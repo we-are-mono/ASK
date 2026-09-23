@@ -149,6 +149,11 @@ struct cdx_ft_binding {
 	struct list_head list;
 	struct net_device *dev;
 	struct nf_flowtable *table; /* retained as identity; borrowed in bind only */
+	/* Bound while an invalidation was latched: counted and watched like any
+	 * other binding, but every flow it is offered stays in software until
+	 * ft_rearm() makes it live. Changed only under the backend transaction,
+	 * which is also what its reader, the rule callback, holds. */
+	bool parked;
 };
 
 /* A device bound passively -- one the classifier cannot program, accepted so
@@ -281,6 +286,10 @@ static LIST_HEAD(ft_block_list);
 static LIST_HEAD(ft_dev_stats);
 static DEFINE_SPINLOCK(ft_dev_stats_lock);
 static unsigned int ft_bound, ft_count;
+/* How many of ft_bound are parked. Written only in the transaction, like
+ * the flag, but ft_invalidate() reads it without one: every write is
+ * WRITE_ONCE, so that read sees either value, never a torn one. */
+static unsigned int ft_parked;
 static unsigned int ft_neighbour_refs;
 static unsigned int ft_handle_refs;
 static atomic64_t ft_neigh_invalidations = ATOMIC64_INIT(0);
@@ -300,13 +309,24 @@ static u64 ft_rearms;
 static bool ft_ready, ft_stopping;
 static atomic_t ft_invalid = ATOMIC_INIT(0);
 static bool ft_invalid_done;
+/* A parked table keeps collecting software flows while the latch is held, so
+ * an event raised then must be covered by a worker pass that flushes them
+ * before the table can go live -- folding it into the latch, as an event
+ * with nothing parked safely is, would let those flows into hardware later.
+ * ft_invalid_seq counts such events (notifier context, no transaction); the
+ * worker samples it before a pass and publishes what that pass covered in
+ * ft_done_seq (under the transaction). */
+static atomic_t ft_invalid_seq = ATOMIC_INIT(0);
+static int ft_done_seq;
 static struct proc_dir_entry *ft_proc;
 static void ft_invalidate_work(struct work_struct *work);
 static void ft_neigh_detach(struct cdx_ft_entry *entry);
 static void ft_retire_workfn(struct work_struct *work);
+static void ft_rearm_workfn(struct work_struct *work);
 static void ft_dev_stats_reap(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_work, ft_invalidate_work);
 static DECLARE_WORK(ft_retire_work, ft_retire_workfn);
+static DECLARE_DELAYED_WORK(ft_rearm_work, ft_rearm_workfn);
 static DECLARE_WORK(ft_dev_stats_work, ft_dev_stats_reap);
 
 static bool ft_fault(unsigned int stage)
@@ -320,8 +340,22 @@ static bool ft_fault(unsigned int stage)
 
 static void ft_invalidate(void)
 {
-	if (READ_ONCE(ft_bound) && !READ_ONCE(ft_stopping) &&
-	    atomic_cmpxchg(&ft_invalid, 0, 1) == 0)
+	bool parked;
+
+	if (!READ_ONCE(ft_bound) || READ_ONCE(ft_stopping))
+		return;
+	/* Counted before the latch is read, with a full barrier between, so
+	 * that ft_rearm(), which clears the latch before reading the count,
+	 * either sees the count move and keeps the latch, or this finds the
+	 * latch clear and takes it -- an ordinary invalidation of bindings
+	 * that are live by then. With nothing parked there is nothing to
+	 * count: a table parked later holds only flows made after its bind. */
+	parked = READ_ONCE(ft_parked);
+	if (parked) {
+		atomic_inc(&ft_invalid_seq);
+		smp_mb__after_atomic();
+	}
+	if (atomic_cmpxchg(&ft_invalid, 0, 1) == 0 || parked)
 		schedule_delayed_work(&ft_work, 0);
 }
 
@@ -2760,6 +2794,14 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 			 * key its previous generation still holds retires it
 			 * before capacity refuses it. */
 			rc = ask_refuse(-ENOSPC);
+		} else if (binding->parked) {
+			/* Declined without touching the flow: its handle stays
+			 * valid, so Netfilter offers it again -- on its next
+			 * refresh, or, while an XFRM policy keeps the software fast
+			 * path out of use, once it expires and is added afresh --
+			 * and once ft_rearm() has made this binding live that offer
+			 * is admitted with no reload. */
+			rc = -EOPNOTSUPP;
 		} else if (ft_admission_fault(cls) || cdx_ft_admission_begin()) {
 			ft_busy++;
 			if (!ft_software_reoffers(cls) && !cdx_ft_observing() && !ft_stopping &&
@@ -2820,6 +2862,92 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	return rc;
 }
 
+/* Whether the worker has finished a pass covering every event counted so
+ * far, not merely the one that took the latch. */
+static bool ft_invalid_complete(void)
+{
+	return ft_invalid_done && ft_done_seq == atomic_read(&ft_invalid_seq);
+}
+
+/* Everything an invalidation leaves behind is gone, except perhaps a deletion
+ * the hardware has not proven yet: every binding that was live when it was
+ * raised has lost its callback, and the worker has finished both hardware
+ * retirement and Linux flow cleanup, for every event raised since as well. A
+ * parked binding is not one of those -- it was made after the latch and owns
+ * no entries. Completion is published as the worker's last action under the
+ * backend transaction, so an old worker cannot change a newly admitted table.
+ * Never reset the fatal latch or error history.
+ */
+static bool ft_drained(void)
+{
+	cdx_ft_assert_held();
+	return ft_ready && !ft_stopping && !cdx_ft_failed() &&
+		atomic_read(&ft_invalid) && ft_invalid_complete() &&
+		ft_bound == ft_parked && !ft_count && !ft_neighbour_refs && !ft_handle_refs;
+}
+
+static bool ft_can_rearm(void)
+{
+	return ft_drained() && !cdx_ft_pending();
+}
+
+/* Make every parked binding live again, once the invalidation they were parked
+ * behind has drained.
+ *
+ * A consumer that reloads atomically binds its new table while the old one is
+ * still bound, so the bind that would once have rearmed admission always finds
+ * a live binding in the way. The bind path parks it instead, and this is
+ * where it comes back. Each event that can complete the drain calls this under
+ * the backend transaction -- the release of the last live binding, the worker
+ * publishing completion, and a parking bind itself, which is how the first
+ * bind after a full detach still rearms at once -- so admission reopens in the
+ * same transaction as the event that allowed it. The parked tables' flows are
+ * offered again by their next refresh and enter hardware with no reload.
+ *
+ * The one condition no adapter event completes is a deletion the hardware has
+ * not proven, including one CDX parked for a path of its own. While every
+ * binding is parked nothing else retries that barrier, so this does, and comes
+ * back every second until it succeeds.
+ */
+static void ft_rearm(void)
+{
+	struct cdx_ft_binding *binding;
+
+	cdx_ft_assert_held();
+	if (!ft_parked || !ft_drained())
+		return;
+	if (cdx_ft_pending()) {
+		cdx_ft_recover();
+		if (cdx_ft_pending()) {
+			schedule_delayed_work(&ft_rearm_work, HZ);
+			return;
+		}
+	}
+	/* Notifiers count events without the transaction. Clear the latch
+	 * first and look at the count after: an event counted in between keeps
+	 * the latch and the bindings parked for the pass it has queued. */
+	atomic_set(&ft_invalid, 0);
+	smp_mb();
+	if (ft_done_seq != atomic_read(&ft_invalid_seq)) {
+		atomic_set(&ft_invalid, 1);
+		return;
+	}
+	list_for_each_entry(binding, &ft_bindings, list)
+		binding->parked = false;
+	pr_info("cdx flowtable: admission rearmed for %u parked binding%s\n",
+		ft_parked, ft_parked == 1 ? "" : "s");
+	WRITE_ONCE(ft_parked, 0);
+	ft_invalid_done = false;
+	ft_rearms++;
+}
+
+static void ft_rearm_workfn(struct work_struct *work)
+{
+	cdx_ft_begin();
+	ft_rearm();
+	cdx_ft_end();
+}
+
 static void ft_release(void *priv)
 {
 	struct cdx_ft_binding *binding = priv;
@@ -2833,6 +2961,13 @@ static void ft_release(void *priv)
 	list_del(&binding->list);
 	ft_bound--;
 	spin_unlock_bh(&ft_watch_lock);
+	/* A live binding going may be the last one a parked binding waits
+	 * for: this is the commit of an atomic reload, releasing the table it
+	 * replaced. */
+	if (binding->parked)
+		WRITE_ONCE(ft_parked, ft_parked - 1);
+	else
+		ft_rearm();
 	cdx_ft_end();
 	dev_put(binding->dev);
 	kfree(binding);
@@ -2853,6 +2988,8 @@ static void ft_release(void *priv)
  * Wi-Fi ingress belongs; the DPAA ports in the same table keep their hardware
  * path. Nothing is allocated for the device beyond the record the unload drain
  * needs to find its table (struct cdx_ft_passive, beside the binding).
+ * The bind path binds a DPAA port the same way when the hardware cannot take
+ * it for the rest of the boot, and says why there.
  */
 static int ft_passive_callback(enum tc_setup_type type, void *data, void *priv)
 {
@@ -2866,17 +3003,37 @@ static void ft_passive_release(void *priv)
 
 static unsigned int ft_passive;
 
-/* All previous callbacks must have lost their bindings, and the worker must
- * have finished both hardware retirement and Linux flow cleanup. Completion
- * is published as its last action under the backend transaction, so an old worker cannot
- * change a newly admitted table. Never reset the fatal latch or error history.
- */
-static bool ft_can_rearm(void)
+/* Bind dev with ft_passive_callback. why names the reason in the log, which is
+ * the only place a consumer whose table committed can learn that one of its
+ * ports stays in software. */
+static int ft_bind_passive(struct net_device *dev, struct flow_block_offload *bo,
+			   struct nf_flowtable *flowtable, bool indirect, struct Qdisc *sch,
+			   void (*cleanup)(struct flow_block_cb *), const char *why)
 {
+	struct cdx_ft_passive *passive;
+	struct flow_block_cb *cb;
+
 	cdx_ft_assert_held();
-	return ft_ready && !ft_stopping && !cdx_ft_failed() &&
-		atomic_read(&ft_invalid) && ft_invalid_done &&
-		!ft_bound && !ft_count && !ft_neighbour_refs && !ft_handle_refs && !cdx_ft_pending();
+	passive = kzalloc(sizeof(*passive), GFP_KERNEL);
+	if (!passive)
+		return -ENOMEM;
+	passive->table = flowtable;
+	cb = indirect ?
+		flow_indr_block_cb_alloc(ft_passive_callback, dev, passive,
+			ft_passive_release, bo, dev, sch, flowtable, NULL,
+			cleanup) :
+		flow_block_cb_alloc(ft_passive_callback, dev, passive,
+			ft_passive_release);
+	if (IS_ERR(cb)) {
+		kfree(passive);
+		return PTR_ERR(cb);
+	}
+	flow_block_cb_add(cb, bo);
+	list_add_tail(&cb->driver_list, &ft_block_list);
+	ft_passive++;
+	pr_info("cdx flowtable: %s bound passively (%s), its flows stay in software\n",
+		netdev_name(dev), why);
+	return 0;
 }
 
 /* Whether flowtable may bind dev beside the tables already bound.
@@ -2943,7 +3100,7 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 {
 	struct cdx_ft_binding *binding;
 	struct flow_block_cb *cb;
-	bool rearm;
+	const char *passive;
 	int rc = 0;
 
 	if (!bo || !bo->block || !bo->net || !dev || !flowtable ||
@@ -2965,37 +3122,23 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 			rc = -EOPNOTSUPP;
 			goto out;
 		}
-		if (!cdx_ft_port_supported(dev)) {
-			struct cdx_ft_passive *passive;
-
-			passive = kzalloc(sizeof(*passive), GFP_KERNEL);
-			if (!passive) {
-				rc = -ENOMEM;
-				goto out;
-			}
-			passive->table = flowtable;
-			cb = indirect ?
-				flow_indr_block_cb_alloc(ft_passive_callback, dev, passive,
-					ft_passive_release, bo, dev, sch, flowtable, NULL,
-					cleanup) :
-				flow_block_cb_alloc(ft_passive_callback, dev, passive,
-					ft_passive_release);
-			if (IS_ERR(cb)) {
-				kfree(passive);
-				rc = PTR_ERR(cb);
-				goto out;
-			}
-			flow_block_cb_add(cb, bo);
-			list_add_tail(&cb->driver_list, &ft_block_list);
-			ft_passive++;
-			pr_info("cdx flowtable: %s bound passively, its flows stay in software\n",
-				netdev_name(dev));
-			goto out;
-		}
-		rearm = atomic_read(&ft_invalid);
-		if (cdx_ft_failed() || ft_bound >= CDX_FT_MAX_BINDINGS ||
-		    (rearm && !ft_can_rearm())) {
-			rc = -EOPNOTSUPP;
+		/* A bind the hardware cannot take must not fail the consumer's
+		 * transaction: that would fail its whole firewall reload, which is
+		 * far worse than a port forwarding in software. A port the
+		 * classifier cannot program is bound passively, and so are two
+		 * refusals that nothing in this boot will lift. A failed deletion
+		 * latches admission off until a fresh boot, so a parked binding
+		 * would wait for a rearm that never comes. A binding past the bound
+		 * could not be flushed by ft_invalidate_work(), whose device
+		 * snapshot that bound sizes; passive bindings are not counted in
+		 * it. An invalidation is different, because it recovers in this
+		 * boot once the bindings it caught are gone: a binding made under
+		 * one is parked below and takes over by itself. */
+		passive = !cdx_ft_port_supported(dev) ? "not a classifier port" :
+			  cdx_ft_failed() ? "admission stopped until reboot" : NULL;
+		if (passive) {
+			rc = ft_bind_passive(dev, bo, flowtable, indirect, sch, cleanup,
+					     passive);
 			goto out;
 		}
 		/* TC_SETUP_FT borrows this live table from Netfilter. A table
@@ -3009,6 +3152,13 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		rc = ft_bind_admissible(flowtable, dev);
 		if (rc)
 			goto out;
+		/* After the table and device checks, so a bind they refuse is
+		 * refused here too rather than accepted passively. */
+		if (ft_bound >= CDX_FT_MAX_BINDINGS) {
+			rc = ft_bind_passive(dev, bo, flowtable, indirect, sch, cleanup,
+					     "no binding left");
+			goto out;
+		}
 		binding = kzalloc(sizeof(*binding), GFP_KERNEL);
 		if (!binding) {
 			rc = -ENOMEM;
@@ -3031,21 +3181,39 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		 * also retires DIRECT flows constructed concurrently with bind. */
 		WRITE_ONCE(flowtable->use_neigh, true);
 		WRITE_ONCE(flowtable->use_hw_handles, true);
-		/* Commit recovery only after allocating a binding successfully.
-		 * While ft_bound is zero, a notifier cannot invalidate new entries:
-		 * none exist yet. A normal bind must not clear an invalidation
-		 * raised during allocation. Rules validate fresh Linux context. */
-		if (rearm) {
-			ft_invalid_done = false;
-			atomic_set(&ft_invalid, 0);
-			ft_rearms++;
-			pr_info("cdx flowtable: admission rearmed for a new binding\n");
-		}
+		/* A binding made while an invalidation is latched is parked:
+		 * the transaction commits, and the table's flows forward in
+		 * software until ft_rearm() makes the binding live. Read only
+		 * after the allocations, so an invalidation raised during them
+		 * parks this binding too; nothing here clears one. ft_rearm()
+		 * does, and only once it has drained -- which it already has
+		 * when every old binding is gone, so the first bind after a full
+		 * detach still rearms at once. That is committed only after the
+		 * binding was allocated successfully, and while no live binding
+		 * exists a notifier cannot invalidate new entries: none exist yet.
+		 * Rules validate fresh Linux context. */
+		binding->parked = atomic_read(&ft_invalid);
 		dev_hold(dev);
 		spin_lock_bh(&ft_watch_lock);
 		list_add_tail(&binding->list, &ft_bindings);
 		ft_bound++;
 		spin_unlock_bh(&ft_watch_lock);
+		if (binding->parked) {
+			WRITE_ONCE(ft_parked, ft_parked + 1);
+			/* A table that already holds flows -- one gaining a
+			 * device -- may hold some made before the latch, through
+			 * a device no pass flushed. Count that like an event, so
+			 * a pass flushes this device's flows before it can go
+			 * live. A table created by this transaction is empty. */
+			if (atomic_read(&flowtable->rhashtable.nelems)) {
+				atomic_inc(&ft_invalid_seq);
+				schedule_delayed_work(&ft_work, 0);
+			}
+			ft_rearm();
+			if (binding->parked)
+				pr_info("cdx flowtable: %s bound parked, its flows stay in software until the invalidated bindings drain\n",
+					netdev_name(dev));
+		}
 		flow_block_cb_add(cb, bo);
 		list_add_tail(&cb->driver_list, &ft_block_list);
 	} else if (bo->command == FLOW_BLOCK_UNBIND) {
@@ -3112,8 +3280,25 @@ static void ft_invalidate_work(struct work_struct *work)
 	struct cdx_ft_binding *binding;
 	struct cdx_ft_entry *entry, *next;
 	unsigned int n = 0, i;
+	int seq;
 
 	cdx_ft_begin();
+	/* A pass queued for an event a rearm has since covered finds the latch
+	 * clear and has nothing to do. */
+	if (!atomic_read(&ft_invalid)) {
+		cdx_ft_end();
+		return;
+	}
+	/* Sampled before anything is retired or snapshotted: an event counted
+	 * after this has queued a pass of its own. */
+	seq = atomic_read(&ft_invalid_seq);
+	/* After a terminal failure nothing is ever admitted again, so a repeat
+	 * pass has no flow to protect. */
+	if (ft_invalid_done && cdx_ft_failed()) {
+		ft_done_seq = seq;
+		cdx_ft_end();
+		return;
+	}
 	list_for_each_entry_safe(entry, next, &ft_entries, list)
 		ft_remove(entry);
 	/* CDX retains failed deletions and owns the terminal hardware latch.
@@ -3137,10 +3322,15 @@ static void ft_invalidate_work(struct work_struct *work)
 		dev_put(devices[i]);
 	}
 	cdx_ft_begin();
-	pr_info("cdx flowtable: invalidated; hardware admission disabled\n");
-	/* No state changes or deferred work after publishing completion. A
-	 * later first bind may now recover if every old binding has gone. */
+	if (!ft_invalid_done)
+		pr_info("cdx flowtable: invalidated; hardware admission disabled\n");
+	/* Publishing completion is this worker's last change of its own, so it
+	 * cannot touch a table admitted after it. A later first bind may now
+	 * recover if every old binding has gone; a binding parked while this
+	 * ran recovers here instead, in the same transaction. */
 	ft_invalid_done = true;
+	ft_done_seq = seq;
+	ft_rearm();
 	cdx_ft_end();
 }
 
@@ -8508,14 +8698,14 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * mark selectors contradict what the running adapter will decode. */
 	seq_printf(seq, "qos_mark_mask %u\nqos_default_class %u\n",
 		   ft_qos_mark_mask, ft_qos_default_class);
-	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nentries %u\nmax_entries %u\n"
+	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nparked %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
 		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nstp_invalidations %lld\nqos_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
-		   cdx_ft_observing(), ft_bound, ft_passive, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
+		   cdx_ft_observing(), ft_bound, ft_passive, ft_parked, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
-		   ft_invalid_done, cdx_ft_failed(),
+		   ft_invalid_complete(), cdx_ft_failed(),
 		   cdx_ft_pending(),
 		   ft_can_rearm(), ft_rearms, ft_neighbour_refs, ft_handle_refs,
 		   atomic64_read(&ft_neigh_invalidations),
@@ -8677,7 +8867,14 @@ classifier:
 indirect:
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 not_ready:
+	/* A bind that arrived while registered may have parked and left its
+	 * rearm retrying. ft_rearm() reads ft_ready under the transaction, so
+	 * clearing it there means no pass that starts later requeues the
+	 * retry, and one that already did is cancelled below. */
+	cdx_ft_begin();
 	WRITE_ONCE(ft_ready, false);
+	cdx_ft_end();
+	cancel_delayed_work_sync(&ft_rearm_work);
 	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
 	/* A port may have stopped since the chain was registered: its sweep
 	 * runs this module's code, so it finishes before the text goes. */
@@ -8831,6 +9028,9 @@ static void __exit ask_flowtable_exit(void)
 	ft_ipsec_watch_flush();
 	cancel_work_sync(&ft_retire_work);
 	cancel_delayed_work_sync(&ft_work);
+	/* ft_stopping, set above, already stops a parked rearm requeueing
+	 * itself; this waits out the pass in flight. */
+	cancel_delayed_work_sync(&ft_rearm_work);
 	/* Direct first: it is the route a DPAA port actually takes, so closing
 	 * it stops new binds before the indirect one is torn down. The
 	 * classifier goes with it, and waits out the frames inside it. */

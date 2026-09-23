@@ -657,7 +657,7 @@ static void flow_stats_update(struct flow_stats *s, u64 b, u64 p, u64 d, unsigne
 #include "flowtable_types.inc"
 struct cdx_ft_hw { struct cdx_ft_counters stats; };
 struct work_struct { int unused; };
-static int ft_work, ft_retire_work, ft_dev_stats_work;
+static int ft_work, ft_retire_work, ft_dev_stats_work, ft_rearm_work;
 /* The stopped-port sweep's own declarations are compiled from the adapter;
  * these let the stubs below name its work item before they appear. */
 #define DECLARE_WORK(n, fn) int n
@@ -681,7 +681,7 @@ static void drop_dev_records(void);
  * most cases, without one, so the assertion is a statement here rather than a
  * check. */
 #define ASSERT_RTNL() do { } while (0)
-static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
+static unsigned ft_count, ft_bound, ft_parked, ft_fail_stage, ft_init_fail_stage;
 /* Module parameters in production; plain globals here so a case can set the
  * mask, drive ft_parse, and read the class back off the rule. */
 static unsigned int ft_qos_mark_mask, ft_qos_default_class;
@@ -836,17 +836,33 @@ static void cdx_ft_admission_end(void) { rtnl_unlock(); }
 static bool cdx_ft_failed(void) { return ft_fatal; }
 static bool cdx_ft_observing(void) { return ft_observe; }
 static unsigned cdx_ft_pending(void) { return private_pending + legacy_pending; }
+/* The barrier a retry issues, and whether it completes. A completed one proves
+ * the backend's own retired deletions; CDX's parked ones stay until one of its
+ * own paths releases them. */
+static unsigned recoveries;
+static bool barrier_fails;
 static int cdx_ft_recover(void)
 {
     assert(cdx_info->ctrl.mutex);
+    recoveries++;
     if (ft_fatal) {
         if (!rtnl_trylock()) return -EAGAIN;
         int rc = dpa_cfg_quiesce(); rtnl_unlock();
         if (rc) return -EAGAIN;
     }
+    if (!barrier_fails)
+        private_pending = 0;
     return retry_error;
 }
-static void schedule_delayed_work(int *work, unsigned delay) { scheduled++; }
+/* The parked rearm's retry is counted apart from the invalidation worker's,
+ * so a case can say which of the two was asked to come back. */
+static unsigned rearm_retries;
+static void schedule_delayed_work(int *work, unsigned delay)
+{
+    if (work == &ft_rearm_work) { assert(delay == HZ); rearm_retries++; return; }
+    assert(work == &ft_work);
+    scheduled++;
+}
 static unsigned neigh_scheduled, dev_stats_scheduled, stopped_scheduled;
 static void schedule_work(int *work)
 {
@@ -954,7 +970,22 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls, struct cdx_ft_ru
 static struct net_device *__dev_get_by_index(struct net *net, int ifindex);
 static int atomic_read(int *v) { return *v; }
 static void atomic_set(int *v, int n) { *v = n; }
-static void ft_invalidate(void) { ft_invalid = 1; }
+static void atomic_inc(int *v) { ++*v; }
+static int ft_invalid_seq, ft_done_seq;
+/* A global event, as the notifiers raise one: counted while anything is
+ * parked, and latched. The pass it would queue is driven by each case. */
+static unsigned events_counted;
+static void ft_invalidate(void)
+{
+    if (ft_parked) { ft_invalid_seq++; events_counted++; }
+    ft_invalid = 1;
+}
+/* The full barrier ft_rearm() puts between clearing the latch and reading the
+ * count is where a notifier on another CPU can land; a case hooks it to raise
+ * an event exactly there. */
+static void (*barrier_hook)(void);
+static void smp_mb(void) { if (barrier_hook) { void (*hook)(void) = barrier_hook; barrier_hook = NULL; hook(); } }
+#define smp_mb__after_atomic() smp_mb()
 static bool cdx_ft_port_supported(struct net_device *d) { return d && physical_ok; }
 /* The egress set is wider in production (an open VAP); the asymmetry has its
  * own harness (wifi_admission.c). Here the two sets coincide. */
@@ -1220,21 +1251,21 @@ static void unregister_switchdev_blocking_notifier(struct notifier_block *nb)
 static void cancel_work_sync(int *work)
 { assert(work == &ft_retire_work || work == &ft_ipsec_follow || work == &ft_dev_stats_work); canceled++; }
 static void cancel_delayed_work_sync(int *work)
-{ assert(work == &ft_work || work == &ft_ipsec_stats); canceled++; }
+{ assert(work == &ft_work || work == &ft_ipsec_stats || work == &ft_rearm_work); canceled++; }
 static int register_indirect(void)
 { assert(ft_ready); if (registration_fails()) return -ENOMEM; indirect_registered=true; return 0; }
 static void unregister_indirect(void)
 {
     assert(indirect_registered && !cdx_info->ctrl.mutex);
-    /* Unload gives this route back last, with all four works cancelled --
-     * retirement, the delayed installer, the SA next-hop follower and the
-     * SA accounting pass -- and every notifier already gone. A load
-     * unwinding its own failure gives it back first and in the opposite
-     * order, with nothing yet scheduled to cancel, so the ordering below is
-     * the exit path's alone. ft_stopping tells them apart, and only exit
-     * sets it. */
+    /* Unload gives this route back last, with all five works cancelled --
+     * retirement, the delayed installer, the parked rearm's retry, the SA
+     * next-hop follower and the SA accounting pass -- and every notifier
+     * already gone. A load unwinding its own failure gives it back first
+     * and in the opposite order, with nothing yet scheduled to cancel, so
+     * the ordering below is the exit path's alone. ft_stopping tells them
+     * apart, and only exit sets it. */
     if (ft_stopping) {
-        assert(canceled == 4);
+        assert(canceled == 5);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered);
         assert(!fdb_registered && !swdev_obj_registered);
     } else {
@@ -1261,7 +1292,7 @@ static unsigned unload_sleeps, unload_failures;
 static void msleep(unsigned ms)
 {
     assert(ms == 1000 && backend_claimed && !cdx_info->ctrl.mutex && !rtnl);
-    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 4);
+    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 5);
     assert(unload_failures);
     unload_sleeps++;
     if (!--unload_failures) { retry_error=0; quiesce_fail=false; }
@@ -4479,25 +4510,57 @@ static bool can_rearm(void)
     mutex_unlock(&cdx_info->ctrl.mutex);
     return ready;
 }
+/* The binding a device holds in a table, or NULL; parked or live alike. */
+static struct cdx_ft_binding *bound_to(const struct flow_block *b, struct net_device *dev)
+{
+    struct flow_block_cb *cb = flow_block_cb_lookup((struct flow_block *)b, ft_rule_callback, dev);
+    return cb ? cb->cb_priv : NULL;
+}
 static void detach_during_cleanup(void)
 {
     cleanup_hook = NULL;
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
     assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
-    assert(!ft_bound && !ft_count && !ft_invalid_done);
+    assert(!ft_bound && !ft_parked && !ft_count && !ft_invalid_done);
     assert(!can_rearm());
-    assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+    /* The worker has not finished, so a bind now is parked behind it rather
+     * than refused. Leaving again gives everything back. */
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+    assert(ft_bound == 1 && ft_parked == 1 && bound_to(&block, &in)->parked && ft_invalid);
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && !ft_bound && !ft_parked);
+}
+/* A bind made while something still holds a rearm back: parked, not refused,
+ * and left again without having reopened anything. */
+static void park_and_leave(struct net_device *dev, u64 rearms)
+{
+    unsigned held = allocated;
+
+    assert(bind_device(dev, FLOW_BLOCK_BIND) == 0);
+    assert(ft_bound == 1 && ft_parked == 1 && bound_to(&block, dev)->parked);
+    assert(ft_invalid && ft_invalid_done && ft_rearms == rearms && dev->refs == 1);
+    assert(bind_device(dev, FLOW_BLOCK_UNBIND) == 0);
+    assert(!ft_bound && !ft_parked && !dev->refs && allocated == held);
 }
 static void test_rearm(void)
 {
     list_init(&block.cb_list);
     assert(ft_invalid && ft_fatal && ft_invalid_done);
-    assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+    u64 rearms = ft_rearms;
+    /* A failed deletion stops admission until a fresh boot. The bind still
+     * succeeds -- refusing it would fail the consumer's whole transaction --
+     * but passively: not counted as a binding, holding no device, never
+     * rearmed, and declining everything it is offered. */
+    assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == 0);
+    assert(ft_passive == 1 && !ft_bound && !ft_parked && !in.refs && !table.use_neigh);
+    assert(!bound_to(&block, &in) && flow_block_cb_lookup(&block, ft_passive_callback, &in));
     /* The fatal latch independently prevents admission, even if another
      * path were to clear the ordinary invalidation flag accidentally. */
     ft_invalid = 0;
-    assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+    assert(bind_device(&out, FLOW_BLOCK_BIND) == 0 && ft_passive == 2 && !ft_bound);
     assert(ft_replace(&binding, &cls) == -EOPNOTSUPP);
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+    assert(!ft_passive && !allocated && !ft_invalid && ft_rearms == rearms);
+    assert(block.cb_list.next == &block.cb_list && ft_block_list.next == &ft_block_list);
     ft_fatal = false; /* Simulated fresh module/boot, never a recovery action. */
     ft_invalid_done = false;
     deletion_error = 0;
@@ -4511,18 +4574,25 @@ static void test_rearm(void)
         invalidate_on_bind = true;
         assert(bind_device(&out, FLOW_BLOCK_BIND) == 0);
         invalidate_on_bind = false;
-        assert(ft_invalid && !ft_invalid_done && ft_rearms == cycle);
-        assert(ft_bound == 2 && allocated == 4 && in.refs == 1 && out.refs == 1);
+        /* Raised while the second binding was being allocated, so that one
+         * is parked behind it rather than clearing it. */
+        assert(ft_invalid && !ft_invalid_done && ft_rearms == rearms + cycle);
+        assert(ft_bound == 2 && ft_parked == 1 && allocated == 4 && in.refs == 1 && out.refs == 1);
+        assert(!bound_to(&block, &in)->parked && bound_to(&block, &out)->parked);
         ft_invalidate();
         /* A failed retirement barrier cannot be bypassed by detachment. */
         retry_error = -EAGAIN;
         ft_invalidate_work(NULL);
         assert(!ft_invalid_done && !can_rearm());
         if (cycle % 3 == 0) {
+            /* The live binding going does not unpark anything while the
+             * worker is still retrying. */
             assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+            assert(ft_invalid && ft_bound == 1 && ft_parked == 1);
             assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
-            assert(!ft_bound && !can_rearm());
-            assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+            assert(!ft_bound && !ft_parked && !can_rearm());
+            assert(bind_device(&in, FLOW_BLOCK_BIND) == 0 && ft_parked == 1);
+            assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && !ft_parked);
         }
         retry_error = 0;
         if (cycle % 3 == 0) {
@@ -4533,24 +4603,38 @@ static void test_rearm(void)
         } else {
             ft_invalidate_work(NULL);
             assert(ft_invalid_done && !can_rearm());
-            assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
-            assert(!can_rearm());
-            assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+            /* The parked binding leaving first changes nothing: the live
+             * one is still in the way. */
             assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+            assert(!ft_parked && ft_bound == 1 && !can_rearm());
+            /* A second binding of the same table on the same device is
+             * refused as ever, parked or not. */
+            assert(bind_device(&in, FLOW_BLOCK_BIND) == -EBUSY && in.refs == 1);
+            /* With nothing parked, the live one going rearms nothing; the
+             * next bind does. */
+            assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+            assert(ft_invalid && ft_rearms == rearms + cycle);
         }
-        assert(!ft_bound && !ft_count && !allocated && !in.refs && !out.refs);
+        assert(!ft_bound && !ft_parked && !ft_count && !allocated && !in.refs && !out.refs);
         assert(can_rearm());
         table.rhashtable.nelems = 2;
         assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
-        assert(ft_invalid && ft_invalid_done && !allocated && ft_rearms == cycle);
+        assert(ft_invalid && ft_invalid_done && !allocated && ft_rearms == rearms + cycle);
         table.rhashtable.nelems = 0;
         ft_neighbour_refs = 1;
-        assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        assert(!can_rearm());
+        park_and_leave(&in, rearms + cycle);
         ft_neighbour_refs = 0;
-        private_pending = 1;
-        assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
-        private_pending = 0; legacy_pending = 1;
-        assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        /* A deletion the barrier cannot prove yet holds a rearm back, and
+         * the parked binding retries that barrier every second. */
+        private_pending = 1; barrier_fails = true;
+        unsigned tries = recoveries, retries = rearm_retries;
+        assert(!can_rearm());
+        park_and_leave(&in, rearms + cycle);
+        assert(recoveries == tries + 1 && rearm_retries == retries + 1);
+        private_pending = 0; legacy_pending = 1; barrier_fails = false;
+        park_and_leave(&in, rearms + cycle);
+        assert(recoveries == tries + 2 && rearm_retries == retries + 2);
         legacy_pending = 0; ft_stopping = true;
         assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
         ft_stopping = false; ft_ready = false;
@@ -4561,10 +4645,14 @@ static void test_rearm(void)
         assert(bind_device(&in, FLOW_BLOCK_BIND) == -ENOMEM);
         callback_allocation_fail = false;
         assert(ft_invalid && ft_invalid_done && can_rearm() && !allocated);
-        assert(ft_rearms == cycle);
+        assert(ft_rearms == rearms + cycle && !ft_bound && !ft_parked);
+        /* Nothing left to wait for: the first bind parks and is made live
+         * in the same call, as the rearming bind always was. */
         assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
-        assert(!ft_invalid && !ft_invalid_done && !can_rearm() && ft_rearms == cycle + 1);
-        assert(bind_device(&out, FLOW_BLOCK_BIND) == 0 && ft_rearms == cycle + 1);
+        assert(!ft_invalid && !ft_invalid_done && !can_rearm() && ft_rearms == rearms + cycle + 1);
+        assert(!ft_parked && !bound_to(&block, &in)->parked);
+        assert(bind_device(&out, FLOW_BLOCK_BIND) == 0 && ft_rearms == rearms + cycle + 1);
+        assert(!ft_parked && !bound_to(&block, &out)->parked);
         fixture();
         struct flow_block_cb *cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
         assert(cb && ft_replace(cb->cb_priv, &cls) == 0);
@@ -5961,6 +6049,223 @@ static void test_table_handover(void)
     assert(!ft_bound && !wan.refs && !lan.refs && !allocated);
 }
 
+/* The same handover after an invalidation. Netfilter binds the replacement
+ * while the invalidated table is still bound, so the bind that used to rearm
+ * admission always finds a live binding in the way, and refusing it failed the
+ * consumer's whole reload. The replacement is parked instead -- bound, counted,
+ * declining every flow -- and made live, with the invalidation cleared and one
+ * rearm counted, as soon as the old bindings are gone and the hardware has
+ * drained. Three events can complete that: the release of the last old
+ * binding, the worker's completion, and the retry of a barrier still owed. */
+static void test_parked_rearm(void)
+{
+    static struct nf_flowtable next_table;
+    static struct flow_block next_block;
+    struct cdx_ft_binding *parked_in, *parked_out;
+    u64 rearms = ft_rearms, errors = ft_errors, rejects, admissions;
+    unsigned tries, retries;
+
+    fixture();
+    list_init(&block.cb_list);
+    list_init(&next_block.cb_list);
+    assert(!ft_bound && !ft_parked && !ft_passive && !ft_invalid && !allocated);
+
+    /* The live table, with a direction in hardware. */
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+    assert(bind_device(&out, FLOW_BLOCK_BIND) == 0);
+    cls.command = FLOW_CLS_REPLACE;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, bound_to(&block, &in)) == 0);
+    assert(ft_count == 1 && live_hw == 1 && handle.refs == 2);
+    /* Invalidated and drained: the entry is retired, the table stays bound. */
+    ft_invalidate();
+    ft_invalidate_work(NULL);
+    assert(ft_invalid && ft_invalid_done && !ft_count && !live_hw && ft_bound == 2);
+    assert(handle.refs == 1 && !ft_handle_refs && !ft_neighbour_refs && !can_rearm());
+
+    /* Prepare binds the replacement beside it: accepted, and parked. */
+    assert(bind_to(&in, FLOW_BLOCK_BIND, &next_table, &next_block) == 0);
+    assert(bind_to(&out, FLOW_BLOCK_BIND, &next_table, &next_block) == 0);
+    parked_in = bound_to(&next_block, &in);
+    parked_out = bound_to(&next_block, &out);
+    assert(parked_in && parked_in->parked && parked_out && parked_out->parked);
+    assert(ft_bound == 4 && ft_parked == 2 && in.refs == 2 && out.refs == 2);
+    assert(next_table.use_neigh && next_table.use_hw_handles);
+    assert(ft_invalid && ft_rearms == rearms && !can_rearm());
+    /* A third table is still one too many, parked or not. */
+    {
+        static struct nf_flowtable third_table;
+        static struct flow_block third_block;
+
+        list_init(&third_block.cb_list);
+        assert(bind_to(&in, FLOW_BLOCK_BIND, &third_table, &third_block) == -EBUSY);
+        assert(ft_bound == 4 && ft_parked == 2 && in.refs == 2);
+    }
+
+    /* A flow offered to the parked table stays in software without taking
+     * RTNL, and nothing about it changes: its handle is still valid, so the
+     * next refresh can offer it again. */
+    fixture();
+    cls.command = FLOW_CLS_REPLACE;
+    rejects = ft_rejects;
+    admissions = ft_admission_invalidations;
+    rtnl_busy = true;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, parked_in) == -EOPNOTSUPP);
+    rtnl_busy = false;
+    assert(!ft_count && !live_hw && !handle.invalid && handle.refs == 1);
+    assert(ft_rejects == rejects + 1 && ft_admission_invalidations == admissions);
+    cls.command = FLOW_CLS_STATS;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, parked_in) == -ENOENT);
+    cls.command = FLOW_CLS_DESTROY;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, parked_in) == 0);
+    cls.command = FLOW_CLS_REPLACE;
+
+    /* Commit releases the old table. The first release leaves a live one. */
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+    assert(ft_invalid && ft_parked == 2 && ft_rearms == rearms);
+    /* The last is what the parked table waited for. */
+    assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+    assert(!ft_invalid && !ft_invalid_done && !ft_parked && ft_rearms == rearms + 1);
+    assert(!parked_in->parked && !parked_out->parked && ft_bound == 2);
+    assert(in.refs == 1 && out.refs == 1 && block.cb_list.next == &block.cb_list);
+    /* The same flow's next refresh is admitted, with no reload. */
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, parked_in) == 0);
+    assert(ft_count == 1 && live_hw == 1 && handle.refs == 2);
+
+    /* The worker's completion finishes the drain when the old bindings left
+     * first, here while it was still retrying a barrier. */
+    ft_invalidate();
+    retry_error = -EAGAIN;
+    ft_invalidate_work(NULL);
+    assert(ft_invalid && !ft_invalid_done && !ft_count && !live_hw);
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == 0 && bind_device(&out, FLOW_BLOCK_BIND) == 0);
+    assert(ft_parked == 2 && bound_to(&block, &in)->parked && bound_to(&block, &out)->parked);
+    assert(bind_to(&in, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0);
+    assert(bind_to(&out, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0);
+    assert(ft_invalid && ft_parked == 2 && ft_bound == 2 && ft_rearms == rearms + 1);
+    retry_error = 0;
+    ft_invalidate_work(NULL);
+    assert(!ft_invalid && !ft_invalid_done && !ft_parked && ft_rearms == rearms + 2);
+    assert(!bound_to(&block, &in)->parked && !bound_to(&block, &out)->parked);
+
+    /* A deletion CDX parked for a path of its own. Nothing the adapter does
+     * completes it, so the parked binding retries the barrier every second
+     * until something releases it. */
+    ft_invalidate();
+    ft_invalidate_work(NULL);
+    assert(ft_invalid && ft_invalid_done);
+    legacy_pending = 1;
+    tries = recoveries; retries = rearm_retries;
+    assert(bind_to(&in, FLOW_BLOCK_BIND, &next_table, &next_block) == 0);
+    /* Not while a live binding is still in the way. */
+    assert(ft_parked == 1 && recoveries == tries && rearm_retries == retries);
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+    assert(ft_parked == 1 && recoveries == tries && rearm_retries == retries);
+    assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+    assert(ft_parked == 1 && ft_invalid && recoveries == tries + 1 && rearm_retries == retries + 1);
+    ft_rearm_workfn(NULL);
+    assert(ft_parked == 1 && ft_invalid && recoveries == tries + 2 && rearm_retries == retries + 2);
+    legacy_pending = 0;
+    ft_rearm_workfn(NULL);
+    assert(!ft_parked && !ft_invalid && ft_rearms == rearms + 3);
+    assert(recoveries == tries + 2 && rearm_retries == retries + 2);
+    /* A retry that was already queued finds nothing left to do. */
+    ft_rearm_workfn(NULL);
+    assert(ft_rearms == rearms + 3 && rearm_retries == retries + 2);
+    /* And a deletion of the backend's own that the retry proves at once. */
+    ft_invalidate();
+    ft_invalidate_work(NULL);
+    private_pending = 1;
+    tries = recoveries;
+    assert(bind_to(&out, FLOW_BLOCK_BIND, &next_table, &next_block) == 0);
+    assert(ft_parked == 1 && bound_to(&next_block, &out)->parked);
+    assert(bind_to(&in, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0);
+    assert(!private_pending && !ft_parked && !ft_invalid && ft_rearms == rearms + 4);
+    assert(recoveries == tries + 1 && rearm_retries == retries + 2);
+
+    /* Past the binding bound a bind is passive: ft_invalidate_work()'s device
+     * snapshot is sized by it. */
+    {
+        unsigned bound = ft_bound;
+
+        ft_bound = CDX_FT_MAX_BINDINGS;
+        assert(bind_to(&in, FLOW_BLOCK_BIND, &next_table, &next_block) == 0);
+        assert(ft_passive == 1 && ft_bound == CDX_FT_MAX_BINDINGS && !ft_parked);
+        assert(!bound_to(&next_block, &in) && !in.refs);
+        /* A bind the table checks refuse is still refused there. */
+        assert(bind_to(&out, FLOW_BLOCK_BIND, &next_table, &next_block) == -EBUSY);
+        assert(ft_passive == 1 && out.refs == 1);
+        ft_bound = bound;
+        assert(bind_to(&in, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0 && !ft_passive);
+    }
+
+    /* An event raised while a table is parked. That table keeps making
+     * software flows the event may have made stale, so the event is counted
+     * and the rearm waits for a pass that flushes them; folded into the latch,
+     * it would let those flows into hardware afterwards. */
+    {
+        unsigned flushes;
+        int seq;
+
+        list_init(&block.cb_list);
+        ft_invalidate();
+        ft_invalidate_work(NULL);
+        assert(ft_invalid && ft_invalid_done && ft_bound == 1 && can_rearm() == false);
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == 0 && ft_parked == 1);
+        seq = ft_invalid_seq;
+        ft_invalidate();
+        assert(ft_invalid_seq == seq + 1);
+        assert(bind_to(&out, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0);
+        assert(ft_invalid && ft_parked == 1 && ft_rearms == rearms + 4 && !can_rearm());
+        flushes = flushed;
+        ft_invalidate_work(NULL);
+        assert(flushed == flushes + 1 && ft_done_seq == ft_invalid_seq);
+        assert(!ft_invalid && !ft_parked && ft_rearms == rearms + 5);
+        /* A pass left queued behind that rearm finds the latch clear and does
+         * nothing at all. */
+        flushes = flushed;
+        ft_invalidate_work(NULL);
+        assert(flushed == flushes && !ft_invalid && !ft_invalid_done);
+
+        /* The same event counted by a notifier on another CPU between the
+         * rearm clearing the latch and reading the count: the latch is put
+         * back and the table stays parked for the event's own pass. */
+        ft_invalidate();
+        ft_invalidate_work(NULL);
+        assert(bind_to(&out, FLOW_BLOCK_BIND, &next_table, &next_block) == 0 && ft_parked == 1);
+        barrier_hook = ft_invalidate;
+        assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+        assert(!barrier_hook && ft_invalid && ft_parked == 1 && ft_rearms == rearms + 5);
+        assert(bound_to(&next_block, &out)->parked);
+        ft_invalidate_work(NULL);
+        assert(!ft_invalid && !ft_parked && ft_rearms == rearms + 6);
+
+        /* A table that already holds flows gaining a device: those flows may
+         * predate the latch and ride a device no pass flushed, so the bind
+         * itself asks for a pass before the table can go live. */
+        ft_invalidate();
+        ft_invalidate_work(NULL);
+        table.rhashtable.nelems = 3;
+        unsigned queued = scheduled;
+        seq = ft_invalid_seq;
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == 0 && ft_parked == 1);
+        assert(scheduled == queued + 1 && ft_invalid_seq == seq + 1);
+        assert(bind_to(&out, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0);
+        assert(ft_invalid && ft_parked == 1 && ft_rearms == rearms + 6);
+        flushes = flushed;
+        ft_invalidate_work(NULL);
+        assert(flushed == flushes + 1 && !ft_invalid && !ft_parked && ft_rearms == rearms + 7);
+        table.rhashtable.nelems = 0;
+        assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+        assert(bind_to(&out, FLOW_BLOCK_BIND, &next_table, &next_block) == 0 && !ft_parked);
+    }
+
+    assert(bind_to(&out, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0);
+    assert(!ft_bound && !ft_parked && !ft_passive && !ft_count && !live_hw && !allocated);
+    assert(!in.refs && !out.refs && handle.refs == 1 && !ft_handle_refs && !ft_neighbour_refs);
+    assert(!ft_invalid && !ft_invalid_done && ft_errors == errors && !rtnl);
+    assert(ft_bindings.next == &ft_bindings && ft_block_list.next == &ft_block_list);
+}
+
 /* OpenWrt's firewall declares `counter` on every flowtable it renders, with no
  * option to turn it off, so refusing a counter-enabled table refuses the only
  * configuration the consumer actually ships. The two counters disagree about
@@ -6485,6 +6790,7 @@ int main(void)
     test_device_dependencies();
     test_binding_capacity();
     test_table_handover();
+    test_parked_rearm();
     test_counter_accounting();
     test_device_recovery();
     test_transient_admission();

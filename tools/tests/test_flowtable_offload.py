@@ -1,8 +1,9 @@
 """IPv4/UDP flowtable acceptance on the real DUT.
 
 Run with make ask-test ASK_TEST_ARGS='-k flowtable_offload'.
-Healthy invalidation can recover after complete flowtable detachment. Terminal
-failure tests still require a fresh boot before using ASK again.
+Healthy invalidation recovers once the invalidated bindings are gone, including
+across an atomic reload. Terminal failure tests still require a fresh boot
+before using ASK again.
 """
 from __future__ import annotations
 
@@ -1077,6 +1078,178 @@ async def test_flowtable_offload_table_reload(rig):
                               "crowded": crowded["stderr"]})
 
 
+async def latch_barrier_failure(r):
+    """Invalidate with the table still bound: fail the retirement barrier of
+    both directions' deletes, which the flowtable's own teardown issues once
+    the connection is removed. The worker's own barrier is not failed, so the
+    invalidation drains completely."""
+    knob = "/proc/fm_ehash_hcsync_fail"
+    before = await r.state()
+    result = await r.target.fs_write(r.session, knob, "2")
+    assert result["errno"] == 0, result
+    try:
+        await r.clear_ct()
+        latched = await r.wait(lambda s: s["invalidation_done"] == 1 and s["entries"] == 0)
+        assert (await read(r.target, r.session, knob)).strip() == "armed=0"
+    finally:
+        result = await r.target.fs_write(r.session, knob, "0")
+        assert result["errno"] == 0, result
+    assert latched["invalidated"] == 1 and latched["errors"] - before["errors"] == 2, (before, latched)
+    assert latched["fatal"] == latched["quarantine"] == 0, latched
+    assert latched["bindings"] == before["bindings"] and latched["rearm_ready"] == 0, latched
+    assert latched["handle_refs"] == latched["neighbour_refs"] == 0, latched
+    return latched
+
+
+async def rearm_ready(r, timeout=10):
+    """Whether a bind would rearm now, polled until the bound: r.wait() for a
+    cleanup, which answers rather than fails. A fatal adapter never becomes
+    ready, so it is not waited for."""
+    deadline = time.monotonic() + timeout
+    while True:
+        state = await r.state()
+        if state["rearm_ready"]:
+            return True
+        if state["fatal"] or time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.1)
+
+
+async def hardware_proof(r, count=256):
+    """The flow's both directions in hardware: exact per-entry hits, conntrack
+    reporting it as hardware-offloaded, and next to nothing sent by the CPU."""
+    installed = await r.state()
+    assert installed["entries"] == 2, installed
+    baseline = {f["cookie"]: int(f["packets"]) for f in installed["flows"]}
+    tx_before = {d: await kernel_tx_packets(r.target, r.session, d) for d in (TARGET_LAN_IF, TARGET_WAN_IF)}
+    await r.exchange(count, promiscuous=False)
+    final = await r.state()
+    tx_after = {d: await kernel_tx_packets(r.target, r.session, d) for d in tx_before}
+    assert {f["cookie"]: int(f["packets"]) - baseline[f["cookie"]] for f in final["flows"]} == \
+        {c: count for c in baseline}, (installed, final)
+    for dev in tx_before:
+        assert 0 <= tx_after[dev] - tx_before[dev] <= 64, (dev, tx_before, tx_after)
+    listing = await ct_listing(r)
+    assert "[HW_OFFLOAD]" in listing, listing
+    return final
+
+
+async def test_flowtable_offload_reload_invalidated(rig):
+    """An atomic reload while an invalidation is latched goes through, and the
+    reloaded table takes hardware over by itself.
+
+    Netfilter binds a reload's new flowtable while the invalidated one is still
+    bound. That bind used to be refused, which failed the consumer's whole
+    firewall reload -- every fw4 reload, once anything had invalidated -- and
+    left hardware offload unrecoverable without a separate detach. The adapter
+    parks it instead: bound and counted, declining every flow, until the old
+    bindings are gone and the hardware has drained, and then makes it live in
+    the same transaction. Two shapes of reload:
+
+      - fw4's, where the old flowtable goes in the same transaction: admission
+        reopens at its commit and the next packets enter hardware;
+      - one where the old table outlives the reload: the flow forwards in
+        software through the parked table, and returns to hardware once the
+        old table is deleted, with no further change to the new one."""
+    r = rig
+    if (await r.state())["observe"]:
+        pytest.skip("the reload proof requires installed hardware")
+    replacement = f"{TABLE}_next"
+    try:
+        await r.table()
+        await r.exchange()
+        await r.wait(lambda s: s["entries"] == 2)
+        latched = await latch_barrier_failure(r)
+        assert latched["bindings"] == 2 and latched["parked"] == 0, latched
+
+        # fw4's own reload: the flowtable is deleted and declared again in one
+        # transaction, inside a table that survives it.
+        reload = (f"table inet {TABLE}\nflush table inet {TABLE}\n"
+                  f"delete flowtable inet {TABLE} fast\n" + r.ruleset())
+        reloaded = await command(r.target, r.session, "nft", reload, check=False)
+        assert reloaded["rc"] == 0 and not reloaded["stderr"], reloaded
+        rearmed = await r.state()
+        assert rearmed["bindings"] == 2 and rearmed["parked"] == 0, rearmed
+        assert rearmed["invalidated"] == rearmed["invalidation_done"] == rearmed["rearm_ready"] == 0, rearmed
+        assert rearmed["rearms"] == latched["rearms"] + 1 and rearmed["errors"] == latched["errors"], rearmed
+        await r.exchange()
+        await r.wait(lambda s: s["entries"] == 2)
+        reopened = await hardware_proof(r)
+        r.record("reload-invalidated-fw4", {"latched": latched, "rearmed": rearmed,
+                                            "hardware": reopened, "nft": reloaded})
+
+        # The old table outlives the reload: the replacement is added and the
+        # old chain emptied in one transaction, leaving the old flowtable
+        # bound. The connection was removed to latch the invalidation, so the
+        # next packet makes a new one, and only the replacement offers it.
+        latched = await latch_barrier_failure(r)
+        takeover = f'''table inet {replacement} {{
+ flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; }}
+ chain forward {{ type filter hook forward priority 0; policy accept;
+ ip saddr {r.lan_ip} ip daddr {WAN_IP} {r.proto} sport {SPORT} {r.proto} dport {DPORT} flow add @fast
+ }}
+}}
+flush chain inet {TABLE} forward'''
+        moved = await command(r.target, r.session, "nft", takeover, check=False)
+        assert moved["rc"] == 0 and not moved["stderr"], moved
+        parked = await r.state()
+        assert parked["bindings"] == 4 and parked["parked"] == 2, parked
+        assert parked["invalidated"] == 1 and parked["rearms"] == latched["rearms"], parked
+        software_before = await kernel_tx_packets(r.target, r.session, TARGET_LAN_IF)
+        await r.exchange(64, promiscuous=False)
+        software_after = await kernel_tx_packets(r.target, r.session, TARGET_LAN_IF)
+        carried = await r.state()
+        listing = await ct_listing(r)
+        # The replacement's software fast path carried it, declined by the
+        # parked bindings rather than by anything about the flow.
+        assert "[OFFLOAD]" in listing and "[HW_OFFLOAD]" not in listing, listing
+        assert software_after - software_before >= 64, (software_before, software_after)
+        assert carried["entries"] == 0 and carried["installs"] == latched["installs"], carried
+        assert carried["rejects"] > parked["rejects"] and carried["parked"] == 2, carried
+        assert carried["invalidated"] == 1 and carried["errors"] == latched["errors"], carried
+
+        # Deleting the old table releases its last binding, which is what the
+        # parked ones waited for. Nothing touches the replacement.
+        await command(r.target, r.session, "nft", "delete", "table", "inet", TABLE)
+        live = await r.state()
+        assert live["bindings"] == 2 and live["parked"] == 0, live
+        assert live["invalidated"] == live["invalidation_done"] == 0, live
+        assert live["rearms"] == latched["rearms"] + 1 and live["errors"] == latched["errors"], live
+        # Netfilter offers a software flow again on its next refresh, at most
+        # once a second under traffic, so keep it flowing until it is taken.
+        # With an XFRM policy anywhere in the namespace the software fast path
+        # is bypassed and the offer waits for the flow to expire, so allow for
+        # the 30-second flowtable timeout too.
+        deadline = time.monotonic() + 45
+        while True:
+            await r.exchange(32, promiscuous=False)
+            admitted = await r.state()
+            if admitted["entries"] == 2:
+                break
+            assert time.monotonic() < deadline, admitted
+        final = await hardware_proof(r)
+        assert final["errors"] == latched["errors"] and final["fatal"] == final["quarantine"] == 0, final
+        assert final["invalidated"] == 0 and final["rearms"] == live["rearms"], final
+        r.record("reload-invalidated-outlived", {"latched": latched, "parked": parked,
+                                                 "carried": carried, "conntrack": listing,
+                                                 "software_lan_tx": software_after - software_before,
+                                                 "live": live, "admitted": admitted, "final": final})
+    finally:
+        await command(r.target, r.session, "nft", "delete", "table", "inet", replacement, check=False)
+        left = await r.delete_table()
+        # A failure between a latch and its rearm would leave the next test's
+        # fixture an invalidation with nothing bound. The next bind clears it,
+        # so make one and give it back -- but only one the adapter can rearm
+        # on: a fatal adapter binds passively, and a quarantine holds the
+        # rearm until its barrier completes. Either way this runs because
+        # something already failed, and a rebind that cannot finish would
+        # replace that error with its own.
+        if left["invalidated"] and not left["fatal"] and await rearm_ready(r):
+            await r.table()
+            await r.wait(lambda s: not s["invalidated"])
+            await r.delete_table()
+
+
 async def ct_counts(r):
     """(packets, bytes) conntrack has accounted to each direction of the flow,
     original first."""
@@ -1318,16 +1491,20 @@ print(json.dumps(states))
             assert stopped["errors"] - live["errors"] == 1, stopped
             assert stopped["entries"] == stopped["bindings"] == stopped["quarantine"] == 0, stopped
             assert stopped["rearm_ready"] == 0, stopped
+            # A hardware table can still be created -- refusing it would fail
+            # a consumer's whole firewall transaction -- but its ports are
+            # bound passively: no binding, no admission, no rearm.
             await console_command(con, "nft", "add", "table", "inet", TABLE)
             attempted = await console_command(con, "nft", f"add flowtable inet {TABLE} fast {{ "
                                   f"hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; "
                                   "flags offload; }", check=False)
-            assert attempted["rc"] != 0 and "Operation not supported" in attempted["stdout"], attempted
+            assert attempted["rc"] == 0, attempted
             refused = status_text((await console_command(con, "cat", "/proc/cdx_flowtable"))["stdout"].strip())
             assert refused["fatal"] == refused["invalidated"] == refused["invalidation_done"] == 1
-            assert refused["bindings"] == refused["entries"] == refused["rearm_ready"] == 0
+            assert refused["bindings"] == refused["parked"] == refused["entries"] == refused["rearm_ready"] == 0
+            assert refused["passive"] == stopped["passive"] + 2, (stopped, refused)
             assert refused["rearms"] == live["rearms"] and refused["errors"] == stopped["errors"]
-            r.record("unlink-rearm-refused", {"state": refused, "nft": attempted})
+            r.record("unlink-rearm-passive", {"state": refused, "nft": attempted})
             await console_command(con, "nft", "delete", "table", "inet", TABLE)
             ports = await console_python(con, port_script)
             assert json.loads(ports["stdout"]) == {"6": 0, "7": 0}, ports

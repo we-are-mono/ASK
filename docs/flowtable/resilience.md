@@ -655,6 +655,68 @@ encoder. The [hardware investigation](multicast-hardware.md) records
 the relevant NXP manuals and diagnostic action sequences; those experiments
 do not count as passing recovery coverage.
 
+## Atomic reload during invalidation
+
+A consumer that reloads atomically binds its new flowtable while the old one is
+still bound: Netfilter binds at prepare and releases the old table only at
+commit. fw4 reloads this way. After a global invalidation the adapter used to
+refuse that bind until every old binding had gone, and Netfilter propagated the
+refusal, so every later fw4 reload failed outright and hardware offload could
+never rearm. Only a consumer that deleted, drained and re-added in separate
+transactions recovered, which the ask-flowtable daemon does.
+
+A bind the hardware cannot take now never fails the transaction:
+
+| Condition at bind | Binding | Flows |
+| --- | --- | --- |
+| Invalidation latched, old bindings still bound or hardware not drained | Parked: counted in `bindings` and `parked`, every flow declined | Software, until rearm |
+| Invalidation latched and drained | Rearmed at once, as the first bind after a detach always was | Hardware |
+| Terminal deletion failure (fresh boot required) | Passive (`passive`), never rearmed | Software |
+| Past the binding bound | Passive | Software |
+| First binding after a detach, candidate table not empty | Refused, as before | - |
+
+Rearm happens in the backend transaction of whichever event completes the
+drain: the release of the last binding that was live at the invalidation (the
+commit of an atomic reload), the worker publishing `invalidation_done`, or the
+parking bind itself. It makes every parked binding live, clears the
+invalidation and counts one `rearms`. A declined flow keeps a valid handle, so
+Netfilter's next refresh, at most a second later under traffic, offers it
+again and it enters hardware with no reload. While an XFRM policy exists
+Netfilter bypasses the software fast path, so the offer waits for the flow to
+expire, up to the 30-second flowtable timeout. If only an unproven hardware
+deletion remains, the parked binding retries that barrier every second until it
+completes. Terminal failure and the binding bound are passive rather than parked
+because nothing in the boot lifts them. A parked binding would wait for a rearm
+that never comes, and one past the bound could not be flushed by the
+invalidation worker.
+
+A parked table keeps making software flows, so the latch cannot simply absorb
+a global event raised meanwhile, as it does when nothing is parked. Such an
+event is counted, `invalidation_done` reads 0 again, and the worker runs another
+pass that flushes the bound devices' flows before anything goes live. A parking
+bind into a table that already holds flows, a device added to it, is counted
+the same way, since those flows may predate the latch. The rearm clears the
+latch before its last look at the count, so an event a notifier counts at that
+moment keeps the table parked for its own pass.
+
+[Host coverage](../../tools/host_tests/flowtable.c) (`test_rearm`,
+`test_parked_rearm`) checks parking against every condition that holds a rearm
+back. It also checks that a parked binding declines a flow without touching its
+handle or RTNL, and that each of the three events rearms at the right moment.
+An event raised while parked, one counted in the rearm's last window, and a
+non-empty table joining must each wait for a flushing pass, and a stale pass
+must do nothing. Both passive cases, a third table's refusal and reference and
+allocation balance on every path are covered too. The
+[rig case](../../tools/tests/test_flowtable_offload.py)
+`test_flowtable_offload_reload_invalidated` latches an invalidation by failing
+both deletions' retirement barriers with the table bound, then performs fw4's
+reload. The reload must commit and admission must reopen at commit, with exact
+hardware counters afterwards. It then latches again and replaces the table
+while the old one stays bound. The flow must forward through the parked table's
+software path (conntrack `[OFFLOAD]`, CPU transmit, parked refusals counted),
+and return to hardware with exact counters once the old table is deleted. No
+further change to the new table is allowed. Hardware validation is pending.
+
 ## Coverage before this slice
 
 The following observations motivated the work:
@@ -671,6 +733,8 @@ The following observations motivated the work:
   Their explicit table recreation and cleanup prove those operations, rather
   than autonomous service recovery. Global invalidation deliberately requires
   a fresh binding/reconciliation boundary; recovery must preserve that barrier.
+  An atomic reload is such a boundary once the old bindings are gone (see
+  [above](#atomic-reload-during-invalidation)).
 - The [homelab profile](../../tools/tests/test_profile_homelab.py) explicitly
   reapplies policy after bridge VLAN-membership invalidation. That is useful
   lifecycle coverage. The separate service bridge test above establishes

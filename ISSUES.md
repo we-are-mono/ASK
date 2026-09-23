@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A237.** A flowtable bound while an invalidation was latched was refused, so every atomic reload (fw4's included) failed whole and offload never rearmed —
+  fixed (_:/^flowtable: park binds made during an invalidation instead of refusing them_).
+
 - [x] **A219.** ask-flowtable took a second flowtable bound beside its own for a table to repair, and replaced its own into a drain the other held up —
   fixed (_:/^flowtable: keep the daemon's table while another is bound beside it_).
 

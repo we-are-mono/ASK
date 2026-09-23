@@ -332,13 +332,26 @@ its final state change. This is distinct from selective generation retirement.
 An unproven hardware unlink also latches provider terminal failure.
 
 Healthy global recovery requires zero old bindings, entries, handle/neighbour
-references and retirement quarantine, completed invalidation work, and an empty
-candidate Linux flowtable. `rearm_ready=1` reports eligibility. The first
-successful binding clears healthy invalidation and increments `rearms`; failure
-to allocate a binding does neither. Counters remain cumulative. A table whose
-hooks were detached can still contain cached flows, so pointer identity or
-reattachment alone is insufficient. Binding never waits for the worker while
-holding Netfilter locks. No recovery operation clears terminal failure.
+references and retirement quarantine, and completed invalidation work. A binding
+made while an invalidation is latched is parked rather than refused: it counts
+in `bindings` and `parked` and declines every flow, so the consumer's
+transaction commits with its flows in software. Recovery makes every parked
+binding live, clears the invalidation and increments `rearms`, in the same
+backend transaction as the event that completed it: the release of the last old
+binding (an atomic reload's commit), the worker publishing `invalidation_done`,
+or the parking bind itself when nothing is left to wait for. While only an
+unproven deletion remains, the parked binding retries that barrier every second.
+A global event raised while anything is parked, or a parking bind into a table
+that already holds flows, is counted and needs a further worker pass: a parked
+table's software flows are flushed before it goes live. Netfilter's refresh
+offers the parked tables' flows again, so they enter hardware with no reload. `rearm_ready=1` reports eligibility; failure to
+allocate a binding neither parks nor rearms. Counters remain cumulative. The
+first binding after a full detach still requires an empty candidate flowtable: a
+table whose hooks were detached can still contain cached flows, so pointer
+identity or reattachment alone is insufficient. Binding never waits for the
+worker while holding Netfilter locks. No recovery operation clears terminal
+failure; after one, and past the binding bound, a bind is accepted passively
+(`passive`) so the transaction still commits.
 
 ## Hardware deletion and shutdown
 
