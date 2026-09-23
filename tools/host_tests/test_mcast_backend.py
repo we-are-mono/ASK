@@ -164,11 +164,11 @@ def test_replace_keeps_the_key_in_the_classifier():
 
 def test_replace_drains_what_it_parks():
     """The displaced chain is parked, and in this ownership mode nothing else
-    would ever release it: the FCI mcast mutators never run, and cdx_ft_hw_del()
-    frees entries directly without touching the quarantine. Membership changes
-    whenever anyone changes channel, so an undrained backlog grows by a chain
-    per change until the entry pool is exhausted -- which fails every classifier
-    insert, not just multicast.
+    is bound to release it soon: the FCI mcast mutators never run, and the
+    flowtable backend issues a barrier only when it deletes or is waiting on
+    the backlog. Membership changes whenever anyone changes channel, so an
+    undrained backlog grows by a chain per change until the entry pool is
+    exhausted -- which fails every classifier insert, not just multicast.
     """
     body = code("cdx_mc_group_replace")
     park = body.index("cdx_ehash_quarantine_entry(")
@@ -183,6 +183,21 @@ def test_replace_drains_what_it_parks():
     assert re.search(r"if \(mc_hcsync\([^)]*\)\)\s*\{\s*DPA_ERROR\([^;]*;\s*\}\s*else\s*\{\s*"
                      r"cdx_ehash_quarantine_free_all\(\);\s*\}", body[park:]), (
         "a failed barrier must leave the displaced chain parked")
+
+
+def test_a_withdrawn_group_parks_against_its_own_table():
+    """Every parked entry records the table it left, so a waiter with no table
+    of its own can issue the barrier through it. A group's members are parked
+    after the delete that frees the group's hw_ct, which is where the table is
+    named, so it has to be read before that delete and handed over."""
+    body = code("cdx_mcast_group_destroy")
+    read = body.index("->ct->td")
+    assert read < body.index("delete_entry_from_classif_table("), (
+        "the table must be read before the delete frees the hw_ct holding it")
+    assert "mc_quarantine_members(pMcastGrpInfo, td)" in body
+    members = code("mc_quarantine_members")
+    assert "cdx_ehash_quarantine_entry(td," in members and "->ct" not in members, (
+        "members are parked against the table they were given, not one read now")
 
 
 def test_a_group_is_keyed_on_its_device_not_its_name():

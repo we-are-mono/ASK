@@ -837,8 +837,9 @@ static bool cdx_ft_failed(void) { return ft_fatal; }
 static bool cdx_ft_observing(void) { return ft_observe; }
 static unsigned cdx_ft_pending(void) { return private_pending + legacy_pending; }
 /* The barrier a retry issues, and whether it completes. A completed one proves
- * the backend's own retired deletions; CDX's parked ones stay until one of its
- * own paths releases them. */
+ * every deletion before it, the backend's own and those CDX parked for itself,
+ * so both pending counts go with it. A failed one leaves both, and reports
+ * failure only for the backend's own, as the backend does. */
 static unsigned recoveries;
 static bool barrier_fails;
 static int cdx_ft_recover(void)
@@ -851,8 +852,8 @@ static int cdx_ft_recover(void)
         if (rc) return -EAGAIN;
     }
     if (!barrier_fails)
-        private_pending = 0;
-    return retry_error;
+        private_pending = legacy_pending = 0;
+    return barrier_fails && private_pending ? -EAGAIN : retry_error;
 }
 /* The parked rearm's retry is counted apart from the invalidation worker's,
  * so a case can say which of the two was asked to come back. */
@@ -4632,10 +4633,11 @@ static void test_rearm(void)
         assert(!can_rearm());
         park_and_leave(&in, rearms + cycle);
         assert(recoveries == tries + 1 && rearm_retries == retries + 1);
-        private_pending = 0; legacy_pending = 1; barrier_fails = false;
+        /* CDX's own parked backlog, the same way. */
+        private_pending = 0; legacy_pending = 1;
         park_and_leave(&in, rearms + cycle);
         assert(recoveries == tries + 2 && rearm_retries == retries + 2);
-        legacy_pending = 0; ft_stopping = true;
+        legacy_pending = 0; barrier_fails = false; ft_stopping = true;
         assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
         ft_stopping = false; ft_ready = false;
         assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
@@ -6148,12 +6150,12 @@ static void test_parked_rearm(void)
     assert(!bound_to(&block, &in)->parked && !bound_to(&block, &out)->parked);
 
     /* A deletion CDX parked for a path of its own. Nothing the adapter does
-     * completes it, so the parked binding retries the barrier every second
-     * until something releases it. */
+     * completes it, so the parked binding retries the barrier every second,
+     * and the retry that completes one releases the backlog and rearms. */
     ft_invalidate();
     ft_invalidate_work(NULL);
     assert(ft_invalid && ft_invalid_done);
-    legacy_pending = 1;
+    legacy_pending = 1; barrier_fails = true;
     tries = recoveries; retries = rearm_retries;
     assert(bind_to(&in, FLOW_BLOCK_BIND, &next_table, &next_block) == 0);
     /* Not while a live binding is still in the way. */
@@ -6164,10 +6166,11 @@ static void test_parked_rearm(void)
     assert(ft_parked == 1 && ft_invalid && recoveries == tries + 1 && rearm_retries == retries + 1);
     ft_rearm_workfn(NULL);
     assert(ft_parked == 1 && ft_invalid && recoveries == tries + 2 && rearm_retries == retries + 2);
-    legacy_pending = 0;
+    assert(legacy_pending == 1);
+    barrier_fails = false;
     ft_rearm_workfn(NULL);
-    assert(!ft_parked && !ft_invalid && ft_rearms == rearms + 3);
-    assert(recoveries == tries + 2 && rearm_retries == retries + 2);
+    assert(!ft_parked && !ft_invalid && ft_rearms == rearms + 3 && !legacy_pending);
+    assert(recoveries == tries + 3 && rearm_retries == retries + 2);
     /* A retry that was already queued finds nothing left to do. */
     ft_rearm_workfn(NULL);
     assert(ft_rearms == rearms + 3 && rearm_retries == retries + 2);

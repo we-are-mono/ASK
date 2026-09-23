@@ -1081,8 +1081,10 @@ int cdx_free_exthash_mcast_members(struct mcast_group_info *pMcastGrpInfo)
  * entries go into the quarantine instead of back to the allocator,
  * because no HC barrier has proven the ucode is done walking them.
  * Slots are cleared so nothing can reach the parked memory through the
- * group again - the group itself is freed right after. */
-static void mc_quarantine_members(struct mcast_group_info *pMcastGrpInfo)
+ * group again - the group itself is freed right after. td is the group's
+ * classifier table, which the caller has to read before the delete that
+ * frees the group's hw_ct. */
+static void mc_quarantine_members(struct mcast_group_info *pMcastGrpInfo, void *td)
 {
 	unsigned int ii;
 
@@ -1090,7 +1092,7 @@ static void mc_quarantine_members(struct mcast_group_info *pMcastGrpInfo)
 	{
 		if (!pMcastGrpInfo->members[ii].bIsValidEntry)
 			continue;
-		cdx_ehash_quarantine_entry(pMcastGrpInfo->members[ii].tbl_entry);
+		cdx_ehash_quarantine_entry(td, pMcastGrpInfo->members[ii].tbl_entry);
 		pMcastGrpInfo->members[ii].tbl_entry = NULL;
 		pMcastGrpInfo->members[ii].bIsValidEntry = 0;
 	}
@@ -1116,8 +1118,13 @@ static void mc_quarantine_members(struct mcast_group_info *pMcastGrpInfo)
 static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 {
 	uint8_t mac[ETH_ALEN];
+	void *td;
 	int rc;
 
+	/* The table the members may have to be parked against, read before
+	 * the delete below frees the hw_ct that holds it. */
+	td = pMcastGrpInfo->pCtEntry && pMcastGrpInfo->pCtEntry->ct ?
+		pMcastGrpInfo->pCtEntry->ct->td : NULL;
 	/* Delete entry in ct table */
 	rc = delete_entry_from_classif_table(pMcastGrpInfo->pCtEntry);
 	if (rc == SUCCESS)
@@ -1146,7 +1153,7 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 		 * releasing its software-only hw_ct wrapper, is
 		 * delete_entry_from_classif_table()'s job (ISSUES.md A95). */
 		FreeMcastGrpID(pMcastGrpInfo->mctype, pMcastGrpInfo->grpid);
-		mc_quarantine_members(pMcastGrpInfo);
+		mc_quarantine_members(pMcastGrpInfo, td);
 	}
 	else
 	{
@@ -1619,7 +1626,7 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 			 * property of the HC channel, not of this listener,
 			 * so every remaining member would fail the same way
 			 * and pile up more quarantined entries. */
-			cdx_ehash_quarantine_entry(tbl_entry);
+			cdx_ehash_quarantine_entry(pMcastGrpInfo->pCtEntry->ct->td, tbl_entry);
 			return -1;
 		}
 		ExternalHashTableEntryFree(tbl_entry);
@@ -2533,7 +2540,8 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 
 		for (ii = 0; ii < MC_MAX_LISTENERS_PER_GROUP; ii++)
 			if (old[ii].bIsValidEntry)
-				cdx_ehash_quarantine_entry(old[ii].tbl_entry);
+				cdx_ehash_quarantine_entry(grp->pCtEntry->ct->td,
+							   old[ii].tbl_entry);
 	}
 	/* And the barrier proving the microcode has left the chain just
 	 * unlinked, which releases it and anything parked before it, so the

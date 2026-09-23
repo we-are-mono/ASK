@@ -390,6 +390,27 @@ void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 	stats->lastused = hw->entry.ct->timestamp;
 }
 
+/* Everything unlinked before a barrier that has just completed: the retired
+ * entries still waiting on one, and the entries CDX parked for paths of its
+ * own. LS1046A runs a single FMan PCD, so a sync issued through any table
+ * proves them all; cdx_ft_claim() refuses a configuration spanning more than
+ * one, where it would not. A possibly linked key -- any other delete_rc -- is
+ * never released: no barrier makes freeing it safe. */
+static void ft_hw_release_synced(void)
+{
+	struct cdx_ft_hw *hw, *next;
+
+	list_for_each_entry_safe(hw, next, &ft_retired, retired) {
+		if (hw->delete_rc != EN_EHASH_DELETE_UNSYNCED)
+			continue;
+		ExternalHashTableEntryFree(hw->entry.ct->handle);
+		kfree(hw->entry.ct);
+		list_del(&hw->retired);
+		kfree(hw);
+	}
+	cdx_ehash_quarantine_free_all();
+}
+
 int cdx_ft_hw_del(struct cdx_ft_hw **entry)
 {
 	struct cdx_ft_hw *hw = *entry;
@@ -409,6 +430,9 @@ int cdx_ft_hw_del(struct cdx_ft_hw **entry)
 		ExternalHashTableEntryFree(ct->handle);
 		kfree(ct);
 		kfree(hw);
+		/* DeleteKey synced the PCD before reporting success, after
+		 * every earlier unlink, so the same barrier settles those. */
+		ft_hw_release_synced();
 		return 0;
 	}
 	hw->delete_rc = rc;
@@ -429,25 +453,35 @@ unsigned int cdx_ft_hw_pending(void)
 	return n;
 }
 
+/* One barrier, since one proves every unlink before it: through the first
+ * retired entry still waiting on one, or, with none, through CDX's own parked
+ * backlog, which the backend waits on as well (cdx_ft_pending()) and which
+ * nothing else would release until an unrelated delete happened to sync.
+ *
+ * Returns -EAGAIN while one of the backend's own retirements is unproven:
+ * that barrier failed, or a hard failure remains, which is never retried --
+ * a second unlink would walk pointers the first one already advanced -- and
+ * only quiescence settles. CDX's backlog is released on the same success but
+ * does not hold this up: it is not the backend's, and the callers that wait
+ * on it read cdx_ft_pending() themselves. */
 int cdx_ft_hw_retry(void)
 {
-	struct cdx_ft_hw *hw, *next;
-	int rc = 0;
+	struct cdx_ft_hw *hw;
+	void *td = NULL;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
-	list_for_each_entry_safe(hw, next, &ft_retired, retired) {
-		/* Never attempt a second unlink, including after a hard error. */
-		if (hw->delete_rc != EN_EHASH_DELETE_UNSYNCED ||
-		    ExternalHashTableFmPcdHcSync(hw->entry.ct->td)) {
-			rc = -EAGAIN;
-			continue;
+	list_for_each_entry(hw, &ft_retired, retired)
+		if (hw->delete_rc == EN_EHASH_DELETE_UNSYNCED) {
+			td = hw->entry.ct->td;
+			break;
 		}
-		ExternalHashTableEntryFree(hw->entry.ct->handle);
-		kfree(hw->entry.ct);
-		list_del(&hw->retired);
-		kfree(hw);
-	}
-	return rc;
+	if (!td)
+		cdx_ehash_quarantine_retry();
+	else if (ExternalHashTableFmPcdHcSync(td))
+		return -EAGAIN;
+	else
+		ft_hw_release_synced();
+	return list_empty(&ft_retired) ? 0 : -EAGAIN;
 }
 
 /* Caller has stopped and detached all classifier ports. Unlinked storage can

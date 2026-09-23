@@ -115,7 +115,26 @@ int cdx_ft_claim(void)
 	cdx_ft_assert_held();
 	if (ft_failed)
 		return -EOPNOTSUPP;
-	if (ft_claimed || ft_live || cdx_ft_pending())
+	/* Parked ehash storage is released on any completed sync, as one
+	 * barrier on the single FMan PCD proves every unlink before it
+	 * (ft_hw_release_synced(), cdx_ehash.c). With two PCDs it would free
+	 * entries the other's walkers may still hold, so refuse to own
+	 * hardware there. LS1046A has one; sealing the config below keeps a
+	 * second from arriving later. The count is the loader's, so this is
+	 * a configuration to refuse, not a kernel bug to trace. */
+	if (dpa_get_num_fmans() > 1) {
+		pr_warn_once("cdx flowtable: the DPA configuration spans %u FMans; hardware offload supports one\n",
+			     dpa_get_num_fmans());
+		return -EOPNOTSUPP;
+	}
+	if (ft_claimed || ft_live)
+		return -EBUSY;
+	/* A deletion still waiting on its barrier -- this backend's, or one
+	 * CDX parked for a path of its own -- is retried here rather than
+	 * left to refuse the load until some unrelated delete syncs. */
+	if (cdx_ft_pending())
+		cdx_ft_hw_retry();
+	if (cdx_ft_pending())
 		return -EBUSY;
 	ft_claimed = true;
 	WRITE_ONCE(ft_config_sealed, true);
@@ -239,6 +258,23 @@ bool cdx_ft_egress_supported(struct net_device *dev)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_egress_supported, ASK_CDX_FLOWTABLE);
 
+/* A deletion waiting on its barrier refuses every new entry in cdx_ft_add(),
+ * and while no invalidation is in progress nothing else retries it: least of
+ * all one CDX parked for a multicast or IPsec delete, which only another delete
+ * of that kind would otherwise release. So admission retries it itself, at
+ * most once a second: a sync under RTNL can busy-wait on the host-command
+ * channel, and a wedged channel would otherwise be asked once per offered
+ * flow. */
+static unsigned long ft_retry_at;
+
+static void cdx_ft_retry_pending(void)
+{
+	if (ft_retry_at && time_before(jiffies, ft_retry_at))
+		return;
+	ft_retry_at = jiffies + HZ;
+	cdx_ft_hw_retry();
+}
+
 int cdx_ft_add(const struct cdx_ft_rule *rule,
 	       const struct cdx_ft_stats_binding *stats,
 	       struct cdx_ft_hw **result)
@@ -248,6 +284,8 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
 	cdx_ft_assert_held();
 	ASSERT_RTNL();
 	*result = NULL;
+	if (!ft_failed && cdx_ft_pending())
+		cdx_ft_retry_pending();
 	/* The adapter validates tuple/NAT eligibility, including same-port
 	 * hairpin routing. The provider rechecks physical device state. */
 	if (!ft_claimed || ft_failed || ft_observe || cdx_ft_pending() ||

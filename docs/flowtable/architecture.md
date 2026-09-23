@@ -366,6 +366,18 @@ of retirement. The failure path uses the already allocated backend owner and
 requires no allocation. CDX accounts for pending retirement after adapter claim
 release and refuses a new claim while it remains unsafe.
 
+Pending retirement includes entries CDX parked for its own paths: a multicast
+group delete or listener swap, or an IPsec SA delete, whose barrier failed. The
+backend refuses a claim and every new entry while any remain. One completed
+barrier proves every unlink before it, because the SoC runs a single FMan PCD.
+So a successful backend delete, or a backend retry through either list,
+releases the backend's retired entries and CDX's parked ones together; CDX's
+own barriers release only its own. The waiters retry that barrier
+themselves: a claim once per attempt, admission at most once a second, the
+unload loop and invalidation worker on each pass, and a parked binding every
+second. A parked backlog therefore no longer waits for an unrelated delete of
+the same kind. A key that may still be linked is never released by a barrier.
+
 Terminal recovery stops the datapath; completion does not establish usable
 software fallback. A provider `NETDEV_PRE_UP` guard prevents physical ports
 from restarting while that CDX instance retains unproven hardware state. The

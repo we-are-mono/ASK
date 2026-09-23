@@ -1297,7 +1297,15 @@ void *dpa_get_pcdhandle(uint32_t fm_index)
 	}
 	return NULL;
 }
-EXPORT_SYMBOL(dpa_get_pcdhandle); 
+EXPORT_SYMBOL(dpa_get_pcdhandle);
+
+/* The FMans, and so the FMan PCDs, the installed configuration spans. Every
+ * write of the count holds the control mutex, so a holder reads a settled one. */
+uint32_t dpa_get_num_fmans(void)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	return num_fmans;
+}
 
 //get channel and workque id infor given a fqid
 int dpa_get_tx_chnl_info(uint32_t fqid, uint32_t *ch_id, uint32_t *wq_id)

@@ -494,19 +494,28 @@ void hw_ct_get_active(struct hw_ct *ct)
  * One successful sync clears the whole backlog:
  * ExternalHashTableFmPcdHcSync() syncs the table handle's PCD, and
  * LS1046A runs a single FMAN PCD, so a success reached via any table or
- * any flow is a valid barrier for every entry unlinked before it.
+ * any flow is a valid barrier for every entry unlinked before it. With a
+ * second PCD it would not be. Every entry that reaches here was programmed
+ * through the flowtable backend (comcerto_fpp_send_command() refuses every
+ * FCI command), and its cdx_ft_claim() refuses such a configuration.
+ *
+ * Each parked entry records the table it was unlinked from, so the backlog
+ * can issue its own barrier (cdx_ehash_quarantine_retry()) for a caller
+ * that has no table to hand: the flowtable backend refuses admission while
+ * anything is parked, and would otherwise wait on some unrelated delete.
  *
  * Concurrency: the quarantine carries no lock of its own. Every touch
  * runs either from an FCI command handler - serialized by ctrl.mutex in
  * cdx_cmdhandler.c, with the multicast callers additionally holding
- * mc_mutators_mutex - from the CT aging kthread, which takes that same
- * ctrl.mutex, or from module exit with no handler in flight. The query
- * walkers never see it, so no softirq-safe variant is needed. Callers
- * must not hold a spinlock: the barriers reached from here busy-wait on
- * host-command completion.
+ * mc_mutators_mutex - from the CT aging kthread or the flowtable backend,
+ * which take that same ctrl.mutex, or from module exit with no handler in
+ * flight. The query walkers never see it, so no softirq-safe variant is
+ * needed. Callers must not hold a spinlock: the barriers reached from here
+ * busy-wait on host-command completion.
  */
 struct cdx_ehash_pending_free {
 	struct list_head list;
+	void *td;
 	void *tbl_entry;
 };
 
@@ -520,7 +529,10 @@ unsigned int cdx_ehash_quarantine_pending(void)
 	return READ_ONCE(cdx_ehash_pending_free_cnt);
 }
 
-void cdx_ehash_quarantine_entry(void *tbl_entry)
+/* td is the table tbl_entry was unlinked from. Any table on this PCD
+ * would do for the barrier; recording the entry's own keeps the handle
+ * one whose lifetime the entry already depended on. */
+void cdx_ehash_quarantine_entry(void *td, void *tbl_entry)
 {
 	struct cdx_ehash_pending_free *node;
 
@@ -539,6 +551,7 @@ void cdx_ehash_quarantine_entry(void *tbl_entry)
 				__func__, tbl_entry);
 		return;
 	}
+	node->td = td;
 	node->tbl_entry = tbl_entry;
 	list_add_tail(&node->list, &cdx_ehash_pending_frees);
 	/* WRITE_ONCE pairs with the debug proc reader's READ_ONCE - the
@@ -566,16 +579,18 @@ void cdx_ehash_quarantine_free_all(void)
 
 /* Module-exit disposition of a backlog no drain could clear. cdx does
  * NOT tear down the FMAN PCD on unload (sdk_fman owns it and stays
- * loaded), so there is no barrier here either: by this point every
- * teardown has already retried the sync and failed, meaning the HC
- * channel is wedged and the ucode may still be walking the parked
- * memory. Leaking a handful of entries at rmmod (test images only; cdx
- * is never unloaded in production) is the only safe terminal state. */
+ * loaded), so the only barrier left is one more sync of its own: nothing
+ * guarantees an earlier teardown tried one after the last entry was
+ * parked. If that fails too, the HC channel is wedged and the ucode may
+ * still be walking the parked memory. Leaking a handful of entries at
+ * rmmod (test images only; cdx is never unloaded in production) is then
+ * the only safe terminal state. The tables the entries name are still
+ * configured here: this runs before the DPA configuration is torn down. */
 void cdx_ehash_quarantine_abandon(void)
 {
 	struct cdx_ehash_pending_free *node, *tmp;
 
-	if (!READ_ONCE(cdx_ehash_pending_free_cnt))
+	if (!READ_ONCE(cdx_ehash_pending_free_cnt) || !cdx_ehash_quarantine_retry())
 		return;
 
 	DPA_ERROR("%s::HC channel never recovered, leaking %u quarantined entries\n",
@@ -614,6 +629,32 @@ void cdx_ehash_quarantine_drain(void *td)
 	cdx_ehash_quarantine_free_all();
 }
 
+/* The same retry for a caller with no table of its own to issue the
+ * barrier through: one sync through the first parked entry's recorded
+ * table. A direct sync, deliberately not routed through the multicast
+ * fault knob's funnel, so an armed knob never keeps a backlog alive.
+ * Returns 0 when nothing is parked any more, -EAGAIN when the sync
+ * failed and everything stays parked. Quiet on failure: the sync itself
+ * already logs, and a caller that retries on a timer should not add a
+ * line per attempt. */
+int cdx_ehash_quarantine_retry(void)
+{
+	struct cdx_ehash_pending_free *node;
+
+	list_for_each_entry(node, &cdx_ehash_pending_frees, list)
+	{
+		if (!node->td)
+			continue;
+		if (ExternalHashTableFmPcdHcSync(node->td))
+			return -EAGAIN;
+		cdx_ehash_quarantine_free_all();
+		return 0;
+	}
+	/* Nothing parked, or nothing that named a table to sync through:
+	 * the latter waits for a barrier from a caller that has one. */
+	return list_empty(&cdx_ehash_pending_frees) ? 0 : -EAGAIN;
+}
+
 /* Delete one key from an external hash table and dispose of its table
  * entry per the ExternalHashTableDeleteKey() tri-state (fm_ehash.h).
  *
@@ -650,7 +691,7 @@ int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle)
 	{
 		/* Out of the chain, but no proof the ucode has left it. Park
 		 * it for the next successful sync on this PCD. */
-		cdx_ehash_quarantine_entry(handle);
+		cdx_ehash_quarantine_entry(td, handle);
 		return rc;
 	}
 	/* Not provably unlinked, and there is no second unlink to retry: a

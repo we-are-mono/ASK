@@ -429,17 +429,20 @@ void hw_ct_get_active(struct hw_ct *ct);
  * The quarantine entry points below are for the paths that splice an
  * entry out by hand instead of calling DeleteKey (multicast listener
  * REMOVE/UPDATE in dpa_control_mc.c) and therefore have to place and
- * retire the barrier themselves.
+ * retire the barrier themselves, and for a waiter with no table of its
+ * own that needs the backlog released (cdx_ehash_quarantine_retry()).
  *
- * Serialization: no lock of their own. Callers run under the FCI
- * ctrl.mutex (cdx_cmdhandler.c) - the multicast ones additionally hold
+ * Serialization: no lock of their own. Callers run under ctrl.mutex -
+ * the FCI dispatch, the CT aging kthread and the flowtable backend all
+ * take it, and the multicast mutators additionally hold
  * mc_mutators_mutex - or at module exit with no handler in flight. Not
  * callable under a spinlock: the barriers busy-wait on host-command
  * completion. */
 int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle);
-void cdx_ehash_quarantine_entry(void *tbl_entry);
+void cdx_ehash_quarantine_entry(void *td, void *tbl_entry);
 void cdx_ehash_quarantine_free_all(void);
 void cdx_ehash_quarantine_drain(void *td);
+int cdx_ehash_quarantine_retry(void);
 void cdx_ehash_quarantine_abandon(void);
 unsigned int cdx_ehash_quarantine_pending(void);
 

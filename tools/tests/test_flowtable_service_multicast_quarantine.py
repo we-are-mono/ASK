@@ -10,7 +10,13 @@ cases fail that barrier on purpose while a control group stands, and require:
     per listener for a delete, the displaced chain for a listener swap;
   - the control group and the survivors to keep replicating exactly, in
     hardware, while those entries are parked;
-  - the next good barrier to release every one of them.
+  - the next good barrier to release every one of them, including one the
+    flowtable backend issues itself when no multicast delete is left to.
+
+Any completed barrier on the PCD releases the backlog, so parked counts are
+read straight after the failure. The windows between stay exact because the
+cases that watch them run no unicast offload: no admission or unicast delete
+can sync there.
 
 The image is KASAN, and the splat window fails a case whose CPU touches memory
 the quarantine should have kept. A walker in the microcode is not something
@@ -25,15 +31,16 @@ armed, and both are disarmed on the way out whatever happened.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import time
 
 import pytest
 
-from _mcast_windows import (COUNT, bridge_settings, delivered, in_hardware, in_software, learn, mcast_rows, mdb,
-                            members, moved, mroute_row, multicast_rig, packets, stream,  # noqa: F401
-                            streamed, summary)
+from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware, in_software, learn,
+                            mcast_rows, mdb, members, moved, mroute_row, multicast_rig, packets,  # noqa: F401
+                            stream, streamed, summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
-from test_flowtable_offload import command, read
+from test_flowtable_offload import command, console_command, hardware_proof, read, rig  # noqa: F401
 from test_mcast_e2e import mcast_bridge, wan_source_address  # noqa: F401
 from test_mroute_capacity import _daemon
 
@@ -270,3 +277,75 @@ async def test_flowtable_service_multicast_quarantine_listener_swap(multicast_ri
             assert released["quarantine"] == 0, summary(released)
     finally:
         await topology.teardown("listener swap quarantine")
+
+
+async def test_flowtable_service_multicast_quarantine_released_without_multicast(multicast_rig, rig):
+    """The only group is withdrawn and its barrier fails, so no multicast
+    delete is left to release what it parked.
+
+    The flowtable backend refuses every new unicast entry, and the adapter's
+    load, while anything is parked, so it retries the barrier itself. A fresh
+    unicast flow's admission releases the backlog and is admitted, with no
+    multicast operation in between; parked a second time with nothing bound,
+    the adapter's unload releases it and the adapter loads again. Both used to
+    wait for an unrelated multicast or IPsec delete that might never come."""
+    m, r = multicast_rig, rig
+    group = GROUPS[4][0]
+    async with _daemon(r.target, r.session, [TARGET_WAN_IF, TARGET_LAN_IF]) as ctl:
+        learner = Routed(m, ctl, 4)
+
+        async def park(label):
+            await learner.add(group)
+            before = await m.proc()
+            assert before["quarantine"] == 0 and before["mroute_installed"] == 1, summary(before)
+            async with armed(m, DELETE_BARRIER, 1):
+                await learner.remove(group)
+                parked = await m.settle(lambda s: s["mroute_installed"] == 0,
+                                        f"{group} withdrawn from hardware before the {label}")
+                assert await remaining(m, DELETE_BARRIER) == "armed=0", "the delete never reached its barrier"
+            # The classifier key and its one listener entry, read before any
+            # later barrier on the PCD could release them.
+            assert learner.withdrawn(parked, group) and parked["quarantine"] == 2, summary(parked)
+            return parked
+
+        parked = await park("admission")
+        await r.table()
+        # Binding alone issues no barrier: the flow's admission has to.
+        bound = await r.state()
+        assert bound["quarantine"] == 2 and bound["entries"] == 0, bound
+        # Admission retries at most once a second, so a flow it declined is
+        # offered again on a later refresh: keep traffic flowing. An XFRM
+        # policy anywhere in the namespace bypasses the software fast path and
+        # defers that offer to the flow's 30-second expiry.
+        deadline = time.monotonic() + 45
+        while True:
+            await r.exchange(32, promiscuous=False)
+            admitted = await r.state()
+            if admitted["entries"] == 2:
+                break
+            assert time.monotonic() < deadline, admitted
+        assert admitted["quarantine"] == 0 and admitted["errors"] == parked["errors"], admitted
+        for counter in ("mroute_groups", "mroute_installed", "mcast_groups", "mcast_installed",
+                        "mroute_install_errors", "mcast_install_errors"):
+            assert admitted[counter] == parked[counter], (counter, summary(parked), summary(admitted))
+        admitted = await hardware_proof(r)
+        drained = await r.delete_table()
+        assert drained["quarantine"] == 0 and drained["errors"] == parked["errors"], drained
+
+        await park("reload")
+        console = await dut_console("quarantine-reload")
+        try:
+            await console_command(console, "rmmod", "ask_flowtable", timeout=30)
+            try:
+                # CDX's own read-back, the adapter's being gone with it.
+                between = await console_command(console, "cat", "/proc/cdx_mc_hcsync_fail")
+            finally:
+                loaded = await console_command(console, "modprobe", "ask_flowtable", timeout=30, check=False)
+        finally:
+            console.close()
+        assert "pending=0" in between["stdout"].split(), between
+        assert loaded["rc"] == 0, loaded
+        reloaded = await m.proc()
+        assert reloaded["quarantine"] == reloaded["fatal"] == reloaded["bindings"] == 0, summary(reloaded)
+        m.record("mcast-quarantine-released", {"parked": summary(parked), "admitted": summary(admitted),
+                                               "unloaded": between["stdout"], "reloaded": summary(reloaded)})

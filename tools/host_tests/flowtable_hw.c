@@ -184,8 +184,11 @@ struct list_head { struct list_head *next, *prev; };
 static void list_add_tail(struct list_head *e, struct list_head *h)
 { e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
 static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->prev = e->prev; }
+static bool list_empty(const struct list_head *h) { return h->next == h; }
 struct key { bool linked, safe; };
-static struct key *key;
+/* The newest key, which most cases hold one of, and an older one a case can
+ * keep underneath it: retired, or still linked after a hard failure. */
+static struct key *key, *older;
 struct hw_ct { void *td; unsigned index; struct key *handle; u64 pkts, bytes; u32 timestamp; };
 struct itf { unsigned type, index; };
 typedef struct { struct itf *itf, *input_itf, *underlying_input_itf; unsigned mtu; u8 dstmac[6]; } RouteEntry;
@@ -240,6 +243,23 @@ static void mutex_unlock(bool *m) { assert(*m); *m = false; }
 static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
 static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
+/* CDX's own parked backlog, as a count. It may only be released once a
+ * barrier completed after it was parked; a case parking entries clears
+ * legacy_proven, and every completed sync sets it. */
+static bool legacy_proven;
+static unsigned legacy_freed;
+/* Park entries as a failed CDX barrier does: after every sync so far. */
+static void park_legacy(unsigned n) { legacy_pending += n; legacy_proven = false; }
+/* The FMans the installed DPA configuration spans, read under the mutex. */
+static uint32_t fmans = 1;
+static unsigned warnings;
+static uint32_t dpa_get_num_fmans(void) { lockdep_assert_held(&cdx_info->ctrl.mutex); return fmans; }
+/* Once per call site, as the kernel's: a second refusal adds no line. */
+#define pr_warn_once(...) ({ static bool warned_; if (!warned_) { warned_ = true; warnings++; } })
+/* Time, for the admission retry's once-a-second bound. */
+static unsigned long jiffies = 1000;
+#define HZ 100
+#define time_before(a, b) ((long)((a) - (b)) < 0)
 static unsigned allocations, deletes, syncs;
 static bool fail_alloc, fail_insert, fail_sync, stopped;
 static int delete_result;
@@ -339,22 +359,59 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));
     if (fail_insert) return -1;
     ct->ct = kzalloc(sizeof(*ct->ct), GFP_KERNEL); assert(ct->ct);
-    assert(!key); key = calloc(1,sizeof(*key)); assert(key); key->linked = true;
+    if (key) { assert(!older); older = key; }
+    key = calloc(1,sizeof(*key)); assert(key); key->linked = true;
     ct->ct->handle = key; ct->ct->td = &in_itf; ct->ct->index = 1;
     return 0;
+}
+/* A completed sync proves every key unlinked before it, whichever table it
+ * went through: the PCD is one. A key still linked is never proven. */
+static void barrier(void)
+{
+    if (key && !key->linked) key->safe = true;
+    if (older && !older->linked) older->safe = true;
+    legacy_proven = true;
 }
 static int ExternalHashTableDeleteKey(void *td, unsigned index, struct key *handle)
 {
     assert(td == &in_itf && index == 1 && handle == key && key->linked);
     deletes++;
     if (delete_result == 0 || delete_result == EN_EHASH_DELETE_UNSYNCED) key->linked = false;
-    if (!delete_result) key->safe = true;
+    if (!delete_result) barrier();
     return delete_result;
 }
 static int ExternalHashTableFmPcdHcSync(void *td)
-{ syncs++; if(fail_sync) return -1; assert(key && !key->linked); key->safe = true; return 0; }
+{
+    assert(td == &in_itf);
+    /* Only ever asked for while something unlinked waits on it. */
+    assert((key && !key->linked) || (older && !older->linked) || legacy_pending);
+    syncs++;
+    if (fail_sync) return -1;
+    barrier();
+    return 0;
+}
 static void ExternalHashTableEntryFree(struct key *handle)
-{ assert(handle == key && !key->linked && (key->safe || stopped)); free(key); key = NULL; }
+{
+    assert(handle && (handle == key || handle == older));
+    assert(!handle->linked && (handle->safe || stopped));
+    if (handle == key) key = NULL; else older = NULL;
+    free(handle);
+}
+static void cdx_ehash_quarantine_free_all(void)
+{
+    assert(!legacy_pending || legacy_proven || stopped);
+    legacy_freed += legacy_pending;
+    legacy_pending = 0;
+}
+/* CDX's own retry, compiled and tested in ehash_lifecycle.c: one sync through
+ * a parked entry's table, releasing everything on success. */
+static int cdx_ehash_quarantine_retry(void)
+{
+    if (!legacy_pending) return 0;
+    if (ExternalHashTableFmPcdHcSync(&in_itf)) return -EAGAIN;
+    cdx_ehash_quarantine_free_all();
+    return 0;
+}
 static void hw_ct_get_active(struct hw_ct *ct) { ct->pkts = 99; ct->bytes = 12345; ct->timestamp = 321; }
 static int dpa_cfg_quiesce(void)
 {
@@ -462,11 +519,27 @@ static void test_backend(void)
         cdx_ft_stats_free(&slot);
         assert(!ifstats_taken);
     }
-    legacy_pending=1;
+    /* A configuration spanning two FMans is refused outright, and before
+     * the claim retries a parked backlog: that barrier would release it on
+     * one PCD's sync alone. The refusal neither fails the backend nor seals
+     * the config, and says why once however often the load is retried. */
+    park_legacy(1);
+    unsigned tries = syncs;
+    fmans = 2;
+    assert(cdx_ft_claim() == -EOPNOTSUPP && warnings == 1);
+    assert(syncs == tries && legacy_pending == 1);
+    assert(!cdx_flowtable_config_sealed() && !cdx_ft_failed());
+    assert(cdx_ft_claim() == -EOPNOTSUPP && warnings == 1 && syncs == tries);
+    fmans = 1;
+    /* A backlog CDX parked for itself refuses the claim only while its
+     * barrier keeps failing: the claim retries it, once per attempt. */
+    fail_sync=true;
     assert(cdx_ft_claim() == -EBUSY && !cdx_flowtable_config_sealed());
-    legacy_pending=0;
+    assert(syncs == tries + 1 && legacy_pending == 1);
+    fail_sync=false;
     assert(cdx_ft_claim() == 0 && cdx_flowtable_config_sealed());
-    assert(cdx_ft_claim() == -EBUSY);
+    assert(syncs == tries + 2 && !legacy_pending);
+    assert(cdx_ft_claim() == -EBUSY && syncs == tries + 2);
     /* The pool itself, through the backend's ownership check: one record at a
      * time here, a kind that reaches the free lists unchanged, a read that
      * reports each half, and a free that returns it. */
@@ -517,6 +590,18 @@ static void test_backend(void)
     out_iface.itf_id=L2_MAX_ONIF; assert(!cdx_ft_port_supported(&out)); out_iface.itf_id=2;
     out_iface.eth_info.net_dev=&in; assert(!cdx_ft_port_supported(&out)); out_iface.eth_info.net_dev=&out;
     ft_observe=true; assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw); ft_observe=false;
+    /* The same backlog refuses admission, and admission is what retries its
+     * barrier in steady state -- at most once a second, not once per flow. */
+    park_legacy(1); fail_sync=true; tries=syncs;
+    assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw && syncs == tries + 1);
+    jiffies += HZ - 1;
+    assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw && syncs == tries + 1);
+    jiffies += 1; fail_sync=false;
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && hw && syncs == tries + 2 && !legacy_pending);
+    assert(cdx_ft_del(&hw) == 0 && !hw && !ft_live && !key);
+    /* With nothing pending, admission issues no barrier at all. */
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && syncs == tries + 2);
+    assert(cdx_ft_del(&hw) == 0 && !hw && !ft_live && !key);
     /* A direction that names an SA. Each end lands in its own slot and marks
      * the entry secure, and the *sending* end additionally replaces the
      * entry's MTU with the egress port's: the microcode adds the tunnel
@@ -930,6 +1015,66 @@ int main(void)
     free(key); key=NULL; stopped=false;
     assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);
     assert(cdx_ft_hw_del(&hw)==0 && !hw && !key && !allocations);
+    /* One completed barrier proves every unlink before it -- the backend's
+     * own retired entries and the backlog CDX parked for itself alike -- so
+     * whichever path completes one releases them all. */
+    {
+        struct cdx_ft_hw *live = NULL;
+        unsigned freed = legacy_freed;
+
+        /* A delete that syncs releases a retired entry and the backlog. */
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);
+        delete_result=EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_hw_del(&hw)==-EAGAIN && cdx_ft_hw_pending()==1);
+        park_legacy(2);
+        delete_result=0;
+        assert(cdx_ft_hw_add(&rule,&stats,&live)==0 && older && !older->linked && !older->safe);
+        old=syncs;
+        assert(cdx_ft_hw_del(&live)==0 && !live && syncs==old);
+        assert(!key && !older && !cdx_ft_hw_pending() && !legacy_pending);
+        assert(legacy_freed==freed+2 && !allocations);
+
+        /* Two retired entries and the backlog take one sync between them;
+         * a failed one keeps all three and says so. */
+        delete_result=EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_del(&hw)==-EAGAIN);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_del(&hw)==-EAGAIN);
+        assert(cdx_ft_hw_pending()==2 && key && older);
+        park_legacy(1); freed=legacy_freed;
+        fail_sync=true; old=syncs;
+        assert(cdx_ft_hw_retry()==-EAGAIN && syncs==old+1);
+        assert(cdx_ft_hw_pending()==2 && legacy_pending==1 && !key->safe && !older->safe);
+        fail_sync=false; old=syncs;
+        assert(cdx_ft_hw_retry()==0 && syncs==old+1);
+        assert(!cdx_ft_hw_pending() && !legacy_pending && legacy_freed==freed+1);
+        assert(!key && !older && !allocations);
+
+        /* With nothing retired of its own, the backlog gets exactly one sync,
+         * and a failed one is the backlog's to report, not the backend's. */
+        park_legacy(2); freed=legacy_freed;
+        fail_sync=true; old=syncs;
+        assert(cdx_ft_hw_retry()==0 && syncs==old+1 && legacy_pending==2);
+        fail_sync=false; old=syncs;
+        assert(cdx_ft_hw_retry()==0 && syncs==old+1 && !legacy_pending);
+        assert(legacy_freed==freed+2);
+        old=syncs;
+        assert(cdx_ft_hw_retry()==0 && syncs==old);
+
+        /* A key a hard failure may have left linked is never freed, by a
+         * retry's barrier or by a later delete's. */
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);
+        delete_result=-1;
+        assert(cdx_ft_hw_del(&hw)==-EIO && key->linked && cdx_ft_hw_pending()==1);
+        park_legacy(1); old=syncs;
+        assert(cdx_ft_hw_retry()==-EAGAIN && syncs==old+1 && !legacy_pending);
+        assert(key->linked && cdx_ft_hw_pending()==1);
+        delete_result=0;
+        assert(cdx_ft_hw_add(&rule,&stats,&live)==0 && older && older->linked);
+        assert(cdx_ft_hw_del(&live)==0 && !key && older->linked && cdx_ft_hw_pending()==1);
+        stopped=true; cdx_ft_hw_quiesced(); stopped=false;
+        assert(!allocations && !cdx_ft_hw_pending() && older->linked);
+        free(older); older=NULL; /* Reset owns the possibly linked allocation. */
+    }
     test_backend();
     puts("Flowtable hardware: encoding, consuming delete, allocation-free retirement, barrier retry and quiescence passed");
 }

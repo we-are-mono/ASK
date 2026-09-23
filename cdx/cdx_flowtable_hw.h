@@ -75,6 +75,8 @@ void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
  * new storage. A repeated delete with *hw == NULL does not erase prior errors. */
 int cdx_ft_hw_del(struct cdx_ft_hw **hw);
 unsigned int cdx_ft_hw_pending(void);
+/* One barrier for every unproven unlink, CDX's parked backlog included; see
+ * the definition for what the return value does and does not cover. */
 int cdx_ft_hw_retry(void);
 /* Only after dpa_cfg_quiesce has succeeded; requires the control mutex. */
 void cdx_ft_hw_quiesced(void);

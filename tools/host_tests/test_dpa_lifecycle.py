@@ -110,6 +110,12 @@ def test_ehash_teardown(tmp_path):
         + wrapper[wrapper.index("#define FM_PCD_COOKIE_SLOTS"):
                   wrapper.index("static t_Error fm_pcd_cookie_to_handle")]
     )
+    # CDX's quarantine over the same table API: its node type through
+    # cdx_ehash_delete_entry(), the one delete every CDX path goes through.
+    quarantine = (ROOT / "cdx/cdx_ehash.c").read_text()
+    (tmp_path / "quarantine_production.inc").write_text(
+        quarantine[quarantine.index("struct cdx_ehash_pending_free {"):
+                   quarantine.index("/* delete classif entry from table.")])
     start = wrapper.index("#if defined(CONFIG_COMPAT)\n        case FM_PCD_IOC_HASH_TABLE_SET_COMPAT:")
     end = wrapper.index("#if defined(CONFIG_COMPAT)\n        case FM_PCD_IOC_HASH_TABLE_ADD_KEY_COMPAT:", start)
     (tmp_path / "hash_ioctl.inc").write_text(

@@ -146,6 +146,99 @@ static void *FM_PCD_HashTableSet(void *pcd, t_FmPcdHashTableParams *params)
 { assert(pcd); if (!requested_table) requested_table = table(pcd); return requested_table; }
 #include "hash_ioctl.inc"
 
+/* CDX's quarantine over this table API, compiled from cdx_ehash.c: what a
+ * failed barrier leaves parked, and what releases it. The table API is the
+ * boundary here, so its three calls are the ones simulated. */
+#include <errno.h>
+#include <stddef.h>
+struct list_head { struct list_head *next, *prev; };
+#define LIST_HEAD(n) struct list_head n = { &n, &n }
+#define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define list_for_each_entry(p, h, m) \
+    for (p = list_entry((h)->next, typeof(*p), m); &p->m != (h); p = list_entry(p->m.next, typeof(*p), m))
+#define list_for_each_entry_safe(p, n, h, m) \
+    for (p = list_entry((h)->next, typeof(*p), m), n = list_entry(p->m.next, typeof(*p), m); \
+         &p->m != (h); p = n, n = list_entry(n->m.next, typeof(*n), m))
+static void list_add_tail(struct list_head *e, struct list_head *h)
+{ e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
+static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->prev = e->prev; }
+static bool list_empty(const struct list_head *h) { return h->next == h; }
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define GFP_KERNEL 0
+#define kmalloc(size, flags) allocate(size)
+#define DPA_ERROR(...) ((void)0)
+#define SUCCESS 0
+#define EN_EHASH_DELETE_UNSYNCED (-2)
+static unsigned hc_syncs;
+static void *synced_table;
+static bool hc_fail;
+static int delete_rc;
+static int ExternalHashTableFmPcdHcSync(void *td)
+{ assert(td); hc_syncs++; synced_table = td; return hc_fail ? -1 : 0; }
+static void ExternalHashTableEntryFree(void *entry) { release(entry); }
+static int ExternalHashTableDeleteKey(void *td, uint16_t index, void *entry)
+{ assert(td && entry); return delete_rc; }
+/* Declared by cdx_common.h in the module; one calls another defined below it. */
+int cdx_ehash_quarantine_retry(void);
+#include "quarantine_production.inc"
+
+static void check_quarantine(void)
+{
+    t_FmPcd pcd = {0};
+    struct en_exthash_info *first = table(&pcd), *second = table(&pcd);
+    unsigned held = allocations;
+    void *entry;
+
+    /* Nothing parked: nothing to sync. */
+    assert(cdx_ehash_quarantine_retry() == 0 && !hc_syncs);
+    /* A delete whose barrier failed parks its entry against the table it
+     * left, and a hand splice parks against the one it names. */
+    delete_rc = EN_EHASH_DELETE_UNSYNCED;
+    assert(cdx_ehash_delete_entry(first, 3, allocate(8)) == EN_EHASH_DELETE_UNSYNCED);
+    cdx_ehash_quarantine_entry(second, allocate(8));
+    assert(cdx_ehash_quarantine_pending() == 2 && allocations == held + 4);
+    /* One sync through the first entry's table; a failed one keeps both. */
+    hc_fail = true;
+    assert(cdx_ehash_quarantine_retry() == -EAGAIN && hc_syncs == 1 && synced_table == first);
+    assert(cdx_ehash_quarantine_pending() == 2 && allocations == held + 4);
+    hc_fail = false;
+    assert(cdx_ehash_quarantine_retry() == 0 && hc_syncs == 2 && synced_table == first);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held);
+    /* An entry parked naming no table waits for a caller that has one; one
+     * behind it that names a table is barrier enough for both. */
+    cdx_ehash_quarantine_entry(NULL, allocate(8));
+    assert(cdx_ehash_quarantine_retry() == -EAGAIN && hc_syncs == 2);
+    cdx_ehash_quarantine_entry(second, allocate(8));
+    assert(cdx_ehash_quarantine_retry() == 0 && hc_syncs == 3 && synced_table == second);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held);
+    /* A delete that syncs is the same barrier: its entry and the backlog go. */
+    assert(cdx_ehash_delete_entry(first, 1, allocate(8)) == EN_EHASH_DELETE_UNSYNCED);
+    delete_rc = SUCCESS;
+    assert(cdx_ehash_delete_entry(first, 2, allocate(8)) == SUCCESS);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 3);
+    /* A key that may still be linked is never parked: nothing makes it free. */
+    delete_rc = -1;
+    entry = allocate(8);
+    assert(cdx_ehash_delete_entry(first, 4, entry) == -1 && !cdx_ehash_quarantine_pending());
+    assert(allocations == held + 1);
+    release(entry); /* Only a hardware reset reclaims it. */
+    /* Module exit tries one last barrier of its own, which releases the
+     * backlog when it completes... */
+    cdx_ehash_quarantine_entry(first, allocate(8));
+    cdx_ehash_quarantine_abandon();
+    assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 4);
+    /* ...and with nothing proven even then gives back only the bookkeeping. */
+    entry = allocate(8);
+    cdx_ehash_quarantine_entry(first, entry);
+    hc_fail = true;
+    cdx_ehash_quarantine_abandon();
+    hc_fail = false;
+    assert(!cdx_ehash_quarantine_pending() && allocations == held + 1 && hc_syncs == 5);
+    release(entry);
+    FreeEnEhashInfo(first);
+    FreeEnEhashInfo(second);
+}
+
 int main(void)
 {
     t_FmPcd pcd = {0};
@@ -222,5 +315,7 @@ int main(void)
     assert(!mapping && !allocations);
     assert(FM_PCD_CcRootModifyNextEngine((void *)1, 0, 0, (void *)1) == E_NOT_SUPPORTED);
     assert(FmPcdCcModifyNextEngineParamTree((void *)1, (void *)1, 0, 0, (void *)1) == E_NOT_SUPPORTED);
-    puts("EHASH teardown, unsupported retargeting and native/compat cookie ownership checks passed");
+    check_quarantine();
+    assert(!allocations);
+    puts("EHASH teardown, unsupported retargeting, native/compat cookie ownership and quarantine checks passed");
 }
