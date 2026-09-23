@@ -66,7 +66,8 @@ PORT_SATURATE = PORT + 12
 PORT_UNCLASSIFIED_SW, PORT_UNCLASSIFIED_HW = PORT + 13, PORT + 14
 PORT_DEFAULT = PORT + 15
 PORT_REMARK_HW, PORT_REMARK_SW = PORT + 18, PORT + 19
-PORTS_LAST = PORT + 19
+PORT_EF_REPLACED = PORT + 20
+PORTS_LAST = PORT + 20
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
 # unshaped and far above what the CPU can: see the module docstring.
@@ -1047,6 +1048,75 @@ async def test_flowtable_qos_dscp_filter_retires_flows_installed_before_it(qos):
     assert int(rows[0]["packets"]) - int(fresh["packets"]) == COUNT, (fresh, rows)
     assert leaf_delta(third, fourth, 1) == {"frames": COUNT, "bytes": COUNT * frame,
                                             "rejected": 0}, leaf_delta(third, fourth, 1)
+
+
+async def test_flowtable_qos_dscp_filter_replace_moves_the_codepoint(qos):
+    """`tc filter replace` of a DSCP filter moves its codepoint to the new
+    class, with the map staying on and the flow on its entry.
+
+    Flower offloads the replacement under a new cookie before it destroys the
+    filter it replaces, so the replacement arrives while the old filter still
+    holds the codepoint. Taken for a second filter on that DSCP, it was
+    refused -- with skip_sw the replace itself failed -- and without skip_sw
+    the old filter's destroy then unmapped the codepoint and, as the port's
+    last, turned the whole map off. Editing a codepoint while the map stays on
+    retires nothing, since an entry reads the table per frame. The leaf counts
+    are exact: EF lands on the old class before the replace and on the new one
+    after it, on leaves nothing else reaches.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    target = f"{r.lan_ip}:{PORT_EF_REPLACED}"
+    frame = 256 + UDP_HEADERS
+    await tree(r, dev, CAP_MBIT, [("1:10", HIGH_PRIO), ("1:11", LOW_PRIO),
+                                  ("1:12", LOW_PRIO + 1)])
+    await r.tc("qdisc", "add", "dev", dev, "clsact")
+
+    async def ef_to(verb, classid):
+        await r.tc("filter", verb, "dev", dev, "egress", "protocol", "ip", "pref", "1",
+                   "handle", "1", "flower", "skip_sw", "ip_tos", f"{EF_TOS:#x}/0xfc",
+                   "action", "skbedit", "priority", classid)
+        return (await r.tc("filter", "show", "dev", dev, "egress"))["stdout"]
+
+    added = await ef_to("add", "1:11")
+    await offload(r, f"ip saddr {WAN_IP} ip daddr {r.lan_ip} udp dport {PORT_EF_REPLACED} "
+                     f"flow add @fast")
+    await lan_start(r, echo=[PORT_EF_REPLACED])
+    forward, _ = await admit(r, PORT_EF_REPLACED, tos=EF_TOS)
+
+    async def burst():
+        before = await egress(r, dev)
+        echoed = await asyncio.to_thread(lockstep, r.lan_ip, PORT_EF_REPLACED, COUNT,
+                                         tos=EF_TOS)
+        after = await egress(r, dev)
+        return {"echoed": echoed, "old": leaf_delta(before, after, 1),
+                "new": leaf_delta(before, after, 2)}
+
+    first = await burst()
+    state = await r.state()
+    replaced = await ef_to("replace", "1:12")
+    second = await burst()
+    final = await r.state()
+    rows = directions(final, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    r.record("qos-dscp-filter-replace", {"added": added, "replaced": replaced,
+                                         "forward": forward, "rows": rows,
+                                         "first": first, "second": second,
+                                         "invalidations": [state["qos_invalidations"],
+                                                           final["qos_invalidations"]]})
+
+    exact = {"frames": COUNT, "bytes": COUNT * frame, "rejected": 0}
+    none = {"frames": 0, "bytes": 0, "rejected": 0}
+    assert "in_hw" in added and "1:11" in added, added
+    # One filter, in hardware, naming the new class. The word alone: tc
+    # prints `in_hw in_hw_count 1` for one filter.
+    assert len(re.findall(r"\bin_hw\b", replaced)) == 1 and "1:12" in replaced, replaced
+    assert first["echoed"] == second["echoed"] == COUNT, (first, second)
+    assert first["old"] == exact and first["new"] == none, first
+    assert second["new"] == exact and second["old"] == none, second
+    # The map never went off, so nothing was retired: the same entry carried
+    # both bursts.
+    assert final["qos_invalidations"] == state["qos_invalidations"], (state, final)
+    assert len(rows) == 1 and rows[0]["cookie"] == forward["cookie"], (forward, rows)
 
 
 async def test_flowtable_qos_dscp_map_moves_ports_without_misrouting(qos):

@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A257.** `tc filter replace` of a DSCP filter was refused as a duplicate, and the old filter's destroy then unmapped the codepoint —
+  fixed (_:/^cdx: keep a DSCP codepoint across tc filter replace_).
+
 - [x] **A256.** A class's DSCP remark was applied only in hardware, so a flow changed codepoint when offloaded and one never offloaded was never remarked —
   fixed (_:/^cdx: remark forwarded frames in software as the hardware does_).
 

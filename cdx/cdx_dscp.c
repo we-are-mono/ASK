@@ -84,6 +84,13 @@ struct cdx_dscp_filter {
 	struct list_head	list;
 	unsigned long		cookie;
 	u32			classid;
+	/* Which filter this is, apart from its cookie: the tc instance it
+	 * lives in and the whole of its key. A replacement arrives under a new
+	 * cookie while the filter it replaces is still here, and these are
+	 * what recognise it (cdx_dscp_replaces()). */
+	u32			prio;
+	u32			chain;
+	__be16			n_proto;
 	u8			dscp;
 	/* Where the class currently sits, in the encoding the qdisc's own
 	 * published map is indexed by: (channel + 1) << 4 | class queue, so
@@ -177,6 +184,32 @@ static struct cdx_dscp_filter *cdx_dscp_find(struct cdx_dscp_port *port,
 	return NULL;
 }
 
+/* Whether `next' replaces `prev' rather than being a second filter on its
+ * DSCP. `tc filter replace' offloads the new filter under a new cookie and
+ * only then destroys the old one, so for a moment both are here. Flower never
+ * keeps two live filters with one key in one instance, and a filter here has
+ * no key beyond its protocol and its DSCP, so the same instance and the same
+ * key can only be that moment. */
+static bool cdx_dscp_replaces(const struct cdx_dscp_filter *next,
+			      const struct cdx_dscp_filter *prev)
+{
+	return next->prio == prev->prio && next->chain == prev->chain &&
+	       next->n_proto == prev->n_proto && next->dscp == prev->dscp;
+}
+
+/* The filter that answers for `dscp' now, if any: the latest one on it, which
+ * is the one programmed last. Runs under cdx_dscp_mutex. */
+static struct cdx_dscp_filter *cdx_dscp_answering(struct cdx_dscp_port *port,
+						  u8 dscp)
+{
+	struct cdx_dscp_filter *f, *found = NULL;
+
+	list_for_each_entry(f, &port->filters, list)
+		if (f->dscp == dscp)
+			found = f;
+	return found;
+}
+
 /* Program one filter, or clear its DSCP when the class it names no longer
  * exists. A class that has gone is not an error here -- the operator deleted
  * it, and the honest answer is that this DSCP no longer selects anything --
@@ -216,9 +249,12 @@ static void cdx_dscp_publish(struct cdx_dscp_port *port)
 
 	for (dscp = 0; dscp < CDX_DSCP_COUNT; dscp++)
 		WRITE_ONCE(port->dscp_class[dscp], 0);
+	/* The last record on a codepoint wins, class or none, exactly as it
+	 * does in the hardware table, which each record was programmed into
+	 * in this order -- two records share one only while a replacement is
+	 * taking the codepoint over (cdx_dscp_replaces()). */
 	list_for_each_entry(f, &port->filters, list)
-		if (f->klass)
-			WRITE_ONCE(port->dscp_class[f->dscp], f->klass);
+		WRITE_ONCE(port->dscp_class[f->dscp], f->klass);
 }
 
 /* Finish the retiring port's retirement: wait for every entry installed while
@@ -363,12 +399,15 @@ static void cdx_dscp_turn_off(struct cdx_dscp_port *port)
 
 /* Only the keys that make a DSCP. Anything else would select a subset of the
  * frames carrying that DSCP, and the table has one entry per DSCP and no way
- * to say "these and not those". */
-static int cdx_dscp_parse(struct flow_cls_offload *f, u8 *dscp)
+ * to say "these and not those". The protocol comes back too, as the rest of
+ * the filter's key: it does not narrow the table, which reads the DSCP of
+ * either family, but it tells one filter from another. */
+static int cdx_dscp_parse(struct flow_cls_offload *f, u8 *dscp, __be16 *n_proto)
 {
 	struct netlink_ext_ack *extack = f->common.extack;
 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
 	struct flow_match_control control;
+	struct flow_match_basic basic;
 	struct flow_match_ip ip;
 	unsigned long long used;
 	const unsigned long long allowed =
@@ -387,6 +426,26 @@ static int cdx_dscp_parse(struct flow_cls_offload *f, u8 *dscp)
 			NL_SET_ERR_MSG_MOD(extack, "flower: fragment matching is not supported");
 			return -EOPNOTSUPP;
 		}
+		/* An address match asks for an address type even when its
+		 * prefix is empty (`src_ip 0.0.0.0/0'), and the mask it leaves
+		 * is what tells such a filter from a plain one on the same
+		 * codepoint: accepted, the two could sit in one instance and
+		 * pass for a replacement of each other. */
+		if (control.mask->addr_type || control.mask->thoff) {
+			NL_SET_ERR_MSG_MOD(extack, "flower: only ip_dscp is supported on egress");
+			return -EOPNOTSUPP;
+		}
+	}
+	*n_proto = 0;
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
+		flow_rule_match_basic(rule, &basic);
+		/* `ip_proto' rides in the same key as the protocol and would
+		 * pick out one transport's frames of that DSCP. */
+		if (basic.mask->ip_proto) {
+			NL_SET_ERR_MSG_MOD(extack, "flower: only ip_dscp is supported on egress");
+			return -EOPNOTSUPP;
+		}
+		*n_proto = basic.key->n_proto & basic.mask->n_proto;
 	}
 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
 		NL_SET_ERR_MSG_MOD(extack, "flower: an ip_dscp match is required");
@@ -444,13 +503,14 @@ static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 	struct netlink_ext_ack *extack = f->common.extack;
 	struct cdx_dscp_port *port;
 	struct cdx_dscp_filter *filter, *existing;
+	__be16 n_proto;
 	u32 classid;
 	u8 dscp;
 	int rc;
 
 	if (!cdx_dscp_entry(cdx_dscp_qm_ctx(dev)))
 		return -EOPNOTSUPP;
-	rc = cdx_dscp_parse(f, &dscp);
+	rc = cdx_dscp_parse(f, &dscp, &n_proto);
 	if (rc)
 		return rc;
 	rc = cdx_dscp_action(f, &classid);
@@ -462,6 +522,9 @@ static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 		return -ENOMEM;
 	filter->cookie = f->cookie;
 	filter->classid = classid;
+	filter->prio = f->common.prio;
+	filter->chain = f->common.chain_index;
+	filter->n_proto = n_proto;
 	filter->dscp = dscp;
 
 	mutex_lock(&cdx_dscp_mutex);
@@ -477,18 +540,27 @@ static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 		goto out;
 	/* Two filters on one DSCP would each be the whole of that codepoint's
 	 * answer, and the second to be programmed would win with nothing
-	 * saying so. tc keeps both, so this has to refuse the second. */
+	 * saying so. tc keeps both, so this has to refuse the second -- but not
+	 * a replacement, which takes the codepoint over from the filter it
+	 * replaces, now, and leaves that one's destroy to find it taken. */
 	list_for_each_entry(existing, &port->filters, list)
-		if (existing->dscp == dscp && existing->cookie != f->cookie) {
+		if (existing->dscp == dscp && existing->cookie != f->cookie &&
+		    !cdx_dscp_replaces(filter, existing)) {
 			NL_SET_ERR_MSG_MOD(extack, "another filter already claims that DSCP");
 			rc = -EEXIST;
 			goto out_unclaim;
 		}
 	/* Into the claimed table, before it is published: a first filter that
-	 * cannot be programmed leaves nothing that ever read the map. */
+	 * cannot be programmed leaves nothing that ever read the map. A
+	 * replacement that cannot be leaves the filter it replaced in place,
+	 * and the codepoint goes back to that one's class. */
 	rc = cdx_dscp_program(dev, filter, extack);
-	if (rc)
+	if (rc) {
+		existing = cdx_dscp_answering(port, dscp);
+		if (existing)
+			cdx_dscp_program(dev, existing, NULL);
 		goto out_unclaim;
+	}
 	/* tc replays a filter onto a block callback that binds after it, so the
 	 * same cookie can arrive twice; the second time reprograms and keeps
 	 * the record already there. */
@@ -517,7 +589,7 @@ out:
 static int cdx_dscp_destroy(struct net_device *dev, struct flow_cls_offload *f)
 {
 	struct cdx_dscp_port *port;
-	struct cdx_dscp_filter *filter;
+	struct cdx_dscp_filter *filter, *other;
 
 	mutex_lock(&cdx_dscp_mutex);
 	port = cdx_dscp_port_of(dev);
@@ -527,8 +599,17 @@ static int cdx_dscp_destroy(struct net_device *dev, struct flow_cls_offload *f)
 	}
 	filter = cdx_dscp_find(port, f->cookie);
 	if (filter) {
-		ceetm_dscp_fq_unmap(cdx_dscp_qm_ctx(dev), filter->dscp);
 		list_del(&filter->list);
+		/* A replacement still holding the codepoint -- the old filter
+		 * going after its successor was offloaded, or the successor
+		 * going because flower failed after offloading it -- answers
+		 * for it from here on, so the table gets its class back rather
+		 * than nothing. */
+		other = cdx_dscp_answering(port, filter->dscp);
+		if (other)
+			cdx_dscp_program(dev, other, NULL);
+		else
+			ceetm_dscp_fq_unmap(cdx_dscp_qm_ctx(dev), filter->dscp);
 		cdx_dscp_publish(port);
 		/* The last filter takes the map with it, so a port with no
 		 * filters classifies exactly as it did before one existed --

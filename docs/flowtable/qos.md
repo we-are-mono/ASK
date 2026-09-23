@@ -1509,9 +1509,23 @@ one.
 
 **The whole codepoint has to be matched.** The table has one entry per DSCP and
 no way to express "these frames and not those", so a partial `ip_tos` mask, a
-port match beside it, or a `ttl` would each claim more traffic than the filter
-described. They are refused rather than narrowed. The ECN bits share the byte
-and are not ours to match on.
+port, address or `ip_proto` match beside it — even an empty prefix such as
+`src_ip 0.0.0.0/0`, which still asks for an address type — or a `ttl` would each
+claim more traffic than the filter described. They are refused rather than narrowed. The ECN bits
+share the byte and are not ours to match on.
+
+**One filter per codepoint, and a replacement is still one.** A second filter
+naming a DSCP that another already holds — from another preference, another
+chain, or another protocol — is refused, because whichever was programmed last
+would win with nothing saying so. `tc filter replace` is not a second filter,
+although it looks like one here: flower offloads the new filter under a new
+cookie and only then destroys the old one. A filter in the same instance (chain
+and preference) with the same key, which flower never keeps twice, is therefore
+taken as the replacement. It takes the codepoint over at once, and the old
+filter's destroy leaves the codepoint with it instead of unmapping it — or, had
+it been the port's last filter, turning the whole map off. If flower then fails
+and destroys the replacement, or the replacement's class does not exist, the
+codepoint goes back to the filter it was replacing.
 
 **The microcode's copy of the table is a singleton.** `dscp_fq_map_ff_g` holds
 one port id — "Now supporting only one interface", as the code enabling it says

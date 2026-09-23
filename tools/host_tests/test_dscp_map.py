@@ -32,7 +32,8 @@ def test_dscp_map(tmp_path):
     # the block callback are left out: they are plumbing over kernel helpers
     # the stub does not model.
     names = ["cdx_dscp_entry", "cdx_dscp_port_of", "cdx_dscp_qm_ctx",
-             "cdx_dscp_port_ctx", "cdx_dscp_find", "cdx_dscp_program",
+             "cdx_dscp_port_ctx", "cdx_dscp_find", "cdx_dscp_replaces",
+             "cdx_dscp_answering", "cdx_dscp_program",
              "cdx_dscp_publish", "cdx_dscp_finish_retiring", "cdx_dscp_claim",
              "cdx_dscp_unclaim", "cdx_dscp_turn_on", "cdx_dscp_turn_off",
              "cdx_dscp_parse", "cdx_dscp_action", "cdx_dscp_replace",

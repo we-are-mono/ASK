@@ -9,6 +9,7 @@
  * and which has to be asked again every time the tree moves, or a codepoint
  * ends up naming a queue nobody meant.
  */
+#include <arpa/inet.h>
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
+typedef uint16_t __be16;
 #define EOPNOTSUPP 95
 #define EINVAL 22
 #define ENOENT 2
@@ -80,10 +82,12 @@ enum {
     FLOW_DISSECTOR_KEY_CONTROL, FLOW_DISSECTOR_KEY_BASIC,
     FLOW_DISSECTOR_KEY_IP, FLOW_DISSECTOR_KEY_PORTS,
 };
-struct flow_dissector_key_control { u16 addr_type; u32 flags; };
+struct flow_dissector_key_control { u16 thoff, addr_type; u32 flags; };
+struct flow_dissector_key_basic { __be16 n_proto; u8 ip_proto; };
 struct flow_dissector_key_ip { u8 tos, ttl; };
 struct flow_dissector { unsigned long long used_keys; };
 struct flow_match_control { struct flow_dissector_key_control *key, *mask; };
+struct flow_match_basic { struct flow_dissector_key_basic *key, *mask; };
 struct flow_match_ip { struct flow_dissector_key_ip *key, *mask; };
 
 struct flow_rule {
@@ -91,16 +95,18 @@ struct flow_rule {
     struct flow_action action;
     struct flow_dissector dis;
     struct flow_dissector_key_control control, control_mask;
+    struct flow_dissector_key_basic basic, basic_mask;
     struct flow_dissector_key_ip ip, ip_mask;
 };
 static bool flow_rule_match_key(const struct flow_rule *r, unsigned key)
 { return r->match.dissector->used_keys & BIT_ULL(key); }
 #define flow_rule_match_control(r, m) do { (m)->key = &(r)->control; (m)->mask = &(r)->control_mask; } while (0)
+#define flow_rule_match_basic(r, m) do { (m)->key = &(r)->basic; (m)->mask = &(r)->basic_mask; } while (0)
 #define flow_rule_match_ip(r, m) do { (m)->key = &(r)->ip; (m)->mask = &(r)->ip_mask; } while (0)
 
 enum { FLOW_CLS_REPLACE, FLOW_CLS_DESTROY, FLOW_CLS_STATS };
 struct flow_cls_offload {
-    struct { struct netlink_ext_ack *extack; } common;
+    struct { struct netlink_ext_ack *extack; u32 chain_index, prio; } common;
     int command;
     unsigned long cookie;
     struct flow_rule *rule;
@@ -256,21 +262,30 @@ static const char *netdev_name(const struct net_device *dev) { (void)dev; return
 static struct netlink_ext_ack ack;
 static struct net_device dev;
 
-/* A filter matching one whole DSCP and naming a class. */
+/* A filter matching one whole DSCP and naming a class, the way
+ * `tc filter add ... protocol ip flower ip_tos ...' arrives: tc sends the
+ * protocol as the flower key's ethertype. */
 static struct flow_rule dscp_rule(u8 dscp, u32 classid)
 {
     struct flow_rule r = { .action = { .num_entries = 1 } };
     r.action.entries[0].id = FLOW_ACTION_PRIORITY;
     r.action.entries[0].priority = classid;
-    r.dis.used_keys = BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) | BIT_ULL(FLOW_DISSECTOR_KEY_IP);
+    r.dis.used_keys = BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
+                      BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) | BIT_ULL(FLOW_DISSECTOR_KEY_IP);
+    r.basic.n_proto = htons(0x0800);
+    r.basic_mask.n_proto = 0xffff;
     r.ip.tos = dscp << 2;
     r.ip_mask.tos = 0xfc;
     return r;
 }
 
+/* The tc instance -- chain and preference -- the next filter is added in. */
+static u32 filter_prio = 1, filter_chain;
+
 static int add(unsigned long cookie, struct flow_rule *r)
 {
-    struct flow_cls_offload f = { .common = { .extack = &ack },
+    struct flow_cls_offload f = { .common = { .extack = &ack,
+        .chain_index = filter_chain, .prio = filter_prio },
         .command = FLOW_CLS_REPLACE, .cookie = cookie, .rule = r };
     r->match.dissector = &r->dis;
     ack.msg = NULL;
@@ -294,7 +309,7 @@ static struct net_device wan = { .priv.qm_ctx = &gQMCtx[4] };
 static int add_on(struct net_device *d, unsigned long cookie, u8 dscp)
 {
     struct flow_rule r = dscp_rule(dscp, 0x00010010);
-    struct flow_cls_offload f = { .common = { .extack = &ack },
+    struct flow_cls_offload f = { .common = { .extack = &ack, .prio = filter_prio },
         .command = FLOW_CLS_REPLACE, .cookie = cookie, .rule = &r };
     r.match.dissector = &r.dis;
     ack.msg = NULL;
@@ -499,10 +514,25 @@ int main(void)
 
     /* ---- what it refuses ---- */
 
-    /* Two filters cannot both be the whole answer for one codepoint. */
+    /* Two filters cannot both be the whole answer for one codepoint: not
+     * from another preference, another chain, or the same instance with
+     * another protocol, all of which tc keeps beside the first. */
     r = dscp_rule(46, 0x00010020);
+    filter_prio = 2;
+    assert(add(3, &r) == -EEXIST);
+    filter_prio = 1; filter_chain = 1;
+    assert(add(3, &r) == -EEXIST);
+    filter_chain = 0;
+    r.basic.n_proto = htons(0x86dd);
     assert(add(3, &r) == -EEXIST);
     assert(hw.fq[46] == ((3 << 8) | 7));
+    assert(cdx_dscp_class(&gQMCtx[3], 46) == ((3 << 4) | 7));
+
+    /* `ip_proto' shares the protocol's key and names one transport's
+     * frames of the codepoint, which the table cannot. */
+    r = dscp_rule(20, 0x00010010); r.basic.ip_proto = 17; r.basic_mask.ip_proto = 0xff;
+    assert(add(4, &r) == -EOPNOTSUPP);
+    assert(hw.fq[20] == -1);
 
     /* Half a DSCP would claim codepoints the filter did not name, and the
      * ECN bits share the byte and are not ours. */
@@ -540,6 +570,59 @@ int main(void)
 
     /* Nothing above left the map holding a codepoint it should not. */
     assert(hw.fq[46] == ((3 << 8) | 7) && hw.fq[10] == ((1 << 8) | 3));
+
+    /* ---- `tc filter replace' ----
+     *
+     * Flower offloads the new filter under a new cookie and only then
+     * destroys the old one, so the new one arrives while the old one still
+     * holds the codepoint. Same instance, same key: it takes the codepoint
+     * over, and the old one's destroy leaves it with the new class rather
+     * than unmapping it -- or turning the map off, had it been the last. */
+    r = dscp_rule(46, 0x00010020);
+    assert(add(11, &r) == 0);
+    assert(hw.fq[46] == ((1 << 8) | 3));
+    assert(cdx_dscp_class(&gQMCtx[3], 46) == ((1 << 4) | 3));
+    assert(del(1) == 0);
+    assert(hw.on && hw.fq[46] == ((1 << 8) | 3));
+    assert(cdx_dscp_class(&gQMCtx[3], 46) == ((1 << 4) | 3));
+    /* Flower failing after it offloaded the replacement destroys the
+     * replacement and keeps the old filter, whose class comes back. */
+    r = dscp_rule(46, 0x00010010);
+    assert(add(12, &r) == 0);
+    assert(hw.fq[46] == ((3 << 8) | 7));
+    assert(del(12) == 0);
+    assert(hw.fq[46] == ((1 << 8) | 3));
+    assert(cdx_dscp_class(&gQMCtx[3], 46) == ((1 << 4) | 3));
+    /* While the replacement and the filter it replaces both hold the
+     * codepoint, the software table answers as the hardware does: the last
+     * one programmed, even when its class has just gone and the codepoint
+     * selects nothing. */
+    r = dscp_rule(46, 0x00010010);
+    assert(add(12, &r) == 0);
+    tree[0].live = false;
+    cdx_dscp_tree_changed(&dev);
+    assert(hw.fq[46] == -1 && cdx_dscp_class(&gQMCtx[3], 46) == 0);
+    tree[0].live = true;
+    assert(del(12) == 0);
+    assert(hw.fq[46] == ((1 << 8) | 3));
+    assert(cdx_dscp_class(&gQMCtx[3], 46) == ((1 << 4) | 3));
+    /* An empty address prefix still asks for an address type, which is a
+     * mask a plain codepoint filter does not have: flower keeps the two side
+     * by side in one instance, so it cannot be taken for a replacement. */
+    r = dscp_rule(46, 0x00010010); r.control_mask.addr_type = 0xffff;
+    assert(add(14, &r) == -EOPNOTSUPP);
+    assert(hw.fq[46] == ((1 << 8) | 3));
+    /* A replacement that cannot be programmed leaves the codepoint with the
+     * filter it would have replaced. */
+    r = dscp_rule(46, 0x00010099);
+    assert(add(13, &r) == -ENOENT);
+    assert(hw.fq[46] == ((1 << 8) | 3));
+    /* Back to where the cases below expect it: EF on 1:10, as cookie 1. */
+    r = dscp_rule(46, 0x00010010);
+    assert(add(1, &r) == 0);
+    assert(del(11) == 0);
+    assert(hw.fq[46] == ((3 << 8) | 7) && hw.fq[10] == ((1 << 8) | 3));
+    assert(allocations == 2);
 
     /* ---- the tree moves underneath ---- */
 
