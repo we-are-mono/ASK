@@ -45,7 +45,7 @@ import pytest_asyncio
 
 from ask_orch.client import Agent
 from ask_orch.uart import Console
-from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_offload import (ARTIFACTS, DPORT, TABLE, WAN_IP, command,
                                     console_command, read, rig)  # noqa: F401
 
@@ -58,6 +58,7 @@ PORT_HIGH, PORT_LOW = PORT + 1, PORT + 2
 PORT_BULK, PORT_PROBE = PORT + 3, PORT + 4
 PORT_EF, PORT_BE, PORT_EF_SOFTWARE = PORT + 5, PORT + 6, PORT + 7
 PORT_POLICED = PORT + 8
+PORT_EGRESS = PORT + 9
 PORTS_LAST = PORT + 19
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
@@ -117,6 +118,10 @@ REMARK_CLASS = 1 << 12 | EF_DSCP << 13
 # A UDP flow does not back off, so the policer's burst only shapes the first
 # instant of the transfer; a megabyte keeps that instant short.
 POLICE_BURST = "1m"
+
+# Goodput a hardware TCP transfer has to hold with no tree in its way. The rig
+# forwards about 9.4 Gbit/s; the CPU a small fraction of that.
+UNSHAPED_GBPS = float(os.environ.get("ASK_FLOWTABLE_QOS_UNSHAPED_GBPS", "7"))
 
 LAN_BASE = "/tmp/ask_flowtable_qos"
 ECHO = f"{LAN_BASE}_echo.py"
@@ -997,3 +1002,179 @@ async def test_flowtable_qos_flower_police_caps_the_flow(qos):
     # The profile meters the frame the port received, headers and all.
     expected = cap * DATAGRAM / (DATAGRAM + UDP_HEADERS)
     assert 0.9 * expected <= goodput <= 1.03 * expected, (goodput, expected)
+
+
+# ---- the egress a flow was installed with ----------------------------------
+
+async def read_intervals(stream, into):
+    """Every interval a `--json-stream` iperf3 reports, with when it arrived
+    here. An interval is reported as it ends, so it covers the second before."""
+    while line := await stream.readline():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("event") == "interval":
+            into.append((time.monotonic(), event["data"]["sum"]["bits_per_second"]))
+
+
+async def conntrack_ids(r, port):
+    """The ids of the LAN VM's TCP connections to one port on this host."""
+    listing = await command(r.target, r.session, "conntrack", "-L", "-p", "tcp",
+                            "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
+                            "--dport", str(port), "-o", "id")
+    return set(re.findall(r"\bid=(\d+)", listing["stdout"]))
+
+
+async def test_flowtable_qos_egress_change_readmits_under_the_tree(qos):
+    """A tree built or removed under live offloaded flows retires and readmits
+    every one of them, with nothing but the next packet doing it.
+
+    A hardware entry carries the egress frame queue it was installed with, so
+    when HTB offload switches a port into or out of CEETM, each entry leaving
+    by that port names a queue the port no longer schedules. cdx tells the
+    adapter after every HTB command, and the adapter retires every entry using
+    the port, counting each as a QoS invalidation. Linux readmits the flow on
+    its next packet, against whatever the port has by then.
+
+    One four-stream TCP transfer from the LAN VM runs through all of it, and
+    its connections are the same conntrack entries at the end as at the start:
+    no flush, no reconnect. Unshaped, it runs at hardware line rate; once the
+    tree is up every stream is back on a fresh entry, carries the class its
+    mark names, and is held at the cap by the leaf that class holds; once the
+    tree is gone every stream is back on a fresh entry again, at line rate.
+    """
+    r = qos
+    dev = TARGET_WAN_IF
+    target = f"{WAN_IP}:{PORT_EGRESS}"
+    await offload(r, f"ip saddr {r.lan_ip} ip daddr {WAN_IP} tcp dport {PORT_EGRESS} "
+                     f"ct mark set {r.mark(HIGH_CQ):#x} flow add @fast")
+    route = f"{WAN_IP}/32"
+    client = f'''
+import json, subprocess
+route = {route!r}
+existing = json.loads(subprocess.check_output(['ip', '-j', 'route', 'show', 'exact', route], text=True))
+assert not existing, existing
+subprocess.run(['ip', 'route', 'add', route, 'via', {r.lan_gateway!r}, 'dev', {LAN_NIC!r},
+                'mtu', '1500'], check=True)
+try:
+    result = subprocess.run(['iperf3', '-c', {WAN_IP!r}, '-B', {r.lan_ip!r},
+                             '-p', {str(PORT_EGRESS)!r}, '-P', '4', '-t', '60'],
+                            capture_output=True, text=True, timeout=90)
+finally:
+    subprocess.run(['ip', 'route', 'del', route, 'dev', {LAN_NIC!r}])
+print(json.dumps({{'rc': result.returncode, 'stderr': result.stderr[-400:]}}))
+'''
+    # The receiving end streams its intervals, so a rate can be read for each
+    # phase of the one transfer. It is stopped once the last phase has been
+    # sampled, which ends the sender too.
+    server = await asyncio.create_subprocess_exec(
+        "iperf3", "-s", "-1", "-B", WAN_IP, "-p", str(PORT_EGRESS), "--json-stream",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    intervals = []
+    reader = asyncio.create_task(read_intervals(server.stdout, intervals))
+    transfer = None
+    try:
+        await asyncio.sleep(0.3)
+        assert server.returncode is None, "the endpoint iperf3 did not start"
+        transfer = asyncio.create_task(lan_run_python(r.lan, client, label="flowtable_qos_egress",
+                                                      timeout=120))
+        deadline = time.monotonic() + 10
+        while True:
+            state = await r.state()
+            bulk = [f for f in directions(state, ingress=TARGET_LAN_IF, proto=6, dst=target)
+                    if int(f["bytes"]) > 1_000_000]
+            if len(bulk) == 4:
+                break
+            assert not transfer.done() and time.monotonic() < deadline, state
+            await asyncio.sleep(0.25)
+        streams = {f["src"] for f in bulk}
+        admitted = time.monotonic()
+        connections = await conntrack_ids(r, PORT_EGRESS)
+        await asyncio.sleep(3.0)
+
+        async def change(step):
+            """Change the WAN port's tree, then wait until every stream is back
+            on an entry installed after the change, and the port's QoS
+            invalidations account for every entry that was using it."""
+            before = await r.state()
+            using = sum(1 for f in before["flows"] if dev in (f["in"], f["out"]))
+            old = {f["cookie"] for f in before["flows"]}
+            started = time.monotonic()
+            await step()
+            # A change is several HTB commands, and a flow readmitted between
+            # two of them is retired again by the next. The retirement itself
+            # is queued work, so give it a moment: an entry still listed for
+            # that instant must not pass for the readmission this waits for.
+            await asyncio.sleep(0.5)
+
+            # A retired connection is readmitted as the same Netfilter flow,
+            # so its cookie is kept; what shows the readmission is an install
+            # for each of its directions. Invalidations count connections,
+            # whose two directions share one handle. Only the bulk streams
+            # are waited for: iperf3's idle control connection is retired
+            # too, and sends nothing that would readmit it.
+            def readmitted(state):
+                present = {f["src"] for f in directions(state, ingress=TARGET_LAN_IF, proto=6,
+                                                        dst=target)}
+                return (streams <= present and
+                        state["installs"] - before["installs"] >= 2 * len(streams) and
+                        state["qos_invalidations"] >= before["qos_invalidations"] + len(streams))
+            after = await r.wait(readmitted, timeout=20)
+            return {"started": started, "readmitted": time.monotonic(), "before": before,
+                    "after": after, "using": using, "old": sorted(old)}
+
+        shaping = await change(lambda: tree(r, dev, CAP_MBIT, [("1:10", HIGH_PRIO)]))
+        await asyncio.sleep(1.0)
+        first = await egress(r, dev)
+        await asyncio.sleep(WINDOW)
+        second = await egress(r, dev)
+        unshaping = await change(lambda: r.tc("qdisc", "del", "dev", dev, "root"))
+        await asyncio.sleep(4.5)
+        ended = time.monotonic()
+        survived = await conntrack_ids(r, PORT_EGRESS)
+    finally:
+        if server.returncode is None:
+            server.terminate()
+        await asyncio.wait_for(server.wait(), 10)
+        await asyncio.gather(reader, return_exceptions=True)
+        # The LAN console is a single channel, and the fixture's teardown needs
+        # it back: the sender has to have finished before anything else runs.
+        sender = await transfer if transfer else None
+    r.record("qos-egress-change", {"intervals": intervals, "admitted": admitted,
+                                   "shaping": shaping, "unshaping": unshaping, "ended": ended,
+                                   "first": first, "second": second,
+                                   "connections": sorted(connections),
+                                   "survived": sorted(survived),
+                                   "sender": sender.stdout if sender else None})
+
+    def median_between(start, end):
+        rates = [bps for arrived, bps in intervals if arrived - 1.0 >= start and arrived <= end]
+        assert len(rates) >= 2, (start, end, intervals)
+        return statistics.median(rates)
+
+    cap = CAP_MBIT * 1e6
+    assert len(connections) >= 4 and survived == connections, (connections, survived)
+    for phase in (shaping, unshaping):
+        after = phase["after"]
+        assert phase["using"] >= 2 * len(streams), phase["before"]
+        # Every connection using the port was retired, and each stream's
+        # directions installed again.
+        assert after["qos_invalidations"] - phase["before"]["qos_invalidations"] >= phase["using"] // 2, (
+            "an entry using the port outlived the change to its egress", phase)
+        assert after["installs"] - phase["before"]["installs"] >= 2 * len(streams), phase
+        assert after["invalidated"] == after["fatal"] == 0 and after["bindings"] == 2, after
+    shaped_rows = directions(shaping["after"], ingress=TARGET_LAN_IF, proto=6, dst=target)
+    assert all(int(f["qos"], 16) == HIGH_CQ for f in shaped_rows), shaped_rows
+    assert median_between(admitted, shaping["started"]) >= UNSHAPED_GBPS * 1e9, intervals
+    expected = cap * TCP_PAYLOAD / (TCP_FRAME + OAL)
+    shaped = median_between(shaping["readmitted"] + 1.0, unshaping["started"])
+    assert 0.88 * expected <= shaped <= 1.01 * expected, (shaped, expected)
+    # The agent's own frames leave by this port through the same class queue as
+    # the transfer while the tree stands, so its reads are slower here than
+    # anywhere else in the file, and the window's edges less certain.
+    held = shaped_bps(first, second, 0)
+    slack = timing_slack(first, second)
+    assert (0.95 - slack) * cap <= held <= (1.03 + slack) * cap, (
+        held, cap, slack, leaf_delta(first, second, 0))
+    assert median_between(unshaping["readmitted"] + 1.0, ended) >= UNSHAPED_GBPS * 1e9, intervals
