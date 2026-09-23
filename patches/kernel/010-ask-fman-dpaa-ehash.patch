@@ -1,4 +1,4 @@
-From 74576e3fa661231fed6c4dd0ccc2f3b742212607 Mon Sep 17 00:00:00 2001
+From 0e9f529a328b842f56483422d0750ece3cd64e56 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -94,7 +94,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
  .../freescale/sdk_dpaa/offline_port.c         |   51 +
  .../net/ethernet/freescale/sdk_fman/Kconfig   |   11 +
- .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  296 +-
+ .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  321 ++-
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
  .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
@@ -102,7 +102,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 ++-----
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 ++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1297 +++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1299 +++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +---------
@@ -163,7 +163,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   35 +-
- 81 files changed, 9294 insertions(+), 5157 deletions(-)
+ 81 files changed, 9318 insertions(+), 5160 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -1980,10 +1980,40 @@ index 3a6d1810b525..dee624569b48 100644
  	bool "FMan RTC (1588 timer) APIs"
  	default n
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-index 80fb535231b9..7111fb02da8b 100644
+index 80fb535231b9..1d77f47cb2bf 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-@@ -50,20 +50,7 @@
+@@ -32,6 +32,8 @@
+  */
+ #define __ERR_MODULE__  MODULE_FM
+ 
++#include <linux/ratelimit.h>
++
+ #include "std_ext.h"
+ #include "error_ext.h"
+ #include "sprint_ext.h"
+@@ -40,6 +42,20 @@
+ #include "fm_common.h"
+ #include "fm_hc.h"
+ 
++/* Once the channel has failed, or while commands cannot be queued, every
++ * later command fails the same way -- and CDX retries a sync on a timer while
++ * anything waits on a barrier. Report those at a bounded rate rather than once
++ * a second for as long as the board runs. The timeout that fails the channel
++ * is reported once, unconditionally. */
++static DEFINE_RATELIMIT_STATE(hc_failure_ratelimit, DEFAULT_RATELIMIT_INTERVAL,
++                              DEFAULT_RATELIMIT_BURST);
++#define HC_RETURN_ERROR_RATELIMITED(_level, _err, _vmsg) \
++    do { \
++        if (__ratelimit(&hc_failure_ratelimit)) \
++            REPORT_ERROR(_level, (_err), _vmsg); \
++        return ERROR_CODE(_err); \
++    } while (0)
++
+ 
+ /**************************************************************************//**
+  @Description       defaults
+@@ -50,20 +66,7 @@
  #define HC_HCOR_OPCODE_KG_SCM                                   0x1
  #define HC_HCOR_OPCODE_SYNC                                     0x2
  #define HC_HCOR_OPCODE_CC                                       0x3
@@ -2004,7 +2034,7 @@ index 80fb535231b9..7111fb02da8b 100644
  #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_CMD_SHIFT       24
  #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_BPID            16
  
-@@ -79,7 +66,12 @@
+@@ -79,7 +82,12 @@
  #define SIZE_OF_HC_FRAME_PROFILE_CNT        (sizeof(t_HcFrame)-sizeof(t_FmPcdPlcrProfileRegs)+sizeof(uint32_t))
  #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
  
@@ -2017,7 +2047,7 @@ index 80fb535231b9..7111fb02da8b 100644
  
  #define BUILD_FD(len)                     \
  do {                                      \
-@@ -111,8 +103,6 @@ typedef struct t_HcFrame {
+@@ -111,8 +119,6 @@ typedef struct t_HcFrame {
          volatile uint32_t                       singleRegForWrite;    /* for writing SP, CPP, profile counter */
          t_FmPcdKgPortRegs                       portRegsForRead;
          volatile uint32_t                       clsPlanEntries[CLS_PLAN_NUM_PER_GRP];
@@ -2026,7 +2056,7 @@ index 80fb535231b9..7111fb02da8b 100644
      } hcSpecificData;
  } t_HcFrame;
  
-@@ -121,6 +111,13 @@ typedef struct t_HcFrame {
+@@ -121,6 +127,13 @@ typedef struct t_HcFrame {
  #endif /* defined(__MWERKS__) && ... */
  
  
@@ -2040,7 +2070,7 @@ index 80fb535231b9..7111fb02da8b 100644
  typedef struct t_FmHc {
      t_Handle                    h_FmPcd;
      t_Handle                    h_HcPortDev;
-@@ -132,11 +129,31 @@ typedef struct t_FmHc {
+@@ -132,11 +145,31 @@ typedef struct t_FmHc {
      uint32_t                    seqNum[HC_CMD_POOL_SIZE];   /* FIFO of seqNum to use when
                                                                 taking buffer */
      uint32_t                    nextSeqNumLocation;         /* seqNum location in seqNum[] for next buffer */
@@ -2074,7 +2104,7 @@ index 80fb535231b9..7111fb02da8b 100644
  
  static t_Error FillBufPool(t_FmHc *p_FmHc)
  {
-@@ -163,6 +180,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
+@@ -163,6 +196,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
      for (i = 0; i < HC_CMD_POOL_SIZE; i++)
      {
          p_FmHc->seqNum[i] = i;
@@ -2082,7 +2112,7 @@ index 80fb535231b9..7111fb02da8b 100644
      }
      p_FmHc->nextSeqNumLocation = 0;
  
-@@ -175,19 +193,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
+@@ -175,19 +209,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
  
      ASSERT_COND(p_FmHc);
  
@@ -2108,7 +2138,7 @@ index 80fb535231b9..7111fb02da8b 100644
      return p_FmHc->p_Frm[*p_SeqNum];
  }
  
-@@ -195,40 +215,66 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
+@@ -195,40 +231,67 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
  {
      uint32_t    intFlags;
  
@@ -2145,7 +2175,8 @@ index 80fb535231b9..7111fb02da8b 100644
 +    if (p_FmHc->failed || p_FmHc->quiescing)
 +    {
 +        HcUnlock(p_FmHc, intFlags);
-+        RETURN_ERROR(MINOR, E_INVALID_STATE, ("HC unavailable; reset required after timeout"));
++        HC_RETURN_ERROR_RATELIMITED(MINOR, E_INVALID_STATE,
++                                    ("HC unavailable; reset required after timeout"));
 +    }
 +    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY);
 +    p_FmHc->bufState[seqNum] = e_HC_BUF_IN_FLIGHT;
@@ -2156,20 +2187,21 @@ index 80fb535231b9..7111fb02da8b 100644
                  DPAA_FD_GET_OFFSET(p_FmFd)));
      err = p_FmHc->f_QmEnqueue(p_FmHc->h_QmArg, (void *)p_FmFd);
      if (err)
-+    {
-+        /* Enqueue errors mean rejection, never an accepted-command timeout. */
-+        intFlags = HcLock(p_FmHc);
-+        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
-+        HcUnlock(p_FmHc, intFlags);
-         RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
-+    }
- 
+-        RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
+-
 -    while (p_FmHc->enqueued[seqNum] && --timeout)
 -        XX_UDelay(100);
 -
 -    if (!timeout)
 -        RETURN_ERROR(MINOR, E_TIMEOUT, ("HC Callback, timeout exceeded"));
--
++    {
++        /* Enqueue errors mean rejection, never an accepted-command timeout. */
++        intFlags = HcLock(p_FmHc);
++        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
++        HcUnlock(p_FmHc, intFlags);
++        HC_RETURN_ERROR_RATELIMITED(MINOR, err, ("HC enqueue failed"));
++    }
+ 
 -    return err;
 +    for (;;)
 +    {
@@ -2194,7 +2226,7 @@ index 80fb535231b9..7111fb02da8b 100644
  }
  
  
-@@ -251,6 +297,12 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -251,6 +314,12 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      p_FmHc->h_QmArg             = p_FmHcParams->params.h_QmArg;
      p_FmHc->dataMemId           = DEFAULT_dataMemId;
      p_FmHc->usageAllowed		= TRUE;
@@ -2207,7 +2239,7 @@ index 80fb535231b9..7111fb02da8b 100644
  
      err = FillBufPool(p_FmHc);
      if (err != E_OK)
-@@ -278,7 +330,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -278,7 +347,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      if (!p_FmHc->h_HcPortDev)
      {
          REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM HC port!"));
@@ -2216,7 +2248,7 @@ index 80fb535231b9..7111fb02da8b 100644
          return NULL;
      }
  
-@@ -312,13 +364,43 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -312,13 +381,43 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      return (t_Handle)p_FmHc;
  }
  
@@ -2262,7 +2294,7 @@ index 80fb535231b9..7111fb02da8b 100644
  
      for (i=0; i<HC_CMD_POOL_SIZE; i++)
          if (p_FmHc->p_Frm[i])
-@@ -326,10 +408,9 @@ void FmHcFree(t_Handle h_FmHc)
+@@ -326,10 +425,9 @@ void FmHcFree(t_Handle h_FmHc)
          else
              break;
  
@@ -2275,7 +2307,7 @@ index 80fb535231b9..7111fb02da8b 100644
  }
  
  /*****************************************************************************/
-@@ -338,16 +419,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
+@@ -338,16 +436,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
  {
      t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
      int     i;
@@ -2307,7 +2339,7 @@ index 80fb535231b9..7111fb02da8b 100644
  }
  
  void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
-@@ -355,20 +450,27 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
+@@ -355,20 +467,27 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
      t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
      t_HcFrame   *p_HcFrame;
      uint32_t    intFlags;
@@ -2342,7 +2374,7 @@ index 80fb535231b9..7111fb02da8b 100644
  }
  
  t_Error FmHcPcdKgSetScheme(t_Handle                    h_FmHc,
-@@ -704,32 +806,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
+@@ -704,32 +823,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
      return E_OK;
  }
  
@@ -2375,7 +2407,7 @@ index 80fb535231b9..7111fb02da8b 100644
  t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragScratchPoolCmdParams *p_FmPcdCcFragScratchPoolCmdParams)
  {
      t_FmHc                              *p_FmHc = (t_FmHc*)h_FmHc;
-@@ -768,40 +844,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
+@@ -768,40 +861,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
      return E_OK;
  }
  
@@ -2416,7 +2448,29 @@ index 80fb535231b9..7111fb02da8b 100644
  t_Error FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId, uint32_t requiredAction)
  {
      t_FmHc              *p_FmHc = (t_FmHc*)h_FmHc;
-@@ -1233,20 +1275,36 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc)
+@@ -1205,9 +1264,11 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
+ 
+     ASSERT_COND(p_FmHc);
+ 
++    /* The one command a waiter retries on a timer: both failures below
++     * repeat on every retry once the channel is gone. */
+     p_HcFrame = GetBuf(p_FmHc, &seqNum);
+     if (!p_HcFrame)
+-        RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
++        HC_RETURN_ERROR_RATELIMITED(MINOR, E_NO_MEMORY, ("HC Frame object"));
+     memset(p_HcFrame, 0, sizeof(t_HcFrame));
+     /* first read SP register */
+     p_HcFrame->opcode = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC);
+@@ -1222,7 +1283,7 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
+     PutBuf(p_FmHc, p_HcFrame, seqNum);
+ 
+     if (err != E_OK)
+-        RETURN_ERROR(MINOR, err, NO_MSG);
++        HC_RETURN_ERROR_RATELIMITED(MINOR, err, NO_MSG);
+ 
+     return E_OK;
+ }
+@@ -1233,20 +1294,36 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc)
      return p_FmHc->h_HcPortDev;
  }
  
@@ -5262,10 +5316,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..bf2c14247fa2
+index 000000000000..d78c0799329a
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1297 @@
+@@ -0,0 +1,1299 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5720,8 +5774,8 @@ index 000000000000..bf2c14247fa2
 +					 * node's free needed the barrier; it waits
 +					 * for the next one, the same discipline as
 +					 * the DeleteKey sync-failure arms. */
-+					printk("%s::FmPcdHcSync failed; add stands, the replaced cumulative node is parked\n",
-+					       __func__);
++					printk_ratelimited("%s::FmPcdHcSync failed; add stands, the replaced cumulative node is parked\n",
++							   __func__);
 +					ehash_park_node(info, cumulative_tbl_entry);
 +					return retval;
 +				}
@@ -6112,7 +6166,9 @@ index 000000000000..bf2c14247fa2
 +	struct en_exthash_info *info;
 +	info = (struct en_exthash_info *)h_HashTbl;
 +	if (ehash_barrier(info, false)) {
-+		printk("%s::FmPcdHcSync failed\n", __func__);
++		/* Callers retry this once a second while a barrier is owed, so
++		 * a wedged channel would otherwise log it for ever. */
++		printk_ratelimited("%s::FmPcdHcSync failed\n", __func__);
 +		return -1;
 +	}
 +	return 0;
@@ -6147,7 +6203,7 @@ index 000000000000..bf2c14247fa2
 +		bucket->h = 0;
 +		XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +		if (ehash_barrier(info, true)) {
-+			printk("%s::FmPcdHcSync failed\n", __func__);
++			printk_ratelimited("%s::FmPcdHcSync failed\n", __func__);
 +			return EN_EHASH_DELETE_UNSYNCED;
 +		}
 +		return 0;
@@ -6265,7 +6321,7 @@ index 000000000000..bf2c14247fa2
 +					/* The replaced node is out of the chain
 +					 * just as the caller's entry is, and waits
 +					 * for the next barrier the same way. */
-+					printk("%s::FmPcdHcSync failed\n", __func__);
++					printk_ratelimited("%s::FmPcdHcSync failed\n", __func__);
 +					ehash_park_node(info, cumulative_tbl_entry);
 +					return EN_EHASH_DELETE_UNSYNCED;
 +				}
@@ -6322,7 +6378,7 @@ index 000000000000..bf2c14247fa2
 +					if (ehash_barrier(info, true)) {
 +						/* Both nodes left the chain when the
 +						 * bucket took the last entry directly. */
-+						printk("%s::FmPcdHcSync failed\n", __func__);
++						printk_ratelimited("%s::FmPcdHcSync failed\n", __func__);
 +						ehash_park_node(info, tmp_tbl_entry);
 +						ehash_park_node(info, cumulative_tbl_entry);
 +						return EN_EHASH_DELETE_UNSYNCED;
@@ -6342,7 +6398,7 @@ index 000000000000..bf2c14247fa2
 +						bucket->h = phyaddr;
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +						if (ehash_barrier(info, true)) {
-+							printk("%s::FmPcdHcSync failed\n", __func__);
++							printk_ratelimited("%s::FmPcdHcSync failed\n", __func__);
 +							ehash_park_node(info, cumulative_tbl_entry);
 +							return EN_EHASH_DELETE_UNSYNCED;
 +						}
@@ -6382,7 +6438,7 @@ index 000000000000..bf2c14247fa2
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +					if (ehash_barrier(info, true)) {
-+						printk("%s::FmPcdHcSync failed\n", __func__);
++						printk_ratelimited("%s::FmPcdHcSync failed\n", __func__);
 +						ehash_park_node(info, cumulative_tbl_entry);
 +						return EN_EHASH_DELETE_UNSYNCED;
 +					}

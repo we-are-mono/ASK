@@ -18,6 +18,7 @@ typedef int t_Error;
 #define REPORT_ERROR(level, err, msg) ((void)0)
 #define SANITY_CHECK_RETURN_ERROR(p, e) do { if (!(p)) return -1; } while (0)
 #define printk(...) ((void)0)
+#define printk_ratelimited(...) ((void)0)
 #define XX_VirtToPhys(p) ((uint64_t)(uintptr_t)(p))
 #define XX_PhysToVirt(a) ((void *)(uintptr_t)(a))
 #define SwapUint64(v) __builtin_bswap64(v)

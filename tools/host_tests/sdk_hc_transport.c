@@ -16,6 +16,11 @@
 #define ASSERT_COND assert
 #define REPORT_ERROR(level, err, msg) ((void)0)
 #define RETURN_ERROR(level, err, msg) return ERROR_CODE(err)
+/* The failures a caller retrying on a timer would repeat for ever go through
+ * hc.c's rate-limited report instead; counted, so a case can require which
+ * ones do. */
+static unsigned limited;
+#define HC_RETURN_ERROR_RATELIMITED(level, err, msg) do { limited++; return ERROR_CODE(err); } while (0)
 #define DBG(level, msg) ((void)0)
 #include "hc_layout.inc"
 
@@ -156,12 +161,15 @@ static void refuses_teardown(t_FmHc *hc)
 static void rejection_and_completion(void)
 {
     t_FmHc *hc = setup();
+    unsigned reported = limited;
     reject = true;
     for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
         assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
         assert(!hc->nextSeqNumLocation && !hc->failed && !delays);
         t_HcFrame expected = {.opcode = HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC};
         assert(!memcmp(hc->p_Frm[0], &expected, sizeof(expected)));
+        /* The rejected enqueue and the sync it failed, both rate-limited. */
+        assert(limited == reported + 2 * (n + 1));
     }
     reject = false;
     inline_confirm = true;
@@ -184,15 +192,22 @@ static void timeout_and_late_confirmation(bool before_return)
         assert(FmAllowHcUsage(hc, false) == E_OK);
         assert(!FmIsHcUsageAllowed(hc));
     }
+    unsigned reported = limited;
     assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_TIMEOUT);
     assert(hc->failed && delays == HC_CONFIRM_POLLS && submissions == 1);
     assert(hc->nextSeqNumLocation == (before_return ? 0 : 1));
+    /* The timeout that failed the channel is reported unconditionally;
+     * only the sync's own failure after it is rate-limited. */
+    assert(limited == reported + 1);
     refuses_teardown(hc);
     t_HcFrame snapshot = *hc->p_Frm[0];
     for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
+        reported = limited;
         assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
         assert(submissions == 1);
         if (!before_return) assert(!memcmp(hc->p_Frm[0], &snapshot, sizeof(snapshot)));
+        /* Every retry after that fails the same two ways, both limited. */
+        assert(limited == reported + 2);
     }
     if (!before_return) {
         /* Exhaust all remaining buffers and return them out of order. The
