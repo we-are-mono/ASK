@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A267.** A failed routed multicast install spent all four retries within one worker pass and went refused-failed before anything could change —
+  fixed (_:/^flowtable: retry a failed routed multicast install once per refresh_).
+
 - [x] **A266.** Bridged memberships standing when the adapter loaded were never offloaded until joined afresh (nothing replayed them, and patch 160's replay could be dropped) —
   fixed (_:/^cdx: offload the bridged memberships standing when the adapter loads_).
 

@@ -258,7 +258,10 @@ int main(void)
     refresh();
     assert(replaces == 2 && hardware.copies == 1 && output[1].refs == 0);
 
-    /* Exhaustion must not retain a subset and report offload forever. */
+    /* Exhaustion must not retain a subset and report offload forever. And a
+     * failure is tried again once a refresh, not back to back in the same
+     * pass, where nothing could have changed: four tries a refresh apart,
+     * then refused until the answer changes. */
     wanted = 2;
     fail_replace = fail_add = true;
     refresh();
@@ -266,8 +269,16 @@ int main(void)
     assert(!g->hw && !g->offloaded);
     assert(!cache.mfc_flags && !ft_mr_installed);
     assert(!input.refs && !output[0].refs && !output[1].refs);
-    assert(g->state == FT_MR_REFUSED_FAILED && g->retries == FT_MR_MAX_RETRIES);
+    assert(g->retries == 1 && g->state != FT_MR_REFUSED_FAILED && !g->dirty);
     unsigned before = adds;
+    run();                  /* nothing asks for it between refreshes */
+    assert(adds == before);
+    for (unsigned i = 2; i <= FT_MR_MAX_RETRIES; i++) {
+        refresh();
+        assert(adds == before + i - 1 && g->retries == i && !g->dirty);
+    }
+    assert(g->state == FT_MR_REFUSED_FAILED);
+    before = adds;
     refresh();
     assert(adds == before); /* timer cannot evade the bounded retry policy */
     fail_replace = fail_add = false;

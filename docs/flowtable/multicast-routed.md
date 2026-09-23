@@ -250,10 +250,11 @@ other is `refused-contested`, and takes the key in the same worker pass the
 first gives it up. See the next section for why this is the only collision
 left.
 
-**Retries.** Four, then `refused-failed`. A failure is not permanent — a port
-that lost carrier gets it back — but retrying forever against a group that
-cannot be carried would spin the worker. Anything that could change the answer
-resets the count.
+**Retries.** Four, one per five-second refresh, then `refused-failed`. A
+failure is not permanent — a port that lost carrier gets it back — but tried
+again at once, in the same pass, nothing could have changed, and retrying
+forever against a group that cannot be carried would spin the worker.
+Anything that could change the answer resets the count.
 
 ## One stream, both learners
 

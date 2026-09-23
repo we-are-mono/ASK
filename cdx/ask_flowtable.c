@@ -7530,8 +7530,9 @@ static void ft_mc_rows(struct seq_file *seq)
  */
 
 /* Enough to ride out a transient -- a port bouncing, a moment of capacity
- * pressure -- and few enough that a group which genuinely cannot be carried
- * stops costing anything. Anything that changes the answer resets it. */
+ * pressure; the tries are a refresh interval apart -- and few enough that a
+ * group which genuinely cannot be carried stops costing anything. Anything
+ * that changes the answer resets it. */
 #define FT_MR_MAX_RETRIES	4
 /* One name per oif, and an oif produces at least one listener, so the listener
  * ceiling bounds the count. */
@@ -9129,10 +9130,12 @@ static void ft_mr_work_fn(struct work_struct *work)
 			 * listener set cannot stand in for the requested one. */
 			if (!hw)
 				ft_mr_release_set(target);
+			/* Tried again at the next refresh, which asks every
+			 * group below the ceiling again, not now: a port that
+			 * lost carrier, or room another entry is about to give
+			 * back, needs time rather than repetition. */
 			if (rc && ++target->retries >= FT_MR_MAX_RETRIES)
 				state = FT_MR_REFUSED_FAILED;
-			else if (rc)
-				target->dirty = true;
 		}
 		/* A port's queues changed while this chain was being built from
 		 * the old ones, and the group was not yet on the list to be told.
