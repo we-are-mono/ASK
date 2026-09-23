@@ -160,10 +160,18 @@ async def bridge_service(rig):
 @pytest_asyncio.fixture
 async def bridge_software(rig):
     """The bridge with no service and no guest: the rig's own flowtable, which
-    a test builds without hardware offload."""
+    a test builds itself, with or without hardware offload.
+
+    That table goes before the bridge does. Taking a bound port out of the
+    bridge is an upper change the adapter answers by invalidating the whole
+    backend, and only the next bind clears that, so the rig's own teardown,
+    which runs after this one, would leave it latched for the next test."""
     r = rig
     async with bridge_topology(r, guest=False):
-        yield r
+        try:
+            yield r
+        finally:
+            await r.delete_table()
 
 
 async def membership(r):
