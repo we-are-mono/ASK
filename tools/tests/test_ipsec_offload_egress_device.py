@@ -10,7 +10,7 @@ xfrm_offload(), which answers NULL for these frames because the state is
 carried with len and no olen.
 
 The flow here is forwarded LAN -> WAN host, IPv4 in IPv4, with no flowtable, so
-every packet takes the software path. Three phases on one SA pair:
+every packet takes the software path. Four phases on one SA pair:
 
   - the route to the peer leaves by the WAN port: every datagram is echoed and
     the port hands exactly that many frames to SEC (`tx toenc`);
@@ -18,7 +18,11 @@ every packet takes the software path. Three phases on one SA pair:
     counted as XfrmOutBundleCheckError, the dummy transmits nothing, and SEC
     sees nothing either;
   - the route is moved back: the same SA carries traffic again, so nothing
-    about the refusal outlived its cause.
+    about the refusal outlived its cause;
+  - with the route still on the WAN port, a tc filter on that port's egress
+    redirects the plaintext to the dummy after xfrm_output() let it through:
+    the dummy's own transmit path refuses every frame, with the same counter,
+    and neither the dummy nor SEC sees one.
 
 The leak oracle is the dummy's own transmit counter. A postrouting counter on
 the dummy would not do: the bundle's POSTROUTING runs before xfrm_output() and
@@ -34,10 +38,12 @@ import socket
 import struct
 
 from ask_orch.client import Agent
+from ask_orch.uart import Console
 from _topology import LAN_IPV6, TARGET_WAN_IF, lan_run_python
 from test_flowtable_ipv6 import PayloadEcho, _udp_exchange, ipv6_rig  # noqa: F401
 from test_flowtable_ipv6_sa import REMOTE_V6
-from test_flowtable_offload import WAN_IP, Echo, command, read, rig  # noqa: F401
+from test_flowtable_offload import (ARTIFACTS, WAN_IP, Echo, command, console_command, read,  # noqa: F401
+                                   rig)
 from test_flowtable_service_ipsec_replay import xfrm_mib
 from test_ipsec_inbound_flow_offload import crypto, sec_counter
 
@@ -227,6 +233,31 @@ async def test_offloaded_sa_plaintext_stays_on_its_port(rig):
         phases["restored"] = {"echoed": echoed, **moved(before, await counters(r))}
         assert phases["restored"] == {"echoed": COUNT, "refused": 0, "detour_tx": 0,
                                       "toenc": COUNT}, phases
+
+        # `tc` is not in the agent's argv allowlist, so the filter is built on
+        # the console.
+        await command(r.target, r.session, "modprobe", "act_mirred")
+        with Console.target(log_path=str(ARTIFACTS / "ipsec-egress-device-uart.log")) as console:
+            await asyncio.to_thread(console.login, "root", None)
+            clsact = False
+            try:
+                await console_command(console, "tc", "qdisc", "add", "dev", TARGET_WAN_IF, "clsact")
+                clsact = True
+                await console_command(console, "tc", "filter", "add", "dev", TARGET_WAN_IF, "egress",
+                                      "protocol", "ip", "flower", "dst_ip", INNER, "action",
+                                      "mirred", "egress", "redirect", "dev", DETOUR)
+                before = await counters(r)
+                await send(r, 3 * COUNT, COUNT, wait=False)
+                await asyncio.sleep(0.5)
+                phases["redirected"] = {"delivered": sum(echo.received[payload(n)]
+                                                         for n in range(3 * COUNT, 4 * COUNT)),
+                                        **moved(before, await counters(r))}
+            finally:
+                if clsact:
+                    await console_command(console, "tc", "qdisc", "del", "dev", TARGET_WAN_IF,
+                                          "clsact", check=False)
+        assert phases["redirected"] == {"delivered": 0, "refused": COUNT, "detour_tx": 0,
+                                        "toenc": 0}, phases
         r.record("ipsec-egress-device", phases)
     finally:
         if transport:
@@ -252,7 +283,7 @@ s.close()
 
 
 async def test_offloaded_cross_family_sa_stays_on_its_port(ipv6_rig):
-    """The same three phases for IPv6 inside the IPv4 tunnel. The bundle's
+    """The first three phases for IPv6 inside the IPv4 tunnel. The bundle's
     route is then the flow's own, which does not move; what moves is the IPv4
     route to the peer, which the kernel asks per packet in the SA's own
     family and refuses the packet for once it leaves by another device."""

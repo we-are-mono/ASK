@@ -84,6 +84,7 @@ IMAGE_INSTALL = " \
 IMAGE_INSTALL:append = " \
     ask-test-agent \
     kernel-module-dummy \
+    kernel-module-act-mirred \
     python3-core \
     python3-aiohttp \
     python3-pyroute2 \
