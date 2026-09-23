@@ -222,6 +222,9 @@ class Echo(asyncio.DatagramProtocol):
     def __init__(self):
         self.received = Counter()
         self.record_payloads = True
+        # A test that needs one direction alone clears this to receive
+        # without answering.
+        self.reply = True
         self.packets = 0
 
     def connection_made(self, transport):
@@ -231,7 +234,8 @@ class Echo(asyncio.DatagramProtocol):
         self.packets += 1
         if self.record_payloads:
             self.received[data] += 1
-        self.transport.sendto(data, addr)
+        if self.reply:
+            self.transport.sendto(data, addr)
 
 
 class Rig:

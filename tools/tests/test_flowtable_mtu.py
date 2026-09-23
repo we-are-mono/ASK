@@ -1,16 +1,22 @@
-"""Re-admit current MTUs through an unchanged table and established TCP socket."""
+"""Re-admit current MTUs through an unchanged table and established TCP socket,
+and fragment what the entry's MTU does not carry whole."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
+import struct
+import threading
+import time
 
 import pytest
 
 from ask_orch.client import Agent
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_connections import FLOWS, by_key, connections, healthy, peer  # noqa: F401
-from test_flowtable_offload import DPORT, TABLE, WAN_IP, command, read, rig  # noqa: F401
+from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, TABLE, WAN_IP, command, ct_listing,  # noqa: F401
+                                    read, rig)
 from test_flowtable_selective_neighbour import hardware, warm
 from test_flowtable_tcp import software_tx
 
@@ -158,3 +164,110 @@ print(json.dumps({{'type': answer[ICMP].type, 'code': answer[ICMP].code, 'mtu': 
                 if result["rc"]:
                     failures.append(result)
             assert not failures, failures
+
+
+async def fragmenter(r):
+    """The microcode fragmenter's cumulative counters, by their proc labels."""
+    text = await read(r.target, r.session, "/proc/ucode_frag/stats")
+    return {label.strip(): int(value) for label, value in
+            (line.rsplit(":", 1) for line in text.splitlines() if ":" in line)}
+
+
+async def test_flowtable_mtu_fragments_non_df_ipv4(rig):
+    """An IPv4 packet with DF clear that exceeds its entry's MTU is fragmented
+    by the microcode and never leaves hardware. A DF one goes to Linux for its
+    Fragmentation Needed instead, which the exception tests cover.
+
+    The rig's host routes carry MTU 1200, so both entries do. The LAN sends
+    1250-byte payloads at its interface MTU with DF clear -- whatever path MTU
+    it learned from earlier tests -- and the WAN endpoint receives without
+    answering, so only the LAN-to-WAN direction fragments. Every packet must
+    leave the WAN port as exactly two fragments within 1200 bytes, the
+    endpoint must reassemble each exactly once, and the microcode must count
+    one fragmented frame and two fragments per packet."""
+    r = rig
+    if (await r.state())["observe"]:
+        pytest.skip("microcode fragmentation requires installed hardware")
+    from scapy.all import AsyncSniffer, Ether, IP, wrpcap
+    await r.table()
+    await r.exchange()
+    installed = await r.wait(lambda s: s["entries"] == 2)
+    assert all(int(f["mtu"]) == 1200 for f in installed["flows"]), installed
+    count, size = 64, 1250
+    payloads = [struct.pack("!Q", n) + b"ASK-fragment".ljust(size - 8, b".") for n in range(count)]
+    script = f'''
+import json, socket, struct, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_IP, 10, 4)  # IP_MTU_DISCOVER: IP_PMTUDISC_INTERFACE, DF clear
+s.bind(({r.lan_ip!r}, {SPORT}))
+for n in range({count}):
+    s.sendto(struct.pack('!Q', n) + b'ASK-fragment'.ljust({size - 8}, b'.'), ({WAN_IP!r}, {DPORT}))
+    time.sleep(0.01)
+s.close()
+print(json.dumps({{'sent': {count}}}))
+'''
+    before, counters_before = await r.state(), await fragmenter(r)
+    ready = threading.Event()
+    sniffer = AsyncSniffer(iface=r.wan_if, filter=f"ip src {r.lan_ip} and ip dst {WAN_IP}",
+                           store=True, started_callback=ready.set)
+    sniffer.start()
+    r.echo.reply = False
+    try:
+        assert await asyncio.to_thread(ready.wait, 5), "endpoint capture did not start"
+        # Management traffic also leaves by the WAN port, so nothing but the
+        # counter reads themselves sits between these two.
+        tx_before = await software_tx(r)
+        result = await lan_run_python(r.lan, script, timeout=20, label="flowtable_fragment")
+        assert result.rc == 0, result.stdout
+        deadline = time.monotonic() + 5
+        while sum(r.echo.received[p] for p in payloads) < count and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
+        tx_after = await software_tx(r)
+    finally:
+        r.echo.reply = True
+        frames = sniffer.stop()
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        wrpcap(str(ARTIFACTS / "fragments-non-df.pcap"), frames)
+    after, counters_after = await r.state(), await fragmenter(r)
+    listing = await ct_listing(r)
+    moved = {label: counters_after[label] - counters_before[label] for label in counters_before}
+    r.record("fragments-non-df", {"before": before, "after": after, "fragmenter": moved,
+                                  "software_tx": {d: tx_after[d] - tx_before[d] for d in tx_before},
+                                  "conntrack": listing, "frames": len(frames)})
+    # The endpoint reassembled each packet, once.
+    assert [r.echo.received[p] for p in payloads] == [1] * count, [r.echo.received[p] for p in payloads]
+    assert moved == {"IPv4 frames received": count, "IPv6 frames received": 0,
+                     "Number of IPv4 fragments sent": 2 * count, "Number of IPv6 fragments sent": 0,
+                     "Failures in allocating buffers": 0}, moved
+    # Still offloaded, the same generation, and carried by hardware alone.
+    assert "[HW_OFFLOAD]" in listing, listing
+    assert (after["installs"], after["deletes"], after["entries"]) == (
+        before["installs"], before["deletes"], 2), (before, after)
+    old, new = {f["in"]: f for f in before["flows"]}, {f["in"]: f for f in after["flows"]}
+    assert {i: f["cookie"] for i, f in old.items()} == {i: f["cookie"] for i, f in new.items()}
+    # A classifier hit counts the frame as it arrived, before fragmentation.
+    assert int(new[TARGET_LAN_IF]["packets"]) - int(old[TARGET_LAN_IF]["packets"]) == count
+    assert int(new[TARGET_LAN_IF]["bytes"]) - int(old[TARGET_LAN_IF]["bytes"]) == count * (14 + 20 + 8 + size)
+    assert new[TARGET_WAN_IF]["packets"] == old[TARGET_WAN_IF]["packets"], (old, new)
+    # Linux forwarding these would have transmitted all 2 * count fragments.
+    assert tx_after[TARGET_WAN_IF] - tx_before[TARGET_WAN_IF] < count, (tx_before, tx_after)
+    # The wire: two fragments per packet, each within the MTU, DF clear,
+    # offsets contiguous, forwarded once with the DUT's own addressing.
+    groups = {}
+    for frame in frames:
+        if IP in frame:
+            groups.setdefault(frame[IP].id, []).append(frame)
+    assert len(groups) == count, sorted(groups)
+    for ident, fragments in groups.items():
+        assert len(fragments) == 2, (ident, [f.summary() for f in fragments])
+        first, last = sorted(fragments, key=lambda f: f[IP].frag)
+        assert (first[IP].frag, int(first[IP].flags), int(last[IP].flags)) == (0, 1, 0), (first, last)
+        assert last[IP].frag * 8 == first[IP].len - 4 * first[IP].ihl, (first, last)
+        assert sum(f[IP].len - 4 * f[IP].ihl for f in fragments) == 8 + size, (first, last)
+        for fragment in fragments:
+            assert fragment[IP].len <= 1200 and fragment[IP].ttl == 63, fragment.summary()
+            assert (fragment[Ether].src, fragment[Ether].dst) == (r.dut_wan_mac, r.wan_mac), fragment.summary()
+            header = fragment[IP].copy()
+            del header.chksum
+            assert IP(bytes(header)).chksum == fragment[IP].chksum, fragment.summary()
