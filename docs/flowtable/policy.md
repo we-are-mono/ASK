@@ -81,6 +81,8 @@ between attempts. Continuous events cannot postpone a due check or defeat
 backoff. Healthy matching tables are left intact. Missing owned tables,
 incorrect binding counts and global invalidation trigger the existing
 drain/install/verify transaction even if the desired policy hash is unchanged.
+A change in the ports `devices auto` finds up is made to the live table
+instead; see [device membership](#device-membership).
 
 | Command | Authority and effect |
 | --- | --- |
@@ -134,6 +136,33 @@ file that may have disappeared.
 
 See the [resilience test plan](resilience.md) for fault coverage and
 the distinction between safe degradation and autonomous restoration.
+
+## Device membership
+
+`devices auto` resolves, on every check, to the CDX physical ports (driver
+`fsl_dpa`) whose link is up. Which ports are up is live state, not
+configuration: the policy hash, and so the table's marker, covers `auto` but
+not the ports it resolved to, and `check` reports the hash the installed table
+carries. When the resolved set changes, the daemon changes the live
+flowtable's device list in one nft transaction, `add flowtable` for ports that
+came up and `delete flowtable` for ports that went down, without deleting the
+table or draining the hardware. Ports that stay keep their bindings and their
+hardware flows; the adapter binds or unbinds only the ports the update names.
+The result is verified as strictly as a replacement: marker, device list, one
+binding per device, no invalidation. If the update fails or does not verify,
+the same check falls back to the drain/install/verify transaction.
+
+If fewer than two ports are up while a healthy table stands, the table is kept
+as it is, with one notice and no retries. Two is the smallest set a policy may
+name, a bound port without carrier costs nothing, and a returning port finds
+the table already right. With no table, or an unhealthy one, fewer than two
+ports is an error that is retried until a second port is up; the old table
+stays in place meanwhile.
+
+Only the daemon follows ports, and only while it holds automatic control. A
+manual `apply` always performs the full transaction. An explicit device list
+is configuration: changing it is a new policy, and the table is replaced.
+`status` reports the installed flowtable's `devices`.
 
 ## Firewall ordering and revocation
 
@@ -196,8 +225,8 @@ case when it retains automatic authority; a manual transaction remains paused
 until explicit apply/resume. A table with the same name but no controller marker,
 or backend bindings owned by another table, is refused.
 
-`status` reports `policy_installed`, `policy_hash`, `admission_ready` and the
-backend counters. A present policy does not establish active hardware traffic.
+`status` reports `policy_installed`, `policy_hash`, `devices`, `admission_ready`
+and the backend counters. A present policy does not establish active hardware traffic.
 Use directional hardware counters, software interface TX counters and CPU
 measurements to prove execution. Global invalidation may leave the policy
 installed while admission is stopped. The daemon performs a full transaction

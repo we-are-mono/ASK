@@ -19,17 +19,6 @@ static int parse_bool(struct ft_ctx *ctx, const char *s, bool *out)
 	FAIL("enabled: expected yes or no");
 }
 
-static int valid_ifname(const char *s)
-{
-	size_t n = strlen(s), i;
-	if (n < 1 || n > FT_IFNAME_MAX)
-		return 0;
-	for (i = 0; i < n; i++)
-		if (!isalnum((unsigned char)s[i]) && s[i] != '_' && s[i] != '.' && s[i] != '-')
-			return 0;
-	return 1;
-}
-
 static int parse_u32(const char *s, uint32_t *out)
 {
 	char *end;
@@ -334,12 +323,12 @@ int ft_conf_parse(struct ft_ctx *ctx, const char *text, size_t len, struct ft_po
 					int i;
 					if (out->ndevices >= FT_MAX_DEVICES)
 						FAIL("devices: at most %d interfaces", FT_MAX_DEVICES);
-					if (!valid_ifname(val))
+					if (!ft_ifname_valid(val))
 						FAIL("devices: invalid interface name '%s'", val);
 					for (i = 0; i < out->ndevices; i++)
 						if (!strcmp(out->devices[i], val))
 							FAIL("devices: duplicate '%s'", val);
-					/* valid_ifname bounds len to FT_IFNAME_MAX; copy incl. NUL. */
+					/* ft_ifname_valid bounds len to FT_IFNAME_MAX; copy incl. NUL. */
 					memcpy(out->devices[out->ndevices], val, strlen(val) + 1);
 					out->ndevices++;
 				} while (next_token(&lp, lend, val, sizeof(val)) > 0);

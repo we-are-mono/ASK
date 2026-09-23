@@ -61,6 +61,10 @@ int ft_enumerate(struct ft_policy *p)
 			continue;
 		if (strlen(e->d_name) > FT_IFNAME_MAX)
 			continue;
+		/* A port renamed to something the controller cannot render and
+		 * read back is left out rather than written into nft. */
+		if (!ft_ifname_valid(e->d_name))
+			continue;
 		if (is_phys_up(e->d_name)) {
 			snprintf(names[n], sizeof(names[n]), "%s", e->d_name);
 			n++;

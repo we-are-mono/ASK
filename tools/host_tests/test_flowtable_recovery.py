@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import threading
@@ -13,6 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE = ROOT / "flowtable/src"
 POLICY = "enabled yes\ndevices eth3 eth4\nscope any\n"
+AUTO = "enabled yes\ndevices auto\nscope any\n"
 
 
 @pytest.fixture
@@ -51,12 +53,25 @@ def controller(tmp_path):
 int ft_nl_open(void) { return open(getenv("FT_TEST_EVENTS"), O_RDWR | O_NONBLOCK); }
 int ft_nl_drain(int fd) { char b[4096]; return read(fd, b, sizeof(b)) > 0; }
 ''')
+    # The up ports are whatever a test last published, eth3 and eth4 until then.
     (src / "enumerate.c").write_text('''
 #include "runtime.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 int ft_enumerate(struct ft_policy *p) {
-    strcpy(p->devices[0], "eth3"); strcpy(p->devices[1], "eth4");
-    return p->ndevices = 2;
+    char path[4096], name[FT_IFNAME_MAX + 1];
+    FILE *f;
+    snprintf(path, sizeof(path), "%s/ports", getenv("FT_TEST_ROOT"));
+    p->ndevices = 0;
+    if (!(f = fopen(path, "r"))) {
+        strcpy(p->devices[0], "eth3"); strcpy(p->devices[1], "eth4");
+        return p->ndevices = 2;
+    }
+    while (p->ndevices < FT_MAX_DEVICES && fscanf(f, "%15s", name) == 1)
+        strcpy(p->devices[p->ndevices++], name);
+    fclose(f);
+    return p->ndevices;
 }
 ''')
     binary = tmp_path / "ask-flowtable"
@@ -124,6 +139,15 @@ class Controller:
         tmp = path.with_suffix(".update")
         tmp.write_text("".join(f"{k} {v}\n" for k, v in fields.items()))
         tmp.replace(path)
+
+    def ports(self, *names):
+        """Publish the ports `devices auto` finds up."""
+        tmp = self.root / "ports.update"
+        tmp.write_text(" ".join(names) + "\n")
+        tmp.replace(self.root / "ports")
+
+    def log(self):
+        return (self.root / "daemon.log").read_text()
 
     @contextmanager
     def daemon(self):
@@ -441,3 +465,158 @@ def test_resume_rejects_candidate_configuration(controller):
     result = c.run("resume", "--config", str(c.root / "policy"), check=False)
     assert result.returncode == 2
     assert c.status()["reconciliation_paused"]
+
+
+def statements(call):
+    """(verb, devices) for each statement of a device membership update."""
+    return [(verb, re.findall(r'"([^"]+)"', names)) for verb, names in
+            re.findall(r"^(add|delete) flowtable inet ask_flowtable fast \{.*?devices = \{([^}]*)\}",
+                       call["script"], re.M)]
+
+
+def following(c, ports):
+    status = c.status()
+    return (sorted(status["devices"] or []) == sorted(ports) and status["admission_ready"]
+            and status["backend"]["bindings"] == len(ports))
+
+
+def test_auto_ports_are_followed_in_place(controller):
+    """Under `devices auto` a port joining or leaving is added to or deleted
+    from the live flowtable. The table is not deleted, nothing drains, the
+    ports that stay are not rebound, and the policy hash, which `check`
+    computes without resolving any port, does not move. A swap is one
+    transaction."""
+    c = controller
+    (c.root / "policy").write_text(AUTO)
+    with c.daemon():
+        c.wait(lambda: following(c, ["eth3", "eth4"]))
+        configured = json.loads(c.run("check").stdout)["policy_hash"]
+        assert c.status()["policy_hash"] == configured
+        # Hardware flows on the ports that stay: a drain would have to empty them.
+        c.backend(entries=6, handle_refs=6, neighbour_refs=6)
+        for ports, update in ((["eth3", "eth4", "eth5"], [("add", ["eth5"])]),
+                              (["eth3", "eth4"], [("delete", ["eth5"])]),
+                              (["eth3", "eth5"], [("add", ["eth5"]), ("delete", ["eth4"])])):
+            before = len(c.calls("-f"))
+            c.ports(*ports)
+            c.wait(lambda: following(c, ports))
+            calls = c.calls("-f")[before:]
+            assert [statements(call) for call in calls] == [update], calls
+            status = c.status()
+            assert status["policy_hash"] == configured, status
+            assert status["backend"]["entries"] == 6, status
+        # Only the first install checked, installed a table and drained.
+        assert not c.calls("delete") and len(c.calls("--check")) == 1
+        assert len(c.calls("-f")) == 4
+
+
+def test_explicit_device_list_change_replaces_the_table(controller):
+    """An explicit device list is configuration: changing it is a new policy,
+    installed by the full delete, drain, check and install transaction."""
+    c = controller
+    with c.daemon():
+        c.wait(c.ready)
+        original = c.status()["policy_hash"]
+        c.backend(entries=6, handle_refs=6, neighbour_refs=6)
+        (c.root / "policy").write_text("enabled yes\ndevices eth3 eth4 eth5\nscope any\n")
+        c.wait(lambda: following(c, ["eth3", "eth4", "eth5"]))
+        status = c.status()
+        assert status["policy_hash"] != original
+        assert status["backend"]["entries"] == 0, status
+        assert len(c.calls("delete")) == 1 and len(c.calls("--check")) == 2
+        assert all(call["script"].startswith("table inet ask_flowtable") for call in c.calls("-f"))
+
+
+def test_auto_below_two_ports_keeps_the_installed_table(controller):
+    """With no table, fewer than two up ports install nothing and retry. Once
+    a table stands, dropping below two keeps it as it is, with one notice and
+    no retries; a different second port is then followed from that table. An
+    unhealthy table is still never replaced by one that cannot forward."""
+    c = controller
+    (c.root / "policy").write_text(AUTO)
+    c.ports("eth3")
+    with c.daemon():
+        c.wait(lambda: "deferred: fewer than two offload-capable ports are up" in c.log())
+        assert not c.calls("-f") and not c.ready()
+        c.ports("eth3", "eth4")
+        c.wait(lambda: following(c, ["eth3", "eth4"]))
+        c.backend(entries=6, handle_refs=6, neighbour_refs=6)
+        deferred = c.log().count("deferred")
+        c.ports("eth3")
+        c.wait(lambda: "keeping the installed devices" in c.log())
+        time.sleep(0.5)  # several more checks
+        assert following(c, ["eth3", "eth4"]) and c.status()["backend"]["entries"] == 6
+        assert c.log().count("keeping the installed devices") == 1, c.log()
+        assert c.log().count("deferred") == deferred, c.log()
+        assert len(c.calls("-f")) == 1 and not c.calls("delete")
+        c.ports("eth3", "eth5")
+        c.wait(lambda: following(c, ["eth3", "eth5"]))
+        assert statements(c.calls("-f")[-1]) == [("add", ["eth5"]), ("delete", ["eth4"])]
+        assert not c.calls("delete") and c.status()["backend"]["entries"] == 6
+        c.ports("eth3")
+        c.backend(invalidated=1)
+        c.wait(lambda: c.log().count("deferred: fewer than two") > 1)
+        assert not c.calls("delete") and sorted(c.status()["devices"]) == ["eth3", "eth5"]
+        c.ports("eth3", "eth5")
+        c.wait(lambda: following(c, ["eth3", "eth5"]))
+        assert len(c.calls("delete")) == 1
+
+
+def relist(c, name, listed):
+    """Make nft list a device under another name than the one installed."""
+    table = c.root / "table"
+    table.write_text(table.read_text().replace(f'"{name}"', f'"{listed}"'))
+
+
+def test_explicit_device_listed_under_its_primary_name_is_kept(controller):
+    """nft accepts a device's alternative name and lists its primary one. An
+    explicit list is identified by its hash, not by comparing names with the
+    listing, which would replace such a table on every check."""
+    c = controller
+    with c.daemon():
+        c.wait(c.ready)
+        relist(c, "eth4", "wan0")
+        time.sleep(0.5)  # several checks
+        assert sorted(c.status()["devices"]) == ["eth3", "wan0"] and c.ready()
+        assert len(c.calls("-f")) == 1 and not c.calls("delete")
+
+
+def test_auto_listing_it_cannot_read_is_judged_by_bindings(controller):
+    """A listing whose devices do not read back degrades to the binding count
+    with one warning, never to a replacement on every check. A change in
+    count is then all it can see, and the full transaction handles it."""
+    c = controller
+    (c.root / "policy").write_text(AUTO)
+    with c.daemon():
+        c.wait(lambda: following(c, ["eth3", "eth4"]))
+        relist(c, "eth4", "e;h4")
+        c.wait(lambda: "cannot read the installed flowtable's devices" in c.log())
+        time.sleep(0.5)  # several checks
+        assert c.status()["devices"] is None and c.ready()
+        assert c.log().count("cannot read the installed flowtable's devices") == 1, c.log()
+        assert len(c.calls("-f")) == 1 and not c.calls("delete")
+        c.ports("eth3", "eth4", "eth5")
+        c.wait(lambda: following(c, ["eth3", "eth4", "eth5"]))
+        assert len(c.calls("delete")) == 1
+
+
+@pytest.mark.parametrize("fault", ["fail-update", "short-bind"])
+def test_failed_device_update_falls_back_to_replacement(controller, fault):
+    """A device update that fails, or commits without the bindings it should
+    have acquired, falls back to the full transaction in the same check. The
+    replacement converges where retrying the update alone could not."""
+    c = controller
+    (c.root / "policy").write_text(AUTO)
+    with c.daemon():
+        c.wait(lambda: following(c, ["eth3", "eth4"]))
+        original = c.status()["policy_hash"]
+        (c.root / fault).touch()
+        c.ports("eth3", "eth4", "eth5")
+        c.wait(lambda: following(c, ["eth3", "eth4", "eth5"]))
+        assert (c.root / "fault-consumed").exists()
+        assert c.status()["policy_hash"] == original
+        installs = c.calls("-f")
+        assert [statements(call) for call in installs] == [[], [("add", ["eth5"])], []], installs
+        assert installs[2]["script"].startswith("table inet ask_flowtable")
+        assert len(c.calls("delete")) == 1
+        assert "device update failed" in c.log()

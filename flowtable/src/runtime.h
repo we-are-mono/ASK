@@ -52,8 +52,10 @@ int ft_nft_exec(char *const argv[], const char *input, char *out, size_t outlen,
 int ft_nft_run(struct ft_ctx *ctx, const char *script, bool check_only, int keepfd);
 int ft_nft_delete(struct ft_ctx *ctx, int keepfd);  /* delete our table if present */
 /* Inspect our table: present, whether it carries our marker (owned) vs a
- * foreign table of the same name, and the marker hash. */
-int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65], int keepfd);
+ * foreign table of the same name, the marker hash and, when devices is not
+ * NULL, the devices an owned table's flowtable is bound to. */
+int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65],
+		   struct ft_devices *devices, int keepfd);
 
 /* flock the single-flight lock for the duration of an operation. Returns an fd
  * (>=0) to close when done, or -1 (ctx->err). */

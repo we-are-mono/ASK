@@ -26,7 +26,8 @@ int ft_nft_run(struct ft_ctx *ctx, const char *script, bool check_only, int keep
 	return 0;
 }
 
-int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65], int keepfd)
+int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65],
+		   struct ft_devices *devices, int keepfd)
 {
 	/* nft's listing of a table rendered within FT_RENDER_MAX; a truncated
 	 * listing is refused, so it must never outgrow this. */
@@ -34,6 +35,8 @@ int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65]
 	char *argv[] = { "nft", "list", "table", "inet", FT_TABLE, NULL };
 	int rc = ft_nft_exec(argv, NULL, out, sizeof(out), keepfd);
 	*present = false; *owned = false; if (hash) hash[0] = '\0';
+	if (devices)
+		devices->n = -1;
 	if (rc < 0) goto inspect_error;
 	if (rc != 0) {
 		/* An unsuccessful lookup is not proof of absence: ENOMEM, denied
@@ -53,6 +56,8 @@ int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65]
 	}
 	*present = true;
 	*owned = ft_marker_owned(out, hash);
+	if (devices && *owned)
+		ft_marker_devices(out, devices);
 	return 0;
 inspect_error:
 	snprintf(ctx->err, sizeof(ctx->err), "cannot inspect nft table state");
@@ -62,7 +67,7 @@ inspect_error:
 int ft_nft_delete(struct ft_ctx *ctx, int keepfd)
 {
 	bool present, owned; char hash[65];
-	if (ft_nft_inspect(ctx, &present, &owned, hash, keepfd))
+	if (ft_nft_inspect(ctx, &present, &owned, hash, NULL, keepfd))
 		return -1;
 	if (!present)
 		return 0;

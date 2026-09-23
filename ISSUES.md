@@ -307,6 +307,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A208.** Under `devices auto` any port's link change replaced the daemon's table, draining every offloaded flow —
+  fixed (_:/^flowtable: follow auto device membership without replacing the table_).
+
 - [x] **A207.** Interface packet counts stepped back by 2^32 at the firmware's 32-bit packet wrap —
   fixed (_:/^cdx: carry interface packet counts past the firmware's 32 bits_).
 

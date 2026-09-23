@@ -101,14 +101,43 @@ int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 long ft_render_bound(struct ft_ctx *ctx, const struct ft_policy *p);
 
 /* 64-hex fingerprint of the policy's canonical form, used as the nft table's
- * ownership marker. Stable across runs and independent of qos_mark_mask. */
+ * ownership marker. Stable across runs and independent of qos_mark_mask.
+ * Under "devices auto" it covers the word auto, not the ports it resolved
+ * to: which ports are up is live state, not configuration. */
 void ft_policy_hash(const struct ft_policy *p, char out[65]);
+
+/* A flowtable's device list as installed, read back from nft. n is -1 when
+ * there is none to read: no owned table, or a listing this controller cannot
+ * parse. */
+struct ft_devices {
+	int  n;
+	char name[FT_MAX_DEVICES][FT_IFNAME_MAX + 1];
+};
+
+/* The update that turns the installed flowtable's devices into the policy's:
+ * one `add flowtable` for the devices it lacks and one `delete flowtable` for
+ * those it no longer names, as a single nft script. Returns its length, 0
+ * (an empty script) when the two already agree, or -1 (ctx->err set) on
+ * overflow. */
+int ft_render_membership(struct ft_ctx *ctx, const struct ft_policy *p,
+			 const struct ft_devices *installed, char *buf, size_t buflen);
+
+/* Interface names this controller writes into nft and reads back from it:
+ * letters, digits, '_', '.' and '-', at most FT_IFNAME_MAX. */
+bool ft_ifname_valid(const char *s);
+bool ft_devices_has(const struct ft_devices *d, const char *name);
 
 /* The nft table name and the ownership-marker prefix. */
 /* Ownership-marker recognition over `nft list table` text (pure; host-tested). */
 int ft_marker_owned(const char *nft_output, char hash[65]);
 
-#define FT_TABLE   "ask_flowtable"
-#define FT_MARKER  "ask-flowtable/v1:"
+/* The owned table's flowtable devices from the same text (pure; host-tested).
+ * Returns 0 with d filled, or -1 (d->n = -1) when the listing names no such
+ * flowtable or a device this parser cannot read back. */
+int ft_marker_devices(const char *nft_output, struct ft_devices *d);
+
+#define FT_TABLE     "ask_flowtable"
+#define FT_FLOWTABLE "fast"
+#define FT_MARKER    "ask-flowtable/v1:"
 
 #endif /* ASK_FLOWTABLE_POLICY_H */

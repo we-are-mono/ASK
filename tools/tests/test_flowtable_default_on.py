@@ -29,12 +29,12 @@ async def test_boot_service_offloads_by_default():
     with Console.target(log_path=str(ARTIFACTS / "default-on-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
 
-        # Zero-config: the shipped default parses and is the catch-all. (Its
-        # `check` hash covers the unresolved "devices auto"; the installed
-        # table's marker is the resolved-device hash, so the two differ by
-        # design and are not compared here.)
+        # Zero-config: the shipped default parses and is the catch-all. Its
+        # `check` hash resolves no port, and under "devices auto" neither does
+        # the installed table's marker, so the two name the same policy.
         shipped = await console_command(con, DAEMON, "check", "--config", DEFAULT_CONF)
-        assert console_json(shipped["stdout"])["policy_hash"], shipped
+        expected = console_json(shipped["stdout"])["policy_hash"]
+        assert expected, shipped
 
         # (Re)start the boot service — idempotent, and the point of the test is
         # that starting it is the *whole* configuration.
@@ -43,17 +43,19 @@ async def test_boot_service_offloads_by_default():
         await console_command(con, DAEMON, "resume")
 
         # It installs its table and binds every up CDX physical port with no
-        # further action.
+        # further action. A table a previous manual apply left is replaced by
+        # the configured one, so wait for that one.
         for _ in range(40):
             status = await _status(con)
-            if status["policy_installed"] and status["admission_ready"]:
+            if (status["policy_installed"] and status["admission_ready"]
+                    and status["policy_hash"] == expected):
                 break
             await asyncio.sleep(0.5)
         else:
             pytest.fail(f"default-on service did not bind the backend: {status}")
 
-        # The installed table carries our ownership marker (a 64-hex hash), and
-        # every up CDX physical port is bound — with no configuration.
-        assert status["policy_hash"] and len(status["policy_hash"]) == 64, status
-        assert status["backend"]["bindings"] >= 2, status
+        # The installed table carries our ownership marker, and every up CDX
+        # physical port is bound — with no configuration.
+        assert len(status["devices"]) >= 2, status
+        assert status["backend"]["bindings"] == len(status["devices"]), status
         assert not status["backend"]["fatal"] and not status["backend"]["invalidated"], status

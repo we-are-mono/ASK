@@ -101,19 +101,66 @@ int ft_load_policy(struct ft_ctx *ctx, const char *path, struct ft_policy *p)
 	return ft_conf_parse(ctx, buf, (size_t)n, p);
 }
 
+static bool same_devices(const struct ft_devices *installed, const struct ft_policy *p)
+{
+	int i;
+
+	if (installed->n != p->ndevices)
+		return false;
+	for (i = 0; i < p->ndevices; i++)
+		if (!ft_devices_has(installed, p->devices[i]))
+			return false;
+	return true;
+}
+
+/* Bring a healthy owned table's flowtable to the ports "devices auto" now
+ * resolves to, in place. The policy is unchanged, so nothing is drained: the
+ * devices that stay keep their bindings and their hardware flows, and the
+ * adapter binds or unbinds only the devices named in the update. Verified as
+ * strictly as a replacement. Returns 0, or -1 (ctx->err) for the caller to
+ * fall back to the full transaction. */
+static int follow_devices(struct ft_ctx *ctx, const struct ft_policy *p,
+			  const struct ft_devices *installed, const char *hash, int lock)
+{
+	struct ft_devices now;
+	struct ft_backend st;
+	bool present, owned;
+	char inhash[65], script[4096];
+	int len = ft_render_membership(ctx, p, installed, script, sizeof(script));
+
+	/* An empty update runs no nft; the verification below still decides. */
+	if (len < 0 || (len && ft_nft_run(ctx, script, false, lock)) ||
+	    ft_nft_inspect(ctx, &present, &owned, inhash, &now, lock) ||
+	    ft_backend_read(ctx, &st))
+		return -1;
+	if (!(present && owned && !strcmp(inhash, hash) && same_devices(&now, p) &&
+	      st.present && !st.observe &&
+	      st.bindings == p->ndevices && !st.fatal && !st.invalidated && !st.quarantine)) {
+		snprintf(ctx->err, sizeof(ctx->err), "updated devices did not acquire healthy backend bindings");
+		return -1;
+	}
+	return 0;
+}
+
+/* Whether the daemon is holding a table whose ports fell below two, and
+ * whether it has an owned table whose devices it cannot read back: each is
+ * logged once per episode rather than on every check. */
+static bool holding, unreadable;
+
 /* The apply transaction, mirroring the Python Runtime.apply(): drain the old
  * hardware before rebinding, never leave a foreign or half-applied table. */
 static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			int lock, bool reconcile)
 {
 	struct ft_backend st, drained;
+	struct ft_devices installed;
 	bool present, owned;
 	char inhash[65], script[FT_RENDER_MAX + 1];
 	char dj[512], bj[512], hash[65];
 	int rc = -1;
 	memset(&drained, 0, sizeof(drained));
 
-	if (ft_nft_inspect(ctx, &present, &owned, inhash, lock))
+	if (ft_nft_inspect(ctx, &present, &owned, inhash, &installed, lock))
 		goto out;
 	if (present && !owned) {
 		snprintf(ctx->err, sizeof(ctx->err),
@@ -136,18 +183,72 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			snprintf(ctx->err, sizeof(ctx->err), "hardware retirement failed; fresh boot required");
 			goto out;
 		}
+		bool held = holding;
+
+		holding = false;
 		if (p->devices_auto)
 			ft_enumerate(p);
+		ft_policy_hash(p, hash);
+		if (owned && installed.n < 0 && !unreadable) {
+			fprintf(stderr, "ask-flowtable: cannot read the installed flowtable's devices; "
+				"judging them by binding count\n");
+			ft_log(LOG_WARNING, "cannot read the installed flowtable's devices; "
+			       "judging them by binding count");
+		}
+		unreadable = owned && installed.n < 0;
+		if (reconcile && owned && !strcmp(inhash, hash) && !st.invalidated && !st.quarantine) {
+			/* Only "devices auto" compares the listed devices with
+			 * the policy's. An explicit list is covered by the hash,
+			 * and nft lists a device named by an alternative name
+			 * under its primary one, so comparing names would replace
+			 * such a table on every check. A listing whose devices
+			 * cannot be read back is judged by its binding count
+			 * alone too: replacing the table on every check would be
+			 * far worse than not following a port. */
+			if (st.bindings == p->ndevices &&
+			    (!p->devices_auto || installed.n < 0 || same_devices(&installed, p)))
+				return 0;
+			/* The same policy on other ports: follow them in place
+			 * when the table is otherwise healthy. */
+			if (p->devices_auto && installed.n >= 0 && st.bindings == installed.n) {
+				/* Fewer than two up: keep the table as it stands.
+				 * Two is the smallest set a policy may name, and
+				 * following below it would leave a table no apply
+				 * could have made. At zero the flowtable would
+				 * lose its last binding, and the adapter refuses
+				 * a first binding while the flowtable still holds
+				 * flows, so the ports' return would force a full
+				 * replacement. A port without carrier costs its
+				 * binding nothing: nothing ingresses on it, and
+				 * the adapter's link events have already retired
+				 * the hardware flows through it. When the port
+				 * returns the table is already right; when another
+				 * one does, it is followed from here. */
+				if (p->ndevices < 2) {
+					if (!held) {
+						fprintf(stderr, "ask-flowtable: fewer than two offload-capable "
+							"ports are up; keeping the installed devices\n");
+						ft_log(LOG_NOTICE, "fewer than two offload-capable ports are up; "
+						       "keeping the installed devices");
+					}
+					holding = true;
+					return 0;
+				}
+				if (!follow_devices(ctx, p, &installed, hash, lock)) {
+					rc = 0;
+					goto out;
+				}
+				fprintf(stderr, "ask-flowtable: device update failed: %s; replacing the table\n",
+					ctx->err);
+				ft_log(LOG_WARNING, "device update failed: %s; replacing the table", ctx->err);
+			}
+		}
 		if (p->ndevices < 2) {
 			snprintf(ctx->err, sizeof(ctx->err), "fewer than two offload-capable ports are up");
 			goto out;
 		}
 		if (ft_render(ctx, p, st.qos_mark_mask, script, sizeof(script)) < 0)
 			goto out;
-		ft_policy_hash(p, hash);
-		if (reconcile && owned && !strcmp(inhash, hash) &&
-		    st.bindings == p->ndevices && !st.invalidated && !st.quarantine)
-			return 0;
 	} else if (reconcile && !present &&
 		   (!st.present || (!st.bindings && !st.entries && !st.handle_refs &&
 				   !st.neighbour_refs && !st.quarantine && !st.fatal))) {
@@ -180,7 +281,7 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 		goto out;
 
 	/* Verify healthy bindings; roll back on any doubt. */
-	if (ft_nft_inspect(ctx, &present, &owned, inhash, lock) || ft_backend_read(ctx, &st))
+	if (ft_nft_inspect(ctx, &present, &owned, inhash, NULL, lock) || ft_backend_read(ctx, &st))
 		goto rollback;
 	ft_policy_hash(p, hash);
 	if (!(present && owned && !strcmp(inhash, hash) &&
@@ -241,7 +342,7 @@ int ft_stop(struct ft_ctx *ctx, bool emit)
 		return -1;
 	if (paused_set(ctx, true))
 		goto out;
-	if (ft_nft_inspect(ctx, &present, &owned, inhash, lock))
+	if (ft_nft_inspect(ctx, &present, &owned, inhash, NULL, lock))
 		goto out;
 	if (ft_backend_read(ctx, &st))
 		goto out;
@@ -268,26 +369,38 @@ out:
 static int cmd_status(struct ft_ctx *ctx)
 {
 	struct ft_backend st;
+	struct ft_devices installed;
 	bool present, owned, paused;
-	char inhash[65];
-	int lock = ft_lock(ctx, 30000);
+	char inhash[65], devices[FT_MAX_DEVICES * (FT_IFNAME_MAX + 4) + 8];
+	size_t o;
+	int i, lock = ft_lock(ctx, 30000);
 	if (lock < 0)
 		return -1;
-	if (paused_read(ctx, &paused) || ft_nft_inspect(ctx, &present, &owned, inhash, lock) ||
+	if (paused_read(ctx, &paused) ||
+	    ft_nft_inspect(ctx, &present, &owned, inhash, &installed, lock) ||
 	    ft_backend_read(ctx, &st)) {
 		close(lock);
 		return -1;
 	}
 	close(lock);
+	/* The ports the installed flowtable is bound to. Under "devices auto"
+	 * the policy hash no longer says, so status does. */
+	o = (size_t)snprintf(devices, sizeof(devices), "%s", installed.n < 0 ? "null" : "[");
+	for (i = 0; i < installed.n; i++)
+		o += (size_t)snprintf(devices + o, sizeof(devices) - o, "%s\"%s\"",
+				      i ? ", " : "", installed.name[i]);
+	if (installed.n >= 0)
+		snprintf(devices + o, sizeof(devices) - o, "]");
 	bool ready = owned && st.present &&
 		     st.bindings > 0 && !st.fatal && !st.invalidated && !st.observe && !st.quarantine;
-	printf("{\"policy_installed\": %s, \"policy_hash\": %s%s%s, "
+	printf("{\"policy_installed\": %s, \"policy_hash\": %s%s%s, \"devices\": %s, "
 	       "\"reconciliation_paused\": %s, "
 	       "\"admission_ready\": %s, \"backend\": {\"present\": %s, "
 	       "\"bindings\": %ld, \"entries\": %ld, \"handle_refs\": %ld, \"neighbour_refs\": %ld, "
 	       "\"quarantine\": %ld, \"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld}}\n",
 	       owned ? "true" : "false",
 	       owned ? "\"" : "null", owned ? inhash : "", owned ? "\"" : "",
+	       devices,
 	       paused ? "true" : "false",
 	       ready ? "true" : "false",
 	       st.present ? "true" : "false",

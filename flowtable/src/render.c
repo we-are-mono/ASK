@@ -80,6 +80,13 @@ static void emit_match(struct out *o, const struct ft_match *m, const char *acti
 		emit(o, "  %s\n", action);
 }
 
+/* The flowtable's hook and flags, shared by the table and by a membership
+ * update of it. Netfilter refuses an update naming another hook or priority,
+ * and one whose flags differ in offload from the live flowtable's; nft always
+ * sends the update's flags, so they have to be restated. */
+#define FT_HOOK  "hook ingress priority 0;"
+#define FT_FLAGS "flags offload;"
+
 int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 	      uint32_t qos_mark_mask, char *buf, size_t buflen)
 {
@@ -96,10 +103,10 @@ int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 
 	emit(&o, "table inet %s {\n", FT_TABLE);
 	emit(&o, " comment \"%s%s\"\n", FT_MARKER, hash);
-	emit(&o, " flowtable fast { hook ingress priority 0; devices = { ");
+	emit(&o, " flowtable " FT_FLOWTABLE " { " FT_HOOK " devices = { ");
 	for (i = 0; i < p->ndevices; i++)
 		emit(&o, "%s\"%s\"", i ? ", " : "", p->devices[i]);
-	emit(&o, " }; flags offload; }\n");
+	emit(&o, " }; " FT_FLAGS " }\n");
 	emit(&o, " chain admit {\n");
 	emit(&o, "  type filter hook forward priority 10; policy accept;\n");
 	/* Both families. The adapter has carried IPv6 since the increment that
@@ -123,6 +130,47 @@ int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 
 	if (o.ovf) {
 		snprintf(ctx->err, sizeof(ctx->err), "rendered ruleset exceeds buffer");
+		return -1;
+	}
+	return (int)o.off;
+}
+
+static bool policy_has(const struct ft_policy *p, const char *name)
+{
+	int i;
+
+	for (i = 0; i < p->ndevices; i++)
+		if (!strcmp(p->devices[i], name))
+			return true;
+	return false;
+}
+
+/* One nft script, so one transaction: an add and a delete commit or abort
+ * together. Netfilter binds an added device while preparing the transaction
+ * and unbinds a deleted one at commit; the devices in both lists are left
+ * alone, and with them every hardware flow that ingresses on them. */
+int ft_render_membership(struct ft_ctx *ctx, const struct ft_policy *p,
+			 const struct ft_devices *installed, char *buf, size_t buflen)
+{
+	struct out o = { buf, buflen, 0, false };
+	int i, n = 0;
+
+	if (buflen)
+		buf[0] = '\0';   /* nothing to change is an empty script */
+	for (i = 0; i < p->ndevices; i++)
+		if (!ft_devices_has(installed, p->devices[i]))
+			emit(&o, n++ ? ", \"%s\"" : "add flowtable inet " FT_TABLE " " FT_FLOWTABLE
+			     " { " FT_HOOK " devices = { \"%s\"", p->devices[i]);
+	if (n)
+		emit(&o, " }; " FT_FLAGS " }\n");
+	for (i = n = 0; i < installed->n; i++)
+		if (!policy_has(p, installed->name[i]))
+			emit(&o, n++ ? ", \"%s\"" : "delete flowtable inet " FT_TABLE " " FT_FLOWTABLE
+			     " { " FT_HOOK " devices = { \"%s\"", installed->name[i]);
+	if (n)
+		emit(&o, " }; }\n");
+	if (o.ovf) {
+		snprintf(ctx->err, sizeof(ctx->err), "rendered device update exceeds buffer");
 		return -1;
 	}
 	return (int)o.off;

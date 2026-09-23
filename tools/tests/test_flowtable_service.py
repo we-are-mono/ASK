@@ -535,13 +535,13 @@ async def rendered_devices(r):
 
 async def devices_follow(r, expected, timeout=20):
     """Wait until the installed flowtable names exactly `expected`, each of
-    them bound, with the service healthy."""
+    them bound, with the service healthy and reporting the same devices."""
     deadline, samples = time.monotonic() + timeout, []
     while time.monotonic() < deadline:
         devices, status = await rendered_devices(r), await service_status(r)
         samples.append({"devices": devices, "status": status})
-        if (devices == expected and status["admission_ready"]
-                and status["backend"]["bindings"] == len(expected)):
+        if (devices == expected and sorted(status["devices"] or []) == expected
+                and status["admission_ready"] and status["backend"]["bindings"] == len(expected)):
             return status
         await asyncio.sleep(0.5)
     r.record("service-devices-timeout", samples)
@@ -557,58 +557,100 @@ async def operstate(r, port, wanted, timeout):
     return False
 
 
+async def set_link(r, port, state):
+    await command(r.target, r.session, "ip", "link", "set", "dev", port, state)
+
+
 async def test_flowtable_service_devices_follow_ports(rig):
-    """`devices auto` is resolved on every reconciliation, not once at start:
-    an offload-capable port gaining its link joins the flowtable and one going
-    down leaves it, with no restart, reload or policy edit in between.
+    """`devices auto` is resolved on every reconciliation, and a change in
+    which ports are up is made to the live flowtable: a spare port gaining its
+    link is added to it and losing the link deletes it again, with no restart,
+    reload or policy edit in between. The policy is the configuration, not the
+    ports it found up, so its hash never moves. Flows on the test ports stay
+    in hardware throughout: the same entries, counting through both changes,
+    with nothing installed or deleted, and their traffic loses nothing.
 
     This image configures only the LAN and WAN ports, so the spare fsl_dpa
-    ports are administratively down. One with a cable is brought up and down
-    again; an already eligible spare is taken down and back up instead. A port
-    carrying an address is never touched."""
+    ports are administratively down; one with a cable is toggled. The flows
+    are proven against a table of the two test ports alone, so a spare that
+    is already up is taken down first and toggled instead. A port carrying an
+    address is never touched."""
     r = rig
+    flows = [{**f, "lan": r.lan_ip} for f in FLOWS[:2]]
+    base = sorted([TARGET_LAN_IF, TARGET_WAN_IF])
     async with managed_service(r, devices=("auto",)):
         ports = await dpaa_ports(r)
         eligible = sorted(name for name, port in ports.items() if port["operstate"] == "up")
-        assert {TARGET_LAN_IF, TARGET_WAN_IF} <= set(eligible), ports
+        assert set(base) <= set(eligible), ports
         baseline = await devices_follow(r, eligible)
         assert baseline["policy_hash"] == r.service_hash, baseline
+        # `check` resolves no port at all, and names the same policy.
+        assert (await flowtable_json(r.service_console, "check"))["policy_hash"] == r.service_hash
         links = json.loads((await command(r.target, r.session, "ip", "-j", "addr", "show"))["stdout"])
         addressed = {link["ifname"] for link in links
                      if any(a["family"] == "inet" or a.get("scope") == "global" for a in link.get("addr_info", []))}
-        spare = [name for name in ports if name not in (TARGET_LAN_IF, TARGET_WAN_IF, *addressed)]
-        port = restore = None
-        steps = []
+        spare = [name for name in ports if name not in (*base, *addressed)]
+        if set(eligible) - set(base) - set(spare):
+            pytest.skip(f"a port carrying an address is up beside the test ports: {eligible}")
+        port, restore = None, {}
         try:
-            live = [name for name in spare if ports[name]["operstate"] == "up"]
-            if live:
-                port, restore = live[0], "up"
-                steps = [("down", sorted(set(eligible) - {port})), ("up", eligible)]
-            else:
-                for name in (name for name in spare if not ports[name]["up"]):
-                    await command(r.target, r.session, "ip", "link", "set", "dev", name, "up")
-                    port, restore = name, "down"
-                    # A 1G copper port negotiates for a few seconds.
-                    if await operstate(r, name, "up", timeout=8):
-                        break
-                    await command(r.target, r.session, "ip", "link", "set", "dev", name, "down")
-                    port = restore = None
-                if port is None:
-                    pytest.skip(f"no spare fsl_dpa port has a link to toggle: {ports}")
-                steps = [(None, sorted([*eligible, port])), ("down", eligible)]
-            transitions = []
-            for action, expected in steps:
-                if action:
-                    await command(r.target, r.session, "ip", "link", "set", "dev", port, action)
-                status = await devices_follow(r, expected)
-                transitions.append({"port": port, "action": action or "carrier", "devices": expected,
-                                    "status": status})
-                # The marker hashes the resolved devices, so a changed set is a
-                # replaced table and the original set is the original policy.
-                assert (status["policy_hash"] == r.service_hash) == (expected == eligible), transitions
-            r.record("service-devices-follow", {"ports": ports, "eligible": eligible,
-                                                "transitions": transitions})
+            for name in sorted(set(eligible) - set(base)):
+                await set_link(r, name, "down")
+                restore[name] = "up"
+                port = port or name
+            for name in ([] if port else [name for name in spare if not ports[name]["up"]]):
+                await set_link(r, name, "up")
+                restore[name] = "down"
+                # A 1G copper port negotiates for a few seconds.
+                linked = await operstate(r, name, "up", timeout=8)
+                await set_link(r, name, "down")
+                if linked:
+                    port = name
+                    break
+            if port is None:
+                pytest.skip(f"no spare fsl_dpa port has a link to toggle: {ports}")
+            await devices_follow(r, base)
+            async with peer(r, flows) as p:
+                await warm(r, p, [0, 1], "service-devices-warm", flows)
+                samples = [await r.state()]
+                forwarded = await r.software_forwarded()
+                # The original sockets carry traffic through both changes.
+                await p.rpc("start", [0, 1], count=0, interval=0.01)
+                transitions = []
+                for state, expected in (("up", sorted([*base, port])), ("down", base)):
+                    await set_link(r, port, state)
+                    if state == "up":
+                        assert await operstate(r, port, "up", timeout=8), port
+                    # Bounded well inside the LAN peer's 35 s wait for its
+                    # next command, so a slow change fails here, not there.
+                    status = await devices_follow(r, expected, timeout=15)
+                    running = await p.rpc("status")
+                    samples.append(await r.state())
+                    transitions.append({"port": port, "link": state, "devices": expected,
+                                        "status": status, "peer": running})
+                    assert running["running"] == 2 and not running["errors"], transitions
+                    assert status["policy_hash"] == r.service_hash, transitions
+                transfers = await p.rpc("stop", [0, 1])
+                slow_path = await r.software_forwarded() - forwarded
+                r.record("service-devices-follow", {"ports": ports, "eligible": eligible, "samples": samples,
+                                                    "transitions": transitions, "transfers": transfers,
+                                                    "software_forwarded": slow_path})
+                assert [s["bindings"] for s in samples] == [2, 3, 2], samples
+                # Each sample against the one before it: the same hardware
+                # entries, still counting, and nothing installed or deleted.
+                for earlier, later in zip(samples, samples[1:]):
+                    assert (later["installs"], later["deletes"]) == (earlier["installs"], earlier["deletes"]), samples
+                    old, new = by_key(earlier), by_key(later)
+                    for key in keys([0, 1], flows):
+                        assert new[key]["cookie"] == old[key]["cookie"], (key, earlier, later)
+                        assert int(new[key]["packets"]) > int(old[key]["packets"]), (key, earlier, later)
+                for report in transfers.values():
+                    assert report["count"] > 0 and report["received"] == report["count"], transfers
+                assert 0 <= slow_path <= 64, slow_path
+                after = await hardware(r, p, "service-devices-after", flows)
+                assert ({key: row["cookie"] for key, row in by_key(after).items()}
+                        == {key: row["cookie"] for key, row in by_key(samples[0]).items()}), (samples[0], after)
         finally:
-            if restore:
-                await command(r.target, r.session, "ip", "link", "set", "dev", port, restore)
-                await devices_follow(r, eligible)
+            for name, state in restore.items():
+                await set_link(r, name, state)
+            await devices_follow(r, eligible)

@@ -59,14 +59,22 @@ void ft_policy_hash(const struct ft_policy *p, char out[65])
 {
 	/* Deterministic canonical serialization; list order is significant and
 	 * preserved, field order within a match is fixed by index. Independent
-	 * of qos_mark_mask so the marker is stable across adapter reloads. */
+	 * of qos_mark_mask so the marker is stable across adapter reloads.
+	 *
+	 * An explicit device list is configuration and is covered. The ports
+	 * "devices auto" resolved to are not: they are whichever ports are up
+	 * at this moment, so covering them made every link change a different
+	 * policy, and reconciling a different policy replaces the table --
+	 * retiring every offloaded flow, on every port, because a spare port's
+	 * link flapped. The daemon follows membership on the live flowtable
+	 * instead, and `check` (which resolves nothing) agrees with the table. */
 	char buf[FT_CONF_MAX * 2];
 	size_t n = sizeof(buf), o = 0;
 	int i;
 
 	app(buf, n, &o, "v%d|en=%d|auto=%d",
 	    p->version, p->enabled ? 1 : 0, p->devices_auto ? 1 : 0);
-	for (i = 0; i < p->ndevices; i++)
+	for (i = 0; !p->devices_auto && i < p->ndevices; i++)
 		app(buf, n, &o, "|d=%s", p->devices[i]);
 	app(buf, n, &o, "#scope");
 	for (i = 0; i < p->nscope; i++)

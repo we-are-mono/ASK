@@ -238,6 +238,109 @@ def test_marker_ownership(engine, text, owned):
     assert r.stdout.startswith("OWNED " if owned else "FOREIGN"), r.stdout
 
 
+# --- device membership ------------------------------------------------------
+
+AUTO = "devices auto\nscope any\nexclude tcp 21\n"
+HOOK = "hook ingress priority 0;"
+
+
+def marker(rules):
+    return re.search(r'comment "ask-flowtable/v1:([0-9a-f]{64})"', rules)[1]
+
+
+def flowtable_line(rules):
+    return next(line for line in rules.splitlines() if "flowtable fast" in line)
+
+
+def test_auto_identity_is_the_configuration_not_the_ports(engine):
+    """Under `devices auto` the ports are live state: the marker is the
+    configuration's hash whichever ports resolution found up, and equals the
+    hash `check` computes without resolving any. When it covered the ports, a
+    spare port's link changing was a different policy, and the daemon replaced
+    the table -- retiring every offloaded flow on every port."""
+    configured = check(engine, AUTO).stdout.split()[1]
+    for ports in ("eth3,eth4", "eth3,eth4,eth5", "eth0,eth3"):
+        r = run(engine, AUTO, "render", "--resolve", ports)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert marker(r.stdout) == configured, (ports, r.stdout)
+        assert re.findall(r'"([^"]+)"', flowtable_line(r.stdout)) == ports.split(","), r.stdout
+
+
+def test_explicit_device_list_is_part_of_the_identity(engine):
+    hashes = {check(engine, f"devices {devices}\nscope any\nexclude tcp 21\n").stdout for devices in
+              ("eth3 eth4", "eth3 eth4 eth5", "eth4 eth3")}
+    hashes.add(check(engine, AUTO).stdout)
+    assert len(hashes) == 4 and all(h.startswith("OK ") for h in hashes), hashes
+
+
+def membership(engine, installed, resolved):
+    r = run(engine, AUTO, "membership", "--installed", installed, "--resolve", resolved)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout.splitlines()
+
+
+@pytest.mark.parametrize("installed,resolved,update", [
+    ("eth3,eth4", "eth3,eth4,eth5",
+     ['add flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth5" }; flags offload; }']),
+    ("eth3,eth4,eth5", "eth3,eth4",
+     ['delete flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth5" }; }']),
+    ("eth3,eth4", "eth3,eth5,eth6",
+     ['add flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth5", "eth6" }; flags offload; }',
+      'delete flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth4" }; }']),
+    ("eth4,eth3", "eth3,eth4", []),
+])
+def test_membership_update_names_only_the_changed_devices(engine, installed, resolved, update):
+    """The add and delete are one script, so one nft transaction, and each
+    names only the devices that change. Netfilter refuses an update on another
+    hook or priority, or whose flags differ in offload from the live
+    flowtable's, so both restate what the table declares."""
+    assert membership(engine, installed, resolved) == update
+    declared = flowtable_line(render(engine, AUTO))
+    assert f"{{ {HOOK} devices" in declared and declared.endswith("flags offload; }")
+
+
+LISTED = """table inet ask_flowtable {{
+\tcomment "ask-flowtable/v1:{hex}"
+\tflowtable fast {{
+\t\thook ingress priority filter
+{devices}\t\tflags offload
+\t}}
+
+\tchain admit {{
+\t\ttype filter hook forward priority filter + 10; policy accept;
+\t\tmeta nfproto != {{ ipv4, ipv6 }} return
+\t}}
+}}
+"""
+
+
+@pytest.mark.parametrize("devices,read", [
+    ("\t\tdevices = { eth3, eth4 }\n", "DEVICES eth3 eth4"),           # nft 1.1.1
+    ('\t\tdevices = { "eth3", "eth4" }\n', "DEVICES eth3 eth4"),       # nft 1.1.6
+    ("\t\tdevices = { eth3 }\n", "DEVICES eth3"),
+    ("", "DEVICES"),                                                   # every device deleted
+    ('\t\tdevices = { eth3, "e;th4" }\n', "UNREADABLE -1"),
+    ("\t\tdevices = { " + ", ".join(f"eth{i}" for i in range(41)) + " }\n", "UNREADABLE -1"),
+])
+def test_listed_devices_are_read_back(engine, devices, read):
+    r = run(engine, LISTED.format(hex="0" * 64, devices=devices), "devices")
+    assert r.returncode == 0 and r.stdout.strip() == read, r.stdout + r.stderr
+
+
+def test_rendered_devices_are_read_back(engine):
+    r = run(engine, render(engine, AUTO), "devices")
+    assert r.stdout.strip() == "DEVICES eth3 eth4", r.stdout
+
+
+def test_devices_outside_the_flowtable_are_not_read(engine):
+    """Only the table's own flowtable declaration, ahead of the chains, is
+    read: a `devices = {` inside a chain is not a flowtable's."""
+    text = LISTED.format(hex="0" * 64, devices="").replace("flowtable fast", "flowtable other")
+    text = text.replace("\t\tmeta nfproto", '\t\tcomment "flowtable fast { devices = { eth9 } }"\n\t\tmeta nfproto')
+    r = run(engine, text, "devices")
+    assert r.stdout.strip() == "UNREADABLE -1", r.stdout
+
+
 def test_builtin_default_is_the_shipped_configuration(engine):
     """With /etc/ask/offload.conf absent the daemon falls back to a policy
     compiled into main.c, and the image installs config/offload.conf in that
