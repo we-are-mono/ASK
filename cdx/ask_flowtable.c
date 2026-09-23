@@ -6484,8 +6484,29 @@ static void ft_mc_work_fn(struct work_struct *work)
 			}
 		} else if (replace) {
 			rc = cdx_mc_group_replace(hw, &spec);
-			if (rc)
+			if (rc) {
+				/* The old chain can omit a port that has just
+				 * joined, or the routed copies the host now needs
+				 * carried; an incomplete set cannot stand in for
+				 * the one asked for. Back to software until a whole
+				 * set installs, as a routed group's failed update
+				 * goes.
+				 *
+				 * Off the group before it is freed: /proc and the
+				 * refresh read the entry under this transaction and
+				 * then ft_mc_lock, and one waiting for the
+				 * transaction would find it freed the moment this
+				 * releases it. Taking ft_mc_lock inside the
+				 * transaction is their order. */
 				ft_mc_install_errors++;
+				mutex_lock(&ft_mc_lock);
+				target->hw = NULL;
+				target->carried_route = NULL;
+				mutex_unlock(&ft_mc_lock);
+				cdx_mc_group_del(&hw);
+				ft_mc_installed--;
+				withdrew = true;
+			}
 		} else {
 			rc = cdx_mc_group_add(&spec, &hw);
 			if (rc) {

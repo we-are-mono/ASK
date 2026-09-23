@@ -312,6 +312,28 @@ def test_a_blocked_port_group_is_not_a_listener():
         "the learner must honour the bridge's source filter")
 
 
+def test_a_failed_chain_swap_takes_the_group_out_of_hardware():
+    """cdx_mc_group_replace() leaves the old chain in place when it fails, and
+    the old chain can be missing a port that has just joined, or the routed
+    copies the host now needs carried: a listener starved with nothing to say
+    why, and a route reported carried that is not. So a failed swap takes
+    the group out, as a routed group's failed update does, and it retries
+    from software.
+    """
+    worker = function(SOURCE.read_text(), "ft_mc_work_fn")
+    swap = worker[worker.index("rc = cdx_mc_group_replace(hw, &spec);"):]
+    swap = swap[:swap.index("} else {")]
+    for step in ("cdx_mc_group_del(&hw);", "ft_mc_installed--;", "withdrew = true;"):
+        assert step in swap, step
+    # /proc and the refresh read the entry under the transaction and then
+    # ft_mc_lock: it leaves the group under that lock before it is freed, or
+    # the first of them to get the transaction reads freed memory.
+    unhooked = swap.index("target->hw = NULL;")
+    assert swap.index("mutex_lock(&ft_mc_lock);") < unhooked < \
+        swap.index("mutex_unlock(&ft_mc_lock);") < swap.index("cdx_mc_group_del(&hw);")
+    assert "if (!hw)\n\t\t\ttarget->carried_route = NULL;" in worker
+
+
 def test_the_dedup_slot_is_forgotten_whenever_an_answer_may_change():
     """The hook records a frame once and then ignores its restatements until
     the slot is forgotten. A frame recorded while no group matched it -- the

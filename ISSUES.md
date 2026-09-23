@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A264.** A bridged group whose chain swap failed stayed counted installed on its old listener set, its route reported carried and the MFC flagged offloaded —
+  fixed (_:/^flowtable: take a bridged multicast group out when its chain swap fails_).
+
 - [x] **A263.** The multicast hook's dedup slot kept a frame recorded while no group matched, so a group created later stayed pending-source for as long as the stream ran —
   fixed (_:/^flowtable: forget the multicast hook's last frame when its answer changes_).
 
