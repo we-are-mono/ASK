@@ -84,6 +84,34 @@ static void expect_insert(const uint8_t *bytes, uint32_t pointer, uint16_t sid)
     assert(memcmp(bytes, expected, sizeof(expected)) == 0);
 }
 
+/* The debug decoder reads the same two big-endian words back. On a
+ * little-endian host a bitfield read of the second puts the session id's
+ * bytes the wrong way round, and a plain read of the first prints the pointer
+ * byte-reversed; ids and pointers whose bytes differ catch both. */
+static void expect_decode(uint8_t *bytes, uint32_t pointer, uint16_t sid)
+{
+    char expected[128];
+
+    display_log[0] = 0;
+    assert(display_pppoehdr_insert_opc(bytes) == bytes + 8);
+    snprintf(expected, sizeof(expected), "opcode : INSERT_PPPoE_HDR\n"
+             "version 1, type 1, code 0\n\nsession id %u\nstats ptr %x\n", sid, pointer);
+    assert(strcmp(display_log, expected) == 0);
+}
+
+/* The encoder only ever writes version 1, type 1 and code 0, so decode a word
+ * that does not: every field distinct, so a nibble read from its neighbour's
+ * place cannot pass. */
+static void check_decode_fields(void)
+{
+    uint8_t param[8] = {0x00, 0xab, 0xcd, 0xef, 0x2b, 0x5a, 0x12, 0x34};
+
+    display_log[0] = 0;
+    assert(display_pppoehdr_insert_opc(param) == param + sizeof(param));
+    assert(strcmp(display_log, "opcode : INSERT_PPPoE_HDR\nversion 2, type 11, code 90\n\n"
+                               "session id 4660\nstats ptr abcdef\n") == 0);
+}
+
 int main(void)
 {
     const uint32_t bases[] = {0, 0x10, 0x12340, 0xabcdef, 0xfffff0};
@@ -93,6 +121,7 @@ int main(void)
 
     assert(sizeof(struct en_ehash_insert_pppoe_hdr) == 8);
     assert(sizeof(struct en_ehash_strip_pppoe_hdr) == 4);
+    check_decode_fields();
 
     /* A session named by an interface keeps the pointer it was allocated. */
     for (unsigned b = 0; b < sizeof(bases) / sizeof(bases[0]); b++)
@@ -114,6 +143,7 @@ int main(void)
         info.l2_info.pppoe_stats_offset = stats_offset;
         assert(create_pppoe_ins_hm(&info) == SUCCESS);
         expect_insert(bytes + 1, stats_base + offsets[o] * 24, sids[s]);
+        expect_decode(bytes + 1, stats_base + offsets[o] * 24, sids[s]);
         assert(bytes[0] == 0xa5 && bytes[9] == 0xa5 && opcode[1] == 0xa5);
         assert(opcode[0] == INSERT_PPPoE_HDR && info.opc_count == 3);
         assert(info.paramptr == bytes + 9 && info.param_size == 0);
@@ -151,9 +181,7 @@ int main(void)
         assert(create_pppoe_ins_hm(&info) == SUCCESS);
         expect_insert(bytes + 1, 0, sids[s]);
         assert(opcode[0] == INSERT_PPPoE_HDR && info.eth_type == ETHERTYPE_PPPOE);
-
-        display_log[0] = 0;
-        assert(display_pppoehdr_insert_opc(bytes + 1) == bytes + 9);
+        expect_decode(bytes + 1, 0, sids[s]);
     }
 
     /* The strip, both ways round. Its only parameter is the pointer, which is

@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A238.** `display_pppoehdr_insert_opc()` decoded the big-endian PPPoE insert words through bitfields: session id byte-swapped, stats pointer byte-reversed —
+  fixed (_:/^sdk_fman: decode the PPPoE insert opcode's big-endian words by shift_).
+
 - [x] **A237.** A flowtable bound while an invalidation was latched was refused, so every atomic reload (fw4's included) failed whole and offload never rearmed —
   fixed (_:/^flowtable: park binds made during an invalidation instead of refusing them_).
 

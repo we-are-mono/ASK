@@ -1,4 +1,4 @@
-From 8430fecfd664a7fc6a12415af19b955537fd886a Mon Sep 17 00:00:00 2001
+From a07b95ead4f463ca8b5ab98c6165c27dcdcd832c Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -123,7 +123,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +--
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1472 ++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1477 ++++++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
@@ -163,7 +163,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   35 +-
- 81 files changed, 9199 insertions(+), 5157 deletions(-)
+ 81 files changed, 9204 insertions(+), 5157 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -11818,10 +11818,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..815070ea1660
+index 000000000000..31ca9978b13e
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1472 @@
+@@ -0,0 +1,1477 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -12910,17 +12910,22 @@ index 000000000000..815070ea1660
 +
 +static inline void *display_pppoehdr_insert_opc(void *ptr)
 +{
-+	uint32_t size;
++	uint32_t size, word;
 +	struct en_ehash_insert_pppoe_hdr *param;
 +
 +	printk("opcode : INSERT_PPPoE_HDR\n");
 +	param = (struct en_ehash_insert_pppoe_hdr *)ptr;
-+	printk("version %d, type %d, code %d\n\n",
-+			param->version,
-+			param->type,
-+			param->code);
-+	printk("session id %d\n", param->session_id);
-+	printk("stats ptr %x\n", param->stats_ptr);
++	/* Both words are big-endian: the whole first one is the statistics
++	 * pointer, and the second carries version in bits 31..28, type in
++	 * 27..24, code in 23..16 and the session id in 15..0. The bitfield
++	 * arms only line up on a big-endian host, so decode by shift. */
++	word = be32_to_cpu(param->word);
++	printk("version %u, type %u, code %u\n\n",
++			(word >> 28) & 0xf,
++			(word >> 24) & 0xf,
++			(word >> 16) & 0xff);
++	printk("session id %u\n", word & 0xffff);
++	printk("stats ptr %x\n", be32_to_cpu(param->stats_ptr));
 +	size = sizeof(struct en_ehash_insert_pppoe_hdr);
 +	return ((uint8_t *)ptr + ALIGN(size, sizeof(uint32_t)));
 +}
