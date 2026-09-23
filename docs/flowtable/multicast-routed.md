@@ -450,9 +450,20 @@ framing comes off per packet exactly as `ft_l2_overhead()` takes it off a
 flow's. The fold runs on a delayed work of its own every five seconds and again
 on every `/proc` read, so a daemon polling `SIOCGETSGCNT` sees activity within
 one interval without anybody reading `/proc` at all. What the hardware matched
-after the last fold is not carried over when a group leaves hardware: at most
-one interval, and the count still never goes back. `/proc`'s own row reports the
+after the last fold is read before a group's entry is deleted and folded then,
+so nothing is lost when a group leaves hardware. `/proc`'s own row reports the
 present hardware group's raw L2 count, which starts again with each group.
+
+One entry's counters only grow, so a sample below what was already folded
+means a misread: the classifier's 64-bit fields are separate loads, and nothing
+documents their update as atomic against the CPU's, so a read across a carry
+can be off by 2^32 either way. A low sample folds nothing, and a sane one after
+it folds from the baseline that stood. A second low sample in a row says the
+baseline came from a high misread, already folded and past taking back, and the
+baseline is taken up from there. Otherwise the count and `lastuse` would stand
+still until the true count passed the bad baseline -- 4 GiB of an IPTV stream,
+about an hour -- which a daemon ageing routes by either reads as a stream that
+stopped. The bridged learner feeds a route's count by the same rule.
 
 The effect is that `ip mroute show` prints `offload`, `ip -s mroute` shows
 traffic the CPU never handled, and `igmpproxy` or `pimd` see their entries

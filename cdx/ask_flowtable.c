@@ -4825,9 +4825,12 @@ struct ft_mc_flow {
 	struct ft_mc_stream next;
 	bool has_next;
 	/* What the classifier had counted at the last refresh, and whether it
-	 * has counted nothing since. An idle entry is how `next` takes over. */
+	 * has counted nothing since. An idle entry is how `next` takes over.
+	 * `count_suspect` is a sample below the baseline just seen; see
+	 * ft_mc_count_delta(). */
 	u64 hw_packets;
 	u64 hw_bytes;
+	bool count_suspect;
 	bool idle;
 	/* When the entry last counted a frame, or was added, and how long it
 	 * may then count nothing before the stream is taken to have stopped:
@@ -6783,6 +6786,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * whole refresh says so, and ages from now. */
 		if (spec.listeners && !rc && !replace) {
 			target->hw_packets = target->hw_bytes = 0;
+			target->count_suspect = false;
 			target->idle = false;
 			target->active = jiffies;
 		}
@@ -6845,6 +6849,43 @@ static void ft_mc_work_fn(struct work_struct *work)
 		schedule_delayed_work(&ft_mc_refresh, FT_MC_REFRESH_INTERVAL);
 }
 
+/* How far a hardware entry's counters moved from a baseline, or false for a
+ * sample below it. Both learners' folds take their deltas from here.
+ *
+ * One entry's counters only grow -- a listener swap keeps its root -- and each
+ * learner starts a baseline from zero when it adds an entry, so a sample below
+ * the baseline means one of the two readings was wrong, and one sample cannot
+ * say which. The two counters are separate loads of fields the classifier
+ * writes, and nothing documents that its 64-bit update is single-copy atomic
+ * against a CPU load: a read taken while a carry propagates can be off by 2^32
+ * either way. The byte count carries every 4 GiB, which an IPTV stream passes
+ * within the hour.
+ *
+ * A low sample followed by a sane one was the glitch: the baseline stands, and
+ * nothing is lost or counted twice. A second low sample in a row says the
+ * baseline is what is wrong -- a high glitch folded as real, which cannot be
+ * taken back, since the counts are only ever added to -- and it is taken up
+ * again from there. Keeping it would fold nothing, and leave a route's count
+ * and lastuse standing, until the true count passed the bad baseline: to a
+ * daemon that ages routes by either, a stream that stopped for an hour. */
+static bool ft_mc_count_delta(u64 *base_packets, u64 *base_bytes,
+			      bool *suspect, const struct cdx_ft_counters *c,
+			      u64 *packets, u64 *bytes)
+{
+	if (c->packets < *base_packets || c->bytes < *base_bytes) {
+		if (*suspect) {
+			*base_packets = c->packets;
+			*base_bytes = c->bytes;
+		}
+		*suspect = !*suspect;
+		return false;
+	}
+	*suspect = false;
+	*packets = c->packets - *base_packets;
+	*bytes = c->bytes - *base_bytes;
+	return true;
+}
+
 /* What an installed flow's entry counted since the last refresh, read at `now`.
  *
  * An entry that counted nothing for a whole interval is idle, and an idle
@@ -6865,27 +6906,33 @@ static void ft_mc_flow_counted(struct ft_mc_flow *f,
 			       const struct cdx_ft_counters *stats,
 			       unsigned long now)
 {
-	bool idle = stats->packets == f->hw_packets;
+	u64 packets = 0, bytes = 0;
+	bool counted;
 
-	/* Every frame the root matched since the last pass is one the bridge
-	 * would have handed the host for ipmr to route, so it is added to the
-	 * route's count, which the routed learner folds into the MFC's. Added,
-	 * because more than one flow can carry a route and an entry counts
-	 * from zero again when it is replaced by another; a sample below the
-	 * last is distrusted. */
-	if (f->carried_route && stats->packets >= f->hw_packets &&
-	    stats->bytes >= f->hw_bytes) {
-		spin_lock_bh(&ft_mc_route_lock);
-		f->carried_route->stats.packets += stats->packets - f->hw_packets;
-		f->carried_route->stats.bytes += stats->bytes - f->hw_bytes;
-		spin_unlock_bh(&ft_mc_route_lock);
+	/* A sample below the last is no answer either way: the entry is
+	 * neither idle nor active on it. See ft_mc_count_delta(). */
+	counted = ft_mc_count_delta(&f->hw_packets, &f->hw_bytes,
+				    &f->count_suspect, stats, &packets, &bytes);
+	if (counted) {
+		/* Every frame the root matched since the last pass is one the
+		 * bridge would have handed the host for ipmr to route, so it is
+		 * added to the route's count, which the routed learner folds
+		 * into the MFC's. Added, because more than one flow can carry
+		 * a route and an entry counts from zero again when it is
+		 * replaced by another. */
+		if (f->carried_route) {
+			spin_lock_bh(&ft_mc_route_lock);
+			f->carried_route->stats.packets += packets;
+			f->carried_route->stats.bytes += bytes;
+			spin_unlock_bh(&ft_mc_route_lock);
+		}
+		if (packets)
+			f->active = now;
+		f->hw_packets = stats->packets;
+		f->hw_bytes = stats->bytes;
 	}
-	if (stats->packets > f->hw_packets)
-		f->active = now;
-	f->hw_packets = stats->packets;
-	f->hw_bytes = stats->bytes;
-	f->idle = idle;
-	if (idle && f->has_next)
+	f->idle = counted && !packets;
+	if (f->idle && f->has_next)
 		f->stale = true;
 	if (f->age && time_after(now, f->active + f->age))
 		f->gone = true;
@@ -7654,9 +7701,11 @@ struct ft_mr_group {
 	/* How much of the hardware's count the MFC entry already holds, raw as
 	 * it is reported: `hw`'s own, which a group the worker has just added
 	 * counts from zero again, or for a group routed through a bridge the
-	 * route's, which only ever grows. */
+	 * route's, which only ever grows. `fold_suspect` is a sample below it
+	 * just seen; see ft_mc_count_delta(). */
 	u64 folded_packets;
 	u64 folded_bytes;
+	bool fold_suspect;
 	enum ft_mr_state state;
 	/* MFC_OFFLOAD is set on the kernel's entry. */
 	bool offloaded;
@@ -8629,8 +8678,9 @@ static void ft_mr_offload_flag(struct ft_mr_group *g, bool on)
  * is the route's from creation and counts trapped packets too; this one
  * exists only while the group is in hardware.
  *
- * What the hardware matched after the last fold is not carried over when the
- * group leaves hardware: at most one fold interval, and never backwards.
+ * What the hardware matched after the last fold is read before a group's entry
+ * is deleted and folded then, so nothing is lost when it leaves hardware, and
+ * the count never goes backwards.
  */
 static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c,
 		       u8 tags)
@@ -8638,13 +8688,12 @@ static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c,
 	u64 packets, bytes;
 
 	/* One hardware group's counters only grow, and so does a route's, and
-	 * the worker zeroes these for a new group, so a sample below them is a
-	 * read to distrust: it adds nothing and moves nothing, as ft_stats()
-	 * treats one. */
-	if (c->packets < g->folded_packets || c->bytes < g->folded_bytes)
+	 * the worker zeroes the baseline for a new group; a sample below it adds
+	 * nothing, and a second in a row moves the baseline there. See
+	 * ft_mc_count_delta(). */
+	if (!ft_mc_count_delta(&g->folded_packets, &g->folded_bytes,
+			       &g->fold_suspect, c, &packets, &bytes))
 		return;
-	packets = c->packets - g->folded_packets;
-	bytes = c->bytes - g->folded_bytes;
 	/* Bytes without a packet are a sample taken between the two loads;
 	 * they belong to the next fold, which will see the packet too. */
 	if (!packets)
@@ -9104,8 +9153,10 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * delete frees is the next add's allocation often enough. So
 		 * does a route this group has just begun riding: it was zeroed
 		 * when it was published. */
-		if (added || (plan.via && !target->via))
+		if (added || (plan.via && !target->via)) {
 			target->folded_packets = target->folded_bytes = 0;
+			target->fold_suspect = false;
+		}
 		if (state == FT_MR_INSTALLED || state == FT_MR_BRIDGED) {
 			/* Adopt the plan whole, references included: the
 			 * backend borrows exactly these pointers, so a group

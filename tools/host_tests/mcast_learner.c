@@ -1912,6 +1912,53 @@ static void idle_flows_age_out(void)
     pass();
     assert(!ft_mc_flow_count);
 
+    /* A sample below the baseline is no answer: nothing added to the route
+     * the flow carries, not idle, not active. A sane one after it counts from
+     * the baseline that stood; a second low one in a row moves the baseline,
+     * and counting goes on from there. */
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw);
+    {
+        struct ft_mc_route r;
+
+        memset(&r, 0, sizeof(r));
+        f->carried_route = &r;
+        f->hw_packets = f->hw_bytes = 0;
+        f->count_suspect = false;
+        f->active = t0;
+        c = (struct cdx_ft_counters){ .packets = 10, .bytes = 640 };
+        ft_mc_flow_counted(f, &c, t0 + HZ);
+        assert(r.stats.packets == 10 && r.stats.bytes == 640 && f->active == t0 + HZ);
+        c = (struct cdx_ft_counters){ .packets = 3, .bytes = 192 };
+        ft_mc_flow_counted(f, &c, t0 + 2 * HZ);
+        assert(r.stats.packets == 10 && !f->idle && f->active == t0 + HZ);
+        assert(f->hw_packets == 10 && f->count_suspect);
+        c = (struct cdx_ft_counters){ .packets = 12, .bytes = 768 };
+        ft_mc_flow_counted(f, &c, t0 + 3 * HZ);
+        assert(r.stats.packets == 12 && r.stats.bytes == 768 && !f->count_suspect);
+        c.bytes += 1ull << 32;                  /* folded, and cannot be undone */
+        c.packets++;
+        ft_mc_flow_counted(f, &c, t0 + 4 * HZ);
+        c.bytes -= 1ull << 32;
+        c.packets++;
+        ft_mc_flow_counted(f, &c, t0 + 5 * HZ);
+        c.packets++;
+        c.bytes += 64;
+        ft_mc_flow_counted(f, &c, t0 + 6 * HZ);
+        assert(f->hw_packets == c.packets && f->hw_bytes == c.bytes);
+        c.packets++;
+        c.bytes += 64;
+        ft_mc_flow_counted(f, &c, t0 + 7 * HZ);
+        assert(r.stats.packets == 14 && f->active == t0 + 7 * HZ);
+        f->carried_route = NULL;
+    }
+    f->gone = true;
+    pass();
+    assert(!ft_mc_flow_count);
+    memset(&c, 0, sizeof(c));
+
     /* No interval, no ageing. */
     membership_interval = 0;
     see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));

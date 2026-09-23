@@ -62,6 +62,7 @@ static void adopted(struct ft_mr_group *g, struct cdx_mc_group *hw)
 {
     g->hw = hw;
     g->folded_packets = g->folded_bytes = 0;
+    g->fold_suspect = false;
 }
 
 /* What ft_mr_counters() decides before a fold: only a group something in
@@ -137,12 +138,50 @@ int main(void)
     counted(&mfc, 25);
 
     /* A sample below what was already folded is distrusted: no wrap into a
-     * huge addition, no jump, and the baseline stays where it was. */
+     * huge addition, no jump, and while the next sample is sane the baseline
+     * stays where it was -- the low one was the misread, and nothing is
+     * counted twice. */
     hw = (struct cdx_ft_counters){ 1, FRAME + VLAN_HLEN };
     fold(&g, &hw);
     counted(&mfc, 25);
     hw = (struct cdx_ft_counters){ 8, 2 * FRAME + 6 * (FRAME + VLAN_HLEN) };
     fold(&g, &hw);
     counted(&mfc, 26);
+
+    /* The other misread: a count high by 2^32 bytes, taken as a carry
+     * propagated, is folded and cannot be taken back. Every true sample after
+     * it is below the baseline. Distrusting them all would fold nothing, and
+     * leave the count and lastuse standing, until 4 GiB more had passed --
+     * to a daemon, a stream that stopped. The second one in a row says the
+     * baseline is what is wrong, and folding goes on from there. */
+    {
+        const u64 carry = 1ull << 32;
+        long bogus;
+
+        hw.packets += 1;
+        hw.bytes += FRAME + VLAN_HLEN + carry;
+        fold(&g, &hw);
+        bogus = atomic_long_read(&mfc.mfc_un.res.bytes);
+        assert(atomic_long_read(&mfc.mfc_un.res.pkt) == 27);
+        hw.bytes -= carry;
+        hw.packets += 2;
+        hw.bytes += 2 * (FRAME + VLAN_HLEN);
+        jiffies = 4000;
+        fold(&g, &hw);                          /* one below: nothing */
+        assert(atomic_long_read(&mfc.mfc_un.res.pkt) == 27);
+        hw.packets += 3;
+        hw.bytes += 3 * (FRAME + VLAN_HLEN);
+        jiffies = 5000;
+        fold(&g, &hw);                          /* two: the baseline moves */
+        assert(atomic_long_read(&mfc.mfc_un.res.pkt) == 27);
+        hw.packets += 4;
+        hw.bytes += 4 * (FRAME + VLAN_HLEN);
+        jiffies = 6000;
+        fold(&g, &hw);                          /* and counting resumes */
+        assert(atomic_long_read(&mfc.mfc_un.res.pkt) == 31);
+        assert(atomic_long_read(&mfc.mfc_un.res.bytes) == bogus + 4 * L3);
+        assert(mfc.mfc_un.res.lastuse == 6000);
+        assert(!g.fold_suspect);
+    }
     return 0;
 }

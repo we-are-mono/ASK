@@ -20,7 +20,8 @@ def test_mroute_fold(tmp_path):
                      source.index("static LIST_HEAD(ft_mr_groups)")]
     (tmp_path / "mroute_types.inc").write_text(
         source[start:source.index("};", start) + 3] + structs)
-    (tmp_path / "mroute_fold.inc").write_text(function(source, "ft_mr_fold"))
+    (tmp_path / "mroute_fold.inc").write_text(
+        function(source, "ft_mc_count_delta") + function(source, "ft_mr_fold"))
     binary = tmp_path / "fold"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
@@ -47,3 +48,19 @@ def test_a_fresh_hardware_group_folds_from_zero():
     assert work.index("added = true;", add) < adopt, "the add must be recorded as such"
     assert "target->folded_packets = target->folded_bytes = 0;" in work[adopt:], \
         "a group the worker has just added must be folded from zero"
+    reset = work[work.index("target->folded_packets = target->folded_bytes = 0;"):]
+    assert "target->fold_suspect = false;" in reset[:reset.index("}")], \
+        "a doubt about the old baseline says nothing about the new one"
+
+
+def test_both_learners_take_deltas_from_one_rule():
+    """A sample below the baseline adds nothing; a second in a row moves the
+    baseline there. The routed fold and the bridged refresh that feeds a
+    route's count must agree, or the MFC's count depends on which learner
+    carried the stream."""
+    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    assert "ft_mc_count_delta(&g->folded_packets, &g->folded_bytes," in function(source, "ft_mr_fold")
+    assert "ft_mc_count_delta(&f->hw_packets, &f->hw_bytes," in function(source, "ft_mc_flow_counted")
+    work = function(source, "ft_mc_work_fn")
+    added = work[work.index("if (spec.listeners && !rc && !replace) {"):]
+    assert "target->count_suspect = false;" in added[:added.index("}")]
