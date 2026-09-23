@@ -41,6 +41,7 @@
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
 #include <linux/slab.h>
+#include <linux/srcu.h>
 #include <net/pkt_cls.h>
 #include <net/pkt_sched.h>
 #include <net/dsfield.h>
@@ -1053,8 +1054,14 @@ static const struct dpa_qdisc_ops cdx_htb_qdisc_ops = {
  * block registration purely on whether the netdev has an ndo_setup_tc at all,
  * so a bind that arrives with nothing registered has to be refused rather than
  * quietly served by neither.
+ *
+ * The call runs in the adapter's text and may sleep there, and nf_tables
+ * makes it without RTNL, so neither the Tx hook's RCU nor the egress hook's
+ * RTNL covers it: each call runs inside cdx_ft_handler_srcu, and
+ * unregistering waits them out before the adapter's module can go.
  */
 static cdx_ft_setup_tc_handler cdx_ft_handler;
+DEFINE_STATIC_SRCU(cdx_ft_handler_srcu);
 
 int cdx_register_ft_setup_tc(cdx_ft_setup_tc_handler handler)
 {
@@ -1069,15 +1076,20 @@ EXPORT_SYMBOL_NS_GPL(cdx_register_ft_setup_tc, ASK_CDX_FLOWTABLE);
 void cdx_unregister_ft_setup_tc(void)
 {
 	WRITE_ONCE(cdx_ft_handler, NULL);
+	/* A call that read the handler before the store may still be inside
+	 * it; the caller's module text has to outlive that call. */
+	synchronize_srcu(&cdx_ft_handler_srcu);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_setup_tc, ASK_CDX_FLOWTABLE);
 
 static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
 			void *type_data)
 {
-	/* Read the handler once: an unregister can NULL it concurrently, and a
-	 * half-torn read would call through freed module text. */
+	/* Read the handler once, inside the SRCU section the unregister waits
+	 * out: it can NULL the pointer concurrently, and a call it did not wait
+	 * for would run in freed module text. */
 	cdx_ft_setup_tc_handler handler;
+	int idx, rc;
 
 	switch (type) {
 	case TC_SETUP_QDISC_HTB:
@@ -1107,8 +1119,11 @@ static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
 		return cdx_police_setup_block(dev, type_data);
 	}
 	case TC_SETUP_FT:
+		idx = srcu_read_lock(&cdx_ft_handler_srcu);
 		handler = READ_ONCE(cdx_ft_handler);
-		return handler ? handler(dev, type, type_data) : -EOPNOTSUPP;
+		rc = handler ? handler(dev, type, type_data) : -EOPNOTSUPP;
+		srcu_read_unlock(&cdx_ft_handler_srcu, idx);
+		return rc;
 	default:
 		return -EOPNOTSUPP;
 	}

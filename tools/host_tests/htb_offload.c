@@ -379,6 +379,19 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 typedef int (*cdx_ft_setup_tc_handler)(struct net_device *dev,
 				       enum tc_setup_type type, void *type_data);
 static cdx_ft_setup_tc_handler cdx_ft_handler;
+/* The flowtable handler's SRCU. One thread cannot run an unregister beside a
+ * call, so what is checked is the shape that makes waiting enough: the call
+ * is inside the read section, and the unregister clears the pointer before it
+ * waits on the same srcu_struct. */
+struct srcu_struct { int readers; unsigned syncs; };
+static struct srcu_struct cdx_ft_handler_srcu;
+static int srcu_read_lock(struct srcu_struct *ssp) { return ssp->readers++; }
+static void srcu_read_unlock(struct srcu_struct *ssp, int idx)
+{ assert(ssp->readers > 0 && idx == --ssp->readers); }
+/* Unused-tolerant so that an unregister that stopped waiting fails the count
+ * below rather than the build. */
+static __attribute__((unused)) void synchronize_srcu(struct srcu_struct *ssp)
+{ assert(ssp == &cdx_ft_handler_srcu && !cdx_ft_handler && !ssp->readers); ssp->syncs++; }
 typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
 
@@ -851,6 +864,8 @@ static int ft_stub(struct net_device *dev, enum tc_setup_type type, void *data)
 {
 	(void)dev; (void)data;
 	assert(type == TC_SETUP_FT);
+	/* Inside the section the unregister waits out. */
+	assert(cdx_ft_handler_srcu.readers == 1);
 	ft_calls++;
 	return 0;
 }
@@ -884,8 +899,13 @@ static void test_dispatch(void)
 	assert(!cdx_setup_tc(&devices[0], TC_SETUP_ROOT_QDISC, &block));
 	assert(!cdx_setup_tc(&devices[0], TC_SETUP_QDISC_HTB, &opt));
 
+	assert(!cdx_ft_handler_srcu.readers && !cdx_ft_handler_srcu.syncs);
+	/* Unregistering waits out the calls already inside the handler before
+	 * the module that owns its text may go. */
 	cdx_unregister_ft_setup_tc();
+	assert(cdx_ft_handler_srcu.syncs == 1);
 	assert(cdx_setup_tc(&devices[0], TC_SETUP_FT, &block) == -EOPNOTSUPP);
+	assert(!cdx_ft_handler_srcu.readers && ft_calls == 1);
 
 	/* Unloading gives the ndo up before anything it reaches goes away, and
 	 * drops the bookkeeping for a qdisc that outlived its module. */
