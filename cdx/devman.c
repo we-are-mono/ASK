@@ -250,7 +250,10 @@ struct net_device *find_osdev_by_fman_params(uint32_t fm_idx, uint32_t port_idx,
 	while(1) {
 		if (!device) 
 			break;
-		if (device->type == ARPHRD_ETHER) {
+		/* Every Ethernet-framed device, bridges and VLAN devices
+		 * included, but only a DPAA port's private area is a
+		 * dpa_priv_s with a MAC behind it. */
+		if (device->type == ARPHRD_ETHER && dpa_netdev_is_dpaa(device)) {
 			t_LnxWrpFmDev *p_LnxWrpFmDev;
 			priv = netdev_priv(device);
 			macdev = priv->mac_dev;
@@ -294,6 +297,15 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 	device = dev_get_by_name(&init_net, name);	
 	if (!device) {
 		DPA_ERROR("%s::could not find device %s\n", __func__, name);
+		return FAILURE;
+	}
+	/* Every later reading of this port's netdev_priv() -- queue
+	 * resolution, statistics, teardown -- relies on this record naming a
+	 * DPAA port, so a device of another driver by that name is refused
+	 * here, once. */
+	if (!dpa_netdev_is_dpaa(device)) {
+		DPA_ERROR("%s::%s is not a DPAA Ethernet port\n", __func__, name);
+		dev_put(device);
 		return FAILURE;
 	}
 	priv = netdev_priv(device);
@@ -440,6 +452,17 @@ struct dpa_iface_info *dpa_get_ifinfo_by_itfid(uint32_t itf_id)
 		iface_info = iface_info->next;
 	}
 	return iface_info;
+}
+
+/* Whether `dev' is a port of the DPAA Ethernet driver, and so has a struct
+ * dpa_priv_s as its private area. netdev_priv() of anything else is some other
+ * driver's state -- a bridge's, a VLAN device's -- and reading it as a DPAA
+ * port's follows garbage. The driver's ops are its own static table; the one
+ * member of it the driver exports is dpa_ndo_init, and no other driver's ops
+ * carry it. */
+bool dpa_netdev_is_dpaa(const struct net_device *dev)
+{
+	return dev && dev->netdev_ops && dev->netdev_ops->ndo_init == dpa_ndo_init;
 }
 
 /* Physical identity survives an OS rename. The control transaction prevents
@@ -3006,6 +3029,11 @@ struct dpa_priv_s* get_eth_priv(unsigned char* name)
 	device = dev_get_by_name(&init_net, name);
 	if (!device) {
 		DPA_INFO("%s::could not find device %s\n", __func__, name);
+		return NULL;
+	}
+	if (!dpa_netdev_is_dpaa(device)) {
+		DPA_INFO("%s::%s is not a DPAA Ethernet port\n", __func__, name);
+		dev_put(device);
 		return NULL;
 	}
 	priv = netdev_priv(device);

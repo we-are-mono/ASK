@@ -796,7 +796,9 @@ headers, read from `skb->data` through any VLAN tags and a PPPoE session header:
   or one still carrying its ingress index — it crossed no scrub — is not looked
   up. The class that comes back is the decode the hardware rule for the same
   flow was given, from the same mark. Only the default conntrack zone is
-  searched.
+  searched, which costs no agreement with the hardware: admission refuses a
+  flow in any other zone, so no such flow is ever in hardware for the software
+  path to agree with.
 - **An IP-in-IP frame takes the class of the connection it carries.** A 6in4 or
   4in6 flow the hardware offloads is an entry for the carried connection,
   classified by its mark; the tunnel's own conntrack describes only the outer

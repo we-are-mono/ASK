@@ -58,8 +58,23 @@ static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
 typedef uint32_t U32;
 #include "qosmark.inc"
 struct dpa_priv_s { bool ceetm_en; void *qm_ctx; };
-struct net_device { struct dpa_priv_s priv; };
-static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return &dev->priv; }
+/* The DPAA driver's ops carry its exported ndo_init; a port of any other
+ * driver has ops of its own, and a private area that is not a dpa_priv_s --
+ * here, one whose every read is caught. */
+struct net_device;
+struct net_device_ops { int (*ndo_init)(struct net_device *dev); };
+static int dpa_ndo_init(struct net_device *dev) { return 0; }
+static int other_ndo_init(struct net_device *dev) { return 0; }
+static const struct net_device_ops dpa_ops = { .ndo_init = dpa_ndo_init };
+static const struct net_device_ops other_ops = { .ndo_init = other_ndo_init };
+struct net_device { const struct net_device_ops *netdev_ops; struct dpa_priv_s priv; };
+static unsigned foreign_reads;
+static struct dpa_priv_s *netdev_priv(struct net_device *dev)
+{
+    if (dev->netdev_ops != &dpa_ops)
+        foreign_reads++;
+    return &dev->priv;
+}
 struct eth_iface_info {
     struct net_device *net_dev;
     struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES];
@@ -171,7 +186,8 @@ int main(void)
     qm_chnl_info[2].cq_info[5].cq_shaper_enable = DISABLE_POLICER;
     provide(2, 0, 0x000400, &port);
     provide(0, 7, 0x000107, &port);
-    struct net_device dev = { .priv = { .ceetm_en = true, .qm_ctx = &port } };
+    struct net_device dev = { .netdev_ops = &dpa_ops,
+                              .priv = { .ceetm_en = true, .qm_ctx = &port } };
     struct eth_iface_info eth = { .net_dev = &dev };
     union ctentry_qosmark none = { .markval = 0 }, named = { .markval = 0 };
 
@@ -200,6 +216,20 @@ int main(void)
     eth.fwd_tx_fqinfo[7].fqid = 0x77;
     tree_asked = 0;
     assert(cdx_get_txfqid(&eth, &named) == 0x77 && !tree_asked);
+
+    /* A port whose netdev is not the DPAA driver's has no queue here, and
+     * its private area is never read as a DPAA port's -- nor is that of a
+     * record with no netdev at all, or one with no ops. */
+    struct net_device foreign = { .netdev_ops = &other_ops,
+                                  .priv = { .ceetm_en = true, .qm_ctx = &port } };
+    struct eth_iface_info other_eth = { .net_dev = &foreign };
+    other_eth.fwd_tx_fqinfo[7].fqid = 0x99;
+    assert(cdx_get_txfqid(&other_eth, &named) == 0 && !tree_asked && !foreign_reads);
+    foreign.netdev_ops = NULL;
+    assert(cdx_get_txfqid(&other_eth, &named) == 0 && !foreign_reads);
+    other_eth.net_dev = NULL;
+    assert(cdx_get_txfqid(&other_eth, &named) == 0);
+    assert(dpa_netdev_is_dpaa(&dev) && !dpa_netdev_is_dpaa(NULL));
 
     puts("CEETM egress fq: channel resolution, bounds, an fqid reading that "
          "leaves the queue alone, and the tree's answer for a classifier entry");

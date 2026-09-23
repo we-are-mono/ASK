@@ -130,6 +130,11 @@ static struct qman_fq *ceetm_egressfq_hook(void *ctx, uint32_t channel,
  * the class it names does not exist. A value rather than the queue itself,
  * because what the caller writes into the entry is a number and because the
  * class-queue policer's profile byte belongs in that number and nowhere else.
+ *
+ * Zero too for a port that is not a DPAA netdev: its forwarding queues are
+ * this driver's, and its private area is not a dpa_priv_s to read CEETM state
+ * from. Registration refuses such a port (get_eth_iface_info()), so this is
+ * the backstop for a record that did not come through it.
  */
 uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info)
 {
@@ -138,7 +143,11 @@ uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info)
 #ifdef ENABLE_EGRESS_QOS
 	struct dpa_priv_s *priv;
 	uint32_t fqid, channel, queue;
+#endif
 
+	if (!dpa_netdev_is_dpaa(eth_info->net_dev))
+		return 0;
+#ifdef ENABLE_EGRESS_QOS
 	priv = netdev_priv(eth_info->net_dev);
 	if (priv->ceetm_en) {
 		/* On a port a hardware qdisc owns, the tree decides what a class
@@ -174,6 +183,9 @@ int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_
 		if(info)
 			qosmark = info;
 
+		*is_dscp_fq_map = 0;
+		if (!dpa_netdev_is_dpaa(eth_info->net_dev))
+			return 0;
 		priv = netdev_priv(eth_info->net_dev);
 		if ((priv) && (priv->ceetm_en)) {
 			/* Only the egress half of the mark decides this. The

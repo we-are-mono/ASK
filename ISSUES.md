@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A260.** CDX read any Ethernet netdev's private area as a DPAA port's, bridges and VLAN devices included, in registration, the FMan-port walk and the queue lookups —
+  fixed (_:/^cdx: read netdev_priv as a DPAA port's only for a DPAA port_).
+
 - [x] **A259.** ip6t_NPT rewrote a confirmed conntrack's reply tuple in place, so a related ICMPv6 error could leave a hashed entry holding a tuple it is not hashed under —
   fixed (_:/^netfilter: rewrite an NPT connection's reply tuple only before confirmation_).
 

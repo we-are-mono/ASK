@@ -30,8 +30,10 @@ def test_ceetm_egress_fq(tmp_path):
     source = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
     names = ["ceetm_resolve_channel", "ceetm_get_egressfq", "ceetm_egress_fqid",
              "cdx_get_txfqid"]
+    # The test for a DPAA port, from where cdx keeps it, ahead of its user.
     (tmp_path / "egress_fq_production.inc").write_text(
-        "\n".join(function(source, name) for name in names))
+        function((ROOT / "cdx/devman.c").read_text(), "dpa_netdev_is_dpaa")
+        + "\n".join(function(source, name) for name in names))
     # The mark's layout as the encoder reads it, not a restatement of it.
     union = re.search(r"union ctentry_qosmark \{.*?\n\};\n",
                       (ROOT / "cdx/control_ipv4.h").read_text(), re.S)
