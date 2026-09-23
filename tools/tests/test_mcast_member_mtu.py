@@ -46,15 +46,28 @@ async def _fragments(target, session):
     return counts
 
 
-async def _state(target, session, group, state, timeout=15):
+async def _state(target, session, group, state, timeout=15, *, family=None):
+    """Wait for the group's row to say `state`.
+
+    With `family`, a few small frames of the stream go out between looks. A
+    group re-derived into hardware is carried on the confirmations it
+    gathered in software, and an nftables commit anywhere in between -- a
+    daemon's included -- takes those back: only a copy Linux forwards after
+    it confirms the group again."""
     last = ""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         last = await mroute_proc_row(target, session, group)
         if f"state={state} " in last:
             return last
+        if family is not None:
+            config = new_config(family, wan_source_address(family), group, PORT, [])
+            await asyncio.to_thread(send, frames(config, {SMALL: 256}, 4))
         await asyncio.sleep(0.2)
-    raise AssertionError(f"{group}: expected state={state}, got {last!r}")
+    changes = re.search(r"^mroute_ruleset_changes (\d+)$",
+                        await read(target, session, "/proc/cdx_flowtable"), re.M)
+    raise AssertionError(f"{group}: expected state={state}, got {last!r}; "
+                         f"ruleset changes so far: {changes and changes[1]}")
 
 
 def _packets(row):
@@ -120,9 +133,11 @@ async def test_mcast_member_mtu_bound(aiohttp_session, target_agent, lan,
             assert "offload" not in route, route
 
             # The listener grows to the ingress's size: the MTU change alone
-            # re-derives the group into hardware.
+            # re-derives the group into hardware, on the confirmations the
+            # window above gathered -- or, after a commit since, on a few
+            # more frames.
             await _exec(target_agent, aiohttp_session, "ip", "link", "set", oif, "mtu", "1500")
-            await _state(target_agent, aiohttp_session, group, "installed")
+            await _state(target_agent, aiohttp_session, group, "installed", family=family)
             result, before, after = await _window(
                 target_agent, aiohttp_session, lan, peer, family, group,
                 {FULL: 1500}, "full-size")
@@ -141,7 +156,7 @@ async def test_mcast_member_mtu_bound(aiohttp_session, target_agent, lan,
                 # The IPv6 MTU alone, which no device event reports: the
                 # learner's periodic refresh has to find it.
                 await _exec(target_agent, aiohttp_session, "ip", "link", "set", oif, "mtu", "1500")
-                await _state(target_agent, aiohttp_session, group, "installed")
+                await _state(target_agent, aiohttp_session, group, "installed", family=family)
                 # Slashes, because the device name has a dot in it: a dotted
                 # key names net/ipv6/conf/eth3/324/mtu, which does not exist,
                 # and not every sysctl says so in its exit code -- so the

@@ -485,7 +485,13 @@ async def test_flowtable_service_multicast_counter_fold(multicast_rig, family):
             await policy("add")
             ruled = True
             await ctl("add", TARGET_WAN_IF, source, group, TARGET_LAN_IF)
-            await r.settle(refused, "refused while the policy rule stands")
+            # The software window is what confirms the group for when the
+            # rule goes, with no traffic of its own: it has to fall after the
+            # ruleset has settled -- a commit the learner first noticed with
+            # this group, such as the boot service's table going, is timed
+            # from here.
+            await r.settle(lambda s: refused(s) and s["mroute_ruleset_settled"] == 1,
+                           "refused while the policy rule stands")
             await window("software", hardware=False)
             await counted(COUNT, "software", offloaded=False)
 
@@ -751,8 +757,10 @@ async def test_flowtable_service_multicast_routed_firewall(multicast_rig, family
                             label=f"firewall-v{family}-{label}")
 
         async with _daemon(r.target, r.session, [TARGET_WAN_IF, TARGET_LAN_IF, oif]) as ctl:
-            await drop()
+            # Owned before it exists: a cancellation after the commit still
+            # takes it down.
             dropping = True
+            await drop()
             await ctl("add", TARGET_WAN_IF, source, group, TARGET_LAN_IF, oif)
             await learn(r, [stream(family, group, hops=63)], held,
                         "confirmed toward the allowed oif only")
@@ -774,10 +782,12 @@ async def test_flowtable_service_multicast_routed_firewall(multicast_rig, family
             in_hardware(second)
             assert moved(second, row) == COUNT, summary(second["after"])
 
-            await drop()
             dropping = True
+            await drop()
+            # Withdrawn at once; confirmed again only once the ruleset has
+            # stood still, which the window below then does toward the port.
             await r.settle(lambda s: s["mroute_ruleset_changes"] > allowed["mroute_ruleset_changes"]
-                           and not carried(s) and
+                           and not carried(s) and s["mroute_ruleset_settled"] == 1 and
                            s["mroute_installed"] == r.initial["mroute_installed"],
                            "withdrawn by the commit")
             third = await window("dropped-again")
