@@ -147,6 +147,12 @@ static bool ft_mc_route_state(struct ft_mc_route *r, struct cdx_ft_counters *sta
     return r->carried;
 }
 static void ft_mr_publish_taps(void) { bridged_side(); taps_published++; }
+/* The generation ft_mc_egress_changed() bumps before it marks anything; the
+ * add below can bump it mid-build, which is the race it exists for. */
+typedef struct { int counter; } atomic_t;
+static atomic_t ft_mc_egress_gen;
+static int atomic_read(const atomic_t *a) { return a->counter; }
+static bool queues_move_during_add;
 static bool ft_mr_apply(struct ft_mr_event *e) { abort(); }
 static void ft_mr_lost_event(u8 family) { abort(); }
 static void ft_mr_event_free(struct ft_mr_event *e) { abort(); }
@@ -179,6 +185,10 @@ static int cdx_mc_group_add(const struct cdx_mc_group_spec *s, struct cdx_mc_gro
     assert(ctrl && !hardware.live && s->in);
     adds++;
     if (fail_add) return -ENOMEM;
+    if (queues_move_during_add) {
+        queues_move_during_add = false;
+        ft_mc_egress_gen.counter++;
+    }
     hardware.live = true;
     hardware.copies = s->listeners;
     *hw = &hardware;
@@ -323,6 +333,45 @@ int main(void)
         g->mfc = &cache;
     }
 
+    /* A port the group copies out of changes its egress queues. The plan is
+     * the same, which the worker would skip; the chain names the old queues,
+     * so it is replaced all the same, and only for a group copying out of
+     * that port. */
+    {
+        unsigned replaced = replaces;
+
+        assert(ft_mr_egress_mark(&input) == 0 && !g->rebuild);
+        assert(ft_mr_egress_mark(&output[0]) == 1);
+        assert(g->rebuild && g->dirty && ft_mr_work.queued);
+        assert(!ft_mr_lock);
+        run();
+        assert(replaces == replaced + 1 && hardware.live && !g->rebuild);
+        assert(g->state == FT_MR_INSTALLED && g->offloaded);
+        /* And nothing more on the next pass: the plan is the same again. */
+        ft_mr_recheck = true;
+        run();
+        assert(replaces == replaced + 1);
+    }
+
+    /* The queues move while a chain is being built from the old ones, and
+     * the group, taken off its hardware for the build, was not there to be
+     * marked. The generation it was built under says so, and it is built
+     * again in the same pass. */
+    {
+        unsigned added = adds, replaced = replaces;
+
+        ft_mr_recheck = true;
+        refuse = true;
+        run();
+        assert(!hardware.live);
+        refuse = false;
+        queues_move_during_add = true;
+        ft_mr_recheck = true;
+        run();
+        assert(adds == added + 1 && replaces == replaced + 1);
+        assert(hardware.live && !g->rebuild && !g->dirty);
+    }
+
     /* Routed through a bridge: nothing of its own goes into hardware. The
      * copies are published to the bridged learner, the state follows what it
      * reports, and the counters folded into the MFC are the bridged group's,
@@ -358,6 +407,8 @@ int main(void)
         folding = folds;
         refresh();
         assert(folds == folding);
+        /* Its copies are the bridged group's, rebuilt by the other half. */
+        assert(ft_mr_egress_mark(&output[0]) == 0 && !g->rebuild);
         /* The parent moving back to a port takes the route back. */
         through_bridge = false;
         ft_mr_recheck = true;

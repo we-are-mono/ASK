@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import re
 
 import pytest
 import pytest_asyncio
@@ -533,3 +534,82 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
                 failures.append(result.stdout)
         await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
         assert not failures, failures
+
+
+# ---- a member port's egress queues change under an installed group --------
+
+EGRESS_RATE, EGRESS_CEIL = '1gbit', '2gbit'
+
+
+async def _ceetm_dequeued(r, dev):
+    """What every leaf of the port's offloaded HTB tree has sent. tc never
+    sees an accelerated frame, so the CEETM counters are the only witness."""
+    text = (await command(r.target, r.session, 'ethtool', '-S', dev))['stdout']
+    return sum(int(value) for value in re.findall(
+        r'^\s*ceetm dequeued frames \[leaf \d+\]:\s*(\d+)', text, re.M))
+
+
+async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicast_bridge_service):
+    """IPTV in tagged on the LAN port, bridged out of the WAN port. An HTB
+    offload tree on the WAN port moves it onto CEETM class queues, and every
+    listener entry names the queue the port had when it was built -- which
+    nothing dequeues any more. The group is rebuilt in place: the replicas
+    keep arriving whole, the classifier keeps carrying them, and they leave by
+    the tree, counted on its leaves. Taking the tree away rebuilds it again."""
+    r = multicast_bridge_service
+    group = '239.9.5.5' if r.multicast_family == 4 else 'ff1e::9:5:5'
+    source = LAN_SOURCE[r.multicast_family]
+    capture_if = r.multicast_send_if
+    tree = False
+    await _mdb(r, TARGET_WAN_IF, group)
+    with Console.target(log_path=str(ARTIFACTS / 'multicast-egress-uart.log')) as con:
+        await asyncio.to_thread(con.login, 'root', None)
+
+        async def tc(*argv, check=True):
+            # tc is not in the agent's allowlist; the console carries it.
+            return await console_command(con, 'tc', *argv, check=check, timeout=30)
+
+        async def window(label):
+            result, before, after, cpu = await _window(
+                r, group, source, None, [capture_if],
+                lambda c, n: _from_lan(r, c, n), TARGET_LAN_IF, label)
+            _assert_bridged_copy(result[capture_if], r.lan_mac, group)
+            assert _packets(after, group) - _packets(before, group) >= \
+                FRAMING_COUNT * 0.95, (before, after)
+            assert cpu < FRAMING_COUNT * 0.1, cpu
+
+        try:
+            await _from_lan(r, new_config(r.multicast_family, source, group,
+                                          FRAMING_PORT, []), 16)
+            await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+            rebuilds = (await r.state())['mcast_egress_rebuilds']
+
+            await tc('qdisc', 'del', 'dev', TARGET_WAN_IF, 'root', check=False)
+            await tc('qdisc', 'add', 'dev', TARGET_WAN_IF, 'root', 'handle', '1:',
+                     'htb', 'offload')
+            tree = True
+            await tc('class', 'add', 'dev', TARGET_WAN_IF, 'parent', '1:',
+                     'classid', '1:10', 'htb', 'rate', EGRESS_RATE, 'ceil', EGRESS_CEIL)
+            await tc('class', 'add', 'dev', TARGET_WAN_IF, 'parent', '1:10',
+                     'classid', '1:100', 'htb', 'rate', EGRESS_RATE,
+                     'ceil', EGRESS_CEIL, 'prio', '0')
+            state = await r.wait(lambda s: s['mcast_egress_rebuilds'] > rebuilds,
+                                 timeout=15)
+            await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+            dequeued = await _ceetm_dequeued(r, TARGET_WAN_IF)
+            await window('multicast-egress-htb')
+            assert await _ceetm_dequeued(r, TARGET_WAN_IF) - dequeued >= FRAMING_COUNT, \
+                'the replicas did not leave by the offloaded tree'
+
+            rebuilds = state['mcast_egress_rebuilds']
+            await tc('qdisc', 'del', 'dev', TARGET_WAN_IF, 'root')
+            tree = False
+            await r.wait(lambda s: s['mcast_egress_rebuilds'] > rebuilds, timeout=15)
+            await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+            await window('multicast-egress-plain')
+        finally:
+            if tree:
+                await tc('qdisc', 'del', 'dev', TARGET_WAN_IF, 'root', check=False)
+            await _mdb(r, TARGET_WAN_IF, group, add=False)
+            await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']),
+                         timeout=12)

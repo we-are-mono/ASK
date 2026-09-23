@@ -408,6 +408,7 @@ family over:
 | A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |
 | A bridge becoming or ceasing to be a multicast router | `SWITCHDEV_ATTR_ID_BRIDGE_MROUTER` | the bridged worker re-matches every group against the routes and VIFs |
+| A port's egress queues: an HTB tree switching it to or from CEETM, a class moving or going, the DSCP map changing | `ft_mc_egress_changed()`, from the adapter's egress hook | every installed group of either learner with a copy on the port is rebuilt in place, because each listener entry names the queue and the DSCP-map bit its port had when it was built; `mcast_egress_rebuilds` counts them |
 
 A replacement that fails is withdrawn completely: retaining the old chain
 could omit a new router port indefinitely. Software carries the whole stream

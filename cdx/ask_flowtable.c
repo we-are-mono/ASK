@@ -3964,6 +3964,10 @@ static void ft_mc_device_gone(struct net_device *dev);
 static void ft_mr_device_gone(struct net_device *dev);
 static void ft_mc_kick_all(void);
 static void ft_mr_kick(void);
+/* CDX changed a port's egress queues, and every multicast group copying out of
+ * it is rebuilt against the queues it has now. Not static: the adapter's egress
+ * hook, which retires the port's flows and SAs, calls it for the groups. */
+void ft_mc_egress_changed(const struct net_device *dev);
 
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
@@ -4895,6 +4899,12 @@ static LIST_HEAD(ft_mc_groups);
 static DEFINE_MUTEX(ft_mc_lock);
 static unsigned int ft_mc_count, ft_mc_installed;
 static u64 ft_mc_refused, ft_mc_install_errors;
+/* Installed groups of either learner rebuilt because a port they copy out of
+ * changed its egress queues, and how many times that happened -- the second
+ * is what an install racing the change compares against; see
+ * ft_mc_egress_changed(). */
+static atomic64_t ft_mc_egress_rebuilds = ATOMIC64_INIT(0);
+static atomic_t ft_mc_egress_gen = ATOMIC_INIT(0);
 static void ft_mc_work_fn(struct work_struct *work);
 static DECLARE_WORK(ft_mc_work, ft_mc_work_fn);
 /* How often an installed group's entry is asked what it has counted. The
@@ -6320,7 +6330,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		struct ft_mc_route *route = NULL;
 		struct ft_mc_group *target = NULL;
 		bool replace = false;
-		int rc = 0;
+		int rc = 0, gen;
 		u8 i;
 
 		mutex_lock(&ft_mc_lock);
@@ -6356,6 +6366,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 			ft_mc_match_group(target);
 		}
 		target->contested = ft_mc_key_contested(target);
+		gen = atomic_read(&ft_mc_egress_gen);
 		/* Snapshot under the lock; the hardware call happens after it
 		 * is dropped. Every device in the spec gets a reference of its
 		 * own for that window: the group's own pins are dropped by a
@@ -6434,6 +6445,11 @@ static void ft_mc_work_fn(struct work_struct *work)
 			target->hw_packets = target->hw_bytes = 0;
 			target->idle = false;
 		}
+		/* A port's queues changed while this chain was being built from
+		 * the old ones; ft_mc_egress_changed() could not tell a group
+		 * that had no entry yet. Build it again. */
+		if (spec.listeners && !rc && atomic_read(&ft_mc_egress_gen) != gen)
+			target->dirty = true;
 		if (spec.listeners && rc) {
 			/* Try again rather than leaving a group pending for
 			 * good: a port that lost carrier gets it back, and
@@ -6722,6 +6738,38 @@ static void ft_mc_vlan_changed(struct net_device *dev)
 		WRITE_ONCE(ft_mc_vlan_stale, true);
 		schedule_work(&ft_mc_work);
 	}
+}
+
+/* This learner's half of ft_mc_egress_changed(): every installed group with a
+ * copy on `dev` -- a member port, or a route's copy riding the group -- is
+ * marked for the worker, whose replace rebuilds the whole chain. Takes
+ * ft_mc_lock and nothing else. Returns how many were marked. */
+static unsigned int ft_mc_egress_mark(const struct net_device *dev)
+{
+	unsigned int marked = 0;
+	struct ft_mc_group *g;
+	u8 i;
+
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		const struct ft_mc_route *r = g->carried_route;
+		bool hit = false;
+
+		if (!g->hw)
+			continue;
+		for (i = 0; i < g->ports; i++)
+			hit |= !g->port[i].absent && g->port[i].dev == dev;
+		for (i = 0; r && i < r->listeners; i++)
+			hit |= r->listener[i].dev == dev;
+		if (!hit)
+			continue;
+		g->dirty = true;
+		marked++;
+	}
+	if (marked && !ft_mc_stopping)
+		schedule_work(&ft_mc_work);
+	mutex_unlock(&ft_mc_lock);
+	return marked;
 }
 
 static void ft_mc_exit(void)
@@ -7063,6 +7111,10 @@ struct ft_mr_group {
 	/* MFC_OFFLOAD is set on the kernel's entry. */
 	bool offloaded;
 	bool dirty;
+	/* A port it copies out of changed its egress queues: the next pass
+	 * replaces the chain even when the plan has not changed, because the
+	 * entries name the queues they were built with. */
+	bool rebuild;
 	/* The kernel deleted the entry; retire and forget it. */
 	bool gone;
 	bool seen;
@@ -8151,6 +8203,39 @@ static void ft_mr_device_gone(struct net_device *dev)
 		schedule_work(&ft_mr_work);
 }
 
+/* This learner's half of ft_mc_egress_changed(): every group with a copy on
+ * `dev` is re-derived with its chain rebuilt even if nothing else changed,
+ * which the worker would otherwise skip as the same plan. A group routed
+ * through a bridge has no chain of its own; its copies are the bridged
+ * group's, marked by the other half. Takes ft_mr_lock and nothing else.
+ * Returns how many installed groups were marked. */
+static unsigned int ft_mr_egress_mark(const struct net_device *dev)
+{
+	unsigned int marked = 0;
+	struct ft_mr_group *g;
+	bool kick = false;
+	u8 i;
+
+	mutex_lock(&ft_mr_lock);
+	list_for_each_entry(g, &ft_mr_groups, list) {
+		bool hit = false;
+
+		for (i = 0; !g->via && i < g->listeners; i++)
+			hit |= g->listener[i].dev == dev;
+		if (!hit)
+			continue;
+		g->rebuild = true;
+		g->dirty = true;
+		kick = true;
+		if (g->hw)
+			marked++;
+	}
+	if (kick && !ft_mr_stopping)
+		schedule_work(&ft_mr_work);
+	mutex_unlock(&ft_mr_lock);
+	return marked;
+}
+
 /* Whether another group of this learner has an entry under the key a spec
  * would install: the same port and address pair. Called with ft_mr_lock
  * held. */
@@ -8326,9 +8411,10 @@ static void ft_mr_work_fn(struct work_struct *work)
 		struct cdx_mc_group *hw = NULL;
 		struct ft_mr_plan plan = {};
 		enum ft_mr_state state;
-		bool rekey = false, same = false, via, added = false;
+		bool rekey = false, same = false, via, rebuild = false;
+		bool added = false;
 		u8 retries = 0;
-		int rc = 0;
+		int rc = 0, gen = 0;
 
 		mutex_lock(&ft_mr_lock);
 		/* A group refused a key another gave up since is asked again,
@@ -8347,6 +8433,9 @@ static void ft_mr_work_fn(struct work_struct *work)
 		}
 		if (target) {
 			target->dirty = false;
+			rebuild = target->rebuild;
+			target->rebuild = false;
+			gen = atomic_read(&ft_mc_egress_gen);
 			retries = target->retries;
 			hw = target->hw;
 			target->hw = NULL;
@@ -8375,7 +8464,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 			       plan.in_tags != target->in_tags ||
 			       memcmp(plan.spec.in_vlan, target->in_vlan,
 				      sizeof(target->in_vlan)));
-		same = hw && !via && state == FT_MR_PENDING &&
+		same = hw && !via && !rebuild && state == FT_MR_PENDING &&
 		       ft_mr_plan_same(target, &plan);
 		rtnl_unlock();
 
@@ -8479,6 +8568,13 @@ static void ft_mr_work_fn(struct work_struct *work)
 				state = FT_MR_REFUSED_FAILED;
 			else if (rc)
 				target->dirty = true;
+		}
+		/* A port's queues changed while this chain was being built from
+		 * the old ones, and the group was not yet on the list to be told.
+		 * Build it again. */
+		if (hw && atomic_read(&ft_mc_egress_gen) != gen) {
+			target->rebuild = true;
+			target->dirty = true;
 		}
 		if (ft_mr_refusal(state) && !ft_mr_refusal(target->state))
 			ft_mr_refused++;
@@ -8627,6 +8723,36 @@ static void ft_mr_rows(struct seq_file *seq)
 				   stats.packets, stats.bytes);
 	}
 	mutex_unlock(&ft_mr_lock);
+}
+
+/* A port's egress queues changed under the multicast groups copying out of it.
+ *
+ * Every listener entry names what its port had when the entry was built: the
+ * frame queue dpa_get_tx_info_by_itf() asked cdx_get_txfqid() for, and whether
+ * the port's DSCP map was on. An HTB tree moving the port to or from CEETM, a
+ * class moving or going, or the map changing leaves those entries enqueuing to
+ * a queue nothing dequeues, or past the classes the operator configured. So
+ * every installed group with a copy on the port is rebuilt, whichever learner
+ * owns it: cdx_mc_group_replace() builds a whole new listener chain, which
+ * asks the port again, and swaps it in under the same key, so the stream does
+ * not leave hardware while it happens. A rebuild that fails withdraws the
+ * group to software, as any failed replace does.
+ *
+ * Both learners' groups are marked and handed to their workers, which do the
+ * hardware. Nothing here needs RTNL or sleeps under a spinlock: it takes each
+ * learner's mutex in turn and never both, which a caller holding RTNL may do
+ * -- it is the order the notifiers take them in -- and one holding nothing may
+ * too. A group whose chain is being built while this runs is not always on its
+ * learner's list to be marked, so the generation it was built under is
+ * compared once it is recorded, and it is built again if the queues moved. */
+void ft_mc_egress_changed(const struct net_device *dev)
+{
+	unsigned int rebuilt;
+
+	atomic_inc(&ft_mc_egress_gen);
+	rebuilt = ft_mc_egress_mark(dev);
+	rebuilt += ft_mr_egress_mark(dev);
+	atomic64_add(rebuilt, &ft_mc_egress_rebuilds);
 }
 
 /* ---------------------------------------------------------------- IPsec
@@ -10330,6 +10456,10 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mc_count, ft_mc_installed, ft_mc_refused,
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
+	/* Installed groups of either learner rebuilt because a port they copy
+	 * out of changed its egress queues; see ft_mc_egress_changed(). */
+	seq_printf(seq, "mcast_egress_rebuilds %lld\n",
+		   atomic64_read(&ft_mc_egress_rebuilds));
 	/* The routed learner's own totals. mroute_policy_rules is the one an
 	 * operator is most likely to need: a single non-default ipmr rule
 	 * keeps every group of that family in software, and nothing else on

@@ -541,6 +541,17 @@ watches on the switchdev chain. What is new is the source: an installed `(S,G)`
 entry whose stream stops has nothing to retire it, so it carries an idle timer
 of its own.
 
+A listener's entry also names the frame queue its port had when it was built,
+and whether the port's DSCP map was on. When CDX changes a port's egress
+queues — an HTB offload tree switching it to or from CEETM, a class moving or
+going, the DSCP map changing — `ft_mc_egress_changed()` marks every installed
+group with a copy on that port, either learner's, and the workers rebuild each
+chain with `cdx_mc_group_replace()`, which asks the port again and swaps the
+chain in under the same key. It needs no RTNL and takes each learner's mutex
+in turn. A group whose chain was being built while it ran is caught by a
+generation the workers compare after recording the build. `/proc` counts the
+rebuilds as `mcast_egress_rebuilds`.
+
 A VLAN change on the bridge, whether a port's membership, the bridge's own,
 its filtering or its protocol, marks every group on that bridge. The worker
 re-derives them under RTNL, not in the notifier, because a port VLAN object

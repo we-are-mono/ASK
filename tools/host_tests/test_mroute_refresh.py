@@ -29,8 +29,8 @@ def test_mroute_refresh(tmp_path):
             "ft_mr_refusal", "ft_mr_state_text", "ft_mr_plan_same",
             "ft_mr_plan_put", "ft_mr_offload_flag", "ft_mr_counters",
             "ft_mr_release_set", "ft_mr_group_free", "ft_mr_dirty_family",
-            "ft_mr_device_gone", "ft_mr_key_taken", "ft_mr_publish",
-            "ft_mr_work_fn", "ft_mr_stats_fn", "ft_mr_exit",
+            "ft_mr_device_gone", "ft_mr_egress_mark", "ft_mr_key_taken",
+            "ft_mr_publish", "ft_mr_work_fn", "ft_mr_stats_fn", "ft_mr_exit",
         ]))
     binary = tmp_path / "refresh"
     subprocess.run([

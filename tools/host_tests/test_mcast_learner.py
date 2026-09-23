@@ -93,6 +93,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_route_feedback",
             "ft_mc_state",
             "ft_mc_device_gone",
+            "ft_mc_egress_mark",
         ]))
     binary = tmp_path / "mcast_learner"
     subprocess.run([
@@ -318,3 +319,41 @@ def test_the_learner_lets_go_of_a_device_that_went_away():
     swdev = function(source, "ft_mc_swdev_obj")
     assert "ft_mc_drop_port(port)" in swdev, (
         "a delete with no master left must still release the port")
+
+
+def test_a_changed_egress_rebuilds_every_group_copying_out_of_the_port():
+    """Each listener entry names the frame queue its port had when it was
+    built, and whether the port's DSCP map was on. CDX changing the port's
+    queues -- an HTB tree switching it to or from CEETM, a class moving, the
+    map changing -- leaves them enqueuing where nothing dequeues, so every
+    installed group of either learner with a copy on the port is rebuilt.
+
+    The caller may or may not hold RTNL and runs in process context, so the
+    hook takes each learner's mutex in turn and never both, and nothing that
+    needs RTNL or the transaction. A group being built while it runs may not
+    be on its learner's list to mark; the generation, bumped before marking,
+    is what both workers compare once they record a build.
+    """
+    source = SOURCE.read_text()
+    assert "void ft_mc_egress_changed(const struct net_device *dev);" in source, (
+        "the entry point is declared with the adapter's other multicast ones")
+    body = function(source, "ft_mc_egress_changed")
+    assert body.index("atomic_inc(&ft_mc_egress_gen)") < body.index("ft_mc_egress_mark(dev)")
+    assert "ft_mr_egress_mark(dev)" in body
+    assert "atomic64_add(rebuilt, &ft_mc_egress_rebuilds)" in body
+    for forbidden in ("rtnl_lock", "ASSERT_RTNL", "cdx_ft_begin", "spin_lock",
+                      "mutex_lock"):
+        assert forbidden not in body, f"{forbidden} does not belong in the hook"
+    for name, lock, other in (("ft_mc_egress_mark", "ft_mc_lock", "ft_mr_lock"),
+                              ("ft_mr_egress_mark", "ft_mr_lock", "ft_mc_lock")):
+        mark = function(source, name)
+        assert f"mutex_lock(&{lock})" in mark and other not in mark, (
+            f"{name} takes its own learner's lock and never the other's")
+        for forbidden in ("rtnl", "cdx_ft_begin", "spin_lock"):
+            assert forbidden not in mark
+    # A rebuild is not skipped as an unchanged plan.
+    assert "!rebuild" in function(source, "ft_mr_work_fn")
+    for worker in ("ft_mc_work_fn", "ft_mr_work_fn"):
+        assert "atomic_read(&ft_mc_egress_gen) != gen" in function(source, worker), (
+            f"{worker} must rebuild a chain the queues moved under")
+    assert "mcast_egress_rebuilds" in function(source, "ft_show")

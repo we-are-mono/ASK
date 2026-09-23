@@ -1237,6 +1237,54 @@ int main(void)
         ft_mc_route_withdraw(&r1);
     }
 
+    /* ---- a port's egress queues change ---------------------------------
+     *
+     * Every listener entry names the queue its port had when it was built.
+     * An installed group copying out of the port -- by a member port or by a
+     * route's copy riding it -- is marked for a rebuild; one that is not
+     * installed, one whose member left the VLAN, and one elsewhere are not. */
+    reset();
+    {
+        const uint32_t S = 0x0100000a, G = 0x120007ef;
+        struct br_ip any = group_v4(G, 0, 289), other = group_v4(G + 1, 0, 289);
+        struct ft_mc_route want, r1;
+        struct ft_mc_group *g, *h;
+
+        memset(&r1, 0, sizeof(r1));
+        vlan_enabled = true;
+        BR.mrouter = true;
+        member(&BR, 289, false);
+        member(&P2, 289, false);
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        assert(ft_mc_membership(&BR, &P2, &other, true, false));
+        g = ft_mc_find(&BR, &any);
+        h = ft_mc_find(&BR, &other);
+        stream(g, &P1, S);
+        route_want(&want, 289, S, G, &P3, 287);
+        ft_mc_route_publish(&r1, &want);
+        ft_mc_match_routes();
+        g->hw = (struct cdx_mc_group *)1;
+        g->carried_route = g->route;
+        g->dirty = h->dirty = false;
+        works = 0;
+        /* Not installed, so nothing to rebuild; the ingress is not a copy. */
+        assert(ft_mc_egress_mark(&P1) == 0 && !g->dirty && !works);
+        /* A member port. */
+        assert(ft_mc_egress_mark(&P2) == 1 && g->dirty && !h->dirty && works == 1);
+        assert(!ft_mc_lock);
+        /* The route's copy. */
+        g->dirty = false;
+        assert(ft_mc_egress_mark(&P3) == 1 && g->dirty);
+        /* A member that left the VLAN has no entry to rebuild. */
+        g->dirty = false;
+        g->port[0].absent = true;
+        assert(ft_mc_egress_mark(&P2) == 0 && !g->dirty);
+        g->port[0].absent = false;
+        g->hw = NULL;
+        g->carried_route = NULL;
+        ft_mc_route_withdraw(&r1);
+    }
+
     /* ---- a device a route or a tap names goes away --------------------- */
     reset();
     {
