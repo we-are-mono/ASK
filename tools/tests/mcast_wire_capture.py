@@ -8,6 +8,14 @@ carried. The test decides what to require of it; this only observes.
 Sockets bind to individual interfaces, VLAN devices included, so VLAN
 demultiplexing is itself the framing oracle for the tag: a copy on the wrong
 VLAN never reaches the socket that expects it.
+
+They take every frame (ETH_P_ALL) and pick this run's out by EtherType
+themselves. A socket bound to one protocol sees nothing on a bridge port: the
+bridge's receive handler takes the frame before protocol taps run, and only
+the all-protocol taps come first. Those also see a tagged frame on its parent
+before the VLAN device does, so a tagged frame some VLAN device here claims is
+left to that device's socket, as the protocol tap would have left it; every
+copy counted records the VLAN it arrived tagged with, 0 for none.
 """
 from __future__ import annotations
 
@@ -25,6 +33,36 @@ import time
 MAGIC = b"ASKMCW1"
 # Magic, token, size class, sequence.
 HEADER = len(MAGIC) + 16 + 1 + 4
+ETH_P_ALL = 0x0003
+SOL_PACKET = 263
+PACKET_ADD_MEMBERSHIP = 1
+PACKET_AUXDATA = 8
+TP_STATUS_VLAN_VALID = 1 << 4
+
+
+def vlan_children(table: Path = Path("/proc/net/vlan/config")) -> set:
+    """(parent, VLAN ID) of every 802.1Q device on this host."""
+    try:
+        lines = table.read_text().splitlines()[2:]
+    except OSError:
+        return set()             # no 8021q module, so no VLAN device
+    children = set()
+    for line in lines:
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) == 3 and fields[1].isdigit():
+            children.add((fields[2], int(fields[1])))
+    return children
+
+
+def arrival_tag(ancillary) -> int:
+    """The VLAN ID a frame arrived tagged with, from its PACKET_AUXDATA; 0 for
+    an untagged or priority-tagged one."""
+    for level, kind, data in ancillary:
+        if level == SOL_PACKET and kind == PACKET_AUXDATA and len(data) >= 20:
+            status, _, _, _, _, tci, _ = struct.unpack_from("=IIIHHHH", data)
+            if status & TP_STATUS_VLAN_VALID:
+                return tci & 0x0fff
+    return 0
 
 
 def multicast_mac(group: str) -> bytes:
@@ -105,16 +143,17 @@ def decode(frame: bytes, config: dict):
 def empty() -> dict:
     return {"seen": {}, "duplicates": 0, "fragments": 0, "hops": set(),
             "sources": set(), "destinations": set(), "lengths": set(),
-            "errors": []}
+            "vlans": set(), "errors": []}
 
 
-def record(result: dict, verdict) -> None:
+def record(result: dict, verdict, vlan: int = 0) -> None:
     if verdict is None:
         return
     kind, info = verdict
     if kind == "fragment":
         result["fragments"] += 1
         return
+    result["vlans"].add(vlan)
     seen = result["seen"].setdefault(str(info["class"]), set())
     if info["sequence"] in seen:
         result["duplicates"] += 1
@@ -129,7 +168,7 @@ def summary(results: dict) -> dict:
     return {iface: {**r, "seen": {k: sorted(v) for k, v in r["seen"].items()},
                     "hops": sorted(r["hops"]), "sources": sorted(r["sources"]),
                     "destinations": sorted(r["destinations"]),
-                    "lengths": sorted(r["lengths"])}
+                    "lengths": sorted(r["lengths"]), "vlans": sorted(r["vlans"])}
             for iface, r in results.items()}
 
 
@@ -144,21 +183,22 @@ def capture(config: dict) -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    protocol = 0x0800 if config["family"] == 4 else 0x86dd
+    children = vlan_children()
     try:
         with selectors.DefaultSelector() as poll:
             for iface in config["interfaces"]:
                 sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
-                                     socket.htons(protocol))
+                                     socket.htons(ETH_P_ALL))
                 sockets.append(sock)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-                sock.bind((iface, protocol))
+                sock.bind((iface, ETH_P_ALL))
+                sock.setsockopt(SOL_PACKET, PACKET_AUXDATA, 1)
                 # Only this group's Ethernet address, on this socket alone.
                 # Closing the socket drops the membership; nothing persistent
                 # (promiscuity, sysctls, IP memberships) is changed.
                 request = struct.pack("IHH8s", socket.if_nametoindex(iface), 0, 6,
                                       multicast_mac(config["group"]))
-                sock.setsockopt(263, 1, request)  # SOL_PACKET/PACKET_ADD_MEMBERSHIP
+                sock.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, request)
                 sock.setblocking(False)
                 poll.register(sock, selectors.EVENT_READ, iface)
             Path(config["ready"]).write_text(str(os.getpid()))
@@ -168,13 +208,17 @@ def capture(config: dict) -> None:
                     iface = key.data
                     for _ in range(64):
                         try:
-                            frame, address = key.fileobj.recvfrom(65536)
+                            frame, ancillary, _, address = key.fileobj.recvmsg(
+                                65536, socket.CMSG_SPACE(32))
                         except BlockingIOError:
                             break
                         if address[2] == socket.PACKET_OUTGOING:
                             continue
+                        vlan = arrival_tag(ancillary)
+                        if vlan and (iface, vlan) in children:
+                            continue     # that VLAN device's copy, not this one's
                         try:
-                            record(results[iface], decode(frame, config))
+                            record(results[iface], decode(frame, config), vlan)
                         except AssertionError as exc:
                             results[iface]["errors"].append(str(exc))
     finally:

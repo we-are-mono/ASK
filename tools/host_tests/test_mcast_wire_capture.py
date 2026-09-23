@@ -89,3 +89,63 @@ def test_payload_round_trips():
     data = capture.payload(TOKEN, 3, 9, 1000)
     assert len(data) == 1000 and data.startswith(b"ASKMCW1")
     assert struct.unpack_from("!BI", data, 7 + 16) == (3, 9)
+
+
+def test_a_copy_records_the_vlan_it_arrived_tagged_with():
+    kind, info = capture.decode(frame(4), config(4))
+    result = capture.empty()
+    capture.record(result, (kind, info), 289)
+    capture.record(result, ("fragment", None), 7)
+    out = capture.summary({"eth0": result})["eth0"]
+    assert out["vlans"] == [289] and out["fragments"] == 1
+
+
+def oracle(name):
+    spec = importlib.util.spec_from_file_location(name, PATH.with_name(f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ORACLES = ["mcast_wire_capture", "mroute_capture"]
+
+
+@pytest.mark.parametrize("name", ORACLES)
+def test_a_bridge_port_is_captured_before_the_bridge_takes_the_frame(name):
+    """A packet socket bound to one protocol sees nothing on a bridge port:
+    the bridge's receive handler takes the frame before protocol taps run.
+    Only the all-protocol taps come first, so each oracle binds ETH_P_ALL,
+    picks its run out by EtherType itself, and asks for each frame's tag."""
+    source = PATH.with_name(f"{name}.py").read_text()
+    assert "socket.htons(ETH_P_ALL)" in source and "sock.bind((iface, ETH_P_ALL))" in source
+    assert "sock.setsockopt(SOL_PACKET, PACKET_AUXDATA, 1)" in source
+    assert "0x0800 if" not in source.split("def capture(")[1], "no protocol-bound socket"
+    assert "if vlan and (iface, vlan) in children:" in source
+
+
+@pytest.mark.parametrize("name", ORACLES)
+def test_a_vlan_device_keeps_its_own_tagged_frames(name, tmp_path):
+    """An all-protocol socket on a VLAN's parent sees the VLAN device's frames
+    too, tagged, before the device does; the table of VLAN devices says which
+    are the device's. No 8021q module is no table and no VLAN device."""
+    module = oracle(name)
+    table = tmp_path / "config"
+    table.write_text("VLAN Dev name\t | VLAN ID\n"
+                     "Name-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD\n"
+                     "eth3.324       | 324  | eth3\n"
+                     "wan3900        | 3900  | br0\n")
+    assert module.vlan_children(table) == {("eth3", 324), ("br0", 3900)}
+    assert module.vlan_children(tmp_path / "absent") == set()
+
+
+@pytest.mark.parametrize("name", ORACLES)
+def test_the_arrival_tag_comes_from_the_auxdata(name):
+    module = oracle(name)
+    tagged = struct.pack("=IIIHHHH", 1 << 4, 100, 100, 0, 14, (5 << 13) | 289, 0x8100)
+    untagged = struct.pack("=IIIHHHH", 0, 100, 100, 0, 14, 289, 0)
+    priority = struct.pack("=IIIHHHH", 1 << 4, 100, 100, 0, 14, 5 << 13, 0x8100)
+    assert module.arrival_tag([(263, 8, tagged)]) == 289
+    assert module.arrival_tag([(263, 8, untagged)]) == 0
+    assert module.arrival_tag([(263, 8, priority)]) == 0
+    assert module.arrival_tag([]) == 0
+    assert module.arrival_tag([(1, 8, tagged)]) == 0    # not SOL_PACKET's

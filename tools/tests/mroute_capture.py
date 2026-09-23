@@ -1,4 +1,4 @@
-"""A158 packet oracle, staged unchanged on a listener host (stdlib only)."""
+"""Routed multicast packet oracle, staged unchanged on a listener host (stdlib only)."""
 from __future__ import annotations
 
 import ipaddress
@@ -13,6 +13,36 @@ import sys
 import time
 
 MAGIC = b"ASK-A158"
+ETH_P_ALL = 0x0003
+SOL_PACKET = 263
+PACKET_ADD_MEMBERSHIP = 1
+PACKET_AUXDATA = 8
+TP_STATUS_VLAN_VALID = 1 << 4
+
+
+def vlan_children(table: Path = Path("/proc/net/vlan/config")) -> set:
+    """(parent, VLAN ID) of every 802.1Q device on this host."""
+    try:
+        lines = table.read_text().splitlines()[2:]
+    except OSError:
+        return set()             # no 8021q module, so no VLAN device
+    children = set()
+    for line in lines:
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) == 3 and fields[1].isdigit():
+            children.add((fields[2], int(fields[1])))
+    return children
+
+
+def arrival_tag(ancillary) -> int:
+    """The VLAN ID a frame arrived tagged with, from its PACKET_AUXDATA; 0 for
+    an untagged or priority-tagged one."""
+    for level, kind, data in ancillary:
+        if level == SOL_PACKET and kind == PACKET_AUXDATA and len(data) >= 20:
+            status, _, _, _, _, tci, _ = struct.unpack_from("=IIIHHHH", data)
+            if status & TP_STATUS_VLAN_VALID:
+                return tci & 0x0fff
+    return 0
 
 
 def multicast_mac(group: str) -> bytes:
@@ -31,6 +61,10 @@ def decode(frame: bytes, config: dict, source_mac: str) -> int | None:
 
     Sockets bind to individual VLAN devices, so VLAN demultiplexing itself is
     the framing oracle. L2/L3 headers here are the frame after that demultiplex.
+    They take every frame (ETH_P_ALL), because a socket bound to one protocol
+    sees nothing on a bridge port -- the bridge's receive handler takes the
+    frame before protocol taps run -- and capture() leaves a tagged frame some
+    VLAN device claims to that device's socket, as the protocol tap did.
     """
     family = config["family"]
     ip_start, udp_start = 14, 34 if family == 4 else 54
@@ -104,27 +138,28 @@ def capture(config: dict) -> None:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    protocol = 0x0800 if config["family"] == 4 else 0x86dd
+    children = vlan_children()
     try:
         with selectors.DefaultSelector() as poll:
             for iface, mac in config["interfaces"].items():
-                sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(protocol))
+                sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
                 sockets.append(sock)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-                sock.bind((iface, protocol))
+                sock.bind((iface, ETH_P_ALL))
+                sock.setsockopt(SOL_PACKET, PACKET_AUXDATA, 1)
                 # Join only this Ethernet multicast address on this socket.
                 # Closing the socket drops its membership; no persistent
                 # promiscuity, sysctl or IP membership is changed.
                 request = struct.pack("IHH8s", socket.if_nametoindex(iface), 0, 6,
                                       multicast_mac(config["group"]))
-                sock.setsockopt(263, 1, request)  # SOL_PACKET/PACKET_ADD_MEMBERSHIP
+                sock.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, request)
                 # And promiscuity, held by this socket alone: a VLAN device on
                 # a snooping bridge (the orchestrator's WAN peer is one) only
                 # sees a group the bridge knows its host joined, and a routed
                 # replica's group is one nothing here joins at the IP layer.
                 # A promiscuous upper makes the bridge deliver it anyway.
                 request = struct.pack("IHH8s", socket.if_nametoindex(iface), 1, 0, b"")
-                sock.setsockopt(263, 1, request)  # PACKET_MR_PROMISC
+                sock.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, request)  # PACKET_MR_PROMISC
                 sock.setblocking(False)
                 poll.register(sock, selectors.EVENT_READ, (iface, mac))
             Path(config["ready"]).write_text(str(os.getpid()))
@@ -134,15 +169,19 @@ def capture(config: dict) -> None:
                     iface, mac = key.data
                     for _ in range(64):
                         try:
-                            frame, address = key.fileobj.recvfrom(65536)
+                            frame, ancillary, _, address = key.fileobj.recvmsg(
+                                65536, socket.CMSG_SPACE(32))
                         except BlockingIOError:
                             break
                         if address[2] == socket.PACKET_OUTGOING:
                             continue
-                        # A socket on a VLAN's parent also receives that
-                        # VLAN's frames, untagged, naming the VLAN device;
-                        # they are the child's copies to count, not ours.
+                        # A socket on a VLAN's parent also sees that VLAN's
+                        # frames, still tagged; they are the child's copies
+                        # to count, not ours.
                         if address[0] != iface:
+                            continue
+                        vlan = arrival_tag(ancillary)
+                        if vlan and (iface, vlan) in children:
                             continue
                         try:
                             sequence = decode(frame, config, mac)
