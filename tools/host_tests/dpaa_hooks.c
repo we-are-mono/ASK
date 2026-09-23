@@ -25,6 +25,7 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
+#define ARRAY_SIZE(a)		(sizeof(a) / sizeof((a)[0]))
 #define READ_ONCE(x)		(x)
 #define WRITE_ONCE(x, v)	((x) = (v))
 #define smp_store_release(p, v)	(*(p) = (v))
@@ -103,7 +104,15 @@ static u16 select_queue(struct net_device *dev, struct sk_buff *skb)
 static struct qman_fq *txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb)
 { assert(rcu_depth == 1); fqs++; return &leaf_fq; }
 static void class_stats(void *qm_ctx, u64 *data)
-{ assert(rcu_depth == 1); stats++; data[0] = 42; }
+{
+	assert(rcu_depth == 1);
+	stats++;
+	data[0] = 42;
+	/* The last value the driver's string set names, after the leaves: the
+	 * control queue's rejected frames. */
+	data[(DPAA_ETH_CEETM_LEAF_QUEUES + DPA_CEETM_IMPLICIT_QUEUES) *
+	     DPA_CEETM_CLASS_STATS - 1] = 7;
+}
 static const struct dpa_qdisc_ops ops = {
 	.select_queue = select_queue, .txq_fq = txq_fq, .class_stats = class_stats,
 };
@@ -117,7 +126,8 @@ int main(void)
 	struct net_device dev = { 3 };
 	struct sk_buff skb = { 0 };
 	struct dpa_bp bp = { 0 };
-	u64 data[DPAA_ETH_CEETM_LEAF_QUEUES * DPA_CEETM_CLASS_STATS];
+	u64 data[(DPAA_ETH_CEETM_LEAF_QUEUES + DPA_CEETM_IMPLICIT_QUEUES) *
+		 DPA_CEETM_CLASS_STATS];
 	int ctx = 0;
 
 	/* ndo_setup_tc: refused with nothing registered, called inside the
@@ -144,9 +154,12 @@ int main(void)
 	assert(dpa_qdisc_select_queue(&dev, &skb, NULL) == (21 & (DPAA_ETH_TX_QUEUES - 1)));
 	assert(selected == 2 && !rcu_depth);
 	assert(dpa_qdisc_txq_fq(&ctx, 0, &skb) == &leaf_fq && fqs == 1 && !rcu_depth);
+	/* Every value the string set names is cleared first, the two queues
+	 * after the leaves included, and the module fills them all. */
 	memset(data, 0xff, sizeof(data));
 	dpa_qdisc_class_stats(&ctx, data);
 	assert(stats == 1 && data[0] == 42 && !data[1] && !rcu_depth);
+	assert(data[ARRAY_SIZE(data) - 1] == 7 && !data[ARRAY_SIZE(data) - 2]);
 	dpa_unregister_qdisc_ops();
 	assert(rcu_syncs == 1);
 	assert(!dpa_qdisc_txq_fq(&ctx, 0, &skb) && fqs == 1);

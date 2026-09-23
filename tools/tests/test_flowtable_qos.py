@@ -68,7 +68,8 @@ PORT_DEFAULT = PORT + 15
 PORT_REMARK_HW, PORT_REMARK_SW = PORT + 18, PORT + 19
 PORT_EF_REPLACED = PORT + 20
 PORT_DECLINED = PORT + 21
-PORTS_LAST = PORT + 21
+PORT_WEIGHTED, PORT_WEIGHTED_BULK = PORT + 22, PORT + 23
+PORTS_LAST = PORT + 23
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
 # unshaped and far above what the CPU can: see the module docstring.
@@ -87,6 +88,9 @@ OAL = 24
 # index. prio 0 is the queue that wins.
 HIGH_PRIO, HIGH_CQ = 0, 7
 LOW_PRIO, LOW_CQ = 1, 6
+# A leaf that gives a quantum takes the first free queue of the weighted group,
+# which starts at class queue 8.
+WEIGHTED_CQ = 8
 
 IPERF_SECONDS = 8
 # Admission, and the burst a token bucket starts with, both happen in the first
@@ -322,6 +326,11 @@ def probe(destination, seconds, *, interval=0.01, timeout=0.25):
 
 LEAF_COUNTER = re.compile(
     r"^\s*ceetm (dequeued frames|dequeued bytes|rejected frames) \[leaf (\d+)\]:\s*(\d+)\s*$", re.M)
+# The two queues traffic that names no leaf takes, after the sixteen slots:
+# where unclassified traffic goes, and the top channel's control queue.
+IMPLICIT_COUNTER = re.compile(
+    r"^\s*ceetm (dequeued frames|dequeued bytes|rejected frames) \[(default|control)\]:\s*(\d+)\s*$",
+    re.M)
 SOFTWARE_TX = re.compile(r"^\s*tx packets \[TOTAL\]:\s*(\d+)\s*$", re.M)
 LEAF_FIELDS = {"dequeued frames": "frames", "dequeued bytes": "bytes",
                "rejected frames": "rejected"}
@@ -329,7 +338,8 @@ LEAF_FIELDS = {"dequeued frames": "frames", "dequeued bytes": "bytes",
 
 async def egress(r, dev):
     """One `ethtool -S` read of a port: each leaf slot's dequeued frames and
-    bytes and rejected frames, the port's software transmit count, and when.
+    bytes and rejected frames, the same for the queues unclassified and
+    control traffic take, the port's software transmit count, and when.
 
     The leaf counters are hardware totals read without clearing, so a delta
     between two reads is exact. The time is the middle of the call, which is
@@ -342,13 +352,16 @@ async def egress(r, dev):
     leaves = {}
     for name, slot, value in LEAF_COUNTER.findall(text):
         leaves.setdefault(int(slot), {})[LEAF_FIELDS[name]] = int(value)
+    for name, queue, value in IMPLICIT_COUNTER.findall(text):
+        leaves.setdefault(queue, {})[LEAF_FIELDS[name]] = int(value)
     software = SOFTWARE_TX.findall(text)
-    assert leaves and len(software) == 1, text
+    assert len(leaves) == 18 and len(software) == 1, text
     return {"at": (started + ended) / 2, "span": ended - started, "leaves": leaves,
             "software_tx": int(software[0])}
 
 
 def leaf_delta(before, after, slot):
+    """What one leaf slot's queue -- or "default" or "control" -- moved by."""
     return {key: after["leaves"][slot][key] - before["leaves"][slot][key]
             for key in ("frames", "bytes", "rejected")}
 
@@ -719,6 +732,72 @@ async def test_flowtable_qos_strict_priority_keeps_its_rate(qos):
     expected_low = (cap - high_shaped) / charge
     assert 0.85 * expected_low <= received_bps(low) <= 1.05 * expected_low, (
         received_bps(low), expected_low)
+
+
+async def test_flowtable_qos_weighted_leaf_outranks_unclassified_traffic(qos):
+    """A weighted leaf keeps its rate beside unmarked traffic saturating the
+    channel.
+
+    A tree with one `quantum` leaf and no `default`: a marked flow offered half
+    the cap lands in the weighted group, and an unmarked one offered three times
+    the cap lands where unclassified traffic goes, class queue 0 of the channel,
+    which competes for committed tokens. The weighted group sits above that
+    queue, so the marked flow must keep the rate it offered and the unmarked one
+    gets what is left. With the group placed below class queue 0, as it once
+    was, the unmarked flow took every token and the weighted leaf starved.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    rate = f"{CAP_MBIT}mbit"
+    await r.tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "offload")
+    await r.tc("class", "add", "dev", dev, "parent", "1:", "classid", "1:1",
+               "htb", "rate", rate, "ceil", rate)
+    await r.tc("class", "add", "dev", dev, "parent", "1:1", "classid", "1:10",
+               "htb", "rate", rate, "ceil", rate, "quantum", "10")
+    await offload(r, inbound(r, "udp", PORT_WEIGHTED, r.mark(WEIGHTED_CQ)),
+                  inbound(r, "udp", PORT_WEIGHTED_BULK))
+    await lan_start(r, iperf=[PORT_WEIGHTED, PORT_WEIGHTED_BULK])
+    weighted_mbit = CAP_MBIT // 2
+    clients = [asyncio.create_task(iperf(r, PORT_WEIGHTED, udp_mbit=weighted_mbit)),
+               asyncio.create_task(iperf(r, PORT_WEIGHTED_BULK, udp_mbit=OFFERED_MBIT))]
+    try:
+        await asyncio.sleep(SETTLE)
+        first = await egress(r, dev)
+        state = await r.state()
+        await asyncio.sleep(WINDOW)
+        second = await egress(r, dev)
+        weighted, bulk = await asyncio.gather(*clients)
+    finally:
+        for client in clients:
+            if not client.done():
+                client.cancel()
+        await asyncio.gather(*clients, return_exceptions=True)
+    cap = CAP_MBIT * 1e6
+    charge = (DATAGRAM + UDP_HEADERS + OAL) / DATAGRAM
+    held, unclassified = leaf_delta(first, second, 0), leaf_delta(first, second, "default")
+    weighted_shaped = shaped_bps(first, second, 0)
+    total = shaped_bps(first, second, 0, "default")
+    rows = {port: directions(state, ingress=TARGET_WAN_IF, proto=17, dst=f"{r.lan_ip}:{port}")
+            for port in (PORT_WEIGHTED, PORT_WEIGHTED_BULK)}
+    r.record("qos-weighted-leaf", {"state": state, "first": first, "second": second,
+                                   "weighted_leaf": held, "unclassified": unclassified,
+                                   "weighted_shaped_bps": weighted_shaped, "total_bps": total,
+                                   "weighted": weighted, "bulk": bulk})
+
+    # Both in hardware: the marked flow on the weighted queue, the unmarked one
+    # with no class, which the port resolves to class queue 0.
+    for port, cq in ((PORT_WEIGHTED, WEIGHTED_CQ), (PORT_WEIGHTED_BULK, 0)):
+        assert len(rows[port]) == 1 and int(rows[port][0]["qos"], 16) == cq, rows
+    assert bulk["end"]["sum_sent"]["bits_per_second"] >= 2 * cap, bulk["end"]["sum_sent"]
+    slack = timing_slack(first, second)
+    assert (0.95 - slack) * cap <= total <= (1.03 + slack) * cap, (total, cap, slack, held,
+                                                                   unclassified)
+    expected = weighted_mbit * 1e6 * charge
+    assert (0.95 - slack) * expected <= weighted_shaped <= (1.05 + slack) * expected, (
+        "the weighted leaf did not keep the rate it offered", weighted_shaped, expected, slack)
+    assert held["rejected"] <= held["frames"] // 200, held
+    assert received_loss(weighted) <= 0.01, weighted["server_output_json"]["intervals"]
+    assert unclassified["rejected"] >= unclassified["frames"], unclassified
 
 
 async def test_flowtable_qos_wred_drops_before_the_tail(qos):

@@ -834,6 +834,15 @@ number does not change when cdx loads either. The name carries the slot, and
 leaf *N* is Tx queue `DPAA_ETH_TX_QUEUES + N`, which is what
 `TC_HTB_LEAF_QUERY_QUEUE` answers for a classid.
 
+After the sixteen slots come two more sets, named `[default]` and `[control]`:
+the queue traffic that names no leaf goes to — the `default` leaf's, or the top
+channel's class queue 0 — and the top channel's class queue 7, where control
+traffic goes ([increment 4](#unclassified-traffic)). No leaf need hold either,
+and without these that traffic was invisible; when a leaf does hold one, the
+same queue is reported under its slot too. Every name fits `ETH_GSTRING_LEN`,
+the longest with nothing to spare, and all of them are written with
+`ethtool_sprintf()`.
+
 **The counters are read without `QMAN_CEETM_FLAG_CLEAR_STATISTICS_COUNTER`**, so
 repeated reads report totals rather than deltas. They have one owner in
 hardware and `CMD_QM_QUERY_QUEUE` can clear them, which moves the baseline

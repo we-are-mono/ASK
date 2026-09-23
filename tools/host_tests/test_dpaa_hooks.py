@@ -41,6 +41,7 @@ def test_dpaa_hooks(tmp_path):
         r"typedef int \(\*dpa_setup_tc_handler\)\([^;]*;",
         r"#define DPA_SELECT_QUEUE_NONE[^\n]*",
         r"#define DPA_CEETM_CLASS_STATS[^\n]*",
+        r"#define DPA_CEETM_IMPLICIT_QUEUES[^\n]*",
         r"struct dpa_qdisc_ops \{.*?\n\};")]
     (tmp_path / "dpaa_hooks_types.inc").write_text("\n".join(types) + "\n")
     (tmp_path / "dpaa_hooks_production.inc").write_text(

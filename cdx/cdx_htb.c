@@ -1599,15 +1599,25 @@ bool cdx_htb_resolve_class(struct tQM_context_ctl *qm_ctx, u32 *channel, u32 *cq
 	return true;
 }
 
-/* The counters that describe accelerated traffic, in leaf-slot order. A slot no
- * class holds, and a queue the hardware will not answer for, are left at the
- * zero the caller already wrote: ethtool asks for a fixed number of values and
- * has to get one for every slot. Runs under RTNL from ethtool, which is also
- * what publishes the map, so this reads a settled one. */
+/* The counters that describe accelerated traffic, in leaf-slot order, and
+ * then those of the two queues traffic that names no leaf takes: the one
+ * unclassified traffic goes to, and the top channel's control queue. Either
+ * may be a leaf's too, and is then reported under that leaf as well; either
+ * may be a queue no leaf holds, and is then visible nowhere else.
+ *
+ * A slot no class holds, a queue with no tree to put it on, and a queue the
+ * hardware will not answer for are left at the zero the caller already wrote:
+ * ethtool asks for a fixed number of values and has to get one for each. Runs
+ * under RTNL from ethtool, which is also what publishes the map, so this reads
+ * a settled one. */
+static_assert(DPA_CEETM_IMPLICIT_QUEUES == 2,
+	      "the unclassified queue, then the control queue, after the leaves");
 static void cdx_htb_class_stats(void *qm_ctx, u64 *data)
 {
 	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
 	unsigned int slot;
+	u16 unclassified;
+	u8 top;
 
 	if (!port)
 		return;
@@ -1620,6 +1630,14 @@ static void cdx_htb_class_stats(void *qm_ctx, u64 *data)
 		ceetm_class_counters(channel, READ_ONCE(port->txq_cq[slot]),
 				     &data[0], &data[1], &data[2]);
 	}
+	top = READ_ONCE(port->top);
+	if (top == CDX_HTB_NONE)
+		return;
+	unclassified = READ_ONCE(port->unclassified);
+	ceetm_class_counters(unclassified >> 8, unclassified & 0xff,
+			     &data[0], &data[1], &data[2]);
+	data += DPA_CEETM_CLASS_STATS;
+	ceetm_class_counters(top, CDX_HTB_CONTROL_CQ, &data[0], &data[1], &data[2]);
 }
 
 static const struct dpa_qdisc_ops cdx_htb_qdisc_ops = {

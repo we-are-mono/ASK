@@ -150,6 +150,7 @@ static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return &dev->pri
 /* What the stack does with a queue index the driver hands back. */
 #define DPA_SELECT_QUEUE_NONE	((u16)~0U)
 #define DPA_CEETM_CLASS_STATS	3
+#define DPA_CEETM_IMPLICIT_QUEUES	2
 struct sk_buff;
 struct qman_fq;
 struct dpa_qdisc_ops {
@@ -1577,7 +1578,8 @@ static void test_remark(void)
  * so a count that moved with the tree would misalign them. */
 static void test_class_statistics(void)
 {
-	u64 data[CDX_HTB_MAX_LEAVES * DPA_CEETM_CLASS_STATS];
+	u64 data[(CDX_HTB_MAX_LEAVES + DPA_CEETM_IMPLICIT_QUEUES) * DPA_CEETM_CLASS_STATS];
+	u64 *implicit = data + CDX_HTB_MAX_LEAVES * DPA_CEETM_CLASS_STATS;
 	struct net_device *dev = &devices[0];
 	u16 qid1, qid2, qid10;
 	unsigned ii;
@@ -1585,7 +1587,7 @@ static void test_class_statistics(void)
 	reset_world();
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
-	assert(!add_leaf(dev, 2, 0, 0, 0, 1000, 1000, &qid2));
+	assert(!add_leaf(dev, 2, 0, 1, 0, 1000, 1000, &qid2));
 	assert(!to_inner(dev, 10, 1, 0, 0));
 	assert(!query(dev, 10, &qid10));
 
@@ -1594,14 +1596,21 @@ static void test_class_statistics(void)
 	/* Slot 0 is class 10: channel 0, the top strict-priority queue. */
 	assert(data[0] == NUM_PQS - 1 && data[1] == 100u * (NUM_PQS - 1));
 	assert(data[2] == NUM_PQS - 1);
-	/* Slot 1 is class 2, on the second channel. */
-	assert(data[3] == 1000u + NUM_PQS - 1);
-	assert(data[4] == 100000u + 100u * (NUM_PQS - 1));
-	assert(data[5] == 10u + NUM_PQS - 1);
+	/* Slot 1 is class 2, on the second channel, at prio 1. */
+	assert(data[3] == 1000u + NUM_PQS - 2);
+	assert(data[4] == 100000u + 100u * (NUM_PQS - 2));
+	assert(data[5] == 10u + NUM_PQS - 2);
 	/* Every other slot is left exactly as the caller had it, which is the
 	 * zero the driver writes before asking. */
-	for (ii = 2 * DPA_CEETM_CLASS_STATS; ii < ARRAY_SIZE(data); ii++)
+	for (ii = 2 * DPA_CEETM_CLASS_STATS; ii < CDX_HTB_MAX_LEAVES * DPA_CEETM_CLASS_STATS; ii++)
 		assert(data[ii] == UINT64_MAX);
+	/* Then the two queues no leaf need hold, on the top channel -- the
+	 * second: where unclassified traffic goes, class queue 0, and where
+	 * control traffic goes, class queue 7. */
+	assert(implicit[0] == 1000u && implicit[1] == 100000u && implicit[2] == 10u);
+	assert(implicit[3] == 1000u + NUM_PQS - 1);
+	assert(implicit[4] == 100000u + 100u * (NUM_PQS - 1));
+	assert(implicit[5] == 10u + NUM_PQS - 1);
 
 	/* A queue the hardware will not answer for leaves its slot alone rather
 	 * than reporting a number nothing stands behind. */
@@ -1620,6 +1629,18 @@ static void test_class_statistics(void)
 	cdx_htb_class_stats(dev->priv.qm_ctx, data);
 	for (ii = 0; ii < ARRAY_SIZE(data); ii++)
 		assert(data[ii] == 0);
+	assert_balanced(dev);
+
+	/* With `default', unclassified traffic goes to the default leaf, and
+	 * that is the queue reported for it: the same counters as its slot. */
+	assert(!create(dev, 1, 10));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!to_inner(dev, 10, 1, 2, 0));
+	memset(data, 0, sizeof(data));
+	cdx_htb_class_stats(dev->priv.qm_ctx, data);
+	assert(data[0] == NUM_PQS - 3 && !memcmp(implicit, data, 3 * sizeof(*data)));
+	assert(implicit[3] == NUM_PQS - 1);
+	assert(!destroy(dev));
 	assert_balanced(dev);
 }
 

@@ -1,4 +1,4 @@
-From 4a9278860924de5f118054f64e1a808f95e7c057 Mon Sep 17 00:00:00 2001
+From 491deb25f225417ca05ac976c9c30289519ede57 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 19:08:09 +0200
 Subject: [PATCH] sdk_dpaa: let this netdev host a hardware qdisc
@@ -73,7 +73,10 @@ reads them.
 One set per leaf slot rather than per class in the tree, so the number of
 statistics is a compile-time constant: ethtool fetches the names and the values
 in separate ioctls, and a count that moved with `tc class add` would leave
-userspace lining one up against the other.
+userspace lining one up against the other. Then one set each for the two
+queues a frame that names no leaf takes, where unclassified traffic goes and
+where control traffic goes: no leaf need hold either, and without these that
+traffic is invisible.
 
 Both registrations point into the module's text, so both unregisters wait
 for the calls already inside it. The ndo_setup_tc handler sleeps, and runs
@@ -87,13 +90,13 @@ PREEMPT_RCU is no reader -- and the unregister waits for a grace period.
 ---
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 173 +++++++++++++++++-
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |  33 +++-
- .../freescale/sdk_dpaa/dpaa_eth_common.h      |  65 +++++++
+ .../freescale/sdk_dpaa/dpaa_eth_common.h      |  69 +++++++
  .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  30 ++-
- .../freescale/sdk_dpaa/dpaa_ethtool.c         |  53 +++++-
- 5 files changed, 344 insertions(+), 10 deletions(-)
+ .../freescale/sdk_dpaa/dpaa_ethtool.c         |  65 ++++++-
+ 5 files changed, 360 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-index 063302116911..0deb06afde81 100644
+index 063302116911..54c0b10296ba 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 @@ -57,6 +57,7 @@
@@ -202,14 +205,14 @@ index 063302116911..0deb06afde81 100644
 +
 +/* Always answers, so the count of statistics this driver reports is a
 + * compile-time constant rather than something that changes when a module
-+ * loads. Unclaimed leaf slots, and every slot when nothing is registered,
++ * loads. Unclaimed leaf slots, and every value when nothing is registered,
 + * read zero. */
 +void dpa_qdisc_class_stats(void *qm_ctx, u64 *data)
 +{
 +	const struct dpa_qdisc_ops *ops;
 +
-+	memset(data, 0, DPAA_ETH_CEETM_LEAF_QUEUES * DPA_CEETM_CLASS_STATS *
-+			sizeof(*data));
++	memset(data, 0, (DPAA_ETH_CEETM_LEAF_QUEUES + DPA_CEETM_IMPLICIT_QUEUES) *
++			DPA_CEETM_CLASS_STATS * sizeof(*data));
 +	rcu_read_lock();
 +	ops = READ_ONCE(dpa_qdisc);
 +	if (ops && qm_ctx)
@@ -373,10 +376,10 @@ index b83261780d96..80350d0a1a64 100644
  #define DPAA_IP_VERSION_4  4
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-index 46816dcda3cb..7d0de0cc9391 100644
+index 46816dcda3cb..f775104c3ae1 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-@@ -111,6 +111,71 @@ typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint
+@@ -111,6 +111,75 @@ typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint
  typedef struct qman_fq *(*cdx_get_ceetm_dscp_fq)(void *, uint8_t dscp);
  int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func);
  void dpa_unregister_ceetm_get_egress_fq(void);
@@ -421,8 +424,10 @@ index 46816dcda3cb..7d0de0cc9391 100644
 + * tree that reading would pick queues the tree never configured.
 + *
 + * class_stats fills the hardware counters for every leaf slot, in slot order,
-+ * DPA_CEETM_CLASS_STATS values each. It fills all of them whatever the tree
-+ * currently looks like, zeroing the slots no class holds, because ethtool's
++ * DPA_CEETM_CLASS_STATS values each, and then for the DPA_CEETM_IMPLICIT_QUEUES
++ * queues traffic that names no leaf takes: the one unclassified traffic goes
++ * to, then the one control traffic goes to. It fills all of them whatever the
++ * tree currently looks like, zeroing what nothing holds, because ethtool's
 + * string set is fixed length: names and values arrive in separate ioctls, so a
 + * count that moved with tc would leave userspace reading one against the other.
 + *
@@ -436,6 +441,8 @@ index 46816dcda3cb..7d0de0cc9391 100644
 +#define DPA_SELECT_QUEUE_NONE	((u16)~0U)
 +/* dequeued frames, dequeued bytes, rejected frames */
 +#define DPA_CEETM_CLASS_STATS	3
++/* the unclassified queue, then the control queue, after the leaf slots */
++#define DPA_CEETM_IMPLICIT_QUEUES	2
 +struct dpa_qdisc_ops {
 +	u16 (*select_queue)(struct net_device *dev, struct sk_buff *skb);
 +	struct qman_fq *(*txq_fq)(void *qm_ctx, u16 txq, struct sk_buff *skb);
@@ -506,10 +513,10 @@ index 62fc7105e9c9..903a88e95aad 100644
  }
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
-index 95f6db29416b..c5f99dbf8a7c 100644
+index 95f6db29416b..6ff76952144f 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
-@@ -93,6 +93,34 @@ static char dpa_stats_global[][ETH_GSTRING_LEN] = {
+@@ -93,6 +93,45 @@ static char dpa_stats_global[][ETH_GSTRING_LEN] = {
  #define DPA_STATS_PERCPU_LEN ARRAY_SIZE(dpa_stats_percpu)
  #define DPA_STATS_GLOBAL_LEN ARRAY_SIZE(dpa_stats_global)
  
@@ -526,6 +533,11 @@ index 95f6db29416b..c5f99dbf8a7c 100644
 + * constant: ethtool fetches the names and the values in separate ioctls, and a
 + * count that moved with `tc class add` would leave userspace lining one up
 + * against the other. A slot no class holds reads zero.
++ *
++ * Then the two queues traffic that names no leaf takes, which a leaf may or
++ * may not hold: [default], where unclassified traffic goes, and [control],
++ * where the frames that keep the link and the gateway itself running go. A
++ * leaf holding one reports the same queue under its own slot too.
 + */
 +static const char dpa_stats_ceetm[][ETH_GSTRING_LEN] = {
 +	"ceetm dequeued frames",
@@ -533,8 +545,14 @@ index 95f6db29416b..c5f99dbf8a7c 100644
 +	"ceetm rejected frames",
 +};
 +
++/* In the order dpa_qdisc_ops.class_stats fills them, after the leaf slots. */
++static const char * const dpa_stats_ceetm_implicit[] = { "default", "control" };
++static_assert(ARRAY_SIZE(dpa_stats_ceetm_implicit) == DPA_CEETM_IMPLICIT_QUEUES,
++	      "one name per queue the qdisc module reports beyond the leaves");
++
 +#define DPA_STATS_CEETM_LEN \
-+	(DPAA_ETH_CEETM_LEAF_QUEUES * ARRAY_SIZE(dpa_stats_ceetm))
++	((DPAA_ETH_CEETM_LEAF_QUEUES + DPA_CEETM_IMPLICIT_QUEUES) * \
++	 ARRAY_SIZE(dpa_stats_ceetm))
 +static_assert(ARRAY_SIZE(dpa_stats_ceetm) == DPA_CEETM_CLASS_STATS,
 +	      "one name per value the qdisc module reports");
 +#else
@@ -544,7 +562,7 @@ index 95f6db29416b..c5f99dbf8a7c 100644
  static int __cold dpa_get_ksettings(struct net_device *net_dev,
  		struct ethtool_link_ksettings *cmd)
  {
-@@ -359,7 +387,8 @@ static int dpa_get_sset_count(struct net_device *net_dev, int type)
+@@ -359,7 +398,8 @@ static int dpa_get_sset_count(struct net_device *net_dev, int type)
  	unsigned int total_stats, num_stats;
  
  	num_stats   = num_online_cpus() + 1;
@@ -554,7 +572,7 @@ index 95f6db29416b..c5f99dbf8a7c 100644
  
  	switch (type) {
  	case ETH_SS_STATS:
-@@ -482,6 +511,14 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
+@@ -482,6 +522,14 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
  	data[offset++] = cg_time;
  	data[offset++] = cg_num;
  	data[offset++] = cg_status;
@@ -569,23 +587,24 @@ index 95f6db29416b..c5f99dbf8a7c 100644
  }
  
  static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
-@@ -505,6 +542,20 @@ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
+@@ -505,6 +553,21 @@ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
  		strings += ETH_GSTRING_LEN;
  	}
  	memcpy(strings, dpa_stats_global, size);
 +	strings += size;
 +
 +#ifdef CONFIG_CPE_FAST_PATH
-+	for (i = 0; i < DPAA_ETH_CEETM_LEAF_QUEUES; i++) {
-+		for (j = 0; j < ARRAY_SIZE(dpa_stats_ceetm); j++) {
-+			/* Leaf i is Tx queue DPAA_ETH_TX_QUEUES + i, which is
-+			 * what TC_HTB_LEAF_QUERY_QUEUE answers for a classid. */
-+			snprintf(stat_string_cpu, ETH_GSTRING_LEN, "%s [leaf %u]",
-+				 dpa_stats_ceetm[j], i);
-+			memcpy(strings, stat_string_cpu, ETH_GSTRING_LEN);
-+			strings += ETH_GSTRING_LEN;
-+		}
-+	}
++	/* Leaf i is Tx queue DPAA_ETH_TX_QUEUES + i, which is what
++	 * TC_HTB_LEAF_QUERY_QUEUE answers for a classid. Every name fits
++	 * ETH_GSTRING_LEN, the longest -- "ceetm rejected frames [leaf 15]" and
++	 * "ceetm dequeued frames [default]" -- with no room to spare. */
++	for (i = 0; i < DPAA_ETH_CEETM_LEAF_QUEUES; i++)
++		for (j = 0; j < ARRAY_SIZE(dpa_stats_ceetm); j++)
++			ethtool_sprintf(&strings, "%s [leaf %u]", dpa_stats_ceetm[j], i);
++	for (i = 0; i < ARRAY_SIZE(dpa_stats_ceetm_implicit); i++)
++		for (j = 0; j < ARRAY_SIZE(dpa_stats_ceetm); j++)
++			ethtool_sprintf(&strings, "%s [%s]", dpa_stats_ceetm[j],
++					dpa_stats_ceetm_implicit[i]);
 +#endif
  }
  
