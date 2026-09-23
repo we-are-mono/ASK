@@ -167,6 +167,11 @@ static bool list_empty(const struct list_head *h) { return h->next == h; }
 #define GFP_KERNEL 0
 #define kmalloc(size, flags) allocate(size)
 #define DPA_ERROR(...) ((void)0)
+/* The control mutex every quarantine mutator requires, and lockdep's check
+ * of it, counted rather than fatal so a case can prove the check is made. */
+static struct { struct { bool mutex; } ctrl; } cdx_instance, *cdx_info = &cdx_instance;
+static unsigned unlocked;
+#define lockdep_assert_held(lock) do { if (!*(lock)) unlocked++; } while (0)
 #define SUCCESS 0
 #define EN_EHASH_DELETE_UNSYNCED (-2)
 static unsigned hc_syncs;
@@ -188,6 +193,17 @@ static void check_quarantine(void)
     struct en_exthash_info *first = table(&pcd), *second = table(&pcd);
     unsigned held = allocations;
     void *entry;
+
+    /* Every mutator asserts the control mutex: one called without it is
+     * caught, whatever else it does. */
+    assert(cdx_ehash_quarantine_retry() == 0 && unlocked == 1);
+    cdx_ehash_quarantine_free_all();
+    cdx_ehash_quarantine_drain(first);
+    cdx_ehash_quarantine_entry(first, NULL);
+    cdx_ehash_quarantine_abandon();
+    assert(unlocked == 5 && !hc_syncs);
+    unlocked = 0;
+    cdx_info->ctrl.mutex = true;
 
     /* Nothing parked: nothing to sync. */
     assert(cdx_ehash_quarantine_retry() == 0 && !hc_syncs);
@@ -235,6 +251,8 @@ static void check_quarantine(void)
     hc_fail = false;
     assert(!cdx_ehash_quarantine_pending() && allocations == held + 1 && hc_syncs == 5);
     release(entry);
+    assert(!unlocked);
+    cdx_info->ctrl.mutex = false;
     FreeEnEhashInfo(first);
     FreeEnEhashInfo(second);
 }

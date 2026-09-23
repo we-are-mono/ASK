@@ -505,12 +505,13 @@ void hw_ct_get_active(struct hw_ct *ct)
  * anything is parked, and would otherwise wait on some unrelated delete.
  *
  * Concurrency: the quarantine carries no lock of its own. Every touch
- * runs either from an FCI command handler - serialized by ctrl.mutex in
- * cdx_cmdhandler.c, with the multicast callers additionally holding
- * mc_mutators_mutex - from the CT aging kthread or the flowtable backend,
- * which take that same ctrl.mutex, or from module exit with no handler in
- * flight. The query walkers never see it, so no softirq-safe variant is
- * needed. Callers must not hold a spinlock: the barriers reached from here
+ * runs under ctrl.mutex: the FCI command handlers (cdx_cmdhandler.c),
+ * with the multicast callers additionally holding mc_mutators_mutex, the
+ * CT aging kthread, the flowtable backend and its multicast and IPsec
+ * callers, and module exit, which tears down under cdx_ctrl_deinit()'s
+ * hold. Each mutator asserts it (cdx_ehash_quarantine_assert_held()).
+ * The query walkers never see it, so no softirq-safe variant is needed.
+ * Callers must not hold a spinlock: the barriers reached from here
  * busy-wait on host-command completion.
  */
 struct cdx_ehash_pending_free {
@@ -521,6 +522,11 @@ struct cdx_ehash_pending_free {
 
 static LIST_HEAD(cdx_ehash_pending_frees);
 static unsigned int cdx_ehash_pending_free_cnt;
+
+static void cdx_ehash_quarantine_assert_held(void)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+}
 
 /* Advisory snapshot for the debug proc readers, which run outside the
  * mutator serialization. */
@@ -536,6 +542,7 @@ void cdx_ehash_quarantine_entry(void *td, void *tbl_entry)
 {
 	struct cdx_ehash_pending_free *node;
 
+	cdx_ehash_quarantine_assert_held();
 	if (!tbl_entry)
 		return;
 
@@ -568,6 +575,7 @@ void cdx_ehash_quarantine_free_all(void)
 {
 	struct cdx_ehash_pending_free *node, *tmp;
 
+	cdx_ehash_quarantine_assert_held();
 	list_for_each_entry_safe(node, tmp, &cdx_ehash_pending_frees, list)
 	{
 		list_del(&node->list);
@@ -590,6 +598,7 @@ void cdx_ehash_quarantine_abandon(void)
 {
 	struct cdx_ehash_pending_free *node, *tmp;
 
+	cdx_ehash_quarantine_assert_held();
 	if (!READ_ONCE(cdx_ehash_pending_free_cnt) || !cdx_ehash_quarantine_retry())
 		return;
 
@@ -617,6 +626,7 @@ void cdx_ehash_quarantine_abandon(void)
  * which is the common case. */
 void cdx_ehash_quarantine_drain(void *td)
 {
+	cdx_ehash_quarantine_assert_held();
 	if (list_empty(&cdx_ehash_pending_frees))
 		return;
 
@@ -641,6 +651,7 @@ int cdx_ehash_quarantine_retry(void)
 {
 	struct cdx_ehash_pending_free *node;
 
+	cdx_ehash_quarantine_assert_held();
 	list_for_each_entry(node, &cdx_ehash_pending_frees, list)
 	{
 		if (!node->td)
