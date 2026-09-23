@@ -9,6 +9,7 @@ reached the wire rather than just the rule.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from contextlib import asynccontextmanager
 import json
 import os
@@ -22,7 +23,7 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from _topology import (DUT_IPV6_LAN, DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN_IF,
                        TARGET_WAN_IF, VIRT_IPV6, WAN_IPV6, lan_run, lan_run_python)
-from test_flowtable_offload import Rig, command, read
+from test_flowtable_offload import Rig, command, read, stop_boot_daemon
 
 TABLE = "ask_poc6"
 NAT_TABLE = "ask_nat6"
@@ -30,7 +31,7 @@ NAT_TABLE = "ask_nat6"
 PORTS = {"routed": (48810, 48811), "snat": (48820, 48821),
          "dnat": (48830, 48831), "tcp": (48840, 48841),
          "masquerade": (48850, 48851), "mtu": (48860, 48861),
-         "budget": (48900, 48990)}
+         "exceptions": (48870, 48871), "budget": (48900, 48990)}
 SNAT_PORT = 49820
 
 
@@ -79,6 +80,19 @@ class Echo(asyncio.DatagramProtocol):
         self.packets += 1
         self.sources.add((addr[0], addr[1]))
         self.transport.sendto(data, addr)
+
+
+class PayloadEcho(Echo):
+    """Also counts each payload: what an exception case must or must not have
+    delivered across the DUT."""
+
+    def __init__(self):
+        super().__init__()
+        self.received = Counter()
+
+    def datagram_received(self, data, addr):
+        self.received[data] += 1
+        super().datagram_received(data, addr)
 
 
 BLOCK = bytes(range(256)) * 16
@@ -151,6 +165,7 @@ async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
     r = IPv6Rig()
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
+    await stop_boot_daemon()
     initial = await r.state()
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     # The adapter's error count is cumulative for the boot and never reset;
@@ -576,6 +591,100 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
         transport.close()
         await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
                       "mtu", str(original), check=False)
+        await _drop_tables(r)
+
+
+async def test_flowtable_ipv6_same_tuple_exceptions(ipv6_rig):
+    """Packets on an offloaded IPv6 tuple that Linux must handle still reach it.
+
+    The IPv6 counterpart of test_flowtable_offload_same_tuple_exceptions. With
+    both directions in hardware, the same 5-tuple carries a hop limit of 1,
+    which must come back as an ICMPv6 error from Linux rather than leave the
+    WAN port, and hop-by-hop options, destination options, a chain of both and
+    fragments, which Linux forwards intact. The entries must still be carrying
+    the flow afterwards.
+    """
+    r = ipv6_rig
+    sport, dport = PORTS["exceptions"]
+    loop = asyncio.get_running_loop()
+    echo = PayloadEcho()
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: echo, local_addr=(WAN_IPV6, dport), family=socket.AF_INET6)
+    forward = (_endpoint(LAN_IPV6, sport), _endpoint(WAN_IPV6, dport),
+               _endpoint(LAN_IPV6, sport), _endpoint(WAN_IPV6, dport), WAN_IPV6)
+    reverse = (_endpoint(WAN_IPV6, dport), _endpoint(LAN_IPV6, sport),
+               _endpoint(WAN_IPV6, dport), _endpoint(LAN_IPV6, sport), LAN_IPV6)
+    try:
+        await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
+
+        async def send(count=8):
+            return await _udp_exchange(r, sport, WAN_IPV6, dport, count, (WAN_IPV6, dport),
+                                       "flowtable_v6_exceptions")
+
+        admitted, admitted_rows = await _settle(r, socket.IPPROTO_UDP, forward, reverse, send,
+                                                "ipv6-exceptions-admission")
+        script = f'''
+import json, socket, struct, time
+from scapy.all import (Ether, IPv6, UDP, Raw, ICMPv6TimeExceeded,
+                       IPv6ExtHdrHopByHop, IPv6ExtHdrDestOpt, IPv6ExtHdrFragment,
+                       fragment6, sendp, srp1)
+iface = {LAN_NIC!r}
+src, dst = {LAN_IPV6!r}, {WAN_IPV6!r}
+sport, dport = {sport}, {dport}
+eth = Ether(dst={r.dut_lan_mac!r})
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind((src, sport)); s.settimeout(3)
+s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_RECVHOPLIMIT, 1)
+def udp(payload, *headers, hlim=64):
+    packet = IPv6(src=src, dst=dst, hlim=hlim)
+    for header in headers:
+        packet = packet/header
+    return packet/UDP(sport=sport, dport=dport)/Raw(payload)
+results = {{}}
+answer = srp1(eth/udp(b'ASK6-expired', hlim=1), iface=iface, timeout=3, verbose=False)
+assert answer is not None and ICMPv6TimeExceeded in answer, answer
+results['hoplimit'] = answer.summary()
+fragments = b'ASK6-fragments'.ljust(1024, b'.')
+for name, packets, payload in [
+    ('hop_by_hop', [udp(b'ASK6-hbh', IPv6ExtHdrHopByHop())], b'ASK6-hbh'),
+    ('destination', [udp(b'ASK6-dest', IPv6ExtHdrDestOpt())], b'ASK6-dest'),
+    ('chain', [udp(b'ASK6-chain', IPv6ExtHdrHopByHop(), IPv6ExtHdrDestOpt())], b'ASK6-chain'),
+    ('fragments', fragment6(udp(fragments, IPv6ExtHdrFragment()), 600), fragments),
+]:
+    sendp([eth/p for p in packets], iface=iface, verbose=False)
+    data, anc, flags, addr = s.recvmsg(4096, 128)
+    assert data == payload and addr[:2] == (dst, dport), (name, data, addr)
+    hops = [struct.unpack('i', v)[0] for level, kind, v in anc
+            if level == socket.IPPROTO_IPV6 and kind == socket.IPV6_HOPLIMIT]
+    assert hops == [63], (name, hops)
+    results[name] = len(data)
+time.sleep(0.5)
+s.close()
+print(json.dumps(results))
+'''
+        result = await lan_run_python(r.lan, script, timeout=40, label="flowtable_v6_exceptions")
+        assert result.rc == 0, result.stdout
+        for payload in (b"ASK6-hbh", b"ASK6-dest", b"ASK6-chain", b"ASK6-fragments".ljust(1024, b".")):
+            assert echo.received[payload] == 1, (payload, echo.received)
+        assert not echo.received[b"ASK6-expired"], echo.received
+
+        # The exceptions went to Linux; the entries kept the flow.
+        before_state = await r.state()
+        before = _assert_pair(before_state, socket.IPPROTO_UDP, forward, reverse)
+        report = await send(16)
+        assert report == {"echoed": 16, "lost": 0}, report
+        after_state = await r.state()
+        after = _assert_pair(after_state, socket.IPPROTO_UDP, forward, reverse)
+        delta = _hardware_delta(before, after)
+        assert delta == {TARGET_LAN_IF: 16, TARGET_WAN_IF: 16}, (delta, before_state, after_state)
+        for direction in before:
+            assert after[direction]["cookie"] == admitted_rows[direction]["cookie"], (admitted, after_state)
+        assert after_state["errors"] == r.errors, after_state
+        r.record("ipv6-exceptions", {"results": json.loads(result.stdout.strip().splitlines()[-1]),
+                                     "admitted": admitted, "after": after_state,
+                                     "hardware_delta": delta})
+    finally:
+        transport.close()
         await _drop_tables(r)
 
 

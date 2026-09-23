@@ -380,6 +380,19 @@ print(json.dumps({{'first': received[0], 'last': received[-1], 'count': len(rece
         (ARTIFACTS / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
 
 
+async def stop_boot_daemon():
+    """The offload service is default-on: a normal boot has already installed
+    the catch-all policy, so the backend starts bound. Controlled tests own the
+    policy themselves, so they stop the boot daemon first -- the init script
+    kills it and removes its table, draining the hardware to an unbound state.
+    Every rig does this itself rather than rely on an earlier test having done
+    it, so a test run on its own after a boot sees the same start."""
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    with Console.target(log_path=str(ARTIFACTS / "boot-daemon-stop.log")) as con:
+        await asyncio.to_thread(con.login, "root", None)
+        await console_command(con, "/etc/init.d/ask-flowtable", "stop", check=False, timeout=45)
+
+
 @pytest_asyncio.fixture
 async def rig(target_agent, aiohttp_session, lan, splat_window, request):
     r = Rig()
@@ -387,13 +400,7 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
     assert r.proto in {"udp", "tcp"}
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
-    # The offload service is default-on: a normal boot has already installed the
-    # catch-all policy, so the backend starts bound. These controlled tests own
-    # the policy themselves, so stop the boot daemon first — the init script
-    # kills it and removes its table, draining the hardware to an unbound state.
-    with Console.target(log_path=str(ARTIFACTS / "boot-daemon-stop.log")) as _con:
-        await asyncio.to_thread(_con.login, "root", None)
-        await console_command(_con, "/etc/init.d/ask-flowtable", "stop", check=False, timeout=45)
+    await stop_boot_daemon()
     initial = await r.state()
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     # The adapter's error count is cumulative for the boot and deliberately
@@ -652,7 +659,7 @@ async def test_flowtable_offload_same_tuple_exceptions(rig):
     await r.exchange(32, payload_size=8)
     r.record("exception-short-packets", {"before": before, "after": await r.state()})
     script = f'''
-import json, socket, struct
+import json, socket, struct, time
 from scapy.all import Ether, IP, UDP, ICMP, Raw, IPOption, fragment, sendp, srp1, getmacbyip
 iface = {LAN_NIC!r}
 src, dst = {r.lan_ip!r}, {WAN_IP!r}
@@ -684,6 +691,15 @@ for name, packets, payload in [
     ttl = [struct.unpack('i', v)[0] for level, kind, v in anc if level == socket.SOL_IP and kind == socket.IP_TTL]
     assert ttl == [63], (name, ttl)
     results[name] = len(data)
+# Headers Linux would discard must not be forwarded by the entry for their tuple.
+for name, pkt in [
+    ('bad_checksum', IP(src=src,dst=dst,ttl=64,chksum=0x1234)/UDP(sport=sport,dport=dport)/Raw(b'ASK-badsum')),
+    ('version', IP(src=src,dst=dst,ttl=64,version=5)/UDP(sport=sport,dport=dport)/Raw(b'ASK-version')),
+    ('version15', IP(src=src,dst=dst,ttl=64,version=15)/UDP(sport=sport,dport=dport)/Raw(b'ASK-version15')),
+]:
+    sendp(eth/pkt, iface=iface, verbose=False)
+    results[name] = 'sent'
+time.sleep(0.5)
 s.close()
 print(json.dumps(results))
 '''
@@ -692,6 +708,7 @@ print(json.dumps(results))
     assert r.echo.received[b"ASK-options"] == 1
     assert r.echo.received[b"ASK-fragments".ljust(1024, b".")] == 1
     assert not r.echo.received[b"ASK-expired"] and not r.echo.received[b"M" * 1250]
+    assert not any(r.echo.received[p] for p in (b"ASK-badsum", b"ASK-version", b"ASK-version15"))
     await r.exchange()
     r.record("exceptions", {"results": json.loads(result.stdout.strip()), "state": await r.state()})
 
