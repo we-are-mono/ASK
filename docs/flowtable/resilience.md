@@ -631,8 +631,11 @@ reordered, within the peer's replay window.
 
 One earlier SA-test baseline timed out on its fourth protected UDP exchange,
 before any fault injection. Both TCP streams completed their 128 records.
-The same-boot retry and the subsequent 24 admission cycles passed; that failure
-remains recorded without an established cause.
+The same-boot retry and the subsequent 24 admission cycles passed. The failure
+matches the ESP sequence-number reuse later found and fixed (ipsec.md, "Two
+feeders, one sequence counter"). A protected datagram encrypted on the CPU path
+while hardware traffic ran on the same SA reused a sequence number, and the peer
+dropped it as a replay.
 
 An instrumented repeat followed the original SA-test order. All four fresh
 admissions delivered their first 128 UDP requests and replies exactly once,

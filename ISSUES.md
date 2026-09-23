@@ -172,28 +172,6 @@ result independently of those temporary files.
   interface's IPv6 MTU) nor the Armbian integration sets it. Derive it from the
   upstream when the uplink is PPPoE or a tunnel.
 
-- [ ] **A199 — one outbound IPsec packet is lost as its flow is admitted.**
-  About one run in ten of `test_flowtable_service_ipsec_receive_failslab` /
-  `_pool_recovery` (also seen in `_admission_churn` and, once, the 4o6
-  tunnel service case) loses one datagram of the protected UDP flow
-  (198.18.102.3:48782 to 198.18.102.2) in a `warm()` right after the flow is
-  (re)offered. Measured on 2026-09-23:
-  - The WAN host never receives it; the five follow-up probes all arrive, so
-    it is one packet, not the flow going dark.
-  - The flow's hardware entries count only the follow-up probes: the lost
-    packet was the last one on the software path, at admission.
-  - The DUT's eth3 capture has it, and a perf skb trace follows it from eth3
-    receive through `net_dev_queue`/`net_dev_xmit` on eth4 (rc 0) into the SEC
-    submit; its skb is freed 69 us later by the SG-table reclaim, i.e. SEC had
-    already consumed the input.
-  - No kernel counter moves (xfrm_stat, snmp, device stats identical to
-    passing runs), no ERN, no SEC error log.
-  So it dies after SEC: SEC output, the IPsec OH port or the TX. ESP sequence
-  numbering is ruled out (one PDB counter per SA, SEC assigns on both paths).
-  Next: diff the FMAN port and policer counters (`/sys/devices/platform/soc/
-  1a00000.fman/*.port/statistics`) across failing and passing runs to name
-  the stage, then the OH-port classification change the admission makes.
-
 - [ ] **A197 — two later upstream flowtable lifetime fixes are not in the
   tree.** 2014ac62df9d ("netfilter: flowtable: publish GC-visible tuple
   last"): `flow_offload_add()` publishes the ORIGINAL tuple, the one the GC
@@ -389,6 +367,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A199.** CPU- and FMan-fed jobs of one SA reused ESP sequence numbers (the SDK zeroed the firmware's FMan port ICIDs) —
+  fixed (_:/^sdk_fman: keep the boot firmware's port ICIDs_).
 
 - [x] **A198.** The microcode fragmented forwarded IPv6 into a smaller path instead of Packet Too Big —
   fixed (_:/^flowtable: keep an IPv6 direction into a smaller path in software_).

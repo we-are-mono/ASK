@@ -7,11 +7,14 @@ All policies remain required while an SA is absent, including on the peer.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
 import secrets
+import struct
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -417,3 +420,99 @@ async def test_flowtable_service_ipsec_admission_churn(ipsec_service):
                 "sec_stats": (await command(r.target, r.session, "ethtool", "-S", TARGET_WAN_IF))["stdout"],
             })
             raise
+
+
+BLASTER = "/tmp/ask-ipsec-sequence-blast.py"
+SEQUENCE_SECONDS = 4
+
+
+def blast_script(seconds):
+    """Flow 2's tuple from one socket, as fast as it goes, echoes discarded."""
+    return f"""
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(({LAN_INNER!r}, {FIRST}))
+s.setblocking(False)
+payload, end = b"x" * 1000, time.time() + {seconds}
+while time.time() < end:
+    try:
+        s.sendto(payload, ({INNER!r}, {DPORT}))
+    except BlockingIOError:
+        time.sleep(0.0001)
+    try:
+        while True:
+            s.recv(2048)
+    except BlockingIOError:
+        pass
+"""
+
+
+def reused_sequences(path):
+    """ESP frames in a pcap, and how many (SPI, sequence) pairs went out twice.
+    A plain walk: scapy takes minutes on a line-rate burst."""
+    seen = Counter()
+    data = Path(path).read_bytes()
+    off = 24
+    while off + 16 <= len(data):
+        length = struct.unpack_from("<I", data, off + 8)[0]
+        frame = data[off + 16:off + 16 + length]
+        off += 16 + length
+        l3 = 18 if frame[12:14] == b"\x81\x00" else 14
+        if len(frame) >= l3 + 28 and frame[l3 + 9] == 50:
+            ihl = (frame[l3] & 0xF) * 4
+            seen[frame[l3 + ihl:l3 + ihl + 8]] += 1
+    return sum(seen.values()), sum(1 for n in seen.values() if n > 1)
+
+
+def replay_drops():
+    """Anti-replay rejections on this host, the SA's receiving peer."""
+    for line in Path("/proc/net/xfrm_stat").read_text().splitlines():
+        if line.startswith("XfrmInStateSeqError"):
+            return int(line.split()[1])
+
+
+async def test_flowtable_service_ipsec_shared_sequence(ipsec_service):
+    """Both SEC feeders of one outbound SA draw from one sequence counter.
+
+    The classifier enqueues the offloaded flow's frames to the SA's SEC queue
+    while the CPU enqueues what the flowtable never offloads, ICMP here. SEC
+    shares a descriptor, and with it the stored ESP sequence number, only
+    between jobs that fetch it under the same ICID. If FMan and the QMan
+    software portals stamp frames differently, both feeders encrypt from the
+    same stored number and the peer drops the later copy as a replay."""
+    r, flows = ipsec_service, flows_for(ipsec_service)
+    # Only the reserved test ports are exempt from the WAN masquerade, and a
+    # masqueraded source no longer matches the IPsec policy.
+    exempt = ["POSTROUTING", "-s", LAN_INNER, "-d", INNER, "-p", "icmp", "-j", "ACCEPT"]
+    await command(r.target, r.session, "iptables", "-t", "nat", "-I", *exempt)
+    capture = Wire(r, "ipsec-shared-sequence")
+    capture.snaplen = 64
+    try:
+        script = base64.b64encode(blast_script(SEQUENCE_SECONDS).encode()).decode()
+        await asyncio.to_thread(r.lan.run, f"echo {script} | base64 -d > {BLASTER}", timeout=15)
+        # A first burst gets the flow admitted, so the measured one runs in
+        # hardware from its first frame.
+        await asyncio.to_thread(r.lan.run, f"python3 {BLASTER}", timeout=SEQUENCE_SECONDS + 15)
+        admitted = by_key(await r.state())
+        for key in keys([2], flows):
+            assert key in admitted, (key, sorted(admitted))
+            assert admitted[key]["sa" if key[0] == TARGET_LAN_IF else "in_sa"] != "0", admitted[key]
+        drops = replay_drops()
+        cpu = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc")
+        async with capture:
+            await asyncio.to_thread(
+                r.lan.run, f"timeout {SEQUENCE_SECONDS} ping -q -f -l 64 -s 64 -I {LAN_INNER} {INNER} "
+                f">/dev/null 2>&1 & python3 {BLASTER}", timeout=SEQUENCE_SECONDS + 15)
+        cpu = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc") - cpu
+        esp, reused = reused_sequences(capture.path)
+        drops = replay_drops() - drops
+        r.record("ipsec-shared-sequence", {"esp": esp, "cpu_fed": cpu, "reused": reused,
+                                           "replay_drops": drops})
+        # Without both feeders busy at once the check below proves nothing.
+        # Unfixed, nearly every CPU-fed frame collides (219 of 238 measured).
+        assert cpu >= 100 and esp - cpu >= 100_000, (cpu, esp)
+        assert (reused, drops) == (0, 0), {"reused": reused, "replay_drops": drops, "cpu_fed": cpu, "esp": esp}
+    finally:
+        await command(r.target, r.session, "iptables", "-t", "nat", "-D", *exempt)
+        await asyncio.to_thread(r.lan.run, f"rm -f {BLASTER}", timeout=15)

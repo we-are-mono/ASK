@@ -1,0 +1,243 @@
+From 20ee1484fcda25990274ff345ec2205d83854182 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Wed, 23 Sep 2026 12:56:31 +0200
+Subject: [PATCH] sdk_fman: keep the boot firmware's port ICIDs
+
+U-Boot gives every FMan port and every QMan software portal the same
+ICID (FSL_DPAA1_STREAM_ID_END). FillRestFmInfo() read the ports' values
+back from the big-endian FMBM_PPID table with a native load, so on a
+little-endian core each Rx port got 0x3F000000 truncated to 0, and the
+OH, Tx and HC ports never read theirs at all. After the FMan reset every
+port was programmed with ICID 0 and stamped it into the frame
+descriptors it enqueued, while CPU-enqueued frames still carried 63.
+
+SEC identifies a shared descriptor by its address and the frame's ICID.
+An IPsec SA fed both by the classifier and by the CPU was therefore two
+descriptors to SEC: SERIAL sharing did not order the two feeders' jobs,
+both encrypted from the same stored ESP sequence number, and the peer
+dropped the later copy as a replay (nearly every CPU-fed frame that
+overlapped hardware traffic on the same SA).
+
+Read the PPID and PLR tables big-endian, before the reset as before,
+and carry each port's firmware LIODN offset through its port
+parameters: Rx as before, OH and Tx through a new non-Rx field, and
+the host-command port through the PCD HC parameters.
+
+The storage-profile ioctl takes the offset from the port it names too,
+resolved by port type and bounds-checked: it indexed the 1G Rx table
+with any user-supplied id, 10G and OH ports included.
+---
+ .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  1 +
+ .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  2 +
+ .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  1 +
+ .../sdk_fman/inc/Peripherals/fm_port_ext.h    |  1 +
+ .../sdk_fman/src/wrapper/lnxwrp_fm.c          | 40 +++++++++++++------
+ .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |  2 +
+ .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   | 27 ++++++++++++-
+ 7 files changed, 61 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
+index 7111fb02da8b..4bfc02941228 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
+@@ -325,6 +325,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+     fmPortParam.specificParams.nonRxParams.errFqid      = p_FmHcParams->params.errFqid;
+     fmPortParam.specificParams.nonRxParams.dfltFqid     = p_FmHcParams->params.confFqid;
+     fmPortParam.specificParams.nonRxParams.qmChannel    = p_FmHcParams->params.qmChannel;
++    fmPortParam.specificParams.nonRxParams.liodnOffset  = p_FmHcParams->params.liodnOffset;
+ 
+     p_FmHc->h_HcPortDev = FM_PORT_Config(&fmPortParam);
+     if (!p_FmHc->h_HcPortDev)
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
+index 145b7b818d47..ecf72c274c03 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
+@@ -2609,6 +2609,8 @@ t_Handle FM_PORT_Config(t_FmPortParams *p_FmPortParams)
+                                 & QMI_DEQ_CFG_SUBPORTAL_MASK);
+                 p_FmPort->p_FmPortDriverParam->dfltFqid =
+                         p_FmPortParams->specificParams.nonRxParams.dfltFqid;
++                p_FmPort->p_FmPortDriverParam->liodnOffset =
++                        p_FmPortParams->specificParams.nonRxParams.liodnOffset;
+                 break;
+             default:
+                 XX_Free(p_FmPort->p_FmPortDriverParam);
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
+index d271ec2374d1..8f4da3c7f85b 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
+@@ -216,6 +216,7 @@ typedef struct t_FmPcdHcParams {
+                                                          portId=0 MUST be used. */
+     uint16_t                    liodnBase;          /**< LIODN base for this port, to be used together with LIODN offset
+                                                          (irrelevant for P4080 revision 1.0) */
++    uint16_t                    liodnOffset;        /**< LIODN offset for this port. */
+     uint32_t                    errFqid;            /**< Host-Command Port error queue Id. */
+     uint32_t                    confFqid;           /**< Host-Command Port confirmation queue Id. */
+     uint32_t                    qmChannel;          /**< QM channel dedicated to this Host-Command port;
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
+index 7ec1daba439d..ebf58958d638 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
+@@ -234,6 +234,7 @@ typedef struct t_FmPortNonRxParams {
+                                                      frames. For OP port - default Rx queue. */
+     uint32_t                qmChannel;          /**< QM-channel dedicated to this port; will be used
+                                                      by the FM for dequeue. */
++    uint16_t                liodnOffset;        /**< Port's LIODN offset. */
+ } t_FmPortNonRxParams;
+ 
+ /**************************************************************************//**
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
+index 707f11fcd62a..786f0eff6531 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
+@@ -364,16 +364,29 @@ typedef _Packed struct {
+     static const uint8_t     phys10GTxPortId[] = {0x30,0x31};
+ 
+     p_Plr = (t_Plr *)UINT_TO_PTR(p_LnxWrpFmDev->fmBaseAddr+FM_DMA_PLR_OFFSET);
++    p_Ppids = (t_Ppids *)UINT_TO_PTR(p_LnxWrpFmDev->fmBaseAddr+FM_BMI_PPIDS_OFFSET);
+ #ifdef MODULE
+     for (i=0;i<FM_MAX_NUM_OF_PARTITIONS/2;i++)
+         p_Plr->plr[i] = 0;
+ #endif /* MODULE */
+ 
++    /* Both tables are big-endian FMan registers, read here before FM_Init()
++     * resets the FMan; the port drivers program the values back. FMBM_PPID
++     * holds the ICID the boot firmware assigned each port, which the port
++     * stamps into every frame descriptor it enqueues. Firmware gives the
++     * FMan ports and the QMan software portals the same ICID, and SEC relies
++     * on that: it shares a descriptor, and the ESP sequence number stored in
++     * it, only between jobs whose frames carry the same ICID. A native load
++     * on a little-endian core lost the value, left every port at ICID 0, and
++     * let CPU- and FMan-fed jobs of one IPsec SA reuse sequence numbers. */
+     for (i=0; i<FM_MAX_NUM_OF_PARTITIONS; i++)
+     {
++        uint32_t plr = GET_UINT32(p_Plr->plr[i/2]);
+         uint16_t liodnBase = (uint16_t)((i%2) ?
+-                       (p_Plr->plr[i/2] & DMA_LOW_LIODN_MASK) :
+-                       ((p_Plr->plr[i/2] & DMA_HIGH_LIODN_MASK) >> DMA_LIODN_SHIFT));
++                       (plr & DMA_LOW_LIODN_MASK) :
++                       ((plr & DMA_HIGH_LIODN_MASK) >> DMA_LIODN_SHIFT));
++        uint16_t liodnOffset = i ?
++                       (uint16_t)(GET_UINT32(p_Ppids->fmbm_ppid[i-1]) & FM_LIODN_OFFSET_MASK) : 0;
+ #ifdef FM_PARTITION_ARRAY
+         /* TODO: this was .liodnPerPartition[i] = liodnBase; is the index meaning the same? */
+         p_LnxWrpFmDev->fmDevSettings.param.liodnBasePerPort[i] = liodnBase;
+@@ -387,6 +400,7 @@ typedef _Packed struct {
+                     break;
+             ASSERT_COND(j<ARRAY_SIZE(phys1GRxPortId));
+             p_LnxWrpFmDev->rxPorts[j].settings.param.liodnBase = liodnBase;
++            p_LnxWrpFmDev->rxPorts[j].settings.param.specificParams.rxParams.liodnOffset = liodnOffset;
+         }
+         else if (FM_MAX_NUM_OF_10G_RX_PORTS &&
+                  (i >= phys10GRxPortId[0]) &&
+@@ -397,6 +411,8 @@ typedef _Packed struct {
+                     break;
+             ASSERT_COND(j<ARRAY_SIZE(phys10GRxPortId));
+             p_LnxWrpFmDev->rxPorts[FM_MAX_NUM_OF_1G_RX_PORTS+j].settings.param.liodnBase = liodnBase;
++            p_LnxWrpFmDev->rxPorts[FM_MAX_NUM_OF_1G_RX_PORTS+j].settings.param.specificParams.rxParams.liodnOffset =
++                    liodnOffset;
+         }
+         else if ((i >= physOhPortId[0]) &&
+                  (i <= physOhPortId[FM_MAX_NUM_OF_OH_PORTS-1]))
+@@ -406,9 +422,16 @@ typedef _Packed struct {
+                     break;
+             ASSERT_COND(j<ARRAY_SIZE(physOhPortId));
+             if (j == 0)
++            {
+                 p_LnxWrpFmDev->hcPort.settings.param.liodnBase = liodnBase;
++                p_LnxWrpFmDev->hcPort.settings.param.specificParams.nonRxParams.liodnOffset = liodnOffset;
++            }
+             else
++            {
+                 p_LnxWrpFmDev->opPorts[j - 1].settings.param.liodnBase = liodnBase;
++                p_LnxWrpFmDev->opPorts[j - 1].settings.param.specificParams.nonRxParams.liodnOffset =
++                        liodnOffset;
++            }
+         }
+         else if ((i >= phys1GTxPortId[0]) &&
+                   (i <= phys1GTxPortId[FM_MAX_NUM_OF_1G_TX_PORTS-1]))
+@@ -418,6 +441,7 @@ typedef _Packed struct {
+                     break;
+             ASSERT_COND(j<ARRAY_SIZE(phys1GTxPortId));
+             p_LnxWrpFmDev->txPorts[j].settings.param.liodnBase = liodnBase;
++            p_LnxWrpFmDev->txPorts[j].settings.param.specificParams.nonRxParams.liodnOffset = liodnOffset;
+         }
+         else if (FM_MAX_NUM_OF_10G_TX_PORTS &&
+                  (i >= phys10GTxPortId[0]) &&
+@@ -428,19 +452,11 @@ typedef _Packed struct {
+                     break;
+             ASSERT_COND(j<ARRAY_SIZE(phys10GTxPortId));
+             p_LnxWrpFmDev->txPorts[FM_MAX_NUM_OF_1G_TX_PORTS+j].settings.param.liodnBase = liodnBase;
++            p_LnxWrpFmDev->txPorts[FM_MAX_NUM_OF_1G_TX_PORTS+j].settings.param.specificParams.nonRxParams.liodnOffset =
++                    liodnOffset;
+         }
+     }
+ 
+-    p_Ppids = (t_Ppids *)UINT_TO_PTR(p_LnxWrpFmDev->fmBaseAddr+FM_BMI_PPIDS_OFFSET);
+-
+-    for (i=0; i<FM_MAX_NUM_OF_1G_RX_PORTS; i++)
+-        p_LnxWrpFmDev->rxPorts[i].settings.param.specificParams.rxParams.liodnOffset =
+-                p_Ppids->fmbm_ppid[phys1GRxPortId[i]-1];
+-
+-    for (i=0; i<FM_MAX_NUM_OF_10G_RX_PORTS; i++)
+-            p_LnxWrpFmDev->rxPorts[FM_MAX_NUM_OF_1G_RX_PORTS+i].settings.param.specificParams.rxParams.liodnOffset =
+-                p_Ppids->fmbm_ppid[phys10GRxPortId[i]-1];
+-
+     return E_OK;
+ }
+ 
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
+index eac7c22f0a17..535c3de9f387 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
+@@ -1029,6 +1029,8 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+ 			p_LnxWrpFmPortDev->settings.param.portId;
+ 		fmPcdParams.hc.liodnBase =
+ 			p_LnxWrpFmPortDev->settings.param.liodnBase;
++		fmPcdParams.hc.liodnOffset = p_LnxWrpFmPortDev->settings.
++			param.specificParams.nonRxParams.liodnOffset;
+ 		fmPcdParams.hc.errFqid =
+ 			qman_fq_fqid(p_LnxWrpFmDev->hc_tx_err_fq);
+ 		fmPcdParams.hc.confFqid =
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
+index c4fb490a2bd4..4fb1e67245fe 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
+@@ -2972,9 +2972,34 @@ Status: not exported
+             if (copy_from_user(&param, (void *)arg, sizeof(param)))
+                 RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
+         {
++            /* The profile stamps its port's firmware LIODN offset (ICID)
++               into the frames it stores. port_id is relative to its type. */
+             uint8_t portId = param.port_params.port_id;
++            t_LnxWrpFmPortDev *p_Port = NULL;
++
++            switch (param.port_params.port_type)
++            {
++                case (e_IOC_FM_PORT_TYPE_RX):
++                    if (portId < FM_MAX_NUM_OF_1G_RX_PORTS)
++                        p_Port = &p_LnxWrpFmDev->rxPorts[portId];
++                    break;
++                case (e_IOC_FM_PORT_TYPE_RX_10G):
++                    if (portId < FM_MAX_NUM_OF_10G_RX_PORTS)
++                        p_Port = &p_LnxWrpFmDev->rxPorts[portId + FM_MAX_NUM_OF_1G_RX_PORTS];
++                    break;
++                case (e_IOC_FM_PORT_TYPE_OH_OFFLINE_PARSING):
++                    if (portId && portId < FM_MAX_NUM_OF_OH_PORTS)
++                        p_Port = &p_LnxWrpFmDev->opPorts[portId - 1];
++                    break;
++                default:
++                    break;
++            }
++            if (!p_Port)
++                RETURN_ERROR(MINOR, E_INVALID_SELECTION, ("VSP port"));
+             param.liodn_offset =
+-                p_LnxWrpFmDev->rxPorts[portId].settings.param.specificParams.rxParams.liodnOffset;
++                (param.port_params.port_type == e_IOC_FM_PORT_TYPE_OH_OFFLINE_PARSING) ?
++                p_Port->settings.param.specificParams.nonRxParams.liodnOffset :
++                p_Port->settings.param.specificParams.rxParams.liodnOffset;
+         }
+         param.p_fm = p_LnxWrpFmDev->h_Dev;
+         param.id = FM_VSP_Config((t_FmVspParams *)&param);
+-- 
+2.47.3
+

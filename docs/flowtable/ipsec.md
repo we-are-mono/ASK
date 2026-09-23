@@ -1041,6 +1041,58 @@ that turns out to have changed nothing, a rebuild the hardware refuses, and
 the delete-versus-resolve ordering, proved by draining the retirement queue
 between the two and watching the work decline to touch the freed SA.
 
+### 9. Two feeders, one sequence counter
+
+Every outbound SA has two feeders into its SEC queue. The classifier enqueues
+the frames of offloaded flows. The CPU enqueues everything else the policy
+covers: a flow's frames before admission, ICMP, and anything the flowtable
+never takes. Both land on the same queue, whose context names one shared
+descriptor, and that descriptor's PDB holds the ESP sequence number. SERIAL
+sharing and the per-job PDB store (see `cdx_ipsec_sh_desc_hdr_flags()`) order
+the jobs of one descriptor so that no number is handed out twice.
+
+SEC decides which jobs share a descriptor by its address **and the ICID** of
+the frame (SEC RM §7.3.2). The ICID travels in each frame descriptor. QMan
+stamps CPU-enqueued frames with the software portal's ICID, and an FMan port
+stamps its own. The boot firmware gives both the same value, 63
+(`FSL_DPAA1_STREAM_ID_END`). The SDK FMan driver then read the ports' values
+back from the big-endian `FMBM_PPID` table with a native load, got 0, and
+programmed 0 into every port after the FMan reset. To SEC the SA was two
+descriptors. Classifier-fed and CPU-fed jobs ran side by side in separate
+DECOs from the same stored number, and the peer dropped the later copy as a
+replay. Each duplicate pair also shared its outer IPv4 ID, which comes from the
+same PDB.
+
+TCP absorbs this as a retransmit, which is why it went unnoticed.
+The ~0.45 % replay-window rejections recorded in that function's comment
+during the GCM work were this bug.
+A UDP flow loses the datagram. The suite saw it as one protected datagram
+missing right after a flow was admitted: its last CPU-path frames overlapped
+hardware traffic on the same SA.
+
+Patch 106 keeps the firmware's port ICIDs for every port type (Rx, OH, Tx and
+the host-command port). Storage profiles take their port's value too: the VSP
+ioctl, and `cdx/vsp_cfg.c` for the Wi-Fi profile. The fix trusts the boot
+firmware, as mainline's FMan driver does. A bootloader that gives FMan ports
+and QMan portals different ICIDs brings the reuse back.
+
+#### Proved on hardware, 2026-09-23
+
+`test_flowtable_service_ipsec_shared_sequence`: an offloaded UDP blast and a
+CPU-path ICMP flood on one SA for 4 s, ESP captured at the peer. The DECO ICID
+row samples SEC's per-DECO debug register while only hardware traffic runs.
+
+```
+                              before patch 106    after
+CPU-fed frames                292                 1,965
+(SPI, seq) pairs sent twice   272                 0
+peer replay drops             274                 0
+DECO ICID, classifier-fed     0                   63 (0x3F)
+```
+
+A pure CPU flood reused nothing even before the fix, because all its frames
+carry one ICID.
+
 ## Tests
 
 IPsec is described elsewhere as the most covered subsystem left on the board.

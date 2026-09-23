@@ -254,6 +254,10 @@ class Capture:
     while a burst runs. The orchestrator is this machine, so tcpdump is a
     plain subprocess."""
 
+    # Bytes kept per frame; 0 keeps whole frames. Headers-only checks set it
+    # so a line-rate burst does not fill /tmp.
+    snaplen = 0
+
     def __init__(self, r, name):
         self.path = ARTIFACTS / f"tunnel-{name}.pcap"
         self.filter = r.shape.capture_filter()
@@ -266,8 +270,8 @@ class Capture:
         # -Z root: tcpdump otherwise drops to its own user before opening the
         # savefile, and the artifact directory is root's.
         self.proc = subprocess.Popen(
-            ["tcpdump", "-i", self.interface, "-U", "-Z", "root", "-w", str(self.path), "-n",
-             self.filter],
+            ["tcpdump", "-i", self.interface, "-U", "-Z", "root", "-s", str(self.snaplen),
+             "-w", str(self.path), "-n", self.filter],
             stdout=subprocess.DEVNULL, stderr=self.log)
         # tcpdump takes a moment to attach; a burst that starts first is
         # partly missed, which would read as loss on the wire.

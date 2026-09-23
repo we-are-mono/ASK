@@ -385,13 +385,15 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
  * ICV failures per 12 s at blast load; SERIAL without SAVECTX plus
  * the PDB store produces zero ICV failures and 2.55 Gbit/s TCP with
  * 20 retransmits — ahead of the CBC+HMAC production path on the same
- * boot (2.37 Gbit/s, 842 retransmits). The residual ESP-level
- * replay-window rejections (~0.45 % at full TCP rate) do not surface
- * as TCP loss (9805 rejections vs 20 retransmits in the same run):
- * the rejected frames are redundant wire duplicates the peer's
- * anti-replay window discards by design, a platform-wide DPAA/SEC
- * trait the CBC path shares (0.154 % at blast scale). NEVER sharing
- * is documented by the RM itself to duplicate sequence numbers.
+ * boot (2.37 Gbit/s, 842 retransmits). The ESP-level replay-window
+ * rejections still measured then (~0.45 % at full TCP rate, 0.154 %
+ * on CBC at blast scale, and the WAIT figure above) were distinct
+ * frames sharing a sequence number, not wire duplicates. SEC orders
+ * an SA's jobs only among frames carrying the same ICID (RM §7.3.2),
+ * and FMan-fed frames carried ICID 0 against the CPU portals' 63
+ * until the SDK FMan driver kept the firmware's port ICIDs (kernel
+ * patch 106). NEVER sharing is documented by the RM itself to
+ * duplicate sequence numbers.
  */
 static uint32_t cdx_ipsec_sh_desc_hdr_flags(PSAEntry sa)
 {

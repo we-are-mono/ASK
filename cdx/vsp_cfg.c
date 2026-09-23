@@ -55,6 +55,10 @@ int dpa_add_virt_storage_profile(struct net_device *net_dev,
 	params.portParams.portType = port->settings.param.portType;
 	params.portParams.portId = port->settings.param.portId;
 	params.relativeProfileId = 1;
+	/* Frames this profile stores carry its LIODN offset as their ICID.
+	 * Keep the port's firmware value, which every other DPAA producer
+	 * shares; SEC orders an SA's jobs only among frames with one ICID. */
+	params.liodnOffset = port->settings.param.specificParams.rxParams.liodnOffset;
 	params.extBufPools.numOfPoolsUsed = 1;
 	params.extBufPools.extBufPool[0].id = bp->bpid;
 	params.extBufPools.extBufPool[0].size = bp->size;
