@@ -7449,14 +7449,15 @@ static const char *ft_dev_stats_name(const struct cdx_ft_dev_stats *record, char
 /* One row per device with a record of the given kind, whether or not the pool
  * had a slot for it: a device without one is the visible face of an exhausted
  * pool -- the flows forward either way, and this is what says which of them
- * are being counted. The counts are the firmware's own totals, whole frames;
- * the device's `ip -s link` shows the same records restated in its units, so
- * the two differ by exactly the framing and nothing else. A ppp device's row
- * also carries the session its last admitted direction named, in the form the
- * flow rows use in in_ppp=/out_ppp=, so the two can be joined. The rows sit
- * with the header rather than in the paged flow iteration because there is
- * one per device, which is the number of uplinks and VLANs rather than the
- * number of connections. */
+ * are being counted. The counts are the firmware's own totals, whole frames,
+ * with packets carried past the 32 bits the firmware keeps exactly as the fold
+ * carries them; the device's `ip -s link` shows the same records restated in
+ * its units, so the two differ by exactly the framing and nothing else. A ppp
+ * device's row also carries the session its last admitted direction named, in
+ * the form the flow rows use in in_ppp=/out_ppp=, so the two can be joined.
+ * The rows sit with the header rather than in the paged flow iteration because
+ * there is one per device, which is the number of uplinks and VLANs rather
+ * than the number of connections. */
 static void ft_tunnel_text(const struct cdx_ft_tunnel *tunnel, char *text, size_t size);
 
 static void ft_dev_rows(struct seq_file *seq, enum cdx_ft_stats_kind kind, bool tunnel)

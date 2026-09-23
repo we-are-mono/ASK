@@ -293,7 +293,8 @@ struct cdx_ft_counters {
 };
 
 /* One direction of an interface-level counter pair, as the firmware keeps it.
- * Packets are 32 bits in the firmware record and are widened here. */
+ * Packets are 32 bits in the firmware record and wrap; the count here is the
+ * total they have advanced by since the record was handed out, which does not. */
 struct cdx_ft_stats {
 	u64 bytes;
 	u64 packets;

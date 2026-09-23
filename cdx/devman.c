@@ -105,7 +105,9 @@
  *   dpa_devlist_lock in their stats helpers; that's the only lock
  *   held across that call. No ordering constraints vs. the
  *   per-file query mutexes elsewhere because dpa_devlist_lock is
- *   always the innermost lock taken.
+ *   the innermost lock they take. The one lock taken inside it is
+ *   cdx_ifstats.c's dpa_statslist_lock, by virt_iface_stats_callback
+ *   reading a record; nothing holding that lock takes this one.
  *
  * Contexts:
  *   dpa_add_*, dpa_remove_*    - process, ioctl configuration.
@@ -3039,6 +3041,7 @@ struct dpa_priv_s *dpa_first_eth_priv(void)
 static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_stats64 *storage)
 {
 	struct dpa_iface_info *iface_info;
+	struct cdx_ft_stats rx, tx;
 
 	spin_lock(&dpa_devlist_lock);
 	iface_info = dpa_interface_info;
@@ -3057,40 +3060,32 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 		//if stats is disabled on the iface do nothing
 		if (!(iface_info->if_flags & IF_STATS_ENABLED))
 			break;
+		/* Every arm reads its record through cdx_ifstats_read(), which
+		 * carries the firmware's 32-bit packet count past its wrap; the
+		 * raw count would step the device's packets back by 2^32 there.
+		 * That nests dpa_statslist_lock inside this lock. */
 		if(iface_info->if_flags & IF_TYPE_PPPOE) {
-			struct en_ehash_ifstats_with_ts *stats;
-			//printk("%s::returning pppoe iface stats\n", __func__);
-			stats = (struct en_ehash_ifstats_with_ts *)iface_info->stats;
-			storage->rx_packets += cpu_to_be32(stats->rxstats.pkts);
-			storage->rx_bytes += cpu_to_be64(stats->rxstats.bytes);
-			storage->tx_packets += cpu_to_be32(stats->txstats.pkts);
-			storage->tx_bytes += cpu_to_be64(stats->txstats.bytes);
+			cdx_ifstats_read(iface_info->stats, &rx, &tx);
+			cdx_ifstats_fold(storage, rx.bytes, rx.packets,
+					 tx.bytes, tx.packets, 0, 0);
 			break;
-		} 
+		}
 		if (iface_info->if_flags & IF_TYPE_ETHERNET) {
-			struct en_ehash_ifstats *stats = iface_info->stats;
-
 			/* The port's record: what UPDATE_ETH_RX_STATS counted on
 			 * ingress and the enqueue counted on egress, both as
 			 * whole frames. The driver's own rx_bytes excludes the
 			 * Ethernet header, so the record is restated to match
 			 * before the two are added; transmit already agrees. */
-			cdx_ifstats_fold(storage,
-					 be64_to_cpu(stats->rxstats.bytes),
-					 be32_to_cpu(stats->rxstats.pkts),
-					 be64_to_cpu(stats->txstats.bytes),
-					 be32_to_cpu(stats->txstats.pkts),
+			cdx_ifstats_read(iface_info->stats, &rx, &tx);
+			cdx_ifstats_fold(storage, rx.bytes, rx.packets,
+					 tx.bytes, tx.packets,
 					 CDX_IFSTATS_PORT_RX_OVERHEAD, 0);
 			break;
 		}
 		if(iface_info->if_flags & (IF_TYPE_TUNNEL | IF_TYPE_VLAN)) {
-			struct en_ehash_ifstats *stats;
-			//printk("%s::returning other iface stats\n", __func__);
-			stats = (struct en_ehash_ifstats *)iface_info->stats;
-			storage->rx_packets += cpu_to_be32(stats->rxstats.pkts);
-			storage->rx_bytes += cpu_to_be64(stats->rxstats.bytes);
-			storage->tx_packets += cpu_to_be32(stats->txstats.pkts);
-			storage->tx_bytes += cpu_to_be64(stats->txstats.bytes);
+			cdx_ifstats_read(iface_info->stats, &rx, &tx);
+			cdx_ifstats_fold(storage, rx.bytes, rx.packets,
+					 tx.bytes, tx.packets, 0, 0);
 			break;
 		}
 		printk("%s::unknown iface type,no stats available\n",
@@ -3108,12 +3103,17 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 static void devman_deinit_linux_stats(void)
 {
 	dev_fp_stats_get_deregister();
+	cdx_ifstats_stop();
 	return;
 }
 
 int devman_init_linux_stats(void)
 {
 	dev_fp_stats_get_register(virt_iface_stats_callback);
+	/* The records the hook folds count packets in 32 bits, which wrap in
+	 * minutes at line rate; the sampler reads them often enough that no
+	 * wrap goes unseen, for as long as the hook can be called. */
+	cdx_ifstats_start();
 	register_cdx_deinit_func(devman_deinit_linux_stats);
 	/* init number active connecions counter */
 	atomic_set(&num_active_connections, 0);

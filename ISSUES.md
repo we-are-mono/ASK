@@ -307,6 +307,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A207.** Interface packet counts stepped back by 2^32 at the firmware's 32-bit packet wrap —
+  fixed (_:/^cdx: carry interface packet counts past the firmware's 32 bits_).
+
 - [x] **A200.** Consumers did not advertise a smaller upstream's IPv6 MTU, so LAN-to-WAN IPv6 behind PPPoE or 6in4 stayed in software —
   documented as the integrating distribution's contract (_:/^docs: state what an integration owes an IPv6 LAN behind a narrower uplink_).
 

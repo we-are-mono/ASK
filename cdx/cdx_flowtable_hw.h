@@ -50,6 +50,12 @@ void cdx_ft_ifstats_fold(const struct net_device *dev, struct rtnl_link_stats64 
 void cdx_ifstats_fold(struct rtnl_link_stats64 *storage,
 		      u64 rx_bytes, u64 rx_packets, u64 tx_bytes, u64 tx_packets,
 		      unsigned int rx_overhead, unsigned int tx_overhead);
+/* A registered interface's record, read the way a slot's is: bytes as the
+ * firmware keeps them and packets carried past its 32 bits, so the fold adds a
+ * total that never steps back. Zeroes for NULL, and for any record once the
+ * carve is gone. */
+void cdx_ifstats_read(const void *record, struct cdx_ft_stats *rx,
+		      struct cdx_ft_stats *tx);
 /* What a physical port's own receive counter leaves out and the firmware's
  * record includes: the Ethernet header, which the driver's rx_bytes counts
  * skb->len after eth_type_trans() has pulled. Transmit needs no correction --

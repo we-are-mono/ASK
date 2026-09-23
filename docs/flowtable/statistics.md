@@ -75,6 +75,19 @@ lock and a process-context discipline, and `dev_get_stats()` is process context
 under RCU or RTNL. Freeing a slot withdraws it under that lock, so a reader
 finds a slot published with a live record or finds nothing.
 
+### Packet counts past 32 bits
+
+A record keeps 64 bits of bytes but only 32 of packets, and the word after the
+packet count is reserved (plain) or padding (timestamped), so nothing carries
+out of it: the count comes round after 2^32 frames, 289 s of minimum-size
+frames at 10G. `cdx/cdx_ifstats.c` therefore keeps, per record and direction,
+the raw count last read and a 64-bit total advanced by the difference modulo
+2^32 on every read, and every reader — both folds and the `/proc` rows — reports
+that total and restates bytes from it. A delayed work item reads every record
+handed out every 30 s, so a count cannot come round twice between two reads
+even if nothing asks; it lives as long as the `dev_get_stats()` hook and is
+cancelled synchronously with it. Handing a record out resets its total.
+
 ### Lifetime
 
 A device's record lives as long as the device, not as long as its flows. A slot
@@ -225,7 +238,8 @@ frames each way per case:
 
 Host tests carry what the bench cannot show cheaply: `test_ifstats.py` the
 publication, fold, restatement and withdrawal against the real allocator on a
-simulated MURAM; `test_vlan_hm.py` the two opcodes' record lists, their order
+simulated MURAM, and the packet count carried across a wrap by reads and the
+sampler in either order; `test_vlan_hm.py` the two opcodes' record lists, their order
 and the all-or-nothing rule against the shipped SDK header; `test_flowtable.py`
 the record's lifetime across flows, unregistration and reuse of an index.
 
@@ -238,9 +252,9 @@ session dev=ppp0 ifindex=18 pppoe=1@00:11:22:33:44:55 lower=7 refs=2 slot=yes rx
 vlan dev=eth3.271 ifindex=16 refs=2 slot=yes rx_packets=64 rx_bytes=19072 tx_packets=64 tx_bytes=19328
 ```
 
-The numbers there are the firmware's own, whole frames; the device's `ip -s
-link` shows the same records restated, so the two differ by the framing and
-nothing else. `slot=none` is a device the pool had nothing for; `dev=-` is a
+The numbers there are the firmware's own, whole frames, with packets carried
+past 32 bits as above; the device's `ip -s link` shows the same records
+restated, so the two differ by the framing and nothing else. `slot=none` is a device the pool had nothing for; `dev=-` is a
 device that has unregistered while a direction still names its record. A
 session row's `pppoe=` is the session the last admitted direction named, in the
 form the flow rows use.

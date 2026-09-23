@@ -13,10 +13,16 @@
  * from the same base. That is the whole hazard, and it is why the pools are
  * checked for overlap in the units the firmware indexes with rather than in
  * pointers.
+ *
+ * The firmware keeps 32 bits of packets per record half, so the other thing
+ * pinned here is the software count carried past them: exact across a wrap,
+ * whichever of a read and the periodic sampler sees the record first, and
+ * starting over whenever a record is handed out again.
  */
 #include <assert.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,8 +41,11 @@
 #define IF_TYPE_PPPOE    (1 << 2)
 
 typedef uint8_t u8;
+typedef uint32_t u32;
 typedef uint64_t u64;
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 
 /* Enough of the kernel's list to hold the published slots, and enough of a net
  * device and its counters for dev_get_stats()'s fold: the index the fold keys
@@ -88,6 +97,37 @@ static void spin_unlock(spinlock_t *lock)
 {
     assert(lock->held && locked);
     lock->held = locked = 0;
+}
+
+/* One delayed work item as the system workqueue holds it: queued or not, and
+ * for how long. Running it is the test's call, which is what lets the order of
+ * a sample against a read be chosen. A synchronous cancel waits for a running
+ * item and so may sleep, which makes it wrong under the statistics lock. */
+#define HZ 250
+struct work_struct { int unused; };
+struct delayed_work {
+    struct work_struct work;
+    void (*func)(struct work_struct *work);
+    int queued;
+    unsigned long delay;
+};
+#define DECLARE_DELAYED_WORK(n, f) struct delayed_work n = { .func = (f) }
+#define to_delayed_work(w) container_of(w, struct delayed_work, work)
+static int schedule_delayed_work(struct delayed_work *dwork, unsigned long delay)
+{
+    if (dwork->queued)
+        return 0;
+    dwork->queued = 1;
+    dwork->delay = delay;
+    return 1;
+}
+static int cancel_delayed_work_sync(struct delayed_work *dwork)
+{
+    int queued = dwork->queued;
+
+    assert(!locked);
+    dwork->queued = 0;
+    return queued;
 }
 
 static unsigned kzalloc_fail;
@@ -279,6 +319,43 @@ static void claim(const struct cdx_ft_stats_slot *slot, const char *pool)
 
 static void reset_claims(void) { claim_count = 0; }
 
+/* What the firmware leaves in one record half after `frames` frames of `size`
+ * bytes each: a byte count wide enough never to wrap, and a packet count that
+ * is the low 32 bits of the frames and nothing more. Either record shape. */
+#define FIRMWARE_COUNTED(half, frames, size)                          \
+    ((half).bytes = cpu_to_be64((u64)(frames) * (size)),              \
+     (half).pkts = cpu_to_be32((uint32_t)(frames)))
+
+/* The workqueue's turn. The sampler runs because it was queued and for no
+ * other reason, and it queues itself again for the same period. */
+static void sampler_period(void)
+{
+    assert(ifstats_sampler.queued);
+    ifstats_sampler.queued = 0;
+    ifstats_sampler.func(&ifstats_sampler.work);
+    assert(!locked);
+    assert(ifstats_sampler.queued && ifstats_sampler.delay == IFSTATS_SAMPLE_PERIOD);
+}
+
+/* How many records the sampler would read: one per record handed out, by
+ * either owner, and none once it is returned. */
+static unsigned live_records(void)
+{
+    unsigned n = 0;
+
+    for (unsigned i = 0; i < MAX_LOGICAL_INTERFACES; i++)
+        n += ifstats_wide[i].live;
+    return n;
+}
+
+static const struct ifstats_wide *wide_of(const void *record)
+{
+    unsigned index = ifstats_record_index(record);
+
+    assert(index < MAX_LOGICAL_INTERFACES);
+    return &ifstats_wide[index];
+}
+
 /* One slot, taken and immediately checked for the properties every slot has:
  * a cleared record, an index that names it, and a range no other record's
  * index names. */
@@ -290,6 +367,11 @@ static struct cdx_ft_stats_slot *take(enum cdx_ft_stats_kind kind, const char *p
     assert(slot && slot->kind == kind);
     assert(all_zero(slot->record,
                     kind == CDX_FT_STATS_TIMESTAMPED ? TS_SIZE : PLAIN_SIZE));
+    /* And its widened counts start from the zero the record was cleared to,
+     * whatever an earlier holder of the record left in them. */
+    assert(wide_of(slot->record)->live);
+    assert(all_zero(&wide_of(slot->record)->rx, sizeof(struct ifstats_wide_half)));
+    assert(all_zero(&wide_of(slot->record)->tx, sizeof(struct ifstats_wide_half)));
     claim(slot, pool);
     return slot;
 }
@@ -327,12 +409,29 @@ int main(void)
     assert(TS_SIZE == 2 * TS_STRIDE && PLAIN_SIZE == 2 * PLAIN_STRIDE);
     assert(TS_RECORDS == 4 && PLAIN_RECORDS == 124);
     assert(STATS_WITH_TS == 0x80);
+    /* One widening entry per record the carve holds, both pools. */
+    assert(sizeof(ifstats_wide) / sizeof(ifstats_wide[0]) == TS_RECORDS + PLAIN_RECORDS);
+
+    /* The sampler starts with the module, before any carve exists, and its
+     * period is well inside the fastest wrap: 2^32 minimum-size frames take
+     * 289 s at 10G (14,880,952 frames a second), and the period leaves room for
+     * a record counting nine times that fast. */
+    assert(!ifstats_sampler.queued);
+    cdx_ifstats_start();
+    assert(ifstats_sampler.queued && ifstats_sampler.delay == IFSTATS_SAMPLE_PERIOD);
+    assert(IFSTATS_SAMPLE_PERIOD <= 60 * HZ);
+    assert(9ULL * 14880952 * IFSTATS_SAMPLE_PERIOD / HZ < (1ULL << 32));
+    /* A period with no carve reads nothing and still comes round again: the
+     * carve follows the configuration, the sampler the module. */
+    sampler_period();
+    assert(!live_records());
 
     /* A carve that cannot be made is reported rather than indexed. */
     muram_fail = 1;
     assert(cdxdrv_init_stats(MURAM_HANDLE) != 0);
     assert(!ts_free_count() && !plain_free_count());
     muram_fail = 0;
+    sampler_period();
 
     init_pools();
 
@@ -509,6 +608,7 @@ int main(void)
     for (unsigned j = 0; j < PLAIN_NAMEABLE; j++)
         cdx_ft_ifstats_free(&plain[j]);
     assert(ts_free_count() == TS_RECORDS && plain_free_count() == PLAIN_RECORDS);
+    assert(!live_records());
     /* A fresh carve, so both lists are back in the order the carve lays them
      * down. Returned records go to the head, so after the returns above the
      * head of each list is its last record rather than its first, and the
@@ -626,9 +726,11 @@ int main(void)
         /* Standing in for the caller that does not exist, so the sanitizer
          * does not report as a leak what production cannot reach. */
         kfree(first);
+        ifstats_wide_claim(stranded, false);
         stranded->next = pppoe_ifstats_freelist;
         pppoe_ifstats_freelist = stranded;
         assert(ts_free_count() == TS_RECORDS);
+        assert(!live_records());
     }
 
     /* ---- publication: what dev_get_stats() sees -------------------------
@@ -690,7 +792,12 @@ int main(void)
         /* Saturation. Minimum-size frames carry padding the firmware counts
          * and the overhead cannot know about, so bytes can fall short of
          * packets times overhead; the answer is then zero, not a wrapped
-         * count in the exabytes. */
+         * count in the exabytes. On a record handed out afresh: a firmware
+         * count only ever grows, and this one rewound would read as a
+         * count gone all the way round. */
+        cdx_ft_ifstats_free(&slot);
+        slot = take(CDX_FT_STATS_PLAIN, "plain");
+        record = slot->record;
         record->rxstats.bytes = cpu_to_be64(60 * 3);
         record->rxstats.pkts = cpu_to_be32(3);
         cdx_ft_ifstats_publish(slot, other.ifindex, 100, 0);
@@ -763,6 +870,224 @@ int main(void)
         init_pools();
     }
 
+    /* ---- packet counts past 32 bits -------------------------------------
+     *
+     * The firmware keeps 32 bits of packets and carries nothing out of them,
+     * so its count comes round after 2^32 frames: under five minutes of
+     * minimum-size frames at 10G. A device's counters only ever grow, and the
+     * bytes are restated per packet, so a fold that added the raw count would
+     * step the packets back by 2^32 at the wrap and the bytes forward by 2^32
+     * Ethernet headers. */
+    {
+        struct net_device port = { .ifindex = 9 };
+        struct rtnl_link_stats64 before, after;
+        struct en_ehash_ifstats *record;
+
+        slot = take(CDX_FT_STATS_PLAIN, "plain");
+        record = slot->record;
+        cdx_ft_ifstats_publish(slot, port.ifindex, ETH_HLEN, 0);
+        FIRMWARE_COUNTED(record->rxstats, 0xfffffff0u, 64);
+        FIRMWARE_COUNTED(record->txstats, 0xffffffffu, 64);
+        memset(&before, 0, sizeof(before));
+        cdx_ft_ifstats_fold(&port, &before);
+        assert(before.rx_packets == 0xfffffff0u && before.tx_packets == 0xffffffffu);
+        assert(before.rx_bytes == 0xfffffff0ULL * (64 - ETH_HLEN));
+
+        /* Thirty-two frames later on receive and one on transmit, both
+         * across the wrap: the raw counts now read 0x10 and 0. */
+        FIRMWARE_COUNTED(record->rxstats, 0x100000010ULL, 64);
+        FIRMWARE_COUNTED(record->txstats, 0x100000000ULL, 64);
+        memset(&after, 0, sizeof(after));
+        cdx_ft_ifstats_fold(&port, &after);
+        assert(after.rx_packets >= before.rx_packets && after.tx_packets >= before.tx_packets);
+        assert(after.rx_bytes >= before.rx_bytes && after.tx_bytes >= before.tx_bytes);
+        assert(after.rx_packets - before.rx_packets == 32);
+        assert(after.tx_packets - before.tx_packets == 1);
+        assert(after.rx_bytes - before.rx_bytes == 32 * (64 - ETH_HLEN));
+        assert(after.tx_bytes - before.tx_bytes == 64);
+        assert(after.rx_packets == 0x100000010ULL);
+
+        /* The /proc rows read the same total, not the raw word. */
+        cdx_ft_ifstats_read(slot, &rx, &tx);
+        assert(rx.packets == 0x100000010ULL && tx.packets == 0x100000000ULL);
+        cdx_ft_ifstats_free(&slot);
+        assert(!live_records());
+    }
+
+    /* The sampler and a read advance one total between them, whichever sees
+     * the record first. Read just short of the wrap, sampled just past it,
+     * read again: the sample takes the wrap and the read after it adds only
+     * what came since, so nothing is counted twice or lost. */
+    {
+        struct net_device port = { .ifindex = 9 };
+        struct rtnl_link_stats64 first, second;
+        struct en_ehash_ifstats *record;
+
+        slot = take(CDX_FT_STATS_PLAIN, "plain");
+        record = slot->record;
+        cdx_ft_ifstats_publish(slot, port.ifindex, ETH_HLEN, 0);
+        FIRMWARE_COUNTED(record->rxstats, 0xfffffff0u, 64);
+        memset(&first, 0, sizeof(first));
+        cdx_ft_ifstats_fold(&port, &first);
+        assert(first.rx_packets == 0xfffffff0u);
+
+        FIRMWARE_COUNTED(record->rxstats, 0x100000010ULL, 64);
+        sampler_period();
+        assert(wide_of(record)->rx.packets == 0x100000010ULL);
+        assert(wide_of(record)->rx.raw == 0x10);
+        /* A read straight after the sample adds nothing to it. */
+        cdx_ft_ifstats_read(slot, &rx, &tx);
+        assert(rx.packets == 0x100000010ULL);
+
+        FIRMWARE_COUNTED(record->rxstats, 0x100000020ULL, 64);
+        memset(&second, 0, sizeof(second));
+        cdx_ft_ifstats_fold(&port, &second);
+        assert(second.rx_packets - first.rx_packets == 48);
+        assert(second.rx_bytes - first.rx_bytes == 48 * (64 - ETH_HLEN));
+
+        /* Nothing reads the record while the count comes round four
+         * times, three quarters of 2^32 a period: the sampler alone sees
+         * it move. The raw word at the end is 0x20 + 5, which is all a read
+         * without the sampler would have had to go on. */
+        {
+            u64 frames = 0x100000020ULL;
+
+            for (unsigned i = 0; i < 4; i++) {
+                frames += 0xc0000000ULL;
+                FIRMWARE_COUNTED(record->rxstats, frames, 64);
+                sampler_period();
+            }
+            FIRMWARE_COUNTED(record->rxstats, frames + 5, 64);
+            assert((uint32_t)(frames + 5) == 0x25);
+            cdx_ft_ifstats_read(slot, &rx, &tx);
+            assert(rx.packets == frames + 5 && rx.bytes == (frames + 5) * 64);
+            assert(rx.packets == 0x400000025ULL);
+            /* Transmit counted nothing, and reads so. */
+            assert(!tx.packets && !tx.bytes);
+        }
+
+        /* Handed out again, the record starts over. Its widened count must
+         * not survive the free: the cleared record reads zero, and a raw
+         * word left at 0x25 would make that zero a wrap worth 2^32 - 0x25
+         * frames. */
+        {
+            const void *reused = slot->record;
+
+            cdx_ft_ifstats_free(&slot);
+            assert(!wide_of(reused)->live);
+            /* Returned, it is on a free list whose link overlays the count;
+             * the sampler leaves it alone. */
+            sampler_period();
+            assert(all_zero(&wide_of(reused)->rx, sizeof(struct ifstats_wide_half)));
+            slot = take(CDX_FT_STATS_PLAIN, "plain");
+            assert(slot->record == reused);
+            record = slot->record;
+            cdx_ft_ifstats_read(slot, &rx, &tx);
+            assert(!rx.packets && !rx.bytes && !tx.packets && !tx.bytes);
+            FIRMWARE_COUNTED(record->rxstats, 7, 64);
+            cdx_ft_ifstats_read(slot, &rx, &tx);
+            assert(rx.packets == 7 && rx.bytes == 7 * 64);
+        }
+        cdx_ft_ifstats_free(&slot);
+    }
+
+    /* The timestamped pool wraps the same way, and its timestamp is no part
+     * of the count. */
+    {
+        struct en_ehash_ifstats_with_ts *record;
+
+        slot = take(CDX_FT_STATS_TIMESTAMPED, "timestamped");
+        record = slot->record;
+        FIRMWARE_COUNTED(record->txstats, 0xffffffffu, 90);
+        record->txstats.timestamp = cpu_to_be64(0x0123456789abcdefULL);
+        cdx_ft_ifstats_read(slot, NULL, &tx);
+        assert(tx.packets == 0xffffffffu);
+        FIRMWARE_COUNTED(record->txstats, 0x100000002ULL, 90);
+        sampler_period();
+        FIRMWARE_COUNTED(record->txstats, 0x100000003ULL, 90);
+        cdx_ft_ifstats_read(slot, NULL, &tx);
+        assert(tx.packets == 0x100000003ULL && tx.bytes == 0x100000003ULL * 90);
+        cdx_ft_ifstats_free(&slot);
+    }
+
+    /* The registered-interface owner's records, read through the call its
+     * fold in devman.c makes: sampled like the flowtable's, restated from the
+     * widened count, and started over when the interface's record is handed
+     * out again. */
+    {
+        struct rtnl_link_stats64 storage;
+        struct cdx_iface_ifinfo *record;
+        struct cdx_pppoe_iface_ifinfo *session;
+        struct dpa_iface_info ppp;
+
+        memset(&iface, 0, sizeof(iface));
+        assert(alloc_iface_stats(IF_TYPE_ETHERNET, &iface) == SUCCESS);
+        record = iface.stats;
+        assert(wide_of(record)->live && live_records() == 1);
+        FIRMWARE_COUNTED(record->stats.rxstats, 0xfffffffeu, 1514);
+        FIRMWARE_COUNTED(record->stats.txstats, 0xfffffffeu, 60);
+        cdx_ifstats_read(iface.stats, &rx, &tx);
+        assert(rx.packets == 0xfffffffeu && tx.packets == 0xfffffffeu);
+        FIRMWARE_COUNTED(record->stats.rxstats, 0x100000001ULL, 1514);
+        FIRMWARE_COUNTED(record->stats.txstats, 0x100000001ULL, 60);
+        sampler_period();
+        FIRMWARE_COUNTED(record->stats.rxstats, 0x100000004ULL, 1514);
+        cdx_ifstats_read(iface.stats, &rx, &tx);
+        assert(rx.packets == 0x100000004ULL && tx.packets == 0x100000001ULL);
+        memset(&storage, 0, sizeof(storage));
+        cdx_ifstats_fold(&storage, rx.bytes, rx.packets, tx.bytes, tx.packets, ETH_HLEN, 0);
+        assert(storage.rx_bytes == 0x100000004ULL * (1514 - ETH_HLEN));
+        assert(storage.tx_bytes == 0x100000001ULL * 60);
+
+        /* A PPPoE interface's record is a timestamped one, found by where it
+         * sits in the carve rather than by anything the caller says. */
+        memset(&ppp, 0, sizeof(ppp));
+        assert(alloc_iface_stats(IF_TYPE_PPPOE, &ppp) == SUCCESS);
+        session = ppp.stats;
+        assert((const uint8_t *)session < carve + TS_RECORDS * TS_SIZE);
+        FIRMWARE_COUNTED(session->stats.rxstats, 0x100000000ULL, 100);
+        cdx_ifstats_read(ppp.stats, &rx, &tx);
+        /* First read of a raw zero: nothing is known to have come round,
+         * which is why a record has to be read once per wrap from the
+         * moment it is handed out -- and the sampler does. */
+        assert(rx.packets == 0 && rx.bytes == 0x100000000ULL * 100);
+        FIRMWARE_COUNTED(session->stats.rxstats, 0x1c0000000ULL, 100);
+        sampler_period();
+        FIRMWARE_COUNTED(session->stats.rxstats, 0x200000001ULL, 100);
+        cdx_ifstats_read(ppp.stats, &rx, &tx);
+        assert(rx.packets == 0x100000001ULL);
+        free_iface_stats(IF_TYPE_PPPOE, &ppp);
+
+        free_iface_stats(IF_TYPE_ETHERNET, &iface);
+        assert(!live_records());
+        memset(&iface, 0, sizeof(iface));
+        assert(alloc_iface_stats(IF_TYPE_ETHERNET, &iface) == SUCCESS);
+        assert((void *)iface.stats == (void *)record);
+        cdx_ifstats_read(iface.stats, &rx, &tx);
+        assert(!rx.packets && !rx.bytes && !tx.packets && !tx.bytes);
+        free_iface_stats(IF_TYPE_ETHERNET, &iface);
+
+        /* No record reads as zeroes rather than as a fault. */
+        rx = (struct cdx_ft_stats){ .bytes = 1, .packets = 1 };
+        cdx_ifstats_read(NULL, &rx, &tx);
+        assert(!rx.bytes && !rx.packets && !tx.bytes && !tx.packets);
+    }
+
+    /* The carve going away takes every widened count with it; a record in a
+     * new carve starts from nothing, and a period without one reads nothing. */
+    slot = take(CDX_FT_STATS_PLAIN, "plain");
+    FIRMWARE_COUNTED(((struct en_ehash_ifstats *)slot->record)->rxstats, 42, 64);
+    sampler_period();
+    assert(live_records() == 1);
+    drop_pools();
+    assert(!live_records());
+    sampler_period();
+    cdx_ft_ifstats_read(slot, &rx, &tx);
+    assert(!rx.packets && !rx.bytes);
+    cdx_ft_ifstats_free(&slot);
+    init_pools();
+    assert(!live_records());
+
     /* ---- deinit ---------------------------------------------------------
      *
      * The carve goes back and both lists go with it. Anything asking after
@@ -799,10 +1124,22 @@ int main(void)
     cdx_ft_ifstats_free(&slot);
     drop_pools();
 
+    /* Unloading stops the sampler for good: nothing is left queued to run
+     * after the module's text is gone, and a second stop is harmless. A
+     * module loaded again starts it again. */
+    cdx_ifstats_stop();
+    assert(!ifstats_sampler.queued);
+    cdx_ifstats_stop();
+    assert(!ifstats_sampler.queued);
+    cdx_ifstats_start();
+    assert(ifstats_sampler.queued);
+    cdx_ifstats_stop();
+    assert(!ifstats_sampler.queued);
+
     assert(!locked);
     assert(kzalloc_calls == kfree_calls);
     assert(dpa_errors);
-    printf("ifstats pool geometry, indices, exhaustion, lifetime and publication checks passed"
+    printf("ifstats pool geometry, indices, exhaustion, lifetime, publication and packet-wrap checks passed"
            " (%u records named, %u allocations)\n",
            (unsigned)(TS_RECORDS + PLAIN_NAMEABLE), kzalloc_calls);
     return 0;

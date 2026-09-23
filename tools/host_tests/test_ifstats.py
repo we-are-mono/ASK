@@ -1,5 +1,6 @@
-"""Check the production interface-statistics allocator, and the fold of its
-records into a net device's counters, against a simulated MURAM."""
+"""Check the production interface-statistics allocator, the fold of its
+records into a net device's counters, and the packet counts carried past the
+firmware's 32 bits, against a simulated MURAM and workqueue."""
 
 import os
 from pathlib import Path
@@ -83,6 +84,10 @@ def test_ifstats(tmp_path):
                    source.index("extern void *FmMurambaseAddr;") + 29]
     (tmp_path / "ifstats.inc").write_text(
         state + "\n"
+        + function(source, "ifstats_record_index")
+        + function(source, "ifstats_widen")
+        + function(source, "ifstats_sample")
+        + function(source, "ifstats_wide_claim")
         + function(source, "cdx_deinit_iface_stats")
         + function(source, "cdxdrv_init_stats")
         + function(source, "alloc_iface_stats")
@@ -91,12 +96,17 @@ def test_ifstats(tmp_path):
         + function(source, "ifstats_slot_index")
         + function(source, "cdx_ft_ifstats_alloc")
         + function(source, "cdx_ft_ifstats_free")
+        + function(source, "ifstats_read_locked")
+        + function(source, "cdx_ifstats_read")
         + function(source, "cdx_ft_ifstats_read")
         + function(source, "cdx_ft_ifstats_publish")
         + function(source, "cdx_ft_ifstats_unpublish")
         + function(source, "ifstats_restated")
         + function(source, "cdx_ifstats_fold")
-        + function(source, "cdx_ft_ifstats_fold"))
+        + function(source, "cdx_ft_ifstats_fold")
+        + function(source, "ifstats_sampler_run")
+        + function(source, "cdx_ifstats_start")
+        + function(source, "cdx_ifstats_stop"))
     binary = tmp_path / "ifstats"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
