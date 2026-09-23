@@ -583,7 +583,11 @@ def test_the_learner_lets_go_of_a_device_that_went_away():
         "memberships are let go of only when the device goes"
     assert "ft_mc_drop_port(dev)" in gone, "as a membership's port"
     assert "ft_mc_flow_drop_port(f, dev)" in gone, "as a flow's copy"
-    assert "f->in == dev" in gone and "dev_put(f->in);" in gone, "as an ingress"
+    assert "f->in == dev" in gone and "f->gone = true;" in gone, "as an ingress"
+    # Whose reference outlives the entry naming it: the backend borrows the
+    # ingress and unsubscribes the port's address through it on delete.
+    assert "dev_put(f->in)" not in gone
+    assert "dev_put(f->in);" in function(source, "ft_mc_flow_free")
     assert "f->bridge == dev" in gone, "as the bridge itself"
     # A port that left is answered by the bridge: -EINVAL for an ingress
     # that is no longer its port ends the flow.

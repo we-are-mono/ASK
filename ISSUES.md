@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A269.** On NETDEV_UNREGISTER the multicast learners released a group's ingress before the worker deleted the entry that unsubscribes through it —
+  fixed (_:/^flowtable: hold a multicast entry's ingress until the entry is deleted_).
+
 - [x] **A268.** Patch 161 sent PORT_MROUTER=true on every per-family router transition, leaking a reference per extra true in drivers that count them (mlxsw) —
   fixed (_:/^patches: send PORT_MROUTER only when the bridge's union changes_).
 

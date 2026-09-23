@@ -401,7 +401,7 @@ family over:
 | Its parent or thresholds | `FIB_EVENT_ENTRY_REPLACE` | re-derived; a changed ingress is a delete and an add, because the port is part of the key and `cdx_mc_group_replace()` refuses a changed one |
 | A VIF added or removed | `FIB_EVENT_VIF_*` | every group of that family re-derived: an index only means anything against the table it indexes |
 | A policy rule | `FIB_EVENT_RULE_*` | the family's count moves and every group re-derived |
-| A port down or unregistering | the netdev chain, beside `ft_mc_device_gone()` | references released synchronously — one still held when `netdev_wait_allrefs()` starts spinning is a device that never finishes unregistering — and the group re-derived |
+| A port down or unregistering | the netdev chain, beside `ft_mc_device_gone()` | the group's references released synchronously and the group re-derived; an installed entry keeps its own hold on its ingress until the worker deletes it, because the backend deletes through that device, so unregistration waits only for the worker it scheduled |
 | A port coming back up | the netdev chain | re-derived; nothing else would ever reconsider a refused group, because the MFC entry does not change and no frame re-offers it |
 | A device MTU | `NETDEV_CHANGEMTU` | every group re-derived, installed ones included; a copy narrower than its parent VIF takes the group out as `refused-mtu` |
 | The IPv6 MTU sysctl | nothing reports it | the five-second refresh re-derives every group, which finds it |

@@ -56,7 +56,9 @@ struct cdx_ft_vlan { u16 proto, id; };
 /* The listener and group descriptions are the header's own, extracted into
  * the generated include, so a field added there is one the worker here has. */
 #include "mroute_backend.inc"
-struct cdx_mc_group { bool live; unsigned copies; };
+/* `in` is the ingress the backend borrows and deletes through. */
+struct cdx_mc_group { bool live; unsigned copies; struct net_device *in; };
+#define WARN_ON_ONCE(x) assert(!(x))
 struct cdx_ft_counters { u64 packets, bytes; };
 struct work_struct { bool queued; };
 #include "mroute_types.inc"
@@ -191,6 +193,7 @@ static int cdx_mc_group_add(const struct cdx_mc_group_spec *s, struct cdx_mc_gro
     }
     hardware.live = true;
     hardware.copies = s->listeners;
+    hardware.in = s->in;
     *hw = &hardware;
     return 0;
 }
@@ -205,6 +208,9 @@ static int cdx_mc_group_replace(struct cdx_mc_group *hw, const struct cdx_mc_gro
 static void cdx_mc_group_del(struct cdx_mc_group **hw)
 {
     assert(ctrl && *hw && (*hw)->live);
+    /* The delete unsubscribes the port's address through the ingress, so
+     * somebody must still hold it. */
+    assert((*hw)->in && (*hw)->in->refs);
     deletes++;
     (*hw)->live = false;
     *hw = NULL;
@@ -244,10 +250,11 @@ int main(void)
     run();
     assert(adds == 1 && hardware.live && ft_mr_installed == 1);
     assert(g->offloaded && cache.mfc_flags == MFC_OFFLOAD);
-    assert(input.refs == 1 && output[0].refs == 1);
+    /* The ingress twice: the group's, and the entry's own. */
+    assert(input.refs == 2 && output[0].refs == 1 && g->hw_in == &input);
     for (unsigned i = 0; i < 20; i++) refresh();
     assert(adds == 1 && replaces == 0 && deletes == 0);
-    assert(derives == 21 && folds == 20 && input.refs == 1);
+    assert(derives == 21 && folds == 20 && input.refs == 2);
 
     /* A router appeared, then disappeared. Refreshed chains carry exact sets. */
     wanted = 2;
@@ -305,15 +312,32 @@ int main(void)
     assert(hardware.live && hardware.copies == 2 && g->offloaded);
 
     /* A router netdev unregisters: release its borrowed plan references
-     * synchronously, then rederive without it and retire the stale root. */
+     * synchronously, then rederive without it and retire the stale root. The
+     * entry keeps its own hold on the ingress until it is deleted. */
     rtnl_lock();
     ft_mr_device_gone(&output[1]);
     rtnl_unlock();
-    assert(!input.refs && !output[0].refs && !output[1].refs);
+    assert(input.refs == 1 && !output[0].refs && !output[1].refs);
     assert(!ft_mr_taps_stale);   /* a port: the VIFs on bridges stand */
     wanted = 1;
     run();
     assert(hardware.live && hardware.copies == 1 && output[0].refs == 1);
+    assert(input.refs == 2);
+
+    /* The ingress itself unregisters. The group lets go of its reference at
+     * once; the entry, which the delete goes through, keeps its own until
+     * the worker takes it out of hardware -- and then lets go too. */
+    rtnl_lock();
+    ft_mr_device_gone(&input);
+    rtnl_unlock();
+    assert(input.refs == 1 && hardware.live && g->hw_in == &input);
+    refuse = true;               /* the plan has no ingress to name any more */
+    run();
+    assert(!hardware.live && !input.refs && !g->hw_in);
+    refuse = false;
+    ft_mr_recheck = true;
+    run();
+    assert(hardware.live && input.refs == 2);
 
     /* A bridge going down: the bridged learner drops its taps, and ipmr
      * keeps the VIFs, so nothing but this would publish them again. */

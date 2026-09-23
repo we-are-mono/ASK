@@ -1776,12 +1776,17 @@ static void devices_and_bridges_change(void)
         ft_mc_device_gone(&P2, true);
         assert(!f->ports && f->dirty && f->stale && !h->ports);
         assert(holds == before - 2 - 2);
-        /* The ingress: the flow is over, its reference let go at once. */
+        /* The ingress: the flow is over. Its reference goes when the worker
+         * frees it, after the entry that names it is out of hardware: the
+         * backend borrows the ingress and deletes through it. */
         before = holds;
+        f->hw = FAKE_HW;
         ft_mc_device_gone(&P1, true);
-        assert(f->gone && !f->in && h->gone && holds == before - 2);
+        assert(f->gone && f->in == &P1 && h->gone && holds == before);
         pass();
-        assert(!ft_mc_flow_count);
+        /* Both flows' ingress and bridge, and the bridge of both
+         * memberships, which the copy's port going left empty. */
+        assert(!ft_mc_flow_count && !ft_mc_count && holds == before - 6);
         /* The bridge itself: its memberships empty, its tap goes. */
         assert(ft_mc_membership(&BR, &P1, &any, true, false));
         ft_mc_device_gone(&BR, true);

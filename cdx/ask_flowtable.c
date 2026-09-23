@@ -7229,12 +7229,13 @@ static void ft_mc_device_gone(struct net_device *dev, bool unregistering)
 	list_for_each_entry(f, &ft_mc_flows, list) {
 		if (f->in == dev || f->bridge == dev) {
 			/* The flow's ingress, or its bridge: the flow is over.
-			 * The reference goes now, because the device is waiting
-			 * for it to unregister. */
-			if (f->in) {
-				dev_put(f->in);
-				f->in = NULL;
-			}
+			 * Its references go when the worker frees it, and not
+			 * before: an installed entry names the ingress, which
+			 * the backend borrows and unsubscribes the port's
+			 * multicast address through when the entry is deleted,
+			 * and an install in flight may be about to leave one.
+			 * The device waits for them only as long as the worker
+			 * this schedules takes to run. */
 			f->gone = true;
 			changed = true;
 		}
@@ -7735,6 +7736,12 @@ struct ft_mr_group {
 	u8 listeners;
 	char oifs[FT_MR_OIF_TEXT];
 	struct cdx_mc_group *hw;
+	/* The ingress `hw` was added with, held from the add to the delete.
+	 * The backend borrows it and unsubscribes the port's multicast address
+	 * through it when the entry is deleted, so it has to outlive `in`,
+	 * which a device going away releases at once. Only the worker and
+	 * teardown add or delete an entry, and only they touch this. */
+	struct net_device *hw_in;
 	/* What a group routed through a bridge publishes; allocated at its
 	 * first publication and freed with the group. */
 	struct ft_mc_route *route;
@@ -8795,6 +8802,11 @@ static void ft_mr_group_free(struct ft_mr_group *g)
 	 * RCU, and a flag cleared after that is written into freed memory. */
 	ft_mr_offload_flag(g, false);
 	ft_mr_release_set(g);
+	/* The entry's hold, once the caller has deleted the entry. */
+	WARN_ON_ONCE(g->hw);
+	if (g->hw_in)
+		dev_put(g->hw_in);
+	g->hw_in = NULL;
 	/* Off the bridged learner's list before it is freed: that is what
 	 * clears every pointer the bridged groups hold to it. */
 	if (g->route) {
@@ -8808,11 +8820,12 @@ static void ft_mr_group_free(struct ft_mr_group *g)
 /* A device this learner holds is going away or has stopped forwarding.
  *
  * Runs from the netdev chain under RTNL, so it may take ft_mr_lock and must
- * not touch the backend. The references are dropped here rather than left to
- * the worker: one still held when netdev_wait_allrefs() starts spinning is a
- * device that never finishes unregistering. The hardware entry still naming it
- * is retired by the worker a moment later, which is the bridged learner's
- * answer to the same window.
+ * not touch the backend. The group's own references are dropped here and the
+ * group asked again. The hardware entry still naming the device is deleted by
+ * the worker this schedules, and keeps a reference of its own on its ingress
+ * until then (`hw_in`), because the delete goes through it; unregistration
+ * waits for that only as long as the worker takes to run. The bridged learner
+ * answers the same window the same way.
  */
 static void ft_mr_device_gone(struct net_device *dev)
 {
@@ -9050,11 +9063,12 @@ static void ft_mr_work_fn(struct work_struct *work)
 	 * because ft_mr_lock is never held across it. */
 	for (;;) {
 		struct ft_mr_group *target = NULL;
+		struct net_device *put_in = NULL;
 		struct cdx_mc_group *hw = NULL;
 		struct ft_mr_plan plan = {};
 		enum ft_mr_state state;
 		bool rekey = false, same = false, via, rebuild = false;
-		bool added = false, counted = false;
+		bool added = false, counted = false, deleted = false;
 		struct cdx_ft_counters last;
 		u8 retries = 0;
 		int rc = 0, gen = 0;
@@ -9132,6 +9146,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 				cdx_mc_group_stats(hw, &last);
 				counted = true;
 				cdx_mc_group_del(&hw);
+				deleted = true;
 				ft_mr_installed--;
 				ft_mr_key_freed = true;
 			}
@@ -9146,6 +9161,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 						cdx_mc_group_stats(hw, &last);
 						counted = true;
 						cdx_mc_group_del(&hw);
+						deleted = true;
 						ft_mr_installed--;
 						ft_mr_key_freed = true;
 					}
@@ -9183,6 +9199,16 @@ static void ft_mr_work_fn(struct work_struct *work)
 
 		mutex_lock(&ft_mr_lock);
 		target->hw = hw;
+		/* The entry's own hold on its ingress: let go with the entry
+		 * just deleted, taken for the one just added. */
+		if (deleted) {
+			put_in = target->hw_in;
+			target->hw_in = NULL;
+		}
+		if (added) {
+			dev_hold(plan.spec.in);
+			target->hw_in = plan.spec.in;
+		}
 		/* The entry just deleted, folded against the baseline it was
 		 * counted from and with the framing it was installed with --
 		 * both still the old set's until the plan is adopted below. */
@@ -9244,6 +9270,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * RTNL. */
 		ft_mr_offload_flag(target, state == FT_MR_INSTALLED);
 		ft_mr_plan_put(&plan);
+		if (put_in)
+			dev_put(put_in);
 	}
 
 	if ((ft_mr_count || READ_ONCE(ft_mr_resync_pending)) &&
