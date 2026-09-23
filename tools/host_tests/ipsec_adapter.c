@@ -322,6 +322,18 @@ struct xfrm_lifetime_cur {
 	u64 bytes, packets;
 	time64_t add_time, use_time;
 };
+/* The two shapes xfrm keeps a sequence space in: the legacy one, and the one
+ * ESN -- or a window wider than 32 -- needs, member for member. */
+struct xfrm_replay_state { u32 oseq, seq, bitmap; };
+struct xfrm_replay_state_esn {
+	unsigned int bmp_len;
+	u32 oseq, seq, oseq_hi, seq_hi, replay_window;
+	u32 bmp[];
+};
+#define U32_MAX ((u32)~0U)
+#define U64_MAX ((u64)~0ULL)
+#define lower_32_bits(n) ((u32)(n))
+#define upper_32_bits(n) ((u32)((u64)(n) >> 32))
 
 struct xfrm_selector { bool mismatch; };
 struct xfrm_state {
@@ -338,13 +350,16 @@ struct xfrm_state {
 	} props;
 	struct { u32 v; } mark;
 	struct { u8 state; u8 dying; } km;
+	u8 repl_mode;
+	struct { u32 replay_window, replay, integrity_failed; } stats;
 	int lock;
 	int mtimer;
 	struct xfrm_algo_auth *aalg;
 	struct xfrm_algo *ealg;
 	struct xfrm_algo_aead *aead;
 	struct xfrm_encap_tmpl *encap;
-	void *replay_esn;
+	struct xfrm_replay_state replay;
+	struct xfrm_replay_state_esn *replay_esn;
 	struct xfrm_lifetime_cfg lft;
 	struct xfrm_lifetime_cur curlft;
 	struct xfrm_dev_offload xso;
@@ -420,6 +435,28 @@ static void xfrm_state_put(struct xfrm_state *x)
 	assert(x->refs && xfrm_state_refs);
 	x->refs--; xfrm_state_refs--;
 }
+
+/* What xfrm's own replay code reaches, for the copy of it compiled in below
+ * as the oracle for bit orientation. Nothing here audits or notifies. */
+enum { XFRM_REPLAY_MODE_LEGACY, XFRM_REPLAY_MODE_BMP, XFRM_REPLAY_MODE_ESN };
+#define XFRM_REPLAY_UPDATE 1
+struct sk_buff;
+static void xfrm_audit_state_replay(struct xfrm_state *x, struct sk_buff *skb,
+				    __be32 net_seq)
+{ (void)x; (void)skb; (void)net_seq; }
+static void *xs_net(struct xfrm_state *x) { (void)x; return NULL; }
+static bool xfrm_aevent_is_on(void *net) { (void)net; return false; }
+static void xfrm_replay_notify(struct xfrm_state *x, int event) { (void)x; (void)event; }
+static void xfrm_dev_state_advance_esn(struct xfrm_state *x) { (void)x; }
+#define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define likely(x) (x)
+#define unlikely(x) (x)
+static u32 ntohl(__be32 v)
+{
+	return __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? __builtin_bswap32(v) : v;
+}
+static __be32 htonl(u32 v) { return ntohl(v); }
 /* The tunnel-reduced inner bound, which is all the adapter asks of it. */
 static u16 xfrm_state_mtu(struct xfrm_state *x, unsigned int mtu)
 {
@@ -506,6 +543,9 @@ struct cdx_ipsec_sa {
 	bool outbound;
 	bool live;
 	u64 packets, bytes, oseq;
+	/* An inbound SA's window, as SEC's scorecard has it. */
+	u64 seq;
+	u32 seen[4];
 };
 static struct cdx_ipsec_sa sa_pool[8];
 static unsigned sa_installed, sa_deleted;
@@ -594,6 +634,9 @@ static void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	counters->packets = sa->packets;
 	counters->bytes = sa->bytes;
 	counters->oseq = sa->outbound ? sa->oseq : 0;
+	counters->seq = sa->outbound ? 0 : sa->seq;
+	memcpy(counters->seen, sa->outbound ? (u32[4]){ 0 } : sa->seen,
+	       sizeof(counters->seen));
 }
 
 /* xfrm's side of a lifetime. The judge itself is the kernel's, compiled; what
@@ -2087,6 +2130,428 @@ static void test_sequence_exhaustion(void)
 	bench_clear_sas();
 }
 
+/* Where an SA's sequence space stands, and how wide a window guards it, as
+ * xfrm hands them over -- in both of the shapes xfrm keeps them. */
+static void test_spec_sequence(void)
+{
+	/* With room for the ring, as xfrm_user allocates it. */
+	struct xfrm_replay_state_esn *esn = calloc(1, sizeof(*esn) + 4 * sizeof(u32));
+	struct cdx_ipsec_sa_spec spec;
+	struct xfrm_state *x = outbound_state();
+	struct netlink_ext_ack ack = { NULL };
+
+	bench_reset();
+
+	/* A fresh SA starts at zero with anti-replay off, which is what a zero
+	 * window means -- not the fixed window it used to get regardless. */
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.seq == 0 && spec.replay_window == 0);
+
+	/* The legacy shape: an outbound SA carries on from the last number it
+	 * sent, an inbound one from the highest it received, each from its own
+	 * field. */
+	x->replay.oseq = 1000;
+	x->replay.seq = 7;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.seq == 1000);
+	x->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	x->props.replay_window = 32;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.seq == 7 && spec.replay_window == 32);
+
+	/* ESN: the high word is part of the number, in each direction. */
+	x->props.replay_window = 0;
+	x->props.flags |= XFRM_STATE_ESN;
+	assert(esn);
+	esn->bmp_len = 4;
+	x->replay_esn = esn;
+	esn->seq = 9;
+	esn->seq_hi = 1;
+	esn->oseq = 5;
+	esn->oseq_hi = 2;
+	esn->replay_window = 64;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.esn && spec.seq == ((1ULL << 32) | 9));
+	assert(spec.replay_window == 64);
+	x->xso.dir = XFRM_DEV_OFFLOAD_OUT;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.seq == ((2ULL << 32) | 5));
+
+	/* The same shape without ESN, which xfrm uses for a window wider than
+	 * its legacy 32-bit bitmap: the high word is not part of the number,
+	 * whatever it holds. */
+	x->props.flags &= ~XFRM_STATE_ESN;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(!spec.esn && spec.seq == 5);
+	x->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	esn->replay_window = 128;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.seq == 9 && spec.replay_window == 128);
+
+	/* A window SEC cannot keep is refused, and said so, rather than
+	 * narrowed into dropping late frames the configuration accepts. */
+	esn->replay_window = CDX_IPSEC_REPLAY_WINDOW_MAX + 1;
+	ack._msg = NULL;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP && ack._msg);
+	/* An outbound SA checks nothing, so any window it names is no reason
+	 * to refuse it. */
+	x->xso.dir = XFRM_DEV_OFFLOAD_OUT;
+	esn->replay_window = 1024;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+
+	x->replay_esn = NULL;
+	free(esn);
+	memset(&x->replay, 0, sizeof(x->replay));
+}
+
+/* The sequence number SEC has reached goes back into the state, so that
+ * whatever re-adds or migrates the SA carries on from there. */
+static void test_publish_oseq(void)
+{
+	struct xfrm_replay_state_esn esn = { .bmp_len = 4 };
+	struct xfrm_state out_state, esn_state, bmp_state, in_state;
+	struct xfrm_state *out, *esn_out, *bmp_out, *in;
+
+	bench_reset();
+	bench_clear_sas();
+	out = install_accounted(&out_state, true, 0);
+	esn_out = install_accounted(&esn_state, true, XFRM_STATE_ESN);
+	esn_out->replay_esn = &esn;
+	bmp_out = install_accounted(&bmp_state, true, 0);
+	in = install_accounted(&in_state, false, 0);
+
+	/* An SA that has sent nothing reads back as installed, which moves
+	 * nothing. */
+	sa_of(out)->oseq = 0;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 0);
+
+	/* The legacy shape takes the number as it is, when nothing was sent in
+	 * the period behind it. */
+	sa_of(out)->oseq = 4096;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 4096);
+
+	/* Ahead by twice what the SA sent in the last period: SEC goes on
+	 * numbering until the SA is deleted, and a re-add must start past
+	 * wherever it got to. */
+	sa_of(out)->packets = 1000;
+	sa_of(out)->oseq = 5000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 7000);
+	/* A quiet period after it holds the number published, rather than
+	 * taking it back to SEC's. */
+	sa_of(out)->oseq = 6000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 7000);
+	sa_of(out)->packets = 1500;
+	sa_of(out)->oseq = 8000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 9000);
+
+	/* ESN splits it across both words, the margin carrying into the high
+	 * one. */
+	sa_of(esn_out)->packets = 16;
+	sa_of(esn_out)->oseq = (3ULL << 32) | 0xfffffff0;
+	ft_ipsec_stats_work(NULL);
+	assert(esn.oseq == 0x10 && esn.oseq_hi == 4);
+
+	/* Only forward: a value set by other means is not undone by a reading
+	 * behind it. */
+	out->replay.oseq = 10000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 10000);
+
+	/* Not ESN but in the wide shape: the low word alone. */
+	{
+		struct xfrm_replay_state_esn wide = { .bmp_len = 4, .oseq_hi = 9 };
+
+		bmp_out->replay_esn = &wide;
+		sa_of(bmp_out)->oseq = 77;
+		ft_ipsec_stats_work(NULL);
+		assert(wide.oseq == 77 && wide.oseq_hi == 9);
+		/* And a margin past the end of a 32-bit space stops at the
+		 * last number SEC will send, FFFFFFFE -- the truth about an SA
+		 * that close. */
+		sa_of(bmp_out)->packets = 200;
+		sa_of(bmp_out)->oseq = 0xffffff00;
+		ft_ipsec_stats_work(NULL);
+		assert(wide.oseq == 0xfffffffe && wide.oseq_hi == 9);
+		bmp_out->replay_esn = NULL;
+	}
+
+	/* An inbound SA has no sequence of its own to publish, whatever it is
+	 * handed. */
+	test_lock(&in->lock);
+	ft_ipsec_publish_oseq(in, 555, 10);
+	test_unlock(&in->lock);
+	assert(in->replay.oseq == 0);
+
+	/* Not VALID: nothing goes back. */
+	out->km.state = XFRM_STATE_EXPIRED;
+	sa_of(out)->oseq = 20000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 10000);
+
+	delete_state(out);
+	delete_state(esn_out);
+	delete_state(bmp_out);
+	delete_state(in);
+	bench_clear_sas();
+}
+
+/* A replay_esn with room for a 128-entry ring, as xfrm_user allocates one. */
+static struct xfrm_replay_state_esn *ring_alloc(u32 window)
+{
+	struct xfrm_replay_state_esn *r = calloc(1, sizeof(*r) + 4 * sizeof(u32));
+
+	assert(r);
+	r->bmp_len = 4;
+	r->replay_window = window;
+	return r;
+}
+
+/* An inbound state that has received the numbers from..to except `missing`,
+ * put through xfrm's own receive bookkeeping one number at a time. */
+static void receive(struct xfrm_state *x, u64 from, u64 to, const u64 *missing,
+		    unsigned int nmissing)
+{
+	for (u64 s = from; s <= to; s++) {
+		bool skip = false;
+
+		for (unsigned int i = 0; i < nmissing; i++)
+			skip |= missing[i] == s;
+		if (!skip)
+			xfrm_replay_advance(x, htonl((u32)s));
+	}
+}
+
+static bool was_missing(u64 s, const u64 *missing, unsigned int nmissing)
+{
+	for (unsigned int i = 0; i < nmissing; i++)
+		if (missing[i] == s)
+			return true;
+	return false;
+}
+
+static bool seen_bit(const u32 *seen, u32 k)
+{
+	return seen[k / 32] & (1U << (k % 32));
+}
+
+/* A state re-added with history carries it to SEC in SEC's orientation --
+ * bit k for seq - k -- whichever of xfrm's three shapes it came in, and marks
+ * everything past its own window as seen. xfrm's own receive code builds the
+ * history, so the orientation is checked against xfrm rather than against a
+ * restatement of it. */
+static void test_replay_seeding(void)
+{
+	static const u64 legacy_missing[] = { 35, 38, 20 };
+	static const u64 bmp_missing[] = { 99, 70, 50 };
+	const u64 esn_missing[] = { (2ULL << 32) | 0xfffffff8, (3ULL << 32) | 0x5,
+				    (3ULL << 32) | 0x1f };
+	struct cdx_ipsec_sa_spec spec;
+	struct xfrm_state *x = outbound_state();
+	struct netlink_ext_ack ack = { NULL };
+	u64 top;
+
+	bench_reset();
+	x->xso.dir = XFRM_DEV_OFFLOAD_IN;
+
+	/* A fresh state has no history to carry. */
+	x->props.replay_window = 32;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	for (u32 k = 0; k < 128; k++)
+		assert(!seen_bit(spec.replay_seen, k));
+
+	/* The legacy shape: a linear 32-bit bitmap. */
+	x->repl_mode = XFRM_REPLAY_MODE_LEGACY;
+	receive(x, 1, 40, legacy_missing, 3);
+	assert(x->replay.seq == 40);
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.seq == 40 && spec.replay_window == 32);
+	for (u32 k = 0; k < 128; k++)
+		assert(seen_bit(spec.replay_seen, k) ==
+		       (k >= 32 || !was_missing(40 - k, legacy_missing, 3)));
+
+	/* The ring xfrm keeps for a window wider than 32, without ESN. */
+	memset(&x->replay, 0, sizeof(x->replay));
+	x->props.replay_window = 0;
+	x->replay_esn = ring_alloc(64);
+	x->repl_mode = XFRM_REPLAY_MODE_BMP;
+	receive(x, 1, 100, bmp_missing, 3);
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.seq == 100 && spec.replay_window == 64);
+	for (u32 k = 0; k < 128; k++)
+		assert(seen_bit(spec.replay_seen, k) ==
+		       (k >= 64 || !was_missing(100 - k, bmp_missing, 3)));
+	free(x->replay_esn);
+
+	/* ESN, across a carry into the high word: the ring is indexed by the
+	 * low 32 bits, and the history straddles the wrap. */
+	x->props.flags |= XFRM_STATE_ESN;
+	x->replay_esn = ring_alloc(64);
+	x->replay_esn->seq_hi = 2;
+	x->replay_esn->seq = 0xffffffe0;
+	x->repl_mode = XFRM_REPLAY_MODE_ESN;
+	receive(x, (2ULL << 32) | 0xffffffe1, (3ULL << 32) | 0x20, esn_missing, 3);
+	top = (3ULL << 32) | 0x20;
+	assert(x->replay_esn->seq_hi == 3 && x->replay_esn->seq == 0x20);
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.esn && spec.seq == top);
+	for (u32 k = 0; k < 128; k++)
+		assert(seen_bit(spec.replay_seen, k) ==
+		       (k >= 64 || !was_missing(top - k, esn_missing, 3)));
+	free(x->replay_esn);
+
+	x->replay_esn = NULL;
+	x->props.flags &= ~XFRM_STATE_ESN;
+	x->props.replay_window = 0;
+	x->repl_mode = XFRM_REPLAY_MODE_LEGACY;
+	memset(&x->replay, 0, sizeof(x->replay));
+}
+
+/* Ask xfrm's own check whether it would take sequence number s. */
+static bool accepts(struct xfrm_state *x, u64 s)
+{
+	return xfrm_replay_check(x, NULL, htonl((u32)s)) == 0;
+}
+
+/* SEC's scorecard goes back into the state in xfrm's orientation, so the
+ * state refuses exactly what SEC has seen -- which is what a re-add built
+ * from it inherits. xfrm's own check is the oracle. */
+static void test_publish_window(void)
+{
+	struct xfrm_state in_state, bmp_state, esn_state;
+	struct xfrm_state *in, *bmp, *esn;
+	u32 pattern[4] = { 0xa5a5f00f, 0x0ff05a5a, 0x12345678, 0x9abcdef1 };
+	u64 top;
+
+	bench_reset();
+	bench_clear_sas();
+
+	/* The legacy shape, 32 wide. */
+	in = install_accounted(&in_state, false, 0);
+	in->props.replay_window = 32;
+	in->repl_mode = XFRM_REPLAY_MODE_LEGACY;
+	sa_of(in)->seq = 1000;
+	memcpy(sa_of(in)->seen, pattern, sizeof(pattern));
+	ft_ipsec_stats_work(NULL);
+	assert(in->replay.seq == 1000);
+	for (u32 k = 0; k < 32; k++)
+		assert(accepts(in, 1000 - k) == !seen_bit(pattern, k));
+	assert(!accepts(in, 1000 - 32) && accepts(in, 1001));
+
+	/* A window behind the state's is not applied; one level with it only
+	 * adds what SEC has seen since. */
+	sa_of(in)->seq = 900;
+	sa_of(in)->seen[0] = ~0U;
+	ft_ipsec_stats_work(NULL);
+	assert(in->replay.seq == 1000);
+	for (u32 k = 0; k < 32; k++)
+		assert(accepts(in, 1000 - k) == !seen_bit(pattern, k));
+	sa_of(in)->seq = 1000;
+	sa_of(in)->seen[0] = pattern[0] | 1U << 2;
+	ft_ipsec_stats_work(NULL);
+	assert(!accepts(in, 998));
+	for (u32 k = 0; k < 32; k++)
+		if (k != 2)
+			assert(accepts(in, 1000 - k) == !seen_bit(pattern, k));
+
+	/* One ahead replaces it outright: nothing seen at the old anchor
+	 * carries over to the new one. */
+	sa_of(in)->seq = 1100;
+	sa_of(in)->seen[0] = 1;
+	ft_ipsec_stats_work(NULL);
+	assert(in->replay.seq == 1100 && !accepts(in, 1100));
+	for (u32 k = 1; k < 32; k++)
+		assert(accepts(in, 1100 - k));
+
+	/* The ring, 64 wide, without ESN; a window ahead replaces what was
+	 * there. */
+	bmp = install_accounted(&bmp_state, false, 0);
+	bmp->replay_esn = ring_alloc(64);
+	bmp->repl_mode = XFRM_REPLAY_MODE_BMP;
+	bmp->replay_esn->seq = 50;
+	bmp->replay_esn->bmp[0] = bmp->replay_esn->bmp[1] = ~0U;
+	sa_of(bmp)->seq = 5000;
+	memcpy(sa_of(bmp)->seen, pattern, sizeof(pattern));
+	ft_ipsec_stats_work(NULL);
+	assert(bmp->replay_esn->seq == 5000);
+	for (u32 k = 0; k < 64; k++)
+		assert(accepts(bmp, 5000 - k) == !seen_bit(pattern, k));
+	assert(!accepts(bmp, 5000 - 64) && accepts(bmp, 5001));
+
+	/* ESN, the window straddling a carry into the high word. */
+	esn = install_accounted(&esn_state, false, XFRM_STATE_ESN);
+	esn->replay_esn = ring_alloc(128);
+	esn->repl_mode = XFRM_REPLAY_MODE_ESN;
+	esn->replay_esn->seq_hi = 6;
+	esn->replay_esn->seq = 0xfffffff0;
+	top = (7ULL << 32) | 0x30;
+	sa_of(esn)->seq = top;
+	memcpy(sa_of(esn)->seen, pattern, sizeof(pattern));
+	ft_ipsec_stats_work(NULL);
+	assert(esn->replay_esn->seq_hi == 7 && esn->replay_esn->seq == 0x30);
+	for (u32 k = 0; k < 128; k++)
+		assert(accepts(esn, top - k) == !seen_bit(pattern, k));
+	assert(accepts(esn, top + 1));
+
+	/* An SA with anti-replay off keeps no window to publish. */
+	sa_of(in)->seq = 2000;
+	in->props.replay_window = 0;
+	ft_ipsec_stats_work(NULL);
+	assert(in->replay.seq == 1100);
+
+	free(bmp->replay_esn);
+	free(esn->replay_esn);
+	bmp->replay_esn = esn->replay_esn = NULL;
+	delete_state(in);
+	delete_state(bmp);
+	delete_state(esn);
+	bench_clear_sas();
+}
+
+/* The whole round trip: a state's history goes to SEC on install, SEC's
+ * scorecard comes back into a state, and a re-add built from that state
+ * refuses exactly what the first one had seen. */
+static void test_replay_round_trip(void)
+{
+	static const u64 missing[] = { 190, 175, 131 };
+	struct xfrm_state first_state, second_state;
+	struct xfrm_state *first, *second;
+	struct cdx_ipsec_sa_spec spec;
+	struct netlink_ext_ack ack = { NULL };
+
+	bench_reset();
+	bench_clear_sas();
+	first_state = *outbound_state();
+	first = &first_state;
+	first->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	first->replay_esn = ring_alloc(96);
+	first->repl_mode = XFRM_REPLAY_MODE_BMP;
+	receive(first, 1, 200, missing, 3);
+
+	/* To SEC: the spec's scorecard is what SEC starts from. */
+	assert(ft_ipsec_spec(first, &spec, &ack) == 0);
+
+	/* From SEC, into a state installed fresh and anchored nowhere yet. */
+	second = install_accounted(&second_state, false, 0);
+	second->replay_esn = ring_alloc(96);
+	second->repl_mode = XFRM_REPLAY_MODE_BMP;
+	sa_of(second)->seq = spec.seq;
+	memcpy(sa_of(second)->seen, spec.replay_seen, sizeof(spec.replay_seen));
+	ft_ipsec_stats_work(NULL);
+	for (u64 s = 200 - 95; s <= 201; s++)
+		assert(accepts(second, s) == accepts(first, s));
+
+	free(first->replay_esn);
+	free(second->replay_esn);
+	second->replay_esn = NULL;
+	delete_state(second);
+	bench_clear_sas();
+}
+
 int main(void)
 {
 	test_spec();
@@ -2107,6 +2572,11 @@ int main(void)
 	test_watch_delete_ordering();
 	test_accounting();
 	test_sequence_exhaustion();
+	test_spec_sequence();
+	test_publish_oseq();
+	test_replay_seeding();
+	test_publish_window();
+	test_replay_round_trip();
 	assert(dev_holds == 0 && neigh_refs == 0 && xfrm_state_refs == 0);
 	printf("ipsec adapter: ok\n");
 	return 0;

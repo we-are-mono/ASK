@@ -213,6 +213,29 @@ static int cdx_ipsec_set_keys(PSAEntry sa, const struct cdx_ipsec_sa_spec *spec)
 	return 0;
 }
 
+/* Where the SA's sequence space starts, and the window that guards it.
+ *
+ * The cache create starts every SA at zero with the legacy owner's fixed
+ * window, because FCI told it neither. Both PDB builders read these when the
+ * SA is installed, so this runs before that: the outbound one seeds SEC one
+ * past sa->seq, the inbound one anchors its window at sa->seq and starts its
+ * scorecard from what the spec says was already received. The window is an
+ * inbound SA's alone; SA_ALLOW_SEQ_ROLL, set at create from a zero width, is
+ * what turns it off. The spec and the PDB number the scorecard the same way,
+ * so it is copied as it stands.
+ */
+static void cdx_ipsec_set_sequence(PSAEntry sa,
+				   const struct cdx_ipsec_sa_spec *spec)
+{
+	static_assert(ARRAY_SIZE(spec->replay_seen) == SA_REPLAY_SEEN_WORDS);
+
+	sa->seq = spec->seq;
+	if (spec->dir != CDX_IPSEC_DIR_IN)
+		return;
+	sa->replay_window = spec->replay_window;
+	memcpy(sa->replay_seen, spec->replay_seen, sizeof(sa->replay_seen));
+}
+
 static int cdx_ipsec_validate(const struct cdx_ipsec_sa_spec *spec)
 {
 	if (!spec->dev || !spec->spi)
@@ -236,6 +259,21 @@ static int cdx_ipsec_validate(const struct cdx_ipsec_sa_spec *spec)
 	/* An outbound SA leaves SEC already addressed, so a next hop is part
 	 * of describing it rather than something to discover later. */
 	if (spec->dir == CDX_IPSEC_DIR_OUT && is_zero_ether_addr(spec->dst_mac))
+		return -EINVAL;
+	/* A window SEC cannot keep is refused rather than narrowed: a
+	 * narrower one would drop late frames the configuration accepts. */
+	if (spec->dir == CDX_IPSEC_DIR_IN &&
+	    spec->replay_window > CDX_IPSEC_REPLAY_WINDOW_MAX)
+		return -EOPNOTSUPP;
+	/* Without ESN the sequence space is 32 bits. An outbound SA has to
+	 * have a number left to send: SEC starts one past this one, and
+	 * refuses to send the all-ones number itself -- FFFFFFFF without ESN,
+	 * FFFFFFFF:FFFFFFFF with it (SEC RM table 9-2) -- so the last it can
+	 * send is one below that. */
+	if (!spec->esn && spec->seq > U32_MAX)
+		return -EINVAL;
+	if (spec->dir == CDX_IPSEC_DIR_OUT &&
+	    spec->seq >= (spec->esn ? U64_MAX : U32_MAX) - 1)
 		return -EINVAL;
 	if (!cdx_ipsec_port_supported(spec->dev))
 		return -EOPNOTSUPP;
@@ -283,7 +321,7 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 	sa = M_ipsec_sa_cache_create(saddr, daddr, spec->spi, IPPROTOCOL_ESP,
 				     spec->family == AF_INET6 ? PROTO_IPV6
 							      : PROTO_IPV4,
-				     handle, spec->replay, spec->esn,
+				     handle, spec->replay_window != 0, spec->esn,
 				     spec->mtu, spec->dev_mtu,
 				     spec->dir == CDX_IPSEC_DIR_IN
 					     ? CDX_DPA_IPSEC_INBOUND
@@ -293,6 +331,7 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		goto err_free_owner;
 	}
 	sa->flags |= SA_XFRM_OWNED;
+	cdx_ipsec_set_sequence(sa, spec);
 
 	rc = cdx_ipsec_set_keys(sa, spec);
 	if (rc)
@@ -538,6 +577,30 @@ static bool cdx_ipsec_sa_sample(PSAEntry entry, u32 *packets, u64 *bytes)
 	return false;
 }
 
+/* Read where an inbound SA's anti-replay window stands, as two readings that
+ * agree. SEC stores the sequence number and the scorecard together after
+ * every frame, and a sequence number from one frame against a scorecard from
+ * another would put every bit in the wrong place. A window busy enough never
+ * to hold still for two readings is left unread this time.
+ */
+static bool cdx_ipsec_sa_replay_sample(PSAEntry entry, u64 *seq, u32 *seen)
+{
+	u32 again_seen[SA_REPLAY_SEEN_WORDS];
+	unsigned int tries;
+	u64 again_seq;
+
+	get_replay_from_sa(entry, seq, seen);
+	for (tries = 0; tries < CDX_IPSEC_SAMPLE_TRIES; tries++) {
+		get_replay_from_sa(entry, &again_seq, again_seen);
+		if (again_seq == *seq &&
+		    !memcmp(again_seen, seen, sizeof(again_seen)))
+			return true;
+		*seq = again_seq;
+		memcpy(seen, again_seen, sizeof(again_seen));
+	}
+	return false;
+}
+
 /* Whether a clean reading of SEC's byte count can be believed.
  *
  * SEC's count only ever moves forward, so a reading that went back is torn.
@@ -571,6 +634,7 @@ void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	u32 packets;
 	u64 bytes;
 
+	static_assert(ARRAY_SIZE(counters->seen) == SA_REPLAY_SEEN_WORDS);
 	cdx_ft_assert_held();
 	memset(counters, 0, sizeof(*counters));
 	if (!sa || !sa->entry)
@@ -595,8 +659,14 @@ void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	counters->packets = sa->packets;
 	counters->bytes = sa->bytes;
 sequence:
-	if (sa->entry->direction == CDX_DPA_IPSEC_OUTBOUND)
+	if (sa->entry->direction == CDX_DPA_IPSEC_OUTBOUND) {
 		counters->oseq = get_oseq_from_sa(sa->entry);
+	} else if (!(sa->entry->flags & SA_ALLOW_SEQ_ROLL) &&
+		   !cdx_ipsec_sa_replay_sample(sa->entry, &counters->seq,
+					       counters->seen)) {
+		counters->seq = 0;
+		memset(counters->seen, 0, sizeof(counters->seen));
+	}
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_stats, ASK_CDX_FLOWTABLE);
 

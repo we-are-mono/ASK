@@ -336,6 +336,13 @@ async def test_flowtable_service_ipsec_receive_failslab(ipsec_service):
         await negative(r, p)
 
 
+def configured(state):
+    """An `ip xfrm state` record less its anti-replay context, which moves
+    with every frame the SA carries."""
+    return "\n".join(line for line in state.splitlines()
+                     if not line.strip().startswith("anti-replay context:"))
+
+
 async def test_flowtable_service_ipsec_pool_recovery(ipsec_service):
     from test_flowtable_failslab import slab_fault
 
@@ -400,7 +407,9 @@ print(json.dumps({'path': str(paths[0]), 'bpid': int(bpid)}))
             recovered = await available()
             refill_seconds = time.monotonic() - started
             await p.batch([0, 1, 2, 3], count=64, interval=0.01)
-            assert await r.ipsec.states() == sas
+            # The same SAs, not reinstalled ones. Their anti-replay context
+            # follows SEC's numbering, which the traffic above advanced.
+            assert [configured(s) for s in await r.ipsec.states()] == [configured(s) for s in sas]
             await plaintext_probe(r, p, "pool-plaintext")
             r.record("pool-refilled", {"pool": pool, "available": recovered,
                                       "seconds": refill_seconds, "fault": hit})

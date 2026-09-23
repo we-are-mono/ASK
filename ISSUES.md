@@ -307,6 +307,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A210.** Offloaded SAs started at sequence zero with a fixed 64-entry window, and SEC's numbering never reached xfrm —
+  fixed (_:/^cdx: carry the IPsec starting sequence and replay window to SEC_).
+
 - [x] **A209.** Offloaded IPsec SAs never accounted into xfrm's lifetimes, so byte and packet expiry never fired —
   fixed (_:/^cdx: account offloaded IPsec SAs into xfrm lifetimes_).
 

@@ -1016,6 +1016,30 @@ u64 get_oseq_from_sa(PSAEntry sa)
 	return low - 1;
 }
 
+static_assert(sizeof_field(struct ipsec_decap_pdb, anti_replay) ==
+	      SA_REPLAY_SEEN_WORDS * sizeof(u32));
+
+/* Where an inbound SA's anti-replay window stands, as SEC keeps it in the
+ * PDB: the highest sequence number received, with the ESN high word when the
+ * SA has one, and the scorecard. SEC keeps the scorecard with the newest
+ * number in the least significant bit of its first word and each bit to the
+ * left one older, carrying on into the next word (SEC RM, IPsec anti-replay
+ * checking) -- so bit k of word k / 32 stands for seq - k. Each word is read
+ * once here; the caller reads twice to know the reading did not straddle a
+ * store.
+ */
+void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen)
+{
+	struct sec_descriptor *sec_desc = sa->pSec_sa_context->sec_desc;
+	unsigned int i;
+
+	*seq = caam32_to_cpu(READ_ONCE(sec_desc->pdb_dec.seq_num));
+	if (sa->flags & SA_ALLOW_EXT_SEQ_NUM)
+		*seq |= (u64)caam32_to_cpu(READ_ONCE(sec_desc->pdb_dec.seq_num_ext_hi)) << 32;
+	for (i = 0; i < SA_REPLAY_SEEN_WORDS; i++)
+		seen[i] = caam32_to_cpu((__force u32)READ_ONCE(sec_desc->pdb_dec.anti_replay[i]));
+}
+
 static inline void save_sa_state_in_external_mem(PSAEntry sa)
 {
 	uint32_t *desc;
@@ -1603,6 +1627,68 @@ static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 	return 0;
 }
 
+/* The anti-replay window SEC keeps for an inbound SA, as PDB options.
+ *
+ * The ESP decapsulation PDB names three widths in its ARS bits -- 32, 64 and
+ * 128 entries (RM table 9-10) -- and ipsec_decap_pdb always has room for the
+ * widest scorecard. SEC's stand-alone anti-replay command takes any width up
+ * to 128, but the ESP protocol does not expose it. A window between two
+ * widths is carried on the next wider, which loses nothing: anti-replay
+ * refuses every sequence number it has already seen whatever the width, and
+ * the width only bounds how late a frame never seen may still be taken. A
+ * narrower window than asked would drop frames the configuration accepts,
+ * which is why a window wider than 128 is refused when the SA is added
+ * (CDX_IPSEC_REPLAY_WINDOW_MAX) rather than narrowed here. An SA whose
+ * creator named no width -- the legacy owner, which FCI never told -- keeps
+ * the 64 entries it always had.
+ */
+static u32 cdx_ipsec_ars(PSAEntry sa)
+{
+	if (sa->flags & SA_ALLOW_SEQ_ROLL)
+		return PDBOPTS_ESP_ARSNONE;
+	if (!sa->replay_window)
+		return PDBOPTS_ESP_ARS64;
+	if (sa->replay_window <= 32)
+		return PDBOPTS_ESP_ARS32;
+	if (sa->replay_window <= 64)
+		return PDBOPTS_ESP_ARS64;
+	return PDBOPTS_ESP_ARS128;
+}
+
+/* The decapsulation PDB's replay state: where the window stands, whether its
+ * numbers are extended, how wide it is, and the scorecard it starts from --
+ * clear for a fresh SA, the history a re-added state brought with it
+ * otherwise, so nothing it accepted before is accepted again. Options are left
+ * in CPU order, as the rest of the builder keeps them until it converts the
+ * word.
+ *
+ * With ESN the stored high word is the window top's. The SEC RM says SEC
+ * holds its own stored ESN back after a rollover until the whole window is
+ * past it (IPsec ESP decapsulation, "Optional use of ESN"), which in the
+ * first window-width of numbers after a rollover is one below the top's. It
+ * does not say which it expects of a window seeded there, nor how it tells
+ * that stretch from the start of a fresh SA, whose window reaches below
+ * number zero in the same way. The rig check in docs/flowtable/ipsec.md
+ * settles it; until then, a state re-added inside that stretch is the case
+ * to watch.
+ */
+static void cdx_ipsec_build_in_replay(PSAEntry sa, struct ipsec_decap_pdb *pdb)
+{
+	unsigned int i;
+
+	pdb->seq_num = cpu_to_caam32(sa->seq & SEQ_NUM_LOW_MASK);
+	if (sa->flags & SA_ALLOW_EXT_SEQ_NUM) {
+		pdb->seq_num_ext_hi =
+			cpu_to_caam32((sa->seq & SEQ_NUM_HI_MASK) >> 32);
+		pdb->options |= PDBOPTS_ESP_ESN;
+	}
+	pdb->options |= cdx_ipsec_ars(sa);
+	if (!(sa->flags & SA_ALLOW_SEQ_ROLL))
+		for (i = 0; i < SA_REPLAY_SEEN_WORDS; i++)
+			pdb->anti_replay[i] =
+				(__force __be32)cpu_to_caam32(sa->replay_seen[i]);
+}
+
 static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 {
 	struct sec_descriptor *sec_desc;
@@ -1615,25 +1701,7 @@ static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 	sec_desc= psec_as_context->sec_desc; 
 	memset(&sec_desc->pdb_dec, 0, sizeof(sec_desc->pdb_dec));
 
-	sec_desc->pdb_dec.seq_num =
-		cpu_to_caam32(sa->seq & SEQ_NUM_LOW_MASK);
-
-
-	if ( sa->flags & SA_ALLOW_EXT_SEQ_NUM ) {
-		sec_desc->pdb_dec.seq_num_ext_hi =
-			cpu_to_caam32((sa->seq & SEQ_NUM_HI_MASK) >> 32);
-		sec_desc->pdb_dec.options |= PDBOPTS_ESP_ESN;
-	}
-
-
-	if (sa->flags & SA_ALLOW_SEQ_ROLL  ) {
-		sec_desc->pdb_dec.options |= PDBOPTS_ESP_ARSNONE;
-	}else{
-		/* assuming anti reply window of 64 defult. This is not
-		   known through cmm-cdx command */
-		/*sa->sec_desc->pdb_dec.options |= PDBOPTS_ESP_ARS32; */
-		sec_desc->pdb_dec.options |= PDBOPTS_ESP_ARS64;
-	}
+	cdx_ipsec_build_in_replay(sa, &sec_desc->pdb_dec);
 
 	if(sa->mode == SA_MODE_TUNNEL)
 	{

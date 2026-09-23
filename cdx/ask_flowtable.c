@@ -6494,6 +6494,56 @@ static int ft_ipsec_next_hop(struct xfrm_state *x,
 				 true, spec->dst_mac, extack);
 }
 
+/* Where xfrm keeps the bit for sequence number top - k in a replay_esn ring.
+ *
+ * The legacy bitmap is linear, bit k for top - k. The replay_esn one is a
+ * ring of replay_window bits in which top sits at (top - 1) % window and each
+ * older number one position before it, wrapping -- the arithmetic
+ * xfrm_replay_check_bmp() and xfrm_replay_check_esn() use, on the low 32 bits
+ * of the number.
+ */
+static u32 ft_ipsec_replay_bit(u32 top, u32 window, u32 k)
+{
+	u32 pos = (top - 1) % window;
+
+	return pos >= k ? pos - k : window - (k - pos);
+}
+
+/* What an inbound state has already received, in the spec's orientation:
+ * bit k of replay_seen for spec->seq - k.
+ *
+ * A fresh state has none. A re-added one carries the window it was read with,
+ * and SEC's scorecard starts from it, so nothing the old SA accepted can be
+ * accepted again. Positions past the state's own window are history xfrm does
+ * not keep, and SEC may keep a wider window than the state asked for: they are
+ * marked received, so a number xfrm would refuse as too old is refused rather
+ * than taken once more.
+ */
+static void ft_ipsec_replay_seen(const struct xfrm_state *x,
+				 struct cdx_ipsec_sa_spec *spec)
+{
+	const struct xfrm_replay_state_esn *esn = x->replay_esn;
+	u32 window = spec->replay_window;
+	u32 top = lower_32_bits(spec->seq);
+	bool seen;
+	u32 k, bit;
+
+	if (!window || !spec->seq)
+		return;
+	for (k = 0; k < CDX_IPSEC_REPLAY_WINDOW_MAX; k++) {
+		if (k >= window) {
+			seen = true;
+		} else if (!esn) {
+			seen = k < 32 && (x->replay.bitmap & (1U << k));
+		} else {
+			bit = ft_ipsec_replay_bit(top, window, k);
+			seen = esn->bmp[bit / 32] & (1U << (bit % 32));
+		}
+		if (seen)
+			spec->replay_seen[k / 32] |= 1U << (k % 32);
+	}
+}
+
 /* Translate a kernel state into the backend's description of one.
  *
  * Algorithm identities come straight from x->props.aalgo and x->props.ealgo,
@@ -6517,7 +6567,32 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 						      : CDX_IPSEC_DIR_OUT;
 	spec->tunnel = x->props.mode == XFRM_MODE_TUNNEL;
 	spec->esn = !!(x->props.flags & XFRM_STATE_ESN);
-	spec->replay = x->props.replay_window || x->replay_esn;
+	/* Where the sequence space stands and how wide a window guards it, in
+	 * xfrm's own terms. A state with a replay_esn keeps both there -- one
+	 * with ESN always, one without when its window is wider than the
+	 * legacy 32-bit bitmap -- and only ESN makes the high word part of the
+	 * number. Each direction's own number is the one that matters: the
+	 * last sent going out, the highest received coming in. */
+	if (x->replay_esn) {
+		const struct xfrm_replay_state_esn *esn = x->replay_esn;
+		bool out = spec->dir == CDX_IPSEC_DIR_OUT;
+
+		spec->replay_window = esn->replay_window;
+		spec->seq = out ? esn->oseq : esn->seq;
+		if (spec->esn)
+			spec->seq |= (u64)(out ? esn->oseq_hi : esn->seq_hi) << 32;
+	} else {
+		spec->replay_window = x->props.replay_window;
+		spec->seq = spec->dir == CDX_IPSEC_DIR_OUT ? x->replay.oseq
+							   : x->replay.seq;
+	}
+	if (spec->dir == CDX_IPSEC_DIR_IN &&
+	    spec->replay_window > CDX_IPSEC_REPLAY_WINDOW_MAX) {
+		NL_SET_ERR_MSG(extack, "cdx: SEC's anti-replay window is at most 128 packets");
+		return -EOPNOTSUPP;
+	}
+	if (spec->dir == CDX_IPSEC_DIR_IN)
+		ft_ipsec_replay_seen(x, spec);
 	if (spec->family == AF_INET6) {
 		memcpy(spec->src.ip6, x->props.saddr.a6, sizeof(spec->src.ip6));
 		memcpy(spec->dst.ip6, x->id.daddr.a6, sizeof(spec->dst.ip6));
@@ -6638,6 +6713,9 @@ static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
  * follows retires them, so an SA can run past its hard limit by up to one
  * period plus the retirement's own latency.
  *
+ * The replay state goes back the same way, in both directions: SEC numbers
+ * and checks the frames, so xfrm's own copy never moves unless this moves it.
+ *
  * There is deliberately no xdo_dev_state_update_stats(). Most of its callers
  * hold x->lock or xfrm_state_lock -- the state timer, xfrm_state_check_expire(),
  * state dumps -- so it cannot sleep for the control mutex, and the 64-bit
@@ -6681,6 +6759,100 @@ static bool ft_ipsec_seq_exhausting(const struct xfrm_state *x, u64 oseq)
 	       oseq >= (1ULL << 32) - FT_IPSEC_SEQ_HEADROOM;
 }
 
+/* Tell xfrm where an outbound SA's sequence space stands.
+ *
+ * Packet offload never advances xfrm's own copy -- SEC numbers the frames --
+ * so it would stay wherever the SA was installed, and whatever carries a
+ * state's sequence number on reads that copy: XFRM_MSG_GETAE, which a keying
+ * daemon reads to carry the number over when it re-adds an SA at a new
+ * address, and the clone xfrm_state_migrate() makes. Either would start the
+ * new SA over numbers its peer has already seen, and the peer drops every
+ * frame until they pass. Only forward, so a stale reading never undoes a
+ * value set by other means. Caller holds x->lock.
+ *
+ * The number goes back ahead of SEC's by twice what the SA sent in the last
+ * period (`sent`). SEC goes on numbering after this reading until the SA is
+ * deleted -- up to a period later, plus however long a daemon takes between
+ * reading the state and deleting it -- and a re-added SA that started behind
+ * that would reuse numbers. Skipping ahead costs the peer nothing: a gap in
+ * the sequence is what loss looks like to it. Twice covers a rate that rises
+ * into the next period; a burst out of idle in the last period before a
+ * re-add is the case it can still fall short on. The margin stops at the last
+ * number SEC will send, one below all-ones (SEC RM table 9-2).
+ */
+static void ft_ipsec_publish_oseq(struct xfrm_state *x, u64 oseq, u64 sent)
+{
+	struct xfrm_replay_state_esn *esn = x->replay_esn;
+	u64 last = x->props.flags & XFRM_STATE_ESN ? U64_MAX - 1 : U32_MAX - 1;
+
+	if (x->xso.dir != XFRM_DEV_OFFLOAD_OUT)
+		return;
+	oseq = oseq < last - min(last, 2 * sent) ? oseq + 2 * sent : last;
+	if (!esn) {
+		if (oseq > x->replay.oseq)
+			x->replay.oseq = oseq;
+	} else if (x->props.flags & XFRM_STATE_ESN) {
+		if (oseq > ((u64)esn->oseq_hi << 32 | esn->oseq)) {
+			esn->oseq = lower_32_bits(oseq);
+			esn->oseq_hi = upper_32_bits(oseq);
+		}
+	} else if (oseq > esn->oseq) {
+		esn->oseq = oseq;
+	}
+}
+
+/* Tell xfrm where an inbound SA's anti-replay window stands.
+ *
+ * SEC checks the frames, so the state's own window never moves either. Left
+ * alone it stays where the SA was installed, and a keying daemon that re-adds
+ * the SA from it anchors the new one there, where every number the old SA
+ * ever accepted counts as new -- each of them replayable once. What SEC's
+ * scorecard says goes into the state's bitmap instead, in xfrm's orientation
+ * (ft_ipsec_replay_bit()). Only forward: a window behind the state's is not
+ * applied, one level with it only adds what SEC has seen since, and one ahead
+ * replaces it. Caller holds x->lock.
+ */
+static void ft_ipsec_publish_window(struct xfrm_state *x,
+				    const struct cdx_ipsec_counters *counters)
+{
+	struct xfrm_replay_state_esn *esn = x->replay_esn;
+	u32 window = esn ? esn->replay_window : x->props.replay_window;
+	u32 top = lower_32_bits(counters->seq);
+	u64 now;
+	u32 k, bit;
+
+	if (!window || !counters->seq)
+		return;
+	if (!esn) {
+		if (counters->seq < x->replay.seq)
+			return;
+		if (counters->seq > x->replay.seq) {
+			x->replay.seq = top;
+			x->replay.bitmap = 0;
+		}
+		x->replay.bitmap |= counters->seen[0] &
+				    (window < 32 ? (1U << window) - 1 : ~0U);
+		return;
+	}
+	now = esn->seq;
+	if (x->props.flags & XFRM_STATE_ESN)
+		now |= (u64)esn->seq_hi << 32;
+	if (counters->seq < now)
+		return;
+	if (counters->seq > now) {
+		esn->seq = top;
+		if (x->props.flags & XFRM_STATE_ESN)
+			esn->seq_hi = upper_32_bits(counters->seq);
+		memset(esn->bmp, 0, esn->bmp_len * sizeof(esn->bmp[0]));
+	}
+	for (k = 0; k < min_t(u32, window, CDX_IPSEC_REPLAY_WINDOW_MAX); k++) {
+		if (!(counters->seen[k / 32] & (1U << (k % 32))))
+			continue;
+		bit = ft_ipsec_replay_bit(top, window, k);
+		esn->bmp[bit / 32] |= 1U << (bit % 32);
+	}
+}
+
 /* Publish one SA's counters into its state and let xfrm judge them.
  *
  * A VALID state only. One that is being deleted has nothing left to expire,
@@ -6693,6 +6865,7 @@ static void ft_ipsec_account(struct ft_ipsec_retirement *owned,
 			     const struct cdx_ipsec_counters *counters)
 {
 	struct xfrm_state *x = owned->x;
+	u64 carried = 0;
 
 	spin_lock_bh(&x->lock);
 	if (x->km.state != XFRM_STATE_VALID)
@@ -6706,9 +6879,14 @@ static void ft_ipsec_account(struct ft_ipsec_retirement *owned,
 		owned->published.bytes = counters->bytes;
 	}
 	if (counters->packets > owned->published.packets) {
-		x->curlft.packets += counters->packets - owned->published.packets;
+		carried = counters->packets - owned->published.packets;
+		x->curlft.packets += carried;
 		owned->published.packets = counters->packets;
 	}
+	if (x->xso.dir == XFRM_DEV_OFFLOAD_OUT)
+		ft_ipsec_publish_oseq(x, counters->oseq, carried);
+	else
+		ft_ipsec_publish_window(x, counters);
 	/* An SA that has carried nothing has nothing to judge, and asking
 	 * anyway would stamp use_time on it -- the moment its use-based
 	 * lifetimes count from. */

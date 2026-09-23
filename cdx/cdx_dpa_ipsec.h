@@ -108,6 +108,7 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info);
 int cdx_ipsec_delete_fp_entry(PSAEntry pSA);
 void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow);
 u64 get_oseq_from_sa(PSAEntry sa);
+void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen);
 
 #ifdef CDX_DEBUG_KEY_ZEROING
 /* H2 regression tripwire — see cdx_dpa_ipsec.c for design rationale.

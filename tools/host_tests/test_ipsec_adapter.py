@@ -25,6 +25,7 @@ def test_ipsec_adapter(tmp_path):
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     policy = (kernel / "net/xfrm/xfrm_policy.c").read_text()
     state = (kernel / "net/xfrm/xfrm_state.c").read_text()
+    replay = (kernel / "net/xfrm/xfrm_replay.c").read_text()
     # The real descriptions, not restatements of them. A field added to the
     # SA spec, to the rule or to the watch has to fail here rather than
     # compile into a harness that no longer matches what the adapter keeps.
@@ -51,8 +52,10 @@ def test_ipsec_adapter(tmp_path):
         "ft_ipsec_mark", "ft_ipsec_neigh_moved", "ft_ipsec_route_moved",
         "ft_ipsec_all_moved", "ft_ipsec_device_moved", "ft_ipsec_egress_changed",
         "ft_ipsec_watch_add", "ft_ipsec_watch_del", "ft_ipsec_watch_flush",
-        "ft_ipsec_peer_mac", "ft_ipsec_next_hop", "ft_ipsec_spec",
-        "ft_ipsec_seq_exhausting", "ft_ipsec_account", "ft_ipsec_stats_work",
+        "ft_ipsec_peer_mac", "ft_ipsec_next_hop",
+        "ft_ipsec_replay_bit", "ft_ipsec_replay_seen", "ft_ipsec_spec",
+        "ft_ipsec_seq_exhausting", "ft_ipsec_publish_oseq",
+        "ft_ipsec_publish_window", "ft_ipsec_account", "ft_ipsec_stats_work",
         "ft_xdo_state_add", "ft_ipsec_retire_work",
         "ft_ipsec_watch_find", "ft_ipsec_watch_stale", "ft_ipsec_follow_work",
         "ft_xdo_state_delete", "ft_xdo_policy_add",
@@ -71,6 +74,13 @@ def test_ipsec_adapter(tmp_path):
         + function(state, "xfrm_state_check_expire").replace(
             "int xfrm_state_check_expire(",
             "static int kernel_xfrm_state_check_expire(", 1)
+        # xfrm's own replay window, in all three of its modes: the oracle
+        # for which bit the adapter reads and writes for which number.
+        + "\n".join(function(replay, name) for name in (
+            "xfrm_replay_seqhi", "xfrm_replay_check_legacy",
+            "xfrm_replay_check_bmp", "xfrm_replay_check_esn", "xfrm_replay_check",
+            "xfrm_replay_advance_bmp", "xfrm_replay_advance_esn",
+            "xfrm_replay_advance"))
         +
         # The neighbour wait's own bounds, which decide whether an install
         # waits at all; a harness inventing them would assert nothing.
@@ -141,17 +151,33 @@ def test_ipsec_receive_ownership(tmp_path):
 
 
 def test_ipsec_backend(tmp_path):
-    """What the backend reports of SEC's per-SA counters and sequence number,
-    compiled from the backend and the PDB reader it relies on."""
+    """What the backend accepts of an SA's sequence space and anti-replay
+    window, and what it reports of SEC's per-SA counters and sequence number,
+    compiled from the backend and the PDB code it relies on."""
     backend = (ROOT / "cdx/cdx_ipsec_backend.c").read_text()
     header = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
     control = (ROOT / "cdx/control_ipsec.h").read_text()
     sec = (ROOT / "cdx/cdx_dpa_ipsec.c").read_text()
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    pdb = (kernel / "drivers/crypto/caam/pdb.h").read_text()
+    layout = (ROOT / "cdx/dpa_ipsec.h").read_text()
+    decap = re.search(r"struct ipsec_decap_pdb \{.*?\n\}[^;\n]*;", pdb, re.S).end()
     (tmp_path / "ipsec_backend_types.inc").write_text(
-        re.search(r"^struct cdx_ipsec_counters \{.*?^\};", header, re.S | re.M).group()
-        + "\n" + "\n".join(re.findall(
-            r"^#define\s+(?:SA_ALLOW_EXT_SEQ_NUM|CDX_DPA_IPSEC_(?:IN|OUT)BOUND)\s.*$",
-            control, re.M)) + "\n")
+        header[header.index("#define CDX_IPSEC_KEY_MAX"):
+               header.index("/* SA operations run inside")]
+        + "\n".join(re.findall(
+            r"^#define\s+(?:SA_ALLOW_(?:EXT_SEQ_NUM|SEQ_ROLL)|SA_REPLAY_SEEN_WORDS|"
+            r"CDX_DPA_IPSEC_(?:IN|OUT)BOUND)\s.*$",
+            control, re.M))
+        # SEC's own option values and PDB layout, and the shared descriptor
+        # CDX lays out around it -- not restatements of them.
+        + "\n" + "\n".join(re.findall(r"^#define\s+PDBOPTS_ESP_(?:ARS\w*|ESN)\s.*$", pdb, re.M))
+        + "\n" + pdb[pdb.index("struct ipsec_encap_cbc {"):decap]
+        + "\n" + re.search(r"^#define MAX_SHARED_DESC_SIZE\s.*$", layout, re.M).group()
+        + "\n" + layout[layout.index("struct desc_hdr {"):
+                        layout.index("/* For all Buffer pools")]
+        + "\n")
     (tmp_path / "ipsec_backend_production.inc").write_text(
         re.search(r"^struct cdx_ipsec_sa \{.*?^\};", backend, re.S | re.M).group() + "\n"
         + "\n".join(re.findall(r"^#define CDX_IPSEC_(?:SAMPLE_TRIES|BYTES_STEP_MAX)\s.*$",
@@ -159,7 +185,16 @@ def test_ipsec_backend(tmp_path):
         + re.search(r"^#define CDX_IPSEC_OSEQ_TRIES\s.*$", sec, re.M).group() + "\n"
         + function(sec, "cdx_ipsec_next_esn")
         + function(sec, "get_oseq_from_sa")
+        # Renamed, so the harness can land SEC's stores between two reads.
+        + function(sec, "get_replay_from_sa").replace(
+            "void get_replay_from_sa(", "static void sec_get_replay_from_sa(", 1)
+        + function(sec, "cdx_ipsec_ars")
+        + "\n".join(re.findall(r"^#define\s+SEQ_NUM_(?:HI|LOW)_MASK\s.*$", sec, re.M)) + "\n"
+        + function(sec, "cdx_ipsec_build_in_replay")
+        + function(backend, "cdx_ipsec_set_sequence")
+        + function(backend, "cdx_ipsec_validate")
         + function(backend, "cdx_ipsec_sa_sample")
+        + function(backend, "cdx_ipsec_sa_replay_sample")
         + function(backend, "cdx_ipsec_sa_bytes_believable")
         + function(backend, "cdx_ipsec_sa_stats"))
     binary = tmp_path / "ipsec_backend"

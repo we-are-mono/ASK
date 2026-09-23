@@ -1,5 +1,5 @@
-/* The IPsec backend's view of what SEC counted, compiled from
- * cdx/cdx_ipsec_backend.c and cdx/cdx_dpa_ipsec.c.
+/* The IPsec backend's view of an SA's sequence space and of what SEC counted,
+ * compiled from cdx/cdx_ipsec_backend.c and cdx/cdx_dpa_ipsec.c.
  *
  * SEC keeps an SA's counters in its shared descriptor and rewrites them by DMA
  * after every frame. Two things about that are worth proving off the
@@ -10,6 +10,10 @@
  * read itself is scripted here, so a case can hand it the torn values a race
  * produces. The sequence number is read by the real function, from a PDB laid
  * out and byte-ordered the way SEC keeps it.
+ *
+ * Going the other way, what the backend accepts of a starting sequence number
+ * and an anti-replay window, and which of SEC's three windows a width is
+ * carried on, with the PDB option values taken from the kernel's own header.
  */
 #include <assert.h>
 #include <stdbool.h>
@@ -22,6 +26,34 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef uint16_t __be16;
+typedef uint32_t __be32;
+
+#define ETH_ALEN 6
+#define AF_INET 2
+#define AF_INET6 10
+#define EINVAL 22
+#define EOPNOTSUPP 95
+#define U32_MAX ((u32)~0U)
+#define U64_MAX ((u64)~0ULL)
+
+union nf_inet_addr {
+	u32 all[4];
+	__be32 ip;
+	__be32 ip6[4];
+};
+struct net_device;
+
+static bool is_zero_ether_addr(const u8 *a)
+{
+	static const u8 zero[ETH_ALEN];
+
+	return !memcmp(a, zero, ETH_ALEN);
+}
+
+/* The port question is the backend's too, but not this harness's: every
+ * case here names a port that can carry an SA. */
+static bool cdx_ipsec_port_supported(struct net_device *dev) { return dev; }
 
 /* SEC on this SoC is big-endian, and the PDB builder writes it through
  * cpu_to_caam32(); the reader undoes that with caam32_to_cpu(). */
@@ -38,16 +70,13 @@ typedef uint64_t u64;
 static void (*before_load)(void);
 #define READ_ONCE(x) (before_load ? before_load() : (void)0, (x))
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define __force
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
+/* The real PDB structures and shared descriptor layout, from the kernel's
+ * pdb.h and cdx/dpa_ipsec.h. */
 #include "ipsec_backend_types.inc"
 
-/* The PDB's sequence words, where the encapsulation PDB keeps them. */
-struct sec_descriptor {
-	struct {
-		u32 seq_num_ext_hi;
-		u32 seq_num;
-	} pdb_en;
-};
 typedef struct {
 	struct sec_descriptor *sec_desc;
 } DpaSecSAContext, *PDpaSecSAContext;
@@ -55,13 +84,28 @@ typedef struct {
 	u8 direction;
 	u16 flags;
 	u16 stats_offset;
+	u64 seq;
+	u16 replay_window;
+	u32 replay_seen[SA_REPLAY_SEEN_WORDS];
 	PDpaSecSAContext pSec_sa_context;
 } SAEntry, *PSAEntry;
 typedef struct { int unused; } RouteEntry;
-struct net_device;
 
 static bool transaction = true;
 static void cdx_ft_assert_held(void) { assert(transaction); }
+
+/* SEC's reader, compiled from cdx_dpa_ipsec.c, with a hook that can store
+ * into the PDB between two of the backend's reads, the way SEC does. */
+static void sec_get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen);
+static void (*between_reads)(void);
+static unsigned replay_reads;
+static void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen)
+{
+	replay_reads++;
+	sec_get_replay_from_sa(sa, seq, seen);
+	if (between_reads)
+		between_reads();
+}
 
 /* What the descriptor holds, and what a racing read sees instead. A scripted
  * reading is consumed once; with none left the descriptor reads as it is. */
@@ -358,6 +402,266 @@ static void test_sequence(void)
 	assert(!c.packets && !c.bytes && !c.oseq);
 }
 
+/* Which of SEC's windows a width is carried on. */
+static void test_replay_window(void)
+{
+	SAEntry sa = { .direction = CDX_DPA_IPSEC_INBOUND };
+
+	/* Anti-replay off is off, whatever width is recorded. */
+	sa.flags = SA_ALLOW_SEQ_ROLL;
+	sa.replay_window = 64;
+	assert(cdx_ipsec_ars(&sa) == PDBOPTS_ESP_ARSNONE);
+
+	/* An SA whose creator named no width -- the legacy owner -- keeps the
+	 * 64 entries it always had. */
+	sa.flags = 0;
+	sa.replay_window = 0;
+	assert(cdx_ipsec_ars(&sa) == PDBOPTS_ESP_ARS64);
+
+	/* Each of SEC's widths as itself, and anything between them on the
+	 * next wider: never a narrower window than was asked for. */
+	for (unsigned w = 1; w <= 128; w++) {
+		u32 ars;
+
+		sa.replay_window = w;
+		ars = cdx_ipsec_ars(&sa);
+		if (w <= 32)
+			assert(ars == PDBOPTS_ESP_ARS32);
+		else if (w <= 64)
+			assert(ars == PDBOPTS_ESP_ARS64);
+		else
+			assert(ars == PDBOPTS_ESP_ARS128);
+		assert((ars & PDBOPTS_ESP_ARS_MASK) == ars);
+	}
+}
+
+/* The spec's sequence space reaches the SA the PDB builders read, and an
+ * inbound SA's window reaches the ARS bits. */
+static void test_set_sequence(void)
+{
+	struct cdx_ipsec_sa_spec spec;
+	SAEntry sa;
+
+	/* Outbound: the last number sent, which the PDB builder seeds SEC one
+	 * past. The window is not an outbound SA's. */
+	memset(&spec, 0, sizeof(spec));
+	memset(&sa, 0, sizeof(sa));
+	spec.dir = CDX_IPSEC_DIR_OUT;
+	spec.seq = (2ULL << 32) | 5;
+	spec.replay_window = 64;
+	spec.replay_seen[0] = 0xffff;
+	cdx_ipsec_set_sequence(&sa, &spec);
+	assert(sa.seq == ((2ULL << 32) | 5) && sa.replay_window == 0);
+	assert(!sa.replay_seen[0]);
+
+	/* Inbound: the highest received, the window, which SEC then keeps at
+	 * the width that covers it, and the scorecard it starts from, word for
+	 * word in the PDB's own numbering. */
+	memset(&sa, 0, sizeof(sa));
+	spec.dir = CDX_IPSEC_DIR_IN;
+	spec.seq = 900;
+	spec.replay_window = 32;
+	spec.replay_seen[0] = 0x80000005;
+	spec.replay_seen[3] = 0x1;
+	cdx_ipsec_set_sequence(&sa, &spec);
+	assert(sa.seq == 900 && sa.replay_window == 32);
+	assert(sa.replay_seen[0] == 0x80000005 && sa.replay_seen[3] == 1);
+	assert(cdx_ipsec_ars(&sa) == PDBOPTS_ESP_ARS32);
+
+	/* A zero width reaches the PDB as anti-replay off, through the flag
+	 * the cache create sets from it -- not as the legacy default. */
+	memset(&sa, 0, sizeof(sa));
+	sa.flags = SA_ALLOW_SEQ_ROLL;
+	spec.replay_window = 0;
+	cdx_ipsec_set_sequence(&sa, &spec);
+	assert(cdx_ipsec_ars(&sa) == PDBOPTS_ESP_ARSNONE);
+}
+
+/* Where an inbound SA's window stands, read back from the decapsulation PDB
+ * as SEC keeps it: big-endian words, the newest number in the least
+ * significant bit of the first scorecard word. */
+static SAEntry *inbound_entry;
+static unsigned stores_left;
+static void sec_stores_again(void)
+{
+	/* SEC takes another frame: the number moves on, and the scorecard
+	 * with it. */
+	if (!stores_left)
+		return;
+	stores_left--;
+	pdb.pdb_dec.seq_num = cpu_to_caam32(caam32_to_cpu(pdb.pdb_dec.seq_num) + 1);
+	pdb.pdb_dec.anti_replay[0] = cpu_to_caam32(
+		(caam32_to_cpu(pdb.pdb_dec.anti_replay[0]) << 1) | 1);
+}
+
+/* The replay state an inbound SA's PDB is built with, word for word in SEC's
+ * byte order, and read back as it went in. */
+static void test_replay_seed(void)
+{
+	SAEntry in = { .direction = CDX_DPA_IPSEC_INBOUND,
+		       .pSec_sa_context = &context,
+		       .seq = 5000, .replay_window = 64,
+		       .replay_seen = { 0x8000000b, 0x40000001, 0xffffffff, 0x2 } };
+	struct ipsec_decap_pdb *dec = &pdb.pdb_dec;
+	u32 seen[SA_REPLAY_SEEN_WORDS];
+	u64 seq;
+
+	/* Without ESN: the low word only, the width's ARS bits, and the
+	 * scorecard with the newest number in the least significant bit of
+	 * its first word. */
+	memset(&pdb, 0, sizeof(pdb));
+	cdx_ipsec_build_in_replay(&in, dec);
+	assert(caam32_to_cpu(dec->seq_num) == 5000 && !dec->seq_num_ext_hi);
+	assert(dec->options == PDBOPTS_ESP_ARS64);
+	assert(caam32_to_cpu(dec->anti_replay[0]) == 0x8000000b &&
+	       caam32_to_cpu(dec->anti_replay[1]) == 0x40000001 &&
+	       caam32_to_cpu(dec->anti_replay[2]) == 0xffffffff &&
+	       caam32_to_cpu(dec->anti_replay[3]) == 0x2);
+	get_replay_from_sa(&in, &seq, seen);
+	assert(seq == 5000 && !memcmp(seen, in.replay_seen, sizeof(seen)));
+
+	/* With ESN: the high word too, and the ESN option. */
+	memset(&pdb, 0, sizeof(pdb));
+	in.flags = SA_ALLOW_EXT_SEQ_NUM;
+	in.seq = (3ULL << 32) | 7;
+	in.replay_window = 128;
+	cdx_ipsec_build_in_replay(&in, dec);
+	assert(caam32_to_cpu(dec->seq_num) == 7 &&
+	       caam32_to_cpu(dec->seq_num_ext_hi) == 3);
+	assert(dec->options == (PDBOPTS_ESP_ESN | PDBOPTS_ESP_ARS128));
+	get_replay_from_sa(&in, &seq, seen);
+	assert(seq == ((3ULL << 32) | 7) &&
+	       !memcmp(seen, in.replay_seen, sizeof(seen)));
+
+	/* Anti-replay off: no window and no scorecard, whatever the SA
+	 * carried. */
+	memset(&pdb, 0, sizeof(pdb));
+	in.flags = SA_ALLOW_SEQ_ROLL;
+	in.seq = 9;
+	cdx_ipsec_build_in_replay(&in, dec);
+	assert(dec->options == PDBOPTS_ESP_ARSNONE);
+	for (unsigned int i = 0; i < SA_REPLAY_SEEN_WORDS; i++)
+		assert(!dec->anti_replay[i]);
+	memset(&pdb, 0, sizeof(pdb));
+}
+
+static void test_replay_read(void)
+{
+	SAEntry in = { .direction = CDX_DPA_IPSEC_INBOUND,
+		       .pSec_sa_context = &context, .stats_offset = 40 };
+	struct cdx_ipsec_sa sa = { .entry = &in };
+	struct cdx_ipsec_counters c;
+
+	inbound_entry = &in;
+	memset(&pdb, 0, sizeof(pdb));
+	script_reset();
+	descriptor.packets = descriptor.bytes = 0;
+	pdb.pdb_dec.seq_num = cpu_to_caam32(5000);
+	pdb.pdb_dec.seq_num_ext_hi = cpu_to_caam32(7);
+	pdb.pdb_dec.anti_replay[0] = cpu_to_caam32(0x0000000b);
+	pdb.pdb_dec.anti_replay[1] = cpu_to_caam32(0x80000000);
+	pdb.pdb_dec.anti_replay[3] = cpu_to_caam32(0x00000001);
+
+	/* The low word alone without ESN, the high one with it, and the
+	 * scorecard word for word: bit k of word k / 32 for seq - k. */
+	cdx_ipsec_sa_stats(&sa, &c);
+	assert(c.seq == 5000 && !c.oseq);
+	assert(c.seen[0] == 0xb && c.seen[1] == 0x80000000 &&
+	       !c.seen[2] && c.seen[3] == 1);
+	in.flags = SA_ALLOW_EXT_SEQ_NUM;
+	cdx_ipsec_sa_stats(&sa, &c);
+	assert(c.seq == ((7ULL << 32) | 5000));
+
+	/* Two readings that agree, taken while SEC stores between them: the
+	 * reading is retaken until it holds still. */
+	in.flags = 0;
+	replay_reads = 0;
+	stores_left = 2;
+	between_reads = sec_stores_again;
+	cdx_ipsec_sa_stats(&sa, &c);
+	assert(c.seq == 5002 && c.seen[0] == ((0xbU << 2) | 3));
+	assert(replay_reads == 4);
+
+	/* A window that never holds still is not reported at all, rather than
+	 * reported with a scorecard from another frame. */
+	stores_left = 100;
+	cdx_ipsec_sa_stats(&sa, &c);
+	assert(!c.seq && !c.seen[0] && !c.seen[1]);
+	between_reads = NULL;
+
+	/* Anti-replay off: SEC keeps no window, and none is read. */
+	in.flags = SA_ALLOW_SEQ_ROLL;
+	replay_reads = 0;
+	cdx_ipsec_sa_stats(&sa, &c);
+	assert(!c.seq && !replay_reads);
+	inbound_entry = NULL;
+}
+
+/* What the backend accepts of the sequence space and the window. */
+static void test_validate(void)
+{
+	static const u8 peer[ETH_ALEN] = { 2, 0, 0, 0, 0, 1 };
+	struct cdx_ipsec_sa_spec spec;
+
+	memset(&spec, 0, sizeof(spec));
+	spec.dev = (struct net_device *)&spec;
+	spec.spi = 0x1234;
+	spec.family = AF_INET;
+	spec.crypt.alg = 12;
+	spec.crypt.bits = 128;
+	spec.dir = CDX_IPSEC_DIR_IN;
+	assert(cdx_ipsec_validate(&spec) == 0);
+
+	/* Every window SEC can keep, and none wider: a narrower one would
+	 * drop late frames the configuration accepts. */
+	spec.replay_window = CDX_IPSEC_REPLAY_WINDOW_MAX;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.replay_window = CDX_IPSEC_REPLAY_WINDOW_MAX + 1;
+	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
+
+	/* An outbound SA checks nothing, so its window is no reason to refuse
+	 * it. */
+	spec.dir = CDX_IPSEC_DIR_OUT;
+	memcpy(spec.dst_mac, peer, ETH_ALEN);
+	spec.replay_window = 4096;
+	assert(cdx_ipsec_validate(&spec) == 0);
+
+	/* Without ESN the space is 32 bits, and an outbound SA needs one
+	 * number left to send: SEC starts one past the one it is given and
+	 * refuses to send FFFFFFFF (SEC RM table 9-2), so FFFFFFFD is the
+	 * last start that leaves one. */
+	spec.seq = U32_MAX - 2;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.seq = U32_MAX - 1;
+	assert(cdx_ipsec_validate(&spec) == -EINVAL);
+	spec.seq = U32_MAX;
+	assert(cdx_ipsec_validate(&spec) == -EINVAL);
+	spec.seq = (u64)U32_MAX + 1;
+	assert(cdx_ipsec_validate(&spec) == -EINVAL);
+
+	/* With ESN the high word is part of the number, and the all-ones
+	 * one is refused the same way. */
+	spec.esn = true;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.seq = U64_MAX - 2;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.seq = U64_MAX - 1;
+	assert(cdx_ipsec_validate(&spec) == -EINVAL);
+	spec.seq = U64_MAX;
+	assert(cdx_ipsec_validate(&spec) == -EINVAL);
+
+	/* An inbound SA may stand at the very top: that is where its window
+	 * starts, not a number it has to send. */
+	spec.dir = CDX_IPSEC_DIR_IN;
+	spec.replay_window = 64;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.esn = false;
+	spec.seq = U32_MAX;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.seq = (u64)U32_MAX + 1;
+	assert(cdx_ipsec_validate(&spec) == -EINVAL);
+}
+
 int main(void)
 {
 	test_packet_total();
@@ -365,6 +669,11 @@ int main(void)
 	test_implausible_bytes();
 	test_no_counters();
 	test_sequence();
+	test_replay_window();
+	test_set_sequence();
+	test_replay_seed();
+	test_replay_read();
+	test_validate();
 	printf("ipsec backend: ok\n");
 	return 0;
 }

@@ -449,6 +449,9 @@ computes, minus the serialisation:
 | NAT-T ports | `x->encap->encap_sport`/`encap_dport` |
 | Lifetimes | not passed: xfrm judges `x->lft` against the `x->curlft` the accounting pass publishes |
 | ESN | `x->props.flags & XFRM_STATE_ESN` |
+| Starting sequence number | `x->replay.oseq`/`seq`, or `x->replay_esn->oseq`/`seq` with `_hi` under ESN |
+| Inbound replay history | `x->replay.bitmap`, or the `x->replay_esn->bmp` ring |
+| Anti-replay window | `x->props.replay_window`, or `x->replay_esn->replay_window` |
 | Hardware cookie | written back to `x->xso.offload_handle` |
 
 The port's `NETIF_F_HW_ESP` feature bit is set here too, without which
@@ -614,6 +617,97 @@ entry off the owned list first. The pass takes `x->lock` only after it drops
 that lock, because deletion takes the two in the other order. Module exit
 cancels the pass after draining retirements; by then no SA is owned, since
 every offloaded state pins the module through its ops.
+
+#### The starting sequence number and the replay window
+
+The SA cache started every SA at sequence zero and gave every inbound SA a
+64-entry window, because FCI carried neither value. An outbound state installed
+with a non-zero `oseq` therefore sent numbers its peer had already seen, and
+the peer dropped every frame until the count passed them. That happens when a
+state is migrated, or re-added by a keying daemon that moves it to a new
+address. The inbound window ignored the configuration, including a window of
+zero, which turns anti-replay off.
+
+The spec now carries both values in xfrm's units. `seq` is the last number sent
+for an outbound SA, which the PDB builder seeds SEC one past, and the highest
+number received for an inbound one, where SEC anchors its window. The high word
+counts only under ESN. `replay_window` is the width in packets. The backend
+refuses a non-ESN number above 32 bits, and an outbound number with nothing left
+to send. SEC refuses to send the all-ones number (SEC RM table 9-2), so the
+last outbound number is `FFFFFFFE`, or `FFFFFFFF:FFFFFFFE` with ESN. A state
+whose `oseq` is one below that or higher is refused.
+
+The ESP decapsulation PDB offers three windows in its ARS bits: 32, 64 and 128
+entries. SEC's stand-alone anti-replay command takes any width up to 128, but
+the ESP protocol does not expose it. A width between two sizes is carried on the
+next larger one. That loses nothing: anti-replay refuses every sequence number
+it has already seen at any width, and the width only bounds how late an unseen
+frame may arrive and still be accepted. A narrower window would drop late
+frames the configuration accepts, so an inbound window wider than 128 is
+refused with an extack message rather than narrowed, as mlx5 refuses any width
+its hardware does not keep (`mlx5e_xfrm_validate_state()`). An outbound SA
+checks nothing, and its window is ignored. Zero clears the window: the backend
+passes it to the cache create as `SA_ALLOW_SEQ_ROLL`, and the PDB gets
+`ARSNONE`. SAs created over FCI keep their 64 entries.
+
+SEC numbers and checks the frames, so xfrm's own replay state never moves
+unless the accounting pass moves it. Anything that carries a state on reads
+that copy: `XFRM_MSG_GETAE`, which a keying daemon reads to carry the state over
+when it re-adds an SA at a new address (strongSwan's MOBIKE update does: GETAE,
+delete, add), and the clone `xfrm_state_migrate()` makes. So the pass publishes
+both directions back, forward only:
+
+- **Outbound**: SEC's last sequence number, plus twice what the SA sent in the
+  last period. SEC keeps numbering until the SA is deleted, up to a period
+  after the reading plus however long the daemon takes between GETAE and the
+  delete. A re-add that started behind that would reuse numbers, while skipping
+  ahead looks like loss to the peer and costs nothing. Twice covers a rate that
+  rises into the next period. A burst out of idle in the last period before a
+  re-add can still exceed it. A non-ESN SA stops at the end of its space.
+- **Inbound**: the decapsulation PDB's sequence number and scorecard, written
+  into `x->replay.seq` and its bitmap, or into `replay_esn->seq`, `seq_hi` and
+  the `bmp` ring. SEC keeps the newest number in the least significant bit of
+  its first scorecard word, and each bit to the left one older (SEC RM, IPsec
+  anti-replay). xfrm's ring keeps the newest at `(seq - 1) % window` and each
+  older one position before it. Without this, a re-add was anchored at zero,
+  and every number the old SA had ever accepted could be replayed once.
+
+In the other direction, a state added with inbound history seeds the PDB with
+it. The sequence number anchors SEC's window, and the bitmap becomes its
+scorecard, so a re-add carries on from where the old SA left off. Positions
+past the state's own window are history xfrm does not keep, while SEC's window
+may be wider. They are marked as seen, so SEC refuses as a replay what xfrm
+would have refused as too old.
+
+One case is open. With ESN, the PDB is seeded with the window top's high word.
+The SEC RM says SEC holds its own stored ESN back after a rollover until the
+whole window is past it ("Optional use of ESN in ESP decapsulation"). In the
+first window-width of numbers after a rollover, the stored ESN is therefore
+one below the top's. The RM does not say which value SEC expects of a window
+seeded inside that stretch, or how it tells that stretch from the start of a
+fresh SA, whose window also reaches below number zero. A wrong choice fails
+every frame's ICV. The rig settles it:
+
+1. Add an inbound ESN SA on the DUT with `replay-window 64 flag esn
+   replay-seq-hi 1 replay-seq 5 offload packet`. Give the peer's matching
+   outbound ESN SA `replay-oseq-hi 1 replay-oseq 5`, so that its next frames
+   are (1, 6), (1, 7), and so on. Send 20 frames through the tunnel.
+2. Do the same with `replay-seq 200` and `replay-oseq 200`, which is outside
+   the stretch. Both readings agree there, so this is the control.
+3. Add an inbound ESN SA seeded at (0, 0xffffffe0), which is outside the
+   stretch, with the peer starting at `replay-oseq-hi 0 replay-oseq
+   0xffffffe0`. Send frames across the rollover. After 10 post-rollover
+   frames, and again after 70, read the SA's replay state with
+   `ip xfrm state`. The pass publishes the PDB's numbers, so a top at
+   `seq_hi 1` after 10 frames means SEC stores the top's high word. A top still
+   at `seq_hi 0` until the window has passed means SEC stores the window
+   bottom's.
+
+In each step, count what the LAN side receives, and the SA's `failed` count in
+`ip -s xfrm state` with `XfrmInStateProtoError`. With the top's convention,
+every step delivers all its frames. With the bottom's, step 1 refuses all 20
+as ICV failures while step 2 delivers, and `cdx_ipsec_build_in_replay()` then
+has to seed `hi - 1` inside the stretch.
 
 ### 4. The slow path
 

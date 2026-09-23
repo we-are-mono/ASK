@@ -15,6 +15,14 @@ struct cdx_ipsec_sa;
  * cipher's nominal strength. */
 #define CDX_IPSEC_KEY_MAX 64
 
+/* The widest anti-replay window SEC keeps for an inbound SA, in packets. The
+ * ESP decapsulation PDB names three widths, 32, 64 and 128 (the ARS bits of
+ * its options byte); a narrower window is carried on the next wider one, and
+ * a wider one than this cannot be honoured at all. Such an SA is refused, as
+ * mlx5 refuses any width its hardware does not keep (mlx5e_xfrm_validate_state()),
+ * rather than narrowed. */
+#define CDX_IPSEC_REPLAY_WINDOW_MAX 128
+
 enum cdx_ipsec_dir {
 	CDX_IPSEC_DIR_IN,
 	CDX_IPSEC_DIR_OUT,
@@ -86,6 +94,26 @@ struct cdx_ipsec_sa_spec {
 	 * and the fragmentation check wants the SA's own bound. */
 	u16 mtu;
 	u16 dev_mtu;
+	/* Where the SA's sequence space stands, in the units xfrm keeps it:
+	 * the ESN high word included when the SA has one. For an outbound SA
+	 * it is the last sequence number sent, and SEC sends the one after it
+	 * first; for an inbound SA it is the highest received, where the
+	 * anti-replay window starts. Zero for a fresh SA. A migrated or
+	 * re-offered state carries on from where it was, rather than sending
+	 * numbers its peer has already seen. */
+	u64 seq;
+	/* The anti-replay window an inbound SA asked for, in packets. Zero
+	 * turns anti-replay off, which is what the legacy owner's
+	 * SA_ALLOW_SEQ_ROLL means. SEC keeps 32, 64 or 128 entries: a
+	 * narrower window is carried on the next wider one, and one wider
+	 * than CDX_IPSEC_REPLAY_WINDOW_MAX is refused. An outbound SA checks
+	 * nothing and ignores it. */
+	u32 replay_window;
+	/* Which sequence numbers an inbound SA has already received, at and
+	 * below seq: bit k of replay_seen[k / 32] stands for seq - k. All
+	 * clear for a fresh SA; a re-added state carries its history here,
+	 * so that nothing it accepted before can be accepted again. */
+	u32 replay_seen[CDX_IPSEC_REPLAY_WINDOW_MAX / 32];
 	/* The next hop toward the remote tunnel endpoint, for an outbound SA.
 	 *
 	 * An outbound SA needs egress framing at install time, because the
@@ -109,9 +137,6 @@ struct cdx_ipsec_sa_spec {
 	 * for these, so it is part of the SA's identity rather than a runtime
 	 * mode that can be turned on later. */
 	bool esn;
-	/* Anti-replay is being checked. False lets the sequence number roll,
-	 * which is what the legacy owner's SA_ALLOW_SEQ_ROLL means. */
-	bool replay;
 	/* Copy the inner header's DF bit to the outer one. Meaningful for an
 	 * IPv4 outbound tunnel and ignored otherwise. */
 	bool copy_df;
@@ -129,6 +154,14 @@ struct cdx_ipsec_counters {
 	 * has one, the low 32 bits alone when it does not. The number the SA
 	 * was installed with until the first frame; zero for an inbound SA. */
 	u64 oseq;
+	/* Where an inbound SA's anti-replay window stands: the highest
+	 * sequence number received, in the units xfrm's own seq counts, and
+	 * which numbers at and below it have been seen -- bit k of seen[k / 32]
+	 * stands for seq - k, over the widest window SEC keeps. SEC checks the
+	 * frames, so this is the only record of them. Zero when the SA is
+	 * outbound, checks nothing, or could not be read cleanly. */
+	u64 seq;
+	u32 seen[CDX_IPSEC_REPLAY_WINDOW_MAX / 32];
 };
 
 /* SA operations run inside the flowtable backend's transaction, taken with

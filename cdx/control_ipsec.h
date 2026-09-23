@@ -302,6 +302,10 @@ typedef struct _tSAID {
 #define SA_XFRM_OWNED		0x200
 #define SA_FQ_WAIT_B4_FREE	0x400 /* reserve 3 bits starting from 0x400 */
 
+/* Words of anti-replay scorecard in the ESP decapsulation PDB, enough for
+ * SEC's widest, 128-entry window (struct ipsec_decap_pdb's anti_replay). */
+#define SA_REPLAY_SEEN_WORDS	4
+
 #define SA_HDR_COPY_TOS  1
 #define SA_HDR_DEC_TTL   2
 #define SA_HDR_COPY_DF   4
@@ -404,6 +408,16 @@ typedef struct _tSAEntry {
 	U32 			route_id;
 	PRouteEntry 		pRtEntry;
 	U64 			seq;
+	/* The anti-replay window an inbound SA asked for, in packets, when
+	 * SA_ALLOW_SEQ_ROLL is clear. Zero when its creator did not say: FCI
+	 * never carried the width, so the legacy owner's SAs keep the
+	 * 64-entry window they always had. */
+	U16			replay_window;
+	/* The anti-replay scorecard an inbound SA starts from, in the
+	 * orientation SEC keeps it: bit k of word k / 32 stands for seq - k.
+	 * Clear unless its creator carried history in with it; the
+	 * decapsulation PDB holds SA_REPLAY_SEEN_WORDS of them. */
+	U32			replay_seen[SA_REPLAY_SEEN_WORDS];
 	U8                      enable_stats;
 	U8                      hdr_flags;          // copy DF,TOS  
 	U16                     stats_offset;
