@@ -15,14 +15,17 @@ from an address on its loopback. Each must arrive whole and in order, and the
 sink's count must come back through the tunnel; XfrmOutError must not move;
 and SEC must have been handed at least one frame per full-size segment. The
 splat window fails the test on the warning. A kprobe on the software
-segmentation must count more for each transfer than for a quiet window, so
-the test cannot pass on a path that never built a GSO packet.
+segmentation must count more during each transfer than a quiet window's rate
+accounts for over the same time, so the test cannot pass on a path that never
+built a GSO packet.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import time
 
 from ask_orch.client import Agent
 from ask_orch.uart import Console
@@ -46,7 +49,8 @@ PATTERN = bytes(range(256)) * 258
 TRACING = "/sys/kernel/tracing"
 PROBE = "ask_ipsec_gso"
 ENABLE = f"{TRACING}/events/kprobes/{PROBE}/enable"
-QUIET = 3
+# Seconds of the quiet window the other windows' noise is judged by.
+QUIET = 5
 
 
 def sender(source):
@@ -104,11 +108,16 @@ async def gso_hits(console):
     return next(int(line.split()[1]) for line in text.splitlines() if line.split()[:1] == [PROBE])
 
 
-async def since(console, start):
-    """PROBE's hits since `start`, and the count to measure the next window
-    from."""
-    now = await gso_hits(console)
-    return now - start, now
+async def gso_mark(console):
+    """PROBE's hits so far, and when they were read."""
+    return await gso_hits(console), time.monotonic()
+
+
+async def gso_window(console, mark):
+    """PROBE's hits and the seconds elapsed since `mark`, and the mark to
+    measure the next window from."""
+    now = await gso_mark(console)
+    return {"hits": now[0] - mark[0], "seconds": now[1] - mark[1]}, now
 
 
 async def offloads(r, iface):
@@ -151,6 +160,12 @@ async def test_offloaded_tunnel_carries_bulk_tcp(rig):
             await asyncio.to_thread(console.login, "root", None)
             probe = enabled = False
             try:
+                # A run that died before its cleanup leaves the probe behind,
+                # and adding it again fails with EEXIST; an enabled probe
+                # cannot be removed.
+                await console_command(console, "sh", "-c", f"if [ -e {ENABLE} ]; then "
+                                      f"echo 0 > {ENABLE} && echo '-:{PROBE}' >> "
+                                      f"{TRACING}/kprobe_events; fi")
                 await console_command(console, "sh", "-c", f"echo 'p:{PROBE} __skb_gso_segment' >> "
                                                            f"{TRACING}/kprobe_events")
                 probe = True
@@ -158,17 +173,17 @@ async def test_offloaded_tunnel_carries_bulk_tcp(rig):
                 enabled = True
                 # Read on the console, so the agent's own replies over TCP
                 # are not counted; the quiet window counts whatever else is.
-                hits = await gso_hits(console)
+                mark = await gso_mark(console)
                 await asyncio.sleep(QUIET)
-                gso["quiet"], hits = await since(console, hits)
+                gso["quiet"], mark = await gso_window(console, mark)
                 result = await lan_run_python(r.lan, sender(r.lan_ip), timeout=90,
                                               label="ipsec_offload_tcp")
                 assert result.rc == 0, result.stdout
                 transfers["forwarded"] = json.loads(result.stdout.strip().splitlines()[-1])
-                gso["forwarded"], hits = await since(console, hits)
+                gso["forwarded"], mark = await gso_window(console, mark)
                 result = await console_python(console, sender(DUT_INNER), timeout=90)
                 transfers["local"] = console_json(result["stdout"].strip())
-                gso["local"], hits = await since(console, hits)
+                gso["local"], mark = await gso_window(console, mark)
             finally:
                 if enabled:
                     await console_command(console, "sh", "-c", f"echo 0 > {ENABLE}", check=False)
@@ -176,6 +191,11 @@ async def test_offloaded_tunnel_carries_bulk_tcp(rig):
                     await console_command(console, "sh", "-c", f"echo '-:{PROBE}' >> "
                                                                f"{TRACING}/kprobe_events", check=False)
         moved = {name: value - before[name] for name, value in (await counters(r)).items()}
+        # Each transfer's floor is what the quiet window's rate would have
+        # counted over that transfer's own length, and one more.
+        noise = gso["quiet"]["hits"] / gso["quiet"]["seconds"]
+        for name in ("forwarded", "local"):
+            gso[name]["floor"] = math.floor(noise * gso[name]["seconds"]) + 1
         record = {"transfers": transfers, "received": sink.received, "moved": moved, "gso": gso}
         r.record("ipsec-offload-tcp", record)
 
@@ -183,8 +203,9 @@ async def test_offloaded_tunnel_carries_bulk_tcp(rig):
             assert transfers[name] == {"sent": TOTAL, "reply": str(TOTAL)}, record
             assert sink.received.get(source) == {"bytes": TOTAL, "intact": True}, record
         # Each transfer put GSO packets through the software segmentation,
-        # beyond what a quiet window of the same probe counts.
-        assert gso["forwarded"] > gso["quiet"] and gso["local"] > gso["quiet"], record
+        # beyond what the rest of the DUT does in the same time.
+        for name in ("forwarded", "local"):
+            assert gso[name]["hits"] >= gso[name]["floor"], record
         assert moved["out_error"] == 0, record
         # Every byte left in a frame SEC encrypted, one ESP per segment: at
         # least a frame per full-size segment of both transfers.
