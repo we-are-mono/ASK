@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A250.** SA peer lookups dropped the output mark, VRF, protocol and NAT-T ports (plain ESP took stale ports), so hardware and Linux could pick different next hops —
+  fixed (_:/^xfrm: route plain ESP without the stack's leftovers for ports_).
+
 - [x] **A248.** A transport-mode SA's frames were given the tunnel's DPOVRD, so SEC encrypted their IP header, named IPIP in the trailer and no peer could decode them —
   fixed (_:/^sdk_dpaa: describe a transport-mode frame's own IP header to SEC_).
 

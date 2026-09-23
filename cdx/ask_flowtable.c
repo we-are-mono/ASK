@@ -7155,7 +7155,8 @@ static void ft_mr_rows(struct seq_file *seq)
  * same way it answers it for a flow.
  *
  * The lookup is the ordinary FIB with the context the kernel's own route to
- * the peer has, and no more: the SA's output mark and its port's VRF, as
+ * the peer has, and no more: the SA's output mark, the protocol and ports its
+ * frames leave with (struct ft_ipsec_route) and its port's VRF, as
  * xfrm_dev_peer_route() asks. A missing route or an unresolved neighbour is a
  * refusal rather than something to retry, because packet offload has no
  * software fallback to wait in.
