@@ -153,7 +153,7 @@ struct sk_buff;
 struct qman_fq;
 struct dpa_qdisc_ops {
 	u16 (*select_queue)(struct net_device *dev, struct sk_buff *skb);
-	struct qman_fq *(*txq_fq)(void *qm_ctx, u16 txq);
+	struct qman_fq *(*txq_fq)(void *qm_ctx, u16 txq, struct sk_buff *skb);
 	void (*class_stats)(void *qm_ctx, u64 *data);
 };
 
@@ -169,11 +169,14 @@ struct nf_conn { u32 mark; };
 #define htons(v)	((u16)((((u16)(v)) >> 8) | (((u16)(v)) << 8)))
 struct iphdr { u8 tos; };
 struct ipv6hdr { u8 dsfield; };
+struct sock;
 struct sk_buff {
 	struct nf_conn *ct;
 	u16 protocol;		/* big-endian, as the kernel keeps it */
 	u8 tos;			/* the whole dsfield, as a header carries it */
 	bool short_header;	/* too short to read the network header */
+	int skb_iif;		/* the ingress a forwarded frame arrived on */
+	struct sock *sk;	/* the gateway's own frames carry their socket */
 };
 struct qman_fq { unsigned channel, quenum; };
 static struct nf_conn *nf_ct_get(struct sk_buff *skb, enum ip_conntrack_info *info)
@@ -502,7 +505,7 @@ static void mutex_unlock(mutex_t *m) { assert(*m); *m = 0; }
 /* The ops table is file-scope data rather than a function, so the harness
  * builds its own from the production callbacks it does compile. */
 static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb);
-static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq);
+static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb);
 static void cdx_htb_class_stats(void *qm_ctx, u64 *data);
 static const struct dpa_qdisc_ops cdx_htb_qdisc_ops = {
 	.select_queue = cdx_htb_select_queue,
@@ -546,8 +549,12 @@ static void reset_world(void)
 	memset(chan_eir, 0, sizeof(chan_eir));
 	memset(gQMCtx, 0, sizeof(gQMCtx));
 	memset(cdx_htb_ports, 0, sizeof(cdx_htb_ports));
-	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++)
+	/* As cdx_htb_init() leaves them: zero is a channel and a leaf slot, so
+	 * the maps have to be published as saying none. */
+	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++) {
 		INIT_LIST_HEAD(&cdx_htb_ports[ii].classes);
+		cdx_htb_publish(&cdx_htb_ports[ii]);
+	}
 	devices[0].priv.qm_ctx = &gQMCtx[3];
 	devices[1].priv.qm_ctx = &gQMCtx[4];
 	gQMCtx[3].net_dev = &devices[0];
@@ -1082,15 +1089,23 @@ static void test_software_path(void)
 	memset(dscp_classes, 0, sizeof(dscp_classes));
 
 	/* And the Tx path resolves the pair back out of the queue index. */
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid10) == &class_fqs[0][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11) == &class_fqs[0][NUM_PQS - 2]);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2) == &class_fqs[1][NUM_PQS - 1]);
-	/* Ordinary queues are not leaf classes, and neither is a slot no class
-	 * holds; both send the frame down the path it took before. */
-	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, 0));
-	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES - 1));
-	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES + 3));
-	assert(!cdx_htb_txq_fq(NULL, qid10));
+	struct sk_buff own = { .ct = NULL };
+	struct nf_conn plain = { .mark = 0 };
+	struct sk_buff forwarded = { .ct = &plain, .skb_iif = 5 };
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid10, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11, &own) == &class_fqs[0][NUM_PQS - 2]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2, &own) == &class_fqs[1][NUM_PQS - 1]);
+	/* An ordinary queue, or a slot no class holds, carries a frame that
+	 * named no leaf -- and on a port with a tree that frame is the tree's
+	 * to place too, never the driver's mark-based guess. The gateway's own
+	 * frame takes the top channel's control queue; a forwarded, tracked
+	 * one takes class queue 0 there, where the hardware puts its flow. */
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[1][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES - 1, &forwarded) ==
+	       &class_fqs[1][0]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES + 3, &own) ==
+	       &class_fqs[1][NUM_PQS - 1]);
+	assert(!cdx_htb_txq_fq(NULL, qid10, &own));
 
 	/* Deleting a leaf that is not the last one takes its class off the map,
 	 * and the leaf that moved into the hole answers for the hole -- with
@@ -1100,8 +1115,8 @@ static void test_software_path(void)
 	assert(moved == 11);
 	assert(pick(dev, (2 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 2)) == qid2);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2) == &class_fqs[0][NUM_PQS - 2]);
-	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, qid11));
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2, &own) == &class_fqs[0][NUM_PQS - 2]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11, &own) == &class_fqs[1][NUM_PQS - 1]);
 	/* Channel 2 stays claimed for the next class under the root, so the
 	 * mark that names "whichever channel this port owns" still resolves the
 	 * way ceetm_get_egressfq() resolves it: to that channel, which now
@@ -1111,17 +1126,149 @@ static void test_software_path(void)
 	assert(!destroy(dev));
 	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES);
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
-	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES));
+	/* No tree, no opinion: the driver's own resolution is back. */
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES, &own));
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &forwarded));
 	assert_balanced(dev);
 
-	/* With no classifier registered nothing here has an opinion, which is
-	 * what leaves a CMM port's Tx path exactly as it was. */
+	/* With no classifier registered no mark is decoded, and no frame is put
+	 * on a leaf's queue. The tree still owns the port, though, so every
+	 * frame still lands on one of its queues rather than wherever the
+	 * driver's mark field would have sent it. */
 	cdx_unregister_ft_qos_class();
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &forwarded) == &class_fqs[0][0]);
 	assert(!destroy(dev));
 	assert_balanced(dev);
+}
+
+/* Traffic that names no leaf, on a port whose tree is live.
+ *
+ * It used to go wherever the driver's mark field said: class queue 7 for every
+ * frame with no mark, a queue no leaf configured and eligible only for excess
+ * tokens. With rate equal to ceil a channel has none except what its classes
+ * leave over, so one saturated leaf starved the gateway's own frames, and the
+ * same flow sat on queue 7 in software and queue 0 in hardware. Now both
+ * paths resolve it the same way, onto a queue the tree keeps eligible for
+ * committed tokens, and `default' is honoured. */
+static void test_unclassified(void)
+{
+	struct net_device *dev = &devices[0];
+	struct tQM_context_ctl *ctx = dev->priv.qm_ctx;
+	struct nf_conn plain = { .mark = 0 };
+	struct nf_conn stray = { .mark = (u32)((1 << 4) | 3) << 8 };	/* no leaf holds it */
+	struct sk_buff own = { .ct = NULL };
+	struct sk_buff own_tracked = { .ct = &plain };
+	struct sk_buff forwarded = { .ct = &plain, .skb_iif = 5 };
+	struct sk_buff forwarded_stray = { .ct = &stray, .skb_iif = 5 };
+	struct sk_buff bridged = { .ct = NULL, .skb_iif = 5 };
+	u16 qid1, qid10, qid20, qid17, qid2;
+	u32 channel, cq;
+
+	/* ---- no default: control on queue 7, unclassified on queue 0 ---- */
+	reset_world();
+	assert(!cdx_register_ft_qos_class(test_qos_class));
+	channel = 0; cq = 0;
+	assert(!cdx_htb_resolve_class(ctx, &channel, &cq));	/* no tree yet */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!to_inner(dev, 10, 1, 1, 0));			/* prio 1: queue 6 */
+	assert(!query(dev, 10, &qid10));
+	/* Both queues those frames take are eligible for the channel's
+	 * committed rate, configured as a leaf's would be. */
+	assert(cq_live[0][0] && cq_weight[0][0] == 0);
+	assert(cq_live[0][NUM_PQS - 1] && cq_weight[0][NUM_PQS - 1] == 0);
+	/* The gateway's own frames, and those conntrack never saw, take the
+	 * control queue; a forwarded, tracked frame takes queue 0 -- as does
+	 * one naming a class no leaf holds. */
+	assert(cdx_htb_select_queue(dev, &own) == DPA_SELECT_QUEUE_NONE);
+	assert(cdx_htb_select_queue(dev, &own_tracked) == DPA_SELECT_QUEUE_NONE);
+	assert(cdx_htb_select_queue(dev, &forwarded) == DPA_SELECT_QUEUE_NONE);
+	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(ctx, 3, &own_tracked) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(ctx, 3, &bridged) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(ctx, 3, &forwarded) == &class_fqs[0][0]);
+	assert(cdx_htb_txq_fq(ctx, 3, &forwarded_stray) == &class_fqs[0][0]);
+	/* And the hardware agrees: no class, or a class no leaf holds, is the
+	 * top channel's queue 0; a leaf's class is the leaf's. The channel is
+	 * in the mark's numbering both ways. */
+	channel = 0; cq = 0;
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == 0);
+	channel = 1; cq = 3;
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == 0);
+	channel = 0; cq = NUM_PQS - 2;
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == NUM_PQS - 2);
+	channel = 15; cq = 15;					/* no such channel */
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == 0);
+
+	/* A leaf on queue 0 (prio 7) is where the unclassified already went, so
+	 * it is now the class they land on in software too, from the leaf's
+	 * own Tx queue. The gateway's own frames stay on the control queue. */
+	assert(!add_leaf(dev, 17, 1, 7, 0, 0, 0, &qid17));
+	assert(cdx_htb_select_queue(dev, &forwarded) == qid17);
+	assert(cdx_htb_select_queue(dev, &forwarded_stray) == qid17);
+	assert(cdx_htb_select_queue(dev, &own) == DPA_SELECT_QUEUE_NONE);
+	/* It is the leaf's queue now, and deleting the leaf gives it back to
+	 * the unclassified: reset, then eligible again. */
+	assert(!del_leaf(dev, 17, NULL));
+	assert(cq_live[0][0] && cdx_htb_select_queue(dev, &forwarded) == DPA_SELECT_QUEUE_NONE);
+	/* A prio 0 leaf shares the control queue rather than displacing it. */
+	assert(!add_leaf(dev, 11, 1, 0, 0, 0, 0, NULL));
+	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(!del_leaf(dev, 11, NULL));
+	assert(cq_live[0][NUM_PQS - 1]);
+
+	/* A class under the root on a higher channel moves the top channel, and
+	 * the eligible queues move with it; the ones left behind are reset. */
+	assert(!add_leaf(dev, 2, 0, 3, 0, 1000, 1000, &qid2));	/* channel 1 */
+	assert(cq_live[1][0] && cq_live[1][NUM_PQS - 1]);
+	assert(!cq_live[0][0] && !cq_live[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[1][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(ctx, 3, &forwarded) == &class_fqs[1][0]);
+	assert(!destroy(dev));
+	assert_balanced(dev);
+
+	/* ---- a default leaf takes all of it ---- */
+	reset_world();
+	assert(!cdx_register_ft_qos_class(test_qos_class));
+	assert(!create(dev, 1, 20));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!to_inner(dev, 10, 1, 0, 0));			/* queue 7 */
+	assert(!query(dev, 10, &qid10));
+	/* Named before the leaf exists, as `tc qdisc add ... default 20' is:
+	 * nothing to honour until a leaf by that minor arrives. */
+	assert(cdx_htb_select_queue(dev, &forwarded) == DPA_SELECT_QUEUE_NONE);
+	assert(!add_leaf(dev, 20, 1, 2, 0, 0, 0, &qid20));	/* queue 5 */
+	/* Tracked or not, forwarded or the gateway's own, with no class or a
+	 * class no leaf holds: the default leaf, from its own Tx queue. */
+	assert(cdx_htb_select_queue(dev, &own) == qid20);
+	assert(cdx_htb_select_queue(dev, &own_tracked) == qid20);
+	assert(cdx_htb_select_queue(dev, &forwarded) == qid20);
+	assert(cdx_htb_select_queue(dev, &forwarded_stray) == qid20);
+	assert(cdx_htb_select_queue(dev, &bridged) == qid20);
+	/* A class a leaf does hold is still that leaf. */
+	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == qid10);
+	/* A frame caught on a direct queue anyway goes there too. */
+	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 3]);
+	/* The hardware resolves no class, and a class no leaf holds, to it. */
+	channel = 0; cq = 0;
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == NUM_PQS - 3);
+	channel = 1; cq = 3;
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == NUM_PQS - 3);
+	channel = 1; cq = NUM_PQS - 1;
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == NUM_PQS - 1);
+	/* Deleting the default leaf takes it back to queue 0. */
+	assert(!del_leaf(dev, 20, NULL));
+	channel = 0; cq = 0;
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == 0);
+	assert(cdx_htb_select_queue(dev, &own) == DPA_SELECT_QUEUE_NONE);
+	assert(!destroy(dev));
+	assert_balanced(dev);
+	cdx_unregister_ft_qos_class();
+	assert(allocations == 0);
 }
 
 /* ethtool asks for a fixed number of values and gets one for every leaf slot,
@@ -1505,6 +1652,7 @@ int main(void)
 	test_depth_and_limits();
 	test_channel_reuse();
 	test_software_path();
+	test_unclassified();
 	test_class_statistics();
 	test_red();
 	test_queue_budget();

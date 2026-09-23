@@ -40,6 +40,7 @@ import statistics
 import struct
 import threading
 import time
+from urllib.parse import urlsplit
 
 import pytest
 import pytest_asyncio
@@ -61,6 +62,9 @@ PORT_EF, PORT_BE, PORT_EF_SOFTWARE = PORT + 5, PORT + 6, PORT + 7
 PORT_POLICED = PORT + 8
 PORT_EGRESS = PORT + 9
 PORT_EF_BEFORE, PORT_EF_MOVED = PORT + 10, PORT + 11
+PORT_SATURATE = PORT + 12
+PORT_UNCLASSIFIED_SW, PORT_UNCLASSIFIED_HW = PORT + 13, PORT + 14
+PORT_DEFAULT = PORT + 15
 PORTS_LAST = PORT + 19
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
@@ -1162,6 +1166,258 @@ async def test_flowtable_qos_dscp_remark_rewrites_the_wire(qos):
     restored = {name: (await read(r.target, r.session, parameters + name)).strip()
                 for name in original}
     assert restored == original, (original, restored)
+
+
+# ---- traffic that names no leaf ---------------------------------------------
+
+async def dut_ping(r, address, count, interval="0.01"):
+    """Ping from the DUT itself, over its console: the gateway's own frames,
+    which no flow and no mark describes. Returns (sent, received)."""
+    result = await console_command(r.console, "ping", "-c", str(count), "-i", interval,
+                                   "-W", "1", address, check=False,
+                                   timeout=int(count * float(interval)) + 30)
+    match = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received",
+                      result["stdout"])
+    assert match, result["stdout"]
+    return int(match.group(1)), int(match.group(2))
+
+
+async def handshakes(host, port, count, timeout=1.0):
+    """Open `count` fresh TCP connections from here and count the ones that
+    completed their handshake within `timeout`."""
+    completed = 0
+    for _ in range(count):
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        except (OSError, asyncio.TimeoutError):
+            continue
+        completed += 1
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+    return completed
+
+
+async def test_flowtable_qos_saturated_leaf_starves_no_control_traffic(qos):
+    """A leaf held saturated by an offloaded flow leaves the gateway's own
+    traffic untouched.
+
+    The tree is on the WAN port: one channel at the cap, rate equal to ceil,
+    and one prio 1 leaf that four offloaded TCP streams from the LAN VM keep
+    backlogged. A channel whose rate is its ceil has no excess rate, and its
+    shaper is coupled, so a queue eligible for excess tokens only transmits
+    when the classes leave committed ones unused -- which a backlogged leaf
+    never does. The gateway's own frames once went to exactly such a queue,
+    and starved. They now take the top channel's control queue, eligible for
+    committed tokens and above every leaf in priority: the DUT pings this host
+    with no loss worth the name, and fresh TCP handshakes with the DUT's agent,
+    whose answers leave by the shaped port, all complete.
+    """
+    r = qos
+    dev = TARGET_WAN_IF
+    target = f"{WAN_IP}:{PORT_SATURATE}"
+    agent = urlsplit(r.target.base_url)
+    await tree(r, dev, CAP_MBIT, [("1:10", LOW_PRIO)])
+    await offload(r, f"ip saddr {r.lan_ip} ip daddr {WAN_IP} tcp dport {PORT_SATURATE} "
+                     f"ct mark set {r.mark(LOW_CQ):#x} flow add @fast")
+    route = f"{WAN_IP}/32"
+    client = f'''
+import json, subprocess
+route = {route!r}
+existing = json.loads(subprocess.check_output(['ip', '-j', 'route', 'show', 'exact', route], text=True))
+assert not existing, existing
+subprocess.run(['ip', 'route', 'add', route, 'via', {r.lan_gateway!r}, 'dev', {LAN_NIC!r},
+                'mtu', '1500'], check=True)
+try:
+    result = subprocess.run(['iperf3', '-c', {WAN_IP!r}, '-B', {r.lan_ip!r},
+                             '-p', {str(PORT_SATURATE)!r}, '-P', '4', '-t', '20'],
+                            capture_output=True, text=True, timeout=60)
+finally:
+    subprocess.run(['ip', 'route', 'del', route, 'dev', {LAN_NIC!r}])
+print(json.dumps({{'rc': result.returncode, 'stderr': result.stderr[-400:]}}))
+'''
+    server = await asyncio.create_subprocess_exec(
+        "iperf3", "-s", "-1", "-B", WAN_IP, "-p", str(PORT_SATURATE),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    transfer = None
+    try:
+        await asyncio.sleep(0.3)
+        assert server.returncode is None, "the endpoint iperf3 did not start"
+        transfer = asyncio.create_task(lan_run_python(r.lan, client, label="flowtable_qos_saturate",
+                                                      timeout=90))
+        deadline = time.monotonic() + 10
+        while True:
+            state = await r.state()
+            bulk = [f for f in directions(state, ingress=TARGET_LAN_IF, proto=6, dst=target)
+                    if int(f["bytes"]) > 1_000_000]
+            if len(bulk) == 4:
+                break
+            assert not transfer.done() and time.monotonic() < deadline, state
+            await asyncio.sleep(0.25)
+        await asyncio.sleep(SETTLE)
+        first = await egress(r, dev)
+        pinged = await dut_ping(r, WAN_IP, 200)
+        connected = await handshakes(agent.hostname, agent.port, 20)
+        second = await egress(r, dev)
+        during = await r.state()
+    finally:
+        sender = await transfer if transfer else None
+        if server.returncode is None:
+            server.terminate()
+        await asyncio.wait_for(server.wait(), 10)
+    saturated = leaf_delta(first, second, 0)
+    rows = directions(during, ingress=TARGET_LAN_IF, proto=6, dst=target)
+    r.record("qos-unclassified-saturated", {"leaf": saturated, "pinged": pinged,
+                                            "connected": connected, "rows": rows,
+                                            "sender": sender.stdout if sender else None})
+
+    # The leaf really was held full by the offloaded flow, in hardware.
+    assert len(rows) == 4 and all(int(f["qos"], 16) == LOW_CQ for f in rows), rows
+    assert saturated["rejected"] > 0, saturated
+    slack = timing_slack(first, second)
+    assert shaped_bps(first, second, 0) >= (0.9 - slack) * CAP_MBIT * 1e6, saturated
+    # And the gateway's own traffic got through beside it.
+    sent, received = pinged
+    assert sent == 200 and received >= 198, pinged
+    assert connected == 20, connected
+
+
+async def test_flowtable_qos_unclassified_flow_keeps_its_queue_when_offloaded(qos):
+    """An unmarked flow's frames land on the same queue in software and in
+    hardware, and the gateway's own frames on the control queue.
+
+    With no `default`, a forwarded frame that names no class goes where the
+    hardware has always put its flow: the top channel's class queue 0. A prio 7
+    leaf holds that queue, so its counters see both halves of an unmarked flow
+    -- the frames the CPU forwards before admission, and the frames the
+    classifier forwards after -- exactly. The software half once went to class
+    queue 7 instead. The DUT's own pings take class queue 7, which the prio 0
+    leaf holds, and none of them reach queue 0.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    frame = 256 + UDP_HEADERS
+    target = f"{r.lan_ip}:{PORT_UNCLASSIFIED_HW}"
+    await tree(r, dev, CAP_MBIT, [("1:10", HIGH_PRIO), ("1:17", 7)])
+    # Only the second port is offered to the flowtable: the first stays in
+    # software for good.
+    await offload(r, f"ip saddr {WAN_IP} ip daddr {r.lan_ip} udp dport {PORT_UNCLASSIFIED_HW} "
+                     f"flow add @fast")
+    await lan_start(r, echo=[PORT_UNCLASSIFIED_SW, PORT_UNCLASSIFIED_HW])
+    forward, _ = await admit(r, PORT_UNCLASSIFIED_HW)
+
+    async def burst(port):
+        before = await egress(r, dev)
+        echoed = await asyncio.to_thread(lockstep, r.lan_ip, port, COUNT)
+        after = await egress(r, dev)
+        return {"echoed": echoed, "unclassified": leaf_delta(before, after, 1),
+                "control": leaf_delta(before, after, 0),
+                "software_tx": after["software_tx"] - before["software_tx"]}
+
+    software = await burst(PORT_UNCLASSIFIED_SW)
+    hardware = await burst(PORT_UNCLASSIFIED_HW)
+    before = await egress(r, dev)
+    pinged = await dut_ping(r, r.lan_ip, COUNT)
+    after = await egress(r, dev)
+    final = await r.state()
+    rows = directions(final, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    r.record("qos-unclassified-queue", {"software": software, "hardware": hardware,
+                                        "pinged": pinged, "rows": rows, "forward": forward,
+                                        "ping_control": leaf_delta(before, after, 0),
+                                        "ping_unclassified": leaf_delta(before, after, 1)})
+
+    exact = {"frames": COUNT, "bytes": COUNT * frame, "rejected": 0}
+    assert software["echoed"] == hardware["echoed"] == COUNT, (software, hardware)
+    # Forwarded by the CPU: every frame on the unclassified queue.
+    assert software["software_tx"] >= COUNT, software
+    assert software["unclassified"] == exact, software
+    # Forwarded by the classifier, unmarked: the same queue, frame for frame.
+    assert int(forward["qos"], 16) == 0 and len(rows) == 1, (forward, rows)
+    assert rows[0]["cookie"] == forward["cookie"], (forward, rows)
+    assert hardware["unclassified"] == exact, hardware
+    assert hardware["software_tx"] <= COUNT // 4, hardware
+    # The gateway's own: the control queue, never the unclassified one.
+    assert pinged[0] == pinged[1] == COUNT, pinged
+    assert leaf_delta(before, after, 0)["frames"] >= COUNT, leaf_delta(before, after, 0)
+    assert leaf_delta(before, after, 1)["frames"] == 0, leaf_delta(before, after, 1)
+
+
+async def test_flowtable_qos_default_class_takes_unclassified_traffic(qos):
+    """`default` names the leaf everything unclassified takes, in both paths.
+
+    A tree built with `default 20`: an unmarked flow offloaded at three times
+    the cap is shaped on leaf 1:20 -- its classifier entry resolves the missing
+    class to that leaf -- and every frame the CPU sends on the port meanwhile,
+    the iperf3 control connection's handshake included, lands there too. The
+    DUT's own pings do as well, as they would under software HTB. The prio 0
+    leaf beside it sees none of it.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    target = f"{r.lan_ip}:{PORT_DEFAULT}"
+    rate = f"{CAP_MBIT}mbit"
+    await r.tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "offload",
+               "default", "20")
+    await r.tc("class", "add", "dev", dev, "parent", "1:", "classid", "1:1",
+               "htb", "rate", rate, "ceil", rate)
+    for classid, prio in (("1:10", HIGH_PRIO), ("1:20", 2)):
+        await r.tc("class", "add", "dev", dev, "parent", "1:1", "classid", classid,
+                   "htb", "rate", rate, "ceil", rate, "prio", str(prio))
+    await offload(r, inbound(r, "udp", PORT_DEFAULT))
+    await lan_start(r, iperf=[PORT_DEFAULT])
+    before = await egress(r, dev)
+    client = asyncio.create_task(iperf(r, PORT_DEFAULT, udp_mbit=OFFERED_MBIT))
+    try:
+        await asyncio.sleep(SETTLE)
+        first = await egress(r, dev)
+        installed = await r.state()
+        await asyncio.sleep(WINDOW)
+        second = await egress(r, dev)
+        report = await client
+    finally:
+        if not client.done():
+            client.cancel()
+            await asyncio.gather(client, return_exceptions=True)
+    await asyncio.sleep(0.5)
+    after = await egress(r, dev)
+    pinged = await dut_ping(r, r.lan_ip, COUNT)
+    pinged_after = await egress(r, dev)
+    state = await r.state()
+    forward = directions(state, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    early = directions(installed, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    whole = leaf_delta(before, after, 1)
+    r.record("qos-default-class", {"installed": installed, "state": state, "whole": whole,
+                                   "window": leaf_delta(first, second, 1),
+                                   "other": leaf_delta(before, after, 0),
+                                   "pinged": pinged,
+                                   "ping_default": leaf_delta(after, pinged_after, 1),
+                                   "ping_other": leaf_delta(after, pinged_after, 0),
+                                   "report": report})
+
+    cap = CAP_MBIT * 1e6
+    assert len(forward) == 1 and len(early) == 1, (early, forward)
+    row = forward[0]
+    assert int(row["qos"], 16) == 0 and early[0]["cookie"] == row["cookie"], (early, row)
+    assert report["end"]["sum_sent"]["bits_per_second"] >= 2 * cap, report["end"]["sum_sent"]
+    # Shaped on the default leaf, at the cap: in hardware, since nothing else
+    # carries this much.
+    slack = timing_slack(first, second)
+    shaped = shaped_bps(first, second, 1)
+    assert (0.95 - slack) * cap <= shaped <= (1.03 + slack) * cap, (shaped, cap, slack)
+    # Every frame of the flow the classifier matched, and every frame the CPU
+    # sent on the port -- the control connection's handshake among them --
+    # is on the default leaf, dequeued or rejected. The other leaf saw none.
+    extra = whole["frames"] + whole["rejected"] - int(row["packets"])
+    assert 0 <= extra <= after["software_tx"] - before["software_tx"], (
+        whole, row["packets"], after["software_tx"] - before["software_tx"])
+    assert extra > 0, whole
+    assert leaf_delta(before, after, 0)["frames"] == 0, leaf_delta(before, after, 0)
+    # The gateway's own frames too.
+    assert pinged[0] == pinged[1] == COUNT, pinged
+    assert leaf_delta(after, pinged_after, 1)["frames"] >= COUNT, leaf_delta(after, pinged_after, 1)
+    assert leaf_delta(after, pinged_after, 0)["frames"] == 0, leaf_delta(after, pinged_after, 0)
 
 
 # ---- ingress policing ------------------------------------------------------

@@ -50,6 +50,40 @@ struct tQM_context_ctl { uint32_t chnl_map; };
 
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
 
+/* What a classifier entry hands cdx_get_txfqid(): a mark's egress pair, on a
+ * port whose driver state says whether CEETM is on. */
+#define ENABLE_EGRESS_QOS
+#define DPAA_FWD_TX_QUEUES	16
+#define ceetm_err(...)		do { } while (0)
+typedef uint32_t U32;
+#include "qosmark.inc"
+struct dpa_priv_s { bool ceetm_en; void *qm_ctx; };
+struct net_device { struct dpa_priv_s priv; };
+static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return &dev->priv; }
+struct eth_iface_info {
+    struct net_device *net_dev;
+    struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES];
+};
+/* A hardware qdisc owning the port, reduced to the answer it gives: whether
+ * it owns it, and where a mark with no class goes there. Its own resolution
+ * is compiled in htb_offload.c. */
+static bool tree_live;
+static uint32_t tree_channel, tree_cq;
+static unsigned tree_asked;
+static bool cdx_htb_resolve_class(struct tQM_context_ctl *qm_ctx, uint32_t *channel,
+                                  uint32_t *cq)
+{
+    assert(qm_ctx);
+    tree_asked++;
+    if (!tree_live)
+        return false;
+    if (!*channel && !*cq) {
+        *channel = tree_channel;
+        *cq = tree_cq;
+    }
+    return true;
+}
+
 #include "egress_fq_production.inc"
 
 static struct tQM_context_ctl port, other;
@@ -131,7 +165,43 @@ int main(void)
     qm_chnl_info[2].cq_info[5].pp_num = 0x07;
     assert(ceetm_egress_fqid(&port, 0, 5) == 0x07000456);
 
-    puts("CEETM egress fq: channel resolution, bounds, and an fqid reading "
-         "that leaves the queue alone");
+    /* ---- what a classifier entry is given ---- */
+
+    qm_chnl_info[2].cq_info[5].ceetmfq.egress_fq.fqid = 0x000456;
+    qm_chnl_info[2].cq_info[5].cq_shaper_enable = DISABLE_POLICER;
+    provide(2, 0, 0x000400, &port);
+    provide(0, 7, 0x000107, &port);
+    struct net_device dev = { .priv = { .ceetm_en = true, .qm_ctx = &port } };
+    struct eth_iface_info eth = { .net_dev = &dev };
+    union ctentry_qosmark none = { .markval = 0 }, named = { .markval = 0 };
+
+    named.chnl_id = 1;
+    named.queue = 7;
+    /* No qdisc: a mark with no class is the port's own channel, queue 0, as
+     * it has always been; a named pair is itself. */
+    tree_live = false;
+    assert(cdx_get_txfqid(&eth, &none) == 0x000400);
+    assert(cdx_get_txfqid(&eth, &named) == 0x000107);
+    /* A qdisc owns the port: the entry is built with what the tree says a
+     * class means there -- the default leaf, for no class -- which is the
+     * queue the software path puts the same flow's frames on. That covers
+     * every caller of this, flows, multicast members and SAs alike. */
+    tree_live = true;
+    tree_channel = 3;
+    tree_cq = 5;
+    tree_asked = 0;
+    assert(cdx_get_txfqid(&eth, &none) == 0x000456);
+    assert(cdx_get_txfqid(&eth, &named) == 0x000107);
+    assert(tree_asked == 2);
+    /* And the mark itself is never rewritten on the way. */
+    assert(!none.chnl_id && !none.queue && named.chnl_id == 1 && named.queue == 7);
+    /* Without CEETM on the port neither the tree nor the channels apply. */
+    dev.priv.ceetm_en = false;
+    eth.fwd_tx_fqinfo[7].fqid = 0x77;
+    tree_asked = 0;
+    assert(cdx_get_txfqid(&eth, &named) == 0x77 && !tree_asked);
+
+    puts("CEETM egress fq: channel resolution, bounds, an fqid reading that "
+         "leaves the queue alone, and the tree's answer for a classifier entry");
     return 0;
 }

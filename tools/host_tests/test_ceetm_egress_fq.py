@@ -28,9 +28,15 @@ def test_ceetm_egress_fq(tmp_path):
     compiler = os.environ.get("CC", "cc")
     assert shutil.which(compiler), f"C compiler required: {compiler}"
     source = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
-    names = ["ceetm_resolve_channel", "ceetm_get_egressfq", "ceetm_egress_fqid"]
+    names = ["ceetm_resolve_channel", "ceetm_get_egressfq", "ceetm_egress_fqid",
+             "cdx_get_txfqid"]
     (tmp_path / "egress_fq_production.inc").write_text(
         "\n".join(function(source, name) for name in names))
+    # The mark's layout as the encoder reads it, not a restatement of it.
+    union = re.search(r"union ctentry_qosmark \{.*?\n\};\n",
+                      (ROOT / "cdx/control_ipv4.h").read_text(), re.S)
+    assert union
+    (tmp_path / "qosmark.inc").write_text(union.group())
     binary = tmp_path / "ceetm_egress_fq"
     subprocess.run([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",

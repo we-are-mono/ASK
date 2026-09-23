@@ -79,8 +79,19 @@ Structure and Macro definitions
 #define CEETM_DEFA_BSIZE        0x2000
 /* default value to add for shaper calculations */
 #define CEETM_DEFA_OAL          24
-/* default priority of WBFQs as programmed from cmm, 0-6 */
-#define CEETM_DEFA_WBFQ_PRIORITY 0
+/* Where the weighted group sits among a channel's eight strict class queues,
+ * in the configuration numbering where 0 is the lowest (GET_CEETM_PRIORITY()
+ * inverts it for the hardware). One places the group directly above class
+ * queue 0 -- hardware CQ7 -- and below the six queues above that.
+ *
+ * Class queue 0 is where a frame that names no class goes on a port whose
+ * tree has no `default', in both paths, and it competes for committed tokens
+ * so that traffic cannot starve outright. Below it, as 0 placed the group, a
+ * backlogged unclassified flow pre-empted every weighted leaf on the channel;
+ * a weighted leaf is one that asked to share its level, not to wait for
+ * traffic nobody classified. A strict leaf at `prio 7' holds class queue 0 and
+ * so sits below the group too. */
+#define CEETM_DEFA_WBFQ_PRIORITY 1
 /* max values for shaper fields */
 #define CEETM_TOKEN_WHOLE_MAXVAL        0x7ff
 #define CEETM_TOKEN_FRAC_MAXVAL         0x1fff

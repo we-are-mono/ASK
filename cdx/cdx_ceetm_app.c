@@ -22,6 +22,7 @@
 #include "cdx_ceetm_gdef.h"
 #include "cdx_common.h"
 #include "cdx_flowtable_backend.h"
+#include "cdx_htb.h"
 
 /* The flowtable adapter decodes a conntrack mark into a channel and class
  * queue, and bounds the channel with its own constant because it must not
@@ -136,11 +137,20 @@ uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info)
 	uint32_t quenum;
 #ifdef ENABLE_EGRESS_QOS
 	struct dpa_priv_s *priv;
-	uint32_t fqid;
+	uint32_t fqid, channel, queue;
 
 	priv = netdev_priv(eth_info->net_dev);
 	if (priv->ceetm_en) {
-		fqid = ceetm_egress_fqid(priv->qm_ctx, qosmark->chnl_id, qosmark->queue);
+		/* On a port a hardware qdisc owns, the tree decides what a class
+		 * means: its leaf, or for no class and for a class no leaf holds
+		 * the queue unclassified traffic takes -- the default leaf, or
+		 * the top channel's class queue 0. That covers every rule built
+		 * here: flows, multicast members, SAs. Anywhere else the mark's
+		 * own pair is the answer, as it always was. */
+		channel = qosmark->chnl_id;
+		queue = qosmark->queue;
+		cdx_htb_resolve_class(priv->qm_ctx, &channel, &queue);
+		fqid = ceetm_egress_fqid(priv->qm_ctx, channel, queue);
 		if (!fqid)
 			ceetm_err("%s::unable to get ceetm fqid for markval %x\n",
 				__func__, qosmark->markval);

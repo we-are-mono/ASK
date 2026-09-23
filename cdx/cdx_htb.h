@@ -26,6 +26,13 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx);
 int cdx_htb_class_queue(struct net_device *dev, u32 classid, u8 *channel, u8 *cq,
 			struct netlink_ext_ack *extack);
 
+/* What an egress class means on a port a hardware qdisc owns, for the
+ * hardware path: the class's leaf, or where unclassified traffic goes for a
+ * class no leaf holds, so that a flow's rule agrees with its software frames.
+ * `channel' and `cq' are in a conntrack mark's numbering, in and out. Returns
+ * false, leaving them alone, on a port with no live tree. Lock-free. */
+bool cdx_htb_resolve_class(struct tQM_context_ctl *qm_ctx, u32 *channel, u32 *cq);
+
 /* The flowtable adapter's egress hook, for CDX's own callers; see struct
  * cdx_ft_egress_ops. The first never sleeps and needs no lock; the second
  * sleeps, and must not be called holding a lock the adapter's retirement work

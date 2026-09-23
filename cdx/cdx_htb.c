@@ -96,6 +96,33 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  */
 #define CDX_HTB_CQ_DEPTH	128
 
+/* Where a frame goes that names no leaf, on a port whose tree is live.
+ *
+ * Unclassified traffic -- no class in its mark, or a class no leaf holds --
+ * takes the leaf `default' names, as software HTB sends it there. With no
+ * default leaf it takes the top channel's class queue 0, the lowest strict
+ * priority: the queue the hardware has always resolved a mark with no class to
+ * (cdx_get_txfqid() with zero nibbles), so a flow's frames land on the same
+ * queue before and after it is offloaded.
+ *
+ * Frames the hardware never carries -- no conntrack, or the gateway's own --
+ * take the top channel's class queue 7, the highest strict priority, as the
+ * driver's own queue choice always gave them: ARP and neighbour discovery,
+ * PPPoE's LCP echoes, DHCP, the gateway's own sessions. A default leaf takes
+ * these too, as it does in software HTB.
+ *
+ * Unlike software HTB's direct queue, neither is unshaped: both sit on the top
+ * channel and so under its cap. That is deliberate. A link shaped to what the
+ * upstream will carry has to hold everything it sends to that rate, or the
+ * queue that builds is the upstream's, where no priority applies.
+ *
+ * Class queue 7 is not reserved: a prio 0 leaf on the top channel holds it,
+ * and control traffic then shares that leaf's queue -- the highest priority
+ * there is, which is what that traffic needs -- and appears in its counters.
+ */
+#define CDX_HTB_UNCLASSIFIED_CQ	0
+#define CDX_HTB_CONTROL_CQ	(NUM_PQS - 1)
+
 /* The WRED curve a RED qdisc on a leaf asked for, kept so it can be put back
  * after the class queue is configured afresh: ceetm_set_class_queue() starts
  * every queue on plain tail drop. */
@@ -141,14 +168,30 @@ struct cdx_htb_port {
 	u16 defcls;
 	u16 leaves;		/* qids in use, dense from CDX_HTB_QID_BASE */
 	bool live;
+	/* Class queues this file made eligible for the unclassified and
+	 * control traffic above while no leaf holds them, all on one channel
+	 * (NONE when there are none). Undone when the channel stops being the
+	 * top one or a leaf takes the queue. */
+	u8 implicit_channel;
+	u16 implicit;
 	/* What the Tx path reads, and the only part of this structure it may.
 	 * Plain byte arrays rather than a walk of the class list, because both
 	 * are read from ndo_select_queue and cpe_fp_tx without RTNL while that
 	 * list is being mutated under it. A reader racing a rebuild sees an old
-	 * byte or a new one, never a freed node. */
+	 * byte or a new one, never a freed node. The hardware path reads them
+	 * too, from cdx_get_txfqid(), for the same answer. */
 	u8 class_txq[CDX_HTB_CLASSES];		/* class -> leaf slot */
 	u8 txq_channel[CDX_HTB_MAX_LEAVES];	/* leaf slot -> CEETM channel */
 	u8 txq_cq[CDX_HTB_MAX_LEAVES];		/* leaf slot -> class queue */
+	/* The top channel, or NONE while no tree is live: which is also the
+	 * switch that tells both paths whether any of this applies. */
+	u8 top;
+	/* The leaf `default' names, as a slot, or NONE. */
+	u8 default_slot;
+	/* Where unclassified traffic goes, as channel << 8 | class queue: the
+	 * default leaf's pair, or the top channel's class queue 0. One word, so
+	 * a reader never pairs one channel with another's queue. */
+	u16 unclassified;
 };
 
 /* Indexed the way gQMCtx is, so a netdev's stashed QoS context names its
@@ -178,6 +221,11 @@ static struct cdx_htb_port *cdx_htb_port_of(struct net_device *dev)
 	if (port)
 		port->qm_ctx = priv->qm_ctx;
 	return port;
+}
+
+static const char *cdx_htb_port_name(struct cdx_htb_port *port)
+{
+	return port->qm_ctx && port->qm_ctx->net_dev ? port->qm_ctx->net_dev->name : "?";
 }
 
 static struct cdx_htb_class *cdx_htb_find(struct cdx_htb_port *port, u16 classid)
@@ -218,10 +266,13 @@ static bool cdx_htb_channel_owned(struct cdx_htb_port *port, u8 channel)
  * zero, and ceetm_get_egressfq() resolves that to the highest one it has. The
  * same answer has to come out here, or a flow the hardware put on a class
  * would take a different one in software. */
+static void cdx_htb_implicit_sync(struct cdx_htb_port *port, u8 top);
+
 static void cdx_htb_publish(struct cdx_htb_port *port)
 {
 	struct cdx_htb_class *cl;
-	u8 top = CDX_HTB_NONE;
+	u8 top = CDX_HTB_NONE, default_slot = CDX_HTB_NONE;
+	u16 unclassified;
 	unsigned int ii;
 
 	memset(port->class_txq, CDX_HTB_NONE, sizeof(port->class_txq));
@@ -229,6 +280,9 @@ static void cdx_htb_publish(struct cdx_htb_port *port)
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
 		if (port->channels & BIT(ii))
 			top = ii;
+	if (!port->live)
+		top = CDX_HTB_NONE;
+	unclassified = top << 8 | CDX_HTB_UNCLASSIFIED_CQ;
 	list_for_each_entry(cl, &port->classes, list) {
 		u8 slot;
 
@@ -242,6 +296,74 @@ static void cdx_htb_publish(struct cdx_htb_port *port)
 		WRITE_ONCE(port->class_txq[((cl->channel + 1) << 4) | cl->cq], slot);
 		if (cl->channel == top)
 			WRITE_ONCE(port->class_txq[cl->cq], slot);
+		if (port->defcls && cl->classid == port->defcls) {
+			default_slot = slot;
+			unclassified = cl->channel << 8 | cl->cq;
+		}
+	}
+	/* Class zero is the unclassified one, and the default leaf answers
+	 * for it; without one it stays whichever leaf holds the top channel's
+	 * class queue 0, which is where the hardware sends it too. */
+	if (default_slot != CDX_HTB_NONE)
+		WRITE_ONCE(port->class_txq[0], default_slot);
+	WRITE_ONCE(port->default_slot, default_slot);
+	WRITE_ONCE(port->unclassified, unclassified);
+	WRITE_ONCE(port->top, top);
+	cdx_htb_implicit_sync(port, top);
+}
+
+/* Keep the class queues unclassified and control traffic take on the top
+ * channel eligible for both of its token buckets while no leaf holds them.
+ *
+ * An unconfigured strict class queue is excess-eligible only, and a channel's
+ * excess tokens come only from committed ones its classes leave unused: the
+ * shaper is coupled, and a class with rate equal to ceil has no excess rate of
+ * its own. So a leaf that keeps its queue backlogged takes every token, and a
+ * queue left excess-only never transmits again -- the gateway's own ARP and
+ * LCP frames starve behind a saturated class, and a PPPoE session drops. Every
+ * queue a frame can be resolved to therefore competes for committed tokens
+ * too, which leaves strict priority deciding between them, as it does between
+ * leaves.
+ *
+ * Redone whole from cdx_htb_publish() after every change: the top channel
+ * moves when a class under the root claims a higher one, and a leaf can take
+ * either queue or give it back. A queue a leaf has taken was configured for
+ * that leaf and is the leaf's; it leaves this set without being reset.
+ */
+static void cdx_htb_implicit_sync(struct cdx_htb_port *port, u8 top)
+{
+	const u16 needed = BIT(CDX_HTB_UNCLASSIFIED_CQ) | BIT(CDX_HTB_CONTROL_CQ);
+	u8 channel = port->implicit_channel;
+	u16 want = 0, drop;
+	unsigned int cq;
+
+	if (top != CDX_HTB_NONE)
+		want = needed & ~port->cq_used[top];
+	if (channel != CDX_HTB_NONE) {
+		drop = channel == top ? port->implicit & ~want : port->implicit;
+		for (cq = 0; cq < NUM_PQS; cq++) {
+			if (!(drop & BIT(cq)))
+				continue;
+			port->implicit &= (u16)~BIT(cq);
+			if (port->cq_used[channel] & BIT(cq))
+				continue;
+			if (ceetm_reset_class_queue(channel, cq))
+				pr_warn("cdx: CEETM channel %u queue %u did not return to its defaults\n",
+					channel, cq);
+		}
+	}
+	port->implicit_channel = top;
+	for (cq = 0; cq < NUM_PQS; cq++) {
+		if (!(want & BIT(cq)) || (port->implicit & BIT(cq)))
+			continue;
+		/* Tried again at the next change if this fails: nothing about
+		 * the command that got here depends on it. */
+		if (ceetm_set_class_queue(top, cq, 0, CDX_HTB_CQ_DEPTH)) {
+			pr_warn("cdx: %s cannot make CEETM channel %u queue %u eligible; frames that name no class can starve there\n",
+				cdx_htb_port_name(port), top, cq);
+			continue;
+		}
+		port->implicit |= BIT(cq);
 	}
 }
 
@@ -354,11 +476,6 @@ static void cdx_htb_cq_release(struct cdx_htb_port *port, u8 channel, u8 cq)
 			channel, cq);
 }
 
-static const char *cdx_htb_port_name(struct cdx_htb_port *port)
-{
-	return port->qm_ctx->net_dev ? port->qm_ctx->net_dev->name : "?";
-}
-
 /* Give a leaf its RED curve back once its class queue has been configured
  * afresh, which always starts the queue on tail drop. A curve that will not go
  * back is dropped from the class too, so the qdisc stops reporting an offload
@@ -458,10 +575,12 @@ static int cdx_htb_create(struct cdx_htb_port *port, struct tc_htb_qopt_offload 
 	memset(port->cq_used, 0, sizeof(port->cq_used));
 	port->channels = 0;
 	port->leaves = 0;
+	port->implicit = 0;
+	port->implicit_channel = CDX_HTB_NONE;
 	port->major = opt->parent_classid;
-	/* Advisory until increment 4: unclassified software traffic does not
-	 * reach a leaf's Tx queue yet, it takes the class queue the hardware
-	 * layer resolves a zero mark to. */
+	/* The class unclassified traffic takes in both paths, from the moment
+	 * a leaf by that minor exists. Fixed for the qdisc's life: sch_htb
+	 * has no change operation to alter it with. */
 	port->defcls = opt->classid;
 	port->live = true;
 	cdx_htb_publish(port);
@@ -490,6 +609,10 @@ static void cdx_htb_destroy(struct cdx_htb_port *port)
 	port->channels = 0;
 	port->leaves = 0;
 	port->live = false;
+	/* Stopping reset every class queue of the port's channels and gave
+	 * the channels back, the implicit ones with them. */
+	port->implicit = 0;
+	port->implicit_channel = CDX_HTB_NONE;
 	/* Stop the Tx path naming a leaf before the queues stop existing. */
 	cdx_htb_publish(port);
 	if (cdx_htb_resize(port, 0))
@@ -1105,6 +1228,10 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 		cdx_htb_class_free(port, cl);
 	memset(port, 0, sizeof(*port));
 	INIT_LIST_HEAD(&port->classes);
+	/* Zero is a channel and a leaf slot, not "none": the maps the Tx path
+	 * reads have to say none explicitly. */
+	port->implicit_channel = CDX_HTB_NONE;
+	cdx_htb_publish(port);
 out:
 	mutex_unlock(&cdx_htb_mutex);
 }
@@ -1113,11 +1240,13 @@ out:
  * maps cdx_htb_publish() keeps.
  *
  * The class comes from the adapter's own classifier, registered below, so the
- * frame lands on the class the hardware rule would have given the same flow. No
- * classifier registered means nothing here has an opinion: the frame keeps the
- * queue the stack chose, and cpe_fp_tx() resolves it exactly as it did before
- * any of this existed. That is what CMM's ports do, and why enabling a qdisc
- * there builds a tree without changing how a frame reaches it.
+ * frame lands on the class the hardware rule would have given the same flow.
+ * With no classifier registered no mark is decoded, but a port with a live
+ * tree still answers for every frame through cdx_htb_txq_fq(): the driver's own
+ * resolution from skb->mark reads a different field in a different encoding,
+ * and on a port the tree owns it would pick queues the tree never configured.
+ * A port without a tree answers nothing, and cpe_fp_tx() resolves the frame as
+ * it did before any of this existed.
  */
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
 
@@ -1175,6 +1304,15 @@ static u8 cdx_htb_dscp_slot(struct cdx_htb_port *port, struct sk_buff *skb)
 	return READ_ONCE(port->class_txq[klass]);
 }
 
+/* A frame the hardware could carry: forwarded, and tracked. The gateway's own
+ * frames and anything conntrack never saw -- ARP, neighbour discovery, PPPoE
+ * discovery and LCP, frames bridged without netfilter -- are never offloaded,
+ * so they have no hardware rule whose queue they must agree with. */
+static bool cdx_htb_forwarded(struct sk_buff *skb, const struct nf_conn *ct)
+{
+	return ct && skb->skb_iif && !skb->sk;
+}
+
 static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 {
 	cdx_ft_qos_class_fn decode = READ_ONCE(cdx_ft_qos_class_func);
@@ -1209,29 +1347,100 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 		if (slot != CDX_HTB_NONE)
 			return CDX_HTB_QID_BASE + slot;
 	}
-	if (!ct)
-		return DPA_SELECT_QUEUE_NONE;
-	slot = READ_ONCE(port->class_txq[klass]);
+	slot = klass ? READ_ONCE(port->class_txq[klass]) : CDX_HTB_NONE;
+	/* Unclassified: no class, or one no leaf holds, which the hardware
+	 * resolves the same way (cdx_htb_resolve_class()). A default leaf takes
+	 * all of it, as software HTB's does. Without one only a frame the
+	 * hardware could carry takes class zero -- whichever leaf holds the
+	 * top channel's class queue 0, where the flow's rule will send it --
+	 * and everything else is left to cdx_htb_txq_fq(), on a direct queue. */
+	if (slot == CDX_HTB_NONE &&
+	    (READ_ONCE(port->default_slot) != CDX_HTB_NONE || cdx_htb_forwarded(skb, ct)))
+		slot = READ_ONCE(port->class_txq[0]);
 	if (slot == CDX_HTB_NONE)
 		return DPA_SELECT_QUEUE_NONE;
 	return CDX_HTB_QID_BASE + slot;
 }
 
-static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq)
+/* The frame queue a frame on Tx queue `txq' leaves by, or NULL when no tree is
+ * live on the port and the driver's own resolution applies.
+ *
+ * A leaf's queue names its class queue. Any other -- a direct queue, or a leaf
+ * slot that went away after the frame was put on it -- carries a frame that
+ * named no leaf, and it goes where unclassified traffic goes: the default leaf,
+ * or for a frame the hardware could carry the top channel's class queue 0, or
+ * for anything else the top channel's control queue. Every one of those is a
+ * queue this port owns and cdx_htb_implicit_sync() keeps eligible, so while
+ * the tree is live no frame is left to the driver's mark-based resolution. */
+static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb)
 {
 	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
-	u8 channel;
-	u16 slot;
+	enum ip_conntrack_info cinfo;
+	u8 top, channel, cq;
+	u16 slot, pair;
 
-	if (!port || txq < CDX_HTB_QID_BASE)
+	if (!port)
 		return NULL;
-	slot = txq - CDX_HTB_QID_BASE;
-	if (slot >= CDX_HTB_MAX_LEAVES)
+	top = READ_ONCE(port->top);
+	if (top == CDX_HTB_NONE)
 		return NULL;
-	channel = READ_ONCE(port->txq_channel[slot]);
-	if (channel == CDX_HTB_NONE)
-		return NULL;
-	return ceetm_class_fq(qm_ctx, channel, READ_ONCE(port->txq_cq[slot]));
+	if (txq >= CDX_HTB_QID_BASE) {
+		slot = txq - CDX_HTB_QID_BASE;
+		if (slot < CDX_HTB_MAX_LEAVES) {
+			channel = READ_ONCE(port->txq_channel[slot]);
+			if (channel != CDX_HTB_NONE)
+				return ceetm_class_fq(qm_ctx, channel,
+						      READ_ONCE(port->txq_cq[slot]));
+		}
+	}
+	if (READ_ONCE(port->default_slot) != CDX_HTB_NONE ||
+	    cdx_htb_forwarded(skb, nf_ct_get(skb, &cinfo))) {
+		pair = READ_ONCE(port->unclassified);
+		channel = pair >> 8;
+		cq = pair & 0xff;
+	} else {
+		channel = top;
+		cq = CDX_HTB_CONTROL_CQ;
+	}
+	return ceetm_class_fq(qm_ctx, channel, cq);
+}
+
+/* The (channel, class queue) a hardware entry on this port enqueues to for an
+ * egress class, when a live tree owns the port: the class's own leaf, or where
+ * unclassified traffic goes for a class no leaf holds -- the same answer the
+ * software path gives the same flow. False when no tree is live, which leaves
+ * the class's own reading in charge. The channel is in the mark's numbering on
+ * the way in and out: zero is the top channel, anything else one-based.
+ *
+ * Lock-free over the published maps, like the Tx path: a change to the tree
+ * retires every entry on the port, so one resolved against a map that was
+ * being rebuilt is replaced. */
+bool cdx_htb_resolve_class(struct tQM_context_ctl *qm_ctx, u32 *channel, u32 *cq)
+{
+	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
+	u8 top, slot = CDX_HTB_NONE, leaf_channel;
+	u16 pair;
+
+	if (!port)
+		return false;
+	top = READ_ONCE(port->top);
+	if (top == CDX_HTB_NONE)
+		return false;
+	if (*channel <= CDX_CEETM_MAX_CHANNELS && *cq < MAX_SCHEDULER_QUEUES &&
+	    (*channel || *cq))
+		slot = READ_ONCE(port->class_txq[*channel << 4 | *cq]);
+	if (slot != CDX_HTB_NONE && slot < CDX_HTB_MAX_LEAVES) {
+		leaf_channel = READ_ONCE(port->txq_channel[slot]);
+		if (leaf_channel != CDX_HTB_NONE) {
+			*channel = leaf_channel + 1;
+			*cq = READ_ONCE(port->txq_cq[slot]);
+			return true;
+		}
+	}
+	pair = READ_ONCE(port->unclassified);
+	*channel = (pair >> 8) + 1;
+	*cq = pair & 0xff;
+	return true;
 }
 
 /* The counters that describe accelerated traffic, in leaf-slot order. A slot no

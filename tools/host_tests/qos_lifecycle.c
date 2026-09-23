@@ -377,7 +377,19 @@ static struct cdx_port_info *get_dpa_port_info(char *name) { return &port; }
 #define qman_ceetm_ratio2wbfs(...) hw_step()
 #define qman_ceetm_set_queue_weight(...) hw_step()
 #define qman_ceetm_lfq_set_context(...) hw_step()
-#define qman_ceetm_channel_set_group(...) hw_step()
+/* Where the weighted group is placed among a channel's strict class queues,
+ * in the hardware's numbering: prio_a N puts group A after CQ N. Counted
+ * rather than kept per channel, because every placement has to be the same. */
+static unsigned group_a_placed, group_a_misplaced;
+static int qman_ceetm_channel_set_group(struct qm_ceetm_channel *channel, int group_b,
+                                        unsigned prio_a, unsigned prio_b)
+{
+    if (hw_step()) return -EIO;
+    assert(channel && !group_b && prio_a < 8);
+    group_a_placed++;
+    group_a_misplaced += prio_a != NUM_PQS - 2;
+    return 0;
+}
 #define qman_ceetm_ccg_set(...) hw_step()
 #define EVENT_QM 1
 static void M_qm_cmdproc(void) {}
@@ -430,6 +442,11 @@ int main(void)
     for (unsigned i = 1; i <= count; i++) { cycle(i); cycle(0); }
     fail_at = 0;
     assert(start() == 0);
+    /* The weighted group sits just above hardware CQ7, which is class queue
+     * 0: where unclassified traffic goes, and eligible for committed tokens,
+     * so below it a backlogged unclassified flow would pre-empt every
+     * weighted leaf on the channel. */
+    assert(group_a_placed >= CDX_CEETM_MAX_CHANNELS && !group_a_misplaced);
     struct net_device dev = {0};
     struct dpa_iface_info iface = {.name = "eth0", .eth_info = {&dev, 1}};
     port.portid = MAX_PHY_PORTS - 1;

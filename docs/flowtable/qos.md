@@ -421,7 +421,9 @@ byte. The **default class** is explicit: an unmarked flow resolves to CEETM
 queue 7, the lowest strict priority. That is the right answer for best-effort
 traffic, but only once it is chosen rather than inherited from `kzalloc`.
 Both are validated at load, because a boot-immutable parameter has exactly one
-moment to be rejected out loud.
+moment to be rejected out loud. (On a port with an HTB tree, the tree decides
+where a flow with no class goes — its `default` leaf if it has one; see
+[unclassified traffic](#unclassified-traffic) in increment 4.)
 
 *Proved on hardware, 2026-09-17.* Booted `ask.offload=flowtable` with
 `ask_flowtable.qos_mark_mask=0xf0` on the KASAN image, and marked every
@@ -554,7 +556,7 @@ queue and logical FQ at module load, so a tc class only ever decides which
 
 | HTB | CEETM | parameters |
 | --- | --- | --- |
-| qdisc root | the port, that is its LNI | `default` is recorded, and advisory until increment 4 |
+| qdisc root | the port, that is its LNI | `default` names the leaf unclassified traffic takes, in both paths ([increment 4](#unclassified-traffic)) |
 | class under the root | a channel bound to that port | `rate` → committed shaper, `ceil` → ceiling |
 | class under one of those | a class queue on that channel | `prio` → one of eight strict-priority queues, `quantum` → the weighted group instead |
 
@@ -581,7 +583,13 @@ weight of 1 to 255; there is no byte-deficit round robin to give a quantum to.
 A leaf that names one asks to share bandwidth at its priority level rather than
 to pre-empt, which is the weighted group; a leaf that does not gets a
 strict-priority queue of its own, and asking for a priority another class holds
-is an error rather than a silent demotion. A leaf's own `rate` and `ceil` have
+is an error rather than a silent demotion. The weighted group as a whole sits
+just above class queue 0: below every strict leaf of `prio 0` to `prio 6`, above
+a `prio 7` leaf and above the unclassified traffic that takes class queue 0
+([increment 4](#unclassified-traffic)). CMM's default placed it below class
+queue 0, which was harmless while that queue was excess-only; once it competes
+for committed tokens, a backlogged unclassified flow there would pre-empt every
+weighted leaf on the channel. A leaf's own `rate` and `ceil` have
 no hardware behind them — CEETM shapes channels, not queues — so what a leaf
 can change is where it sits among its siblings.
 
@@ -742,6 +750,68 @@ queues with one leaf class and sixteen again after teardown. Under
 alone. No KASAN, BUG, WARNING or lockdep output in either boot.
 
 *Effort: 3–4 days.*
+
+#### Unclassified traffic
+
+What the increment above left out is every frame that names no leaf: no class
+in its mark, a class no leaf holds, or no conntrack at all. Those kept the
+stack's queue choice, and `cpe_fp_tx()` then resolved them from `skb->mark` —
+a different field in a different encoding — to class queue 7 of the port's top
+channel. That queue is one no leaf configured, and an unconfigured strict class
+queue is eligible for excess tokens only. With rate equal to ceil a channel has
+no excess rate, and its shaper is coupled, so excess tokens exist only when the
+classes leave committed ones unused. **One saturated leaf therefore starved
+everything unclassified**: ARP and neighbour discovery, DHCP, PPPoE's LCP echoes
+(so the session dropped), the gateway's own traffic and every new handshake.
+Unmarked flows were split too — queue 7 in software before admission, queue 0
+in hardware after — and `default` was recorded and ignored.
+
+Both paths now resolve unclassified traffic the same way, with the tree
+deciding:
+
+| frame | with `default` | without |
+| --- | --- | --- |
+| no class, or a class no leaf holds, forwarded and tracked | the default leaf | the top channel's class queue 0 |
+| no conntrack, or the gateway's own | the default leaf | the top channel's class queue 7 |
+
+- **`default` is honoured**, as software HTB honours it and as mlx5 does. The
+  software path puts the frame on the default leaf's Tx queue; the hardware
+  path, in `cdx_get_txfqid()`, resolves a mark with no class — and one naming a
+  class no leaf holds — to the same leaf, which covers flows, multicast members
+  and SAs alike.
+- **Without one**, a frame the hardware could carry goes where the hardware has
+  always put its flow — class queue 0 of the top channel, the lowest strict
+  priority — so a flow no longer changes queue when it is offloaded. A leaf at
+  `prio 7` holds that queue and then counts both. Frames the hardware never
+  carries go to class queue 7 of the top channel, the highest priority, as the
+  driver's own choice always put them. **Class queue 7 is not reserved**: a
+  `prio 0` leaf on the top channel holds it, control traffic shares that leaf's
+  queue and appears in its counters, and it keeps the priority it needs.
+- **Every queue a frame can be resolved to competes for committed tokens.** The
+  tree makes the top channel's class queues 0 and 7 eligible for both token
+  buckets, at a leaf's depth, whenever no leaf holds them, and moves them when
+  a class under the root claims a higher channel. Strict priority then decides
+  between them and the leaves exactly as it does between leaves: control
+  traffic above everything, unclassified traffic below every leaf -- the
+  weighted group included, which is placed directly above class queue 0 for
+  that reason -- sharing its queue only with a `prio 7` leaf.
+- **None of it is unshaped.** Software HTB sends unclassified traffic with no
+  default to its direct queue, which bypasses the tree. Here it stays on the
+  top channel, under that channel's cap. That is deliberate: a link shaped to
+  what the upstream will carry has to hold everything it sends to that rate,
+  or the queue builds at the upstream, where no priority applies.
+- **The driver's mark-based resolution is unreachable on a port with a tree.**
+  `struct dpa_qdisc_ops.txq_fq` is handed the skb (patch 150) and answers for
+  ordinary Tx queues as well as leaf ones whenever the tree is live; only a
+  port without a tree answers `NULL` and falls back to `skb->mark` and the
+  legacy DSCP table. That also takes the legacy table's unlocked read off every
+  port a DSCP filter can be installed on.
+
+The consequence worth stating: without `default`, an unmarked forwarded flow is
+the lowest priority on its channel, so a saturated leaf of any higher priority
+still starves it — that is strict priority doing what it was asked. What no
+longer starves is the traffic that keeps the link and the gateway alive. A tree
+that should carry unmarked flows alongside a busy class names a `default`.
 
 ### 5. Hardware statistics through ethtool
 
