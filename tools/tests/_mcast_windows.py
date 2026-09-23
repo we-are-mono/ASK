@@ -276,16 +276,22 @@ async def kernel_mroute(r: MulticastRig, family: int, source: str, group: str, *
         await asyncio.sleep(0.2)
 
 
-async def learn(r: MulticastRig, configs: list[dict], installed, what: str) -> dict:
-    """Short bursts until the bridged learner has taken each stream's source.
+async def learn(r: MulticastRig, configs: list[dict], installed, what: str, *,
+                sender: str = "wan") -> dict:
+    """Short bursts until the learners have taken each stream.
 
-    A (*,G) membership has no key until traffic supplies one, and a frame
-    sent before the learner's hook is registered teaches it nothing, so this
-    keeps offering until the groups are installed."""
+    A (*,G) membership has no key until traffic supplies one, and a routed
+    group is carried only once Linux has been seen forwarding a copy of it to
+    every oif. A frame sent before either learner's hook is registered
+    teaches it nothing, so this keeps offering until the groups are
+    installed. A LAN `sender` offers them from behind the LAN port."""
     deadline = time.monotonic() + 15
     while True:
         primers = [{**config, "count": 8, "token": uuid.uuid4().hex} for config in configs]
-        await asyncio.to_thread(send_wire, primers, r.wire)
+        if sender == "lan":
+            await send_lan(r.lan, primers)
+        else:
+            await asyncio.to_thread(send_wire, primers, r.wire)
         state = await r.proc()
         if installed(state):
             return state

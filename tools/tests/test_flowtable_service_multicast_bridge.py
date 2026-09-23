@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 
 import pytest
 import pytest_asyncio
@@ -543,11 +544,19 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
                            'grp', group, 'vid', str(ROUTED_VID)])
         async with _daemon(r.target, r.session, [iptv_dev, routed_dev]) as ctl:
             await ctl('add', iptv_dev, source, group, routed_dev)
-            # The first frames teach the bridged learner the stream.
-            await _from_wan(r, new_config(family, source, group, FRAMING_PORT, []),
-                            16, r.wan_mac)
-            row = await _iptv_group(r, group, lambda g: g['state'] == 'installed'
-                                    and g['routed'] != '-')
+            # The first frames teach the bridged learner the stream, and the
+            # route rides it only once ipmr has been seen forwarding a copy.
+            # A burst sent before either learner was watching teaches
+            # nothing, so bursts until both have taken it.
+            deadline = time.monotonic() + 20
+            while True:
+                await _from_wan(r, new_config(family, source, group, FRAMING_PORT, []),
+                                16, r.wan_mac)
+                row = _iptv_row(await r.state(), group)
+                if row and row['state'] == 'installed' and row['routed'] != '-':
+                    break
+                assert time.monotonic() < deadline, ('never carried with its route', row)
+                await asyncio.sleep(0.3)
             assert row['ports'] == f'{TARGET_LAN_IF}/{IPTV_VID}', row
             assert row['routed'] == f'{TARGET_LAN_IF}/{ROUTED_VID}', row
             assert row['in'] == TARGET_WAN_IF and row['smac'] == r.wan_mac.lower(), row

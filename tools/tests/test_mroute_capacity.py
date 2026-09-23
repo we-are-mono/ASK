@@ -136,7 +136,12 @@ async def _daemon(target, session, interfaces):
         await target.fs_write(session, config, "")
 
 
-async def _state(target, session, group, state, listeners=()):
+async def _state(target, session, group, state, listeners=(), *, family=None):
+    """Wait for the group's row to say `state` with exactly `listeners`.
+
+    With `family`, a few frames of the stream go out between looks: a routed
+    group is carried only once Linux has been seen forwarding a copy of it to
+    every oif, so a route nothing has used yet waits as pending-confirm."""
     last = ""
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -145,6 +150,9 @@ async def _state(target, session, group, state, listeners=()):
         actual = set(names[1].split(",")) if names and names[1] != "-" else set()
         if f"state={state} " in last and actual == set(listeners):
             return last
+        if family is not None:
+            await asyncio.to_thread(_send, {"family": family, "source": wan_source_address(family),
+                                            "group": group, "token": uuid.uuid4().hex}, 8)
         await asyncio.sleep(0.1)
     raise AssertionError(f"{group}: expected {state}, {list(listeners)}, got {last!r}")
 
@@ -158,14 +166,14 @@ async def _absent(target, session, group):
     raise AssertionError(f"{group}: multicast row survived route removal")
 
 
-def _send(config):
+def _send(config, count=COUNT):
     from scapy.all import Ether, IP, IPv6, UDP, Raw, sendp
     layer = (IP(src=config["source"], dst=config["group"], ttl=64)
              if config["family"] == 4 else
              IPv6(src=config["source"], dst=config["group"], hlim=64))
     frames = [Ether(dst=multicast_mac(config["group"])) / layer /
               UDP(sport=PORT, dport=PORT) / Raw(payload(config["token"], i))
-              for i in range(COUNT)]
+              for i in range(count)]
     sendp(frames, iface=os.environ.get("ASK_WAN_INJECT_IF", "br0"),
           inter=1 / PPS, verbose=False)
 
@@ -240,7 +248,8 @@ async def test_routed_listener_ceiling(aiohttp_session, target_agent, lan,
                 state = "installed" if size == 8 else "refused-listener"
                 listeners = [f"{TARGET_LAN_IF}/{v}" for v in VLAN_IDS_MROUTE_LIMIT[:size]]
                 await _state(target_agent, aiohttp_session, group, state,
-                             listeners if size == 8 else ())
+                             listeners if size == 8 else (),
+                             family=family if size == 8 else None)
                 await _window(target_agent, aiohttp_session, family=family, group=group,
                               observers=[(lan, dict.fromkeys(peers, mac))],
                               expected=peers[:size], hardware=size == 8,
@@ -293,7 +302,8 @@ print(subprocess.check_output(['ip', '-j', '-d', 'link', 'show', 'dev', {wan_pee
                            [TARGET_WAN_IF, lan_oif, wan_oif]) as ctl:
             await ctl("add", TARGET_WAN_IF, wan_source_address(family), group, lan_oif, wan_oif)
             await _state(target_agent, aiohttp_session, group, "installed",
-                         [f"{TARGET_LAN_IF}/{vid}", f"{TARGET_WAN_IF}/{wan_vid}"])
+                         [f"{TARGET_LAN_IF}/{vid}", f"{TARGET_WAN_IF}/{wan_vid}"],
+                         family=family)
             await _window(target_agent, aiohttp_session, family=family, group=group,
                           observers=[(lan, {lan_peer: lan_mac}), (None, {wan_peer: wan_mac})],
                           expected=[lan_peer, wan_peer], hardware=True, label="physical-ports")

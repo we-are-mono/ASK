@@ -111,7 +111,32 @@ async def wait_group(r, group, installed):
     def ready(state):
         current = row(state, group, r.multicast_kind)
         return (current and current['state'] == 'installed') if installed else (current is None or current['state'] != 'installed')
-    return await r.wait(ready, timeout=12)
+    if not installed:
+        return await r.wait(ready, timeout=12)
+    deadline = time.monotonic() + 12
+    while True:
+        state = await r.state()
+        if ready(state):
+            return state
+        if time.monotonic() > deadline:
+            pytest.fail(f'{group} never installed: {row(state, group, r.multicast_kind)}')
+        await offer(r, group)
+
+
+async def offer(r, group):
+    """A few frames of the group, in a window of their own. Both learners need
+    them: a bridged flow is learned from its frames, and a routed group is
+    carried only once Linux has been seen forwarding it to every oif."""
+    window = r.multicast_window
+    r.multicast_window += 1
+    await asyncio.to_thread(send, r, [group], window, 4)
+    await asyncio.sleep(0.2)
+
+
+async def offering(r, group):
+    """Offer the group until cancelled, for a wait that is not on its state."""
+    while True:
+        await offer(r, group)
 
 
 def send(r, groups, window, count):
@@ -225,7 +250,14 @@ async def recover(r, fault):
                             'group-failslab': 'mroute-group'}[fault]
                 async with slab_fault(r, selected, label) as injection:
                     await route(r, target)
-                    hit = await injection.hit()
+                    # The install the fault waits for happens only once the
+                    # group has frames to learn or confirm it from.
+                    offered = asyncio.create_task(offering(r, target))
+                    try:
+                        hit = await injection.hit()
+                    finally:
+                        offered.cancel()
+                        await asyncio.gather(offered, return_exceptions=True)
                     admitted = await wait_group(r, target, True)
                     if fault == 'install-failslab':
                         worker = 'ft_mc_work_fn' if r.multicast_kind == 'mcast' else 'ft_mr_work_fn'

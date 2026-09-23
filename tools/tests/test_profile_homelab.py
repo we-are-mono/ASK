@@ -885,6 +885,21 @@ async def _smcroute(ctx, *oifs):
     assert result["rc"] == 0, (oifs, result)
 
 
+async def _routed_installed(ctx, predicate, timeout=20):
+    """Short bursts of the stream until the adapter's routed rows satisfy
+    `predicate`. A routed group is carried only once Linux has been seen
+    forwarding a copy of it to every oif, so a route no frame has used yet
+    waits in software as pending-confirm."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        state = await ctx.state()
+        if predicate(state["mroute"]):
+            return state
+        assert asyncio.get_running_loop().time() < deadline, state["mroute"]
+        await asyncio.to_thread(_inject_stream, 0.2, 50, PORT_MCAST)
+        await asyncio.sleep(0.3)
+
+
 async def _mroute_row(ctx):
     for row in (await ctx.state())["mroute"]:
         if row["group"] == GROUP and row["src"] == orchestrator_source():
@@ -1500,8 +1515,10 @@ async def test_profile_homelab_routed_multicast_replicates(homelab, splat_window
     The routed learner reads ipmr's MFC, where every fact the bridged learner
     has to recover from traffic is already stated: mfc_origin and mfc_mcastgrp
     are an exact (S,G), mfc_parent names the ingress, and ttls[] is the
-    replication list. So there is nothing to learn and nothing pending -- an
-    entry either installs or is refused, and the row says which.
+    replication list. So there is nothing to learn. What the MFC cannot say is
+    whether the firewall forwards the stream, so an entry is carried once
+    Linux has been seen forwarding a copy to each oif, and the row says
+    pending-confirm until then.
 
     Four oracles. `ip mroute show` reports offload, which is the kernel's own
     view of what a driver claimed. The adapter's row says `installed`, which is
@@ -1527,11 +1544,12 @@ async def test_profile_homelab_routed_multicast_replicates(homelab, splat_window
                 raise
             pytest.skip("smcroute is not in the DUT image; add `smcroute` to "
                         "IMAGE_INSTALL")
-        # The entry is installed by the daemon and adopted by the learner; give
-        # the worker its transaction before the stream starts, or the first
-        # second of it is measured against a route that is still pending.
-        await ctx.wait(lambda s: any(r["group"] == GROUP and r["state"] == "installed"
-                                     for r in s["mroute"]), timeout=20)
+        # The entry is installed by the daemon and adopted by the learner, and
+        # carried once a few frames have been seen forwarded; settle that
+        # before the stream starts, or the first second of it is measured
+        # against a route that is still pending.
+        await _routed_installed(ctx, lambda rows: any(
+            r["group"] == GROUP and r["state"] == "installed" for r in rows))
         observed = await _watch_routed(ctx, [trusted], STREAM_S, "profile_home_mcast")
         ctx.record("home-mroute-one", observed)
         sent = observed["sent"]
@@ -1559,9 +1577,10 @@ async def test_profile_homelab_routed_multicast_replicates(homelab, splat_window
 
         # A second outbound interface: the IoT VLAN joins the same group.
         await _smcroute(ctx, ctx.bridge_text[VID_A], ctx.bridge_text[VID_B])
-        await ctx.wait(lambda s: any(
+        # The new oif is confirmed from the stream like the first was.
+        await _routed_installed(ctx, lambda rows: any(
             r["group"] == GROUP and r["state"] == "installed"
-            and ctx.bridge_text[VID_B] in r["oifs"] for r in s["mroute"]), timeout=20)
+            and ctx.bridge_text[VID_B] in r["oifs"] for r in rows))
         both = await _watch_routed(ctx, [trusted, iot], STREAM_S,
                                    "profile_home_mcast_two")
         ctx.record("home-mroute-two", both)

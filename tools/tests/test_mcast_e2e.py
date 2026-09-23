@@ -743,6 +743,26 @@ async def mroute_lan_bridge(aiohttp_session, target_agent):
         await stack.teardown("mroute_lan_bridge")
 
 
+async def installed_by_traffic(target_agent, aiohttp_session, group: str,
+                               family: int, timeout: float = 15.0) -> str:
+    """Short bursts of the stream until the routed row says installed, and
+    that row.
+
+    A routed group is carried only once Linux has been seen forwarding a copy
+    of it to every oif, so a route with no traffic yet waits in software as
+    pending-confirm. The entry also appears a moment after the route does --
+    the FIB chain fires under RTNL and the adapter's worker installs outside
+    it -- which the retries cover as well."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        row = await mroute_proc_row(target_agent, aiohttp_session, group)
+        if "state=installed" in row or loop.time() > deadline:
+            return row
+        await asyncio.to_thread(send_stream_from_vision, group, family, 0.2, 50)
+        await asyncio.sleep(0.3)
+
+
 async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
                           family: int, oif: str, egress_port: str,
                           lan_iface: str, label: str, smcrouted,
@@ -768,11 +788,7 @@ async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
 
     await _exec(target_agent, aiohttp_session,
                 "smcroutectl", "add", TARGET_WAN_IF, source, group, oif)
-    # The FIB chain fires under RTNL and the adapter's worker installs outside
-    # it, so the entry appears a moment after the route does.
-    await asyncio.sleep(2.0)
-
-    row = await mroute_proc_row(target_agent, aiohttp_session, group)
+    row = await installed_by_traffic(target_agent, aiohttp_session, group, family)
     assert "state=installed" in row, (
         f"{group}: the routed learner did not install it. /proc row: "
         f"{row or '(absent)'}. A refused-* state names which clause of the "
@@ -969,9 +985,7 @@ async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
         await smcrouted([TARGET_WAN_IF, TARGET_LAN_IF, dut_if])
         await _exec(target_agent, aiohttp_session, "smcroutectl", "add",
                     TARGET_WAN_IF, source, group, TARGET_LAN_IF, dut_if)
-        await asyncio.sleep(2.0)
-
-        row = await mroute_proc_row(target_agent, aiohttp_session, group)
+        row = await installed_by_traffic(target_agent, aiohttp_session, group, 4)
         assert "state=installed" in row, (
             f"{group}: two oifs on one port were not installed. /proc row: "
             f"{row or '(absent)'}")

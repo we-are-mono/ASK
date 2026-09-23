@@ -97,7 +97,9 @@ print(subprocess.check_output(['ip', '-j', '-d', 'link', 'show', 'dev', {WAN_PEE
                                    ipv4="198.18.164.253/30", ipv6=f"fd00:{WAN_VID:x}::1/64")
         async with _daemon(r.target, r.session, [TARGET_WAN_IF, TARGET_LAN_IF, oif]) as ctl:
             await ctl("add", TARGET_WAN_IF, source, group, TARGET_LAN_IF)
-            first = await r.settle(lambda s: routed(s, group, source), "installed on the WAN port")
+            # Carried once Linux has been seen forwarding it: a few frames first.
+            first = await learn(r, [stream(family, group, hops=63)],
+                                lambda s: routed(s, group, source), "installed on the WAN port")
             inbound = await r.window([stream(family, group, hops=63)], [(r.lan, {LAN_NIC: r.dut_lan_mac})],
                                      ingress=TARGET_WAN_IF, label=f"move-v{family}-wan")
             assert delivered(inbound, streamed(inbound, group), LAN_NIC)
@@ -105,12 +107,16 @@ print(subprocess.check_output(['ip', '-j', '-d', 'link', 'show', 'dev', {WAN_PEE
             in_hardware(inbound)
 
             await ctl("add", TARGET_LAN_IF, source, group, oif)
-            after = await r.settle(lambda s: routed(s, group, source, inbound=TARGET_LAN_IF, listeners={wan}),
-                                   "rekeyed on the LAN port")
+            # A new oif, confirmed from the stream as it now arrives.
+            after = await learn(r, [stream(family, group, hops=63)],
+                                lambda s: routed(s, group, source, inbound=TARGET_LAN_IF,
+                                                 listeners={wan}),
+                                "rekeyed on the LAN port", sender="lan")
             assert [g for g in after["mroute"] if same(g["group"], group)] == [row(after)], summary(after)
             assert after["mroute_installed"] == first["mroute_installed"], summary(after)
-            # A new key is a new classifier entry, counted from nothing.
-            assert packets(row(after)) == 0, summary(after)
+            # A new key is a new classifier entry: counted from nothing but
+            # the tail of the burst that confirmed it, not the old entry's.
+            assert packets(row(after)) < 8, summary(after)
             line, _, _ = await kernel_mroute(r, family, source, group, offloaded=True)
             assert line and f"Iif: {TARGET_LAN_IF}" in line and "offload" in line, line
 
@@ -158,8 +164,9 @@ async def test_flowtable_service_multicast_two_sources(multicast_rig, family):
     async with _daemon(r.target, r.session, [TARGET_WAN_IF, TARGET_LAN_IF]) as ctl:
         for source in (first, second):
             await ctl("add", TARGET_WAN_IF, source, group, TARGET_LAN_IF)
-        both = await r.settle(lambda s: routed(s, group, first) and routed(s, group, second),
-                              "both sources installed")
+        both = await learn(r, [stream(family, group, hops=63, source=s) for s in (first, second)],
+                           lambda s: routed(s, group, first) and routed(s, group, second),
+                           "both sources installed")
         assert both["mroute_installed"] == r.initial["mroute_installed"] + 2, summary(both)
 
         together = await window([first, second], "together")
@@ -308,9 +315,12 @@ async def test_flowtable_service_multicast_learner_handoff(multicast_rig, mcast_
 
             # The bridge goes, its group with it, and the key is handed back.
             await dissolve(r, console, bridge, address, gateway)
-            taken = await r.settle(lambda s: routed(s, group, source) and not mcast_rows(s, group) and
-                                   s["mcast_installed"] == r.initial["mcast_installed"],
-                                   "the routed learner taking the key")
+            # The port plain again: ipmr sees the stream on it, and the
+            # routed group is carried once it has been seen forwarding it.
+            taken = await learn(r, [stream(family, group, hops=63)],
+                                lambda s: routed(s, group, source) and not mcast_rows(s, group) and
+                                s["mcast_installed"] == r.initial["mcast_installed"],
+                                "the routed learner taking the key")
             assert taken["mroute_installed"] == r.initial["mroute_installed"] + 1, summary(taken)
             second = await r.window([stream(family, group, hops=63)], routed_observers,
                                     ingress=TARGET_WAN_IF, label=f"handoff-v{family}-routed")
@@ -381,7 +391,8 @@ async def test_flowtable_service_multicast_reload_routed(multicast_rig, family):
 
     async with _daemon(r.target, r.session, [TARGET_WAN_IF, TARGET_LAN_IF]) as ctl:
         await ctl("add", TARGET_WAN_IF, source, group, TARGET_LAN_IF)
-        await r.settle(lambda s: routed(s, group, source), "installed before the reload")
+        await learn(r, [stream(family, group, hops=63)], lambda s: routed(s, group, source),
+                    "installed before the reload")
         before = await r.window([stream(family, group, hops=63)], observers, ingress=TARGET_WAN_IF,
                                 label=f"reload-routed-v{family}-before")
         assert delivered(before, streamed(before, group), LAN_NIC)
@@ -396,7 +407,9 @@ async def test_flowtable_service_multicast_reload_routed(multicast_rig, family):
             assert line and "offload" not in line, line
 
         async def standing():
-            return await r.settle(lambda s: routed(s, group, source), "relearned after the reload")
+            # Confirmations went with the module: seen afresh.
+            return await learn(r, [stream(family, group, hops=63)],
+                               lambda s: routed(s, group, source), "relearned after the reload")
 
         relearned = await reload_adapter(r, f"mcast-reload-routed-v{family}", standing, unloaded)
         assert len([g for g in relearned["mroute"] if same(g["group"], group)]) == 1, summary(relearned)

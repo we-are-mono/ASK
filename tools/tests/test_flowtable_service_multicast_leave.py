@@ -210,12 +210,16 @@ async def test_flowtable_service_multicast_routed_bridge_leave(multicast_rig, li
         if spec["end"] == "silence":
             await end(stack, leaving, spec, bridge.lan_left)
         await ctl("add", TARGET_WAN_IF, source, group, bridge.left, bridge.kept)
-        both = await r.settle(lambda s: carrying(s, {left, kept}), f"{mechanism}: two listeners")
+        # Carried once Linux has been seen forwarding it to both oifs.
+        both = await learn(r, [stream(family, group, hops=63)],
+                           lambda s: carrying(s, {left, kept}), f"{mechanism}: two listeners")
         first = await window("two-listeners")
         assert delivered(first, streamed(first, group), bridge.lan_left)
         assert delivered(first, streamed(first, group), bridge.lan_kept)
         in_hardware(first)
-        assert packets(row(first["after"])) == COUNT, summary(first["after"])
+        # Counted from what the tail of the confirming burst left on it.
+        base = packets(row(first["before"]))
+        assert packets(row(first["after"])) == base + COUNT, summary(first["after"])
 
         if spec["end"] != "silence":
             await end(stack, leaving, spec, bridge.lan_left)
@@ -228,7 +232,7 @@ async def test_flowtable_service_multicast_routed_bridge_leave(multicast_rig, li
         in_hardware(second)
         # One root counted both windows: the chain was swapped under it
         # rather than the group torn down and built again.
-        assert packets(row(second["after"])) == 2 * COUNT, summary(second["after"])
+        assert packets(row(second["after"])) == base + 2 * COUNT, summary(second["after"])
 
         # The last listener goes and the group leaves hardware with it.
         await mdb(r, bridge.name, group, add=False, vid=VID_KEPT)

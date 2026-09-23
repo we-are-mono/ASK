@@ -75,7 +75,8 @@ class Routed:
     kind, hops = "mroute", 63
 
     def __init__(self, r, ctl, family):
-        self.r, self.ctl, self.source = r, ctl, wan_source_address(family)
+        self.r, self.ctl, self.family = r, ctl, family
+        self.source = wan_source_address(family)
         self.observers = [(r.lan, {LAN_NIC: r.dut_lan_mac})]
 
     def row(self, state, group):
@@ -88,8 +89,10 @@ class Routed:
     async def add(self, *groups):
         for group in groups:
             await self.ctl("add", TARGET_WAN_IF, self.source, group, TARGET_LAN_IF)
-        return await self.r.settle(lambda s: all(self.installed(s, g) for g in groups),
-                                   f"routed {groups} installed")
+        # Carried once Linux has been seen forwarding each: frames first.
+        return await learn(self.r, [stream(self.family, g, hops=63) for g in groups],
+                           lambda s: all(self.installed(s, g) for g in groups),
+                           f"routed {groups} installed")
 
     async def remove(self, group):
         await self.ctl("remove", TARGET_WAN_IF, self.source, group)
@@ -242,9 +245,12 @@ async def test_flowtable_service_multicast_quarantine_listener_swap(multicast_ri
                 row = mroute_row(state, group, source)
                 return bool(row) and row["state"] == "installed" and members(row, "listeners") == listeners
 
-            await r.settle(lambda s: carried(s, {untagged, tagged}), "two listeners installed")
+            await learn(r, [stream(family, group, hops=63)],
+                        lambda s: carried(s, {untagged, tagged}), "two listeners installed")
             both = await r.window([stream(family, group, hops=63)], observers,
                                   ingress=TARGET_WAN_IF, label=f"swap-{family}-both")
+            # What the tail of the confirming burst left on the root.
+            base = packets(mroute_row(both["before"], group, source))
             assert delivered(both, both["streams"][0], LAN_NIC)
             assert delivered(both, both["streams"][0], peer)
             in_hardware(both)
@@ -267,7 +273,8 @@ async def test_flowtable_service_multicast_quarantine_listener_swap(multicast_ri
             assert not delivered(survivor, survivor["streams"][0], peer)
             in_hardware(survivor)
             # The same root counted both windows: it never left the table.
-            assert packets(mroute_row(survivor["after"], group, source)) == 2 * COUNT, summary(survivor["after"])
+            assert packets(mroute_row(survivor["after"], group, source)) == base + 2 * COUNT, \
+                summary(survivor["after"])
             assert survivor["after"]["quarantine"] == 2, summary(survivor["after"])
 
             await ctl("remove", TARGET_WAN_IF, source, group)
