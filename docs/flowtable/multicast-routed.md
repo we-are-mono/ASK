@@ -741,6 +741,17 @@ classifier counts them, and the fragment counters still do not move. Lowering
 it again takes the installed group back out. For IPv6, the IPv6 MTU sysctl
 alone does the same within the refresh interval.
 
+`test_flowtable_service_multicast_routed_firewall`, in
+`tools/tests/test_flowtable_service_multicast_edges.py`, proves the
+confirmation for both families. The group has two oifs, the LAN port and a VLAN
+device on it, and an `inet` forward chain drops the group toward the VLAN
+device, as fw4's zone policy would. The group reads `pending-confirm` with the
+VLAN device `unconfirmed`. The port receives the stream through software, and
+the VLAN peer receives nothing. With the table deleted, the group is carried to
+both, and the classifier counts the whole window. Adding the chain back is a
+commit: `mroute_ruleset_changes` moves, the group leaves hardware, and the VLAN
+peer receives nothing again.
+
 ## Proved on hardware
 
 Flowtable boot, KASAN image, 2026-09-21. The DUT routes between its WAN and

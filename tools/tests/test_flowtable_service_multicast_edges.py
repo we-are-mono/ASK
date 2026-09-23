@@ -4,7 +4,8 @@
   - two sources of one group, which are two keys;
   - the two learners handing one key between them as the topology changes;
   - the adapter reloaded under standing groups;
-  - `ip -s mroute` across the group leaving and re-entering hardware.
+  - `ip -s mroute` across the group leaving and re-entering hardware;
+  - a forward chain dropping a routed group toward one of its oifs.
 
 Each case reads the same three things as the rest of the suite: every
 sequence at every observer, the classifier's own count on the adapter's row,
@@ -26,7 +27,7 @@ from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, host
                             mroute_row, multicast_rig, packets, same, stream, streamed,  # noqa: F401
                             summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN, TopologyStack,
-                       dut_vlan_subif)
+                       dut_vlan_subif, lan_vlan_subif)
 from mroute_capture import payload
 from test_flowtable_offload import command, console_command
 from test_mcast_e2e import mcast_bridge, wan_source_address  # noqa: F401
@@ -40,6 +41,11 @@ RELOAD_GROUP = {4: "239.9.9.4", 6: "ff1e::9:9:4"}
 FOLD_GROUP = {4: "239.9.9.5", 6: "ff1e::9:9:5"}
 RELOAD_FILTER_GROUP = {4: "239.9.9.6", 6: "ff1e::9:9:6"}
 IDLE_GROUP = {4: "239.9.9.7", 6: "ff1e::9:9:7"}
+FIREWALL_GROUP = {4: "239.9.9.8", 6: "ff1e::9:9:8"}
+# The second oif of the firewall case, tagged on the LAN port; claimed in
+# _topology.
+FIREWALL_VID = 325
+FIREWALL_TABLE = "ask_ft_mr_firewall"
 # The bridge's group membership interval for the ageing case, in centiseconds
 # as the bridge takes it: short enough to wait out, and not so short that a
 # refresh or two could land either side of it.
@@ -693,3 +699,101 @@ async def test_flowtable_service_multicast_bridged_idle_flow_ages_out(multicast_
                            "removed", timeout=15)
     assert final["quarantine"] == 0, summary(final)
     assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)
+
+
+@pytest.mark.parametrize("family", [4, 6])
+async def test_flowtable_service_multicast_routed_firewall(multicast_rig, family):
+    """A forward chain dropping the group toward one oif, as fw4 does from WAN to LAN.
+
+    Linux never forwards the stream there, so no copy of it is seen leaving
+    by that oif, and the group waits in software whole: the dropped oif
+    receives nothing and the other receives the stream from the CPU. The rule
+    gone, the next copy confirms the oif and the group is carried to both.
+    The rule back is an nftables commit, which takes every routed group back
+    to software; this one cannot be confirmed toward the oif again, and that
+    oif stops receiving."""
+    r = multicast_rig
+    group, source = FIREWALL_GROUP[family], wan_source_address(family)
+    untagged, tagged = f"{TARGET_LAN_IF}/0", f"{TARGET_LAN_IF}/{FIREWALL_VID}"
+    match = "ip daddr" if family == 4 else "ip6 daddr"
+    topology = TopologyStack()
+    dropping = False
+
+    def row(state):
+        return mroute_row(state, group, source)
+
+    def carried(state):
+        current = row(state)
+        return (bool(current) and current["state"] == "installed" and
+                members(current, "listeners") == {untagged, tagged})
+
+    try:
+        oif = await dut_vlan_subif(topology, r.target, r.session, parent=TARGET_LAN_IF,
+                                   vid=FIREWALL_VID, ipv4="198.18.167.1/24",
+                                   ipv6="fd00:167::1/64")
+        peer = await lan_vlan_subif(topology, r.lan, parent=LAN_NIC, vid=FIREWALL_VID)
+        observers = [(r.lan, {LAN_NIC: r.dut_lan_mac, peer: r.dut_lan_mac})]
+
+        def held(state):
+            current = row(state)
+            return (bool(current) and current["state"] == "pending-confirm" and
+                    current["unconfirmed"] == oif)
+
+        async def drop():
+            await command(r.target, r.session, "nft", f'''table inet {FIREWALL_TABLE} {{
+ chain forward {{ type filter hook forward priority filter; policy accept;
+  oifname "{oif}" {match} {group} drop
+ }}
+}}''')
+
+        def window(label):
+            return r.window([stream(family, group, hops=63)], observers, ingress=TARGET_WAN_IF,
+                            label=f"firewall-v{family}-{label}")
+
+        async with _daemon(r.target, r.session, [TARGET_WAN_IF, TARGET_LAN_IF, oif]) as ctl:
+            await drop()
+            dropping = True
+            await ctl("add", TARGET_WAN_IF, source, group, TARGET_LAN_IF, oif)
+            await learn(r, [stream(family, group, hops=63)], held,
+                        "confirmed toward the allowed oif only")
+            first = await window("dropped")
+            assert delivered(first, streamed(first, group), LAN_NIC)
+            assert not delivered(first, streamed(first, group), peer)
+            in_software(first)
+            assert held(first["after"]), summary(first["after"])
+            assert first["after"]["mroute_installed"] == r.initial["mroute_installed"], \
+                summary(first["after"])
+
+            await command(r.target, r.session, "nft", "delete", "table", "inet", FIREWALL_TABLE)
+            dropping = False
+            allowed = await learn(r, [stream(family, group, hops=63)], carried,
+                                  "carried to both once allowed")
+            second = await window("allowed")
+            assert delivered(second, streamed(second, group), LAN_NIC)
+            assert delivered(second, streamed(second, group), peer)
+            in_hardware(second)
+            assert moved(second, row) == COUNT, summary(second["after"])
+
+            await drop()
+            dropping = True
+            await r.settle(lambda s: s["mroute_ruleset_changes"] > allowed["mroute_ruleset_changes"]
+                           and not carried(s) and
+                           s["mroute_installed"] == r.initial["mroute_installed"],
+                           "withdrawn by the commit")
+            third = await window("dropped-again")
+            assert delivered(third, streamed(third, group), LAN_NIC)
+            assert not delivered(third, streamed(third, group), peer)
+            in_software(third)
+            assert held(third["after"]), summary(third["after"])
+
+            await ctl("remove", TARGET_WAN_IF, source, group)
+            final = await r.settle(lambda s: row(s) is None and
+                                   s["mroute_installed"] == r.initial["mroute_installed"],
+                                   "the route removed")
+        assert final["quarantine"] == 0, summary(final)
+        assert final["mroute_install_errors"] == r.initial["mroute_install_errors"], summary(final)
+    finally:
+        if dropping:
+            await command(r.target, r.session, "nft", "delete", "table", "inet", FIREWALL_TABLE,
+                          check=False)
+        await topology.teardown("routed firewall")
