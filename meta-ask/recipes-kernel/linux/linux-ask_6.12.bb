@@ -92,6 +92,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://150-sdk_dpaa-hardware-qdisc.patch \
            file://160-bridge-switchdev-mdb-group.patch \
            file://161-bridge-multicast-egress-snapshot.patch \
+           file://162-bridge-forward-path-forwarding-state.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

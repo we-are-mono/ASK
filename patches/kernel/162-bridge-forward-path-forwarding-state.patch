@@ -1,0 +1,382 @@
+From 26157a3cb04ea8b20c72ac3b3922488a6d132ae1 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Wed, 23 Sep 2026 18:25:22 +0200
+Subject: [PATCH] bridge: keep flow offload off ports that are not forwarding
+
+br_fill_forward_path() resolved the FDB port without asking whether the
+bridge forwards through it. A flow built on that path skipped the STP
+state checks. A DIRECT tuple transmitted past br_forward(), and the
+flowtable ingress hook runs before br_handle_frame(). So a blocked port
+carried routed traffic both ways.
+
+The walk now refuses a port that is not FORWARDING with -EAGAIN. It
+applies the port's STP state (unless MST owns it), the port's VLAN state
+and the bridge entry's VLAN state, as should_deliver() and
+br_pass_frame_up() do. dev_fill_forward_path() passes the error up, and nft_flow_route()
+then caches no flow at all: a flow cached on the logical device would
+never reach the port once it forwards again.
+
+br_port_forwarding() exports the same test for offloads that admit
+flows asynchronously. A VLAN state set directly now raises
+SWITCHDEV_ATTR_ID_PORT_VLAN_STATE; before, only MST states had an event.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ include/linux/if_bridge.h        |  6 ++++
+ include/net/switchdev.h          |  9 ++++++
+ net/bridge/br_device.c           |  9 ++++++
+ net/bridge/br_private.h          | 19 +++++++++++++
+ net/bridge/br_stp.c              | 18 ++++++++++++
+ net/bridge/br_vlan.c             | 21 ++++++++++++++
+ net/bridge/br_vlan_options.c     | 25 ++++++++++++++++
+ net/core/dev.c                   |  2 +-
+ net/netfilter/nft_flow_offload.c | 49 +++++++++++++++++++++++---------
+ 9 files changed, 144 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index d5ec233201a8..418746f11fb3 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -205,6 +205,7 @@ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ void br_fdb_clear_offload(const struct net_device *dev, u16 vid);
+ bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag);
+ u8 br_port_get_stp_state(const struct net_device *dev);
++bool br_port_forwarding(const struct net_device *dev, u16 vid);
+ clock_t br_get_ageing_time(const struct net_device *br_dev);
+ #else
+ static inline struct net_device *
+@@ -230,6 +231,11 @@ static inline u8 br_port_get_stp_state(const struct net_device *dev)
+ 	return BR_STATE_DISABLED;
+ }
+ 
++static inline bool br_port_forwarding(const struct net_device *dev, u16 vid)
++{
++	return false;
++}
++
+ static inline clock_t br_get_ageing_time(const struct net_device *br_dev)
+ {
+ 	return 0;
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index da9e6370ed0f..f87bc384a3e6 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -33,6 +33,7 @@ enum switchdev_attr_id {
+ 	SWITCHDEV_ATTR_ID_BRIDGE_MST,
+ 	SWITCHDEV_ATTR_ID_MRP_PORT_ROLE,
+ 	SWITCHDEV_ATTR_ID_VLAN_MSTI,
++	SWITCHDEV_ATTR_ID_PORT_VLAN_STATE,
+ };
+ 
+ struct switchdev_mst_state {
+@@ -50,6 +51,13 @@ struct switchdev_vlan_msti {
+ 	u16 msti;
+ };
+ 
++/* A VLAN's own STP state, set directly rather than through an MSTI: on a
++ * port, or on the bridge's own entry when orig_dev is the bridge. */
++struct switchdev_vlan_state {
++	u16 vid;
++	u8 state;
++};
++
+ struct switchdev_attr {
+ 	struct net_device *orig_dev;
+ 	enum switchdev_attr_id id;
+@@ -68,6 +76,7 @@ struct switchdev_attr {
+ 		bool mc_disabled;			/* MC_DISABLED */
+ 		u8 mrp_port_role;			/* MRP_PORT_ROLE */
+ 		struct switchdev_vlan_msti vlan_msti;	/* VLAN_MSTI */
++		struct switchdev_vlan_state vlan_state;	/* PORT_VLAN_STATE */
+ 	} u;
+ };
+ 
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index 3768cc9c8ecb..3633749e714d 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -405,6 +405,15 @@ static int br_fill_forward_path(struct net_device_path_ctx *ctx,
+ 	if (br_vlan_fill_forward_path_mode(br, dst, path))
+ 		return -1;
+ 
++	/* A port the bridge would not forward through is no path at all:
++	 * br_forward() drops what br_dev_xmit() hands it, and br_handle_frame()
++	 * what it receives. Reported apart from the failures above, which a
++	 * caller may route around, because a flow cached on this path would
++	 * carry both directions past those checks.
++	 */
++	if (!br_port_forwarding_vid(dst, path->bridge.vlan_id))
++		return -EAGAIN;
++
+ 	path->type = DEV_PATH_BRIDGE;
+ 	path->dev = dst->br->dev;
+ 	ctx->dev = dst->dev;
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index eaa949a77904..2ed20d43cbb8 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -1606,6 +1606,7 @@ void br_vlan_fill_forward_path_pvid(struct net_bridge *br,
+ int br_vlan_fill_forward_path_mode(struct net_bridge *br,
+ 				   struct net_bridge_port *dst,
+ 				   struct net_device_path *path);
++bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid);
+ 
+ static inline struct net_bridge_vlan_group *br_vlan_group(
+ 					const struct net_bridge *br)
+@@ -1782,6 +1783,11 @@ static inline int br_vlan_fill_forward_path_mode(struct net_bridge *br,
+ 	return 0;
+ }
+ 
++static inline bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid)
++{
++	return true;
++}
++
+ static inline struct net_bridge_vlan_group *br_vlan_group(
+ 					const struct net_bridge *br)
+ {
+@@ -1977,6 +1983,19 @@ static inline void br_mst_uninit(struct net_bridge *br)
+ }
+ #endif
+ 
++/* The state half of should_deliver() for a frame in @vid: the port's STP state
++ * unless MST supersedes it, then the per-VLAN states. It is also all that
++ * br_handle_frame() and br_handle_frame_finish() let a received frame through,
++ * since both stop short of FORWARDING. Membership, isolation and hairpin are
++ * the caller's. RCU.
++ */
++static inline bool br_port_forwarding_vid(const struct net_bridge_port *p,
++					  u16 vid)
++{
++	return (br_mst_is_enabled(p) || p->state == BR_STATE_FORWARDING) &&
++	       br_vlan_forwarding(p, vid);
++}
++
+ struct nf_br_ops {
+ 	int (*br_dev_xmit_hook)(struct sk_buff *skb);
+ };
+diff --git a/net/bridge/br_stp.c b/net/bridge/br_stp.c
+index 4cfebf5fcdf5..9a5183f24d1b 100644
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -84,6 +84,24 @@ u8 br_port_get_stp_state(const struct net_device *dev)
+ }
+ EXPORT_SYMBOL_GPL(br_port_get_stp_state);
+ 
++/* Whether the bridge carries frames in @vid through port @dev, in either
++ * direction, as far as STP, MST and per-VLAN states decide. For an offload
++ * that admits flows asynchronously to the events reporting those states.
++ */
++bool br_port_forwarding(const struct net_device *dev, u16 vid)
++{
++	const struct net_bridge_port *p;
++	bool forwarding;
++
++	rcu_read_lock();
++	p = br_port_get_check_rcu(dev);
++	forwarding = p && br_port_forwarding_vid(p, vid);
++	rcu_read_unlock();
++
++	return forwarding;
++}
++EXPORT_SYMBOL_GPL(br_port_forwarding);
++
+ /* called under bridge lock */
+ struct net_bridge_port *br_get_port(struct net_bridge *br, u16 port_no)
+ {
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index 88cd613ccf70..204edcaf043e 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -1519,6 +1519,27 @@ int br_vlan_fill_forward_path_mode(struct net_bridge *br,
+ 	return 0;
+ }
+ 
++/* The per-VLAN half of br_port_forwarding_vid(). br_forward() checks the
++ * port's VLAN through br_allowed_egress(); a flow's reply goes up the
++ * bridge's own entry, in br_pass_frame_up() -> br_allowed_egress(). MST
++ * drives the port VLANs' states itself, so this holds with it enabled too.
++ */
++bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid)
++{
++	struct net_bridge_vlan *v;
++
++	if (!br_opt_get(p->br, BROPT_VLAN_ENABLED))
++		return true;
++
++	v = br_vlan_find(nbp_vlan_group_rcu(p), vid);
++	if (!v || br_vlan_get_state(v) != BR_STATE_FORWARDING)
++		return false;
++
++	v = br_vlan_find(br_vlan_group_rcu(p->br), vid);
++	return v && br_vlan_should_use(v) &&
++	       br_vlan_get_state(v) == BR_STATE_FORWARDING;
++}
++
+ int br_vlan_get_info(const struct net_device *dev, u16 vid,
+ 		     struct bridge_vlan_info *p_vinfo)
+ {
+diff --git a/net/bridge/br_vlan_options.c b/net/bridge/br_vlan_options.c
+index 4a736e005bad..2d9c2d96921b 100644
+--- a/net/bridge/br_vlan_options.c
++++ b/net/bridge/br_vlan_options.c
+@@ -5,6 +5,7 @@
+ #include <linux/rtnetlink.h>
+ #include <linux/slab.h>
+ #include <net/ip_tunnels.h>
++#include <net/switchdev.h>
+ 
+ #include "br_private.h"
+ #include "br_private_tunnel.h"
+@@ -86,6 +87,29 @@ size_t br_vlan_opts_nl_size(void)
+ 	       + 0;
+ }
+ 
++/* A VLAN entering or leaving FORWARDING changes what the bridge carries with
++ * no other event: MST reports its per-VLAN states as PORT_MST_STATE, but a
++ * state set directly had nothing, so an offload that forwards without the
++ * bridge could not hear it. Deferred like the port's STP state, and advisory:
++ * a driver that does not know the attribute answers -EOPNOTSUPP.
++ */
++static void br_vlan_state_notify(const struct net_bridge_vlan *v, u8 state)
++{
++	struct net_device *dev = br_vlan_is_brentry(v) ? v->br->dev :
++							 v->port->dev;
++	struct switchdev_attr attr = {
++		.orig_dev = dev,
++		.id = SWITCHDEV_ATTR_ID_PORT_VLAN_STATE,
++		.flags = SWITCHDEV_F_DEFER,
++		.u.vlan_state = {
++			.vid = v->vid,
++			.state = state,
++		},
++	};
++
++	switchdev_port_attr_set(dev, &attr, NULL);
++}
++
+ static int br_vlan_modify_state(struct net_bridge_vlan_group *vg,
+ 				struct net_bridge_vlan *v,
+ 				u8 state,
+@@ -124,6 +148,7 @@ static int br_vlan_modify_state(struct net_bridge_vlan_group *vg,
+ 
+ 	br_vlan_set_state(v, state);
+ 	*changed = true;
++	br_vlan_state_notify(v, state);
+ 
+ 	return 0;
+ }
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 1aab6f06d9eb..2a326163cfe3 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -751,7 +751,7 @@ int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
+ 		memset(path, 0, sizeof(struct net_device_path));
+ 		ret = ctx.dev->netdev_ops->ndo_fill_forward_path(&ctx, path);
+ 		if (ret < 0)
+-			return -1;
++			return ret;
+ 
+ 		if (WARN_ON_ONCE(last_dev == ctx.dev))
+ 			return -1;
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index 9d793f43c94e..95d631ab80be 100644
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -269,10 +269,10 @@ static bool nft_flowtable_find_dev(const struct net_device *dev,
+ 	return found;
+ }
+ 
+-static void nft_dev_forward_path(struct nf_flow_route *route,
+-				 const struct nf_conn *ct,
+-				 enum ip_conntrack_dir dir,
+-				 struct nft_flowtable *ft)
++static int nft_dev_forward_path(struct nf_flow_route *route,
++				const struct nf_conn *ct,
++				enum ip_conntrack_dir dir,
++				struct nft_flowtable *ft)
+ {
+ 	const struct dst_entry *dst = route->tuple[dir].dst;
+ 	struct net_device_path_stack stack;
+@@ -283,13 +283,23 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
+ 	 * the stack held. A PPPoE hop overwrites it before anything reads it,
+ 	 * but only because it is always the first hop. */
+ 	unsigned char ha[ETH_ALEN] = {};
+-	int i;
+-
+-	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
++	int i, err;
++
++	err = nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack);
++	/* A bridge port that is not forwarding is not a path to fall back
++	 * from: a flow cached now would carry the port's traffic past
++	 * br_handle_frame() and br_forward(), which enforce its state, and one
++	 * cached on the logical device instead would never be offered to the
++	 * port once it forwards again. Every other failure keeps the neighbour
++	 * fallback below.
++	 */
++	if (err == -EAGAIN)
++		return err;
++	if (err >= 0)
+ 		nft_dev_path_info(&stack, &info, ha, &ft->data);
+ 
+ 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
+-		return;
++		return 0;
+ 
+ 	/* Belongs to this direction's egress path, as out.h_dest does, and
+ 	 * unlike out.h_dest it survives NEIGH output. */
+@@ -311,6 +321,8 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
+ 		route->tuple[dir].xmit_type = info.xmit_type;
+ 	}
++
++	return 0;
+ }
+ 
+ static int nft_flow_route(const struct nft_pktinfo *pkt,
+@@ -322,6 +334,7 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+ 	struct dst_entry *this_dst = skb_dst(pkt->skb);
+ 	struct dst_entry *other_dst = NULL;
+ 	struct flowi fl;
++	int err = 0;
+ 
+ 	memset(&fl, 0, sizeof(fl));
+ 	switch (nft_pf(pkt)) {
+@@ -364,8 +377,9 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+ 
+ 	if (route->tuple[dir].xmit_type	== FLOW_OFFLOAD_XMIT_NEIGH &&
+ 	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
+-		nft_dev_forward_path(route, ct, dir, ft);
+-		nft_dev_forward_path(route, ct, !dir, ft);
++		err = nft_dev_forward_path(route, ct, dir, ft);
++		if (!err)
++			err = nft_dev_forward_path(route, ct, !dir, ft);
+ 	} else if (READ_ONCE(ft->data.use_neigh)) {
+ 		/* A transform in one direction must not hide the other one's
+ 		 * bridge/VLAN path. Its physical ingress and tags also name
+@@ -374,9 +388,18 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+ 		 * XFRM outer peer, and must never turn XFRM into DIRECT.
+ 		 */
+ 		if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
+-			nft_dev_forward_path(route, ct, dir, ft);
+-		if (route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
+-			nft_dev_forward_path(route, ct, !dir, ft);
++			err = nft_dev_forward_path(route, ct, dir, ft);
++		if (!err &&
++		    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
++			err = nft_dev_forward_path(route, ct, !dir, ft);
++	}
++
++	/* The caller's error path releases nothing: both destinations are
++	 * still this function's to drop. */
++	if (err) {
++		dst_release(route->tuple[dir].dst);
++		dst_release(route->tuple[!dir].dst);
++		return err;
+ 	}
+ 
+ 	return 0;
+-- 
+2.47.3
+

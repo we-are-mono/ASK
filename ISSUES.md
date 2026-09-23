@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A213.** The bridge's forward-path walk resolved a port STP or a VLAN state had stopped, so the software flowtable forwarded through it —
+  fixed (_:/^bridge: keep flow offload off ports that are not forwarding_).
+
 - [x] **A193.** Multicast quarantine on a failed hardware delete had no flowtable-mode driver —
   covered (_:/^tests: prove a failed multicast barrier parks and the next one frees_).
 
