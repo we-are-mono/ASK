@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A252.** The devlink policers reported their ranges' ceilings until first set, so restoring what `show` reported switched both meters off —
+  fixed (_:/^cdx: register the devlink policers with what the meters run_).
+
 - [x] **A251.** `xfrm_state_update()` moved a packet-offloaded SA's NAT-T ports or output mark in place without telling the driver, leaving the hardware on the old ones —
   fixed (_:/^xfrm: refuse changing a packet-offloaded state's output mark in place_).
 

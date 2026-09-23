@@ -48,8 +48,6 @@
 #include <net/devlink.h>
 #include <dpaa_eth.h>
 #include <dpaa_eth_common.h>
-#include "lnxwrp_fm.h"
-#include "mac.h"
 #include "cdx.h"
 #include "misc.h"
 #include "portdefs.h"
@@ -67,13 +65,6 @@
 #define CDX_PUNT_RATE_MAX		5000000
 #define CDX_PUNT_BURST_MIN		1
 #define CDX_PUNT_BURST_MAX		2048
-
-static const struct devlink_trap_policer cdx_trap_policers[] = {
-	DEVLINK_TRAP_POLICER(CDX_DEVLINK_POLICER_PUNT,
-			     CDX_PUNT_RATE_MAX, CDX_PUNT_BURST_MAX,
-			     CDX_PUNT_RATE_MAX, CDX_PUNT_RATE_MIN,
-			     CDX_PUNT_BURST_MAX, CDX_PUNT_BURST_MIN),
-};
 
 static struct devlink *cdx_devlink;
 
@@ -99,6 +90,11 @@ static struct devlink *cdx_devlink;
  * The flowtable's XFRM provider now sends flows to SEC, but that frames
  * traverse this meter is not yet demonstrated: the policer reports drops, not
  * passes, and showing traversal means exceeding its rate.
+ *
+ * What it reports is the peak pair. The profile passes green and yellow alike
+ * and drops only red, so the committed rate colours frames without deciding
+ * anything; the peak rate and burst are the whole of what it enforces, and a
+ * set programs both pairs with the one value devlink carries.
  */
 #define CDX_DEVLINK_POLICER_SEC	2
 
@@ -108,12 +104,72 @@ static struct devlink *cdx_devlink;
 #define CDX_SEC_BURST_MIN	1
 #define CDX_SEC_BURST_MAX	2048
 
-static const struct devlink_trap_policer cdx_sec_policers[] = {
-	DEVLINK_TRAP_POLICER(CDX_DEVLINK_POLICER_SEC,
-			     CDX_SEC_RATE_MAX, CDX_SEC_BURST_MAX,
-			     CDX_SEC_RATE_MAX, CDX_SEC_RATE_MIN,
-			     CDX_SEC_BURST_MAX, CDX_SEC_BURST_MIN),
-};
+/* ---- what devlink is told at registration ---------------------------------
+ *
+ * A devlink policer reports the rate and burst it was registered with until a
+ * set succeeds, and a set that names only a rate keeps the registered burst. So
+ * the registered values have to be the ones the hardware runs, not the ends of
+ * the ranges: reporting 5000000 for a meter programmed at 195312, and then
+ * "restoring" that value, would turn the meter all but off.
+ *
+ * Built once, at attach, from what the profiles were created with -- the
+ * hardware layer keeps those beside each handle -- and kept for as long as the
+ * registration, because devlink holds a pointer to each descriptor. A meter
+ * that does not exist, or runs in a unit or at a value devlink cannot express,
+ * is left out rather than described approximately.
+ */
+static struct devlink_trap_policer cdx_policers[2];
+static unsigned int cdx_policer_count;
+
+/* Whether a programmed value fits the range the policer declares. Out of range
+ * is left unregistered, never clamped: a clamped value is one the hardware is
+ * not running, which is the fault this whole table exists to avoid. */
+static bool cdx_devlink_in_range(const char *what, u32 rate, u32 burst,
+				 u32 rate_min, u32 rate_max,
+				 u32 burst_min, u32 burst_max)
+{
+	if (rate >= rate_min && rate <= rate_max &&
+	    burst >= burst_min && burst <= burst_max)
+		return true;
+	pr_warn("cdx: the %s policer runs at rate %u burst %u, outside the range devlink would accept; not registered\n",
+		what, rate, burst);
+	return false;
+}
+
+/* Fill cdx_policers[] from the programmed profiles and return how many there
+ * are. Called under RTNL and the control mutex, before anything is registered,
+ * so nothing else reads the table while it changes. */
+static unsigned int cdx_devlink_policers_build(void)
+{
+	unsigned int n = 0;
+	u32 rate, burst;
+
+	/* The punt profile, if it exists and meters packets: a byte-mode
+	 * profile has a rate devlink would report in the wrong unit. */
+	if (cdx_expt_rate_config(FMAN_INDEX, CDX_EXPT_ETH_RATELIMIT,
+				 &rate, &burst) == SUCCESS &&
+	    cdx_expt_rate_is_packet_mode(FMAN_INDEX) &&
+	    cdx_devlink_in_range("punt", rate, burst,
+				 CDX_PUNT_RATE_MIN, CDX_PUNT_RATE_MAX,
+				 CDX_PUNT_BURST_MIN, CDX_PUNT_BURST_MAX))
+		cdx_policers[n++] = (struct devlink_trap_policer)
+			DEVLINK_TRAP_POLICER(CDX_DEVLINK_POLICER_PUNT, rate, burst,
+					     CDX_PUNT_RATE_MAX, CDX_PUNT_RATE_MIN,
+					     CDX_PUNT_BURST_MAX, CDX_PUNT_BURST_MIN);
+	/* The SEC profile, if it exists and is on: a disabled one refuses
+	 * every set (cdxdrv_modify_ingress_qos_policer_profile()), so offering
+	 * it would offer a verb that can only fail. */
+	if (cdx_ingress_policer_peak(FMAN_INDEX, INGRESS_SEC_POLICER_QUEUE_NUM,
+				     &rate, &burst) == SUCCESS &&
+	    cdx_devlink_in_range("SEC", rate, burst,
+				 CDX_SEC_RATE_MIN, CDX_SEC_RATE_MAX,
+				 CDX_SEC_BURST_MIN, CDX_SEC_BURST_MAX))
+		cdx_policers[n++] = (struct devlink_trap_policer)
+			DEVLINK_TRAP_POLICER(CDX_DEVLINK_POLICER_SEC, rate, burst,
+					     CDX_SEC_RATE_MAX, CDX_SEC_RATE_MIN,
+					     CDX_SEC_BURST_MAX, CDX_SEC_BURST_MIN);
+	return n;
+}
 
 
 static int cdx_devlink_policer_set(struct devlink *devlink,
@@ -186,61 +242,46 @@ static const struct devlink_ops cdx_devlink_ops = {
 
 /* Register once, against the FMAN the punted traffic is metered by.
  *
- * Called as each ethernet interface comes up, because that is the first moment
- * cdx holds anything that can name the FMAN's own platform device, and it is
- * idempotent so the second interface costs nothing. The instance belongs to the
+ * Called from the DPA configuration, once both meters' profiles exist: that is
+ * the first moment there is anything true to report, and cdx already holds the
+ * FMAN's own device from resolving its PCD handle. The instance belongs to the
  * FMAN rather than to a port: one profile meters every port's misses, and a
  * devlink instance per port would be four handles onto one meter.
+ *
+ * Neither meter is turned on here. Both profiles are created already metering
+ * -- the SEC profile is the one ingress profile created enabled -- and a
+ * disabled one is not registered at all.
  */
-int cdx_devlink_attach(struct net_device *net_dev)
+int cdx_devlink_attach(struct device *dev)
 {
-	struct dpa_priv_s *priv = netdev_priv(net_dev);
 	struct devlink *devlink;
-	t_LnxWrpFmDev *fm_dev;
-	struct device *dev;
+	unsigned int count;
 	int rc;
 
-	if (cdx_devlink)
+	if (cdx_devlink || !dev)
 		return 0;
-	if (!priv->mac_dev || !priv->mac_dev->fm_dev)
-		return 0;
-	/* The SDK's own accessors cast this pointer the same way -- see
-	 * fm_get_handle() -- so `struct fm' is this wrapper and nothing else. */
-	fm_dev = (t_LnxWrpFmDev *)priv->mac_dev->fm_dev;
-	dev = fm_dev->dev;
-	if (!dev)
+	count = cdx_devlink_policers_build();
+	if (!count)
 		return 0;
 
 	devlink = devlink_alloc(&cdx_devlink_ops, 0, dev);
 	if (!devlink)
 		return -ENOMEM;
 	devl_lock(devlink);
-	rc = devl_trap_policers_register(devlink, cdx_trap_policers,
-					 ARRAY_SIZE(cdx_trap_policers));
-	if (!rc) {
-		/* Turned on once, here, rather than on every write: the
-		 * hardware layer's enable is idempotent but announces itself in
-		 * a printk, and a meter that logs a line each time it is set is
-		 * one nobody sets twice. */
-		cdx_ingress_enable_or_disable_qos(FMAN_INDEX,
-						  INGRESS_SEC_POLICER_QUEUE_NUM,
-						  ENABLE_INGRESS_POLICER);
-		rc = devl_trap_policers_register(devlink, cdx_sec_policers,
-						 ARRAY_SIZE(cdx_sec_policers));
-		if (rc)
-			devl_trap_policers_unregister(devlink, cdx_trap_policers,
-						      ARRAY_SIZE(cdx_trap_policers));
-	}
+	rc = devl_trap_policers_register(devlink, cdx_policers, count);
 	devl_unlock(devlink);
 	if (rc) {
 		devlink_free(devlink);
 		return rc;
 	}
+	cdx_policer_count = count;
 	devlink_register(devlink);
 	cdx_devlink = devlink;
 	return 0;
 }
 
+/* Unregister it, before the profiles its callbacks program are released. Safe
+ * to call again, and with nothing registered. */
 void cdx_devlink_detach(void)
 {
 	struct devlink *devlink = cdx_devlink;
@@ -250,10 +291,8 @@ void cdx_devlink_detach(void)
 	cdx_devlink = NULL;
 	devlink_unregister(devlink);
 	devl_lock(devlink);
-	devl_trap_policers_unregister(devlink, cdx_sec_policers,
-				      ARRAY_SIZE(cdx_sec_policers));
-	devl_trap_policers_unregister(devlink, cdx_trap_policers,
-				      ARRAY_SIZE(cdx_trap_policers));
+	devl_trap_policers_unregister(devlink, cdx_policers, cdx_policer_count);
 	devl_unlock(devlink);
+	cdx_policer_count = 0;
 	devlink_free(devlink);
 }

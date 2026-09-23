@@ -449,6 +449,8 @@ unsigned int cdx_ehash_quarantine_pending(void);
 int cdx_set_expt_rate(uint32_t fm_index, uint32_t type, uint32_t limit, uint32_t burst_size);
 int cdx_get_expt_rate(void *cmd);
 bool cdx_expt_rate_is_packet_mode(uint32_t fm_index);
+int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,
+			 uint32_t *burst);
 struct cdx_police_counters;
 int cdx_expt_rate_counters(uint32_t fm_index, uint32_t type,
 			   struct cdx_police_counters *out);
@@ -474,6 +476,8 @@ int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
 				 struct cdx_police_counters *out);
 int cdx_ingress_policer_config(uint32_t fm_index, uint32_t queue_no,
 			       uint32_t *cir, uint32_t *cbs);
+int cdx_ingress_policer_peak(uint32_t fm_index, uint32_t queue_no,
+			     uint32_t *pir, uint32_t *pbs);
 int cdx_get_policer_profile_id(uint32_t fm_index, uint32_t queue_no);
 int cdx_ingress_enable_or_disable_qos(uint32_t fm_index,uint32_t queue_no,uint32_t oper);
 int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs);

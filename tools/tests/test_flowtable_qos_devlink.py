@@ -16,7 +16,9 @@ is the profile's rate resolution and whatever background traffic shares the
 meter for those few seconds -- not an allowance for the arithmetic.
 
 Every value a case sets is put back as devlink reported it before the case, by
-the fixture, whatever the case did.
+the fixture, whatever the case did. devlink reports what each meter was created
+with until something sets it, so what the fixture puts back is what the
+hardware ran at boot, not a placeholder that would switch a meter off.
 """
 from __future__ import annotations
 
@@ -44,6 +46,11 @@ POLICER_PUNT, POLICER_SEC = 1, 2
 # itself, before the driver is asked.
 LIMITS = {POLICER_PUNT: {"rate": (1000, 5000000), "burst": (1, 2048)},
           POLICER_SEC: {"rate": (1, 14880952), "burst": (1, 2048)}}
+# What each meter's profile is created with, and so what devlink reports until
+# something sets it: dpa_app's punt defaults, and the SEC profile's peak pair --
+# it passes green and yellow alike, so the peak rate and burst are all it
+# enforces.
+BOOT = {POLICER_PUNT: (195312, 64), POLICER_SEC: (1060000, 64)}
 
 FLOOD_RATE = 1000          # packets per second the meter is set to
 FLOOD_OFFERED = 2000       # and what the flood offers it
@@ -155,6 +162,27 @@ async def test_flowtable_qos_devlink_policers_round_trip(devlink):
             assert await current(policer) == wanted, (policer, rate, burst)
         await set_policer(con, handle, policer, *start)
         assert await current(policer) == start, (policer, start)
+
+
+async def test_flowtable_qos_devlink_policers_report_what_the_hardware_runs(devlink):
+    """Each policer reports the rate and burst its meter was created with, and a
+    set that names only a rate keeps the burst the meter runs.
+
+    devlink reports a policer's registered values until a set succeeds, and
+    keeps the registered burst for a set that leaves it out. Every case in this
+    file puts back what it found, so the values found here are the boot values
+    on any run of the same boot; a case that failed to restore fails here.
+    """
+    con, handle, original = devlink
+    found = {policer: (row["rate"], row["burst"]) for policer, row in original.items()}
+    assert found == BOOT, found
+    rate = 100000
+    await console_command(con, "devlink", "trap", "policer", "set", handle,
+                          "policer", str(POLICER_PUNT), "rate", str(rate))
+    _, rows = await policers(con)
+    assert (rows[POLICER_PUNT]["rate"], rows[POLICER_PUNT]["burst"]) == (
+        rate, BOOT[POLICER_PUNT][1]), rows[POLICER_PUNT]
+    assert (rows[POLICER_SEC]["rate"], rows[POLICER_SEC]["burst"]) == BOOT[POLICER_SEC], rows
 
 
 class Sink(asyncio.DatagramProtocol):

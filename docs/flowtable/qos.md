@@ -1528,10 +1528,17 @@ way, so the choice moves the registration and nothing else.
 The instance lands on the FMAN's own platform device, reached through
 `mac_dev->fm_dev` — which the SDK's own `fm_get_handle()` casts to
 `t_LnxWrpFmDev *`, so the pointer is that wrapper and nothing else. It is
-registered as the first ethernet interface comes up, because that is the first
-moment cdx holds anything that can name the device, and it belongs to the FMAN
+registered by the DPA configuration once both meters' profiles exist — the
+same wrapper is what cdx resolves the FMAN's PCD handle through — and
+unregistered first when that configuration is rolled back or torn down, while
+the profiles its callbacks program are still there. It belongs to the FMAN
 rather than to a port: one profile meters every port's misses, and an instance
 per port would be four handles onto one meter.
+
+(It was first registered as the first ethernet interface came up, which is
+earlier than either profile exists. See
+[below](#what-devlink-reported-was-not-what-the-hardware-ran) for what that
+cost.)
 
 **No traps, and no groups.** The kernel binds policers to trap groups and groups
 to traps, and a trap is something a driver *reports* — it hands every punted
@@ -1558,6 +1565,9 @@ platform/1a00000.fman
   policer 1 rate 5000000 burst 2048
 ```
 
+That first reading was the range's ceiling, not the profile: the punt meter ran
+195312 packets a second in bursts of 64 all along, and the registration now
+says so ([below](#what-devlink-reported-was-not-what-the-hardware-ran)).
 Set to `rate 100000 burst 512` it reads back as asked. CMM's validated range
 survives as the policer's own `min`/`max`, so devlink refuses what CMM refused,
 with its own message rather than a driver error:
@@ -1620,12 +1630,55 @@ change here — gating it on the ownership mode would only leave a gate somebody
 has to remember to remove.
 
 *Proved on hardware, 2026-09-17.* Both policers appear on
-`platform/1a00000.fman`, policer 2 defaulting to `rate 14880952 burst 2048` —
-`QM_SECRATE_MAX_CIR`, the 64-byte frame rate of a 10G port. Set to
+`platform/1a00000.fman`, policer 2 then reporting `rate 14880952 burst 2048` —
+`QM_SECRATE_MAX_CIR`, the 64-byte frame rate of a 10G port, which was the
+range's ceiling rather than what the profile ran (see the next section). Set to
 `rate 200000 burst 1024` it read back as asked, and CMM's range is enforced at
 both edges: `rate 99999999` and `burst 4096` are both refused. `devlink dev
 param show` is now empty, the parameters having been replaced rather than
 duplicated. No BUG, WARNING or call trace.
+
+#### What devlink reported was not what the hardware ran
+
+Both policers were registered with the ends of their ranges as their initial
+values — `rate 5000000 burst 2048` and `rate 14880952 burst 2048` — and devlink
+reports a policer's initial values until a set succeeds. The profiles ran
+something else entirely:
+
+| policer | reported at boot | the profile ran |
+| --- | --- | --- |
+| 1, punt | `rate 5000000 burst 2048` | 195312 packets/s, burst 64 — `dpa_app`'s defaults |
+| 2, SEC | `rate 14880952 burst 2048` | committed 740000, peak 1060000 packets/s, bursts 32 and 64 |
+
+So `devlink trap policer show` was wrong on every boot, "restoring" the values
+it reported turned both meters effectively off until the next boot, and a set
+naming only a rate took the fictional burst of 2048, because devlink keeps the
+registered burst for an attribute a set leaves out.
+
+The registration now carries the programmed values. It happens once both
+profiles exist, which is what moved it out of the interface bring-up, and each
+policer is built from what the hardware layer recorded beside its handle: the
+punt profile's limit and burst, and the SEC profile's *peak* pair. The SEC
+profile passes green and yellow alike and drops only red, so the peak rate and
+burst are the whole of what it enforces, and 1060000 with a burst of 64 is what
+policer 2 reports. A profile devlink cannot describe honestly is left out
+rather than approximated: a punt profile configured off or metering bytes gives
+no policer 1, a SEC profile that is off gives no policer 2, and a programmed
+value outside the declared range is reported in the kernel log and not
+registered, never clamped.
+
+```
+# devlink trap policer show
+  policer 1 rate 195312 burst 64
+  policer 2 rate 1060000 burst 64
+```
+
+The attach no longer enables the SEC profile either. It was created enabled
+all along, so that call only ever returned an error nobody read.
+`tools/host_tests/test_devlink_policer.py` compiles the chain from the loader's
+defaults through profile creation to the registered descriptors, and
+`test_cdx_startup.py` holds the instance to the profiles' lifetime through
+every startup fault point.
 
 **What this closes.** With the punt rate a trap policer and the SEC rate a
 parameter, no `CMD_QM_*` family is left without a kernel-verb equivalent, and

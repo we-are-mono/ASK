@@ -30,6 +30,7 @@
 #include "cdx_ceetm_gdef.h"
 #include "layer2.h"
 #include "cdx_flowtable.h"
+#include "cdx_devlink.h"
 
 //#define DPA_CFG_DEBUG 	1
 
@@ -545,6 +546,26 @@ bool cdx_expt_rate_is_packet_mode(uint32_t fm_index)
 	return (fman_info + fm_index)->expt_ratelim_mode != EXPT_PKT_LIM_PLCR_MODE_BYTE;
 }
 
+/* What the punt profile of one exception type was programmed with: a limit and
+ * the burst every type shares, in whichever unit expt_ratelim_mode says. Only a
+ * profile that exists answers -- a type configured DISABLE_EXPT_PROFILE was
+ * never created -- so a caller reporting it never reports a meter that is not
+ * there. */
+int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,
+			 uint32_t *burst)
+{
+	struct cdx_fman_info *finfo;
+
+	if (fm_index >= num_fmans || type >= CDX_EXPT_MAX_EXPT_LIMIT_TYPES)
+		return FAILURE;
+	finfo = (fman_info + fm_index);
+	if (!finfo->expt_rate_limit_info[type].handle)
+		return FAILURE;
+	*limit = finfo->expt_rate_limit_info[type].limit;
+	*burst = finfo->expt_ratelim_burst_size;
+	return SUCCESS;
+}
+
 /* The colours the punt profile counted, for a caller with no FCI command
  * structure to fill. Read without clearing, as everywhere else. */
 int cdx_expt_rate_counters(uint32_t fm_index, uint32_t type,
@@ -840,6 +861,9 @@ static int dpa_rollback_resources(void)
 	uint32_t ii;
 	int ret;
 
+	/* First, while every profile it programs and counts still exists: its
+	 * callbacks reach them through handles released further down. */
+	cdx_devlink_detach();
 	dpa_release_pcd_fqs();
 	for (ii = 0; ii < MAX_PHY_PORTS; ii++) {
 		if (phy_port[ii].flags) {
@@ -1108,6 +1132,12 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		goto err_ret;
 	}
 #endif
+	/* Both device-wide meters exist from here, so devlink can be told what
+	 * they run rather than a placeholder. A failure costs the operator the
+	 * verb and not the port, so it is reported rather than fatal; the
+	 * rollback below detaches it either way, before the profiles go. */
+	if (cdx_devlink_attach(wrappers[FMAN_INDEX]->dev))
+		DPA_ERROR("%s::unable to register the devlink instance\n", __func__);
 #ifdef ENABLE_EGRESS_QOS
 	if (ceetm_init_cq_plcr() || cdx_dpa_init_fault()) {
 		retval = -EIO;
@@ -1495,6 +1525,27 @@ int cdx_ingress_policer_config(uint32_t fm_index, uint32_t queue_no,
 		return FAILURE;
 	*cir = finfo->ingress_policer_info[queue_no].cir_value;
 	*cbs = finfo->ingress_policer_info[queue_no].cbs;
+	return SUCCESS;
+}
+
+/* The peak rate and burst one ingress profile enforces, when it is metering at
+ * all. A profile whose green and yellow share an action drops on the peak pair
+ * alone, so this pair is what it actually holds traffic to. A disabled profile
+ * does not answer: it passes everything, and it refuses a new rate until it is
+ * enabled again. */
+int cdx_ingress_policer_peak(uint32_t fm_index, uint32_t queue_no,
+			     uint32_t *pir, uint32_t *pbs)
+{
+	struct cdx_fman_info *finfo;
+
+	if (fm_index >= num_fmans || queue_no >= INGRESS_ALL_POLICER_QUEUES)
+		return FAILURE;
+	finfo = (fman_info + fm_index);
+	if (!finfo->ingress_policer_info[queue_no].handle ||
+	    finfo->ingress_policer_info[queue_no].policer_on != ENABLE_INGRESS_POLICER)
+		return FAILURE;
+	*pir = finfo->ingress_policer_info[queue_no].pir_value;
+	*pbs = finfo->ingress_policer_info[queue_no].pbs;
 	return SUCCESS;
 }
 

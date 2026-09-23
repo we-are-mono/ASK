@@ -25,11 +25,14 @@
 typedef void *t_Handle;
 typedef int t_Error;
 
+#define FMAN_INDEX 0
 struct port { bool enabled, detached; };
+struct device { unsigned id; };
 typedef struct { bool active; t_Handle h_Dev; } t_LnxWrpFmPortDev;
 typedef struct {
     unsigned id;
     t_LnxWrpFmPortDev opPorts[2], rxPorts[4];
+    struct device *dev;
 } t_LnxWrpFmDev;
 struct list_head { struct list_head *next; };
 struct qman_fq { unsigned id; };
@@ -200,8 +203,32 @@ int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *f)
     }
     return 0;
 }
+/* The devlink instance reports both device-wide meters and programs them, so it
+ * may exist only while their profiles do: registered once both are created,
+ * unregistered before either is released. A registration that fails costs the
+ * verb, not the configuration. */
+static struct device fman_devices[2];
+static bool devlink_live;
+static unsigned devlink_attaches;
+static int devlink_attach_rc;
+static int cdx_devlink_attach(struct device *dev)
+{
+    assert(rtnl && cdx_info->ctrl.mutex && dpa_cfg_lock);
+    assert(dev == &fman_devices[FMAN_INDEX] && !devlink_live);
+    for (unsigned i = 0; i < CDX_EXPT_MAX_EXPT_LIMIT_TYPES; i++)
+        assert(fman_info[FMAN_INDEX].expt_rate_limit_info[i].handle);
+    for (unsigned i = 0; i < INGRESS_ALL_POLICER_QUEUES; i++)
+        assert(fman_info[FMAN_INDEX].ingress_policer_info[i].handle);
+    devlink_attaches++;
+    devlink_live = !devlink_attach_rc;
+    return devlink_attach_rc;
+}
+static void cdx_devlink_detach(void) { devlink_live = false; }
 static int FM_PCD_PlcrProfileDelete(void *p)
-{ assert(stopped()); kfree(p); int ret = fail_delete ? -EIO : 0; fail_delete = false; return ret; }
+{
+    assert(stopped() && !devlink_live);
+    kfree(p); int ret = fail_delete ? -EIO : 0; fail_delete = false; return ret;
+}
 static int FM_PORT_PcdPlcrFreeProfiles(void *p) { assert(!((struct port *)p)->enabled && slots); slots--; return 0; }
 static int ceetm_init_cq_plcr(void) { ceetm = acquire(); return ceetm ? 0 : -ENOMEM; }
 static int ceetm_exit_cq_plcr(void) { assert(stopped()); kfree(ceetm); ceetm = NULL; return 0; }
@@ -218,6 +245,7 @@ static void setup(void)
         input[i].pcd_handle = (void *)(uintptr_t)(i + 1);
         input[i].max_ports = 2; input[i].num_tables = 1; input[i].index = i;
         wrappers[i].id = i;
+        wrappers[i].dev = &fman_devices[i];
         wrappers[i].opPorts[0] = (t_LnxWrpFmPortDev){ true, &ports[2 * i] };
         wrappers[i].rxPorts[2] = (t_LnxWrpFmPortDev){ true, &ports[2 * i + 1] };
         ports[2 * i] = (struct port){.enabled = !!(port_up_mask & (1U << (2 * i)))};
@@ -235,6 +263,7 @@ static void clean_success(void)
     cdx_ctrl_unlock_with_rtnl();
     dpa_cfg_deinit();
     assert(!fman_info && !rtnl && !dpa_cfg_lock && !cdx_info->ctrl.mutex);
+    assert(!devlink_live);
     for (unsigned i = 0; i < 4; i++)
         assert(ports[i].enabled == !!(port_up_mask & (1U << i)));
     assert(!live_allocs && !slots && !queues);
@@ -242,7 +271,7 @@ static void clean_success(void)
 static void retry(void)
 {
     assert(!fman_info && !live_allocs && !slots && !queues);
-    assert(!cdx_info->ctrl.mutex && !dpa_cfg_lock && !rtnl);
+    assert(!cdx_info->ctrl.mutex && !dpa_cfg_lock && !rtnl && !devlink_live);
     assert(!unsafe_enable);
     for (unsigned i = 0; i < 4; i++)
         assert(ports[i].enabled == !!(port_up_mask & (1U << i)));
@@ -279,7 +308,12 @@ int main(void)
     assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
     assert(lock_waits == 5 && !lock_contention);
     unsigned allocations = alloc_step, steps = step;
-    assert(!unsafe_enable); clean_success();
+    assert(!unsafe_enable && devlink_live && devlink_attaches == 1); clean_success();
+    /* A registration that fails is reported, and the ports are configured
+     * all the same; the unwind then has nothing registered to take down. */
+    setup(); devlink_attach_rc = -ENOMEM;
+    assert(!cdx_ioc_set_dpa_params((unsigned long)&request) && !devlink_live);
+    devlink_attach_rc = 0; clean_success();
     for (unsigned n = 1; n <= allocations; n++) {
         setup(); fail_alloc = n;
         assert(cdx_ioc_set_dpa_params((unsigned long)&request));

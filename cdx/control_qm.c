@@ -529,12 +529,6 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 		priv = netdev_priv(qm_ctx->net_dev);
 		priv->qm_ctx = qm_ctx;
 	}
-	/* First interface up is the first moment anything here can name the
-	 * FMAN's own device, which is what the punt policer belongs to. A
-	 * failure is not this interface's problem: the scheduler works without
-	 * a devlink instance and the interface has already been built. */
-	if (cdx_devlink_attach(qm_ctx->net_dev))
-		ceetm_err("%s::unable to register the devlink instance\n", __func__);
 #endif
 	return SUCCESS;
 }
