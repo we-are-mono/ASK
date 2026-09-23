@@ -142,8 +142,14 @@ async def test_mcast_member_mtu_bound(aiohttp_session, target_agent, lan,
                 # learner's periodic refresh has to find it.
                 await _exec(target_agent, aiohttp_session, "ip", "link", "set", oif, "mtu", "1500")
                 await _state(target_agent, aiohttp_session, group, "installed")
-                await _exec(target_agent, aiohttp_session, "sysctl", "-w",
-                            f"net.ipv6.conf.{oif}.mtu=1280")
+                # Slashes, because the device name has a dot in it: a dotted
+                # key names net/ipv6/conf/eth3/324/mtu, which does not exist,
+                # and not every sysctl says so in its exit code -- so the
+                # value is read back as well.
+                key = f"net/ipv6/conf/{oif}/mtu"
+                await _exec(target_agent, aiohttp_session, "sysctl", "-w", f"{key}=1280")
+                assert (await read(target_agent, aiohttp_session,
+                                   f"/proc/sys/{key}")).strip() == "1280", key
                 await _state(target_agent, aiohttp_session, group, "refused-mtu", timeout=15)
                 result, _, _ = await _window(
                     target_agent, aiohttp_session, lan, peer, family, group,

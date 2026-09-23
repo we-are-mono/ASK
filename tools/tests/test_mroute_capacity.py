@@ -36,7 +36,7 @@ CAPTURE_SOURCE = Path(__file__).with_name("mroute_capture.py").read_text()
 
 async def _python(lan, script):
     if lan is not None:
-        r = await lan_run_python(lan, script, label="a158", timeout=15)
+        r = await lan_run_python(lan, script, label="mroute_capture", timeout=15)
         assert r.rc == 0, r.stdout
         return r.stdout
     proc = await asyncio.create_subprocess_exec(
@@ -50,7 +50,7 @@ async def _python(lan, script):
 
 @asynccontextmanager
 async def _capture(lan, config):
-    path = f"/tmp/ask-a158-{uuid.uuid4().hex}"
+    path = f"/tmp/ask-mroute-capture-{uuid.uuid4().hex}"
     config = {**config, "ready": path + ".ready", "result": path + ".json"}
     script = path + ".py"
     try:
@@ -74,7 +74,7 @@ print('READY' if ready.exists() else 'WAIT')
             await asyncio.sleep(0.1)
         else:
             log = await _python(lan, f"print(open({path + '.log'!r}).read())")
-            raise AssertionError(f"A158 capture did not become ready: {log}")
+            raise AssertionError(f"multicast capture did not become ready: {log}")
         yield (lan, config, path)
     finally:
         # Verify process identity before signalling; a capture may have hit its
@@ -110,7 +110,7 @@ for suffix in ('.pid', '.ready', '.json', '.log', '.py'):
 
 @asynccontextmanager
 async def _daemon(target, session, interfaces):
-    name = "ask-a158-" + uuid.uuid4().hex[:8]
+    name = "ask-smcroute-" + uuid.uuid4().hex[:8]
     config = f"/tmp/{name}.conf"
     text = "".join(f"phyint {dev} enable\n" for dev in interfaces)
     r = await target.fs_write(session, config, text)
@@ -129,7 +129,7 @@ async def _daemon(target, session, interfaces):
                 break
             await asyncio.sleep(0.1)
         else:
-            raise AssertionError("A158 smcrouted failed to own the default routing table")
+            raise AssertionError("smcrouted failed to own the default routing table")
         yield command
     finally:
         await command("kill", check=False)
@@ -197,7 +197,7 @@ async def _window(target, session, *, family, group, observers,
     artifact = {"config": config, "results": results, "before": before_row,
                 "after": row, "mroute": route, "cpu_rx": after - before, "idle": idle}
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    (ARTIFACTS / f"a158-{label}-v{family}.json").write_text(json.dumps(artifact, indent=2))
+    (ARTIFACTS / f"mroute-capacity-{label}-v{family}.json").write_text(json.dumps(artifact, indent=2))
     assert_results(results, expected, COUNT)
     assert ("offload" in route) == hardware, route
     cpu = after - before
