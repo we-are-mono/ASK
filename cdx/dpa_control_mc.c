@@ -25,6 +25,7 @@
 #include "linux/netdevice.h"
 #include <linux/if_arp.h>
 #include <linux/if_ether.h>
+#include <linux/etherdevice.h>
 #include <net/ipv6.h>
 #include <net/net_namespace.h>
 
@@ -259,6 +260,12 @@ void cdx_mc_remove_hcsync_fail_probe(void)
 static void cdx_mcast_compute_mac(const struct mcast_group_info *grp,
 				  uint8_t mac[ETH_ALEN])
 {
+	/* A group keyed on its frames' own Ethernet pair matches exactly that
+	 * destination, which is the one the port has to let through. */
+	if (grp->mac_keyed) {
+		memcpy(mac, grp->mac_pair, ETH_ALEN);
+		return;
+	}
 	if (grp->mctype == 0) {
 		/* IPv4: 01:00:5E:<low 23 bits of dst>. The mask on byte 3
 		 * matches the on-disk daddr endianness used elsewhere in
@@ -708,7 +715,7 @@ static struct en_exthash_tbl_entry *mcast_member_by_name(RouteEntry *pRtEntry,
 		return NULL;
 	}
 	tbl_entry = create_exthash_entry4mcast_member(pRtEntry, onif_desc, dev, NULL,
-						     prev_tbl_entry, tbl_type);
+						     NULL, prev_tbl_entry, tbl_type);
 	dev_put(dev);
 	return tbl_entry;
 }
@@ -814,8 +821,22 @@ static int cdx_add_mcast_table_entry(struct mcast_group_info *pMcastGrpInfo)
 		retval = -EINVAL;
 		goto err_ret;
 	}
-	retval = insert_mcast_entry_in_classif_table(pCtEntry, pMcastGrpInfo->uiListenerCnt, phyaddr,
-			pMcastGrpInfo->members[ii].tbl_entry, pMcastGrpInfo->bridged);
+	{
+		/* What the group arrives as: the ingress tags the root validates
+		 * and, for a group keyed on them, its frames' own addresses. The
+		 * legacy owner describes neither and keeps its routed root. */
+		struct cdx_l2_encap in_encap = {};
+
+		in_encap.num_ingress = pMcastGrpInfo->in_vlans;
+		memcpy(in_encap.ingress, pMcastGrpInfo->in_vlan,
+		       sizeof(in_encap.ingress));
+		retval = insert_mcast_entry_in_classif_table(pCtEntry,
+				pMcastGrpInfo->uiListenerCnt, phyaddr,
+				pMcastGrpInfo->members[ii].tbl_entry,
+				pMcastGrpInfo->bridged,
+				pMcastGrpInfo->mac_keyed ? pMcastGrpInfo->mac_pair : NULL,
+				&in_encap);
+	}
 	if(retval)
 	{
 		DPA_ERROR("%s::Insert Mcast entry failed \r\n",__func__);
@@ -2133,11 +2154,20 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
 	int rc;
 
 	if (!spec->in || !spec->listeners ||
-	    spec->listeners > CDX_MC_MAX_LISTENERS)
+	    spec->listeners > CDX_MC_MAX_LISTENERS ||
+	    spec->in_vlans > CDX_FT_VLAN_MAX)
 		return -EOPNOTSUPP;
 	rc = cdx_mc_check_group(spec);
 	if (rc)
 		return rc;
+	/* A bridged group is keyed on its frames' own addresses and its
+	 * listeners write them back, so it has to have them: a multicast
+	 * destination, and a source that is a station. Without them there is
+	 * nothing to key on but the routed key, and a routed key cannot
+	 * preserve a sender's address. */
+	if (spec->bridged && (!is_multicast_ether_addr(spec->dst_mac) ||
+			      !is_valid_ether_addr(spec->src_mac)))
+		return -EOPNOTSUPP;
 	if (!cdx_mc_port_supported(spec->in))
 		return -EOPNOTSUPP;
 	for (ii = 0; ii < spec->listeners; ii++) {
@@ -2181,6 +2211,7 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
  * for why the legacy owner's name lookup is not interchangeable with it. */
 static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
 		const struct cdx_mc_listener *listener,
+		const struct cdx_mc_member_frame *frame,
 		struct en_exthash_tbl_entry *prev, uint32_t tbl_type)
 {
 	struct cdx_l2_encap encap = {};
@@ -2220,7 +2251,7 @@ static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
 	return create_exthash_entry4mcast_member(pRtEntry, onif_desc,
 						 listener->dev,
 						 listener->vlans ? &encap : NULL,
-						 prev, tbl_type);
+						 frame, prev, tbl_type);
 }
 
 /* Builds a whole listener chain into `grp`, threaded head to tail, and leaves
@@ -2233,16 +2264,26 @@ static int cdx_mc_build_listeners(struct mcast_group_info *grp,
 {
 	struct en_exthash_tbl_entry *tbl_entry = NULL;
 	RouteEntry RtEntry, *pRtEntry = &RtEntry;
+	struct cdx_mc_member_frame frame = {};
 	uint32_t tbl_type;
 	unsigned int ii;
 
 	memset(&RtEntry, 0, sizeof(RouteEntry));
 	cdx_mcast_compute_mac(grp, pRtEntry->dstmac);
-	tbl_type = grp->mctype ? IPV6_MULTICAST_TABLE : IPV4_MULTICAST_TABLE;
+	/* A listener's entry comes from its port's table of the root's type,
+	 * and a bridged copy writes back the pair its root matched. */
+	if (grp->mac_keyed) {
+		tbl_type = grp->mctype ? IPV6_BRIDGED_MULTICAST_TABLE :
+					 IPV4_BRIDGED_MULTICAST_TABLE;
+		frame.mac_pair = grp->mac_pair;
+	} else {
+		tbl_type = grp->mctype ? IPV6_MULTICAST_TABLE :
+					 IPV4_MULTICAST_TABLE;
+	}
 
 	for (ii = 0; ii < spec->listeners; ii++) {
 		tbl_entry = cdx_mc_listener_entry(pRtEntry, &spec->listener[ii],
-						  tbl_entry, tbl_type);
+						  &frame, tbl_entry, tbl_type);
 		if (!tbl_entry) {
 			/* Releases the entries built so far and clears their
 			 * slots. It also hands back the group id, so a caller
@@ -2310,11 +2351,108 @@ unsigned int cdx_mc_group_count(void)
 	return cdx_mc_groups_owned;
 }
 
+/* Fill in everything about a group its root entry is built from: the family,
+ * the addresses, the ingress and what the group's frames arrive as. Shared by
+ * add and by replace's scratch group, so the two can never describe one key
+ * two ways. */
+static void cdx_mc_describe(struct mcast_group_info *grp,
+			    const struct cdx_mc_group_spec *spec)
+{
+	u8 ii;
+
+	grp->mctype = spec->family == AF_INET6;
+	grp->bridged = spec->bridged;
+	if (grp->mctype) {
+		memcpy(grp->ipv6_saddr, &spec->src.in6, IPV6_ADDRESS_LENGTH);
+		memcpy(grp->ipv6_daddr, &spec->dst.in6, IPV6_ADDRESS_LENGTH);
+	} else {
+		grp->ipv4_saddr = spec->src.ip;
+		grp->ipv4_daddr = spec->dst.ip;
+	}
+	strncpy(grp->ucIngressIface, spec->in->name, IF_NAME_SIZE - 1);
+	/* Keyed on the device rather than on that name. The caller pins it for
+	 * the group's life, nothing in cdx handles NETDEV_CHANGENAME, and a
+	 * group that stopped recognising its own ingress after a rename would
+	 * refuse every subsequent replace and freeze its listener set. */
+	grp->in_dev = spec->in;
+	grp->mac_keyed = spec->bridged;
+	if (grp->mac_keyed) {
+		memcpy(grp->mac_pair, spec->dst_mac, ETH_ALEN);
+		memcpy(grp->mac_pair + ETH_ALEN, spec->src_mac, ETH_ALEN);
+	}
+	/* The spec orders tags outermost first, the encapsulation innermost
+	 * first -- the same reversal a listener's tags take. */
+	grp->in_vlans = spec->in_vlans;
+	for (ii = 0; ii < spec->in_vlans; ii++) {
+		grp->in_vlan[spec->in_vlans - 1 - ii].tpid =
+			ntohs(spec->in_vlan[ii].proto);
+		grp->in_vlan[spec->in_vlans - 1 - ii].tci = spec->in_vlan[ii].id;
+	}
+}
+
+/* Whether a group already holds this one's classifier key.
+ *
+ * The key is what the root entry is hashed on: the ingress port, the address
+ * pair, and -- in the bridged multicast table -- the frame's own Ethernet pair.
+ * Two groups that differ in any of those are two entries the classifier tells
+ * apart, and both may exist: the same (S,G) arriving on two ports, or from two
+ * senders into a bridge. Two that agree on all of them are one entry, whatever
+ * else differs, and the second is refused -- including one that differs only
+ * in its ingress tags, because the key names no VLAN and the classifier would
+ * hold two entries it cannot choose between.
+ *
+ * A legacy group names its ingress by interface name and never coexists with
+ * one keyed on a device; against it the legacy owner's own rule applies, the
+ * address pair alone. Called with mc_mutators_mutex held; the bucket lock is
+ * taken here, as GetMcastGrpId() takes it. */
+static bool cdx_mc_key_taken(const struct mcast_group_info *grp)
+{
+	struct mcast_group_info *tmp;
+	struct list_head *head;
+	spinlock_t *lock;
+	bool taken = false;
+
+	if (grp->mctype) {
+		unsigned int hash = HASH_MC6((void *)grp->ipv6_daddr);
+
+		head = &mc6_grp_list[hash];
+		lock = &mc6_spinlocks[hash];
+	} else {
+		unsigned int hash = HASH_MC4(grp->ipv4_daddr);
+
+		head = &mc4_grp_list[hash];
+		lock = &mc4_spinlocks[hash];
+	}
+	spin_lock(lock);
+	list_for_each_entry(tmp, head, list) {
+		if (tmp->mctype != grp->mctype)
+			continue;
+		if (grp->mctype ?
+		    (memcmp(tmp->ipv6_daddr, grp->ipv6_daddr, IPV6_ADDRESS_LENGTH) ||
+		     memcmp(tmp->ipv6_saddr, grp->ipv6_saddr, IPV6_ADDRESS_LENGTH)) :
+		    (tmp->ipv4_daddr != grp->ipv4_daddr ||
+		     tmp->ipv4_saddr != grp->ipv4_saddr))
+			continue;
+		if (!tmp->in_dev || !grp->in_dev) {
+			taken = true;
+			break;
+		}
+		if (tmp->in_dev != grp->in_dev || tmp->mac_keyed != grp->mac_keyed)
+			continue;
+		if (grp->mac_keyed &&
+		    memcmp(tmp->mac_pair, grp->mac_pair, sizeof(grp->mac_pair)))
+			continue;
+		taken = true;
+		break;
+	}
+	spin_unlock(lock);
+	return taken;
+}
+
 int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
 		     struct cdx_mc_group **result)
 {
 	struct mcast_group_info *grp;
-	uint8_t IngressIface[IF_NAME_SIZE];
 	struct cdx_mc_group *group;
 	int rc;
 
@@ -2334,35 +2472,17 @@ int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
 	}
 	INIT_LIST_HEAD(&grp->list);
 	grp->grpid = -1;
-	grp->mctype = spec->family == AF_INET6;
-	grp->bridged = spec->bridged;
-	if (grp->mctype) {
-		memcpy(grp->ipv6_saddr, &spec->src.in6, IPV6_ADDRESS_LENGTH);
-		memcpy(grp->ipv6_daddr, &spec->dst.in6, IPV6_ADDRESS_LENGTH);
-	} else {
-		grp->ipv4_saddr = spec->src.ip;
-		grp->ipv4_daddr = spec->dst.ip;
-	}
-	strncpy(grp->ucIngressIface, spec->in->name, IF_NAME_SIZE - 1);
-	/* Keyed on the device rather than on that name. The caller pins it for
-	 * the group's life, nothing in cdx handles NETDEV_CHANGENAME, and a
-	 * group that stopped recognising its own ingress after a rename would
-	 * refuse every subsequent replace and freeze its listener set. */
-	grp->in_dev = spec->in;
+	cdx_mc_describe(grp, spec);
 
 	/* Serialized against the FCI mutators, which is the discipline this
 	 * file's own header states for any caller that does not arrive through
 	 * the command dispatcher. Both owners never run at once, but the rule
 	 * is about this file's state rather than about who is driving. */
 	mutex_lock(&mc_mutators_mutex);
-	/* GetMcastGrpId() matches on the address pair alone -- the ingress is
-	 * reported back rather than compared -- so this refuses a second
-	 * ingress for one (S,G) as well as a genuine duplicate. That is the
-	 * legacy owner's restriction and it is inherited deliberately: one
-	 * group id and one root entry exist per address pair here, and lifting
-	 * it is a change to that structure rather than to this check. A caller
-	 * wanting a different listener set for an installed key wants replace. */
-	if (GetMcastGrpId(grp, IngressIface) != -1) {
+	/* One entry per classifier key; see cdx_mc_key_taken(). A caller
+	 * wanting a different listener set for an installed key wants
+	 * replace. */
+	if (cdx_mc_key_taken(grp)) {
 		rc = -EEXIST;
 		goto err_unlock;
 	}
@@ -2416,6 +2536,20 @@ static bool cdx_mc_same_key(const struct mcast_group_info *grp,
 	 * replace and freeze the listener set for good. */
 	if (grp->in_dev != spec->in)
 		return false;
+	/* What the frames arrive as is the root's too: the Ethernet pair is
+	 * in the key, and the ingress tags are what its STRIP_ALL_VLAN_HDRS
+	 * validates. A chain swap changes neither. */
+	{
+		struct mcast_group_info described = {};
+
+		cdx_mc_describe(&described, spec);
+		if (described.mac_keyed != grp->mac_keyed ||
+		    (grp->mac_keyed && memcmp(described.mac_pair, grp->mac_pair,
+					      sizeof(grp->mac_pair))) ||
+		    described.in_vlans != grp->in_vlans ||
+		    memcmp(described.in_vlan, grp->in_vlan, sizeof(grp->in_vlan)))
+			return false;
+	}
 	if (grp->mctype)
 		return !memcmp(grp->ipv6_saddr, &spec->src.in6, IPV6_ADDRESS_LENGTH) &&
 		       !memcmp(grp->ipv6_daddr, &spec->dst.in6, IPV6_ADDRESS_LENGTH);
@@ -2508,6 +2642,10 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 	memcpy(fresh->ipv6_daddr, grp->ipv6_daddr, sizeof(fresh->ipv6_daddr));
 	strncpy(fresh->ucIngressIface, grp->ucIngressIface, IF_NAME_SIZE - 1);
 	fresh->in_dev = grp->in_dev;
+	/* And the pair a bridged copy writes back, with the table its entries
+	 * come from. */
+	fresh->mac_keyed = grp->mac_keyed;
+	memcpy(fresh->mac_pair, grp->mac_pair, sizeof(fresh->mac_pair));
 
 	mutex_lock(&mc_mutators_mutex);
 	/* Reclaim anything a previous failed barrier left parked before adding

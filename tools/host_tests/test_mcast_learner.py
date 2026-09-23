@@ -44,12 +44,17 @@ def test_mcast_learner(tmp_path):
             "ft_mc_mtu_bounded",
             "ft_mc_port_eligible",
             "ft_mc_port_tags",
+            "ft_mc_drop_next",
+            "ft_mc_drop_stream",
             "ft_mc_group_free",
             "ft_mc_membership",
             "ft_mc_drop_port",
             "ft_mc_key_contested",
             "ft_mc_seen_eq",
             "ft_mc_match",
+            "ft_mc_resolve",
+            "ft_mc_adopt_next",
+            "ft_mc_revalidate",
         ]))
     binary = tmp_path / "mcast_learner"
     subprocess.run([
@@ -94,6 +99,32 @@ def test_the_worker_never_holds_the_group_lock_across_the_transaction():
     assert "cdx_ft_begin();" in body, "the worker is where the hardware happens"
     assert unlock < body.index("cdx_ft_begin();"), (
         "ft_mc_lock must be released before the transaction is taken")
+
+
+def test_the_vlan_rederivation_takes_rtnl_first_and_never_across_hardware():
+    """The bridge VLAN lookups need RTNL, and the switchdev handler holds it
+    while it takes ft_mc_lock, so the worker takes them in that order too. And
+    RTNL is never held across the transaction -- cdx_ctrl_lock_with_rtnl()'s
+    standing rule -- nor is the transaction taken by the refresh in any order
+    but /proc's."""
+    from test_mroute_learner import _assert_not_inside, _held_regions
+    source = SOURCE.read_text()
+    worker = function(source, "ft_mc_work_fn")
+    rederive = worker[worker.index("if (READ_ONCE(ft_mc_vlan_stale))"):]
+    rederive = rederive[:rederive.index("rtnl_unlock();")]
+    assert rederive.index("rtnl_lock();") < rederive.index("mutex_lock(&ft_mc_lock);")
+    assert "ft_mc_revalidate(g)" in rederive
+    _assert_not_inside(worker, _held_regions(worker, "rtnl_lock()", "rtnl_unlock()"),
+                       "cdx_ft_begin()", "RTNL must be released before the transaction")
+    # The handler only marks: a port VLAN object is notified before the
+    # bridge applies it, so reading the bridge there would read the old state.
+    changed = function(source, "ft_mc_vlan_changed")
+    assert "ft_mc_port_tags" not in changed and "br_vlan_get" not in changed
+    assert "g->vlan_stale = true;" in changed
+    refresh = function(source, "ft_mc_refresh_fn")
+    assert refresh.index("cdx_ft_begin();") < refresh.index("mutex_lock(&ft_mc_lock);")
+    exit_body = function(source, "ft_mc_exit")
+    assert exit_body.count("cancel_delayed_work_sync(&ft_mc_refresh)") == 2
 
 
 def test_every_reference_the_learner_takes_is_released():

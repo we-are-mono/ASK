@@ -4,9 +4,12 @@ Investigation status, 2026-09-22: hardware tests establish that multicast
 entries qualified by the original Ethernet addresses can preserve those
 addresses while inserting the required VLAN. Both IPv4 and IPv6 support the
 larger key, including two entries for the same IP stream with different
-source MACs. This is a verified hardware mechanism, not a completed
-production integration. The production bridge multicast encoder still
-replaces the source MAC with the egress port's MAC.
+source MACs.
+
+Production status, A191: bridged groups now use this mechanism. See
+[Production integration](#production-integration) at the end for the table
+plan, the key, the ingress tags and what the rig asserts. The sections before
+it are the investigation that justified it, kept as written.
 
 This qualifies the original single-pass design in
 [multicast.md](multicast.md). Producing the requested VLAN
@@ -254,3 +257,80 @@ IPv4/IPv6, tagged/untagged ingress and egress, and acceleration under load.
 The offline pass adds hardware work per affected copy and needs measurement.
 
 No software-fallback policy has been selected as part of this investigation.
+
+## Production integration
+
+A191 turned the proof into the bridged learner's path. What it adds, piece by
+piece:
+
+**Tables of their own, behind the routed ones.** A table cannot mix key
+layouts, and a routed group cannot be keyed on MACs: the upstream router's
+address is not in the MFC entry. So `cdx_pcd.xml` gains `cdx_bridged_mcast4_cc`
+(22-byte key) and `cdx_bridged_mcast6_cc` (46 bytes). Their distributions list
+`ethernet.dst`, `ethernet.src`, the source, the group and the protocol. In
+every policy they come right after the routed multicast distributions. The key
+generator selects the first distribution in policy order whose protocols a
+frame has. fmc gives the policy's first distribution the lowest scheme id,
+which the host-mode model dump confirms. So the routed ones match every
+multicast frame first. The bridged ones are reached only as the routed tables'
+miss, which `cdxdrv_set_miss_action()` points at them. Their miss then goes to
+the Ethernet table, as the routed tables' used to. This is the pattern the
+3-tuple UDP tables already follow behind the 5-tuple ones. A routed group's
+ingress is never a bridge port and a bridged group's always is, so no frame
+is a candidate for both. fmc numbers classification groups in reverse policy
+order, so Ethernet, PPPoE and the two 3-tuple tables keep groups 0 to 3; the
+soft parser's PPPoE path counts from that base. A configuration without the
+new tables still loads: the routed miss falls back to Ethernet, and a bridged
+group cannot then be installed.
+
+**Types.** cdx indexes a port's tables by the type dpa_app reports, so the
+bridged tables take the two 3-tuple TCP slots the vendor reserved and nothing
+creates (`IPV4_BRIDGED_MULTICAST_TABLE`, `IPV6_BRIDGED_MULTICAST_TABLE` in
+`cdx_ioctl.h`). The kernel reads a table type only to choose the microcode
+class, and these are multicast (L3) tables, the class the proof ran in. So
+dpa_app hands `FM_PCD_HashTableSet()` the multicast types for them, and no
+kernel patch changes.
+
+**The key and the rebuild.** `fill_mcast_mac_key()` composes port id,
+destination MAC, source MAC, source, group and protocol, the order the key
+generator extracts them in. Each listener is drawn from its port's bridged
+table. It rebuilds Ethernet with exactly the pair its root matched
+(`struct cdx_mc_member_frame`, applied after the interface walk), behind the
+listener's own tags. The hop count is untouched, as before.
+
+**Ingress tags.** `cdx_mc_group_spec` names the tags a group arrives with
+(`in_vlan`, `in_vlans`). The root's `STRIP_ALL_VLAN_HDRS` validates and
+strips exactly those, the way a flow's root does. An untagged stream, which
+is what a port's PVID gives the group's VLAN, is validated as untagged. The
+key names no VLAN, so the same key tagged differently on the same port is
+excepted to Linux rather than replicated as this group's. The routed learner
+now passes its parent VIF's tags too. Before that, a VLAN-device parent had
+its root expect an untagged frame and never carried its stream.
+
+**Streams.** The traffic hook records each frame's MAC pair and whether it
+carried the group's VLAN as a single 802.1Q tag. It does not learn from
+anything a root cannot validate: a second tag, a tag in another protocol, or
+a tag on a bridge that does not filter, which forwards it intact. An installed
+entry keeps its key while it carries traffic. A five-second refresh reads each
+entry's counter. An entry idle for a whole interval reopens the hook, and a
+stream seen then takes the key over. That covers a sender whose MAC changed, a
+source that moved, and the same stream arriving on another port. Two live
+senders do not trade one entry. A bridge VLAN change re-derives every group
+on that bridge under RTNL: listener tags, listeners that left the VLAN, and
+whether the ingress shape still resolves to the group's VLAN.
+
+**What the rig asserts.** `test_flowtable_service_multicast_bridge.py` reads
+the replica's frame, not just its datagram, in both directions:
+
+- `test_flowtable_service_multicast_bridge_keeps_the_sender`: untagged in on
+  the WAN port, tagged out to the LAN listener. The source MAC is the
+  sender's, the destination is the group's MAC and the hop count is unchanged.
+  The classifier counts at least 95% of the frames and the ingress CPU sees at
+  most 10%. A second sender MAC then takes the key over once the first goes
+  idle, with the same assertions for the new sender.
+- `test_flowtable_service_multicast_bridge_tagged_ingress`: tagged in on the
+  LAN port, out of the WAN port to the orchestrator's wire. The same
+  assertions hold, and the `/proc` row names the ingress tag.
+
+Not established by these: MAC-variant capacity beyond one stream per
+membership, and bursty streams near the idle interval.

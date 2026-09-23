@@ -4371,6 +4371,7 @@ static int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *pt
  * with that state rather than with this chain's other cases. */
 static bool ft_mc_swdev_obj(unsigned long event,
 			    struct switchdev_notifier_port_obj_info *obj);
+static void ft_mc_vlan_changed(struct net_device *dev);
 
 /* Whether a port attribute takes a bridge port, one MSTI of it, or one VLAN
  * of it or of the bridge's own entry, out of FORWARDING -- or may take any
@@ -4474,8 +4475,11 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 	 * listener's tag from exactly the three settings this case carries, so
 	 * a change to any of them makes its recorded set describe something
 	 * the bridge no longer does. It is re-derived rather than retired; the
-	 * worker decides whether the group survives the new configuration. */
+	 * worker decides whether the group survives the new configuration.
+	 * A bridged group holds the same three decisions for its listeners and
+	 * its ingress, and is re-derived the same way. */
 	ft_mr_kick();
+	ft_mc_vlan_changed(dev);
 	spin_lock_bh(&ft_watch_lock);
 	/* Latch before releasing the watch lock, exactly as the netdev
 	 * upper-device event does: a concurrent last unbind and fresh bind must
@@ -4756,6 +4760,23 @@ struct ft_mc_port {
 	 * say why. That is the partial replication the contract refuses, and
 	 * refusing it means knowing the member is there. */
 	bool uncarried;
+	/* The port left the group's VLAN after it joined, so the bridge no
+	 * longer delivers to it and neither may the hardware. Kept rather than
+	 * dropped, because the membership still stands and the port rejoining
+	 * the VLAN makes it a listener again with no MDB event to say so. */
+	bool absent;
+};
+
+/* One stream of a group, as the traffic half observed it: the port it
+ * arrives on, its source, its frames' Ethernet pair, and whether they carry
+ * the group's VLAN as a tag. Everything a bridged group's hardware key and
+ * ingress validation are made of. */
+struct ft_mc_stream {
+	struct net_device *in;
+	union nf_inet_addr src;
+	u8 dst_mac[ETH_ALEN];
+	u8 src_mac[ETH_ALEN];
+	bool tagged;
 };
 
 /* A group the bridge has told us about.
@@ -4796,7 +4817,31 @@ struct ft_mc_group {
 	 */
 	struct net_device *in;
 	union nf_inet_addr src;
+	/* The rest of what the traffic half learned, and the rest of the key:
+	 * the frames' own Ethernet pair, which a bridged group is keyed on and
+	 * rebuilt with, and whether they carry the group's VLAN as a tag or
+	 * arrive untagged on the port's PVID, which is what the root accepts. */
+	u8 dst_mac[ETH_ALEN];
+	u8 src_mac[ETH_ALEN];
+	bool in_tagged;
 	struct cdx_mc_group *hw;
+	/* Another stream of this group reached the CPU while an entry was
+	 * installed -- the only way one can, because the entry's own frames
+	 * never do: a sender whose MAC changed, a source that moved, the same
+	 * stream on another port. It takes over the key once the installed
+	 * one has gone idle, and not while that one is still carrying traffic,
+	 * so two live senders do not trade one entry back and forth. `next.in`
+	 * holds a reference of its own. */
+	struct ft_mc_stream next;
+	bool has_next;
+	/* What the classifier had counted at the last refresh, and whether it
+	 * has counted nothing since. An idle installed group reopens the
+	 * traffic hook, which is how `next` is ever seen. */
+	u64 hw_packets;
+	bool idle;
+	/* The bridge's VLAN configuration changed and the worker has not
+	 * re-derived this group's tags and ingress against it yet. */
+	bool vlan_stale;
 	/* Another membership on this bridge resolves to the same hardware key,
 	 * so neither may be installed.
 	 *
@@ -4830,6 +4875,15 @@ static unsigned int ft_mc_count, ft_mc_installed;
 static u64 ft_mc_refused, ft_mc_install_errors;
 static void ft_mc_work_fn(struct work_struct *work);
 static DECLARE_WORK(ft_mc_work, ft_mc_work_fn);
+/* How often an installed group's entry is asked what it has counted. The
+ * routed learner's fold runs at the same pace, and nothing here wants to be
+ * finer: an entry idle this long hands its key to another stream. */
+#define FT_MC_REFRESH_INTERVAL	(5 * HZ)
+static void ft_mc_refresh_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ft_mc_refresh, ft_mc_refresh_fn);
+/* Some group's bridge changed its VLAN configuration; the worker re-derives
+ * every group marked vlan_stale under RTNL before it installs anything. */
+static bool ft_mc_vlan_stale;
 /* Set once the adapter is tearing down, so a queued worker that runs during
  * exit does nothing rather than reaching a backend that is going away. */
 static bool ft_mc_stopping;
@@ -5019,6 +5073,31 @@ static void ft_mc_drop_port(struct net_device *port)
 	}
 }
 
+/* Forget a stream the group was keeping for later. */
+static void ft_mc_drop_next(struct ft_mc_group *g)
+{
+	if (g->has_next)
+		dev_put(g->next.in);
+	memset(&g->next, 0, sizeof(g->next));
+	g->has_next = false;
+}
+
+/* Forget the stream the group is keyed on, which returns it to waiting for
+ * one. The hardware entry, if any, is the worker's to retire: a group with no
+ * ingress is not installable. */
+static void ft_mc_drop_stream(struct ft_mc_group *g)
+{
+	if (g->in)
+		dev_put(g->in);
+	g->in = NULL;
+	memset(&g->src, 0, sizeof(g->src));
+	eth_zero_addr(g->dst_mac);
+	eth_zero_addr(g->src_mac);
+	g->in_tagged = false;
+	g->retries = 0;
+	g->dirty = true;
+}
+
 static void ft_mc_group_free(struct ft_mc_group *g)
 {
 	u8 i;
@@ -5027,6 +5106,7 @@ static void ft_mc_group_free(struct ft_mc_group *g)
 		dev_put(g->port[i].dev);
 	if (g->in)
 		dev_put(g->in);
+	ft_mc_drop_next(g);
 	dev_put(g->bridge);
 	kfree(g);
 }
@@ -5109,10 +5189,22 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 		list_add(&g->list, &ft_mc_groups);
 		ft_mc_count++;
 	}
-	for (i = 0; i < g->ports; i++)
-		if (g->port[i].dev == port)	/* already a member */
-			return !g->port[i].uncarried && !g->host &&
-			       ft_mc_carriable(g);
+	for (i = 0; i < g->ports; i++) {
+		struct ft_mc_port *p = &g->port[i];
+
+		if (p->dev != port)
+			continue;
+		/* Already a member. One that had left the group's VLAN and is
+		 * joining again is in it again: the bridge would not report the
+		 * join otherwise. */
+		if (p->absent && !p->uncarried &&
+		    !ft_mc_port_tags(bridge, port, addr->vid, p->vlan, &p->vlans)) {
+			p->absent = false;
+			g->dirty = true;
+		}
+		return !p->uncarried && !p->absent && !g->host &&
+		       ft_mc_carriable(g);
+	}
 	if (g->ports == FT_MC_MAX_MEMBERS) {
 		/* Nowhere to record it, so from here the group has a member it
 		 * cannot name and must not be installed. */
@@ -5172,6 +5264,16 @@ struct ft_mc_seen {
 	int in_ifindex;
 	struct br_ip addr;
 	union nf_inet_addr src;
+	/* The frame's own Ethernet pair, which a bridged group is keyed on and
+	 * which every copy is rebuilt with; see the bridged multicast tables in
+	 * cdx_ioctl.h. */
+	u8 dst_mac[ETH_ALEN];
+	u8 src_mac[ETH_ALEN];
+	/* The frame carried the group's VLAN as an 802.1Q tag, rather than
+	 * arriving untagged and being given it by the port's PVID. The root
+	 * accepts exactly one of the two shapes, and it has to be the one the
+	 * stream has. */
+	bool tagged;
 };
 
 /* Deep enough to absorb the few frames between an observation and the worker
@@ -5195,7 +5297,10 @@ static bool ft_mc_seen_eq(const struct ft_mc_seen *a, const struct ft_mc_seen *b
 	return a->bridge_ifindex == b->bridge_ifindex &&
 	       a->in_ifindex == b->in_ifindex &&
 	       !memcmp(&a->addr, &b->addr, sizeof(a->addr)) &&
-	       !memcmp(&a->src, &b->src, sizeof(a->src));
+	       !memcmp(&a->src, &b->src, sizeof(a->src)) &&
+	       ether_addr_equal(a->dst_mac, b->dst_mac) &&
+	       ether_addr_equal(a->src_mac, b->src_mac) &&
+	       a->tagged == b->tagged;
 }
 
 /* The VLAN this frame is on, as the bridge will resolve it a moment later in
@@ -5240,9 +5345,12 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 	unsigned int next, l3_off;
 	__be16 proto;
 
-	/* Cheapest tests first: this sits in the bridge's receive path. */
+	/* Cheapest tests first: this sits in the bridge's receive path. A
+	 * source that is not a station's cannot key an entry whose listeners
+	 * write it back. */
 	if (!port || !skb || !is_multicast_ether_addr(eth_hdr(skb)->h_dest) ||
-	    is_broadcast_ether_addr(eth_hdr(skb)->h_dest))
+	    is_broadcast_ether_addr(eth_hdr(skb)->h_dest) ||
+	    !is_valid_ether_addr(eth_hdr(skb)->h_source))
 		return NF_ACCEPT;
 	bridge = netdev_master_upper_dev_get_rcu(port);
 	if (!bridge || !netif_is_bridge_master(bridge))
@@ -5265,6 +5373,18 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 		proto = vhdr->h_vlan_encapsulated_proto;
 		l3_off = VLAN_HLEN;
 	}
+	/* The one framing a group can be learned from is a single tag in the
+	 * bridge's own protocol, or none. A tag still inline here is a second
+	 * one, and a root validates one stack only; a tag in another protocol
+	 * is one br_allowed_ingress() treats as payload. Both keep the stream
+	 * in software, which is where they were anyway: before a group could
+	 * say what it arrives with, its root refused every tagged frame. And a
+	 * bridge that does not filter forwards a tagged frame with its tag,
+	 * which a listener given the bridge's (empty) egress tags would drop. */
+	if (l3_off ||
+	    (skb_vlan_tag_present(skb) &&
+	     (!br_vlan_enabled(bridge) || skb->vlan_proto != htons(ETH_P_8021Q))))
+		return NF_ACCEPT;
 
 	if (proto == htons(ETH_P_IP)) {
 		const struct iphdr *iph;
@@ -5300,6 +5420,9 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 	seen.addr.vid = ft_mc_frame_vid(bridge, port, skb);
 	seen.bridge_ifindex = bridge->ifindex;
 	seen.in_ifindex = port->ifindex;
+	ether_addr_copy(seen.dst_mac, eth_hdr(skb)->h_dest);
+	ether_addr_copy(seen.src_mac, eth_hdr(skb)->h_source);
+	seen.tagged = skb_vlan_tag_present(skb);
 
 	spin_lock(&ft_mc_ring_lock);
 	if (ft_mc_seen_eq(&seen, &ft_mc_last))
@@ -5412,24 +5535,17 @@ static bool ft_mc_resolve(struct ft_mc_group *g, const struct ft_mc_seen *seen)
 
 	lockdep_assert_held(&ft_mc_lock);
 	if (g->in && g->in->ifindex == seen->in_ifindex &&
-	    !memcmp(&g->src, &seen->src, sizeof(g->src)))
+	    !memcmp(&g->src, &seen->src, sizeof(g->src)) &&
+	    ether_addr_equal(g->dst_mac, seen->dst_mac) &&
+	    ether_addr_equal(g->src_mac, seen->src_mac) &&
+	    g->in_tagged == seen->tagged)
 		return false;	/* already what we have */
-	/* An installed group keeps the key it was installed with.
-	 *
-	 * cdx_mc_group_replace() exists to exchange a listener set under a
-	 * fixed key and refuses anything else, so a re-key here would set
-	 * `dirty`, take the replace arm, fail -EINVAL, and leave the hardware
-	 * carrying the old source while the bookkeeping claimed the new one.
-	 * And a group with two live senders -- 239.255.255.250 has as many
-	 * senders as there are hosts -- would alternate on every frame,
-	 * taking the global control mutex each time to fail again.
-	 *
-	 * So the first source wins for as long as the group is installed. The
-	 * contract wants an entry per source; carrying that means a set of
-	 * hardware groups per membership, which is the traffic learner's to
-	 * grow and not something to fake by re-keying one entry. */
-	if (g->hw)
-		return false;
+	if (g->hw && g->has_next && g->next.in->ifindex == seen->in_ifindex &&
+	    !memcmp(&g->next.src, &seen->src, sizeof(g->next.src)) &&
+	    ether_addr_equal(g->next.dst_mac, seen->dst_mac) &&
+	    ether_addr_equal(g->next.src_mac, seen->src_mac) &&
+	    g->next.tagged == seen->tagged)
+		return false;	/* already waiting to take over */
 	in = dev_get_by_index(&init_net, seen->in_ifindex);
 	if (!in)
 		return false;
@@ -5437,12 +5553,138 @@ static bool ft_mc_resolve(struct ft_mc_group *g, const struct ft_mc_seen *seen)
 		dev_put(in);
 		return false;
 	}
+	/* An installed group keeps the key it was installed with for as long
+	 * as that key carries traffic.
+	 *
+	 * cdx_mc_group_replace() exchanges a listener set under a fixed key
+	 * and refuses anything else, so a new stream is a new entry rather than
+	 * a modified one. And a group with two live senders -- 239.255.255.250
+	 * has as many senders as there are hosts -- must not trade one entry
+	 * between them on every frame, taking the global control mutex each
+	 * time. So the stream is kept for later, and takes over once the
+	 * refresh finds the installed key idle: the sender's MAC changed, the
+	 * source moved, the stream now arrives elsewhere. Carrying several live
+	 * streams at once would take a set of hardware groups per membership. */
+	if (g->hw) {
+		ft_mc_drop_next(g);
+		g->next.in = in;
+		g->next.src = seen->src;
+		ether_addr_copy(g->next.dst_mac, seen->dst_mac);
+		ether_addr_copy(g->next.src_mac, seen->src_mac);
+		g->next.tagged = seen->tagged;
+		g->has_next = true;
+		return g->idle;
+	}
+	/* With nothing installed there is nothing to wait for: the stream is
+	 * the group's now, and one kept from an installed phase is stale. */
+	ft_mc_drop_next(g);
 	if (g->in)
 		dev_put(g->in);
 	g->in = in;
 	g->src = seen->src;
+	ether_addr_copy(g->dst_mac, seen->dst_mac);
+	ether_addr_copy(g->src_mac, seen->src_mac);
+	g->in_tagged = seen->tagged;
 	g->retries = 0;
 	return true;
+}
+
+/* Put the stream a group was keeping in place of the one it is keyed on.
+ * Called with ft_mc_lock held, once the installed key has been taken out of
+ * hardware; the reference `next.in` held becomes the group's own. */
+static void ft_mc_adopt_next(struct ft_mc_group *g)
+{
+	lockdep_assert_held(&ft_mc_lock);
+	if (!g->has_next)
+		return;
+	if (g->in)
+		dev_put(g->in);
+	g->in = g->next.in;
+	g->src = g->next.src;
+	ether_addr_copy(g->dst_mac, g->next.dst_mac);
+	ether_addr_copy(g->src_mac, g->next.src_mac);
+	g->in_tagged = g->next.tagged;
+	memset(&g->next, 0, sizeof(g->next));
+	g->has_next = false;
+	g->retries = 0;
+}
+
+/* Re-derive a group against the bridge's VLAN configuration as it now is.
+ *
+ * Every tag decision the group holds was made against the configuration of
+ * the moment: each listener's egress tag at its join, and the ingress shape
+ * -- tagged, or untagged and resolved to the VLAN by the port's PVID -- at the
+ * frame it was learned from. None of them emits a netdev event when it
+ * changes. A listener whose membership changed is re-resolved, and one that
+ * left the VLAN stops being a listener until it returns. An ingress whose
+ * shape no longer resolves to this group's VLAN is forgotten, and the stream
+ * is learned again from its next frame: a root still accepting untagged frames
+ * on a port whose PVID moved would replicate another VLAN's traffic here.
+ *
+ * Called from the worker with RTNL, which the bridge VLAN lookups need, and
+ * then ft_mc_lock -- the order the switchdev handler takes them in. */
+static void ft_mc_revalidate(struct ft_mc_group *g)
+{
+	u16 pvid;
+	u8 i;
+
+	ASSERT_RTNL();
+	lockdep_assert_held(&ft_mc_lock);
+	g->vlan_stale = false;
+	for (i = 0; i < g->ports; i++) {
+		struct ft_mc_port *p = &g->port[i];
+		struct cdx_ft_vlan stack[CDX_FT_VLAN_MAX] = {};
+		bool uncarried, absent = false;
+		u8 count = 0;
+		int rc;
+
+		/* A port that is not a CDX port stays what it was. */
+		if (!ft_mc_port_eligible(p->dev))
+			continue;
+		rc = ft_mc_port_tags(g->bridge, p->dev, g->addr.vid, stack, &count);
+		if (rc == -ENOENT) {
+			absent = true;
+			rc = 0;
+			count = 0;
+			memset(stack, 0, sizeof(stack));
+		}
+		uncarried = rc != 0;
+		if (uncarried) {
+			count = 0;
+			memset(stack, 0, sizeof(stack));
+		}
+		if (p->absent == absent && p->uncarried == uncarried &&
+		    p->vlans == count && !memcmp(p->vlan, stack, sizeof(stack)))
+			continue;
+		if (uncarried && !p->uncarried)
+			ft_mc_refused++;
+		p->absent = absent;
+		p->uncarried = uncarried;
+		p->vlans = count;
+		memcpy(p->vlan, stack, sizeof(p->vlan));
+		g->dirty = true;
+	}
+	/* A stream waiting to take over was observed against the old
+	 * configuration too, and is simply seen again if it is still there. */
+	ft_mc_drop_next(g);
+	if (!g->in)
+		return;
+	/* A bridge that stopped filtering forwards a tagged frame with its
+	 * tag, and the listeners it resolves carry none; see ft_mc_hook(). */
+	if (!br_vlan_enabled(g->bridge)) {
+		if (g->in_tagged)
+			ft_mc_drop_stream(g);
+		return;
+	}
+	if (g->in_tagged) {
+		struct bridge_vlan_info info;
+
+		if (!br_vlan_get_info(g->in, g->addr.vid, &info))
+			return;
+	} else if (!br_vlan_get_pvid(g->in, &pvid) && pvid == g->addr.vid) {
+		return;
+	}
+	ft_mc_drop_stream(g);
 }
 
 /* Whether another membership on this bridge would resolve to the same
@@ -5492,6 +5734,20 @@ static void ft_mc_work_fn(struct work_struct *work)
 			g->dirty = true;
 		}
 		mutex_unlock(&ft_mc_lock);
+	}
+
+	/* A bridge's VLAN configuration changed under some groups. The lookups
+	 * need RTNL, taken before ft_mc_lock as the switchdev handler takes them,
+	 * and neither is held across the transaction below. */
+	if (READ_ONCE(ft_mc_vlan_stale)) {
+		WRITE_ONCE(ft_mc_vlan_stale, false);
+		rtnl_lock();
+		mutex_lock(&ft_mc_lock);
+		list_for_each_entry(g, &ft_mc_groups, list)
+			if (g->vlan_stale && !ft_mc_stopping)
+				ft_mc_revalidate(g);
+		mutex_unlock(&ft_mc_lock);
+		rtnl_unlock();
 	}
 
 	/* Drain what the hook observed. */
@@ -5550,11 +5806,13 @@ static void ft_mc_work_fn(struct work_struct *work)
 	 * ft_mc_lock is never held across it. */
 	for (;;) {
 		struct cdx_mc_group_spec spec = {};
-		struct cdx_mc_group *hw = NULL;
+		struct cdx_mc_group *hw = NULL, *stale = NULL;
 		struct ft_mc_group *target = NULL;
 		union nf_inet_addr key_src = {}, key_dst = {};
+		union nf_inet_addr old_src = {}, old_dst = {};
 		bool replace = false, contested = false, release = false;
-		u8 key_family = AF_INET;
+		bool keep_claim = false;
+		u8 key_family = AF_INET, old_family = AF_INET;
 		int rc = 0, take;
 		u8 i;
 
@@ -5580,6 +5838,17 @@ static void ft_mc_work_fn(struct work_struct *work)
 			break;
 		}
 		target->dirty = false;
+		/* The installed key has carried nothing for a whole refresh while
+		 * another stream of the group reached the CPU: that stream takes
+		 * over. The old entry comes out first -- it matches nothing, so
+		 * its going costs no frame -- and the new one goes in as an add,
+		 * because a different key is a different entry. */
+		if (target->hw && target->has_next && target->idle) {
+			ft_mc_group_key(target, &old_family, &old_src, &old_dst);
+			stale = target->hw;
+			target->hw = NULL;
+			ft_mc_adopt_next(target);
+		}
 		target->contested = ft_mc_key_contested(target);
 		ft_mc_group_key(target, &key_family, &key_src, &key_dst);
 		/* Snapshot under the lock; the hardware call happens after it
@@ -5605,8 +5874,21 @@ static void ft_mc_work_fn(struct work_struct *work)
 				spec.src.ip = target->src.ip;
 				spec.dst.ip = target->addr.dst.ip4;
 			}
-			spec.listeners = target->ports;
+			/* The frames' own pair, which the root is keyed on and
+			 * every copy is rebuilt with, and the one ingress shape
+			 * the root accepts. */
+			ether_addr_copy(spec.dst_mac, target->dst_mac);
+			ether_addr_copy(spec.src_mac, target->src_mac);
+			if (target->in_tagged) {
+				spec.in_vlan[0].proto = htons(ETH_P_8021Q);
+				spec.in_vlan[0].id = target->addr.vid;
+				spec.in_vlans = 1;
+			}
 			for (i = 0; i < target->ports; i++) {
+				struct cdx_mc_listener *l;
+
+				if (target->port[i].absent)
+					continue;
 				/* A port replicating back out the port the
 				 * frame arrived on is something br_forward()
 				 * never does, and a LAN segment with a dumb
@@ -5615,11 +5897,11 @@ static void ft_mc_work_fn(struct work_struct *work)
 					spec.listeners = 0;
 					break;
 				}
-				spec.listener[i].dev = target->port[i].dev;
-				spec.listener[i].vlans = target->port[i].vlans;
-				memcpy(spec.listener[i].vlan,
-				       target->port[i].vlan,
-				       sizeof(spec.listener[i].vlan));
+				l = &spec.listener[spec.listeners++];
+				l->dev = target->port[i].dev;
+				l->vlans = target->port[i].vlans;
+				memcpy(l->vlan, target->port[i].vlan,
+				       sizeof(l->vlan));
 			}
 			replace = target->hw != NULL;
 			hw = target->hw;
@@ -5636,28 +5918,49 @@ static void ft_mc_work_fn(struct work_struct *work)
 		}
 		mutex_unlock(&ft_mc_lock);
 
+		/* A stream that takes over the same address pair -- its
+		 * sender's MAC changed, or it moved port -- keeps the claim the
+		 * old one held. Any other takeover hands the old pair back once
+		 * the old entry is gone, below. */
+		if (stale && old_family == key_family &&
+		    !memcmp(&old_src, &key_src, sizeof(old_src)) &&
+		    !memcmp(&old_dst, &key_dst, sizeof(old_dst)))
+			keep_claim = true;
+
 		/* The shared key is taken before the transaction rather than
 		 * inside it. An address pair the routed learner is already
 		 * carrying is an answer for the operator rather than an
 		 * error, and finding that out here costs neither a
 		 * transaction nor the three retries an -EEXIST would burn. A
 		 * replace keeps the key it already holds. */
-		take = spec.listeners && !replace ?
+		take = spec.listeners && !replace && !keep_claim ?
 			ft_mc_claim_take(key_family, &key_src, &key_dst) : 0;
 		if (take == -EEXIST)
 			contested = true;
 		else if (take)
 			rc = take;	/* an install failure like any other */
 
+		if (stale) {
+			cdx_ft_begin();
+			cdx_mc_group_del(&stale);
+			cdx_ft_end();
+			ft_mc_installed--;
+			if (!keep_claim)
+				ft_mc_claim_give(old_family, &old_src, &old_dst);
+		}
 		if (!take) {
 			cdx_ft_begin();
 			if (!spec.listeners) {
 				/* Became ineligible: take it out of hardware and
 				 * leave the membership, which may become installable
-				 * again when the host leaves or a port returns. */
+				 * again when the host leaves or a port returns. A
+				 * takeover that cannot install hands back the pair
+				 * it kept for itself. */
 				if (hw) {
 					cdx_mc_group_del(&hw);
 					ft_mc_installed--;
+					release = true;
+				} else if (keep_claim) {
 					release = true;
 				}
 			} else if (replace) {
@@ -5689,6 +5992,12 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * frees one and it is not reentrant. */
 		if (spec.listeners || hw)
 			target->hw = hw;
+		/* A new entry has counted nothing yet and is not idle until a
+		 * whole refresh says so. */
+		if (spec.listeners && !rc && !replace) {
+			target->hw_packets = 0;
+			target->idle = false;
+		}
 		if (spec.listeners && rc) {
 			/* Try again rather than leaving a group pending for
 			 * good: a port that lost carrier gets it back, and
@@ -5714,11 +6023,15 @@ static void ft_mc_work_fn(struct work_struct *work)
 		}
 	}
 
-	/* Somebody still waiting for a source keeps the hook registered. */
+	/* Somebody still waiting for a source keeps the hook registered, and so
+	 * does an installed group that has gone idle: its stream may simply
+	 * have stopped, or may be reaching the CPU as another sender's -- and
+	 * only a frame can say which. A group whose entry is carrying its
+	 * stream costs the hook nothing. */
 	mutex_lock(&ft_mc_lock);
 	want_hook = false;
 	list_for_each_entry(g, &ft_mc_groups, list)
-		if (!g->host && g->ports && !g->hw) {
+		if (!g->host && g->ports && (!g->hw || g->idle)) {
 			want_hook = true;
 			break;
 		}
@@ -5727,6 +6040,55 @@ static void ft_mc_work_fn(struct work_struct *work)
 		ft_mc_hook_sync(want_hook);
 	else
 		ft_mc_hook_sync(false);
+	/* The refresh runs while anything is installed; see ft_mc_refresh_fn(). */
+	if (READ_ONCE(ft_mc_installed) && !READ_ONCE(ft_mc_stopping))
+		schedule_delayed_work(&ft_mc_refresh, FT_MC_REFRESH_INTERVAL);
+}
+
+/* The periodic half of the bridged learner: what each installed entry has
+ * counted since the last pass.
+ *
+ * An entry that counted nothing for a whole interval is idle. That reopens the
+ * traffic hook, because an idle entry is either a stream that stopped or one
+ * whose frames no longer match it -- a sender whose MAC changed, a source that
+ * moved -- and those are reaching the CPU and the bridge in software. A stream
+ * the hook saw in the meantime takes over the key. The transaction first and
+ * the lock second, which is /proc's order and so the only one either may use.
+ */
+static void ft_mc_refresh_fn(struct work_struct *work)
+{
+	struct cdx_ft_counters stats;
+	struct ft_mc_group *g;
+	bool kick = false;
+
+	if (READ_ONCE(ft_mc_stopping))
+		return;
+	cdx_ft_begin();
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		bool idle;
+
+		if (!g->hw)
+			continue;
+		cdx_mc_group_stats(g->hw, &stats);
+		idle = stats.packets == g->hw_packets;
+		g->hw_packets = stats.packets;
+		if (idle != g->idle)
+			kick = true;
+		g->idle = idle;
+		if (idle && g->has_next) {
+			g->dirty = true;
+			kick = true;
+		}
+	}
+	mutex_unlock(&ft_mc_lock);
+	cdx_ft_end();
+	if (READ_ONCE(ft_mc_stopping))
+		return;
+	if (kick)
+		schedule_work(&ft_mc_work);
+	if (READ_ONCE(ft_mc_installed))
+		schedule_delayed_work(&ft_mc_refresh, FT_MC_REFRESH_INTERVAL);
 }
 
 /* The MDB half of the switchdev chain.
@@ -5825,11 +6187,10 @@ static void ft_mc_device_gone(struct net_device *dev)
 			/* Back to pending: the membership is still what the
 			 * bridge says, and a stream arriving on some other
 			 * port will resolve it again. */
-			dev_put(g->in);
-			g->in = NULL;
-			g->retries = 0;
-			g->dirty = true;
+			ft_mc_drop_stream(g);
 		}
+		if (g->has_next && g->next.in == dev)
+			ft_mc_drop_next(g);
 		if (g->bridge == dev) {
 			/* The bridge itself. Its memberships cannot outlive
 			 * it, and dropping every port is what makes the
@@ -5850,6 +6211,39 @@ static void ft_mc_device_gone(struct net_device *dev)
 		schedule_work(&ft_mc_work);
 }
 
+/* A bridge's VLAN configuration changed: a port's membership, the bridge's
+ * own, its filtering or its protocol. `dev` is the bridge or one of its
+ * ports.
+ *
+ * Every group on that bridge is marked for re-derivation rather than
+ * re-derived here. This runs from the switchdev chain under RTNL, and a
+ * port VLAN object is notified before the bridge applies it, so the state it
+ * describes is not yet the state the lookups would read. The worker reads it
+ * afterwards, under RTNL of its own; see ft_mc_revalidate(). */
+static void ft_mc_vlan_changed(struct net_device *dev)
+{
+	struct net_device *bridge;
+	struct ft_mc_group *g;
+	bool marked = false;
+
+	bridge = netif_is_bridge_master(dev) ? dev :
+		 netdev_master_upper_dev_get(dev);
+	if (!bridge || !netif_is_bridge_master(bridge))
+		return;
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		if (g->bridge != bridge)
+			continue;
+		g->vlan_stale = true;
+		marked = true;
+	}
+	mutex_unlock(&ft_mc_lock);
+	if (marked && !READ_ONCE(ft_mc_stopping)) {
+		WRITE_ONCE(ft_mc_vlan_stale, true);
+		schedule_work(&ft_mc_work);
+	}
+}
+
 static void ft_mc_exit(void)
 {
 	struct ft_mc_group *g, *tmp;
@@ -5862,9 +6256,15 @@ static void ft_mc_exit(void)
 	 * already inside it. And again afterwards, because the worker may have
 	 * been part-way through registering one when the flag went up -- the
 	 * second call is what actually removes it in that ordering. Both are
-	 * serialized against the worker by ft_mc_hook_lock. */
+	 * serialized against the worker by ft_mc_hook_lock.
+	 *
+	 * The refresh can queue the worker and the worker can rearm the
+	 * refresh, so the refresh is drained on both sides of the worker, the
+	 * way the routed learner drains its own pair. */
 	ft_mc_hook_sync(false);
+	cancel_delayed_work_sync(&ft_mc_refresh);
 	cancel_work_sync(&ft_mc_work);
+	cancel_delayed_work_sync(&ft_mc_refresh);
 	ft_mc_hook_sync(false);
 	/* The chain is already unregistered by the caller, so nothing can add
 	 * to this list while it drains. */
@@ -5936,29 +6336,36 @@ static void ft_mc_rows(struct seq_file *seq)
 		cdx_mc_group_stats(g->hw, &stats);
 		ports[0] = '\0';
 		for (i = 0; i < g->ports; i++)
-			n += scnprintf(ports + n, sizeof(ports) - n, "%s%s/%u",
+			n += scnprintf(ports + n, sizeof(ports) - n, "%s%s/%u%s",
 				       i ? "," : "", g->port[i].dev->name,
-				       g->port[i].vlans ? g->port[i].vlan[0].id : 0);
+				       g->port[i].vlans ? g->port[i].vlan[0].id : 0,
+				       g->port[i].absent ? "!" : "");
 		/* Two sources, and the difference is the whole design: `member`
 		 * is what the bridge asked for -- zero for a (*,G) join -- and
 		 * `src` is what the traffic taught us, which is the one in the
 		 * hardware key. Showing only the first makes an installed group
-		 * look unkeyed. */
+		 * look unkeyed. The Ethernet pair and the ingress tag are the
+		 * rest of that key; `in_vid` is 0 for a stream that arrives
+		 * untagged on the port's PVID. */
 		if (g->addr.proto == htons(ETH_P_IPV6))
 			seq_printf(seq,
-				   "mcast br=%s family=6 group=%pI6c member_src=%pI6c src=%pI6c vid=%u ports=%s in=%s state=%s packets=%llu bytes=%llu\n",
+				   "mcast br=%s family=6 group=%pI6c member_src=%pI6c src=%pI6c vid=%u ports=%s in=%s in_vid=%u smac=%pM dmac=%pM state=%s packets=%llu bytes=%llu\n",
 				   g->bridge->name, &g->addr.dst.ip6,
 				   &g->addr.src.ip6, &g->src.in6, g->addr.vid,
 				   g->ports ? ports : "-",
 				   g->in ? g->in->name : "-",
+				   g->in_tagged ? g->addr.vid : 0,
+				   g->src_mac, g->dst_mac,
 				   ft_mc_state(g), stats.packets, stats.bytes);
 		else
 			seq_printf(seq,
-				   "mcast br=%s family=4 group=%pI4 member_src=%pI4 src=%pI4 vid=%u ports=%s in=%s state=%s packets=%llu bytes=%llu\n",
+				   "mcast br=%s family=4 group=%pI4 member_src=%pI4 src=%pI4 vid=%u ports=%s in=%s in_vid=%u smac=%pM dmac=%pM state=%s packets=%llu bytes=%llu\n",
 				   g->bridge->name, &g->addr.dst.ip4,
 				   &g->addr.src.ip4, &g->src.ip, g->addr.vid,
 				   g->ports ? ports : "-",
 				   g->in ? g->in->name : "-",
+				   g->in_tagged ? g->addr.vid : 0,
+				   g->src_mac, g->dst_mac,
 				   ft_mc_state(g), stats.packets, stats.bytes);
 	}
 	mutex_unlock(&ft_mc_lock);
@@ -6099,6 +6506,9 @@ struct ft_mr_group {
 	union nf_inet_addr src;
 	union nf_inet_addr dst;
 	struct net_device *in;
+	/* The tags the stream arrives with on `in`, outermost first: what the
+	 * root validates, and what the counter fold takes off each frame. */
+	struct cdx_ft_vlan in_vlan[CDX_FT_VLAN_MAX];
 	u8 in_tags;
 	struct cdx_mc_listener listener[CDX_MC_MAX_LISTENERS];
 	u8 listeners;
@@ -6557,6 +6967,14 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	spec.in = ft_mr_ingress_port(vif_dev, &in);
 	if (!spec.in)
 		return FT_MR_REFUSED_INGRESS;
+	/* The classifier key names the port and not the VLAN, so the root is
+	 * told which tags the stream arrives with and accepts only those: the
+	 * same (S,G) on another VLAN of the port -- or untagged -- is excepted
+	 * to Linux, which counts it wrong_if as ip_mr_forward() would. Without
+	 * it the root validated an untagged frame and a VLAN-device parent
+	 * never carried its stream at all. */
+	spec.in_vlans = in.vlans;
+	memcpy(spec.in_vlan, in.vlan, sizeof(spec.in_vlan));
 	if (ft_mr_host_member(vif_dev, g->family, &g->dst))
 		return FT_MR_REFUSED_HOST;
 
@@ -6630,6 +7048,10 @@ static bool ft_mr_plan_same(const struct ft_mr_group *g,
 	if (g->in != plan->spec.in || g->in_tags != plan->in_tags ||
 	    g->listeners != plan->spec.listeners)
 		return false;
+	for (j = 0; j < g->in_tags; j++)
+		if (g->in_vlan[j].proto != plan->spec.in_vlan[j].proto ||
+		    g->in_vlan[j].id != plan->spec.in_vlan[j].id)
+			return false;
 	for (i = 0; i < g->listeners; i++) {
 		const struct cdx_mc_listener *a = &g->listener[i];
 		const struct cdx_mc_listener *b = &plan->spec.listener[i];
@@ -7032,6 +7454,7 @@ static void ft_mr_release_set(struct ft_mr_group *g)
 		dev_put(g->in);
 	g->in = NULL;
 	g->in_tags = 0;
+	memset(g->in_vlan, 0, sizeof(g->in_vlan));
 	g->oifs[0] = '\0';
 }
 
@@ -7189,7 +7612,10 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * rather than a replacement. Decided here rather than after
 		 * the unlock because the installed ingress is the other thing
 		 * ft_mr_device_gone() clears, and it holds RTNL to do it. */
-		rekey = hw && plan.spec.in != target->in;
+		rekey = hw && (plan.spec.in != target->in ||
+			       plan.in_tags != target->in_tags ||
+			       memcmp(plan.spec.in_vlan, target->in_vlan,
+				      sizeof(target->in_vlan)));
 		same = hw && state == FT_MR_PENDING && ft_mr_plan_same(target, &plan);
 		rtnl_unlock();
 
@@ -7254,6 +7680,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 			ft_mr_release_set(target);
 			target->in = plan.spec.in;
 			target->in_tags = plan.in_tags;
+			memcpy(target->in_vlan, plan.spec.in_vlan,
+			       sizeof(target->in_vlan));
 			target->listeners = plan.spec.listeners;
 			memcpy(target->listener, plan.spec.listener,
 			       sizeof(target->listener));

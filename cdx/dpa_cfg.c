@@ -358,7 +358,13 @@ static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t 
 		case IPV4_MULTICAST_TABLE:
 			table_distrb_type =  IPV4_MULTICAST_DIST;
 			break;
-	}	
+		case IPV4_BRIDGED_MULTICAST_TABLE:
+			table_distrb_type =  IPV4_BRIDGED_MULTICAST_DIST;
+			break;
+		case IPV6_BRIDGED_MULTICAST_TABLE:
+			table_distrb_type =  IPV6_BRIDGED_MULTICAST_DIST;
+			break;
+	}
 	port_info = finfo->portinfo;
 	for (ii = 0; ii < finfo->max_ports; ii++) {
 		dist = port_info->dist_info;
@@ -663,11 +669,31 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 				break;
 			case IPV4_MULTICAST_TABLE:
 			case IPV6_MULTICAST_TABLE:
+				/* A frame no routed group claims is offered to
+				 * the bridged groups next, whose key carries the
+				 * frame's Ethernet pair and so cannot share this
+				 * table. A routed group's ingress is never a
+				 * bridge port and a bridged group's always is,
+				 * so no frame is a candidate for both. A
+				 * configuration without the bridged tables falls
+				 * straight through to Ethernet, as it always did,
+				 * and bridged groups then cannot be installed. */
+				miss_engine_params.params.kgParams.h_DirectScheme =
+					get_dist_info_by_fman_params(finfo,
+						tbl_info->type == IPV4_MULTICAST_TABLE ?
+						IPV4_BRIDGED_MULTICAST_TABLE :
+						IPV6_BRIDGED_MULTICAST_TABLE);
+				if (!miss_engine_params.params.kgParams.h_DirectScheme)
+					miss_engine_params.params.kgParams.h_DirectScheme =
+						get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);
+				break;
+			case IPV4_BRIDGED_MULTICAST_TABLE:
+			case IPV6_BRIDGED_MULTICAST_TABLE:
 			case IPV4_3TUPLE_UDP_TABLE:
 			case IPV6_TCP_TABLE:
 			case IPV4_TCP_TABLE:
 			case IPV6_3TUPLE_UDP_TABLE:
-				miss_engine_params.params.kgParams.h_DirectScheme = 
+				miss_engine_params.params.kgParams.h_DirectScheme =
 					get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);
 				break;
 

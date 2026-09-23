@@ -31,7 +31,8 @@ def test_bridge_mode_reaches_root_and_cannot_change_on_replace():
     adapter = (ROOT / "cdx/ask_flowtable.c").read_text()
     encoder = (ROOT / "cdx/cdx_ehash.c").read_text()
     assert "spec.bridged = true;" in function(adapter, "ft_mc_work_fn")
-    assert "grp->bridged = spec->bridged;" in code("cdx_mc_group_add")
+    assert "cdx_mc_describe(grp, spec);" in code("cdx_mc_group_add")
+    assert "grp->bridged = spec->bridged;" in code("cdx_mc_describe")
     assert "grp->bridged != spec->bridged" in code("cdx_mc_same_key")
     assert "pMcastGrpInfo->bridged" in code("cdx_add_mcast_table_entry")
     assert "fill_actions(entry, info, !bridged)" in function(encoder, "insert_mcast_entry_in_classif_table")
@@ -73,18 +74,40 @@ def test_mcast_hm(tmp_path):
         + typedef(common, "IPv6_HDR_STRUCT")
         + declaration(common, "dpa_l3hdr_info")
         + declaration((ROOT / "cdx/control_ipv4.h").read_text(), "cdx_l2_encap")
-        + "\n".join(re.findall(r"^#define\s+(?:INSERT_VLAN_HDR|INSERT_L2_HDR)\s.*$",
-                               header, re.M)) + "\n"
+        # Name and value only: several of these carry comments that run on
+        # past the line.
+        + "".join(f"#define {name} {value}\n" for name, value in re.findall(
+            r"^#define\s+(INSERT_VLAN_HDR|INSERT_L2_HDR|STRIP_ALL_VLAN_HDRS|"
+            r"OP_SKIP_VLAN_VALIDATE|OP_VLAN_FILTER_EN|OP_VLAN_FILTER_PVID_SET|"
+            r"MAX_VLAN_PER_FLOW)\s+(\([^)]*\)|\S+)", header, re.M))
         + loose_declaration(header, "en_ehash_stats")
         + loose_declaration(header, "en_ehash_insert_vlan_hdr")
-        + loose_declaration(header, "en_ehash_insert_l2_hdr"))
+        + loose_declaration(header, "en_ehash_insert_l2_hdr")
+        + loose_declaration(header, "en_ehash_strip_all_vlan_hdrs")
+        # Every classifier key layout, the bridged multicast ones included,
+        # and the union they are composed through.
+        + common[common.index("//ipv4 tcp key used in cc table"):
+                 common.index("#define MAX_KEY_SIZE")]
+        # What a listener's copy owes to something other than its interface.
+        + declaration((ROOT / "cdx/dpa_control_mc.h").read_text(),
+                      "cdx_mc_member_frame")
+        # The entry-builder flags the ingress strip reads.
+        + "".join(f"#define {name} {value}\n" for name, value in re.findall(
+            r"^#define\s+(EHASH_BRIDGE_FLOW|ROUTE_FLOW_VLAN_FIL_EN|ROUTE_FLOW_PVID_SET)"
+            r"\s+(\([^)]*\))", ehash, re.M))
+        + re.search(r"^#define PAD\(.*$", ehash, re.M).group() + "\n")
     (tmp_path / "mcast_hm.inc").write_text(
         function(ehash, "apply_l2_encap")
         # The predicate the tag emitter gates its statistics pointer on, which
         # it calls and this test therefore has to carry.
         + function(ehash, "vlan_flow_stats_named")
         + function(ehash, "create_vlan_ins_hm")
-        + function(ehash, "create_ethernet_hm"))
+        + function(ehash, "create_ethernet_hm")
+        # A bridged group's root key and its copies' Ethernet pair, and the
+        # strip that validates the tags the group arrives with.
+        + function(ehash, "fill_mcast_mac_key")
+        + function(ehash, "mcast_member_frame")
+        + function(ehash, "insert_remove_vlan_hm"))
     binary = tmp_path / "mcast_hm"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
@@ -95,6 +118,11 @@ def test_mcast_hm(tmp_path):
         # diagnostic globally, so requiring it here would only reject the
         # production source for a property the production build accepts.
         "-Wno-address-of-packed-member",
+        # The ingress strip compares a signed index with an unsigned count,
+        # which the kernel build does not warn about (-Wsign-compare is not
+        # part of its warning set); the harness would reject the production
+        # source for it all the same.
+        "-Wno-sign-compare",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         "-DINCLUDE_VLAN_IFSTATS=1", "-DVLAN_FILTER=1",
         str(Path(__file__).with_name("mcast_hm.c")), "-o", str(binary),
@@ -133,6 +161,23 @@ def test_listener_builder_owns_its_cursor():
     for caller in ("cdx_create_mcast_group", "cdx_update_mcast_group"):
         assert "ins_entry_info" not in function(mc, caller), (
             f"{caller} must not hold a cursor to share between listeners")
+
+
+def test_an_ipv6_listener_is_framed_as_ipv6_in_either_table():
+    """A listener's rebuilt Ethernet header takes its EtherType from the
+    entry's family, and the builder learns the family from the table it draws
+    the entry from. A bridged group's listeners come from the bridged tables,
+    so testing for the routed IPv6 type alone framed every bridged IPv6 copy
+    as IPv4.
+    """
+    body = function((ROOT / "cdx/cdx_ehash.c").read_text(),
+                    "create_exthash_entry4mcast_member")
+    flag = body.index("pInsEntryInfo->flags |= EHASH_IPV6_FLOW")
+    condition = body[body.rindex("if", 0, flag):flag]
+    for table in ("IPV6_MULTICAST_TABLE", "IPV6_BRIDGED_MULTICAST_TABLE"):
+        assert f"tbl_type == {table}" in condition, (
+            f"a listener drawn from {table} must be framed as IPv6")
+    assert "IPV4" not in condition
 
 
 def test_listener_arrives_resolved():

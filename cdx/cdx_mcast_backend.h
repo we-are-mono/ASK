@@ -70,18 +70,32 @@ struct cdx_mc_listener {
 struct cdx_mc_group_spec {
 	/* The physical port this group's frames arrive on. It is part of the
 	 * classifier key rather than merely a validity check, so a stream of
-	 * the same (S,G) arriving on a different port misses this entry and is
-	 * forwarded in software.
-	 *
-	 * That does not mean a second ingress can have an entry of its own.
-	 * One group id and one root entry exist per address pair, so the
-	 * second one is refused with -EEXIST; see cdx_mc_group_add(). */
+	 * the same (S,G) arriving on a different port misses this entry, and
+	 * may have an entry of its own; see cdx_mc_group_add(). */
 	struct net_device *in;
+	/* The tags this group's frames carry on `in`, outermost first, and
+	 * the only ones the root accepts: it validates and strips exactly
+	 * these, so the same key on another VLAN of the port -- untagged
+	 * included -- is excepted to Linux rather than replicated as though it
+	 * were this group's. The key itself names no VLAN, which is why this
+	 * has to. Empty for a group that arrives untagged, which is also what
+	 * a bridge's PVID resolves an untagged frame to. */
+	struct cdx_ft_vlan in_vlan[CDX_FT_VLAN_MAX];
+	u8 in_vlans;
 	union nf_inet_addr src;
 	union nf_inet_addr dst;
+	/* A bridged group's frames' own Ethernet pair. The root is keyed on it
+	 * in the bridged multicast table and every listener rebuilds Ethernet
+	 * with it, because a bridge forwards a frame with the addresses it
+	 * arrived with and the only way the hardware can know them is to have
+	 * matched them. Required for a bridged group, zero for a routed one,
+	 * whose copies take the egress port's address. */
+	u8 dst_mac[ETH_ALEN];
+	u8 src_mac[ETH_ALEN];
 	u8 family;
 	u8 listeners;
-	/* A bridge preserves IP hop counts; a router decrements them. */
+	/* A bridge preserves IP hop counts and Ethernet addresses; a router
+	 * decrements the one and rewrites the other. */
 	bool bridged;
 	struct cdx_mc_listener listener[CDX_MC_MAX_LISTENERS];
 };
@@ -135,13 +149,14 @@ bool cdx_mc_port_identity(struct net_device *dev);
  * flow's rule keeps, and for the same reason: the entry names ports that must
  * not be unregistered underneath it.
  *
- * -EOPNOTSUPP: a device, address family or group address cannot be carried.
- * -EEXIST: this address pair already has a group. Note that the pair is the
- *          whole of that test -- the ingress is not part of it, because one
- *          group id and one root entry exist per pair. So a second ingress for
- *          one (S,G) is refused rather than given an entry of its own, and a
- *          caller seeing this on a group it does not know about is looking at
- *          the same stream arriving somewhere else.
+ * -EOPNOTSUPP: a device, address family or group address cannot be carried,
+ *          or a bridged group names no Ethernet pair to key on.
+ * -EEXIST: another group holds this classifier key: the same ingress port and
+ *          address pair and, for a bridged group, the same Ethernet pair. The
+ *          ingress tags are not part of it -- the key names no VLAN -- so two
+ *          groups that differ only there are one entry and the second is
+ *          refused. The same (S,G) on another port, or from another sender
+ *          into a bridge, is a different key and may be added.
  * -ENOSPC: no free group id, or the external hash table is full.
  * -ENOMEM: no memory for the group's own bookkeeping.
  * -EIO: an entry could not be built or the classifier refused the key.

@@ -46,14 +46,42 @@ enum {
 	ETHERNET_DIST,
 #ifdef CDX_RTP_RELAY // RTP relay feature
 	IPV4_3TUPLE_UDP_DIST,
-	IPV4_3TUPLE_TCP_DIST,	//unused, reserved to keep the numbering stable
-	IPV6_3TUPLE_UDP_DIST,
-	IPV6_3TUPLE_TCP_DIST,	//unused, reserved to keep the numbering stable
 #endif //CDX_RTP_RELAY
+	/* The bridged multicast distributions take the two slots the vendor
+	 * reserved for 3-tuple TCP, which nothing ever defined, so every other
+	 * type keeps its number. See the table aliases below. */
+	IPV4_BRIDGED_MULTICAST_DIST,
+#ifdef CDX_RTP_RELAY // RTP relay feature
+	IPV6_3TUPLE_UDP_DIST,
+#endif //CDX_RTP_RELAY
+	IPV6_BRIDGED_MULTICAST_DIST,
 	IPV4_FRAG_DIST,
 	IPV6_FRAG_DIST,
 	MAX_DIST_TYPES
 };
+
+/* The bridged multicast tables, as dpa_app reports them to cdx.
+ *
+ * A bridge has to forward a frame with the Ethernet addresses it arrived
+ * with, and successive frames of one (S,G) can come from different senders,
+ * so a bridged group is keyed on the frame's own MAC pair as well as its
+ * (S,G) -- ingress port, destination MAC, source MAC, source, group and
+ * protocol, the order the key generator extracts them in -- and each listener
+ * rebuilds Ethernet with exactly the pair its root matched. A routed group
+ * cannot carry that key: the upstream router's address is no fact of the MFC.
+ * One table cannot mix the two key layouts, so the bridged groups get tables
+ * of their own, reached from a routed multicast table's miss. See
+ * docs/flowtable/multicast-hardware.md.
+ *
+ * cdx indexes a port's tables by this type, so it needs two numbers no other
+ * table uses: the 3-tuple TCP slots the vendor reserved and nothing creates.
+ * The kernel sees these tables as the multicast types they are -- dpa_app
+ * hands FM_PCD_HashTableSet() IPV4_MULTICAST_TABLE and IPV6_MULTICAST_TABLE
+ * for them -- because the kernel reads a table type for one thing only, the
+ * microcode class of the table, and these are multicast (L3) tables exactly
+ * like the routed ones. */
+#define IPV4_BRIDGED_MULTICAST_TABLE	IPV4_3TUPLE_TCP_TABLE
+#define IPV6_BRIDGED_MULTICAST_TABLE	IPV6_3TUPLE_TCP_TABLE
 
 //port distribution info
 struct cdx_dist_info {

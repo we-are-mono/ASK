@@ -24,6 +24,7 @@
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
+typedef uint64_t u64;
 
 /* The address union conntrack and the rule share. Only the two arms the
  * learner names are needed; the shape has to match so a group's key compares
@@ -105,6 +106,25 @@ static unsigned holds;   /* net-device references outstanding */
 static void dev_hold(struct net_device *d) { (void)d; holds++; }
 static void dev_put(struct net_device *d) { (void)d; assert(holds); holds--; }
 
+/* The devices the traffic half can resolve an ingress index to. */
+static struct net_device *by_index[8];
+static struct net_device *dev_get_by_index(void *net, int ifindex)
+{
+    (void)net;
+    for (unsigned i = 0; i < 8; i++)
+        if (by_index[i] && by_index[i]->ifindex == ifindex) {
+            dev_hold(by_index[i]);
+            return by_index[i];
+        }
+    return NULL;
+}
+static int init_net;
+
+static bool ether_addr_equal(const u8 *a, const u8 *b) { return !memcmp(a, b, ETH_ALEN); }
+static void ether_addr_copy(u8 *d, const u8 *s) { memcpy(d, s, ETH_ALEN); }
+static void eth_zero_addr(u8 *a) { memset(a, 0, ETH_ALEN); }
+#define ASSERT_RTNL() ((void)0)
+
 static bool cdx_mc_port_identity(struct net_device *d)
 {
     return d && d->physical;
@@ -117,6 +137,18 @@ static uint16_t vlan_proto = ETH_P_8021Q;
 static struct { struct net_device *port; uint16_t vid; bool untagged; bool member; }
     memberships[16];
 static unsigned membership_count;
+
+static struct { struct net_device *port; uint16_t pvid; } pvids[8];
+static unsigned pvid_count;
+static int br_vlan_get_pvid(struct net_device *port, uint16_t *p)
+{
+    for (unsigned i = 0; i < pvid_count; i++)
+        if (pvids[i].port == port) {
+            *p = pvids[i].pvid;
+            return 0;
+        }
+    return -EOPNOTSUPP;
+}
 
 static bool br_vlan_enabled(struct net_device *br) { (void)br; return vlan_enabled; }
 static int br_vlan_get_proto(struct net_device *br, uint16_t *p)
@@ -194,6 +226,8 @@ static void reset(void)
     }
     ft_mc_count = 0;
     membership_count = 0;
+    pvid_count = 0;
+    memset(by_index, 0, sizeof(by_index));
     vlan_enabled = false;
     ft_mc_refused = 0;
     assert(holds == 0);
@@ -603,6 +637,172 @@ int main(void)
         assert(ft_mc_membership(&BR, &P1, &wildcard, true, false));
         assert(ft_mc_membership(&BR2, &P2, &sourced, true, false));
         assert(!ft_mc_key_contested(ft_mc_find(&BR, &wildcard)));
+    }
+
+    /* ---- the stream a group is keyed on --------------------------------
+     *
+     * A bridged group's hardware key is the frames' own Ethernet pair as
+     * well as the ingress port and the (S,G), and its root accepts one
+     * ingress shape: tagged with the group's VLAN, or untagged on the port's
+     * PVID. All of it is read off the frame that resolved the group. */
+    reset();
+    {
+        struct br_ip any = group_v4(0x0e0007ef, 0, 0);
+        struct ft_mc_seen a, b;
+        struct ft_mc_group *g;
+        static const u8 mac_a[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x0a };
+        static const u8 mac_b[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x0b };
+        static const u8 group_mac[ETH_ALEN] = { 0x01, 0, 0x5e, 0x07, 0, 0x0e };
+
+        by_index[0] = &P2;
+        by_index[1] = &P3;
+        assert(ft_mc_membership(&BR, &P1, &any, true, false));
+        g = ft_mc_find(&BR, &any);
+
+        memset(&a, 0, sizeof(a));
+        a.bridge_ifindex = BR.ifindex;
+        a.in_ifindex = P2.ifindex;
+        a.addr = any;
+        a.src.ip = 0x0100000a;
+        memcpy(a.dst_mac, group_mac, ETH_ALEN);
+        memcpy(a.src_mac, mac_a, ETH_ALEN);
+        a.tagged = true;
+
+        /* Every part of the stream is a different fact to the hook's dedup:
+         * a second sender's MAC is a second stream even from one source. */
+        b = a;
+        assert(ft_mc_seen_eq(&a, &b));
+        memcpy(b.src_mac, mac_b, ETH_ALEN);
+        assert(!ft_mc_seen_eq(&a, &b));
+        b = a;
+        b.tagged = false;
+        assert(!ft_mc_seen_eq(&a, &b));
+        b = a;
+        b.dst_mac[5] ^= 1;
+        assert(!ft_mc_seen_eq(&a, &b));
+
+        /* A pending group takes all of it, and pins the ingress. */
+        assert(ft_mc_resolve(g, &a));
+        assert(g->in == &P2 && g->src.ip == a.src.ip && g->in_tagged);
+        assert(!memcmp(g->src_mac, mac_a, ETH_ALEN));
+        assert(!memcmp(g->dst_mac, group_mac, ETH_ALEN));
+        assert(holds == 3);   /* bridge, listener, ingress */
+        /* The same stream again changes nothing. */
+        assert(!ft_mc_resolve(g, &a));
+        assert(holds == 3);
+
+        /* Installed, the key stays while it carries traffic: another sender
+         * of the group is kept for later rather than taking over, so two
+         * live senders do not trade one entry. */
+        g->hw = (struct cdx_mc_group *)1;
+        g->idle = false;
+        b = a;
+        memcpy(b.src_mac, mac_b, ETH_ALEN);
+        assert(!ft_mc_resolve(g, &b));
+        assert(g->has_next && !memcmp(g->next.src_mac, mac_b, ETH_ALEN));
+        assert(!memcmp(g->src_mac, mac_a, ETH_ALEN));
+        assert(holds == 4);   /* and the stream in waiting pins its port */
+        /* Seen again, still waiting, nothing new held. */
+        assert(!ft_mc_resolve(g, &b));
+        assert(holds == 4);
+        /* A newer stream replaces the one waiting, releasing its port. */
+        b.in_ifindex = P3.ifindex;
+        assert(!ft_mc_resolve(g, &b));
+        assert(g->next.in == &P3 && holds == 4);
+        /* Once the installed key is idle, the next frame asks for the
+         * takeover straight away. */
+        g->idle = true;
+        b.src.ip = 0x0200000a;
+        assert(ft_mc_resolve(g, &b));
+        assert(g->next.src.ip == 0x0200000a && holds == 4);
+        /* And adopting it moves the reference rather than taking one. */
+        ft_mc_adopt_next(g);
+        assert(!g->has_next && g->in == &P3 && g->src.ip == 0x0200000a);
+        assert(!memcmp(g->src_mac, mac_b, ETH_ALEN));
+        assert(holds == 3);
+        /* A stream kept from an installed phase is stale once nothing is
+         * installed: the same stream seen again is simply the group's. */
+        b = a;
+        memcpy(b.src_mac, mac_a, ETH_ALEN);
+        b.in_ifindex = P2.ifindex;
+        g->idle = false;
+        assert(!ft_mc_resolve(g, &b) && g->has_next && holds == 4);
+        g->hw = NULL;
+        assert(ft_mc_resolve(g, &b));
+        assert(!g->has_next && g->in == &P2 && holds == 3);
+        /* And an uninstalled group simply follows the stream it sees. */
+        b.in_ifindex = P3.ifindex;
+        assert(ft_mc_resolve(g, &b));
+        assert(g->in == &P3 && holds == 3);
+
+        /* ---- re-deriving against a changed VLAN configuration ---------- */
+        vlan_enabled = true;
+        member(&P1, 3999, false);
+        member(&P3, 3999, false);
+        g->addr.vid = 3999;
+        g->in_tagged = true;
+        /* Nothing changed: the tagged ingress is still a member, and the
+         * listener's tag is what it was. */
+        g->port[0].vlans = 1;
+        g->port[0].vlan[0].proto = htons(ETH_P_8021Q);
+        g->port[0].vlan[0].id = 3999;
+        g->dirty = false;
+        g->vlan_stale = true;
+        ft_mc_revalidate(g);
+        assert(!g->vlan_stale && g->in == &P3 && !g->dirty);
+        /* The listener becomes an untagged member: re-resolved, dirty. */
+        memberships[0].untagged = true;
+        ft_mc_revalidate(g);
+        assert(g->port[0].vlans == 0 && g->dirty && !g->port[0].absent);
+        /* The listener leaves the VLAN: no longer a listener, still
+         * recorded, and a listener again when it comes back. */
+        g->dirty = false;
+        memberships[0].member = false;
+        ft_mc_revalidate(g);
+        assert(g->port[0].absent && g->dirty && g->ports == 1);
+        g->dirty = false;
+        memberships[0].member = true;
+        ft_mc_revalidate(g);
+        assert(!g->port[0].absent && g->dirty);
+        /* The tagged ingress leaves the VLAN: the stream is forgotten and
+         * the group waits for one again. */
+        memberships[1].member = false;
+        ft_mc_revalidate(g);
+        assert(!g->in && holds == 2);
+        /* An untagged stream is kept while the port's PVID is the group's
+         * VLAN, and forgotten when the PVID moves. */
+        memberships[1].member = true;
+        pvids[0].port = &P3;
+        pvids[0].pvid = 3999;
+        pvid_count = 1;
+        a.in_ifindex = P3.ifindex;
+        a.tagged = false;
+        a.addr.vid = 3999;
+        assert(ft_mc_resolve(g, &a));
+        ft_mc_revalidate(g);
+        assert(g->in == &P3 && !g->in_tagged);
+        pvids[0].pvid = 1;
+        ft_mc_revalidate(g);
+        assert(!g->in);
+        /* And a tagged stream on a bridge that stops filtering is forgotten:
+         * such a bridge forwards the tag, which no listener would add. */
+        pvids[0].pvid = 3999;
+        a.tagged = true;
+        assert(ft_mc_resolve(g, &a));
+        vlan_enabled = false;
+        ft_mc_revalidate(g);
+        assert(!g->in);
+        /* A stream waiting to take over is dropped by a re-derivation. */
+        vlan_enabled = true;
+        assert(ft_mc_resolve(g, &a));
+        g->hw = (struct cdx_mc_group *)1;
+        b = a;
+        memcpy(b.src_mac, mac_b, ETH_ALEN);
+        assert(!ft_mc_resolve(g, &b) && g->has_next);
+        ft_mc_revalidate(g);
+        assert(!g->has_next && g->in == &P3);
+        g->hw = NULL;
+        vlan_enabled = false;
     }
 
     /* Dropping a port by device alone, for the delete that arrives after the

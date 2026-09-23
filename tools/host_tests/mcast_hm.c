@@ -29,20 +29,25 @@
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define cpu_to_be32(x) __builtin_bswap32((uint32_t)(x))
+#define cpu_to_be16(x) __builtin_bswap16((uint16_t)(x))
 #define htons(x) __builtin_bswap16((uint16_t)(x))
 #else
 #define cpu_to_be32(x) ((uint32_t)(x))
+#define cpu_to_be16(x) ((uint16_t)(x))
 #define htons(x) ((uint16_t)(x))
 #endif
 #define be32_to_cpu(x) cpu_to_be32(x)
+#define be16_to_cpu(x) cpu_to_be16(x)
 #define MAX_OPCODES 16
 #define SUCCESS 0
 #define FAILURE -1
 #define ETHER_ADDR_LEN 6
 #define ETHER_TYPE_LEN 2
 #define ETHERTYPE_VLAN 0x8100
+#define IPV6_ADDRESS_LENGTH 16
 #define DPA_ERROR(...) ((void)0)
 #define DPA_INFO(...) ((void)0)
+#define DPA_PACKED __attribute__((packed))
 typedef uint8_t U8;
 typedef uint16_t U16;
 typedef uint32_t U32;
@@ -51,11 +56,11 @@ typedef uint32_t U32;
 
 #include "mcast_hm_types.inc"
 
-/* Only the fields the two emitters and the applier touch. Deliberately not the
+/* Only the fields the emitters and the applier touch. Deliberately not the
  * production struct: what is under test is that the cursor is per entry, and a
  * local definition makes the test say so rather than inherit it. */
 struct ins_entry_info {
-    unsigned opc_count, param_size, eth_type;
+    unsigned opc_count, param_size, eth_type, flags;
     uint8_t *paramptr, *opcptr;
     uint32_t *vlan_hdrs;
     struct dpa_l2hdr_info l2_info;
@@ -64,7 +69,27 @@ struct ins_entry_info {
     struct dpa_l3hdr_info l3_info;
 };
 
+/* The fields the multicast key composer reads off a conntrack entry. */
+#define FFTYPE_IPV4 1
+#define FFTYPE_IPV6 2
+typedef struct {
+    unsigned fftype;
+    uint8_t proto;
+    uint32_t Saddr_v4, Daddr_v4;
+    uint32_t Saddr_v6[4], Daddr_v6[4];
+} CtEntry, *PCtEntry;
+#define IS_IPV6_FLOW(e) (((e)->fftype & FFTYPE_IPV6) != 0)
+
 static uint32_t get_logical_ifstats_base(void) { return 0; }
+/* The registered-interface arm of the ingress strip, which a group's own
+ * description never takes: its records come from the description. */
+enum { RX_IFSTATS, TX_IFSTATS };
+#define IF_TYPE_VLAN (1 << 1)
+static int dpa_get_num_vlan_iface_stats_entries(uint32_t a, uint32_t b, uint32_t *n)
+{ (void)a; (void)b; (void)n; assert(!"a group names its own tags"); return -1; }
+static int dpa_get_iface_stats_entries(uint32_t a, uint32_t b, uint8_t *o,
+                                       uint32_t t, uint32_t i)
+{ (void)a; (void)b; (void)o; (void)t; (void)i; assert(!"a group names its own tags"); return -1; }
 
 #include "mcast_hm.inc"
 
@@ -190,6 +215,116 @@ int main(void)
             assert(listener(&info) == SUCCESS);
             assert(info.opc_count == 2);
         }
+    }
+
+    /* ---- a bridged group ------------------------------------------------
+     *
+     * The root is keyed on the frame's own Ethernet pair ahead of the routed
+     * key's fields, in the order the key generator extracts them, and every
+     * copy writes back exactly that pair. 22 and 46 bytes with the port id,
+     * which is what cdx_pcd.xml sizes the bridged multicast tables for. */
+    {
+        static const uint8_t pair[2 * ETHER_ADDR_LEN] = {
+            0x01, 0x00, 0x5e, 0x09, 0x05, 0x01,     /* destination */
+            0x02, 0x11, 0x22, 0x33, 0x44, 0x55,     /* the sender */
+        };
+        uint8_t key[64];
+        CtEntry ct;
+
+        memset(&ct, 0, sizeof(ct));
+        memset(key, 0xa5, sizeof(key));
+        ct.fftype = FFTYPE_IPV4;
+        ct.proto = 17;
+        ct.Saddr_v4 = 0x0267120a;   /* network order, as the entry holds it */
+        ct.Daddr_v4 = 0x010509ef;
+        assert(fill_mcast_mac_key(&ct, pair, key, 7) == 22);
+        assert(key[0] == 7);
+        assert(!memcmp(key + 1, pair, 6));          /* destination MAC */
+        assert(!memcmp(key + 7, pair + 6, 6));      /* source MAC */
+        assert(!memcmp(key + 13, &ct.Saddr_v4, 4));
+        assert(!memcmp(key + 17, &ct.Daddr_v4, 4));
+        assert(key[21] == 17);
+        assert(key[22] == 0xa5);                    /* and nothing beyond */
+
+        memset(&ct, 0, sizeof(ct));
+        memset(key, 0xa5, sizeof(key));
+        ct.fftype = FFTYPE_IPV6;
+        ct.proto = 17;
+        ct.Saddr_v6[0] = 0x00fe0000;
+        ct.Daddr_v6[0] = 0x00ff1eff;
+        assert(fill_mcast_mac_key(&ct, pair, key, 3) == 46);
+        assert(key[0] == 3);
+        assert(!memcmp(key + 1, pair, 12));
+        assert(!memcmp(key + 13, ct.Saddr_v6, 16));
+        assert(!memcmp(key + 29, ct.Daddr_v6, 16));
+        assert(key[45] == 17 && key[46] == 0xa5);
+
+        /* The copy is rebuilt with the pair the root matched, not the
+         * egress port's address the interface walk filled in, and its tag
+         * still comes first. */
+        {
+            struct cdx_l2_encap encap = one_tag(289);
+            struct cdx_mc_member_frame frame = { .mac_pair = pair };
+
+            memset(&info, 0, sizeof(info));
+            memset(info.l2_info.l2hdr, 0xee, sizeof(info.l2_info.l2hdr));
+            assert(apply_l2_encap(&info, &encap) == SUCCESS);
+            mcast_member_frame(&info, &frame);
+            cursor(&info, &e);
+            assert(listener(&info) == SUCCESS);
+            assert(e.opcodes[0] == INSERT_VLAN_HDR && e.opcodes[1] == INSERT_L2_HDR);
+            {
+                uint8_t *l2 = e.params + sizeof(struct en_ehash_insert_vlan_hdr) + 4
+                              + sizeof(struct en_ehash_insert_l2_hdr);
+                assert(!memcmp(l2, pair, 12));
+                assert(l2[12] == 0x81 && l2[13] == 0x00);
+            }
+            /* No frame, or a routed one, leaves the walk's header alone. */
+            memset(&info, 0, sizeof(info));
+            memset(info.l2_info.l2hdr, 0xee, sizeof(info.l2_info.l2hdr));
+            mcast_member_frame(&info, NULL);
+            frame.mac_pair = NULL;
+            mcast_member_frame(&info, &frame);
+            for (unsigned i = 0; i < sizeof(info.l2_info.l2hdr); i++)
+                assert(info.l2_info.l2hdr[i] == 0xee);
+        }
+    }
+
+    /* ---- the tags a group arrives with -------------------------------
+     *
+     * The root validates and strips exactly the tags the group describes.
+     * Before a group could describe them the strip expected an untagged
+     * frame, and a tagged one matched the key and was handed to Linux. */
+    {
+        struct cdx_l2_encap encap = {0};
+        struct en_ehash_strip_all_vlan_hdrs *p;
+
+        encap.num_ingress = 1;
+        encap.ingress[0].tpid = ETHERTYPE_VLAN;
+        encap.ingress[0].tci = 289;
+        memset(&info, 0, sizeof(info));
+        assert(apply_l2_encap(&info, &encap) == SUCCESS);
+        assert(info.l2_info.vlan_present && info.l2_info.num_ingress_vlan_hdrs == 1);
+        cursor(&info, &e);
+        memset(e.params, 0, sizeof(e.params));
+        assert(insert_remove_vlan_hm(&info, 0, 0) == SUCCESS);
+        assert(e.opcodes[0] == STRIP_ALL_VLAN_HDRS && info.opc_count == 1);
+        p = (struct en_ehash_strip_all_vlan_hdrs *)e.params;
+        assert(be16_to_cpu(p->vlan_id[0]) == 289);
+        /* Not a bridge flow: the tag is validated, never skipped. */
+        assert(!(p->op_flags & OP_SKIP_VLAN_VALIDATE));
+        /* A tag with no record of its own counts nowhere. */
+        assert(p->word == 0);
+
+        /* Untagged, the strip expects no tag and one that arrives is
+         * refused by it -- which is the other VLANs of the port. */
+        memset(&info, 0, sizeof(info));
+        info.l2_info.vlan_flow_ifstats = 1;
+        cursor(&info, &e);
+        memset(e.params, 0, sizeof(e.params));
+        assert(insert_remove_vlan_hm(&info, 0, 0) == SUCCESS);
+        p = (struct en_ehash_strip_all_vlan_hdrs *)e.params;
+        assert(p->vlan_id[0] == 0 && !(p->op_flags & OP_SKIP_VLAN_VALIDATE));
     }
 
     /* And the arithmetic that made sharing it a ceiling, stated so that a

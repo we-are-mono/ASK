@@ -318,20 +318,10 @@ static void mr_cache_put(struct mr_mfc *c)
 }
 
 /* --- the backend interface -------------------------------------------- */
+/* The listener and group descriptions come from cdx_mcast_backend.h itself,
+ * at the head of the generated include, so a field added there is a field
+ * the harness has. */
 struct cdx_ft_vlan { u16 proto; u16 id; };
-struct cdx_mc_listener {
-    struct net_device *dev;
-    struct cdx_ft_vlan vlan[CDX_FT_VLAN_MAX];
-    u8 vlans;
-};
-struct cdx_mc_group_spec {
-    struct net_device *in;
-    union nf_inet_addr src;
-    union nf_inet_addr dst;
-    u8 family;
-    u8 listeners;
-    struct cdx_mc_listener listener[CDX_MC_MAX_LISTENERS];
-};
 struct cdx_mc_group;
 
 /* --- the host's own memberships --------------------------------------- */
@@ -750,10 +740,33 @@ int main(void)
     assert(refuse(g) == FT_MR_REFUSED_INGRESS);
     /* A VLAN device resolves to the port beneath it: the key names a port
      * and the per-listener rebuild strips whatever L2 arrived. The tag count
-     * is kept because the counter fold has to subtract it. */
+     * is kept because the counter fold has to subtract it, and the tag itself
+     * goes to the root, which accepts only frames carrying it -- the same
+     * key untagged, or on another VLAN of the port, is Linux's. */
     vif_set(AF_INET, 0, &VWAN, 0);
     assert(derive(g, &plan) == FT_MR_PENDING);
     assert(plan.spec.in == &WAN && plan.in_tags == 1);
+    assert(plan.spec.in_vlans == 1 && plan.spec.in_vlan[0].id == 10);
+    assert(plan.spec.in_vlan[0].proto == htons(ETH_P_8021Q));
+    /* Routed: no Ethernet pair to key on, the copies take the port's. */
+    assert(!plan.spec.bridged);
+    /* A group installed on another VLAN of the same port is not the same
+     * plan: the root it needs validates a different tag. */
+    g->in = plan.spec.in;
+    g->in_tags = plan.in_tags;
+    g->listeners = plan.spec.listeners;
+    memcpy(g->listener, plan.spec.listener, sizeof(g->listener));
+    memcpy(g->in_vlan, plan.spec.in_vlan, sizeof(g->in_vlan));
+    assert(ft_mr_plan_same(g, &plan));
+    g->in_vlan[0].id = 20;
+    assert(!ft_mr_plan_same(g, &plan));
+    g->in = NULL;
+    g->listeners = 0;
+    ft_mr_plan_put(&plan);
+    /* And a plain port has no tag to validate. */
+    vif_set(AF_INET, 0, &WAN, 0);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.in_vlans == 0);
     ft_mr_plan_put(&plan);
     free(g);
 

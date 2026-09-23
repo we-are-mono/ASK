@@ -187,6 +187,28 @@ struct ipv6_esp_key{
 	uint32_t spi;   //spi
 }DPA_PACKED;
 
+/* A bridged multicast group's key, in the bridged multicast tables: the
+ * frame's own Ethernet pair ahead of the routed key's fields. The order is the
+ * key generator's, which extracts by hardware field id rather than in the
+ * order the distribution names them -- the Ethernet fields come first. With
+ * the port id ahead of it that is 22 bytes for IPv4 and 46 for IPv6, which is
+ * what cdx_pcd.xml sizes the two tables for. */
+struct ipv4_mcast_mac_key {
+	uint8_t ether_da[6];
+	uint8_t ether_sa[6];
+	uint32_t ipv4_saddr;
+	uint32_t ipv4_daddr;
+	uint8_t ipv4_protocol;
+}DPA_PACKED;
+
+struct ipv6_mcast_mac_key {
+	uint8_t ether_da[6];
+	uint8_t ether_sa[6];
+	uint8_t ipv6_saddr[16];
+	uint8_t ipv6_daddr[16];
+	uint8_t ipv6_protocol;
+}DPA_PACKED;
+
 
 
 //possible key combinations
@@ -203,6 +225,8 @@ union dpa_key {
 			struct ipv6_esp_key ipv6_esp_key;
 			struct ipv4_3tuple_tcpudp_key ipv4_3tuple_tcpudp_key;
 			struct ipv6_3tuple_tcpudp_key ipv6_3tuple_tcpudp_key;
+			struct ipv4_mcast_mac_key ipv4_mcast_mac_key;
+			struct ipv6_mcast_mac_key ipv6_mcast_mac_key;
 		};
 	}DPA_PACKED;
 	char key_array[0];

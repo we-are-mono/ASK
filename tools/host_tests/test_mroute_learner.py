@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 
+from test_pppoe_hm import declaration
 from test_qos_lifecycle import function
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,8 +32,11 @@ def test_mroute_learner(tmp_path):
     # The harness restates this one constant, so it must not drift.
     assert "#define FT_MR_OIF_TEXT\t\t(CDX_MC_MAX_LISTENERS * (IFNAMSIZ + 1))" \
         in source, "FT_MR_OIF_TEXT changed; mroute_learner.c repeats it"
+    header = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
     (tmp_path / "mroute_learner.inc").write_text(
-        source[enum_start:source.index("};", enum_start) + 3]
+        declaration(header, "cdx_mc_listener")
+        + declaration(header, "cdx_mc_group_spec")
+        + source[enum_start:source.index("};", enum_start) + 3]
         + _between(source, "struct ft_mr_vif {", "static LIST_HEAD(ft_mr_groups)")
         # The table the decision reads, declared between the struct it is an
         # array of and the functions that read it. The production definition

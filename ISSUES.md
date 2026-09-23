@@ -166,19 +166,6 @@ result independently of those temporary files.
   auto_bridge. Remove what the flowtable path does not use, with host-test
   coverage for the shared machinery the handlers sit beside.
 
-- [ ] **A191 — bridged multicast rewrites the source MAC and cannot accept
-  tagged ingress.** The listener builders in `cdx/cdx_ehash.c` strip Ethernet
-  at the root and insert a literal header carrying the egress port's MAC, which
-  is right for a router and wrong for a bridge: successive packets of one
-  `(S,G)` can come from different senders. Wire probes on both families confirm
-  the rewrite; hop counts are already preserved for bridged groups. Separately,
-  `cdx_mc_group_spec` carries no ingress VLAN or PVID, so tagged frames match
-  the root and then fall back to Linux. Hardware proof exists for keying entries
-  on the original MAC pair and rebuilding with the matched source; production
-  integration does not. `test_flowtable_service_multicast_bridge.py` checks IP
-  source and hop count only, so it cannot catch the rewrite; the fix needs a
-  wire-level MAC assertion. See [the hardware investigation](docs/flowtable/multicast-hardware.md).
-
 - [ ] **A188 — a group that is both bridged and routed is carried once, not
   merged.** The classifier keeps one group id and one root entry per address
   pair, so the two multicast learners share a key namespace and coordinate
@@ -276,6 +263,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A191.** Bridged multicast rewrote the source MAC to the egress port's and sent tagged ingress to the CPU —
+  fixed (_:/^cdx: bridge multicast with the sender's MAC and its ingress tag_).
 
 - [x] **A196.** The microcode fragmented multicast replicas over a listener's MTU, where Linux sends Packet Too Big or drops —
   fixed (_:/^flowtable: keep a multicast group that could fragment in software_).

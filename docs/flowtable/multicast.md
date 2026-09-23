@@ -1,9 +1,12 @@
 # Multicast without CMM
 
 Validation update: the original design below did not account for the ASK
-listener encoder replacing a bridged packet's source MAC. See the
-[hardware investigation](multicast-hardware.md) for the observed
-defect, NXP documentation, wire probes and remaining hardware proof.
+listener encoder replacing a bridged packet's source MAC. A bridged group is
+now keyed on its frames' own Ethernet pair in tables of its own, every copy is
+rebuilt with that pair, and the group names the ingress tag its root
+validates. See [the hardware investigation](multicast-hardware.md) for the
+defect, the proof and the
+[production integration](multicast-hardware.md#production-integration).
 
 Roadmap item 7. What the hardware already replicates, what the bridge already
 knows, and the one thing neither of them has — which decides the shape of the
@@ -429,6 +432,24 @@ entry is keyed on it, so a stream arriving elsewhere misses and is forwarded in
 software — which is correct rather than a failure, and is how a second ingress
 gets its own entry.
 
+**The frame.** The key also carries the frame's own destination and source
+MACs. A bridge forwards a frame with the addresses it arrived with, and a
+listener can only write back addresses its root matched. So a second sender of
+the same `(S,G)` misses and is bridged in software, still with its own address.
+The ingress shape is learned as well: the group's VLAN as one 802.1Q tag, or
+untagged on the port's PVID. The root validates and strips exactly that shape.
+A frame with two tags, a tag in another protocol, or a tag on a bridge that
+does not filter is not learned from, because no root can validate it. The
+`/proc` row shows `smac`, `dmac` and `in_vid`, which is 0 for untagged.
+
+**A stream is replaced only when idle.** An installed entry keeps its key
+while it carries traffic, so two live senders do not trade one entry. A
+five-second refresh reads each entry's counter. An entry that counted nothing
+for a whole interval reopens the traffic hook, and a stream seen then takes
+over the key: a sender whose MAC changed, a source that moved, the stream on
+another port. The hook costs nothing while every installed entry is carrying
+its stream.
+
 **The listeners.** Each MDB port group names a bridge port. That port must
 satisfy `cdx_ft_port_supported()` — a registered physical CDX Ethernet onif,
 not an L3 slave, not a switch-ASIC port, up and with carrier. A port that does
@@ -507,6 +528,15 @@ stack depends on the bridge's VLAN configuration, which the adapter already
 watches on the switchdev chain. What is new is the source: an installed `(S,G)`
 entry whose stream stops has nothing to retire it, so it carries an idle timer
 of its own.
+
+A VLAN change on the bridge, whether a port's membership, the bridge's own,
+its filtering or its protocol, marks every group on that bridge. The worker
+re-derives them under RTNL, not in the notifier, because a port VLAN object
+is notified before the bridge applies it. Each listener's tag is re-resolved.
+A listener that left the VLAN stops being one, but stays recorded so it
+returns with its VLAN. An ingress whose shape no longer resolves to the
+group's VLAN is forgotten and learned again: a moved PVID, or a tagged
+ingress port that left the VLAN.
 
 ## Implementation plan
 

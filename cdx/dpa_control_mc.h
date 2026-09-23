@@ -108,6 +108,17 @@ struct mcast_group_info
   struct net_device *in_dev;
   uint8_t mctype;
   bool bridged;
+  /* Both set only by an owner that describes the frame the group arrives
+   * as; the legacy owner leaves them zero and gets its routed root.
+   *
+   * `mac_keyed`: the root is keyed on `mac_pair` -- destination then source,
+   * the frame's own -- in the bridged multicast table, and every listener
+   * rebuilds Ethernet with that pair. `in_vlan` is the tag stack the root
+   * validates and strips, innermost first as struct cdx_l2_encap orders it. */
+  bool mac_keyed;
+  uint8_t mac_pair[2 * ETHER_ADDR_LEN];
+  uint8_t in_vlans;
+  struct vlan_header in_vlan[DPA_CLS_HM_MAX_VLANs];
 };
 
 #define CDX_MC_ACTION_ADD			0
@@ -116,9 +127,11 @@ struct mcast_group_info
 
 int GetMcastGrpId( struct mcast_group_info *pMcastGrpInfo,
 						uint8_t *ingress_iface);
-int insert_mcast_entry_in_classif_table(struct _tCtEntry *pCtEntry, 
+int insert_mcast_entry_in_classif_table(struct _tCtEntry *pCtEntry,
 		unsigned int num_members, uint64_t first_member_flow_addr,
-						void *first_listener_entry, bool bridged);
+						void *first_listener_entry, bool bridged,
+						const uint8_t *mac_pair,
+						const struct cdx_l2_encap *in_encap);
 void *dpa_get_pcdhandle(uint32_t fm_index);
 int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 		struct dpa_l3hdr_info *l3_info, PRouteEntry tnl_rt_entry, void *queinfo, uint32_t hash);
@@ -145,6 +158,19 @@ int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action);
 int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action);
 int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6);
 
+/* How one listener's copy is framed beyond what its egress interface and tags
+ * give it. NULL is the routed answer the legacy owner always wanted: the
+ * egress port's own address as the source and the group's mapped address as
+ * the destination.
+ *
+ * `mac_pair` is a bridged copy's: the destination and source the root matched,
+ * in the order the header carries them, written back verbatim. A bridge
+ * forwards a frame with the addresses it arrived with, and the root is keyed
+ * on this pair precisely so that the listener can know them. */
+struct cdx_mc_member_frame {
+	const uint8_t *mac_pair;
+};
+
 /* Builds one listener's entry. The listener is already resolved -- an onif and
  * the netdev whose MTU the enqueue carries, borrowed for the call -- because
  * the two owners resolve it differently. `encap` names the tags this listener's
@@ -153,6 +179,7 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6);
  * merely tidiness. */
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
 	POnifDesc onif_desc, struct net_device *dev, const struct cdx_l2_encap *encap,
+	const struct cdx_mc_member_frame *frame,
 	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type);
 
 /* Module init/exit functions */

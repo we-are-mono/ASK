@@ -214,7 +214,9 @@ def test_a_group_is_keyed_on_its_device_not_its_name():
         "the ingress must not be compared by name")
 
     add = function(source, "cdx_mc_group_add")
-    assert "grp->in_dev = spec->in;" in add, "the pinned device must be recorded"
+    assert "cdx_mc_describe(grp, spec);" in add
+    assert "grp->in_dev = spec->in;" in function(source, "cdx_mc_describe"), (
+        "the pinned device must be recorded")
 
     # And the resolutions that follow from it: the ingress onif and the MAC
     # subscription both prefer the device when the group carries one.
@@ -307,3 +309,64 @@ def test_replace_refuses_a_different_key():
     for field in ("in_dev", "ipv4_saddr", "ipv4_daddr",
                   "ipv6_saddr", "ipv6_daddr", "mctype"):
         assert field in key, f"{field} is part of the key and must be compared"
+
+
+def test_a_bridged_group_is_keyed_on_its_own_frames():
+    """A bridge forwards a frame with the addresses it arrived with, and
+    successive frames of one (S,G) can come from different senders. So a
+    bridged group's root is keyed on the frame's own Ethernet pair, in the
+    bridged multicast table, and every copy writes that pair back: the only
+    way a listener can know the sender's address is for its root to have
+    matched it. A routed group keeps the routed key and its copies take the
+    egress port's address.
+    """
+    check = code("cdx_mc_check")
+    assert "spec->bridged && (!is_multicast_ether_addr(spec->dst_mac)" in check
+    assert "!is_valid_ether_addr(spec->src_mac)" in check
+
+    describe = code("cdx_mc_describe")
+    assert "grp->mac_keyed = spec->bridged;" in describe
+    assert "memcpy(grp->mac_pair, spec->dst_mac, ETH_ALEN);" in describe
+    assert "memcpy(grp->mac_pair + ETH_ALEN, spec->src_mac, ETH_ALEN);" in describe
+
+    root = code("cdx_add_mcast_table_entry")
+    assert "pMcastGrpInfo->mac_keyed ? pMcastGrpInfo->mac_pair : NULL" in root
+    assert "&in_encap" in root
+
+    build = code("cdx_mc_build_listeners")
+    assert "IPV4_BRIDGED_MULTICAST_TABLE" in build and "IPV6_BRIDGED_MULTICAST_TABLE" in build
+    assert "frame.mac_pair = grp->mac_pair;" in build
+
+    encoder = (ROOT / "cdx/cdx_ehash.c").read_text()
+    insert = code("insert_mcast_entry_in_classif_table", encoder)
+    assert "fill_mcast_mac_key(entry, mac_pair," in insert
+    assert "IPV6_BRIDGED_MULTICAST_TABLE" in insert
+    # The group's own tags are applied after the interface walk, as a flow's
+    # are, and only when it names some.
+    assert insert.index("dpa_get_tx_info_by_itf(") < insert.index("apply_l2_encap(info, in_encap)")
+    member = code("create_exthash_entry4mcast_member", encoder)
+    assert member.index("apply_l2_encap(pInsEntryInfo, encap)") < \
+        member.index("mcast_member_frame(pInsEntryInfo, frame);"), (
+        "the pair overrides the walk's header after the walk")
+
+
+def test_one_entry_per_classifier_key_not_per_address_pair():
+    """The root is hashed on the ingress port, the address pair and, in the
+    bridged table, the Ethernet pair. Groups that differ in any of those are
+    entries the classifier tells apart and may coexist; the address pair alone
+    is only the legacy owner's rule. A difference in ingress tags alone does
+    not make a second key, because the key names no VLAN.
+    """
+    taken = code("cdx_mc_key_taken")
+    assert "tmp->in_dev != grp->in_dev || tmp->mac_keyed != grp->mac_keyed" in taken
+    assert "memcmp(tmp->mac_pair, grp->mac_pair, sizeof(grp->mac_pair))" in taken
+    assert "!tmp->in_dev || !grp->in_dev" in taken, "the legacy owner's rule"
+    assert "in_vlan" not in taken
+    assert "cdx_mc_key_taken(grp)" in code("cdx_mc_group_add")
+    assert "GetMcastGrpId(" not in code("cdx_mc_group_add")
+
+    # And a replace may change neither the pair nor the tags: both belong to
+    # the root, which a chain swap leaves where it is.
+    same = code("cdx_mc_same_key")
+    assert "described.mac_keyed != grp->mac_keyed" in same
+    assert "memcmp(described.in_vlan, grp->in_vlan, sizeof(grp->in_vlan))" in same

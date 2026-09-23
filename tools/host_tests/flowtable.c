@@ -430,6 +430,8 @@ static void ft_mc_device_gone(struct net_device *dev)
     mc_devices_gone++;
 }
 static void ft_mc_kick_all(void) { mc_rechecks++; }
+static unsigned mc_vlan_changes;
+static void ft_mc_vlan_changed(struct net_device *dev) { (void)dev; mc_vlan_changes++; }
 /* The routed learner has its own file and its own harness
  * (mroute_learner.c); here the chains' calls into it only count. The two
  * multicast families the FIB chain carries are ipmr's and ip6mr's, and this
@@ -2631,12 +2633,16 @@ static void test_bridge_fdb(void)
     bridge_out_fixture();
     assert(ft_replace(&binding, &cls) == 0);
     assert(!atomic_read(&ft_invalid));
+    unsigned vlan_changes = mc_vlan_changes;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
     assert(atomic_read(&ft_invalid) && !obj.handled);
     atomic_set(&ft_invalid, 0);
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_DEL, &obj) == NOTIFY_DONE);
     assert(atomic_read(&ft_invalid) && !obj.handled);
     atomic_set(&ft_invalid, 0);
+    /* The bridged multicast learner holds the same VLAN decisions for its
+     * listeners and ingress, and hears both. */
+    assert(mc_vlan_changes == vlan_changes + 2);
     /* A device nothing here depends on is somebody else's bridge. Every
      * bridge installs its default PVID on a port the moment it is enslaved,
      * whatever its VLAN filtering setting, so a scope test that let this

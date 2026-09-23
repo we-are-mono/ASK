@@ -84,7 +84,9 @@ static struct ccnode_table_params table_params[] = {
 	{(char *)"cdx_esp4", 	ESP_IPV4_TABLE},
 	{(char *)"cdx_esp6", 	ESP_IPV6_TABLE},
 	{(char *)"cdx_tuple3udp4",	IPV4_3TUPLE_UDP_TABLE},
-	{(char *)"cdx_tuple3udp6", IPV6_3TUPLE_UDP_TABLE}
+	{(char *)"cdx_tuple3udp6", IPV6_3TUPLE_UDP_TABLE},
+	{(char *)"cdx_bridged_mcast4", IPV4_BRIDGED_MULTICAST_TABLE},
+	{(char *)"cdx_bridged_mcast6", IPV6_BRIDGED_MULTICAST_TABLE}
 };
 #define MAX_TABLE_PARAMS\
 		(sizeof(table_params) / sizeof(struct ccnode_table_params))
@@ -103,6 +105,8 @@ static struct model_dist_params dist_name[] = {
 	{(char *)"cdx_ethernet_dist", 	ETHERNET_DIST},
 	{(char *)"cdx_tup3udp4_dist", 	IPV4_3TUPLE_UDP_DIST},
 	{(char *)"cdx_tup3udp6_dist", 	IPV6_3TUPLE_UDP_DIST},
+	{(char *)"cdx_bridged_mcast4_dist", IPV4_BRIDGED_MULTICAST_DIST},
+	{(char *)"cdx_bridged_mcast6_dist", IPV6_BRIDGED_MULTICAST_DIST},
 };
 #define MAX_DIST_PARAMS\
 		(sizeof(dist_name) / sizeof(struct model_dist_params))
@@ -614,6 +618,19 @@ static int set_table_types(struct fmc_model_t *model)
 			}
 			if (strstr(model->htnode_name[index], "cdx_tuple3udp6")) {
 				model->htnode[index].table_type = IPV6_3TUPLE_UDP_TABLE;
+				break;
+			}
+			/* The bridged multicast tables are multicast tables
+			 * to the microcode, so the kernel is given the
+			 * multicast types and the L3 class they select. Only
+			 * cdx tells the two apart, by the type it is given
+			 * in table_params[]. */
+			if (strstr(model->htnode_name[index], "cdx_bridged_mcast4")) {
+				model->htnode[index].table_type = IPV4_MULTICAST_TABLE;
+				break;
+			}
+			if (strstr(model->htnode_name[index], "cdx_bridged_mcast6")) {
+				model->htnode[index].table_type = IPV6_MULTICAST_TABLE;
 				break;
 			}
 			model->htnode[index].table_type = ETHERNET_TABLE;

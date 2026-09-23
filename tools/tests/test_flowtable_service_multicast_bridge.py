@@ -9,8 +9,11 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
+from _mcast_wire import capture, frames, new_config, send
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from mcast_wire_capture import multicast_mac
 from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, rig  # noqa: F401
 from test_flowtable_service import managed_service
 from test_flowtable_service_multicast import recover
@@ -159,3 +162,186 @@ except BaseException:
 @pytest.mark.parametrize('fault', ['withdrawal', 'claim-failslab'])
 async def test_flowtable_service_multicast_bridge_recovery(multicast_bridge_service, fault):
     await recover(multicast_bridge_service, fault)
+
+
+# ---- what a bridged replica looks like on the wire --------------------------
+#
+# A bridge forwards a frame with the Ethernet addresses and hop count it arrived
+# with. The listeners' old literal header wrote the egress port's address over
+# the sender's, and the IP-level oracles above cannot see that: they read the
+# datagram, not the frame. These read the frame.
+
+FRAMING_PORT = 47395
+FRAMING_COUNT = 128
+# How the WAN wire carries IPTV: untagged on the port's PVID by default, tagged
+# where the bench trunks it (ASK_MCAST_RECOVERY_TAGGED=1).
+WAN_WIRE_VID = IPTV_VID if IPTV_TAGGED else 0
+# A LAN-side sender on the IPTV segment, the listener's own address.
+LAN_SOURCE = {4: '198.18.103.3', 6: 'fd42:6173:8:2::3'}
+
+
+def _group(r):
+    return '239.9.5.3' if r.multicast_family == 4 else 'ff1e::9:5:3'
+
+
+async def _bridged_row(r, group, ready):
+    def found(state):
+        rows = [g for g in state['mcast'] if g['group'] == group]
+        return rows and ready(rows[0])
+    state = await r.wait(found, timeout=15)
+    return next(g for g in state['mcast'] if g['group'] == group)
+
+
+async def _mdb(r, port, group, add=True):
+    return await command(r.target, r.session, 'bridge', 'mdb', 'replace' if add else 'del',
+                         'dev', BRIDGE, 'port', port, 'grp', group, 'vid', str(IPTV_VID),
+                         *(['permanent'] if add else []))
+
+
+def _packets(state, group):
+    return int(next(g for g in state['mcast'] if g['group'] == group)['packets'])
+
+
+async def _window(r, group, source, capture_on, ifaces, inject, ingress, label):
+    """Inject a fresh run and read it off the listener's wire, with the
+    classifier's own count and the ingress CPU's beside it."""
+    config = new_config(r.multicast_family, source, group, FRAMING_PORT, ifaces)
+    before = await r.state()
+    cpu = await kernel_rx_packets(r.target, r.session, ingress)
+    async with capture(capture_on, config) as handle:
+        await inject(config, FRAMING_COUNT)
+        await asyncio.sleep(0.5)
+    cpu = await kernel_rx_packets(r.target, r.session, ingress) - cpu
+    after = await r.state()
+    r.record(label, {'result': handle['result'], 'before': before, 'after': after,
+                     'cpu_rx': cpu})
+    return handle['result'], before, after, cpu
+
+
+async def _from_wan(r, config, count, source_mac):
+    """Frames from the orchestrator onto the WAN wire, as the IPTV head end's
+    router would send them: tagged where the bench trunks the IPTV VLAN."""
+    await asyncio.to_thread(send, frames(config, {1: 512}, count, source_mac=source_mac,
+                                         vlan=IPTV_VID if IPTV_TAGGED else None),
+                            r.multicast_send_if)
+
+
+async def _from_lan(r, config, count):
+    """Frames from the LAN VM's own IPTV VLAN device. The kernel there puts the
+    tag on, so the DUT's LAN port receives exactly the tagged frames a sender
+    behind a trunk would send."""
+    overhead = (20 if config['family'] == 4 else 40) + 8
+    layer = (f"IP(src={config['source']!r}, dst={config['group']!r}, ttl=64, flags='DF')"
+             if config['family'] == 4 else
+             f"IPv6(src={config['source']!r}, dst={config['group']!r}, hlim=64)")
+    script = f'''
+import struct, time
+from scapy.all import Ether, IP, IPv6, UDP, Raw, conf
+token = bytes.fromhex({config['token']!r})
+sock = conf.L2socket(iface={LISTENER!r})
+try:
+    for sequence in range({count}):
+        data = b'ASKMCW1' + token + struct.pack('!BI', 1, sequence)
+        data += b'.' * ({512 - overhead} - len(data))
+        sock.send(Ether(dst={multicast_mac(config['group']).hex(':')!r}) / {layer}
+                  / UDP(sport={FRAMING_PORT}, dport={FRAMING_PORT}) / Raw(data))
+        time.sleep(0.005)
+finally:
+    sock.close()
+'''
+    result = await lan_run_python(r.lan, script, label='multicast_bridge_lan_source',
+                                  timeout=30)
+    assert result.rc == 0, result.stdout
+
+
+def _assert_bridged_copy(result, source_mac, group):
+    assert not result['errors'], result
+    assert result['seen'].get('1') == list(range(FRAMING_COUNT)), result
+    assert result['duplicates'] == 0 and result['fragments'] == 0, result
+    # A bridge changes neither the sender's address nor the hop count.
+    assert result['sources'] == [source_mac.lower()], result
+    assert result['destinations'] == [multicast_mac(group).hex(':')], result
+    assert result['hops'] == [64], result
+
+
+async def test_flowtable_service_multicast_bridge_keeps_the_sender(multicast_bridge_service):
+    """IPTV in on the WAN port, out to the set-top box tagged. The replica
+    carries the sender's MAC, the group's MAC and the sender's hop count, and
+    the classifier -- not the CPU -- made it. A second sender of the same
+    (S,G) misses the key, which names the first one's address, and once the
+    first has gone idle the learner moves the key to the second."""
+    r = multicast_bridge_service
+    group = _group(r)
+    source = r.multicast_source
+    await _mdb(r, TARGET_LAN_IF, group)
+    try:
+        # The first frames teach the learner the stream; then it is hardware.
+        await _from_wan(r, new_config(r.multicast_family, source, group, FRAMING_PORT, []),
+                        16, r.wan_mac)
+        row = await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+        assert row['smac'] == r.wan_mac.lower(), row
+        assert row['dmac'] == multicast_mac(group).hex(':'), row
+        assert row['in'] == TARGET_WAN_IF and row['in_vid'] == str(WAN_WIRE_VID), row
+        assert row['ports'] == f'{TARGET_LAN_IF}/{IPTV_VID}', row
+        result, before, after, cpu = await _window(
+            r, group, source, r.lan, [LISTENER],
+            lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
+            'multicast-bridge-sender')
+        _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
+        assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
+            (before, after)
+        assert cpu < FRAMING_COUNT * 0.1, cpu
+
+        other = '02:a5:19:10:00:02'
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            await _from_wan(r, new_config(r.multicast_family, source, group,
+                                          FRAMING_PORT, []), 16, other)
+            row = await _bridged_row(r, group, lambda g: True)
+            if row['smac'] == other and row['state'] == 'installed':
+                break
+            assert asyncio.get_running_loop().time() < deadline, row
+            await asyncio.sleep(1)
+        result, before, after, cpu = await _window(
+            r, group, source, r.lan, [LISTENER],
+            lambda c, n: _from_wan(r, c, n, other), TARGET_WAN_IF,
+            'multicast-bridge-new-sender')
+        _assert_bridged_copy(result[LISTENER], other, group)
+        assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
+            (before, after)
+        assert cpu < FRAMING_COUNT * 0.1, cpu
+    finally:
+        await _mdb(r, TARGET_LAN_IF, group, add=False)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
+
+
+async def test_flowtable_service_multicast_bridge_tagged_ingress(multicast_bridge_service):
+    """IPTV in tagged on the LAN port, out of the WAN port as the WAN wire
+    carries it. Before a group could say what it arrives with, its root
+    expected an untagged frame and every tagged one fell back to the CPU; now
+    the root strips the tag it was told about, and the copy leaves with the
+    LAN sender's own address and hop count."""
+    r = multicast_bridge_service
+    group = _group(r)
+    source = LAN_SOURCE[r.multicast_family]
+    capture_if = r.multicast_send_if
+    await _mdb(r, TARGET_WAN_IF, group)
+    try:
+        await _from_lan(r, new_config(r.multicast_family, source, group, FRAMING_PORT, []), 16)
+        row = await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+        assert row['smac'] == r.lan_mac.lower(), row
+        assert row['in'] == TARGET_LAN_IF and row['in_vid'] == str(IPTV_VID), row
+        assert row['ports'] == f'{TARGET_WAN_IF}/{WAN_WIRE_VID}', row
+        # The orchestrator's own wire port is the listener: it receives the
+        # copy exactly as the WAN segment carries it.
+        result, before, after, cpu = await _window(
+            r, group, source, None, [capture_if],
+            lambda c, n: _from_lan(r, c, n), TARGET_LAN_IF,
+            'multicast-bridge-tagged-ingress')
+        _assert_bridged_copy(result[capture_if], r.lan_mac, group)
+        assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
+            (before, after)
+        assert cpu < FRAMING_COUNT * 0.1, cpu
+    finally:
+        await _mdb(r, TARGET_WAN_IF, group, add=False)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)

@@ -130,8 +130,12 @@ traffic that does not exist. A ppp device likewise. All of these are
 
 The classifier key includes the port but not its VLAN tag, and the
 per-listener rebuild strips whatever L2 the frame arrived with, so a VLAN
-device above a port keys on the port. The tag count is kept anyway, because the
-counter fold has to subtract the framing it represents.
+device above a port keys on the port. The tags themselves go into the group
+description (`in_vlan`), and the root's `STRIP_ALL_VLAN_HDRS` validates and
+strips exactly those, the way a flow's root does. Before that, the root
+expected an untagged frame. A VLAN-device parent matched its key and then
+fell back to Linux on every frame, and no rig case had a tagged ingress to
+show it. The tag count is also what the counter fold subtracts per frame.
 
 **The thresholds.** Every oif must be at threshold 1. `ip_mr_forward()`
 forwards out VIF `i` when `ttl > ttls[i]`; the hardware forwards when the TTL
@@ -182,17 +186,17 @@ on one port ([IPv6 guide](ipv6.md)). So a group whose iif is
 is not. Unicast additionally lets full NAT make an identical-stack hairpin a
 distinct path; a group has no NAT, so identical is refused outright.
 
-**The residual that carries, stated rather than discovered.** The classifier
-key names a port and no VLAN, so an entry whose iif is `eth3.10` also matches
-the same `(S,G)` arriving on `eth3` untagged or on `eth3.20` — and replicates
-it as though it had arrived on `eth3.10`, where `ip_mr_forward()` would have
-counted `wrong_if` and dropped it. This is inherent to keying on the port and
-predates the rule above: it exists for any VLAN-device iif. What the rule adds
-is one more reachable shape of it — a stream injected on a VLAN that is also
-an oif is replicated back onto that VLAN, once. It cannot amplify: a replica
-is transmitted, not re-classified, so one frame in is always N frames out.
-Nothing in the adapter can narrow it, because the decision is made by a key
-the parser composes before any table is consulted.
+**The residual, and how the ingress tag closes it.** The classifier key names
+a port and no VLAN. An entry whose iif is `eth3.10` used to match the same
+`(S,G)` arriving on `eth3` untagged or on `eth3.20` too, and to replicate it
+as though it had arrived on `eth3.10`, where `ip_mr_forward()` would have
+counted `wrong_if` and dropped it. The root now validates the parent's own
+tags. The same key untagged or on another VLAN matches, fails the strip, and
+is excepted to Linux, which counts it `wrong_if`. One entry per key remains:
+two parents on different VLANs of one port with the same `(S,G)` share a key
+the classifier cannot tell apart, and the second is refused. The rule above
+is unaffected: a copy is transmitted, not re-classified, so one frame in is
+always N frames out.
 
 Two further rules, both `refused-listener`:
 

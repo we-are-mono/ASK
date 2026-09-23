@@ -46,13 +46,11 @@ struct net_device { unsigned refs; };
 struct mr_mfc { int mfc_flags; unsigned refs; };
 union nf_inet_addr { u32 all[4]; };
 struct cdx_ft_vlan { u16 proto, id; };
-struct cdx_mc_listener { struct net_device *dev; struct cdx_ft_vlan vlan[2]; u8 vlans; };
-struct cdx_mc_group_spec {
-    struct net_device *in;
-    struct cdx_mc_listener listener[8];
-    u8 listeners, family;
-    union nf_inet_addr src, dst;
-};
+#define CDX_FT_VLAN_MAX 2
+#define ETH_ALEN 6
+/* The listener and group descriptions are the header's own, extracted into
+ * the generated include, so a field added there is one the worker here has. */
+#include "mroute_backend.inc"
 struct cdx_mc_group { bool live; unsigned copies; };
 struct cdx_ft_counters { u64 packets, bytes; };
 struct work_struct { bool queued; };

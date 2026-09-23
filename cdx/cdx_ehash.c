@@ -457,6 +457,41 @@ static int fill_key_info(PCtEntry entry, uint8_t *keymem, uint32_t port_id)
 	return key_size;
 }
 
+/* A bridged multicast root's key: the port, the frame's own Ethernet pair, and
+ * the routed multicast key's fields, in the key generator's extraction order.
+ *
+ * The pair is part of the key rather than something read at replication time
+ * because the listeners rebuild Ethernet with a literal header: the only way a
+ * listener can write the sender's source address back is to have matched on
+ * it. A frame of the same (S,G) from another sender misses this entry and is
+ * bridged in software, which is what a second source MAC deserves until the
+ * learner has an entry for it. `mac_pair` is the destination then the source,
+ * the order the header carries them in. */
+static uint32_t fill_mcast_mac_key(PCtEntry entry, const uint8_t *mac_pair,
+				   uint8_t *keymem, uint32_t port_id)
+{
+	union dpa_key *key = (union dpa_key *)keymem;
+
+	key->portid = port_id;
+	if (IS_IPV6_FLOW(entry)) {
+		struct ipv6_mcast_mac_key *k = &key->ipv6_mcast_mac_key;
+
+		memcpy(k->ether_da, mac_pair, ETHER_ADDR_LEN);
+		memcpy(k->ether_sa, mac_pair + ETHER_ADDR_LEN, ETHER_ADDR_LEN);
+		memcpy(k->ipv6_saddr, entry->Saddr_v6, IPV6_ADDRESS_LENGTH);
+		memcpy(k->ipv6_daddr, entry->Daddr_v6, IPV6_ADDRESS_LENGTH);
+		k->ipv6_protocol = entry->proto;
+		return sizeof(*k) + 1;
+	}
+	memcpy(key->ipv4_mcast_mac_key.ether_da, mac_pair, ETHER_ADDR_LEN);
+	memcpy(key->ipv4_mcast_mac_key.ether_sa, mac_pair + ETHER_ADDR_LEN,
+	       ETHER_ADDR_LEN);
+	key->ipv4_mcast_mac_key.ipv4_saddr = entry->Saddr_v4;
+	key->ipv4_mcast_mac_key.ipv4_daddr = entry->Daddr_v4;
+	key->ipv4_mcast_mac_key.ipv4_protocol = entry->proto;
+	return sizeof(key->ipv4_mcast_mac_key) + 1;
+}
+
 /* check activity */
 void hw_ct_get_active(struct hw_ct *ct)
 {
@@ -1422,9 +1457,21 @@ err_ret1:
 	return FAILURE;
 }
 
-int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry, 
+/* A multicast group's root entry: the classifier key, the ingress validation,
+ * and REPLICATE_PKT naming the head of the listener chain.
+ *
+ * `mac_pair`, when given, keys the root on the frame's own Ethernet pair
+ * (destination then source) in the bridged multicast table instead of the
+ * routed one; see fill_mcast_mac_key(). `in_encap`, when it names ingress
+ * tags, is what the root validates and strips: without it STRIP_ALL_VLAN_HDRS
+ * expects an untagged frame, so a tagged one matched the key and was then
+ * handed to Linux -- which is how tagged ingress fell back before a group
+ * could say what it arrives with. Only its ingress half is read. */
+int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 					unsigned int num_members, uint64_t first_member_flow_addr,
-					void *first_listener_entry, bool bridged)
+					void *first_listener_entry, bool bridged,
+					const uint8_t *mac_pair,
+					const struct cdx_l2_encap *in_encap)
 {
 	struct ins_entry_info *info;
 	struct en_exthash_tbl_entry *tbl_entry;
@@ -1493,7 +1540,10 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 							__func__);
 		goto err_ret;
 	}
-	
+	if (mac_pair)
+		tbl_type = IS_IPV6_FLOW(entry) ? IPV6_BRIDGED_MULTICAST_TABLE :
+						 IPV4_BRIDGED_MULTICAST_TABLE;
+
 	//get table descriptor based on type and port
 	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, tbl_type);
 	if (info->td == NULL) {
@@ -1526,7 +1576,16 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 									__func__);
 		goto err_ret;
 	}
-	
+	/* After the interface walk, as for a flow: the root route names a
+	 * physical port, so the walk found no tag and the group's own
+	 * description is the only one. An untagged ingress passes nothing and
+	 * is validated as untagged. */
+	if (in_encap && in_encap->num_ingress &&
+	    apply_l2_encap(info, in_encap)) {
+		DPA_ERROR("%s::unable to apply the ingress tags\n", __func__);
+		goto err_ret;
+	}
+
 	//allocate hash table entry
 	DPA_INFO("%s::info->td %p\n", __func__, info->td);
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
@@ -1548,29 +1607,35 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	SET_STATS_ENABLE(flags);
 #endif
 //fill key information from entry
-	key_size = fill_key_info(entry, &tbl_entry->hashentry.key[0], info->port_id);
+	if (mac_pair)
+		key_size = fill_mcast_mac_key(entry, mac_pair,
+					      &tbl_entry->hashentry.key[0],
+					      info->port_id);
+	else
+		key_size = fill_key_info(entry, &tbl_entry->hashentry.key[0],
+					 info->port_id);
 	if (!key_size) {
 		DPA_ERROR("%s::unable to compose key\n",
 								__func__);
 		goto err_ret;
 	}
 	//round off keysize to next 4 bytes boundary
-	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];			
+	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];
 	ptr += ALIGN(key_size, TBLENTRY_OPC_ALIGN);
-	//set start of opcode list 
+	//set start of opcode list
 	info->opcptr = ptr;
 	//ptr now after opcode section
 	ptr += MAX_OPCODES;
 
 	//set offset to first opcode
 	SET_OPC_OFFSET(flags, (uint32_t)(info->opcptr - (uint8_t *)tbl_entry));
-	//set param offset 
+	//set param offset
 	SET_PARAM_OFFSET(flags, (uint32_t)(ptr - (uint8_t *)tbl_entry));
 	//param_ptr now points after timestamp location
 	tbl_entry->hashentry.flags = cpu_to_be16(flags);
 	//param pointer and opcode pointer now valid
 	info->paramptr = ptr;
-	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
+	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE -
 		GET_PARAM_OFFSET(flags));
 	if (fill_actions(entry, info, !bridged)) {
 		DPA_ERROR("%s::unable to fill actions\n", __func__);
@@ -3074,6 +3139,22 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 	return SUCCESS;
 }
 
+/* Apply what a listener's copy owes to something other than its egress
+ * interface to the description create_ethernet_hm() writes the header from.
+ *
+ * A bridged copy's Ethernet pair replaces the egress port's address and the
+ * group's mapped destination the interface walk filled in. It is written over
+ * the walk's result rather than instead of the walk, because the walk still
+ * decides the transmit queue and the tags. */
+static void mcast_member_frame(struct ins_entry_info *info,
+			       const struct cdx_mc_member_frame *frame)
+{
+	if (!frame)
+		return;
+	if (frame->mac_pair)
+		memcpy(info->l2_info.l2hdr, frame->mac_pair, 2 * ETHER_ADDR_LEN);
+}
+
 /* Builds one listener's entry in a multicast group's replication chain.
  *
  * The scratch state is allocated here rather than supplied by the caller, and
@@ -3110,9 +3191,13 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
  * dpa_iface_info with no net_dev and without IF_TYPE_ETHERNET, so resolving
  * every listener from a netdev would silently stop finding CMM's tagged ones.
  * `dev` is borrowed and the caller holds it across the call.
+ *
+ * `frame` is what the copy's framing owes to something other than its egress
+ * interface; see struct cdx_mc_member_frame.
  */
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
 	POnifDesc onif_desc, struct net_device *dev, const struct cdx_l2_encap *encap,
+	const struct cdx_mc_member_frame *frame,
 	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type)
 {
 	struct ins_entry_info *pInsEntryInfo;
@@ -3193,6 +3278,7 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 	 * interface that carries them, never both. */
 	if (encap && apply_l2_encap(pInsEntryInfo, encap))
 		goto err_ret;
+	mcast_member_frame(pInsEntryInfo, frame);
 	pL2Info->mtu = dev->mtu;
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s:: mtu %d\n", __func__, dev->mtu);
@@ -3224,9 +3310,12 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 	tbl_entry->hashentry.flags = cpu_to_be16(flags);
 	//param pointer and opcode pointer now valid
 	pInsEntryInfo->paramptr = ptr;
-	pInsEntryInfo->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
+	pInsEntryInfo->param_size = (MAX_EN_EHASH_ENTRY_SIZE -
 			GET_PARAM_OFFSET(flags));
-	if(tbl_type == IPV6_MULTICAST_TABLE)
+	/* The family is the table's, and a bridged group's listeners come from
+	 * the bridged tables: the rebuilt header's EtherType is chosen by it. */
+	if (tbl_type == IPV6_MULTICAST_TABLE ||
+	    tbl_type == IPV6_BRIDGED_MULTICAST_TABLE)
 		pInsEntryInfo->flags |= EHASH_IPV6_FLOW;
 
 	if (fill_mcast_member_actions(pRtEntry, pInsEntryInfo)) {
