@@ -8514,7 +8514,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 		struct ft_mr_plan plan = {};
 		enum ft_mr_state state;
 		bool rekey = false, same = false, via, rebuild = false;
-		bool added = false;
+		bool added = false, counted = false;
+		struct cdx_ft_counters last;
 		u8 retries = 0;
 		int rc = 0, gen = 0;
 
@@ -8584,7 +8585,12 @@ static void ft_mr_work_fn(struct work_struct *work)
 
 		if (!same && (hw || (state == FT_MR_PENDING && !via))) {
 			cdx_ft_begin();
+			/* What an entry counted since the last fold goes with it
+			 * unless it is read first; it is folded once the group
+			 * is under its lock again. */
 			if (hw && (rekey || state != FT_MR_PENDING)) {
+				cdx_mc_group_stats(hw, &last);
+				counted = true;
 				cdx_mc_group_del(&hw);
 				ft_mr_installed--;
 				ft_mr_key_freed = true;
@@ -8597,6 +8603,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 						/* The old set can omit a newly learned
 						 * router. Return the entire stream to
 						 * software until a full set installs. */
+						cdx_mc_group_stats(hw, &last);
+						counted = true;
 						cdx_mc_group_del(&hw);
 						ft_mr_installed--;
 						ft_mr_key_freed = true;
@@ -8635,6 +8643,11 @@ static void ft_mr_work_fn(struct work_struct *work)
 
 		mutex_lock(&ft_mr_lock);
 		target->hw = hw;
+		/* The entry just deleted, folded against the baseline it was
+		 * counted from and with the framing it was installed with --
+		 * both still the old set's until the plan is adopted below. */
+		if (counted)
+			ft_mr_fold(target, &last, target->in_tags);
 		/* A group made in this pass counts from zero, whatever the last
 		 * one had reached. Here, not by comparing handles: the one a
 		 * delete frees is the next add's allocation often enough. So

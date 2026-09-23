@@ -209,8 +209,9 @@ static void cdx_mc_group_del(struct cdx_mc_group **hw)
     (*hw)->live = false;
     *hw = NULL;
 }
+static struct cdx_ft_counters hw_count;
 static void cdx_mc_group_stats(struct cdx_mc_group *hw, struct cdx_ft_counters *c)
-{ assert(ctrl && hw->live); memset(c, 0, sizeof(*c)); }
+{ assert(ctrl && hw->live); *c = hw_count; }
 static unsigned folded_tags;
 static struct cdx_ft_counters folded;
 static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c, u8 tags)
@@ -275,9 +276,18 @@ int main(void)
     assert(hardware.live && hardware.copies == 2 && g->offloaded);
 
     /* An uncarriable router withdraws the whole chain. A timer discovers
-     * restored eligibility even while no group is installed. */
+     * restored eligibility even while no group is installed. What the entry
+     * counted after the refresh's fold is read before it goes, and folded:
+     * the refresh folds once, the delete once more, with the entry's count. */
     refuse = true;
-    refresh();
+    hw_count = (struct cdx_ft_counters){ 9, 9 * 100 };
+    {
+        unsigned before = folds;
+
+        refresh();
+        assert(folds == before + 2 && folded.packets == 9);
+    }
+    hw_count = (struct cdx_ft_counters){ 0, 0 };
     assert(!hardware.live && !ft_mr_installed && !input.refs);
     refuse = false;
     refresh();
