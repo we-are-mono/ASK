@@ -1,4 +1,4 @@
-From a267fa90e877c4f04ea182f0e0618ba5c76442eb Mon Sep 17 00:00:00 2001
+From 415bbf0782abdeb6013daaed87bbe240029f32fb Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 18:26:25 +0200
 Subject: [PATCH] xfrm: route a cross-family packet-offload tunnel by the flow
@@ -22,26 +22,42 @@ and software SAs are untouched.
 The flowtable resolves an offloaded XFRM flow's Ethernet destination,
 and the ASK direct output uses the SA's next hop, on the route under the
 bundle. For an SA of the other family that route has no neighbour for
-the endpoint, so xfrm_dev_peer_neigh() routes the endpoint in its own
-family, as the bundle lookup would, and names the neighbour on the SA's
-device.
+the endpoint, so xfrm_dev_peer_route() routes the endpoint in its own
+family, with the SA's output mark and its device's VRF, and names the
+neighbour on the SA's device. The direct output asks it per packet and
+drops the packet when the endpoint has moved off that device, as it does
+for an SA of the flow's family; the lookup names its next hop itself, so
+it takes the FIB's cached route rather than a clone per packet.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/net/xfrm.h                    |  6 +++
- net/netfilter/nf_flow_table_offload.c | 11 +++--
- net/xfrm/xfrm_output.c                |  5 ++-
- net/xfrm/xfrm_policy.c                | 65 ++++++++++++++++++++++++++-
- 4 files changed, 81 insertions(+), 6 deletions(-)
+ include/net/xfrm.h                    |  10 ++
+ net/ipv4/xfrm4_policy.c               |   7 +-
+ net/ipv6/xfrm6_policy.c               |   5 +-
+ net/netfilter/nf_flow_table_offload.c |  11 ++-
+ net/xfrm/xfrm_output.c                |   9 +-
+ net/xfrm/xfrm_policy.c                | 134 +++++++++++++++++++++++---
+ 6 files changed, 153 insertions(+), 23 deletions(-)
 
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index 714ae9bc72e7..2a9e36aa85c1 100644
+index 714ae9bc72e7..c238651f0c99 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
-@@ -1873,12 +1873,18 @@ struct sk_buff *xfrm6_gro_udp_encap_rcv(struct sock *sk, struct list_head *head,
+@@ -395,6 +395,9 @@ struct xfrm_dst_lookup_params {
+ 	u32 mark;
+ 	__u8 ipproto;
+ 	union flowi_uli uli;
++	/* The caller resolves the next hop for an address it names itself,
++	 * rather than for the destination of the packet the route carries. */
++	bool nexthop_named;
+ };
+ 
+ struct net_device;
+@@ -1873,12 +1876,19 @@ struct sk_buff *xfrm6_gro_udp_encap_rcv(struct sock *sk, struct list_head *head,
  					struct sk_buff *skb);
  int xfrm_user_policy(struct sock *sk, int optname, sockptr_t optval,
  		     int optlen);
++int xfrm_dev_peer_route(struct xfrm_state *x, struct neighbour **n);
 +struct neighbour *xfrm_dev_peer_neigh(struct xfrm_state *x);
  #else
  static inline int xfrm_user_policy(struct sock *sk, int optname,
@@ -57,6 +73,42 @@ index 714ae9bc72e7..2a9e36aa85c1 100644
  #endif
  
  struct dst_entry *__xfrm_dst_lookup(int family, const struct xfrm_dst_lookup_params *params);
+diff --git a/net/ipv4/xfrm4_policy.c b/net/ipv4/xfrm4_policy.c
+index 985934c2e331..884ae4faf752 100644
+--- a/net/ipv4/xfrm4_policy.c
++++ b/net/ipv4/xfrm4_policy.c
+@@ -41,9 +41,12 @@ static struct dst_entry *__xfrm4_dst_lookup(struct flowi4 *fl4,
+ 	 * flag "FLOWI_FLAG_KNOWN_NH" is passed during tunnel route lookup.
+ 	 * This flag will ensure that if the src and dst are directly connected
+ 	 * then a new route entry is created with "rt_gateway" set to dst
+-	 * address (tunnel dst address).
++	 * address (tunnel dst address). A caller that resolves the next hop
++	 * for the endpoint itself needs no such entry, and asks for the
++	 * FIB's cached route instead of one made per lookup.
+ 	 */
+-	fl4->flowi4_flags |= FLOWI_FLAG_KNOWN_NH;
++	if (!params->nexthop_named)
++		fl4->flowi4_flags |= FLOWI_FLAG_KNOWN_NH;
+ #endif
+ 
+ 	rt = __ip_route_output_key(params->net, fl4);
+diff --git a/net/ipv6/xfrm6_policy.c b/net/ipv6/xfrm6_policy.c
+index 470e0590d480..493c71f6ec5c 100644
+--- a/net/ipv6/xfrm6_policy.c
++++ b/net/ipv6/xfrm6_policy.c
+@@ -46,8 +46,11 @@ static struct dst_entry *xfrm6_dst_lookup(const struct xfrm_dst_lookup_params *p
+ 	 * neighbor resolution is done for inner destination since we do not
+ 	 * add tunnel headers in slow path to IPsec packets. To fix this issue,
+ 	 * flag "FLOWI_FLAG_KNOWN_NH" is passed during tunnel route lookup.
++	 * A caller that resolves the next hop for the endpoint itself needs
++	 * no such clone.
+ 	 */
+-	fl6.flowi6_flags |= FLOWI_FLAG_KNOWN_NH;
++	if (!params->nexthop_named)
++		fl6.flowi6_flags |= FLOWI_FLAG_KNOWN_NH;
+ #endif
+ 
+ 	dst = ip6_route_output(params->net, NULL, &fl6);
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
 index 4a7c5b2b1412..539fa6ae2b3a 100644
 --- a/net/netfilter/nf_flow_table_offload.c
@@ -94,31 +146,84 @@ index 4a7c5b2b1412..539fa6ae2b3a 100644
  			return -ENOENT;
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index bda6f29fb97b..c6cc302551c1 100644
+index 2bce33d6e2f9..02dc7958c485 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
-@@ -744,13 +744,14 @@ static int xfrm_dev_direct_output(struct sock *sk, struct xfrm_state *x,
- /* The neighbour a packet-offloaded tunnel SA's frames are addressed to, or
-  * NULL. The child route is the route to the SA's endpoint when the two share
-  * a family, so its neighbour for that endpoint is the next hop, found exactly
-- * as neighbour output would find it.
-+ * as neighbour output would find it. For an SA of the other family the child
-+ * is the flow's own route, so the endpoint is routed in its own family.
-  */
- static struct neighbour *xfrm_dev_sec_neigh(struct xfrm_state *x,
- 					    struct dst_entry *child)
+@@ -749,8 +749,15 @@ static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
  {
- 	if (child->ops->family != x->props.family)
--		return NULL;
-+		return xfrm_dev_peer_neigh(x);
- 	return dst_neigh_lookup(child, &x->id.daddr);
- }
+ 	struct neighbour *n = NULL;
  
+-	if (path->ops->family == x->props.family)
++	/* For an SA of the other family the bundle's route is the flow's own,
++	 * so the endpoint is routed in its own family; that is also where a
++	 * route moved off the SA's device shows. */
++	if (path->ops->family != x->props.family) {
++		if (xfrm_dev_peer_route(x, &n))
++			return false;
++	} else {
+ 		n = dst_neigh_lookup(path, &x->id.daddr);
++	}
+ 	if (n) {
+ 		neigh_event_send(n, NULL);
+ 		neigh_release(n);
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index e94dcb89bd6d..fadfb40833ad 100644
+index e94dcb89bd6d..e2d05958c787 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
-@@ -2683,6 +2683,62 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+@@ -302,6 +302,28 @@ struct dst_entry *__xfrm_dst_lookup(int family,
+ }
+ EXPORT_SYMBOL(__xfrm_dst_lookup);
+ 
++/* The protocol and ports the state's outer packets carry, which a route
++ * lookup matches rules on. */
++static void xfrm_dst_lookup_proto(const struct xfrm_state *x,
++				  struct xfrm_dst_lookup_params *params)
++{
++	params->ipproto = x->id.proto;
++	if (x->encap) {
++		switch (x->encap->encap_type) {
++		case UDP_ENCAP_ESPINUDP:
++			params->ipproto = IPPROTO_UDP;
++			params->uli.ports.sport = x->encap->encap_sport;
++			params->uli.ports.dport = x->encap->encap_dport;
++			break;
++		case TCP_ENCAP_ESPINTCP:
++			params->ipproto = IPPROTO_TCP;
++			params->uli.ports.sport = x->encap->encap_sport;
++			params->uli.ports.dport = x->encap->encap_dport;
++			break;
++		}
++	}
++}
++
+ static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
+ 						int tos, int oif,
+ 						xfrm_address_t *prev_saddr,
+@@ -329,21 +351,8 @@ static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
+ 	params.tos = tos;
+ 	params.oif = oif;
+ 	params.mark = mark;
+-	params.ipproto = x->id.proto;
+-	if (x->encap) {
+-		switch (x->encap->encap_type) {
+-		case UDP_ENCAP_ESPINUDP:
+-			params.ipproto = IPPROTO_UDP;
+-			params.uli.ports.sport = x->encap->encap_sport;
+-			params.uli.ports.dport = x->encap->encap_dport;
+-			break;
+-		case TCP_ENCAP_ESPINTCP:
+-			params.ipproto = IPPROTO_TCP;
+-			params.uli.ports.sport = x->encap->encap_sport;
+-			params.uli.ports.dport = x->encap->encap_dport;
+-			break;
+-		}
+-	}
++	params.nexthop_named = false;
++	xfrm_dst_lookup_proto(x, &params);
+ 
+ 	dst = __xfrm_dst_lookup(family, &params);
+ 
+@@ -2683,6 +2692,92 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
  EXPORT_SYMBOL(xfrm_get_tos);
  #endif
  
@@ -150,38 +255,68 @@ index e94dcb89bd6d..fadfb40833ad 100644
 +	       dst->dev == READ_ONCE(x->xso.dev);
 +}
 +
-+/* The neighbour a packet-offloaded tunnel SA's frames leave for: its remote
-+ * endpoint, routed in the SA's own family exactly as a bundle routes it, on
-+ * the SA's own device. NULL if there is none; a returned one is held.
++/* Route a packet-offloaded tunnel SA's remote endpoint in the SA's own family,
++ * as a bundle routes it, and name its neighbour on the SA's device.
 + *
 + * Whoever holds a bundle normally asks the route under it, and for an SA of
 + * the flow's family that is this same route. For one of the other family it
 + * is the flow's own route (see above), which has no neighbour for an address
 + * of the SA's family, so the endpoint is routed afresh here.
++ *
++ * The lookup carries what the bundle's would: the SA's output mark, and the
++ * L3 master of the SA's device, whose table the endpoint lives in when the
++ * device is enslaved to a VRF. The software path asks this for every packet,
++ * so it names its next hop itself and takes the FIB's cached route rather
++ * than a clone made per lookup.
++ *
++ * Returns -EHOSTUNREACH when the endpoint does not route by the SA's device.
++ * Otherwise *n is the neighbour, held, or NULL if none could be made.
 + */
-+struct neighbour *xfrm_dev_peer_neigh(struct xfrm_state *x)
++int xfrm_dev_peer_route(struct xfrm_state *x, struct neighbour **n)
 +{
 +	struct net_device *dev = READ_ONCE(x->xso.dev);
-+	xfrm_address_t saddr = {}, daddr = {};
-+	struct neighbour *n = NULL;
++	struct xfrm_dst_lookup_params params;
 +	struct dst_entry *dst;
++	int err = 0;
 +
++	*n = NULL;
 +	if (!dev)
-+		return NULL;
-+	dst = xfrm_dst_lookup(x, 0, 0, &saddr, &daddr, x->props.family,
-+			      xfrm_smark_get(0, x));
++		return -EHOSTUNREACH;
++	memset(&params, 0, sizeof(params));
++	params.net = xs_net(x);
++	params.saddr = &x->props.saddr;
++	params.daddr = &x->id.daddr;
++	/* Only its L3 master is used, and only for the table. */
++	params.oif = dev->ifindex;
++	params.mark = xfrm_smark_get(0, x);
++	params.nexthop_named = true;
++	xfrm_dst_lookup_proto(x, &params);
++	dst = __xfrm_dst_lookup(x->props.family, &params);
 +	if (IS_ERR(dst))
-+		return NULL;
++		return -EHOSTUNREACH;
 +	if (dst->dev == dev)
-+		n = dst_neigh_lookup(dst, &x->id.daddr);
++		*n = dst_neigh_lookup(dst, &x->id.daddr);
++	else
++		err = -EHOSTUNREACH;
 +	dst_release(dst);
++	return err;
++}
++
++/* The same neighbour, or NULL when there is none or the endpoint routes by
++ * another device. */
++struct neighbour *xfrm_dev_peer_neigh(struct xfrm_state *x)
++{
++	struct neighbour *n;
++
++	if (xfrm_dev_peer_route(x, &n))
++		return NULL;
 +	return n;
 +}
 +EXPORT_SYMBOL_GPL(xfrm_dev_peer_neigh);
  
  /* Allocate chain of dst_entry's, attach known xfrm's, calculate
   * all the metrics... Shortly, bundle a bundle.
-@@ -2750,7 +2806,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+@@ -2750,7 +2845,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
  		xdst->route = dst;
  		dst_copy_metrics(dst1, dst);
  
@@ -191,7 +326,7 @@ index e94dcb89bd6d..fadfb40833ad 100644
  			__u32 mark = 0;
  			int oif;
  
-@@ -2766,6 +2823,12 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+@@ -2766,6 +2862,12 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
  			err = PTR_ERR(dst);
  			if (IS_ERR(dst))
  				goto put_states;

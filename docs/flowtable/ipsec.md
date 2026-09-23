@@ -764,12 +764,18 @@ elsewhere was followed to a next hop on the old port. Patch 146 is the other hal
 for a tunnel whose outer family differs: the child route is the flow's own
 when that leaves by the SA's device, instead of the SA's endpoints looked up
 in the wrong family. That route then cannot name the tunnel's next hop, so
-the flowtable's Ethernet destination and the adapter's next hop come from
-`xfrm_dev_peer_neigh()`, which routes the endpoint in the SA's family, and the
-adapter checks and watches that neighbour in that family
+the flowtable's Ethernet destination, the adapter's next hop and the direct
+output's per-packet neighbour use come from `xfrm_dev_peer_route()`, which
+routes the endpoint in the SA's family with the SA's output mark and its
+port's VRF, and the adapter checks and watches that neighbour in that family
 (`cdx_ft_rule.next_hop_family`). Before, both read the IPv4 endpoint as an
 IPv6 address on the route under the bundle, which answered only through a
-default route's gateway.
+default route's gateway. The same per-packet lookup is where such an SA's
+endpoint moving off its port shows, so the packet is refused as
+`XfrmOutBundleCheckError` there, as a same-family SA's is by its own route;
+and the lookup names its next hop itself, so an on-link endpoint takes the
+FIB's cached route rather than the per-lookup clone the tunnel lookups ask
+for. The adapter's own peer lookup carries the same mark and VRF.
 
 **It must set `sp->len` and not `sp->olen`.** `xfrm_offload(skb)` answers
 non-NULL exactly when `olen` is non-zero and equal to `len`, and a non-NULL

@@ -1,4 +1,4 @@
-From 2ebd0142271d145e04c958c19aa517e558497f4e Mon Sep 17 00:00:00 2001
+From c45355e53a7b1b607dfc83768c62e4187f546d22 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -51,11 +51,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/ipsec_flow.h        |  31 ++
  net/xfrm/xfrm_device.c       |  24 +
  net/xfrm/xfrm_input.c        |  21 +
- net/xfrm/xfrm_output.c       | 350 ++++++++++++++
+ net/xfrm/xfrm_output.c       | 354 ++++++++++++++
  net/xfrm/xfrm_policy.c       |  90 ++++
  net/xfrm/xfrm_state.c        | 236 +++++++++
  net/xfrm/xfrm_user.c         |   4 +
- 19 files changed, 1962 insertions(+), 7 deletions(-)
+ 19 files changed, 1966 insertions(+), 7 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -1608,7 +1608,7 @@ index 5d3633ce6ba3..907409eb5da8 100644
  		spin_lock(&x->lock);
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index a5b5d82bd755..fd4265857ecd 100644
+index a5b5d82bd755..2bce33d6e2f9 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
 @@ -67,6 +67,10 @@ static int xfrm4_transport_output(struct xfrm_state *x, struct sk_buff *skb)
@@ -1767,22 +1767,34 @@ index a5b5d82bd755..fd4265857ecd 100644
  	kfree_skb(skb);
  out:
  	return err;
-@@ -644,6 +732,100 @@ static int xfrm_dev_direct_output(struct sock *sk, struct xfrm_state *x,
+@@ -644,6 +732,102 @@ static int xfrm_dev_direct_output(struct sock *sk, struct xfrm_state *x,
  	return dev_queue_xmit(skb);
  }
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+/* The neighbour a packet-offloaded tunnel SA's frames are addressed to, or
-+ * NULL. The child route is the route to the SA's endpoint when the two share
-+ * a family, so its neighbour for that endpoint is the next hop, found exactly
-+ * as neighbour output would find it.
++/* Use a packet-offloaded tunnel SA's next hop as neighbour output would use
++ * it for every packet: that keeps the entry from ageing out, moves a stale one
++ * on to a probe and starts resolution for one that is gone. Linux's entry is
++ * what refreshes the address the SA was programmed with and what lets its
++ * flows back into hardware; the frame does not wait for it.
++ *
++ * `path` is the bundle's route, which is the route to the SA's endpoint when
++ * the two share a family, so its neighbour for that endpoint is the next hop,
++ * found exactly as neighbour output would find it. Returns false if the SA's
++ * endpoint no longer routes by the SA's device; for an SA of the flow's family
++ * the caller has already proved that it does, by checking `path` itself.
 + */
-+static struct neighbour *xfrm_dev_sec_neigh(struct xfrm_state *x,
-+					    struct dst_entry *child)
++static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
 +{
-+	if (child->ops->family != x->props.family)
-+		return NULL;
-+	return dst_neigh_lookup(child, &x->id.daddr);
++	struct neighbour *n = NULL;
++
++	if (path->ops->family == x->props.family)
++		n = dst_neigh_lookup(path, &x->id.daddr);
++	if (n) {
++		neigh_event_send(n, NULL);
++		neigh_release(n);
++	}
++	return true;
 +}
 +
 +/* Hand a tunnel-mode packet for a packet-offloaded SA straight to the SA's
@@ -1798,11 +1810,8 @@ index a5b5d82bd755..fd4265857ecd 100644
 + * frame: the inner family has no neighbour for a tunnel endpoint of the other
 + * family, and a link carrying only IPv4 has no IPv6 neighbours at all.
 + *
-+ * The SA's next hop is still used, as neighbour output would use it for every
-+ * packet: that keeps it from ageing out, moves a stale entry on to a probe and
-+ * starts resolution for one that is gone. Linux's entry is what refreshes the
-+ * address the SA was programmed with and what lets its flows back into
-+ * hardware; the frame does not wait for it.
++ * The SA's next hop is still used, by xfrm_dev_sec_next_hop() before the
++ * packet gets here.
 + *
 + * Unlike xfrm_dev_direct_output() this does not run the child route's
 + * local_out. The inner header is already final -- the forwarding path
@@ -1819,7 +1828,6 @@ index a5b5d82bd755..fd4265857ecd 100644
 +	struct net *net = xs_net(x);
 +	struct net_device *dev;
 +	struct dst_entry *dst;
-+	struct neighbour *n;
 +	int err;
 +
 +	dst = skb_dst_pop(skb);
@@ -1830,12 +1838,6 @@ index a5b5d82bd755..fd4265857ecd 100644
 +	}
 +	skb_dst_set(skb, dst);
 +	nf_reset_ct(skb);
-+
-+	n = xfrm_dev_sec_neigh(x, dst);
-+	if (n) {
-+		neigh_event_send(n, NULL);
-+		neigh_release(n);
-+	}
 +
 +	rcu_read_lock();
 +	dev = READ_ONCE(x->xso.dev);
@@ -1868,7 +1870,7 @@ index a5b5d82bd755..fd4265857ecd 100644
  static int xfrm_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
  {
  	return xfrm_output_resume(sk, skb, 1);
-@@ -734,6 +916,127 @@ static void xfrm_get_inner_ipproto(struct sk_buff *skb, struct xfrm_state *x)
+@@ -734,6 +918,127 @@ static void xfrm_get_inner_ipproto(struct sk_buff *skb, struct xfrm_state *x)
  	}
  }
  
@@ -1996,7 +1998,7 @@ index a5b5d82bd755..fd4265857ecd 100644
  int xfrm_output(struct sock *sk, struct sk_buff *skb)
  {
  	struct net *net = dev_net(skb_dst(skb)->dev);
-@@ -763,6 +1066,35 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+@@ -763,6 +1068,37 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
  			return -EHOSTUNREACH;
  		}
  
@@ -2016,7 +2018,9 @@ index a5b5d82bd755..fd4265857ecd 100644
 +			 * than one transform would leave with one applied. */
 +			if (xfrm_dst_child(skb_dst(skb))->xfrm ||
 +			    xfrm_dst_path(skb_dst(skb))->dev !=
-+			    READ_ONCE(x->xso.dev)) {
++			    READ_ONCE(x->xso.dev) ||
++			    (x->props.mode == XFRM_MODE_TUNNEL &&
++			     !xfrm_dev_sec_next_hop(x, xfrm_dst_path(skb_dst(skb))))) {
 +				XFRM_INC_STATS(net,
 +					       LINUX_MIB_XFRMOUTBUNDLECHECKERROR);
 +				kfree_skb(skb);
@@ -2032,7 +2036,7 @@ index a5b5d82bd755..fd4265857ecd 100644
  		/* Exclusive direct xmit for tunnel mode, as
  		 * some filtering or matching rules may apply
  		 * in transport mode.
-@@ -866,10 +1198,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -866,10 +1202,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
  	if (err)
  		return err;
  
@@ -2053,7 +2057,7 @@ index a5b5d82bd755..fd4265857ecd 100644
  }
  
  #if IS_ENABLED(CONFIG_IPV6)
-@@ -914,10 +1256,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -914,10 +1260,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
  	if (err)
  		return err;
  

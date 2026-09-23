@@ -270,7 +270,7 @@ static void dst_release(struct dst_entry *d)
 }
 
 struct rtable { struct dst_entry dst; };
-struct flowi4 { __be32 daddr, saddr; __be16 fl4_dport, fl4_sport; int flowi4_oif; };
+struct flowi4 { __be32 daddr, saddr; __be16 fl4_dport, fl4_sport; int flowi4_oif; u32 flowi4_mark; int flowi4_l3mdev; };
 struct flowi6 { struct in6_addr daddr, saddr; __be16 fl6_dport, fl6_sport; };
 struct flowi {
 	union { struct flowi4 ip4; struct flowi6 ip6; } u;
@@ -347,6 +347,7 @@ struct xfrm_state {
 		u8 aalgo, ealgo;
 		u8 flags;
 		u32 replay_window, reqid;
+		struct { u32 v, m; } smark;
 	} props;
 	struct { u32 v; } mark;
 	struct { u8 state; u8 dying; } km;
@@ -775,13 +776,23 @@ static struct rtable *route_answer;
 static int route_error;
 static struct neighbour *route_neigh;
 static unsigned route_lookups, route_puts;
-static int route_oif;
+static int route_oif, route_l3mdev;
+static u32 route_mark;
 static struct dst_ops v4_ops = { .family = AF_INET };
+/* The VRF the SA's port is enslaved to, or zero. */
+static int port_l3_master;
+static int l3mdev_master_ifindex(struct net_device *dev) { (void)dev; return port_l3_master; }
+static u32 xfrm_smark_get(u32 mark, struct xfrm_state *x)
+{
+	return (mark & ~x->props.smark.m) | (x->props.smark.v & x->props.smark.m);
+}
 
 static struct rtable *ip_route_output_key(void *net, struct flowi4 *fl4)
 {
 	(void)net;
 	route_oif = fl4->flowi4_oif;
+	route_mark = fl4->flowi4_mark;
+	route_l3mdev = fl4->flowi4_l3mdev;
 	route_lookups++;
 	if (route_error)
 		return ERR_PTR(route_error);
@@ -1017,6 +1028,18 @@ static void test_next_hop(void)
 	 * could never happen. */
 	assert(route_oif == 0);
 	x->xso.dev = &WAN;
+
+	/* Unbound, but not without context: the peer is routed in the table
+	 * of the port's VRF and with the SA's output mark, as the kernel's
+	 * own lookup of it is. */
+	bench_reset();
+	port_l3_master = 9;
+	x->props.smark.v = 0x70;
+	x->props.smark.m = 0xf0;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(route_l3mdev == 9 && route_mark == 0x70);
+	port_l3_master = 0;
+	x->props.smark.v = x->props.smark.m = 0;
 
 	/* A neighbour that has not answered is asked for and waited on, not
 	 * refused outright -- a cold ARP cache is the normal state of a
