@@ -10,6 +10,7 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 #define FT_MR_OIF_TEXT 136
+#define MAXVIFS 32
 #define CDX_MC_MAX_LISTENERS 8
 #define CDX_FT_VLAN_MAX 2
 #define ETH_HLEN 14

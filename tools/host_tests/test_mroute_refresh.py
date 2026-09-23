@@ -24,8 +24,18 @@ def test_mroute_refresh(tmp_path):
                    source.index("struct ft_mc_tap {")]
     (tmp_path / "mroute_types.inc").write_text(
         route + source[start:source.index("};", start) + 3] + structs)
+    # The confirmation table and the ruleset it is armed for, as declared.
+    (tmp_path / "mroute_confirm_types.inc").write_text(
+        source[source.index("struct ft_mr_watch {"):
+               source.index("/* The ruleset in force, as the packet path reads it.")])
     (tmp_path / "mroute_refresh.inc").write_text("\n".join(
         function(source, name) for name in [
+            # What Linux itself forwarded: the table the hook fills, the
+            # ruleset it is good for, and the admission they decide.
+            "ft_mr_ruleset_read", "ft_mr_ruleset_current", "ft_mr_watch_bucket",
+            "ft_mr_watch_complete", "ft_mr_confirm_seen", "ft_mr_ruleset_sync",
+            "ft_mr_watch_arm", "ft_mr_watch_drop", "ft_mr_admit",
+            "ft_mr_ruleset_fn",
             "ft_mr_refusal", "ft_mr_state_text", "ft_mr_plan_same",
             "ft_mr_plan_put", "ft_mr_offload_flag", "ft_mr_counters",
             "ft_mr_release_set", "ft_mr_group_free", "ft_mr_dirty_family",

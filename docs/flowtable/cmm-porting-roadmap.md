@@ -398,12 +398,16 @@ Where the bridged learner had to recover a source and an ingress port from the
 first frames of a stream, because an MDB membership states neither, `ipmr`'s
 MFC entry states both — `mfc_origin`, `mfc_parent` and `ttls[]` are a key, an
 ingress and a replication list written down before any traffic arrives. So the
-routed learner has no packet hook, nothing is ever pending on traffic, and the
-encoder needed no change: `TTL_HM_VALID` on the root entry and the per-listener
-Ethernet rebuild are a router's transform, which the bridged half had been
-using to bridge. What it did need was a shared hardware-key register, because
-two learners now compose keys into a space the classifier keeps one entry per
-address pair in. See the [routed design](multicast-routed.md).
+routed learner has nothing to learn from traffic, and the encoder needed no
+change: `TTL_HM_VALID` on the root entry and the per-listener Ethernet rebuild
+are a router's transform, which the bridged half had been using to bridge.
+What it did need was a shared hardware-key register, because two learners now
+compose keys into a space the classifier keeps one entry per address pair in.
+It later gained a `POST_ROUTING` observer for a different reason. The MFC does
+not say whether the firewall lets a stream through, so a group is carried only
+once Linux has been seen forwarding it to every oif; see
+[what Linux forwarded](multicast-routed.md#what-linux-forwarded). See the
+[routed design](multicast-routed.md).
 
 **Item 9 needs read-back rather than a mechanism.** The allocator that hands
 out firmware statistics records is general and a session already uses it; what

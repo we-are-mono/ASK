@@ -568,6 +568,16 @@ time the state changes. The rig case
 group in a bridge `forward` chain while it is carried: the flow comes out, the
 set-top box receives nothing, and the flow goes back in when the chain goes.
 
+A bridge `input` chain sees what the host receives. A plain bridged flow's
+frames never go there. A flow carrying a route's copies is different: the
+bridge hands its frames up for ipmr to route, and those copies are carried
+only once ipmr has been seen forwarding them past the inet hooks. A bridge
+`input` chain that drops them prevents that. Its changes are followed with the
+rest of the nftables ruleset; see
+[what Linux forwarded](multicast-routed.md#what-linux-forwarded). A bridge
+`output` chain sees what the host sends. The routed learner checks for one
+before carrying a copy routed into a bridge.
+
 Some hooks never go away once they appear, and keep bridged multicast in
 software for the rest of the boot: `br_netfilter` once loaded (Docker and
 libvirt load it), an ebtables table once anything has listed or used it, and

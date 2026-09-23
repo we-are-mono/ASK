@@ -445,11 +445,83 @@ def test_proc_reports_a_row_and_a_summary():
     show = function(source, "ft_show")
     assert "ft_mr_rows(seq);" in show
     for key in ("mroute_groups", "mroute_installed", "mroute_refused",
-                "mroute_install_errors", "mroute_policy_rules"):
+                "mroute_install_errors", "mroute_policy_rules",
+                "mroute_ruleset_changes", "mroute_confirm_errors"):
         assert key in show, f"{key} missing from the summary"
     rows = function(source, "ft_mr_rows")
     for field in ("family=", "table=", "group=", "src=", "in=", "oifs=",
-                  "listeners=", "state=", "packets=", "bytes="):
+                  "listeners=", "state=", "unconfirmed=", "packets=", "bytes="):
         assert field in rows, f"{field} missing from the row"
     # A read is also a fold, so the two surfaces never disagree.
     assert "ft_mr_fold(g, &stats, tags)" in rows
+
+
+# ------------------------------------------------ what Linux itself forwarded
+
+def test_a_group_is_carried_only_where_linux_forwards_it():
+    """The MFC says where ipmr sends a stream, not whether the firewall lets
+    it go, and a hardware entry replicates where no hook runs again. So a
+    copy has to be seen leaving each oif at POST_ROUTING, after every filter
+    and NAT hook, before the group is carried. What every packet pays at that
+    hook is the multicast test; a forwarded copy of a group, one lookup.
+    """
+    source = SOURCE.read_text()
+    hook = function(source, "ft_mr_confirm_hook")
+    for family, test, mark in (
+            ("AF_INET", "ipv4_is_multicast(iph->daddr)",
+             "IPCB(skb)->flags & IPSKB_FORWARDED"),
+            ("AF_INET6", "ipv6_addr_is_multicast(&ip6h->daddr)",
+             "IP6CB(skb)->flags & IP6SKB_FORWARDED")):
+        call = hook.index(f"ft_mr_confirm_seen({family},")
+        assert hook.index(test) < hook.index(mark) < call
+    assert "state->out->ifindex" in hook
+    assert hook.count("return NF_ACCEPT;") == 4 and "NF_DROP" not in hook
+    ops = source[source.index("static struct nf_hook_ops ft_mr_confirm_ops[2]"):]
+    ops = ops[:ops.index("};\n")]
+    assert ops.count(".hooknum = NF_INET_POST_ROUTING") == 2
+    assert ".priority = NF_IP_PRI_LAST" in ops and ".priority = NF_IP6_PRI_LAST" in ops
+
+    # Confirmations are good for one ruleset: nftables' commit counter and
+    # the cursor the rules are read through.
+    read = function(source, "ft_mr_ruleset_read")
+    assert "smp_load_acquire(&init_net.nft.base_seq)" in read
+    assert "READ_ONCE(init_net.nft.gencursor)" in read
+    seen = function(source, "ft_mr_confirm_seen")
+    assert seen.index("READ_ONCE(ft_mr_gen_open)") < seen.index("ft_mr_ruleset_current()") < \
+        seen.index("test_and_set_bit(i, &w->seen)")
+    # Re-arming closes, waits out every copy in hand, clears, reads the
+    # ruleset, waits out every copy already past FORWARD, and only then opens.
+    sync = function(source, "ft_mr_ruleset_sync")
+    steps = ["WRITE_ONCE(ft_mr_gen_open, false);", "synchronize_rcu();",
+             "WRITE_ONCE(w->seen, 0);", "ft_mr_ruleset_read(&seq, &cursor);",
+             "WRITE_ONCE(ft_mr_gen_open, true);"]
+    at = [sync.index(s) for s in steps]
+    assert at == sorted(at)
+    assert sync.count("synchronize_rcu();") == 2
+    assert sync.index("ft_mr_ruleset_read(&seq, &cursor);") < \
+        sync.rindex("synchronize_rcu();") < sync.index("WRITE_ONCE(ft_mr_gen_open, true);")
+
+    # The worker follows the ruleset first, watches a group once its oifs
+    # are known, and decides its state from the confirmations before it
+    # decides whether the chain it has is the same.
+    worker = function(source, "ft_mr_work_fn")
+    assert "ft_mr_ruleset_sync()" in worker
+    assert worker.index("ft_mr_derive(target, &plan)") < \
+        worker.index("ft_mr_watch_arm(target, &plan)") < \
+        worker.index("state = ft_mr_admit(target, &plan)") < worker.index("same = hw &&")
+    admit = function(source, "ft_mr_admit")
+    assert "ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING))" in admit
+    assert "return FT_MR_UNCONFIRMED;" in admit and "ft_mr_watch_complete(g->watch)" in admit
+    # A ruleset commit is looked for while any group exists.
+    assert "schedule_delayed_work(&ft_mr_ruleset, FT_MR_RULESET_INTERVAL)" in worker
+    assert "schedule_work(&ft_mr_work)" in function(source, "ft_mr_ruleset_fn")
+
+    # The watch goes with its group, and teardown takes the hook down before
+    # the worker and the table go, and again after anything the worker did.
+    assert "ft_mr_watch_drop(g);" in function(source, "ft_mr_group_free")
+    exit_body = function(source, "ft_mr_exit")
+    assert exit_body.index("ft_mr_confirm_sync();") < exit_body.index("cancel_work_sync(&ft_mr_work)") < \
+        exit_body.rindex("ft_mr_confirm_sync();")
+    assert exit_body.count("cancel_delayed_work_sync(&ft_mr_ruleset)") == 2
+    sync_hook = function(source, "ft_mr_confirm_sync")
+    assert "READ_ONCE(ft_mr_stopping)" in sync_hook and "synchronize_net();" in sync_hook

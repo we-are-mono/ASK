@@ -702,12 +702,18 @@ int main(void)
      * traffic to it whatever this entry says. */
     g->table = 100;
     assert(refuse(g) == FT_MR_REFUSED_TABLE);
+    /* Its VIF indexes are another table's, so it names no oif to watch. */
+    assert(derive(g, &plan) == FT_MR_REFUSED_TABLE && !plan.oifs_known);
     g->table = RT_TABLE_DEFAULT;
     /* A non-default rule anywhere in the family keeps the whole family out
      * of hardware, because an entry that matches at the classifier is never
      * offered to the rule that would have redirected it. */
     ft_mr_policy[ft_mr_idx(AF_INET)] = 1;
     assert(refuse(g) == FT_MR_REFUSED_POLICY);
+    /* Its oifs are named all the same, so Linux forwarding it meanwhile
+     * confirms it for the moment the rule goes. */
+    assert(derive(g, &plan) == FT_MR_REFUSED_POLICY);
+    assert(plan.oifs_known && plan.oif_count == 1 && plan.oif[0] == LAN.ifindex);
     ft_mr_policy[ft_mr_idx(AF_INET)] = 0;
     /* And it is per family: an IPv6 rule does not refuse IPv4. */
     ft_mr_policy[ft_mr_idx(AF_INET6)] = 1;
@@ -996,6 +1002,10 @@ int main(void)
     oif(g, 1, 1);
     oif(g, 2, 1);
     assert(derive(g, &plan) == FT_MR_PENDING);
+    /* Every MFC oif, in VIF order, by the device ipmr sends each copy
+     * through: what a copy is seen leaving by at POST_ROUTING. */
+    assert(plan.oifs_known && plan.oif_count == 2);
+    assert(plan.oif[0] == LAN.ifindex && plan.oif[1] == VLAN_LAN.ifindex);
     assert(plan.spec.listeners == 2);
     assert(plan.spec.listener[0].dev == &LAN && plan.spec.listener[0].vlans == 0);
     assert(plan.spec.listener[1].dev == &LAN && plan.spec.listener[1].vlans == 1);
@@ -1116,6 +1126,9 @@ int main(void)
     vif_set(AF_INET, 1, &BR, 0);
     oif(g, 1, 1);
     assert(derive(g, &plan) == FT_MR_PENDING);
+    /* The bridge is the oif ipmr sends to and the one a copy is seen
+     * leaving by; it leaves through the bridge's own hooks after that. */
+    assert(plan.oif_count == 1 && plan.oif[0] == BR.ifindex && plan.out_bridged);
     assert(plan.spec.listeners == 2);
     assert(plan.spec.listener[0].dev == &LAN &&
            plan.spec.listener[1].dev == &LAN2);
@@ -1253,6 +1266,12 @@ int main(void)
     ft_mr_plan_put(&plan);
     LAN.mtu = 1400;
     assert(refuse(g) == FT_MR_REFUSED_MTU);
+    /* The oifs are named all the same -- by ifindex, holding nothing -- so
+     * the worker watches for Linux forwarding to them while the group waits
+     * for its MTU. */
+    assert(derive(g, &plan) == FT_MR_REFUSED_MTU);
+    assert(plan.oifs_known && plan.oif_count == 1 && plan.oif[0] == LAN.ifindex);
+    assert(!plan.out_bridged);
     /* Larger is fine: nothing that arrives can exceed it. */
     LAN.mtu = 9000;
     assert(derive(g, &plan) == FT_MR_PENDING);
@@ -1474,11 +1493,12 @@ int main(void)
         /* Every refusal has a word of its own: one "refused" would answer
          * ten different questions the same way. */
         static const enum ft_mr_state all[] = {
-            FT_MR_PENDING, FT_MR_INSTALLED, FT_MR_REFUSED_TABLE,
+            FT_MR_PENDING, FT_MR_INSTALLED, FT_MR_BRIDGED, FT_MR_UNCONFIRMED,
+            FT_MR_REFUSED_TABLE,
             FT_MR_REFUSED_POLICY, FT_MR_REFUSED_WILDCARD,
             FT_MR_REFUSED_SCOPE, FT_MR_REFUSED_INGRESS, FT_MR_REFUSED_HOST,
             FT_MR_REFUSED_THRESHOLD, FT_MR_REFUSED_LISTENER,
-            FT_MR_REFUSED_MTU, FT_MR_REFUSED_CONTESTED,
+            FT_MR_REFUSED_MTU, FT_MR_REFUSED_FILTER, FT_MR_REFUSED_CONTESTED,
             FT_MR_REFUSED_FAILED, FT_MR_REFUSED_RESYNC,
         };
 
@@ -1487,8 +1507,8 @@ int main(void)
             for (unsigned j = i + 1; j < ARRAY_SIZE(all); j++)
                 assert(strcmp(ft_mr_state_text(all[i]),
                               ft_mr_state_text(all[j])));
-            /* And the two that are not refusals are not counted as ones. */
-            assert(ft_mr_refusal(all[i]) == (i >= 2));
+            /* And the four that are not refusals are not counted as ones. */
+            assert(ft_mr_refusal(all[i]) == (i >= 4));
         }
     }
 
