@@ -103,6 +103,15 @@ tunnel's own address rather than ignoring the words is what keeps a future
 kernel that starts writing something else there from being silently overridden
 — the same discipline the session egress applies to its zero words.
 
+A tunnel over a PPPoE session (6rd or DS-Lite on a PPPoE WAN) meets both
+contracts at once, and the tunnel's is the one that holds: the words are the
+tunnel's local address, because the route leaves by the tunnel, and the
+session's zero words never reach the adapter. The check therefore follows the
+tunnel whenever there is one, and the session only when it is outermost. The
+destination is the concentrator either way: a ppp device resolves no neighbour
+at all, so the outer next hop the kernel walked is the session's far end, and
+its Ethernet address is the one the session records.
+
 ## What the hardware cannot reproduce
 
 The outer IPv4 header carries no don't-fragment bit. This is a limitation of
@@ -239,6 +248,7 @@ which the counters alone cannot show:
 | TCP | 6o4 | half a megabyte on one connection, the cookies unchanged, so it was never readmitted against a changed tunnel |
 | Reconfigure under load | 6o4 | `ip tunnel change` of the TTL retires the flow through the link watch, and the flow readmitted afterwards carries the new TTL on the wire |
 | Delete under load | 6o4 | deleting the tunnel device retires both directions and leaves the bindings up, so the next flow is judged against whatever tunnel exists then |
+| Over a PPPoE session | yes | `test_flowtable_pppoe.py::test_flowtable_pppoe_tunnel`: the insert carries the outer header, the session header and the WAN tag, the strip removes all three; the outer frames reach the concentrator's ppp device, which only a frame addressed to it and to this session does; one session and one tunnel record, each held by both directions |
 
 Both directions of both modes offload at the path's line rate: measured LAN VM
 → DUT → tunnel → orchestrator over four TCP streams, 6o4 ran 9.15 Gb/s
@@ -250,15 +260,6 @@ image, with the adapter's error, fatal and quarantine counters at zero
 afterwards.
 
 ## What this does not carry
-
-**A tunnel over a PPPoE session is refused, not accelerated.** The walk crosses
-it — a 6rd or DS-Lite tunnel over a PPPoE WAN link is a real topology — but the
-session egress requires the Ethernet mangle words to be zero and a tunnel over
-it leaves the tunnel's own local address there, so the flow is declined to
-software rather than misforwarded. The frames still reach their destination; the
-acceleration is what is missing. Carrying it would need the session and tunnel
-dst-MAC contracts reconciled, which no production topology on this box needs
-today.
 
 **The don't-fragment bit**, as above: the offloaded outer header never carries
 it, matching CMM, so the tunnel's pmtudisc reaches the wire only for

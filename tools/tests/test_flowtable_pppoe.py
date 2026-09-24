@@ -1200,3 +1200,85 @@ async def _echo_stream(reader, writer):
             await writer.drain()
     finally:
         writer.close()
+
+
+@pytest.mark.parametrize("mode", ["6o4", "4o6"])
+@pytest.mark.parametrize("pppoe_rig", ["ipv6"], indirect=True)
+async def test_flowtable_pppoe_tunnel(pppoe_rig, mode):
+    """A tunnel whose outer packets leave by the session: 6rd or a tunnel
+    broker on a PPPoE WAN for 6o4, DS-Lite on one for 4o6.
+
+    One direction is both encapsulations at once -- the tunnel's outer header,
+    then the session's, then the tag the session runs over -- and the other
+    arrives inside all three. The outer header is addressed to the far end of
+    the tunnel, which is not the neighbour the frame is for: the concentrator
+    is, and the only place its Ethernet address is recorded is the session.
+    Frames that reach the concentrator's ppp device, where the capture sits,
+    are ones its PPPoE stack took for this session, which is the proof that
+    the frame was addressed to it.
+    """
+    import test_flowtable_tunnel as tunnel
+
+    r = pppoe_rig
+    shape = tunnel.Shape(mode, 48960, 48961)
+    if mode == "6o4":
+        shape.outer, shape.mtu = (INNER_REMOTE, INNER_LOCAL), SESSION_MTU - 20
+    else:
+        shape.outer, shape.mtu = (INNER_REMOTE6, INNER_LOCAL6), SESSION_MTU - 60
+    r.shape = shape
+    # The concentrator's ppp device is where the outer packets are plain IP.
+    r.wan_if = r.server_ppp_if
+    cleanup, lan_cleanup = [], []
+    transport = None
+    try:
+        await tunnel._lan_side(r, cleanup, lan_cleanup)
+        if shape.family == 6:
+            # The LAN advertises the tunnel's MTU, the configuration under
+            # which an IPv6 direction into it is offloaded at all.
+            key = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
+            previous = (await command(r.target, r.session, "sysctl", "-n", key))["stdout"].strip()
+            cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))
+            await command(r.target, r.session, "sysctl", "-w", f"{key}={shape.mtu}")
+        else:
+            accept = ["POSTROUTING", "-s", r.lan_address, "-d", shape.inner_orch, "-p", "udp",
+                      "--sport", str(shape.sport), "--dport", str(shape.dport), "-j", "ACCEPT"]
+            await command(r.target, r.session, "iptables", "-t", "nat", "-I", *accept)
+            cleanup.append((r.target, ["iptables", "-t", "nat", "-D", *accept]))
+        await tunnel._dut_tunnel(r, cleanup)
+        await tunnel._orchestrator_tunnel(r, cleanup)
+        await tunnel._wait_reachable(r)
+        await tunnel._clear_ct(r)
+        transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+            tunnel.EchoServer, local_addr=(shape.inner_orch, shape.dport),
+            family=socket.AF_INET6 if shape.family == 6 else socket.AF_INET)
+        before = await r.state()
+        flows, delta = await tunnel._established(r, name=f"pppoe-{mode}")
+        forward, reverse = tunnel._directions(r, flows)
+        tunnel._assert_tunnel(r, forward, reverse)
+        _assert_session(r, forward, reverse)
+        assert all(d == 64 for d in delta.values()), delta
+        state = await r.state()
+        # One tunnel record and the one session record, each held by both
+        # directions of the one connection.
+        row = _session_row(state, r.session_identity)
+        assert row["refs"] == "2", row
+        tunnels = [t for t in state["tunnels"] if t["dev"] == shape.device]
+        assert len(tunnels) == 1 and tunnels[0]["refs"] == "2", state["tunnels"]
+        assert state["errors"] == before["errors"], (before, state)
+        r.record(f"pppoe-tunnel-{mode}", {"flows": flows, "delta": delta, "session": row,
+                                          "tunnel": tunnels[0]})
+    finally:
+        if transport:
+            transport.close()
+        failures = []
+        await command(r.target, r.session, "nft", "delete", "table", "inet", tunnel.TABLE,
+                      check=False)
+        if hasattr(r, "lan_address"):
+            await tunnel._clear_ct(r)
+        for agent, argv in reversed(cleanup):
+            result = await command(agent, r.session, *argv, check=False)
+            if result["rc"] and "Cannot find device" not in (result.get("stderr") or ""):
+                failures.append(result)
+        for cmd in reversed(lan_cleanup):
+            await lan_run(r.lan, cmd)
+        assert not failures, failures

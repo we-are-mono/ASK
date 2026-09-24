@@ -3265,23 +3265,22 @@ static void test_tunnel(void)
     assert(decoded.out_tunnel.present && decoded.out_bridge == &br);
     assert(!decoded.out_vlans && decoded.out == &out);
 
-    /* And over a PPPoE session, which is the one shape where the tunnel does
-     * not decide the destination: the outer packet is still addressed to the
-     * concentrator, so the session's address wins and the hop's own may be
-     * the zero one a ppp device's neighbours carry.
-     *
-     * The Ethernet words are zeroed here because that is what the session arm
-     * of ft_parse() requires. A real kernel writes the *tunnel device's*
-     * address into them, since the route names the tunnel and not the ppp
-     * device -- see the note in the report; this case therefore proves the
-     * path derivation and the statistics rather than the word check. */
+    /* And over a PPPoE session -- DS-Lite or 6rd on a PPPoE WAN -- which is
+     * the one shape where the tunnel does not decide the destination: the
+     * outer packet is still addressed to the concentrator, so the session's
+     * address wins and the hop's own may be the zero one a ppp device's
+     * neighbours carry. The Ethernet words are what a real kernel writes:
+     * the route names the tunnel, so they carry the tunnel device's address,
+     * exactly as for a tunnel over a port. Zero words, which the ppp device's
+     * own neighbour would have given, describe a route that never named the
+     * tunnel and are refused. */
     ip6tnl_out_fixture();
     egress_tunnel.lower_ifindex = ppp.ifindex;
     memset(egress_tunnel.h_dest, 0, ETH_ALEN);
     egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex,
                                                .id = SESSION_ID };
     memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
-    zero_ethernet_dest();
+    tunnel_ethernet_dest(&ip6tnl);
     session_push(SESSION_ID);
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.out_tunnel.present && decoded.out_session.present);
@@ -3289,6 +3288,8 @@ static void test_tunnel(void)
     assert(decoded.out_session.lower_ifindex == out.ifindex);
     assert(!memcmp(decoded.dst_mac, AC_MAC, ETH_ALEN));
     assert(decoded.out == &out && decoded.out_logical == &ip6tnl);
+    zero_ethernet_dest();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
 
     /* Every way the hop can fail to describe something the hardware could
      * reproduce. */

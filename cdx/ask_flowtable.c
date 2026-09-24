@@ -2124,41 +2124,44 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	if ((out->out_tunnel.present || out->in_tunnel.present) &&
 	    (out->sa_handle || out->in_sa_handle))
 		return ask_refuse(-EOPNOTSUPP);
+	/* What Netfilter writes into the four mangle words is the neighbour of
+	 * the device the route leaves by, and that is the outermost one the
+	 * walk took: the tunnel where there is one, else the ppp device. Each
+	 * is required exactly, rather than ignored, so a kernel that started
+	 * resolving something else there is not silently overridden.
+	 *
+	 * A tunnel device is NOARP, but unlike a ppp device it has header ops
+	 * and an address -- its local IP address, four or sixteen bytes -- and
+	 * for such a device ndisc_constructor() and arp_constructor() both copy
+	 * that address into the neighbour's hardware address. So the words are
+	 * the tunnel's own local address, zero-padded to six bytes. */
+	if (out->out_tunnel.present) {
+		u8 own[ETH_ALEN] = {};
+
+		memcpy(own, out->out_logical->dev_addr,
+		       min_t(unsigned int, out->out_logical->addr_len, ETH_ALEN));
+		if (memcmp(ethernet, own, ETH_ALEN))
+			return ask_refuse(-EOPNOTSUPP);
+	}
 	if (out->out_session.present) {
-		/* A ppp device resolves no Ethernet destination and Netfilter
-		 * writes none: flow_offload_eth_dst() reads the NOARP neighbour
-		 * arp_constructor() built on it, whose hardware address is the
-		 * zero one a device with no address length leaves behind. So
-		 * the four mangle words must be exactly that, and the real
-		 * destination is the concentrator the session names. Requiring
-		 * the zero rather than ignoring the words is what keeps a
-		 * future kernel that starts writing something here from being
-		 * silently overridden. A tunnel over the session changes none
-		 * of this: the outer packet is still addressed to the
-		 * concentrator. */
-		if (!is_zero_ether_addr(ethernet))
+		/* A ppp device resolves no Ethernet destination: its NOARP
+		 * neighbour, the one arp_constructor() builds, carries the zero
+		 * address a device with no address length leaves behind. So
+		 * with no tunnel above it the words must be that zero, and
+		 * either way the real destination is the concentrator the
+		 * session names: a tunnel's outer packet over the session is
+		 * addressed to it as well. */
+		if (!out->out_tunnel.present && !is_zero_ether_addr(ethernet))
 			return ask_refuse(-EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, out->out_session.mac);
 	} else if (out->out_tunnel.present) {
 		struct net_device *lower = __dev_get_by_index(
 			&init_net, out->out_tunnel.lower_ifindex);
-		u8 own[ETH_ALEN] = {};
 
-		/* A tunnel device is NOARP too, but unlike a ppp device it has
-		 * header ops and an address -- its local IP address, four or
-		 * sixteen bytes -- and for such a device ndisc_constructor() and
-		 * arp_constructor() both copy that address into the neighbour's
-		 * hardware address. So what Netfilter writes into the four
-		 * mangle words is the tunnel's own local address, zero-padded
-		 * to six bytes, and that is what is required here, exactly, for
-		 * the reason the session arm requires zero: a kernel that
-		 * started resolving something else there must not be silently
-		 * overridden. The destination is the outer next hop the walk
-		 * resolved on the device below, checked against that device's
-		 * neighbour as a routed flow's is checked against its own. */
-		memcpy(own, out->out_logical->dev_addr,
-		       min_t(unsigned int, out->out_logical->addr_len, ETH_ALEN));
-		if (memcmp(ethernet, own, ETH_ALEN) || !lower ||
+		/* The destination is the outer next hop the walk resolved on
+		 * the device below, checked against that device's neighbour as
+		 * a routed flow's is checked against its own. */
+		if (!lower ||
 		    !ft_neigh_check(out->out_tunnel.family, lower,
 				    &out->out_tunnel.nexthop, out->out_tunnel.mac))
 			return ask_refuse(-EOPNOTSUPP);

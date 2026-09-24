@@ -240,16 +240,6 @@ result independently of those temporary files.
   both sets inside `CDX_MC_MAX_LISTENERS`. Deferred rather than guessed at.
   See the [routed multicast design](docs/flowtable/multicast-routed.md).
 
-- [ ] **A186 — a tunnel over a PPPoE session is refused rather than offloaded.**
-  `cdx/ask_flowtable.c` `ft_parse`: a 6o4/4o6 tunnel whose outer packet egresses
-  over a PPPoE session (6rd or DS-Lite on a PPPoE WAN) is declined to software,
-  not misforwarded — the session-egress arm requires zero Ethernet mangle words
-  and a tunnel over it leaves the tunnel's own local address there. Frames still
-  reach their destination; only the acceleration is missing. No production
-  topology on this box needs it today. To enable: reconcile the session and
-  tunnel dst-MAC contracts so the tunnel arm runs when both are present. See
-  the [tunnel design](docs/flowtable/tunnels.md).
-
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN
@@ -334,6 +324,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A186.** A 6o4/4o6 tunnel whose outer packets leave by a PPPoE session was refused rather than offloaded —
+  fixed (_:/^flowtable: offload a tunnel over a PPPoE session_).
 
 - [x] **A206.** A flow admitted through a bridge port went on being bridged in hardware after STP blocked the port —
   fixed (_:/^flowtable: retire flows bridged through a port STP stops_).
