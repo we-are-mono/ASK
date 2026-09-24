@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import pathlib
 import re
@@ -99,6 +100,22 @@ NAT_TABLE = "ask_pppoe_nat"
 # the eight bytes a PPPoE header costs. Nothing here sets it; that it arrives
 # at 1492 on its own is part of what the MTU case proves.
 SESSION_MTU = 1492
+
+# Seconds between the LCP echo requests each end of the session sends. Both
+# ends are configured from this, and it bounds what the session exchanges on
+# its own while a case measures around it.
+LCP_ECHO_INTERVAL = 5
+
+# The untagged flow the session-record case runs beside the session: the LAN
+# VM to the WAN host's own address on the bare WAN port, crossing neither the
+# session nor the tag it stands on. Ports of its own, so its conntrack is never
+# the session flow's.
+UNTAGGED_SPORT = int(os.environ.get("ASK_FLOWTABLE_PPPOE_UNTAGGED_SPORT", "48284"))
+UNTAGGED_DPORT = UNTAGGED_SPORT + 1
+UNTAGGED_COUNT = 10000
+# That host's address, read at import: pppoe_rig rebinds the offload module's
+# endpoint to the session's inner address for the length of each case.
+WAN_ENDPOINT = ft.WAN_IP
 
 # The QoS case's two flows: one marked into a class, which the port has to find
 # again after the session scrubbed its conntrack, and one unmarked, which
@@ -193,7 +210,7 @@ def _server_start(ipv6=False):
         f"mtu {SESSION_MTU}\n"
         f"mru {SESSION_MTU}\n"
         "nodefaultroute\n"
-        "lcp-echo-interval 5\n"
+        f"lcp-echo-interval {LCP_ECHO_INTERVAL}\n"
         "lcp-echo-failure 3\n"
         "noipdefault\n"
         + ("+ipv6\n" if ipv6 else ""))
@@ -274,7 +291,7 @@ async def _dial(console, lower, ipv6=False):
         "holdoff 2\n"
         f"mtu {SESSION_MTU}\n"
         f"mru {SESSION_MTU}\n"
-        "lcp-echo-interval 5\n"
+        f"lcp-echo-interval {LCP_ECHO_INTERVAL}\n"
         "lcp-echo-failure 3\n"
         f"pap-secrets {DUT_SECRETS}\n"
         f"chap-secrets {DUT_SECRETS}\n"
@@ -1079,6 +1096,278 @@ async def test_flowtable_pppoe_session_counters(pppoe_rig):
     assert row["refs"] == "0" and row["slot"] == "yes", row
     assert state["session_records"] == 1 and state["session_slots"] == 1, state
     assert {k: int(row[k]) for k in after} == after, (row, after)
+
+
+async def _untagged_path(r, cleanup):
+    """The WAN host's own address across the two bare ports, beside the
+    session: the path test_flowtable_offload's rig builds, restated here
+    because that fixture and this one cannot share a case -- each owns the
+    offload module's endpoint.
+
+    Built before anything is admitted, since a host route added under an
+    installed flow is a routing change the adapter answers. The concentrator's
+    route back to the LAN is left pointing into the session; the case moves it
+    for its window alone. Returns what that move needs: the WAN host's device
+    and the DUT's own address on the WAN port.
+    """
+    addresses = json.loads((await command(r.wan, r.session, "ip", "-j", "-4", "addr"))["stdout"])
+    wan_if = next((i["ifname"] for i in addresses
+                   if any(a.get("local") == WAN_ENDPOINT for a in i["addr_info"])), None)
+    assert wan_if, (f"ASK_WAN_IPERF_IP={WAN_ENDPOINT} is none of the WAN host's addresses",
+                    addresses)
+    wan_mac = json.loads((await command(r.wan, r.session, "ip", "-j", "link", "show",
+                                        "dev", wan_if))["stdout"])[0]["address"]
+    dut = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show",
+                                    "dev", TARGET_WAN_IF))["stdout"])[0]
+    dut_wan_ip = next(a["local"] for a in dut["addr_info"] if a["family"] == "inet")
+    # Pinned, as the rig pins it, and put back as it was found: a neighbour
+    # resolving mid-measurement is a change the adapter would answer inside
+    # the window.
+    old = json.loads((await command(r.target, r.session, "ip", "-j", "neigh", "show", "to",
+                                    WAN_ENDPOINT, "dev", TARGET_WAN_IF))["stdout"])
+    restore = ["ip", "neigh", "del", WAN_ENDPOINT, "dev", TARGET_WAN_IF]
+    if old and old[0].get("lladdr"):
+        state = "permanent" if "PERMANENT" in old[0]["state"] else "stale"
+        restore = ["ip", "neigh", "replace", WAN_ENDPOINT, "lladdr", old[0]["lladdr"],
+                   "nud", state, "dev", TARGET_WAN_IF]
+    await command(r.target, r.session, "ip", "neigh", "replace", WAN_ENDPOINT, "lladdr",
+                  wan_mac, "nud", "permanent", "dev", TARGET_WAN_IF)
+    cleanup.append((r.target, restore))
+    routes = json.loads((await command(r.target, r.session, "ip", "-j", "route", "show",
+                                       "exact", f"{WAN_ENDPOINT}/32"))["stdout"])
+    assert not routes, ("a host route to the WAN host was left behind", routes)
+    await command(r.target, r.session, "ip", "route", "add", f"{WAN_ENDPOINT}/32",
+                  "dev", TARGET_WAN_IF)
+    cleanup.append((r.target, ["ip", "route", "del", f"{WAN_ENDPOINT}/32",
+                               "dev", TARGET_WAN_IF]))
+    # Routed, not translated: the image's own masquerade would rewrite it.
+    accept = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_ENDPOINT, "-p", "udp",
+              "--sport", str(UNTAGGED_SPORT), "--dport", str(UNTAGGED_DPORT), "-j", "ACCEPT"]
+    await command(r.target, r.session, "iptables", "-t", "nat", "-I", *accept)
+    cleanup.append((r.target, ["iptables", "-t", "nat", "-D", *accept]))
+    clear = ["conntrack", "-D", "-p", "udp", "--orig-src", r.lan_ip, "--orig-dst", WAN_ENDPOINT,
+             "--sport", str(UNTAGGED_SPORT), "--dport", str(UNTAGGED_DPORT)]
+    await command(r.target, r.session, *clear, check=False)
+    cleanup.append((r.target, clear))
+    return wan_if, dut_wan_ip
+
+
+async def _untagged_exchange(r, count):
+    """Echo `count` datagrams from the LAN VM to the WAN host over the bare
+    ports, one at a time, so each is one frame each way and the entries'
+    counters can be held to exactly `count`. A lost reply is counted, not
+    fatal, so the caller decides what loss means."""
+    script = f'''
+import json, socket, struct
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.bind(({r.lan_ip!r}, {UNTAGGED_SPORT}))
+echoed = lost = 0
+for n in range({count}):
+    payload = struct.pack('!Q', n) + b'ASK-pppoe-untagged'.ljust(56, b'.')
+    s.sendto(payload, ({WAN_ENDPOINT!r}, {UNTAGGED_DPORT}))
+    try:
+        while True:
+            data, addr = s.recvfrom(2048)
+            if data == payload:
+                break
+    except TimeoutError:
+        lost += 1
+        continue
+    assert addr == ({WAN_ENDPOINT!r}, {UNTAGGED_DPORT}), (n, addr)
+    echoed += 1
+s.close()
+print(json.dumps({{'echoed': echoed, 'lost': lost}}))
+'''
+    result = await r.run_peer(script, timeout=count * 0.01 + 40, label="flowtable_pppoe_untagged")
+    assert result.rc == 0, result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _untagged_directions(r, flows):
+    """The untagged flow's two installed directions, forward first, or None
+    until hardware holds both."""
+    lan, wan = f"{r.lan_ip}:{UNTAGGED_SPORT}", f"{WAN_ENDPOINT}:{UNTAGGED_DPORT}"
+    forward = [f for f in flows if (f["src"], f["dst"]) == (lan, wan)]
+    reverse = [f for f in flows if (f["src"], f["dst"]) == (wan, lan)]
+    if len(forward) == len(reverse) == 1:
+        return forward[0], reverse[0]
+    return None
+
+
+async def _untagged_window(r, echo):
+    """Admit the untagged flow, then run UNTAGGED_COUNT round trips over it
+    between two readings of everything the session keeps: its record, its
+    ppp device's counters, and its download's entry in the adapter state."""
+    for _ in range(10):
+        await _untagged_exchange(r, 4)
+        state = await r.state()
+        if _untagged_directions(r, state["flows"]):
+            break
+    else:
+        pytest.fail(f"the untagged flow was not admitted beside the session: {state}")
+    before = await r.state()
+    assert _untagged_directions(r, before["flows"]), before["flows"]
+    record = _session_halves(before, r.session_identity)
+    opened = time.monotonic()
+    link = await _ppp_link(r)
+    answered = echo.packets
+    report = await _untagged_exchange(r, UNTAGGED_COUNT)
+    answered = echo.packets - answered
+    link_after = await _ppp_link(r)
+    window = time.monotonic() - opened
+    after = await r.state()
+    return {"before": before, "after": after, "report": report, "answered": answered,
+            "window": window, "record": record,
+            "record_after": _session_halves(after, r.session_identity),
+            "link": link, "link_after": link_after}
+
+
+async def test_flowtable_pppoe_session_record_ignores_untagged_flows(pppoe_rig):
+    """A session's hardware record ignores untagged flows that do not cross it.
+
+    An entry whose ingress names no tag and no session still carries the strip
+    that validates it arrived untagged, and that strip's statistics word is a
+    count of zero at a pointer to the base of the statistics carve
+    (insert_remove_vlan_hm()). The carve opens with the session pool, so the
+    pointer is the receive half of the first session record -- the very
+    address the download of a session holding that record counts into. Only
+    the count tells the two apart. A microcode that followed the pointer
+    whatever the count would put every untagged frame into that session's
+    record, and through the fold into its ppp device's `ip -s link`; with the
+    record free, into the free list's link, which occupies the same bytes.
+
+    So a plain routed flow runs both ways between the bare ports while the
+    session holds a record, and the record must not move at all. That is sharp
+    while the session holds the first record, and here it does by
+    construction: the pool is a stack laid down in carve order, taken from and
+    returned to its head, so it hands out the first record every time until
+    two sessions hold records at once -- and no case on this bench ever holds
+    two, since each dials the only session (_session_identity). What of that
+    can be read back is checked: no record held before the admission, exactly
+    one after.
+
+    The control is the session's own download: 64 frames through it still
+    move the same record by exactly 64. A record that counted nothing at all
+    would pass everything else here too.
+    """
+    r = pppoe_rig
+    initial = await r.state()
+    assert initial["session_records"] == 0, (
+        "a session record outlived its device, so the one this case takes would "
+        "not come off the head of the pool", initial["sessions"])
+    cleanup = []
+    transport = None
+    try:
+        wan_if, dut_wan_ip = await _untagged_path(r, cleanup)
+        await r.table()
+        await r.nft(f"add rule inet {ft.TABLE} forward ip saddr {r.lan_ip} "
+                    f"ip daddr {WAN_ENDPOINT} udp sport {UNTAGGED_SPORT} "
+                    f"udp dport {UNTAGGED_DPORT} flow add @fast")
+        await r.exchange(count=4)
+        await _download_only(r, initial)
+        held = await r.state()
+        row = _session_row(held, r.session_identity)
+        assert row["slot"] == "yes" and row["dev"] == r.ppp_if, row
+        assert held["session_records"] == held["session_slots"] == 1, held
+        transport, echo = await asyncio.get_running_loop().create_datagram_endpoint(
+            Echo, local_addr=(WAN_ENDPOINT, UNTAGGED_DPORT))
+        echo.record_payloads = False
+        # The concentrator reaches the LAN VM through the session, so the WAN
+        # host's echoes would come back inside it. For the window its route to
+        # the LAN VM goes by the DUT's WAN address instead, which leaves both
+        # halves of the flow bare; the session's route is back before the
+        # control, which needs it.
+        await command(r.wan, r.session, "ip", "route", "replace", r.reachable,
+                      "via", dut_wan_ip, "dev", wan_if)
+        try:
+            measured = await _untagged_window(r, echo)
+        finally:
+            await command(r.wan, r.session, "ip", "route", "replace", r.reachable,
+                          "dev", r.ppp_if, check=False)
+        r.record("pppoe-untagged-beside-session",
+                 {**measured, "session": _session_text(r.session_identity)})
+
+        before, after = measured["before"], measured["after"]
+        old = _untagged_directions(r, before["flows"])
+        new = _untagged_directions(r, after["flows"])
+        _assert_undisturbed(r, before, after, new is not None and
+                            [f["cookie"] for f in new] == [f["cookie"] for f in old])
+        # Bare both ways: nothing described on either side of either
+        # direction, so each entry's strip is the one that names no record.
+        for flow, ingress, egress in ((old[0], TARGET_LAN_IF, TARGET_WAN_IF),
+                                      (old[1], TARGET_WAN_IF, TARGET_LAN_IF)):
+            assert (flow["in"], flow["out"]) == (ingress, egress), flow
+            assert all(flow[k] == "-" for k in ("in_vlan", "out_vlan", "in_br", "out_br",
+                                                "in_ppp", "out_ppp", "in_tnl", "out_tnl")), flow
+        # Every round trip crossed in hardware, both ways.
+        assert measured["report"] == {"echoed": UNTAGGED_COUNT, "lost": 0}, measured["report"]
+        assert measured["answered"] == UNTAGGED_COUNT, measured["answered"]
+        moved = [int(n["packets"]) - int(o["packets"]) for o, n in zip(old, new)]
+        assert moved == [UNTAGGED_COUNT, UNTAGGED_COUNT], (moved, old, new)
+        # Nothing crossed the session's download in hardware meanwhile, where
+        # it is still installed -- it can go idle and expire in the window,
+        # which retires the entry and keeps the record. So any movement below
+        # is the pointer's and not traffic's.
+        download = {f["cookie"]: int(f["packets"]) for f in before["flows"] if f["in_ppp"] != "-"}
+        crossed = {f["cookie"]: int(f["packets"]) - download[f["cookie"]]
+                   for f in after["flows"] if f["cookie"] in download}
+        assert not any(crossed.values()), (crossed, before["flows"], after["flows"])
+        record = {k: measured["record_after"][k] - measured["record"][k]
+                  for k in measured["record"]}
+        assert record == dict.fromkeys(record, 0), (
+            f"{2 * UNTAGGED_COUNT} untagged frames moved the session's record",
+            measured["record"], measured["record_after"])
+        # What the session exchanges on its own meanwhile: each end sends an
+        # LCP echo request every LCP_ECHO_INTERVAL seconds and answers the
+        # other's, so the DUT receives at most two frames per interval, and a
+        # window of w seconds overlaps at most ceil(w / interval) + 1 of them;
+        # each is at most a full frame. A record counting the untagged flows
+        # would fold thousands in here.
+        allowance = 2 * (math.ceil(measured["window"] / LCP_ECHO_INTERVAL) + 1)
+        link = {k: measured["link_after"][k] - measured["link"][k] for k in measured["link"]}
+        assert 0 <= link["rx_packets"] <= allowance, (
+            allowance, measured["window"], measured["link"], measured["link_after"])
+        assert link["rx_bytes"] <= link["rx_packets"] * 1518, (
+            measured["link"], measured["link_after"])
+        assert after["errors"] == initial["errors"], (initial["errors"], after)
+        row = _session_row(after, r.session_identity)
+        assert row["slot"] == "yes", row
+        assert after["session_records"] == after["session_slots"] == 1, after
+
+        # The control. The download may have expired over the window, so it
+        # is offered until hardware holds it again, then measured as
+        # test_flowtable_pppoe_session_counters measures it.
+        for _ in range(10):
+            await r.exchange(count=4)
+            state = await r.state()
+            if any(f["in_ppp"] != "-" for f in state["flows"]):
+                break
+        else:
+            pytest.fail(f"the session's download was not readmitted: {state}")
+        download = _direction(state["flows"], INNER_LOCAL, r.lan_ip)
+        halves = _session_halves(state, r.session_identity)
+        payload = 256
+        await r.exchange(count=64, payload_size=payload)
+        burst = await r.state()
+        counted = _direction(burst["flows"], INNER_LOCAL, r.lan_ip)
+        _assert_undisturbed(r, state, burst, counted["cookie"] == download["cookie"])
+        control = {k: v - halves[k] for k, v in _session_halves(burst, r.session_identity).items()}
+        r.record("pppoe-untagged-control", {"before": halves, "delta": control,
+                                            "download": [download, counted]})
+        assert int(counted["packets"]) - int(download["packets"]) == 64, (download, counted)
+        assert control == {"rx_packets": 64,
+                           "rx_bytes": 64 * (20 + 8 + payload + PPP_RX_OVERHEAD),
+                           "tx_packets": 0, "tx_bytes": 0}, (halves, control)
+    finally:
+        if transport:
+            transport.close()
+        # The table first, so its entries retire by unbinding rather than by
+        # the routes below going out from under them.
+        await command(r.target, r.session, "nft", "delete", "table", "inet", ft.TABLE,
+                      check=False)
+        for agent, argv in reversed(cleanup):
+            await command(agent, r.session, *argv, check=False)
 
 
 @pytest.mark.parametrize("target", ["dev-stats", "hardware"])
