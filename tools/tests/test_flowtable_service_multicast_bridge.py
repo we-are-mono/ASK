@@ -16,6 +16,7 @@ import pytest_asyncio
 from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
 from _mcast_helpers import arm_bridge_querier
+from _mcast_windows import cpu_frames, stream_cpu_counters
 from _mcast_wire import capture, frames, new_config, send
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mcast_wire_capture import multicast_mac
@@ -133,7 +134,9 @@ except BaseException:
         lan_created = True
         await asyncio.sleep(3)
         await arm_bridge_querier(lambda *argv: command(r.target, r.session, *argv), BRIDGE)
-        async with managed_service(r):
+        # Before the service learns anything: a commit once a routed group
+        # exists would take its confirmations back.
+        async with stream_cpu_counters(r.target, r.session, (FRAMING_PORT,)), managed_service(r):
             yield r
     finally:
         failures = []
@@ -214,22 +217,22 @@ async def _window(r, group, source, capture_on, ifaces, inject, ingress, label):
     """Inject a fresh run and read it off the listener's wire, with the
     classifier's own count and the ingress CPU's beside it.
 
-    `cpu` is the ingress port's software receive count across the injection,
-    `idle` the same count over as long again with nothing injected: the
-    segment's own traffic -- queries, reports, neighbour discovery -- which a
-    CPU bound has to allow for. The injection's length is not known until it
+    `cpu` is how many of the run's own frames reached the CPU on the ingress
+    port (cpu_frames()). `idle` is kept for the record only: the port's
+    software receive count over as long again with nothing injected, the
+    segment's own traffic. The injection's length is not known until it
     ends, since a LAN-side one runs over the console, so the idle interval is
     taken after it rather than before."""
     config = new_config(r.multicast_family, source, group, FRAMING_PORT, ifaces)
     before = await r.state()
     loop = asyncio.get_running_loop()
     async with capture(capture_on, config) as handle:
-        rx = await kernel_rx_packets(r.target, r.session, ingress)
+        counted = await cpu_frames(r.target, r.session, ingress)
         started = loop.time()
         await inject(config, FRAMING_COUNT)
         await asyncio.sleep(0.5)
-        cpu = await kernel_rx_packets(r.target, r.session, ingress) - rx
         elapsed = loop.time() - started
+        cpu = await cpu_frames(r.target, r.session, ingress) - counted
     after = await r.state()
     rx = await kernel_rx_packets(r.target, r.session, ingress)
     await asyncio.sleep(elapsed)
@@ -314,7 +317,7 @@ async def test_flowtable_service_multicast_bridge_keeps_the_sender(multicast_bri
         _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
         assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
             (before, after)
-        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+        assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
 
         other = '02:a5:19:10:00:02'
         deadline = asyncio.get_running_loop().time() + 30
@@ -333,7 +336,7 @@ async def test_flowtable_service_multicast_bridge_keeps_the_sender(multicast_bri
         _assert_bridged_copy(result[LISTENER], other, group)
         assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
             (before, after)
-        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+        assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
     finally:
         await _mdb(r, TARGET_LAN_IF, group, add=False)
         await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
@@ -365,7 +368,7 @@ async def test_flowtable_service_multicast_bridge_tagged_ingress(multicast_bridg
         _assert_bridged_copy(result[capture_if], r.lan_mac, group, WAN_WIRE_VID)
         assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
             (before, after)
-        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+        assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
     finally:
         await _mdb(r, TARGET_WAN_IF, group, add=False)
         await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
@@ -419,7 +422,7 @@ async def test_flowtable_service_multicast_bridge_yields_to_a_bridge_filter(mult
         _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
         assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
             (before, after)
-        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+        assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
     finally:
         if filtered:
             await command(r.target, r.session, 'nft', 'delete', 'table', 'bridge',
@@ -625,7 +628,7 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
         counted = int(_iptv_row(after, group)['packets']) - \
             int(_iptv_row(before, group)['packets'])
         assert counted >= FRAMING_COUNT * 0.95, (before, after)
-        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+        assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
         # ipmr's own counters are the classifier's, folded: a daemon
         # ageing its routes sees the stream flow.
         _, packets = await mroute_line(r.target, r.session, family, source, group)
@@ -643,7 +646,7 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
             'multicast-route-alone')
         assert not result[LISTENER]['seen'], result
         _assert_routed_copy(result[ROUTED_LISTENER], egress_mac, group)
-        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+        assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
 
         # And the route goes: nothing names the group, and it retires.
         await route.ctl('remove', route.iptv_dev, source, group)
@@ -790,7 +793,7 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
             _assert_bridged_copy(result[capture_if], r.lan_mac, group, WAN_WIRE_VID)
             assert _packets(after, group) - _packets(before, group) >= \
                 FRAMING_COUNT * 0.95, (before, after)
-            assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+            assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
 
         async def root():
             shown = (await tc('qdisc', 'show', 'dev', TARGET_WAN_IF, 'root'))['stdout']

@@ -3,8 +3,8 @@
 Every window sends numbered streams and counts each sequence at every observer
 beneath the IP layer (mroute_capture.py), so a copy that is missing, doubled or
 still arriving after its listener left is a number rather than an impression.
-Beside it, the ingress port's SDK software receive counter says whether the
-CPU carried the stream: a replicated frame never reaches the host.
+Beside it, a counter on the ingress port's netdev hook says how much of each
+stream the CPU carried: a replicated frame never reaches the host.
 
 The rig traps that make a working offload read as dead are kept out of the
 cases here rather than in each of them:
@@ -182,6 +182,7 @@ class MulticastRig:
                     captures.append((config, await stack.enter_async_context(
                         _capture(peer, {**config, "interfaces": interfaces}))))
             before = await self.proc() if adapter else None
+            counted = await cpu_frames(self.target, self.session, ingress)
             rx, sent = await kernel_rx_packets(self.target, self.session, ingress), time.monotonic()
             if sender == "lan":
                 await send_lan(self.lan, streams)
@@ -190,11 +191,13 @@ class MulticastRig:
             cpu = await kernel_rx_packets(self.target, self.session, ingress) - rx
             idle = round(idle * (time.monotonic() - sent) / idle_seconds)
             await asyncio.sleep(0.4)  # drain receiver queues before asking
+            counted = await cpu_frames(self.target, self.session, ingress) - counted
         received = {}
         for config, capture in captures:
             received.setdefault(config["group"] + "/" + config["source"], {}).update(await _finish(capture))
         after = await self.proc() if adapter else None  # also folds the routed counters
-        result = {"streams": streams, "received": received, "cpu": cpu, "idle": idle,
+        result = {"streams": streams, "received": received, "stream_cpu": counted,
+                  "cpu": cpu, "idle": idle,
                   "before": before and summary(before), "after": after and summary(after)}
         self.record(f"mcast-window-{label}", result)
         return {**result, "before": before, "after": after}
@@ -235,13 +238,53 @@ def delivered(window: dict, config: dict, iface: str) -> bool:
 
 
 def in_hardware(window: dict, streams: int = 1) -> None:
-    """None of the stream reached the CPU beyond the segment's own noise."""
-    assert window["cpu"] - window["idle"] < COUNT * streams * 0.1, (window["cpu"], window["idle"])
+    """Next to none of the stream reached the CPU."""
+    assert window["stream_cpu"] < COUNT * streams * 0.1, (window["stream_cpu"], window["cpu"], window["idle"])
 
 
 def in_software(window: dict, streams: int = 1) -> None:
     """The whole stream reached the CPU: the classifier matched none of it."""
-    assert window["cpu"] >= COUNT * streams, (window["cpu"], window["idle"])
+    assert window["stream_cpu"] >= COUNT * streams, (window["stream_cpu"], window["cpu"], window["idle"])
+
+
+CPU_TABLE = "ask_mc_cpu"
+
+
+@asynccontextmanager
+async def stream_cpu_counters(target, session, ports: tuple[int, ...]):
+    """Count the test streams' frames that reach the CPU, per port.
+
+    A netdev ingress chain on each port counts UDP to the streams' own ports.
+    The kernel has taken a VLAN tag off before this hook, and a frame the
+    classifier replicates never gets here, so it counts the streams' CPU
+    frames and nothing else; the port's own receive counter also moves for
+    everything else on the segment, and a one-second querier draws a burst
+    of reports from every host on it.
+
+    Installed once, before a case learns anything, and only read around a
+    window (cpu_frames()): the routed learner takes any ruleset commit as
+    unconfirming every routed group, so a table written inside a window
+    would itself send a routed stream to the CPU."""
+    await command(target, session, "nft", "delete", "table", "netdev", CPU_TABLE, check=False)
+    await command(target, session, "nft", "add", "table", "netdev", CPU_TABLE)
+    try:
+        for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+            await command(target, session, "nft", "add", "chain", "netdev", CPU_TABLE, dev, "{", "type",
+                          "filter", "hook", "ingress", "device", dev, "priority", "-500", ";",
+                          "policy", "accept", ";", "}")
+            await command(target, session, "nft", "add", "rule", "netdev", CPU_TABLE, dev, "udp", "dport",
+                          "{", ", ".join(str(p) for p in ports), "}", "counter")
+        yield
+    finally:
+        await command(target, session, "nft", "delete", "table", "netdev", CPU_TABLE, check=False)
+
+
+async def cpu_frames(target, session, ingress: str) -> int:
+    """The stream frames that have reached the CPU on `ingress` so far."""
+    listed = json.loads((await command(target, session, "nft", "-j", "list", "chain", "netdev",
+                                       CPU_TABLE, ingress))["stdout"])
+    return sum(e["counter"]["packets"] for item in listed["nftables"] if "rule" in item
+               for e in item["rule"]["expr"] if "counter" in e)
 
 
 def packets(row: dict | None) -> int:
@@ -500,11 +543,12 @@ async def multicast_rig(target_agent, aiohttp_session, lan, splat_window):
     r.wire = wire_interface()
     r.dut_lan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_LAN_IF)
     r.dut_wan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_WAN_IF)
-    try:
-        yield r
-    finally:
-        drained = await r.settle(
-            lambda s: s["mcast_groups"] == s["mroute_groups"] == 0 and
-            s["mcast_installed"] == s["mroute_installed"] == 0 and s["quarantine"] == 0,
-            "multicast state drained after the case", timeout=15)
-        r.record("mcast-drained", summary(drained))
+    async with stream_cpu_counters(target_agent, aiohttp_session, (PORT,)):
+        try:
+            yield r
+        finally:
+            drained = await r.settle(
+                lambda s: s["mcast_groups"] == s["mroute_groups"] == 0 and
+                s["mcast_installed"] == s["mroute_installed"] == 0 and s["quarantine"] == 0,
+                "multicast state drained after the case", timeout=15)
+            r.record("mcast-drained", summary(drained))

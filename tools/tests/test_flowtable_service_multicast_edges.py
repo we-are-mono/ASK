@@ -201,7 +201,7 @@ async def test_flowtable_service_multicast_two_sources(multicast_rig, family):
         assert delivered(after, streamed(after, group, second), LAN_NIC)
         assert moved(after, row(second)) == COUNT, summary(after["after"])
         in_software(after)
-        assert after["cpu"] - after["idle"] < COUNT * 1.1, (after["cpu"], after["idle"])
+        assert after["stream_cpu"] < COUNT * 1.1, (after["stream_cpu"], after["cpu"], after["idle"])
         assert withdrawn(after["after"], group, first), summary(after["after"])
 
         await ctl("remove", TARGET_WAN_IF, second, group)
@@ -632,7 +632,7 @@ async def test_flowtable_service_multicast_reload_bridged_blocked_source(multica
         await learn(r, streams, settled, "the allowed source carried, the blocked one not")
         before = await window("before")
         assert moved(before, lambda s: row(s, allowed)) == COUNT, summary(before["after"])
-        assert before["cpu"] - before["idle"] < COUNT * 1.1, (before["cpu"], before["idle"])
+        assert before["stream_cpu"] < COUNT * 1.1, (before["stream_cpu"], before["cpu"], before["idle"])
 
         async def unloaded():
             out = await window("unloaded", adapter=False)
@@ -646,7 +646,7 @@ async def test_flowtable_service_multicast_reload_bridged_blocked_source(multica
         after = await window("after")
         assert moved(after, lambda s: row(s, allowed)) == COUNT, summary(after["after"])
         assert moved(after, lambda s: row(s, blocked)) == 0, summary(after["after"])
-        assert after["cpu"] - after["idle"] < COUNT * 1.1, (after["cpu"], after["idle"])
+        assert after["stream_cpu"] < COUNT * 1.1, (after["stream_cpu"], after["cpu"], after["idle"])
     final = await r.settle(lambda s: not mcast_rows(s, group) and
                            s["mcast_installed"] == r.initial["mcast_installed"],
                            "removed after the reload", timeout=15)

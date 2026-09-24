@@ -412,7 +412,7 @@ async def test_flowtable_service_multicast_bridged_ssm_beside_asm(multicast_rig,
         assert moved(after, lambda s: flow_row(s, group, first)) == COUNT, summary(after["after"])
         assert moved(after, lambda s: flow_row(s, group, second)) == 0, summary(after["after"])
         # The second source reached the CPU, and the bridge dropped it there.
-        assert after["cpu"] - after["idle"] < COUNT * 1.1, (after["cpu"], after["idle"])
+        assert after["stream_cpu"] < COUNT * 1.1, (after["stream_cpu"], after["cpu"], after["idle"])
     final = await r.settle(lambda s: not mcast_rows(s, group) and
                            s["mcast_groups"] == r.initial["mcast_groups"],
                            f"v{family}: no record left", timeout=15)
@@ -458,7 +458,7 @@ async def test_flowtable_service_multicast_bridged_block_before_the_stream(multi
         assert delivered(second, streamed(second, group, allowed), LAN_NIC)
         assert moved(second, lambda s: flow_row(s, group, allowed)) == COUNT, summary(second["after"])
         assert moved(second, lambda s: flow_row(s, group, blocked)) == 0, summary(second["after"])
-        assert second["cpu"] - second["idle"] < COUNT * 1.1, (second["cpu"], second["idle"])
+        assert second["stream_cpu"] < COUNT * 1.1, (second["stream_cpu"], second["cpu"], second["idle"])
     final = await r.settle(lambda s: not mcast_rows(s, group) and
                            s["mcast_groups"] == r.initial["mcast_groups"],
                            f"v{family}: no record left", timeout=15)

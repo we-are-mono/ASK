@@ -180,7 +180,7 @@ async def withdrawal(r, learner, family):
     assert delivered(after, streamed(after, control), LAN_NIC)
     assert moved(after, row(control)) == COUNT, summary(after["after"])
     in_software(after)
-    assert after["cpu"] - after["idle"] < COUNT * 1.1, (after["cpu"], after["idle"])
+    assert after["stream_cpu"] < COUNT * 1.1, (after["stream_cpu"], after["cpu"], after["idle"])
     # No barrier ran in that window, so nothing may have been released.
     assert after["after"]["quarantine"] == 2, summary(after["after"])
     assert learner.withdrawn(after["after"], target), summary(after["after"])
