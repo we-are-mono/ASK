@@ -189,9 +189,12 @@ async def test_auto_peer_behind_another_device_works_in_software(aiohttp_session
         # and a printk breaking the console's framing does not change that.
         console = Console.target(log_path=str(ARTIFACTS / "ipsec-auto-uart.log"))
         await asyncio.to_thread(console.login, "root", None)
-        await console_command(console, "ping", "-c", "1", "-W", "1", "-I", LOCAL, INNER,
-                              check=False, resync=True)
+        ping = await console_command(console, "ping", "-c", "1", "-W", "1", "-I", LOCAL, INNER,
+                                     check=False, resync=True)
         after_mib = xfrm_mib(await read(agent, session, "/proc/net/xfrm_stat"))
+        # Async SEC encryption takes the packet and sends it later. A
+        # noqueue device used to report that as -ENOMEM, and ping resent it.
+        assert "sendmsg" not in ping["stdout"], ping
         assert await _state_packets(agent, session, "out") == before_sa + 1
         assert int(await read(agent, session,
                               f"/sys/class/net/{DETOUR}/statistics/tx_packets")) >= before_tx + 1
