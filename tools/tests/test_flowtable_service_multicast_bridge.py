@@ -21,7 +21,7 @@ from _mcast_wire import capture, frames, new_config, send
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mcast_wire_capture import multicast_mac
 from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read, rig  # noqa: F401
-from test_flowtable_service import managed_service
+from test_flowtable_service import managed_service, wait_service
 from test_flowtable_service_multicast import recover
 from test_mcast_e2e import dut_mac, mroute_line
 from test_mroute_capacity import _daemon
@@ -239,6 +239,15 @@ async def _window(r, group, source, capture_on, ifaces, inject, ingress, label):
     idle = await kernel_rx_packets(r.target, r.session, ingress) - rx
     r.record(label, {'result': handle['result'], 'before': before, 'after': after,
                      'cpu_rx': cpu, 'idle_rx': idle, 'seconds': elapsed})
+    # One binding and one ruleset per window. A table replacement rebinds
+    # (rearms) and commits twice, and every commit takes each routed group's
+    # confirmations back, so a stream both bridged and routed goes to Linux
+    # part-way through and reads as a mixed window rather than as what it
+    # was. The ruleset count moves only while a routed group is watched.
+    moved = {key: (before[key], after[key]) for key in ('rearms', 'mroute_ruleset_changes')
+             if before[key] != after[key]}
+    assert not moved, (f'{label}: the flowtable was rebound or the ruleset changed '
+                       f'inside the window', moved)
     return handle['result'], before, after, cpu, idle
 
 
@@ -554,6 +563,14 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
                       'grp', group, 'vid', str(ROUTED_VID), 'permanent',
                       reverse=['bridge', 'mdb', 'del', 'dev', BRIDGE, 'port', TARGET_LAN_IF,
                                'grp', group, 'vid', str(ROUTED_VID)])
+        # A VLAN joining a bound port, or a VLAN device going onto one, latches
+        # the flowtable's invalidation, and the service answers by replacing
+        # its table: two nftables commits, seconds later through the test's
+        # nft wrapper. Each takes every routed group's confirmations back, so
+        # one landing after the route is ridden sends the stream to Linux in
+        # the middle of a window. Admission is ready again only once the
+        # replacement is done.
+        await wait_service(r, timeout=30)
         async with _daemon(r.target, r.session, [iptv_dev, routed_dev]) as ctl:
             await ctl('add', iptv_dev, source, group, routed_dev)
             yield SimpleNamespace(ctl=ctl, source=source, iptv_dev=iptv_dev,
@@ -732,6 +749,10 @@ async def test_flowtable_service_multicast_bridge_route_count_across_a_bridge_bo
             except Exception as error:
                 assert time.monotonic() < deadline, ('management did not come back', repr(error))
                 await asyncio.sleep(1)
+        # And the service back to ready: a bounced bridge can latch the
+        # invalidation as the setup did, and the replacement's commits would
+        # take the route's confirmations back mid-window.
+        await wait_service(r, timeout=30)
 
         # Carried again: the stream is learned from its frames once more.
         _, routed, sent = await _ride(r, group, source)
