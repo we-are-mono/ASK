@@ -342,98 +342,51 @@ int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t type,
 	return 0;
 }
 
+/* A frame on an offline port's own default or error queue is one no owner
+ * took; on a port nothing feeds, the Wi-Fi one, it should not happen at all.
+ * Each is reported with its parse result and, for a contiguous frame, its
+ * payload, but no more often than the network rate limit allows: a port that
+ * does start receiving must not turn every frame into a console dump. The
+ * buffer goes back to its pool either way, a scatter-gather frame's table and
+ * segments included. */
+static void ofport_rx_report(const char *handler, const struct qm_fd *fd,
+			     uint32_t fqid)
+{
+	uint8_t *ptr;
+	uint32_t len = fd->length20;
+
+	if (!net_ratelimit())
+		return;
+	pr_err("%s::fqid %x(%d), bpid %d, status %08x, len %d, offset %d, format %s\n",
+	       handler, fqid, fqid, fd->bpid, fd->status, len, fd->offset,
+	       (fd->format == qm_fd_sg) ? "SGlist" : "simple");
+	if (!len)
+		return;
+	ptr = (uint8_t *)phys_to_virt(qm_fd_addr(fd));
+	pr_err("Displaying parse result:\n");
+	display_buff_data(ptr, 0x70);
+	if (fd->format != qm_fd_sg) {
+		pr_err("Displaying the packet:\n");
+		display_buff_data(ptr + fd->offset, len);
+	}
+}
 
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
 {
-
-	const struct qm_fd *fd;
-	uint8_t *ptr;
-	uint32_t len;
-
-	len = dq->fd.length20;
-
-	fd = &dq->fd;
-	printk("%s::fqid %x(%d), bpid %d, len %d, offset %d  addr %llx status: %x\n", __func__,
-			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
-			dq->fd.offset, (uint64_t)dq->fd.addr, dq->fd.status);
-	if(len)
-	{	
-		ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr));
-		printk("Dispalying parse result:\n");
-		display_buff_data(ptr, 0x70);
-		ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr) + dq->fd.offset);
-		printk("Displaying the packet: \n");
-		display_buff_data(ptr, len);
-	}	
-	if (dq->fd.bpid) {
-		if (fd->format != qm_fd_sg) {
-			struct bm_buffer bmb;
-			struct dpa_bp *dpa_bp;
-			dpa_bp = dpa_bpid2pool(fd->bpid);
-			if (dpa_bp) {
-				printk(KERN_CRIT "%s::releasing buffer to pool %d\n", 
-						__func__, fd->bpid);
-				memset(&bmb, 0, sizeof(struct bm_buffer));
-				bm_buffer_set64(&bmb, dq->fd.addr);
-				while (bman_release(dpa_bp->pool, &bmb, 1, 0))
-					cpu_relax();
-			}
-		} else {
-			printk(KERN_CRIT "%s::cannot handle sg buffers now\n", __func__);
-		}
-	}
+	ofport_rx_report(__func__, &dq->fd, dq->fqid);
+	if (dq->fd.bpid)
+		dpa_fd_release(NULL, &dq->fd);
 	return qman_cb_dqrr_consume;
 }
 
 static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq) 
 {
-	const struct qm_fd *fd;
-	struct dpa_bp *dpa_bp;
-	struct bm_buffer bmb;
-	uint8_t *ptr;
-	uint32_t len;
-
-	len = dq->fd.length20;
-	fd = &dq->fd;
-	printk("%s::fqid %x(%d), bpid %d status %08x, len %d(0x%x), format %s\n", __func__,
-			fq->fqid, fq->fqid, fd->bpid, fd->status,len,len,
-			(fd->format == qm_fd_sg) ? "SGlist" : "simple");
-	if(len)	
-	{	
-		ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr));
-		printk("Dispalying parse result:\n");
-		display_buff_data(ptr, 0x70);
-		if (fd->format != qm_fd_sg)
-		{
-			ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr) + dq->fd.offset);
-			printk("Displaying the packet: \n");
-			display_buff_data(ptr, len);
-		}
-		else
-		{
-			printk("have to print data in SG case\n");
-		}
-	}	
-	if (dq->fd.bpid) {
-		if (fd->format != qm_fd_sg) {
-			dpa_bp = dpa_bpid2pool(fd->bpid);
-			if (dpa_bp) {
-				printk(KERN_CRIT "%s::releasing buffer to pool %d\n", 
-						__func__, fd->bpid);
-				memset(&bmb, 0, sizeof(struct bm_buffer));
-				bm_buffer_set64(&bmb, dq->fd.addr);
-				while (bman_release(dpa_bp->pool, &bmb, 1, 0))
-					cpu_relax();
-			}
-		} else {
-			printk(KERN_CRIT "%s::freeing sg buffers now\n", __func__);
-			dpa_fd_release(NULL, fd);
-		}
-	}
+	ofport_rx_report(__func__, &dq->fd, fq->fqid);
+	if (dq->fd.bpid)
+		dpa_fd_release(NULL, &dq->fd);
 	return qman_cb_dqrr_consume;
-
 }
 
 //routine to create all FQs required by distribution in xml file
