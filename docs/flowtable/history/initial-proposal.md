@@ -53,8 +53,8 @@ Useful starting points in this repository are:
 | Responsibility | Existing implementation |
 | --- | --- |
 | CMM event handling and registration | [cmm/src/conntrack.c](../../../cmm/src/conntrack.c) |
-| FCI dispatch and control serialization | [cdx/cdx_cmdhandler.c](../../../cdx/cdx_cmdhandler.c) |
-| Connection pairs, routes, installation, ageing | [cdx/control_ipv4.c](../../../cdx/control_ipv4.c) |
+| FCI dispatch and control serialization | `cdx/cdx_cmdhandler.c` (since removed with the FCI plane; `git log -- cdx/cdx_cmdhandler.c`) |
+| Connection pairs, routes, installation, ageing | `cdx/control_ipv4.c` (since removed with the FCI plane; `git log -- cdx/control_ipv4.c`) |
 | Classifier entries, hardware actions, activity, safe deletion | [cdx/cdx_ehash.c](../../../cdx/cdx_ehash.c) |
 | Initial classifier and physical-port setup | [cdx/dpa_cfg.c](../../../cdx/dpa_cfg.c) |
 | Device and queue information | [cdx/devman.c](../../../cdx/devman.c) |
