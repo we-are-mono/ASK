@@ -70,7 +70,6 @@ void cdx_reset_offline_ports(void)
 	memset(offline_port_info, 0, sizeof(offline_port_info));
 }
 
-extern int FM_PORT_SetOhPortOfne(uint32_t fmidx, uint32_t portidx, uint32_t nia_val);
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq);
 
@@ -471,19 +470,6 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 	} 		
 	offline_port_info[iface_info->fman_idx][iface_info->port_idx].flags |=
 		(OF_FQID_VALID | PORT_VALID);
-	return 0;
-}
-
-int ohport_set_ofne(uint32_t handle, uint32_t nia_val)
-{
-	uint32_t fm_idx;
-	uint32_t port_idx;
-	uint32_t portid;
-
-	if (get_ofport_fman_and_portindex(0, handle, &fm_idx, &port_idx, &portid))
-		return -1;
-	if (FM_PORT_SetOhPortOfne(fm_idx, port_idx, nia_val))
-		return -1;
 	return 0;
 }
 

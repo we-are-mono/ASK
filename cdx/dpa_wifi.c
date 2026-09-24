@@ -1150,13 +1150,7 @@ static int vwd_init_ohport(struct dpaa_vwd_priv_s *priv)
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO("%s: allocated oh port %d\n", __func__, priv->oh_port_handle);
 #endif
-
-
-	/* Send exceptions to the parser, without the SEC error check. */
-	handle = ohport_set_ofne(priv->oh_port_handle, 0x440000);
-	if (handle < 0)
-		release_offline_port(FMAN_IDX, priv->oh_port_handle);
-	return handle;
+	return 0;
 }
 
 static int vwd_init_stats(struct dpaa_vwd_priv_s *priv)
