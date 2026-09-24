@@ -9,16 +9,12 @@ struct cdx_wifi_vap;
 
 /* A VAP is a netdev the classifier may enqueue finished frames to.
  *
- * The legacy control plane spells this as FPP_CMD_WIFI_VAP_ENTRY, sent by CMM
- * once it has read an interface list out of a static UCI file, with the VAP's
- * id, name and hardware address all chosen by that userspace and carried in
- * the command. Nothing here has that constraint: a VAP registering is a netdev
- * event, and its name, index and address come off the netdev. So the command
- * does not reappear as a function -- what the caller supplies is the device,
- * and everything the hardware needs is read from it.
+ * A VAP registering is a netdev event, and its name, index and address come
+ * off the netdev: what the caller supplies is the device, and everything the
+ * hardware needs is read from it.
  *
- * Registration is three coupled things that the legacy owner also did
- * together, and doing fewer leaves hardware that half-works:
+ * Registration is three coupled things, and doing fewer leaves hardware that
+ * half-works:
  *
  *   - the logical interface, so the encoder can resolve an egress by itf id;
  *   - the devman record carrying the VAP id, so the encoder's WLAN arm can
@@ -60,8 +56,7 @@ bool cdx_wifi_vap_supported(struct net_device *dev);
  *
  * The VAP id is allocated here rather than supplied. A caller has no way to
  * know which ids are free -- the VWD slot table and the physical-port range
- * are both indexed by them -- and CMM only got to choose because it was the
- * only client.
+ * are both indexed by them.
  *
  * The device is **borrowed**, not pinned, and the distinction is the whole of
  * this interface's teardown contract. VWD stores the same pointer the same
@@ -112,15 +107,5 @@ void cdx_wifi_vap_del(struct cdx_wifi_vap **vap);
  * reusable by a later VAP once this one is deleted.
  */
 u16 cdx_wifi_vap_id(const struct cdx_wifi_vap *vap);
-
-struct nf_hook_ops;
-
-/* Whether a netfilter hook is one of VWD's own: the IPv4, IPv6 and bridge
- * PRE_ROUTING hooks that hand a frame bound for a VAP to its fast path, and
- * are registered while any VAP is open. They decide no policy, so a caller
- * asking whether some filter could see a frame -- the multicast learners do,
- * before carrying a stream past every hook -- does not count them.
- */
-bool cdx_wifi_owns_hook(const struct nf_hook_ops *ops);
 
 #endif

@@ -23,8 +23,6 @@
 #define VWD_TXQ_CNT	16
 #define VWD_RXQ_CNT	3
 
-#define VWD_MINOR               0
-#define VWD_MINOR_COUNT         1
 #define VWD_DRV_NAME            "vwd"
 #define VWD_DEV_COUNT           1
 #define	WIFI_TOE_PE_ID	5
@@ -58,8 +56,6 @@ struct vap_desc_s {
 	char								ifname[IFNAMSIZ];
 	unsigned char  				macaddr[ETH_ALEN];
 	unsigned short 				vapid;
-	unsigned short  			direct_rx_path;          /* Direct path support from offload device=>VWD */
-	unsigned short				no_l2_itf;
 	uint32_t						channel;
 	struct dpa_fq				*wlan_fq_to_fman;
 	struct dpa_fq				*wlan_fq_from_fman[CDX_VWD_FWD_FQ_MAX];
@@ -69,21 +65,9 @@ struct vap_desc_s {
 
 struct vap_stats_s {
 	u32                                pkts_local_tx_dpaa;
-	u32                                pkts_transmitted;
 	u32                                pkts_slow_forwarded;
-	u32                                pkts_tx_dropped;
 	u32                                pkts_rx_fast_forwarded;
-	u32                                pkts_tx_sg;
-	u32                                pkts_tx_cloned;
-	u32                                pkts_tx_no_head;
-	u32                                pkts_tx_non_linear;
-	u32                                pkts_tx_realign;
-	u32                                pkts_tx_copied;
-	u32                                pkts_tx_route;
-	u32                                pkts_tx_bridge;
-	u32                                pkts_direct_rx;
 	u32                                pkts_rx_ipsec;
-	u32                                pkts_oh_buf_threshold_drop;
 	u32                                pkts_slow_path_drop;
 };
 
@@ -91,19 +75,15 @@ struct vap_stats_s {
 
 #define         ADD             0
 #define         REMOVE          1
-#define         UPDATE          2
-#define         RESET           3
 #define         CONFIGURE       4
-/* Returns one configured-but-closed slot to the free pool. Only an owner that
- * allocates vap ids needs it; see the RELEASE arm of dpaa_vwd_handle_vap(). */
+/* Returns one configured-but-closed slot to the free pool; see the RELEASE arm
+ * of dpaa_vwd_handle_vap(). */
 #define         RELEASE         5
 
 struct vap_cmd_s {
 	int32_t	action;
 	int32_t	ifindex;
 	int16_t vapid;
-	int16_t direct_rx_path;
-	unsigned short	no_l2_itf;
 	unsigned char 	ifname[IFNAMSIZ];
 	unsigned char 	macaddr[ETH_ALEN];
 };
@@ -112,7 +92,6 @@ struct vap_cmd_s {
 struct dpaa_vwd_priv_s {
 
 	unsigned char 				name[IFNAMSIZ];
-	int 					vwd_major;
 	struct class 				*vwd_class;
 	struct device 				*vwd_device;
 	struct dpa_priv_s			*eth_priv;
@@ -122,10 +101,8 @@ struct dpaa_vwd_priv_s {
 	struct dpa_fq				*wlan_exception_fq;
 	uint32_t						expt_fq_count; /* Number of FQs created to HOST */
 	struct vap_desc_s 	vaps[MAX_WIFI_VAPS];
-	int								vap_count;
 	spinlock_t 				vaplock;
 	spinlock_t 				txlock;
-	int 					fast_path_enable;
 	struct vwd_global_stats_s  __percpu         	*vwd_global_stats;
 };
 
@@ -147,14 +124,11 @@ int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash);
 int dpaa_get_wifi_dev(uint16_t vap_id, void** netdev);
 int dpaa_get_wifi_ohport_handle( uint32_t* oh_handle);
 void drain_tx_bp_pool(struct dpa_bp *bp);
-int vwd_is_no_l2_itf_device(struct net_device* dev);
 
 /* function called after fq-id creation ,
 to avoid multiple declarations , declaration added here
 other header files are added in many files where the struct qman_fq 
 definition is not found */
 void cdx_remove_fqid_info_in_procfs(uint32_t fqid);
-
-int cdx_wifi_rx_fastpath(struct sk_buff *skb);
 
 #endif /* _DPAA_HOST_GENERIC_H_ */

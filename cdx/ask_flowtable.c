@@ -6186,11 +6186,9 @@ static struct nf_hook_ops ft_mc_hook_ops = {
 };
 
 /* Whether a bridge hook that could decide a frame's fate is registered in
- * init_net at any of `hooks`, a mask of NF_BR_* bits. CDX's own are not: the
- * bridged learner's, which only observes, and VWD's, which hands a frame
- * bound for a VAP to its fast path and is registered whenever an access point
- * is up. Asked of the hook lists themselves, which cost a few loads under
- * RCU: no event says a hook was registered. */
+ * init_net at any of `hooks`, a mask of NF_BR_* bits. The bridged learner's
+ * own is not: it only observes. Asked of the hook lists themselves, which
+ * cost a few loads under RCU: no event says a hook was registered. */
 static bool ft_bridge_hooked(unsigned int hooks)
 {
 #if IS_ENABLED(CONFIG_NETFILTER_FAMILY_BRIDGE)
@@ -6210,8 +6208,7 @@ static bool ft_bridge_hooked(unsigned int hooks)
 			continue;
 		ops = nf_hook_entries_get_hook_ops(e);
 		for (j = 0; j < e->num_hook_entries; j++)
-			if (ops[j] != &ft_mc_hook_ops &&
-			    !cdx_wifi_owns_hook(ops[j])) {
+			if (ops[j] != &ft_mc_hook_ops) {
 				hooked = true;
 				break;
 			}

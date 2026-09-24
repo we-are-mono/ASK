@@ -111,7 +111,6 @@ static struct dpa_priv_s *netdev_priv(struct net_device *dev) { assert(dev == &d
 static bool dpaa_eth_napi_schedule(struct dpa_percpu_priv_s *p, struct qman_portal *q)
 { (void)p; (void)q; return napi_defer; }
 #endif
-static int vwd_is_no_l2_itf_device(struct net_device *dev) { (void)dev; return 0; }
 static struct sk_buff *contig_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd, bool *gro, bool ts)
 { (void)p; (void)fd; (void)gro; (void)ts; assert(unmapped && !converted && pool.count); pool.count--; converted++; packet.data = received_data; return &packet; }
 static struct sk_buff *sg_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd, bool *gro, int *count, bool ts)
@@ -123,8 +122,6 @@ static struct sk_buff *sg_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd
     ++*count; /* The SGT returns to BMan. */
     return skb;
 }
-static void skb_pull(struct sk_buff *skb, int n) { (void)skb; (void)n; }
-static void skb_reset_network_header(struct sk_buff *skb) { (void)skb; }
 static unsigned eth_type_trans(struct sk_buff *skb, struct net_device *dev)
 { unsigned short type; (void)dev; memcpy(&type, skb->data + 12, 2); return type; }
 static long long ktime_get_real_seconds(void) { return 1; }

@@ -327,7 +327,7 @@ soon as that reason goes.
 device above one, is seen as itself. A copy routed into a bridge then passes
 the bridge's own `output` and `postrouting` hooks after the confirmation, so a
 group with such an oif is `refused-filter` while any bridge hook is registered
-there. CDX's own VWD hooks are not counted. A group routed *through* a bridge,
+there. A group routed *through* a bridge,
 with its parent VIF on one, is confirmed the same way, from what ipmr forwards
 once the bridge has handed the stream up, before its copies are published to
 the bridged flow that carries them. That covers a bridge `input` chain on the

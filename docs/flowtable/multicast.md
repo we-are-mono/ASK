@@ -557,10 +557,10 @@ or `br_netfilter` handing bridged traffic to iptables would stop seeing the
 stream the moment it went into hardware: a drop rule would stop dropping it,
 and a counter would stop counting it. So while any bridge hook is registered
 in the initial namespace at `prerouting`, `forward` or `postrouting`, no
-bridged flow is carried, and installed ones come out. CDX's own hooks do not
-count: the learner's, which only observes, and VWD's, which hands frames bound
-for a Wi-Fi VAP to its fast path and is registered whenever an access point is
-up. Hooks are per namespace, not per bridge, so this applies to every bridge.
+bridged flow is carried, and installed ones come out. The learner's own hook
+does not count: it only observes. (VWD's Wi-Fi fast-path hook was exempted the
+same way until it was removed from CDX.) Hooks are per namespace, not per
+bridge, so this applies to every bridge.
 Nothing announces a registered hook, so the worker checks the hook lists at
 every pass, and the refresh runs a pass every five seconds while any flow
 exists. `/proc` says `refused-filter`, and the kernel log says so once each

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* VAP registration for the flowtable ownership mode.
+/* VAP registration for the flowtable adapter.
  *
- * The legacy owner reaches the same three tables through control_wifi.c, from
- * an FCI command carrying a VAP id, an interface name and a hardware address
- * that CMM read out of a static configuration file. This is the same work
- * driven by a netdev instead, which is why the id is allocated here rather
- * than received and why every field comes off the device.
+ * Driven by a netdev, which is why the id is allocated here rather than
+ * received and why every field comes off the device.
  */
 
 #include <linux/etherdevice.h>
@@ -110,9 +107,7 @@ bool cdx_wifi_vap_supported(struct net_device *dev)
 	/* The classifier finishes a frame by writing an ethernet header and
 	 * enqueueing it, and vap_rx_fwd_pkt() hands the result to the device's
 	 * ordinary transmit. A device that does not present that header has
-	 * nothing for either half to write -- which is also what VWD's
-	 * no_l2_itf flag describes, and why this ownership mode never sets it:
-	 * the devices it would describe are refused here first. */
+	 * nothing for either half to write, so it is refused here. */
 	if (dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN)
 		return false;
 	/* VWD owns the offline port a VAP's frames are classified against and
@@ -158,8 +153,8 @@ int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **result)
 	port = phy_port_get(PORT_WIFI_IDX + vapid);
 	ether_addr_copy(mac, dev->dev_addr);
 
-	/* The order is the FCI command's, and it is the order the failure
-	 * handling below unwinds: the logical interface first because
+	/* The order is the one the failure handling below unwinds: the
+	 * logical interface first because
 	 * dpa_add_wlan_if() records its index, and the VWD slot last because
 	 * it is the only step that publishes a pointer the datapath can
 	 * reach. Nothing is visible to a classifier until the ADD returns. */
@@ -184,16 +179,6 @@ int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **result)
 	cmd.ifindex = dev->ifindex;
 	strscpy((char *)cmd.ifname, dev->name, sizeof(cmd.ifname));
 	ether_addr_copy(cmd.macaddr, mac);
-	/* The vendor fast path: a driver calling cdx_wifi_rx_fastpath()
-	 * directly instead of letting the frame reach the netfilter hook. NXP
-	 * implemented it for one driver family and ships it disabled for every
-	 * other, and nothing in this tree calls that entry point at all, so
-	 * zero is the only truthful value. */
-	cmd.direct_rx_path = 0;
-	/* Always zero: cdx_wifi_vap_supported() admits only devices that
-	 * present an ethernet header, so the case this flag describes cannot
-	 * reach here. */
-	cmd.no_l2_itf = 0;
 
 	cmd.action = CONFIGURE;
 	if (dpaa_vwd_vap_cmd(&cmd)) {

@@ -36,10 +36,12 @@ datapath rather than the line count:
   `dev_queue_xmit()` on the VAP's netdev. **The Wi-Fi driver is unmodified
   and unaware** — it receives an ordinary transmit, exactly as it would from
   the bridge.
-- *Wi-Fi to wire.* Two mechanisms exist. `cdx_wifi_rx_fastpath()` is exported
-  for a driver to call directly, and *nothing in any tree calls it*; VWD also
-  registers a `NF_INET_PRE_ROUTING` hook at `NF_IP_PRI_FIRST` which needs
-  nothing from the driver at all.
+- *Wi-Fi to wire.* Two mechanisms existed. `cdx_wifi_rx_fastpath()` was
+  exported for a driver to call directly, and *nothing in any tree called it*;
+  VWD also registered a `NF_INET_PRE_ROUTING` hook at `NF_IP_PRI_FIRST`, behind
+  the `vwd_fast_path_enable` sysfs knob, which needed nothing from the driver
+  at all. Only CMM's configuration ever enabled either, and both have since
+  been removed from CDX.
 
 NXP's own configuration says which is which. `wifi_fastforward_conf_file` in
 the reference tree carries a per-interface `direct_path_rx` flag and the
@@ -453,8 +455,8 @@ LS1012x/LS104x/LS102x, Rev. E, 10.24) says so outright. Section 10.24.2.3
 requires that "the WLAN driver needs to be modified to call
 `comcerto_wifi_rx_fastpath()` instead of `netif_rx()`/`netif_receive_skb()`",
 and records the path as enabled by default only for `ath0/ath1/ath2`. That is
-our `cdx_wifi_rx_fastpath()`, which has no caller in any tree because `moal`
-was never modified; their own `wifi_fastforward_conf_file` sets
+our `cdx_wifi_rx_fastpath()` (since removed), which had no caller in any tree
+because `moal` was never modified; their own `wifi_fastforward_conf_file` sets
 `direct_rx_path = 0` for every non-QCA driver. The stated purpose is reducing
 an NCNB cache penalty, which is a PPFE memory-architecture cost that DPAA does
 not have -- so on this board even the motivation does not transfer.
@@ -487,8 +489,11 @@ packet into the offline port and taking every one straight back
 (`pkts_tx_route` and `pkts_slow_forwarded` both 237240), for a global vaplock
 and two DMAs each.
 
-The mechanism therefore stays in the tree, off, and reachable if a future
-board changes the arithmetic.
+The mechanism therefore stayed in the tree, off, and reachable if a future
+board changed the arithmetic -- until CMM's control plane was removed from CDX,
+when it went with it (the hook, `vwd_fast_path_enable`, `cdx_wifi_rx_fastpath()`
+and the `no_l2_itf` VAP flag). Git history has it if the arithmetic ever does
+change.
 
 ## Tests
 
@@ -528,7 +533,8 @@ lifecycle, compiled from the adapter against stubs.
 
 ## Open questions
 
-- ~~**What `no_l2_itf` means.**~~ Settled from the code: `dpa_wifi.c` says it
+- ~~**What `no_l2_itf` means.**~~ Settled from the code, and since removed
+  with CMM's control plane: `dpa_wifi.c` said it
   above `vwd_is_no_l2_itf_device()` — *"will return 1 if the device is
   cellular"* — so it describes an interface with no L2 header at all. Zero for
   `moal`, and zero by construction rather than by choice: admission only

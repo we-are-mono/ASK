@@ -311,8 +311,6 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	struct xfrm_state *x;
 	bool use_gro;
 	int pool_balance = 0;
-	unsigned short protocol;
-	int no_l2_itf_dev;
 	gro_result_t gro_result;
 	const struct qman_portal_config *pc;
 	struct dpa_napi_portal *np;
@@ -360,7 +358,6 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	}
 #endif /* CONFIG_FSL_ASK_QMAN_PORTAL_NAPI */
 
-	no_l2_itf_dev = vwd_is_no_l2_itf_device(net_dev);
 	/* sg_fd_to_skb accounts each data buffer and the recycled SGT in
 	 * this packet-local balance. It must never touch the Ethernet count. */
 	dpa_bp = dpa_bpid2pool(dq->fd.bpid);
@@ -400,24 +397,9 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		ptr[12]= 0x08;
 		ptr[13] = 0x00;
 	}
-	protocol = *((unsigned short *)(ptr + 12));
 
 	skb->dev = net_dev;
-	if (no_l2_itf_dev)
-	{
-#ifndef UNIT_TEST
-		skb_pull(skb, ETH_HLEN);
-		skb_reset_network_header(skb);
-		skb->mac_len = 0;
-		skb->protocol = protocol;
-#else
-		skb->protocol = eth_type_trans(skb, net_dev);
-#endif
-	}
-	else
-	{
-		skb->protocol = eth_type_trans(skb, net_dev);
-	}
+	skb->protocol = eth_type_trans(skb, net_dev);
 
 	/* SEC has decrypted the packet, but has not checked the complete
 	 * receiving policy. Initialize the secpath with olen/verified_cnt zero

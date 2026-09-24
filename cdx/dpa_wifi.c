@@ -45,7 +45,6 @@
 //uncomment to allow debug prints
 //#define DPA_WIFI_DEBUG  1
 
-static unsigned int num_tx_sent = 0;
 static DEFINE_PER_CPU(unsigned int, num_tx_done);
 static atomic_t vwd_tx_pending = ATOMIC_INIT(0);
 static struct delayed_work vwd_tx_work;
@@ -84,34 +83,30 @@ static bool vwd_stopping = true;
  *   vwd.vaplock (spinlock_t in dpaa_vwd_priv_s)
  *      - Guards the VAP table (vwd.vap[] and dev_attr_vap[]) and
  *        the associated sysfs attribute bindings. Taken _bh on the
- *        ioctl paths and by the softirq classifiers/rx fastpath, so
+ *        VAP command path and by the softirq dequeue paths, so
  *        NOTHING may sleep under it. Sleeping VAP setup (vwd_vap_up:
  *        GFP_KERNEL allocs, qman FQ creation; device_create_file)
- *        runs outside the lock: the ioctl handler claims the slot
+ *        runs outside the lock: dpaa_vwd_vap_cmd() claims the slot
  *        with VAP_ST_CONFIGURING under the lock, drops it for the
  *        work, and re-takes it to publish VAP_ST_OPEN or roll back.
  *        Datapath consumers key on net_dev->wifi_offload_dev (the
- *        nf-hook classifiers and the lock-free ipsec xmit hook —
- *        release-published only after the FQs are live) or on
- *        VAP_ST_OPEN (the rx fastpath), so they never observe a
- *        half-built VAP.
+ *        lock-free ipsec xmit hook -- release-published only after
+ *        the FQs are live) or on VAP_ST_OPEN (the forwarding dequeue
+ *        path), so they never observe a half-built VAP.
  *   vwd.txlock (spinlock_t)
- *      - Guards the tx-path state used by dpaa_vwd_send_packet and
- *        the netfilter route/bridge hooks. Taken in softirq
- *        context (hook path), so spin_lock() without _bh is OK
- *        because callers are already under softirq or sufficiently
- *        serialized. Producers on the ioctl path disable BH as
- *        needed.
+ *      - Serializes draining the tx-done buffer pool, from the
+ *        reclaim work and from exit, against the vwd_stopping
+ *        transition.
  *   vwd (file-scope struct)
  *      - Initialized once in dpaa_vwd_init(), torn down in
  *        dpaa_vwd_exit(). VWD holds the Ethernet netdev reference
- *        returned by get_eth_priv() until callbacks have drained,
- *        then releases it during initialization failure or exit.
+ *        returned by dpa_first_eth_priv() until callbacks have
+ *        drained, then releases it during initialization failure or
+ *        exit.
  *
  * Contexts:
- *   dpaa_vwd_open/close/ioctl               - process.
- *   dpaa_vwd_nf_{route,bridge}_hook_fn      - softirq (netfilter).
- *   dpaa_vwd_send_packet                    - softirq.
+ *   dpaa_vwd_vap_cmd                        - process, under RTNL.
+ *   dequeue callbacks                       - softirq.
  *   dpaa_vwd_{init,exit,up,down}           - module init/exit.
  */
 
@@ -121,157 +116,31 @@ extern struct dpa_bp *dpa_bpid2pool(int bpid);
 extern struct dpa_priv_s* get_eth_priv(unsigned char* name);
 extern struct dpa_priv_s *dpa_first_eth_priv(void);
 
-static int dpaa_vwd_open(struct inode *inode, struct file *file);
-static long dpaa_vwd_ioctl(struct file * file, unsigned int cmd, unsigned long arg);
-
-// nf_hookfn modified in netfilter.h //const struct nf_hook_ops *ops,
-static unsigned int dpaa_vwd_nf_route_hook_fn( void *ops,struct sk_buff *skb,const struct nf_hook_state *state);
-static unsigned int dpaa_vwd_nf_bridge_hook_fn( void *ops,struct sk_buff *skb,const struct nf_hook_state *state);
-
-static int dpaa_vwd_send_packet(struct dpaa_vwd_priv_s *priv, void *vap_handle, struct sk_buff *skb);
-/* Defined with the hook registration it drives, below, rather than here: the
- * callers are the two places vap_count changes outside init and exit. */
-static void vwd_hooks_sync(struct dpaa_vwd_priv_s *priv);
 static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *attr, char *buf);
-static ssize_t vwd_show_fast_path_enable(struct device *dev, struct device_attribute *attr, char *buf);
-static ssize_t vwd_set_fast_path_enable(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
-static ssize_t vwd_show_oh_buff_limit(struct device *dev, struct device_attribute *attr, char *buf);
-static ssize_t vwd_set_oh_buff_limit(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 static DEVICE_ATTR(vwd_debug_stats, 0444, vwd_show_dump_stats, NULL);
-static DEVICE_ATTR(vwd_fast_path_enable, 0644, vwd_show_fast_path_enable, vwd_set_fast_path_enable);
 static struct device_attribute dev_attr_vap[MAX_WIFI_VAPS];
-static DEVICE_ATTR(vwd_oh_buff_limit, 0644, vwd_show_oh_buff_limit, vwd_set_oh_buff_limit);
 static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq, const struct qm_dqrr_entry *dq);
 static void vwd_release_pcd_fqs(struct dpaa_vwd_priv_s *priv);
 void drain_bp_tx_done_bpool(struct dpa_bp *bp);
 
-static int (*vwd_rx_hdlr)(struct sk_buff *);
-
-static unsigned int oh_buff_limit = 1024;
-
-static int wifi_rx_dummy_hdlr(struct sk_buff *skb)
-{
-	return -1;
-}
-
-static int wifi_rx_fastpath_register(int (*hdlr)(struct sk_buff *skb))
-{
-	pr_info("%s:%d VWD Tx function registered\n", __func__, __LINE__ );
-	WRITE_ONCE(vwd_rx_hdlr, hdlr);
-
-	return 0;
-}
-
-static void wifi_rx_fastpath_unregister(void)
-{
-	pr_info("%s:%d VWD Tx function unregistered\n", __func__, __LINE__ );
-	WRITE_ONCE(vwd_rx_hdlr, wifi_rx_dummy_hdlr);
-
-	return;
-}
-
-int cdx_wifi_rx_fastpath(struct sk_buff *skb)
-{
-	int (*handler)(struct sk_buff *);
-	int ret = -1;
-
-	rcu_read_lock();
-	handler = READ_ONCE(vwd_rx_hdlr);
-	if (handler)
-		ret = handler(skb);
-	rcu_read_unlock();
-	return ret;
-}
-EXPORT_SYMBOL(cdx_wifi_rx_fastpath);
-
-static const struct file_operations vwd_fops = {
-	.owner                  = THIS_MODULE,
-	.open                   = dpaa_vwd_open,
-	.unlocked_ioctl         = dpaa_vwd_ioctl,
-};
-
-/* IPV4 route hook , recieve the packet and forward to VWD driver*/
-static struct nf_hook_ops vwd_hook = {
-	.hook = dpaa_vwd_nf_route_hook_fn,
-	.pf = PF_INET,
-	.hooknum = NF_INET_PRE_ROUTING,
-	.priority = NF_IP_PRI_FIRST,
-};
-
-/* IPV6 route hook , recieve the packet and forward to VWD driver*/
-static struct nf_hook_ops vwd_hook_ipv6 = {
-	.hook = dpaa_vwd_nf_route_hook_fn,
-	.pf = PF_INET6,
-	.hooknum = NF_INET_PRE_ROUTING,
-	.priority = NF_IP6_PRI_FIRST,
-};
-
-/* Bridge hook , recieve the packet and forward to VWD driver*/
-static struct nf_hook_ops vwd_hook_bridge = {
-	.hook = dpaa_vwd_nf_bridge_hook_fn,
-	.pf = PF_BRIDGE,
-	.hooknum = NF_BR_PRE_ROUTING,
-	.priority = NF_BR_PRI_FIRST,
-};
-
-/* See cdx_wifi_backend.h. Compared by identity, which a registered hook's
- * orig_ops keeps. */
-bool cdx_wifi_owns_hook(const struct nf_hook_ops *ops)
-{
-	return ops == &vwd_hook || ops == &vwd_hook_ipv6 ||
-	       ops == &vwd_hook_bridge;
-}
-EXPORT_SYMBOL_NS_GPL(cdx_wifi_owns_hook, ASK_CDX_FLOWTABLE);
 /* In case VWD OFFLOAD , headers can be added in ucode, and the length of the 
 	 original buffer can be increased. And this increased length is written from 
 	 fixed offset (192) for packets coming from OH port causing headers to grow at tail.
 	 So tailroom is introduced to allow the tail to grow upto 64 bytes */
 #define SKB_ASK_TAILROOM 	64
 
-bool a050385_check_skb(struct sk_buff *skb, struct dpa_priv_s *priv);
-struct sk_buff *a050385_realign_skb(struct sk_buff *skb, struct dpa_priv_s *priv);
-
-/* This function will return 1 if the device is cellular (i.e no_l2_itf) */
-int vwd_is_no_l2_itf_device(struct net_device* dev)
-{
-	struct vap_desc_s *vap;
-	if (dev->wifi_offload_dev)
-	{
-		vap = (struct vap_desc_s *)dev->wifi_offload_dev;
-		if (vap->no_l2_itf)
-			return 1;
-	}
-	return 0;
-}
-
 /* This function transmits local ESP packets to SEC for processing */
 static int vwd_xmit_local_packet(struct sk_buff *skb)
 {
 	struct dpaa_vwd_priv_s *priv = &vwd;
 	struct vap_desc_s *vap;
-	unsigned char hdroom_realloced = 0;
-	int ret;
 
 	INCR_PER_CPU_STAT(priv->vwd_global_stats, pkts_total_local_tx);
 	if (!skb->dev->wifi_offload_dev)
 		goto send_pkt;
 
 	vap = (struct vap_desc_s *)skb->dev->wifi_offload_dev;
-
-	if (vap->no_l2_itf)
-	{
-		ret = dpa_add_dummy_eth_hdr(&skb, 0, &hdroom_realloced); 
-
-		if (ret < 0)
-			goto send_pkt;
-
-		skb_push(skb, ETH_HLEN);
-
-		if (hdroom_realloced) {
-			INCR_PER_CPU_STAT(vap->vap_stats, pkts_tx_no_head);
-		}
-	}
 
 	/* Only what SEC was given: a frame the submit could not hand over is
 	 * already freed and counted as the device's transmit drop. */
@@ -307,37 +176,15 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 	for_each_possible_cpu(i) {
 		per_cpu_stats = per_cpu_ptr(priv->vaps[ii].vap_stats, i);
 		total_stats.pkts_local_tx_dpaa += per_cpu_stats->pkts_local_tx_dpaa;
-		total_stats.pkts_transmitted += per_cpu_stats->pkts_transmitted;
 		total_stats.pkts_slow_forwarded += per_cpu_stats->pkts_slow_forwarded;
-		total_stats.pkts_tx_dropped += per_cpu_stats->pkts_tx_dropped;
 		total_stats.pkts_rx_fast_forwarded += per_cpu_stats->pkts_rx_fast_forwarded;
-		total_stats.pkts_tx_cloned += per_cpu_stats->pkts_tx_cloned;
-		total_stats.pkts_tx_no_head += per_cpu_stats->pkts_tx_no_head;
-		total_stats.pkts_tx_non_linear += per_cpu_stats->pkts_tx_non_linear;
-		total_stats.pkts_tx_realign += per_cpu_stats->pkts_tx_realign;
-		total_stats.pkts_tx_sg += per_cpu_stats->pkts_tx_sg;
-		total_stats.pkts_tx_copied += per_cpu_stats->pkts_tx_copied;
-		total_stats.pkts_tx_route += per_cpu_stats->pkts_tx_route;
-		total_stats.pkts_tx_bridge += per_cpu_stats->pkts_tx_bridge;
-		total_stats.pkts_direct_rx += per_cpu_stats->pkts_direct_rx;
 		total_stats.pkts_rx_ipsec += per_cpu_stats->pkts_rx_ipsec;
-		total_stats.pkts_oh_buf_threshold_drop += per_cpu_stats->pkts_oh_buf_threshold_drop;
 		total_stats.pkts_slow_path_drop += per_cpu_stats->pkts_slow_path_drop;
 	}
 
 	len += sprintf(buf, "VAP (id : %d  name : %s)\n",ii,priv->vaps[ii].ifname);
 	len += sprintf(buf + len, "\nTo DPAA\n");
-	len += sprintf(buf + len, "  WiFi Rx pkts from route hook : %u\n", total_stats.pkts_tx_route);
-	len += sprintf(buf + len, "  WiFi Rx pkts from bridge hook : %u\n", total_stats.pkts_tx_bridge);
-	len += sprintf(buf + len, "  WiFi Rx pkts from direct rx : %u\n", total_stats.pkts_direct_rx);
-	len += sprintf(buf + len, "  WiFi Rx pkts submitted to DPAA : %u\n", total_stats.pkts_transmitted);
 	len += sprintf(buf + len, "  WiFi local Tx pkts submitted to DPAA : %u\n", total_stats.pkts_local_tx_dpaa);
-	len += sprintf(buf + len, "  Drops while sending it to DPAA : %u\n", total_stats.pkts_tx_dropped);
-	len += sprintf(buf + len, "  WiFI OH buf threshold Drops : %u\n", total_stats.pkts_oh_buf_threshold_drop);
-	len += sprintf(buf + len, "  No head room|non linear|cloned|realign - %x : %x : %x : %x\n", total_stats.pkts_tx_no_head, total_stats.pkts_tx_non_linear, total_stats.pkts_tx_cloned, total_stats.pkts_tx_realign);
-
-	len += sprintf(buf + len, "  Paged SG submissions : %u\n", total_stats.pkts_tx_sg);
-	len += sprintf(buf + len, "  Copies for private/unsupported layouts : %u\n", total_stats.pkts_tx_copied);
 
 	len += sprintf(buf + len, "From DPAA\n");
 	len += sprintf(buf + len, "  WiFi Rx pkts : %u \n", total_stats.pkts_slow_forwarded);
@@ -371,9 +218,8 @@ static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *
 	}
 
 	len += sprintf(buf + len, "\nStatus\n");
-	len += sprintf(buf + len, "  Fast path - %s\n", priv->fast_path_enable ? "Enable" : "Disable");
 	percpu_var_sum(num_tx_done, total_num_tx_done);
-	len += sprintf(buf + len, "  tx_sent:done  %u:%u\n", num_tx_sent, total_num_tx_done);
+	len += sprintf(buf + len, "  tx done  %u\n", total_num_tx_done);
 	len += sprintf(buf + len, "  Hardware-owned frames : %d\n",
 			atomic_read(&vwd_tx_pending));
 
@@ -389,67 +235,6 @@ static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *
 }
 
 
-/** vwd_show_fast_path_enable
- *
- */
-static ssize_t vwd_show_fast_path_enable(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct dpaa_vwd_priv_s *priv = &vwd;
-	int idx;
-
-	idx = sprintf(buf, "\n%d\n", priv->fast_path_enable);
-	return idx;
-}
-
-/** vwd_set_fast_path_enable
- *
- */
-static ssize_t vwd_set_fast_path_enable(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct dpaa_vwd_priv_s  *priv = &vwd;
-	unsigned int fast_path = 0;
-
-	sscanf(buf, "%d", &fast_path);
-	if (fast_path && !priv->fast_path_enable)
-	{
-		DPAWIFI_INFO("%s: Wifi fast path enabled \n", __func__);
-		priv->fast_path_enable = 1;
-	}
-	else if (!fast_path && priv->fast_path_enable)
-	{
-		DPAWIFI_INFO("%s: Wifi fast path disabled \n", __func__);
-		priv->fast_path_enable = 0;
-	}
-	return count;
-}
-
-/** vwd_show_oh_buff_limit
- *
- */
-static ssize_t vwd_show_oh_buff_limit(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	int idx;
-
-	idx = sprintf(buf, "\n%d\n", oh_buff_limit);
-	return idx;
-}
-
-/** vwd_set_oh_buff_limit
- *
- */
-static ssize_t vwd_set_oh_buff_limit(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	int buff_limit = 0;
-
-	sscanf(buf, "%d", &buff_limit);
-	if (buff_limit <= 0)
-	{
-		DPAWIFI_INFO("%s: Invalid buff limit value \n", __func__);
-	}
-	oh_buff_limit = buff_limit;
-	return count;
-}
-
 
 /** dpaa_vwd_sysfs_init
  *
@@ -458,24 +243,8 @@ static int dpaa_vwd_sysfs_init( struct dpaa_vwd_priv_s *priv )
 {
 
 	if (device_create_file(priv->vwd_device, &dev_attr_vwd_debug_stats))
-		goto err_dbg_sts;
-
-	if (device_create_file(priv->vwd_device, &dev_attr_vwd_fast_path_enable))
-		goto err_fp_en;
-
-
-	if (device_create_file(priv->vwd_device, &dev_attr_vwd_oh_buff_limit))
-		goto err_oh_buff_limit;
+		return -1;
 	return 0;
-err_oh_buff_limit:
-
-
-	device_remove_file(priv->vwd_device, &dev_attr_vwd_fast_path_enable);
-err_fp_en:
-	device_remove_file(priv->vwd_device, &dev_attr_vwd_debug_stats);
-err_dbg_sts:
-	return -1;
-
 }
 
 /** dpaa_vwd_sysfs_exit
@@ -485,234 +254,9 @@ static void dpaa_vwd_sysfs_exit(void)
 {
 	struct dpaa_vwd_priv_s *priv = &vwd;
 
-
-	device_remove_file(priv->vwd_device, &dev_attr_vwd_oh_buff_limit);
-	device_remove_file(priv->vwd_device, &dev_attr_vwd_fast_path_enable);
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_debug_stats);
 }
 
-/* This function returns 1 if the packet is not supported
-	 in fast path */
-static int vwd_unsupported_eth_packet(struct sk_buff* skb)
-{
-	unsigned char* data_ptr;
-	int length;
-	/* Move to packet network header */
-	data_ptr = skb_mac_header(skb);
-	length = skb->len + (skb->data - data_ptr);
-	/* Broadcasts and MC are handled by stack */
-	if((eth_hdr(skb)->h_dest[0] & 0x1) || ( length <= ETH_HLEN ) )
-	{
-		return 1;
-	}
-	/* Jambo frames are not supported, will be handled by stack */
-	if (length > ETH_FRAME_LEN || skb_is_gso(skb))
-	{
-		DPAWIFI_INFO(KERN_INFO "%s:%d frame len:%d is bigger. Disable LRO/GRO on %s\n", __func__, __LINE__, length, skb->dev->name);
-		return 1;
-	}
-
-	return 0;
-}
-
-/* This function returns 1 if the routed packet is not offloaded and sent to stack
-	 and 0 for all packets sent to fast past , only routed packets are handled here*/
-static int vwd_classify_route_packet( struct dpaa_vwd_priv_s *priv,struct sk_buff **skb_in, int *vapid)
-{
-	int rc = 1;	
-	struct sk_buff *skb = *skb_in;
-	struct vap_desc_s *vap;
-	unsigned char hdroom_realloced = 0;
-
-	spin_lock_bh(&priv->vaplock);
-	/* getting vap structure from netdev pointer */
-	vap = (struct vap_desc_s*)skb->dev->wifi_offload_dev;
-
-	/* when a packet is received on other than wifi fastpath devices,
-	 * vap can be NULL
-	 */
-	/* All bridge packets are handled in bridge hook  and bridge 
-		 device should not have wifi_offloade_dev set*/
-	if (!vap) 
-		goto done;
-
-	if (vap->ifindex != skb->skb_iif)
-		goto done;
-
-	/* packets sent to DPAA and returned from DPAA with no entry 
-		 should be given to host */
-	if (skb->expt_pkt == 1)
-	{
-		skb->expt_pkt = 0;
-		goto done;
-	}
-	*vapid = vap->vapid;
-
-	/* handle packets with NO L2 header */
-	if (vap->no_l2_itf)
-	{
-		spin_unlock_bh(&priv->vaplock);
-		if (dpa_add_dummy_eth_hdr(skb_in, priv->eth_priv->tx_headroom, &hdroom_realloced)  < 0 )
-			return 1;
-
-		skb = *skb_in;
-
-		if (hdroom_realloced) {
-			INCR_PER_CPU_STAT(vap->vap_stats, pkts_tx_no_head);
-		}
-		return 0;
-	}
-
-	if (vwd_unsupported_eth_packet(skb))
-		goto done;
-
-	if (skb->protocol != ntohs(ETH_P_IP) && skb->protocol != ntohs(ETH_P_IPV6))
-		goto done;
-
-	rc = 0; /* Success */
-done:
-	spin_unlock_bh(&priv->vaplock);
-	return rc;
-}
-
-/* This fucntion returns l3_protocol from ethennet packet */
-static void vwd_get_l3_proto(struct sk_buff* skb, unsigned short* l3_proto)
-{
-	unsigned short type = 0;
-	unsigned char* data_ptr;
-	struct ethhdr* hdr;
-
-	data_ptr = skb_mac_header(skb);
-
-	hdr = (struct ethhdr *)data_ptr;
-
-	type = htons(hdr->h_proto);
-	data_ptr += ETH_HLEN;
-
-	if( type == ETH_P_8021Q )
-	{
-		struct vlan_hdr *vhdr = (struct vlan_hdr *)data_ptr;
-		data_ptr += VLAN_HLEN;
-		type = htons(vhdr->h_vlan_encapsulated_proto);
-	}
-	if( type == ETH_P_PPP_SES )
-	{
-		struct pppoe_hdr *phdr = (struct pppoe_hdr *)data_ptr;
-		if (htons(*(u16 *)(phdr+1)) == PPP_IP)
-			type = ETH_P_IP;
-		else if (htons(*(u16 *)(phdr+1)) == PPP_IPV6)
-			type = ETH_P_IPV6;
-	}
-
-	*l3_proto = type;
-}
-
-/* This function processes all bridge packets , and send supported
-	 bridge packets to DPAA for lookup and fast forwarding */
-static int vwd_classify_bridge_packet( struct dpaa_vwd_priv_s *priv,struct sk_buff *skb, int *vapid)
-{
-	int rc = 1;
-	struct vap_desc_s *vap;
-	unsigned short l3_proto;
-	spin_lock_bh(&priv->vaplock);
-	vap = (struct vap_desc_s*)skb->dev->wifi_offload_dev;
-
-	/* when a packet is received on other than wifi fastpath devices,
-	 * vap can be NULL
-	 */
-	if (!vap)
-		goto done;
-
-	if (vap->ifindex != skb->skb_iif)
-		goto done;
-
-	*vapid = vap->vapid;
-	/* packets sent to DPAA and returned from DPAA with no entry 
-		 should be given to host */
-	if (skb->expt_pkt == 1)
-	{
-		skb->expt_pkt = 0;
-		goto done;
-	}
-
-
-	if (vwd_unsupported_eth_packet(skb))
-		goto done;
-
-
-	if (skb->pkt_type == PACKET_HOST)
-	{
-		vwd_get_l3_proto(skb, &l3_proto);
-		if (l3_proto != ETH_P_IP && l3_proto != ETH_P_IPV6)
-			goto done;
-	}
-	/*WiFi management packets received with dst address as bssid*/
-	else if (!memcmp(vap->macaddr, eth_hdr(skb)->h_dest, ETH_ALEN))
-	{
-		goto done;
-	}
-
-	rc = 0;
-done:
-	spin_unlock_bh(&priv->vaplock);
-	return rc;
-
-}
-
-
-static unsigned int dpaa_vwd_nf_bridge_hook_fn( void *ops, //const struct nf_hook_ops *ops,
-		struct sk_buff *skb,
-		const struct nf_hook_state *state)
-{
-	struct dpaa_vwd_priv_s *priv = &vwd;
-	int vapid = -1;
-
-	if (!priv->fast_path_enable)
-		goto done;
-
-	if( !vwd_classify_bridge_packet(priv,skb,&vapid) )
-	{
-#ifdef DPA_WIFI_DEBUG
-		DPAWIFI_INFO("%s: Accepted devname : %s \n", __func__,skb->dev->name);
-#endif
-		INCR_PER_CPU_STAT(priv->vaps[vapid].vap_stats, pkts_tx_bridge);
-		skb_push(skb, ETH_HLEN);
-		spin_lock_bh(&priv->txlock);
-		dpaa_vwd_send_packet( priv, &priv->vaps[vapid], skb);
-		spin_unlock_bh(&priv->txlock);
-		return NF_STOLEN;
-	}
-done:
-	return NF_ACCEPT;
-}
-
-/** vwd_nf_route_hook_fn
- *
- */
-static unsigned int dpaa_vwd_nf_route_hook_fn( void *ops, //const struct nf_hook_ops *ops,
-		struct sk_buff *skb,
-		const struct nf_hook_state *state)
-{
-	struct dpaa_vwd_priv_s *priv = &vwd;
-	int vapid = -1;
-
-	if (!priv->fast_path_enable)
-		goto done;
-	if( !vwd_classify_route_packet(priv, &skb, &vapid) )
-	{
-#ifdef DPA_WIFI_DEBUG
-		DPAWIFI_INFO("%s: Accepted devname : %s \n", __func__,skb->dev->name);
-#endif
-		INCR_PER_CPU_STAT(priv->vaps[vapid].vap_stats, pkts_tx_route);
-		skb_push(skb, ETH_HLEN);
-		spin_lock_bh(&priv->txlock);
-		dpaa_vwd_send_packet( priv, &priv->vaps[vapid], skb);
-		spin_unlock_bh(&priv->txlock);
-		return NF_STOLEN;
-	}
-done:
-	return NF_ACCEPT;
-}
 
 
 struct vwd_dma_mapping {
@@ -781,97 +325,6 @@ static struct vwd_tx_buffer *vwd_unmap_tx_buffer(struct dpa_bp *bp,
 	dma_unmap_single(bp->dev, addr, tx->size, DMA_BIDIRECTIONAL);
 	vwd_unmap_payload(bp, tx);
 	return tx;
-}
-
-static int vwd_skb_to_sg_fd(struct dpaa_vwd_priv_s *priv, struct sk_buff *skb,
-			  struct vap_desc_s *vap, u32 generation, struct qm_fd *fd)
-{
-	struct dpa_bp *bp = priv->txconf_bp;
-	unsigned int offset = priv->eth_priv->tx_headroom;
-	unsigned int size = ALIGN(offset + DPA_SGT_SIZE, SMP_CACHE_BYTES);
-	unsigned int alloc_size = sizeof(struct vwd_tx_buffer) + size;
-	struct vwd_tx_buffer *tx;
-	struct qm_sg_entry *sgt;
-	struct vwd_dma_mapping *map;
-	dma_addr_t addr;
-	unsigned int i;
-	bool page_allocated = false;
-
-	BUILD_BUG_ON(DPA_SGT_SIZE < DPA_SGT_MAX_ENTRIES * sizeof(*sgt));
-	if (WARN_ON_ONCE(offset > DPA_MAX_FD_OFFSET ||
-			 skb_shinfo(skb)->nr_frags >= DPA_SGT_MAX_ENTRIES))
-		return -EINVAL;
-
-#ifdef FM_ERRATUM_A050385
-	page_allocated = fm_has_errata_a050385();
-#endif
-	if (page_allocated) {
-		if (WARN_ON_ONCE(alloc_size > PAGE_SIZE))
-			return -EINVAL;
-		tx = (void *)get_zeroed_page(GFP_ATOMIC);
-	} else {
-		tx = kzalloc(alloc_size, GFP_ATOMIC);
-	}
-	if (!tx)
-		return -ENOMEM;
-	tx->skb = skb;
-	tx->dev = skb->dev;
-	dev_hold(tx->dev);
-	tx->vap = vap;
-	tx->generation = generation;
-	tx->size = size;
-	tx->page_allocated = page_allocated;
-	sgt = (void *)(tx->buffer + offset);
-
-	/* Map the whole writable head, but describe only its packet data.
-	 * The SG address includes headroom; neither the 9-bit FD offset nor
-	 * the 13-bit SG offset has to encode the skb's headroom.
-	 */
-	map = &tx->maps[0];
-	map->size = skb_end_pointer(skb) - skb->head;
-	map->addr = dma_map_single(bp->dev, skb->head, map->size,
-				   DMA_BIDIRECTIONAL);
-	if (dma_mapping_error(bp->dev, map->addr))
-		goto unmap;
-	tx->num_maps++;
-	qm_sg_entry_set64(&sgt[0], map->addr + skb_headroom(skb));
-	qm_sg_entry_set_len(&sgt[0], skb_headlen(skb));
-	qm_sg_entry_set_bpid(&sgt[0], 0xff);
-
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
-		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
-
-		map = &tx->maps[i + 1];
-		map->page = skb_frag_page(frag);
-		map->page_offset = skb_frag_off(frag);
-		map->size = skb_frag_size(frag);
-		map->addr = skb_frag_dma_map(bp->dev, frag, 0, map->size,
-					     DMA_BIDIRECTIONAL);
-		if (dma_mapping_error(bp->dev, map->addr))
-			goto unmap;
-		tx->num_maps++;
-		qm_sg_entry_set64(&sgt[i + 1], map->addr);
-		qm_sg_entry_set_len(&sgt[i + 1], map->size);
-		qm_sg_entry_set_bpid(&sgt[i + 1], 0xff);
-	}
-	qm_sg_entry_set_final(&sgt[tx->num_maps - 1], 1);
-
-	/* FMan also writes parse results into this prefix. */
-	addr = dma_map_single(bp->dev, tx->buffer, tx->size,
-			      DMA_BIDIRECTIONAL);
-	if (dma_mapping_error(bp->dev, addr))
-		goto unmap;
-	fd->format = qm_fd_sg;
-	fd->bpid = bp->bpid;
-	fd->offset = offset;
-	fd->length20 = skb->len;
-	qm_fd_addr_set64(fd, addr);
-	return 0;
-
-unmap:
-	vwd_unmap_payload(bp, tx);
-	vwd_free_tx_buffer(tx);
-	return -ENOMEM;
 }
 
 /* Locate a returned segment in the original DMA mappings before reading it.
@@ -1086,117 +539,6 @@ static struct sk_buff *__hot contig_fd_to_vwd_skb(const struct dpa_priv_s *priv,
 
 }
 
-static int dpaa_vwd_send_packet(struct dpaa_vwd_priv_s *priv, void *vap_handle,
-				struct sk_buff *skb)
-{
-	struct vap_desc_s *vap = vap_handle;
-	struct qm_fd fd;
-	struct sk_buff *nskb;
-	unsigned int total_num_tx_done;
-	u32 generation;
-	bool copy = skb_cloned(skb) || skb_shared(skb) || skb_zcopy(skb) ||
-		    skb_has_shared_frag(skb) || skb_has_frag_list(skb) ||
-		    skb_shinfo(skb)->nr_frags >= DPA_SGT_MAX_ENTRIES ||
-		    skb_headlen(skb) < ETH_HLEN ||
-		    skb->ip_summed == CHECKSUM_PARTIAL;
-	int err, i;
-
-	/* Classification and submission are separate critical sections. */
-	spin_lock(&priv->vaplock);
-	if (vwd_stopping || vap->state != VAP_ST_OPEN ||
-	    (void *)READ_ONCE(skb->dev->wifi_offload_dev) != vap) {
-		spin_unlock(&priv->vaplock);
-		goto drop;
-	}
-	generation = vap->generation;
-	spin_unlock(&priv->vaplock);
-
-	percpu_var_sum(num_tx_done, total_num_tx_done);
-	if (num_tx_sent - total_num_tx_done >= (VAP_TX_CONF_BUF_COUNT >> 4))
-		drain_bp_tx_done_bpool(priv->txconf_bp);
-
-	percpu_var_sum(num_tx_done, total_num_tx_done);
-	if (num_tx_sent - total_num_tx_done > oh_buff_limit) {
-		INCR_PER_CPU_STAT(vap->vap_stats, pkts_oh_buf_threshold_drop);
-		goto free_skb;
-	}
-
-	if (skb->len < ETH_HLEN || skb->len > ETH_FRAME_LEN + SKB_ASK_TAILROOM)
-		goto drop;
-	if (skb_is_nonlinear(skb))
-		INCR_PER_CPU_STAT(vap->vap_stats, pkts_tx_non_linear);
-	if (skb_cloned(skb) || skb_shared(skb))
-		INCR_PER_CPU_STAT(vap->vap_stats, pkts_tx_cloned);
-
-	/* FMan can write packet headers. Keep private, representable page
-	 * fragments in place; copy shared data and layouts beyond its table.
-	 */
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
-		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
-
-		if (!skb_frag_size(frag) || page_count(skb_frag_page(frag)) != 1)
-			copy = true;
-	}
-	if (copy) {
-		nskb = skb_copy_expand(skb, priv->eth_priv->tx_headroom,
-				       SKB_ASK_TAILROOM, GFP_ATOMIC);
-		if (!nskb)
-			goto drop;
-		dev_kfree_skb(skb);
-		skb = nskb;
-		INCR_PER_CPU_STAT(vap->vap_stats, pkts_tx_copied);
-	}
-
-#ifdef FM_ERRATUM_A050385
-	if (unlikely(fm_has_errata_a050385()) &&
-	    a050385_check_skb(skb, priv->eth_priv)) {
-		INCR_PER_CPU_STAT(vap->vap_stats, pkts_tx_realign);
-		nskb = a050385_realign_skb(skb, priv->eth_priv);
-		if (!nskb)
-			goto drop;
-		dev_kfree_skb(skb);
-		skb = nskb;
-	}
-#endif
-
-	if (skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(skb))
-		goto drop;
-
-	clear_fd(&fd);
-	err = vwd_skb_to_sg_fd(priv, skb, vap, generation, &fd);
-	if (err)
-		goto drop;
-
-	if (skb_is_nonlinear(skb))
-		INCR_PER_CPU_STAT(vap->vap_stats, pkts_tx_sg);
-
-	atomic_inc(&vwd_tx_pending);
-	for (i = 0; i < 100000; i++) {
-		err = qman_enqueue(&vap->wlan_fq_to_fman->fq_base, &fd, 0);
-		if (err != -EBUSY)
-			break;
-	}
-	if (err < 0) {
-		struct vwd_tx_buffer *tx;
-
-		tx = vwd_unmap_tx_buffer(priv->txconf_bp, qm_fd_addr(&fd));
-		vwd_free_tx_buffer(tx);
-		atomic_dec(&vwd_tx_pending);
-		goto drop;
-	}
-
-	num_tx_sent++;
-	INCR_PER_CPU_STAT(vap->vap_stats, pkts_transmitted);
-	queue_delayed_work(system_wq, &vwd_tx_work, msecs_to_jiffies(10));
-	return 0;
-
-drop:
-	INCR_PER_CPU_STAT(vap->vap_stats, pkts_tx_dropped);
-free_skb:
-	dev_kfree_skb(skb);
-	return -1;
-}
-
 static int process_rx_exception_pkt(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
 {
@@ -1232,29 +574,13 @@ static int process_rx_exception_pkt(struct qman_portal *portal, struct qman_fq *
 		dev_kfree_skb(skb);
 		goto rel_fd;
 	}
-	if (!vap->no_l2_itf)
-	{
-		skb->protocol = eth_type_trans(skb, dev);
-		skb->expt_pkt = 1;
-		if (netif_receive_skb(skb) == NET_RX_DROP) {
+	skb->protocol = eth_type_trans(skb, dev);
+	skb->expt_pkt = 1;
+	if (netif_receive_skb(skb) == NET_RX_DROP) {
 #ifdef DPA_WIFI_DEBUG
-			DPAWIFI_ERROR("%s::netif_receive_skb:NET_RX_DROP\n", __func__);
+		DPAWIFI_ERROR("%s::netif_receive_skb:NET_RX_DROP\n", __func__);
 #endif
-			INCR_PER_CPU_STAT(vap->vap_stats, pkts_slow_path_drop);
-		}
-	}
-	else
-	{
-		skb_pull(skb, ETH_HLEN);
-		skb_reset_network_header(skb);
-		skb->mac_len = 0;
-		skb->expt_pkt = 1;
-		if (netif_rx(skb) == NET_RX_DROP) {
-#ifdef DPA_WIFI_DEBUG
-			DPAWIFI_ERROR("%s::netif_receive_skb:NET_RX_DROP\n", __func__);
-#endif
-			INCR_PER_CPU_STAT(vap->vap_stats, pkts_slow_path_drop);
-		}
+		INCR_PER_CPU_STAT(vap->vap_stats, pkts_slow_path_drop);
 	}
 	INCR_PER_CPU_STAT(vap->vap_stats, pkts_slow_forwarded);
 rel_fd:
@@ -1452,7 +778,6 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 	struct dpa_bp *dpa_bp, *ipsec_bp, *frag_bp;
 	struct vap_desc_s *vap; 
 	struct vwd_tx_buffer *tx = NULL;
-	bool no_l2_itf;
 	int *count_ptr;
 
 	dpa_bp = dpa_bpid2pool(dq->fd.bpid);
@@ -1476,8 +801,6 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 		if (!vap || smp_load_acquire(&vap->state) != VAP_ST_OPEN ||
 		    !netif_running(net_dev))
 			net_dev = NULL;
-		else
-			no_l2_itf = vap->no_l2_itf;
 	}
 	/*If vap interface is down then fq net_dev is NULL, in this case release the fd.*/
 	if (!net_dev)
@@ -1554,24 +877,7 @@ process_skb:
 		INCR_PER_CPU_STAT(vap->vap_stats, pkts_rx_ipsec);
 	}
 
-	/* check if vap is corresponding to no l2 hdr */
-	if (!no_l2_itf)
-		vwd_send_to_vap(skb);
-	else
-	{
-		/* Set the protocol before giving it to stack */
-		/* skip the ethernet header in skb, then transmit */
-		struct ethhdr *hdr;
-
-		hdr = (struct ethhdr *)skb->data;
-		skb->protocol = hdr->h_proto;
-
-		skb_pull(skb, ETH_HLEN);
-		skb_reset_network_header(skb);
-		skb->mac_len = 0;
-		skb->priority = 0;
-		original_dev_queue_xmit(skb);
-	}
+	vwd_send_to_vap(skb);
 done:
 	if (tx)
 		vwd_complete_tx_buffer(tx);
@@ -1978,7 +1284,7 @@ int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash)
 {
 	struct dpa_fq *dpa_fq;
 
-	/* A slot's queues exist only from its first open. The legacy owner
+	/* A slot's queues exist only from its first open. cdx_wifi_vap_add()
 	 * creates the devman record before it opens the slot, so the encoder
 	 * can ask about a slot that has none; answer failure, not a NULL. */
 	if (vap_id >= MAX_WIFI_VAPS)
@@ -2151,8 +1457,6 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 
 	vap->ifindex = cmd->ifindex;
 
-	vap->no_l2_itf = cmd->no_l2_itf;
-	vap->direct_rx_path = cmd->direct_rx_path;
 	memcpy(vap->macaddr, cmd->macaddr, ETH_ALEN);
 	vap->wifi_dev = wifi_dev;
 	vap->vwd = priv;
@@ -2189,9 +1493,8 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 
 	dev_put(wifi_dev);
 #ifdef DPA_WIFI_DEBUG
-	DPAWIFI_INFO("%s: UP: name:%s, vapid:%d, direct_rx_path : %s, ifindex:%d, mac:%x:%x:%x:%x:%x:%x\n",
-			__func__, vap->ifname, vap->vapid,
-			vap->direct_rx_path ? "ON":"OFF", vap->ifindex,
+	DPAWIFI_INFO("%s: UP: name:%s, vapid:%d, ifindex:%d, mac:%x:%x:%x:%x:%x:%x\n",
+			__func__, vap->ifname, vap->vapid, vap->ifindex,
 			vap->macaddr[0], vap->macaddr[1],
 			vap->macaddr[2], vap->macaddr[3],
 			vap->macaddr[4], vap->macaddr[5] );
@@ -2204,9 +1507,8 @@ static int vwd_vap_down(struct dpaa_vwd_priv_s *priv , struct vap_desc_s *vap)
 {
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO("%s:%d\n", __func__, __LINE__);
-	DPAWIFI_INFO("%s:DOWN: name:%s, vapid:%d, direct_rx_path : %s, ifindex:%d, mac:%x:%x:%x:%x:%x:%x\n",
-			__func__, vap->ifname, vap->vapid,
-			vap->direct_rx_path ? "ON":"OFF", vap->ifindex,
+	DPAWIFI_INFO("%s:DOWN: name:%s, vapid:%d, ifindex:%d, mac:%x:%x:%x:%x:%x:%x\n",
+			__func__, vap->ifname, vap->vapid, vap->ifindex,
 			vap->macaddr[0], vap->macaddr[1],
 			vap->macaddr[2], vap->macaddr[3],
 			vap->macaddr[4], vap->macaddr[5] );
@@ -2222,7 +1524,6 @@ static int vwd_vap_down(struct dpaa_vwd_priv_s *priv , struct vap_desc_s *vap)
 	smp_store_release(&vap->state, VAP_ST_CONFIGURED);
 
 	vap->wifi_dev = NULL;
-	priv->vap_count--;
 
 	return 0;
 }
@@ -2234,8 +1535,6 @@ static int vwd_vap_configure(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *va
 {
 	vap->vapid = cmd->vapid;
 	vap->ifindex = cmd->ifindex;
-	vap->direct_rx_path = cmd->direct_rx_path;
-	vap->no_l2_itf = cmd->no_l2_itf;
 	/* The whole name, not the first 12 bytes of it. Both sides are
 	 * IFNAMSIZ and the hard-coded length silently truncated anything
 	 * longer -- which CMM never produced, because it named VAPs from a
@@ -2257,9 +1556,10 @@ static int vwd_vap_configure(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *va
 }
 
 /* Clear every netdev's wifi_offload_dev alias pointing at this VAP —
- * the wifi netdev itself and any VLAN-on-vap device control_vlan
- * copied the pointer onto. Caller holds rtnl (the ioctl entry takes
- * it), which is what makes the netdev walk safe. */
+ * the wifi netdev itself and any VLAN-on-vap device
+ * vwd_publish_vlan_aliases() copied the pointer onto. Caller holds rtnl
+ * (dpaa_vwd_vap_cmd() asserts it), which is what makes the netdev walk
+ * safe. */
 static void vwd_unpublish_vap(struct vap_desc_s *vap)
 {
 	struct net_device *dev;
@@ -2272,14 +1572,11 @@ static void vwd_unpublish_vap(struct vap_desc_s *vap)
 	}
 }
 
-/* Republish the vap pointer onto VLAN devices riding on its wifi
- * netdev. FCI VLAN registration copies the parent's pointer when the
- * VLAN entry is added (control_vlan); a REMOVE/re-ADD cycle of the vap
- * would otherwise leave those aliases cleared until the VLAN entry is
- * re-registered, which no netlink event triggers. This publishes by
- * netdev relationship, so VLANs that were never FCI-registered get the
- * alias too — safe: their ESP traffic takes the SEC round-trip and
- * falls back to the exception/software path. Caller holds rtnl. */
+/* Publish the vap pointer onto VLAN devices riding on its wifi netdev,
+ * by netdev relationship, each time the VAP opens: a REMOVE clears the
+ * aliases and nothing else puts them back. Safe for any such VLAN: its
+ * ESP traffic takes the SEC round-trip and falls back to the
+ * exception/software path. Caller holds rtnl. */
 static void vwd_publish_vlan_aliases(struct vap_desc_s *vap)
 {
 	struct net_device *dev;
@@ -2300,14 +1597,9 @@ static void vwd_publish_vlan_aliases(struct vap_desc_s *vap)
  */
 static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *cmd )
 {
-	int rc = 0, ii;
-	int create_sysfs = 0;
+	int rc = 0;
+	int create_sysfs = 0, remove_sysfs = 0;
 	struct vap_desc_s *vap;
-	DECLARE_BITMAP(reset_mask, MAX_WIFI_VAPS);
-	DECLARE_BITMAP(open_mask, MAX_WIFI_VAPS);
-
-	bitmap_zero(reset_mask, MAX_WIFI_VAPS);
-	bitmap_zero(open_mask, MAX_WIFI_VAPS);
 
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO( "%s function called %d: %s\n", __func__, cmd->action, cmd->ifname);
@@ -2360,9 +1652,9 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 
 			/* vwd_vap_up sleeps (GFP_KERNEL allocs, qman FQ
 			 * setup) and must not run under the BH spinlock the
-			 * softirq classifiers share. Claim the slot so
-			 * concurrent ioctls see it mid-transition and bail;
-			 * the classifiers and the ipsec xmit hook key on
+			 * softirq dequeue paths share. Claim the slot so a
+			 * concurrent command sees it mid-transition and bails;
+			 * the dequeue path and the ipsec xmit hook key on
 			 * VAP_ST_OPEN / wifi_offload_dev and stay away. */
 			vap->state = VAP_ST_CONFIGURING;
 			spin_unlock_bh(&priv->vaplock);
@@ -2382,7 +1674,6 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 				/* Last: the dequeue path reads this first, and
 				 * the queues' device pointers were stored above. */
 				smp_store_release(&vap->state, VAP_ST_OPEN);
-				priv->vap_count++;
 			}
 			break;
 		case REMOVE:
@@ -2393,7 +1684,7 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 				rc = -1;
 				break;
 			}
-			/* Claim the slot (other ioctls are also rtnl-
+			/* Claim the slot (other commands are also rtnl-
 			 * serialized; the claim additionally keeps the exit
 			 * walk away), unpublish every wifi_offload_dev alias
 			 * and wait out in-flight lock-free consumers before
@@ -2410,23 +1701,16 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 		case RELEASE:
 			/* Hand a slot back to the free pool.
 			 *
-			 * REMOVE stops at VAP_ST_CONFIGURED because that is
-			 * where the legacy owner wants it: CMM configures each
-			 * VAP once from a static file and then cycles it
-			 * up and down under a fixed id, so the configured
-			 * fields stay true across a REMOVE and re-configuring
-			 * them would be wasted work. Nothing there ever needed
-			 * a slot back.
-			 *
-			 * An owner that allocates ids does. Once a VAP's netdev
-			 * is gone its slot has to become reusable by a
-			 * different device, and a CONFIGURE onto a slot still
-			 * holding the old ifname is refused -- so without this
-			 * the id space would drain one VAP at a time until the
-			 * allocator wrapped onto an unusable slot. The sysfs
-			 * attribute goes with it, for the reason RESET drops
-			 * its own: it is named after the old interface, and a
-			 * later CONFIGURE would otherwise double-create it.
+			 * REMOVE stops at VAP_ST_CONFIGURED, leaving the
+			 * configured fields in place. Once a VAP's netdev is
+			 * gone its slot has to become reusable by a different
+			 * device, and a CONFIGURE onto a slot still holding the
+			 * old ifname is refused -- so without this the id space
+			 * would drain one VAP at a time until the allocator
+			 * wrapped onto an unusable slot. The sysfs attribute
+			 * goes with it: it is named after the old interface,
+			 * and a later CONFIGURE would otherwise double-create
+			 * it.
 			 */
 			DPAWIFI_INFO("%s: RELEASE ... %s\n", __func__, vap->ifname);
 			if (vap->state != VAP_ST_CONFIGURED) {
@@ -2436,68 +1720,19 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 				break;
 			}
 			vap->state = VAP_ST_CLOSE;
-			__set_bit(cmd->vapid, reset_mask);
-			break;
-		case UPDATE:
-			DPAWIFI_INFO("%s: UPDATE ... %s\n", __func__, cmd->ifname);
-			if (vap->state == VAP_ST_CONFIGURING) {
-				/* an ADD is mid-flight outside the lock;
-				 * updating its fields now would race it */
-				rc = -1;
-				break;
-			}
-			vap->ifindex = cmd->ifindex;
-			vap->direct_rx_path = cmd->direct_rx_path;
-			vap->no_l2_itf = cmd->no_l2_itf;
-			memcpy(vap->macaddr, cmd->macaddr, ETH_ALEN);
-			break;		
-		case RESET:
-			DPAWIFI_INFO("%s: RESET ...\n", __func__);
-			/* pass 1 (locked): claim OPEN slots and mark
-			 * everything that will drop to CLOSE */
-			for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
-				vap = &priv->vaps[ii];
-
-				if (vap->state == VAP_ST_CLOSE ||
-						vap->state == VAP_ST_CONFIGURING)
-					continue;
-
-				if (vap->state == VAP_ST_OPEN) {
-					vap->state = VAP_ST_CONFIGURING;
-					__set_bit(ii, open_mask);
-				}
-				__set_bit(ii, reset_mask);
-			}
-			if (!bitmap_empty(reset_mask, MAX_WIFI_VAPS)) {
-				/* unpublish + grace period for the formerly
-				 * OPEN slots, outside the BH spinlock */
-				spin_unlock_bh(&priv->vaplock);
-				for_each_set_bit(ii, open_mask, MAX_WIFI_VAPS)
-					vwd_unpublish_vap(&priv->vaps[ii]);
-				if (!bitmap_empty(open_mask, MAX_WIFI_VAPS))
-					synchronize_rcu();
-				spin_lock_bh(&priv->vaplock);
-				for_each_set_bit(ii, open_mask, MAX_WIFI_VAPS)
-					vwd_vap_down(priv, &priv->vaps[ii]);
-				for_each_set_bit(ii, reset_mask, MAX_WIFI_VAPS)
-					priv->vaps[ii].state = VAP_ST_CLOSE;
-				/* per-vap sysfs attrs are removed after the
-				 * final unlock below */
-			}
+			remove_sysfs = 1;
 			break;
 
 		default:
-			DPAWIFI_INFO("%s::unhandled cmd %d\n", __func__, cmd->action);	
+			DPAWIFI_INFO("%s::unhandled cmd %d\n", __func__, cmd->action);
 			rc = -1;
 			break;
 	}
 
 	spin_unlock_bh(&priv->vaplock);
 
-	/* Every path above that can change vap_count reaches here, and this
-	 * is the first point at which sleeping is allowed again. */
-	vwd_hooks_sync(priv);
-
+	/* device_create_file() and device_remove_file() sleep, so both run
+	 * here, after the unlock. */
 	if (create_sysfs) {
 		/* Create sysfs entry for vap interface */
 		if (device_create_file(priv->vwd_device, &dev_attr_vap[cmd->vapid])) {
@@ -2505,82 +1740,15 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 					__func__, cmd->ifname);
 		}
 	}
-	/* RESET dropped these to CLOSE; drop their sysfs attrs too so a
-	 * later re-CONFIGURE doesn't double-create (device_remove_file
-	 * sleeps, so it runs here, after the unlock) */
-	for_each_set_bit(ii, reset_mask, MAX_WIFI_VAPS)
-		device_remove_file(priv->vwd_device, &dev_attr_vap[ii]);
+	if (remove_sysfs)
+		device_remove_file(priv->vwd_device, &dev_attr_vap[cmd->vapid]);
 	return rc;
 
 }
 
-/** vwd_open
- *
- */
-static int dpaa_vwd_open(struct inode *inode, struct file *file)
-{
-	int result = 0;
-	unsigned dev_minor = iminor(inode);
-
-	if (READ_ONCE(vwd_stopping))
-		return -ENODEV;
-	DPAWIFI_INFO( "%s :  minor device -> %d\n", __func__, dev_minor);
-	if (dev_minor != 0)
-	{
-		DPAWIFI_INFO(KERN_ERR ": trying to access unknown minor device -> %d\n", dev_minor);
-		result = -ENODEV;
-		goto out;
-	}
-
-	file->private_data = &vwd;
-
-out:
-	return result;
-}
-
-#define SIOCVAPUPDATE  ( 0x6401 )
-
-/**dpaa_vwd_ioctl
- *
- */
-long dpaa_vwd_ioctl(struct file * file, unsigned int cmd, unsigned long arg)
-{
-	struct vap_cmd_s vap_cmd;
-	void __user *argp = (void __user *)arg;
-	int rc = -EOPNOTSUPP;
-	struct dpaa_vwd_priv_s *priv = (struct dpaa_vwd_priv_s *)file->private_data;
-
-	rtnl_lock();
-	if (READ_ONCE(vwd_stopping)) {
-		rc = -ENODEV;
-		goto done;
-	}
-#ifdef DPA_WIFI_DEBUG
-	DPAWIFI_INFO("%s vapcmd recvd:%x \n", __func__, cmd);
-#endif
-	switch(cmd) {
-		case SIOCVAPUPDATE:
-			if (copy_from_user(&vap_cmd, argp, sizeof(struct vap_cmd_s))) {
-				rc = -EFAULT;
-				goto done;
-			}
-
-			rc = dpaa_vwd_handle_vap(priv, &vap_cmd);
-	}
-done:
-	rtnl_unlock();
-	return rc;
-}
-
-/* The same VAP table, reached from inside the kernel.
- *
- * dpaa_vwd_ioctl() is the legacy owner's door: it copies a vap_cmd_s out of a
- * userspace buffer and takes RTNL around the handler. An owner that learns
- * about VAPs from netdev events has the command already and is called with
- * RTNL held, so it needs the handler without either -- which is all this is.
- * The lock the ioctl takes is asserted rather than taken, because taking it
- * here would deadlock the notifier-driven caller this exists for.
- */
+/* The VAP table's one door, driven by cdx_wifi_backend.c from netdev events.
+ * RTNL is asserted rather than taken: the notifier-driven caller already
+ * holds it, and taking it here would deadlock. */
 int dpaa_vwd_vap_cmd(struct vap_cmd_s *cmd)
 {
 	ASSERT_RTNL();
@@ -2760,45 +1928,11 @@ static int vwd_free_ohport(struct dpaa_vwd_priv_s *priv)
 	return 0;
 }
 
-/*
- * vwd_wifi_if_send_pkt
- */
-static int vwd_wifi_if_send_pkt(struct sk_buff *skb)
-{
-	struct dpaa_vwd_priv_s *priv = &vwd;
-	struct vap_desc_s *vap;
-	int rc = -1;
-
-	if (!READ_ONCE(priv->fast_path_enable) || skb_is_gso(skb) ||
-	    (eth_hdr(skb)->h_dest[0] & 0x1))
-	{
-		goto end;
-	}
-
-	spin_lock_bh(&priv->vaplock);
-	vap = (struct vap_desc_s *)skb->dev->wifi_offload_dev;
-
-	if (vap && (vap->ifindex == skb->dev->ifindex) && vap->direct_rx_path && (vap->state == VAP_ST_OPEN))
-	{
-		spin_unlock_bh(&priv->vaplock);
-		INCR_PER_CPU_STAT(priv->vaps[vap->vapid].vap_stats, pkts_direct_rx);
-		skb_push(skb, ETH_HLEN);
-		spin_lock_bh(&priv->txlock);
-		dpaa_vwd_send_packet( priv, &priv->vaps[vap->vapid], skb);
-		spin_unlock_bh(&priv->txlock);
-		rc = 0;
-	}
-	else
-		spin_unlock_bh(&priv->vaplock);
-end:
-	return rc;
-}
-
 /* NETDEV_UNREGISTER teardown: cdx deliberately holds no ref on the
  * wifi netdev (vwd_vap_up dev_puts after publishing), so an unregister
  * while a VAP is OPEN would leave vap->wifi_dev and the fq net_dev
  * links dangling. Notifiers run in process context under rtnl, so the
- * unpublish + grace + down sequence the ioctl REMOVE arm uses works
+ * unpublish + grace + down sequence the REMOVE arm uses works
  * here too. Upper devices (VLAN aliases) unregister before their real
  * device and each event clears its own dev's pointer. */
 static int vwd_netdev_event(struct notifier_block *nb,
@@ -2855,12 +1989,6 @@ static int vwd_netdev_event(struct notifier_block *nb,
 				vwd_vap_down(priv, vap);
 		}
 		spin_unlock_bh(&priv->vaplock);
-		/* The fourth place vap_count moves, and the one that is not an
-		 * ioctl: a VAP whose netdev unregistered takes the count down
-		 * with it, and the last one out should take the hooks with it
-		 * too. Safe here -- notifiers run under RTNL in process
-		 * context, and nothing below holds vaplock. */
-		vwd_hooks_sync(priv);
 	}
 	return NOTIFY_DONE;
 }
@@ -2872,121 +2000,16 @@ static struct notifier_block vwd_netdev_notifier = {
 /** dpaa_vwd_up
  *
  */
-/* The classifier hooks are registered only while a VAP exists.
- *
- * They sit at NF_INET_PRE_ROUTING with NF_IP_PRI_FIRST, so with them
- * registered every packet that reaches PRE_ROUTING enters
- * vwd_classify_route_packet(), which takes the global vaplock before it can
- * discover that the device has no VAP and there was nothing to do. A fully
- * offloaded flow never gets there -- the flowtable steals it earlier, at
- * NF_NETDEV_INGRESS -- but everything on the software path does: first
- * packets, local traffic, anything the classifier declined. On a board with
- * no radio configured that is a global lock acquisition per packet buying
- * nothing.
- *
- * This did not matter while VWD was built only for the legacy owner, which
- * had a VAP whenever it was running at all. It matters now that the hardware
- * comes up whether or not a radio is configured, so the cost is tied to a VAP
- * existing rather than to the subsystem being compiled in.
- */
-static DEFINE_MUTEX(vwd_hook_mutex);
-static bool vwd_hooks_on;
-
-static int vwd_hooks_register(void)
-{
-	int ret;
-
-	ret = nf_register_net_hook(&init_net, &vwd_hook);
-	if (ret)
-		return ret;
-	ret = nf_register_net_hook(&init_net, &vwd_hook_ipv6);
-	if (ret)
-		goto err_ipv6;
-	ret = nf_register_net_hook(&init_net, &vwd_hook_bridge);
-	if (ret)
-		goto err_bridge;
-	return 0;
-
-err_bridge:
-	nf_unregister_net_hook(&init_net, &vwd_hook_ipv6);
-err_ipv6:
-	nf_unregister_net_hook(&init_net, &vwd_hook);
-	synchronize_net();
-	return ret;
-}
-
-static void vwd_hooks_unregister(void)
-{
-	nf_unregister_net_hook(&init_net, &vwd_hook);
-	nf_unregister_net_hook(&init_net, &vwd_hook_ipv6);
-	nf_unregister_net_hook(&init_net, &vwd_hook_bridge);
-	/* nf_unregister_net_hook only call_rcu()s the old array; it does not
-	 * wait. Callers that go on to free what a classifier could still be
-	 * walking must synchronise themselves. */
-}
-
-/* Bring the hooks into line with whether any VAP is open.
- *
- * Must not be called with vaplock held: registration allocates and
- * unregistration waits. Every caller therefore runs it after dropping that
- * lock, which is also why the decision is re-read here rather than passed in
- * -- the count can have moved again by the time we get the mutex, and the
- * last writer to reach this point is the one that should win.
- */
-static void vwd_hooks_sync(struct dpaa_vwd_priv_s *priv)
-{
-	bool want;
-
-	spin_lock_bh(&priv->vaplock);
-	want = priv->vap_count > 0;
-	spin_unlock_bh(&priv->vaplock);
-
-	mutex_lock(&vwd_hook_mutex);
-	if (want && !vwd_hooks_on) {
-		if (!vwd_hooks_register()) {
-			vwd_hooks_on = true;
-			/* Both transitions are logged because the hooks are
-			 * otherwise invisible: they are netfilter registrations
-			 * with no sysfs or procfs face, so whether the
-			 * classifier is in the path at all can only be inferred
-			 * from behaviour. Saying it once per transition costs
-			 * nothing -- the count moves only on a VAP appearing or
-			 * going away -- and is the difference between "no
-			 * offload because no hook" and "no offload because the
-			 * flow was declined", which look identical from the
-			 * counters.
-			 *
-			 * pr_info rather than DPAWIFI_INFO: that macro compiles
-			 * to nothing unless CDX_DPA_DEBUG is defined, which no
-			 * shipped build defines, so a transition logged through
-			 * it is exactly as invisible as no log at all. */
-			pr_info("cdx wifi: classifier hooks registered; first VAP is open\n");
-		} else {
-			DPAWIFI_ERROR("%s::could not register the classifier hooks; this VAP will not offload\n",
-				      __func__);
-		}
-	} else if (!want && vwd_hooks_on) {
-		vwd_hooks_unregister();
-		vwd_hooks_on = false;
-		pr_info("cdx wifi: classifier hooks unregistered; no VAP is open\n");
-		/* A classifier may still be in flight against the VAP that
-		 * just went away; the caller's own teardown waits it out. */
-	}
-	mutex_unlock(&vwd_hook_mutex);
-}
-
 static int dpaa_vwd_up(struct dpaa_vwd_priv_s *priv)
 {
 	int ret;
 
-	/* No hooks here. They arrive with the first VAP; see vwd_hooks_sync(). */
 	ret = register_netdevice_notifier(&vwd_netdev_notifier);
 	if (ret)
 		return ret;
 	ret = dpaa_vwd_sysfs_init(priv);
 	if (ret)
 		goto err_sysfs;
-	wifi_rx_fastpath_register(vwd_wifi_if_send_pkt);
 	return 0;
 
 err_sysfs:
@@ -3016,27 +2039,15 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 	 * below then finds them CONFIGURED and still releases their FQs
 	 * and attrs exactly once via the masks */
 	unregister_netdevice_notifier(&vwd_netdev_notifier);
-	wifi_rx_fastpath_unregister();
-	/* Whatever the VAP count says: the notifier replay above has already
-	 * taken every VAP down, so this is the unconditional counterpart to
-	 * the deferred registration and leaves nothing behind on exit. */
-	mutex_lock(&vwd_hook_mutex);
-	if (vwd_hooks_on) {
-		vwd_hooks_unregister();
-		vwd_hooks_on = false;
-	}
-	mutex_unlock(&vwd_hook_mutex);
-	/* nf_unregister_net_hook only call_rcu()s the old entries array —
-	 * it does NOT wait — and the rx-fastpath unregister is a bare
-	 * pointer swap. Wait out in-flight classifiers/rx handlers here so
-	 * release_vap_fqs below can't free FQs under them. */
+	/* Wait out in-flight lock-free consumers of the VAPs' published
+	 * pointers so release_vap_fqs below can't free FQs under them. */
 	synchronize_rcu();
 
 	/* rtnl taken for the whole vap teardown: it drains any in-flight
-	 * vap ioctl (they run entirely under rtnl), so no slot can be
-	 * mid-ADD when the walk below runs, and it covers the netdev walk
-	 * in the alias sweep. Ioctls arriving after we drop it find every
-	 * slot CLOSE and bail on their state checks. */
+	 * vap command (dpaa_vwd_vap_cmd() runs under rtnl), so no slot can
+	 * be mid-ADD when the walk below runs, and it covers the netdev walk
+	 * in the alias sweep. Commands arriving after we drop it find
+	 * vwd_stopping set and bail. */
 	rtnl_lock();
 
 	/* state transitions under the lock; sleeping teardown after */
@@ -3045,7 +2056,7 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 	{
 		struct vap_desc_s *vap = &priv->vaps[ii];
 
-		/* unreachable now that rtnl above drains in-flight ioctls
+		/* unreachable now that rtnl above drains in-flight commands
 		 * before this walk; kept as a defensive skip */
 		if (vap->state == VAP_ST_CONFIGURING)
 			continue;
@@ -3057,7 +2068,6 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 			vap->state = VAP_ST_CLOSE;
 		}
 	}
-	priv->vap_count = 0;
 	spin_unlock_bh(&priv->vaplock);
 
 	/* clear every wifi_offload_dev still pointing into the vap table —
@@ -3121,18 +2131,15 @@ int dpaa_vwd_init(void)
 	if (rc)
 		goto err_oh;
 
-	priv->vwd_major = register_chrdev(0, "vwd", &vwd_fops);
-	if (priv->vwd_major < 0) {
-		rc = priv->vwd_major;
-		goto err_fqs;
-	}
+	/* The class and its device carry no character device: they are where
+	 * the statistics and per-VAP files live, under /sys/class/vwd/vwd0. */
 	priv->vwd_class = class_create("vwd");
 	if (IS_ERR(priv->vwd_class)) {
 		rc = PTR_ERR(priv->vwd_class);
-		goto err_chrdev;
+		goto err_fqs;
 	}
-	priv->vwd_device = device_create(priv->vwd_class, NULL,
-			MKDEV(priv->vwd_major, VWD_MINOR), NULL, "vwd0");
+	priv->vwd_device = device_create(priv->vwd_class, NULL, 0, NULL,
+					 "vwd0");
 	if (IS_ERR(priv->vwd_device)) {
 		rc = PTR_ERR(priv->vwd_device);
 		goto err_class;
@@ -3145,26 +2152,15 @@ int dpaa_vwd_init(void)
 		goto err_hooks;
 
 	WRITE_ONCE(vwd_stopping, false);
-	/* fast_path_enable stays off. It is CMM's Wi-Fi fast path: it steals
-	 * frames at NF_INET_PRE_ROUTING and injects them into the Wi-Fi offline
-	 * port itself, which the flowtable already does through the classifier
-	 * entries it installs. Enabling it puts two owners on the same frames:
-	 * the flowtable's NF_NETDEV_INGRESS hook takes what it can and this
-	 * takes the rest. That works, which is the problem -- it hides which
-	 * path is carrying the traffic, and it costs a global vaplock on every
-	 * packet that reaches PRE_ROUTING, which is the cost e67f0ba removed.
-	 */
 	register_cdx_deinit_func(dpaa_vwd_exit);
 	return 0;
 
 err_hooks:
 	dpaa_vwd_down(priv);
 err_device:
-	device_destroy(priv->vwd_class, MKDEV(priv->vwd_major, VWD_MINOR));
+	device_unregister(priv->vwd_device);
 err_class:
 	class_destroy(priv->vwd_class);
-err_chrdev:
-	unregister_chrdev(priv->vwd_major, "vwd");
 err_fqs:
 	vwd_release_pcd_fqs(priv);
 err_oh:
@@ -3191,7 +2187,6 @@ void dpaa_vwd_exit(void)
 	/* Block new submissions before unpublishing any callback resources. */
 	spin_lock_bh(&priv->txlock);
 	WRITE_ONCE(vwd_stopping, true);
-	WRITE_ONCE(priv->fast_path_enable, 0);
 	spin_unlock_bh(&priv->txlock);
 	dpa_unregister_wifi_xmit_local_hook();
 	dpaa_vwd_down(priv);
@@ -3224,7 +2219,6 @@ void dpaa_vwd_exit(void)
 	vwd_release_stats(priv);
 	dev_put(priv->eth_priv->net_dev);
 	priv->eth_priv = NULL;
-	device_destroy(priv->vwd_class, MKDEV(priv->vwd_major, VWD_MINOR));
-	unregister_chrdev(priv->vwd_major, "vwd");
+	device_unregister(priv->vwd_device);
 	class_destroy(priv->vwd_class);
 }

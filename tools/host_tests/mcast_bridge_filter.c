@@ -4,8 +4,8 @@
  *
  * A hardware entry replicates at the classifier, before any of them runs, so
  * while one is registered at PRE_ROUTING, FORWARD or POST_ROUTING no bridged
- * flow may be carried. CDX's own hooks -- the learner's, at PRE_ROUTING, and
- * VWD's -- never count. LOCAL_IN and LOCAL_OUT see only what the host
+ * flow may be carried. The learner's own hook, at PRE_ROUTING, never counts:
+ * it only observes. LOCAL_IN and LOCAL_OUT see only what the host
  * receives or sends, which a plain bridged flow never is. A route's copies
  * are: the routed learner asks about LOCAL_OUT and POST_ROUTING for a copy
  * routed into a bridge, and a copy handed up through LOCAL_IN is confirmed
@@ -58,13 +58,6 @@ static struct {
 } init_net;
 
 static struct nf_hook_ops ft_mc_hook_ops, nft_chain, ebtables, br_netfilter;
-/* VWD's bridge hook, which a board with its access point up registers at
- * PRE_ROUTING, first. */
-static struct nf_hook_ops vwd_bridge;
-static bool cdx_wifi_owns_hook(const struct nf_hook_ops *ops)
-{
-    return ops == &vwd_bridge;
-}
 
 #include "mcast_bridge_filter.inc"
 
@@ -90,17 +83,10 @@ static void registered(unsigned int hook, unsigned int n, ...)
 
 int main(void)
 {
-    /* Nothing registered, or only CDX's own hooks: the learner's, which
-     * observes, and VWD's, which an access point being up registers and
-     * which only hands a VAP's frames to its fast path. */
+    /* Nothing registered, or only the learner's own hook, which observes. */
     assert(!ft_mc_bridge_filtered());
     registered(NF_BR_PRE_ROUTING, 1, &ft_mc_hook_ops);
     assert(!ft_mc_bridge_filtered());
-    registered(NF_BR_PRE_ROUTING, 2, &vwd_bridge, &ft_mc_hook_ops);
-    assert(!ft_mc_bridge_filtered());
-    registered(NF_BR_PRE_ROUTING, 3, &vwd_bridge, &nft_chain, &ft_mc_hook_ops);
-    assert(ft_mc_bridge_filtered());
-    registered(NF_BR_PRE_ROUTING, 1, &ft_mc_hook_ops);
 
     /* Another hook beside it at PRE_ROUTING, before or after it. */
     registered(NF_BR_PRE_ROUTING, 2, &ebtables, &ft_mc_hook_ops);
