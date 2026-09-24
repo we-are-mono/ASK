@@ -192,8 +192,10 @@ async def test_flowtable_service_multicast_two_sources(multicast_rig, family):
                                   s["mroute_installed"] == r.initial["mroute_installed"] + 1,
                                   "the first source removed")
         assert routed(survived, group, second), summary(survived)
-        # Both windows it was sent in, on the same entry.
-        assert packets(row(second)(survived)) == 2 * COUNT, summary(survived)
+        # Both windows it was sent in, on the same entry, over what the
+        # learning stream left on it once the route was in hardware.
+        learned = packets(row(second)(together["before"]))
+        assert packets(row(second)(survived)) == learned + 2 * COUNT, summary(survived)
         after = await window([first, second], "survivor")
         assert not delivered(after, streamed(after, group, first), LAN_NIC)
         assert delivered(after, streamed(after, group, second), LAN_NIC)
