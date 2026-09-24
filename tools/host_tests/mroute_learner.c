@@ -170,7 +170,26 @@ struct net_device {
      * VIF that names the device. */
     int reg_state;
     struct net *nd_net;
+    /* The device's own address, which ipmr builds a copy's header with on
+     * the oif it sends the copy through. */
+    unsigned char dev_addr[ETH_ALEN];
+    unsigned char addr_len;
 };
+
+static bool is_zero_ether_addr(const u8 *a)
+{
+    return !(a[0] | a[1] | a[2] | a[3] | a[4] | a[5]);
+}
+static bool is_multicast_ether_addr(const u8 *a) { return a[0] & 1; }
+static bool is_valid_ether_addr(const u8 *a)
+{
+    return !is_multicast_ether_addr(a) && !is_zero_ether_addr(a);
+}
+static void ether_addr_copy(u8 *d, const u8 *s) { memcpy(d, s, ETH_ALEN); }
+static bool ether_addr_equal(const u8 *a, const u8 *b)
+{
+    return !memcmp(a, b, ETH_ALEN);
+}
 
 #define NETREG_REGISTERED 1
 #define NETREG_UNREGISTERING 2
@@ -452,6 +471,18 @@ static void dev_init(struct net_device *d, const char *name, int ifindex)
     d->reg_state = NETREG_REGISTERED;
     d->nd_net = &init_net;
     INIT_LIST_HEAD(&d->lowers);
+    /* One address per device, locally administered, so a copy says which
+     * device it was framed from. */
+    d->addr_len = ETH_ALEN;
+    d->dev_addr[0] = 0x02;
+    d->dev_addr[5] = (unsigned char)ifindex;
+}
+
+/* A VLAN device takes the address of the device below it when it is made,
+ * which is what vlan_dev_init() does unless one is given. */
+static void inherit_address(struct net_device *vlan, const struct net_device *lower)
+{
+    ether_addr_copy(vlan->dev_addr, lower->dev_addr);
 }
 
 static void lower_add(struct net_device *parent, struct net_device *child)
@@ -611,16 +642,19 @@ static void reset(void)
     VWAN.vlan_proto = ETH_P_8021Q;
     VWAN.vlan_id = 10;
     lower_add(&VWAN, &WAN);
+    inherit_address(&VWAN, &WAN);
     dev_init(&VLAN_LAN, "eth3.20", 24);
     VLAN_LAN.vlan = true;
     VLAN_LAN.vlan_proto = ETH_P_8021Q;
     VLAN_LAN.vlan_id = 20;
     lower_add(&VLAN_LAN, &LAN);
+    inherit_address(&VLAN_LAN, &LAN);
     dev_init(&QINQ, "eth3.20.30", 25);
     QINQ.vlan = true;
     QINQ.vlan_proto = ETH_P_8021Q;
     QINQ.vlan_id = 30;
     lower_add(&QINQ, &VLAN_LAN);
+    inherit_address(&QINQ, &VLAN_LAN);
 }
 
 static void bridge_port(struct net_device *port, unsigned long flags)
@@ -779,7 +813,7 @@ int main(void)
     assert(plan.parent == VWAN.ifindex);
     assert(plan.spec.in_vlans == 1 && plan.spec.in_vlan[0].id == 10);
     assert(plan.spec.in_vlan[0].proto == htons(ETH_P_8021Q));
-    /* Routed: no Ethernet pair to key on, the copies take the port's. */
+    /* Routed: no Ethernet pair to key on; each copy names its own. */
     assert(!plan.spec.bridged);
     /* A group installed on another VLAN of the same port is not the same
      * plan: the root it needs validates a different tag. */
@@ -1357,6 +1391,178 @@ int main(void)
     assert(refuse(g) == FT_MR_REFUSED_LISTENER);
     free(g);
 
+    /* ---- the address a copy leaves with ------------------------------ *
+     *
+     * ipmr builds each copy's header on the oif it sends it through, and a
+     * bridge or a VLAN device passes it on unchanged, so a copy leaves with
+     * its oif's address -- which is its port's only when the oif is the
+     * port. Every listener an oif becomes carries that address, read from
+     * the oif and never from the port the walk ends on. */
+    reset();
+    g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+    vif_set(AF_INET, 0, &WAN, 0);
+    vif_set(AF_INET, 1, &LAN, 0);
+    oif(g, 1, 1);
+    /* A port's copy leaves with the port's own. */
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listener[0].routed);
+    assert(ether_addr_equal(plan.spec.listener[0].src_mac, LAN.dev_addr));
+    ft_mr_plan_put(&plan);
+    /* A VLAN device's with its own: the port's while it still has the one
+     * it took from the port... */
+    vif_set(AF_INET, 1, &VLAN_LAN, 0);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(ether_addr_equal(plan.spec.listener[0].src_mac, LAN.dev_addr));
+    ft_mr_plan_put(&plan);
+    /* ...and not once it is given another. */
+    VLAN_LAN.dev_addr[4] = 0x20;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listener[0].dev == &LAN);
+    assert(ether_addr_equal(plan.spec.listener[0].src_mac, VLAN_LAN.dev_addr));
+    assert(!ether_addr_equal(plan.spec.listener[0].src_mac, LAN.dev_addr));
+    /* An address change is a different plan. Nothing in the MFC follows
+     * one -- NETDEV_CHANGEADDR asks every group again -- and the chain
+     * installed from the old plan writes the old address until it is
+     * replaced, so a refresh must not take the two for the same. */
+    g->in = plan.spec.in;
+    g->in_tags = plan.in_tags;
+    g->mtu = plan.mtu;
+    g->listeners = plan.spec.listeners;
+    memcpy(g->listener, plan.spec.listener, sizeof(g->listener));
+    memcpy(g->in_vlan, plan.spec.in_vlan, sizeof(g->in_vlan));
+    assert(ft_mr_plan_same(g, &plan));
+    ft_mr_plan_put(&plan);
+    VLAN_LAN.dev_addr[4] = 0x21;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(!ft_mr_plan_same(g, &plan));
+    ft_mr_plan_put(&plan);
+    VLAN_LAN.dev_addr[4] = 0x20;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(ft_mr_plan_same(g, &plan));
+    ft_mr_plan_put(&plan);
+    g->in = NULL;
+    g->listeners = 0;
+    /* An oif with no unicast address of its own names no frame the
+     * hardware could write, and the port's is not what Linux would send:
+     * refused, never approximated. */
+    memset(VLAN_LAN.dev_addr, 0, ETH_ALEN);
+    assert(refuse(g) == FT_MR_REFUSED_LISTENER);
+    VLAN_LAN.dev_addr[0] = 0x01;   /* a group's address is no station's */
+    assert(refuse(g) == FT_MR_REFUSED_LISTENER);
+    inherit_address(&VLAN_LAN, &LAN);
+    VLAN_LAN.addr_len = 0;
+    assert(refuse(g) == FT_MR_REFUSED_LISTENER);
+    VLAN_LAN.addr_len = ETH_ALEN;
+    free(g);
+
+    /* A bridge's copies leave with the bridge's address, whichever port
+     * each goes out of; none of its ports shares it here. */
+    reset();
+    bridge_port(&LAN, BR_MCAST_FLOOD);
+    bridge_port(&LAN2, BR_MCAST_FLOOD);
+    g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+    vif_set(AF_INET, 0, &WAN, 0);
+    vif_set(AF_INET, 1, &BR, 0);
+    oif(g, 1, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 2);
+    assert(!ether_addr_equal(BR.dev_addr, LAN.dev_addr) &&
+           !ether_addr_equal(BR.dev_addr, LAN2.dev_addr));
+    for (unsigned i = 0; i < plan.spec.listeners; i++)
+        assert(ether_addr_equal(plan.spec.listener[i].src_mac, BR.dev_addr));
+    ft_mr_plan_put(&plan);
+    /* And the br-lan.N shape: a VLAN device on the bridge sends with the
+     * address it took from the bridge, and with its own once given one. */
+    vlan_enabled = true;
+    bridge_pvid = 1;
+    member(&LAN, 3999, false);
+    member(&LAN2, 3999, true);
+    dev_init(&SOFT, "br0.3999", 26);
+    SOFT.vlan = true;
+    SOFT.vlan_proto = ETH_P_8021Q;
+    SOFT.vlan_id = 3999;
+    lower_add(&SOFT, &BR);
+    inherit_address(&SOFT, &BR);
+    vif_set(AF_INET, 1, &SOFT, 0);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 2);
+    for (unsigned i = 0; i < plan.spec.listeners; i++)
+        assert(ether_addr_equal(plan.spec.listener[i].src_mac, BR.dev_addr));
+    ft_mr_plan_put(&plan);
+    SOFT.dev_addr[4] = 0x39;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    for (unsigned i = 0; i < plan.spec.listeners; i++)
+        assert(ether_addr_equal(plan.spec.listener[i].src_mac, SOFT.dev_addr));
+    ft_mr_plan_put(&plan);
+    free(g);
+
+    /* Two oifs with one port and one framing but different addresses are
+     * two frames on the wire in Linux, and two copies here: the port
+     * itself, and a bridge over it with an address of its own. With the
+     * port's address the bridge's copy is the port's, and collapses. */
+    reset();
+    bridge_port(&LAN, BR_MCAST_FLOOD);
+    g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+    vif_set(AF_INET, 0, &WAN, 0);
+    vif_set(AF_INET, 1, &LAN, 0);
+    vif_set(AF_INET, 2, &BR, 0);
+    oif(g, 1, 1);
+    oif(g, 2, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 2);
+    assert(plan.spec.listener[0].dev == &LAN && plan.spec.listener[1].dev == &LAN);
+    assert(plan.spec.listener[0].vlans == 0 && plan.spec.listener[1].vlans == 0);
+    assert(ether_addr_equal(plan.spec.listener[0].src_mac, LAN.dev_addr));
+    assert(ether_addr_equal(plan.spec.listener[1].src_mac, BR.dev_addr));
+    ft_mr_plan_put(&plan);
+    ether_addr_copy(BR.dev_addr, LAN.dev_addr);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 1);
+    ft_mr_plan_put(&plan);
+    free(g);
+
+    /* A parent VIF on the bridge and an oif on it too -- IPTV bridged to
+     * the set-top box on one VLAN and routed into another of the same LAN
+     * port. The copy the plan publishes for the bridged group leaves with
+     * the routed VLAN device's address, which it took from the bridge, and
+     * not with the port's it goes out of. */
+    reset();
+    {
+        static struct net_device IPTV, ROUTED;
+
+        bridge_port(&LAN, BR_MCAST_FLOOD);
+        vlan_enabled = true;
+        bridge_pvid = 1;
+        member(&BR, 289, false);
+        member(&LAN, 289, false);
+        member(&LAN, 290, false);
+        dev_init(&IPTV, "br0.289", 33);
+        IPTV.vlan = true;
+        IPTV.vlan_proto = ETH_P_8021Q;
+        IPTV.vlan_id = 289;
+        lower_add(&IPTV, &BR);
+        inherit_address(&IPTV, &BR);
+        dev_init(&ROUTED, "br0.290", 34);
+        ROUTED.vlan = true;
+        ROUTED.vlan_proto = ETH_P_8021Q;
+        ROUTED.vlan_id = 290;
+        lower_add(&ROUTED, &BR);
+        inherit_address(&ROUTED, &BR);
+        g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+        vif_set(AF_INET, 0, &IPTV, 0);
+        vif_set(AF_INET, 1, &ROUTED, 0);
+        oif(g, 1, 1);
+        assert(derive(g, &plan) == FT_MR_PENDING);
+        assert(plan.via == &BR && plan.via_vid == 289 && !plan.spec.in);
+        assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN);
+        assert(plan.spec.listener[0].vlans == 1 &&
+               plan.spec.listener[0].vlan[0].id == 290);
+        assert(ether_addr_equal(plan.spec.listener[0].src_mac, BR.dev_addr));
+        assert(!ether_addr_equal(plan.spec.listener[0].src_mac, LAN.dev_addr));
+        ft_mr_plan_put(&plan);
+        free(g);
+    }
+
     /* ---- the MTU bound ----------------------------------------------- *
      *
      * A listener's entry ends in ENQUEUE_PKT, which fragments any replica
@@ -1456,11 +1662,13 @@ int main(void)
     BR.mtu = 1400;
     assert(refuse(g) == FT_MR_REFUSED_MTU);
     BR.mtu = 1500;
-    /* eth3 directly and eth3 through the bridge are one copy. The direct
-     * oif comes first and the bridge's copy collapses into it, yet the
-     * bridge path is the narrower one and still bounds the group. */
+    /* eth3 directly and eth3 through a bridge that took its address are one
+     * copy. The direct oif comes first and the bridge's copy collapses into
+     * it, yet the bridge path is the narrower one and still bounds the
+     * group. */
     LAN2.port_flags = 0;
     LAN.mtu = 9000;
+    ether_addr_copy(BR.dev_addr, LAN.dev_addr);
     vif_set(AF_INET, 1, &LAN, 0);
     vif_set(AF_INET, 2, &BR, 0);
     oif(g, 2, 1);

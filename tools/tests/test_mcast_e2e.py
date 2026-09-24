@@ -598,6 +598,9 @@ SMCROUTE_CONF = "/tmp/ask_mroute.conf"
 # bridged cases build: those enslave the WAN port too, which would make the
 # ingress a bridge port and the whole group ineligible.
 MROUTE_BRIDGE = "br_mroute_e2e"
+# An address of the bridge's own, locally administered, so a copy sent with
+# it cannot be mistaken for one sent with its port's.
+MROUTE_BRIDGE_MAC = "02:a5:19:10:02:90"
 
 
 async def _exec(target_agent, session, *argv, check=True, timeout_ms=10000):
@@ -756,16 +759,18 @@ async def installed_by_traffic(target_agent, aiohttp_session, group: str,
 
 
 async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
-                          family: int, oif: str, egress_port: str,
-                          lan_iface: str, label: str, smcrouted,
-                          check_source_mac: bool = True):
+                          family: int, oif: str, lan_iface: str, label: str,
+                          smcrouted):
     """One routed case, end to end.
 
     Six oracles: `ip mroute show` reports offload, /proc says installed, the
     DUT's CPU never sees the stream, the consumer receives it, the replicas
     carry the router's own framing, and `ip -s mroute` shows the hardware's
     count where the software counter is zero. The last two are what a bridged
-    case cannot produce.
+    case cannot produce. The router's framing is the oif's: ipmr builds each
+    copy's header on the device it sends it through, and a VLAN device or a
+    bridge passes it on, so the source is the oif's own address -- which the
+    hardware has to write too, whatever port the copy leaves by.
     """
     source = wan_source_address(family)
     sent = int(STREAM_S * STREAM_PPS)
@@ -844,7 +849,7 @@ async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
     captured = read_pcap_count(lan, capfile)
     headers = lan.run(f"tcpdump -r {capfile} -nn -e -v -c 2 2>&1",
                       timeout=15).stdout
-    mac = await dut_mac(target_agent, aiohttp_session, egress_port)
+    mac = await dut_mac(target_agent, aiohttp_session, oif)
     lan.run(f"rm -f {capfile}", timeout=5)
 
     # Forwarding first: without it the rest describes a broken path.
@@ -881,11 +886,11 @@ async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
         f"{group}: replicas do not carry {ttl}, so nothing decremented the "
         f"header — the frame was bridged rather than routed. Headers: "
         f"{headers[:400]!r}")
-    if check_source_mac:
-        assert mac in headers.lower(), (
-            f"{group}: replicas do not carry {egress_port}'s address {mac} as "
-            f"their Ethernet source, so the listener entry did not rebuild "
-            f"the L2 header. Headers: {headers[:400]!r}")
+    assert mac in headers.lower(), (
+        f"{group}: replicas do not carry the oif {oif}'s address {mac} as "
+        f"their Ethernet source, which is what ipmr sends them with, so the "
+        f"listener entry did not rebuild the L2 header as Linux would. "
+        f"Headers: {headers[:400]!r}")
 
     # Teardown is an assertion too: the entry going has to take the hardware
     # group and the kernel's flag with it.
@@ -908,7 +913,7 @@ async def test_routed_to_a_port(aiohttp_session, target_agent, lan, smcrouted,
     group = GROUPS_V6["routed"] if family == 6 else GROUPS_V4["routed"]
     await run_routed_case(
         aiohttp_session, target_agent, lan, group=group, family=family,
-        oif=TARGET_LAN_IF, egress_port=TARGET_LAN_IF, lan_iface=LAN_NIC,
+        oif=TARGET_LAN_IF, lan_iface=LAN_NIC,
         label=f"mroute_port_v{family}", smcrouted=smcrouted,
     )
 
@@ -935,7 +940,7 @@ async def test_routed_to_a_vlan_subinterface(aiohttp_session, target_agent,
         )
         await run_routed_case(
             aiohttp_session, target_agent, lan, group=group, family=4,
-            oif=dut_if, egress_port=TARGET_LAN_IF, lan_iface=lan_if,
+            oif=dut_if, lan_iface=lan_if,
             label="mroute_vlan", smcrouted=smcrouted,
         )
     finally:
@@ -1068,15 +1073,19 @@ async def test_routed_to_a_bridge(aiohttp_session, target_agent, lan,
     """The oif is a bridge over the LAN port, with snooping off.
 
     br_dev_xmit() hands such a frame to br_flood(), so the listener set is
-    every port carrying BR_MCAST_FLOOD -- here the one. The source-MAC oracle
-    is not asserted: the hardware writes the egress *port's* address and the
-    software path would write the bridge's, and the two are only equal
-    because a one-port bridge inherits its port's address, so an assertion on
-    it would be testing that coincidence rather than the offload.
+    every port carrying BR_MCAST_FLOOD -- here the one. ipmr sends the copy
+    with the bridge's address, and so must the hardware, though it leaves by
+    the port. A one-port bridge takes its port's address, which would make
+    that oracle a coincidence, so the bridge is given one of its own first.
     """
+    await _exec(target_agent, aiohttp_session, "ip", "link", "set",
+                mroute_lan_bridge, "address", MROUTE_BRIDGE_MAC)
+    assert await dut_mac(target_agent, aiohttp_session, mroute_lan_bridge) != \
+        await dut_mac(target_agent, aiohttp_session, TARGET_LAN_IF), (
+        "the bridge still shares its port's address, so the source-MAC oracle "
+        "cannot tell the bridge's copy from the port's")
     await run_routed_case(
         aiohttp_session, target_agent, lan, group=GROUPS_V4["routed_bridge"],
-        family=4, oif=mroute_lan_bridge, egress_port=TARGET_LAN_IF,
-        lan_iface=LAN_NIC, label="mroute_bridge", smcrouted=smcrouted,
-        check_source_mac=False,
+        family=4, oif=mroute_lan_bridge, lan_iface=LAN_NIC,
+        label="mroute_bridge", smcrouted=smcrouted,
     )

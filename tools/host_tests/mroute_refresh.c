@@ -64,6 +64,11 @@ union nf_inet_addr { u32 all[4]; };
 struct cdx_ft_vlan { u16 proto, id; };
 #define CDX_FT_VLAN_MAX 2
 #define ETH_ALEN 6
+static bool ether_addr_equal(const u8 *a, const u8 *b) { return !memcmp(a, b, ETH_ALEN); }
+/* The address each oif's copy leaves with, which a case changes the way an
+ * address change on the oif would. */
+static u8 oif_addr[2][ETH_ALEN] = { { 0x02, 0, 0, 0, 0, 0x31 },
+                                    { 0x02, 0, 0, 0, 0, 0x32 } };
 /* The listener and group descriptions are the header's own, extracted into
  * the generated include, so a field added there is one the worker here has. */
 #include "mroute_backend.inc"
@@ -545,6 +550,7 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
     for (unsigned i = 0; i < wanted; i++) {
         p->spec.listener[i].dev = &output[i];
         p->spec.listener[i].routed = true;
+        memcpy(p->spec.listener[i].src_mac, oif_addr[i], ETH_ALEN);
         dev_hold(&output[i]);
     }
     return FT_MR_PENDING;
@@ -852,6 +858,27 @@ int main(void)
         assert(replaces == r0 + 1 && adds == a0 && deletes == d0);
         assert(hardware.live && hardware.copies == 1 && output[0].refs == 1);
         assert(input.refs == 2 && g->state == FT_MR_INSTALLED);
+    }
+
+    /* The oif given another address. Nothing else about the plan moved, yet
+     * the chain writes the old address, so the group asked again -- an
+     * address change kicks the learner -- swaps it for one that writes the
+     * new, under the same key. A pass that finds the address as it was
+     * swaps nothing. */
+    {
+        unsigned a0 = adds, r0 = replaces, d0 = deletes;
+
+        ft_mr_recheck = true;
+        run();
+        assert(replaces == r0);
+        oif_addr[0][4] = 0x10;
+        ft_mr_recheck = true;
+        run();
+        assert(replaces == r0 + 1 && adds == a0 && deletes == d0);
+        assert(ether_addr_equal(replaced_with.listener[0].src_mac, oif_addr[0]));
+        assert(ether_addr_equal(g->listener[0].src_mac, oif_addr[0]));
+        assert(ether_addr_equal(g->hw_spec.listener[0].src_mac, oif_addr[0]));
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
     }
 
     /* The ingress itself unregisters. The group lets go of its reference at

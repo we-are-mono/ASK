@@ -371,6 +371,24 @@ def test_the_learner_lets_go_of_a_device_that_went_away():
     assert "ft_mr_kick();" in netdev
 
 
+def test_an_address_change_asks_every_routed_group_again():
+    """A routed copy leaves with its oif's address, which the derivation reads
+    off the device, and no MFC event follows a change of it. The address
+    change itself has to ask again, or the chain writes the old address until
+    the next refresh happens to replace it -- and the plan comparison has to
+    see the difference, or even that would not."""
+    source = SOURCE.read_text()
+    netdev = function(source, "ft_netdev_event")
+    arm = netdev[netdev.index("case NETDEV_CHANGEADDR:"):]
+    arm = arm[:arm.index("break;")]
+    assert "ft_mr_kick();" in arm
+    assert "ether_addr_copy(src_mac, dev->dev_addr);" in function(source, "ft_mr_expand")
+    assert "ether_addr_equal(a->src_mac, b->src_mac)" in function(source, "ft_mr_plan_same")
+    # And a copy riding a bridged group: the route it publishes changes, and
+    # the flow carrying it is rebuilt.
+    assert "a->listener[i].src_mac" in function(source, "ft_mc_route_same")
+
+
 def test_exit_drains_before_the_module_text_goes_away():
     """The worker and the delayed counter fold both hold pointers into this
     module. Unloading has to stop both and drain the groups, the queue and the

@@ -33,12 +33,14 @@ struct cdx_mc_group;
  * Resolving that is the caller's, because it is a question about bridge
  * configuration and this side knows only ports.
  *
- * A listener is identified by its whole framing rather than by its device, so
- * one port may appear twice in a group with different tags and may not appear
- * twice with the same ones. Two tagged copies out of one port is what a
- * gateway carrying several VLANs on one link replicates, and nothing below
- * this interface objects: each listener gets its own external-hash entry,
- * built from its own encapsulation and threaded into the chain by pointer.
+ * A listener is identified by its whole framing rather than by its device --
+ * its port, its tags and, for a routed copy, the address it leaves with -- so
+ * one port may appear twice in a group with different tags or addresses and
+ * may not appear twice with the same ones. Two tagged copies out of one port
+ * is what a gateway carrying several VLANs on one link replicates, and nothing
+ * below this interface objects: each listener gets its own external-hash
+ * entry, built from its own encapsulation and threaded into the chain by
+ * pointer.
  */
 struct cdx_mc_listener {
 	struct net_device *dev;
@@ -48,10 +50,20 @@ struct cdx_mc_listener {
 	 * to some ports and the host routes to others is one classifier key,
 	 * so it is one group, and its root preserves the hop count and keys on
 	 * the frame's own Ethernet pair for the bridged copies. A routed copy
-	 * therefore decrements the hop count in its own entry and takes the
-	 * egress port's address, as a router's would. Meaningless in a routed
-	 * group, whose root decrements for every copy. */
+	 * therefore decrements the hop count in its own entry and leaves with
+	 * `src_mac`, as a router's would. Meaningless in a routed group, whose
+	 * root decrements for every copy and all of whose copies are routed. */
 	bool routed;
+	/* The address a routed copy leaves with: that of the device ipmr sends
+	 * it through, which builds the copy's header there, and a bridge or a
+	 * VLAN device on one forwards it unchanged. That is the port's own only
+	 * when the device is the port -- a VLAN device can be given another,
+	 * and a bridge carries one of its ports' or the one it was given -- so
+	 * the caller, which knows the device, names it and nothing below
+	 * falls back to the port's. Required, a unicast address, for every copy
+	 * of a routed group and every routed copy of a bridged one; zero for a
+	 * bridged copy, which keeps its sender's. */
+	u8 src_mac[ETH_ALEN];
 };
 
 /* A group, described once and installed in one pass.
@@ -92,7 +104,7 @@ struct cdx_mc_group_spec {
 	 * with it, because a bridge forwards a frame with the addresses it
 	 * arrived with and the only way the hardware can know them is to have
 	 * matched them. Required for a bridged group, zero for a routed one,
-	 * whose copies take the egress port's address. */
+	 * whose copies each name the address they leave with. */
 	u8 dst_mac[ETH_ALEN];
 	u8 src_mac[ETH_ALEN];
 	u8 family;
@@ -156,7 +168,8 @@ bool cdx_mc_port_identity(struct net_device *dev);
  * device afterwards; the hardware names its port's queues, not the device.
  *
  * -EOPNOTSUPP: a device, address family or group address cannot be carried,
- *          or a bridged group names no Ethernet pair to key on.
+ *          a bridged group names no Ethernet pair to key on, a routed copy
+ *          names no address to leave with, or a listener is named twice.
  * -EEXIST: another group holds this classifier key: the same ingress port and
  *          address pair and, for a bridged group, the same Ethernet pair. The
  *          ingress tags are not part of it -- the key names no VLAN -- so two

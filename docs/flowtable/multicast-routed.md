@@ -44,10 +44,12 @@ matched frame — and the FMC soft parser ends the parse before classification
 for any frame arriving with 0 or 1, which is the kernel's own `ttl > 1` rule
 expressed one layer down. Each listener entry
 (`create_exthash_entry4mcast_member`, `fill_mcast_member_actions`) rebuilds the
-Ethernet header with the egress port's own address and the group's mapped
-multicast destination. Decrement the hop count, rewrite the L2 header, replicate:
-that *is* a router. The bridged learner has been driving a router and asking it
-to bridge. This one asks it to do what it does.
+Ethernet header, to the group's mapped multicast destination from the address
+of the VIF the copy is sent through (see **The source address** under
+[the eligibility contract](#the-eligibility-contract)). Decrement the hop
+count, rewrite the L2 header, replicate: that *is* a router. The bridged learner
+has been driving a router and asking it to bridge. This one asks it to do what
+it does.
 
 ## What the kernel offers
 
@@ -179,6 +181,27 @@ indexed by position, and the name copied into `if_info` is for the query dump.
 The two name lookups that exist, `Cdx_GetMcastMemberId()` and
 `mcast_member_by_name()`, are on the FCI mutators and are never reached from
 this path.
+
+**The source address.** ipmr builds each copy's Ethernet header on the VIF
+device it sends the copy through (`ip_finish_output2()`,
+`ip6_finish_output2()`), and a bridge or a VLAN device passes it on unchanged.
+So a copy leaves with its oif's own address, which is the port's only when the
+oif is the port: a VLAN device can be given another, and a bridge carries one
+of its ports' or the one it was given — the ordinary `br-lan.N` layout. The
+learner reads the oif's `dev_addr` before walking down to the port, and every
+listener the oif becomes carries it (`struct cdx_mc_listener` `src_mac`); the
+backend writes it in place of the port's, and refuses a routed copy that names
+none rather than falling back to the port. The address is part of a listener's
+identity: two oifs with one port and one tag stack but different addresses —
+the port itself and a bridge over it with its own — are two copies, as Linux
+sends them, and a plan whose addresses changed is a different plan. An oif
+with no unicast address is `refused-listener`. No MFC event follows an address
+change, so `NETDEV_CHANGEADDR` on any device asks every group again; a VLAN
+device that inherited its address raises the event for itself when its lower
+device's changes. The unicast path refuses the same divergence instead
+(a flow whose logical egress address is not its port's); refusing it here would
+keep a whole IPTV stream, bridged copies included, in software on
+`br-lan.N`.
 
 The same rule decides what "back the way it came" means, and it is the rule
 the unicast path has used since the IPv6 increment. `ft_parse()` refuses a
@@ -439,8 +462,10 @@ routed to the rest of the house arrives on a bridge port. The bridge forwards it
 to the box and, as a multicast router, hands it to the host on `br0.289`, where
 ipmr routes it out of another port. That is one classifier key — the bridged
 one — so it is one hardware group, carrying the union of the two sets: the
-box's copy with the sender's Ethernet pair and hop count, ipmr's with the egress
-port's address, the group's mapped destination and one hop fewer.
+box's copy with the sender's Ethernet pair and hop count, ipmr's with its oif's
+address, the group's mapped destination and one hop fewer. The two differ in
+address and hop count even where they leave by one port with one tag stack, so
+both are carried there too.
 
 **Who owns what.** The bridged learner owns the group, as one of its flows,
 because only its traffic hook knows the port, the Ethernet pair and the tag the
@@ -482,9 +507,6 @@ box's copy alone and starved ipmr: the routed half was silently lost.
 
 **What does not merge**, each with its reason:
 
-- A routed copy framed exactly like a bridged one — one port, one tag stack —
-  would be two identical-looking entries the backend takes for a duplicate:
-  `refused-listener`.
 - The union has to fit `CDX_MC_MAX_LISTENERS`: `refused-listener`.
 - Every routed copy has to fit the port the stream arrives on, which the bridge
   hands up whatever the bridge device's MTU: `refused-mtu` on the bridged row.

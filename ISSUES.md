@@ -237,6 +237,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A275.** Routed multicast copies left with the egress port's MAC rather than their oif's (a VLAN or bridge VIF), as ipmr sends them, and no chain followed an oif's MAC change —
+  fixed (_:/^flowtable: send a routed multicast copy from its oif's address_).
+
 - [x] **A273.** A software ESP SA routed out a noqueue device (dummy, bridge, VLAN, veth) returned -ENOMEM to local senders for every packet async SEC encryption took, so they resent it; upstream's 7.2 fix never reached 6.12.y —
   fixed (_:/^kernel: backport xfrm's -EINPROGRESS from validate_xmit_xfrm_).
 

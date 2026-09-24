@@ -2486,11 +2486,13 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 /* Apply what a listener's copy owes to something other than its egress
  * interface to the description create_ethernet_hm() writes the header from.
  *
- * A bridged copy's Ethernet pair replaces the egress port's address and the
- * group's mapped destination the interface walk filled in. It is written over
- * the walk's result rather than instead of the walk, because the walk still
- * decides the transmit queue and the tags. A routed copy in a group whose root
- * kept the hop count decrements it itself; see fill_mcast_member_actions(). */
+ * A copy's Ethernet pair -- the one a bridged copy's root matched, or a routed
+ * copy's own, from the device ipmr sends it through -- replaces the egress
+ * port's address and the group's mapped destination the interface walk filled
+ * in. It is written over the walk's result rather than instead of the walk,
+ * because the walk still decides the transmit queue and the tags. A routed
+ * copy in a group whose root kept the hop count decrements it itself; see
+ * fill_mcast_member_actions(). */
 static void mcast_member_frame(struct ins_entry_info *info,
 			       const struct cdx_mc_member_frame *frame)
 {

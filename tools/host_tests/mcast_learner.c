@@ -532,7 +532,8 @@ static bool same_chain(const struct cdx_mc_group_spec *a, const struct cdx_mc_gr
         const struct cdx_mc_listener *x = &a->listener[i], *y = &b->listener[i];
 
         if (x->dev != y->dev || x->routed != y->routed || x->vlans != y->vlans ||
-            memcmp(x->vlan, y->vlan, x->vlans * sizeof(x->vlan[0])))
+            memcmp(x->vlan, y->vlan, x->vlans * sizeof(x->vlan[0])) ||
+            !ether_addr_equal(x->src_mac, y->src_mac))
             return false;
     }
     return true;
@@ -657,6 +658,9 @@ static struct net_device BR2  = { .name = "br1",  .ifindex = 15, .bridge_master 
 static const u8 GROUP_MAC[ETH_ALEN] = { 0x01, 0, 0x5e, 0x07, 0, 0x01 };
 static const u8 SENDER[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x51 };
 static const u8 OTHER_SENDER[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x52 };
+/* The address of the VIF a route's copy is sent through, which the copy
+ * leaves with; the routed learner reads it off the oif. */
+static const u8 VIF_MAC[ETH_ALEN] = { 0x02, 0, 0, 0, 0x02, 0x87 };
 
 static struct br_ip group_v4(uint32_t dst, uint32_t src, uint16_t vid)
 {
@@ -866,6 +870,7 @@ static void route_want(struct ft_mc_route *want, uint16_t vid, uint32_t src,
     want->dst.ip = dst;
     want->listener[0].dev = port;
     want->listener[0].routed = true;
+    ether_addr_copy(want->listener[0].src_mac, VIF_MAC);
     if (tag) {
         want->listener[0].vlans = 1;
         want->listener[0].vlan[0].proto = htons(ETH_P_8021Q);
@@ -1642,6 +1647,10 @@ static void one_stream_both_learners(void)
     assert(spec.listener[0].vlans == 1 && spec.listener[0].vlan[0].id == 289);
     assert(spec.listener[1].dev == &P3 && spec.listener[1].routed);
     assert(spec.listener[1].vlan[0].id == 287);
+    /* The routed copy leaves with its VIF's address, which the route names;
+     * the bridged one names none and keeps its sender's pair. */
+    assert(ether_addr_equal(spec.listener[1].src_mac, VIF_MAC));
+    assert(!memchr_inv(spec.listener[0].src_mac, 0, ETH_ALEN));
     assert(!strcmp(ft_mc_state(f), "installed"));
     {
         struct cdx_ft_counters c;
@@ -1662,12 +1671,46 @@ static void one_stream_both_learners(void)
     assert(ft_mc_route_publish(&r1, &want));
     assert(works == 1 && f->stale && r1.listener[0].vlan[0].id == 286);
     pass();
+    /* So is the VIF being given another address, which changes nothing else
+     * about the route: the entry carrying it writes the old one until the
+     * flow is rebuilt from the new. */
+    works = 0;
+    want.listener[0].src_mac[5] ^= 0x10;
+    assert(ft_mc_route_publish(&r1, &want));
+    assert(works == 1 && f->stale);
+    assert(ether_addr_equal(r1.listener[0].src_mac, want.listener[0].src_mac));
+    pass();
+    assert(f->hw && !f->stale && r1.carried);
+    ft_mc_flow_spec(f, &spec);
+    assert(ether_addr_equal(spec.listener[1].src_mac, want.listener[0].src_mac));
+    assert(ether_addr_equal(f->hw_spec.listener[1].src_mac, want.listener[0].src_mac));
 
-    /* What does not merge, with its reason. A routed copy framed exactly
-     * like the bridged one is two entries the backend would take for a
-     * duplicate; the union has to fit one group; and every copy has to fit
-     * what the ingress can deliver. */
+    /* A routed copy out of the port and tag stack the bridged copy takes --
+     * one port, two VLANs untagged on it -- is a copy of its own and is
+     * carried: it leaves with its VIF's address and one hop fewer where the
+     * bridged one keeps its sender's pair and hop count, two frames Linux
+     * sends, which the backend tells apart by the address. */
     route_want(&want, 289, S, G, &P2, 289);
+    ft_mc_route_publish(&r1, &want);
+    assert(ft_mc_carriable(f) && ft_mc_installable(f));
+    pass();
+    assert(f->hw && r1.carried && !strcmp(ft_mc_state(f), "installed"));
+    ft_mc_flow_spec(f, &spec);
+    assert(spec.listeners == 2);
+    assert(spec.listener[0].dev == &P2 && spec.listener[1].dev == &P2);
+    assert(spec.listener[0].vlans == spec.listener[1].vlans &&
+           spec.listener[0].vlan[0].id == spec.listener[1].vlan[0].id);
+    assert(!spec.listener[0].routed && spec.listener[1].routed);
+    assert(!ether_addr_equal(spec.listener[0].src_mac, spec.listener[1].src_mac));
+
+    /* What does not merge, with its reason: the union has to fit one group,
+     * and every copy has to fit what the ingress can deliver. */
+    route_want(&want, 289, S, G, &P3, 1);
+    for (unsigned i = 1; i < CDX_MC_MAX_LISTENERS; i++) {
+        want.listener[i] = want.listener[0];
+        want.listener[i].vlan[0].id = 1 + i;
+    }
+    want.listeners = CDX_MC_MAX_LISTENERS;
     ft_mc_route_publish(&r1, &want);
     assert(!ft_mc_carriable(f) && !ft_mc_installable(f));
     assert(!strcmp(ft_mc_state(f), "refused-listener"));
@@ -1676,14 +1719,6 @@ static void one_stream_both_learners(void)
      * made with, and what the fold takes off it when the route goes. */
     pass();
     assert(!f->hw && !r1.carried && r1.in_tags == 1);
-    route_want(&want, 289, S, G, &P3, 1);
-    for (unsigned i = 1; i < CDX_MC_MAX_LISTENERS; i++) {
-        want.listener[i] = want.listener[0];
-        want.listener[i].vlan[0].id = 1 + i;
-    }
-    want.listeners = CDX_MC_MAX_LISTENERS;
-    ft_mc_route_publish(&r1, &want);
-    assert(!strcmp(ft_mc_state(f), "refused-listener"));
     want.listeners = CDX_MC_MAX_LISTENERS - 1;
     ft_mc_route_publish(&r1, &want);
     assert(ft_mc_carriable(f));

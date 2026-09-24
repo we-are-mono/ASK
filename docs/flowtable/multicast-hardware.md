@@ -350,11 +350,14 @@ entries:
   start. The opcode's parameter word is the DSCP marking a flow's conntrack mark
   can request; a replica has no mark, so it is written zero, which is what a
   routed root with no mark writes.
-- The backend frames the copy as a router's: the egress port's address as the
-  source and the group's mapped address as the destination
+- The backend frames the copy as a router's: the address of the VIF ipmr sends
+  it through as the source and the group's mapped address as the destination
   (`cdx_mcast_group_mac()`), not the matched pair. `struct cdx_mc_listener`
-  says which copies are routed; `struct cdx_mc_member_frame` carries the
-  per-copy choice into the entry builder.
+  says which copies are routed and names each one's address (`src_mac`), which
+  is its port's own only when the VIF is the port; `struct cdx_mc_member_frame`
+  carries the per-copy pair into the entry builder, which writes it over the
+  port's address the interface walk filled in. Every copy of a routed group is
+  framed the same way.
 
 **This is unproven on hardware and is the first thing to measure.** Every
 replica edit measured so far is a prepend: VLAN and Ethernet inserts, which the

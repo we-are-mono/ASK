@@ -932,7 +932,7 @@ def _listener_script(client, seconds, port, result):
 
     A raw socket rather than a UDP one, and promiscuous, because a routed
     replica is not the frame the source sent: the hardware rebuilt its Ethernet
-    header with the egress port's own address and decremented the TTL, and those
+    header with its oif's own address and decremented the TTL, and those
     two fields are the difference between a replica the classifier made and a
     frame the bridge flooded. Nothing joins the group here -- routed multicast is
     static, and a membership would let a snooping path deliver frames that say
@@ -1568,11 +1568,16 @@ async def test_profile_homelab_routed_multicast_replicates(homelab, splat_window
         assert observed["cpu"] < sent * 0.05, (
             f"{observed['cpu']} of {sent} frames reached the DUT's CPU; the "
             f"stream is being replicated in software")
-        # The replica is not the frame the source sent: the egress port's own
-        # address is on it and the TTL is one lower, which is the routing the
-        # hardware did on the way through. A flooded copy would carry neither.
+        # The replica is not the frame the source sent: the address of the
+        # VLAN device ipmr sends it through is on it -- which that device took
+        # from the bridge, not the port it leaves by -- and the TTL is one
+        # lower, which is the routing the hardware did on the way through. A
+        # flooded copy would carry neither.
+        oif_mac = {vid: (await read(ctx.target, ctx.session,
+                                    f"/sys/class/net/{ctx.bridge_text[vid]}/address")).strip()
+                   for vid in (VID_A, VID_B)}
         for sample in listener["samples"]:
-            assert sample["src_mac"] == ctx.dut_lan_mac, (sample, ctx.dut_lan_mac)
+            assert sample["src_mac"] == oif_mac[VID_A], (sample, oif_mac)
             assert sample["ttl"] == STREAM_TTL - 1, sample
 
         # A second outbound interface: the IoT VLAN joins the same group.
@@ -1592,7 +1597,7 @@ async def test_profile_homelab_routed_multicast_replicates(homelab, splat_window
         # is the assertion that the copy for that VLAN was tagged -- and the
         # trusted client's macvlan receives nothing that carried one.
         for sample in both["clients"]["b"]["samples"]:
-            assert sample["src_mac"] == ctx.dut_lan_mac, (sample, ctx.dut_lan_mac)
+            assert sample["src_mac"] == oif_mac[VID_B], (sample, oif_mac)
             assert sample["ttl"] == STREAM_TTL - 1, sample
         assert both["cpu"] < both["sent"] * 0.05, both
     finally:

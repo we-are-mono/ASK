@@ -4201,6 +4201,16 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * record, and neither can be rewritten in place -- so it is
 		 * registered again instead. */
 		ft_wifi_address_changed(dev);
+		/* And every routed multicast copy sent through the device, in
+		 * its own entry or riding a bridged group: each is written with
+		 * its oif's address, which no MFC event follows. A VLAN device
+		 * that took its address from the device below follows it and
+		 * raises this again for itself. Asked of every group, because
+		 * the device may be an oif of any; one whose address did not
+		 * change derives the plan it already has, which costs the
+		 * hardware nothing. A bridged copy keeps its sender's address
+		 * and has nothing to follow. */
+		ft_mr_kick();
 		break;
 	case NETDEV_CHANGENAME:
 		/* Names carry no forwarding semantics; backend lookup uses the
@@ -4773,7 +4783,7 @@ static const struct cdx_ft_egress_ops ft_egress_ops = {
  * host, where ipmr routes it out of the others. That is one classifier key,
  * the bridged one, so it is one hardware group carrying the union of both
  * learners' copies: the bridge's with the sender's Ethernet pair and hop
- * count, ipmr's with the egress port's address and one hop fewer.
+ * count, ipmr's with its VIF's address and one hop fewer.
  *
  * The bridged learner owns that group, as one of its flows, because only its
  * traffic hook knows the port, the pair and the tag the stream arrives with.
@@ -5226,32 +5236,21 @@ static struct ft_mc_group *ft_mc_find(const struct net_device *bridge,
  * in software in its entirety rather than by the hardware in part; the
  * derivation records that as `error`.
  *
- * A route riding the flow is part of the same set. The union has to fit one
- * group, and a routed copy framed exactly like a bridged one -- one port, one
- * tag stack, two VLANs untagged on it -- is refused rather than programmed as
- * a second entry the backend would take for a duplicate.
+ * A route riding the flow is part of the same set, and the union has to fit
+ * one group. A routed copy leaving by the same port with the same tags as a
+ * bridged one -- one port, two VLANs untagged on it -- is still a copy of its
+ * own and is carried as one: it leaves with its VIF's address and one hop
+ * fewer where the bridged copy keeps its sender's pair and hop count, which
+ * are two frames Linux sends, and the backend tells its listeners apart by the
+ * address as well as by the framing.
  */
 static bool ft_mc_carriable(const struct ft_mc_flow *f)
 {
 	const struct ft_mc_route *r = f->route;
-	u8 i, j;
 
 	if (f->error)
 		return false;
-	if (!r)
-		return true;
-	if (f->ports + r->listeners > CDX_MC_MAX_LISTENERS)
-		return false;
-	for (j = 0; j < r->listeners; j++)
-		for (i = 0; i < f->ports; i++) {
-			const struct cdx_mc_listener *p = &f->port[i];
-
-			if (p->dev == r->listener[j].dev &&
-			    p->vlans == r->listener[j].vlans &&
-			    !memcmp(p->vlan, r->listener[j].vlan, sizeof(p->vlan)))
-				return false;
-		}
-	return true;
+	return !r || f->ports + r->listeners <= CDX_MC_MAX_LISTENERS;
 }
 
 /* Whether every frame the ingress port can deliver fits every port the flow
@@ -5466,13 +5465,17 @@ static bool ft_mc_route_same(const struct ft_mc_route *a,
 	    memcmp(&a->dst, &b->dst, sizeof(a->dst)) ||
 	    a->listeners != b->listeners || a->mtu != b->mtu)
 		return false;
-	/* Field by field: the listener struct has tail padding. */
+	/* Field by field, so no padding can decide it. The address a copy
+	 * leaves with is part of it: a VIF given another one changes what the
+	 * carrying flow has to write, and nothing else about the route moves. */
 	for (i = 0; i < a->listeners; i++)
 		if (a->listener[i].dev != b->listener[i].dev ||
 		    a->listener[i].vlans != b->listener[i].vlans ||
 		    a->listener[i].routed != b->listener[i].routed ||
 		    memcmp(a->listener[i].vlan, b->listener[i].vlan,
-			   sizeof(a->listener[i].vlan)))
+			   sizeof(a->listener[i].vlan)) ||
+		    !ether_addr_equal(a->listener[i].src_mac,
+				      b->listener[i].src_mac))
 			return false;
 	return true;
 }
@@ -5847,9 +5850,10 @@ static void ft_mc_flow_spec(const struct ft_mc_flow *f,
 	 * which br_multicast_list_ports() leaves out as should_deliver() does. */
 	for (i = 0; i < f->ports; i++)
 		spec->listener[spec->listeners++] = f->port[i];
-	/* The routed copies take the egress port's address and one hop off,
-	 * as ipmr's would; a routed copy back out of the ingress port is one
-	 * ipmr sends too, since it leaves by another VIF. */
+	/* The routed copies take the address of the VIF each is sent through,
+	 * which the route names per copy, and one hop off, as ipmr's would; a
+	 * routed copy back out of the ingress port is one ipmr sends too,
+	 * since it leaves by another VIF. */
 	for (i = 0; r && i < r->listeners; i++) {
 		spec->listener[spec->listeners] = r->listener[i];
 		spec->listener[spec->listeners++].routed = true;
@@ -6771,10 +6775,12 @@ static bool ft_mc_listeners_same(const struct cdx_mc_listener *a,
 {
 	u8 i;
 
-	/* Field by field: the listener struct has tail padding. */
+	/* Field by field, so no padding can decide it, and every field that
+	 * identifies a listener -- a bridged one's address is always zero. */
 	for (i = 0; i < n; i++)
 		if (a[i].dev != b[i].dev || a[i].vlans != b[i].vlans ||
-		    memcmp(a[i].vlan, b[i].vlan, sizeof(a[i].vlan)))
+		    memcmp(a[i].vlan, b[i].vlan, sizeof(a[i].vlan)) ||
+		    !ether_addr_equal(a[i].src_mac, b[i].src_mac))
 			return false;
 	return true;
 }
@@ -8051,8 +8057,8 @@ static void ft_mc_rows(struct seq_file *seq)
  * This learner requests a routed root, which decrements TTL or hop limit;
  * the bridge learner preserves it. The parser refuses to classify a frame
  * arriving with 0 or 1, matching the router's `ttl > 1` rule. Listener entries
- * rebuild Ethernet with the egress port's address and the group's mapped
- * multicast destination, as this routed path requires.
+ * rebuild Ethernet from the address of the VIF each copy is sent through to
+ * the group's mapped multicast destination, as ipmr's own copies are built.
  *
  * An entry whose parent VIF is a bridge, or an 802.1Q device above one, is the
  * exception: its stream arrives on a bridge port, which only the bridged
@@ -8546,13 +8552,14 @@ static struct net_device *ft_mr_ingress_bridge(struct net_device *dev,
  * `path_mtu` is the smallest MTU on the way from the oif down to this port,
  * and *mtu the smallest over every copy the group makes -- including one that
  * collapses into a copy another oif already produced, because Linux would have
- * sent that one down its own, possibly narrower, path.
+ * sent that one down its own, possibly narrower, path. `src_mac` is the oif's
+ * own address, which the copy leaves with; see ft_mr_expand().
  */
 static int ft_mr_listener(struct net_device *port,
 			  const struct cdx_mc_listener *ingress,
 			  const struct cdx_ft_vlan *inner, unsigned int tags,
-			  u32 path_mtu, struct cdx_mc_listener *out, u8 *count,
-			  u32 *mtu)
+			  u32 path_mtu, const u8 *src_mac,
+			  struct cdx_mc_listener *out, u8 *count, u32 *mtu)
 {
 	struct cdx_mc_listener add = {};
 	unsigned int i;
@@ -8562,6 +8569,7 @@ static int ft_mr_listener(struct net_device *port,
 	add.dev = port;
 	add.vlans = tags;
 	add.routed = true;
+	ether_addr_copy(add.src_mac, src_mac);
 	for (i = 0; i < tags; i++)
 		add.vlan[i] = inner[tags - 1 - i];
 	/* A copy that would leave the way the frame arrived is not a copy: a
@@ -8583,20 +8591,23 @@ static int ft_mr_listener(struct net_device *port,
 	if (add.dev == ingress->dev && add.vlans == ingress->vlans &&
 	    !memcmp(add.vlan, ingress->vlan, sizeof(add.vlan)))
 		return -EOPNOTSUPP;
-	/* Two oifs resolving to the same port with the same framing are one
-	 * copy and collapse; with different framing they are two, and the
-	 * backend takes both -- it identifies a listener by its whole framing
-	 * rather than by its device, and each gets its own entry in the chain.
-	 * A gateway serving several VLANs out of one port replicates that way,
-	 * and so does the bench: the rig has one LAN port with carrier and
-	 * every group's other port is its ingress, so two tagged oifs on that
-	 * port are the only way replication to several listeners and the chain
-	 * swap a join performs can be exercised there at all (ISSUES.md
-	 * A158). */
+	/* Two oifs resolving to the same port with the same framing and the
+	 * same address are one copy and collapse; with different framing they
+	 * are two, and the backend takes both -- it identifies a listener by
+	 * its whole framing rather than by its device, and each gets its own
+	 * entry in the chain. A gateway serving several VLANs out of one port
+	 * replicates that way, and so does the bench: the rig has one LAN port
+	 * with carrier and every group's other port is its ingress, so two
+	 * tagged oifs on that port are the only way replication to several
+	 * listeners and the chain swap a join performs can be exercised there
+	 * at all (ISSUES.md A158). Two oifs with one framing and different
+	 * addresses -- the port itself and a bridge over it given an address
+	 * of its own -- are two frames on the wire in Linux, and two here. */
 	*mtu = min(*mtu, path_mtu);
 	for (i = 0; i < *count; i++)
 		if (out[i].dev == add.dev && out[i].vlans == add.vlans &&
-		    !memcmp(out[i].vlan, add.vlan, sizeof(add.vlan)))
+		    !memcmp(out[i].vlan, add.vlan, sizeof(add.vlan)) &&
+		    ether_addr_equal(out[i].src_mac, add.src_mac))
 			return 0;
 	if (*count == CDX_MC_MAX_LISTENERS)
 		return -EOPNOTSUPP;
@@ -8642,7 +8653,8 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
 			       unsigned int tags, u8 family,
 			       const union nf_inet_addr *src,
 			       const union nf_inet_addr *dst, u32 path_mtu,
-			       struct cdx_mc_listener *out, u8 *count, u32 *mtu)
+			       const u8 *src_mac, struct cdx_mc_listener *out,
+			       u8 *count, u32 *mtu)
 {
 	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
 	struct br_ip group = {};
@@ -8680,7 +8692,7 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
 			return -EOPNOTSUPP;
 		rc = ft_mr_listener(chosen[i], ingress, stack, c,
 				    min_t(u32, path_mtu, READ_ONCE(chosen[i]->mtu)),
-				    out, count, mtu);
+				    src_mac, out, count, mtu);
 		if (rc)
 			return rc;
 	}
@@ -8701,6 +8713,18 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
  * each device on the way down counts, because the oif is what ipmr and ip6mr
  * send against and the port is what the listener's enqueue fragments at.
  * *bridged comes back true when the oif is a bridge or sits on one.
+ *
+ * Every copy leaves with the oif's own address, read here before the walk goes
+ * down, because that is the one ipmr's copy carries: ip_finish_output2() and
+ * ip6_finish_output2() build the header on the VIF device, and a bridge, or a
+ * VLAN device on a port or a bridge, sends it on unchanged. It is the port's
+ * only when the oif is the port -- a VLAN device can be given another, and a
+ * bridge carries one of its ports' or its own -- and the unicast path's answer
+ * to the same divergence, refusing it, would keep a whole IPTV stream in
+ * software on the ordinary br-lan.N layout. An oif with no unicast address of
+ * its own names no frame the hardware could write, and is refused. Read under
+ * RTNL, which every address change holds, so the plan and the device agree;
+ * NETDEV_CHANGEADDR asks for the plan again.
  */
 static int ft_mr_expand(struct net_device *dev,
 			const struct cdx_mc_listener *ingress,
@@ -8712,7 +8736,12 @@ static int ft_mr_expand(struct net_device *dev,
 	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX] = {};
 	unsigned int tags = 0;
 	u32 path_mtu = U32_MAX;
+	u8 src_mac[ETH_ALEN];
 
+	if (!dev || dev->addr_len != ETH_ALEN ||
+	    !is_valid_ether_addr(dev->dev_addr))
+		return -EOPNOTSUPP;
+	ether_addr_copy(src_mac, dev->dev_addr);
 	for (;;) {
 		if (!dev)
 			return -EOPNOTSUPP;
@@ -8721,11 +8750,12 @@ static int ft_mr_expand(struct net_device *dev,
 			*bridged = true;
 			return ft_mr_expand_bridge(dev, ingress, inner, tags,
 						   family, src, dst, path_mtu,
-						   out, count, mtu);
+						   src_mac, out, count, mtu);
 		}
 		if (cdx_mc_port_identity(dev))
 			return ft_mr_listener(dev, ingress, inner, tags,
-					      path_mtu, out, count, mtu);
+					      path_mtu, src_mac, out, count,
+					      mtu);
 		if (!is_vlan_dev(dev) || tags == CDX_FT_VLAN_MAX ||
 		    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q))
 			return -EOPNOTSUPP;
@@ -8971,7 +9001,10 @@ static bool ft_mr_plan_same(const struct ft_mr_group *g,
 		const struct cdx_mc_listener *a = &g->listener[i];
 		const struct cdx_mc_listener *b = &plan->spec.listener[i];
 
-		if (a->dev != b->dev || a->vlans != b->vlans)
+		/* The address too: an oif given another one is a chain that
+		 * writes the old one until it is replaced. */
+		if (a->dev != b->dev || a->vlans != b->vlans ||
+		    !ether_addr_equal(a->src_mac, b->src_mac))
 			return false;
 		for (j = 0; j < a->vlans; j++)
 			if (a->vlan[j].proto != b->vlan[j].proto ||

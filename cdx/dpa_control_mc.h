@@ -61,8 +61,8 @@ struct mcast_group_info
    * that leaves them zero gets its routed root.
    *
    * `mac_keyed`: the root is keyed on `mac_pair` -- destination then source,
-   * the frame's own -- in the bridged multicast table, and every listener
-   * rebuilds Ethernet with that pair. `in_vlan` is the tag stack the root
+   * the frame's own -- in the bridged multicast table, and every bridged
+   * copy rebuilds Ethernet with that pair. `in_vlan` is the tag stack the root
    * validates and strips, innermost first as struct cdx_l2_encap orders it. */
   bool mac_keyed;
   uint8_t mac_pair[2 * ETHER_ADDR_LEN];
@@ -88,13 +88,17 @@ extern spinlock_t *mc4_spinlocks;
 extern spinlock_t *mc6_spinlocks;
 
 /* How one listener's copy is framed beyond what its egress interface and tags
- * give it. NULL is the routed answer: the egress port's own address as the
- * source and the group's mapped address as the destination.
+ * give it.
  *
- * `mac_pair` is a bridged copy's: the destination and source the root matched,
- * in the order the header carries them, written back verbatim. A bridge
- * forwards a frame with the addresses it arrived with, and the root is keyed
- * on this pair precisely so that the listener can know them.
+ * `mac_pair` is the destination and source the copy is written with, in the
+ * order the header carries them, over the header the interface walk filled
+ * in. A bridged copy's is the pair its root matched, written back verbatim: a
+ * bridge forwards a frame with the addresses it arrived with, and the root is
+ * keyed on this pair precisely so that the listener can know them. A routed
+ * copy's is the group's mapped address and the address of the device ipmr
+ * sends it through, which is the port's own only when that device is the
+ * port. NULL leaves the walk's header: the egress port's own address to the
+ * group's mapped one, which the group interface never asks for.
  *
  * `hop` is a routed copy's in a group whose root preserves the hop count for
  * its bridged copies: the entry decrements it itself, ahead of its header

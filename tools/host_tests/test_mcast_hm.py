@@ -115,6 +115,31 @@ def test_mcast_hm(tmp_path):
         + function(ehash, "insert_opcodeonly_hm")
         + function(ehash, "create_member_hop_hm")
         + function(ehash, "insert_remove_vlan_hm"))
+    # The group interface's check and listener builder, which decide the pair
+    # each copy is written with, over the backend's own descriptions.
+    mc = (ROOT / "cdx/dpa_control_mc.c").read_text()
+    mc_header = (ROOT / "cdx/dpa_control_mc.h").read_text()
+    backend = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
+    flowtable = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
+    layer2 = (ROOT / "cdx/layer2.h").read_text()
+    route_end = "}RouteEntry, *PRouteEntry;"
+    (tmp_path / "mcast_backend_types.inc").write_text(
+        "".join(re.search(pattern, text, re.M).group() + "\n" for pattern, text in (
+            (r"^#define IF_NAME_SIZE\s+\d+", (ROOT / "cdx/types.h").read_text()),
+            (r"^#define CDX_FT_VLAN_MAX\s+\d+", flowtable),
+            (r"^#define CDX_MC_MAX_LISTENERS\s+\d+", backend),
+            (r"^#define MC_MAX_LISTENERS_PER_GROUP\s+\d+", mc_header)))
+        + declaration(flowtable, "cdx_ft_vlan")
+        + declaration(backend, "cdx_mc_listener")
+        + declaration(backend, "cdx_mc_group_spec")
+        + loose_declaration(mc_header, "mcast_group_member")
+        + loose_declaration(mc_header, "mcast_group_info")
+        + layer2[layer2.index("typedef struct _tRouteEntry {"):
+                 layer2.index(route_end) + len(route_end)] + "\n")
+    (tmp_path / "mcast_backend.inc").write_text("".join(
+        function(mc, name) for name in (
+            "cdx_mcast_group_mac", "cdx_mcast_compute_mac", "cdx_mc_check_group",
+            "cdx_mc_check", "cdx_mc_describe", "cdx_mc_build_listeners")))
     binary = tmp_path / "mcast_hm"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
@@ -181,18 +206,23 @@ def test_only_a_bridged_root_gives_a_routed_copy_its_own_hop():
     already decrements for all of them. Only a root that keeps the hop count
     -- the bridged one, keyed on the frame's own pair -- may have a routed copy
     decrement again in its own entry, or a routed group's copies would leave
-    two hops down. And such a copy is a router's frame: from the egress port
-    to the group's mapped address, not the matched pair.
+    two hops down. And every routed copy is a router's frame: from the address
+    of the device ipmr sends it through, which the listener names, to the
+    group's mapped address -- never the matched pair, and never the port's own
+    address the interface walk writes (mcast_hm.c runs the builder).
     """
     from test_mcast_backend import code
     body = code("cdx_mc_build_listeners")
-    guard = "if (grp->mac_keyed && spec->listener[ii].routed) {"
+    guard = "if (!grp->mac_keyed || listener->routed) {"
     assert guard in body
     arm = body[body.index(guard):]
     arm = arm[:arm.index("}")]
-    assert "copy.hop = true;" in arm and "copy.mac_pair = NULL;" in arm
+    assert "copy.hop = grp->mac_keyed;" in arm
+    assert "memcpy(routed_pair, mapped, ETH_ALEN);" in arm
+    assert "memcpy(routed_pair + ETH_ALEN, listener->src_mac, ETH_ALEN);" in arm
+    assert "copy.mac_pair = routed_pair;" in arm
     assert "memcpy(pRtEntry->dstmac, mapped, ETH_ALEN);" in arm
-    assert body.count("copy.hop = true;") == 1
+    assert "copy.hop = true;" not in body and "copy.mac_pair = NULL;" not in body
     # Every copy starts from the root's framing, the per-copy change on top.
     assert body.index("memcpy(pRtEntry->dstmac, arrived, ETH_ALEN);") < body.index(guard)
 

@@ -127,6 +127,179 @@ static struct cdx_l2_encap one_tag(uint16_t vid)
     return encap;
 }
 
+/* ---- the group interface's listener builder --------------------------
+ *
+ * Which pair each copy is written with is the builder's decision, not the
+ * emitters': a bridged copy writes back the pair its root matched, and a
+ * routed copy -- every copy of a routed group, and the routed ones of a
+ * bridged group -- the group's mapped address from the address of the device
+ * ipmr sends it through, which the caller names per copy. The builder and the
+ * check in front of it are the backend's own. The entry builder beneath them
+ * is replaced by one that does to the header what
+ * create_exthash_entry4mcast_member() does -- the interface walk writes the
+ * port's own address, the copy's frame is written over it, the emitters lay
+ * the entry down -- and keeps the header the entry carries. */
+#define ETH_ALEN ETHER_ADDR_LEN
+#define AF_INET 2
+#define AF_INET6 10
+#define EOPNOTSUPP 95
+#define EIO 5
+#define IPV6_ADDR_SCOPE_LINKLOCAL 0x02
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define htonl(x) __builtin_bswap32((uint32_t)(x))
+#else
+#define htonl(x) ((uint32_t)(x))
+#endif
+#define ntohl(x) htonl(x)
+#define ntohs(x) htons(x)
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint16_t __be16;
+/* Distinct values: which table a listener is drawn from is all the builder
+ * says about it. */
+enum { IPV4_MULTICAST_TABLE = 1, IPV6_MULTICAST_TABLE,
+       IPV4_BRIDGED_MULTICAST_TABLE, IPV6_BRIDGED_MULTICAST_TABLE };
+
+struct net_device {
+    char name[16];
+    unsigned char dev_addr[ETH_ALEN];
+};
+struct list_head { struct list_head *next, *prev; };
+struct in6_addr { uint8_t s6_addr[16]; };
+union nf_inet_addr {
+    uint32_t all[4];
+    uint32_t ip;
+    struct in6_addr in6;
+};
+struct en_exthash_tbl_entry;
+
+#include "mcast_backend_types.inc"
+
+static bool is_zero_ether_addr(const u8 *a)
+{
+    return !(a[0] | a[1] | a[2] | a[3] | a[4] | a[5]);
+}
+static bool is_multicast_ether_addr(const u8 *a) { return a[0] & 1; }
+static bool is_valid_ether_addr(const u8 *a)
+{
+    return !is_multicast_ether_addr(a) && !is_zero_ether_addr(a);
+}
+static bool ether_addr_equal(const u8 *a, const u8 *b)
+{
+    return !memcmp(a, b, ETH_ALEN);
+}
+static bool ipv6_addr_any(const struct in6_addr *a)
+{
+    static const struct in6_addr zero;
+
+    return !memcmp(a, &zero, sizeof(*a));
+}
+static bool ipv6_addr_is_multicast(const struct in6_addr *a)
+{
+    return a->s6_addr[0] == 0xff;
+}
+/* A model of the two scope helpers: for a multicast address the scope is the
+ * low nibble of the second byte, and nothing else is asked of them here. */
+static int __ipv6_addr_type(const struct in6_addr *a)
+{
+    return ipv6_addr_is_multicast(a) ? ((a->s6_addr[1] & 0x0f) << 16) : 0;
+}
+static int __ipv6_addr_src_scope(int type) { return type >> 16; }
+/* Every port here is one the flowtable can carry: what is under test is the
+ * copies, not the ports. */
+static bool cdx_mc_port_supported(struct net_device *dev) { return dev != NULL; }
+
+static unsigned freed;
+static int cdx_free_exthash_mcast_members(struct mcast_group_info *grp)
+{
+    (void)grp;
+    freed++;
+    return 0;
+}
+
+/* What each copy's entry was built from and what it carries. */
+static struct {
+    const struct cdx_mc_listener *listener;
+    uint32_t tbl_type;
+    uint8_t header[2 * ETHER_ADDR_LEN];
+    bool hop;
+} copies[MC_MAX_LISTENERS_PER_GROUP];
+static unsigned copies_built;
+
+static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
+        const struct cdx_mc_listener *copy,
+        const struct cdx_mc_member_frame *frame,
+        struct en_exthash_tbl_entry *prev, uint32_t tbl_type)
+{
+    struct ins_entry_info info;
+    struct entry e;
+    uint8_t *header;
+    unsigned at = copies_built++;
+
+    assert(at < ARRAY_SIZE(copies));
+    /* Threaded head to tail, each entry after the last one built. */
+    assert(prev == (at ? (struct en_exthash_tbl_entry *)&copies[at - 1] : NULL));
+    memset(&info, 0, sizeof(info));
+    /* The interface walk: the route's destination, from the port's own
+     * address. */
+    memcpy(info.l2_info.l2hdr, pRtEntry->dstmac, ETHER_ADDR_LEN);
+    memcpy(info.l2_info.l2hdr + ETHER_ADDR_LEN, copy->dev->dev_addr, ETHER_ADDR_LEN);
+    assert(copy->vlans <= 1);
+    if (copy->vlans) {
+        struct cdx_l2_encap encap = one_tag(copy->vlan[0].id);
+
+        assert(apply_l2_encap(&info, &encap) == SUCCESS);
+    }
+    mcast_member_frame(&info, frame);
+    if (tbl_type == IPV6_MULTICAST_TABLE || tbl_type == IPV6_BRIDGED_MULTICAST_TABLE)
+        info.flags |= EHASH_IPV6_FLOW;
+    cursor(&info, &e);
+    assert(listener(&info) == SUCCESS);
+    /* The header as the entry carries it: after the hop's word and the
+     * tag's, where the Ethernet insert's parameters begin. */
+    copies[at].hop = (info.flags & TTL_HM_VALID) != 0;
+    header = e.params + (copies[at].hop ? sizeof(struct en_ehash_update_dscp) : 0)
+             + (copy->vlans ? sizeof(struct en_ehash_insert_vlan_hdr) + 4 : 0)
+             + sizeof(struct en_ehash_insert_l2_hdr);
+    memcpy(copies[at].header, header, sizeof(copies[at].header));
+    copies[at].listener = copy;
+    copies[at].tbl_type = tbl_type;
+    return (struct en_exthash_tbl_entry *)&copies[at];
+}
+
+#include "mcast_backend.inc"
+
+/* Describe a group and build its listeners, as add does once the key is its
+ * own. */
+static int build(struct mcast_group_info *grp, const struct cdx_mc_group_spec *spec)
+{
+    memset(grp, 0, sizeof(*grp));
+    grp->grpid = -1;
+    cdx_mc_describe(grp, spec);
+    copies_built = 0;
+    return cdx_mc_build_listeners(grp, spec);
+}
+
+static struct cdx_mc_listener copy_to(struct net_device *dev, uint16_t vid,
+                                      bool routed, const uint8_t *src_mac)
+{
+    struct cdx_mc_listener l;
+
+    memset(&l, 0, sizeof(l));
+    l.dev = dev;
+    if (vid) {
+        l.vlans = 1;
+        l.vlan[0].proto = htons(ETHERTYPE_VLAN);
+        l.vlan[0].id = vid;
+    }
+    l.routed = routed;
+    if (src_mac)
+        memcpy(l.src_mac, src_mac, ETH_ALEN);
+    return l;
+}
+
 int main(void)
 {
     struct ins_entry_info info;
@@ -399,6 +572,119 @@ int main(void)
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         cursor(&info, &entries[8]);
         assert(listener(&info) == FAILURE);
+    }
+
+    /* ---- the address each copy leaves with ----------------------------
+     *
+     * ipmr builds a copy's header on the device it sends it through, and a
+     * bridge or a VLAN device passes it on: the copy leaves with that
+     * device's address, which is its port's only when the device is the
+     * port. The walk writes the port's; a routed copy's own is written over
+     * it. */
+    {
+        static struct net_device in = { "eth4", { 0x02, 0, 0, 0, 0, 0x04 } };
+        static struct net_device out = { "eth3", { 0x02, 0, 0, 0, 0, 0x03 } };
+        /* br-ftmcast.290's, say, and a second VLAN device's on the port. */
+        static const uint8_t vif[ETH_ALEN] = { 0x02, 0, 0, 0, 0x02, 0x90 };
+        static const uint8_t vif2[ETH_ALEN] = { 0x02, 0, 0, 0, 0x02, 0x91 };
+        static const uint8_t sender[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+        /* 239.9.5.4 */
+        static const uint8_t mapped[ETH_ALEN] = { 0x01, 0x00, 0x5e, 0x09, 0x05, 0x04 };
+        /* A bridged frame's own destination, which need not be the mapped
+         * one: the root matches it and a bridged copy writes it back. */
+        static const uint8_t arrived[ETH_ALEN] = { 0x01, 0x00, 0x5e, 0x89, 0x05, 0x04 };
+        struct cdx_mc_group_spec spec;
+        struct mcast_group_info grp;
+
+        /* A routed group: every copy is a router's, whether or not the
+         * caller marked it, from the group's mapped address and its own
+         * device's address, and the root takes the hop off for all. */
+        memset(&spec, 0, sizeof(spec));
+        spec.in = &in;
+        spec.family = AF_INET;
+        spec.src.ip = htonl(0x0a000034);
+        spec.dst.ip = htonl(0xef090504);
+        spec.listener[0] = copy_to(&out, 0, true, vif);
+        spec.listener[1] = copy_to(&out, 290, false, vif2);
+        spec.listeners = 2;
+        assert(cdx_mc_check(&spec) == 0);
+        assert(build(&grp, &spec) == 0 && copies_built == 2 && grp.uiListenerCnt == 2);
+        for (unsigned i = 0; i < 2; i++) {
+            assert(copies[i].tbl_type == IPV4_MULTICAST_TABLE && !copies[i].hop);
+            assert(!memcmp(copies[i].header, mapped, ETH_ALEN));
+        }
+        assert(!memcmp(copies[0].header + ETH_ALEN, vif, ETH_ALEN));
+        assert(!memcmp(copies[1].header + ETH_ALEN, vif2, ETH_ALEN));
+        /* IPv6 the same, from the IPv6 table. */
+        spec.family = AF_INET6;
+        memset(&spec.src, 0, sizeof(spec.src));
+        memset(&spec.dst, 0, sizeof(spec.dst));
+        spec.src.in6.s6_addr[0] = 0xfd;
+        spec.src.in6.s6_addr[15] = 0x02;
+        spec.dst.in6.s6_addr[0] = 0xff;
+        spec.dst.in6.s6_addr[1] = 0x1e;
+        spec.dst.in6.s6_addr[15] = 0x04;
+        assert(cdx_mc_check(&spec) == 0);
+        assert(build(&grp, &spec) == 0 && copies_built == 2);
+        assert(copies[0].tbl_type == IPV6_MULTICAST_TABLE);
+        assert(copies[0].header[0] == 0x33 && copies[0].header[1] == 0x33);
+        assert(!memcmp(copies[0].header + ETH_ALEN, vif, ETH_ALEN));
+        spec.family = AF_INET;
+        spec.src.ip = htonl(0x0a000034);
+        spec.dst.ip = htonl(0xef090504);
+
+        /* A routed copy names no address of its own, or one no station
+         * has: refused, never defaulted to the port's -- which is what Linux
+         * sends only when the device is the port. */
+        memset(spec.listener[1].src_mac, 0, ETH_ALEN);
+        assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
+        spec.listener[1].src_mac[0] = 0x01;
+        assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
+        /* Two copies out of one port with one framing are two only when
+         * their addresses differ, which is two devices ipmr sends through;
+         * the same copy twice is refused. */
+        spec.listener[1] = copy_to(&out, 0, true, vif2);
+        assert(cdx_mc_check(&spec) == 0);
+        spec.listener[1] = copy_to(&out, 0, true, vif);
+        assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
+
+        /* A bridged group: the bridged copy writes back the pair its root
+         * matched and keeps the hop count, the routed one leaves from its
+         * device to the mapped address and takes its own hop off -- two
+         * copies out of one port and one tag stack, told apart by the
+         * address. */
+        memset(&spec, 0, sizeof(spec));
+        spec.in = &in;
+        spec.family = AF_INET;
+        spec.bridged = true;
+        spec.src.ip = htonl(0x0a000034);
+        spec.dst.ip = htonl(0xef090504);
+        memcpy(spec.dst_mac, arrived, ETH_ALEN);
+        memcpy(spec.src_mac, sender, ETH_ALEN);
+        spec.listener[0] = copy_to(&out, 289, false, NULL);
+        spec.listener[1] = copy_to(&out, 289, true, vif);
+        spec.listener[2] = copy_to(&out, 290, true, vif);
+        spec.listeners = 3;
+        assert(cdx_mc_check(&spec) == 0);
+        assert(build(&grp, &spec) == 0 && copies_built == 3);
+        assert(copies[0].tbl_type == IPV4_BRIDGED_MULTICAST_TABLE && !copies[0].hop);
+        assert(!memcmp(copies[0].header, arrived, ETH_ALEN));
+        assert(!memcmp(copies[0].header + ETH_ALEN, sender, ETH_ALEN));
+        for (unsigned i = 1; i < 3; i++) {
+            assert(copies[i].tbl_type == IPV4_BRIDGED_MULTICAST_TABLE && copies[i].hop);
+            assert(!memcmp(copies[i].header, mapped, ETH_ALEN));
+            assert(!memcmp(copies[i].header + ETH_ALEN, vif, ETH_ALEN));
+            assert(memcmp(copies[i].header + ETH_ALEN, out.dev_addr, ETH_ALEN));
+        }
+        /* A routed copy without an address is refused here too, and a
+         * bridged copy naming one is asking for something it cannot have:
+         * it keeps its sender's. */
+        memset(spec.listener[1].src_mac, 0, ETH_ALEN);
+        assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
+        spec.listener[1] = copy_to(&out, 289, true, vif);
+        memcpy(spec.listener[0].src_mac, vif2, ETH_ALEN);
+        assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
+        assert(!freed);
     }
 
     printf("ok\n");

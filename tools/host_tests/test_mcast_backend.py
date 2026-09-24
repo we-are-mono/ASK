@@ -127,6 +127,10 @@ def test_a_listener_is_its_whole_framing_not_its_port():
     body = code("cdx_mc_check")
     assert "o->vlans == l->vlans" in body and "memcmp(o->vlan, l->vlan" in body, (
         "the duplicate test must compare the whole framing, not the device")
+    # And the address a copy leaves with: two devices ipmr sends through, or a
+    # bridged copy beside a routed one, are two frames on one port and tags.
+    assert "ether_addr_equal(o->src_mac, l->src_mac)" in body, (
+        "copies that differ only in their source address are two copies")
     assert "spec->listener[jj].dev == l->dev" not in body, (
         "a port named twice with different tags is two copies, not a duplicate")
     # And the in-kernel build path still indexes its members by position.
@@ -317,8 +321,8 @@ def test_a_bridged_group_is_keyed_on_its_own_frames():
     bridged group's root is keyed on the frame's own Ethernet pair, in the
     bridged multicast table, and every copy writes that pair back: the only
     way a listener can know the sender's address is for its root to have
-    matched it. A routed group keeps the routed key and its copies take the
-    egress port's address.
+    matched it. A routed group keeps the routed key and its copies take their
+    oif's own address, as ipmr sends them.
     """
     check = code("cdx_mc_check")
     assert "spec->bridged && (!is_multicast_ether_addr(spec->dst_mac)" in check

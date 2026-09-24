@@ -967,6 +967,19 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
 			return -EOPNOTSUPP;
 		if (!cdx_mc_port_supported(l->dev))
 			return -EOPNOTSUPP;
+		/* A routed copy leaves with the address of the device ipmr
+		 * sends it through, which only the caller knows. Without one
+		 * it could only take its port's, which is not what Linux sends
+		 * whenever that device is a bridge or a VLAN device given an
+		 * address of its own -- so it is refused rather than defaulted,
+		 * and a caller that forgot it is told instead of diverging
+		 * silently. A bridged copy keeps its sender's pair and names
+		 * none, which keeps the address a part of what tells two
+		 * listeners apart below. */
+		if ((!spec->bridged || l->routed) ?
+		    !is_valid_ether_addr(l->src_mac) :
+		    !is_zero_ether_addr(l->src_mac))
+			return -EOPNOTSUPP;
 		/* A listener repeated exactly would be programmed twice and
 		 * that port would receive two identical copies of every frame.
 		 * It fails rather than being deduplicated, because silently
@@ -976,18 +989,21 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
 		 * The same port with *different* framing is not that, and is
 		 * not refused: those are two different copies, one tagged for
 		 * each VLAN the port serves, which is what a gateway carrying
-		 * several VLANs on one link replicates. Nothing below this
-		 * interface identifies a member by its device. Each one gets
-		 * its own external-hash entry from its own ins_entry_info,
-		 * built from the onif plus the caller's cdx_l2_encap and
-		 * threaded into the chain by pointer; the group's members[] is
-		 * indexed by position, and the name copied into if_info is for
-		 * the log alone. */
+		 * several VLANs on one link replicates -- or one from each of
+		 * two devices ipmr sends through, which differ in address, or
+		 * a bridged copy beside a routed one, which differ in address
+		 * and hop count. Nothing below this interface identifies a
+		 * member by its device. Each one gets its own external-hash
+		 * entry from its own ins_entry_info, built from the onif plus
+		 * the caller's cdx_l2_encap and threaded into the chain by
+		 * pointer; the group's members[] is indexed by position, and
+		 * the name copied into if_info is for the log alone. */
 		for (jj = 0; jj < ii; jj++) {
 			const struct cdx_mc_listener *o = &spec->listener[jj];
 
 			if (o->dev == l->dev && o->vlans == l->vlans &&
-			    !memcmp(o->vlan, l->vlan, sizeof(o->vlan)))
+			    !memcmp(o->vlan, l->vlan, sizeof(o->vlan)) &&
+			    ether_addr_equal(o->src_mac, l->src_mac))
 				return -EOPNOTSUPP;
 		}
 	}
@@ -1070,21 +1086,30 @@ static int cdx_mc_build_listeners(struct mcast_group_info *grp,
 	}
 
 	for (ii = 0; ii < spec->listeners; ii++) {
+		const struct cdx_mc_listener *listener = &spec->listener[ii];
 		struct cdx_mc_member_frame copy = frame;
+		uint8_t routed_pair[2 * ETH_ALEN];
 
-		/* A routed copy of a bridged group is a router's frame: from
-		 * the egress port to the group's mapped address, one hop fewer
-		 * than the root, which kept the count for the bridged copies,
-		 * let it arrive with. A routed group's root decrements for
-		 * every copy and needs none of this. */
+		/* A routed copy is a router's frame: from the address of the
+		 * device ipmr sends it through, which the listener names, to
+		 * the group's mapped address -- written over the walk's header
+		 * as a bridged pair is, because the walk writes the port's own
+		 * address, and that is what Linux sends only when the device
+		 * is the port. Every copy of a routed group is one, and so is
+		 * a routed copy of a bridged group. That one also takes a hop
+		 * off in its own entry, because a bridged root keeps the count
+		 * for its bridged copies; a routed root decrements for all of
+		 * its copies itself. */
 		memcpy(pRtEntry->dstmac, arrived, ETH_ALEN);
-		if (grp->mac_keyed && spec->listener[ii].routed) {
-			copy.mac_pair = NULL;
-			copy.hop = true;
+		if (!grp->mac_keyed || listener->routed) {
+			memcpy(routed_pair, mapped, ETH_ALEN);
+			memcpy(routed_pair + ETH_ALEN, listener->src_mac, ETH_ALEN);
+			copy.mac_pair = routed_pair;
+			copy.hop = grp->mac_keyed;
 			memcpy(pRtEntry->dstmac, mapped, ETH_ALEN);
 		}
-		tbl_entry = cdx_mc_listener_entry(pRtEntry, &spec->listener[ii],
-						  &copy, tbl_entry, tbl_type);
+		tbl_entry = cdx_mc_listener_entry(pRtEntry, listener, &copy,
+						  tbl_entry, tbl_type);
 		if (!tbl_entry) {
 			/* Releases the entries built so far and clears their
 			 * slots. It also hands back the group id, so a caller

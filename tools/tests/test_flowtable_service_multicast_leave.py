@@ -40,7 +40,7 @@ from _mcast_windows import (COUNT, bridge_settings, delivered, host, in_hardware
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
 from test_flowtable_offload import command
-from test_mcast_e2e import mcast_bridge, wan_source_address  # noqa: F401
+from test_mcast_e2e import dut_mac, mcast_bridge, wan_source_address  # noqa: F401
 from test_mroute_capacity import _daemon, _python
 
 # How a membership ends, and what the host does to end it. `mode` is the
@@ -179,7 +179,11 @@ async def test_flowtable_service_multicast_routed_bridge_leave(multicast_rig, li
     group, source = ROUTED_GROUP[family], wan_source_address(family)
     bridge = listener_bridge
     left, kept = f"{TARGET_LAN_IF}/{VID_LEFT}", f"{TARGET_LAN_IF}/{VID_KEPT}"
-    observers = [(r.lan, {bridge.lan_left: r.dut_lan_mac, bridge.lan_kept: r.dut_lan_mac})]
+    # Each copy leaves with the address of the VLAN device ipmr sends it
+    # through, which it took from the bridge -- not the port's own, though a
+    # one-port bridge happens to carry that.
+    observers = [(r.lan, {bridge.lan_left: await dut_mac(r.target, r.session, bridge.left),
+                          bridge.lan_kept: await dut_mac(r.target, r.session, bridge.kept)})]
 
     def row(state):
         return mroute_row(state, group, source)

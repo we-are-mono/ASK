@@ -458,8 +458,8 @@ def _mroute_row(state, group):
 
 
 def _assert_routed_copy(result, source_mac, group):
-    """What ipmr would have sent: the whole stream, once, from the egress
-    port's address to the group's, one hop fewer."""
+    """What ipmr would have sent: the whole stream, once, from the address of
+    the device it sends the copy through to the group's, one hop fewer."""
     assert not result['errors'], result
     assert result['seen'].get('1') == list(range(FRAMING_COUNT)), result
     assert result['duplicates'] == 0 and result['fragments'] == 0, result
@@ -534,7 +534,16 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
 ''', label='multicast_bridge_routed_listener', timeout=15)
         assert result.rc == 0, result.stdout
         lan_created = True
-        egress_mac = await dut_mac(r.target, r.session, TARGET_LAN_IF)
+        # ipmr builds the routed copy's header on the VLAN device it sends it
+        # through, and the bridge forwards it unchanged: its source is that
+        # device's address, the bridge's on br-ftmcast.290, which is the WAN
+        # port's here and not the port the copy leaves by. On eth3.290 it is
+        # the port's own.
+        egress_mac = await dut_mac(r.target, r.session, routed_dev)
+        if via_bridge:
+            assert egress_mac != await dut_mac(r.target, r.session, TARGET_LAN_IF), (
+                'the routed VLAN device shares the egress port\'s address, so the '
+                'source-MAC oracle cannot tell the two apart')
 
         # The set-top box on VLAN 289, and a listener on the routed LAN, whose
         # membership is what sends ipmr's copy out of the LAN port at all
@@ -595,7 +604,8 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
     routed by smcroute from br-ftmcast.289 into VLAN 290 on the same LAN port.
 
     Both copies come out of one classifier entry. The bridged one keeps the
-    sender's MAC and hop count; the routed one leaves with the port's address
+    sender's MAC and hop count; the routed one leaves with br-ftmcast.290's
+    address -- the bridge's, as ipmr sends it, not the port's it leaves by --
     and one hop fewer, taken off in its own listener entry because the root
     keeps the count for the bridged copy. That per-copy decrement is the part
     no earlier run has measured: a replica sharing its IP header with its
