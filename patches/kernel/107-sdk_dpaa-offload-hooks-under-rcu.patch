@@ -1,4 +1,4 @@
-From 8e57526e5e2d05edfc6d308f7ef583c62bb9ad0c Mon Sep 17 00:00:00 2001
+From a92ab6a2b5eb203b926eb011617a18da5e551241 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 23:30:35 +0200
 Subject: [PATCH] sdk_dpaa: hold RCU across the offload module's transmit hooks
@@ -21,11 +21,11 @@ waits for them whatever context they were entered from.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 71 ++++++++++++++++---
- 1 file changed, 61 insertions(+), 10 deletions(-)
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 72 ++++++++++++++++---
+ 1 file changed, 62 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index a54f30068c98..87c67e0cfe4b 100644
+index c3918d871492..fb822da604b8 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -82,7 +82,10 @@ int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_
@@ -53,7 +53,7 @@ index a54f30068c98..87c67e0cfe4b 100644
  void dpa_unregister_ipsec_fq_handler(void)
  {
  	WRITE_ONCE(cdx_get_ipsec_fq_hookfn, NULL);
-@@ -1569,11 +1574,7 @@ static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
+@@ -1565,11 +1570,7 @@ static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
  	return true;
  }
  
@@ -61,12 +61,12 @@ index a54f30068c98..87c67e0cfe4b 100644
 - * else means it was freed here instead and counted as dropped on net_dev, so
 - * a caller counting what it gave SEC counts only a 0.
 - */
--__hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+-static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
 +static __hot int __dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
  {
  	struct xfrm_state *x;
  	struct qman_fq *egress_fq = NULL;
-@@ -1680,6 +1681,24 @@ __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *ne
+@@ -1676,6 +1677,25 @@ static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_dev
  	return err;
  }
  
@@ -79,7 +79,7 @@ index a54f30068c98..87c67e0cfe4b 100644
 + * before anything it answered with may go. Hold the read-side section here,
 + * across the lookup and the enqueue, rather than trusting the caller's
 + * context to be one. */
-+__hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
++static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
 +{
 +	int rc;
 +
@@ -88,10 +88,11 @@ index a54f30068c98..87c67e0cfe4b 100644
 +	rcu_read_unlock();
 +	return rc;
 +}
- EXPORT_SYMBOL(dpaa_submit_outb_pkt_to_SEC);
- 
++
  /* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
-@@ -1711,7 +1730,8 @@ static bool dpa_inb_port_ok(const struct net_device *port,
+  * its private area. The ops table is the driver's own, and dpa_ndo_init is
+  * the one member of it exported, so no other driver's ops carry it: the test
+@@ -1705,7 +1725,8 @@ static bool dpa_inb_port_ok(const struct net_device *port,
   * that could not be queued -- and the skb is exactly as it came, for
   * xfrm_input() to decide what becomes of it.
   */
@@ -101,7 +102,7 @@ index a54f30068c98..87c67e0cfe4b 100644
  {
  	struct qman_fq *sec_fq = NULL;
  	struct dpa_priv_s	*priv = NULL;
-@@ -1854,13 +1874,26 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+@@ -1848,13 +1869,26 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  	skb->data += tmp_len;
  	return -1; /* give packet to linux */
  }
@@ -129,7 +130,7 @@ index a54f30068c98..87c67e0cfe4b 100644
  {
  	struct dpa_priv_s	*priv;
  	struct dpa_percpu_priv_s *percpu_priv;
-@@ -1949,6 +1982,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1943,6 +1977,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  	conf_fq = priv->conf_fqs[queuenum  & (DPAA_ETH_TX_QUEUES-1)];
  	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
  }

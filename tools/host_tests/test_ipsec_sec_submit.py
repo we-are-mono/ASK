@@ -25,7 +25,7 @@ def test_ipsec_sec_submit(tmp_path):
     # The header sizes, the L3 finder, the DPOVRD choice and the submit.
     (tmp_path / "ipsec_sec_submit.inc").write_text(
         source[source.index("#define ETH_HDR_SIZE"):
-               source.index("EXPORT_SYMBOL(dpaa_submit_outb_pkt_to_SEC);")])
+               source.index("/* Whether @dev is a port of this driver")])
     binary = tmp_path / "ipsec_sec_submit"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

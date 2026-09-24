@@ -13,7 +13,7 @@ def test_ipsec_sec_sg(tmp_path):
     source = (kernel / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c").read_text()
     (tmp_path / "ipsec_sec_sg.inc").write_text(
         source[source.index("static void dma_unmap_skb_sg_addrs"):
-               source.index("EXPORT_SYMBOL(skb_fraglist_to_sg_fd);")])
+               source.index("int __hot skb_to_sg_fd(")])
     binary = tmp_path / "ipsec_sec_sg"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

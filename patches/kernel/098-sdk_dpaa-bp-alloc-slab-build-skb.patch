@@ -1,4 +1,4 @@
-From 256c6ee8ee5c36de0e145930e0b3530f6a8f0db5 Mon Sep 17 00:00:00 2001
+From e81b28feeb250b41becd80d9caeac983f96701b3 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 04:09:54 +0200
 Subject: [PATCH] sdk_dpaa: preserve SEC buffer ownership through receive and
@@ -13,22 +13,22 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 164 insertions(+), 232 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-index a653166..b832617 100644
+index 9515cbfe67e9..1f34bc8d3964 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-@@ -689,4 +689,7 @@ struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
- int skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
- 			  struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd);
+@@ -684,4 +684,7 @@ static inline void _dpa_bp_free_pf(void *addr)
+ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs,
+ 			      bool act_skb);
  
 +void dpaa_sec_sg_release(const struct qm_fd *fd, bool free_skb);
 +unsigned int dpaa_sec_sg_reap(unsigned int budget);
 +
  #endif	/* __DPA_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 96d913c..1eb907b 100644
+index dc012b4dd1e2..20b5b83ef336 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -134,7 +134,11 @@ static void dpa_bp_recycle_frag(struct dpa_bp *dpa_bp, unsigned long vaddr,
+@@ -135,7 +135,11 @@ static void dpa_bp_recycle_frag(struct dpa_bp *dpa_bp, unsigned long vaddr,
  	addr = dma_map_single(dpa_bp->dev, (void *)vaddr, dpa_bp->size,
  			      DMA_BIDIRECTIONAL);
  	if (unlikely(dma_mapping_error(dpa_bp->dev, addr))) {
@@ -40,7 +40,7 @@ index 96d913c..1eb907b 100644
  		return;
  	}
  
-@@ -158,7 +162,8 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
+@@ -159,7 +163,8 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
  	uint32_t bufsize;
  
  	if (act_skb)
@@ -50,7 +50,7 @@ index 96d913c..1eb907b 100644
  	else
  		bufsize =  SMP_CACHE_BYTES + dpa_bp->size + DPA_MAX_FD_OFFSET + 128;
  
-@@ -175,11 +180,21 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
+@@ -176,11 +181,21 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
  		else
  			entries_in_bmb = 8;
  		for (ii= 0; ii<entries_in_bmb; ii++) {
@@ -74,7 +74,7 @@ index 96d913c..1eb907b 100644
  						__func__,__LINE__,ii, buffs2fill);
  				goto handle_fail;
  			}
-@@ -195,11 +210,11 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
+@@ -196,11 +211,11 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
  				 * We only need enough space to store a pointer, but allocate
  				 * an entire cacheline for performance reasons.
  				 */
@@ -89,7 +89,7 @@ index 96d913c..1eb907b 100644
  					goto handle_fail;
  				}
  				ptr_buf = PTR_ALIGN(ptr_buf, SMP_CACHE_BYTES) + SMP_CACHE_BYTES;
-@@ -212,7 +227,7 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
+@@ -213,7 +228,7 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
  			addr = dma_map_single(dev, ptr_buf, dpa_bp->size, DMA_BIDIRECTIONAL);
  			if (unlikely(dma_mapping_error(dev, addr)))
  			{
@@ -98,7 +98,7 @@ index 96d913c..1eb907b 100644
  						__func__,__LINE__,ii,buffs2fill);
  				if (act_skb)
  				{
-@@ -1089,7 +1104,7 @@ static void dma_unmap_skb_sg_addrs(struct device *dev, struct sk_buff *skb,
+@@ -1073,7 +1088,7 @@ static void dma_unmap_skb_sg_addrs(struct device *dev, struct sk_buff *skb,
  		sgt_idx++;
  
  		nr_frags = skb_shinfo(cur_skb)->nr_frags;
@@ -107,11 +107,11 @@ index 96d913c..1eb907b 100644
  		{
  			addr = qm_sg_addr(&sgt[sgt_idx]);
  			dma_unmap_page(dev, addr, qm_sg_entry_get_len(&sgt[sgt_idx]), dma_dir);
-@@ -1123,169 +1138,162 @@ static inline void prepare_qm_sg_entry(struct qm_sg_entry *sgt, int sgt_idx,
+@@ -1107,169 +1122,162 @@ static inline void prepare_qm_sg_entry(struct qm_sg_entry *sgt, int sgt_idx,
  	return;
  }
  
--int __hot skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev , struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd)
+-static int __hot skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev , struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd)
 +/* The SGT has one permanent bidirectional mapping from pool seeding.
 + * Software ownership lives beyond the largest hardware table, so completion
 + * never has to infer a pointer or mapping device from hardware final bits. */
@@ -200,8 +200,8 @@ index 96d913c..1eb907b 100644
 +}
 +EXPORT_SYMBOL(dpaa_sec_sg_reap);
 +
-+int __hot skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
-+			      struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd)
++static int __hot skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
++				       struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd)
 +{
 +	struct dpa_bp *clean = smp_load_acquire(&sg_bpool_g);
 +	struct dpa_bp *done = smp_load_acquire(&skb_2bfreed_bpool_g);
@@ -410,8 +410,8 @@ index 96d913c..1eb907b 100644
 +	return -ENOMEM;
  }
  
- EXPORT_SYMBOL(skb_fraglist_to_sg_fd);
-@@ -1589,47 +1597,8 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1644,47 +1652,8 @@ static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_dev
  		}
  
  		if (unlikely(err < 0)) {
@@ -461,7 +461,7 @@ index 96d913c..1eb907b 100644
  			goto sec_submit_failed;
  		}
  
-@@ -1842,48 +1811,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd)
+@@ -1838,48 +1807,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  		}
  
  		if (unlikely(err < 0)) {

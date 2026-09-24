@@ -1,4 +1,4 @@
-From d986c2bf833e518b30a533573e50776940d8df6e Mon Sep 17 00:00:00 2001
+From 22e8f65942a33d6489d3a5fdcb067c7413627fa1 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -57,7 +57,6 @@ include/net/xfrm.h and __xfrm_state_lookup_byhandle is static.
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  drivers/crypto/caam/pdb.h                     |  12 +-
- .../freescale/sdk_dpaa/dpaa_eth_common.h      |   2 +-
  .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 126 +++++++--
  include/net/netns/xfrm.h                      |   3 +
  include/net/xfrm.h                            |  11 +
@@ -69,7 +68,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/xfrm_input.c                         |  48 ++++
  net/xfrm/xfrm_output.c                        | 248 ++++++++++++++++++
  net/xfrm/xfrm_state.c                         | 193 ++++++++++++++
- 13 files changed, 656 insertions(+), 32 deletions(-)
+ 12 files changed, 655 insertions(+), 31 deletions(-)
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac..1669e0d267e3 100644
@@ -129,21 +128,8 @@ index 4b1bcf53f7ac..1669e0d267e3 100644
  
  /*
   * IPSec ESP Datapath Protocol Override Register (DPOVRD)
-diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-index 2c38096743a3..d9f9062ec75d 100644
---- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-+++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-@@ -103,7 +103,7 @@ int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn);
- void dpa_unregister_ipsec_fq_handler(void);
- struct xfrm_state;
- int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x);
-- __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp);
-+__hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp);
- 
- #endif
- 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 454a8b948107..804549bfb999 100644
+index f1609f46faba..dc012b4dd1e2 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -58,6 +58,7 @@
@@ -154,11 +140,11 @@ index 454a8b948107..804549bfb999 100644
  #include <net/xfrm.h>
  #endif
  
-@@ -1480,17 +1481,90 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+@@ -1478,17 +1479,90 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
  	}
  }
  
-- __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+-static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
 +/* The DPOVRD value SEC encrypts a frame for `x` with; false if the frame's IP
 + * header is one it cannot be told about.
 + *
@@ -232,7 +218,7 @@ index 454a8b948107..804549bfb999 100644
 + * else means it was freed here instead and counted as dropped on net_dev, so
 + * a caller counting what it gave SEC counts only a 0.
 + */
-+__hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
++static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
  {
  	struct xfrm_state *x;
  	struct qman_fq *egress_fq = NULL;
@@ -248,7 +234,7 @@ index 454a8b948107..804549bfb999 100644
  	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
  	 * concurrently; never read the global twice */
  	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
-@@ -1507,9 +1581,9 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+@@ -1505,9 +1579,9 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
  		use the below code */
  		if (!egress_fq)
  		{
@@ -261,7 +247,7 @@ index 454a8b948107..804549bfb999 100644
  		}
  
  		/*
-@@ -1530,7 +1604,8 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+@@ -1528,7 +1602,8 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
  				 * offload interface), COW it first so the capture is not
  				 * corrupted. skb_cow_head() is a cheap branch when the skb is
  				 * not cloned; on failure drop the packet like the paths below. */
@@ -271,7 +257,7 @@ index 454a8b948107..804549bfb999 100644
  					goto sec_submit_failed;
  				/* skb_cow_head() may have reallocated skb->head, so the cached
  				 * network-header pointer is now stale; re-derive it against the
-@@ -1546,22 +1621,20 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+@@ -1544,22 +1619,20 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
  				skb->data = skb->data + l3_offset - ETH_HDR_SIZE;
  				skb->len = skb->len - l3_offset + ETH_HDR_SIZE;
  			}
@@ -301,7 +287,7 @@ index 454a8b948107..804549bfb999 100644
  			goto sec_submit_failed;
  		}
  
-@@ -1619,12 +1692,12 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+@@ -1617,12 +1690,12 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
  
  		/* sucessful transmit to CAAM */
  		netif_trans_update(net_dev);
@@ -317,8 +303,8 @@ index 454a8b948107..804549bfb999 100644
 +	return err;
  }
  
- EXPORT_SYMBOL(dpaa_submit_outb_pkt_to_SEC);
-@@ -1757,8 +1830,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+ /* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
+@@ -1753,8 +1826,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, 0);
  		if (unlikely(err < 0))
  		{
@@ -329,7 +315,7 @@ index 454a8b948107..804549bfb999 100644
  			goto err_giveback; /* give packet to linux */
  		}
  
-@@ -1864,9 +1937,12 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1860,9 +1933,12 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  #ifdef CONFIG_XFRM
  #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
  	if(skb->ipsec_offload) {
