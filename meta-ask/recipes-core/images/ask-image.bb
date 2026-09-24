@@ -85,6 +85,7 @@ IMAGE_INSTALL:append = " \
     ask-test-agent \
     kernel-module-dummy \
     kernel-module-act-mirred \
+    kernel-module-nft-meta-bridge \
     python3-core \
     python3-aiohttp \
     python3-pyroute2 \
