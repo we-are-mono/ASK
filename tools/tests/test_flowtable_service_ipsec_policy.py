@@ -378,6 +378,7 @@ print(json.dumps({'path': str(paths[0]), 'bpid': int(bpid)}))
             initial_pool = await available()
             assert 480 <= initial_pool <= 512, initial_pool
             sas = await r.ipsec.states()
+            depleted = (await r.state())["ipsec_sec_refused_buffer_depletion"]
             async with slab_fault(r, "ipsec-pool", "ipsec-pool-slab", continuous=True) as fault:
                 # Outbound SEC output returns to BMan in hardware; each
                 # software receive consumes one dedicated pool buffer.
@@ -406,6 +407,13 @@ print(json.dumps({'path': str(paths[0]), 'bpid': int(bpid)}))
                 await asyncio.sleep(0.05)
             recovered = await available()
             refill_seconds = time.monotonic() - started
+            # SEC had no buffer to write what the empty pool could not
+            # supply. Those frames never reached Linux: the FMan microcode
+            # counted and dropped them, and the adapter reports them as a
+            # resource SEC ran out of, not as anything the traffic did.
+            state = await r.wait(lambda s: s["ipsec_sec_refused_buffer_depletion"] > depleted, timeout=5)
+            r.record("pool-depletion-refusals",
+                     {key: value for key, value in state.items() if key.startswith("ipsec_sec_refused")})
             await p.batch([0, 1, 2, 3], count=64, interval=0.01)
             # The same SAs, not reinstalled ones. Their anti-replay context
             # follows SEC's numbering, which the traffic above advanced.

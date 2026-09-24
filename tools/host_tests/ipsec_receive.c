@@ -149,13 +149,14 @@ static int napi_gro_receive(int *napi, struct sk_buff *skb)
 { (void)napi; netif_receive_skb(skb); return 0; }
 static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
 { (void)dev; (void)fd; assert(!unmapped && !converted && !skb_frees && !fd_releases); fd_releases++; }
-static void pr_err_ratelimited(const char *fmt, ...) { (void)fmt; }
+static unsigned errors_logged;
+static void pr_err_ratelimited(const char *fmt, ...) { (void)fmt; errors_logged++; }
 #include "ipsec_receive_production.inc"
 
 static void reset(void)
 {
     assert(!refs);
-    refs = fd_releases = skb_frees = delivered = converted = unmapped = 0;
+    refs = fd_releases = skb_frees = delivered = converted = unmapped = errors_logged = 0;
     no_device = no_state = napi_defer = refill_fail = secpath_fail = short_frame = false;
     memset(&packet, 0, sizeof(packet));
     memset(&packet.path, 0xa5, sizeof(packet.path));
@@ -198,6 +199,9 @@ int main(void)
             if (fault == 4 || fault == 7) assert(!delivered && skb_frees == 1 && !fd_releases);
             if (fault == 1 || fault == 2 || fault == 5) assert(fd_releases == 1 && !skb_frees);
             if (fault == 6) assert(!fd_releases && !skb_frees);
+            /* A frame SEC refused is not expected here at all -- FMan counts
+             * and drops those -- so one that arrives is said out loud. */
+            assert(errors_logged == (fault == 4 || fault == 5));
             assert(bp_count == 640);
             if (converted) {
                 unsigned consumed = sg ? sg_buffers : 1;

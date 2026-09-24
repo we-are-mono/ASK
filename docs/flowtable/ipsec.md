@@ -728,11 +728,123 @@ every frame's ICV. The rig settles it:
    at `seq_hi 0` until the window has passed means SEC stores the window
    bottom's.
 
-In each step, count what the LAN side receives, and the SA's `failed` count in
-`ip -s xfrm state` with `XfrmInStateProtoError`. With the top's convention,
-every step delivers all its frames. With the bottom's, step 1 refuses all 20
-as ICV failures while step 2 delivers, and `cdx_ipsec_build_in_replay()` then
-has to seed `hi - 1` inside the stretch.
+In each step, count what the LAN side receives, and what SEC refused:
+`ipsec_sec_refused` in `/proc/cdx_flowtable` (next subsection; per SA there is
+no count). With the top's convention, every step delivers all its frames. With
+the bottom's, step 1 refuses all 20 as ICV failures while step 2 delivers, and
+`cdx_ipsec_build_in_replay()` then has to seed `hi - 1` inside the stretch.
+
+#### Frames SEC refuses
+
+A frame SEC refuses never reaches Linux, whichever feeder brought it. SEC
+returns every job's frame, with its job status, to the SA's FROM_SEC queue,
+which the SA's TO_SEC queue names in its Context B. FROM_SEC feeds the IPsec
+offline port, and its Context A hands each frame to the ASK FMan microcode
+with the action that checks SEC's status. The microcode counts a refused frame
+in a table it keeps in MURAM (`en_SEC_failure_stats`, in the global block
+after the external hash tables' internal buffer pool) and drops the frame
+inside FMan. The CPU's feed goes the same way. An ESP datagram that reached
+the CPU, such as one reassembled from fragments, goes from `xfrm_input()` to
+SEC (`tx todec`) before xfrm's own replay check, into the same SA queues. So
+neither xfrm nor cdx ever holds a refused frame. The SA's exception queue
+carries only frames SEC processed that missed the offline port's flow table.
+
+The microcode's table is the only record, and it has limits:
+
+- **It is global.** It has 23 counters for the whole FMan, and none of them
+  names an SA or a direction.
+- **The total is exact, but the classes are not.** Measured on microcode
+  v210.10.1, N refused frames move the sum of the counters by exactly N. But
+  every replayed or late frame lands in `other_errs`, never in the
+  anti-replay counters. Three bursts of ten GCM frames under a wrong key split
+  1/9, 1/9 and 2/8 between `icv_failures` and `other_errs`. AES-GMAC ICV
+  failures land in `icv_failures`.
+- **The counters are 32-bit and big-endian.** The SDK's reader,
+  `ExternalHashGetSECfailureStats()`, converts them to host order. It fails
+  until the first external hash table has placed the block. The counters
+  wrap. The SDK exports no reset: the microcode updates them with a
+  read-modify-write, which a reset would race.
+
+The adapter reads the table once per accounting pass (`ft_sec_refusals_fold()`,
+through the backend's `cdx_ipsec_sec_refusals()`). It folds whatever moved since
+the last reading into `/proc/net/xfrm_stat`, putting each class in the counter
+xfrm raises for its own equivalent drop:
+
+| Microcode class | `/proc/net/xfrm_stat` | Why |
+| --- | --- | --- |
+| `icv_failures` | `XfrmInStateProtoError` | `xfrm_input()` counts a failed ICV (`-EBADMSG`) there |
+| `CCM_AAD_size_errs` | `XfrmInStateProtoError` | the cipher refusing the job: `crypto_aead_decrypt()` failing in `esp_input()` |
+| `protocol_format_errs` | `XfrmInStateProtoError` | a frame the transform cannot parse, which `esp_input()` fails with `-EINVAL` |
+| `ipsec_pad_chk_failures` | `XfrmInStateProtoError` | a malformed trailer, which `esp_input()` fails |
+| `anti_replay_replay_errs`, `anti_replay_late_errs` | `XfrmInStateSeqError` | `xfrm_replay_check()` counts both |
+| `seq_num_overflows` | `XfrmOutStateSeqError` | see below |
+| `other_errs` | `XfrmInError` | xfrm's "errors not matched by others"; replays and ICV failures both land here |
+| `ipsec_ttl_zero_errs` | none | Linux's ESP input decapsulates such a frame, and `ip_forward()` drops it as an IP header error; no SA asks SEC to decrement the TTL |
+| the other 14 | none | SEC's own faults, or resources it ran out of |
+
+SEC raises a sequence overflow in both directions (SEC RM table 9-2), and the
+count does not say which. The outbound one is the one the offload can reach.
+SEC will not number a non-ESN SA past `FFFFFFFE`, and an SA whose rekey never
+came hits that at line rate. xfrm counts its own outbound exhaustion as
+`XfrmOutStateSeqError`: `xfrm_output_one()` does, when `xfrm_replay_overflow()`
+finds no number left. An inbound overflow needs a peer sending past its own
+sequence space, which RFC 4303 forbids a sender to do and Linux's own output
+refuses.
+
+Only `ipsec_sec_refused` in `/proc/cdx_flowtable` is the exact count of every
+refusal. What the four xfrm counters gain is exactly what the microcode sorted
+into the classes folded there. That leaves out TTL and the 14 fault classes,
+and it is only as good as the microcode's sorting. A protocol refusal the
+microcode filed as a fault would be missed, and a replay is counted as
+`XfrmInError`, not as `XfrmInStateSeqError`.
+
+The xfrm counters need `CONFIG_XFRM_STATISTICS`. Only the meta-ask test image
+enables it (`ask.cfg`). The Armbian and OpenWrt kernels leave it off. On those
+kernels the fold into xfrm compiles to nothing and `/proc/net/xfrm_stat` does
+not exist, so `/proc/cdx_flowtable` is where the counts appear.
+
+The adapter's reading at load is the baseline, so nothing SEC refused before
+the adapter existed is put down to it. The pass runs only while an SA is
+owned, so the last SA's retirement folds once more, and so does module
+unload. Nothing counted while the adapter is loaded is lost. The fold goes
+into `init_net`. The xfrmdev ops are attached only to ports there, and xfrm
+offloads a state only to a device in its own namespace.
+
+The 14 fault classes reach no xfrm counter, because they are not protocol
+errors. They are hardware and DMA errors, the DECO watchdog, input-frame and
+preheader reads, output-frame writes, compound-frame reads and writes, buffers
+and table buffers too small or depleted, output too large, and output length
+rollover. Whenever any
+of them moves, one ratelimited line reports it:
+
+```
+ask_flowtable: 256 IPsec frames dropped, SEC could not process them: buffer_depletion=256
+```
+
+`/proc/cdx_flowtable` carries every class, counted since the adapter loaded
+and as of the pass's last reading. `ipsec_sec_refused` is the exact total, and
+`ipsec_sec_refused_<class>` gives each class under the names in
+`ft_sec_refusal[]`.
+
+**No count exists per SA.** For an offloaded SA, `ip -s xfrm state` shows
+`replay-window 0 replay 0 failed 0` however many of its frames SEC refused.
+SEC keeps no per-SA count, and the microcode's count is global. No design
+recovers one at a price worth paying:
+
+- **A counter pair around the protocol operation in the shared descriptor.**
+  A refused job ends at the operation, before the descriptor is stored back,
+  so the increment survives only in one DECO's copy.
+- **Dequeuing FROM_SEC in software to read each status.** This costs a CPU
+  round trip per decrypted frame.
+- **A FROM_SEC action that passes errors on.** This risks FMan forwarding a
+  refused frame, which for a replay is the whole decrypted packet.
+
+The exception queue's handler still drops a frame that arrives with FMan's
+non-FM error bit set, and logs it. It is not expected to fire, because the
+microcode drops refused frames before that queue. A frame that did arrive
+would be SEC's output for a job SEC refused. For a replay that is the whole
+decrypted packet, since SEC checks the ICV before the window, and delivering
+it would pass it off as authenticated.
 
 ### 4. The slow path
 

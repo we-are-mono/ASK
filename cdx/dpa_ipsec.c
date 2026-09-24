@@ -328,6 +328,14 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		goto rel_fd;
 	}
 
+	/* A frame SEC refused, which this queue is not expected to carry: the
+	 * offline port's microcode checks SEC's status on the way here, counts
+	 * a refusal and drops the frame in FMan (see the adapter's
+	 * ft_sec_refusals_fold()). One that got through anyway would still be
+	 * SEC's output for a job it refused -- for a replay the whole decrypted
+	 * packet, since SEC checks the ICV before the window -- and delivering
+	 * it would pass it off as authenticated. Dropped, and said out loud,
+	 * because it means FMan no longer does what the accounting counts on. */
 	if (unlikely(dq->fd.status & FM_FD_RX_STATUS_ERR_NON_FM)) {
 		pr_err_ratelimited(
 			"cdx: IPsec SEC error on %s, fqid=0x%x sagd=0x%x status=0x%08x - dropping\n",

@@ -1,4 +1,4 @@
-From faf65e8faecc5d5144f6b9710f2bf92314d648fb Mon Sep 17 00:00:00 2001
+From 8710b2cb4d7d337289f26eb6837128d60497cfde Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -102,7 +102,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 ++-----
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 ++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1302 +++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1253 +++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +---------
@@ -123,7 +123,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +--
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1481 ++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1486 ++++++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
@@ -163,7 +163,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   34 +-
- 81 files changed, 9338 insertions(+), 5161 deletions(-)
+ 81 files changed, 9294 insertions(+), 5161 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -5326,10 +5326,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..dbfced5d18b9
+index 000000000000..e9825126d7f8
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1302 @@
+@@ -0,0 +1,1253 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -6476,7 +6476,9 @@ index 000000000000..dbfced5d18b9
 +
 +int32_t ExternalHashGetSECfailureStats(en_SEC_failure_stats *stats)
 +{
-+	if (!stats)
++	/* The block is placed with the first external hash table; until then
++	 * there are no counters to read. */
++	if (!stats || !en_global_muram_mem)
 +		return -1;
 +
 +	stats->anti_replay_late_errs =
@@ -6491,7 +6493,10 @@ index 000000000000..dbfced5d18b9
 +	
 +	stats->buff_too_small_errs =
 +		GET_UINT32(en_global_muram_mem->SEC_failure_stats.buff_too_small_errs);
-+	
++
++	stats->CCM_AAD_size_errs =
++		GET_UINT32(en_global_muram_mem->SEC_failure_stats.CCM_AAD_size_errs);
++
 +	stats->cmpnd_frame_read_errs =
 +		GET_UINT32(en_global_muram_mem->SEC_failure_stats.cmpnd_frame_read_errs);
 +	
@@ -6549,60 +6554,6 @@ index 000000000000..dbfced5d18b9
 +	return 0;
 +}
 +EXPORT_SYMBOL(ExternalHashGetSECfailureStats);
-+
-+int32_t ExternalHashResetSECfailureStats(void)
-+{
-+	if (!en_global_muram_mem)
-+		return -1;
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.anti_replay_late_errs, 0);
-+		
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.anti_replay_replay_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.buff_pool_depletion_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.buff_too_small_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.cmpnd_frame_read_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.cmpnd_frame_write_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.DECO_watchdog_timer_timedout_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.DMA_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.hw_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.icv_failures, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.input_frame_read_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.ipsec_pad_chk_failures, 0);
-+
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.ipsec_ttl_zero_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.other_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.output_frame_length_rollover_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.output_frame_too_large_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.output_frame_write_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.prehdr_read_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.protocol_format_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.seq_num_overflows, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.tbl_buff_pool_depletion_errs, 0);
-+	
-+	WRITE_UINT32(en_global_muram_mem->SEC_failure_stats.tbl_buff_too_small_errs, 0);
-+
-+	return 0;
-+}
-+
-+EXPORT_SYMBOL(ExternalHashResetSECfailureStats);
 +
 +int32_t ExternalHashSetDscpVlanpcpMapCfg(en_dscp_vlanpcp_map_cfg *map)
 +{
@@ -11973,10 +11924,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..b37754e6c6b3
+index 000000000000..5ae38364e388
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1481 @@
+@@ -0,0 +1,1486 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -12507,7 +12458,9 @@ index 000000000000..b37754e6c6b3
 +#define EN_EHASH_MISS_ACTION_DONE       0
 +//AD for this table, defines assuming a LE GPP core
 +
-+/* Following structure is used to update SEC failure stats in ucode */
++/* Following structure is used to update SEC failure stats in ucode.
++ * Its layout is the microcode's (v210.10.1), which counts here, big-endian,
++ * each frame SEC returns with an error status. */
 +typedef struct en_SEC_failure_stats_s
 +{
 +	uint32_t icv_failures; /* incremented when a ucode receives ICV failure*/
@@ -12555,8 +12508,11 @@ index 000000000000..b37754e6c6b3
 +	en_SEC_failure_stats	SEC_failure_stats;
 +} __attribute__ ((packed)) en_exthash_global_mem;
 +
++/* Reads the SEC failure counters, in host order, or returns -1 before the
++ * first external hash table has placed them. There is deliberately no reset:
++ * the microcode updates them read-modify-write, and its readers take
++ * differences. */
 +int32_t ExternalHashGetSECfailureStats(en_SEC_failure_stats *stats);
-+int32_t ExternalHashResetSECfailureStats(void);
 +int32_t ExternalHashSetDscpVlanpcpMapCfg(en_dscp_vlanpcp_map_cfg *map);
 +int32_t ExternalHashGetDscpVlanpcpMapCfg(en_dscp_vlanpcp_map_cfg *map);
 +

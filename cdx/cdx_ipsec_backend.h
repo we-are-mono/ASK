@@ -158,6 +158,46 @@ struct cdx_ipsec_counters {
 	u32 seen[CDX_IPSEC_REPLAY_WINDOW_MAX / 32];
 };
 
+/* The classes the FMan microcode counts SEC's refusals in, one counter each,
+ * in the order of its own table (en_SEC_failure_stats, fm_ehash.h; microcode
+ * v210.10.1), each beside the field it comes from. The table is the only
+ * record of a refused frame: SEC returns it with its job status to the SA's
+ * FROM_SEC queue, the IPsec offline port's microcode counts it here and drops
+ * it, and nothing in software ever sees it. Global, not per SA.
+ */
+enum cdx_sec_refusal {
+	CDX_SEC_REFUSED_ICV,		  /* icv_failures */
+	CDX_SEC_REFUSED_HW,		  /* hw_errs */
+	CDX_SEC_REFUSED_CCM_AAD_SIZE,	  /* CCM_AAD_size_errs */
+	CDX_SEC_REFUSED_LATE,		  /* anti_replay_late_errs */
+	CDX_SEC_REFUSED_REPLAY,		  /* anti_replay_replay_errs */
+	CDX_SEC_REFUSED_SEQ_OVERFLOW,	  /* seq_num_overflows */
+	CDX_SEC_REFUSED_DMA,		  /* DMA_errs */
+	CDX_SEC_REFUSED_DECO_WATCHDOG,	  /* DECO_watchdog_timer_timedout_errs */
+	CDX_SEC_REFUSED_INPUT_READ,	  /* input_frame_read_errs */
+	CDX_SEC_REFUSED_PROTOCOL_FORMAT,  /* protocol_format_errs */
+	CDX_SEC_REFUSED_TTL_ZERO,	  /* ipsec_ttl_zero_errs */
+	CDX_SEC_REFUSED_PAD_CHECK,	  /* ipsec_pad_chk_failures */
+	CDX_SEC_REFUSED_LENGTH_ROLLOVER,  /* output_frame_length_rollover_errs */
+	CDX_SEC_REFUSED_TABLE_TOO_SMALL,  /* tbl_buff_too_small_errs */
+	CDX_SEC_REFUSED_TABLE_DEPLETION,  /* tbl_buff_pool_depletion_errs */
+	CDX_SEC_REFUSED_OUTPUT_TOO_LARGE, /* output_frame_too_large_errs */
+	CDX_SEC_REFUSED_COMPOUND_WRITE,	  /* cmpnd_frame_write_errs */
+	CDX_SEC_REFUSED_BUFFER_TOO_SMALL, /* buff_too_small_errs */
+	CDX_SEC_REFUSED_BUFFER_DEPLETION, /* buff_pool_depletion_errs */
+	CDX_SEC_REFUSED_OUTPUT_WRITE,	  /* output_frame_write_errs */
+	CDX_SEC_REFUSED_COMPOUND_READ,	  /* cmpnd_frame_read_errs */
+	CDX_SEC_REFUSED_PREHEADER_READ,	  /* prehdr_read_errs */
+	CDX_SEC_REFUSED_OTHER,		  /* other_errs */
+	CDX_SEC_REFUSAL_CLASSES
+};
+
+/* The microcode's counts as they stand, in host order. Each is a u32 that
+ * only moves forward and wraps; the caller takes differences. */
+struct cdx_sec_refusals {
+	u32 count[CDX_SEC_REFUSAL_CLASSES];
+};
+
 /* SA operations run inside the flowtable backend's transaction, taken with
  * cdx_ft_begin() and asserted with cdx_ft_assert_held(). There is deliberately
  * no second transaction here: an SA and a flow reach the same classifier
@@ -265,5 +305,20 @@ u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa);
  */
 void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 			struct cdx_ipsec_counters *counters);
+
+/* Reads the microcode's count of the frames SEC refused, every class of it.
+ *
+ * What it counts is every refusal on every SA, whichever feeder brought the
+ * frame to SEC -- the classifier's or the CPU's -- and in either direction.
+ * The total is exact; the class a refusal lands in is the microcode's choice
+ * and not a reliable one (see cdx_sec_refusal). Nothing is reset: the
+ * microcode updates these read-modify-write, and a caller keeps its own
+ * reading to take differences from.
+ *
+ * -ENODEV while the counters do not exist: FMan places them with the first
+ * external hash table, and until then there is nothing to read. Needs no
+ * transaction.
+ */
+int cdx_ipsec_sec_refusals(struct cdx_sec_refusals *refusals);
 
 #endif

@@ -17,6 +17,7 @@
  * there to be rebuilt.
  */
 #include <assert.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -130,6 +131,47 @@ static unsigned warnings;
 #define netdev_warn(dev, fmt, ...) do { (void)(dev); warnings++; } while (0)
 #define pr_warn(...) ((void)0)
 #define pr_err(...) ((void)0)
+/* Functions rather than macros over snprintf: the kernel's u64 is unsigned
+ * long long and this host's is unsigned long, one size, which the format
+ * checker would object to at every call. */
+static int scnprintf(char *buf, size_t size, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (!size)
+		return 0;
+	va_start(ap, fmt);
+	n = vsnprintf(buf, size, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return 0;
+	return (size_t)n < size ? n : (int)(size - 1);
+}
+/* The adapter's one line about the frames SEC could not process, kept so a
+ * case can read back what it said, and how often. */
+static unsigned sec_fault_lines;
+static char sec_fault_line[512];
+static void pr_warn_ratelimited(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(sec_fault_line, sizeof(sec_fault_line), fmt, ap);
+	va_end(ap);
+	sec_fault_lines++;
+}
+/* /proc/cdx_flowtable, as far as the rows a case reads. */
+struct seq_file { char buf[4096]; size_t len; };
+static void seq_printf(struct seq_file *seq, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	seq->len += vsnprintf(seq->buf + seq->len, sizeof(seq->buf) - seq->len, fmt, ap);
+	va_end(ap);
+	assert(seq->len < sizeof(seq->buf));
+}
 #define WARN_ON_ONCE(cond) ({ bool hit = !!(cond); assert(!hit); hit; })
 #define xchg(p, value) ({ __typeof__(*(p)) old = *(p); *(p) = (value); old; })
 #define ASSERT_RTNL() do { } while (0)
@@ -679,6 +721,27 @@ static void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	memcpy(counters->seen, sa->outbound ? (u32[4]){ 0 } : sa->seen,
 	       sizeof(counters->seen));
 }
+
+/* What the FMan microcode counted of the frames SEC refused, read the whole
+ * way the kernel reads it: the SDK's reader over the microcode's own table,
+ * through the SDK's own big-endian load, and the backend's sorting of it into
+ * classes -- all compiled, over a block of "MURAM" a case fills in the
+ * microcode's byte order. The load's two primitives are the kernel's, for a
+ * little-endian host; each 32-bit load is counted. */
+#define ENODEV 19
+static unsigned muram_reads;
+static u32 __raw_readl(const volatile void *addr)
+{
+	muram_reads++;
+	return *(const volatile u32 *)addr;
+}
+#define __be32_to_cpu(x) ntohl(x)
+#include "sec_refusals.inc"
+/* The /proc/net/xfrm_stat counters the adapter adds to, numbered as the
+ * kernel numbers them. Only init_net's are ever touched. */
+static u64 xfrm_mib[__LINUX_MIB_XFRMMAX];
+#define XFRM_ADD_STATS(net, field, val) \
+	do { assert((net) == &init_net); xfrm_mib[field] += (val); } while (0)
 
 /* xfrm's side of a lifetime. The judge itself is the kernel's, compiled; what
  * it reaches is recorded here. */
@@ -2765,6 +2828,236 @@ static void test_replay_round_trip(void)
 	bench_clear_sas();
 }
 
+/* The global block the microcode keeps in MURAM, and its refusal table. */
+static en_exthash_global_mem muram;
+static en_SEC_failure_stats *const table = &muram.SEC_failure_stats;
+
+static u64 sec_total(void)
+{
+	u64 total = 0;
+
+	for (unsigned i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++)
+		total += ft_sec_counted[i];
+	return total;
+}
+
+static u64 mib_total(void)
+{
+	u64 total = 0;
+
+	for (unsigned i = 0; i < __LINUX_MIB_XFRMMAX; i++)
+		total += xfrm_mib[i];
+	return total;
+}
+
+/* Frames SEC refused reach the counters xfrm keeps for its own equivalent
+ * drops, from the only record of them there is: the microcode's global table,
+ * read differences at a time. */
+static void test_sec_refusals(void)
+{
+	struct xfrm_state in_state, out_state;
+	struct xfrm_state *in, *out;
+	struct cdx_sec_refusals now;
+	struct seq_file seq = { .len = 0 };
+	unsigned reads;
+	char row[64];
+
+	bench_reset();
+	bench_clear_sas();
+	memset(xfrm_mib, 0, sizeof(xfrm_mib));
+	sec_fault_lines = 0;
+
+	/* Before FMan has placed the table there is nothing to read, and so no
+	 * reading to count from either. */
+	en_global_muram_mem = NULL;
+	assert(cdx_ipsec_sec_refusals(&now) == -ENODEV);
+	ft_sec_refusals_fold();
+	assert(!ft_sec_known && !sec_total() && !mib_total());
+
+	/* Placed, and already counting what was refused before this module
+	 * existed -- the rig's boot totals. The first reading is only where
+	 * counting starts: none of it is put down to the adapter. */
+	memset(&muram, 0, sizeof(muram));
+	table->icv_failures = htonl(9);
+	table->other_errs = htonl(55);
+	table->buff_pool_depletion_errs = htonl(256);
+	en_global_muram_mem = &muram;
+	ft_sec_refusals_fold();
+	assert(ft_sec_known && !sec_total() && !mib_total() && !sec_fault_lines);
+	/* The table is big-endian, and read in host order exactly once. */
+	assert(cdx_ipsec_sec_refusals(&now) == 0);
+	assert(now.count[CDX_SEC_REFUSED_ICV] == 9 && now.count[CDX_SEC_REFUSED_OTHER] == 55 &&
+	       now.count[CDX_SEC_REFUSED_BUFFER_DEPLETION] == 256);
+
+	/* Ten frames under a wrong GCM key, split the way the microcode split
+	 * one measured burst: one ICV failure, nine "other". Counted once a
+	 * pass, not once an SA -- one reading of the whole table. */
+	in = install_accounted(&in_state, false, 0);
+	out = install_accounted(&out_state, true, 0);
+	table->icv_failures = htonl(10);
+	table->other_errs = htonl(64);
+	reads = muram_reads;
+	ft_ipsec_stats_work(NULL);
+	assert(muram_reads - reads == CDX_SEC_REFUSAL_CLASSES);
+	assert(xfrm_mib[LINUX_MIB_XFRMINSTATEPROTOERROR] == 1 && xfrm_mib[LINUX_MIB_XFRMINERROR] == 9);
+	assert(sec_total() == 10 && mib_total() == 10 && !sec_fault_lines);
+	/* Nothing moved: nothing more. */
+	ft_ipsec_stats_work(NULL);
+	assert(sec_total() == 10 && mib_total() == 10);
+
+	/* Each class xfrm has a counter for goes to it. A TTL taken to zero
+	 * has none, and is counted here only. */
+	table->anti_replay_replay_errs = htonl(3);
+	table->anti_replay_late_errs = htonl(2);
+	table->seq_num_overflows = htonl(1);
+	table->CCM_AAD_size_errs = htonl(1);
+	table->ipsec_pad_chk_failures = htonl(1);
+	table->protocol_format_errs = htonl(1);
+	table->ipsec_ttl_zero_errs = htonl(4);
+	ft_ipsec_stats_work(NULL);
+	assert(xfrm_mib[LINUX_MIB_XFRMINSTATESEQERROR] == 5);
+	assert(xfrm_mib[LINUX_MIB_XFRMOUTSTATESEQERROR] == 1);
+	assert(xfrm_mib[LINUX_MIB_XFRMINSTATEPROTOERROR] == 4);
+	assert(xfrm_mib[LINUX_MIB_XFRMINERROR] == 9);
+	assert(ft_sec_counted[CDX_SEC_REFUSED_TTL_ZERO] == 4);
+	assert(sec_total() == 23 && mib_total() == 19 && !sec_fault_lines);
+
+	/* SEC's own faults and the resources it ran out of reach no xfrm
+	 * counter, and are said out loud: one line, naming each class. */
+	table->buff_pool_depletion_errs = htonl(256 + 7);
+	table->DMA_errs = htonl(1);
+	ft_ipsec_stats_work(NULL);
+	assert(mib_total() == 19 && sec_total() == 31);
+	assert(sec_fault_lines == 1);
+	assert(strstr(sec_fault_line, "8 IPsec frames dropped"));
+	assert(strstr(sec_fault_line, " dma=1") && strstr(sec_fault_line, " buffer_depletion=7"));
+	assert(!strstr(sec_fault_line, "other") && !strstr(sec_fault_line, "ttl_zero"));
+	/* And not again while they stand still. */
+	ft_ipsec_stats_work(NULL);
+	assert(sec_fault_lines == 1);
+
+	/* A count that wrapped since the last reading adds what it counted. */
+	table->other_errs = htonl(0xfffffff0);
+	ft_ipsec_stats_work(NULL);
+	assert(xfrm_mib[LINUX_MIB_XFRMINERROR] == 9 + (0xfffffff0 - 64));
+	table->other_errs = htonl(5);
+	ft_ipsec_stats_work(NULL);
+	assert(xfrm_mib[LINUX_MIB_XFRMINERROR] == 9 + (0xfffffff0 - 64) + 21);
+	assert(ft_sec_counted[CDX_SEC_REFUSED_OTHER] == 9 + (0xfffffff0 - 64) + 21);
+
+	/* The pass stops once no SA is owned. The last SA out counts what was
+	 * refused up to its going; one leaving beside another does not. */
+	table->anti_replay_replay_errs = htonl(3 + 4);
+	delete_state(in);
+	reads = muram_reads;
+	bench_drain_retirements();
+	assert(muram_reads == reads && xfrm_mib[LINUX_MIB_XFRMINSTATESEQERROR] == 5);
+	delete_state(out);
+	bench_drain_retirements();
+	assert(muram_reads - reads == CDX_SEC_REFUSAL_CLASSES);
+	assert(xfrm_mib[LINUX_MIB_XFRMINSTATESEQERROR] == 9);
+
+	/* /proc/cdx_flowtable: the total since load, then every class. */
+	ft_sec_refusal_rows(&seq);
+	snprintf(row, sizeof(row), "ipsec_sec_refused %llu\n", (unsigned long long)sec_total());
+	assert(!strncmp(seq.buf, row, strlen(row)));
+	assert(strstr(seq.buf, "\nipsec_sec_refused_buffer_depletion 7\n"));
+	assert(strstr(seq.buf, "\nipsec_sec_refused_ttl_zero 4\n"));
+	assert(strstr(seq.buf, "\nipsec_sec_refused_replay 7\n"));
+	/* The fault line has room for every fault class moving at once, each
+	 * at the widest count a u32 prints. */
+	size_t widest = 1;
+	for (unsigned i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++)
+		if (ft_sec_refusal[i].fault)
+			widest += strlen(ft_sec_refusal[i].name) + strlen(" =4294967295");
+	assert(widest <= FT_SEC_FAULT_TEXT);
+	for (unsigned i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++) {
+		/* Every class has a row, under a name no other has. */
+		assert(ft_sec_refusal[i].name);
+		snprintf(row, sizeof(row), "\nipsec_sec_refused_%s ", ft_sec_refusal[i].name);
+		assert(strstr(seq.buf, row));
+		for (unsigned j = 0; j < i; j++)
+			assert(strcmp(ft_sec_refusal[i].name, ft_sec_refusal[j].name));
+		/* A class is folded into a counter of xfrm's, or is a fault
+		 * said out loud, or neither; never both. */
+		assert(!(ft_sec_refusal[i].mib && ft_sec_refusal[i].fault));
+	}
+
+	/* Every counter of the microcode's at once, each moving by an amount
+	 * no other does: each lands in its own class and no other, and each
+	 * class in the xfrm counter it is folded into, or in none. Named by
+	 * field, so a class read from the wrong one fails here. */
+#define SEC_FIELD(f) offsetof(en_SEC_failure_stats, f)
+	static const struct {
+		size_t field;
+		enum cdx_sec_refusal cls;
+		int mib;	/* zero for none */
+	} every[] = {
+		{ SEC_FIELD(icv_failures), CDX_SEC_REFUSED_ICV, LINUX_MIB_XFRMINSTATEPROTOERROR },
+		{ SEC_FIELD(hw_errs), CDX_SEC_REFUSED_HW, 0 },
+		{ SEC_FIELD(CCM_AAD_size_errs), CDX_SEC_REFUSED_CCM_AAD_SIZE, LINUX_MIB_XFRMINSTATEPROTOERROR },
+		{ SEC_FIELD(anti_replay_late_errs), CDX_SEC_REFUSED_LATE, LINUX_MIB_XFRMINSTATESEQERROR },
+		{ SEC_FIELD(anti_replay_replay_errs), CDX_SEC_REFUSED_REPLAY, LINUX_MIB_XFRMINSTATESEQERROR },
+		{ SEC_FIELD(seq_num_overflows), CDX_SEC_REFUSED_SEQ_OVERFLOW, LINUX_MIB_XFRMOUTSTATESEQERROR },
+		{ SEC_FIELD(DMA_errs), CDX_SEC_REFUSED_DMA, 0 },
+		{ SEC_FIELD(DECO_watchdog_timer_timedout_errs), CDX_SEC_REFUSED_DECO_WATCHDOG, 0 },
+		{ SEC_FIELD(input_frame_read_errs), CDX_SEC_REFUSED_INPUT_READ, 0 },
+		{ SEC_FIELD(protocol_format_errs), CDX_SEC_REFUSED_PROTOCOL_FORMAT, LINUX_MIB_XFRMINSTATEPROTOERROR },
+		{ SEC_FIELD(ipsec_ttl_zero_errs), CDX_SEC_REFUSED_TTL_ZERO, 0 },
+		{ SEC_FIELD(ipsec_pad_chk_failures), CDX_SEC_REFUSED_PAD_CHECK, LINUX_MIB_XFRMINSTATEPROTOERROR },
+		{ SEC_FIELD(output_frame_length_rollover_errs), CDX_SEC_REFUSED_LENGTH_ROLLOVER, 0 },
+		{ SEC_FIELD(tbl_buff_too_small_errs), CDX_SEC_REFUSED_TABLE_TOO_SMALL, 0 },
+		{ SEC_FIELD(tbl_buff_pool_depletion_errs), CDX_SEC_REFUSED_TABLE_DEPLETION, 0 },
+		{ SEC_FIELD(output_frame_too_large_errs), CDX_SEC_REFUSED_OUTPUT_TOO_LARGE, 0 },
+		{ SEC_FIELD(cmpnd_frame_write_errs), CDX_SEC_REFUSED_COMPOUND_WRITE, 0 },
+		{ SEC_FIELD(buff_too_small_errs), CDX_SEC_REFUSED_BUFFER_TOO_SMALL, 0 },
+		{ SEC_FIELD(buff_pool_depletion_errs), CDX_SEC_REFUSED_BUFFER_DEPLETION, 0 },
+		{ SEC_FIELD(output_frame_write_errs), CDX_SEC_REFUSED_OUTPUT_WRITE, 0 },
+		{ SEC_FIELD(cmpnd_frame_read_errs), CDX_SEC_REFUSED_COMPOUND_READ, 0 },
+		{ SEC_FIELD(prehdr_read_errs), CDX_SEC_REFUSED_PREHEADER_READ, 0 },
+		{ SEC_FIELD(other_errs), CDX_SEC_REFUSED_OTHER, LINUX_MIB_XFRMINERROR },
+	};
+#undef SEC_FIELD
+	_Static_assert(sizeof(every) / sizeof(every[0]) == CDX_SEC_REFUSAL_CLASSES,
+		       "every class of the microcode's is exercised");
+	u64 counted_before[CDX_SEC_REFUSAL_CLASSES], mib_before[__LINUX_MIB_XFRMMAX];
+	u64 mib_expected[__LINUX_MIB_XFRMMAX] = { 0 };
+	bool covered[CDX_SEC_REFUSAL_CLASSES] = { false };
+	unsigned lines = sec_fault_lines;
+
+	memcpy(counted_before, ft_sec_counted, sizeof(counted_before));
+	memcpy(mib_before, xfrm_mib, sizeof(mib_before));
+	for (unsigned i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++) {
+		u32 value;
+
+		/* Byte-wise: the table is packed, and big-endian. */
+		memcpy(&value, (u8 *)table + every[i].field, sizeof(value));
+		value = htonl(ntohl(value) + 1000 * (i + 1));
+		memcpy((u8 *)table + every[i].field, &value, sizeof(value));
+	}
+	ft_ipsec_stats_work(NULL);
+	for (unsigned i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++) {
+		enum cdx_sec_refusal cls = every[i].cls;
+
+		assert(!covered[cls]);
+		covered[cls] = true;
+		assert(ft_sec_counted[cls] - counted_before[cls] == 1000 * (i + 1));
+		assert(ft_sec_refusal[cls].mib == every[i].mib);
+		mib_expected[every[i].mib] += 1000 * (i + 1);
+		/* Each fault class moved, so the one line names each. */
+		snprintf(row, sizeof(row), " %s=%u", ft_sec_refusal[cls].name, 1000 * (i + 1));
+		assert(!ft_sec_refusal[cls].fault == !strstr(sec_fault_line, row));
+	}
+	for (unsigned m = 1; m < __LINUX_MIB_XFRMMAX; m++)
+		assert(xfrm_mib[m] - mib_before[m] == mib_expected[m]);
+	assert(sec_fault_lines == lines + 1);
+
+	bench_clear_sas();
+	en_global_muram_mem = NULL;
+	ft_sec_known = false;
+	memset(ft_sec_counted, 0, sizeof(ft_sec_counted));
+}
+
 int main(void)
 {
 	test_spec();
@@ -2792,6 +3085,7 @@ int main(void)
 	test_replay_seeding();
 	test_publish_window();
 	test_replay_round_trip();
+	test_sec_refusals();
 	assert(dev_holds == 0 && neigh_refs == 0 && xfrm_state_refs == 0);
 	printf("ipsec adapter: ok\n");
 	return 0;

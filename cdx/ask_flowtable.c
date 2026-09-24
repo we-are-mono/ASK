@@ -11122,6 +11122,152 @@ static void ft_ipsec_publish_window(struct xfrm_state *x,
 	}
 }
 
+/* ------------------------------------------------- what SEC refused, for xfrm
+ *
+ * A frame SEC refuses never reaches Linux. SEC hands it back with its job
+ * status to the SA's FROM_SEC queue, which feeds the IPsec offline port; the
+ * FMan microcode there checks the status, counts the refusal in a table of
+ * its own in MURAM and drops the frame inside FMan. Both feeders end there:
+ * the classifier's, and the CPU's (`tx todec`), which enqueues to the same SA
+ * queue before xfrm_input() gets as far as its own replay check. So neither
+ * xfrm nor cdx ever holds a refused frame to count, and the microcode's table
+ * (cdx_ipsec_sec_refusals()) is the only record of one.
+ *
+ * Its total is exact: it moves by one for each refused frame. Its classes are
+ * not. Measured on microcode v210.10.1, replayed and late frames all land in
+ * other_errs and never in the anti-replay counters, and the ICV failures of
+ * one GCM burst split between icv_failures and other_errs differently from
+ * the next. And it is global: nothing in it names an SA, or a direction.
+ *
+ * So the pass folds the table into /proc/net/xfrm_stat, each class that has
+ * one into the counter xfrm raises for its own equivalent drop
+ * (ft_sec_refusal[]), and into no state: `ip -s xfrm state` replay/failed
+ * stay at zero for an offloaded SA, because no per-SA count of them exists.
+ * What the folded counters gain is exactly what the microcode sorted into
+ * those classes, no more reliable than its sorting; the exact count of every
+ * refusal is the total in /proc/cdx_flowtable, which carries every class. The
+ * classes that are no doing of the traffic's -- SEC's own faults, and
+ * resources it ran out of -- are said out loud as well. Without
+ * CONFIG_XFRM_STATISTICS the fold into xfrm compiles to nothing, and
+ * /proc/cdx_flowtable is where the counts are.
+ *
+ * Differences, never a reset: the microcode updates these read-modify-write,
+ * and a reset from here would race it. The reading taken at load is where
+ * this module's counting starts, so nothing refused before it existed is put
+ * down to it, and the counters' 32-bit wrap costs nothing at one reading a
+ * period. Into init_net: the ops are attached only to ports there
+ * (ft_netdev_event()), and xfrm offloads a state only to a device in its own
+ * namespace, so every SA these can have been counted for is init_net's.
+ */
+static const struct {
+	/* The class's row in /proc/cdx_flowtable, after "ipsec_sec_refused_". */
+	const char *name;
+	/* The xfrm_stat counter it is folded into, or zero -- LINUX_MIB_XFRMNUM,
+	 * which counts nothing -- for none. */
+	u8 mib;
+	/* SEC's own fault or a resource it ran out of: nothing the traffic
+	 * did, and nothing xfrm counts. */
+	bool fault;
+} ft_sec_refusal[CDX_SEC_REFUSAL_CLASSES] = {
+	/* xfrm_input() counts as a protocol error whatever the ESP transform
+	 * refuses: a failed ICV, the -EBADMSG it audits as one; a CCM job the
+	 * cipher rejects, crypto_aead_decrypt() failing in esp_input(); a
+	 * frame the transform cannot parse, and a malformed trailer, both of
+	 * which esp_input() fails with -EINVAL. */
+	[CDX_SEC_REFUSED_ICV]		  = { "icv", LINUX_MIB_XFRMINSTATEPROTOERROR },
+	[CDX_SEC_REFUSED_CCM_AAD_SIZE]	  = { "ccm_aad_size", LINUX_MIB_XFRMINSTATEPROTOERROR },
+	[CDX_SEC_REFUSED_PROTOCOL_FORMAT] = { "protocol_format", LINUX_MIB_XFRMINSTATEPROTOERROR },
+	[CDX_SEC_REFUSED_PAD_CHECK]	  = { "pad_check", LINUX_MIB_XFRMINSTATEPROTOERROR },
+	/* Both are xfrm_replay_check()'s sequence errors. */
+	[CDX_SEC_REFUSED_LATE]		  = { "late", LINUX_MIB_XFRMINSTATESEQERROR },
+	[CDX_SEC_REFUSED_REPLAY]	  = { "replay", LINUX_MIB_XFRMINSTATESEQERROR },
+	/* SEC raises this on either side (SEC RM table 9-2), and the count
+	 * does not say which. The outbound one is the one the offload reaches:
+	 * SEC will not number a non-ESN SA past FFFFFFFE, and an SA whose rekey
+	 * never came runs into that at line rate. xfrm counts its own outbound
+	 * exhaustion here: xfrm_output_one() does, when xfrm_replay_overflow()
+	 * finds no number left. The inbound one needs a peer
+	 * sending past its own sequence space, which RFC 4303 forbids a sender
+	 * and Linux's own output refuses. */
+	[CDX_SEC_REFUSED_SEQ_OVERFLOW]	  = { "seq_overflow", LINUX_MIB_XFRMOUTSTATESEQERROR },
+	/* A TTL or hop limit SEC took to zero. No xfrm counter: Linux's ESP
+	 * input decapsulates such a frame, and it is ip_forward() that drops it,
+	 * as an IP header error. No SA here asks SEC to decrement the TTL, so
+	 * this is not expected to move. */
+	[CDX_SEC_REFUSED_TTL_ZERO]	  = { "ttl_zero" },
+	/* xfrm's "errors not matched by others". Replays and ICV failures both
+	 * land here, so putting it down to either would be wrong. */
+	[CDX_SEC_REFUSED_OTHER]		  = { "other", LINUX_MIB_XFRMINERROR },
+	[CDX_SEC_REFUSED_HW]		  = { "hw", 0, true },
+	[CDX_SEC_REFUSED_DMA]		  = { "dma", 0, true },
+	[CDX_SEC_REFUSED_DECO_WATCHDOG]	  = { "deco_watchdog", 0, true },
+	[CDX_SEC_REFUSED_INPUT_READ]	  = { "input_read", 0, true },
+	[CDX_SEC_REFUSED_LENGTH_ROLLOVER] = { "length_rollover", 0, true },
+	[CDX_SEC_REFUSED_TABLE_TOO_SMALL] = { "table_too_small", 0, true },
+	[CDX_SEC_REFUSED_TABLE_DEPLETION] = { "table_depletion", 0, true },
+	[CDX_SEC_REFUSED_OUTPUT_TOO_LARGE] = { "output_too_large", 0, true },
+	[CDX_SEC_REFUSED_COMPOUND_WRITE]  = { "compound_write", 0, true },
+	[CDX_SEC_REFUSED_BUFFER_TOO_SMALL] = { "buffer_too_small", 0, true },
+	[CDX_SEC_REFUSED_BUFFER_DEPLETION] = { "buffer_depletion", 0, true },
+	[CDX_SEC_REFUSED_OUTPUT_WRITE]	  = { "output_write", 0, true },
+	[CDX_SEC_REFUSED_COMPOUND_READ]	  = { "compound_read", 0, true },
+	[CDX_SEC_REFUSED_PREHEADER_READ]  = { "preheader_read", 0, true },
+};
+
+/* The microcode's counts as last read, whether they have been read at all,
+ * and what this module has counted of them since it loaded. Under the
+ * control transaction. */
+static u32 ft_sec_seen[CDX_SEC_REFUSAL_CLASSES];
+static bool ft_sec_known;
+static u64 ft_sec_counted[CDX_SEC_REFUSAL_CLASSES];
+
+/* Room for every fault class moving at once, at ten digits each: 343 bytes.
+ * scnprintf() truncates rather than overruns if a name ever grows. */
+#define FT_SEC_FAULT_TEXT	384
+
+/* Count what SEC refused since the last reading. Transaction held.
+ *
+ * The first reading only sets where counting starts. Until one succeeds there
+ * is nothing to start from: FMan places the counters with the first external
+ * hash table, and nothing is offloaded -- so nothing refused -- before one
+ * exists.
+ */
+static void ft_sec_refusals_fold(void)
+{
+	char faults[FT_SEC_FAULT_TEXT];
+	struct cdx_sec_refusals now;
+	unsigned int i, at = 0;
+	u64 faulted = 0;
+	u32 moved;
+
+	if (cdx_ipsec_sec_refusals(&now))
+		return;
+	if (!ft_sec_known) {
+		memcpy(ft_sec_seen, now.count, sizeof(ft_sec_seen));
+		ft_sec_known = true;
+		return;
+	}
+	for (i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++) {
+		/* Unsigned 32-bit difference: a count that wrapped since the
+		 * last reading still adds what it counted. */
+		moved = now.count[i] - ft_sec_seen[i];
+		ft_sec_seen[i] = now.count[i];
+		if (!moved)
+			continue;
+		ft_sec_counted[i] += moved;
+		if (ft_sec_refusal[i].mib)
+			XFRM_ADD_STATS(&init_net, ft_sec_refusal[i].mib, moved);
+		if (!ft_sec_refusal[i].fault)
+			continue;
+		faulted += moved;
+		at += scnprintf(faults + at, sizeof(faults) - at, " %s=%u",
+				ft_sec_refusal[i].name, moved);
+	}
+	if (faulted)
+		pr_warn_ratelimited("ask_flowtable: %llu IPsec frames dropped, SEC could not process them:%s\n",
+				    faulted, faults);
+}
+
 /* Publish one SA's counters into its state and let xfrm judge them.
  *
  * A VALID state only. One that is being deleted has nothing left to expire,
@@ -11205,6 +11351,9 @@ static void ft_ipsec_stats_work(struct work_struct *work)
 		ft_ipsec_account(owned, &counters);
 		xfrm_state_put(owned->x);
 	}
+	/* What SEC refused is counted for no SA in particular, so once a pass
+	 * rather than once an SA. */
+	ft_sec_refusals_fold();
 	spin_lock_bh(&ft_ipsec_retired_lock);
 	more = !list_empty(&ft_ipsec_owned);
 	spin_unlock_bh(&ft_ipsec_retired_lock);
@@ -11311,6 +11460,17 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	return 0;
 }
 
+/* Whether the SAs are all gone: none owned, and no retirement still queued. */
+static bool ft_ipsec_none_left(void)
+{
+	bool none;
+
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	none = list_empty(&ft_ipsec_owned) && list_empty(&ft_ipsec_retired);
+	spin_unlock_bh(&ft_ipsec_retired_lock);
+	return none;
+}
+
 static void ft_ipsec_retire_work(struct work_struct *work)
 {
 	struct ft_ipsec_retirement *retirement;
@@ -11350,6 +11510,11 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 		/* Out of the hardware: an egress drain waiting on it may now
 		 * say so, having taken this transaction to look. */
 		atomic_dec(&ft_ipsec_retiring);
+		/* The accounting pass stops once no SA is owned. The last one
+		 * out counts what SEC refused up to its going, so that is not
+		 * left waiting for the next SA to be installed. */
+		if (ft_ipsec_none_left())
+			ft_sec_refusals_fold();
 		cdx_ft_end();
 		kfree(retirement);
 	}
@@ -12129,6 +12294,23 @@ static void ft_dev_rows(struct seq_file *seq, enum cdx_ft_stats_kind kind, bool 
 	}
 }
 
+/* The frames SEC refused since this module loaded: all of them, which is
+ * exact, and then each class the microcode counted them in, which is only as
+ * good as its sorting; see ft_sec_refusal[]. As of the accounting pass's last
+ * reading. Transaction held. */
+static void ft_sec_refusal_rows(struct seq_file *seq)
+{
+	u64 total = 0;
+	unsigned int i;
+
+	for (i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++)
+		total += ft_sec_counted[i];
+	seq_printf(seq, "ipsec_sec_refused %llu\n", total);
+	for (i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++)
+		seq_printf(seq, "ipsec_sec_refused_%s %llu\n", ft_sec_refusal[i].name,
+			   ft_sec_counted[i]);
+}
+
 /* The PPPoE session, as the id and the concentrator the path walk resolved.
  * Both are shown for either direction even though only an egress session is
  * inserted: the two come from the same walk, so a direction that strips and
@@ -12294,6 +12476,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_ipsec_invalidations),
 		   atomic64_read(&ft_ipsec_policy_invalidations),
 		   atomic64_read(&ft_ipsec_next_hop_updates));
+	ft_sec_refusal_rows(seq);
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   session_records, session_slots);
 	ft_dev_rows(seq, CDX_FT_STATS_TIMESTAMPED, false);
@@ -12437,6 +12620,10 @@ static int __init ask_flowtable_init(void)
 	 * this module's lifetime, including failed initialization and exit. */
 	cdx_ft_begin();
 	rc = cdx_ft_claim();
+	/* What SEC refused before this module existed is not its to count:
+	 * this reading is where its counting starts. */
+	if (!rc)
+		ft_sec_refusals_fold();
 	cdx_ft_end();
 	if (rc)
 		return rc;
@@ -12653,6 +12840,12 @@ static void __exit ask_flowtable_exit(void)
 	 * none is by now: every offloaded state pins this module through its
 	 * ops, and xfrm deletes a state before it lets it go. */
 	cancel_delayed_work_sync(&ft_ipsec_stats);
+	/* The last SA's retirement counted what SEC had refused by then; this
+	 * counts whatever SEC finished refusing after it, the last this module
+	 * will. */
+	cdx_ft_begin();
+	ft_sec_refusals_fold();
+	cdx_ft_end();
 	/* The notifiers that mark a watch are gone above, so nothing can queue
 	 * this again; stop the pass in flight and drop the watches it walked,
 	 * which are this module's memory rather than the kernel's. */

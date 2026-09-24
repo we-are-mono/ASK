@@ -26,6 +26,24 @@ def test_ipsec_adapter(tmp_path):
     policy = (kernel / "net/xfrm/xfrm_policy.c").read_text()
     state = (kernel / "net/xfrm/xfrm_state.c").read_text()
     replay = (kernel / "net/xfrm/xfrm_replay.c").read_text()
+    sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
+    ehash_h = (sdk / "inc/Peripherals/fm_ehash.h").read_text()
+    ehash_c = (sdk / "Peripherals/FM/Pcd/fm_ehash.c").read_text()
+    sdk_types = (sdk / "src/inc/types_linux.h").read_text()
+    snmp = (kernel / "include/uapi/linux/snmp.h").read_text()
+    # The microcode's refusal counters, read the way the kernel reads them:
+    # xfrm's own MIB numbering, the microcode's table as the SDK lays it
+    # out, the SDK's big-endian load, its reader, and the backend's sorting
+    # of the result into classes.
+    (tmp_path / "sec_refusals.inc").write_text(
+        re.search(r"^enum\s*\{\s*LINUX_MIB_XFRMNUM = 0,.*?^\};", snmp, re.S | re.M).group() + "\n"
+        + ehash_h[ehash_h.index("/* Following structure is used to update SEC failure stats"):
+                  ehash_h.index("int32_t ExternalHashGetSECfailureStats(")]
+        + "\n".join(re.search(rf"^#define {name}\(.*$", sdk_types, re.M).group()
+                    for name in ("in_be32", "GET_UINT32")) + "\n"
+        + re.search(r"^en_exthash_global_mem \*en_global_muram_mem = NULL;$", ehash_c, re.M).group() + "\n"
+        + definition(ehash_c, "ExternalHashGetSECfailureStats")
+        + function((ROOT / "cdx/cdx_ipsec_backend.c").read_text(), "cdx_ipsec_sec_refusals"))
     # The real descriptions, not restatements of them. A field added to the
     # SA spec, to the rule or to the watch has to fail here rather than
     # compile into a harness that no longer matches what the adapter keeps.
@@ -57,7 +75,7 @@ def test_ipsec_adapter(tmp_path):
         "ft_ipsec_replay_bit", "ft_ipsec_replay_seen", "ft_ipsec_spec",
         "ft_ipsec_seq_exhausting", "ft_ipsec_publish_oseq",
         "ft_ipsec_publish_window", "ft_ipsec_account", "ft_ipsec_stats_work",
-        "ft_xdo_state_add", "ft_ipsec_retire_work",
+        "ft_xdo_state_add", "ft_ipsec_none_left", "ft_ipsec_retire_work",
         "ft_ipsec_watch_find", "ft_ipsec_watch_stale", "ft_ipsec_follow_work",
         "ft_xdo_state_delete", "ft_xdo_policy_add",
         "ft_xdo_state_free", "ft_xdo_offload_ok",
@@ -94,6 +112,11 @@ def test_ipsec_adapter(tmp_path):
         # waits at all; a harness inventing them would assert nothing.
         source[source.index("#define FT_IPSEC_NEIGH_TRIES"):
                source.index("static int ft_ipsec_peer_mac")]
+        # How each class of SEC refusal is counted, the fold that counts
+        # it, and the rows /proc/cdx_flowtable shows it in.
+        + source[source.index("/* ------------------------------------------------- what SEC refused"):
+                 source.index("/* Publish one SA's counters into its state")]
+        + function(source, "ft_sec_refusal_rows")
         + "\n".join(function(source, name) for name in names)
         + source[source.index("static const struct xfrmdev_ops ft_xfrmdev_ops = {"):
                  source.index("/* Attach the ops to a CDX physical port")]
@@ -119,6 +142,24 @@ def test_sa_delete_counts_its_retirement_before_the_watch_goes():
     map the entry still reads."""
     body = function(SOURCE.read_text(), "ft_xdo_state_delete")
     assert body.index("atomic_inc(&ft_ipsec_retiring)") < body.index("ft_ipsec_watch_del(sa)"), body
+
+
+def test_sec_refusals_counted_from_load_to_unload():
+    """What SEC refused is counted from the reading taken at load, so nothing
+    refused before the module existed is put down to it, and once more at
+    unload, after the pass has stopped for good, so nothing counted since its
+    last period is lost."""
+    source = SOURCE.read_text()
+    init = function(source, "ask_flowtable_init")
+    claim = init.index("rc = cdx_ft_claim();")
+    fold = init.index("ft_sec_refusals_fold();", claim)
+    assert fold < init.index("cdx_ft_end();", claim), init
+    assert init.index("cdx_ft_begin();") < claim, init
+    exit_ = function(source, "ask_flowtable_exit")
+    stopped = exit_.index("cancel_delayed_work_sync(&ft_ipsec_stats);")
+    fold = exit_.index("ft_sec_refusals_fold();", stopped)
+    assert exit_.index("cdx_ft_begin();", stopped) < fold, exit_
+    assert "cdx_ft_end();" in exit_[fold:], exit_
 
 
 def test_ipsec_backend_natt_order(tmp_path):

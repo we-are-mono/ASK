@@ -949,6 +949,11 @@ static unsigned ipsec_attached, ipsec_detached, ipsec_detached_all;
 static void ft_ipsec_attach(struct net_device *d) { ipsec_attached++; }
 static void ft_ipsec_detach(struct net_device *d) { ipsec_detached++; }
 static void ft_ipsec_detach_all(void) { ipsec_detached_all++; }
+/* The count of what SEC refused, which the module takes at load to count
+ * from and once more at unload, both inside the transaction. The fold itself
+ * is compiled in ipsec_adapter.c. */
+static unsigned sec_refusal_folds;
+static void ft_sec_refusals_fold(void) { assert(cdx_info->ctrl.mutex); sec_refusal_folds++; }
 static bool swdev_obj_registered, indirect_registered;
 /* An SA rebuild an egress change asked for and that has not happened yet, on
  * this port; the follow pass clears it if `ipsec_rebuild_succeeds'. The watch
@@ -6942,8 +6947,12 @@ static void test_qos_decode(void)
     ft_ready=ft_stopping=false; registration_step=canceled=0;
     fixture();
     ft_qos_mark_mask = CDX_FT_QOS_MASK; ft_qos_default_class = 0;
+    sec_refusal_folds = 0;
     assert(ask_flowtable_init() == 0);
+    /* Counting what SEC refused starts at load and ends at unload. */
+    assert(sec_refusal_folds == 1);
     ask_flowtable_exit();
+    assert(sec_refusal_folds == 2);
     ft_ready=ft_stopping=false; registration_step=canceled=0;
     fixture();
     ft_qos_mark_mask = (CDX_FT_QOS_MASK << 1) | 1;   /* one bit too wide */

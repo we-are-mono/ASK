@@ -629,4 +629,44 @@ sequence:
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_stats, ASK_CDX_FLOWTABLE);
 
+int cdx_ipsec_sec_refusals(struct cdx_sec_refusals *refusals)
+{
+	/* Zeroed, so a field the reader left unset could only ever read as
+	 * nothing counted, never as a stack word taken for a count. */
+	en_SEC_failure_stats stats = { 0 };
+	u32 *count = refusals->count;
+
+	/* One class per counter of the microcode's: a counter added to its
+	 * table has to be given a class here before this builds again. */
+	static_assert(sizeof(stats) == sizeof(refusals->count));
+	/* The reader converts from MURAM's big-endian itself (GET_UINT32). */
+	if (ExternalHashGetSECfailureStats(&stats))
+		return -ENODEV;
+	count[CDX_SEC_REFUSED_ICV] = stats.icv_failures;
+	count[CDX_SEC_REFUSED_HW] = stats.hw_errs;
+	count[CDX_SEC_REFUSED_CCM_AAD_SIZE] = stats.CCM_AAD_size_errs;
+	count[CDX_SEC_REFUSED_LATE] = stats.anti_replay_late_errs;
+	count[CDX_SEC_REFUSED_REPLAY] = stats.anti_replay_replay_errs;
+	count[CDX_SEC_REFUSED_SEQ_OVERFLOW] = stats.seq_num_overflows;
+	count[CDX_SEC_REFUSED_DMA] = stats.DMA_errs;
+	count[CDX_SEC_REFUSED_DECO_WATCHDOG] = stats.DECO_watchdog_timer_timedout_errs;
+	count[CDX_SEC_REFUSED_INPUT_READ] = stats.input_frame_read_errs;
+	count[CDX_SEC_REFUSED_PROTOCOL_FORMAT] = stats.protocol_format_errs;
+	count[CDX_SEC_REFUSED_TTL_ZERO] = stats.ipsec_ttl_zero_errs;
+	count[CDX_SEC_REFUSED_PAD_CHECK] = stats.ipsec_pad_chk_failures;
+	count[CDX_SEC_REFUSED_LENGTH_ROLLOVER] = stats.output_frame_length_rollover_errs;
+	count[CDX_SEC_REFUSED_TABLE_TOO_SMALL] = stats.tbl_buff_too_small_errs;
+	count[CDX_SEC_REFUSED_TABLE_DEPLETION] = stats.tbl_buff_pool_depletion_errs;
+	count[CDX_SEC_REFUSED_OUTPUT_TOO_LARGE] = stats.output_frame_too_large_errs;
+	count[CDX_SEC_REFUSED_COMPOUND_WRITE] = stats.cmpnd_frame_write_errs;
+	count[CDX_SEC_REFUSED_BUFFER_TOO_SMALL] = stats.buff_too_small_errs;
+	count[CDX_SEC_REFUSED_BUFFER_DEPLETION] = stats.buff_pool_depletion_errs;
+	count[CDX_SEC_REFUSED_OUTPUT_WRITE] = stats.output_frame_write_errs;
+	count[CDX_SEC_REFUSED_COMPOUND_READ] = stats.cmpnd_frame_read_errs;
+	count[CDX_SEC_REFUSED_PREHEADER_READ] = stats.prehdr_read_errs;
+	count[CDX_SEC_REFUSED_OTHER] = stats.other_errs;
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sec_refusals, ASK_CDX_FLOWTABLE);
+
 #endif /* DPA_IPSEC_OFFLOAD */

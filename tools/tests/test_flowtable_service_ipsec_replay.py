@@ -227,12 +227,27 @@ async def arrivals(r, spi, seen, expected):
     return since(await delivered(r))
 
 
+# The /proc/net/xfrm_stat counters the adapter folds SEC's protocol refusals
+# into. Which of them a refusal lands in follows the class the FMan microcode
+# counted it in, and that is not reliable -- replays have been measured in
+# its catch-all, other_errs, which folds to XfrmInError -- so only their sum
+# is held to account. It leaves out SEC's faults, which a replay burst does
+# not cause; the exact count of every refusal is ipsec_sec_refused in
+# /proc/cdx_flowtable.
+SEC_REFUSAL_MIBS = ("XfrmInStateSeqError", "XfrmInStateProtoError", "XfrmInError", "XfrmOutStateSeqError")
+
+
 async def dut_counters(r):
     snmp = [line.split()[1:] for line in (await read(r.target, r.session, "/proc/net/snmp")).splitlines()
             if line.startswith("Ip:")]
+    mib = xfrm_mib(await read(r.target, r.session, "/proc/net/xfrm_stat"))
+    state = await r.state()
     return {"todec": await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx todec"),
             "reasm": int(dict(zip(*snmp))["ReasmOKs"]),
-            "seq_errors": xfrm_mib(await read(r.target, r.session, "/proc/net/xfrm_stat"))["XfrmInStateSeqError"]}
+            "refusals": sum(mib[name] for name in SEC_REFUSAL_MIBS),
+            **{name: mib[name] for name in SEC_REFUSAL_MIBS},
+            # Every class the microcode counted, and their exact total.
+            **{key: value for key, value in state.items() if key.startswith("ipsec_sec_refused")}}
 
 
 class Inbound:
@@ -356,7 +371,11 @@ async def test_flowtable_service_ipsec_replay_window(ipsec_service):
     Whole frames reach SEC through the classifier and fragments through the
     CPU, and the two share one window. Every datagram is delivered to the LAN
     end exactly as often as its window allows, and every frame the window
-    refuses is counted where Linux counts its own replay drops."""
+    refuses is counted: once in the FMan microcode's refusal total, which
+    /proc/cdx_flowtable carries, and once across the /proc/net/xfrm_stat
+    counters the adapter folds the microcode's non-fault classes into, which
+    is where the microcode files replays and late frames. Per SA it is counted
+    nowhere; SEC keeps no such count."""
     r = ipsec_service
     marker = secrets.token_bytes(16)
     script = base64.b64encode(listener_script(marker).encode()).decode()
@@ -391,22 +410,37 @@ async def test_flowtable_service_ipsec_replay_window(ipsec_service):
                     "whole frames must reach SEC through the classifier and fragments through the CPU", record)
                 rejected += step["rejected"]
                 accepted[sa.spi] += sum(got.values())
-        # The accounting pass publishes SEC's figures once a second.
+        # The accounting pass publishes SEC's figures, and reads the
+        # microcode's refusal count, once a second.
         await asyncio.sleep(1.5)
         figures = {sa.spi: await sa_state(r, sa.spi, "in") for sa in sas}
-        final = await dut_counters(r)
-        counted = final["seq_errors"] - initial["seq_errors"]
+        for _ in range(8):
+            final = await dut_counters(r)
+            counted = {key: final[key] - initial[key] for key in ("refusals", "ipsec_sec_refused")}
+            if min(counted.values()) >= rejected:
+                break
+            await asyncio.sleep(0.5)
         errors = [line for line in (await command(r.target, r.session, "dmesg"))["stdout"].splitlines()
-                  if "IPsec SEC error" in line][-64:]
+                  if "IPsec SEC error" in line or "SEC could not process" in line][-64:]
         r.record("ipsec-replay-window-accounting", {
             "refused": rejected, "counted": counted, "sec_errors": errors,
+            "classes": {key: final[key] - initial[key] for key in final
+                        if key.startswith("ipsec_sec_refused_") or key.startswith("Xfrm")},
             "sas": {f"{spi:#x}": {"accepted": accepted[spi], **figures[spi]} for spi in accepted}})
         # SEC counts the frames it decrypted, whichever feeder brought them,
         # and not the ones its window refused: a replay must not age an SA.
         assert {spi: figures[spi]["packets"] for spi in accepted} == dict(accepted), (figures, accepted)
-        assert counted == rejected, (
-            f"SEC refused {rejected} replayed or late frames and XfrmInStateSeqError moved by {counted}; "
-            "a hardware replay drop must be counted where Linux counts its own")
+        # Every frame SEC refused, through either feeder, is counted once:
+        # by the microcode, whose total /proc/cdx_flowtable carries, and
+        # across the xfrm_stat counters, since the microcode files replays
+        # and late frames in a class that is folded there (measured: its
+        # catch-all, other_errs, never a fault class).
+        assert counted["ipsec_sec_refused"] == rejected, (
+            f"SEC refused {rejected} replayed or late frames and the microcode's count moved by "
+            f"{counted['ipsec_sec_refused']}")
+        assert counted["refusals"] == rejected, (
+            f"SEC refused {rejected} replayed or late frames and {'+'.join(SEC_REFUSAL_MIBS)} moved by "
+            f"{counted['refusals']}; a hardware refusal must be counted where Linux counts its own")
     finally:
         await lan_run(r.lan, f"kill $(cat {LISTENER_PID}) 2>/dev/null; rm -f {LISTENER} {DELIVERED} {LISTENER_PID}", 10)
         await command(r.target, r.session, "conntrack", "-D", "-p", "udp", "--orig-src", INNER,

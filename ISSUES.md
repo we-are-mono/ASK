@@ -393,6 +393,9 @@ file's git history.
 - [x] **A201.** Oversized IPv6 into an SA was unmeasured — measured: SEC encrypts it whole and only the outer IPv4 packet is fragmented, so no bound
   is needed (_:/^tests: measure what an oversized IPv6 packet into an SA becomes_).
 
+- [x] **A211.** IPsec frames SEC refused were counted nowhere Linux could see: FMan's microcode tallies and drops them globally, and nothing read the tally —
+  fixed (_:/^cdx: count SEC's refusals from the FMan microcode's own tally_).
+
 - [x] **A210.** Offloaded SAs started at sequence zero with a fixed 64-entry window, and SEC's numbering never reached xfrm —
   fixed (_:/^cdx: carry the IPsec starting sequence and replay window to SEC_).
 
