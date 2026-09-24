@@ -15,6 +15,7 @@ def test_flowtable_handle_lifecycle(tmp_path):
     (tmp_path / "handle_production.inc").write_text(
         source[source.index("struct nf_flow_offload_handle {"):
                source.index("static void\nflow_offload_fill_dir")]
+        + function(source, "flow_offload_free_rcu")
         + function(source, "flow_offload_free")
         + function(source, "flow_offload_add")
         + source[source.index("struct flow_offload_tuple_rhash *\nflow_offload_lookup"):

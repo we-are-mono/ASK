@@ -172,17 +172,6 @@ result independently of those temporary files.
   interface's IPv6 MTU) nor the Armbian integration sets it. Derive it from the
   upstream when the uplink is PPPoE or a tunnel.
 
-- [ ] **A197 — two later upstream flowtable lifetime fixes are not in the
-  tree.** 2014ac62df9d ("netfilter: flowtable: publish GC-visible tuple
-  last"): `flow_offload_add()` publishes the ORIGINAL tuple, the one the GC
-  walk treats as owning the flow, before the REPLY one, so the GC can free a
-  flow still being inserted (KASAN use-after-free in the rhashtable path).
-  e75a9fa1d44b ("netfilter: flowtable: hold reference on ct until flow is
-  released"): `nf_ct_put()` frees ct->ext at once while the datapath may still
-  reach the conntrack through the flow until the RCU grace period. Both touch
-  `net/netfilter/nf_flow_table_core.c` where patches 141-144 sit; backport them
-  into a patch after 144.
-
 - [ ] **A196 — oversized multicast replicas are fragmented by the microcode.**
   A multicast member's entry has no preemptive-check op
   (`fill_mcast_member_actions()` in `cdx/cdx_ehash.c` starts from a fresh
@@ -367,6 +356,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A197.** Two later upstream flowtable lifetime fixes (2014ac62df9d, e75a9fa1d44b) were missing from the tree —
+  backported as patch 145 (_:/^netfilter: backport two upstream flowtable lifetime fixes_).
 
 - [x] **A199.** CPU- and FMan-fed jobs of one SA reused ESP sequence numbers (the SDK zeroed the firmware's FMan port ICIDs) —
   fixed (_:/^sdk_fman: keep the boot firmware's port ICIDs_).

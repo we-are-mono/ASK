@@ -67,8 +67,24 @@ static void *kzalloc(size_t size, int flags)
 }
 static void defer_free(void *p) { assert(deferred_count < 32); deferred[deferred_count++] = p; }
 #define kfree_rcu(p, member) defer_free(p)
+static void kfree(void *p) { free(p); assert(allocations); allocations--; }
+/* call_rcu() callbacks, run at the next grace period like kfree_rcu()'s frees:
+ * a flow's conntrack reference is only dropped there, after every reader that
+ * could still reach the conntrack through the flow is done. */
+static struct { struct rcu_head *head; void (*func)(struct rcu_head *); } callbacks[32];
+static unsigned callback_count;
+static void call_rcu(struct rcu_head *head, void (*func)(struct rcu_head *))
+{
+    assert(callback_count < 32);
+    callbacks[callback_count].head = head;
+    callbacks[callback_count++].func = func;
+}
 static void grace_period(void)
 {
+    while (callback_count) {
+        callback_count--;
+        callbacks[callback_count].func(callbacks[callback_count].head);
+    }
     while (deferred_count) { free(deferred[--deferred_count]); assert(allocations); allocations--; }
 }
 static int rhashtable_insert_fast(struct rhashtable *table, struct rhash_head *node, int params)
@@ -135,8 +151,10 @@ int main(void)
     allocation_fail = false;
     assert(!flow_offload_hw_invalid(flow) && flow_offload_lookup(&table, &key[0]));
     expired = true; nf_flow_offload_gc_step(&table, flow, NULL); expired = false;
-    assert(!ct.refs && !table.rhashtable.slots[0] && !extensions);
-    grace_period(); assert(!allocations);
+    /* Unhashed at once; the conntrack is only put after the grace period,
+     * since a datapath reader may still reach it through the flow. */
+    assert(ct.refs == 1 && !table.rhashtable.slots[0] && !extensions);
+    grace_period(); assert(!allocations && !ct.refs);
 
     table.use_hw_handles = table.hardware = true;
     flow = new_flow(&ct); allocation_fail = true;
@@ -162,8 +180,8 @@ int main(void)
     nf_flow_offload_gc_step(&table, flow, NULL); assert(deletes == 1);
     set_bit(NF_FLOW_HW_DEAD, &flow->flags);
     nf_flow_offload_gc_step(&table, flow, NULL);
-    assert(old->refs == 2 && !ct.refs && extensions == 1);
-    grace_period(); assert(allocations == 1);
+    assert(old->refs == 2 && ct.refs == 1 && extensions == 1);
+    grace_period(); assert(allocations == 1 && !ct.refs);
 
     /* A retained old handle owns no Linux flow/route/CT. Reusing the tuple
      * cannot turn a delayed invalidation into an operation on the new flow. */
@@ -178,8 +196,8 @@ int main(void)
     old = flow->hw_handle;
     nf_flow_offload_handle_get(old);
     flow_offload_del(&table, flow); /* Table destruction may precede driver put. */
-    assert(!nf_flow_offload_handle_valid(old) && old->refs == 1 && !ct.refs);
-    grace_period(); assert(allocations == 1);
+    assert(!nf_flow_offload_handle_valid(old) && old->refs == 1 && ct.refs == 1);
+    grace_period(); assert(allocations == 1 && !ct.refs);
     nf_flow_offload_handle_put(old); grace_period(); assert(!allocations);
     assert(route_releases == 6 && adds == 2);
     /* A policy update retires both lookup directions before asynchronous GC,
