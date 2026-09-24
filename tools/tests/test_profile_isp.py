@@ -140,6 +140,8 @@ PORT_BULK = PORT_MAIN + 8
 PORT_PUBLIC = PORT_MAIN + 10
 PORT_IPTV = PORT_MAIN + 12      # and +13, one per channel
 PORT_RATE = PORT_MAIN + 16
+# The throughput floor's ramp: past it, the receiver's count is steady state.
+RAMP_SECONDS = 3
 
 # Two channels, so the channel-change case has a survivor to keep watching.
 # Each carries its own destination port: two sockets bound to one port both
@@ -1735,8 +1737,12 @@ async def test_profile_isp_throughput(isp, splat_window):
     carry this much: the point of the case is the floor, not the measurement. It
     runs against the same profile as everything above, so what it measures is
     the shipping configuration rather than a bare NAT path. A floor needs a
-    steady-state sample, not a long one: five measured seconds after a
-    two-second ramp.
+    steady-state sample, not a long one: the receiver's own count over the
+    five seconds after a three-second ramp, in which a slow start that
+    overshoots has recovered. Taken from the receiver's per-second intervals
+    rather than iperf3's omit period, whose first interval after the omit
+    claims two seconds for one second's bytes when the two timers fire in the
+    same microsecond.
     """
     ctx = isp
     client = BY_NAME["main"]
@@ -1749,7 +1755,7 @@ async def test_profile_isp_throughput(isp, splat_window):
         script = f'''
 import json, subprocess
 argv = ['iperf3', '-c', {INNER_LOCAL!r}, '-B', {client['ip']!r}, '-p', {str(PORT_RATE)!r},
-        '-P', '4', '-t', '5', '-O', '2', '-Z', '-J']
+        '-P', '4', '-t', '8', '-Z', '-J']
 result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
 print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
 '''
@@ -1758,8 +1764,13 @@ print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
         assert result.rc == 0, result.stdout
         report = json.loads(result.stdout.strip().splitlines()[-1])
         stdout, _ = await asyncio.wait_for(server.communicate(), 15)
-        measured = json.loads(stdout)["end"]["sum_received"]
-        ctx.record("isp-throughput", {"client": report, "server": measured})
+        received = json.loads(stdout)
+        settled = [i["sum"] for i in received["intervals"] if i["sum"]["start"] >= RAMP_SECONDS - 0.01]
+        assert settled, received["intervals"]
+        measured = {"bits_per_second": sum(i["bytes"] for i in settled) * 8 / sum(i["seconds"] for i in settled),
+                    "seconds": sum(i["seconds"] for i in settled)}
+        ctx.record("isp-throughput", {"client": report, "server": received["end"]["sum_received"],
+                                      "settled": measured})
         assert report["rc"] == 0, report
         # This path's own ceiling, not the plain-NAT one. Every frame here
         # spends both encapsulation slots -- a session inside a carrier tag --
