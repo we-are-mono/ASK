@@ -3973,6 +3973,9 @@ static void ft_mr_kick(void);
 static void ft_mc_egress_changed(const struct net_device *dev);
 static int ft_mc_egress_drain(const struct net_device *dev);
 static int ft_mr_egress_drain(const struct net_device *dev);
+/* And the SA deletions still on their way to the hardware, for the same
+ * drain; see ft_ipsec_retiring. */
+static bool ft_ipsec_retire_pending(void);
 
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
@@ -4552,10 +4555,10 @@ static void ft_egress_changed(struct net_device *dev)
  * entry itself, so that is waited for too -- and a recovery that cannot finish
  * yet, the hardware not proven stopped, is reported rather than waited out.
  * So is an unload in progress, which retires everything on its own schedule,
- * an SA whose rebuild failed and is waiting for its peer, and a multicast
- * group whose recorded chain lost a device or whose rebuild failed, which its
- * worker now owns. -EAGAIN leaves nothing to undo; the caller asks again
- * later.
+ * an SA whose rebuild failed and is waiting for its peer, an SA being deleted
+ * whose entries are not out of the hardware yet, and a multicast group whose
+ * recorded chain lost a device or whose rebuild failed, which its worker now
+ * owns. -EAGAIN leaves nothing to undo; the caller asks again later.
  *
  * Sleeps. Safe under RTNL, which none of the work waited on takes except by
  * trying. Both multicast workers do take RTNL, to ask the bridge and ipmr, so
@@ -4563,7 +4566,7 @@ static void ft_egress_changed(struct net_device *dev)
  * mutex, which all of it takes. */
 static int ft_egress_drain(struct net_device *dev)
 {
-	bool done;
+	bool done, retiring;
 	int rc;
 
 	might_sleep();
@@ -4596,6 +4599,15 @@ static int ft_egress_drain(struct net_device *dev)
 		if (ft_ipsec_rebuild_pending(dev))
 			return -EAGAIN;
 	}
+	/* An SA being deleted has left the watch list already, and its entries
+	 * leave the hardware only when ft_ipsec_retire gets to it. Reported,
+	 * not waited for: that work may be waiting on a recovery that needs
+	 * RTNL, which the caller can hold. */
+	cdx_ft_begin();
+	retiring = ft_ipsec_retire_pending();
+	cdx_ft_end();
+	if (retiring)
+		return -EAGAIN;
 	/* And every multicast group with a copy on the port, both learners'
 	 * whatever the first says: each rebuilds what it can. */
 	rc = ft_mc_egress_drain(dev);
@@ -10936,6 +10948,21 @@ struct ft_ipsec_retirement {
 static LIST_HEAD(ft_ipsec_owned);
 static LIST_HEAD(ft_ipsec_retired);
 static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
+/* SAs whose deletion has begun and whose hardware entries are not yet out:
+ * counted before the SA's watch goes, and uncounted by ft_ipsec_retire inside
+ * the transaction that deletes them. An outbound SA's entry transmits on its
+ * port and may read the port's DSCP map; once its watch has gone, this count
+ * is the only trace of it the egress drain can find. */
+static atomic_t ft_ipsec_retiring = ATOMIC_INIT(0);
+
+/* Whether an SA deletion is still on its way to the hardware. Read after the
+ * watch list, and inside the transaction ft_ipsec_retire deletes in, so a
+ * deletion either left its watch where ft_ipsec_rebuild_pending() saw it, is
+ * counted here, or has finished. */
+static bool ft_ipsec_retire_pending(void)
+{
+	return atomic_read(&ft_ipsec_retiring) != 0;
+}
 
 /* ------------------------------------------------ what SEC counted, for xfrm
  *
@@ -11325,6 +11352,9 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 			msleep(20);
 		}
 		cdx_ipsec_sa_del(&retirement->sa);
+		/* Out of the hardware: an egress drain waiting on it may now
+		 * say so, having taken this transaction to look. */
+		atomic_dec(&ft_ipsec_retiring);
 		cdx_ft_end();
 		kfree(retirement);
 	}
@@ -11499,6 +11529,10 @@ static void ft_xdo_state_delete(struct xfrm_state *x)
 	/* Close the admission-before-watch race independently of policy
 	 * changes; an SA expiry leaves policy itself unchanged. */
 	atomic64_inc_return_release(&ft_ipsec_genid);
+	/* Counted before the watch goes, which is what the egress drain saw
+	 * of the SA until now: it reads the watches and then this, under the
+	 * watch lock the removal releases. */
+	atomic_inc(&ft_ipsec_retiring);
 	ft_ipsec_watch_del(sa);
 	ft_ipsec_retire_sa(cdx_ipsec_sa_handle(sa));
 	spin_lock_bh(&ft_ipsec_retired_lock);
@@ -11510,8 +11544,10 @@ static void ft_xdo_state_delete(struct xfrm_state *x)
 		break;
 	}
 	spin_unlock_bh(&ft_ipsec_retired_lock);
-	if (WARN_ON_ONCE(!owned))
+	if (WARN_ON_ONCE(!owned)) {
+		atomic_dec(&ft_ipsec_retiring);
 		return;
+	}
 	schedule_work(&ft_ipsec_retire);
 }
 

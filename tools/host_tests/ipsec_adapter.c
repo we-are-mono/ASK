@@ -143,6 +143,11 @@ static atomic64_t atomic64_inc_return(atomic64_t *v) { return ++*v; }
 static atomic64_t atomic64_read(const atomic64_t *v) { return *v; }
 static atomic64_t atomic64_read_acquire(const atomic64_t *v) { return *v; }
 static atomic64_t ft_ipsec_genid;
+typedef int atomic_t;
+#define ATOMIC_INIT(v) (v)
+static void atomic_inc(atomic_t *v) { (*v)++; }
+static void atomic_dec(atomic_t *v) { assert(*v > 0); (*v)--; }
+static int atomic_read(const atomic_t *v) { return *v; }
 
 static int ft_watch_lock;
 static bool ether_addr_equal(const u8 *a, const u8 *b)
@@ -951,6 +956,8 @@ static void bench_drain_retirements(void)
 static void bench_clear_sas(void)
 {
 	bench_drain_retirements();
+	/* Every deletion counted has reached the hardware. */
+	assert(!ft_ipsec_retire_pending());
 	while (ft_ipsec_owned.next != &ft_ipsec_owned) {
 		struct ft_ipsec_retirement *r = list_entry(ft_ipsec_owned.next, struct ft_ipsec_retirement, list);
 		list_del(&r->list);
@@ -1157,7 +1164,10 @@ static void test_state_add(void)
 	assert(ether_addr_equal(sa_pool[0].dst_mac, PEER_MAC));
 
 	/* Deleting retires the flows naming the handle -- while the handle
-	 * still names this SA -- and queues the hardware teardown. */
+	 * still names this SA -- and queues the hardware teardown. Until that
+	 * has run, the deletion is counted where the egress drain looks: the
+	 * SA's watch, which is how the drain saw it before, is already gone. */
+	assert(!ft_ipsec_retire_pending());
 	fail_alloc_after = 0;
 	unsigned old_allocations = allocation_calls;
 	ft_xdo_state_delete(x);
@@ -1166,6 +1176,7 @@ static void test_state_add(void)
 	assert(ft_ipsec_owned.next == &ft_ipsec_owned);
 	assert(retired_handles == 1 && retires_scheduled == 1);
 	assert(x->xso.offload_handle == 0);
+	assert(ft_ipsec_retire_pending() && !ft_ipsec_rebuild_pending(&WAN));
 
 	/* Model an admission that was not yet on the watch when deletion
 	 * ran. The SA worker must discover it, remove it under the transaction,
@@ -1181,6 +1192,7 @@ static void test_state_add(void)
 	bench_drain_retirements();
 	assert(!late_handle.valid && !retirement_flows && !retirement_barriers);
 	assert(slept == slept_before + 2 && sa_deleted == 1);
+	assert(!ft_ipsec_retire_pending());
 
 	/* A refused install leaves nothing behind: no SA, and no watch whose
 	 * SA never existed. */

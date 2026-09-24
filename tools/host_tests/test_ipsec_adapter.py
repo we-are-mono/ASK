@@ -112,6 +112,15 @@ def test_ipsec_adapter(tmp_path):
     })
 
 
+def test_sa_delete_counts_its_retirement_before_the_watch_goes():
+    """The egress drain reads the SA watches and then the retiring count. A
+    delete that removed the watch first would leave an instant in which the
+    SA's hardware entry is in neither, and the drain would release a DSCP
+    map the entry still reads."""
+    body = function(SOURCE.read_text(), "ft_xdo_state_delete")
+    assert body.index("atomic_inc(&ft_ipsec_retiring)") < body.index("ft_ipsec_watch_del(sa)"), body
+
+
 def test_ipsec_backend_natt_order(tmp_path):
     """The adapter hands NAT-T ports over in network order and the SA cache
     keeps host order; the backend stored them unconverted, which sent every

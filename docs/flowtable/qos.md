@@ -1691,10 +1691,19 @@ retirement with the filter lock dropped (`drain()`), and only then release the
 table. A port asking for the map meanwhile is told it is busy. A drain that
 cannot prove the entries gone — a global invalidation whose recovery has not
 finished, an unload in progress, an SA on the port whose rebuild is waiting
-for its peer, a multicast group it could not rebuild — leaves the table
-claimed and says so in the kernel log; the next port to ask tries the drain
-again first, and the port that let go can take its own table back without
-one.
+for its peer, an SA being deleted whose entries are not out of the hardware
+yet, a multicast group it could not rebuild — leaves the table claimed and
+says so in the kernel log; the next port to ask tries the drain again first,
+and the port that let go can take its own table back without one.
+
+The deleted SA is a case of its own because an outbound SA's egress entry
+reads the map like any flow's, and its deletion takes its watch — what the
+drain finds SAs by — off the list at once, in `xdo_dev_state_delete()`,
+while the hardware delete waits for the retire work. So a deletion is counted
+before its watch goes and uncounted inside the transaction that deletes it,
+and the drain reads that count after the watches. It does not wait for the
+retire work: that work can be waiting on a recovery that needs RTNL, which
+the drain's caller holds.
 
 The first filter is ordered the other way round for the same reason: the table
 is claimed and programmed before it is published, so a first filter that

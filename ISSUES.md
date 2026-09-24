@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A254.** Turning a port's DSCP map on or off retired nothing: flows and SAs (a deleted one too) kept reading it on whichever port took it next, and `cpe_fp_tx()` raced its free —
+  fixed (_:/^flowtable: hold the DSCP map while a deleted SA is still in hardware_).
+
 - [x] **A261.** Multicast listener entries kept the queue and DSCP-map bit of when they were built, so an HTB tree or DSCP map change left groups on a dead queue or another port's map —
   fixed (_:/^flowtable: retire a multicast entry in the transaction that unlists it_).
 

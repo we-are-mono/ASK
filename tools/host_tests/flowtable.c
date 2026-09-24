@@ -957,6 +957,12 @@ static struct net_device *ipsec_rebuild_pending_on;
 static bool ipsec_rebuild_succeeds = true;
 static bool ft_ipsec_rebuild_pending(const struct net_device *dev)
 { return dev && ipsec_rebuild_pending_on == dev; }
+/* An SA deletion still on its way to the hardware, which the retire work,
+ * compiled in ipsec_adapter.c, finishes inside the transaction; so it is
+ * asked inside one. */
+static bool ipsec_retiring;
+static bool ft_ipsec_retire_pending(void)
+{ assert(cdx_info->ctrl.mutex); return ipsec_retiring; }
 /* Work items run where they are flushed, which is what flushing proves. */
 static void ft_retire_workfn(struct work_struct *work);
 static void ft_invalidate_work(struct work_struct *work);
@@ -6815,6 +6821,15 @@ static void test_egress_drain(void)
     assert(ft_egress_drain(&out) == -EAGAIN && mc_drains == 2 && mr_drains == 2);
     mr_drain_rc = 0;
     assert(!ft_egress_drain(&out) && mc_drains == 3 && mr_drains == 3);
+
+    /* An SA being deleted has left the watch list, and its entries -- an
+     * outbound one reads the port's DSCP map -- leave the hardware only when
+     * its retire work runs. The drain says so rather than wait for that
+     * work, which can itself be waiting on RTNL. */
+    ipsec_retiring = true;
+    assert(ft_egress_drain(&out) == -EAGAIN && !cdx_info->ctrl.mutex);
+    ipsec_retiring = false;
+    assert(!ft_egress_drain(&out));
 }
 
 static void test_qos_decode(void)
