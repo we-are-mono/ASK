@@ -97,6 +97,17 @@ class RunResult:
     rc:     int
 
 
+class ConsoleBusy(RuntimeError):
+    """run() waited far past its own timeout for another operation.
+
+    Not a TimeoutError: callers that resynchronise after a lost marker must
+    not mistake overlapping console use, a harness bug, for line noise."""
+
+
+# How much longer than its own timeout run() waits for the console.
+BUSY_SLACK_S = 60.0
+
+
 class Console:
     """Thin serial wrapper with send/expect + login + run-and-exit-code.
 
@@ -255,8 +266,15 @@ class Console:
         marker = f"__ASK_RC_{os.getpid()}_{int(time.monotonic() * 1e6)}__"
         wrapped = f"{cmd}; echo {marker}=$?\n"
         # Send and read as one unit: a second reader arriving between the two
-        # would eat this command's marker and leave both waiting.
-        with self.lock:
+        # would eat this command's marker and leave both waiting. A command
+        # queued behind another waits out that one's timeout and prompt flush;
+        # a holder that outlasts this command's own timeout by BUSY_SLACK_S is
+        # instead holding the console for its lifetime -- a background peer
+        # still running, say -- and waiting on would only hang the caller.
+        wait = timeout + BUSY_SLACK_S
+        if not self.lock.acquire(timeout=wait):
+            raise ConsoleBusy(f"{self.port}: another operation held the console for {wait:g}s")
+        try:
             self.send(wrapped)
 
             # Everything between "the shell's echo of our wrapped command"
@@ -271,6 +289,8 @@ class Console:
                 self.expect(PROMPT_RE, timeout=5.0)
             except TimeoutError:
                 pass
+        finally:
+            self.lock.release()
 
         raw = before.decode(errors="replace")
         out = _strip_echo(raw, wrapped)

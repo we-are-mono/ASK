@@ -238,10 +238,9 @@ async def lan_run_python(
     path = f"/tmp/ask_lan_{label}_{os.getpid()}_{int(time.monotonic() * 1e6)}.py"
     b64 = base64.b64encode(script.encode()).decode()
 
-    stage = lan.run(
-        f"echo {b64} | base64 -d > {path} && echo STAGED",
-        timeout=10,
-    )
+    # Off the event loop like the run itself: a console another operation
+    # holds would otherwise stall every task the test has in flight.
+    stage = await lan_run(lan, f"echo {b64} | base64 -d > {path} && echo STAGED", 10)
     if stage.rc != 0 or "STAGED" not in stage.stdout:
         raise AssertionError(
             f"failed to stage Python script on LAN at {path}: "

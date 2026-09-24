@@ -135,3 +135,36 @@ def test_two_readers_on_one_port_do_not_eat_each_others_output(pty_port):
         a.close()
         b.close()
         responder.join(timeout=2)
+
+
+def test_run_behind_a_long_operation_fails_instead_of_hanging(pty_port, monkeypatch):
+    """A command queued behind an operation that outlasts its own timeout
+    by the slack raises ConsoleBusy, not TimeoutError, and sends nothing.
+
+    A background peer holds the LAN console for its whole lease. A test that
+    ran a second command meanwhile froze its event loop on the lock until the
+    peer's own controller timed out, and then failed somewhere else."""
+    monkeypatch.setattr(uart, "BUSY_SLACK_S", 0.0)
+    master, path = pty_port
+    os.set_blocking(master, False)
+    holder, waiter = Console(path), Console(path)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with holder.lock:
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    try:
+        assert held.wait(5)
+        with pytest.raises(uart.ConsoleBusy):
+            waiter.run("true", timeout=0.2)
+        with pytest.raises(BlockingIOError):
+            os.read(master, 4096)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        holder.close()
+        waiter.close()
