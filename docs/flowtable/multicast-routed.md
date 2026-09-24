@@ -749,14 +749,21 @@ mroute_confirm_errors 0
 
 ```
 mroute family=4 table=253 group=239.8.1.5 src=10.0.0.52 in=eth4 oifs=eth3 \
-    listeners=eth3/0 state=installed unconfirmed=- packets=1500 bytes=795000
+    listeners=eth3/0 state=installed unconfirmed=- adds=1 packets=1500 bytes=795000
 ```
 
 `oifs` names the VIF devices the kernel listed; `listeners` names the physical
 ports and tags the hardware was actually given, which is where a bridge oif
 becomes several. `unconfirmed` names the oifs Linux has not yet been seen
 forwarding the group to, which is what keeps a `pending-confirm` group in
-software. The states are `installed`, `pending`, `pending-bridged`,
+software. `adds` counts the hardware entries added for this group: its first
+install, and each time it left hardware and came back. A chain swap adds none,
+so it is what tells a swap from a withdrawal and re-add that end on the same
+row. `mroute_refused` cannot, because it counts every group's refusals —
+including the listener-less entries `smcrouted` adds for whatever its WAN VIF
+hears. A group routed through a bridge rides the bridged group's entry and
+adds none of its own, so its count stays where it was.
+The states are `installed`, `pending`, `pending-bridged`,
 `pending-confirm`, and the refusals above plus `refused-filter`, each distinct
 so an operator can tell them apart. While a routed group exists,
 `mroute_ruleset_settled` is 0 for the second after a commit, and for as long
@@ -967,7 +974,7 @@ same path with every counter read by hand.
 | Oif a VLAN sub-interface — tag on the wire | `listeners=eth3/244`; **1488 of 1500** captured on the LAN VM's own sub-interface, so the tag the entry inserts is the one the peer demultiplexes on |
 | Oif a bridge, snooping off — flood set | passes; the bridge's one flood-enabled port becomes the one listener |
 | Two oifs on one port, untagged and tagged — both copies counted (A158) | passes; the row names **two** listeners, `eth3/0,eth3/244`, and the two copies are counted separately |
-| One of those two dropped — the chain swap (A158) | passes on the row and its listener count; deleting the VLAN device withdraws its VIF and the group is re-derived onto the remaining listener. That oracle cannot tell a chain swap from the group leaving hardware and coming back, which is what the learner did until A221; the case now also requires `mroute_refused` to stand still across it |
+| One of those two dropped — the chain swap (A158) | passes on the row and its listener count; deleting the VLAN device withdraws its VIF and the group is re-derived onto the remaining listener. That oracle cannot tell a chain swap from the group leaving hardware and coming back, which is what the learner did until A221; the case now also requires the group's own `adds` to stand still across it (the global `mroute_refused` also moves for unrelated groups) |
 | A non-default ipmr rule present | measured: the group goes to **`refused-policy`** and out of hardware the moment `ip -4 mrule add iif eth4 lookup 199` lands, and is readmitted when the rule is withdrawn |
 | The route removed | group retired, `/proc` row gone, `offload` gone |
 | KASAN, lockdep, kmemleak across every run above | **no reports** |

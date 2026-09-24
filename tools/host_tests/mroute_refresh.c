@@ -750,6 +750,8 @@ int main(void)
     run();
     assert(adds == 1 && hardware.live && ft_mr_installed == 1);
     assert(g->offloaded && cache.mfc_flags == MFC_OFFLOAD && !g->watch->news);
+    /* The group's own count of entries added, which /proc reports per row. */
+    assert(g->adds == 1);
     /* A copy seen again is no news. */
     ft_mr_work.queued = false;
     seen(g, OIF_A);
@@ -769,7 +771,8 @@ int main(void)
     refresh();
     assert(folds == 21);
 
-    /* A router appeared, then disappeared. Refreshed chains carry exact sets. */
+    /* A router appeared, then disappeared. Refreshed chains carry exact sets,
+     * swapped under the entry already there: the group adds none. */
     wanted = 2;
     ft_mr_recheck = true;
     run();
@@ -777,6 +780,7 @@ int main(void)
     wanted = 1;
     refresh();
     assert(replaces == 2 && hardware.copies == 1 && output[1].refs == 0);
+    assert(g->adds == 1);
 
     /* Exhaustion must not retain a subset and report offload forever. And a
      * failure is tried again once a refresh, not back to back in the same
@@ -805,6 +809,9 @@ int main(void)
     ft_mr_recheck = true;
     run();
     assert(hardware.live && hardware.copies == 2 && g->offloaded);
+    /* Withdrawn and put back: an entry added again, which the group counts,
+     * where only the failed tries did not. */
+    assert(g->adds == 2);
 
     /* An uncarriable router withdraws the whole chain. A timer discovers
      * restored eligibility even while no group is installed. What the entry
@@ -845,6 +852,7 @@ int main(void)
      * hardware for a listener it did not lose. */
     {
         unsigned a0 = adds, r0 = replaces, d0 = deletes;
+        u32 own = g->adds;
 
         rtnl_lock();
         ft_mr_device_gone(&output[1]);
@@ -858,6 +866,9 @@ int main(void)
         assert(replaces == r0 + 1 && adds == a0 && deletes == d0);
         assert(hardware.live && hardware.copies == 1 && output[0].refs == 1);
         assert(input.refs == 2 && g->state == FT_MR_INSTALLED);
+        /* And the row says so: its own count of entries added stood still,
+         * which a withdrawal and re-add ending on the same set would not. */
+        assert(g->adds == own);
     }
 
     /* The oif given another address. Nothing else about the plan moved, yet
@@ -867,6 +878,7 @@ int main(void)
      * swaps nothing. */
     {
         unsigned a0 = adds, r0 = replaces, d0 = deletes;
+        u32 own = g->adds;
 
         ft_mr_recheck = true;
         run();
@@ -874,7 +886,7 @@ int main(void)
         oif_addr[0][4] = 0x10;
         ft_mr_recheck = true;
         run();
-        assert(replaces == r0 + 1 && adds == a0 && deletes == d0);
+        assert(replaces == r0 + 1 && adds == a0 && deletes == d0 && g->adds == own);
         assert(ether_addr_equal(replaced_with.listener[0].src_mac, oif_addr[0]));
         assert(ether_addr_equal(g->listener[0].src_mac, oif_addr[0]));
         assert(ether_addr_equal(g->hw_spec.listener[0].src_mac, oif_addr[0]));
@@ -884,17 +896,23 @@ int main(void)
     /* The ingress itself unregisters. The group lets go of its reference at
      * once; the entry, which the delete goes through, keeps its own until
      * the worker takes it out of hardware -- and then lets go too. */
-    rtnl_lock();
-    ft_mr_device_gone(&input);
-    rtnl_unlock();
-    assert(input.refs == 1 && hardware.live && g->hw_in == &input);
-    refuse = true;               /* the plan has no ingress to name any more */
-    run();
-    assert(!hardware.live && !input.refs && !g->hw_in);
-    refuse = false;
-    ft_mr_recheck = true;
-    run();
-    assert(hardware.live && input.refs == 2);
+    {
+        u32 own = g->adds;
+
+        rtnl_lock();
+        ft_mr_device_gone(&input);
+        rtnl_unlock();
+        assert(input.refs == 1 && hardware.live && g->hw_in == &input);
+        refuse = true;           /* the plan has no ingress to name any more */
+        run();
+        assert(!hardware.live && !input.refs && !g->hw_in);
+        refuse = false;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && input.refs == 2);
+        /* Out of hardware and back in: one more entry of its own. */
+        assert(g->adds == own + 1);
+    }
 
     /* A bridge going down: the bridged learner drops its taps, and ipmr
      * keeps the VIFs, so nothing but this would publish them again. */
@@ -933,6 +951,8 @@ int main(void)
         run();
         assert(adds == added + 1 && h->hw && h->state == FT_MR_INSTALLED);
         assert(h->offloaded && other.mfc_flags == MFC_OFFLOAD && !cache.refs);
+        /* Each group counts its own: the refused one's first entry. */
+        assert(h->adds == 1);
         g = h;
         cache = other;
         g->mfc = &cache;

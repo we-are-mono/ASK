@@ -8275,6 +8275,13 @@ struct ft_mr_group {
 	u64 folded_bytes;
 	u32 folded_series;
 	bool fold_suspect;
+	/* How many entries of its own the group has had added: its first
+	 * install, and each time it left hardware and came back. A chain swap
+	 * adds none. /proc reports it per group, which is what tells a swap
+	 * from a withdrawal and re-add where the row otherwise ends the same:
+	 * mroute_refused counts every group's refusals, related or not. A group
+	 * routed through a bridge has no entry of its own and adds none. */
+	u32 adds;
 	enum ft_mr_state state;
 	/* MFC_OFFLOAD is set on the kernel's entry. */
 	bool offloaded;
@@ -10374,6 +10381,7 @@ static enum ft_mr_state ft_mr_record(struct ft_mr_group *g, struct cdx_mc_group 
 		g->folded_packets = g->folded_bytes = 0;
 		g->folded_series = 0;
 		g->fold_suspect = false;
+		g->adds++;
 	}
 	if (state == FT_MR_INSTALLED || state == FT_MR_BRIDGED) {
 		/* Adopt the plan whole, references included: the backend
@@ -10949,8 +10957,9 @@ static void ft_mr_rows(struct seq_file *seq)
 			   g->listeners ? listeners : "-",
 			   ft_mr_state_text(g->state));
 		ft_mr_unconfirmed(seq, g);
-		seq_printf(seq, " packets=%llu bytes=%llu\n",
-			   stats.packets, stats.bytes);
+		/* `adds` is the group's own: see struct ft_mr_group. */
+		seq_printf(seq, " adds=%u packets=%llu bytes=%llu\n",
+			   g->adds, stats.packets, stats.bytes);
 	}
 	mutex_unlock(&ft_mr_lock);
 }

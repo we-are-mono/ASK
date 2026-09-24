@@ -571,8 +571,14 @@ def test_proc_reports_a_row_and_a_summary():
         assert key in show, f"{key} missing from the summary"
     rows = function(source, "ft_mr_rows")
     for field in ("family=", "table=", "group=", "src=", "in=", "oifs=",
-                  "listeners=", "state=", "unconfirmed=", "packets=", "bytes="):
+                  "listeners=", "state=", "unconfirmed=", "adds=", "packets=",
+                  "bytes="):
         assert field in rows, f"{field} missing from the row"
+    # The group's own count of entries added, not the global refusal count:
+    # a swap and a withdrawal-and-re-add end on the same row otherwise, and
+    # any unrelated group can move mroute_refused.
+    assert "g->adds, stats.packets" in rows
+    assert "g->adds++;" in function(source, "ft_mr_record")
     # Every unseen oif is named, however many VIFs there are: written name
     # by name, never through a buffer that could cut the list short.
     assert "ft_mr_unconfirmed(seq, g);" in rows

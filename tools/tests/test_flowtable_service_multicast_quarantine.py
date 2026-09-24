@@ -266,10 +266,15 @@ async def test_flowtable_service_multicast_quarantine_listener_swap(multicast_ri
                 assert (await remaining(r, SPLICE_BARRIER)).startswith("armed=0"), \
                     "the swap never reached its barrier"
             assert swapped["mroute_installed"] == before["mroute_installed"], summary(swapped)
-            # Never refused on the way: a group taken out of hardware and put
-            # back also ends on one listener with the count it had.
-            for counter in ("mroute_refused", "mroute_install_errors"):
-                assert swapped[counter] == before[counter], (counter, summary(swapped))
+            # Never out of hardware on the way: a group taken out and put back
+            # also ends on one listener with the count it had, but under an
+            # entry added again, which its own row counts. The global refusal
+            # count would not say so: it moves for any group, smcrouted's
+            # listener-less entries for what the WAN VIF hears among them.
+            now, then = mroute_row(swapped, group, source), mroute_row(before, group, source)
+            assert now and then and now["adds"] == then["adds"], summary(swapped)
+            assert swapped["mroute_install_errors"] == before["mroute_install_errors"], \
+                summary(swapped)
             assert swapped["quarantine"] == 2, summary(swapped)
 
             survivor = await r.window([stream(family, group, hops=63)], observers,
