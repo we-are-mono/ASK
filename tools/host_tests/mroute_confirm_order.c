@@ -6,7 +6,8 @@
  * a hook registered later ahead of the ones already there, so what follows the
  * observer is whatever held the last priority when it registered: conntrack's
  * confirmation, which is the kernel's own and registers with no type, and
- * possibly an nftables chain or a BPF program, which are not.
+ * possibly an nftables chain, which is not. A BPF program cannot be there: a
+ * netfilter BPF link refuses the last priority.
  */
 #include <assert.h>
 #include <limits.h>
@@ -57,7 +58,8 @@ static struct nf_hook_ops ft_mr_confirm_ops[2] = {
 
 #include "mroute_confirm_order.inc"
 
-/* The kernel's own at the last priority, and what a user can put there. */
+/* The kernel's own at the last priority, what a user can put there, and a
+ * typed hook no user can. */
 static struct nf_hook_ops conntrack_confirm = { INT_MAX, NF_HOOK_OP_UNDEFINED };
 static struct nf_hook_ops nat = { 100, NF_HOOK_OP_UNDEFINED };
 static struct nf_hook_ops nft_filter = { 0, NF_HOOK_OP_NF_TABLES };
@@ -104,9 +106,12 @@ int main(void)
     assert(!ft_mr_observer_followed(AF_INET));
     /* One registered before it -- the observer registers afresh whenever a
      * family's first group appears -- runs after it, and can still drop,
-     * queue or steal the copy. So can a BPF program. */
+     * queue or steal the copy. */
     registered(AF_INET, 4, &nft_filter, v4, &nft_last, &conntrack_confirm);
     assert(ft_mr_observer_followed(AF_INET));
+    /* Any typed hook there counts the same. None but a chain can be there
+     * today -- a netfilter BPF link refuses the last priority -- so this
+     * only keeps the walk from depending on which type it is. */
     registered(AF_INET, 3, v4, &conntrack_confirm, &bpf_last);
     assert(ft_mr_observer_followed(AF_INET));
     /* Per family: the other family's list is its own. */

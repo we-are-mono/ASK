@@ -621,10 +621,11 @@ def test_the_kernel_marks_a_commit_until_it_is_applied():
 
 def test_nothing_that_can_drop_a_copy_runs_after_the_observer(tmp_path):
     """The observer is last by priority, but at an equal priority netfilter
-    puts a later registration first, so an nftables chain or BPF program that
-    held the last priority when the observer registered runs after it and can
-    still drop what it confirmed. Such a hook keeps the group in software;
-    conntrack's confirmation, the kernel's own, does not."""
+    puts a later registration first, so an nftables chain that held the last
+    priority when the observer registered runs after it and can still drop
+    what it confirmed. Such a chain keeps the group in software; conntrack's
+    confirmation, the kernel's own, does not. No BPF program can be there: a
+    netfilter BPF link refuses the last priority."""
     source = SOURCE.read_text()
     (tmp_path / "mroute_confirm_order.inc").write_text(
         function(source, "ft_mr_observer_followed"))

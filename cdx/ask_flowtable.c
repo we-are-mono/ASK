@@ -8766,7 +8766,7 @@ static bool ft_mr_plan_same(const struct ft_mr_group *g,
  * it does to each packet: a rate limit, a quota, a counter or a match that
  * differs from packet to packet stops applying once the group is carried, as
  * it does for a flowtable flow. Nor does it see past the observer: an
- * nftables or BPF hook that runs after it at POST_ROUTING keeps the group in
+ * nftables chain that runs after it at POST_ROUTING keeps the group in
  * software, and a chain at a device's egress is not seen at all.
  *
  * A ruleset change takes every confirmation back. An nftables commit --
@@ -8970,8 +8970,10 @@ static unsigned int ft_mr_confirm_hook(void *priv, struct sk_buff *skb,
  * first. At the very same priority netfilter puts a hook registered later
  * ahead of the ones already there, so what follows the observer is whatever
  * sat at the last priority when it was registered: conntrack's confirmation,
- * which only drops a copy it cannot insert, and any nftables chain or BPF
- * program placed there. ft_mr_observer_followed() looks for the last two. */
+ * which only drops a copy it cannot insert, and any nftables chain placed
+ * there. A BPF program cannot be: a netfilter BPF link refuses the last
+ * priority, which it leaves to conntrack. ft_mr_observer_followed() looks for
+ * the chains. */
 static struct nf_hook_ops ft_mr_confirm_ops[2] = {
 	{
 		.hook = ft_mr_confirm_hook,
@@ -9166,11 +9168,13 @@ static void ft_mr_watch_drop(struct ft_mr_group *g)
 	kfree_rcu(w, rcu);
 }
 
-/* Whether an nftables chain or a BPF program runs after the family's observer
- * at POST_ROUTING, where it could still drop, queue or steal a copy the
- * observer has confirmed. The hooks registered with no type -- conntrack's
- * confirmation, which sits at the same last priority -- are the kernel's
- * own. A registration publishes a new array, read here under RCU; an
+/* Whether an nftables chain runs after the family's observer at POST_ROUTING,
+ * where it could still drop, queue or steal a copy the observer has
+ * confirmed. Only a hook at the last priority can follow the observer, and a
+ * netfilter BPF link refuses that priority, so a hook there with a type is a
+ * chain; any typed hook counts. The hooks registered with no type --
+ * conntrack's confirmation, which sits at the same last priority -- are the
+ * kernel's own. A registration publishes a new array, read here under RCU; an
  * unregistration may instead leave netfilter's placeholder in place, which
  * has no type either. */
 static bool ft_mr_observer_followed(u8 family)
@@ -12245,7 +12249,9 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mr_lost);
 	/* How many times an nftables commit took every routed group back to
 	 * software to be confirmed again; whether the ruleset has stood still
-	 * long enough since for copies to confirm under it; and how often the
+	 * long enough since for copies to confirm under it -- followed only
+	 * while a routed group exists, so with none it is the last value read,
+	 * which may predate a commit; and how often the
 	 * forwarding check could not be registered or a group's watch
 	 * allocated -- which keeps groups in software with nothing else to say
 	 * why. */

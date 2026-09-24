@@ -304,12 +304,13 @@ the old parent confirm nothing for the new one.
 later ahead of the ones already there. So an nftables chain at priority
 2147483647 created after the observer runs before it and is covered. One that
 already existed when the observer registered runs after it. The observer
-registers afresh whenever a family's first group appears. Such a chain, or a
-BPF program there, can still drop, queue or steal a confirmed copy. While one
-follows the observer on that family's `POST_ROUTING`, its groups are
-`refused-filter`. Conntrack's confirmation also sits at that priority. It is
-the kernel's own, registered with no hook type, and drops a copy only when it
-cannot insert its entry, so it does not count.
+registers afresh whenever a family's first group appears. Such a chain can
+still drop, queue or steal a confirmed copy. While one follows the observer on
+that family's `POST_ROUTING`, its groups are `refused-filter`. Conntrack's
+confirmation also sits at that priority. It is the kernel's own, registered
+with no hook type, and drops a copy only when it cannot insert its entry, so it
+does not count. No BPF program can be there at all: a netfilter BPF link
+refuses the last priority, which it leaves to conntrack.
 
 **All or nothing.** A root consumes every frame it matches, and no listener the
 encoder expresses delivers to the CPU; the bridged learner's `refused-host` is
@@ -392,8 +393,16 @@ stream to that oif, not what it does to each packet:
   - set elements added by the datapath (`add @s`, `update @s`) or expiring
     by timeout;
   - `fib`-based rules after a route change;
-  - an interface renamed, or moved between groups, under an `oifname` or
-    `oifgroup` rule.
+  - an interface renamed, or moved between groups, under an `iifname`,
+    `oifname`, `iifgroup` or `oifgroup` rule -- the parent VIF's name counts
+    as much as an oif's, since a confirmation holds for its parent;
+  - a table owned by a netlink socket (`flags owner`, not `persist`), which
+    nf_tables releases when that socket closes, and every table, which it
+    releases when its module is unloaded. Neither is a commit. Both only take
+    hooks away, which loosens a verdict rather than tightening it, except
+    across tables: a mark set in the table that went and tested by a drop in
+    another. A carried group then keeps bypassing that drop until something
+    else takes it back to software.
 - A copy queued to userspace (NFQUEUE) before a commit and reinjected after
   the re-arm is observed under the new pair.
 - Anything after `POST_ROUTING` is not seen at all: an nftables `netdev`
@@ -581,7 +590,7 @@ family over:
 | A copy seen leaving an oif at `POST_ROUTING`, having arrived by the parent VIF | the observer, which wakes the worker when a group's last oif is seen | re-derived and carried |
 | The MFC entry's parent replaced | the FIB chain | a new watch with nothing confirmed; to software until copies from the new parent are seen |
 | A bridge hook registered at `output` or `postrouting` | nothing reports it: asked at every derivation | a group with an oif through a bridge is `refused-filter` |
-| An nftables chain or BPF program after the observer at `POST_ROUTING` | nothing reports it: asked at every derivation, and creating a chain is a commit | the family's groups are `refused-filter` |
+| An nftables chain after the observer at `POST_ROUTING` | nothing reports it: asked at every derivation, and creating a chain is a commit | the family's groups are `refused-filter` |
 | The host joining the group on the parent VIF or an oif | nothing reports it | `refused-host` at the next derivation; the five-second refresh finds it |
 | A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |
@@ -673,10 +682,14 @@ becomes several. `unconfirmed` names the oifs Linux has not yet been seen
 forwarding the group to, which is what keeps a `pending-confirm` group in
 software. The states are `installed`, `pending`, `pending-bridged`,
 `pending-confirm`, and the refusals above plus `refused-filter`, each distinct
-so an operator can tell them apart. `mroute_ruleset_settled` is 0 for the
-second after a commit, and for as long as the commit is still being applied.
-Meanwhile no copy confirms anything, and every group reads `pending-confirm`
-with all its oifs unconfirmed. `mroute_confirm_errors`
+so an operator can tell them apart. While a routed group exists,
+`mroute_ruleset_settled` is 0 for the second after a commit, and for as long
+as the commit is still being applied. Meanwhile no copy confirms anything, and
+every group reads `pending-confirm` with all its oifs unconfirmed. With no
+group the ruleset is not followed: it is read only when something else wakes
+the learner, so the value can still read 1 across a commit until the first
+group appears and the next pass reads the pair. Read it beside a group's
+state, never alone. `mroute_confirm_errors`
 counts failures to register the observer or to allocate a group's watch, each
 of which keeps groups in software. A group
 routed through a bridge names the bridge as `in`: the port its stream arrives
@@ -776,7 +789,7 @@ cannot be allocated admits nothing and is counted. The same happens for IPv6
 in a table of its own. It also runs two MFC entries on one port's two VLANs,
 the second `refused-contested` until the first retires.
 `mroute_confirm_order.c` runs the real walk of the `POST_ROUTING` list, where
-only an nftables or BPF hook after the observer counts.
+only an nftables chain after the observer counts.
 `mcast_learner.c` runs the bridged half: the union and its
 ceiling, a duplicate framing, the MTU bound, retention while either learner
 names a group, the group a route creates for itself and the join that fills
