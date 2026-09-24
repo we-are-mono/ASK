@@ -118,6 +118,13 @@ def capture(config: dict) -> None:
                 request = struct.pack("IHH8s", socket.if_nametoindex(iface), 0, 6,
                                       multicast_mac(config["group"]))
                 sock.setsockopt(263, 1, request)  # SOL_PACKET/PACKET_ADD_MEMBERSHIP
+                # And promiscuity, held by this socket alone: a VLAN device on
+                # a snooping bridge (the orchestrator's WAN peer is one) only
+                # sees a group the bridge knows its host joined, and a routed
+                # replica's group is one nothing here joins at the IP layer.
+                # A promiscuous upper makes the bridge deliver it anyway.
+                request = struct.pack("IHH8s", socket.if_nametoindex(iface), 1, 0, b"")
+                sock.setsockopt(263, 1, request)  # PACKET_MR_PROMISC
                 sock.setblocking(False)
                 poll.register(sock, selectors.EVENT_READ, (iface, mac))
             Path(config["ready"]).write_text(str(os.getpid()))
