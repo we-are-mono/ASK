@@ -501,9 +501,9 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
     assert "old->parent == plan->parent" in arm and "w->parent = plan->parent;" in arm
     assert "old->parent == w->parent ? READ_ONCE(old->seen) : 0" in arm
     # Re-arming closes, waits out every copy in hand, clears, reads the
-    # ruleset and starts timing it. Opening waits for it to have stood still,
-    # waits out every copy already past FORWARD when it was read, and opens
-    # only if it still stands.
+    # ruleset and starts timing it. Opening waits for it to have stood still
+    # and for the commit behind it to be applied whole, waits out every copy
+    # judged before that, and opens only if it still stands.
     sync = function(source, "ft_mr_ruleset_sync")
     close = sync[sync.index("WRITE_ONCE(ft_mr_gen_open, false);"):]
     steps = ["WRITE_ONCE(ft_mr_gen_open, false);", "synchronize_rcu();",
@@ -512,11 +512,15 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
     at = [close.index(s) for s in steps]
     assert at == sorted(at) and "WRITE_ONCE(ft_mr_gen_open, true);" not in close
     opening = sync[:sync.index("WRITE_ONCE(ft_mr_gen_open, false);")]
-    steps = ["time_before(jiffies, ft_mr_gen_since + FT_MR_RULESET_SETTLE)",
-             "synchronize_rcu();", "if (ft_mr_ruleset_current())",
-             "WRITE_ONCE(ft_mr_gen_open, true);"]
+    steps = ["ft_mr_gen_armed && ft_mr_ruleset_current()",
+             "time_before(jiffies, ft_mr_gen_since + FT_MR_RULESET_SETTLE)",
+             "if (ft_mr_ruleset_applying())", "synchronize_rcu();",
+             "if (ft_mr_ruleset_current())", "WRITE_ONCE(ft_mr_gen_open, true);"]
     at = [opening.index(s) for s in steps]
     assert at == sorted(at)
+    # The commit's mark is the kernel's own reader, next to the pair in
+    # struct net: no symbol from nf_tables, and read after the pair.
+    assert "nft_commit_in_progress(&init_net)" in function(source, "ft_mr_ruleset_applying")
 
     # The worker follows the ruleset first, watches a group once its oifs
     # are known, and decides its state from the confirmations before it
@@ -546,6 +550,31 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
     assert exit_body.count("cancel_delayed_work_sync(&ft_mr_ruleset)") == 2
     sync_hook = function(source, "ft_mr_confirm_sync")
     assert "READ_ONCE(ft_mr_stopping)" in sync_hook and "synchronize_net();" in sync_hook
+
+
+def test_the_kernel_marks_a_commit_until_it_is_applied():
+    """A commit moves the generation, then goes on applying itself: chain
+    policies, element timeouts, set backend updates. The learner may not
+    take a ruleset as settled until that is over, and only nf_tables knows.
+    So the kernel marks the commit from just before the generation is
+    published -- ordered by the publishing release -- until the last set
+    update is in, cleared with a release the learner's acquire pairs with;
+    and the mark sits beside the pair in struct net, read inline."""
+    patch = (ROOT / "patches/kernel/148-netfilter-nftables-commit-in-progress.patch").read_text()
+    sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
+    commit = sections["net/netfilter/nf_tables_api.c"]
+    assert commit.index("+\tWRITE_ONCE(net->nft.commit_applying, 1);") < \
+        commit.index(" \tsmp_store_release(&net->nft.base_seq, base_seq);")
+    assert commit.index(" \tnft_set_commit_update(&set_update_list);") < \
+        commit.index("+\tsmp_store_release(&net->nft.commit_applying, 0);") < \
+        commit.index(" \tnft_commit_notify(net, NETLINK_CB(skb).portid);")
+    assert "+\treturn smp_load_acquire(&net->nft.commit_applying);" in \
+        sections["include/net/netfilter/nf_tables.h"]
+    assert "+\tu8\t\t\tcommit_applying;" in sections["include/net/netns/nftables.h"]
+    # Every build applies it; meta-ask lists its patches one by one.
+    recipe = (ROOT / "meta-ask/recipes-kernel/linux/linux-ask_6.12.bb").read_text()
+    listed = re.findall(r"file://(\d+)-\S+\.patch", recipe)
+    assert "148" in listed and listed == sorted(listed)
 
 
 def test_nothing_that_can_drop_a_copy_runs_after_the_observer(tmp_path):

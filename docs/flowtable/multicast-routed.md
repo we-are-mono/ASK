@@ -347,17 +347,25 @@ confirmations back.
 **Settling.** A commit goes on applying some of itself after it has moved the
 pair: a new base chain's policy, element timeouts, and a concatenated (pipapo)
 set's new contents, which become visible only after the transaction loop.
-Nothing outside nf_tables can see when that is done. Its commit mutex and busy
-mark are private to it, and in this kernel nfnetlink's subsystem lock is
-released before the batch runs, so taking it would wait for nothing. So
-confirmations start again only once the pair has stood still for a second
-(`FT_MR_RULESET_SETTLE`), and `mroute_ruleset_settled` says whether it has.
+nf_tables' own commit mutex and busy mark are private to its pernet state, and
+nfnetlink releases its subsystem lock before the batch runs. So kernel patch
+148 adds a mark beside the pair in `struct net`. `net->nft.commit_applying` is
+set just before the new `base_seq` is published, which orders it by that
+release store. It is cleared with a release store once the set backends'
+updates are in. `nft_commit_in_progress()` reads it with an acquire. It fits in
+the padding after `gencursor`, so `struct net` does not grow, and the learner
+reads it inline without depending on the nf_tables module. Read after the pair,
+a clear mark means the commit that produced the pair is applied whole.
+
 Re-arming first waits out the copies the observer has in hand, clears every
-confirmation, and reads the pair. After the second has passed, it waits again
-for every copy already past `FORWARD` when the pair was read, reads the pair
-once more, and only then accepts confirmations. The residual is a commit whose
-post-flip work outlasts that second, which takes a very large set load. A
-confirmation made during it may reflect the half-applied set.
+confirmation, and reads the pair. Confirmations start again once three things
+hold: the pair has stood still for a second (`FT_MR_RULESET_SETTLE`), the
+commit behind it is no longer applying, and a grace period has passed for
+every copy judged before that. It then reads the pair once more. A commit
+that takes longer than the second to apply is waited out. The learner looks
+again every 100 ms until it is done. The second itself is hysteresis. It
+bounds how often a run of commits moves a group in and out of hardware.
+`mroute_ruleset_settled` says whether confirmations are being accepted.
 
 **What a commit costs.** Every commit counts, including a set element added by
 a daemon. For each routed group it costs one episode in software, and the
@@ -648,8 +656,9 @@ forwarding the group to, which is what keeps a `pending-confirm` group in
 software. The states are `installed`, `pending`, `pending-bridged`,
 `pending-confirm`, and the refusals above plus `refused-filter`, each distinct
 so an operator can tell them apart. `mroute_ruleset_settled` is 0 for the
-second after a commit, while no copy confirms anything and every group reads
-`pending-confirm` with all its oifs unconfirmed. `mroute_confirm_errors`
+second after a commit, and for as long as the commit is still being applied.
+Meanwhile no copy confirms anything, and every group reads `pending-confirm`
+with all its oifs unconfirmed. `mroute_confirm_errors`
 counts failures to register the observer or to allocate a group's watch, each
 of which keeps groups in software. A group
 routed through a bridge names the bridge as `in`: the port its stream arrives
@@ -735,8 +744,10 @@ admission with the real table as well. A group is `pending-confirm` until
 its oif is seen, and a copy to another device, of another group, from another
 parent or of the other family confirms nothing. A commit, by the counter or by
 the cursor alone, withdraws the group. Copies confirm nothing until the
-ruleset has stood still for its second, and a further commit, or one landing
-in the grace period before opening, starts that again. The next copy after
+ruleset has stood still for its second. A further commit, or one landing in
+the grace period before opening, starts that again. A commit still being
+applied when the second is up holds it closed, looked at again every 100 ms
+until the mark clears. The next copy after
 it re-confirms the group. A copy seen after a commit the worker has not
 caught up with confirms nothing and wakes it. So does a commit between the
 pass's sync and its admission. An oif Linux never forwards to keeps the group

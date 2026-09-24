@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A272.** Routed multicast in hardware reached every MFC oif, bypassing forward-chain drops (fw4's WAN-to-LAN policy) and a host membership's loopback copy —
+  fixed (_:/^flowtable: never take a ruleset still being applied as settled_).
+
 - [x] **A271.** Bridged multicast in hardware bypassed bridge netfilter (nftables bridge chains, ebtables, br_netfilter), so a drop rule stopped applying once a flow was offloaded —
   fixed (_:/^flowtable: keep bridged multicast in software while a bridge hook filters_).
 

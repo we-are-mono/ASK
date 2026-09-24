@@ -111,7 +111,14 @@ static void hlist_replace_rcu(struct hlist_node *old, struct hlist_node *new)
 static unsigned long jiffies = 1000;
 #define time_before(a, b) ((long)((a) - (b)) < 0)
 #define time_after(a, b) time_before(b, a)
-static struct { struct { unsigned int base_seq; u8 gencursor; } nft; } init_net;
+static struct {
+    struct { unsigned int base_seq; u8 gencursor; u8 commit_applying; } nft;
+} init_net;
+/* The kernel's reader of the mark a commit holds while it applies itself. */
+static bool nft_commit_in_progress(const __typeof__(init_net) *net)
+{
+    return net->nft.commit_applying;
+}
 /* A grace period only counts, unless a case has a commit land inside the
  * next one. */
 static unsigned grace_periods;
@@ -777,7 +784,28 @@ int main(void)
         assert(!ft_mr_gen_open && ft_mr_ruleset_changes == 4);
         run();
         assert(!ft_mr_gen_open && ft_mr_ruleset_changes == 5);
-        settle();
+        /* A commit still applying itself when the second is up -- a
+         * large set load -- is not settled however long it takes: looked
+         * at again a short while later, and opened only once it is done,
+         * after a grace period for the copies it judged half applied. */
+        jiffies += ruleset_delay;
+        init_net.nft.commit_applying = 1;
+        {
+            unsigned periods = grace_periods;
+
+            for (unsigned i = 0; i < 3; i++) {
+                poll_ruleset();
+                run();
+                assert(!ft_mr_gen_open && grace_periods == periods);
+                assert(ruleset_delay == FT_MR_RULESET_APPLYING);
+                jiffies += ruleset_delay;
+            }
+            init_net.nft.commit_applying = 0;
+            poll_ruleset();
+            run();
+            assert(ft_mr_gen_open && grace_periods == periods + 1);
+            assert(ft_mr_ruleset_changes == 5);
+        }
         seen(g, OIF_A);
         run();
         assert(hardware.live && g->state == FT_MR_INSTALLED);

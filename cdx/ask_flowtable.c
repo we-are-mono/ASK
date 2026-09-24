@@ -58,6 +58,7 @@
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
+#include <net/netfilter/nf_tables.h>
 #include <net/switchdev.h>
 #include <net/l3mdev.h>
 #include <net/xfrm.h>
@@ -8589,14 +8590,12 @@ static bool ft_mr_plan_same(const struct ft_mr_group *g,
  * software, so a drop rule added later stops the stream rather than being
  * bypassed. A commit goes on applying some of itself after it has moved the
  * pair -- a new chain's policy, element timeouts, a concatenated set's new
- * contents -- and nothing outside nf_tables can see when it is done: its
- * commit mutex and busy mark are private to it, and nfnetlink's subsystem
- * lock is let go before the batch runs. So confirmations start again only
- * once the pair has stood still for FT_MR_RULESET_SETTLE, which outlasts
- * that for anything short of a very large set load, and which also bounds
- * how often a run of commits can move a group in and out of hardware. An
- * iptables-legacy table is replaced with no generation anyone can read, so a
- * change there is followed only once something else takes the group back.
+ * contents -- which nft_commit_in_progress() says it is still doing. So
+ * confirmations start again only once the commit behind the pair has been
+ * applied whole, and the pair has stood still for FT_MR_RULESET_SETTLE, which
+ * bounds how often a run of commits can move a group in and out of hardware.
+ * An iptables-legacy table is replaced with no generation anyone can read, so
+ * a change there is followed only once something else takes the group back.
  */
 
 /* One group's confirmations, in a table the hook reads under RCU. */
@@ -8638,8 +8637,10 @@ static u64 ft_mr_ruleset_changes, ft_mr_confirm_errors;
 #define FT_MR_RULESET_INTERVAL	HZ
 /* How long a ruleset has to stand still before copies confirm under it: the
  * software episode every commit costs a carried group, less the first copy
- * of it after that. */
+ * of it after that. And how soon to look again at one whose commit is still
+ * being applied after that. */
 #define FT_MR_RULESET_SETTLE	HZ
+#define FT_MR_RULESET_APPLYING	(HZ / 10)
 static void ft_mr_ruleset_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_mr_ruleset, ft_mr_ruleset_fn);
 
@@ -8654,6 +8655,19 @@ static void ft_mr_ruleset_read(unsigned int *seq, u8 *cursor)
 #else
 	*seq = 0;
 	*cursor = 0;
+#endif
+}
+
+/* Whether nftables is still applying a commit: after moving the pair, it goes
+ * on changing what a packet sees until the whole transaction is in place.
+ * Read after the pair, with an acquire the commit's release pairs with, a
+ * false here means the commit that produced the pair read is complete. */
+static bool ft_mr_ruleset_applying(void)
+{
+#if IS_ENABLED(CONFIG_NF_TABLES)
+	return nft_commit_in_progress(&init_net);
+#else
+	return false;
 #endif
 }
 
@@ -8847,11 +8861,17 @@ static bool ft_mr_ruleset_sync(void)
 		if (READ_ONCE(ft_mr_gen_open) ||
 		    time_before(jiffies, ft_mr_gen_since + FT_MR_RULESET_SETTLE))
 			return false;
-		/* Stood still long enough. A copy already past FORWARD when
-		 * the pair was read may have been judged by the rules before
-		 * it: every such one finishes first. After this, a copy the
-		 * hook sees started under the pair, or under a later one it
-		 * will not match. */
+		/* Stood still long enough, but not settled while the commit
+		 * behind it is still being applied, however long that takes:
+		 * a copy judged meanwhile saw part of it. Asked after the pair
+		 * was read, which ft_mr_ruleset_current() just did. */
+		if (ft_mr_ruleset_applying())
+			return false;
+		/* Applied whole. A copy already past FORWARD by now may have
+		 * been judged by the rules before it, or by the commit half
+		 * applied: every such one finishes first. After this, a copy
+		 * the hook sees started under the pair applied whole, or under
+		 * a later one it will not match. */
 		synchronize_rcu();
 		if (ft_mr_ruleset_current())
 			WRITE_ONCE(ft_mr_gen_open, true);
@@ -8881,13 +8901,14 @@ static bool ft_mr_ruleset_sync(void)
 	return armed;
 }
 
-/* How long until the ruleset in force has stood still long enough for copies
- * to confirm under it: the rest of its settling time, at least a tick. */
+/* How long until the ruleset in force may have settled: the rest of its
+ * settling time, or once that is over -- the commit behind it still being
+ * applied, or a newer one to arm for -- a short while. */
 static unsigned long ft_mr_ruleset_wait(void)
 {
 	unsigned long due = ft_mr_gen_since + FT_MR_RULESET_SETTLE;
 
-	return time_after(due, jiffies) ? due - jiffies : 1;
+	return time_after(due, jiffies) ? due - jiffies : FT_MR_RULESET_APPLYING;
 }
 
 /* Watch for a group's copies arriving by the parent VIF of its plan and

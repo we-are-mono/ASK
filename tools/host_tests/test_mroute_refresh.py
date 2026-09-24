@@ -32,7 +32,8 @@ def test_mroute_refresh(tmp_path):
         function(source, name) for name in [
             # What Linux itself forwarded: the table the hook fills, the
             # ruleset it is good for, and the admission they decide.
-            "ft_mr_ruleset_read", "ft_mr_ruleset_current", "ft_mr_watch_bucket",
+            "ft_mr_ruleset_read", "ft_mr_ruleset_applying", "ft_mr_ruleset_current",
+            "ft_mr_watch_bucket",
             "ft_mr_watch_complete", "ft_mr_confirm_seen", "ft_mr_ruleset_sync",
             "ft_mr_ruleset_wait", "ft_mr_watch_arm", "ft_mr_watch_drop", "ft_mr_admit",
             "ft_mr_ruleset_fn",
