@@ -2,7 +2,9 @@
 import importlib.util
 import gzip
 import json
+import os
 from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -115,6 +117,27 @@ def test_task_context_faults_exclude_softirq_stacks(tmp_path, knobs, target):
         assert result["excluded"] is None
     else:
         assert (result["excluded"]["start"], result["excluded"]["end"]) == (0x3000, 0x4000)
+
+
+# Where each target's owner keeps its source: the ASK modules in cdx/, the
+# kernel's own in the tree ASK_KERNEL_SOURCE names.
+KERNEL_DIRS = {None: "net/core", "nf_flow_table": "net/netfilter"}
+
+
+@pytest.mark.parametrize("target", sorted(guard.TARGETS))
+def test_every_target_names_a_function_its_module_defines(target):
+    """A target whose function was renamed or removed never arms, and the
+    rig case that relies on it fails at setup instead of injecting."""
+    name, module, _ = guard.TARGETS[target]
+    if module in ("cdx", "ask_flowtable"):
+        files = sorted((SOURCE.parents[2] / "cdx").glob("*.c"))
+    else:
+        kernel = os.environ.get("ASK_KERNEL_SOURCE")
+        if not kernel:
+            pytest.skip("ASK_KERNEL_SOURCE names no kernel tree")
+        files = sorted((Path(kernel) / KERNEL_DIRS[module]).glob("*.c"))
+    definition = re.compile(rf"(?m)^(?:[A-Za-z_][\w \t*]*[\s*])?{re.escape(name)}\([^;{{]*\)\s*\{{")
+    assert any(definition.search(path.read_text(errors="replace")) for path in files), (target, name)
 
 
 def test_symbol_selection_requires_unique_visible_module_function():
