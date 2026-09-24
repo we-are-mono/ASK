@@ -16,6 +16,11 @@
  * The answer the handler gives the bridge is the other half. `handled`
  * becomes MDB_PG_FLAGS_OFFLOAD and shows up in `bridge mdb show`, so a port
  * the hardware could never replicate to must not claim to have been taken on.
+ *
+ * Most cases put flows "in hardware" with pass(), which stands in for the
+ * worker. The worker itself is compiled too, against a backend that keeps
+ * what each entry was built from, for what it records beside an entry and
+ * how that meets the egress drain.
  */
 #include <assert.h>
 #include <stdbool.h>
@@ -55,6 +60,8 @@ union nf_inet_addr {
 #define EOPNOTSUPP 95
 #define ENOENT 2
 #define EINVAL 22
+#define EAGAIN 11
+#define ENOMEM 12
 #define E2BIG 7
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 /* As include/linux/if_bridge.h has them with patch 161. */
@@ -85,9 +92,15 @@ struct net_device {
     bool mrouter;
     struct net_device *master;
     unsigned int flags;
+    /* Where unregistration has got to. Numbered so that a device no case
+     * touches reads as registered; the worker only compares. */
+    int reg_state;
 };
+#define NETREG_REGISTERED 0
+#define NETREG_UNREGISTERING 2
 
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
 
 struct cdx_ft_vlan { uint16_t proto; uint16_t id; };
 
@@ -384,12 +397,198 @@ static void schedule_delayed_work(int *w, unsigned long delay)
     (void)delay;
     refresh_rearms++;
 }
-static int in_transaction;
-static void cdx_ft_begin(void) { assert(!in_transaction && !ft_mc_lock); in_transaction = 1; }
+/* The worker takes RTNL only to ask the bridge, and never with the
+ * transaction or the group lock held. The one caller that takes the
+ * transaction under RTNL is the egress drain, under the RTNL a tc command
+ * holds (`caller_rtnl`). */
+static int in_transaction, rtnl;
+static bool caller_rtnl;
+static void rtnl_lock(void) { assert(!rtnl && !in_transaction && !ft_mc_lock); rtnl = 1; }
+static void rtnl_unlock(void) { assert(rtnl && !caller_rtnl); rtnl = 0; }
+/* Something that gets the transaction just before whoever asks for it next,
+ * run once: a tc command's egress change and drain, or a device going away,
+ * landing while the worker waits for the transaction with a flow it picked. */
+static void (*before_begin)(void);
+static void recorded_chains_name_live_devices(void);
+static void cdx_ft_begin(void)
+{
+    assert(!in_transaction && !ft_mc_lock && (!rtnl || caller_rtnl));
+    if (before_begin) {
+        void (*run)(void) = before_begin;
+
+        before_begin = NULL;
+        run();
+    }
+    recorded_chains_name_live_devices();
+    in_transaction = 1;
+}
 static void cdx_ft_end(void) { assert(in_transaction); in_transaction = 0; }
 static bool cdx_mc_group_stats(const struct cdx_mc_group *hw, struct cdx_ft_counters *c);
+struct cdx_mc_group_spec;
+static int cdx_mc_group_replace(struct cdx_mc_group *hw,
+                                const struct cdx_mc_group_spec *spec);
+static int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
+                            struct cdx_mc_group **result);
+static void cdx_mc_group_del(struct cdx_mc_group **group);
+
+/* What the worker needs beyond the learner's own functions. The egress count
+ * is the adapter's, shared with its IPsec half; ft_egress_changed() moves it
+ * before any learner marks anything. */
+typedef int64_t s64;
+static s64 ft_egress_changes;
+static s64 atomic64_read(const s64 *v) { return *v; }
+static s64 atomic64_read_acquire(const s64 *v) { return *v; }
+static bool ft_mc_recheck;
+static bool bridge_hooked;
+static bool ft_mc_bridge_filtered(void) { return bridge_hooked; }
+static void ft_mc_hook_sync(bool want) { (void)want; }
+#define pr_info(...) ((void)0)
 
 #include "mcast_learner.inc"
+
+/* A port's egress changing, as the adapter's hook has it: counted, then
+ * every installed flow copying out of the port marked. */
+static void egress_changed(struct net_device *dev)
+{
+    ft_egress_changes++;
+    ft_mc_egress_mark(dev);
+}
+
+/* No chain recorded for the drain names a device that has begun to go: the
+ * drain replays it with nothing of its own holding those devices. Checked
+ * whenever anything takes the transaction. */
+static void recorded_chains_name_live_devices(void)
+{
+    struct ft_mc_flow *f;
+
+    list_for_each_entry(f, &ft_mc_flows, list) {
+        if (!f->hw_spec.listeners)
+            continue;
+        assert(f->hw_spec.in->reg_state == NETREG_REGISTERED);
+        for (u8 i = 0; i < f->hw_spec.listeners; i++)
+            assert(f->hw_spec.listener[i].dev->reg_state == NETREG_REGISTERED);
+    }
+}
+
+/* The backend, as far as the worker and the drain reach it. An entry the
+ * worker added is one of these, keyed as the backend keys it and remembering
+ * the chain it was last given and the egress count it was built against. The
+ * cases that put a flow "in hardware" themselves use FAKE_HW, which is never
+ * looked into. */
+struct cdx_mc_group {
+    bool live;
+    struct cdx_mc_group_spec key;
+    struct cdx_mc_group_spec chain;
+    s64 built_at;
+};
+static struct cdx_mc_group entries[4];
+static struct cdx_mc_group *const FAKE_HW = (struct cdx_mc_group *)0x1000;
+static unsigned adds, dels;
+static int add_rc;
+/* A port's egress changing after a build has read it and before the worker
+ * records it: counted, and marking what it can at once, since the worker
+ * holds no learner lock while it builds. */
+static struct net_device *change_during_build;
+
+/* The classifier key cdx_mc_same_key() compares: a replace keeps it. */
+static bool same_key(const struct cdx_mc_group_spec *a, const struct cdx_mc_group_spec *b)
+{
+    return a->in == b->in && a->bridged == b->bridged && a->family == b->family &&
+           !memcmp(&a->src, &b->src, sizeof(a->src)) &&
+           !memcmp(&a->dst, &b->dst, sizeof(a->dst)) &&
+           !memcmp(a->src_mac, b->src_mac, ETH_ALEN) &&
+           !memcmp(a->dst_mac, b->dst_mac, ETH_ALEN) &&
+           a->in_vlans == b->in_vlans &&
+           !memcmp(a->in_vlan, b->in_vlan, a->in_vlans * sizeof(a->in_vlan[0]));
+}
+
+/* The key and every copy: what the entry replicates to, and how. */
+static bool same_chain(const struct cdx_mc_group_spec *a, const struct cdx_mc_group_spec *b)
+{
+    if (!same_key(a, b) || a->listeners != b->listeners)
+        return false;
+    for (u8 i = 0; i < a->listeners; i++) {
+        const struct cdx_mc_listener *x = &a->listener[i], *y = &b->listener[i];
+
+        if (x->dev != y->dev || x->routed != y->routed || x->vlans != y->vlans ||
+            memcmp(x->vlan, y->vlan, x->vlans * sizeof(x->vlan[0])))
+            return false;
+    }
+    return true;
+}
+
+static void built(struct cdx_mc_group *hw, const struct cdx_mc_group_spec *spec)
+{
+    hw->chain = *spec;
+    hw->built_at = ft_egress_changes;
+    if (change_during_build) {
+        struct net_device *dev = change_during_build;
+
+        change_during_build = NULL;
+        egress_changed(dev);
+    }
+}
+
+/* Only the worker adds and deletes, and it does the hardware with the
+ * transaction alone: the MDB handler and the netdev events, which take
+ * ft_mc_lock under RTNL, must never wait behind a hardware call. The drain
+ * replaces holding ft_mc_lock, under its tc command's RTNL. */
+static int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
+                            struct cdx_mc_group **result)
+{
+    assert(in_transaction && !ft_mc_lock && spec->listeners);
+    adds++;
+    *result = NULL;
+    if (add_rc)
+        return add_rc;
+    for (unsigned i = 0; i < ARRAY_SIZE(entries); i++)
+        if (!entries[i].live) {
+            entries[i].live = true;
+            entries[i].key = *spec;
+            built(&entries[i], spec);
+            *result = &entries[i];
+            return 0;
+        }
+    abort();
+}
+
+static void cdx_mc_group_del(struct cdx_mc_group **group)
+{
+    assert(*group && in_transaction && !ft_mc_lock);
+    if (*group != FAKE_HW) {
+        assert((*group)->live);
+        memset(*group, 0, sizeof(**group));
+    }
+    dels++;
+    *group = NULL;
+}
+
+/* A replace: the drain's rebuild of a recorded chain, made inside the
+ * transaction with the learner's lock taken there under its tc command's
+ * RTNL, or the worker's, made with the transaction alone. What it was asked
+ * to build is kept for a case to read; one can fail it, which leaves the old
+ * chain in place. A spec under another key is refused, as the backend
+ * refuses it. */
+static struct cdx_mc_group_spec replaced;
+static unsigned replaces;
+static int replace_rc;
+static int cdx_mc_group_replace(struct cdx_mc_group *hw,
+                                const struct cdx_mc_group_spec *spec)
+{
+    assert(hw && in_transaction && spec->listeners);
+    assert(!ft_mc_lock == !caller_rtnl);
+    replaced = *spec;
+    replaces++;
+    if (replace_rc)
+        return replace_rc;
+    if (hw != FAKE_HW) {
+        assert(hw->live);
+        if (!same_key(&hw->key, spec))
+            return -EINVAL;
+        built(hw, spec);
+    }
+    return 0;
+}
 
 static bool stats_fail;
 static struct cdx_ft_counters stats_now;
@@ -433,8 +632,6 @@ static struct net_device P2   = { .name = "eth4", .ifindex = 12, .physical = tru
 static struct net_device P3   = { .name = "eth5", .ifindex = 13, .physical = true, .master = &BR };
 static struct net_device SOFT = { .name = "vx0",  .ifindex = 14, .physical = false, .master = &BR };
 static struct net_device BR2  = { .name = "br1",  .ifindex = 15, .bridge_master = true };
-
-static struct cdx_mc_group *const FAKE_HW = (struct cdx_mc_group *)0x1000;
 
 static const u8 GROUP_MAC[ETH_ALEN] = { 0x01, 0, 0x5e, 0x07, 0, 0x01 };
 static const u8 SENDER[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x51 };
@@ -543,14 +740,19 @@ static void pass(void)
         }
         f->stale = false;
         f->contested = ft_mc_key_contested(f);
+        /* The worker records the chain it built, whole, with the entry,
+         * and a build is current against every egress change before it. */
         if (!f->contested && ft_mc_installable(f) &&
             f->retries < FT_MC_MAX_RETRIES) {
             f->hw = FAKE_HW;
             f->carried_route = ft_mc_live_route(f) ? f->route : NULL;
+            ft_mc_flow_spec(f, &f->hw_spec);
         } else {
             f->hw = NULL;
             f->carried_route = NULL;
+            memset(&f->hw_spec, 0, sizeof(f->hw_spec));
         }
+        f->egress_stale = false;
     }
     ft_mc_route_feedback();
 }
@@ -1734,6 +1936,29 @@ static void the_dedup_slots(void)
     }
 }
 
+/* A tc command: RTNL, held around what it asks of the adapter. */
+static void tc_begin(void)
+{
+    rtnl_lock();
+    caller_rtnl = true;
+}
+static void tc_end(void)
+{
+    caller_rtnl = false;
+    rtnl_unlock();
+}
+
+/* A DSCP filter's drain of `dev`, under its tc command's RTNL. */
+static int tc_drain(struct net_device *dev)
+{
+    int rc;
+
+    tc_begin();
+    rc = ft_mc_egress_drain(dev);
+    tc_end();
+    return rc;
+}
+
 static void devices_and_bridges_change(void)
 {
     const uint32_t S = 0x0100000a, G = 0x120007ef;
@@ -1773,14 +1998,62 @@ static void devices_and_bridges_change(void)
                 h = x;
     }
     assert(f && h && f->hw && f->carried_route == &r1 && h->hw);
+    /* What the worker recorded is the chain it built: the bridge's copy to
+     * P2 and the route's copy to P3, keyed on the sender and the tag the
+     * stream arrives with. */
+    assert(f->hw_spec.listeners == 2 && f->hw_spec.in == &P1);
+    assert(f->hw_spec.listener[0].dev == &P2 && !f->hw_spec.listener[0].routed);
+    assert(f->hw_spec.listener[1].dev == &P3 && f->hw_spec.listener[1].routed);
+    assert(f->hw_spec.in_vlans == 1 && f->hw_spec.in_vlan[0].id == 289);
+    assert(!memcmp(f->hw_spec.src_mac, SENDER, ETH_ALEN));
     h->hw = NULL;
+    memset(&h->hw_spec, 0, sizeof(h->hw_spec));
     f->stale = h->stale = false;
     works = 0;
-    assert(ft_mc_egress_mark(&P1) == 0 && !f->stale && !works);
-    assert(ft_mc_egress_mark(&P2) == 1 && f->stale && !h->stale && works == 1);
+    assert(ft_mc_egress_mark(&P1) == 0 && !f->stale && !f->egress_stale && !works);
+    assert(ft_mc_egress_mark(&P2) == 1 && f->stale && f->egress_stale && !h->stale);
+    assert(works == 1 && !h->egress_stale);
     assert(!ft_mc_lock);
+    f->stale = f->egress_stale = false;
+    assert(ft_mc_egress_mark(&P3) == 1 && f->stale && f->egress_stale);
+
+    /* ---- and the drain, which rebuilds in place under the tc command's
+     * RTNL. No rtnl_lock() and no flush_work() are provided here: the
+     * worker takes RTNL to ask the bridge, so a drain that waited for it
+     * would not compile. What it replaces the entry with is the chain
+     * recorded for it, whole -- the routed copy riding it, the ingress tag
+     * and the sender included -- not a spec made up from what the flow now
+     * says, which may be the next shape. */
     f->stale = false;
-    assert(ft_mc_egress_mark(&P3) == 1 && f->stale);
+    replaces = 0;
+    works = 0;
+    assert(!tc_drain(&P1) && !replaces && f->egress_stale);
+    assert(!tc_drain(&P3) && replaces == 1 && !f->egress_stale);
+    assert(!in_transaction && !ft_mc_lock && !f->stale && !works);
+    assert(replaced.listeners == 2 && replaced.listener[1].dev == &P3 &&
+           replaced.listener[1].routed);
+    assert(replaced.in == &P1 && replaced.in_vlans == 1 &&
+           replaced.in_vlan[0].id == 289 && replaced.bridged);
+    assert(!memcmp(replaced.src_mac, SENDER, ETH_ALEN));
+    /* Nothing marked, nothing rebuilt. */
+    assert(!tc_drain(&P3) && replaces == 1);
+    /* A replace that fails left the old chain in place: the flow is the
+     * worker's to rebuild or withdraw, and the drain says it could not
+     * vouch for it -- once, not after waiting out any retries. */
+    assert(ft_mc_egress_mark(&P2) == 1);
+    f->stale = false;
+    works = 0;
+    replace_rc = -ENOMEM;
+    assert(tc_drain(&P2) == -EAGAIN && replaces == 2);
+    assert(f->egress_stale && f->stale && works == 1);
+    replace_rc = 0;
+    assert(!tc_drain(&P2) && replaces == 3 && !f->egress_stale);
+    /* A flow the change reached with no entry any more has nothing
+     * reading the old queues. */
+    f->egress_stale = true;
+    f->hw = NULL;
+    assert(!tc_drain(&P2) && replaces == 3 && !f->egress_stale);
+    f->hw = FAKE_HW;
 
     /* ---- a bridge setting, or a port moving -------------------------- */
     f->dirty = h->dirty = false;
@@ -1809,6 +2082,13 @@ static void devices_and_bridges_change(void)
         ft_mc_device_gone(&P3, true);
         assert(!r1.listeners && !r1.bridge && holds == before - 2);
         assert(works == 1);
+        /* The chain recorded for f named it: nothing may replay that now,
+         * and the flow is the worker's to rebuild. Until it has, any port
+         * may be in its entry, and a drain cannot vouch for it. */
+        assert(!f->hw_spec.listeners && f->stale);
+        assert(ft_mc_egress_mark(&P1) == 1 && f->egress_stale);
+        assert(tc_drain(&P1) == -EAGAIN && replaces == 3);
+        f->egress_stale = false;
         /* Until the next pass drops it, the emptied route is not a route:
          * the host still needs its copies, and there are none to carry. */
         assert(f->route == &r1 && !ft_mc_installable(f));
@@ -1855,6 +2135,190 @@ static void devices_and_bridges_change(void)
         assert(!ft_mc_count);
         ft_mc_route_withdraw(&r1);
     }
+}
+
+/* A tc command changing a port's egress and draining it, run as the
+ * transaction's next taker: what it replaced, and what the drain said. */
+static struct net_device *drain_port;
+static int drain_rc;
+static unsigned drain_replaces;
+static struct cdx_mc_group_spec drained_with;
+static void tc_changes_and_drains(void)
+{
+    unsigned before = replaces;
+
+    tc_begin();
+    egress_changed(drain_port);
+    drain_rc = ft_mc_egress_drain(drain_port);
+    drain_replaces = replaces - before;
+    drained_with = replaced;
+    tc_end();
+}
+
+/* P2 starts unregistering and its event runs, under RTNL of its own. */
+static void p2_goes(void)
+{
+    rtnl_lock();
+    P2.reg_state = NETREG_UNREGISTERING;
+    ft_mc_device_gone(&P2, true);
+    rtnl_unlock();
+}
+
+static void the_worker_records_what_the_drain_replays(void)
+{
+    const uint32_t S = 0x0100000a, G = 0x170007ef;
+    struct br_ip any = group_v4(G, 0, 289);
+    struct ft_mc_route want, r1;
+    struct cdx_mc_group *hw;
+    struct ft_mc_flow *f;
+    unsigned r0, a0, d0;
+
+    /* The worker itself this time, against the backend above: an IPTV
+     * stream in tagged on P1, bridged to P2 and routed to P3 through
+     * br0.289, as one entry. */
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    memset(&r1, 0, sizeof(r1));
+    vlan_enabled = true;
+    member(&BR, 289, false);
+    member(&P1, 289, false);
+    member(&P2, 289, false);
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    route_want(&want, 289, S, G, &P3, 287);
+    ft_mc_route_publish(&r1, &want);
+    answer(&P1, S, 289, BR_MCAST_TO_HOST_ROUTER, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
+    adds = dels = replaces = 0;
+
+    /* ---- the first build, with the count moving under it ---------------
+     *
+     * A flow with no entry yet is on no list a change could mark, and the
+     * change does not wait for the worker to record: the worker holds no
+     * learner lock while it builds. The worker reads the egress count inside
+     * its transaction before building, and compares it when it records: a
+     * chain built from the queues before the change is marked and built
+     * again, in the same run. What is recorded beside the entry, in the same
+     * transaction, is what was built, whole. */
+    change_during_build = &P2;
+    ft_mc_work_fn(NULL);
+    assert(!change_during_build);
+    f = flow(&P1, S, 289);
+    assert(f && f->hw && f->hw != FAKE_HW && adds == 1 && replaces == 1);
+    hw = f->hw;
+    assert(hw->built_at == ft_egress_changes && !f->egress_stale && !f->stale);
+    assert(same_chain(&f->hw_spec, &hw->chain));
+    assert(f->hw_spec.listeners == 2 && f->hw_spec.in == &P1);
+    assert(f->hw_spec.listener[0].dev == &P2 && !f->hw_spec.listener[0].routed);
+    assert(f->hw_spec.listener[1].dev == &P3 && f->hw_spec.listener[1].routed);
+    assert(f->hw_spec.in_vlans == 1 && f->hw_spec.in_vlan[0].id == 289);
+    assert(!memcmp(f->hw_spec.src_mac, SENDER, ETH_ALEN));
+    assert(!in_transaction && !ft_mc_lock && !rtnl);
+
+    /* ---- a tc command's drain -------------------------------------------
+     *
+     * The change marks the flow for its copy on the port -- the bridge's to
+     * P2 or the routed one riding it to P3 -- and the drain, under the tc
+     * command's RTNL, replaces the entry with the chain recorded for it: no
+     * RTNL of its own, no worker waited for, nothing decided. */
+    for (int i = 0; i < 2; i++) {
+        struct net_device *port = i ? &P3 : &P2;
+
+        tc_begin();
+        r0 = replaces;
+        egress_changed(port);
+        assert(f->egress_stale && f->stale);
+        assert(!ft_mc_egress_drain(port));
+        assert(replaces == r0 + 1 && !f->egress_stale && f->hw == hw);
+        assert(hw->built_at == ft_egress_changes && same_chain(&replaced, &f->hw_spec));
+        tc_end();
+        /* The mark's own pass rebuilds it once more, which costs nothing. */
+        ft_mc_work_fn(NULL);
+        assert(!f->stale && !f->egress_stale && f->hw == hw);
+    }
+
+    /* ---- the drain while the worker holds the flow ----------------------
+     *
+     * The entry went idle while the stream arrived from another sender, so
+     * the worker picks the flow to move it to the new key. The new shape is
+     * the flow's from the pick; the entry, and the chain recorded for it,
+     * are the old key's until the worker is inside its transaction. A tc
+     * command that gets the transaction first rebuilds the old entry from
+     * the old chain. A spec made from the flow as it is now would carry the
+     * new sender, which the backend refuses as another key, and the drain
+     * would hold the DSCP map until the worker had run. The worker then
+     * moves the flow as it meant to, against the queues as they are now. */
+    f->idle = true;
+    see(seen_v4(&BR, &P1, G, S, 289, true, OTHER_SENDER));
+    assert(f->has_next && f->stale);
+    a0 = adds;
+    d0 = dels;
+    drain_port = &P2;
+    drain_rc = 1;
+    before_begin = tc_changes_and_drains;
+    ft_mc_work_fn(NULL);
+    assert(!before_begin && !drain_rc && drain_replaces == 1);
+    assert(!memcmp(drained_with.src_mac, SENDER, ETH_ALEN));
+    assert(dels == d0 + 1 && adds == a0 + 1 && f->hw && !f->has_next);
+    hw = f->hw;
+    assert(!memcmp(hw->key.src_mac, OTHER_SENDER, ETH_ALEN));
+    assert(same_chain(&f->hw_spec, &hw->chain) && !f->egress_stale);
+    assert(hw->built_at == ft_egress_changes);
+
+    /* ---- a drain that cannot rebuild ------------------------------------
+     *
+     * The replace fails and leaves the old chain: the drain hands the flow
+     * to the worker and says so. The worker's own replace fails too and
+     * withdraws the flow in that pass, spending one retry, so the next drain
+     * finds nothing reading the old queues -- it never waits out retries the
+     * refresh paces. The install is tried again at the refresh, not before. */
+    tc_begin();
+    egress_changed(&P2);
+    replace_rc = -ENOMEM;
+    works = 0;
+    assert(ft_mc_egress_drain(&P2) == -EAGAIN);
+    assert(f->egress_stale && f->stale && works == 1 && f->hw == hw);
+    tc_end();
+    d0 = dels;
+    ft_mc_work_fn(NULL);
+    assert(!f->hw && dels == d0 + 1 && f->retries == 1);
+    assert(!f->egress_stale && !f->hw_spec.listeners);
+    replace_rc = 0;
+    tc_begin();
+    assert(!ft_mc_egress_drain(&P2));
+    tc_end();
+    a0 = adds;
+    ft_mc_work_fn(NULL);
+    assert(adds == a0 && !f->hw);
+    ft_mc_refresh_fn(NULL);
+    ft_mc_work_fn(NULL);
+    assert(adds == a0 + 1 && f->hw && !f->retries && f->hw_spec.listeners == 2);
+
+    /* ---- a device going while the worker builds with it -----------------
+     *
+     * The worker holds a reference of its own on every device in the chain
+     * it builds. P2 starts unregistering meanwhile, and its event drops the
+     * flow's hold on it, empties the chain recorded before and asks for
+     * another pass. The chain just built names P2 and is not recorded: once
+     * the build lets go of P2 nothing would hold it, and a drain replaying
+     * that chain would reach a freed device. recorded_chains_name_live_
+     * devices() says so at every transaction; the pass that follows records
+     * the chain without P2. */
+    f->stale = true;
+    before_begin = p2_goes;
+    r0 = replaces;
+    ft_mc_work_fn(NULL);
+    assert(!before_begin && replaces == r0 + 2 && f->hw && !f->ports);
+    assert(f->hw_spec.listeners == 1 && f->hw_spec.listener[0].dev == &P3);
+    assert(same_chain(&f->hw_spec, &f->hw->chain));
+    P2.reg_state = NETREG_REGISTERED;
+
+    /* Nothing names the flow now -- P2's membership went with P2 -- so the
+     * route going retires it, entry and all. */
+    d0 = dels;
+    ft_mc_route_withdraw(&r1);
+    ft_mc_work_fn(NULL);
+    assert(!flow(&P1, S, 289) && !ft_mc_flow_count && dels == d0 + 1);
+    reset();
 }
 
 static void rows_speak_for_memberships(void)
@@ -2268,6 +2732,7 @@ int main(void)
     one_stream_both_learners();
     the_dedup_slots();
     devices_and_bridges_change();
+    the_worker_records_what_the_drain_replays();
     rows_speak_for_memberships();
     replayed_memberships();
     a_bridge_filter_refuses_every_flow();

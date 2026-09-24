@@ -1176,8 +1176,8 @@ static int cdx_htb_command(struct cdx_htb_port *port, struct tc_htb_qopt_offload
  * block callback is not registered unlocked, so tc takes RTNL around it. The
  * adapter's registration is still kept alive by SRCU rather than by that --
  * the adapter's unload does not take RTNL to unregister, and a caller's locking
- * is not the hook's to depend on -- and SRCU rather than RCU because drain()
- * sleeps. Unregistering waits out every call already inside the adapter's
+ * is not the hook's to depend on -- and SRCU rather than RCU because both ops
+ * sleep. Unregistering waits out every call already inside the adapter's
  * text.
  */
 DEFINE_STATIC_SRCU(cdx_ft_egress_srcu);
@@ -1185,8 +1185,8 @@ static const struct cdx_ft_egress_ops __rcu *cdx_ft_egress_ops;
 /* Serialises registration against itself; callers never take it. */
 static DEFINE_MUTEX(cdx_ft_egress_lock);
 
-/* Mark every entry on `dev' for re-installation. Never sleeps, and a no-op
- * with no adapter registered: then there are no entries to mark. */
+/* Mark every entry on `dev' for re-installation. May sleep, and a no-op with
+ * no adapter registered: then there are no entries to mark. */
 void cdx_ft_egress_changed(struct net_device *dev)
 {
 	const struct cdx_ft_egress_ops *ops;

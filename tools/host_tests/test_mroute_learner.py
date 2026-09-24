@@ -130,7 +130,9 @@ def test_the_worker_never_holds_a_lock_across_the_transaction():
     """/proc takes cdx_ft_begin() and then ft_mr_lock, so a worker that took
     the transaction while holding the lock would close a cycle with it. And
     cdx_ctrl_lock_with_rtnl() states the other one outright: never wait for
-    RTNL or the control mutex while holding the other.
+    RTNL or the control mutex while holding the other. The worker waits for
+    RTNL, so it never holds the transaction then; the one caller that takes
+    the transaction under RTNL is the drain, below.
     """
     body = function(SOURCE.read_text(), "ft_mr_work_fn")
     assert "cdx_ft_begin();" in body, "the worker is where the hardware happens"
@@ -142,6 +144,43 @@ def test_the_worker_never_holds_a_lock_across_the_transaction():
     ):
         _assert_not_inside(body, _held_regions(body, lock, unlock),
                            "cdx_ft_begin()", why)
+
+
+def test_the_drain_takes_the_transaction_under_its_callers_rtnl_only():
+    """The drain runs under the RTNL a tc command holds and takes the
+    transaction there, the order the bind path already takes; it takes no
+    RTNL of its own, never waits for the worker, and takes ft_mr_lock only
+    inside the transaction. The worker, for its part, keeps the group's
+    hardware until it is inside its own transaction and records before it
+    leaves, so the drain never meets a group it cannot rebuild -- a group
+    going over to a bridge's copies included, whose entry of its own is
+    recorded gone before the transaction is let go.
+    """
+    source = SOURCE.read_text()
+    drain = function(source, "ft_mr_egress_drain")
+    for forbidden in ("rtnl_lock()", "flush_work", "cancel_work", "busy"):
+        assert forbidden not in drain, forbidden
+    assert drain.index("cdx_ft_begin();") < drain.index("mutex_lock(&ft_mr_lock)")
+    assert drain.index("mutex_unlock(&ft_mr_lock)") < drain.index("cdx_ft_end();")
+    # The installed spec, whole, as it was built: never one made up here
+    # from the group's fields, which would leave the ingress tags out.
+    assert "cdx_mc_group_replace(g->hw, &g->hw_spec)" in drain
+    assert "memset(&spec" not in drain
+    worker = function(source, "ft_mr_work_fn")
+    taken = worker.index("hw = target->hw;")
+    begin = worker.rindex("cdx_ft_begin();", 0, taken)
+    end = worker.index("cdx_ft_end();", taken)
+    assert begin < taken < worker.index("ft_mr_record(", taken) < end
+    assert "cdx_ft_end();" not in worker[begin:taken]
+    # Every place the worker takes the entry away from the group is inside
+    # that transaction.
+    at = worker.find("target->hw = NULL")
+    while at != -1:
+        assert begin < at < end, "the group's hardware stays the group's until the transaction"
+        at = worker.find("target->hw = NULL", at + 1)
+    record = function(source, "ft_mr_record")
+    assert "g->hw_spec = plan->spec;" in record
+    assert "memset(&g->hw_spec, 0, sizeof(g->hw_spec));" in function(source, "ft_mr_release_set")
 
 
 def test_the_two_learners_never_nest_their_locks():
@@ -261,7 +300,10 @@ def test_a_plan_is_adopted_whole_or_returned_whole():
         "a returned plan must not be returned twice")
     worker = function(source, "ft_mr_work_fn")
     assert "ft_mr_plan_put(&plan);" in worker
-    assert "memset(&plan, 0, sizeof(plan));" in worker, (
+    # The worker records through ft_mr_record(), which adopts the plan.
+    assert worker.count("ft_mr_record(") == 2
+    record = function(source, "ft_mr_record")
+    assert "memset(plan, 0, sizeof(*plan));" in record, (
         "an adopted plan must be emptied before the unconditional put")
 
 
@@ -330,7 +372,7 @@ def test_the_learners_share_streams_not_keys():
     # anything else takes back what it once published.
     assert "ft_mr_publish(target, &plan)" in worker
     assert "ft_mc_route_withdraw(target->route)" in worker
-    assert "(hw || (state == FT_MR_PENDING && !via))" in worker, (
+    assert "(installed || (state == FT_MR_PENDING && !via))" in worker, (
         "a group routed through a bridge must never reach cdx_mc_group_add")
     # Each learner keeps its own collisions: two MFC entries on one port with
     # different tags are one key whose root validates one stack. Asked before
@@ -529,7 +571,7 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
     assert "ft_mr_ruleset_sync()" in worker
     assert worker.index("ft_mr_derive(target, &plan)") < \
         worker.index("ft_mr_watch_arm(target, &plan)") < \
-        worker.index("state = ft_mr_admit(target, &plan)") < worker.index("same = hw &&")
+        worker.index("state = ft_mr_admit(target, &plan)") < worker.index("same = installed &&")
     admit = function(source, "ft_mr_admit")
     assert "ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING))" in admit
     assert "if (ft_mr_observer_followed(g->family))" in admit

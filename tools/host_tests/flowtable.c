@@ -716,6 +716,7 @@ static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
 static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
+static u64 atomic64_inc_return(u64 *v) { return ++*v; }
 static u64 atomic64_read_acquire(u64 *v) { return *v; }
 static u64 ft_ipsec_genid, xfrm_genid, ft_ipsec_invalidations, ft_ipsec_policy_invalidations;
 static u64 xfrm_flowtable_genid(struct net *net) { return xfrm_genid; }
@@ -1256,8 +1257,22 @@ static void cdx_unregister_ft_egress(void) { registered_egress_changed = 0; }
 /* The IPsec half of an egress change, compiled and tested in ipsec_adapter.c;
  * here only whether the flow half hands it the port. */
 static struct net_device *ipsec_egress_changed;
+static u64 ft_egress_changes, egress_changes_seen_by_ipsec;
 static void ft_ipsec_egress_changed(const struct net_device *dev)
-{ ipsec_egress_changed = (struct net_device *)dev; }
+{ ipsec_egress_changed = (struct net_device *)dev; egress_changes_seen_by_ipsec = ft_egress_changes; }
+/* The multicast halves, compiled in mcast_learner.c and mroute_refresh.c; here
+ * only whether the port reaches them, after the change is counted, and whether
+ * a group they cannot vouch for holds the drain. */
+static struct net_device *mc_egress_changed;
+static u64 egress_changes_seen_by_mc;
+static int mc_drain_rc, mr_drain_rc;
+static unsigned mc_drains, mr_drains;
+static void ft_mc_egress_changed(const struct net_device *dev)
+{ mc_egress_changed = (struct net_device *)dev; egress_changes_seen_by_mc = ft_egress_changes; }
+static int ft_mc_egress_drain(const struct net_device *dev)
+{ assert(!cdx_info->ctrl.mutex); mc_drains++; return mc_drain_rc; }
+static int ft_mr_egress_drain(const struct net_device *dev)
+{ assert(!cdx_info->ctrl.mutex); mr_drains++; return mr_drain_rc; }
 /* What the encoder would write into the two PPPoE opcodes, recorded so a test
  * can require the index rather than the slot pointer: a direction that strips
  * counts into its session's receive half, one that inserts into the transmit
@@ -2894,15 +2909,20 @@ static void test_bridge_fdb(void)
 
     /* A port whose egress queues changed under it -- an HTB tree coming or
      * going -- re-installs everything that transmits on it: its flows are
-     * retired to be readmitted against the new queues, and its SAs are
-     * handed on to be rebuilt. Other ports are left alone. */
-    u64 before_qos = ft_qos_invalidations;
-    ipsec_egress_changed = NULL;
+     * retired to be readmitted against the new queues, and its SAs and
+     * multicast groups are handed on to be rebuilt, each only after the
+     * change is counted, which is what something built meanwhile compares
+     * against. Other ports are left alone. */
+    u64 before_qos = ft_qos_invalidations, counted = ft_egress_changes;
+    ipsec_egress_changed = mc_egress_changed = NULL;
     ft_egress_changed(&decoy);
     assert(ft_qos_invalidations == before_qos && ipsec_egress_changed == &decoy);
+    assert(mc_egress_changed == &decoy && ft_egress_changes == counted + 1);
     ft_egress_changed(&out);
     assert(ft_qos_invalidations == before_qos + 1 && handle.invalid);
-    assert(ipsec_egress_changed == &out);
+    assert(ipsec_egress_changed == &out && mc_egress_changed == &out);
+    assert(ft_egress_changes == counted + 2);
+    assert(egress_changes_seen_by_ipsec == counted + 2 && egress_changes_seen_by_mc == counted + 2);
     handle.invalid = false;
 
     ft_handle_invalidate(&handle, &ft_mac_invalidations);
@@ -6783,6 +6803,18 @@ static void test_egress_drain(void)
     ipsec_rebuild_succeeds = true;
     assert(!ft_egress_drain(&out) && !ipsec_rebuild_pending_on);
     assert(follow_scheduled == 2 && follow_flushes == 2);
+
+    /* A multicast group either learner cannot vouch for holds the drain
+     * too, each learner is asked outside the control transaction, and one
+     * that fails does not keep the other from rebuilding what it can. */
+    mc_drains = mr_drains = 0;
+    mc_drain_rc = -EAGAIN;
+    assert(ft_egress_drain(&out) == -EAGAIN && mc_drains == 1 && mr_drains == 1);
+    mc_drain_rc = 0;
+    mr_drain_rc = -EAGAIN;
+    assert(ft_egress_drain(&out) == -EAGAIN && mc_drains == 2 && mr_drains == 2);
+    mr_drain_rc = 0;
+    assert(!ft_egress_drain(&out) && mc_drains == 3 && mr_drains == 3);
 }
 
 static void test_qos_decode(void)

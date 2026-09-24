@@ -3718,11 +3718,11 @@ static LIST_HEAD(ft_ipsec_watches);
 static u64 ft_ipsec_watch_cookies;
 static u64 ft_ipsec_follow_pass;
 static atomic64_t ft_ipsec_next_hop_updates = ATOMIC64_INIT(0);
-/* Egress changes seen so far. An SA being installed while one lands is not on
- * the watch list yet for the change to mark, and its entry may have been built
- * from either side of it; the install compares this across the build and marks
- * its own watch instead. */
-static atomic64_t ft_ipsec_egress_changes = ATOMIC64_INIT(0);
+/* Egress changes seen so far, on any port (ft_egress_changed()). Something
+ * being built while one lands -- an SA, a multicast chain -- is not yet where
+ * the change can mark it, and may have been built from either side of it; the
+ * builder compares this across the build and marks itself instead. */
+static atomic64_t ft_egress_changes = ATOMIC64_INIT(0);
 
 static void ft_ipsec_follow_work(struct work_struct *work);
 static DECLARE_WORK(ft_ipsec_follow, ft_ipsec_follow_work);
@@ -3834,15 +3834,14 @@ static void ft_ipsec_device_moved(const struct net_device *dev)
  * on, chosen when it was built. Neither address moved, so this asks for the
  * rebuild outright rather than for a check.
  *
- * Counted first, fully ordered after whatever the caller changed and before
- * the walk: an install that read the count before this built from the old
- * state, and it either sees the new count when it publishes its watch or
- * publishes it before the walk below finds it. */
+ * The caller has counted the change (ft_egress_changes) before this walk: an
+ * install that read the count before it built from the old state, and it
+ * either sees the new count when it publishes its watch or publishes it before
+ * the walk below finds it. */
 static void ft_ipsec_egress_changed(const struct net_device *dev)
 {
 	struct ft_ipsec_watch *watch;
 
-	atomic64_inc_return(&ft_ipsec_egress_changes);
 	spin_lock_bh(&ft_watch_lock);
 	list_for_each_entry(watch, &ft_ipsec_watches, list)
 		if (watch->dev == dev) {
@@ -3905,7 +3904,7 @@ static void ft_ipsec_watch_add(struct ft_ipsec_watch *watch,
 	ether_addr_copy(watch->src_mac, spec->dev->dev_addr);
 	spin_lock_bh(&ft_watch_lock);
 	watch->cookie = ++ft_ipsec_watch_cookies;
-	watch->rebuild = atomic64_read(&ft_ipsec_egress_changes) != changes;
+	watch->rebuild = atomic64_read(&ft_egress_changes) != changes;
 	list_add_tail(&watch->list, &ft_ipsec_watches);
 	ft_ipsec_mark(watch);
 	spin_unlock_bh(&ft_watch_lock);
@@ -3968,10 +3967,12 @@ static void ft_mc_port_moved(struct net_device *dev, struct net_device *left);
 static void ft_mr_device_gone(struct net_device *dev);
 static void ft_mc_kick_all(void);
 static void ft_mr_kick(void);
-/* CDX changed a port's egress queues, and every multicast group copying out of
- * it is rebuilt against the queues it has now. Not static: the adapter's egress
- * hook, which retires the port's flows and SAs, calls it for the groups. */
-void ft_mc_egress_changed(const struct net_device *dev);
+/* The multicast halves of the egress hook: every group copying out of a port
+ * whose egress changed is marked for its learner's worker, and a drain
+ * rebuilds what is still marked in place. See ft_mc_egress_changed(). */
+static void ft_mc_egress_changed(const struct net_device *dev);
+static int ft_mc_egress_drain(const struct net_device *dev);
+static int ft_mr_egress_drain(const struct net_device *dev);
 
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
@@ -4520,42 +4521,50 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
  * per frame -- and nothing drains the queues of the mode the port left, so
  * everything on it is re-installed against what the port has now. Flows are
  * retired and readmitted on their next packet, which is the same treatment a
- * route or MTU change gets; SAs are rebuilt in place, because nothing
- * re-offers one. Multicast replicas are not flow entries, and neither this
- * nor ft_egress_drain() covers them.
+ * route or MTU change gets; SAs and multicast groups are rebuilt in place,
+ * because nothing re-offers one -- a group's whole listener chain, since every
+ * listener entry names its own queue.
  *
- * Takes only ft_watch_lock and never sleeps, and relies on no lock of the
- * caller's: both callers hold RTNL, but admission is caught without it.
- * Admission publishes an entry on the watch list before building the hardware
- * entry and removes it if the handle was invalidated meanwhile, so an
- * admission racing this either is marked here or builds from the state the
- * caller changed before calling. An SA install does the same through the
- * egress count (ft_ipsec_watch_add()). */
+ * Relies on no lock of the caller's: both callers hold RTNL, but admission is
+ * caught without it. It sleeps, on the learners' mutexes. The change is
+ * counted first, fully ordered after whatever the caller changed and before
+ * any walk: something being built meanwhile either reads the new state or sees
+ * the count move when it records what it built (ft_ipsec_watch_add(), the
+ * multicast workers), and marks itself. Admission publishes a flow on the
+ * watch list before building its hardware entry and removes it if the handle
+ * was invalidated meanwhile, to the same effect. */
 static void ft_egress_changed(struct net_device *dev)
 {
+	atomic64_inc_return(&ft_egress_changes);
 	ft_device_retire(dev, &ft_qos_invalidations);
 	ft_ipsec_egress_changed(dev);
+	ft_mc_egress_changed(dev);
 }
 
 /* Wait until everything ft_egress_changed(dev) started has finished: every
- * flow it retired is out of the hardware, and every SA on the port it asked to
- * rebuild has been rebuilt. CDX calls this before handing the microcode's DSCP
- * map to another port: the map is one table with no port in it, so an entry
- * still reading it after the hand-over would transmit on the other port's
- * queues.
+ * flow it retired is out of the hardware, and every SA and multicast group on
+ * the port it asked to rebuild has been rebuilt. CDX calls this before handing
+ * the microcode's DSCP map to another port: the map is one table with no port
+ * in it, so an entry still reading it after the hand-over would transmit on the
+ * other port's queues.
  *
  * Retirement stands aside for a global invalidation, which removes every
  * entry itself, so that is waited for too -- and a recovery that cannot finish
  * yet, the hardware not proven stopped, is reported rather than waited out.
  * So is an unload in progress, which retires everything on its own schedule,
- * and an SA whose rebuild failed and is waiting for its peer. -EAGAIN leaves
- * nothing to undo; the caller asks again later.
+ * an SA whose rebuild failed and is waiting for its peer, and a multicast
+ * group whose recorded chain lost a device or whose rebuild failed, which its
+ * worker now owns. -EAGAIN leaves nothing to undo; the caller asks again
+ * later.
  *
  * Sleeps. Safe under RTNL, which none of the work waited on takes except by
- * trying; not under the control mutex, which all of it takes. */
+ * trying. Both multicast workers do take RTNL, to ask the bridge and ipmr, so
+ * their groups are rebuilt here rather than waited for. Not under the control
+ * mutex, which all of it takes. */
 static int ft_egress_drain(struct net_device *dev)
 {
 	bool done;
+	int rc;
 
 	might_sleep();
 	flush_work(&ft_retire_work);
@@ -4587,7 +4596,10 @@ static int ft_egress_drain(struct net_device *dev)
 		if (ft_ipsec_rebuild_pending(dev))
 			return -EAGAIN;
 	}
-	return 0;
+	/* And every multicast group with a copy on the port, both learners'
+	 * whatever the first says: each rebuilds what it can. */
+	rc = ft_mc_egress_drain(dev);
+	return ft_mr_egress_drain(dev) ?: rc;
 }
 
 static const struct cdx_ft_egress_ops ft_egress_ops = {
@@ -4722,14 +4734,22 @@ struct ft_mc_tap {
  * two live under: never wait for either lock while holding the other. So the
  * handler only ever takes ft_mc_lock and marks, and a work item asks the
  * bridge -- under RTNL, then ft_mc_lock, the handler's own order -- and then
- * does the hardware with neither held.
+ * does the hardware without RTNL.
  *
  * That leaves one ordering obligation, which every function below keeps:
  * **ft_mc_lock is never held across cdx_ft_begin()**. /proc reads the lists
  * from inside the transaction, so a worker that took the transaction while
  * holding ft_mc_lock would close a cycle with it. The worker therefore
- * snapshots under the lock, releases it, does the hardware, and re-takes it to
- * record what happened.
+ * snapshots under the lock and releases it, takes the transaction, programs
+ * the hardware with the transaction alone, and takes the lock again inside it
+ * only to record what it did -- /proc's order -- so nothing else that takes
+ * the transaction sees an entry half built, and nothing that takes only the
+ * lock under RTNL waits behind a hardware call. The egress drain is the one
+ * caller that takes the transaction holding RTNL, a tc command's: RTNL then
+ * the transaction, the order the routed learner's drain explains, and the
+ * worker never waits for RTNL while it holds the transaction. The drain holds
+ * ft_mc_lock across its rebuilds, which delays nothing under RTNL: its caller
+ * holds RTNL.
  */
 
 /* The largest packet `dev` carries for `family`, in the units the forwarding
@@ -4890,6 +4910,19 @@ struct ft_mc_flow {
 	bool dirty;
 	bool stale;
 	bool gone;
+	/* The chain `hw` was built from, whole -- the routed copies riding it
+	 * included -- recorded with `hw` inside the transaction that built it,
+	 * and what the egress drain replaces it with. Borrowed: a device in it
+	 * that goes away empties it first (ft_mc_device_gone()), so every one
+	 * it names is registered. No listeners means none is recorded. */
+	struct cdx_mc_group_spec hw_spec;
+	/* The installed chain may hold an entry built before an egress change
+	 * on a port it copies out of -- an HTB tree, the DSCP map -- naming the
+	 * queue, or reading the map, of the state before it. Unlike `stale`,
+	 * which a pass consumes when it picks the flow, it is cleared only by a
+	 * build that started after the last change (ft_egress_changes), since
+	 * a caller waiting for the change to reach the hardware reads it. */
+	bool egress_stale;
 	/* A source of the group was turned away at FT_MC_MAX_FLOWS while this
 	 * flow held its place, and counted in mcast_refused. The next one is
 	 * not counted again until the group's flows change: a group every host
@@ -4920,12 +4953,10 @@ static LIST_HEAD(ft_mc_flows);
 static DEFINE_MUTEX(ft_mc_lock);
 static unsigned int ft_mc_count, ft_mc_flow_count, ft_mc_installed;
 static u64 ft_mc_refused, ft_mc_install_errors;
-/* Installed groups of either learner rebuilt because a port they copy out of
- * changed its egress queues, and how many times that happened -- the second
- * is what an install racing the change compares against; see
- * ft_mc_egress_changed(). */
+/* Installed groups of either learner marked for a rebuild because a port they
+ * copy out of changed its egress; see ft_mc_egress_changed(). A build racing
+ * the change compares ft_egress_changes instead. */
 static atomic64_t ft_mc_egress_rebuilds = ATOMIC64_INIT(0);
-static atomic_t ft_mc_egress_gen = ATOMIC_INIT(0);
 static void ft_mc_work_fn(struct work_struct *work);
 static DECLARE_WORK(ft_mc_work, ft_mc_work_fn);
 /* How often an installed flow's entry is asked what it has counted, and every
@@ -5631,6 +5662,33 @@ static void ft_mc_flow_spec(const struct ft_mc_flow *f,
 		spec->listener[spec->listeners] = r->listener[i];
 		spec->listener[spec->listeners++].routed = true;
 	}
+}
+
+/* Whether every device a spec the worker built names is still registered, so
+ * that the chain may be recorded for the egress drain to replay.
+ *
+ * The recorded chain borrows its devices from the flow and from its route,
+ * and ft_mc_device_gone() empties it before either lets go of one. A build
+ * does not borrow: it holds a reference of its own on each device for as long
+ * as it runs, so a device can be unregistered while it runs, emptying the
+ * chain recorded before, and a chain recorded from the build would then name
+ * a device nothing holds once the build lets go of it. Unregistration moves a
+ * device out of NETREG_REGISTERED before ft_mc_device_gone() takes ft_mc_lock,
+ * which the caller holds: a device that still reads as registered here is one
+ * whose ft_mc_device_gone() is still to come, and will empty what is recorded
+ * now. A chain that cannot be recorded leaves nothing for a drain to replay,
+ * and the device's own event asks the worker for a rebuild without it. */
+static bool ft_mc_spec_registered(const struct cdx_mc_group_spec *spec)
+{
+	u8 i;
+
+	lockdep_assert_held(&ft_mc_lock);
+	if (READ_ONCE(spec->in->reg_state) != NETREG_REGISTERED)
+		return false;
+	for (i = 0; i < spec->listeners; i++)
+		if (READ_ONCE(spec->listener[i].dev->reg_state) != NETREG_REGISTERED)
+			return false;
+	return true;
 }
 
 /* Whether anything still names a flow: a membership of its group on its
@@ -6671,7 +6729,7 @@ static void ft_mc_drain(void)
 
 /* The worker. Runs outside RTNL except while it asks the bridge, so it may
  * take the transaction -- and never while holding ft_mc_lock or RTNL, which is
- * the ordering obligation stated above.
+ * the ordering obligation stated above; ft_mc_lock it takes inside it.
  */
 static void ft_mc_work_fn(struct work_struct *work)
 {
@@ -6759,14 +6817,24 @@ static void ft_mc_work_fn(struct work_struct *work)
 
 	/* Install or update whatever is now installable. One flow per pass
 	 * through the list, because the transaction is dropped between each --
-	 * ft_mc_lock is never held across it. */
+	 * ft_mc_lock is never held across taking it.
+	 *
+	 * A flow's entry and the chain recorded for it stay the flow's until
+	 * this pass is inside the transaction, and what the pass built is
+	 * recorded before it leaves it, with ft_mc_lock taken inside the
+	 * transaction for the record -- the order /proc, the refresh and the
+	 * egress drain take the two in. None of them ever sees an entry built
+	 * but not yet recorded, or recorded but not yet built -- the drain,
+	 * which rebuilds the recorded chain in place, least of all. */
 	for (;;) {
 		struct cdx_mc_group_spec spec = {};
-		struct cdx_mc_group *hw = NULL, *stale = NULL;
 		struct ft_mc_route *route = NULL;
 		struct ft_mc_flow *target = NULL;
-		bool replace = false, withdrew = false;
-		int rc = 0, gen;
+		bool swap = false, swapped = false, withdrew = false;
+		bool added = false;
+		struct cdx_mc_group *hw;
+		s64 changes;
+		int rc = 0;
 		u8 i;
 
 		mutex_lock(&ft_mc_lock);
@@ -6798,18 +6866,17 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * the flow reached the CPU in another shape: that shape takes
 		 * over. The old entry comes out first -- it matches nothing, so
 		 * its going costs no frame -- and the new one goes in as an add,
-		 * because a different key is a different entry. */
+		 * because a different key is a different entry. Both happen in
+		 * the transaction below; until then the old entry, and the chain
+		 * recorded for it, are still the flow's. */
 		if (target->hw && target->has_next && target->idle) {
-			stale = target->hw;
-			target->hw = NULL;
-			target->carried_route = NULL;
+			swap = true;
 			ft_mc_adopt_next(target);
 		}
 		target->contested = ft_mc_key_contested(target);
-		gen = atomic_read(&ft_mc_egress_gen);
-		/* Snapshot under the lock; the hardware call happens after it
-		 * is dropped. Every device in the spec gets a reference of its
-		 * own for that window: the flow's own pins are dropped when a
+		/* Snapshot under the lock; the hardware call is made in the
+		 * transaction below. Every device in the spec gets a reference of
+		 * its own for that window: the flow's own pins are dropped when a
 		 * port goes away, from the netdev chain under RTNL, which takes
 		 * no part in this transaction -- and a route's by the routed
 		 * learner. Borrowing either would leave the spec naming a
@@ -6817,28 +6884,39 @@ static void ft_mc_work_fn(struct work_struct *work)
 		if (!target->contested && ft_mc_installable(target) &&
 		    target->retries < FT_MC_MAX_RETRIES)
 			ft_mc_flow_spec(target, &spec);
-		hw = target->hw;
 		if (spec.listeners) {
-			replace = hw != NULL;
 			/* The route whose copies the spec carries, if any. */
 			if (ft_mc_live_route(target))
 				route = target->route;
 			dev_hold(spec.in);
 			for (i = 0; i < spec.listeners; i++)
 				dev_hold(spec.listener[i].dev);
-		} else {
-			target->hw = NULL;
-			target->carried_route = NULL;
 		}
 		mutex_unlock(&ft_mc_lock);
 
-		if (stale) {
-			cdx_ft_begin();
-			cdx_mc_group_del(&stale);
-			cdx_ft_end();
-			ft_mc_installed--;
-		}
+		/* The hardware is programmed with the transaction alone, and
+		 * ft_mc_lock is taken only to record the outcome. What must not
+		 * see an entry half built -- /proc, the refresh, the egress
+		 * drain -- takes the transaction first; what takes only the lock
+		 * -- the MDB handler, the netdev events and the egress mark, all
+		 * under RTNL -- never waits behind a hardware call, and nothing
+		 * it changes meanwhile is lost: a mark is caught by the egress
+		 * count, a device going by ft_mc_spec_registered(), and a route
+		 * withdrawn by the check below.
+		 *
+		 * The flow is still allocated: only this function frees one, and
+		 * it is not reentrant. Its entry is changed only here, and is
+		 * what it is now: a drain may have rebuilt it in place since the
+		 * pick, never replaced it. */
 		cdx_ft_begin();
+		hw = target->hw;
+		/* Before anything is built: see ft_egress_changes. */
+		changes = atomic64_read_acquire(&ft_egress_changes);
+		if (swap && hw) {
+			cdx_mc_group_del(&hw);
+			ft_mc_installed--;
+			swapped = true;
+		}
 		if (!spec.listeners) {
 			/* Became ineligible: take it out of hardware and keep
 			 * the flow, which may become installable again when the
@@ -6848,7 +6926,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 				ft_mc_installed--;
 				withdrew = true;
 			}
-		} else if (replace) {
+		} else if (hw) {
 			rc = cdx_mc_group_replace(hw, &spec);
 			if (rc) {
 				/* The old chain can omit a port that has just
@@ -6856,19 +6934,10 @@ static void ft_mc_work_fn(struct work_struct *work)
 				 * carried; an incomplete set cannot stand in for
 				 * the one asked for. Back to software until a whole
 				 * set installs, as a routed group's failed update
-				 * goes.
-				 *
-				 * Off the flow before it is freed: /proc and the
-				 * refresh read the entry under this transaction and
-				 * then ft_mc_lock, and one waiting for the
-				 * transaction would find it freed the moment this
-				 * releases it. Taking ft_mc_lock inside the
-				 * transaction is their order. */
+				 * goes. Recorded below before the transaction is let
+				 * go, so /proc and the refresh, which read the entry
+				 * under it, never find it freed. */
 				ft_mc_install_errors++;
-				mutex_lock(&ft_mc_lock);
-				target->hw = NULL;
-				target->carried_route = NULL;
-				mutex_unlock(&ft_mc_lock);
 				cdx_mc_group_del(&hw);
 				ft_mc_installed--;
 				withdrew = true;
@@ -6880,38 +6949,54 @@ static void ft_mc_work_fn(struct work_struct *work)
 				hw = NULL;
 			} else {
 				ft_mc_installed++;
+				added = true;
 			}
 		}
-		cdx_ft_end();
 
 		mutex_lock(&ft_mc_lock);
-		/* The flow may have been retired while the transaction was
-		 * held; it is still allocated, because only this function
-		 * frees one and it is not reentrant. */
-		if (spec.listeners || hw)
-			target->hw = hw;
+		target->hw = hw;
 		/* What the entry was built with. A route withdrawn while the
-		 * transaction was held has already cleared the flow's pointer
-		 * and marked it for another pass, and must not be recorded: its
-		 * owner is free to release it the moment it is off the list. */
+		 * spec was being taken has already cleared the flow's pointer and
+		 * marked it for another pass, and must not be recorded: its owner
+		 * is free to release it the moment it is off the list. */
 		if (spec.listeners && !rc)
 			target->carried_route = route && target->route == route ?
 						route : NULL;
 		if (!hw)
 			target->carried_route = NULL;
+		/* And the chain itself, whole, for the egress drain to replace
+		 * the entry with; nothing is recorded for an entry this pass took
+		 * out, or one it could not build, or one naming a device on its
+		 * way out (ft_mc_spec_registered()). */
+		if (hw && spec.listeners && !rc) {
+			if (ft_mc_spec_registered(&spec))
+				target->hw_spec = spec;
+			else
+				memset(&target->hw_spec, 0,
+				       sizeof(target->hw_spec));
+		} else if (!hw) {
+			memset(&target->hw_spec, 0, sizeof(target->hw_spec));
+		}
 		/* A new entry has counted nothing yet, is not idle until a
 		 * whole refresh says so, and ages from now. */
-		if (spec.listeners && !rc && !replace) {
+		if (added) {
 			target->hw_packets = target->hw_bytes = 0;
 			target->count_suspect = false;
 			target->idle = false;
 			target->active = jiffies;
 		}
-		/* A port's queues changed while this chain was being built from
-		 * the old ones; ft_mc_egress_changed() could not tell a flow
-		 * that had no entry yet. Build it again. */
-		if (spec.listeners && !rc && atomic_read(&ft_mc_egress_gen) != gen)
+		/* A chain built whole after the last egress change is current;
+		 * one built across a change is not, and is built again -- the
+		 * change could not mark a flow that had no entry yet. Nothing
+		 * installed is nothing stale. */
+		if (!hw) {
+			target->egress_stale = false;
+		} else if (atomic64_read(&ft_egress_changes) != changes) {
+			target->egress_stale = true;
 			target->stale = true;
+		} else if (spec.listeners && !rc) {
+			target->egress_stale = false;
+		}
 		if (spec.listeners && rc) {
 			/* Tried again at the next refresh, not now: a port
 			 * that lost carrier, or room another entry is about to
@@ -6925,9 +7010,10 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * frames the entry matched reach the CPU again, and one recorded
 		 * while the entry carried a different answer must be able to be
 		 * recorded again. */
-		if (withdrew || stale)
+		if (withdrew || swapped)
 			ft_mc_forget_seen();
 		mutex_unlock(&ft_mc_lock);
+		cdx_ft_end();
 		if (spec.listeners) {
 			dev_put(spec.in);
 			for (i = 0; i < spec.listeners; i++)
@@ -7099,10 +7185,13 @@ static void ft_mc_refresh_fn(struct work_struct *work)
 
 /* The MDB half of the switchdev chain.
  *
- * Never blocks, never touches hardware, and answers `handled` for a membership
- * the adapter has taken on -- which is earlier than having installed it, for
- * the reason the section header gives. /proc is the surface that says what is
- * actually in hardware.
+ * Takes ft_mc_lock and nothing else, and never waits behind a hardware call
+ * for it: the worker takes it only around its records, and the one holder
+ * that keeps it across a rebuild, the egress drain, holds RTNL as this
+ * handler does. Never touches hardware, and answers `handled` for a
+ * membership the adapter has taken on -- which is earlier than having
+ * installed it, for the reason the section header gives. /proc is the
+ * surface that says what is actually in hardware.
  */
 static bool ft_mc_swdev_obj(unsigned long event,
 			    struct switchdev_notifier_port_obj_info *obj)
@@ -7327,6 +7416,19 @@ static void ft_mc_device_gone(struct net_device *dev, bool unregistering)
 		}
 		ft_mc_flow_drop_port(f, dev);
 		changed |= f->dirty;
+		/* The chain recorded for the entry borrows its devices, and
+		 * this one is about to go: nothing may replay it now. The entry
+		 * itself is the worker's to rebuild or take out, which the
+		 * marks above ask for -- a routed copy's device reaches the
+		 * flow through its route, which the routed learner withdraws. */
+		for (j = 0; j < f->hw_spec.listeners; j++)
+			if (f->hw_spec.listener[j].dev == dev)
+				break;
+		if (f->hw_spec.in == dev || j < f->hw_spec.listeners) {
+			memset(&f->hw_spec, 0, sizeof(f->hw_spec));
+			f->stale = true;
+			changed = true;
+		}
 	}
 out:
 	mutex_unlock(&ft_mc_lock);
@@ -7412,29 +7514,38 @@ static void ft_mc_port_moved(struct net_device *dev, struct net_device *left)
 		schedule_work(&ft_mc_work);
 }
 
-/* This learner's half of ft_mc_egress_changed(): every installed flow with a
- * copy on `dev` -- a port the bridge forwards it to, or a route's copy riding
- * it -- is marked for the worker, whose replace rebuilds the whole chain.
- * Takes ft_mc_lock and nothing else. Returns how many were marked. */
+/* Whether a flow's installed chain may have a copy on `dev`: a port the bridge
+ * forwards it to, or a route's copy riding it. The recorded chain is exactly
+ * what was built; a flow with an entry and nothing recorded -- a device in it
+ * went away -- could have any port in it. Called with ft_mc_lock held. */
+static bool ft_mc_flow_hw_lists(const struct ft_mc_flow *f,
+				const struct net_device *dev)
+{
+	u8 i;
+
+	lockdep_assert_held(&ft_mc_lock);
+	if (!f->hw_spec.listeners)
+		return true;
+	for (i = 0; i < f->hw_spec.listeners; i++)
+		if (f->hw_spec.listener[i].dev == dev)
+			return true;
+	return false;
+}
+
+/* This learner's half of ft_mc_egress_changed(): every installed flow whose
+ * chain may have a copy on `dev` is marked stale for the egress drain and
+ * handed to the worker, whose replace rebuilds the whole chain. Takes
+ * ft_mc_lock and nothing else. Returns how many were marked. */
 static unsigned int ft_mc_egress_mark(const struct net_device *dev)
 {
 	unsigned int marked = 0;
 	struct ft_mc_flow *f;
-	u8 i;
 
 	mutex_lock(&ft_mc_lock);
 	list_for_each_entry(f, &ft_mc_flows, list) {
-		const struct ft_mc_route *r = f->carried_route;
-		bool hit = false;
-
-		if (!f->hw)
+		if (!f->hw || !ft_mc_flow_hw_lists(f, dev))
 			continue;
-		for (i = 0; i < f->ports; i++)
-			hit |= f->port[i].dev == dev;
-		for (i = 0; r && i < r->listeners; i++)
-			hit |= r->listener[i].dev == dev;
-		if (!hit)
-			continue;
+		f->egress_stale = true;
 		f->stale = true;
 		marked++;
 	}
@@ -7442,6 +7553,54 @@ static unsigned int ft_mc_egress_mark(const struct net_device *dev)
 		schedule_work(&ft_mc_work);
 	mutex_unlock(&ft_mc_lock);
 	return marked;
+}
+
+/* Rebuild what ft_mc_egress_mark(dev) marked, here and now.
+ *
+ * Called under the RTNL a tc command holds, so the worker, which takes RTNL
+ * to ask the bridge, is never waited for. Nor is anything decided: the port's
+ * forwarding did not change, only its queues, so each flow's recorded chain
+ * -- the bridge's copies and the routed copies riding it, as they were built,
+ * with the flow's own ingress tag and sender -- is replaced by itself, which
+ * builds every listener entry against the port as it is now. Transaction
+ * first and ft_mc_lock inside it, the order the worker records in, so an entry
+ * is never seen here half built.
+ *
+ * A flow this cannot vouch for is handed to the worker and reported with
+ * -EAGAIN: its recorded chain lost a device, whose own event has already
+ * marked the flow, or the replace failed -- which left the old chain in place,
+ * and which the worker's own replace answers by rebuilding or withdrawing the
+ * flow, either way in one pass. The caller asks again later; nothing here
+ * waits for a retry the refresh paces. */
+static int ft_mc_egress_drain(const struct net_device *dev)
+{
+	struct ft_mc_flow *f;
+	bool kick = false;
+	int rc = 0;
+
+	cdx_ft_begin();
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		if (!f->egress_stale || !ft_mc_flow_hw_lists(f, dev))
+			continue;
+		if (!f->hw) {
+			f->egress_stale = false;
+			continue;
+		}
+		if (!f->hw_spec.listeners ||
+		    cdx_mc_group_replace(f->hw, &f->hw_spec)) {
+			f->stale = true;
+			kick = true;
+			rc = -EAGAIN;
+			continue;
+		}
+		f->egress_stale = false;
+	}
+	if (kick && !ft_mc_stopping)
+		schedule_work(&ft_mc_work);
+	mutex_unlock(&ft_mc_lock);
+	cdx_ft_end();
+	return rc;
 }
 
 static void ft_mc_exit(void)
@@ -7710,14 +7869,27 @@ static void ft_mc_rows(struct seq_file *seq)
  * the mfc and the device, appends to a queue under a spinlock, and wakes a
  * worker. The worker takes ft_mr_lock to choose a group, releases it, takes
  * RTNL to decide -- device walks, bridge VLAN state and the kernel's multicast
- * egress snapshot -- releases RTNL, and only then takes the
- * transaction. Three rules hold throughout, and tools/host_tests/
- * test_mroute_learner.py greps for each:
+ * egress snapshot -- releases RTNL, and only then takes the transaction, which
+ * it holds until the outcome is recorded. Three rules hold, and
+ * tools/host_tests/test_mroute_learner.py greps for each:
  *
  *   - ft_mr_lock is never held across cdx_ft_begin(). /proc takes the
- *     transaction and then the lock, so the other order would close a cycle.
- *   - RTNL is never held across cdx_ft_begin() either, which is
- *     cdx_ctrl_lock_with_rtnl()'s standing rule rather than this section's.
+ *     transaction and then the lock, so the other order would close a cycle;
+ *     the worker and the drain take the lock inside the transaction, which is
+ *     the same order. The worker takes it there only to record: it programs
+ *     the hardware with the transaction alone, so nothing that takes the lock
+ *     under RTNL waits behind a hardware call. The drain keeps it across its
+ *     rebuilds, which delays nothing under RTNL: its caller holds RTNL.
+ *   - The worker never holds RTNL across cdx_ft_begin(). One caller does:
+ *     ft_mr_egress_drain(), which runs under the RTNL a tc command holds and
+ *     takes the transaction there -- RTNL then the transaction, the order the
+ *     flowtable's bind path and the DSCP map's barrier already take.
+ *     cdx_ctrl_lock_with_rtnl() forbids waiting for either lock while holding
+ *     the other, and the one path that waits for RTNL while holding the
+ *     transaction is the legacy FCI command plane, which is sealed once the
+ *     flowtable owns the hardware. So that order closes no cycle, and the
+ *     worker, which may wait for RTNL, never holds the transaction then. The
+ *     bridged learner's drain, ft_mc_egress_drain(), is the same.
  *   - ft_mr_lock and ft_mc_lock are never nested. The bridged side only
  *     kicks this worker; the routed side reads bridge state from the kernel,
  *     and publishes its routes and taps through functions that take
@@ -7880,10 +8052,24 @@ struct ft_mr_group {
 	/* MFC_OFFLOAD is set on the kernel's entry. */
 	bool offloaded;
 	bool dirty;
-	/* A port it copies out of changed its egress queues: the next pass
-	 * replaces the chain even when the plan has not changed, because the
-	 * entries name the queues they were built with. */
-	bool rebuild;
+	/* The worker has picked the group and not yet recorded the outcome.
+	 * `hw` and the installed set stay the group's meanwhile: the worker
+	 * builds and records inside one transaction (ft_mr_record()), so
+	 * nothing else that takes the transaction sees them half-changed. */
+	bool busy;
+	/* The installed listener chain may hold an entry built before an
+	 * egress change on a port it copies out of -- an HTB tree, the DSCP
+	 * map -- naming the queue, or reading the map, of the state before it.
+	 * The next pass replaces the chain even when the plan has not changed.
+	 * Cleared only by a rebuild that started after the last change
+	 * (ft_egress_changes), because a caller waiting for the change reads it
+	 * (ft_mr_egress_drain()). */
+	bool egress_stale;
+	/* The spec `hw` was built from, whole -- ingress tags included -- and
+	 * what the egress drain replaces it with. It borrows the installed
+	 * set's pinned devices, and goes with that set (ft_mr_release_set()).
+	 * No listeners means none is recorded. */
+	struct cdx_mc_group_spec hw_spec;
 	/* The kernel deleted the entry; retire and forget it. */
 	bool gone;
 	bool seen;
@@ -9474,6 +9660,8 @@ static void ft_mr_release_set(struct ft_mr_group *g)
 	g->via_tagged = false;
 	g->mtu = 0;
 	g->oifs[0] = '\0';
+	/* It borrowed the devices just let go of. */
+	memset(&g->hw_spec, 0, sizeof(g->hw_spec));
 }
 
 static void ft_mr_group_free(struct ft_mr_group *g)
@@ -9539,37 +9727,99 @@ static void ft_mr_device_gone(struct net_device *dev)
 		schedule_work(&ft_mr_work);
 }
 
-/* This learner's half of ft_mc_egress_changed(): every group with a copy on
- * `dev` is re-derived with its chain rebuilt even if nothing else changed,
- * which the worker would otherwise skip as the same plan. A group routed
- * through a bridge has no chain of its own; its copies are the bridged
- * group's, marked by the other half. Takes ft_mr_lock and nothing else.
- * Returns how many installed groups were marked. */
+/* Whether a group's installed chain may have a listener on `dev`. `listener[]`
+ * is the installed set, and stays so while the worker decides a group: it is
+ * replaced only when the outcome is recorded. A group whose set was released
+ * (ft_mr_device_gone()) while its hardware stayed could have any port in it.
+ * Called with ft_mr_lock held. */
+static bool ft_mr_may_list(const struct ft_mr_group *g,
+			   const struct net_device *dev)
+{
+	u8 i;
+
+	if (!g->listeners)
+		return true;
+	for (i = 0; i < g->listeners; i++)
+		if (g->listener[i].dev == dev)
+			return true;
+	return false;
+}
+
+/* This learner's half of ft_mc_egress_changed(): every installed group that
+ * may copy out of `dev` is marked stale and handed to the worker, whose replace
+ * rebuilds the whole chain even when the plan has not changed. A group the
+ * worker is deciding is marked and left to it: the worker sees the mark, or
+ * the count, when it records the outcome. A group routed through a bridge has
+ * no chain of its own; its copies are the bridged flow's, marked by the other
+ * half. Takes ft_mr_lock and nothing else. Returns how many were marked. */
 static unsigned int ft_mr_egress_mark(const struct net_device *dev)
 {
 	unsigned int marked = 0;
 	struct ft_mr_group *g;
-	bool kick = false;
-	u8 i;
 
 	mutex_lock(&ft_mr_lock);
 	list_for_each_entry(g, &ft_mr_groups, list) {
-		bool hit = false;
-
-		for (i = 0; !g->via && i < g->listeners; i++)
-			hit |= g->listener[i].dev == dev;
-		if (!hit)
+		if (!g->hw || !ft_mr_may_list(g, dev))
 			continue;
-		g->rebuild = true;
-		g->dirty = true;
-		kick = true;
-		if (g->hw)
-			marked++;
+		g->egress_stale = true;
+		if (!g->busy)
+			g->dirty = true;
+		marked++;
 	}
-	if (kick && !ft_mr_stopping)
+	if (marked && !ft_mr_stopping)
 		schedule_work(&ft_mr_work);
 	mutex_unlock(&ft_mr_lock);
 	return marked;
+}
+
+/* Rebuild what ft_mr_egress_mark(dev) marked, here and now.
+ *
+ * Waiting for the worker is not an option: it takes RTNL to decide, and the
+ * caller holds RTNL. Nor is a decision needed. The port's membership did not
+ * change, only its queues, so the installed chain is replaced by itself --
+ * the spec it was built from, recorded whole, ingress tags included, its
+ * devices still pinned by the installed set -- which rebuilds every listener
+ * entry against the port as it is now. Transaction first and ft_mr_lock
+ * inside it, the order /proc takes them in.
+ *
+ * That holds for a group the worker is deciding too, which is the common case:
+ * the refresh keeps the worker busy, and a worker that picked a group is
+ * waiting for the RTNL this caller holds. The worker builds and records inside
+ * the transaction, so here a group is never half-built; its hardware and set
+ * are the installed ones until the worker's own pass replaces them.
+ *
+ * A group that cannot be rebuilt here -- its set was released, or the replace
+ * failed and it is handed back to the worker, whose own failed replace
+ * withdraws it in one pass -- is reported with -EAGAIN. */
+static int ft_mr_egress_drain(const struct net_device *dev)
+{
+	struct ft_mr_group *g;
+	bool kick = false;
+	int rc = 0;
+
+	cdx_ft_begin();
+	mutex_lock(&ft_mr_lock);
+	list_for_each_entry(g, &ft_mr_groups, list) {
+		if (!g->egress_stale || !ft_mr_may_list(g, dev))
+			continue;
+		if (!g->hw) {
+			g->egress_stale = false;
+			continue;
+		}
+		if (!g->hw_spec.listeners ||
+		    cdx_mc_group_replace(g->hw, &g->hw_spec)) {
+			g->dirty = true;
+			kick = true;
+			rc = -EAGAIN;
+			continue;
+		}
+		g->egress_stale = false;
+	}
+	mutex_unlock(&ft_mr_lock);
+	cdx_ft_end();
+	if (kick && !READ_ONCE(ft_mr_stopping))
+		schedule_work(&ft_mr_work);
+	return rc;
 }
 
 /* Whether another group of this learner has an entry under the key a spec
@@ -9673,6 +9923,105 @@ static void ft_mr_publish_taps(void)
 		dev_put(taps[i].bridge);
 }
 
+/* What the worker's pass for `g` came to, recorded with ft_mr_lock held and,
+ * when the pass built anything, still inside its transaction, so nothing else
+ * that takes the transaction -- /proc, the fold, the egress drain -- sees the
+ * group half changed. `hw` is the group's hardware now and `plan` what the
+ * pass derived; `touched` says the pass programmed the hardware, with the
+ * egress count read as `changes` before it did. `last` is what an entry the
+ * pass deleted had counted, if that was read, and `added` and `deleted` say
+ * the entry is new or went; the ingress hold of one that went is handed back
+ * in `put_in`, to be dropped outside the lock. Returns the group's state.
+ *
+ * A chain built whole after the last egress change is current; one built
+ * across a change is not, and neither is one left alone while a change asked
+ * for it meanwhile. Nothing installed is nothing stale. */
+static enum ft_mr_state ft_mr_record(struct ft_mr_group *g, struct cdx_mc_group *hw,
+				     enum ft_mr_state state, int rc,
+				     struct ft_mr_plan *plan, bool touched, s64 changes,
+				     const struct cdx_ft_counters *last, bool deleted,
+				     bool added, struct net_device **put_in)
+{
+	lockdep_assert_held(&ft_mr_lock);
+	if (state == FT_MR_PENDING && !plan->via && !rc && hw)
+		state = FT_MR_INSTALLED;
+	g->hw = hw;
+	/* The entry's own hold on its ingress: let go with the entry just
+	 * deleted, taken for the one just added. */
+	if (deleted) {
+		*put_in = g->hw_in;
+		g->hw_in = NULL;
+	}
+	if (added) {
+		dev_hold(plan->spec.in);
+		g->hw_in = plan->spec.in;
+	}
+	/* The entry just deleted, folded against the baseline it was counted
+	 * from and with the framing it was installed with -- both still the
+	 * old set's until the plan is adopted below. */
+	if (last)
+		ft_mr_fold(g, last, g->in_tags);
+	/* A group made in this pass counts from zero, whatever the last one
+	 * had reached. Here, not by comparing handles: the one a delete frees
+	 * is the next add's allocation often enough. So does a route this
+	 * group has just begun riding: it was zeroed when it was published. */
+	if (added || (plan->via && !g->via)) {
+		g->folded_packets = g->folded_bytes = 0;
+		g->fold_suspect = false;
+	}
+	if (state == FT_MR_INSTALLED || state == FT_MR_BRIDGED) {
+		/* Adopt the plan whole, references included: the backend
+		 * borrows exactly these pointers, so a group owning some of them
+		 * would name one it did not. */
+		ft_mr_release_set(g);
+		g->in = plan->spec.in;
+		g->in_tags = plan->in_tags;
+		memcpy(g->in_vlan, plan->spec.in_vlan, sizeof(g->in_vlan));
+		g->via = plan->via;
+		g->via_vid = plan->via_vid;
+		g->via_tagged = plan->via_tagged;
+		g->mtu = plan->mtu;
+		g->listeners = plan->spec.listeners;
+		memcpy(g->listener, plan->spec.listener, sizeof(g->listener));
+		strscpy(g->oifs, plan->oifs, sizeof(g->oifs));
+		/* And the spec itself, for the egress drain to rebuild the
+		 * entry with -- only for an entry of the group's own. */
+		if (hw)
+			g->hw_spec = plan->spec;
+		memset(plan, 0, sizeof(*plan));
+		g->retries = 0;
+	} else {
+		/* A failed update was withdrawn: an incomplete old listener
+		 * set cannot stand in for the requested one. */
+		if (!hw)
+			ft_mr_release_set(g);
+		/* Named in /proc beside the ones still unseen. */
+		if (state == FT_MR_UNCONFIRMED)
+			strscpy(g->oifs, plan->oifs, sizeof(g->oifs));
+		/* Tried again at the next refresh, which asks every group below
+		 * the ceiling again, not now: a port that lost carrier, or room
+		 * another entry is about to give back, needs time rather than
+		 * repetition. */
+		if (rc && ++g->retries >= FT_MR_MAX_RETRIES)
+			state = FT_MR_REFUSED_FAILED;
+	}
+	if (ft_mr_refusal(state) && !ft_mr_refusal(g->state))
+		ft_mr_refused++;
+	g->state = state;
+	g->busy = false;
+	if (!hw) {
+		g->egress_stale = false;
+	} else if (touched && atomic64_read(&ft_egress_changes) != changes) {
+		g->egress_stale = true;
+		g->dirty = true;
+	} else if (touched && !rc) {
+		g->egress_stale = false;
+	} else if (g->egress_stale) {
+		g->dirty = true;
+	}
+	return state;
+}
+
 static void ft_mr_work_fn(struct work_struct *work)
 {
 	struct ft_mr_group *g, *tmp;
@@ -9752,18 +10101,30 @@ static void ft_mr_work_fn(struct work_struct *work)
 	}
 
 	/* 5. One group per pass: the transaction is dropped between each,
-	 * because ft_mr_lock is never held across it. */
+	 * because ft_mr_lock is never held across taking it.
+	 *
+	 * The group is marked busy while it is decided, but its hardware and
+	 * installed set stay the group's until this pass is inside the
+	 * transaction, and the outcome is recorded, with ft_mr_lock taken
+	 * inside the transaction for the record alone, before the pass leaves
+	 * it.
+	 * A drain (ft_mr_egress_drain()) takes the transaction too, so it only
+	 * ever sees a group that is either not yet being built or already
+	 * recorded -- and can rebuild it in place, rather than wait for a worker
+	 * that may itself be waiting on the drain's caller for RTNL. */
 	for (;;) {
 		struct ft_mr_group *target = NULL;
 		struct net_device *put_in = NULL;
 		struct cdx_mc_group *hw = NULL;
 		struct ft_mr_plan plan = {};
 		enum ft_mr_state state;
-		bool rekey = false, same = false, via, rebuild = false;
+		bool rekey = false, same = false, via, installed;
 		bool added = false, counted = false, deleted = false;
+		bool touched = false, recorded = false;
 		struct cdx_ft_counters last;
+		s64 changes = 0;
 		u8 retries = 0;
-		int rc = 0, gen = 0;
+		int rc = 0;
 
 		mutex_lock(&ft_mr_lock);
 		/* A group refused a key another gave up since is asked again,
@@ -9782,20 +10143,20 @@ static void ft_mr_work_fn(struct work_struct *work)
 		}
 		if (target) {
 			target->dirty = false;
-			rebuild = target->rebuild;
-			target->rebuild = false;
-			gen = atomic_read(&ft_mc_egress_gen);
+			target->busy = true;
 			retries = target->retries;
-			hw = target->hw;
-			target->hw = NULL;
 		}
 		mutex_unlock(&ft_mr_lock);
 		if (!target)
 			break;
 
-		/* Decide under RTNL with no learner mutex held: the walk reads
-		 * bridge and netdev state, including the kernel's current MDB
-		 * and router-port set. Nothing in it touches hardware. */
+		/* Decide under RTNL with no learner mutex held across the walk:
+		 * it reads bridge and netdev state, including the kernel's
+		 * current MDB and router-port set. Nothing in it touches
+		 * hardware, and nothing but this worker adds or deletes the
+		 * group's entry -- a drain only rebuilds it in place -- so
+		 * whether it has one is the same answer inside the transaction
+		 * below. */
 		rtnl_lock();
 		if (test_bit(ft_mr_idx(target->family), &ft_mr_resync_pending))
 			state = FT_MR_REFUSED_RESYNC;
@@ -9810,6 +10171,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 			ft_mr_watch_arm(target, &plan);
 		if (state == FT_MR_PENDING)
 			state = ft_mr_admit(target, &plan);
+		mutex_lock(&ft_mr_lock);
+		installed = !!target->hw;
 		/* cdx_mc_group_replace() refuses a spec whose ingress differs
 		 * from the installed one -- the port is part of the classifier
 		 * key -- so a parent VIF that moved is a delete and an add
@@ -9817,12 +10180,15 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * the unlock because the installed ingress is the other thing
 		 * ft_mr_device_gone() clears, and it holds RTNL to do it. */
 		via = state == FT_MR_PENDING && plan.via;
-		rekey = hw && (via || plan.spec.in != target->in ||
-			       plan.in_tags != target->in_tags ||
-			       memcmp(plan.spec.in_vlan, target->in_vlan,
-				      sizeof(target->in_vlan)));
-		same = hw && !via && !rebuild && state == FT_MR_PENDING &&
-		       ft_mr_plan_same(target, &plan);
+		rekey = installed && (via || plan.spec.in != target->in ||
+				      plan.in_tags != target->in_tags ||
+				      memcmp(plan.spec.in_vlan, target->in_vlan,
+					     sizeof(target->in_vlan)));
+		/* An unchanged plan still rebuilds a chain an egress change
+		 * marked: every entry in it names the queue it was built with. */
+		same = installed && !via && !target->egress_stale &&
+		       state == FT_MR_PENDING && ft_mr_plan_same(target, &plan);
+		mutex_unlock(&ft_mr_lock);
 		rtnl_unlock();
 
 		/* A new root needs its key to itself. Any other group of this
@@ -9830,18 +10196,31 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * source to the same group -- another VLAN of the port, which
 		 * the key does not name -- and the one root could validate only
 		 * one of the two tag stacks. A replace keeps its key. */
-		if (state == FT_MR_PENDING && !via && (!hw || rekey)) {
+		if (state == FT_MR_PENDING && !via && (!installed || rekey)) {
 			mutex_lock(&ft_mr_lock);
 			if (ft_mr_key_taken(target, &plan.spec))
 				state = FT_MR_REFUSED_CONTESTED;
 			mutex_unlock(&ft_mr_lock);
 		}
 
-		if (!same && (hw || (state == FT_MR_PENDING && !via))) {
+		if (!same && (installed || (state == FT_MR_PENDING && !via))) {
+			/* The hardware with the transaction alone, and ft_mr_lock
+			 * only to record: what must not see a group half built
+			 * takes the transaction first, and what takes only the
+			 * lock under RTNL -- the netdev events, the egress mark --
+			 * never waits behind a hardware call. What they change
+			 * meanwhile is the record's to see: a mark by the egress
+			 * count, a released set by the plan's own references,
+			 * which the record adopts. The group's entry is changed
+			 * only here, so it is read without the lock. */
 			cdx_ft_begin();
+			hw = target->hw;
+			/* Before anything is built: see ft_egress_changes. */
+			changes = atomic64_read_acquire(&ft_egress_changes);
+			touched = true;
 			/* What an entry counted since the last fold goes with it
-			 * unless it is read first; it is folded once the group
-			 * is under its lock again. */
+			 * unless it is read first; it is folded as the outcome is
+			 * recorded, against the set it was installed with. */
 			if (hw && (rekey || state != FT_MR_PENDING)) {
 				counted = cdx_mc_group_stats(hw, &last);
 				cdx_mc_group_del(&hw);
@@ -9873,12 +10252,31 @@ static void ft_mr_work_fn(struct work_struct *work)
 					}
 				}
 			}
-			cdx_ft_end();
 			if (rc)
 				ft_mr_install_errors++;
+			mutex_lock(&ft_mr_lock);
+			if (!via) {
+				state = ft_mr_record(target, hw, state, rc, &plan,
+						     touched, changes,
+						     counted ? &last : NULL,
+						     deleted, added, &put_in);
+				recorded = true;
+			} else {
+				/* Routed through a bridge from here on: its own
+				 * entry is gone, and recorded gone before the
+				 * transaction is let go. The rest is recorded
+				 * once the copies are published below. */
+				target->hw = NULL;
+				if (deleted) {
+					put_in = target->hw_in;
+					target->hw_in = NULL;
+				}
+				if (counted)
+					ft_mr_fold(target, &last, target->in_tags);
+			}
+			mutex_unlock(&ft_mr_lock);
+			cdx_ft_end();
 		}
-		if (state == FT_MR_PENDING && !via && !rc && hw)
-			state = FT_MR_INSTALLED;
 
 		/* Routed through a bridge: the copies are the bridged group's to
 		 * carry, and whether it does is this group's state. Anything
@@ -9895,78 +10293,13 @@ static void ft_mr_work_fn(struct work_struct *work)
 			ft_mc_route_withdraw(target->route);
 		}
 
-		mutex_lock(&ft_mr_lock);
-		target->hw = hw;
-		/* The entry's own hold on its ingress: let go with the entry
-		 * just deleted, taken for the one just added. */
-		if (deleted) {
-			put_in = target->hw_in;
-			target->hw_in = NULL;
+		if (!recorded) {
+			mutex_lock(&ft_mr_lock);
+			state = ft_mr_record(target, target->hw, state, rc, &plan,
+					     touched, changes, NULL, false, false,
+					     &put_in);
+			mutex_unlock(&ft_mr_lock);
 		}
-		if (added) {
-			dev_hold(plan.spec.in);
-			target->hw_in = plan.spec.in;
-		}
-		/* The entry just deleted, folded against the baseline it was
-		 * counted from and with the framing it was installed with --
-		 * both still the old set's until the plan is adopted below. */
-		if (counted)
-			ft_mr_fold(target, &last, target->in_tags);
-		/* A group made in this pass counts from zero, whatever the last
-		 * one had reached. Here, not by comparing handles: the one a
-		 * delete frees is the next add's allocation often enough. So
-		 * does a route this group has just begun riding: it was zeroed
-		 * when it was published. */
-		if (added || (plan.via && !target->via)) {
-			target->folded_packets = target->folded_bytes = 0;
-			target->fold_suspect = false;
-		}
-		if (state == FT_MR_INSTALLED || state == FT_MR_BRIDGED) {
-			/* Adopt the plan whole, references included: the
-			 * backend borrows exactly these pointers, so a group
-			 * owning some of them would name one it did not. */
-			ft_mr_release_set(target);
-			target->in = plan.spec.in;
-			target->in_tags = plan.in_tags;
-			memcpy(target->in_vlan, plan.spec.in_vlan,
-			       sizeof(target->in_vlan));
-			target->via = plan.via;
-			target->via_vid = plan.via_vid;
-			target->via_tagged = plan.via_tagged;
-			target->mtu = plan.mtu;
-			target->listeners = plan.spec.listeners;
-			memcpy(target->listener, plan.spec.listener,
-			       sizeof(target->listener));
-			strscpy(target->oifs, plan.oifs, sizeof(target->oifs));
-			memset(&plan, 0, sizeof(plan));
-			target->retries = 0;
-		} else {
-			/* A failed update was withdrawn above: an incomplete old
-			 * listener set cannot stand in for the requested one. */
-			if (!hw)
-				ft_mr_release_set(target);
-			/* Named in /proc beside the ones still unseen. */
-			if (state == FT_MR_UNCONFIRMED)
-				strscpy(target->oifs, plan.oifs,
-					sizeof(target->oifs));
-			/* Tried again at the next refresh, which asks every
-			 * group below the ceiling again, not now: a port that
-			 * lost carrier, or room another entry is about to give
-			 * back, needs time rather than repetition. */
-			if (rc && ++target->retries >= FT_MR_MAX_RETRIES)
-				state = FT_MR_REFUSED_FAILED;
-		}
-		/* A port's queues changed while this chain was being built from
-		 * the old ones, and the group was not yet on the list to be told.
-		 * Build it again. */
-		if (hw && atomic_read(&ft_mc_egress_gen) != gen) {
-			target->rebuild = true;
-			target->dirty = true;
-		}
-		if (ft_mr_refusal(state) && !ft_mr_refusal(target->state))
-			ft_mr_refused++;
-		target->state = state;
-		mutex_unlock(&ft_mr_lock);
 
 		/* Outside every lock this worker holds, because it takes
 		 * RTNL. */
@@ -10170,17 +10503,20 @@ static void ft_mr_rows(struct seq_file *seq)
  * group to software, as any failed replace does.
  *
  * Both learners' groups are marked and handed to their workers, which do the
- * hardware. Nothing here needs RTNL or sleeps under a spinlock: it takes each
- * learner's mutex in turn and never both, which a caller holding RTNL may do
- * -- it is the order the notifiers take them in -- and one holding nothing may
- * too. A group whose chain is being built while this runs is not always on its
- * learner's list to be marked, so the generation it was built under is
- * compared once it is recorded, and it is built again if the queues moved. */
-void ft_mc_egress_changed(const struct net_device *dev)
+ * hardware; a caller that has to know the rebuilds happened -- the DSCP map
+ * leaving the port -- asks the drains, which rebuild in place what is still
+ * marked (ft_mc_egress_drain(), ft_mr_egress_drain()). Nothing here needs
+ * RTNL or sleeps under a spinlock: it takes each learner's mutex in turn and
+ * never both, which a caller holding RTNL may do -- it is the order the
+ * notifiers take them in -- and one holding nothing may too. A group whose
+ * chain is being built while this runs is not always on its learner's list to
+ * be marked, so ft_egress_changed() counts the change before calling this, and
+ * each worker compares the count across its build when it records it, and
+ * marks the chain again if it moved. */
+static void ft_mc_egress_changed(const struct net_device *dev)
 {
 	unsigned int rebuilt;
 
-	atomic_inc(&ft_mc_egress_gen);
 	rebuilt = ft_mc_egress_mark(dev);
 	rebuilt += ft_mr_egress_mark(dev);
 	atomic64_add(rebuilt, &ft_mc_egress_rebuilds);
@@ -10861,7 +11197,7 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	cdx_ft_begin();
 	/* Before the build reads the port's egress, which an egress change
 	 * updates before counting itself. */
-	changes = atomic64_read_acquire(&ft_ipsec_egress_changes);
+	changes = atomic64_read_acquire(&ft_egress_changes);
 	rc = cdx_ipsec_sa_add(&spec, x, &sa);
 	if (!rc && watch) {
 		ft_ipsec_route_of(x, &route);
@@ -11891,8 +12227,9 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mc_count, ft_mc_flow_count, ft_mc_installed, ft_mc_refused,
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
-	/* Installed groups of either learner rebuilt because a port they copy
-	 * out of changed its egress queues; see ft_mc_egress_changed(). */
+	/* Installed groups of either learner marked for a rebuild because a
+	 * port they copy out of changed its egress -- its queues or its DSCP
+	 * map; see ft_mc_egress_changed(). */
 	seq_printf(seq, "mcast_egress_rebuilds %lld\n",
 		   atomic64_read(&ft_mc_egress_rebuilds));
 	/* The routed learner's own totals. mroute_policy_rules is the one an

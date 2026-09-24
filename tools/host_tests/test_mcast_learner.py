@@ -84,6 +84,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_host_wants",
             "ft_mc_installable",
             "ft_mc_flow_spec",
+            "ft_mc_spec_registered",
             "ft_mc_flow_named",
             "ft_mc_retire",
             "ft_mc_route_feedback",
@@ -115,7 +116,12 @@ def test_mcast_learner(tmp_path):
             "ft_mc_device_gone",
             "ft_mc_bridge_changed",
             "ft_mc_port_moved",
+            "ft_mc_flow_hw_lists",
             "ft_mc_egress_mark",
+            "ft_mc_egress_drain",
+            # The worker itself, which builds, records inside its
+            # transaction, and meets the drain there.
+            "ft_mc_work_fn",
             "ft_mc_state",
             "ft_mc_member_src",
             "ft_mc_group_has_flow",
@@ -450,7 +456,7 @@ def test_an_idle_entry_ages_on_the_bridges_clock():
     counted = function(source, "ft_mc_flow_counted")
     assert "time_after(now, f->active + f->age)" in counted and "f->gone = true;" in counted
     worker = function(source, "ft_mc_work_fn")
-    added = worker[worker.index("if (spec.listeners && !rc && !replace) {"):]
+    added = worker[worker.index("if (added) {"):]
     assert "target->active = jiffies;" in added[:added.index("}")]
     patch = (ROOT / "patches/kernel/161-bridge-multicast-egress-snapshot.patch").read_text()
     assert "+EXPORT_SYMBOL_GPL(br_multicast_membership_interval);" in patch
@@ -547,13 +553,38 @@ def test_a_failed_chain_swap_takes_the_flow_out_of_hardware():
     swap = swap[:swap.index("} else {")]
     for step in ("cdx_mc_group_del(&hw);", "ft_mc_installed--;", "withdrew = true;"):
         assert step in swap, step
-    # /proc and the refresh read the entry under the transaction and then
-    # ft_mc_lock: it leaves the group under that lock before it is freed, or
-    # the first of them to get the transaction reads freed memory.
-    unhooked = swap.index("target->hw = NULL;")
-    assert swap.index("mutex_lock(&ft_mc_lock);") < unhooked < \
-        swap.index("mutex_unlock(&ft_mc_lock);") < swap.index("cdx_mc_group_del(&hw);")
+    # /proc, the refresh and the egress drain read the entry under the
+    # transaction: the hardware call and the record of what it did are made
+    # in one transaction hold, so none of them can find the entry freed, or
+    # built and not yet recorded. ft_mc_lock is taken for the record alone.
+    build = worker[worker.index("Install or update whatever is now installable"):]
+    build = build[build.index("cdx_ft_begin();"):]
+    build = build[:build.index("cdx_ft_end();")]
+    assert build.index("hw = target->hw;") < \
+        build.index("rc = cdx_mc_group_replace(hw, &spec);") < \
+        build.index("mutex_lock(&ft_mc_lock);") < build.index("target->hw = hw;") < \
+        build.index("mutex_unlock(&ft_mc_lock);")
     assert "if (!hw)\n\t\t\ttarget->carried_route = NULL;" in worker
+
+
+def test_no_worker_holds_its_learner_lock_across_the_hardware():
+    """The MDB handler, the netdev events and the egress mark take the
+    learners' locks holding RTNL. A worker that held one across a backend call
+    -- which allocates entries and waits on the PCD -- would stall them, and
+    every RTNL user behind them, for a whole build. The transaction is what
+    keeps a half-built entry from being seen; the learner lock is only for
+    the records."""
+    from test_mroute_learner import _assert_not_inside, _held_regions
+    source = SOURCE.read_text()
+    for worker, lock in (("ft_mc_work_fn", "ft_mc_lock"), ("ft_mr_work_fn", "ft_mr_lock")):
+        # The code, not what its comments mention.
+        body = re.sub(r"/\*.*?\*/", "", function(source, worker), flags=re.S)
+        regions = _held_regions(body, f"mutex_lock(&{lock})", f"mutex_unlock(&{lock})")
+        for call in ("cdx_mc_group_add(", "cdx_mc_group_replace(", "cdx_mc_group_del("):
+            assert call in body, (worker, call)
+        for call in ("cdx_mc_group_add(", "cdx_mc_group_replace(", "cdx_mc_group_del(",
+                     "cdx_mc_group_stats("):
+            _assert_not_inside(body, regions, call, f"{worker} holds {lock} across {call}")
 
 
 def test_the_dedup_slots_are_forgotten_whenever_an_answer_may_change():
@@ -579,9 +610,12 @@ def test_the_dedup_slots_are_forgotten_whenever_an_answer_may_change():
     # An entry taken out of hardware and kept -- only one that was in it --
     # or replaced by the shape waiting to take over.
     withdraw = worker[worker.index("if (!spec.listeners) {"):]
-    withdraw = withdraw[:withdraw.index("} else if (replace)")]
+    withdraw = withdraw[:withdraw.index("} else if (hw) {")]
     assert withdraw.index("if (hw) {") < withdraw.index("withdrew = true;")
-    assert "if (withdrew || stale)\n\t\t\tft_mc_forget_seen();" in worker
+    assert "if (withdrew || swapped)\n\t\t\tft_mc_forget_seen();" in worker
+    # The shape taking over: its old entry is gone once deleted, so the
+    # swap is remembered by a flag of its own rather than by the pointer.
+    assert "swapped = true;" in worker
     # The retry goes through the helper, which asserts the group lock.
     assert "memset(ft_mc_last" not in worker
     assert "lockdep_assert_held(&ft_mc_lock)" in function(source, "ft_mc_forget_seen")
@@ -648,18 +682,22 @@ def test_a_changed_egress_rebuilds_every_group_copying_out_of_the_port():
     map changing -- leaves them enqueuing where nothing dequeues, so every
     installed group of either learner with a copy on the port is rebuilt.
 
-    The caller may or may not hold RTNL and runs in process context, so the
-    hook takes each learner's mutex in turn and never both, and nothing that
-    needs RTNL or the transaction. A group being built while it runs may not
-    be on its learner's list to mark; the generation, bumped before marking,
-    is what both workers compare once they record a build.
+    The adapter's egress hook counts the change and then marks: each learner's
+    mutex in turn and never both, and nothing that needs RTNL or the
+    transaction. A group being built while it runs may not be on its learner's
+    list to mark; the count, taken before marking, is what both workers
+    compare once they record a build, inside the transaction. The DSCP map
+    may not leave the port before every marked group is rebuilt, and the
+    caller holds RTNL, which both workers take: so each learner's drain
+    rebuilds in place, from the chain recorded with the entry.
     """
     source = SOURCE.read_text()
-    assert "void ft_mc_egress_changed(const struct net_device *dev);" in source, (
-        "the entry point is declared with the adapter's other multicast ones")
+    assert "static void ft_mc_egress_changed(const struct net_device *dev);" in source
+    hook = function(source, "ft_egress_changed")
+    assert hook.index("atomic64_inc_return(&ft_egress_changes);") < \
+        hook.index("ft_mc_egress_changed(dev);")
     body = function(source, "ft_mc_egress_changed")
-    assert body.index("atomic_inc(&ft_mc_egress_gen)") < body.index("ft_mc_egress_mark(dev)")
-    assert "ft_mr_egress_mark(dev)" in body
+    assert body.index("ft_mc_egress_mark(dev)") < body.index("ft_mr_egress_mark(dev)")
     assert "atomic64_add(rebuilt, &ft_mc_egress_rebuilds)" in body
     for forbidden in ("rtnl_lock", "ASSERT_RTNL", "cdx_ft_begin", "spin_lock",
                       "mutex_lock"):
@@ -671,9 +709,27 @@ def test_a_changed_egress_rebuilds_every_group_copying_out_of_the_port():
             f"{name} takes its own learner's lock and never the other's")
         for forbidden in ("rtnl", "cdx_ft_begin", "spin_lock"):
             assert forbidden not in mark
-    # A rebuild is not skipped as an unchanged plan.
-    assert "!rebuild" in function(source, "ft_mr_work_fn")
+        # Marked stale until a rebuild after the change, not merely picked.
+        assert "->egress_stale = true;" in mark
+    # The bridged mark asks the chain that was built, routed copies riding
+    # it included, rather than what the bridge now says.
+    assert "ft_mc_flow_hw_lists(f, dev)" in function(source, "ft_mc_egress_mark")
+    # A marked chain is not skipped as an unchanged plan.
+    assert "!target->egress_stale" in function(source, "ft_mr_work_fn")
+    # Both workers compare the count across a build, inside the transaction.
+    assert "atomic64_read(&ft_egress_changes) != changes" in function(source, "ft_mc_work_fn")
+    assert "atomic64_read(&ft_egress_changes) != changes" in function(source, "ft_mr_record")
     for worker in ("ft_mc_work_fn", "ft_mr_work_fn"):
-        assert "atomic_read(&ft_mc_egress_gen) != gen" in function(source, worker), (
-            f"{worker} must rebuild a chain the queues moved under")
+        assert "changes = atomic64_read_acquire(&ft_egress_changes);" in \
+            function(source, worker)
+    # The drains: under the caller's RTNL, so they wait for no worker and
+    # take no RTNL; transaction then learner lock; the recorded chain.
+    for name, lock, recorded in (("ft_mc_egress_drain", "ft_mc_lock", "&f->hw_spec"),
+                                 ("ft_mr_egress_drain", "ft_mr_lock", "&g->hw_spec")):
+        drain = function(source, name)
+        for forbidden in ("rtnl_lock", "flush_work", "ft_mc_flow_spec(",
+                          "ft_mr_derive("):
+            assert forbidden not in drain, (name, forbidden)
+        assert drain.index("cdx_ft_begin();") < drain.index(f"mutex_lock(&{lock});")
+        assert f"cdx_mc_group_replace(" in drain and recorded in drain, name
     assert "mcast_egress_rebuilds" in function(source, "ft_show")

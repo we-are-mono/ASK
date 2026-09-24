@@ -625,12 +625,17 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
 EGRESS_RATE, EGRESS_CEIL = '1gbit', '2gbit'
 
 
-async def _ceetm_dequeued(r, dev):
-    """What every leaf of the port's offloaded HTB tree has sent. tc never
-    sees an accelerated frame, so the CEETM counters are the only witness."""
+async def _ceetm_unclassified_dequeued(r, dev):
+    """What the queue the port's offloaded HTB tree gives traffic naming no
+    class has sent: a replica carries no class, so that is where it leaves --
+    the default leaf, or the top channel's class queue 0 when there is none.
+    ethtool reports that queue as [default] whether or not a leaf holds it.
+    tc never sees an accelerated frame, so the CEETM counters are the only
+    witness."""
     text = (await command(r.target, r.session, 'ethtool', '-S', dev))['stdout']
-    return sum(int(value) for value in re.findall(
-        r'^\s*ceetm dequeued frames \[leaf \d+\]:\s*(\d+)', text, re.M))
+    found = re.findall(r'^\s*ceetm dequeued frames \[default\]:\s*(\d+)', text, re.M)
+    assert len(found) == 1, text
+    return int(found[0])
 
 
 async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicast_bridge_service):
@@ -639,12 +644,13 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
     listener entry names the queue the port had when it was built -- which
     nothing dequeues any more. The group is rebuilt in place: the replicas
     keep arriving whole, the classifier keeps carrying them, and they leave by
-    the tree, counted on its leaves. Taking the tree away rebuilds it again.
+    the tree, on the queue it gives traffic naming no class. Taking the tree
+    away rebuilds it again.
 
-    It depends on the adapter's egress hook being wired: the rebuild, and the
-    `mcast_egress_rebuilds` count the waits below read, come from
-    ft_mc_egress_changed(), and nothing in CDX calls it yet when an HTB tree
-    moves a port's queues. Until something does, those waits time out."""
+    Each HTB command reaches the adapter's egress hook, which counts the
+    change and marks every installed flow whose recorded chain copies out of
+    the port (`mcast_egress_rebuilds`, which the waits below read); the
+    bridged learner's worker then replaces the chain under the same key."""
     r = multicast_bridge_service
     group = '239.9.5.5' if r.multicast_family == 4 else 'ff1e::9:5:5'
     source = LAN_SOURCE[r.multicast_family]
@@ -693,15 +699,13 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
             await tc('class', 'add', 'dev', TARGET_WAN_IF, 'parent', '1:10',
                      'classid', '1:100', 'htb', 'rate', EGRESS_RATE,
                      'ceil', EGRESS_CEIL, 'prio', '0')
-            # Needs ft_mc_egress_changed() called on the tree's change; see
-            # the docstring.
             state = await r.wait(lambda s: s['mcast_egress_rebuilds'] > rebuilds,
                                  timeout=15)
             await _bridged_row(r, group, lambda g: g['state'] == 'installed')
-            dequeued = await _ceetm_dequeued(r, TARGET_WAN_IF)
+            dequeued = await _ceetm_unclassified_dequeued(r, TARGET_WAN_IF)
             await window('multicast-egress-htb')
-            assert await _ceetm_dequeued(r, TARGET_WAN_IF) - dequeued >= FRAMING_COUNT, \
-                'the replicas did not leave by the offloaded tree'
+            assert await _ceetm_unclassified_dequeued(r, TARGET_WAN_IF) - dequeued \
+                >= FRAMING_COUNT, 'the replicas did not leave by the offloaded tree'
 
             rebuilds = state['mcast_egress_rebuilds']
             await tc('qdisc', 'del', 'dev', TARGET_WAN_IF, 'root')

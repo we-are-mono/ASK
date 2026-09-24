@@ -597,9 +597,12 @@ static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
 	if (sa_add_error)
 		return sa_add_error;
 	/* The port's egress changing after the build read it and before the
-	 * install publishes its watch. */
-	if (egress_change_during_add)
+	 * install publishes its watch: counted, then walked, as
+	 * ft_egress_changed() does. */
+	if (egress_change_during_add) {
+		atomic64_inc_return(&ft_egress_changes);
 		ft_ipsec_egress_changed(egress_change_during_add);
+	}
 	assert(sa_installed < sizeof(sa_pool) / sizeof(sa_pool[0]));
 	sa = &sa_pool[sa_installed];
 	sa->handle = (u16)(sa_installed + 1);

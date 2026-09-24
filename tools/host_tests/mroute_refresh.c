@@ -10,6 +10,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int64_t s64;
 #define AF_INET 2
 #define AF_INET6 10
 #define MAXVIFS 32
@@ -59,7 +60,9 @@ struct cdx_ft_vlan { u16 proto, id; };
  * the generated include, so a field added there is one the worker here has. */
 #include "mroute_backend.inc"
 /* `in` is the ingress the backend borrows and deletes through. */
-struct cdx_mc_group { bool live; unsigned copies; struct net_device *in; };
+/* `built_at' is the egress count the last chain was built against: a chain
+ * built before the latest change still names the queues from before it. */
+struct cdx_mc_group { bool live; unsigned copies; struct net_device *in; s64 built_at; };
 #define WARN_ON_ONCE(x) assert(!(x))
 struct cdx_ft_counters { u64 packets, bytes; };
 struct work_struct { bool queued; };
@@ -195,13 +198,71 @@ static unsigned planned_oifs = 1;
 static int planned_parent = PARENT_A;
 static bool out_bridged, commit_in_derive;
 static void mutex_lock(int *m) { assert(!*m); *m = 1; }
+#define lockdep_assert_held(m) assert(*(m))
 static void mutex_unlock(int *m) { assert(*m); *m = 0; }
 #define spin_lock_bh mutex_lock
 #define spin_unlock_bh mutex_unlock
-static void rtnl_lock(void) { assert(!rtnl && !ctrl && !ft_mr_lock); rtnl = 1; }
-static void rtnl_unlock(void) { assert(rtnl); rtnl = 0; }
-static void cdx_ft_begin(void) { assert(!rtnl && !ctrl && !ft_mr_lock); ctrl = 1; }
+/* The learner never takes the transaction under RTNL. A DSCP filter's drain
+ * does, holding the RTNL tc took for it, which is the order the flowtable's
+ * bind path already uses; `caller_rtnl' marks that one. */
+static bool caller_rtnl;
+static void egress_change(struct net_device *dev);
+static int ft_mr_egress_drain(const struct net_device *dev);
+/* A tc command holding RTNL while the worker waits for it: its egress change
+ * and its drain run before the worker gets the lock, with the group the
+ * worker has picked in whatever state picking left it. */
+static struct net_device *drain_while_waiting;
+static int drain_rc;
+static void rtnl_lock(void)
+{
+    assert(!rtnl && !ctrl && !ft_mr_lock);
+    if (drain_while_waiting) {
+        struct net_device *dev = drain_while_waiting;
+
+        drain_while_waiting = NULL;
+        rtnl = 1;
+        caller_rtnl = true;
+        egress_change(dev);
+        drain_rc = ft_mr_egress_drain(dev);
+        caller_rtnl = false;
+        rtnl = 0;
+    }
+    rtnl = 1;
+}
+/* A tc command that gets RTNL the moment the worker lets go of it, having
+ * decided: its egress change lands after the decision and before the outcome
+ * is recorded. */
+static struct net_device *change_after_decision;
+static void rtnl_unlock(void)
+{
+    assert(rtnl);
+    rtnl = 0;
+    if (change_after_decision && !caller_rtnl) {
+        struct net_device *dev = change_after_decision;
+
+        change_after_decision = NULL;
+        rtnl = 1;
+        caller_rtnl = true;
+        egress_change(dev);
+        caller_rtnl = false;
+        rtnl = 0;
+    }
+}
+static void cdx_ft_begin(void) { assert((!rtnl || caller_rtnl) && !ctrl && !ft_mr_lock); ctrl = 1; }
 static void cdx_ft_end(void) { assert(ctrl); ctrl = 0; }
+/* Egress changes, counted by ft_egress_changed() before any learner walks
+ * its groups, and this learner's half of the walk. */
+static s64 ft_egress_changes;
+static s64 atomic64_read(const s64 *v) { return *v; }
+static s64 atomic64_read_acquire(const s64 *v) { return *v; }
+static unsigned int ft_mr_egress_mark(const struct net_device *dev);
+static void egress_change(struct net_device *dev)
+{
+    ft_egress_changes++;
+    ft_mr_egress_mark(dev);
+}
+/* A change landing while the worker is deciding or programming a group. */
+static struct net_device *change_during_derive, *change_during_program;
 static void dev_hold(struct net_device *d) { d->refs++; }
 static void dev_put(struct net_device *d) { assert(d->refs); d->refs--; }
 static void mr_cache_put(struct mr_mfc *c) { assert(c->refs); c->refs--; }
@@ -275,20 +336,27 @@ static bool ft_mc_route_state(struct ft_mc_route *r, struct cdx_ft_counters *sta
     return r->carried;
 }
 static void ft_mr_publish_taps(void) { bridged_side(); taps_published++; }
-/* The generation ft_mc_egress_changed() bumps before it marks anything; the
- * add below can bump it mid-build, which is the race it exists for. */
-typedef struct { int counter; } atomic_t;
-static atomic_t ft_mc_egress_gen;
-static int atomic_read(const atomic_t *a) { return a->counter; }
+/* The add below can move the egress count mid-build, which is the race the
+ * count exists for. */
 static bool queues_move_during_add;
 static bool ft_mr_apply(struct ft_mr_event *e) { abort(); }
 static void ft_mr_lost_event(u8 family) { abort(); }
 static void ft_mr_event_free(struct ft_mr_event *e) { abort(); }
 static void ft_mr_resync(void) { abort(); }
+/* The stream arrives tagged on its port: a spec the root validates the tag
+ * of, which a rebuild has to carry as well. */
+static bool tagged_ingress;
 static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p)
 {
     assert(rtnl);
     derives++;
+    if (change_during_derive) {
+        /* Under RTNL, as the tc caller is: the group is the worker's, and
+         * still holds what it installed. */
+        assert(g->busy);
+        egress_change(change_during_derive);
+        change_during_derive = NULL;
+    }
     if (refuse) return FT_MR_REFUSED_LISTENER;
     /* The oif walk, which a refusal above never reached. */
     for (unsigned i = 0; i < planned_oifs; i++)
@@ -309,6 +377,12 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
     } else {
         p->spec.in = &input;
         dev_hold(&input);
+        if (tagged_ingress) {
+            p->spec.in_vlan[0].proto = 0x0081;
+            p->spec.in_vlan[0].id = 100;
+            p->spec.in_vlans = 1;
+            p->in_tags = 1;
+        }
     }
     p->spec.listeners = wanted;
     for (unsigned i = 0; i < wanted; i++) {
@@ -318,32 +392,53 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
     }
     return FT_MR_PENDING;
 }
+/* The worker programs the hardware with the transaction alone: the netdev
+ * events and the egress mark, which take ft_mr_lock under RTNL, must never
+ * wait behind a hardware call. Only the drain, under its tc command's RTNL,
+ * replaces holding it. */
 static int cdx_mc_group_add(const struct cdx_mc_group_spec *s, struct cdx_mc_group **hw)
 {
-    assert(ctrl && !hardware.live && s->in);
+    assert(ctrl && !ft_mr_lock && !hardware.live && s->in);
     adds++;
     if (fail_add) return -ENOMEM;
     if (queues_move_during_add) {
         queues_move_during_add = false;
-        ft_mc_egress_gen.counter++;
+        ft_egress_changes++;
     }
     hardware.live = true;
     hardware.copies = s->listeners;
     hardware.in = s->in;
+    hardware.built_at = ft_egress_changes;
     *hw = &hardware;
     return 0;
 }
+/* What the last replace was asked to build, for a case to read. */
+static struct cdx_mc_group_spec replaced_with;
 static int cdx_mc_group_replace(struct cdx_mc_group *hw, const struct cdx_mc_group_spec *s)
 {
-    assert(ctrl && hw->live);
+    assert(ctrl && hw->live && s->in == hw->in);
+    assert(!ft_mr_lock == !caller_rtnl);
     replaces++;
+    replaced_with = *s;
     if (fail_replace) return -ENOMEM;  /* backend keeps the previous chain */
     hw->copies = s->listeners;
+    hw->built_at = ft_egress_changes;
+    if (change_during_program) {
+        /* After the chain read the port, so this chain is from before the
+         * change. The change is counted and marks the group now, not once
+         * the worker has recorded: the worker holds no learner lock while
+         * it programs. */
+        struct net_device *dev = change_during_program;
+
+        change_during_program = NULL;
+        egress_change(dev);
+        assert(hw->built_at < ft_egress_changes);
+    }
     return 0;
 }
 static void cdx_mc_group_del(struct cdx_mc_group **hw)
 {
-    assert(ctrl && *hw && (*hw)->live);
+    assert(ctrl && !ft_mr_lock && *hw && (*hw)->live);
     /* The delete unsubscribes the port's address through the ingress, so
      * somebody must still hold it. */
     assert((*hw)->in && (*hw)->in->refs);
@@ -639,16 +734,18 @@ int main(void)
     /* A port the group copies out of changes its egress queues. The plan is
      * the same, which the worker would skip; the chain names the old queues,
      * so it is replaced all the same, and only for a group copying out of
-     * that port. */
+     * that port. The mark stays until a rebuild after the change has
+     * happened, for a drain to read. */
     {
         unsigned replaced = replaces;
 
-        assert(ft_mr_egress_mark(&input) == 0 && !g->rebuild);
+        assert(ft_mr_egress_mark(&input) == 0 && !g->egress_stale);
         assert(ft_mr_egress_mark(&output[0]) == 1);
-        assert(g->rebuild && g->dirty && ft_mr_work.queued);
+        assert(g->egress_stale && g->dirty && ft_mr_work.queued);
         assert(!ft_mr_lock);
         run();
-        assert(replaces == replaced + 1 && hardware.live && !g->rebuild);
+        assert(replaces == replaced + 1 && hardware.live && !g->egress_stale);
+        assert(hardware.built_at == ft_egress_changes);
         assert(g->state == FT_MR_INSTALLED && g->offloaded);
         /* And nothing more on the next pass: the plan is the same again. */
         ft_mr_recheck = true;
@@ -657,9 +754,8 @@ int main(void)
     }
 
     /* The queues move while a chain is being built from the old ones, and
-     * the group, taken off its hardware for the build, was not there to be
-     * marked. The generation it was built under says so, and it is built
-     * again in the same pass. */
+     * the group, having no entry yet, was not there to be marked. The count
+     * it was built under says so, and it is built again in the same pass. */
     {
         unsigned added = adds, replaced = replaces;
 
@@ -672,7 +768,156 @@ int main(void)
         ft_mr_recheck = true;
         run();
         assert(adds == added + 1 && replaces == replaced + 1);
-        assert(hardware.live && !g->rebuild && !g->dirty);
+        assert(hardware.live && !g->egress_stale && !g->dirty);
+        assert(hardware.built_at == ft_egress_changes);
+    }
+
+    /* A DSCP filter's drain cannot wait for the worker: the worker takes
+     * RTNL, which the filter's caller holds. It rebuilds the installed chain
+     * itself, from the spec recorded with it, without deriving anything, and
+     * the worker then finds the group current. */
+    {
+        unsigned r0 = replaces, d0 = derives;
+
+        rtnl_lock();
+        caller_rtnl = true;
+        egress_change(&output[0]);
+        assert(!ft_mr_egress_drain(&output[0]));
+        assert(replaces == r0 + 1 && !g->egress_stale && derives == d0);
+        assert(hardware.built_at == ft_egress_changes && hardware.copies == 1);
+        assert(replaced_with.in == &input && replaced_with.listeners == 1 &&
+               replaced_with.listener[0].dev == &output[0]);
+        caller_rtnl = false;
+        rtnl_unlock();
+        run();
+        assert(replaces == r0 + 1 && derives == d0 + 1);
+
+        /* A rebuild that fails in the drain hands the group to the worker
+         * and holds the drain -- once: the worker's own failed replace
+         * withdraws the group, so the next drain finds nothing reading the
+         * old queues, whatever the refresh's retry pacing. Another port's
+         * drain is not held by it. */
+        rtnl_lock();
+        caller_rtnl = true;
+        egress_change(&output[0]);
+        fail_replace = true;
+        assert(ft_mr_egress_drain(&output[0]) == -EAGAIN);
+        assert(g->egress_stale && g->dirty && ft_mr_work.queued);
+        assert(!ft_mr_egress_drain(&output[1]));
+        caller_rtnl = false;
+        rtnl_unlock();
+        run();
+        assert(!hardware.live && !g->hw && !g->egress_stale);
+        rtnl_lock();
+        caller_rtnl = true;
+        assert(!ft_mr_egress_drain(&output[0]));
+        caller_rtnl = false;
+        rtnl_unlock();
+        fail_replace = false;
+        g->retries = 0;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && g->hw && g->state == FT_MR_INSTALLED);
+    }
+
+    /* The drain's common case: the refresh keeps the worker busy, and a
+     * worker that has picked a group waits for the RTNL the tc caller holds.
+     * The group is still what it installed until the worker's own pass, so
+     * the drain rebuilds it in place rather than report it held -- and a
+     * drain for a port the group does not list is not held by it at all.
+     * The worker then finds the chain current and builds nothing. */
+    {
+        unsigned r2 = replaces, d2 = derives;
+
+        g->dirty = true;
+        drain_rc = 1;
+        drain_while_waiting = &output[1];
+        run();
+        assert(!drain_rc && replaces == r2 && derives == d2 + 1);
+        g->dirty = true;
+        drain_rc = 1;
+        drain_while_waiting = &output[0];
+        run();
+        assert(!drain_rc && replaces == r2 + 1 && derives == d2 + 2);
+        assert(!g->egress_stale && !g->busy && hardware.built_at == ft_egress_changes);
+        assert(hardware.live && input.refs == 2 && output[0].refs == 1);
+    }
+
+    /* A change landing while the worker decides marks a group the worker
+     * holds, and the decision sees the mark: the unchanged plan is rebuilt
+     * in the same pass. */
+    {
+        unsigned r1 = replaces;
+
+        g->dirty = true;
+        change_during_derive = &output[0];
+        run();
+        assert(replaces == r1 + 1 && !g->egress_stale);
+        assert(hardware.built_at == ft_egress_changes);
+        /* One landing after the worker has decided, the plan unchanged and
+         * nothing to build, marks a group the worker still holds, which the
+         * mark leaves to it: recording nothing built, the worker sees the
+         * mark and goes round again rather than leave the old chain. */
+        g->dirty = true;
+        change_after_decision = &output[0];
+        run();
+        assert(!change_after_decision && replaces == r1 + 2);
+        assert(!g->egress_stale && !g->dirty && !g->busy);
+        assert(hardware.built_at == ft_egress_changes);
+        /* And one landing after the chain read the port moves the count
+         * under the build, so the worker builds again. */
+        r1 = replaces;
+        egress_change(&output[0]);
+        change_during_program = &output[0];
+        run();
+        assert(replaces == r1 + 2 && !g->egress_stale);
+        assert(hardware.built_at == ft_egress_changes);
+    }
+
+    /* IPTV on a VLAN: the stream arrives tagged, and the root validates the
+     * tag. The drain replaces the chain with the spec it was built from,
+     * tag included -- one made up from the group's addresses would carry
+     * no tag, which the backend refuses as another key, so the drain
+     * would hold the map for good. */
+    {
+        unsigned r3 = replaces;
+
+        tagged_ingress = true;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && g->in_tags == 1 && g->hw_spec.in_vlans == 1);
+        r3 = replaces;
+        rtnl_lock();
+        caller_rtnl = true;
+        egress_change(&output[0]);
+        assert(!ft_mr_egress_drain(&output[0]) && replaces == r3 + 1);
+        assert(replaced_with.in_vlans == 1 && replaced_with.in_vlan[0].id == 100);
+        caller_rtnl = false;
+        rtnl_unlock();
+        tagged_ingress = false;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && !g->in_tags && !g->hw_spec.in_vlans);
+    }
+
+    /* A device the installed set names going away releases the set, and
+     * the recorded spec with it: nothing may replay a spec naming a device
+     * that is going. Until the worker has rebuilt the group, a drain cannot
+     * vouch for it. */
+    {
+        rtnl_lock();
+        ft_mr_device_gone(&output[0]);
+        rtnl_unlock();
+        assert(!g->listeners && !g->hw_spec.listeners && g->hw && g->dirty);
+        assert(ft_mr_egress_mark(&output[1]) == 1 && g->egress_stale);
+        rtnl_lock();
+        caller_rtnl = true;
+        assert(ft_mr_egress_drain(&output[1]) == -EAGAIN);
+        caller_rtnl = false;
+        rtnl_unlock();
+        run();
+        assert(hardware.live && g->listeners == 1 && g->hw_spec.listeners == 1);
+        assert(!g->egress_stale);
     }
 
     /* Routed through a bridge: nothing of its own goes into hardware. The
@@ -711,7 +956,7 @@ int main(void)
         refresh();
         assert(folds == folding);
         /* Its copies are the bridged group's, rebuilt by the other half. */
-        assert(ft_mr_egress_mark(&output[0]) == 0 && !g->rebuild);
+        assert(ft_mr_egress_mark(&output[0]) == 0 && !g->egress_stale);
         /* The parent moving back to a port takes the route back. */
         through_bridge = false;
         ft_mr_recheck = true;

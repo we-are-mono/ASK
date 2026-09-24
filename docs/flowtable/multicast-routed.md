@@ -530,10 +530,28 @@ with it; and `cdx_ctrl_lock_with_rtnl()` states the other half outright — neve
 wait for RTNL or the control mutex while holding the other. So one pass is:
 take `ft_mr_lock`, choose a dirty group, release it; take RTNL, derive the whole
 decision into a plan with a device reference of its own for every device in it,
-release RTNL; take the transaction, call the backend, release it; take
-`ft_mr_lock` again and record what happened. The delayed counter fold takes the
-transaction *and then* `ft_mr_lock`, which is `/proc`'s order and therefore the
-only one either may use.
+release RTNL; take the transaction, call the backend with the transaction
+alone, take `ft_mr_lock` inside it to record what happened (`ft_mr_record()`),
+and release both. The group keeps its hardware and its installed set until
+then, so nothing else that takes the transaction ever meets it half-built,
+and nothing that takes only `ft_mr_lock` under RTNL — the netdev events, the
+egress mark — waits behind a hardware call. The delayed counter fold takes the
+transaction *and then* `ft_mr_lock`, which is `/proc`'s order and therefore
+the only one either may use. The bridged worker does the same with
+`ft_mc_lock`: the MDB handler takes it under RTNL and never waits behind a
+build either.
+
+One caller does take the transaction under RTNL: the egress drain a DSCP
+filter runs, under the RTNL `tc` took for it — RTNL then the transaction, the
+order the flowtable's bind path already takes. It closes no cycle because the
+only path that waits for RTNL while holding the transaction is the legacy FCI
+command plane, sealed once the flowtable owns the hardware, and the worker,
+which does wait for RTNL, never holds the transaction then. The drain never
+waits for the worker either: a worker that has picked a group may well be
+waiting for that same RTNL. So the drain rebuilds the group in place from the
+spec its entry was built from, recorded whole beside it — ingress tags
+included — with nothing to decide. The bridged learner's drain does the same
+for its flows; see [bridged multicast](multicast.md).
 
 **The two learners never nest their locks.** `ft_mr_lock` is never taken while
 `ft_mc_lock` is held and `ft_mc_lock` is never taken while `ft_mr_lock` is held.
@@ -569,7 +587,7 @@ family over:
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |
 | A bridge becoming or ceasing to be a multicast router | `SWITCHDEV_ATTR_ID_BRIDGE_MROUTER` | the bridged worker asks the bridge about every flow on it again, and re-matches each against the routes and VIFs; the dedup slots are forgotten, so a stream only a route names is learned from its next frame |
 | A bridge turning promiscuous, or back | nothing reports it | each publication of a route through the bridge compares, one per refresh, and forgets the dedup slots when it changed |
-| A port's egress queues: an HTB tree switching it to or from CEETM, a class moving or going, the DSCP map changing | `ft_mc_egress_changed()`, from the adapter's egress hook | every installed group of either learner with a copy on the port is rebuilt in place, because each listener entry names the queue and the DSCP-map bit its port had when it was built; `mcast_egress_rebuilds` counts them |
+| A port's egress queues: an HTB tree switching it to or from CEETM, a class moving or going, the DSCP map changing | `ft_mc_egress_changed()`, from the adapter's egress hook | every installed group of either learner with a copy on the port is marked and rebuilt in place, because each listener entry names the queue and the DSCP-map bit its port had when it was built; a group routed through a bridge is rebuilt with the bridged flow its copies ride; the DSCP map's drain rebuilds what the workers have not yet, from each entry's recorded spec; `mcast_egress_rebuilds` counts the marks |
 
 A replacement that fails is withdrawn completely: retaining the old chain
 could omit a new router port indefinitely. Software carries the whole stream

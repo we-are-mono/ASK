@@ -71,17 +71,20 @@ u64 cdx_ft_qos_control_overruns(void);
  * queue nothing dequeues, and its classifier hits keep the flow alive while it
  * does. The adapter registers these to re-install everything on the port.
  *
- * changed() marks every flow entry and outbound SA on the port for
- * re-installation and returns without sleeping; the re-installation itself is
- * the adapter's queued work. Multicast replicas are not covered.
- * It relies on no lock of the caller's. Both callers hold RTNL today -- an HTB
- * command always, and a DSCP filter because its block callback is not
- * registered unlocked, so tc takes RTNL around it -- but neither op needs it.
+ * changed() marks every flow entry, outbound SA and multicast group
+ * replicating to the port for re-installation; the re-installation itself is
+ * the adapter's queued work. It may sleep, and relies on no lock of the
+ * caller's. Both callers hold RTNL today -- an HTB command always, and a DSCP
+ * filter because its block callback is not registered unlocked, so tc takes
+ * RTNL around it -- but neither op needs it.
  *
  * drain(dev) sleeps until everything changed(dev) started has finished, or
  * reports -EAGAIN when it cannot say so yet: before CDX hands the DSCP map to
  * another port, no entry installed while this one held it may still read it.
- * It takes the control mutex, so it is never called with it held.
+ * It takes the control mutex, so it is never called with it held. It never
+ * waits for RTNL: a multicast group whose rebuild is still due is rebuilt by
+ * drain() itself rather than waited for, since the learners' workers take
+ * RTNL.
  *
  * Registration is a one-shot claim, and unregistration waits out every call
  * already inside either op, so the module that registered can go once it

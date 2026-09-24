@@ -44,12 +44,16 @@ def test_a_fresh_hardware_group_folds_from_zero():
     source = (ROOT / "cdx/ask_flowtable.c").read_text()
     work = function(source, "ft_mr_work_fn")
     add = work.index("cdx_mc_group_add(&plan.spec, &hw)")
-    adopt = work.index("target->hw = hw;")
+    # The outcome is adopted by ft_mr_record(), inside the transaction the
+    # fold takes too, so no fold sees the new entry against the old baseline.
+    adopt = work.index("ft_mr_record(", add)
     assert work.index("added = true;", add) < adopt, "the add must be recorded as such"
-    assert "target->folded_packets = target->folded_bytes = 0;" in work[adopt:], \
+    record = function(source, "ft_mr_record")
+    assert "g->hw = hw;" in record
+    assert "g->folded_packets = g->folded_bytes = 0;" in record, \
         "a group the worker has just added must be folded from zero"
-    reset = work[work.index("target->folded_packets = target->folded_bytes = 0;"):]
-    assert "target->fold_suspect = false;" in reset[:reset.index("}")], \
+    reset = record[record.index("g->folded_packets = g->folded_bytes = 0;"):]
+    assert "g->fold_suspect = false;" in reset[:reset.index("}")], \
         "a doubt about the old baseline says nothing about the new one"
 
 
@@ -62,5 +66,5 @@ def test_both_learners_take_deltas_from_one_rule():
     assert "ft_mc_count_delta(&g->folded_packets, &g->folded_bytes," in function(source, "ft_mr_fold")
     assert "ft_mc_count_delta(&f->hw_packets, &f->hw_bytes," in function(source, "ft_mc_flow_counted")
     work = function(source, "ft_mc_work_fn")
-    added = work[work.index("if (spec.listeners && !rc && !replace) {"):]
+    added = work[work.index("if (added) {"):]
     assert "target->count_suspect = false;" in added[:added.index("}")]

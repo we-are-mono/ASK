@@ -34,9 +34,10 @@ int cdx_htb_class_queue(struct net_device *dev, u32 classid, u8 *channel, u8 *cq
 bool cdx_htb_resolve_class(struct tQM_context_ctl *qm_ctx, u32 *channel, u32 *cq);
 
 /* The flowtable adapter's egress hook, for CDX's own callers; see struct
- * cdx_ft_egress_ops. The first never sleeps and needs no lock; the second
- * sleeps, and must not be called holding a lock the adapter's retirement work
- * takes -- the control mutex above all. */
+ * cdx_ft_egress_ops. Both may sleep. The first needs no lock of the caller's;
+ * the second must not be called holding a lock the adapter's retirement work
+ * takes -- the control mutex above all. Neither waits for RTNL, which both
+ * callers hold. */
 void cdx_ft_egress_changed(struct net_device *dev);
 int cdx_ft_egress_drain(struct net_device *dev);
 

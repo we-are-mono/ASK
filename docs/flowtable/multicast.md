@@ -670,13 +670,34 @@ dropped as a duplicate of a queued event for another group sharing its MAC.
 A listener's entry also names the frame queue its port had when it was built,
 and whether the port's DSCP map was on. When CDX changes a port's egress
 queues — an HTB offload tree switching it to or from CEETM, a class moving or
-going, the DSCP map changing — `ft_mc_egress_changed()` marks every installed
-group with a copy on that port, either learner's, and the workers rebuild each
-chain with `cdx_mc_group_replace()`, which asks the port again and swaps the
-chain in under the same key. It needs no RTNL and takes each learner's mutex
-in turn. A group whose chain was being built while it ran is caught by a
-generation the workers compare after recording the build. `/proc` counts the
-rebuilds as `mcast_egress_rebuilds`.
+going, the DSCP map changing — the adapter's egress hook counts the change and
+`ft_mc_egress_changed()` marks every installed group with a copy on that port,
+either learner's, and the workers rebuild each chain with
+`cdx_mc_group_replace()`, which asks the port again and swaps the chain in
+under the same key. The mark needs no RTNL and takes each learner's mutex in
+turn. What a flow's copies are is read from the chain its entry was built
+from, recorded whole beside the entry in the same transaction: the bridge's
+copies and the routed copies riding it, so a route's port changing its queues
+rebuilds the bridged flow that carries it. A flow whose chain was being built
+while the change landed was not yet there to mark; the worker compares the
+count of egress changes — the same count an SA install compares — across the
+build and marks the flow itself. `/proc` counts the marks as
+`mcast_egress_rebuilds`.
+
+A DSCP map leaving a port cannot wait for the workers: its `drain()` runs
+under the RTNL `tc` holds, and the bridged worker takes RTNL to ask the bridge.
+So the drain rebuilds every flow still marked itself, in place, by replacing
+its entry with the chain recorded for it, whole — the sender and the ingress
+tag the root is keyed on, and the routed copies, included — with nothing to
+decide: only the port's queues changed, not where the stream goes. That holds
+while the worker has the flow in hand, because the worker keeps the flow's
+entry and its recorded chain until it is inside its own transaction, and
+records what it built before leaving it. A flow the drain cannot vouch for —
+its recorded chain lost a device, or the replace failed and left the old chain
+in place — is handed to the worker and reported, and the map stays claimed
+until the next port asking for it finds the drain done. The worker's own
+failed replace withdraws the flow to software in the same pass, so that wait
+never runs to the retries the refresh paces.
 
 A VLAN change on the bridge, whether a port's membership, the bridge's own,
 its filtering or its protocol, marks every flow on that bridge. The worker

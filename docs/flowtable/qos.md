@@ -1644,9 +1644,32 @@ and the hook relies on no lock of the caller's. The adapter registers it before
 anything can build an entry and unregisters it before cancelling the work it
 queues. An SA being installed while the map turns is not on the watch list for
 the hook to mark yet, so the install compares a count of egress changes across
-its build and marks its own watch for the rebuild if one landed. Multicast
-replicas are outside this hook: they are not flow entries, and neither the
-retirement nor `drain()` covers them.
+its build and marks its own watch for the rebuild if one landed.
+
+Multicast groups carry the bit too, one listener entry per port they replicate
+to, and are rebuilt rather than retired: nothing re-offers a group the way a
+packet re-offers a flow. The hook marks every installed group of either
+learner whose chain has a listener on the port, and its learner's worker
+replaces the whole chain against the port as it is now, though the membership
+is unchanged. A bridged flow's chain includes the routed copies riding it, so
+a route's port is covered by the flow that carries it. A group being built
+while the map turns compares the same count of egress changes as an SA
+install, and marks itself.
+
+`drain()` cannot wait for either worker: both take RTNL — the bridged one to
+ask the bridge, the routed one to derive — and the filter's caller holds it.
+So `drain()` rebuilds every group still marked itself, in place, by replacing
+its entry with the spec it was built from, recorded whole beside the entry in
+the transaction that built it — ingress tags, the sender and the routed copies
+included — with nothing to decide. That covers a group a worker has picked and
+is deciding, which is the usual case: each worker keeps a group's entry and
+recorded spec until it is inside its own transaction, and records what it
+built before leaving it. A group `drain()` cannot vouch for — the spec went
+with a device, or the replace failed and left the old chain — holds the map
+as an unfinished drain does and is handed to its worker, whose own failed
+replace withdraws it to software in one pass, leaving nothing reading the
+map; the drain waits on no retry the refresh paces. An HTB change goes through
+the same hook, so a group's listener entries follow a class that moved too.
 
 With no adapter registered — one on its way out has unregistered the hook
 before it retires its SAs and multicast groups — CDX asks the backend instead,
@@ -1663,9 +1686,10 @@ retirement with the filter lock dropped (`drain()`), and only then release the
 table. A port asking for the map meanwhile is told it is busy. A drain that
 cannot prove the entries gone — a global invalidation whose recovery has not
 finished, an unload in progress, an SA on the port whose rebuild is waiting
-for its peer — leaves the table claimed and says so in the kernel log; the
-next port to ask tries the drain again first, and the port that let go can
-take its own table back without one.
+for its peer, a multicast group it could not rebuild — leaves the table
+claimed and says so in the kernel log; the next port to ask tries the drain
+again first, and the port that let go can take its own table back without
+one.
 
 The first filter is ordered the other way round for the same reason: the table
 is claimed and programmed before it is published, so a first filter that
