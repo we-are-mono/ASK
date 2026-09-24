@@ -1,4 +1,4 @@
-From 2ec08415e9e516422d2e8d43351ff8f11db8e74e Mon Sep 17 00:00:00 2001
+From 66e0a7e5260a1e334cf73c8bacc6ac56c8c573e5 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:42:47 +0200
 Subject: [PATCH] ask: PPP/PPPoE fast-path hooks
@@ -17,8 +17,8 @@ did not change.
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  drivers/net/ppp/ppp_generic.c | 22 ++++++++++++++++++++++
- drivers/net/ppp/pppoe.c       | 23 +++++++++++++++++++++++
- 2 files changed, 45 insertions(+)
+ drivers/net/ppp/pppoe.c       | 15 +++++++++++++++
+ 2 files changed, 37 insertions(+)
 
 diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
 index 5d6d69632c84..cf1ebc51781e 100644
@@ -63,25 +63,10 @@ index 5d6d69632c84..cf1ebc51781e 100644
  }
  
 diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
-index 8ff2024dde60..ded3afb250b0 100644
+index 8ff2024dde60..05b0883b2c4a 100644
 --- a/drivers/net/ppp/pppoe.c
 +++ b/drivers/net/ppp/pppoe.c
-@@ -956,6 +956,14 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
- 
- 	skb->protocol = cpu_to_be16(ETH_P_PPP_SES);
- 	skb->dev = dev;
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)  
-+	if((skb->ipsec_offload == 1) && (!secpath_exists(skb)))
-+	{
-+		dev_hard_header(skb, dev, ETH_P_PPP_SES,
-+				dev->dev_addr, po->pppoe_pa.remote, data_len);
-+	}
-+	else
-+#endif
- 
- 	dev_hard_header(skb, dev, ETH_P_PPP_SES,
- 			po->pppoe_pa.remote, NULL, data_len);
-@@ -1038,17 +1046,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
+@@ -1038,17 +1038,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
  {
  	struct pppox_sock *po;
  	char *dev_name;
