@@ -941,10 +941,15 @@ that neighbour in that family (`cdx_ft_rule.next_hop_family`). Before, both read
 IPv6 address on the route under the bundle, which answered only through a
 default route's gateway. The same per-packet lookup is where such an SA's
 endpoint moving off its port shows, so the packet is refused as
-`XfrmOutBundleCheckError` there, as a same-family SA's is by its own route;
-and the lookup names its next hop itself, so an on-link endpoint takes the
-FIB's cached route rather than the per-lookup clone the tunnel lookups ask
-for. The adapter's own peer lookup, at install and when it follows the
+`XfrmOutBundleCheckError` there, as a same-family SA's is by its own route.
+Every xfrm route lookup takes the FIB's cached route: patch 040 used to add
+`FLOWI_FLAG_KNOWN_NH`, which made an on-link endpoint's route an uncached one
+(an IPv6 clone) naming the endpoint as its next hop, for a slow path that sent a
+packet-offloaded SA's frames to neighbour output without their outer header.
+No path does that now -- a tunnel-mode frame goes to the SA's device
+directly, the next-hop probe names the endpoint, and a transport-mode frame
+is addressed to the endpoint -- so the flag changed no neighbour and was
+removed. The adapter's own peer lookup, at install and when it follows the
 peer, carries the same mark, VRF, protocol and ports: without the last two a
 rule on them, or a multipath hash over the ports, could give the hardware
 one next hop while Linux's frames take another.

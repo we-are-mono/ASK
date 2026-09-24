@@ -11279,7 +11279,6 @@ static int ft_ipsec_peer_on_port(struct xfrm_state *x,
 		/* Only its L3 master is used, and only for the table. */
 		.oif = dev->ifindex,
 		.ipproto = x->id.proto,
-		.nexthop_named = true,
 	};
 	struct dst_entry *dst;
 	bool on_port;

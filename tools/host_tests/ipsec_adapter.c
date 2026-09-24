@@ -992,7 +992,6 @@ struct xfrm_dst_lookup_params {
 	u32 mark;
 	u8 ipproto;
 	union flowi_uli uli;
-	bool nexthop_named;
 };
 static struct rtable wan_route;
 static struct dst_entry *peer_answer;
@@ -1240,7 +1239,7 @@ static void test_spec(void)
 	 * next hop. It is asked the question its outbound half will be --
 	 * whether the route to the peer leaves by the SA's device -- through
 	 * xfrm's own lookup: from the local endpoint to the peer, in the SA's
-	 * family and its port's VRF, with no output mark and no clone. */
+	 * family and its port's VRF, with no output mark. */
 	x->xso.dir = XFRM_DEV_OFFLOAD_IN;
 	x->props.smark.v = 0x40;
 	x->props.smark.m = 0xff;
@@ -1250,7 +1249,7 @@ static void test_spec(void)
 	assert(is_zero_ether_addr(spec.dst_mac));
 	assert(peer_family == AF_INET && peer_key.oif == WAN.ifindex);
 	assert(peer_key.saddr == &x->id.daddr && peer_key.daddr == &x->props.saddr);
-	assert(peer_key.mark == 0 && peer_key.ipproto == IPPROTO_ESP && peer_key.nexthop_named);
+	assert(peer_key.mark == 0 && peer_key.ipproto == IPPROTO_ESP);
 	x->props.smark.v = x->props.smark.m = 0;
 
 	/* A peer routed by any other device is refused, and so is one with no

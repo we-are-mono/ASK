@@ -1,11 +1,10 @@
-From bfb2ca55433b3aa44427860a4bc97c837beb0450 Mon Sep 17 00:00:00 2001
+From d986c2bf833e518b30a533573e50776940d8df6e Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
 
 Adds the IPsec packet offload to the FMAN SEC (CAAM) engine: hook points
-in xfrm_input.c, xfrm_output.c, xfrm_device.c and xfrm_state.c, and the
-IPv4/IPv6 policy glue (xfrm4_policy.c, xfrm6_policy.c). New Kconfigs
+in xfrm_input.c, xfrm_output.c, xfrm_device.c and xfrm_state.c. New Kconfigs
 INET_IPSEC_OFFLOAD (net/ipv4/Kconfig) and INET6_IPSEC_OFFLOAD
 (net/ipv6/Kconfig), both depending on CPE_FAST_PATH from 010.
 
@@ -64,15 +63,13 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/net/xfrm.h                            |  11 +
  include/uapi/linux/pfkeyv2.h                  |   1 +
  net/ipv4/Kconfig                              |   6 +
- net/ipv4/xfrm4_policy.c                       |  13 +
  net/ipv6/Kconfig                              |   6 +
- net/ipv6/xfrm6_policy.c                       |  10 +
  net/key/af_key.c                              |   8 +
  net/xfrm/xfrm_device.c                        |  24 ++
  net/xfrm/xfrm_input.c                         |  48 ++++
  net/xfrm/xfrm_output.c                        | 248 ++++++++++++++++++
  net/xfrm/xfrm_state.c                         | 193 ++++++++++++++
- 15 files changed, 679 insertions(+), 32 deletions(-)
+ 13 files changed, 656 insertions(+), 32 deletions(-)
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac..1669e0d267e3 100644
@@ -420,30 +417,6 @@ index 4cfd87b28c04..8871e4f90f2c 100644
  config INET_IPCOMP
  	tristate "IP: IPComp transformation"
  	select INET_XFRM_TUNNEL
-diff --git a/net/ipv4/xfrm4_policy.c b/net/ipv4/xfrm4_policy.c
-index 7e1c2faed1ff..985934c2e331 100644
---- a/net/ipv4/xfrm4_policy.c
-+++ b/net/ipv4/xfrm4_policy.c
-@@ -33,6 +33,19 @@ static struct dst_entry *__xfrm4_dst_lookup(struct flowi4 *fl4,
- 	fl4->flowi4_proto = params->ipproto;
- 	fl4->uli = params->uli;
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	/*
-+	 * For IPsec packets with directly connected IPv4 tunnel end points,
-+	 * neighbor resolution is done for inner destination since we do not
-+	 * add tunnel headers in slow path to IPsec packets. To fix this issue,
-+	 * flag "FLOWI_FLAG_KNOWN_NH" is passed during tunnel route lookup.
-+	 * This flag will ensure that if the src and dst are directly connected
-+	 * then a new route entry is created with "rt_gateway" set to dst
-+	 * address (tunnel dst address).
-+	 */
-+	fl4->flowi4_flags |= FLOWI_FLAG_KNOWN_NH;
-+#endif
-+
- 	rt = __ip_route_output_key(params->net, fl4);
- 	if (!IS_ERR(rt))
- 		return &rt->dst;
 diff --git a/net/ipv6/Kconfig b/net/ipv6/Kconfig
 index 1c9c686d9522..396a081a12b9 100644
 --- a/net/ipv6/Kconfig
@@ -461,27 +434,6 @@ index 1c9c686d9522..396a081a12b9 100644
  config INET6_IPCOMP
  	tristate "IPv6: IPComp transformation"
  	select INET6_XFRM_TUNNEL
-diff --git a/net/ipv6/xfrm6_policy.c b/net/ipv6/xfrm6_policy.c
-index 3b749475f6ed..470e0590d480 100644
---- a/net/ipv6/xfrm6_policy.c
-+++ b/net/ipv6/xfrm6_policy.c
-@@ -40,6 +40,16 @@ static struct dst_entry *xfrm6_dst_lookup(const struct xfrm_dst_lookup_params *p
- 	fl6.flowi4_proto = params->ipproto;
- 	fl6.uli = params->uli;
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	/*
-+	 * For IPsec packets with directly connected tunnel end points,
-+	 * neighbor resolution is done for inner destination since we do not
-+	 * add tunnel headers in slow path to IPsec packets. To fix this issue,
-+	 * flag "FLOWI_FLAG_KNOWN_NH" is passed during tunnel route lookup.
-+	 */
-+	fl6.flowi6_flags |= FLOWI_FLAG_KNOWN_NH;
-+#endif
-+
- 	dst = ip6_route_output(params->net, NULL, &fl6);
- 
- 	err = dst->error;
 diff --git a/net/key/af_key.c b/net/key/af_key.c
 index c1731bbd85d7..ff8887654f1d 100644
 --- a/net/key/af_key.c
