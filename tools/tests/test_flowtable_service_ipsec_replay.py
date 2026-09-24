@@ -44,11 +44,13 @@ from test_flowtable_service_ipsec import test_flowtable_service_ipsec_shared_seq
 
 # An AES-128 key followed by the four-byte salt RFC 4106 and 4543 take with it.
 GCM_KEY = "0x" + "c3" * 20
+# The AEAD transforms SEC carries. GMAC (rfc4543) is not one of them: see
+# test_ipsec_gmac_refused.
 AEAD = {
     "rfc4106-icv16": Transform(("aead", "rfc4106(gcm(aes))", GCM_KEY, "128")),
     "rfc4106-icv8": Transform(("aead", "rfc4106(gcm(aes))", GCM_KEY, "64")),
-    "rfc4543": Transform(("aead", "rfc4543(gcm(aes))", GCM_KEY, "128")),
 }
+GMAC = ("aead", "rfc4543(gcm(aes))", GCM_KEY, "128")
 # Counters on this host that move when it refuses a frame the DUT produced.
 PEER_ERRORS = ("XfrmInError", "XfrmInHdrError", "XfrmInNoStates", "XfrmInStateProtoError",
                "XfrmInStateSeqError", "XfrmInStateMismatch", "XfrmInStateInvalid", "XfrmInTmplMismatch")
@@ -485,3 +487,52 @@ async def test_ipsec_replay_window_limit(aiohttp_session, target_agent, splat_wi
                           "dst", LIMIT_LOCAL, "proto", "esp", "spi", hex(spi), check=False)
         await endpoints_down(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=LIMIT_LOCAL,
                              peer=LIMIT_PEER)
+
+
+# Again a pair, SPIs and a reqid of its own, and again nothing is sent.
+GMAC_LOCAL, GMAC_PEER = "198.18.108.1", "198.18.108.2"
+GMAC_REQID = "49307"
+GMAC_STATES = {
+    "out": ["src", GMAC_LOCAL, "dst", GMAC_PEER, "proto", "esp", "spi", hex(0x474D0001)],
+    "in": ["src", GMAC_PEER, "dst", GMAC_LOCAL, "proto", "esp", "spi", hex(0x474D0002)],
+}
+
+
+async def test_ipsec_gmac_refused(aiohttp_session, target_agent, splat_window):
+    """AES-GMAC is refused for packet offload in both directions, with the
+    reason, and the same state installs in software.
+
+    SEC runs GMAC as GCM with the payload left unencrypted, so its ICV covers
+    the ESP header and payload but not the IV, which RFC 4543 and every
+    software peer authenticate. Offloaded, every frame the SA sent failed the
+    peer's check and every compliant frame it received was dropped."""
+    await endpoints_up(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=GMAC_LOCAL,
+                       peer=GMAC_PEER, lladdr="02:00:00:00:08:02")
+    try:
+        for direction, identity in GMAC_STATES.items():
+            added = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "add", *identity,
+                                  "mode", "tunnel", "reqid", GMAC_REQID, *GMAC,
+                                  "offload", "packet", "dev", TARGET_WAN_IF, "dir", direction, check=False)
+            shown = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "get", *identity,
+                                  check=False)
+            result = {"direction": direction, "add": added, "get": shown}
+            assert added["rc"] != 0, result
+            assert "cdx: SEC's AES-GMAC leaves the IV out of the ICV" in added["stderr"], result
+            # Packet offload has no software fallback: nothing was installed.
+            assert shown["rc"] != 0, result
+        # Asked for without offload, it is software's, which follows the RFC.
+        identity = GMAC_STATES["out"]
+        added = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "add", *identity,
+                              "mode", "tunnel", "reqid", GMAC_REQID, *GMAC, check=False)
+        shown = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "get", *identity,
+                              check=False)
+        result = {"add": added, "get": shown}
+        assert added["rc"] == 0 and shown["rc"] == 0, result
+        assert GMAC[1] in shown["stdout"], result
+        assert "crypto offload parameters" not in shown["stdout"], result
+    finally:
+        for identity in GMAC_STATES.values():
+            await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "delete", *identity,
+                          check=False)
+        await endpoints_down(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=GMAC_LOCAL,
+                             peer=GMAC_PEER)

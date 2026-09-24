@@ -258,11 +258,15 @@ int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
 			sa->icvsz = 16;
 			sa->pSec_sa_context->auth_data.split_key_len = 0;
 			break;
-		/* GCM/GMAC offload re-enabled: the shared-descriptor sharing
+		/* GCM offload re-enabled: the shared-descriptor sharing
 		 * policy now keeps GHASH context and PDB.seq coherent across
 		 * DECOs — see cdx_ipsec_sh_desc_hdr_flags() in
-		 * cdx_dpa_ipsec.c. RFC 4106/4543: 4-byte salt trails the AES
-		 * key, hence comb_mode with extra_size 4. */
+		 * cdx_dpa_ipsec.c. RFC 4106: 4-byte salt trails the AES
+		 * key, hence comb_mode with extra_size 4.
+		 *
+		 * SADB_X_EALG_NULL_AES_GMAC has no arm: SEC's AES-GMAC leaves
+		 * out of its ICV the IV that RFC 4543 authenticates, so no
+		 * peer would accept a frame it produced (ft_ipsec_spec()). */
 		case SADB_X_EALG_AES_GCM_ICV8:
 			algo = OP_PCL_IPSEC_AES_GCM8;
 			sa->blocksz = 16;
@@ -281,14 +285,6 @@ int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
 			break;
 		case SADB_X_EALG_AES_GCM_ICV16:
 			algo = OP_PCL_IPSEC_AES_GCM16;
-			sa->blocksz = 16;
-			comb_mode = 1;
-			extra_size = 4;
-			sa->icvsz = 16;
-			sa->pSec_sa_context->auth_data.split_key_len = 0;
-			break;
-		case SADB_X_EALG_NULL_AES_GMAC:
-			algo = OP_PCL_IPSEC_AES_GMAC;
 			sa->blocksz = 16;
 			comb_mode = 1;
 			extra_size = 4;

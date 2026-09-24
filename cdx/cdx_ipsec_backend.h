@@ -36,7 +36,7 @@ enum cdx_ipsec_dir {
  * union nf_inet_addr in cdx_ft_rule rather than a tuple of its own.
  *
  * An AEAD transform is one key with an alg that names its ICV length
- * (SADB_X_EALG_AES_GCM_ICV8/12/16, SADB_X_EALG_NULL_AES_GMAC), so it occupies
+ * (SADB_X_EALG_AES_GCM_ICV8/12/16, SADB_X_EALG_AES_CCM_ICV8/12/16), so it occupies
  * `crypt` alone and leaves `auth` empty. There is deliberately no separate
  * ICV field: the length is part of the algorithm's identity here, and a
  * second field naming it could disagree with the first.

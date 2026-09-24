@@ -325,8 +325,7 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
 {
 	return cipher_type == OP_PCL_IPSEC_AES_GCM8 ||
 	       cipher_type == OP_PCL_IPSEC_AES_GCM12 ||
-	       cipher_type == OP_PCL_IPSEC_AES_GCM16 ||
-	       cipher_type == OP_PCL_IPSEC_AES_GMAC;
+	       cipher_type == OP_PCL_IPSEC_AES_GCM16;
 }
 
 /*
@@ -364,7 +363,7 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
  *    1390 bytes) and line-rate TCP bursts overrun it and tail-drop
  *    (measured 65 Mbit/s with ~1000 retransmits on a 10 s stream).
  *
- * GCM/GMAC therefore run SERIAL without SAVECTX; the other ciphers
+ * GCM therefore runs SERIAL without SAVECTX; the other ciphers
  * keep the SERIAL+SAVECTX arrangement they have always shipped with.
  * The paired half of the fix is in save_sa_state_in_external_mem():
  * RM §7.3.1 requires every job of a WAIT/SERIAL flow to STORE the PDB
@@ -1289,7 +1288,6 @@ static int built_encap_extra_material(PSAEntry sa,
 		case OP_PCL_IPSEC_AES_GCM8:
 		case OP_PCL_IPSEC_AES_GCM12:
 		case OP_PCL_IPSEC_AES_GCM16:
-		case OP_PCL_IPSEC_AES_GMAC:
 			block_size = 16; /* block size in bytes */
 			break;
 		default:
@@ -1728,8 +1726,7 @@ static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 						sa->pSec_sa_context->cipher_data.cipher_key_len;
 	if ((sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM8) ||
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM12) ||
-			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16) ||
-			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC))
+			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16))
 	{
 		memcpy(sec_desc->pdb_dec.gcm.salt, salt, AES_GCM_SALT_LEN);
 	}
@@ -1903,8 +1900,7 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 		__func__,__LINE__,salt[0],salt[1],salt[2],salt[3]); */
 	if ((sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM8) ||
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM12) ||
-			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16) ||
-			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC))
+			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16))
 	{
 		memcpy(sec_desc->pdb_en.gcm.salt, salt,  AES_GCM_SALT_LEN);
 	}

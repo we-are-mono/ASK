@@ -10965,6 +10965,18 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 		spec->crypt.bits = x->ealg->alg_key_len;
 		memcpy(spec->crypt.key, x->ealg->alg_key, x->ealg->alg_key_len / 8);
 	} else if (x->aead) {
+		/* SEC's IPsec protocol runs AES-GMAC as GCM with the payload left
+		 * unencrypted (SEC RM §9.1), so its ICV covers the ESP header and
+		 * payload but not the IV. RFC 4543 (Figure 4, erratum 62) and
+		 * every software peer include the IV, so no frame would
+		 * authenticate in either direction, and no PDB option changes
+		 * what SEC authenticates. Refused: xfrm hands the error back for
+		 * packet offload and installs nothing, and the SA belongs in
+		 * software, added without offload. */
+		if (x->props.ealgo == SADB_X_EALG_NULL_AES_GMAC) {
+			NL_SET_ERR_MSG(extack, "cdx: SEC's AES-GMAC leaves the IV out of the ICV");
+			return -EOPNOTSUPP;
+		}
 		if (x->aead->alg_key_len > CDX_IPSEC_KEY_MAX * 8) {
 			NL_SET_ERR_MSG(extack, "cdx: AEAD key too long");
 			return -EINVAL;

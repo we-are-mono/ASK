@@ -263,9 +263,13 @@ Linux, in software, exactly as it does today.
 **The SA.** ESP only — `x->id.proto == IPPROTO_ESP`; AH is refused, as 040's
 own check already does. Tunnel mode and transport mode, IPv4 and IPv6 outer.
 Ciphers as the CDX shared-descriptor builder supports them: CBC and CTR with
-an HMAC, and AEAD — GCM at ICV 8/12/16 and GMAC (`rfc4543`). GCM is admitted
-without reservation: A24a fixed the shared-descriptor sharing policy that made
-it unsafe (DNCPE-2358, `43f29a0`) and GCM now outperforms CBC+HMAC on TCP.
+an HMAC, and AEAD — GCM at ICV 8/12/16. GMAC (`rfc4543`) is refused with
+`EOPNOTSUPP` and belongs in software: SEC's IPsec protocol leaves the IV out of
+the GMAC ICV, where RFC 4543 and every software peer authenticate it, so no
+frame would pass the other side's check in either direction (A220). GCM is
+admitted without reservation: A24a fixed the shared-descriptor sharing policy
+that made it unsafe (DNCPE-2358, `43f29a0`) and GCM now outperforms CBC+HMAC
+on TCP.
 NAT-T is carried through `x->encap->encap_sport/dport`, which the hardware SA
 keeps. An in-place `XFRM_MSG_UPDSA` reaches no driver, so 040 refuses one that
 would change a packet-offloaded state's ports or its output mark (`EINVAL`) —
@@ -468,7 +472,7 @@ computes, minus the serialisation:
 | SA identity, direction | `x->id.proto`, `x->id.spi`, `x->props.family`, `x->props.saddr`, `x->id.daddr`, `x->xso.dir` |
 | Authentication key | `x->aalg->alg_key`/`alg_key_len`, `x->props.aalgo` |
 | Cipher key | `x->ealg->alg_key`/`alg_key_len`, `x->props.ealgo` |
-| AEAD key and ICV | `x->aead->alg_key`/`alg_key_len`/`alg_icv_len`, `alg_name` for the GCM/CCM/GMAC split |
+| AEAD key and ICV | `x->aead->alg_key`/`alg_key_len`, `x->props.ealgo`, which names the mode and ICV length together; GMAC is refused |
 | Outer header | `x->props.mode == XFRM_MODE_TUNNEL`, built from `props.saddr`/`id.daddr` |
 | NAT-T ports | `x->encap->encap_sport`/`encap_dport` |
 | Lifetimes | not passed: xfrm judges `x->lft` against the `x->curlft` the accounting pass publishes |

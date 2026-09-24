@@ -26,6 +26,7 @@ def test_ipsec_adapter(tmp_path):
     policy = (kernel / "net/xfrm/xfrm_policy.c").read_text()
     state = (kernel / "net/xfrm/xfrm_state.c").read_text()
     replay = (kernel / "net/xfrm/xfrm_replay.c").read_text()
+    pfkey = (kernel / "include/uapi/linux/pfkeyv2.h").read_text()
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     ehash_h = (sdk / "inc/Peripherals/fm_ehash.h").read_text()
     ehash_c = (sdk / "Peripherals/FM/Pcd/fm_ehash.c").read_text()
@@ -48,7 +49,10 @@ def test_ipsec_adapter(tmp_path):
     # SA spec, to the rule or to the watch has to fail here rather than
     # compile into a harness that no longer matches what the adapter keeps.
     (tmp_path / "ipsec_types.inc").write_text(
-        rule[rule.index("#define CDX_FT_VLAN_MAX"):
+        # The AEAD identities xfrm hands the adapter in x->props.ealgo.
+        "\n".join(re.findall(r"^#define\s+SADB_X_EALG_(?:AES_GCM_ICV\d+|NULL_AES_GMAC)\s.*$",
+                             pfkey, re.M)) + "\n"
+        + rule[rule.index("#define CDX_FT_VLAN_MAX"):
              rule.index("/* Process-context transactions")]
         + backend[backend.index("#define CDX_IPSEC_KEY_MAX"):
                   backend.index("/* SA operations run inside")]

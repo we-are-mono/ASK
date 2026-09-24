@@ -1195,6 +1195,49 @@ static void test_spec(void)
 	x->props.family = AF_INET;
 }
 
+/* An AEAD transform is one key under an identity that names the mode and the
+ * ICV length together. GCM is admitted at each of its three lengths. GMAC is
+ * refused in both directions, and says why: SEC authenticates it without the
+ * IV that RFC 4543 and every software peer authenticate, so not one frame
+ * would pass the other side's check. */
+static void test_spec_aead(void)
+{
+	static const u8 gcm[] = { SADB_X_EALG_AES_GCM_ICV8, SADB_X_EALG_AES_GCM_ICV12,
+				  SADB_X_EALG_AES_GCM_ICV16 };
+	/* An AES-128 key and the four-byte salt both RFCs append to it. */
+	struct xfrm_algo_aead aead = { .alg_key_len = 160 };
+	struct cdx_ipsec_sa_spec spec;
+	struct netlink_ext_ack ack;
+	struct xfrm_state *x;
+	unsigned dir, i, lookups;
+
+	bench_reset();
+	memset(aead.alg_key, 0xc3, aead.alg_key_len / 8);
+	for (dir = XFRM_DEV_OFFLOAD_OUT; dir <= XFRM_DEV_OFFLOAD_IN; dir++) {
+		x = outbound_state();
+		x->xso.dir = dir;
+		x->aalg = NULL;
+		x->ealg = NULL;
+		x->props.aalgo = 0;
+		x->aead = &aead;
+		for (i = 0; i < sizeof(gcm) / sizeof(gcm[0]); i++) {
+			x->props.ealgo = gcm[i];
+			ack._msg = NULL;
+			assert(ft_ipsec_spec(x, &spec, &ack) == 0 && !ack._msg);
+			assert(spec.crypt.alg == gcm[i] && spec.crypt.bits == 160);
+			assert(!memcmp(spec.crypt.key, aead.alg_key, aead.alg_key_len / 8));
+			assert(!spec.auth.alg && !spec.auth.bits);
+		}
+		x->props.ealgo = SADB_X_EALG_NULL_AES_GMAC;
+		ack._msg = NULL;
+		lookups = route_lookups;
+		assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+		assert(ack._msg && strstr(ack._msg, "GMAC"));
+		/* Refused before anything is resolved for it. */
+		assert(route_lookups == lookups);
+	}
+}
+
 static void test_next_hop(void)
 {
 	struct cdx_ipsec_sa_spec spec;
@@ -3264,6 +3307,7 @@ static void test_sec_refusals(void)
 int main(void)
 {
 	test_spec();
+	test_spec_aead();
 	test_next_hop();
 	test_state_add();
 	test_policy_add();
