@@ -1098,7 +1098,8 @@ patches were regenerated surgically rather than one being dropped. What 060
 actually carried besides the xtables modules is
 `net/netfilter/comcerto_fp_netfilter.c` — the hooks that stamp a conntrack's
 `comcerto_fp_info` for cmm, nothing to do with QoS. 060 keeps only those and is
-renamed `060-ask-netfilter-fastpath-hooks.patch`.
+renamed `060-ask-netfilter-fastpath-hooks.patch`. (With CMM retired nothing read
+those stamps any more, and 060 was later dropped entirely.)
 
 Removing `IPCT_QOSCONNMARK` also puts `IPCT_SYNPROXY` back on its mainline
 value. It had been inserted mid-enum, shifting everything after it.

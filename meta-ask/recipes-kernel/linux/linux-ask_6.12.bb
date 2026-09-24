@@ -57,11 +57,9 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://ask-kasan.cfg \
            file://mono-gateway-dk.dts \
            file://010-ask-fman-dpaa-ehash.patch \
-           file://020-ask-bridge-hooks.patch \
            file://030-ask-ipv4-ipv6-forwarding.patch \
            file://040-ask-xfrm-ipsec-offload.patch \
            file://050-ask-conntrack-offload.patch \
-           file://060-ask-netfilter-fastpath-hooks.patch \
            file://070-ask-ppp-hooks.patch \
            file://080-wext-core-restore-ndo_do_ioctl.patch \
            file://090-qbman-dpa_alloc-preallocate-nodes.patch \

@@ -44,12 +44,12 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 286 insertions(+)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
-index 13f4363917da..e4b0b8c51034 100644
+index c5fe3b2a53e8..67b9405a489d 100644
 --- a/include/linux/if_bridge.h
 +++ b/include/linux/if_bridge.h
-@@ -86,6 +86,13 @@ int unregister_brevent_notifier(struct notifier_block *nb);
- int call_brevent_notifiers(unsigned long val, void *v);
- #endif
+@@ -69,6 +69,13 @@ void brioctl_set(int (*hook)(struct net *net, unsigned int cmd,
+ 			     void __user *uarg));
+ int br_ioctl_call(struct net *net, unsigned int cmd, void __user *uarg);
  
 +/* Why br_multicast_list_ports() says a bridge hands received data up to the
 + * host as well as forwarding it. */
@@ -61,7 +61,7 @@ index 13f4363917da..e4b0b8c51034 100644
  #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_BRIDGE_IGMP_SNOOPING)
  int br_multicast_list_adjacent(struct net_device *dev,
  			       struct list_head *br_ip_list);
-@@ -94,6 +101,11 @@ bool br_multicast_has_querier_adjacent(struct net_device *dev, int proto);
+@@ -77,6 +84,11 @@ bool br_multicast_has_querier_adjacent(struct net_device *dev, int proto);
  bool br_multicast_has_router_adjacent(struct net_device *dev, int proto);
  bool br_multicast_enabled(const struct net_device *dev);
  bool br_multicast_router(const struct net_device *dev);
@@ -73,7 +73,7 @@ index 13f4363917da..e4b0b8c51034 100644
  #else
  static inline int br_multicast_list_adjacent(struct net_device *dev,
  					     struct list_head *br_ip_list)
-@@ -121,6 +133,20 @@ static inline bool br_multicast_enabled(const struct net_device *dev)
+@@ -104,6 +116,20 @@ static inline bool br_multicast_enabled(const struct net_device *dev)
  {
  	return false;
  }

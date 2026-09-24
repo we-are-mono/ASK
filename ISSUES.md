@@ -152,20 +152,6 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A194 — cdx and the kernel patches still carry CMM's control plane.**
-  Retiring CMM left dead code behind, kept deliberately while the cmm/, fci/
-  and auto_bridge/ reference sources are still consulted. `cdx/cdx_cmdhandler.c`
-  `comcerto_fpp_send_command()` now refuses every command, so the FCI command
-  handlers registered across `cdx/control_*.c`, `cdx_cmd_handler()`, the
-  `comcerto_fpp_register_event_cb()` event path and the command-validation
-  tables are unreachable. `cdx/dpa_wifi.c` keeps CMM's Wi-Fi fast path (the
-  NF_INET_PRE_ROUTING hook behind the `vwd_fast_path_enable` sysfs knob), which
-  nothing enables. On the kernel side, audit which parts of
-  `patches/kernel/020-ask-bridge-hooks.patch` (the BREVENT hooks auto_bridge
-  consumed) and `060-ask-netfilter-fastpath-hooks.patch` serve only CMM or
-  auto_bridge. Remove what the flowtable path does not use, with host-test
-  coverage for the shared machinery the handlers sit beside.
-
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN
@@ -250,6 +236,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A194.** cdx and the kernel patches still carried CMM's dead FCI control plane, Wi-Fi fast path and bridge/conntrack hooks —
+  removed (_:/^cdx: remove the FCI control plane_).
 
 - [x] **A254.** Turning a port's DSCP map on or off retired nothing: flows and SAs (a deleted one too) kept reading it on whichever port took it next, and `cpe_fp_tx()` raced its free —
   fixed (_:/^flowtable: hold the DSCP map while a deleted SA is still in hardware_).
