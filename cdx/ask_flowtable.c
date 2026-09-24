@@ -849,6 +849,23 @@ static bool ft_neigh_check(u8 family, struct net_device *dev,
 	return valid;
 }
 
+/* Whether the neighbour at @dst is usable and names an address other than
+ * @mac: not a neighbour still resolving or gone, but one that has moved. */
+static bool ft_neigh_moved(u8 family, struct net_device *dev,
+			   const union nf_inet_addr *dst, const u8 *mac)
+{
+	struct neighbour *neigh = neigh_lookup(ft_neigh_table(family), dst, dev);
+	bool moved;
+
+	if (!neigh)
+		return false;
+	read_lock_bh(&neigh->lock);
+	moved = ft_neigh_matches(neigh, neigh->ha) && !ether_addr_equal(neigh->ha, mac);
+	read_unlock_bh(&neigh->lock);
+	neigh_release(neigh);
+	return moved;
+}
+
 /* A gateway is normally link-local, which a flow endpoint may never be, so
  * this is deliberately weaker than the endpoint test. */
 static bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop)
@@ -1238,6 +1255,20 @@ static bool ft_routes_valid(const struct flow_cls_offload *cls)
 	return cls->nf_dst && cls->nf_dst_reverse &&
 		dst_check(cls->nf_dst, cls->nf_dst_cookie) &&
 		dst_check(cls->nf_dst_reverse, cls->nf_dst_reverse_cookie);
+}
+
+/* The two things about an offer that no lock orders against it: the policy
+ * generation it was queued under, and the two routes it borrows. Either one
+ * having moved on retires the offer's whole generation. Needs no RTNL, so an
+ * offer answered without admission is held to it as well. Returns whether the
+ * generation is still valid. */
+static bool ft_offer_current(const struct flow_cls_offload *cls)
+{
+	if (cls->nf_xfrm_genid != xfrm_flowtable_genid(&init_net))
+		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_policy_invalidations);
+	if (nf_flow_offload_handle_valid(cls->nf_handle) && !ft_routes_valid(cls))
+		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
+	return nf_flow_offload_handle_valid(cls->nf_handle);
 }
 
 static int ft_neigh_attach(struct cdx_ft_entry *entry)
@@ -1923,8 +1954,9 @@ static bool ft_vlan_actions(const struct flow_action *actions,
  * tunnel, unless that LAN's IPv6 MTU is set to the smaller path's. An SA does
  * not narrow the bound: through a transform the flow's MTU is its outer
  * device's, because ip6_dst_mtu_maybe_forward() ignores the bundle's unlocked
- * RTAX_MTU. Checked at admission and on every stats pass, because the IPv6
- * MTU is a sysctl of its own that no device event reports. */
+ * RTAX_MTU. Checked at admission, and for an installed direction on every
+ * stats pass and every time Linux offers it again, because the IPv6 MTU is a
+ * sysctl of its own that no device event reports. */
 static bool ft_ipv6_mtu_bounded(struct net_device *in, u32 mtu)
 {
 	struct inet6_dev *idev;
@@ -1977,6 +2009,60 @@ static bool ft_ipv4_mtu_carried(const struct cdx_ft_rule *rule, const struct net
 
 	return rule->proto == IPPROTO_TCP || rule->sa_handle || rule->in_sa_handle ||
 	       ft_ipv4_arriving(in, stripped) <= mtu;
+}
+
+/* Whether the decoder is certain to refuse this offer on its MTU bound, decided
+ * from the request alone and before RTNL. Linux offers a flow again about once
+ * a second for as long as software forwards any of it, so a direction the bound
+ * keeps out keeps coming back while it carries traffic -- on a PPPoE uplink
+ * that is every IPv4 UDP upload -- and each offer would otherwise take RTNL and
+ * walk the whole path only to be refused again.
+ *
+ * Only a refusal that holds whatever the walk would find is made here. The
+ * ingress device is the reverse destination's, exactly as the decoder takes
+ * it, and the IPv6 bound reads nothing else. The IPv4 one is taken with the
+ * most any ingress of an IPv4 flow can strip -- a session and the IPv6 outer
+ * header of 4in6, the one tunnel mode that carries IPv4 -- which is where it is
+ * lowest. And no transform may be in reach: neither destination carries one
+ * and no policy or blocking default is configured, so every lookup
+ * ft_ipsec_handle() makes returns the plain route. No SA can then exempt the
+ * direction, and no policy can deny it -- a denial retires the whole
+ * generation, which a refusal here would otherwise skip. A socket's own
+ * policy is not one of those: it never governs a forwarded packet, and
+ * neither the lookups nor xfrm_flowtable_policy_check() consult it. Everything
+ * that passes still meets the exact bound in the decoder. */
+static bool ft_mtu_refused(const struct flow_cls_offload *cls)
+{
+	struct flow_rule *rule = cls->rule;
+	struct flow_match_basic basic;
+	struct net_device *in;
+	bool refused;
+
+	if (!rule || !cls->nf_dst || !cls->nf_dst_reverse ||
+	    !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_BASIC)) ||
+	    dst_xfrm(cls->nf_dst) || dst_xfrm(cls->nf_dst_reverse) ||
+	    !xfrm_flowtable_enabled(&init_net))
+		return false;
+	flow_rule_match_basic(rule, &basic);
+	if (basic.mask->n_proto != htons(0xffff) || basic.mask->ip_proto != 0xff)
+		return false;
+	/* Without RTNL the destination's device can be swapped for the
+	 * blackhole one while its own unregisters; the device read here stays
+	 * valid until the grace period unregistration waits for. */
+	rcu_read_lock();
+	in = READ_ONCE(cls->nf_dst_reverse->dev);
+	if (basic.key->n_proto == htons(ETH_P_IP))
+		refused = basic.key->ip_proto != IPPROTO_TCP &&
+			  ft_ipv4_arriving(in, PPPOE_SES_HLEN + sizeof(struct ipv6hdr)) >
+			  cls->nf_mtu;
+	else
+		refused = basic.key->n_proto == htons(ETH_P_IPV6) &&
+			  !ft_ipv6_mtu_bounded(in, cls->nf_mtu);
+	if (refused)
+		ask_dbg(ASK_DBG_DEVICE, "proto %u mtu %u below ingress %s before RTNL\n",
+			basic.key->ip_proto, cls->nf_mtu, netdev_name(in));
+	rcu_read_unlock();
+	return refused;
 }
 
 /* Exact masks preserve every selector. Native flowtables supply routing
@@ -2287,11 +2373,23 @@ static int ft_parse(struct cdx_ft_binding *binding,
 
 		/* The destination is the outer next hop the walk resolved on
 		 * the device below, checked against that device's neighbour as
-		 * a routed flow's is checked against its own. */
-		if (!lower ||
-		    !ft_neigh_check(out->out_tunnel.family, lower,
-				    &out->out_tunnel.nexthop, out->out_tunnel.mac))
+		 * a routed flow's is checked against its own.
+		 *
+		 * Unlike a routed flow's, that address is recorded once, when
+		 * Linux creates the flow, and no later offer of the same
+		 * generation carries a newer one. A neighbour that is usable
+		 * but has moved to another address therefore never matches
+		 * again for this generation: it is stale the way a changed
+		 * source address is, and retires the generation so that the
+		 * next one walks the path afresh. */
+		if (!lower)
 			return ask_refuse(-EOPNOTSUPP);
+		if (!ft_neigh_check(out->out_tunnel.family, lower,
+				    &out->out_tunnel.nexthop, out->out_tunnel.mac))
+			return ask_refuse(ft_neigh_moved(out->out_tunnel.family, lower,
+							 &out->out_tunnel.nexthop,
+							 out->out_tunnel.mac) ?
+					  -ESTALE : -EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, out->out_tunnel.mac);
 	} else {
 		if (!is_valid_ether_addr(ethernet) ||
@@ -2352,10 +2450,8 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	 * merely because its opaque directional cookie has the same value. */
 	if (entry && entry->handle != cls->nf_handle)
 		return ask_refuse(-ESTALE);
-	if (cls->nf_xfrm_genid != xfrm_flowtable_genid(&init_net))
-		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_policy_invalidations);
-	if (nf_flow_offload_handle_valid(cls->nf_handle) && !ft_routes_valid(cls))
-		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
+	/* An invalid generation is refused by the parse below. */
+	ft_offer_current(cls);
 	rc = ft_parse(binding, cls, &rule, &next_hop);
 	if (rc == -ESTALE)
 		ft_handle_invalidate(cls->nf_handle, &ft_mac_invalidations);
@@ -2443,10 +2539,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	 * was not yet watched, and RTNL did not exclude it. Recheck once the
 	 * notifier can see this entry; an invalid handle then retires it below
 	 * through the same path as a change observed during insertion. */
-	if (cls->nf_xfrm_genid != xfrm_flowtable_genid(&init_net))
-		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_policy_invalidations);
-	if (!ft_routes_valid(cls))
-		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
+	ft_offer_current(cls);
 	if (ft_fault(3) || atomic_read(&ft_invalid) ||
 	    !nf_flow_offload_handle_valid(entry->handle)) {
 		ft_remove(entry);
@@ -2487,6 +2580,19 @@ static unsigned int ft_l2_overhead(const struct cdx_ft_rule *rule)
 	       (rule->in_tunnel.present ? rule->in_tunnel.header_size : 0);
 }
 
+/* Whether an installed direction still holds its IPv6 ingress bound, retiring
+ * its generation when it does not. The one admission condition no event
+ * reports, so it is asked whenever Linux touches the direction again. Needs
+ * no RTNL: the entry holds its ingress logical device. */
+static bool ft_entry_bounded(struct cdx_ft_entry *entry)
+{
+	if (entry->rule.family != AF_INET6 ||
+	    ft_ipv6_mtu_bounded(entry->rule.in_logical, entry->rule.mtu))
+		return true;
+	ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
+	return false;
+}
+
 static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 {
 	struct cdx_ft_counters now;
@@ -2497,11 +2603,8 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 		ft_neigh_invalidate(entry);
 		return -EOPNOTSUPP;
 	}
-	if (entry->rule.family == AF_INET6 &&
-	    !ft_ipv6_mtu_bounded(entry->rule.in_logical, entry->rule.mtu)) {
-		ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
+	if (!ft_entry_bounded(entry))
 		return -EOPNOTSUPP;
-	}
 	cdx_ft_stats(entry->hw, &now);
 	/* 64-bit counters cannot wrap during this PoC's lifetime. A backwards
 	 * sample means hardware state was reset or could not be read reliably;
@@ -2548,6 +2651,51 @@ static bool ft_request_targets(const struct cdx_ft_binding *binding,
 	       meta.key->ingress_ifindex == binding->dev->ifindex;
 }
 
+/* Whether Linux will offer this direction again on its own. flow_offload_refresh()
+ * does, at most about once a second, for as long as the software fast path
+ * forwards the direction's packets: it queues the whole flow, and
+ * flow_offload_work_add() offers both directions. The normal stack never offers
+ * a flow that already exists, so a direction whose packets never reach the
+ * fast path is never offered again by its own traffic. Two kinds never do:
+ *
+ * - every direction, while any xfrm policy or a default other than accept is
+ *   configured: nf_flow_offload_ip_hook() and its IPv6 twin then hand every
+ *   packet of a table with hardware handles to the normal stack;
+ * - one that arrives through a tunnel. For a table with neighbour output its
+ *   tuple names the port below the tunnel, where the fast path sees only the
+ *   outer packet and cannot parse it, and the inner packet the tunnel device
+ *   delivers arrives on a device the tuple does not name.
+ *
+ * The second is offered again only by its sibling's software traffic, which
+ * stops the moment the sibling is in hardware; and in either case it is then
+ * the sibling's hardware counters that keep the generation alive. */
+static bool ft_software_reoffers(const struct flow_cls_offload *cls)
+{
+	return xfrm_flowtable_enabled(&init_net) && cls->nf_tunnel_reverse &&
+	       !cls->nf_tunnel_reverse->lower_ifindex;
+}
+
+/* Whether an offer names a direction this generation already has in hardware,
+ * with no global latch pending. Such an offer is answered without RTNL and
+ * without a new walk, because nothing it describes can have changed without
+ * something else retiring the entry first. Its rule comes from the flow's tuple,
+ * destinations, session and tunnel records and MTU, all fixed for the
+ * generation; what those resolve through -- routes, neighbours, a device's MTU,
+ * address, link and uppers, bridge forwarding state, tunnel parameters, egress
+ * queues, SAs -- retires the generation through its own event, as it has to for
+ * a fully offloaded flow, which is never offered again at all. The conntrack
+ * mark and a police filter are sampled once, at admission, which is all a fully
+ * offloaded flow ever gets of them either. What ft_replace() checks ahead of
+ * any parse still applies, through ft_offer_current(), and so does the one
+ * admission bound no event reports, through ft_entry_bounded(). */
+static bool ft_offer_installed(const struct cdx_ft_entry *entry,
+			       const struct flow_cls_offload *cls)
+{
+	return entry && entry->handle == cls->nf_handle &&
+	       nf_flow_offload_handle_valid(cls->nf_handle) && !cdx_ft_observing() &&
+	       !atomic_read(&ft_invalid) && !ft_stopping && !cdx_ft_failed();
+}
+
 static bool ft_admission_fault(const struct flow_cls_offload *cls)
 {
 #ifdef CDX_DEBUG_FLOWTABLE
@@ -2577,25 +2725,82 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		entry = NULL;
 	switch (cls->command) {
 	case FLOW_CLS_REPLACE:
-		/* Never wait for RTNL here: device teardown under RTNL may be
-		 * flushing this workqueue. Retire a busy generation so fresh
-		 * traffic retries after native GC, rather than retaining one
-		 * accelerated direction indefinitely. */
+		/* Native work offers each direction to every bound port. The
+		 * other ports' visits are not refusals, so they are neither
+		 * counted nor allowed near RTNL. */
 		if (!ft_request_targets(binding, cls)) {
 			rc = -EOPNOTSUPP;
+			break;
+		}
+		/* Linux re-offers a flow while software forwards any part of
+		 * it, installed half included, so the offers that cannot change
+		 * anything are answered first, without RTNL: a direction already
+		 * installed, one whose MTU bound is certain to refuse it, and one
+		 * a full table would refuse.
+		 *
+		 * Never wait for RTNL here: device teardown under RTNL may be
+		 * flushing this workqueue. An offer that cannot take it retires
+		 * nothing while software will offer the direction again -- it
+		 * stays on the software path until the next offer, and whatever
+		 * is already installed stays installed. Where nothing will (see
+		 * ft_software_reoffers()) an installed direction would keep the
+		 * generation alive from hardware alone; retire it, so that
+		 * fresh traffic retries both directions after native GC. */
+		if (ft_offer_installed(entry, cls)) {
+			rc = ft_offer_current(cls) && ft_entry_bounded(entry) ?
+			     0 : ask_refuse(-EOPNOTSUPP);
+		} else if (!entry && ft_mtu_refused(cls)) {
+			rc = ask_refuse(-EOPNOTSUPP);
+		} else if (!entry && ft_count >= CDX_FT_MAX_ENTRIES &&
+			   ft_software_reoffers(cls)) {
+			/* A full table refuses whatever the walk finds, and a
+			 * direction software keeps offering would otherwise take
+			 * RTNL and walk its path every second until a slot frees.
+			 * One nothing offers again goes on to admission, where a
+			 * key its previous generation still holds retires it
+			 * before capacity refuses it. */
+			rc = ask_refuse(-ENOSPC);
 		} else if (ft_admission_fault(cls) || cdx_ft_admission_begin()) {
 			ft_busy++;
-			if (!cdx_ft_observing() && !ft_stopping &&
+			if (!ft_software_reoffers(cls) && !cdx_ft_observing() && !ft_stopping &&
 			    !atomic_read(&ft_invalid) && !cdx_ft_failed())
 				ft_handle_invalidate(cls->nf_handle, &ft_admission_invalidations);
 			rc = -EAGAIN;
 		} else {
 			rc = ft_replace(binding, cls);
-			/* A partially installed generation can stay alive entirely
-			 * through its hardware direction, without software refresh
-			 * retrying the failed allocation. Retire only this generation
-			 * so native GC permits fresh admission after memory recovers. */
-			if (rc == -ENOMEM)
+			/* Two more refusals can clear by themselves, and each is
+			 * retried by retiring only this generation, so native GC
+			 * permits a fresh admission.
+			 *
+			 * An allocation failure always: memory pressure is when
+			 * a retry is least likely to succeed a second later, and
+			 * where nothing offers the direction again its installed
+			 * sibling would otherwise hold the generation from
+			 * hardware alone.
+			 *
+			 * A hardware key another generation of the connection
+			 * still holds, where nothing offers the direction again:
+			 * Linux queues the old generation's removal on another
+			 * workqueue than this offer, and it is gone within a GC
+			 * pass. Where software re-offers it, that suffices.
+			 *
+			 * Capacity is not retried this way: the readmission would
+			 * compete for the same full table, and the direction that
+			 * holds a slot is worth more than a flow churning in and
+			 * out of it. Nor is a neighbour this adapter cannot use.
+			 * For a routed direction Linux builds neither direction's
+			 * rule unless that neighbour is valid, so what reaches
+			 * here is a change racing the offer or a state this
+			 * adapter never accepts, and retiring on the latter would
+			 * readmit forever. A tunnel's egress is the exception:
+			 * Linux resolves only the tunnel device's own NOARP
+			 * neighbour, and the outer next hop this adapter checks
+			 * may still be resolving. That refusal waits for the next
+			 * offer, which software makes unless a policy is
+			 * configured; an outer neighbour that resolved to another
+			 * address than the walk recorded has already retired the
+			 * generation in the parse. */
+			if (rc == -ENOMEM || (rc == -EEXIST && !ft_software_reoffers(cls)))
 				ft_handle_invalidate(cls->nf_handle, &ft_admission_invalidations);
 			cdx_ft_admission_end();
 		}

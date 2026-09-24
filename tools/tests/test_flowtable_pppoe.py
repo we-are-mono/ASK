@@ -837,7 +837,7 @@ def _assert_carried(r, measured):
     units it counts itself.
 
     The same two entries carried it, each at least a hundred packets, with
-    nothing installed or retired meanwhile. The session record's
+    nothing installed, retired or declined meanwhile. The session record's
     halves are those same frames: the insert's the upload's, the strip's the
     download's. And `ip -s link` on the ppp device moved by the record,
     restated into payload bytes, plus only what the session itself exchanged

@@ -178,7 +178,12 @@ a port receives full frames regardless
 ([architecture.md](architecture.md#native-context-and-admission)); TCP is
 carried, DF set, and so is the direction out of the session. A session
 negotiated at 1500 over a 1508-byte Ethernet (RFC 4638) is no smaller than the
-LAN, so its UDP stays in hardware too.
+LAN, so its UDP stays in hardware too. Linux offers such a flow again about once
+a second while its upload forwards in software. With no IPsec policy configured
+both bounds refuse that offer before taking RTNL, and the installed download
+direction answers its own offer from its entry, so a partially offloaded flow
+costs no admission lock
+([architecture.md](architecture.md#native-context-and-admission)).
 
 The classifier key is unchanged — the physical port plus the 5-tuple — so a
 session reaches the hardware only as the header it inserts or strips.

@@ -47,7 +47,7 @@ for operating the supported flowtable/CDX path.
 | IPv4 route-prefix change | Retire affected generations; fresh route lookup readmits |
 | Physical MTU, MAC, carrier or administrative down/up change | Retire dependent generations; current device/route state gates automatic readmission |
 | Rename | Preserve physical identity, installed cookies and fresh binding under the new name |
-| Transient matching admission contention | Retire a partial generation; native GC and fresh traffic retry both directions |
+| Transient matching admission contention | Decline the direction and keep any installed one; Linux's periodic offer retries it while software forwards it. Where nothing offers it again -- an xfrm policy configured, or a direction arriving through a tunnel -- retire the partial generation; native GC and fresh traffic retry both directions |
 | Routing policy, nexthop-object or unsupported topology change | Globally stop admission; recreate/apply the table after configuration settles |
 | Healthy adapter unload | Drain hardware; existing sockets forward in Linux; reload and recreate the table to regain hardware |
 | Actual physical driver removal | Retire flow references; full CDX teardown releases remaining configuration/queue pins before driver removal completes |

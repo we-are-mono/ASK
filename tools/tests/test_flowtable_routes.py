@@ -228,6 +228,10 @@ async def test_flowtable_routes_selective(routes):
                                   "dev", TARGET_LAN_IF, "mtu", "1100", check=False)
         assert duplicate["rc"] != 0, duplicate
         state = await r.state()
+        # A's UDP reply re-offers its flow whenever it crosses Linux, and that
+        # refusal is decided before RTNL; nothing here should take RTNL at
+        # all, and busy moving would name an offer that did.
+        assert state["busy"] == before["busy"], ("an offer took RTNL mid-window", before, state)
         peer_unchanged(before, state, ALL, flows=routed(1100))
         reports = await p.rpc("stop", B)
         assert all(report["count"] > 128 for report in reports.values()), reports

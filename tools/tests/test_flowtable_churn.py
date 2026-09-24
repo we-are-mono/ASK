@@ -390,9 +390,10 @@ async def sustained_churn(r, path):
                 assert readmitted <= len(regenerated) <= TURNOVER_ROUND, (readmitted, sorted(regenerated))
                 unchanged(before, after, excluded=removed | {old[k]["cookie"] for k in regenerated})
                 # Admitting the group is the only ownership this round asked
-                # for. Anything deleted alongside it is a contended admission
-                # rolled back, or a further flow Linux turned over; both publish
-                # and retire in pairs, so the surplus installs must match them.
+                # for. Anything deleted alongside it is a generation the
+                # adapter retired for an admission reason it counts, or a
+                # further flow Linux turned over; both publish and retire in
+                # pairs, so the surplus installs must match them.
                 retries = after["admission_invalidations"] - freed["admission_invalidations"]
                 surplus = after["deletes"] - freed["deletes"]
                 assert after["installs"] - freed["installs"] == 2 * len(admit) + surplus, (freed, after)

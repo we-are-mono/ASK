@@ -219,12 +219,17 @@ def status_text(text):
 
 
 def assert_undisturbed(r, before, after, same=True, label="flow-disturbed"):
-    """Nothing was readmitted between two adapter states.
+    """Nothing was readmitted between two adapter states, and no offer lost
+    RTNL.
 
-    That is the caller's own verdict on the rows -- `same`, typically that
-    the cookies did not move -- and a failure is reported with every counter
-    that could name its cause."""
-    if same:
+    A direction the adapter refused re-offers its flow about once a second
+    while it carries traffic. An MTU refusal is decided before RTNL and an
+    installed direction's offer is answered without it, so such a window
+    should never take RTNL at all; busy moving names an offer that did. That
+    is checked with the caller's own verdict on the rows -- `same`, typically
+    that the cookies did not move -- and a failure is reported with every
+    counter that could name its cause."""
+    if after["busy"] == before["busy"] and same:
         return
     r.record(label, {"before": before, "after": after})
     pytest.fail("the measured flow was disturbed mid-measurement: " +
@@ -851,9 +856,10 @@ async def test_flowtable_offload_add_failures(rig):
             remaining = (await read(r.target, r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage")).strip()
             if remaining == "0":
                 break
-            # RTNL contention deliberately declines admission before fault
-            # injection. Native flowtable does not retry that installation;
-            # a fresh connection is needed to exercise the requested stage.
+            # RTNL contention declines admission before fault injection. The
+            # software path offers the flow again about a second later, but
+            # only while traffic keeps it there, so a fresh connection is the
+            # dependable way to reach the requested stage.
             state = await r.state()
             assert state["busy"] > before["busy"] and state["invalidated"] == 0, state
             await r.delete_table()

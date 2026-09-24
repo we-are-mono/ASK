@@ -65,10 +65,17 @@ def test_ipsec_adapter(tmp_path):
     # The attachment comes last: it names the ops table, which names every
     # callback above.
     attachment = ["ft_ipsec_attach", "ft_ipsec_detach"]
+    # Patch 140 tells a socket's own policy apart by the direction its index
+    # encodes. A tree unpacked before that has neither the call nor the case
+    # that exercises it.
+    check = function(policy, "xfrm_flowtable_policy_check")
+    socket_policies = "xfrm_policy_is_dead_or_sk" in check
     (tmp_path / "ipsec_production.inc").write_text(
-        "\n".join(function(policy, name) for name in (
+        ("#define FT_SOCKET_POLICY_EXEMPT\n" if socket_policies else "")
+        + "\n".join(function(policy, name) for name in (
             "xfrm_state_ok", "xfrm_policy_ok", "secpath_has_nontransport",
-            "xfrm_flowtable_policy_check"))
+            *(("xfrm_policy_is_dead_or_sk",) if socket_policies else ())))
+        + check
         # xfrm's own judge of a lifetime, which the accounting pass hands its
         # counters to. Renamed so the harness can count the calls around it.
         + function(state, "xfrm_state_check_expire").replace(

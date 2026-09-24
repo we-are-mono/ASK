@@ -442,8 +442,9 @@ async def admit(r, port, *, tos=0, destination=None, timeout=20):
     are installed, and return the two rows.
 
     A deadline rather than a round count: an admission that loses the adapter's
-    RTNL trylock is declined and offered again only after flowtable GC ticks, so
-    every attempt sends before it looks.
+    RTNL trylock is declined, and the software path offers the flow again only
+    about a second later, while traffic keeps it there, so every attempt sends
+    before it looks.
     """
     destination = destination or r.lan_ip
     target = f"{destination}:{port}"

@@ -62,9 +62,12 @@ configuration instructions.
 
 The bound is 32,768 **directions**, sufficient for 16,384 fully accelerated connections.
 Admission is directional: a capacity or unsupported-direction refusal can leave
-the other direction accelerated. Matching transient admission contention has
-explicit partial-generation recovery. Hardware flags alone do not establish
-that both directions are offloaded.
+the other direction accelerated. A direction that loses the admission lock is
+retried by Linux's own periodic offer while software forwards it, and the
+installed direction keeps its hardware; where nothing offers it again -- an
+xfrm policy is configured, or it arrives through a tunnel -- the partial
+generation is retired and readmitted instead. Hardware flags alone do not
+establish that both directions are offloaded.
 
 Counter-enabled hardware tables are admitted, since OpenWrt's firewall declares
 `counter` on every flowtable. Conntrack accounting then includes the hardware

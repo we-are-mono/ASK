@@ -131,6 +131,23 @@ and TCP and the download direction stay in hardware. Device and route MTU
 changes retire installed directions through their events, so the bound is
 checked at admission.
 
+A refused direction does not stay refused quietly. Linux offers a flow again
+at most about once a second for as long as the software fast path forwards
+either direction's packets: `flow_offload_refresh()` queues the whole flow, and
+the offload work offers both directions. A direction the MTU bound is certain to refuse is therefore refused
+before RTNL is taken, counted as a reject and never as busy, retiring nothing:
+IPv4 other than TCP whose path is below the larger of the ingress device's MTU
+and 1452 bytes (a full frame less a session and a 4in6 outer header, the most
+any ingress strips), or IPv6 whose path is below the ingress IPv6 MTU. It does
+so only while no xfrm policy or blocking default is configured and neither
+destination carries a transform, because an SA exempts an IPv4 direction and a
+policy denial retires the generation, and only the walk under RTNL finds out
+either. Whatever passes is held to the exact bound there. A full table is
+refused the same way, before RTNL and counted as a reject, for a direction
+software keeps offering; one nothing offers again goes on to admission, where a
+hardware key its previous generation still holds retires it before capacity
+refuses it (see below).
+
 The selected next hop needs a live ARP neighbour whose MAC matches the rewrite.
 PERMANENT, REACHABLE, STALE, DELAY and PROBE are eligible; NOARP, unresolved,
 failed and detached neighbours are refused. A neighbour is rechecked and its
@@ -180,23 +197,74 @@ The hardware match remains the ingress tuple; for NAT the twin is the inverse
 translated tuple. The [NAT guide](nat.md#mapping-and-dependencies)
 defines mapping validation and dependency addresses.
 
-A direction reports success only after insertion. An identical replacement is
-idempotent; a changed replacement retires the old entry first. A conflicting
-cookie for the same hardware key is refused, as is a reused cookie with a
-different shared generation. Capacity or unsupported-direction refusal can
-leave the other direction accelerated. `[HW_OFFLOAD]` is not proof of a pair.
+A direction reports success only after insertion. An offer for a direction
+already installed in the same generation is answered from its entry (below);
+one that arrives while a global latch is pending goes through admission, which
+takes the entry out if it no longer parses and replaces it if it parses
+differently. A conflicting cookie for the same hardware key is refused, as is
+a reused cookie with a different shared generation. Capacity or
+unsupported-direction refusal can leave the other direction accelerated.
+`[HW_OFFLOAD]` is not proof of a pair.
 
-Matching-ingress RTNL contention instead invalidates that shared generation,
-retiring a partial pair so native GC and fresh traffic can retry both directions
-through the same table. A callback visiting the other bound port is rejected
-before RTNL and cannot invalidate a successfully installed direction.
+The periodic offer of a partially offloaded flow includes its installed
+direction, and that offer is answered from the entry without RTNL or a new
+walk. Nothing it describes can differ from what was installed without the
+generation being retired first: the rule is built from the flow's tuple,
+destinations, session and tunnel records and MTU, all fixed for the
+generation, and what those resolve through -- routes, neighbours, device MTU,
+address, link and uppers of every device the path names or crosses, bridge
+forwarding state, tunnel parameters, egress queues, SAs -- retires it by event.
+A fully offloaded flow, which is never offered again, relies on exactly that.
+The conntrack mark and a police filter are sampled once at admission, as for
+any offloaded flow ([QoS](qos.md)). What no event reports is rechecked on the
+offer: the policy generation and the two borrowed routes, as before any parse,
+and the IPv6 ingress MTU, a sysctl, as on every statistics pass. A pending
+global latch sends the offer through admission as before.
 
-Admission allocation failures use the same selective recovery: adapter entry
-and hardware-owner `-ENOMEM`, and genuine native admission work/rule/action
-allocation failures, invalidate the opted-in generation. Otherwise hardware
-activity in one installed direction can keep a partial pair alive without
-software refresh retrying its missing peer. Native work already pending and
-failed statistics/deletion work allocations retain their normal semantics;
+An offer that loses `rtnl_trylock()` is declined with `-EAGAIN` and counted as
+busy. Where software will offer the direction again it retires nothing: the
+fast path forwards the direction and offers the flow again within about a
+second, and an installed direction keeps its hardware entry. Two kinds of
+direction are never offered again by their own traffic, and for those the busy
+generation is invalidated instead, so that native GC and fresh traffic retry
+both directions through the same table -- otherwise an installed sibling, whose
+own traffic no longer reaches software, would keep the partial pair alive from
+hardware statistics indefinitely:
+
+- every direction while an xfrm policy or blocking default is configured, since
+  the flowtable hook then hands every packet of a table with hardware handles
+  to the normal stack, which never offers an existing flow again;
+- a direction arriving through a tunnel (4in6, 6in4), whose tuple names the
+  port below the tunnel, where the fast path sees only the outer packet and
+  cannot parse it.
+
+Visits to the other bound ports' callbacks, which native work makes for every
+direction, are neither refusals nor RTNL users: they are answered first,
+counted nowhere, and cannot invalidate a successfully installed direction.
+
+Two more refusals clear by themselves and are retried by retiring only that
+generation. Admission allocation failures do so whatever the direction:
+adapter entry and hardware-owner `-ENOMEM`, and genuine native admission
+work/rule/action allocation failures, invalidate the opted-in generation,
+because memory pressure is when a retry a second later is least likely, and
+where nothing offers the direction again hardware activity in its installed
+sibling would keep the partial pair alive. A hardware key still held by
+another generation of the same connection (`-EEXIST`, whose removal Linux
+queues on a different workqueue from the new offer and completes within a GC
+pass) retires the generation only for a direction nothing offers again.
+Capacity (`-ENOSPC`) does not: a readmission would compete for the same full
+table, and the installed direction is worth more than a flow churning through
+it. Nor does a neighbour the adapter cannot use. For a routed direction Linux
+builds neither direction's rule unless that neighbour is valid, so what reaches
+the adapter is a change racing the offer or a state it never accepts, and
+retiring on the latter would readmit forever. A tunnel's egress is the
+exception, because Linux resolves only the tunnel device's own NOARP neighbour
+and never the outer next hop the adapter checks: an outer neighbour still
+resolving waits for the next offer, and one that resolved to another address
+than the walk recorded at flow creation is stale for the whole generation and
+retires it (`-ESTALE`, as a changed source address does;
+[tunnels](tunnels.md#what-stands-in-for-the-neighbour)). Native work already pending and failed
+statistics/deletion work allocations retain their normal semantics;
 unsupported match/action construction is not treated as memory pressure.
 See the [failslab recovery contract](resilience.md#allocation-failure-recovery--2026-09-21).
 

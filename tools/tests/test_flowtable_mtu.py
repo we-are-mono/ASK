@@ -82,6 +82,13 @@ async def udp_size(r, sport, size, label, mtus=None):
                                ignore_pmtu=True, promiscuous=False)
     after, tx_after = await r.state(), await software_tx(r)
     healthy(after)
+    if len(wanted) < 2:
+        # The direction Linux keeps re-offers the flow about once a second.
+        # Its refusal is decided before RTNL and the installed direction's
+        # offer is answered without it, so nothing here should take RTNL at
+        # all; busy moving would name an offer that did, before anything
+        # below could only report what it cost.
+        assert after["busy"] == before["busy"], ("an offer took RTNL mid-burst", before, after)
     assert before["installs"] == after["installs"] and before["deletes"] == after["deletes"], (before, after)
     old, new = by_key(before), by_key(after)
     assert old.keys() == new.keys() and sorted(key[0] for key in new) == sorted(wanted), (before, after)
@@ -136,14 +143,14 @@ async def test_flowtable_mtu_recovery(connections):
                     tx_after = await software_tx(r)
                     current_mtus(after, mtus)
                     # This case changes an MTU under RTNL while traffic is
-                    # flowing, so an admission can lose rtnl_trylock, decline
-                    # with -EAGAIN and retire its generation for a later retry.
-                    # Each such retry reinstalls what it retired, which is one
-                    # more install and one more delete than the directions
-                    # this is counting -- and busy is exactly how many.
-                    retries = after["busy"] - before["busy"]
-                    assert after["installs"] == before["installs"] + len(expected) + retries, (before, after)
-                    assert after["deletes"] == before["deletes"] + before["entries"] + retries, (before, after)
+                    # flowing, so an admission can lose rtnl_trylock and
+                    # decline with -EAGAIN. With no IPsec policy configured
+                    # that retires nothing -- the software path offers the
+                    # flow again about a second later -- so whatever busy
+                    # reads, the installs and deletes are exactly the
+                    # directions this is counting.
+                    assert after["installs"] == before["installs"] + len(expected), (before, after)
+                    assert after["deletes"] == before["deletes"] + before["entries"], (before, after)
                     assert after["mtu_invalidations"] == before["mtu_invalidations"] + 2, (before, after)
                     assert after["rearms"] == initial["rearms"] and not after["invalidation_done"], after
                     assert all(report["count"] > 0 for report in reports.values()), reports

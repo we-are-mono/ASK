@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A217.** A partially offloaded flow's periodic re-offer took RTNL for its installed half, and a lost trylock retired the whole generation —
+  fixed (_:/^flowtable: answer a re-offered installed direction without RTNL_).
+
 - [x] **A216.** Devices a path crosses without naming (a VLAN device under a session or tunnel, the ppp device under a tunnel) were neither held nor watched —
   fixed (_:/^flowtable: hold and watch the devices a path crosses without naming_).
 

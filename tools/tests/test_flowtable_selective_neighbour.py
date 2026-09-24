@@ -183,6 +183,12 @@ async def hardware(r, p, label, flows=FLOWS):
     tx_before, cpu_before = await software_tx(r), await cpu(r)
     reports = await p.batch(ids, count=256, interval=0.03125)
     after, tx_after, cpu_after = await r.state(), await software_tx(r), await cpu(r)
+    if any(flows[i].get("software") for i in ids):
+        # A direction Linux keeps re-offers its flow about once a second while
+        # it carries traffic. Its refusal is decided before RTNL and the
+        # installed direction's offer is answered without it, so nothing here
+        # should take RTNL at all; busy moving names an offer that did.
+        assert after["busy"] == before["busy"], ("an offer took RTNL mid-window", before, after)
     unchanged(before, after, ids, flows)
     assert before["installs"] == after["installs"] and before["deletes"] == after["deletes"], (before, after)
     old, new = by_key(before), by_key(after)

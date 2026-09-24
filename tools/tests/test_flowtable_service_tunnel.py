@@ -177,6 +177,11 @@ async def hardware(r, p, label, flows):
     async with Capture(r, label) as capture:
         reports = await p.batch(list(range(len(flows))), count=256, interval=0.03125)
     after, tx_after = await r.state(), await software_tx(r)
+    # A 4o6 UDP upload Linux keeps re-offers its flow about once a second. Its
+    # refusal is decided before RTNL and the installed direction's offer is
+    # answered without it, so nothing here should take RTNL at all; busy
+    # moving names an offer that did.
+    assert after['busy'] == before['busy'], ('an offer took RTNL mid-window', before, after)
     unchanged(before, after, list(range(len(flows))), flows)
     assert (before['installs'], before['deletes']) == (after['installs'], after['deletes'])
     old, new = by_key(before), by_key(after)
@@ -288,6 +293,7 @@ async def test_flowtable_service_tunnel_recreated(tunnel_service):
                     len(keys([0, 1, 2, 3], flows))
             await p.batch([0, 1, 2, 3], count=128, interval=0.045)
             quiet = await r.state()
+            assert quiet['busy'] == after['busy'], ('an offer took RTNL mid-window', after, quiet)
             unchanged(after, quiet, [0, 1, 2, 3], flows)
             assert (quiet['installs'], quiet['deletes']) == (after['installs'], after['deletes'])
             assert await attempts(r) == initial_attempts

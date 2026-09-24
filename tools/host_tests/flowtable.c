@@ -711,7 +711,15 @@ static void (*cleanup_hook)(void);
 static struct { struct { bool mutex; } ctrl; } instance, *cdx_info = &instance;
 static void mutex_lock(bool *m) { assert(!*m); *m = true; }
 static void mutex_unlock(bool *m) { assert(*m); *m = false; }
-static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
+/* Every attempt counts, won or lost: an offer answered without RTNL is one
+ * that never asked. */
+static unsigned rtnl_trylocks;
+static bool rtnl_trylock(void)
+{
+    rtnl_trylocks++;
+    if (rtnl_busy) return false;
+    assert(!rtnl); rtnl = true; return true;
+}
 /* Only the stopped-port sweep waits for RTNL, and it must never do so inside
  * the backend transaction: the rule callbacks its flush waits for take that. */
 static void rtnl_lock(void) { assert(!rtnl && !cdx_info->ctrl.mutex && !ft_watch_lock); rtnl = true; }
@@ -921,9 +929,21 @@ static void ft_ipsec_device_moved(const struct net_device *d) { ipsec_marked_dev
  * forwards in the clear. */
 static bool ipsec_ok = true;
 static u16 ipsec_sa, ipsec_in_sa;
+/* Whether any xfrm policy or blocking default is configured. With none, every
+ * lookup the real resolver makes returns the plain route -- no SA, no denial --
+ * so a case that wants either has to configure a policy first. That is also
+ * what sends a table's packets past the software fast path, and so what stops
+ * Linux offering its flows again. */
+static bool xfrm_policies;
+static bool xfrm_flowtable_enabled(struct net *net)
+{
+    assert(net == &init_net);
+    return !xfrm_policies;
+}
 static bool ft_ipsec_handle(const struct flow_cls_offload *cls, struct cdx_ft_rule *out,
                             struct net_device *egress, struct net_device *ingress)
 {
+    assert(xfrm_policies || (ipsec_ok && !ipsec_sa && !ipsec_in_sa));
     out->sa_handle = ipsec_sa;
     out->in_sa_handle = ipsec_in_sa;
     return ipsec_ok;
@@ -1315,6 +1335,7 @@ static void fixture(void)
     /* Both ends plain by default: a case that wants a transform says so. */
     ipsec_ok = true;
     ipsec_sa = ipsec_in_sa = 0;
+    xfrm_policies = false;
     in.ip6_mtu = 0;
     in.mtu = 1500;
     ft_ipsec_genid = xfrm_genid = 0;
@@ -1536,9 +1557,9 @@ static void test_ipv6(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     tcp_fixture(); cls.nf_mtu = 1492;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 1492);
-    fixture(); cls.nf_mtu = 1492; ipsec_sa = 7;
+    fixture(); cls.nf_mtu = 1492; xfrm_policies = true; ipsec_sa = 7;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-    fixture(); cls.nf_mtu = 1492; ipsec_in_sa = 8;
+    fixture(); cls.nf_mtu = 1492; xfrm_policies = true; ipsec_in_sa = 8;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     /* Equal is enough, and a larger ingress counts at its own size. */
     fixture(); in.ip6_mtu = 1280;
@@ -3622,14 +3643,20 @@ static void test_tunnel(void)
     TUNNEL_IN_REJECT(cls.nf_tunnel_reverse = NULL);
     /* A tunnel inside a transform, or a transform inside a tunnel, is a
      * header order nothing in this contract proves. */
-    TUNNEL_REJECT(ipsec_sa = 7);
-    TUNNEL_REJECT(ipsec_in_sa = 8);
-    TUNNEL_IN_REJECT(ipsec_sa = 7);
+    TUNNEL_REJECT(xfrm_policies = true; ipsec_sa = 7);
+    TUNNEL_REJECT(xfrm_policies = true; ipsec_in_sa = 8);
+    TUNNEL_IN_REJECT(xfrm_policies = true; ipsec_sa = 7);
     /* The outer neighbour is checked exactly as a routed flow's own is. */
-    TUNNEL_REJECT(gateway.ha[5]++);
     TUNNEL_REJECT(gateway.nud_state = NUD_FAILED);
     TUNNEL_REJECT(gateway.dev = &in);
     TUNNEL_REJECT(neigh_ok = false);
+    /* Except that its address is the one the walk recorded when the flow was
+     * created, which no later offer of the generation refreshes: a usable
+     * neighbour that has moved is stale, like a changed source address. */
+    sit_out_fixture(); gateway.ha[5]++;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -ESTALE);
+    sit_out_fixture(); gateway.ha[5]++; gateway.nud_state = NUD_FAILED;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     /* An ip6tnl device carries its own set of cross-checks. */
     TUNNEL6_REJECT(ip6tnl_priv.parms.laddr = addr6(TNL6_PREFIX, 3));
     TUNNEL6_REJECT(ip6tnl_priv.parms.raddr = addr6(TNL6_PREFIX, 4));
@@ -4561,7 +4588,7 @@ static void test_gateways(void)
     REJECT(route.dst.valid = false);
     static struct xfrm_state sa;
     REJECT(route.dst.xfrm = &sa);            /* a bundle with no route under it */
-    REJECT(ipsec_ok = false);                /* a policy claims it, hardware cannot */
+    REJECT(xfrm_policies = true; ipsec_ok = false); /* a policy claims it, hardware cannot */
     REJECT(route.dst.lwtstate = &route);
     REJECT(route.rt_type = 2); /* Local route, not forwarded unicast. */
     REJECT(route.rt_gw_family = AF_INET6);
@@ -4894,39 +4921,109 @@ static void remove_all(void)
 static void test_transient_admission(void)
 {
     struct cdx_ft_binding other_binding = { .dev = &out };
-    for (unsigned tcp = 0; tcp < 2; tcp++) {
-        if (tcp) tcp_fixture(); else fixture();
-        cls.command = FLOW_CLS_REPLACE;
-        u64 invalidations = ft_admission_invalidations, busy = ft_busy;
-        ft_fail_stage = 4;
-        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-        assert(ft_fail_stage == 4 && ft_count == 1 && !handle.invalid);
-        /* Visiting a different ingress cannot consume the fault or retire
-         * the successfully installed direction, even during real contention. */
-        rtnl_busy = true;
-        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &other_binding) == -EOPNOTSUPP);
-        assert(ft_fail_stage == 4 && ft_busy == busy && !handle.invalid);
-        rtnl_busy = false;
-        cls.cookie++; pk.src++;
-        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
-        assert(!ft_fail_stage && handle.invalid && ft_count == 1);
-        assert(ft_busy == busy + 1 && ft_admission_invalidations == invalidations + 1);
-        ft_retire_workfn(NULL);
-        assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && handle.refs == 1);
-        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
-        /* Fresh generation after native GC; the same table stays eligible. */
-        handle = (struct nf_flow_offload_handle){ .refs = 1 };
-        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-        assert(!ft_invalid && !handle.invalid && ft_count == 1);
-        rtnl_busy = true;
-        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
-        assert(handle.invalid && ft_admission_invalidations == invalidations + 2);
-        rtnl_busy = false;
-        ft_retire_workfn(NULL);
-        assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated && !live_hw);
-    }
+    for (unsigned tcp = 0; tcp < 2; tcp++)
+        for (unsigned policies = 0; policies < 2; policies++) {
+            if (tcp) tcp_fixture(); else fixture();
+            /* A policy anywhere closes the software fast path, and with it
+             * the only thing that would ever offer this flow again. None
+             * of them claims this flow. */
+            xfrm_policies = policies;
+            cls.command = FLOW_CLS_REPLACE;
+            u64 invalidations = ft_admission_invalidations, busy = ft_busy;
+            unsigned long first = cls.cookie;
+            ft_fail_stage = 4;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            assert(ft_fail_stage == 4 && ft_count == 1 && !handle.invalid);
+            /* Visiting a different ingress cannot consume the fault or retire
+             * the successfully installed direction, even during real contention. */
+            /* Nor is the visit a refusal: a rejects count that moved on
+             * visits alone would pass an oracle for a refusal that never
+             * happened. */
+            rtnl_busy = true;
+            u64 rejects = ft_rejects;
+            unsigned visits = rtnl_trylocks;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &other_binding) == -EOPNOTSUPP);
+            assert(ft_fail_stage == 4 && ft_busy == busy && !handle.invalid);
+            assert(ft_rejects == rejects && rtnl_trylocks == visits);
+            rtnl_busy = false;
+            /* Nor can the installed direction offered again, which is what
+             * Linux does alongside its other one: it never asks for RTNL. */
+            unsigned trylocks = rtnl_trylocks;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            assert(ft_fail_stage == 4 && rtnl_trylocks == trylocks && ft_count == 1);
+            /* The second direction loses RTNL. */
+            cls.cookie++; pk.src++;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
+            assert(!ft_fail_stage && ft_count == 1 && ft_busy == busy + 1);
+            if (!policies) {
+                /* Software forwards it and offers the flow again within a
+                 * second, so the installed direction keeps its hardware and
+                 * the next offer admits this one next to it. */
+                assert(!handle.invalid && ft_admission_invalidations == invalidations);
+                assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+                assert(ft_count == 2 && !handle.invalid && handle.refs == 3);
+            } else {
+                /* Nothing would offer it again, and the installed direction
+                 * keeps the generation alive from hardware alone: retire it,
+                 * so fresh traffic retries both after native GC. */
+                assert(handle.invalid && ft_admission_invalidations == invalidations + 1);
+                ft_retire_workfn(NULL);
+                assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && handle.refs == 1);
+                assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+                /* Fresh generation after native GC; the same table stays eligible. */
+                handle = (struct nf_flow_offload_handle){ .refs = 1 };
+                assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+                cls.cookie = first; pk.src--;
+                assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+                assert(ft_count == 2 && !handle.invalid && handle.refs == 3);
+            }
+            /* Both installed: however busy RTNL is, offering either again
+             * takes nothing out of hardware, and asks for nothing. */
+            rtnl_busy = true;
+            trylocks = rtnl_trylocks;
+            busy = ft_busy;
+            invalidations = ft_admission_invalidations;
+            for (unsigned direction = 0; direction < 2; direction++) {
+                cls.cookie = first + direction; pk.src = htons(10000) + direction;
+                assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            }
+            rtnl_busy = false;
+            assert(!handle.invalid && ft_count == 2 && handle.refs == 3 && live_hw == 2);
+            assert(rtnl_trylocks == trylocks && ft_busy == busy &&
+                   ft_admission_invalidations == invalidations);
+            remove_all();
+        }
+    /* RTNL really held elsewhere, on the first offer of a flow and on the
+     * second direction of one whose first is installed. With software
+     * forwarding the flow nothing is retired and the next offer admits the
+     * direction; with a policy closing that path, retiring the generation is
+     * what lets fresh traffic retry. */
+    for (unsigned installed = 0; installed < 2; installed++)
+        for (unsigned policies = 0; policies < 2; policies++) {
+            fixture(); cls.command = FLOW_CLS_REPLACE;
+            xfrm_policies = policies;
+            if (installed) {
+                assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+                cls.cookie++; pk.src++;
+            }
+            u64 invalidations = ft_admission_invalidations, busy = ft_busy;
+            rtnl_busy = true;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
+            rtnl_busy = false;
+            assert(ft_busy == busy + 1 && ft_count == installed);
+            assert(handle.invalid == !!policies &&
+                   ft_admission_invalidations == invalidations + policies);
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) ==
+                   (policies ? -EOPNOTSUPP : 0));
+            assert(ft_count == installed + !policies);
+            if (policies) ft_retire_workfn(NULL);
+            remove_all();
+        }
+    /* A latch pending owns the recovery, even where a lost RTNL would
+     * otherwise retire the generation. */
     for (unsigned excluded = 0; excluded < 4; excluded++) {
         fixture(); cls.command = FLOW_CLS_REPLACE;
+        xfrm_policies = true;
         u64 invalidations = ft_admission_invalidations;
         ft_observe = excluded == 0; ft_stopping = excluded == 1;
         ft_invalid = excluded == 2; ft_fatal = excluded == 3;
@@ -4971,6 +5068,214 @@ static void test_allocation_admission_recovery(void)
                 assert(ft_remove(ft_find(&binding, cls.cookie)) == 0);
                 cdx_ft_end();
             }
+}
+
+/* A direction already in hardware offered again, which Linux does about once
+ * a second while software forwards the flow's other direction. */
+static void test_installed_reoffer(void)
+{
+    for (unsigned stale = 0; stale < 3; stale++)
+        for (unsigned policies = 0; policies < 2; policies++) {
+            fixture(); cls.command = FLOW_CLS_REPLACE;
+            xfrm_policies = policies;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            struct cdx_ft_entry *installed = ft_find(&binding, cls.cookie);
+            u64 busy = ft_busy, rejects = ft_rejects, validated = ft_validated;
+            u64 admission = ft_admission_invalidations, policy = ft_ipsec_policy_invalidations;
+            u64 routes = ft_route_invalidations;
+            unsigned trylocks = rtnl_trylocks, lookups = police_lookups;
+            /* What no lock orders against an offer still counts: a policy
+             * generation or a borrowed route that has moved on. */
+            if (stale == 1) xfrm_genid++;
+            if (stale == 2) route.dst.valid = false;
+            rtnl_busy = true;
+            int rc = ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding);
+            rtnl_busy = false;
+            /* Answered without RTNL and without a walk, whatever the answer. */
+            assert(rtnl_trylocks == trylocks && ft_busy == busy && ft_validated == validated &&
+                   police_lookups == lookups && ft_admission_invalidations == admission);
+            assert(ft_find(&binding, cls.cookie) == installed && ft_count == 1 && live_hw == 1);
+            if (!stale) {
+                assert(rc == 0 && !handle.invalid && handle.refs == 2 && ft_rejects == rejects);
+                assert(installed->handle == &handle && ft_handle_refs == 1);
+                remove_all();
+                continue;
+            }
+            assert(rc == -EOPNOTSUPP && handle.invalid && ft_rejects == rejects + 1);
+            assert(ft_ipsec_policy_invalidations == policy + (stale == 1));
+            assert(ft_route_invalidations == routes + (stale == 2));
+            ft_retire_workfn(NULL);
+            assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated && !live_hw);
+        }
+    /* The IPv6 ingress MTU is a sysctl no event reports. A partially offloaded
+     * flow is offered again every second, which is when a raised LAN IPv6 MTU
+     * has to take its installed direction out -- also without RTNL. */
+    for (unsigned raised = 0; raised < 2; raised++) {
+        fixture6(); cls.command = FLOW_CLS_REPLACE;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
+        u64 mtu = ft_mtu_invalidations, rejects = ft_rejects;
+        unsigned trylocks = rtnl_trylocks;
+        if (raised) in.ip6_mtu = 1500;
+        rtnl_busy = true;
+        int rc = ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding);
+        rtnl_busy = false;
+        assert(rtnl_trylocks == trylocks && ft_count == 1);
+        assert(rc == (raised ? -EOPNOTSUPP : 0) && handle.invalid == !!raised);
+        assert(ft_mtu_invalidations == mtu + raised && ft_rejects == rejects + raised);
+        if (raised) ft_retire_workfn(NULL); else remove_all();
+        assert(!ft_count && !ft_handle_refs);
+    }
+    /* A generation already retired -- by an event, a latch or Linux itself --
+     * is not an installed direction to answer for. The offer goes through
+     * admission: with RTNL it is refused and the entry taken out at once, and
+     * with RTNL busy it is declined and the retirement already queued takes it
+     * out, retiring nothing more. */
+    for (unsigned busy = 0; busy < 2; busy++) {
+        fixture(); cls.command = FLOW_CLS_REPLACE;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        nf_flow_offload_handle_invalidate(&handle);
+        u64 busy_before = ft_busy, admission = ft_admission_invalidations;
+        unsigned trylocks = rtnl_trylocks;
+        rtnl_busy = busy;
+        int rc = ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding);
+        rtnl_busy = false;
+        assert(rtnl_trylocks == trylocks + 1 && ft_admission_invalidations == admission);
+        assert(rc == (busy ? -EAGAIN : -EOPNOTSUPP) && ft_busy == busy_before + busy);
+        assert(ft_count == busy);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated && !live_hw);
+    }
+    /* A latch pending sends the offer the way it always went, through
+     * admission, which takes the entry out. */
+    unsigned trylocks;
+    for (unsigned latch = 0; latch < 4; latch++) {
+        fixture(); cls.command = FLOW_CLS_REPLACE;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        trylocks = rtnl_trylocks;
+        ft_observe = latch == 0; ft_stopping = latch == 1;
+        ft_invalid = latch == 2; ft_fatal = latch == 3;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+        ft_observe = ft_stopping = ft_fatal = false; ft_invalid = 0;
+        assert(rtnl_trylocks == trylocks + 1 && !ft_count && !live_hw && !allocated);
+    }
+    /* An offer from another generation under the same cookie is not the
+     * installed direction, and admission refuses it as before. */
+    fixture(); cls.command = FLOW_CLS_REPLACE;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    struct nf_flow_offload_handle other = { .refs = 1 };
+    struct cdx_ft_entry *current = ft_find(&binding, cls.cookie);
+    assert(ft_offer_installed(current, &cls));
+    cls.nf_handle = &other;
+    assert(!ft_offer_installed(current, &cls));
+    trylocks = rtnl_trylocks;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -ESTALE);
+    assert(rtnl_trylocks == trylocks + 1 && ft_count == 1 && other.refs == 1 && !other.invalid);
+    cls.nf_handle = &handle;
+    remove_all();
+}
+
+/* Either kind of direction from the same connection: one that arrives through
+ * a tunnel -- 4in6, or 6in4 when the flow is IPv6 -- or the same flow arriving
+ * on the port directly. */
+static void arrival_fixture(bool ipv6, bool tunnel)
+{
+    if (tunnel) {
+        if (ipv6) sit_in_fixture(); else ip6tnl_in_fixture();
+    } else {
+        if (ipv6) fixture6(); else fixture();
+    }
+    cls.command = FLOW_CLS_REPLACE;
+}
+
+/* A direction that arrives through a tunnel is never offered again by its own
+ * traffic: its tuple names the port below the tunnel, where software sees only
+ * the outer packet. With its sibling in hardware, a refusal that clears by
+ * itself therefore retires the generation, where a direction the fast path
+ * forwards simply waits for its next offer. */
+static void test_tunnel_arrival_retry(void)
+{
+    for (unsigned ipv6 = 0; ipv6 < 2; ipv6++)
+        for (unsigned tunnel = 0; tunnel < 2; tunnel++) {
+            /* RTNL lost on the second direction. */
+            arrival_fixture(ipv6, tunnel);
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            cls.cookie++; pk.src++;
+            u64 invalidations = ft_admission_invalidations, busy = ft_busy;
+            rtnl_busy = true;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
+            rtnl_busy = false;
+            assert(ft_busy == busy + 1 && ft_count == 1);
+            assert(handle.invalid == !!tunnel &&
+                   ft_admission_invalidations == invalidations + tunnel);
+            ft_retire_workfn(NULL);
+            remove_all();
+
+            /* A hardware key another generation still holds: the one Linux
+             * tore down, whose removal has not run yet. */
+            struct nf_flow_offload_handle old = { .refs = 1 };
+            arrival_fixture(ipv6, tunnel);
+            cls.nf_handle = &old; cls.cookie = 900;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            cls.nf_handle = &handle; cls.cookie = 901; pk.src++;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            cls.cookie = 902; pk.src--;
+            invalidations = ft_admission_invalidations;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EEXIST);
+            assert(handle.invalid == !!tunnel && !old.invalid &&
+                   ft_admission_invalidations == invalidations + tunnel);
+            ft_retire_workfn(NULL);
+            assert(ft_count == 2 - tunnel);
+            remove_all();
+            assert(old.refs == 1);
+
+            /* A full table keeps the direction that holds a slot. */
+            arrival_fixture(ipv6, tunnel);
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            cls.cookie++; pk.src++;
+            unsigned count = ft_count, attempts = rtnl_trylocks;
+            u64 rejects = ft_rejects;
+            busy = ft_busy;
+            ft_count = CDX_FT_MAX_ENTRIES;
+            rtnl_busy = !tunnel;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -ENOSPC);
+            rtnl_busy = false;
+            ft_count = count;
+            assert(!handle.invalid && ft_count == 1);
+            /* Refused before RTNL where software keeps offering it, since
+             * it would be refused again every second until a slot frees;
+             * where nothing offers it again, admission decides. */
+            assert(rtnl_trylocks == attempts + tunnel && ft_busy == busy);
+            assert(ft_rejects == rejects + 1);
+            remove_all();
+
+            /* And so does a neighbour this adapter cannot use, which Linux
+             * never offers unresolved: what reaches here raced the offer, or
+             * is a state that would be refused again after readmission. */
+            arrival_fixture(ipv6, tunnel);
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            cls.cookie++; pk.src++;
+            neighbour.ha[5]++;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+            neighbour.ha[5]--;
+            assert(!handle.invalid && ft_count == 1);
+            remove_all();
+        }
+    /* A tunnel's egress whose outer next hop has moved since the walk
+     * recorded it would be refused on every later offer of the generation,
+     * so the first retires it and the next generation walks the path afresh.
+     * One still resolving waits for the next offer instead. */
+    for (unsigned moved = 0; moved < 2; moved++) {
+        sit_out_fixture(); cls.command = FLOW_CLS_REPLACE;
+        if (moved)
+            gateway.ha[5]++;
+        else
+            gateway.nud_state = NUD_INCOMPLETE;
+        u64 macs = ft_mac_invalidations;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) ==
+               (moved ? -ESTALE : -EOPNOTSUPP));
+        assert(handle.invalid == !!moved && ft_mac_invalidations == macs + moved);
+        assert(!ft_count);
+    }
 }
 
 /* Devices a direction crosses without the rule naming them: held while it is
@@ -5162,6 +5467,190 @@ static void test_crossed_devices(void)
         assert(!ft_fail_stage && !ft_count && !out_tag.refs && !out_qinq.refs);
         drop_dev_records();
     }
+}
+
+/* A direction the MTU bound keeps out, offered again for as long as software
+ * forwards it: refused before RTNL, never counted busy, retiring nothing. */
+static void test_mtu_before_admission(void)
+{
+    static struct xfrm_state sa;
+    struct cdx_ft_rule decoded;
+
+    /* The PPPoE uplink: the download admitted through its session, the
+     * upload from a 1500-byte LAN port refused -- offered in the order
+     * Linux offers them, three rounds, RTNL held elsewhere every other one. */
+    pppoe_in_fixture(); cls.command = FLOW_CLS_REPLACE;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
+    unsigned long download = cls.cookie;
+    cls.cookie++; pk.src++;
+    reverse_route.dst.dev = &in;
+    ingress_session = (struct nf_flow_session){};
+    route.dst.dev = &ppp;
+    cls.nf_mtu = ppp.mtu;
+    egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex, .id = SESSION_ID };
+    memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
+    zero_ethernet_dest();
+    session_push(SESSION_ID);
+    u64 busy = ft_busy, rejects = ft_rejects, validated = ft_validated;
+    u64 admission = ft_admission_invalidations;
+    unsigned trylocks = rtnl_trylocks, lookups = police_lookups;
+    assert(ft_mtu_refused(&cls));
+    for (unsigned offer = 0; offer < 3; offer++) {
+        rtnl_busy = offer & 1;
+        cls.cookie = download;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        cls.cookie = download + 1;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+    }
+    rtnl_busy = false;
+    assert(rtnl_trylocks == trylocks && ft_busy == busy && ft_rejects == rejects + 3);
+    assert(ft_validated == validated && police_lookups == lookups);
+    assert(!handle.invalid && ft_admission_invalidations == admission);
+    assert(ft_count == 1 && ft_find(&binding, download) && !ft_find(&binding, download + 1));
+    /* The refusal is the one ft_parse() makes. */
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    remove_all();
+
+    /* What is not certain goes to admission, which decides as before. TCP
+     * is carried into the smaller path. */
+    tcp_fixture(); cls.command = FLOW_CLS_REPLACE; cls.nf_mtu = 1492;
+    trylocks = rtnl_trylocks;
+    assert(!ft_mtu_refused(&cls));
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
+    assert(rtnl_trylocks == trylocks + 1);
+    remove_all();
+    /* With a policy configured an SA may exempt the direction, or a policy
+     * deny it and retire the generation; the walk finds out which. */
+    for (unsigned exempt = 0; exempt < 2; exempt++) {
+        fixture(); cls.command = FLOW_CLS_REPLACE; cls.nf_mtu = 1492;
+        xfrm_policies = true;
+        ipsec_sa = exempt ? 7 : 0;
+        trylocks = rtnl_trylocks;
+        assert(!ft_mtu_refused(&cls));
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == (exempt ? 0 : -EOPNOTSUPP));
+        assert(rtnl_trylocks == trylocks + 1 && ft_count == exempt);
+        remove_all();
+    }
+    /* Nor is a transform on either destination left to this. */
+    fixture(); cls.nf_mtu = 1492;
+    route.dst.xfrm = &sa;
+    assert(!ft_mtu_refused(&cls));
+    fixture(); cls.nf_mtu = 1492;
+    reverse_route.dst.xfrm = &sa;
+    assert(!ft_mtu_refused(&cls));
+    /* A request this cannot read is not one it refuses. */
+    fixture(); cls.nf_mtu = 1492; bm.ip_proto = 0;
+    assert(!ft_mtu_refused(&cls));
+    fixture(); cls.nf_mtu = 1492; bm.n_proto = 0;
+    assert(!ft_mtu_refused(&cls));
+    fixture(); cls.nf_mtu = 1492; dissector.used_keys &= ~BIT_ULL(FLOW_DISSECTOR_KEY_BASIC);
+    assert(!ft_mtu_refused(&cls));
+    fixture(); cls.nf_mtu = 1492; cls.nf_dst_reverse = NULL;
+    assert(!ft_mtu_refused(&cls));
+    fixture(); cls.nf_mtu = 1492; cls.nf_dst = NULL;
+    assert(!ft_mtu_refused(&cls));
+    fixture(); cls.nf_mtu = 1492; cls.rule = NULL;
+    assert(!ft_mtu_refused(&cls));
+    /* Nor a path the bound admits, the ordinary Ethernet WAN. */
+    fixture();
+    assert(!ft_mtu_refused(&cls));
+
+    /* IPv6 is refused on its own bound, the ingress IPv6 MTU, for every
+     * protocol -- and admitted through RTNL once the LAN advertises the path. */
+    for (unsigned tcp = 0; tcp < 2; tcp++) {
+        fixture6(); cls.command = FLOW_CLS_REPLACE;
+        if (tcp) tcp_flow();
+        in.ip6_mtu = 1500;
+        trylocks = rtnl_trylocks; busy = ft_busy;
+        assert(ft_mtu_refused(&cls));
+        rtnl_busy = true;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+        rtnl_busy = false;
+        assert(rtnl_trylocks == trylocks && ft_busy == busy && !handle.invalid && !ft_count);
+        in.ip6_mtu = cls.nf_mtu;
+        assert(!ft_mtu_refused(&cls));
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
+        assert(rtnl_trylocks == trylocks + 1);
+        remove_all();
+    }
+}
+
+/* The early refusal never refuses what admission would admit: every ingress
+ * shape the walk can find, both families, both protocols, with and without a
+ * policy or an SA, across ingress MTUs and paths either side of each bound. And
+ * where only the MTU can decide, it refuses exactly what admission refuses. */
+static void test_mtu_refusal_sound(void)
+{
+    enum { PLAIN, SESSION, TUNNEL, SESSION_TUNNEL, TAG, BRIDGE,
+           PLAIN6, SESSION6, TUNNEL6, SHAPES };
+    static const int ingress[] = { 1280, 1400, 1440, 1452, 1460, 1480, 1491, 1492,
+                                   1493, 1500, 1508, 9000 };
+    static const u16 paths[] = { 68, 1279, 1280, 1400, 1440, 1451, 1452, 1453, 1459,
+                                 1460, 1480, 1491, 1492, 1493, 1499, 1500, 1508, 9000 };
+    unsigned refused = 0, exact = 0;
+
+    for (unsigned shape = 0; shape < SHAPES; shape++)
+    for (unsigned tcp = 0; tcp < 2; tcp++)
+    for (unsigned sec = 0; sec < 4; sec++)
+    for (unsigned i = 0; i < ARRAY_SIZE(ingress); i++)
+    for (unsigned p = 0; p < ARRAY_SIZE(paths); p++) {
+        struct net_device *logical;
+        struct cdx_ft_rule decoded;
+
+        switch (shape) {
+        case PLAIN: fixture(); logical = &in; break;
+        case SESSION: pppoe_in_fixture(); logical = &in_ppp; break;
+        case TUNNEL: ip6tnl_in_fixture(); logical = &in_ip6tnl; break;
+        case SESSION_TUNNEL:
+            ip6tnl_in_fixture();
+            ingress_tunnel.lower_ifindex = in_ppp.ifindex;
+            memset(ingress_tunnel.h_dest, 0, ETH_ALEN);
+            ingress_session = (struct nf_flow_session){ .lower_ifindex = in.ifindex,
+                                                        .id = SESSION_ID + 1 };
+            memcpy(ingress_session.h_dest, AC_MAC, ETH_ALEN);
+            logical = &in_ip6tnl;
+            break;
+        case TAG: ingress_tag_fixture(); logical = &in_tag; break;
+        case BRIDGE: bridge_fixture(); reverse_route.dst.dev = &in_br; logical = &in_br; break;
+        case PLAIN6: fixture6(); logical = &in; break;
+        case SESSION6:
+            fixture6();
+            reverse_route6.dst.dev = &in_ppp;
+            ingress_session = (struct nf_flow_session){ .lower_ifindex = in.ifindex,
+                                                        .id = SESSION_ID + 1 };
+            memcpy(ingress_session.h_dest, AC_MAC, ETH_ALEN);
+            logical = &in_ppp;
+            break;
+        default: sit_in_fixture(); logical = &in_sit; break;
+        }
+        if (tcp) tcp_flow(); else udp_flow();
+        /* None, a policy claiming nothing, an SA sending, an SA receiving. */
+        xfrm_policies = sec > 0;
+        ipsec_sa = sec == 2 ? 7 : 0;
+        ipsec_in_sa = sec == 3 ? 8 : 0;
+        /* The IPv6 MTU follows the device's, so one number moves both. */
+        logical->mtu = ingress[i];
+        logical->ip6_mtu = 0;
+        out.mtu = 9000;
+        cls.nf_mtu = paths[p];
+        bool early = ft_mtu_refused(&cls);
+        int rc = ft_parse(&binding, &cls, &decoded, &next_hop);
+        assert(!early || rc == -EOPNOTSUPP);
+        refused += early;
+        /* Behind a session under 4in6 the IPv4 bound is at its lowest, which
+         * is the one the early refusal assumes; IPv6 reads nothing else. */
+        if (!sec && ((shape == SESSION_TUNNEL && !tcp) || shape >= PLAIN6)) {
+            assert(early == (rc != 0));
+            exact++;
+        }
+        logical->mtu = logical == &in ? 1500 : logical == &in_ppp ? 1492 :
+                       logical == &in_ip6tnl ? 1452 : logical == &in_sit ? 1480 : 1500;
+        logical->ip6_mtu = 0;
+        out.mtu = 1500;
+    }
+    assert(refused && exact);
+    xfrm_policies = false;
+    ipsec_sa = ipsec_in_sa = 0;
 }
 
 static void test_ipsec_generation_retirement(void)
@@ -6000,7 +6489,11 @@ int main(void)
     test_device_recovery();
     test_transient_admission();
     test_allocation_admission_recovery();
+    test_installed_reoffer();
+    test_tunnel_arrival_retry();
     test_crossed_devices();
+    test_mtu_before_admission();
+    test_mtu_refusal_sound();
     test_ipsec_generation_retirement();
     test_nexthop_objects();
     test_qos_decode();

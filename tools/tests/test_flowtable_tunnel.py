@@ -230,7 +230,8 @@ async def _offload_table(r, proto="udp"):
 async def _admit(r, timeout=15):
     """Exchange short bursts until the expected directions are installed. A
     deadline rather than a round count: an admission that loses rtnl_trylock
-    is declined and re-offered only after two flowtable GC ticks."""
+    is declined, and the software path offers the flow again only about a
+    second later, while traffic keeps it there."""
     deadline = time.monotonic() + timeout
     while True:
         await _udp_exchange(r, 4)

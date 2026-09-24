@@ -166,9 +166,11 @@ argument; neither is configured in the shipping product today.
 
 Concretely:
 
-- `struct cdx_ft_rule` gains a `u32 qos` field. It is part of the key, so a mark
-  change produces a different rule and `ft_replace`'s `memcmp` reinstalls it,
-  exactly as the IPv6 widening reached every index at once.
+- `struct cdx_ft_rule` gains a `u32 qos` field. It is part of the rule, so the
+  class is part of what a direction is installed with, exactly as the IPv6
+  widening reached every index at once. An installed direction is not decoded
+  again when Linux re-offers its flow (see the contract below and the
+  [architecture](architecture.md)), so a later mark change does not move it.
 - `ft_parse` replaces the zero-mark refusal with a decode under a configured
   mask, so the mark can be shared with `mwan3` and firewall policy routing the
   way `fwmark` masks are shared everywhere else in OpenWrt. The policy tool

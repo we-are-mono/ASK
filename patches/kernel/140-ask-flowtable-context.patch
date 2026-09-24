@@ -21,10 +21,10 @@ Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
  net/netfilter/nf_flow_table_offload.c |  95 +++++++++++++++++++++++-
  net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++++++++-----
  net/xfrm/xfrm_device.c                |  29 ++++++--
- net/xfrm/xfrm_policy.c                |  75 ++++++++++++++++++-
+ net/xfrm/xfrm_policy.c                |  77 ++++++++++++++++++-
  net/xfrm/xfrm_state.c                 |  25 +++++--
  net/xfrm/xfrm_user.c                  |   6 ++
- 19 files changed, 677 insertions(+), 76 deletions(-)
+ 19 files changed, 679 insertions(+), 76 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index 2919329..a6780e8 100644
@@ -1489,7 +1489,7 @@ index 7744ed8..ee88242 100644
  	return true;
  }
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index 40e3676..e94dcb8 100644
+index 40e3676..33d9b3d 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
 @@ -34,6 +34,7 @@
@@ -1538,7 +1538,7 @@ index 40e3676..e94dcb8 100644
  
  	return pol;
  }
-@@ -3583,6 +3598,58 @@ static inline int secpath_has_nontransport(const struct sec_path *sp, int k, int
+@@ -3583,6 +3598,60 @@ static inline int secpath_has_nontransport(const struct sec_path *sp, int k, int
  	return 0;
  }
  
@@ -1555,10 +1555,12 @@ index 40e3676..e94dcb8 100644
 +	int i, k = 0, idx;
 +
 +	/* A packet mark can be assigned by prerouting after a hardware lookup.
-+	 * The conntrack mark is not a substitute for that classification. */
++	 * The conntrack mark is not a substitute for that classification. A
++	 * socket's own policy governs only that socket's packets, never a
++	 * forwarded one, so a mark on it decides nothing here. */
 +	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
 +	list_for_each_entry(pol, &net->xfrm.policy_all, walk.all) {
-+		if (!pol->walk.dead && pol->mark.m) {
++		if (!xfrm_policy_is_dead_or_sk(pol) && pol->mark.m) {
 +			spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
 +			return false;
 +		}
@@ -1597,7 +1599,7 @@ index 40e3676..e94dcb8 100644
  static bool icmp_err_packet(const struct flowi *fl, unsigned short family)
  {
  	const struct flowi4 *fl4 = &fl->u.ip4;
-@@ -3862,7 +3929,8 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+@@ -3862,7 +3931,8 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
  			tpp = stp;
  		}
  
@@ -1607,7 +1609,7 @@ index 40e3676..e94dcb8 100644
  			/* This policy template was already checked by HW
  			 * and secpath was removed in __xfrm_policy_check2.
  			 */
-@@ -4372,6 +4440,7 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4372,6 +4442,7 @@ static int __net_init xfrm_net_init(struct net *net)
  
  	/* Initialize the per-net locks here */
  	spin_lock_init(&net->xfrm.xfrm_state_lock);
@@ -1615,7 +1617,7 @@ index 40e3676..e94dcb8 100644
  	spin_lock_init(&net->xfrm.xfrm_policy_lock);
  	seqcount_spinlock_init(&net->xfrm.xfrm_policy_hash_generation, &net->xfrm.xfrm_policy_lock);
  	mutex_init(&net->xfrm.xfrm_cfg_mutex);
-@@ -4670,6 +4739,8 @@ static int xfrm_policy_migrate(struct xfrm_policy *pol,
+@@ -4670,6 +4741,8 @@ static int xfrm_policy_migrate(struct xfrm_policy *pol,
  		}
  	}
  

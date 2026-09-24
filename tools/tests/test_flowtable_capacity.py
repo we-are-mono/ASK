@@ -297,9 +297,11 @@ async def test_flowtable_capacity_overflow_and_reuse(rig):
             reused = await r.state()
             r.record("capacity-reuse", reused)
             unchanged(full, reused, excluded=removed)
-            # A new generation can lose RTNL between directional admissions.
-            # Its shared handle then retires any provisional hardware before
-            # Linux retries. Existing owners must survive unchanged; account
+            # A new generation can lose RTNL between directional admissions;
+            # with no IPsec policy configured that only declines the offer, and
+            # the software path offers it again. Anything retired here is a
+            # generation the adapter retired for its own admission reason,
+            # which it counts. Existing owners must survive unchanged; account
             # for this bounded, explicitly reported admission recovery.
             retries = reused["admission_invalidations"] - freed["admission_invalidations"]
             retired = reused["deletes"] - freed["deletes"]

@@ -367,7 +367,12 @@ struct xfrm_state {
 	unsigned refs;
 };
 
+#define XFRM_POLICY_OUT 1
 #define XFRM_POLICY_FWD 2
+#define XFRM_POLICY_MAX 3
+/* A policy's direction is the low three bits of its index, and a socket's
+ * own policy is filed under XFRM_POLICY_MAX plus its direction. */
+static inline int xfrm_policy_id2dir(u32 index) { return index & 7; }
 #define XFRM_POLICY_TYPE_MAIN 0
 #define XFRM_POLICY_ALLOW 0
 #define XFRM_USERPOLICY_BLOCK 1
@@ -398,6 +403,7 @@ struct xfrm_policy {
 	struct xfrm_dev_offload xdo;
 	struct { struct list_head all; bool dead; } walk;
 	struct { u32 m; } mark;
+	u32 index;
 	int type, action, xfrm_nr;
 	struct xfrm_tmpl xfrm_vec[XFRM_MAX_DEPTH];
 	unsigned refs;
@@ -1412,6 +1418,14 @@ static void test_receiving_policy(void)
 		pol.mark.m = 0xff;
 		list_add_tail(&pol.walk.all, &init_net.xfrm.policy_all);
 		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+#ifdef FT_SOCKET_POLICY_EXEMPT
+		/* A socket's own policy governs that socket's packets and never a
+		 * forwarded one, however it is marked. */
+		pol.index = 8 + XFRM_POLICY_MAX + XFRM_POLICY_OUT;
+		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		pol.index = 8 + XFRM_POLICY_FWD;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+#endif
 		pol.walk.dead = true;
 		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
 		list_del(&pol.walk.all);

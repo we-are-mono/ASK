@@ -78,6 +78,18 @@ description reaching it is what is new. Because the ingress half is the one
 Netfilter hides, it is the half most likely to be silently refused, which is
 why every hardware case below asserts both directions separately.
 
+The ingress half is also the one Linux never offers again by itself. Its tuple
+names the port below the tunnel, as the hardware needs, and there the software
+fast path sees only the outer packet, which its tuple parser does not accept;
+the inner packet the tunnel device delivers arrives on a device the tuple does
+not name. Only the egress half's software traffic re-offers the flow, and that
+stops the moment the egress half is in hardware. So a refusal of the ingress
+half that clears by itself -- a lost RTNL, a hardware key still held by the
+connection's previous generation -- retires the whole generation, and native GC
+and the next packet readmit both halves, where a direction the fast path
+forwards would simply wait for its next offer
+([architecture](architecture.md#references-and-directional-resources)).
+
 ## What stands in for the neighbour
 
 A tunnel device is `IFF_NOARP` and resolves no Ethernet destination of its own,
@@ -91,6 +103,16 @@ the flow, and the outer route going away retires it through the route watch,
 matched on the *outer* remote in the outer header's family rather than on the
 inner destination the tuple names. The inner next hop the tuple carries is a
 fiction with a zero address, and nothing watches it.
+
+Before a direction is installed there is nothing to watch, and the outer
+address is the one the walk recorded when Linux created the flow: no later
+offer of that generation carries a newer one, and Linux never checks it -- it
+resolves only the tunnel device's own NOARP neighbour. An outer neighbour still
+resolving refuses the direction until its next offer. One that is usable but
+names another address than the recorded one would refuse every offer of the
+generation, so it is treated as stale, the way a changed source address is:
+the generation is retired (`mac_invalidations`) and the next one walks the
+path afresh.
 
 One consequence surfaces in the Ethernet mangle words. A tunnel device is
 NOARP but, unlike a ppp device, it has header ops and an address — its own

@@ -335,10 +335,12 @@ def _hardware_delta(before, after):
 async def _drive(r, send, settled, failure, timeout=10):
     """Exchange traffic until `settled(state)` holds, failing with `failure`
     once `timeout` seconds have passed. A deadline, not a round count: an
-    admission can lose rtnl_trylock in the backend, which declines it and
-    retires the generation, and Linux re-offers the flow only after two
-    flowtable GC ticks. A round is one short LAN exchange plus a state read,
-    well under a second, so the default covers that retry several times."""
+    admission can lose rtnl_trylock in the backend, which declines it, and the
+    software path offers the flow again only about a second later -- or, where
+    an IPsec policy keeps the flow off that path, the generation is retired
+    and re-offered after two flowtable GC ticks. A round is one short LAN
+    exchange plus a state read, well under a second, so the default covers
+    that retry several times."""
     deadline = time.monotonic() + timeout
     while True:
         await send()
@@ -556,8 +558,9 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
             """`expected` maps egress device to MTU: a direction describes the
             path it leaves by, so only the one egressing the changed device
             moves."""
-            # The reduce step below retires the flow twice over (the MTU change,
-            # then the injected lost RTNL), four GC ticks in the worst case.
+            # The reduce step below retires the flow once, for the MTU change,
+            # and then has one readmission declined for the injected lost RTNL,
+            # which the software path offers again about a second later.
             return await _drive(r, send, lambda s: s["entries"] == 2 and all(
                 int(f["mtu"]) == expected[f["out"]] for f in s["flows"]),
                 f"IPv6 flow did not settle at MTU {expected}", timeout=20)
@@ -569,9 +572,11 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
         #
         # The readmission is made to lose RTNL on its second direction. The
         # backend never waits for RTNL under its transaction: it declines with
-        # -EAGAIN, retires the generation, and Linux re-offers the flow after
-        # two flowtable GC ticks. Any RTNL holder can cause that in production,
-        # so the re-description has to survive it every run, not by chance.
+        # -EAGAIN and, with no IPsec policy configured, retires nothing -- the
+        # first direction stays installed, and the software path forwarding
+        # the second offers the flow again about a second later. Any RTNL
+        # holder can cause that in production, so the re-description has to
+        # survive it every run, not by chance.
         #
         # The LAN's IPv6 MTU goes first: lowering it leaves both installed
         # directions bounded, so nothing retires until the device change.
@@ -591,7 +596,8 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
             assert (await r.target.fs_write(r.session, knob, "0"))["errno"] == 0
         assert reduced["errors"] == r.errors, reduced
         assert reduced["busy"] >= initial["busy"] + 1, (initial, reduced)
-        assert reduced["admission_invalidations"] >= initial["admission_invalidations"] + 1, \
+        # The lost RTNL declined an offer and retired nothing.
+        assert reduced["admission_invalidations"] == initial["admission_invalidations"], \
             (initial, reduced)
         r.record("ipv6-mtu-reduced", {"retired": retired, "reduced": reduced})
         # The LAN first again, so the WAN-to-LAN direction is never left

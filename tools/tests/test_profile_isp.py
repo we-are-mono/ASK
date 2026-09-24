@@ -460,9 +460,9 @@ async def _admit(ctx, client, *, peer, dport, sport, timeout=20, label="profile_
     Linux's (see _upload_in_linux), whose refusal is then counted.
 
     A deadline rather than a round count: an admission that loses rtnl_trylock
-    is declined and re-offered only after two flowtable GC ticks, and nothing
-    re-offers a retired flow on its own -- so every attempt has to send before it
-    looks.
+    is declined, and the software path offers the flow again only about a
+    second later, while traffic keeps it there; nothing re-offers a retired
+    flow on its own -- so every attempt has to send before it looks.
     """
     source = _bracketed(_source_address(client, peer))
     target = _bracketed(peer)
@@ -504,8 +504,8 @@ async def _accounted(ctx, client, *, peer, dport, sport, count=128, payload_size
     upload is Linux's.
 
     Three things are required of that burst and all three are needed: the rows
-    are the same rows -- the cookies did not move, so nothing was readmitted
-    underneath the measurement -- the classifier
+    are the same rows -- the cookies did not move and no offer took RTNL,
+    so nothing was readmitted underneath the measurement -- the classifier
     counted every frame, and the physical ports' software receive counters did
     not. The bound on the WAN port is looser because the agent's own control
     channel shares it; the LAN port carries nothing but the profile. An upload
@@ -558,8 +558,8 @@ async def _tcp_accounted(ctx, client, *, peer, dport, label="profile_isp"):
 
     TCP is how the IPv4 upload is proved on this profile (see
     _upload_in_linux). The measured phase must be hardware's: the same two
-    rows, a hundred packets or more each, nothing installed or retired
-    meanwhile, and the WAN port's software transmit count well below
+    rows, a hundred packets or more each, nothing installed, retired or
+    declined meanwhile, and the WAN port's software transmit count well below
     the upload. The client lets the kernel pick its port, so a connection an
     earlier case left in TIME_WAIT is never in the way; the rows are found by
     the far end's port, which no other TCP connection here uses, and joined

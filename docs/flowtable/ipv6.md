@@ -90,8 +90,12 @@ advertisements) is no larger than the direction's own. A direction refused for
 this stays on the software flowtable path, where the oversized packet reaches
 `ip6_forward()` and gets its Packet Too Big; the reverse direction is admitted
 on its own. The IPv6 MTU is a sysctl that no device event reports, so every
-stats pass rechecks the bound and retires an installed direction that no
-longer satisfies it (counted as `mtu_invalidations`).
+stats pass, and every time Linux offers an installed direction again, rechecks
+the bound and retires an installed direction that no longer satisfies it
+(counted as `mtu_invalidations`). The re-offer is what reaches the installed
+half of a partially offloaded flow within a second, since Linux offers such a
+flow again every second its other half forwards in software; the stats pass
+reaches it too, on the statistics period.
 
 Equal MTUs everywhere, the ordinary case, are unaffected. A smaller upstream
 is where it shows: IPv6 leaving a 1500-byte LAN by PPPoE (1492) or a 6in4
@@ -202,7 +206,8 @@ handle. The WAN port is reduced to 1400 together with the LAN's IPv6 MTU, as
 an operator would, so both directions come back at 1400 in hardware.
 `test_flowtable_ipv6_mtu_bound` proves the bound itself: with the WAN route
 locked to 1280 and the LAN's IPv6 MTU at 1280, only the LAN-to-WAN direction
-is admitted; raising the LAN to 1500 retires it on the next stats pass and the
+is admitted; raising the LAN to 1500 retires it on the next stats pass or
+re-offer and the
 flow comes back with only the WAN-to-LAN direction in hardware; a 1448-byte
 datagram then gets Packet Too Big with MTU 1280 and the microcode's IPv6
 fragment counter does not move. `test_flowtable_ipv6_same_tuple_exceptions`
