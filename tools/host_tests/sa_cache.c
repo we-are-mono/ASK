@@ -64,6 +64,26 @@ static int sa_lock_held, sa_lock_takes;
 #define spin_unlock_irqrestore(l, f) do { (void)(l); (void)(f); assert(sa_lock_held); \
 	sa_lock_held = 0; } while (0)
 
+/* Every link into and unlink from the two tables -- which is every list
+ * operation the cache makes -- has to happen under that lock, or an atomic
+ * walker can be standing on the entry as it goes. Counted too, so a case can
+ * say how many it expects and a path that skips the list altogether shows. */
+static unsigned sa_links, sa_unlinks;
+static inline void cache_slist_add(struct slist_head *list, struct slist_entry *entry)
+{
+	assert(sa_lock_held);
+	sa_links++;
+	slist_add(list, entry);
+}
+static inline void cache_slist_remove(struct slist_head *list, struct slist_entry *entry)
+{
+	assert(sa_lock_held);
+	sa_unlinks++;
+	slist_remove(list, entry);
+}
+#define slist_add cache_slist_add
+#define slist_remove cache_slist_remove
+
 /* The allocators, each able to fail once on request. */
 static bool fail_sa_alloc, fail_context_alloc;
 static unsigned live_sa, live_context;
@@ -146,6 +166,7 @@ int main(void)
 	PSAEntry a, b;
 	U16 got;
 	int takes;
+	unsigned links, unlinks;
 
 	for (int i = 0; i < NUM_SA_ENTRIES; i++) {
 		sa_cache_by_h[i].next = NULL;
@@ -164,10 +185,11 @@ int main(void)
 
 	/* Two SAs sharing a handle bucket and a frame-queue bucket. */
 	takes = sa_lock_takes;
+	links = sa_links;
 	a = create(3, 0x200 + 5, false);
 	b = create(3 + NUM_SA_ENTRIES, 0x200 + 5 + NUM_SA_ENTRIES, true);
 	/* Each create links both tables under the lock. */
-	assert(sa_lock_takes - takes == 4);
+	assert(sa_lock_takes - takes == 4 && sa_links - links == 4);
 	a->netdev = &dev_a;
 	b->netdev = &dev_b;
 	assert(a->hash_by_h == b->hash_by_h);
@@ -198,12 +220,16 @@ int main(void)
 	assert(!sa_lock_held);
 
 	/* A handle nobody holds is refused and touches nothing. */
+	unlinks = sa_unlinks;
 	assert(M_ipsec_sa_cache_delete(3 + 2 * NUM_SA_ENTRIES) == ERR_SA_UNKNOWN);
-	assert(!released && live_sa == 2);
+	assert(!released && live_sa == 2 && sa_unlinks == unlinks);
 
-	/* Deleting one leaves the other reachable through both tables. */
+	/* Deleting one leaves the other reachable through both tables. Its
+	 * two unlinks, one from each table, are both made under the lock:
+	 * the list operations above assert it. */
 	assert(M_ipsec_sa_cache_delete(3) == NO_ERR);
 	assert(released == a && live_sa == 1 && live_context == 1);
+	assert(sa_unlinks - unlinks == 2);
 	assert(!M_ipsec_sa_cache_lookup_by_h(3));
 	assert(M_ipsec_sa_cache_lookup_by_h(3 + NUM_SA_ENTRIES) == b);
 	assert(!get_netdev_of_SA_by_fqid(0x200 + 5, &got));
@@ -212,6 +238,7 @@ int main(void)
 	released = NULL;
 	assert(M_ipsec_sa_cache_delete(3 + NUM_SA_ENTRIES) == NO_ERR);
 	assert(released == b && !live_sa && !live_context && !sa_lock_held);
+	assert(sa_unlinks - unlinks == 4 && sa_links - sa_unlinks == 0);
 	for (int i = 0; i < NUM_SA_ENTRIES; i++)
 		assert(!sa_cache_by_h[i].next && !sa_cache_by_fqid[i].next);
 
