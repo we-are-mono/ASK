@@ -192,7 +192,6 @@ bool dpa_netdev_is_physical(const struct net_device *dev);
 bool dpa_netdev_is_dpaa(const struct net_device *dev);
 extern spinlock_t dpa_devlist_lock;
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid);
-void display_iface_info(struct dpa_iface_info *iface_info);
 int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq);
 int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry);
 void dpa_release_iflist(void);

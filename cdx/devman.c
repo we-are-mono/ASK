@@ -128,9 +128,6 @@ uint8_t iface_count;
 #define PORTID_SHIFT_VAL	8
 
 
-#define display_iface_info(x)
-
-
 static enum qman_cb_dqrr_result fwd_tx_drain_dqrr(struct qman_portal *portal,
 		struct qman_fq *fq, const struct qm_dqrr_entry *dq)
 {
@@ -1411,9 +1408,6 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	dpa_update_eth_if(priv);
 	iface_info->if_flags |= IF_STATS_ENABLED;
 #endif
-#ifdef DEVMAN_DEBUG
-	display_iface_info(iface_info);
-#endif
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
@@ -1566,9 +1560,6 @@ int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char
 		goto err_ret;
 	}
 
-#ifdef DEVMAN_DEBUG
-	display_iface_info(iface_info);
-#endif
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::dpa_add_port_to_list failed\n",

@@ -237,6 +237,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A236.** A cdx build with `DEVOH_DEBUG` failed at modpost: `display_iface_info()` was declared but never defined, and only devman.c's empty macro stood in for it —
+  fixed (_:/^cdx: drop a debug helper that was declared and never defined_).
+
 - [x] **A235.** Mark-steered uplinks: an inbound SA is offloaded only when the unmarked route to its peer leaves by its port, the one signal there is when it is added; it fails safe, and a source rule for the local address makes it hold —
   documented contract (_:/^cdx: offload a child SA whole or leave it to software_).
 

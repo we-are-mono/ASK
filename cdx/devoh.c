@@ -298,9 +298,6 @@ int dpa_add_oh_if(char *name)
 				__func__); 
 		goto err_ret;
 	}
-#ifdef DEVOH_DEBUG
-	display_iface_info(iface_info);
-#endif
 	return SUCCESS;
 err_ret:
 	cdx_remove_dir_in_procfs(&iface_info->tx_proc_entry);
