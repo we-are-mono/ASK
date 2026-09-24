@@ -1,19 +1,14 @@
-From 29587e7fbd0ce6cf189744f9b30440a05c831ae3 Mon Sep 17 00:00:00 2001
+From fa2d96152595d0cad107d162c8d545259b16f4d1 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] ask: IPv4/IPv6 forwarding-path hook points
 
-Wires Comcerto fast-path hooks into the kernel's IP forwarding code path:
-net/ipv4/{ip_output,ip_tunnel}.c, net/ipv6/{ip6_output,ip6_tunnel,sit,udp,
-output_core}.c and net/ipv6/netfilter/ip6t_NPT.c. Also the tunnel-related
-UAPI (if_arp.h ARPHRD_IPV6_IPV6_TUNNEL, if_tunnel.h, ip6_tunnel.h).
-
-Depends on the dpa_add_dummy_eth_hdr export and skb fields from 010.
-
-The underlying_iif RX stamp covers all three tunnel receive paths
-(ip_tunnel.c, sit.c, __ip6_tnl_rcv) matching the NXP 5.4 reference;
-the ip6_tunnel site was dropped during the forward-port when the
-4RD machinery was stripped, which broke the 4o6/6in6 decap binding.
+Wires the IPsec offload's output bypasses into the kernel's IP output
+path: net/ipv4/ip_output.c and net/ipv6/{ip6_output,output_core}.c. A
+transport-mode frame for a packet-offloaded SA (skb->ipsec_offload, the
+skb field from 010, set by the XFRM offload in 040) is still plaintext
+and leaves by the SA's own device: it skips LOCAL_OUT, POST_ROUTING and
+fragmentation on the way there, since SEC builds the ESP packet.
 
 ip6t_NPT points a connection's reply tuple at the translated prefix, so
 replies match it. It does so only while the conntrack is unconfirmed:
@@ -24,13 +19,10 @@ other LAN address turned into a connection no reply could find.
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  net/ipv4/ip_output.c          | 24 +++++++++++++++++++++++-
- net/ipv4/ip_tunnel.c          |  3 +++
  net/ipv6/ip6_output.c         | 18 ++++++++++++++++--
- net/ipv6/ip6_tunnel.c         |  4 ++++
  net/ipv6/netfilter/ip6t_NPT.c | 35 +++++++++++++++++++++++++++++++++++
  net/ipv6/output_core.c        |  8 ++++++++
- net/ipv6/sit.c                |  3 +++
- 7 files changed, 92 insertions(+), 3 deletions(-)
+ 4 files changed, 82 insertions(+), 3 deletions(-)
 
 diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
 index 41031c5c4303..cf455f665713 100644
@@ -81,20 +73,6 @@ index 41031c5c4303..cf455f665713 100644
  	ret_val = NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
  				net, sk, skb, indev, dev,
  				ip_finish_output,
-diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
-index 7c77d06372d1..708663706279 100644
---- a/net/ipv4/ip_tunnel.c
-+++ b/net/ipv4/ip_tunnel.c
-@@ -438,6 +438,9 @@ int ip_tunnel_rcv(struct ip_tunnel *tunnel, struct sk_buff *skb,
- 		skb->protocol = eth_type_trans(skb, tunnel->dev);
- 		skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
- 	} else {
-+#ifdef CONFIG_CPE_FAST_PATH
-+		skb->underlying_iif = skb->dev->ifindex;
-+#endif
- 		skb->dev = tunnel->dev;
- 	}
- 
 diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
 index 5d17982cb994..4ec7a6da32ee 100644
 --- a/net/ipv6/ip6_output.c
@@ -131,28 +109,6 @@ index 5d17982cb994..4ec7a6da32ee 100644
  	return NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
  			    net, sk, skb, indev, dev,
  			    ip6_finish_output,
-diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
-index b788a06bd3a5..09964b40f0d2 100644
---- a/net/ipv6/ip6_tunnel.c
-+++ b/net/ipv6/ip6_tunnel.c
-@@ -837,6 +837,9 @@ static int __ip6_tnl_rcv(struct ip6_tnl *tunnel, struct sk_buff *skb,
- 		skb->protocol = eth_type_trans(skb, tunnel->dev);
- 		skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
- 	} else {
-+#ifdef CONFIG_CPE_FAST_PATH
-+		skb->underlying_iif = skb->dev->ifindex;
-+#endif
- 		skb->dev = tunnel->dev;
- 		skb_reset_mac_header(skb);
- 	}
-@@ -1201,6 +1204,7 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
- 		       IPV6_MIN_MTU : IPV4_MIN_MTU);
- 
- 	skb_dst_update_pmtu_no_confirm(skb, mtu);
-+
- 	if (skb->len - t->tun_hlen - eth_hlen > mtu && !skb_is_gso(skb)) {
- 		*pmtu = mtu;
- 		err = -EMSGSIZE;
 diff --git a/net/ipv6/netfilter/ip6t_NPT.c b/net/ipv6/netfilter/ip6t_NPT.c
 index 787c74aa85e3..a63cd09c5440 100644
 --- a/net/ipv6/netfilter/ip6t_NPT.c
@@ -232,20 +188,6 @@ index 90a178dd24aa..c96261180a3d 100644
  	return nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT,
  		       net, sk, skb, NULL, skb_dst(skb)->dev,
  		       dst_output);
-diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
-index 78e685011382..710d66374c57 100644
---- a/net/ipv6/sit.c
-+++ b/net/ipv6/sit.c
-@@ -694,6 +694,9 @@ static int ipip6_rcv(struct sk_buff *skb)
- 		skb->mac_header = skb->network_header;
- 		skb_reset_network_header(skb);
- 		IPCB(skb)->flags = 0;
-+#ifdef CONFIG_CPE_FAST_PATH
-+		skb->underlying_iif = skb->dev->ifindex;
-+#endif
- 		skb->dev = tunnel->dev;
- 
- 		if (packet_is_spoofed(skb, iph, tunnel)) {
 -- 
 2.47.3
 
