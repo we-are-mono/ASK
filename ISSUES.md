@@ -237,6 +237,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A229.** get_ofport_info() collected an offline port's table types as bits of its flags word, where types 8, 9, 12 and 13 are OF_FQID_VALID, IN_USE and the port type —
+  fixed (_:/^cdx: keep an offline port's table types out of its flags_).
+
 - [x] **A194.** cdx and the kernel patches still carried CMM's dead FCI control plane, Wi-Fi fast path and bridge/conntrack hooks —
   removed (_:/^cdx: remove the FCI control plane_).
 

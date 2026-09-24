@@ -42,8 +42,7 @@
 struct oh_port_info {
 	char name[64];
 	uint32_t fm_idx;
-	uint32_t flags; //fqid valid and tdesc valid bits
-	void *td[MAX_MATCH_TABLES];//td for tables attached to this port
+	uint32_t flags; //OF_FQID_VALID, IN_USE, PORT_VALID and the PORT_TYPE_*
 	uint32_t channel;
 	struct oh_iface_info *ohinfo; //iface info from config
 	struct dpa_fq *rx_dpa_fq;
@@ -124,16 +123,19 @@ int get_ofport_info(uint32_t fm_idx, uint32_t handle, uint32_t *channel, void **
 	}
 	info = &offline_port_info[fm_idx][handle];
 	if (info->flags & IN_USE) {
+		void *tables[MAX_MATCH_TABLES] = { NULL };
+		int present = 0;
 		uint32_t ii;
 
 		*channel = info->channel;
-		get_tableInfo_by_portid(fm_idx, info->ohinfo->portid, info->td, &info->flags); 
-		for (ii = 0; ii < MAX_MATCH_TABLES; ii++) {
-			if (info->flags & (1 << ii))
-				*(td + ii) = info->td[ii];
-			else
-				*(td + ii) = NULL;
-		}
+		/* The tables attached to this port now, by type, gathered into a
+		 * mask of their own. Types run up to MAX_MATCH_TABLES, and as bits
+		 * of info->flags they would land on OF_FQID_VALID, IN_USE and the
+		 * port type -- a type 12 table on the IPsec port made it a Wi-Fi
+		 * port as well -- and would outlive the tables they stood for. */
+		get_tableInfo_by_portid(fm_idx, info->ohinfo->portid, tables, &present);
+		for (ii = 0; ii < MAX_MATCH_TABLES; ii++)
+			td[ii] = (present & (1 << ii)) ? tables[ii] : NULL;
 		return 0;
 	}
 	DPA_ERROR("%s::ofport handle %d not in use\n",
