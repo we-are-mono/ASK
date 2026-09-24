@@ -34,6 +34,20 @@ typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
 int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn);
 void cdx_unregister_ft_qos_class(void);
 
+/* A port's egress queues changed under the entries that transmit on it.
+ *
+ * Every hardware entry names the frame queue it enqueues to, chosen once, at
+ * install, from the port's scheduling mode at that moment (cdx_get_txfqid()).
+ * An HTB tree switches the port to CEETM at its first leaf and back when it
+ * goes, and a class change moves or removes the queue a class names. Nothing
+ * drains the queues of the mode the port has left, so an entry installed
+ * before the change sends everything into a queue nothing dequeues, and its
+ * classifier hits keep the flow alive while it does. The adapter registers
+ * this to re-install everything on the port; called under RTNL. */
+typedef void (*cdx_ft_egress_changed_fn)(struct net_device *dev);
+int cdx_register_ft_egress_changed(cdx_ft_egress_changed_fn fn);
+void cdx_unregister_ft_egress_changed(void);
+
 int cdx_flowtable_guard_init(void);
 void cdx_flowtable_guard_exit(void);
 void cdx_flowtable_quiesced(void);

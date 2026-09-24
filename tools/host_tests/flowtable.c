@@ -654,7 +654,7 @@ static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned int ft_qos_mark_mask, ft_qos_default_class;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_admission_invalidations;
+static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_qos_invalidations, ft_admission_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static u64 atomic64_read_acquire(u64 *v) { return *v; }
 static u64 ft_ipsec_genid, xfrm_genid, ft_ipsec_invalidations, ft_ipsec_policy_invalidations;
@@ -1003,6 +1003,23 @@ static int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
     return 0;
 }
 static void cdx_unregister_ft_qos_class(void) { registered_qos_class = 0; }
+/* The hook CDX calls when a port's egress queues change under its entries,
+ * claimed and returned with the two above. */
+static int registered_egress_changed;
+typedef void (*cdx_ft_egress_changed_fn)(struct net_device *dev);
+static int cdx_register_ft_egress_changed(cdx_ft_egress_changed_fn fn)
+{
+    assert(fn);
+    if (registered_egress_changed) return -EBUSY;
+    registered_egress_changed = 1;
+    return 0;
+}
+static void cdx_unregister_ft_egress_changed(void) { registered_egress_changed = 0; }
+/* The IPsec half of an egress change, compiled and tested in ipsec_adapter.c;
+ * here only whether the flow half hands it the port. */
+static struct net_device *ipsec_egress_changed;
+static void ft_ipsec_egress_changed(const struct net_device *dev)
+{ ipsec_egress_changed = (struct net_device *)dev; }
 /* What the encoder would write into the two PPPoE opcodes, recorded so a test
  * can require the index rather than the slot pointer: a direction that strips
  * counts into its session's receive half, one that inserts into the transmit
@@ -2323,6 +2340,19 @@ static void test_bridge_fdb(void)
     }
     set.attr = NULL;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+
+    /* A port whose egress queues changed under it -- an HTB tree coming or
+     * going -- re-installs everything that transmits on it: its flows are
+     * retired to be readmitted against the new queues, and its SAs are
+     * handed on to be rebuilt. Other ports are left alone. */
+    u64 before_qos = ft_qos_invalidations;
+    ipsec_egress_changed = NULL;
+    ft_egress_changed(&decoy);
+    assert(ft_qos_invalidations == before_qos && ipsec_egress_changed == &decoy);
+    ft_egress_changed(&out);
+    assert(ft_qos_invalidations == before_qos + 1 && handle.invalid);
+    assert(ipsec_egress_changed == &out);
+    handle.invalid = false;
 
     ft_handle_invalidate(&handle, &ft_mac_invalidations);
     ft_retire_workfn(NULL);
@@ -5281,10 +5311,10 @@ static void test_registration(void)
      * and the second one failing has to give the first back: a module that
      * left the driver's ndo pointing into it would be unloadable text on the
      * flowtable's binding path. */
-    for (ft_init_fail_stage=9; ft_init_fail_stage<=10; ft_init_fail_stage++) {
+    for (ft_init_fail_stage=9; ft_init_fail_stage<=11; ft_init_fail_stage++) {
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         assert(ask_flowtable_init() == -EBUSY);
-        assert(!registered_setup_tc && !registered_qos_class);
+        assert(!registered_setup_tc && !registered_qos_class && !registered_egress_changed);
         assert(!ft_ready && !ft_proc && !backend_claimed && !indirect_registered);
     }
     ft_init_fail_stage=0;

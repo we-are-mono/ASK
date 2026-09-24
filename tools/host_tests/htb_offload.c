@@ -382,6 +382,21 @@ static cdx_ft_setup_tc_handler cdx_ft_handler;
 typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
 
+/* The flowtable's hook for a port whose egress queues changed. RTNL is modelled
+ * as held throughout, so registration's lock pair has nothing to take. */
+typedef void (*cdx_ft_egress_changed_fn)(struct net_device *dev);
+static cdx_ft_egress_changed_fn cdx_ft_egress_changed_func;
+#define rtnl_lock()		do { } while (0)
+#define rtnl_unlock()		do { } while (0)
+static struct net_device *egress_changed_dev;
+static unsigned egress_changes;
+static void egress_hook(struct net_device *dev)
+{
+	assert(rtnl && dev);
+	egress_changed_dev = dev;
+	egress_changes++;
+}
+
 /* The filter layers, which own what a police action and a DSCP filter mean.
  * This file is about the qdisc layer and the one ndo_setup_tc they all share,
  * so all that matters here is that a block request reaches the half that owns
@@ -480,6 +495,9 @@ static void reset_world(void)
 	real_num_tx_queues_fails = 0;
 	class_counters_fail = false;
 	cdx_ft_qos_class_func = NULL;
+	cdx_ft_egress_changed_func = NULL;
+	egress_changed_dev = NULL;
+	egress_changes = 0;
 	stop_calls = 0;
 	fault_point = -1;
 	fault_seen = 0;
@@ -1193,9 +1211,45 @@ static void test_refusals(void)
 	assert(destroy(&devices[0]) == -ENOENT);
 }
 
+/* Every command that can change which queues a port drains tells the
+ * flowtable, naming that port: the first leaf switches it to CEETM, a class
+ * change moves or removes the queue a class names, and destroy switches it
+ * back. A query changes nothing and says nothing. A failed command still
+ * tells, because it may have got as far as switching the mode. */
+static void test_egress_changed(void)
+{
+	struct net_device *dev = &devices[0];
+	u16 qid1, qid11, moved, got;
+	unsigned n;
+
+	reset_world();
+	assert(!cdx_register_ft_egress_changed(egress_hook));
+	assert(cdx_register_ft_egress_changed(egress_hook) == -EBUSY);
+	assert(!create(dev, 1, 20));
+	assert(egress_changes == 1 && egress_changed_dev == dev);
+	assert(!add_leaf(dev, 1, 0, 0, 0, 125000000, 125000000, &qid1));
+	assert(egress_changes == 2 && cdx_htb_port_of(dev)->qm_ctx->qos_enabled);
+	assert(!query(dev, 1, &got) && egress_changes == 2);
+	assert(!to_inner(dev, 10, 1, 0, 0) && egress_changes == 3);
+	assert(!add_leaf(dev, 11, 1, 1, 0, 0, 0, &qid11) && egress_changes == 4);
+	assert(!modify(dev, 11, 3, 0, 0, 0) && egress_changes == 5);
+	assert(!del_leaf(dev, 11, &moved) && egress_changes == 6);
+	n = egress_changes;
+	assert(add_leaf(dev, 99, 1, 0, 0, 0, 0, NULL) == -EEXIST);
+	assert(egress_changes == n + 1 && egress_changed_dev == dev);
+	egress_changed_dev = NULL;
+	assert(!destroy(dev));
+	assert(egress_changes == n + 2 && egress_changed_dev == dev);
+	cdx_unregister_ft_egress_changed();
+	assert(!create(dev, 1, 20) && egress_changes == n + 2);
+	assert(!destroy(dev));
+	assert_balanced(dev);
+}
+
 int main(void)
 {
 	test_tree();
+	test_egress_changed();
 	test_density();
 	test_depth_and_limits();
 	test_channel_reuse();

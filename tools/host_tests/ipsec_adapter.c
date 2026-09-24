@@ -1614,6 +1614,21 @@ static void test_watch_route_and_device(void)
 	 * a second pass has nothing to do. */
 	ft_ipsec_follow_work(NULL);
 	assert(sa_next_hop_calls == 2);
+
+	/* The port's egress queues changed under the SA -- an HTB tree came or
+	 * went -- while neither address moved. That still takes a rebuild,
+	 * which re-derives the queue the entry transmits on, and the watch
+	 * settles after it like after any other. Another port's change is not
+	 * this SA's business. */
+	works_scheduled = 0;
+	ft_ipsec_egress_changed(&LAN);
+	assert(works_scheduled == 0);
+	ft_ipsec_egress_changed(&WAN);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 3);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 3);
 	WAN.dev_addr[5] = 4;
 
 	/* Another port's address change is not this SA's business. */

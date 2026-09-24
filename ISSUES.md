@@ -335,6 +335,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A205.** Hardware entries kept enqueuing to a port's old frame queues after an HTB tree switched it to or from CEETM —
+  fixed (_:/^cdx: retire flows when a port's egress queues change_).
+
 - [x] **A204.** A second flowtable bound at once was refused with EBUSY, failing every atomic reload and silently sending fw4's probe to software offload —
   fixed (_:/^flowtable: let a consumer reload its table in one transaction_).
 

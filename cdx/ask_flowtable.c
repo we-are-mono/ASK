@@ -269,6 +269,7 @@ static atomic64_t ft_mtu_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_link_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mac_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_fdb_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_qos_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_admission_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_ipsec_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_ipsec_genid = ATOMIC64_INIT(0);
@@ -2911,6 +2912,9 @@ struct ft_ipsec_watch {
 	u8 src_mac[ETH_ALEN];
 	u8 family;
 	bool stale;
+	/* Rebuild even though neither address moved: the port's egress queues
+	 * changed under the entry, which names one of them. */
+	bool rebuild;
 	/* A failure has been reported for this watch, so the next one stays
 	 * quiet. Cleared by a rebuild that works, because the next failure
 	 * after a recovery is news again. */
@@ -3024,6 +3028,23 @@ static void ft_ipsec_device_moved(const struct net_device *dev)
 	list_for_each_entry(watch, &ft_ipsec_watches, list)
 		if (watch->dev == dev)
 			ft_ipsec_mark(watch);
+	spin_unlock_bh(&ft_watch_lock);
+}
+
+/* This port's egress queues changed under the SAs riding it: an outbound SA's
+ * entry, the one SEC's output is classified by, names the queue it transmits
+ * on, chosen when it was built. Neither address moved, so this asks for the
+ * rebuild outright rather than for a check. */
+static void ft_ipsec_egress_changed(const struct net_device *dev)
+{
+	struct ft_ipsec_watch *watch;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(watch, &ft_ipsec_watches, list)
+		if (watch->dev == dev) {
+			watch->rebuild = true;
+			ft_ipsec_mark(watch);
+		}
 	spin_unlock_bh(&ft_watch_lock);
 }
 
@@ -3573,6 +3594,21 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 		ft_invalidate();
 	spin_unlock_bh(&ft_watch_lock);
 	return NOTIFY_DONE;
+}
+
+/* CDX changed a port's egress queues: an HTB tree switched it to or from
+ * CEETM, or a class moved or went away (cdx_register_ft_egress_changed()).
+ * Each hardware entry transmitting on the port names a queue chosen when it
+ * was installed, and nothing drains the queues of the mode the port left, so
+ * everything on it is re-installed against what the port has now. Flows are
+ * retired and readmitted on their next packet, which is the same treatment a
+ * route or MTU change gets; SAs are rebuilt in place, because nothing
+ * re-offers one. Called under RTNL. */
+static void ft_egress_changed(struct net_device *dev)
+{
+	ASSERT_RTNL();
+	ft_device_retire(dev, &ft_qos_invalidations);
+	ft_ipsec_egress_changed(dev);
 }
 
 /* --------------------------------------------- The multicast key namespace
@@ -6730,7 +6766,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 	u8 was_dst[ETH_ALEN];
 	u8 was_src[ETH_ALEN];
 	u8 mac[ETH_ALEN];
-	bool reported;
+	bool reported, rebuild;
 	u64 cookie;
 	u64 pass;
 	u8 family;
@@ -6755,6 +6791,8 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 		local = watch->local;
 		peer = watch->peer;
 		reported = watch->reported;
+		rebuild = watch->rebuild;
+		watch->rebuild = false;
 		ether_addr_copy(was_dst, watch->dst_mac);
 		ether_addr_copy(was_src, watch->src_mac);
 		dev_hold(dev);
@@ -6762,7 +6800,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 
 		rc = ft_ipsec_peer_mac(dev, family, &local, &peer, false, mac,
 				       NULL);
-		if (!rc && ether_addr_equal(mac, was_dst) &&
+		if (!rc && !rebuild && ether_addr_equal(mac, was_dst) &&
 		    ether_addr_equal(dev->dev_addr, was_src)) {
 			/* Neither address moved. A route event marks every SA
 			 * under the changed prefix, so most passes end here. */
@@ -6797,6 +6835,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 			watch = ft_ipsec_watch_find(cookie);
 			if (watch) {
 				watch->stale = true;
+				watch->rebuild |= rebuild;
 				watch->reported = true;
 			}
 			spin_unlock_bh(&ft_watch_lock);
@@ -7556,7 +7595,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nqos_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
 		   cdx_ft_observing(), ft_bound, ft_passive, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -7568,6 +7607,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_link_invalidations),
 		   atomic64_read(&ft_mac_invalidations),
 		   atomic64_read(&ft_fdb_invalidations),
+		   atomic64_read(&ft_qos_invalidations),
 		   atomic64_read(&ft_admission_invalidations),
 		   atomic64_read(&ft_ipsec_invalidations),
 		   atomic64_read(&ft_ipsec_policy_invalidations),
@@ -7707,8 +7747,14 @@ static int __init ask_flowtable_init(void)
 	/* Hand the classifier over too, so a frame the software path sends
 	 * takes the class this same function gave the flow's hardware rule. */
 	rc = ft_init_fault(10) ? -EBUSY : cdx_register_ft_qos_class(ft_qos_class);
+	if (rc)
+		goto classifier;
+	/* And be told when a port's egress queues change under its entries. */
+	rc = ft_init_fault(11) ? -EBUSY : cdx_register_ft_egress_changed(ft_egress_changed);
 	if (!rc)
 		return 0;
+	cdx_unregister_ft_qos_class();
+classifier:
 	cdx_unregister_ft_setup_tc();
 indirect:
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
@@ -7856,6 +7902,7 @@ static void __exit ask_flowtable_exit(void)
 	 * classifier goes with it, and waits out the frames inside it. */
 	cdx_unregister_ft_setup_tc();
 	cdx_unregister_ft_qos_class();
+	cdx_unregister_ft_egress_changed();
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	/* Indirect binds are gone with the line above; the direct ones are
 	 * still Netfilter's, and nothing else will ever hand them back. */

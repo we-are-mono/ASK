@@ -12,6 +12,7 @@ SRC_URI = "file://S03debugfs \
            file://S50ask-flowtable \
            file://dnsmasq-gateway.conf \
            file://hostapd-ask.conf \
+           file://ask-flowtable-qos.conf \
           "
 
 # No source tree — just config files, referenced via UNPACKDIR below.
@@ -48,6 +49,12 @@ fakeroot do_install() {
     install -d ${D}${sysconfdir}/modules-load.d
     install -m 0644 ${ASK_SRCROOT}/config/ask-modules.conf \
         ${D}${sysconfdir}/modules-load.d/ask.conf
+
+    # Test image only: turn on mark classification so the suite exercises
+    # the hardware HTB path rather than skipping it.
+    install -d ${D}${sysconfdir}/modprobe.d
+    install -m 0644 ${UNPACKDIR}/ask-flowtable-qos.conf \
+        ${D}${sysconfdir}/modprobe.d/ask-flowtable-qos.conf
 
     # The default offload policy. The ask-flowtable daemon (its own package)
     # falls back to identical built-in defaults when this file is absent.
@@ -97,6 +104,7 @@ FILES:${PN} = " \
     ${sysconfdir}/cdx_pcd.xml \
     ${sysconfdir}/cdx_sp.xml \
     ${sysconfdir}/modules-load.d/ask.conf \
+    ${sysconfdir}/modprobe.d/ask-flowtable-qos.conf \
     ${sysconfdir}/ask/offload.conf \
     ${sysconfdir}/init.d/debugfs \
     ${sysconfdir}/rcS.d/S03debugfs \

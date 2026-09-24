@@ -756,6 +756,17 @@ static int cdx_htb_command(struct cdx_htb_port *port, struct tc_htb_qopt_offload
 	return -EOPNOTSUPP;
 }
 
+static cdx_ft_egress_changed_fn cdx_ft_egress_changed_func;
+
+/* Called under RTNL, which registration and unregistration also take, so the
+ * adapter's module cannot leave while a call is inside it. */
+static void cdx_ft_egress_changed(struct net_device *dev)
+{
+	ASSERT_RTNL();
+	if (cdx_ft_egress_changed_func)
+		cdx_ft_egress_changed_func(dev);
+}
+
 static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *opt)
 {
 	struct cdx_htb_port *port = cdx_htb_port_of(dev);
@@ -777,8 +788,38 @@ static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *
 	 * queue the operator no longer means. Outside the lock, because the
 	 * reprogramming comes back through the resolver below. */
 	cdx_dscp_tree_changed(dev);
+	/* And every entry transmitting on the port, for the same reason one
+	 * level down: each names the queue it was installed with. Even after
+	 * a failed command, which may have got as far as switching the mode;
+	 * re-installing what did not need it only costs a readmission. */
+	if (opt->command != TC_HTB_LEAF_QUERY_QUEUE)
+		cdx_ft_egress_changed(dev);
 	return rc;
 }
+
+int cdx_register_ft_egress_changed(cdx_ft_egress_changed_fn fn)
+{
+	int rc = 0;
+
+	if (!fn)
+		return -EINVAL;
+	rtnl_lock();
+	if (cdx_ft_egress_changed_func)
+		rc = -EBUSY;
+	else
+		cdx_ft_egress_changed_func = fn;
+	rtnl_unlock();
+	return rc;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_register_ft_egress_changed, ASK_CDX_FLOWTABLE);
+
+void cdx_unregister_ft_egress_changed(void)
+{
+	rtnl_lock();
+	cdx_ft_egress_changed_func = NULL;
+	rtnl_unlock();
+}
+EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_egress_changed, ASK_CDX_FLOWTABLE);
 
 /* The CEETM channel and class queue a leaf class names, for a filter that
  * wants to send something to it.
