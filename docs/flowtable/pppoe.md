@@ -117,9 +117,11 @@ flow-described session is registered as nothing, so the insert would have aimed
 the microcode's counter update at the unallocated index zero — another
 interface's record — and the strip would have failed outright, since its lookup
 resolves an interface of type `IF_TYPE_PPPOE` and is handed a physical port.
-`pppoe_flow_ifstats` makes both take their index from the description instead,
-the insert from `pppoe_stats_offset` and the strip from `pppoe_rx_stats_offset`,
-which is what lets the adapter own a record rather than borrow an interface's.
+Both now take their index from the description, the insert from
+`pppoe_stats_offset` and the strip from `pppoe_rx_stats_offset`, which is what
+lets the adapter own a record rather than borrow an interface's. A session only
+ever reaches the description through a flow, so the registered-interface arms
+are gone rather than kept beside a flag choosing between them.
 
 An index of zero then means no record at all and both opcodes emit a null
 pointer. That arm rests on weaker evidence than the VLAN one: the VLAN insert's
@@ -130,8 +132,7 @@ evidence that null means "no statistics" for them is that NXP's own
 rather than the normal one — a session that got a record names it — and it is
 reached only when the firmware pool is empty. `tools/host_tests/pppoe_hm.c`
 pins both arms against the shipped header: the index the description names for
-each opcode, the null pointer when it names none, and the strip not attempting
-the interface lookup at all.
+each opcode and the null pointer when it names none.
 
 ## Eligibility
 

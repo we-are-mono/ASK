@@ -52,7 +52,7 @@ static int emit(unsigned op) { trace[count++] = op; return count == fail_at; }
 #define create_eth_rx_stats_hm(i,a,b) ((void)(a), (void)(b), emit(RX_STATS))
 #define create_strip_eth_hm(i) emit(STRIP_ETH)
 #define insert_remove_vlan_hm(i,a,b) ((void)(a), (void)(b), emit(VLAN_CHECK))
-#define insert_remove_pppoe_hm(i,a) ((void)(a), emit(PPPOE_REMOVE))
+#define insert_remove_pppoe_hm(i) emit(PPPOE_REMOVE)
 #define create_tunnel_remove_hm(i) emit(TUNNEL_REMOVE)
 #define create_nat_hm(i) emit(NAT)
 #define create_ttl_hm(i) emit(TTL)

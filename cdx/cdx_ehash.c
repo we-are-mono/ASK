@@ -86,7 +86,7 @@ static int create_replicate_hm(struct ins_entry_info *info);
 static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info *info);
 static int create_tunnel_remove_hm(struct ins_entry_info *info);
 static int create_pppoe_ins_hm(struct ins_entry_info *info);
-static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_index);
+static int insert_remove_pppoe_hm(struct ins_entry_info *info);
 static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index);
 static int create_vlan_ins_hm(struct ins_entry_info *info);
 static int create_eth_rx_stats_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index);
@@ -902,11 +902,8 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed
 			break;
 
 		if (info->l2_info.pppoe_present) {
-			/* strip pppoe hdrs. Only physical ports register as
-			 * interfaces, so the session is the flow's and the port
-			 * under it is the one to name. */
-			if (insert_remove_pppoe_hm(info,
-					entry->pRtEntry->underlying_input_itf->index))
+			/* strip pppoe hdrs */
+			if (insert_remove_pppoe_hm(info))
 				break;
 		}
 
@@ -985,12 +982,11 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed
  * dpa_get_tx_info_by_itf() has no VLAN or PPPoE interface to walk and returns
  * a bare description.
  *
- * The statistics indices come from the description too. pppoe_flow_ifstats
- * tells both PPPoE opcodes to take theirs from it, which carries the record the
- * caller allocated for the session, or zero for a session that has none;
- * vlan_flow_ifstats does the same for the two VLAN opcodes, one index per tag.
- * Without either the unallocated index 0 would aim the ucode's counter update
- * at another interface's record; a tag that has no record gets none.
+ * The statistics indices come from the description too, and nowhere else:
+ * the record the caller allocated for the session, tunnel or tag, or zero for
+ * one that has none, which the opcodes then emit as no pointer at all rather
+ * than as another owner's record zero. vlan_flow_ifstats marks a VLAN stack as
+ * described here, because the strip also runs for a flow that described none.
  *
  * The session's Ethernet destination is written to ac_mac_addr because that is
  * where create_ethernet_hm() reads a PPPoE flow's destination from. It is the
@@ -1056,13 +1052,12 @@ static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap
 		memcpy(l2_info->ac_mac_addr, encap->egress_session_mac,
 		       ETHER_ADDR_LEN);
 	}
-	if (encap->ingress_pppoe || encap->egress_pppoe) {
-		l2_info->pppoe_flow_ifstats = 1;
 #ifdef INCLUDE_PPPoE_IFSTATS
+	if (encap->ingress_pppoe || encap->egress_pppoe) {
 		l2_info->pppoe_rx_stats_offset = encap->ingress_stats_index;
 		l2_info->pppoe_stats_offset = encap->egress_stats_index;
-#endif
 	}
+#endif
 	if (encap->ingress_tunnel.present || encap->egress_tunnel.present) {
 		struct dpa_l3hdr_info *l3_info = &info->l3_info;
 
@@ -1085,7 +1080,6 @@ static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap
 				  __func__);
 			return FAILURE;
 		}
-		l3_info->tunnel_flow_ifstats = 1;
 		if (encap->ingress_tunnel.present) {
 			l3_info->tnl_header_present = 1;
 			l3_info->mode = encap->ingress_tunnel.mode;
@@ -1572,20 +1566,9 @@ static int create_pppoe_ins_hm(struct ins_entry_info *info)
 	/* Update the Ethertype now PPPoE is the outermost header  */
 	info->eth_type = ETHERTYPE_PPPOE;
 #ifdef INCLUDE_PPPoE_IFSTATS
-	/* A flow-described session names its own record, or names none. Either
-	 * way the index is already in the description, where the interface
-	 * walk put a registered interface's. */
-	if (info->l2_info.pppoe_flow_ifstats) {
-		param->stats_ptr =
-			cpu_to_be32(pppoe_stats_pointer(info->l2_info.pppoe_stats_offset));
-	} else {
-		uint8_t offset;
-
-		offset = (info->l2_info.pppoe_stats_offset & ~STATS_WITH_TS);
-		word = (get_logical_ifstats_base() +
-				(offset * sizeof(struct en_ehash_stats_with_ts)));
-		param->stats_ptr = cpu_to_be32(word);
-	}
+	/* The session names its own record in the description, or names none. */
+	param->stats_ptr =
+		cpu_to_be32(pppoe_stats_pointer(info->l2_info.pppoe_stats_offset));
 #else
 	param->stats_ptr = 0;
 #endif
@@ -1636,12 +1619,10 @@ static int create_vlan_ins_hm(struct ins_entry_info *info)
 	/* already set to 0(NULL), so we can skip the stats.*/
 	if (!l2_info->egress_vlan_hdrs[0].tci)
 		goto skip_stats;
-	/* A flow-described stack names its records or names none; a registered
-	 * stack has one per interface. */
-	if (l2_info->vlan_flow_ifstats) {
-		if (!vlan_flow_stats_named(l2_info->vlan_stats_offsets, num_egress_vlan_hdrs))
-			goto skip_stats;
-	}
+	/* Only a flow describes egress tags (apply_l2_encap()), and it names
+	 * a record for every tag or names none. */
+	if (!vlan_flow_stats_named(l2_info->vlan_stats_offsets, num_egress_vlan_hdrs))
+		goto skip_stats;
 	{
 		uint8_t *st_ptr;
 
@@ -1653,26 +1634,16 @@ static int create_vlan_ins_hm(struct ins_entry_info *info)
 				return FAILURE;
 			/* add stats base */
 			word |= (get_logical_ifstats_base());
-			if (l2_info->vlan_flow_ifstats) {
-				/* The ucode inserts the innermost header first and
-				 * counts the k-th record with the frame as it
-				 * stands after the k-th insertion (measured: a
-				 * frame ending at 306 bytes reads 302 in the first
-				 * record and 306 in the second). Listing the
-				 * records innermost first therefore gives each VLAN
-				 * device the frame with its own tag on and the tags
-				 * inside it, which is what the device's own
-				 * transmit counter would have shown. The registered
-				 * path below keeps its historical reversed order. */
-				for (ii = 0; ii < (int32_t)num_egress_vlan_hdrs; ii++)
-					*st_ptr++ = l2_info->vlan_stats_offsets[ii];
-			} else {
-				for (ii = num_egress_vlan_hdrs - 1 ; ii >=0 ; ii--) {
-					*st_ptr = l2_info->vlan_stats_offsets[ii];
-					/* save offset reversed order so that uCode can update easily */
-					st_ptr++;
-				}
-			}
+			/* The ucode inserts the innermost header first and counts
+			 * the k-th record with the frame as it stands after the
+			 * k-th insertion (measured: a frame ending at 306 bytes
+			 * reads 302 in the first record and 306 in the second).
+			 * Listing the records innermost first therefore gives each
+			 * VLAN device the frame with its own tag on and the tags
+			 * inside it, which is what the device's own transmit
+			 * counter would have shown. */
+			for (ii = 0; ii < (int32_t)num_egress_vlan_hdrs; ii++)
+				*st_ptr++ = l2_info->vlan_stats_offsets[ii];
 		} else {
 			/* single Vlan header, add stats ptr directly */
 			word |= (get_logical_ifstats_base() + 
@@ -1750,7 +1721,7 @@ static int create_ethernet_hm(struct ins_entry_info *info, uint32_t update_ethty
 	return SUCCESS;
 }
 
-static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_index)
+static int insert_remove_pppoe_hm(struct ins_entry_info *info)
 {
 	uint32_t param_size;
 	struct en_ehash_strip_pppoe_hdr *param;
@@ -1761,28 +1732,9 @@ static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_inde
 	if (param_size > info->param_size)
 		return FAILURE;
 #ifdef INCLUDE_PPPoE_IFSTATS
-	/* The lookup below resolves a registered PPPoE interface, which a
-	 * session described by a flow does not have -- itf_index names the
-	 * physical port and the lookup would fail outright, taking the flow
-	 * with it. Such a session names its receive record in the description
-	 * instead, or names none. */
-	if (info->l2_info.pppoe_flow_ifstats) {
-		stats_ptr = pppoe_stats_pointer(info->l2_info.pppoe_rx_stats_offset);
-	} else {
-		uint8_t offset;
-
-		if (dpa_get_iface_stats_entries(itf_index, 0, &offset, RX_IFSTATS, IF_TYPE_PPPOE)) {
-			DPA_ERROR("%s::unable to get stats offset on pppoe iface on ingress\n",
-					__func__);
-			return FAILURE;
-		}
-		offset &= ~STATS_WITH_TS;
-		stats_ptr = (get_logical_ifstats_base() + 
-				(offset * sizeof(struct en_ehash_stats_with_ts)));
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __func__, stats_ptr);
-#endif
-	}
+	/* The session names its receive record in the description, or names
+	 * none. */
+	stats_ptr = pppoe_stats_pointer(info->l2_info.pppoe_rx_stats_offset);
 #else
 	stats_ptr = 0;
 	DPA_INFO("%s:PPPoE ingress stats disabled\n", __func__);
@@ -1819,10 +1771,7 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 		 * the frame with its own tag off, which is what the device's own
 		 * receive counter would have shown once the Ethernet header is
 		 * taken off too. Without records the word is the vendor's own
-		 * statistics-disabled encoding rather than a base with a count
-		 * of zero, which is what the registered path emits for an
-		 * untagged ingress and what a reader would otherwise have to
-		 * know is ignored. */
+		 * statistics-disabled encoding. */
 		uint32_t padding;
 
 		num_entries = info->l2_info.num_ingress_vlan_hdrs;
@@ -1848,51 +1797,21 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 					 sizeof(struct en_ehash_stats))));
 		}
 	} else {
-		uint32_t padding;
+		/* A flow that named no encapsulation at all, or a multicast group
+		 * with an untagged ingress: nothing to strip and no record to
+		 * count. The port must still be a registered one, which has no
+		 * VLAN records of its own (dpa_get_num_vlan_iface_stats_entries()
+		 * counts none and refuses anything else), so the word is the
+		 * statistics base with a count of zero. */
 		if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
 					&num_entries)) {
 			DPA_ERROR("%s::unable to get number on vlan iface on ingress\n",
 					__func__);
 			return FAILURE;
 		}
-		if (num_entries > 1) {
-			padding = PAD(num_entries, sizeof(uint32_t));
-			param_size += (padding + num_entries);
-			//check if we have room
-			if (param_size > info->param_size)
-				return FAILURE;
-			word = ((padding << 30) | (num_entries << 24)| get_logical_ifstats_base());
-			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
-						&param->stats_offsets[0], RX_IFSTATS, IF_TYPE_VLAN)) {
-				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__func__);
-				return FAILURE;
-			}
-		} else {
-			/* Zero rather than indeterminate: with no VLAN interface
-			 * on the ingress path the lookup below answers SUCCESS
-			 * without writing the offset, and the word then carries
-			 * a count of zero beside whatever this held. */
-			uint8_t offset = 0;
-
-			padding = 0;
-			//check if we have room
-			if (param_size > info->param_size)
-				return FAILURE;
-			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index,
-						&offset, RX_IFSTATS, IF_TYPE_VLAN)) {
-				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__func__);
-				return FAILURE;
-			}
-			word = ((num_entries << 24) |
-					(get_logical_ifstats_base() + 
-					 (offset * sizeof(struct en_ehash_stats))));
-		}
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::padding %d, stats ptr %x, num_entries %d\n", \
-				__func__, padding, (word & 0xffffff), num_entries);
-#endif
+		if (param_size > info->param_size)
+			return FAILURE;
+		word = get_logical_ifstats_base();
 	}
 #else
 	if (param_size > info->param_size)
@@ -1922,59 +1841,31 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 }
 
 
-/* Removes all logical headers retaining the Ethernet header as required by Sec, While stripping the headers,
- *  stats is also handled */
-
+/* Strip every header between the Ethernet header, which SEC wants kept, and
+ * the outer IP one. Only an inbound SA's entry takes this, and nothing
+ * describes a tag or a session for one -- dpa_get_l2l3_info_by_itf_id() fills
+ * in neither -- so there are no VLAN ids to validate and no records to list:
+ * the word is the statistics base with a count of zero, on a port that must be
+ * a registered one. */
 static int insert_remove_l2_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index)
 {
 	uint32_t param_size;
 	struct en_ehash_strip_l2_hdrs *param;
 	uint32_t num_entries;
 	uint32_t word;
-	uint8_t i = 0;
 
 	param = (struct en_ehash_strip_l2_hdrs*)info->paramptr;
 	param_size = sizeof(struct en_ehash_strip_l2_hdrs);
 #ifdef INCLUDE_VLAN_IFSTATS
-	{
-		uint32_t padding;
-		if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
-					&num_entries)) {
-			DPA_ERROR("%s::unable to get number on vlan iface on ingress\n",
-					__func__);
-			return FAILURE;
-		}
-		if (num_entries > 0) {
-			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
-						&param->stats_offsets[0], RX_IFSTATS, IF_TYPE_VLAN)) {
-				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__func__);
-				return FAILURE;
-			}
-		} 
-		if(info->l2_info.pppoe_present){
-			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
-						&param->stats_offsets[num_entries], RX_IFSTATS, IF_TYPE_PPPOE)) {
-				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__func__);
-				return FAILURE;
-			}
-			param->stats_offsets[num_entries++] &= ~STATS_WITH_TS;
-		}
-
-		padding = PAD(num_entries, sizeof(uint32_t));
-		param_size += (padding + num_entries);
-		/* check if we have room */
-		if (param_size > info->param_size)
-			return FAILURE;
-
-		word = ((padding << 30) | (num_entries << 24)| get_logical_ifstats_base());
-
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::padding %d, stats ptr %x, num_entries %d\n", \
-				__func__, padding, (word & 0xffffff), num_entries);
-#endif
+	if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
+				&num_entries)) {
+		DPA_ERROR("%s::unable to get number on vlan iface on ingress\n",
+				__func__);
+		return FAILURE;
 	}
+	if (param_size > info->param_size)
+		return FAILURE;
+	word = get_logical_ifstats_base();
 #else
 	if (param_size > info->param_size)
 		return FAILURE;
@@ -1982,15 +1873,6 @@ static int insert_remove_l2_hm(struct ins_entry_info *info, uint32_t iif_index, 
 	DPA_INFO("%s::Vlan / PPPoE ingress stats disabled\n", __func__);
 #endif
 	param->word = cpu_to_be32(word);
-	if( info->l2_info.num_ingress_vlan_hdrs)
-	{
-		/* Outer vlan id is stored first in param ptr and then inner vlan id.
-		This is for convenience in writing ucode to validate the vlan's.
-		In ucode first outer vlan is validated and then inner vlan */
-		for (i = 0 ; i < info->l2_info.num_ingress_vlan_hdrs; i++) {
-			param->vlan_id[i] = cpu_to_be16(info->l2_info.ingress_vlan_hdrs[info->l2_info.num_ingress_vlan_hdrs-i-1].tci);
-		}
-	}
 	*(info->opcptr) = STRIP_L2_HDR;
 	info->opc_count++;
 	info->opcptr++;
@@ -2205,33 +2087,8 @@ static int create_tunnel_insert_hm(struct ins_entry_info *info)
 	//TODO: routing destination offset is now 0
 	word = 0;
 #ifdef INCLUDE_TUNNEL_IFSTATS
-	if (info->l3_info.tunnel_flow_ifstats) {
-		/* A flow-described tunnel names its own record, or names
-		 * none; the lookup below resolves a registered tunnel
-		 * interface, which such a flow does not have. */
-		word |= tunnel_stats_pointer(info->l3_info.tunnel_stats_offset);
-	} else {
-		uint8_t offset;
-		PCtEntry ctentry;
-
-		ctentry = info->entry;
-		if ((!ctentry) || (!ctentry->pRtEntry) || (!ctentry->pRtEntry->itf)) {
-			DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on egress\n",
-					__func__, __LINE__);
-			return FAILURE;
-		}
-		if (dpa_get_iface_stats_entries(ctentry->pRtEntry->itf->index, 0,
-					&offset, TX_IFSTATS, IF_TYPE_TUNNEL)) {
-			DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on egress\n",
-					__func__, __LINE__);
-			return FAILURE;
-		}
-		word |= ((get_logical_ifstats_base() +
-					(offset * sizeof(struct en_ehash_stats))) & 0xffffff);
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __func__, (word & 0xffffff));
-#endif
-	}
+	/* The tunnel names its own record in the description, or names none. */
+	word |= tunnel_stats_pointer(info->l3_info.tunnel_stats_offset);
 #endif
 	info->tnl_hdr_size += info->l3_info.header_size;
 	ptr->word_1 = cpu_to_be32(word);
@@ -2245,7 +2102,6 @@ static int create_tunnel_insert_hm(struct ins_entry_info *info)
 
 static int create_tunnel_remove_hm(struct ins_entry_info *info)
 {
-	PCtEntry ctentry;
 	struct en_ehash_remove_first_ip_hdr *param;
 	uint32_t word = 0;
 
@@ -2253,37 +2109,12 @@ static int create_tunnel_remove_hm(struct ins_entry_info *info)
 		return FAILURE;
 	if (sizeof(struct en_ehash_remove_first_ip_hdr) > info->param_size)
 		return FAILURE;
-	ctentry = info->entry;
 	param = (struct en_ehash_remove_first_ip_hdr *)info->paramptr;
 
-	if ((!ctentry) || (!ctentry->pRtEntry) || (!ctentry->pRtEntry->input_itf)) {
-		DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on ingress\n",
-				__func__, __LINE__);
-		return FAILURE;
-	}
-
 #ifdef INCLUDE_TUNNEL_IFSTATS
-	if (info->l3_info.tunnel_flow_ifstats) {
-		/* The lookup below resolves a registered tunnel interface,
-		 * which a flow-described tunnel does not have: input_itf is the
-		 * physical port and the lookup would fail outright, taking the
-		 * flow with it. Such a tunnel names its receive record in the
-		 * description instead, or names none. */
-		word |= tunnel_stats_pointer(info->l3_info.tunnel_rx_stats_offset);
-	} else {
-		uint8_t offset;
-		if (dpa_get_iface_stats_entries(ctentry->pRtEntry->input_itf->index, 0,
-					&offset, RX_IFSTATS, IF_TYPE_TUNNEL)) {
-			DPA_ERROR("%s::unable to get stats offset on tunnel iface on ingress\n",
-					__func__);
-			return FAILURE;
-		}
-		word |= ((get_logical_ifstats_base() +
-                                (offset * sizeof(struct en_ehash_stats))) & 0xffffff);
-		DPA_INFO("%s::stats ptr %x\n", __func__, word);
-	}
-#else
-	word = 0;
+	/* The tunnel names its receive record in the description, or names
+	 * none. */
+	word |= tunnel_stats_pointer(info->l3_info.tunnel_rx_stats_offset);
 #endif
 	info->eth_type = Get_Tnl_Ethertype(info->l3_info.mode) & 0xFFFF;	
 	if (info->l3_info.tunnel_flags & DSCP_COPY)

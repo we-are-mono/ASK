@@ -46,25 +46,18 @@ struct ins_entry_info {
 };
 
 static uint32_t stats_base = 0x1000;
-static unsigned lookups, legacy_entries;
-static uint8_t legacy_offsets[4];
+static unsigned lookups;
+static int port_unregistered;
 static uint32_t get_logical_ifstats_base(void) { return stats_base; }
-/* The registered-interface path. A flow-described stack must never reach
- * either lookup: there is no interface to walk, and on a physical port the
- * walk answers with nothing. */
+/* Whether the ingress is a registered port, which never has VLAN records of
+ * its own. Only a strip with no description of its own asks: a flow that
+ * described a stack names its records, and never needs the port. */
 static int dpa_get_num_vlan_iface_stats_entries(unsigned iif, unsigned underlying, uint32_t *n)
 {
     lookups++;
-    *n = legacy_entries;
-    return SUCCESS;
-}
-static int dpa_get_iface_stats_entries(unsigned iif, unsigned underlying, uint8_t *offset,
-                                       unsigned dir, unsigned type)
-{
-    lookups++;
-    assert(dir == RX_IFSTATS && type == IF_TYPE_VLAN);
-    memcpy(offset, legacy_offsets, legacy_entries ? legacy_entries : 1);
-    return SUCCESS;
+    assert(iif == 5 && underlying == 5);
+    *n = 0;
+    return port_unregistered ? FAILURE : SUCCESS;
 }
 
 static char display_log[512];
@@ -219,11 +212,6 @@ int main(void)
     display_vlanhdr_insert_opc(PARAMS);
     assert(strstr(display_log, "stats offset 13::") && strstr(display_log, "stats offset 15::"));
 
-    /* The registered path keeps its historical outermost-first list. */
-    info = egress(16, 2, qinq, both, 0, opcode);
-    assert(create_vlan_ins_hm(&info) == SUCCESS);
-    assert(PARAMS[12] == 0x0f && PARAMS[13] == 0x0d);
-
     /* Two tags with one record missing: none at all, because the list form
      * has no way to skip a tag and zero there is another owner's record. */
     info = egress(16, 2, qinq, partial, 1, opcode);
@@ -236,12 +224,6 @@ int main(void)
     info = egress(8, 1, priority, one, 1, opcode);
     assert(create_vlan_ins_hm(&info) == SUCCESS);
     assert(word_at(PARAMS) == (1u << 24));
-
-    /* The registered-interface path is unchanged: its offsets come from the
-     * description too, filled by the interface walk. */
-    info = egress(8, 1, single, one, 0, opcode);
-    assert(create_vlan_ins_hm(&info) == SUCCESS);
-    assert(word_at(PARAMS) == ((1u << 24) | (stats_base + 0x0d * 16)));
 
     /* Refusals leave every cursor untouched and write no opcode. The vendor's
      * insert lays the headers down before it sizes the record list, so a
@@ -260,10 +242,8 @@ int main(void)
 
     /* ---- the strip ------------------------------------------------------
      *
-     * One tag with a record: count one, pointer direct, and no lookup at all
-     * -- on a physical port the registered-interface walk would answer with
-     * nothing, and the legacy path's single-entry arm would then read an
-     * index it never wrote. */
+     * One tag with a record: count one, pointer direct, and no lookup at all:
+     * the flow named the record, so there is nothing to ask the port. */
     info = ingress(12, 1, single, one, 1, opcode);
     assert(insert_remove_vlan_hm(&info, 5, 5) == SUCCESS);
     assert(!lookups);
@@ -303,13 +283,28 @@ int main(void)
     assert(!strip_params()->vlan_id[0] && !strip_params()->vlan_id[1]);
     assert(!strip_params()->op_flags);
 
-    /* The registered-interface path still walks the interfaces. */
-    legacy_entries = 1;
-    legacy_offsets[0] = 0x21;
-    info = ingress(12, 1, single, NULL, 0, opcode);
+    /* No description at all -- a flow that named no encapsulation, or an
+     * untagged multicast group: no tag to validate and no record, and the word
+     * is the statistics base with a count of zero, as it has always been for
+     * such an entry. The port is still asked whether it is a registered one,
+     * once, and a refusal refuses the entry without touching its cursors. */
+    info = ingress(12, 0, NULL, NULL, 0, opcode);
     assert(insert_remove_vlan_hm(&info, 5, 5) == SUCCESS);
-    assert(lookups == 2);
-    assert(word_at(PARAMS + 4) == ((1u << 24) | (stats_base + 0x21 * 16)));
+    assert(lookups == 1);
+    assert(word_at(PARAMS + 4) == stats_base);
+    assert(!strip_params()->vlan_id[0] && !strip_params()->vlan_id[1]);
+    assert(opcode[0] == STRIP_ALL_VLAN_HDRS && info.opc_count == 2);
+    assert(info.paramptr == PARAMS + 12 && info.param_size == 0);
+    guards_intact(PARAMS + 12);
+    port_unregistered = 1;
+    info = ingress(12, 0, NULL, NULL, 0, opcode);
+    assert(insert_remove_vlan_hm(&info, 5, 5) == FAILURE);
+    assert(info.opc_count == 1 && info.param_size == 12 && opcode[0] == 0xa5);
+    assert(!strip_params()->word);
+    port_unregistered = 0;
+    info = ingress(11, 0, NULL, NULL, 0, opcode);
+    assert(insert_remove_vlan_hm(&info, 5, 5) == FAILURE);
+    assert(info.opc_count == 1 && info.param_size == 11 && opcode[0] == 0xa5);
     lookups = 0;
 
     /* Refusals leave the cursors alone and write nothing past the zeroed
@@ -346,10 +341,10 @@ int main(void)
         assert(info.l2_info.ingress_vlan_stats_offsets[0] == 0x0e);
         assert(info.l2_info.ingress_vlan_stats_offsets[1] == 0x10);
         assert(info.l2_info.vlan_stats_offsets[0] == 0x13 && !info.l2_info.vlan_stats_offsets[1]);
-        assert(info.l2_info.vlan_present && !info.l2_info.pppoe_flow_ifstats);
+        assert(info.l2_info.vlan_present && !info.l2_info.pppoe_present);
 
         /* No tags, no indices: still flow-described, so the strip emits the
-         * disabled word rather than walking interfaces that do not exist. */
+         * disabled word without asking the port. */
         memset(&info, 0, sizeof(info));
         encap = (struct cdx_l2_encap){};
         assert(apply_l2_encap(&info, &encap) == SUCCESS);

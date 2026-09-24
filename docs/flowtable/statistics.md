@@ -170,9 +170,10 @@ That decides four things.
 - **The insert's record list is innermost-first.** The firmware inserts the
   innermost header first and counts the k-th listed record after the k-th
   insertion, so listing the records outermost-first — the order the strip uses
-  beside its VIDs, and the order the legacy path has always written — would
-  hand the outer device the frame with only the inner tag on. The flow path
-  lists them the other way; the legacy path is left as it was.
+  beside its VIDs, and the order the legacy path wrote — would hand the outer
+  device the frame with only the inner tag on. The flow path lists them the
+  other way; the legacy path, which no description reached once VLAN devices
+  stopped registering, is gone.
 - **A ppp device subtracts the Ethernet header plus one tag per VLAN device its
   session runs over on receive, and the Ethernet and session headers on
   transmit.** `ppp_generic.c` counts `skb->len - PPP_PROTO_LEN` both ways, the

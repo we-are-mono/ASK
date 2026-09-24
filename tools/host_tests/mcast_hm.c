@@ -82,15 +82,11 @@ typedef struct {
 #define IS_IPV6_FLOW(e) (((e)->fftype & FFTYPE_IPV6) != 0)
 
 static uint32_t get_logical_ifstats_base(void) { return 0; }
-/* The registered-interface arm of the ingress strip, which a group's own
- * description never takes: its records come from the description. */
-enum { RX_IFSTATS, TX_IFSTATS };
-#define IF_TYPE_VLAN (1 << 1)
+/* The ingress strip's check that an undescribed ingress is a registered port,
+ * which a group's own description never needs: its records come from the
+ * description. */
 static int dpa_get_num_vlan_iface_stats_entries(uint32_t a, uint32_t b, uint32_t *n)
 { (void)a; (void)b; (void)n; assert(!"a group names its own tags"); return -1; }
-static int dpa_get_iface_stats_entries(uint32_t a, uint32_t b, uint8_t *o,
-                                       uint32_t t, uint32_t i)
-{ (void)a; (void)b; (void)o; (void)t; (void)i; assert(!"a group names its own tags"); return -1; }
 
 #include "mcast_hm.inc"
 

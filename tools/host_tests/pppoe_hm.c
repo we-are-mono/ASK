@@ -1,8 +1,10 @@
 /* The two PPPoE header manipulations and the description they read, compiled
  * from CDX against the shipped SDK header. What this pins down is the one
- * thing a hardware run cannot show cheaply: that a session described by a flow
- * emits a null statistics pointer rather than aiming the ucode's counter
- * update at the unallocated offset zero, which belongs to another interface. */
+ * thing a hardware run cannot show cheaply: that each opcode counts into the
+ * record half the flow's description names for it, and that a session with no
+ * record emits a null statistics pointer rather than aiming the ucode's
+ * counter update at the unallocated offset zero, which belongs to another
+ * interface. */
 #include <assert.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -18,8 +20,6 @@
 #define MAX_OPCODES 16
 #define SUCCESS 0
 #define FAILURE -1
-#define RX_IFSTATS 0
-#define IF_TYPE_PPPOE 4
 #define ETHERTYPE_PPPOE 0x8864
 #define ETHER_ADDR_LEN 6
 #define DPA_ERROR(...) ((void)0)
@@ -42,21 +42,7 @@ struct ins_entry_info {
 
 static uint32_t stats_base;
 static uint8_t stats_offset;
-static int fail_stats;
-static unsigned stats_lookups;
 static uint32_t get_logical_ifstats_base(void) { return stats_base; }
-static int dpa_get_iface_stats_entries(unsigned index, unsigned underlying,
-                                       uint8_t *offset, unsigned dir, unsigned type)
-{
-    stats_lookups++;
-    /* The interface index is the one the caller resolved; a flow-described
-     * session must never get this far, because on a physical port this lookup
-     * fails and takes the whole flow with it. */
-    assert(index == 7 && underlying == 0 && dir == RX_IFSTATS && type == IF_TYPE_PPPOE);
-    if (fail_stats) return FAILURE;
-    *offset = stats_offset;
-    return SUCCESS;
-}
 
 static char display_log[256];
 static void printk(const char *fmt, ...)
@@ -123,7 +109,7 @@ int main(void)
     assert(sizeof(struct en_ehash_strip_pppoe_hdr) == 4);
     check_decode_fields();
 
-    /* A session named by an interface keeps the pointer it was allocated. */
+    /* A session keeps the record its description names. */
     for (unsigned b = 0; b < sizeof(bases) / sizeof(bases[0]); b++)
     for (unsigned o = 0; o < sizeof(offsets); o++)
     for (unsigned s = 0; s < sizeof(sids) / sizeof(sids[0]); s++) {
@@ -151,21 +137,6 @@ int main(void)
          * type is written afterwards has to be the session one. */
         assert(info.eth_type == ETHERTYPE_PPPOE);
 
-        /* A flow-described session names its own record in the description,
-         * and the pointer is built from that rather than from a registered
-         * interface -- the same arithmetic, a different source. */
-        memset(bytes, 0xa5, sizeof(bytes));
-        info = (struct ins_entry_info){ .opc_count = 2, .param_size = 8,
-                                        .paramptr = bytes + 1, .opcptr = opcode,
-                                        .eth_type = 0x0800 };
-        opcode[0] = opcode[1] = 0xa5;
-        info.l2_info.pppoe_sess_id = sids[s];
-        info.l2_info.pppoe_stats_offset = stats_offset;
-        info.l2_info.pppoe_flow_ifstats = 1;
-        assert(create_pppoe_ins_hm(&info) == SUCCESS);
-        expect_insert(bytes + 1, stats_base + offsets[o] * 24, sids[s]);
-        assert(opcode[0] == INSERT_PPPoE_HDR && info.eth_type == ETHERTYPE_PPPOE);
-
         /* And a session with no record names index zero, which is never a
          * record: every real one has STATS_WITH_TS set. The opcode then
          * carries the null pointer the statistics-disabled build writes,
@@ -177,17 +148,14 @@ int main(void)
         opcode[0] = opcode[1] = 0xa5;
         info.l2_info.pppoe_sess_id = sids[s];
         info.l2_info.pppoe_stats_offset = 0;
-        info.l2_info.pppoe_flow_ifstats = 1;
         assert(create_pppoe_ins_hm(&info) == SUCCESS);
         expect_insert(bytes + 1, 0, sids[s]);
         assert(opcode[0] == INSERT_PPPoE_HDR && info.eth_type == ETHERTYPE_PPPOE);
         expect_decode(bytes + 1, 0, sids[s]);
     }
 
-    /* The strip, both ways round. Its only parameter is the pointer, which is
-     * exactly why a flow-described session must not be allowed to compute
-     * one: there is no interface to look the offset up on, and the lookup
-     * itself fails on a physical port. */
+    /* The strip. Its only parameter is the pointer, built from the receive
+     * record the description names. */
     for (unsigned o = 0; o < sizeof(offsets); o++) {
         uint8_t bytes[6], opcode[2] = {0xa5, 0xa5};
         struct ins_entry_info info = {
@@ -200,9 +168,11 @@ int main(void)
         stats_base = bases[o % (sizeof(bases) / sizeof(bases[0]))];
         stats_offset = offsets[o] | 0x80;
         pointer = stats_base + offsets[o] * 24;
-        stats_lookups = 0;
-        assert(insert_remove_pppoe_hm(&info, 7) == SUCCESS);
-        assert(stats_lookups == 1);
+        info.l2_info.pppoe_rx_stats_offset = stats_offset;
+        /* The transmit index is the insert's and must not be read here: the
+         * two halves of one record are different addresses. */
+        info.l2_info.pppoe_stats_offset = (uint8_t)(stats_offset + 1);
+        assert(insert_remove_pppoe_hm(&info) == SUCCESS);
         const uint8_t expected[] = { pointer >> 24, pointer >> 16,
                                      pointer >> 8, pointer };
         assert(memcmp(bytes + 1, expected, sizeof(expected)) == 0);
@@ -210,34 +180,12 @@ int main(void)
         assert(opcode[0] == STRIP_PPPoE_HDR && info.opc_count == 3);
         assert(info.paramptr == bytes + 5 && info.param_size == 0);
 
-        /* A flow-described session names its receive record in the
-         * description. The lookup is not attempted at all -- on a physical
-         * port it returns a failure that would refuse the whole flow -- and
-         * the pointer comes from the index that was named. */
+        /* No record: index zero, null pointer. */
         memset(bytes, 0xa5, sizeof(bytes));
         opcode[0] = opcode[1] = 0xa5;
         info = (struct ins_entry_info){ .opc_count = 2, .param_size = 4,
                                         .paramptr = bytes + 1, .opcptr = opcode };
-        info.l2_info.pppoe_flow_ifstats = 1;
-        info.l2_info.pppoe_rx_stats_offset = stats_offset;
-        /* The transmit index is the insert's and must not be read here: the
-         * two halves of one record are different addresses. */
-        info.l2_info.pppoe_stats_offset = (uint8_t)(stats_offset + 1);
-        stats_lookups = 0;
-        assert(insert_remove_pppoe_hm(&info, 7) == SUCCESS);
-        assert(stats_lookups == 0);
-        assert(memcmp(bytes + 1, expected, sizeof(expected)) == 0);
-        assert(opcode[0] == STRIP_PPPoE_HDR);
-
-        /* No record: index zero, null pointer, still no lookup. */
-        memset(bytes, 0xa5, sizeof(bytes));
-        opcode[0] = opcode[1] = 0xa5;
-        info = (struct ins_entry_info){ .opc_count = 2, .param_size = 4,
-                                        .paramptr = bytes + 1, .opcptr = opcode };
-        info.l2_info.pppoe_flow_ifstats = 1;
-        stats_lookups = 0;
-        assert(insert_remove_pppoe_hm(&info, 7) == SUCCESS);
-        assert(stats_lookups == 0);
+        assert(insert_remove_pppoe_hm(&info) == SUCCESS);
         assert(memcmp(bytes + 1, (uint8_t[4]){0}, 4) == 0);
         assert(opcode[0] == STRIP_PPPoE_HDR);
 
@@ -246,7 +194,7 @@ int main(void)
     }
 
     /* Refusals leave every cursor and every parameter byte untouched. */
-    for (unsigned failure = 0; failure < 5; failure++) {
+    for (unsigned failure = 0; failure < 3; failure++) {
         uint8_t bytes[8], opcode = 0xa5;
         struct ins_entry_info info = {
             .param_size = 8, .paramptr = bytes, .opcptr = &opcode,
@@ -254,37 +202,24 @@ int main(void)
         unsigned count, size;
 
         memset(bytes, 0xa5, sizeof(bytes));
-        fail_stats = 0;
         switch (failure) {
         case 0: info.opc_count = MAX_OPCODES; break;
         case 1: info.param_size = 7; break;
         case 2: info.param_size = 3; break;
-        case 3: fail_stats = 1; break;
-        case 4: fail_stats = 1; info.l2_info.pppoe_flow_ifstats = 1; break;
         }
         count = info.opc_count;
         size = info.param_size;
         if (failure < 2)
             assert(create_pppoe_ins_hm(&info) == FAILURE);
-        else if (failure == 2)
-            assert(insert_remove_pppoe_hm(&info, 7) == FAILURE);
-        else if (failure == 3)
-            assert(insert_remove_pppoe_hm(&info, 7) == FAILURE);
         else
-            /* A flow-described session never consults the interface, so the
-             * lookup's failure cannot reach it. */
-            assert(insert_remove_pppoe_hm(&info, 7) == SUCCESS);
-        if (failure == 4)
-            continue;
+            assert(insert_remove_pppoe_hm(&info) == FAILURE);
         assert(info.opc_count == count && info.param_size == size);
         assert(info.paramptr == bytes && info.opcptr == &opcode && opcode == 0xa5);
         for (unsigned i = 0; i < sizeof(bytes); i++) assert(bytes[i] == 0xa5);
     }
-    fail_stats = 0;
 
-    /* What puts the session into that description in the first place. The
-     * caller's encapsulation is the flow's, so it must also be what turns the
-     * statistics pointer off on both opcodes. */
+    /* What puts the session into that description in the first place: the
+     * caller's encapsulation, records and all. */
     {
         struct ins_entry_info info = { .param_size = 8 };
         struct cdx_l2_encap encap = {};
@@ -300,7 +235,6 @@ int main(void)
         encap.egress_stats_index = 0x84;
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         assert(info.l2_info.add_pppoe_hdr && !info.l2_info.pppoe_present);
-        assert(info.l2_info.pppoe_flow_ifstats);
         assert(info.l2_info.pppoe_sess_id == 0x1234);
         assert(!memcmp(info.l2_info.ac_mac_addr, ac, ETHER_ADDR_LEN));
         assert(info.l2_info.pppoe_rx_stats_offset == 0x83);
@@ -310,7 +244,6 @@ int main(void)
         encap = (struct cdx_l2_encap){ .ingress_pppoe = 1, .ingress_stats_index = 0x85 };
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         assert(info.l2_info.pppoe_present && !info.l2_info.add_pppoe_hdr);
-        assert(info.l2_info.pppoe_flow_ifstats);
         assert(info.l2_info.pppoe_rx_stats_offset == 0x85);
         /* A session that inserts nothing names no transmit record either. */
         assert(!info.l2_info.pppoe_stats_offset);
@@ -325,26 +258,26 @@ int main(void)
         info.l2_info.add_pppoe_hdr = 1;
         assert(apply_l2_encap(&info, &encap) == FAILURE);
 
-        /* And tags with no session leave both PPPoE flags, and the
-         * suppression, alone. */
+        /* And tags with no session leave both PPPoE flags, and both
+         * records, alone -- even with indices in the encapsulation. */
         memset(&info, 0, sizeof(info));
-        encap = (struct cdx_l2_encap){ .num_egress = 1 };
+        encap = (struct cdx_l2_encap){ .num_egress = 1, .ingress_stats_index = 0x86,
+                                       .egress_stats_index = 0x87 };
         encap.egress[0].tpid = 0x8100;
         encap.egress[0].tci = 100;
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         assert(!info.l2_info.pppoe_present && !info.l2_info.add_pppoe_hdr);
-        assert(!info.l2_info.pppoe_flow_ifstats);
         assert(!info.l2_info.pppoe_rx_stats_offset && !info.l2_info.pppoe_stats_offset);
         assert(info.l2_info.num_egress_vlan_hdrs == 1);
         /* A tag says nothing about a tunnel either way. */
         assert(!info.l3_info.add_tnl_header && !info.l3_info.tnl_header_present);
-        assert(!info.l3_info.tunnel_flow_ifstats && !info.l3_info.header_size);
+        assert(!info.l3_info.header_size);
+        assert(!info.l3_info.tunnel_stats_offset && !info.l3_info.tunnel_rx_stats_offset);
     }
 
     /* The tunnel half of the same description. A tunnel is an L3 header, so it
      * spends no encapsulation slot and lands in l3_info; what it shares with a
-     * session is that the flow names its own record, which is what stops the
-     * opcodes resolving a registered tunnel interface that does not exist. */
+     * session is that the flow names its own record. */
     {
         struct ins_entry_info info;
         struct cdx_l2_encap encap;
@@ -363,7 +296,6 @@ int main(void)
         memcpy(encap.egress_tunnel.header, outer, 20);
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         assert(info.l3_info.add_tnl_header && !info.l3_info.tnl_header_present);
-        assert(info.l3_info.tunnel_flow_ifstats);
         assert(info.l3_info.mode == TNL_MODE_6O4 && info.l3_info.header_size == 20);
         assert(!memcmp(info.l3_info.header, outer, 20));
         /* Only what the description named: the bytes past the header stay
@@ -385,7 +317,6 @@ int main(void)
         encap.ingress_tunnel.stats_index = 0x0e;
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         assert(info.l3_info.tnl_header_present && !info.l3_info.add_tnl_header);
-        assert(info.l3_info.tunnel_flow_ifstats);
         assert(info.l3_info.mode == TNL_MODE_4O6 && info.l3_info.header_size == 40);
         assert(info.l3_info.tunnel_flags == DSCP_COPY);
         assert(info.l3_info.tunnel_rx_stats_offset == 0x0e);

@@ -250,25 +250,14 @@ struct dpa_l2hdr_info {
 		uint32_t pppoe_present:1;
 		uint32_t is_wlan_iface:1;
 		uint32_t add_pppoe_hdr:1;
-		/* The two PPPoE header manipulations reach the logical
-		 * statistics area by an index a registered PPPoE interface
-		 * owns: the insert reads one off the description and the strip
-		 * looks one up by interface id. A session described by a flow
-		 * has no such interface, so set this and both take their index
-		 * from the description instead -- pppoe_stats_offset for the
-		 * insert and pppoe_rx_stats_offset for the strip. An index of
-		 * zero then means no record at all and both emit a null
-		 * pointer, which is what the vendor's own
-		 * INCLUDE_PPPoE_IFSTATS-disabled arms write; leaving the
-		 * unallocated index zero to be used as an index would aim the
-		 * ucode's counter update at another interface's record. */
-		uint32_t pppoe_flow_ifstats:1;
-		/* The VLAN counterpart: the two VLAN header manipulations look
-		 * their record indices up from registered VLAN interfaces, which
-		 * a flow-described stack has none of. Set, they read
+		/* Set when a flow described its own encapsulation
+		 * (apply_l2_encap()), the only way tags reach this description.
+		 * The two VLAN header manipulations then read
 		 * vlan_stats_offsets (insert) and ingress_vlan_stats_offsets
-		 * (strip) instead, one index per tag, and emit no pointer at
-		 * all unless every tag in the stack names a record. */
+		 * (strip), one index per tag, and emit no pointer at all unless
+		 * every tag in the stack names a record. Clear, there are no
+		 * tags, and the strip only checks that the port is a
+		 * registered one. */
 		uint32_t vlan_flow_ifstats:1;
 		uint32_t add_eth_type:1;
 	};
@@ -283,17 +272,17 @@ struct dpa_l2hdr_info {
 #ifdef INCLUDE_VLAN_IFSTATS
 	uint8_t vlan_stats_offsets[DPA_CLS_HM_MAX_VLANs];
 	/* Receive halves for the strip, innermost first like everything
-	 * else here. Only a flow-described stack fills this: the legacy strip
-	 * walks the registered interfaces for its indices. */
+	 * else here. */
 	uint8_t ingress_vlan_stats_offsets[DPA_CLS_HM_MAX_VLANs];
 #endif
 	uint8_t l2hdr[6 * 2];
 	uint8_t ac_mac_addr[6];
 	uint16_t pppoe_sess_id;
 #ifdef INCLUDE_PPPoE_IFSTATS
-	/* The transmit half, which the insert has always read from here. The
-	 * receive half has no field in the legacy path because the strip looks
-	 * it up instead; a flow-described session cannot, so it names it. */
+	/* The session's record: the transmit half for the insert and the
+	 * receive half for the strip. Zero is no record, and both emit a null
+	 * pointer, which is what the vendor's own INCLUDE_PPPoE_IFSTATS-disabled
+	 * arms write; index zero itself belongs to someone else. */
 	uint8_t pppoe_stats_offset;
 	uint8_t pppoe_rx_stats_offset;
 #endif
@@ -309,18 +298,13 @@ struct dpa_l3hdr_info {
 		uint8_t add_tnl_header:1;
 		uint8_t tnl_header_present:1;
 		uint8_t ipsec_inbound_flow:1; /* Flag to identify ipsec inbound flow */
-		/* The two tunnel header manipulations reach the logical
-		 * statistics area by an index a registered tunnel interface
-		 * owns, looked up from the route's interfaces. A tunnel
-		 * described by a flow has no such interface, so set this and
-		 * both take their index from the description instead --
-		 * tunnel_stats_offset for the insert and tunnel_rx_stats_offset
-		 * for the strip. Zero is no record and emits a null pointer,
-		 * which is what the INCLUDE_TUNNEL_IFSTATS-disabled arms
-		 * write; index zero itself belongs to someone else. */
-		uint8_t tunnel_flow_ifstats:1;
 	};
 	uint8_t tunnel_flags; /* used in dscp propagation */
+	/* The tunnel's record, from the flow's description: the transmit half
+	 * for the insert and the receive half for the strip. Zero is no record
+	 * and emits a null pointer, which is what the
+	 * INCLUDE_TUNNEL_IFSTATS-disabled arms write; index zero itself belongs
+	 * to someone else. */
 	uint8_t tunnel_stats_offset;
 	uint8_t tunnel_rx_stats_offset;
 	uint8_t pad;

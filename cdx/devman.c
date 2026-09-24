@@ -1066,9 +1066,8 @@ static void dpa_get_iface_stats(struct dpa_iface_info *iface_info,
 }
 
 /* The record a registered port counts in. Only Ethernet ports and Wi-Fi VAPs
- * register, so a VLAN asks for nothing and succeeds on either, while a PPPoE
- * session or a tunnel, which has no interface of its own to hold one, is
- * refused. */
+ * register; a VLAN device, PPPoE session or tunnel has its record named by
+ * the flow that crosses it, never looked up here. */
 int dpa_get_iface_stats_entries(uint32_t iif_index,
 		uint32_t underlying_iif_index, uint8_t *offset,
 		uint32_t stats_type, uint32_t iface_type)
@@ -1089,11 +1088,9 @@ int dpa_get_iface_stats_entries(uint32_t iif_index,
 	{
 		case IF_TYPE_ETHERNET:
 		case IF_TYPE_WLAN:
-		case IF_TYPE_VLAN:
 			if (!(iface_info->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_WLAN)))
 				return FAILURE;
-			if (iface_type != IF_TYPE_VLAN)
-				dpa_get_iface_stats(iface_info, offset, stats_type);
+			dpa_get_iface_stats(iface_info, offset, stats_type);
 			return SUCCESS;
 	}
 	return FAILURE;
