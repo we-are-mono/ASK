@@ -570,27 +570,9 @@ async def test_bridged_ipv6(aiohttp_session, target_agent, lan, mcast_bridge,
     )
 
 
-async def test_bridged_ipv4_on_the_iptv_vlan(aiohttp_session, target_agent,
-                                             lan, mcast_bridge):
-    """The shape the product actually runs: the ISP delivers IPTV on a VLAN
-    the box simply bridges, so the group's frames carry a tag on the way in
-    and the listener port's membership decides whether they carry one out.
-    """
-    pytest.skip("VLAN-aware bridge fixture lands with the membership learner")
-
-
-async def test_a_leave_does_not_interrupt_the_others(aiohttp_session,
-                                                     target_agent, lan,
-                                                     mcast_bridge):
-    """Two consumers, one leaves mid-stream, the other must not notice.
-
-    This is the chain swap's reason for existing. Replacing a listener set by
-    deleting the group and re-adding it would take the key out of the
-    classifier between the two, so every remaining listener would lose frames
-    because a different listener left — and in an IPTV deployment membership
-    changes whenever anyone changes channel.
-    """
-    pytest.skip("needs the second LAN consumer the topology does not yet have")
+# IPTV tagged on the way in is test_flowtable_service_multicast_bridge's
+# tagged_ingress case, and a consumer leaving while another keeps watching
+# is test_flowtable_service_multicast_leave's bridged_leave.
 
 
 # ------------------------------------------------------- routed multicast
