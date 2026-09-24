@@ -84,9 +84,16 @@ async def lan_counters(r):
 
 
 async def summary(r):
-    result = await r.target.fs_read(r.session, "/proc/cdx_flowtable", max_bytes=4096)
+    # The counters and status rows come before the first flow row, and a full
+    # table runs to thousands of rows here, so only its head is read. The head
+    # ends at the first line that is a flow row: a counter can end in "flow"
+    # itself (ipsec_sec_refused_seq_overflow).
+    limit = 16384
+    result = await r.target.fs_read(r.session, "/proc/cdx_flowtable", max_bytes=limit)
     assert result["errno"] == 0, result
-    return status_text(bytes.fromhex(result["content_hex"]).decode().split("flow ", 1)[0])
+    head, row, _ = bytes.fromhex(result["content_hex"]).decode().partition("\nflow ")
+    assert row or result["size"] < limit, ("the table's head outgrew the read", result["size"])
+    return status_text(head)
 
 
 async def wait_entries(r, count, p, timeout=90):
