@@ -85,6 +85,12 @@ is why this is testable without a radio at all — a VAP binds to a netdev by
 `net_dev->wifi_offload_dev`, and nothing on that path requires the netdev to
 be wireless.
 
+(Since removed: the per-VAP queue into the offline port, the port's receive
+queues and the transmit-confirmation pool behind them. Only CMM's Wi-Fi fast
+path ever injected a frame there, and the ingress half they would serve is not
+built — see step 6. The port is still claimed, because its id is what names a
+VAP to the classifier.)
+
 **The board provides that port, and provides it for this.** The DK ships two
 offline ports and no more, one per subsystem that needs one:
 

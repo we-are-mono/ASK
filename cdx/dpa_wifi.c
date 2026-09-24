@@ -45,12 +45,7 @@
 //uncomment to allow debug prints
 //#define DPA_WIFI_DEBUG  1
 
-static DEFINE_PER_CPU(unsigned int, num_tx_done);
-static atomic_t vwd_tx_pending = ATOMIC_INIT(0);
-static struct delayed_work vwd_tx_work;
 static bool vwd_stopping = true;
-#define PORTID_SHIFT_VAL 	8
-#define VAP_TX_CONF_BUF_COUNT	128
 #define DPAWIFI_ERROR(fmt, ...)\
 {\
         printk(KERN_CRIT fmt, ## __VA_ARGS__);\
@@ -63,14 +58,6 @@ static bool vwd_stopping = true;
 #else
 #define DPAWIFI_INFO(fmt, ...)
 #endif
-
-#define percpu_var_sum(var, total)\
-{\
-	unsigned int ii; \
-	total = 0;\
-	for_each_possible_cpu(ii)\
-		total += per_cpu(var, ii);\
-}
 
 #define INCR_PER_CPU_STAT(ptr, stat)\
 {\
@@ -93,10 +80,6 @@ static bool vwd_stopping = true;
  *        (release-published only after the FQs are live) and on
  *        VAP_ST_OPEN (the forwarding dequeue path), so they never
  *        observe a half-built VAP.
- *   vwd.txlock (spinlock_t)
- *      - Serializes draining the tx-done buffer pool, from the
- *        reclaim work and from exit, against the vwd_stopping
- *        transition.
  *   vwd (file-scope struct)
  *      - Initialized once in dpaa_vwd_init(), torn down in
  *        dpaa_vwd_exit(). VWD holds the Ethernet netdev reference
@@ -120,14 +103,6 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 static DEVICE_ATTR(vwd_debug_stats, 0444, vwd_show_dump_stats, NULL);
 static struct device_attribute dev_attr_vap[MAX_WIFI_VAPS];
 static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq, const struct qm_dqrr_entry *dq);
-static void vwd_release_pcd_fqs(struct dpaa_vwd_priv_s *priv);
-void drain_bp_tx_done_bpool(struct dpa_bp *bp);
-
-/* In case VWD OFFLOAD , headers can be added in ucode, and the length of the 
-	 original buffer can be increased. And this increased length is written from 
-	 fixed offset (192) for packets coming from OH port causing headers to grow at tail.
-	 So tailroom is introduced to allow the tail to grow upto 64 bytes */
-#define SKB_ASK_TAILROOM 	64
 
 static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *attribute, char *buf)
 {
@@ -152,18 +127,14 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 	memset(&total_stats, 0, sizeof(struct vap_stats_s));
 	for_each_possible_cpu(i) {
 		per_cpu_stats = per_cpu_ptr(priv->vaps[ii].vap_stats, i);
-		total_stats.pkts_slow_forwarded += per_cpu_stats->pkts_slow_forwarded;
 		total_stats.pkts_rx_fast_forwarded += per_cpu_stats->pkts_rx_fast_forwarded;
 		total_stats.pkts_rx_ipsec += per_cpu_stats->pkts_rx_ipsec;
-		total_stats.pkts_slow_path_drop += per_cpu_stats->pkts_slow_path_drop;
 	}
 
 	len += sprintf(buf, "VAP (id : %d  name : %s)\n",ii,priv->vaps[ii].ifname);
 	len += sprintf(buf + len, "From DPAA\n");
-	len += sprintf(buf + len, "  WiFi Rx pkts : %u \n", total_stats.pkts_slow_forwarded);
 	len += sprintf(buf + len, "  WiFi Tx pkts : %u \n", total_stats.pkts_rx_fast_forwarded);
 	len += sprintf(buf + len, "  WiFi Tx ipsec pkts : %u\n", total_stats.pkts_rx_ipsec);
-	len += sprintf(buf + len, "  WiFI Rx slow path drops : %u\n", total_stats.pkts_slow_path_drop);
 
 	return len;
 }
@@ -175,8 +146,6 @@ static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *
 {
 	ssize_t len = 0;
 	struct dpaa_vwd_priv_s *priv = &vwd;
-	unsigned int total_num_tx_done;
-	//int ii;
 	struct vwd_global_stats_s *per_cpu_stats;
 	struct vwd_global_stats_s total_stats;
 	int i;
@@ -186,17 +155,9 @@ static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *
 		per_cpu_stats = per_cpu_ptr(priv->vwd_global_stats, i);
 		total_stats.pkts_slow_fail += per_cpu_stats->pkts_slow_fail;
 		total_stats.pkts_dev_down_drop += per_cpu_stats->pkts_dev_down_drop;
-		total_stats.pkts_tx_errors += per_cpu_stats->pkts_tx_errors;
 	}
 
-	len += sprintf(buf + len, "\nStatus\n");
-	percpu_var_sum(num_tx_done, total_num_tx_done);
-	len += sprintf(buf + len, "  tx done  %u\n", total_num_tx_done);
-	len += sprintf(buf + len, "  Hardware-owned frames : %d\n",
-			atomic_read(&vwd_tx_pending));
-
 	len += sprintf(buf + len, "From DPAA\n");
-	len += sprintf(buf + len, "  Hardware/enqueue errors : %u\n", total_stats.pkts_tx_errors);
 	len += sprintf(buf + len, "  WiFI Rx Fails : %u\n", total_stats.pkts_slow_fail);
 	len += sprintf(buf + len, "  WiFI Device Down Drops : %u\n", total_stats.pkts_dev_down_drop);
 
@@ -224,204 +185,6 @@ static void dpaa_vwd_sysfs_exit(void)
 	struct dpaa_vwd_priv_s *priv = &vwd;
 
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_debug_stats);
-}
-
-
-
-struct vwd_dma_mapping {
-	dma_addr_t addr;
-	unsigned int size;
-	unsigned int page_offset;
-	struct page *page;
-};
-
-/* Completion in BMan returns only the buffer address, not the FD. Keep
- * ownership and the original mappings before the DMA area, on separate
- * cache lines. Never use hardware-writable SG entries to unmap a frame.
- */
-struct vwd_tx_buffer {
-	struct sk_buff *skb;
-	struct net_device *dev;
-	struct vap_desc_s *vap;
-	u32 generation;
-	unsigned int size;
-	unsigned int num_maps;
-	bool page_allocated;
-	struct vwd_dma_mapping maps[DPA_SGT_MAX_ENTRIES];
-	u8 buffer[] __aligned(SMP_CACHE_BYTES);
-};
-
-static void vwd_free_tx_buffer(struct vwd_tx_buffer *tx)
-{
-	dev_put(tx->dev);
-	if (tx->page_allocated)
-		free_page((unsigned long)tx);
-	else
-		kfree(tx);
-}
-
-static void vwd_complete_tx_buffer(struct vwd_tx_buffer *tx)
-{
-	vwd_free_tx_buffer(tx);
-	get_cpu_var(num_tx_done)++;
-	put_cpu_var(num_tx_done);
-	atomic_dec(&vwd_tx_pending);
-}
-
-static void vwd_unmap_payload(struct dpa_bp *bp, struct vwd_tx_buffer *tx)
-{
-	unsigned int i;
-
-	for (i = 0; i < tx->num_maps; i++) {
-		struct vwd_dma_mapping *map = &tx->maps[i];
-
-		if (map->page)
-			dma_unmap_page(bp->dev, map->addr, map->size,
-				       DMA_BIDIRECTIONAL);
-		else
-			dma_unmap_single(bp->dev, map->addr, map->size,
-					 DMA_BIDIRECTIONAL);
-	}
-}
-
-static struct vwd_tx_buffer *vwd_unmap_tx_buffer(struct dpa_bp *bp,
-					       dma_addr_t addr)
-{
-	/* Like the surrounding DPAA SDK, this path uses direct DMA addresses. */
-	struct vwd_tx_buffer *tx = (void *)((u8 *)phys_to_virt(addr) -
-					offsetof(struct vwd_tx_buffer, buffer));
-
-	dma_unmap_single(bp->dev, addr, tx->size, DMA_BIDIRECTIONAL);
-	vwd_unmap_payload(bp, tx);
-	return tx;
-}
-
-/* Locate a returned segment in the original DMA mappings before reading it.
- * Hardware may adjust descriptors when it changes packet headers.
- */
-static int vwd_sg_mapping(struct vwd_tx_buffer *tx, const struct qm_sg_entry *sg,
-			 unsigned int *offset)
-{
-	dma_addr_t addr = qm_sg_addr(sg) + qm_sg_entry_get_offset(sg);
-	unsigned int len = qm_sg_entry_get_len(sg);
-	unsigned int i;
-
-	if (qm_sg_entry_get_ext(sg) || !len)
-		return -EINVAL;
-	for (i = 0; i < tx->num_maps; i++) {
-		struct vwd_dma_mapping *map = &tx->maps[i];
-
-		if (addr >= map->addr && addr - map->addr <= map->size &&
-		    len <= map->size - (addr - map->addr)) {
-			*offset = addr - map->addr;
-			return i;
-		}
-	}
-	return -EINVAL;
-}
-
-static void vwd_copy_segment(struct vwd_tx_buffer *tx, unsigned int index,
-			     unsigned int offset, u8 *dst, unsigned int len)
-{
-	struct vwd_dma_mapping *map = &tx->maps[index];
-
-	if (!map->page) {
-		memcpy(dst, tx->skb->head + offset, len);
-		return;
-	}
-	offset += map->page_offset;
-	while (len) {
-		struct page *page = nth_page(map->page, offset >> PAGE_SHIFT);
-		unsigned int off = offset_in_page(offset);
-		unsigned int count = min(len, (unsigned int)PAGE_SIZE - off);
-		void *src = kmap_local_page(page);
-
-		memcpy(dst, src + off, count);
-		kunmap_local(src);
-		dst += count;
-		offset += count;
-		len -= count;
-	}
-}
-
-static struct sk_buff *vwd_tx_fd_to_skb(const struct qm_fd *fd,
-				      struct vwd_tx_buffer **owner)
-{
-	struct vwd_tx_buffer *tx = vwd_unmap_tx_buffer(vwd.txconf_bp,
-						     qm_fd_addr(fd));
-	struct sk_buff *skb = tx->skb, *nskb = NULL;
-	unsigned int off = dpa_fd_offset(fd), total = 0, count = 0, i;
-	struct qm_sg_entry *sgt;
-	bool unchanged = true;
-
-	/* The caller retains the device reference through delivery or drop. */
-	*owner = tx;
-	if (fd->format != qm_fd_sg || off > tx->size - DPA_SGT_SIZE)
-		goto drop;
-	sgt = (void *)(tx->buffer + off);
-	for (i = 0; i < DPA_SGT_MAX_ENTRIES; i++) {
-		unsigned int offset, len = qm_sg_entry_get_len(&sgt[i]);
-		int index = vwd_sg_mapping(tx, &sgt[i], &offset);
-
-		if (index < 0 || total > dpa_fd_length(fd) ||
-		    len > dpa_fd_length(fd) - total)
-			goto drop;
-		if (index != i || offset != (i ? 0 : skb_headroom(skb)) ||
-		    len != (i ? tx->maps[index].size : skb_headlen(skb)))
-			unchanged = false;
-		total += len;
-		if (qm_sg_entry_get_final(&sgt[i])) {
-			count = i + 1;
-			break;
-		}
-	}
-	if (!count || total != dpa_fd_length(fd) || total < ETH_HLEN ||
-	    total > ETH_FRAME_LEN + SKB_ASK_TAILROOM)
-		goto drop;
-	if (unchanged && count == tx->num_maps && total == skb->len) {
-		return skb;
-	}
-
-	/* Preserve a hardware-modified layout, including Wi-Fi-to-Wi-Fi
-	 * forwarding. Ordinary exceptions retain their original nonlinear skb.
-	 */
-	nskb = alloc_skb(NET_SKB_PAD + NET_IP_ALIGN + total, GFP_ATOMIC);
-	if (!nskb)
-		goto drop;
-	skb_reserve(nskb, NET_SKB_PAD + NET_IP_ALIGN);
-	skb_copy_header(nskb, skb);
-	skb_headers_offset_update(nskb, skb_headroom(nskb) - skb_headroom(skb));
-	for (i = 0; i < count; i++) {
-		unsigned int offset, len = qm_sg_entry_get_len(&sgt[i]);
-		int index = vwd_sg_mapping(tx, &sgt[i], &offset);
-
-		vwd_copy_segment(tx, index, offset, skb_put(nskb, len), len);
-	}
-	skb_reset_mac_header(nskb);
-	skb_set_network_header(nskb, ETH_HLEN);
-	skb_reset_transport_header(nskb);
-	/* A changed layout invalidates receive checksum metadata. */
-	nskb->ip_summed = CHECKSUM_NONE;
-	nskb->csum = 0;
-drop:
-	dev_kfree_skb_any(skb);
-	return nskb;
-}
-
-static void vwd_release_tx_frame(const struct qm_fd *fd)
-{
-	struct vwd_tx_buffer *tx = vwd_unmap_tx_buffer(vwd.txconf_bp,
-						     qm_fd_addr(fd));
-
-	dev_kfree_skb_any(tx->skb);
-	vwd_complete_tx_buffer(tx);
-}
-
-static void vwd_ern(struct qman_portal *portal, struct qman_fq *fq,
-		    const struct qm_mr_entry *msg)
-{
-	INCR_PER_CPU_STAT(vwd.vwd_global_stats, pkts_tx_errors);
-	vwd_release_tx_frame(&msg->ern.fd);
 }
 
 /* This function converts the fd from ipsec  and frag bufferpool to skb */
@@ -506,55 +269,6 @@ static struct sk_buff *__hot contig_fd_to_vwd_skb(const struct dpa_priv_s *priv,
 #endif
 	return skb;
 
-}
-
-static int process_rx_exception_pkt(struct qman_portal *portal, struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq)
-{
-	struct dpaa_vwd_priv_s *priv = &vwd;
-	struct sk_buff *skb;
-	struct net_device *dev;
-	struct vap_desc_s *vap;
-	struct vwd_tx_buffer *tx;
-
-#ifdef DPA_WIFI_DEBUG
-	DPAWIFI_INFO("%s::exception packet\n", __func__);
-	DPAWIFI_INFO("%s::fqid %x(%d), bpid %d, len %d, offset %d addr %llx status %08x\n", __func__,
-			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
-			dq->fd.offset,  (uint64_t)dq->fd.addr, dq->fd.status);
-#endif
-
-	skb = vwd_tx_fd_to_skb(&dq->fd, &tx);
-
-	if (!skb) {
-		INCR_PER_CPU_STAT(priv->vwd_global_stats, pkts_slow_fail);
-		DPAWIFI_ERROR("%s::unable to get skb pointer for fd\n", __func__);
-		goto rel_fd;
-	}
-
-	dev = tx->dev;
-	vap = tx->vap;
-	/* A completion may outlive removal and re-registration of its VAP. */
-	if (READ_ONCE(vap->state) != VAP_ST_OPEN ||
-	    READ_ONCE(vap->generation) != tx->generation ||
-	    (void *)READ_ONCE(dev->wifi_offload_dev) != vap ||
-	    READ_ONCE(dev->reg_state) != NETREG_REGISTERED) {
-		INCR_PER_CPU_STAT(priv->vwd_global_stats, pkts_dev_down_drop);
-		dev_kfree_skb(skb);
-		goto rel_fd;
-	}
-	skb->protocol = eth_type_trans(skb, dev);
-	skb->expt_pkt = 1;
-	if (netif_receive_skb(skb) == NET_RX_DROP) {
-#ifdef DPA_WIFI_DEBUG
-		DPAWIFI_ERROR("%s::netif_receive_skb:NET_RX_DROP\n", __func__);
-#endif
-		INCR_PER_CPU_STAT(vap->vap_stats, pkts_slow_path_drop);
-	}
-	INCR_PER_CPU_STAT(vap->vap_stats, pkts_slow_forwarded);
-rel_fd:
-	vwd_complete_tx_buffer(tx);
-	return 0;
 }
 
 void drain_tx_bp_pool(struct dpa_bp *bp)
@@ -685,34 +399,6 @@ static int vwd_napi_schedule(struct qman_portal *portal)
 	return 0;
 }
 
-static enum qman_cb_dqrr_result vwd_rx_exception_pkt(struct qman_portal *portal, struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq)
-{
-	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
-		return qman_cb_dqrr_consume;
-
-	if (unlikely(vwd_napi_schedule(portal)))
-		return qman_cb_dqrr_stop;
-
-	process_rx_exception_pkt(portal, fq, dq);
-	return qman_cb_dqrr_consume;
-}
-
-
-static enum qman_cb_dqrr_result vwd_rx_error(struct qman_portal *portal,
-		struct qman_fq *fq, const struct qm_dqrr_entry *dq)
-{
-	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
-		return qman_cb_dqrr_consume;
-
-	if (unlikely(vwd_napi_schedule(portal)))
-		return qman_cb_dqrr_stop;
-	INCR_PER_CPU_STAT(vwd.vwd_global_stats, pkts_tx_errors);
-	vwd_release_tx_frame(&dq->fd);
-	return qman_cb_dqrr_consume;
-}
-
-
 static void vwd_send_to_vap(struct sk_buff* skb)
 {
 	struct ethhdr *hdr;
@@ -745,8 +431,7 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 	struct sk_buff *skb;
 	struct net_device *net_dev;
 	struct dpa_bp *dpa_bp, *ipsec_bp, *frag_bp;
-	struct vap_desc_s *vap; 
-	struct vwd_tx_buffer *tx = NULL;
+	struct vap_desc_s *vap;
 	int *count_ptr;
 
 	dpa_bp = dpa_bpid2pool(dq->fd.bpid);
@@ -787,11 +472,6 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 			dq->fd.offset, net_dev, net_dev->name, (uint64_t)dq->fd.addr);
 #endif
 	ipsec_bp = get_ipsec_bp();
-	if (dpa_bp == priv->txconf_bp) {
-		skb = vwd_tx_fd_to_skb(&dq->fd, &tx);
-		goto process_skb;
-	}
-	/* Other pools retain their Ethernet/IPsec ownership rules. */
 	if (dq->fd.format != qm_fd_contig) {
 		DPAWIFI_ERROR("%s::TBD discarding SG frame :%d\n ", __func__,dq->fd.format);
 		INCR_PER_CPU_STAT(priv->vwd_global_stats, pkts_slow_fail);
@@ -813,18 +493,16 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 			goto rel_fd;
 		goto process_skb;
 	}
-	/* Check if buffer is from ethernet pool to refill buffer pool
-	   for wifi packets, buffers are skb buffers and they will get freed to kernel */
-	if (dpa_bp != priv->txconf_bp)
-	{
-		count_ptr = raw_cpu_ptr(vwd.eth_priv->percpu_count);
-		if (unlikely(dpaa_eth_refill_bpools(dpa_bp, count_ptr,
-				CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD))) {
-			//if we cant refill give this up
-			goto rel_fd;
-		}
-		*count_ptr -= 1;
+	/* The buffer is from an Ethernet pool: refill that pool for the
+	   frame the Wi-Fi driver takes, as its buffers are skb buffers that
+	   will be freed to the kernel */
+	count_ptr = raw_cpu_ptr(vwd.eth_priv->percpu_count);
+	if (unlikely(dpaa_eth_refill_bpools(dpa_bp, count_ptr,
+			CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD))) {
+		//if we cant refill give this up
+		goto rel_fd;
 	}
+	*count_ptr -= 1;
 
 	skb = contig_fd_to_vwd_skb(priv->eth_priv, &dq->fd);
 
@@ -835,10 +513,6 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 	}
 
 process_skb:
-	if (!skb) {
-		INCR_PER_CPU_STAT(priv->vwd_global_stats, pkts_slow_fail);
-		goto done;
-	}
 	skb->dev = net_dev;
 
 	INCR_PER_CPU_STAT(vap->vap_stats, pkts_rx_fast_forwarded);
@@ -848,16 +522,10 @@ process_skb:
 
 	vwd_send_to_vap(skb);
 done:
-	if (tx)
-		vwd_complete_tx_buffer(tx);
 	rcu_read_unlock();
 	return 0;
 
 rel_fd:
-	if (dpa_bp == priv->txconf_bp) {
-		vwd_release_tx_frame(&dq->fd);
-		goto done;
-	}
 	{
 		struct bm_buffer bmb;
 
@@ -868,149 +536,6 @@ rel_fd:
 			cpu_relax();	
 	}
 	goto done;
-}
-
-
-static int vwd_init_pcd_fqs(struct dpaa_vwd_priv_s *priv)
-{
-	uint32_t fqbase;
-	uint32_t fqcount;
-	uint32_t portid;
-	uint32_t ii,jj;
-	uint32_t portal_channel[NR_CPUS];
-	uint32_t num_portals, max_dist;
-	uint32_t next_portal_ch_idx = 0;
-	const cpumask_t *affine_cpus;
-	struct dpa_fq *dpa_fq;
-	struct dpa_iface_info *oh_iface_info;
-	struct qman_fq *fq;
-
-	/*get cpu portal channel info */
-	num_portals = 0;
-	next_portal_ch_idx = 0;
-	affine_cpus = qman_affine_cpus();
-	/* get channel used by portals affined to each cpu */
-	for_each_cpu(ii, affine_cpus) {
-		portal_channel[num_portals] = qman_affine_channel(ii);
-		num_portals++;
-	}
-	if (!num_portals) {
-		DPAWIFI_ERROR("%s::unable to get affined portal info\n", __func__);
-		return -1;
-	}
-#ifdef DPA_WIFI_DEBUG
-	DPAWIFI_INFO("%s::num_portals %d ::", __func__, num_portals);
-	for (ii = 0; ii < num_portals; ii++)
-		DPAWIFI_INFO("%d ", portal_channel[ii]);
-	DPAWIFI_INFO("\n");
-#endif
-
-	if (get_ofport_max_dist(FMAN_IDX, priv->oh_port_handle, &max_dist) < 0)
-	{
-		DPAWIFI_ERROR("%s::unable to get distributions for oh port\n", __func__);
-		return -1;
-	}
-
-	for(jj = 0;jj < max_dist; jj++)
-	{
-
-		if (get_oh_port_pcd_fqinfo(FMAN_IDX, priv->oh_port_handle, 
-					jj, &fqbase, &fqcount)) {
-			DPAWIFI_ERROR("%s::err getting pcd fq\n", __func__) ;
-			return -1;
-		}
-		/*get port id required for FQ creation*/
-		if (get_ofport_portid(FMAN_IDX, priv->oh_port_handle, &portid)) {
-			DPAWIFI_ERROR("%s::err getting of port id\n", __func__) ;
-			return -1;
-		}
-		DPAWIFI_INFO("%s::pcd FQ base for portid %d  dist %x(%d), count %d\n",
-				__func__, portid, fqbase, fqbase, fqcount);
-
-		if ((oh_iface_info = dpa_get_ohifinfo_by_portid(portid)) == NULL) {
-			DPAWIFI_ERROR("%s::err getting oh iface info of port id %u\n", __func__, portid) ;
-			return -1;
-		}
-		if (oh_iface_info->pcd_proc_entry == NULL)
-		{
-			DPAWIFI_ERROR("%s()::%d OH iface pcd proc entry is invalid:\n", __func__, __LINE__);
-			return -1;
-		}
-
-		/*alloc for as many fqs as required */
-		priv->wlan_exception_fq = kzalloc((sizeof(struct dpa_fq) * fqcount), GFP_KERNEL);
-		if (!priv->wlan_exception_fq) {
-			DPAWIFI_ERROR("%s::err allocating fq mem\n", __func__) ;
-			return -1;
-		}
-		/*save dpa_fq base info */
-		dpa_fq = priv->wlan_exception_fq;
-		/*add port id into FQID */
-		fqbase |= (portid << PORTID_SHIFT_VAL);
-		/*create all FQs */
-		priv->expt_fq_count = 0;
-		for (ii = 0; ii < fqcount; ii++) {
-			struct qm_mcc_initfq opts;
-
-			memset(dpa_fq, 0, sizeof(struct dpa_fq));
-			/*set FQ parameters 
-			  dpa_fq->net_dev = vap->wifi_dev; */
-			dpa_fq->fq_type = FQ_TYPE_RX_PCD;
-			dpa_fq->fqid = fqbase;
-			/*set call back function pointer*/
-			fq = &dpa_fq->fq_base;
-			fq->cb.dqrr = vwd_rx_exception_pkt;
-			/*round robin channel like ethernet driver does */
-			dpa_fq->channel = portal_channel[next_portal_ch_idx];
-			if (next_portal_ch_idx == (num_portals - 1))
-				next_portal_ch_idx = 0;
-			else
-				next_portal_ch_idx++;
-			dpa_fq->wq = DEFA_WQ_ID;
-			/*set options similar to ethernet driver */
-			memset(&opts, 0, sizeof(struct qm_mcc_initfq));
-			opts.fqd.fq_ctrl = (QM_FQCTRL_PREFERINCACHE | QM_FQCTRL_HOLDACTIVE);
-			opts.fqd.context_a.stashing.exclusive =
-				(QM_STASHING_EXCL_DATA | QM_STASHING_EXCL_ANNOTATION);
-			opts.fqd.context_a.stashing.data_cl = NUM_PKT_DATA_LINES_IN_CACHE;
-			opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
-			/*create FQ */
-			if (qman_create_fq(dpa_fq->fqid, 0, fq)) {
-				DPAWIFI_ERROR("%s::qman_create_fq failed for fqid %d\n",
-						__func__, dpa_fq->fqid);
-				goto err_ret;
-			}
-			opts.fqid = dpa_fq->fqid;
-			opts.count = 1;
-			opts.fqd.dest.channel = dpa_fq->channel;
-			opts.fqd.dest.wq = dpa_fq->wq;
-			opts.we_mask = (QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL |
-					QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA);
-
-			/*init FQ */
-			if (qman_init_fq(fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
-				DPAWIFI_ERROR("%s::qman_init_fq failed for fqid %d\n",
-						__func__, dpa_fq->fqid);
-				qman_destroy_fq(fq, 0);
-				goto err_ret;
-			}
-
-			cdx_create_type_fqid_info_in_procfs(fq, PCD_DIR, oh_iface_info->pcd_proc_entry, NULL);
-#ifdef DPA_WIFI_DEBUG
-			DPAWIFI_INFO("%s::created pcd fq %x(%d) for wlan packets "
-					"channel 0x%x\n", __func__,
-					dpa_fq->fqid, dpa_fq->fqid, dpa_fq->channel);
-#endif
-			/*next FQ */
-			dpa_fq++;
-			fqbase++;
-			priv->expt_fq_count++;
-		}
-	}
-	return 0;
-err_ret:
-	vwd_release_pcd_fqs(priv);
-	return -1;
 }
 
 static int create_vap_fwd_from_fman_fqs(struct vap_desc_s *vap, void *proc_entry)
@@ -1113,15 +638,8 @@ static int create_vap_fwd_from_fman_fqs(struct vap_desc_s *vap, void *proc_entry
 
 static int create_vap_fqs(struct vap_desc_s *vap)
 {
-	//uint32_t ii;
-	struct dpa_fq *dpa_fq;
-	struct qman_fq *fq;
-	struct qm_mcc_initfq opts;
-	struct dpa_fq **dpa_fq_ptr;
 	struct dpa_iface_info *oh_iface_info;
-	uint32_t flags;
 	uint32_t portid;
-
 
 	/*get port id required for FQ creation*/
 	if (get_ofport_portid(FMAN_IDX, vap->vwd->oh_port_handle, &portid)) {
@@ -1144,86 +662,20 @@ static int create_vap_fqs(struct vap_desc_s *vap)
 		DPAWIFI_ERROR("%s::unable to create fwd fqs\n", __func__) ;
 		return -1;
 	}
-
-	if (oh_iface_info->rx_proc_entry == NULL)
-	{
-		DPAWIFI_ERROR("%s()::%d OH iface rx proc entry is invalid:\n", __func__, __LINE__);
-		return -1;
-	}
-
-
-	/* create FQ for exception packets from wireless interface */
-	dpa_fq = kzalloc(sizeof(struct dpa_fq), GFP_KERNEL);
-	if (!dpa_fq) {
-		DPAWIFI_ERROR("%s::unable to alloc mem for dpa_fq\n", __func__) ;
-		return -1;
-	}
-	memset(dpa_fq, 0, sizeof(struct dpa_fq));
-	memset(&opts, 0, sizeof(struct qm_mcc_initfq));
-	fq = &dpa_fq->fq_base;
-	fq->cb.ern = vwd_ern;
-	/* Retirement can return frames that have not reached FMan. */
-	fq->cb.dqrr = vwd_rx_error;
-	dpa_fq_ptr = NULL;
-	flags = 0;
-	/* offline port fq */
-	flags |= QMAN_FQ_FLAG_TO_DCPORTAL;
-	opts.fqd.fq_ctrl = QM_FQCTRL_PREFERINCACHE;
-	dpa_fq->channel = vap->channel;
-	/* contexta, b  */
-	opts.fqd.context_a.hi = 0; //0x12000000; //OVFQ, A2V, OVOM
-	opts.fqd.context_a.lo = 0x00000000; //0;
-	dpa_fq->fq_type = FQ_TYPE_RX_PCD;
-	dpa_fq->wq = DEFA_VWD_WQ_ID;
-	dpa_fq->net_dev = vap->wifi_dev;
-	if (!dpa_fq->fqid)
-		flags |= QMAN_FQ_FLAG_DYNAMIC_FQID;
-	if (qman_create_fq(dpa_fq->fqid, flags, fq)) {
-		DPAWIFI_ERROR("%s::qman_create_fq failed for fqid %d\n",
-				__func__, dpa_fq->fqid);
-		kfree(dpa_fq);
-		return -1;
-	}
-
-	dpa_fq->fqid = fq->fqid;
-	opts.fqid = dpa_fq->fqid;
-	opts.count = 1;
-	opts.fqd.dest.channel = dpa_fq->channel;
-	opts.fqd.dest.wq = dpa_fq->wq;
-	opts.we_mask = (QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL |
-			QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA);
-	if (qman_init_fq(fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
-		DPAWIFI_ERROR("%s::qman_init_fq failed for fqid %d\n",
-				__func__, dpa_fq->fqid);
-		qman_destroy_fq(fq, 0);
-		kfree(dpa_fq);
-		return -1;
-	}	
-
-	/* RX OH2 */
-	cdx_create_type_fqid_info_in_procfs(fq, RX_DIR, 
-				oh_iface_info->rx_proc_entry, NULL);
-	vap->wlan_fq_to_fman = dpa_fq;
-
-#ifdef DPA_WIFI_DEBUG
-	DPAWIFI_INFO("%s::created fq %x(%d) for wlan packets "
-			"channel 0x%x\n", __func__,
-			dpa_fq->fqid, dpa_fq->fqid, dpa_fq->channel);
-#endif
 	return 0;
 }
 
-
+/* Whether a slot's forwarding queues exist. They are created in order, and
+ * vwd_vap_up() releases every one already made if any of them fails, so the
+ * last one standing means every one does. */
+static bool vwd_vap_fqs_built(const struct vap_desc_s *vap)
+{
+	return READ_ONCE(vap->wlan_fq_from_fman[CDX_VWD_FWD_FQ_MAX - 1]) != NULL;
+}
 
 static int release_vap_fqs(struct vap_desc_s *vap)
 {
 	int i;
-	/* This WLAN exception FQ is used for all vwd interfaces */
-	/* TODO - Need to modify to delete only for last interface, and add 
-	   for 1st interface */	
-#ifdef DPA_WIFI_DEBUG
-	DPAWIFI_INFO("%s:: vwd count :%d\n", __func__, vap->vwd->expt_fq_count);
-#endif
 
 	for (i = 0; i < CDX_VWD_FWD_FQ_MAX; i++) {
 		if (vap->wlan_fq_from_fman[i])
@@ -1235,16 +687,6 @@ static int release_vap_fqs(struct vap_desc_s *vap)
 			kfree(vap->wlan_fq_from_fman[i]);
 			vap->wlan_fq_from_fman[i] = NULL;
 		}
-	}
-
-	if (vap->wlan_fq_to_fman)
-	{
-#ifdef DPA_WIFI_DEBUG
-		DPAWIFI_INFO("%s:: releasing fq to fman :%d\n", __func__, vap->wlan_fq_to_fman->fqid);
-#endif
-		cdx_destroy_fq(&vap->wlan_fq_to_fman->fq_base);
-		kfree(vap->wlan_fq_to_fman);
-		vap->wlan_fq_to_fman = NULL;
 	}
 	return 0;
 }
@@ -1282,99 +724,6 @@ int dpaa_get_wifi_ohport_handle( uint32_t* oh_handle)
 	return 0;
 }
 
-static int add_device_tx_done_bpool(struct dpaa_vwd_priv_s  *vwd)
-{
-	struct dpa_bp *bp;
-	struct dpa_bp *bp_parent;
-
-	if (get_phys_port_poolinfo_bysize(VAPDEV_BUFSIZE, &vwd->parent_pool_info)) {
-		DPAWIFI_ERROR("%s::failed to locate eth bman pool for dev %s\n", __func__, vwd->name);
-		return -1;
-	}
-	bp_parent = dpa_bpid2pool(vwd->parent_pool_info.pool_id);
-	if (!bp_parent)
-		return -ENODEV;
-
-	bp = kzalloc(sizeof(struct dpa_bp), GFP_KERNEL);
-
-	if (unlikely(bp == NULL)) {
-		DPAWIFI_ERROR("%s::failed to allocate mem for bman pool for dev %s\n",
-				__func__,vwd->name);
-		return -1;
-	}
-	bp->size = VAPDEV_BUFSIZE;
-	bp->config_count = VAP_TX_CONF_BUF_COUNT;
-	bp->dev = bp_parent->dev;
-	if (dpa_bp_alloc(bp, bp->dev)) {
-		DPAWIFI_ERROR("%s::dpa_bp_alloc failed for dev %s\n", __func__, vwd->name);
-		kfree(bp);
-		return -1;
-	}
-	vwd->txconf_bp = bp;
-	printk("%s::txconf bpid %d, for dev %s\n", __func__, bp->bpid, vwd->name);
-
-	return 0;
-}
-
-void drain_bp_tx_done_bpool(struct dpa_bp *bp)
-{
-	int ret, num = 8;
-
-
-	do {
-		struct bm_buffer bmb[8];
-		int i;
-
-		ret = bman_acquire(bp->pool, bmb, num, 0);
-		if (ret < 0) {
-			if (num == 8) {
-				/* we have less than 8 buffers left;
-				 * drain them one by one
-				 */
-				num = 1;
-				ret = 1;
-				continue;
-			} else {
-				/* Pool is fully drained */
-				break;
-			}
-		}
-
-		for (i = 0; i < num; i++) {
-			struct vwd_tx_buffer *tx;
-
-			tx = vwd_unmap_tx_buffer(bp, bm_buf_addr(&bmb[i]));
-			dev_kfree_skb_any(tx->skb);
-			vwd_complete_tx_buffer(tx);
-		}
-	} while (ret > 0);
-
-}
-
-/* Hardware may return the last few frames after traffic has stopped.
- * Reclaim them without waiting for another transmit, including the netdev
- * references that otherwise prevent interface unregistration from finishing.
- */
-static void vwd_tx_reclaim_work(struct work_struct *work)
-{
-	spin_lock_bh(&vwd.txlock);
-	drain_bp_tx_done_bpool(vwd.txconf_bp);
-	if (!vwd_stopping && atomic_read(&vwd_tx_pending))
-		queue_delayed_work(system_wq, &vwd_tx_work, msecs_to_jiffies(10));
-	spin_unlock_bh(&vwd.txlock);
-}
-
-static int release_device_tx_done_bpool(struct dpaa_vwd_priv_s  *vwd)
-{
-	if (!vwd->txconf_bp)
-		return 0;
-	drain_bp_tx_done_bpool(vwd->txconf_bp);
-	_dpa_bp_free(vwd->txconf_bp);
-	kfree(vwd->txconf_bp);
-	vwd->txconf_bp = NULL;
-	return 0;
-}
-
 
 /* Both publish to the lock-free dequeue path, process_vap_rx_fwd_pkt(). */
 static int set_vap_fqs_netdev(struct vap_desc_s *vap)
@@ -1382,7 +731,6 @@ static int set_vap_fqs_netdev(struct vap_desc_s *vap)
 	int index = 0;
 	for (index = 0; index < CDX_VWD_FWD_FQ_MAX; index++)
 		WRITE_ONCE(vap->wlan_fq_from_fman[index]->net_dev, vap->wifi_dev);
-	WRITE_ONCE(vap->wlan_fq_to_fman->net_dev, vap->wifi_dev);
 	return 0;
 }
 
@@ -1394,7 +742,6 @@ static int reset_vap_fqs_netdev(struct vap_desc_s *vap)
 	int index = 0;
 	for (index = 0; index < CDX_VWD_FWD_FQ_MAX; index++)
 		WRITE_ONCE(vap->wlan_fq_from_fman[index]->net_dev, NULL);
-	WRITE_ONCE(vap->wlan_fq_to_fman->net_dev, NULL);
 	return 0;
 }
 
@@ -1417,12 +764,6 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 		dev_put(wifi_dev);
 		return -1;
 	}
-	if (get_ofport_info(FMAN_IDX, priv->oh_port_handle, &vap->channel,
-				&vap->td[0]))
-	{
-		dev_put(wifi_dev);
-		return -1;
-	}
 
 	vap->ifindex = cmd->ifindex;
 
@@ -1430,9 +771,9 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 	vap->wifi_dev = wifi_dev;
 	vap->vwd = priv;
 
-	/* vap->wlan_fq_to_fman is NULL means so far this interface is not up. If it gets up first time
-	   it creates all the frame queues. These frame queues can delete only cdx module gets unloaded.*/
-	if (!vap->wlan_fq_to_fman)
+	/* A slot opened for the first time creates its frame queues, which
+	   are kept until the cdx module is unloaded. */
+	if (!vwd_vap_fqs_built(vap))
 	{
 		/* create frame queues */
 		if (create_vap_fqs(vap)) {
@@ -1792,15 +1133,20 @@ bool dpaa_vwd_vap_built(uint16_t vap_id)
 {
 	if (vap_id >= MAX_WIFI_VAPS || READ_ONCE(vwd_stopping))
 		return false;
-	return READ_ONCE(vwd.vaps[vap_id].wlan_fq_to_fman) != NULL;
+	return vwd_vap_fqs_built(&vwd.vaps[vap_id]);
 }
 
 static int vwd_init_ohport(struct dpaa_vwd_priv_s *priv)
 {
 	int handle;
 
-	/* Get OH port for this driver */
-	handle = alloc_offline_port(FMAN_IDX, PORT_TYPE_WIFI, vwd_rx_exception_pkt, vwd_rx_error);
+	/* Claim the Wi-Fi offline port. Its port id is what names a VAP to the
+	 * classifier (see get_wlan_iface_info()), but nothing enqueues frames
+	 * into the port itself: a flow leaving through a VAP is enqueued by the
+	 * classifier straight to the VAP's forwarding queues. So its default and
+	 * error queues keep devoh.c's own handlers, which report and release
+	 * whatever should ever arrive there. */
+	handle = alloc_offline_port(FMAN_IDX, PORT_TYPE_WIFI, NULL, NULL);
 	if (handle < 0)
 	{
 		DPAWIFI_ERROR("%s: Error in allocating OH port Channel\n", __func__);
@@ -1817,32 +1163,6 @@ static int vwd_init_ohport(struct dpaa_vwd_priv_s *priv)
 	if (handle < 0)
 		release_offline_port(FMAN_IDX, priv->oh_port_handle);
 	return handle;
-}
-
-static void vwd_release_pcd_fqs(struct dpaa_vwd_priv_s *priv)
-{
-	struct qman_fq* fq;
-	struct dpa_fq* dpafq;
-	int i;
-
-	if (priv->wlan_exception_fq)
-	{
-#ifdef DPA_WIFI_DEBUG
-		DPAWIFI_INFO("%s:: releasing expt fq :%d\n", __func__, priv->expt_fq_count);
-#endif
-		dpafq = priv->wlan_exception_fq;
-		for (i = 0; i < priv->expt_fq_count; i++)
-		{
-			fq= &dpafq->fq_base;
-			cdx_destroy_fq(fq);
-			dpafq++;
-		}
-		kfree(priv->wlan_exception_fq);
-		priv->wlan_exception_fq = NULL;
-		priv->expt_fq_count = 0;
-	}
-
-	return;
 }
 
 static int vwd_init_stats(struct dpaa_vwd_priv_s *priv)
@@ -2072,8 +1392,6 @@ int dpaa_vwd_init(void)
 	memset(priv, 0, sizeof(*priv));
 	strscpy(priv->name, "vwd", sizeof(priv->name));
 	spin_lock_init(&priv->vaplock);
-	spin_lock_init(&priv->txlock);
-	INIT_DELAYED_WORK(&vwd_tx_work, vwd_tx_reclaim_work);
 	WRITE_ONCE(vwd_stopping, true);
 
 	rc = vwd_init_stats(priv);
@@ -2091,22 +1409,16 @@ int dpaa_vwd_init(void)
 		rc = -ENODEV;
 		goto err_napi;
 	}
-	rc = add_device_tx_done_bpool(priv);
-	if (rc)
-		goto err_eth;
 	rc = vwd_init_ohport(priv);
 	if (rc < 0)
-		goto err_pool;
-	rc = vwd_init_pcd_fqs(priv);
-	if (rc)
-		goto err_oh;
+		goto err_eth;
 
 	/* The class and its device carry no character device: they are where
 	 * the statistics and per-VAP files live, under /sys/class/vwd/vwd0. */
 	priv->vwd_class = class_create("vwd");
 	if (IS_ERR(priv->vwd_class)) {
 		rc = PTR_ERR(priv->vwd_class);
-		goto err_fqs;
+		goto err_oh;
 	}
 	priv->vwd_device = device_create(priv->vwd_class, NULL, 0, NULL,
 					 "vwd0");
@@ -2126,13 +1438,9 @@ err_device:
 	device_unregister(priv->vwd_device);
 err_class:
 	class_destroy(priv->vwd_class);
-err_fqs:
-	vwd_release_pcd_fqs(priv);
 err_oh:
 	vwd_free_ohport(priv);
 	synchronize_net();
-err_pool:
-	release_device_tx_done_bpool(priv);
 err_eth:
 	dev_put(priv->eth_priv->net_dev);
 	priv->eth_priv = NULL;
@@ -2146,40 +1454,17 @@ err_stats:
 void dpaa_vwd_exit(void)
 {
 	struct dpaa_vwd_priv_s *priv = &vwd;
-	unsigned long deadline = jiffies + 5 * HZ;
 	int i;
 
-	/* Block new submissions before unpublishing any callback resources. */
-	spin_lock_bh(&priv->txlock);
+	/* Refuse VAP commands before tearing anything down. */
 	WRITE_ONCE(vwd_stopping, true);
-	spin_unlock_bh(&priv->txlock);
 	dpaa_vwd_down(priv);
-	cancel_delayed_work_sync(&vwd_tx_work);
-
-	/* Keep completion callbacks and the pool alive until hardware gives
-	 * back every descriptor. A timeout cannot make DMA memory safe to free.
-	 */
-	for (;;) {
-		spin_lock_bh(&priv->txlock);
-		drain_bp_tx_done_bpool(priv->txconf_bp);
-		spin_unlock_bh(&priv->txlock);
-		if (!atomic_read(&vwd_tx_pending))
-			break;
-		if (time_after(jiffies, deadline)) {
-			pr_warn("vwd: waiting for %d hardware-owned frames\n",
-				atomic_read(&vwd_tx_pending));
-			deadline = jiffies + 5 * HZ;
-		}
-		usleep_range(1000, 2000);
-	}
 	for (i = 0; i < MAX_WIFI_VAPS; i++)
 		release_vap_fqs(&priv->vaps[i]);
-	vwd_release_pcd_fqs(priv);
 	vwd_free_ohport(priv);
 	synchronize_net();
 	/* Every queue is retired, so no poll can be scheduled any more. */
 	vwd_napi_del();
-	release_device_tx_done_bpool(priv);
 	vwd_release_stats(priv);
 	dev_put(priv->eth_priv->net_dev);
 	priv->eth_priv = NULL;

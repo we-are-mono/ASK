@@ -32,13 +32,11 @@
 #define CFG_WIFI_OFFLOAD
 
 #define FMAN_IDX		0
-#define DEFA_WQ_ID      	0
 #define DEFA_VWD_WQ_ID      	5
 //used for PCD FQ creation
 #define NUM_PKT_DATA_LINES_IN_CACHE     2
 #define NUM_ANN_LINES_IN_CACHE          1
 
-#define VAPDEV_BUFSIZE  1700
 #define CDX_VWD_FWD_FQ_MAX (1 << 6)
 
 //values for state
@@ -56,18 +54,13 @@ struct vap_desc_s {
 	char								ifname[IFNAMSIZ];
 	unsigned char  				macaddr[ETH_ALEN];
 	unsigned short 				vapid;
-	uint32_t						channel;
-	struct dpa_fq				*wlan_fq_to_fman;
 	struct dpa_fq				*wlan_fq_from_fman[CDX_VWD_FWD_FQ_MAX];
-	void * td[MAX_MATCH_TABLES];
 	struct vap_stats_s  __percpu         	*vap_stats;
 };
 
 struct vap_stats_s {
-	u32                                pkts_slow_forwarded;
 	u32                                pkts_rx_fast_forwarded;
 	u32                                pkts_rx_ipsec;
-	u32                                pkts_slow_path_drop;
 };
 
 //action values in vap_cmd_s
@@ -94,21 +87,15 @@ struct dpaa_vwd_priv_s {
 	struct class 				*vwd_class;
 	struct device 				*vwd_device;
 	struct dpa_priv_s			*eth_priv;
-	struct dpa_bp 				*txconf_bp;
-	struct port_bman_pool_info		parent_pool_info;
 	uint32_t						oh_port_handle;
-	struct dpa_fq				*wlan_exception_fq;
-	uint32_t						expt_fq_count; /* Number of FQs created to HOST */
 	struct vap_desc_s 	vaps[MAX_WIFI_VAPS];
 	spinlock_t 				vaplock;
-	spinlock_t 				txlock;
 	struct vwd_global_stats_s  __percpu         	*vwd_global_stats;
 };
 
 /* Common stats not corresponding to specific vap*/
 struct vwd_global_stats_s {
 	u32 					pkts_slow_fail;
-	u32 					pkts_tx_errors;
 	u32 					pkts_dev_down_drop;
 };
 
