@@ -27,8 +27,7 @@ FAULTS = [
     ("cdxdrv_create_of_fqs", 4),
     ("cdxdrv_create_missaction_policer_profiles", 1),
     ("cdxdrv_create_ingress_qos_policer_profiles", 9),
-    ("cdx_ioc_set_dpa_params", 9),        # all CEETM policers
-    ("cdx_ioc_set_dpa_params", 10),       # classifier miss actions
+    ("cdx_ioc_set_dpa_params", 9),        # classifier miss actions
 ]
 SPLATS = re.compile(r"BUG:|WARNING: CPU:|Oops:|Kernel panic|possible circular locking|"
                     r"inconsistent lock state|sleeping function called|did not drain|"

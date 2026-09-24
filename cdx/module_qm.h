@@ -26,17 +26,11 @@ struct ceetm_fq {
 #define NUM_CHANNEL_SHAPERS	8
 #define MAX_SCHEDULER_QUEUES	(NUM_PQS + NUM_WBFQS)
 #define GET_CEETM_PRIORITY(x)	((x) < NUM_PQS) ? ((x) ^ (NUM_PQS - 1)) : (x)
-#define EGRESS_MAX_CQ_PROFILES  (MAX_SCHEDULER_QUEUES * NUM_CHANNEL_SHAPERS)
 
 
 /* For byte mode this is the max expected pkt size */
 #define DEFAULT_INGRESS_BYTE_MODE_CBS 2000
 #define DEFAULT_INGRESS_BYTE_MODE_PBS 2000
-
-enum {
-	CDX_EGRESS_MIN_CQ_PROFILE=CDX_INGRESS_ALL_PROFILES + 1,
-	CDX_EGRESS_MAX_CQ_PROFILES=(CDX_EGRESS_MIN_CQ_PROFILE + (EGRESS_MAX_CQ_PROFILES -1))
-};
 
 struct shaper_info {
 	uint64_t rate;
@@ -66,9 +60,6 @@ struct classque_info {
 		uint32_t weight;	/* for WBFQs */
 	};
 	uint32_t qdepth;		/* CQ depths */
-	uint32_t shaper_rate;	/* shaper rate in Kbps */
-	void     *pp_handle;	/* policer profile handle */
-	void     *pcd_handle;       /* handle to fm_pcd device for this fman */
 };
 
 #define MAX_DSCP	64
@@ -110,8 +101,7 @@ struct ceetm_chnl_info {
 	uint32_t idx;
 	uint32_t wbfq_priority;
 	uint32_t wbfq_chshaper;
-	void *pcd_handle;	/* handle to fm_pcd device for this fman */
-	struct shaper_info shaper_info; 
+	struct shaper_info shaper_info;
 	PQM_context_ctl qm_ctx;
 	struct classque_info cq_info[MAX_SCHEDULER_QUEUES]; 
 };
@@ -123,12 +113,6 @@ struct ceetm_chnl_info {
 
 #define SHAPER_ON               1
 #define SHAPER_OFF              2
-
-#define DEFAULT_CQ_CIR_VALUE 0xffffffff
-#define DEFAULT_CQ_PIR_VALUE 0xffffffff
-/* For byte mode this is the max expected pkt size */
-#define DEFAULT_CQ_BYTE_MODE_CBS 2000
-#define DEFAULT_CQ_BYTE_MODE_PBS 2000
 
 int qm_init(void);
 void qm_exit(void);

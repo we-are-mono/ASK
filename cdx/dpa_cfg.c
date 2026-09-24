@@ -899,10 +899,6 @@ static int dpa_rollback_resources(void)
 		}
 	}
 	ret = cdxdrv_release_port_policer_slots();
-#ifdef ENABLE_EGRESS_QOS
-	if (ceetm_exit_cq_plcr())
-		ret = -EIO;
-#endif
 	for (ii = 0; ii < num_fmans; ii++)
 		if (cdxdrv_release_shared_policers(&fman_info[ii]))
 			ret = -EIO;
@@ -1164,12 +1160,6 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	 * rollback below detaches it either way, before the profiles go. */
 	if (cdx_devlink_attach(wrappers[FMAN_INDEX]->dev))
 		DPA_ERROR("%s::unable to register the devlink instance\n", __func__);
-#ifdef ENABLE_EGRESS_QOS
-	if (ceetm_init_cq_plcr() || cdx_dpa_init_fault()) {
-		retval = -EIO;
-		goto err_ret;
-	}
-#endif
 	//init the fman and its ports
 	for (ii = 0; ii < num_fmans; ii++) {
 		if (cdxdrv_set_miss_action(ii) || cdx_dpa_init_fault()) {

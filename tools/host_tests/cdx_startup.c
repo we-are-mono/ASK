@@ -56,7 +56,7 @@ static struct cdx_ctrl_set_dpa_params request = { input, 2 };
 static t_LnxWrpFmDev wrappers[2];
 static struct port ports[4];
 static unsigned alloc_step, fail_alloc, live_allocs, step, fail_step, copy_step, fail_copy;
-static void *stats, *oh[2], *eth[MAX_PHY_PORTS], *ceetm;
+static void *stats, *oh[2], *eth[MAX_PHY_PORTS];
 static unsigned slots, queues;
 static bool restoring, unsafe_enable, fail_delete;
 
@@ -104,7 +104,7 @@ static int FM_PORT_DetachPCD(void *p)
 static int FM_PORT_Disable(void *p) { ((struct port *)p)->enabled = false; return 0; }
 static int FM_PORT_Enable(void *p)
 {
-    if (!((struct port *)p)->detached && (!stats || !ceetm || queues != 4)) unsafe_enable = true;
+    if (!((struct port *)p)->detached && (!stats || queues != 4)) unsafe_enable = true;
     ((struct port *)p)->enabled = true; return 0;
 }
 static int cdxdrv_get_fman_handles(struct cdx_fman_info *f, t_LnxWrpFmDev **wrapper)
@@ -230,9 +230,7 @@ static int FM_PCD_PlcrProfileDelete(void *p)
     kfree(p); int ret = fail_delete ? -EIO : 0; fail_delete = false; return ret;
 }
 static int FM_PORT_PcdPlcrFreeProfiles(void *p) { assert(!((struct port *)p)->enabled && slots); slots--; return 0; }
-static int ceetm_init_cq_plcr(void) { ceetm = acquire(); return ceetm ? 0 : -ENOMEM; }
-static int ceetm_exit_cq_plcr(void) { assert(stopped()); kfree(ceetm); ceetm = NULL; return 0; }
-static int cdxdrv_set_miss_action(unsigned n) { (void)n; assert(stats && queues == 4 && ceetm); return 0; }
+static int cdxdrv_set_miss_action(unsigned n) { (void)n; assert(stats && queues == 4); return 0; }
 #include "cdx_policers.inc"
 #include "cdx_startup.inc"
 

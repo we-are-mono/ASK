@@ -65,7 +65,9 @@ Nor is much of the hardware CMM's doing. `qm_init()` builds the entire CEETM
 tree at module load, before any interface exists and before any command
 arrives: 8 channels, and per channel 16 CCGs, 16 class queues and 16 LFQs —
 128 of each — plus 128 egress FMAN policer profiles allocated at DPA init
-(`ceetm_init_cq_plcr`, `cdx/cdx_ceetm_app.c:854`). Per-interface, netdev
+(`ceetm_init_cq_plcr`). Those profiles were later removed: a frame reached one
+only through a class-queue policer byte in the classifier's fqid, which nothing
+ever set. Per-interface, netdev
 registration claims the sub-portal and LNI. What the FCI commands actually do
 is bind a channel to an LNI, flip the sub-portal into CEETM mode, and push
 rates, weights and thresholds into objects that already exist.
@@ -2567,4 +2569,6 @@ made "see A141" ambiguous for as long as it lasted.
   carried through the whole command path, and read by nothing.
 - In flowtable mode, `CMD_INIT(qm)` still builds 8 channels, 128 class queues,
   128 LFQs and 128 FMAN policer profiles that no command can reach, because
-  unlike the IPsec family it is not gated on `cdx_flowtable_enabled()`.
+  unlike the IPsec family it is not gated on `cdx_flowtable_enabled()`. (The
+  tree went on to serve the `tc` HTB offload; the profiles, which no frame
+  could reach, were removed.)

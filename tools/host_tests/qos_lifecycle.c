@@ -24,11 +24,6 @@ static int atomic_read(atomic_t *p) { return p->value; }
 #define MAX_PHY_PORTS 10
 #define GEM_PORTS 8
 #define DPAA_ETH_TX_QUEUES 16
-#define CDX_INGRESS_ALL_PROFILES 8
-#define DEFAULT_CQ_CIR_VALUE 100
-#define DEFAULT_CQ_PIR_VALUE 100
-#define DEFAULT_CQ_BYTE_MODE_CBS 2000
-#define DEFAULT_CQ_BYTE_MODE_PBS 2000
 #define KERN_INFO ""
 #define printk(...) ((void)0)
 #define ceetm_err(...) ((void)0)
@@ -137,23 +132,7 @@ struct rcu_head { void *next; };
 #include "qos_types.inc"
 QM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
-typedef void *t_Handle;
-typedef struct {
-    struct { struct { unsigned profileType, relativeProfileId; } newParams; } id;
-    unsigned algSelection, colorMode, nextEngineOnGreen, nextEngineOnYellow, nextEngineOnRed;
-    struct { unsigned dfltColor, override; } color;
-    struct { unsigned action; } paramsOnGreen, paramsOnYellow, paramsOnRed;
-    struct {
-        unsigned rateMode, committedInfoRate, peakOrExcessInfoRate;
-        unsigned committedBurstSize, peakOrExcessBurstSize;
-        struct { unsigned frameLengthSelection, rollBackFrameSelection; } byteModeParams;
-    } nonPassthroughAlgParams;
-} t_FmPcdPlcrProfileParams;
-enum { e_FM_PCD_PLCR_RFC_2698, e_FM_PCD_PLCR_COLOR_BLIND, e_FM_PCD_PLCR_RED,
-       e_FM_PCD_PLCR_BYTE_MODE, e_FM_PCD_PLCR_FULL_FRM_LEN, e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN,
-       e_FM_PCD_DONE, e_FM_PCD_ENQ_FRAME, e_FM_PCD_DROP_FRAME, e_FM_PCD_PLCR_SHARED };
-
-static unsigned fail_at, step, allocations, channels, lfqs, fqs, profiles;
+static unsigned fail_at, step, allocations, channels, lfqs, fqs;
 static unsigned next_channel, mapping_id;
 static unsigned pending_enqueues, pending_frames, pending_erns, queries;
 static unsigned long jiffies;
@@ -276,15 +255,6 @@ static int dpa_register_ceetm_get_egress_fq(void *a, void *b)
     assert(!callbacks); callbacks = true; return 0;
 }
 static void dpa_unregister_ceetm_get_egress_fq(void) { assert(callbacks); callbacks = false; }
-static void *dpa_get_pcdhandle(unsigned fm) { return hw_step() ? NULL : (void *)1; }
-static void *FM_PCD_PlcrProfileSet(void *pcd, t_FmPcdPlcrProfileParams *params)
-{
-    void *p = kzalloc(1, 0);
-    if (p) profiles++;
-    return p;
-}
-static int FM_PCD_PlcrProfileDelete(void *p)
-{ assert(profiles); profiles--; kfree(p); return release_error ? -EIO : 0; }
 static int qman_ceetm_sp_claim(struct qm_ceetm_sp **out, unsigned fm, unsigned index)
 {
     if (hw_step()) return -ENOMEM;
@@ -408,16 +378,14 @@ static void shutdown_qos(void)
 
 static void empty(void)
 {
-    assert(!allocations && !channels && !lfqs && !fqs && !profiles);
+    assert(!allocations && !channels && !lfqs && !fqs);
     assert(!callbacks && !command_handler && !lni.claimed && !sp.claimed);
     for (unsigned i = 0; i < MAX_PHY_PORTS; i++) assert(!gQMCtx[i].net_dev);
 }
 static int start(void)
 {
     int ret = qm_init();
-    if (ret) { empty(); return ret; }
-    ret = ceetm_init_cq_plcr();
-    if (ret) assert(!profiles);
+    if (ret) empty();
     return ret;
 }
 static unsigned cycle(unsigned failure)
@@ -550,7 +518,7 @@ int main(void)
         shutdown_qos(); empty();
     }
     /* A failed interface drain may outlive the interface context. Keep the
-     * CQ device references and policers until a later successful cleanup. */
+     * CQ device references until a later successful cleanup. */
     assert(start() == 0);
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
     assert(ceetm_assign_chnl(ctx, 0) == 0);
@@ -562,7 +530,6 @@ int main(void)
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
     assert(ceetm_assign_chnl(ctx, 0) < 0);
     assert(cdx_disable_ceetm_on_iface(&iface) == 0);
-    assert(ceetm_exit_cq_plcr() < 0 && profiles);
     assert(ceetm_exit() < 0 && dev.refs && packet_live[0]);
     recover_on_shutdown_wait = true;
     rtnl_lock();

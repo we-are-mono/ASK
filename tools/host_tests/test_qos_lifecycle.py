@@ -57,9 +57,8 @@ def test_qos_lifecycle(tmp_path):
         "ceetm_create_lni", "ceetm_get_fqcount",
         "ceetm_create_ccg_for_class_queue", "ceetm_num_to_2powN_multiple",
         "ceetm_cfg_td_on_class_queue", "ceetm_create_cq",
-        "ceetm_cq_policer_fill_defaults", "ceetm_create_cq_policer_profiles",
         "ceetm_create_queues", "ceetm_create_channel", "ceetm_init_channels",
-        "ceetm_init_cq_plcr", "ceetm_exit_cq_plcr", "ceetm_assign_chnl",
+        "ceetm_assign_chnl",
         "ceetm_release_fd", "ceetm_sync_portal", "ceetm_sync_portals",
         "ceetm_drain_queue", "ceetm_drain_channel",
         "ceetm_quiesce_port", "ceetm_put_channel_devices",
@@ -70,7 +69,6 @@ def test_qos_lifecycle(tmp_path):
         "static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];\n"
         "static bool ceetm_callbacks_registered;\n"
         "static int ceetm_release_channels(void);\n"
-        "int ceetm_exit_cq_plcr(void);\n"
         + "\n".join(function(source, name) for name in names)
         + "\n".join(function(control, name) for name in [
             "qm_init", "qm_quiesce", "qm_exit", "cdx_enable_ceetm_on_iface", "cdx_disable_ceetm_on_iface",

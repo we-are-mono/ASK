@@ -83,7 +83,7 @@ static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t 
  * such queue. A frame the CPU enqueues goes to the FQ object; a frame the
  * hardware forwards is described by a number in a parameter block, and that
  * number is this one. The microcode reads the byte above the 24-bit fqid as a
- * class-queue policer's profile; cdx enables none, so that byte stays clear.
+ * class-queue policer's profile; cdx creates none, so that byte stays clear.
  */
 uint32_t ceetm_egress_fqid(void *ctx, uint32_t channel, uint32_t classque)
 {
@@ -107,8 +107,8 @@ static struct qman_fq *ceetm_egressfq_hook(void *ctx, uint32_t channel,
 
 /* The fqid a classifier entry's action should carry for this mark, or zero if
  * the class it names does not exist. A value rather than the queue itself,
- * because what the caller writes into the entry is a number and because the
- * class-queue policer's profile byte belongs in that number and nowhere else.
+ * because what the caller writes into the entry is a number, which is what
+ * the microcode reads its queue from (ceetm_egress_fqid()).
  *
  * Zero too for a port that is not a DPAA netdev: its forwarding queues are
  * this driver's, and its private area is not a dpa_priv_s to read CEETM state
@@ -645,63 +645,6 @@ err_ret:
 	return CEETM_FAILURE;
 }
 
-static void ceetm_cq_policer_fill_defaults(t_FmPcdPlcrProfileParams *Params)
-{
-	Params->algSelection = e_FM_PCD_PLCR_RFC_2698;
-	Params->colorMode = e_FM_PCD_PLCR_COLOR_BLIND;
-	/*color as red by default*/
-	Params->color.dfltColor = e_FM_PCD_PLCR_RED;
-	/*override color is RED */
-	Params->color.override = e_FM_PCD_PLCR_RED;
-	/*set algorithm mode as bytes/sec (kilobits/sec)*/
-	Params->nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_BYTE_MODE;
-
-	Params->nonPassthroughAlgParams.committedBurstSize = DEFAULT_CQ_BYTE_MODE_CBS;
-	Params->nonPassthroughAlgParams.peakOrExcessBurstSize = DEFAULT_CQ_BYTE_MODE_PBS;
-	Params->nonPassthroughAlgParams.byteModeParams.frameLengthSelection = e_FM_PCD_PLCR_FULL_FRM_LEN;
-	Params->nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection = e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
-
-	Params->nextEngineOnGreen = e_FM_PCD_DONE;
-	Params->paramsOnGreen.action = e_FM_PCD_ENQ_FRAME;
-	Params->nextEngineOnYellow = e_FM_PCD_DONE;
-	Params->paramsOnYellow.action = e_FM_PCD_DROP_FRAME;
-	Params->nextEngineOnRed =e_FM_PCD_DONE;
-	Params->paramsOnRed.action = e_FM_PCD_DROP_FRAME;
-}
-
-static int ceetm_create_cq_policer_profiles(t_Handle h_FmPcd, struct classque_info *cqinfo, uint32_t profile)
-{
-	t_FmPcdPlcrProfileParams Params;
-
-
-	/* init default cir and pir values */
-	cqinfo->shaper_rate = DEFAULT_CQ_CIR_VALUE;
-
-	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
-	Params.id.newParams.profileType = e_FM_PCD_PLCR_SHARED;
-	Params.id.newParams.relativeProfileId = profile;
-
-	Params.nonPassthroughAlgParams.committedInfoRate = DEFAULT_CQ_CIR_VALUE;
-	Params.nonPassthroughAlgParams.peakOrExcessInfoRate = DEFAULT_CQ_PIR_VALUE;
-
-	ceetm_cq_policer_fill_defaults(&Params);
-
-	cqinfo->pp_handle = FM_PCD_PlcrProfileSet(h_FmPcd, &Params);
-	if (!cqinfo->pp_handle) {
-		printk("%s::unable to set profile for profile %d\n",
-		 __func__, profile);
-		return CEETM_FAILURE;
-	}
-	ceetm_dbg("%s:plcr profile created for handle %p, profile %d\n",
-		__func__, cqinfo->pp_handle, profile);
-	ceetm_dbg("cir %u, pir %u, cbs %d, pbs %d\n",
-			Params.nonPassthroughAlgParams.committedInfoRate,
-			Params.nonPassthroughAlgParams.peakOrExcessInfoRate,
-			Params.nonPassthroughAlgParams.committedBurstSize,
-			Params.nonPassthroughAlgParams.peakOrExcessBurstSize);
-	return CEETM_SUCCESS;
-}
-
 static int ceetm_create_queues(struct ceetm_chnl_info *chnl_ctx) 
 {
 	uint32_t ii; 
@@ -851,102 +794,6 @@ err_release:
 	return CEETM_FAILURE;
 }
 
-int ceetm_init_cq_plcr(void)
-{
-	uint32_t ii;
-	uint32_t jj;
-	uint32_t fm_index =0,profile = CDX_EGRESS_MIN_CQ_PROFILE;
-	struct ceetm_chnl_info *chinfo;
-	struct classque_info *cqinfo;
-	void *pcd_handle;
-
-	chinfo = &qm_chnl_info[0];
-	pcd_handle = dpa_get_pcdhandle(fm_index);
-
-	if (pcd_handle == NULL) {
-		ceetm_err("%s::no pcd handle for fm_index %d\n",
-			 __func__, fm_index);
-		return CEETM_FAILURE;
-	}
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
-		cqinfo = &chinfo->cq_info[0];
-		chinfo->pcd_handle = pcd_handle;
-		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
-			if (ceetm_create_cq_policer_profiles(chinfo->pcd_handle, cqinfo, profile))
-				goto err_release;
-			cqinfo++;
-			profile++;
-		}
-		chinfo++;
-	}
-	return CEETM_SUCCESS;
-
-err_release:
-	ceetm_exit_cq_plcr();
-	return CEETM_FAILURE;
-}
-
-int ceetm_exit_cq_plcr(void)
-{
-	int ii, jj;
-	int ret = CEETM_SUCCESS;
-
-	for (ii = CDX_CEETM_MAX_CHANNELS - 1; ii >= 0; ii--) {
-		for (jj = MAX_SCHEDULER_QUEUES - 1; jj >= 0; jj--) {
-			struct classque_info *cqinfo = &qm_chnl_info[ii].cq_info[jj];
-
-			if (!cqinfo->pp_handle)
-				continue;
-			if (cqinfo->drain_failed) {
-				ret = CEETM_FAILURE;
-				continue;
-			}
-			if (FM_PCD_PlcrProfileDelete(cqinfo->pp_handle)) {
-				ceetm_err("unable to delete policer for channel %d queue %d\n",
-					  ii, jj);
-				ret = CEETM_FAILURE;
-			}
-			/* The SDK invalidates the profile and releases its lock
-			 * even when the hardware command fails. */
-			cqinfo->pp_handle = NULL;
-		}
-		qm_chnl_info[ii].pcd_handle = NULL;
-	}
-	return ret;
-}
-
-
-static int ceetm_set_default_cq_policer_profile(void *pcd_handle, struct classque_info *cqinfo)
-{
-	void *handle;
-	t_FmPcdPlcrProfileParams Params;
-
-
-	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
-	Params.modify = 1;
-	Params.id.h_Profile = cqinfo->pp_handle;
-
-	/*init default cir and pir values */
-	Params.nonPassthroughAlgParams.committedInfoRate = DEFAULT_CQ_CIR_VALUE;
-	Params.nonPassthroughAlgParams.peakOrExcessInfoRate = DEFAULT_CQ_PIR_VALUE;
-
-	ceetm_cq_policer_fill_defaults(&Params);
-
-        handle = FM_PCD_PlcrProfileSet(pcd_handle, &Params);
-        if (!handle) {
-		printk("%s::unable to set default values for cq queue %p\n",
-			__func__, cqinfo);
-		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
-        }
-	/* init default cir and pir values */
-	cqinfo->shaper_rate = DEFAULT_CQ_CIR_VALUE;
-#ifdef DEVMAN_DEBUG
-	printk("%s::plcr profile set to default for cd queue %p, handle %p\n",
-		 __func__,cqinfo, handle);
-#endif
-	return CEETM_SUCCESS;
-}
-
 int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 {
 	uint32_t ii;
@@ -1005,7 +852,7 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 				ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 				return CEETM_FAILURE;
 			}
-			/* program default weights, depths and policer profiles on all class queues */
+			/* program default weights and depths on all class queues */
 			cqinfo = &qm_channel->cq_info[0];
 			for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
   				struct qm_ceetm_weight_code weight_code;
@@ -1072,7 +919,6 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 						return CEETM_FAILURE;
 					}
 				}
-				ceetm_set_default_cq_policer_profile(qm_channel->pcd_handle,cqinfo);
 				cqinfo++;
 			}
 		}		
@@ -1387,8 +1233,7 @@ int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
 	 * minimum well below the requested one. */
 	maxth = (uint32_t)params.wr_parm_g.MA << params.wr_parm_g.Mn;
 	ceetm_wred_slope(maxp, maxth > min ? maxth - min : 1, &params.wr_parm_g);
-	/* One curve for every colour. A RED qdisc describes one, and a frame's
-	 * colour here is whatever the class queue's policer made it; giving the
+	/* One curve for every colour. A RED qdisc describes one; giving the
 	 * colours separate curves is what GRED is for, and is not this. */
 	params.wr_parm_y = params.wr_parm_g;
 	params.wr_parm_r = params.wr_parm_g;
@@ -2131,8 +1976,6 @@ int ceetm_exit(void)
 	}
 	if (ceetm_release_channels())
 		return CEETM_FAILURE;
-	if (ceetm_exit_cq_plcr())
-		ret = CEETM_FAILURE;
 	return ret;
 }
 #endif
