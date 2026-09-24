@@ -10935,6 +10935,47 @@ out:
 	return rc;
 }
 
+/* Whether the peer resolves now, asked without probing it: the same route
+ * and neighbour ft_ipsec_peer_mac() would use, usable and with an address.
+ *
+ * The follow work probes a peer that does not resolve and returns, leaving
+ * the neighbour event the answer raises to bring it back. That event marks a
+ * watch whose address it does not change only while the watch is stale, and
+ * the work sets that after its probe -- so an answer landing in between is
+ * lost, and the SA keeps its old framing until something else moves. The work
+ * asks this once the watch is stale again, and goes round once more if the
+ * answer has come. Called with no lock held.
+ */
+static bool ft_ipsec_peer_resolved(struct net_device *dev, u8 family,
+				   const union nf_inet_addr *local,
+				   const union nf_inet_addr *peer,
+				   const struct ft_ipsec_route *route)
+{
+	struct neighbour *neighbour;
+	bool resolved = false;
+	u8 mac[ETH_ALEN];
+	struct flowi4 fl4;
+	struct rtable *rt;
+
+	if (family != AF_INET)
+		return false;
+	rt = ft_ipsec_peer_route(dev, local, peer, route, &fl4);
+	if (IS_ERR(rt))
+		return false;
+	neighbour = rt->dst.dev == dev ? dst_neigh_lookup(&rt->dst, &fl4.daddr) : NULL;
+	if (neighbour) {
+		if (READ_ONCE(neighbour->nud_state) & NUD_VALID) {
+			read_lock_bh(&neighbour->lock);
+			ether_addr_copy(mac, neighbour->ha);
+			read_unlock_bh(&neighbour->lock);
+			resolved = !is_zero_ether_addr(mac);
+		}
+		neigh_release(neighbour);
+	}
+	ip_rt_put(rt);
+	return resolved;
+}
+
 static void ft_ipsec_route_of(struct xfrm_state *x, struct ft_ipsec_route *route)
 {
 	*route = (struct ft_ipsec_route){
@@ -11949,7 +11990,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 	u8 was_dst[ETH_ALEN];
 	u8 was_src[ETH_ALEN];
 	u8 mac[ETH_ALEN];
-	bool reported, rebuild, moved, reframe;
+	bool reported, rebuild, moved, reframe, resolved, listed;
 	u32 asked, was_built, was_path, path_mtu;
 	u64 cookie;
 	u64 pass;
@@ -11991,6 +12032,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 		path_mtu = 0;
 		rc = ft_ipsec_peer_mac(dev, family, &local, &peer, &route, false,
 				       mac, &path_mtu, NULL);
+		resolved = !rc;
 		/* The path's MTU is framing as much as the addresses are: the
 		 * entry fragments SEC's output to it, and every direction the
 		 * SA encrypts was bounded by the SA on it. It is known once the
@@ -12057,11 +12099,19 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 		if (rc) {
 			spin_lock_bh(&ft_watch_lock);
 			watch = ft_ipsec_watch_find(cookie);
+			listed = !!watch;
 			if (watch) {
 				watch->stale = true;
 				watch->reported = true;
 			}
 			spin_unlock_bh(&ft_watch_lock);
+			/* The peer's answer to the probe above may have landed
+			 * before the watch was stale again, and been lost; ask
+			 * once more now that it is. A rebuild that failed with
+			 * the peer resolved waits for an event, as before. */
+			if (!resolved && listed &&
+			    ft_ipsec_peer_resolved(dev, family, &local, &peer, &route))
+				schedule_work(&ft_ipsec_follow);
 			if (!reported && family == AF_INET6)
 				netdev_warn(dev,
 					    "cdx: IPsec SA to %pI6c could not follow its peer (%d); its tunnel keeps emitting to %pM\n",

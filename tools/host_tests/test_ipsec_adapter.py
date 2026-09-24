@@ -88,7 +88,7 @@ def test_ipsec_adapter(tmp_path):
         "ft_ipsec_rebuild_pending",
         "ft_ipsec_watch_add", "ft_ipsec_watch_del", "ft_ipsec_watch_flush",
         "ft_ipsec_peer_route", "ft_ipsec_route_mtu", "ft_ipsec_path_mtu",
-        "ft_ipsec_peer_mac", "ft_ipsec_route_of", "ft_ipsec_next_hop",
+        "ft_ipsec_peer_mac", "ft_ipsec_peer_resolved", "ft_ipsec_route_of", "ft_ipsec_next_hop",
         "ft_ipsec_peer_on_port", "ft_ipsec_replay_bit", "ft_ipsec_replay_seen", "ft_ipsec_spec",
         "ft_ipsec_seq_exhausting", "ft_ipsec_publish_oseq",
         "ft_ipsec_publish_window", "ft_ipsec_account", "ft_ipsec_sample_paths",

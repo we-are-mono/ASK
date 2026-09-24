@@ -246,6 +246,9 @@ file's git history.
 - [x] **A235.** Mark-steered uplinks: an inbound SA is offloaded only when the unmarked route to its peer leaves by its port, the one signal there is when it is added; it fails safe, and a source rule for the local address makes it hold —
   documented contract (_:/^cdx: offload a child SA whole or leave it to software_).
 
+- [x] **A234.** The follow work set a watch stale again only after probing its unresolved peer, so an answer arriving in between was lost and the SA kept framing it had not been rebuilt for (a moved path MTU) until something else moved —
+  fixed (_:/^cdx: look again at an SA's peer that answers the follow's own probe_).
+
 - [x] **A233.** Under strongSwan's `hw_offload = auto`, a child SA whose outbound SA cdx refused came up with that SA in software, its outbound policy offloaded and its inbound SA in hardware: up and dead —
   fixed (_:/^cdx: offload a child SA whole or leave it to software_).
 

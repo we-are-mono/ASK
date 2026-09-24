@@ -1475,7 +1475,11 @@ install has nowhere to retry from — packet offload has no software fallback,
 so a refusal fails the tunnel — while a re-resolution has the neighbour event
 that will arrive when the peer answers. So it probes and returns rather than
 holding a shared workqueue for seconds, and a failed lookup leaves the SA on
-the address it has.
+the address it has. That event marks a watch whose address it does not
+change only while the watch waits, and the work puts it back to waiting after
+the probe, so an answer landing in between would be lost. The work therefore
+looks at the peer once more, without probing, once the watch waits again,
+and goes round again if the answer has come.
 
 A failure is said out loud, once per SA and again after any recovery, because
 one case cannot be fixed at all: a peer that moves to a route leaving by a

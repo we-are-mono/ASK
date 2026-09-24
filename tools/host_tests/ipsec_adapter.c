@@ -287,9 +287,19 @@ static void neigh_release(struct neighbour *n)
 	assert(n->refs && neigh_refs);
 	n->refs--; neigh_refs--;
 }
+/* A peer that answers the probe itself, before the prober has looked again:
+ * its entry turns usable and the notifier runs, as ARP would have it. */
+static bool probe_answers;
+static void ft_ipsec_neigh_moved(struct neighbour *neigh);
 static int neigh_event_send(struct neighbour *n, void *skb)
 {
-	(void)skb; (void)n; neigh_probes++; return 0;
+	(void)skb;
+	neigh_probes++;
+	if (probe_answers) {
+		n->nud_state = NUD_REACHABLE;
+		ft_ipsec_neigh_moved(n);
+	}
+	return 0;
 }
 
 /* --- destinations and routes ----------------------------------------- */
@@ -1133,6 +1143,7 @@ static void bench_reset(void)
 	features_changes = 0;
 	slept = 0;
 	neigh_probes = 0;
+	probe_answers = false;
 	auth_key.alg_key_len = 160;
 	auth_key.alg_trunc_len = 96;
 	assert(neigh_refs == 0);
@@ -2719,15 +2730,18 @@ static void test_watch_sample_route_only(void)
 
 	/* The path narrows while the peer is down. The pass marks the watch
 	 * once; the work retires the directions and records the path although
-	 * nothing can be rebuilt, asking the neighbour table that once. */
+	 * nothing can be rebuilt, probing the peer that once and looking at it
+	 * once more after. */
 	peer_neigh.nud_state = NUD_FAILED;
 	wan_route.dst.mtu = 1400;
+	neigh_probes = 0;
 	assert(accounting_passes(1) == 1);
-	assert(flows_retired() && neigh_lookups == 1 && sa_next_hop_calls == 1);
-	assert(sa_pool[0].path_mtu == 1500);
+	assert(flows_retired() && neigh_probes == 1 && neigh_lookups == 2);
+	assert(sa_next_hop_calls == 1 && sa_pool[0].path_mtu == 1500);
 	/* And the passes after it are quiet. */
 	assert(accounting_passes(5) == 0);
-	assert(neigh_lookups == 1 && sa_next_hop_calls == 1 && !flows_retired());
+	assert(neigh_probes == 1 && neigh_lookups == 2);
+	assert(sa_next_hop_calls == 1 && !flows_retired());
 
 	/* The peer answering is what brings the rebuild, at the new MTU, and
 	 * retires nothing further. */
@@ -2793,6 +2807,71 @@ static void test_peer_route_is_the_fibs(void)
 	assert(accounting_passes(3) == 0 && sa_next_hop_calls == 0);
 
 	route_bundle = NULL;
+	ft_xdo_state_delete(x);
+	bench_clear_sas();
+}
+
+/* A peer that answers between the work's probe and its mark.
+ *
+ * The work probes a peer that does not resolve and leaves the watch stale for
+ * the neighbour event the answer raises; that event marks an unchanged
+ * address only on a stale watch, and the work marks it after the probe. An
+ * answer landing in between found it neither, and the SA kept the framing it
+ * had -- here the old path's MTU -- until something else moved. */
+static void test_watch_answer_during_probe(void)
+{
+	struct xfrm_state state;
+	struct xfrm_state *x;
+
+	bench_reset();
+	bench_clear_sas();
+	x = install_outbound(&state);
+	flows_ride(sa_pool[0].handle);
+
+	/* The path narrows while the peer is unresolved, and the peer answers
+	 * the very probe the work sends for it. */
+	peer_neigh.nud_state = NUD_FAILED;
+	wan_route.dst.mtu = 1400;
+	probe_answers = true;
+	ft_ipsec_route_moved(AF_INET, &(__be32){ PEER_IP }, 0xffffffff, 32);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(neigh_probes == 1 && sa_next_hop_calls == 0 && flows_retired());
+	/* The work looked again and went round once more. */
+	assert(works_scheduled == 2);
+	probe_answers = false;
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 1 && sa_pool[0].path_mtu == 1400 && !flows_retired());
+	assert(neigh_probes == 1 && dev_holds == 0 && neigh_refs == 0 && !ft_watch_lock);
+
+	/* A rebuild that fails with the peer resolved is not gone round
+	 * again: it waits for an event, as a peer that stays down does. */
+	wan_route.dst.mtu = 1300;
+	sa_next_hop_error = -EBUSY;
+	works_scheduled = 0;
+	ft_ipsec_all_moved();
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 2 && works_scheduled == 1 && flows_retired());
+	peer_neigh.nud_state = NUD_FAILED;
+	ft_ipsec_device_moved(&WAN);
+	ft_ipsec_follow_work(NULL);
+	assert(works_scheduled == 2 && sa_next_hop_calls == 2 && neigh_probes == 2);
+	sa_next_hop_error = 0;
+
+	/* A usable neighbour with no address resolves nothing, so the second
+	 * look must not take it for an answer: the work would find the same
+	 * entry and queue itself for ever. */
+	peer_neigh.nud_state = NUD_REACHABLE;
+	memset(peer_neigh.ha, 0, ETH_ALEN);
+	works_scheduled = 0;
+	ft_ipsec_device_moved(&WAN);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(works_scheduled == 1 && sa_next_hop_calls == 2 && neigh_probes == 2);
+	assert(neigh_refs == 0 && dev_holds == 0);
+
+	flows_leave();
+	wan_route.dst.mtu = 0;
 	ft_xdo_state_delete(x);
 	bench_clear_sas();
 }
@@ -3847,6 +3926,7 @@ int main(void)
 	test_watch_path_mtu();
 	test_watch_sample_route_only();
 	test_peer_route_is_the_fibs();
+	test_watch_answer_during_probe();
 	test_accounting();
 	test_sequence_exhaustion();
 	test_spec_sequence();
