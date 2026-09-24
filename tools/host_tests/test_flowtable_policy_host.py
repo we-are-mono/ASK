@@ -110,6 +110,33 @@ def test_rejects_oversized_device_list(engine):
     assert r.returncode != 0 and ("at most 40" in r.stdout or "2 to 40" in r.stdout), r.stdout
 
 
+def _heavy(n):
+    """n rules that each render four long lines: every selector, port shorthand."""
+    rule = ("scope proto tcp saddr 203.0.113.254/32 daddr 198.51.100.254/32 "
+            "reply-saddr 198.51.100.254/32 reply-daddr 203.0.113.254/32 "
+            "mark 0xffffffff/0xffffffff port 65534-65535\n")
+    return "devices eth3 eth4\n" + rule * n
+
+
+def test_every_accepted_policy_renders(engine):
+    """check and apply must agree. A policy well inside the 64 KiB and
+    256-rule limits used to pass check and then be refused at apply with
+    "rendered ruleset exceeds buffer", because a port rule renders four lines.
+    The validator now measures the rendered table and names the limit."""
+    rejected = 0
+    for n in (64, 128, 129, 131, 160, 192, 224, 256):
+        conf = _heavy(n)
+        assert len(conf) <= 65536
+        r = check(engine, conf)
+        if r.returncode:
+            assert "renders to" in r.stdout and "byte limit" in r.stdout, r.stdout
+            rejected += 1
+            continue
+        out = run(engine, conf, "render")
+        assert out.returncode == 0, (n, out.stdout[-200:])
+    assert rejected, "the largest of these policies should exceed the render limit"
+
+
 def test_rejects_config_over_64k(engine):
     conf = "devices eth3 eth4\nscope any\n" + "# pad\n" * 20000
     r = check(engine, conf)

@@ -24,6 +24,11 @@
 #define FT_IFNAME_MAX    15
 #define FT_NAME_MAX      64
 #define FT_CONF_MAX      65536
+/* The rendered table is larger than its conf (a port rule renders four
+ * lines), so it has its own limit. ft_validate() measures the render against
+ * it, which is what makes a policy that passes check always render at apply.
+ * Buffers holding the script, or nft's listing of it, are sized from it. */
+#define FT_RENDER_MAX    (FT_CONF_MAX * 2)
 
 /* One selector set. Every field is optional; an empty match (in scope) means
  * "any". Presence is tracked by the has_* flags. An address is stored as a
@@ -85,9 +90,15 @@ int ft_validate(struct ft_ctx *ctx, const struct ft_policy *p);
 
 /* Render the nftables table text for an enabled, validated policy into buf.
  * qos_mark_mask is read from the live adapter (0 when unknown). Returns the
- * number of bytes written (excluding NUL), or -1 (ctx->err set) on overflow. */
+ * number of bytes written (excluding NUL), or -1 (ctx->err set) on overflow.
+ * With buf NULL and buflen 0 it only measures, returning the length. */
 int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 	      uint32_t qos_mark_mask, char *buf, size_t buflen);
+
+/* The most an enabled policy can render at apply: its rules under the widest
+ * mark guard, plus the longest device list "devices auto" may resolve to.
+ * Returns -1 (ctx->err set) if it cannot be rendered at all. */
+long ft_render_bound(struct ft_ctx *ctx, const struct ft_policy *p);
 
 /* 64-hex fingerprint of the policy's canonical form, used as the nft table's
  * ownership marker. Stable across runs and independent of qos_mark_mask. */

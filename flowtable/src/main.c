@@ -108,7 +108,7 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 {
 	struct ft_backend st, drained;
 	bool present, owned;
-	char inhash[65], script[FT_CONF_MAX * 2];
+	char inhash[65], script[FT_RENDER_MAX + 1];
 	char dj[512], bj[512], hash[65];
 	int rc = -1;
 	memset(&drained, 0, sizeof(drained));
@@ -478,7 +478,7 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(cmd, "render")) {
 		struct ft_backend st;
-		char buf[FT_CONF_MAX * 2];
+		char buf[FT_RENDER_MAX + 1];
 		uint32_t mask = 0;
 		if (ft_backend_read(&ctx, &st) == 0 && st.present)
 			mask = st.qos_mark_mask;

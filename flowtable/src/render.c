@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <string.h>
 
+/* buf NULL measures: off still advances by what would have been written. */
 struct out {
 	char  *buf;
 	size_t len;
@@ -15,19 +16,21 @@ struct out {
 static void emit(struct out *o, const char *fmt, ...)
 {
 	va_list ap;
+	size_t room = o->buf && o->off < o->len ? o->len - o->off : 0;
 	int n;
 	va_start(ap, fmt);
-	n = vsnprintf(o->buf + o->off, o->off < o->len ? o->len - o->off : 0, fmt, ap);
+	n = vsnprintf(room ? o->buf + o->off : NULL, room, fmt, ap);
 	va_end(ap);
 	if (n < 0) { o->ovf = true; return; }
 	o->off += (size_t)n;
-	if (o->off >= o->len)
+	if (o->buf && o->off >= o->len)
 		o->ovf = true;
 }
 
 /* Build the selector prefix common to every expansion of a match (proto,
- * addresses, explicit ports, mark) into pfx. */
-static void match_prefix(const struct ft_match *m, char *pfx, size_t n)
+ * addresses, explicit ports, mark) into pfx. Every field is bounded, so the
+ * prefix fits; a false return would mean the rule text was cut short. */
+static bool match_prefix(const struct ft_match *m, char *pfx, size_t n)
 {
 	size_t o = 0;
 	int i;
@@ -47,6 +50,7 @@ static void match_prefix(const struct ft_match *m, char *pfx, size_t n)
 	if (m->has_mark)
 		ADD("%sct mark & %#x == %#x", o ? " " : "", m->mark_mask, m->mark_value);
 #undef ADD
+	return o < n;
 }
 
 /* Emit the admission lines for one match. action is "return" (exclude) or
@@ -55,7 +59,10 @@ static void match_prefix(const struct ft_match *m, char *pfx, size_t n)
 static void emit_match(struct out *o, const struct ft_match *m, const char *action)
 {
 	char pfx[512];
-	match_prefix(m, pfx, sizeof(pfx));
+	if (!match_prefix(m, pfx, sizeof(pfx))) {
+		o->ovf = true;
+		return;
+	}
 
 	if (m->has_port_any) {
 		int i;
@@ -119,4 +126,19 @@ int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 		return -1;
 	}
 	return (int)o.off;
+}
+
+long ft_render_bound(struct ft_ctx *ctx, const struct ft_policy *p)
+{
+	/* No adapter mask refuses every mark bit: the longest guard line. */
+	int n = ft_render(ctx, p, 0, NULL, 0);
+	long bound;
+
+	if (n < 0)
+		return -1;
+	bound = n;
+	/* Each resolved device renders as `, "name"`. */
+	if (p->devices_auto)
+		bound += (long)FT_MAX_DEVICES * (FT_IFNAME_MAX + 4);
+	return bound;
 }

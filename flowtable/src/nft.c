@@ -28,7 +28,9 @@ int ft_nft_run(struct ft_ctx *ctx, const char *script, bool check_only, int keep
 
 int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65], int keepfd)
 {
-	char out[FT_CONF_MAX * 4];
+	/* nft's listing of a table rendered within FT_RENDER_MAX; a truncated
+	 * listing is refused, so it must never outgrow this. */
+	char out[FT_RENDER_MAX * 2];
 	char *argv[] = { "nft", "list", "table", "inet", FT_TABLE, NULL };
 	int rc = ft_nft_exec(argv, NULL, out, sizeof(out), keepfd);
 	*present = false; *owned = false; if (hash) hash[0] = '\0';

@@ -380,5 +380,11 @@ int ft_validate(struct ft_ctx *ctx, const struct ft_policy *p)
 		FAIL("enabled policy requires an explicit admission scope");
 	if (p->nscope > FT_MAX_RULES || p->nexclude > FT_MAX_RULES)
 		FAIL("scope/exclude: too many matches");
+	/* Measure the table apply will render, so check and apply agree. */
+	long need = ft_render_bound(ctx, p);
+	if (need < 0)
+		return -1;
+	if (need > FT_RENDER_MAX)
+		FAIL("policy renders to %ld bytes, over the %d-byte limit", need, FT_RENDER_MAX);
 	return 0;
 }

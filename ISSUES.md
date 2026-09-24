@@ -250,16 +250,6 @@ result independently of those temporary files.
   tunnel dst-MAC contracts so the tunnel arm runs when both are present. See
   the [tunnel design](docs/flowtable/tunnels.md).
 
-- [ ] **A181 — ask-flowtable render buffer can reject a validated maximal policy.**
-  `flowtable/src/`: the conf validator accepts up to 256 scope + 256 exclude rules,
-  but `ft_render` targets a `FT_CONF_MAX*2` (128 KiB) buffer, and a `port`-shorthand
-  rule with address prefixes expands to four lines. A pathological maximal policy can
-  overflow the render buffer and be refused at apply with "rendered ruleset exceeds
-  buffer" though it validated. Bounded by `vsnprintf` (no memory unsafety) and no real
-  policy approaches it, but size the render buffer to the worst-case expansion, or cap
-  the rule count against it, so validation and rendering agree. Found in the C daemon's
-  adversarial review.
-
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN
@@ -344,6 +334,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A181.** ask-flowtable could validate a maximal policy and then refuse it at apply for overflowing the render buffer —
+  fixed (_:/^flowtable: size the render buffer to what the validator accepts_).
 
 - [x] **A187.** `display_l3hdr_insert_opc()` decoded the tunnel insert word's flag bits and stats pointer wrongly —
   fixed (_:/^cdx: decode the tunnel insert word's flag bits and stats pointer_).

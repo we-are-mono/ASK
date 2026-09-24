@@ -20,7 +20,7 @@ int main(int argc, char **argv)
 	struct ft_ctx ctx;
 	struct ft_policy p;
 	/* One byte past the limit so the engine's own >64 KiB check can fire. */
-	char text[FT_CONF_MAX + 2], buf[FT_CONF_MAX * 2];
+	char text[FT_CONF_MAX + 2], buf[FT_RENDER_MAX + 1];
 	uint32_t mask = 0;
 	const char *mode = argc > 1 ? argv[1] : "check";
 	int i;
