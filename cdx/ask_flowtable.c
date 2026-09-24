@@ -11515,10 +11515,10 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	 * The datapath works in handles rather than pointers, because that is
 	 * all a frame can carry: SEC stamps the handle into a decrypted
 	 * frame's trailer, and the transmit path looks the frame queue up by
-	 * it. Setting it here, before the state is inserted, is what makes the
-	 * kernel's handle index point at the SA the hardware actually has --
-	 * xfrm_state_insert_byh() honours a handle that is already set rather
-	 * than allocating over it.
+	 * it. Setting it here, before the state is inserted, is what puts the
+	 * state in the kernel's handle index at all: xfrm_state_insert_byh()
+	 * indexes only states whose driver has set a handle, so the index holds
+	 * nothing but the handles the hardware knows.
 	 */
 	x->handle = cdx_ipsec_sa_handle(sa);
 	return 0;
