@@ -9,7 +9,12 @@ hardware eligibility contract first, and because the two available
 architectures here differ in what the tree carries forever rather than in how
 long they take to write. CDX's FCI plane (`cdx_cmdhandler.c`, the
 `control_ipsec.c` command handlers, the SA lifetime timer) has since been
-removed; references to it below describe the tree as it was then.
+removed; references to it below describe the tree as it was then. So has
+patch 040's half for CMM: the `NETLINK_KEY` protocol in `af_key.c`,
+`x->offloaded` and its output path, `net/xfrm/ipsec_flow.c`,
+`parent_sa_handle` and the kernel's own handle allocator. The `x->handle`
+index stayed, holding only the handles the backend gives packet-offloaded
+states (step 4, the slow path).
 
 ## The shape of the problem
 

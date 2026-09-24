@@ -1,4 +1,4 @@
-From eba56451d1caa5b9ac63e55e5f597dc772e7667d Mon Sep 17 00:00:00 2001
+From 29587e7fbd0ce6cf189744f9b30440a05c831ae3 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] ask: IPv4/IPv6 forwarding-path hook points
@@ -23,44 +23,21 @@ other LAN address turned into a connection no reply could find.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- net/ipv4/ip_output.c          | 38 ++++++++++++++++++++++++++++++++++-
+ net/ipv4/ip_output.c          | 24 +++++++++++++++++++++++-
  net/ipv4/ip_tunnel.c          |  3 +++
- net/ipv6/ip6_output.c         | 28 ++++++++++++++++++++++++--
+ net/ipv6/ip6_output.c         | 18 ++++++++++++++++--
  net/ipv6/ip6_tunnel.c         |  4 ++++
- net/ipv6/netfilter/ip6t_NPT.c | 35 ++++++++++++++++++++++++++++++++
- net/ipv6/output_core.c        | 19 ++++++++++++++++++
+ net/ipv6/netfilter/ip6t_NPT.c | 35 +++++++++++++++++++++++++++++++++++
+ net/ipv6/output_core.c        |  8 ++++++++
  net/ipv6/sit.c                |  3 +++
- 7 files changed, 127 insertions(+), 3 deletions(-)
+ 7 files changed, 92 insertions(+), 3 deletions(-)
 
 diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
-index 41031c5c4303..2eb271fe8755 100644
+index 41031c5c4303..cf455f665713 100644
 --- a/net/ipv4/ip_output.c
 +++ b/net/ipv4/ip_output.c
-@@ -102,6 +102,17 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
- {
- 	struct iphdr *iph = ip_hdr(skb);
+@@ -116,6 +116,14 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
  
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD)
-+	/*
-+	 * The tunnel header is not added in slow path and packet may be ipv6
-+	 * (IPv6 traffic and IPv4 IPSec tunnel) in case IPv6 over IPv4 IPsec
-+	 * tunnel. When it assumes as IPv4 and accessing IP header from SKB
-+	 * causing invalid accesses it leading to kernel panic.
-+	 * Avoiding ip header checks.
-+	 */
-+	if((skb->ipsec_offload) && (iph->version == 6))
-+		goto sendout;
-+#endif /* endif for CONFIG_INET_IPSEC_OFFLOAD */
- 	IP_INC_STATS(net, IPSTATS_MIB_OUTREQUESTS);
- 
- 	iph_set_totlen(iph, skb->len);
-@@ -114,8 +125,19 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
- 	if (unlikely(!skb))
- 		return 0;
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD)
-+sendout:
-+#endif
  	skb->protocol = htons(ETH_P_IP);
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD)
@@ -74,7 +51,7 @@ index 41031c5c4303..2eb271fe8755 100644
  	return nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
  		       net, sk, skb, NULL, skb_dst_dev(skb),
  		       dst_output);
-@@ -308,7 +330,11 @@ static int __ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *
+@@ -308,7 +316,11 @@ static int __ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *
  	if (skb_is_gso(skb))
  		return ip_finish_output_gso(net, sk, skb, mtu);
  
@@ -87,7 +64,7 @@ index 41031c5c4303..2eb271fe8755 100644
  		return ip_fragment(net, sk, skb, mtu, ip_finish_output2);
  
  	return ip_finish_output2(net, sk, skb);
-@@ -434,6 +460,16 @@ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+@@ -434,6 +446,16 @@ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
  	skb->dev = dev;
  	skb->protocol = htons(ETH_P_IP);
  
@@ -119,34 +96,10 @@ index 7c77d06372d1..708663706279 100644
  	}
  
 diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index 5d17982cb994..685da1a7dd66 100644
+index 5d17982cb994..4ec7a6da32ee 100644
 --- a/net/ipv6/ip6_output.c
 +++ b/net/ipv6/ip6_output.c
-@@ -83,6 +83,13 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
- 
- 	hdr = ipv6_hdr(skb);
- 	daddr = &hdr->daddr;
-+#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	/* For IPv4 over IPv6 IPsec tunnel cases, just send the packet out
-+	 * since the packet is IPv4
-+	 */
-+	if((skb->ipsec_offload) && (hdr->version == 4))
-+		goto sendout;
-+#endif /* endif for CONFIG_INET6_IPSEC_OFFLOAD */
- 	if (ipv6_addr_is_multicast(daddr)) {
- 		if (!(dev->flags & IFF_LOOPBACK) && sk_mc_loop(sk) &&
- 		    ((mroute6_is_socket(net, skb) &&
-@@ -114,6 +121,9 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
- 		}
- 	}
- 
-+#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+sendout:
-+#endif /* endif for CONFIG_INET6_IPSEC_OFFLOAD */
- 	if (lwtunnel_xmit_redirect(dst->lwtstate)) {
- 		int res = lwtunnel_xmit(skb);
- 
-@@ -208,8 +218,15 @@ static int __ip6_finish_output(struct net *net, struct sock *sk, struct sk_buff
+@@ -208,8 +208,15 @@ static int __ip6_finish_output(struct net *net, struct sock *sk, struct sk_buff
  	if (skb_is_gso(skb))
  		return ip6_finish_output_gso(net, sk, skb, mtu);
  
@@ -164,7 +117,7 @@ index 5d17982cb994..685da1a7dd66 100644
  		return ip6_fragment(net, sk, skb, ip6_finish_output2);
  
  	return ip6_finish_output2(net, sk, skb);
-@@ -244,6 +261,13 @@ int ip6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+@@ -244,6 +251,13 @@ int ip6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
  		return 0;
  	}
  
@@ -261,29 +214,10 @@ index 787c74aa85e3..a63cd09c5440 100644
  }
  
 diff --git a/net/ipv6/output_core.c b/net/ipv6/output_core.c
-index 90a178dd24aa..34e96333bd44 100644
+index 90a178dd24aa..c96261180a3d 100644
 --- a/net/ipv6/output_core.c
 +++ b/net/ipv6/output_core.c
-@@ -128,7 +128,18 @@ int __ip6_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
- 	len = skb->len - sizeof(struct ipv6hdr);
- 	if (len > IPV6_MAXPLEN)
- 		len = 0;
-+
-+#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+/* Since tunnel header is not added in slow path and route cache entry lookup is changed to perform
-+   lookup on tunnel header, for Ipv4 over Ipv6 IPsec tunnel cases,dst_output will be ip6 output 
-+   but packet will be IPv4 type. So,this check is introduced to update ipv6 pay_load for the following cases
-+   1.IPv6 over Ipv6 IPsec tunnel.
-+   2.IPv4 over Ipv6 Ipsec tunnel when software encryption come into play(i.e for packets > 1782 bytes) */
-+        if((ipv6_hdr(skb)->version) == 6)
-+                ipv6_hdr(skb)->payload_len = htons(len);
-+#else
- 	ipv6_hdr(skb)->payload_len = htons(len);
-+#endif
- 	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
- 
- 	/* if egress device is enslaved to an L3 master device pass the
-@@ -140,6 +151,14 @@ int __ip6_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
+@@ -140,6 +140,14 @@ int __ip6_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
  
  	skb->protocol = htons(ETH_P_IPV6);
  

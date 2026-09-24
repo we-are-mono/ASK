@@ -1,4 +1,4 @@
-From fadd55fab1d292a2aab2e5da1767e84822765d09 Mon Sep 17 00:00:00 2001
+From 288465d701cc8651dea1a137792565309a42a420 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 18:26:25 +0200
 Subject: [PATCH] xfrm: route a cross-family packet-offload tunnel by the flow
@@ -45,10 +45,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  6 files changed, 155 insertions(+), 24 deletions(-)
 
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index 714ae9bc72e7..c238651f0c99 100644
+index 0c09f0162676..4c79394d793a 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
-@@ -395,6 +395,9 @@ struct xfrm_dst_lookup_params {
+@@ -376,6 +376,9 @@ struct xfrm_dst_lookup_params {
  	u32 mark;
  	__u8 ipproto;
  	union flowi_uli uli;
@@ -58,7 +58,7 @@ index 714ae9bc72e7..c238651f0c99 100644
  };
  
  struct net_device;
-@@ -1873,12 +1876,19 @@ struct sk_buff *xfrm6_gro_udp_encap_rcv(struct sock *sk, struct list_head *head,
+@@ -1854,12 +1857,19 @@ struct sk_buff *xfrm6_gro_udp_encap_rcv(struct sock *sk, struct list_head *head,
  					struct sk_buff *skb);
  int xfrm_user_policy(struct sock *sk, int optname, sockptr_t optval,
  		     int optlen);
@@ -115,7 +115,7 @@ index 470e0590d480..493c71f6ec5c 100644
  
  	dst = ip6_route_output(params->net, NULL, &fl6);
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4a7c5b2b1412..539fa6ae2b3a 100644
+index 2532c1e332da..5fa1a432218f 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -291,6 +291,7 @@ static int flow_offload_eth_dst(struct net *net,
@@ -151,10 +151,10 @@ index 4a7c5b2b1412..539fa6ae2b3a 100644
  			return -ENOENT;
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index 2bce33d6e2f9..02dc7958c485 100644
+index 8c4d265b7f47..2b32a9277e1f 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
-@@ -749,8 +749,15 @@ static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
+@@ -661,8 +661,15 @@ static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
  {
  	struct neighbour *n = NULL;
  
@@ -172,10 +172,10 @@ index 2bce33d6e2f9..02dc7958c485 100644
  		neigh_event_send(n, NULL);
  		neigh_release(n);
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index 0df847267f5a..c414b0b0a735 100644
+index 01ffa8de8402..d5cd1b9d0616 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
-@@ -302,13 +302,35 @@ struct dst_entry *__xfrm_dst_lookup(int family,
+@@ -292,13 +292,35 @@ struct dst_entry *__xfrm_dst_lookup(int family,
  }
  EXPORT_SYMBOL(__xfrm_dst_lookup);
  
@@ -212,7 +212,7 @@ index 0df847267f5a..c414b0b0a735 100644
  	struct net *net = xs_net(x);
  	xfrm_address_t *saddr = &x->props.saddr;
  	xfrm_address_t *daddr = &x->id.daddr;
-@@ -329,21 +351,8 @@ static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
+@@ -319,21 +341,8 @@ static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
  	params.tos = tos;
  	params.oif = oif;
  	params.mark = mark;
@@ -236,9 +236,9 @@ index 0df847267f5a..c414b0b0a735 100644
  
  	dst = __xfrm_dst_lookup(family, &params);
  
-@@ -2683,6 +2692,93 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
- EXPORT_SYMBOL(xfrm_get_tos);
- #endif
+@@ -2666,6 +2675,93 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+ 	return err;
+ }
  
 +/* Packet offload hands the device the packet still in the flow's family, so
 + * a tunnel SA's child route has to be a route of that family: its local_out
@@ -330,7 +330,7 @@ index 0df847267f5a..c414b0b0a735 100644
  
  /* Allocate chain of dst_entry's, attach known xfrm's, calculate
   * all the metrics... Shortly, bundle a bundle.
-@@ -2750,7 +2846,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+@@ -2733,7 +2829,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
  		xdst->route = dst;
  		dst_copy_metrics(dst1, dst);
  
@@ -340,7 +340,7 @@ index 0df847267f5a..c414b0b0a735 100644
  			__u32 mark = 0;
  			int oif;
  
-@@ -2766,6 +2863,12 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+@@ -2749,6 +2846,12 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
  			err = PTR_ERR(dst);
  			if (IS_ERR(dst))
  				goto put_states;
