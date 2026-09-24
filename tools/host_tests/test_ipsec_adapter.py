@@ -238,6 +238,10 @@ def test_sa_cache(tmp_path):
 
 
 def test_ipsec_receive_ownership(tmp_path):
+    """What SEC hands back on an SA's exception queue: who owns the frame
+    descriptor, the skb and the SA reference on every way through, and that
+    nothing is built from the private area of a device that is not a DPAA
+    port, whatever device the SA names."""
     source = (ROOT / "cdx/dpa_ipsec.c").read_text()
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
@@ -247,6 +251,8 @@ def test_ipsec_receive_ownership(tmp_path):
     (tmp_path / "ipsec_receive_production.inc").write_text(
         text[start:end] + source[source.index("/* Only buffers transferred permanently"):
                                 source.index("struct dpa_bp* get_ipsec_bp(void)")]
+        # The test for a DPAA port, from where cdx keeps it.
+        + function((ROOT / "cdx/devman.c").read_text(), "dpa_netdev_is_dpaa")
         + function(source, "ipsec_exception_pkt_handler"))
     for portal_napi in (False, True):
         binary = tmp_path / f"ipsec_receive_{portal_napi}"
@@ -258,10 +264,63 @@ def test_ipsec_receive_ownership(tmp_path):
             *(["-DCONFIG_FSL_ASK_QMAN_PORTAL_NAPI"] if portal_napi else []),
             "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_receive.c")), "-o", str(binary),
         ], check=True)
+        # The harness reports a touch of its guard page itself, by name.
         subprocess.run([str(binary)], check=True, timeout=30, env={
-            **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+            **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1:handle_segv=0",
             "UBSAN_OPTIONS": "halt_on_error=1",
         })
+
+
+def test_ipsec_sa_device_is_its_bound_port():
+    """The device an SA's exception queue delivers through, reading its
+    private area as a DPAA port's, is the port the state is bound to: the one
+    admission proved is a port and the caller holds. The address lookup that
+    keys the classifier entry names no device, because for a local endpoint
+    on a Wi-Fi VAP the device it would name is the VAP."""
+    backend = (ROOT / "cdx/cdx_ipsec_backend.c").read_text()
+    add = function(backend, "cdx_ipsec_sa_add")
+    store = "sa->netdev = spec->dev;"
+    assert add.count(store) == 1, "an SA does not take the device it is bound to"
+    assert add.index("rc = cdx_ipsec_validate(spec);") < add.index(store) \
+        < add.index("rc = ipsec_install_fp_entry(sa);")
+    # And an inbound SA's local endpoint is on that port before anything is
+    # built for it (test_ipsec_local_endpoint has the rule itself).
+    check = "rc = cdx_ipsec_local_on_port(spec, daddr);"
+    assert add.count(check) == 1, "the local endpoint is not checked against the port"
+    assert add.index("rc = cdx_ipsec_validate(spec);") < add.index(check) \
+        < add.index("M_ipsec_sa_cache_create(")
+    assert "cdx_ipsec_port_supported(spec->dev)" in function(backend, "cdx_ipsec_validate")
+    assert "dpa_netdev_is_physical(dev)" in function(backend, "cdx_ipsec_port_supported")
+    # And nothing else in CDX stores a device there.
+    stores = [(path.name, match.group()) for path in sorted((ROOT / "cdx").glob("*.[ch]"))
+              for match in re.finditer(r"[\w>.-]*[>.]netdev\s*=(?!=)[^;]*;|&\w+->netdev\b",
+                                       path.read_text())]
+    assert stores == [("cdx_ipsec_backend.c", store)], stores
+
+
+def test_ipsec_local_endpoint(tmp_path):
+    """An inbound SA is installed only when its local address is found on the
+    port it is bound to: the classifier entry is keyed on the port the address
+    is on, and what SEC returns is delivered through the bound one. Compiled
+    from the backend, against stubs that say where an address lives."""
+    backend = (ROOT / "cdx/cdx_ipsec_backend.c").read_text()
+    header = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
+    (tmp_path / "ipsec_local_endpoint_types.inc").write_text(
+        re.search(r"^enum cdx_ipsec_dir \{.*?^\};", header, re.S | re.M).group() + "\n")
+    (tmp_path / "ipsec_local_endpoint.inc").write_text(
+        function(backend, "cdx_ipsec_local_on_port"))
+    binary = tmp_path / "ipsec_local_endpoint"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+        "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+        "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_local_endpoint.c")),
+        "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
 
 
 def test_ipsec_backend(tmp_path):

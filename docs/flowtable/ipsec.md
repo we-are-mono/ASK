@@ -284,10 +284,11 @@ offload, where the stack builds the ESP header.
 **The device.** The state's `xso.dev` must be a registered physical CDX port.
 A state bound to any other device is refused rather than accepted and ignored,
 because packet offload has no silent software fallback and an accepted-but-dead
-SA would black-hole the tunnel. This is an *identity* test and deliberately not
-the liveness one a flow's ports face: an SA may legitimately be installed
-before the link it will ride has carrier, and refusing then would fail the
-tunnel outright instead of delaying it.
+SA would black-hole the tunnel. (Inbound ESP arriving on a device that is not
+a DPAA port is the one frame-level exception; see step 6.) This is an
+*identity* test and deliberately not the liveness one a flow's ports face: an
+SA may legitimately be installed before the link it will ride has carrier, and
+refusing then would fail the tunnel outright instead of delaying it.
 
 **And there must be an engine behind the port.** The IPsec offline port, its
 buffer pool and PCD frame queues, and the CAAM job ring are all claimed at
@@ -308,9 +309,15 @@ work chose — it is how CDX resolves an SA to an interface at all.
 `cdx_ipsec_add_classification_table_entry()` looks the SA up by address:
 `sa->id.saddr` for an outbound SA, `sa->id.daddr` for an inbound one. A
 tunnel whose local endpoint lives somewhere else is refused with
-`dpa_get_iface_info_by_ipaddress returned error` in the log. Real deployments
-satisfy this without trying, because strongSwan's local endpoint is the WAN
-address; a bench that invents endpoints has to put one on the port.
+`dpa_get_iface_info_by_ipaddress returned error` in the log. For an inbound
+SA the port the address is found on must also be the state's own device
+(`cdx_ipsec_local_on_port()`), or the state is refused with `EADDRNOTAVAIL`
+and says so: its classifier entry is keyed on the port the address is on,
+and what SEC returns is delivered through the device the state is bound to,
+so on two ports the decrypted frames would arrive addressed to the other one.
+Real deployments satisfy this without trying, because strongSwan binds a state
+to the device that holds its local address; a bench that invents endpoints has
+to put one on the port.
 
 The inner LAN may still be a bridge or VLAN. For an opted-in flowtable,
 Netfilter resolves that direction's physical path even when the opposite
@@ -744,10 +751,12 @@ with the action that checks SEC's status. The microcode counts a refused frame
 in a table it keeps in MURAM (`en_SEC_failure_stats`, in the global block
 after the external hash tables' internal buffer pool) and drops the frame
 inside FMan. The CPU's feed goes the same way. An ESP datagram that reached
-the CPU, such as one reassembled from fragments, goes from `xfrm_input()` to
-SEC (`tx todec`) before xfrm's own replay check, into the same SA queues. So
-neither xfrm nor cdx ever holds a refused frame. The SA's exception queue
-carries only frames SEC processed that missed the offline port's flow table.
+the CPU on a DPAA port, such as one reassembled from fragments, goes from
+`xfrm_input()` to SEC (`tx todec`) before xfrm's own replay check, into the
+same SA queues. So neither xfrm nor cdx ever holds a refused frame. (ESP that
+arrived on another device is the exception: it is given back to software ESP,
+see step 6.) The SA's exception queue carries only frames SEC processed that
+missed the offline port's flow table.
 
 The microcode's table is the only record, and it has limits:
 
@@ -828,6 +837,8 @@ and as of the pass's last reading. `ipsec_sec_refused` is the exact total, and
 
 **No count exists per SA.** For an offloaded SA, `ip -s xfrm state` shows
 `replay-window 0 replay 0 failed 0` however many of its frames SEC refused.
+Only frames software ESP decrypted, which step 6 says arrive on a device
+other than a DPAA port, move those counters.
 SEC keeps no per-SA count, and the microcode's count is global. No design
 recovers one at a price worth paying:
 
@@ -1079,6 +1090,18 @@ loki SA counters: 32 packets  the peer encrypted all 32
 So the SPI-keyed half of inbound was complete before this increment started:
 the inbound SA's own classifier entry steers ESP to SEC, and `xfrm_input()` is
 not on the path. What was missing is everything after decryption.
+
+ESP that misses that entry and reaches `xfrm_input()` anyway goes to SEC
+through the software submit (`tx todec`) only when it arrived on a DPAA port,
+or on a VLAN or PPPoE session over one, because the submit borrows the port's
+driver state and reads no other driver's. ESP arriving anywhere else, on a
+bridge, a veth or a Wi-Fi VAP, is given back and decrypted by the state's own
+software ESP. That is a choice, not a constraint, and it costs anti-replay:
+xfrm's window for an offloaded SA is a copy of SEC's, refreshed once per
+accounting pass, and SEC never learns what software accepted, so each can
+accept a frame the other already has. No SA strongSwan installs carries such
+traffic, since the other half of a tunnel whose peer lies behind another
+device is refused; it comes from hand-built SAs or from an attacker.
 
 #### The three defects, in the order the bench found them
 

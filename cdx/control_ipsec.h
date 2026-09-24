@@ -201,6 +201,9 @@ typedef struct _tSAEntry {
 	struct hw_ct 		*ct;
 	U16                    	stats_indx;
 	U16                    	next_cmd_indx;
+	/* The DPAA port the SA is bound to, whose private area the SA's
+	 * exception queue borrows to deliver what SEC returns. Its creator
+	 * sets it and holds the device for the SA's life. */
 	void 			*netdev;
 } SAEntry, *PSAEntry;
 

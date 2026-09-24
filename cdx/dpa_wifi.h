@@ -106,7 +106,6 @@ bool dpaa_vwd_vap_owns(uint16_t vap_id, const struct net_device *dev);
 bool dpaa_vwd_vap_built(uint16_t vap_id);
 
 int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash);
-int dpaa_get_wifi_dev(uint16_t vap_id, void** netdev);
 int dpaa_get_wifi_ohport_handle( uint32_t* oh_handle);
 void drain_tx_bp_pool(struct dpa_bp *bp);
 

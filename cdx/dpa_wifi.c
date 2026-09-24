@@ -710,13 +710,6 @@ int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash)
 	return 0;
 }
 
-/* This function returns net dev with VAP id */
-int dpaa_get_wifi_dev(uint16_t vap_id, void** netdev)
-{
-	*netdev = (void*)vwd.vaps[vap_id].wifi_dev;
-	return 0;
-}
-
 /* This function returns  WIFI related OH port handle */
 int dpaa_get_wifi_ohport_handle( uint32_t* oh_handle)
 {
@@ -885,9 +878,10 @@ static void vwd_unpublish_vap(struct vap_desc_s *vap)
 
 /* Publish the vap pointer onto VLAN devices riding on its wifi netdev,
  * by netdev relationship, each time the VAP opens: a REMOVE clears the
- * aliases and nothing else puts them back. Safe for any such VLAN: its
- * ESP traffic takes the SEC round-trip and falls back to the
- * exception/software path. Caller holds rtnl. */
+ * aliases and nothing else puts them back. Safe for any such VLAN: ESP
+ * arriving on it did not arrive on a DPAA port, so the DPAA driver gives
+ * it back rather than submit it to SEC, and Linux decrypts it. Caller
+ * holds rtnl. */
 static void vwd_publish_vlan_aliases(struct vap_desc_s *vap)
 {
 	struct net_device *dev;

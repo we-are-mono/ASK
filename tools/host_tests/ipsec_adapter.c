@@ -52,6 +52,7 @@ typedef uint32_t __be32;
 #define EOPNOTSUPP 95
 #define EHOSTUNREACH 113
 #define ENETUNREACH 101
+#define EADDRNOTAVAIL 99
 #define XFRM_INF (~(u64)0)
 
 struct in6_addr { u8 s6_addr[16]; };
@@ -1262,10 +1263,18 @@ static void test_state_add(void)
 	bench_reset();
 	bench_clear_sas();
 	sa_add_error = -EIO;
+	ack._msg = NULL;
 	assert(ft_xdo_state_add(x, &ack) == -EIO);
 	assert(sa_installed == 0);
+	assert(ack._msg && !strcmp(ack._msg, "cdx: the hardware refused this SA"));
 	ft_ipsec_all_moved();
 	assert(works_scheduled == 0);
+	/* An inbound SA whose local address is not on the device it names is
+	 * told so, not given the generic refusal. */
+	sa_add_error = -EADDRNOTAVAIL;
+	ack._msg = NULL;
+	assert(ft_xdo_state_add(x, &ack) == -EADDRNOTAVAIL && sa_installed == 0);
+	assert(ack._msg && strstr(ack._msg, "local address must be on the device"));
 	sa_add_error = 0;
 
 	/* An inbound SA is installed without a watch: it is classified rather

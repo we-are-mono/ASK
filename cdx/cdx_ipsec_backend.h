@@ -239,6 +239,7 @@ bool cdx_ipsec_port_supported(struct net_device *dev);
  * recognise this SA later.
  *
  * -EOPNOTSUPP: the device, direction or transform cannot be carried.
+ * -EADDRNOTAVAIL: an inbound SA's local address is not on the device.
  * -ENOSPC: no free handle or no free SEC context.
  * -EIO: the descriptor or classifier entry could not be built.
  * On any error nothing is installed and *result is NULL.

@@ -2379,8 +2379,8 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 		else
 			sa_addr = &sa->id.saddr[0];
 
-		if( dpa_get_iface_info_by_ipaddress(sa->family, sa_addr, NULL, 
-					NULL , NULL, &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
+		if( dpa_get_iface_info_by_ipaddress(sa->family, sa_addr, NULL,
+					NULL , NULL, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
 					__func__);
@@ -2504,8 +2504,11 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 #ifdef CDX_DPA_DEBUG
 		printk("%s::inbound sa\n", __func__);
 #endif
+		/* The port the local endpoint is on keys the classifier entry.
+		 * The SA's device is not looked up here: it is the port the SA
+		 * is bound to (sa->netdev), set by its creator. */
 		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.daddr.a6[0], NULL,
-					&itf_id , &info->port_id, &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
+					&itf_id , &info->port_id, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n",
 					__func__);
@@ -2544,32 +2547,13 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		}
 
 		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.saddr[0], NULL,
-					NULL , NULL,  &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
+					NULL , NULL, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n",
 					__func__);
 			goto err_ret;
 		}
 
-/*
-		if(!sa->pRtEntry)
-		{
-			DPA_ERROR("%s:: NULL ROUTE for out SA  finding outbound interface by ipaddress\n",
-					__func__);
-			if (dpa_get_iface_info_by_ipaddress(sa->family,
-						((sa->family == PROTO_IPV4) ?  &sa->tunnel.ip4.SourceAddress : 
-						 &sa->tunnel.ip6.SourceAddress[0]),
-						&info->l2_info.fqid, &itf_id, 
-						NULL, NULL, (uint32_t) sa->handle) != SUCCESS)
-			{
-				DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
-						__func__);
-				goto err_ret;
-			}
-			dpa_get_l2l3_info_by_itf_id( itf_id,
-					&info->l2_info, &info->l3_info);
-		} else {
-*/
 		if (dpa_get_out_tx_info_by_itf_id(sa->pRtEntry,
 					&info->l2_info, &info->l3_info,
 					(uint32_t)sa->handle)) {

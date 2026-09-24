@@ -115,7 +115,7 @@ DEFINE_SPINLOCK(dpa_devlist_lock);
 struct dpa_iface_info *dpa_interface_info;
 
 static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
-		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, void **netdev, uint32_t hash);
+		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, uint32_t hash);
 
 extern struct net init_net;
 extern int fm_port_get_hwid(const struct fm_port *port);
@@ -552,12 +552,16 @@ static inline int dpa_get_fqid_from_eth(struct eth_iface_info *eth_info,
 }
 
 /*
- * This function gets the tx fqid, portid and netdev of the interface.
+ * This function gets the tx fqid and portid of the interface.
  * Return value: In success case return SUCCESS and parameters gets updated.
- *               In failure case it returns FAILURE. 
+ *               In failure case it returns FAILURE.
+ *
+ * It names no device. A WLAN interface's would be a Wi-Fi VAP, which has no
+ * struct dpa_priv_s behind it, so a caller that needs a port to borrow one
+ * from names that port itself, as an IPsec SA names the one it is bound to.
  */
 static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
-		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, void **netdev, uint32_t hash)
+		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, uint32_t hash)
 {
 	uint32_t ohport_handle;
 
@@ -572,10 +576,6 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 
 	if (iface_info->if_flags & IF_TYPE_WLAN)
 	{
-		if ((netdev))
-		{
-			dpaa_get_wifi_dev(iface_info->wlan_info.vap_id,netdev);
-		}
 		if (portid)
 		{
 			dpaa_get_wifi_ohport_handle(&ohport_handle);
@@ -615,9 +615,6 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 				return FAILURE;
 			}
 		}
-
-		if(netdev)
-			*netdev = (void*)eth_info->net_dev;
 	}
 
 	return SUCCESS;
@@ -653,7 +650,7 @@ int dpa_check_for_logical_iface_types(struct _itf *input_itf,
 }
 
 int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * tx_fqid,
-		uint32_t * itf_id, uint32_t * portid , void **netdev, uint32_t hash)
+		uint32_t * itf_id, uint32_t * portid, uint32_t hash)
 {
 	struct dpa_iface_info *iface_info;
 	struct net_device* device = NULL;
@@ -686,7 +683,7 @@ int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * 
 						if (if_info->ifa_local == *daddr)
 						{
 							ret = dpa_get_tx_fqid_devinfo_by_iface(iface_info,
-									tx_fqid, NULL, portid, netdev, hash);
+									tx_fqid, NULL, portid, hash);
 							if (ret < 0)
 							{
 								printk("%s:: Could not get portid and tx_fqid for : %s \n",__func__, iface_info->name);
@@ -717,7 +714,7 @@ int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * 
 						if (!(memcmp(&ifp->addr, daddr, 16 )))
 						{
 							ret = dpa_get_tx_fqid_devinfo_by_iface(iface_info,
-									tx_fqid, NULL, portid, netdev, hash);
+									tx_fqid, NULL, portid, hash);
 							if (ret < 0)
 							{
 								printk("%s:: Could not get portid and tx_fqid for : %s \n",__func__, iface_info->name);

@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import subprocess
 
+from test_qos_lifecycle import function
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -34,5 +36,39 @@ def test_ipsec_sec_submit(tmp_path):
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+
+
+def test_ipsec_inbound_submit_device(tmp_path):
+    """Which frames the driver hands SEC on the way in, by the device they
+    reached the stack on.
+
+    xfrm_input() finds a packet-offloaded state by address and SPI and asks
+    the driver to submit whatever arrived, on a bridge or a veth as readily
+    as on a port, and the submit borrows the device's private area as a
+    DPAA port's. A port, or a VLAN or PPPoE session over one, is submitted as
+    before; anything else is given back untouched for the state's software
+    ESP. Every device that is not a port keeps its private area on an
+    unreadable page, so borrowing it fails the run.
+    """
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    source = (kernel / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c").read_text()
+    (tmp_path / "ipsec_inbound_submit.inc").write_text(
+        function(source, "dpa_netdev_is_dpaa_port")
+        + function(source, "__dpaa_submit_inb_pkt_to_SEC")
+        + function(source, "dpaa_submit_inb_pkt_to_SEC"))
+    binary = tmp_path / "ipsec_inbound_submit"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+        "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+        "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_inbound_submit.c")),
+        "-o", str(binary),
+    ], check=True)
+    # The harness reports a touch of the guard page itself, by name.
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1:handle_segv=0",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

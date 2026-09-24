@@ -1,10 +1,15 @@
 /* Compile the receive callback and secpath initializer with poisoned metadata
- * and independently accounted FD, skb and SA ownership. */
+ * and independently accounted FD, skb and SA ownership. A device that is not a
+ * DPAA port keeps its private area on a page nothing may read or write, so the
+ * callback borrowing it as a port's fails the run by name. */
 #include <assert.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <errno.h>
 
@@ -56,7 +61,13 @@ struct qman_portal_config { unsigned index; };
 struct dpa_napi_portal { struct qman_portal *p; int napi; };
 struct dpa_percpu_priv_s { unsigned rx_sg; struct dpa_napi_portal np[1]; };
 struct dpa_priv_s { struct dpa_percpu_priv_s *percpu_priv; int *percpu_count; };
-struct net_device { unsigned features; const char *name; };
+struct net_device;
+struct net_device_ops { int (*ndo_init)(struct net_device *dev); };
+/* priv is what netdev_priv() answers: a struct dpa_priv_s behind a port. */
+struct net_device {
+    unsigned features; const char *name; const struct net_device_ops *netdev_ops;
+    void *priv; unsigned long rx_dropped;
+};
 struct dpa_bp { unsigned count; void *dev; unsigned size; };
 struct xfrm_state { struct { long long use_time; } curlft; };
 struct sec_path { int len, olen, verified_cnt; struct xfrm_state *xvec[6]; unsigned ovec[24]; };
@@ -70,7 +81,15 @@ static unsigned int dpaa_sec_sg_reap(unsigned int budget)
 static bool no_device, no_state, napi_defer, refill_fail, secpath_fail, short_frame;
 static struct xfrm_state state;
 static struct sk_buff packet;
-static struct net_device device = { .name = "eth4" };
+/* The one member of the DPAA driver's ops the driver exports. */
+static int dpa_ndo_init(struct net_device *dev) { (void)dev; return 0; }
+static int other_ndo_init(struct net_device *dev) { (void)dev; return 0; }
+static const struct net_device_ops dpa_ops = { .ndo_init = dpa_ndo_init };
+static const struct net_device_ops bridge_ops = { .ndo_init = other_ndo_init };
+static const struct net_device_ops wifi_ops = { .ndo_init = NULL };
+static struct net_device device = { .name = "eth4", .netdev_ops = &dpa_ops };
+/* The device the SA names. */
+static struct net_device *sa_device = &device;
 static struct dpa_bp pool;
 static struct dpa_bp *dpa_bpid2pool(unsigned id) { (void)id; return &pool; }
 static void dma_unmap_single(void *dev, uintptr_t addr, unsigned size, int direction)
@@ -96,17 +115,18 @@ static int dpaa_bp_alloc_n_add_buffs(struct dpa_bp *p, unsigned count, bool skb)
 static struct dpa_percpu_priv_s cpu;
 static int bp_count;
 static struct dpa_priv_s priv = { .percpu_priv = &cpu, .percpu_count = &bp_count };
+static inline void dev_core_stats_rx_dropped_inc(struct net_device *dev) { dev->rx_dropped++; }
 static void *skb_ext_find(struct sk_buff *skb, int kind)
 { (void)kind; return skb->has_path ? &skb->path : NULL; }
 static void *skb_ext_add(struct sk_buff *skb, int kind)
 { (void)kind; if (secpath_fail) return NULL; skb->has_path = true; return &skb->path; }
 static struct net_device *get_netdev_of_SA_by_fqid(unsigned fqid, unsigned short *handle)
-{ (void)fqid; *handle = 7; return no_device ? NULL : &device; }
+{ (void)fqid; *handle = 7; return no_device ? NULL : sa_device; }
 static void *dev_net(struct net_device *dev) { return dev; }
 static struct xfrm_state *xfrm_state_lookup_byhandle(void *net, unsigned handle)
 { (void)net; assert(handle == 7); if (no_state) return NULL; refs++; return &state; }
 static void xfrm_state_put(struct xfrm_state *x) { assert(x == &state && refs); refs--; }
-static struct dpa_priv_s *netdev_priv(struct net_device *dev) { assert(dev == &device); return &priv; }
+static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return dev->priv; }
 #ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
 static bool dpaa_eth_napi_schedule(struct dpa_percpu_priv_s *p, struct qman_portal *q)
 { (void)p; (void)q; return napi_defer; }
@@ -153,6 +173,37 @@ static unsigned errors_logged;
 static void pr_err_ratelimited(const char *fmt, ...) { (void)fmt; errors_logged++; }
 #include "ipsec_receive_production.inc"
 
+/* The page behind every device that is not a port. */
+static void *guard;
+static size_t page;
+
+static void fault(int sig, siginfo_t *info, void *context)
+{
+    static const char touched[] =
+        "FAIL: the callback touched the private area of a device that is not a DPAA port\n";
+    static const char other[] = "FAIL: segmentation fault outside the guard page\n";
+    uintptr_t at = (uintptr_t)info->si_addr, base = (uintptr_t)guard;
+
+    (void)sig; (void)context;
+    if (at >= base && at < base + page)
+        (void)!write(2, touched, sizeof(touched) - 1);
+    else
+        (void)!write(2, other, sizeof(other) - 1);
+    _exit(3);
+}
+
+static void setup_devices(void)
+{
+    struct sigaction sa = { .sa_sigaction = fault, .sa_flags = SA_SIGINFO };
+
+    page = (size_t)sysconf(_SC_PAGESIZE);
+    guard = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(guard != MAP_FAILED);
+    sigemptyset(&sa.sa_mask);
+    assert(!sigaction(SIGSEGV, &sa, NULL) && !sigaction(SIGBUS, &sa, NULL));
+    device.priv = &priv;
+}
+
 static void reset(void)
 {
     assert(!refs);
@@ -182,6 +233,7 @@ int main(void)
         .fd = { .addr = (uintptr_t)frame, .length20 = sizeof(frame) } };
     struct qman_portal portal;
     struct qman_fq fq;
+    setup_devices();
     for (unsigned sg = 0; sg < 2; sg++) for (unsigned gro = 0; gro < 2; gro++) {
         dq.fd.format = sg;
         dq.fd.addr = (uintptr_t)(sg ? table : frame);
@@ -230,6 +282,25 @@ int main(void)
         assert(!refs && !converted && !fd_releases && !skb_frees);
 #endif
     }
+    /* An SA naming a device that is not a DPAA port: a bridge, a Wi-Fi VAP,
+     * a device with no ops at all. Nothing is built from its private area:
+     * the frame goes back to BMan and is counted as the device's drop, with
+     * no SA reference taken and the IPsec pool untouched. */
+    struct net_device bridge = { .name = "br-lan", .netdev_ops = &bridge_ops, .priv = guard };
+    struct net_device vap = { .name = "wlan0", .netdev_ops = &wifi_ops, .priv = guard };
+    struct net_device no_ops = { .name = "dummy0", .priv = guard };
+    struct net_device *others[] = { &bridge, &vap, &no_ops };
+    for (unsigned i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0;
+        dq.fd.format = qm_fd_contig; dq.fd.addr = (uintptr_t)frame;
+        sa_device = others[i];
+        assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_consume);
+        assert(fd_releases == 1 && !unmapped && !converted && !skb_frees && !delivered);
+        assert(!refs && others[i]->rx_dropped == 1 && errors_logged == 1);
+        assert(pool.count == 512 && !ipsec_pool_debt && bp_count == 640);
+        sa_device = &device;
+    }
+    assert(!device.rx_dropped);
     /* Exhaust the whole pool under allocation pressure. Only the queued
      * worker can recover it: no receive event or SA recreation follows. */
     reset();

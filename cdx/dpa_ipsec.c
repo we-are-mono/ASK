@@ -328,6 +328,19 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		goto rel_fd;
 	}
 
+	/* The frame is delivered below through this device's receive context,
+	 * read from its private area as a DPAA port's. The SA's device is the
+	 * port it is bound to, which admission accepts only when it is one;
+	 * any other device's private area is some other driver's state, so
+	 * the frame is dropped rather than built from it. */
+	if (unlikely(!dpa_netdev_is_dpaa(net_dev))) {
+		dev_core_stats_rx_dropped_inc(net_dev);
+		pr_err_ratelimited(
+			"cdx: IPsec SA 0x%x is bound to %s, not a DPAA port - dropping\n",
+			sagd_pkt, net_dev->name);
+		goto rel_fd;
+	}
+
 	/* A frame SEC refused, which this queue is not expected to carry: the
 	 * offline port's microcode checks SEC's status on the way here, counts
 	 * a refusal and drops the frame in FMan (see the adapter's

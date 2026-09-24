@@ -29,6 +29,7 @@
 #include "cdx_flowtable_backend.h"
 #include "cdx_ipsec_backend.h"
 #include "fe.h"
+#include "misc.h"
 
 #ifdef DPA_IPSEC_OFFLOAD
 
@@ -275,6 +276,32 @@ static int cdx_ipsec_validate(const struct cdx_ipsec_sa_spec *spec)
 	return 0;
 }
 
+/* An inbound SA's local endpoint has to be an address on the port the SA is
+ * bound to. Its classifier entry is keyed on the port the address is found on,
+ * and what SEC hands back is delivered through the bound port with the
+ * Ethernet header of the frame that went in: on two ports, the entry would sit
+ * on one and the frames be delivered on the other, addressed to someone else.
+ * An address on no registered port has nothing to key the entry on at all.
+ * Caller holds the control transaction. */
+static int cdx_ipsec_local_on_port(const struct cdx_ipsec_sa_spec *spec,
+				   U32 *daddr)
+{
+	struct dpa_iface_info *port;
+	uint32_t itf_id;
+
+	if (spec->dir != CDX_IPSEC_DIR_IN)
+		return 0;
+	port = dpa_get_ifinfo_by_netdev(spec->dev);
+	if (!port)
+		return -EOPNOTSUPP;
+	if (dpa_get_iface_info_by_ipaddress(spec->family == AF_INET6 ? PROTO_IPV6
+								     : PROTO_IPV4,
+					    daddr, NULL, &itf_id, NULL, 0) != SUCCESS ||
+	    itf_id != port->itf_id)
+		return -EADDRNOTAVAIL;
+	return 0;
+}
+
 int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		     struct cdx_ipsec_sa **result)
 {
@@ -302,6 +329,9 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		saddr[0] = spec->src.ip;
 		daddr[0] = spec->dst.ip;
 	}
+	rc = cdx_ipsec_local_on_port(spec, daddr);
+	if (rc)
+		return rc;
 
 	owner = kzalloc(sizeof(*owner), GFP_KERNEL);
 	if (!owner)
@@ -370,6 +400,14 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		ether_addr_copy(owner->route.dstmac, spec->dst_mac);
 		sa->pRtEntry = &owner->route;
 	}
+
+	/* What SEC hands back on the SA's exception queue is delivered through
+	 * the receive context of this device, as a DPAA port's. So it is the
+	 * port the state is bound to, which validation proved is one and the
+	 * caller holds -- for an inbound SA also the port its local endpoint
+	 * was found on above -- and never what an address lookup finds, which
+	 * can be a Wi-Fi VAP. */
+	sa->netdev = spec->dev;
 
 	rc = ipsec_install_fp_entry(sa);
 	if (rc) {

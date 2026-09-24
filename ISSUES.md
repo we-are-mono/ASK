@@ -237,6 +237,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A224.** Inbound IPsec read another driver's netdev private area as a DPAA port's: the driver's submit for ESP arriving on a bridge, VLAN-over-bridge or veth, and the exception queue for an SA whose local endpoint was on a Wi-Fi VAP —
+  fixed (_:/^sdk_dpaa, cdx: take a DPAA port's private area only from a DPAA port_).
+
 - [x] **A229.** get_ofport_info() collected an offline port's table types as bits of its flags word, where types 8, 9, 12 and 13 are OF_FQID_VALID, IN_USE and the port type —
   fixed (_:/^cdx: keep an offline port's table types out of its flags_).
 

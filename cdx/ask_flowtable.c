@@ -11430,6 +11430,8 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	if (rc) {
 		kfree(retirement);
 		kfree(watch);
+		if (rc == -EADDRNOTAVAIL)
+			NL_SET_ERR_MSG(extack, "cdx: an inbound SA's local address must be on the device it is offloaded to");
 		NL_SET_ERR_MSG_WEAK(extack, "cdx: the hardware refused this SA");
 		return rc;
 	}

@@ -21,7 +21,7 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				struct dpa_l2hdr_info *l2_info,
 				struct dpa_l3hdr_info *l3_info, uint32_t hash);
 int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * tx_fqid,
-		uint32_t * itf_id, uint32_t * portid , void **netdev, uint32_t hash);
+		uint32_t * itf_id, uint32_t * portid, uint32_t hash);
 struct dpa_priv_s *dpa_first_eth_priv(void);
 int dpa_get_mac_addr(char *name, char *mac_addr);
 uint32_t dpa_get_timestamp_addr(uint32_t id);
