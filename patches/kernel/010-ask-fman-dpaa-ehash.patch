@@ -1,4 +1,4 @@
-From c5aec0f9902369193a545780c80441f6cce3c58e Mon Sep 17 00:00:00 2001
+From 7a704549fe2befb0c8d3f06cdc1cfe4144440a10 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -13,15 +13,12 @@ sdk_dpaa, sdk_fman, drivers/staging/fsl_qbman) with ASK-specific
 EHASH extensions for hardware packet classification, declares
 the master CONFIG_CPE_FAST_PATH Kconfig in net/Kconfig, and extends the
 core kernel with the skb fields (abm_ff, expt_pkt, iif_index,
-underlying_iif/vlan_tci, ipsec_offload) and
-netdevice/net_device fields (wifi_offload_dev) plus the dev_queue_xmit
-hook infrastructure (dpaa_wifi_xmit_local_ipsec_handler,
-dpa_register_wifi_xmit_local_hook, original_dev_queue_xmit,
-dpa_add_dummy_eth_hdr) that downstream slices (020-080) consume.
+underlying_iif/vlan_tci, ipsec_offload) and the net_device field
+(wifi_offload_dev) that downstream slices (020-080) consume.
 
 Every cdx-registered hook has a matching unregister
-(dpa_unregister_ipsec_fq_handler, dpa_unregister_ceetm_get_egress_fq,
-dpa_unregister_wifi_xmit_local_hook) that clears the pointer and
+(dpa_unregister_ipsec_fq_handler, dpa_unregister_ceetm_get_egress_fq)
+that clears the pointer and
 synchronize_rcu()s before returning, so cdx deinit — including the
 failed-init unwind — can free module text safely and a later load can
 register again. Datapath readers take a READ_ONCE snapshot instead of
@@ -88,7 +85,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   31 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.c      |   71 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |   37 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 1059 +++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  958 ++++++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
@@ -151,7 +148,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/staging/fsl_qbman/qman_high.c         |   84 +-
  include/linux/fsl_oh_port.h                   |   26 +
  include/linux/fsl_qman.h                      |    6 +
- include/linux/netdevice.h                     |   43 +
+ include/linux/netdevice.h                     |   12 +
  include/linux/skbuff.h                        |   11 +
  .../uapi/linux/fmd/Peripherals/fm_ioctls.h    |   28 +
  .../linux/fmd/Peripherals/fm_pcd_ioctls.h     |   57 +-
@@ -159,11 +156,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/uapi/linux/if.h                       |    1 +
  include/uapi/linux/netlink.h                  |    6 +-
  net/Kconfig                                   |    9 +
- net/core/dev.c                                |  101 +-
+ net/core/dev.c                                |   63 +-
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   34 +-
- 81 files changed, 9334 insertions(+), 5161 deletions(-)
+ 81 files changed, 9164 insertions(+), 5161 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -646,7 +643,7 @@ index f46c243ff1b8..2c38096743a3 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..541b11962bab 100644
+index 4164644d3268..34f5b2322e89 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -53,6 +53,71 @@
@@ -948,7 +945,7 @@ index 4164644d3268..541b11962bab 100644
  					   struct dpa_priv_s *priv)
  {
  	int trans_offset = skb_transport_offset(skb);
-@@ -882,8 +1044,245 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
+@@ -882,8 +1044,237 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
  	put_page(npage);
  	return NULL;
  }
@@ -960,14 +957,6 @@ index 4164644d3268..541b11962bab 100644
 +
 +struct dpa_bp *skb_2bfreed_bpool_g; //if no recyclable skbs exist in skb fraglist, those should be freed back, SEC engine will add to this bman pool
 +EXPORT_SYMBOL(skb_2bfreed_bpool_g);
-+
-+static struct device* dpa_get_bp_device(void)
-+{
-+	if (skb_2bfreed_bpool_g)
-+		return skb_2bfreed_bpool_g->dev;
-+	else
-+		return NULL;
-+}
 +
 +/* 
 + *This functions unmaps all the mapped skb sg so far and stored in sgt.  
@@ -1194,7 +1183,7 @@ index 4164644d3268..541b11962bab 100644
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  		       struct sk_buff *skb, struct qm_fd *fd)
  {
-@@ -1030,9 +1429,626 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1030,9 +1421,533 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(skb_to_sg_fd);
  
@@ -1409,76 +1398,6 @@ index 4164644d3268..541b11962bab 100644
 +
 +EXPORT_SYMBOL(dpaa_submit_outb_pkt_to_SEC);
 +
-+/**
-+ * dpa_add_dummy_eth_hdr - Add dummy Ethernet header space to SKB
-+ * @skb_in: Pointer to SKB pointer (may be reallocated)
-+ * @priv_headroom: Private headroom to reserve (not used, for API compatibility)
-+ * @hdroom_realloc: Set to 1 if headroom was reallocated
-+ *
-+ * This function ensures there is space for an Ethernet header in the SKB
-+ * headroom for cellular interfaces that don't have a MAC header.
-+ * Returns 0 on success, negative on failure.
-+ */
-+int dpa_add_dummy_eth_hdr(struct sk_buff **skb_in, int priv_headroom,
-+			  unsigned char *hdroom_realloc)
-+{
-+	struct sk_buff *skb = *skb_in;
-+	struct ethhdr *eth;
-+	__be16 proto;
-+	int headroom_needed = ETH_HLEN + priv_headroom;
-+	int ipv;
-+
-+	/* Check if we have enough headroom */
-+	if (skb_headroom(skb) < headroom_needed) {
-+		struct sk_buff *new_skb;
-+
-+		new_skb = skb_realloc_headroom(skb, headroom_needed);
-+		if (!new_skb)
-+			return -ENOMEM;
-+
-+		dev_kfree_skb(skb);
-+		*skb_in = new_skb;
-+		skb = new_skb;
-+		*hdroom_realloc = 1;
-+	}
-+
-+	/* The skb_push()/memset() below writes the dummy Ethernet header in
-+	 * place into the head buffer. If that buffer is shared with a clone
-+	 * (e.g. a tcpdump tap on the cellular offload interface), COW it first
-+	 * so the capture is not corrupted. skb_cow_head() is a cheap
-+	 * skb_header_cloned() branch when the skb is not cloned; the realloc
-+	 * path above already yields a private head, so this never double-
-+	 * reallocs. It may reallocate skb->head, but leaves the skb struct
-+	 * pointer (and thus *skb_in) unchanged, so no propagation is needed.
-+	 * On failure return -ENOMEM like the realloc path; the caller then
-+	 * hands the packet back to Linux. */
-+	if (skb_cow_head(skb, 0))
-+		return -ENOMEM;
-+
-+	/* Determine IP version from first byte of packet */
-+	ipv = (skb->data[0] >> 4) & 0xf;
-+
-+	/* Set protocol based on IP version */
-+	if (ipv == 6)
-+		proto = htons(ETH_P_IPV6);
-+	else
-+		proto = htons(ETH_P_IP);
-+
-+	/* Push ethernet header space */
-+	eth = (struct ethhdr *)skb_push(skb, ETH_HLEN);
-+
-+	/* Initialize with dummy MAC addresses (will be overwritten later) */
-+	memset(eth->h_dest, 0, ETH_ALEN);
-+	memset(eth->h_source, 0, ETH_ALEN);
-+	eth->h_proto = proto;
-+
-+	/* Reset SKB pointers - caller will adjust data/len */
-+	skb_pull(skb, ETH_HLEN);
-+
-+	return 0;
-+}
-+EXPORT_SYMBOL(dpa_add_dummy_eth_hdr);
-+
 +/* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
 + * its private area. The ops table is the driver's own, and dpa_ndo_init is
 + * the one member of it exported, so no other driver's ops carry it: the test
@@ -1514,11 +1433,10 @@ index 4164644d3268..541b11962bab 100644
 +	struct dpa_priv_s	*priv = NULL;
 +	struct dpa_percpu_priv_s *percpu_priv = NULL;
 +	struct qm_fd		 fd;
-+	int err, ii, ret;
++	int err, ii;
 +	uint8_t tmp_len = 0, data[ETH_HLEN],ipvsn;
 +	struct net_device *netdev;
 +	struct device* dev;
-+	unsigned char hdroom_realloced = 0;
 +	struct net_device *real_dev = NULL;
 +	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
 +	 * concurrently; never read the global twice */
@@ -1600,32 +1518,11 @@ index 4164644d3268..541b11962bab 100644
 +		if (!priv)
 +			return -1;
 +
-+		if (skb->dev->wifi_offload_dev)
-+		{
-+			dev = dpa_get_bp_device();
-+			netdev = skb->dev;
-+			/* Following code is added for cellular interfaces */
-+			/* FIX :May be we can check for device type as ARPHRD_NONE */
-+			if (skb->mac_len == 0)
-+			{
-+				tmp_len = (skb->data - skb_network_header(skb));
-+				skb->len += tmp_len;
-+				skb->data = skb_network_header(skb);
-+				/* Add mac_header */
-+				ret = dpa_add_dummy_eth_hdr(&skb, 0, &hdroom_realloced);
-+				if (ret < 0)
-+					goto err_giveback;
-+
-+				skb->data -= ETH_HLEN;
-+				skb->len += ETH_HLEN;
-+				tmp_len += ETH_HLEN;
-+			}
-+		}
-+		else
-+		{
-+			dev = priv->dpa_bp->dev;
-+			netdev = priv->net_dev;
-+		}
++		/* Both arms above leave the state's own port in priv, so the
++		 * frame is mapped for that port's pool whatever device it
++		 * reached the stack by. */
++		dev = priv->dpa_bp->dev;
++		netdev = priv->net_dev;
 +		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, 0);
 +		if (unlikely(err < 0))
 +		{
@@ -1698,15 +1595,14 @@ index 4164644d3268..541b11962bab 100644
 +	return -1; /* give packet to linux */
 +
 +	/* Inbound offload failed after the branch above shifted skb->data/len
-+	 * (the ARPHRD_ETHER / ARPHRD_PPP reposition, or the mac_len==0
-+	 * dummy-header push). The skb is handed back to Linux, not consumed,
-+	 * so undo the shift first or Linux sees a packet with a shifted data
-+	 * pointer / inflated length. tmp_len is the accumulated shift delta;
-+	 * adjusting the live skb->data pointer (rather than restoring a saved
-+	 * one) stays correct across an intervening skb_cow_head() /
-+	 * skb_realloc_headroom() that may have reallocated the head. The PPP
-+	 * branch additionally rewrote ETH_HLEN bytes in place, so restore them
-+	 * from the backup before moving the pointer back. */
++	 * (the ARPHRD_ETHER / ARPHRD_PPP reposition). The skb is handed back to
++	 * Linux, not consumed, so undo the shift first or Linux sees a packet
++	 * with a shifted data pointer / inflated length. tmp_len is the shift
++	 * delta; adjusting the live skb->data pointer (rather than restoring a
++	 * saved one) stays correct across an intervening skb_cow_head() that
++	 * may have reallocated the head. The PPP branch additionally rewrote
++	 * ETH_HLEN bytes in place, so restore them from the backup before
++	 * moving the pointer back. */
 +err_giveback:
 +	if (skb->dev->type == ARPHRD_PPP)
 +		memcpy(skb->data, data, ETH_HLEN);
@@ -1822,7 +1718,7 @@ index 4164644d3268..541b11962bab 100644
  	int queue_mapping = dpa_get_queue_mapping(skb);
  	struct qman_fq *egress_fq, *conf_fq;
  
-@@ -1044,6 +2060,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1044,6 +1959,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
  		return NETDEV_TX_OK;
  #endif
  
@@ -1833,7 +1729,7 @@ index 4164644d3268..541b11962bab 100644
  	priv = netdev_priv(net_dev);
  
  #ifdef CONFIG_FSL_DPAA_CEETM
-@@ -1212,13 +2232,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1212,13 +2131,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  		 * but we need the skb to look as if returned by build_skb().
  		 * We need to manually adjust the tailptr as well.
  		 */
@@ -18255,7 +18151,7 @@ index c42bde697436..68225db4d865 100644
  }
  #endif
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index ea9b40b196de..c658c038556d 100644
+index ea9b40b196de..1591778c36f8 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -2075,6 +2075,10 @@ struct net_device {
@@ -18269,49 +18165,7 @@ index ea9b40b196de..c658c038556d 100644
  	int			ifindex;
  	unsigned int		real_num_rx_queues;
  	struct netdev_rx_queue	*_rx;
-@@ -3102,10 +3106,41 @@ u16 dev_pick_tx_zero(struct net_device *dev, struct sk_buff *skb,
- int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev);
- int __dev_direct_xmit(struct sk_buff *skb, u16 queue_id);
- 
-+#if defined(CONFIG_CPE_FAST_PATH)
-+int original_dev_queue_xmit(struct sk_buff *skb);
-+typedef int (*dpaa_wifi_xmit_local_hook_t)(struct sk_buff *skb);
-+int dpa_register_wifi_xmit_local_hook(dpaa_wifi_xmit_local_hook_t hookfn);
-+void dpa_unregister_wifi_xmit_local_hook(void);
-+int dpa_add_dummy_eth_hdr(struct sk_buff** skb_in, int priv_headroom, unsigned char *hdroom_realloc);
-+extern dpaa_wifi_xmit_local_hook_t dpaa_wifi_xmit_local_ipsec_handler;
-+
-+static inline int dev_queue_xmit(struct sk_buff *skb)
-+{
-+	/* snapshot: dpa_unregister_wifi_xmit_local_hook may NULL the hook
-+	 * concurrently; never read the global twice. This runs before
-+	 * __dev_queue_xmit's rcu_read_lock_bh, possibly in plain process
-+	 * context, so take an explicit read-side section for the
-+	 * unregister's synchronize_rcu */
-+	dpaa_wifi_xmit_local_hook_t wifi_xmit_hook;
-+
-+	rcu_read_lock();
-+	wifi_xmit_hook = READ_ONCE(dpaa_wifi_xmit_local_ipsec_handler);
-+	if (wifi_xmit_hook && skb->ipsec_offload &&
-+	    skb->dev->wifi_offload_dev) {
-+		int rc = wifi_xmit_hook(skb);
-+
-+		rcu_read_unlock();
-+		return rc;
-+	}
-+	rcu_read_unlock();
-+	return original_dev_queue_xmit(skb);
-+}
-+#else
- static inline int dev_queue_xmit(struct sk_buff *skb)
- {
- 	return __dev_queue_xmit(skb, NULL);
- }
-+#endif
- 
- static inline int dev_queue_xmit_accel(struct sk_buff *skb,
- 				       struct net_device *sb_dev)
-@@ -5311,6 +5346,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
+@@ -5311,6 +5315,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
  
  extern struct net_device *blackhole_netdev;
  
@@ -18575,7 +18429,7 @@ index a629f92dc86b..020d6dd73bca 100644
  source "net/ipv6/Kconfig"
  source "net/netlabel/Kconfig"
 diff --git a/net/core/dev.c b/net/core/dev.c
-index ce5a1ab86ab5..1aab6f06d9eb 100644
+index ce5a1ab86ab5..f7b66649feeb 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
 @@ -172,6 +172,10 @@ static int call_netdevice_notifiers_extack(unsigned long val,
@@ -18611,52 +18465,7 @@ index ce5a1ab86ab5..1aab6f06d9eb 100644
  		/* If packet is not checksummed and device does not
  		 * support checksumming for this protocol, complete
  		 * checksumming here.
-@@ -4587,6 +4598,44 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
- }
- EXPORT_SYMBOL(__dev_queue_xmit);
- 
-+#if defined(CONFIG_CPE_FAST_PATH)
-+/* WiFi IPSEC offload hook - allows cdx to intercept packets for IPSEC
-+ * processing when the packet is transmitted on a wifi interface.
-+ */
-+dpaa_wifi_xmit_local_hook_t dpaa_wifi_xmit_local_ipsec_handler;
-+EXPORT_SYMBOL(dpaa_wifi_xmit_local_ipsec_handler);
-+
-+/* Register a hook function for IPSEC offload on wifi interfaces */
-+int dpa_register_wifi_xmit_local_hook(dpaa_wifi_xmit_local_hook_t hookfn)
-+{
-+	if (dpaa_wifi_xmit_local_ipsec_handler) {
-+		pr_warn("%s: hook already registered\n", __func__);
-+		return -1;
-+	}
-+	/* release-publish so readers can't see the hook before the vwd
-+	 * state it uses is initialized */
-+	smp_store_release(&dpaa_wifi_xmit_local_ipsec_handler, hookfn);
-+	return 0;
-+}
-+EXPORT_SYMBOL(dpa_register_wifi_xmit_local_hook);
-+
-+/* Unregister the IPSEC offload hook. Waits out in-flight xmit readers
-+ * so the hook's module text may be freed once this returns. */
-+void dpa_unregister_wifi_xmit_local_hook(void)
-+{
-+	WRITE_ONCE(dpaa_wifi_xmit_local_ipsec_handler, NULL);
-+	synchronize_rcu();
-+}
-+EXPORT_SYMBOL(dpa_unregister_wifi_xmit_local_hook);
-+
-+/* Original dev_queue_xmit - called when wifi hook is not applicable */
-+int original_dev_queue_xmit(struct sk_buff *skb)
-+{
-+	return __dev_queue_xmit(skb, NULL);
-+}
-+EXPORT_SYMBOL(original_dev_queue_xmit);
-+#endif
-+
- int __dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
- {
- 	struct net_device *dev = skb->dev;
-@@ -5595,6 +5644,14 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
+@@ -5595,6 +5606,14 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
  
  	trace_netif_receive_skb(skb);
  
@@ -18671,7 +18480,7 @@ index ce5a1ab86ab5..1aab6f06d9eb 100644
  	orig_dev = skb->dev;
  
  	skb_reset_network_header(skb);
-@@ -6936,8 +6993,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
+@@ -6936,8 +6955,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
  		napi_gro_flush(n, HZ >= 1000);
  	}
  
@@ -18680,7 +18489,7 @@ index ce5a1ab86ab5..1aab6f06d9eb 100644
  	/* Some drivers may have called napi_schedule
  	 * prior to exhausting their budget.
  	 */
-@@ -11093,10 +11148,44 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
+@@ -11093,10 +11110,44 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
  			storage->rx_otherhost_dropped += READ_ONCE(core_stats->rx_otherhost_dropped);
  		}
  	}

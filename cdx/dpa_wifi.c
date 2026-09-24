@@ -409,7 +409,7 @@ static void vwd_send_to_vap(struct sk_buff* skb)
 	skb_reset_mac_header(skb);
 	skb_set_network_header(skb, sizeof(struct ethhdr));
 	skb->priority = 0;
-	original_dev_queue_xmit(skb);
+	dev_queue_xmit(skb);
 	return;
 }
 

@@ -117,10 +117,6 @@ static unsigned char *skb_mac_header(const struct sk_buff *skb)
 {
 	return skb->head + skb->mac_header;
 }
-static unsigned char *skb_network_header(const struct sk_buff *skb)
-{
-	return skb->head + skb->network_header;
-}
 static struct net *dev_net(const struct net_device *dev) { (void)dev; return &init_net; }
 
 static int skb_cow_head(struct sk_buff *skb, unsigned int headroom)
@@ -128,19 +124,6 @@ static int skb_cow_head(struct sk_buff *skb, unsigned int headroom)
 	(void)skb; (void)headroom;
 	bench.cows++;
 	return 0;
-}
-
-/* The pool SEC takes a Wi-Fi VAP's frames from. */
-static struct device shared_pool_dev;
-static struct device *dpa_get_bp_device(void) { return &shared_pool_dev; }
-
-/* Only a Wi-Fi device without an Ethernet header gets one made up, and no
- * frame here is one. */
-static int dpa_add_dummy_eth_hdr(struct sk_buff **skb, int headroom, unsigned char *realloc)
-{
-	(void)skb; (void)headroom; (void)realloc;
-	assert(!"a dummy Ethernet header was asked for");
-	return -1;
 }
 
 static int skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
@@ -339,14 +322,10 @@ static void test_ports(void)
 	taken(submit(), &eth3_priv, &eth3_dma);
 	assert(skb.data == buffer + 4 && skb.len == 100 + 34);
 
-	/* A port VWD was pointed at -- nothing on that path needs a radio --
-	 * is mapped for the shared pool, and counted as the port's all the
-	 * same. */
+	/* The other port, for a state bound to it: its own pool. */
 	sa.xso.dev = &eth4;
-	eth4.wifi_offload_dev = &vap_desc;
 	frame(&eth4, 14, 14);
-	taken(submit(), &eth4_priv, &shared_pool_dev);
-	eth4.wifi_offload_dev = NULL;
+	taken(submit(), &eth4_priv, &eth4_dma);
 
 	/* A PPPoE session on it: the Ethernet header rebuilt in front. */
 	session(&eth4);

@@ -1,4 +1,4 @@
-From afde617fc5c9fd3c783ce870f994ba71be91bcf5 Mon Sep 17 00:00:00 2001
+From a951b0b9d05a9b501445ad01cdae6d3cd7f02930 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 23 Aug 2026 18:48:54 +0200
 Subject: [PATCH] sdk: build the vendored SDK on stock mainline
@@ -7,8 +7,8 @@ The vendored NXP DPAA SDK drivers (sdk_fman, sdk_dpaa, staging/fsl_qbman)
 target the NXP LSDK kernel, which carries wiring and APIs that stock
 mainline lacks. Bundle every change needed to build the SDK overlay on a
 stock kernel.org tree into one ASK-owned patch; each consumer that bases
-on mainline (rather than the NXP vendor tag) needs it. Folds five
-previously-separate OpenWrt build-compat patches (705/710/711/712/713).
+on mainline (rather than the NXP vendor tag) needs it. Folds four
+previously-separate OpenWrt build-compat patches (705/710/712/713).
 
 Driver wiring (ex-705):
  - source the sdk_fman/sdk_dpaa Kconfigs and add their obj-$() entries
@@ -39,12 +39,6 @@ SDK source alignment (sdk_dpaa/mac.c):
    macro in this patch would collapse 702's switch cases onto the 2500BASEX
    cases (duplicate-case build error) once a 702-carrying tree consumes it.
 
-Warning hygiene (ex-711):
- - mark dpa_get_bp_device() __maybe_unused; it is only called from the SEC
-   inbound path, compiled out when CPE_FAST_PATH is disabled, so an
-   SDK-only (fast-path-off) build would otherwise trip
-   -Werror=unused-function.
-
 Board support (ex-712):
  - swphy: decode a 10000 Mbit/s fixed-link like 1000 (no distinct 10G MII
    code). The Mono Gateway's 10G (xfi) MACs use fixed-link 10000; mainline
@@ -72,7 +66,6 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  arch/arm64/include/asm/pgtable.h              |  7 +++++
  drivers/net/ethernet/freescale/Kconfig        |  2 ++
  drivers/net/ethernet/freescale/Makefile       |  2 ++
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  2 +-
  drivers/net/ethernet/freescale/sdk_dpaa/mac.c |  4 +--
  drivers/net/phy/phylink.c                     |  3 ++-
  drivers/net/phy/swphy.c                       |  1 +
@@ -82,7 +75,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/linux/skbuff.h                        |  1 +
  net/core/rtnetlink.c                          |  1 +
  net/core/skbuff.c                             | 26 +++++++++++++++++++
- 14 files changed, 53 insertions(+), 4 deletions(-)
+ 13 files changed, 52 insertions(+), 3 deletions(-)
 
 diff --git a/arch/arm64/include/asm/io.h b/arch/arm64/include/asm/io.h
 index 46bd37707e08..8ad3052680f6 100644
@@ -142,19 +135,6 @@ index d0a259e47960..966141be7f9a 100644
  
  obj-y += dpaa2/
  obj-y += enetc/
-diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index d2a0bbc1e71f..d0d33d17e558 100644
---- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-+++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -1055,7 +1055,7 @@ EXPORT_SYMBOL(sg_bpool_g);
- struct dpa_bp *skb_2bfreed_bpool_g; //if no recyclable skbs exist in skb fraglist, those should be freed back, SEC engine will add to this bman pool
- EXPORT_SYMBOL(skb_2bfreed_bpool_g);
- 
--static struct device* dpa_get_bp_device(void)
-+static struct device __maybe_unused *dpa_get_bp_device(void)
- {
- 	if (skb_2bfreed_bpool_g)
- 		return skb_2bfreed_bpool_g->dev;
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/mac.c b/drivers/net/ethernet/freescale/sdk_dpaa/mac.c
 index 3163fd8e6b0e..a2b87f33e5dd 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/mac.c
@@ -238,10 +218,10 @@ index 5c01048860c4..50fec86d1b22 100644
  /**
   * struct phylink_mac_ops - MAC operations structure.
 diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
-index 46498bc4a9b2..42513e250c7f 100644
+index 956bc8ad25dd..5d520c71e93c 100644
 --- a/include/linux/skbuff.h
 +++ b/include/linux/skbuff.h
-@@ -1341,6 +1341,7 @@ static inline void consume_skb(struct sk_buff *skb)
+@@ -1337,6 +1337,7 @@ static inline void consume_skb(struct sk_buff *skb)
  #endif
  
  void __consume_stateless_skb(struct sk_buff *skb);
@@ -262,7 +242,7 @@ index a13e87558d0e..fa1f9d704c75 100644
  void rtmsg_ifinfo_newnet(int type, struct net_device *dev, unsigned int change,
  			 gfp_t flags, int *new_nsid, int new_ifindex)
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index b76f9c813689..baaddb8521fb 100644
+index cef20afbc891..8781900e75ae 100644
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
 @@ -1515,6 +1515,32 @@ void napi_consume_skb(struct sk_buff *skb, int budget)

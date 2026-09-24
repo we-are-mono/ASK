@@ -1,4 +1,4 @@
-From 0fddc66544789c44f6aa9c51b158f25993cbb3a3 Mon Sep 17 00:00:00 2001
+From 8e57526e5e2d05edfc6d308f7ef583c62bb9ad0c Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 23:30:35 +0200
 Subject: [PATCH] sdk_dpaa: hold RCU across the offload module's transmit hooks
@@ -25,7 +25,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 61 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index ba13b912a131..6a4d92ba9dee 100644
+index a54f30068c98..87c67e0cfe4b 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -82,7 +82,10 @@ int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_
@@ -53,7 +53,7 @@ index ba13b912a131..6a4d92ba9dee 100644
  void dpa_unregister_ipsec_fq_handler(void)
  {
  	WRITE_ONCE(cdx_get_ipsec_fq_hookfn, NULL);
-@@ -1577,11 +1582,7 @@ static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
+@@ -1569,11 +1574,7 @@ static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
  	return true;
  }
  
@@ -66,7 +66,7 @@ index ba13b912a131..6a4d92ba9dee 100644
  {
  	struct xfrm_state *x;
  	struct qman_fq *egress_fq = NULL;
-@@ -1688,6 +1689,24 @@ __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *ne
+@@ -1680,6 +1681,24 @@ __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *ne
  	return err;
  }
  
@@ -90,8 +90,8 @@ index ba13b912a131..6a4d92ba9dee 100644
 +}
  EXPORT_SYMBOL(dpaa_submit_outb_pkt_to_SEC);
  
- /**
-@@ -1789,7 +1808,8 @@ static bool dpa_inb_port_ok(const struct net_device *port,
+ /* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
+@@ -1711,7 +1730,8 @@ static bool dpa_inb_port_ok(const struct net_device *port,
   * that could not be queued -- and the skb is exactly as it came, for
   * xfrm_input() to decide what becomes of it.
   */
@@ -101,7 +101,7 @@ index ba13b912a131..6a4d92ba9dee 100644
  {
  	struct qman_fq *sec_fq = NULL;
  	struct dpa_priv_s	*priv = NULL;
-@@ -1955,13 +1975,26 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+@@ -1854,13 +1874,26 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  	skb->data += tmp_len;
  	return -1; /* give packet to linux */
  }
@@ -129,7 +129,7 @@ index ba13b912a131..6a4d92ba9dee 100644
  {
  	struct dpa_priv_s	*priv;
  	struct dpa_percpu_priv_s *percpu_priv;
-@@ -2050,6 +2083,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1949,6 +1982,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  	conf_fq = priv->conf_fqs[queuenum  & (DPAA_ETH_TX_QUEUES-1)];
  	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
  }
