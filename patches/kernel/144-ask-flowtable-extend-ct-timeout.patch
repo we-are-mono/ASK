@@ -1,4 +1,4 @@
-From c0635c25c16ee0acb6fcfb04e4b4749e168bccc9 Mon Sep 17 00:00:00 2001
+From bec69495292bd9e31771b4392aff78143ab0e473 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 01:01:33 +0200
 Subject: [PATCH] netfilter: flowtable: extend offloaded conntrack timeouts
@@ -39,10 +39,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  3 files changed, 116 insertions(+), 19 deletions(-)
 
 diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
-index 6bee6dccf84e..1c3b1e0add95 100644
+index 8cb70e7485e2..3bed3970e414 100644
 --- a/include/net/netfilter/nf_conntrack.h
 +++ b/include/net/netfilter/nf_conntrack.h
-@@ -369,16 +369,6 @@ static inline bool nf_ct_should_gc(const struct nf_conn *ct)
+@@ -325,16 +325,6 @@ static inline bool nf_ct_should_gc(const struct nf_conn *ct)
  
  #define	NF_CT_DAY	(86400 * HZ)
  
@@ -58,12 +58,12 @@ index 6bee6dccf84e..1c3b1e0add95 100644
 -
  struct kernel_param;
  
- #if defined(CONFIG_CPE_FAST_PATH)
+ int nf_conntrack_set_hashsize(const char *val, const struct kernel_param *kp);
 diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
-index cef394777efc..6a2174fd2dd8 100644
+index 0c457e159727..dcac5fe0f6c8 100644
 --- a/net/netfilter/nf_conntrack_core.c
 +++ b/net/netfilter/nf_conntrack_core.c
-@@ -1514,12 +1514,6 @@ static void gc_worker(struct work_struct *work)
+@@ -1515,12 +1515,6 @@ static void gc_worker(struct work_struct *work)
  
  			tmp = nf_ct_tuplehash_to_ctrack(h);
  
@@ -77,10 +77,10 @@ index cef394777efc..6a2174fd2dd8 100644
  				rcu_read_unlock();
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 4c8e07a6e4ee..e43ee1b1bd95 100644
+index 443af858af92..06058722a256 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -360,7 +360,7 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+@@ -364,7 +364,7 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
  		return err;
  	}
  
@@ -89,7 +89,7 @@ index 4c8e07a6e4ee..e43ee1b1bd95 100644
  
  	if (nf_flowtable_hw_offload(flow_table)) {
  		__set_bit(NF_FLOW_HW, &flow->flags);
-@@ -412,8 +412,9 @@ void flow_offload_teardown(struct flow_offload *flow)
+@@ -416,8 +416,9 @@ void flow_offload_teardown(struct flow_offload *flow)
  	 * collector calls this again on every pass while the flow waits for its
  	 * hardware retirement, and a tuple reopened in the meantime has already
  	 * given the conntrack to a new flow, which the repeat would rob of the
@@ -101,7 +101,7 @@ index 4c8e07a6e4ee..e43ee1b1bd95 100644
  	 * reaches the software path to set the bit again.
  	 */
  	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
-@@ -489,6 +490,116 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+@@ -493,6 +494,116 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
  	return flow_table->type->gc && flow_table->type->gc(flow);
  }
  
@@ -218,7 +218,7 @@ index 4c8e07a6e4ee..e43ee1b1bd95 100644
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
-@@ -511,6 +622,8 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+@@ -515,6 +626,8 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  
  	if (retire)
  		flow_offload_teardown(flow);
