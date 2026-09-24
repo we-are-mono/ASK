@@ -684,18 +684,27 @@ int main(void)
     refresh();
     assert(hardware.live && hardware.copies == 2 && g->offloaded);
 
-    /* A router netdev unregisters: release its borrowed plan references
-     * synchronously, then rederive without it and retire the stale root. The
-     * entry keeps its own hold on the ingress until it is deleted. */
-    rtnl_lock();
-    ft_mr_device_gone(&output[1]);
-    rtnl_unlock();
-    assert(input.refs == 1 && !output[0].refs && !output[1].refs);
-    assert(!ft_mr_taps_stale);   /* a port: the VIFs on bridges stand */
-    wanted = 1;
-    run();
-    assert(hardware.live && hardware.copies == 1 && output[0].refs == 1);
-    assert(input.refs == 2);
+    /* A router netdev unregisters: the copies' references are let go of
+     * synchronously, and the ingress, which is still the entry's key, is
+     * kept. So the rederivation without it swaps the chain under the same
+     * root -- one replace, no delete and add -- and the stream never leaves
+     * hardware for a listener it did not lose. */
+    {
+        unsigned a0 = adds, r0 = replaces, d0 = deletes;
+
+        rtnl_lock();
+        ft_mr_device_gone(&output[1]);
+        rtnl_unlock();
+        assert(input.refs == 2 && g->in == &input && g->hw_in == &input);
+        assert(!output[0].refs && !output[1].refs && !g->listeners);
+        assert(!g->hw_spec.listeners);   /* no drain may replay it */
+        assert(!ft_mr_taps_stale);   /* a port: the VIFs on bridges stand */
+        wanted = 1;
+        run();
+        assert(replaces == r0 + 1 && adds == a0 && deletes == d0);
+        assert(hardware.live && hardware.copies == 1 && output[0].refs == 1);
+        assert(input.refs == 2 && g->state == FT_MR_INSTALLED);
+    }
 
     /* The ingress itself unregisters. The group lets go of its reference at
      * once; the entry, which the delete goes through, keeps its own until

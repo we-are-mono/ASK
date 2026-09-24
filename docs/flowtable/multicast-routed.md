@@ -217,7 +217,13 @@ Two further rules, both `refused-listener`:
 At most `CDX_MC_MAX_LISTENERS` listeners in total, which is eight — counted in
 copies rather than in ports, since one port can be several of them. An oif
 whose VIF has been removed is dropped rather than refused, because what is left
-is a shorter replication list; an empty one is `refused-listener`.
+is a shorter replication list; an empty one is `refused-listener`. A VIF whose
+device is no longer registered in `init_net` counts as removed even before the
+`FIB_EVENT_VIF_DEL` saying so has reached the learner: ipmr and ip6mr delete a
+device's VIFs in the RTNL hold that unregisters it or moves it to another
+namespace, and the derivation runs under RTNL. A VLAN device on its way out
+has already been unlinked from its port, so walking it instead would fail and
+refuse the whole group for the one copy it lost.
 
 **The MTU.** No copy may leave by a path narrower than the parent VIF. Each
 listener's entry ends in `ENQUEUE_PKT`, which fragments a replica larger than
@@ -577,7 +583,7 @@ family over:
 | Its parent or thresholds | `FIB_EVENT_ENTRY_REPLACE` | re-derived; a changed ingress is a delete and an add, because the port is part of the key and `cdx_mc_group_replace()` refuses a changed one |
 | A VIF added or removed | `FIB_EVENT_VIF_*` | every group of that family re-derived: an index only means anything against the table it indexes |
 | A policy rule | `FIB_EVENT_RULE_*` | the family's count moves and every group re-derived |
-| A port down or unregistering | the netdev chain, beside `ft_mc_device_gone()` | the group's references released synchronously and the group re-derived; an installed entry keeps its own hold on its ingress until the worker deletes it, because the backend deletes through that device, so unregistration waits only for the worker it scheduled |
+| A port down or unregistering | the netdev chain, beside `ft_mc_device_gone()` | the group's references on it released synchronously and the group re-derived. A port the group copies out of takes only the copies half of the set with it — the listeners and the recorded spec that borrows them — and the ingress stays, so when what is left can still be carried the re-derivation swaps the chain under the same root rather than reading a released ingress as a new key. That is a port that went away with its VIF. One that is only down, or has lost carrier, is still an oif ipmr forwards to and still a listener of the set, and a set with a port that cannot carry is refused whole (`cdx_mc_port_supported()`): the group leaves hardware and is tried again at each refresh up to the retry ceiling, and whenever a port comes back up. The ingress's own port releases the whole set; the installed entry keeps its own hold on the ingress until the worker deletes it, because the backend deletes through that device, so unregistration waits only for the worker it scheduled |
 | A port coming back up | the netdev chain | re-derived; nothing else would ever reconsider a refused group, because the MFC entry does not change and no frame re-offers it |
 | A device MTU | `NETDEV_CHANGEMTU` | every group re-derived, installed ones included; a copy narrower than its parent VIF takes the group out as `refused-mtu` |
 | The IPv6 MTU sysctl | nothing reports it | the five-second refresh re-derives every group, which finds it |
@@ -891,7 +897,7 @@ same path with every counter read by hand.
 | Oif a VLAN sub-interface — tag on the wire | `listeners=eth3/244`; **1488 of 1500** captured on the LAN VM's own sub-interface, so the tag the entry inserts is the one the peer demultiplexes on |
 | Oif a bridge, snooping off — flood set | passes; the bridge's one flood-enabled port becomes the one listener |
 | Two oifs on one port, untagged and tagged — both copies counted (A158) | passes; the row names **two** listeners, `eth3/0,eth3/244`, and the two copies are counted separately |
-| One of those two dropped — the chain swap (A158) | passes; deleting the VLAN device withdraws its VIF and the group is re-derived onto the remaining listener without leaving hardware |
+| One of those two dropped — the chain swap (A158) | passes on the row and its listener count; deleting the VLAN device withdraws its VIF and the group is re-derived onto the remaining listener. That oracle cannot tell a chain swap from the group leaving hardware and coming back, which is what the learner did until A221; the case now also requires `mroute_refused` to stand still across it |
 | A non-default ipmr rule present | measured: the group goes to **`refused-policy`** and out of hardware the moment `ip -4 mrule add iif eth4 lookup 199` lands, and is readmitted when the rule is withdrawn |
 | The route removed | group retired, `/proc` row gone, `offload` gone |
 | KASAN, lockdep, kmemleak across every run above | **no reports** |

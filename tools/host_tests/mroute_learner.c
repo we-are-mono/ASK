@@ -165,7 +165,21 @@ struct net_device {
     union nf_inet_addr joined[4];
     unsigned joins;
     bool joined_v6;
+    /* How far unregistration has got, and the namespace the device is in:
+     * either one leaving init_net's registered set is ipmr deleting every
+     * VIF that names the device. */
+    int reg_state;
+    struct net *nd_net;
 };
+
+#define NETREG_REGISTERED 1
+#define NETREG_UNREGISTERING 2
+struct net { int unused; };
+static struct net init_net, other_net;
+__attribute__((unused))
+static struct net *dev_net(const struct net_device *d) { return d->nd_net; }
+__attribute__((unused))
+static bool net_eq(const struct net *a, const struct net *b) { return a == b; }
 
 struct ft_lower { struct list_head list; struct net_device *dev; };
 static struct ft_lower lower_pool[64];
@@ -435,6 +449,8 @@ static void dev_init(struct net_device *d, const char *name, int ifindex)
     strscpy(d->name, name, sizeof(d->name));
     d->ifindex = ifindex;
     d->mtu = 1500;
+    d->reg_state = NETREG_REGISTERED;
+    d->nd_net = &init_net;
     INIT_LIST_HEAD(&d->lowers);
 }
 
@@ -1133,6 +1149,75 @@ int main(void)
     vif_set(AF_INET, 1, &LAN, 0);
     vif_set(AF_INET, 0, NULL, 0);
     assert(refuse(g) == FT_MR_REFUSED_INGRESS);
+    free(g);
+
+    /* `ip link del` of a VLAN oif while the worker waits for RTNL. In the
+     * one RTNL hold the VLAN device is unlinked from its port and
+     * unregistered, and ipmr deletes its VIF -- but the VIF_DEL saying so is
+     * still queued, so the mirror names the device when the derivation
+     * runs. That VIF is gone as far as ipmr is concerned: it is dropped,
+     * and the group keeps the listener that is left, rather than being
+     * refused for a device it can no longer walk. */
+    reset();
+    g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 7), 0);
+    vif_set(AF_INET, 0, &WAN, 0);
+    vif_set(AF_INET, 1, &LAN, 0);
+    vif_set(AF_INET, 2, &VLAN_LAN, 0);
+    oif(g, 1, 1);
+    oif(g, 2, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 2);
+    ft_mr_plan_put(&plan);
+    INIT_LIST_HEAD(&VLAN_LAN.lowers);   /* netdev_upper_dev_unlink() */
+    VLAN_LAN.reg_state = NETREG_UNREGISTERING;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN &&
+           plan.spec.listener[0].vlans == 0);
+    /* And the confirmation list agrees: only the oif ipmr still forwards to
+     * has to have been seen. */
+    assert(plan.oif_count == 1 && plan.oif[0] == LAN.ifindex);
+    ft_mr_plan_put(&plan);
+    /* A device moved to another namespace takes its VIFs with it the same
+     * way -- ipmr sees NETDEV_UNREGISTER -- while it is still registered. */
+    reset();
+    vif_set(AF_INET, 0, &WAN, 0);
+    vif_set(AF_INET, 1, &LAN, 0);
+    vif_set(AF_INET, 2, &VLAN_LAN, 0);
+    VLAN_LAN.nd_net = &other_net;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN);
+    ft_mr_plan_put(&plan);
+    /* And a parent that went is the ingress refusal it always was. */
+    VLAN_LAN.nd_net = &init_net;
+    WAN.reg_state = NETREG_UNREGISTERING;
+    assert(refuse(g) == FT_MR_REFUSED_INGRESS);
+    free(g);
+    /* ip6mr deletes a device's MIFs the same way, in its own table. */
+    reset();
+    g = group6(&MFC6, ip6(0xfc00, 0x99), ip6(0xff1e, 0x07), 0);
+    vif_set(AF_INET6, 0, &WAN, 0);
+    vif_set(AF_INET6, 1, &LAN, 0);
+    vif_set(AF_INET6, 2, &VLAN_LAN, 0);
+    oif(g, 1, 1);
+    oif(g, 2, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 2);
+    ft_mr_plan_put(&plan);
+    INIT_LIST_HEAD(&VLAN_LAN.lowers);
+    VLAN_LAN.reg_state = NETREG_UNREGISTERING;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN &&
+           plan.spec.listener[0].vlans == 0);
+    assert(plan.oif_count == 1 && plan.oif[0] == LAN.ifindex);
+    ft_mr_plan_put(&plan);
+    /* The IPv4 table is not the one this group is derived from. */
+    reset();
+    vif_set(AF_INET6, 0, &WAN, 0);
+    vif_set(AF_INET6, 1, &LAN, 0);
+    vif_set(AF_INET, 2, &VLAN_LAN, 0);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN);
+    ft_mr_plan_put(&plan);
     free(g);
 
     /* ---- an oif that is a bridge -------------------------------------- */

@@ -645,6 +645,16 @@ async def mroute_proc_row(target_agent, session, group: str) -> str:
     return ""
 
 
+async def mroute_refused(target_agent, session) -> int:
+    """How many times a routed group has gone to a refusal from a state that
+    was not one. A group taken out of hardware and put back counts here even
+    when it ends as it began."""
+    m = re.search(r"^mroute_refused (\d+)$",
+                  await flowtable_proc(target_agent, session), re.MULTILINE)
+    assert m, "/proc/cdx_flowtable has no mroute_refused line"
+    return int(m.group(1))
+
+
 @pytest_asyncio.fixture
 async def smcrouted(aiohttp_session, target_agent):
     """A running smcrouted with a VIF on exactly the interfaces a case names.
@@ -1030,7 +1040,9 @@ async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
         # `smcroutectl add` for the same (S,G) cannot stand in for it -- it
         # does not shrink an oif list, it leaves the route as it was, which is
         # what an earlier revision of this case asserted against and what the
-        # rig reported back.
+        # rig reported back. Swapped, not withdrawn and put back: the row alone
+        # cannot tell the two apart, the refusal count can.
+        refused = await mroute_refused(target_agent, aiohttp_session)
         await _exec(target_agent, aiohttp_session, "ip", "link", "del", dut_if)
         await asyncio.sleep(3.0)
         row = await mroute_proc_row(target_agent, aiohttp_session, group)
@@ -1039,6 +1051,9 @@ async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
         listeners = re.search(r"listeners=(\S+)", row)
         assert listeners and listeners.group(1).count(TARGET_LAN_IF) == 1, (
             f"{group}: the replaced set still names two listeners: {row!r}")
+        assert await mroute_refused(target_agent, aiohttp_session) == refused, (
+            f"{group}: the group left hardware to lose an oif rather than "
+            f"having its chain swapped: {row!r}")
 
         await _exec(target_agent, aiohttp_session, "smcroutectl", "remove",
                     TARGET_WAN_IF, source, group)

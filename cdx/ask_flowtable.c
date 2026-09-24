@@ -8699,6 +8699,30 @@ static void ft_mr_plan_put(struct ft_mr_plan *plan)
 	memset(plan, 0, sizeof(*plan));
 }
 
+/* The device VIF `ct` names, as ipmr and ip6mr see it now. Called under RTNL.
+ *
+ * The mirror is applied by the worker from a queue the chain fills under RTNL,
+ * so a derivation that takes RTNL straight after a device went -- its worker
+ * had picked the group and was waiting for the lock -- still finds the VIF
+ * the device's removal deleted. ipmr and ip6mr delete every VIF naming a
+ * device on NETDEV_UNREGISTER, in the RTNL hold that takes it off
+ * NETREG_REGISTERED or out of the namespace, so under RTNL a mirrored device
+ * no longer registered here is exactly a VIF the kernel has removed, and is
+ * answered like one. The queued VIF_DEL lets go of it on the next pass. */
+static struct net_device *ft_mr_vif_dev(unsigned int idx, int ct)
+{
+	struct net_device *dev;
+
+	ASSERT_RTNL();
+	if (ct < 0 || ct >= MAXVIFS)
+		return NULL;
+	dev = ft_mr_vif[idx][ct].dev;
+	if (dev && (READ_ONCE(dev->reg_state) != NETREG_REGISTERED ||
+		    !net_eq(dev_net(dev), &init_net)))
+		return NULL;
+	return dev;
+}
+
 /* The whole contract, in the order an operator would want it answered.
  *
  * Runs under RTNL with neither learner mutex held, and touches no hardware.
@@ -8733,7 +8757,7 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	 * policy rule, a host membership or its MTU gathers its confirmations
 	 * meanwhile, and is carried the moment it is otherwise eligible. */
 	for (ct = mfc->mfc_un.res.minvif; ct < mfc->mfc_un.res.maxvif; ct++) {
-		struct net_device *oif = ct < MAXVIFS ? ft_mr_vif[idx][ct].dev : NULL;
+		struct net_device *oif = ft_mr_vif_dev(idx, ct);
 
 		if (mfc->mfc_un.res.ttls[ct] != 255 && oif)
 			plan->oif[plan->oif_count++] = oif->ifindex;
@@ -8742,8 +8766,7 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	 * rule -- fw4's zones are -- judges a stream by where it comes from,
 	 * so copies seen from one parent confirm nothing for another. No
 	 * device is no index, which no copy arrives by. */
-	vif_dev = mfc->mfc_parent < MAXVIFS ?
-		  ft_mr_vif[idx][mfc->mfc_parent].dev : NULL;
+	vif_dev = ft_mr_vif_dev(idx, mfc->mfc_parent);
 	plan->parent = vif_dev ? vif_dev->ifindex : 0;
 	plan->oifs_known = true;
 	/* A policy rule that is not the default one can send a stream to a
@@ -8766,7 +8789,7 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	 * and the hardware would be asked to forward onto nothing. */
 	bad_flags = g->family == AF_INET6 ? MIFF_REGISTER :
 					    (VIFF_TUNNEL | VIFF_REGISTER);
-	vif_dev = ft_mr_vif[idx][mfc->mfc_parent].dev;
+	vif_dev = ft_mr_vif_dev(idx, mfc->mfc_parent);
 	if (!vif_dev || (ft_mr_vif[idx][mfc->mfc_parent].flags & bad_flags))
 		return FT_MR_REFUSED_INGRESS;
 	spec.in = ft_mr_ingress_port(vif_dev, &in);
@@ -8795,7 +8818,7 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	 * never comes back up: a process on the router listening there would
 	 * be starved. */
 	for (ct = mfc->mfc_un.res.minvif; ct < mfc->mfc_un.res.maxvif; ct++) {
-		struct net_device *oif = ct < MAXVIFS ? ft_mr_vif[idx][ct].dev : NULL;
+		struct net_device *oif = ft_mr_vif_dev(idx, ct);
 
 		if (mfc->mfc_un.res.ttls[ct] != 255 && oif &&
 		    ft_mr_host_member(oif, g->family, &g->dst))
@@ -8819,14 +8842,15 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 			return FT_MR_REFUSED_THRESHOLD;
 		if (ct == mfc->mfc_parent)
 			return FT_MR_REFUSED_LISTENER;
-		if (ft_mr_vif[idx][ct].flags & bad_flags)
-			return FT_MR_REFUSED_LISTENER;
-		oif = ft_mr_vif[idx][ct].dev;
+		oif = ft_mr_vif_dev(idx, ct);
 		/* A VIF the kernel has removed is dropped rather than
 		 * refused: what is left is a smaller replication list, and an
-		 * empty one is caught below. */
+		 * empty one is caught below. Whatever flags it had went with
+		 * it. */
 		if (!oif)
 			continue;
+		if (ft_mr_vif[idx][ct].flags & bad_flags)
+			return FT_MR_REFUSED_LISTENER;
 		rc = ft_mr_expand(oif, &in, g->family, &g->src, &g->dst,
 				  spec.listener, &spec.listeners, &out_mtu,
 				  &plan->out_bridged);
@@ -9813,7 +9837,9 @@ static bool ft_mr_counters(struct ft_mr_group *g, struct cdx_ft_counters *c,
 	return false;
 }
 
-static void ft_mr_release_set(struct ft_mr_group *g)
+/* The copies half of the installed set: the listeners, what was derived from
+ * them, and the recorded spec, which borrows them. */
+static void ft_mr_release_copies(struct ft_mr_group *g)
 {
 	u8 i;
 
@@ -9822,6 +9848,14 @@ static void ft_mr_release_set(struct ft_mr_group *g)
 			dev_put(g->listener[i].dev);
 	memset(g->listener, 0, sizeof(g->listener));
 	g->listeners = 0;
+	g->mtu = 0;
+	g->oifs[0] = '\0';
+	memset(&g->hw_spec, 0, sizeof(g->hw_spec));
+}
+
+static void ft_mr_release_set(struct ft_mr_group *g)
+{
+	ft_mr_release_copies(g);
 	if (g->in)
 		dev_put(g->in);
 	g->in = NULL;
@@ -9832,10 +9866,6 @@ static void ft_mr_release_set(struct ft_mr_group *g)
 	g->via = NULL;
 	g->via_vid = 0;
 	g->via_tagged = false;
-	g->mtu = 0;
-	g->oifs[0] = '\0';
-	/* It borrowed the devices just let go of. */
-	memset(&g->hw_spec, 0, sizeof(g->hw_spec));
 }
 
 static void ft_mr_group_free(struct ft_mr_group *g)
@@ -9863,12 +9893,19 @@ static void ft_mr_group_free(struct ft_mr_group *g)
 /* A device this learner holds is going away or has stopped forwarding.
  *
  * Runs from the netdev chain under RTNL, so it may take ft_mr_lock and must
- * not touch the backend. The group's own references are dropped here and the
- * group asked again. The hardware entry still naming the device is deleted by
- * the worker this schedules, and keeps a reference of its own on its ingress
- * until then (`hw_in`), because the delete goes through it; unregistration
- * waits for that only as long as the worker takes to run. The bridged learner
- * answers the same window the same way.
+ * not touch the backend. The group's own references on the device are dropped
+ * here and the group asked again.
+ *
+ * A listener's device takes the copies half of the set with it and nothing
+ * else: the ingress is still the one the entry is keyed on, so the worker can
+ * rebuild the chain under the same root rather than read a released ingress
+ * as a new key and take the stream out of hardware to re-add it. Only the
+ * ingress's own device, or its bridge's, releases the whole set; the entry
+ * still naming it is then deleted by the worker this schedules, and keeps a
+ * reference of its own on its ingress until then (`hw_in`), because the
+ * delete goes through it; unregistration waits for that only as long as the
+ * worker takes to run. The bridged learner answers the same window the same
+ * way.
  */
 static void ft_mr_device_gone(struct net_device *dev)
 {
@@ -9878,13 +9915,17 @@ static void ft_mr_device_gone(struct net_device *dev)
 
 	mutex_lock(&ft_mr_lock);
 	list_for_each_entry(g, &ft_mr_groups, list) {
-		bool hit = g->in == dev || g->via == dev;
+		bool ingress = g->in == dev || g->via == dev;
+		bool copy = false;
 
 		for (i = 0; i < g->listeners; i++)
-			hit |= g->listener[i].dev == dev;
-		if (!hit)
+			copy |= g->listener[i].dev == dev;
+		if (!ingress && !copy)
 			continue;
-		ft_mr_release_set(g);
+		if (ingress)
+			ft_mr_release_set(g);
+		else
+			ft_mr_release_copies(g);
 		g->retries = 0;
 		g->dirty = true;
 		changed = true;
@@ -9903,8 +9944,9 @@ static void ft_mr_device_gone(struct net_device *dev)
 
 /* Whether a group's installed chain may have a listener on `dev`. `listener[]`
  * is the installed set, and stays so while the worker decides a group: it is
- * replaced only when the outcome is recorded. A group whose set was released
- * (ft_mr_device_gone()) while its hardware stayed could have any port in it.
+ * replaced only when the outcome is recorded. A group whose copies were
+ * released (ft_mr_device_gone()) while its hardware stayed could have any port
+ * in it.
  * Called with ft_mr_lock held. */
 static bool ft_mr_may_list(const struct ft_mr_group *g,
 			   const struct net_device *dev)
@@ -9965,9 +10007,9 @@ static unsigned int ft_mr_egress_mark(const struct net_device *dev)
  * the transaction, so here a group is never half-built; its hardware and set
  * are the installed ones until the worker's own pass replaces them.
  *
- * A group that cannot be rebuilt here -- its set was released, or the replace
- * failed and it is handed back to the worker, whose own failed replace
- * withdraws it in one pass -- is reported with -EAGAIN. */
+ * A group that cannot be rebuilt here -- its copies were released, or the
+ * replace failed and it is handed back to the worker, whose own failed
+ * replace withdraws it in one pass -- is reported with -EAGAIN. */
 static int ft_mr_egress_drain(const struct net_device *dev)
 {
 	struct ft_mr_group *g;
@@ -10373,8 +10415,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * from the installed one -- the port is part of the classifier
 		 * key -- so a parent VIF that moved is a delete and an add
 		 * rather than a replacement. Decided here rather than after
-		 * the unlock because the installed ingress is the other thing
-		 * ft_mr_device_gone() clears, and it holds RTNL to do it. */
+		 * the unlock because ft_mr_device_gone() clears the installed
+		 * ingress when its device goes, and holds RTNL to do it. */
 		via = state == FT_MR_PENDING && plan.via;
 		rekey = installed && (via || plan.spec.in != target->in ||
 				      plan.in_tags != target->in_tags ||

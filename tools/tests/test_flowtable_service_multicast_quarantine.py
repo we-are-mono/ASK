@@ -266,6 +266,10 @@ async def test_flowtable_service_multicast_quarantine_listener_swap(multicast_ri
                 assert (await remaining(r, SPLICE_BARRIER)).startswith("armed=0"), \
                     "the swap never reached its barrier"
             assert swapped["mroute_installed"] == before["mroute_installed"], summary(swapped)
+            # Never refused on the way: a group taken out of hardware and put
+            # back also ends on one listener with the count it had.
+            for counter in ("mroute_refused", "mroute_install_errors"):
+                assert swapped[counter] == before[counter], (counter, summary(swapped))
             assert swapped["quarantine"] == 2, summary(swapped)
 
             survivor = await r.window([stream(family, group, hops=63)], observers,

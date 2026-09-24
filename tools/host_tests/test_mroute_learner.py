@@ -63,6 +63,7 @@ def test_mroute_learner(tmp_path):
             "ft_mr_expand_bridge",
             "ft_mr_expand",
             "ft_mr_plan_put",
+            "ft_mr_vif_dev",
             "ft_mr_derive",
             "ft_mr_plan_same",
             "ft_mr_find",
@@ -180,7 +181,10 @@ def test_the_drain_takes_the_transaction_under_its_callers_rtnl_only():
         at = worker.find("target->hw = NULL", at + 1)
     record = function(source, "ft_mr_record")
     assert "g->hw_spec = plan->spec;" in record
-    assert "memset(&g->hw_spec, 0, sizeof(g->hw_spec));" in function(source, "ft_mr_release_set")
+    # The recorded spec borrows the listeners, so it goes with them: with the
+    # copies half, which releasing the whole set releases too.
+    assert "memset(&g->hw_spec, 0, sizeof(g->hw_spec));" in function(source, "ft_mr_release_copies")
+    assert "ft_mr_release_copies(g);" in function(source, "ft_mr_release_set")
 
 
 def test_the_two_learners_never_nest_their_locks():
@@ -272,7 +276,10 @@ def test_every_reference_the_learner_takes_is_released():
     assert "ft_mr_release_set(g)" in free
     assert "mr_cache_put(g->mfc)" in free
     release = function(source, "ft_mr_release_set")
-    assert "dev_put(g->listener[i].dev)" in release
+    # The listeners through the copies half, which a listener's own device
+    # going releases on its own; the ingress here.
+    assert "ft_mr_release_copies(g);" in release
+    assert "dev_put(g->listener[i].dev)" in function(source, "ft_mr_release_copies")
     assert "dev_put(g->in)" in release
 
     # mr_cache_put() can free the entry through RCU, so a flag written after
@@ -318,6 +325,9 @@ def test_the_learner_lets_go_of_a_device_that_went_away():
         "both the link going down and unregistration must reach the learner")
     gone = function(source, "ft_mr_device_gone")
     assert "ft_mr_release_set(g)" in gone, "released here, not by the worker"
+    # A listener's device only its copies: the ingress is still the key the
+    # entry is swapped under.
+    assert "ft_mr_release_copies(g)" in gone
     assert "g->in == dev" in gone, "as an ingress"
     assert "g->listener[i].dev == dev" in gone, "as a listener"
     # A port coming back has nothing else that would reconsider a group: the
