@@ -45,13 +45,9 @@
 #define IF_STATS_ENABLED	(1 << 10)
 
 
+/* An egress, embedded in whatever owns it: a flowtable direction, an
+ * outbound IPsec SA, a multicast group member. */
 typedef struct _tRouteEntry {
-	struct slist_entry list;
-	U16 nbref;
-	/* Matches the U32 RtCommand.id wire field; storing anything
-	 * narrower silently truncates and makes the route unfindable
-	 * by its original id. */
-	U32 id;
 	struct _itf *itf;
 	U8 dstmac[ETHER_ADDR_LEN];
 	U16 mtu;
@@ -64,11 +60,6 @@ typedef struct _tRouteEntry {
 	};
 	struct _itf *input_itf;
 	struct _itf *underlying_input_itf;
-#ifdef VLAN_FILTER
-	U16 egress_vid;
-	U16 underlying_vid;
-	U16 vlan_filter_flags;
-#endif
 }RouteEntry, *PRouteEntry;
 
 
@@ -91,17 +82,8 @@ typedef struct tOnifDesc {
 
 extern OnifDesc gOnif_DB[] __attribute__((aligned(32))) ;
 
-PRouteEntry L2_route_get(U32 id);
-void L2_route_put(PRouteEntry pRtEntry);
-PRouteEntry L2_route_find(U32 id);
-int L2_route_remove(U32 id);
-PRouteEntry L2_route_add(U32 id);
-
-
-POnifDesc get_onif_by_name(U8 *itf_name);
 POnifDesc add_onif(U8 *input_itf_name, struct _itf *itf, struct _itf *phys_itf, U8 type);
 void remove_onif_by_index(U32 if_index);
-U16 itf_get_phys_port(struct _itf *itf);
 
 
 

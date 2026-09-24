@@ -243,7 +243,7 @@ struct cdx_ft_rule {
  * encoder starts from profile 0 and only an iqid-carrying mark moves it
  * (`quenum` in create_entry_in_classif_table_hm), so profile 0 is what every
  * flow that says nothing has always metered against — it is the default
- * profile, which CMM spells `set qm ingress queue default`. A nibble reserved
+ * profile. A nibble reserved
  * to mean "no policer" would therefore select profile 0 anyway, and collide
  * with the nibble that names it.
  *
@@ -439,7 +439,7 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
 	       const struct cdx_ft_stats_binding *stats,
 	       struct cdx_ft_hw **result);
 /* Interface-level byte counters live in a small fixed firmware area, four
- * timestamped records and the rest plain, shared with the legacy owner.
+ * timestamped records and the rest plain, shared with the ports' own records.
  * Allocation is therefore expected to fail, and failing is not fatal:
  * counters are observability and forwarding is the product, so a caller that
  * cannot have a slot must still install its flow. -ENOSPC says exactly that.

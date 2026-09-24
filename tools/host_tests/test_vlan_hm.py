@@ -34,10 +34,6 @@ def test_vlan_hm(tmp_path):
     (tmp_path / "vlan_hm_types.inc").write_text(
         re.search(r"^#define DPA_CLS_HM_MAX_VLANs.*$", common, re.M).group() + "\n"
         + re.search(r"^#define PAD\(.*$", ehash, re.M).group() + "\n"
-        # The ingress flags the strip turns into opcode flags, as the encoder
-        # defines them rather than as this test might guess them.
-        + "\n".join(re.findall(r"^#define\s+(?:EHASH_BRIDGE_FLOW|ROUTE_FLOW_VLAN_FIL_EN|"
-                               r"ROUTE_FLOW_PVID_SET)\s.*$", ehash, re.M)) + "\n"
         + declaration(common, "vlan_header")
         + declaration(common, "dpa_l2hdr_info")
         # And the L3 half, which an encapsulation naming a tunnel writes into.
@@ -50,8 +46,7 @@ def test_vlan_hm(tmp_path):
         # that would swallow the defines after it.
         + "\n".join(re.sub(r"\s*/\*.*$", "", line) for line in
                     re.findall(r"^#define\s+(?:MAX_VLAN_PER_FLOW|INSERT_VLAN_HDR|"
-                               r"STRIP_ALL_VLAN_HDRS|OP_SKIP_VLAN_VALIDATE|"
-                               r"OP_VLAN_FILTER_EN|OP_VLAN_FILTER_PVID_SET)\s.*$",
+                               r"STRIP_ALL_VLAN_HDRS)\s.*$",
                                header, re.M)) + "\n"
         + declaration(header, "en_ehash_stats")
         + declaration(header, "en_ehash_insert_vlan_hdr")

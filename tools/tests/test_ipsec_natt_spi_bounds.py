@@ -13,9 +13,10 @@ FCI-installed SA could not: production resolved an SA's kernel state by handle
 and a synthetic SA had none, so its push failed and its ct was torn down
 again — which is why this test used to need the CDX_DEBUG_IPSEC_TEST_XFRM
 by-SPI fallback to fabricate one. An offloaded SA is built *from* a real
-xfrm_state, and cdx_ipsec_sa_add() binds it before the entry is installed. The
-ct survives because the SA is genuine, so the array accumulates on its own and
-the test hook is not part of this any more.
+xfrm_state, and cdx_ipsec_sa_add() installs its entry without looking any
+kernel state up again. The ct survives because nothing can fail that lookup,
+so the array accumulates on its own and the test hook is not part of this any
+more.
 
 Fill semantics, one SPI per SA:
   - the first SA of a flow finds no twin, so the entry is built and takes

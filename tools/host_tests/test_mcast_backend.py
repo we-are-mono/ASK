@@ -67,10 +67,11 @@ def test_every_operation_runs_in_the_flowtable_transaction():
             f"{name} must assert the flowtable transaction is held")
 
 
-def test_mutators_serialise_against_the_fci_handlers():
-    """dpa_control_mc.h states the rule: the three mutators run under
-    mc_mutators_mutex, and a caller that does not arrive through the command
-    dispatcher takes it explicitly. These are exactly such callers.
+def test_mutators_take_the_mutators_mutex():
+    """dpa_control_mc.c states the rule: the three mutators and the
+    interface-removal sweep run under mc_mutators_mutex. The flowtable
+    transaction happens to serialise every current caller; the mutex keeps the
+    invariant explicit for one that does not.
     """
     source = SOURCE.read_text()
     for name in ("cdx_mc_group_add", "cdx_mc_group_replace", "cdx_mc_group_del"):
@@ -114,10 +115,9 @@ def test_a_listener_is_its_whole_framing_not_its_port():
 
     Nothing below this interface identifies a member by its device: each
     listener gets its own external-hash entry built from its own
-    encapsulation, members[] is indexed by position, and the name copied into
-    if_info is for the query dump. The name lookups that exist --
-    Cdx_GetMcastMemberId, mcast_member_by_name -- are on the FCI mutators and
-    never reach this path.
+    encapsulation, and members[] is indexed by position. The name lookups the
+    retired FCI mutators used -- Cdx_GetMcastMemberId, mcast_member_by_name --
+    must not come back on this path.
 
     The shape matters because of the bench rather than the product: the rig
     has one LAN port with carrier and every group's other port is its ingress,
@@ -163,10 +163,9 @@ def test_replace_keeps_the_key_in_the_classifier():
 
 
 def test_replace_drains_what_it_parks():
-    """The displaced chain is parked, and in this ownership mode nothing else
-    is bound to release it soon: the FCI mcast mutators never run, and the
-    flowtable backend issues a barrier only when it deletes or is waiting on
-    the backlog. Membership changes whenever anyone changes channel, so an
+    """The displaced chain is parked, and nothing else is bound to release it
+    soon: the flowtable backend issues a barrier only when it deletes or is
+    waiting on the backlog. Membership changes whenever anyone changes channel, so an
     undrained backlog grows by a chain per change until the entry pool is
     exhausted -- which fails every classifier insert, not just multicast.
     """
@@ -219,21 +218,22 @@ def test_a_group_is_keyed_on_its_device_not_its_name():
         "the pinned device must be recorded")
 
     # And the resolutions that follow from it: the ingress onif and the MAC
-    # subscription both prefer the device when the group carries one.
+    # subscription both go through the device, and nothing falls back to the
+    # name.
     root = function(source, "cdx_add_mcast_table_entry")
     assert "pMcastGrpInfo->in_dev" in root and "get_onif_by_index(" in root, (
-        "the ingress onif must resolve by index when a device is held")
-    ingress = function(source, "cdx_mcast_ingress_dev")
-    assert "grp->in_dev" in ingress and "dev_get_by_name(" in ingress, (
-        "the MAC subscription must prefer the device and fall back to the name")
+        "the ingress onif must resolve by index from the device")
+    assert "dev_mc_add(grp->in_dev," in function(source, "cdx_mcast_subscribe_ingress_mac")
+    assert "dev_mc_del(grp->in_dev," in function(source, "cdx_mcast_unsubscribe_ingress_mac")
+    for lookup in ("get_onif_by_name(", "dev_get_by_name("):
+        assert lookup not in source, f"nothing may resolve the ingress by name ({lookup})"
 
 
 def test_an_untagged_listener_overrides_nothing():
     """apply_l2_encap() refuses a description the interface walk already filled
-    in, and a DSCP-to-PCP egress map fills one in -- it pushes a priority tag on
-    a plain physical port. Handing it an empty override would fail the whole
-    group for a listener that asked for nothing. The flowtable's own encoder
-    guards the same way.
+    in, so handing it an empty override could only fail the whole group for a
+    listener that asked for nothing. The flowtable's own encoder guards the
+    same way.
     """
     body = code("cdx_mc_listener_entry")
     assert "listener->vlans ? &encap : NULL" in body, (
@@ -353,14 +353,15 @@ def test_a_bridged_group_is_keyed_on_its_own_frames():
 def test_one_entry_per_classifier_key_not_per_address_pair():
     """The root is hashed on the ingress port, the address pair and, in the
     bridged table, the Ethernet pair. Groups that differ in any of those are
-    entries the classifier tells apart and may coexist; the address pair alone
-    is only the legacy owner's rule. A difference in ingress tags alone does
-    not make a second key, because the key names no VLAN.
+    entries the classifier tells apart and may coexist. A difference in
+    ingress tags alone does not make a second key, because the key names no
+    VLAN. Every group pins its ingress device, so there is no nameless group
+    for the address pair alone to collide with.
     """
     taken = code("cdx_mc_key_taken")
     assert "tmp->in_dev != grp->in_dev || tmp->mac_keyed != grp->mac_keyed" in taken
     assert "memcmp(tmp->mac_pair, grp->mac_pair, sizeof(grp->mac_pair))" in taken
-    assert "!tmp->in_dev || !grp->in_dev" in taken, "the legacy owner's rule"
+    assert "!tmp->in_dev" not in taken and "!grp->in_dev" not in taken
     assert "in_vlan" not in taken
     assert "cdx_mc_key_taken(grp)" in code("cdx_mc_group_add")
     assert "GetMcastGrpId(" not in code("cdx_mc_group_add")

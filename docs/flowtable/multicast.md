@@ -107,7 +107,8 @@ the flowtable adapter calls `cdx_ft_add()` and the IPsec adapter calls
 listener-ceiling experiment has to run in a CMM boot**, because that is the
 only boot in which raw FCI is answered. (The image no longer builds CMM, and
 `comcerto_fpp_send_command()` now refuses every command unconditionally, so
-that boot no longer exists.)
+that boot no longer exists. The FCI plane, `cdx_cmdhandler.c` included, has
+since been removed from CDX altogether.)
 
 **CMM never learned a group either.** `cmm -c "query mc4"` on the production
 gateway that carries IPTV answers *"FPP Multicast IPV4 table empty"*. There is

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* A hardware qdisc for the DPAA netdev: HTB offload driving CEETM.
  *
- * The scheduler CMM builds with twelve CMD_QM_* commands is the same scheduler
- * sch_htb asks for with tc_htb_qopt_offload, so this translates one into the
- * other. Nothing new is claimed here: ceetm_init_channels() already built every
- * channel, class queue and logical FQ at module load, and each setter in
- * cdx_ceetm_app.c is a thin function over a (channel, class queue) pair. What
- * this file owns is which pair a tc class means, and giving it back.
+ * The scheduler CMM used to build with twelve CMD_QM_* commands is the same
+ * scheduler sch_htb asks for with tc_htb_qopt_offload, so this translates one
+ * into the other. Nothing new is claimed here: ceetm_init_channels() already
+ * built every channel, class queue and logical FQ at module load, and each
+ * setter in cdx_ceetm_app.c is a thin function over a (channel, class queue)
+ * pair. What this file owns is which pair a tc class means, and giving it
+ * back.
  *
  * The tree maps onto the hardware's own three levels:
  *
@@ -30,12 +31,9 @@
  * Everything below runs under RTNL in process context, and sch_htb wraps every
  * leaf add, delete and graft in dev_deactivate()/dev_activate(), so the netdev
  * can be quiesced the moment a callback returns. RTNL is also what serialises
- * this against itself. It does not serialise it against the FCI QM command
- * family, which is the other control plane over these objects; they are not
- * meant to be used together, and where it matters the hardware layer already
- * refuses -- ceetm_assign_chnl() will not hand out a channel the other side
- * holds, and TC_HTB_CREATE below will not take a port that is already
- * configured.
+ * this against itself; the hardware layer still refuses what would clash --
+ * ceetm_assign_chnl() will not hand out a channel another port holds, and
+ * TC_HTB_CREATE below will not take a port that is already configured.
  */
 #include <linux/list.h>
 #include <linux/netdevice.h>
@@ -664,12 +662,12 @@ static int cdx_htb_create(struct cdx_htb_port *port, struct tc_htb_qopt_offload 
 		NL_SET_ERR_MSG_MOD(opt->extack, "a hardware qdisc already owns this port");
 		return -EBUSY;
 	}
-	/* CMM configures the same LNI, channels and class queues through the
-	 * FCI QM commands. Two control planes over one scheduler would each
-	 * undo the other, so whichever configured the port first keeps it. */
+	/* A port whose LNI or channels are still configured is not this
+	 * qdisc's to take over: only a hardware qdisc configures them, and one
+	 * left configured belongs to a tree that was never taken down. */
 	if (port->qm_ctx->qos_enabled || port->qm_ctx->chnl_map) {
 		NL_SET_ERR_MSG_MOD(opt->extack,
-				   "CEETM on this port is already configured by another control plane");
+				   "CEETM on this port is still configured by a tree that was never taken down");
 		return -EBUSY;
 	}
 	INIT_LIST_HEAD(&port->classes);

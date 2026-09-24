@@ -16,55 +16,7 @@ struct cdx_l2_encap;
 
 #define MC4_NUM_HASH_ENTRIES 16
 #define MC6_NUM_HASH_ENTRIES 16
-#define MC4_MIN_COMMAND_SIZE	32+12 /* with one listener entry using 1 interface name */
-#define MC6_MIN_COMMAND_SIZE	64+12 /* with one listener entry using 1 interface name */
-#define MC_MAX_LISTENERS_IN_QUERY    5
-#define MC4_MAX_LISTENERS_IN_QUERY    MC_MAX_LISTENERS_IN_QUERY
-#define MC6_MAX_LISTENERS_IN_QUERY    MC_MAX_LISTENERS_IN_QUERY
 #define MC_MAX_LISTENERS_PER_GROUP 8
-#define MC4_MAX_LISTENERS_PER_GROUP  MC_MAX_LISTENERS_PER_GROUP
-
-typedef struct _tMC4Output {
-        U32             timer;
-        U8              output_device_str[IF_NAME_SIZE];
-        U8              shaper_mask;
-        U8              uc_bit:1,
-                        q_bit:1,
-                        rsvd:6;
-        U8              uc_mac[6];
-        U8              queue;
-        U8              new_output_device_str[IF_NAME_SIZE];
-        U8              if_bit:1,
-                        unused:7;
-        U8              padding[2];
-}__attribute__((__packed__)) MC4Output, MC6Output, *PMC4Output,*PMC6Output;
-
-
-typedef struct _tMC4Command {
-        U16             action;
-        U8              src_addr_mask;
-        U8              mode : 1,
-                        queue : 5,
-                        rsvd : 2;
-        U32             src_addr;
-        U32             dst_addr;
-        U32             num_output;
-        U8              input_device_str[IF_NAME_SIZE];
-        MC4Output output_list[MC4_MAX_LISTENERS_IN_QUERY];
-}__attribute__((__packed__)) MC4Command, *PMC4Command;
-
-typedef struct _tMC6Command {
-	U16		action;
-	U8 		mode : 1,
-	     		queue : 5,
-	     		rsvd : 2;
-	U8		src_mask_len;
-	U32		src_addr[4];
-	U32		dst_addr[4];
-	U32		num_output;
-        U8              input_device_str[IF_NAME_SIZE];
-	MC6Output output_list[MC6_MAX_LISTENERS_IN_QUERY];
-}__attribute__((__packed__)) MC6Command, *PMC6Command;
 
 struct mcast_group_member
 {
@@ -95,21 +47,18 @@ struct mcast_group_info
   struct mcast_group_member members[MC_MAX_LISTENERS_PER_GROUP];
   struct _tCtEntry *pCtEntry;
   char ucIngressIface[IF_NAME_SIZE];
-  /* The ingress device, when the owner that installed this group holds one.
+  /* The ingress device.
    *
-   * The legacy owner names an interface and leaves this NULL, because its
-   * whole control plane is names and nothing it does outlives a rename. A
-   * group installed through cdx_mcast_backend.h is identified by its ports,
-   * which the caller pins for the group's life, so it can be keyed on the
-   * device itself -- and must be: nothing in cdx handles NETDEV_CHANGENAME, so
-   * a renamed ingress would otherwise stop matching its own group and freeze
-   * its listener set forever. ucIngressIface stays populated either way, for
-   * the query walkers and the log. */
+   * A group installed through cdx_mcast_backend.h is identified by its ports,
+   * which the caller pins for the group's life, so it is keyed on the device
+   * itself -- and must be: nothing in cdx handles NETDEV_CHANGENAME, so a
+   * renamed ingress would otherwise stop matching its own group and freeze its
+   * listener set forever. ucIngressIface is only for the log. */
   struct net_device *in_dev;
   uint8_t mctype;
   bool bridged;
-  /* Both set only by an owner that describes the frame the group arrives
-   * as; the legacy owner leaves them zero and gets its routed root.
+  /* Both set only for a group that describes the frame it arrives as; one
+   * that leaves them zero gets its routed root.
    *
    * `mac_keyed`: the root is keyed on `mac_pair` -- destination then source,
    * the frame's own -- in the bridged multicast table, and every listener
@@ -121,12 +70,6 @@ struct mcast_group_info
   struct vlan_header in_vlan[DPA_CLS_HM_MAX_VLANs];
 };
 
-#define CDX_MC_ACTION_ADD			0
-#define CDX_MC_ACTION_REMOVE			1
-#define CDX_MC_ACTION_UPDATE       		2
-
-int GetMcastGrpId( struct mcast_group_info *pMcastGrpInfo,
-						uint8_t *ingress_iface);
 int insert_mcast_entry_in_classif_table(struct _tCtEntry *pCtEntry,
 		unsigned int num_members, uint64_t first_member_flow_addr,
 						void *first_listener_entry, bool bridged,
@@ -137,31 +80,16 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 		struct dpa_l3hdr_info *l3_info, PRouteEntry tnl_rt_entry, void *queinfo, uint32_t hash);
 void AddToMcastGrpList(struct mcast_group_info *pMcastGrpInfo);
 /* Clears the references the multicast group routes hold on an interface that
- * is being removed. Their RouteEntry lives outside rt_cache, so the route walk
- * in remove_onif_by_index() cannot reach them. Process context only. */
+ * is being removed; remove_onif_by_index() calls it. Process context only. */
 void cdx_mcast_clear_itf_refs(U32 if_index);
 extern struct list_head mc4_grp_list[MC4_NUM_HASH_ENTRIES];
 extern struct list_head mc6_grp_list[MC6_NUM_HASH_ENTRIES];
 extern spinlock_t *mc4_spinlocks;
 extern spinlock_t *mc6_spinlocks;
-/* The three mcast mutators (cdx_create/update/delete_mcast_group_member)
- * must run under mc_mutators_mutex, taken in MC{4,6}_Command_Handler.
- * The functions themselves don't take the mutex (cdx_create can recurse
- * into cdx_update for the duplicate-group fast path, which would
- * deadlock); they rely on the dispatcher being the only entry point.
- * Add a new caller? Either route it through the dispatcher, or take
- * mc_mutators_mutex explicitly before calling. See ISSUES.md M10/M11. */
-int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6);
-
-struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo);
-int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action);
-int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action);
-int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6);
 
 /* How one listener's copy is framed beyond what its egress interface and tags
- * give it. NULL is the routed answer the legacy owner always wanted: the
- * egress port's own address as the source and the group's mapped address as
- * the destination.
+ * give it. NULL is the routed answer: the egress port's own address as the
+ * source and the group's mapped address as the destination.
  *
  * `mac_pair` is a bridged copy's: the destination and source the root matched,
  * in the order the header carries them, written back verbatim. A bridge
@@ -177,11 +105,10 @@ struct cdx_mc_member_frame {
 };
 
 /* Builds one listener's entry. The listener is already resolved -- an onif and
- * the netdev whose MTU the enqueue carries, borrowed for the call -- because
- * the two owners resolve it differently. `encap` names the tags this listener's
- * frames leave with, or is NULL to take them from the egress interface. The
- * scratch state is the builder's own; see the definition for why that is not
- * merely tidiness. */
+ * the netdev whose MTU the enqueue carries, borrowed for the call. `encap`
+ * names the tags this listener's frames leave with, or is NULL to take them
+ * from the egress interface. The scratch state is the builder's own; see the
+ * definition for why that is not merely tidiness. */
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
 	POnifDesc onif_desc, struct net_device *dev, const struct cdx_l2_encap *encap,
 	const struct cdx_mc_member_frame *frame,
@@ -192,8 +119,6 @@ int mc4_init(void);
 int mc6_init(void);
 void mc4_exit(void);
 void mc6_exit(void);
-U16 M_mc4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd);
-U16 M_mc6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd);
 
 #ifdef CDX_DEBUG_MC_HCSYNC_FAIL
 /* HC-sync fault-injection knob - see dpa_control_mc.c for the design

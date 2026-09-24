@@ -7,7 +7,9 @@ This document is the decision and the contract. It is written before any code,
 because the roadmap asks items 5 to 8 each to settle a feature-specific
 hardware eligibility contract first, and because the two available
 architectures here differ in what the tree carries forever rather than in how
-long they take to write.
+long they take to write. CDX's FCI plane (`cdx_cmdhandler.c`, the
+`control_ipsec.c` command handlers, the SA lifetime timer) has since been
+removed; references to it below describe the tree as it was then.
 
 ## The shape of the problem
 
@@ -430,6 +432,9 @@ to whichever SA was created next.
 installs the entry and then looks the state up, which is the only order
 available to it. Here the order matters: frames can arrive from SEC the moment
 the entry exists, and one arriving before the state is reachable is dropped.
+(Once the FCI plane was removed the SA stopped keeping the pointer at all: the
+receive path resolves the state by the SA's handle, which exists before the
+entry does.)
 
 The SA machinery itself is not duplicated. `M_ipsec_sa_cache_create()`, the two
 key setters, `M_ipsec_sa_cache_delete()` and the classifier install are the
@@ -483,8 +488,8 @@ and together they fix the design:
   on the garbage collector's workqueue or after a `synchronize_rcu()`.
 - **The backend must not hold a reference to the state.** Free is reached only
   once the last reference is gone, so a reference held by the SA would be
-  waiting for the teardown that is waiting for it. The pointer is borrowed and
-  dropped in the teardown.
+  waiting for the teardown that is waiting for it. The pointer was borrowed and
+  dropped in the teardown; the SA now keeps none.
 
 **And the teardown must not wait for free either**, which is the part this
 increment got wrong first and had to be shown on hardware. A frame handed to
@@ -587,8 +592,9 @@ pass held off for seconds at line rate does not wedge the count. Under
 `x->lock`, and only for a `VALID` state, the pass adds to `curlft` whatever
 the totals moved forward since its last publication, and calls
 `xfrm_state_check_expire()`. Soft and hard expiry are then xfrm's own, down to
-`km_state_expired()` and the state timer. The legacy timer skips SAs marked
-`SA_XFRM_OWNED`, and the spec no longer carries lifetimes.
+`km_state_expired()` and the state timer. The legacy SA lifetime timer, which
+skipped SAs marked `SA_XFRM_OWNED`, has since been removed with the FCI plane,
+and the spec no longer carries lifetimes.
 
 A hard expiry does not stop SEC at once. The state timer deletes the state,
 and the SA's classifier entries keep forwarding until the retirement that

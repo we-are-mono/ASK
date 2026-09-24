@@ -66,8 +66,8 @@ static struct dpa_fq *dpa_pcd_fq;
  *   cdx_ctrl_lock_with_rtnl(), then dpa_cfg_lock
  *      - Acquires RTNL and ctrl.mutex without waiting on one while
  *        holding the other; contention restarts before any state change.
- *      - Excludes FCI commands and timers while startup publishes or
- *        unwinds interfaces and classifier metadata.
+ *      - Excludes the flowtable transaction and timers while startup
+ *        publishes or unwinds interfaces and classifier metadata.
  *
  *   dpa_cfg_lock (file-local mutex)
  *      - Serializes the one-shot install of the DPA configuration
@@ -572,8 +572,8 @@ int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,
 	return SUCCESS;
 }
 
-/* The colours the punt profile counted, for a caller with no FCI command
- * structure to fill. Read without clearing, as everywhere else. */
+/* The colours the punt profile counted. Read without clearing, as everywhere
+ * else. */
 int cdx_expt_rate_counters(uint32_t fm_index, uint32_t type,
 			   struct cdx_police_counters *out)
 {
@@ -1315,30 +1315,6 @@ struct cdx_port_info *get_dpa_port_info(char *name)
 	return NULL;
 }
 
-/* get port name by port id */
-char *get_dpa_port_name(uint32_t portid)
-{
-	uint32_t ii;
-	struct cdx_fman_info *finfo;
-
-	finfo = fman_info;
-	for (ii = 0; ii < num_fmans; ii++) {
-		struct cdx_port_info *port_info;
-		uint32_t jj;
-		port_info = finfo->portinfo;
-		/* seach for port in fman structures*/
-		for (jj = 0; jj < finfo->max_ports; jj++) {
-			if (port_info->portid == portid) {
-				return port_info->name;
-			}
-			port_info++;
-		}
-		finfo++;
-	}
-	DPA_ERROR("%s::could not find port name for port %u\n", __func__, portid);
-	return NULL;
-}
-
 //get kernel pcd dev handle by fman index
 void *dpa_get_pcdhandle(uint32_t fm_index)
 {
@@ -1490,51 +1466,6 @@ int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32
 
 	return cdxdrv_modify_ingress_qos_policer_profile(finfo,queue_no,cir,pir,cbs,pbs);
 }
-int cdx_ingress_policer_reset(uint32_t fm_index)
-{
-	struct cdx_fman_info *finfo;
-
-	if (fm_index >= num_fmans)
-		return -1;
-
-	finfo = (fman_info + fm_index);
-	cdxdrv_ingress_policer_reset(finfo);
-	return 0;
-}
-
-#ifdef SEC_PROFILE_SUPPORT
-int cdx_sec_policer_reset(uint32_t fm_index)
-{
-	struct cdx_fman_info *finfo;
-
-	if (fm_index >= num_fmans)
-		return -1;
-
-	finfo = (fman_info + fm_index);
-	cdxdrv_sec_policer_reset(finfo);
-	return 0;
-}
-#endif /* endif for SEC_PROFILE_SUPPORT */
-
-int cdx_ingress_policer_stats(uint32_t fm_index,uint32_t queue_no,void *stats,uint32_t clear)
-{
-	struct cdx_fman_info *finfo;
-
-	if (fm_index >= num_fmans || queue_no >= INGRESS_ALL_POLICER_QUEUES)
-		return -1;
-
-	finfo = (fman_info + fm_index);
-
-	if (!finfo->ingress_policer_info[queue_no].handle)
-	{
-		printk("%s::policer handle is NULL\n", __func__);
-		return -1;
-	}
-
-	cdxdrv_ingress_policer_stats(finfo,queue_no,stats,clear);
-
-	return 0;
-}
 
 /* What one ingress profile is currently programmed with. The hardware layer
  * keeps these beside the handle, so a caller that has to change one of a pair
@@ -1575,9 +1506,9 @@ int cdx_ingress_policer_peak(uint32_t fm_index, uint32_t queue_no,
 	return SUCCESS;
 }
 
-/* The colours one ingress profile counted, without the FCI command structure
- * around them. Read without clearing, so every other reader's baseline stays
- * where it was; a caller wanting deltas keeps its own. */
+/* The colours one ingress profile counted. Read without clearing, so every
+ * other reader's baseline stays where it was; a caller wanting deltas keeps
+ * its own. */
 int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
 				 struct cdx_police_counters *out)
 {

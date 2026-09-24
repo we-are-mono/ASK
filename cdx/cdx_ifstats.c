@@ -34,7 +34,7 @@
  *   dpa_statslist_lock (spinlock)
  *      - Guards the cdx_iface_ifinfo free lists (ifstats_freelist
  *        and the PPPoE variant) and their backing stats_mem
- *        region. All takers are process context (ioctl-path
+ *        region. All takers are process context (record
  *        alloc/free, the dev_get_stats callback and the sampler's
  *        work item), which is why plain spin_lock() is sufficient;
  *        do not add a softirq taker without switching the
@@ -156,10 +156,7 @@ static u64 ifstats_widen(struct ifstats_wide_half *half, u32 raw)
 }
 
 /* One record read and its packet counts advanced. The firmware writes these
- * fields big-endian, so the read is a be-to-cpu conversion. control_stat.c
- * spells the same conversion cpu_to_be32/64, which is the identical byte swap
- * under a name that says the opposite; it is not copied here, because a reader
- * of this path should be able to tell which way the value is travelling.
+ * fields big-endian, so the read is a be-to-cpu conversion.
  * Caller holds dpa_statslist_lock, with the index one ifstats_record_index()
  * returned while the carve was present. */
 static void ifstats_sample(unsigned int index, struct cdx_ft_stats *rx,
@@ -337,7 +334,7 @@ int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
 	if (!iface->stats) {
 		/* freelist exhausted. Returning SUCCESS here would leave
 		 * rxstats_index/txstats_index aliasing slot 0 and a NULL
-		 * stats pointer that the FCI stats query would deref. */
+		 * stats pointer for the next reader to dereference. */
 		DPA_ERROR("%s::stats freelist exhausted for type %x\n",
 				__func__, dev_type);
 		kfree(iface->last_stats);

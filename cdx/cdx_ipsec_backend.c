@@ -2,18 +2,11 @@
 /*
  * Typed SA interface for the flowtable owner.
  *
- * The legacy control plane reaches the same SA cache through FCI: strongSwan
- * programs XFRM, the kernel broadcasts the state on a private netlink family,
- * CMM re-encodes each message as an FCI command and cdx decodes it again. This
- * file is what replaces every hop of that but the first. An SA arrives as one
- * complete description from a caller that already holds the kernel state, and
- * is installed in a single pass under the control mutex.
- *
- * What it does not do is duplicate the SA machinery. Everything below the
- * translation -- the cache, the SEC context, the shared descriptor, the
- * classifier entry -- is the code control_ipsec.c and cdx_dpa_ipsec.c already
- * run for the legacy owner, reached through the helpers control_ipsec.h now
- * declares. Only the door is new.
+ * An SA arrives as one complete description from a caller that already holds
+ * the kernel state, and is installed in a single pass under the control mutex.
+ * Everything below the translation -- the cache, the SEC context, the shared
+ * descriptor, the classifier entry -- is control_ipsec.c's and
+ * cdx_dpa_ipsec.c's, reached through the helpers control_ipsec.h declares.
  */
 
 #include <linux/etherdevice.h>
@@ -46,14 +39,9 @@
 struct cdx_ipsec_sa {
 	PSAEntry entry;
 	struct net_device *dev;
-	/* The outbound SA's own egress route, embedded rather than looked up.
-	 *
-	 * The legacy owner resolves sa->pRtEntry out of CDX's route table,
-	 * which CMM fills over FCI and which this ownership mode leaves empty
-	 * by design -- the flowtable gives each direction a private route for
-	 * the same reason. So an SA gets one too, built from what the caller
-	 * resolved, and it never joins the legacy route hash, its reference
-	 * counting or its ageing. */
+	/* The outbound SA's own egress route, embedded rather than looked up,
+	 * as the flowtable gives each direction a private route: built from
+	 * what the caller resolved, and owned by this SA alone. */
 	RouteEntry route;
 	/* The packet total cdx_ipsec_sa_stats() reports, and SEC's own count
 	 * as that function last read it. SEC keeps the count in 32 bits and
@@ -93,9 +81,8 @@ unsigned int cdx_ipsec_sa_count(void)
 
 /* Find a handle no live SA holds.
  *
- * The legacy owner never needed this: CMM chose the sagd and cdx trusted it,
- * which works only while there is exactly one client. The handle is what
- * indexes sa_cache_by_h and what SEC stamps into a decrypted frame's trailer,
+ * The handle is what indexes sa_cache_by_h and what SEC stamps into a
+ * decrypted frame's trailer,
  * so it has to be unique among live SAs and it has to be non-zero -- zero is
  * what an absent handle reads as on both paths.
  *
@@ -159,10 +146,9 @@ EXPORT_SYMBOL_NS_GPL(cdx_ipsec_port_supported, ASK_CDX_FLOWTABLE);
 
 /* Build the outer header a tunnel-mode SA prepends.
  *
- * The legacy path receives this prebuilt over FCI, assembled by the kernel
- * patch that serialises the state. Doing it here instead keeps the ESP next
- * header and the two header sizes on this side of the interface, where the
- * rest of the hardware's format knowledge already is.
+ * Built here, from the spec, keeps the ESP next header and the two header
+ * sizes on this side of the interface, where the rest of the hardware's
+ * format knowledge already is.
  *
  * TotalLength, Identification, the fragment fields and the checksum are left
  * zero deliberately: SEC computes them per frame, and a value placed here
@@ -199,9 +185,9 @@ static void cdx_ipsec_build_tunnel(PSAEntry sa,
 
 /* xfrm, and so the spec, carry the NAT-T ports in network order. The SA
  * cache keeps sa->natt in host order: its consumers convert from that when
- * they build the ESP-in-UDP header and the inbound classifier key, as the
- * legacy owner did after its own conversion. Storing the network-order
- * value sent every UDP-encapsulated SA to a byte-swapped port. */
+ * they build the ESP-in-UDP header and the inbound classifier key. Storing
+ * the network-order value sent every UDP-encapsulated SA to a byte-swapped
+ * port. */
 static void cdx_ipsec_set_natt(unsigned short *sport, unsigned short *dport,
 			       __be16 natt_sport, __be16 natt_dport)
 {
@@ -224,8 +210,8 @@ static int cdx_ipsec_set_keys(PSAEntry sa, const struct cdx_ipsec_sa_spec *spec)
 
 /* Where the SA's sequence space starts, and the window that guards it.
  *
- * The cache create starts every SA at zero with the legacy owner's fixed
- * window, because FCI told it neither. Both PDB builders read these when the
+ * The cache create starts every SA at zero with no window of its own. Both
+ * PDB builders read these when the
  * SA is installed, so this runs before that: the outbound one seeds SEC one
  * past sa->seq, the inbound one anchors its window at sa->seq and starts its
  * scorecard from what the spec says was already received. The window is an
@@ -325,7 +311,7 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		goto err_free_owner;
 
 	/* The cache create allocates the SEC context and links the entry into
-	 * all three indexes, so from here on failure has to unwind through
+	 * both indexes, so from here on failure has to unwind through
 	 * M_ipsec_sa_cache_delete() rather than by freeing anything directly. */
 	sa = M_ipsec_sa_cache_create(saddr, daddr, spec->spi, IPPROTOCOL_ESP,
 				     spec->family == AF_INET6 ? PROTO_IPV6
@@ -339,7 +325,6 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		rc = -ENOSPC;
 		goto err_free_owner;
 	}
-	sa->flags |= SA_XFRM_OWNED;
 	cdx_ipsec_set_sequence(sa, spec);
 
 	rc = cdx_ipsec_set_keys(sa, spec);
@@ -351,25 +336,20 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 	else
 		sa->mode = SA_MODE_TRANSPORT;
 
-	/* The cache create decides SA_HDR_COPY_DF for an IPv4 outbound SA on
-	 * its own, which is the legacy owner's fixed policy. Honour what the
-	 * caller asked instead: it read the state's own flags. */
+	/* Whether the outer header copies DF is the state's own flag, which the
+	 * caller read. */
 	if (spec->copy_df)
 		sa->hdr_flags |= SA_HDR_COPY_DF;
-	else
-		sa->hdr_flags &= ~SA_HDR_COPY_DF;
 
-	if (spec->natt_sport) {
+	if (spec->natt_sport)
 		cdx_ipsec_set_natt(&sa->natt.sport, &sa->natt.dport,
 				   spec->natt_sport, spec->natt_dport);
-		sa->natt.socket = NULL;
-	}
 
 	/* An outbound SA transmits, so it needs the egress framing now. The
 	 * onif is the hardware identity of the port the caller bound the SA
 	 * to, and the MAC is the next hop it resolved toward the peer. An
 	 * inbound SA is classified rather than transmitted and leaves this
-	 * NULL, which is what the legacy path also does for it. */
+	 * NULL. */
 	if (spec->dir == CDX_IPSEC_DIR_OUT) {
 		struct dpa_iface_info *iface;
 		POnifDesc onif;
@@ -388,40 +368,16 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		owner->route.itf = onif->itf;
 		owner->route.mtu = spec->dev_mtu;
 		ether_addr_copy(owner->route.dstmac, spec->dst_mac);
-		/* One holder: this SA. sa_remove() puts the route on teardown,
-		 * and that put warns on an unbalanced count -- so the embedded
-		 * route carries the reference a table-held one would have,
-		 * rather than the shared release path learning to special-case
-		 * a route it did not hand out. */
-		owner->route.nbref = 1;
 		sa->pRtEntry = &owner->route;
 	}
-
-	/* Borrowed, deliberately without a reference.
-	 *
-	 * A reference here would be a cycle. The kernel tears an offloaded SA
-	 * down through xdo_dev_state_free(), which ___xfrm_state_destroy()
-	 * reaches only once the last reference to the state is gone -- so a
-	 * reference held by this SA would be waiting for the teardown that is
-	 * waiting for it, and neither would ever happen. The pointer is safe
-	 * without one because the caller destroys this SA from inside that
-	 * same free callback, while the state is still allocated.
-	 *
-	 * It is bound before the entry is installed rather than after, because
-	 * frames can arrive from SEC the moment the entry exists and the
-	 * completion path needs the state to attach a sec_path to them. */
-	sa->xfrm_state = x;
 
 	rc = ipsec_install_fp_entry(sa);
 	if (rc) {
 		rc = -EIO;
-		goto err_clear_state;
+		goto err_delete_sa;
 	}
 
 	sa->flags |= SA_ENABLED;
-	sa->state = SA_STATE_VALID;
-	sa->lft_cur.bytes = 0;
-	sa->lft_cur.packets = 0;
 
 	owner->entry = sa;
 	owner->handle = handle;
@@ -430,8 +386,6 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 	*result = owner;
 	return 0;
 
-err_clear_state:
-	sa->xfrm_state = NULL;
 err_delete_sa:
 	M_ipsec_sa_cache_delete(handle);
 err_free_owner:
@@ -451,13 +405,6 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 	*sa = NULL;
 	if (!WARN_ON_ONCE(!cdx_ipsec_sa_owned))
 		cdx_ipsec_sa_owned--;
-	/* Drop the borrowed state pointer before the release path runs. That
-	 * path puts a reference for the legacy owner, which does hold one --
-	 * this SA does not, for the reason cdx_ipsec_sa_add() gives, so the
-	 * put has to be given nothing to do rather than a reference that was
-	 * never taken. */
-	if (owner->entry)
-		owner->entry->xfrm_state = NULL;
 	rc = M_ipsec_sa_cache_delete(owner->handle);
 	/* The only way this fails is a handle the cache never had, which would
 	 * mean this owner outlived its entry -- worth saying out loud, because
@@ -578,9 +525,9 @@ static bool cdx_ipsec_sa_sample(PSAEntry entry, u32 *packets, u64 *bytes)
 	u32 again_packets;
 	u64 again_bytes;
 
-	get_stats_from_sa(entry, packets, bytes, NULL);
+	get_stats_from_sa(entry, packets, bytes);
 	for (tries = 0; tries < CDX_IPSEC_SAMPLE_TRIES; tries++) {
-		get_stats_from_sa(entry, &again_packets, &again_bytes, NULL);
+		get_stats_from_sa(entry, &again_packets, &again_bytes);
 		if (again_packets == *packets && again_bytes == *bytes)
 			return true;
 		*packets = again_packets;

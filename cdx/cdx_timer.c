@@ -18,17 +18,17 @@
  *   ctrl->timer_inner_wheel, ctrl->timer_outer_wheel
  *      - The inner/outer timer wheels and their position counters
  *        are serialized by cdx_info->ctrl.mutex, the same mutex the
- *        command dispatcher holds across every command handler. The
- *        tick loop below takes it for the whole tick, so a handler
- *        adding or deleting a timer can never race the wheel walk.
+ *        flowtable transaction holds. The tick loop below takes it
+ *        for the whole tick, so a caller adding or deleting a timer
+ *        can never race the wheel walk.
  *   ctrl->timer_thread
  *      - Started in cdx_main.c under ctrl->mutex; runs until
  *        cdx_ctrl_timer_exit() stops it via kthread_stop.
  *
  * cdx_timer_add() / cdx_timer_del() and the internal helpers they
  * call take no lock of their own: every caller already runs under
- * ctrl->mutex, either from a command handler or from a timer handler
- * invoked by the tick loop.
+ * ctrl->mutex, either inside the flowtable transaction (an SA's
+ * deferred release) or from a timer handler invoked by the tick loop.
  *
  * Contexts: all of the above is process context (the kthread
  * included), so the mutex may be slept on.

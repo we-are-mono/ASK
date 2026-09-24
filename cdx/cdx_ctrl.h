@@ -16,8 +16,6 @@ struct _cdx_ctrl {
 	struct task_struct *timer_thread;
 	struct hlist_head *timer_inner_wheel;
 	struct hlist_head *timer_outer_wheel;
-
-	int (*event_cb)(u16, u16, u16*);
 };
 
 struct _cdx_info {

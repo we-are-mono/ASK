@@ -12,11 +12,11 @@ struct cdx_mc_group;
 
 /* How many listeners one group may replicate to.
  *
- * MC_MAX_LISTENERS_PER_GROUP, which is what the legacy owner enforces and what
- * sizes the group's member array. It is not a hardware bound and nothing names
+ * MC_MAX_LISTENERS_PER_GROUP, which sizes the group's member array. It is not
+ * a hardware bound and nothing names
  * one: the programming path is a loop, one external-hash entry per listener,
  * threaded into the next. It is repeated here rather than widened because a
- * bridged group's listeners are physical ports in this ownership mode and a
+ * bridged group's listeners are physical ports and a
  * gateway has five, so no reachable configuration approaches it -- and because
  * a number that has never been measured should not be quietly raised by the
  * caller that would first depend on it.
@@ -26,8 +26,8 @@ struct cdx_mc_group;
 /* One listener: a physical CDX port and the tags this group's frames leave it
  * with, outermost first, in the order the wire carries them.
  *
- * A bridged listener's tags are not the port's own -- the port has no VLAN
- * interface in this ownership mode and would describe none -- they are what the
+ * A bridged listener's tags are not the port's own -- CDX keeps no VLAN
+ * interface for the port and would describe none -- they are what the
  * bridge would have added on egress for this group's VLAN, which is a tag when
  * the port is a tagged member of it and nothing when the port is untagged.
  * Resolving that is the caller's, because it is a question about bridge
@@ -56,21 +56,16 @@ struct cdx_mc_listener {
 
 /* A group, described once and installed in one pass.
  *
- * The legacy control plane spells this as a sequence of FCI commands -- an ADD
- * naming up to five listeners and an UPDATE for each batch after that --
- * because MC4Command is a wire message with a fixed-depth listener array and
- * CMM forwards whatever arrives. Nothing here has that constraint: a caller
- * that watched the bridge's MDB already knows the whole port set, so the group
- * is described whole and there is no window in which a half-built one is
- * reachable.
+ * A caller that watched the bridge's MDB already knows the whole port set, so
+ * the group is described whole and there is no window in which a half-built
+ * one is reachable.
  *
  * `src` is a specific sender and is never zero. The classifier composes
  * {portid, saddr, daddr, protocol} into an external *hash* table, so a masked
  * source cannot match -- a wildcard would change the hash rather than widen
- * it. MC4Command.src_addr_mask is a wire field the tree reads nowhere and
- * could not have honoured. A caller holding a (*,G) membership therefore has
- * to learn a source before it has a group to install; that is the traffic
- * half of the learner, not something this interface can paper over.
+ * it. A caller holding a (*,G) membership therefore has to learn a source
+ * before it has a group to install; that is the traffic half of the learner,
+ * not something this interface can paper over.
  *
  * Addresses are in network byte order, `family` selects the arm of each, and
  * the unused bytes of both are zero so whole specs compare bytewise.
@@ -202,8 +197,8 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 
 /* Always consumes *group. Releases every listener entry, the classifier entry
  * and the group id, and drops the group's ingress MAC subscription. Storage
- * the microcode may still be walking goes through the same quarantine barrier
- * the legacy delete path uses rather than being freed directly.
+ * the microcode may still be walking goes through the quarantine barrier
+ * rather than being freed directly.
  */
 void cdx_mc_group_del(struct cdx_mc_group **group);
 

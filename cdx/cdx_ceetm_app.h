@@ -98,11 +98,6 @@ Structure and Macro definitions
 /* default TD value */
 #define DEFAULT_CQ_DEPTH        8
 
-/* shaper types */
-#define CHANNEL_SHAPER_TYPE	0		
-#define PORT_SHAPER_TYPE	1
-
-
 /**********************************************************************************************************************
    Function Prototypes
 **********************************************************************************************************************/
@@ -115,12 +110,7 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx);
 int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper);
-int ceetm_configure_shaper(void *cfg);
-int ceetm_configure_wbfq(void *cfg);
-int ceetm_configure_cq(void *cfg);
 int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num);
-int ceetm_get_qos_cfg(struct tQM_context_ctl *qm_ctx, pQosQueryCmd cmd);
-int ceetm_get_cq_query(pQosCqQueryCmd cmd);
 int ceetm_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, uint8_t channel_num, uint8_t clsqueue_num);
 int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp);
 

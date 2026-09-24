@@ -81,12 +81,6 @@
 #define FRAG_DISABLE				(1<<3)
 
 
-/* defined in fpp.h */
-typedef struct fpp_sec_failure_stats_query_cmd {
-	uint16_t	action;
-	en_SEC_failure_stats	SEC_failure_stats;
-} __attribute__((__packed__)) fpp_sec_failure_stats_query_cmd_t;
-
 int cdx_ipsec_init(void);
 void cdx_ipsec_deinit(void);
 bool cdx_ipsec_ready(void);
@@ -106,7 +100,7 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			uint32_t sa_dir_in);
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info);
 int cdx_ipsec_delete_fp_entry(PSAEntry pSA);
-void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow);
+void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes);
 u64 get_oseq_from_sa(PSAEntry sa);
 void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen);
 

@@ -24,16 +24,12 @@ EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX
 #                              see tools/tests/test_ipsec_key_zeroing.py
 #   CDX_DEBUG_MC_HCSYNC_FAIL - dpa_control_mc.c HC-sync fault injection;
 #                              no flowtable-mode driver yet (ISSUES.md A193)
-#   CDX_DEBUG_IPSEC_TEST_XFRM - control_ipsec.c by-SPI xfrm fallback so a
-#                              synthetic NAT-T SA can clear the fast-path
-#                              gate with a real, pre-created `ip xfrm`
-#                              state; see tools/tests/test_ipsec_natt_spi_bounds.py
 #   CDX_DEBUG_DPA_INIT      - startup acquisition fault injection;
 #                              see tools/startup_tests/test_dpa_init.py
 # Single quotes are load-bearing: bitbake inlines EXTRA_OEMAKE verbatim
 # into the generated shell command, so without them the space would split
 # CFG_FLAGS across two make arguments and the second define would be lost.
-EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL=1 -DCDX_DEBUG_IPSEC_TEST_XFRM=1 -DCDX_DEBUG_DPA_INIT=1 -DCDX_DEBUG_FLOWTABLE=1'"
+EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL=1 -DCDX_DEBUG_DPA_INIT=1 -DCDX_DEBUG_FLOWTABLE=1'"
 
 # Silence the [buildpaths] QA warning on the split kernel-module sub-package.
 # cdx.ko embeds a handful of TMPDIR-prefixed header paths in its .rodata

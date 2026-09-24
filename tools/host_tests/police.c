@@ -204,8 +204,8 @@ static int cdx_port_police_set(const char *ifname, bool byte_mode,
 static int cdx_port_police_clear(const char *ifname) { (void)ifname; hw.cleared = true; return SUCCESS; }
 
 /* The colours a profile counted. Free-running totals, as the hardware keeps
- * them, so a case can move them the way traffic would -- or clear them the way
- * the FCI query commands still can. */
+ * them, so a case can move them the way traffic would -- or reset them
+ * underneath the filter. */
 struct cdx_police_counters { u32 green, yellow, red; };
 static struct cdx_police_counters port_hw, prof_hw[CDX_FT_QOS_MAX_POLICER + 1];
 static bool counters_fail;
@@ -417,7 +417,7 @@ int main(void)
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
     assert(s.pkts == 0 && s.drops == 0 && s.lastused == 0);
 
-    /* Another reader cleared the profile. What the counter now holds is the
+    /* The profile was reset underneath. What the counter now holds is the
      * whole of the delta; reading a counter that went backwards as a 32-bit
      * wrap would credit the filter with four billion frames it never saw. */
     port_hw = (struct cdx_police_counters){ .green = 3, .yellow = 0, .red = 1 };

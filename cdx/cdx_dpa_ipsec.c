@@ -10,11 +10,11 @@
 
 /*
  * Concurrency:
- *   The IPsec SA lifecycle (add, remove, update) is driven by
- *   netlink from userspace through the FCI command path, which
- *   serializes ioctl dispatch through cdx_cmdhandler via
- *   ctrl->mutex (see cdx_main.c). SA state mutations therefore
- *   run single-threaded with respect to each other.
+ *   The IPsec SA lifecycle (add, remove, update) is driven by the
+ *   flowtable adapter's XFRM provider through cdx_ipsec_backend.c,
+ *   inside the flowtable transaction, which holds ctrl->mutex (see
+ *   cdx_main.c). SA state mutations therefore run single-threaded
+ *   with respect to each other.
  *
  *   Per-SA DMA maps (auth_key_dma, crypto_key_dma, shared_desc):
  *      - Maps/unmaps happen inside a single call to
@@ -38,7 +38,7 @@
  *        command path.
  *
  * Contexts:
- *   cdx_ipsec_add/remove/update_*     - process, FCI command.
+ *   cdx_ipsec_add/remove/update_*     - process, flowtable transaction.
  *   cdx_ipsec_sec_sa_context_*        - process, under command path.
  *   split_key_done (CAAM callback)    - softirq; touches only the
  *                                       per-call completion atomic_t.
@@ -61,8 +61,6 @@
 #include "cdx_common.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
-#include "control_pppoe.h"
-#include "control_socket.h"
 #include "layer2.h"
 #include "control_ipsec.h"
 
@@ -316,14 +314,6 @@ static inline void cdx_ipsec_capture_post_free(void *p, size_t n) { }
 #define PPPOE_HDR_LEN		8 
 #define UDP_HEADER_LEN          8
 
-extern int gIPSecStatQueryTimer;
-/*Here 1300000 value came based on 128 packet size max packets getting fastforwarded
- * is 921828. On safe side increased it to 1300000.
- */
-#define MAX_IPSEC_PKTS_FWD_PSEC	1300000
-#define SEQ_NUM_SOFT_LIMIT	(0xFFFFFFFF - (MAX_IPSEC_PKTS_FWD_PSEC * gIPSecStatQueryTimer))
-#define SEQ_NUM_ESN_SOFT_LIMIT	(0xFFFFFFFFFFFFFFFF - (MAX_IPSEC_PKTS_FWD_PSEC * gIPSecStatQueryTimer))
-
 struct ipsec_info *ipsec_instance;
 int sec_era;
 U64 post_sec_out_data_off;
@@ -402,8 +392,6 @@ static uint32_t cdx_ipsec_sh_desc_hdr_flags(PSAEntry sa)
 
 	return HDR_SAVECTX | HDR_SHARE_SERIAL;
 }
-
-extern void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
 
 extern int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num);
 
@@ -748,9 +736,6 @@ static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 	/* delete from list_fq */
 	sa_remove_from_list_fqid(pSA);
 
-	/* remove xfrm_state */
-	if (pSA->xfrm_state)
-		cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(pSA->xfrm_state);
 	sa_context = pSA->pSec_sa_context;
 	cdx_ipsec_sec_sa_context_free(sa_context);
 	pSA->pSec_sa_context = NULL;
@@ -945,12 +930,11 @@ static  void build_stats_descriptor_part(PSAEntry sa, size_t pdb_len)
 			((stats_offset + 8) << MOVE_OFFSET_SHIFT) | sizeof(u64));
 }
 
-void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow)
+void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes)
 {
 	uint32_t *desc;
 	uint32_t *stats_desc;
 	uint64_t* bytes_desc;
-	uint64_t  ullCurSeqNum;
 
 	PDpaSecSAContext pSec_sa_context = sa->pSec_sa_context;
 
@@ -959,38 +943,6 @@ void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow)
 
 	stats_desc++;
 	*pkts =  be32_to_cpu(*stats_desc);
-	if ((pSeqOverflow) && (!sa->seq_overflow))
-	{
-		if (sa->direction  == CDX_DPA_IPSEC_OUTBOUND)
-		{
-			ullCurSeqNum = be32_to_cpu(sa->pSec_sa_context->sec_desc->pdb_en.seq_num_ext_hi);
-			ullCurSeqNum <<= 32;
-			ullCurSeqNum |= be32_to_cpu(sa->pSec_sa_context->sec_desc->pdb_en.seq_num);
-		}
-		else
-		{
-			ullCurSeqNum = be32_to_cpu(sa->pSec_sa_context->sec_desc->pdb_dec.seq_num_ext_hi);
-			ullCurSeqNum <<= 32;
-			ullCurSeqNum |= be32_to_cpu(sa->pSec_sa_context->sec_desc->pdb_dec.seq_num); 
-		}
-
-		if (sa->flags & SA_ALLOW_EXT_SEQ_NUM)
-		{
-			if (ullCurSeqNum > SEQ_NUM_ESN_SOFT_LIMIT)
-			{
-				*pSeqOverflow = 1;
-				sa->seq_overflow = 1;
-			}
-		}
-		else
-		{
-			if (ullCurSeqNum > SEQ_NUM_SOFT_LIMIT)
-			{
-				*pSeqOverflow = 1;
-				sa->seq_overflow = 1;
-			}
-		}
-	}
 	/* increment 8 bytes to go to byte cnt */
 	stats_desc++;
 	bytes_desc = (uint64_t*)stats_desc;
@@ -1658,9 +1610,9 @@ static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
  * the width only bounds how late a frame never seen may still be taken. A
  * narrower window than asked would drop frames the configuration accepts,
  * which is why a window wider than 128 is refused when the SA is added
- * (CDX_IPSEC_REPLAY_WINDOW_MAX) rather than narrowed here. An SA whose
- * creator named no width -- the legacy owner, which FCI never told -- keeps
- * the 64 entries it always had.
+ * (CDX_IPSEC_REPLAY_WINDOW_MAX) rather than narrowed here. A zero width
+ * comes with SA_ALLOW_SEQ_ROLL, which answers first; were it to arrive
+ * alone, the SA would keep SEC's 64 entries.
  */
 static u32 cdx_ipsec_ars(PSAEntry sa)
 {
@@ -2757,28 +2709,4 @@ err_ret:
 	return FAILURE;
 }
 
-int IPsec_get_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len)
-{
-	fpp_sec_failure_stats_query_cmd_t *pStats;
-	int retval;
-
-	if (cmd_len < sizeof(fpp_sec_failure_stats_query_cmd_t))
-	{
-		return ERR_WRONG_COMMAND_SIZE;
-	}
-
-	pStats = (fpp_sec_failure_stats_query_cmd_t *)pcmd;
-	retval = ExternalHashGetSECfailureStats(&pStats->SEC_failure_stats);
-
-	if (retval)
-		return ERR_WRONG_COMMAND_PARAM;
-
-	return cmd_len;
-}
-
-int IPsec_reset_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len)
-{
-	ExternalHashResetSECfailureStats();
-	return 0;
-}
 #endif /* DPA_IPSEC_OFFLOAD */

@@ -42,16 +42,6 @@ static __inline void __WRITE_UNALIGNED_INT(void *_addr, U32 _val)
 
 #define WRITE_UNALIGNED_INT(var, val) __WRITE_UNALIGNED_INT(&(var), (val))
 
-typedef struct tHostMessage {
-	u16	length;
-	u16	code;
-	u16	data[128];
-} HostMessage;
-
-HostMessage *msg_alloc(void);
-void msg_free(HostMessage *msg);
-int msg_send(HostMessage *msg);
-
 void *Heap_Alloc(int size);
 
 #define Heap_Alloc_ARAM(s)	Heap_Alloc(s)

@@ -4,10 +4,8 @@
  *
  * Ingress policing as a tc verb.
  *
- * The FMAN meters ingress traffic with RFC-2698 policer profiles, and until now
- * the only way to set one was an FCI command -- a control plane that is sealed
- * in flowtable mode and whose only client does not run there. tc already has
- * the vocabulary:
+ * The FMAN meters ingress traffic with RFC-2698 policer profiles, which only
+ * CMM's control plane used to set. tc already has the vocabulary:
  *
  *	tc qdisc  add dev eth4 clsact
  *	tc filter add dev eth4 ingress matchall \
@@ -156,12 +154,12 @@ struct cdx_police_port {
 
 static LIST_HEAD(cdx_police_ports);
 
-/* One counter's delta. A counter that has gone backwards was cleared by
- * another reader -- the FCI query commands still clear these on request --
- * rather than having wrapped, so the value it now holds is the whole of the
- * delta. Reading it as a 32-bit wrap instead would credit a filter with most
- * of four billion frames to cover a sample nobody missed, which is a far worse
- * answer than losing one wrap's worth of counting. */
+/* One counter's delta. A counter that has gone backwards was reset
+ * underneath the filter rather than having wrapped, so the value it now holds
+ * is the whole of the delta. Reading it as a 32-bit wrap
+ * instead would credit a filter with most of four billion frames to cover a
+ * sample nobody missed, which is a far worse answer than losing one wrap's
+ * worth of counting. */
 static u32 cdx_police_delta(u32 *last, u32 now)
 {
 	u32 delta = now >= *last ? now - *last : now;

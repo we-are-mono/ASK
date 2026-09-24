@@ -53,13 +53,9 @@ struct cdx_ipsec_key {
 
 /* Everything an SA needs, in one value.
  *
- * The legacy control plane spells this as five FCI commands in sequence --
- * CREATE, SET_KEYS, SET_TUNNEL or SET_NATT, SET_LIFETIME, SET_STATE -- because
- * PF_KEY delivers an SA to userspace in installments and CMM forwards each one
- * as it arrives. Nothing here has that constraint: xdo_dev_state_add() is
- * handed a complete xfrm_state, so the SA is described once and installed
- * once, and there is no window in which a half-built SA is reachable by
- * handle.
+ * xdo_dev_state_add() is handed a complete xfrm_state, so the SA is described
+ * once and installed once, and there is no window in which a half-built SA is
+ * reachable by handle.
  *
  * Addresses are the SA's own endpoints. In tunnel mode they are also the outer
  * header's, which the backend builds rather than receiving prebuilt: the
@@ -103,8 +99,8 @@ struct cdx_ipsec_sa_spec {
 	 * numbers its peer has already seen. */
 	u64 seq;
 	/* The anti-replay window an inbound SA asked for, in packets. Zero
-	 * turns anti-replay off, which is what the legacy owner's
-	 * SA_ALLOW_SEQ_ROLL means. SEC keeps 32, 64 or 128 entries: a
+	 * turns anti-replay off, which the SA cache records as
+	 * SA_ALLOW_SEQ_ROLL. SEC keeps 32, 64 or 128 entries: a
 	 * narrower window is carried on the next wider one, and one wider
 	 * than CDX_IPSEC_REPLAY_WINDOW_MAX is refused. An outbound SA checks
 	 * nothing and ignores it. */
@@ -117,9 +113,7 @@ struct cdx_ipsec_sa_spec {
 	/* The next hop toward the remote tunnel endpoint, for an outbound SA.
 	 *
 	 * An outbound SA needs egress framing at install time, because the
-	 * encapsulated frame leaves SEC already addressed. The legacy owner
-	 * supplied that as a route object it had already been told about over
-	 * FCI; this ownership mode keeps no such table, so the caller resolves
+	 * encapsulated frame leaves SEC already addressed. The caller resolves
 	 * the peer itself and names the result here, exactly as a flow's rule
 	 * names its own destination MAC. Ignored for an inbound SA, which is
 	 * classified rather than transmitted.
@@ -192,20 +186,15 @@ bool cdx_ipsec_port_supported(struct net_device *dev);
 
 /* Install an SA and return its opaque owner.
  *
- * `x` is the kernel state this SA was built from, and it is **borrowed**: the
- * backend records the pointer and takes no reference. It needs the pointer
- * because the SEC completion path has nothing but the SA's handle to work
- * from and the stack drops a decrypted frame unless a sec_path naming the
- * state is attached first. It must not take a reference because the caller is
- * expected to destroy this SA from inside the kernel's own teardown of that
- * state, which only runs once every reference is gone -- a reference here
- * would be waiting for the teardown that is waiting for it. The pointer is
- * therefore valid exactly as long as the caller honours that: destroy the SA
- * while the state is still allocated.
+ * `x` is the kernel state this SA was built from. The backend neither keeps
+ * the pointer nor takes a reference: the SEC completion path finds the state
+ * by the SA's handle, which the caller publishes as x->handle, and a
+ * reference here would be a cycle -- the caller destroys this SA from inside
+ * the kernel's own teardown of that state, which only runs once every
+ * reference is gone.
  *
  * The handle is allocated here rather than supplied. A caller has no way to
- * know which values are free -- the SA cache is indexed by them -- and the
- * legacy owner only got to choose because it was the only client. Read it back
+ * know which values are free -- the SA cache is indexed by them. Read it back
  * with cdx_ipsec_sa_handle() and store it wherever the caller needs to
  * recognise this SA later.
  *
@@ -218,8 +207,7 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		     struct cdx_ipsec_sa **result);
 
 /* Always consumes *sa. Releases the SEC context, the classifier entry and the
- * handle, and drops the borrowed state pointer without putting a reference it
- * never took. A flow still naming this SA is not the backend's problem to
+ * handle. A flow still naming this SA is not the backend's problem to
  * solve: the caller retires its dependent directions first, exactly as it
  * does for a neighbour or a route.
  */
@@ -234,8 +222,7 @@ unsigned int cdx_ipsec_sa_count(void);
  * The peer's Ethernet address is not consulted per frame. It is written into
  * the classifier entry's header-manipulation opcodes when that entry is
  * built, so a peer that moves cannot be followed by storing a new value
- * anywhere: the entry has to come out and go back in. That is what the legacy
- * owner did on CMD_IPSEC_SA_SET_TNL_ROUTE, and it is what this does.
+ * anywhere: the entry has to come out and go back in, which is what this does.
  *
  * The SEC context is untouched. SA_SH_DESC_BUILT keeps the shared descriptor
  * -- the keys, the PDB and the outer header -- exactly as it was, so the

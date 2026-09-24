@@ -2557,7 +2557,7 @@ static void test_queue_budget(void)
 }
 
 /* An interface with no CEETM context cannot host this qdisc, and neither can a
- * port another control plane already configured. */
+ * port still configured by a tree that was never taken down. */
 static void test_refusals(void)
 {
 	struct net_device bare = { 0 };

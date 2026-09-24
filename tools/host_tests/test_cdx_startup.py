@@ -36,6 +36,33 @@ def test_cdx_shutdown(tmp_path):
                         "UBSAN_OPTIONS": "halt_on_error=1"})
 
 
+@pytest.mark.parametrize("ipsec", [True, False])
+def test_cdx_subsystems(tmp_path, ipsec):
+    """Each subsystem's exit runs once, only if its init succeeded, and in the
+    reverse of the order they came up -- at every failure point, since the
+    module's deinit chain runs the exit whatever the init returned."""
+    main = (ROOT / "cdx/cdx_main.c").read_text()
+    # The per-subsystem flags, as declared: the IPsec one only where IPsec is
+    # built, or a build without it warns about a flag nothing reads.
+    flags = main[main.index("static bool cdx_tx_up"):main.index("static int __init cdx_subsys_init")]
+    (tmp_path / "cdx_subsys.inc").write_text(
+        flags + function(main, "cdx_subsys_init") + function(main, "cdx_subsys_exit"))
+    binary = tmp_path / "cdx_subsys"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-Wall", "-Wextra", "-Werror",
+        "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+        *(["-DDPA_IPSEC_OFFLOAD"] if ipsec else []),
+        "-I", str(tmp_path), str(Path(__file__).with_name("cdx_subsys.c")),
+        "-o", str(binary),
+    ], check=True)
+    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30,
+                            env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+                                 "UBSAN_OPTIONS": "halt_on_error=1"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"CDX subsystem fault points passed: {6 if ipsec else 5}" in result.stdout
+
+
 def test_cdx_startup(tmp_path):
     source = (ROOT / "cdx/dpa_cfg.c").read_text()
     names = ["release_cfg_info", "dpa_prepare_ports", "dpa_set_ports_enabled",

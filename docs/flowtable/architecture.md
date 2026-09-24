@@ -47,9 +47,9 @@ CDX has no flowtable-module dependency. Kernel integration targets the pinned
 The flowtable adapter is the only hardware flow owner; there is no boot-time
 owner selection. The test initramfs loads CDX and then the adapter. CMM, FCI
 and auto_bridge are neither built nor shipped; their source trees remain only
-as reference. CDX's FCI entry point, `comcerto_fpp_send_command()`, returns
-`-EOPNOTSUPP` for every command, and the FCI command handlers behind it are
-dead code awaiting removal. `ask.flowtable_observe=1` on the kernel command
+as reference. CDX no longer carries an FCI entry point or command handlers:
+the flowtable adapter and the tc, devlink and netdev verbs are its only
+control surfaces. `ask.flowtable_observe=1` on the kernel command
 line validates requests but declines installation; CDX owns the read-only
 `flowtable_observe` module parameter. Module loading is implemented in the test
 initramfs; production packaging and persistent deployment remain separate work.

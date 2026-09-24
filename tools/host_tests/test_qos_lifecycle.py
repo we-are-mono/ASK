@@ -48,7 +48,7 @@ def test_qos_lifecycle(tmp_path):
     constants = (ROOT / "cdx/cdx_ceetm_app.h").read_text()
     (tmp_path / "qos_types.inc").write_text(
         constants[constants.index("#define CDX_CEETM_MAX_LNIS"):constants.index("   Function Prototypes")].rsplit("/*", 1)[0]
-        + header[header.index("struct ceetm_fq {"):header.index("// commands")]
+        + header[header.index("struct ceetm_fq {"):header.index("/* return values */")]
     )
     names = [
         "ceetm_resolve_channel", "ceetm_get_egressfq", "ceetm_egressfq_hook",

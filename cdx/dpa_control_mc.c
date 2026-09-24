@@ -13,7 +13,6 @@
  * redefining them. */
 #include "portdefs.h"
 #include "cdx.h"
-#include "cdx_cmd_validator.h"
 #include "list.h"
 #include "cdx_common.h"
 #include "misc.h"
@@ -45,10 +44,9 @@ typedef union ucode_phyaddr_u {
  *        arrays of MC{4,6}_NUM_HASH_ENTRIES entries. A given
  *        bucket's list (mc{4,6}_grp_list[hash]) is walked and
  *        mutated under its matching spinlock. Mutators and walkers
- *        (the latter in cdx_mc_query.c) must agree on the
- *        convention - use plain spin_lock()/unlock() everywhere
- *        so process-context and softirq-context callers don't
- *        disagree on bh state.
+ *        must agree on the convention - use plain
+ *        spin_lock()/unlock() everywhere so process-context and
+ *        softirq-context callers don't disagree on bh state.
  *   mc4_grp_list[], mc6_grp_list[]
  *      - Arrays of list heads, one per hash bucket. Protected by
  *        the matching spinlock above.
@@ -60,16 +58,15 @@ typedef union ucode_phyaddr_u {
  *        out of the FMAN replication chain but not yet provably
  *        walker-free. This file only places entries into it and
  *        retires them; the lock discipline (none of its own; the
- *        mcast callers hold the FCI ctrl.mutex plus
- *        mc_mutators_mutex below, mc{4,6}_exit() runs at module
- *        unload with no handler in flight) is documented at the
- *        implementation.
+ *        mcast callers hold ctrl.mutex plus mc_mutators_mutex
+ *        below, mc{4,6}_exit() runs at module unload with no
+ *        caller in flight) is documented at the implementation.
  *
  * Contexts:
- *   AddToMcastGrpList(), GetMcastGrp(), cdx_delete_mcast_group_*()
- *                        - process, IGMP/MLD-driven slow path.
- *   Lookups from mc_query.c
- *                        - process, ioctl query path.
+ *   cdx_mc_group_add/replace/del()
+ *                        - process, under the flowtable transaction.
+ *   cdx_mcast_clear_itf_refs()
+ *                        - process, interface removal.
  *
  * Lock ordering: these spinlocks are leaves - do not take any
  * other cdx lock while holding one.
@@ -84,30 +81,17 @@ uint8_t *mc4grp_ids=NULL, *mc6grp_ids=NULL;
 spinlock_t *mc4_spinlocks =  NULL, *mc6_spinlocks = NULL;
 uint16_t  max_mc4grp_ids, max_mc6grp_ids;
 
-/* Serializes mcast mutators (ADD / REMOVE / UPDATE). The lookup-then-
- * mutate sequences inside cdx_create/update/delete_mcast_group_member
- * unavoidably drop the per-bucket spinlock between GetMcastGrp /
- * Cdx_GetMcastMemberId and the eventual members[] / list mutation —
- * helpers like ExternalHashTableFmPcdHcSync sleep on FmPcdLock and
- * can't be held under spinlock. Without an outer lock, two concurrent
- * mutators of the same group could TOCTOU each other's member_id /
- * pMcastGrpInfo pointer (ISSUES.md M10, M11). Today's FCI dispatcher
- * happens to run one command at a time, providing the invariant
- * implicitly; this mutex makes it explicit and survives any future
- * caller that runs from a kthread / workqueue.
- *
- * Held only across mutators in MC{4,6}_Command_Handler; queries
- * stay outside it (they're protected by mc{4,6}_spinlocks[] for
- * list traversal plus mc_query_mutex in cdx_mc_query.c for the
- * paginated snapshot state). */
+/* Serializes the group mutators (cdx_mc_group_add/replace/del) and the
+ * interface-removal sweep. Their lookup-then-mutate sequences unavoidably
+ * drop the per-bucket spinlock between finding a group and mutating its
+ * members[] or list linkage -- helpers like ExternalHashTableFmPcdHcSync
+ * sleep on FmPcdLock and can't be held under spinlock. Without an outer
+ * lock, two mutators of the same group could TOCTOU each other's
+ * pMcastGrpInfo pointer (ISSUES.md M10, M11). The flowtable transaction
+ * happens to serialize every current caller; this mutex makes the invariant
+ * explicit and survives any future caller that runs from a kthread or
+ * workqueue. */
 static DEFINE_MUTEX(mc_mutators_mutex);
-
-static inline bool mcast_action_is_mutator(uint16_t action)
-{
-	return action == CDX_MC_ACTION_ADD ||
-	       action == CDX_MC_ACTION_REMOVE ||
-	       action == CDX_MC_ACTION_UPDATE;
-}
 
 #ifdef CDX_DEBUG_MC_HCSYNC_FAIL
 /*
@@ -146,8 +130,7 @@ static struct proc_dir_entry *mc_hcsync_fail_proc;
 #endif /* CDX_DEBUG_MC_HCSYNC_FAIL */
 
 /* Single funnel for every FMAN host-command barrier this file issues by
- * hand - i.e. the ones that follow a listener splice: the legacy REMOVE's
- * open-coded unlink, and cdx_mc_group_replace()'s chain swap.
+ * hand - i.e. the one that follows cdx_mc_group_replace()'s chain swap.
  * Barriers issued inside the shared ehash helpers (DeleteKey's internal
  * sync, cdx_ehash_quarantine_drain()) are not routed through here and
  * are not affected by this file's knob.
@@ -254,9 +237,9 @@ void cdx_mc_remove_hcsync_fail_probe(void)
  * MAC — otherwise the FMAN MEMAC hardware filter drops matching
  * frames before PCD can classify and replicate them. PROMISC on this
  * driver bypasses unicast filtering only; multicast filtering still
- * applies. Without an explicit dev_mc_add() during MC4 ADD, an
- * offload-managed group silently fails: FCI returns NO_ERR, cmm
- * query mc4 shows the group, zero frames replicate. */
+ * applies. Without an explicit dev_mc_add() when the group is added, an
+ * offload-managed group silently fails: the add succeeds, the group is
+ * installed, and zero frames replicate. */
 static void cdx_mcast_group_mac(const struct mcast_group_info *grp,
 				uint8_t mac[ETH_ALEN])
 {
@@ -296,40 +279,16 @@ static void cdx_mcast_compute_mac(const struct mcast_group_info *grp,
 		cdx_mcast_group_mac(grp, mac);
 }
 
-/* The group's ingress device.
- *
- * A group whose owner holds the device uses it; one that only has a name looks
- * the name up. The distinction matters at teardown rather than at install: a
- * rename between the two would leave the name lookup finding nothing, and the
- * dev_mc_add() refcount would never be dropped. Returns NULL with nothing held
- * when the device is gone, which for an unsubscribe means the subscription
- * went with it. */
-static struct net_device *cdx_mcast_ingress_dev(const struct mcast_group_info *grp,
-						bool *put)
-{
-	*put = false;
-	if (grp->in_dev)
-		return grp->in_dev;
-	*put = true;
-	return dev_get_by_name(&init_net, grp->ucIngressIface);
-}
-
+/* Both go through the group's ingress device, which the owner pins for the
+ * group's life (cdx_mcast_backend.h), never its name: a rename between the
+ * two would leave a name lookup finding nothing, and the dev_mc_add()
+ * refcount would never be dropped. */
 static int cdx_mcast_subscribe_ingress_mac(const struct mcast_group_info *grp,
 					   const uint8_t mac[ETH_ALEN])
 {
-	struct net_device *dev;
-	bool put;
 	int rc;
 
-	dev = cdx_mcast_ingress_dev(grp, &put);
-	if (!dev) {
-		DPA_ERROR("%s::ingress netdev %s not found\n", __func__,
-			  grp->ucIngressIface);
-		return -ENODEV;
-	}
-	rc = dev_mc_add(dev, mac);
-	if (put)
-		dev_put(dev);
+	rc = dev_mc_add(grp->in_dev, mac);
 	if (rc)
 		DPA_ERROR("%s::dev_mc_add(%s, %pM) failed: %d\n",
 			  __func__, grp->ucIngressIface, mac, rc);
@@ -339,18 +298,7 @@ static int cdx_mcast_subscribe_ingress_mac(const struct mcast_group_info *grp,
 static void cdx_mcast_unsubscribe_ingress_mac(const struct mcast_group_info *grp,
 					      const uint8_t mac[ETH_ALEN])
 {
-	struct net_device *dev;
-	bool put;
-
-	dev = cdx_mcast_ingress_dev(grp, &put);
-	if (!dev) {
-		/* Interface gone (e.g. removed before group teardown). The
-		 * subscription is gone with it; nothing to undo. */
-		return;
-	}
-	(void)dev_mc_del(dev, mac);
-	if (put)
-		dev_put(dev);
+	(void)dev_mc_del(grp->in_dev, mac);
 }
 
 
@@ -380,64 +328,6 @@ void AddToMcastGrpList(struct mcast_group_info *pMcastGrpInfo)
 	}
 
 	return;
-}
-
-int GetMcastGrpId( struct mcast_group_info *pMcastGrpInfo,
-		uint8_t *ingress_iface)
-{
-	struct mcast_group_info *tmp;
-	struct list_head *ptr;
-	unsigned int uiHash;
-
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
-
-		spin_lock(&mc4_spinlocks[uiHash]);
-		list_for_each(ptr, &mc4_grp_list[uiHash])
-		{
-			tmp = list_entry(ptr,struct mcast_group_info,list);
-
-			DPA_INFO("%s(%d) tmp->ucIngressIface %s, pMcastGrpInfo->ucIngressIface %s dst-addr 0x%x, s-addr %x\n",
-					__func__,__LINE__, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface, tmp->ipv4_daddr,
-					tmp->ipv4_saddr);
-			if((tmp->ipv4_daddr == pMcastGrpInfo->ipv4_daddr)
-					&& (tmp->ipv4_saddr == pMcastGrpInfo->ipv4_saddr))
-			{
-				if (ingress_iface)
-					strncpy(ingress_iface,tmp->ucIngressIface, IF_NAME_SIZE);
-				spin_unlock(&mc4_spinlocks[uiHash]);
-				return tmp->grpid;
-			}
-		}
-		spin_unlock(&mc4_spinlocks[uiHash]);
-	}
-	else
-	{
-		uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
-		spin_lock(&mc6_spinlocks[uiHash]);
-		list_for_each(ptr, &mc6_grp_list[uiHash])
-		{
-			tmp = list_entry(ptr,struct mcast_group_info,list);
-			DPA_INFO("%s(%d) ptr %p tmp->ucIngressIface %s, pMcastGrpInfo->ucIngressIface %s\n",
-					__func__,__LINE__, tmp,  tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface);
-			DPA_INFO("%s(%d) tmp ipv6daddr: 0x%x:%x:%x:%x src-addr: 0x%x:%x:%x:%x \n",
-					__func__,__LINE__, tmp->ipv6_daddr[0], tmp->ipv6_daddr[1],
-					tmp->ipv6_daddr[2], tmp->ipv6_daddr[3], tmp->ipv6_saddr[0],
-					tmp->ipv6_saddr[1], tmp->ipv6_saddr[2], tmp->ipv6_saddr[3]);
-
-			if(!IPV6_CMP(tmp->ipv6_daddr, pMcastGrpInfo->ipv6_daddr) 
-					&& !IPV6_CMP(tmp->ipv6_saddr, pMcastGrpInfo->ipv6_saddr))   
-			{
-				if (ingress_iface)
-					strncpy(ingress_iface,tmp->ucIngressIface, IF_NAME_SIZE);
-				spin_unlock(&mc6_spinlocks[uiHash]);
-				return tmp->grpid;
-			}
-		}
-		spin_unlock(&mc6_spinlocks[uiHash]);
-	}
-	return -1;
 }
 
 static int GetNewMcastGrpId(uint8_t mctype)
@@ -487,62 +377,6 @@ static void FreeMcastGrpID(uint8_t mctype, int grp_id)
 	}
 }
 
-struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo)
-{
-	struct mcast_group_info *tmp;
-	struct list_head *ptr;
-	unsigned int uiHash;
-
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
-		spin_lock(&mc4_spinlocks[uiHash]);
-		list_for_each(ptr, &mc4_grp_list[uiHash])
-		{
-			tmp = list_entry(ptr,struct mcast_group_info,list);
-
-			DPA_INFO("%s(%d) tmp->ucIngressIface %s, pMcastGrpInfo->ucIngressIface %s dst-addr 0x%x, s-addr %x\n",
-					__func__,__LINE__, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface, tmp->ipv4_daddr,
-					tmp->ipv4_saddr);
-			if((tmp->ipv4_daddr == pMcastGrpInfo->ipv4_daddr)
-					&& (!strncmp(pMcastGrpInfo->ucIngressIface, tmp->ucIngressIface, IF_NAME_SIZE))
-					&& (tmp->ipv4_saddr == pMcastGrpInfo->ipv4_saddr))
-			{
-				spin_unlock(&mc4_spinlocks[uiHash]);
-				return tmp;
-			}
-		}
-		spin_unlock(&mc4_spinlocks[uiHash]);
-	}
-	else
-	{
-		uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
-		spin_lock(&mc6_spinlocks[uiHash]);
-		list_for_each(ptr, &mc6_grp_list[uiHash])
-		{
-			tmp = list_entry(ptr,struct mcast_group_info,list);
-
-			DPA_INFO("%s(%d) ptr %p, tmp->ucIngressIface %s, pMcastGrpInfo->ucIngressIface %s\n",
-					__func__,__LINE__,tmp, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface);
-			DPA_INFO("%s(%d) tmp ipv6daddr: 0x%x:%x:%x:%x src-addr: 0x%x:%x:%x:%x \n",
-					__func__,__LINE__, tmp->ipv6_daddr[0], tmp->ipv6_daddr[1],
-					tmp->ipv6_daddr[2], tmp->ipv6_daddr[3], tmp->ipv6_saddr[0],
-					tmp->ipv6_saddr[1], tmp->ipv6_saddr[2], tmp->ipv6_saddr[3]);
-			if(!strncmp(pMcastGrpInfo->ucIngressIface, tmp->ucIngressIface, IF_NAME_SIZE))
-			{
-				if(!IPV6_CMP(tmp->ipv6_daddr, pMcastGrpInfo->ipv6_daddr) 
-						&& !IPV6_CMP(tmp->ipv6_saddr, pMcastGrpInfo->ipv6_saddr))   
-				{
-					spin_unlock(&mc6_spinlocks[uiHash]);
-					return tmp;
-				}
-			}
-		}
-		spin_unlock(&mc6_spinlocks[uiHash]);
-	}
-	return NULL;
-}
-
 /* Drops every reference the groups in one hash bucket hold on the interface
  * being removed. Called with the bucket's spinlock held. */
 static void ClearMcastGrpItfRefs(struct list_head *pGrpList, U32 if_index)
@@ -572,21 +406,20 @@ static void ClearMcastGrpItfRefs(struct list_head *pGrpList, U32 if_index)
 	}
 }
 
-/* Called by remove_onif_by_index() while the dying interface is still valid.
- * A multicast group's RouteEntry is allocated on its own, outside rt_cache,
- * so the route walk in layer2.c cannot quarantine it; do it here instead.
- * The bucket spinlocks order us against the ioctl-side query walkers,
- * mc_mutators_mutex against the ADD / REMOVE / UPDATE handlers. */
+/* Called by remove_onif_by_index() while the dying interface is still valid:
+ * a multicast group's RouteEntry names the interface, so clear it before the
+ * caller frees what it points into. mc_mutators_mutex orders us against the
+ * group mutators, the bucket spinlocks against the list walkers. */
 void cdx_mcast_clear_itf_refs(U32 if_index)
 {
 	unsigned int uiHash;
 
 	mutex_lock(&mc_mutators_mutex);
 
-	/* mc{4,6}_exit() frees the bucket lock arrays before the command
-	 * handler teardown reaches the tx and tunnel exits, which also remove
-	 * onifs. Any groups still on the lists at that point are unload-time
-	 * leaks nothing will dereference again, so skipping the walk is safe. */
+	/* mc{4,6}_exit() frees the bucket lock arrays before the subsystem
+	 * teardown reaches tx_exit, which also removes onifs. Any groups still
+	 * on the lists at that point are unload-time leaks nothing will
+	 * dereference again, so skipping the walk is safe. */
 	if (mc4_spinlocks)
 	{
 		for (uiHash = 0; uiHash < MC4_NUM_HASH_ENTRIES; uiHash++)
@@ -610,143 +443,26 @@ void cdx_mcast_clear_itf_refs(U32 if_index)
 	mutex_unlock(&mc_mutators_mutex);
 }
 
-static int Cdx_GetMcastMemberId(char *pIn_Info, struct mcast_group_info *pMcastGrpInfo)
-{
-	int ii;
-	struct mcast_group_member *pMember;
-	unsigned int uiHash;
-
-	if(!pMcastGrpInfo)
-		return -1;
-
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
-		spin_lock(&mc4_spinlocks[uiHash]);
-	}
-	else
-	{
-		uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
-		spin_lock(&mc6_spinlocks[uiHash]);
-	}
-	for(ii=0; ii < MC4_MAX_LISTENERS_PER_GROUP; ii++)
-	{
-		pMember = &(pMcastGrpInfo->members[ii]);
-		if(pMember->bIsValidEntry == 1)
-		{
-			if(strcmp(pIn_Info,pMember->if_info )== 0)
-			{
-				if(pMcastGrpInfo->mctype == 0)
-					spin_unlock(&mc4_spinlocks[uiHash]);
-				else
-					spin_unlock(&mc6_spinlocks[uiHash]);
-				return pMember->member_id;
-			}
-		}
-	}  
-	if(pMcastGrpInfo->mctype == 0)
-		spin_unlock(&mc4_spinlocks[uiHash]);
-	else
-		spin_unlock(&mc6_spinlocks[uiHash]);
-	return -1;
-}
-
-
-static int Cdx_GetMcastMemberFreeIndex(struct mcast_group_info *pMcastGrpInfo)
-{
-	int ii;
-	struct mcast_group_member *pMember;
-	unsigned int uiHash;
-
-	if(!pMcastGrpInfo)
-		return -1;
-
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
-		spin_lock(&mc4_spinlocks[uiHash]);
-	}
-	else
-	{
-		uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
-		spin_lock(&mc6_spinlocks[uiHash]);
-	}
-
-	for(ii=0; ii < MC4_MAX_LISTENERS_PER_GROUP; ii++)
-	{
-		pMember = &(pMcastGrpInfo->members[ii]);
-		if (pMember->bIsValidEntry == 0)
-		{
-			if(pMcastGrpInfo->mctype == 0)
-				spin_unlock(&mc4_spinlocks[uiHash]);
-			else
-				spin_unlock(&mc6_spinlocks[uiHash]);
-			return ii;
-		}
-	}  
-	if(pMcastGrpInfo->mctype == 0)
-		spin_unlock(&mc4_spinlocks[uiHash]);
-	else
-		spin_unlock(&mc6_spinlocks[uiHash]);
-	return -1;
-}
 
 
 int cdx_free_exthash_mcast_members(struct mcast_group_info *pMcastGrpInfo);
 
-/* One listener of an FCI-described group.
- *
- * The legacy control plane names a registered interface, so both halves of the
- * listener -- the onif its classification and egress framing come from, and the
- * netdev whose MTU the enqueue opcode carries -- are found by that one name.
- * Whatever tags it carries are the interface's own, which is why no
- * encapsulation is named here; see create_exthash_entry4mcast_member().
- */
-static struct en_exthash_tbl_entry *mcast_member_by_name(RouteEntry *pRtEntry,
-		U8 *name, struct en_exthash_tbl_entry *prev_tbl_entry,
-		uint32_t tbl_type)
-{
-	struct en_exthash_tbl_entry *tbl_entry;
-	struct net_device *dev;
-	POnifDesc onif_desc;
-
-	onif_desc = get_onif_by_name(name);
-	if (!onif_desc) {
-		DPA_ERROR("%s::unable to get onif for iface %s\n", __func__, name);
-		return NULL;
-	}
-	dev = dev_get_by_name(&init_net, (const char *)name);
-	if (!dev) {
-		DPA_ERROR("%s::no netdev for iface %s\n", __func__, name);
-		return NULL;
-	}
-	tbl_entry = create_exthash_entry4mcast_member(pRtEntry, onif_desc, dev, NULL,
-						     NULL, prev_tbl_entry, tbl_type);
-	dev_put(dev);
-	return tbl_entry;
-}
-
 /* The group's root entry: the classifier key, and the pointer to the head of
  * the listener chain the microcode replicates along.
  *
- * Everything this needs is already in the group -- the ingress interface name,
- * both addresses and the family -- so it takes no command. It used to read the
- * FCI message for the same three things, which meant the only way to build a
- * group's root entry was to have a wire message to hand. */
+ * Everything this needs is already in the group -- the ingress device, both
+ * addresses and the family. */
 static int cdx_add_mcast_table_entry(struct mcast_group_info *pMcastGrpInfo)
 {
+	struct dpa_iface_info *iface;
 	RouteEntry *pRtEntry;
 	POnifDesc onif_desc;
 	struct _tCtEntry *pCtEntry;
 	int retval,ii;
 	uint64_t phyaddr=0;
-	char ucInterface[IF_NAME_SIZE];
 
 	pRtEntry = NULL;
 	pCtEntry = NULL;
-
-	strncpy(ucInterface, pMcastGrpInfo->ucIngressIface, IF_NAME_SIZE-1);
-	ucInterface[IF_NAME_SIZE-1] = '\0';
 
 	pRtEntry = kzalloc((sizeof(RouteEntry)), GFP_KERNEL);
 	if (!pRtEntry)
@@ -783,24 +499,19 @@ static int cdx_add_mcast_table_entry(struct mcast_group_info *pMcastGrpInfo)
 		pCtEntry->fftype = FFTYPE_IPV6;
 	}
 
-	/* By device where the owner holds one, by name otherwise -- the same
-	 * split, and for the same reason, as a listener's resolution. */
-	if (pMcastGrpInfo->in_dev) {
-		struct dpa_iface_info *iface;
-
-		iface = dpa_get_ifinfo_by_netdev(pMcastGrpInfo->in_dev);
-		onif_desc = (iface && iface->itf_id < L2_MAX_ONIF) ?
-			get_onif_by_index(iface->itf_id) : NULL;
-		if (onif_desc && (!(onif_desc->flags & ENTRY_VALID) ||
-				  !onif_desc->itf ||
-				  onif_desc->itf->index != iface->itf_id))
-			onif_desc = NULL;
-	} else {
-		onif_desc = get_onif_by_name(ucInterface);
-	}
+	/* By device, as a listener's resolution is: the owner pins it, and a
+	 * name would stop matching after a rename. */
+	iface = dpa_get_ifinfo_by_netdev(pMcastGrpInfo->in_dev);
+	onif_desc = (iface && iface->itf_id < L2_MAX_ONIF) ?
+		get_onif_by_index(iface->itf_id) : NULL;
+	if (onif_desc && (!(onif_desc->flags & ENTRY_VALID) ||
+			  !onif_desc->itf ||
+			  onif_desc->itf->index != iface->itf_id))
+		onif_desc = NULL;
 	if (!onif_desc)
 	{
-		DPA_ERROR("%s::unable to get onif for iface %s\n",__func__, ucInterface);
+		DPA_ERROR("%s::unable to get onif for iface %s\n",__func__,
+			  pMcastGrpInfo->ucIngressIface);
 		retval = -EIO;
 		goto err_ret;
 	}
@@ -829,8 +540,8 @@ static int cdx_add_mcast_table_entry(struct mcast_group_info *pMcastGrpInfo)
 	}
 	{
 		/* What the group arrives as: the ingress tags the root validates
-		 * and, for a group keyed on them, its frames' own addresses. The
-		 * legacy owner describes neither and keeps its routed root. */
+		 * and, for a group keyed on them, its frames' own addresses. A
+		 * group that names neither keeps its routed root. */
 		struct cdx_l2_encap in_encap = {};
 
 		in_encap.num_ingress = pMcastGrpInfo->in_vlans;
@@ -865,224 +576,6 @@ err_ret:
 	return retval;
 }
 
-
-static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
-{
-	PMC4Command mcast4_group;
-	PMC6Command mcast6_group;
-	MC4Output	*pListener;
-	RouteEntry *pRtEntry, RtEntry;
-	int iRet = 0;
-	struct mcast_group_info *pMcastGrpInfo;
-	int ii, member_id = 0;
-	unsigned int uiNoOfListeners;
-	char *pInIface;
-	uint8_t IngressIface[IF_NAME_SIZE];
-	struct en_exthash_tbl_entry *tbl_entry = NULL;
-	uint32_t tbl_type;
-
-	// memory allocation for multicast group
-	pMcastGrpInfo = (struct mcast_group_info *)kzalloc((sizeof(struct mcast_group_info)), GFP_KERNEL);
-	if(!pMcastGrpInfo)
-	{
-		DPA_ERROR("%s::%d  failed to allocate memory \r\n", __func__, __LINE__);
-		return ERR_NOT_ENOUGH_MEMORY;
-	}
-
-	INIT_LIST_HEAD(&pMcastGrpInfo->list); 
-	DPA_INFO("%s(%d) : IP type %s\n", __func__,__LINE__,
-			(bIsIPv6) ? "IPv6" : "IPv4");
-	memset(&mcast4_group, 0, sizeof(mcast4_group));
-	memset(&mcast6_group, 0, sizeof(mcast6_group));
-	pMcastGrpInfo->mctype = bIsIPv6;
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		mcast4_group = (PMC4Command)mcast_cmd;
-		pMcastGrpInfo->ipv4_saddr = mcast4_group->src_addr;
-		pMcastGrpInfo->ipv4_daddr = mcast4_group->dst_addr;
-		uiNoOfListeners = mcast4_group->num_output;
-		pInIface = mcast4_group->input_device_str;
-		DPA_INFO("%s(%d) listeners %d, Src IP addr 0x%x,Dst IP addr 0x%x\n",
-				__func__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
-				mcast4_group->dst_addr);
-	}
-	else
-	{
-		mcast6_group = (PMC6Command)mcast_cmd;
-		memcpy(pMcastGrpInfo->ipv6_saddr,mcast6_group->src_addr, IPV6_ADDRESS_LENGTH);
-		memcpy(pMcastGrpInfo->ipv6_daddr,mcast6_group->dst_addr, IPV6_ADDRESS_LENGTH);
-		uiNoOfListeners = mcast6_group->num_output;
-		pInIface = mcast6_group->input_device_str;
-		DPA_INFO("%s(%d) listeners %d, Src IPv6 addr 0x%x.%x.%x.%x,Dst IPv6 addr 0x%x.%x.%x.%x\n",
-				__func__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
-				mcast6_group->src_addr[2],mcast6_group->src_addr[3], 
-				mcast6_group->dst_addr[0], mcast6_group->dst_addr[1],mcast6_group->dst_addr[2],
-				mcast6_group->dst_addr[3]);
-	}
-
-	pMcastGrpInfo->grpid = -1; 
-	strncpy(pMcastGrpInfo->ucIngressIface, pInIface, IF_NAME_SIZE-1);
-
-	if((uiNoOfListeners) > MC_MAX_LISTENERS_PER_GROUP)
-	{
-		DPA_ERROR("%s::%d Exceeding max members(%d) in the group \r\n",
-				__func__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
-		iRet	= ERR_MC_MAX_LISTENERS_PER_GROUP;
-		goto err_ret;
-	}
-
-	if((iRet = GetMcastGrpId(pMcastGrpInfo, IngressIface))!= -1)
-	{
-		if (strncmp(pMcastGrpInfo->ucIngressIface, 
-					IngressIface, IF_NAME_SIZE))
-		{
-			DPA_ERROR("%s::%d multiple ingress interfaces(%s, existing %s) are not allowed \n"
-					"for the same set of source IP and dest.IP pair \r\n",
-					__func__, __LINE__,pMcastGrpInfo->ucIngressIface,
-					IngressIface);
-			iRet	= -1;
-			goto err_ret;
-		}
-		kfree(pMcastGrpInfo);
-		DPA_INFO("%s(%d) GetMcastGrpId returned %d, calling update_mcast_grp\n",
-				__func__,__LINE__,iRet);
-		return (cdx_update_mcast_group(mcast_cmd, bIsIPv6));
-	}
-
-	if ((pMcastGrpInfo->grpid = GetNewMcastGrpId(pMcastGrpInfo->mctype)) == -1)
-	{
-		DPA_ERROR("Exceeding max number of multicast entries\n");
-		/* iRet currently equals -1 here only as a side-effect of
-		 * line 518's `if((iRet = GetMcastGrpId(...))!= -1)` test —
-		 * a refactor of that idiom would silently regress this path
-		 * to NO_ERR. Set explicitly. */
-		iRet = -1;
-		goto err_ret;
-	}
-	memset(&RtEntry,0, sizeof(RouteEntry));
-	pRtEntry = &RtEntry;
-
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		pRtEntry->dstmac[0] = 0x01;
-		pRtEntry->dstmac[1] = 0x00;
-		pRtEntry->dstmac[2] = 0x5E;
-		pRtEntry->dstmac[3] = (mcast4_group->dst_addr >> 8)&0x7f;
-		pRtEntry->dstmac[4] = (mcast4_group->dst_addr >> 16) & 0xff;
-		pRtEntry->dstmac[5] = (mcast4_group->dst_addr >> 24) & 0xff;
-		tbl_type = IPV4_MULTICAST_TABLE;
-	}
-	else
-	{
-		pRtEntry->dstmac[0] = 0x33;
-		pRtEntry->dstmac[1] = 0x33;
-		pRtEntry->dstmac[2] = (mcast6_group->dst_addr[3]) &  0xff;
-		pRtEntry->dstmac[3] = (mcast6_group->dst_addr[3] >> 8) & 0xff;
-		pRtEntry->dstmac[4] = (mcast6_group->dst_addr[3] >> 16) & 0xff;
-		pRtEntry->dstmac[5] = (mcast6_group->dst_addr[3] >> 24) & 0xff;
-		tbl_type = IPV6_MULTICAST_TABLE;
-	}
-
-	/* Subscribe the ingress netdev to the group's L2 multicast MAC
-	 * BEFORE any HW state is committed. Sequencing this first means a
-	 * subscribe failure (e.g. -ENOMEM under memory pressure / failslab)
-	 * unwinds with no FMAN-side cleanup needed — keeping the err_ret
-	 * cascade simple and (per ISSUES.md M9) reachable only via paths
-	 * that haven't installed an EHASH entry yet. */
-	{
-		uint8_t mac[ETH_ALEN];
-		cdx_mcast_compute_mac(pMcastGrpInfo, mac);
-		iRet = cdx_mcast_subscribe_ingress_mac(pMcastGrpInfo, mac);
-		if (iRet) {
-			DPA_ERROR("%s::%d MAC filter subscription failed (%d)\n",
-				  __func__, __LINE__, iRet);
-			goto err_ret;
-		}
-	}
-
-	pMcastGrpInfo->uiListenerCnt = 0;
-
-	for (ii=0; ii< uiNoOfListeners; ii++)
-	{
-		if(pMcastGrpInfo->mctype == 0)
-			pListener = &mcast4_group->output_list[ii];
-		else
-			pListener = &mcast6_group->output_list[ii];
-
-		DPA_INFO("%s(%d) creating table entry of mcast member %s\n",
-				__func__,__LINE__, pListener->output_device_str);
-		tbl_entry = mcast_member_by_name(pRtEntry, pListener->output_device_str,
-						 tbl_entry, tbl_type);
-		if (!tbl_entry)
-		{
-			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
-					__func__, __LINE__);
-			/* See note at the GetNewMcastGrpId failure above —
-			 * don't depend on iRet's value carried in from the
-			 * GetMcastGrpId-test side-effect. */
-			iRet = -1;
-			goto err_ret;
-		}
-		pMcastGrpInfo->members[member_id].bIsValidEntry = 1;
-		strncpy(pMcastGrpInfo->members[member_id].if_info, pListener->output_device_str,IF_NAME_SIZE-1);
-		pMcastGrpInfo->members[member_id].member_id = member_id;
-		pMcastGrpInfo->members[member_id].tbl_entry= tbl_entry;
-		pMcastGrpInfo->uiListenerCnt++;
-		member_id++;
-	}
-
-	iRet = cdx_add_mcast_table_entry(pMcastGrpInfo);
-
-	if(iRet != 0)
-	{
-		DPA_ERROR(" %s::%d Adding mcast table entry failed \r\n", __func__, __LINE__);
-		goto err_ret;
-	}
-
-	AddToMcastGrpList(pMcastGrpInfo);
-	return 0;
-
-err_ret:
-	if(pMcastGrpInfo)
-	{
-		/* Undo the dev_mc_add() done above (if it ran). dev_mc_del
-		 * is refcounted and silently no-ops when the address isn't
-		 * present, so calling it unconditionally is safe — covers
-		 * both "subscribe failed at the call site" and "subscribe
-		 * succeeded then a later step failed". */
-		{
-			uint8_t mac[ETH_ALEN];
-			cdx_mcast_compute_mac(pMcastGrpInfo, mac);
-			cdx_mcast_unsubscribe_ingress_mac(pMcastGrpInfo, mac);
-		}
-		/* Use a local for the cleanup return; reassigning iRet here
-		 * would clobber the original failure code set by whichever
-		 * arm of the create path jumped here. cdx_free_exthash_mcast_members
-		 * always returns 0 today, so a reassignment would make every
-		 * err_ret path return "success" to the caller even though the
-		 * group has been torn down. */
-		int free_rc = cdx_free_exthash_mcast_members(pMcastGrpInfo);
-		if (free_rc)
-			DPA_ERROR("%s::%d mcast group deletion failed (rc=%d)\n",
-				  __func__, __LINE__, free_rc);
-		/* Defense in depth (ISSUES.md M9): pMcastGrpInfo->pCtEntry
-		 * is only assigned inside cdx_add_mcast_table_entry's
-		 * success arm at line ~435, after which the outer caller
-		 * returns 0 without taking err_ret — so today this branch
-		 * is unreachable. Any future path that lands here with
-		 * pCtEntry already wired in would silently leak the CT
-		 * chain; freeing it here keeps the err_ret invariant
-		 * "no caller-owned allocation survives" intact. */
-		if (pMcastGrpInfo->pCtEntry) {
-			if (pMcastGrpInfo->pCtEntry->pRtEntry)
-				kfree(pMcastGrpInfo->pCtEntry->pRtEntry);
-			kfree(pMcastGrpInfo->pCtEntry);
-			pMcastGrpInfo->pCtEntry = NULL;
-		}
-		kfree(pMcastGrpInfo);
-	}
-	return iRet;
-}
 
 int cdx_free_exthash_mcast_members(struct mcast_group_info *pMcastGrpInfo)
 {
@@ -1134,9 +627,9 @@ static void mc_quarantine_members(struct mcast_group_info *pMcastGrpInfo, void *
  * EnQFrm() waits for each completion with an XX_UDelay(100) busy-loop
  * (sdk_fman .../Peripherals/FM/HC/hc.c) — up to ~10 ms of spinning per
  * command. That is legal under a spinlock (FmPcdLock is spin_lock_irqsave,
- * not a sleeping lock) but wasteful, and the group-DELETE path already runs
- * this teardown unlocked. Once the node is off the list no reader
- * (cdx_mc_query.c) can find it, which is what makes that safe.
+ * not a sleeping lock) but wasteful, and the group-delete path already runs
+ * this teardown unlocked. Once the node is off the list no reader can find
+ * it, which is what makes that safe.
  *
  * Order is load-bearing: the classifier entry leaves the hardware table
  * first, then the listener table entries, then the CT/route backing memory.
@@ -1226,707 +719,14 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 	kfree(pMcastGrpInfo);
 }
 
-void cdx_exthash_update_first_mcast_member_addr(struct en_exthash_tbl_entry *temp_entry,
-		uint64_t listener_phyaddri,
-		struct en_exthash_tbl_entry *listener);
-
-int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
-{
-	PMC4Command mcast4_group;
-	PMC6Command mcast6_group;
-	RouteEntry *pRtEntry, RtEntry;
-	struct mcast_group_info *pMcastGrpInfo, McastGrpInfo;
-	struct mcast_group_info *pTempGrpInfo;
-	struct en_exthash_tbl_entry *tbl_entry = NULL;
-	unsigned int uiNoOfListeners, uiHash;
-	int iRet, ii;
-	int member_id;
-	MC4Output   *pListener;
-	char *pInIface;
-	uint32_t tbl_type;
-	uint64_t phyaddr;
-
-
-	/* The create path zeroes its stack RouteEntry; without this the
-	 * vlan_filter_flags read by dpa_get_tx_info_by_itf is stack garbage. */
-	memset(&RtEntry, 0, sizeof(RouteEntry));
-	pRtEntry = &RtEntry;
-	mcast4_group = NULL;
-	mcast6_group = NULL;
-	iRet = 0;
-
-	if(bIsIPv6)
-		mcast6_group = (PMC6Command)mcast_cmd;
-	else
-		mcast4_group = (PMC4Command)mcast_cmd;
-
-	pMcastGrpInfo = &McastGrpInfo;
-	memset(pMcastGrpInfo, 0,sizeof(struct mcast_group_info));
-
-	pMcastGrpInfo->mctype = bIsIPv6;
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		pMcastGrpInfo->ipv4_saddr = mcast4_group->src_addr;
-		pMcastGrpInfo->ipv4_daddr = mcast4_group->dst_addr;
-		pMcastGrpInfo->mctype  = 0;
-		uiNoOfListeners = mcast4_group->num_output;
-		pInIface = mcast4_group->input_device_str;
-		DPA_INFO("%s(%d) listeners %d, Src IP addr 0x%x,Dst IP addr 0x%x\n",
-				__func__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
-				mcast4_group->dst_addr);
-	}
-	else
-	{
-		memcpy(pMcastGrpInfo->ipv6_saddr,mcast6_group->src_addr, IPV6_ADDRESS_LENGTH);
-		memcpy(pMcastGrpInfo->ipv6_daddr,mcast6_group->dst_addr, IPV6_ADDRESS_LENGTH);
-		pMcastGrpInfo->mctype  = 1;
-		uiNoOfListeners = mcast6_group->num_output;
-		pInIface = mcast6_group->input_device_str;
-		DPA_INFO("%s(%d) listeners %d, Src IPv6 addr 0x%x.%x.%x.%x,Dst IPv6 addr 0x%x.%x.%x.%x\n",
-				__func__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
-				mcast6_group->src_addr[2],mcast6_group->src_addr[3], 
-				mcast6_group->dst_addr[0], mcast6_group->dst_addr[1],mcast6_group->dst_addr[2],
-				mcast6_group->dst_addr[3]);
-	}
-	strncpy(pMcastGrpInfo->ucIngressIface, pInIface, IF_NAME_SIZE-1);
-
-	if((pTempGrpInfo = GetMcastGrp(pMcastGrpInfo)) == NULL)
-	{
-		DPA_ERROR("%s::%d multicast group does not exist \r\n", __func__, __LINE__);
-		iRet = -1;
-		goto err_ret;
-	}
-
-	pMcastGrpInfo = pTempGrpInfo;
-
-	/* Reclaim anything a previous failed barrier left parked before
-	 * touching the chain again. Cheap: no-op unless something is
-	 * pending, and the group is resolved so the PCD handle is valid. */
-	cdx_ehash_quarantine_drain(pMcastGrpInfo->pCtEntry->ct->td);
-
-	if((uiNoOfListeners +  pMcastGrpInfo->uiListenerCnt) > MC_MAX_LISTENERS_PER_GROUP)
-	{
-		DPA_ERROR("%s::%d Exceeding max members(%d) in the group \r\n",
-				__func__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
-		iRet = ERR_MC_MAX_LISTENERS_PER_GROUP;
-		goto err_ret;
-	}
-
-	if(!bIsIPv6)
-	{
-		pRtEntry->dstmac[0] = 0x01;
-		pRtEntry->dstmac[1] = 0x00;
-		pRtEntry->dstmac[2] = 0x5E;
-		pRtEntry->dstmac[3] = (mcast4_group->dst_addr >> 8)&0x7f;
-		pRtEntry->dstmac[4] = (mcast4_group->dst_addr >> 16) & 0xff;
-		pRtEntry->dstmac[5] = (mcast4_group->dst_addr >> 24) & 0xff;
-		tbl_type = IPV4_MULTICAST_TABLE;
-	}
-	else
-	{
-		pRtEntry->dstmac[0] = 0x33;
-		pRtEntry->dstmac[1] = 0x33;
-		pRtEntry->dstmac[2] = (mcast6_group->dst_addr[3]) &  0xff;
-		pRtEntry->dstmac[3] = (mcast6_group->dst_addr[3] >> 8) & 0xff;
-		pRtEntry->dstmac[4] = (mcast6_group->dst_addr[3] >> 16) & 0xff;
-		pRtEntry->dstmac[5] = (mcast6_group->dst_addr[3] >> 24) & 0xff;
-		tbl_type = IPV6_MULTICAST_TABLE;
-	}
-
-	for(ii=0 ; ii < uiNoOfListeners; ii++)
-	{
-		if(bIsIPv6)
-		{
-			pListener = &(mcast6_group->output_list[ii]);
-		}
-		else
-		{
-			pListener = &(mcast4_group->output_list[ii]);
-		}
-
-		if((member_id = Cdx_GetMcastMemberId(pListener->output_device_str ,pMcastGrpInfo)) != -1)
-		{
-			DPA_ERROR("%s::%d member:%s already exists in the mcgroup \r\n",
-					__func__, __LINE__, pListener->output_device_str );
-			iRet = -1;
-			goto err_ret;    
-		}
-
-		DPA_INFO("%s(%d) creating table entry of mcast member %s\n",
-				__func__,__LINE__, pListener->output_device_str);
-
-		if( (member_id = Cdx_GetMcastMemberFreeIndex(pMcastGrpInfo)) == -1)
-		{
-			DPA_ERROR("%s::%d Exceeding max members(%d) in the group \r\n",
-					__func__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
-			iRet = -1;
-			goto err_ret;
-		}
-
-		tbl_entry = mcast_member_by_name(pRtEntry, pListener->output_device_str,
-						 NULL, tbl_type);
-		if (!tbl_entry)
-		{
-			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
-					__func__, __LINE__);
-			/* Preserve a non-zero status all the way back to the
-			 * FCI handler. iRet is initialised to 0 at function
-			 * entry and the loop body only sets it on error
-			 * branches, so without an explicit assignment here
-			 * the err_ret label returns 0 = NO_ERR even though
-			 * the listener add failed.
-			 *
-			 * Note what the caller is NOT told: listeners earlier
-			 * in this batch are already spliced into the live
-			 * chain and keep replicating, because err_ret unwinds
-			 * nothing. See ISSUES.md A156. */
-			iRet = -1;
-			goto err_ret;
-		}
-		phyaddr = XX_VirtToPhys(tbl_entry);
-		DPA_INFO("%s(%d) member_id %d, tbl_entry %p, phy_tbl_entry %p\n",
-				__func__,__LINE__, member_id, tbl_entry, (uint64_t *)phyaddr);
-		if(pMcastGrpInfo->mctype == 0)
-		{
-			uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
-			spin_lock(&mc4_spinlocks[uiHash]);
-		}
-		else
-		{
-			uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
-			spin_lock(&mc6_spinlocks[uiHash]);
-		}
-		pMcastGrpInfo->members[member_id].bIsValidEntry = 1;
-		strncpy(pMcastGrpInfo->members[member_id].if_info, pListener->output_device_str,IF_NAME_SIZE-1);
-		pMcastGrpInfo->members[member_id].member_id = member_id;
-		pMcastGrpInfo->members[member_id].tbl_entry= tbl_entry;
-		pMcastGrpInfo->uiListenerCnt++; 
-		//fill next pointer info and link into chain
-		//adjust the prev pointer in the old entry
-		//fill next pointer physaddr for uCode
-
-		cdx_exthash_update_first_mcast_member_addr((struct en_exthash_tbl_entry *)pMcastGrpInfo->pCtEntry->ct->handle, phyaddr,
-				tbl_entry);
-		if(pMcastGrpInfo->mctype == 0)
-			spin_unlock(&mc4_spinlocks[uiHash]);
-		else
-			spin_unlock(&mc6_spinlocks[uiHash]);
-
-	}
-
-	tbl_entry = (struct en_exthash_tbl_entry *)pMcastGrpInfo->pCtEntry->ct->handle;
-#ifdef CDX_DPA_DEBUG
-	{
-		if (pMcastGrpInfo->mctype == 0)
-			display_ehash_tbl_entry(&tbl_entry->hashentry, 10);
-		else
-			display_ehash_tbl_entry(&tbl_entry->hashentry, 34);
-	}
-#endif // CDX_DPA_DEBUG
-err_ret:
-	return iRet;
-}
-
-int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
-{
-	PMC4Command mcast4_group;
-	PMC6Command mcast6_group;
-	int mcast_grpd, member_id;
-	struct mcast_group_info  McastGrpInfo, *pMcastGrpInfo;
-	int iRet = 0;
-	MC4Output *pListener;
-	int ii;
-	unsigned int uiNoOfListeners, uiHash;
-	struct mcast_group_info *pTempGrpInfo;
-	struct en_exthash_tbl_entry *tbl_entry, *temp_entry;
-	uint64_t phyaddr;
-	struct en_ehash_replicate_param *replicate_params; 
-	ucode_phyaddr_t tmp_val;
-
-	mcast4_group = NULL;
-	mcast6_group = NULL;
-
-	if(bIsIPv6 == 0)
-		mcast4_group =  (PMC4Command)mcast_cmd;
-	else 
-		mcast6_group =  (PMC6Command)mcast_cmd;
-
-	pMcastGrpInfo = &McastGrpInfo;
-
-	INIT_LIST_HEAD(&pMcastGrpInfo->list); 
-	pMcastGrpInfo->mctype = bIsIPv6;
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		DPA_INFO("%s(%d) IPv4 \n",__func__,__LINE__);
-		pMcastGrpInfo->ipv4_saddr = mcast4_group->src_addr;
-		pMcastGrpInfo->ipv4_daddr = mcast4_group->dst_addr;
-		pMcastGrpInfo->mctype  = 0;
-		uiNoOfListeners = mcast4_group->num_output;
-		strncpy(pMcastGrpInfo->ucIngressIface,
-				mcast4_group->input_device_str, IF_NAME_SIZE-1);
-		DPA_INFO("%s(%d) listeners %d, Src IP addr 0x%x,Dst IP addr 0x%x\n",
-				__func__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
-				mcast4_group->dst_addr);
-	}
-	else
-	{
-		DPA_INFO("%s(%d) IPv6 \n",__func__,__LINE__);
-		memcpy(pMcastGrpInfo->ipv6_saddr,mcast6_group->src_addr, IPV6_ADDRESS_LENGTH);
-		memcpy(pMcastGrpInfo->ipv6_daddr,mcast6_group->dst_addr, IPV6_ADDRESS_LENGTH);
-		pMcastGrpInfo->mctype  = 1;
-		uiNoOfListeners = mcast6_group->num_output;
-		strncpy(pMcastGrpInfo->ucIngressIface,
-				mcast6_group->input_device_str, IF_NAME_SIZE-1);
-		DPA_INFO("%s(%d) listeners %d, Src IPv6 addr 0x%x.%x.%x.%x,Dst IPv6 addr 0x%x.%x.%x.%x\n",
-				__func__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
-				mcast6_group->src_addr[2],mcast6_group->src_addr[3], 
-				mcast6_group->dst_addr[0], mcast6_group->dst_addr[1],mcast6_group->dst_addr[2],
-				mcast6_group->dst_addr[3]);
-	}
-
-	if((pTempGrpInfo = GetMcastGrp(pMcastGrpInfo)) == NULL)
-	{
-		DPA_ERROR("%s::%d multicast group does not exist \r\n", __func__, __LINE__);
-		iRet = -1;
-		goto err_ret;
-	}
-
-	pMcastGrpInfo = pTempGrpInfo;
-
-	/* Reclaim anything a previous failed barrier left parked before
-	 * touching the chain again. Cheap: no-op unless something is
-	 * pending, and the group is resolved so the PCD handle is valid. */
-	cdx_ehash_quarantine_drain(pMcastGrpInfo->pCtEntry->ct->td);
-
-	mcast_grpd = pMcastGrpInfo->grpid;
-
-	/* Validate every listener in the request actually exists in the
-	 * group before touching any state. The count-match fast path
-	 * below (and the per-listener loop further down) used to assume
-	 * the request was well-formed: REMOVE [foo] against a group
-	 * { bar } whose count happened to equal 1 would hit the fast
-	 * path and delete the whole group, even though `foo` was never
-	 * a member (ISSUES.md M12). Validating up-front rejects mismatched
-	 * requests atomically, before either path mutates members[] or
-	 * unlinks the group.
-	 *
-	 * Also dedupe by tracking which members[] slot each requested
-	 * name resolved to. A request like REMOVE [a, a] against
-	 * { a, b } would otherwise validate twice against the same
-	 * member_id, the count-match fast path would trigger, and the
-	 * whole group would be wiped (ISSUES.md M13). MC_MAX_LISTENERS_PER_GROUP
-	 * is 8 so a u8 bitmap fits the slot space exactly. */
-	{
-		uint8_t seen_members = 0;
-		int found_id;
-		BUILD_BUG_ON(MC_MAX_LISTENERS_PER_GROUP > 8);
-		for (ii = 0; ii < uiNoOfListeners; ii++) {
-			if (bIsIPv6)
-				pListener = &(mcast6_group->output_list[ii]);
-			else
-				pListener = &(mcast4_group->output_list[ii]);
-			found_id = Cdx_GetMcastMemberId(
-				pListener->output_device_str, pMcastGrpInfo);
-			if (found_id == -1) {
-				DPA_ERROR("%s::%d member:%s does not exist in the mcgroup\n",
-					  __func__, __LINE__,
-					  pListener->output_device_str);
-				iRet = -1;
-				goto err_ret;
-			}
-			if (seen_members & (1u << found_id)) {
-				DPA_ERROR("%s::%d duplicate listener %s in REMOVE\n",
-					  __func__, __LINE__,
-					  pListener->output_device_str);
-				iRet = -1;
-				goto err_ret;
-			}
-			seen_members |= (1u << found_id);
-		}
-	}
-
-	if(pMcastGrpInfo->uiListenerCnt == uiNoOfListeners)
-	{
-		/* Unlink the group from the per-bucket list under the same
-		 * spinlock that cdx_mc_query.c readers hold during traversal.
-		 * Once we release the lock, no reader can find the node, so
-		 * the rest of teardown (HW table evict + listener tbl_entry
-		 * frees + pCtEntry/pRtEntry/group frees) runs unlocked — the
-		 * ExternalHashTable* helpers issue hardware completions and
-		 * can sleep, which the per-listener REMOVE path at lines
-		 * 967-975 likewise performs outside the spinlock. */
-		if (pMcastGrpInfo->mctype == 0) {
-			uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
-			spin_lock(&mc4_spinlocks[uiHash]);
-			list_del(&(pMcastGrpInfo->list));
-			spin_unlock(&mc4_spinlocks[uiHash]);
-		} else {
-			uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
-			spin_lock(&mc6_spinlocks[uiHash]);
-			list_del(&(pMcastGrpInfo->list));
-			spin_unlock(&mc6_spinlocks[uiHash]);
-		}
-
-		cdx_mcast_group_destroy(pMcastGrpInfo);
-		return 0;
-	}
-
-
-	for(ii=0 ; ii < uiNoOfListeners; ii++)
-	{
-		if(bIsIPv6)
-			pListener = &(mcast6_group->output_list[ii]);
-		else
-			pListener = &(mcast4_group->output_list[ii]);
-
-		if((member_id = Cdx_GetMcastMemberId(pListener->output_device_str ,pMcastGrpInfo)) == -1)
-		{
-			DPA_ERROR("%s::%d member:%s does not exist in the mcgroup \r\n",
-					__func__, __LINE__, pListener->output_device_str );
-			iRet = -1;
-			goto err_ret;    
-		}
-
-		if(pMcastGrpInfo->mctype == 0)
-		{
-			uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
-			spin_lock(&mc4_spinlocks[uiHash]);
-		}
-		else
-		{
-			uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
-			spin_lock(&mc6_spinlocks[uiHash]);
-		}
-		tbl_entry = (struct en_exthash_tbl_entry *)pMcastGrpInfo->members[member_id].tbl_entry;
-
-		temp_entry = (struct en_exthash_tbl_entry *)pMcastGrpInfo->pCtEntry->ct->handle;
-		replicate_params = (struct en_ehash_replicate_param *)temp_entry->replicate_params;
-
-		if (tbl_entry)
-		{
-			/* flags is stored big-endian (cpu_to_be16 at entry build), so
-			 * SET_INVALID_ENTRY's host-order 1<<15 would set BE bit 7 — an
-			 * OPC_OFFSET bit — corrupting the live entry instead of
-			 * invalidating it. The reference driver switched to a
-			 * swap-modify-swap of the whole word for the same reason. */
-			tbl_entry->hashentry.flags |= cpu_to_be16(1 << 15);
-			if (tbl_entry == replicate_params->first_listener_entry)  // first listener
-			{
-				phyaddr = XX_VirtToPhys(tbl_entry->next);
-				tmp_val.rsvd = 0;
-				tmp_val.addr_hi = cpu_to_be16((phyaddr >> 32) & 0xffff);
-				tmp_val.addr_lo = cpu_to_be32(phyaddr  & 0xffffffff);
-				replicate_params->first_member_flow_addr =  tmp_val.addr;
-				replicate_params->first_listener_entry = tbl_entry->next;
-				if (tbl_entry->next)
-					tbl_entry->next->prev = NULL;
-			} 
-			else 
-			{
-				temp_entry =  tbl_entry->prev;
-				if (tbl_entry->next)
-					(tbl_entry->next)->prev = temp_entry;
-				temp_entry->next = tbl_entry->next;
-				tmp_val.rsvd = temp_entry->hashentry.flags;
-				tmp_val.addr_hi = tbl_entry->hashentry.next_entry_hi;
-				tmp_val.addr_lo = tbl_entry->hashentry.next_entry_lo;
-				temp_entry->hashentry.next_entry = tmp_val.addr;
-			}
-		}
-
-		pMcastGrpInfo->members[member_id].bIsValidEntry = 0;
-		pMcastGrpInfo->uiListenerCnt -= 1;
-		pMcastGrpInfo->members[member_id].tbl_entry = NULL;
-		if(pMcastGrpInfo->mctype == 0)
-			spin_unlock(&mc4_spinlocks[uiHash]);
-		else
-			spin_unlock(&mc6_spinlocks[uiHash]);
-		if (mc_hcsync(pMcastGrpInfo->pCtEntry->ct->td)) {
-			DPA_ERROR("%s::FmPcdHcSync failed\n", __func__);
-			/* The splice above already happened, so the entry is
-			 * out of the chain but has no barrier proving the
-			 * ucode left it. It cannot be freed here and cannot
-			 * be unlinked a second time. Park it; the next
-			 * mutator that reaches this PCD reclaims it.
-			 *
-			 * Abandon the rest of the batch: a sync failure is a
-			 * property of the HC channel, not of this listener,
-			 * so every remaining member would fail the same way
-			 * and pile up more quarantined entries. */
-			cdx_ehash_quarantine_entry(pMcastGrpInfo->pCtEntry->ct->td, tbl_entry);
-			return -1;
-		}
-		ExternalHashTableEntryFree(tbl_entry);
-		/* That sync is a barrier for the whole PCD, not just this
-		 * entry - anything parked by an earlier failure is now
-		 * provably walker-free too, with no second round-trip. */
-		cdx_ehash_quarantine_free_all();
-	}
-
-	tbl_entry = (struct en_exthash_tbl_entry *)pMcastGrpInfo->pCtEntry->ct->handle;
-#ifdef CDX_DPA_DEBUG
-	if (pMcastGrpInfo->mctype == 0)
-		display_ehash_tbl_entry(&tbl_entry->hashentry, 10);
-	else
-		display_ehash_tbl_entry(&tbl_entry->hashentry, 34);
-#endif // CDX_DPA_DEBUG
-err_ret:
-	return iRet;
-}
-
-
-void cdx_exthash_update_first_mcast_member_addr(struct en_exthash_tbl_entry *temp_entry,
-		uint64_t listener_phyaddr, 
-		struct en_exthash_tbl_entry *listener)
-{
-	struct en_ehash_replicate_param *param = 
-		(struct en_ehash_replicate_param *)temp_entry->replicate_params;
-	struct en_exthash_tbl_entry *entry;
-	ucode_phyaddr_t tmp_val;
-
-	if (temp_entry->replicate_params)
-	{
-		listener->hashentry.next_entry_hi = param->first_member_flow_addr_hi;
-		listener->hashentry.next_entry_lo = param->first_member_flow_addr_lo;
-		tmp_val.rsvd = 0;
-		tmp_val.addr_hi = cpu_to_be16((listener_phyaddr >> 32) & 0xffff);
-		tmp_val.addr_lo = cpu_to_be32(listener_phyaddr  & 0xffffffff);
-		/* The freshly built listener entry (opcodes, params, and the
-		 * next_entry chain words written just above) sits in coherent
-		 * DDR that FMAN walks the moment first_member_flow_addr below
-		 * points at it. This publishes into a live chain — the bucket
-		 * spinlock held by the caller only orders CPU accesses, not
-		 * FMAN's. Same hazard as the ADD-path publish in
-		 * cdx_create_hw_entry; drain the store buffer first. */
-		wmb();
-		param->first_member_flow_addr = tmp_val.addr;
-		entry = (struct en_exthash_tbl_entry *)param->first_listener_entry;
-		DPA_INFO("%s(%d) updated first_member_flow_addr %p, next_entry addr %p \n",
-				__func__,__LINE__,(uint64_t*)param->first_member_flow_addr,
-				(uint64_t *)listener->hashentry.next_entry);
-		if (entry)
-		{
-			entry->prev = listener;
-		}
-		listener->next = param->first_listener_entry;
-		param->first_listener_entry = listener;
-		return;
-
-	}
-}
-
-
-static int MC6_Command_Handler(PMC6Command cmd)
-{
-	int rc = NO_ERR;
-	int reset_action = 0;
-	bool locked = false;
-
-	if(cmd->action != ACTION_QUERY && cmd->action != ACTION_QUERY_CONT)
-	{
-		if(cmd->num_output > MC6_MAX_LISTENERS_IN_QUERY) {
-			*((unsigned short *)cmd)= ERR_MC_MAX_LISTENERS;
-			return sizeof(unsigned short);
-		}
-	}
-
-	/* See MC4_Command_Handler — mutators run serialized via
-	 * mc_mutators_mutex. Same mutex protects v4 and v6 paths
-	 * because they share the same mutator functions. */
-	if (mcast_action_is_mutator(cmd->action)) {
-		mutex_lock(&mc_mutators_mutex);
-		locked = true;
-	}
-
-	switch(cmd->action)
-	{
-		case CDX_MC_ACTION_ADD:
-			rc = cdx_create_mcast_group((void *)cmd,1);
-			break;
-		case CDX_MC_ACTION_REMOVE:
-			rc = cdx_delete_mcast_group_member((void *)cmd, 1);
-			break;
-		case CDX_MC_ACTION_UPDATE:
-			rc = cdx_update_mcast_group((void *)cmd, 1);
-			break;
-		case ACTION_QUERY:
-			reset_action = 1;
-			fallthrough;
-		case ACTION_QUERY_CONT:
-			rc = MC6_Get_Next_Hash_Entry(cmd, reset_action);
-			if(rc == NO_ERR)
-			{
-				rc = sizeof(MC6Command);
-			}
-			else
-			{
-				*((unsigned short *)cmd)= rc;
-				rc = sizeof(unsigned short);
-			}
-			goto out;
-		default:
-			DPA_ERROR("%s::%d Command:%d not yet handled in cdx \r\n", __func__, __LINE__,cmd->action);
-			rc = 0;
-	}
-
-	if ( rc == -1 )
-		*((unsigned short *)cmd)= ERR_MC_CONFIG;
-	else
-		*((unsigned short *)cmd)= rc;
-
-	rc = sizeof(unsigned short);
-
-out:
-	if (locked)
-		mutex_unlock(&mc_mutators_mutex);
-	return rc;
-}
-
-static int MC4_Command_Handler(PMC4Command cmd)
-{
-	int rc = NO_ERR;
-	int reset_action=0;
-	bool locked = false;
-
-	/* some errors parsing on the command*/
-	if(cmd->action != ACTION_QUERY && cmd->action != ACTION_QUERY_CONT)
-	{
-		if(cmd->num_output > MC4_MAX_LISTENERS_IN_QUERY) {
-			*((unsigned short *)cmd) = ERR_MC_MAX_LISTENERS;
-			return sizeof(unsigned short);
-		}
-
-		// IPv4 MC addresses must be 224.x.x.x through 239.x.x.x (i.e., high byte => 0xE0-0xEF)
-		if ((ntohl(cmd->dst_addr) & 0xF0000000) != 0xE0000000)
-		{
-			DPA_ERROR("%s::%d \r\n", __func__, __LINE__);
-			*((unsigned short *)cmd) = ERR_MC_INVALID_ADDR;
-			return sizeof(unsigned short);
-		}
-	}
-
-	/* Mutators run serialized — see mc_mutators_mutex docstring at
-	 * the top of this file. cdx_create_mcast_group can recursively
-	 * invoke cdx_update_mcast_group on the duplicate-group fast
-	 * path, so the mutex is taken here at the dispatcher rather
-	 * than inside each mutator (which would deadlock). */
-	if (mcast_action_is_mutator(cmd->action)) {
-		mutex_lock(&mc_mutators_mutex);
-		locked = true;
-	}
-
-	switch(cmd->action)
-	{
-		case CDX_MC_ACTION_ADD:
-			rc = cdx_create_mcast_group((void*)cmd, 0);
-			break;
-		case CDX_MC_ACTION_REMOVE:
-			rc = cdx_delete_mcast_group_member((void *)cmd, 0);
-			break;
-		case CDX_MC_ACTION_UPDATE:
-			rc = cdx_update_mcast_group((void *)cmd, 0);
-			break;
-		case ACTION_QUERY:
-			reset_action = 1;
-			fallthrough;
-		case ACTION_QUERY_CONT:
-			rc = MC4_Get_Next_Hash_Entry(cmd, reset_action);
-			if(rc == NO_ERR)
-			{
-				rc = sizeof(MC4Command);
-			}
-			else
-			{
-				*((unsigned short *)cmd)= rc;
-				rc = sizeof(unsigned short);
-			}
-			goto out;
-		default:
-			DPA_ERROR("%s::%d Command:%d not yet handled in cdx \r\n", __func__, __LINE__,cmd->action);
-			rc = 0;
-	}
-
-	if ( rc == -1 )
-		*((unsigned short *)cmd)= ERR_MC_CONFIG;
-	else
-		*((unsigned short *)cmd)= rc;
-
-	rc = sizeof(unsigned short);
-
-out:
-	if (locked)
-		mutex_unlock(&mc_mutators_mutex);
-	return rc;
-}
-
-/*
- * MC wrapper discipline is different from the other control_*.c
- * subsystems: MC{4,6}_Command_Handler writes the status word (or
- * query reply payload) directly into pcmd and returns the total
- * reply length in bytes, not a U16 status code. The dispatcher's
- * contract is the other way around - handler returns a U16 status,
- * dispatcher stamps pcmd[0] afterwards. To fit, the wrapper reads
- * pcmd[0] back after the inner call (the value the inner just
- * wrote) and returns it, so the dispatcher's pcmd[0] = rc stamp
- * is a no-op. The inner-returned length flows through
- * *out_reply_len unchanged.
- *
- * Query-success path in the inner handler returns sizeof(MC{4,6}
- * Command) - larger than sizeof(U16) - and leaves pcmd holding
- * the query data. Matches PPPoE's "struct-as-reply-status word
- * replaces action field at offset 0" wire contract.
- */
-static U16 mc4_multicast_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	int rc_len;
-
-	(void)cmd_len;
-	rc_len = MC4_Command_Handler((PMC4Command)pcmd);
-	*out_reply_len = (U16)rc_len;
-	return *(U16 *)pcmd;
-}
-
-static U16 mc6_multicast_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	int rc_len;
-
-	(void)cmd_len;
-	rc_len = MC6_Command_Handler((PMC6Command)pcmd);
-	*out_reply_len = (U16)rc_len;
-	return *(U16 *)pcmd;
-}
-
-static const struct cdx_cmd_spec mc4_cmd_table[] = {
-	CDX_CMD_VAR(CMD_MC4_MULTICAST, MC4_MIN_COMMAND_SIZE, sizeof(MC4Command),
-		    NULL, mc4_multicast_handle),
-};
-
-static const struct cdx_cmd_spec mc6_cmd_table[] = {
-	CDX_CMD_VAR(CMD_MC6_MULTICAST, MC6_MIN_COMMAND_SIZE, sizeof(MC6Command),
-		    NULL, mc6_multicast_handle),
-};
-
-U16 M_mc6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
-{
-	return cdx_dispatch_cmd(mc6_cmd_table, ARRAY_SIZE(mc6_cmd_table),
-				cmd_code, cmd_len, pcmd);
-}
-
-U16 M_mc4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
-{
-	return cdx_dispatch_cmd(mc4_cmd_table, ARRAY_SIZE(mc4_cmd_table),
-				cmd_code, cmd_len, pcmd);
-}
-
 #define MAX_MC4_ENTRIES 512
 #define MAX_MC6_ENTRIES 512
 int mc4_init(void)
 {
 	int ii;
 
-	/* Allocate before publishing the handler: registering first would
-	 * leave a live dispatch target over NULL tables if an allocation
-	 * failed (mc4_exit is not run when this init fails). */
+	/* mc4_exit is not run when this init fails, so a failure here
+	 * releases what it already allocated. */
 	mc4grp_ids = kzalloc((sizeof(uint8_t)*MAX_MC4_ENTRIES), GFP_KERNEL);
 	if (!mc4grp_ids)
 	{
@@ -1945,7 +745,6 @@ int mc4_init(void)
 		INIT_LIST_HEAD(&mc4_grp_list[ii]);
 		spin_lock_init(&mc4_spinlocks[ii]);
 	}
-	set_cmd_handler(EVENT_MC4, M_mc4_cmdproc);
 
 	return 0;
 }
@@ -1954,7 +753,8 @@ int mc6_init(void)
 {
 	int ii;
 
-	/* Same ordering constraint as mc4_init(). */
+	/* As in mc4_init(), a failure here releases what it already
+	 * allocated. */
 	mc6grp_ids = kzalloc((sizeof(uint8_t)*MAX_MC6_ENTRIES), GFP_KERNEL);
 	if (!mc6grp_ids)
 	{
@@ -1973,25 +773,19 @@ int mc6_init(void)
 		INIT_LIST_HEAD(&mc6_grp_list[ii]);
 		spin_lock_init(&mc6_spinlocks[ii]);
 	}
-	set_cmd_handler(EVENT_MC6, M_mc6_cmdproc);
 
 	return 0;
 }
 
 /* Tears down every group still linked on a bucket array at module exit.
  *
- * Locking: concurrent FCI access is already excluded here — cdx_ctrl_deinit()
- * holds ctrl->mutex across the whole of cdx_cmdhandler_exit(), and
- * comcerto_fpp_send_command(), the only way into cdx_cmd_handler, takes that
- * same mutex. So the query walkers in cdx_mc_query.c cannot run against these
- * lists while the drain does. The bucket spinlocks are taken anyway: it keeps
- * the drain structurally identical to the group-DELETE path (unlink locked,
- * destroy unlocked) and leaves it correct without depending on that outer
- * exclusion, which nothing here enforces locally.
- *
- * Sibling exits (tunnel_exit, vlan_exit, pppoe_exit) drain their caches
- * lock-free only because those caches have no per-bucket lock at all; they
- * set no precedent for skipping one that exists.
+ * Locking: cdx_ctrl_deinit() holds ctrl->mutex across the whole of the
+ * subsystem teardown, and every group mutator (cdx_mc_group_add/replace/del)
+ * runs under that same mutex, so nothing can change these lists while the
+ * drain runs. The bucket spinlocks are taken anyway: it keeps the drain
+ * structurally identical to the group-delete path (unlink locked, destroy
+ * unlocked) and leaves it correct without depending on that outer exclusion,
+ * which nothing here enforces locally.
  *
  * Must run before the caller frees the spinlock and group-id arrays:
  * cdx_free_exthash_mcast_members() releases each group's id back into
@@ -2030,9 +824,9 @@ void mc4_exit(void)
 {
 	cdx_mcast_drain_grp_lists(mc4_grp_list, mc4_spinlocks,
 				  MC4_NUM_HASH_ENTRIES);
-	/* No abandon here: later exits in the chain (ipsec/socket/ipv4/ipv6
-	 * resets) can still park entries, so the terminal disposition runs
-	 * once from cdx_ctrl_deinit() after the whole chain. */
+	/* No abandon here: later exits in the chain (the IPsec teardown) can
+	 * still park entries, so the terminal disposition runs once from
+	 * cdx_ctrl_deinit() after the whole chain. */
 	if (mc4_spinlocks)
 	{
 		kfree(mc4_spinlocks);
@@ -2067,21 +861,11 @@ void mc6_exit(void)
 
 /* ------------------------------------------------- the flowtable owner's door
  *
- * The typed group interface cdx_mcast_backend.h declares.
- *
- * The legacy control plane reaches the machinery below through FCI: something
- * outside the box sends CMD_MC4_MULTICAST, CMM forwards it, and this file
- * decodes a wire message back into a group. Nothing in the product ever sent
- * that command -- `query mc4` on a production gateway carrying IPTV answers
- * "table empty" -- so what follows is not a second way in to a working feature.
- * It is the first one.
- *
- * What it is not is a second implementation. The group list, the id allocator,
- * the ingress MAC subscription, the per-listener entry builder, the root entry
- * and the whole of teardown are the code the legacy owner already runs; only
- * the door is new. A caller here describes a group whole, in kernel types, and
- * it is installed in one pass -- there is no ADD-then-UPDATE sequence because
- * there is no five-listener wire message to split it across.
+ * The typed group interface cdx_mcast_backend.h declares, and the only way in
+ * to the machinery above: the group list, the id allocator, the ingress MAC
+ * subscription, the per-listener entry builder, the root entry and the whole
+ * of teardown. A caller here describes a group whole, in kernel types, and it
+ * is installed in one pass.
  */
 
 struct cdx_mc_group {
@@ -2198,9 +982,7 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
 		 * built from the onif plus the caller's cdx_l2_encap and
 		 * threaded into the chain by pointer; the group's members[] is
 		 * indexed by position, and the name copied into if_info is for
-		 * the query dump alone. The name lookups that do exist --
-		 * Cdx_GetMcastMemberId(), mcast_member_by_name() -- are on the
-		 * FCI mutators, which never reach this path. */
+		 * the log alone. */
 		for (jj = 0; jj < ii; jj++) {
 			const struct cdx_mc_listener *o = &spec->listener[jj];
 
@@ -2212,9 +994,8 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
 	return 0;
 }
 
-/* One listener's entry. The onif comes from the netdev by index, which is the
- * resolution this ownership mode can do -- see create_exthash_entry4mcast_member
- * for why the legacy owner's name lookup is not interchangeable with it. */
+/* One listener's entry. The onif comes from the netdev by index, never by
+ * name, which would stop matching after a rename. */
 static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
 		const struct cdx_mc_listener *listener,
 		const struct cdx_mc_member_frame *frame,
@@ -2248,12 +1029,11 @@ static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
 		encap.egress[listener->vlans - 1 - ii].tci = listener->vlan[ii].id;
 	}
 	encap.num_egress = listener->vlans;
-	/* An untagged listener asks for no override, and must not be given
-	 * one: apply_l2_encap() refuses a description the interface walk
-	 * already filled in, and a DSCP-to-PCP egress map fills one in -- it
-	 * pushes a priority tag on a plain physical port. Overriding nothing
-	 * would then fail the whole group for a listener that wanted nothing.
-	 * The flowtable's own encoder guards the same way. */
+	/* An untagged listener asks for no override, and is given none:
+	 * apply_l2_encap() refuses a description the interface walk already
+	 * filled in, so overriding nothing could only fail the whole group
+	 * for a listener that wanted nothing. The flowtable's own encoder
+	 * guards the same way. */
 	return create_exthash_entry4mcast_member(pRtEntry, onif_desc,
 						 listener->dev,
 						 listener->vlans ? &encap : NULL,
@@ -2334,7 +1114,7 @@ static int cdx_mc_program(struct mcast_group_info *grp,
 
 	cdx_mcast_compute_mac(grp, mac);
 	/* Before any hardware state, so a failure here unwinds with nothing to
-	 * undo -- the sequencing the legacy create path settled on. */
+	 * undo. */
 	rc = cdx_mcast_subscribe_ingress_mac(grp, mac);
 	if (rc) {
 		DPA_ERROR("%s::MAC filter subscription failed (%d)\n",
@@ -2422,10 +1202,7 @@ static void cdx_mc_describe(struct mcast_group_info *grp,
  * in its ingress tags, because the key names no VLAN and the classifier would
  * hold two entries it cannot choose between.
  *
- * A legacy group names its ingress by interface name and never coexists with
- * one keyed on a device; against it the legacy owner's own rule applies, the
- * address pair alone. Called with mc_mutators_mutex held; the bucket lock is
- * taken here, as GetMcastGrpId() takes it. */
+ * Called with mc_mutators_mutex held; the bucket lock is taken here. */
 static bool cdx_mc_key_taken(const struct mcast_group_info *grp)
 {
 	struct mcast_group_info *tmp;
@@ -2454,10 +1231,6 @@ static bool cdx_mc_key_taken(const struct mcast_group_info *grp)
 		    (tmp->ipv4_daddr != grp->ipv4_daddr ||
 		     tmp->ipv4_saddr != grp->ipv4_saddr))
 			continue;
-		if (!tmp->in_dev || !grp->in_dev) {
-			taken = true;
-			break;
-		}
 		if (tmp->in_dev != grp->in_dev || tmp->mac_keyed != grp->mac_keyed)
 			continue;
 		if (grp->mac_keyed &&
@@ -2495,10 +1268,8 @@ int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
 	grp->grpid = -1;
 	cdx_mc_describe(grp, spec);
 
-	/* Serialized against the FCI mutators, which is the discipline this
-	 * file's own header states for any caller that does not arrive through
-	 * the command dispatcher. Both owners never run at once, but the rule
-	 * is about this file's state rather than about who is driving. */
+	/* Serialized against the other mutators and the interface-removal
+	 * sweep, which is the discipline this file's header states. */
 	mutex_lock(&mc_mutators_mutex);
 	/* One entry per classifier key; see cdx_mc_key_taken(). A caller
 	 * wanting a different listener set for an installed key wants
@@ -2581,10 +1352,9 @@ static bool cdx_mc_same_key(const struct mcast_group_info *grp,
  *
  * The root entry's REPLICATE opcode holds one pointer, the head of the chain
  * the microcode walks, so a whole listener set is exchanged by rewriting that
- * pointer -- the same publish cdx_exthash_update_first_mcast_member_addr()
- * performs to prepend a single listener, for the same reason and with the same
- * barrier. The classifier key never leaves the table, so no frame of this group
- * misses while the set changes.
+ * pointer, behind a barrier that makes the new chain visible first. The
+ * classifier key never leaves the table, so no frame of this group misses
+ * while the set changes.
  *
  * The caller owns the ordering: the new chain must be fully built and the old
  * one must not be released until after this returns, because the microcode may
@@ -2670,7 +1440,7 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 
 	mutex_lock(&mc_mutators_mutex);
 	/* Reclaim anything a previous failed barrier left parked before adding
-	 * to the backlog again, exactly as the legacy mutators open. */
+	 * to the backlog again. */
 	cdx_ehash_quarantine_drain(grp->pCtEntry->ct->td);
 	rc = cdx_mc_build_listeners(fresh, spec);
 	if (rc)
@@ -2717,9 +1487,9 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 	 * unlinked, which releases it and anything parked before it, so the
 	 * backlog settles at zero rather than growing by a chain per channel
 	 * change. This is the listener splice this interface performs, so its
-	 * barrier goes through mc_hcsync() like the legacy REMOVE's does: a
-	 * failure leaves the displaced chain parked for the next barrier on this
-	 * PCD, and the test image can make one fail on demand. */
+	 * barrier goes through mc_hcsync(): a failure leaves the displaced chain
+	 * parked for the next barrier on this PCD, and the test image can make
+	 * one fail on demand. */
 	if (mc_hcsync(grp->pCtEntry->ct->td)) {
 		DPA_ERROR("%s::FmPcdHcSync failed, %u entries still quarantined\n",
 			  __func__, cdx_ehash_quarantine_pending());
@@ -2754,10 +1524,9 @@ void cdx_mc_group_del(struct cdx_mc_group **group)
 		return;
 
 	mutex_lock(&mc_mutators_mutex);
-	/* Unlink under the bucket lock the query walkers hold, then tear down
+	/* Unlink under the bucket lock the list walkers hold, then tear down
 	 * unlocked: the hash-table helpers issue hardware completions and can
-	 * sleep, and once the node is out of the list no reader can reach it.
-	 * The legacy delete path splits it the same way. */
+	 * sleep, and once the node is out of the list no reader can reach it. */
 	if (grp->mctype == 0) {
 		uiHash = HASH_MC4(grp->ipv4_daddr);
 		spin_lock(&mc4_spinlocks[uiHash]);

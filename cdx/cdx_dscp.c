@@ -7,10 +7,8 @@
  * The hardware has always had a second classifier beside the conntrack mark: a
  * per-port table of sixty-four frame queues, one per DSCP, consulted when a
  * frame names no class of its own. `dpa_tx()` reads it on the software path and
- * the microcode reads its own copy on the hardware one. Until now the only way
- * to fill either was CMD_QM_DSCP_Q_MAP_CFG -- an FCI command, on a control
- * plane that is sealed in flowtable mode and whose only client does not run
- * there.
+ * the microcode reads its own copy on the hardware one. Only CMM's control
+ * plane, now retired, used to fill either.
  *
  *	tc qdisc  add dev eth3 clsact
  *	tc filter add dev eth3 egress protocol ip flower ip_dscp 46 \

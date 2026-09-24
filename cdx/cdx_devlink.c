@@ -14,16 +14,15 @@
  * A frame that matches no classifier entry meets a shared FMAN policer profile
  * on its way to the CPU: `cdxdrv_create_missaction_policer_profiles()' creates
  * it and `dpa_cfg.c' installs it as the miss action of the Ethernet and
- * PPPoE-relay hash tables. Until now the only way to set its rate was
- * CMD_QM_EXPT_RATE, an FCI command on a control plane that is sealed in
- * flowtable mode and whose only client does not run there.
+ * PPPoE-relay hash tables. Its rate used to be set only by CMD_QM_EXPT_RATE, a
+ * command on CMM's control plane, which is retired.
  *
  *	devlink trap policer set platform/<fman> policer 1 rate 100000 burst 512
  *	devlink trap policer show
  *
  * is the kernel's own way of saying it. "Rate-limit what this device sends to
  * its CPU" is exactly what a trap policer is, and `trap_policer_set' and
- * `trap_policer_counter_get' are the shape of the FCI set and query, down to
+ * `trap_policer_counter_get' are the shape of the old set and query, down to
  * the drop count behind them.
  *
  * Two things are deliberately not here.
@@ -36,8 +35,9 @@
  * settable, which is the whole of the verb being ported.
  *
  * *No rate in bytes.* A devlink policer's rate is packets per second, and the
- * profile can be programmed either way -- `expt_ratelim_mode'. The FCI command
- * that fed it named its field `pkts_per_sec', so packet mode is the intent, but
+ * profile can be programmed either way -- `expt_ratelim_mode'. The command
+ * that used to feed it named its field `pkts_per_sec', so packet mode is the
+ * intent, but
  * the mode is configuration and this refuses rather than quietly reinterpreting
  * a rate it was given in one unit as the other.
  */
@@ -58,9 +58,9 @@
  * misses reach the CPU. */
 #define CDX_DEVLINK_POLICER_PUNT	1
 
-/* The range CMM validated before it wrote one, which is the grammar-level
- * checking the FCI control plane took with it. devlink refuses anything
- * outside min/max itself, so stating them here is how that survives. */
+/* The range CMM validated before it wrote one. devlink refuses anything
+ * outside min/max itself, so stating them here is how that checking
+ * survives. */
 #define CDX_PUNT_RATE_MIN		1000
 #define CDX_PUNT_RATE_MAX		5000000
 #define CDX_PUNT_BURST_MIN		1

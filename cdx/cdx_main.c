@@ -20,11 +20,11 @@
 /*
  * Concurrency (module-level):
  *   cdx_info->ctrl.mutex
- *      - Module-global mutex covering the FCI command handler
- *        table (see cdx_cmdhandler.c), the cmdhandler init/exit
- *        sequence here, and the timer wheels (see cdx_timer.c —
- *        the timer kthread and every wheel mutator take this same
- *        mutex; there is no separate wheel spinlock).
+ *      - Module-global mutex covering the subsystem init/exit
+ *        sequence here, the flowtable transaction (see
+ *        cdx_flowtable_backend.c) and the timer wheels (see
+ *        cdx_timer.c — the timer kthread and every wheel mutator
+ *        take this same mutex; there is no separate wheel spinlock).
  *   cdx_info->ctrl.timer_thread
  *      - kthread started under ctrl->mutex in cdx_ctrl_init;
  *        consumes the timer wheels under ctrl->mutex.
@@ -42,8 +42,11 @@
 #include <linux/delay.h>
 #include "cdx.h"
 #include "cdx_flowtable.h"
-#include "cdx_cmdhandler.h"
 #include "cdx_htb.h"
+#include "control_tx.h"
+#include "module_qm.h"
+#include "control_ipsec.h"
+#include "dpa_control_mc.h"
 #include "dpa_ipsec.h"
 
 #ifdef CDX_DEBUG_KEY_ZEROING
@@ -79,8 +82,9 @@ static uint32_t init_level;
 static cdx_deinit_func deinit_fn[MAX_CDX_INIT_FUNCTIONS];
 
 /* Configuration and final teardown need both locks. RTNL holders may flush
- * flowtable callbacks which need ctrl.mutex; legacy FCI can take RTNL with
- * ctrl.mutex held. Never wait for either lock while holding the other. */
+ * flowtable callbacks which need ctrl.mutex, and the flowtable's admission
+ * path takes RTNL with ctrl.mutex held (it only trylocks, for this reason).
+ * Never wait for either lock while holding the other. */
 void cdx_ctrl_lock_with_rtnl(void)
 {
 	for (;;) {
@@ -110,16 +114,76 @@ void register_cdx_deinit_func(cdx_deinit_func func)
 	return;
 }
 
+/* The subsystems whose state the flowtable backends drive: the physical
+ * ports, the CEETM channels and class queues, the IPsec SA caches with the
+ * SEC job ring and datapath frame-queue hook, and the multicast group
+ * tables. Each is torn down only if it came up, in the reverse order. */
+static bool cdx_tx_up, cdx_qm_up, cdx_mc4_up, cdx_mc6_up;
+#ifdef DPA_IPSEC_OFFLOAD
+static bool cdx_ipsec_up;
+#endif
+
+static int __init cdx_subsys_init(void)
+{
+	int rc;
+
+	rc = tx_init();
+	if (rc < 0)
+		return rc;
+	cdx_tx_up = true;
+	rc = qm_init();
+	if (rc < 0)
+		return rc;
+	cdx_qm_up = true;
+#ifdef DPA_IPSEC_OFFLOAD
+	rc = ipsec_init();
+	if (rc < 0)
+		return rc;
+	cdx_ipsec_up = true;
+#endif
+	rc = mc4_init();
+	if (rc < 0)
+		return rc;
+	cdx_mc4_up = true;
+	rc = mc6_init();
+	if (rc < 0)
+		return rc;
+	cdx_mc6_up = true;
+	return 0;
+}
+
+/* Forwarding state first, then the QoS queues and interfaces it names. */
+static void cdx_subsys_exit(void)
+{
+	if (cdx_mc6_up)
+		mc6_exit();
+	cdx_mc6_up = false;
+	if (cdx_mc4_up)
+		mc4_exit();
+	cdx_mc4_up = false;
+#ifdef DPA_IPSEC_OFFLOAD
+	if (cdx_ipsec_up)
+		ipsec_exit();
+	cdx_ipsec_up = false;
+#endif
+	if (cdx_qm_up)
+		qm_exit();
+	cdx_qm_up = false;
+	if (cdx_tx_up)
+		tx_exit();
+	cdx_tx_up = false;
+}
+
 static void cdx_ctrl_deinit(void)
 {
 	cdx_ctrl_lock_with_rtnl();
 	if (dpa_cfg_quiesce())
 		pr_err("cdx: cannot quiesce DPA ports before control teardown\n");
-	cdx_cmdhandler_exit();
-	/* Last on purpose: the exit chain above (ipsec/socket/ipv4/ipv6
-	 * resets included) can still park entries whose delete failed, so
-	 * the abandon must run after every subsystem's teardown, not from
-	 * an individual _exit hook partway down the chain. */
+	cdx_subsys_exit();
+	/* Last on purpose: the exit chain above (the multicast and IPsec
+	 * teardowns included) can still park entries whose delete failed,
+	 * so the abandon must run after every subsystem's teardown, not
+	 * from an individual _exit hook partway down the chain. */
 	cdx_ehash_quarantine_abandon();
 	cdx_ctrl_unlock_with_rtnl();
 }
@@ -136,8 +200,7 @@ static int __init cdx_ctrl_init(struct _cdx_info *cdx_info)
 	if (rc)
 		goto error;
 	mutex_lock(&ctrl->mutex);
-	/* Initialize interface to fci */
-	rc = cdx_cmdhandler_init();
+	rc = cdx_subsys_init();
 	mutex_unlock(&ctrl->mutex);
 	if (!rc)
 		wake_up_process(ctrl->timer_thread);
@@ -386,8 +449,8 @@ static int __init cdx_module_init(void)
 		 * port's private data -- and a board without them is a gateway
 		 * without Wi-Fi offload, not a gateway without offload.
 		 * dpaa_vwd_ready() stays false, so cdx_wifi_vap_supported()
-		 * refuses every VAP and dpaa_vwd_vap_cmd() refuses the legacy
-		 * owner's commands; nothing else here depends on it. */
+		 * refuses every VAP and dpaa_vwd_vap_cmd() refuses any that
+		 * reaches it; nothing else here depends on it. */
 		pr_warn("%s: Wi-Fi offload unavailable, VWD init failed (%d)\n",
 			__func__, rc);
 		rc = 0;

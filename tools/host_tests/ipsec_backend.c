@@ -83,7 +83,6 @@ typedef struct {
 typedef struct {
 	u8 direction;
 	u16 flags;
-	u8 seq_overflow;
 	u16 stats_offset;
 	u64 seq;
 	u16 replay_window;
@@ -108,8 +107,7 @@ static void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen)
 		between_reads();
 }
 
-/* The descriptor reader's own dependencies: SEC's words are big-endian, and
- * the legacy overflow report it can also make is never asked for here. */
+/* The descriptor reader's own dependencies: SEC's words are big-endian. */
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define be32_to_cpu(x) __builtin_bswap32(x)
 #define be64_to_cpu(x) __builtin_bswap64(x)
@@ -119,20 +117,17 @@ static void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen)
 #define be64_to_cpu(x) (x)
 #define cpu_to_be64(x) (x)
 #endif
-static int gIPSecStatQueryTimer;
-static void sec_get_stats_from_sa(PSAEntry sa, u32 *pkts, u64 *bytes,
-				  u8 *pSeqOverflow);
+static void sec_get_stats_from_sa(PSAEntry sa, u32 *pkts, u64 *bytes);
 
 /* What the descriptor holds, and what a racing read sees instead. A scripted
  * reading is consumed once; with none left the descriptor reads as it is. */
 static struct { u32 packets; u64 bytes; } descriptor, script[16];
 static unsigned scripted, script_next, descriptor_reads;
-static void get_stats_from_sa(PSAEntry sa, u32 *pkts, u64 *bytes, u8 *overflow)
+static void get_stats_from_sa(PSAEntry sa, u32 *pkts, u64 *bytes)
 {
 	/* A descriptor that keeps no counters is never read for them: offset
 	 * zero is the PDB's options word. */
 	assert(sa->stats_offset);
-	assert(!overflow);	/* the legacy report is not this reader's */
 	descriptor_reads++;
 	if (script_next < scripted) {
 		*pkts = script[script_next].packets;
@@ -664,7 +659,7 @@ static void test_stats_layout(void)
 		memcpy(base + offset, &packets, sizeof(packets));
 		memcpy(base + offset + 8, &bytes, sizeof(bytes));
 		e.stats_offset = offset;
-		sec_get_stats_from_sa(&e, &got_packets, &got_bytes, NULL);
+		sec_get_stats_from_sa(&e, &got_packets, &got_bytes);
 		assert(got_packets == 5 && got_bytes == 0x200000345ULL);
 	}
 }

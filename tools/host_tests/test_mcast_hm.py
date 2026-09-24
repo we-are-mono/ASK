@@ -147,7 +147,7 @@ def test_listener_builder_owns_its_cursor():
     opc_count -- which nothing in the tree ever assigns zero -- to accumulate
     across every listener. Assert the shape that makes that unrepresentable:
     the builder takes no cursor from its caller and allocates its own, and
-    neither mcast caller keeps one to hand it.
+    no multicast caller keeps one to hand it.
     """
     ehash = (ROOT / "cdx/cdx_ehash.c").read_text()
     mc = (ROOT / "cdx/dpa_control_mc.c").read_text()
@@ -165,7 +165,13 @@ def test_listener_builder_owns_its_cursor():
     assert body.count("kfree(pInsEntryInfo)") == 2, (
         "both the success and the failure exit must free the cursor")
 
-    for caller in ("cdx_create_mcast_group", "cdx_update_mcast_group"):
+    # The builder has one caller, and it is the one a group's listeners are
+    # built through; nothing on the way there may hold a cursor either.
+    assert re.findall(r"\bcreate_exthash_entry4mcast_member\(", mc) == [
+        "create_exthash_entry4mcast_member("]
+    assert "create_exthash_entry4mcast_member(" in function(mc, "cdx_mc_listener_entry")
+    for caller in ("cdx_mc_listener_entry", "cdx_mc_build_listeners",
+                   "cdx_mc_program", "cdx_mc_group_add", "cdx_mc_group_replace"):
         assert "ins_entry_info" not in function(mc, caller), (
             f"{caller} must not hold a cursor to share between listeners")
 
@@ -209,11 +215,9 @@ def test_an_ipv6_listener_is_framed_as_ipv6_in_either_table():
 
 
 def test_listener_arrives_resolved():
-    """The two owners resolve a listener differently and neither way serves the
-    other: dpa_add_vlan_if() records a VLAN's dpa_iface_info without a net_dev
-    and without IF_TYPE_ETHERNET, so dpa_get_ifinfo_by_netdev() cannot find
-    CMM's tagged listeners, while a caller holding a netdev has no name worth
-    trusting. So the builder takes the resolved pair and neither lookup.
+    """A listener is a netdev, and a name is not worth trusting: it stops
+    matching after a rename. So the builder takes the resolved onif and netdev
+    pair, and its one caller resolves the pair by index.
     """
     ehash = (ROOT / "cdx/cdx_ehash.c").read_text()
     mc = (ROOT / "cdx/dpa_control_mc.c").read_text()
@@ -228,11 +232,11 @@ def test_listener_arrives_resolved():
         assert lookup not in body, (
             f"the builder must not resolve the listener itself ({lookup})")
 
-    # And the name lookup the legacy owner still needs lives in one place,
-    # which is also where the netdev reference it borrows is released.
-    helper = function(mc, "mcast_member_by_name")
-    assert "get_onif_by_name(name)" in helper and "dev_get_by_name(" in helper
-    assert helper.count("dev_put(dev)") == 1
+    # The caller resolves by index, never by name.
+    caller = function(mc, "cdx_mc_listener_entry")
+    assert "get_onif_by_index(iface->itf_id)" in caller
+    for lookup in ("get_onif_by_name(", "dev_get_by_name("):
+        assert lookup not in mc, f"no multicast path may resolve by name ({lookup})"
 
 
 def test_root_entry_needs_no_wire_message():

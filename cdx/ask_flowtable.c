@@ -3645,8 +3645,8 @@ static void ft_ipsec_retire_sa(u16 handle)
  * first packet, not after. Nothing re-reads it per frame, so a peer that
  * moves (a gateway failover, a replaced NIC on the far end) would leave the
  * tunnel emitting to an address nobody answers to, with no error anywhere.
- * The legacy owner was told about such a move over FCI, as
- * CMD_IPSEC_SA_SET_TNL_ROUTE; this ownership mode has to notice it itself.
+ * Nothing tells CDX about such a move, so the adapter has to notice it
+ * itself.
  *
  * So each outbound SA keeps a watch here, and the same notifiers that retire
  * a flow whose neighbour or route moved mark the watch instead. Marking
@@ -10605,10 +10605,8 @@ static void ft_mc_egress_changed(const struct net_device *dev)
  * An outbound SA needs this at install time, because what leaves SEC is a
  * finished frame: the hardware writes the outer header and the Ethernet
  * addresses, so it has to be told the destination before the first packet,
- * not after. The legacy owner never resolved anything here -- CMM had already
- * populated CDX's route table over FCI and named a route id -- and this
- * ownership mode keeps no such table, so the adapter answers the question the
- * same way it answers it for a flow.
+ * not after. CDX keeps no route table to look the peer up in, so the adapter
+ * answers the question the same way it answers it for a flow.
  *
  * The lookup is the ordinary FIB with the context the kernel's own route to
  * the peer has, and no more: the SA's output mark, the protocol and ports its
@@ -11015,10 +11013,10 @@ static bool ft_ipsec_retire_pending(void)
  * and the tunnel carries nothing that way.
  * Linux's software path stops at the same wall and warns nobody either, but
  * it rarely gets there; the offload does. At 1.4 Mpps the space lasts 51
- * minutes, less than strongSwan's default hour between rekeys. The legacy
- * owner reported the approach to CMM; here it is a soft expire, which is what
- * makes strongSwan rekey. 2^28 is a sixteenth of the space and over three
- * minutes at that rate, enough for an IKE exchange and its retransmissions.
+ * minutes, less than strongSwan's default hour between rekeys. The approach
+ * is reported as a soft expire, which is what makes strongSwan rekey. 2^28 is
+ * a sixteenth of the space and over three minutes at that rate, enough for an
+ * IKE exchange and its retransmissions.
  * An ESN SA has 2^64 and never comes close.
  */
 #define FT_IPSEC_SEQ_HEADROOM	(1ULL << 28)

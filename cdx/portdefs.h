@@ -78,13 +78,8 @@ struct eth_iface_info {
 	uint32_t num_pools;	//pools used by port
 	struct port_bman_pool_info pool_info[MAX_PORT_BMAN_POOLS]; //pool info
 	/* No mac_addr here: a physical port's own address is net_dev's, read
-	 * where the Ethernet header is encoded. Every other interface type in
-	 * this family does carry one, because CMM invents those interfaces and
-	 * describes them over FCI -- there is no kernel object to ask. This is
-	 * the one arm that has a netdev, and so the one that should not cache
-	 * an address that goes stale the moment anyone changes it. */
-	uint8_t br_mac_addr[ETH_ALEN];	//bridge mac address
-	uint8_t is_bridged;		// flag to check if interface is bridged or not
+	 * where the Ethernet header is encoded, rather than a cached copy that
+	 * goes stale the moment anyone changes it. */
 	uint32_t max_dist;		//max PCD distributions
 	struct cdx_dist_info *dist_info;//pointer to array of pcd dist
 	struct dpa_fq *defa_rx_dpa_fq; //default rx fq pointer
@@ -106,10 +101,7 @@ struct oh_iface_info {
 struct vlan_iface_info {
 	struct dpa_iface_info *parent;
 	uint16_t vlan_id;
-	uint8_t is_bridged; 		/* Flag to check if interface is bridged or not */
-	uint8_t pad;  			/* not used */
 	uint8_t mac_addr[ETH_ALEN]; 	/* Vlan interface mac address */
-	uint8_t br_mac_addr[ETH_ALEN]; 	/* Bridge mac address stored if interface is part of bridge group */
 };
 
 //pppoe device information
@@ -126,10 +118,7 @@ struct wlan_iface_info {
 	 * the ethernet arm's own net_dev does. */
 	struct net_device *net_dev;
 	uint16_t vap_id;
-	uint8_t is_bridged;		/* Flag to check if interface is bridged or not */
-	uint8_t pad;			/* not used */
 	uint8_t mac_addr[ETH_ALEN];	/* Wlan interface mac address */
-	uint8_t br_mac_addr[ETH_ALEN];	/* Bridge mac address stored if interface is part of bridge group */
 	uint32_t fman_idx;
 	uint32_t port_idx;
 	uint32_t portid;
@@ -252,8 +241,6 @@ void *dpa_get_fm_MURAM_handle(uint32_t fm_idx, uint64_t *phyBaseAddr,
 					uint32_t *MuramSize);
 int dpaa_vwd_init(void);
 void dpaa_vwd_exit(void);
-U16 dpa_iface_stats_get( struct dpa_iface_info *iface_info, struct iface_stats *ifstats);
-void  dpa_iface_stats_reset(struct dpa_iface_info *iface_info, struct iface_stats *stats);
 uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *markval);
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void *markval);
 int dpaa_is_oh_port(uint32_t portid);

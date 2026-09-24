@@ -5,11 +5,9 @@
 #include "cdx_flowtable_backend.h"
 
 /* One statistics record held by the adapter rather than by a registered
- * interface. The legacy owner reaches a record through an interface it
- * registered and looks the indices up by interface id; this ownership mode
- * registers none, so it holds the record and its indices directly. Staying off
- * every list the legacy code walks is what keeps remove_onif_by_index()'s
- * conntrack and route-cache sweep away from it.
+ * interface. A registered interface's record is reached through the interface,
+ * its indices looked up by interface id; the adapter registers none for these,
+ * so it holds the record and its indices directly.
  *
  * The indices are what the header manipulations carry, in the units of their
  * own pool's record, with STATS_WITH_TS set for a timestamped one. Zero is

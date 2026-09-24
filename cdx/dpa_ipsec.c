@@ -291,29 +291,6 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 
 
 
-void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle)
-{
-	struct xfrm_state *x;
-	struct net_device *netdev = (struct net_device *)dev;
-
-	if ((x = xfrm_state_lookup_byhandle(dev_net(netdev), handle)) == NULL)
-	{
-		DPAIPSEC_ERROR("(%s)xfrm_state not found for handle %x\n",
-				__func__, handle);
-		return NULL;
-	}
-	return x;
-}
-
-void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state)
-{
-	if (xfrm_state)
-	{
-		xfrm_state_put((struct xfrm_state *)xfrm_state);
-	}
-	return;
-}
-
 extern 	struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,
 		uint16_t *sagd_pkt);
 static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *qm,
@@ -1495,8 +1472,7 @@ int cdx_dpa_ipsec_init(void)
 	}
 	register_cdx_deinit_func(cdx_dpa_ipsec_exit);
 	/* Last, once everything a reader could reach through it exists, and
-	 * ordered after it: the FCI device is already registered by now, so a
-	 * command can be asking. */
+	 * ordered after it: a reader that sees the flag must see all of it. */
 	smp_store_release(&dpa_ipsec_ready, true);
 	return SUCCESS;
 

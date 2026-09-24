@@ -68,36 +68,19 @@ typedef struct _tCtEntry {
 
 	/* End of fields used by hardware */
 
-	U32 route_id;
 	PRouteEntry pRtEntry;
 	union ctentry_qosmark qosmark;
 	U16 status;
-	cdx_timer_t last_ct_timer;
-
-	U16 ip_chksm_corr;
-	U16 tcp_udp_chksm_corr;
 
 	PRouteEntry tnl_route;
 	U16 hSAEntry[SA_MAX_OP];
-	
-	U8	rtpqos_slot;
-	U8 fftype;
 
-	U16 socket;
+	U8 fftype;
 
 	struct _tCtEntry *twin;
 	struct hw_ct *ct;       /** pointer to the hardware conntrack */
 
 }CtEntry, *PCtEntry;
-
-
-
-typedef struct _ctPair
-{
-	CtEntry	orig;
-	CtEntry	repl;
-	TIMER_ENTRY timer;
-} CT_PAIR, *PCT_PAIR;
 
 /* Conntrack status */
 #define CONNTRACK_4O6			0x4000
@@ -119,47 +102,7 @@ typedef struct _ctPair
 #define	FFTYPE_IPV4	0x01
 #define FFTYPE_IPV6	0x02
 
-
-static inline U8 GET_PROTOCOL(PCtEntry pCtEntry)
-{
-	return pCtEntry->proto; 
-}
-
-static inline void SET_PROTOCOL(PCtEntry pCtEntry_orig,PCtEntry pCtEntry_rep, U8 Proto)
-{
-	pCtEntry_orig->proto = Proto;
-	pCtEntry_rep->proto  = Proto;
-}
-
-
 #define CT_TWIN(pentry)		(((PCtEntry)(pentry))->twin)
-#define CT_ORIG(pentry)		((((PCtEntry)(pentry))->status & CONNTRACK_ORIG) ? (PCtEntry)(pentry) : ((PCtEntry)(pentry))->twin)
-#define CT_REPLY_BIT(pentry)	(!(((PCtEntry)(pentry))->status & CONNTRACK_ORIG))
-
-#define IS_BIDIR(pEntry_orig, pEntry_repl) (!(pEntry_orig->status & CONNTRACK_FF_DISABLED) &&	\
-						!(pEntry_repl->status & CONNTRACK_FF_DISABLED))
-
-U32 get_timeout_value(U32 Proto,int sam_flag, int bidir_flag);
-#define GET_TIMEOUT_VALUE(CtEntry,bidir_flag) get_timeout_value(CtEntry->proto,CtEntry->status & (CONNTRACK_4O6 | CONNTRACK_SEC),bidir_flag)
-
-PCT_PAIR ct_alloc(void);
-void ct_free(PCtEntry pEntry_orig);
-void ct_free_unresolved(PCtEntry pEntry_orig);
-void ct_timer_update(PCT_PAIR ppair);
-int ct_add(PCtEntry pEntry_orig, TIMER_HANDLER handler);
-void ct_update(PCtEntry pEntry_orig);
-void ct_remove(PCtEntry pEntry_orig);
-
-int ct_aging_handler(TIMER_ENTRY *timer);
-
-int ipv4_init(void);
-void ipv4_exit(void);
-
-int IPv4_delete_CTpair(PCtEntry ctEntry);
-void IP_deleteCt_from_onif_index(U32 if_index);
-PRouteEntry IP_Check_Route(PCtEntry pCtEntry);
-void IP_delete_CT_route(PCtEntry pCtEntry);
-cdx_timer_t ct_get_time_remaining(PCT_PAIR ppair);
 
 /* Layer 2 encapsulation supplied by the caller instead of derived from a
  * registered VLAN interface. The Linux flowtable owner has no such interface:
@@ -216,13 +159,11 @@ struct cdx_l2_encap {
 	} ingress_tunnel, egress_tunnel;
 };
 
-int insert_entry_in_classif_table(PCtEntry entry);
-/* As above, with an explicit encapsulation. A NULL encap is exactly the
- * interface-derived behaviour, which is what every legacy caller wants. */
+/* Insert a direction's classifier entry. A NULL encap derives the L2 framing
+ * from the registered interfaces alone; a flow that carries tags, a PPPoE
+ * session or a tunnel names them in encap. */
 int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap);
 int delete_entry_from_classif_table(PCtEntry entry);
-
-PCtEntry IPv4_find_ctentry(U32 saddr, U32 daddr, U16 sport, U16 dport, U8 proto);
 
 void display_ctentry(PCtEntry entry);
 void display_route_entry(PRouteEntry entry);

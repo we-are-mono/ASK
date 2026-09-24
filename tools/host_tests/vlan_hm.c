@@ -238,19 +238,8 @@ int main(void)
     assert(word_at(PARAMS) == (1u << 24));
 
     /* The registered-interface path is unchanged: its offsets come from the
-     * description too, filled by the interface walk, and a bridge's tags
-     * suppress them through vlan_filtering. */
+     * description too, filled by the interface walk. */
     info = egress(8, 1, single, one, 0, opcode);
-    assert(create_vlan_ins_hm(&info) == SUCCESS);
-    assert(word_at(PARAMS) == ((1u << 24) | (stats_base + 0x0d * 16)));
-    info = egress(8, 1, single, one, 0, opcode);
-    info.l2_info.vlan_filtering = 1;
-    assert(create_vlan_ins_hm(&info) == SUCCESS);
-    assert(word_at(PARAMS) == (1u << 24));
-    /* Whereas a flow-described stack is not suppressed by that flag, which it
-     * no longer borrows. */
-    info = egress(8, 1, single, one, 1, opcode);
-    info.l2_info.vlan_filtering = 1;
     assert(create_vlan_ins_hm(&info) == SUCCESS);
     assert(word_at(PARAMS) == ((1u << 24) | (stats_base + 0x0d * 16)));
 
@@ -312,12 +301,7 @@ int main(void)
     assert(insert_remove_vlan_hm(&info, 5, 5) == SUCCESS);
     assert(word_at(PARAMS + 4) == 0 && !lookups);
     assert(!strip_params()->vlan_id[0] && !strip_params()->vlan_id[1]);
-    /* The bridge and filtering flags ride the opcode unchanged. */
-    info = ingress(12, 0, NULL, NULL, 1, opcode);
-    info.flags = EHASH_BRIDGE_FLOW | ROUTE_FLOW_VLAN_FIL_EN | ROUTE_FLOW_PVID_SET;
-    assert(insert_remove_vlan_hm(&info, 5, 5) == SUCCESS);
-    assert(strip_params()->op_flags == (OP_SKIP_VLAN_VALIDATE | OP_VLAN_FILTER_EN |
-                                        OP_VLAN_FILTER_PVID_SET));
+    assert(!strip_params()->op_flags);
 
     /* The registered-interface path still walks the interfaces. */
     legacy_entries = 1;
@@ -343,8 +327,7 @@ int main(void)
     /* ---- what puts the records into the description ---------------------
      *
      * The caller's encapsulation carries one index per tag on each side, and
-     * apply_l2_encap() copies them across and marks the stack flow-described
-     * -- without borrowing vlan_filtering any more. */
+     * apply_l2_encap() copies them across and marks the stack flow-described. */
     {
         struct cdx_l2_encap encap = {};
 
@@ -358,7 +341,7 @@ int main(void)
         encap.egress[0].tpid = 0x8100; encap.egress[0].tci = 200;
         encap.egress_vlan_stats_index[0] = 0x13;
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
-        assert(info.l2_info.vlan_flow_ifstats && !info.l2_info.vlan_filtering);
+        assert(info.l2_info.vlan_flow_ifstats);
         assert(info.l2_info.num_ingress_vlan_hdrs == 2 && info.l2_info.num_egress_vlan_hdrs == 1);
         assert(info.l2_info.ingress_vlan_stats_offsets[0] == 0x0e);
         assert(info.l2_info.ingress_vlan_stats_offsets[1] == 0x10);

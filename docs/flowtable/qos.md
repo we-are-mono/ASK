@@ -3,6 +3,10 @@
 How CMM programs egress QoS today, why none of it reaches a flowtable-offloaded
 flow, and what has to exist before CMM can be retired from the QoS path.
 
+CDX's FCI plane (`cdx_cmdhandler.c`, the `control_qm.c` and `control_tx.c`
+command handlers, the DSCP-to-PCP map) has since been removed; references to it
+below describe the tree as it was when this was written.
+
 This is a design document, not a delivered contract. The accepted boundary is
 still the [supported scope](README.md#supported-scope), which
 admits only flows with a **zero conntrack mark**. That exclusion is the subject

@@ -31,8 +31,8 @@ MACVLAN — is declined by the walk itself rather than by an action count that
 happens not to add up.
 
 CDX takes the stack from the rule. It has no VLAN interface to walk: the
-adapter registers none, and in this ownership mode `control_vlan.c` never
-runs. `insert_entry_in_classif_table_encap()` applies the rule's tags to the
+adapter registers none, and `control_vlan.c`, which registered them for CMM,
+has been removed. `insert_entry_in_classif_table_encap()` applies the rule's tags to the
 L2 description that `dpa_get_tx_info_by_itf()` derived from the physical
 ports, and marks the stack flow-described so the two VLAN header manipulations
 take their per-interface statistics pointers from the description as well —

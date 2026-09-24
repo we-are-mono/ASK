@@ -245,13 +245,7 @@ int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *finfo);
 int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs);
 int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no);
 int cdxdrv_enable_or_disable_ingress_policer(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t oper);
-int cdxdrv_ingress_policer_reset(struct cdx_fman_info *finfo);
-int cdxdrv_ingress_policer_stats(struct cdx_fman_info *finfo,uint32_t queue_no,void *stats, uint32_t clear);
-#ifdef SEC_PROFILE_SUPPORT
-int cdxdrv_sec_policer_reset(struct cdx_fman_info *finfo);
-#endif /* endif for SEC_PROFILE_SUPPORT */
 #endif
 
 struct cdx_port_info *get_dpa_port_info(char *name);
-char *get_dpa_port_name(uint32_t portid);
 #endif

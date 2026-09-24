@@ -32,7 +32,6 @@
 #include "cdx.h"
 #include "cdx_common.h"
 #include "fe.h"
-#include "control_pppoe.h"
 #include "control_tunnel.h"
 #include "control_ipv6.h"
 #include "procfs.h"
@@ -256,8 +255,9 @@ int dpa_add_oh_if(char *name)
 	iface_info->name[IF_NAME_SIZE - 1] = '\0';
 
 	iface_info->if_flags = IF_TYPE_OFPORT;
-	/* OFPORT fixtures have no onif id; use a sentinel that no FCI
-	 * itf_id can equal so by-id lookups can never alias them */
+	/* OFPORT fixtures have no onif id; use a sentinel that no
+	 * logical interface id can equal so by-id lookups can never
+	 * alias them */
 	iface_info->itf_id = ~0U;
 	iface_info->oh_info.channel_id = info.channel_id;
 	iface_info->oh_info.fman_idx = fman_idx;

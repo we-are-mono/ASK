@@ -3,7 +3,9 @@
 What the Linux flowtable path still has to absorb before CMM can be retired,
 and what it already replaces. Derived from `cmm/src/` (22 modules, ~21k lines),
 the `cdx/control_*.c` handlers those modules drive, and the FCI command
-families declared across `cdx/`.
+families declared across `cdx/`. Those handlers and the FCI plane have since
+been removed from CDX; the file and line references below describe the tree
+as it was when this was written.
 
 Effort is relative, not an estimate. The column that decides sequencing is
 whether Linux already provides the mechanism: where it does, the work is FMAN

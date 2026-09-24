@@ -17,12 +17,9 @@
 #define CONNTRACK_DNAT 2
 #define CONNTRACK_NAT 3
 #define IF_TYPE_PPPOE 1
-#define VLAN_INGRESS_FILTERED 1
-#define VLAN_PVID 2
 #define DPA_ERROR(...) do {} while (0)
 struct _itf { unsigned index, type; };
-struct route { struct _itf *input_itf, *underlying_input_itf, *itf;
-               unsigned vlan_filter_flags; };
+struct route { struct _itf *input_itf, *underlying_input_itf, *itf; };
 struct ct {
     struct route *pRtEntry;
     unsigned family, proto, status, Sport, Dport;
@@ -72,7 +69,7 @@ int main(void)
 {
     struct _itf port = { .index = 1 };
     struct route route = { .input_itf = &port, .underlying_input_itf = &port,
-                           .itf = &port, .vlan_filter_flags = VLAN_INGRESS_FILTERED | VLAN_PVID };
+                           .itf = &port };
     for (unsigned v6 = 0; v6 < 2; v6++) {
         struct ct entry = { .family = v6 ? AF_INET6 : AF_INET, .pRtEntry = &route };
         for (unsigned routed = 0; routed < 2; routed++) {
@@ -87,9 +84,6 @@ int main(void)
                 assert(count == (failure ? failure : steps));
                 assert(!memcmp(trace, expected, count * sizeof(trace[0])));
                 assert(!!(info.flags & TTL_HM_VALID) == routed);
-                assert(info.flags & ROUTE_FLOW_VLAN_FIL_EN);
-                assert(info.flags & ROUTE_FLOW_PVID_SET);
-                assert(!(info.flags & EHASH_BRIDGE_FLOW)); /* keep VLAN validation */
             }
         }
         /* The unicast caller still requests an IP hop update. */

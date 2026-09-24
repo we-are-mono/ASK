@@ -140,6 +140,62 @@ def test_ipsec_backend_natt_order(tmp_path):
     })
 
 
+def definition(source, name):
+    """A function definition by name, whatever it returns -- the SA cache's
+    are spelled `void*  name(` and `static PSAEntry name(`, which the shared
+    extractor's return-type list does not take."""
+    match = re.search(r"^[A-Za-z_][^\n;{}()]*?\b" + name + r"\s*\([^;{]*?\)\s*\{",
+                      source, re.M)
+    assert match, name
+    end, depth = match.end(), 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[match.start():end] + "\n"
+
+
+def test_sa_cache(tmp_path):
+    """The SA cache every offloaded SA lives in: two hashed tables, three
+    walkers, and a lock two of those walkers take from atomic context."""
+    source = (ROOT / "cdx/control_ipsec.c").read_text()
+    header = (ROOT / "cdx/control_ipsec.h").read_text()
+    fe = (ROOT / "cdx/fe.h").read_text()
+    sec = (ROOT / "cdx/cdx_dpa_ipsec.h").read_text()
+    (tmp_path / "sa_cache_types.inc").write_text(
+        (ROOT / "cdx/list.h").read_text() + "\n"
+        + re.search(r"^#define NUM_SA_ENTRIES\s.*$", fe, re.M).group() + "\n"
+        + re.search(r"^enum return_code \{.*?^\};", fe, re.S | re.M).group() + "\n"
+        + re.search(r"^#define IPPROTOCOL_ESP\s+\d+", fe, re.M).group() + "\n"
+        + re.search(r"^enum FPP_L3_PROTO \{.*?^\};",
+                    (ROOT / "cdx/types.h").read_text(), re.S | re.M).group() + "\n"
+        + "\n".join(re.findall(r"^#define\s+(?:SA_ALLOW_SEQ_ROLL|SA_ALLOW_EXT_SEQ_NUM|SA_DELETE|"
+                               r"CDX_DPA_IPSEC_(?:IN|OUT)BOUND)\s.*$", header, re.M)) + "\n"
+        + "\n".join(re.findall(r"^#define\s+OP_PCL_IPSEC_(?:HMAC_NULL|NULL_ENC)\s.*$",
+                               sec, re.M)) + "\n")
+    (tmp_path / "sa_cache.inc").write_text(
+        "\n".join(re.findall(r"^struct slist_head sa_cache_by_\w+\[NUM_SA_ENTRIES\];$",
+                             source, re.M)) + "\n"
+        + re.search(r"^static DEFINE_SPINLOCK\(sa_cache_lock\);$", source, re.M).group() + "\n"
+        + "".join(definition(source, name) for name in (
+            "sa_free", "sa_alloc", "sa_add", "sa_remove_from_list_fqid", "sa_remove",
+            "M_ipsec_sa_cache_lookup_by_h", "M_ipsec_sa_cache_create",
+            "M_ipsec_sa_cache_delete", "get_netdev_of_SA_by_fqid",
+            "cdx_get_to_sec_fq_handler")))
+    binary = tmp_path / "sa_cache"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+        "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+        "-I", str(tmp_path), str(Path(__file__).with_name("sa_cache.c")), "-o", str(binary),
+    ], check=True)
+    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SA cache:" in result.stdout
+
+
 def test_ipsec_receive_ownership(tmp_path):
     source = (ROOT / "cdx/dpa_ipsec.c").read_text()
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
@@ -204,9 +260,6 @@ def test_ipsec_backend(tmp_path):
         # script what a racing read sees.
         + re.search(r"^#define CDX_DPA_IPSEC_STATS_LEN\s+\d+",
                     (ROOT / "cdx/cdx_dpa_ipsec.h").read_text(), re.M).group() + "\n"
-        + "\n".join(re.findall(
-            r"^#define\s+(?:MAX_IPSEC_PKTS_FWD_PSEC|SEQ_NUM_(?:ESN_)?SOFT_LIMIT)\s.*$",
-            sec, re.M)) + "\n"
         + function(sec, "cdx_ipsec_pdb_len")
         + function(sec, "cdx_ipsec_stats_offset")
         + function(sec, "get_stats_from_sa").replace(

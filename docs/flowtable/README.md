@@ -58,7 +58,7 @@ configuration instructions.
 | Routing and neighbours | Direct routes, IPv4 gateways, IPv6 gateways including link-local next hops, permanent neighbours, ordinary ARP and neighbour discovery |
 | Automatic recovery | Dependent route, neighbour, physical MTU/MAC and link-state retirement followed by fresh admission. A bridged flow additionally retires when the FDB entry that chose its egress port moves, ages out or is deleted, and when the bridge's per-port VLAN membership is reconfigured. A PPPoE session dropping retires selectively through the route watch, leaving the bindings up and admission enabled, so a redial readmits without the table being touched |
 | Lifetime and policy | Conntrack/flow expiry and deletion, safe adapter unload, explicit global recovery, live policy revocation, bounded capacity fallback |
-| Ownership | The flowtable adapter is the only hardware flow owner; CDX's FCI entry point refuses every command with `-EOPNOTSUPP` |
+| Ownership | The flowtable adapter is the only hardware flow owner; CDX carries no FCI control plane |
 
 The bound is 32,768 **directions**, sufficient for 16,384 fully accelerated connections.
 Admission is directional: a capacity or unsupported-direction refusal can leave

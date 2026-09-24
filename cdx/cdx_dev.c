@@ -120,15 +120,10 @@ func_ret:
 #endif
 
 /*
- * Table-driven ioctl dispatch, matching the validator-table
- * idiom that FCI cmdprocs use (cdx_cmd_validator.h). The ioctl
- * ABI is different enough from FCI's (cmd, cmd_len, pcmd)
- * that we keep a file-local spec here rather than reusing
- * cdx_dispatch_cmd: ioctl commands don't carry a cmd_len and
- * the handler communicates back via copy_to_user instead of an
- * in/out buffer. What we do preserve is the single lookup
- * surface so adding, removing, or gating a new ioctl is a
- * single-line table edit.
+ * Table-driven ioctl dispatch: one lookup surface, so adding,
+ * removing or gating an ioctl is a single-line table edit. Each
+ * handler takes the user pointer and copies back with
+ * copy_to_user itself.
  */
 struct cdx_ioctl_spec {
 	unsigned int cmd;

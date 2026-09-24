@@ -247,9 +247,6 @@ struct vlan_header {
 struct dpa_l2hdr_info {
 	struct {
 		uint32_t vlan_present:1;
-#ifdef VLAN_FILTER
-		uint32_t vlan_filtering:1;
-#endif
 		uint32_t pppoe_present:1;
 		uint32_t is_wlan_iface:1;
 		uint32_t add_pppoe_hdr:1;
@@ -271,12 +268,9 @@ struct dpa_l2hdr_info {
 		 * a flow-described stack has none of. Set, they read
 		 * vlan_stats_offsets (insert) and ingress_vlan_stats_offsets
 		 * (strip) instead, one index per tag, and emit no pointer at
-		 * all unless every tag in the stack names a record. This also
-		 * retires the earlier borrowing of vlan_filtering to keep the
-		 * insert from emitting the unallocated index zero. */
+		 * all unless every tag in the stack names a record. */
 		uint32_t vlan_flow_ifstats:1;
 		uint32_t add_eth_type:1;
-		uint32_t dscp_vlanpcp_map_enable:1;
 	};
 	uint32_t fqid;
 	uint8_t rspid;
@@ -457,8 +451,8 @@ int hw_ct_get_active(struct hw_ct *ct);
  * own that needs the backlog released (cdx_ehash_quarantine_retry()).
  *
  * Serialization: no lock of their own. Callers run under ctrl.mutex -
- * the FCI dispatch, the CT aging kthread and the flowtable backend all
- * take it, and the multicast mutators additionally hold
+ * the flowtable backend and the timer kthread both take it, and the multicast
+ * mutators additionally hold
  * mc_mutators_mutex - or at module exit with no handler in flight. Not
  * callable under a spinlock: the barriers busy-wait on host-command
  * completion. */
@@ -471,19 +465,15 @@ void cdx_ehash_quarantine_abandon(void);
 unsigned int cdx_ehash_quarantine_pending(void);
 
 int cdx_set_expt_rate(uint32_t fm_index, uint32_t type, uint32_t limit, uint32_t burst_size);
-int cdx_get_expt_rate(void *cmd);
 bool cdx_expt_rate_is_packet_mode(uint32_t fm_index);
 int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,
 			 uint32_t *burst);
 struct cdx_police_counters;
 int cdx_expt_rate_counters(uint32_t fm_index, uint32_t type,
 			   struct cdx_police_counters *out);
-int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir);
 int cdx_port_police_set(char *ifname, bool byte_mode,
 			uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs);
 int cdx_port_police_clear(char *ifname);
-int cdx_get_ff_rate(void *cmd);
-void get_plcr_counter(void *handle, uint32_t *counterval, uint32_t clear);
 
 /* What an RFC-2698 profile counts: frames per output colour, and nothing
  * else. There is no byte counter in the hardware. Green and yellow are
@@ -505,9 +495,4 @@ int cdx_ingress_policer_peak(uint32_t fm_index, uint32_t queue_no,
 int cdx_get_policer_profile_id(uint32_t fm_index, uint32_t queue_no);
 int cdx_ingress_enable_or_disable_qos(uint32_t fm_index,uint32_t queue_no,uint32_t oper);
 int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs);
-int cdx_ingress_policer_reset(uint32_t fm_index);
-int cdx_ingress_policer_stats(uint32_t fm_index,uint32_t queue_no,void *stats,uint32_t clear);
-#ifdef SEC_PROFILE_SUPPORT
-int cdx_sec_policer_reset(uint32_t fm_index);
-#endif /* endif for SEC_PROFILE_SUPPORT */
 #endif

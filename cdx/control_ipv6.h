@@ -17,21 +17,6 @@
 
 #define IPV6_HDR_SIZE		sizeof(ipv6_hdr_t)
 
-/* IPv6 Next Header values */
-#define IPV6_GRE		47
-
-int ipv6_cmp(void *src, void *dst);
-#define IPV6_CMP(addr1, addr2) ipv6_cmp(addr1, addr2)
-
-void ipv6_init(void);
-
-int IPv6_delete_CTpair(PCtEntry pCtEntry);
-int IPv6_Get_Next_Hash_CTEntry(PCtExCommandIPv6 pV6CtCmd, int reset_action);
-PCtEntry IPv6_find_ctentry(U32 *saddr, U32 *daddr, U16 sport, U16 dport, U8 proto);
-
-int IPv6_handle_RESET(void);
-
-
 static inline u32 is_ipv6_addr_any(u32 *addr)
 {
        return ((addr[0] | addr[1] | addr[2] | addr[3]) == 0);

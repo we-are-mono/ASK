@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Firmware backend for independent Linux flowtable directions. No legacy CT
- * hash, route hash, CMM notification, or ageing timer owns these objects. */
+/* Firmware backend for independent Linux flowtable directions. The adapter
+ * owns each direction's objects; no hash, notification or ageing timer here
+ * does. */
 #include <linux/etherdevice.h>
 #include <linux/module.h>
 #include <net/ip.h>
@@ -22,8 +23,9 @@ struct cdx_ft_hw {
 	int delete_rc;
 };
 
-/* Retirement needs no allocation after unlink. Unlike the legacy quarantine,
- * the adapter can retain the already allocated owner until the barrier passes. */
+/* Retirement needs no allocation after unlink. Unlike the ehash quarantine
+ * (cdx_ehash.c), the adapter can retain the already allocated owner until the
+ * barrier passes. */
 static LIST_HEAD(ft_retired);
 
 #ifdef CDX_DEBUG_FLOWTABLE
@@ -159,21 +161,21 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * full-size frame -- 1438 + 62 against 1438 -- and each one takes the
 	 * exception path instead. The flow is then matched and counted and
 	 * forwarded by the CPU anyway, which looks like an offload that works
-	 * and performs like software: measured at 0.07 Gb/s against the legacy
-	 * owner's 2.54 on the same tunnel, with the software SEC submit
-	 * counting once per packet.
+	 * and performs like software: measured at 0.07 Gb/s against CMM's 2.54
+	 * on the same tunnel, with the software SEC submit counting once per
+	 * packet.
 	 *
-	 * The limit that belongs here is the egress port's own. The legacy
-	 * owner never met this because its route table holds interface MTUs
-	 * rather than per-flow ones, and the same reasoning is already written
-	 * down beside the tunnel-interface case in devman.c. */
+	 * The limit that belongs here is the egress port's own. CMM never met
+	 * this because its route table held interface MTUs rather than per-flow
+	 * ones, and the same reasoning is written down beside the
+	 * tunnel-interface case in devman.c. */
 	hw->route.mtu = rule->sa_handle ? rule->out_logical->mtu : rule->mtu;
 	/* The same reasoning for a tunnel, where the expansion is a fixed
 	 * header rather than SEC's variable one: Netfilter's MTU is the tunnel
 	 * device's, already reduced by the outer header, and the microcode
 	 * compares the outer packet against what it is given, so the header
-	 * goes back on here. This is the arithmetic the legacy owner's
-	 * tunnel-interface arm in devman.c does. */
+	 * goes back on here. This is the arithmetic the tunnel-interface arm in
+	 * devman.c does. */
 	if (rule->out_tunnel.present)
 		hw->route.mtu += rule->out_tunnel.header_size;
 	ether_addr_copy(hw->route.dstmac, rule->dst_mac);
@@ -203,7 +205,7 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		/* The IPv6 encoder rewrites each address whenever its bit is set
 		 * and never compares the two, and it gates the port rewrite on
 		 * either bit. Mark a direction translated when its address or its
-		 * port moved, exactly as the legacy IPv6 control path does. */
+		 * port moved. */
 		if (!ipv6_addr_equal(&rule->new_src.in6, &rule->src.in6) ||
 		    rule->new_sport != rule->sport)
 			ct->status |= CONNTRACK_SNAT;
@@ -253,10 +255,9 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	ft_encap_stats(stats->in_vlan, rule->in_vlans, true, encap.ingress_vlan_stats_index);
 	ft_encap_stats(stats->out_vlan, rule->out_vlans, false, encap.egress_vlan_stats_index);
 	/* A tunnel on either side, outside everything above. The egress header
-	 * is built by the same function the legacy tunnel interface builds its
-	 * own with, from the endpoints, TTL and traffic class the walk
-	 * recorded, so both owners insert the same bytes; the per-packet
-	 * fields are the microcode's. The size it comes back with has to be
+	 * is built by tnl_build_header() from the endpoints, TTL and traffic
+	 * class the walk recorded; the per-packet fields are the microcode's.
+	 * The size it comes back with has to be
 	 * the one admission derived from the device, or the two would be
 	 * describing different headers. */
 	if (rule->out_tunnel.present) {
@@ -272,9 +273,9 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		 * a limitation of the INSERT_L3_HDR opcode rather than a choice:
 		 * measured on the DK, the microcode fills the fragment field
 		 * itself and ignores the template's, so a header built with DF
-		 * still leaves the port without it. The legacy owner met the
-		 * same wall and hardcoded frag_off to zero in M_tnl_build_header;
-		 * this matches it. So the tunnel device's pmtudisc setting
+		 * still leaves the port without it. CMM's tunnel interface met
+		 * the same wall and hardcoded frag_off to zero; this matches it.
+		 * So the tunnel device's pmtudisc setting
 		 * reaches the wire only for frames the CPU forwards. */
 		egress->header_size = tnl_build_header(egress->mode, tunnel->local.all,
 						       tunnel->remote.all, fl, tunnel->ttl,
@@ -341,9 +342,7 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * rest: insert_entry_in_classif_table_encap() reads CONNTRACK_SEC and
 	 * calls cdx_ipsec_fill_sec_info(), which resolves these handles and
 	 * points the entry's action at the SEC frame queue instead of the
-	 * egress port. That hook has been there all along, driven by the FCI
-	 * conntrack command's SA_handle fields; this is the same description
-	 * arriving from a different control plane.
+	 * egress port.
 	 *
 	 * The array holds SA_MAX_OP so a stacked bundle (ESP under AH) can name
 	 * both, and nothing here proves the opcode order such a bundle needs --
@@ -366,9 +365,8 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	}
 	/* A flow with no encapsulation asks for no override, and takes exactly
 	 * the path it took before tags existed. The override refuses a
-	 * description the interfaces already filled in -- a DSCP-to-PCP egress
-	 * map is the one thing that does so -- and that refusal must not reach
-	 * a flow that is not asking to replace anything. */
+	 * description the interfaces already filled in, and that refusal must
+	 * not reach a flow that is not asking to replace anything. */
 	if (insert_entry_in_classif_table_encap(
 		    ct, encap.num_ingress || encap.num_egress ||
 			encap.ingress_pppoe || encap.egress_pppoe ||

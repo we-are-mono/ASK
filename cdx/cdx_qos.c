@@ -39,7 +39,6 @@
 #include "cdx_common.h"
 #include "module_qm.h"
 #include "fe.h"
-#include "control_pppoe.h"
 #include "control_tunnel.h"
 #include "control_ipv6.h"
 #include "endian_ext.h" 
@@ -427,8 +426,8 @@ int cdxdrv_release_shared_policers(struct cdx_fman_info *finfo)
  * port init; this only pushes parameters into it.
  *
  * `cbs`/`pbs` of zero mean "use the burst this port's speed implies", which is
- * what the FCI fast-forward path has always done. A tc police action carries
- * its own burst and passes it through.
+ * what restoring the boot-time rate does. A tc police action carries its own
+ * burst and passes it through.
  */
 static int port_plcr_set(char *ifname, uint32_t rate_mode,
 			 uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs)
@@ -520,15 +519,7 @@ static int port_plcr_set(char *ifname, uint32_t rate_mode,
 	return SUCCESS;
 }
 
-/* The FCI fast-forward rate. Its unit is whatever port_ff_lim_mode says, which
- * is packets per second, and its burst comes from the port's speed. */
-int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
-{
-	return port_plcr_set(ifname, port_ff_lim_mode, cir, pir, 0, 0);
-}
-
-/* A tc `matchall action police` on a port's ingress, which is the same object
- * reached by a kernel verb instead of an FCI command. The caller has already
+/* A tc `matchall action police` on a port's ingress. The caller has already
  * converted the action's rates into this profile's unit; byte mode is Kbit/s,
  * packet mode is packets per second. */
 int cdx_port_police_set(char *ifname, bool byte_mode,
@@ -558,9 +549,9 @@ int cdx_port_police_clear(char *ifname)
 	return port_plcr_set(ifname, port_ff_lim_mode, cir, pir, 0, 0);
 }
 
-/* The colours a profile counted, for a caller that has no FCI command
- * structure to fill. Read without clearing: the counters have more than one
- * reader, and clearing them here would move everyone else's baseline.
+/* The colours a profile counted. Read without clearing: the counters have
+ * more than one reader, and clearing them here would move everyone else's
+ * baseline.
  *
  * Both of these reach FM_PCD_PlcrProfileGetCounter(), which may take the
  * host-command path and busy-wait there, so neither is callable under a
@@ -568,12 +559,12 @@ int cdx_port_police_clear(char *ifname)
  */
 void cdx_plcr_colours(void *handle, struct cdx_police_counters *out)
 {
-	uint32_t counterval[MAX_RATLIM_CNTR] = { 0 };
-
-	get_plcr_counter(handle, counterval, 0);
-	out->green = counterval[GREEN_TOTAL];
-	out->yellow = counterval[YELLOW_TOTAL];
-	out->red = counterval[RED_TOTAL];
+	out->green = FM_PCD_PlcrProfileGetCounter(handle,
+			e_FM_PCD_PLCR_PROFILE_GREEN_PACKET_TOTAL_COUNTER);
+	out->yellow = FM_PCD_PlcrProfileGetCounter(handle,
+			e_FM_PCD_PLCR_PROFILE_YELLOW_PACKET_TOTAL_COUNTER);
+	out->red = FM_PCD_PlcrProfileGetCounter(handle,
+			e_FM_PCD_PLCR_PROFILE_RED_PACKET_TOTAL_COUNTER);
 }
 
 int cdx_port_police_counters(char *ifname, struct cdx_police_counters *out)
@@ -583,98 +574,6 @@ int cdx_port_police_counters(char *ifname, struct cdx_police_counters *out)
 	if (hardwarePortId == -1 || !port_rate_lim_mode[hardwarePortId].handle)
 		return FAILURE;
 	cdx_plcr_colours(port_rate_lim_mode[hardwarePortId].handle, out);
-	return SUCCESS;
-}
-
-void get_plcr_counter(void *handle, uint32_t *counterval, uint32_t clear)
-{
-	uint32_t ii;
-	uint32_t counter_id;
-
-	for (ii = 0; ii < MAX_RATLIM_CNTR; ii++) {
-		switch(ii) {
-			case RED_TOTAL:
-				counter_id = e_FM_PCD_PLCR_PROFILE_RED_PACKET_TOTAL_COUNTER;
-				break;
-			case YELLOW_TOTAL:
-				counter_id = e_FM_PCD_PLCR_PROFILE_YELLOW_PACKET_TOTAL_COUNTER;
-				break;
-			case GREEN_TOTAL:
-				counter_id = e_FM_PCD_PLCR_PROFILE_GREEN_PACKET_TOTAL_COUNTER;
-				break;
-			case RED_RECOLORED:
-				counter_id = e_FM_PCD_PLCR_PROFILE_RECOLOURED_RED_PACKET_TOTAL_COUNTER;
-				break;
-			case YELLOW_RECOLORED:
-				counter_id = e_FM_PCD_PLCR_PROFILE_RECOLOURED_YELLOW_PACKET_TOTAL_COUNTER;
-				break;
-			default:
-				return;
-		}
-		*(counterval + ii) = 
-			FM_PCD_PlcrProfileGetCounter(handle, counter_id);
-		if (clear) {
-			FM_PCD_PlcrProfileSetCounter(handle, counter_id, 0);
-		}
-	}
-}
-
-int cdx_get_expt_rate(void *pcmd)
-{
-	PQosExptRateCommand cmd;
-	struct cdx_fman_info *finfo;
-	void *handle;
-
-	cmd = (PQosExptRateCommand)pcmd;
-
-	if (cmd->expt_iftype != CDX_EXPT_ETH_RATELIMIT) {
-		DPA_ERROR("%s::type %d not supported\n", __func__, cmd->expt_iftype);
-		return -1;
-	}
-	finfo = (fman_info + FMAN_INDEX);
-	handle = finfo->expt_rate_limit_info[cmd->expt_iftype].handle;
-	if (!handle)	
-		return -1;
-	cmd->pkts_per_sec = finfo->expt_rate_limit_info[cmd->expt_iftype].limit;
-	cmd->burst_size =  finfo->expt_ratelim_burst_size;
-	get_plcr_counter(handle, &cmd->counterval[0], cmd->clear);
-#ifdef QOS_DEBUG
-	printk("%s::type %d rate %d pps\n", __func__, cmd->expt_iftype, cmd->pkts_per_sec);
-	printk("red %d yellow %d, green %d red recolored %d, yellow recolored %d\n",
-			cmd->counterval[RED_TOTAL], cmd->counterval[YELLOW_TOTAL],
-			cmd->counterval[GREEN_TOTAL], cmd->counterval[RED_RECOLORED],
-			cmd->counterval[YELLOW_RECOLORED]);
-#endif
-	return 0;
-}
-
-int cdx_get_ff_rate(void *pcmd)
-{
-	int hardwarePortId;
-	void *handle;
-	PQosFFRateCommand cmd;
-
-	cmd = (PQosFFRateCommand)pcmd;
-	hardwarePortId = dpa_get_iface_hwid_by_name_and_type(cmd->interface, IF_TYPE_ETHERNET);
-	if (hardwarePortId == -1) {
-		return FAILURE;	
-	}
-	handle = port_rate_lim_mode[hardwarePortId].handle;
-	if (!handle)  {
-		printk("%s::invalid handle\n", __func__);
-		return FAILURE;	
-	}
-	cmd->cir = port_rate_lim_mode[hardwarePortId].cir_value;
-	cmd->pir = port_rate_lim_mode[hardwarePortId].pir_value;
-	get_plcr_counter(handle, &cmd->counterval[0], cmd->clear);
-#ifdef QOS_DEBUG
-	printk("%s::port %s::%d cir value %d, pir value %d\n",
-			__func__, cmd->interface, hardwarePortId, cmd->cir, cmd->pir);
-	printk("red %d yellow %d, green %d red recolored %d, yellow recolored %d\n",
-			cmd->counterval[RED_TOTAL], cmd->counterval[YELLOW_TOTAL],
-			cmd->counterval[GREEN_TOTAL], cmd->counterval[RED_RECOLORED],
-			cmd->counterval[YELLOW_RECOLORED]);
-#endif
 	return SUCCESS;
 }
 
@@ -833,8 +732,8 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 		/* Honour the caller's burst. This used to force the default of
 		 * 2000 bytes whatever was asked for -- barely one frame, so a
 		 * TCP flow lost enough of every window to collapse rather than
-		 * settle at the rate. The FCI path passes zero and still gets
-		 * the default. */
+		 * settle at the rate. A caller passing zero still gets the
+		 * default. */
 		if (!cbs)
 			cbs = DEFAULT_INGRESS_BYTE_MODE_CBS;
 		if (!pbs)
@@ -987,64 +886,7 @@ int cdxdrv_enable_or_disable_ingress_policer(struct cdx_fman_info *finfo, uint32
 	return SUCCESS;
 }
 
-int cdxdrv_ingress_policer_reset(struct cdx_fman_info *finfo)
-{
-	uint32_t ii;
-	for(ii = 0; ii< INGRESS_FLOW_POLICER_QUEUES; ii++) {
-		if(finfo->ingress_policer_info[ii].handle) {
-			if (cdxdrv_set_default_qos_policer_profile(finfo,ii)!= SUCCESS)
-				printk("%s::plcr reset failed for queue %d, handle %p\n",
-						__func__, ii, finfo->ingress_policer_info[ii].handle);
-			else
-				finfo->ingress_policer_info[ii].policer_on = DISABLE_INGRESS_POLICER;
-		}
-		else
-			printk("%s::plcr reset failed as handle is NULL for queue %d\n",
-					__func__, ii);
-	}
-	return SUCCESS;
-}
-
 #ifdef SEC_PROFILE_SUPPORT
-int cdxdrv_sec_policer_reset(struct cdx_fman_info *finfo)
-{
-	uint32_t queue_no = INGRESS_SEC_POLICER_QUEUE_NUM;
-
-	if(finfo->ingress_policer_info[queue_no].handle) {
-		if (cdxdrv_set_default_qos_policer_profile(finfo, queue_no)!= SUCCESS)
-			printk("%s::plcr reset failed for sec profile, handle %p\n",
-					__func__, finfo->ingress_policer_info[queue_no].handle);
-		else
-			finfo->ingress_policer_info[queue_no].policer_on = DISABLE_INGRESS_POLICER;
-	}
-	else
-		printk("%s::plcr reset failed as handle is NULL for sec profile queue\n",
-				__func__);
-	return SUCCESS;
-}
 #endif /* endif for SEC_PROFILE_SUPPORT */
 
-int cdxdrv_ingress_policer_stats(struct cdx_fman_info *finfo,uint32_t queue_no,void *stats,uint32_t clear)
-{
-
-	pIngressQosStat plcr_stats = (pIngressQosStat)stats;
-
-	if(finfo->ingress_policer_info[queue_no].policer_on == ENABLE_INGRESS_POLICER)
-		get_plcr_counter(finfo->ingress_policer_info[queue_no].handle, &plcr_stats->counterval[0],clear);
-
-	plcr_stats->policer_on = finfo->ingress_policer_info[queue_no].policer_on;
-	plcr_stats->cir = finfo->ingress_policer_info[queue_no].cir_value;
-	plcr_stats->pir = finfo->ingress_policer_info[queue_no].pir_value;
-	plcr_stats->cbs = finfo->ingress_policer_info[queue_no].cbs;
-	plcr_stats->pbs = finfo->ingress_policer_info[queue_no].pbs;
-
-#ifdef QOS_DEBUG
-	printk("%s:: queue %d policer_on %d red %d yellow %d, green %d red recolored %d, yellow recolored %d\n",
-			__func__,queue_no,plcr_stats->policer_on,plcr_stats->counterval[RED_TOTAL],
-			plcr_stats->counterval[YELLOW_TOTAL],plcr_stats->counterval[GREEN_TOTAL],
-			plcr_stats->counterval[RED_RECOLORED],plcr_stats->counterval[YELLOW_RECOLORED]);
-#endif
-
-	return SUCCESS;
-}
 #endif
