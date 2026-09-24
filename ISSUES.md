@@ -276,6 +276,9 @@ file's git history.
 - [x] **A223.** The adapter ignored an HMAC's truncation, so an SA at a length SEC has no operation for (SHA-256 at 96 bits) failed the ICV check both ways, and `cmac(aes)`, which has no PF_KEY number, was offloaded unauthenticated —
   fixed (_:/^cdx: carry an HMAC's truncation, refusing lengths SEC lacks_).
 
+- [x] **A222.** A routed group was decided without the events queued while the worker waited for RTNL, so a removed VIF, a new policy rule or the entry's own delete reached hardware a pass late —
+  fixed (_:/^flowtable: apply what the chain queued before deciding a routed group_).
+
 - [x] **A221.** Deleting one oif's device took its whole routed multicast group out of hardware and re-added it, instead of swapping the chain —
   fixed (_:/^flowtable: swap a routed multicast chain when one of its oifs goes_).
 

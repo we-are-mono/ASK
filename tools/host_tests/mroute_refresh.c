@@ -17,7 +17,12 @@ typedef int64_t s64;
 #define FT_MR_OIF_TEXT 136
 #define CDX_MC_MAX_LISTENERS 8
 #define FT_MR_MAX_RETRIES 4
+#define FT_MR_MAX_RESTARTS 4
 #define FT_MR_STATS_INTERVAL 5
+/* Upstream's values, for the events a case queues. */
+#define FIB_EVENT_ENTRY_REPLACE 0
+#define FIB_EVENT_ENTRY_DEL 3
+#define FIB_EVENT_VIF_DEL 9
 #define MFC_OFFLOAD 1
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
@@ -40,6 +45,9 @@ static void list_del(struct list_head *n)
 { n->prev->next = n->next; n->next->prev = n->prev; }
 static void list_move(struct list_head *n, struct list_head *h)
 { list_del(n); list_add(n, h); }
+static void list_add_tail(struct list_head *n, struct list_head *h)
+{ n->next = h; n->prev = h->prev; h->prev->next = n; h->prev = n; }
+static bool list_empty(const struct list_head *h) { return h->next == h; }
 #define list_for_each_entry(p, h, m) \
     for (p = container_of((h)->next, __typeof__(*p), m); &p->m != h; \
          p = container_of(p->m.next, __typeof__(*p), m))
@@ -213,9 +221,65 @@ static int ft_mr_egress_drain(const struct net_device *dev);
  * worker has picked in whatever state picking left it. */
 static struct net_device *drain_while_waiting;
 static int drain_rc;
+#define ASSERT_RTNL() assert(rtnl)
+/* The chain speaking while the worker waits for RTNL: whoever holds it queues
+ * an event, as ipmr does under RTNL, about the group the worker has picked, at
+ * each of the next `speak_while_waiting` waits. What it says is `speech`: a
+ * VIF of the group's family going; the group's own entry deleted; a VIF of
+ * that family going in another table, which the learner does not mirror;
+ * another entry of the family replaced; a VIF of the other family going; or
+ * an event lost for want of memory, which asks for a resync and queues
+ * nothing. A derivation made with anything queued is counted. */
+enum speech {
+    SPEAK_VIF, SPEAK_DELETE, SPEAK_OTHER_TABLE, SPEAK_OTHER_ENTRY,
+    SPEAK_OTHER_FAMILY, SPEAK_LOST,
+};
+static enum speech speech;
+static unsigned speak_while_waiting, derived_behind;
+static struct mr_mfc other_entry = { .refs = 1 };
+static void chain_speaks(void)
+{
+    struct ft_mr_group *h, *picked = NULL;
+    struct ft_mr_event *e;
+
+    list_for_each_entry(h, &ft_mr_groups, list)
+        if (h->busy)
+            picked = h;
+    if (!speak_while_waiting || !picked)
+        return;
+    speak_while_waiting--;
+    if (speech == SPEAK_LOST) {
+        ft_mr_resync_pending |= 1UL << ft_mr_idx(picked->family);
+        return;
+    }
+    e = calloc(1, sizeof(*e));
+    assert(e);
+    e->family = picked->family;
+    e->event = FIB_EVENT_VIF_DEL;
+    switch (speech) {
+    case SPEAK_DELETE:
+        e->event = FIB_EVENT_ENTRY_DEL;
+        e->mfc = picked->mfc;
+        break;
+    case SPEAK_OTHER_TABLE:
+        e->table = 100;
+        break;
+    case SPEAK_OTHER_ENTRY:
+        e->event = FIB_EVENT_ENTRY_REPLACE;
+        e->mfc = &other_entry;
+        break;
+    case SPEAK_OTHER_FAMILY:
+        e->family = picked->family == AF_INET ? AF_INET6 : AF_INET;
+        break;
+    default:
+        break;
+    }
+    list_add_tail(&e->list, &ft_mr_queue);
+}
 static void rtnl_lock(void)
 {
     assert(!rtnl && !ctrl && !ft_mr_lock);
+    chain_speaks();
     if (drain_while_waiting) {
         struct net_device *dev = drain_while_waiting;
 
@@ -362,16 +426,71 @@ static void ft_mr_publish_taps(void) { bridged_side(); taps_published++; }
 /* The add below can move the egress count mid-build, which is the race the
  * count exists for. */
 static bool queues_move_during_add;
-static bool ft_mr_apply(struct ft_mr_event *e) { abort(); }
+/* Only chain_speaks() queues anything, and what it queues is applied the way
+ * ft_mr_apply() applies it (mroute_learner.c runs the real one): a VIF in
+ * another table is none of this learner's, a VIF going asks its family
+ * again, an entry's change asks its own group again and its delete retires
+ * it. */
+static unsigned applied;
+static bool ft_mr_apply(struct ft_mr_event *e)
+{
+    struct ft_mr_group *h;
+
+    assert(ft_mr_lock && !rtnl);
+    applied++;
+    if (e->table)
+        return true;
+    list_for_each_entry(h, &ft_mr_groups, list) {
+        if (e->mfc ? h->mfc != e->mfc : h->family != e->family)
+            continue;
+        h->dirty = true;
+        if (e->event == FIB_EVENT_ENTRY_DEL)
+            h->gone = true;
+    }
+    return true;
+}
 static void ft_mr_lost_event(u8 family) { abort(); }
-static void ft_mr_event_free(struct ft_mr_event *e) { abort(); }
-static void ft_mr_resync(void) { abort(); }
+static void ft_mr_event_free(struct ft_mr_event *e) { free(e); }
+/* The resync a lost event asks for, as the worker's first step runs it: it
+ * takes RTNL of its own, and whether it finishes or not, every group of a
+ * family it was asked for is derived again. One that does not finish leaves
+ * the family asked for, and is what it returns. `lost_after_resync` is an
+ * event lost behind it, once it has let go of RTNL: the family is asked for
+ * again, though this resync finished it. */
+static unsigned resyncs, lost_after_resync;
+static bool resync_fails;
+static void ft_mr_dirty_family(u8 family);
+static unsigned long ft_mr_resync(void)
+{
+    unsigned long failed = 0;
+
+    assert(!rtnl && !ft_mr_lock && !ctrl);
+    resyncs++;
+    for (unsigned idx = 0; idx < 2; idx++) {
+        if (!test_bit(idx, &ft_mr_resync_pending))
+            continue;
+        if (resync_fails)
+            failed |= 1UL << idx;
+        else
+            ft_mr_resync_pending &= ~(1UL << idx);
+        mutex_lock(&ft_mr_lock);
+        ft_mr_dirty_family(idx ? AF_INET6 : AF_INET);
+        mutex_unlock(&ft_mr_lock);
+        if (lost_after_resync) {
+            lost_after_resync--;
+            ft_mr_resync_pending |= 1UL << idx;
+        }
+    }
+    return failed;
+}
 /* The stream arrives tagged on its port: a spec the root validates the tag
  * of, which a rebuild has to carry as well. */
 static bool tagged_ingress;
 static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p)
 {
     assert(rtnl);
+    if (!list_empty(&ft_mr_queue))
+        derived_behind++;
     derives++;
     if (change_during_derive) {
         /* Under RTNL, as the tc caller is: the group is the worker's, and
@@ -1296,6 +1415,165 @@ int main(void)
     seen(g, OIF_A);
     run();
     assert(hardware.live);
+
+    /* ---- the chain speaks while the worker waits for RTNL --------------
+     *
+     * A VIF goes while the worker, having picked the group, waits for the
+     * lock. Nothing is decided against the mirror that VIF is still in: the
+     * worker applies what was queued, picks the group again, and decides
+     * once, against the chain as it stands. */
+    {
+        unsigned d0 = derives, a0 = applied;
+        unsigned x0 = adds, r0 = replaces, del0 = deletes;
+
+        g->dirty = true;
+        speech = SPEAK_VIF;
+        speak_while_waiting = 1;
+        run();
+        assert(!speak_while_waiting && applied == a0 + 1);
+        assert(derives == d0 + 1 && !derived_behind);
+        assert(adds == x0 && replaces == r0 && deletes == del0);
+        assert(hardware.live && g->state == FT_MR_INSTALLED && !g->busy);
+        assert(list_empty(&ft_mr_queue));
+    }
+    /* What was queued need not ask the group again: a VIF in a table this
+     * learner does not mirror is applied and touches nothing. The group was
+     * handed back undecided, so it is decided in the same run all the same,
+     * not left for the refresh five seconds on. */
+    {
+        unsigned d0 = derives, a0 = applied;
+
+        g->dirty = true;
+        speech = SPEAK_OTHER_TABLE;
+        speak_while_waiting = 1;
+        run();
+        assert(!speak_while_waiting && applied == a0 + 1);
+        assert(derives == d0 + 1 && !derived_behind);
+        assert(!g->dirty && !g->busy && g->state == FT_MR_INSTALLED);
+    }
+    /* And what cannot change its answer is not waited for: the other
+     * family's VIFs, another entry of its own. The group is decided at once,
+     * with the event still queued, and the next run applies it. */
+    {
+        static const enum speech idle[] = { SPEAK_OTHER_FAMILY, SPEAK_OTHER_ENTRY };
+
+        for (unsigned i = 0; i < ARRAY_SIZE(idle); i++) {
+            unsigned d0 = derives, a0 = applied, b0 = derived_behind;
+
+            g->dirty = true;
+            speech = idle[i];
+            speak_while_waiting = 1;
+            run();
+            assert(!speak_while_waiting && applied == a0);
+            assert(derives == d0 + 1 && derived_behind == b0 + 1);
+            assert(!list_empty(&ft_mr_queue) && g->state == FT_MR_INSTALLED);
+            run();
+            assert(applied == a0 + 1 && list_empty(&ft_mr_queue));
+        }
+        derived_behind = 0;
+    }
+    /* A chain that never falls quiet delays the decision rather than
+     * preventing it: past FT_MR_MAX_RESTARTS the worker decides against a
+     * mirror one event behind, and the next run applies that event. */
+    {
+        unsigned d0 = derives, a0 = applied;
+
+        g->dirty = true;
+        speech = SPEAK_VIF;
+        speak_while_waiting = FT_MR_MAX_RESTARTS + 1;
+        run();
+        assert(!speak_while_waiting && applied == a0 + FT_MR_MAX_RESTARTS);
+        assert(derives == d0 + 1 && derived_behind == 1);
+        assert(!list_empty(&ft_mr_queue) && !g->busy);
+        run();
+        assert(applied == a0 + FT_MR_MAX_RESTARTS + 1);
+        assert(list_empty(&ft_mr_queue) && derived_behind == 1);
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+        derived_behind = 0;
+    }
+    /* An event lost for want of memory while the worker waits asks for a
+     * resync and queues nothing. The resync runs before the group is
+     * decided, rather than the group going to software for a resync the
+     * next pass would have finished. */
+    {
+        unsigned d0 = derives, s0 = resyncs, del0 = deletes;
+
+        g->dirty = true;
+        speech = SPEAK_LOST;
+        speak_while_waiting = 1;
+        run();
+        assert(!speak_while_waiting && resyncs == s0 + 1);
+        assert(!ft_mr_resync_pending && derives == d0 + 1);
+        assert(deletes == del0 && hardware.live && g->state == FT_MR_INSTALLED);
+    }
+    /* A resync that cannot finish is tried once a run, not once a wait: the
+     * group is refused until it does, as it always was. */
+    {
+        unsigned s0 = resyncs, del0 = deletes, x0 = adds;
+
+        g->dirty = true;
+        resync_fails = true;
+        speech = SPEAK_LOST;
+        speak_while_waiting = 1;
+        run();
+        assert(resyncs == s0 + 1 && ft_mr_resync_pending);
+        assert(deletes == del0 + 1 && !hardware.live);
+        assert(g->state == FT_MR_REFUSED_RESYNC);
+        resync_fails = false;
+        run();
+        assert(resyncs == s0 + 2 && !ft_mr_resync_pending);
+        assert(adds == x0 + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+    }
+    /* An event lost just after a resync finished, once it has let go of
+     * RTNL: the family is asked for again, but not by a resync that failed,
+     * so it is run again before the group is decided rather than the group
+     * refused for it. */
+    {
+        unsigned s0 = resyncs, del0 = deletes;
+
+        g->dirty = true;
+        ft_mr_resync_pending |= 1UL << ft_mr_idx(g->family);
+        lost_after_resync = 1;
+        run();
+        assert(!lost_after_resync && resyncs == s0 + 2 && !ft_mr_resync_pending);
+        assert(deletes == del0 && hardware.live && g->state == FT_MR_INSTALLED);
+    }
+    /* The entry the worker picked is deleted while it waits: it is retired
+     * from hardware, and nothing is built for an entry ipmr no longer has --
+     * here a second listener it would otherwise have been replaced with. */
+    {
+        unsigned d0 = derives, x0 = adds, r0 = replaces, del0 = deletes;
+
+        g->dirty = true;
+        wanted = 2;
+        speech = SPEAK_DELETE;
+        speak_while_waiting = 1;
+        run();
+        speech = SPEAK_VIF;
+        wanted = 1;
+        assert(derives == d0 && adds == x0 && replaces == r0);
+        assert(deletes == del0 + 1 && !hardware.live);
+        assert(!ft_mr_count && !ft_mr_installed && !ft_mr_watch_count[1]);
+        assert(!cache.refs && !cache.mfc_flags && !input.refs);
+        assert(!output[0].refs && !output[1].refs);
+    }
+    /* And back, for teardown to find something to release. */
+    g = calloc(1, sizeof(*g));
+    assert(g);
+    cache.refs = 1;
+    g->mfc = &cache;
+    g->family = AF_INET6;
+    g->src.all[0] = 0x20010db8;
+    g->dst.all[0] = 0xff0e0000;
+    g->dst.all[3] = 1;
+    g->dirty = true;
+    list_add(&g->list, &ft_mr_groups);
+    ft_mr_count = 1;
+    run();
+    assert(g->state == FT_MR_UNCONFIRMED);
+    seen(g, OIF_A);
+    run();
+    assert(hardware.live && g->state == FT_MR_INSTALLED);
 
     /* Stop with a timer/worker rearm in flight, and release every owner. */
     simulate_rearm = true;

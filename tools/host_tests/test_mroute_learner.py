@@ -147,6 +147,42 @@ def test_the_worker_never_holds_a_lock_across_the_transaction():
                            "cdx_ft_begin()", why)
 
 
+def test_the_worker_decides_against_the_chain_as_it_stands():
+    """After registration the chain's producers all run under RTNL, so what
+    the queue holds under the RTNL a derivation runs under stays as found; one
+    found holding something that could change the answer was written while
+    the worker waited, and is applied first. The look has to sit between
+    taking RTNL and deriving, and handing the group back must follow the lock
+    order: RTNL let go of before the learner lock, and no transaction at all.
+    """
+    source = SOURCE.read_text()
+    assert "ASSERT_RTNL();" in function(source, "ft_mr_queue_behind")
+    worker = function(source, "ft_mr_work_fn")
+    lock = worker.index("rtnl_lock();")
+    look = worker.index("ft_mr_queue_behind(target, unresolved)")
+    derive = worker.index("ft_mr_derive(target, &plan)")
+    assert lock < look < derive
+    back = worker[look:worker.index("goto again;", look)]
+    assert "cdx_ft_begin" not in back
+    assert back.index("rtnl_unlock();") < back.index("mutex_lock(&ft_mr_lock);")
+    assert "FT_MR_MAX_RESTARTS" in worker[lock:look], \
+        "a chain that never falls quiet must not keep every group waiting"
+    # The hand-back's own rtnl_unlock() ends the region the lock-order model
+    # above computes, so the rest of the decision is checked here: nothing
+    # between the look and the unlock that follows the derivation takes the
+    # transaction.
+    decided = worker.index("rtnl_unlock();", derive)
+    assert "cdx_ft_begin" not in worker[look:decided]
+    # And a resync this run could not finish is not asked for per wait. Which
+    # one that was is the resync's own answer, decided under the RTNL it held,
+    # not the pending bits read after it let go -- an event lost in between
+    # would read as one it had tried.
+    assert worker.index("unresolved = ft_mr_resync();") < lock
+    assert "unresolved = READ_ONCE" not in worker
+    resync = function(source, "ft_mr_resync")
+    assert resync.index("failed |= BIT(idx);") < resync.index("rtnl_unlock();")
+
+
 def test_the_drain_takes_the_transaction_under_its_callers_rtnl_only():
     """The drain runs under the RTNL a tc command holds and takes the
     transaction there, the order the bind path already takes; it takes no

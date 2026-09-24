@@ -556,6 +556,32 @@ the only one either may use. The bridged worker does the same with
 `ft_mc_lock`: the MDB handler takes it under RTNL and never waits behind a
 build either.
 
+A pass decides against the chain as it stands, not as it stood when the queue
+was last applied. The queue is applied before a group is chosen, so a worker
+that chose one and then waited for RTNL can find it has grown behind the
+holder it waited for: `ip link del` of a VLAN oif unlinks and unregisters the
+device, and ipmr deletes its VIF, inside one RTNL hold; a daemon deletes a VIF
+or the very entry being decided the same way. The first thing done under RTNL
+is therefore to look at the queue (`ft_mr_queue_behind()`). Once registration
+is over only an RTNL holder adds to it — the VIF and entry notifiers assert
+RTNL, and rule changes are RTNL doit handlers — so what it holds stays as found
+for as long as the lock is held. Nothing there that could change the group's
+answer means the VIF mirror, the rule count and the entry are exactly ipmr's;
+anything that could hands the group back undecided and starts the pass again
+from applying it. The other family's events and another entry's do not count,
+since neither touches what the derivation reads. Nor does a queue alone: an
+event lost for want of memory queues nothing and asks for a resync, and a
+resync asked for while the worker waited is run before the group is decided,
+rather than the group going to software for it; one the run already tried and
+could not finish refuses the group, as before, instead of being retried at
+every wait. The pass goes back at most `FT_MR_MAX_RESTARTS` times a run — a
+budget each group renewed would let a steady writer keep one run going for
+ever, since every go back can ask again groups the run already decided — so a
+chain that never falls quiet delays decisions rather than preventing them.
+Past that, a mirrored device no longer registered in `init_net` is still read
+as the removed VIF it is, while a picked entry whose delete is still queued
+can be put in hardware for the one pass before the next run retires it.
+
 One caller does take the transaction under RTNL: the egress drain a DSCP
 filter runs, under the RTNL `tc` took for it — RTNL then the transaction, the
 order the flowtable's bind path already takes. It closes no cycle because the

@@ -8040,7 +8040,9 @@ static void ft_mc_rows(struct seq_file *seq)
  * worker. The worker takes ft_mr_lock to choose a group, releases it, takes
  * RTNL to decide -- device walks, bridge VLAN state and the kernel's multicast
  * egress snapshot -- releases RTNL, and only then takes the transaction, which
- * it holds until the outcome is recorded. Three rules hold, and
+ * it holds until the outcome is recorded. What the handler queued while the
+ * worker waited for RTNL, and could change the answer, is applied before the
+ * group is decided under it (ft_mr_queue_behind()). Three rules hold, and
  * tools/host_tests/test_mroute_learner.py greps for each:
  *
  *   - ft_mr_lock is never held across cdx_ft_begin(). /proc takes the
@@ -8078,6 +8080,20 @@ static void ft_mc_rows(struct seq_file *seq)
  * to be finer: the numbers feed `ip -s mroute` and a daemon's SIOCGETSGCNT,
  * both of which an operator reads by hand. */
 #define FT_MR_STATS_INTERVAL	(5 * HZ)
+/* How many times one worker run goes back to apply what the chain queued while
+ * it waited for RTNL before deciding a group anyway: enough to take in the
+ * burst one RTNL holder writes -- a device going takes its VIFs and a daemon
+ * its entries -- and few enough that a chain that never falls quiet cannot
+ * keep every group waiting. Per run rather than per group: every go back
+ * applies events that can ask again groups the run has already decided, so a
+ * budget each pick renewed would let a steady writer keep one run going for
+ * ever. What spends it is what ft_mr_queue_behind() waits for: any VIF or
+ * rule event of the picked group's family -- a VIF in a table this learner
+ * does not mirror and the default rule included, which cannot change the
+ * answer but are not told apart -- an event of the group's own entry, and a
+ * resync asked for since the run last tried one. The other family's events
+ * and another entry's never do. */
+#define FT_MR_MAX_RESTARTS	4
 
 enum ft_mr_state {
 	/* Eligible, and the worker has not installed it yet. */
@@ -9654,6 +9670,49 @@ static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
 	return NOTIFY_DONE;
 }
 
+/* Whether the chain has said anything the worker has not applied yet that
+ * could change `g`'s answer. Asked by the worker under the RTNL it decides
+ * under.
+ *
+ * Once registration is over, every producer runs under RTNL: the mr_* callers
+ * of the VIF and entry notifiers assert it, and rule changes arrive from RTNL
+ * doit handlers. So what is found here stays as found until this RTNL is let
+ * go of, and when nothing is, the mirror the derivation reads is exactly
+ * ipmr's and ip6mr's -- their VIFs, their rules and this entry -- as of this
+ * hold. Anything found was written while the worker waited for the lock, by
+ * whoever held it: a VIF a daemon deleted, or a device took with it, that the
+ * mirror still names; a rule that would refuse the family; the delete of the
+ * very entry the worker picked; or, as a pending resync, one of those lost
+ * for want of memory. Deciding against that would carry the stream to a port
+ * ipmr has stopped forwarding to, put in hardware an entry ipmr no longer
+ * has, or take the group out of hardware for a resync one pass would have
+ * finished.
+ *
+ * What cannot change `g`'s answer is not waited for: the other family, whose
+ * VIFs, rules and entries are a table of their own, and another entry's add,
+ * replace or delete, which touches nothing the derivation reads. A resync
+ * this run already tried and could not finish (`failed`) is not tried again
+ * here either; the group is refused until it succeeds, as before. */
+static bool ft_mr_queue_behind(const struct ft_mr_group *g,
+			       unsigned long failed)
+{
+	unsigned int idx = ft_mr_idx(g->family);
+	struct ft_mr_event *ev;
+	bool behind;
+
+	ASSERT_RTNL();
+	behind = test_bit(idx, &ft_mr_resync_pending) && !test_bit(idx, &failed);
+	spin_lock_bh(&ft_mr_queue_lock);
+	list_for_each_entry(ev, &ft_mr_queue, list) {
+		if (behind)
+			break;
+		behind = ev->family == g->family &&
+			 (!ev->mfc || ev->mfc == g->mfc);
+	}
+	spin_unlock_bh(&ft_mr_queue_lock);
+	return behind;
+}
+
 struct ft_mr_snapshot {
 	struct notifier_block nb;
 	struct list_head events;
@@ -9675,9 +9734,15 @@ static int ft_mr_snapshot_event(struct notifier_block *nb, unsigned long event,
 
 /* The provider's dump includes rules, VIFs and resolved MFCs. RTNL excludes
  * table changes across capture AND commit; RCU protects the provider and its
- * table walks. The private callback owns no hardware and never sleeps. */
-static void ft_mr_resync(void)
+ * table walks. The private callback owns no hardware and never sleeps.
+ *
+ * Returns the families it tried and could not finish, decided under the RTNL
+ * each attempt holds: a family asked for again once that is let go of -- an
+ * event lost behind it -- is one this pass did not try, and the worker's look
+ * under its own RTNL (ft_mr_queue_behind()) has to tell the two apart. */
+static unsigned long ft_mr_resync(void)
 {
+	unsigned long failed = 0;
 	unsigned int idx;
 
 	for (idx = 0; idx < ARRAY_SIZE(ft_mr_vif); idx++) {
@@ -9740,6 +9805,8 @@ static void ft_mr_resync(void)
 			}
 			mutex_unlock(&ft_mr_lock);
 		}
+		if (rc)
+			failed |= BIT(idx);
 		rtnl_unlock();
 		list_splice_tail_init(&stale, &snapshot.events);
 		list_for_each_entry_safe(ev, tmp, &snapshot.events, list) {
@@ -9753,6 +9820,7 @@ static void ft_mr_resync(void)
 		ft_mr_dirty_family(family);
 		mutex_unlock(&ft_mr_lock);
 	}
+	return failed;
 }
 
 /* MFC_OFFLOAD is what makes `ip mroute show` print `offload` against an entry,
@@ -10245,13 +10313,17 @@ static void ft_mr_work_fn(struct work_struct *work)
 {
 	struct ft_mr_group *g, *tmp;
 	struct ft_mr_event *ev;
-	bool retiring = false;
+	unsigned int restarts = 0;
+	unsigned long unresolved;
+	bool retiring;
 	LIST_HEAD(dead);
 
 	/* Registration may replay its dump after a sequence mismatch. Do not
 	 * apply those attempts before the initial authoritative resync. */
 	if (!smp_load_acquire(&ft_mr_ready))
 		return;
+again:
+	retiring = false;
 	/* 1. What the chain saw. */
 	for (;;) {
 		spin_lock_bh(&ft_mr_queue_lock);
@@ -10268,8 +10340,12 @@ static void ft_mr_work_fn(struct work_struct *work)
 		mutex_unlock(&ft_mr_lock);
 		ft_mr_event_free(ev);
 	}
+	/* The families this run tried to resync and could not, as the resync
+	 * found them: a group of one is refused below rather than sent back to
+	 * try again, while one asked for since is resynced first. */
+	unresolved = 0;
 	if (READ_ONCE(ft_mr_resync_pending) && !READ_ONCE(ft_mr_stopping))
-		ft_mr_resync();
+		unresolved = ft_mr_resync();
 
 	/* 2. Anything outside this learner that stales an answer it gave: a
 	 * ruleset commit takes back every confirmation, and every group is
@@ -10396,6 +10472,25 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * whether it has one is the same answer inside the transaction
 		 * below. */
 		rtnl_lock();
+		/* And against the chain as it stands now, not as it stood when
+		 * the queue was last applied: what it said while this worker
+		 * waited for the lock is applied first, from the top, and the
+		 * group is picked again. It is handed back as it was picked --
+		 * nothing of it was decided or built -- and asked again: what
+		 * was queued need not ask it, a VIF in another table or the
+		 * default rule for one. Bounded, so a chain that never falls
+		 * quiet delays a decision rather than preventing it; a removed
+		 * VIF is still answered then, by ft_mr_vif_dev(). */
+		if (restarts < FT_MR_MAX_RESTARTS &&
+		    ft_mr_queue_behind(target, unresolved)) {
+			rtnl_unlock();
+			mutex_lock(&ft_mr_lock);
+			target->busy = false;
+			target->dirty = true;
+			mutex_unlock(&ft_mr_lock);
+			restarts++;
+			goto again;
+		}
 		if (test_bit(ft_mr_idx(target->family), &ft_mr_resync_pending))
 			state = FT_MR_REFUSED_RESYNC;
 		else

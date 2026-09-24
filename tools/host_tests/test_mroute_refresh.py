@@ -12,6 +12,9 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_mroute_refresh(tmp_path):
     source = (ROOT / "cdx/ask_flowtable.c").read_text()
     header = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
+    # The harness restates the restart bound its cases count against.
+    assert "#define FT_MR_MAX_RESTARTS\t4\n" in source, \
+        "FT_MR_MAX_RESTARTS changed; mroute_refresh.c repeats it"
     (tmp_path / "mroute_backend.inc").write_text(
         declaration(header, "cdx_mc_listener")
         + declaration(header, "cdx_mc_group_spec"))
@@ -42,7 +45,7 @@ def test_mroute_refresh(tmp_path):
             "ft_mr_release_copies", "ft_mr_release_set", "ft_mr_group_free",
             "ft_mr_dirty_family",
             "ft_mr_device_gone", "ft_mr_may_list", "ft_mr_egress_mark",
-            "ft_mr_egress_drain", "ft_mr_key_taken",
+            "ft_mr_egress_drain", "ft_mr_key_taken", "ft_mr_queue_behind",
             "ft_mr_publish", "ft_mr_record", "ft_mr_work_fn", "ft_mr_stats_fn",
             "ft_mr_exit",
         ]))
