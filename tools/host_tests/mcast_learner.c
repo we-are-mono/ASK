@@ -2313,6 +2313,28 @@ static void the_worker_records_what_the_drain_replays(void)
     assert(same_chain(&f->hw_spec, &hw->chain) && !f->egress_stale);
     assert(hw->built_at == ft_egress_changes);
 
+    /* ---- marked before the pick, drained before the build ---------------
+     *
+     * The change marks the flow before the worker picks it, and a tc
+     * command's drain gets the transaction between the pick and the build.
+     * Picking consumes the request for a pass, not the mark: only a build
+     * that started after the change clears it. The drain therefore still
+     * finds the flow marked, and rebuilds it rather than answer for an
+     * entry built before the change. */
+    tc_begin();
+    egress_changed(&P2);
+    tc_end();
+    assert(f->egress_stale && f->stale && hw->built_at < ft_egress_changes);
+    r0 = replaces;
+    drain_port = &P2;
+    drain_rc = 1;
+    before_begin = tc_drains_and_counts;
+    before_begin_skip = 1;
+    ft_mc_work_fn(NULL);
+    assert(!before_begin && !drain_rc && drain_replaces == 1 && !stale_live);
+    assert(replaces == r0 + 2 && !f->egress_stale && f->hw == hw);
+    assert(hw->built_at == ft_egress_changes);
+
     /* ---- a drain that cannot rebuild ------------------------------------
      *
      * The replace fails and leaves the old chain: the drain hands the flow
