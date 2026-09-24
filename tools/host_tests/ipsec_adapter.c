@@ -397,6 +397,17 @@ struct xfrm_replay_state_esn {
 #define lower_32_bits(n) ((u32)(n))
 #define upper_32_bits(n) ((u32)((u64)(n) >> 32))
 
+/* ESP's transform, as far as its geometry goes: what crypto_aead_blocksize()
+ * and crypto_aead_authsize() answer for it. */
+struct crypto_aead { unsigned int blocksize, authsize; };
+static unsigned int crypto_aead_blocksize(struct crypto_aead *aead) { return aead->blocksize; }
+static unsigned int crypto_aead_authsize(struct crypto_aead *aead) { return aead->authsize; }
+struct xfrm_type { u8 proto; };
+struct iphdr { u8 bytes[20]; };
+struct ipv6hdr { u8 bytes[40]; };
+#define XFRM_MODE_BEET 4
+#define ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
+
 struct xfrm_selector { bool mismatch; };
 struct xfrm_state {
 	struct xfrm_selector sel;
@@ -410,7 +421,10 @@ struct xfrm_state {
 		u8 flags;
 		u32 replay_window, reqid;
 		struct { u32 v, m; } smark;
+		int header_len;
 	} props;
+	const struct xfrm_type *type;
+	void *data;
 	struct { u32 v; } mark;
 	struct { u8 state; u8 dying; } km;
 	u8 repl_mode;
@@ -526,11 +540,6 @@ static u32 ntohl(__be32 v)
 	return __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? __builtin_bswap32(v) : v;
 }
 static __be32 htonl(u32 v) { return ntohl(v); }
-/* The tunnel-reduced inner bound, which is all the adapter asks of it. */
-static u16 xfrm_state_mtu(struct xfrm_state *x, unsigned int mtu)
-{
-	return (u16)(mtu - (x->props.mode == XFRM_MODE_TUNNEL ? 60 : 30));
-}
 
 /* The inbound half of a pair, as xfrm's own index answers it. */
 static struct xfrm_state *paired_state;
@@ -999,12 +1008,21 @@ static struct rtable wan_route;
 
 static struct xfrm_algo_auth auth_key = { .alg_key_len = 160, .alg_trunc_len = 96 };
 static struct xfrm_algo cipher_key = { .alg_key_len = 128 };
+/* What esp4 builds for AES-CBC with HMAC-MD5-96: a 16-byte block and IV and
+ * a 12-byte ICV, behind an ESP header, an IV and, in tunnel mode, an outer
+ * IPv4 header. */
+static const struct xfrm_type esp_type = { .proto = IPPROTO_ESP };
+static struct crypto_aead cbc_md5 = { .blocksize = 16, .authsize = 12 };
+#define CBC_TUNNEL_HEADER (8 + 16 + 20)
 
 static struct xfrm_state *outbound_state(void)
 {
 	static struct xfrm_state x;
 
 	memset(&x, 0, sizeof(x));
+	x.type = &esp_type;
+	x.data = &cbc_md5;
+	x.props.header_len = CBC_TUNNEL_HEADER;
 	x.id.daddr.a4 = PEER_IP;
 	x.id.spi = 0x0a878e3e;
 	x.id.proto = IPPROTO_ESP;
@@ -1121,7 +1139,9 @@ static void test_spec(void)
 	assert(spec.auth.alg == 2 && spec.auth.bits == 160);
 	assert(spec.crypt.alg == 12 && spec.crypt.bits == 128);
 	assert(ether_addr_equal(spec.dst_mac, PEER_MAC));
-	assert(spec.dev_mtu == 1500 && spec.mtu == 1440);
+	/* ((1500 - 44 - 12) & ~15) - 2: what Linux answers Fragmentation
+	 * Needed with, on a state not yet valid. */
+	assert(spec.dev_mtu == 1500 && spec.mtu == 1438);
 	/* DF is copied for an IPv4 outbound tunnel unless the state asked for
 	 * no path-MTU discovery, which is asking for the opposite. */
 	assert(spec.copy_df);
@@ -1203,11 +1223,13 @@ static void test_spec(void)
 	x->xso.dir = XFRM_DEV_OFFLOAD_OUT;
 
 	/* Transport mode keeps the SA's own reduced MTU and builds no outer
-	 * header. */
+	 * header: ((1500 - 24 - 12 - 20) & ~15) + 20 - 2. */
 	x->props.mode = XFRM_MODE_TRANSPORT;
+	x->props.header_len = 8 + 16;
 	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
-	assert(!spec.tunnel && spec.mtu == 1470);
+	assert(!spec.tunnel && spec.mtu == 1458);
 	x->props.mode = XFRM_MODE_TUNNEL;
+	x->props.header_len = CBC_TUNNEL_HEADER;
 
 	/* An outbound IPv6 SA has no resolver here yet, and one that cannot
 	 * be addressed must be refused rather than installed blind. */
@@ -1331,6 +1353,71 @@ static void test_spec_auth(void)
 	/* Each pair once per direction, so none of the oracle went untried. */
 	assert(admissions == 2 * sizeof(admitted) / sizeof(admitted[0]));
 	auth_key.alg_trunc_len = 96;
+}
+
+/* The SA's MTU, whose difference from the port's is the expansion the
+ * microcode adds to a packet bound for SEC before the size check that hands
+ * an oversized IPv4 packet with DF to Linux. It has to be the MTU xfrm
+ * computes for the state once it is valid -- the one Linux answers
+ * Fragmentation Needed with -- for every transform geometry, mode, family
+ * and encapsulation, whether the state is still being added (VOID, as
+ * xfrm_user hands it over) or arrives valid (as a migrate does). xfrm's own
+ * function is the oracle, compiled from the kernel. */
+static void test_spec_mtu(void)
+{
+	/* Block size and ICV, and the IV esp puts in front: AES-CBC with a
+	 * 96-, 128- and 256-bit HMAC, 3DES, and GCM, a stream whose block
+	 * esp aligns to 4. */
+	static struct crypto_aead geometries[] = {
+		{ 16, 12 }, { 16, 16 }, { 16, 32 }, { 8, 12 }, { 1, 16 }, { 1, 8 },
+	};
+	static const int ivs[] = { 16, 16, 16, 8, 8, 8 };
+	/* Some not a multiple of 4, where GCM's aligned block shows. */
+	static const u32 mtus[] = { 1500, 1499, 1492, 1477, 1452, 1400, 1280, 9000, 1001, 100, 68 };
+	struct cdx_ipsec_sa_spec spec;
+	struct netlink_ext_ack ack = { NULL };
+	struct xfrm_state *x;
+	unsigned g, m, mode, family, natt;
+	u32 expected;
+
+	bench_reset();
+	for (g = 0; g < sizeof(geometries) / sizeof(geometries[0]); g++)
+	for (mode = XFRM_MODE_TRANSPORT; mode <= XFRM_MODE_TUNNEL; mode++)
+	for (family = 0; family < 2; family++)
+	for (natt = 0; natt < 2; natt++)
+	for (m = 0; m < sizeof(mtus) / sizeof(mtus[0]); m++) {
+		x = outbound_state();
+		x->data = &geometries[g];
+		x->props.mode = (u8)mode;
+		x->props.family = family ? AF_INET6 : AF_INET;
+		x->props.header_len = 8 + ivs[g] +
+			(mode == XFRM_MODE_TUNNEL ? (family ? 40 : 20) : 0) + (natt ? 8 : 0);
+		x->km.state = XFRM_STATE_VALID;
+		expected = kernel_xfrm_state_mtu(x, (int)mtus[m]);
+		assert(ft_ipsec_esp_mtu(x, mtus[m]) == expected);
+		x->km.state = XFRM_STATE_VOID;
+		assert(ft_ipsec_esp_mtu(x, mtus[m]) == expected);
+	}
+
+	/* Through the translation, on a state being added: the SA's MTU is
+	 * the bundle's, not the port's less the headers alone, and the
+	 * expansion the classifier gets carries the ICV, the trailer and the
+	 * padding. For AES-CBC with HMAC-SHA256-128 over IPv4 that is
+	 * 1500 - 1438 = 62 (tools/tests/test_flowtable_ipv6_sa.py), where xfrm
+	 * answers a state not yet valid with 1456. */
+	x = outbound_state();
+	x->data = &geometries[1];
+	x->km.state = XFRM_STATE_VOID;
+	assert(kernel_xfrm_state_mtu(x, 1500) == 1500 - CBC_TUNNEL_HEADER);
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(spec.dev_mtu == 1500 && spec.mtu == 1438);
+	x->km.state = XFRM_STATE_VALID;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && spec.mtu == 1438);
+	/* A state that is not ESP's has no transform to measure, and keeps
+	 * xfrm's header-only answer. */
+	x->data = NULL;
+	assert(ft_ipsec_esp_mtu(x, 1500) == 1500 - CBC_TUNNEL_HEADER);
+	assert(ft_ipsec_esp_mtu(x, 40) == 1);
 }
 
 static void test_next_hop(void)
@@ -3413,6 +3500,7 @@ int main(void)
 	test_spec();
 	test_spec_aead();
 	test_spec_auth();
+	test_spec_mtu();
 	test_next_hop();
 	test_state_add();
 	test_policy_add();

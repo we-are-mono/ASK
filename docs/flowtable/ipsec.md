@@ -109,7 +109,7 @@ if (entry->status & CONNTRACK_SEC) {
 
 - **outbound** — sets `info->to_sec_fqid` from the SA's SEC context, plus
   `info->sa_family` and `info->tnl_hdr_size` (derived as `dev_mtu - mtu`, the
-  tunnel header expansion). The classifier action then enqueues matching
+  whole ESP expansion). The classifier action then enqueues matching
   frames to the SEC frame queue instead of the egress port.
 - **inbound** — sets `info->l3_info.ipsec_inbound_flow` and replaces the table
   descriptor with the offline port's via `dpa_ipsec_ofport_td()`, so the
@@ -1253,8 +1253,8 @@ The cause is one field. The microcode compares the size of what it
 to SEC that is the outer frame: the expansion travels separately, in
 `hdr_xpnd_sz`, and is added before the comparison. Netfilter's MTU for a
 transformed flow is the tunnel-*reduced* inner one, so programming
-`cls->nf_mtu` directly asks the hardware whether 1438 + 44 fits in 1438. It
-does not, and every full-size frame took the exception path.
+`cls->nf_mtu` directly asks the hardware whether 1438 plus the expansion fits
+in 1438. It does not, and every full-size frame took the exception path.
 
 NXP wrote the rule down at the only other site that meets it, where a tunnel
 interface's reduced MTU is corrected before programming:
@@ -1270,6 +1270,23 @@ The legacy owner never met it because its route table holds interface MTUs
 rather than per-flow ones. So a direction carrying an outbound SA now programs
 the egress port's MTU, and `cdx_ft_rule.mtu` keeps meaning what it meant: the
 flow's own bound, which admission still checks and `/proc` still reports.
+
+The expansion has to be all of ESP's, too. It is `dev_mtu - mtu`, with the
+SA's MTU taken from the state, and xfrm hands the state to the driver before it
+is valid, when `xfrm_state_mtu()` takes off only the headers. So the expansion
+left out the ICV, the trailer and the padding: 44 where ESP adds 62 for AES-CBC
+with HMAC-SHA256-128 over IPv4. A migrated state, already valid, got the whole
+62, so the same SA was programmed two ways. The size check the expansion feeds
+is also the one that hands an oversized IPv4 packet with DF to Linux, which
+answers Fragmentation Needed with the SA's MTU. A DF packet of 1439–1456 bytes
+therefore went to SEC instead and left it larger than the port, with DF copied
+to the outer header. The adapter now computes the SA's MTU from its transform,
+as `xfrm_state_mtu()` does for a valid state, whatever the state's lifecycle
+(A227). `test_flowtable_service_ipsec_mtu.py` sends DF datagrams across that
+window and expects Fragmentation Needed with the SA's MTU, and one at exactly
+that MTU crossing in hardware as a single frame. IPv6 is unchanged: the check excepts IPv4 alone, so an IPv6 packet in
+that window still goes to SEC whole and leaves as outer fragments
+([ipv6.md](ipv6.md)).
 
 Worth naming the shape of this, because it is the second time in this
 increment: a hardware path that *degrades* rather than fails is invisible to

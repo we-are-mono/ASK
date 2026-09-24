@@ -14,6 +14,7 @@
  * uses RTNL trylock for admission and fatal recovery, never a blocking acquire.
  * Each binding pins its ingress device; each installed direction pins egress.
  */
+#include <crypto/aead.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/hashtable.h>
@@ -10860,6 +10861,48 @@ static void ft_ipsec_replay_seen(const struct xfrm_state *x,
 	}
 }
 
+/* The largest inner packet an ESP state carries in one frame of `mtu` bytes:
+ * what xfrm_state_mtu() answers for the state once it is valid, with the
+ * outer and ESP headers, the IV, the ICV, the trailer and the worst-case
+ * padding all taken off.
+ *
+ * Not xfrm_state_mtu() itself, which answers by the state's lifecycle rather
+ * than its transform. xfrm_user hands the state to the driver before
+ * inserting it, while it is still XFRM_STATE_VOID, and for such a state that
+ * function returns only mtu - header_len; a migrated state arrives already
+ * valid. The same SA was programmed two ways, and on the add path its
+ * classifier expansion (dev_mtu - mtu) left out the ICV, trailer and padding.
+ * The microcode adds that expansion to a packet bound for SEC before its size
+ * check, the one that hands an oversized IPv4 packet with DF to Linux for
+ * Fragmentation Needed: a DF packet over the SA's MTU by up to that much went
+ * to SEC instead and left it larger than the port, DF copied to the outer
+ * header, where Linux would have answered with the SA's MTU.
+ *
+ * x->data is ESP's AEAD transform, which __xfrm_init_state() has built by the
+ * time any driver sees the state, and the only thing this reads of it is
+ * what xfrm_state_mtu() reads.
+ */
+static u32 ft_ipsec_esp_mtu(struct xfrm_state *x, u32 mtu)
+{
+	struct crypto_aead *aead = x->data;
+	u32 header_len = x->props.header_len;
+	u32 blksize, net_adj = 0, overhead, payload_mtu;
+
+	if (!aead)
+		return mtu > header_len ? mtu - header_len : 1;
+	blksize = ALIGN(crypto_aead_blocksize(aead), 4);
+	if (x->props.mode == XFRM_MODE_TRANSPORT)
+		net_adj = x->props.family == AF_INET6 ? sizeof(struct ipv6hdr)
+						      : sizeof(struct iphdr);
+	overhead = header_len + crypto_aead_authsize(aead) + net_adj;
+	if (mtu <= overhead)
+		return 1;
+	payload_mtu = (mtu - overhead) & ~(blksize - 1);
+	if (payload_mtu <= 2)
+		return 1;
+	return payload_mtu + net_adj - 2;
+}
+
 /* Translate a kernel state into the backend's description of one.
  *
  * Algorithm identities come straight from x->props.aalgo and x->props.ealgo,
@@ -11004,7 +11047,7 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 		memcpy(spec->crypt.key, x->aead->alg_key, x->aead->alg_key_len / 8);
 	}
 	spec->dev_mtu = dev->mtu;
-	spec->mtu = xfrm_state_mtu(x, dev->mtu);
+	spec->mtu = ft_ipsec_esp_mtu(x, dev->mtu);
 	if (spec->dir == CDX_IPSEC_DIR_OUT)
 		return ft_ipsec_next_hop(x, spec, extack);
 	return ft_ipsec_peer_on_port(x, extack);

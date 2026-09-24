@@ -277,6 +277,12 @@ static int cdx_ipsec_validate(const struct cdx_ipsec_sa_spec *spec)
 	 * it turns a caller's omission into plaintext on the wire. */
 	if (!spec->auth.alg && !spec->crypt.alg)
 		return -EOPNOTSUPP;
+	/* What SEC adds to a frame, dev_mtu - mtu, reaches the classifier in a
+	 * byte (hdr_xpnd_sz). No admitted transform comes near it -- an IPv6
+	 * outer header, NAT-T, a 16-byte IV and a 32-byte ICV with the worst
+	 * padding is 121 -- but one that did would wrap it silently. */
+	if (spec->mtu > spec->dev_mtu || spec->dev_mtu - spec->mtu > U8_MAX)
+		return -EOPNOTSUPP;
 	/* SEC fixes the ICV in the operation, so a truncation it has no
 	 * operation for is refused here, before anything is built, rather
 	 * than by the key setter once the SA exists. */

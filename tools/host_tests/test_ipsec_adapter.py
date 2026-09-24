@@ -85,7 +85,8 @@ def test_ipsec_adapter(tmp_path):
         "ft_ipsec_rebuild_pending",
         "ft_ipsec_watch_add", "ft_ipsec_watch_del", "ft_ipsec_watch_flush",
         "ft_ipsec_peer_mac", "ft_ipsec_route_of", "ft_ipsec_next_hop",
-        "ft_ipsec_peer_on_port", "ft_ipsec_replay_bit", "ft_ipsec_replay_seen", "ft_ipsec_spec",
+        "ft_ipsec_peer_on_port", "ft_ipsec_replay_bit", "ft_ipsec_replay_seen",
+        "ft_ipsec_esp_mtu", "ft_ipsec_spec",
         "ft_ipsec_seq_exhausting", "ft_ipsec_publish_oseq",
         "ft_ipsec_publish_window", "ft_ipsec_account", "ft_ipsec_stats_work",
         "ft_xdo_state_add", "ft_ipsec_none_left", "ft_ipsec_retire_work",
@@ -114,6 +115,13 @@ def test_ipsec_adapter(tmp_path):
         + function(state, "xfrm_state_check_expire").replace(
             "int xfrm_state_check_expire(",
             "static int kernel_xfrm_state_check_expire(", 1)
+        # xfrm's MTU for a state, the oracle for the SA's: renamed, since
+        # the adapter must not call it. It compares an int against a u32,
+        # which the kernel's warnings allow and this harness's do not.
+        + '#pragma GCC diagnostic push\n#pragma GCC diagnostic ignored "-Wsign-compare"\n'
+        + function(state, "xfrm_state_mtu").replace(
+            "u32 xfrm_state_mtu(", "static u32 kernel_xfrm_state_mtu(", 1)
+        + "#pragma GCC diagnostic pop\n"
         # xfrm's own replay window, in all three of its modes: the oracle
         # for which bit the adapter reads and writes for which number.
         + "\n".join(function(replay, name) for name in (

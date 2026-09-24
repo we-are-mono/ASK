@@ -34,6 +34,7 @@ typedef uint32_t __be32;
 #define AF_INET6 10
 #define EINVAL 22
 #define EOPNOTSUPP 95
+#define U8_MAX ((u8)~0U)
 #define U32_MAX ((u32)~0U)
 #define U64_MAX ((u64)~0ULL)
 
@@ -689,6 +690,19 @@ static void test_validate(void)
 	spec.auth.icv_bits = 96;
 	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
 	memset(&spec.auth, 0, sizeof(spec.auth));
+
+	/* What SEC adds to a frame reaches the classifier in a byte, so an SA
+	 * whose expansion would not fit is refused rather than wrapped. */
+	spec.dev_mtu = 1500;
+	spec.mtu = 1438;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.mtu = 1500 - 255;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.mtu = 1500 - 256;
+	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
+	spec.mtu = 1501;
+	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
+	spec.mtu = spec.dev_mtu = 0;
 
 	/* Every window SEC can keep, and none wider: a narrower one would
 	 * drop late frames the configuration accepts. */

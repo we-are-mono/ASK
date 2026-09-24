@@ -255,6 +255,9 @@ file's git history.
 - [x] **A229.** get_ofport_info() collected an offline port's table types as bits of its flags word, where types 8, 9, 12 and 13 are OF_FQID_VALID, IN_USE and the port type —
   fixed (_:/^cdx: keep an offline port's table types out of its flags_).
 
+- [x] **A227.** An SA added over netlink got an MTU less only its headers (the state is not yet valid then), so the DF check sent IPv4 DF packets up to ICV, trailer and padding over the SA's MTU to SEC and out larger than the port —
+  fixed (_:/^cdx: program an SA's expansion as the whole of ESP's_).
+
 - [x] **A226.** A failed split-key job (full ring, unmappable job, SEC error) still installed the HMAC SA with a key SEC never wrote, and its ~1 s timeout freed a descriptor the ring still owned —
   fixed (_:/^cdx: refuse an SA whose HMAC split key SEC failed to derive_).
 
