@@ -108,8 +108,9 @@ if (entry->status & CONNTRACK_SEC) {
 `hSAEntry[SA_MAX_OP]` handles and, per direction:
 
 - **outbound** — sets `info->to_sec_fqid` from the SA's SEC context, plus
-  `info->sa_family` and `info->tnl_hdr_size` (derived as `dev_mtu - mtu`, the
-  whole ESP expansion). The classifier action then enqueues matching
+  `info->sa_family` and `info->tnl_hdr_size` (the whole ESP expansion: the
+  direction's own on the path to the peer when the flowtable admitted it, else
+  the SA's `dev_mtu - mtu`). The classifier action then enqueues matching
   frames to the SEC frame queue instead of the egress port.
 - **inbound** — sets `info->l3_info.ipsec_inbound_flow` and replaces the table
   descriptor with the offline port's via `dpa_ipsec_ofport_td()`, so the
@@ -1273,11 +1274,12 @@ meaning what it meant: the flow's own bound, which admission still checks and
 `/proc` still reports.
 
 The bound under the expansion is the one Linux enforces for the direction: the
-bundle's MTU, the smaller of the SA's MTU and the inner route's
-(`xfrm_init_pmtu()`). Netfilter's MTU is the bundle's when the packet that
-created the flow was transformed, and the plain inner route's when the reply
-created it. So the entry takes the smaller of Netfilter's MTU and the SA's own,
-adds the expansion, and caps the sum at the egress port's MTU. An earlier
+bundle's MTU, the smaller of the SA's MTU on the path to the peer and the inner
+route's (`xfrm_init_pmtu()`). Netfilter's MTU is the bundle's when the packet
+that created the flow was transformed, and the plain inner route's when the
+reply created it. So the entry takes the smaller of Netfilter's MTU and the
+SA's on that path, adds the expansion, and caps the sum at the egress port's
+MTU. An earlier
 revision programmed the port's MTU outright, which left an inner route's MTU
 out of the hardware's bound. With a route MTU of 1400 under an SA MTU of 1438,
 a DF packet of 1401–1438 bytes crossed in hardware where Linux answers
@@ -1300,13 +1302,34 @@ to the outer header. The adapter now computes the SA's MTU from its transform,
 as `xfrm_state_mtu()` does for a valid state, whatever the state's lifecycle
 (A227).
 
+Both figures also have to be the path's rather than the port's. The SA's MTU
+and expansion were computed once, at install, from the port's `dev->mtu`, and
+never again. A hop narrower than the port — a routed DSL modem at 1492, as a
+route to the peer with an MTU of its own or as a PMTU learned after the flow
+was admitted — never reached the hardware, and neither did a port MTU lowered
+later. Linux bounds such a direction by the SA's MTU on the narrower path, so
+the hardware stayed laxer than Linux and kept encrypting DF datagrams into
+frames the hop drops, which is how PMTU discovery black-holes. Admission now
+takes both per direction, from the bundle the direction's own lookup built:
+the SA's MTU over the MTU of the bundle's outer route (`dst_mtu()`, which is a
+learned PMTU while one is current, else the route's own, else the device's),
+as the legacy owner did with the outer route's `dst_mtu`, and the expansion as
+the difference. The rule carries them (`cdx_ft_rule.sa_mtu` and
+`sa_expansion`), and the entry takes its `hdr_xpnd_sz` from the rule. When the
+path changes after admission, the SA follows it (§8): its directions are
+retired, counted in `mtu_invalidations`, and readmitted under the new bound
+(A231).
+
 `test_flowtable_service_ipsec_mtu.py` sends DF datagrams across both windows,
-once with the inner route carrying no MTU and once with one below the SA's.
-Each must draw Fragmentation Needed with the bound, one at exactly the bound
-must cross in hardware as a single frame, and one without DF over the inner
-route's MTU must cross whole. IPv6 is unchanged: the check excepts IPv4 alone,
-and an IPv6 direction's Netfilter MTU is its outer device's, so an IPv6 packet
-in either window still goes to SEC whole and leaves as outer fragments
+with the bound set four ways: by the SA's MTU on the port, with the inner route
+carrying no MTU; by an inner route MTU below the SA's; and by a 1492-byte hop
+to the peer, once as a route with that MTU and once as a PMTU learned from the
+peer's Fragmentation Needed, each narrowing after the flow is in hardware.
+Each size over the bound must draw Fragmentation Needed with it, one at exactly
+the bound must cross in hardware as a single frame, and one without DF over the
+inner route's MTU must cross whole. IPv6 is unchanged: the check excepts IPv4
+alone, and an IPv6 direction's Netfilter MTU is its outer device's, so an IPv6
+packet in either window still goes to SEC whole and leaves as outer fragments
 ([ipv6.md](ipv6.md)).
 
 Worth naming the shape of this, because it is the second time in this
@@ -1462,6 +1485,48 @@ nothing else would report it. The watch is re-marked rather than re-queued,
 so the event that fixes the underlying problem is what brings the work back;
 re-queueing would spin against a peer that is simply down.
 
+**The path's MTU is framing too.** The SA's entry fragments what leaves SEC to
+the MTU of the path to the peer, capped at the port's, and every direction the
+SA encrypts was admitted under the SA's MTU on that path (§7). So the same
+re-resolution reads the route's `dst_mtu()` beside the neighbour, and a path
+whose MTU moved is followed twice over. The directions are retired at once,
+since Linux's own bound moved with the path already, and the path is recorded
+even when the peer does not resolve at that moment. The entry is rebuilt at
+the new MTU, retried like any rebuild if the hardware refuses it, without
+retiring the directions a second time. A port MTU change marks the SAs riding
+the port and a route event marks those under the changed prefix, as for a
+moved peer.
+
+The route is the FIB's, asked the way the kernel routes a bundle's outer
+packet (`__ip_route_output_key()`, as `__xfrm4_dst_lookup()` does), and never
+through xfrm. `ip_route_output_key()` goes on through `xfrm_lookup_route()`
+when the flow names a protocol, and a policy whose selector covers the SA's
+own endpoints — a host-to-host transport SA with strongSwan's any-protocol
+selectors, or any host-to-host tunnel — answers with the SA's own bundle. That
+leaves by the port, and its MTU is the SA's inner bound: 1458 for AES-CBC with
+HMAC-SHA256-128 in transport mode, which the entry then held every full-size
+frame leaving SEC to. Without a state yet, as under a trap policy at install,
+the answer with the default `xfrm_larval_drop` was a blackhole on the loopback
+device, which refused the SA, and the lookup could send an ACQUIRE for a flow
+nothing had sent. `test_ipsec_offload_transport.py` sends full-size frames through such an
+SA, installed before its policy and after it, and each must cross whole.
+
+A learned PMTU announces itself to nobody: `__ip_rt_update_pmtu()` and its
+IPv6 counterpart record an exception on the nexthop, which is not a FIB
+change, so neither the FIB notifier nor the route netevents patch 140 adds
+(`NETEVENT_IPV4_ROUTE_UPDATE`, `NETEVENT_IPV6_ROUTE_UPDATE`) hears of it. So
+the one-second accounting pass samples it, and asks the FIB alone: one route
+lookup per SA, no neighbour, and only an SA whose path's MTU differs from the
+one it last followed is marked for the re-resolution. The full re-resolution
+stays on the events that can change its answer. Run on a clock, it would
+probe a peer that is down once a second — the chase the neighbour watch above
+refuses — and retry a refused rebuild (a shared NAT-T entry, a stranded SA)
+on the same clock. A PMTU is followed within one period of being learned.
+Until then a DF datagram between the new bound and the old one is still
+encrypted in hardware into a frame the hop drops; the sender hears nothing for
+it, and the next one after the pass is answered. That second is the residual,
+the price of sampling what no event reports (A231).
+
 `ipsec_next_hop_updates` in `/proc/cdx_flowtable` counts the rebuilds, beside
 the invalidation counters.
 
@@ -1503,7 +1568,13 @@ success — so the cases live in the harness: a neighbour that aged versus one
 that moved, a peer that has gone away and must not be chased, a route event
 that turns out to have changed nothing, a rebuild the hardware refuses, and
 the delete-versus-resolve ordering, proved by draining the retirement queue
-between the two and watching the work decline to touch the freed SA.
+between the two and watching the work decline to touch the freed SA. The
+path's MTU has its own cases: a route, a port and a sampled PMTU each moving
+it, the directions retired once however the rebuild goes, and accounting
+passes that ask the FIB and never the neighbour table, with the peer down and
+a rebuild refused. The rebuild itself — the MTU it writes, capped at the
+port, and both halves of the framing put back when the new entry cannot be
+installed — is compiled from the backend in `ipsec_backend.c`.
 
 ### 9. Two feeders, one sequence counter
 

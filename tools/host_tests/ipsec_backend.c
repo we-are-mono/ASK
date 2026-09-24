@@ -32,6 +32,8 @@ typedef uint32_t __be32;
 #define ETH_ALEN 6
 #define AF_INET 2
 #define AF_INET6 10
+#define EIO 5
+#define EBUSY 16
 #define EINVAL 22
 #define EOPNOTSUPP 95
 #define U8_MAX ((u8)~0U)
@@ -43,7 +45,8 @@ union nf_inet_addr {
 	__be32 ip;
 	__be32 ip6[4];
 };
-struct net_device;
+/* All of a port an SA's rebuild reads. */
+struct net_device { unsigned int mtu; };
 
 static bool is_zero_ether_addr(const u8 *a)
 {
@@ -51,6 +54,10 @@ static bool is_zero_ether_addr(const u8 *a)
 
 	return !memcmp(a, zero, ETH_ALEN);
 }
+static void ether_addr_copy(u8 *dst, const u8 *src) { memcpy(dst, src, ETH_ALEN); }
+#define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+#define pr_warn(...) ((void)0)
+#define pr_err(...) ((void)0)
 
 /* The port question is the backend's too, but not this harness's: every
  * case here names a port that can carry an SA. */
@@ -73,6 +80,7 @@ static void (*before_load)(void);
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define __force
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+typedef uint16_t U16;
 
 /* The real PDB structures and shared descriptor layout, from the kernel's
  * pdb.h and cdx/dpa_ipsec.h. */
@@ -89,11 +97,45 @@ typedef struct {
 	u16 replay_window;
 	u32 replay_seen[SA_REPLAY_SEEN_WORDS];
 	PDpaSecSAContext pSec_sa_context;
+	/* An outbound SA's egress: its route, the classifier entry its frames
+	 * leave SEC by, and the UDP ports a NAT-T SA shares that entry on. */
+	struct _tRouteEntry *pRtEntry;
+	struct hw_ct *ct;
+	struct { u16 sport, dport; } natt;
 } SAEntry, *PSAEntry;
-typedef struct { int unused; } RouteEntry;
+/* The two fields of CDX's route an SA's framing is rebuilt from. */
+typedef struct _tRouteEntry {
+	u8 dstmac[ETH_ALEN];
+	U16 mtu;
+} RouteEntry;
 
 static bool transaction = true;
 static void cdx_ft_assert_held(void) { assert(transaction); }
+
+/* The classifier entry an outbound SA's frames leave SEC by. Removal answers
+ * as scripted, EN_EHASH_DELETE_UNSYNCED being the arm that parks the key
+ * provably out of the table (the value the ehash patch gives it); each
+ * install answers from its script and records the framing it was built
+ * from. */
+#define EN_EHASH_DELETE_UNSYNCED (-2)
+static bool ft_failed;
+static bool cdx_ft_failed(void) { return ft_failed; }
+static int fp_delete_rc;
+static unsigned fp_deletes, fp_installs;
+static int fp_install_rc[4];
+static RouteEntry fp_installed[4];
+static int cdx_ipsec_delete_fp_entry(PSAEntry sa)
+{
+	assert(transaction && sa->ct && sa->ct->handle);
+	fp_deletes++;
+	return fp_delete_rc;
+}
+static int ipsec_install_fp_entry(PSAEntry sa)
+{
+	assert(transaction && fp_installs < 4);
+	fp_installed[fp_installs] = *sa->pRtEntry;
+	return fp_install_rc[fp_installs++];
+}
 
 /* SEC's reader, compiled from cdx_dpa_ipsec.c, with a hook that can store
  * into the PDB between two of the backend's reads, the way SEC does. */
@@ -754,6 +796,106 @@ static void test_validate(void)
 	assert(cdx_ipsec_validate(&spec) == -EINVAL);
 }
 
+/* Moving an SA's framing: the peer's address and the path's MTU, rebuilt
+ * into the classifier entry its frames leave SEC by -- and put back as they
+ * were, both of them, when the new entry cannot be installed. */
+static void test_set_next_hop(void)
+{
+	static const u8 was[ETH_ALEN] = { 2, 0, 0, 0, 0, 1 };
+	static const u8 now[ETH_ALEN] = { 2, 0, 0, 0, 0, 2 };
+	struct net_device port = { .mtu = 1500 };
+	struct hw_ct ct = { .handle = &ct };
+	SAEntry sa_entry = { .ct = &ct };
+	struct cdx_ipsec_sa sa = { .entry = &sa_entry, .dev = &port, .handle = 7 };
+
+	sa_entry.pRtEntry = &sa.route;
+#define REARM(mtu_) do { \
+	memcpy(sa.route.dstmac, was, ETH_ALEN); sa.route.mtu = (mtu_); \
+	sa.stranded = false; ft_failed = false; fp_delete_rc = 0; \
+	fp_deletes = fp_installs = 0; memset(fp_install_rc, 0, sizeof(fp_install_rc)); \
+	memset(fp_installed, 0, sizeof(fp_installed)); \
+} while (0)
+
+	/* A narrower path: the entry is rebuilt to fragment to it. */
+	REARM(1500);
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1492) == 0);
+	assert(fp_deletes == 1 && fp_installs == 1);
+	assert(!memcmp(fp_installed[0].dstmac, now, ETH_ALEN) && fp_installed[0].mtu == 1492);
+	assert(!memcmp(sa.route.dstmac, now, ETH_ALEN) && sa.route.mtu == 1492);
+
+	/* Never wider than the port, whatever the route says. */
+	REARM(1492);
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 9000) == 0);
+	assert(fp_installed[0].mtu == 1500 && sa.route.mtu == 1500);
+	port.mtu = 1480;
+	REARM(1500);
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1500) == 0);
+	assert(sa.route.mtu == 1480);
+	port.mtu = 1500;
+
+	/* No MTU keeps the one the entry has: a peer that moved, alone. */
+	REARM(1400);
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 0) == 0);
+	assert(fp_installed[0].mtu == 1400 && sa.route.mtu == 1400);
+
+	/* An install that fails puts the old framing back, address and MTU,
+	 * and reinstalls it. */
+	REARM(1500);
+	fp_install_rc[0] = -1;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == -EIO);
+	assert(fp_installs == 2 && !sa.stranded);
+	assert(!memcmp(fp_installed[0].dstmac, now, ETH_ALEN) && fp_installed[0].mtu == 1400);
+	assert(!memcmp(fp_installed[1].dstmac, was, ETH_ALEN) && fp_installed[1].mtu == 1500);
+	assert(!memcmp(sa.route.dstmac, was, ETH_ALEN) && sa.route.mtu == 1500);
+
+	/* And when that fails too, the SA is stranded on the framing it had. */
+	REARM(1500);
+	fp_install_rc[0] = fp_install_rc[1] = -1;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == -EIO);
+	assert(fp_installs == 2 && sa.stranded);
+	assert(!memcmp(sa.route.dstmac, was, ETH_ALEN) && sa.route.mtu == 1500);
+	/* Which is terminal for its framing. */
+	fp_installs = fp_deletes = 0;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == -EIO);
+	assert(fp_deletes == 0 && fp_installs == 0 && sa.route.mtu == 1500);
+
+	/* A removal that cannot prove the key gone moves nothing, for good. */
+	REARM(1500);
+	fp_delete_rc = -1;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == -EIO);
+	assert(sa.stranded && fp_installs == 0);
+	assert(!memcmp(sa.route.dstmac, was, ETH_ALEN) && sa.route.mtu == 1500);
+	/* The unsynced arm parks the key out of the table, so a rebuild over
+	 * it goes ahead. */
+	REARM(1500);
+	fp_delete_rc = EN_EHASH_DELETE_UNSYNCED;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == 0);
+	assert(fp_installs == 1 && sa.route.mtu == 1400 && !sa.stranded);
+
+	/* A NAT-T entry another SA shares would only drop a reference, so it
+	 * is refused with nothing touched. */
+	REARM(1500);
+	sa_entry.natt.sport = sa_entry.natt.dport = 4500;
+	ct.natt_out_refcnt = 2;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == -EBUSY);
+	assert(fp_deletes == 0 && fp_installs == 0 && sa.route.mtu == 1500);
+	ct.natt_out_refcnt = 1;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == 0 && sa.route.mtu == 1400);
+	sa_entry.natt.sport = sa_entry.natt.dport = 0;
+
+	/* Refused outright: no address, a route not the SA's own, a failed
+	 * backend. */
+	REARM(1500);
+	assert(cdx_ipsec_sa_set_next_hop(&sa, (const u8[ETH_ALEN]){ 0 }, 1400) == -EINVAL);
+	sa_entry.pRtEntry = NULL;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == -EINVAL);
+	sa_entry.pRtEntry = &sa.route;
+	ft_failed = true;
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == -EIO);
+	assert(fp_deletes == 0 && fp_installs == 0 && sa.route.mtu == 1500);
+#undef REARM
+}
+
 int main(void)
 {
 	test_packet_total();
@@ -767,6 +909,7 @@ int main(void)
 	test_replay_read();
 	test_stats_layout();
 	test_validate();
+	test_set_next_hop();
 	printf("ipsec backend: ok\n");
 	return 0;
 }

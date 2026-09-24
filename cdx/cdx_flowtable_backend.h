@@ -203,6 +203,16 @@ struct cdx_ft_rule {
 	 * a direction can hold both.
 	 */
 	u16 sa_handle;
+	/* With sa_handle: the SA's inner MTU on the outer path its frames take,
+	 * as that path stood when the direction was admitted, and what SEC adds
+	 * to a packet of that size. The bundle Linux bounds the direction with
+	 * is the smaller of this MTU and the flow's own, and the expansion is
+	 * what the classifier adds to a packet before comparing it; both are
+	 * the direction's rather than the SA's, because the SA's outer path
+	 * can narrow -- a lower port MTU, a route or a learned PMTU to the
+	 * peer -- after the SA was installed. Zero without sa_handle. */
+	u16 sa_mtu;
+	u8 sa_expansion;
 	/* The offloaded SA this direction's frames arrive decrypted from, or
 	 * zero.
 	 *

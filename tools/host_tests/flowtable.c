@@ -6631,9 +6631,14 @@ static void test_device_recovery(void)
                 in.net = NULL;
                 assert(!handle.invalid && *counter == invalidations);
                 info.dev = egress ? &out : &in; /* Egress has no binding of its own. */
+                unsigned marked = ipsec_marked_device;
                 ft_netdev_event(NULL, event, &info);
                 ft_netdev_event(NULL, event, &info);
                 assert(handle.invalid && *counter == invalidations + 1);
+                /* An SA riding the port carries both its address and, in the
+                 * MTU it fragments SEC's output to, its MTU: each asks the
+                 * SA to follow. Going down retires flows and leaves SAs. */
+                assert(ipsec_marked_device == marked + (event == NETDEV_GOING_DOWN ? 0 : 2));
                 assert(!ft_invalid && !ft_invalid_done && ft_count == 2 && handle.refs == 3);
                 ft_retire_workfn(NULL);
                 assert(ft_bound == 1 && !ft_count && !ft_handle_refs && !ft_neighbour_refs);

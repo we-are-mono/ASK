@@ -301,7 +301,16 @@ struct dst_entry {
 	struct xfrm_state *xfrm;
 	struct dst_entry *child;
 	int refs;
+	/* The route's own MTU -- a learned PMTU or its metric -- or zero for
+	 * its device's, as dst_mtu() answers. */
+	unsigned mtu;
 };
+static u32 dst_mtu(const struct dst_entry *d)
+{
+	if (d->mtu)
+		return d->mtu;
+	return d->dev ? d->dev->mtu : 1500;	/* an Ethernet port's */
+}
 static struct xfrm_state *dst_xfrm(const struct dst_entry *d) { return d->xfrm; }
 static struct dst_entry *xfrm_dst_child(const struct dst_entry *d) { return d->child; }
 static struct dst_entry *xfrm_dst_path(struct dst_entry *d)
@@ -392,6 +401,7 @@ struct xfrm_replay_state_esn {
 	u32 oseq, seq, oseq_hi, seq_hi, replay_window;
 	u32 bmp[];
 };
+#define U8_MAX ((u8)~0U)
 #define U32_MAX ((u32)~0U)
 #define U64_MAX ((u64)~0ULL)
 #define lower_32_bits(n) ((u32)(n))
@@ -624,6 +634,8 @@ struct cdx_ipsec_sa {
 	/* An inbound SA's window, as SEC's scorecard has it. */
 	u64 seq;
 	u32 seen[4];
+	/* The path MTU its entry fragments SEC's output to. */
+	u16 path_mtu;
 };
 static struct cdx_ipsec_sa sa_pool[8];
 static unsigned sa_installed, sa_deleted;
@@ -677,6 +689,7 @@ static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
 	sa->outbound = spec->dir == CDX_IPSEC_DIR_OUT;
 	sa->live = true;
 	ether_addr_copy(sa->dst_mac, spec->dst_mac);
+	sa->path_mtu = spec->path_mtu;
 	sa_installed++;
 	*result = sa;
 	return 0;
@@ -694,7 +707,8 @@ static void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
  * while it runs. */
 static bool ft_ipsec_rebuild_pending(const struct net_device *dev);
 static struct net_device *pending_during_rebuild, *egress_change_during_rebuild;
-static int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac)
+static int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
+				     u16 path_mtu)
 {
 	sa_next_hop_calls++;
 	/* The invariant the watch design rests on: a rebuild is only ever
@@ -707,6 +721,8 @@ static int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac)
 	if (sa_next_hop_error)
 		return sa_next_hop_error;
 	ether_addr_copy(sa->dst_mac, dst_mac);
+	if (path_mtu)
+		sa->path_mtu = path_mtu;
 	return 0;
 }
 static bool port_supported = true;
@@ -872,12 +888,16 @@ struct flow_cls_offload {
 	struct nf_flow_offload_handle { bool valid; } *nf_handle;
 };
 static atomic64_t ft_admission_invalidations, ft_ipsec_invalidations;
+static atomic64_t ft_mtu_invalidations;
 struct cdx_ft_entry {
 	struct list_head list;
+	/* The dependency watch's list, which a moved path is looked up on. */
+	struct list_head neigh_list;
 	struct { u16 sa_handle, in_sa_handle; } rule;
 	struct nf_flow_offload_handle *handle;
 };
 static LIST_HEAD(ft_entries);
+static LIST_HEAD(ft_neigh_entries);
 static int ft_remove(struct cdx_ft_entry *e)
 {
 	assert(ft_transaction && retirement_flows);
@@ -895,6 +915,10 @@ static int cdx_ft_recover(void)
 }
 static void ft_handle_invalidate(struct nf_flow_offload_handle *h, atomic64_t *count)
 {
+	/* A moved path's flows are walked on the watch's list, which the
+	 * watch lock guards. */
+	if (count == &ft_mtu_invalidations)
+		assert(ft_watch_lock);
 	if (h->valid) { h->valid = false; (*count)++; }
 }
 
@@ -916,9 +940,12 @@ static u32 xfrm_smark_get(u32 mark, struct xfrm_state *x)
 	return (mark & ~x->props.smark.m) | (x->props.smark.v & x->props.smark.m);
 }
 
-static struct rtable *ip_route_output_key(void *net, struct flowi4 *fl4)
+/* The FIB's answer, which is all the adapter may ask for the peer. */
+static struct rtable *__ip_route_output_key(void *net, struct flowi4 *fl4)
 {
 	(void)net;
+	/* Asked with every lock dropped, as the adapter promises. */
+	assert(!ft_watch_lock);
 	route_oif = fl4->flowi4_oif;
 	route_mark = fl4->flowi4_mark;
 	route_l3mdev = fl4->flowi4_l3mdev;
@@ -927,6 +954,20 @@ static struct rtable *ip_route_output_key(void *net, struct flowi4 *fl4)
 	if (route_error)
 		return ERR_PTR(route_error);
 	return route_answer;
+}
+/* What ip_route_output_key() adds when the flow names a protocol:
+ * xfrm_lookup_route(), which answers with a policy's bundle when its selector
+ * covers the flow -- here `route_bundle`, the SA's own over its port. Nothing
+ * in the adapter may call it; it is here so that a peer lookup going back to
+ * it compiles and is caught by the bundle case. */
+static struct rtable *route_bundle;
+static inline struct rtable *ip_route_output_key(void *net, struct flowi4 *fl4)
+{
+	struct rtable *rt = __ip_route_output_key(net, fl4);
+
+	if (!IS_ERR(rt) && fl4->flowi4_proto && route_bundle)
+		return route_bundle;
+	return rt;
 }
 static void ip_rt_put(struct rtable *rt) { (void)rt; route_puts++; }
 
@@ -970,9 +1011,11 @@ static bool xfrm_addr_equal(const xfrm_address_t *a, const xfrm_address_t *b,
 {
 	return !memcmp(a, b, family == AF_INET ? 4 : 16);
 }
+static unsigned neigh_lookups;
 static struct neighbour *dst_neigh_lookup(struct dst_entry *dst, const void *key)
 {
 	(void)dst; (void)key;
+	neigh_lookups++;
 	if (!route_neigh)
 		return NULL;
 	route_neigh->refs++;
@@ -1054,7 +1097,11 @@ static void bench_reset(void)
 	wan_route.dst.ops = &v4_ops;
 	wan_route.dst.dev = &WAN;
 	wan_route.dst.error = 0;
+	wan_route.dst.mtu = 0;
+	WAN.mtu = 1500;
+	neigh_lookups = 0;
 	route_answer = &wan_route;
+	route_bundle = NULL;
 	route_error = 0;
 	peer_answer = NULL;
 	peer_error = 0;
@@ -1142,6 +1189,15 @@ static void test_spec(void)
 	/* ((1500 - 44 - 12) & ~15) - 2: what Linux answers Fragmentation
 	 * Needed with, on a state not yet valid. */
 	assert(spec.dev_mtu == 1500 && spec.mtu == 1438);
+	/* And the path to the peer, which the SA's own entry fragments SEC's
+	 * output to: the route's MTU where it has one -- a narrower hop, a
+	 * learned PMTU -- never more than the port's. */
+	assert(spec.path_mtu == 1500);
+	wan_route.dst.mtu = 1492;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && spec.path_mtu == 1492);
+	wan_route.dst.mtu = 9000;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && spec.path_mtu == 1500);
+	wan_route.dst.mtu = 0;
 	/* DF is copied for an IPv4 outbound tunnel unless the state asked for
 	 * no path-MTU discovery, which is asking for the opposite. */
 	assert(spec.copy_df);
@@ -1909,7 +1965,7 @@ static void test_resolve(void)
 
 	/* No destination at all is not a refusal: a direction with nothing to
 	 * ask about is a plain one. */
-	assert(ft_ipsec_resolve(NULL, &fl, &WAN, NULL, &handle, NULL));
+	assert(ft_ipsec_resolve(NULL, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
 	assert(handle == 0);
 
 	/* A carried transform must not preserve a policy that has since been
@@ -1919,14 +1975,14 @@ static void test_resolve(void)
 		struct dst_entry carried = { .ops = &v4_ops, .xfrm = x,
 					     .child = &under, .refs = 1 };
 
-		assert(ft_ipsec_resolve(&carried, &fl, &WAN, NULL, &handle, NULL));
+		assert(ft_ipsec_resolve(&carried, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
 		assert(handle == 0 && policy_lookups == 1 && under.refs == 1);
 		assert(carried.refs == 1);	/* borrowed, and given back */
 	}
 
 	/* No policy covers the tuple: an ordinary plain end, with the
 	 * reference taken to ask handed back. */
-	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
 	assert(handle == 0 && plain.refs == 1 && policy_lookups == 2);
 
 	/* A policy resolving to an offloaded SA. The bundle takes over the
@@ -1934,7 +1990,7 @@ static void test_resolve(void)
 	 * to leave the borrowed destination exactly as it was found. */
 	policy_answer(WAN.ifindex, &bundle);
 	bundle.refs = 0;
-	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
 	assert(handle == 5);
 	assert(plain.refs == 1 && bundle.refs == 0);
 
@@ -1944,12 +2000,12 @@ static void test_resolve(void)
 	 * say -- which is how fifty-nine packets went out in the clear. */
 	memset(policy_answers, 0, sizeof(policy_answers));
 	policy_error = -EINVAL;
-	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL));
+	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
 	assert(plain.refs == 1);
 
 	/* The same answer at the receiving end is not a refusal: nothing has
 	 * been decrypted, so nothing is arriving that this tuple could miss. */
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle, NULL, NULL, NULL));
 	policy_error = 0;
 
 	/* A policy resolving to a transform the hardware cannot carry refuses
@@ -1958,10 +2014,10 @@ static void test_resolve(void)
 	policy_answer(WAN.ifindex, &bundle);
 	bundle.refs = 0;
 	x->xso.type = XFRM_DEV_OFFLOAD_CRYPTO;
-	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL));
+	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
 	assert(plain.refs == 1 && bundle.refs == 0);
 	bundle.refs = 0;
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle, NULL, NULL, NULL));
 	assert(handle == 0 && plain.refs == 1 && bundle.refs == 0);
 	x->xso.type = XFRM_DEV_OFFLOAD_PACKET;
 	sa_pool[0].handle = 0;
@@ -2073,7 +2129,7 @@ static void test_handle_and_flowi(void)
 {
 	struct xfrm_state *x = outbound_state();
 	struct xfrm_state in, back;
-	struct dst_entry forward = { .ops = &v4_ops, .refs = 1 };
+	struct dst_entry forward = { .ops = &v4_ops, .dev = &WAN, .refs = 1 };
 	struct dst_entry reverse = { .ops = &v4_ops, .refs = 1 };
 	struct dst_entry bundle = { .ops = &v4_ops, .xfrm = x };
 	struct dst_entry back_bundle = { .ops = &v4_ops };
@@ -2133,6 +2189,26 @@ static void test_handle_and_flowi(void)
 	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
 	assert(rule.sa_handle == 5 && rule.in_sa_handle == 0);
 	assert(forward.refs == 1 && reverse.refs == 1);
+	/* The sending end carries the bound the SA puts on it over the path
+	 * its frames take now -- the bundle's outer route -- and what SEC adds
+	 * there: AES-CBC with HMAC-MD5-96 on a 1500-byte path is 1438 and 62.
+	 * A narrower path, a 1492-byte hop or a PMTU learned for the peer,
+	 * narrows it; the SA's own figures, from its install, would not. */
+	assert(rule.sa_mtu == 1438 && rule.sa_expansion == 62);
+	forward.mtu = 1492;
+	bundle.refs = 0;
+	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
+	assert(rule.sa_mtu == 1422 && rule.sa_expansion == 70);
+	/* An expansion past the byte the classifier carries it in is refused
+	 * rather than wrapped, the generation with it. */
+	x->props.header_len = 300;
+	bundle.refs = 0;
+	assert(!ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
+	assert(!handle.valid);
+	x->props.header_len = CBC_TUNNEL_HEADER;
+	forward.mtu = 0;
+	handle.valid = true;
+	ft_admission_invalidations = 0;
 
 	/* A missing inbound half is NOT permission for plaintext. A receiving
 	 * policy on the opposite logical egress refuses this whole generation. */
@@ -2467,6 +2543,256 @@ static void test_watch_route_and_device(void)
 	ft_ipsec_device_moved(&LAN);
 	assert(works_scheduled == 0);
 
+	ft_xdo_state_delete(x);
+	bench_clear_sas();
+}
+
+/* Flows riding the bench SA, on the list a moved path is looked up on: one
+ * direction it encrypts, one it decrypts, and one another SA encrypts. */
+static struct nf_flow_offload_handle sending_handle, receiving_handle, other_handle;
+static struct cdx_ft_entry sending_flow = { .handle = &sending_handle };
+static struct cdx_ft_entry receiving_flow = { .handle = &receiving_handle };
+static struct cdx_ft_entry other_flow = { .handle = &other_handle };
+
+static void flows_ride(u16 handle)
+{
+	ft_neigh_entries.next = ft_neigh_entries.prev = &ft_neigh_entries;
+	sending_flow.rule.sa_handle = handle;
+	receiving_flow.rule.in_sa_handle = handle;
+	other_flow.rule.sa_handle = handle + 1;
+	sending_handle.valid = receiving_handle.valid = other_handle.valid = true;
+	list_add_tail(&sending_flow.neigh_list, &ft_neigh_entries);
+	list_add_tail(&receiving_flow.neigh_list, &ft_neigh_entries);
+	list_add_tail(&other_flow.neigh_list, &ft_neigh_entries);
+	ft_mtu_invalidations = 0;
+}
+
+/* Whether the directions the SA encrypts were retired since the last ask,
+ * counted as an MTU invalidation, with the one it decrypts and another SA's
+ * left alone. Rearms them for the next ask. */
+static bool flows_retired(void)
+{
+	bool retired = !sending_handle.valid;
+
+	assert(receiving_handle.valid && other_handle.valid);
+	assert(ft_mtu_invalidations == retired);
+	sending_handle.valid = true;
+	ft_mtu_invalidations = 0;
+	return retired;
+}
+
+static void flows_leave(void)
+{
+	ft_neigh_entries.next = ft_neigh_entries.prev = &ft_neigh_entries;
+}
+
+/* The path an SA's frames take is framing too. Its MTU changing -- a route to
+ * the peer with an MTU of its own, a port whose MTU changed, a PMTU learned
+ * for the peer that nothing announces -- rebuilds the SA's entry to fragment
+ * SEC's output to the new MTU, and retires the directions the SA encrypts,
+ * whose bound came from the old path. */
+static void test_watch_path_mtu(void)
+{
+	struct xfrm_state state;
+	struct xfrm_state *x;
+
+	bench_reset();
+	bench_clear_sas();
+	x = install_outbound(&state);
+	assert(sa_pool[0].path_mtu == 1500);
+	flows_ride(sa_pool[0].handle);
+
+	/* A route to the peer through a narrower hop. The route event marks
+	 * the watch; the work rebuilds and retires. */
+	wan_route.dst.mtu = 1492;
+	ft_ipsec_route_moved(AF_INET, &(__be32){ PEER_IP }, 0xffffffff, 32);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 1 && sa_pool[0].path_mtu == 1492);
+	assert(flows_retired());
+	assert(ft_ipsec_next_hop_updates == 1);
+	assert(dev_holds == 0 && neigh_refs == 0 && !ft_transaction && !ft_watch_lock);
+	/* Settled: the same path again moves nothing. */
+	ft_ipsec_all_moved();
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 1 && !flows_retired());
+
+	/* A rebuild that fails is retried, but the directions are retired
+	 * once: their bound followed the path already. */
+	wan_route.dst.mtu = 1400;
+	sa_next_hop_error = -EIO;
+	ft_ipsec_all_moved();
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 2 && flows_retired() && sa_pool[0].path_mtu == 1492);
+	sa_next_hop_error = 0;
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 3 && !flows_retired() && sa_pool[0].path_mtu == 1400);
+
+	/* A PMTU learned for the peer changes nothing any notifier reports;
+	 * the accounting pass asks every SA's path again. */
+	wan_route.dst.mtu = 1300;
+	works_scheduled = 0;
+	ft_ipsec_stats_work(NULL);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 4 && flows_retired() && sa_pool[0].path_mtu == 1300);
+
+	/* The port's MTU is the path's when the route carries none: lowered,
+	 * it is followed from the device event, and never exceeded. */
+	wan_route.dst.mtu = 0;
+	WAN.mtu = 1480;
+	works_scheduled = 0;
+	ft_ipsec_device_moved(&WAN);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 5 && flows_retired() && sa_pool[0].path_mtu == 1480);
+	wan_route.dst.mtu = 9000;
+	ft_ipsec_all_moved();
+	ft_ipsec_follow_work(NULL);
+	assert(sa_pool[0].path_mtu == 1480 && !flows_retired());
+
+	flows_leave();
+	WAN.mtu = 1500;
+	wan_route.dst.mtu = 0;
+	ft_xdo_state_delete(x);
+	bench_clear_sas();
+}
+
+/* Accounting passes, each followed by whatever it queued, run as the
+ * workqueue would; how many queued anything. */
+static unsigned accounting_passes(unsigned n)
+{
+	unsigned queued = 0;
+
+	while (n--) {
+		unsigned before = works_scheduled;
+
+		ft_ipsec_stats_work(NULL);
+		if (works_scheduled != before) {
+			queued++;
+			ft_ipsec_follow_work(NULL);
+		}
+	}
+	return queued;
+}
+
+/* The accounting pass asks the FIB, never the neighbour table.
+ *
+ * It samples every SA's path each period for the PMTU nothing announces, and
+ * the whole re-resolution is the real triggers' -- a neighbour or route
+ * event, a port's address or MTU. Asked every period instead, it would probe
+ * a peer that is down once a second and retry a refused rebuild on the same
+ * clock. A path that did move is followed once, even with the peer down: the
+ * directions retire, the path is recorded, and the passes after it are
+ * quiet until the peer answers. */
+static void test_watch_sample_route_only(void)
+{
+	struct xfrm_state state;
+	struct xfrm_state *x;
+	unsigned queued;
+
+	bench_reset();
+	bench_clear_sas();
+	x = install_outbound(&state);
+	flows_ride(sa_pool[0].handle);
+
+	/* A peer that has gone away, on a path that has not moved. */
+	peer_neigh.nud_state = NUD_FAILED;
+	neigh_lookups = neigh_probes = route_lookups = route_puts = 0;
+	queued = accounting_passes(5);
+	assert(neigh_lookups == 0 && neigh_probes == 0 && neigh_refs == 0);
+	assert(queued == 0 && route_lookups == 5 && route_puts == route_lookups);
+	assert(sa_next_hop_calls == 0 && dev_holds == 0 && !ft_watch_lock);
+
+	/* A rebuild the backend refuses is not retried on the clock either. */
+	sa_next_hop_error = -EBUSY;
+	peer_neigh.nud_state = NUD_REACHABLE;
+	ether_addr_copy(peer_neigh.ha, MOVED_MAC);
+	ft_ipsec_neigh_moved(&peer_neigh);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 1 && works_scheduled == 1);
+	neigh_lookups = 0;
+	assert(accounting_passes(5) == 0);
+	assert(sa_next_hop_calls == 1 && neigh_lookups == 0);
+	sa_next_hop_error = 0;
+	ether_addr_copy(peer_neigh.ha, PEER_MAC);
+
+	/* The path narrows while the peer is down. The pass marks the watch
+	 * once; the work retires the directions and records the path although
+	 * nothing can be rebuilt, asking the neighbour table that once. */
+	peer_neigh.nud_state = NUD_FAILED;
+	wan_route.dst.mtu = 1400;
+	assert(accounting_passes(1) == 1);
+	assert(flows_retired() && neigh_lookups == 1 && sa_next_hop_calls == 1);
+	assert(sa_pool[0].path_mtu == 1500);
+	/* And the passes after it are quiet. */
+	assert(accounting_passes(5) == 0);
+	assert(neigh_lookups == 1 && sa_next_hop_calls == 1 && !flows_retired());
+
+	/* The peer answering is what brings the rebuild, at the new MTU, and
+	 * retires nothing further. */
+	peer_neigh.nud_state = NUD_REACHABLE;
+	works_scheduled = 0;
+	ft_ipsec_neigh_moved(&peer_neigh);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 2 && sa_pool[0].path_mtu == 1400);
+	assert(!flows_retired());
+
+	/* No route to the peer says nothing about its path. */
+	route_error = -ENETUNREACH;
+	assert(accounting_passes(1) == 0 && dev_holds == 0);
+	route_error = 0;
+
+	flows_leave();
+	wan_route.dst.mtu = 0;
+	ft_xdo_state_delete(x);
+	bench_clear_sas();
+}
+
+/* The route to the peer is the FIB's, never a policy's bundle.
+ *
+ * A policy whose selector covers the SA's own endpoints for its protocol --
+ * transport mode between two hosts, any protocol, or a host-to-host tunnel --
+ * answers ip_route_output_key() with the SA's own bundle. That leaves by the
+ * port, and its MTU is the SA's inner bound, so an SA that took it for its
+ * path would have its entry fragment or except every full-size frame leaving
+ * SEC, from its install or from the next accounting pass. */
+static void test_peer_route_is_the_fibs(void)
+{
+	struct xfrm_state state;
+	struct xfrm_state *x;
+	static struct rtable bundle;
+
+	bench_reset();
+	bench_clear_sas();
+	/* As xfrm_lookup_route() would answer: over the port's route, with
+	 * xfrm_mtu() for its MTU -- 1458 for an AES-CBC SA with a 12-byte ICV
+	 * in transport mode on 1500 bytes. */
+	bundle.dst = (struct dst_entry){ .ops = &v4_ops, .dev = &WAN, .xfrm = &state,
+					 .child = &wan_route.dst, .mtu = 1458 };
+
+	/* The policy arrives after the SA: neither the accounting pass nor a
+	 * route event takes its bundle for the path. */
+	x = install_outbound(&state);
+	assert(sa_pool[0].path_mtu == 1500);
+	route_bundle = &bundle;
+	assert(accounting_passes(3) == 0);
+	ft_ipsec_route_moved(AF_INET, &(__be32){ PEER_IP }, 0xffffffff, 32);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 0 && sa_pool[0].path_mtu == 1500);
+	assert(dev_holds == 0 && route_puts == route_lookups);
+	ft_xdo_state_delete(x);
+	bench_clear_sas();
+
+	/* The policy is there first, as a trap policy is: the install does
+	 * not take it either. */
+	works_scheduled = 0;
+	x = install_outbound(&state);
+	assert(sa_pool[0].path_mtu == 1500);
+	assert(accounting_passes(3) == 0 && sa_next_hop_calls == 0);
+
+	route_bundle = NULL;
 	ft_xdo_state_delete(x);
 	bench_clear_sas();
 }
@@ -3518,6 +3844,9 @@ int main(void)
 	test_watch_unreachable_peer();
 	test_watch_failures();
 	test_watch_delete_ordering();
+	test_watch_path_mtu();
+	test_watch_sample_route_only();
+	test_peer_route_is_the_fibs();
 	test_accounting();
 	test_sequence_exhaustion();
 	test_spec_sequence();

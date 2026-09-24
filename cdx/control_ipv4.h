@@ -73,6 +73,10 @@ typedef struct _tCtEntry {
 	U16 status;
 
 	U16 hSAEntry[SA_MAX_OP];
+	/* What SEC adds to a frame of this entry's, as the flowtable adapter
+	 * worked it out for the direction's outer path; zero takes the
+	 * outbound SA's own, from its install. */
+	U8 sec_expansion;
 
 	U8 fftype;
 

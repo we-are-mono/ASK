@@ -433,7 +433,8 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 			goto err_delete_sa;
 		}
 		owner->route.itf = onif->itf;
-		owner->route.mtu = spec->dev_mtu;
+		owner->route.mtu = spec->path_mtu ?
+			min(spec->path_mtu, spec->dev_mtu) : spec->dev_mtu;
 		ether_addr_copy(owner->route.dstmac, spec->dst_mac);
 		sa->pRtEntry = &owner->route;
 	}
@@ -492,9 +493,11 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_del, ASK_CDX_FLOWTABLE);
 
-int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac)
+int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
+			      u16 path_mtu)
 {
 	u8 previous[ETH_ALEN];
+	u16 previous_mtu;
 	PSAEntry entry;
 	int rc;
 
@@ -546,6 +549,9 @@ int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac)
 	}
 	ether_addr_copy(previous, sa->route.dstmac);
 	ether_addr_copy(sa->route.dstmac, dst_mac);
+	previous_mtu = sa->route.mtu;
+	if (path_mtu)
+		sa->route.mtu = min_t(u16, path_mtu, READ_ONCE(sa->dev->mtu));
 	rc = ipsec_install_fp_entry(entry);
 	if (!rc)
 		return 0;
@@ -556,6 +562,7 @@ int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac)
 	 * it started, reachable on an address that has moved, instead of with
 	 * frames leaving SEC to match nothing. */
 	ether_addr_copy(sa->route.dstmac, previous);
+	sa->route.mtu = previous_mtu;
 	if (ipsec_install_fp_entry(entry)) {
 		sa->stranded = true;
 		pr_err("cdx: IPsec SA handle %u lost its classifier entry while following its peer; its tunnel carries nothing until the SA is reinstalled\n",

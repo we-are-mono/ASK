@@ -106,7 +106,6 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	struct dpa_iface_info *in_iface, *out_iface;
 	struct cdx_l2_encap encap = {};
 	struct cdx_ft_hw *hw;
-	u16 sa_mtu = 0, expansion = 0;
 	PCtEntry ct;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
@@ -114,13 +113,14 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	if ((rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP) ||
 	    (rule->family != AF_INET && rule->family != AF_INET6))
 		return ask_refuse(-EOPNOTSUPP);
-	/* A direction handed to SEC is bounded by its SA as well and has what
-	 * SEC adds put on top, below, so the SA it names has to be there to
-	 * say both. */
+	/* A direction handed to SEC carries the bound its SA puts on it and
+	 * what SEC adds, both from admission, and names an SA that has to be
+	 * there to encrypt it. */
 	if (rule->sa_handle &&
-	    !cdx_ipsec_sa_bound(rule->sa_handle, &sa_mtu, &expansion)) {
-		ask_dbg(ASK_DBG_DEVICE, "hw sa %u names no outbound SA\n",
-			rule->sa_handle);
+	    (!rule->sa_mtu || !rule->sa_expansion ||
+	     !cdx_ipsec_sa_outbound(rule->sa_handle))) {
+		ask_dbg(ASK_DBG_DEVICE, "hw sa %u bound %u+%u names no outbound SA\n",
+			rule->sa_handle, rule->sa_mtu, rule->sa_expansion);
 		return ask_refuse(-EOPNOTSUPP);
 	}
 	/* The last gate before hardware, and the one whose silence is most
@@ -177,16 +177,22 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 *
 	 * So the entry compares the inner packet against the bound Linux
 	 * itself enforces for the direction -- the bundle's MTU, the smaller
-	 * of the SA's and the inner route's (xfrm_init_pmtu()) -- with the
-	 * expansion put back on, as it is for a tunnel below: an oversized
-	 * packet with DF goes to Linux for Fragmentation Needed with that
-	 * bound. Netfilter's MTU is the bundle's when the packet that created
-	 * the flow was transformed, and the plain inner route's when it was
-	 * the reply, so the SA's MTU is taken in again here and the bound is
-	 * the bundle's either way. Programming the egress port's MTU instead
-	 * let a DF packet over an inner route's MTU through to SEC (A230). */
+	 * of the SA's on its outer path and the inner route's
+	 * (xfrm_init_pmtu()) -- with the expansion put back on, as it is for a
+	 * tunnel below: an oversized packet with DF goes to Linux for
+	 * Fragmentation Needed with that bound. Netfilter's MTU is the
+	 * bundle's when the packet that created the flow was transformed, and
+	 * the plain inner route's when it was the reply, so the SA's MTU is
+	 * taken in again here and the bound is the bundle's either way.
+	 * Programming the egress port's MTU instead let a DF packet over an
+	 * inner route's MTU through to SEC (A230). The SA's MTU and the
+	 * expansion are the direction's, from the outer path at admission
+	 * (cdx_ft_rule.sa_mtu): the SA's own date from its install, before a
+	 * narrower path or a lower port MTU (A231). The entry is given the
+	 * same expansion to add (ct->sec_expansion), so the two cannot differ. */
 	if (rule->sa_handle)
-		hw->route.mtu = min_t(u32, min_t(u32, rule->mtu, sa_mtu) + expansion,
+		hw->route.mtu = min_t(u32, min_t(u32, rule->mtu, rule->sa_mtu) +
+					   rule->sa_expansion,
 				      rule->out_logical->mtu);
 	else
 		hw->route.mtu = rule->mtu;
@@ -377,6 +383,7 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * feeds another. */
 	if (rule->sa_handle) {
 		ct->hSAEntry[0] = rule->sa_handle;
+		ct->sec_expansion = rule->sa_expansion;
 		ct->status |= CONNTRACK_SEC;
 	}
 	if (rule->in_sa_handle) {

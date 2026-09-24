@@ -100,6 +100,11 @@ struct cdx_ipsec_sa_spec {
 	 * and the fragmentation check wants the SA's own bound. */
 	u16 mtu;
 	u16 dev_mtu;
+	/* For an outbound SA, the MTU of the path to the peer as the caller
+	 * resolved it with the next hop -- a learned PMTU, a route's own or the
+	 * port's -- which the entry SEC's output is classified by fragments it
+	 * to. Zero takes dev_mtu. */
+	u16 path_mtu;
 	/* Where the SA's sequence space stands, in the units xfrm keeps it:
 	 * the ESN high word included when the SA has one. For an outbound SA
 	 * it is the last sequence number sent, and SEC sends the one after it
@@ -304,6 +309,11 @@ unsigned int cdx_ipsec_sa_count(void);
  * the framing has moved may pass the address it already has and let the rest
  * be picked up.
  *
+ * `path_mtu` is the MTU of the path to the peer now, which the entry
+ * fragments SEC's output to, capped at the port's; zero keeps the one it had.
+ * It is framing too, and moves the same way: a route or a learned PMTU that
+ * narrowed, or a port whose MTU changed.
+ *
  * Inbound SAs are refused: they are classified rather than transmitted and
  * hold no egress framing to move.
  *
@@ -316,7 +326,8 @@ unsigned int cdx_ipsec_sa_count(void);
  *  in the first case it can no longer be moved at all -- a second attempt
  *  would add a key the hardware still holds.
  */
-int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac);
+int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
+			      u16 path_mtu);
 
 /* The handle SEC and the classifier know this SA by. Stable for the SA's
  * life, never zero, and reusable by a later SA once this one is deleted.

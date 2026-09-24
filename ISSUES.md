@@ -252,6 +252,9 @@ file's git history.
 - [x] **A232.** An offloaded inbound SA's ESP that SEC was not given (another device or port, a refused queue, GRO) was decrypted in software against xfrm's copy of SEC's replay window, which SEC never learns from —
   fixed (_:/^xfrm: receive a hardware-held inbound SA through SEC alone_).
 
+- [x] **A231.** An SA's MTU and expansion were fixed at install from the port's MTU, so a narrower hop to the peer (a route MTU, a PMTU learned later) or a lowered port left DF packets Linux answers crossing in hardware into frames the path drops —
+  fixed (_:/^cdx: bound an SA's directions by its path's MTU, not the port's_).
+
 - [x] **A230.** A direction into an SA was bounded by the port's MTU, not the flow's, so DF packets over an inner route's MTU (1401–1438 under a 1400 route) crossed in hardware where Linux answers Fragmentation Needed —
   fixed (_:/^cdx: bound a direction into an SA by the bundle's MTU_).
 

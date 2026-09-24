@@ -988,6 +988,74 @@ static bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop)
 	return (type & IPV6_ADDR_UNICAST) && !(type & IPV6_ADDR_LOOPBACK);
 }
 
+/* The largest inner packet an ESP state carries in one frame of `mtu` bytes:
+ * what xfrm_state_mtu() answers for the state once it is valid, with the
+ * outer and ESP headers, the IV, the ICV, the trailer and the worst-case
+ * padding all taken off.
+ *
+ * Not xfrm_state_mtu() itself, which answers by the state's lifecycle rather
+ * than its transform. xfrm_user hands the state to the driver before
+ * inserting it, while it is still XFRM_STATE_VOID, and for such a state that
+ * function returns only mtu - header_len; a migrated state arrives already
+ * valid. The same SA was programmed two ways, and on the add path its
+ * classifier expansion (dev_mtu - mtu) left out the ICV, trailer and padding.
+ * The microcode adds that expansion to a packet bound for SEC before its size
+ * check, the one that hands an oversized IPv4 packet with DF to Linux for
+ * Fragmentation Needed: a DF packet over the SA's MTU by up to that much went
+ * to SEC instead and left it larger than the port, DF copied to the outer
+ * header, where Linux would have answered with the SA's MTU.
+ *
+ * x->data is ESP's AEAD transform, which __xfrm_init_state() has built by the
+ * time any driver sees the state, and the only thing this reads of it is
+ * what xfrm_state_mtu() reads.
+ */
+static u32 ft_ipsec_esp_mtu(struct xfrm_state *x, u32 mtu)
+{
+	struct crypto_aead *aead = x->data;
+	u32 header_len = x->props.header_len;
+	u32 blksize, net_adj = 0, overhead, payload_mtu;
+
+	if (!aead)
+		return mtu > header_len ? mtu - header_len : 1;
+	blksize = ALIGN(crypto_aead_blocksize(aead), 4);
+	if (x->props.mode == XFRM_MODE_TRANSPORT)
+		net_adj = x->props.family == AF_INET6 ? sizeof(struct ipv6hdr)
+						      : sizeof(struct iphdr);
+	overhead = header_len + crypto_aead_authsize(aead) + net_adj;
+	if (mtu <= overhead)
+		return 1;
+	payload_mtu = (mtu - overhead) & ~(blksize - 1);
+	if (payload_mtu <= 2)
+		return 1;
+	return payload_mtu + net_adj - 2;
+}
+
+/* The bound an outbound SA puts on a direction over the path its frames take
+ * now, and what SEC adds to a packet at that bound.
+ *
+ * `outer` is the route the SA's frames leave by: the child of the bundle the
+ * direction's lookup built, which is where Linux's own bound for the
+ * direction starts (xfrm_init_pmtu()). Its MTU is the PMTU learned for the
+ * peer while one is current, else the route's own, else its device's
+ * (dst_mtu()), so a hop narrower than the port -- a DSL modem at 1492 -- is
+ * in it, and so is a port whose MTU changed after the SA was installed; the
+ * SA's own figures date from its install and see neither.
+ *
+ * False when the expansion does not fit the byte the classifier carries it in
+ * (hdr_xpnd_sz), which no admitted transform comes near.
+ */
+static bool ft_ipsec_bound(struct xfrm_state *x, const struct dst_entry *outer,
+			   u16 *mtu, u8 *expansion)
+{
+	u32 path = dst_mtu(outer), inner = ft_ipsec_esp_mtu(x, path);
+
+	if (path <= inner || path - inner > U8_MAX)
+		return false;
+	*mtu = inner;
+	*expansion = path - inner;
+	return true;
+}
+
 /* Borrow the route selected by Netfilter, not a second FIB lookup which could
  * lose its policy/ingress context. The callback supplies retained NEIGH and
  * XFRM dsts with the cookie they were selected under: an IPv6 destination
@@ -1125,10 +1193,14 @@ static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_
  * KEEP_DST_REF is what makes the lookup safe on a destination this code does
  * not own: without it a matching policy releases the reference the caller
  * borrowed.
+ *
+ * The sending end also takes its bound from the same bundle, into `sa_mtu`
+ * and `sa_expansion` when given (ft_ipsec_bound()).
  */
 static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 			     struct net_device *dev, struct net_device *pair_in,
-			     u16 *handle, struct xfrm_state **received)
+			     u16 *handle, struct xfrm_state **received,
+			     u16 *sa_mtu, u8 *sa_expansion)
 {
 	struct dst_entry *bundle;
 	struct xfrm_state *x;
@@ -1174,6 +1246,9 @@ static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 
 	x = ft_ipsec_offloaded(bundle, dev);
 	ok = x ? ft_ipsec_record(x, pair_in, handle, received) : !!pair_in;
+	if (ok && x && !pair_in && sa_mtu &&
+	    !ft_ipsec_bound(x, xfrm_dst_child(bundle), sa_mtu, sa_expansion))
+		ok = false;
 	/* Releases the whole chain, including the reference the bundle took
 	 * over from us above. */
 	dst_release(bundle);
@@ -1256,13 +1331,14 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 	bool allowed;
 
 	ft_ipsec_flowi(rule, false, out, &fl);
-	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, NULL, &rule->sa_handle, NULL))
+	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, NULL, &rule->sa_handle, NULL,
+			      &rule->sa_mtu, &rule->sa_expansion))
 		goto denied;
 	/* Both directions share one Linux generation. Validate both receiving
 	 * ends even when their SAs exist: policy may now require a different
 	 * transform, or forbid the tuple altogether. */
 	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, rule->out, &reverse_in,
-			     &received))
+			     &received, NULL, NULL))
 		goto denied;
 	allowed = ft_ipsec_receiving(cls, rule, true, received);
 	if (received)
@@ -1271,7 +1347,7 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 		goto denied;
 	ft_ipsec_flowi(rule, true, in, &fl);
 	if (!ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, rule->in,
-			     &rule->in_sa_handle, &received))
+			     &rule->in_sa_handle, &received, NULL, NULL))
 		goto denied;
 	allowed = ft_ipsec_receiving(cls, rule, false, received);
 	if (received)
@@ -3638,6 +3714,21 @@ static void ft_ipsec_retire_sa(u16 handle)
 	spin_unlock_bh(&ft_watch_lock);
 }
 
+/* The path an outbound SA's frames take has a different MTU now, so every
+ * direction the SA encrypts was admitted under a bound that no longer holds
+ * (cdx_ft_rule.sa_mtu). Retired rather than rewritten, like any dependency:
+ * Linux readmits each on its next packet, and admission takes the bound from
+ * the path as it now stands. Only the sending end: a direction decrypted by
+ * the SA transmits into its own path. Caller holds ft_watch_lock. */
+static void ft_ipsec_path_moved(u16 handle)
+{
+	struct cdx_ft_entry *entry;
+
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
+		if (handle && entry->rule.sa_handle == handle)
+			ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
+}
+
 /* ------------------------------------------- following a peer that moves
  *
  * An outbound SA's next hop is resolved once, when the state is installed,
@@ -3688,6 +3779,10 @@ struct ft_ipsec_watch {
 	 * re-marks a watch whose rebuild failed, so without this a failure
 	 * would be picked straight back up inside the same pass and spin. */
 	u64 pass;
+	/* Which accounting pass last asked after this watch's path. That pass
+	 * drops the lock for each lookup too, and this is its guard against
+	 * taking a watch twice. */
+	u64 sampled;
 	struct cdx_ipsec_sa *sa;
 	struct net_device *dev;
 	union nf_inet_addr local;
@@ -3699,6 +3794,14 @@ struct ft_ipsec_watch {
 	 * either changing is the same defect and takes the same rebuild. */
 	u8 dst_mac[ETH_ALEN];
 	u8 src_mac[ETH_ALEN];
+	/* The MTU of the path to the peer: the one the entry fragments SEC's
+	 * output to (built_mtu), and the one the SA's directions were last
+	 * admitted under (path_mtu), each bounded by the SA on that path. The
+	 * path narrowing or widening under either is followed -- the entry
+	 * rebuilt, the directions retired -- and they are kept apart because
+	 * a rebuild can fail and be retried where a retirement need not be. */
+	u32 built_mtu;
+	u32 path_mtu;
 	u8 family;
 	bool stale;
 	/* Rebuild even though neither address moved: the port's egress queues
@@ -3718,6 +3821,7 @@ struct ft_ipsec_watch {
 static LIST_HEAD(ft_ipsec_watches);
 static u64 ft_ipsec_watch_cookies;
 static u64 ft_ipsec_follow_pass;
+static u64 ft_ipsec_sample_pass;
 static atomic64_t ft_ipsec_next_hop_updates = ATOMIC64_INIT(0);
 /* Egress changes seen so far, on any port (ft_egress_changed()). Something
  * being built while one lands -- an SA, a multicast chain -- is not yet where
@@ -3733,6 +3837,31 @@ static void ft_ipsec_mark(struct ft_ipsec_watch *watch)
 {
 	watch->stale = true;
 	schedule_work(&ft_ipsec_follow);
+}
+
+/* Find a watch by the identity it was created with, never by its address.
+ * Caller holds ft_watch_lock.
+ */
+static struct ft_ipsec_watch *ft_ipsec_watch_find(u64 cookie)
+{
+	struct ft_ipsec_watch *watch;
+
+	list_for_each_entry(watch, &ft_ipsec_watches, list)
+		if (watch->cookie == cookie)
+			return watch;
+	return NULL;
+}
+
+/* The next watch this accounting pass has not asked after yet. Caller holds
+ * ft_watch_lock. */
+static struct ft_ipsec_watch *ft_ipsec_watch_unsampled(u64 pass)
+{
+	struct ft_ipsec_watch *watch;
+
+	list_for_each_entry(watch, &ft_ipsec_watches, list)
+		if (watch->sampled != pass)
+			return watch;
+	return NULL;
 }
 
 /* A neighbour this adapter may have resolved an SA against has changed.
@@ -3903,6 +4032,7 @@ static void ft_ipsec_watch_add(struct ft_ipsec_watch *watch,
 	watch->peer = spec->dst;
 	ether_addr_copy(watch->dst_mac, spec->dst_mac);
 	ether_addr_copy(watch->src_mac, spec->dev->dev_addr);
+	watch->built_mtu = watch->path_mtu = spec->path_mtu;
 	spin_lock_bh(&ft_watch_lock);
 	watch->cookie = ++ft_ipsec_watch_cookies;
 	watch->rebuild = atomic64_read(&ft_egress_changes) != changes;
@@ -4048,6 +4178,10 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		/* IPv4 flushes route caches under this event's RTNL. Admission
 		 * rechecks both destinations before publishing queued context. */
 		ft_device_retire(dev, &ft_mtu_invalidations);
+		/* And an SA riding the port fragments SEC's output to the old
+		 * MTU; nothing re-offers an SA, so it is asked to follow its
+		 * path, which is where the new MTU shows. */
+		ft_ipsec_device_moved(dev);
 		/* A multicast group is carried only while no packet its ingress
 		 * can deliver is larger than a listener's MTU, and an installed
 		 * group is no exception: both learners reconsider every group,
@@ -10613,6 +10747,99 @@ static void ft_mc_egress_changed(const struct net_device *dev)
  * refusal rather than something to retry, because packet offload has no
  * software fallback to wait in.
  */
+/* The route to the peer, as the kernel's own lookup of it finds it.
+ *
+ * The SA's own local endpoint is part of the question, not decoration: an
+ * output lookup carrying a source address answers for the route that address
+ * may actually use, which is the one this tunnel's frames will take.
+ *
+ * No output interface, though. A lookup bound to the SA's port answers
+ * through that port whatever the table says -- a less specific route via it,
+ * or the destination assumed on-link -- so a caller's check that the route
+ * leaves by the port could never fail, and a peer whose route had moved to
+ * another port was followed to a next hop on the old one. The kernel drops
+ * frames for a bundle routed off the SA's port, so this has to agree with it,
+ * and asks with what the kernel's own lookup of the peer carries: the table
+ * of the VRF the port is enslaved to, if any, and the SA's `route`.
+ *
+ * And it asks the FIB alone, as __xfrm4_dst_lookup() does for a bundle's
+ * outer packet. ip_route_output_key() would not: with a protocol in the flow
+ * it goes on through xfrm_lookup_route(), and a policy whose selector covers
+ * the SA's own endpoints for that protocol -- transport mode between two
+ * hosts, any protocol, which is strongSwan's default, or any host-to-host
+ * tunnel -- answers with the SA's own bundle. That leaves by the port, so it
+ * passes for the route, and its dst_mtu() is xfrm_mtu(): the SA's inner bound
+ * (1458 for AES-CBC with HMAC-SHA256-128 in transport mode on a 1500-byte
+ * port), which the SA's entry then fragmented or excepted every full-size
+ * frame leaving SEC against. With no state for such a policy yet -- a trap
+ * policy at install -- the answer, with the default xfrm_larval_drop, was a
+ * blackhole on the loopback device, which refused the SA, and the lookup
+ * could send an ACQUIRE for a flow nothing had sent.
+ */
+static struct rtable *ft_ipsec_peer_route(struct net_device *dev,
+					  const union nf_inet_addr *local,
+					  const union nf_inet_addr *peer,
+					  const struct ft_ipsec_route *route,
+					  struct flowi4 *fl4)
+{
+	*fl4 = (struct flowi4){
+		.daddr = peer->ip,
+		.saddr = local->ip,
+		.flowi4_mark = route->mark,
+		.flowi4_l3mdev = l3mdev_master_ifindex(dev),
+		.flowi4_proto = route->proto,
+		.fl4_sport = route->sport,
+		.fl4_dport = route->dport,
+	};
+	return __ip_route_output_key(&init_net, fl4);
+}
+
+/* What the SA's frames can carry to the peer on `rt`: its learned PMTU while
+ * one is current, else its own MTU, else the device's (dst_mtu()), and never
+ * more than the port's. What the entry SEC's output is classified by
+ * fragments them to, and the path every direction the SA encrypts is bounded
+ * on (ft_ipsec_bound()). */
+static u32 ft_ipsec_route_mtu(const struct rtable *rt,
+			      const struct net_device *dev)
+{
+	return min_t(u32, dst_mtu(&rt->dst), READ_ONCE(dev->mtu));
+}
+
+/* The MTU of the path to an SA's peer now, asked of the FIB alone.
+ *
+ * This is the accounting pass's question (ft_ipsec_sample_paths()), and the
+ * route is all of it on purpose. The neighbour belongs to the real triggers
+ * -- a neighbour or route event, a port's address or MTU changing -- which
+ * run the whole re-resolution. Asking it on a clock would probe an
+ * unresolved peer once a period, which ft_ipsec_neigh_moved() is written not
+ * to do, and retry a rebuild the backend refused on the same clock rather
+ * than on the event that could change the answer.
+ *
+ * Fails, and says nothing about the path, when there is no route or it no
+ * longer leaves by the SA's port; a route event is what follows those.
+ */
+static int ft_ipsec_path_mtu(struct net_device *dev, u8 family,
+			     const union nf_inet_addr *local,
+			     const union nf_inet_addr *peer,
+			     const struct ft_ipsec_route *route, u32 *path_mtu)
+{
+	struct flowi4 fl4;
+	struct rtable *rt;
+	int rc = 0;
+
+	if (family != AF_INET)
+		return -EOPNOTSUPP;
+	rt = ft_ipsec_peer_route(dev, local, peer, route, &fl4);
+	if (IS_ERR(rt))
+		return PTR_ERR(rt);
+	if (rt->dst.dev == dev)
+		*path_mtu = ft_ipsec_route_mtu(rt, dev);
+	else
+		rc = -EOPNOTSUPP;
+	ip_rt_put(rt);
+	return rc;
+}
+
 /* How long to wait for the peer's neighbour entry, and in how many steps.
  * Two seconds total: an ARP exchange on a LAN completes in microseconds, so
  * this is a bound on something going wrong rather than an expected cost. */
@@ -10628,39 +10855,22 @@ static void ft_mc_egress_changed(const struct net_device *dev)
  * the neighbour event that arrives when the peer answers brings it straight
  * back here -- so it probes and returns rather than holding a shared
  * workqueue for seconds.
+ *
+ * `path_mtu` receives the path's MTU (ft_ipsec_route_mtu()) once the route
+ * is found, and keeps it when the neighbour then fails to resolve: the path
+ * is the route's, whatever the peer on it does.
  */
 static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
 			     const union nf_inet_addr *local,
 			     const union nf_inet_addr *peer,
 			     const struct ft_ipsec_route *route, bool wait,
-			     u8 *mac, struct netlink_ext_ack *extack)
+			     u8 *mac, u32 *path_mtu,
+			     struct netlink_ext_ack *extack)
 {
 	struct neighbour *neighbour;
 	unsigned int attempt;
+	struct flowi4 fl4;
 	struct rtable *rt;
-	/* The SA's own local endpoint is part of the question, not decoration:
-	 * an output lookup carrying a source address answers for the route
-	 * that address may actually use, which is the one this tunnel's frames
-	 * will take.
-	 *
-	 * No output interface, though. A lookup bound to the SA's port answers
-	 * through that port whatever the table says -- a less specific route
-	 * via it, or the destination assumed on-link -- so the refusal below
-	 * could never fire, and a peer whose route had moved to another port
-	 * was followed to a next hop on the old one. The kernel now drops
-	 * frames for a bundle routed off the SA's port, so this has to agree
-	 * with it, and asks with what the kernel's own lookup of the peer
-	 * carries: the table of the VRF the port is enslaved to, if any, and
-	 * the SA's `route`. */
-	struct flowi4 fl4 = {
-		.daddr = peer->ip,
-		.saddr = local->ip,
-		.flowi4_mark = route->mark,
-		.flowi4_l3mdev = l3mdev_master_ifindex(dev),
-		.flowi4_proto = route->proto,
-		.fl4_sport = route->sport,
-		.fl4_dport = route->dport,
-	};
 	int rc = 0;
 
 	eth_zero_addr(mac);
@@ -10668,7 +10878,7 @@ static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
 		NL_SET_ERR_MSG(extack, "cdx: only IPv4 tunnel endpoints are supported");
 		return -EOPNOTSUPP;
 	}
-	rt = ip_route_output_key(&init_net, &fl4);
+	rt = ft_ipsec_peer_route(dev, local, peer, route, &fl4);
 	if (IS_ERR(rt)) {
 		NL_SET_ERR_MSG(extack, "cdx: no route to the remote tunnel endpoint");
 		return PTR_ERR(rt);
@@ -10678,6 +10888,7 @@ static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
 		rc = -EOPNOTSUPP;
 		goto out;
 	}
+	*path_mtu = ft_ipsec_route_mtu(rt, dev);
 	/* Resolve the peer, asking for it if nobody has yet.
 	 *
 	 * An offloaded SA is usually installed moments after an IKE exchange
@@ -10743,10 +10954,15 @@ static int ft_ipsec_next_hop(struct xfrm_state *x,
 			     struct netlink_ext_ack *extack)
 {
 	struct ft_ipsec_route route;
+	u32 path_mtu;
+	int rc;
 
 	ft_ipsec_route_of(x, &route);
-	return ft_ipsec_peer_mac(spec->dev, spec->family, &spec->src, &spec->dst,
-				 &route, true, spec->dst_mac, extack);
+	rc = ft_ipsec_peer_mac(spec->dev, spec->family, &spec->src, &spec->dst,
+			       &route, true, spec->dst_mac, &path_mtu, extack);
+	if (!rc)
+		spec->path_mtu = path_mtu;
+	return rc;
 }
 
 /* Whether an inbound SA's peer is reached by the SA's own device.
@@ -10859,48 +11075,6 @@ static void ft_ipsec_replay_seen(const struct xfrm_state *x,
 		if (seen)
 			spec->replay_seen[k / 32] |= 1U << (k % 32);
 	}
-}
-
-/* The largest inner packet an ESP state carries in one frame of `mtu` bytes:
- * what xfrm_state_mtu() answers for the state once it is valid, with the
- * outer and ESP headers, the IV, the ICV, the trailer and the worst-case
- * padding all taken off.
- *
- * Not xfrm_state_mtu() itself, which answers by the state's lifecycle rather
- * than its transform. xfrm_user hands the state to the driver before
- * inserting it, while it is still XFRM_STATE_VOID, and for such a state that
- * function returns only mtu - header_len; a migrated state arrives already
- * valid. The same SA was programmed two ways, and on the add path its
- * classifier expansion (dev_mtu - mtu) left out the ICV, trailer and padding.
- * The microcode adds that expansion to a packet bound for SEC before its size
- * check, the one that hands an oversized IPv4 packet with DF to Linux for
- * Fragmentation Needed: a DF packet over the SA's MTU by up to that much went
- * to SEC instead and left it larger than the port, DF copied to the outer
- * header, where Linux would have answered with the SA's MTU.
- *
- * x->data is ESP's AEAD transform, which __xfrm_init_state() has built by the
- * time any driver sees the state, and the only thing this reads of it is
- * what xfrm_state_mtu() reads.
- */
-static u32 ft_ipsec_esp_mtu(struct xfrm_state *x, u32 mtu)
-{
-	struct crypto_aead *aead = x->data;
-	u32 header_len = x->props.header_len;
-	u32 blksize, net_adj = 0, overhead, payload_mtu;
-
-	if (!aead)
-		return mtu > header_len ? mtu - header_len : 1;
-	blksize = ALIGN(crypto_aead_blocksize(aead), 4);
-	if (x->props.mode == XFRM_MODE_TRANSPORT)
-		net_adj = x->props.family == AF_INET6 ? sizeof(struct ipv6hdr)
-						      : sizeof(struct iphdr);
-	overhead = header_len + crypto_aead_authsize(aead) + net_adj;
-	if (mtu <= overhead)
-		return 1;
-	payload_mtu = (mtu - overhead) & ~(blksize - 1);
-	if (payload_mtu <= 2)
-		return 1;
-	return payload_mtu + net_adj - 2;
 }
 
 /* Translate a kernel state into the backend's description of one.
@@ -11452,6 +11626,69 @@ out:
 	spin_unlock_bh(&x->lock);
 }
 
+/* Ask after every SA's path, and mark for the follow work only the watches
+ * whose path's MTU has moved since they last followed it.
+ *
+ * A PMTU learned for a peer changes the path an SA's frames take and is
+ * announced to nobody: __ip_rt_update_pmtu() records an exception on the
+ * nexthop, which no FIB notification or netevent carries. So the accounting
+ * pass samples it, and a path that narrows between two passes is followed
+ * within a period.
+ *
+ * The FIB alone, and only a moved MTU marked (ft_ipsec_path_mtu()): the
+ * follow work's whole re-resolution stays on the events that can change its
+ * answer. A watch that is marked gets it once; the work records the path it
+ * found whether or not the peer then resolved, so the next pass finds
+ * nothing to mark.
+ *
+ * Every lock is dropped across each lookup, with the same shape and the same
+ * per-pass guard as the follow work: a route lookup per SA is no work for
+ * under a lock the neighbour and route notifiers take.
+ */
+static void ft_ipsec_sample_paths(void)
+{
+	struct ft_ipsec_watch *watch;
+	struct ft_ipsec_route route;
+	union nf_inet_addr local;
+	union nf_inet_addr peer;
+	struct net_device *dev;
+	u64 cookie, pass;
+	u32 path_mtu;
+	u8 family;
+
+	spin_lock_bh(&ft_watch_lock);
+	pass = ++ft_ipsec_sample_pass;
+	spin_unlock_bh(&ft_watch_lock);
+
+	for (;;) {
+		spin_lock_bh(&ft_watch_lock);
+		watch = ft_ipsec_watch_unsampled(pass);
+		if (!watch) {
+			spin_unlock_bh(&ft_watch_lock);
+			return;
+		}
+		watch->sampled = pass;
+		cookie = watch->cookie;
+		dev = watch->dev;
+		family = watch->family;
+		route = watch->route;
+		local = watch->local;
+		peer = watch->peer;
+		dev_hold(dev);
+		spin_unlock_bh(&ft_watch_lock);
+
+		if (!ft_ipsec_path_mtu(dev, family, &local, &peer, &route,
+				       &path_mtu)) {
+			spin_lock_bh(&ft_watch_lock);
+			watch = ft_ipsec_watch_find(cookie);
+			if (watch && watch->path_mtu != path_mtu)
+				ft_ipsec_mark(watch);
+			spin_unlock_bh(&ft_watch_lock);
+		}
+		dev_put(dev);
+	}
+}
+
 /* One accounting pass over every owned SA.
  *
  * The control transaction is held throughout, and it is what makes the walk
@@ -11493,8 +11730,10 @@ static void ft_ipsec_stats_work(struct work_struct *work)
 	more = !list_empty(&ft_ipsec_owned);
 	spin_unlock_bh(&ft_ipsec_retired_lock);
 	cdx_ft_end();
-	if (more)
+	if (more) {
+		ft_ipsec_sample_paths();
 		schedule_delayed_work(&ft_ipsec_stats, FT_IPSEC_STATS_PERIOD);
+	}
 }
 
 static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack)
@@ -11659,19 +11898,6 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 
 static DECLARE_WORK(ft_ipsec_retire, ft_ipsec_retire_work);
 
-/* Find a watch by the identity it was created with, never by its address.
- * Caller holds ft_watch_lock.
- */
-static struct ft_ipsec_watch *ft_ipsec_watch_find(u64 cookie)
-{
-	struct ft_ipsec_watch *watch;
-
-	list_for_each_entry(watch, &ft_ipsec_watches, list)
-		if (watch->cookie == cookie)
-			return watch;
-	return NULL;
-}
-
 /* The next watch this pass has not already taken on. Caller holds
  * ft_watch_lock. */
 static struct ft_ipsec_watch *ft_ipsec_watch_stale(u64 pass)
@@ -11723,8 +11949,8 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 	u8 was_dst[ETH_ALEN];
 	u8 was_src[ETH_ALEN];
 	u8 mac[ETH_ALEN];
-	bool reported, rebuild;
-	u32 asked;
+	bool reported, rebuild, moved, reframe;
+	u32 asked, was_built, was_path, path_mtu;
 	u64 cookie;
 	u64 pass;
 	struct ft_ipsec_route route;
@@ -11757,14 +11983,40 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 		asked = watch->rebuilds_asked;
 		ether_addr_copy(was_dst, watch->dst_mac);
 		ether_addr_copy(was_src, watch->src_mac);
+		was_built = watch->built_mtu;
+		was_path = watch->path_mtu;
 		dev_hold(dev);
 		spin_unlock_bh(&ft_watch_lock);
 
+		path_mtu = 0;
 		rc = ft_ipsec_peer_mac(dev, family, &local, &peer, &route, false,
-				       mac, NULL);
-		if (!rc && !rebuild && ether_addr_equal(mac, was_dst) &&
+				       mac, &path_mtu, NULL);
+		/* The path's MTU is framing as much as the addresses are: the
+		 * entry fragments SEC's output to it, and every direction the
+		 * SA encrypts was bounded by the SA on it. It is known once the
+		 * route is, whether or not the peer then resolved. */
+		moved = path_mtu && path_mtu != was_path;
+		reframe = !rc && path_mtu != was_built;
+		if (moved) {
+			/* The directions follow the path even when the peer
+			 * does not resolve or the rebuild below fails: their
+			 * bound is Linux's, which moved with the path already.
+			 * Recording the path here rather than after a rebuild
+			 * is also what keeps the accounting pass from marking
+			 * this watch again every period while its peer is
+			 * down. A watch still listed names an SA not yet queued
+			 * for retirement, so its handle is still its own. */
+			spin_lock_bh(&ft_watch_lock);
+			watch = ft_ipsec_watch_find(cookie);
+			if (watch && watch->sa) {
+				ft_ipsec_path_moved(cdx_ipsec_sa_handle(watch->sa));
+				watch->path_mtu = path_mtu;
+			}
+			spin_unlock_bh(&ft_watch_lock);
+		}
+		if (!rc && !rebuild && !reframe && ether_addr_equal(mac, was_dst) &&
 		    ether_addr_equal(dev->dev_addr, was_src)) {
-			/* Neither address moved. A route event marks every SA
+			/* Nothing to rebuild. A route event marks every SA
 			 * under the changed prefix, so most passes end here. */
 			dev_put(dev);
 			continue;
@@ -11775,7 +12027,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 			watch = ft_ipsec_watch_find(cookie);
 			sa = watch ? watch->sa : NULL;
 			spin_unlock_bh(&ft_watch_lock);
-			rc = sa ? cdx_ipsec_sa_set_next_hop(sa, mac) : 0;
+			rc = sa ? cdx_ipsec_sa_set_next_hop(sa, mac, path_mtu) : 0;
 			if (sa && !rc) {
 				spin_lock_bh(&ft_watch_lock);
 				watch = ft_ipsec_watch_find(cookie);
@@ -11783,14 +12035,22 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 					ether_addr_copy(watch->dst_mac, mac);
 					ether_addr_copy(watch->src_mac,
 							dev->dev_addr);
+					watch->built_mtu = path_mtu;
 					watch->reported = false;
 					if (watch->rebuilds_asked == asked)
 						watch->rebuild = false;
 				}
 				spin_unlock_bh(&ft_watch_lock);
 				atomic64_inc(&ft_ipsec_next_hop_updates);
-				netdev_info(dev, "cdx: IPsec SA followed its peer to %pM\n",
-					    mac);
+				if (reframe && family == AF_INET6)
+					netdev_info(dev, "cdx: IPsec SA to %pI6c follows its path's MTU, now %u\n",
+						    &peer.in6, path_mtu);
+				else if (reframe)
+					netdev_info(dev, "cdx: IPsec SA to %pI4 follows its path's MTU, now %u\n",
+						    &peer.ip, path_mtu);
+				else
+					netdev_info(dev, "cdx: IPsec SA followed its peer to %pM\n",
+						    mac);
 			}
 			cdx_ft_end();
 		}
@@ -11802,7 +12062,11 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 				watch->reported = true;
 			}
 			spin_unlock_bh(&ft_watch_lock);
-			if (!reported)
+			if (!reported && family == AF_INET6)
+				netdev_warn(dev,
+					    "cdx: IPsec SA to %pI6c could not follow its peer (%d); its tunnel keeps emitting to %pM\n",
+					    &peer.in6, rc, was_dst);
+			else if (!reported)
 				netdev_warn(dev,
 					    "cdx: IPsec SA to %pI4 could not follow its peer (%d); its tunnel keeps emitting to %pM\n",
 					    &peer.ip, rc, was_dst);

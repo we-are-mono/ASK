@@ -106,7 +106,8 @@ hosts a Packet Too Big round trip on every new path. An SA does not narrow
 the bound: through a transform a flow's MTU is its outer device's, because
 `ip6_dst_mtu_maybe_forward()` ignores the bundle's unlocked `RTAX_MTU`, so an
 IPv6 direction into an SA is admitted as before. Its entry's bound is the SA's
-MTU with the ESP expansion on top, which is the port's MTU, and nothing excepts
+MTU on the path to the peer with the ESP expansion on top, which is that path's
+MTU -- the port's, unless a hop to the peer is narrower -- and nothing excepts
 an IPv6 packet on size. So a packet that fits the port but not the bundle
 (1438 for AES-CBC and a 128-bit HMAC-SHA256 tag over IPv4) is taken by the
 hardware: SEC encrypts the inner packet whole and the microcode fragments the

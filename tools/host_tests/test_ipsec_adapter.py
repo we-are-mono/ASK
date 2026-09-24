@@ -78,19 +78,23 @@ def test_ipsec_adapter(tmp_path):
     # forward-declaring keeps the harness from depending on where in the
     # source a function happens to sit.
     names = [
+        "ft_ipsec_esp_mtu", "ft_ipsec_bound",
         "ft_ipsec_offloaded", "ft_ipsec_paired_inbound", "ft_ipsec_record",
         "ft_ipsec_resolve", "ft_ipsec_flowi", "ft_ipsec_receiving", "ft_ipsec_handle",
-        "ft_ipsec_mark", "ft_ipsec_neigh_moved", "ft_ipsec_route_moved",
+        "ft_ipsec_mark", "ft_ipsec_watch_find", "ft_ipsec_watch_unsampled",
+        "ft_ipsec_path_moved",
+        "ft_ipsec_neigh_moved", "ft_ipsec_route_moved",
         "ft_ipsec_all_moved", "ft_ipsec_device_moved", "ft_ipsec_egress_changed",
         "ft_ipsec_rebuild_pending",
         "ft_ipsec_watch_add", "ft_ipsec_watch_del", "ft_ipsec_watch_flush",
+        "ft_ipsec_peer_route", "ft_ipsec_route_mtu", "ft_ipsec_path_mtu",
         "ft_ipsec_peer_mac", "ft_ipsec_route_of", "ft_ipsec_next_hop",
-        "ft_ipsec_peer_on_port", "ft_ipsec_replay_bit", "ft_ipsec_replay_seen",
-        "ft_ipsec_esp_mtu", "ft_ipsec_spec",
+        "ft_ipsec_peer_on_port", "ft_ipsec_replay_bit", "ft_ipsec_replay_seen", "ft_ipsec_spec",
         "ft_ipsec_seq_exhausting", "ft_ipsec_publish_oseq",
-        "ft_ipsec_publish_window", "ft_ipsec_account", "ft_ipsec_stats_work",
+        "ft_ipsec_publish_window", "ft_ipsec_account", "ft_ipsec_sample_paths",
+        "ft_ipsec_stats_work",
         "ft_xdo_state_add", "ft_ipsec_none_left", "ft_ipsec_retire_work",
-        "ft_ipsec_watch_find", "ft_ipsec_watch_stale", "ft_ipsec_follow_work",
+        "ft_ipsec_watch_stale", "ft_ipsec_follow_work",
         "ft_xdo_state_delete", "ft_ipsec_names_owned", "ft_ipsec_policy_served",
         "ft_xdo_policy_add",
         "ft_xdo_state_free", "ft_xdo_offload_ok",
@@ -432,6 +436,10 @@ def test_ipsec_backend(tmp_path):
         + "\n" + re.search(r"^#define MAX_SHARED_DESC_SIZE\s.*$", layout, re.M).group()
         + "\n" + layout[layout.index("struct desc_hdr {"):
                         layout.index("/* For all Buffer pools")]
+        # The classifier entry an outbound SA's frames leave SEC by, which a
+        # NAT-T SA can share.
+        + "\n" + re.search(r"^struct hw_ct \{.*?^\};",
+                           (ROOT / "cdx/cdx_common.h").read_text(), re.S | re.M).group()
         + "\n")
     (tmp_path / "ipsec_backend_production.inc").write_text(
         re.search(r"^struct cdx_ipsec_sa \{.*?^\};", backend, re.S | re.M).group() + "\n"
@@ -468,7 +476,10 @@ def test_ipsec_backend(tmp_path):
         + function(backend, "cdx_ipsec_sa_sample")
         + function(backend, "cdx_ipsec_sa_replay_sample")
         + function(backend, "cdx_ipsec_sa_bytes_believable")
-        + function(backend, "cdx_ipsec_sa_stats"))
+        + function(backend, "cdx_ipsec_sa_stats")
+        # The rebuild that moves an SA's framing: its peer, its path's MTU.
+        + re.search(r"^#define IS_NATT_SA\(.*$", control, re.M).group() + "\n"
+        + function(backend, "cdx_ipsec_sa_set_next_hop"))
     binary = tmp_path / "ipsec_backend"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

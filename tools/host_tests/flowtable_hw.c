@@ -197,6 +197,7 @@ typedef struct CtEntry {
     RouteEntry *pRtEntry;
     struct hw_ct *ct;
     u16 hSAEntry[SA_MAX_OP];
+    u8 sec_expansion;
     unsigned fftype, status, proto, hash;
     __be16 Sport, Dport;
     /* The real hardware-visible overlay, byte for byte: an IPv6 destination
@@ -282,22 +283,18 @@ static bool expected_hairpin;
  * bound rejects every full-size frame. */
 static unsigned expected_mtu;
 static u16 expected_sa, expected_in_sa;
-/* The outbound SA a direction names, as the SA cache answers for it: its MTU
- * and what its frames grow by through SEC. Handle 7 is AES-CBC with
- * HMAC-SHA256-128 over IPv4 on a 1500-byte port; any other names nothing. */
-static u16 sa_mtu = 1438, sa_expansion = 62;
+/* Whether the SA cache still holds the outbound SA a direction names: handle
+ * 7 it does, any other it does not. What the entry adds for SEC is the
+ * direction's own, carried in the rule from admission. */
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 static unsigned sa_lookups;
-static bool cdx_ipsec_sa_bound(u16 handle, u16 *mtu, u16 *expansion)
+static bool cdx_ipsec_sa_outbound(u16 handle)
 {
     lockdep_assert_held(&cdx_info->ctrl.mutex);
     sa_lookups++;
-    if (handle != 7)
-        return false;
-    *mtu = sa_mtu;
-    *expansion = sa_expansion;
-    return true;
+    return handle == 7;
 }
+static u8 expected_expansion;
 static struct cdx_l2_encap observed_encap;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
@@ -376,6 +373,9 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     assert(ct->pRtEntry->underlying_input_itf == &in_itf);
     assert(ct->pRtEntry->mtu == expected_mtu);
     assert(ct->hSAEntry[0] == expected_sa && ct->hSAEntry[1] == expected_in_sa);
+    /* The expansion the entry adds before its size check is the one its MTU
+     * was raised by, so the two cannot differ. */
+    assert(ct->sec_expansion == expected_expansion);
     assert(!(ct->status & CONNTRACK_SEC) == !(expected_sa || expected_in_sa));
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));
     if (fail_insert) return -1;
@@ -637,18 +637,32 @@ static void test_backend(void)
      * (1500 on the port's own MTU), and either way the entry must answer
      * above 1438; an inner route with an MTU of its own (1400, 1200) is the
      * bound, where the egress port's MTU alone let 1401..1438 through. An
-     * egress device smaller than the SA's port caps it, and one raised past
-     * the port the SA was programmed on does not lift the SA's own bound. */
+     * egress device smaller than the path caps it.
+     *
+     * The SA's bound and the expansion are the direction's, from the outer
+     * path at admission, not the SA's from its install: a peer behind a
+     * 1492-byte hop gives AES-CBC/SHA256 1422 and 70, a port lowered to
+     * 1480 gives 1406 and 74, and the entry follows each -- the SA's own
+     * figures, 1438 and 62 from a 1500-byte port, would let 1423..1438 and
+     * 1407..1418 through. The entry adds the same expansion it was raised
+     * by. */
     rule.sa_handle = expected_sa = 7;
     {
-        static const struct { unsigned flow, port, entry; } bounds[] = {
-            { 1200, 1500, 1262 }, { 1400, 1500, 1462 }, { 1438, 1500, 1500 },
-            { 1500, 1500, 1500 }, { 1500, 1480, 1480 }, { 9000, 9000, 1500 },
+        static const struct {
+            unsigned flow, sa, expansion, port, entry;
+        } bounds[] = {
+            { 1200, 1438, 62, 1500, 1262 }, { 1400, 1438, 62, 1500, 1462 },
+            { 1438, 1438, 62, 1500, 1500 }, { 1500, 1438, 62, 1500, 1500 },
+            { 1500, 1438, 62, 1480, 1480 }, { 1500, 1422, 70, 1500, 1492 },
+            { 1400, 1422, 70, 1500, 1470 }, { 1480, 1406, 74, 1480, 1480 },
+            { 9000, 8938, 62, 9000, 9000 },
         };
         unsigned saved = rule.mtu, i;
 
         for (i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
             rule.mtu = bounds[i].flow;
+            rule.sa_mtu = bounds[i].sa;
+            rule.sa_expansion = expected_expansion = bounds[i].expansion;
             out.mtu = bounds[i].port;
             expected_mtu = bounds[i].entry;
             assert(cdx_ft_add(&rule,&stats,&hw) == 0 && hw);
@@ -657,11 +671,19 @@ static void test_backend(void)
         rule.mtu = saved;
         out.mtu = 1500;
     }
-    /* An SA the cache no longer holds cannot say how much SEC adds, so the
-     * direction is refused before anything is built. */
+    /* A direction that names an SA without the bound admission works out
+     * for it, or an SA the cache no longer holds, is refused before
+     * anything is built. */
+    rule.sa_expansion = 0;
+    assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw && !allocations);
+    rule.sa_expansion = 62;
+    rule.sa_mtu = 0;
+    assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw && !allocations);
+    rule.sa_mtu = 1438;
     rule.sa_handle = expected_sa = 9;
     assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw && !allocations);
     rule.sa_handle = expected_sa = 0;
+    rule.sa_mtu = rule.sa_expansion = expected_expansion = 0;
     /* The receiving end takes no such correction: what it transmits is the
      * decrypted inner frame, so the flow's own bound is the right one. */
     rule.in_sa_handle = expected_in_sa = 8;

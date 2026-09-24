@@ -221,10 +221,9 @@ unsigned int M_ipsec_sa_cache_entries(void);
 /* An authenticator is its algorithm and the ICV it truncates to, in bits;
  * cdx_ipsec_auth_op() is the one list of pairs SEC produces. */
 int cdx_ipsec_auth_op(u16 alg, unsigned int icv_bits);
-/* An outbound SA's MTU -- the largest inner packet it carries in one frame --
- * and the bytes its frames grow by through SEC; false for a handle naming no
- * outbound SA. Control mutex. */
-bool cdx_ipsec_sa_bound(u16 handle, u16 *mtu, u16 *expansion);
+/* Whether a handle names an outbound SA the cache still holds. Control
+ * mutex. */
+bool cdx_ipsec_sa_outbound(u16 handle);
 int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, unsigned int icv_bits,
 			      U16 key_bits, U8 *key);
 int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8 *key);

@@ -133,11 +133,13 @@ changes retire installed directions through their events, so the bound is
 checked at admission.
 
 A direction into an SA is exempt because its entry is bounded differently. The
-bound is the bundle's MTU that Linux enforces, the smaller of the SA's MTU and
-the inner route's, with SEC's expansion on top, which the microcode adds before
-comparing. `PREEMPT_DFBIT_HONOR` therefore hands Linux exactly the DF packets
-Linux would answer, and a packet without DF goes to SEC whole
-([ipsec.md](ipsec.md), A227, A230).
+bound is the bundle's MTU that Linux enforces, the smaller of the SA's MTU on
+the path to the peer and the inner route's, with SEC's expansion on top, which
+the microcode adds before comparing. `PREEMPT_DFBIT_HONOR` therefore hands
+Linux exactly the DF packets Linux would answer, and a packet without DF goes
+to SEC whole. A change to that path -- the port's MTU, a route to the peer, a
+learned PMTU -- retires the directions the SA encrypts, so readmission reads
+the new bound ([ipsec.md](ipsec.md), A227, A230, A231).
 
 A refused direction does not stay refused quietly. Linux offers a flow again
 at most about once a second for as long as the software fast path forwards

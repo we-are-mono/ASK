@@ -119,6 +119,21 @@ class SecurityAssociations:
         return [p for p in await xfrm(self.r, self.r.target, "policy") if INNER + "/32" in p.splitlines()[0]]
 
 
+def wire_interface(r):
+    """The WAN host's DUT-facing physical port, where ESP is captured as the
+    wire carries it. XFRM reinjects decrypted packets on the host's L3
+    interface, so capturing below a bridge keeps those copies from
+    masquerading as plaintext on the wire."""
+    members = Path('/sys/class/net', r.wan_if, 'brif')
+    physical = [p.name for p in members.iterdir()
+                if Path('/sys/class/net', p.name, 'device').exists()] if members.exists() else [r.wan_if]
+    wire = os.environ.get('ASK_WAN_WIRE_IF')
+    if not wire:
+        assert len(physical) == 1, ('set ASK_WAN_WIRE_IF to the DUT-facing physical port', physical)
+        wire = physical[0]
+    return wire
+
+
 @pytest_asyncio.fixture
 async def ipsec_service(rig, request):
     r = rig
@@ -127,15 +142,7 @@ async def ipsec_service(rig, request):
     outer = next(a["local"] for i in json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show", "dev", TARGET_WAN_IF))["stdout"])
                  for a in i["addr_info"] if a["family"] == "inet")
     r.ipsec = sa = SecurityAssociations(r, wan, outer, transform)
-    # XFRM reinjects decrypted packets on the host's L3 interface. Capture
-    # below a bridge so those copies cannot masquerade as plaintext on wire.
-    members = Path('/sys/class/net', r.wan_if, 'brif')
-    physical = [p.name for p in members.iterdir()
-                if Path('/sys/class/net', p.name, 'device').exists()] if members.exists() else [r.wan_if]
-    r.ipsec_wire_if = os.environ.get('ASK_WAN_WIRE_IF')
-    if not r.ipsec_wire_if:
-        assert len(physical) == 1, ('set ASK_WAN_WIRE_IF to the DUT-facing physical port', physical)
-        r.ipsec_wire_if = physical[0]
+    r.ipsec_wire_if = wire_interface(r)
     transport, lan_created, encap = None, False, None
     cleanup = []
     for agent in (r.target, wan):
