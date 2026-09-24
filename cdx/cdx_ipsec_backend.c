@@ -79,6 +79,7 @@ unsigned int cdx_ipsec_sa_count(void)
 	cdx_ft_assert_held();
 	return cdx_ipsec_sa_owned;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_count, ASK_CDX_FLOWTABLE);
 
 /* Find a handle no live SA holds.
  *
@@ -151,6 +152,12 @@ bool cdx_ipsec_auth_supported(u16 alg, unsigned int icv_bits)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_auth_supported, ASK_CDX_FLOWTABLE);
 
+unsigned int cdx_ipsec_sa_cache_entries(void)
+{
+	return M_ipsec_sa_cache_entries();
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_cache_entries, ASK_CDX_FLOWTABLE);
+
 /* Build the outer header a tunnel-mode SA prepends.
  *
  * Built here, from the spec, keeps the ESP next header and the two header
@@ -202,12 +209,24 @@ static void cdx_ipsec_set_natt(unsigned short *sport, unsigned short *dport,
 	*dport = be16_to_cpu(natt_dport);
 }
 
-static int cdx_ipsec_set_keys(PSAEntry sa, const struct cdx_ipsec_sa_spec *spec)
+static int cdx_ipsec_set_keys(PSAEntry sa, const struct cdx_ipsec_sa_spec *spec,
+			      struct netlink_ext_ack *extack)
 {
-	if (spec->auth.alg &&
-	    M_ipsec_sa_set_digest_key(sa, spec->auth.alg, spec->auth.icv_bits,
-				      spec->auth.bits, (U8 *)spec->auth.key))
-		return -EOPNOTSUPP;
+	int rc;
+
+	if (spec->auth.alg) {
+		rc = M_ipsec_sa_set_digest_key(sa, spec->auth.alg,
+					       spec->auth.icv_bits,
+					       spec->auth.bits,
+					       (U8 *)spec->auth.key);
+		/* Anything but a transform SEC lacks is the split-key job
+		 * failing: a hardware failure, passed on as it is rather than
+		 * as a capability the SA did not ask for. */
+		if (rc && rc != -EOPNOTSUPP)
+			NL_SET_ERR_MSG(extack, "cdx: SEC could not derive the HMAC split key");
+		if (rc)
+			return rc;
+	}
 	if (spec->crypt.alg &&
 	    M_ipsec_sa_set_cipher_key(sa, spec->crypt.alg, spec->crypt.bits,
 				      (U8 *)spec->crypt.key))
@@ -315,7 +334,7 @@ static int cdx_ipsec_local_on_port(const struct cdx_ipsec_sa_spec *spec,
 }
 
 int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
-		     struct cdx_ipsec_sa **result)
+		     struct cdx_ipsec_sa **result, struct netlink_ext_ack *extack)
 {
 	struct cdx_ipsec_sa *owner;
 	PSAEntry sa;
@@ -369,7 +388,7 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 	}
 	cdx_ipsec_set_sequence(sa, spec);
 
-	rc = cdx_ipsec_set_keys(sa, spec);
+	rc = cdx_ipsec_set_keys(sa, spec, extack);
 	if (rc)
 		goto err_delete_sa;
 

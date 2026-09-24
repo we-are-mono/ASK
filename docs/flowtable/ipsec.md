@@ -498,6 +498,22 @@ once the bit is advertised in `hw_features` the first term stops carrying it,
 so anything that later recomputes features would clear it and the only symptom
 would be strongSwan quietly declining to offload from then on.
 
+**An HMAC's split key is derived at install, and a failure refuses the SA.**
+SEC loads an HMAC key as a split key, its inner and outer pads, which a job on
+cdx's SEC job ring derives and writes encrypted. That job can fail: the ring
+can be full (`EBUSY`), the job may not be buildable or mappable (`ENOMEM`), or
+SEC can end it with an error (`EIO`, whose status the CAAM driver logs). Each
+refuses the SA with *"cdx: SEC could not derive the HMAC split key"* and
+installs nothing. Before, the SA was installed anyway with a key SEC never
+wrote, and every frame it authenticated failed (A226). The install waits for
+the job without a bound, as the kernel's own `gen_split_key()` does, because a
+job the ring accepted always completes and reads and writes memory that has to
+outlive it. `ipsec_sas` and `ipsec_sa_cache` in `/proc/cdx_flowtable` count the
+SAs the adapter installed and the SAs cdx's cache holds, which is how a refused
+install is seen to leave nothing behind. On the test image
+(`CDX_DEBUG_SPLIT_KEY_FAIL`), `/proc/cdx_split_key_fail` halts the next N
+split-key jobs on SEC.
+
 #### The callback contract, which decides where the teardown goes
 
 Three facts about when these run, none of them obvious from the ops struct,

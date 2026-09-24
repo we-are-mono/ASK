@@ -22,6 +22,8 @@ typedef uint32_t U32;
 typedef uint64_t U64;
 
 #define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
+#define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
+#define WRITE_ONCE(x, v) (*(volatile __typeof__(x) *)&(x) = (v))
 #define printk_ratelimited(...) ((void)0)
 #define printk(...) ((void)0)
 
@@ -182,14 +184,16 @@ int main(void)
 					3, 1, 0, 1400, 1500, 0));
 	assert(!live_sa && !live_context && !sa_lock_held);
 	assert(!M_ipsec_sa_cache_lookup_by_h(3));
+	assert(M_ipsec_sa_cache_entries() == 0);
 
 	/* Two SAs sharing a handle bucket and a frame-queue bucket. */
 	takes = sa_lock_takes;
 	links = sa_links;
 	a = create(3, 0x200 + 5, false);
 	b = create(3 + NUM_SA_ENTRIES, 0x200 + 5 + NUM_SA_ENTRIES, true);
-	/* Each create links both tables under the lock. */
+	/* Each create links both tables under the lock, and is counted once. */
 	assert(sa_lock_takes - takes == 4 && sa_links - links == 4);
+	assert(M_ipsec_sa_cache_entries() == 2);
 	a->netdev = &dev_a;
 	b->netdev = &dev_b;
 	assert(a->hash_by_h == b->hash_by_h);
@@ -223,6 +227,7 @@ int main(void)
 	unlinks = sa_unlinks;
 	assert(M_ipsec_sa_cache_delete(3 + 2 * NUM_SA_ENTRIES) == ERR_SA_UNKNOWN);
 	assert(!released && live_sa == 2 && sa_unlinks == unlinks);
+	assert(M_ipsec_sa_cache_entries() == 2);
 
 	/* Deleting one leaves the other reachable through both tables. Its
 	 * two unlinks, one from each table, are both made under the lock:
@@ -230,6 +235,7 @@ int main(void)
 	assert(M_ipsec_sa_cache_delete(3) == NO_ERR);
 	assert(released == a && live_sa == 1 && live_context == 1);
 	assert(sa_unlinks - unlinks == 2);
+	assert(M_ipsec_sa_cache_entries() == 1);
 	assert(!M_ipsec_sa_cache_lookup_by_h(3));
 	assert(M_ipsec_sa_cache_lookup_by_h(3 + NUM_SA_ENTRIES) == b);
 	assert(!get_netdev_of_SA_by_fqid(0x200 + 5, &got));
@@ -239,6 +245,7 @@ int main(void)
 	assert(M_ipsec_sa_cache_delete(3 + NUM_SA_ENTRIES) == NO_ERR);
 	assert(released == b && !live_sa && !live_context && !sa_lock_held);
 	assert(sa_unlinks - unlinks == 4 && sa_links - sa_unlinks == 0);
+	assert(M_ipsec_sa_cache_entries() == 0);
 	for (int i = 0; i < NUM_SA_ENTRIES; i++)
 		assert(!sa_cache_by_h[i].next && !sa_cache_by_fqid[i].next);
 

@@ -113,4 +113,13 @@ int  cdx_ipsec_init_key_zeroing_probe(void);
 void cdx_ipsec_remove_key_zeroing_probe(void);
 #endif
 
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+/* Split-key fault-injection knob - see cdx_dpa_ipsec.c. Both functions
+ * exist only when CDX_DEBUG_SPLIT_KEY_FAIL is defined; the meta-ask test
+ * image sets it via CFG_FLAGS, production builds do not.
+ */
+int  cdx_ipsec_init_split_key_fail_probe(void);
+void cdx_ipsec_remove_split_key_fail_probe(void);
+#endif
+
 #endif

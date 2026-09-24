@@ -69,6 +69,14 @@ int  cdx_mc_init_hcsync_fail_probe(void);
 void cdx_mc_remove_hcsync_fail_probe(void);
 #endif
 
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+/* IPsec split-key fault-injection knob - see cdx_dpa_ipsec.c for design
+ * rationale. Forward-declared for the include-order reason above.
+ */
+int  cdx_ipsec_init_split_key_fail_probe(void);
+void cdx_ipsec_remove_split_key_fail_probe(void);
+#endif
+
 /* Quarantine terminal disposition (cdx_ehash.c) — forward-declared for the
  * include-order reason above; the full contract lives in cdx_common.h. */
 void cdx_ehash_quarantine_abandon(void);
@@ -425,6 +433,12 @@ static int __init cdx_module_init(void)
 		register_cdx_deinit_func(cdx_mc_remove_hcsync_fail_probe);
 	else
 		printk(KERN_WARNING "%s::cdx_mc_init_hcsync_fail_probe failed\n", __func__);
+#endif
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+	if (cdx_ipsec_init_split_key_fail_probe() == 0)
+		register_cdx_deinit_func(cdx_ipsec_remove_split_key_fail_probe);
+	else
+		printk(KERN_WARNING "%s::cdx_ipsec_init_split_key_fail_probe failed\n", __func__);
 #endif
 #ifdef START_DPA_APP
 	rc = start_dpa_app();

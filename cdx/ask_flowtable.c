@@ -11513,7 +11513,7 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	/* Before the build reads the port's egress, which an egress change
 	 * updates before counting itself. */
 	changes = atomic64_read_acquire(&ft_egress_changes);
-	rc = cdx_ipsec_sa_add(&spec, x, &sa);
+	rc = cdx_ipsec_sa_add(&spec, x, &sa, extack);
 	if (!rc && watch) {
 		ft_ipsec_route_of(x, &route);
 		ft_ipsec_watch_add(watch, &spec, sa, &route, changes);
@@ -12631,6 +12631,10 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_ipsec_invalidations),
 		   atomic64_read(&ft_ipsec_policy_invalidations),
 		   atomic64_read(&ft_ipsec_next_hop_updates));
+	/* The SAs this adapter installed, and every SA cdx's cache holds: an
+	 * install refused part-way has to leave both where they were. */
+	seq_printf(seq, "ipsec_sas %u\nipsec_sa_cache %u\n",
+		   cdx_ipsec_sa_count(), cdx_ipsec_sa_cache_entries());
 	ft_sec_refusal_rows(seq);
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   session_records, session_slots);

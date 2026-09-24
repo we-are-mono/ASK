@@ -40,8 +40,11 @@
  * Contexts:
  *   cdx_ipsec_add/remove/update_*     - process, flowtable transaction.
  *   cdx_ipsec_sec_sa_context_*        - process, under command path.
- *   split_key_done (CAAM callback)    - softirq; touches only the
- *                                       per-call completion atomic_t.
+ *   split_key_done (CAAM callback)    - softirq; the kernel's own, it
+ *                                       touches only the per-call
+ *                                       split_key_result, which
+ *                                       cdx_ipsec_generate_split_key()
+ *                                       keeps alive until it completes.
  */
 #ifdef DPA_IPSEC_OFFLOAD
 #include <linux/delay.h>
@@ -52,6 +55,9 @@
 #include "jr.h"
 #include "pdb.h"
 #include "desc_constr.h"
+/* The kernel's split-key job completion and pad lengths; after
+ * desc_constr.h, whose struct alginfo it names. */
+#include "key_gen.h"
 /* intern.h needs compat.h and regs.h in scope first; pdb.h and
  * desc_constr.h above already pull them in, so it goes last. */
 #include "intern.h"
@@ -2122,27 +2128,104 @@ err_unmap_auth:
 	return ret;
 }
 
-static void split_key_done(struct device *dev, u32 *desc, u32 err,
-		void *context)
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+/*
+ * Split-key fault injection -- DEBUG-ONLY, NOT FOR PRODUCTION.
+ *
+ * Deriving an SA's HMAC split key is a SEC job, and one that fails on real
+ * hardware means a full or faulted job ring -- not reproducible on demand.
+ * Write a decimal count to /proc/cdx_split_key_fail and that many of the
+ * following split-key jobs halt on SEC with a user status before doing
+ * anything else (a JUMP of type "halt with user-specified status", SEC RM
+ * 7.20.1.5), so the job completes with an error through the same callback
+ * a real failure takes. Reading the file back reports how many are still
+ * armed.
+ *
+ * Production (Armbian) builds DO NOT define CDX_DEBUG_SPLIT_KEY_FAIL. The
+ * flag is set only in the meta-ask test image, and the probe pr_warn_once's
+ * at init so an accidental enable surfaces loudly.
+ */
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
+
+#define SPLIT_KEY_FAIL_PROC_NAME "cdx_split_key_fail"
+/* What an armed job reports: any non-zero LOCAL OFFSET is an error. */
+#define CDX_SPLIT_KEY_FAULT_STATUS 0x5a
+
+static atomic_t split_key_fail_countdown = ATOMIC_INIT(0);
+static struct proc_dir_entry *split_key_fail_proc;
+
+/* Whether this job is one of the armed ones, consuming it if so. */
+static bool cdx_ipsec_split_key_fault(void)
 {
-	register atomic_t *done = context;
-	//printk(KERN_ERR "%s: Job ring  err  value =%d\n", __func__, err);
-
-	if (err)
-		caam_jr_strstatus(dev, err);
-
-	atomic_set(done, 1);
+	/* atomic_dec_if_positive() returns the post-decrement value, so
+	 * >= 0 means an armed job was actually taken. */
+	return atomic_dec_if_positive(&split_key_fail_countdown) >= 0;
 }
 
-/* determine the HASH algorithm and the coresponding split key length */
+static int split_key_fail_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "armed=%d\n", atomic_read(&split_key_fail_countdown));
+	return 0;
+}
+
+static int split_key_fail_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, split_key_fail_show, NULL);
+}
+
+static ssize_t split_key_fail_write(struct file *file, const char __user *buf,
+				    size_t len, loff_t *ppos)
+{
+	char kbuf[16];
+	unsigned int n;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+	if (kstrtouint(strim(kbuf), 0, &n))
+		return -EINVAL;
+	/* The countdown is an atomic_t, so anything that would not survive
+	 * the cast is rejected rather than silently wrapped negative. */
+	if (n > (unsigned int)INT_MAX)
+		return -EINVAL;
+	atomic_set(&split_key_fail_countdown, (int)n);
+	return len;
+}
+
+static const struct proc_ops split_key_fail_proc_ops = {
+	.proc_open    = split_key_fail_open,
+	.proc_read    = seq_read,
+	.proc_write   = split_key_fail_write,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+int cdx_ipsec_init_split_key_fail_probe(void)
+{
+	pr_warn_once("cdx: CDX_DEBUG_SPLIT_KEY_FAIL is on - /proc/%s can fail IPsec split-key jobs; do not ship\n",
+		     SPLIT_KEY_FAIL_PROC_NAME);
+	split_key_fail_proc = proc_create(SPLIT_KEY_FAIL_PROC_NAME, 0600, NULL,
+					  &split_key_fail_proc_ops);
+	return split_key_fail_proc ? 0 : -ENOMEM;
+}
+
+void cdx_ipsec_remove_split_key_fail_probe(void)
+{
+	if (split_key_fail_proc) {
+		proc_remove(split_key_fail_proc);
+		split_key_fail_proc = NULL;
+	}
+}
+#endif /* CDX_DEBUG_SPLIT_KEY_FAIL */
+
+/* The MDHA algorithm an authenticator's split key is derived with, or 0 when
+ * it has none: XCBC derives its keys inside the protocol operation. */
 static int cdx_ipsec_get_split_key_info(struct auth_params *auth_param, u32 *hmac_alg)
 {
-	/*
-	 * Sizes for MDHA pads (*not* keys): MD5, SHA1, 224, 256, 384, 512
-	 * Running digest size
-	 */
-	const u8 mdpadlen[] = {16, 20, 32, 32, 64, 64};
-
 	switch (auth_param->auth_type) {
 		case OP_PCL_IPSEC_HMAC_MD5_96:
 		case OP_PCL_IPSEC_HMAC_MD5_128:
@@ -2163,27 +2246,39 @@ static int cdx_ipsec_get_split_key_info(struct auth_params *auth_param, u32 *hma
 			break;
 		case OP_PCL_IPSEC_AES_XCBC_MAC_96:
 			*hmac_alg = 0;
-			auth_param->split_key_len = 0;
 			break;
 		default:
 			log_err("Unsupported authentication algorithm\n");
 			return -EINVAL;
 	}
-
-	if (*hmac_alg)
-		auth_param->split_key_len =
-			mdpadlen[(*hmac_alg & OP_ALG_ALGSEL_SUBMASK) >>
-			OP_ALG_ALGSEL_SHIFT] * 2;
-
 	return 0;
 }
+
+/* Derive the SA's HMAC split key: the key's inner and outer pads, which SEC
+ * writes encrypted under its job-descriptor key-encryption key and which the
+ * shared descriptor then loads for every frame (KEY_ENC | KEY_DEST_MDHA_SPLIT).
+ *
+ * Returns 0 once the key is in place, and otherwise a negative errno with no
+ * split key recorded: -ENOMEM when the job could not be built or mapped,
+ * -EBUSY when the job ring had no room for it, -EIO when SEC failed it. An SA
+ * whose split key was never written would carry a key SEC never derived, and
+ * every frame it authenticated would fail its peer's check or SEC's own.
+ *
+ * The job is waited for without a bound, as the kernel's gen_split_key()
+ * waits. A job the ring accepted always completes, and the descriptor, both
+ * buffers and the result it reports into must all outlive it: giving up
+ * early would leave SEC reading a freed descriptor and its completion
+ * writing into a returned stack frame. Every caller is in process context.
+ */
 int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 {
+	struct split_key_result result;
 	dma_addr_t dma_addr_in, dma_addr_out;
-	u32 *desc, timeout = 1000000, alg_sel = 0;
-	atomic_t done;
-	int ret = 0;
+	u32 *desc, alg_sel = 0, key_len, pad_len;
+	int ret;
 
+	auth_param->split_key_len = 0;
+	auth_param->split_key_pad_len = 0;
 	if (!jrdev_g)
 		return -ENODEV;
 
@@ -2191,7 +2286,8 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 	/* exit if error or there is no need to compute a split key */
 	if (ret < 0 || alg_sel == 0)
 		return ret;
-
+	key_len = split_key_len(alg_sel);
+	pad_len = split_key_pad_len(alg_sel);
 
 	desc = kmalloc(CAAM_CMD_SZ * 6 + CAAM_PTR_SZ * 2, GFP_KERNEL | GFP_DMA);
 	if (!desc) {
@@ -2199,27 +2295,28 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 		return -ENOMEM;
 	}
 
-	auth_param->split_key_pad_len = ALIGN(auth_param->split_key_len, 16);
-
 	dma_addr_in = dma_map_single(jrdev_g, auth_param->auth_key,
 			auth_param->auth_key_len, DMA_TO_DEVICE);
 	if (dma_mapping_error(jrdev_g, dma_addr_in)) {
 		dev_err(jrdev_g, "Unable to DMA map the input key address\n");
-		kfree(desc);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_free;
 	}
 
-	dma_addr_out = dma_map_single(jrdev_g, auth_param->split_key,
-			auth_param->split_key_pad_len,
+	dma_addr_out = dma_map_single(jrdev_g, auth_param->split_key, pad_len,
 			DMA_FROM_DEVICE);
 	if (dma_mapping_error(jrdev_g, dma_addr_out)) {
 		dev_err(jrdev_g, "Unable to DMA map the output key address\n");
-		dma_unmap_single(jrdev_g, dma_addr_in, auth_param->auth_key_len,
-				DMA_TO_DEVICE);
-		kfree(desc);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_unmap_in;
 	}
 	init_job_desc(desc, 0);
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+	/* First, so an armed job does nothing but fail. */
+	if (cdx_ipsec_split_key_fault())
+		append_jump(desc, JUMP_TYPE_HALT_USER | JUMP_TEST_ALL |
+			    CDX_SPLIT_KEY_FAULT_STATUS);
+#endif
 
 	append_key(desc, dma_addr_in, auth_param->auth_key_len,
 			CLASS_2 | KEY_DEST_CLASS_REG);
@@ -2237,25 +2334,39 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 
 	/* FIFO_STORE with the explicit split-key content store
 	 * (0x26 output type) */
-	append_fifo_store(desc, dma_addr_out, auth_param->split_key_len,
+	append_fifo_store(desc, dma_addr_out, key_len,
 			LDST_CLASS_2_CCB | FIFOST_TYPE_SPLIT_KEK);
 
-	atomic_set(&done, 0);
-	ret = caam_jr_enqueue(jrdev_g, desc, split_key_done, &done);
-
-	while (!atomic_read(&done) && --timeout) {
-		udelay(1);
-		cpu_relax();
+	/* The kernel's own completion for split-key jobs: split_key_done()
+	 * reports SEC's status through caam_jr_strstatus() and completes. */
+	result.err = 0;
+	init_completion(&result.completion);
+	ret = caam_jr_enqueue(jrdev_g, desc, split_key_done, &result);
+	if (ret == -EINPROGRESS) {
+		wait_for_completion(&result.completion);
+		ret = result.err ? -EIO : 0;
+	} else {
+		/* Nothing was queued, so there is nothing to wait for. A full
+		 * ring is busy rather than out of space, and a descriptor it
+		 * could not map is out of memory like ours above. */
+		log_err("split key job not queued: %d\n", ret);
+		ret = ret == -ENOSPC ? -EBUSY : ret == -EIO ? -ENOMEM : ret;
 	}
 
-	if (timeout == 0)
-		log_err("Timeout waiting for job ring to complete\n");
-
-	dma_unmap_single(jrdev_g, dma_addr_out, auth_param->split_key_pad_len,
-			DMA_FROM_DEVICE);
+	dma_unmap_single(jrdev_g, dma_addr_out, pad_len, DMA_FROM_DEVICE);
+out_unmap_in:
 	dma_unmap_single(jrdev_g, dma_addr_in, auth_param->auth_key_len,
 			DMA_TO_DEVICE);
+out_free:
 	kfree(desc);
+	if (!ret) {
+		auth_param->split_key_len = key_len;
+		auth_param->split_key_pad_len = pad_len;
+	} else {
+		/* A job SEC failed may have stored part of a key before it
+		 * stopped; none of it is kept. */
+		memzero_explicit(auth_param->split_key, pad_len);
+	}
 	return ret;
 }
 

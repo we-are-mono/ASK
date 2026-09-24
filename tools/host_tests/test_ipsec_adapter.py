@@ -231,7 +231,9 @@ def test_sa_cache(tmp_path):
         "\n".join(re.findall(r"^struct slist_head sa_cache_by_\w+\[NUM_SA_ENTRIES\];$",
                              source, re.M)) + "\n"
         + re.search(r"^static DEFINE_SPINLOCK\(sa_cache_lock\);$", source, re.M).group() + "\n"
+        + re.search(r"^static unsigned int sa_cache_entries;$", source, re.M).group() + "\n"
         + "".join(definition(source, name) for name in (
+            "M_ipsec_sa_cache_entries",
             "sa_free", "sa_alloc", "sa_add", "sa_remove_from_list_fqid", "sa_remove",
             "M_ipsec_sa_cache_lookup_by_h", "M_ipsec_sa_cache_create",
             "M_ipsec_sa_cache_delete", "get_netdev_of_SA_by_fqid",
@@ -253,17 +255,24 @@ def test_sa_cache(tmp_path):
 
 def test_ipsec_keys(tmp_path):
     """What the key setter programs from a spec: the authenticator's SEC
-    operation, which fixes the ICV, and its key and length -- compiled from
-    the backend and control_ipsec.c."""
+    operation, which fixes the ICV, its key and length, and the SEC job that
+    derives an HMAC's split key -- compiled from the backend,
+    control_ipsec.c and cdx_dpa_ipsec.c, the job's completion from the
+    kernel's key_gen.c, against a modelled job ring."""
     control = (ROOT / "cdx/control_ipsec.c").read_text()
     header = (ROOT / "cdx/control_ipsec.h").read_text()
     backend = (ROOT / "cdx/cdx_ipsec_backend.c").read_text()
     spec = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
+    sec = (ROOT / "cdx/cdx_dpa_ipsec.c").read_text()
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    caam = kernel / "drivers/crypto/caam"
+    key_gen = (caam / "key_gen.h").read_text()
     (tmp_path / "ipsec_keys_types.inc").write_text(
         "\n".join(re.findall(r"^#define\s+SADB_(?:X_)?AALG_\w+\s.*$",
                              (kernel / "include/uapi/linux/pfkeyv2.h").read_text(), re.M)) + "\n"
+        + "\n".join(re.findall(r"^#define\s+JRSTA_SSRC_\w+\s.*$",
+                               (caam / "regs.h").read_text(), re.M)) + "\n"
         + "\n".join(re.findall(r"^#define\s+OP_PCL_IPSEC_(?:HMAC_\w+|AES_XCBC_MAC_96)\s.*$",
                                (ROOT / "cdx/cdx_dpa_ipsec.h").read_text(), re.M)) + "\n"
         + re.search(r"^#define IPSEC_MAX_KEY_SIZE\s.*$", header, re.M).group() + "\n"
@@ -272,13 +281,28 @@ def test_ipsec_keys(tmp_path):
         + spec[spec.index("#define CDX_IPSEC_KEY_MAX"):spec.index("/* SA operations run inside")])
     (tmp_path / "ipsec_keys_production.inc").write_text(
         function(control, "cdx_ipsec_auth_op")
+        # The kernel's split-key job: its pad lengths, its result and the
+        # completion that reports SEC's status into it.
+        + function(key_gen, "split_key_len") + function(key_gen, "split_key_pad_len")
+        + re.search(r"^struct split_key_result \{.*?^\};", key_gen, re.S | re.M).group() + "\n"
+        + function((caam / "key_gen.c").read_text(), "split_key_done")
+        # The test image's fault knob, which the harness compiles in.
+        + re.search(r"^#define CDX_SPLIT_KEY_FAULT_STATUS\s.*$", sec, re.M).group() + "\n"
+        + re.search(r"^static atomic_t split_key_fail_countdown\b.*$", sec, re.M).group() + "\n"
+        + function(sec, "cdx_ipsec_split_key_fault")
+        + function(sec, "cdx_ipsec_get_split_key_info")
+        + function(sec, "cdx_ipsec_generate_split_key")
         + function(control, "M_ipsec_sa_set_digest_key")
         + function(backend, "cdx_ipsec_set_keys"))
     binary = tmp_path / "ipsec_keys"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
-        "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
-        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+        # desc.h builds its command words by shifting into the sign bit,
+        # which the kernel's own build tolerates.
+        "-fsanitize=address,undefined", "-fno-sanitize=shift",
+        "-fno-pie", "-no-pie", "-DCDX_DEBUG_SPLIT_KEY_FAIL",
+        "-I", str(tmp_path), "-I", str(caam),
         str(Path(__file__).with_name("ipsec_keys.c")), "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=30, env={

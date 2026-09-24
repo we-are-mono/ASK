@@ -6,6 +6,7 @@
 #include <linux/netfilter.h>
 
 struct net_device;
+struct netlink_ext_ack;
 struct xfrm_state;
 struct cdx_ipsec_sa;
 
@@ -242,6 +243,11 @@ bool cdx_ipsec_port_supported(struct net_device *dev);
  * anything is built. Needs neither a transaction nor RTNL. */
 bool cdx_ipsec_auth_supported(u16 alg, unsigned int icv_bits);
 
+/* How many SAs cdx's SA cache holds, whichever owner added them -- beside
+ * cdx_ipsec_sa_count(), which counts this interface's alone, it is what shows
+ * that a refused install left nothing behind. Needs no transaction. */
+unsigned int cdx_ipsec_sa_cache_entries(void);
+
 /* Install an SA and return its opaque owner.
  *
  * `x` is the kernel state this SA was built from. The backend neither keeps
@@ -259,11 +265,15 @@ bool cdx_ipsec_auth_supported(u16 alg, unsigned int icv_bits);
  * -EOPNOTSUPP: the device, direction or transform cannot be carried.
  * -EADDRNOTAVAIL: an inbound SA's local address is not on the device.
  * -ENOSPC: no free handle or no free SEC context.
- * -EIO: the descriptor or classifier entry could not be built.
+ * -EIO: the descriptor or classifier entry could not be built, or SEC failed
+ *  the job deriving the HMAC split key.
+ * -EBUSY, -ENOMEM: the split-key job found the job ring full, or could not be
+ *  built.
+ * A split-key failure also says so in `extack`.
  * On any error nothing is installed and *result is NULL.
  */
 int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
-		     struct cdx_ipsec_sa **result);
+		     struct cdx_ipsec_sa **result, struct netlink_ext_ack *extack);
 
 /* Always consumes *sa. Releases the SEC context, the classifier entry and the
  * handle. A flow still naming this SA is not the backend's problem to

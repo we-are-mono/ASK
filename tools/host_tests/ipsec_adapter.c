@@ -49,6 +49,7 @@ typedef uint32_t __be32;
 #define UDP_ENCAP_ESPINUDP 2
 #define EINVAL 22
 #define EIO 5
+#define EBUSY 16
 #define ENOMEM 12
 #define EOPNOTSUPP 95
 #define EHOSTUNREACH 113
@@ -619,6 +620,7 @@ static struct cdx_ipsec_sa sa_pool[8];
 static unsigned sa_installed, sa_deleted;
 static unsigned retirement_flows, retirement_barriers;
 static int sa_add_error;
+static const char *sa_add_message;
 static int sa_next_hop_error;
 static unsigned sa_next_hop_calls;
 
@@ -632,8 +634,11 @@ static u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa)
 {
 	return sa ? sa->handle : 0;
 }
+struct netlink_ext_ack;
+static void backend_says(struct netlink_ext_ack *extack, const char *msg);
 static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
-			    struct xfrm_state *x, struct cdx_ipsec_sa **result)
+			    struct xfrm_state *x, struct cdx_ipsec_sa **result,
+			    struct netlink_ext_ack *extack)
 {
 	struct cdx_ipsec_sa *sa;
 
@@ -643,8 +648,13 @@ static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
 	 * refused before anything is built. */
 	if (!cdx_ipsec_port_supported(spec->dev))
 		return -EOPNOTSUPP;
-	if (sa_add_error)
+	if (sa_add_error) {
+		/* What the backend says when it knows why, as it does when
+		 * SEC fails the split-key job. */
+		if (sa_add_message)
+			backend_says(extack, sa_add_message);
 		return sa_add_error;
+	}
 	/* The port's egress changing after the build read it and before the
 	 * install publishes its watch: counted, then walked, as
 	 * ft_egress_changed() does. */
@@ -839,6 +849,11 @@ struct xfrmdev_ops {
 	struct netlink_ext_ack *__e = (extack); \
 	if (__e && !__e->_msg) __e->_msg = __msg; \
 } while (0)
+static void backend_says(struct netlink_ext_ack *extack, const char *msg)
+{
+	if (extack)
+		extack->_msg = msg;
+}
 
 /* What the classifier callback borrowed for each direction. */
 struct flow_cls_offload {
@@ -1038,6 +1053,7 @@ static void bench_reset(void)
 	policy_lookups = 0;
 	paired_state = NULL;
 	sa_add_error = 0;
+	sa_add_message = NULL;
 	sa_next_hop_error = 0;
 	sa_next_hop_calls = 0;
 	works_scheduled = retires_scheduled = 0;
@@ -1486,7 +1502,16 @@ static void test_state_add(void)
 	ack._msg = NULL;
 	assert(ft_xdo_state_add(x, &ack) == -EADDRNOTAVAIL && sa_installed == 0);
 	assert(ack._msg && strstr(ack._msg, "local address must be on the device"));
+	/* A backend that says why keeps its reason, and its errno: a split
+	 * key SEC failed to derive is a busy ring or a failed job, not a
+	 * transform the port cannot carry. */
+	sa_add_error = -EBUSY;
+	sa_add_message = "cdx: SEC could not derive the HMAC split key";
+	ack._msg = NULL;
+	assert(ft_xdo_state_add(x, &ack) == -EBUSY);
+	assert(ack._msg == sa_add_message && sa_installed == 0);
 	sa_add_error = 0;
+	sa_add_message = NULL;
 
 	/* An inbound SA whose peer is routed by another device is refused
 	 * before anything is built, with no watch and no handle. */

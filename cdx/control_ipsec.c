@@ -52,6 +52,14 @@ static PSAEntry sa_alloc(void)
  * lock-free. Never nests inside another lock; contention is nil
  * (writers are SA install/teardown only). */
 static DEFINE_SPINLOCK(sa_cache_lock);
+/* SAs in the handle table. Written under sa_cache_lock beside the link it
+ * counts. */
+static unsigned int sa_cache_entries;
+
+unsigned int M_ipsec_sa_cache_entries(void)
+{
+	return READ_ONCE(sa_cache_entries);
+}
 
 static int sa_add(PSAEntry pSA)
 {
@@ -59,6 +67,7 @@ static int sa_add(PSAEntry pSA)
 
 	spin_lock_irqsave(&sa_cache_lock, irqflags);
 	slist_add(&sa_cache_by_h[pSA->hash_by_h], &pSA->list_h);
+	WRITE_ONCE(sa_cache_entries, sa_cache_entries + 1);
 	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 
 	return NO_ERR;
@@ -90,6 +99,7 @@ static void sa_remove(PSAEntry pSA)
 	 * release/free chain that follows. */
 	spin_lock_irqsave(&sa_cache_lock, irqflags);
 	slist_remove(&sa_cache_by_h[pSA->hash_by_h], &pSA->list_h);
+	WRITE_ONCE(sa_cache_entries, sa_cache_entries - 1);
 	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 
 	/*
@@ -200,31 +210,45 @@ int cdx_ipsec_auth_op(u16 alg, unsigned int icv_bits)
 	return -1;
 }
 
+/* Program the SA's authenticator. -EOPNOTSUPP when SEC cannot carry it; any
+ * other error is SEC failing to derive the split key, and leaves the SA with
+ * no authenticator rather than one whose key was never written. */
 int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, unsigned int icv_bits,
 			      U16 key_bits, U8 *key)
 {
-	int      algo;
+	struct auth_params *auth = &sa->pSec_sa_context->auth_data;
+	int      algo, rc;
 
 	if ((key_bits/8) > IPSEC_MAX_KEY_SIZE)
 	{
 		DPA_ERROR("%s (%d) key_bits %u higher than max key size\n",__func__,__LINE__, key_bits);
-		return -1;
+		return -EOPNOTSUPP;
 	}
 
 	algo = cdx_ipsec_auth_op(key_alg, icv_bits);
 	if (algo < 0)
-		return -1;
-	sa->pSec_sa_context->auth_data.auth_type = algo;
-	sa->pSec_sa_context->auth_data.auth_key_len = (key_bits/8);
-	memcpy(sa->pSec_sa_context->auth_data.auth_key,	key, (key_bits/8));
+		return -EOPNOTSUPP;
+	auth->auth_type = algo;
+	auth->auth_key_len = (key_bits/8);
+	memcpy(auth->auth_key, key, (key_bits/8));
 	/* Generate the split key from the normal auth key. XCBC-MAC derives
 	 * its keys inside the SEC program and null auth has no key at all, so
 	 * neither has a split key to compute. Compare in the OP_PCL namespace
 	 * that the mapping above produced, not the SADB one it consumed. A
 	 * truncation changes only the operation, never the split key: MD5 and
 	 * SHA-1 derive the same one at either ICV length. */
-	if (algo != OP_PCL_IPSEC_AES_XCBC_MAC_96 && algo != OP_PCL_IPSEC_HMAC_NULL)
-		cdx_ipsec_generate_split_key(&sa->pSec_sa_context->auth_data );
+	if (algo != OP_PCL_IPSEC_AES_XCBC_MAC_96 && algo != OP_PCL_IPSEC_HMAC_NULL) {
+		rc = cdx_ipsec_generate_split_key(auth);
+		if (rc) {
+			/* The generator has already cleared whatever part of a
+			 * split key the failed job stored; the key it was
+			 * derived from goes with it. */
+			auth->auth_type = OP_PCL_IPSEC_HMAC_NULL;
+			auth->auth_key_len = 0;
+			memzero_explicit(auth->auth_key, key_bits / 8);
+			return rc;
+		}
+	}
 	return 0;
 }
 
