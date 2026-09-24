@@ -10748,6 +10748,68 @@ static int ft_ipsec_next_hop(struct xfrm_state *x,
 				 &route, true, spec->dst_mac, extack);
 }
 
+/* Whether an inbound SA's peer is reached by the SA's own device.
+ *
+ * The question the outbound SA to the same peer is asked (ft_ipsec_peer_mac()),
+ * asked of the inbound half first: strongSwan installs a child SA's inbound SA
+ * before its outbound one and binds both to the device holding the local
+ * address. When the route to the peer leaves by another device, the outbound
+ * half is refused, and under `hw_offload = auto` strongSwan installs it in
+ * software instead. The inbound half would then be the only one in hardware,
+ * and the peer's ESP, which comes in the way the route to the peer goes out --
+ * a LAN client tunnelling to the WAN address arrives on the LAN bridge --
+ * reaches SEC only through the SA's own port, where it never arrives, and is
+ * dropped everywhere else (xfrm_state_sec_only()). Refused here, `auto`
+ * installs it in software as well and the whole child SA works there;
+ * `packet` fails the child SA, as the outbound half would have.
+ *
+ * The lookup is the outbound one reversed: from the local endpoint to the
+ * peer, in the SA's family and its port's VRF, carrying the protocol and
+ * ports a reply to the peer would. No output mark, which an inbound SA does
+ * not have to give: neither of its marks says how its peer is routed, and the
+ * outbound half, which does carry one, is installed after it. The unmarked
+ * route is also the one strict reverse-path filtering asks of the peer's
+ * frames. An uplink reached only by a mark is therefore refused here, and a
+ * source rule for the local address (`ip rule from <address> lookup <table>`)
+ * is what lets this lookup see it (docs/flowtable/ipsec.md; ISSUES.md A235).
+ */
+static int ft_ipsec_peer_on_port(struct xfrm_state *x,
+				 struct netlink_ext_ack *extack)
+{
+	struct net_device *dev = x->xso.dev;
+	struct xfrm_dst_lookup_params params = {
+		.net = xs_net(x),
+		.saddr = &x->id.daddr,
+		.daddr = &x->props.saddr,
+		/* Only its L3 master is used, and only for the table. */
+		.oif = dev->ifindex,
+		.ipproto = x->id.proto,
+		.nexthop_named = true,
+	};
+	struct dst_entry *dst;
+	bool on_port;
+
+	/* The one encapsulation ft_ipsec_spec() admits, with the state's ports
+	 * the other way round: an inbound state's source port is the peer's. */
+	if (x->encap && x->encap->encap_type == UDP_ENCAP_ESPINUDP) {
+		params.ipproto = IPPROTO_UDP;
+		params.uli.ports.sport = x->encap->encap_dport;
+		params.uli.ports.dport = x->encap->encap_sport;
+	}
+	dst = __xfrm_dst_lookup(x->props.family, &params);
+	if (IS_ERR(dst)) {
+		NL_SET_ERR_MSG(extack, "cdx: no route to the remote tunnel endpoint");
+		return PTR_ERR(dst);
+	}
+	on_port = dst->dev == dev;
+	dst_release(dst);
+	if (!on_port) {
+		NL_SET_ERR_MSG(extack, "cdx: the route to the peer does not leave by the offload device");
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
 /* Where xfrm keeps the bit for sequence number top - k in a replay_esn ring.
  *
  * The legacy bitmap is linear, bit k for top - k. The replay_esn one is a
@@ -10915,7 +10977,7 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 	spec->mtu = xfrm_state_mtu(x, dev->mtu);
 	if (spec->dir == CDX_IPSEC_DIR_OUT)
 		return ft_ipsec_next_hop(x, spec, extack);
-	return 0;
+	return ft_ipsec_peer_on_port(x, extack);
 }
 
 /* Retirement storage belongs to an SA from its initial installation.
@@ -11731,6 +11793,60 @@ static bool ft_xdo_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
 	return true;
 }
 
+/* Whether @t names an outbound SA this adapter holds on @dev.
+ *
+ * Matched on the fields xfrm_state_find() pairs a template with a
+ * packet-offloaded state by, less three: the policy's mark and if_id and a
+ * tunnel template's source address. So this accepts a superset of what the
+ * kernel would pair: it never refuses a policy the kernel pairs with a held
+ * SA, and for strongSwan, whose policies and SAs agree on those three, it is
+ * exact. Caller holds ft_ipsec_retired_lock, which keeps each owned entry's
+ * state valid. */
+static bool ft_ipsec_names_owned(const struct net_device *dev,
+				 const struct xfrm_tmpl *t)
+{
+	struct ft_ipsec_retirement *owned;
+	const struct xfrm_state *x;
+
+	list_for_each_entry(owned, &ft_ipsec_owned, list) {
+		x = owned->x;
+		if (x->xso.dir == XFRM_DEV_OFFLOAD_OUT && x->xso.dev == dev &&
+		    x->id.spi == t->id.spi && x->id.proto == t->id.proto &&
+		    x->props.reqid == t->reqid && x->props.mode == t->mode &&
+		    x->props.family == t->encap_family &&
+		    (xfrm_addr_any(&t->id.daddr, t->encap_family) ||
+		     xfrm_addr_equal(&x->id.daddr, &t->id.daddr, t->encap_family)))
+			return true;
+	}
+	return false;
+}
+
+/* Whether every SA an outbound policy names by SPI is one this adapter holds
+ * on the policy's device.
+ *
+ * A packet-offloaded outbound policy selects packet-offloaded states only, and
+ * only on its own device (xfrm_state_find()), so a policy naming a state that
+ * is not one could never select it: every packet it matched would wait on an
+ * acquire instead, with the child SA up. That is what strongSwan's
+ * `hw_offload = auto` builds whenever this adapter refuses a child SA's
+ * outbound SA: it installs the SA in software, and then asks for the policy
+ * with offload regardless. Refused here, `auto` installs the policy in
+ * software too, where it selects the software SA. strongSwan names the SA's
+ * SPI in an outbound policy's template; a policy that names none -- a trap
+ * policy, installed before any SA exists -- is taken as before. */
+static bool ft_ipsec_policy_served(const struct xfrm_policy *xp)
+{
+	bool served = true;
+	int i;
+
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	for (i = 0; i < xp->xfrm_nr && served; i++)
+		if (xp->xfrm_vec[i].id.spi)
+			served = ft_ipsec_names_owned(xp->xdo.dev, &xp->xfrm_vec[i]);
+	spin_unlock_bh(&ft_ipsec_retired_lock);
+	return served;
+}
+
 /* Policy offload, which is not optional however little the hardware needs it.
  *
  * CDX steers on flows and SPIs, not on policy selectors, so there is nothing
@@ -11745,6 +11861,9 @@ static bool ft_xdo_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
  * that flows matching it may select this device's offloaded SAs, which is
  * exactly what is wanted; the steering those flows then get is the SA's, and
  * the classifier entry belongs to the flow rather than to the policy.
+ *
+ * The pairing cuts both ways, though: an outbound policy is refused when it
+ * names an SA it could never pair with (ft_ipsec_policy_served()).
  */
 static int ft_xdo_policy_add(struct xfrm_policy *xp, struct netlink_ext_ack *extack)
 {
@@ -11754,6 +11873,10 @@ static int ft_xdo_policy_add(struct xfrm_policy *xp, struct netlink_ext_ack *ext
 	}
 	if (!cdx_ipsec_port_supported(xp->xdo.dev)) {
 		NL_SET_ERR_MSG(extack, "cdx: not an offload-capable port");
+		return -EOPNOTSUPP;
+	}
+	if (xp->xdo.dir == XFRM_DEV_OFFLOAD_OUT && !ft_ipsec_policy_served(xp)) {
+		NL_SET_ERR_MSG(extack, "cdx: the SA this policy names is not offloaded to its device");
 		return -EOPNOTSUPP;
 	}
 	/* These policies select SAs for flow admission; the hardware does not

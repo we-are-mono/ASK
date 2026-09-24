@@ -237,6 +237,12 @@ file's git history.
 
 ## Gating
 
+- [x] **A235.** Mark-steered uplinks: an inbound SA is offloaded only when the unmarked route to its peer leaves by its port, the one signal there is when it is added; it fails safe, and a source rule for the local address makes it hold —
+  documented contract (_:/^cdx: offload a child SA whole or leave it to software_).
+
+- [x] **A233.** Under strongSwan's `hw_offload = auto`, a child SA whose outbound SA cdx refused came up with that SA in software, its outbound policy offloaded and its inbound SA in hardware: up and dead —
+  fixed (_:/^cdx: offload a child SA whole or leave it to software_).
+
 - [x] **A232.** An offloaded inbound SA's ESP that SEC was not given (another device or port, a refused queue, GRO) was decrypted in software against xfrm's copy of SEC's replay window, which SEC never learns from —
   fixed (_:/^xfrm: receive a hardware-held inbound SA through SEC alone_).
 

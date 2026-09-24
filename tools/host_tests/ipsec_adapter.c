@@ -43,6 +43,7 @@ typedef uint32_t __be32;
 #define AF_INET 2
 #define AF_INET6 10
 #define IPPROTO_ESP 50
+#define IPPROTO_AH 51
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
 #define UDP_ENCAP_ESPINUDP 2
@@ -900,6 +901,47 @@ static struct rtable *ip_route_output_key(void *net, struct flowi4 *fl4)
 	return route_answer;
 }
 static void ip_rt_put(struct rtable *rt) { (void)rt; route_puts++; }
+
+/* xfrm's own route lookup, which an inbound SA's peer is looked up with, in
+ * either family: the route it answers with (the WAN route unless told
+ * otherwise), or an error, and the whole key it was asked with. */
+union flowi_uli { struct { __be16 dport, sport; } ports; };
+struct xfrm_dst_lookup_params {
+	struct net *net;
+	int tos, oif;
+	xfrm_address_t *saddr, *daddr;
+	u32 mark;
+	u8 ipproto;
+	union flowi_uli uli;
+	bool nexthop_named;
+};
+static struct rtable wan_route;
+static struct dst_entry *peer_answer;
+static int peer_error, peer_family;
+static unsigned peer_lookups;
+static struct xfrm_dst_lookup_params peer_key;
+static struct dst_entry *__xfrm_dst_lookup(int family,
+					   const struct xfrm_dst_lookup_params *params)
+{
+	struct dst_entry *dst = peer_answer ? peer_answer : &wan_route.dst;
+
+	peer_lookups++;
+	peer_key = *params;
+	peer_family = family;
+	if (peer_error)
+		return ERR_PTR(peer_error);
+	dst_hold(dst);
+	return dst;
+}
+static bool xfrm_addr_any(const xfrm_address_t *a, unsigned short family)
+{
+	return family == AF_INET ? !a->a4 : !(a->a6[0] | a->a6[1] | a->a6[2] | a->a6[3]);
+}
+static bool xfrm_addr_equal(const xfrm_address_t *a, const xfrm_address_t *b,
+			    unsigned short family)
+{
+	return !memcmp(a, b, family == AF_INET ? 4 : 16);
+}
 static struct neighbour *dst_neigh_lookup(struct dst_entry *dst, const void *key)
 {
 	(void)dst; (void)key;
@@ -977,6 +1019,9 @@ static void bench_reset(void)
 	wan_route.dst.error = 0;
 	route_answer = &wan_route;
 	route_error = 0;
+	peer_answer = NULL;
+	peer_error = 0;
+	peer_lookups = 0;
 	route_neigh = &peer_neigh;
 	route_lookups = route_puts = 0;
 	peer_neigh.nud_state = NUD_REACHABLE;
@@ -1084,12 +1129,56 @@ static void test_spec(void)
 	auth_key.alg_key_len = 160;
 
 	/* An inbound SA is classified rather than transmitted, so it needs no
-	 * next hop and never asks the FIB for one. */
+	 * next hop. It is asked the question its outbound half will be --
+	 * whether the route to the peer leaves by the SA's device -- through
+	 * xfrm's own lookup: from the local endpoint to the peer, in the SA's
+	 * family and its port's VRF, with no output mark and no clone. */
 	x->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	x->props.smark.v = 0x40;
+	x->props.smark.m = 0xff;
 	route_lookups = 0;
 	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
-	assert(spec.dir == CDX_IPSEC_DIR_IN && route_lookups == 0);
+	assert(spec.dir == CDX_IPSEC_DIR_IN && route_lookups == 0 && peer_lookups == 1);
 	assert(is_zero_ether_addr(spec.dst_mac));
+	assert(peer_family == AF_INET && peer_key.oif == WAN.ifindex);
+	assert(peer_key.saddr == &x->id.daddr && peer_key.daddr == &x->props.saddr);
+	assert(peer_key.mark == 0 && peer_key.ipproto == IPPROTO_ESP && peer_key.nexthop_named);
+	x->props.smark.v = x->props.smark.m = 0;
+
+	/* A peer routed by any other device is refused, and so is one with no
+	 * route at all: its outbound half would be, and under `auto` this one
+	 * then goes to software with it. */
+	static struct rtable lan_route;
+	lan_route.dst.ops = &v4_ops;
+	lan_route.dst.dev = &LAN;
+	peer_answer = &lan_route.dst;
+	ack._msg = NULL;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+	assert(ack._msg && strstr(ack._msg, "does not leave by the offload device"));
+	assert(lan_route.dst.refs == 0);
+	peer_answer = NULL;
+	peer_error = -ENETUNREACH;
+	ack._msg = NULL;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -ENETUNREACH);
+	assert(ack._msg && strstr(ack._msg, "no route"));
+	peer_error = 0;
+
+	/* NAT-T asks with the ports a reply to the peer carries: the state's
+	 * own the other way round, since an inbound state's source is the
+	 * peer's. */
+	x->encap = &natt;
+	natt.encap_type = UDP_ENCAP_ESPINUDP;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	assert(peer_key.ipproto == IPPROTO_UDP);
+	assert(peer_key.uli.ports.sport == htons(61000) &&
+	       peer_key.uli.ports.dport == htons(4500));
+	x->encap = NULL;
+
+	/* An IPv6 inbound SA is asked in its own family, and taken. */
+	x->props.family = AF_INET6;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && peer_family == AF_INET6);
+	x->props.family = AF_INET;
+	assert(wan_route.dst.refs == 0);
 	x->xso.dir = XFRM_DEV_OFFLOAD_OUT;
 
 	/* Transport mode keeps the SA's own reduced MTU and builds no outer
@@ -1277,6 +1366,21 @@ static void test_state_add(void)
 	assert(ack._msg && strstr(ack._msg, "local address must be on the device"));
 	sa_add_error = 0;
 
+	/* An inbound SA whose peer is routed by another device is refused
+	 * before anything is built, with no watch and no handle. */
+	bench_reset();
+	bench_clear_sas();
+	x->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	static struct rtable elsewhere;
+	elsewhere.dst.ops = &v4_ops;
+	elsewhere.dst.dev = &LAN;
+	peer_answer = &elsewhere.dst;
+	x->handle = 0;
+	assert(ft_xdo_state_add(x, &ack) == -EOPNOTSUPP);
+	assert(sa_installed == 0 && !x->handle && !x->xso.offload_handle);
+	assert(ft_ipsec_owned.next == &ft_ipsec_owned);
+	peer_answer = NULL;
+
 	/* An inbound SA is installed without a watch: it is classified rather
 	 * than transmitted, so it has no next hop that can move. */
 	bench_reset();
@@ -1309,6 +1413,96 @@ static void test_policy_add(void)
 	policy.xdo.dev = &WAN;
 	policy.xdo.type = XFRM_DEV_OFFLOAD_CRYPTO;
 	assert(ft_xdo_policy_add(&policy, &ack) == -EOPNOTSUPP);
+	policy.xdo.type = XFRM_DEV_OFFLOAD_PACKET;
+
+	/* An outbound policy naming an SA by SPI -- as strongSwan's do -- is
+	 * taken only when that SA is one this adapter holds on the policy's
+	 * device: xfrm_state_find() pairs a packet-offloaded policy with
+	 * nothing else. Under `auto`, an outbound SA the adapter refused is
+	 * installed in software, and the policy asked for next must go to
+	 * software with it, or every packet it matches waits on an acquire. */
+	struct xfrm_state *x = outbound_state();
+	x->props.reqid = 7;
+	bench_clear_sas();
+	assert(ft_xdo_state_add(x, &ack) == 0);
+	policy.xdo.dir = XFRM_DEV_OFFLOAD_OUT;
+	policy.xfrm_nr = 1;
+	policy.xfrm_vec[0] = (struct xfrm_tmpl){
+		.id = { .daddr.a4 = PEER_IP, .spi = x->id.spi, .proto = IPPROTO_ESP },
+		.saddr.a4 = LOCAL_IP, .reqid = 7, .mode = XFRM_MODE_TUNNEL,
+		.encap_family = AF_INET };
+	assert(ft_xdo_policy_add(&policy, &ack) == 0);
+	/* The same SA by SPI alone, as a transport template leaves the
+	 * address to the flow. */
+	policy.xfrm_vec[0].id.daddr.a4 = 0;
+	assert(ft_xdo_policy_add(&policy, &ack) == 0);
+	policy.xfrm_vec[0].id.daddr.a4 = PEER_IP;
+
+	/* Anything that would not pair is refused, and says why: an SPI the
+	 * adapter never took, another peer, another reqid, mode, family, a
+	 * transform that is not ESP (AH carrying the held ESP SA's SPI), or
+	 * the SA held on another device than the policy's. */
+	struct xfrm_tmpl good = policy.xfrm_vec[0];
+	for (int miss = 0; miss < 7; miss++) {
+		policy.xfrm_vec[0] = good;
+		switch (miss) {
+		case 0: policy.xfrm_vec[0].id.spi ^= 1; break;
+		case 1: policy.xfrm_vec[0].id.daddr.a4 ^= 1; break;
+		case 2: policy.xfrm_vec[0].reqid = 8; break;
+		case 3: policy.xfrm_vec[0].mode = XFRM_MODE_TRANSPORT; break;
+		case 4: policy.xfrm_vec[0].encap_family = AF_INET6; break;
+		case 5: policy.xdo.dev = &LAN; break;
+		case 6: policy.xfrm_vec[0].id.proto = IPPROTO_AH; break;
+		}
+		ack._msg = NULL;
+		assert(ft_xdo_policy_add(&policy, &ack) == -EOPNOTSUPP);
+		assert(ack._msg && strstr(ack._msg, "not offloaded to its device"));
+		policy.xdo.dev = &WAN;
+	}
+	/* Every template that names an SPI has to be served, not just one. */
+	policy.xfrm_vec[0] = good;
+	policy.xfrm_vec[1] = good;
+	policy.xfrm_vec[1].id.spi ^= 1;
+	policy.xfrm_nr = 2;
+	assert(ft_xdo_policy_add(&policy, &ack) == -EOPNOTSUPP);
+	policy.xfrm_nr = 1;
+
+	/* A template naming no SPI -- a trap policy, installed before any SA
+	 * exists -- is taken as before, and so is an inbound policy, which
+	 * xfrm checks against the states that decrypted a packet whatever
+	 * their offload. */
+	policy.xfrm_vec[0].id.spi = 0;
+	assert(ft_xdo_policy_add(&policy, &ack) == 0);
+	policy.xfrm_vec[0] = good;
+	policy.xfrm_vec[0].id.spi ^= 1;
+	policy.xdo.dir = XFRM_DEV_OFFLOAD_IN;
+	assert(ft_xdo_policy_add(&policy, &ack) == 0);
+
+	/* Once the SA is deleted the policy naming it goes to software too. */
+	policy.xdo.dir = XFRM_DEV_OFFLOAD_OUT;
+	policy.xfrm_vec[0] = good;
+	ft_xdo_state_delete(x);
+	assert(ft_xdo_policy_add(&policy, &ack) == -EOPNOTSUPP);
+	bench_clear_sas();
+
+	/* An inbound SA is not what an outbound policy selects, even one the
+	 * adapter holds under the SPI, reqid and mode the template names, with
+	 * no address in the template to tell them apart. */
+	bench_reset();
+	x->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	x->props.mode = XFRM_MODE_TRANSPORT;
+	assert(ft_xdo_state_add(x, &ack) == 0);
+	policy.xfrm_vec[0] = good;
+	policy.xfrm_vec[0].mode = XFRM_MODE_TRANSPORT;
+	policy.xfrm_vec[0].id.daddr.a4 = 0;
+	ack._msg = NULL;
+	assert(ft_xdo_policy_add(&policy, &ack) == -EOPNOTSUPP);
+	assert(ack._msg && strstr(ack._msg, "not offloaded to its device"));
+	ft_xdo_state_delete(x);
+	bench_clear_sas();
+	x->xso.dir = XFRM_DEV_OFFLOAD_OUT;
+	x->props.mode = XFRM_MODE_TUNNEL;
+	x->props.reqid = 0;
 }
 
 /* The attachment, and what it does when there is no engine behind the port.

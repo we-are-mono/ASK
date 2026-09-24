@@ -1524,18 +1524,14 @@ encapsulation it was not configured for), and it is none of the four the
 adapter folds SEC's refusals into. A state another driver offloads has no
 handle and is received as upstream receives it.
 
-No working tunnel strongSwan installs carries such traffic. strongSwan binds a
-state to the device that holds its local address, and the adapter refuses the
-outbound half of a tunnel whose peer lies behind any other device. Under
-`hw_offload = packet` the child SA then fails. Under `auto`, which is what
-OpenWrt's UCI wrapper can say, strongSwan retries the refused outbound SA as
-crypto offload; the adapter refuses that too, and xfrm installs the SA in
-software. The inbound SA stays offloaded and both policies are installed
-packet-offloaded, and `xfrm_state_find()` never pairs a packet-offloaded
-policy with a software state. So the child SA comes up, but its outbound
-traffic finds no state and keeps raising acquires: the tunnel is up and dead.
-What is dropped comes from hand-built SAs, from such a tunnel, or from someone
-replaying captured ESP through another door.
+No tunnel strongSwan installs carries such traffic. strongSwan binds a state
+to the device that holds its local address, and the adapter refuses both
+halves of a tunnel whose peer lies behind any other device, because the route
+to the peer decides both (see "`auto` keeps a child SA whole" below). Under
+`hw_offload = packet` the child SA then fails; under `auto`, which is what
+OpenWrt's UCI wrapper can say, it is installed and works in software. What is
+dropped comes from hand-built SAs, or from someone replaying captured ESP
+through another door.
 
 ## Tests
 
@@ -1644,14 +1640,95 @@ and simply does not fail the SA when the device does not advertise offload
 from `option hw_offload 'auto'` today. When the adapter refuses an SA instead,
 `auto` retries it as crypto offload, which the adapter also refuses, and xfrm
 installs it in software; a refused policy it retries without offload. It
-treats each SA and policy on its own, not the child SA as a whole, which is
-what leaves the tunnel in step 9 half in hardware. Adding `crypto|packet` to that
+treats each SA and policy on its own, not the child SA as a whole, and the
+adapter makes up for that (below). Adding `crypto|packet` to that
 allowlist is a one-line package patch worth carrying anyway, because `auto`
 silently degrades to software and an operator asking for hardware IPsec
 usually wants to be told when they did not get it.
 
 A swanctl file written by hand bypasses the wrapper entirely and takes
 `hw_offload = packet` directly. That is the right form for the rig.
+
+**`auto` keeps a child SA whole.** strongSwan 6.0.3 installs a child SA's
+inbound SA, then its outbound SA, then its inbound, forwarding and outbound
+policies (`child_create.c`, `child_sa.c`), each with `auto`'s retry, so each
+half lands in hardware or in software on its own. Two of the combinations do
+not work:
+
+- **A packet-offloaded outbound policy over a software outbound SA.**
+  `xfrm_state_find()` pairs a packet-offloaded policy only with
+  packet-offloaded states on its own device, so every packet the tunnel sends
+  waits on an acquire, with the child SA reported up. strongSwan asks for the
+  policy with offload whatever became of the SA, because it keys on the
+  configuration.
+- **An offloaded inbound SA whose peer's ESP arrives on another device.** It
+  is dropped as never reaching SEC (step 9).
+
+A tunnel whose peer lies behind another device -- a LAN client, or a phone on
+the home Wi-Fi, tunnelling to the WAN address -- got both: its outbound SA is
+refused for the route, and its inbound SA was not. The adapter now refuses
+what would build either (A233):
+
+- An **inbound SA** is refused when the route to its peer does not leave by
+  its device (`ft_ipsec_peer_on_port()`): the test its outbound half faces,
+  asked first, since strongSwan installs the inbound half first. Such a tunnel
+  is then refused in both halves, and `auto` installs both in software. A peer
+  routed by the port whose outbound half is refused for something else -- an
+  IPv6 outer header, a neighbour that did not resolve -- keeps its inbound
+  half in hardware, where its ESP does arrive.
+- An **outbound policy** is refused when its template names by SPI an SA the
+  adapter does not hold on the policy's device (`ft_ipsec_policy_served()`), so
+  `auto` installs it in software, beside the SA it names. strongSwan names the
+  SA's SPI in every outbound policy but per-CPU and labelled ones. A policy
+  naming none, such as a trap policy installed before any SA exists, is taken
+  as before, and a policy is asked again whenever strongSwan updates it, as it
+  does when the child SA comes up or is rekeyed.
+
+Under `packet` such a child SA failed at its outbound half and now fails at
+its inbound one. A policy added by hand before the SA it names by SPI is
+refused too, and has to follow the SA.
+`tools/tests/test_ipsec_offload_auto_fallback.py` drives strongSwan's sequence
+with `ip xfrm`.
+
+**Mark-steered uplinks (A235, a documented contract).** The inbound check asks
+the unmarked route to the peer, because that is the only signal there is when
+the inbound SA is added: neither of its marks says how the peer is routed
+(`mark_in` selects it, `set_mark_in` marks what it decrypts), and the outbound
+half, which carries the routing mark, comes after it. So a tunnel whose
+outbound SA reaches the peer by the port only through its output mark
+(`set_mark_out` and an `ip rule fwmark ...`), while the unmarked route leaves
+by another device, has its inbound SA refused, with
+`cdx: the route to the peer does not leave by the offload device` in
+strongSwan's log. What that costs depends on the mode:
+
+- `packet`: the child SA fails, with that error.
+- `auto` without ESN: the inbound half goes to software and the outbound half
+  stays offloaded. Both policies pair, and the tunnel works with its inbound
+  traffic on the CPU.
+- `auto` with ESN: xfrm refuses the crypto-offload retry itself ("Device
+  doesn't support offload with ESN") before the adapter sees it, so the child
+  SA fails.
+
+A source rule for the local address makes the check succeed:
+`ip rule add from <local address> lookup <uplink table>` routes the lookup,
+which carries the local address as its source, the way the mark routes the
+tunnel. The unmarked route is also what strict reverse-path filtering would ask
+of the peer's frames; with loose filtering, usual on multi-WAN, the frames are
+accepted on either uplink, so the check is about where the tunnel's peer is,
+not a filter the kernel would apply anyway. The trade-off is accepted because
+it fails safe: a refusal is never a tunnel that is up and dead, which every
+alternative risks. Asking the policy's mark is impossible, since policies
+follow both SAs, and a guess such as "refuse only a peer on-link on another
+device" brings the dead tunnel back for a peer on a routed LAN subnet or a
+bare second port. OpenWrt's UCI wrapper exposes no marks, so only a
+hand-written swanctl or Armbian configuration can meet this.
+
+**A NAT-T float or MOBIKE move** makes strongSwan re-add an SA (`update_sa`)
+with offload for its new local address and without `auto`'s fallback, so an
+offloaded SA whose re-add the adapter refuses is lost rather than moved to
+software. That already held for an outbound half whose peer moved behind
+another device; the inbound check adds the inbound half of the same move, and
+of a move onto an uplink reached only by a mark.
 
 ## Open questions
 
