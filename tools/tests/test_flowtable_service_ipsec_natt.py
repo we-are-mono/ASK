@@ -201,14 +201,17 @@ async def test_ipsec_natt_update_keeps_hardware_ports(aiohttp_session, target_ag
             identities.append(identity)
             # The DUT's own port, whichever side of the pair it is on.
             moved = (ports[0] + 1, ports[1]) if direction == "out" else (ports[0], ports[1] + 1)
+            # An update names the state's direction: xfrm_state_update()
+            # answers ESRCH to one whose direction differs, none included.
             refused = {
                 "ports": await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "update", *state,
-                                       *natt(*moved), "output-mark", MARK, check=False),
+                                       *natt(*moved), "output-mark", MARK, "dir", direction, check=False),
                 "mark": await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "update", *state,
-                                      *natt(*ports), "output-mark", OTHER_MARK, check=False),
+                                      *natt(*ports), "output-mark", OTHER_MARK, "dir", direction, check=False),
             }
             kept = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "update", *state,
-                                 *natt(*ports), "output-mark", MARK, "limit", "time-hard", "86400", check=False)
+                                 *natt(*ports), "output-mark", MARK, "limit", "time-hard", "86400",
+                                 "dir", direction, check=False)
             shown = (await command(target_agent, aiohttp_session, "ip", "-s", "xfrm", "state", "get",
                                    *identity))["stdout"]
             results.append({"direction": direction, "refused": refused, "kept": kept, "shown": shown})

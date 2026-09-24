@@ -2,9 +2,11 @@
 
 TCP hands the stack GSO packets. A local socket builds them from its send
 queue, because a bundle whose SA is offloaded on the route's own port keeps
-the socket's segmentation offload (xfrm_dst_offload_ok()); the LAN port's GRO
-merges forwarded segments into them. With no flowtable every one reaches
-xfrm_output() for the offloaded SA. SEC encrypts one packet per ESP and needs
+the socket's segmentation offload (xfrm_dst_offload_ok()). With no flowtable
+every one reaches xfrm_output() for the offloaded SA. Forwarded segments would
+arrive merged only if the LAN port's GRO merged them, and the DPAA receive
+path does not for this traffic, so only the local transfer is required to
+exercise the segmentation; the forwarded one still has to arrive whole. SEC encrypts one packet per ESP and needs
 the inner checksums finished, so each GSO packet has to be segmented in
 software before SEC sees it; finishing a GSO packet's checksum in place is
 refused with a warning and the packet dropped.
@@ -15,9 +17,9 @@ from an address on its loopback. Each must arrive whole and in order, and the
 sink's count must come back through the tunnel; XfrmOutError must not move;
 and SEC must have been handed at least one frame per full-size segment. The
 splat window fails the test on the warning. A kprobe on the software
-segmentation must count more during each transfer than a quiet window's rate
-accounts for over the same time, so the test cannot pass on a path that never
-built a GSO packet.
+segmentation must count more during the local transfer than a quiet window's
+rate accounts for over the same time, so the test cannot pass on a path that
+never built a GSO packet.
 """
 from __future__ import annotations
 
@@ -202,10 +204,13 @@ async def test_offloaded_tunnel_carries_bulk_tcp(rig):
         for name, source in (("forwarded", r.lan_ip), ("local", DUT_INNER)):
             assert transfers[name] == {"sent": TOTAL, "reply": str(TOTAL)}, record
             assert sink.received.get(source) == {"bytes": TOTAL, "intact": True}, record
-        # Each transfer put GSO packets through the software segmentation,
-        # beyond what the rest of the DUT does in the same time.
-        for name in ("forwarded", "local"):
-            assert gso[name]["hits"] >= gso[name]["floor"], record
+        # The DUT's own transfer put GSO packets through the software
+        # segmentation, beyond what the rest of the DUT does in the same time.
+        # The forwarded one is recorded but not required to: the DPAA receive
+        # path hands a frame to GRO only once the FMan parser has validated its
+        # L4 checksum (_dpa_process_parse_results()), which it does not for
+        # these, so forwarded segments reach xfrm_output() one by one.
+        assert gso["local"]["hits"] >= gso["local"]["floor"], record
         assert moved["out_error"] == 0, record
         # Every byte left in a frame SEC encrypted, one ESP per segment: at
         # least a frame per full-size segment of both transfers.

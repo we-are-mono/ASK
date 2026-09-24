@@ -89,8 +89,9 @@ async def test_offloaded_transport_sa_is_decrypted(rig):
         await step(r.target, ["ip", "xfrm", "state", "add", *state, *algorithms,
                               "offload", "packet", "dev", TARGET_WAN_IF, "dir", "out"],
                    ["ip", "xfrm", "state", "delete", *state])
-        # Only this test's datagrams: the selector names the port.
-        selector = ["src", outer + "/32", "dst", PEER + "/32", "proto", "udp", "dport", str(PORT)]
+        # Only this test's datagrams: the selector names the port. UDP by
+        # number: the image carries no /etc/protocols for ip to resolve names.
+        selector = ["src", outer + "/32", "dst", PEER + "/32", "proto", "17", "dport", str(PORT)]
         template = ["tmpl", "src", outer, "dst", PEER, "proto", "esp", "mode", "transport",
                     "reqid", REQID, "level", "required"]
         await step(wan, ["ip", "xfrm", "policy", "add", *selector, "dir", "in", *template],
