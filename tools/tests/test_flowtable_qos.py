@@ -754,8 +754,14 @@ async def test_flowtable_qos_weighted_leaf_outranks_unclassified_traffic(qos):
                "htb", "rate", rate, "ceil", rate)
     await r.tc("class", "add", "dev", dev, "parent", "1:1", "classid", "1:10",
                "htb", "rate", rate, "ceil", rate, "quantum", "10")
+    # iperf's control connections are TCP on the same ports. Left unmarked,
+    # the bulk's would share the queue its own datagrams overrun three times
+    # over, and starve until iperf gave up; they carry a few kilobytes, so
+    # they ride the weighted leaf without moving its measured rate.
     await offload(r, inbound(r, "udp", PORT_WEIGHTED, r.mark(WEIGHTED_CQ)),
-                  inbound(r, "udp", PORT_WEIGHTED_BULK))
+                  inbound(r, "udp", PORT_WEIGHTED_BULK),
+                  inbound(r, "tcp", PORT_WEIGHTED, r.mark(WEIGHTED_CQ)),
+                  inbound(r, "tcp", PORT_WEIGHTED_BULK, r.mark(WEIGHTED_CQ)))
     await lan_start(r, iperf=[PORT_WEIGHTED, PORT_WEIGHTED_BULK])
     weighted_mbit = CAP_MBIT // 2
     clients = [asyncio.create_task(iperf(r, PORT_WEIGHTED, udp_mbit=weighted_mbit)),
@@ -876,7 +882,10 @@ async def test_flowtable_qos_wred_drops_before_the_tail(qos):
 
     for name, phase in phases.items():
         assert phase["leaf"]["rejected"] > 0, (name, phase["leaf"])
-        assert phase["received"] >= 100, (name, phase["received"], phase["lost"])
+        # The probe waits for each reply, so a deeper queue sends fewer in the
+        # window, and the curve drops some of them as it should: a floor for
+        # the median to rest on, not a count of what was sent.
+        assert phase["received"] >= 50, (name, phase["received"], phase["lost"])
         assert phase["goodput"] >= 0.8 * rate * TCP_PAYLOAD / (TCP_FRAME + OAL), (
             name, phase["goodput"])
         assert len(phase["rows"]) >= 4, (name, phase["rows"])
@@ -1429,8 +1438,11 @@ print(json.dumps({{'rc': result.returncode, 'stderr': result.stderr[-400:]}}))
                                             "connected": connected, "rows": rows,
                                             "sender": sender.stdout if sender else None})
 
-    # The leaf really was held full by the offloaded flow, in hardware.
-    assert len(rows) == 4 and all(int(f["qos"], 16) == LOW_CQ for f in rows), rows
+    # The leaf really was held full by the offloaded flow, in hardware: its
+    # four streams, not iperf's control connection on the same port, which
+    # carries a few hundred bytes and may be offloaded beside them.
+    streams = [f for f in rows if int(f["bytes"]) > 1_000_000]
+    assert len(streams) == 4 and all(int(f["qos"], 16) == LOW_CQ for f in streams), rows
     assert saturated["rejected"] > 0, saturated
     slack = timing_slack(first, second)
     assert shaped_bps(first, second, 0) >= (0.9 - slack) * CAP_MBIT * 1e6, saturated

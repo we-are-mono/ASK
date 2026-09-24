@@ -108,7 +108,12 @@ SESSION_MTU = 1492
 PORT_QOS_VOICE = int(os.environ.get("ASK_FLOWTABLE_PPPOE_QOS_PORT", "48290"))
 PORT_QOS_BULK = PORT_QOS_VOICE + 1
 QOS_TABLE = "ask_pppoe_qos"
-QOS_RATE_MBIT, QOS_BULK_MBIT = 20, 60
+# The QoS case forwards everything in software -- no flowtable is bound --
+# and on the test image (KASAN, lockdep) one core saturates near 6,000
+# frames a second: at 20 and 60 it pegged, delaying the marked flow's echoes
+# past their timeout although every one of them had left on its leaf. Three
+# times the channel still fills the unclassified queue.
+QOS_RATE_MBIT, QOS_BULK_MBIT = 5, 15
 QOS_VOICE_PRIO, QOS_VOICE_CQ = 1, 6
 QOS_DATAGRAM, QOS_COUNT = 1200, 200
 QOS_BULK_SCRIPT = "/tmp/ask_pppoe_qos_bulk.py"
@@ -175,6 +180,7 @@ def _server_start(ipv6=False):
     server = "/usr/sbin/pppoe-server"
     if not os.access(server, os.X_OK):
         pytest.skip(f"{server} not installed on the orchestrator")
+    _server_clear(server)
     pathlib.Path(SERVER_SECRETS).write_text(
         f'"{PPPOE_USER}"   *   "{PPPOE_SECRET}"   *\n')
     os.chmod(SERVER_SECRETS, 0o600)
@@ -200,6 +206,28 @@ def _server_start(ipv6=False):
          "-N", "4", "-O", SERVER_OPTS, "-k", "-F"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return proc
+
+
+def _server_clear(server):
+    """Stop any concentrator a run that never reached its teardown left on
+    SERVER_IF. Every one there answers the DUT's discovery, so the session
+    could otherwise come up on a stale server started with other options --
+    one without IPv6CP, say. Matched by exact argv from /proc, not a pkill
+    pattern, which would also match the shell running it."""
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        argv = [a.decode(errors="replace") for a in argv if a]
+        if argv[:1] == [server] and argv[1:3] == ["-I", SERVER_IF]:
+            pid = int(entry.name)
+            os.kill(pid, 15)
+            deadline = time.monotonic() + 5
+            while pathlib.Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
 
 
 def _server_stop(proc):
@@ -1376,9 +1404,9 @@ async def test_flowtable_pppoe_qos_upload_keeps_its_class(pppoe_rig):
         # SNAT case uses, ahead of the image's own masquerade.
         await command(r.target, r.session, "nft", f"""table ip {QOS_TABLE} {{
  chain forward {{ type filter hook forward priority -150; policy accept;
- ip saddr {r.lan_ip} udp dport {PORT_QOS_VOICE} ct mark set {mark:#x} }}
+ ip saddr {r.lan_ip} udp dport {PORT_QOS_VOICE} ct mark set {mark:#x}; }}
  chain postrouting {{ type nat hook postrouting priority 90; policy accept;
- ip saddr {r.lan_ip} ip daddr {INNER_LOCAL} udp dport {PORT_QOS_VOICE} snat to {SNAT_ADDR} }}
+ ip saddr {r.lan_ip} ip daddr {INNER_LOCAL} udp dport {PORT_QOS_VOICE} snat to {SNAT_ADDR}; }}
 }}""")
         await _qos_bulk(r, seconds=30)
         bulk = True

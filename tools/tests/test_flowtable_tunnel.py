@@ -51,7 +51,7 @@ from ask_orch.client import Agent
 from ask_orch.counters import kernel_tx_packets
 from _gated_tcp import GatedTcp
 from _topology import (DUT_IPV6_LAN, DUT_IPV6_WAN, FULL_FRAME, LAN_IPV6, LAN_NIC, TARGET_LAN_IF,
-                       TARGET_WAN_IF, kernel_rx_packets, lan_run, lan_run_python)
+                       TARGET_WAN_IF, lan_run, lan_run_python)
 import test_flowtable_offload as ft
 from test_flowtable_offload import ARTIFACTS, Rig, assert_undisturbed, command, read
 
@@ -396,6 +396,36 @@ def _ip_checksum(header):
     return (~total) & 0xffff
 
 
+OUTER_TABLE = "ask_tunnel_outer"
+
+
+async def _outer_counter_add(r):
+    """Count the tunnel's received outer packets where Linux would first see
+    them: a netdev ingress chain on the WAN port, which a frame the hardware
+    strips and forwards never reaches. The port's software receive total would
+    also count the control channel and whatever else shares the segment."""
+    dut, orch = r.shape.outer
+    if r.shape.mode == "6o4":
+        match = f"ip saddr {orch} ip daddr {dut} ip protocol 41"
+    else:
+        # l4proto looks past the destination options ip6tnl adds.
+        match = f"ip6 saddr {orch} ip6 daddr {dut} meta l4proto 4"
+    await command(r.target, r.session, "nft", "delete", "table", "netdev", OUTER_TABLE,
+                  check=False)
+    await command(r.target, r.session, "nft", f"""table netdev {OUTER_TABLE} {{
+ chain ingress {{ type filter hook ingress device {TARGET_WAN_IF} priority 10; policy accept;
+ {match} counter;
+ }}
+}}""")
+
+
+async def _outer_counter(r):
+    listing = json.loads((await command(r.target, r.session, "nft", "-j", "list", "table",
+                                        "netdev", OUTER_TABLE))["stdout"])
+    return sum(expr["counter"]["packets"] for item in listing["nftables"] if "rule" in item
+               for expr in item["rule"]["expr"] if "counter" in expr)
+
+
 async def _established(r, count=64, payload_size=64, name="routed"):
     """Install the flow, then measure a second burst against the hardware,
     the software receive counter of the WAN port, the tunnel device's own
@@ -406,10 +436,15 @@ async def _established(r, count=64, payload_size=64, name="routed"):
     before = {f["cookie"]: int(f["packets"]) for f in flows}
     record0 = _tunnel_record(r, installed)
     tun0 = await _tunnel_counters(r)
-    sw0 = await kernel_rx_packets(r.target, r.session, TARGET_WAN_IF)
-    async with Capture(r, name) as capture:
-        report = await _udp_exchange(r, count, payload_size)
-    sw1 = await kernel_rx_packets(r.target, r.session, TARGET_WAN_IF)
+    await _outer_counter_add(r)
+    try:
+        sw0 = await _outer_counter(r)
+        async with Capture(r, name) as capture:
+            report = await _udp_exchange(r, count, payload_size)
+        sw1 = await _outer_counter(r)
+    finally:
+        await command(r.target, r.session, "nft", "delete", "table", "netdev", OUTER_TABLE,
+                      check=False)
     tun1 = await _tunnel_counters(r)
     state = await r.state()
     after = {f["cookie"]: int(f["packets"]) for f in state["flows"]}
@@ -417,8 +452,8 @@ async def _established(r, count=64, payload_size=64, name="routed"):
     assert report == {"echoed": count, "lost": 0}, report
     delta = {c: after[c] - before[c] for c in before}
     assert all(d == count for d in delta.values()), delta
-    # The control channel shares the WAN port, so its own packets are in the
-    # software count; the burst must not be.
+    # The burst's outer packets Linux saw: the hardware stripped the rest
+    # before any hook ran. A quarter of the burst is the allowance.
     software = sw1 - sw0
     assert software < count // 4, (software, count)
     tunnel = {k: tun1[k] - tun0[k] for k in tun0}
