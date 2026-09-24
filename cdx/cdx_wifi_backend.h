@@ -102,10 +102,4 @@ int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **result);
  */
 void cdx_wifi_vap_del(struct cdx_wifi_vap **vap);
 
-/* The id the encoder and VWD know this VAP by, and what the classifier entry
- * for a flow leaving through it carries. Stable for the VAP's life, and
- * reusable by a later VAP once this one is deleted.
- */
-u16 cdx_wifi_vap_id(const struct cdx_wifi_vap *vap);
-
 #endif

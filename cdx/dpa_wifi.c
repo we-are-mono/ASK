@@ -113,7 +113,6 @@ static bool vwd_stopping = true;
 struct dpaa_vwd_priv_s vwd;
 
 extern struct dpa_bp *dpa_bpid2pool(int bpid);
-extern struct dpa_priv_s* get_eth_priv(unsigned char* name);
 extern struct dpa_priv_s *dpa_first_eth_priv(void);
 
 static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *attr, char *buf);

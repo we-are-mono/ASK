@@ -1297,15 +1297,6 @@ struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
 	return ceetm_get_egressfq(qm_ctx, channel + 1, quenum);
 }
 
-/* The same queue's fqid, by the same numbering. */
-uint32_t ceetm_class_fqid(struct tQM_context_ctl *qm_ctx, uint32_t channel,
-			  uint32_t quenum)
-{
-	if (channel >= CDX_CEETM_MAX_CHANNELS)
-		return 0;
-	return ceetm_egress_fqid(qm_ctx, channel + 1, quenum);
-}
-
 /* The WRED curve a tc RED qdisc describes, in the congestion group's own
  * encoding.
  *

@@ -250,9 +250,3 @@ void cdx_wifi_vap_del(struct cdx_wifi_vap **vap)
 	kfree(v);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_wifi_vap_del, ASK_CDX_FLOWTABLE);
-
-u16 cdx_wifi_vap_id(const struct cdx_wifi_vap *vap)
-{
-	return vap->vapid;
-}
-EXPORT_SYMBOL_NS_GPL(cdx_wifi_vap_id, ASK_CDX_FLOWTABLE);

@@ -1467,24 +1467,6 @@ int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32
 	return cdxdrv_modify_ingress_qos_policer_profile(finfo,queue_no,cir,pir,cbs,pbs);
 }
 
-/* What one ingress profile is currently programmed with. The hardware layer
- * keeps these beside the handle, so a caller that has to change one of a pair
- * can read the other back rather than shadow it and risk the two disagreeing. */
-int cdx_ingress_policer_config(uint32_t fm_index, uint32_t queue_no,
-			       uint32_t *cir, uint32_t *cbs)
-{
-	struct cdx_fman_info *finfo;
-
-	if (fm_index >= num_fmans || queue_no >= INGRESS_ALL_POLICER_QUEUES)
-		return FAILURE;
-	finfo = (fman_info + fm_index);
-	if (!finfo->ingress_policer_info[queue_no].handle)
-		return FAILURE;
-	*cir = finfo->ingress_policer_info[queue_no].cir_value;
-	*cbs = finfo->ingress_policer_info[queue_no].cbs;
-	return SUCCESS;
-}
-
 /* The peak rate and burst one ingress profile enforces, when it is metering at
  * all. A profile whose green and yellow share an action drops on the peak pair
  * alone, so this pair is what it actually holds traffic to. A disabled profile

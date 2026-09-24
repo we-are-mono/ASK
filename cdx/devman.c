@@ -2449,29 +2449,10 @@ int get_phys_port_poolinfo_bysize(uint32_t size, struct port_bman_pool_info *poo
 	return -1;
 }
 
-struct dpa_priv_s* get_eth_priv(unsigned char* name)
-{
-	struct net_device *device;
-	struct dpa_priv_s *priv;
-
-	device = dev_get_by_name(&init_net, name);
-	if (!device) {
-		DPA_INFO("%s::could not find device %s\n", __func__, name);
-		return NULL;
-	}
-	if (!dpa_netdev_is_dpaa(device)) {
-		DPA_INFO("%s::%s is not a DPAA Ethernet port\n", __func__, name);
-		dev_put(device);
-		return NULL;
-	}
-	priv = netdev_priv(device);
-	return priv;
-}
-
 /* The first physical Ethernet port on record, held. For consumers that need
  * a DPAA port's private data for what every port shares -- the buffer layout
  * and errata handling -- rather than for any one port in particular. Pairs
- * with dev_put() on the returned priv's net_dev, exactly as get_eth_priv(). */
+ * with dev_put() on the returned priv's net_dev. */
 struct dpa_priv_s *dpa_first_eth_priv(void)
 {
 	struct dpa_iface_info *iface;
