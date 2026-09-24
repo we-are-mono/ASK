@@ -163,15 +163,6 @@ result independently of those temporary files.
   `sa_handle` directions by `dst_mtu(cls->nf_dst)` at admission and in
   `ft_stats`, and `in_sa` ones by the reverse bundle's.
 
-- [ ] **A200 — consumers do not advertise a smaller upstream's IPv6 MTU.**
-  An IPv6 direction is admitted to hardware only while its ingress
-  interface's IPv6 MTU is no larger than the path's (A198), so on a PPPoE
-  (1492) or 6in4 (1480) uplink the LAN-to-WAN IPv6 direction runs in
-  software unless the LAN's `net.ipv6.conf.<lan>.mtu` is lowered and advertised
-  in router advertisements. Neither the OpenWrt package (odhcpd `ra_mtu`, the
-  interface's IPv6 MTU) nor the Armbian integration sets it. Derive it from the
-  upstream when the uplink is PPPoE or a tunnel.
-
 - [ ] **A196 — oversized multicast replicas are fragmented by the microcode.**
   A multicast member's entry has no preemptive-check op
   (`fill_mcast_member_actions()` in `cdx/cdx_ehash.c` starts from a fresh
@@ -315,6 +306,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A200.** Consumers did not advertise a smaller upstream's IPv6 MTU, so LAN-to-WAN IPv6 behind PPPoE or 6in4 stayed in software —
+  documented as the integrating distribution's contract (_:/^docs: state what an integration owes an IPv6 LAN behind a narrower uplink_).
 
 - [x] **A192.** VLAN and PPPoE admissions had no allocation-failure coverage —
   covered (_:/^tests: fail the allocations of tagged and session admissions_).

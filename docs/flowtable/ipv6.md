@@ -106,6 +106,26 @@ with an oversized one is open, A201). IPv4 is not bounded: the microcode
 fragments a packet without DF as a Linux router would, and excepts one with DF
 for Linux's ICMP.
 
+## The consumer contract
+
+One obligation, and only on a network whose upstream path is narrower than
+its LAN. When the WAN is a PPPoE session (1492) or a 6in4/6rd tunnel (1480),
+the integration that owns the LAN interface sets its IPv6 MTU to the upstream
+path's and advertises that value in its router advertisements:
+
+- `net.ipv6.conf.<lan>.mtu` set to the uplink's IPv6 MTU, which is what the
+  admission bound above compares against;
+- the RA MTU option carrying the same value (odhcpd `ra_mtu`, radvd
+  `AdvLinkMTU`, systemd-networkd `[IPv6SendRA] ... LinkMTU` equivalents), so
+  hosts send packets that fit and never need the Packet Too Big round trip.
+
+Without it nothing breaks: the LAN-to-WAN IPv6 direction stays on the software
+flowtable path and every oversized packet still gets its Packet Too Big from
+`ip6_forward()`. Only that direction's acceleration is lost. Deriving the value
+from the uplink belongs to the integration that configures the uplink, since
+only it knows when a PPPoE session or tunnel comes up and at what MTU. ASK
+itself configures neither interface.
+
 ## Translation
 
 `nf_flow_rule_route_ipv6()` lays a translation out differently from IPv4: one
