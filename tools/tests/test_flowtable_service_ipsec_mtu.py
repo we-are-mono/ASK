@@ -43,12 +43,12 @@ import struct
 
 import pytest
 
-from _topology import LAN_NIC, TARGET_WAN_IF, lan_run_python
+from _topology import TARGET_WAN_IF
 from test_flowtable_connections import by_key, peer
 from test_flowtable_ipv6_sa import fragments_sent
-from test_flowtable_offload import DPORT, WAN_IP, command, rig  # noqa: F401
+from test_flowtable_offload import WAN_IP, command, rig  # noqa: F401
 from test_flowtable_selective_neighbour import keys, unchanged, warm
-from test_flowtable_service_ipsec import (INNER, LAN_INNER, Transform, flows_for, ipsec_service,  # noqa: F401
+from test_flowtable_service_ipsec import (INNER, Transform, flows_for, ipsec_service,  # noqa: F401
                                           sec_counter)
 from test_flowtable_service_ipsec_replay import AEAD
 
@@ -88,40 +88,32 @@ def forward_key(flow):
     return next(key for key in keys([0], [flow]) if key[0] != TARGET_WAN_IF)
 
 
-def probe_script(r, sport, payload, df):
-    """Send one IPv4 datagram, with DF or without, on the probe flow's own
-    tuple from the LAN end, and collect every Fragmentation Needed quoting it."""
-    return f'''
-import json
-from scapy.all import Ether, IP, IPerror, UDP, ICMP, Raw, sendp, sniff
-packet = IP(src={LAN_INNER!r}, dst={INNER!r}, flags={"DF" if df else 0!r})/UDP(sport={sport}, dport={DPORT})/Raw({payload!r})
-def frag_needed(p):
-    return (ICMP in p and p[ICMP].type == 3 and p[ICMP].code == 4 and IPerror in p
-            and p[IPerror].src == {LAN_INNER!r} and p[IPerror].dst == {INNER!r})
-answers = sniff(iface={LAN_NIC!r}, timeout=2, lfilter=frag_needed,
-                started_callback=lambda: sendp(Ether(dst={r.dut_lan_mac!r})/packet,
-                                               iface={LAN_NIC!r}, verbose=False))
-print(json.dumps({{"length": len(packet),
-                  "frag_needed": [{{"mtu": a[ICMP].nexthopmtu, "length": a[IPerror].len}}
-                                  for a in answers]}}))
-'''
-
-
-async def probe(r, flow, size, df=True):
+async def probe(r, p, flow, size, df=True):
     """One datagram of `size` bytes, all headers included, and what it did:
     whether the LAN end heard Fragmentation Needed, whether the far end got
     it intact, and what the hardware direction, the software SEC submit and
-    the microcode's fragmenter counted meanwhile."""
+    the microcode's fragmenter counted meanwhile.
+
+    The LAN peer sends it from the flow's own socket: the peer holds the one
+    LAN console for its whole life, so nothing else can run there meanwhile.
+    The far end does not answer it. A reply would cross the other direction
+    and, without DF, be fragmented on the way to the LAN end's narrower
+    route, as Linux would; the fragmenter's counts are global and would read
+    as this direction's."""
     payload = (b"ASK-ipsec-mtu-" + secrets.token_bytes(8)).ljust(size - 28, b".")
     forward = forward_key(flow)
     before, fragments = await r.state(), await fragments_sent(r)
+    # Every probe is on a direction in hardware; a missing one expired or
+    # was retired before this probe, not by it.
+    assert forward in by_key(before), (forward, sorted(by_key(before)))
     submitted = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc")
-    result = await lan_run_python(r.lan, probe_script(r, flow["sport"], payload, df), timeout=20,
-                                  label="flowtable_ipsec_mtu")
-    assert result.rc == 0, result.stdout
-    await asyncio.sleep(0.5)
+    r.inner_echo.reply = False
+    try:
+        lan = await p.rpc("df_probe", ident=flow["id"], data=payload.hex(), df=df)
+        await asyncio.sleep(0.5)
+    finally:
+        r.inner_echo.reply = True
     after = await r.state()
-    lan = json.loads(result.stdout.strip().splitlines()[-1])
     assert lan["length"] == size, lan
     return {"size": size, "df": df, "lan": lan, "delivered": r.echo.received[payload],
             "hardware": int(by_key(after)[forward]["packets"]) - int(by_key(before)[forward]["packets"]),
@@ -193,7 +185,7 @@ async def test_flowtable_service_ipsec_df_mtu(ipsec_service, bound_by):
             if bound_by in NARROWING:
                 # Before the hop narrows, the port's bound holds: the SA's
                 # MTU on the port crosses in hardware.
-                result = results[f"df-{sa_mtu}-wide"] = await probe(r, flow, sa_mtu)
+                result = results[f"df-{sa_mtu}-wide"] = await probe(r, p, flow, sa_mtu)
                 r.record(label, {**context, "results": results})
                 assert result["lan"]["frag_needed"] == [], result
                 assert result["delivered"] == 1 and result["hardware"] == 1, result
@@ -215,7 +207,7 @@ async def test_flowtable_service_ipsec_df_mtu(ipsec_service, bound_by):
                 r.record(label + "-narrowed", {"retired": retired, "readmitted": readmitted,
                                                "route": learned["stdout"]})
             for size in oversized:
-                result = results[f"df-{size}"] = await probe(r, flow, size)
+                result = results[f"df-{size}"] = await probe(r, p, flow, size)
                 r.record(label, {**context, "results": results})
                 # Linux's answer, once, with the bound, and the datagram
                 # dropped: never handed to SEC by the CPU or the hardware, so
@@ -224,7 +216,7 @@ async def test_flowtable_service_ipsec_df_mtu(ipsec_service, bound_by):
                 assert result["delivered"] == 0 and result["toenc"] == 0, result
                 assert result["fragments"] == {4: 0, 6: 0}, result
                 unchanged(result["before"], result["after"], [0], [flow])
-            result = results[f"df-{bound}"] = await probe(r, flow, bound)
+            result = results[f"df-{bound}"] = await probe(r, p, flow, bound)
             r.record(label, {**context, "results": results})
             # The largest the bound admits: SEC encrypts it in hardware and it
             # leaves as one frame the path carries -- exactly the port's MTU
@@ -242,7 +234,7 @@ async def test_flowtable_service_ipsec_df_mtu(ipsec_service, bound_by):
                 # fragments nothing -- so it reaches the far end intact, as
                 # one frame, without an answer, and encrypted in hardware.
                 size = (bound + sa_mtu) // 2
-                result = results[f"no-df-{size}"] = await probe(r, flow, size, df=False)
+                result = results[f"no-df-{size}"] = await probe(r, p, flow, size, df=False)
                 r.record(label, {**context, "results": results})
                 assert result["lan"]["frag_needed"] == [] and result["delivered"] == 1, result
                 assert result["hardware"] == 1 and result["toenc"] == 0, result

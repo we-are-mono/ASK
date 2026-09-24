@@ -191,7 +191,9 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
                          "offload", "packet", "dev", TARGET_WAN_IF)
             if direction == "in":
                 await sa.add(r.target, "policy", [*selector, "dev", TARGET_LAN_IF, "dir", "fwd"], *template)
-        echo = Echo()
+        # The far inner end's echo, sharing the rig echo's record of what
+        # arrived; a test that needs the outbound direction alone silences it.
+        r.inner_echo = echo = Echo()
         echo.received = r.echo.received
         transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(lambda: echo, local_addr=(INNER, DPORT))
         async with managed_service(r, extra_paths=[(LAN_INNER, INNER)]):

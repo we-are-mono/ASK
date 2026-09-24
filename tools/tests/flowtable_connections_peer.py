@@ -16,6 +16,10 @@ import time
 
 TCP_SIZE = 16384
 UDP_SIZE = 256
+# linux/in.h: a socket's DF policy, for probes on a flow's own tuple.
+IP_MTU_DISCOVER = 10
+IP_PMTUDISC_PROBE = 3
+IP_PMTUDISC_INTERFACE = 4
 
 
 def payload(ident, serial, size):
@@ -163,6 +167,76 @@ class Flow:
             except (TimeoutError, OSError) as error:
                 results.append(type(error).__name__)
         return f"after the loss, {time.monotonic():.3f}: " + " ".join(results)
+
+    async def df_probe(self, data, df):
+        """One datagram of `data` on this UDP flow's own tuple, with DF or
+        without, and every Fragmentation Needed quoting it.
+
+        PROBE sets DF and INTERFACE leaves it clear; both size the datagram by
+        the interface alone, so the PMTU an earlier probe taught this host
+        neither refuses nor fragments this one. The ICMP marks the connected
+        socket with EMSGSIZE, consumed here; so is an echo that comes back
+        within the listening window, and a caller that needs none at all
+        silences the far end instead."""
+        assert self.sock and self.sock.family == socket.AF_INET, self.spec
+        loop = asyncio.get_running_loop()
+        local, remote = self.sock.getsockname()[:2], self.sock.getpeername()[:2]
+        mode = self.sock.getsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER)
+        answers = []
+        # Where the flow's own socket lives, or the answer is never seen.
+        with namespace(self.spec):
+            icmp = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        with icmp:
+            icmp.setblocking(False)
+
+            async def frag_needed():
+                while True:
+                    packet = await loop.sock_recv(icmp, 65536)
+                    offset = (packet[0] & 15) * 4
+                    quoted = packet[offset + 8:]
+                    if len(packet) < offset + 8 or packet[offset:offset + 2] != b"\x03\x04":
+                        continue
+                    header = (quoted[0] & 15) * 4 if quoted else 0
+                    if len(quoted) < max(header, 20) + 4 or quoted[9] != socket.IPPROTO_UDP:
+                        continue
+                    sport, dport = struct.unpack_from("!HH", quoted, header)
+                    if ((socket.inet_ntoa(quoted[12:16]), sport) == local
+                            and (socket.inet_ntoa(quoted[16:20]), dport) == remote):
+                        answers.append({"mtu": struct.unpack_from("!H", packet, offset + 6)[0],
+                                        "length": struct.unpack_from("!H", quoted, 2)[0]})
+
+            async def echo():
+                while True:
+                    try:
+                        if await loop.sock_recv(self.sock, len(data) + 1) == data:
+                            return True
+                    except OSError as error:
+                        if error.errno != errno.EMSGSIZE:
+                            raise
+
+            self.sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER,
+                                 IP_PMTUDISC_PROBE if df else IP_PMTUDISC_INTERFACE)
+            try:
+                await loop.sock_sendall(self.sock, data)
+                echoing = asyncio.ensure_future(echo())
+                try:
+                    # Two seconds for Linux's answer, as the LAN end has
+                    # always listened; frag_needed() returns only by timing out.
+                    async with asyncio.timeout(2):
+                        await frag_needed()
+                except TimeoutError:
+                    pass
+                finally:
+                    echoing.cancel()
+                    # A cancelled reader yields CancelledError, which is not an
+                    # Exception; a real receive error is, and is raised.
+                    echoed, = await asyncio.gather(echoing, return_exceptions=True)
+                if isinstance(echoed, Exception):
+                    raise echoed
+            finally:
+                self.sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, mode)
+                self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        return {"length": 28 + len(data), "frag_needed": answers, "echoed": echoed is True}
 
     async def run(self, count, interval, allow_loss=False, udp_timeout=None):
         # Loss-tolerant UDP windows validate every received payload. Their
@@ -330,6 +404,10 @@ async def main(config):
                     result = multicast.rpc(**command["changes"])
                 elif op == "wire_probe":
                     result = wire_probe.rpc(**command["changes"])
+                elif op == "df_probe":
+                    assert command["ident"] not in running, command
+                    result = await flows[command["ident"]].df_probe(bytes.fromhex(command["data"]),
+                                                                    command["df"])
                 elif op == "start":
                     for ident in ids:
                         assert ident not in running
