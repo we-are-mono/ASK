@@ -879,9 +879,9 @@ static void vwd_unpublish_vap(struct vap_desc_s *vap)
 /* Publish the vap pointer onto VLAN devices riding on its wifi netdev,
  * by netdev relationship, each time the VAP opens: a REMOVE clears the
  * aliases and nothing else puts them back. Safe for any such VLAN: ESP
- * arriving on it did not arrive on a DPAA port, so the DPAA driver gives
- * it back rather than submit it to SEC, and Linux decrypts it. Caller
- * holds rtnl. */
+ * arriving on it did not arrive on an SA's own DPAA port, so the DPAA
+ * driver gives it back rather than submit it to SEC, and xfrm drops it
+ * for an SA the hardware holds. Caller holds rtnl. */
 static void vwd_publish_vlan_aliases(struct vap_desc_s *vap)
 {
 	struct net_device *dev;

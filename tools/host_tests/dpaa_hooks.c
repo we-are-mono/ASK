@@ -78,8 +78,9 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *dev)
 static int __dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *dev,
 					 struct dpa_bp *bp)
 { assert(rcu_depth == 1); bodies++; return 0; }
-static int __dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd)
-{ assert(rcu_depth == 1); bodies++; return -1; }
+struct xfrm_state { u16 handle; };
+static int __dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+{ assert(rcu_depth == 1 && x->handle == 5); bodies++; return -1; }
 
 /* File-scope state in the driver, declared where the harness can see it. */
 static dpa_setup_tc_handler dpa_setup_tc_func;
@@ -172,7 +173,8 @@ int main(void)
 	/* The body's answer comes back through the section: 0 is a frame SEC
 	 * has, which is what a caller counting what it gave SEC counts. */
 	assert(dpaa_submit_outb_pkt_to_SEC(&skb, &dev, &bp) == 0 && !rcu_depth);
-	assert(dpaa_submit_inb_pkt_to_SEC(&skb, 5) == -1 && !rcu_depth);
+	assert(dpaa_submit_inb_pkt_to_SEC(&skb, &(struct xfrm_state){ .handle = 5 }) == -1 &&
+	       !rcu_depth);
 	assert(bodies == 3);
 	dpa_unregister_ceetm_get_egress_fq();
 	dpa_unregister_ipsec_fq_handler();

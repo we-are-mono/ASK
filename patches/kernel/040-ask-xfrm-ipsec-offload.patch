@@ -1,4 +1,4 @@
-From e4be5d66cc07bb66ea459e35e1ae54c63b2e47df Mon Sep 17 00:00:00 2001
+From 84d8dffa377726d37e14fa6a6dadbaad460a2cbe Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -42,6 +42,15 @@ of an update, and the hardware SA carries the ports and was addressed by
 a route looked up with the mark, so deleting and adding the state is
 what programs new ones.
 
+A state with a handle is received through SEC and nothing else: SEC
+keeps its anti-replay window, and xfrm's copy of it is refreshed from
+SEC but never written back. xfrm_input() hands its ESP to the driver,
+which takes only a frame that arrived on the state's own device, and
+drops whatever SEC is not given -- another device's or another port's
+ESP, a frame the driver could not queue, ESP delivered by GRO -- as
+XfrmInStateMismatch rather than decrypt it against a second window. A
+state another driver offloads is received as upstream receives it.
+
 Compiles warning-free: xfrm_state_lookup_byhandle() is declared in
 include/net/xfrm.h and __xfrm_state_lookup_byhandle is static.
 
@@ -59,10 +68,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/ipv6/xfrm6_policy.c                       |  10 +
  net/key/af_key.c                              |   8 +
  net/xfrm/xfrm_device.c                        |  24 ++
- net/xfrm/xfrm_input.c                         |  17 ++
+ net/xfrm/xfrm_input.c                         |  48 ++++
  net/xfrm/xfrm_output.c                        | 248 ++++++++++++++++++
  net/xfrm/xfrm_state.c                         | 193 ++++++++++++++
- 15 files changed, 648 insertions(+), 32 deletions(-)
+ 15 files changed, 679 insertions(+), 32 deletions(-)
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac..1669e0d267e3 100644
@@ -123,20 +132,20 @@ index 4b1bcf53f7ac..1669e0d267e3 100644
  /*
   * IPSec ESP Datapath Protocol Override Register (DPOVRD)
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-index 46816dcda3cb..674e4cba3b29 100644
+index 2c38096743a3..d9f9062ec75d 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-@@ -102,7 +102,7 @@ typedef struct qman_fq *(*cdx_get_ipsec_fq_hook_t)(u32 handle);
- int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn);
+@@ -103,7 +103,7 @@ int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn);
  void dpa_unregister_ipsec_fq_handler(void);
- int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd);
+ struct xfrm_state;
+ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x);
 - __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp);
 +__hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp);
  
  #endif
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 04650986e173..044ed0365dd9 100644
+index 541b11962bab..4820f3559821 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -58,6 +58,7 @@
@@ -311,7 +320,7 @@ index 04650986e173..044ed0365dd9 100644
  }
  
  EXPORT_SYMBOL(dpaa_submit_outb_pkt_to_SEC);
-@@ -1824,8 +1897,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd)
+@@ -1859,8 +1932,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, 0);
  		if (unlikely(err < 0))
  		{
@@ -322,7 +331,7 @@ index 04650986e173..044ed0365dd9 100644
  			goto err_giveback; /* give packet to linux */
  		}
  
-@@ -1928,9 +2001,12 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1967,9 +2040,12 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  #ifdef CONFIG_XFRM
  #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
  	if(skb->ipsec_offload) {
@@ -534,21 +543,38 @@ index 7744ed8e4c83..f2a7fa2704a4 100644
  		return skb;
  
 diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
-index 5d3633ce6ba3..79e0d4b19f61 100644
+index 5d3633ce6ba3..d0e39279123c 100644
 --- a/net/xfrm/xfrm_input.c
 +++ b/net/xfrm/xfrm_input.c
-@@ -44,6 +44,10 @@ struct xfrm_trans_cb {
+@@ -44,6 +44,27 @@ struct xfrm_trans_cb {
  
  #define XFRM_TRANS_SKB_CB(__skb) ((struct xfrm_trans_cb *)&((__skb)->cb[0]))
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+extern int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd);
++extern int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb,
++				      const struct xfrm_state *x);
++
++/*
++ * Whether @x is received through SEC and nothing else: a packet-offloaded
++ * state the DPAA offload module took, the one driver that gives a state a
++ * handle (from xdo_dev_state_add(), before the state is inserted). SEC keeps
++ * such a state's anti-replay window. xfrm's own is a copy the driver
++ * refreshes now and then, and nothing tells SEC what software accepted, so
++ * decrypting a frame here would check it against a second window, each
++ * accepting what the other had already seen. What SEC is not given is
++ * dropped instead. A state another driver offloads has no handle and is
++ * received as upstream receives it.
++ */
++static bool xfrm_state_sec_only(const struct xfrm_state *x)
++{
++	return x->xso.type == XFRM_DEV_OFFLOAD_PACKET && x->handle;
++}
 +#endif /* IPSEC */
 +
  static DEFINE_SPINLOCK(xfrm_input_afinfo_lock);
  static struct xfrm_input_afinfo const __rcu *xfrm_input_afinfo[2][AF_INET6 + 1];
  
-@@ -599,6 +603,19 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+@@ -599,6 +620,19 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
  			goto drop;
  		}
  
@@ -560,14 +586,35 @@ index 5d3633ce6ba3..79e0d4b19f61 100644
 +		 * would target a hardware SA context the driver may already
 +		 * have torn down (or reused).
 +		 */
-+		if (x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
++		if (xfrm_state_sec_only(x) &&
 +		    x->km.state == XFRM_STATE_VALID &&
-+		    !dpaa_submit_inb_pkt_to_SEC(skb, x->handle))
++		    !dpaa_submit_inb_pkt_to_SEC(skb, x))
 +			return 0;
 +#endif /* IPSEC offload end */
  lock:
  		spin_lock(&x->lock);
  
+@@ -611,6 +645,20 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+ 			goto drop_unlock;
+ 		}
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/*
++		 * Whatever of such a state SEC was not given: ESP that arrived
++		 * on another device or another port, ESP the driver could not
++		 * queue, and ESP that GRO brought straight here. The state is
++		 * valid and the frame may be genuine, but it did not come the
++		 * way this state receives, as with the encapsulation below.
++		 */
++		if (xfrm_state_sec_only(x)) {
++			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMISMATCH);
++			goto drop_unlock;
++		}
++#endif
++
+ 		if ((x->encap ? x->encap->encap_type : 0) != encap_type) {
+ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMISMATCH);
+ 			goto drop_unlock;
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
 index a5b5d82bd755..8c4d265b7f47 100644
 --- a/net/xfrm/xfrm_output.c

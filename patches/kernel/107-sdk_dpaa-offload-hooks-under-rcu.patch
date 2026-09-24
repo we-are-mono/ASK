@@ -1,4 +1,4 @@
-From 391119058f2c95b20fb236a02bc28ae0351fbfc0 Mon Sep 17 00:00:00 2001
+From 0fddc66544789c44f6aa9c51b158f25993cbb3a3 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 23:30:35 +0200
 Subject: [PATCH] sdk_dpaa: hold RCU across the offload module's transmit hooks
@@ -21,11 +21,11 @@ waits for them whatever context they were entered from.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 70 ++++++++++++++++---
- 1 file changed, 60 insertions(+), 10 deletions(-)
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 71 ++++++++++++++++---
+ 1 file changed, 61 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 02aeb021b9ab..22c26bdc1ccb 100644
+index ba13b912a131..6a4d92ba9dee 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -82,7 +82,10 @@ int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_
@@ -91,16 +91,17 @@ index 02aeb021b9ab..22c26bdc1ccb 100644
  EXPORT_SYMBOL(dpaa_submit_outb_pkt_to_SEC);
  
  /**
-@@ -1763,7 +1782,7 @@ EXPORT_SYMBOL(dpa_add_dummy_eth_hdr);
- /* This function is invoked from xfrm_input.c to submit IPSEC packets
-    to SEC engine, if the corresponding SA is programmed in ucode
- */
--int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd)
-+static int __dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd)
+@@ -1789,7 +1808,8 @@ static bool dpa_inb_port_ok(const struct net_device *port,
+  * that could not be queued -- and the skb is exactly as it came, for
+  * xfrm_input() to decide what becomes of it.
+  */
+-int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
++static int __dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb,
++					const struct xfrm_state *x)
  {
  	struct qman_fq *sec_fq = NULL;
  	struct dpa_priv_s	*priv = NULL;
-@@ -1916,13 +1935,26 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd)
+@@ -1955,13 +1975,26 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  	skb->data += tmp_len;
  	return -1; /* give packet to linux */
  }
@@ -108,12 +109,12 @@ index 02aeb021b9ab..22c26bdc1ccb 100644
 +/* As dpaa_submit_outb_pkt_to_SEC(): xfrm_input() reaches this from softirq and
 + * from resumed asynchronous transforms alike, and the read-side section the
 + * hook's unregister waits for is taken here. */
-+int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd)
++int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
 +{
 +	int rc;
 +
 +	rcu_read_lock();
-+	rc = __dpaa_submit_inb_pkt_to_SEC(skb, sagd);
++	rc = __dpaa_submit_inb_pkt_to_SEC(skb, x);
 +	rcu_read_unlock();
 +	return rc;
 +}
@@ -128,7 +129,7 @@ index 02aeb021b9ab..22c26bdc1ccb 100644
  {
  	struct dpa_priv_s	*priv;
  	struct dpa_percpu_priv_s *percpu_priv;
-@@ -2011,6 +2043,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -2050,6 +2083,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  	conf_fq = priv->conf_fqs[queuenum  & (DPAA_ETH_TX_QUEUES-1)];
  	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
  }

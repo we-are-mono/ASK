@@ -237,6 +237,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A232.** An offloaded inbound SA's ESP that SEC was not given (another device or port, a refused queue, GRO) was decrypted in software against xfrm's copy of SEC's replay window, which SEC never learns from —
+  fixed (_:/^xfrm: receive a hardware-held inbound SA through SEC alone_).
+
 - [x] **A224.** Inbound IPsec read another driver's netdev private area as a DPAA port's: the driver's submit for ESP arriving on a bridge, VLAN-over-bridge or veth, and the exception queue for an SA whose local endpoint was on a Wi-Fi VAP —
   fixed (_:/^sdk_dpaa, cdx: take a DPAA port's private area only from a DPAA port_).
 

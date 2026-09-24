@@ -47,16 +47,18 @@ def test_ipsec_inbound_submit_device(tmp_path):
     xfrm_input() finds a packet-offloaded state by address and SPI and asks
     the driver to submit whatever arrived, on a bridge or a veth as readily
     as on a port, and the submit borrows the device's private area as a
-    DPAA port's. A port, or a VLAN or PPPoE session over one, is submitted as
-    before; anything else is given back untouched for the state's software
-    ESP. Every device that is not a port keeps its private area on an
-    unreadable page, so borrowing it fails the run.
+    DPAA port's. The state's own port, or a VLAN or PPPoE session over it, is
+    submitted as before; anything else, another port included, is given back
+    untouched, for xfrm_input() to drop. Every device that is not a port
+    keeps its private area on an unreadable page, so borrowing it fails the
+    run.
     """
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     source = (kernel / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c").read_text()
     (tmp_path / "ipsec_inbound_submit.inc").write_text(
         function(source, "dpa_netdev_is_dpaa_port")
+        + function(source, "dpa_inb_port_ok")
         + function(source, "__dpaa_submit_inb_pkt_to_SEC")
         + function(source, "dpaa_submit_inb_pkt_to_SEC"))
     binary = tmp_path / "ipsec_inbound_submit"

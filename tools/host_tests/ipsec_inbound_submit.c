@@ -1,9 +1,10 @@
 /* The driver's inbound hand-off to SEC is production code: the test for a
- * DPAA port and the submit around it. xfrm_input() calls it for a
- * packet-offloaded state whatever device the frame reached the stack on, so
- * it is given each kind here. Every device that is not a port keeps its
- * private area on a page nothing may read or write: the submit borrowing it
- * as a struct dpa_priv_s faults, and the fault fails the test by name. */
+ * DPAA port, the test for the state's own port and the submit around them.
+ * xfrm_input() calls it for a packet-offloaded state whatever device the frame
+ * reached the stack on, so it is given each kind here, and the state bound to
+ * one port or another. Every device that is not a port keeps its private area
+ * on a page nothing may read or write: the submit borrowing it as a struct
+ * dpa_priv_s faults, and the fault fails the test by name. */
 #include <assert.h>
 #include <errno.h>
 #include <signal.h>
@@ -64,6 +65,12 @@ struct sk_buff {
 	unsigned int len;
 	u16 mac_header, network_header, mac_len;
 	int iif_index;
+};
+/* What the submit reads of the state: its handle and the device it is bound
+ * to. */
+struct xfrm_state {
+	u16 handle;
+	struct { struct net_device *dev; } xso;
 };
 
 typedef struct qman_fq *(*cdx_get_ipsec_fq_hook_t)(u32 handle);
@@ -291,7 +298,10 @@ static void session(struct net_device *lower)
 	skb.iif_index = lower ? lower->ifindex : 99;
 }
 
-static int submit(void) { return dpaa_submit_inb_pkt_to_SEC(&skb, 7); }
+/* The state the frame is for, bound to one port or another. */
+static struct xfrm_state sa = { .handle = 7 };
+
+static int submit(void) { return dpaa_submit_inb_pkt_to_SEC(&skb, &sa); }
 
 /* Given back to Linux exactly as it came: nothing moved, nothing written,
  * nothing given to SEC. */
@@ -318,12 +328,13 @@ static void taken(int rc, struct dpa_priv_s *priv, struct device *dma)
 
 static void test_ports(void)
 {
-	/* A port: SEC gets the frame from its MAC header. */
+	/* The state's own port: SEC gets the frame from its MAC header. */
+	sa.xso.dev = &eth3;
 	frame(&eth3, 14, 14);
 	taken(submit(), &eth3_priv, &eth3_dma);
 	assert(skb.data == buffer && skb.len == 100 + 34);
 
-	/* A VLAN over a port lends the port's. */
+	/* A VLAN over it lends the port's. */
 	frame(&eth3_vlan, 18, 14);
 	taken(submit(), &eth3_priv, &eth3_dma);
 	assert(skb.data == buffer + 4 && skb.len == 100 + 34);
@@ -331,18 +342,33 @@ static void test_ports(void)
 	/* A port VWD was pointed at -- nothing on that path needs a radio --
 	 * is mapped for the shared pool, and counted as the port's all the
 	 * same. */
+	sa.xso.dev = &eth4;
 	eth4.wifi_offload_dev = &vap_desc;
 	frame(&eth4, 14, 14);
 	taken(submit(), &eth4_priv, &shared_pool_dev);
 	eth4.wifi_offload_dev = NULL;
 
-	/* A PPPoE session on a port: the Ethernet header rebuilt in front. */
+	/* A PPPoE session on it: the Ethernet header rebuilt in front. */
 	session(&eth4);
 	taken(submit(), &eth4_priv, &eth4_dma);
 	assert(bench.cows == 1 && skb.data == buffer + 8 && skb.len == 100 + 34);
 	assert(skb.data[12] == 0x08 && skb.data[13] == 0x00);
 
+	/* Another port -- directly, under a VLAN, under a PPPoE session -- is
+	 * not the state's, however much a port it is. */
+	frame(&eth3, 14, 14);
+	handed_back(submit());
+	frame(&eth3_vlan, 18, 14);
+	handed_back(submit());
+	session(&eth3);
+	handed_back(submit());
+	/* Nor is any port once the state is bound to none. */
+	sa.xso.dev = NULL;
+	frame(&eth4, 14, 14);
+	handed_back(submit());
+
 	/* What SEC refuses to queue goes back to Linux, the shift undone. */
+	sa.xso.dev = &eth3;
 	frame(&eth3, 14, 14);
 	bench.enqueue_result = -5;
 	assert(submit() == -1);
@@ -363,21 +389,26 @@ static void test_other_devices(void)
 {
 	struct net_device *others[] = { &bridge, &bridge_vlan, &veth, &vap, &vap_vlan, &usb };
 
+	/* Even a state bound to the very device a frame arrived on is not
+	 * submitted from it unless it is a port. */
 	for (unsigned i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+		sa.xso.dev = &eth4;
+		frame(others[i], 18, 14);
+		handed_back(submit());
+		sa.xso.dev = others[i];
 		frame(others[i], 18, 14);
 		handed_back(submit());
 	}
+	sa.xso.dev = &eth4;
 
 	/* A tunnel device: no Ethernet header, and no port under it. */
 	frame(&gre, 14, 0);
 	handed_back(submit());
 
-	/* A non-Ethernet device VWD serves goes to SEC through the shared
-	 * pool, borrowing nothing: no private area read, no port counted. */
+	/* A non-Ethernet device VWD serves has no port under it either, and
+	 * is not the state's: nothing goes to SEC from it. */
 	frame(&wwan, 14, 14);
-	assert(submit() == 0 && bench.sg_calls == 1 && bench.enqueues == 1);
-	assert(bench.sg_dev == &shared_pool_dev && bench.sg_netdev == &wwan);
-	assert(!eth3_cpu.tx_caam_dec && !eth4_cpu.tx_caam_dec);
+	handed_back(submit());
 
 	/* A session over another driver's device, or over one that is gone. */
 	session(&usb);

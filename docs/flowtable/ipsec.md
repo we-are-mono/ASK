@@ -284,11 +284,10 @@ offload, where the stack builds the ESP header.
 **The device.** The state's `xso.dev` must be a registered physical CDX port.
 A state bound to any other device is refused rather than accepted and ignored,
 because packet offload has no silent software fallback and an accepted-but-dead
-SA would black-hole the tunnel. (Inbound ESP arriving on a device that is not
-a DPAA port is the one frame-level exception; see step 6.) This is an
-*identity* test and deliberately not the liveness one a flow's ports face: an
-SA may legitimately be installed before the link it will ride has carrier, and
-refusing then would fail the tunnel outright instead of delaying it.
+SA would black-hole the tunnel. This is an *identity* test and deliberately not
+the liveness one a flow's ports face: an SA may legitimately be installed
+before the link it will ride has carrier, and refusing then would fail the
+tunnel outright instead of delaying it.
 
 **And there must be an engine behind the port.** The IPsec offline port, its
 buffer pool and PCD frame queues, and the CAAM job ring are all claimed at
@@ -751,12 +750,11 @@ with the action that checks SEC's status. The microcode counts a refused frame
 in a table it keeps in MURAM (`en_SEC_failure_stats`, in the global block
 after the external hash tables' internal buffer pool) and drops the frame
 inside FMan. The CPU's feed goes the same way. An ESP datagram that reached
-the CPU on a DPAA port, such as one reassembled from fragments, goes from
-`xfrm_input()` to SEC (`tx todec`) before xfrm's own replay check, into the
-same SA queues. So neither xfrm nor cdx ever holds a refused frame. (ESP that
-arrived on another device is the exception: it is given back to software ESP,
-see step 6.) The SA's exception queue carries only frames SEC processed that
-missed the offline port's flow table.
+the CPU on the SA's own port, such as one reassembled from fragments, goes
+from `xfrm_input()` to SEC (`tx todec`) before xfrm's own replay check, into
+the same SA queues, and one that reached it any other way is dropped (step 9).
+So neither xfrm nor cdx ever holds a refused frame. The SA's exception queue
+carries only frames SEC processed that missed the offline port's flow table.
 
 The microcode's table is the only record, and it has limits:
 
@@ -836,9 +834,8 @@ and as of the pass's last reading. `ipsec_sec_refused` is the exact total, and
 `ft_sec_refusal[]`.
 
 **No count exists per SA.** For an offloaded SA, `ip -s xfrm state` shows
-`replay-window 0 replay 0 failed 0` however many of its frames SEC refused.
-Only frames software ESP decrypted, which step 6 says arrive on a device
-other than a DPAA port, move those counters.
+`replay-window 0 replay 0 failed 0` however many of its frames SEC refused,
+and software never decrypts one of its frames to move them (step 9).
 SEC keeps no per-SA count, and the microcode's count is global. No design
 recovers one at a price worth paying:
 
@@ -1092,16 +1089,12 @@ the inbound SA's own classifier entry steers ESP to SEC, and `xfrm_input()` is
 not on the path. What was missing is everything after decryption.
 
 ESP that misses that entry and reaches `xfrm_input()` anyway goes to SEC
-through the software submit (`tx todec`) only when it arrived on a DPAA port,
-or on a VLAN or PPPoE session over one, because the submit borrows the port's
-driver state and reads no other driver's. ESP arriving anywhere else, on a
-bridge, a veth or a Wi-Fi VAP, is given back and decrypted by the state's own
-software ESP. That is a choice, not a constraint, and it costs anti-replay:
-xfrm's window for an offloaded SA is a copy of SEC's, refreshed once per
-accounting pass, and SEC never learns what software accepted, so each can
-accept a frame the other already has. No SA strongSwan installs carries such
-traffic, since the other half of a tunnel whose peer lies behind another
-device is refused; it comes from hand-built SAs or from an attacker.
+through the software submit (`tx todec`) only when it arrived on the SA's own
+port, directly or on a VLAN or PPPoE session over it: the submit borrows that
+port's driver state and reads no other driver's, and SEC's output for a frame
+from another port would come back to Linux through the SA's port still
+addressed to the one it came in on. Everything else is dropped rather than
+decrypted in software (step 9).
 
 #### The three defects, in the order the bench found them
 
@@ -1498,6 +1491,52 @@ DECO ICID, classifier-fed     0                   63 (0x3F)
 A pure CPU flood reused nothing even before the fix, because all its frames
 carry one ICID.
 
+#### Inbound: one window, without exception
+
+An inbound SA's anti-replay window is SEC's, in the decapsulation PDB, and
+both feeders reach it: the classifier's by SPI, and the CPU's through the
+software submit. xfrm's `x->replay` for the SA is only a copy, which the
+accounting pass refreshes from SEC (`ft_ipsec_publish_window()`), and nothing
+writes what software accepts back into SEC. Decrypting any of the SA's frames
+in software would check it against that copy, and each window would then
+accept what the other had already seen: a frame SEC took, replayed along a
+path software decrypts, or the other way round.
+
+So a state cdx holds (a packet-offloaded state with a handle,
+`xfrm_state_sec_only()` in patch 040) is received through SEC and nothing
+else. `xfrm_input()` drops, and counts as `XfrmInStateMismatch`, whatever of
+it SEC is not given:
+
+- ESP that arrived on a device that is not the SA's own port or a VLAN or
+  PPPoE session over it: a bridge, a veth, a Wi-Fi VAP, a tunnel.
+- ESP that arrived on another DPAA port. SEC would decrypt it, but what SEC
+  returns goes back to Linux through the SA's port, still addressed to the
+  port the frame came in on, and is dropped there as another host's.
+- ESP the driver could not queue: no S/G table, a queue that refused it, no
+  queue for the SA's handle.
+- ESP that GRO delivered straight to decryption, past the driver
+  (`esp4_gro_receive()`, `esp6_gro_receive()`). The DPAA ports never pass ESP
+  through GRO; another NIC may.
+
+`XfrmInStateMismatch` is the counter `xfrm_input()` raises when a frame
+reaches a valid state along a path the state does not receive by (an
+encapsulation it was not configured for), and it is none of the four the
+adapter folds SEC's refusals into. A state another driver offloads has no
+handle and is received as upstream receives it.
+
+No working tunnel strongSwan installs carries such traffic. strongSwan binds a
+state to the device that holds its local address, and the adapter refuses the
+outbound half of a tunnel whose peer lies behind any other device. Under
+`hw_offload = packet` the child SA then fails. Under `auto`, which is what
+OpenWrt's UCI wrapper can say, strongSwan retries the refused outbound SA as
+crypto offload; the adapter refuses that too, and xfrm installs the SA in
+software. The inbound SA stays offloaded and both policies are installed
+packet-offloaded, and `xfrm_state_find()` never pairs a packet-offloaded
+policy with a software state. So the child SA comes up, but its outbound
+traffic finds no state and keeps raising acquires: the tunnel is up and dead.
+What is dropped comes from hand-built SAs, from such a tunnel, or from someone
+replaying captured ESP through another door.
+
 ## Tests
 
 IPsec is described elsewhere as the most covered subsystem left on the board.
@@ -1600,9 +1639,13 @@ requirement, not a packaging one, and it belongs in step 3 below.
 (`feeds/packages/net/strongswan/files/swanctl.init:327`), so a UCI-configured
 tunnel cannot say `packet` even though the library accepts it. Two ways
 through, and the first is free: `auto` **already sets `XFRM_OFFLOAD_PACKET`**
-and simply does not fail the SA when offload is unavailable
+and simply does not fail the SA when the device does not advertise offload
 (`kernel_netlink_ipsec.c:1666`), so an unmodified OpenWrt gets packet offload
-from `option hw_offload 'auto'` today. Adding `crypto|packet` to that
+from `option hw_offload 'auto'` today. When the adapter refuses an SA instead,
+`auto` retries it as crypto offload, which the adapter also refuses, and xfrm
+installs it in software; a refused policy it retries without offload. It
+treats each SA and policy on its own, not the child SA as a whole, which is
+what leaves the tunnel in step 9 half in hardware. Adding `crypto|packet` to that
 allowlist is a one-line package patch worth carrying anyway, because `auto`
 silently degrades to software and an operator asking for hardware IPsec
 usually wants to be told when they did not get it.
