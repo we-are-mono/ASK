@@ -52,7 +52,6 @@ typedef struct _tRouteEntry {
 	U8 dstmac[ETHER_ADDR_LEN];
 	U16 mtu;
 	U16 flags;
-	U16 onif_index;
 	union
 	{
 		U32 Daddr_v4;

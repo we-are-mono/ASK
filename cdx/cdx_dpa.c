@@ -135,7 +135,7 @@ int add_incoming_iface_info(PCtEntry entry)
 		 * something is genuinely wrong. Full flow identity dumped to
 		 * identify it; rate-limited (fires once per rejected flow). */
 		if (IS_IPV6_FLOW(entry))
-			pr_err_ratelimited("ASK-DIAG no-input-itf: %s %pI6c.%u -> %pI6c.%u %s status=0x%04x fftype=0x%02x oif[idx=%u type=0x%x phys=%d] onif_idx=%u underlying_iif[idx=%d] inPhyPort=%u\n",
+			pr_err_ratelimited("ASK-DIAG no-input-itf: %s %pI6c.%u -> %pI6c.%u %s status=0x%04x fftype=0x%02x oif[idx=%u type=0x%x phys=%d] underlying_iif[idx=%d] inPhyPort=%u\n",
 				pn,
 				entry->Saddr_v6, (unsigned int)ntohs(entry->Sport),
 				entry->Daddr_v6, (unsigned int)ntohs(entry->Dport),
@@ -144,11 +144,10 @@ int add_incoming_iface_info(PCtEntry entry)
 				(unsigned int)(rt->itf ? rt->itf->index : 0xff),
 				(unsigned int)(rt->itf ? rt->itf->type : 0),
 				(rt->itf && rt->itf->phys) ? (int)rt->itf->phys->index : -1,
-				(unsigned int)rt->onif_index,
 				rt->underlying_input_itf ? (int)rt->underlying_input_itf->index : -1,
 				(unsigned int)entry->inPhyPortNum);
 		else
-			pr_err_ratelimited("ASK-DIAG no-input-itf: %s %pI4.%u -> %pI4.%u %s status=0x%04x fftype=0x%02x oif[idx=%u type=0x%x phys=%d] onif_idx=%u underlying_iif[idx=%d] inPhyPort=%u\n",
+			pr_err_ratelimited("ASK-DIAG no-input-itf: %s %pI4.%u -> %pI4.%u %s status=0x%04x fftype=0x%02x oif[idx=%u type=0x%x phys=%d] underlying_iif[idx=%d] inPhyPort=%u\n",
 				pn,
 				&entry->Saddr_v4, (unsigned int)ntohs(entry->Sport),
 				&entry->Daddr_v4, (unsigned int)ntohs(entry->Dport),
@@ -157,7 +156,6 @@ int add_incoming_iface_info(PCtEntry entry)
 				(unsigned int)(rt->itf ? rt->itf->index : 0xff),
 				(unsigned int)(rt->itf ? rt->itf->type : 0),
 				(rt->itf && rt->itf->phys) ? (int)rt->itf->phys->index : -1,
-				(unsigned int)rt->onif_index,
 				rt->underlying_input_itf ? (int)rt->underlying_input_itf->index : -1,
 				(unsigned int)entry->inPhyPortNum);
 
