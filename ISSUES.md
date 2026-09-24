@@ -240,18 +240,6 @@ result independently of those temporary files.
   both sets inside `CDX_MC_MAX_LISTENERS`. Deferred rather than guessed at.
   See the [routed multicast design](docs/flowtable/multicast-routed.md).
 
-- [ ] **A187 — `display_l3hdr_insert_opc()` decodes the wrong bits of the tunnel insert word.**
-  `patches/kernel/010-ask-fman-dpaa-ehash.patch`, the debug decoder for
-  `INSERT_L3_HDR`: the encoder writes the first word big-endian with the mode at
-  bits 25-24 and inherited traffic class at bit 27, but the decode prints `df`
-  from bit 28 (which is `calc_cksum`) and `cs` from bit 29 (reserved), and reads
-  `stats_ptr` through the little-endian bitfield arm, byte-reversed on an LE
-  host. `hdr_len` and the mode happen to land right. Debug-path only (the
-  `display_*` decoders run under CDX_DPA_DEBUG), no runtime effect; found while
-  building `tools/host_tests/test_tunnel_hm.py`, which pins only the correct
-  fields. Fix the bit positions and the stats-pointer read when 010 is next
-  touched.
-
 - [ ] **A186 — a tunnel over a PPPoE session is refused rather than offloaded.**
   `cdx/ask_flowtable.c` `ft_parse`: a 6o4/4o6 tunnel whose outer packet egresses
   over a PPPoE session (6rd or DS-Lite on a PPPoE WAN) is declined to software,
@@ -356,6 +344,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A187.** `display_l3hdr_insert_opc()` decoded the tunnel insert word's flag bits and stats pointer wrongly —
+  fixed (_:/^cdx: decode the tunnel insert word's flag bits and stats pointer_).
 
 - [x] **A197.** Two later upstream flowtable lifetime fixes (2014ac62df9d, e75a9fa1d44b) were missing from the tree —
   backported as patch 145 (_:/^netfilter: backport two upstream flowtable lifetime fixes_).

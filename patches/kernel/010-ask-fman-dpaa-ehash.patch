@@ -1,4 +1,4 @@
-From 2c860b115dcda6cf8feb0eb1ed6b3a0948fa012e Mon Sep 17 00:00:00 2001
+From 8430fecfd664a7fc6a12415af19b955537fd886a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -123,7 +123,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +--
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1468 ++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1472 ++++++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
@@ -163,7 +163,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   35 +-
- 81 files changed, 9195 insertions(+), 5157 deletions(-)
+ 81 files changed, 9199 insertions(+), 5157 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -11818,10 +11818,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..28e20cb1b43b
+index 000000000000..815070ea1660
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1468 @@
+@@ -0,0 +1,1472 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -12932,7 +12932,11 @@ index 000000000000..28e20cb1b43b
 +
 +	printk("opcode : INSERT_L3_HDR - ");
 +	param = (struct en_ehash_insert_l3_hdr *)ptr;
-+	word = cpu_to_be32(param->word);
++	/* Both words are big-endian: flags and type in bits 31..24 of the
++	 * first (calc_cksum 28, qos 27, df 26, type 25..24), and the 24-bit
++	 * statistics pointer in the low bits of the second. The bitfield
++	 * arms only line up on a big-endian host, so decode by shift. */
++	word = be32_to_cpu(param->word);
 +	switch ((word >> 24) & 3) {
 +
 +		case TYPE_4o6:
@@ -12946,11 +12950,11 @@ index 000000000000..28e20cb1b43b
 +			break;
 +	}
 +	printk("hdr len %d\n", param->hdr_len);
-+	printk("df %d, qos %d, cs %d\n", 
-+		((word >> 28) & 1),
++	printk("df %d, qos %d, cs %d\n",
++		((word >> 26) & 1),
 +		((word >> 27) & 1),
-+		((word >> 29) & 1));
-+	printk("stats ptr %x\n", param->stats_ptr);
++		((word >> 28) & 1));
++	printk("stats ptr %x\n", be32_to_cpu(param->word_1) & 0xffffff);
 +	disp_buf(&param->l3hdr[0], param->hdr_len);
 +	return ((uint8_t *)ptr + 
 +		ALIGN((sizeof(struct en_ehash_insert_l3_hdr) + 

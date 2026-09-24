@@ -133,7 +133,7 @@ static void check_insert(unsigned mode, uint8_t tunnel_flags,
     const unsigned tos = mode == TNL_MODE_4O6 && (tunnel_flags & INHERIT_TC);
     const unsigned type = mode == TNL_MODE_6O4 ? TYPE_6o4 : TYPE_4o6;
     uint8_t expected[8];
-    char head[64], dump[256];
+    char head[160], dump[256];
 
     memset(bytes, 0xa5, sizeof(bytes));
     info.l3_info.mode = (uint8_t)mode;
@@ -173,19 +173,45 @@ static void check_insert(unsigned mode, uint8_t tunnel_flags,
     assert(info.eth_type == (mode == TNL_MODE_6O4 ? ETHERTYPE_IPV4 : ETHERTYPE_IPV6));
     assert(info.tnl_hdr_size == 3 + header_size);
 
-    /* The debug decode, for the fields it reads the way the encoder writes
-     * them: the opcode, the tunnel type, the header length and where the next
-     * opcode's parameters begin. Its remaining lines -- the don't-fragment and
-     * checksum flags and the statistics pointer -- read bit positions and a
-     * bitfield arm that do not correspond to what create_tunnel_insert_hm()
-     * writes on a little-endian host, so they are deliberately not pinned. */
+    /* The debug decode reads every field back the way the encoder wrote it:
+     * the opcode, the tunnel type, the header length, the don't-fragment,
+     * traffic-class and checksum bits (26, 27 and 28 of the big-endian
+     * word), the 24-bit statistics pointer, and where the next opcode's
+     * parameters begin. */
     display_log[0] = 0;
     assert(display_l3hdr_insert_opc(bytes + 1) == bytes + 1 + size);
-    snprintf(head, sizeof(head), "opcode : INSERT_L3_HDR - TYPE_%s\nhdr len %u\n",
-             mode == TNL_MODE_6O4 ? "6o4" : "4o6", header_size);
+    snprintf(head, sizeof(head),
+             "opcode : INSERT_L3_HDR - TYPE_%s\nhdr len %u\n"
+             "df 0, qos %u, cs 0\nstats ptr %x\n",
+             mode == TNL_MODE_6O4 ? "6o4" : "4o6", header_size, tos, pointer);
     assert(strncmp(display_log, head, strlen(head)) == 0);
     expect_dump(dump, sizeof(dump), info.l3_info.header, header_size);
     assert(strstr(display_log, dump));
+}
+
+/* The encoder never sets the don't-fragment or checksum bits, so decode a
+ * word that does: each flag on its own, with the pointer's top byte set so a
+ * byte-reversed read of the second word cannot pass either. */
+static void check_decode_flags(void)
+{
+    static const struct { uint8_t byte0; const char *flags; } cases[] = {
+        {TYPE_6o4 | 1u << 2, "df 1, qos 0, cs 0\n"},
+        {TYPE_6o4 | 1u << 3, "df 0, qos 1, cs 0\n"},
+        {TYPE_6o4 | 1u << 4, "df 0, qos 0, cs 1\n"},
+    };
+    uint8_t param[8 + 4];
+    unsigned i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        memset(param, 0, sizeof(param));
+        param[0] = cases[i].byte0;
+        param[1] = 4;
+        param[5] = 0xab; param[6] = 0xcd; param[7] = 0xef;
+        display_log[0] = 0;
+        assert(display_l3hdr_insert_opc(param) == param + sizeof(param));
+        assert(strstr(display_log, cases[i].flags));
+        assert(strstr(display_log, "stats ptr abcdef\n"));
+    }
 }
 
 int main(void)
@@ -200,6 +226,7 @@ int main(void)
     assert(sizeof(struct en_ehash_remove_first_ip_hdr) == 4);
     assert(sizeof(struct en_ehash_insert_l3_hdr) == 8);
     assert(sizeof(struct en_ehash_stats) == 16);
+    check_decode_flags();
 
     /* The strip. Its only parameter is the record pointer and the flag that
      * copies the outer DSCP over the inner one. */
