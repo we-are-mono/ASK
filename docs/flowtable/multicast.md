@@ -692,12 +692,16 @@ tag the root is keyed on, and the routed copies, included — with nothing to
 decide: only the port's queues changed, not where the stream goes. That holds
 while the worker has the flow in hand, because the worker keeps the flow's
 entry and its recorded chain until it is inside its own transaction, and
-records what it built before leaving it. A flow the drain cannot vouch for —
-its recorded chain lost a device, or the replace failed and left the old chain
-in place — is handed to the worker and reported, and the map stays claimed
-until the next port asking for it finds the drain done. The worker's own
-failed replace withdraws the flow to software in the same pass, so that wait
-never runs to the retries the refresh paces.
+records what it built before leaving it. It holds for a flow being retired
+too: the drain can only answer for flows it finds on the list, so the worker
+takes a flow off the list and its entry out of the hardware in one
+transaction hold, and the drain sees the flow either still listed — and
+rebuilds it — or already gone from the hardware. A flow the drain cannot
+vouch for — its recorded chain lost a device, or the replace failed and left
+the old chain in place — is handed to the worker and reported, and the map
+stays claimed until the next port asking for it finds the drain done. The
+worker's own failed replace withdraws the flow to software in the same pass,
+so that wait never runs to the retries the refresh paces.
 
 A VLAN change on the bridge, whether a port's membership, the bridge's own,
 its filtering or its protocol, marks every flow on that bridge. The worker

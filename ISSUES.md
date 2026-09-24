@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A261.** Multicast listener entries kept the queue and DSCP-map bit of when they were built, so an HTB tree or DSCP map change left groups on a dead queue or another port's map —
+  fixed (_:/^flowtable: retire a multicast entry in the transaction that unlists it_).
+
 - [x] **A272.** Routed multicast in hardware reached every MFC oif, bypassing forward-chain drops (fw4's WAN-to-LAN policy) and a host membership's loopback copy —
   fixed (_:/^flowtable: never take a ruleset still being applied as settled_).
 

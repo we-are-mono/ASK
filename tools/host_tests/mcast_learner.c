@@ -407,13 +407,18 @@ static void rtnl_lock(void) { assert(!rtnl && !in_transaction && !ft_mc_lock); r
 static void rtnl_unlock(void) { assert(rtnl && !caller_rtnl); rtnl = 0; }
 /* Something that gets the transaction just before whoever asks for it next,
  * run once: a tc command's egress change and drain, or a device going away,
- * landing while the worker waits for the transaction with a flow it picked. */
+ * landing while the worker waits for the transaction with a flow it picked.
+ * `before_begin_skip` lets that many transactions go by first: a worker pass
+ * takes one to retire before any it builds in. */
 static void (*before_begin)(void);
+static unsigned before_begin_skip;
 static void recorded_chains_name_live_devices(void);
 static void cdx_ft_begin(void)
 {
     assert(!in_transaction && !ft_mc_lock && (!rtnl || caller_rtnl));
-    if (before_begin) {
+    if (before_begin && before_begin_skip) {
+        before_begin_skip--;
+    } else if (before_begin) {
         void (*run)(void) = before_begin;
 
         before_begin = NULL;
@@ -2155,6 +2160,23 @@ static void tc_changes_and_drains(void)
     tc_end();
 }
 
+/* A tc command draining a port whose change was marked earlier, run as the
+ * transaction's next taker: what the drain said, what it replaced, and how
+ * many entries built before the last change it left in the hardware. */
+static unsigned stale_live;
+static void tc_drains_and_counts(void)
+{
+    unsigned before = replaces;
+
+    tc_begin();
+    drain_rc = ft_mc_egress_drain(drain_port);
+    drain_replaces = replaces - before;
+    stale_live = 0;
+    for (unsigned i = 0; i < ARRAY_SIZE(entries); i++)
+        stale_live += entries[i].live && entries[i].built_at < ft_egress_changes;
+    tc_end();
+}
+
 /* P2 starts unregistering and its event runs, under RTNL of its own. */
 static void p2_goes(void)
 {
@@ -2255,6 +2277,7 @@ static void the_worker_records_what_the_drain_replays(void)
     drain_port = &P2;
     drain_rc = 1;
     before_begin = tc_changes_and_drains;
+    before_begin_skip = 1;
     ft_mc_work_fn(NULL);
     assert(!before_begin && !drain_rc && drain_replaces == 1);
     assert(!memcmp(drained_with.src_mac, SENDER, ETH_ALEN));
@@ -2305,6 +2328,7 @@ static void the_worker_records_what_the_drain_replays(void)
      * the chain without P2. */
     f->stale = true;
     before_begin = p2_goes;
+    before_begin_skip = 1;
     r0 = replaces;
     ft_mc_work_fn(NULL);
     assert(!before_begin && replaces == r0 + 2 && f->hw && !f->ports);
@@ -2312,11 +2336,26 @@ static void the_worker_records_what_the_drain_replays(void)
     assert(same_chain(&f->hw_spec, &f->hw->chain));
     P2.reg_state = NETREG_REGISTERED;
 
-    /* Nothing names the flow now -- P2's membership went with P2 -- so the
-     * route going retires it, entry and all. */
+    /* ---- a flow retired while the DSCP map leaves its port ----------------
+     *
+     * Nothing names the flow now but the route -- P2's membership went with
+     * P2 -- so the route going retires it, entry and all. The change marks
+     * it first, and a tc command's drain gets the transaction before the
+     * worker's retirement does. The flow leaves the list only in the
+     * transaction hold that takes its entry out of the hardware, so the
+     * drain finds it still listed and rebuilds it: it never answers for an
+     * entry it did not see. */
+    tc_begin();
+    egress_changed(&P3);
+    tc_end();
+    assert(f->egress_stale && f->hw && f->hw->built_at < ft_egress_changes);
     d0 = dels;
+    drain_port = &P3;
+    drain_rc = 1;
+    before_begin = tc_drains_and_counts;
     ft_mc_route_withdraw(&r1);
     ft_mc_work_fn(NULL);
+    assert(!before_begin && !drain_rc && drain_replaces == 1 && !stale_live);
     assert(!flow(&P1, S, 289) && !ft_mc_flow_count && dels == d0 + 1);
     reset();
 }

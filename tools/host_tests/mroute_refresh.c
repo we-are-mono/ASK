@@ -248,8 +248,6 @@ static void rtnl_unlock(void)
         rtnl = 0;
     }
 }
-static void cdx_ft_begin(void) { assert((!rtnl || caller_rtnl) && !ctrl && !ft_mr_lock); ctrl = 1; }
-static void cdx_ft_end(void) { assert(ctrl); ctrl = 0; }
 /* Egress changes, counted by ft_egress_changed() before any learner walks
  * its groups, and this learner's half of the walk. */
 static s64 ft_egress_changes;
@@ -263,6 +261,31 @@ static void egress_change(struct net_device *dev)
 }
 /* A change landing while the worker is deciding or programming a group. */
 static struct net_device *change_during_derive, *change_during_program;
+/* A tc command that gets the transaction just before its next taker, holding
+ * RTNL of its own, and drains a port whose change was marked earlier. What
+ * the drain said, and whether it left installed an entry built before the
+ * last change, are kept for a case to read. */
+static struct net_device *drain_first;
+static int drain_first_rc;
+static bool drain_first_left_stale;
+static void cdx_ft_begin(void)
+{
+    assert((!rtnl || caller_rtnl) && !ctrl && !ft_mr_lock);
+    if (drain_first) {
+        struct net_device *dev = drain_first;
+
+        drain_first = NULL;
+        rtnl = 1;
+        caller_rtnl = true;
+        drain_first_rc = ft_mr_egress_drain(dev);
+        drain_first_left_stale = hardware.live &&
+                                 hardware.built_at < ft_egress_changes;
+        caller_rtnl = false;
+        rtnl = 0;
+    }
+    ctrl = 1;
+}
+static void cdx_ft_end(void) { assert(ctrl); ctrl = 0; }
 static void dev_hold(struct net_device *d) { d->refs++; }
 static void dev_put(struct net_device *d) { assert(d->refs); d->refs--; }
 static void mr_cache_put(struct mr_mfc *c) { assert(c->refs); c->refs--; }
@@ -1204,11 +1227,32 @@ int main(void)
         out_bridged = false;
     }
 
+    /* Deleting the route while a port it copies out of changes its egress:
+     * the change marks the group, and a tc command's drain gets the
+     * transaction before the worker's retirement does. The group leaves the
+     * list only in the transaction hold that takes its entry out of the
+     * hardware, so the drain finds it still listed and rebuilds it; it never
+     * answers for an entry it did not see. */
+    {
+        unsigned deleted = deletes;
+
+        rtnl_lock();
+        caller_rtnl = true;
+        egress_change(&output[0]);
+        caller_rtnl = false;
+        rtnl_unlock();
+        assert(g->egress_stale && hardware.live);
+        g->gone = true;
+        drain_first = &output[0];
+        drain_first_rc = 1;
+        run();
+        assert(!drain_first && !drain_first_rc && !drain_first_left_stale);
+        assert(deletes == deleted + 1);
+    }
+
     /* Deleting the route leaves no hardware key, port or MFC reference, and
      * no watch: the forwarding check goes with the last group of its
      * family. */
-    g->gone = true;
-    run();
     assert(!hardware.live && !cache.refs && !input.refs);
     assert(!cache.mfc_flags && !ft_mr_count && !ft_mr_installed);
     assert(!ft_mr_watch_count[0] && !confirm_hooked[0]);

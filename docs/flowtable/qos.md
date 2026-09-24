@@ -1664,7 +1664,12 @@ the transaction that built it — ingress tags, the sender and the routed copies
 included — with nothing to decide. That covers a group a worker has picked and
 is deciding, which is the usual case: each worker keeps a group's entry and
 recorded spec until it is inside its own transaction, and records what it
-built before leaving it. A group `drain()` cannot vouch for — the spec went
+built before leaving it. A group being retired — a bridged flow with no
+member left, or a routed group whose MFC entry is deleted — leaves the list
+and the hardware in one transaction hold, and a routed group that has only
+lost its last listener stays listed while its build's own transaction deletes
+the entry. So `drain()`, which can only answer for what it finds listed, never
+misses an entry still installed. A group `drain()` cannot vouch for — the spec went
 with a device, or the replace failed and left the old chain — holds the map
 as an unfinished drain does and is handed to its worker, whose own failed
 replace withdraws it to software in one pass, leaving nothing reading the

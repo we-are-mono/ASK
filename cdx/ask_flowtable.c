@@ -6788,29 +6788,41 @@ static void ft_mc_work_fn(struct work_struct *work)
 	}
 
 	/* Match the routed learner's routes against the answers just derived,
-	 * then retire what nothing holds or names any more. */
+	 * then retire what nothing holds or names any more.
+	 *
+	 * A retired flow leaves the list and its entry leaves the hardware in
+	 * one transaction hold. Everything else that has to know every entry
+	 * still installed -- the egress drain above all, which vouches that no
+	 * entry built before an egress change is left -- takes the transaction
+	 * and reads the list, so it sees the flow either still listed or
+	 * already out of the hardware, never gone from the list with its entry
+	 * still installed. ft_mc_lock is held only for the lists, not for the
+	 * hardware: nothing but this worker reaches a flow once it is off
+	 * them. */
+	cdx_ft_begin();
 	mutex_lock(&ft_mc_lock);
 	if (!ft_mc_stopping)
 		ft_mc_match_routes();
 	ft_mc_retire(&dead, &gone);
 	mutex_unlock(&ft_mc_lock);
-
-	list_for_each_entry_safe(g, gtmp, &dead, list) {
-		list_del(&g->list);
-		ft_mc_group_free(g);
-	}
-	list_for_each_entry_safe(f, ftmp, &gone, list) {
+	list_for_each_entry(f, &gone, list) {
 		if (f->hw) {
 			/* Even while stopping. Skipping the delete would strand
 			 * the classifier entry, its group id and its listener
 			 * chain in hardware with nothing left to own them --
 			 * this flow is already off the list ft_mc_exit()
 			 * drains, so nobody else would ever see it. */
-			cdx_ft_begin();
 			cdx_mc_group_del(&f->hw);
-			cdx_ft_end();
 			ft_mc_installed--;
 		}
+	}
+	cdx_ft_end();
+
+	list_for_each_entry_safe(g, gtmp, &dead, list) {
+		list_del(&g->list);
+		ft_mc_group_free(g);
+	}
+	list_for_each_entry_safe(f, ftmp, &gone, list) {
 		list_del(&f->list);
 		ft_mc_flow_free(f);
 	}
@@ -7564,7 +7576,8 @@ static unsigned int ft_mc_egress_mark(const struct net_device *dev)
  * with the flow's own ingress tag and sender -- is replaced by itself, which
  * builds every listener entry against the port as it is now. Transaction
  * first and ft_mc_lock inside it, the order the worker records in, so an entry
- * is never seen here half built.
+ * is never seen here half built -- nor retired from the list with its entry
+ * still installed, which the worker does in one transaction hold.
  *
  * A flow this cannot vouch for is handed to the worker and reported with
  * -EAGAIN: its recorded chain lost a device, whose own event has already
@@ -9784,7 +9797,10 @@ static unsigned int ft_mr_egress_mark(const struct net_device *dev)
  * the spec it was built from, recorded whole, ingress tags included, its
  * devices still pinned by the installed set -- which rebuilds every listener
  * entry against the port as it is now. Transaction first and ft_mr_lock
- * inside it, the order /proc takes them in.
+ * inside it, the order /proc takes them in. A group the kernel deleted leaves
+ * the list and the hardware in one transaction hold (ft_mr_work_fn(), step
+ * 4), so none is missed here for being off the list with its entry still
+ * installed.
  *
  * That holds for a group the worker is deciding too, which is the common case:
  * the refresh keeps the worker busy, and a worker that picked a group is
@@ -10030,6 +10046,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 {
 	struct ft_mr_group *g, *tmp;
 	struct ft_mr_event *ev;
+	bool retiring = false;
 	LIST_HEAD(dead);
 
 	/* Registration may replay its dump after a sequence mismatch. Do not
@@ -10079,27 +10096,45 @@ static void ft_mr_work_fn(struct work_struct *work)
 	if (!READ_ONCE(ft_mr_stopping))
 		ft_mr_publish_taps();
 
-	/* 4. Entries the kernel has deleted. */
+	/* 4. Entries the kernel has deleted. Off the list and out of the
+	 * hardware in one transaction hold, for the reason the bridged learner
+	 * retires its flows that way: the egress drain reads the list under
+	 * the transaction, and a group gone from it with its entry still
+	 * installed is one the drain would vouch for without having seen.
+	 * Only this worker marks a group gone, so the look beforehand, which
+	 * spares a pass with nothing to retire the transaction, cannot miss
+	 * one. */
 	mutex_lock(&ft_mr_lock);
-	list_for_each_entry_safe(g, tmp, &ft_mr_groups, list) {
-		if (!g->gone)
-			continue;
-		list_move(&g->list, &dead);
-		ft_mr_count--;
-	}
+	list_for_each_entry(g, &ft_mr_groups, list)
+		if (g->gone) {
+			retiring = true;
+			break;
+		}
 	mutex_unlock(&ft_mr_lock);
-	list_for_each_entry_safe(g, tmp, &dead, list) {
-		if (g->hw) {
+	if (retiring) {
+		cdx_ft_begin();
+		mutex_lock(&ft_mr_lock);
+		list_for_each_entry_safe(g, tmp, &ft_mr_groups, list) {
+			if (!g->gone)
+				continue;
+			list_move(&g->list, &dead);
+			ft_mr_count--;
+		}
+		mutex_unlock(&ft_mr_lock);
+		list_for_each_entry(g, &dead, list) {
+			if (!g->hw)
+				continue;
 			/* Even while stopping: this group is already off the
 			 * list ft_mr_exit() drains, so leaving it would strand
 			 * the entry, its group id and its listener chain with
 			 * nothing left to own them. */
-			cdx_ft_begin();
 			cdx_mc_group_del(&g->hw);
-			cdx_ft_end();
 			ft_mr_installed--;
 			ft_mr_key_freed = true;
 		}
+		cdx_ft_end();
+	}
+	list_for_each_entry_safe(g, tmp, &dead, list) {
 		list_del(&g->list);
 		ft_mr_group_free(g);
 	}
