@@ -65,7 +65,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://090-qbman-dpa_alloc-preallocate-nodes.patch \
            file://091-sdk_dpaa-dpa_get_channel-use-mutex.patch \
            file://092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch \
-           file://093-netlink-name-L2FLOW-cb-mutex.patch \
+           file://093-netlink-name-every-cb-mutex-class.patch \
            file://094-sdk-fman-dpaa-qbman-kasan-sanitize-off.patch \
            file://096-sdk_fman-mac-hash-alloc-null-check.patch \
            file://097-xfrm-trans-queue-force-dst-refcount.patch \

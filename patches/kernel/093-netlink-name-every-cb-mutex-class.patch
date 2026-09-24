@@ -1,16 +1,15 @@
-From ab592a3ae09afe7d17398adf1813c057144affc5 Mon Sep 17 00:00:00 2001
+From 6a5222fb6c01f51bbf492c52d19f7a6ed54633a0 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] netlink: name every cb_mutex lock class up to MAX_LINKS
 
 The ASK patch that raised MAX_LINKS from 32 to 64 left the lockdep name
-table for the per-protocol cb_mutex at its upstream length, so the first
-version of this change named only the two protocols ASK itself uses
-(NETLINK_KEY = 32, NETLINK_L2FLOW = 33) and every slot above them stayed
-NULL. That is not a cosmetic gap: lockdep_init_map_type() refuses a
-nameless class with DEBUG_LOCKS_WARN_ON, which calls debug_locks_off() --
-lockdep is disabled for the rest of the boot and the console log level is
-raised to 15. The Wi-Fi driver creates its socket at NETLINK_NXP =
+table for the per-protocol cb_mutex at its upstream length, so every
+slot above 31 stayed NULL. That is not a cosmetic gap:
+lockdep_init_map_type() refuses a nameless class with
+DEBUG_LOCKS_WARN_ON, which calls debug_locks_off() -- lockdep is
+disabled for the rest of the boot and the console log level is raised
+to 15. The Wi-Fi driver creates its socket at NETLINK_NXP =
 MAX_LINKS - 1, so a debug kernel with moal loaded ran without lockdep
 from 29 seconds after boot, with every KERN_INFO line on the serial
 console.
@@ -21,19 +20,19 @@ Name the whole range; the sentinel stays last, at index MAX_LINKS.
  1 file changed, 36 insertions(+)
 
 diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
-index e250d4a3d030..630d57d08f31 100644
+index e250d4a3d030..69d5684887ab 100644
 --- a/net/netlink/af_netlink.c
 +++ b/net/netlink/af_netlink.c
 @@ -127,6 +127,42 @@ static const char *const nlk_cb_mutex_key_strings[MAX_LINKS + 1] = {
  	"nlk_cb_mutex-29",
  	"nlk_cb_mutex-30",
  	"nlk_cb_mutex-31",
-+	"nlk_cb_mutex-KEY",        /* NETLINK_KEY = 32 */
-+	"nlk_cb_mutex-L2FLOW",     /* NETLINK_L2FLOW = 33 (ASK) */
 +	/* MAX_LINKS is 64 here, not 32, and every slot needs a name: a NULL
 +	 * makes lockdep_init_map_type() WARN, which turns lockdep off for the
 +	 * rest of the boot and sets the console to motormouth. The Wi-Fi
 +	 * driver's socket sits at MAX_LINKS - 1. */
++	"nlk_cb_mutex-32",
++	"nlk_cb_mutex-33",
 +	"nlk_cb_mutex-34",
 +	"nlk_cb_mutex-35",
 +	"nlk_cb_mutex-36",

@@ -1,4 +1,4 @@
-From cd583a55880e87fb2af2faeb2ec0a4acb01584ea Mon Sep 17 00:00:00 2001
+From 17f47b1b7575533ebe6bb83205f1971c687b61f1 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -24,8 +24,8 @@ failed-init unwind — can free module text safely and a later load can
 register again. Datapath readers take a READ_ONCE snapshot instead of
 re-reading the global across the NULL check and the call.
 
-Also ships the NETLINK_FF=30, NETLINK_KEY=32, NETLINK_L2FLOW=33 protocol
-reservations in UAPI.
+Also raises MAX_LINKS in UAPI from 32 to 64; the Wi-Fi driver opens its
+socket at MAX_LINKS - 1.
 
 Compiles warning-free: cross-TU APIs are declared in their owning
 headers (fm_ehash.h, fm_cc.h, fm_kg.h, fm_port_ext.h, fsl_fman_port.h,
@@ -154,13 +154,13 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../linux/fmd/Peripherals/fm_pcd_ioctls.h     |   57 +-
  .../linux/fmd/Peripherals/fm_port_ioctls.h    |   18 +-
  include/uapi/linux/if.h                       |    1 +
- include/uapi/linux/netlink.h                  |    6 +-
+ include/uapi/linux/netlink.h                  |    2 +-
  net/Kconfig                                   |    9 +
  net/core/dev.c                                |   61 +-
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 81 files changed, 9039 insertions(+), 5159 deletions(-)
+ 81 files changed, 9035 insertions(+), 5159 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -18215,21 +18215,15 @@ index 797ba2c1562a..1fd18997282c 100644
  		IFF_MASTER|IFF_SLAVE|IFF_RUNNING|IFF_LOWER_UP|IFF_DORMANT)
  
 diff --git a/include/uapi/linux/netlink.h b/include/uapi/linux/netlink.h
-index f87aaf28a649..b21fa5669175 100644
+index f87aaf28a649..ac5461d57fb0 100644
 --- a/include/uapi/linux/netlink.h
 +++ b/include/uapi/linux/netlink.h
-@@ -30,9 +30,13 @@
- #define NETLINK_CRYPTO		21	/* Crypto layer */
- #define NETLINK_SMC		22	/* SMC monitoring */
+@@ -32,7 +32,7 @@
  
-+#define NETLINK_FF              30
-+#define NETLINK_KEY             32
-+#define NETLINK_L2FLOW          33
-+#define MAX_LINKS 64
-+
  #define NETLINK_INET_DIAG	NETLINK_SOCK_DIAG
  
 -#define MAX_LINKS 32		
++#define MAX_LINKS 64
  
  struct sockaddr_nl {
  	__kernel_sa_family_t	nl_family;	/* AF_NETLINK	*/
