@@ -152,17 +152,6 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A201 — oversized IPv6 into an SA is unmeasured.** The A198 bound does
-  not cover a transform: `ip6_dst_mtu_maybe_forward()` ignores the bundle's
-  unlocked `RTAX_MTU`, so an IPv6 direction into an SA carries its outer
-  device's MTU and is admitted, while software would send Packet Too Big at
-  `dst_mtu(bundle)` (`xfrm6_tunnel_check_size`). The entry is programmed with
-  the port MTU plus the ESP expansion (`cdx/cdx_flowtable_hw.c`), and no rig case
-  sends a full-size IPv6 inner packet into an SA. Measure it (`/proc/ucode_frag/stats`,
-  Packet Too Big or not): if the microcode fragments the inner packet, bound
-  `sa_handle` directions by `dst_mtu(cls->nf_dst)` at admission and in
-  `ft_stats`, and `in_sa` ones by the reverse bundle's.
-
 - [ ] **A196 — oversized multicast replicas are fragmented by the microcode.**
   A multicast member's entry has no preemptive-check op
   (`fill_mcast_member_actions()` in `cdx/cdx_ehash.c` starts from a fresh
@@ -306,6 +295,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A201.** Oversized IPv6 into an SA was unmeasured — measured: SEC encrypts it whole and only the outer IPv4 packet is fragmented, so no bound
+  is needed (_:/^tests: measure what an oversized IPv6 packet into an SA becomes_).
 
 - [x] **A210.** Offloaded SAs started at sequence zero with a fixed 64-entry window, and SEC's numbering never reached xfrm —
   fixed (_:/^cdx: carry the IPsec starting sequence and replay window to SEC_).

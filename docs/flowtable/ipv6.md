@@ -101,8 +101,17 @@ configuration such a network wants anyway, since it is also what spares its
 hosts a Packet Too Big round trip on every new path. An SA does not narrow
 the bound: through a transform a flow's MTU is its outer device's, because
 `ip6_dst_mtu_maybe_forward()` ignores the bundle's unlocked `RTAX_MTU`, so an
-IPv6 direction into an SA is admitted as before (what the microcode then does
-with an oversized one is open, A201). IPv4 is not bounded: the microcode
+IPv6 direction into an SA is admitted as before. Its entry carries the port's
+MTU plus the ESP expansion, so a packet that fits the port but not the bundle
+(1438 for AES-CBC and a 128-bit HMAC-SHA256 tag over IPv4) is taken by the
+hardware: SEC encrypts the inner packet whole and the microcode fragments the
+outer IPv4 packet, whose DF stays clear because an IPv6 inner packet has none
+to copy. Measured on the DK (`test_flowtable_ipv6_sa.py`): the peer reassembles
+and decrypts every such packet exactly once, the microcode counts two IPv4
+fragments and no IPv6 ones, and no Packet Too Big is sent. The inner packet is
+never fragmented, which is what bounding exists to prevent -- a router must not
+fragment IPv6 -- and post-encryption fragmentation is what Linux itself does
+for an IPv4 inner packet without DF, so the direction stays in hardware. IPv4 is not bounded: the microcode
 fragments a packet without DF as a Linux router would, and excepts one with DF
 for Linux's ICMP.
 
