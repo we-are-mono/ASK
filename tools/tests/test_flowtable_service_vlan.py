@@ -7,6 +7,7 @@ import os
 import struct
 import time
 
+import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
@@ -137,6 +138,61 @@ def balanced(state, errors):
     assert state["errors"] == errors and state["fatal"] == state["quarantine"] == 0, state
     assert state["installs"] - state["deletes"] == state["entries"], state
     assert state["entries"] == state["handle_refs"] == state["neighbour_refs"] == len(state["flows"]), state
+
+
+def vlan_row(state):
+    rows = [v for v in state["vlans"] if v["dev"] == DUT_IF]
+    assert len(rows) == 1, (DUT_IF, state["vlans"])
+    return rows[0]
+
+
+@pytest.mark.parametrize("target", ["dev-stats", "hardware"])
+async def test_flowtable_service_vlan_admission_failslab(vlan_service, target):
+    """A tagged direction's admission takes a reference on its VLAN device's
+    statistics record before the hardware entry exists, which no untagged flow
+    does. A hardware failure after that has to hand the reference back, and the
+    connection recovers by traffic alone. A failure creating the record itself
+    is not an admission failure: that direction forwards in hardware and
+    counts nowhere, which the record's references and counters both show.
+    Untagged controls are undisturbed either way."""
+    from test_flowtable_failslab import slab_fault
+
+    r = vlan_service
+    vlan = {"lan": ADDRESS, "netns": NETNS}
+    flows = [
+        {"id": 0, "proto": "udp", "sport": FIRST, "lan": r.lan_ip},
+        {"id": 1, "proto": "tcp", "sport": FIRST, "lan": r.lan_ip},
+        {"id": 2, "proto": "udp", "sport": FIRST, **vlan},
+    ]
+    service = await supervision_status(r)
+    async with peer(r, flows, initial_ids=[0, 1], lease=300) as p:
+        await warm(r, p, [0, 1], "vlan-slab-baseline", flows[:2])
+        before = await hardware(r, p, "vlan-slab-baseline-hardware", flows[:2])
+        assert not tagged(before) and before["vlan_records"] == r.service_vlan_records_before, before
+        async with slab_fault(r, target, "vlan-" + target) as fault:
+            started = time.monotonic()
+            await p.rpc("open", [2])
+            await p.batch([2], count=32, interval=0.01)
+            hit = await fault.hit()
+            admitted = await warm(r, p, [0, 1, 2], "vlan-slab-readmitted", flows[:3])
+            assert time.monotonic() - started < 20, admitted
+        counted = vlan_row(await r.state())
+        after = await hardware(r, p, "vlan-slab-hardware", flows[:3])
+        unchanged(before, after, [0, 1], flows)
+        balanced(after, before["errors"])
+        assert tagged(after) and after["vlan_records"] == r.service_vlan_records_before + 1, after
+        # One half of the record strips the tag and the other inserts it, and
+        # the hardware burst moved each direction of the tagged flow by 256.
+        row = vlan_row(after)
+        assert row["slot"] == "yes", row
+        moved = {half: int(row[half + "_packets"]) - int(counted[half + "_packets"])
+                 for half in ("rx", "tx")}
+        if target == "dev-stats":
+            assert row["refs"] == "1" and sorted(moved.values()) == [0, 256], (counted, row)
+        else:
+            assert row["refs"] == "2" and moved == {"rx": 256, "tx": 256}, (counted, row)
+        assert await supervision_status(r) == service
+        r.record("vlan-" + target + "-recovery", {"before": before, "after": after, "hit": hit})
 
 
 async def test_flowtable_service_vlan_recreation(vlan_service):

@@ -35,6 +35,7 @@ import pathlib
 import re
 import socket
 import subprocess
+import time
 
 import pytest
 import pytest_asyncio
@@ -915,6 +916,68 @@ async def test_flowtable_pppoe_session_counters(pppoe_rig):
     assert row["refs"] == "0" and row["slot"] == "yes", row
     assert state["session_records"] == 1 and state["session_slots"] == 1, state
     assert {k: int(row[k]) for k in after} == after, (row, after)
+
+
+@pytest.mark.parametrize("target", ["dev-stats", "hardware"])
+async def test_flowtable_pppoe_admission_failslab(pppoe_rig, target):
+    """A session direction's admission takes a reference on the ppp device's
+    statistics record before its hardware entry exists. A hardware failure
+    after that has to hand the reference back, and the connection recovers by
+    traffic alone. A failure creating the record itself is not an admission
+    failure: that direction forwards in hardware and counts nowhere, which the
+    record's references and counters both show."""
+    from test_flowtable_failslab import slab_fault
+    from test_flowtable_service import FAULT_DIR
+
+    r = pppoe_rig
+    # The guard is staged and cancelled over the DUT console; no service
+    # fixture runs here to own the directory it lives in.
+    r.service_console = r.console
+    await console_command(r.console, "rm", "-rf", FAULT_DIR)
+    await console_command(r.console, "mkdir", FAULT_DIR)
+    try:
+        initial = await r.state()
+        await r.table()
+        async with slab_fault(r, target, "pppoe-" + target) as fault:
+            await r.exchange(count=4)
+            hit = await fault.hit()
+        deadline = time.monotonic() + 20
+        while True:
+            await r.exchange(count=4)
+            state = await r.state()
+            if len(state["flows"]) == 2:
+                break
+            assert time.monotonic() < deadline, state
+    finally:
+        await console_command(r.console, "rm", "-rf", FAULT_DIR, check=False)
+    flows = state["flows"]
+    _assert_session(r, _direction(flows, r.lan_ip, INNER_LOCAL),
+                    _direction(flows, INNER_LOCAL, r.lan_ip))
+    assert state["errors"] == initial["errors"] and state["fatal"] == state["quarantine"] == 0, state
+    assert state["installs"] - state["deletes"] == state["entries"] == 2, state
+    assert state["session_records"] == initial["session_records"] + 1, (initial, state)
+    counted = _session_row(state, r.session_identity)
+    assert counted["slot"] == "yes", counted
+    before = {f["cookie"]: int(f["packets"]) for f in flows}
+    await r.exchange(count=64)
+    state = await r.state()
+    assert {f["cookie"]: int(f["packets"]) - before[f["cookie"]]
+            for f in state["flows"]} == {c: 64 for c in before}, (before, state["flows"])
+    # The forward direction inserts the session header and the reverse one
+    # strips it, and the burst moved each by 64.
+    row = _session_row(state, r.session_identity)
+    moved = {half: int(row[half + "_packets"]) - int(counted[half + "_packets"])
+             for half in ("rx", "tx")}
+    if target == "dev-stats":
+        assert row["refs"] == "1" and sorted(moved.values()) == [0, 64], (counted, row)
+    else:
+        assert row["refs"] == "2" and moved == {"rx": 64, "tx": 64}, (counted, row)
+    r.record("pppoe-" + target + "-recovery", {"initial": initial, "state": state,
+                                               "hit": hit, "row": row})
+    # Retiring the connection returns exactly the references it took.
+    await r.delete_table()
+    row = _session_row(await r.state(), r.session_identity)
+    assert row["refs"] == "0", row
 
 
 async def test_flowtable_pppoe_snat(pppoe_rig):

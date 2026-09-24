@@ -32,6 +32,9 @@ TARGETS = {
     "callback": ("flow_block_cb_alloc", None, SOFTIRQ),
     "entry": ("ft_replace", "ask_flowtable", SOFTIRQ),
     "hardware": ("cdx_ft_hw_add", "cdx", SOFTIRQ),
+    # The per-device statistics record only a VLAN device, PPPoE session or
+    # tunnel needs, allocated as such a direction is admitted.
+    "dev-stats": ("ft_dev_stats_get", "ask_flowtable", SOFTIRQ),
     "work": ("nf_flow_offload_add", "nf_flow_table", None),
     "rule": ("nf_flow_offload_rule_alloc", "nf_flow_table", SOFTIRQ),
     "actions": ("flow_rule_alloc", None, SOFTIRQ),

@@ -205,15 +205,6 @@ result independently of those temporary files.
   withdraw a group, proving the failed delete quarantines rather than frees live
   hardware state and reclaims on the next good barrier.
 
-- [ ] **A192 — VLAN and PPPoE admissions have no allocation-failure coverage.**
-  `test_flowtable_failslab.py` injects failures into plain TCP/UDP admission
-  (work, rule, actions, entry, hardware), and the tunnel, IPsec, IPv6 and
-  multicast service suites have their own, but nothing fails an allocation
-  while admitting a flow whose egress pushes a VLAN tag or a PPPoE session. The
-  deleted `test_vlan_failslab.py` and `test_pppoe_failslab.py` covered those
-  entry builders through FCI. Add stack-filtered failslab cases for both encaps
-  to the flowtable service suites.
-
 - [ ] **A191 — bridged multicast rewrites the source MAC and cannot accept
   tagged ingress.** The listener builders in `cdx/cdx_ehash.c` strip Ethernet
   at the root and insert a literal header carrying the egress port's MAC, which
@@ -324,6 +315,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A192.** VLAN and PPPoE admissions had no allocation-failure coverage —
+  covered (_:/^tests: fail the allocations of tagged and session admissions_).
 
 - [x] **A186.** A 6o4/4o6 tunnel whose outer packets leave by a PPPoE session was refused rather than offloaded —
   fixed (_:/^flowtable: offload a tunnel over a PPPoE session_).
