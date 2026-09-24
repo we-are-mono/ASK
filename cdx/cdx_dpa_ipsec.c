@@ -2525,7 +2525,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		 * May also can be used for orginal interface stats also.
 		 */
 		info->sa_itf_id = itf_id;
-		dpa_get_l2l3_info_by_itf_id( itf_id, &info->l2_info, &info->l3_info, &sa_dir_in );
+		dpa_get_l2l3_info_by_itf_id( itf_id, &info->l2_info, &info->l3_info);
 #ifdef CDX_DPA_DEBUG
 		/*       printk("%s:: Got the table id for portid %d and key type %d as %p \n",
 					__func__, info->port_id, key_info->type, sa->ct->td); */
@@ -2567,7 +2567,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 				goto err_ret;
 			}
 			dpa_get_l2l3_info_by_itf_id( itf_id,
-					&info->l2_info, &info->l3_info,sa_dir_in );
+					&info->l2_info, &info->l3_info);
 		} else {
 */
 		if (dpa_get_out_tx_info_by_itf_id(sa->pRtEntry,

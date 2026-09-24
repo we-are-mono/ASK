@@ -97,20 +97,6 @@ struct oh_iface_info {
         struct cdx_dist_info *dist_info;//pointer to array of pcd dist
 };
 
-//vlan device information
-struct vlan_iface_info {
-	struct dpa_iface_info *parent;
-	uint16_t vlan_id;
-	uint8_t mac_addr[ETH_ALEN]; 	/* Vlan interface mac address */
-};
-
-//pppoe device information
-struct pppoe_iface_info {
-	struct dpa_iface_info *parent;
-	uint16_t session_id;
-	uint8_t mac_addr[ETH_ALEN];
-};
-
 struct wlan_iface_info {
 	/* The device this VAP rides, so a netdev can be resolved back to its
 	 * iface the way an ethernet port can. Borrowed, never dereferenced --
@@ -122,26 +108,6 @@ struct wlan_iface_info {
 	uint32_t fman_idx;
 	uint32_t port_idx;
 	uint32_t portid;
-};
-
-
-//tunnel device information
-struct tunnel_iface_info {
-
-	struct dpa_iface_info *parent;
-	uint8_t mode; /*4o6/6o4/remote_any*/
-	uint8_t proto;
-	uint8_t flags;
-	uint8_t  pad;
-	uint16_t header_size;
-	uint32_t local_ip[4];
-	uint32_t remote_ip[4];
-	uint8_t dstmac[ETH_ALEN];
-	union {
-		uint8_t   header[40];
-		ipv4_hdr_t header_v4;
-		ipv6_hdr_t header_v6;
-	};
 };
 
 struct iface_stats {
@@ -160,11 +126,11 @@ struct dpa_iface_info {
 	uint32_t mtu;		//iface mtu
 
 	uint8_t name[IF_NAME_SIZE]; //name as seen by OS
+	/* Only physical ports register: Ethernet ports, Wi-Fi VAPs and the
+	 * offline ports. A VLAN, PPPoE session or tunnel in front of one is
+	 * described by the flow that crosses it. */
 	union {
 		struct eth_iface_info eth_info; //info if iface type is eth
-		struct vlan_iface_info vlan_info; //info if type is vlan
-		struct pppoe_iface_info pppoe_info; //info if type is pppoe
-		struct tunnel_iface_info tunnel_info; //info if type is tunnel
 		struct wlan_iface_info wlan_info; //internal wlan  info
 		struct oh_iface_info oh_info; //internal oh parsing port info
 

@@ -15,10 +15,8 @@ int dpa_get_fm_port_index(uint32_t itf_index, uint32_t underlying_iif_index ,
 int dpa_get_iface_stats_entries(uint32_t iif_index,
 			uint32_t underlying_iif_index, uint8_t *offset,
 			uint32_t stats_type, uint32_t iface_type);
-int dpa_check_for_logical_iface_types(struct _itf *input_itf, 
-			struct _itf *underlying_input_itf,
-			struct dpa_l2hdr_info *l2_info,
-			struct dpa_l3hdr_info *l3_info);
+int dpa_check_for_logical_iface_types(struct _itf *input_itf,
+			struct dpa_l2hdr_info *l2_info);
 int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				struct dpa_l2hdr_info *l2_info,
 				struct dpa_l3hdr_info *l3_info, uint32_t hash);
@@ -44,4 +42,4 @@ struct dpa_bp* get_ipsec_bp(void);
 struct dpa_bp* get_frag_bp(void);
 void dpa_update_timestamp(uint32_t ts);
 int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
-		struct dpa_l3hdr_info *l3_info, uint32_t *dir_in);
+		struct dpa_l3hdr_info *l3_info);

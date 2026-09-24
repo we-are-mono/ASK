@@ -72,7 +72,6 @@ typedef struct _tCtEntry {
 	union ctentry_qosmark qosmark;
 	U16 status;
 
-	PRouteEntry tnl_route;
 	U16 hSAEntry[SA_MAX_OP];
 
 	U8 fftype;

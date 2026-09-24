@@ -902,15 +902,11 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed
 			break;
 
 		if (info->l2_info.pppoe_present) {
-			struct _itf *itf = NULL;
-
-			if ((entry->pRtEntry->input_itf) && (entry->pRtEntry->input_itf->type & IF_TYPE_PPPOE))
-				itf = entry->pRtEntry->input_itf;
-			else
-				itf = entry->pRtEntry->underlying_input_itf;
-
-			/* strip pppoe hdrs */
-			if (insert_remove_pppoe_hm(info, itf->index))
+			/* strip pppoe hdrs. Only physical ports register as
+			 * interfaces, so the session is the flow's and the port
+			 * under it is the one to name. */
+			if (insert_remove_pppoe_hm(info,
+					entry->pRtEntry->underlying_input_itf->index))
 				break;
 		}
 
@@ -1002,9 +998,9 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed
  * has the concentrator as its destination MAC; writing both keeps this path
  * exercising exactly the branch an interface-derived session does.
  *
- * Refusing a description that already carries tags or a session is deliberate:
- * the interface walk only fills one in for a registered VLAN or PPPoE
- * interface, and a flow naming its own on top of that would describe two.
+ * Refusing a description that already carries tags or a session is a guard:
+ * VLAN and PPPoE interfaces no longer register, so the interface walk never
+ * fills one in, and a flow naming its own on top of one would describe two.
  */
 #ifdef INCLUDE_VLAN_IFSTATS
 /* Whether a flow-described stack names a record for every one of its tags.
@@ -1190,7 +1186,7 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 	}
 
 	if (dpa_get_tx_info_by_itf(entry->pRtEntry, &info->l2_info,
-				&info->l3_info, entry->tnl_route, &entry->qosmark, (uint32_t)entry->hash)) {
+				&info->l3_info, &entry->qosmark, (uint32_t)entry->hash)) {
 		DPA_ERROR("%s::unable to get tx params\n",
 				__func__);
 		goto err_ret;
@@ -1433,7 +1429,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	}
 	
 	if (dpa_get_tx_info_by_itf(entry->pRtEntry, &info->l2_info,
-			&info->l3_info, entry->tnl_route, &entry->qosmark, (uint32_t)entry->hash)) {
+			&info->l3_info, &entry->qosmark, (uint32_t)entry->hash)) {
 		DPA_ERROR("%s::unable to get tx params\n",
 									__func__);
 		goto err_ret;
@@ -2804,7 +2800,7 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 		union ctentry_qosmark qosmark;
 
 		qosmark.markval = 0;
-		if (dpa_get_tx_info_by_itf(pRtEntry, pL2Info, pL3Info, NULL, &qosmark, 0))
+		if (dpa_get_tx_info_by_itf(pRtEntry, pL2Info, pL3Info, &qosmark, 0))
 		{
 			DPA_ERROR("%s::unable to get tx params\n",__func__);
 			goto err_ret;

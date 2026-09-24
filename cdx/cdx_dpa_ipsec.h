@@ -95,7 +95,7 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param);
 void cdx_ipsec_release_sa_resources(PSAEntry pSA);
 int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id,
 				struct dpa_l2hdr_info *l2_info,
-				struct dpa_l3hdr_info *l3_info, uint32_t *dir_in);
+				struct dpa_l3hdr_info *l3_info);
 int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			uint32_t sa_dir_in);
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info);

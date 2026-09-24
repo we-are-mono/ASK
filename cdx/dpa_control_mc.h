@@ -77,7 +77,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *pCtEntry,
 						const struct cdx_l2_encap *in_encap);
 void *dpa_get_pcdhandle(uint32_t fm_index);
 int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
-		struct dpa_l3hdr_info *l3_info, PRouteEntry tnl_rt_entry, void *queinfo, uint32_t hash);
+		struct dpa_l3hdr_info *l3_info, void *queinfo, uint32_t hash);
 void AddToMcastGrpList(struct mcast_group_info *pMcastGrpInfo);
 /* Clears the references the multicast group routes hold on an interface that
  * is being removed; remove_onif_by_index() calls it. Process context only. */
