@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A216.** Devices a path crosses without naming (a VLAN device under a session or tunnel, the ppp device under a tunnel) were neither held nor watched —
+  fixed (_:/^flowtable: hold and watch the devices a path crosses without naming_).
+
 - [x] **A202.** The microcode's IPv4 fragments of a frame received on an Ethernet port carry an all-zero payload, and a UDP direction into a smaller path was offloaded —
   fixed (_:/^flowtable: keep non-TCP IPv4 out of a path smaller than its ingress_).
 

@@ -199,6 +199,17 @@ struct cdx_ft_dev_stats {
 	struct cdx_ft_tunnel tunnel;
 };
 
+/* Per side: a device under a tunnel and one under a session, and every tag's
+ * device. Fewer are ever distinct, since most of these are the same device
+ * seen from two hops or a device the rule already names. */
+#define CDX_FT_CROSSED_MAX (2 * (CDX_FT_VLAN_MAX + 2))
+
+/* What a device is to the installed flows, weakest first: nothing; a device
+ * paths only cross on their way down to a port; some direction's own logical
+ * device or bridge; a port -- bound, or some direction's physical ingress or
+ * egress. How far a change to it reaches follows from which. */
+enum ft_device_role { FT_DEV_UNUSED, FT_DEV_CROSSED, FT_DEV_NAMED, FT_DEV_PORT };
+
 struct cdx_ft_entry {
 	struct list_head list;
 	struct hlist_node cookie_node;
@@ -221,6 +232,15 @@ struct cdx_ft_entry {
 	/* And the tunnel device's, held the same way. */
 	struct cdx_ft_dev_stats *in_tunnel_stats;
 	struct cdx_ft_dev_stats *out_tunnel_stats;
+	/* The devices each side's frames cross that the rule names only by
+	 * index: a VLAN device between the logical device and the port, and
+	 * the ppp device a tunnel runs over. The walk that admitted the
+	 * direction required each of them -- up, carrying the port's address,
+	 * stacked exactly so -- so each is held and watched like the devices
+	 * the rule does name. Kept on the entry for the reason the records
+	 * above are. */
+	struct net_device *crossed[CDX_FT_CROSSED_MAX];
+	unsigned int ncrossed;
 	unsigned long cookie;
 	struct cdx_ft_rule rule;
 	struct cdx_ft_hw *hw;
@@ -369,6 +389,64 @@ static void ft_devices_put(const struct cdx_ft_rule *rule)
 	if (rule->out_logical != rule->out)
 		dev_put(rule->out_logical);
 	dev_put(rule->out);
+}
+
+static bool ft_rule_names(const struct cdx_ft_rule *rule, const struct net_device *dev)
+{
+	return rule->in == dev || rule->out == dev ||
+		rule->in_logical == dev || rule->out_logical == dev ||
+		rule->in_bridge == dev || rule->out_bridge == dev;
+}
+
+/* Hold one device the walk crossed, by the index the rule recorded it under,
+ * unless the rule names it already or it is held for this entry once. Under
+ * the admission's RTNL, the same hold the walk resolved the index under, so it
+ * still names that device. */
+static void ft_crossed_hold(struct cdx_ft_entry *entry, int ifindex)
+{
+	struct net_device *dev;
+	unsigned int i;
+
+	if (!ifindex)
+		return;
+	dev = __dev_get_by_index(&init_net, ifindex);
+	if (!dev || ft_rule_names(&entry->rule, dev))
+		return;
+	for (i = 0; i < entry->ncrossed; i++)
+		if (entry->crossed[i] == dev)
+			return;
+	if (WARN_ON_ONCE(entry->ncrossed == ARRAY_SIZE(entry->crossed)))
+		return;
+	dev_hold(dev);
+	entry->crossed[entry->ncrossed++] = dev;
+}
+
+/* A tag the bridge adds has no device and records index zero. A tunnel's own
+ * device is the logical one, and so is the top of the tag stack whenever
+ * nothing sits above it. */
+static void ft_crossed_hold_all(struct cdx_ft_entry *entry)
+{
+	const struct cdx_ft_rule *rule = &entry->rule;
+	unsigned int i;
+
+	if (rule->out_tunnel.present)
+		ft_crossed_hold(entry, rule->out_tunnel.lower_ifindex);
+	if (rule->out_session.present)
+		ft_crossed_hold(entry, rule->out_session.lower_ifindex);
+	for (i = 0; i < rule->out_vlans; i++)
+		ft_crossed_hold(entry, rule->out_vlan[i].ifindex);
+	if (rule->in_tunnel.present)
+		ft_crossed_hold(entry, rule->in_tunnel.lower_ifindex);
+	if (rule->in_session.present)
+		ft_crossed_hold(entry, rule->in_session.lower_ifindex);
+	for (i = 0; i < rule->in_vlans; i++)
+		ft_crossed_hold(entry, rule->in_vlan[i].ifindex);
+}
+
+static void ft_crossed_put_all(struct cdx_ft_entry *entry)
+{
+	while (entry->ncrossed)
+		dev_put(entry->crossed[--entry->ncrossed]);
 }
 
 /* What the firmware's VLAN opcodes count into a device's record and the
@@ -706,6 +784,7 @@ static int ft_remove(struct cdx_ft_entry *entry)
 	nf_flow_offload_handle_put(entry->handle);
 	ft_handle_refs--;
 	ft_devices_put(&entry->rule);
+	ft_crossed_put_all(entry);
 	kfree(entry);
 	ft_count--;
 	ft_deletes++;
@@ -2325,6 +2404,9 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	nf_flow_offload_handle_get(entry->handle);
 	ft_handle_refs++;
 	ft_devices_hold(&rule);
+	/* Before the watch list can see the entry, so an event on any of them
+	 * finds it from the moment it is published. */
+	ft_crossed_hold_all(entry);
 	rc = ft_neigh_attach(entry);
 	if (!rc) {
 		struct cdx_ft_stats_binding binding;
@@ -2343,6 +2425,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		nf_flow_offload_handle_put(entry->handle);
 		ft_handle_refs--;
 		ft_devices_put(&rule);
+		ft_crossed_put_all(entry);
 		kfree(entry);
 		return ask_refuse(rc);
 	}
@@ -2856,16 +2939,27 @@ static void ft_invalidate_work(struct work_struct *work)
 	cdx_ft_end();
 }
 
+static bool ft_entry_crosses(const struct cdx_ft_entry *entry, const struct net_device *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < entry->ncrossed; i++)
+		if (entry->crossed[i] == dev)
+			return true;
+	return false;
+}
+
 /* Every device a flow's forwarding depends on: both physical ports, both
- * logical devices, and any bridge between them. A VLAN device carries its own
- * MTU and administrative state, and a bridge carries both plus the FDB that
- * chose the egress port, so a flow depends on each exactly as it depends on
- * the physical port underneath. */
+ * logical devices, any bridge between them, and every device the walk crossed
+ * on the way down -- a VLAN device under a session, a tunnel or another tag,
+ * and the ppp device under a tunnel. A VLAN device carries its own MTU and
+ * administrative state, a bridge carries both plus the FDB that chose the
+ * egress port, and a device under a session or a tunnel had to carry the
+ * port's address for the walk to admit the direction, so a flow depends on
+ * each exactly as it depends on the physical port underneath. */
 static bool ft_entry_uses(const struct cdx_ft_entry *entry, const struct net_device *dev)
 {
-	return entry->rule.in == dev || entry->rule.out == dev ||
-		entry->rule.in_logical == dev || entry->rule.out_logical == dev ||
-		entry->rule.in_bridge == dev || entry->rule.out_bridge == dev;
+	return ft_rule_names(&entry->rule, dev) || ft_entry_crosses(entry, dev);
 }
 
 static bool ft_device_used(const struct net_device *dev)
@@ -2884,6 +2978,29 @@ static bool ft_device_used(const struct net_device *dev)
 		if (ft_entry_uses(entry, dev))
 			return true;
 	return false;
+}
+
+/* The strongest part @dev plays here. Pinned device objects are compared,
+ * never names or recyclable interface indices. A physical port is never
+ * crossed -- a path's walk ends on it -- so a crossed device is never a
+ * port as well. */
+static enum ft_device_role ft_device_role(const struct net_device *dev)
+{
+	bool port = false, named = false, crossed = false;
+	struct cdx_ft_binding *binding;
+	struct cdx_ft_entry *entry;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(binding, &ft_bindings, list)
+		port |= binding->dev == dev;
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+		port |= entry->rule.in == dev || entry->rule.out == dev;
+		named |= ft_rule_names(&entry->rule, dev);
+		crossed |= ft_entry_crosses(entry, dev);
+	}
+	spin_unlock_bh(&ft_watch_lock);
+	return port ? FT_DEV_PORT : named ? FT_DEV_NAMED :
+	       crossed ? FT_DEV_CROSSED : FT_DEV_UNUSED;
 }
 
 static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
@@ -3409,20 +3526,31 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		/* And a VLAN device's counter record, which outlives its flows
 		 * and so has nothing but this event to end it. */
 		ft_dev_stats_gone(dev);
-		/* A tunnel device is never a port and never bound, only a
-		 * dependency of the flows through it, so its removal retires
-		 * exactly those and leaves the bindings up -- the same answer
-		 * as its route going away, which in `ip link del` happens in
-		 * the same RTNL transaction, too late for the retirement it
-		 * causes to have emptied the watch list before this event
-		 * arrives and takes the device for a port whose flows were
-		 * abandoned. */
-		if (ft_tunnel_dev(dev)) {
+		/* A device that is neither bound nor any direction's port --
+		 * a VLAN device, a bridge, a ppp or tunnel device, named by a
+		 * flow or only crossed by one -- is a dependency of the flows
+		 * through it and nothing more, so its removal retires exactly
+		 * those and leaves the bindings and admission up. That is also
+		 * what its route going away does, but not reliably first: a
+		 * session dropping or `ip link del` removes the route in the
+		 * same RTNL transaction, and the retirement that causes runs
+		 * asynchronously, so the watch list can still name the device
+		 * when this arrives. Only a port's removal stops admission
+		 * globally, below. */
+		if (ft_device_role(dev) != FT_DEV_PORT) {
 			ft_device_retire(dev, &ft_link_invalidations);
 			break;
 		}
 		fallthrough;
 	case NETDEV_CHANGEUPPER:
+		/* A device paths only cross gaining or losing an upper changes
+		 * those paths and nothing any flow names; retire them the same
+		 * way. Anywhere else an upper change may change what a port or
+		 * a flow's own device carries, and stops admission globally. */
+		if (event == NETDEV_CHANGEUPPER && ft_device_role(dev) == FT_DEV_CROSSED) {
+			ft_device_retire(dev, &ft_link_invalidations);
+			break;
+		}
 		spin_lock_bh(&ft_watch_lock);
 		/* Latch before releasing the watch lock: a concurrent last unbind
 		 * and fresh bind must not redirect this event to a new table. */

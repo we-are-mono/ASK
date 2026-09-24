@@ -41,7 +41,7 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
         # adapter defines it: the cases below assert the published values.
         + "\n".join(re.findall(r"^#define FT_(?:VLAN|PPP)_[RT]X_OVERHEAD\s.*$", source, re.M)) + "\n"
     )
-    names = ["ft_fault", "ft_devices_hold", "ft_devices_put",
+    names = ["ft_fault", "ft_devices_hold", "ft_devices_put", "ft_rule_names", "ft_crossed_hold", "ft_crossed_hold_all", "ft_crossed_put_all",
              "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
              "ft_neigh_table", "ft_neigh_check", "ft_nexthop_usable",
              "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
@@ -54,7 +54,7 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
              "ft_l2_overhead", "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
              "ft_vlan_lower", "ft_bridge_vlan", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_ipv6_mtu_bounded", "ft_ipv4_arriving", "ft_ipv4_mtu_carried", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_stats", "ft_request_targets", "ft_admission_fault", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_bind_admissible", "ft_passive_callback", "ft_passive_release", "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
-             "ft_invalidate_work", "ft_entry_uses", "ft_device_used", "ft_device_retire",
+             "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire",
              "ft_port_stopped", "ft_stopped_clean", "ft_stopped_workfn", "ft_netdev_event",
              "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_init_fault", "ask_flowtable_init", "ft_block_drain", "ask_flowtable_exit", "ft_position", "ft_start", "ft_next", "ft_stop"]
     (tmp_path / "flowtable_production.inc").write_text(

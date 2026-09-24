@@ -1340,10 +1340,11 @@ async def test_flowtable_pppoe_session_retires_and_redials(pppoe_rig):
     every counter looking healthy.
 
     What notices is the route. pppd's peer route dies with the device, and the
-    flow borrowed that destination, so the route watch retires its directions
-    before the device is even unregistered. By the time it is, nothing
-    references it and it was never a binding, so the netdev watch has nothing
-    left to do. That makes a session drop *selective*: the retirement costs
+    flow borrowed that destination, so the route watch retires its directions,
+    normally before the device is even unregistered. Should the unregistration
+    arrive while the entries are still being taken out, it retires them too
+    rather than stopping admission: a ppp device is neither bound nor a port.
+    That makes a session drop *selective*: the retirement costs
     the directions it should and nothing else, the bindings stay up, and
     admission is never disabled. A drop is therefore self-healing -- the table
     is not touched, nothing re-arms, and the next packet re-offers the flow

@@ -239,12 +239,14 @@ causes can coalesce. Hardware retirement errors escalate to global recovery.
 | --- | --- |
 | Neighbour MAC, unusable state or object detachment | Retire dependent generations; ordinary resolution permits fresh admission |
 | Committed IPv4 route prefix | Retire generations using the prefix; fresh route lookup permits readmission |
-| MTU, going down, carrier loss or MAC change | Retire generations using the physical device; current port/route state gates readmission |
+| MTU, going down, carrier loss or MAC change | Retire generations using the device on either side: physical or logical (VLAN, bridge, ppp, tunnel), or one the path crosses without naming it (a VLAN device under a session, a tunnel or another tag, the ppp device under a tunnel), each held while the direction is installed; current port/route state gates readmission |
+| Unregistration of a device that is neither bound nor any direction's port -- a VLAN device, bridge, ppp or tunnel device, named or only crossed | Retire the generations using it, leaving bindings and admission up, whether or not a route retirement got there first |
+| Upper-device change on a device paths only cross | Retire the generations crossing it |
 | Built-in FIB nexthop ADD/DEL during device/address synchronization | Retire all installed generations conservatively, preserving bindings |
 | Bridge FDB entry moved, aged out or deleted for a flow's destination MAC | Retire generations pinned to that entry; relearning permits readmission |
 | Bridge per-port VLAN membership add or delete | Stop admission globally; recreate the table after configuration settles |
 | Rename or same-MAC usable NUD progress | Preserve valid entries |
-| Routing policy, nexthop-object mutation, relevant unregister or upper-device change | Stop admission globally; recreate the table after configuration settles |
+| Routing policy, nexthop-object mutation, a port's unregistration, or an upper-device change on a port or on a device a flow names | Stop admission globally; recreate the table after configuration settles |
 | Nexthop-object statistics query or notifier registration dump without bindings | No invalidation |
 
 Route-prefix events cover every committed IPv4 alias insertion, replacement,

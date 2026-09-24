@@ -24,7 +24,12 @@ Bucket count alone is not an admission or performance guarantee.
 
 The DUT has approximately 6.5 GiB visible to its KASAN kernel and over 5 GiB
 free before this workload. The adapter's two software indexes occupy 256 KiB
-on arm64. Each adapter entry is 192 bytes before allocator overhead; its private
+on arm64. Each adapter entry is 648 bytes on arm64 (72 of them -- eight device
+pointers and their count -- for the devices a path crosses without naming,
+which the entry holds and watches; it was 576 before). Either size is served
+from `kmalloc-1k`, so an entry costs 1 KiB of slab, 32 MiB at the cap, and the
+structure can grow by another 376 bytes before the next size class; the 72
+bytes are 2.25 MiB of the struct at the cap but nothing in slab. Its private
 CDX hardware owner is 328 bytes, with classifier allocations and Linux
 conntrack/flow storage additional. Measured memory use is recorded with the
 DUT proof, including KASAN and allocator effects.

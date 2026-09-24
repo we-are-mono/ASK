@@ -4874,6 +4874,23 @@ static void test_selective_neighbours(void)
     assert(!ft_handle_refs && handle.refs == 1 && !allocated);
 }
 
+/* Take every installed direction out, and the device records a session left
+ * behind, which outlive the entries that counted into them. In the cases below
+ * both directions of the fixture's flow share one generation: the second is
+ * the same connection offered under the next cookie, with a source port of its
+ * own so the two never share a hardware key. */
+static void remove_all(void)
+{
+    struct cdx_ft_entry *entry, *next;
+
+    cdx_ft_begin();
+    list_for_each_entry_safe(entry, next, &ft_entries, list)
+        assert(ft_remove(entry) == 0);
+    cdx_ft_end();
+    drop_dev_records();
+    assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated && !live_hw);
+}
+
 static void test_transient_admission(void)
 {
     struct cdx_ft_binding other_binding = { .dev = &out };
@@ -4954,6 +4971,197 @@ static void test_allocation_admission_recovery(void)
                 assert(ft_remove(ft_find(&binding, cls.cookie)) == 0);
                 cdx_ft_end();
             }
+}
+
+/* Devices a direction crosses without the rule naming them: held while it is
+ * installed, and retiring it on a change exactly as a named device does. */
+static void test_crossed_devices(void)
+{
+    /* QinQ egress: eth3.100 lies between the logical eth3.100.300 and the
+     * port. */
+    const unsigned long events[] = { NETDEV_CHANGEMTU, NETDEV_CHANGEADDR,
+                                     NETDEV_UNREGISTER, NETDEV_CHANGEUPPER };
+    for (unsigned event = 0; event < ARRAY_SIZE(events); event++) {
+        vlan_fixture(); cls.command = FLOW_CLS_REPLACE;
+        route.dst.dev = &out_qinq;
+        neighbour.dev = &out_qinq;
+        encap_actions(0, (const u16[]){ 100, 300 }, 2);
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
+        assert(e->ncrossed == 1 && e->crossed[0] == &out_tag);
+        assert(out_tag.refs == 1 && out_qinq.refs == 1 && !in_tag.refs);
+        assert(ft_device_role(&out_tag) == FT_DEV_CROSSED);
+        assert(ft_device_role(&out_qinq) == FT_DEV_NAMED);
+        assert(ft_device_role(&out) == FT_DEV_PORT && ft_device_role(&in) == FT_DEV_PORT);
+        assert(ft_device_role(&in_tag) == FT_DEV_UNUSED);
+        u64 *counter = event == 0 ? &ft_mtu_invalidations :
+                       event == 1 ? &ft_mac_invalidations : &ft_link_invalidations;
+        u64 before = *counter;
+        /* Its unregistration, and an upper it gains or loses, retire the
+         * flows through it and leave every binding and every other flow
+         * up. */
+        device_event(&out_tag, events[event], false);
+        assert(handle.invalid && *counter == before + 1);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !out_tag.refs && !out_qinq.refs);
+        drop_dev_records();
+    }
+    /* The ingress side, crossed the same way: 4in6 arriving over a PPPoE
+     * session, where the ppp device under the tunnel is crossed, and over a
+     * VLAN device, where the tag's device is. */
+    for (unsigned under = 0; under < 2; under++) {
+        struct net_device *crossed = under ? &in_tag : &in_ppp;
+
+        ip6tnl_in_fixture(); cls.command = FLOW_CLS_REPLACE;
+        ingress_tunnel.lower_ifindex = crossed->ifindex;
+        if (under) {
+            encap_actions(1, NULL, 0);
+            encap_keys((const u16[]){ 200 }, 1);
+        } else {
+            memset(ingress_tunnel.h_dest, 0, ETH_ALEN);
+            ingress_session = (struct nf_flow_session){ .lower_ifindex = in.ifindex,
+                                                        .id = SESSION_ID + 1 };
+            memcpy(ingress_session.h_dest, AC_MAC, ETH_ALEN);
+        }
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
+        assert(e->ncrossed == 1 && e->crossed[0] == crossed);
+        assert(crossed->refs == 1 && in_ip6tnl.refs == 1);
+        assert(ft_device_role(crossed) == FT_DEV_CROSSED);
+        assert(ft_device_role(&in_ip6tnl) == FT_DEV_NAMED);
+        u64 links = ft_link_invalidations;
+        device_event(crossed, NETDEV_UNREGISTER, false);
+        assert(handle.invalid && ft_link_invalidations == links + 1);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !crossed->refs && !in_ip6tnl.refs);
+        drop_dev_records();
+    }
+    /* And two tags on ingress with nothing above them, where the device of
+     * the outer tag is crossed by the tag walk alone: the frame arrives on
+     * `out` as eth3.100.300 and leaves by `in`. */
+    struct cdx_ft_binding qinq_binding = { .dev = &out };
+    vlan_fixture(); cls.command = FLOW_CLS_REPLACE;
+    reverse_route.dst.dev = &out_qinq;
+    mk.ingress_ifindex = out.ifindex;
+    source_mac(&in);
+    rule.action.entries[4].dev = &in;
+    route.dst.dev = &in;
+    neighbour.dev = &in;
+    encap_actions(2, NULL, 0);
+    encap_keys((const u16[]){ 100, 300 }, 2);
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &qinq_binding) == 0);
+    struct cdx_ft_entry *qinq = ft_find(&qinq_binding, cls.cookie);
+    assert(qinq && qinq->ncrossed == 1 && qinq->crossed[0] == &out_tag);
+    assert(out_tag.refs == 1 && out_qinq.refs == 1);
+    assert(ft_device_role(&out_tag) == FT_DEV_CROSSED);
+    u64 crossings = ft_link_invalidations;
+    device_event(&out_tag, NETDEV_UNREGISTER, false);
+    assert(handle.invalid && ft_link_invalidations == crossings + 1);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !out_tag.refs && !out_qinq.refs && !in.refs);
+    drop_dev_records();
+    /* A session over a VLAN device: the device the session runs over is the
+     * tag's, and a carrier loss there reaches the flow. */
+    pppoe_out_fixture(); cls.command = FLOW_CLS_REPLACE;
+    egress_session.lower_ifindex = out_tag.ifindex;
+    encap_actions(0, (const u16[]){ 100 }, 1);
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
+    assert(e->ncrossed == 1 && e->crossed[0] == &out_tag && out_tag.refs == 1 && ppp.refs == 1);
+    u64 links = ft_link_invalidations;
+    out_tag.carrier_lost = true;
+    device_event(&out_tag, NETDEV_CHANGE, false);
+    out_tag.carrier_lost = false;
+    assert(handle.invalid && ft_link_invalidations == links + 1);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !out_tag.refs && !ppp.refs);
+    drop_dev_records();
+    /* A tunnel over a session: the ppp device is what the tunnel runs over,
+     * and a session dropping under it retires the flow selectively. */
+    ip6tnl_out_fixture(); cls.command = FLOW_CLS_REPLACE;
+    egress_tunnel.lower_ifindex = ppp.ifindex;
+    memset(egress_tunnel.h_dest, 0, ETH_ALEN);
+    egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex,
+                                               .id = SESSION_ID };
+    memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
+    tunnel_ethernet_dest(&ip6tnl);
+    session_push(SESSION_ID);
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    e = ft_find(&binding, cls.cookie);
+    assert(e->ncrossed == 1 && e->crossed[0] == &ppp && ppp.refs == 1 && ip6tnl.refs == 1);
+    links = ft_link_invalidations;
+    device_event(&ppp, NETDEV_UNREGISTER, false);
+    assert(handle.invalid && ft_link_invalidations == links + 1);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !ppp.refs && !ip6tnl.refs);
+    drop_dev_records();
+    /* A device one flow crosses and another names is named: eth3.100 under
+     * one flow's eth3.100.300 and another's own logical device. An upper
+     * change on it may change what that flow carries, and stops admission;
+     * its unregistration only retires the two flows. */
+    vlan_fixture(); cls.command = FLOW_CLS_REPLACE;
+    route.dst.dev = &out_qinq;
+    neighbour.dev = &out_qinq;
+    encap_actions(0, (const u16[]){ 100, 300 }, 2);
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    cls.cookie++; pk.src++;
+    route.dst.dev = &out_tag;
+    neighbour.dev = &out_tag;
+    rule.action.entries[5] = rule.action.entries[6];
+    rule.action.num_entries = 6;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 2);
+    assert(out_tag.refs == 2 && ft_device_role(&out_tag) == FT_DEV_NAMED);
+    device_event(&out_tag, NETDEV_CHANGEUPPER, true);
+    assert(!handle.invalid);
+    links = ft_link_invalidations;
+    device_event(&out_tag, NETDEV_UNREGISTER, false);
+    assert(handle.invalid && ft_link_invalidations == links + 1);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !out_tag.refs && !out_qinq.refs);
+    drop_dev_records();
+    /* Every device a flow names without it being a port leaves the same way:
+     * a VLAN device, a bridge, a ppp device and a tunnel device, each its
+     * flow's own logical device. The port's unregistration still stops
+     * everything. */
+    for (unsigned kind = 0; kind < 5; kind++) {
+        struct net_device *named;
+
+        switch (kind) {
+        case 0: egress_tag_fixture(); named = &out_tag; break;
+        case 1: bridge_fixture(); reverse_route.dst.dev = &in_br; named = &in_br; break;
+        case 2: pppoe_out_fixture(); named = &ppp; break;
+        case 3: ip6tnl_out_fixture(); named = &ip6tnl; break;
+        default: vlan_fixture(); named = &out; break;
+        }
+        cls.command = FLOW_CLS_REPLACE;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
+        bool port = kind == 4;
+        assert(ft_device_role(named) == (port ? FT_DEV_PORT : FT_DEV_NAMED));
+        links = ft_link_invalidations;
+        device_event(named, NETDEV_UNREGISTER, port);
+        assert(handle.invalid == !port && ft_link_invalidations == links + !port);
+        if (port) {
+            ft_invalid = 0;
+            remove_all();
+        } else {
+            ft_retire_workfn(NULL);
+            assert(!ft_count && !named->refs);
+            drop_dev_records();
+        }
+    }
+    /* An installation that fails gives back what it took. */
+    for (unsigned stage = 1; stage <= 3; stage++) {
+        vlan_fixture();
+        route.dst.dev = &out_qinq;
+        neighbour.dev = &out_qinq;
+        encap_actions(0, (const u16[]){ 100, 300 }, 2);
+        ft_fail_stage = stage;
+        cdx_ft_begin();
+        assert(ft_replace(&binding, &cls) < 0);
+        cdx_ft_end();
+        assert(!ft_fail_stage && !ft_count && !out_tag.refs && !out_qinq.refs);
+        drop_dev_records();
+    }
 }
 
 static void test_ipsec_generation_retirement(void)
@@ -5792,6 +6000,7 @@ int main(void)
     test_device_recovery();
     test_transient_admission();
     test_allocation_admission_recovery();
+    test_crossed_devices();
     test_ipsec_generation_retirement();
     test_nexthop_objects();
     test_qos_decode();

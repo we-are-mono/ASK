@@ -240,13 +240,19 @@ same way.
 ## Retirement
 
 A session drop is **self-healing, and selective**, which was not the
-expectation. The route is what notices first: pppd's peer route dies with the
-device, the flow borrowed that destination, and the route watch retires both
-directions before the device is unregistered. By the time it is, nothing
-references it and it was never a binding, so `ft_device_used()` is already
-false and the netdev watch's escalation to full invalidation never fires. The
-bindings stay up, admission is never disabled, nothing re-arms, and the next
-packet re-offers the flow against whatever session exists then.
+expectation. The route is usually what notices first: pppd's peer route dies
+with the device, the flow borrowed that destination, and the route watch
+retires both directions, typically before the device is unregistered. That
+ordering is no longer load-bearing. The retirement it starts runs
+asynchronously, so the watch list can still name the ppp device when its
+unregistration arrives, and a ppp device is neither bound nor any direction's
+port: its unregistration, like a VLAN device's, a bridge's or a tunnel
+device's, retires exactly the flows using it and never escalates to full
+invalidation. The same holds for a VLAN device the session runs over, and for
+the ppp device under a tunnel (DS-Lite on a PPPoE WAN), both of which the
+entry holds and watches as devices its path crosses. The bindings stay up,
+admission is never disabled, nothing re-arms, and the next packet re-offers
+the flow against whatever session exists then.
 
 What the adapter depends on otherwise is the ppp device itself: its MTU — which
 arrives at 1492 without anyone setting it, the eight bytes of overhead already
