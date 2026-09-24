@@ -282,6 +282,22 @@ static bool expected_hairpin;
  * bound rejects every full-size frame. */
 static unsigned expected_mtu;
 static u16 expected_sa, expected_in_sa;
+/* The outbound SA a direction names, as the SA cache answers for it: its MTU
+ * and what its frames grow by through SEC. Handle 7 is AES-CBC with
+ * HMAC-SHA256-128 over IPv4 on a 1500-byte port; any other names nothing. */
+static u16 sa_mtu = 1438, sa_expansion = 62;
+#define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+static unsigned sa_lookups;
+static bool cdx_ipsec_sa_bound(u16 handle, u16 *mtu, u16 *expansion)
+{
+    lockdep_assert_held(&cdx_info->ctrl.mutex);
+    sa_lookups++;
+    if (handle != 7)
+        return false;
+    *mtu = sa_mtu;
+    *expansion = sa_expansion;
+    return true;
+}
 static struct cdx_l2_encap observed_encap;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
@@ -608,16 +624,43 @@ static void test_backend(void)
     assert(cdx_ft_add(&rule,&stats,&hw) == 0 && syncs == tries + 2);
     assert(cdx_ft_del(&hw) == 0 && !hw && !ft_live && !key);
     /* A direction that names an SA. Each end lands in its own slot and marks
-     * the entry secure, and the *sending* end additionally replaces the
-     * entry's MTU with the egress port's: the microcode adds the tunnel
-     * expansion before comparing, so leaving the flow's tunnel-reduced bound
-     * there rejects every full-size frame and sends it to the CPU instead.
-     * That failure is invisible to a functional test -- the entry matches and
-     * counts either way -- so it is pinned here. */
+     * the entry secure, and the *sending* end's MTU has SEC's expansion put
+     * back on: the microcode adds it before comparing, so the flow's inner
+     * bound alone rejects every full-size frame and sends it to the CPU
+     * instead. That failure is invisible to a functional test -- the entry
+     * matches and counts either way -- so it is pinned here.
+     *
+     * The bound under the expansion is the bundle's, which Linux enforces:
+     * the smaller of the SA's MTU and the inner route's. Netfilter hands
+     * over the bundle's when the packet that created the flow was
+     * transformed (1438) and the plain inner route's when it was the reply
+     * (1500 on the port's own MTU), and either way the entry must answer
+     * above 1438; an inner route with an MTU of its own (1400, 1200) is the
+     * bound, where the egress port's MTU alone let 1401..1438 through. An
+     * egress device smaller than the SA's port caps it, and one raised past
+     * the port the SA was programmed on does not lift the SA's own bound. */
     rule.sa_handle = expected_sa = 7;
-    expected_mtu = out.mtu;
-    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && hw);
-    assert(cdx_ft_del(&hw) == 0 && !hw);
+    {
+        static const struct { unsigned flow, port, entry; } bounds[] = {
+            { 1200, 1500, 1262 }, { 1400, 1500, 1462 }, { 1438, 1500, 1500 },
+            { 1500, 1500, 1500 }, { 1500, 1480, 1480 }, { 9000, 9000, 1500 },
+        };
+        unsigned saved = rule.mtu, i;
+
+        for (i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
+            rule.mtu = bounds[i].flow;
+            out.mtu = bounds[i].port;
+            expected_mtu = bounds[i].entry;
+            assert(cdx_ft_add(&rule,&stats,&hw) == 0 && hw);
+            assert(cdx_ft_del(&hw) == 0 && !hw);
+        }
+        rule.mtu = saved;
+        out.mtu = 1500;
+    }
+    /* An SA the cache no longer holds cannot say how much SEC adds, so the
+     * direction is refused before anything is built. */
+    rule.sa_handle = expected_sa = 9;
+    assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw && !allocations);
     rule.sa_handle = expected_sa = 0;
     /* The receiving end takes no such correction: what it transmits is the
      * decrypted inner frame, so the flow's own bound is the right one. */

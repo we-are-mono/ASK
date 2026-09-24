@@ -496,6 +496,26 @@ void cdx_ipsec_deinit(void)
 }
 
 
+/* How many bytes larger than what it is handed an outbound SA's frames leave
+ * SEC: its port's MTU less its own, the whole of ESP's overhead (A227). The
+ * classifier gets it as a direction's expansion, and the direction's MTU bound
+ * takes it on top (cdx_ft_hw_add()). */
+static u16 cdx_ipsec_expansion_of(PSAEntry sa)
+{
+	return sa->dev_mtu > sa->mtu ? sa->dev_mtu - sa->mtu : 0;
+}
+
+bool cdx_ipsec_sa_bound(u16 handle, u16 *mtu, u16 *expansion)
+{
+	PSAEntry sa = M_ipsec_sa_cache_lookup_by_h(handle);
+
+	if (!sa || sa->direction != CDX_DPA_IPSEC_OUTBOUND)
+		return false;
+	*mtu = sa->mtu;
+	*expansion = cdx_ipsec_expansion_of(sa);
+	return true;
+}
+
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 {
 	int i;
@@ -511,7 +531,7 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 				info->to_sec_fqid = 
 				sa->pSec_sa_context->to_sec_fqid;
 				info->sa_family = sa->family ;
-				info->tnl_hdr_size = (sa->dev_mtu - sa->mtu); /* Gives you the header expansion size */
+				info->tnl_hdr_size = cdx_ipsec_expansion_of(sa);
 #ifdef CDX_DPA_DEBUG	
 				printk(KERN_CRIT "%s OutBound SA info->to_sec_fqid  = %d\n", __func__,info->to_sec_fqid );
 #endif				

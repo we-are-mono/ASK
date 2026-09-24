@@ -9,6 +9,7 @@
 #include "portdefs.h"
 #include "cdx.h"
 #include "control_ipv4.h"
+#include "control_ipsec.h"
 #include "control_tunnel.h"
 #include "fm_ehash.h"
 #include "cdx_flowtable_backend.h"
@@ -105,6 +106,7 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	struct dpa_iface_info *in_iface, *out_iface;
 	struct cdx_l2_encap encap = {};
 	struct cdx_ft_hw *hw;
+	u16 sa_mtu = 0, expansion = 0;
 	PCtEntry ct;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
@@ -112,6 +114,15 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	if ((rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP) ||
 	    (rule->family != AF_INET && rule->family != AF_INET6))
 		return ask_refuse(-EOPNOTSUPP);
+	/* A direction handed to SEC is bounded by its SA as well and has what
+	 * SEC adds put on top, below, so the SA it names has to be there to
+	 * say both. */
+	if (rule->sa_handle &&
+	    !cdx_ipsec_sa_bound(rule->sa_handle, &sa_mtu, &expansion)) {
+		ask_dbg(ASK_DBG_DEVICE, "hw sa %u names no outbound SA\n",
+			rule->sa_handle);
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	/* The last gate before hardware, and the one whose silence is most
 	 * expensive: a direction that reaches here has already satisfied
 	 * admission, so a refusal means the two disagree, and the operands are
@@ -156,20 +167,29 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	/* The ucode checks the size of what it *transmits* against this, and
 	 * for a direction handed to SEC that is the outer frame: the entry
 	 * carries the expansion separately, in hdr_xpnd_sz, and the check adds
-	 * it before comparing. Netfilter's MTU for such a flow is the
-	 * tunnel-reduced inner one, so programming it directly fails every
-	 * full-size frame -- 1438 + 62 against 1438 -- and each one takes the
-	 * exception path instead. The flow is then matched and counted and
-	 * forwarded by the CPU anyway, which looks like an offload that works
-	 * and performs like software: measured at 0.07 Gb/s against CMM's 2.54
-	 * on the same tunnel, with the software SEC submit counting once per
-	 * packet.
+	 * it before comparing. Netfilter's MTU for such a flow is an inner one,
+	 * so programming it directly fails every full-size frame -- 1438 + 62
+	 * against 1438 -- and each one takes the exception path instead. The
+	 * flow is then matched and counted and forwarded by the CPU anyway,
+	 * which looks like an offload that works and performs like software:
+	 * measured at 0.07 Gb/s against CMM's 2.54 on the same tunnel, with
+	 * the software SEC submit counting once per packet.
 	 *
-	 * The limit that belongs here is the egress port's own. CMM never met
-	 * this because its route table held interface MTUs rather than per-flow
-	 * ones, and the same reasoning is written down beside the
-	 * tunnel-interface case in devman.c. */
-	hw->route.mtu = rule->sa_handle ? rule->out_logical->mtu : rule->mtu;
+	 * So the entry compares the inner packet against the bound Linux
+	 * itself enforces for the direction -- the bundle's MTU, the smaller
+	 * of the SA's and the inner route's (xfrm_init_pmtu()) -- with the
+	 * expansion put back on, as it is for a tunnel below: an oversized
+	 * packet with DF goes to Linux for Fragmentation Needed with that
+	 * bound. Netfilter's MTU is the bundle's when the packet that created
+	 * the flow was transformed, and the plain inner route's when it was
+	 * the reply, so the SA's MTU is taken in again here and the bound is
+	 * the bundle's either way. Programming the egress port's MTU instead
+	 * let a DF packet over an inner route's MTU through to SEC (A230). */
+	if (rule->sa_handle)
+		hw->route.mtu = min_t(u32, min_t(u32, rule->mtu, sa_mtu) + expansion,
+				      rule->out_logical->mtu);
+	else
+		hw->route.mtu = rule->mtu;
 	/* The same reasoning for a tunnel, where the expansion is a fixed
 	 * header rather than SEC's variable one: Netfilter's MTU is the tunnel
 	 * device's, already reduced by the outer header, and the microcode

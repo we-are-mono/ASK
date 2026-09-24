@@ -1267,9 +1267,25 @@ l2_info->mtu += l3_info->header_size;
 ```
 
 The legacy owner never met it because its route table holds interface MTUs
-rather than per-flow ones. So a direction carrying an outbound SA now programs
-the egress port's MTU, and `cdx_ft_rule.mtu` keeps meaning what it meant: the
-flow's own bound, which admission still checks and `/proc` still reports.
+rather than per-flow ones. So a direction carrying an outbound SA has the
+expansion put back on, as the tunnel case does, and `cdx_ft_rule.mtu` keeps
+meaning what it meant: the flow's own bound, which admission still checks and
+`/proc` still reports.
+
+The bound under the expansion is the one Linux enforces for the direction: the
+bundle's MTU, the smaller of the SA's MTU and the inner route's
+(`xfrm_init_pmtu()`). Netfilter's MTU is the bundle's when the packet that
+created the flow was transformed, and the plain inner route's when the reply
+created it. So the entry takes the smaller of Netfilter's MTU and the SA's own,
+adds the expansion, and caps the sum at the egress port's MTU. An earlier
+revision programmed the port's MTU outright, which left an inner route's MTU
+out of the hardware's bound. With a route MTU of 1400 under an SA MTU of 1438,
+a DF packet of 1401–1438 bytes crossed in hardware where Linux answers
+Fragmentation Needed with 1400 (A230). A change to the inner route retires the
+direction through the route watch, which matches the inner destination, and
+readmission reads the new bound. A packet without DF over the bound still goes
+to SEC whole, because the enqueue to SEC fragments nothing. That is what Linux
+does too: the bundle carries such a packet, encrypted whole.
 
 The expansion has to be all of ESP's, too. It is `dev_mtu - mtu`, with the
 SA's MTU taken from the state, and xfrm hands the state to the driver before it
@@ -1282,10 +1298,15 @@ answers Fragmentation Needed with the SA's MTU. A DF packet of 1439–1456 bytes
 therefore went to SEC instead and left it larger than the port, with DF copied
 to the outer header. The adapter now computes the SA's MTU from its transform,
 as `xfrm_state_mtu()` does for a valid state, whatever the state's lifecycle
-(A227). `test_flowtable_service_ipsec_mtu.py` sends DF datagrams across that
-window and expects Fragmentation Needed with the SA's MTU, and one at exactly
-that MTU crossing in hardware as a single frame. IPv6 is unchanged: the check excepts IPv4 alone, so an IPv6 packet in
-that window still goes to SEC whole and leaves as outer fragments
+(A227).
+
+`test_flowtable_service_ipsec_mtu.py` sends DF datagrams across both windows,
+once with the inner route carrying no MTU and once with one below the SA's.
+Each must draw Fragmentation Needed with the bound, one at exactly the bound
+must cross in hardware as a single frame, and one without DF over the inner
+route's MTU must cross whole. IPv6 is unchanged: the check excepts IPv4 alone,
+and an IPv6 direction's Netfilter MTU is its outer device's, so an IPv6 packet
+in either window still goes to SEC whole and leaves as outer fragments
 ([ipv6.md](ipv6.md)).
 
 Worth naming the shape of this, because it is the second time in this
