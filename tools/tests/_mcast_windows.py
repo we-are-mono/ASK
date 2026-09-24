@@ -86,6 +86,21 @@ def mcast_rows(state: dict, group: str) -> list[dict]:
     return [row for row in state["mcast"] if same(row["group"], group)]
 
 
+def lan_groups(state: dict) -> set[tuple[str, str]]:
+    """Every bridged group but those held only on the WAN port.
+
+    The test bridges query their WAN port too, and every host on that live
+    segment answers with memberships of its own -- SSDP, mDNS, DHCPv6 --
+    that come and go on their own schedule, so the adapter's group count
+    moves under a case that changed nothing. Their streams are the WAN's
+    too: a flow in by the WAN port that no port wants is theirs as well."""
+    def foreign(row):
+        if row["ports"] in ("", "-"):
+            return row["in"] == TARGET_WAN_IF
+        return all(port.split("/")[0] == TARGET_WAN_IF for port in row["ports"].split(","))
+    return {(row["group"], row["vid"]) for row in state["mcast"] if not foreign(row)}
+
+
 def members(row: dict | None, field: str) -> set[str]:
     """A row's `listeners` or `ports` as a set; empty for no row at all."""
     if row is None or row[field] == "-":

@@ -34,7 +34,7 @@ import pytest
 import pytest_asyncio
 
 from _mcast_windows import (COUNT, bridge_settings, delivered, host, in_hardware, in_software,
-                            learn, mcast_rows, mdb, mdb_ports, members, moved, mroute_row,
+                            lan_groups, learn, mcast_rows, mdb, mdb_ports, members, moved, mroute_row,
                             multicast_rig, packets, same, silenced, stream, streamed,  # noqa: F401
                             summary, trickle)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
@@ -420,7 +420,7 @@ async def test_flowtable_service_multicast_bridged_ssm_beside_asm(multicast_rig,
         # The second source reached the CPU, and the bridge dropped it there.
         assert after["stream_cpu"] < COUNT * 1.1, (after["stream_cpu"], after["cpu"], after["idle"])
     final = await r.settle(lambda s: not mcast_rows(s, group) and
-                           s["mcast_groups"] == r.initial["mcast_groups"],
+                           lan_groups(s) == lan_groups(r.initial),
                            f"v{family}: no record left", timeout=15)
     assert final["mcast_installed"] == r.initial["mcast_installed"], summary(final)
     assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)
@@ -466,7 +466,7 @@ async def test_flowtable_service_multicast_bridged_block_before_the_stream(multi
         assert moved(second, lambda s: flow_row(s, group, blocked)) == 0, summary(second["after"])
         assert second["stream_cpu"] < COUNT * 1.1, (second["stream_cpu"], second["cpu"], second["idle"])
     final = await r.settle(lambda s: not mcast_rows(s, group) and
-                           s["mcast_groups"] == r.initial["mcast_groups"],
+                           lan_groups(s) == lan_groups(r.initial),
                            f"v{family}: no record left", timeout=15)
     assert final["mcast_installed"] == r.initial["mcast_installed"], summary(final)
     assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)
