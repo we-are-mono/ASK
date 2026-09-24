@@ -10869,6 +10869,8 @@ static void ft_ipsec_replay_seen(const struct xfrm_state *x,
  * requested ICV length. So GCM at 8, 12 and 16 bytes arrive as three distinct
  * identities with nothing here to derive -- the legacy serialiser matched on
  * alg_name substrings and ICV arithmetic to reach the same three constants.
+ * An authenticator's identity names no ICV length, so its truncation is
+ * carried beside it.
  */
 static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 			 struct netlink_ext_ack *extack)
@@ -10948,7 +10950,23 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 			NL_SET_ERR_MSG(extack, "cdx: authentication key too long");
 			return -EINVAL;
 		}
+		/* The ICV is the state's truncation, which peers choose: RFC
+		 * 4868 gives SHA-2 half its digest, while strongSwan's
+		 * sha256_96, and xfrm's default for a state that names no
+		 * truncation, give SHA-256 96 bits. SEC fixes the ICV in the
+		 * protocol operation, so a pair it has no operation for would
+		 * send every frame with an ICV of the wrong length and refuse
+		 * every frame received. An authenticator with no PF_KEY number,
+		 * xfrm's cmac(aes), arrives as algorithm 0 with a key, and zero
+		 * is "no authenticator" to the backend: it is refused here with
+		 * the rest, never skipped, or the SA would carry no
+		 * authentication at all. */
+		if (!cdx_ipsec_auth_supported(x->props.aalgo, x->aalg->alg_trunc_len)) {
+			NL_SET_ERR_MSG(extack, "cdx: SEC cannot produce this authenticator at this ICV length");
+			return -EOPNOTSUPP;
+		}
 		spec->auth.alg = x->props.aalgo;
+		spec->auth.icv_bits = x->aalg->alg_trunc_len;
 		spec->auth.bits = x->aalg->alg_key_len;
 		memcpy(spec->auth.key, x->aalg->alg_key, x->aalg->alg_key_len / 8);
 	}

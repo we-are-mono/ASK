@@ -269,7 +269,15 @@ the GMAC ICV, where RFC 4543 and every software peer authenticate it, so no
 frame would pass the other side's check in either direction (A220). GCM is
 admitted without reservation: A24a fixed the shared-descriptor sharing policy
 that made it unsafe (DNCPE-2358, `43f29a0`) and GCM now outperforms CBC+HMAC
-on TCP.
+on TCP. The authenticator is admitted only at a truncation SEC has an
+operation for, because SEC fixes the ICV in the operation itself: HMAC-MD5 at
+96 or 128 bits, HMAC-SHA1 at 96 or 160, HMAC-SHA-256/384/512 at 128/192/256
+(RFC 4868), AES-XCBC at 96, or null authentication. Any other truncation is
+refused with `EOPNOTSUPP` and belongs in software, SHA-256 at 96 bits
+included — strongSwan's `sha256_96`, and xfrm's default for `auth` rather than
+`auth-trunc` — since every frame would carry an ICV of the wrong length (A223).
+So is `cmac(aes)`: SEC has AES-CMAC-96 but cdx carries no CMAC, and with no
+PF_KEY number it used to reach SEC as no authentication at all.
 NAT-T is carried through `x->encap->encap_sport/dport`, which the hardware SA
 keeps. An in-place `XFRM_MSG_UPDSA` reaches no driver, so 040 refuses one that
 would change a packet-offloaded state's ports or its output mark (`EINVAL`) —
@@ -470,7 +478,7 @@ computes, minus the serialisation:
 | CDX needs | Read from |
 | --- | --- |
 | SA identity, direction | `x->id.proto`, `x->id.spi`, `x->props.family`, `x->props.saddr`, `x->id.daddr`, `x->xso.dir` |
-| Authentication key | `x->aalg->alg_key`/`alg_key_len`, `x->props.aalgo` |
+| Authentication key and ICV | `x->aalg->alg_key`/`alg_key_len`, `x->props.aalgo`, and `alg_trunc_len`, which SEC must have an operation for |
 | Cipher key | `x->ealg->alg_key`/`alg_key_len`, `x->props.ealgo` |
 | AEAD key and ICV | `x->aead->alg_key`/`alg_key_len`, `x->props.ealgo`, which names the mode and ICV length together; GMAC is refused |
 | Outer header | `x->props.mode == XFRM_MODE_TUNNEL`, built from `props.saddr`/`id.daddr` |

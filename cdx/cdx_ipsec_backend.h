@@ -37,9 +37,15 @@ enum cdx_ipsec_dir {
  *
  * An AEAD transform is one key with an alg that names its ICV length
  * (SADB_X_EALG_AES_GCM_ICV8/12/16, SADB_X_EALG_AES_CCM_ICV8/12/16), so it occupies
- * `crypt` alone and leaves `auth` empty. There is deliberately no separate
- * ICV field: the length is part of the algorithm's identity here, and a
- * second field naming it could disagree with the first.
+ * `crypt` alone and leaves `auth` empty. Its icv_bits stays zero: the length
+ * is part of the algorithm's identity there, and a second field naming it
+ * could disagree with the first.
+ *
+ * An authenticator is the opposite case. PF_KEY numbers it by algorithm
+ * alone, and the ICV it leaves on each frame is the SA's own truncation --
+ * xfrm's alg_trunc_len, which peers choose -- so `auth` carries that length
+ * beside the identity, and SEC can carry only the pairs cdx_ipsec_auth_supported()
+ * admits.
  *
  * Algorithm zero is absence. SADB_AALG_NONE and SADB_EALG_NONE are both 0,
  * so a zeroed spec describes an SA with neither, which the SEC context
@@ -48,6 +54,9 @@ enum cdx_ipsec_dir {
 struct cdx_ipsec_key {
 	u16 alg;
 	u16 bits;
+	/* The ICV an authenticator leaves on each frame, in bits. Zero for a
+	 * cipher and for AEAD. */
+	u16 icv_bits;
 	u8 key[CDX_IPSEC_KEY_MAX];
 };
 
@@ -223,6 +232,15 @@ struct cdx_sec_refusals {
  * a netdev notifier.
  */
 bool cdx_ipsec_port_supported(struct net_device *dev);
+
+/* Whether SEC can authenticate as PF_KEY algorithm `alg` with an ICV of
+ * `icv_bits`: the pairs its IPsec protocol operation has, and no others (SEC
+ * RM table 7-54). SEC fixes the ICV in the operation, so an SA whose
+ * truncation it lacks would send every frame with an ICV of the wrong length
+ * and refuse every frame its peer sent. cdx_ipsec_sa_add() refuses such an SA
+ * too; this lets a caller refuse it first, with its own reason, before
+ * anything is built. Needs neither a transaction nor RTNL. */
+bool cdx_ipsec_auth_supported(u16 alg, unsigned int icv_bits);
 
 /* Install an SA and return its opaque owner.
  *

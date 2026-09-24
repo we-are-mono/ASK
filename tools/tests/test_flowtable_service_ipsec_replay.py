@@ -536,3 +536,59 @@ async def test_ipsec_gmac_refused(aiohttp_session, target_agent, splat_window):
                           check=False)
         await endpoints_down(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=GMAC_LOCAL,
                              peer=GMAC_PEER)
+
+
+# Once more a pair, SPIs and a reqid of its own, and nothing is sent.
+TRUNC_LOCAL, TRUNC_PEER = "198.18.109.1", "198.18.109.2"
+TRUNC_REQID = "49308"
+TRUNC_STATES = {
+    "out": ["src", TRUNC_LOCAL, "dst", TRUNC_PEER, "proto", "esp", "spi", hex(0x54520001)],
+    "in": ["src", TRUNC_PEER, "dst", TRUNC_LOCAL, "proto", "esp", "spi", hex(0x54520002)],
+}
+# HMAC-SHA-256 at 96 bits, which strongSwan's sha256_96 and older Linux peers
+# use, and the same through `auth`, which takes xfrm's 96-bit default.
+SHA256_96 = CBC[:-1] + ("96",)
+SHA256_DEFAULT = CBC[:3] + ("auth",) + CBC[4:-1]
+
+
+async def test_ipsec_auth_truncation_refused(aiohttp_session, target_agent, splat_window):
+    """An HMAC truncated to a length SEC has no operation for is refused for
+    packet offload in both directions, with the reason, and the same state
+    installs in software.
+
+    SEC fixes the ICV in its protocol operation, and SHA-256 is only ever 128
+    bits there. Offloaded at 96, every frame the SA sent ended in a 16-byte
+    ICV where the peer expected 12 and failed its check, and every frame it
+    received failed SEC's."""
+    await endpoints_up(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=TRUNC_LOCAL,
+                       peer=TRUNC_PEER, lladdr="02:00:00:00:09:02")
+    attempts = [("out", SHA256_96), ("in", SHA256_96), ("out", SHA256_DEFAULT)]
+    try:
+        for direction, algorithms in attempts:
+            identity = TRUNC_STATES[direction]
+            added = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "add", *identity,
+                                  "mode", "tunnel", "reqid", TRUNC_REQID, *algorithms,
+                                  "offload", "packet", "dev", TARGET_WAN_IF, "dir", direction, check=False)
+            shown = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "get", *identity,
+                                  check=False)
+            result = {"direction": direction, "algorithms": algorithms, "add": added, "get": shown}
+            assert added["rc"] != 0, result
+            assert "cdx: SEC cannot produce this authenticator at this ICV length" in added["stderr"], result
+            # Packet offload has no software fallback: nothing was installed.
+            assert shown["rc"] != 0, result
+        # Asked for without offload, it is software's.
+        identity = TRUNC_STATES["out"]
+        added = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "add", *identity,
+                              "mode", "tunnel", "reqid", TRUNC_REQID, *SHA256_96, check=False)
+        shown = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "get", *identity,
+                              check=False)
+        result = {"add": added, "get": shown}
+        assert added["rc"] == 0 and shown["rc"] == 0, result
+        assert re.search(r"auth-trunc hmac\(sha256\) \S+ 96$", shown["stdout"], re.M), result
+        assert "crypto offload parameters" not in shown["stdout"], result
+    finally:
+        for identity in TRUNC_STATES.values():
+            await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "delete", *identity,
+                          check=False)
+        await endpoints_down(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=TRUNC_LOCAL,
+                             peer=TRUNC_PEER)

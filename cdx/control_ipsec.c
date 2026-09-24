@@ -164,9 +164,46 @@ void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa)
 }
 
 
-int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
+/* The SEC protocol operation that authenticates as PF_KEY algorithm `alg`
+ * with an ICV of `icv_bits`, or -1 when SEC has none.
+ *
+ * PF_KEY numbers an authenticator by its algorithm alone, but the ICV it
+ * leaves on each frame is the SA's own truncation, and peers choose it: RFC
+ * 4868 gives SHA-2 half its digest, while older Linux and strongSwan's
+ * sha256_96 cut SHA-256 to 96 bits. SEC's IPsec protocol fixes the ICV in the
+ * operation itself (SEC RM table 7-54, PROTINFO[7:0]), so each pair below is
+ * one operation and no pair missing from it can be carried: the frames would
+ * leave with an ICV of the wrong length and every one received would fail
+ * SEC's check. Null authentication leaves no ICV at all. */
+int cdx_ipsec_auth_op(u16 alg, unsigned int icv_bits)
 {
-	U16      algo;
+	static const struct {
+		u16 alg;
+		u16 icv_bits;
+		u16 op;
+	} ops[] = {
+		{ SADB_AALG_MD5HMAC,		 96, OP_PCL_IPSEC_HMAC_MD5_96 },
+		{ SADB_AALG_MD5HMAC,		128, OP_PCL_IPSEC_HMAC_MD5_128 },
+		{ SADB_AALG_SHA1HMAC,		 96, OP_PCL_IPSEC_HMAC_SHA1_96 },
+		{ SADB_AALG_SHA1HMAC,		160, OP_PCL_IPSEC_HMAC_SHA1_160 },
+		{ SADB_X_AALG_SHA2_256HMAC,	128, OP_PCL_IPSEC_HMAC_SHA2_256_128 },
+		{ SADB_X_AALG_SHA2_384HMAC,	192, OP_PCL_IPSEC_HMAC_SHA2_384_192 },
+		{ SADB_X_AALG_SHA2_512HMAC,	256, OP_PCL_IPSEC_HMAC_SHA2_512_256 },
+		{ SADB_X_AALG_AES_XCBC_MAC,	 96, OP_PCL_IPSEC_AES_XCBC_MAC_96 },
+		{ SADB_X_AALG_NULL,		  0, OP_PCL_IPSEC_HMAC_NULL },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ops); i++)
+		if (ops[i].alg == alg && ops[i].icv_bits == icv_bits)
+			return ops[i].op;
+	return -1;
+}
+
+int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, unsigned int icv_bits,
+			      U16 key_bits, U8 *key)
+{
+	int      algo;
 
 	if ((key_bits/8) > IPSEC_MAX_KEY_SIZE)
 	{
@@ -174,38 +211,18 @@ int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
 		return -1;
 	}
 
-	switch (key_alg) {
-		case SADB_AALG_MD5HMAC:
-			algo =OP_PCL_IPSEC_HMAC_MD5_96;
-			break;
-		case SADB_AALG_SHA1HMAC:
-			algo = OP_PCL_IPSEC_HMAC_SHA1_96;
-			break;
-		case SADB_X_AALG_SHA2_256HMAC:
-			algo = OP_PCL_IPSEC_HMAC_SHA2_256_128;
-			break;
-		case SADB_X_AALG_SHA2_384HMAC:
-			algo = OP_PCL_IPSEC_HMAC_SHA2_384_192;
-			break;
-		case SADB_X_AALG_SHA2_512HMAC:
-			algo = OP_PCL_IPSEC_HMAC_SHA2_512_256;
-			break;
-		case SADB_X_AALG_AES_XCBC_MAC:
-			algo = OP_PCL_IPSEC_AES_XCBC_MAC_96;
-			break;
-		case SADB_X_AALG_NULL:
-			algo  =OP_PCL_IPSEC_HMAC_NULL;
-			break;
-		default:
-			return -1;
-	}
+	algo = cdx_ipsec_auth_op(key_alg, icv_bits);
+	if (algo < 0)
+		return -1;
 	sa->pSec_sa_context->auth_data.auth_type = algo;
 	sa->pSec_sa_context->auth_data.auth_key_len = (key_bits/8);
 	memcpy(sa->pSec_sa_context->auth_data.auth_key,	key, (key_bits/8));
 	/* Generate the split key from the normal auth key. XCBC-MAC derives
 	 * its keys inside the SEC program and null auth has no key at all, so
 	 * neither has a split key to compute. Compare in the OP_PCL namespace
-	 * that the switch above produced, not the SADB one it consumed. */
+	 * that the mapping above produced, not the SADB one it consumed. A
+	 * truncation changes only the operation, never the split key: MD5 and
+	 * SHA-1 derive the same one at either ICV length. */
 	if (algo != OP_PCL_IPSEC_AES_XCBC_MAC_96 && algo != OP_PCL_IPSEC_HMAC_NULL)
 		cdx_ipsec_generate_split_key(&sa->pSec_sa_context->auth_data );
 	return 0;

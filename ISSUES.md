@@ -258,6 +258,9 @@ file's git history.
 - [x] **A224.** Inbound IPsec read another driver's netdev private area as a DPAA port's: the driver's submit for ESP arriving on a bridge, VLAN-over-bridge or veth, and the exception queue for an SA whose local endpoint was on a Wi-Fi VAP —
   fixed (_:/^sdk_dpaa, cdx: take a DPAA port's private area only from a DPAA port_).
 
+- [x] **A223.** The adapter ignored an HMAC's truncation, so an SA at a length SEC has no operation for (SHA-256 at 96 bits) failed the ICV check both ways, and `cmac(aes)`, which has no PF_KEY number, was offloaded unauthenticated —
+  fixed (_:/^cdx: carry an HMAC's truncation, refusing lengths SEC lacks_).
+
 - [x] **A220.** An offloaded AES-GMAC (`rfc4543`) SA failed the ICV check both ways: SEC's GMAC leaves out the IV that RFC 4543 authenticates —
   refused for packet offload (_:/^cdx: refuse GMAC offload, whose SEC ICV leaves out the IV_).
 

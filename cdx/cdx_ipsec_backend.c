@@ -145,6 +145,12 @@ bool cdx_ipsec_port_supported(struct net_device *dev)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_port_supported, ASK_CDX_FLOWTABLE);
 
+bool cdx_ipsec_auth_supported(u16 alg, unsigned int icv_bits)
+{
+	return cdx_ipsec_auth_op(alg, icv_bits) >= 0;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_auth_supported, ASK_CDX_FLOWTABLE);
+
 /* Build the outer header a tunnel-mode SA prepends.
  *
  * Built here, from the spec, keeps the ESP next header and the two header
@@ -199,8 +205,8 @@ static void cdx_ipsec_set_natt(unsigned short *sport, unsigned short *dport,
 static int cdx_ipsec_set_keys(PSAEntry sa, const struct cdx_ipsec_sa_spec *spec)
 {
 	if (spec->auth.alg &&
-	    M_ipsec_sa_set_digest_key(sa, spec->auth.alg, spec->auth.bits,
-				      (U8 *)spec->auth.key))
+	    M_ipsec_sa_set_digest_key(sa, spec->auth.alg, spec->auth.icv_bits,
+				      spec->auth.bits, (U8 *)spec->auth.key))
 		return -EOPNOTSUPP;
 	if (spec->crypt.alg &&
 	    M_ipsec_sa_set_cipher_key(sa, spec->crypt.alg, spec->crypt.bits,
@@ -251,6 +257,12 @@ static int cdx_ipsec_validate(const struct cdx_ipsec_sa_spec *spec)
 	 * nothing should ask: it is the shape a zeroed spec has, so accepting
 	 * it turns a caller's omission into plaintext on the wire. */
 	if (!spec->auth.alg && !spec->crypt.alg)
+		return -EOPNOTSUPP;
+	/* SEC fixes the ICV in the operation, so a truncation it has no
+	 * operation for is refused here, before anything is built, rather
+	 * than by the key setter once the SA exists. */
+	if (spec->auth.alg &&
+	    !cdx_ipsec_auth_supported(spec->auth.alg, spec->auth.icv_bits))
 		return -EOPNOTSUPP;
 	/* An outbound SA leaves SEC already addressed, so a next hop is part
 	 * of describing it rather than something to discover later. */

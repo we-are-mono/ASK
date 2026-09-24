@@ -49,9 +49,10 @@ def test_ipsec_adapter(tmp_path):
     # SA spec, to the rule or to the watch has to fail here rather than
     # compile into a harness that no longer matches what the adapter keeps.
     (tmp_path / "ipsec_types.inc").write_text(
-        # The AEAD identities xfrm hands the adapter in x->props.ealgo.
-        "\n".join(re.findall(r"^#define\s+SADB_X_EALG_(?:AES_GCM_ICV\d+|NULL_AES_GMAC)\s.*$",
-                             pfkey, re.M)) + "\n"
+        # The identities xfrm hands the adapter in x->props.aalgo and
+        # x->props.ealgo.
+        "\n".join(re.findall(r"^#define\s+SADB_(?:X_EALG_(?:AES_GCM_ICV\d+|NULL_AES_GMAC)|"
+                             r"(?:X_)?AALG_\w+)\s.*$", pfkey, re.M)) + "\n"
         + rule[rule.index("#define CDX_FT_VLAN_MAX"):
              rule.index("/* Process-context transactions")]
         + backend[backend.index("#define CDX_IPSEC_KEY_MAX"):
@@ -63,6 +64,14 @@ def test_ipsec_adapter(tmp_path):
         # for them, again up to that pass's work item.
         + source[source.index("struct ft_ipsec_retirement {"):
                  source.index("static void ft_ipsec_stats_work(struct work_struct")])
+    # Which authenticators SEC produces: the one table that decides it and
+    # the backend's predicate over it, with SEC's operation codes as cdx
+    # defines them.
+    (tmp_path / "ipsec_auth.inc").write_text(
+        "\n".join(re.findall(r"^#define\s+OP_PCL_IPSEC_(?:HMAC_\w+|AES_XCBC_MAC_96)\s.*$",
+                             (ROOT / "cdx/cdx_dpa_ipsec.h").read_text(), re.M)) + "\n"
+        + function((ROOT / "cdx/control_ipsec.c").read_text(), "cdx_ipsec_auth_op")
+        + function((ROOT / "cdx/cdx_ipsec_backend.c").read_text(), "cdx_ipsec_auth_supported"))
     # The extraction order is not the file's: the policy half sits with the
     # rule callbacks, the watch with the other dependency watches and the
     # translation with the xfrmdev ops. Ordering here rather than
@@ -242,6 +251,42 @@ def test_sa_cache(tmp_path):
     assert "SA cache:" in result.stdout
 
 
+def test_ipsec_keys(tmp_path):
+    """What the key setter programs from a spec: the authenticator's SEC
+    operation, which fixes the ICV, and its key and length -- compiled from
+    the backend and control_ipsec.c."""
+    control = (ROOT / "cdx/control_ipsec.c").read_text()
+    header = (ROOT / "cdx/control_ipsec.h").read_text()
+    backend = (ROOT / "cdx/cdx_ipsec_backend.c").read_text()
+    spec = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    (tmp_path / "ipsec_keys_types.inc").write_text(
+        "\n".join(re.findall(r"^#define\s+SADB_(?:X_)?AALG_\w+\s.*$",
+                             (kernel / "include/uapi/linux/pfkeyv2.h").read_text(), re.M)) + "\n"
+        + "\n".join(re.findall(r"^#define\s+OP_PCL_IPSEC_(?:HMAC_\w+|AES_XCBC_MAC_96)\s.*$",
+                               (ROOT / "cdx/cdx_dpa_ipsec.h").read_text(), re.M)) + "\n"
+        + re.search(r"^#define IPSEC_MAX_KEY_SIZE\s.*$", header, re.M).group() + "\n"
+        + re.search(r"^struct cipher_params \{.*?^\};", header, re.S | re.M).group() + "\n"
+        + re.search(r"^struct auth_params \{.*?^\};", header, re.S | re.M).group() + "\n"
+        + spec[spec.index("#define CDX_IPSEC_KEY_MAX"):spec.index("/* SA operations run inside")])
+    (tmp_path / "ipsec_keys_production.inc").write_text(
+        function(control, "cdx_ipsec_auth_op")
+        + function(control, "M_ipsec_sa_set_digest_key")
+        + function(backend, "cdx_ipsec_set_keys"))
+    binary = tmp_path / "ipsec_keys"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("ipsec_keys.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+
+
 def test_ipsec_receive_ownership(tmp_path):
     """What SEC hands back on an SA's exception queue: who owns the frame
     descriptor, the skb and the SA reference on every way through, and that
@@ -379,6 +424,14 @@ def test_ipsec_backend(tmp_path):
         + "\n".join(re.findall(r"^#define\s+SEQ_NUM_(?:HI|LOW)_MASK\s.*$", sec, re.M)) + "\n"
         + function(sec, "cdx_ipsec_build_in_replay")
         + function(backend, "cdx_ipsec_set_sequence")
+        # The authenticators SEC produces, which the validator admits: the
+        # PF_KEY numbers, SEC's operation codes and the table between them.
+        + "\n".join(re.findall(r"^#define\s+SADB_(?:X_)?AALG_\w+\s.*$",
+                               (kernel / "include/uapi/linux/pfkeyv2.h").read_text(), re.M)) + "\n"
+        + "\n".join(re.findall(r"^#define\s+OP_PCL_IPSEC_(?:HMAC_\w+|AES_XCBC_MAC_96)\s.*$",
+                               (ROOT / "cdx/cdx_dpa_ipsec.h").read_text(), re.M)) + "\n"
+        + function((ROOT / "cdx/control_ipsec.c").read_text(), "cdx_ipsec_auth_op")
+        + function(backend, "cdx_ipsec_auth_supported")
         + function(backend, "cdx_ipsec_validate")
         + function(backend, "cdx_ipsec_sa_sample")
         + function(backend, "cdx_ipsec_sa_replay_sample")

@@ -679,6 +679,17 @@ static void test_validate(void)
 	spec.dir = CDX_IPSEC_DIR_IN;
 	assert(cdx_ipsec_validate(&spec) == 0);
 
+	/* An authenticator only at a truncation SEC has an operation for,
+	 * refused before anything is built: SHA-256 at RFC 4868's 128 bits,
+	 * not at the 96 an older peer uses. */
+	spec.auth.alg = SADB_X_AALG_SHA2_256HMAC;
+	spec.auth.bits = 256;
+	spec.auth.icv_bits = 128;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.auth.icv_bits = 96;
+	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
+	memset(&spec.auth, 0, sizeof(spec.auth));
+
 	/* Every window SEC can keep, and none wider: a narrower one would
 	 * drop late frames the configuration accepts. */
 	spec.replay_window = CDX_IPSEC_REPLAY_WINDOW_MAX;

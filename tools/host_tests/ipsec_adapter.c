@@ -361,7 +361,7 @@ struct flowi {
 typedef union { __be32 a4; __be32 a6[4]; } xfrm_address_t;
 
 struct xfrm_algo { u16 alg_key_len; char alg_key[128]; };
-struct xfrm_algo_auth { u16 alg_key_len; char alg_key[128]; };
+struct xfrm_algo_auth { u16 alg_key_len; unsigned int alg_trunc_len; char alg_key[128]; };
 struct xfrm_algo_aead { u16 alg_key_len; char alg_key[128]; };
 struct xfrm_encap_tmpl { u16 encap_type; __be16 encap_sport, encap_dport; };
 
@@ -695,6 +695,10 @@ static bool cdx_ipsec_port_supported(struct net_device *dev)
 {
 	return dev && dev->physical && port_supported;
 }
+/* Which authenticators SEC produces: the backend's predicate and the table
+ * behind it, compiled, with SEC's operation codes from cdx's own header. */
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#include "ipsec_auth.inc"
 
 /* The control-plane transaction. The rebuild must hold it; the resolution
  * that precedes the rebuild must not. */
@@ -978,7 +982,7 @@ static struct neighbour peer_neigh = {
 };
 static struct rtable wan_route;
 
-static struct xfrm_algo_auth auth_key = { .alg_key_len = 160 };
+static struct xfrm_algo_auth auth_key = { .alg_key_len = 160, .alg_trunc_len = 96 };
 static struct xfrm_algo cipher_key = { .alg_key_len = 128 };
 
 static struct xfrm_state *outbound_state(void)
@@ -1049,6 +1053,7 @@ static void bench_reset(void)
 	slept = 0;
 	neigh_probes = 0;
 	auth_key.alg_key_len = 160;
+	auth_key.alg_trunc_len = 96;
 	assert(neigh_refs == 0);
 	assert(xfrm_state_refs == 0);
 	assert(dev_holds == 0);
@@ -1236,6 +1241,80 @@ static void test_spec_aead(void)
 		/* Refused before anything is resolved for it. */
 		assert(route_lookups == lookups);
 	}
+}
+
+/* An authenticator is its algorithm and the ICV it is truncated to, and SEC
+ * fixes the ICV in its protocol operation. Every pair SEC has is admitted,
+ * carries its length to the backend and selects that operation; every other
+ * truncation of the same algorithms, and an algorithm SEC has no operation
+ * for at all, is refused in both directions before anything is resolved, and
+ * says why. */
+static void test_spec_auth(void)
+{
+	/* The oracle is SEC RM table 7-54 rather than the code: each pair's
+	 * PROTINFO[7:0], whose name states the ICV it produces. */
+	static const struct { u8 alg; unsigned icv_bits; int op; } admitted[] = {
+		{ SADB_AALG_MD5HMAC, 96, 0x01 },		/* HMAC_MD5_96 */
+		{ SADB_AALG_MD5HMAC, 128, 0x06 },		/* HMAC_MD5_128 */
+		{ SADB_AALG_SHA1HMAC, 96, 0x02 },		/* HMAC_SHA1_96 */
+		{ SADB_AALG_SHA1HMAC, 160, 0x07 },		/* HMAC_SHA1_160 */
+		{ SADB_X_AALG_SHA2_256HMAC, 128, 0x0c },	/* HMAC_SHA2_256_128 */
+		{ SADB_X_AALG_SHA2_384HMAC, 192, 0x0d },	/* HMAC_SHA2_384_192 */
+		{ SADB_X_AALG_SHA2_512HMAC, 256, 0x0e },	/* HMAC_SHA2_512_256 */
+		{ SADB_X_AALG_AES_XCBC_MAC, 96, 0x05 },		/* AES_XCBC_MAC_96 */
+		{ SADB_X_AALG_NULL, 0, 0x00 },			/* NULL */
+	};
+	/* Every authenticator xfrm can hand over, and the widest truncation it
+	 * accepts for each: its full digest. xfrm's cmac(aes) has no PF_KEY
+	 * number and arrives as algorithm 0 with a key; zero reads as "no
+	 * authenticator" further down, so it has to be refused here rather
+	 * than passed on, or the SA would leave unauthenticated. */
+	static const struct { u8 alg; unsigned full_bits; } algorithms[] = {
+		{ SADB_AALG_MD5HMAC, 128 }, { SADB_AALG_SHA1HMAC, 160 },
+		{ SADB_X_AALG_SHA2_256HMAC, 256 }, { SADB_X_AALG_SHA2_384HMAC, 384 },
+		{ SADB_X_AALG_SHA2_512HMAC, 512 }, { SADB_X_AALG_RIPEMD160HMAC, 160 },
+		{ SADB_X_AALG_AES_XCBC_MAC, 128 }, { SADB_X_AALG_SM3_256HMAC, 256 },
+		{ SADB_X_AALG_NULL, 0 }, { 0 /* cmac(aes) */, 128 },
+	};
+	struct cdx_ipsec_sa_spec spec;
+	struct netlink_ext_ack ack;
+	struct xfrm_state *x;
+	unsigned dir, a, bits, i, lookups, admissions = 0;
+
+	bench_reset();
+	for (dir = XFRM_DEV_OFFLOAD_OUT; dir <= XFRM_DEV_OFFLOAD_IN; dir++) {
+		for (a = 0; a < sizeof(algorithms) / sizeof(algorithms[0]); a++) {
+			for (bits = 0; bits <= algorithms[a].full_bits; bits++) {
+				int op = -1;
+
+				for (i = 0; i < sizeof(admitted) / sizeof(admitted[0]); i++)
+					if (admitted[i].alg == algorithms[a].alg &&
+					    admitted[i].icv_bits == bits)
+						op = admitted[i].op;
+				x = outbound_state();
+				x->xso.dir = dir;
+				x->props.aalgo = algorithms[a].alg;
+				auth_key.alg_trunc_len = bits;
+				assert(cdx_ipsec_auth_op(algorithms[a].alg, bits) == op);
+				assert(cdx_ipsec_auth_supported(algorithms[a].alg, bits) == (op >= 0));
+				ack._msg = NULL;
+				lookups = route_lookups;
+				if (op >= 0) {
+					assert(ft_ipsec_spec(x, &spec, &ack) == 0 && !ack._msg);
+					assert(spec.auth.alg == algorithms[a].alg);
+					assert(spec.auth.icv_bits == bits && spec.auth.bits == 160);
+					admissions++;
+					continue;
+				}
+				assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+				assert(ack._msg && strstr(ack._msg, "ICV length"));
+				assert(route_lookups == lookups);
+			}
+		}
+	}
+	/* Each pair once per direction, so none of the oracle went untried. */
+	assert(admissions == 2 * sizeof(admitted) / sizeof(admitted[0]));
+	auth_key.alg_trunc_len = 96;
 }
 
 static void test_next_hop(void)
@@ -3308,6 +3387,7 @@ int main(void)
 {
 	test_spec();
 	test_spec_aead();
+	test_spec_auth();
 	test_next_hop();
 	test_state_add();
 	test_policy_add();

@@ -217,7 +217,11 @@ void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto,
 			      U8 family, U16 handle, U8 replay, U8 esn,
 			      U16 mtu, U16 dev_mtu, U8 dir);
 int M_ipsec_sa_cache_delete(U16 handle);
-int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8 *key);
+/* An authenticator is its algorithm and the ICV it truncates to, in bits;
+ * cdx_ipsec_auth_op() is the one list of pairs SEC produces. */
+int cdx_ipsec_auth_op(u16 alg, unsigned int icv_bits);
+int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, unsigned int icv_bits,
+			      U16 key_bits, U8 *key);
 int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8 *key);
 int ipsec_install_fp_entry(PSAEntry sa);
 extern struct slist_head sa_cache_by_h[];
