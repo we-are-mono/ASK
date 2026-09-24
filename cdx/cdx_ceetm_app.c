@@ -43,15 +43,7 @@ static int ceetm_release_channels(void);
  *
  * Channel zero means "whichever channel this port owns", which is how a
  * conntrack mark spells a class that does not care; every other value is
- * one-based.
- *
- * This used to OR the class-queue policer's profile number into the returned
- * FQ's own fqid, which is a value the *microcode* wants and the software Tx
- * path must never see -- and it wrote it into an object every caller shares.
- * The clearing branch could not undo it either, because it required the
- * policer to be disabled. The byte is composed by value in
- * ceetm_egress_fqid() instead, where the parameter block is written, and the
- * qman_fq itself is now never written to at all.
+ * one-based. The qman_fq is shared by every caller and never written here.
  */
 /* The channel index a mark's nibble names, or negative for none.
  *
@@ -87,30 +79,17 @@ static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t 
 	return &chnl_ctx->cq_info[classque].ceetmfq.egress_fq;
 }
 
-/* The same queue's fqid as the microcode wants it: the class-queue policer's
- * profile number in the top byte when that policer is on, and a clear top byte
- * when it is not. Zero means there is no such queue.
- *
- * By value, because the two readings of an fqid differ and only one of them
- * belongs in the shared qman_fq. A frame the CPU enqueues goes to the FQ
- * object; a frame the hardware forwards is described by a number in a
- * parameter block, and that number is this one.
+/* The same queue's fqid as the microcode wants it, or zero if there is no
+ * such queue. A frame the CPU enqueues goes to the FQ object; a frame the
+ * hardware forwards is described by a number in a parameter block, and that
+ * number is this one. The microcode reads the byte above the 24-bit fqid as a
+ * class-queue policer's profile; cdx enables none, so that byte stays clear.
  */
 uint32_t ceetm_egress_fqid(void *ctx, uint32_t channel, uint32_t classque)
 {
-	struct ceetm_chnl_info *chnl_ctx;
 	struct qman_fq *fq = ceetm_get_egressfq(ctx, channel, classque);
-	int resolved;
-	uint32_t fqid;
 
-	if (!fq)
-		return 0;
-	resolved = ceetm_resolve_channel(ctx, channel);
-	chnl_ctx = &qm_chnl_info[resolved];
-	fqid = fq->fqid & 0x00FFFFFF;
-	if (chnl_ctx->cq_info[classque].cq_shaper_enable)
-		fqid |= (uint32_t)chnl_ctx->cq_info[classque].pp_num << 24;
-	return fqid;
+	return fq ? fq->fqid & 0x00FFFFFF : 0;
 }
 
 /* The Tx path's hook keeps the SDK's four-argument shape, whose last argument
@@ -713,17 +692,13 @@ static int ceetm_create_cq_policer_profiles(t_Handle h_FmPcd, struct classque_in
 		 __func__, profile);
 		return CEETM_FAILURE;
 	}
-	cqinfo->pp_num = FmPcdPlcrProfileGetAbsoluteId(cqinfo->pp_handle);
-
-	ceetm_dbg("%s:plcr profile created for  handle %p,profile_id %d\n",
-		__func__, cqinfo->pp_handle,cqinfo->pp_num);
+	ceetm_dbg("%s:plcr profile created for handle %p, profile %d\n",
+		__func__, cqinfo->pp_handle, profile);
 	ceetm_dbg("cir %u, pir %u, cbs %d, pbs %d\n",
 			Params.nonPassthroughAlgParams.committedInfoRate,
 			Params.nonPassthroughAlgParams.peakOrExcessInfoRate,
 			Params.nonPassthroughAlgParams.committedBurstSize,
 			Params.nonPassthroughAlgParams.peakOrExcessBurstSize);
-
-	cqinfo->cq_shaper_enable = DISABLE_POLICER;
 	return CEETM_SUCCESS;
 }
 
@@ -934,8 +909,6 @@ int ceetm_exit_cq_plcr(void)
 			/* The SDK invalidates the profile and releases its lock
 			 * even when the hardware command fails. */
 			cqinfo->pp_handle = NULL;
-			cqinfo->pp_num = 0;
-			cqinfo->cq_shaper_enable = DISABLE_POLICER;
 		}
 		qm_chnl_info[ii].pcd_handle = NULL;
 	}
@@ -1100,7 +1073,6 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 					}
 				}
 				ceetm_set_default_cq_policer_profile(qm_channel->pcd_handle,cqinfo);
-				cqinfo->cq_shaper_enable = DISABLE_POLICER;
 				cqinfo++;
 			}
 		}		
@@ -1831,8 +1803,7 @@ int ceetm_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, uint8_t chan
 		return CEETM_FAILURE;
 	}
 
-		/* fast path wants the same queue as a number, with the
-		 * class-queue policer's profile byte in it */
+		/* fast path wants the same queue as a number */
 	fqid = ceetm_egress_fqid(qm_ctx, channel_num, clsqueue_num);
 	if (!fqid || add_dscp_fq_map_ff(qm_ctx, dscp, fqid))
 	{

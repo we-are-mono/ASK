@@ -1,14 +1,13 @@
 /* Which class queue a (channel, class queue) pair names, and the two readings
  * of its frame queue.
  *
- * There are two, and conflating them is what made this worth pinning. The
- * software Tx path enqueues to the `struct qman_fq` itself; the microcode is
- * handed a *number*, and that number carries the class-queue policer's profile
- * in its top byte. The lookup used to serve the second reading by ORing the
- * byte into the shared object's own fqid -- which every other caller then saw,
- * with no way back, because the clearing branch required the policer to be off.
+ * The software Tx path enqueues to the `struct qman_fq` itself; the microcode
+ * is handed a *number*, whose byte above the 24-bit fqid it would read as a
+ * class-queue policer's profile. The lookup once composed that byte into the
+ * shared object's own fqid, which every other caller then saw.
  *
- * So the invariant here is blunt: asking for the fqid never changes the queue.
+ * So the invariant here is blunt: asking for the fqid never changes the queue,
+ * and the number handed to the microcode never carries a top byte.
  */
 #include <assert.h>
 #include <stdbool.h>
@@ -20,8 +19,6 @@
 typedef uint8_t u8; typedef uint32_t u32;
 #define CDX_CEETM_MAX_CHANNELS			8
 #define CDX_CEETM_MAX_QUEUES_PER_CHANNEL	16
-#define DISABLE_POLICER				0
-#define ENABLE_POLICER				1
 #define ceetm_dbg(...)				do { } while (0)
 
 /* The kernel's fls: one-based index of the highest set bit, zero for zero. */
@@ -37,8 +34,6 @@ struct qman_fq { uint32_t fqid; };
 struct cq_info {
     struct { struct qman_fq egress_fq; } ceetmfq;
     uint32_t fq_created;
-    uint32_t cq_shaper_enable;
-    uint8_t  pp_num;
 };
 
 struct ceetm_chnl_info {
@@ -144,46 +139,28 @@ int main(void)
 
     /* ---- the two readings ---- */
 
-    /* With no class-queue policer the number is the queue's own fqid. */
+    /* The number is the queue's own fqid, and zero for no queue. */
     assert(ceetm_egress_fqid(&port, 1, 3) == 0x000123);
     assert(ceetm_egress_fqid(&port, 0, 5) == 0x000456);
     assert(ceetm_egress_fqid(&port, 1, 4) == 0);
     assert(ceetm_egress_fqid(&port, 2, 5) == 0);
 
-    /* With one, the profile number rides in the top byte -- of the value. */
-    qm_chnl_info[0].cq_info[3].cq_shaper_enable = ENABLE_POLICER;
-    qm_chnl_info[0].cq_info[3].pp_num = 0x2a;
-    assert(ceetm_egress_fqid(&port, 1, 3) == 0x2a000123);
-
-    /* And the queue is untouched by having been asked. This is the whole
-     * point: the software Tx path enqueues to this object, and a policer
-     * profile number in its fqid is not a frame queue. */
+    /* And the queue is untouched by having been asked, however often. The
+     * software Tx path enqueues to this object. */
     fq = ceetm_get_egressfq(&port, 1, 3);
-    assert(fq->fqid == 0x000123);
-    /* Asking repeatedly does not accumulate, either. */
-    assert(ceetm_egress_fqid(&port, 1, 3) == 0x2a000123);
-    assert(ceetm_egress_fqid(&port, 1, 3) == 0x2a000123);
-    assert(fq->fqid == 0x000123);
-
-    /* Turning the policer off is enough to clear the byte, without anything
-     * having to remember to undo a write. Under the old lookup this was an
-     * `else if' that a fast-path call could skip entirely. */
-    qm_chnl_info[0].cq_info[3].cq_shaper_enable = DISABLE_POLICER;
+    assert(ceetm_egress_fqid(&port, 1, 3) == 0x000123);
     assert(ceetm_egress_fqid(&port, 1, 3) == 0x000123);
     assert(fq->fqid == 0x000123);
 
-    /* A queue whose stored fqid already has a top byte -- the state the old
-     * lookup could leave behind -- is still reported as the hardware's, not
-     * doubled up with a second profile number. */
+    /* A stored fqid with a top byte -- the state the old lookup could leave
+     * behind -- reaches the microcode without it, so it can never be read as
+     * a policer profile. */
     qm_chnl_info[2].cq_info[5].ceetmfq.egress_fq.fqid = 0x99000456;
-    qm_chnl_info[2].cq_info[5].cq_shaper_enable = ENABLE_POLICER;
-    qm_chnl_info[2].cq_info[5].pp_num = 0x07;
-    assert(ceetm_egress_fqid(&port, 0, 5) == 0x07000456);
+    assert(ceetm_egress_fqid(&port, 0, 5) == 0x000456);
 
     /* ---- what a classifier entry is given ---- */
 
     qm_chnl_info[2].cq_info[5].ceetmfq.egress_fq.fqid = 0x000456;
-    qm_chnl_info[2].cq_info[5].cq_shaper_enable = DISABLE_POLICER;
     provide(2, 0, 0x000400, &port);
     provide(0, 7, 0x000107, &port);
     struct net_device dev = { .netdev_ops = &dpa_ops,

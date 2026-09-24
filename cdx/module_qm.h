@@ -67,8 +67,6 @@ struct classque_info {
 	};
 	uint32_t qdepth;		/* CQ depths */
 	uint32_t shaper_rate;	/* shaper rate in Kbps */
-	uint32_t cq_shaper_enable;	/* cq shaper */
-	uint8_t  pp_num;		/* policer profile number */
 	void     *pp_handle;	/* policer profile handle */
 	void     *pcd_handle;       /* handle to fm_pcd device for this fman */
 };
@@ -126,7 +124,6 @@ struct ceetm_chnl_info {
 #define SHAPER_ON               1
 #define SHAPER_OFF              2
 
-#define DISABLE_POLICER         0
 #define DEFAULT_CQ_CIR_VALUE 0xffffffff
 #define DEFAULT_CQ_PIR_VALUE 0xffffffff
 /* For byte mode this is the max expected pkt size */

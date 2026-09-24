@@ -29,7 +29,6 @@ static int atomic_read(atomic_t *p) { return p->value; }
 #define DEFAULT_CQ_PIR_VALUE 100
 #define DEFAULT_CQ_BYTE_MODE_CBS 2000
 #define DEFAULT_CQ_BYTE_MODE_PBS 2000
-#define DISABLE_POLICER 0
 #define KERN_INFO ""
 #define printk(...) ((void)0)
 #define ceetm_err(...) ((void)0)
@@ -284,7 +283,6 @@ static void *FM_PCD_PlcrProfileSet(void *pcd, t_FmPcdPlcrProfileParams *params)
     if (p) profiles++;
     return p;
 }
-static unsigned FmPcdPlcrProfileGetAbsoluteId(void *p) { return profiles; }
 static int FM_PCD_PlcrProfileDelete(void *p)
 { assert(profiles); profiles--; kfree(p); return release_error ? -EIO : 0; }
 static int qman_ceetm_sp_claim(struct qm_ceetm_sp **out, unsigned fm, unsigned index)
