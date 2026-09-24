@@ -61,7 +61,7 @@ except BaseException:
         await change(["ip", "addr", "add", GATEWAY + "/24", "dev", TARGET_LAN_IF],
                      ["ip", "addr", "del", GATEWAY + "/24", "dev", TARGET_LAN_IF])
         for p in peers:
-            await change(["ip", "route", "add", p["lan"] + "/32", "dev", TARGET_LAN_IF, "mtu", "1200"],
+            await change(["ip", "route", "add", p["lan"] + "/32", "dev", TARGET_LAN_IF],
                          ["ip", "route", "del", p["lan"] + "/32", "dev", TARGET_LAN_IF])
             await change(["ip", "neigh", "add", p["lan"], "lladdr", p["mac"], "nud", "permanent", "dev", TARGET_LAN_IF],
                          ["ip", "neigh", "del", p["lan"], "dev", TARGET_LAN_IF])
@@ -149,8 +149,11 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
                 initial = await hardware(r, p, expected, "hardware")
                 assert all(f["in"] == f["out"] == TARGET_LAN_IF for f in initial["flows"]), initial
                 ct_before = await conntracks()
+                # A real route change that leaves the path a full frame, as
+                # in the DNAT case: a smaller MTU would keep the UDP direction
+                # toward the server in Linux.
                 await console_command(con, "ip", "route", "replace", SERVER["lan"] + "/32", "dev", TARGET_LAN_IF,
-                                      "mtu", "1200", "advmss", "1100")
+                                      "advmss", "1100")
                 routed = await warm(r, p, expected)
                 assert routed["route_invalidations"] > initial["route_invalidations"], (initial, routed)
                 assert routed["deletes"] >= initial["deletes"] + 4, (initial, routed)

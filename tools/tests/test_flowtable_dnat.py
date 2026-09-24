@@ -51,13 +51,13 @@ class LocalClients:
         await asyncio.gather(*(f.close() for f in self.flows.values()))
 
 
-def translation_rows(state, expected):
+def translation_rows(r, state, expected):
     healthy(state)
     rows = by_key(state)
     assert rows.keys() == expected.keys(), (state, expected)
     for key, values in expected.items():
         assert tuple(rows[key][k] for k in ("new_src", "new_dst", "nexthop")) == values, rows[key]
-        assert rows[key]["mtu"] == "1200", rows[key]
+        assert int(rows[key]["mtu"]) == r.port_mtu, rows[key]
     return rows
 
 
@@ -66,14 +66,14 @@ async def warm(r, clients, expected):
         await clients.batch([0, 1])
         state = await r.state()
         if state["entries"] == len(expected):
-            translation_rows(state, expected)
+            translation_rows(r, state, expected)
             return state
     pytest.fail(f"NAT admission did not converge: {state}")
 
 
 async def hardware(r, clients, expected, label):
     before = await r.state()
-    old = translation_rows(before, expected)
+    old = translation_rows(r, before, expected)
     tx_before, cpu_before = await software_tx(r), await cpu(r)
     # 256 packets is the assertion below; the spacing only has to keep some
     # wall-clock in the window so an event-driven retirement would have room
@@ -84,7 +84,7 @@ async def hardware(r, clients, expected, label):
     reports = await clients.batch([0, 1], 256, 0.015625)
     cpu_after, tx_after = await cpu(r), await software_tx(r)
     after = await r.state()
-    new = translation_rows(after, expected)
+    new = translation_rows(r, after, expected)
     assert (after["installs"], after["deletes"]) == (before["installs"], before["deletes"]), (before, after)
     for key in old:
         assert new[key]["cookie"] == old[key]["cookie"], (before, after)
@@ -171,8 +171,11 @@ async def test_flowtable_dnat(rig, zero_checksum, double_nat=False):
                     assert (await read(r.target, r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage")).strip() == "0"
                     initial = await hardware(r, clients, expected, "dnat-hardware")
                     ct_before = await conntracks()
+                    # A real route change that leaves the path a full frame:
+                    # the advertised MSS is no forwarding input, and a smaller
+                    # MTU would keep the UDP direction toward the LAN in Linux.
                     await console_command(con, "ip", "route", "replace", r.lan_ip + "/32", "dev", TARGET_LAN_IF,
-                                          "mtu", "1200", "advmss", "1100")
+                                          "advmss", "1100")
                     routed = await warm(r, clients, expected)
                     assert routed["route_invalidations"] > initial["route_invalidations"], (initial, routed)
                     assert routed["deletes"] >= initial["deletes"] + 4, (initial, routed)

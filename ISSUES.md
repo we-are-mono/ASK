@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A202.** The microcode's IPv4 fragments of a frame received on an Ethernet port carry an all-zero payload, and a UDP direction into a smaller path was offloaded —
+  fixed (_:/^flowtable: keep non-TCP IPv4 out of a path smaller than its ingress_).
+
 - [x] **A215.** An MSTI remap or MST switched off stopped bridge ports without naming them, and their software flows were never swept —
   fixed (_:/^cdx: sweep a bridge whose MST events stop ports without saying which_).
 

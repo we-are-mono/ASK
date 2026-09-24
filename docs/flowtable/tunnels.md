@@ -170,7 +170,10 @@ the microcode would fragment the outer packet of an oversized one where Linux
 sends the inner Packet Too Big. It is admitted only while the LAN's IPv6 MTU
 is no larger than the tunnel's ([ipv6.md](ipv6.md#packets-larger-than-the-path)),
 so the rig sets the LAN's IPv6 MTU to the tunnel's, the configuration a 6in4
-LAN wants anyway.
+LAN wants anyway. A 4o6 egress direction other than TCP stays in software
+from an Ethernet LAN whatever its MTU, because the microcode's IPv4 fragments
+of a received frame carry no payload
+([architecture.md](architecture.md#native-context-and-admission)).
 
 ## Per-tunnel-device counters
 

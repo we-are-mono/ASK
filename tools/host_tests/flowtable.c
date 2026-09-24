@@ -19,8 +19,10 @@ static u32 rol32(u32 v, unsigned n) { return (v << n) | (v >> (32 - n)); }
 #include "flowtable_hash.inc"
 static u32 get_random_u32(void) { return 0x87654321; }
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+#define max_t(type, a, b) ((type)(a) > (type)(b) ? (type)(a) : (type)(b))
 #define ETH_ALEN 6
 #define ETH_HLEN 14
+#define ETH_DATA_LEN 1500
 #define VLAN_HLEN 4
 #define PPPOE_SES_HLEN 8
 #define ETH_P_IP 0x0800
@@ -1314,6 +1316,7 @@ static void fixture(void)
     ipsec_ok = true;
     ipsec_sa = ipsec_in_sa = 0;
     in.ip6_mtu = 0;
+    in.mtu = 1500;
     ft_ipsec_genid = xfrm_genid = 0;
     assert(!ft_handle_refs && handle.refs <= 1);
     handle = (struct nf_flow_offload_handle){ .refs = 1 };
@@ -1360,7 +1363,9 @@ static void fixture(void)
     rule.action.entries[4].dev = &out;
     egress_session = ingress_session = (struct nf_flow_session){};
     egress_tunnel = ingress_tunnel = (struct nf_flow_tunnel){};
-    cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1492,
+    /* The path as large as the port the flow arrives on, the ordinary
+     * Ethernet case: a case about a smaller one narrows it. */
+    cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1500,
         .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL,
         .nf_session = &egress_session, .nf_session_reverse = &ingress_session,
         .nf_tunnel = &egress_tunnel, .nf_tunnel_reverse = &ingress_tunnel };
@@ -1376,6 +1381,10 @@ static void fixture(void)
 #define V6_LAN 0x202
 #define V6_WAN 0x401
 #define V6_NAT 0x104
+static void tcp_fixture(void);
+static void tcp_flow(void);
+static void udp_flow(void);
+
 static void fixture6(void)
 {
     fixture();
@@ -1397,8 +1406,10 @@ static void fixture6(void)
     reverse_route6.dst.dev = &in;
     cls.nf_dst = &route6.dst; cls.nf_dst_reverse = &reverse_route6.dst;
     cls.nf_dst_cookie = cls.nf_dst_reverse_cookie = 0x5e1;
-    /* The LAN advertises the path's MTU, which is what lets an IPv6
-     * direction into hardware at all when the path is smaller. */
+    /* A path smaller than the port, as a PPPoE uplink's is, and a LAN that
+     * advertises it, which is what lets an IPv6 direction into hardware at
+     * all when the path is smaller. */
+    cls.nf_mtu = 1492;
     in.ip6_mtu = cls.nf_mtu;
     neighbour.tbl = &nd_tbl;
     neighbour.primary_key = (union nf_inet_addr){ .in6 = i6k.dst };
@@ -1497,7 +1508,7 @@ static void test_ipv6(void)
     V6_REJECT(bk.n_proto = htons(ETH_P_IP));
     V6_REJECT(ct.tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.l3num = AF_INET);
     /* IPv6 never fragments in transit, so the floor is its minimum link MTU. */
-    V6_REJECT(cls.nf_mtu = IPV6_MIN_MTU - 1);
+    V6_REJECT(cls.nf_mtu = in.ip6_mtu = IPV6_MIN_MTU - 1);
     fixture6(); cls.nf_mtu = in.ip6_mtu = IPV6_MIN_MTU;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == IPV6_MIN_MTU);
     /* Nor may the microcode fragment one, which it does to anything over the
@@ -1509,11 +1520,34 @@ static void test_ipv6(void)
     V6_REJECT(in.ip6_mtu = 0);
     fixture6(); in.mtu = 9000;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-    in.mtu = 1500;
-    /* IPv4 is not bounded: there the microcode fragments as Linux would, and
-     * hands a DF packet to Linux for its ICMP. */
-    fixture(); in.ip6_mtu = 9000;
-    assert(in.mtu > cls.nf_mtu && ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    /* IPv4 is bounded for what the microcode would fragment -- a packet
+     * without DF over the entry's MTU, whose fragments it builds without
+     * their payload. TCP sets DF, which the microcode hands to Linux, so a
+     * TCP direction is carried into the smaller path; any other one is not.
+     * A direction to or from SEC is never bounded: its fragmenting happens
+     * after SEC, on the offline port. And the IPv6 MTU plays no part. */
+    fixture(); cls.nf_mtu = 1492;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    fixture(); cls.nf_mtu = in.ip6_mtu = 1492;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* A port lowered to the path still receives full Ethernet frames from a
+     * host nobody told, so its MTU never counts for less than that. */
+    fixture(); cls.nf_mtu = in.mtu = 1492;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    tcp_fixture(); cls.nf_mtu = 1492;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 1492);
+    fixture(); cls.nf_mtu = 1492; ipsec_sa = 7;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    fixture(); cls.nf_mtu = 1492; ipsec_in_sa = 8;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    /* Equal is enough, and a larger ingress counts at its own size. */
+    fixture(); in.ip6_mtu = 1280;
+    assert(in.mtu == cls.nf_mtu && ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    fixture(); in.mtu = 9000;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    fixture(); in.mtu = out.mtu = cls.nf_mtu = 9000;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 9000);
+    out.mtu = 1500;
     /* The neighbour must be discovered in the IPv6 table. */
     V6_REJECT(neighbour.tbl = &arp_tbl);
 #undef V6_REJECT
@@ -2662,12 +2696,16 @@ static void session_push(u16 sid)
 /* A session on the egress path, running straight on the physical port. The
  * route names the ppp device, the redirect still names the port, and the
  * session is what lies between. No neighbour moves to the ppp device: there
- * is none to move, which is half the point. */
+ * is none to move, which is half the point. The path is the session's, and
+ * the flow is TCP, the kind carried into a path smaller than the LAN's; see
+ * the reject case for UDP. */
 static void pppoe_out_fixture(void)
 {
     vlan_fixture();
+    tcp_flow();
     assert(!ppp.refs && !in_ppp.refs);
     route.dst.dev = &ppp;
+    cls.nf_mtu = ppp.mtu;
     egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex,
                                                .id = SESSION_ID };
     memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
@@ -2713,6 +2751,19 @@ static void test_pppoe(void)
     /* The MTU is the ppp device's, which already accounts for the eight bytes
      * the session header costs; nothing here has to subtract them. */
     assert(decoded.mtu == 1492 && ppp.mtu == 1492);
+    /* UDP from a 1500-byte LAN into the session would be fragmented by the
+     * microcode, so it stays in software; the other way it fits the LAN.
+     * An ingress session counts eight bytes less of the frame. */
+    PPPOE_REJECT(udp_flow());
+    pppoe_in_fixture(); cls.nf_mtu = 1492;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 1492);
+    pppoe_in_fixture(); cls.nf_mtu = 1491;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* A ppp device set smaller counts for no less: the concentrator may still
+     * send what the Ethernet below carries. */
+    pppoe_in_fixture(); in_ppp.mtu = cls.nf_mtu = 1480;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    in_ppp.mtu = 1492;
 
     /* No neighbour is consulted at all. Making every lookup fail leaves the
      * decode untouched, which an ordinary flow would not survive. */
@@ -2747,7 +2798,9 @@ static void test_pppoe(void)
     /* And over a bridge, where the device below the session has no tag of its
      * own but does have a bridge hop the walk must still cross. */
     bridge_fixture();
+    tcp_flow();
     route.dst.dev = &ppp;
+    cls.nf_mtu = ppp.mtu;
     egress_session = (struct nf_flow_session){ .lower_ifindex = br.ifindex,
                                                .id = SESSION_ID };
     memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
@@ -3298,10 +3351,12 @@ static void sit_in_fixture(void)
 
 /* 4o6 egress: an IPv4 flow leaving by an ip6tnl device in ipip6 mode. Built on
  * the VLAN fixture so the cases that put a tag or a bridge under the tunnel
- * have the devices they need. */
+ * have the devices they need. TCP, the kind carried into the tunnel's path
+ * from a larger LAN; see the reject case for UDP. */
 static void ip6tnl_out_fixture(void)
 {
     vlan_fixture();
+    tcp_flow();
     tunnel_devices();
     route.dst.dev = &ip6tnl;
     cls.nf_mtu = ip6tnl.mtu;
@@ -3409,6 +3464,10 @@ static void test_tunnel(void)
     assert(decoded.family == AF_INET && decoded.out_logical == &ip6tnl);
     assert(!memcmp(decoded.dst_mac, OUTER_MAC, ETH_ALEN));
     assert(decoded.mtu == 1452);
+    /* A 1500-byte LAN into the 1452-byte tunnel: the microcode would
+     * fragment a UDP packet without DF, so that direction stays in software,
+     * while a TCP one is carried -- DF set, its segments clamped. */
+    TUNNEL6_REJECT(udp_flow());
 
     /* 4o6 ingress, and the one per-tunnel property only this mode may carry:
      * the ip6tnl strip can copy the outer DSCP over the inner one. */
@@ -3419,6 +3478,13 @@ static void test_tunnel(void)
     assert(decoded.in_tunnel.flags == CDX_FT_TUNNEL_DSCP_COPY);
     assert(decoded.in_tunnel.header_size == 40 && !decoded.out_tunnel.present);
     assert(decoded.in_logical == &in_ip6tnl);
+    /* What arrives through it is what a full outer packet carries past its
+     * 40-byte header -- a peer need not add the encapsulation limit the
+     * device's own MTU allows for -- so UDP needs that much path. */
+    ip6tnl_in_fixture(); cls.nf_mtu = 1460;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    ip6tnl_in_fixture(); cls.nf_mtu = 1459;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
 
     /* The tunnel over a VLAN device. A tunnel is above every tag, so the
      * device the outer packet leaves by is walked exactly as it would be
@@ -3438,6 +3504,7 @@ static void test_tunnel(void)
     /* And over a bridge, where the device below the tunnel has no tag of its
      * own but does have a bridge hop the walk must still cross. */
     bridge_fixture();
+    tcp_flow();
     tunnel_devices();
     route.dst.dev = &ip6tnl;
     cls.nf_mtu = ip6tnl.mtu;
@@ -3512,6 +3579,9 @@ static void test_tunnel(void)
      * flow through a sit device is IPv4 in IPv4 and an IPv6 one through an
      * ip6tnl device is IPv6 in IPv6, neither of which the hardware builds. */
     vlan_fixture();
+    /* Each flow fits its path otherwise -- TCP, and a LAN advertising the
+     * tunnel's IPv6 MTU -- so the family is the only thing wrong with either. */
+    tcp_flow();
     tunnel_devices();
     route.dst.dev = &sit;
     cls.nf_mtu = sit.mtu;
@@ -3522,7 +3592,7 @@ static void test_tunnel(void)
     fixture6();
     tunnel_devices();
     route6.dst.dev = &ip6tnl;
-    cls.nf_mtu = ip6tnl.mtu;
+    cls.nf_mtu = in.ip6_mtu = ip6tnl.mtu;
     tnl6_hop(&egress_tunnel, out.ifindex);
     tunnel_ethernet_dest(&ip6tnl);
     outer_neighbour(&out, AF_INET6);
@@ -4304,14 +4374,29 @@ static void test_double_nat(void)
     }
 }
 
-static void tcp_fixture(void)
+/* Make whatever flow the fixture built an established TCP one. */
+static void tcp_flow(void)
 {
-    fixture();
     ct.protonum = bk.ip_proto = IPPROTO_TCP;
     ct.tcp_state = TCP_CONNTRACK_ESTABLISHED; ct.status = IPS_ASSURED;
     dissector.used_keys |= BIT(FLOW_DISSECTOR_KEY_TCP);
     tk.flags = 0; tm.flags = htons(5);
     rule.tcp = (struct flow_match_tcp){ &tk, &tm };
+}
+
+/* And back to the plain fixture's UDP, for a TCP fixture's UDP case. */
+static void udp_flow(void)
+{
+    ct.protonum = bk.ip_proto = IPPROTO_UDP;
+    ct.tcp_state = 0; ct.status = 0;
+    dissector.used_keys &= ~BIT(FLOW_DISSECTOR_KEY_TCP);
+    rule.tcp = (struct flow_match_tcp){ 0 };
+}
+
+static void tcp_fixture(void)
+{
+    fixture();
+    tcp_flow();
 }
 #define REJECT(change) do { fixture(); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
 
@@ -5286,6 +5371,12 @@ static void test_device_recovery(void)
                 assert(ft_replace(b, &cls) == -EOPNOTSUPP && !ft_count && !ft_invalid);
                 physical_ok = true;
                 out.mtu = cls.nf_mtu = 1400;
+                /* Now smaller than what the ingress receives, which only a
+                 * TCP direction is carried into: a UDP one stays in software. */
+                if (!tcp) {
+                    assert(ft_replace(b, &cls) == -EOPNOTSUPP && !ft_count && !ft_invalid);
+                    tcp_flow();
+                }
                 assert(ft_replace(b, &cls) == 0);
                 assert(ft_find(b, cls.cookie)->rule.mtu == 1400 && ft_bound == 1);
                 assert(ft_rearms == rearms); /* No table recreation or global rearm. */
@@ -5594,14 +5685,21 @@ int main(void)
     fixture();
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(is4(&decoded.src, ik.src) && is4(&decoded.dst, ik.dst) && decoded.sport == htons(10000));
-    assert(decoded.mtu == 1492 && decoded.in == &in && decoded.out == &out);
+    assert(decoded.mtu == 1500 && decoded.in == &in && decoded.out == &out);
     assert(!memcmp(decoded.dst_mac, (u8[]){2,0x11,0x22,0x33,0x44,0x55}, 6));
     assert(!memcmp(decoded.src_mac, out.dev_addr, 6));
+    /* The MTU is the path's, not the egress device's. */
+    tcp_fixture(); cls.nf_mtu = 1400;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 1400 && out.mtu == 1500);
     REJECT(cls.nf_ct = NULL); REJECT(ct.net = NULL); REJECT(ct.zone[0] = 1); REJECT(ct.zone[1] = 1);
     REJECT(cls.nf_handle = NULL);
     REJECT(handle.invalid = true);
     REJECT(ct.mark = 1); REJECT(ct.status = IPS_NAT_MASK); REJECT(cls.nf_mtu = 0);
-    REJECT(cls.nf_mtu = 67); REJECT(cls.nf_mtu = 1501); REJECT(cls.common.chain_index = 1);
+    /* The floor on a TCP flow, which no ingress bound refuses first. */
+    REJECT(tcp_flow(); cls.nf_mtu = 67);
+    tcp_fixture(); cls.nf_mtu = 68;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 68);
+    REJECT(cls.nf_mtu = 1501); REJECT(cls.common.chain_index = 1);
     REJECT(cls.common.protocol = 0); REJECT(dissector.used_keys |= BIT(10));
     REJECT(mm.ingress_ifindex = 0); REJECT(mk.ingress_ifindex++); REJECT(mm.ingress_iftype = 1);
     REJECT(mm.l2_miss = 1); REJECT(cm.flags = 1); REJECT(cm.thoff = 1); REJECT(cm.addr_type = 0);

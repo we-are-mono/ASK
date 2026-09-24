@@ -36,7 +36,7 @@ async def create_vlan(r, *, console=False):
     r.service_vlan_created = True
     await run("ip", "addr", "add", GATEWAY + "/24", "dev", DUT_IF)
     await run("ip", "link", "set", "dev", DUT_IF, "up")
-    await run("ip", "route", "add", ADDRESS + "/32", "dev", DUT_IF, "mtu", "1200")
+    await run("ip", "route", "add", ADDRESS + "/32", "dev", DUT_IF)
     await run("ip", "neigh", "replace", ADDRESS, "lladdr", r.lan_mac,
               "nud", "permanent", "dev", DUT_IF)
 

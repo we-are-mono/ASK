@@ -111,9 +111,13 @@ and decrypts every such packet exactly once, the microcode counts two IPv4
 fragments and no IPv6 ones, and no Packet Too Big is sent. The inner packet is
 never fragmented, which is what bounding exists to prevent -- a router must not
 fragment IPv6 -- and post-encryption fragmentation is what Linux itself does
-for an IPv4 inner packet without DF, so the direction stays in hardware. IPv4 is not bounded: the microcode
-fragments a packet without DF as a Linux router would, and excepts one with DF
-for Linux's ICMP.
+for an IPv4 inner packet without DF, so the direction stays in hardware; the
+microcode's fragments of the SEC output are correct. IPv4 has a bound of its
+own for a different reason: the microcode's fragments of a frame received on
+an Ethernet port carry an all-zero payload, so an IPv4 direction that is
+neither TCP nor to or from an SA is never admitted into a path smaller than
+what its ingress receives
+([architecture.md](architecture.md#native-context-and-admission)).
 
 ## The consumer contract
 

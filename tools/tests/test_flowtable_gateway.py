@@ -89,7 +89,7 @@ print(json.dumps({{'forwarding': old}}))
         for agent, args, undo in [
             (r.target, ["ip", "route", "add", ALTERNATE_GW + "/32", "dev", TARGET_LAN_IF],
                        ["ip", "route", "del", ALTERNATE_GW + "/32", "dev", TARGET_LAN_IF]),
-            (r.target, ["ip", "route", "add", PEER_IP + "/32", "via", original_ip, "dev", TARGET_LAN_IF, "mtu", "1200"],
+            (r.target, ["ip", "route", "add", PEER_IP + "/32", "via", original_ip, "dev", TARGET_LAN_IF],
                        ["ip", "route", "del", PEER_IP + "/32", "dev", TARGET_LAN_IF]),
             (wan, ["ip", "route", "add", PEER_IP + "/32", "via", dut_ip, "dev", r.wan_if],
                   ["ip", "route", "del", PEER_IP + "/32", "via", dut_ip, "dev", r.wan_if]),
@@ -160,7 +160,7 @@ async def assert_gateway(r, address):
 
 async def switch_gateway(r, before):
     await command(r.target, r.session, "ip", "route", "replace", PEER_IP + "/32",
-                  "via", ALTERNATE_GW, "dev", TARGET_LAN_IF, "mtu", "1200")
+                  "via", ALTERNATE_GW, "dev", TARGET_LAN_IF)
     await invalidated(r, before, "gateway-route-invalidated", counter="route_invalidations")
     r.arp_address = ALTERNATE_GW
     r.arp_neighbours.append((ALTERNATE_GW, TARGET_LAN_IF))

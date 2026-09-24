@@ -9,7 +9,7 @@ import os
 import pytest_asyncio
 
 from ask_orch.client import Agent
-from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from _topology import FULL_FRAME, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_connections import by_key, peer
 from test_flowtable_offload import DPORT, SPORT, TABLE, WAN_IP, command, read, rig  # noqa: F401
 from test_flowtable_selective_neighbour import keys as peer_keys, unchanged as peer_unchanged
@@ -26,6 +26,21 @@ keys = partial(peer_keys, flows=FLOWS)
 unchanged = partial(peer_unchanged, flows=FLOWS)
 warm = partial(peer_warm, flows=FLOWS)
 hardware = partial(peer_hardware, flows=FLOWS)
+
+
+def routed(mtu):
+    """FLOWS while peer A's route carries `mtu`.
+
+    The route's MTU is what names the route a readmitted flow took, so the
+    cases below set a different one on each route they add. Below a full
+    frame, A's UDP reply -- arriving on the WAN port, which can deliver 1500
+    bytes whatever its MTU -- no longer fits its path, and the adapter leaves
+    it to Linux rather than have the microcode fragment it. A's TCP reply
+    carries DF and takes the route's MTU into hardware, which is where the
+    marker is read."""
+    return [{**f, "software": (TARGET_WAN_IF,)}
+            if f["id"] in A and f["proto"] == "udp" and mtu < FULL_FRAME else f
+            for f in FLOWS]
 
 
 @pytest_asyncio.fixture
@@ -74,7 +89,7 @@ except BaseException:
                 assert json.loads(existing["stdout"]) == [], existing
             await change(r.target, ["ip", "route", "add", "blackhole", network + "/24"],
                          ["ip", "route", "del", "blackhole", network + "/24"])
-            await change(r.target, ["ip", "route", "add", network + "/25", "dev", TARGET_LAN_IF, "mtu", "1200"],
+            await change(r.target, ["ip", "route", "add", network + "/25", "dev", TARGET_LAN_IF],
                          ["ip", "route", "del", network + "/25", "dev", TARGET_LAN_IF])
             await change(wan, ["ip", "route", "add", spec["lan"] + "/32", "via", dut_ip, "dev", r.wan_if],
                          ["ip", "route", "del", spec["lan"] + "/32", "via", dut_ip, "dev", r.wan_if])
@@ -147,18 +162,21 @@ async def retired(r, before, label):
     state = await r.wait(lambda s: s["entries"] == 4)
     unchanged(before, state, B)
     assert by_key(state).keys() == keys(B), state
+    # Both of A's connections retire, with however many directions each had.
+    removed = len(by_key(before).keys() & keys(A))
     assert state["route_invalidations"] == before["route_invalidations"] + 2, (before, state)
-    assert state["installs"] == before["installs"] and state["deletes"] == before["deletes"] + 4, (before, state)
+    assert state["installs"] == before["installs"] and state["deletes"] == before["deletes"] + removed, (before, state)
     assert state["rearms"] == before["rearms"] and not state["invalidation_done"], state
     r.record(label, {"before": before, "after": state})
 
 
 async def readmitted(r, p, initial, mtu, label):
-    state = await warm(r, p, A, label)
+    flows = routed(mtu)
+    state = await peer_warm(r, p, A, label, flows=flows)
     unchanged(initial, state, B)
-    for key in keys(A):
+    for key in peer_keys(A, flows):
         flow = by_key(state)[key]
-        assert int(flow["mtu"]) == (mtu if flow["out"] == TARGET_LAN_IF else 1200), state
+        assert int(flow["mtu"]) == (mtu if flow["out"] == TARGET_LAN_IF else r.port_mtu), state
     return state
 
 
@@ -209,11 +227,12 @@ async def test_flowtable_routes_selective(routes):
         duplicate = await command(r.target, r.session, "ip", "route", "add", ROUTE,
                                   "dev", TARGET_LAN_IF, "mtu", "1100", check=False)
         assert duplicate["rc"] != 0, duplicate
-        unchanged(before, await r.state(), ALL)
+        state = await r.state()
+        peer_unchanged(before, state, ALL, flows=routed(1100))
         reports = await p.rpc("stop", B)
         assert all(report["count"] > 128 for report in reports.values()), reports
         r.record("routes-unaffected-transfers", reports)
-        final = await hardware(r, p, "routes-final-hardware")
+        final = await peer_hardware(r, p, "routes-final-hardware", flows=routed(1100))
         unchanged(initial, final, B)
         assert final["rearms"] == initial["rearms"], (initial, final)
         assert final["route_invalidations"] == initial["route_invalidations"] + 12, (initial, final)

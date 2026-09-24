@@ -20,7 +20,7 @@ from test_flowtable_selective_neighbour import keys, unchanged, warm
 from test_flowtable_service import FIRST, managed_service, supervision_status
 from test_flowtable_service_vlan import attempts, balanced, denied
 from test_flowtable_tcp import software_tx
-from test_flowtable_tunnel import Capture, Shape, _assert_outer, _assert_tunnel, _tunnel_text
+from test_flowtable_tunnel import Capture, Shape, _assert_outer, _assert_tunnel, _tunnel_text, _upload_refused
 
 
 async def create_tunnel(r, agent):
@@ -77,12 +77,6 @@ async def tunnel_service(rig, request):
     try:
         previous = (await read(r.target, r.session, '/proc/sys/net/ipv6/conf/all/forwarding')).strip()
         await change(r.target, ['sysctl', '-w', 'net.ipv6.conf.all.forwarding=1'], ['sysctl', '-w', 'net.ipv6.conf.all.forwarding=' + previous])
-        if shape.mode == '6o4':
-            # The ordinary rig reserves a 1200-byte WAN host route for its
-            # exception tests. IPv6 encapsulation needs an outer path that
-            # carries the tunnel MTU; this route is owned by that fixture.
-            await change(r.target, ['ip', 'route', 'change', WAN_IP + '/32', 'dev', TARGET_WAN_IF, 'mtu', '1500'],
-                         ['ip', 'route', 'change', WAN_IP + '/32', 'dev', TARGET_WAN_IF, 'mtu', '1200'])
         if shape.family == 6:
             # The LAN tells its hosts the tunnel's MTU, without which the
             # IPv6 direction into the tunnel stays in software (see
@@ -101,7 +95,10 @@ async def tunnel_service(rig, request):
         else:
             await lan_change(['ip', 'addr', 'add', r.tunnel_source + '/32', 'dev', 'lo'],
                              ['ip', 'addr', 'del', r.tunnel_source + '/32', 'dev', 'lo'])
-            await change(r.target, ['ip', 'route', 'add', r.tunnel_source + '/32', 'via', r.lan_ip, 'dev', TARGET_LAN_IF, 'mtu', '1400'],
+            # No MTU of its own: the download arrives in the tunnel, and a
+            # path back to the LAN smaller than that could deliver would keep
+            # its UDP direction in Linux too.
+            await change(r.target, ['ip', 'route', 'add', r.tunnel_source + '/32', 'via', r.lan_ip, 'dev', TARGET_LAN_IF],
                          ['ip', 'route', 'del', r.tunnel_source + '/32', 'via', r.lan_ip, 'dev', TARGET_LAN_IF])
             for agent, address, other, mac, dev in [
                 (r.target, shape.outer[0], shape.outer[1], r.wan_mac, TARGET_WAN_IF),
@@ -157,7 +154,7 @@ async def tunnel_service(rig, request):
 
 def flows_for(r, protocol='tcp'):
     endpoint = {'lan': r.tunnel_source, 'connect_ip': r.shape.inner_orch}
-    return [
+    flows = [
         {'id': 0, 'proto': 'udp', 'sport': FIRST, 'lan': r.lan_ip},
         {'id': 1, 'proto': 'tcp', 'sport': FIRST, 'lan': r.lan_ip},
         {'id': 2, 'proto': 'udp', 'sport': FIRST, **endpoint},
@@ -166,6 +163,12 @@ def flows_for(r, protocol='tcp'):
         {'id': 5, 'proto': 'udp', 'sport': FIRST + 2, 'lan': r.lan_ip},
         {'id': 6, 'proto': 'udp', 'sport': FIRST + 2, **endpoint},
     ]
+    # A 4o6 UDP upload stays in Linux: the LAN port can deliver a full frame
+    # and the tunnel's path is smaller (see test_flowtable_tunnel).
+    for flow in flows[2:]:
+        if _upload_refused(r.shape, flow['proto']):
+            flow['software'] = (TARGET_LAN_IF,)
+    return flows
 
 
 async def hardware(r, p, label, flows):
@@ -183,14 +186,18 @@ async def hardware(r, p, label, flows):
             assert delta >= (256 if flows[ident]['proto'] == 'udp' else reports[ident]['bytes'] // 1500), (key, delta)
         if ident >= 2:
             rows = [new[key] for key in keys([ident], flows)]
-            _assert_tunnel(r, next(f for f in rows if f['in'] == TARGET_LAN_IF), next(f for f in rows if f['in'] == TARGET_WAN_IF))
+            _assert_tunnel(r, next((f for f in rows if f['in'] == TARGET_LAN_IF), None),
+                           next(f for f in rows if f['in'] == TARGET_WAN_IF))
     tx_delta = {dev: tx_after[dev] - tx[dev] for dev in tx}
+    # The slow-path counter sits on the forward hook, which a direction
+    # Linux keeps by design bypasses through the software flowtable.
     slow_path = await r.software_forwarded() - forwarded
     assert 0 <= slow_path <= 64, slow_path
     assert after['tunnel_records'] == after['tunnel_slots'] == 1, after
     record = after['tunnels'][0]
     assert record['dev'] == r.shape.device and record['tnl'] == _tunnel_text(r.shape), record
-    assert int(record['refs']) == 2 * (len(flows) - 2), record
+    # One reference per tunnel direction in hardware.
+    assert int(record['refs']) == len(keys(range(2, len(flows)), flows)), record
     _assert_outer(r, capture.packets(), 256)
     r.record(label, {'before': before, 'after': after, 'reports': reports, 'software_tx': tx_delta,
                      'software_forwarded': slow_path})
@@ -277,7 +284,8 @@ async def test_flowtable_service_tunnel_recreated(tunnel_service):
             else:
                 # Recreating the nexthop can retire controls again. All
                 # displaced directions must balance and re-enter hardware.
-                assert after['installs'] - before['installs'] == after['deletes'] - before['deletes'] >= 8
+                assert after['installs'] - before['installs'] == after['deletes'] - before['deletes'] >= \
+                    len(keys([0, 1, 2, 3], flows))
             await p.batch([0, 1, 2, 3], count=128, interval=0.045)
             quiet = await r.state()
             unchanged(after, quiet, [0, 1, 2, 3], flows)

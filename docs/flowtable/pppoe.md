@@ -171,7 +171,14 @@ IPv6 into the session is admitted only while the LAN's IPv6 MTU is no larger
 than the session's 1492: the microcode would fragment a larger packet where a
 router has to answer with Packet Too Big
 ([ipv6.md](ipv6.md#packets-larger-than-the-path)). A PPPoE LAN should
-advertise 1492 anyway; the IPv6 case and the ISP profile set it.
+advertise 1492 anyway; the IPv6 case and the ISP profile set it. IPv4 UDP from
+an Ethernet LAN into the session stays in software whatever the LAN's MTU,
+because the microcode's IPv4 fragments of a received frame carry no payload and
+a port receives full frames regardless
+([architecture.md](architecture.md#native-context-and-admission)); TCP is
+carried, DF set, and so is the direction out of the session. A session
+negotiated at 1500 over a 1508-byte Ethernet (RFC 4638) is no smaller than the
+LAN, so its UDP stays in hardware too.
 
 The classifier key is unchanged — the physical port plus the 5-tuple — so a
 session reaches the hardware only as the header it inserts or strips.

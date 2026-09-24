@@ -106,6 +106,31 @@ state or an IPv6 gateway. The driver uses Linux's selected route rather than
 repeating policy routing with incomplete packet context. Effective MTU must be
 at least 68 and no greater than the egress device MTU.
 
+An IPv4 direction that is neither TCP nor to or from an SA is admitted only
+while nothing larger than its MTU can arrive. The microcode fragments a packet
+without DF that exceeds the entry's MTU, and for a frame received on an
+Ethernet port those fragments leave with correct headers and an all-zero
+payload, so the receiver discards them. Fragments of the SEC output, which
+reaches the classifier through the offline port, are correct. What can arrive
+is the ingress device's MTU, but never less than a standard 1500-byte
+Ethernet payload less whatever the direction strips (a PPPoE session's 8
+bytes, a tunnel's outer header): a DPAA port keeps receiving full frames after
+its MTU is lowered, and the hosts behind it keep sending them unless each is
+configured, since DHCP's MTU option is widely ignored. A TCP direction is
+carried into the smaller path: TCP sets DF, the preemptive
+`PREEMPT_DFBIT_HONOR` check hands an oversized DF packet to Linux for its
+Fragmentation Needed, and one that clamps the MSS rarely sees any. The one
+exception, a sender that clears DF on TCP into an unclamped smaller path,
+loses those segments and stalls rather than delivering corrupt data, since
+the zero payload fails the receiver's checksum. A refused direction stays
+on the software flowtable path, where `ip_forward()` fragments correctly; the
+reverse direction is admitted on its own. Equal MTUs, the ordinary Ethernet
+WAN, are unaffected. A smaller upstream is where it shows: UDP leaving a LAN
+by PPPoE (1492) or a 4in6 tunnel (1452) runs in software in that direction,
+and TCP and the download direction stay in hardware. Device and route MTU
+changes retire installed directions through their events, so the bound is
+checked at admission.
+
 The selected next hop needs a live ARP neighbour whose MAC matches the rewrite.
 PERMANENT, REACHABLE, STALE, DELAY and PROBE are eligible; NOARP, unresolved,
 failed and detached neighbours are refused. A neighbour is rechecked and its

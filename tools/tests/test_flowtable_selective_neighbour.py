@@ -1,6 +1,7 @@
 """Retire one peer's TCP/UDP flows while another peer stays in hardware."""
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 
@@ -23,6 +24,10 @@ CHANGED_MAC = "02:9d:99:b2:33:a2"
 
 
 def keys(ids, flows=FLOWS):
+    """The hardware directions of `ids`. A spec's `software` names the ports
+    whose arriving direction the adapter is expected to leave to Linux -- a
+    UDP direction into a path smaller than a full frame -- and those are left
+    out."""
     result = set()
     for ident in ids:
         spec = flows[ident]
@@ -31,8 +36,18 @@ def keys(ids, flows=FLOWS):
             return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
         src = endpoint(spec["lan"], spec["sport"])
         dst = endpoint(spec.get("connect_ip", WAN_IP), spec.get("connect_port", DPORT))
-        result.update(((TARGET_LAN_IF, proto, src, dst), (TARGET_WAN_IF, proto, dst, src)))
+        result.update(key for key in ((TARGET_LAN_IF, proto, src, dst), (TARGET_WAN_IF, proto, dst, src))
+                      if key[0] not in spec.get("software", ()))
     return result
+
+
+def software_egress(ids, flows=FLOWS):
+    """How many of `ids`' directions Linux forwards, by the port each leaves."""
+    counts = Counter()
+    for ident in ids:
+        for ingress in flows[ident].get("software", ()):
+            counts[TARGET_WAN_IF if ingress == TARGET_LAN_IF else TARGET_LAN_IF] += 1
+    return counts
 
 
 def unchanged(before, after, ids, flows=FLOWS):
@@ -85,7 +100,7 @@ except BaseException:
                      ["ip", "addr", "del", GATEWAY + "/24", "dev", TARGET_LAN_IF])
         for spec in PEERS:
             address = spec["lan"] + "/32"
-            await change(r.target, ["ip", "route", "add", address, "dev", TARGET_LAN_IF, "mtu", "1200"],
+            await change(r.target, ["ip", "route", "add", address, "dev", TARGET_LAN_IF],
                          ["ip", "route", "del", address, "dev", TARGET_LAN_IF])
             await change(wan, ["ip", "route", "add", address, "via", dut_ip, "dev", r.wan_if],
                          ["ip", "route", "del", address, "via", dut_ip, "dev", r.wan_if])
@@ -147,14 +162,15 @@ assert not errors, errors
 
 
 async def warm(r, p, ids, label, flows=FLOWS):
+    expected = keys(range(len(flows)), flows)
     samples = []
     for _ in range(8):
         await p.batch(ids, count=128, interval=0.01)
         state = await r.state()
         samples.append(state)
-        if state["entries"] == 2 * len(flows):
+        if state["entries"] == len(expected):
             healthy(state)
-            assert state["handle_refs"] == 2 * len(flows) and by_key(state).keys() == keys(range(len(flows)), flows), state
+            assert state["handle_refs"] == len(expected) and by_key(state).keys() == expected, state
             r.record(label, samples)
             return state
     pytest.fail(f"automatic hardware admission failed: {samples}")
@@ -186,10 +202,15 @@ async def hardware(r, p, label, flows=FLOWS):
     slow_path = await r.software_forwarded() - forwarded if forwarded is not None else None
     r.record(label, {"before": before, "after": after, "transfers": reports,
                      "software_tx": tx, "software_forwarded": slow_path, "cpu": cpu_delta(cpu_before, cpu_after)})
+    # A direction left to Linux crosses the software flowtable, which bypasses
+    # the forward hook the slow-path counter sits on but not the port's own
+    # transmit count: all 256 of its datagrams, on top of the usual allowance.
+    carried = {dev: 256 * n for dev, n in software_egress(ids, flows).items()}
     if slow_path is not None:
         assert 0 <= slow_path <= 64, slow_path
     else:
-        assert 0 <= tx[TARGET_LAN_IF] <= 64 and 0 <= tx[TARGET_WAN_IF] <= 512, tx
+        assert carried.get(TARGET_LAN_IF, 0) <= tx[TARGET_LAN_IF] <= 64 + carried.get(TARGET_LAN_IF, 0), tx
+        assert carried.get(TARGET_WAN_IF, 0) <= tx[TARGET_WAN_IF] <= 512 + carried.get(TARGET_WAN_IF, 0), tx
     return after
 
 

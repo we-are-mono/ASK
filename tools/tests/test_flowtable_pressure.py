@@ -32,6 +32,12 @@ async def test_flowtable_concurrent_policy_and_routes(connections):
                 await p.rpc("start", [0, 1], count=0, interval=0.01)
                 running = True
                 try:
+                    # Every route replacement and port MTU change below is a
+                    # real event. While the route or the LAN port is below a
+                    # full frame, the UDP connection's direction into it is
+                    # refused and crosses in Linux; nothing here asks it to be
+                    # in hardware until the fixture's MTU-less route and the
+                    # port's own MTU are back.
                     script = f'''
 import concurrent.futures, json, pathlib, subprocess, time
 confs = { [policy_to_conf(policy), policy_to_conf(excluded)]!r}
@@ -59,7 +65,7 @@ try:
 finally:
     for path in paths: path.unlink(missing_ok=True)
     subprocess.run(['ip', 'link', 'set', 'dev', {TARGET_LAN_IF!r}, 'mtu', '1500'], check=True)
-    subprocess.run(['ip', 'route', 'replace', {WAN_IP + '/32'!r}, 'dev', {TARGET_WAN_IF!r}, 'mtu', '1200'], check=True)
+    subprocess.run(['ip', 'route', 'replace', {WAN_IP + '/32'!r}, 'dev', {TARGET_WAN_IF!r}], check=True)
 '''
                     job = asyncio.create_task(console_python(con, script, timeout=60))
                     try:

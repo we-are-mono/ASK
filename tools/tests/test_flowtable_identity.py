@@ -119,7 +119,7 @@ async def test_flowtable_mac_recovery(connections):
             # source with a raw receive socket as well as hardware counters.
             await change(TARGET_LAN_IF, "02:f6:d7:00:01:33")
             r.dut_lan_mac = current[TARGET_LAN_IF]
-            await udp_warm(r, flows[0]["sport"], {d: 1200 for d in original})
+            await udp_warm(r, flows[0]["sport"], {d: r.port_mtu for d in original})
             await udp_size(r, flows[0]["sport"], 256, "mac-lan-wire")
             assert await table_identity(r) == identity
         finally:

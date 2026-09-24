@@ -65,7 +65,7 @@ async def tcp_snat(rig, request):
             expected = {TARGET_LAN_IF: (local, remote, mapped, remote, WAN_IP),
                         TARGET_WAN_IF: (remote, mapped, remote, local, r.lan_ip)}
             for row in result["flows"]:
-                assert row["proto"] == "6" and row["mtu"] == "1200", result
+                assert row["proto"] == "6" and int(row["mtu"]) == r.port_mtu, result
                 assert tuple(row[k] for k in ("src", "dst", "new_src", "new_dst", "nexthop")) == expected[row["in"]], result
             return result
 

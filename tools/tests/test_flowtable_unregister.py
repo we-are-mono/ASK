@@ -109,7 +109,7 @@ for address in {addresses!r}:
     args = ['ip', 'addr', 'replace', address['local'] + '/' + str(address['prefixlen']), 'dev', {TARGET_LAN_IF!r}]
     if 'broadcast' in address: args += ['broadcast', address['broadcast']]
     run(*args)
-run('ip', 'route', 'replace', {r.lan_ip + '/32'!r}, 'dev', {TARGET_LAN_IF!r}, 'mtu', '1200')
+run('ip', 'route', 'replace', {r.lan_ip + '/32'!r}, 'dev', {TARGET_LAN_IF!r})
 run('ip', 'neigh', 'replace', {r.lan_ip!r}, 'dev', {TARGET_LAN_IF!r}, 'lladdr', {r.lan_mac!r}, 'nud', 'permanent')
 result.unlink()
 result.parent.rmdir()

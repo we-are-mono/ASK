@@ -244,9 +244,11 @@ pseudo-port on the same wire, so the bridge relearns rather than being told to
 the flow, and is readmitted against the first port when ordinary traffic
 teaches the bridge it is back. An entry left to age out under a live flow does
 the same, which is the case that would misforward silently if the delete were
-not watched. And lowering the bridge's MTU moves only the direction leaving by
-it, the other keeping the port's, with one connection retiring as a single
-invalidation because both directions share a handle.
+not watched. And lowering the bridge's MTU retires the connection as a single
+invalidation, because both directions share a handle; the UDP direction
+leaving by the bridge then stays in software, the path now smaller than what a
+port receives ([architecture.md](architecture.md#native-context-and-admission)),
+while the other is readmitted at the port's.
 
 All of it on the KASAN image, with the adapter's error, fatal and quarantine
 counters at zero afterwards and no suppressed diagnostics.

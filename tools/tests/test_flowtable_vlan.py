@@ -284,22 +284,32 @@ async def test_flowtable_vlan_device_mtu_retires(vlan_rig):
     """The VLAN device carries its own MTU, and a flow through it depends on it.
 
     Each direction carries the MTU of the interface it leaves by, so lowering
-    the tagged LAN device moves only the reverse direction. Both directions
+    the tagged LAN device touches only the reverse direction. Both directions
     share one invalidation handle, so retiring the connection is a single
     increment rather than two.
+
+    Lowered below a full frame, the tagged device is a path the reverse's
+    datagrams -- arriving on the WAN port, which can deliver 1500 bytes
+    whatever its MTU -- no longer fit, and the microcode would have to
+    fragment them. So the flow comes back with the forward direction alone
+    in hardware, still at the WAN port's MTU, and the reverse refused to
+    Linux, which fragments correctly.
     """
     r = vlan_rig
     await r.table()
 
-    async def settled(expected):
-        """`expected` maps egress port to the MTU the direction leaving by it
-        should describe. Readmission needs traffic, so each attempt sends
-        before it looks; nothing re-offers a retired flow on its own."""
+    async def settled(expected, since=None):
+        """`expected` maps the egress port of each direction hardware should
+        hold to the MTU it should describe; `since`, a state the directions
+        must have been installed after. Readmission needs traffic, so each
+        attempt sends before it looks; nothing re-offers a retired flow on its
+        own."""
         for _ in range(10):
             await r.exchange(count=4)
             state = await r.state()
-            if state["entries"] == 2 and all(
-                    int(f["mtu"]) == expected[f["out"]] for f in state["flows"]):
+            if (sorted(f["out"] for f in state["flows"]) == sorted(expected)
+                    and all(int(f["mtu"]) == expected[f["out"]] for f in state["flows"])
+                    and (since is None or state["installs"] > since["installs"])):
                 return state
         pytest.fail(f"flow did not settle at {expected}: {state}")
 
@@ -308,10 +318,13 @@ async def test_flowtable_vlan_device_mtu_retires(vlan_rig):
     try:
         invalidated = await r.wait(
             lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
-        # Only the direction leaving by the tagged device moves; the flow comes
-        # back describing the new path rather than staying retired.
-        reduced = await settled({TARGET_LAN_IF: 1400, TARGET_WAN_IF: 1500})
+        # The flow comes back rather than staying retired: the direction
+        # leaving by the WAN port as it was, the one into the tagged device
+        # refused. Installed since, so a state caught mid-retirement cannot
+        # pass for the readmitted one.
+        reduced = await settled({TARGET_WAN_IF: 1500}, since=before)
         assert reduced["errors"] == before["errors"], reduced
+        assert reduced["rejects"] > invalidated["rejects"], (invalidated, reduced)
         r.record("vlan-mtu", {"before": before, "invalidated": invalidated,
                               "reduced": reduced})
     finally:

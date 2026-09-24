@@ -22,7 +22,7 @@ NETNS, LAN_IF = "ask-ft-service-route", "askftroute"
 ADDRESS, NETWORK = "172.29.87.2", "172.29.87.0/24"
 NEXT_HOP = "198.18.87.2"
 MAC = "02:9d:99:b2:33:e1"
-ROUTE = [ADDRESS + "/32", "via", NEXT_HOP, "dev", TARGET_LAN_IF, "mtu", "1200"]
+ROUTE = [ADDRESS + "/32", "via", NEXT_HOP, "dev", TARGET_LAN_IF]
 
 
 @pytest_asyncio.fixture

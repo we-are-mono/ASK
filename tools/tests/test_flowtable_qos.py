@@ -497,11 +497,12 @@ async def reload_adapter(r, *parameters, idle=True):
 async def qos(rig):
     """The rig, readied for multi-gigabit transfers and hardware queues.
 
-    The rig pins host routes at MTU 1200 for its exception cases; a transfer
-    measured at line rate needs full-size frames, so they are widened here, and
-    the orchestrator's route to the LAN VM too, because an earlier exception
-    case can leave a path MTU cached against it. Flows in this file's port block
-    are routed rather than masqueraded, so a row's endpoints are the hosts'.
+    A transfer measured at line rate needs full-size frames. The rig's host
+    routes carry the ports' own MTU already, but an earlier case that lowered
+    a path can leave a smaller MTU cached against the LAN VM at the
+    orchestrator, so that route is widened here explicitly. Flows in this
+    file's port block are routed rather than masqueraded, so a row's endpoints
+    are the hosts'.
 
     Teardown takes down every tree and clsact qdisc on both ports, then forwards
     an exchange through both: that is the proof each port still transmits once
@@ -533,9 +534,6 @@ async def qos(rig):
         # after the console's last use.
         printk = " ".join((await read(r.target, r.session, "/proc/sys/kernel/printk")).split()[:4])
         await command(r.target, r.session, "sysctl", "-w", "kernel.printk=1 4 1 7")
-        for address, dev in ((r.lan_ip, TARGET_LAN_IF), (WAN_IP, TARGET_WAN_IF)):
-            await command(r.target, r.session, "ip", "route", "replace", address + "/32",
-                          "dev", dev, "mtu", "1500")
         route = json.loads((await command(wan, r.session, "ip", "-j", "route", "show",
                                           "exact", f"{r.lan_ip}/32"))["stdout"])[0]
         await command(wan, r.session, "ip", "route", "replace", f"{r.lan_ip}/32",

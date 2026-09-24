@@ -31,7 +31,7 @@ async def test_flowtable_link_recovery(connections):
             # Recreate only the fixture's routes/neighbours if the down event
             # discarded them. No table, conntrack or endpoint socket is reset.
             address, mac = (r.lan_ip, r.lan_mac) if dev == TARGET_LAN_IF else (WAN_IP, r.wan_mac)
-            await console_command(con, "ip", "route", "replace", address + "/32", "dev", dev, "mtu", "1200")
+            await console_command(con, "ip", "route", "replace", address + "/32", "dev", dev)
             await console_command(con, "ip", "neigh", "replace", address, "lladdr", mac,
                                   "nud", "permanent", "dev", dev)
 
@@ -71,11 +71,11 @@ async def test_flowtable_link_recovery(connections):
                         assert reports["1"]["count"] > 0, reports
                         after = await warm(r, p, [0, 1], f"link-{cycle}-{dev}-admission", flows)
                         # Traffic may briefly use the connected route between UP
-                        # and restoration of the fixture's lower-MTU host route.
-                        # Each such generation must also retire without leaking.
+                        # and restoration of the fixture's host route. Each such
+                        # generation must also retire without leaking.
                         assert after["installs"] >= before["installs"] + 4, (before, after)
                         assert after["installs"] - before["installs"] == after["deletes"] - before["deletes"]
-                        assert all(int(f["mtu"]) == 1200 for f in after["flows"]), after
+                        assert all(int(f["mtu"]) == r.port_mtu for f in after["flows"]), after
                         assert after["rearms"] == initial["rearms"] and not after["invalidation_done"], after
                         assert await table_identity(r) == identity
                         r.record(f"link-{cycle}-{dev}", {"before": before, "down": down, "held": held,

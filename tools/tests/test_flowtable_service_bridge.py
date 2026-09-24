@@ -82,7 +82,7 @@ async def bridge_topology(r, *, guest=True):
                 await dut("ip", "addr", "add", address, "dev", dev)
             await dut("ip", "link", "set", dev, "up")
         for address, dev in hosts:
-            await dut("ip", "route", "replace", address + "/32", "dev", dev, "mtu", "1200")
+            await dut("ip", "route", "replace", address + "/32", "dev", dev)
             await dut("ip", "neigh", "replace", address, "lladdr", r.lan_mac, "nud", "permanent", "dev", dev)
         if not guest:
             yield
@@ -133,7 +133,7 @@ except BaseException:
                 await attempt(console_command(con, "ip", "link", "del", BRIDGE))
                 for address in original:
                     await attempt(console_command(con, "ip", "addr", "replace", address, "dev", TARGET_LAN_IF))
-                await attempt(console_command(con, "ip", "route", "replace", r.lan_ip + "/32", "dev", TARGET_LAN_IF, "mtu", "1200"))
+                await attempt(console_command(con, "ip", "route", "replace", r.lan_ip + "/32", "dev", TARGET_LAN_IF))
                 await attempt(console_command(con, "ip", "neigh", "replace", r.lan_ip, "lladdr", r.lan_mac,
                                               "nud", "permanent", "dev", TARGET_LAN_IF))
         if lan_created:

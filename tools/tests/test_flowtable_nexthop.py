@@ -30,7 +30,7 @@ async def test_flowtable_nexthop_object_replacement(connections):
         try:
             await command(r.target, r.session, "ip", "-4", "nexthop", "add", "id", NHID, "dev", TARGET_WAN_IF)
             created = True
-            await command(r.target, r.session, "ip", "route", "replace", WAN_IP + "/32", "nhid", NHID, "mtu", "1200")
+            await command(r.target, r.session, "ip", "route", "replace", WAN_IP + "/32", "nhid", NHID)
             # Registration dumps existing objects; unregister also dumps DEL.
             # Neither may leave a stale invalidation on a fresh consumer.
             await console_command(con, "rmmod", "ask_flowtable")
@@ -87,7 +87,7 @@ async def test_flowtable_nexthop_object_replacement(connections):
         finally:
             # Restore the fixture's directly connected host route before
             # deleting the nexthop object, including after any test failure.
-            await console_command(con, "ip", "route", "replace", WAN_IP + "/32", "dev", TARGET_WAN_IF, "mtu", "1200")
+            await console_command(con, "ip", "route", "replace", WAN_IP + "/32", "dev", TARGET_WAN_IF)
             await r.delete_table()
             if created:
                 await command(r.target, r.session, "ip", "nexthop", "del", "id", NHID)

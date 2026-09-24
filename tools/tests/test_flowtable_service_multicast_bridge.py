@@ -79,7 +79,7 @@ async def multicast_bridge_service(rig, request):
                 for address in original[dev]:
                     await console_command(con, 'ip', 'addr', 'add', address, 'dev', logical)
             for address, logical, mac in [(r.lan_ip, LAN_L3, r.lan_mac), (WAN_IP, WAN_L3, r.wan_mac)]:
-                await console_command(con, 'ip', 'route', 'replace', address + '/32', 'dev', logical, 'mtu', '1200')
+                await console_command(con, 'ip', 'route', 'replace', address + '/32', 'dev', logical)
                 await console_command(con, 'ip', 'neigh', 'replace', address, 'lladdr', mac, 'nud', 'permanent', 'dev', logical)
             if default:
                 await console_command(con, 'ip', 'route', 'replace', 'default', 'via', default['gateway'], 'dev', WAN_L3)
@@ -141,7 +141,7 @@ except BaseException:
                     for address in original[dev]:
                         await undo('ip', 'addr', 'replace', address, 'dev', dev)
                 for address, dev, mac in [(r.lan_ip, TARGET_LAN_IF, r.lan_mac), (WAN_IP, TARGET_WAN_IF, r.wan_mac)]:
-                    await undo('ip', 'route', 'replace', address + '/32', 'dev', dev, 'mtu', '1200')
+                    await undo('ip', 'route', 'replace', address + '/32', 'dev', dev)
                     await undo('ip', 'neigh', 'replace', address, 'lladdr', mac, 'nud', 'permanent', 'dev', dev)
                 if default:
                     await undo('ip', 'route', 'replace', 'default', 'via', default['gateway'], 'dev', TARGET_WAN_IF)

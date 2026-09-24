@@ -540,22 +540,31 @@ async def test_flowtable_bridge_device_retires(bridge_rig):
     """The bridge carries its own MTU and link state, and the flow depends on both.
 
     Each direction carries the MTU of the interface it leaves by, so lowering
-    the bridge moves only the direction leaving by it. Both directions share
+    the bridge touches only the direction leaving by it. Both directions share
     one invalidation handle, so retiring the connection is a single increment
     rather than two.
+
+    Lowered below a full frame, the bridge is a path the reverse's datagrams
+    -- arriving on the WAN port, which can deliver 1500 bytes whatever its
+    MTU -- no longer fit, and the microcode would have to fragment them. So
+    the flow comes back with the forward direction alone in hardware and the
+    reverse refused to Linux, which fragments correctly.
     """
     r = bridge_rig
     await r.table()
 
-    async def settled(expected):
-        """`expected` maps egress port to the MTU the direction leaving by it
-        should describe. Readmission needs traffic, so each attempt sends
-        before it looks; nothing re-offers a retired flow on its own."""
+    async def settled(expected, since=None):
+        """`expected` maps the egress port of each direction hardware should
+        hold to the MTU it should describe; `since`, a state the directions
+        must have been installed after. Readmission needs traffic, so each
+        attempt sends before it looks; nothing re-offers a retired flow on its
+        own."""
         for _ in range(10):
             await r.exchange(count=4)
             state = await r.state()
-            if state["entries"] == 2 and all(
-                    int(f["mtu"]) == expected[f["out"]] for f in state["flows"]):
+            if (sorted(f["out"] for f in state["flows"]) == sorted(expected)
+                    and all(int(f["mtu"]) == expected[f["out"]] for f in state["flows"])
+                    and (since is None or state["installs"] > since["installs"])):
                 return state
         pytest.fail(f"flow did not settle at {expected}: {state}")
 
@@ -564,8 +573,11 @@ async def test_flowtable_bridge_device_retires(bridge_rig):
     try:
         invalidated = await r.wait(
             lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
-        reduced = await settled({TARGET_LAN_IF: 1400, TARGET_WAN_IF: 1500})
+        # Installed since, so a state caught mid-retirement cannot pass for
+        # the readmitted one.
+        reduced = await settled({TARGET_WAN_IF: 1500}, since=before)
         assert reduced["errors"] == before["errors"], reduced
+        assert reduced["rejects"] > invalidated["rejects"], (invalidated, reduced)
         r.record("bridge-mtu", {"before": before, "invalidated": invalidated,
                                 "reduced": reduced})
     finally:

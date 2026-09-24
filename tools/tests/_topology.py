@@ -58,6 +58,13 @@ VLAN_ID_PPPOE_WAN: int                = 3900
 TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth3")
 LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "enp4s0")
 
+# The largest IPv4 packet an Ethernet port delivers, whatever MTU the DUT gives
+# the port: the MAC's receive frame length is fixed at init, and the sending
+# host is never told the DUT's setting. The flowtable adapter installs a
+# non-TCP IPv4 direction only where its path carries this much from its
+# ingress, so a UDP direction into any smaller path stays in Linux.
+FULL_FRAME = 1500
+
 
 # ---- composable topology primitives --------------------------------------
 

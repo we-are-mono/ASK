@@ -70,7 +70,7 @@ def mapping_rows(r, state, ids, external):
                               (TARGET_WAN_IF, (remote, mapped, remote, local, r.lan_ip))):
             row, = [f for f in state["flows"] if f["in"] == dev and f["proto"] == proto]
             assert tuple(row[k] for k in ("src", "dst", "new_src", "new_dst", "nexthop")) == expected, state
-            assert row["mtu"] == "1200", row
+            assert int(row["mtu"]) == r.port_mtu, row
             rows[(dev, proto)] = row
     return rows
 
@@ -164,7 +164,7 @@ async def test_flowtable_masquerade_wan_lifecycle(connections, masquerade_networ
                     break
                 await asyncio.sleep(0.1)
             assert carrier["stdout"].strip() == "1", carrier
-            await console_command(con, "ip", "route", "replace", WAN_IP + "/32", "dev", TARGET_WAN_IF, "mtu", "1200")
+            await console_command(con, "ip", "route", "replace", WAN_IP + "/32", "dev", TARGET_WAN_IF)
             await console_command(con, "ip", "neigh", "replace", WAN_IP, "lladdr", r.wan_mac, "nud", "permanent", "dev", TARGET_WAN_IF)
 
         existing = await command(r.target, r.session, "nft", "list", "table", "ip", nat_table, check=False)

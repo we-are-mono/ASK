@@ -17,6 +17,15 @@ control plane. Traffic is classified into CEETM queues by a conntrack mark, and
 one port is forwarded from the WAN side into a LAN client. Five features, one
 bridge, one physical port on each side.
 
+One behaviour of the shipping configuration shapes every traffic case: a
+subscriber's IPv4 UDP upload into the session stays in Linux. The LAN port can
+deliver a full 1500-byte frame whatever MTU it is given and the session carries
+1492, so the microcode would have to fragment it -- and its fragments of a frame
+an Ethernet port received carry no payload. The download still crosses in
+hardware, and so does all of TCP, which sets DF. So each case proves the UDP
+download and the refusal of its upload, and proves the upload itself on a TCP
+connection.
+
 Two disciplines every case here keeps, because a profile test is exactly where
 they are easiest to lose:
 
@@ -57,6 +66,7 @@ import json
 import os
 import re
 import socket
+import time
 
 import aiohttp
 import pytest
@@ -65,9 +75,10 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from ask_orch.counters import kernel_tx_packets
+from _gated_tcp import GatedTcp
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        dut_vlan_subif, kernel_rx_packets, lan_run_python)
-from test_flowtable_offload import (ARTIFACTS, STATUS_ROWS, Rig, command,
+from test_flowtable_offload import (ARTIFACTS, STATUS_ROWS, Rig, assert_undisturbed, command,
                                     console_command, read)
 from test_flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6,
                                   INNER_REMOTE6, SESSION_MTU, SourceEcho, WAN_VID,
@@ -220,20 +231,41 @@ def _direction(flows, source, destination):
     return matching[0]
 
 
-def _directions(flows, source, sport, peer, dport):
+def _directions(flows, source, sport, peer, dport, upload=True):
     """Both halves of one connection, whether or not it is translated.
 
     The forward half is named by the tuple the client sent. The reverse half is
     named by the tuple that arrives from the peer, which under masquerade
     carries the translated address and can be joined back to the client only
     through `new_dst`. Matching on that covers both cases with one helper, and a
-    profile has both at once.
+    profile has both at once. With `upload` false the forward half is Linux's
+    by design (see _upload_in_linux): it must be absent, and is returned as
+    None.
     """
-    forward = _direction(flows, f"{source}:{sport}", f"{peer}:{dport}")
     reverse = [f for f in flows if f["src"] == f"{peer}:{dport}"
                and f["new_dst"] == f"{source}:{sport}"]
     assert len(reverse) == 1, (source, sport, peer, dport, flows)
-    return forward, reverse[0]
+    if not upload:
+        assert not [f for f in flows if f["src"] == f"{source}:{sport}"
+                    and f["dst"] == f"{peer}:{dport}"], (source, sport, peer, dport, flows)
+        return None, reverse[0]
+    return _direction(flows, f"{source}:{sport}", f"{peer}:{dport}"), reverse[0]
+
+
+def _upload_in_linux(peer):
+    """Whether a UDP connection's LAN-to-WAN direction stays in Linux.
+
+    An IPv4 one arrives on the LAN port, which can deliver a full 1500-byte
+    frame whatever MTU the port is given -- and many hosts ignore the MTU a
+    DHCP server offers -- and leaves into the session's 1492. The
+    microcode would have to fragment it, and its fragments of a frame an
+    Ethernet port received carry no payload, so the adapter leaves that
+    direction to Linux: this is what a subscriber's UDP upload does on this
+    profile, and the download still crosses in hardware. An IPv6 upload is
+    bounded by the MTU the subscriber VLAN advertises instead, and a TCP one
+    carries DF, so both of those stay in hardware; TCP is how every property
+    of the IPv4 upload is proved here."""
+    return ":" not in peer
 
 
 def _bracketed(address):
@@ -423,7 +455,9 @@ async def _software_tx(ctx):
 
 
 async def _admit(ctx, client, *, peer, dport, sport, timeout=20, label="profile_isp"):
-    """Send short bursts until both directions of the connection are installed.
+    """Send short bursts until the connection's hardware directions are
+    installed: both of them, or the download alone where the upload is
+    Linux's (see _upload_in_linux), whose refusal is then counted.
 
     A deadline rather than a round count: an admission that loses rtnl_trylock
     is declined and re-offered only after two flowtable GC ticks, and nothing
@@ -432,13 +466,18 @@ async def _admit(ctx, client, *, peer, dport, sport, timeout=20, label="profile_
     """
     source = _bracketed(_source_address(client, peer))
     target = _bracketed(peer)
+    upload = not _upload_in_linux(peer)
+    initial = await ctx.state()
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         await _exchange(ctx, client, peer=peer, dport=dport, sport=sport, count=4,
                         label=label)
-        flows = (await ctx.state())["flows"]
+        state = await ctx.state()
         try:
-            return _directions(flows, source, sport, target, dport)
+            directions = _directions(state["flows"], source, sport, target, dport,
+                                     upload=upload)
+            assert upload or state["rejects"] > initial["rejects"], (initial, state)
+            return directions
         except AssertionError:
             if asyncio.get_running_loop().time() > deadline:
                 conntrack = await command(ctx.target, ctx.session, "conntrack", "-L",
@@ -448,75 +487,147 @@ async def _admit(ctx, client, *, peer, dport, sport, timeout=20, label="profile_
                            {"state": state, "conntrack": conntrack})
                 pytest.fail(
                     f"{client['name']} {source}:{sport} -> {target}:{dport} was not "
-                    f"admitted in both directions: validated={state['validated']} "
+                    f"admitted as {'both directions' if upload else 'the download alone'}: "
+                    f"validated={state['validated']} "
                     f"rejects={state['rejects']} busy={state['busy']} "
                     f"errors={state['errors']}\nflows={state['flows']}")
             await asyncio.sleep(0.5)
 
 
-async def _accounted(ctx, client, *, peer, dport, sport, count=64, payload_size=256,
+async def _accounted(ctx, client, *, peer, dport, sport, count=128, payload_size=256,
                      label="profile_isp"):
     """Admit the connection, then measure a second burst against the hardware.
 
     Returns the two rows as they stood before the measured burst, so a case
     asserts the encapsulation on rows whose counters it has just accounted for
-    rather than on rows it has merely seen.
+    rather than on rows it has merely seen. The forward row is None where the
+    upload is Linux's.
 
     Three things are required of that burst and all three are needed: the rows
     are the same rows -- the cookies did not move, so nothing was readmitted
-    underneath the measurement -- the classifier counted every frame, and the
-    physical ports' software receive counters did not. The bound on the WAN port
-    is looser because the agent's own control channel shares it; the LAN port
-    carries nothing but the profile.
+    underneath the measurement -- the classifier
+    counted every frame, and the physical ports' software receive counters did
+    not. The bound on the WAN port is looser because the agent's own control
+    channel shares it; the LAN port carries nothing but the profile. An upload
+    Linux keeps has to have left the WAN port in software instead, once per
+    datagram -- a floor the burst is long enough to stand well clear of the
+    control channel's own frames.
     """
     forward, reverse = await _admit(ctx, client, peer=peer, dport=dport, sport=sport,
                                     label=label)
-    before = {f["cookie"]: int(f["packets"]) for f in (forward, reverse)}
-    software_before = await _software_rx(ctx)
+    installed = await ctx.state()
+    before = {f["cookie"]: int(f["packets"]) for f in (forward, reverse) if f}
+    software_before, sent_before = await _software_rx(ctx), await _software_tx(ctx)
     report = await _exchange(ctx, client, peer=peer, dport=dport, sport=sport,
                              count=count, payload_size=payload_size, label=label)
-    software_after = await _software_rx(ctx)
+    software_after, sent_after = await _software_rx(ctx), await _software_tx(ctx)
     state = await ctx.state()
     after = {f["cookie"]: int(f["packets"]) for f in state["flows"]
              if f["cookie"] in before}
     assert report == {"echoed": count, "lost": 0}, report
-    assert set(after) == set(before), (
-        "a direction was readmitted mid-measurement: "
-        + " ".join(f"{k}={state[k]}" for k in sorted(state)
-                   if k.endswith("invalidations") or
-                   k in ("invalidated", "invalidation_done", "rearms", "errors",
-                         "rejects", "busy", "installs", "deletes")))
+    assert_undisturbed(ctx, installed, state, set(after) == set(before),
+                       label=f"isp-{label}-readmitted")
     delta = {c: after[c] - before[c] for c in before}
     assert all(d == count for d in delta.values()), (delta, state)
     software = {dev: software_after[dev] - software_before[dev]
                 for dev in software_before}
+    sent = {dev: sent_after[dev] - sent_before[dev] for dev in sent_before}
+    ctx.record(f"isp-{label}", {"forward": forward, "reverse": reverse,
+                                "delta": delta, "software_rx": software,
+                                "software_tx": sent})
     # A software-forwarded burst puts `count` frames through each port's
     # receive path, so anything well under that says the hardware carried it.
     # The LAN port carries nothing but the profile and takes the tight bound;
     # the WAN port also carries the agent's own control channel, which is a
     # handful of frames per call on a kept-alive connection.
-    assert software[TARGET_LAN_IF] < count // 4, (software, count)
     assert software[TARGET_WAN_IF] < count // 2, (software, count)
-    ctx.record(f"isp-{label}", {"forward": forward, "reverse": reverse,
-                                "delta": delta, "software_rx": software})
+    if forward:
+        assert software[TARGET_LAN_IF] < count // 4, (software, count)
+    else:
+        # Whether the upload's arrival shows in the LAN port's receive count
+        # depends on the path Linux forwarded it by (see _software_tx), so the
+        # proof that Linux carried it is the WAN port's transmit count.
+        assert sent[TARGET_WAN_IF] >= count, (sent, count)
+    return forward, reverse
+
+
+async def _tcp_accounted(ctx, client, *, peer, dport, label="profile_isp"):
+    """One TCP connection from a client to the far end, read back while it is
+    open and idle (see _gated_tcp): a first phase admits it, a second is
+    measured. Returns (forward, reverse) as installed.
+
+    TCP is how the IPv4 upload is proved on this profile (see
+    _upload_in_linux). The measured phase must be hardware's: the same two
+    rows, a hundred packets or more each, nothing installed or retired
+    meanwhile, and the WAN port's software transmit count well below
+    the upload. The client lets the kernel pick its port, so a connection an
+    earlier case left in TIME_WAIT is never in the way; the rows are found by
+    the far end's port, which no other TCP connection here uses, and joined
+    back to the client's port once it reports it.
+    """
+    source, target = _bracketed(_source_address(client, peer)), _bracketed(peer)
+
+    def rows(state):
+        forward = [f for f in state["flows"] if f["proto"] == "6"
+                   and f["src"].startswith(source + ":") and f["dst"] == f"{target}:{dport}"]
+        reverse = [f for f in state["flows"] if f["proto"] == "6"
+                   and f["src"] == f"{target}:{dport}"
+                   and f["new_dst"].startswith(source + ":")]
+        assert len(forward) == len(reverse) == 1, (
+            f"{client['name']} TCP to {target}:{dport} is not in hardware both ways: "
+            f"validated={state['validated']} rejects={state['rejects']} "
+            f"busy={state['busy']}\nflows={state['flows']}")
+        return forward[0], reverse[0]
+
+    async def run(script, **kwargs):
+        return await _client_python(ctx, client, script, **kwargs)
+
+    async with GatedTcp(run, source=_source_address(client, peer), peer=peer, dport=dport,
+                        label=label) as transfer:
+        await transfer.warmed()
+        before = await ctx.state()
+        forward, reverse = rows(before)
+        sent = (await _software_tx(ctx))[TARGET_WAN_IF]
+        await transfer.measure()
+        sent = (await _software_tx(ctx))[TARGET_WAN_IF] - sent
+        after = await ctx.state()
+        now = rows(after)
+    ctx.record(f"isp-{label}", {"before": before, "after": after, "software_wan_tx": sent,
+                                "report": transfer.report})
+    assert_undisturbed(ctx, before, after,
+                       (now[0]["cookie"], now[1]["cookie"]) == (forward["cookie"], reverse["cookie"])
+                       and (after["installs"], after["deletes"]) == (before["installs"], before["deletes"]),
+                       label=f"isp-{label}-readmitted")
+    upload = int(now[0]["packets"]) - int(forward["packets"])
+    download = int(now[1]["packets"]) - int(reverse["packets"])
+    assert upload > 100 and download > 100, (upload, download)
+    # Only the handful of frames the reads above cost, and the session's own
+    # echoes, left the WAN port in software while the measured phase crossed.
+    assert sent < upload // 4, (sent, upload)
+    port = transfer.report["port"]
+    assert forward["src"] == f"{source}:{port}", (forward, transfer.report)
+    assert reverse["new_dst"] == f"{source}:{port}", (reverse, transfer.report)
     return forward, reverse
 
 
 def _assert_session(ctx, forward, reverse):
     """The session is named on the direction that inserts it and the one that
     strips it, and on neither LAN half; the carrier tag is under it on both.
+    `forward` is None where the upload is Linux's.
 
     Both directions still name the physical ports. Neither a ppp device nor a
     bridge ever becomes one, which is the invariant a profile is likeliest to
     break: there are four upper devices in this path and only two ports.
     """
     expected = _session_text(ctx.session_identity)
-    assert forward["out_ppp"] == expected and forward["in_ppp"] == "-", forward
     assert reverse["in_ppp"] == expected and reverse["out_ppp"] == "-", reverse
-    assert forward["out_vlan"] == str(WAN_VID), forward
     assert reverse["in_vlan"] == str(WAN_VID), reverse
-    assert forward["in"] == TARGET_LAN_IF and forward["out"] == TARGET_WAN_IF, forward
     assert reverse["in"] == TARGET_WAN_IF and reverse["out"] == TARGET_LAN_IF, reverse
+    if forward is None:
+        return
+    assert forward["out_ppp"] == expected and forward["in_ppp"] == "-", forward
+    assert forward["out_vlan"] == str(WAN_VID), forward
+    assert forward["in"] == TARGET_LAN_IF and forward["out"] == TARGET_WAN_IF, forward
 
 
 # ---- multicast -------------------------------------------------------------
@@ -1191,11 +1302,19 @@ async def test_profile_isp_subscriber_reaches_the_internet(isp, splat_window):
     that itself rides the carrier tag. A bridge on one side and a session over a
     tag on the other, on one connection: the row has to name all three, and
     nothing else.
+
+    A UDP upload into the session is Linux's (see _upload_in_linux), so the
+    UDP connection proves the download and its refusal; the upload the row
+    describes is a TCP connection's.
     """
     ctx = isp
-    forward, reverse = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
-                                        dport=PORT_MAIN, sport=PORT_MAIN,
-                                        label="subscriber")
+    _, download = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                   dport=PORT_MAIN, sport=PORT_MAIN, label="subscriber")
+    _assert_session(ctx, None, download)
+    assert download["out_br"] == ctx.bridge_text[LAN_VID] and download["in_br"] == "-", download
+    assert download["out_vlan"] == "-", download
+    forward, reverse = await _tcp_accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                            dport=PORT_MAIN, label="subscriber-tcp")
     _assert_session(ctx, forward, reverse)
     # The bridge is named on the direction that crosses it and only there, and
     # the subscriber's wire carries no tag although a VLAN device is in the
@@ -1220,12 +1339,17 @@ async def test_profile_isp_guest_vlan_is_tagged_on_the_wire(isp, splat_window):
     Same bridge, same port, same session. A derivation that stopped at the
     netdevs would push the subscriber VLAN's tag here too, or none at all, and
     either way the guest receives frames it cannot parse while every counter
-    looks healthy.
+    looks healthy. The UDP download pushes the guest tag; the upload that pops
+    it is a TCP connection's, a UDP one being Linux's.
     """
     ctx = isp
-    forward, reverse = await _accounted(ctx, BY_NAME["guest"], peer=INNER_LOCAL,
-                                        dport=PORT_GUEST, sport=PORT_GUEST,
-                                        label="guest")
+    _, download = await _accounted(ctx, BY_NAME["guest"], peer=INNER_LOCAL,
+                                   dport=PORT_GUEST, sport=PORT_GUEST, label="guest")
+    _assert_session(ctx, None, download)
+    assert download["out_br"] == ctx.bridge_text[GUEST_VID], download
+    assert download["out_vlan"] == str(GUEST_VID), download
+    forward, reverse = await _tcp_accounted(ctx, BY_NAME["guest"], peer=INNER_LOCAL,
+                                            dport=PORT_GUEST, label="guest-tcp")
     _assert_session(ctx, forward, reverse)
     assert forward["in_br"] == ctx.bridge_text[GUEST_VID], forward
     assert forward["in_vlan"] == str(GUEST_VID), forward
@@ -1298,6 +1422,11 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
     accelerated frame never passes through a leaf's software qdisc, so tc has
     nothing to report and `cdx_htb` refuses TCA statistics outright rather than
     return a zero that reads like an answer.
+
+    Both flows are TCP. The queues are the WAN port's, so what they count is
+    the upload, and a UDP upload into the session is Linux's (see
+    _upload_in_linux): its frames would reach the port through the software
+    qdisc and land on the default class whatever their mark.
     """
     ctx = isp
     mask = int((await read(ctx.target, ctx.session,
@@ -1366,10 +1495,10 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
             assert classid in tree, (classid, tree)
         await dut("nft", f'''table inet {QOS_TABLE} {{
  chain mangle {{ type filter hook forward priority -150; policy accept;
- udp dport {PORT_VOICE} ct mark set {voice_mark:#x}
- udp sport {PORT_VOICE} ct mark set {voice_mark:#x}
- udp dport {PORT_BULK} ct mark set {bulk_mark:#x}
- udp sport {PORT_BULK} ct mark set {bulk_mark:#x}
+ tcp dport {PORT_VOICE} ct mark set {voice_mark:#x}
+ tcp sport {PORT_VOICE} ct mark set {voice_mark:#x}
+ tcp dport {PORT_BULK} ct mark set {bulk_mark:#x}
+ tcp sport {PORT_BULK} ct mark set {bulk_mark:#x}
  }}
 }}''')
         # The mark is sampled at admission, so a connection that predates the
@@ -1377,13 +1506,11 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
         await dut("conntrack", "-F", check=False)
 
         before = await leaves()
-        voice_fwd, voice_rev = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
-                                                dport=PORT_VOICE, sport=PORT_VOICE,
-                                                label="voice")
+        voice_fwd, voice_rev = await _tcp_accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                                    dport=PORT_VOICE, label="voice")
         voiced = await leaves()
-        bulk_fwd, bulk_rev = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
-                                              dport=PORT_BULK, sport=PORT_BULK,
-                                              label="bulk")
+        bulk_fwd, bulk_rev = await _tcp_accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                                  dport=PORT_BULK, label="bulk")
         bulked = await leaves()
 
         for row in (voice_fwd, voice_rev):
@@ -1430,14 +1557,36 @@ async def test_profile_isp_port_forward_reaches_the_subscriber(isp, splat_window
     Netfilter describes an ingress session with nothing at all -- no pop action,
     no dissector key -- so this rule is byte-for-byte the rule an unencapsulated
     flow produces, and is the half likelier to be refused without saying so.
+
+    The subscriber's replies are an upload into the session. Over UDP that is
+    Linux's (see _upload_in_linux), so the UDP knock proves the inbound half
+    and the refusal of the reply, and a TCP connection to the same port proves
+    both halves, the reply translated back in front of the insert.
     """
     ctx = isp
     client = BY_NAME["main"]
     receiver = f"/tmp/ask_profile_isp_forward_{os.getpid()}.py"
     listener = f'''
-import socket
+import socket, threading
+address = ({client['ip']!r}, {PORT_PUBLIC})
+def serve(conn):
+    with conn:
+        while True:
+            data = conn.recv(65536)
+            if not data:
+                break
+            conn.sendall(data)
+def stream():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(address)
+    s.listen()
+    while True:
+        conn, _ = s.accept()
+        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+threading.Thread(target=stream, daemon=True).start()
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(({client['ip']!r}, {PORT_PUBLIC}))
+s.bind(address)
 while True:
     data, peer = s.recvfrom(2048)
     s.sendto(data, peer)
@@ -1445,6 +1594,7 @@ while True:
     await command(ctx.target, ctx.session, "nft", f'''table inet {NAT_TABLE} {{
  chain prerouting {{ type nat hook prerouting priority -110; policy accept;
  iif {ctx.ppp_if} ip daddr {ctx.ppp_local} udp dport {PORT_PUBLIC} dnat ip to {client['ip']}:{PORT_PUBLIC}
+ iif {ctx.ppp_if} ip daddr {ctx.ppp_local} tcp dport {PORT_PUBLIC} dnat ip to {client['ip']}:{PORT_PUBLIC}
  }}
 }}''')
     staged = (f"import pathlib, subprocess\n"
@@ -1478,38 +1628,96 @@ while True:
             sock.close()
         return echoed
 
+    def _stream(seconds):
+        """The same knock over TCP: a connection echoing 4 KiB blocks for
+        `seconds`, from a port the kernel picks."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(20)
+        block, blocks = bytes(range(256)) * 16, 0
+        try:
+            sock.bind((INNER_LOCAL, 0))
+            sock.connect((public, PORT_PUBLIC))
+            port = sock.getsockname()[1]
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                sock.sendall(block)
+                remaining = len(block)
+                while remaining:
+                    chunk = sock.recv(remaining)
+                    assert chunk, "the subscriber closed mid-transfer"
+                    remaining -= len(chunk)
+                blocks += 1
+                time.sleep(0.002)
+        finally:
+            sock.close()
+        return {"port": port, "blocks": blocks}
+
+    def _tcp_rows(flows):
+        inbound = [f for f in flows if f["proto"] == "6"
+                   and f["src"].startswith(INNER_LOCAL + ":")
+                   and f["dst"] == f"{ctx.ppp_local}:{PORT_PUBLIC}"]
+        reply = [f for f in flows if f["proto"] == "6"
+                 and f["src"] == f"{client['ip']}:{PORT_PUBLIC}"
+                 and f["new_src"] == f"{ctx.ppp_local}:{PORT_PUBLIC}"]
+        if (len(inbound) == len(reply) == 1 and int(inbound[0]["packets"]) > 100
+                and int(reply[0]["packets"]) > 100):
+            return inbound[0], reply[0]
+        return None
+
     try:
         result = await _client_python(ctx, client, staged,
                                       label="profile_isp_forward_receiver", timeout=30)
         assert "RECEIVER-UP" in result.stdout, result.stdout
         await asyncio.sleep(1.0)
+        initial = await ctx.state()
         sent = 64
         echoed = await asyncio.to_thread(_knock, sent)
         assert echoed >= sent - 4, (echoed, sent)
-        flows = (await ctx.state())["flows"]
+        state = await ctx.state()
+        flows = state["flows"]
         forward = _direction(flows, f"{INNER_LOCAL}:{PORT_PUBLIC}",
                              f"{ctx.ppp_local}:{PORT_PUBLIC}")
-        reverse = [f for f in flows if f["src"] == f"{client['ip']}:{PORT_PUBLIC}"
-                   and f["new_src"] == f"{ctx.ppp_local}:{PORT_PUBLIC}"]
-        assert len(reverse) == 1, flows
-        reverse = reverse[0]
+        # The reply is a UDP upload into the session: Linux's, and refused.
+        assert not [f for f in flows if f["src"] == f"{client['ip']}:{PORT_PUBLIC}"
+                    and f["new_src"] == f"{ctx.ppp_local}:{PORT_PUBLIC}"], flows
+        assert state["rejects"] > initial["rejects"], (initial, state)
         assert forward["new_dst"] == f"{client['ip']}:{PORT_PUBLIC}", forward
         assert forward["in_ppp"] == _session_text(ctx.session_identity), forward
         assert forward["in"] == TARGET_WAN_IF and forward["out"] == TARGET_LAN_IF, \
             forward
         assert forward["out_br"] == ctx.bridge_text[LAN_VID], forward
-        assert reverse["out_ppp"] == _session_text(ctx.session_identity), reverse
         # A second knock, accounted for by the classifier's own counters: the
-        # rule alone never proves the frame reached the wire.
-        counted = {f["cookie"]: int(f["packets"]) for f in (forward, reverse)}
+        # rule alone never proves the frame reached the wire. Every reply to it
+        # came back through Linux.
+        counted = {forward["cookie"]: int(forward["packets"])}
         again = await asyncio.to_thread(_knock, sent)
         assert again == sent, (again, sent)
         after = {f["cookie"]: int(f["packets"]) for f in (await ctx.state())["flows"]
                  if f["cookie"] in counted}
         assert set(after) == set(counted), (counted, after)
         assert all(after[c] - counted[c] == sent for c in counted), (counted, after)
-        ctx.record("isp-port-forward", {"forward": forward, "reverse": reverse,
-                                        "echoed": echoed, "second": again})
+
+        # The same port over TCP, with both halves read back while it runs.
+        streaming = asyncio.create_task(asyncio.to_thread(_stream, 5))
+        rows = None
+        try:
+            while rows is None and not streaming.done():
+                rows = _tcp_rows((await ctx.state())["flows"])
+                if rows is None:
+                    await asyncio.sleep(0.5)
+        finally:
+            report = await streaming
+        assert rows, f"the forwarded TCP connection was not carried both ways: {await ctx.state()}"
+        inbound, reply = rows
+        assert inbound["src"] == f"{INNER_LOCAL}:{report['port']}", (inbound, report)
+        assert inbound["new_dst"] == f"{client['ip']}:{PORT_PUBLIC}", inbound
+        _assert_session(ctx, reply, inbound)
+        assert inbound["out_br"] == ctx.bridge_text[LAN_VID], inbound
+        assert reply["in_br"] == ctx.bridge_text[LAN_VID], reply
+        ctx.record("isp-port-forward", {"forward": forward, "echoed": echoed,
+                                        "second": again, "tcp": {"inbound": inbound,
+                                                                 "reply": reply,
+                                                                 "report": report}})
     finally:
         await command(ctx.target, ctx.session, "nft", "delete", "table", "inet",
                       NAT_TABLE, check=False)
@@ -1616,6 +1824,10 @@ async def test_profile_isp_redial_readmits_every_flow(isp, splat_window):
     destination and nothing else: the bindings stay up, admission is never
     disabled, and the IPTV group -- which depends on the bridge and not on the
     session -- keeps its hardware entry throughout.
+
+    A UDP upload into the session is Linux's, so the UDP connection carries the
+    strip across the redial, and the insert readmitted against the new session
+    is a TCP connection's.
     """
     ctx = isp
     await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL, dport=PORT_MAIN,
@@ -1660,12 +1872,14 @@ async def test_profile_isp_redial_readmits_every_flow(isp, splat_window):
     await _session_ipv6(ctx, [])
     await _reachable(ctx, BY_NAME["main"], INNER_LOCAL)
 
-    forward, reverse = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
-                                        dport=PORT_MAIN, sport=PORT_MAIN,
-                                        label="redial-after")
+    _, download = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                   dport=PORT_MAIN, sport=PORT_MAIN, label="redial-after")
     # Against the session that exists now. A flow that had survived the hangup,
     # or been readmitted from anything cached, would name the old one -- which is
     # exactly the failure that forwards happily and delivers nothing.
+    _assert_session(ctx, None, download)
+    forward, reverse = await _tcp_accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                            dport=PORT_MAIN, label="redial-after-tcp")
     _assert_session(ctx, forward, reverse)
     after = await ctx.state()
     assert after["bindings"] == 2 and after["rearms"] == before["rearms"], after
@@ -1705,9 +1919,14 @@ async def test_profile_isp_lan_port_flap_readmits(isp, splat_window):
     # the one before it, and nothing re-offers a retired flow on its own.
     await asyncio.sleep(3.0)
     await _reachable(ctx, BY_NAME["main"], INNER_LOCAL)
-    forward, reverse = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
-                                        dport=PORT_MAIN, sport=PORT_MAIN,
-                                        label="flap-after")
+    # The UDP connection's download, and a TCP connection for the upload a UDP
+    # one leaves to Linux.
+    _, download = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                   dport=PORT_MAIN, sport=PORT_MAIN, label="flap-after")
+    _assert_session(ctx, None, download)
+    assert download["out_br"] == ctx.bridge_text[LAN_VID], download
+    forward, reverse = await _tcp_accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                            dport=PORT_MAIN, label="flap-after-tcp")
     _assert_session(ctx, forward, reverse)
     assert forward["in_br"] == ctx.bridge_text[LAN_VID], forward
     # And the group is relearned from the next report rather than resurrected.
@@ -1755,9 +1974,14 @@ async def test_profile_isp_policy_revokes_and_readmits(isp, splat_window):
 
     await apply(ctx.console, _policy(), r=ctx)
     await ctx.wait(lambda s: s["bindings"] == 2)
-    forward, reverse = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
-                                        dport=PORT_MAIN, sport=PORT_MAIN,
-                                        label="policy-after")
+    # The same UDP socket's download back in hardware, its upload Linux's as
+    # before the stop, and a TCP connection for the upload in hardware.
+    _, download = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                   dport=PORT_MAIN, sport=PORT_MAIN, label="policy-after")
+    _assert_session(ctx, None, download)
+    assert download["out_br"] == ctx.bridge_text[LAN_VID], download
+    forward, reverse = await _tcp_accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,
+                                            dport=PORT_MAIN, label="policy-after-tcp")
     _assert_session(ctx, forward, reverse)
     assert forward["in_br"] == ctx.bridge_text[LAN_VID], forward
     after = await ctx.state()

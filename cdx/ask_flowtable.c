@@ -1859,6 +1859,47 @@ static bool ft_ipv6_mtu_bounded(struct net_device *in, u32 mtu)
 	return bounded;
 }
 
+/* The largest IPv4 packet a direction arriving on @in may be handed once its
+ * ingress has taken @stripped bytes of session and tunnel header off: the
+ * device's MTU, but never less than a standard Ethernet frame carries through
+ * the same stripping. The IPv4 MTU bound and its refusal ahead of admission
+ * both measure a path against this, so the two cannot disagree about what
+ * arrives. */
+static u32 ft_ipv4_arriving(const struct net_device *in, unsigned int stripped)
+{
+	return max_t(u32, READ_ONCE(in->mtu), ETH_DATA_LEN - stripped);
+}
+
+/* Whether an IPv4 direction leaving by a path of @mtu can be carried although
+ * a packet arriving on @in could be larger. The microcode fragments an
+ * oversized IPv4 packet without DF itself, and for a frame an Ethernet port
+ * received, the fragments it builds carry the headers but not the payload:
+ * measured on the DK, every payload byte of every fragment is zero, whatever
+ * the memory the buffers sit in and with no VSP on the port. One with DF it
+ * hands to Linux for the ICMP. TCP sets DF, and a PPPoE or tunnel uplink
+ * clamps its MSS besides, so a TCP direction stays in hardware; any other
+ * direction into a smaller path stays in software, where Linux fragments.
+ * A direction to or from SEC is exempt: its enqueue to SEC fragments nothing,
+ * and what SEC returns is fragmented on the offline port, where the
+ * microcode's fragments are whole.
+ *
+ * What may arrive is the ingress device's MTU, but never less than a
+ * standard Ethernet frame carries through whatever the direction strips: a
+ * port keeps receiving full frames after its MTU is lowered, and a host that
+ * was not told the smaller MTU -- DHCP's option for it is widely ignored --
+ * keeps sending them. The ingress and the path are device and route MTUs,
+ * whose changes retire the flow through their own events, so admission alone
+ * decides. */
+static bool ft_ipv4_mtu_carried(const struct cdx_ft_rule *rule, const struct net_device *in,
+				u32 mtu)
+{
+	unsigned int stripped = (rule->in_session.present ? PPPOE_SES_HLEN : 0) +
+				(rule->in_tunnel.present ? rule->in_tunnel.header_size : 0);
+
+	return rule->proto == IPPROTO_TCP || rule->sa_handle || rule->in_sa_handle ||
+	       ft_ipv4_arriving(in, stripped) <= mtu;
+}
+
 /* Exact masks preserve every selector. Native flowtables supply routing
  * semantics (including TTL decrement), four Ethernet mangle words, an
  * encapsulation block, optional translation/checksum actions and a final
@@ -2118,6 +2159,11 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	if (family == AF_INET6 && !ft_ipv6_mtu_bounded(out->in_logical, cls->nf_mtu)) {
 		ask_dbg(ASK_DBG_DEVICE, "ipv6 mtu %u below ingress %s\n",
 			cls->nf_mtu, netdev_name(out->in_logical));
+		return ask_refuse(-EOPNOTSUPP);
+	}
+	if (family == AF_INET && !ft_ipv4_mtu_carried(out, out->in_logical, cls->nf_mtu)) {
+		ask_dbg(ASK_DBG_DEVICE, "ipv4 proto %u mtu %u below ingress %s\n",
+			out->proto, cls->nf_mtu, netdev_name(out->in_logical));
 		return ask_refuse(-EOPNOTSUPP);
 	}
 	/* A tunnel inside a transform, or a transform inside a tunnel, is a

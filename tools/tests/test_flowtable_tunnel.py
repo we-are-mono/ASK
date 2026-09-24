@@ -26,6 +26,14 @@ Shapes: `6o4` is IPv6 inside IPv4 (`sit`, proto 41), the tunnel-broker and
 shape. The outer endpoints are the DUT's WAN address and the orchestrator's;
 the inner ones a /64 or a /24 that belongs to neither segment, so a routing
 mistake cannot look like a working path.
+
+A 4o6 UDP upload stays in Linux. It arrives on the LAN port, which can deliver
+a full 1500-byte frame whatever MTU it is given, and the tunnel's path is
+smaller: the microcode would have to fragment it, and the fragments it builds
+from a frame an Ethernet port received carry no payload. So the 4o6 UDP cases
+assert that refusal and the download half, and the 4o6 upload -- the insert
+opcode -- is carried by TCP, which sets DF and is never the microcode's to
+fragment.
 """
 from __future__ import annotations
 
@@ -40,10 +48,12 @@ import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
-from _topology import (DUT_IPV6_LAN, DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN_IF,
+from ask_orch.counters import kernel_tx_packets
+from _gated_tcp import GatedTcp
+from _topology import (DUT_IPV6_LAN, DUT_IPV6_WAN, FULL_FRAME, LAN_IPV6, LAN_NIC, TARGET_LAN_IF,
                        TARGET_WAN_IF, kernel_rx_packets, lan_run, lan_run_python)
 import test_flowtable_offload as ft
-from test_flowtable_offload import ARTIFACTS, Rig, command, read
+from test_flowtable_offload import ARTIFACTS, Rig, assert_undisturbed, command, read
 
 TABLE = "ask_tunnel"
 DUT_WAN_IPV4 = os.environ.get("ASK_TARGET_IP", "10.0.0.62")
@@ -69,6 +79,17 @@ PORTS = {"routed": (48910, 48911), "mtu": (48920, 48921), "tcp": (48930, 48931),
 # What the outer header's TTL is asked to be, and what it is changed to by the
 # case that reconfigures the tunnel under a live flow.
 TTL, CHANGED_TTL = 64, 33
+
+
+def _upload_refused(shape, proto="udp"):
+    """Whether the adapter leaves the LAN-to-tunnel direction to Linux.
+
+    A non-TCP IPv4 direction is installed only where its path carries the
+    largest packet its ingress port can deliver; into a tunnel smaller than a
+    full frame, the microcode would fragment it, and its fragments of a frame
+    an Ethernet port received are zero-filled. TCP sets DF and is exempt, and
+    an IPv6 direction is bounded by the LAN's advertised MTU instead."""
+    return shape.family == 4 and proto != "tcp" and shape.mtu < FULL_FRAME
 
 
 class TunnelRig(Rig):
@@ -119,11 +140,15 @@ class Shape:
                 f"{proto} dport {self.dport}")
 
     def capture_filter(self):
-        """The outer packets the DUT sends, and only those."""
+        """The outer packets the DUT sends, and only those. A 4o6 packet Linux
+        built carries ip6tnl's tunnel encapsulation limit in a destination
+        options header before the inner one, which `ip6 proto` would not look
+        past, so the next header is read at both places it can be."""
         local, remote = self.outer
         if self.mode == "6o4":
             return f"ip proto 41 and src host {local} and dst host {remote}"
-        return f"ip6 proto 4 and src host {local} and dst host {remote}"
+        return (f"ip6 and src host {local} and dst host {remote} "
+                f"and (ip6[6] == 4 or (ip6[6] == 60 and ip6[40] == 4))")
 
 
 # ---- traffic -------------------------------------------------------------
@@ -166,17 +191,25 @@ print(json.dumps({{'echoed': echoed, 'lost': lost}}))
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
-async def _both_directions(r):
+def _expected(r, proto="udp"):
+    """How many directions of the connection hardware should hold."""
+    return 1 if _upload_refused(r.shape, proto) else 2
+
+
+async def _both_directions(r, proto="udp", state=None):
     """Admission is directional: one direction refused leaves the other
     accelerated, and a throughput number hides the difference. The ingress
     half of a tunnel is the likelier refusal, because its rule is
-    byte-for-byte the rule an unencapsulated flow produces."""
-    state = await r.state()
-    if len(state["flows"]) != 2:
+    byte-for-byte the rule an unencapsulated flow produces. Where the upload
+    is Linux's by design, the download alone is what is expected. Reads the
+    state unless handed one."""
+    state = state or await r.state()
+    expected = _expected(r, proto)
+    if len(state["flows"]) != expected:
         conntrack = await command(r.target, r.session, "conntrack", "-L", "-o", "extended",
                                   check=False)
         r.record("tunnel-partial-admission", {"state": state, "conntrack": conntrack})
-        pytest.fail(f"{len(state['flows'])} of 2 directions admitted: "
+        pytest.fail(f"{len(state['flows'])} of {expected} directions admitted: "
                     f"validated={state['validated']} rejects={state['rejects']} "
                     f"busy={state['busy']} errors={state['errors']}\n"
                     f"flows={state['flows']}\nconntrack={conntrack['stdout']}")
@@ -195,14 +228,14 @@ async def _offload_table(r, proto="udp"):
 
 
 async def _admit(r, timeout=15):
-    """Exchange short bursts until both directions are installed. A deadline
-    rather than a round count: an admission that loses rtnl_trylock is
-    declined and re-offered only after two flowtable GC ticks."""
+    """Exchange short bursts until the expected directions are installed. A
+    deadline rather than a round count: an admission that loses rtnl_trylock
+    is declined and re-offered only after two flowtable GC ticks."""
     deadline = time.monotonic() + timeout
     while True:
         await _udp_exchange(r, 4)
         state = await r.state()
-        if len(state["flows"]) == 2:
+        if len(state["flows"]) == _expected(r):
             return state["flows"]
         if time.monotonic() > deadline:
             return await _both_directions(r)
@@ -221,20 +254,30 @@ def _bracketed(address):
 
 
 def _directions(r, flows):
+    """(forward, reverse). The forward is None where the upload is Linux's by
+    design, and then it must be absent rather than merely unasked for."""
     lan, orch = _bracketed(r.lan_address), _bracketed(r.shape.inner_orch)
-    return _direction(flows, lan, orch), _direction(flows, orch, lan)
+    reverse = _direction(flows, orch, lan)
+    if _upload_refused(r.shape, "tcp" if reverse["proto"] == "6" else "udp"):
+        assert not [f for f in flows if f["src"].startswith(lan + ":")], flows
+        return None, reverse
+    return _direction(flows, lan, orch), reverse
 
 
 def _assert_tunnel(r, forward, reverse):
     """The tunnel is named on the direction that inserts its header and on the
     one that strips it, and on neither LAN half. Both directions still name
-    the physical ports: a tunnel device never becomes one."""
+    the physical ports: a tunnel device never becomes one. `forward` is None
+    where the upload stays in Linux."""
     expected = _tunnel_text(r.shape)
-    assert forward["out_tnl"] == expected and forward["in_tnl"] == "-", forward
     assert reverse["in_tnl"] == expected and reverse["out_tnl"] == "-", reverse
-    assert forward["in"] == TARGET_LAN_IF and forward["out"] == TARGET_WAN_IF, forward
     assert reverse["in"] == TARGET_WAN_IF and reverse["out"] == TARGET_LAN_IF, reverse
-    assert forward["family"] == reverse["family"] == str(r.shape.family), (forward, reverse)
+    assert reverse["family"] == str(r.shape.family), reverse
+    if forward is None:
+        return
+    assert forward["out_tnl"] == expected and forward["in_tnl"] == "-", forward
+    assert forward["in"] == TARGET_LAN_IF and forward["out"] == TARGET_WAN_IF, forward
+    assert forward["family"] == str(r.shape.family), forward
     # The forward direction leaves by the tunnel, so it carries the tunnel's
     # MTU; the reverse carries the LAN port's.
     assert int(forward["mtu"]) == r.shape.mtu, forward
@@ -247,6 +290,14 @@ async def _tunnel_counters(r):
     stats = json.loads(result["stdout"])[0]["stats64"]
     return {"rx": stats["rx"]["packets"], "tx": stats["tx"]["packets"],
             "rx_bytes": stats["rx"]["bytes"], "tx_bytes": stats["tx"]["bytes"]}
+
+
+def _tunnel_record(r, state):
+    """The adapter's record for the tunnel device: the strip counts into its
+    receive half and the insert into its transmit half."""
+    rows = [t for t in state["tunnels"] if t["dev"] == r.shape.device]
+    assert len(rows) == 1, (r.shape.device, state["tunnels"])
+    return {k: int(rows[0][k]) for k in ("rx_packets", "rx_bytes", "tx_packets", "tx_bytes")}
 
 
 class Capture:
@@ -303,7 +354,12 @@ def _assert_outer(r, packets, count, ttl=TTL):
     which is the routing the hardware did on the way through. The outer IPv4
     header carries no DF: the insert opcode fills the fragment field itself,
     a limitation the legacy owner also had, so requiring its absence is what
-    catches a future microcode that starts honouring the template."""
+    catches a future microcode that starts honouring the template.
+
+    A 4o6 UDP upload is Linux's by design, so its outer packets are the
+    kernel's own: ip6tnl adds a tunnel encapsulation limit option the insert
+    opcode never builds, and for those the endpoints, the hop limit and the
+    routed inner packet are what the two have in common."""
     from scapy.all import IP, IPv6, UDP, TCP
     shape = r.shape
     outer = [p for p in packets if (IP in p if shape.outer_family == 4 else IPv6 in p)]
@@ -322,10 +378,12 @@ def _assert_outer(r, packets, count, ttl=TTL):
             assert inner[IPv6].hlim == 63, inner[IPv6].hlim
         else:
             o = p[IPv6]
-            assert (o.src, o.dst, o.nh) == (shape.outer[0], shape.outer[1], 4), p.summary()
-            assert o.hlim == ttl, (o.hlim, ttl)
             inner = o.payload
             assert IP in inner, p.summary()
+            linux = _upload_refused(shape, "tcp" if TCP in inner else "udp")
+            assert (o.src, o.dst) == (shape.outer[0], shape.outer[1]), p.summary()
+            assert linux or o.nh == 4, p.summary()
+            assert o.hlim == ttl, (o.hlim, ttl)
             assert inner[IP].ttl == 63, inner[IP].ttl
         assert UDP in inner or TCP in inner, p.summary()
 
@@ -343,7 +401,9 @@ async def _established(r, count=64, payload_size=64, name="routed"):
     counters and the frames on the wire."""
     await _offload_table(r)
     flows = await _admit(r)
+    installed = await r.state()
     before = {f["cookie"]: int(f["packets"]) for f in flows}
+    record0 = _tunnel_record(r, installed)
     tun0 = await _tunnel_counters(r)
     sw0 = await kernel_rx_packets(r.target, r.session, TARGET_WAN_IF)
     async with Capture(r, name) as capture:
@@ -352,10 +412,7 @@ async def _established(r, count=64, payload_size=64, name="routed"):
     tun1 = await _tunnel_counters(r)
     state = await r.state()
     after = {f["cookie"]: int(f["packets"]) for f in state["flows"]}
-    if set(before) != set(after):
-        r.record("tunnel-readmitted", {"before": before, "state": state})
-        pytest.fail(f"a direction was readmitted mid-measurement: before={before} "
-                    f"after={after}")
+    assert_undisturbed(r, installed, state, set(before) == set(after), label="tunnel-readmitted")
     assert report == {"echoed": count, "lost": 0}, report
     delta = {c: after[c] - before[c] for c in before}
     assert all(d == count for d in delta.values()), delta
@@ -364,11 +421,18 @@ async def _established(r, count=64, payload_size=64, name="routed"):
     software = sw1 - sw0
     assert software < count // 4, (software, count)
     tunnel = {k: tun1[k] - tun0[k] for k in tun0}
-    assert tunnel["rx"] >= count and tunnel["tx"] >= count, tunnel
-    _assert_outer(r, capture.packets(), count)
+    record = {k: v - record0[k] for k, v in _tunnel_record(r, state).items()}
     r.record(f"tunnel-{name}", {"flows": flows, "delta": delta, "software_rx": software,
-                                "tunnel": tunnel, "report": report,
+                                "tunnel": tunnel, "record": record, "report": report,
                                 "tunnel_text": _tunnel_text(r.shape)})
+    assert tunnel["rx"] >= count and tunnel["tx"] >= count, tunnel
+    # The record counts what the hardware did: every download it stripped,
+    # and every upload it inserted -- none, where the upload is Linux's, whose
+    # sends the device counted itself above. The fold of inserted frames into
+    # the device is test_flowtable_tunnel_tcp's to prove.
+    inserted = 0 if _upload_refused(r.shape) else count
+    assert (record["rx_packets"], record["tx_packets"]) == (count, inserted), record
+    _assert_outer(r, capture.packets(), count)
     return flows, delta
 
 
@@ -639,20 +703,23 @@ async def tunnel_rig(target_agent, aiohttp_session, lan, splat_window, request):
 
 @pytest.mark.parametrize("tunnel_rig", ["6o4", "4o6"], indirect=True)
 async def test_flowtable_tunnel_routed(tunnel_rig):
-    """A routed UDP flow through the tunnel, both directions in hardware.
+    """A routed UDP flow through the tunnel.
 
     The forward direction inserts the outer header and the reverse strips it;
     the adapter names the tunnel on exactly those two and on neither LAN half.
     The frames the DUT put on the wire carry the header the kernel would have
     built, and the tunnel device's counters moved by the burst although no
-    packet of it reached the CPU.
+    packet of its hardware directions reached the CPU. A 4o6 upload is
+    Linux's (see the module docstring), so there the strip is what is proved
+    and the insert is test_flowtable_tunnel_tcp's.
     """
     r = tunnel_rig
     flows, delta = await _established(r)
     forward, reverse = _directions(r, flows)
     _assert_tunnel(r, forward, reverse)
-    assert forward["in_vlan"] == reverse["out_vlan"] == "-", (forward, reverse)
-    assert forward["in_ppp"] == reverse["out_ppp"] == "-", (forward, reverse)
+    assert reverse["out_vlan"] == reverse["out_ppp"] == "-", reverse
+    if forward:
+        assert forward["in_vlan"] == forward["in_ppp"] == "-", forward
     assert all(d == 64 for d in delta.values()), delta
 
 
@@ -664,7 +731,9 @@ async def test_flowtable_tunnel_full_mtu(tunnel_rig):
     what it transmits is the outer packet; a direction programmed with the
     tunnel-reduced inner MTU excepts every full-size frame to the CPU while
     every counter says the flow is offloaded. The payload here is exactly the
-    inner MTU less its own headers.
+    inner MTU less its own headers. For 4o6 only the strip carries it in
+    hardware; the full-size insert is proved by test_flowtable_tunnel_tcp,
+    whose segments fill the tunnel.
     """
     r = tunnel_rig
     payload = r.shape.mtu - (40 if r.shape.family == 6 else 20) - 8
@@ -674,19 +743,7 @@ async def test_flowtable_tunnel_full_mtu(tunnel_rig):
     assert all(d == 32 for d in delta.values()), delta
 
 
-async def _echo_stream(reader, writer):
-    try:
-        while True:
-            data = await reader.read(65536)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
-    finally:
-        writer.close()
-
-
-@pytest.mark.parametrize("tunnel_rig", ["6o4/tcp"], indirect=True)
+@pytest.mark.parametrize("tunnel_rig", ["6o4/tcp", "4o6/tcp"], indirect=True)
 async def test_flowtable_tunnel_tcp(tunnel_rig):
     """An established TCP connection through the tunnel.
 
@@ -694,47 +751,64 @@ async def test_flowtable_tunnel_tcp(tunnel_rig):
     it; and the classifier punts SYN, FIN and RST before its own lookup, so
     what the hardware carries is the bulk transfer in the middle. The cookies
     staying put proves the connection was never readmitted underneath it.
+
+    It is also the large-segment insert. The far end advertises the MSS its
+    tunnel allows, so every full data segment of the upload comes within its
+    TCP options of the tunnel's MTU; a size check that counted the outer
+    header against that MTU would except each one to Linux, which would then
+    send it out of the WAN port itself. For 4o6 this is the only hardware
+    insert there is, the UDP upload being Linux's.
     """
     r = tunnel_rig
     shape = r.shape
     await _offload_table(r, "tcp")
-    peer = f'''
-import json, socket, time
-s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(({r.lan_address!r}, {shape.sport}))
-s.settimeout(20)
-s.connect(({shape.inner_orch!r}, {shape.dport}))
-block = bytes(range(256)) * 16
-sent = 0
-for _ in range(128):
-    s.sendall(block)
-    sent += len(block)
-    remaining = len(block)
-    while remaining:
-        chunk = s.recv(remaining)
-        assert chunk, 'peer closed mid-transfer'
-        remaining -= len(chunk)
-    time.sleep(0.002)
-s.close()
-print(json.dumps({{'sent': sent}}))
-'''
-    server = await asyncio.start_server(_echo_stream, shape.inner_orch, shape.dport,
-                                        family=socket.AF_INET6)
-    try:
-        async with server:
-            result = await lan_run_python(r.lan, peer, timeout=120, label="flowtable_tunnel_tcp")
-        assert result.rc == 0, result.stdout
-        report = json.loads(result.stdout.strip().splitlines()[-1])
-        flows = await _both_directions(r)
-        forward, reverse = _directions(r, flows)
-        _assert_tunnel(r, forward, reverse)
-        assert forward["proto"] == reverse["proto"] == "6", flows
-        assert int(forward["packets"]) > 100 and int(reverse["packets"]) > 100, flows
-        r.record("tunnel-tcp", {"flows": flows, "report": report})
-    finally:
-        server.close()
-        await server.wait_closed()
+
+    async def run(script, **kwargs):
+        return await lan_run_python(r.lan, script, **kwargs)
+
+    # Read while the connection is open and idle (see _gated_tcp): a FIN
+    # retires the entries within about a second of the peer closing.
+    async with GatedTcp(run, source=r.lan_address, sport=shape.sport, peer=shape.inner_orch,
+                        dport=shape.dport, label="flowtable_tunnel_tcp") as transfer:
+        await transfer.warmed()
+        before = await r.state()
+        flows = await _both_directions(r, "tcp", before)
+        record = _tunnel_record(r, before)
+        link = await _tunnel_counters(r)
+        sent = await kernel_tx_packets(r.target, r.session, TARGET_WAN_IF)
+        await transfer.measure()
+        sent = await kernel_tx_packets(r.target, r.session, TARGET_WAN_IF) - sent
+        after = await r.state()
+        record = {k: v - record[k] for k, v in _tunnel_record(r, after).items()}
+        link = {k: v - link[k] for k, v in (await _tunnel_counters(r)).items()}
+    forward, reverse = _directions(r, flows)
+    r.record("tunnel-tcp", {"flows": flows, "after": after, "record": record, "link": link,
+                            "software_wan_tx": sent, "report": transfer.report})
+    _assert_tunnel(r, forward, reverse)
+    assert forward["proto"] == reverse["proto"] == "6", flows
+    new = {f["cookie"]: f for f in after["flows"]}
+    assert_undisturbed(r, before, after, new.keys() == {forward["cookie"], reverse["cookie"]}
+                       and (after["installs"], after["deletes"]) == (before["installs"], before["deletes"]),
+                       label="tunnel-readmitted")
+    upload = int(new[forward["cookie"]]["packets"]) - int(forward["packets"])
+    download = int(new[reverse["cookie"]]["packets"]) - int(reverse["packets"])
+    assert upload > 100 and download > 100, (upload, download)
+    # The tunnel device's record counts the same frames the two entries did:
+    # the insert's the upload's, the strip's the download's.
+    assert (record["tx_packets"], record["rx_packets"]) == (upload, download), (record, upload, download)
+    # And `ip -s link` on the device moved by the record restated into the
+    # inner packets it counts itself -- the Ethernet and outer headers off what
+    # the insert counted, the Ethernet header off what the strip did -- which
+    # is the transmit fold of inserted frames that a UDP upload in Linux cannot
+    # show, plus at most a few frames the device sent or took itself.
+    for half, overhead in (("tx", 14 + shape.header), ("rx", 14)):
+        stray = link[half] - record[half + "_packets"]
+        assert 0 <= stray <= 8, (half, record, link)
+        inner = record[half + "_bytes"] - overhead * record[half + "_packets"]
+        assert inner <= link[half + "_bytes"] <= inner + stray * 1518, (half, record, link)
+    # Only the handful of frames the reads above cost left the WAN port in
+    # software while the measured phase crossed it.
+    assert 0 <= sent < upload // 4, (sent, upload)
 
 
 @pytest.mark.parametrize("tunnel_rig", ["6o4/change"], indirect=True)

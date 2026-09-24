@@ -218,6 +218,24 @@ def status_text(text):
     return state
 
 
+def assert_undisturbed(r, before, after, same=True, label="flow-disturbed"):
+    """Nothing was readmitted between two adapter states.
+
+    That is the caller's own verdict on the rows -- `same`, typically that
+    the cookies did not move -- and a failure is reported with every counter
+    that could name its cause."""
+    if same:
+        return
+    r.record(label, {"before": before, "after": after})
+    pytest.fail("the measured flow was disturbed mid-measurement: " +
+                " ".join(f"{k}={before.get(k)}->{after[k]}" for k in sorted(after)
+                         if isinstance(after[k], int) and (
+                             k.endswith("invalidations") or
+                             k in ("invalidated", "invalidation_done", "rearms", "errors",
+                                   "rejects", "busy", "installs", "deletes"))) +
+                f"\nbefore={before['flows']}\nafter={after['flows']}")
+
+
 class Echo(asyncio.DatagramProtocol):
     def __init__(self):
         self.received = Counter()
@@ -443,6 +461,18 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
         else:
             await command(wan, r.session, "ip", "route", "add", f"{r.lan_ip}/32", "via", dut_ip, "dev", r.wan_if)
             cleanup.append((wan, ["ip", "route", "del", f"{r.lan_ip}/32", "via", dut_ip, "dev", r.wan_if]))
+        # Equal-MTU Ethernet: both ports share one MTU of at least a standard
+        # frame, and the host routes below carry none, so every direction's
+        # path MTU is its egress port's. The adapter installs a non-TCP IPv4
+        # direction only when its path carries the largest packet its ingress
+        # can deliver -- a full Ethernet frame, whatever MTU the port is given
+        # -- so this is what admits the rig's UDP directions at all. A test
+        # that needs a smaller path builds it for its own duration.
+        mtus = {dev: int((await read(r.target, r.session, f"/sys/class/net/{dev}/mtu")).strip())
+                for dev in (TARGET_LAN_IF, TARGET_WAN_IF)}
+        assert len(set(mtus.values())) == 1 and mtus[TARGET_LAN_IF] >= 1500, \
+            ("the rig needs both ports at one MTU of at least 1500", mtus)
+        r.port_mtu = mtus[TARGET_LAN_IF]
         for ip, mac, dev in [(r.lan_ip, lan_mac, TARGET_LAN_IF), (WAN_IP, wan_mac, TARGET_WAN_IF)]:
             old = json.loads((await command(r.target, r.session, "ip", "-j", "neigh", "show", "to", ip, "dev", dev))["stdout"])
             restore = ["ip", "neigh", "del", ip, "dev", dev]
@@ -451,11 +481,9 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
                 restore = ["ip", "neigh", "replace", ip, "lladdr", old[0]["lladdr"], "nud", state, "dev", dev]
             await command(r.target, r.session, "ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent", "dev", dev)
             cleanup.append((r.target, restore))
-            # A route MTU below both port MTUs lets exception tests send a
-            # valid ingress Ethernet frame which is oversized at egress.
             routes = json.loads((await command(r.target, r.session, "ip", "-j", "route", "show", "exact", f"{ip}/32"))["stdout"])
             assert not routes, ("fixture requires unused host routes", routes)
-            await command(r.target, r.session, "ip", "route", "add", f"{ip}/32", "dev", dev, "mtu", "1200")
+            await command(r.target, r.session, "ip", "route", "add", f"{ip}/32", "dev", dev)
             cleanup.append((r.target, ["ip", "route", "del", f"{ip}/32", "dev", dev]))
         nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", r.proto, "--sport", str(SPORT), "--dport", str(DPORT), "-j", "ACCEPT"]
         await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
@@ -584,7 +612,7 @@ async def test_flowtable_offload_reference_and_lifecycle(rig):
         r.record("observe", state)
         return
     installed = await r.wait(lambda s: s["entries"] == 2)
-    assert all(flow["mtu"] == "1200" for flow in installed["flows"]), installed
+    assert all(int(flow["mtu"]) == r.port_mtu for flow in installed["flows"]), installed
     before = {dev: await kernel_rx_packets(r.target, r.session, dev) for dev in [TARGET_LAN_IF, TARGET_WAN_IF]}
     baseline = {flow["in"]: int(flow["packets"]) for flow in installed["flows"]}
     from scapy.all import AsyncSniffer, Ether, IP, UDP, wrpcap
@@ -664,6 +692,10 @@ async def test_flowtable_offload_same_tuple_exceptions(rig):
     before = await r.state()
     await r.exchange(32, payload_size=8)
     r.record("exception-short-packets", {"before": before, "after": await r.state()})
+    # An oversized DF packet is not among these. A UDP direction is installed
+    # only where its path carries the largest frame its ingress port can
+    # deliver, so nothing arriving on this tuple can exceed its entry; the DF
+    # exception is proved on a TCP entry in test_flowtable_mtu.py.
     script = f'''
 import json, socket, struct, time
 from scapy.all import Ether, IP, UDP, ICMP, Raw, IPOption, fragment, sendp, srp1, getmacbyip
@@ -680,12 +712,10 @@ base = IP(src=src, dst=dst, ttl=64)/UDP(sport=sport, dport=dport)
 results = {{}}
 for name, pkt, icmp_type, icmp_code in [
     ('ttl', IP(src=src,dst=dst,ttl=1)/UDP(sport=sport,dport=dport)/Raw(b'ASK-expired'), 11, 0),
-    ('mtu', IP(src=src,dst=dst,ttl=64,flags='DF')/UDP(sport=sport,dport=dport)/Raw(b'M'*1250), 3, 4),
 ]:
     answer = srp1(eth/pkt, iface=iface, timeout=3, verbose=False)
     assert answer is not None and ICMP in answer, (name, answer)
     assert (answer[ICMP].type, answer[ICMP].code) == (icmp_type, icmp_code), answer.summary()
-    if name == 'mtu': assert answer[ICMP].nexthopmtu == 1200, answer.show(dump=True)
     results[name] = answer.summary()
 for name, packets, payload in [
     ('options', [IP(src=src,dst=dst,ttl=64,options=[IPOption(b'\\x01'*4)])/UDP(sport=sport,dport=dport)/Raw(b'ASK-options')], b'ASK-options'),
@@ -713,7 +743,7 @@ print(json.dumps(results))
     assert result.rc == 0, result.stdout
     assert r.echo.received[b"ASK-options"] == 1
     assert r.echo.received[b"ASK-fragments".ljust(1024, b".")] == 1
-    assert not r.echo.received[b"ASK-expired"] and not r.echo.received[b"M" * 1250]
+    assert not r.echo.received[b"ASK-expired"]
     assert not any(r.echo.received[p] for p in (b"ASK-badsum", b"ASK-version", b"ASK-version15"))
     await r.exchange()
     r.record("exceptions", {"results": json.loads(result.stdout.strip()), "state": await r.state()})
@@ -933,8 +963,7 @@ async def test_flowtable_offload_rearm(rig):
             await r.exchange(128, promiscuous=False)
             installed = await r.wait(lambda s: s["entries"] == 2)
             for flow in installed["flows"]:
-                expected_mtu = 1200
-                assert int(flow["mtu"]) == expected_mtu, installed
+                assert int(flow["mtu"]) == r.port_mtu, installed
             tx_before = {d: await kernel_tx_packets(r.target, r.session, d)
                          for d in (TARGET_LAN_IF, TARGET_WAN_IF)}
             report = await r.exchange(512, promiscuous=False)
@@ -1304,7 +1333,7 @@ print(json.dumps(states))
     # Restore these before its normal undo actions and software proof.
     for address, mac, dev in ((r.lan_ip, r.lan_mac, TARGET_LAN_IF),
                               (WAN_IP, r.wan_mac, TARGET_WAN_IF)):
-        await console_command(con, "ip", "route", "replace", address + "/32", "dev", dev, "mtu", "1200")
+        await console_command(con, "ip", "route", "replace", address + "/32", "dev", dev)
         await console_command(con, "ip", "neigh", "replace", address, "lladdr", mac,
                               "nud", "permanent", "dev", dev)
     absent = await console_command(con, "test", "-e", "/sys/module/cdx", check=False)

@@ -28,7 +28,7 @@ def snat_flows(r, state, external, port):
                           (TARGET_WAN_IF, (remote, translated, remote, local, r.lan_ip))):
         f = rows[dev]
         assert tuple(f[k] for k in ("src", "dst", "new_src", "new_dst", "nexthop")) == expected, state
-        assert f["proto"] == "17" and f["mtu"] == "1200", state
+        assert f["proto"] == "17" and int(f["mtu"]) == r.port_mtu, state
     return rows
 
 
@@ -135,8 +135,10 @@ async def test_flowtable_udp_snat(connections, zero_checksum, nat_kind="snat"):
                                           "--sport", str(FLOWS[0]["sport"]), "-o", "extended,id")
                 # A LAN route update retires both NAT directions and readmits
                 # the same socket and conntrack mapping without table recreation.
+                # Only the advertised MSS changes, which forwarding never reads:
+                # a smaller MTU would keep the UDP reply in Linux.
                 await console_command(con, "ip", "route", "replace", f"{r.lan_ip}/32", "dev", TARGET_LAN_IF,
-                                      "mtu", "1200", "advmss", "1100")
+                                      "advmss", "1100")
                 routed = await snat_warm(r, p, external, port, "snat-route-readmission")
                 assert routed["route_invalidations"] > initial["route_invalidations"]
                 assert routed["deletes"] >= initial["deletes"] + 2

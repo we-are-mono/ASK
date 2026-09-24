@@ -310,10 +310,13 @@ async def test_flowtable_capacity_overflow_and_reuse(rig):
             record_delivery(r, p, "capacity-transfers", reports)
             # A committed route replacement affects every generation. This
             # exercises the full atomic dependency walk and worker retirement,
-            # then repopulates the entire cap using the same live sockets.
+            # then repopulates the entire cap using the same live sockets. The
+            # replacement changes only the advertised MSS, which forwarding
+            # never reads: a smaller MTU would keep every UDP upload in Linux,
+            # and the cap could not be filled again.
             started = time.monotonic()
             await command(r.target, r.session, "ip", "route", "replace", f"{WAN_IP}/32",
-                          "dev", TARGET_WAN_IF, "mtu", "1300")
+                          "dev", TARGET_WAN_IF, "advmss", "1300")
             route_seconds = time.monotonic() - started
             drained = await wait_entries(r, 0, p)
             assert drained["route_invalidations"] - after["route_invalidations"] == CONNECTIONS
@@ -333,8 +336,7 @@ async def test_flowtable_capacity_overflow_and_reuse(rig):
             await wait_entries(r, CAPACITY, p)
             regenerated = await r.state()
             healthy(regenerated)
-            assert all(int(f["mtu"]) == (1300 if f["out"] == TARGET_WAN_IF else 1200)
-                       for f in regenerated["flows"])
+            assert all(int(f["mtu"]) == r.port_mtu for f in regenerated["flows"])
             assert regenerated["installs"] - regenerated["deletes"] == CAPACITY
             r.record("capacity-regenerated", regenerated)
             await hardware_window(r, regenerated, "capacity-regenerated-steady")
