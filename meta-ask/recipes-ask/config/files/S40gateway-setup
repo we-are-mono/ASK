@@ -122,8 +122,8 @@ start_filter6() {
 }
 
 start_dnsmasq() {
-    # dnsmasq's bind-interfaces requires the LAN address to exist, which
-    # start_lan above guarantees. Exit early if a dnsmasq is already running.
+    # dnsmasq binds the LAN address, which start_lan above guarantees exists.
+    # Exit early if a dnsmasq is already running.
     if pidof dnsmasq >/dev/null 2>&1; then
         return 0
     fi

@@ -6,10 +6,9 @@
 # Short-Description: Bring up the `ask-test` access point on uap0
 ### END INIT INFO
 
-# Runs before gateway-setup, not after, and that ordering is load-bearing:
-# dnsmasq is started at the end of S40 with bind-interfaces, so uap0 has to
-# exist and carry its address by then or dnsmasq refuses to bind it and Wi-Fi
-# clients get no lease.
+# Runs before gateway-setup, not after: dnsmasq is started at the end of S40,
+# and while bind-dynamic would pick uap0 up later, having it addressed first
+# means Wi-Fi clients get a lease from the start.
 #
 # The AP gets its own subnet rather than joining eth3 in a bridge. Bridging
 # would put Wi-Fi clients on the LAN, which is how a product would ship it,

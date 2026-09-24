@@ -124,6 +124,13 @@ ROOTFS_POSTPROCESS_COMMAND += "disable_dnsmasq_default_init;"
 # arriving with a version bump.
 ROOTFS_POSTPROCESS_COMMAND += "disable_smcroute_init;"
 
+# S35wifi-ap starts hostapd itself, on uap0 with /etc/hostapd-ask.conf, and
+# only when the board has a radio. The package's own init script starts it
+# on wlan0 from the stock /etc/hostapd.conf -- a device no board here has --
+# so it fails on every boot, with or without a radio. Strip its rc links; the
+# init script stays for anyone starting it by hand.
+ROOTFS_POSTPROCESS_COMMAND += "disable_hostapd_default_init;"
+
 disable_conntrackd_init() {
     rm -f ${IMAGE_ROOTFS}/etc/init.d/conntrackd
     rm -f ${IMAGE_ROOTFS}/etc/rcS.d/*conntrackd*
@@ -138,6 +145,11 @@ disable_dnsmasq_default_init() {
 disable_smcroute_init() {
     rm -f ${IMAGE_ROOTFS}/etc/init.d/smcroute
     rm -f ${IMAGE_ROOTFS}/etc/rc*.d/*smcroute*
+}
+
+disable_hostapd_default_init() {
+    rm -f ${IMAGE_ROOTFS}/etc/rcS.d/*hostapd*
+    rm -f ${IMAGE_ROOTFS}/etc/rc*.d/*hostapd*
 }
 
 inherit image
