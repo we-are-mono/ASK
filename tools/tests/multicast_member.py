@@ -46,6 +46,16 @@ def request(config: dict, with_source: bool) -> bytes:
     return raw
 
 
+def igmp_querier(iface: str) -> str:
+    """The IGMP version `iface` answers queries in: /proc/net/igmp's Querier
+    column, V1 or V2 while an older query was heard recently, else V3."""
+    for line in Path("/proc/net/igmp").read_text().splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 5 and fields[1] == iface and fields[2] == ":":
+            return fields[4]
+    raise AssertionError(f"{iface} is not in /proc/net/igmp")
+
+
 def publish(path: Path, state: dict) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(state))
@@ -73,6 +83,12 @@ def run(config: dict) -> None:
         # Before the join, so the very first report is already the version
         # under test rather than whatever the querier last negotiated.
         version.write_text(str(config["version"]))
+        if family == 4 and config["version"] == 3:
+            # force_igmp_version=3 does not override an IGMPv2 query heard
+            # in the last few minutes: the interface would report no sources
+            # and send no BLOCK, and a source filter would test nothing.
+            answering = igmp_querier(config["iface"])
+            assert answering == "V3", f"{config['iface']} answers IGMP as {answering} after a v2 query"
         sock.setsockopt(level, MCAST_JOIN_SOURCE_GROUP if ssm else MCAST_JOIN_GROUP,
                         request(config, ssm))
         state = {"pid": os.getpid(), "done": [], "member": True}

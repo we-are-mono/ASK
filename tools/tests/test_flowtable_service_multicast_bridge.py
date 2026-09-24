@@ -70,9 +70,13 @@ async def multicast_bridge_service(rig, request):
         # UART carries the address move so management is never needed midway.
         with Console.target(log_path=str(ARTIFACTS / 'multicast-bridge-setup-uart.log')) as con:
             await asyncio.to_thread(con.login, 'root', None)
+            # IGMPv3/MLDv2 queries, though this case's listener reports v2:
+            # the LAN VM's other interfaces hear them too, and one v2 query
+            # keeps an interface in v2 mode for minutes, past this file.
             await console_command(con, 'ip', 'link', 'add', 'name', BRIDGE, 'type', 'bridge',
                                   'vlan_filtering', '1', 'vlan_default_pvid', '0',
-                                  'mcast_snooping', '1', 'mcast_querier', '1')
+                                  'mcast_snooping', '1', 'mcast_querier', '1',
+                                  'mcast_igmp_version', '3', 'mcast_mld_version', '2')
             bridge_created = True
             await console_command(con, 'ip', 'link', 'set', BRIDGE, 'address', r.dut_wan_mac, 'up')
             for dev, logical, vid, mac in [(TARGET_LAN_IF, LAN_L3, LAN_VID, r.dut_lan_mac),

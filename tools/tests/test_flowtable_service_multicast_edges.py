@@ -257,7 +257,8 @@ async def dissolve(r, console, bridge, address, gateway):
 
 async def rebuild(r, console, bridge, address, gateway, mac):
     """Put the bridge back as its fixture built it, address and all."""
-    steps = [["ip", "link", "add", "name", bridge, "type", "bridge", "mcast_snooping", "1", "mcast_querier", "1"],
+    steps = [["ip", "link", "add", "name", bridge, "type", "bridge", "mcast_snooping", "1", "mcast_querier", "1",
+              "mcast_igmp_version", "3", "mcast_mld_version", "2"],
              ["ip", "link", "set", bridge, "address", mac], ["ip", "link", "set", bridge, "up"],
              ["ip", "addr", "del", address, "dev", TARGET_WAN_IF],
              ["ip", "link", "set", TARGET_WAN_IF, "master", bridge],
@@ -632,6 +633,14 @@ async def test_flowtable_service_multicast_reload_bridged_blocked_source(multica
             version=3 if family == 4 else 2, source=blocked))
         await member.do("block")
         await asyncio.sleep(3.5)   # the unanswered group-and-source queries
+        # The bridge itself has to hold the source blocked on the port, or
+        # the host never sent the BLOCK and there is nothing to carry across.
+        listed = json.loads((await command(r.target, r.session, "bridge", "-j", "-d", "mdb", "show",
+                                           "dev", bridge))["stdout"] or "[]")
+        entries = [e for block in listed for e in block.get("mdb", [])]
+        assert any(e.get("port") == TARGET_LAN_IF and same(e["grp"], group) and e.get("src")
+                   and same(e["src"], blocked) and "blocked" in e.get("flags", [])
+                   for e in entries), ("the bridge holds no blocked source", entries)
         await learn(r, streams, settled, "the allowed source carried, the blocked one not")
         before = await window("before")
         assert moved(before, lambda s: row(s, allowed)) == COUNT, summary(before["after"])

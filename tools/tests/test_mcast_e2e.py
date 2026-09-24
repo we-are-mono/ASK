@@ -204,8 +204,12 @@ async def mcast_bridge(aiohttp_session, target_agent):
             pytest.fail(f"the agent did not answer after {management} was put "
                         f"back on {TARGET_WAN_IF}")
 
+        # IGMPv3 and MLDv2 from the first query: a host hears it on the LAN
+        # port, and one IGMPv2 query keeps that host's interface in v2 mode
+        # for minutes, where it neither reports sources nor sends a BLOCK.
         r = await _exec("ip", "link", "add", "name", BRIDGE, "type", "bridge",
-                        "mcast_snooping", "1", "mcast_querier", "1")
+                        "mcast_snooping", "1", "mcast_querier", "1",
+                        "mcast_igmp_version", "3", "mcast_mld_version", "2")
         assert r["rc"] == 0, f"bridge add {BRIDGE}: {r}"
         r = await _exec("ip", "link", "set", BRIDGE, "address", mac)
         assert r["rc"] == 0, f"bridge mac {mac}: {r}"

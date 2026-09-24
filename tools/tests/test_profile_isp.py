@@ -850,8 +850,11 @@ async def _bridge_lan(ctx, stack):
     original = next(f"{a['local']}/{a['prefixlen']}" for a in addresses["addr_info"]
                     if a["family"] == "inet")
     await dut("ip", "link", "del", BRIDGE, check=False)
+    # IGMPv3/MLDv2 queries: a v2 query heard on the LAN keeps a host's
+    # interface in v2 mode for minutes, and later cases need v3 hosts.
     await dut("ip", "link", "add", "name", BRIDGE, "type", "bridge",
-              "mcast_snooping", "1", "mcast_querier", "1")
+              "mcast_snooping", "1", "mcast_querier", "1",
+              "mcast_igmp_version", "3", "mcast_mld_version", "2")
 
     async def _drop_bridge():
         await dut("ip", "link", "del", BRIDGE, check=False)

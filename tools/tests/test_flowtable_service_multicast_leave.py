@@ -134,8 +134,10 @@ async def listener_bridge(multicast_rig):
         return await command(r.target, r.session, *argv, check=check)
 
     try:
+        # IGMPv3 and MLDv2 from the first query, as mcast_bridge does.
         await run("ip", "link", "add", "name", LISTENER_BRIDGE, "type", "bridge", "vlan_filtering", "1",
-                  "mcast_snooping", "1", "mcast_querier", "1")
+                  "mcast_snooping", "1", "mcast_querier", "1",
+                  "mcast_igmp_version", "3", "mcast_mld_version", "2")
 
         async def restore():
             await run("ip", "link", "set", TARGET_LAN_IF, "nomaster", check=False)
