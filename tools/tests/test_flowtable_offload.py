@@ -1144,6 +1144,72 @@ async def test_flowtable_offload_counter_enabled_live(rig):
     assert accounted == expected, (counted, accounted, expected)
 
 
+async def test_flowtable_offload_partial_accounting(rig):
+    """The hardware half of a partially offloaded flow reaches conntrack while
+    its software half is still forwarding.
+
+    A host route smaller than a full frame keeps the UDP upload in Linux, and
+    the download goes to hardware. Linux refreshes the flow's timeout on every
+    upload packet, and the flowtable collector used to ask the hardware only
+    once a tenth of that timeout had run down -- which it never does while the
+    upload flows -- so the download's bytes reached conntrack only after the
+    upload stopped, and the adapter's statistics pass, with the neighbour
+    keepalive it carries, never ran for it. The collector now also asks a flow
+    with a direction in hardware once that period has passed since it last
+    asked. So conntrack's reply direction has to grow mid-exchange, in
+    Netfilter's units: 284 bytes per 256-byte datagram."""
+    r = rig
+    if r.proto != "udp":
+        pytest.skip("a TCP direction is carried into the smaller path")
+    if (await r.state())["observe"]:
+        pytest.skip("requires installed hardware")
+    timeout = int((await read(r.target, r.session,
+                              "/proc/sys/net/netfilter/nf_flowtable_udp_timeout")).strip())
+    await command(r.target, r.session, "ip", "route", "replace", f"{WAN_IP}/32",
+                  "dev", TARGET_WAN_IF, "mtu", "1400")
+    try:
+        await r.table(counter=True)
+        await r.clear_ct()
+        payload, datagram = 256, 256 + 8 + 20
+        initial = await r.state()
+        await r.exchange(16, payload_size=payload)
+        admitted = await r.wait(lambda s: s["entries"] == 1 and s["rejects"] > initial["rejects"])
+        assert [f["in"] for f in admitted["flows"]] == [TARGET_WAN_IF], admitted
+        before = await ct_counts(r)
+        # Two statistics periods and some, with an upload packet every 50 ms
+        # refreshing the timeout throughout.
+        period = max(1, timeout // 10)
+        window = 2 * period + 6
+        exchange = asyncio.create_task(r.exchange(int((window + 4) / 0.05), interval=0.05,
+                                                  payload_size=payload))
+        grown, samples = None, []
+        try:
+            deadline = time.monotonic() + window
+            while time.monotonic() < deadline and not exchange.done():
+                now = await ct_counts(r)
+                samples.append(now)
+                if now[1][1] - before[1][1] >= 20 * datagram and not exchange.done():
+                    grown = now
+                    break
+                await asyncio.sleep(1)
+        finally:
+            report = await exchange
+        after = await r.state()
+        r.record("partial-accounting", {"timeout": timeout, "admitted": admitted,
+                                        "before": before, "samples": samples,
+                                        "after": after, "exchange": report})
+        assert grown, ("the download's hardware bytes did not reach conntrack while the "
+                       "upload forwarded in software", before, samples, after)
+        # Whole datagrams, in Netfilter's units.
+        packets, octets = grown[1][0] - before[1][0], grown[1][1] - before[1][1]
+        assert octets == packets * datagram, (before, grown)
+        assert after["busy"] == admitted["busy"] and after["entries"] == 1, (admitted, after)
+        assert after["installs"] == admitted["installs"], (admitted, after)
+    finally:
+        await command(r.target, r.session, "ip", "route", "replace", f"{WAN_IP}/32",
+                      "dev", TARGET_WAN_IF)
+
+
 async def terminal_stream(r, duration=12):
     """Keep sending across an intentional datapath stop; validate every echo.
 

@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A218.** Linux never asked for a partially offloaded flow's hardware counters while software kept refreshing it —
+  fixed (_:/^netfilter: poll a partially offloaded flow's hardware counters_).
+
 - [x] **A217.** A partially offloaded flow's periodic re-offer took RTNL for its installed half, and a lost trylock retired the whole generation —
   fixed (_:/^flowtable: answer a re-offered installed direction without RTNL_).
 

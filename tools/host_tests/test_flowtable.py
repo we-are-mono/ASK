@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -144,6 +146,33 @@ def test_flowtable_neighbour_fallback(tmp_path):
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
         "-Werror", "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable_neigh.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+
+
+def test_flowtable_stats_poll(tmp_path):
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
+    header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
+    stats = function(offload, "nf_flow_offload_stats")
+    # The tree the image build unpacked; it follows patches/kernel/ only once a
+    # build has run since the patch changed.
+    if "stats_time" not in stats:
+        pytest.skip(f"{kernel} predates patch 140's partial-flow statistics poll")
+    (tmp_path / "stats_poll_production.inc").write_text(
+        function(header, "nf_flow_timeout_delta") + stats)
+    binary = tmp_path / "flowtable_stats_poll"
+    subprocess.run([
+        # Upstream compares the signed timeout delta with the unsigned
+        # timeout, which the kernel's flags never warn about and -Wextra does.
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
+        "-Wno-sign-compare",
+        "-Werror", "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("flowtable_stats_poll.c")), "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",

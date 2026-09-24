@@ -49,7 +49,9 @@ struct flow_offload {
     struct nf_conn *ct;
     struct nf_flow_offload_handle *hw_handle;
     unsigned long flags;
-    unsigned type, timeout;
+    /* stats_time is the statistics clock patch 140 starts in
+     * flow_offload_add(); a tree that predates it never names it. */
+    unsigned type, timeout, stats_time;
     uint64_t xfrm_genid;
     struct rcu_head rcu_head;
 };

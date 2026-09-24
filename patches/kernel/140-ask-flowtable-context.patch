@@ -1,30 +1,30 @@
-From 46164972fc10c50b3512289b148bacbb05a713d1 Mon Sep 17 00:00:00 2001
+From 679de5b1f43a2e7acb14b8a63fa586abb4b7bf68 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
  context
 
 ---
- drivers/net/bonding/bond_main.c       |  80 +++++++++++++-------
+ drivers/net/bonding/bond_main.c       |  80 ++++++++++++------
  include/linux/netdevice.h             |   2 +
  include/net/flow.h                    |   2 +
- include/net/flow_offload.h            |  34 +++++++++
- include/net/netevent.h                |  31 ++++++++
- include/net/netfilter/nf_flow_table.h |  45 ++++++++++++
+ include/net/flow_offload.h            |  34 ++++++++
+ include/net/netevent.h                |  31 +++++++
+ include/net/netfilter/nf_flow_table.h |  49 +++++++++++
  include/net/netns/xfrm.h              |   2 +
- include/net/xfrm.h                    |  83 ++++++++++++++++++---
+ include/net/xfrm.h                    |  83 ++++++++++++++++---
  net/ipv4/fib_trie.c                   |  20 +++++
  net/ipv4/route.c                      |   3 +-
  net/ipv6/ip6_fib.c                    |  23 ++++++
- net/netfilter/nf_flow_table_core.c    |  71 +++++++++++++++++-
- net/netfilter/nf_flow_table_ip.c      |  25 ++++++-
- net/netfilter/nf_flow_table_offload.c |  95 +++++++++++++++++++++++-
- net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++++++++-----
- net/xfrm/xfrm_device.c                |  29 ++++++--
- net/xfrm/xfrm_policy.c                |  77 ++++++++++++++++++-
- net/xfrm/xfrm_state.c                 |  25 +++++--
+ net/netfilter/nf_flow_table_core.c    |  75 ++++++++++++++++-
+ net/netfilter/nf_flow_table_ip.c      |  25 +++++-
+ net/netfilter/nf_flow_table_offload.c | 113 +++++++++++++++++++++++++-
+ net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++++++----
+ net/xfrm/xfrm_device.c                |  29 +++++--
+ net/xfrm/xfrm_policy.c                |  77 +++++++++++++++++-
+ net/xfrm/xfrm_state.c                 |  25 ++++--
  net/xfrm/xfrm_user.c                  |   6 ++
- 19 files changed, 679 insertions(+), 76 deletions(-)
+ 19 files changed, 704 insertions(+), 77 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index 2919329..a6780e8 100644
@@ -401,7 +401,7 @@ index 1be3757..11b7d12 100644
  
  int register_netevent_notifier(struct notifier_block *nb);
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 1a6fca0..3794672 100644
+index 1a6fca0..7888c0b 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -84,6 +84,12 @@ struct nf_flowtable {
@@ -451,7 +451,7 @@ index 1a6fca0..3794672 100644
  	union {
  		struct {
  			struct dst_entry *dst_cache;
-@@ -180,6 +206,8 @@ enum flow_offload_type {
+@@ -180,9 +206,15 @@ enum flow_offload_type {
  struct flow_offload {
  	struct flow_offload_tuple_rhash		tuplehash[FLOW_OFFLOAD_DIR_MAX];
  	struct nf_conn				*ct;
@@ -460,7 +460,14 @@ index 1a6fca0..3794672 100644
  	unsigned long				flags;
  	u16					type;
  	u32					timeout;
-@@ -214,6 +242,10 @@ struct nf_flow_route {
++	/* When hardware counters were last asked for, in the timeout's clock.
++	 * Software refresh keeps a partially offloaded flow's timeout fresh,
++	 * so the timeout alone never says when they are due. */
++	u32					stats_time;
+ 	struct rcu_head				rcu_head;
+ };
+ 
+@@ -214,6 +246,10 @@ struct nf_flow_route {
  			u8			h_source[ETH_ALEN];
  			u8			h_dest[ETH_ALEN];
  		} out;
@@ -471,7 +478,7 @@ index 1a6fca0..3794672 100644
  		enum flow_offload_xmit_type	xmit_type;
  	} tuple[FLOW_OFFLOAD_DIR_MAX];
  };
-@@ -221,6 +253,19 @@ struct nf_flow_route {
+@@ -221,6 +257,19 @@ struct nf_flow_route {
  struct flow_offload *flow_offload_alloc(struct nf_conn *ct);
  void flow_offload_free(struct flow_offload *flow);
  
@@ -793,7 +800,7 @@ index 5b94cb8..2c1b9df 100644
  }
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index df72b03..b27c2bc 100644
+index df72b03..19dcf5a 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
 @@ -9,6 +9,7 @@
@@ -884,7 +891,7 @@ index df72b03..b27c2bc 100644
  	switch (flow->type) {
  	case NF_FLOW_OFFLOAD_ROUTE:
  		flow_offload_route_release(flow);
-@@ -276,6 +336,11 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+@@ -276,6 +336,15 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
  {
  	int err;
  
@@ -893,10 +900,14 @@ index df72b03..b27c2bc 100644
 +		if (!flow->hw_handle)
 +			return -ENOMEM;
 +	}
++	/* The statistics clock starts with the flow's own: a zero would read
++	 * as long past for half of every wrap of jiffies and as the future
++	 * for the other half. */
++	flow->stats_time = nf_flowtable_time_stamp;
  	flow->timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
  
  	err = rhashtable_insert_fast(&flow_table->rhashtable,
-@@ -363,7 +428,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
+@@ -363,7 +432,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
  
  	dir = tuplehash->tuple.dir;
  	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
@@ -905,7 +916,7 @@ index df72b03..b27c2bc 100644
  		return NULL;
  
  	if (unlikely(nf_ct_is_dying(flow->ct)))
-@@ -417,7 +482,7 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+@@ -417,7 +486,7 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
@@ -914,7 +925,7 @@ index df72b03..b27c2bc 100644
  	    nf_ct_is_dying(flow->ct) ||
  	    nf_flow_custom_gc(flow_table, flow))
  		flow_offload_teardown(flow);
-@@ -542,6 +607,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
+@@ -542,6 +611,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
  {
  	int err;
  
@@ -1003,7 +1014,7 @@ index 98edcaa..ff35d60 100644
  	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
  	if (ret < 0)
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f5..3ffc10a 100644
+index 4f346f5..7ffa064 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -12,6 +12,7 @@
@@ -1164,6 +1175,44 @@ index 4f346f5..3ffc10a 100644
  		clear_bit(NF_FLOW_HW_PENDING, &flow->flags);
  		return NULL;
  	}
+@@ -1125,20 +1214,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
+ 	flow_offload_queue_work(offload);
+ }
+ 
++/* Hardware counters are asked for once a tenth of the offload timeout has
++ * passed since the flow was last known to be alive. For a fully offloaded flow
++ * that is its timeout running down. For one with a direction in hardware and
++ * the other in software it never is: software refreshes the timeout on its own
++ * packets every second, so the hardware direction's bytes would reach
++ * conntrack, and its activity the driver, only once software fell silent. A
++ * flow with any direction in hardware is therefore also asked once more than
++ * that period has passed since it was last asked -- the pace a fully offloaded
++ * flow is asked at, which that clause leaves unchanged. Drivers report the
++ * counters as deltas since their last report, so no count is taken twice.
++ */
+ void nf_flow_offload_stats(struct nf_flowtable *flowtable,
+ 			   struct flow_offload *flow)
+ {
+ 	struct flow_offload_work *offload;
++	u32 period = flow_offload_get_timeout(flow) / 10;
+ 	__s32 delta;
+ 
+ 	delta = nf_flow_timeout_delta(flow->timeout);
+-	if ((delta >= (9 * flow_offload_get_timeout(flow)) / 10))
++	if ((delta >= (9 * flow_offload_get_timeout(flow)) / 10) &&
++	    (!test_bit(IPS_HW_OFFLOAD_BIT, &flow->ct->status) ||
++	     (__s32)(nf_flowtable_time_stamp - READ_ONCE(flow->stats_time)) <=
++	     (__s32)period))
+ 		return;
+ 
+ 	offload = nf_flow_offload_work_alloc(flowtable, flow, FLOW_CLS_STATS);
+ 	if (!offload)
+ 		return;
+ 
++	WRITE_ONCE(flow->stats_time, nf_flowtable_time_stamp);
+ 	flow_offload_queue_work(offload);
+ }
+ 
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
 index 7dbbd89..d7e5ddf 100644
 --- a/net/netfilter/nft_flow_offload.c

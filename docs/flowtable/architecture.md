@@ -394,6 +394,16 @@ unsigned underflow. Firmware timestamps use 32-bit CDX jiffies, expanded relativ
 to current kernel time; supported idle intervals must stay below half that
 clock's range. Linux owns activity refresh and expiry.
 
+Linux asks for the counters once a tenth of the offload timeout has passed
+without the flow being refreshed, and (patch 140) once that long has passed
+since it last asked for a flow with any direction in hardware. The second
+clause is what reaches a partially offloaded flow: software refreshes its
+timeout on every packet of the software half, so the first alone never came
+due, and the installed half's bytes reached conntrack -- and the statistics
+pass's neighbour keepalive its neighbour -- only once software fell silent.
+A fully offloaded flow is asked at the same pace as before, and since the
+callback reports deltas, nothing is counted twice.
+
 Counter-enabled hardware tables are admitted, and a reported delta is restated
 in the units Netfilter counts in. The two counters disagree about framing, not
 about packets: a classifier hit counts the frame as it arrived, while
