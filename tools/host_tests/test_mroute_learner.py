@@ -519,7 +519,11 @@ def test_the_counter_fold_restates_the_units():
     # ageing its routes by SIOCGETSGCNT must see a merged stream flow.
     counters = function(source, "ft_mr_counters")
     assert "*tags = g->in_tags;" in counters
-    assert "ft_mc_route_state(g->route, c, tags)" in counters
+    assert "ft_mc_route_state(g->route, c, tags, &series)" in counters
+    # A route's count is taken from zero again only when its series says it
+    # started again, never because the group derived its bridge anew.
+    assert "if (series != g->folded_series) {" in counters
+    assert "plan->via && !g->via" not in function(source, "ft_mr_record")
     for caller in ("ft_mr_stats_fn", "ft_mr_rows"):
         assert "if (ft_mr_counters(g, &stats, &tags))" in function(source, caller)
 

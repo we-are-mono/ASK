@@ -1635,9 +1635,12 @@ static void one_stream_both_learners(void)
     assert(!strcmp(ft_mc_state(f), "installed"));
     {
         struct cdx_ft_counters c;
+        u32 series = 0;
         u8 tags = 9;
 
-        assert(ft_mc_route_state(&r1, &c, &tags) && tags == 1);
+        assert(ft_mc_route_state(&r1, &c, &tags, &series) && tags == 1);
+        /* Linked once: the count's first run. */
+        assert(series == 1);
         assert(!ft_mc_route_feedback());   /* said already */
     }
     /* Publishing the same copies again is not news; a changed copy set is,
@@ -1691,7 +1694,16 @@ static void one_stream_both_learners(void)
     assert(spec.listeners == 1 && spec.listener[0].routed);
     /* The route goes too. Every pointer to it is cleared before its owner
      * frees it, and with neither learner naming the flow, it retires. */
-    ft_mc_route_withdraw(&r1);
+    {
+        u32 run = r1.series;
+
+        r1.stats.packets = 5;
+        r1.stats.bytes = 5 * 578;
+        ft_mc_route_withdraw(&r1);
+        /* The count starts from zero again, and a new series says so,
+         * whoever reads it next. */
+        assert(r1.series == run + 1 && !r1.stats.packets && !r1.stats.bytes);
+    }
     assert(!r1.linked && !f->route && !f->carried_route && f->stale);
     assert(!r1.carried && !r1.listeners && !r1.bridge);
     pass();

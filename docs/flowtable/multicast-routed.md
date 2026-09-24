@@ -681,6 +681,16 @@ still until the true count passed the bad baseline -- 4 GiB of an IPTV stream,
 about an hour -- which a daemon ageing routes by either reads as a stream that
 stopped. The bridged learner feeds a route's count by the same rule.
 
+A group routed through a bridge folds its route's count, which starts from
+zero only when the route is linked or withdrawn; each of those moves the
+route's series, and the group takes its baseline from zero again when the
+series it reads is not the one the baseline came from, and at no other time.
+The bridge going down and coming back does neither: the group lets go of the
+bridge and derives it again, the route stays published and its count goes on,
+and so does the baseline. Taking it from zero on the group's re-derivation, as
+the learner did until A225, added everything the route had already carried to
+`ip -s mroute` a second time.
+
 The effect is that `ip mroute show` prints `offload`, `ip -s mroute` shows
 traffic the CPU never handled, and `igmpproxy` or `pimd` see their entries
 staying alive through the ioctl they already use — which matters, because a

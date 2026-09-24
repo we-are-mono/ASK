@@ -270,6 +270,9 @@ file's git history.
 - [x] **A226.** A failed split-key job (full ring, unmappable job, SEC error) still installed the HMAC SA with a key SEC never wrote, and its ~1 s timeout freed a descriptor the ring still owned —
   fixed (_:/^cdx: refuse an SA whose HMAC split key SEC failed to derive_).
 
+- [x] **A225.** A group routed through a bridge took its fold baseline from zero when it derived the bridge again, so a bridge going down and back added the still-published route's whole count to `ip -s mroute` a second time —
+  fixed (_:/^flowtable: fold a routed group's bridge count from where it stood_).
+
 - [x] **A224.** Inbound IPsec read another driver's netdev private area as a DPAA port's: the driver's submit for ESP arriving on a bridge, VLAN-over-bridge or veth, and the exception queue for an SA whose local endpoint was on a Wi-Fi VAP —
   fixed (_:/^sdk_dpaa, cdx: take a DPAA port's private area only from a DPAA port_).
 

@@ -403,6 +403,10 @@ static bool ft_mc_route_publish(struct ft_mc_route *r, const struct ft_mc_route 
     assert(want->bridge == &bridge && want->listeners == wanted);
     for (unsigned i = 0; i < want->listeners; i++)
         assert(want->listener[i].dev == &output[i]);
+    /* Linking starts the count again, and a new series says so; restating
+     * a linked route does neither. */
+    if (!r->linked)
+        r->series++;
     r->linked = true;
     r->carried = carried;
     return carried;
@@ -413,13 +417,15 @@ static void ft_mc_route_withdraw(struct ft_mc_route *r)
     withdrawals++;
     r->linked = false;
     r->carried = false;
+    r->series++;
 }
 static bool ft_mc_route_state(struct ft_mc_route *r, struct cdx_ft_counters *stats,
-                              u8 *in_tags)
+                              u8 *in_tags, u32 *series)
 {
     assert(ft_mr_lock);   /* a leaf lock, readable under this learner's */
     *stats = bridged_count;
     *in_tags = 1;
+    *series = r->series;
     return r->carried;
 }
 static void ft_mr_publish_taps(void) { bridged_side(); taps_published++; }
@@ -1098,6 +1104,40 @@ int main(void)
         unsigned folding = folds;
         refresh();
         assert(folds == folding + 1 && folded.packets == 7 && folded_tags == 1);
+        /* The bridge goes down while the route stays published: the group
+         * lets go of it and derives it again, and the route's count goes on
+         * from where it was. So does the baseline the MFC's count was folded
+         * to -- here the route's 7, as a real fold would have left it. Taken
+         * from zero instead, the next fold would add all 7 a second time. */
+        {
+            unsigned published = publishes;
+
+            g->folded_packets = bridged_count.packets;
+            g->folded_bytes = bridged_count.bytes;
+            rtnl_lock();
+            ft_mr_device_gone(&bridge);
+            rtnl_unlock();
+            assert(!g->via && !bridge.refs && g->route->linked);
+            run();
+            assert(g->via == &bridge && g->state == FT_MR_INSTALLED);
+            assert(publishes == published + 1 && withdrawals == withdrawn);
+            refresh();
+            assert(g->folded_packets == bridged_count.packets);
+            assert(g->folded_bytes == bridged_count.bytes);
+            /* A route taken back and published again does start from
+             * zero, and the baseline with it. */
+            refuse = true;
+            ft_mr_recheck = true;
+            run();
+            assert(withdrawals == withdrawn + 1 && !g->route->linked);
+            refuse = false;
+            ft_mr_recheck = true;
+            run();
+            assert(g->route->linked && g->state == FT_MR_INSTALLED);
+            refresh();
+            assert(!g->folded_packets && !g->folded_bytes);
+            withdrawn = withdrawals;
+        }
         /* And stops carrying it. */
         carried = false;
         ft_mr_recheck = true;

@@ -4832,6 +4832,11 @@ struct ft_mc_route {
 	bool carried;
 	u8 in_tags;
 	struct cdx_ft_counters stats;
+	/* Which run of `stats` this is: moved each time the count starts from
+	 * zero again -- the route linked, or withdrawn -- and at no other time,
+	 * so the owner folding it can tell a count that went back to zero from
+	 * one it has already taken part of. */
+	u32 series;
 };
 
 /* A VIF on a bridge, in an ft_mc_route's terms: the host receives that bridge
@@ -5527,9 +5532,11 @@ static bool ft_mc_route_publish(struct ft_mc_route *r,
 			list_add_tail(&r->list, &ft_mc_routes);
 			r->linked = true;
 			/* The count only grows while the route is published; its
-			 * owner folds it from zero again from here. */
+			 * owner folds it from zero again from here, which the
+			 * new series tells it. */
 			spin_lock_bh(&ft_mc_route_lock);
 			memset(&r->stats, 0, sizeof(r->stats));
+			r->series++;
 			spin_unlock_bh(&ft_mc_route_lock);
 		}
 		/* The worker re-matches every flow each pass, but a flow
@@ -5580,15 +5587,22 @@ static void ft_mc_route_withdraw(struct ft_mc_route *r)
 	spin_lock_bh(&ft_mc_route_lock);
 	r->carried = false;
 	memset(&r->stats, 0, sizeof(r->stats));
+	/* The routed learner would not miss this one: a withdrawn route
+	 * reports nothing carried until it is linked again, which moves the
+	 * series itself. It moves here too so that the series means what it
+	 * says -- a new one for every run of the count from zero -- without
+	 * resting on when the count is read. */
+	r->series++;
 	spin_unlock_bh(&ft_mc_route_lock);
 }
 
 /* What the bridged learner last said about a route: whether its copies are in
- * hardware, and if so what the carrying group counted and the ingress framing
- * that count includes. Takes only the leaf lock, so it may be called holding
- * ft_mr_lock. */
+ * hardware, and if so what the carrying group counted, which run of that count
+ * it is, and the ingress framing it includes. Takes only the leaf lock, so it
+ * may be called holding ft_mr_lock. */
 static bool ft_mc_route_state(struct ft_mc_route *r,
-			      struct cdx_ft_counters *stats, u8 *in_tags)
+			      struct cdx_ft_counters *stats, u8 *in_tags,
+			      u32 *series)
 {
 	bool carried;
 
@@ -5596,6 +5610,7 @@ static bool ft_mc_route_state(struct ft_mc_route *r,
 	carried = r->carried;
 	*stats = r->stats;
 	*in_tags = r->in_tags;
+	*series = r->series;
 	spin_unlock_bh(&ft_mc_route_lock);
 	return carried;
 }
@@ -8230,9 +8245,12 @@ struct ft_mr_group {
 	 * it is reported: `hw`'s own, which a group the worker has just added
 	 * counts from zero again, or for a group routed through a bridge the
 	 * route's, which only ever grows. `fold_suspect` is a sample below it
-	 * just seen; see ft_mc_count_delta(). */
+	 * just seen; see ft_mc_count_delta(). `folded_series` is the run of the
+	 * route's count the baseline was taken from, and 0 while it is `hw`'s.
+	 */
 	u64 folded_packets;
 	u64 folded_bytes;
+	u32 folded_series;
 	bool fold_suspect;
 	enum ft_mr_state state;
 	/* MFC_OFFLOAD is set on the kernel's entry. */
@@ -9892,15 +9910,30 @@ static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c,
  * bridged group carrying its copies counted -- every frame of which the bridge
  * would have handed to ipmr. False, with nothing counted, while nothing in
  * hardware carries it or its count could not be read; see
- * cdx_mc_group_stats(). Called with ft_mr_lock and the transaction held. */
+ * cdx_mc_group_stats(). Called with ft_mr_lock and the transaction held.
+ *
+ * A route's count starts from zero only when the route is linked or
+ * withdrawn, and says so with a new series; the baseline goes back to zero
+ * with it and at no other time. Not when the group lets go of its bridge and
+ * derives it again -- a bridge going down and coming back leaves the route
+ * published and its count going on, and a baseline taken from zero then would
+ * add everything the route had carried to the MFC's count a second time. */
 static bool ft_mr_counters(struct ft_mr_group *g, struct cdx_ft_counters *c,
 			   u8 *tags)
 {
+	u32 series;
+
 	*tags = g->in_tags;
 	if (g->hw)
 		return cdx_mc_group_stats(g->hw, c);
-	if (g->route && ft_mc_route_state(g->route, c, tags))
+	if (g->route && ft_mc_route_state(g->route, c, tags, &series)) {
+		if (series != g->folded_series) {
+			g->folded_series = series;
+			g->folded_packets = g->folded_bytes = 0;
+			g->fold_suspect = false;
+		}
 		return true;
+	}
 	memset(c, 0, sizeof(*c));
 	return false;
 }
@@ -10250,10 +10283,12 @@ static enum ft_mr_state ft_mr_record(struct ft_mr_group *g, struct cdx_mc_group 
 		ft_mr_fold(g, last, g->in_tags);
 	/* A group made in this pass counts from zero, whatever the last one
 	 * had reached. Here, not by comparing handles: the one a delete frees
-	 * is the next add's allocation often enough. So does a route this
-	 * group has just begun riding: it was zeroed when it was published. */
-	if (added || (plan->via && !g->via)) {
+	 * is the next add's allocation often enough. A route's count is told
+	 * apart by its series instead (ft_mr_counters()), which the baseline
+	 * no longer belongs to once it is the entry's. */
+	if (added) {
 		g->folded_packets = g->folded_bytes = 0;
+		g->folded_series = 0;
 		g->fold_suspect = false;
 	}
 	if (state == FT_MR_INSTALLED || state == FT_MR_BRIDGED) {
