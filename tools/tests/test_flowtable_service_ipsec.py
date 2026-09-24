@@ -212,7 +212,7 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
             states = [s for s in await xfrm(r, agent, "state") if owned_state(s)]
             policies = [p for p in await xfrm(r, agent, "policy") if INNER + "/32" in p.splitlines()[0]]
             if states or policies:
-                failures.append({"agent": str(agent), "states": len(states), "policies": policies})
+                failures.append({"agent": str(agent), "states": states, "policies": policies})
         if lan_created:
             result = await lan_run_python(r.lan,
                 f"import subprocess\nsubprocess.run(['ip','addr','del',{LAN_INNER + '/32'!r},'dev','lo'],check=True)\n",
