@@ -678,10 +678,14 @@ under the same key. The mark needs no RTNL and takes each learner's mutex in
 turn. What a flow's copies are is read from the chain its entry was built
 from, recorded whole beside the entry in the same transaction: the bridge's
 copies and the routed copies riding it, so a route's port changing its queues
-rebuilds the bridged flow that carries it. A flow whose chain was being built
-while the change landed was not yet there to mark; the worker compares the
-count of egress changes — the same count an SA install compares — across the
-build and marks the flow itself. `/proc` counts the marks as
+rebuilds the bridged flow that carries it. The record holds a reference on
+every device it names, because the drain below replays it: a port leaving —
+unregistered, or moved to another namespace, where it stays registered and
+nothing more about it arrives — waits for the worker's next pass, which
+records the chain without it, and is never replayed after it is freed. A flow
+whose chain was being built while the change landed was not yet there to mark;
+the worker compares the count of egress changes — the same count an SA install
+compares — across the build and marks the flow itself. `/proc` counts the marks as
 `mcast_egress_rebuilds`.
 
 A DSCP map leaving a port cannot wait for the workers: its `drain()` runs

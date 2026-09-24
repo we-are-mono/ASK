@@ -64,6 +64,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_drop_next",
             "ft_mc_group_free",
             "ft_mc_flow_release_ports",
+            "ft_mc_chain_forget",
             "ft_mc_flow_free",
             # The two learners' shared streams: what the routed learner
             # publishes, how a flow finds its route, what it is installed
@@ -84,7 +85,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_host_wants",
             "ft_mc_installable",
             "ft_mc_flow_spec",
-            "ft_mc_spec_registered",
+            "ft_mc_chain_record",
             "ft_mc_flow_named",
             "ft_mc_retire",
             "ft_mc_route_feedback",

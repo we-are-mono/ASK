@@ -152,10 +152,13 @@ bool cdx_mc_port_identity(struct net_device *dev);
  * receiving. The caller therefore gets an error and keeps the whole group in
  * software, where the bridge is still flooding it.
  *
- * Devices are borrowed. The caller pins every one of them, the ingress and each
- * listener, for as long as the group lives -- which is the same discipline a
- * flow's rule keeps, and for the same reason: the entry names ports that must
- * not be unregistered underneath it.
+ * Devices are borrowed. The ingress is kept: the group subscribes it to the
+ * frames' destination MAC and unsubscribes through it when it is deleted, so
+ * the caller pins it for as long as the group lives. A listener is read only
+ * during the call that names it -- its port, framing and MTU go into its
+ * entry, and its name into the query dump -- so the caller pins each for the
+ * call, and replace() is a call like this one. Nothing here reads a listener's
+ * device afterwards; the hardware names its port's queues, not the device.
  *
  * -EOPNOTSUPP: a device, address family or group address cannot be carried,
  *          or a bridged group names no Ethernet pair to key on.

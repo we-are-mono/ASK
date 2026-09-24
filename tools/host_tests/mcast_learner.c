@@ -92,12 +92,10 @@ struct net_device {
     bool mrouter;
     struct net_device *master;
     unsigned int flags;
-    /* Where unregistration has got to. Numbered so that a device no case
-     * touches reads as registered; the worker only compares. */
-    int reg_state;
+    /* References the learner holds on it: a device going away waits for
+     * these, and one nothing holds may be freed. */
+    unsigned refs;
 };
-#define NETREG_REGISTERED 0
-#define NETREG_UNREGISTERING 2
 
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
@@ -159,9 +157,9 @@ static bool ft_mc_filtered;
 __attribute__((unused)) static unsigned int ft_mc_installed;
 __attribute__((unused)) static unsigned long long ft_mc_install_errors;
 
-static unsigned holds;   /* net-device references outstanding */
-static void dev_hold(struct net_device *d) { (void)d; holds++; }
-static void dev_put(struct net_device *d) { (void)d; assert(holds); holds--; }
+static unsigned holds;   /* net-device references outstanding, all devices */
+static void dev_hold(struct net_device *d) { holds++; d->refs++; }
+static void dev_put(struct net_device *d) { assert(holds && d->refs); holds--; d->refs--; }
 
 /* The devices the traffic half can resolve an ingress index to. */
 static struct net_device *by_index[8];
@@ -412,7 +410,7 @@ static void rtnl_unlock(void) { assert(rtnl && !caller_rtnl); rtnl = 0; }
  * takes one to retire before any it builds in. */
 static void (*before_begin)(void);
 static unsigned before_begin_skip;
-static void recorded_chains_name_live_devices(void);
+static void recorded_chains_hold_their_devices(void);
 static void cdx_ft_begin(void)
 {
     assert(!in_transaction && !ft_mc_lock && (!rtnl || caller_rtnl));
@@ -424,7 +422,7 @@ static void cdx_ft_begin(void)
         before_begin = NULL;
         run();
     }
-    recorded_chains_name_live_devices();
+    recorded_chains_hold_their_devices();
     in_transaction = 1;
 }
 static void cdx_ft_end(void) { assert(in_transaction); in_transaction = 0; }
@@ -459,19 +457,37 @@ static void egress_changed(struct net_device *dev)
     ft_mc_egress_mark(dev);
 }
 
-/* No chain recorded for the drain names a device that has begun to go: the
- * drain replays it with nothing of its own holding those devices. Checked
- * whenever anything takes the transaction. */
-static void recorded_chains_name_live_devices(void)
+/* How many times the chains recorded for the drain name `d`. */
+static unsigned recorded_namings(const struct net_device *d)
+{
+    const struct ft_mc_flow *f;
+    unsigned n = 0;
+
+    list_for_each_entry(f, &ft_mc_flows, list) {
+        if (!f->hw_spec.listeners)
+            continue;
+        n += f->hw_spec.in == d;
+        for (u8 i = 0; i < f->hw_spec.listeners; i++)
+            n += f->hw_spec.listener[i].dev == d;
+    }
+    return n;
+}
+
+/* Every device a chain recorded for the drain names is held at least once
+ * for each time it is named: the drain replays the chain with nothing else
+ * of its own holding those devices, and a device nothing holds may be freed.
+ * Checked whenever anything takes the transaction. */
+static void recorded_chains_hold_their_devices(void)
 {
     struct ft_mc_flow *f;
 
     list_for_each_entry(f, &ft_mc_flows, list) {
         if (!f->hw_spec.listeners)
             continue;
-        assert(f->hw_spec.in->reg_state == NETREG_REGISTERED);
+        assert(f->hw_spec.in->refs >= recorded_namings(f->hw_spec.in));
         for (u8 i = 0; i < f->hw_spec.listeners; i++)
-            assert(f->hw_spec.listener[i].dev->reg_state == NETREG_REGISTERED);
+            assert(f->hw_spec.listener[i].dev->refs >=
+                   recorded_namings(f->hw_spec.listener[i].dev));
     }
 }
 
@@ -749,13 +765,16 @@ static void pass(void)
          * and a build is current against every egress change before it. */
         if (!f->contested && ft_mc_installable(f) &&
             f->retries < FT_MC_MAX_RETRIES) {
+            struct cdx_mc_group_spec spec;
+
             f->hw = FAKE_HW;
             f->carried_route = ft_mc_live_route(f) ? f->route : NULL;
-            ft_mc_flow_spec(f, &f->hw_spec);
+            ft_mc_flow_spec(f, &spec);
+            ft_mc_chain_record(f, &spec);
         } else {
             f->hw = NULL;
             f->carried_route = NULL;
-            memset(&f->hw_spec, 0, sizeof(f->hw_spec));
+            ft_mc_chain_forget(f);
         }
         f->egress_stale = false;
     }
@@ -1378,8 +1397,9 @@ static void the_bridge_decides(void)
     pass();
     assert(f->hw && f->ports == 2 && f->port[1].dev == &P3);
     /* Two memberships of a bridge and a port each; the flow's bridge and
-     * ingress; its two copies. */
-    assert(holds == 2 + 2 + 2 + 2);
+     * ingress; its two copies; and the chain recorded for its entry, which
+     * holds the ingress and both copies again. */
+    assert(holds == 2 + 2 + 2 + 2 + 3);
 
     /* Why the bridge also hands a frame up. The host joined, or nothing is
      * snooping and the frame floods: refused, since the entry would starve
@@ -1424,7 +1444,9 @@ static void the_bridge_decides(void)
     answer(&P1, S1, 0, 0, 1, &P2);
     f->dirty = true;
     pass();
-    assert(!f->error && f->hw && holds == 2 + 2 + 1);
+    /* The membership's bridge and port, the flow's bridge and ingress, its
+     * copy, and the recorded chain's ingress and copy. */
+    assert(!f->error && f->hw && holds == 2 + 2 + 1 + 2);
     /* The ingress is no longer a port of this bridge: the flow is over. */
     answer(&P1, S1, 0, 0, -EINVAL);
     f->dirty = true;
@@ -2012,7 +2034,7 @@ static void devices_and_bridges_change(void)
     assert(f->hw_spec.in_vlans == 1 && f->hw_spec.in_vlan[0].id == 289);
     assert(!memcmp(f->hw_spec.src_mac, SENDER, ETH_ALEN));
     h->hw = NULL;
-    memset(&h->hw_spec, 0, sizeof(h->hw_spec));
+    ft_mc_chain_forget(h);
     f->stale = h->stale = false;
     works = 0;
     assert(ft_mc_egress_mark(&P1) == 0 && !f->stale && !f->egress_stale && !works);
@@ -2085,12 +2107,15 @@ static void devices_and_bridges_change(void)
         works = 0;
         before = holds;
         ft_mc_device_gone(&P3, true);
-        assert(!r1.listeners && !r1.bridge && holds == before - 2);
+        assert(!r1.listeners && !r1.bridge);
         assert(works == 1);
         /* The chain recorded for f named it: nothing may replay that now,
          * and the flow is the worker's to rebuild. Until it has, any port
-         * may be in its entry, and a drain cannot vouch for it. */
+         * may be in its entry, and a drain cannot vouch for it. The record
+         * lets go of what it held -- the ingress and both copies -- as the
+         * route let go of the bridge and its copy. */
         assert(!f->hw_spec.listeners && f->stale);
+        assert(holds == before - 2 - 3 && !P3.refs);
         assert(ft_mc_egress_mark(&P1) == 1 && f->egress_stale);
         assert(tc_drain(&P1) == -EAGAIN && replaces == 3);
         f->egress_stale = false;
@@ -2177,11 +2202,12 @@ static void tc_drains_and_counts(void)
     tc_end();
 }
 
-/* P2 starts unregistering and its event runs, under RTNL of its own. */
-static void p2_goes(void)
+/* P2 is moved to another namespace, under RTNL of its own: NETDEV_UNREGISTER
+ * in this one, with the device still registered, and nothing more about it
+ * reaches the learner after. Unregistering it is the same event. */
+static void p2_leaves(void)
 {
     rtnl_lock();
-    P2.reg_state = NETREG_UNREGISTERING;
     ft_mc_device_gone(&P2, true);
     rtnl_unlock();
 }
@@ -2319,22 +2345,25 @@ static void the_worker_records_what_the_drain_replays(void)
     /* ---- a device going while the worker builds with it -----------------
      *
      * The worker holds a reference of its own on every device in the chain
-     * it builds. P2 starts unregistering meanwhile, and its event drops the
-     * flow's hold on it, empties the chain recorded before and asks for
-     * another pass. The chain just built names P2 and is not recorded: once
-     * the build lets go of P2 nothing would hold it, and a drain replaying
-     * that chain would reach a freed device. recorded_chains_name_live_
-     * devices() says so at every transaction; the pass that follows records
-     * the chain without P2. */
+     * it builds. P2 moves to another namespace meanwhile -- still
+     * registered, so nothing about it can be read off the device -- and its
+     * event drops the flow's and the membership's holds on it, empties the
+     * chain recorded before, letting go of that one's too, and asks for
+     * another pass. The build then records a chain naming P2, and that
+     * record holds P2 itself: once the build let go, nothing else would, P2
+     * could be freed in the other namespace, and a drain replaying the
+     * chain would reach it. recorded_chains_hold_their_devices() checks at
+     * every transaction. The pass that follows records the chain without
+     * P2 and lets it go, so the device waits for the worker and no longer. */
     f->stale = true;
-    before_begin = p2_goes;
+    before_begin = p2_leaves;
     before_begin_skip = 1;
     r0 = replaces;
     ft_mc_work_fn(NULL);
     assert(!before_begin && replaces == r0 + 2 && f->hw && !f->ports);
     assert(f->hw_spec.listeners == 1 && f->hw_spec.listener[0].dev == &P3);
     assert(same_chain(&f->hw_spec, &f->hw->chain));
-    P2.reg_state = NETREG_REGISTERED;
+    assert(!P2.refs && P3.refs && P1.refs);
 
     /* ---- a flow retired while the DSCP map leaves its port ----------------
      *

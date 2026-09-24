@@ -4912,9 +4912,10 @@ struct ft_mc_flow {
 	bool gone;
 	/* The chain `hw` was built from, whole -- the routed copies riding it
 	 * included -- recorded with `hw` inside the transaction that built it,
-	 * and what the egress drain replaces it with. Borrowed: a device in it
-	 * that goes away empties it first (ft_mc_device_gone()), so every one
-	 * it names is registered. No listeners means none is recorded. */
+	 * and what the egress drain replaces it with. It holds a reference on
+	 * every device it names (ft_mc_chain_record()); a device going away
+	 * empties it (ft_mc_device_gone()). No listeners means none is
+	 * recorded, and nothing held. */
 	struct cdx_mc_group_spec hw_spec;
 	/* The installed chain may hold an entry built before an egress change
 	 * on a port it copies out of -- an HTB tree, the DSCP map -- naming the
@@ -5269,8 +5270,24 @@ static void ft_mc_flow_release_ports(struct ft_mc_flow *f)
 	f->ports = 0;
 }
 
+/* Forget the chain recorded for a flow's entry, and the references it held
+ * (ft_mc_chain_record()). With ft_mc_lock held, or on a flow nothing else can
+ * reach any more. */
+static void ft_mc_chain_forget(struct ft_mc_flow *f)
+{
+	u8 i;
+
+	if (!f->hw_spec.listeners)
+		return;
+	dev_put(f->hw_spec.in);
+	for (i = 0; i < f->hw_spec.listeners; i++)
+		dev_put(f->hw_spec.listener[i].dev);
+	memset(&f->hw_spec, 0, sizeof(f->hw_spec));
+}
+
 static void ft_mc_flow_free(struct ft_mc_flow *f)
 {
+	ft_mc_chain_forget(f);
 	ft_mc_flow_release_ports(f);
 	if (f->in)
 		dev_put(f->in);
@@ -5664,31 +5681,30 @@ static void ft_mc_flow_spec(const struct ft_mc_flow *f,
 	}
 }
 
-/* Whether every device a spec the worker built names is still registered, so
- * that the chain may be recorded for the egress drain to replay.
+/* Record `spec` as the chain the flow's entry was built from, for the egress
+ * drain to replay, with a reference of its own on every device it names.
  *
- * The recorded chain borrows its devices from the flow and from its route,
- * and ft_mc_device_gone() empties it before either lets go of one. A build
- * does not borrow: it holds a reference of its own on each device for as long
- * as it runs, so a device can be unregistered while it runs, emptying the
- * chain recorded before, and a chain recorded from the build would then name
- * a device nothing holds once the build lets go of it. Unregistration moves a
- * device out of NETREG_REGISTERED before ft_mc_device_gone() takes ft_mc_lock,
- * which the caller holds: a device that still reads as registered here is one
- * whose ft_mc_device_gone() is still to come, and will empty what is recorded
- * now. A chain that cannot be recorded leaves nothing for a drain to replay,
- * and the device's own event asks the worker for a rebuild without it. */
-static bool ft_mc_spec_registered(const struct cdx_mc_group_spec *spec)
+ * Borrowing them would not do. The flow and its route hold the devices the
+ * flow names now, which is not what an installed chain names once the bridge
+ * or the route has moved on; and the build holds its own only while it runs.
+ * A device leaving while a build runs -- unregistered, or moved to another
+ * namespace, which stays registered and reports nothing here afterwards --
+ * empties the chain recorded before, but the build then records one naming
+ * it, and once the build let go nothing would hold the device that chain
+ * names. So the record holds it: a device going away waits for this worker,
+ * whose next pass, which the device's own event asked for, records a chain
+ * without it and lets it go. Called with ft_mc_lock held. */
+static void ft_mc_chain_record(struct ft_mc_flow *f,
+			       const struct cdx_mc_group_spec *spec)
 {
 	u8 i;
 
 	lockdep_assert_held(&ft_mc_lock);
-	if (READ_ONCE(spec->in->reg_state) != NETREG_REGISTERED)
-		return false;
+	dev_hold(spec->in);
 	for (i = 0; i < spec->listeners; i++)
-		if (READ_ONCE(spec->listener[i].dev->reg_state) != NETREG_REGISTERED)
-			return false;
-	return true;
+		dev_hold(spec->listener[i].dev);
+	ft_mc_chain_forget(f);
+	f->hw_spec = *spec;
 }
 
 /* Whether anything still names a flow: a membership of its group on its
@@ -6913,8 +6929,8 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * -- the MDB handler, the netdev events and the egress mark, all
 		 * under RTNL -- never waits behind a hardware call, and nothing
 		 * it changes meanwhile is lost: a mark is caught by the egress
-		 * count, a device going by ft_mc_spec_registered(), and a route
-		 * withdrawn by the check below.
+		 * count, a device going by the references the record takes, and
+		 * a route withdrawn by the check below.
 		 *
 		 * The flow is still allocated: only this function frees one, and
 		 * it is not reentrant. Its entry is changed only here, and is
@@ -6977,18 +6993,12 @@ static void ft_mc_work_fn(struct work_struct *work)
 		if (!hw)
 			target->carried_route = NULL;
 		/* And the chain itself, whole, for the egress drain to replace
-		 * the entry with; nothing is recorded for an entry this pass took
-		 * out, or one it could not build, or one naming a device on its
-		 * way out (ft_mc_spec_registered()). */
-		if (hw && spec.listeners && !rc) {
-			if (ft_mc_spec_registered(&spec))
-				target->hw_spec = spec;
-			else
-				memset(&target->hw_spec, 0,
-				       sizeof(target->hw_spec));
-		} else if (!hw) {
-			memset(&target->hw_spec, 0, sizeof(target->hw_spec));
-		}
+		 * the entry with, holding what it names; nothing is recorded for
+		 * an entry this pass took out, or one it could not build. */
+		if (hw && spec.listeners && !rc)
+			ft_mc_chain_record(target, &spec);
+		else if (!hw)
+			ft_mc_chain_forget(target);
 		/* A new entry has counted nothing yet, is not idle until a
 		 * whole refresh says so, and ages from now. */
 		if (added) {
@@ -7428,16 +7438,19 @@ static void ft_mc_device_gone(struct net_device *dev, bool unregistering)
 		}
 		ft_mc_flow_drop_port(f, dev);
 		changed |= f->dirty;
-		/* The chain recorded for the entry borrows its devices, and
-		 * this one is about to go: nothing may replay it now. The entry
-		 * itself is the worker's to rebuild or take out, which the
-		 * marks above ask for -- a routed copy's device reaches the
-		 * flow through its route, which the routed learner withdraws. */
+		/* The chain recorded for the entry names this device, which is
+		 * going: nothing may replay it now, and its hold must not keep
+		 * the device past this worker's next pass. The entry itself is
+		 * the worker's to rebuild or take out, which the marks above ask
+		 * for -- a routed copy's device reaches the flow through its
+		 * route, which the routed learner withdraws. A build running now
+		 * may record a chain naming the device again; that record holds
+		 * it until the pass this asks for records one without it. */
 		for (j = 0; j < f->hw_spec.listeners; j++)
 			if (f->hw_spec.listener[j].dev == dev)
 				break;
 		if (f->hw_spec.in == dev || j < f->hw_spec.listeners) {
-			memset(&f->hw_spec, 0, sizeof(f->hw_spec));
+			ft_mc_chain_forget(f);
 			f->stale = true;
 			changed = true;
 		}
