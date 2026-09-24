@@ -64,7 +64,6 @@ struct vap_desc_s {
 };
 
 struct vap_stats_s {
-	u32                                pkts_local_tx_dpaa;
 	u32                                pkts_slow_forwarded;
 	u32                                pkts_rx_fast_forwarded;
 	u32                                pkts_rx_ipsec;
@@ -108,7 +107,6 @@ struct dpaa_vwd_priv_s {
 
 /* Common stats not corresponding to specific vap*/
 struct vwd_global_stats_s {
-	u32 					pkts_total_local_tx;
 	u32 					pkts_slow_fail;
 	u32 					pkts_tx_errors;
 	u32 					pkts_dev_down_drop;

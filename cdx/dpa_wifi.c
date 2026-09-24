@@ -89,10 +89,10 @@ static bool vwd_stopping = true;
  *        runs outside the lock: dpaa_vwd_vap_cmd() claims the slot
  *        with VAP_ST_CONFIGURING under the lock, drops it for the
  *        work, and re-takes it to publish VAP_ST_OPEN or roll back.
- *        Datapath consumers key on net_dev->wifi_offload_dev (the
- *        lock-free ipsec xmit hook -- release-published only after
- *        the FQs are live) or on VAP_ST_OPEN (the forwarding dequeue
- *        path), so they never observe a half-built VAP.
+ *        Datapath consumers key on net_dev->wifi_offload_dev
+ *        (release-published only after the FQs are live) and on
+ *        VAP_ST_OPEN (the forwarding dequeue path), so they never
+ *        observe a half-built VAP.
  *   vwd.txlock (spinlock_t)
  *      - Serializes draining the tx-done buffer pool, from the
  *        reclaim work and from exit, against the vwd_stopping
@@ -129,28 +129,6 @@ void drain_bp_tx_done_bpool(struct dpa_bp *bp);
 	 So tailroom is introduced to allow the tail to grow upto 64 bytes */
 #define SKB_ASK_TAILROOM 	64
 
-/* This function transmits local ESP packets to SEC for processing */
-static int vwd_xmit_local_packet(struct sk_buff *skb)
-{
-	struct dpaa_vwd_priv_s *priv = &vwd;
-	struct vap_desc_s *vap;
-
-	INCR_PER_CPU_STAT(priv->vwd_global_stats, pkts_total_local_tx);
-	if (!skb->dev->wifi_offload_dev)
-		goto send_pkt;
-
-	vap = (struct vap_desc_s *)skb->dev->wifi_offload_dev;
-
-	/* Only what SEC was given: a frame the submit could not hand over is
-	 * already freed and counted as the device's transmit drop. */
-	if (!dpaa_submit_outb_pkt_to_SEC(skb, skb->dev, priv->txconf_bp))
-		INCR_PER_CPU_STAT(vap->vap_stats, pkts_local_tx_dpaa);
-
-	return 0;
-send_pkt:
-	return original_dev_queue_xmit(skb);
-}
-
 static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *attribute, char *buf)
 {
 	ssize_t len = 0;
@@ -174,7 +152,6 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 	memset(&total_stats, 0, sizeof(struct vap_stats_s));
 	for_each_possible_cpu(i) {
 		per_cpu_stats = per_cpu_ptr(priv->vaps[ii].vap_stats, i);
-		total_stats.pkts_local_tx_dpaa += per_cpu_stats->pkts_local_tx_dpaa;
 		total_stats.pkts_slow_forwarded += per_cpu_stats->pkts_slow_forwarded;
 		total_stats.pkts_rx_fast_forwarded += per_cpu_stats->pkts_rx_fast_forwarded;
 		total_stats.pkts_rx_ipsec += per_cpu_stats->pkts_rx_ipsec;
@@ -182,9 +159,6 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 	}
 
 	len += sprintf(buf, "VAP (id : %d  name : %s)\n",ii,priv->vaps[ii].ifname);
-	len += sprintf(buf + len, "\nTo DPAA\n");
-	len += sprintf(buf + len, "  WiFi local Tx pkts submitted to DPAA : %u\n", total_stats.pkts_local_tx_dpaa);
-
 	len += sprintf(buf + len, "From DPAA\n");
 	len += sprintf(buf + len, "  WiFi Rx pkts : %u \n", total_stats.pkts_slow_forwarded);
 	len += sprintf(buf + len, "  WiFi Tx pkts : %u \n", total_stats.pkts_rx_fast_forwarded);
@@ -210,7 +184,6 @@ static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *
 	memset(&total_stats, 0, sizeof(struct vwd_global_stats_s));
 	for_each_possible_cpu(i) {
 		per_cpu_stats = per_cpu_ptr(priv->vwd_global_stats, i);
-		total_stats.pkts_total_local_tx += per_cpu_stats->pkts_total_local_tx;
 		total_stats.pkts_slow_fail += per_cpu_stats->pkts_slow_fail;
 		total_stats.pkts_dev_down_drop += per_cpu_stats->pkts_dev_down_drop;
 		total_stats.pkts_tx_errors += per_cpu_stats->pkts_tx_errors;
@@ -221,9 +194,6 @@ static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *
 	len += sprintf(buf + len, "  tx done  %u\n", total_num_tx_done);
 	len += sprintf(buf + len, "  Hardware-owned frames : %d\n",
 			atomic_read(&vwd_tx_pending));
-
-	len += sprintf(buf + len, "\nTo DPAA\n");
-	len += sprintf(buf + len, "  WiFi local Tx pkts : %u\n", total_stats.pkts_total_local_tx);
 
 	len += sprintf(buf + len, "From DPAA\n");
 	len += sprintf(buf + len, "  Hardware/enqueue errors : %u\n", total_stats.pkts_tx_errors);
@@ -1481,10 +1451,11 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 
 	/* In struct net_device , wifi_offload_dev field is defined,
 	 * using this field to store the vap_desc_t structure pointer.
-	 * Published only now, after the FQs are live: the ipsec xmit
-	 * hook consumes this pointer lock-free, so a release-publish
-	 * after the FQ stores is what keeps it from seeing a half-built
-	 * VAP. The caller flips vap->state to VAP_ST_OPEN under vaplock.
+	 * Published only now, after the FQs are live: the forwarding
+	 * dequeue path consumes this pointer lock-free, so a
+	 * release-publish after the FQ stores is what keeps it from seeing
+	 * a half-built VAP. The caller flips vap->state to VAP_ST_OPEN
+	 * under vaplock.
 	 */
 	vap->generation++;
 	smp_store_release(&wifi_dev->wifi_offload_dev,
@@ -1513,8 +1484,8 @@ static int vwd_vap_down(struct dpaa_vwd_priv_s *priv , struct vap_desc_s *vap)
 			vap->macaddr[4], vap->macaddr[5] );
 #endif
 
-	/* unpublish from the lock-free ipsec xmit hook and the dequeue path
-	 * first, then tear down the fq netdev links they would have used */
+	/* unpublish from the lock-free dequeue path first, then tear down
+	 * the fq netdev links it would have used */
 	if(vap->wifi_dev)
 		WRITE_ONCE(vap->wifi_dev->wifi_offload_dev, NULL);
 
@@ -1653,8 +1624,8 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			 * setup) and must not run under the BH spinlock the
 			 * softirq dequeue paths share. Claim the slot so a
 			 * concurrent command sees it mid-transition and bails;
-			 * the dequeue path and the ipsec xmit hook key on
-			 * VAP_ST_OPEN / wifi_offload_dev and stay away. */
+			 * the dequeue path keys on VAP_ST_OPEN /
+			 * wifi_offload_dev and stays away. */
 			vap->state = VAP_ST_CONFIGURING;
 			spin_unlock_bh(&priv->vaplock);
 			rc = vwd_vap_up(priv, vap, cmd);
@@ -2146,16 +2117,11 @@ int dpaa_vwd_init(void)
 	rc = dpaa_vwd_up(priv);
 	if (rc)
 		goto err_device;
-	rc = dpa_register_wifi_xmit_local_hook(vwd_xmit_local_packet);
-	if (rc < 0)
-		goto err_hooks;
 
 	WRITE_ONCE(vwd_stopping, false);
 	register_cdx_deinit_func(dpaa_vwd_exit);
 	return 0;
 
-err_hooks:
-	dpaa_vwd_down(priv);
 err_device:
 	device_unregister(priv->vwd_device);
 err_class:
@@ -2187,7 +2153,6 @@ void dpaa_vwd_exit(void)
 	spin_lock_bh(&priv->txlock);
 	WRITE_ONCE(vwd_stopping, true);
 	spin_unlock_bh(&priv->txlock);
-	dpa_unregister_wifi_xmit_local_hook();
 	dpaa_vwd_down(priv);
 	cancel_delayed_work_sync(&vwd_tx_work);
 
