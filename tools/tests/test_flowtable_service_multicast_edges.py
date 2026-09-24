@@ -58,7 +58,10 @@ WAN_PEER = os.environ.get("ASK_MROUTE_WAN_IF", "wan3900")
 # A multicast policy rule that matches none of these streams: its presence
 # alone refuses the whole family, which sends a standing group to software
 # and back without touching its MFC entry.
-POLICY = {4: ("-4", "198.18.254.0/24"), 6: ("-6", "fd00:254::/64")}
+POLICY = {4: "-4", 6: "-6"}
+# A mark nothing sets, so the rule matches no packet. Not a source prefix:
+# iproute2 6.13 parses an mrule's prefix in the IPMR family and refuses it.
+POLICY_MARK = "0xa51f"
 POLICY_PREF = "32011"
 LOCAL = f"{TARGET_LAN_IF}/0"
 
@@ -449,7 +452,7 @@ async def test_flowtable_service_multicast_counter_fold(multicast_rig, family):
     daemon's SIOCGETSGCNT reads the same numbers and prunes on them."""
     r = multicast_rig
     group, source = FOLD_GROUP[family], wan_source_address(family)
-    flag, selector = POLICY[family]
+    flag = POLICY[family]
     size = (20 if family == 4 else 40) + 8 + len(payload("00" * 16, 0))
     observers = [(r.lan, {LAN_NIC: r.dut_lan_mac})]
     samples = []
@@ -462,7 +465,7 @@ async def test_flowtable_service_multicast_counter_fold(multicast_rig, family):
         return bool(current) and current["state"] == "refused-policy"
 
     async def policy(op, check=True):
-        return await command(r.target, r.session, "ip", flag, "mrule", op, "from", selector,
+        return await command(r.target, r.session, "ip", flag, "mrule", op, "fwmark", POLICY_MARK,
                              "lookup", "253", "pref", POLICY_PREF, check=check)
 
     async def counted(expected, label, offloaded):
