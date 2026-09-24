@@ -775,7 +775,10 @@ async def test_flowtable_service_multicast_bridge_route_count_across_a_bridge_bo
                  {'settled': settled, 'grown': grown, 'sent': sent})
         assert FRAMING_COUNT <= grown <= sent, (settled, grown, sent)
 
+        # The route goes, and the set-top box with it: the box's static
+        # membership alone keeps the bridged group standing.
         await route.ctl('remove', route.iptv_dev, source, group)
+        await _mdb(r, TARGET_LAN_IF, group, add=False)
         await r.wait(lambda s: _iptv_row(s, group) is None
                      and _mroute_row(s, group) is None, timeout=15)
 
