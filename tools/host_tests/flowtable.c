@@ -4046,20 +4046,25 @@ static void tcp_fixture(void)
  * particular, release must not run while ft_bind holds the control mutex. */
 static struct flow_block block;
 static struct nf_flowtable table;
-static int bind_device(struct net_device *dev, int command)
+static int bind_to(struct net_device *dev, int command, struct nf_flowtable *t,
+                   struct flow_block *b)
 {
-    struct flow_block_offload bo = { .block = &block, .net = &init_net,
+    struct flow_block_offload bo = { .block = b, .net = &init_net,
         .binder_type = FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS, .command = command };
     list_init(&bo.cb_list);
-    int rc = ft_bind(dev, NULL, NULL, TC_SETUP_FT, &bo, &table, NULL);
-    assert(!table.flow_block_lock && !block_write_lock && !cdx_info->ctrl.mutex);
+    int rc = ft_bind(dev, NULL, NULL, TC_SETUP_FT, &bo, t, NULL);
+    assert(!t->flow_block_lock && !block_write_lock && !cdx_info->ctrl.mutex);
     while (bo.cb_list.next != &bo.cb_list) {
         struct flow_block_cb *cb = list_entry(bo.cb_list.next, struct flow_block_cb, list);
         list_del(&cb->list);
-        if (command == FLOW_BLOCK_BIND) list_add_tail(&cb->list, &block.cb_list);
+        if (command == FLOW_BLOCK_BIND) list_add_tail(&cb->list, &b->cb_list);
         else { cb->release(cb->cb_priv); kfree(cb); }
     }
     return rc;
+}
+static int bind_device(struct net_device *dev, int command)
+{
+    return bind_to(dev, command, &table, &block);
 }
 /* The direct route, as a netdev that has an ndo_setup_tc takes it: Netfilter
  * passes the flowtable's own embedded block and no table argument, recovers
@@ -4816,7 +4821,7 @@ static void test_device_dependencies(void)
  * every bound device, not for the first two it snapshots. */
 static void test_binding_capacity(void)
 {
-    struct net_device ports[CDX_FT_MAX_BINDINGS + 1];
+    struct net_device ports[CDX_FT_MAX_TABLE_DEVICES + 1];
     unsigned i, before;
 
     fixture();
@@ -4824,13 +4829,13 @@ static void test_binding_capacity(void)
     for (i = 0; i < ARRAY_SIZE(ports); i++)
         ports[i] = (struct net_device){ .ifindex = 1000 + (int)i, .mtu = 1500,
             .type = ARPHRD_ETHER, .dev_addr = {2, 0, 0, 0, 1, (u8)i} };
-    for (i = 0; i < CDX_FT_MAX_BINDINGS; i++) {
+    for (i = 0; i < CDX_FT_MAX_TABLE_DEVICES; i++) {
         assert(bind_device(&ports[i], FLOW_BLOCK_BIND) == 0);
         assert(ft_bound == i + 1 && ports[i].refs == 1);
         /* One binding per device, whatever the count is -- while there is
          * room, since a full table refuses everything before it looks at
          * which device is asking. */
-        if (ft_bound < CDX_FT_MAX_BINDINGS)
+        if (ft_bound < CDX_FT_MAX_TABLE_DEVICES)
             assert(bind_device(&ports[i], FLOW_BLOCK_BIND) == -EBUSY);
         assert(ft_bound == i + 1 && ports[i].refs == 1);
     }
@@ -4840,14 +4845,65 @@ static void test_binding_capacity(void)
     before = flushed;
     ft_invalidate();
     ft_invalidate_work(NULL);
-    assert(flushed - before == CDX_FT_MAX_BINDINGS && ft_invalid_done);
-    for (i = 0; i < CDX_FT_MAX_BINDINGS; i++) {
+    assert(flushed - before == CDX_FT_MAX_TABLE_DEVICES && ft_invalid_done);
+    for (i = 0; i < CDX_FT_MAX_TABLE_DEVICES; i++) {
         assert(bind_device(&ports[i], FLOW_BLOCK_UNBIND) == 0);
         assert(!ports[i].refs);
     }
     assert(!ft_bound && !allocated && ft_installs == ft_deletes);
     ft_invalid = 0;
     ft_invalid_done = false;
+}
+
+/* A consumer replaces its table in one transaction: Netfilter binds the new
+ * flowtable while preparing it and unbinds the old one only at commit. OpenWrt's
+ * firewall also probes offload with a second table while its own is bound. Both
+ * have to bind beside the live table without disturbing it; a refusal aborts
+ * the whole firewall transaction, or turns the probe into a silent fallback to
+ * software. The same table twice on one device, or a third table at once, is
+ * still refused. */
+static void test_table_handover(void)
+{
+    static struct nf_flowtable next_table, probe_table;
+    static struct flow_block next_block, probe_block;
+    struct net_device wan = { .ifindex = 71, .mtu = 1500, .type = ARPHRD_ETHER,
+                              .dev_addr = {2, 0, 0, 0, 2, 1} };
+    struct net_device lan = { .ifindex = 72, .mtu = 1500, .type = ARPHRD_ETHER,
+                              .dev_addr = {2, 0, 0, 0, 2, 2} };
+    struct cdx_ft_binding *binding;
+
+    fixture();
+    list_init(&next_block.cb_list);
+    list_init(&probe_block.cb_list);
+    assert(bind_device(&wan, FLOW_BLOCK_BIND) == 0);
+    assert(bind_device(&lan, FLOW_BLOCK_BIND) == 0);
+    assert(bind_device(&wan, FLOW_BLOCK_BIND) == -EBUSY && wan.refs == 1);
+
+    /* The replacement binds the same devices beside the live table. */
+    assert(bind_to(&wan, FLOW_BLOCK_BIND, &next_table, &next_block) == 0);
+    assert(bind_to(&lan, FLOW_BLOCK_BIND, &next_table, &next_block) == 0);
+    assert(ft_bound == 4 && wan.refs == 2 && lan.refs == 2);
+    /* A third table at once is not a handover. */
+    assert(bind_to(&wan, FLOW_BLOCK_BIND, &probe_table, &probe_block) == -EBUSY);
+    assert(ft_bound == 4 && wan.refs == 2);
+
+    /* Commit unbinds the old table and leaves the new one bound. */
+    assert(bind_device(&wan, FLOW_BLOCK_UNBIND) == 0);
+    assert(bind_device(&lan, FLOW_BLOCK_UNBIND) == 0);
+    assert(ft_bound == 2 && wan.refs == 1 && lan.refs == 1);
+    list_for_each_entry(binding, &ft_bindings, list)
+        assert(binding->table == &next_table);
+
+    /* A probe binds and unbinds a second table while the live one stays. */
+    assert(bind_to(&wan, FLOW_BLOCK_BIND, &probe_table, &probe_block) == 0);
+    assert(bind_to(&wan, FLOW_BLOCK_UNBIND, &probe_table, &probe_block) == 0);
+    assert(ft_bound == 2 && wan.refs == 1);
+    list_for_each_entry(binding, &ft_bindings, list)
+        assert(binding->table == &next_table);
+
+    assert(bind_to(&wan, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0);
+    assert(bind_to(&lan, FLOW_BLOCK_UNBIND, &next_table, &next_block) == 0);
+    assert(!ft_bound && !wan.refs && !lan.refs && !allocated);
 }
 
 /* OpenWrt's firewall declares `counter` on every flowtable it renders, with no
@@ -5351,6 +5407,7 @@ int main(void)
     test_double_nat();
     test_device_dependencies();
     test_binding_capacity();
+    test_table_handover();
     test_counter_accounting();
     test_device_recovery();
     test_transient_admission();

@@ -2529,6 +2529,48 @@ static bool ft_can_rearm(void)
 		!ft_bound && !ft_count && !ft_neighbour_refs && !ft_handle_refs && !cdx_ft_pending();
 }
 
+/* Whether flowtable may bind dev beside the tables already bound.
+ *
+ * Several tables can be bound at once, for a moment: Netfilter binds a table
+ * while preparing the transaction that adds it and unbinds the one it replaces
+ * only at commit, and a consumer probing offload binds a second table beside
+ * its own. Refusing either aborts the consumer's firewall transaction, or turns
+ * its probe into a silent fallback to software. Each binding owns only its own
+ * entries, and a conntrack belongs to one flowtable at a time, so two tables
+ * never describe the same flow to the hardware.
+ *
+ * Still refused: a table past its device bound, the same table twice on one
+ * device, and a third table at once.
+ */
+static int ft_bind_admissible(const struct nf_flowtable *flowtable,
+			      const struct net_device *dev)
+{
+	const struct nf_flowtable *others[CDX_FT_MAX_TABLES - 1];
+	struct cdx_ft_binding *other;
+	unsigned int devices = 0, nothers = 0, i;
+	bool duplicate = false, crowded = false;
+
+	cdx_ft_assert_held();
+	list_for_each_entry(other, &ft_bindings, list) {
+		if (other->table == flowtable) {
+			devices++;
+			duplicate |= other->dev == dev;
+			continue;
+		}
+		for (i = 0; i < nothers && others[i] != other->table; i++)
+			;
+		if (i < nothers)
+			continue;
+		if (nothers == ARRAY_SIZE(others))
+			crowded = true;
+		else
+			others[nothers++] = other->table;
+	}
+	if (devices >= CDX_FT_MAX_TABLE_DEVICES)
+		return -EOPNOTSUPP;
+	return duplicate || crowded ? -EBUSY : 0;
+}
+
 /* Netfilter reaches a driver by one of two routes, and they disagree about two
  * things that no build can check.
  *
@@ -2549,7 +2591,7 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 			  struct nf_flowtable *flowtable, bool indirect,
 			  struct Qdisc *sch, void (*cleanup)(struct flow_block_cb *))
 {
-	struct cdx_ft_binding *binding, *other;
+	struct cdx_ft_binding *binding;
 	struct flow_block_cb *cb;
 	bool rearm;
 	int rc = 0;
@@ -2614,11 +2656,9 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 			rc = -EOPNOTSUPP;
 			goto out;
 		}
-		list_for_each_entry(other, &ft_bindings, list)
-			if (other->table != flowtable || other->dev == dev) {
-				rc = -EBUSY;
-				goto out;
-			}
+		rc = ft_bind_admissible(flowtable, dev);
+		if (rc)
+			goto out;
 		binding = kzalloc(sizeof(*binding), GFP_KERNEL);
 		if (!binding) {
 			rc = -ENOMEM;

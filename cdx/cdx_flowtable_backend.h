@@ -17,19 +17,28 @@ struct cdx_ft_hw;
 /* How many devices one flowtable may be bound to at once.
  *
  * A binding is a device reference and a rule callback; it reserves nothing in
- * hardware, and admission already refuses a second binding for a device it
- * holds. So the ceiling is however many devices can pass
+ * hardware, and admission already refuses a second binding of one table for a
+ * device it holds. So the ceiling is however many devices can pass
  * cdx_ft_port_supported(), which admits only a physical Ethernet onif --
  * cdx_add_eth_onif() is the sole creator of one and it takes a phy_port slot
  * first, of which there are MAX_PHY_PORTS. A bound flowtable can therefore
- * never reach this number, and the adapter sizes its drain snapshot by it.
- * cdx_flowtable_backend.c asserts that the two bounds agree.
+ * never reach this number. cdx_flowtable_backend.c asserts that the two
+ * bounds agree.
  *
  * A gateway needs more than a pair: PPPoE on the WAN with br-lan, br-guest
  * and br-iot below it is four. The pair this replaced was the proof of
  * concept's own acceptance limit, carried along unexamined ever since.
  */
-#define CDX_FT_MAX_BINDINGS 40
+#define CDX_FT_MAX_TABLE_DEVICES 40
+
+/* How many flowtables may be bound at once: the live one and the one about to
+ * replace it. Netfilter binds a table while preparing the transaction that
+ * adds it and unbinds the old one only at commit, and a consumer probing
+ * offload binds a second table beside its own. */
+#define CDX_FT_MAX_TABLES 2
+
+/* Every binding at once, which the adapter sizes its drain snapshot by. */
+#define CDX_FT_MAX_BINDINGS (CDX_FT_MAX_TABLE_DEVICES * CDX_FT_MAX_TABLES)
 
 /* One 802.1Q tag. proto is the TPID in network byte order and id the 12-bit
  * VID. A flowtable rule describes neither priority nor DEI, so neither is

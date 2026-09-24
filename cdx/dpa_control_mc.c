@@ -2056,7 +2056,7 @@ struct cdx_mc_group {
  * and raising the public one alone would overrun struct mcast_group_info's
  * member array on the heap. The file already pins the array's own width with
  * BUILD_BUG_ON(MC_MAX_LISTENERS_PER_GROUP > 8); this pins the two to each
- * other, the way CDX_FT_MAX_BINDINGS and CDX_FT_VLAN_MAX are pinned to theirs. */
+ * other, the way CDX_FT_MAX_TABLE_DEVICES and CDX_FT_VLAN_MAX are pinned to theirs. */
 static_assert(CDX_MC_MAX_LISTENERS == MC_MAX_LISTENERS_PER_GROUP,
 	      "the group interface's listener bound must be the member array's");
 

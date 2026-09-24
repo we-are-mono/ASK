@@ -239,10 +239,11 @@ def test_marker_ownership(engine, text, owned):
 
 
 def test_device_bound_matches_the_adapter():
-    """FT_MAX_DEVICES restates CDX_FT_MAX_BINDINGS. Drift would refuse a policy
-    the adapter would have taken, or accept one it will only half bind."""
+    """FT_MAX_DEVICES restates CDX_FT_MAX_TABLE_DEVICES, the adapter's bound for
+    one table. Drift would refuse a policy the adapter would have taken, or
+    accept one it will only half bind."""
     header = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     policy_h = (ENGINE / "policy.h").read_text()
-    adapter = int(re.search(r"^#define CDX_FT_MAX_BINDINGS\s+(\d+)", header, re.M)[1])
+    adapter = int(re.search(r"^#define CDX_FT_MAX_TABLE_DEVICES\s+(\d+)", header, re.M)[1])
     engine_max = int(re.search(r"^#define FT_MAX_DEVICES\s+(\d+)", policy_h, re.M)[1])
     assert adapter == engine_max

@@ -1791,10 +1791,12 @@ over them.
 - **Who owns the flowtable, and how a conflict is reported.** There are two
   conflicts and only one of them is already handled. ASK registers an *indirect*
   block callback (`flow_indr_dev_register`, `cdx/ask_flowtable.c:1417`), so a
-  foreign flowtable declaring `flags offload` on a supported port can seize the
-  CDX backend; the adapter then refuses the second table with `-EBUSY`
-  (`:949`) and the controller reports "another flowtable owns the backend
-  bindings". That one is loud. The other is not: a foreign flowtable whose
+  foreign flowtable declaring `flags offload` on a supported port binds the
+  CDX backend too. The adapter accepts one table beside another, because that
+  is also the shape of an atomic reload and of a consumer's probe
+  (`ft_bind_admissible()`), and the controller, finding bindings it does not
+  own, reports "another flowtable owns the backend bindings" and leaves them
+  alone. That one is loud. The other is not: a foreign flowtable whose
   forward chain runs at a **lower priority number** than ASK's 10 wins
   `test_and_set_bit(IPS_OFFLOAD_BIT)` in `nft_flow_offload_eval()` and takes
   every flow. There is no packet state in which the earlier chain declines and
@@ -1920,11 +1922,14 @@ run through `nft -c` (`nft_try_hw_offload()`, `fw4.uc:477`). A checked
 transaction still binds: `nft_register_flowtable_net_hooks()` calls the
 driver and propagates its error (`net/netfilter/nf_tables_api.c:8513`), and for
 a `flags offload` table `nf_flow_table_offload_setup()` returns exactly what
-`ndo_setup_tc` returned (`nf_flow_table_offload.c:1273`). If ASK's *own* table
-is already bound, that second table is refused with `-EBUSY`, the check fails,
-and fw4 does not stop — it warns `Hardware flow offloading unavailable,
-falling back to software offloading`, sets `flow_offloading_hw` false, and
-installs the software offload that takes every flow at priority 0.
+`ndo_setup_tc` returned (`nf_flow_table_offload.c:1273`). While the adapter
+admitted one table at a time, a probe run with any table already bound was
+refused with `-EBUSY`, the check failed, and fw4 did not stop — it warned
+`Hardware flow offloading unavailable, falling back to software offloading`,
+set `flow_offloading_hw` false, and installed the software offload that takes
+every flow at priority 0. The adapter now binds a second table beside the
+first, so the probe passes, and so does fw4's own reload, which binds its new
+flowtable while preparing the transaction and unbinds the old one at commit.
 
 So ASK's controller holding its own table, while fw4 has any offloading
 enabled, degrades to the worst available outcome without anyone choosing it.
@@ -2010,7 +2015,7 @@ driver. Every number here is the hardware's or the driver's, not a policy:
 | Tail-drop depth | 128 frames | per leaf, ASK's default | hardware default is 8, far too shallow |
 | Ingress policer profiles | 8, of which **7** are addressable | per port | profile 0 is the default for everything unclassified; `CDX_FT_QOS_MAX_POLICER` |
 | DSCP→class egress map | **1 port at a time** | SoC-wide | "Now supporting only one interface", and the second port is refused |
-| Flowtable bindings | `MAX_PHY_PORTS` | one per cdx-backed port | `CDX_FT_MAX_BINDINGS`; was 2 until A152 |
+| Flowtable bindings | `MAX_PHY_PORTS` per table, 2 tables | one per cdx-backed port per table; the second table is a replacement or a probe | `CDX_FT_MAX_TABLE_DEVICES`, `CDX_FT_MAX_TABLES`; was 2 until A152 |
 | Offloaded flows | 32768 | global, all ports together | `CDX_FT_MAX_ENTRIES`; admission budget, no eviction |
 
 The two that bite a real configuration first are the eight channels, because

@@ -335,6 +335,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A204.** A second flowtable bound at once was refused with EBUSY, failing every atomic reload and silently sending fw4's probe to software offload —
+  fixed (_:/^flowtable: let a consumer reload its table in one transaction_).
+
 - [x] **A203.** Every offloaded NAT-T SA sent and expected byte-swapped UDP ports, and a transport-mode one would have left as bare ESP —
   fixed (_:/^cdx: store NAT-T ports in host order, refuse transport-mode NAT-T_).
 

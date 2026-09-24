@@ -252,18 +252,21 @@ class Rig:
     async def nft(self, text):
         return await command(self.target, self.session, "nft", text)
 
-    async def table(self, hardware=True, counter=False, mark=None):
+    def ruleset(self, hardware=True, counter=False, mark=None):
         # A mark is set in the same rule that offers the flow, so admission
         # sees it: it is how a test asks for a hardware decline that owes
         # nothing to fault injection.
         marking = f"ct mark set {mark:#x}" if mark else ""
-        await self.nft(f'''table inet {TABLE} {{
+        return f'''table inet {TABLE} {{
  flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }};
  {"flags offload;" if hardware else ""} {"counter;" if counter else ""} }}
  chain forward {{ type filter hook forward priority 0; policy accept;
  ip saddr {self.lan_ip} ip daddr {WAN_IP} {self.proto} sport {SPORT} {self.proto} dport {DPORT} {marking} flow add @fast
  }}
-}}''')
+}}'''
+
+    async def table(self, hardware=True, counter=False, mark=None):
+        await self.nft(self.ruleset(hardware, counter, mark))
         if hardware:
             await self.wait(lambda s: s["bindings"] == 2)
 
@@ -902,6 +905,52 @@ async def test_flowtable_offload_invalidation(rig, trigger):
     if trigger != "neighbour":
         assert (await r.state())["entries"] == 0
     r.record(f"invalidation-{trigger}", state)
+
+
+async def test_flowtable_offload_table_reload(rig):
+    """A consumer reloads its ruleset by deleting its table and creating it
+    again in one transaction, which is how `nft -f` with a flush and fw4 both
+    apply a change. Netfilter binds the new flowtable while preparing and
+    releases the old one only at commit, so for that instant two tables hold
+    every port: the reload has to go through with hardware rather than fall
+    back to software, and so does fw4's check-mode probe of a second offload
+    table. A third table at once is still refused, and nothing is left behind
+    by any of it."""
+    r = rig
+    if (await r.state())["observe"]:
+        pytest.skip("the reload proof requires installed hardware")
+    await r.table()
+    await r.exchange(count=4)
+    before = await r.wait(lambda s: s["entries"] == 2)
+    ports = f"devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload;"
+    probe = f"table inet {TABLE}_probe {{ flowtable probe {{ hook ingress priority 0; {ports} }}; }}"
+    third = f"table inet {TABLE}_third {{ flowtable third {{ hook ingress priority 0; {ports} }}; }}"
+    checked = await command(r.target, r.session, "nft", "-c", probe, check=False)
+    assert checked["rc"] == 0, checked
+    crowded = await command(r.target, r.session, "nft", "-c", probe + "\n" + third, check=False)
+    assert crowded["rc"] != 0 and "busy" in crowded["stderr"].lower(), crowded
+    probed = await r.state()
+    assert probed["bindings"] == 2 and probed["entries"] == 2, probed
+    assert {f["cookie"] for f in probed["flows"]} == {f["cookie"] for f in before["flows"]}, (before, probed)
+    reloaded = await command(r.target, r.session, "nft", f"delete table inet {TABLE}\n" + r.ruleset(),
+                             check=False)
+    assert reloaded["rc"] == 0, reloaded
+    # The old flowtable took its flows with it; conntrack still holds the
+    # connection, so the next packets offer it to the new one.
+    await r.wait(lambda s: s["bindings"] == 2 and not s["entries"])
+    await r.exchange(count=4)
+    admitted = await r.wait(lambda s: s["entries"] == 2)
+    baseline = {f["cookie"]: int(f["packets"]) for f in admitted["flows"]}
+    await r.exchange(count=64)
+    after = await r.state()
+    assert {f["cookie"]: int(f["packets"]) - baseline[f["cookie"]] for f in after["flows"]} == \
+        {c: 64 for c in baseline}, (admitted, after)
+    for key in ("errors", "fatal", "quarantine", "invalidated"):
+        assert after[key] == before[key], (key, before, after)
+    assert after["installs"] - after["deletes"] == after["entries"] == 2, after
+    assert after["handle_refs"] == after["neighbour_refs"] == 2, after
+    r.record("table-reload", {"before": before, "probed": probed, "after": after,
+                              "crowded": crowded["stderr"]})
 
 
 async def terminal_stream(r, duration=12):

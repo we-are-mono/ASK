@@ -16,7 +16,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Mirrors CDX_FT_MAX_BINDINGS in cdx/cdx_flowtable_backend.h. Restated here so
+/* Mirrors CDX_FT_MAX_TABLE_DEVICES in cdx/cdx_flowtable_backend.h. Restated here so
  * an oversized policy is refused at check time, naming the limit, rather than
  * binding part of itself and rolling back. A host test fails if they diverge. */
 #define FT_MAX_DEVICES   40
