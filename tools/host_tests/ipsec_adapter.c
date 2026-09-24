@@ -31,6 +31,12 @@ typedef uint64_t u64;
 typedef uint16_t __be16;
 typedef uint32_t __be32;
 
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define htons(x) ((__be16)__builtin_bswap16((uint16_t)(x)))
+#else
+#define htons(x) ((__be16)(x))
+#endif
+
 #define ETH_ALEN 6
 #define AF_INET 2
 #define AF_INET6 10
@@ -788,8 +794,10 @@ static void test_spec(void)
 {
 	struct cdx_ipsec_sa_spec spec;
 	struct xfrm_state *x = outbound_state();
+	/* xfrm hands the ports over in network order, and the pair is
+	 * deliberately asymmetric so a swap shows too. */
 	struct xfrm_encap_tmpl natt = { .encap_type = UDP_ENCAP_ESPINUDP,
-					.encap_sport = 4500, .encap_dport = 4500 };
+					.encap_sport = htons(4500), .encap_dport = htons(61000) };
 	struct netlink_ext_ack ack = { NULL };
 
 	bench_reset();
@@ -815,10 +823,16 @@ static void test_spec(void)
 	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && !spec.copy_df);
 	x->props.flags &= ~XFRM_STATE_NOPMTUDISC;
 
-	/* NAT-T carries both ports, and only the encapsulation SEC knows. */
+	/* NAT-T carries both ports, in the spec's network order, and only the
+	 * encapsulation SEC knows. */
 	x->encap = &natt;
 	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
-	assert(spec.natt_sport == 4500 && spec.natt_dport == 4500);
+	assert(spec.natt_sport == htons(4500) && spec.natt_dport == htons(61000));
+	/* SEC builds the UDP header only on its tunnel arms: a transport SA
+	 * asking for it would leave as bare ESP, so it is refused. */
+	x->props.mode = XFRM_MODE_TRANSPORT;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+	x->props.mode = XFRM_MODE_TUNNEL;
 	natt.encap_type = 0;
 	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
 	x->encap = NULL;

@@ -6432,6 +6432,12 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 			NL_SET_ERR_MSG(extack, "cdx: only UDP-encapsulated ESP is supported");
 			return -EOPNOTSUPP;
 		}
+		/* SEC builds the UDP header, and the decap offset past it, only
+		 * on its tunnel arms: a transport SA would leave as bare ESP. */
+		if (!spec->tunnel) {
+			NL_SET_ERR_MSG(extack, "cdx: UDP encapsulation needs tunnel mode");
+			return -EOPNOTSUPP;
+		}
 		spec->natt_sport = x->encap->encap_sport;
 		spec->natt_dport = x->encap->encap_dport;
 	}

@@ -176,6 +176,18 @@ static void cdx_ipsec_build_tunnel(PSAEntry sa,
 	sa->mode = SA_MODE_TUNNEL;
 }
 
+/* xfrm, and so the spec, carry the NAT-T ports in network order. The SA
+ * cache keeps sa->natt in host order: its consumers convert from that when
+ * they build the ESP-in-UDP header and the inbound classifier key, as the
+ * legacy owner did after its own conversion. Storing the network-order
+ * value sent every UDP-encapsulated SA to a byte-swapped port. */
+static void cdx_ipsec_set_natt(unsigned short *sport, unsigned short *dport,
+			       __be16 natt_sport, __be16 natt_dport)
+{
+	*sport = be16_to_cpu(natt_sport);
+	*dport = be16_to_cpu(natt_dport);
+}
+
 static int cdx_ipsec_set_keys(PSAEntry sa, const struct cdx_ipsec_sa_spec *spec)
 {
 	if (spec->auth.alg &&
@@ -287,8 +299,8 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		sa->hdr_flags &= ~SA_HDR_COPY_DF;
 
 	if (spec->natt_sport) {
-		sa->natt.sport = spec->natt_sport;
-		sa->natt.dport = spec->natt_dport;
+		cdx_ipsec_set_natt(&sa->natt.sport, &sa->natt.dport,
+				   spec->natt_sport, spec->natt_dport);
 		sa->natt.socket = NULL;
 	}
 

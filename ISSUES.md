@@ -335,6 +335,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A203.** Every offloaded NAT-T SA sent and expected byte-swapped UDP ports, and a transport-mode one would have left as bare ESP —
+  fixed (_:/^cdx: store NAT-T ports in host order, refuse transport-mode NAT-T_).
+
 - [x] **A181.** ask-flowtable could validate a maximal policy and then refuse it at apply for overflowing the render buffer —
   fixed (_:/^flowtable: size the render buffer to what the validator accepts_).
 

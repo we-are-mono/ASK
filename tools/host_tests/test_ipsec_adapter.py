@@ -82,6 +82,25 @@ def test_ipsec_adapter(tmp_path):
     })
 
 
+def test_ipsec_backend_natt_order(tmp_path):
+    """The adapter hands NAT-T ports over in network order and the SA cache
+    keeps host order; the backend stored them unconverted, which sent every
+    UDP-encapsulated SA to port 37905 and never matched its inbound key."""
+    source = (ROOT / "cdx/cdx_ipsec_backend.c").read_text()
+    (tmp_path / "ipsec_backend_natt.inc").write_text(function(source, "cdx_ipsec_set_natt"))
+    binary = tmp_path / "ipsec_backend_natt"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("ipsec_backend_natt.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+
+
 def test_ipsec_receive_ownership(tmp_path):
     source = (ROOT / "cdx/dpa_ipsec.c").read_text()
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
