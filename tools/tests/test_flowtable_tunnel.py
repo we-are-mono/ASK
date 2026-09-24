@@ -320,9 +320,12 @@ class Capture:
         self.path.unlink(missing_ok=True)
         self.log = open(self.path.with_suffix(".log"), "wb")
         # -Z root: tcpdump otherwise drops to its own user before opening the
-        # savefile, and the artifact directory is root's.
+        # savefile, and the artifact directory is root's. --immediate-mode:
+        # -U only flushes what tcpdump has read, and without it tcpdump reads
+        # the kernel's ring a buffer timeout at a time, so a burst that ends
+        # less than that before the stop below was received and never saved.
         self.proc = subprocess.Popen(
-            ["tcpdump", "-i", self.interface, "-U", "-Z", "root", "-s", str(self.snaplen),
+            ["tcpdump", "-i", self.interface, "--immediate-mode", "-U", "-Z", "root", "-s", str(self.snaplen),
              "-w", str(self.path), "-n", self.filter],
             stdout=subprocess.DEVNULL, stderr=self.log)
         # tcpdump takes a moment to attach; a burst that starts first is
