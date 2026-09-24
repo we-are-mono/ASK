@@ -237,6 +237,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A274.** Offloaded ESP transforms were admitted without ever being proven against a peer —
+  each is now proven interoperable with a Linux software peer (_:/^tests: prove every offloaded ESP transform against a software peer_).
+
 - [x] **A236.** A cdx build with `DEVOH_DEBUG` failed at modpost: `display_iface_info()` was declared but never defined, and only devman.c's empty macro stood in for it —
   fixed (_:/^cdx: drop a debug helper that was declared and never defined_).
 
