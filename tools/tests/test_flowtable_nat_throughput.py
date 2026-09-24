@@ -10,7 +10,7 @@ from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_connections import by_key, healthy
-from test_flowtable_offload import (ARTIFACTS, DPORT, WAN_IP, command,
+from test_flowtable_offload import (ARTIFACTS, DPORT, HEALTH_BASELINE, WAN_IP, command,
                                    console_command, rig)  # noqa: F401
 from test_flowtable_policy import CONFIG, apply, candidate, stop
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
@@ -156,5 +156,6 @@ assert result.returncode == 0
                         await command(r.target, r.session, "conntrack", "-D", "-p", "tcp", "--orig-src", r.lan_ip,
                             "--orig-dst", WAN_IP, "--dport", str(PORT), check=False)
             final = await r.state()
-            assert final["installs"] == final["deletes"] and final["errors"] == final["fatal"] == final["quarantine"] == 0, final
+            assert final["installs"] == final["deletes"] and final["fatal"] == final["quarantine"] == 0, final
+            assert final["errors"] == HEALTH_BASELINE["errors"], (final, HEALTH_BASELINE)
             r.record("nat-rate-cleanup", final)

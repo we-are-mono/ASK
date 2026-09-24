@@ -10,7 +10,7 @@ from _topology import TARGET_WAN_IF
 from test_flowtable_connections import FLOWS, connections, peer  # noqa: F401
 from test_flowtable_module import table
 from test_flowtable_mtu import table_identity
-from test_flowtable_offload import (ARTIFACTS, WAN_IP, command, console_command,
+from test_flowtable_offload import (ARTIFACTS, HEALTH_BASELINE, WAN_IP, command, console_command,
                                     rig, status_text)  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, warm
 from test_flowtable_tcp import software_tx
@@ -37,6 +37,8 @@ async def test_flowtable_nexthop_object_replacement(connections):
             await console_command(con, "modprobe", "ask_flowtable")
             fresh = await r.state()
             assert all(fresh[k] == 0 for k in ("bindings", "entries", "invalidated", "fatal", "errors")), fresh
+            # The reload restarted the error count; health is measured from it.
+            HEALTH_BASELINE["errors"] = fresh["errors"]
             r.record("nexthop-existing-object-reload", fresh)
             await table(r)
             identity = await table_identity(r)

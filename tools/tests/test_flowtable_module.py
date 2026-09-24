@@ -8,7 +8,8 @@ from ask_orch.uart import Console
 from _ioctl import CDX_CTRL_DPA_SET_PARAMS, SIZEOF_CDX_CTRL_SET_DPA_PARAMS
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import FLOWS, SPORT, connections, peer  # noqa: F401
-from test_flowtable_offload import ARTIFACTS, DPORT, TABLE, WAN_IP, console_command, read, rig  # noqa: F401
+from test_flowtable_offload import (ARTIFACTS, DPORT, HEALTH_BASELINE, TABLE, WAN_IP, console_command,  # noqa: F401
+                                    read, rig)
 from test_flowtable_selective_neighbour import hardware, warm
 from test_flowtable_tcp import software_tx
 
@@ -62,6 +63,9 @@ async def test_flowtable_module_lifecycle(connections):
             failures.append({"stage": stage, "failure": result, "reclaimed": state})
         r.record("module-failed-loads", {"provider_refcount": provider, "pinned": pinned, "stages": failures})
         await console_command(con, "modprobe", "ask_flowtable")
+        # A fresh adapter counts errors from zero, so the boot's baseline no
+        # longer applies; health from here on means none since this load.
+        HEALTH_BASELINE["errors"] = (await r.state())["errors"]
         await table(r)
         async with peer(r, flows) as p:
             await warm(r, p, ids, "module-initial-admission", flows)
@@ -92,6 +96,7 @@ async def test_flowtable_module_lifecycle(connections):
                 # registration. The old table stays in software until recreated.
                 detached = await r.state()
                 assert detached["bindings"] == detached["entries"] == detached["fatal"] == 0, detached
+                HEALTH_BASELINE["errors"] = detached["errors"]
                 await p.batch(ids, count=64)
                 assert (await r.state())["entries"] == 0
                 await r.delete_table()

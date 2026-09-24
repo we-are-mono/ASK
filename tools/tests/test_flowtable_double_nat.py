@@ -11,7 +11,7 @@ from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_connections import healthy, peer
 from test_flowtable_dnat import (PUBLIC_PORT, hardware, warm,
                                  test_flowtable_dnat as _dnat)
-from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, WAN_IP, command,
+from test_flowtable_offload import (ARTIFACTS, DPORT, HEALTH_BASELINE, SPORT, WAN_IP, command,
                                    console_command, read, rig)  # noqa: F401
 from test_flowtable_policy import CONFIG, apply, candidate, stop
 from test_flowtable_tcp import software_tx
@@ -196,5 +196,6 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
                     await command(r.target, r.session, "conntrack", "-D", "-p", proto, "--orig-src", CLIENT["lan"],
                         "--orig-dst", external, "--sport", str(sport), "--dport", str(PUBLIC_PORT), check=False)
             final = await r.state()
-            assert final["installs"] == final["deletes"] and final["errors"] == final["fatal"] == final["quarantine"] == 0, final
+            assert final["installs"] == final["deletes"] and final["fatal"] == final["quarantine"] == 0, final
+            assert final["errors"] == HEALTH_BASELINE["errors"], (final, HEALTH_BASELINE)
             r.record("cleanup", final)

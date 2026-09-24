@@ -10,7 +10,7 @@ import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF
-from test_flowtable_offload import (ARTIFACTS, TABLE, command, console_command,
+from test_flowtable_offload import (ARTIFACTS, HEALTH_BASELINE, TABLE, command, console_command,
                                     console_python, read, rig, terminal_stream)  # noqa: F401
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_UNREGISTER") != "1",
@@ -73,7 +73,7 @@ print(json.dumps({{'device': str(device), 'name': device.name, 'driver': str(dri
             assert time.monotonic() < deadline, state
             await asyncio.sleep(0.05)
         assert state["handle_refs"] == state["neighbour_refs"] == state["quarantine"] == 0, state
-        assert state["fatal"] == state["errors"] == 0, state
+        assert state["fatal"] == 0 and state["errors"] == HEALTH_BASELINE["errors"], state
         assert state["installs"] == state["deletes"], state
         # Completion is deliberately held until the provider releases its
         # non-flow references; unloading only the adapter is insufficient.

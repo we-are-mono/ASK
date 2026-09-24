@@ -11,7 +11,8 @@ import time
 import pytest
 
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read, rig  # noqa: F401
+from test_flowtable_offload import (ARTIFACTS, HEALTH_BASELINE, WAN_IP, command, console_command, read,  # noqa: F401
+                                    rig)
 from test_flowtable_tcp import BLOCK, connection, hardware_transfer, installed, software_tx
 
 CHANGED_MAC = "02:9d:99:b2:33:02"
@@ -79,7 +80,8 @@ async def invalidated(r, before, label, *, global_invalidation=False, counter="n
         s["invalidation_done"] == 1 if global_invalidation else
         s[counter] > before[counter]))
     assert state["invalidated"] == int(global_invalidation) and state["bindings"] == 2, state
-    assert state["handle_refs"] == state["neighbour_refs"] == state["errors"] == state["fatal"] == state["quarantine"] == 0, state
+    assert state["handle_refs"] == state["neighbour_refs"] == state["fatal"] == state["quarantine"] == 0, state
+    assert state["errors"] == HEALTH_BASELINE["errors"], (state, HEALTH_BASELINE)
     assert state["installs"] == before["installs"] and state["rearms"] == before["rearms"], (before, state)
     r.record(f"arp-{r.proto}-{label}", {"before": before, "after": state, "neighbours": await neighbours(r)})
     return state

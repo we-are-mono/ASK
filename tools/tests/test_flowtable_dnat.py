@@ -10,7 +10,7 @@ from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 from flowtable_connections_peer import Flow
 from flowtable_udp_wire import udp_capture_socket, udp_wire_payload
 from test_flowtable_connections import by_key, healthy, peer
-from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, WAN_IP, command,
+from test_flowtable_offload import (ARTIFACTS, DPORT, HEALTH_BASELINE, SPORT, WAN_IP, command,
                                    console_command, read, rig)  # noqa: F401
 from test_flowtable_policy import CONFIG, apply, candidate, stop
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
@@ -225,5 +225,6 @@ async def test_flowtable_dnat(rig, zero_checksum, double_nat=False):
                     await command(r.target, r.session, "conntrack", "-D", "-p", proto, "--orig-src", WAN_IP,
                         "--orig-dst", external, "--sport", str(sport), "--dport", str(PUBLIC_PORT), check=False)
             final = await r.state()
-            assert final["installs"] == final["deletes"] and final["errors"] == final["fatal"] == final["quarantine"] == 0, final
+            assert final["installs"] == final["deletes"] and final["fatal"] == final["quarantine"] == 0, final
+            assert final["errors"] == HEALTH_BASELINE["errors"], (final, HEALTH_BASELINE)
             r.record("dnat-cleanup", final)

@@ -6,7 +6,7 @@ import json
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import FLOWS, by_key, connections, peer  # noqa: F401
 from test_flowtable_module import table
-from test_flowtable_offload import command, upper_roundtrip, rig  # noqa: F401
+from test_flowtable_offload import HEALTH_BASELINE, command, upper_roundtrip, rig  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_tcp import software_tx
 
@@ -73,7 +73,7 @@ async def test_flowtable_device_dependencies(connections):
                 retired = await r.wait(lambda s: s["invalidation_done"] == 1 and not s["entries"])
                 assert retired["invalidated"] == 1 and retired["bindings"] == 2, retired
                 assert retired["handle_refs"] == retired["neighbour_refs"] == retired["quarantine"] == 0, retired
-                assert retired["fatal"] == retired["errors"] == 0, retired
+                assert retired["fatal"] == 0 and retired["errors"] == HEALTH_BASELINE["errors"], retired
                 assert retired["installs"] == before["installs"] and retired["deletes"] == before["deletes"] + 4
                 assert retired["rearms"] == before["rearms"], retired
                 transition = await p.rpc("stop", ids)

@@ -29,7 +29,7 @@ from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, host
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN, TopologyStack,
                        dut_vlan_subif, lan_vlan_subif)
 from mroute_capture import payload
-from test_flowtable_offload import command, console_command
+from test_flowtable_offload import HEALTH_BASELINE, command, console_command
 from test_mcast_e2e import mcast_bridge, wan_source_address  # noqa: F401
 from test_mroute_capacity import _daemon, _python
 
@@ -376,6 +376,8 @@ async def reload_adapter(r, label, standing, during):
         unloaded = False
         loaded = await r.proc()
         assert loaded["fatal"] == loaded["quarantine"] == 0, summary(loaded)
+        # The reload restarted the error count; health is measured from it.
+        HEALTH_BASELINE["errors"] = loaded["errors"]
     finally:
         try:
             if unloaded:

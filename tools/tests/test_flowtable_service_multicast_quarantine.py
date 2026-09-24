@@ -40,7 +40,8 @@ from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_h
                             stream, streamed, summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
-from test_flowtable_offload import command, console_command, hardware_proof, read, rig  # noqa: F401
+from test_flowtable_offload import (HEALTH_BASELINE, command, console_command, hardware_proof, read,  # noqa: F401
+                                    rig)
 from test_mcast_e2e import mcast_bridge, wan_source_address  # noqa: F401
 from test_mroute_capacity import _daemon
 
@@ -360,5 +361,7 @@ async def test_flowtable_service_multicast_quarantine_released_without_multicast
         assert loaded["rc"] == 0, loaded
         reloaded = await m.proc()
         assert reloaded["quarantine"] == reloaded["fatal"] == reloaded["bindings"] == 0, summary(reloaded)
+        # The reload restarted the error count; health is measured from it.
+        HEALTH_BASELINE["errors"] = reloaded["errors"]
         m.record("mcast-quarantine-released", {"parked": summary(parked), "admitted": summary(admitted),
                                                "unloaded": between["stdout"], "reloaded": summary(reloaded)})

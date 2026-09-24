@@ -670,7 +670,7 @@ async def test_flowtable_offload_reference_and_lifecycle(rig):
             removed = await r.delete_table()
         finally:
             await traffic
-        assert removed["quarantine"] == removed["errors"] == 0, removed
+        assert removed["quarantine"] == 0 and removed["errors"] == HEALTH_BASELINE["errors"], removed
         await r.exchange()
         assert (await r.state())["entries"] == 0
         await r.clear_ct()
@@ -684,7 +684,7 @@ async def test_flowtable_offload_reference_and_lifecycle(rig):
         assert (await r.state())["entries"] == 2
         await asyncio.sleep(2)
     expired = await r.wait(lambda s: s["entries"] == 0, timeout=40)
-    assert expired["quarantine"] == expired["errors"] == 0
+    assert expired["quarantine"] == 0 and expired["errors"] == HEALTH_BASELINE["errors"], expired
     r.record("idle-expiry", expired)
 
 
@@ -871,7 +871,8 @@ async def test_flowtable_offload_add_failures(rig):
         await r.wait(lambda s: s["rejects"] > before["rejects"])
         assert (await read(r.target, r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage")).strip() == "0"
         state = await r.delete_table()
-        assert state["errors"] == state["quarantine"] == 0 and state["installs"] == state["deletes"], state
+        assert state["errors"] == HEALTH_BASELINE["errors"] and state["quarantine"] == 0, state
+        assert state["installs"] == state["deletes"], state
         await r.clear_ct()
         r.record(f"add-failure-{stage}", state)
 
