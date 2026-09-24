@@ -991,7 +991,12 @@ One number is worth carrying forward because it is the design working rather
 than a shortfall. `ip -s mroute` lags the hardware by up to the fold's
 five-second interval, so a reader who wants it exact reads
 `/proc/cdx_flowtable` first — that read folds. A test that asked the kernel
-first saw 88% of a three-second stream and looked like a broken fold.
+first saw 88% of a three-second stream and looked like a broken fold. A group
+routed through a bridge, carried on the bridged entry, reaches the MFC in two
+passes: the bridged learner's refresh hands the entry's growth to the route,
+and the routed fold hands the route's to ipmr, each every five seconds. The
+`/proc` read runs only the second, so such a group can still trail by one
+bridged refresh after it.
 
 ## A189 follow-up — 2026-09-21
 

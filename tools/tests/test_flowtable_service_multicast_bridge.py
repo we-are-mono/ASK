@@ -643,7 +643,7 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
         assert row['in'] == TARGET_WAN_IF and row['smac'] == r.wan_mac.lower(), row
         assert routed['in'] == BRIDGE, routed
         assert routed['listeners'] == f'{TARGET_LAN_IF}/{ROUTED_VID}', routed
-        line, _ = await mroute_line(r.target, r.session, family, source, group)
+        line, mfc_before = await mroute_line(r.target, r.session, family, source, group)
         assert 'offload' in line, line
 
         result, before, after, cpu, idle = await _window(
@@ -657,9 +657,12 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
         assert counted >= FRAMING_COUNT * 0.95, (before, after)
         assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
         # ipmr's own counters are the classifier's, folded: a daemon
-        # ageing its routes sees the stream flow.
-        _, packets = await mroute_line(r.target, r.session, family, source, group)
-        assert packets >= FRAMING_COUNT, packets
+        # ageing its routes sees the stream flow. Carried on the bridged
+        # entry, the count reaches the MFC in two passes, the bridged
+        # learner's and then the routed one's, each on its own five-second
+        # timer; before that the MFC shows only what Linux forwarded itself.
+        grown = await _mfc_packets(r, group, source) - mfc_before
+        assert grown >= counted, (mfc_before, grown, counted)
 
         # The set-top box leaves. The group stays in hardware for the
         # routed copy alone: its root retires only when both are empty.
