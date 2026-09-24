@@ -50,8 +50,8 @@ def software_egress(ids, flows=FLOWS):
     return counts
 
 
-def unchanged(before, after, ids, flows=FLOWS):
-    healthy(after)
+def unchanged(before, after, ids, flows=FLOWS, bindings=2):
+    healthy(after, bindings)
     assert after["handle_refs"] == after["entries"], after
     old, new = by_key(before), by_key(after)
     for key in keys(ids, flows):
@@ -176,7 +176,7 @@ async def warm(r, p, ids, label, flows=FLOWS):
     pytest.fail(f"automatic hardware admission failed: {samples}")
 
 
-async def hardware(r, p, label, flows=FLOWS):
+async def hardware(r, p, label, flows=FLOWS, bindings=2):
     ids = list(range(len(flows)))
     before = await r.state()
     forwarded = await r.software_forwarded() if hasattr(r, "software_forwarded") else None
@@ -189,7 +189,7 @@ async def hardware(r, p, label, flows=FLOWS):
         # installed direction's offer is answered without it, so nothing here
         # should take RTNL at all; busy moving names an offer that did.
         assert after["busy"] == before["busy"], ("an offer took RTNL mid-window", before, after)
-    unchanged(before, after, ids, flows)
+    unchanged(before, after, ids, flows, bindings)
     assert before["installs"] == after["installs"] and before["deletes"] == after["deletes"], (before, after)
     old, new = by_key(before), by_key(after)
     for ident in ids:

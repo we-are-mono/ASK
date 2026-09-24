@@ -1798,7 +1798,10 @@ over them.
   is also the shape of an atomic reload and of a consumer's probe
   (`ft_bind_admissible()`), and the controller, finding bindings it does not
   own, reports "another flowtable owns the backend bindings" and leaves them
-  alone. That one is loud. The other is not: a foreign flowtable whose
+  alone -- or, when its own table is already installed and the other one binds
+  beside it, "another flowtable is bound beside this one" and keeps both,
+  rather than replacing its own into a drain the other table holds up. That
+  one is loud. The other is not: a foreign flowtable whose
   forward chain runs at a **lower priority number** than ASK's 10 wins
   `test_and_set_bit(IPS_OFFLOAD_BIT)` in `nft_flow_offload_eval()` and takes
   every flow. There is no packet state in which the earlier chain declines and

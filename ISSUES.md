@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A219.** ask-flowtable took a second flowtable bound beside its own for a table to repair, and replaced its own into a drain the other held up —
+  fixed (_:/^flowtable: keep the daemon's table while another is bound beside it_).
+
 - [x] **A218.** Linux never asked for a partially offloaded flow's hardware counters while software kept refreshing it —
   fixed (_:/^netfilter: poll a partially offloaded flow's hardware counters_).
 

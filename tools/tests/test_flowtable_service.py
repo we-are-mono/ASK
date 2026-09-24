@@ -463,6 +463,38 @@ async def test_flowtable_service_rendered_admission(service):
     assert f"ct original proto-dst {DPORT}" in policy[0], policy
 
 
+async def test_flowtable_service_foreign_table_beside(service):
+    """Another offload flowtable binds beside the service's live one -- a
+    consumer's own, or its check-mode probe -- which the adapter allows. The
+    service counts more bindings than its table has devices and keeps its
+    table and its flows through two health checks, rather than deleting the
+    table into a drain the other one holds up; it carries on once the other
+    table is gone."""
+    r = service
+    flows = [{**f, "lan": r.lan_ip} for f in FLOWS[:2]]
+    status = await service_status(r)
+    async with peer(r, flows, initial_ids=[0, 1]) as p:
+        await warm(r, p, [0, 1], "service-beside-baseline", flows)
+        before = await hardware(r, p, "service-beside-before", flows)
+        ports = f"devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload;"
+        await command(r.target, r.session, "nft",
+                      f"table inet ask_beside {{ flowtable beside {{ hook ingress priority 0; {ports} }}; }}")
+        try:
+            await r.wait(lambda s: s["bindings"] == 4)
+            await asyncio.sleep(11)  # two health checks
+            during = await hardware(r, p, "service-beside-during", flows, bindings=4)
+            assert (during["installs"], during["deletes"]) == (before["installs"], before["deletes"]), (
+                before, during)
+            assert (await service_status(r))["policy_hash"] == status["policy_hash"]
+        finally:
+            await command(r.target, r.session, "nft", "delete", "table", "inet", "ask_beside", check=False)
+        after = await r.wait(lambda s: s["bindings"] == 2)
+        await asyncio.sleep(6)
+        await hardware(r, p, "service-beside-after", flows)
+        assert (await service_status(r))["admission_ready"]
+        r.record("service-beside", {"before": before, "during": during, "after": after})
+
+
 async def test_flowtable_service_firewall_revocation(service):
     """Revoke a cached flow across a service stop, the firewall-maintenance
     procedure policy.md prescribes: stop acceleration, change the firewall,

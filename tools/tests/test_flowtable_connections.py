@@ -43,8 +43,10 @@ def keys(r, ids):
 # therefore means "no new errors", not "none ever": against an absolute zero
 # every test collected after that one fails on its predecessor's bookkeeping.
 # The other three are current state rather than counters and stay absolute.
-def healthy(state):
-    assert state["bindings"] == 2 and state["max_entries"] == 32768, state
+# A second offload table bound beside the rig's own adds its devices to
+# `bindings`; a caller that holds one passes the total it expects.
+def healthy(state, bindings=2):
+    assert state["bindings"] == bindings and state["max_entries"] == 32768, state
     assert state["entries"] == state["neighbour_refs"] == state["handle_refs"] == len(state["flows"]), state
     assert state["invalidated"] == state["fatal"] == state["quarantine"] == 0, state
     assert state["errors"] == HEALTH_BASELINE["errors"], (state, HEALTH_BASELINE)

@@ -353,6 +353,28 @@ def test_foreign_backend_bindings_are_never_replaced(controller):
         c.wait(c.ready)
 
 
+def test_foreign_table_bound_beside_ours_is_left_alone(controller):
+    """The adapter binds a second flowtable beside this one: a consumer's own,
+    or its offload probe mid-transaction. The backend then counts more
+    bindings than this table has devices. Replacing this table would delete it
+    and wait on a drain the other table holds up, so the daemon keeps it, says
+    why once, and refuses an explicit apply until the other table is gone."""
+    c = controller
+    with c.daemon():
+        c.wait(c.ready)
+        installs = len(c.calls("-f"))
+        c.backend(bindings=4)
+        time.sleep(0.6)
+        assert not c.calls("delete") and len(c.calls("-f")) == installs
+        assert c.log().count("bound beside") == 1, c.log()
+        result = c.run("apply", check=False)
+        assert result.returncode != 0 and "bound beside" in result.stderr, result.stderr
+        assert not c.calls("delete") and len(c.calls("-f")) == installs
+        c.backend(bindings=2)
+        time.sleep(0.4)
+        assert c.ready() and not c.calls("delete") and len(c.calls("-f")) == installs
+
+
 @pytest.mark.parametrize("field,value", [("fatal", 1), ("observe", 1)])
 def test_inactive_or_fatal_backend_is_not_rearmed(controller, field, value):
     c = controller

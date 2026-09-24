@@ -142,10 +142,11 @@ static int follow_devices(struct ft_ctx *ctx, const struct ft_policy *p,
 	return 0;
 }
 
-/* Whether the daemon is holding a table whose ports fell below two, and
- * whether it has an owned table whose devices it cannot read back: each is
- * logged once per episode rather than on every check. */
-static bool holding, unreadable;
+/* Whether the daemon is holding a table whose ports fell below two, whether it
+ * has an owned table whose devices it cannot read back, and whether another
+ * flowtable is bound beside its own: each is logged once per episode rather
+ * than on every check. */
+static bool holding, unreadable, beside;
 
 /* The apply transaction, mirroring the Python Runtime.apply(): drain the old
  * hardware before rebinding, never leave a foreign or half-applied table. */
@@ -196,6 +197,26 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			       "judging them by binding count");
 		}
 		unreadable = owned && installed.n < 0;
+		/* The adapter binds a second flowtable beside this one -- a
+		 * consumer's own, or its offload probe mid-transaction -- and
+		 * that shows only as more bindings than this table has devices.
+		 * The other table is not ours to judge, and replacing ours would
+		 * delete it and then wait on a drain the other one holds up:
+		 * keep both as they are until it is gone. */
+		if (owned && st.bindings > (installed.n >= 0 ? installed.n : p->ndevices)) {
+			if (!beside) {
+				fprintf(stderr, "ask-flowtable: another flowtable is bound beside this one; "
+					"keeping both\n");
+				ft_log(LOG_NOTICE, "another flowtable is bound beside this one; keeping both");
+			}
+			beside = true;
+			if (reconcile)
+				return 0;
+			snprintf(ctx->err, sizeof(ctx->err),
+				 "another flowtable is bound beside this one; not replacing it");
+			goto out;
+		}
+		beside = false;
 		if (reconcile && owned && !strcmp(inhash, hash) && !st.invalidated && !st.quarantine) {
 			/* Only "devices auto" compares the listed devices with
 			 * the policy's. An explicit list is covered by the hash,
