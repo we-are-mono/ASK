@@ -335,6 +335,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A206.** A flow admitted through a bridge port went on being bridged in hardware after STP blocked the port —
+  fixed (_:/^flowtable: retire flows bridged through a port STP stops_).
+
 - [x] **A205.** Hardware entries kept enqueuing to a port's old frame queues after an HTB tree switched it to or from CEETM —
   fixed (_:/^cdx: retire flows when a port's egress queues change_).
 

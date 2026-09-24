@@ -261,3 +261,68 @@ async def test_flowtable_service_bridge_membership(bridge_service):
         bridge_paths(final, r)
         for ident in (5, 6):
             await denied(r, p, ident)
+
+
+async def port_state(r):
+    rows = json.loads((await command(r.target, r.session, "bridge", "-j", "link", "show", "dev", TARGET_LAN_IF))["stdout"])
+    return rows[0]["state"]
+
+
+async def test_flowtable_service_bridge_stp(bridge_service):
+    """A port that stops forwarding takes every flow bridged through it out of
+    hardware at once, since the classifier has no idea of a port state and
+    would go on bridging through a blocked port. Nothing is readmitted while
+    it stays blocked, in either direction, and traffic alone readmits every
+    connection once it forwards again."""
+    r = bridge_service
+    guest = {"lan": ADDRESS, "netns": NETNS}
+    flows = [
+        {"id": 0, "proto": "udp", "sport": FIRST, "lan": r.lan_ip},
+        {"id": 1, "proto": "tcp", "sport": FIRST, "lan": r.lan_ip},
+        {"id": 2, "proto": "udp", "sport": FIRST, **guest},
+        {"id": 3, "proto": "tcp", "sport": FIRST, **guest},
+    ]
+    service = await supervision_status(r)
+    assert await port_state(r) == "forwarding"
+    probes = {0: (r.lan_ip, payload(0, (1 << 63) - 1, 256)), 2: (ADDRESS, payload(2, (1 << 63) - 1, 256))}
+    async with peer(r, flows, initial_ids=[0, 1, 2, 3], lease=300) as p:
+        await warm(r, p, [0, 1, 2, 3], "service-bridge-stp-baseline", flows)
+        initial = await hardware(r, p, "service-bridge-stp-baseline-hardware", flows)
+        bridge_paths(initial, r)
+        try:
+            # Spanning tree is off, so the port state is the operator's to set,
+            # exactly as a userspace STP daemon would set it.
+            await console_command(r.service_console, "bridge", "link", "set", "dev", TARGET_LAN_IF, "state", "4")
+            blocked_at = time.monotonic()
+            retired = await r.wait(lambda s: not s["flows"], timeout=5)
+            r.record("service-bridge-stp-retired", retired)
+            balanced(retired, initial["errors"])
+            # One retirement per connection: both directions share a handle.
+            assert retired["stp_invalidations"] - initial["stp_invalidations"] == len(flows), (initial, retired)
+            samples = []
+            while time.monotonic() - blocked_at < 6:
+                for ident, (lan, probe) in probes.items():
+                    r.echo.transport.sendto(probe, (lan, FIRST))
+                for ident in (0, 2):
+                    await denied(r, p, ident)
+                peer_state = await p.rpc("status")
+                assert not peer_state["errors"], ("a reply crossed the blocked port", peer_state)
+                state = await r.state()
+                samples.append({"seconds": time.monotonic() - blocked_at, "state": state})
+                balanced(state, initial["errors"])
+                assert not state["flows"], state
+            assert await port_state(r) == "blocking"
+            r.record("service-bridge-stp-blocked", samples)
+        finally:
+            if await port_state(r) != "forwarding":
+                await console_command(r.service_console, "bridge", "link", "set", "dev", TARGET_LAN_IF, "state", "3")
+        restored_at = time.monotonic()
+        await warm(r, p, [0, 1, 2, 3], "service-bridge-stp-readmitted", flows)
+        assert time.monotonic() - restored_at < 20
+        after = await hardware(r, p, "service-bridge-stp-hardware", flows)
+        balanced(after, initial["errors"])
+        bridge_paths(after, r)
+        assert after["stp_invalidations"] == retired["stp_invalidations"], (retired, after)
+        assert all(after[k] == initial[k] for k in ("vlan_records", "vlan_slots")), (initial, after)
+        assert await supervision_status(r) == service
+        r.record("service-bridge-stp-recovery", {"initial": initial, "retired": retired, "after": after})

@@ -269,6 +269,7 @@ static atomic64_t ft_mtu_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_link_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mac_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_fdb_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_stp_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_qos_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_admission_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_ipsec_invalidations = ATOMIC64_INIT(0);
@@ -1692,6 +1693,15 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 			 * a stacked device hides a tag from this walk and is
 			 * declined by the same requirement. */
 			if (netdev_master_upper_dev_get(physical) != logical)
+				return -EOPNOTSUPP;
+			/* The bridge forwards nothing through a port STP has
+			 * taken out of FORWARDING, and its forward-path walk
+			 * does not ask; the event that retires such a port's
+			 * flows is deferred, so admission asks here. With MST
+			 * the state is per VLAN and not readable from here, so
+			 * such a bridge's ports stay in software. */
+			if (br_mst_enabled(logical) ||
+			    br_port_get_stp_state(physical) != BR_STATE_FORWARDING)
 				return -EOPNOTSUPP;
 			vid = ft_bridge_vlan(logical, physical, inner, &count);
 			if (vid < 0)
@@ -3523,6 +3533,20 @@ static int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *pt
 static bool ft_mc_swdev_obj(unsigned long event,
 			    struct switchdev_notifier_port_obj_info *obj);
 
+/* Whether a port attribute takes a bridge port, or one MSTI of it, out of
+ * FORWARDING. */
+static bool ft_stp_stopped(const struct switchdev_attr *attr)
+{
+	switch (attr->id) {
+	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
+		return attr->u.stp_state != BR_STATE_FORWARDING;
+	case SWITCHDEV_ATTR_ID_PORT_MST_STATE:
+		return attr->u.mst_state.state != BR_STATE_FORWARDING;
+	default:
+		return false;
+	}
+}
+
 static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	const struct switchdev_notifier_port_attr_info *attr;
@@ -3567,6 +3591,14 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 			 * snapshot, not the event's coarse boolean, is authority. */
 			if (dev && net_eq(dev_net(dev), &init_net))
 				ft_mr_kick();
+			/* A port STP takes out of FORWARDING carries nothing in
+			 * software from here on, while its hardware entries would
+			 * forward on in both directions under the shared handle.
+			 * Admission refuses such a port too; this retires what was
+			 * admitted before. An MSTI leaving FORWARDING retires the
+			 * whole port: which VLANs it covers is not readable here. */
+			if (dev && ft_stp_stopped(attr->attr))
+				ft_device_retire(dev, &ft_stp_invalidations);
 			return NOTIFY_DONE;
 		default:
 			break;
@@ -7595,7 +7627,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nqos_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nstp_invalidations %lld\nqos_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
 		   cdx_ft_observing(), ft_bound, ft_passive, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -7607,6 +7639,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_link_invalidations),
 		   atomic64_read(&ft_mac_invalidations),
 		   atomic64_read(&ft_fdb_invalidations),
+		   atomic64_read(&ft_stp_invalidations),
 		   atomic64_read(&ft_qos_invalidations),
 		   atomic64_read(&ft_admission_invalidations),
 		   atomic64_read(&ft_ipsec_invalidations),

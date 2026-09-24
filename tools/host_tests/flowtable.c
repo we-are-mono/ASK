@@ -267,7 +267,7 @@ struct bridge_vlan_info { u16 vid, flags; };
 struct net_device { int ifindex, refs, mtu, ip6_mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
                     unsigned short type; unsigned char addr_len; void *priv;
                     struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto;
-                    bool bridge, vlan_filtering; struct net_device *master;
+                    bool bridge, vlan_filtering, stp_blocked, mst; struct net_device *master;
                     u16 br_proto, pvid; struct br_vlan_entry br_vlans[BR_MAX_VLANS];
                     unsigned br_nvlans; };
 #define netdev_priv(d) ((d)->priv)
@@ -296,6 +296,16 @@ static bool ipv6_addr_is_multicast(const struct in6_addr *a)
 static bool is_vlan_dev(const struct net_device *d) { return d->real_dev && !d->bridge; }
 static bool netif_is_bridge_master(const struct net_device *d) { return d->bridge; }
 static struct net_device *netdev_master_upper_dev_get(struct net_device *d) { return d->master; }
+/* A port forwards unless a case blocks it, and MST is off unless a case turns
+ * it on: the state every other case's bridge is in. */
+#define BR_STATE_DISABLED 0
+#define BR_STATE_LISTENING 1
+#define BR_STATE_LEARNING 2
+#define BR_STATE_FORWARDING 3
+#define BR_STATE_BLOCKING 4
+static u8 br_port_get_stp_state(const struct net_device *d)
+{ return d->stp_blocked ? BR_STATE_BLOCKING : BR_STATE_FORWARDING; }
+static bool br_mst_enabled(const struct net_device *d) { assert(d->bridge); return d->mst; }
 /* The bridge queries the adapter mirrors br_vlan_fill_forward_path_pvid() and
  * br_vlan_fill_forward_path_mode() through. br_vlan_get_proto() reports host
  * order, and br_vlan_get_pvid() succeeds even with no PVID configured -- the
@@ -367,7 +377,11 @@ enum switchdev_attr_id {
     SWITCHDEV_ATTR_ID_VLAN_MSTI,
 };
 struct switchdev_obj { enum switchdev_obj_id id; };
-struct switchdev_attr { enum switchdev_attr_id id; };
+struct switchdev_mst_state { u16 msti; u8 state; };
+struct switchdev_attr {
+    enum switchdev_attr_id id;
+    union { u8 stp_state; struct switchdev_mst_state mst_state; } u;
+};
 struct switchdev_notifier_port_obj_info {
     struct switchdev_notifier_info info; /* must be first */
     const struct switchdev_obj *obj;
@@ -654,7 +668,7 @@ static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned int ft_qos_mark_mask, ft_qos_default_class;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_qos_invalidations, ft_admission_invalidations;
+static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static u64 atomic64_read_acquire(u64 *v) { return *v; }
 static u64 ft_ipsec_genid, xfrm_genid, ft_ipsec_invalidations, ft_ipsec_policy_invalidations;
@@ -1970,6 +1984,17 @@ static void test_bridge(void)
     /* The Ethernet source is still the port's, because that is the address
      * flow_offload_eth_src() writes for a neighbour-output flow. */
     assert(!memcmp(decoded.src_mac, out.dev_addr, ETH_ALEN));
+    /* The bridge forwards nothing through a port STP has taken out of
+     * FORWARDING, and its forward-path walk does not ask, so admission has
+     * to. With MST the state is per VLAN and unreadable here: such a
+     * bridge's ports stay in software. */
+    out.stp_blocked = true;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    out.stp_blocked = false;
+    br.mst = true;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    br.mst = false;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
 
     /* br-lan.100 over a bridge whose egress port is tagged for 100: the tag
      * comes from the VLAN device and the bridge keeps it. */
@@ -2327,8 +2352,13 @@ static void test_bridge_fdb(void)
         SWITCHDEV_ATTR_ID_VLAN_MSTI,
     };
     for (unsigned i = 0; i < ARRAY_SIZE(changes); i++) {
+        /* A port going (or staying) FORWARDING retires nothing. */
         struct switchdev_attr change = { .id = changes[i] };
         unsigned kicks = mroute_kicks;
+        if (changes[i] == SWITCHDEV_ATTR_ID_PORT_STP_STATE)
+            change.u.stp_state = BR_STATE_FORWARDING;
+        if (changes[i] == SWITCHDEV_ATTR_ID_PORT_MST_STATE)
+            change.u.mst_state.state = BR_STATE_FORWARDING;
         set.attr = &change;
         set.info.dev = &out;
         assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
@@ -2340,6 +2370,35 @@ static void test_bridge_fdb(void)
     }
     set.attr = NULL;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+
+    /* A port STP takes out of FORWARDING retires every flow through it:
+     * software stops forwarding there at once, and the hardware would carry
+     * on in both directions under the shared handle. Blocking, disabled and
+     * an MSTI leaving FORWARDING all count. Other ports are left alone. */
+    const u8 stopped[] = { BR_STATE_BLOCKING, BR_STATE_DISABLED, BR_STATE_LISTENING };
+    for (unsigned i = 0; i < ARRAY_SIZE(stopped); i++) {
+        struct switchdev_attr stp = { .id = SWITCHDEV_ATTR_ID_PORT_STP_STATE,
+                                      .u.stp_state = stopped[i] };
+        u64 before = ft_stp_invalidations;
+        set.attr = &stp;
+        set.info.dev = &decoy;
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(ft_stp_invalidations == before);
+        set.info.dev = &out;
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(ft_stp_invalidations == before + 1);
+        assert(!atomic_read(&ft_invalid) && !set.handled);
+        handle.invalid = false;
+    }
+    struct switchdev_attr msti = { .id = SWITCHDEV_ATTR_ID_PORT_MST_STATE,
+                                   .u.mst_state = { .msti = 1, .state = BR_STATE_BLOCKING } };
+    u64 before_mst = ft_stp_invalidations;
+    set.attr = &msti;
+    set.info.dev = &out;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    assert(ft_stp_invalidations == before_mst + 1);
+    handle.invalid = false;
+    set.attr = NULL;
 
     /* A port whose egress queues changed under it -- an HTB tree coming or
      * going -- re-installs everything that transmits on it: its flows are
