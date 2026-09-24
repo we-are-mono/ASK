@@ -1,0 +1,101 @@
+From cc3cf03c231bcd12bab7690ff5dd5530264c201c Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Thu, 24 Sep 2026 01:55:38 +0200
+Subject: [PATCH] netfilter: nf_tables: say when a commit is still being
+ applied
+
+A commit bumps net->nft.base_seq and flips the generation cursor, then
+goes on applying the rest of the transaction: base chain policies,
+element timeouts, the set backends' commit updates. Something outside
+nf_tables that caches a verdict for a generation cannot tell when that
+is over. The commit mutex and the gc_seq busy mark are private to the
+pernet state, whose id is not exported, and nfnetlink releases its
+subsystem lock before the batch runs.
+
+Add net->nft.commit_applying, set just before base_seq is published and
+cleared with a release store once the set updates are in, and
+nft_commit_in_progress() to read it with an acquire. A reader that has
+seen a commit's base_seq with smp_load_acquire() and then finds it
+clear sees that commit fully applied. The field sits in the padding
+after gencursor, so struct net does not grow, and the reader is an
+inline load with no dependency on the nf_tables module.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ include/net/netfilter/nf_tables.h | 19 +++++++++++++++++++
+ include/net/netns/nftables.h      |  2 ++
+ net/netfilter/nf_tables_api.c     | 10 ++++++++++
+ 3 files changed, 31 insertions(+)
+
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index f4b59915a49c..f8301f226852 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -1937,4 +1937,23 @@ static inline u64 nft_net_tstamp(const struct net *net)
+ 	return nft_pernet(net)->tstamp;
+ }
+ 
++/**
++ * nft_commit_in_progress - whether a commit in @net is still applying itself
++ * @net: the network namespace
++ *
++ * A commit bumps net->nft.base_seq and flips the generation cursor, then goes
++ * on applying the rest of the transaction: base chain policies, element
++ * timeouts, set backend updates. This is true from just before the bump until
++ * all of that is in place. A reader that loaded base_seq with
++ * smp_load_acquire(), as the packet path's set lookups do, and then finds this
++ * false sees the commit that produced that base_seq fully applied.
++ *
++ * It lives beside base_seq in struct net, so a reader outside nf_tables needs
++ * neither its pernet id nor a symbol from it.
++ */
++static inline bool nft_commit_in_progress(const struct net *net)
++{
++	return smp_load_acquire(&net->nft.commit_applying);
++}
++
+ #endif /* _NET_NF_TABLES_H */
+diff --git a/include/net/netns/nftables.h b/include/net/netns/nftables.h
+index 99dd166c5d07..9fb5adf835f0 100644
+--- a/include/net/netns/nftables.h
++++ b/include/net/netns/nftables.h
+@@ -5,6 +5,8 @@
+ struct netns_nftables {
+ 	unsigned int		base_seq;
+ 	u8			gencursor;
++	/* Set while a commit applies itself; see nft_commit_in_progress(). */
++	u8			commit_applying;
+ };
+ 
+ #endif
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 03dd9d1db12f..5c30a237a3a5 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -10303,6 +10303,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+ 	while (++base_seq == 0)
+ 		;
+ 
++	/* Visible to anyone who sees the new base_seq, through the release
++	 * below; see nft_commit_in_progress().
++	 */
++	WRITE_ONCE(net->nft.commit_applying, 1);
++
+ 	/* pairs with smp_load_acquire in nft_lookup_eval */
+ 	smp_store_release(&net->nft.base_seq, base_seq);
+ 
+@@ -10534,6 +10539,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+ 
+ 	nft_set_commit_update(&set_update_list);
+ 
++	/* Everything a packet can see of this transaction is in place.
++	 * Pairs with smp_load_acquire in nft_commit_in_progress().
++	 */
++	smp_store_release(&net->nft.commit_applying, 0);
++
+ 	nft_commit_notify(net, NETLINK_CB(skb).portid);
+ 	nf_tables_gen_notify(net, skb, NFT_MSG_NEWGEN);
+ 	nf_tables_commit_audit_log(&adl, nft_base_seq(net));
+-- 
+2.47.3
+
