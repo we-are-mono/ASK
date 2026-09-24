@@ -21,7 +21,8 @@ def test_mroute_fold(tmp_path):
     (tmp_path / "mroute_types.inc").write_text(
         source[start:source.index("};", start) + 3] + structs)
     (tmp_path / "mroute_fold.inc").write_text(
-        function(source, "ft_mc_count_delta") + function(source, "ft_mr_fold"))
+        function(source, "ft_mc_count_delta") + function(source, "ft_mr_fold")
+        + function(source, "ft_mr_route_baseline"))
     binary = tmp_path / "fold"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

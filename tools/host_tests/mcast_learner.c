@@ -781,6 +781,17 @@ static void pass(void)
     ft_mc_route_feedback();
 }
 
+/* The routed learner taking a route back, where what it counted does not
+ * matter to the case. */
+static void withdraw(struct ft_mc_route *r)
+{
+    struct cdx_ft_counters last;
+    u32 series;
+    u8 tags;
+
+    ft_mc_route_withdraw(r, &last, &tags, &series);
+}
+
 static void reset(void)
 {
     LIST_HEAD(dead);
@@ -793,8 +804,7 @@ static void reset(void)
     free_lists(&dead, &gone);
     /* Routes belong to the routed learner, which withdraws them. */
     while (ft_mc_routes.next != &ft_mc_routes)
-        ft_mc_route_withdraw(list_entry(ft_mc_routes.next,
-                                        struct ft_mc_route, list));
+        withdraw(list_entry(ft_mc_routes.next, struct ft_mc_route, list));
     ft_mc_taps_publish(NULL, 0, false);
     BR.mrouter = BR2.mrouter = false;
     BR.flags = BR2.flags = 0;
@@ -1661,6 +1671,11 @@ static void one_stream_both_learners(void)
     ft_mc_route_publish(&r1, &want);
     assert(!ft_mc_carriable(f) && !ft_mc_installable(f));
     assert(!strcmp(ft_mc_state(f), "refused-listener"));
+    /* Out of hardware, the route carried by nothing. It keeps the framing
+     * of the flow that last carried it: that is what the count it holds was
+     * made with, and what the fold takes off it when the route goes. */
+    pass();
+    assert(!f->hw && !r1.carried && r1.in_tags == 1);
     route_want(&want, 289, S, G, &P3, 1);
     for (unsigned i = 1; i < CDX_MC_MAX_LISTENERS; i++) {
         want.listener[i] = want.listener[0];
@@ -1695,14 +1710,23 @@ static void one_stream_both_learners(void)
     /* The route goes too. Every pointer to it is cleared before its owner
      * frees it, and with neither learner naming the flow, it retires. */
     {
-        u32 run = r1.series;
+        struct cdx_ft_counters last;
+        u32 run = r1.series, series = 0;
+        u8 tags = 9;
 
         r1.stats.packets = 5;
         r1.stats.bytes = 5 * 578;
-        ft_mc_route_withdraw(&r1);
+        /* What it counted is handed to its owner as it goes, with the
+         * framing and the run that count belongs to, for the MFC entry. */
+        assert(ft_mc_route_withdraw(&r1, &last, &tags, &series));
+        assert(last.packets == 5 && last.bytes == 5 * 578);
+        assert(tags == 1 && series == run);
         /* The count starts from zero again, and a new series says so,
          * whoever reads it next. */
         assert(r1.series == run + 1 && !r1.stats.packets && !r1.stats.bytes);
+        /* Nothing is left to hand over a second time. */
+        assert(!ft_mc_route_withdraw(&r1, &last, &tags, &series));
+        assert(!last.packets && r1.series == run + 2);
     }
     assert(!r1.linked && !f->route && !f->carried_route && f->stale);
     assert(!r1.carried && !r1.listeners && !r1.bridge);
@@ -1737,7 +1761,7 @@ static void one_stream_both_learners(void)
     ft_mc_route_publish(&r1, &want);
     pass();
     assert(f->route == &r1 && f->hw);
-    ft_mc_route_withdraw(&r1);
+    withdraw(&r1);
     pass();
     assert(!f->hw && !strcmp(ft_mc_state(f), "refused-routed"));
     /* Not a router: the tap sees nothing, and the flow is the box's. */
@@ -1815,7 +1839,7 @@ static void one_stream_both_learners(void)
     answer(&P1, S, 289, BR_MCAST_TO_HOST_ROUTER, 1, &P2);
     pass();
     assert(ft_mc_flow_count == 1 && f->ports == 1 && f->hw);
-    ft_mc_route_withdraw(&r1);
+    withdraw(&r1);
 
     /* A bridge turning promiscuous hands the host everything as a router
      * does, and tells nobody: no switchdev attribute, no netdev event. The
@@ -1851,7 +1875,7 @@ static void one_stream_both_learners(void)
     BR.flags &= ~IFF_PROMISC;
     ft_mc_route_publish(&r1, &want);
     assert(!r1.learns);
-    ft_mc_route_withdraw(&r1);
+    withdraw(&r1);
 }
 
 static void the_dedup_slots(void)
@@ -1938,7 +1962,7 @@ static void the_dedup_slots(void)
     assert(ft_mc_record(&o));
     ft_mc_drain();
     assert(flow(&P1, S, 0));
-    ft_mc_route_withdraw(&r1);
+    withdraw(&r1);
 
     /* Several slots: two streams interleaving are each recorded once, and a
      * slot is reused only after FT_MC_SEEN_SLOTS others. */
@@ -2175,7 +2199,7 @@ static void devices_and_bridges_change(void)
         assert(!ft_mc_tap_count && !only_group()->ports);
         pass();
         assert(!ft_mc_count);
-        ft_mc_route_withdraw(&r1);
+        withdraw(&r1);
     }
 }
 
@@ -2416,7 +2440,7 @@ static void the_worker_records_what_the_drain_replays(void)
     drain_port = &P3;
     drain_rc = 1;
     before_begin = tc_drains_and_counts;
-    ft_mc_route_withdraw(&r1);
+    withdraw(&r1);
     ft_mc_work_fn(NULL);
     assert(!before_begin && !drain_rc && drain_replaces == 1 && !stale_live);
     assert(!flow(&P1, S, 289) && !ft_mc_flow_count && dels == d0 + 1);

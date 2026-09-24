@@ -5560,10 +5560,18 @@ static bool ft_mc_route_publish(struct ft_mc_route *r,
 
 /* Take a route back. Its flow loses those copies at the worker's next pass,
  * and is retired then if nothing else names it. Safe on a route that was never
- * published, and after ft_mc_exit(), which unlinks every route itself. */
-static void ft_mc_route_withdraw(struct ft_mc_route *r)
+ * published, and after ft_mc_exit(), which unlinks every route itself.
+ *
+ * `last` is what the route had counted when it went, with the framing and
+ * series that count belongs to: taken in the hold that zeroes it, after every
+ * flow that could add to it has let go, so nothing counted is in neither.
+ * Returns whether there was any, for the owner to fold. */
+static bool ft_mc_route_withdraw(struct ft_mc_route *r,
+				 struct cdx_ft_counters *last, u8 *in_tags,
+				 u32 *series)
 {
 	struct ft_mc_flow *f;
+	bool counted;
 
 	mutex_lock(&ft_mc_lock);
 	if (r->linked) {
@@ -5585,6 +5593,10 @@ static void ft_mc_route_withdraw(struct ft_mc_route *r)
 		schedule_work(&ft_mc_work);
 	mutex_unlock(&ft_mc_lock);
 	spin_lock_bh(&ft_mc_route_lock);
+	counted = r->stats.packets || r->stats.bytes;
+	*last = r->stats;
+	*in_tags = r->in_tags;
+	*series = r->series;
 	r->carried = false;
 	memset(&r->stats, 0, sizeof(r->stats));
 	/* The routed learner would not miss this one: a withdrawn route
@@ -5594,6 +5606,7 @@ static void ft_mc_route_withdraw(struct ft_mc_route *r)
 	 * resting on when the count is read. */
 	r->series++;
 	spin_unlock_bh(&ft_mc_route_lock);
+	return counted;
 }
 
 /* What the bridged learner last said about a route: whether its copies are in
@@ -5951,7 +5964,11 @@ static bool ft_mc_route_feedback(void)
 		spin_lock_bh(&ft_mc_route_lock);
 		changed |= r->carried != carried;
 		r->carried = carried;
-		r->in_tags = tags;
+		/* Kept while nothing carries it: the count the route holds was
+		 * made with the framing of the flow that last did, and is
+		 * folded with it when the route goes. */
+		if (carried)
+			r->in_tags = tags;
 		spin_unlock_bh(&ft_mc_route_lock);
 	}
 	return changed;
@@ -9918,6 +9935,15 @@ static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c,
  * derives it again -- a bridge going down and coming back leaves the route
  * published and its count going on, and a baseline taken from zero then would
  * add everything the route had carried to the MFC's count a second time. */
+static void ft_mr_route_baseline(struct ft_mr_group *g, u32 series)
+{
+	if (series == g->folded_series)
+		return;
+	g->folded_series = series;
+	g->folded_packets = g->folded_bytes = 0;
+	g->fold_suspect = false;
+}
+
 static bool ft_mr_counters(struct ft_mr_group *g, struct cdx_ft_counters *c,
 			   u8 *tags)
 {
@@ -9927,15 +9953,38 @@ static bool ft_mr_counters(struct ft_mr_group *g, struct cdx_ft_counters *c,
 	if (g->hw)
 		return cdx_mc_group_stats(g->hw, c);
 	if (g->route && ft_mc_route_state(g->route, c, tags, &series)) {
-		if (series != g->folded_series) {
-			g->folded_series = series;
-			g->folded_packets = g->folded_bytes = 0;
-			g->fold_suspect = false;
-		}
+		ft_mr_route_baseline(g, series);
 		return true;
 	}
 	memset(c, 0, sizeof(*c));
 	return false;
+}
+
+/* Take a group's route back, and fold what it counted since the last fold
+ * first: the route's count goes to zero with it, and what ipmr would have
+ * counted of those frames is the MFC's all the same. Folded against the
+ * baseline of its own run, and so called while that is still the baseline --
+ * before an entry of the group's own is added, which takes the baseline from
+ * zero, and before the group lets go of the MFC entry. What a bridged entry
+ * carrying the route matched since the bridged learner last sampled it is
+ * not in the count yet and is not folded: sampling it here, off that
+ * learner's schedule, would shorten the interval its ageing judges an entry
+ * idle by.
+ *
+ * Takes ft_mc_lock for the withdrawal and ft_mr_lock for the fold, one after
+ * the other and never nested, so it is called holding neither. */
+static void ft_mr_route_retire(struct ft_mr_group *g)
+{
+	struct cdx_ft_counters last;
+	u32 series;
+	u8 tags;
+
+	if (!ft_mc_route_withdraw(g->route, &last, &tags, &series))
+		return;
+	mutex_lock(&ft_mr_lock);
+	ft_mr_route_baseline(g, series);
+	ft_mr_fold(g, &last, tags);
+	mutex_unlock(&ft_mr_lock);
 }
 
 /* The copies half of the installed set: the listeners, what was derived from
@@ -9982,9 +10031,11 @@ static void ft_mr_group_free(struct ft_mr_group *g)
 	g->hw_in = NULL;
 	ft_mr_watch_drop(g);
 	/* Off the bridged learner's list before it is freed: that is what
-	 * clears every pointer the bridged groups hold to it. */
+	 * clears every pointer the bridged groups hold to it. And what it
+	 * counted since the last fold into the MFC entry while the group still
+	 * holds it: at unload the entry outlives the adapter. */
 	if (g->route) {
-		ft_mc_route_withdraw(g->route);
+		ft_mr_route_retire(g);
 		kfree(g->route);
 	}
 	mr_cache_put(g->mfc);
@@ -10559,6 +10610,14 @@ again:
 		mutex_unlock(&ft_mr_lock);
 		rtnl_unlock();
 
+		/* Not routed through a bridge from here on: what it published,
+		 * if it ever did, is taken back, and what that counted since the
+		 * last fold is folded first -- here, before an entry of its own
+		 * can be added below and take the baseline from zero. It takes
+		 * ft_mc_lock, so it runs under no lock of this learner. */
+		if (!via && target->route)
+			ft_mr_route_retire(target);
+
 		/* A new root needs its key to itself. Any other group of this
 		 * learner holding it arrives on the same port, from the same
 		 * source to the same group -- another VLAN of the port, which
@@ -10647,9 +10706,8 @@ again:
 		}
 
 		/* Routed through a bridge: the copies are the bridged group's to
-		 * carry, and whether it does is this group's state. Anything
-		 * else takes back what it published, if it ever did. Both take
-		 * ft_mc_lock, so neither runs under this learner's lock. */
+		 * carry, and whether it does is this group's state. It takes
+		 * ft_mc_lock, so it runs under no lock of this learner. */
 		if (via) {
 			rc = ft_mr_publish(target, &plan);
 			if (rc < 0)
@@ -10657,8 +10715,6 @@ again:
 			else
 				state = rc ? FT_MR_INSTALLED : FT_MR_BRIDGED;
 			rc = min(rc, 0);
-		} else if (target->route) {
-			ft_mc_route_withdraw(target->route);
 		}
 
 		if (!recorded) {
@@ -10762,7 +10818,16 @@ static void ft_mr_exit(void)
 	}
 	list_for_each_entry_safe(g, tmp, &ft_mr_groups, list) {
 		if (g->hw) {
+			struct cdx_ft_counters last;
+
 			cdx_ft_begin();
+			/* What the entry counted since the last fold, into the
+			 * MFC entry, which outlives the adapter; the worker's own
+			 * deletes read it the same way. */
+			mutex_lock(&ft_mr_lock);
+			if (cdx_mc_group_stats(g->hw, &last))
+				ft_mr_fold(g, &last, g->in_tags);
+			mutex_unlock(&ft_mr_lock);
 			cdx_mc_group_del(&g->hw);
 			cdx_ft_end();
 		}

@@ -264,6 +264,9 @@ file's git history.
 - [x] **A229.** get_ofport_info() collected an offline port's table types as bits of its flags word, where types 8, 9, 12 and 13 are OF_FQID_VALID, IN_USE and the port type —
   fixed (_:/^cdx: keep an offline port's table types out of its flags_).
 
+- [x] **A228.** A group leaving a bridge, or freed, dropped its route's count since the last fold, and unload dropped its entry's, so `ip -s mroute` under-counted —
+  fixed (_:/^flowtable: fold a routed group's last count when it stops being carried_).
+
 - [x] **A227.** An SA added over netlink got an MTU less only its headers (the state is not yet valid then), so the DF check sent IPv4 DF packets up to ICV, trailer and padding over the SA's MTU to SEC and out larger than the port —
   fixed (_:/^cdx: program an SA's expansion as the whole of ESP's_).
 

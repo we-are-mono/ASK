@@ -184,5 +184,25 @@ int main(void)
         assert(mfc.mfc_un.res.lastuse == 6000);
         assert(!g.fold_suspect);
     }
+
+    /* A route's run the group has not folded any of, after an entry of its
+     * own: the route's count starts from zero and is folded from there. Left
+     * against the entry's baseline, well above it, the count would read as
+     * one gone backwards and add nothing. */
+    {
+        struct cdx_ft_counters route = { 7, 7 * FRAME };
+        long before = atomic_long_read(&mfc.mfc_un.res.pkt);
+
+        g.hw = NULL;
+        g.in_tags = 0;
+        assert(g.folded_packets > route.packets && !g.folded_series);
+        ft_mr_route_baseline(&g, 3);
+        assert(g.folded_series == 3 && !g.folded_packets && !g.fold_suspect);
+        ft_mr_fold(&g, &route, 0);
+        assert(atomic_long_read(&mfc.mfc_un.res.pkt) == before + 7);
+        /* The same run again is no new start: the baseline stands. */
+        ft_mr_route_baseline(&g, 3);
+        assert(g.folded_packets == 7);
+    }
     return 0;
 }

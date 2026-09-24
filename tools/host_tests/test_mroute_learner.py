@@ -415,9 +415,15 @@ def test_the_learners_share_streams_not_keys():
     assert "ft_mc_claim" not in source, "the address-pair register is gone"
     worker = function(source, "ft_mr_work_fn")
     # A parent on a bridge installs nothing: its copies are published, and
-    # anything else takes back what it once published.
+    # anything else takes back what it once published, folding what that
+    # counted first -- before an entry of its own can be added and take the
+    # baseline from zero.
     assert "ft_mr_publish(target, &plan)" in worker
-    assert "ft_mc_route_withdraw(target->route)" in worker
+    retire = worker.index("ft_mr_route_retire(target)")
+    assert retire < worker.index("cdx_mc_group_add(&plan.spec, &hw)")
+    assert "ft_mc_route_withdraw(" not in worker
+    body = function(source, "ft_mr_route_retire")
+    assert body.index("ft_mc_route_withdraw(") < body.index("mutex_lock(&ft_mr_lock)")
     assert "(installed || (state == FT_MR_PENDING && !via))" in worker, (
         "a group routed through a bridge must never reach cdx_mc_group_add")
     # Each learner keeps its own collisions: two MFC entries on one port with
@@ -445,7 +451,10 @@ def test_the_routed_learner_reaches_the_bridged_one_only_through_its_door():
     taps = function(source, "ft_mr_publish_taps")
     assert taps.index("mutex_unlock(&ft_mr_lock);") < taps.index("ft_mc_taps_publish(")
     free = function(source, "ft_mr_group_free")
-    assert free.index("ft_mc_route_withdraw(g->route)") < free.index("kfree(g->route)")
+    # And what the route counted is folded while the group still holds the
+    # MFC entry.
+    assert free.index("ft_mr_route_retire(g)") < free.index("kfree(g->route)") < \
+        free.index("mr_cache_put(g->mfc)")
     for name in ("ft_mc_route_publish", "ft_mc_route_withdraw", "ft_mc_taps_publish"):
         body = function(source, name)
         assert "mutex_lock(&ft_mc_lock)" in body and "ft_mr_lock" not in body
@@ -522,7 +531,8 @@ def test_the_counter_fold_restates_the_units():
     assert "ft_mc_route_state(g->route, c, tags, &series)" in counters
     # A route's count is taken from zero again only when its series says it
     # started again, never because the group derived its bridge anew.
-    assert "if (series != g->folded_series) {" in counters
+    assert "ft_mr_route_baseline(g, series);" in counters
+    assert "if (series == g->folded_series)" in function(source, "ft_mr_route_baseline")
     assert "plan->via && !g->via" not in function(source, "ft_mr_record")
     for caller in ("ft_mr_stats_fn", "ft_mr_rows"):
         assert "if (ft_mr_counters(g, &stats, &tags))" in function(source, caller)

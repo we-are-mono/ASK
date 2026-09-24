@@ -411,13 +411,22 @@ static bool ft_mc_route_publish(struct ft_mc_route *r, const struct ft_mc_route 
     r->carried = carried;
     return carried;
 }
-static void ft_mc_route_withdraw(struct ft_mc_route *r)
+/* A published route holds what its carrying flow counted, `bridged_count`
+ * here, and hands it back as it goes. */
+static bool ft_mc_route_withdraw(struct ft_mc_route *r, struct cdx_ft_counters *last,
+                                 u8 *in_tags, u32 *series)
 {
+    bool counted = r->linked;
+
     bridged_side();
     withdrawals++;
+    *last = counted ? bridged_count : (struct cdx_ft_counters){ 0, 0 };
+    *in_tags = 1;
+    *series = r->series;
     r->linked = false;
     r->carried = false;
     r->series++;
+    return counted;
 }
 static bool ft_mc_route_state(struct ft_mc_route *r, struct cdx_ft_counters *stats,
                               u8 *in_tags, u32 *series)
@@ -607,10 +616,24 @@ static bool cdx_mc_group_stats(struct cdx_mc_group *hw, struct cdx_ft_counters *
     *c = hw_count;
     return true;
 }
+/* What the last fold was given, whether the group had an entry of its own
+ * and that entry was in hardware when it was made, and the baseline and run
+ * it was folded against. */
 static unsigned folded_tags;
 static struct cdx_ft_counters folded;
+static bool folded_own, folded_live;
+static u64 folded_base;
+static u32 folded_run;
 static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c, u8 tags)
-{ folds++; folded = *c; folded_tags = tags; }
+{
+    folds++;
+    folded = *c;
+    folded_tags = tags;
+    folded_own = g->hw != NULL;
+    folded_live = hardware.live;
+    folded_base = g->folded_packets;
+    folded_run = g->folded_series;
+}
 /* The forwarding check's registration, as the worker asks for it. A failed
  * one is counted in /proc, which is not compiled here. */
 static bool confirm_hooked[2];
@@ -1148,13 +1171,73 @@ int main(void)
         assert(folds == folding);
         /* Its copies are the bridged group's, rebuilt by the other half. */
         assert(ft_mr_egress_mark(&output[0]) == 0 && !g->egress_stale);
-        /* The parent moving back to a port takes the route back. */
+        /* The parent moving back to a port takes the route back, and what
+         * it counted since the last fold is folded as it goes: against its
+         * own baseline, before the entry of the group's own is added and
+         * takes the baseline from zero. */
+        folding = folds;
         through_bridge = false;
         ft_mr_recheck = true;
         run();
         assert(withdrawals == withdrawn + 1 && !g->route->linked);
+        assert(folds == folding + 1 && folded.packets == bridged_count.packets);
+        assert(folded_tags == 1 && !folded_own);
         assert(hardware.live && g->hw && g->state == FT_MR_INSTALLED);
         assert(!bridge.refs && g->via == NULL);
+        assert(!g->folded_packets && !g->folded_series);
+        /* Taken back already: a later pass folds nothing more of it. */
+        folding = folds;
+        ft_mr_recheck = true;
+        run();
+        assert(folds == folding);
+    }
+    /* A route taken back before anything of it was folded. The group's
+     * baseline is still its own entry's -- here 1000, as a real fold of that
+     * entry would have left it, well above the 7 the route counted -- and
+     * belongs to no run of the route's. The route's count is folded from
+     * zero, its own run's start: against the entry's baseline it would read
+     * as a count gone backwards and be lost, or come short by 1000. */
+    {
+        unsigned folding;
+        u32 run_linked;
+
+        g->folded_packets = 1000;
+        g->folded_bytes = 1000 * 100;
+        g->folded_series = 0;
+        through_bridge = true;
+        carried = true;
+        ft_mr_recheck = true;
+        run();
+        assert(!g->hw && g->route->linked && g->state == FT_MR_INSTALLED);
+        assert(g->folded_packets == 1000 && !g->folded_series);
+        run_linked = g->route->series;
+        folding = folds;
+        through_bridge = false;
+        ft_mr_recheck = true;
+        run();
+        assert(folds == folding + 1 && folded.packets == bridged_count.packets);
+        assert(folded_run == run_linked && !folded_base && !folded_own);
+        assert(hardware.live && g->hw && !g->route->linked);
+        carried = false;
+    }
+    /* A group freed while it rides a bridge -- its entry deleted, or the
+     * adapter unloading -- folds what its route counted too, into the MFC
+     * entry it still holds. */
+    {
+        struct mr_mfc gone = { .refs = 1 };
+        struct ft_mr_group *h = calloc(1, sizeof(*h));
+        unsigned folding = folds, withdrawn = withdrawals;
+
+        assert(h);
+        h->mfc = &gone;
+        h->family = AF_INET;
+        h->route = calloc(1, sizeof(*h->route));
+        assert(h->route);
+        h->route->linked = true;
+        h->route->series = 1;
+        ft_mr_group_free(h);
+        assert(withdrawals == withdrawn + 1 && folds == folding + 1);
+        assert(folded.packets == bridged_count.packets && !gone.refs);
     }
 
     /* ---- a ruleset commit ---------------------------------------------
@@ -1615,9 +1698,16 @@ int main(void)
     run();
     assert(hardware.live && g->state == FT_MR_INSTALLED);
 
-    /* Stop with a timer/worker rearm in flight, and release every owner. */
+    /* Stop with a timer/worker rearm in flight, and release every owner --
+     * folding what the entry counted since the last fold into the MFC entry
+     * before it is deleted, as the worker's own deletes do: the entry
+     * outlives the adapter. */
     simulate_rearm = true;
+    unsigned exiting = folds;
+    hw_count = (struct cdx_ft_counters){ 3, 3 * 100 };
     ft_mr_exit();
+    assert(folds == exiting + 1 && folded.packets == 3 && folded_live && folded_own);
+    hw_count = (struct cdx_ft_counters){ 0, 0 };
     /* The producers, the worker, then again whatever the worker rearmed. */
     assert(!strcmp(cancels, "srwsr") && !ft_mr_work.queued && !ft_mr_stats.queued);
     assert(!ft_mr_ruleset.queued && !confirm_hooked[0] && !confirm_hooked[1]);

@@ -666,8 +666,20 @@ framing comes off per packet exactly as `ft_l2_overhead()` takes it off a
 flow's. The fold runs on a delayed work of its own every five seconds and again
 on every `/proc` read, so a daemon polling `SIOCGETSGCNT` sees activity within
 one interval without anybody reading `/proc` at all. What the hardware matched
-after the last fold is read before a group's entry is deleted and folded then,
-so nothing is lost when a group leaves hardware. `/proc`'s own row reports the
+after the last fold is read before a group's entry is deleted and folded then:
+by the worker's deletes of an entry that changes or goes to software, and by
+the adapter unloading, since the MFC entry outlives it. An entry whose MFC
+entry ipmr has deleted goes without the read -- nothing can ask that MFC entry
+for its counters any more. A group that stops riding a bridge -- routed
+elsewhere, refused, its MFC entry deleted, the adapter unloading -- folds what
+its route counted since the last fold as it takes the route back, against that
+route's own baseline and before an entry of its own can take the baseline from
+zero; for a deleted MFC entry that fold is merely harmless. So nothing the
+counts hold is lost when a group leaves hardware, but for one thing: what a
+bridged entry carrying the route matched since the bridged learner last
+sampled it, at most one of that learner's five-second refreshes, is not in the
+route's count yet, and sampling it early would shorten the interval that
+learner's ageing judges an entry idle by. `/proc`'s own row reports the
 present hardware group's raw L2 count, which starts again with each group.
 
 One entry's counters only grow, so a sample below what was already folded
