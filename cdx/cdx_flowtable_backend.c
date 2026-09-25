@@ -346,6 +346,13 @@ void cdx_ft_stats_free(struct cdx_ft_stats_slot **slot)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_free, ASK_CDX_FLOWTABLE);
 
+void cdx_ft_stats_retention(unsigned int *retained, u64 *deferred)
+{
+	cdx_ft_assert_held();
+	cdx_ft_ifstats_retention(retained, deferred);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_retention, ASK_CDX_FLOWTABLE);
+
 void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
 		       struct cdx_ft_stats *rx, struct cdx_ft_stats *tx)
 {

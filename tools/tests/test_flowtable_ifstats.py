@@ -15,7 +15,9 @@ of known size through a tagged LAN and require that:
 - the two native surfaces agree with each other;
 - and a frame the flowtable forwards in software is counted by the driver too,
   which it was not before the stack's return value stopped being read as a
-  drop report.
+  drop report;
+- and a device's record stays out of the pool while a hardware entry that may
+  still write it is unproven, so the next device is handed a sound one.
 """
 from __future__ import annotations
 
@@ -25,10 +27,12 @@ import re
 
 import pytest
 
-from _topology import TARGET_LAN_IF, TARGET_WAN_IF
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif
 from ask_orch.uart import Console
-from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read
-from test_flowtable_vlan import VLAN_ID, VLAN_INNER, _both_directions, vlan_rig  # noqa: F401
+from test_flowtable_offload import (ARTIFACTS, TABLE, WAN_IP, command, console_command, read,
+                                    rearm_ready)
+from test_flowtable_vlan import (DUT_VLAN_ADDR, VLAN_ID, VLAN_INNER, _both_directions,  # noqa: F401
+                                 vlan_rig)
 
 PAYLOAD = 256
 COUNT = 64
@@ -40,6 +44,14 @@ ETH_HLEN, VLAN_HLEN = 14, 4
 # devices while the counters are read. They are few, and each is at most one
 # frame long.
 STRAY_LIMIT, FRAME_MAX = 12, 1518
+# CDX's debug knob withholding proofs that hardware entries are gone: each
+# completed unlink reports its barrier failed, each retry barrier fails, until
+# the count is spent. Absent from a production build.
+FAIL_SYNC = "/sys/module/cdx/parameters/flowtable_fail_sync"
+# Both directions' deletes, then three of the retries the invalidation worker
+# makes once a second: the entries stay unproven for about three seconds, long
+# past the device's unregistration and the reap that follows it.
+WITHHELD_PROOFS = 5
 
 
 @pytest.fixture
@@ -238,3 +250,104 @@ async def test_flowtable_ifstats_software_path(offload_service_stopped, vlan_rig
     assert COUNT * (IP_LEN + ETH_HLEN) <= vlan["tx_bytes"] <= \
         COUNT * (IP_LEN + ETH_HLEN) + stray * FRAME_MAX, vlan
     r.record("ifstats-software", {"delta": delta})
+
+
+async def test_flowtable_ifstats_record_waits_for_an_unproven_delete(offload_service_stopped,
+                                                                     vlan_rig):
+    """A VLAN device goes while the deletes of the entries naming its record
+    cannot be proven: the record stays out of the pool until they are, and the
+    next device on the tag gets a record that counts exactly.
+
+    The microcode writes a record every time it runs an entry's opcodes, and a
+    retired entry may still be walked until a barrier completes. Returned to
+    the pool before that, the record's first word is the free list's link for
+    the late write to overwrite, and the next device is handed a record the old
+    entry still counts into. CDX's debug knob withholds the proofs, so the
+    device's record is released while both entries are still retired; the
+    release is counted as deferred, and the slot as retained until recovery
+    settles them."""
+    r = vlan_rig
+    knob = await r.target.fs_read(r.session, FAIL_SYNC, max_bytes=64)
+    if knob["errno"]:
+        pytest.skip("withholding a delete's proof needs a CDX_DEBUG_FLOWTABLE build")
+    if (await r.state())["observe"]:
+        pytest.skip("retirement needs installed hardware")
+    try:
+        # Inside the try, so a count some earlier run left behind is still
+        # cleared on the way out.
+        assert bytes.fromhex(knob["content_hex"]).decode().strip() == "0", knob
+        await r.table()
+        await r.exchange(count=4, payload_size=PAYLOAD)
+        await _both_directions(r)
+        before = await r.state()
+        record = [v for v in before["vlans"] if v["dev"] == r.dut_vlan_if]
+        # Both directions name the one record: the strip counts into its
+        # receive half, the insert into its transmit half.
+        assert len(record) == 1 and record[0]["slot"] == "yes" and record[0]["refs"] == "2", \
+            before["vlans"]
+        assert before["entries"] == 2 and before["stats_retained"] == 0, before
+        result = await r.target.fs_write(r.session, FAIL_SYNC, str(WITHHELD_PROOFS))
+        assert result["errno"] == 0, result
+        await command(r.target, r.session, "ip", "link", "del", r.dut_vlan_if)
+        # Whichever came last, the unregistration's reap or the last
+        # direction's release, freed the record while the entries were still
+        # retired: one deferred release, one slot held.
+        deferred = await r.wait(lambda s: s["stats_deferred"] != before["stats_deferred"])
+        assert deferred["stats_deferred"] == before["stats_deferred"] + 1, (before, deferred)
+        assert deferred["stats_retained"] == 1, deferred
+        assert not [v for v in deferred["vlans"] if v["ifindex"] == record[0]["ifindex"]], \
+            deferred["vlans"]
+        # Recovery runs its ordinary course once the withheld proofs are spent:
+        # a barrier completes, both entries are released, and the record goes
+        # back with them. Nothing is left retained -- no slot leaked.
+        settled = await r.wait(lambda s: s["invalidation_done"] == 1 and not s["quarantine"]
+                               and not s["stats_retained"], timeout=20)
+        assert settled["invalidated"] == 1 and not settled["fatal"] and not settled["entries"], \
+            settled
+        assert settled["errors"] - before["errors"] == 2, (before, settled)
+        assert settled["stats_deferred"] == deferred["stats_deferred"], settled
+        assert settled["vlan_records"] == 0, settled
+        assert (await read(r.target, r.session, FAIL_SYNC)).strip() == "0"
+        r.record("ifstats-unproven-delete", {"before": before, "deferred": deferred,
+                                             "settled": settled})
+
+        # A fresh device on the same tag. Its record is the one the retired
+        # entries named -- the pool hands back the last record returned -- so
+        # an exact count is what says the late writes and the free list never
+        # met.
+        await r.delete_table()
+        await r.wait(lambda s: s["rearm_ready"] == 1, timeout=20)
+        await r.clear_ct()
+        # The fixture's own teardown deletes the device by name.
+        await dut_vlan_subif(TopologyStack(), r.target, r.session, parent=TARGET_LAN_IF,
+                             vid=VLAN_ID, ipv4=f"{DUT_VLAN_ADDR}/24")
+        await command(r.target, r.session, "ip", "neigh", "replace", r.lan_ip, "lladdr",
+                      r.lan_mac, "nud", "permanent", "dev", r.dut_vlan_if)
+        fresh_before, fresh_after, delta = await _burst(r)
+        tagged, untagged = IP_LEN + ETH_HLEN + VLAN_HLEN, IP_LEN + ETH_HLEN
+        assert delta["vlans"][r.dut_vlan_if] == {"rx_packets": COUNT, "rx_bytes": COUNT * untagged,
+                                                 "tx_packets": COUNT,
+                                                 "tx_bytes": COUNT * tagged}, delta["vlans"]
+        assert fresh_after["state"] == {"vlan_records": 1, "vlan_slots": 1}, fresh_after["state"]
+        _native(delta, r.dut_vlan_if, "rx", COUNT, COUNT * IP_LEN)
+        _native(delta, r.dut_vlan_if, "tx", COUNT, COUNT * untagged)
+        final = await r.state()
+        assert not final["stats_retained"] and not final["invalidated"], final
+        assert final["stats_deferred"] == deferred["stats_deferred"], final
+        r.record("ifstats-unproven-delete-fresh", {"before": fresh_before, "after": fresh_after,
+                                                   "delta": delta})
+    finally:
+        # Unspent proofs would fail the next test's deletes, and an
+        # invalidation left latched would refuse its fixture. The next bind
+        # clears the latch, but only on an adapter that can rearm: a fatal one
+        # binds passively, and an unproven retirement holds the rearm. This
+        # runs because something may already have failed, so it asks rather
+        # than fails, and the fixture gives the table back.
+        await r.target.fs_write(r.session, FAIL_SYNC, "0")
+        left = await r.state()
+        if left["invalidated"] and not left["fatal"]:
+            await command(r.target, r.session, "nft", "delete", "table", "inet", TABLE,
+                          check=False)
+            if await rearm_ready(r, timeout=20):
+                await r.clear_ct()
+                await r.table()

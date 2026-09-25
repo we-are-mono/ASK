@@ -454,9 +454,17 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
  * counters are observability and forwarding is the product, so a caller that
  * cannot have a slot must still install its flow. -ENOSPC says exactly that.
  * A slot outlives no adapter: free every one before unload.
+ *
+ * Freeing is the caller's release, not the record's return. An entry that
+ * named the record and whose delete failed still holds it until a barrier, or
+ * a stopped datapath, proves nothing walks that entry; the record goes back to
+ * the pool then, and until then no device can be handed it.
  */
 int cdx_ft_stats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **slot);
 void cdx_ft_stats_free(struct cdx_ft_stats_slot **slot);
+/* How many freed slots such an entry still holds, and how many frees have had
+ * to wait on one since CDX loaded. */
+void cdx_ft_stats_retention(unsigned int *retained, u64 *deferred);
 /* Reads the firmware's own record. Either pointer may be NULL to skip it; a
  * NULL slot reports zeroes, which is what a caller without one should show. */
 void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,

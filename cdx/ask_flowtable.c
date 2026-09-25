@@ -250,12 +250,12 @@ struct cdx_ft_binding {
  * the pool is zeroed when handed out again, so a record that came and went
  * with the flows would drop the device's counters back to zero every time it
  * went idle. refs counts the hardware directions whose opcodes name the
- * record's indices and is what makes freeing safe: the device can unregister
- * while an entry naming the record is still being retired, and the slot has
- * to outlive that opcode. gone marks the device as unregistered. The record is
+ * record's indices: the device can unregister while an entry naming the record
+ * is still being retired. gone marks the device as unregistered. The record is
  * freed by whichever comes last, the unregistration or the last release, and a
  * gone record is never found by index again, so a device that reuses the index
- * starts a record of its own.
+ * starts a record of its own. Freeing it releases only this module's hold on
+ * the slot; an entry CDX retired without proof holds the slot itself.
  *
  * slot is NULL for a device admitted while its pool was empty: its flows
  * forward without counting, and the row in /proc/cdx_flowtable says so. The
@@ -766,9 +766,9 @@ static void ft_dev_stats_reap(struct work_struct *work)
 	cdx_ft_end();
 }
 
-/* At unload, after the backend release has proved no hardware direction is
- * left: the devices are still registered, so the list does not drain by
- * construction, and every record is freed here. */
+/* At unload, once no hardware direction is left and every retirement has been
+ * proven (ft_hw_settle()): the devices are still registered, so the list does
+ * not drain by construction, and every record is freed here. */
 static void ft_dev_stats_drop_all(void)
 {
 	struct cdx_ft_dev_stats *record, *next;
@@ -887,8 +887,11 @@ static int ft_remove(struct cdx_ft_entry *entry)
 	hash_del(&entry->cookie_node);
 	hash_del(&entry->key_node);
 	ft_neigh_detach(entry);
-	/* After the hardware entry is gone, so the firmware has stopped
-	 * counting into the record before it can be handed to anyone else. */
+	/* After the delete, whatever it returned. This only drops the
+	 * adapter's references: a delete that could not prove the firmware
+	 * has stopped walking the entry leaves CDX's retained owner holding
+	 * every record the entry names, so a record freed here stays out of
+	 * the pool until that proof arrives. */
 	ft_stats_detach(entry);
 	nf_flow_offload_handle_put(entry->handle);
 	ft_handle_refs--;
@@ -13166,7 +13169,8 @@ static int ft_show(struct seq_file *seq, void *v)
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
 	unsigned int session_records = 0, session_slots = 0, vlan_records = 0, vlan_slots = 0;
-	unsigned int tunnel_records = 0, tunnel_slots = 0;
+	unsigned int tunnel_records = 0, tunnel_slots = 0, stats_retained;
+	u64 stats_deferred;
 	char in_vlan[16], out_vlan[16];
 	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
 	char in_ppp[26], out_ppp[26];
@@ -13271,6 +13275,14 @@ static int ft_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "ipsec_sas %u\nipsec_sa_cache %u\n",
 		   cdx_ipsec_sa_count(), cdx_ipsec_sa_cache_entries());
 	ft_sec_refusal_rows(seq);
+	/* Device records this module has let go that stay out of the pool
+	 * because a retired entry naming them is not yet proven gone, of any
+	 * kind; and how many releases have had to wait that way since CDX
+	 * loaded. The first returns to zero with every completed retirement,
+	 * so one that stays up is a slot recovery never gave back. */
+	cdx_ft_stats_retention(&stats_retained, &stats_deferred);
+	seq_printf(seq, "stats_retained %u\nstats_deferred %llu\n",
+		   stats_retained, stats_deferred);
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   session_records, session_slots);
 	ft_dev_rows(seq, CDX_FT_STATS_TIMESTAMPED, false);
@@ -13378,6 +13390,29 @@ static void ft_block_drain(void)
 		/* Runs ft_release(), which retires this binding's entries and
 		 * drops its device reference, exactly as an unbind would. */
 		flow_block_cb_free(cb);
+	}
+}
+
+/* Every deletion left unproven, proven: a barrier completes, or -- after one
+ * that may have left its key linked -- the datapath is stopped, as the backend
+ * requires of an -EIO. Both unload and a load unwinding its own failure owe
+ * this before the device records go and the claim is released, and neither
+ * can count on the invalidation worker for it: ft_invalidate() does nothing
+ * once ft_stopping is set. It cannot fail, so it waits, releasing the
+ * transaction between attempts so configuration and other kernel work can
+ * progress. A fatal state stays in CDX, and a later load cannot clear it. */
+static void ft_hw_settle(void)
+{
+	int rc;
+
+	for (;;) {
+		cdx_ft_begin();
+		rc = cdx_ft_recover();
+		cdx_ft_end();
+		if (!rc)
+			return;
+		pr_warn_ratelimited("ask_flowtable: waiting for safe hardware retirement before releasing CDX\n");
+		msleep(1000);
 	}
 }
 
@@ -13556,6 +13591,11 @@ netdev:
 	cancel_delayed_work_sync(&ft_ipsec_stats);
 	cancel_work_sync(&ft_ipsec_follow);
 	ft_ipsec_watch_flush();
+	/* The drain above deleted whatever the binds had installed, and a
+	 * delete it could not prove queued no recovery: this proves it, or
+	 * stops the datapath after an -EIO, before the records the entries
+	 * named are dropped and the claim goes. */
+	ft_hw_settle();
 	/* A flow admitted through the indirect bind before the failure claimed
 	 * device records, and those outlive their flows by design, so the
 	 * unwind has to drop them: left behind, their slots would stay
@@ -13580,7 +13620,6 @@ release:
 static void __exit ask_flowtable_exit(void)
 {
 	struct cdx_ft_entry *entry;
-	int rc;
 
 	proc_remove(ft_proc);
 	ft_proc = NULL;
@@ -13661,20 +13700,12 @@ static void __exit ask_flowtable_exit(void)
 	ft_block_drain();
 	WRITE_ONCE(ft_ready, false);
 	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,
-	 * before releasing CDX. Release the transaction between retries so
-	 * configuration and other kernel work can progress. Fatal state stays
-	 * in CDX and a subsequent adapter load cannot clear it. */
-	do {
-		cdx_ft_begin();
-		rc = cdx_ft_recover();
-		if (!rc)
-			rc = cdx_ft_release();
-		cdx_ft_end();
-		if (rc) {
-			pr_warn_ratelimited("ask_flowtable: waiting for safe hardware retirement before unload\n");
-			msleep(1000);
-		}
-	} while (rc);
+	 * before releasing CDX. The drain above removed every direction and
+	 * nothing is left that could add one, so the release finds none. */
+	ft_hw_settle();
+	cdx_ft_begin();
+	WARN_ON_ONCE(cdx_ft_release());
+	cdx_ft_end();
 	/* The device records are held by their devices, which are still here,
 	 * so the list does not drain on its own; the release above proved that
 	 * nothing references them. The notifier that could queue the reaper is

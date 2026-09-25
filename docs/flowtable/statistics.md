@@ -106,6 +106,18 @@ namespace keeps its index there and this one can hand it to a new device while
 the old record waits, and the fold keys on the index alone; a work item then
 takes the backend transaction and frees what nothing references.
 
+Freeing is the adapter's release, not the record's return. The microcode writes
+a record whenever it runs an entry's opcodes, and a delete whose barrier failed
+leaves an entry CDX cannot yet prove is no longer walked. So each hardware
+entry holds every record its opcodes name from the moment its key is linked,
+and gives them back only once a barrier completes or the datapath is stopped;
+until then the record stays off the free list, where its first word would be
+the list's link and the next device would be handed a record the old entry
+still counts into. `/proc/cdx_flowtable` shows `stats_retained`, the records
+freed by the adapter and held that way now, which returns to zero with every
+completed recovery, and `stats_deferred`, how many frees have had to wait since
+CDX loaded.
+
 pppd normally creates a ppp device per dial and destroys it when the session
 ends, so a ppp device's record lives exactly as long as its session; with
 `persist`, or a session renegotiated under a unit that stays, it lives across

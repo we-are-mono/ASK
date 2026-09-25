@@ -80,8 +80,8 @@ struct cdx_l2_encap {
     } ingress_tunnel, egress_tunnel;
 };
 /* The slot as CDX defines it. The encoder reads only the two indices, which
- * is the whole of what it needs from one. */
-struct cdx_ft_stats_slot { void *record; int kind; u8 rx_index, tx_index; };
+ * is the whole of what it needs from one; the owner adds its holds. */
+struct cdx_ft_stats_slot { void *record; int kind; u8 rx_index, tx_index; unsigned holds; };
 union nf_inet_addr {
     u32 all[4];
     __be32 ip;
@@ -117,6 +117,13 @@ static union nf_inet_addr v6(u32 tail)
 #define module_param_named(...)
 #define MODULE_PARM_DESC(...)
 #define xchg(p, value) ({ __typeof__(*(p)) old = *(p); *(p) = (value); old; })
+#define cmpxchg(p, expected, value) \
+    ({ __typeof__(*(p)) old = *(p); if (old == (expected)) *(p) = (value); old; })
+/* The host's own uapi headers may already carry the annotation. */
+#ifndef __counted_by
+#define __counted_by(member)
+#endif
+#define struct_size(p, member, count) (sizeof(*(p)) + sizeof(*(p)->member) * (count))
 struct net { int unused; };
 static struct net init_net, other_net;
 struct net_device {
@@ -496,6 +503,24 @@ static void cdx_ft_ifstats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
 static void cdx_ft_ifstats_unpublish(struct cdx_ft_stats_slot *slot)
 {
     assert(!slot || slot == &ifstats_slot);
+}
+/* An entry's hold on each record its opcodes name. What the last put does with
+ * the record is the allocator's, exercised in the ifstats harness; here the
+ * count is the whole of it, and a put nobody took is a double release. */
+static void cdx_ft_ifstats_hold(struct cdx_ft_stats_slot *slot)
+{
+    assert(cdx_info->ctrl.mutex);
+    slot->holds++;
+}
+static void cdx_ft_ifstats_put(struct cdx_ft_stats_slot *slot)
+{
+    assert(cdx_info->ctrl.mutex && slot->holds);
+    slot->holds--;
+}
+static void cdx_ft_ifstats_retention(unsigned *retained, u64 *deferred)
+{
+    *retained = 0;
+    *deferred = 0;
 }
 #include "hardware_production.inc"
 #include "backend_production.inc"
@@ -1153,6 +1178,89 @@ int main(void)
         stopped=true; cdx_ft_hw_quiesced(); stopped=false;
         assert(!allocations && !cdx_ft_hw_pending() && older->linked);
         free(older); older=NULL; /* Reset owns the possibly linked allocation. */
+    }
+    /* Every record an entry's opcodes can name is held by the entry itself for
+     * as long as the microcode may walk it, whatever the adapter does with its
+     * own hold: taken once the key is linked, one per name, and given back
+     * only by what proves the entry gone -- its own synced delete, the barrier
+     * that settles it once retired, or quiescence whichever way its delete
+     * failed. A record back in the pool early is a free-list link the
+     * microcode can still overwrite, and a record the next device is handed
+     * while the old entry still counts into it. */
+    {
+        struct cdx_ft_stats_slot vlan_slot = { .rx_index = 0x10, .tx_index = 0x11 };
+        struct cdx_ft_hw *live = NULL;
+        unsigned before;
+
+        delete_result = 0;
+        stats = (struct cdx_ft_stats_binding){
+            .in_session = &ifstats_slot, .out_session = &ifstats_slot,
+            .out_tunnel = &tunnel_slot,
+            .in_vlan = { &vlan_slot }, .out_vlan = { NULL, &vlan_slot } };
+        fail_insert = true;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EIO && !hw);
+        assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+        fail_insert = false;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(ifstats_slot.holds == 2 && tunnel_slot.holds == 1 && vlan_slot.holds == 2);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+        assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+
+        /* Retired: held through a barrier that fails, given back by the one
+         * that completes. */
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        delete_result = EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_hw_del(&hw) == -EAGAIN && ifstats_slot.holds == 2 && vlan_slot.holds == 2);
+        fail_sync = true;
+        assert(cdx_ft_hw_retry() == -EAGAIN && ifstats_slot.holds == 2 && tunnel_slot.holds == 1);
+        fail_sync = false;
+        assert(cdx_ft_hw_retry() == 0 && !cdx_ft_hw_pending() && !key);
+        assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+
+        /* And by a later delete's own sync, which proves it too. */
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && cdx_ft_hw_del(&hw) == -EAGAIN);
+        delete_result = 0;
+        assert(cdx_ft_hw_add(&rule,&stats,&live) == 0 && ifstats_slot.holds == 4);
+        assert(cdx_ft_hw_del(&live) == 0 && !cdx_ft_hw_pending() && !key && !older);
+        assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+
+        /* No barrier releases a key a hard failure may have left linked,
+         * and so none releases its records; quiescence releases both kinds,
+         * keeping only the key itself for the reset. */
+        delete_result = EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && cdx_ft_hw_del(&hw) == -EAGAIN);
+        delete_result = -1;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && cdx_ft_hw_del(&hw) == -EIO);
+        assert(cdx_ft_hw_retry() == -EAGAIN && !older && key->linked);
+        assert(ifstats_slot.holds == 2 && vlan_slot.holds == 2 && cdx_ft_hw_pending() == 1);
+        stopped = true; cdx_ft_hw_quiesced(); stopped = false;
+        assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+        assert(!allocations && !cdx_ft_hw_pending() && key->linked);
+        free(key); key = NULL;
+
+        /* The debug knob's withheld proof: a delete that completed reports
+         * its barrier failed, and each retry after it fails without issuing
+         * one, until the count is spent. The entry and its holds are parked
+         * exactly as for a real failure. A failed unlink spends nothing. */
+        delete_result = -1;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        ft_fail_sync = 1;
+        assert(cdx_ft_hw_del(&hw) == -EIO && ft_fail_sync == 1 && key->linked);
+        stopped = true; cdx_ft_hw_quiesced(); stopped = false;
+        free(key); key = NULL;
+        delete_result = 0;
+        ft_fail_sync = 3;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        before = deletes;
+        assert(cdx_ft_hw_del(&hw) == -EAGAIN && deletes == before + 1 && ft_fail_sync == 2);
+        assert(key && !key->linked && cdx_ft_hw_pending() == 1 && ifstats_slot.holds == 2);
+        before = syncs;
+        assert(cdx_ft_hw_retry() == -EAGAIN && syncs == before && ft_fail_sync == 1);
+        assert(cdx_ft_hw_retry() == -EAGAIN && syncs == before && !ft_fail_sync);
+        assert(key && ifstats_slot.holds == 2 && vlan_slot.holds == 2);
+        assert(cdx_ft_hw_retry() == 0 && syncs == before + 1 && !key && !cdx_ft_hw_pending());
+        assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds && !allocations);
+        stats = (struct cdx_ft_stats_binding){};
     }
     test_backend();
     puts("Flowtable hardware: encoding, consuming delete, allocation-free retirement, barrier retry and quiescence passed");

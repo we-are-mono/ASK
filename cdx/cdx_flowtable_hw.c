@@ -22,7 +22,23 @@ struct cdx_ft_hw {
 	RouteEntry route;
 	struct list_head retired;
 	int delete_rc;
+	/* In the padding delete_rc leaves, so an entry naming no record takes
+	 * no more memory than one without the array. */
+	unsigned int nstats;
+	/* The statistics records the entry's opcodes name, recorded when the
+	 * owner is allocated, so retirement still allocates nothing, and each
+	 * held from the moment the key is linked until the entry is proven
+	 * gone. */
+	struct cdx_ft_stats_slot *stats[] __counted_by(nstats);
 };
+
+/* What nstats can reach: a session and a tunnel on each side and one record
+ * per tag of each stack, which is every slot a binding can name -- the binding
+ * being nothing else. A slot added to it fails here until the walk below
+ * learns it. */
+#define FT_HW_STATS_MAX (2 * (2 + CDX_FT_VLAN_MAX))
+static_assert(sizeof(struct cdx_ft_stats_binding) ==
+	      FT_HW_STATS_MAX * sizeof(struct cdx_ft_stats_slot *));
 
 /* Retirement needs no allocation after unlink. Unlike the ehash quarantine
  * (cdx_ehash.c), the adapter can retain the already allocated owner until the
@@ -33,6 +49,13 @@ static LIST_HEAD(ft_retired);
 static bool ft_fail_unlink;
 module_param_named(flowtable_fail_unlink, ft_fail_unlink, bool, 0600);
 MODULE_PARM_DESC(flowtable_fail_unlink, "One-shot delete failure leaving a live key linked; reboot required");
+/* A count rather than a flag: a connection is two entries, and the retry that
+ * follows a failed barrier runs at once, so a single withheld proof is settled
+ * by the other direction's delete before anything that waits on it can be
+ * observed. */
+static unsigned int ft_fail_sync;
+module_param_named(flowtable_fail_sync, ft_fail_sync, uint, 0600);
+MODULE_PARM_DESC(flowtable_fail_sync, "Proofs to withhold: each completed unlink reports its barrier failed and each retry barrier fails, until spent");
 #endif
 
 static bool ft_unlink_fault(void)
@@ -42,6 +65,61 @@ static bool ft_unlink_fault(void)
 #else
 	return false;
 #endif
+}
+
+/* One withheld proof: an unlink that completed, reported as one whose barrier
+ * failed, or a retry barrier reported failed without being issued. Either
+ * leaves the owner parked exactly as a real failure does, and recovery takes
+ * its ordinary course once the count is spent. */
+static bool ft_sync_fault(void)
+{
+#ifdef CDX_DEBUG_FLOWTABLE
+	unsigned int left = READ_ONCE(ft_fail_sync);
+
+	return left && cmpxchg(&ft_fail_sync, left, left - 1) == left;
+#else
+	return false;
+#endif
+}
+
+static unsigned int ft_hw_note(struct cdx_ft_stats_slot *slot,
+			       struct cdx_ft_stats_slot **table, unsigned int n)
+{
+	if (slot && table)
+		table[n] = slot;
+	return n + !!slot;
+}
+
+/* Every slot the binding names, whether or not the encoding carries its index:
+ * holding one the opcodes do not reach only delays its reuse. One per name, so
+ * a record named twice is held twice and put twice. Counts them, at most
+ * FT_HW_STATS_MAX, and lists them in table when there is one. */
+static unsigned int ft_hw_stats_walk(const struct cdx_ft_stats_binding *stats,
+				     struct cdx_ft_stats_slot **table)
+{
+	unsigned int i, n = 0;
+
+	n = ft_hw_note(stats->in_session, table, n);
+	n = ft_hw_note(stats->out_session, table, n);
+	n = ft_hw_note(stats->in_tunnel, table, n);
+	n = ft_hw_note(stats->out_tunnel, table, n);
+	for (i = 0; i < CDX_FT_VLAN_MAX; i++) {
+		n = ft_hw_note(stats->in_vlan[i], table, n);
+		n = ft_hw_note(stats->out_vlan[i], table, n);
+	}
+	return n;
+}
+
+/* The owner's end, only once nothing can walk its entry: a barrier completed
+ * after the unlink, or the ports are stopped and detached. The records it
+ * named go back to whoever else holds them, or to their pools. */
+static void ft_hw_free(struct cdx_ft_hw *hw)
+{
+	unsigned int i;
+
+	for (i = 0; i < hw->nstats; i++)
+		cdx_ft_ifstats_put(hw->stats[i]);
+	kfree(hw);
 }
 
 /* The rule orders its tags outermost first, as the wire and Netfilter do;
@@ -106,6 +184,7 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	struct dpa_iface_info *in_iface, *out_iface;
 	struct cdx_l2_encap encap = {};
 	struct cdx_ft_hw *hw;
+	unsigned int nstats, i;
 	PCtEntry ct;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
@@ -158,9 +237,12 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * reads the netdev directly now, and admission has already refused any
 	 * direction whose source is not that port's current address, so the
 	 * two agree by construction rather than by being copied. */
-	hw = kzalloc(sizeof(*hw), GFP_KERNEL);
+	nstats = ft_hw_stats_walk(stats, NULL);
+	hw = kzalloc(struct_size(hw, stats, nstats), GFP_KERNEL);
 	if (!hw)
 		return -ENOMEM;
+	hw->nstats = nstats;
+	ft_hw_stats_walk(stats, hw->stats);
 	hw->route.itf = out->itf;
 	hw->route.input_itf = in->itf;
 	hw->route.underlying_input_itf = in->itf;
@@ -402,6 +484,12 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		kfree(hw);
 		return -EIO;
 	}
+	/* Linked, so the microcode can reach every record the opcodes name
+	 * from the next hit on, and it may still reach them after the adapter
+	 * has let the records go: this entry holds them itself. Every failure
+	 * above freed an owner that held nothing. */
+	for (i = 0; i < hw->nstats; i++)
+		cdx_ft_ifstats_hold(hw->stats[i]);
 	*result = hw;
 	return 0;
 }
@@ -431,7 +519,7 @@ static void ft_hw_release_synced(void)
 		ExternalHashTableEntryFree(hw->entry.ct->handle);
 		kfree(hw->entry.ct);
 		list_del(&hw->retired);
-		kfree(hw);
+		ft_hw_free(hw);
 	}
 	cdx_ehash_quarantine_free_all();
 }
@@ -447,14 +535,17 @@ int cdx_ft_hw_del(struct cdx_ft_hw **entry)
 		return 0;
 	ct = hw->entry.ct;
 	/* Preserve the real linked allocation to exercise fatal retirement.
-	 * Never inject a hard error after a successful destructive unlink. */
+	 * Never inject a hard error after a successful destructive unlink; a
+	 * withheld proof is the one failure that can truthfully follow it. */
 	rc = ft_unlink_fault() ? -EIO :
 		ExternalHashTableDeleteKey(ct->td, ct->index, ct->handle);
+	if (!rc && ft_sync_fault())
+		rc = EN_EHASH_DELETE_UNSYNCED;
 	*entry = NULL;
 	if (!rc) {
 		ExternalHashTableEntryFree(ct->handle);
 		kfree(ct);
-		kfree(hw);
+		ft_hw_free(hw);
 		/* DeleteKey synced the PCD before reporting success, after
 		 * every earlier unlink, so the same barrier settles those. */
 		ft_hw_release_synced();
@@ -502,7 +593,7 @@ int cdx_ft_hw_retry(void)
 		}
 	if (!td)
 		cdx_ehash_quarantine_retry();
-	else if (ExternalHashTableFmPcdHcSync(td))
+	else if (ft_sync_fault() || ExternalHashTableFmPcdHcSync(td))
 		return -EAGAIN;
 	else
 		ft_hw_release_synced();
@@ -511,7 +602,9 @@ int cdx_ft_hw_retry(void)
 
 /* Caller has stopped and detached all classifier ports. Unlinked storage can
  * now be freed even if HC never recovered. A possibly linked key must remain
- * allocated until reset: freeing it would leave a dangling hash-chain link. */
+ * allocated until reset: freeing it would leave a dangling hash-chain link.
+ * Its statistics records are released all the same, since no port is left to
+ * deliver a frame that could reach its opcodes. */
 void cdx_ft_hw_quiesced(void)
 {
 	struct cdx_ft_hw *hw, *next;
@@ -525,6 +618,6 @@ void cdx_ft_hw_quiesced(void)
 			       hw->entry.ct->handle);
 		kfree(hw->entry.ct);
 		list_del(&hw->retired);
-		kfree(hw);
+		ft_hw_free(hw);
 	}
 }

@@ -7175,6 +7175,28 @@ static void test_registration(void)
     assert(ask_flowtable_init() == -EOPNOTSUPP && !backend_claimed && !registration_step);
     assert(!ft_proc && !cdx_info->ctrl.mutex);
     ft_fatal=false;
+    /* A load unwinding its own failure owes the same: a drain whose delete
+     * fails fatally is proven by stopping the datapath, and the unwind waits
+     * for that before it lets the claim go. With the adapter stopping, the
+     * production ft_invalidate() queues no worker, so nothing else would;
+     * this harness's latches regardless, and is cleared on either side. */
+    {
+        unsigned sleeps = unload_sleeps, tries = recoveries;
+
+        route_open_hook = bind_while_loading;
+        ft_init_fail_stage=9; ft_invalid=0;
+        ft_ready=ft_stopping=false; registration_step=canceled=0;
+        work_queued_invalidate = work_queued_retire = work_queued_rearm = false;
+        fixture();
+        deletion_error=-EIO; quiesce_fail=true; unload_failures=1;
+        assert(ask_flowtable_init() == -EBUSY);
+        assert(ft_fatal && !quiesce_fail && unload_sleeps == sleeps + 1);
+        assert(recoveries == tries + 2);
+        assert(!ft_ready && !ft_proc && !backend_claimed && !indirect_registered);
+        unwound();
+        route_open_hook = NULL;
+        ft_init_fail_stage=0; deletion_error=0; ft_fatal=false; ft_invalid=0;
+    }
 }
 
 int main(void)

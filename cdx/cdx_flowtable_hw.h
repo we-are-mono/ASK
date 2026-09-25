@@ -14,6 +14,14 @@
  * never a valid index -- a timestamped one always has that bit set and a plain
  * one starts past the timestamped pool -- so zero can mean "no slot" wherever
  * an index is passed on.
+ *
+ * The record goes back to its pool only when nothing names it any more. The
+ * adapter holds it from allocation until it frees the slot, and every hardware
+ * entry whose opcodes carry one of its indices holds it until that entry is
+ * proven gone: the microcode writes the record each time it runs those opcodes
+ * after a hit, and a retired entry may still be walked. A record on a free
+ * list has its first word overwritten with the list's link, and the next
+ * device to be handed it would count what the old entry still adds.
  */
 struct cdx_ft_stats_slot {
 	void *record;
@@ -27,13 +35,35 @@ struct cdx_ft_stats_slot {
 	int ifindex;
 	unsigned int rx_overhead;
 	unsigned int tx_overhead;
+	/* The adapter's hold and one per hardware entry naming the record.
+	 * retained is set when the adapter lets go while an entry still holds
+	 * it, and is what the last put answers for. Both change only under the
+	 * control mutex, which every flowtable caller holds. */
+	unsigned int holds;
+	bool retained;
 };
 
 /* Implemented beside the free lists in cdx_ifstats.c, exported by the backend.
- * All take dpa_statslist_lock, which is a process-context discipline; the fold
- * runs from dev_get_stats(), which is process context under RCU or RTNL. */
+ * Allocation, free, read, publication, withdrawal and the fold take
+ * dpa_statslist_lock, which is a process-context discipline; the fold runs
+ * from dev_get_stats(), which is process context under RCU or RTNL. A put
+ * takes it only when it is the last and returns the record; the hold and the
+ * retention count take no lock of their own. Allocation, free, hold, put and
+ * the retention count are called with the control mutex held, which is what
+ * serializes the holds. */
 int cdx_ft_ifstats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **slot);
+/* The adapter's release: the publication is withdrawn at once, the record
+ * goes back with the last hold. */
 void cdx_ft_ifstats_free(struct cdx_ft_stats_slot **slot);
+/* A hardware entry's hold, taken once its key is linked and given back only
+ * after a barrier, or the stopped datapath, proves nothing walks the entry.
+ * Never under dpa_statslist_lock or a caller's own spinlock: the last put
+ * returns the record, which takes the former. */
+void cdx_ft_ifstats_hold(struct cdx_ft_stats_slot *slot);
+void cdx_ft_ifstats_put(struct cdx_ft_stats_slot *slot);
+/* Slots the adapter has freed that an unproven entry still holds, and how many
+ * of its frees have had to wait on one since CDX loaded. */
+void cdx_ft_ifstats_retention(unsigned int *retained, u64 *deferred);
 void cdx_ft_ifstats_read(const struct cdx_ft_stats_slot *slot,
 			 struct cdx_ft_stats *rx, struct cdx_ft_stats *tx);
 void cdx_ft_ifstats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
@@ -70,7 +100,9 @@ void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
 /* Always consumes *hw. 0: removed and synchronized. -EAGAIN: unlinked but
  * quarantined. -EIO: removal unproven; caller must stop further admission and
  * quiesce the datapath. The backend retains failed deletions without allocating
- * new storage. A repeated delete with *hw == NULL does not erase prior errors. */
+ * new storage, and a retained entry keeps its holds on the statistics records
+ * it names until the same proof releases it. A repeated delete with
+ * *hw == NULL does not erase prior errors. */
 int cdx_ft_hw_del(struct cdx_ft_hw **hw);
 unsigned int cdx_ft_hw_pending(void);
 /* One barrier for every unproven unlink, CDX's parked backlog included; see

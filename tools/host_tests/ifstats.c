@@ -43,6 +43,8 @@
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
+/* A warning the kernel would print is a failure here. */
+#define WARN_ON_ONCE(condition) ({ assert(!(condition)); 0; })
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
@@ -98,6 +100,11 @@ static void spin_unlock(spinlock_t *lock)
     assert(lock->held && locked);
     lock->held = locked = 0;
 }
+/* The CDX control mutex, under which every flowtable caller counts the holds.
+ * This harness is one thread standing in for those callers, so it is always
+ * inside it. */
+static struct { struct { int mutex; } ctrl; } cdx_instance = { { 1 } }, *cdx_info = &cdx_instance;
+#define lockdep_assert_held(lock) assert(*(lock))
 
 /* One delayed work item as the system workqueue holds it: queued or not, and
  * for how long. Running it is the test's call, which is what lets the order of
@@ -867,6 +874,79 @@ int main(void)
         assert(!storage.rx_packets && !storage.rx_bytes);
         cdx_ft_ifstats_free(&slot);
         assert(list_empty(&published_slots));
+        init_pools();
+    }
+
+    /* ---- a record a hardware entry still names --------------------------
+     *
+     * The flowtable owner frees a device's slot when the device goes, and an
+     * entry whose delete could not be proven may still be walked by the
+     * microcode, which writes the record on every hit. Freeing withdraws the
+     * publication at once -- the device's index may already be someone
+     * else's -- but the record goes back to its pool only with the last hold:
+     * back on the list early, its first word would be the list's link for the
+     * microcode to overwrite, and the next device would be handed a record the
+     * old entry still counts into. */
+    {
+        struct net_device gone = { .ifindex = 11 };
+        struct rtnl_link_stats64 storage;
+        struct cdx_ft_stats_slot *adapter, *other;
+        unsigned free_before, retained;
+        u64 deferred, deferred_before;
+        const void *record;
+
+        cdx_ft_ifstats_retention(&retained, &deferred_before);
+        assert(!retained);
+        slot = take(CDX_FT_STATS_PLAIN, "plain");
+        record = slot->record;
+        free_before = plain_free_count();
+        cdx_ft_ifstats_publish(slot, gone.ifindex, 0, 0);
+        /* Both directions of one connection name the record. */
+        cdx_ft_ifstats_hold(slot);
+        cdx_ft_ifstats_hold(slot);
+        adapter = slot;
+        cdx_ft_ifstats_free(&adapter);
+        assert(!adapter && list_empty(&published_slots));
+        cdx_ft_ifstats_retention(&retained, &deferred);
+        assert(retained == 1 && deferred == deferred_before + 1);
+        assert(plain_free_count() == free_before);
+        /* A late write lands in the record itself, which is folded into no
+         * device, and the next device is handed another record. */
+        ((struct en_ehash_ifstats *)slot->record)->rxstats.pkts = cpu_to_be32(5);
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&gone, &storage);
+        assert(!storage.rx_packets);
+        other = take(CDX_FT_STATS_PLAIN, "plain");
+        assert(other->record != record);
+        cdx_ft_ifstats_free(&other);
+        /* One direction proven: still held. The other: back at the head of
+         * its list, and cleared when it is handed out again. */
+        cdx_ft_ifstats_put(slot);
+        cdx_ft_ifstats_retention(&retained, &deferred);
+        assert(retained == 1 && plain_free_count() == free_before);
+        cdx_ft_ifstats_put(slot);
+        cdx_ft_ifstats_retention(&retained, &deferred);
+        assert(!retained && deferred == deferred_before + 1);
+        assert(plain_free_count() == free_before + 1);
+        slot = take(CDX_FT_STATS_PLAIN, "plain");
+        assert(slot->record == record);
+        /* A free no entry waits on returns the record at once and defers
+         * nothing. */
+        cdx_ft_ifstats_free(&slot);
+        cdx_ft_ifstats_retention(&retained, &deferred);
+        assert(!retained && deferred == deferred_before + 1);
+        assert(plain_free_count() == free_before + 1);
+        /* A hold that outlives the carve: the last put finds no list to
+         * return the record to, and frees the slot alone. */
+        slot = take(CDX_FT_STATS_PLAIN, "plain");
+        cdx_ft_ifstats_hold(slot);
+        adapter = slot;
+        cdx_ft_ifstats_free(&adapter);
+        drop_pools();
+        cdx_ft_ifstats_put(slot);
+        cdx_ft_ifstats_retention(&retained, &deferred);
+        assert(!retained && deferred == deferred_before + 2);
+        assert(!plain_free_count());
         init_pools();
     }
 

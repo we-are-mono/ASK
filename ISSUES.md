@@ -258,6 +258,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A279.** A VLAN/PPPoE/tunnel stats record went back to its LIFO pool while an entry whose delete was unproven still named it, so a late microcode write could corrupt the free list or count into the next device's record —
+  fixed (_:/^cdx: hold a stats record until every entry naming it is proven gone_).
+
 - [x] **A275.** Routed multicast copies left with the egress port's MAC rather than their oif's (a VLAN or bridge VIF), as ipmr sends them, and no chain followed an oif's MAC change —
   fixed (_:/^flowtable: send a routed multicast copy from its oif's address_).
 

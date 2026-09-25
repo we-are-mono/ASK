@@ -21,6 +21,7 @@
 #include "layer2.h"
 #include "portdefs.h"
 #include "fm_muram_ext.h"
+#include "cdx_ctrl.h"
 #include "cdx_flowtable_hw.h"
 
 #ifdef INCLUDE_IFSTATS_SUPPORT
@@ -56,6 +57,14 @@
  *      - Each record's packet counts carried past 32 bits, under the
  *        same lock: every read of a record advances them.
  *
+ *   cdx_ft_stats_slot.holds, .retained, ifstats_retained,
+ *   ifstats_deferred
+ *      - Who still names a flowtable record, under the CDX control
+ *        mutex rather than this lock: every caller of the hold, the put
+ *        and the free already holds the mutex, and the last put takes
+ *        this lock itself to return the record. The netdev notifier,
+ *        which holds no mutex, only withdraws a publication.
+ *
  *   ifstats_sampler
  *      - Reads every record handed out, once a period, so that no count
  *        comes round twice between two reads. It touches the carve and
@@ -68,8 +77,8 @@
  *
  * Contexts:
  *   alloc_iface_stats, free_iface_stats     - process, interface registration.
- *   cdx_ft_ifstats_alloc, _free, _read,
- *   _publish, _unpublish                    - process, flowtable transaction.
+ *   cdx_ft_ifstats_alloc, _free, _hold, _put,
+ *   _retention, _read, _publish, _unpublish - process, flowtable transaction.
  *   cdxdrv_init_stats                       - module init.
  *   cdx_deinit_iface_stats                  - module exit.
  *   cdx_ft_ifstats_fold, cdx_ifstats_read   - process, dev_get_stats().
@@ -88,6 +97,11 @@ struct cdx_iface_ifinfo *ifstats_freelist;
 struct cdx_pppoe_iface_ifinfo *pppoe_ifstats_freelist;
 //flowtable-owned records published to a net device
 static LIST_HEAD(published_slots);
+/* Flowtable slots the adapter has freed while a hardware entry that has not
+ * been proven gone still held them, and how many frees have waited that way
+ * since load. Under the control mutex, like the holds they follow. */
+static unsigned int ifstats_retained;
+static u64 ifstats_deferred;
 /* Where the plain pool starts: past the timestamped records, in bytes from the
  * start of the carve. */
 #define IFSTATS_PLAIN_OFFSET \
@@ -411,6 +425,8 @@ int cdx_ft_ifstats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot *
 		return -ENOMEM;
 	slot->kind = kind;
 	INIT_LIST_HEAD(&slot->published);
+	/* The caller's, until it frees the slot. */
+	slot->holds = 1;
 	spin_lock(&dpa_statslist_lock);
 	if (!stats_mem) {
 		/* Deinit has returned the carve; there is nothing to index. */
@@ -460,13 +476,24 @@ int cdx_ft_ifstats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot *
 	return 0;
 }
 
-void cdx_ft_ifstats_free(struct cdx_ft_stats_slot **out)
+void cdx_ft_ifstats_hold(struct cdx_ft_stats_slot *slot)
 {
-	struct cdx_ft_stats_slot *slot = *out;
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	slot->holds++;
+}
 
-	if (!slot)
+/* One holder fewer. The last returns the record to its pool and frees the
+ * slot; until then the record stays off both free lists, where its first word
+ * would become the list's link and the next device would be handed it. Never
+ * under dpa_statslist_lock, which the last put takes. */
+void cdx_ft_ifstats_put(struct cdx_ft_stats_slot *slot)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	/* A put nobody took would return a record something still names. */
+	if (WARN_ON_ONCE(!slot->holds) || --slot->holds)
 		return;
-	*out = NULL;
+	if (slot->retained)
+		ifstats_retained--;
 	spin_lock(&dpa_statslist_lock);
 	/* Withdrawn under the same lock the fold reads under, so a reader
 	 * finds the slot published or finds nothing; never a freed one. */
@@ -488,6 +515,36 @@ void cdx_ft_ifstats_free(struct cdx_ft_stats_slot **out)
 	}
 	spin_unlock(&dpa_statslist_lock);
 	kfree(slot);
+}
+
+/* The adapter letting go. The publication is withdrawn now, whoever else
+ * still holds the record: the device it was published to may be gone and its
+ * index already someone else's, and the fold keys on the index alone. The
+ * record itself waits for the last hold. */
+void cdx_ft_ifstats_free(struct cdx_ft_stats_slot **out)
+{
+	struct cdx_ft_stats_slot *slot = *out;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	if (!slot)
+		return;
+	*out = NULL;
+	spin_lock(&dpa_statslist_lock);
+	list_del_init(&slot->published);
+	spin_unlock(&dpa_statslist_lock);
+	if (slot->holds > 1) {
+		slot->retained = true;
+		ifstats_retained++;
+		ifstats_deferred++;
+	}
+	cdx_ft_ifstats_put(slot);
+}
+
+void cdx_ft_ifstats_retention(unsigned int *retained, u64 *deferred)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	*retained = ifstats_retained;
+	*deferred = ifstats_deferred;
 }
 
 /* Zeroes for a record the carve does not hold, including every record once the
