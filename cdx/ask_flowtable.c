@@ -11370,9 +11370,9 @@ static u32 ft_ipsec_replay_bit(u32 top, u32 window, u32 k)
  * A fresh state has none. A re-added one carries the window it was read with,
  * and SEC's scorecard starts from it, so nothing the old SA accepted can be
  * accepted again. Positions past the state's own window are history xfrm does
- * not keep, and SEC may keep a wider window than the state asked for: they are
- * marked received, so a number xfrm would refuse as too old is refused rather
- * than taken once more.
+ * not keep, and past SEC's too, which is exactly as wide (ft_ipsec_spec()):
+ * they are marked received all the same, so the scorecard never calls unseen
+ * a number xfrm would refuse as too old.
  */
 static void ft_ipsec_replay_seen(const struct xfrm_state *x,
 				 struct cdx_ipsec_sa_spec *spec)
@@ -11443,9 +11443,17 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 		spec->seq = spec->dir == CDX_IPSEC_DIR_OUT ? x->replay.oseq
 							   : x->replay.seq;
 	}
+	/* SEC keeps an inbound window at exactly the width asked for, or not
+	 * at all (cdx_ipsec_replay_window_supported()): carried on another
+	 * width, it would take or drop late frames otherwise than xfrm's own
+	 * check of the same state. An outbound SA checks nothing, and its
+	 * window is no reason to refuse it. */
 	if (spec->dir == CDX_IPSEC_DIR_IN &&
-	    spec->replay_window > CDX_IPSEC_REPLAY_WINDOW_MAX) {
-		NL_SET_ERR_MSG(extack, "cdx: SEC's anti-replay window is at most 128 packets");
+	    !cdx_ipsec_replay_window_supported(spec->replay_window, spec->tunnel)) {
+		if (spec->replay_window == CDX_IPSEC_REPLAY_WINDOW_MAX)
+			NL_SET_ERR_MSG(extack, "cdx: SEC keeps a 128-packet replay window only in tunnel mode");
+		else
+			NL_SET_ERR_MSG(extack, "cdx: SEC keeps 32/64/128-packet replay windows");
 		return -EOPNOTSUPP;
 	}
 	if (spec->dir == CDX_IPSEC_DIR_IN)

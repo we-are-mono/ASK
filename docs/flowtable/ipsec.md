@@ -703,16 +703,19 @@ whose `oseq` is one below that or higher is refused.
 
 The ESP decapsulation PDB offers three windows in its ARS bits: 32, 64 and 128
 entries. SEC's stand-alone anti-replay command takes any width up to 128, but
-the ESP protocol does not expose it. A width between two sizes is carried on the
-next larger one. That loses nothing: anti-replay refuses every sequence number
-it has already seen at any width, and the width only bounds how late an unseen
-frame may arrive and still be accepted. A narrower window would drop late
-frames the configuration accepts, so an inbound window wider than 128 is
-refused with an extack message rather than narrowed, as mlx5 refuses any width
-its hardware does not keep (`mlx5e_xfrm_validate_state()`). An outbound SA
-checks nothing, and its window is ignored. Zero clears the window: the backend
-passes it to the cache create as `SA_ALLOW_SEQ_ROLL`, and the PDB gets
-`ARSNONE`. SAs created over FCI keep their 64 entries.
+the ESP protocol does not expose it. The 128-entry window also belongs to the
+tunnel-mode protocol alone (SEC's "new mode", `OP_PCLID_IPSEC_TUNNEL`); a
+transport SA runs the legacy protocol, for which ARS128 is not a width. An
+inbound SA is admitted only at a width SEC keeps exactly: 32, 64, or 128 in
+tunnel mode. Everything else is refused with an extack message
+(`cdx: SEC keeps 32/64/128-packet replay windows`), as mlx5 refuses every
+width its hardware does not keep (`mlx5e_xfrm_validate_state()`). A width used
+to be carried on the next larger window, but Linux drops a number
+`replay_window` or more behind the top, so SEC then took late frames that
+xfrm's own check of the same state refuses. An outbound SA checks nothing, and
+its window is ignored. Zero clears the window: the backend passes it to the
+cache create as `SA_ALLOW_SEQ_ROLL`, and the PDB gets `ARSNONE`. xfrm itself
+refuses an inbound ESN state with no window.
 
 SEC numbers and checks the frames, so xfrm's own replay state never moves
 unless the accounting pass moves it. Anything that carries a state on reads
@@ -739,9 +742,9 @@ both directions back, forward only:
 In the other direction, a state added with inbound history seeds the PDB with
 it. The sequence number anchors SEC's window, and the bitmap becomes its
 scorecard, so a re-add carries on from where the old SA left off. Positions
-past the state's own window are history xfrm does not keep, while SEC's window
-may be wider. They are marked as seen, so SEC refuses as a replay what xfrm
-would have refused as too old.
+past the state's own window are history xfrm does not keep, and past SEC's
+window too, which is exactly as wide. They are marked as seen all the same, so
+the scorecard never calls unseen a number xfrm would refuse as too old.
 
 One case is open. With ESN, the PDB is seeded with the window top's high word.
 The SEC RM says SEC holds its own stored ESN back after a rollover until the

@@ -1633,32 +1633,37 @@ static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 	return 0;
 }
 
-/* The anti-replay window SEC keeps for an inbound SA, as PDB options.
+/* The anti-replay window SEC keeps for an inbound SA, as PDB options, or
+ * -EOPNOTSUPP for a width it keeps no window of.
  *
  * The ESP decapsulation PDB names three widths in its ARS bits -- 32, 64 and
  * 128 entries (RM table 9-10) -- and ipsec_decap_pdb always has room for the
  * widest scorecard. SEC's stand-alone anti-replay command takes any width up
- * to 128, but the ESP protocol does not expose it. A window between two
- * widths is carried on the next wider, which loses nothing: anti-replay
- * refuses every sequence number it has already seen whatever the width, and
- * the width only bounds how late a frame never seen may still be taken. A
- * narrower window than asked would drop frames the configuration accepts,
- * which is why a window wider than 128 is refused when the SA is added
- * (CDX_IPSEC_REPLAY_WINDOW_MAX) rather than narrowed here. A zero width
- * comes with SA_ALLOW_SEQ_ROLL, which answers first; were it to arrive
- * alone, the SA would keep SEC's 64 entries.
+ * to 128, but the ESP protocol does not expose it, and the 128-entry window
+ * is the tunnel-mode protocol's alone: a transport SA runs the legacy one
+ * (OP_PCLID_IPSEC), for which ARS128 is not a width. Each width maps to its
+ * own window and nothing else maps at all. Linux refuses a number
+ * replay_window or more behind the top, so a width carried on a wider window
+ * would take late frames the state refuses, and on a narrower one would drop
+ * frames it takes. The backend refuses such an SA when it is added
+ * (cdx_ipsec_replay_window_supported()); this will not build one either. A
+ * zero width comes with SA_ALLOW_SEQ_ROLL, which is anti-replay off.
  */
-static u32 cdx_ipsec_ars(PSAEntry sa)
+static int cdx_ipsec_ars(PSAEntry sa)
 {
 	if (sa->flags & SA_ALLOW_SEQ_ROLL)
 		return PDBOPTS_ESP_ARSNONE;
-	if (!sa->replay_window)
-		return PDBOPTS_ESP_ARS64;
-	if (sa->replay_window <= 32)
+	switch (sa->replay_window) {
+	case 32:
 		return PDBOPTS_ESP_ARS32;
-	if (sa->replay_window <= 64)
+	case 64:
 		return PDBOPTS_ESP_ARS64;
-	return PDBOPTS_ESP_ARS128;
+	case 128:
+		if (sa->mode == SA_MODE_TUNNEL)
+			return PDBOPTS_ESP_ARS128;
+		break;
+	}
+	return -EOPNOTSUPP;
 }
 
 /* The decapsulation PDB's replay state: where the window stands, whether its
@@ -1677,22 +1682,28 @@ static u32 cdx_ipsec_ars(PSAEntry sa)
  * number zero in the same way. The rig check in docs/flowtable/ipsec.md
  * settles it; until then, a state re-added inside that stretch is the case
  * to watch.
+ *
+ * A width SEC keeps no window of builds nothing (cdx_ipsec_ars()).
  */
-static void cdx_ipsec_build_in_replay(PSAEntry sa, struct ipsec_decap_pdb *pdb)
+static int cdx_ipsec_build_in_replay(PSAEntry sa, struct ipsec_decap_pdb *pdb)
 {
+	int ars = cdx_ipsec_ars(sa);
 	unsigned int i;
 
+	if (ars < 0)
+		return ars;
 	pdb->seq_num = cpu_to_caam32(sa->seq & SEQ_NUM_LOW_MASK);
 	if (sa->flags & SA_ALLOW_EXT_SEQ_NUM) {
 		pdb->seq_num_ext_hi =
 			cpu_to_caam32((sa->seq & SEQ_NUM_HI_MASK) >> 32);
 		pdb->options |= PDBOPTS_ESP_ESN;
 	}
-	pdb->options |= cdx_ipsec_ars(sa);
+	pdb->options |= ars;
 	if (!(sa->flags & SA_ALLOW_SEQ_ROLL))
 		for (i = 0; i < SA_REPLAY_SEEN_WORDS; i++)
 			pdb->anti_replay[i] =
 				(__force __be32)cpu_to_caam32(sa->replay_seen[i]);
+	return 0;
 }
 
 static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
@@ -1701,13 +1712,16 @@ static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 	PDpaSecSAContext psec_as_context;
 	struct decap_ccm_opt *ccm_opt;
 	uint8_t *salt;
+	int rc;
 	/*struct iphdr *outer_ip_hdr;*/
 
 	psec_as_context = sa->pSec_sa_context;
-	sec_desc= psec_as_context->sec_desc; 
+	sec_desc= psec_as_context->sec_desc;
 	memset(&sec_desc->pdb_dec, 0, sizeof(sec_desc->pdb_dec));
 
-	cdx_ipsec_build_in_replay(sa, &sec_desc->pdb_dec);
+	rc = cdx_ipsec_build_in_replay(sa, &sec_desc->pdb_dec);
+	if (rc)
+		return rc;
 
 	if(sa->mode == SA_MODE_TUNNEL)
 	{
@@ -2016,11 +2030,12 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	if (cdx_dpa_get_ipsec_pool_info(&bpid, &buf_size))
 		return -EIO;
 	psec_sa_context = sa->pSec_sa_context;
-	if(sa->direction == CDX_DPA_IPSEC_OUTBOUND ){
-		cdx_ipsec_build_out_sa_pdb( sa);
-	}else{
-		cdx_ipsec_build_in_sa_pdb(sa);
-	}
+	if (sa->direction == CDX_DPA_IPSEC_OUTBOUND)
+		ret = cdx_ipsec_build_out_sa_pdb(sa);
+	else
+		ret = cdx_ipsec_build_in_sa_pdb(sa);
+	if (ret)
+		return ret;
 
 	/* check whether a split or a normal key is used */
 	if (psec_sa_context->auth_data.split_key_len) {

@@ -16,13 +16,37 @@ struct cdx_ipsec_sa;
  * cipher's nominal strength. */
 #define CDX_IPSEC_KEY_MAX 64
 
-/* The widest anti-replay window SEC keeps for an inbound SA, in packets. The
- * ESP decapsulation PDB names three widths, 32, 64 and 128 (the ARS bits of
- * its options byte); a narrower window is carried on the next wider one, and
- * a wider one than this cannot be honoured at all. Such an SA is refused, as
- * mlx5 refuses any width its hardware does not keep (mlx5e_xfrm_validate_state()),
- * rather than narrowed. */
+/* The widest anti-replay window SEC keeps for an inbound SA, in packets, and
+ * so how much of a scorecard the spec and the PDB carry. */
 #define CDX_IPSEC_REPLAY_WINDOW_MAX 128
+
+/* Whether SEC keeps an inbound SA's anti-replay window at exactly `window`
+ * packets, in the protocol a tunnel-mode SA, or else a transport one, runs.
+ *
+ * The ESP decapsulation PDB names three widths in the ARS bits of its options
+ * byte, 32, 64 and 128, and nothing between them. The 128-packet one belongs
+ * to the tunnel-mode protocol (OP_PCLID_IPSEC_TUNNEL, SEC's "new mode"); a
+ * transport SA runs the legacy protocol (OP_PCLID_IPSEC), which has only the
+ * other two. Zero is anti-replay off. Any other width is refused rather than
+ * carried on another: Linux drops a number replay_window or more behind the
+ * top, so a wider window would take late frames the state's own check refuses
+ * and a narrower one would drop frames it takes -- the same SA judged two ways
+ * depending on whether SEC or the stack sees the frame. mlx5 refuses every
+ * width its hardware does not keep as well (mlx5e_xfrm_validate_state()).
+ * Needs neither a transaction nor RTNL. */
+static inline bool cdx_ipsec_replay_window_supported(u32 window, bool tunnel)
+{
+	switch (window) {
+	case 0:
+	case 32:
+	case 64:
+		return true;
+	case CDX_IPSEC_REPLAY_WINDOW_MAX:
+		return tunnel;
+	default:
+		return false;
+	}
+}
 
 enum cdx_ipsec_dir {
 	CDX_IPSEC_DIR_IN,
@@ -115,9 +139,9 @@ struct cdx_ipsec_sa_spec {
 	u64 seq;
 	/* The anti-replay window an inbound SA asked for, in packets. Zero
 	 * turns anti-replay off, which the SA cache records as
-	 * SA_ALLOW_SEQ_ROLL. SEC keeps 32, 64 or 128 entries: a
-	 * narrower window is carried on the next wider one, and one wider
-	 * than CDX_IPSEC_REPLAY_WINDOW_MAX is refused. An outbound SA checks
+	 * SA_ALLOW_SEQ_ROLL. SEC keeps 32, 64 or, in tunnel mode, 128
+	 * entries, and any other width is refused
+	 * (cdx_ipsec_replay_window_supported()). An outbound SA checks
 	 * nothing and ignores it. */
 	u32 replay_window;
 	/* Which sequence numbers an inbound SA has already received, at and

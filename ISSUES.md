@@ -264,6 +264,12 @@ file's git history.
 - [x] **A283.** SEC drew random 64-bit IVs for offloaded GCM, CCM and CTR SAs, which collide after about 2^32 frames and, under GCM, give away the authentication key —
   fixed (_:/^cdx: count counter-mode IVs up from a random start per SA_).
 
+- [x] **A282.** An inbound SA's replay window between SEC's widths was carried on the next wider one, so SEC took late frames xfrm's check of the same state refuses —
+  fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
+
+- [x] **A286.** A transport-mode inbound SA with a 128-packet window got ARS128, which SEC's legacy transport protocol does not have —
+  fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
+
 - [x] **A275.** Routed multicast copies left with the egress port's MAC rather than their oif's (a VLAN or bridge VIF), as ipmr sends them, and no chain followed an oif's MAC change —
   fixed (_:/^flowtable: send a routed multicast copy from its oif's address_).
 

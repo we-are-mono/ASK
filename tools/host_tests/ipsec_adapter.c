@@ -3305,16 +3305,45 @@ static void test_spec_sequence(void)
 	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
 	assert(spec.seq == 9 && spec.replay_window == 128);
 
-	/* A window SEC cannot keep is refused, and said so, rather than
-	 * narrowed into dropping late frames the configuration accepts. */
-	esn->replay_window = CDX_IPSEC_REPLAY_WINDOW_MAX + 1;
+	/* A window SEC cannot keep at exactly its width is refused, and said
+	 * so, rather than carried on another width, where SEC would take late
+	 * frames xfrm's own check of the state refuses -- or drop ones it
+	 * takes. */
+	static const u32 foreign[] = { 1, 16, 31, 33, 48, 63, 65, 100, 127,
+				       CDX_IPSEC_REPLAY_WINDOW_MAX + 1, 256 };
+	for (unsigned i = 0; i < ARRAY_SIZE(foreign); i++) {
+		esn->replay_window = foreign[i];
+		ack._msg = NULL;
+		assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+		assert(ack._msg && !strcmp(ack._msg, "cdx: SEC keeps 32/64/128-packet replay windows"));
+	}
+	/* 128 is the tunnel-mode protocol's alone: a transport SA runs SEC's
+	 * legacy protocol, which keeps 32 and 64. */
+	x->props.mode = XFRM_MODE_TRANSPORT;
+	esn->replay_window = 128;
 	ack._msg = NULL;
-	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP && ack._msg);
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+	assert(ack._msg && !strcmp(ack._msg, "cdx: SEC keeps a 128-packet replay window only in tunnel mode"));
+	esn->replay_window = 64;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && spec.replay_window == 64);
+	x->props.mode = XFRM_MODE_TUNNEL;
 	/* An outbound SA checks nothing, so any window it names is no reason
-	 * to refuse it. */
+	 * to refuse it, in either mode: strongSwan gives one 0 or 1. */
 	x->xso.dir = XFRM_DEV_OFFLOAD_OUT;
 	esn->replay_window = 1024;
 	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	for (unsigned i = 0; i < ARRAY_SIZE(foreign); i++) {
+		esn->replay_window = foreign[i];
+		assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	}
+	x->props.mode = XFRM_MODE_TRANSPORT;
+	esn->replay_window = 128;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	x->props.mode = XFRM_MODE_TUNNEL;
+	x->replay_esn = NULL;
+	x->props.replay_window = 1;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	x->props.replay_window = 0;
 
 	x->replay_esn = NULL;
 	free(esn);
@@ -3645,7 +3674,7 @@ static void test_replay_round_trip(void)
 	first_state = *outbound_state();
 	first = &first_state;
 	first->xso.dir = XFRM_DEV_OFFLOAD_IN;
-	first->replay_esn = ring_alloc(96);
+	first->replay_esn = ring_alloc(128);
 	first->repl_mode = XFRM_REPLAY_MODE_BMP;
 	receive(first, 1, 200, missing, 3);
 
@@ -3654,12 +3683,12 @@ static void test_replay_round_trip(void)
 
 	/* From SEC, into a state installed fresh and anchored nowhere yet. */
 	second = install_accounted(&second_state, false, 0);
-	second->replay_esn = ring_alloc(96);
+	second->replay_esn = ring_alloc(128);
 	second->repl_mode = XFRM_REPLAY_MODE_BMP;
 	sa_of(second)->seq = spec.seq;
 	memcpy(sa_of(second)->seen, spec.replay_seen, sizeof(spec.replay_seen));
 	ft_ipsec_stats_work(NULL);
-	for (u64 s = 200 - 95; s <= 201; s++)
+	for (u64 s = 200 - 127; s <= 201; s++)
 		assert(accepts(second, s) == accepts(first, s));
 
 	free(first->replay_esn);

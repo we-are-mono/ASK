@@ -336,14 +336,16 @@ def both_feeders(base):
     ]
 
 
-def rounded_up(base):
-    """A 48-wide window rides SEC's 64-entry one: 50 behind the highest is
-    still accepted, 70 behind is not."""
+def exact(base, window):
+    """A window SEC keeps at exactly its width ends where Linux ends it: a
+    number window - 1 behind the highest is still taken, one window behind is
+    not (xfrm_replay_check_bmp())."""
+    top = base + window + 16
     return [
-        phase("fresh", whole(base, base + 80), [base, base + 80]),
-        phase("late-inside-64", whole(base + 30), [base + 30]),
-        phase("too-old-for-64", whole(base + 10), [], rejected=1),
-        phase("replay", whole(base + 80), [], rejected=1),
+        phase("fresh", whole(base, top), [base, top]),
+        phase("late-at-edge", whole(top - (window - 1)), [top - (window - 1)]),
+        phase("too-old-at-edge", whole(top - window), [], rejected=1),
+        phase("replay", whole(top), [], rejected=1),
     ]
 
 
@@ -362,7 +364,8 @@ CBC = Transform().algorithms
 REPLAY_CASES = [
     ("cbc-32", CBC, 32, both_feeders(1000)),
     ("rfc4106-32", AEAD["rfc4106-icv16"].algorithms, 32, both_feeders(1000)),
-    ("cbc-48", CBC, 48, rounded_up(2000)),
+    ("cbc-64", CBC, 64, exact(2000, 64)),
+    ("cbc-128", CBC, 128, exact(4000, 128)),
     ("cbc-0", CBC, 0, disabled(3000)),
 ]
 
@@ -454,37 +457,60 @@ async def test_flowtable_service_ipsec_replay_window(ipsec_service):
 LIMIT_LOCAL, LIMIT_PEER = "198.18.105.1", "198.18.105.2"
 
 
-async def test_ipsec_replay_window_limit(aiohttp_session, target_agent, splat_window):
-    """SEC keeps at most a 128-entry window. A wider one is refused with the
-    reason rather than silently narrowed, which would drop late frames the
-    configuration accepts; 128 itself installs."""
+# Each width an inbound SA asks for, the mode it runs in, and the refusal it
+# gets, or None where it installs. SEC keeps 32, 64 and -- in the tunnel-mode
+# protocol only -- 128 entries, and nothing between them.
+WIDTHS = [
+    (32, "tunnel", None),
+    (64, "tunnel", None),
+    (128, "tunnel", None),
+    (33, "tunnel", "cdx: SEC keeps 32/64/128-packet replay windows"),
+    (100, "tunnel", "cdx: SEC keeps 32/64/128-packet replay windows"),
+    (200, "tunnel", "cdx: SEC keeps 32/64/128-packet replay windows"),
+    (32, "transport", None),
+    (128, "transport", "cdx: SEC keeps a 128-packet replay window only in tunnel mode"),
+]
+
+
+async def test_ipsec_replay_window_exact(aiohttp_session, target_agent, splat_window):
+    """An inbound SA is offloaded only at a window SEC keeps exactly as wide.
+
+    Linux drops a number replay_window or more behind the highest, so a width
+    carried on SEC's next wider window took late frames the state's own check
+    refuses. Every other width is refused with the reason, and nothing is
+    installed: packet offload has no software fallback."""
     await endpoints_up(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=LIMIT_LOCAL,
                        peer=LIMIT_PEER, lladdr="02:00:00:00:05:02")
-    results = {}
+    results = []
+    identities = []
     try:
-        for window, spi in ((128, 0x4D6F0080), (200, 0x4D6F00C8)):
-            identity = ["src", LIMIT_PEER, "dst", LIMIT_LOCAL, "proto", "esp", "spi", hex(spi)]
+        for n, (window, mode, refusal) in enumerate(WIDTHS):
+            identity = ["src", LIMIT_PEER, "dst", LIMIT_LOCAL, "proto", "esp", "spi", hex(0x4D6F0100 + n)]
+            identities.append(identity)
             added = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "add", *identity,
-                                  "mode", "tunnel", "reqid", "49305", *CBC, "replay-window", str(window),
+                                  "mode", mode, "reqid", "49305", *CBC, "replay-window", str(window),
                                   "offload", "packet", "dev", TARGET_WAN_IF, "dir", "in", check=False)
             shown = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "get", *identity,
                                   check=False)
-            results[window] = {"add": added, "get": shown}
+            result = {"window": window, "mode": mode, "add": added, "get": shown}
+            results.append(result)
             if added["rc"] == 0:
                 await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "delete", *identity)
-        assert results[128]["add"]["rc"] == 0, results[128]
-        assert "replay_window 128" in results[128]["get"]["stdout"], results[128]
-        assert re.search(rf"crypto offload parameters: dev {TARGET_WAN_IF} dir in mode packet",
-                         results[128]["get"]["stdout"]), results[128]
-        refused = results[200]["add"]
-        assert refused["rc"] != 0, results[200]
-        assert "cdx: SEC's anti-replay window is at most 128 packets" in refused["stderr"], refused
-        # Packet offload has no software fallback: nothing was installed.
-        assert results[200]["get"]["rc"] != 0, results[200]
+            if refusal is None:
+                assert added["rc"] == 0, result
+                # Up to 32 in the legacy replay state, wider in the ESN-format
+                # one, which ip shows as replay_window.
+                assert re.search(rf"replay[-_]window {window}\b", shown["stdout"]), result
+                assert re.search(rf"crypto offload parameters: dev {TARGET_WAN_IF} dir in mode packet",
+                                 shown["stdout"]), result
+            else:
+                assert added["rc"] != 0, result
+                assert refusal in added["stderr"], result
+                assert shown["rc"] != 0, result
     finally:
-        for spi in (0x4D6F0080, 0x4D6F00C8):
-            await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "delete", "src", LIMIT_PEER,
-                          "dst", LIMIT_LOCAL, "proto", "esp", "spi", hex(spi), check=False)
+        for identity in identities:
+            await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "delete", *identity,
+                          check=False)
         await endpoints_down(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=LIMIT_LOCAL,
                              peer=LIMIT_PEER)
 

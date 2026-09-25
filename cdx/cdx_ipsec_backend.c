@@ -241,9 +241,10 @@ static int cdx_ipsec_set_keys(PSAEntry sa, const struct cdx_ipsec_sa_spec *spec,
  * SA is installed, so this runs before that: the outbound one seeds SEC one
  * past sa->seq, the inbound one anchors its window at sa->seq and starts its
  * scorecard from what the spec says was already received. The window is an
- * inbound SA's alone; SA_ALLOW_SEQ_ROLL, set at create from a zero width, is
- * what turns it off. The spec and the PDB number the scorecard the same way,
- * so it is copied as it stands.
+ * inbound SA's alone, at a width validation proved SEC keeps as it is;
+ * SA_ALLOW_SEQ_ROLL, set at create from a zero width, is what turns it off.
+ * The spec and the PDB number the scorecard the same way, so it is copied as
+ * it stands.
  */
 static void cdx_ipsec_set_sequence(PSAEntry sa,
 				   const struct cdx_ipsec_sa_spec *spec)
@@ -293,10 +294,11 @@ static int cdx_ipsec_validate(const struct cdx_ipsec_sa_spec *spec)
 	 * of describing it rather than something to discover later. */
 	if (spec->dir == CDX_IPSEC_DIR_OUT && is_zero_ether_addr(spec->dst_mac))
 		return -EINVAL;
-	/* A window SEC cannot keep is refused rather than narrowed: a
-	 * narrower one would drop late frames the configuration accepts. */
+	/* A window SEC cannot keep at exactly its width is refused rather than
+	 * carried on another, which would judge late frames otherwise than the
+	 * state does. */
 	if (spec->dir == CDX_IPSEC_DIR_IN &&
-	    spec->replay_window > CDX_IPSEC_REPLAY_WINDOW_MAX)
+	    !cdx_ipsec_replay_window_supported(spec->replay_window, spec->tunnel))
 		return -EOPNOTSUPP;
 	/* Without ESN the sequence space is 32 bits. An outbound SA has to
 	 * have a number left to send: SEC starts one past this one, and

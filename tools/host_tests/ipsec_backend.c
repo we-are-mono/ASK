@@ -12,8 +12,8 @@
  * out and byte-ordered the way SEC keeps it.
  *
  * Going the other way, what the backend accepts of a starting sequence number
- * and an anti-replay window, and which of SEC's three windows a width is
- * carried on, with the PDB option values taken from the kernel's own header.
+ * and an anti-replay window, and which of SEC's three windows a width is kept
+ * in, with the PDB option values taken from the kernel's own header.
  */
 #include <assert.h>
 #include <stdbool.h>
@@ -91,6 +91,8 @@ typedef struct {
 } DpaSecSAContext, *PDpaSecSAContext;
 typedef struct {
 	u8 direction;
+	/* Tunnel or transport, which decides the protocol SEC runs. */
+	u8 mode;
 	u16 flags;
 	u16 stats_offset;
 	u64 seq;
@@ -456,37 +458,60 @@ static void test_sequence(void)
 	assert(!c.packets && !c.bytes && !c.oseq);
 }
 
-/* Which of SEC's windows a width is carried on. */
+/* Which of SEC's windows a width is kept in: its own, or none. */
 static void test_replay_window(void)
 {
-	SAEntry sa = { .direction = CDX_DPA_IPSEC_INBOUND };
+	SAEntry sa = { .direction = CDX_DPA_IPSEC_INBOUND, .mode = SA_MODE_TUNNEL };
 
 	/* Anti-replay off is off, whatever width is recorded. */
 	sa.flags = SA_ALLOW_SEQ_ROLL;
 	sa.replay_window = 64;
 	assert(cdx_ipsec_ars(&sa) == PDBOPTS_ESP_ARSNONE);
 
-	/* An SA whose creator named no width -- the legacy owner -- keeps the
-	 * 64 entries it always had. */
+	/* No width without anti-replay off is no window at all, rather than
+	 * the 64 entries an owner that named none once got. */
 	sa.flags = 0;
 	sa.replay_window = 0;
-	assert(cdx_ipsec_ars(&sa) == PDBOPTS_ESP_ARS64);
+	assert(cdx_ipsec_ars(&sa) == -EOPNOTSUPP);
 
-	/* Each of SEC's widths as itself, and anything between them on the
-	 * next wider: never a narrower window than was asked for. */
-	for (unsigned w = 1; w <= 128; w++) {
-		u32 ars;
+	/* Each of SEC's widths as itself, and anything between them refused:
+	 * carried on the next wider, SEC would take late frames Linux refuses
+	 * for the same state. 128 is the tunnel-mode protocol's alone. */
+	for (unsigned w = 1; w <= 256; w++) {
+		int tunnel, transport;
 
 		sa.replay_window = w;
-		ars = cdx_ipsec_ars(&sa);
-		if (w <= 32)
-			assert(ars == PDBOPTS_ESP_ARS32);
-		else if (w <= 64)
-			assert(ars == PDBOPTS_ESP_ARS64);
-		else
-			assert(ars == PDBOPTS_ESP_ARS128);
-		assert((ars & PDBOPTS_ESP_ARS_MASK) == ars);
+		sa.mode = SA_MODE_TUNNEL;
+		tunnel = cdx_ipsec_ars(&sa);
+		sa.mode = SA_MODE_TRANSPORT;
+		transport = cdx_ipsec_ars(&sa);
+		if (w == 32) {
+			assert(tunnel == PDBOPTS_ESP_ARS32 && transport == PDBOPTS_ESP_ARS32);
+		} else if (w == 64) {
+			assert(tunnel == PDBOPTS_ESP_ARS64 && transport == PDBOPTS_ESP_ARS64);
+		} else if (w == 128) {
+			assert(tunnel == PDBOPTS_ESP_ARS128 && transport == -EOPNOTSUPP);
+		} else {
+			assert(tunnel == -EOPNOTSUPP && transport == -EOPNOTSUPP);
+			continue;
+		}
+		assert((tunnel & PDBOPTS_ESP_ARS_MASK) == tunnel);
+		/* And the backend's own predicate says the same. */
+		assert(cdx_ipsec_replay_window_supported(w, true));
+		assert(cdx_ipsec_replay_window_supported(w, false) == (w != 128));
 	}
+	for (unsigned w = 1; w <= 256; w++)
+		if (w != 32 && w != 64 && w != 128)
+			assert(!cdx_ipsec_replay_window_supported(w, true) &&
+			       !cdx_ipsec_replay_window_supported(w, false));
+	assert(cdx_ipsec_replay_window_supported(0, true) &&
+	       cdx_ipsec_replay_window_supported(0, false));
+	/* A build of an SA with such a width builds nothing. */
+	sa.mode = SA_MODE_TUNNEL;
+	sa.replay_window = 48;
+	memset(&pdb, 0, sizeof(pdb));
+	assert(cdx_ipsec_build_in_replay(&sa, &pdb.pdb_dec) == -EOPNOTSUPP);
+	assert(!pdb.pdb_dec.options && !pdb.pdb_dec.seq_num);
 }
 
 /* The spec's sequence space reaches the SA the PDB builders read, and an
@@ -509,8 +534,8 @@ static void test_set_sequence(void)
 	assert(!sa.replay_seen[0]);
 
 	/* Inbound: the highest received, the window, which SEC then keeps at
-	 * the width that covers it, and the scorecard it starts from, word for
-	 * word in the PDB's own numbering. */
+	 * that width, and the scorecard it starts from, word for word in the
+	 * PDB's own numbering. */
 	memset(&sa, 0, sizeof(sa));
 	spec.dir = CDX_IPSEC_DIR_IN;
 	spec.seq = 900;
@@ -552,7 +577,7 @@ static void sec_stores_again(void)
  * byte order, and read back as it went in. */
 static void test_replay_seed(void)
 {
-	SAEntry in = { .direction = CDX_DPA_IPSEC_INBOUND,
+	SAEntry in = { .direction = CDX_DPA_IPSEC_INBOUND, .mode = SA_MODE_TUNNEL,
 		       .pSec_sa_context = &context,
 		       .seq = 5000, .replay_window = 64,
 		       .replay_seen = { 0x8000000b, 0x40000001, 0xffffffff, 0x2 } };
@@ -564,7 +589,7 @@ static void test_replay_seed(void)
 	 * scorecard with the newest number in the least significant bit of
 	 * its first word. */
 	memset(&pdb, 0, sizeof(pdb));
-	cdx_ipsec_build_in_replay(&in, dec);
+	assert(cdx_ipsec_build_in_replay(&in, dec) == 0);
 	assert(caam32_to_cpu(dec->seq_num) == 5000 && !dec->seq_num_ext_hi);
 	assert(dec->options == PDBOPTS_ESP_ARS64);
 	assert(caam32_to_cpu(dec->anti_replay[0]) == 0x8000000b &&
@@ -579,7 +604,7 @@ static void test_replay_seed(void)
 	in.flags = SA_ALLOW_EXT_SEQ_NUM;
 	in.seq = (3ULL << 32) | 7;
 	in.replay_window = 128;
-	cdx_ipsec_build_in_replay(&in, dec);
+	assert(cdx_ipsec_build_in_replay(&in, dec) == 0);
 	assert(caam32_to_cpu(dec->seq_num) == 7 &&
 	       caam32_to_cpu(dec->seq_num_ext_hi) == 3);
 	assert(dec->options == (PDBOPTS_ESP_ESN | PDBOPTS_ESP_ARS128));
@@ -592,7 +617,7 @@ static void test_replay_seed(void)
 	memset(&pdb, 0, sizeof(pdb));
 	in.flags = SA_ALLOW_SEQ_ROLL;
 	in.seq = 9;
-	cdx_ipsec_build_in_replay(&in, dec);
+	assert(cdx_ipsec_build_in_replay(&in, dec) == 0);
 	assert(dec->options == PDBOPTS_ESP_ARSNONE);
 	for (unsigned int i = 0; i < SA_REPLAY_SEEN_WORDS; i++)
 		assert(!dec->anti_replay[i]);
@@ -746,17 +771,40 @@ static void test_validate(void)
 	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
 	spec.mtu = spec.dev_mtu = 0;
 
-	/* Every window SEC can keep, and none wider: a narrower one would
-	 * drop late frames the configuration accepts. */
-	spec.replay_window = CDX_IPSEC_REPLAY_WINDOW_MAX;
-	assert(cdx_ipsec_validate(&spec) == 0);
-	spec.replay_window = CDX_IPSEC_REPLAY_WINDOW_MAX + 1;
+	/* Every window SEC keeps as it is, and nothing between or beyond
+	 * them: carried on another width, SEC would take or drop late frames
+	 * otherwise than the state does. 128 only in tunnel mode, whose
+	 * protocol has it. */
+	spec.tunnel = true;
+	for (unsigned w = 0; w <= 256; w++) {
+		bool kept = w == 0 || w == 32 || w == 64 || w == 128;
+
+		spec.replay_window = w;
+		assert(cdx_ipsec_validate(&spec) == (kept ? 0 : -EOPNOTSUPP));
+	}
+	spec.replay_window = 33;
 	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
+	spec.replay_window = 100;
+	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
+	spec.tunnel = false;
+	spec.replay_window = 64;
+	assert(cdx_ipsec_validate(&spec) == 0);
+	spec.replay_window = CDX_IPSEC_REPLAY_WINDOW_MAX;
+	assert(cdx_ipsec_validate(&spec) == -EOPNOTSUPP);
+	spec.tunnel = true;
+	assert(cdx_ipsec_validate(&spec) == 0);
 
 	/* An outbound SA checks nothing, so its window is no reason to refuse
-	 * it. */
+	 * it, in either mode and at any width -- strongSwan gives one 0 or 1. */
 	spec.dir = CDX_IPSEC_DIR_OUT;
 	memcpy(spec.dst_mac, peer, ETH_ALEN);
+	for (unsigned w = 0; w <= 256; w++) {
+		spec.replay_window = w;
+		spec.tunnel = false;
+		assert(cdx_ipsec_validate(&spec) == 0);
+		spec.tunnel = true;
+		assert(cdx_ipsec_validate(&spec) == 0);
+	}
 	spec.replay_window = 4096;
 	assert(cdx_ipsec_validate(&spec) == 0);
 

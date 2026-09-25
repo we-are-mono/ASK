@@ -426,7 +426,7 @@ def test_ipsec_backend(tmp_path):
         header[header.index("#define CDX_IPSEC_KEY_MAX"):
                header.index("/* SA operations run inside")]
         + "\n".join(re.findall(
-            r"^#define\s+(?:SA_ALLOW_(?:EXT_SEQ_NUM|SEQ_ROLL)|SA_REPLAY_SEEN_WORDS|"
+            r"^#define\s+(?:SA_ALLOW_(?:EXT_SEQ_NUM|SEQ_ROLL)|SA_REPLAY_SEEN_WORDS|SA_MODE_\w+|"
             r"CDX_DPA_IPSEC_(?:IN|OUT)BOUND)\s.*$",
             control, re.M))
         # SEC's own option values and PDB layout, and the shared descriptor
