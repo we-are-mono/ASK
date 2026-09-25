@@ -39,6 +39,7 @@ import pytest_asyncio
 
 from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
+from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mroute_capture import MAGIC, multicast_mac, payload
 from test_flowtable_offload import ARTIFACTS, command, read, status_text, stop_boot_daemon
@@ -260,46 +261,6 @@ def in_hardware(window: dict, streams: int = 1) -> None:
 def in_software(window: dict, streams: int = 1) -> None:
     """The whole stream reached the CPU: the classifier matched none of it."""
     assert window["stream_cpu"] >= COUNT * streams, (window["stream_cpu"], window["cpu"], window["idle"])
-
-
-CPU_TABLE = "ask_mc_cpu"
-
-
-@asynccontextmanager
-async def stream_cpu_counters(target, session, ports: tuple[int, ...]):
-    """Count the test streams' frames that reach the CPU, per port.
-
-    A netdev ingress chain on each port counts UDP to the streams' own ports.
-    The kernel has taken a VLAN tag off before this hook, and a frame the
-    classifier replicates never gets here, so it counts the streams' CPU
-    frames and nothing else; the port's own receive counter also moves for
-    everything else on the segment, and a one-second querier draws a burst
-    of reports from every host on it.
-
-    Installed once, before a case learns anything, and only read around a
-    window (cpu_frames()): the routed learner takes any ruleset commit as
-    unconfirming every routed group, so a table written inside a window
-    would itself send a routed stream to the CPU."""
-    await command(target, session, "nft", "delete", "table", "netdev", CPU_TABLE, check=False)
-    await command(target, session, "nft", "add", "table", "netdev", CPU_TABLE)
-    try:
-        for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
-            await command(target, session, "nft", "add", "chain", "netdev", CPU_TABLE, dev, "{", "type",
-                          "filter", "hook", "ingress", "device", dev, "priority", "-500", ";",
-                          "policy", "accept", ";", "}")
-            await command(target, session, "nft", "add", "rule", "netdev", CPU_TABLE, dev, "udp", "dport",
-                          "{", ", ".join(str(p) for p in ports), "}", "counter")
-        yield
-    finally:
-        await command(target, session, "nft", "delete", "table", "netdev", CPU_TABLE, check=False)
-
-
-async def cpu_frames(target, session, ingress: str) -> int:
-    """The stream frames that have reached the CPU on `ingress` so far."""
-    listed = json.loads((await command(target, session, "nft", "-j", "list", "chain", "netdev",
-                                       CPU_TABLE, ingress))["stdout"])
-    return sum(e["counter"]["packets"] for item in listed["nftables"] if "rule" in item
-               for e in item["rule"]["expr"] if "counter" in e)
 
 
 def packets(row: dict | None) -> int:

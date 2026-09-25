@@ -18,6 +18,7 @@ import uuid
 import pytest
 
 from ask_orch.counters import kernel_rx_packets
+from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _topology import (
     LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
     VLAN_IDS_MROUTE_LIMIT, VLAN_ID_PPPOE_WAN,
@@ -185,33 +186,33 @@ async def _window(target, session, *, family, group, observers,
     config = {"family": family, "source": wan_source_address(family), "group": group,
               "port": PORT, "count": COUNT, "token": uuid.uuid4().hex}
     captures = []
-    idle_start = await kernel_rx_packets(target, session, TARGET_WAN_IF)
-    await asyncio.sleep(COUNT / PPS)
-    idle = await kernel_rx_packets(target, session, TARGET_WAN_IF) - idle_start
     async with AsyncExitStack() as stack:
         for peer, interfaces in observers:
             captures.append(await stack.enter_async_context(
                 _capture(peer, {**config, "interfaces": interfaces})))
         before_row = await mroute_proc_row(target, session, group)
-        before = await kernel_rx_packets(target, session, TARGET_WAN_IF)
+        counted = await cpu_frames(target, session, TARGET_WAN_IF)
+        rx = await kernel_rx_packets(target, session, TARGET_WAN_IF)
         await asyncio.to_thread(_send, config)
-        after = await kernel_rx_packets(target, session, TARGET_WAN_IF)
         await asyncio.sleep(0.4)  # drain receiver queues before requesting output
+        cpu = await cpu_frames(target, session, TARGET_WAN_IF) - counted
+        rx = await kernel_rx_packets(target, session, TARGET_WAN_IF) - rx
     results = {}
     for capture in captures:
         results.update(await _finish(capture))
     row = await mroute_proc_row(target, session, group)  # also folds MFC counters
     route, _ = await mroute_line(target, session, family, config["source"], group)
+    # The port's receive count is for the record only: the WAN segment's own
+    # traffic moves it too (see _mcast_cpu), and the stream's count does not.
     artifact = {"config": config, "results": results, "before": before_row,
-                "after": row, "mroute": route, "cpu_rx": after - before, "idle": idle}
+                "after": row, "mroute": route, "stream_cpu": cpu, "port_rx": rx}
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     (ARTIFACTS / f"mroute-capacity-{label}-v{family}.json").write_text(json.dumps(artifact, indent=2))
     assert_results(results, expected, COUNT)
     assert ("offload" in route) == hardware, route
-    cpu = after - before
     if hardware:
         assert "state=installed" in row, row
-        assert cpu - idle < COUNT * 0.1, artifact
+        assert cpu < COUNT * 0.1, artifact
         packets = lambda text: int(re.search(r"packets=(\d+)", text)[1])
         assert packets(row) - packets(before_row) >= COUNT * 0.95, artifact
     else:
@@ -240,7 +241,8 @@ async def test_routed_listener_ceiling(aiohttp_session, target_agent, lan,
                 ipv6=f"fd00:158:{vid:x}::1/64"))
             peers.append(await lan_vlan_subif(topology, lan, parent=LAN_NIC, vid=vid))
         mac = await dut_mac(target_agent, aiohttp_session, TARGET_LAN_IF)
-        async with _daemon(target_agent, aiohttp_session, [TARGET_WAN_IF, *dut]) as ctl:
+        async with stream_cpu_counters(target_agent, aiohttp_session, (PORT,)), \
+                _daemon(target_agent, aiohttp_session, [TARGET_WAN_IF, *dut]) as ctl:
             await ctl("add", TARGET_WAN_IF, wan_source_address(family), group, *dut[:8])
             for size in (8, 9, 8):
                 if size == 9:
@@ -298,8 +300,8 @@ print(subprocess.check_output(['ip', '-j', '-d', 'link', 'show', 'dev', {wan_pee
         # own sender address, without changing its addresses or routes.
         lan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_LAN_IF)
         wan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_WAN_IF)
-        async with _daemon(target_agent, aiohttp_session,
-                           [TARGET_WAN_IF, lan_oif, wan_oif]) as ctl:
+        async with stream_cpu_counters(target_agent, aiohttp_session, (PORT,)), \
+                _daemon(target_agent, aiohttp_session, [TARGET_WAN_IF, lan_oif, wan_oif]) as ctl:
             await ctl("add", TARGET_WAN_IF, wan_source_address(family), group, lan_oif, wan_oif)
             await _state(target_agent, aiohttp_session, group, "installed",
                          [f"{TARGET_LAN_IF}/{vid}", f"{TARGET_WAN_IF}/{wan_vid}"],

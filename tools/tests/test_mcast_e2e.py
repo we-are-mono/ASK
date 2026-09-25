@@ -23,7 +23,8 @@ oracles, and the third is the one that discriminates:
      "actually installed", and it is where a disagreement with (1) surfaces.
   3. **The DUT's CPU does not see the stream.** A hardware-replicated frame is
      matched and transmitted by the FMAN and never reaches the host, so a
-     capture on the DUT's bridge device counts ~0 while loki counts thousands.
+     counter on the ingress port's netdev hook, keyed on the stream's own UDP
+     port, counts ~0 while loki counts thousands.
      Software flooding cannot produce that, and neither can a group that is
      merely present in a table but not matching.
 
@@ -50,9 +51,9 @@ import re
 import pytest
 import pytest_asyncio
 
-from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
 
+from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _mcast_helpers import (  # noqa: F401  (fixture imported for resolution)
     arm_bridge_querier,
     capture_parallel_window,
@@ -118,6 +119,14 @@ STREAM_PPS = 500
 
 
 # ---------------------------------------------------------------- fixtures
+
+@pytest_asyncio.fixture
+async def stream_cpu(aiohttp_session, target_agent):
+    """The stream's own CPU counters (_mcast_cpu), installed before the case
+    learns anything: a ruleset commit later would unconfirm a routed group."""
+    async with stream_cpu_counters(target_agent, aiohttp_session, (MCAST_PORT,)):
+        yield
+
 
 @pytest_asyncio.fixture
 async def mcast_bridge(aiohttp_session, target_agent):
@@ -308,26 +317,6 @@ async def hardware_has_group(target_agent, session, group: str) -> bool:
     return group in await flowtable_proc(target_agent, session)
 
 
-async def dut_cpu_frame_count(target_agent, session, iface: str,
-                              window_s: float) -> int:
-    """How many frames the DUT's CPU received on `iface` during the window.
-
-    The discriminating oracle. A hardware-replicated frame is matched and
-    transmitted by the FMAN without ever being enqueued to the host, so this
-    stays at the segment's background noise when the offload is carrying the
-    stream and rises by the whole stream when software is forwarding it.
-
-    The SDK driver's private `rx packets [TOTAL]` rather than a capture: the
-    agent's capture window snapshots dmesg and counters and records no
-    packets at all, and the netdev totals it would otherwise be read from
-    include the hardware's own counts (ISSUES.md A136), which is precisely
-    the traffic this has to exclude.
-    """
-    before = await kernel_rx_packets(target_agent, session, iface)
-    await asyncio.sleep(window_s)
-    return await kernel_rx_packets(target_agent, session, iface) - before
-
-
 # ------------------------------------------------------------ LAN VM side
 
 def _join_script(group: str, port: int, source: str | None,
@@ -476,23 +465,6 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
         f"a stale entry from an earlier run would satisfy every oracle here"
     )
 
-    # What the segment costs the CPU anyway, measured before the consumer
-    # starts rather than inside its window. The counter below is the whole
-    # port's, and this is a populated lab: ARP, SSDP and the agent's own
-    # management traffic all arrive here and all reach the CPU, and the port
-    # carries the DUT's management address while it is bridged. Roughly thirty
-    # frames a second of that is enough to spend a flat five-percent budget on
-    # its own, which is how this read failed once with the offload carrying
-    # every frame of the group. What the case is entitled to assert is the
-    # *excess*.
-    #
-    # Before the joiner, not after it: the consumer's window is only four
-    # seconds longer than the stream's, and an idle window inside it leaves no
-    # room for the stream itself.
-    idle = await dut_cpu_frame_count(
-        target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
-    )
-
     joiner = asyncio.create_task(lan_join_and_count(
         lan, group=group, source=source, family=family,
         seconds=STREAM_S + 4.0, igmp_version=igmp_version, label=label,
@@ -500,17 +472,15 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
     # Let the report reach the bridge and the learner act on it.
     await asyncio.sleep(2.0)
 
-    # On the ingress port, not on the bridge device: the counter that
-    # discriminates is the SDK driver's own, and a bridge master has none.
-    cpu_frames = asyncio.create_task(dut_cpu_frame_count(
-        target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
-    ))
+    # On the ingress port, not on the bridge device: the port's hook sees a
+    # frame before the bridge does, and a replicated one not at all.
+    counted = await cpu_frames(target_agent, aiohttp_session, TARGET_WAN_IF)
     await asyncio.to_thread(
         send_stream_from_vision, group, family, STREAM_S, STREAM_PPS,
     )
 
     received = await joiner
-    cpu_seen = await cpu_frames
+    cpu_seen = await cpu_frames(target_agent, aiohttp_session, TARGET_WAN_IF) - counted
     offloaded = await mdb_reports_offload(target_agent, aiohttp_session, group)
     in_hw = await hardware_has_group(target_agent, aiohttp_session, group)
 
@@ -529,13 +499,11 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
         f"some path other than the membership it was supposed to come from"
     )
     # The discriminating one.
-    assert cpu_seen - idle < sent * 0.05, (
-        f"{group}: the DUT's CPU received {cpu_seen} frames on "
-        f"{TARGET_WAN_IF} while the stream ran against {idle} over an idle "
-        f"window of the same length, so {cpu_seen - idle} of {sent} are this "
-        f"group's. A hardware-replicated frame never reaches the CPU, so the "
-        f"bridge is still flooding this group in software whatever the table "
-        f"says"
+    assert cpu_seen < sent * 0.05, (
+        f"{group}: {cpu_seen} of the {sent} frames sent reached the DUT's CPU "
+        f"on {TARGET_WAN_IF}. A hardware-replicated frame never reaches the "
+        f"CPU, so the bridge is still flooding this group in software "
+        f"whatever the table says"
     )
 
 
@@ -544,7 +512,7 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
     ("v2", None, 2),
 ])
 async def test_bridged_ipv4(aiohttp_session, target_agent, lan, mcast_bridge,
-                            case, source_kind, igmp_version):
+                            stream_cpu, case, source_kind, igmp_version):
     """IPv4, both report versions.
 
     v3 INCLUDE gives the MDB a source, so the membership alone composes a key.
@@ -564,7 +532,7 @@ async def test_bridged_ipv4(aiohttp_session, target_agent, lan, mcast_bridge,
     ("mldv1", None),
 ])
 async def test_bridged_ipv6(aiohttp_session, target_agent, lan, mcast_bridge,
-                            case, source_kind):
+                            stream_cpu, case, source_kind):
     """IPv6, both report versions, against the mc6 side of the encoder."""
     source = wan_source_address(6) if source_kind == "explicit" else None
     await run_bridged_case(
@@ -805,28 +773,18 @@ async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
     # about this group. Measured rather than reasoned: the same case with the
     # capture removed goes from 0 of 1500 delivered to 1500 of 1500, with the
     # classifier counting both runs.
-    # The segment's own cost, measured before the consumer starts rather than
-    # inside its window: the port counter is the whole port's, and what this
-    # case is entitled to assert is the excess over the ARP, SSDP and
-    # management traffic the CPU receives here anyway. Before the joiner,
-    # because its window is only a few seconds longer than the stream's.
-    idle = await dut_cpu_frame_count(
-        target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
-    )
     joiner = asyncio.create_task(lan_join_and_count(
         lan, group=group, source=None, family=family,
         seconds=STREAM_S + 4.0, igmp_version=None, label=label,
         iface=lan_iface,
     ))
     await asyncio.sleep(2.0)
-    cpu_frames = asyncio.create_task(dut_cpu_frame_count(
-        target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
-    ))
+    counted = await cpu_frames(target_agent, aiohttp_session, TARGET_WAN_IF)
     await asyncio.to_thread(
         send_stream_from_vision, group, family, STREAM_S, STREAM_PPS,
     )
     received = await joiner
-    cpu_seen = await cpu_frames
+    cpu_seen = await cpu_frames(target_agent, aiohttp_session, TARGET_WAN_IF) - counted
 
     # Second window: the console is idle now, so the capture has it to itself.
     # This is the one that answers what the replicas look like on the wire.
@@ -867,12 +825,11 @@ async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
         f"offload: {line!r}. MFC_OFFLOAD is set by the learner after a "
         f"successful install, so the two disagreeing means the flag was "
         f"never written or was cleared behind the entry's back")
-    assert cpu_seen - idle < sent * 0.05, (
-        f"{group}: the DUT's CPU received {cpu_seen} frames on "
-        f"{TARGET_WAN_IF} while the stream ran against {idle} over an idle "
-        f"window of the same length, so {cpu_seen - idle} of {sent} are this "
-        f"group's. A hardware-replicated frame never reaches the CPU, so ipmr "
-        f"is still forwarding this group in software whatever the table says")
+    assert cpu_seen < sent * 0.05, (
+        f"{group}: {cpu_seen} of the {sent} frames sent reached the DUT's CPU "
+        f"on {TARGET_WAN_IF}. A hardware-replicated frame never reaches the "
+        f"CPU, so ipmr is still forwarding this group in software whatever "
+        f"the table says")
     assert packets - before > 2 * sent * 0.9, (
         f"{group}: `ip -s mroute` moved by {packets - before} over two "
         f"streams of {sent}. The software counter is zero for an offloaded "
@@ -907,7 +864,7 @@ async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
 
 @pytest.mark.parametrize("family", [4, 6])
 async def test_routed_to_a_port(aiohttp_session, target_agent, lan, smcrouted,
-                                family):
+                                stream_cpu, family):
     """The plain shape, both families: one (S,G), one oif, and that oif is the
     LAN port itself.
     """
@@ -920,7 +877,7 @@ async def test_routed_to_a_port(aiohttp_session, target_agent, lan, smcrouted,
 
 
 async def test_routed_to_a_vlan_subinterface(aiohttp_session, target_agent,
-                                             lan, smcrouted):
+                                             lan, smcrouted, stream_cpu):
     """The oif is a VLAN device over the LAN port.
 
     The listener is the port beneath it and the tag is pushed by the entry's
@@ -950,7 +907,7 @@ async def test_routed_to_a_vlan_subinterface(aiohttp_session, target_agent,
 
 async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
                                                    target_agent, lan,
-                                                   smcrouted):
+                                                   smcrouted, stream_cpu):
     """Two oifs on the one LAN port: untagged, and tagged on a sub-interface.
 
     This is the only multi-listener replication this rig can do, and it is the
@@ -1000,23 +957,18 @@ async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
         # console and cannot be in flight together. The two copies are still
         # counted separately, which is what discriminates replication from one
         # copy seen twice -- they are just counted one stream apart.
-        idle = await dut_cpu_frame_count(
-            target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
-        )
         joiner = asyncio.create_task(lan_join_and_count(
             lan, group=group, source=None, family=4,
             seconds=STREAM_S + 4.0, igmp_version=None,
             label="mroute_pair", iface=LAN_NIC,
         ))
         await asyncio.sleep(2.0)
-        cpu_frames = asyncio.create_task(dut_cpu_frame_count(
-            target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
-        ))
+        counted = await cpu_frames(target_agent, aiohttp_session, TARGET_WAN_IF)
         await asyncio.to_thread(
             send_stream_from_vision, group, 4, STREAM_S, STREAM_PPS,
         )
         untagged = await joiner
-        cpu_seen = await cpu_frames
+        cpu_seen = await cpu_frames(target_agent, aiohttp_session, TARGET_WAN_IF) - counted
 
         spawn_parallel_tcpdumps(lan, [lan_if], [capfile],
                                 f"udp port {MCAST_PORT}")
@@ -1035,10 +987,9 @@ async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
             f"{group}: the tagged copy arrived {tagged} of {sent} times on "
             f"{lan_if}. One copy of two means the chain carries one entry "
             f"where it should carry two")
-        assert cpu_seen - idle < sent * 0.05, (
-            f"{group}: {cpu_seen - idle} of {sent} frames reached the DUT's "
-            f"CPU above the segment's own {idle}, so ipmr replicated this in "
-            f"software")
+        assert cpu_seen < sent * 0.05, (
+            f"{group}: {cpu_seen} of {sent} frames reached the DUT's CPU, so "
+            f"ipmr replicated this in software")
 
         # The chain swap, triggered the way one really happens: the VLAN device
         # carrying the second oif goes away, ipmr withdraws its VIF, and the
@@ -1074,7 +1025,7 @@ async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
 
 
 async def test_routed_to_a_bridge(aiohttp_session, target_agent, lan,
-                                  smcrouted, mroute_lan_bridge):
+                                  smcrouted, mroute_lan_bridge, stream_cpu):
     """The oif is a bridge over the LAN port, with snooping off.
 
     br_dev_xmit() hands such a frame to br_flood(), so the listener set is

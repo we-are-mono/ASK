@@ -16,7 +16,7 @@ import pytest_asyncio
 from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
 from _mcast_helpers import arm_bridge_querier
-from _mcast_windows import cpu_frames, stream_cpu_counters
+from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _mcast_wire import capture, frames, new_config, send
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mcast_wire_capture import multicast_mac
