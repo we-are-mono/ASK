@@ -178,6 +178,27 @@ result independently of those temporary files.
   Captures, image identity and diagnostic scripts:
   `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
 
+- [ ] **A276 — the data plane wedged twice under a flooded ESP SA.**
+  During `test_flowtable_service_ipsec_shared_sequence` (CBC, build 4) and its GCM
+  variant in `test_flowtable_service_ipsec_replay.py` (build 5), each deep in a long
+  IPsec file sequence, the first 4 s flood of a newly admitted flow on a fresh SA left
+  both 10G Rx ports, eth4's Tx port and the HC port with every task held at enqueue, and
+  SEC busy with no traffic (SSTA `0x405`, healthy `0x406`). eth3's Tx still dequeued, and
+  QMan, BMan and FMan DMA reported nothing wrong. Thirty seconds later the flow's retire
+  timed out an HC command (`HC confirmation timed out; board reset required`), and only a
+  reset recovered. Best-fitting reading, unproven: a SEC job of the flooded SA hangs, and
+  FMan's in-order enqueue stream to QMan blocks behind that SA's to-SEC queue. Patch 106
+  (CPU- and FMan-fed jobs sharing one SERIAL descriptor) is the plausible trigger. Rate:
+  2 in ~14 shared-sequence runs on builds 4-5, 0 in ~34 on builds 6-7, including a
+  20-round re-admission stress and four back-to-back replay-file runs, so builds 6-7 may
+  not carry it; nothing there is known to fix it. At the next wedge, before any reset:
+  CAAM SSTA/QISTA/QIDESC/DECO debug registers (`0x1700FD4`, `0x177000C`,
+  `0x1770100-30`, `0x1780E00-18` per DECO), the FPM task table twice 10 s apart, the
+  QMI/BMI port registers, and one QMan FQ query at a time on a spare CPU, never
+  `qman/fqd/state_*` (it walks every FQ with interrupts off and starves RCU). Then flush
+  SEC's queue interface (`QICTL_LS`) and watch whether the Rx frame counters resume: that
+  shows which side is the head, and whether a runtime recovery exists.
+
 ## Feature enablement (not bugs)
 
 Config-gated capabilities that are OFF in the current product — not defects.
