@@ -645,10 +645,16 @@ and the SA's classifier entries keep forwarding until the retirement that
 follows removes them. An SA can therefore run past its hard limit by up to
 one accounting period, plus the retirement's latency.
 
-An outbound SA on the extended encapsulation descriptor, which it gets only
-when its features overflow the normal one, keeps no counters at all: that
-builder never enables them. Such an SA reports none, and only its time limits
-apply. Every other SA has counters, whatever its outer family, despite old
+Every SA is built on the one shared descriptor that fits SEC's queue
+interface, 50 words. NXP's extended encapsulation descriptor, which an
+outbound SA overflowing that used to get, never stored its PDB back after a
+job: its counters stayed at zero, nothing ordered SEC's refetch of the
+sequence number against another DECO's update of it, and the number read back
+for xfrm never moved. It is gone. Nothing admitted comes near the limit, the
+largest descriptor (CBC or CCM with a split HMAC key behind an IPv6 NAT-T
+outer header) taking 48 words, so an SA that would overflow it is a change to
+the builder: `cdx_ipsec_create_shareddescriptor()` warns once and refuses it.
+Every SA has counters, whatever its outer family, despite old
 comments in the builder that said IPv4 only. `cdx_ipsec_pdb_len()` places them
 past the outer header the encapsulation PDB carries: 20 or 40 bytes, plus 8
 for NAT-T. The decapsulation PDB carries no header, so its layout is the same

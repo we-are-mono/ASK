@@ -27,8 +27,6 @@
 					* 2 words for packets
 					* 2 words for bytes
 					*/
-/* The maximum length (in bytes) for the CAAM extra commands */
-#define MAX_EXTRA_DESC_COMMANDS         (64 * sizeof(U32))
 
 
 

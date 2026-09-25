@@ -682,15 +682,14 @@ void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	memset(counters, 0, sizeof(*counters));
 	if (!sa || !sa->entry)
 		return;
-	/* The extended encapsulation descriptor, which an outbound SA gets only
-	 * when its features overflow the normal one, keeps no counters: its
-	 * builder never enables them and leaves stats_offset at zero, where a
-	 * read would take the PDB's options word for a packet count. Such an
-	 * SA reports none, and xfrm judges its time limits alone. Its sequence
-	 * number reads as installed, because that builder does not store the
-	 * PDB back either; a stale number only ever errs low. */
+	/* Every descriptor the builder makes keeps these counters, and SEC
+	 * stores them back with the PDB after each job. An offset of zero is a
+	 * descriptor never built, where a read would take the PDB's options
+	 * word for a packet count and a PDB nothing stores for the sequence:
+	 * nothing is reported, which a published number or window only ever
+	 * takes as no news. */
 	if (!sa->entry->stats_offset)
-		goto sequence;
+		return;
 	if (cdx_ipsec_sa_sample(sa->entry, &packets, &bytes) &&
 	    cdx_ipsec_sa_bytes_believable(sa, bytes)) {
 		/* Unsigned 32-bit difference, so a count that wrapped since
@@ -701,7 +700,6 @@ void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	}
 	counters->packets = sa->packets;
 	counters->bytes = sa->bytes;
-sequence:
 	if (sa->entry->direction == CDX_DPA_IPSEC_OUTBOUND) {
 		counters->oseq = get_oseq_from_sa(sa->entry);
 	} else if (!(sa->entry->flags & SA_ALLOW_SEQ_ROLL) &&

@@ -370,7 +370,9 @@ static void test_implausible_bytes(void)
 	assert(c.bytes == 0x1000005a0ULL + (5ULL << 32) + 1000000000);
 }
 
-/* A descriptor built without counters is never read for them. */
+/* A descriptor never built is read for nothing: no counters, whose offset
+ * would be the PDB's options word, and no sequence either, which nothing
+ * stores back into its PDB. */
 static void test_no_counters(void)
 {
 	SAEntry bare = { .direction = CDX_DPA_IPSEC_OUTBOUND,
@@ -383,9 +385,11 @@ static void test_no_counters(void)
 	descriptor.bytes = 9999;
 	pdb_next(0, 43);
 	cdx_ipsec_sa_stats(&sa, &c);
-	assert(!descriptor_reads && !c.packets && !c.bytes);
-	/* Its sequence number still reads. */
-	assert(c.oseq == 42);
+	assert(!descriptor_reads && !c.packets && !c.bytes && !c.oseq);
+	bare.direction = CDX_DPA_IPSEC_INBOUND;
+	replay_reads = 0;
+	cdx_ipsec_sa_stats(&sa, &c);
+	assert(!replay_reads && !c.seq);
 }
 
 static void test_sequence(void)

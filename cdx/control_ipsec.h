@@ -139,11 +139,6 @@ typedef struct dpa_sec_sa_context_s{
                                           * computed the SEC 4.x descriptor
                                           * according to the SA information.
                                           * do not free this pointer!         */
-        U32  *sec_desc_extra_cmds_unaligned;
-        U32   *sec_desc_extra_cmds; /* aligned to CORE cache line size     */
-        U8  job_desc_len; /* Number of words CAAM Job Descriptor occupies
-                                * form the CAAM Descriptor length
-                                * MAX_CAAM_DESCSIZE                           */
 
 	/* The descriptor's KEY commands DMA-read these bus addresses on
 	 * every SEC job, so the mappings must live as long as the SA —
@@ -195,12 +190,12 @@ typedef struct _tSAEntry {
 	 * Clear unless its creator carried history in with it; the
 	 * decapsulation PDB holds SA_REPLAY_SEEN_WORDS of them. */
 	U32			replay_seen[SA_REPLAY_SEEN_WORDS];
-	U8                      enable_stats;
-	U8                      hdr_flags;          // copy DF,TOS  
+	U8                      hdr_flags;          // copy DF,TOS
+	/* Where the per-SA counters sit in the shared descriptor, in bytes:
+	 * past the PDB, which SEC stores back with them after every job
+	 * (cdx_ipsec_stats_offset()). Set when the descriptor is built. */
 	U16                     stats_offset;
 	struct hw_ct 		*ct;
-	U16                    	stats_indx;
-	U16                    	next_cmd_indx;
 	/* The DPAA port the SA is bound to, whose private area the SA's
 	 * exception queue borrows to deliver what SEC returns. Its creator
 	 * sets it and holds the device for the SA's life. */

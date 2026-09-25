@@ -264,6 +264,9 @@ file's git history.
 - [x] **A283.** SEC drew random 64-bit IVs for offloaded GCM, CCM and CTR SAs, which collide after about 2^32 frames and, under GCM, give away the authentication key —
   fixed (_:/^cdx: count counter-mode IVs up from a random start per SA_).
 
+- [x] **A285.** An outbound SA overflowing the shared descriptor got NXP's extended one, which never stored its PDB back, so its sequence state was unordered across DECOs and never reached xfrm —
+  fixed (_:/^cdx: build every SA on the descriptor that stores its PDB back_).
+
 - [x] **A282.** An inbound SA's replay window between SEC's widths was carried on the next wider one, so SEC took late frames xfrm's check of the same state refuses —
   fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
 
