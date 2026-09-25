@@ -1,4 +1,4 @@
-From 22e8f65942a33d6489d3a5fdcb067c7413627fa1 Mon Sep 17 00:00:00 2001
+From 2a5c7e5d3d6b0930b1b4cd9261eef54b3efed437 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -51,6 +51,14 @@ ESP, a frame the driver could not queue, ESP delivered by GRO -- as
 XfrmInStateMismatch rather than decrypt it against a second window. A
 state another driver offloads is received as upstream receives it.
 
+A packet-offloaded state's sequence numbers and anti-replay window move in
+its device, so xfrm's copy of them is the driver's to publish.
+XFRM_MSG_GETAE and xfrm_state_migrate() ask it to
+(xdo_dev_state_update_stats()) before they read that copy, as
+XFRM_MSG_GETSA already does, and XFRM_MSG_NEWAE refuses to write it: no
+driver hears of an update, so the state would report a replay state its
+device never had.
+
 Compiles warning-free: xfrm_state_lookup_byhandle() is declared in
 include/net/xfrm.h and __xfrm_state_lookup_byhandle is static.
 
@@ -67,8 +75,9 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/xfrm_device.c                        |  24 ++
  net/xfrm/xfrm_input.c                         |  48 ++++
  net/xfrm/xfrm_output.c                        | 248 ++++++++++++++++++
- net/xfrm/xfrm_state.c                         | 193 ++++++++++++++
- 12 files changed, 655 insertions(+), 31 deletions(-)
+ net/xfrm/xfrm_state.c                         | 202 ++++++++++++++
+ net/xfrm/xfrm_user.c                          |  27 ++
+ 13 files changed, 691 insertions(+), 31 deletions(-)
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac..1669e0d267e3 100644
@@ -828,7 +837,7 @@ index a5b5d82bd755..8c4d265b7f47 100644
  		 * some filtering or matching rules may apply
  		 * in transport mode.
 diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
-index 792e5ef9361a..d3962a74c132 100644
+index 792e5ef9361a..02188558bd1c 100644
 --- a/net/xfrm/xfrm_state.c
 +++ b/net/xfrm/xfrm_state.c
 @@ -58,6 +58,28 @@ static inline bool xfrm_state_hold_rcu(struct xfrm_state __rcu *x)
@@ -865,20 +874,20 @@ index 792e5ef9361a..d3962a74c132 100644
  	}
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+static void xfrm_hash_transfer(struct hlist_head *list,
-+			       struct hlist_head *ndsttable,
-+			       struct hlist_head *nsrctable,
-+			       struct hlist_head *nspitable,
-+			       struct hlist_head *nseqtable,
-+			       struct hlist_head *nhtable,
-+			       unsigned int nhashmask)
-+#else
  static void xfrm_hash_transfer(struct hlist_head *list,
  			       struct hlist_head *ndsttable,
  			       struct hlist_head *nsrctable,
  			       struct hlist_head *nspitable,
  			       struct hlist_head *nseqtable,
++			       struct hlist_head *nhtable,
  			       unsigned int nhashmask)
++#else
++static void xfrm_hash_transfer(struct hlist_head *list,
++			       struct hlist_head *ndsttable,
++			       struct hlist_head *nsrctable,
++			       struct hlist_head *nspitable,
++			       struct hlist_head *nseqtable,
++			       unsigned int nhashmask)
 +#endif
  {
  	struct hlist_node *tmp;
@@ -1033,7 +1042,23 @@ index 792e5ef9361a..d3962a74c132 100644
  	hrtimer_start(&x->mtimer, ktime_set(1, 0), HRTIMER_MODE_REL_SOFT);
  	if (x->replay_maxage)
  		mod_timer(&x->rtimer, jiffies + x->replay_maxage);
-@@ -2098,6 +2199,40 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+@@ -2068,6 +2169,15 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+ {
+ 	struct xfrm_state *xc;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* The clone carries on from x's replay state, which for a
++	 * packet-offloaded x moves in its device and reaches xfrm's copy only
++	 * when the driver publishes it. Have it do so first, under x->lock as
++	 * the state timer asks, so the clone starts where the device is. */
++	spin_lock_bh(&x->lock);
++	xfrm_dev_state_update_stats(x);
++	spin_unlock_bh(&x->lock);
++#endif
+ 	xc = xfrm_state_clone(x, encap);
+ 	if (!xc)
+ 		return NULL;
+@@ -2098,6 +2208,40 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
  EXPORT_SYMBOL(xfrm_state_migrate);
  #endif
  
@@ -1074,7 +1099,7 @@ index 792e5ef9361a..d3962a74c132 100644
  int xfrm_state_update(struct xfrm_state *x)
  {
  	struct xfrm_state *x1, *to_put;
-@@ -2154,6 +2289,10 @@ int xfrm_state_update(struct xfrm_state *x)
+@@ -2154,6 +2298,10 @@ int xfrm_state_update(struct xfrm_state *x)
  	err = -EINVAL;
  	spin_lock_bh(&x1->lock);
  	if (likely(x1->km.state == XFRM_STATE_VALID)) {
@@ -1085,7 +1110,7 @@ index 792e5ef9361a..d3962a74c132 100644
  		if (x->encap && x1->encap &&
  		    x->encap->encap_type == x1->encap->encap_type)
  			memcpy(x1->encap, x->encap, sizeof(*x1->encap));
-@@ -2272,6 +2411,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
+@@ -2272,6 +2420,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
  }
  EXPORT_SYMBOL(xfrm_state_lookup_byaddr);
  
@@ -1122,7 +1147,7 @@ index 792e5ef9361a..d3962a74c132 100644
  struct xfrm_state *
  xfrm_find_acq(struct net *net, const struct xfrm_mark *mark, u8 mode, u32 reqid,
  	      u32 if_id, u32 pcpu_num, u8 proto, const xfrm_address_t *daddr,
-@@ -2521,6 +2690,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
+@@ -2521,6 +2699,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
  			x->id.spi = newspi;
  			h = xfrm_spi_hash(net, &x->id.daddr, newspi, x->id.proto, x->props.family);
  			XFRM_STATE_INSERT(byspi, &x->byspi, net->xfrm.state_byspi + h, x->xso.type);
@@ -1139,7 +1164,7 @@ index 792e5ef9361a..d3962a74c132 100644
  			spin_unlock_bh(&net->xfrm.xfrm_state_lock);
  			err = 0;
  			goto unlock;
-@@ -3207,6 +3386,12 @@ int __net_init xfrm_state_init(struct net *net)
+@@ -3207,6 +3395,12 @@ int __net_init xfrm_state_init(struct net *net)
  	if (!net->xfrm.state_byseq)
  		goto out_byseq;
  
@@ -1152,7 +1177,7 @@ index 792e5ef9361a..d3962a74c132 100644
  	net->xfrm.state_cache_input = alloc_percpu(struct hlist_head);
  	if (!net->xfrm.state_cache_input)
  		goto out_state_cache_input;
-@@ -3221,6 +3406,10 @@ int __net_init xfrm_state_init(struct net *net)
+@@ -3221,6 +3415,10 @@ int __net_init xfrm_state_init(struct net *net)
  	return 0;
  
  out_state_cache_input:
@@ -1163,7 +1188,7 @@ index 792e5ef9361a..d3962a74c132 100644
  	xfrm_hash_free(net->xfrm.state_byseq, sz);
  out_byseq:
  	xfrm_hash_free(net->xfrm.state_byspi, sz);
-@@ -3251,6 +3440,10 @@ void xfrm_state_fini(struct net *net)
+@@ -3251,6 +3449,10 @@ void xfrm_state_fini(struct net *net)
  	xfrm_hash_free(net->xfrm.state_bysrc, sz);
  	WARN_ON(!hlist_empty(net->xfrm.state_bydst));
  	xfrm_hash_free(net->xfrm.state_bydst, sz);
@@ -1174,6 +1199,51 @@ index 792e5ef9361a..d3962a74c132 100644
  	free_percpu(net->xfrm.state_cache_input);
  }
  
+diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
+index 9da6bb095888..41a8cadb7ce9 100644
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -2709,6 +2709,16 @@ static int xfrm_get_ae(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	 * while we are still reading) - jhs
+ 	*/
+ 	spin_lock_bh(&x->lock);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* A packet-offloaded state's sequence numbers and anti-replay window
++	 * move in its device, and xfrm's copy of them only when the driver
++	 * publishes it. Have it do so now, as XFRM_MSG_GETSA does before it
++	 * reports the lifetime (copy_to_user_state()): a keying daemon reads
++	 * this to carry the SA over when it re-adds it at a new address, and
++	 * a stale copy would start the new SA behind the old one. Under
++	 * x->lock, where the state timer asks too. */
++	xfrm_dev_state_update_stats(x);
++#endif
+ 	c.data.aevent = p->flags;
+ 	c.seq = nlh->nlmsg_seq;
+ 	c.portid = nlh->nlmsg_pid;
+@@ -2769,6 +2779,23 @@ static int xfrm_new_ae(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (err)
+ 		goto out;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* A packet-offloaded state's replay state is its device's: the device
++	 * numbers and checks the frames, and no driver hears of an update.
++	 * Written here, it would change what the state reports and nothing
++	 * the device does -- and a driver publishing only forward would keep
++	 * anything moved ahead for its next re-add to start from. The state is
++	 * added again with the replay state it is to start from instead. The
++	 * message is refused whole, so a NEWAE that also names a lifetime or a
++	 * threshold changes nothing; one naming only those, which are xfrm's
++	 * own, still applies. */
++	if ((rp || re) && x->xso.type == XFRM_DEV_OFFLOAD_PACKET) {
++		NL_SET_ERR_MSG(extack, "The replay state of a packet-offloaded SA is its device's");
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++#endif
++
+ 	spin_lock_bh(&x->lock);
+ 	xfrm_update_ae_params(x, attrs, 1);
+ 	spin_unlock_bh(&x->lock);
 -- 
 2.47.3
 
