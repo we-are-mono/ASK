@@ -49,6 +49,7 @@
 #ifdef DPA_IPSEC_OFFLOAD
 #include <linux/delay.h>
 #include <linux/udp.h>
+#include <linux/random.h>
 #include <linux/reboot.h>
 #include "error.h"
 #include "desc.h"
@@ -332,6 +333,17 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
 	return cipher_type == OP_PCL_IPSEC_AES_GCM8 ||
 	       cipher_type == OP_PCL_IPSEC_AES_GCM12 ||
 	       cipher_type == OP_PCL_IPSEC_AES_GCM16;
+}
+
+/* The modes whose outbound IV counts up in the PDB rather than coming from
+ * SEC's generator (cdx_ipsec_build_out_sa_pdb()). */
+static bool cdx_ipsec_cipher_counts_iv(uint32_t cipher_type)
+{
+	return cdx_ipsec_cipher_is_gcm(cipher_type) ||
+	       cipher_type == OP_PCL_IPSEC_AES_CCM8 ||
+	       cipher_type == OP_PCL_IPSEC_AES_CCM12 ||
+	       cipher_type == OP_PCL_IPSEC_AES_CCM16 ||
+	       cipher_type == OP_PCL_IPSEC_AES_CTR;
 }
 
 /*
@@ -1827,12 +1839,32 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 		cpu_to_caam32(next_seq & SEQ_NUM_LOW_MASK);
 
 
-	//if (!sa->init_vector)
-	sec_desc->pdb_en.options |= PDBOPTS_ESP_IVSRC;
-	/*else
-	  memcpy(&sec_desc->pdb_en.cbc,
-	  sa->init_vector->init_vector,
-	  sa->.init_vector->length);*/
+	/* The counter modes need an IV that never repeats under the key, and
+	 * SEC's random ones are 64 bits: two collide after about 2^32 frames,
+	 * and one GCM collision gives away the authentication key. Without
+	 * IVSRC, SEC sends the PDB's IV and counts it up per frame, and the
+	 * PDB store carries it from job to job. Each SA starts at a random
+	 * point, as Linux's seqiv salts each instance, so a re-add with the
+	 * same key and a stale sequence number cannot repeat one either. CBC
+	 * keeps SEC's random IVs: it needs them unpredictable, not unique. */
+	switch (psec_as_context->cipher_data.cipher_type) {
+	case OP_PCL_IPSEC_AES_GCM8:
+	case OP_PCL_IPSEC_AES_GCM12:
+	case OP_PCL_IPSEC_AES_GCM16:
+		sec_desc->pdb_en.gcm.iv = cpu_to_caam64(get_random_u64());
+		break;
+	case OP_PCL_IPSEC_AES_CCM8:
+	case OP_PCL_IPSEC_AES_CCM12:
+	case OP_PCL_IPSEC_AES_CCM16:
+		sec_desc->pdb_en.ccm.iv = cpu_to_caam64(get_random_u64());
+		break;
+	case OP_PCL_IPSEC_AES_CTR:
+		sec_desc->pdb_en.ctr.iv = cpu_to_caam64(get_random_u64());
+		break;
+	default:
+		sec_desc->pdb_en.options |= PDBOPTS_ESP_IVSRC;
+		break;
+	}
 
 	if(sa->mode == SA_MODE_TUNNEL)
 	{
@@ -1929,7 +1961,7 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 		memcpy(sec_desc->pdb_en.gcm.salt, salt,  AES_GCM_SALT_LEN);
 	}
 
-	/* CTR — RFC 3686. Per-packet 8-byte iv is filled by SEC under PDBOPTS_ESP_IVSRC. */
+	/* CTR — RFC 3686. The per-packet 8-byte iv counts up from the PDB's. */
 	else if (sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_CTR)
 	{
 		memcpy(sec_desc->pdb_en.ctr.ctr_nonce, salt, AES_CTR_SALT_LEN);
@@ -2040,15 +2072,18 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 		case -EPERM:
 			/* The extended builders lack the per-job PDB store
 			 * that keeps GCM sequence state coherent across
-			 * DECOs. A GCM descriptor fits the normal builder
-			 * (worst case, IPv6 tunnel + NAT-T with L2 copy,
-			 * builds ~45 words against the 50-word limit), so
-			 * this is unreachable today; refuse loudly rather
-			 * than corrupt quietly if that ever changes. The SA
-			 * then stays on kernel xfrm. */
-			if (cdx_ipsec_cipher_is_gcm(
+			 * DECOs, and that carries a counter mode's IV from
+			 * job to job: without it, every refetch would restart
+			 * the IV from its seed and repeat a nonce. These
+			 * descriptors fit the normal builder (worst case,
+			 * IPv6 tunnel + NAT-T with L2 copy, builds ~48 words
+			 * against the 50-word limit), so this is unreachable
+			 * today; refuse loudly rather than corrupt quietly if
+			 * that ever changes. The SA then stays on kernel
+			 * xfrm. */
+			if (cdx_ipsec_cipher_counts_iv(
 					psec_sa_context->cipher_data.cipher_type)) {
-				log_err("GCM SA spi %d needs an extended descriptor; not supported\n",
+				log_err("Counter-mode SA spi %d needs an extended descriptor; not supported\n",
 						sa->id.spi);
 				ret = -EFAULT;
 				goto err_unmap_crypto;

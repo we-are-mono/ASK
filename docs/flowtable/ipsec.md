@@ -270,7 +270,11 @@ the GMAC ICV, where RFC 4543 and every software peer authenticate it, so no
 frame would pass the other side's check in either direction (A220). GCM is
 admitted without reservation: A24a fixed the shared-descriptor sharing policy
 that made it unsafe (DNCPE-2358, `43f29a0`) and GCM now outperforms CBC+HMAC
-on TCP. The authenticator is admitted only at a truncation SEC has an
+on TCP. The counter modes (GCM, CCM, CTR) take their IVs from the PDB, which
+SEC counts up by one per frame, starting at a random point per SA as Linux's
+seqiv salts each instance; SEC's own random IVs are only 64 bits there, and
+two of them collide after about 2^32 frames, which under GCM gives away the
+authentication key (A283). CBC keeps SEC's random IVs. The authenticator is admitted only at a truncation SEC has an
 operation for, because SEC fixes the ICV in the operation itself: HMAC-MD5 at
 96 or 128 bits, HMAC-SHA1 at 96 or 160, HMAC-SHA-256/384/512 at 128/192/256
 (RFC 4868), AES-XCBC at 96, or null authentication. Any other truncation is

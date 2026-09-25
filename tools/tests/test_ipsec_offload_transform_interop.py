@@ -21,7 +21,13 @@ is the reference. The DUT pings the peer's inner address, and the case proves:
     moves;
   - the DUT's inbound SA accounts for exactly the replies. SEC encrypted every
     echo the CPU handed it, and the replies reached SEC through the classifier,
-    not through a CPU-fed decrypt.
+    not through a CPU-fed decrypt;
+  - no IV repeats. The counter modes (GCM, CCM, CTR) need an IV that is only
+    unique, so each SA's IVs count up from a random start of its own, one per
+    sequence number; Linux's seqiv likewise salts each SA's sequence numbers.
+    SEC's random IVs are 64 bits there, and two collide after about 2^32
+    frames: under GCM that gives away the authentication key. CBC keeps random
+    IVs, which it needs unpredictable.
 
 Each transform and each direction gets its own key, and no key is one repeated
 byte. A repeated byte hides a key, salt or nonce read from the wrong offset,
@@ -43,6 +49,9 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
+import struct
+import threading
 
 import aiohttp
 import pytest
@@ -101,6 +110,18 @@ class Transform:
     icv: int
     auth: str | None = None
     auth_key: int = 0
+
+    @property
+    def iv_size(self):
+        """The bytes of IV each ESP frame carries after its sequence number."""
+        if self.counter_iv or self.cipher in ("cbc(des3_ede)", "cbc(des)"):
+            return 8
+        return 16 if self.cipher == "cbc(aes)" else 0
+
+    @property
+    def counter_iv(self):
+        """Whether the mode needs its IVs unique rather than unpredictable."""
+        return self.cipher.startswith(("rfc4106", "rfc4309", "rfc3686"))
 
     def algorithms(self, case, direction):
         if self.auth is None:
@@ -163,6 +184,46 @@ def peer_errors(before, after):
     /proc/net/xfrm_stat. Every XfrmIn* counter there counts a refusal."""
     return {name: after[name] - before.get(name, 0) for name in after
             if name.startswith("XfrmIn") and after[name] != before.get(name, 0)}
+
+
+# Where each counter-mode case's SA started its IVs, so no two start alike.
+IV_STARTS = {}
+
+
+class EspCapture:
+    """The DUT's frames under one SA as they reach this host: each one's
+    sequence number and the IV that follows it. A raw socket on the peer's
+    interface, which is this host's."""
+
+    def __init__(self, ifname, source, spi, iv_size):
+        self.source, self.spi, self.iv_size = socket.inet_aton(source), spi, iv_size
+        self.frames = []
+        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+        self.sock.bind((ifname, 0))
+        self.sock.settimeout(0.1)
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while not self.done.is_set():
+            try:
+                frame = self.sock.recv(128)
+            except socket.timeout:
+                continue
+            ip = frame[14:]
+            if len(ip) < 20 or ip[0] >> 4 != 4 or ip[9] != 50 or ip[12:16] != self.source:
+                continue
+            esp = ip[(ip[0] & 0xf) * 4:]
+            spi, seq = struct.unpack(">II", esp[:8])
+            if spi == self.spi:
+                self.frames.append((seq, esp[8:8 + self.iv_size]))
+
+    def stop(self):
+        self.done.set()
+        self.thread.join()
+        self.sock.close()
+        return sorted(self.frames)
 
 
 class Interop:
@@ -363,8 +424,14 @@ async def test_ipsec_offload_transform_interop(interop, case, splat_window):
         mib = peer_mib()
         toenc = await sec_counter(ctx.session, ctx.target, TARGET_WAN_IF, "tx toenc")
         todec = await sec_counter(ctx.session, ctx.target, TARGET_WAN_IF, "tx todec")
-        sent, answered = await dut_ping(ctx, PEER_INNER, COUNT, interval="0.1")
+        capture = EspCapture(ctx.wan_if, ctx.outer, spi(case, "out"), transform.iv_size)
+        try:
+            sent, answered = await dut_ping(ctx, PEER_INNER, COUNT, interval="0.1")
+            await asyncio.sleep(0.2)
+        finally:
+            frames = capture.stop()
         record["ping"] = {"sent": sent, "answered": answered}
+        record["ivs"] = [[seq, iv.hex()] for seq, iv in frames]
         record["peer"] = {
             "decrypted": await ctx.figures(ctx.wan, ctx.state("out", spi(case, "out"))),
             "encrypted": await ctx.figures(ctx.wan, ctx.state("in", spi(case, "in"))),
@@ -388,6 +455,18 @@ async def test_ipsec_offload_transform_interop(interop, case, splat_window):
             "the DUT's inbound SA did not account for exactly the replies", record)
         assert (record["dut"]["toenc"], record["dut"]["todec"]) == (COUNT, 0), (
             "SEC must encrypt every echo the CPU gave it and receive the replies through the classifier", record)
+        assert [seq for seq, _ in frames] == list(range(1, COUNT + 1)), (
+            "the capture did not see each echo SEC encrypted exactly once", record)
+        if transform.counter_iv:
+            starts = {(int.from_bytes(iv, "big") - seq) % 2**64 for seq, iv in frames}
+            assert len(starts) == 1, (
+                "a counter mode's IVs must count up one per sequence number: random ones collide", record)
+            start = starts.pop()
+            assert start not in IV_STARTS.values(), ("two SAs started their IVs alike", IV_STARTS, record)
+            IV_STARTS[case] = start
+        elif transform.iv_size:
+            ivs = [iv for _, iv in frames]
+            assert len(set(ivs)) == len(ivs), ("an IV repeated", record)
     finally:
         failures = await ctx.remove_states()
         leftovers = await ctx.leftovers()

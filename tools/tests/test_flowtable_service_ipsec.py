@@ -15,7 +15,7 @@ import secrets
 import socket
 import struct
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -516,6 +516,27 @@ def reused_sequences(path):
     return sum(seen.values()), sum(1 for n in seen.values() if n > 1)
 
 
+def iv_starts(path):
+    """Per SPI in a pcap, how many different points its frames' 8-byte IVs
+    count from against their sequence numbers. A counter mode's IVs step once
+    per sequence number from one start, so each SPI has exactly one; random
+    IVs give nearly every frame its own."""
+    starts = defaultdict(set)
+    data = Path(path).read_bytes()
+    off = 24
+    while off + 16 <= len(data):
+        length = struct.unpack_from("<I", data, off + 8)[0]
+        frame = data[off + 16:off + 16 + length]
+        off += 16 + length
+        l3 = 18 if frame[12:14] == b"\x81\x00" else 14
+        if len(frame) >= l3 + 28 and frame[l3 + 9] == 50:
+            esp = l3 + (frame[l3] & 0xF) * 4
+            if len(frame) >= esp + 16:
+                spi, seq = struct.unpack_from("!II", frame, esp)
+                starts[spi].add((int.from_bytes(frame[esp + 8:esp + 16], "big") - seq) % 2**64)
+    return {spi: len(found) for spi, found in starts.items()}
+
+
 def replay_drops():
     """Anti-replay rejections on this host, the SA's receiving peer."""
     for line in Path("/proc/net/xfrm_stat").read_text().splitlines():
@@ -531,7 +552,9 @@ async def test_flowtable_service_ipsec_shared_sequence(ipsec_service):
     shares a descriptor, and with it the stored ESP sequence number, only
     between jobs that fetch it under the same ICID. If FMan and the QMan
     software portals stamp frames differently, both feeders encrypt from the
-    same stored number and the peer drops the later copy as a replay."""
+    same stored number and the peer drops the later copy as a replay. A
+    counter mode's IV is stored with it, so there the two feeders must also
+    step one IV: a repeated one is a repeated nonce."""
     r, flows = ipsec_service, flows_for(ipsec_service)
     # Only the reserved test ports are exempt from the WAN masquerade, and a
     # masqueraded source no longer matches the IPsec policy.
@@ -558,12 +581,17 @@ async def test_flowtable_service_ipsec_shared_sequence(ipsec_service):
         cpu = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc") - cpu
         esp, reused = reused_sequences(capture.path)
         drops = replay_drops() - drops
+        counter = r.ipsec.transform.algorithms[1].startswith(("rfc4106", "rfc4309", "rfc3686"))
+        starts = iv_starts(capture.path) if counter else {}
         r.record("ipsec-shared-sequence", {"esp": esp, "cpu_fed": cpu, "reused": reused,
-                                           "replay_drops": drops})
+                                           "replay_drops": drops,
+                                           "iv_starts": {hex(spi): n for spi, n in starts.items()}})
         # Without both feeders busy at once the check below proves nothing.
         # Unfixed, nearly every CPU-fed frame collides (219 of 238 measured).
         assert cpu >= 100 and esp - cpu >= 100_000, (cpu, esp)
         assert (reused, drops) == (0, 0), {"reused": reused, "replay_drops": drops, "cpu_fed": cpu, "esp": esp}
+        assert not counter or starts, "no counter-mode IV was read from the capture"
+        assert all(n == 1 for n in starts.values()), ("both feeders must step one IV counter", starts)
     finally:
         await command(r.target, r.session, "iptables", "-t", "nat", "-D", *exempt)
         await asyncio.to_thread(r.lan.run, f"rm -f {BLASTER}", timeout=15)
