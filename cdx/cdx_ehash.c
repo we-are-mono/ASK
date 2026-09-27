@@ -1259,6 +1259,12 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 				__func__);
 		goto err_ret;
 	}	
+	/* A decrypted flow matches only frames the SA it was admitted for
+	 * decrypted; cdx_ipsec_fill_sec_info() named that SA and chose the
+	 * offline port's table whose key carries it. */
+	if (info->l3_info.ipsec_inbound_flow)
+		key_size = cdx_ipsec_key_tag(&tbl_entry->hashentry.key[0],
+					     key_size, info->sec_tag);
 
 	//round off keysize to next 4 bytes boundary 
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];          

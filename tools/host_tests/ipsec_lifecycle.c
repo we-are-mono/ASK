@@ -454,6 +454,18 @@ static unsigned sa_lifecycle(void)
     assert(!module_refs && !sa_range && !ipsecinfo.ipsec_exception_fq);
     assert(allocs == baseline && queues == 12);
 
+    /* An SA whose classifier entry may still be linked keeps its FQIDs when
+     * its queues go, so no later SA is handed the ones that entry is keyed
+     * on; everything else is released as usual. */
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa && sa_range);
+    sa_retired(sa);
+    cdx_dpa_ipsecsa_keep_fqids(sa);
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
+    assert(!module_refs && sa_range && !ipsecinfo.ipsec_exception_fq);
+    assert(allocs == baseline && queues == 12);
+    sa_range = false;	/* what a reset gives back */
+
     for (unsigned fail = 1; fail <= count; fail++) {
         steps = 0; fail_step = fail; pauses = 0;
         retires_failed = oos_failed = 2;

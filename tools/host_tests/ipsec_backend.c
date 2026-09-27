@@ -977,15 +977,12 @@ static void test_set_next_hop(void)
 	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == 0);
 	assert(fp_installs == 1 && sa.route.mtu == 1400 && !sa.stranded);
 
-	/* A NAT-T entry another SA shares would only drop a reference, so it
-	 * is refused with nothing touched. */
+	/* An outbound NAT-T entry is its SA's own, keyed on it, so it moves
+	 * like any other: out, and back in on the new framing. */
 	REARM(1500);
 	sa_entry.natt.sport = sa_entry.natt.dport = 4500;
-	ct.natt_out_refcnt = 2;
-	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == -EBUSY);
-	assert(fp_deletes == 0 && fp_installs == 0 && sa.route.mtu == 1500);
-	ct.natt_out_refcnt = 1;
-	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == 0 && sa.route.mtu == 1400);
+	assert(cdx_ipsec_sa_set_next_hop(&sa, now, 1400) == 0);
+	assert(fp_deletes == 1 && fp_installs == 1 && sa.route.mtu == 1400);
 	sa_entry.natt.sport = sa_entry.natt.dport = 0;
 
 	/* Refused outright: no address, a route not the SA's own, a failed

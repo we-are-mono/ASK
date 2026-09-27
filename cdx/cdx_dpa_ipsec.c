@@ -498,10 +498,36 @@ bool cdx_ipsec_sa_outbound(u16 handle)
 	return sa && sa->direction == CDX_DPA_IPSEC_OUTBOUND;
 }
 
+/* The FQID an SA's FROM_SEC queue names in its Context B, which is its TO_CP
+ * queue (create_ipsec_fqs()). See cdx_ipsec_key_tag(). */
+uint32_t cdx_ipsec_key_tag_of(PSAEntry sa)
+{
+	return sa->pSec_sa_context->to_cp_fqid;
+}
+
+/* The tables a decrypted flow may be classified in on the offline port: the
+ * ones its distributions key on the SA as well as the tuple. The shared
+ * encoder files a UDP flow without ports under multicast, which that port has
+ * no table for, so such a flow stays in software. */
+static bool cdx_ipsec_decrypted_table(uint32_t tbl_type)
+{
+	return tbl_type == IPV4_TCP_TABLE || tbl_type == IPV4_UDP_TABLE ||
+	       tbl_type == IPV6_TCP_TABLE || tbl_type == IPV6_UDP_TABLE;
+}
+
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 {
 	int i;
 	PSAEntry sa;
+
+	/* A handle the SA cache does not hold is a refusal, not a direction
+	 * without that SA: a decrypted direction skipped here would be
+	 * installed on its physical port, keyed to match the same tuple in
+	 * the clear, and an encrypted one would leave unencrypted. */
+	for (i = 0; i < SA_MAX_OP; i++)
+		if (entry->hSAEntry[i] &&
+		    !M_ipsec_sa_cache_lookup_by_h(entry->hSAEntry[i]))
+			return -1;
   
 	for (i=0;i < SA_MAX_OP;i++)
 	{ 
@@ -519,7 +545,16 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 				printk(KERN_CRIT "%s OutBound SA info->to_sec_fqid  = %d\n", __func__,info->to_sec_fqid );
 #endif				
 			}else{
+				/* The entry lives where SEC's output is
+				 * classified, and is keyed on the SA that
+				 * decrypted it as well as on the tuple: every
+				 * inbound SA's frames reach the same offline
+				 * port, and admission proved the flow for this
+				 * one only. */
+				if (!cdx_ipsec_decrypted_table(info->tbl_type))
+					return -1;
 				info->l3_info.ipsec_inbound_flow = 1;
+				info->sec_tag = cdx_ipsec_key_tag_of(sa);
 				if (dpa_ipsec_ofport_td(ipsec_instance,
 					info->tbl_type, &info->td, &info->port_id))
 					return -1;
@@ -634,17 +669,13 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 		__func__,__LINE__,(pSA->direction)?"INBOUND":"OUTBOUND",
 		pSA->handle,
 		pSA->pSec_sa_context ? pSA->pSec_sa_context->to_sec_fqid : 0);
-	/* WE need to lock below section of code */
+	/* WE need to lock below section of code. Only an inbound NAT-T
+	 * entry is shared; an outbound SA's is its own (see
+	 * cdx_ipsec_process_udp_classification_table_entry()). */
 	if (IS_NATT_SA(pSA) && pSA->ct && (pSA->ct->handle))
 	{
 		natt_tbl_entry = pSA->ct->handle;
-		if ( (pSA->direction == CDX_DPA_IPSEC_OUTBOUND) && (pSA->ct->natt_out_refcnt > 1))
-		{
-			pSA->ct->natt_out_refcnt--;
-			pSA->ct = NULL;
-			return 0;
-		}
-		else if ((pSA->direction == CDX_DPA_IPSEC_INBOUND) && (pSA->ct->natt_in_refcnt > 1))
+		if ((pSA->direction == CDX_DPA_IPSEC_INBOUND) && (pSA->ct->natt_in_refcnt > 1))
 		{
 			ipsec_preempt_params = ( struct en_ehash_ipsec_preempt_op *)natt_tbl_entry->ipsec_preempt_params;
 			pSA->ct->natt_in_refcnt--;
@@ -672,6 +703,16 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 				pSA->ct->handle);
 		if (rc)
 			DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
+		/* An entry the delete could not prove unlinked may still match,
+		 * and it names this SA's queues: an outbound SA's is keyed on
+		 * its TO_CP FQID (cdx_ipsec_key_tag()), an inbound SA's
+		 * enqueues to its TO_SEC one. A later SA handed the same FQIDs
+		 * would meet it, so they are never given back. One unlinked
+		 * but not yet proven left by the microcode needs nothing: no
+		 * new lookup reaches it. */
+		if (rc && rc != EN_EHASH_DELETE_UNSYNCED && pSA->pSec_sa_context &&
+		    pSA->pSec_sa_context->dpa_ipsecsa_handle)
+			cdx_dpa_ipsecsa_keep_fqids(pSA->pSec_sa_context->dpa_ipsecsa_handle);
 		pSA->ct->handle =  NULL;
 		hwct = pSA->ct;
 		pSA->ct = NULL;
@@ -2048,28 +2089,28 @@ static int get_tbl_type(PSAEntry sa)
  - Checks if there are any NATT SAs with the matched 5-tuple entries
  - If found and already programmed to Fast path, update the array mask and fill the new spi's in the fast path entry
 -- If not found then add the new entry as UDP tuple entry
+
+Only inbound SAs share. Their entry is on the port the peer's frames arrive
+by, keyed on the UDP 5-tuple, and chooses the SA by SPI. An outbound SA's is
+on the offline port and keyed on the SA itself (cdx_ipsec_key_tag()), so two
+outbound SAs on one tuple have an entry each.
 */
 
 int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 {
 	/* Check if the entry already exists */
-	PSAEntry natt_sa;
+	PSAEntry natt_sa = NULL;
 	int arr_index;
 	struct en_exthash_tbl_entry *natt_tbl_entry;
 	struct en_ehash_ipsec_preempt_op *ipsec_preempt_params;
-	uint32_t* sa_addr;
 	uint32_t bytes_to_copy = ETH_HDR_LEN;
 
-	natt_sa = M_ipsec_get_matched_natt_tunnel(sa);
+	if (sa->direction == CDX_DPA_IPSEC_INBOUND)
+		natt_sa = M_ipsec_get_matched_natt_tunnel(sa);
 
 	if (natt_sa && natt_sa->ct)
 	{
-		if (sa->direction == CDX_DPA_IPSEC_INBOUND)
-			sa_addr = &sa->id.daddr.a6[0];
-		else
-			sa_addr = &sa->id.saddr[0];
-
-		if( dpa_get_iface_info_by_ipaddress(sa->family, sa_addr, NULL,
+		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.daddr.a6[0], NULL,
 					NULL , NULL, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
@@ -2088,33 +2129,28 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 		sa->ct = natt_sa->ct;
 		
 		/* We need to lock this section of code */
-		if (sa->direction ==  CDX_DPA_IPSEC_INBOUND)
+		/* update in table entry */
+		natt_tbl_entry = (struct en_exthash_tbl_entry *)sa->ct->handle;
+		ipsec_preempt_params = (struct en_ehash_ipsec_preempt_op*) natt_tbl_entry->ipsec_preempt_params;
+		arr_index = get_free_natt_arr_index(be16_to_cpu(ipsec_preempt_params->natt_arr_mask));
+		if (arr_index >= MAX_SPI_PER_FLOW)
 		{
-			/* update in table entry */
-			natt_tbl_entry = (struct en_exthash_tbl_entry *)sa->ct->handle;
-			ipsec_preempt_params = (struct en_ehash_ipsec_preempt_op*) natt_tbl_entry->ipsec_preempt_params;
-			arr_index = get_free_natt_arr_index(be16_to_cpu(ipsec_preempt_params->natt_arr_mask));
-			if (arr_index >= MAX_SPI_PER_FLOW)
-			{
-				/* No refcount was taken on the shared ct; leaving
-				 * the pointer set would make a later delete steal a
-				 * reference this SA never held. Callers enter with
-				 * sa->ct NULL, so this restores that invariant. */
-				sa->ct = NULL;
-				goto err_ret;
-			}
-			sa->ct->natt_in_refcnt++;
-			ipsec_preempt_params->spi_param[arr_index].spi = sa->id.spi;
-			ipsec_preempt_params->spi_param[arr_index].fqid = cpu_to_be32(sa->pSec_sa_context->to_sec_fqid);
-			set_natt_arr_mask(&ipsec_preempt_params->natt_arr_mask, arr_index);
-			sa->natt_arr_index = arr_index;
-#ifdef CDX_DPA_DEBUG
-			printk(" SPI : %x - natt_arr_mask :%x\n", sa->id.spi, ipsec_preempt_params->natt_arr_mask);
-			display_ehash_tbl_entry(&natt_tbl_entry->hashentry, 14);
-#endif
+			/* No refcount was taken on the shared ct; leaving
+			 * the pointer set would make a later delete steal a
+			 * reference this SA never held. Callers enter with
+			 * sa->ct NULL, so this restores that invariant. */
+			sa->ct = NULL;
+			goto err_ret;
 		}
-		else
-			sa->ct->natt_out_refcnt++;
+		sa->ct->natt_in_refcnt++;
+		ipsec_preempt_params->spi_param[arr_index].spi = sa->id.spi;
+		ipsec_preempt_params->spi_param[arr_index].fqid = cpu_to_be32(sa->pSec_sa_context->to_sec_fqid);
+		set_natt_arr_mask(&ipsec_preempt_params->natt_arr_mask, arr_index);
+		sa->natt_arr_index = arr_index;
+#ifdef CDX_DPA_DEBUG
+		printk(" SPI : %x - natt_arr_mask :%x\n", sa->id.spi, ipsec_preempt_params->natt_arr_mask);
+		display_ehash_tbl_entry(&natt_tbl_entry->hashentry, 14);
+#endif
 	}
 	else{
 		if (cdx_ipsec_add_classification_table_entry(sa))
@@ -2303,6 +2339,13 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 				__func__);
 		goto err_ret;
 	}
+	/* An outbound SA's entry is on the offline port, where every SA's
+	 * output and every decrypted frame is classified: it matches only
+	 * what this SA encrypted, and never a decrypted packet built to look
+	 * like it. */
+	if (!sa_dir_in)
+		key_size = cdx_ipsec_key_tag(&tbl_entry->hashentry.key[0],
+					     key_size, cdx_ipsec_key_tag_of(sa));
 
 	/*round off keysize to next 4 bytes boundary */
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];

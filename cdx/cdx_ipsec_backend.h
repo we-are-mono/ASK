@@ -348,9 +348,6 @@ unsigned int cdx_ipsec_sa_count(void);
  * hold no egress framing to move.
  *
  * -EINVAL: not an outbound SA, or no usable address.
- * -EBUSY: an outbound NAT-T entry shared with another SA on the same UDP
- *  tuple. Its framing belongs to whichever SA built it and a rebuild would
- *  change nothing; try again once the other SA is gone.
  * -EIO: the old entry could not be proved gone, so nothing was rebuilt, or
  *  the rebuild failed. Either way the SA is left on the framing it had, and
  *  in the first case it can no longer be moved at all -- a second attempt

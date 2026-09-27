@@ -198,6 +198,40 @@ result independently of those temporary files.
   `qman/fqd/state_*` (it walks every FQ with interrupts off and starves RCU). Then flush
   SEC's queue interface (`QICTL_LS`) and watch whether the Rx frame counters resume: that
   shows which side is the head, and whether a runtime recovery exists.
+  Update 2026-09-27: now 2/2 on an image carrying the offline-port per-SA keying
+  (A280), 4/4 without it on the same image (A279+A283 present in both), 0/34 on the
+  two builds before A280 — so A280 makes this reliable. The new capture
+  (`wedge2-e2.txt`) is the same signature: all FPM tasks held across the 10G Rx/Tx
+  and OH ports, `hc.c:306 EnQFrm: Operation Timed Out`, and crucially no QMan ERN,
+  ECSR/ECIR/EADR 0 -- enqueues are not being rejected, frames are held inside FMan
+  before enqueue, which is the SEC/to-SEC head-of-line, not a bad FQID. Offline
+  against the fmc model and the SDK, A280's OH-port paths were eliminated as the
+  head: every OH frame class matches a scheme (all frames are Ethernet-framed, so
+  the `cdx_sec_ethernet` catch-all always matches); all seven OH distributions'
+  FQs (0x2900-0x2960, base | portid<<8) are created and scheduled by
+  `create_ipsec_pcd_fqs()` now that `get_oh_port_pcd_fqinfo()` indexes by position
+  (cdx/devoh.c) rather than by type, which would have skipped the Ethernet one;
+  every table's miss resolves on the OH port itself via `miss_scheme_on_port()`
+  (cdx/dpa_cfg.c) to `cdx_sec_ethernet` -> policer -> CP, with no cross-port scheme
+  and no loop back onto the OH channel; genuine decrypted and encrypted frames hit
+  their per-SA entries (the passing inbound-flow and transform-interop tests prove
+  the FQID extract and keying), and only never-offloaded classes (the test's
+  flooded ICMP echo replies) miss to CP, exactly as before A280. What A280 changes
+  is the per-frame work the OH port does on every FROM_SEC frame -- the added
+  enqueue-FQID generic extract and the per-SA CC lookup across its own tree -- which
+  is the plausible reason the pre-existing SEC/to-SEC race now closes reliably under
+  this ICMP-plus-blast mix. Next wedge, to pin the head with safe reads only (never
+  SEC registers -- a devmem of SSTA hung a CPU): decode fmfp_ts[0..127] against the
+  hardware port ids (BASE_OH_PORTID 0x2, 1G-Rx 0x8, 10G-Rx 0x10, 1G-Tx 0x28, 10G-Tx
+  0x30; fm_common.h) to see which port's tasks are held first; read each SA's
+  FROM_SEC and TO_SEC FQ depth from /proc (`cdx/.../pcd` and the SA dirs) to see
+  whether FROM_SEC is full (OH port not draining) or TO_SEC is full (SEC not
+  draining); and the QMI enqueue/dequeue-enable for the crypto channel. If FROM_SEC
+  is the full one, the OH port is the bottleneck and the mitigation is on the CDX
+  side (spread or relieve the OH exception path); if TO_SEC is full with FROM_SEC
+  empty, SEC is the head and this is patch 106's descriptor sharing, independent of
+  A280's keying. The A280 security fix is not reverted for this: it closes a
+  cross-SA forwarding hole, and the wedge is a pre-existing SEC race it exposes.
 
 ## Feature enablement (not bugs)
 
@@ -278,6 +312,12 @@ file's git history.
 
 - [x] **A286.** A transport-mode inbound SA with a 128-packet window got ARS128, which SEC's legacy transport protocol does not have —
   fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
+
+- [x] **A280.** A decrypted flow's offline-port entry keyed on the port id and inner 5-tuple alone, so any second offloaded inbound SA could encrypt that tuple and have SEC's output forwarded as the flow's (inherited from NXP) —
+  fixed (_:/^cdx: bind a decrypted flow's classifier entry to its SA_).
+
+- [x] **A287.** Outbound-SA entries on the offline port were keyed the same way, so a decrypted inner ESP or NAT-T UDP packet could match one and the gateway emit a frame a peer forged toward a third party —
+  fixed (_:/^cdx: bind a decrypted flow's classifier entry to its SA_).
 
 - [x] **A275.** Routed multicast copies left with the egress port's MAC rather than their oif's (a VLAN or bridge VIF), as ipmr sends them, and no chain followed an oif's MAC change —
   fixed (_:/^flowtable: send a routed multicast copy from its oif's address_).

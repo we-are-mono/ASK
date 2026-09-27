@@ -360,6 +360,9 @@ struct ins_entry_info {
 	uint32_t opc_count;
 	uint32_t tbl_type;
 	uint32_t to_sec_fqid;
+	/* What a decrypted flow's key names of its SA, alongside
+	 * l3_info.ipsec_inbound_flow; see cdx_ipsec_key_tag(). */
+	uint32_t sec_tag;
 	uint16_t tnl_hdr_size;
 	uint16_t sa_family;
 	uint16_t eth_type;

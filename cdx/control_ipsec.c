@@ -145,6 +145,11 @@ void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa)
 			 * on every iteration and never filtering entries.) */
 			if (!IS_NATT_SA(pEntry))
 				continue;
+			/* Only a twin in the same direction shares an entry:
+			 * an inbound one's parameters are its SPI table, an
+			 * outbound one's its enqueue, in one union. */
+			if (pEntry->direction != sa->direction)
+				continue;
 #ifdef CONTROL_IPSEC_DEBUG
 			printk("%x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x\n", \
 				pEntry->natt.sport,  sa->natt.sport, pEntry->natt.dport,  \

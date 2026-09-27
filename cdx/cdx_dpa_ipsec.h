@@ -97,6 +97,38 @@ int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id,
 int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			uint32_t sa_dir_in);
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info);
+
+/* What a frame classified on the IPsec offline port carries of the SA it left
+ * SEC by, and where the port's keys hold it.
+ *
+ * Every SA's FROM_SEC queue feeds that one port, whichever SA decrypted or
+ * encrypted the frame, and the only thing the queue gives FMan per SA is its
+ * Context B, which the Context A override (dpa_ipsec.c) makes the frame's
+ * enqueue FQID: the SA's TO_CP queue, where the frame goes on a miss. The
+ * port's distributions append that FQID's 24 bits to their keys, after the
+ * tuple, since the key generator places generic extractions after its known
+ * fields (<nonheader source="fqid" offset="0" size="3"/>, cdx_pcd.xml). An
+ * entry made for one SA -- a flow it decrypts, or the SA's own encrypted
+ * frames -- then matches nothing another SA produced.
+ *
+ * These two and that XML are the whole of the choice of discriminator; one
+ * carried elsewhere in the frame changes them and nothing that calls them.
+ */
+#define CDX_IPSEC_KEY_TAG_LEN	3
+
+uint32_t cdx_ipsec_key_tag_of(PSAEntry sa);
+
+/* Place `tag` in the key the caller has composed up to `key_size`, and return
+ * the key's size with it. */
+static inline uint32_t cdx_ipsec_key_tag(uint8_t *key, uint32_t key_size,
+					 uint32_t tag)
+{
+	key[key_size] = (tag >> 16) & 0xff;
+	key[key_size + 1] = (tag >> 8) & 0xff;
+	key[key_size + 2] = tag & 0xff;
+	return key_size + CDX_IPSEC_KEY_TAG_LEN;
+}
+
 int cdx_ipsec_delete_fp_entry(PSAEntry pSA);
 void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes);
 u64 get_oseq_from_sa(PSAEntry sa);
