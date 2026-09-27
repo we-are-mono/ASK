@@ -114,9 +114,10 @@ async def replace_outbound(r, *options, peer=()):
 async def restore_outbound(r, expired):
     """Put an outbound SA back once a hard expiry has deleted the fixture's.
 
-    The new state also removes the larval one an acquire left behind: the
-    policy is still required, and traffic after the expiry asked the key
-    manager, which the monitor is, for a state that never came."""
+    The new state also removes the larval one an acquire left behind, if it
+    has not expired first (the fixture keeps net.core.xfrm_acq_expires
+    short): the policy is still required, and traffic after the expiry asked
+    the key manager, which the monitor is, for a state that never came."""
     if await sa_state(r, expired) is not None:
         return None
     spi = await r.ipsec.prepare_peer("out")

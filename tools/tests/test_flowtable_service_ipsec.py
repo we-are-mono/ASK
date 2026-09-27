@@ -63,6 +63,35 @@ def owned_state(state):
     return any(re.search(r"\breqid " + reqid + r"\b", state) for reqid in REQIDS.values())
 
 
+def larval_state(state):
+    """An acquire's placeholder the fixture's own traffic left: no SPI, one of
+    the fixture's reqids, a selector between the fixture's inner addresses.
+    xfrm_state_find() leaves one when a packet meets a required policy with no
+    state and a key manager listens (an `ip xfrm monitor`, charon); it goes
+    only when net.core.xfrm_acq_expires runs out or a state for it is added,
+    and no DELSA can name it, having no SPI to be found by."""
+    inner = f"({re.escape(LAN_INNER)}|{re.escape(INNER)})/32"
+    return bool(owned_state(state) and re.search(r"\bspi 0x0+\b", state)
+                and re.search(rf"\bsel src {inner} dst {inner}", state))
+
+
+# What the fixture lowers the DUT's net.core.xfrm_acq_expires to while it
+# runs, so a placeholder a test's traffic left is gone within seconds rather
+# than lingering into the next module's setup.
+FIXTURE_ACQ_EXPIRES = 3
+
+
+async def acq_expires(r, agent):
+    """The host's net.core.xfrm_acq_expires, or the kernel's default of 30 s
+    where the agent cannot read it."""
+    try:
+        result = await agent.fs_read(r.session, "/proc/sys/net/core/xfrm_acq_expires")
+        value = bytes.fromhex(result["content_hex"]).decode().strip() if result["errno"] == 0 else ""
+    except Exception:
+        value = ""
+    return int(value) if value.isdigit() else 30
+
+
 class SecurityAssociations:
     def __init__(self, r, wan, outer, transform=Transform()):
         self.r, self.wan, self.outer = r, wan, outer
@@ -145,6 +174,7 @@ async def ipsec_service(rig, request):
     r.ipsec_wire_if = wire_interface(r)
     transport, lan_created, encap = None, False, None
     cleanup = []
+    acq_saved = None
     for agent in (r.target, wan):
         assert not json.loads((await command(agent, r.session, "ip", "-j", "route", "show", "table", "all", "exact", INNER + "/32"))["stdout"])
         states = [s for s in await xfrm(r, agent, "state") if owned_state(s)]
@@ -152,6 +182,8 @@ async def ipsec_service(rig, request):
         policies = [p for p in await xfrm(r, agent, "policy") if INNER + "/32" in p.splitlines()[0]]
         assert not policies, policies
     try:
+        acq_saved = int((await read(r.target, r.session, "/proc/sys/net/core/xfrm_acq_expires")).strip())
+        await command(r.target, r.session, "sysctl", "-w", f"net.core.xfrm_acq_expires={FIXTURE_ACQ_EXPIRES}")
         setup = f'''
 import json, subprocess
 addresses=json.loads(subprocess.check_output(['ip','-j','-4','addr'],text=True))
@@ -204,9 +236,15 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
         if encap:
             encap.close()
         failures = []
+        # Policies before states, on both hosts: a packet meeting a required
+        # policy with its state gone leaves an acquire's placeholder behind
+        # (larval_state()), and with the policies out first nothing can.
+        undo = list(reversed(sa.cleanup))
+        steps = ([step for step in undo if step[1][2] == "policy"]
+                 + [step for step in undo if step[1][2] != "policy"] + list(reversed(cleanup)))
         with Console.target(log_path=str(ARTIFACTS / "service-ipsec-cleanup-uart.log")) as con:
             await asyncio.to_thread(con.login, "root", None)
-            for agent, argv in reversed(cleanup + sa.cleanup):
+            for agent, argv in steps:
                 try:
                     # Withdrawn/rekeyed states already disappeared. Exact identities
                     # prevent teardown from touching somebody else's XFRM state.
@@ -218,10 +256,24 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
                 except Exception as error:
                     failures.append(repr(error))
         for agent in (r.target, wan):
-            states = [s for s in await xfrm(r, agent, "state") if owned_state(s)]
+            # A placeholder a test's own traffic left earlier -- after a hard
+            # expiry, say -- expires on its own and cannot be deleted; it is
+            # waited out, for as long as xfrm keeps one there and no longer.
+            # Any other test-owned state is a leftover at once.
+            deadline = time.monotonic() + await acq_expires(r, agent) + 2
+            while True:
+                states = [s for s in await xfrm(r, agent, "state") if owned_state(s)]
+                if not any(larval_state(s) for s in states) or time.monotonic() > deadline:
+                    break
+                await asyncio.sleep(0.5)
             policies = [p for p in await xfrm(r, agent, "policy") if INNER + "/32" in p.splitlines()[0]]
             if states or policies:
                 failures.append({"agent": str(agent), "states": states, "policies": policies})
+        if acq_saved is not None:
+            restored = await command(r.target, r.session, "sysctl", "-w",
+                                     f"net.core.xfrm_acq_expires={acq_saved}", check=False)
+            if restored["rc"]:
+                failures.append(restored)
         if lan_created:
             result = await lan_run_python(r.lan,
                 f"import subprocess\nsubprocess.run(['ip','addr','del',{LAN_INNER + '/32'!r},'dev','lo'],check=True)\n",
