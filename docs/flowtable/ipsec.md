@@ -472,11 +472,12 @@ with FCI. Only the door is new.
 
 ### 3. `xfrmdev_ops` on the DPAA netdev
 
-`xdo_dev_state_add` / `_delete` / `_free` / `_offload_ok` and
-`xdo_dev_policy_add` / `_delete` / `_free`, registered by the adapter on the
-bound physical ports rather than by the SDK driver, so CDX keeps no flowtable
-dependency. There is no `_state_advance_esn` and no `_state_update_stats`; the
-accounting subsection below says why. `xdo_dev_state_add` maps the `xfrm_state` straight onto the
+`xdo_dev_state_add` / `_delete` / `_free` / `_update_stats` / `_offload_ok`
+and `xdo_dev_policy_add` / `_delete` / `_free`, registered by the adapter on
+the bound physical ports rather than by the SDK driver, so CDX keeps no
+flowtable dependency. There is no `_state_advance_esn`, and `_update_stats`
+publishes the replay state alone; the accounting subsection below says why.
+`xdo_dev_state_add` maps the `xfrm_state` straight onto the
 backend call; the field mapping is exactly what `ipsec_xfrm2nlkey()` already
 computes, minus the serialisation:
 
@@ -662,15 +663,15 @@ for both families, and so is the replay state read back from it.
 `tools/host_tests/ipsec_backend.c` checks the placement and the read for every
 header size.
 
-There is no `xdo_dev_state_update_stats()`. Most of its callers hold `x->lock`
-or `xfrm_state_lock`: the state timer, `xfrm_state_check_expire()`, and state
-dumps. So it cannot sleep for the control mutex, under which the backend
-builds its 64-bit packet total; a second reader outside the mutex would race
-the pass. `XFRM_MSG_GETSA` reaches it holding only `xfrm_cfg_mutex`, and there
-nothing keeps the SA from being retired underneath it. What the op could
-publish, `curlft` already holds, at most a second old. mlx5 is no fresher: its
-flow counters are cached on a one-second period (`MLX5_FC_STATS_PERIOD`), and
-a one-second work judges its software limits (`mlx5e_ipsec_handle_sw_limits()`).
+`xdo_dev_state_update_stats()` publishes the replay state and nothing else
+(below). Its callers hold `x->lock` or `xfrm_state_lock`, or run in atomic
+context: the state timer, `xfrm_state_check_expire()`, state dumps and
+notifications. So it cannot sleep for the control mutex, under which the
+backend builds its 64-bit packet total, and a second reader of SEC's counters
+outside the mutex would race the pass. `curlft` stays the pass's, at most a
+second old. mlx5 is no fresher: its flow counters are cached on a one-second
+period (`MLX5_FC_STATS_PERIOD`), and a one-second work judges its software
+limits (`mlx5e_ipsec_handle_sw_limits()`).
 
 The pass also raises a soft expiry for a non-ESN outbound SA within 2^28 of the
 end of its sequence space. SEC does not wrap the sequence number: past the
@@ -724,19 +725,31 @@ cache create as `SA_ALLOW_SEQ_ROLL`, and the PDB gets `ARSNONE`. xfrm itself
 refuses an inbound ESN state with no window.
 
 SEC numbers and checks the frames, so xfrm's own replay state never moves
-unless the accounting pass moves it. Anything that carries a state on reads
-that copy: `XFRM_MSG_GETAE`, which a keying daemon reads to carry the state over
-when it re-adds an SA at a new address (strongSwan's MOBIKE update does: GETAE,
-delete, add), and the clone `xfrm_state_migrate()` makes. So the pass publishes
-both directions back, forward only:
+unless the adapter moves it. Anything that carries a state on reads that copy:
+`XFRM_MSG_GETSA` and `GETAE`, which a keying daemon reads to carry the state
+over when it re-adds an SA at a new address (strongSwan's MOBIKE update and a
+NAT's new mapping: GETSA, GETAE, delete, add with the same SPI and keys), and
+the clone `xfrm_state_migrate()` makes. The accounting pass publishes both
+directions back once a second, and `xdo_dev_state_update_stats()` publishes a
+live reading whenever xfrm is about to read the state. Upstream asks for it
+before GETSA, dumps and the state timer; patch 040 has GETAE and
+`xfrm_state_migrate()` ask as well, and refuses an `XFRM_MSG_NEWAE` that would
+write the replay state of a packet-offloaded SA, which no driver hears of.
 
-- **Outbound**: SEC's last sequence number, plus twice what the SA sent in the
-  last period. SEC keeps numbering until the SA is deleted, up to a period
-  after the reading plus however long the daemon takes between GETAE and the
-  delete. A re-add that started behind that would reuse numbers, while skipping
-  ahead looks like loss to the peer and costs nothing. Twice covers a rate that
-  rises into the next period. A burst out of idle in the last period before a
-  re-add can still exceed it. A non-ESN SA stops at the end of its space.
+The op reads the PDB alone (`cdx_ipsec_sa_replay_state()`), with no
+transaction, and holds `ft_ipsec_retired_lock` across the reading, which is
+what keeps the SA installed: deletion clears the state's handle before it moves
+the SA's entry off the owned list under that lock, and only the retirement that
+takes it from there frees the SA. The lock also serialises every publication,
+the pass's included, and is taken inside `x->lock` where that is held, the
+order deletion takes the two in. Publication is forward only, in both
+directions:
+
+- **Outbound**: SEC's last sequence number, exactly as SEC has it, so `ip xfrm
+  state` and the exhaustion check below see a number SEC has sent. SEC keeps
+  numbering after any reading, until the SA is out of the hardware, and a
+  re-add that started behind that would reuse numbers; the re-add is what
+  covers it (below), not the published number.
 - **Inbound**: the decapsulation PDB's sequence number and scorecard, written
   into `x->replay.seq` and its bitmap, or into `replay_esn->seq`, `seq_hi` and
   the `bmp` ring. SEC keeps the newest number in the least significant bit of
@@ -751,6 +764,59 @@ scorecard, so a re-add carries on from where the old SA left off. Positions
 past the state's own window are history xfrm does not keep, and past SEC's
 window too, which is exactly as wide. They are marked as seen all the same, so
 the scorecard never calls unseen a number xfrm would refuse as too old.
+
+A reading, however fresh, is taken before the delete, and SEC goes on taking
+and sending the old SA's frames until its retirement takes it out of the
+hardware. So the retirement reads where SEC left the SA once its classifier
+entry is out, its queues retired and SEC's last jobs done
+(`cdx_ipsec_sa_del()`), and keeps that record for ten seconds, at most 256 of
+them. A re-add of the same SA (the same SPI and direction under a keyed digest
+of the same keys, wherever it is bound: a MOBIKE move changes one direction's
+destination, and can change its family) is folded forward from it
+(`ft_ipsec_fold()`): inbound, the higher window top with every number either
+window refuses; outbound, the higher of the carried number and the old SA's
+last, moved on by twice what the old SA sent in its last period and by 2^16 at
+the least. Skipping ahead looks like loss to the peer and costs it nothing,
+where a reused number costs it the frame. This is the one place a number goes
+ahead of SEC's; an add that re-adds nothing starts exactly where it asked to.
+The fold holds whatever the re-add carries: an inbound SA that had taken
+nothing when it was read exports nothing and still takes frames until it is
+out, and under the same keys a number taken or sent once must not be taken or
+sent again. A new SA reusing an SPI under other keys starts where it asked to.
+Manual keying with a window lives with that: an inbound SA re-added within ten
+seconds under the same SPI and keys refuses a peer that restarted at 1 until
+the peer passes the old top. With no window, iproute2's default, nothing
+inbound is folded. The carried state is folded, never refused: packet offload
+has no software fallback, so refusing it would fail every MOBIKE update.
+
+A reader without `x->lock` (GETSA, dumps) can pair words of a publication
+from either side of it, as it can with any update xfrm makes under that lock:
+an ESN number's two halves, or a new bitmap with the old top. Nothing orders
+those stores for it; the fold is what keeps a re-add read that way from
+starting behind the old SA.
+
+A re-add that arrives while the old SA is still retiring waits for that
+retirement first, as does any add whose classifier entry would take a retiring
+SA's key. That keeps the two SAs from taking frames at once. With the
+destination unchanged, an ESP entry's key (destination and SPI) is the old
+one's, which the hash table refuses, and the re-add would fail. With a new
+destination, or under NAT-T a new peer address or port, the keys differ, and
+both SAs would take frames, each against its own window, so a frame one of
+them accepted could be replayed into the other. The wait is bounded at five
+seconds: the add holds `xfrm_cfg_mutex`, and a retirement that a wedged
+classifier keeps from finishing must not stall every xfrm change behind it.
+Past that, the add is refused with `-EBUSY`.
+
+Two ways of carrying an SA on get none of this. A make-before-break re-add
+under the same SPI and keys, the new SA added before the old one is deleted,
+finds nothing retiring or remembered: it starts at the number it read, and
+reuses whatever the old SA sends after that. strongSwan never does this: its
+`update_sa` deletes first, and a rekey is a new SPI under new keys.
+`XFRM_MSG_MIGRATE` of a packet-offloaded state clones it, in 6.12.103, to a
+software state, which the offloaded policy skips, so the clone carries no
+traffic whatever its sequence number. `CONFIG_XFRM_MIGRATE` is off in the
+shipped configuration; if it is ever enabled, MIGRATE must be refused for
+packet-offloaded states.
 
 One case is open. With ESN, the PDB is seeded with the window top's high word.
 The SEC RM says SEC holds its own stored ESN back after a rollover until the
@@ -1887,7 +1953,9 @@ with offload for its new local address and without `auto`'s fallback, so an
 offloaded SA whose re-add the adapter refuses is lost rather than moved to
 software. That already held for an outbound half whose peer moved behind
 another device; the inbound check adds the inbound half of the same move, and
-of a move onto an uplink reached only by a mark.
+of a move onto an uplink reached only by a mark. A re-add that is admitted
+carries on from where SEC left the old SA, not from where the daemon's reading
+found it (see "The starting sequence number and the replay window").
 
 ## Open questions
 

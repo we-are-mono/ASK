@@ -25,6 +25,7 @@ def function(source, name):
                       r"const struct ft_mc_route ?\* ?|"
                       r"struct ft_mr_group ?\* ?|struct ft_mr_event ?\* ?|"
                       r"struct xfrm_state ?\* ?|struct ft_ipsec_watch ?\* ?|const struct xfrmdev_ops ?\* ?|"
+                      r"struct ft_ipsec_retirement ?\* ?|"
                       r"struct rtable ?\* ?|"
                       r"enum ft_mr_state |enum qman_cb_dqrr_result )"
                       # __init/__exit sit between the return type and the name.

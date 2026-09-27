@@ -264,6 +264,9 @@ file's git history.
 - [x] **A283.** SEC drew random 64-bit IVs for offloaded GCM, CCM and CTR SAs, which collide after about 2^32 frames and, under GCM, give away the authentication key —
   fixed (_:/^cdx: count counter-mode IVs up from a random start per SA_).
 
+- [x] **A281.** A keying daemon re-adding an offloaded SA (MOBIKE, a NAT float) read its replay state up to a second stale, and SEC ran on until the retirement, so the new SA re-took accepted inbound frames and reused outbound numbers —
+  fixed (_:/^cdx: carry an SA's replay state across a re-add from where SEC has it_).
+
 - [x] **A284.** XFRM_MSG_NEWAE rewrote a packet-offloaded SA's replay state in xfrm's copy alone, which SEC never learns of and forward-only publication would have kept —
   fixed (_:/^patches: read an offloaded SA's replay state from its device, never write it_).
 

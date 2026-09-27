@@ -60,9 +60,10 @@ def test_ipsec_adapter(tmp_path):
         # Up to the work item, which is the kernel's and not a type.
         + source[source.index("struct ft_ipsec_route {"):
                  source.index("static void ft_ipsec_follow_work(struct work_struct")]
-        # The SAs the adapter owns and the bounds of the pass that accounts
-        # for them, again up to that pass's work item.
-        + source[source.index("struct ft_ipsec_retirement {"):
+        # The SAs the adapter owns, and remembers once retired, and the
+        # bounds of the pass that accounts for them, again up to that pass's
+        # work item.
+        + source[source.index("struct ft_ipsec_identity {"):
                  source.index("static void ft_ipsec_stats_work(struct work_struct")])
     # Which authenticators SEC produces: the one table that decides it and
     # the backend's predicate over it, with SEC's operation codes as cdx
@@ -71,7 +72,10 @@ def test_ipsec_adapter(tmp_path):
         "\n".join(re.findall(r"^#define\s+OP_PCL_IPSEC_(?:HMAC_\w+|AES_XCBC_MAC_96)\s.*$",
                              (ROOT / "cdx/cdx_dpa_ipsec.h").read_text(), re.M)) + "\n"
         + function((ROOT / "cdx/control_ipsec.c").read_text(), "cdx_ipsec_auth_op")
-        + function((ROOT / "cdx/cdx_ipsec_backend.c").read_text(), "cdx_ipsec_auth_supported"))
+        + function((ROOT / "cdx/cdx_ipsec_backend.c").read_text(), "cdx_ipsec_auth_supported")
+        # And the backend's own first check of every spec it is handed, which
+        # has the last word on what the adapter built.
+        + function((ROOT / "cdx/cdx_ipsec_backend.c").read_text(), "cdx_ipsec_validate"))
     # The extraction order is not the file's: the policy half sits with the
     # rule callbacks, the watch with the other dependency watches and the
     # translation with the xfrmdev ops. Ordering here rather than
@@ -91,8 +95,13 @@ def test_ipsec_adapter(tmp_path):
         "ft_ipsec_peer_mac", "ft_ipsec_peer_resolved", "ft_ipsec_route_of", "ft_ipsec_next_hop",
         "ft_ipsec_peer_on_port", "ft_ipsec_replay_bit", "ft_ipsec_replay_seen", "ft_ipsec_spec",
         "ft_ipsec_seq_exhausting", "ft_ipsec_publish_oseq",
-        "ft_ipsec_publish_window", "ft_ipsec_account", "ft_ipsec_sample_paths",
+        "ft_ipsec_publish_window", "ft_ipsec_publish", "ft_ipsec_account",
+        "ft_xdo_state_update_stats", "ft_ipsec_sample_paths",
         "ft_ipsec_stats_work",
+        "ft_ipsec_identify", "ft_ipsec_same", "ft_ipsec_in_the_way",
+        "ft_ipsec_retiring_in_the_way",
+        "ft_ipsec_remember", "ft_ipsec_forget_all", "ft_ipsec_refuses",
+        "ft_ipsec_fold_window", "ft_ipsec_fold_oseq", "ft_ipsec_fold",
         "ft_xdo_state_add", "ft_ipsec_none_left", "ft_ipsec_retire_work",
         "ft_ipsec_watch_stale", "ft_ipsec_follow_work",
         "ft_xdo_state_delete", "ft_ipsec_names_owned", "ft_ipsec_policy_served",
@@ -476,6 +485,7 @@ def test_ipsec_backend(tmp_path):
         + function(backend, "cdx_ipsec_sa_sample")
         + function(backend, "cdx_ipsec_sa_replay_sample")
         + function(backend, "cdx_ipsec_sa_bytes_believable")
+        + function(backend, "cdx_ipsec_sa_replay_state")
         + function(backend, "cdx_ipsec_sa_stats")
         # The rebuild that moves an SA's framing: its peer, its path's MTU.
         + re.search(r"^#define IS_NATT_SA\(.*$", control, re.M).group() + "\n"

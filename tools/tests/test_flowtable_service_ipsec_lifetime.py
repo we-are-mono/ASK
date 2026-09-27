@@ -321,10 +321,9 @@ async def test_flowtable_service_ipsec_starting_sequence(ipsec_service):
             assert echoed == SEQUENCE_COUNT and not refused, record
             assert seqs and seqs[0] == first, record
             assert sorted(seqs) == list(range(first, first + SEQUENCE_COUNT)), record
-            # SEC numbers the frames; the accounting pass carries its position
-            # back into the state within about a pass. It publishes ahead of
-            # the hardware by twice the last period's packets, so that a state
-            # re-added from it can never reuse a number already sent.
+            # SEC numbers the frames, and its position comes back into the
+            # state as SEC has it, within about a pass: the last number sent.
+            # A re-add of the SA is what goes past it, never the state.
             deadline = time.monotonic() + 3
             while not (start + SEQUENCE_COUNT <= (figures := await sa_state(r, spi))["oseq"]
                        <= start + 3 * SEQUENCE_COUNT):

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter
+import contextlib
 import hashlib
 import hmac
 import os
@@ -29,18 +30,21 @@ import re
 import secrets
 import socket
 import struct
+import time
 
 import pytest
 
-from _ipsec_helpers import endpoints_down, endpoints_up
+from _ipsec_helpers import endpoints_down, endpoints_up, iface_index, sa_add, sa_replay_state
 from _topology import TARGET_WAN_IF, lan_run
 from test_flowtable_connections import peer
 from test_flowtable_offload import DPORT, WAN_IP, command, read, rig  # noqa: F401
 from test_flowtable_selective_neighbour import warm
 from test_flowtable_service import FIRST
-from test_flowtable_service_ipsec import (INNER, LAN_INNER, REQIDS, Transform, flows_for, hardware,
-                                          ipsec_service, negative, plaintext_probe, sec_counter)  # noqa: F401
+from test_flowtable_service_ipsec import (INNER, LAN_INNER, REQIDS, Transform, Wire, flows_for, hardware,
+                                          ipsec_service, negative, plaintext_probe, replay_drops,  # noqa: F401
+                                          sec_counter)
 from test_flowtable_service_ipsec import test_flowtable_service_ipsec_shared_sequence as shared_sequence
+from test_ipsec_inbound_flow_offload import AUTH, CIPHER
 
 # An AES-128 key followed by the four-byte salt RFC 4106 and 4543 take with it.
 GCM_KEY = "0x" + "c3" * 20
@@ -229,6 +233,25 @@ async def arrivals(r, spi, seen, expected):
     return since(await delivered(r))
 
 
+@contextlib.asynccontextmanager
+async def lan_listener(r, marker):
+    """The LAN end's record of marked datagrams, for as long as the block runs.
+    A background process with a pidfile: the LAN console is one channel, and
+    the listener has to outlive the command that starts it."""
+    script = base64.b64encode(listener_script(marker).encode()).decode()
+    started = await lan_run(r.lan, f"echo {script} | base64 -d > {LISTENER} && rm -f {DELIVERED} && "
+                                   f"(nohup python3 {LISTENER} >/dev/null 2>&1 & echo $! > {LISTENER_PID}) && "
+                                   f"for i in $(seq 1 25); do grep -q READY {DELIVERED} 2>/dev/null && break; "
+                                   f"sleep 0.2; done; cat {DELIVERED}", 20)
+    try:
+        assert started.rc == 0 and "READY" in started.stdout, started.stdout
+        yield
+    finally:
+        await lan_run(r.lan, f"kill $(cat {LISTENER_PID}) 2>/dev/null; rm -f {LISTENER} {DELIVERED} {LISTENER_PID}", 10)
+        await command(r.target, r.session, "conntrack", "-D", "-p", "udp", "--orig-src", INNER,
+                      "--orig-dst", LAN_INNER, "--dport", str(RPORT), check=False)
+
+
 # The /proc/net/xfrm_stat counters the adapter folds SEC's protocol refusals
 # into. Which of them a refusal lands in follows the class the FMan microcode
 # counted it in, and that is not reliable -- replays have been measured in
@@ -383,16 +406,8 @@ async def test_flowtable_service_ipsec_replay_window(ipsec_service):
     nowhere; SEC keeps no such count."""
     r = ipsec_service
     marker = secrets.token_bytes(16)
-    script = base64.b64encode(listener_script(marker).encode()).decode()
     records, sas = [], []
-    # A background process with a pidfile: the LAN console is one channel,
-    # and the listener has to outlive this command.
-    started = await lan_run(r.lan, f"echo {script} | base64 -d > {LISTENER} && rm -f {DELIVERED} && "
-                                   f"(nohup python3 {LISTENER} >/dev/null 2>&1 & echo $! > {LISTENER_PID}) && "
-                                   f"for i in $(seq 1 25); do grep -q READY {DELIVERED} 2>/dev/null && break; "
-                                   f"sleep 0.2; done; cat {DELIVERED}", 20)
-    try:
-        assert started.rc == 0 and "READY" in started.stdout, started.stdout
+    async with lan_listener(r, marker):
         initial = await dut_counters(r)
         rejected, accepted = 0, Counter()
         for name, algorithms, window, phases in REPLAY_CASES:
@@ -446,10 +461,264 @@ async def test_flowtable_service_ipsec_replay_window(ipsec_service):
         assert counted["refusals"] == rejected, (
             f"SEC refused {rejected} replayed or late frames and {'+'.join(SEC_REFUSAL_MIBS)} moved by "
             f"{counted['refusals']}; a hardware refusal must be counted where Linux counts its own")
-    finally:
-        await lan_run(r.lan, f"kill $(cat {LISTENER_PID}) 2>/dev/null; rm -f {LISTENER} {DELIVERED} {LISTENER_PID}", 10)
-        await command(r.target, r.session, "conntrack", "-D", "-p", "udp", "--orig-src", INNER,
-                      "--orig-dst", LAN_INNER, "--dport", str(RPORT), check=False)
+
+
+# ------------------------------------------ the replay state xfrm hands a daemon
+
+SENDER = "/tmp/ask-ipsec-replay-sender.py"
+
+
+def sender_script(*, count=None, seconds=None):
+    """Datagrams on flow 2's tuple, out through the fixture's outbound SA:
+    `count` of them a millisecond apart, or as many as go in `seconds`.
+    Flow 2's tuple is exempt from the WAN masquerade, which would take it out
+    of the policy's selector. The inner echo's answers are discarded."""
+    return f"""
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(({LAN_INNER!r}, {FIRST}))
+s.setblocking(False)
+count, seconds = {count!r}, {seconds!r}
+payload, sent = b"r" * 200, 0
+end = time.time() + (seconds or 3600)
+while (count is None or sent < count) and time.time() < end:
+    try:
+        s.sendto(payload, ({INNER!r}, {DPORT}))
+        sent += 1
+    except BlockingIOError:
+        time.sleep(0.0001)
+    try:
+        while True:
+            s.recv(2048)
+    except BlockingIOError:
+        pass
+    if count is not None:
+        time.sleep(0.001)
+print("sent", sent)
+"""
+
+
+async def send_out(r, **how):
+    script = base64.b64encode(sender_script(**how).encode()).decode()
+    result = await lan_run(r.lan, f"echo {script} | base64 -d > {SENDER} && python3 {SENDER}; rm -f {SENDER}",
+                           (how.get("seconds") or 0) + 30)
+    assert result.rc == 0 and "sent" in result.stdout, result.stdout
+
+
+async def getsa(agent, r, identity):
+    """XFRM_MSG_GETSA's replay state for a state in the legacy shape (a
+    window of 32 or less), as `ip -s xfrm state get` prints it, and its
+    packet count."""
+    text = (await command(agent, r.session, "ip", "-s", "xfrm", "state", "get", *identity))["stdout"]
+    replay = re.search(r"anti-replay context: seq 0x([0-9a-f]+), oseq 0x([0-9a-f]+), bitmap 0x([0-9a-f]+)", text)
+    current = re.search(r"lifetime current:\s*\d+\(bytes\), (\d+)\(packets\)", text)
+    assert replay and current, text
+    return {"seq": int(replay[1], 16), "oseq": int(replay[2], 16), "bitmap": int(replay[3], 16),
+            "packets": int(current[1])}
+
+
+def esp_sequences(path, spi):
+    """The sequence numbers of `spi`'s ESP frames in a pcap, in wire order.
+    A plain walk, as reused_sequences() takes one: scapy takes minutes on a
+    line-rate burst."""
+    numbers = []
+    data = Path(path).read_bytes()
+    off = 24
+    while off + 16 <= len(data):
+        length = struct.unpack_from("<I", data, off + 8)[0]
+        frame = data[off + 16:off + 16 + length]
+        off += 16 + length
+        l3 = 18 if frame[12:14] == b"\x81\x00" else 14
+        if len(frame) >= l3 + 28 and frame[l3 + 9] == 50:
+            ihl = (frame[l3] & 0xF) * 4
+            owner, seq = struct.unpack_from("!II", frame, l3 + ihl)
+            if owner == spi:
+                numbers.append(seq)
+    return numbers
+
+
+def esp_capture(r, label):
+    capture = Wire(r, label)
+    capture.filter = f"ether src {r.dut_wan_mac} and ip proto 50"
+    capture.snaplen = 64
+    return capture
+
+
+LIVE_ROUNDS = 5
+LIVE_BLAST_SECONDS = 3
+# Datagrams the old outbound SA sends between a daemon's read and its delete.
+OUT_AFTER_READ = 500
+# How long a re-add may take: the adapter waits up to five seconds for the
+# old SA's retirement (FT_IPSEC_RETIRE_WAIT) before it refuses with -EBUSY,
+# which has to come back as that refusal rather than as the agent timing out.
+READD_TIMEOUT_MS = 7000
+
+
+async def test_ipsec_replay_state_read_live(ipsec_service):
+    """What xfrm hands a keying daemon of an offloaded SA's sequence space is
+    SEC's at that moment, not the accounting pass's of up to a second before.
+
+    strongSwan reads an SA with GETSA and GETAE and deletes it straight after
+    when it moves it to a new address, and re-adds it from what it read. Read
+    well inside a second of a burst's last frame, both must already cover it:
+    the inbound top and bitmap every frame SEC took, the outbound number every
+    one the peer received. The inbound rounds are several, so the pass
+    happening to run between a burst and its read cannot pass them all."""
+    r = ipsec_service
+    inbound = Inbound(r, secrets.token_bytes(16), CBC, 32)
+    await inbound.install()
+    identity = r.ipsec.state("in", inbound.spi)
+    records = []
+    for n in range(LIVE_ROUNDS):
+        await asyncio.sleep(1.1)
+        base = 1000 * n + 1
+        # A number SEC never sees in the middle of the burst, so the bitmap
+        # has something to be wrong about.
+        numbers = [s for s in range(base, base + 40) if s != base + 30]
+        await inbound.send(whole(*numbers))
+        sent = time.monotonic()
+        await asyncio.sleep(0.05)
+        read_sa = await getsa(r.target, r, identity)
+        read_ae = await sa_replay_state(r.target, r.session, dst=r.ipsec.outer, spi=inbound.spi)
+        record = {"round": n, "top": max(numbers), "getsa": read_sa, "getae": read_ae,
+                  "read_after": time.monotonic() - sent}
+        records.append(record)
+        r.record("ipsec-replay-read-live-in", records)
+        assert record["read_after"] < 1.0, record
+        for read in (read_sa, read_ae):
+            assert read["seq"] == max(numbers), record
+            for k in range(32):
+                assert bool(read["bitmap"] >> k & 1) == (max(numbers) - k in numbers), (k, record)
+
+    out = r.ipsec.state("out", r.ipsec.active["out"])
+    records = []
+    for n in range(2):
+        await send_out(r, seconds=LIVE_BLAST_SECONDS)
+        read_sa = await getsa(r.target, r, out)
+        read_ae = await sa_replay_state(r.target, r.session, dst=WAN_IP, spi=r.ipsec.active["out"])
+        # The peer's own SA: the highest number it has taken from the DUT.
+        received = await getsa(r.ipsec.wan, r, out)
+        record = {"round": n, "getsa": read_sa, "getae": read_ae, "peer": received}
+        records.append(record)
+        r.record("ipsec-replay-read-live-out", records)
+        assert received["packets"] > 0, record
+        assert read_sa["oseq"] >= received["seq"] and read_ae["oseq"] >= received["seq"], record
+
+
+async def test_ipsec_readd_carries_replay_state(ipsec_service):
+    """strongSwan moving a child SA to a new address, a MOBIKE update or a
+    NAT's new mapping: GETSA and GETAE, DELSA, then NEWSA with the same SPI
+    and keys and the replay state it read.
+
+    Frames go on arriving and leaving between the read and the delete, and
+    SEC goes on taking and numbering them until the old SA is out of the
+    hardware. The new SA must still refuse every frame the old one accepted,
+    and number past every frame the old one sent: the peer keeps its own SA,
+    and drops the new one's frames as replays until they pass. Both hold
+    only because the re-add is carried past where SEC left the old SA, which
+    no reading taken before the delete can know."""
+    r = ipsec_service
+    marker = secrets.token_bytes(16)
+    ifindex = await iface_index(r.target, r.session, TARGET_WAN_IF)
+    keys = {"cipher_key": bytes.fromhex(CIPHER[2:]), "auth_key": bytes.fromhex(AUTH[2:])}
+    inbound = Inbound(r, marker, CBC, 32)
+    identity = r.ipsec.state("in", inbound.spi)
+    async with lan_listener(r, marker):
+        await inbound.install()
+        seen = await delivered(r)
+        await inbound.send(whole(*range(1, 21)))
+        assert sum((await arrivals(r, inbound.spi, seen, 20)).values()) == 20
+        read_sa = await getsa(r.target, r, identity)
+        read_ae = await sa_replay_state(r.target, r.session, dst=r.ipsec.outer, spi=inbound.spi)
+        # Taken after the read and before the delete, which the reading
+        # cannot know of.
+        seen = await delivered(r)
+        await inbound.send(whole(*range(21, 25)))
+        assert sum((await arrivals(r, inbound.spi, seen, 4)).values()) == 4
+        await command(r.target, r.session, "ip", "xfrm", "state", "delete", *identity)
+        # strongSwan takes GETSA's replay state where it has one.
+        reply = await sa_add(r.target, r.session, src=WAN_IP, dst=r.ipsec.outer, spi=inbound.spi,
+                             reqid=int(REQIDS["in"]), ifindex=ifindex, inbound=True, **keys,
+                             replay_window=32, replay=(0, read_sa["seq"], read_sa["bitmap"]),
+                             timeout_ms=READD_TIMEOUT_MS)
+        assert reply.ok, reply.raw
+        readded = await getsa(r.target, r, identity)
+        before, seen = await dut_counters(r), await delivered(r)
+        # One the reading had taken, one only SEC had: both refused.
+        await inbound.send(whole(20, 23))
+        replayed = await arrivals(r, inbound.spi, seen, 0)
+        # And a number neither had seen is taken: the new SA works.
+        await inbound.send(whole(25))
+        fresh = await arrivals(r, inbound.spi, seen, 1)
+        # The pass reads the microcode's count once a second.
+        for _ in range(8):
+            await asyncio.sleep(0.5)
+            after = await dut_counters(r)
+            if after["ipsec_sec_refused"] - before["ipsec_sec_refused"] >= 2:
+                break
+        record = {"read": {"getsa": read_sa, "getae": read_ae}, "readded": readded,
+                  "replayed": sorted(replayed.elements()), "fresh": sorted(fresh.elements()),
+                  "refused": after["ipsec_sec_refused"] - before["ipsec_sec_refused"]}
+        r.record("ipsec-readd-in", record)
+        assert (read_sa["seq"], read_ae["seq"]) == (20, 20), record
+        assert not replayed, record
+        assert fresh == Counter({25: 1}), record
+        assert record["refused"] == 2, record
+
+    # Outbound, first on a fresh SA that has sent nothing when it is read,
+    # so the reading carries no rate to go ahead by; then on one that has
+    # been busy until just before.
+    spi = await r.ipsec.prepare_peer("out")
+    await r.ipsec.remove("out")
+    await r.ipsec.install("out", spi)
+    await readd_outbound(r, ifindex, keys, "idle")
+    await send_out(r, seconds=2)
+    await readd_outbound(r, ifindex, keys, "busy")
+
+
+async def readd_outbound(r, ifindex, keys, label):
+    """The fixture's outbound SA read, sending OUT_AFTER_READ more, deleted
+    and added again from the reading; and then what the new one sends, which
+    its peer, keeping its own SA, has to take."""
+    out_spi = r.ipsec.active["out"]
+    out = r.ipsec.state("out", out_spi)
+    async with esp_capture(r, f"ipsec-readd-{label}-old") as old_wire:
+        read_sa = await getsa(r.target, r, out)
+        read_ae = await sa_replay_state(r.target, r.session, dst=WAN_IP, spi=out_spi)
+        # SEC numbering on after the read, past the number read.
+        await send_out(r, count=OUT_AFTER_READ)
+    sent = esp_sequences(old_wire.path, out_spi)
+    # What the read gave is the number SEC had last sent, nothing added:
+    # the first frame after it carries the one after it. Nothing else is
+    # proved below unless the old SA went on past it.
+    precondition = {"case": label, "read": read_sa["oseq"], "getae": read_ae["oseq"],
+                    "frames_after_read": len(sent), "first_after_read": min(sent, default=None)}
+    assert len(sent) == OUT_AFTER_READ, (
+        "precondition: every datagram sent after the read must leave by the old SA", precondition)
+    assert min(sent) == read_sa["oseq"] + 1 and read_ae["oseq"] == read_sa["oseq"], (
+        "the published number must be the last SEC sent", precondition)
+    await command(r.target, r.session, "ip", "xfrm", "state", "delete", *out)
+    reply = await sa_add(r.target, r.session, src=r.ipsec.outer, dst=WAN_IP, spi=out_spi,
+                         reqid=int(REQIDS["out"]), ifindex=ifindex, **keys,
+                         replay=(read_sa["oseq"], 0, 0), timeout_ms=READD_TIMEOUT_MS)
+    assert reply.ok, reply.raw
+    drops, received = replay_drops(), await getsa(r.ipsec.wan, r, out)
+    async with esp_capture(r, f"ipsec-readd-{label}-new") as new_wire:
+        await send_out(r, count=200)
+    numbered = esp_sequences(new_wire.path, out_spi)
+    accepted = await getsa(r.ipsec.wan, r, out)
+    record = {"case": label, "read": {"getsa": read_sa, "getae": read_ae},
+              "old": {"frames": len(sent), "last": max(sent, default=0)},
+              "new": {"frames": len(numbered), "first": min(numbered, default=0)},
+              "peer": {"before": received, "after": accepted}, "peer_replay_drops": replay_drops() - drops}
+    r.record(f"ipsec-readd-out-{label}", record)
+    # The re-add carried the read number, which the old SA had passed by
+    # OUT_AFTER_READ: only where SEC left it, with its margin, puts the new
+    # SA beyond -- for the idle SA, nothing else would move it at all.
+    assert numbered and min(numbered) > max(sent), record
+    assert record["peer_replay_drops"] == 0, record
+    assert accepted["packets"] - received["packets"] == len(numbered), record
 
 
 # A documentation-range pair of its own, so no other IPsec test's endpoints

@@ -971,7 +971,7 @@ static bool ft_ipsec_retire_pending(void)
 /* Work items run where they are flushed, which is what flushing proves. */
 static void ft_retire_workfn(struct work_struct *work);
 static void ft_invalidate_work(struct work_struct *work);
-static unsigned stopped_flushes, follow_flushes;
+static unsigned stopped_flushes, follow_flushes, ipsec_retire_flushes;
 static void flush_work(int *work)
 {
     if (work == &ft_stopped_work) {
@@ -995,6 +995,16 @@ static void flush_work(int *work)
         return;
     }
     assert(work == &ft_ipsec_retire);
+    ipsec_retire_flushes++;
+}
+/* What retired SAs left for a re-add of them, dropped only once the
+ * retirements that record it are drained. The records themselves are
+ * compiled in ipsec_adapter.c. */
+static unsigned ipsec_forgotten;
+static void ft_ipsec_forget_all(void)
+{
+    assert(ipsec_retire_flushes > ipsec_forgotten);
+    ipsec_forgotten++;
 }
 /* Set by a case to model a rearm landing while the egress drain waits for
  * the invalidation pass: the latch clears, and the done flag with it. */

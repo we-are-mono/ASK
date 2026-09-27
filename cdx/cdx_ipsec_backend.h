@@ -308,8 +308,14 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
  * handle. A flow still naming this SA is not the backend's problem to
  * solve: the caller retires its dependent directions first, exactly as it
  * does for a neighbour or a route.
+ *
+ * `last`, when not NULL, is where SEC left the SA's sequence space, read as
+ * cdx_ipsec_sa_replay_state() reads it once the SA's classifier entry has
+ * come out and SEC has finished the frames it had taken: nothing moves it
+ * after that. All zero when there was nothing to read. Finishing takes a
+ * short, bounded sleep.
  */
-void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa);
+void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa, struct cdx_ipsec_counters *last);
 
 /* How many SAs added here are not yet deleted, whatever became of the module
  * that added them. Transaction held. */
@@ -369,6 +375,26 @@ u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa);
  */
 void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 			struct cdx_ipsec_counters *counters);
+
+/* Reads where an SA's sequence space stands in SEC's PDB right now: oseq for
+ * an outbound SA, seq and seen for an inbound one, as cdx_ipsec_sa_stats()
+ * reports them, which it reads them with. Nothing else in `state` is touched,
+ * and nothing of the SA's is: its packet and byte totals are the
+ * transaction's, and this does not take it.
+ *
+ * So the caller has to keep the SA installed across the call by other means
+ * -- the adapter holds the lock its deletion takes before the SA can be
+ * retired. Needs no transaction and does not sleep, so a caller under a
+ * spinlock may use it. SEC stores the PDB back after every frame; an inbound
+ * window that never holds still for two readings is left unread, as the
+ * stats read leaves it.
+ *
+ * False, with the three fields zero, when there is nothing to read: an
+ * inbound SA with anti-replay off, a window that would not hold still, or a
+ * descriptor that stores no PDB back.
+ */
+bool cdx_ipsec_sa_replay_state(const struct cdx_ipsec_sa *sa,
+			       struct cdx_ipsec_counters *state);
 
 /* Reads the microcode's count of the frames SEC refused, every class of it.
  *

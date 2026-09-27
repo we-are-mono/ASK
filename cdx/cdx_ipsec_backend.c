@@ -9,6 +9,7 @@
  * cdx_dpa_ipsec.c's, reached through the helpers control_ipsec.h declares.
  */
 
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/if_arp.h>
 #include <linux/kernel.h>
@@ -83,9 +84,11 @@ EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_count, ASK_CDX_FLOWTABLE);
 
 /* Find a handle no live SA holds.
  *
- * The handle is what indexes sa_cache_by_h and what SEC stamps into a
- * decrypted frame's trailer,
- * so it has to be unique among live SAs and it has to be non-zero -- zero is
+ * The handle is what indexes sa_cache_by_h, and what names the SA of a frame
+ * SEC hands back to the CPU: that frame carries nothing of its SA, but it
+ * arrives on the SA's own exception queue, whose id get_netdev_of_SA_by_fqid()
+ * turns into this handle and xfrm_state_lookup_byhandle() into the state. So
+ * it has to be unique among live SAs and it has to be non-zero -- zero is
  * what an absent handle reads as on both paths.
  *
  * Rotating rather than scanning from one keeps a deleted SA's handle out of
@@ -472,12 +475,51 @@ err_free_owner:
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_add, ASK_CDX_FLOWTABLE);
 
-void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
+/* How many times, and how many microseconds apart, a deletion looks for SEC
+ * to have stopped taking an SA's frames. */
+#define CDX_IPSEC_QUIESCE_TRIES	20
+#define CDX_IPSEC_QUIESCE_US	100
+
+/* Wait for SEC to be done with an SA whose classifier entry has come out and
+ * whose queues have been retired, so that its PDB holds the last of what SEC
+ * did with it.
+ *
+ * Retiring the queue SEC takes the SA's frames from stops it being handed
+ * more, but QMan may complete the retirement a little later, once a dequeue
+ * already under way finishes (SA_FQ_WAIT_B4_FREE), and SEC finishes the jobs
+ * it had taken either way, each in a few microseconds. So this waits,
+ * briefly and boundedly, for the retirement and then for several times what
+ * a job takes. The memory is still the SA's throughout: its release is
+ * deferred to the CDX timer, which runs under the control mutex the caller
+ * holds. A queue that did not retire in that time, or could not be retired,
+ * is said out loud: what is read afterwards may then be short of frames SEC
+ * still takes.
+ */
+static void cdx_ipsec_sa_quiesce(PSAEntry entry)
+{
+	void *handle = entry->pSec_sa_context ?
+		       entry->pSec_sa_context->dpa_ipsecsa_handle : NULL;
+	unsigned int tries;
+
+	if (!handle)
+		return;
+	for (tries = 0; tries < CDX_IPSEC_QUIESCE_TRIES &&
+	     cdx_ipsec_sa_fq_check_if_retired_state(handle, FQ_TO_SEC); tries++)
+		usleep_range(CDX_IPSEC_QUIESCE_US, 2 * CDX_IPSEC_QUIESCE_US);
+	if (cdx_ipsec_sa_fq_check_if_retired_state(handle, FQ_TO_SEC))
+		pr_warn_ratelimited("cdx: IPsec SA handle %u: SEC's queue did not retire; its last sequence state may miss frames SEC still takes\n",
+				    entry->handle);
+	usleep_range(CDX_IPSEC_QUIESCE_US, 2 * CDX_IPSEC_QUIESCE_US);
+}
+
+void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa, struct cdx_ipsec_counters *last)
 {
 	struct cdx_ipsec_sa *owner = *sa;
 	int rc;
 
 	cdx_ft_assert_held();
+	if (last)
+		memset(last, 0, sizeof(*last));
 	if (!owner)
 		return;
 	*sa = NULL;
@@ -488,9 +530,15 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 	 * mean this owner outlived its entry -- worth saying out loud, because
 	 * the hardware entry then stays in the classifier and the next SA with
 	 * the same key is refused by the hash table rather than by us. */
-	if (rc)
+	if (rc) {
 		pr_warn("cdx: IPsec SA handle %u was not in the cache (%d); its hardware entry may be stranded\n",
 			owner->handle, rc);
+	} else if (last) {
+		/* Out of the classifier, its queues retired: once SEC has
+		 * finished with what it took, the PDB is where the SA ends. */
+		cdx_ipsec_sa_quiesce(owner->entry);
+		cdx_ipsec_sa_replay_state(owner, last);
+	}
 	kfree(owner);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_del, ASK_CDX_FLOWTABLE);
@@ -671,24 +719,48 @@ static bool cdx_ipsec_sa_bytes_believable(struct cdx_ipsec_sa *sa, u64 bytes)
 	return false;
 }
 
+bool cdx_ipsec_sa_replay_state(const struct cdx_ipsec_sa *sa,
+			       struct cdx_ipsec_counters *state)
+{
+	PSAEntry entry = sa ? sa->entry : NULL;
+
+	static_assert(ARRAY_SIZE(state->seen) == SA_REPLAY_SEEN_WORDS);
+	state->oseq = 0;
+	state->seq = 0;
+	memset(state->seen, 0, sizeof(state->seen));
+	/* Every descriptor the builder makes stores its PDB back after each
+	 * job, the counters behind it. An offset of zero is a descriptor never
+	 * built, whose PDB nothing stores: nothing is read, which a published
+	 * number or window only ever takes as no news. */
+	if (!entry || !entry->stats_offset)
+		return false;
+	if (entry->direction == CDX_DPA_IPSEC_OUTBOUND) {
+		state->oseq = get_oseq_from_sa(entry);
+		return true;
+	}
+	/* Anti-replay off keeps no window. */
+	if (entry->flags & SA_ALLOW_SEQ_ROLL)
+		return false;
+	if (cdx_ipsec_sa_replay_sample(entry, &state->seq, state->seen))
+		return true;
+	state->seq = 0;
+	memset(state->seen, 0, sizeof(state->seen));
+	return false;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_replay_state, ASK_CDX_FLOWTABLE);
+
 void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 			struct cdx_ipsec_counters *counters)
 {
 	u32 packets;
 	u64 bytes;
 
-	static_assert(ARRAY_SIZE(counters->seen) == SA_REPLAY_SEEN_WORDS);
 	cdx_ft_assert_held();
 	memset(counters, 0, sizeof(*counters));
-	if (!sa || !sa->entry)
-		return;
-	/* Every descriptor the builder makes keeps these counters, and SEC
-	 * stores them back with the PDB after each job. An offset of zero is a
-	 * descriptor never built, where a read would take the PDB's options
-	 * word for a packet count and a PDB nothing stores for the sequence:
-	 * nothing is reported, which a published number or window only ever
-	 * takes as no news. */
-	if (!sa->entry->stats_offset)
+	/* The counters sit behind the PDB, so a descriptor that stores no PDB
+	 * keeps none either: a read at offset zero would take the PDB's
+	 * options word for a packet count. */
+	if (!sa || !sa->entry || !sa->entry->stats_offset)
 		return;
 	if (cdx_ipsec_sa_sample(sa->entry, &packets, &bytes) &&
 	    cdx_ipsec_sa_bytes_believable(sa, bytes)) {
@@ -700,14 +772,7 @@ void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	}
 	counters->packets = sa->packets;
 	counters->bytes = sa->bytes;
-	if (sa->entry->direction == CDX_DPA_IPSEC_OUTBOUND) {
-		counters->oseq = get_oseq_from_sa(sa->entry);
-	} else if (!(sa->entry->flags & SA_ALLOW_SEQ_ROLL) &&
-		   !cdx_ipsec_sa_replay_sample(sa->entry, &counters->seq,
-					       counters->seen)) {
-		counters->seq = 0;
-		memset(counters->seen, 0, sizeof(counters->seen));
-	}
+	cdx_ipsec_sa_replay_state(sa, counters);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_stats, ASK_CDX_FLOWTABLE);
 

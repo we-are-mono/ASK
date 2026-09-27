@@ -680,6 +680,59 @@ static void test_replay_read(void)
 	inbound_entry = NULL;
 }
 
+/* The sequence space alone, read without the transaction -- xfrm asks for
+ * it holding a spinlock, never the control mutex -- the same way the stats
+ * read reads it, and leaving the SA's totals, and every field of the
+ * caller's but the three it reads, as they were. */
+static void test_replay_state(void)
+{
+	SAEntry out = { .direction = CDX_DPA_IPSEC_OUTBOUND,
+			.pSec_sa_context = &context, .stats_offset = 40 };
+	SAEntry in = { .direction = CDX_DPA_IPSEC_INBOUND,
+		       .pSec_sa_context = &context, .stats_offset = 40 };
+	struct cdx_ipsec_sa sa = { .entry = &out, .packets = 7, .sec_packets = 7,
+				   .bytes = 70 };
+	struct cdx_ipsec_counters c = { .packets = 123, .bytes = 456, .oseq = 9,
+					.seq = 9, .seen = { 1, 1, 1, 1 } };
+
+	transaction = false;
+	script_reset();
+	memset(&pdb, 0, sizeof(pdb));
+	pdb_next(0, 43);
+	assert(cdx_ipsec_sa_replay_state(&sa, &c));
+	assert(c.oseq == 42 && !c.seq && !c.seen[0] && !c.seen[3]);
+	assert(c.packets == 123 && c.bytes == 456);
+	assert(!descriptor_reads && sa.packets == 7 && sa.sec_packets == 7 && sa.bytes == 70);
+
+	/* Inbound: the top and the scorecard, word for word. */
+	memset(&pdb, 0, sizeof(pdb));
+	sa.entry = &in;
+	pdb.pdb_dec.seq_num = cpu_to_caam32(5000);
+	pdb.pdb_dec.anti_replay[0] = cpu_to_caam32(0xb);
+	pdb.pdb_dec.anti_replay[3] = cpu_to_caam32(0x80000000);
+	assert(cdx_ipsec_sa_replay_state(&sa, &c));
+	assert(c.seq == 5000 && c.seen[0] == 0xb && c.seen[3] == 0x80000000 && !c.oseq);
+
+	/* A window that never holds still is not read at all. */
+	stores_left = 100;
+	between_reads = sec_stores_again;
+	assert(!cdx_ipsec_sa_replay_state(&sa, &c));
+	assert(!c.seq && !c.seen[0] && !c.seen[3]);
+	between_reads = NULL;
+	/* Anti-replay off keeps no window. */
+	in.flags = SA_ALLOW_SEQ_ROLL;
+	replay_reads = 0;
+	assert(!cdx_ipsec_sa_replay_state(&sa, &c) && !c.seq && !replay_reads);
+	/* Nor does a descriptor never built, or no SA. */
+	in.flags = 0;
+	in.stats_offset = 0;
+	assert(!cdx_ipsec_sa_replay_state(&sa, &c) && !replay_reads);
+	assert(!cdx_ipsec_sa_replay_state(NULL, &c));
+	assert(c.packets == 123 && c.bytes == 456);
+	transaction = true;
+	memset(&pdb, 0, sizeof(pdb));
+}
+
 /* Where the per-SA counters sit in the shared descriptor, for every outer
  * header the encapsulation PDB carries and for decapsulation -- both
  * families -- and that the reader finds there what the descriptor stores. */
@@ -959,6 +1012,7 @@ int main(void)
 	test_set_sequence();
 	test_replay_seed();
 	test_replay_read();
+	test_replay_state();
 	test_stats_layout();
 	test_validate();
 	test_set_next_hop();

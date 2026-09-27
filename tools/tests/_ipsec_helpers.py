@@ -51,6 +51,10 @@ NETLINK_XFRM = 6
 
 XFRM_MSG_NEWSA = 16
 XFRM_MSG_DELSA = 17
+# The async event pair, which carries a state's replay state and lifetime:
+# GETAE asks, and the kernel answers with a NEWAE.
+XFRM_MSG_NEWAE = 30
+XFRM_MSG_GETAE = 31
 
 NLM_F_REQUEST = 0x01
 NLM_F_ACK     = 0x04
@@ -64,6 +68,10 @@ XFRMA_ALG_CRYPT      = 2
 XFRMA_ALG_AEAD       = 18
 XFRMA_ENCAP          = 4
 XFRMA_OFFLOAD_DEV    = 28
+# struct xfrm_replay_state (oseq, seq, bitmap: three u32) and its ESN-format
+# sibling (bmp_len, oseq, seq, oseq_hi, seq_hi, replay_window, then the ring).
+XFRMA_REPLAY_VAL     = 10
+XFRMA_REPLAY_ESN_VAL = 23
 
 # xfrm_user_offload.flags
 XFRM_OFFLOAD_IPV6    = 1
@@ -184,12 +192,18 @@ def newsa(
     cipher_key: bytes = CIPHER_KEY,
     auth_key: bytes = AUTH_KEY,
     natt: tuple[int, int] | None = None,
+    replay_window: int = 0,
+    replay: tuple[int, int, int] | None = None,
 ) -> bytes:
     """Build an XFRM_MSG_NEWSA body: xfrm_usersa_info then its attributes.
 
     `offload=False` describes the same SA without XFRMA_OFFLOAD_DEV, which is
     how a case asks for a software state -- useful as the control that proves
     an assertion is about the offload rather than about xfrm.
+
+    `replay` is the (oseq, seq, bitmap) a keying daemon carries over when it
+    re-adds an SA, as XFRMA_REPLAY_VAL: the legacy shape, for a window of 32
+    or less, which is what `ip` cannot send.
     """
     info = (
         _selector()                                   # sel
@@ -211,7 +225,7 @@ def newsa(
         + b"\x00" * 32                                # curlft
         + b"\x00" * 12                                # stats
         + struct.pack("<II", 0, reqid)                # seq, reqid
-        + struct.pack("<HBBB", AF_INET, mode, 0, 0)   # family, mode, replay, flags
+        + struct.pack("<HBBB", AF_INET, mode, replay_window, 0)   # family, mode, replay, flags
         + b"\x00" * 7                                 # tail padding to 224
     )
     assert len(info) == 224, len(info)
@@ -220,6 +234,8 @@ def newsa(
         + _nla(XFRMA_ALG_AUTH_TRUNC,
                _algo_auth(AUTH_ALG, auth_key, AUTH_TRUNC_BITS))
     )
+    if replay is not None:
+        attrs += _nla(XFRMA_REPLAY_VAL, struct.pack("<III", *replay))
     if natt is not None:
         sport, dport = natt
         attrs += _nla(XFRMA_ENCAP,
@@ -237,6 +253,53 @@ def delsa(*, dst: str, spi: int) -> bytes:
     """Build an XFRM_MSG_DELSA body: struct xfrm_usersa_id."""
     return (_addr(dst) + struct.pack(">I", spi)
             + struct.pack("<HBB", AF_INET, IPPROTO_ESP, 0))
+
+
+def getae(*, dst: str, spi: int) -> bytes:
+    """Build an XFRM_MSG_GETAE body: struct xfrm_aevent_id, 48 bytes. The
+    kernel finds the state by the xfrm_usersa_id at its head alone; the
+    source, flags and reqid after it are left zero."""
+    return delsa(dst=dst, spi=spi) + _addr(None) + struct.pack("<II", 0, 0)
+
+
+def replay_attrs(attrs: bytes) -> dict:
+    """The replay state among a NEWAE's (or NEWSA's) attributes: the legacy
+    shape as oseq, seq and bitmap, the ESN-format one as oseq and seq with
+    their high words folded in, its window and its ring."""
+    out: dict = {}
+    off = 0
+    while off + 4 <= len(attrs):
+        length, kind = struct.unpack_from("<HH", attrs, off)
+        if length < 4:
+            break
+        value = attrs[off + 4:off + length]
+        kind &= 0x3FFF          # NLA_F_NESTED and NLA_F_NET_BYTEORDER
+        if kind == XFRMA_REPLAY_VAL:
+            out["oseq"], out["seq"], out["bitmap"] = struct.unpack_from("<III", value)
+        elif kind == XFRMA_REPLAY_ESN_VAL:
+            bmp_len, oseq, seq, oseq_hi, seq_hi, window = struct.unpack_from("<6I", value)
+            out.update(oseq=oseq_hi << 32 | oseq, seq=seq_hi << 32 | seq, window=window,
+                       bmp=list(struct.unpack_from(f"<{bmp_len}I", value, 24)))
+        off += (length + 3) & ~3
+    return out
+
+
+async def sa_replay_state(target_agent, session, *, dst: str, spi: int) -> dict:
+    """An SA's replay state as XFRM_MSG_GETAE reports it -- what a keying
+    daemon reads to carry the state over when it re-adds the SA."""
+    result = await target_agent.netlink_send(
+        session, NETLINK_XFRM, getae(dst=dst, spi=spi),
+        nlmsg_type=XFRM_MSG_GETAE, nlmsg_flags=NLM_F_REQUEST, timeout_ms=3000)
+    reply = bytes.fromhex(result.get("reply_hex", "") or "")
+    assert len(reply) >= 16, result
+    length, kind = struct.unpack_from("<IH", reply, 0)
+    if kind == NLMSG_ERROR:
+        raise RuntimeError(f"GETAE refused: {struct.unpack_from('<i', reply, 16)[0]}")
+    assert kind == XFRM_MSG_NEWAE and length <= len(reply), result
+    # nlmsghdr, then the xfrm_aevent_id echoed back, then the attributes.
+    state = replay_attrs(reply[16 + 48:length])
+    assert "seq" in state, result
+    return state
 
 
 # ---------------------------------------------------------------- results
@@ -299,14 +362,16 @@ async def sa_add(
     offload: bool = True, cipher_key: bytes = CIPHER_KEY,
     auth_key: bytes = AUTH_KEY, natt: tuple[int, int] | None = None,
     failslab_times: int | None = None, timeout_ms: int = 3000,
+    replay_window: int = 0, replay: tuple[int, int, int] | None = None,
 ) -> SaReply:
     """Install one SA over XFRM, optionally with the Nth kmalloc of the send
-    forced to NULL."""
+    forced to NULL, and with a replay state carried in (newsa())."""
     result = await target_agent.netlink_send(
         session, NETLINK_XFRM,
         newsa(src=src, dst=dst, spi=spi, reqid=reqid, ifindex=ifindex,
               inbound=inbound, mode=mode, offload=offload,
-              cipher_key=cipher_key, auth_key=auth_key, natt=natt),
+              cipher_key=cipher_key, auth_key=auth_key, natt=natt,
+              replay_window=replay_window, replay=replay),
         nlmsg_type=XFRM_MSG_NEWSA,
         nlmsg_flags=NLM_F_REQUEST | NLM_F_ACK,
         timeout_ms=timeout_ms, failslab_times=failslab_times,

@@ -34,8 +34,10 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
 #include <linux/proc_fs.h>
+#include <linux/once.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
+#include <linux/siphash.h>
 #include <linux/spinlock.h>
 #include <linux/tc_act/tc_csum.h>
 #include <linux/workqueue.h>
@@ -11557,11 +11559,30 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 	return ft_ipsec_peer_on_port(x, extack);
 }
 
+/* Who an SA is to a re-add of it (ft_ipsec_fold()): its SPI and direction,
+ * and a digest of its transform and keys (ft_ipsec_identify()). A re-add
+ * keeps all three wherever it moves the SA -- a MOBIKE move changes one
+ * direction's destination, even its family -- and a new SA reusing an SPI
+ * has other keys. The window and ESN say how its replay state reads. Its
+ * destination and family are what its classifier entry is keyed on, which
+ * another SA with the same SPI can collide with (ft_ipsec_in_the_way()). */
+struct ft_ipsec_identity {
+	union nf_inet_addr daddr;
+	__be32 spi;
+	u32 replay_window;
+	u64 digest;
+	u8 family;
+	u8 dir;
+	bool esn;
+};
+
 /* Retirement storage belongs to an SA from its initial installation.
  * Deletion can run from expiry under a spinlock and must never allocate.
  *
  * While the SA is owned, the same entry is what the accounting pass below
- * walks, which is why it names the state as well as the SA. */
+ * walks, which is why it names the state as well as the SA. Once the SA is
+ * out of the hardware, the entry may stay a little longer as the record of
+ * where SEC left it, on ft_ipsec_remembered. */
 struct ft_ipsec_retirement {
 	struct list_head list;
 	struct cdx_ipsec_sa *sa;
@@ -11578,10 +11599,43 @@ struct ft_ipsec_retirement {
 	 * counted -- xfrm_user takes a current lifetime at install -- keeps
 	 * it. */
 	struct cdx_ipsec_counters published;
+	/* How many frames the SA carries in an accounting period: the rate a
+	 * re-add of an outbound SA is carried past the old one's last number
+	 * with (ft_ipsec_fold_oseq()), kept on the record once it retires.
+	 * Halved each period it is not topped up, so one reading SEC's
+	 * counters would not give up does not take it to nothing while the SA
+	 * is at its busiest. Under ft_ipsec_retired_lock. */
+	u64 sent;
+	/* Set at install, read by a re-add. */
+	struct ft_ipsec_identity id;
+	/* Where SEC left the SA's sequence space once it was out of the
+	 * hardware, and when that was (jiffies): what ft_ipsec_fold() carries
+	 * into a re-add of it. Written by the retirement, then read under
+	 * ft_ipsec_retired_lock. */
+	struct cdx_ipsec_counters last;
+	unsigned long retired;
 };
 static LIST_HEAD(ft_ipsec_owned);
 static LIST_HEAD(ft_ipsec_retired);
 static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
+/* Retired SAs whose last state a re-add of them may still ask for, oldest
+ * first, one per identity. strongSwan re-adds an SA at a new address a
+ * moment after deleting it (MOBIKE, a NAT's new mapping), so a few seconds
+ * are plenty; the bound on the count keeps a flood of deletions from growing
+ * it. Under ft_ipsec_retired_lock. */
+static LIST_HEAD(ft_ipsec_remembered);
+static unsigned int ft_ipsec_remembered_count;
+#define FT_IPSEC_REMEMBERED	256
+#define FT_IPSEC_REMEMBER_FOR	(10 * HZ)
+/* Woken as each retirement finishes, for an add waiting on one
+ * (ft_xdo_state_add()), which gives up after FT_IPSEC_RETIRE_WAIT: a
+ * retirement a wedged classifier keeps from finishing must not hold every
+ * xfrm configuration change behind the xfrm_cfg_mutex the add is under. */
+static DECLARE_WAIT_QUEUE_HEAD(ft_ipsec_retired_wait);
+#define FT_IPSEC_RETIRE_WAIT	(5 * HZ)
+/* The key ft_ipsec_identify() digests an SA's keys with: this module's own,
+ * so a digest says nothing of the keys it stands for. */
+static siphash_key_t ft_ipsec_digest_key;
 /* SAs whose deletion has begun and whose hardware entries are not yet out:
  * counted before the SA's watch goes, and uncounted by ft_ipsec_retire inside
  * the transaction that deletes them. An outbound SA's entry transmits on its
@@ -11623,23 +11677,38 @@ static bool ft_ipsec_retire_pending(void)
  *
  * The replay state goes back the same way, in both directions: SEC numbers
  * and checks the frames, so xfrm's own copy never moves unless this moves it.
+ * A period is too long for that copy, though. A keying daemon re-adding an SA
+ * at a new address reads it and deletes the SA straight after, and a copy up
+ * to a period old would start the new SA over numbers the old one had
+ * already sent, or anchor its window below frames the old one had already
+ * taken. So xdo_dev_state_update_stats() publishes it too, from a live
+ * reading, whenever xfrm is about to read it: XFRM_MSG_GETSA and GETAE, state
+ * dumps and notifications, the state timer, xfrm_state_check_expire() and the
+ * clone xfrm_state_migrate() makes (patch 040 asks for the last two it did
+ * not).
  *
- * There is deliberately no xdo_dev_state_update_stats(). Most of its callers
- * hold x->lock or xfrm_state_lock -- the state timer, xfrm_state_check_expire(),
- * state dumps -- so it cannot sleep for the control mutex, and the 64-bit
- * packet total is built under that mutex; a second reader outside it would
- * race the pass. XFRM_MSG_GETSA reaches it holding only xfrm_cfg_mutex, where
- * nothing even keeps the SA from being retired underneath it. What the op
- * could publish, curlft already holds, at most one period old -- as stale as
- * mlx5's, whose flow counters are cached on the same one-second period
- * (MLX5_FC_STATS_PERIOD) and whose software limits are judged by a
- * one-second work (mlx5e_ipsec_handle_sw_limits()).
+ * The op publishes the replay state alone. Its callers hold x->lock or
+ * xfrm_state_lock, or are in atomic context, so it cannot take the control
+ * mutex the 64-bit packet total is built under, and a second reader of SEC's
+ * counters outside it would race the pass. curlft stays the pass's, at most
+ * one period old -- as stale as mlx5's, whose flow counters are cached on the
+ * same one-second period (MLX5_FC_STATS_PERIOD) and whose software limits are
+ * judged by a one-second work (mlx5e_ipsec_handle_sw_limits()). The replay
+ * state needs neither: the backend reads it from the PDB alone
+ * (cdx_ipsec_sa_replay_state()), and ft_ipsec_retired_lock keeps the SA
+ * installed across the reading (ft_xdo_state_update_stats()).
  *
  * Nor an xdo_dev_state_advance_esn(). xfrm_dev_state_add() asks for it only
  * for crypto offload, and SEC keeps an ESN SA's high word in its PDB and
  * advances it there.
  */
 #define FT_IPSEC_STATS_PERIOD	HZ
+
+/* How far past the old SA's number a re-add of an outbound SA starts at the
+ * least, whatever the old one sent in its last period (ft_ipsec_fold_oseq()).
+ * 2^16 frames is 47 ms at 1.4 Mpps: far more than SEC can still have been
+ * holding of the old SA when its last number was read. */
+#define FT_IPSEC_OSEQ_FLOOR	(1ULL << 16)
 
 /* How close to the end of its sequence space a non-ESN outbound SA may come
  * before the pass asks for a rekey.
@@ -11671,41 +11740,44 @@ static bool ft_ipsec_seq_exhausting(const struct xfrm_state *x, u64 oseq)
  *
  * Packet offload never advances xfrm's own copy -- SEC numbers the frames --
  * so it would stay wherever the SA was installed, and whatever carries a
- * state's sequence number on reads that copy: XFRM_MSG_GETAE, which a keying
- * daemon reads to carry the number over when it re-adds an SA at a new
- * address, and the clone xfrm_state_migrate() makes. Either would start the
- * new SA over numbers its peer has already seen, and the peer drops every
- * frame until they pass. Only forward, so a stale reading never undoes a
- * value set by other means. Caller holds x->lock.
+ * state's sequence number on reads that copy: XFRM_MSG_GETSA and GETAE, which
+ * a keying daemon reads to carry the number over when it re-adds an SA at a
+ * new address, and the clone xfrm_state_migrate() makes. Either would start
+ * the new SA over numbers its peer has already seen, and the peer drops every
+ * frame until they pass.
  *
- * The number goes back ahead of SEC's by twice what the SA sent in the last
- * period (`sent`). SEC goes on numbering after this reading until the SA is
- * deleted -- up to a period later, plus however long a daemon takes between
- * reading the state and deleting it -- and a re-added SA that started behind
- * that would reuse numbers. Skipping ahead costs the peer nothing: a gap in
- * the sequence is what loss looks like to it. Twice covers a rate that rises
- * into the next period; a burst out of idle in the last period before a
- * re-add is the case it can still fall short on. The margin stops at the last
- * number SEC will send, one below all-ones (SEC RM table 9-2).
+ * What goes back is SEC's number as it is, the last one sent, so what `ip
+ * xfrm state` shows and what the exhaustion check sees are numbers SEC has
+ * put on the wire. SEC goes on numbering after any reading until the SA is
+ * out of the hardware, but covering that is the re-add's business, not the
+ * published number's: a re-add is carried past wherever the retirement left
+ * SEC, with a margin (ft_ipsec_fold()). Only forward, so a reading older than
+ * the one published never undoes it.
+ *
+ * Caller holds ft_ipsec_retired_lock, which every publication takes, and
+ * x->lock unless it is one of xfrm's own readers that do not
+ * (ft_xdo_state_update_stats()). Each word is stored whole (WRITE_ONCE); a
+ * reader without x->lock can still pair an ESN number's two words from either
+ * side of a publication, as it can with any update xfrm makes under that
+ * lock, and nothing here orders the two for it. A re-add read that way is
+ * carried past the old SA all the same, by the fold.
  */
-static void ft_ipsec_publish_oseq(struct xfrm_state *x, u64 oseq, u64 sent)
+static void ft_ipsec_publish_oseq(struct xfrm_state *x, u64 oseq)
 {
 	struct xfrm_replay_state_esn *esn = x->replay_esn;
-	u64 last = x->props.flags & XFRM_STATE_ESN ? U64_MAX - 1 : U32_MAX - 1;
 
 	if (x->xso.dir != XFRM_DEV_OFFLOAD_OUT)
 		return;
-	oseq = oseq < last - min(last, 2 * sent) ? oseq + 2 * sent : last;
 	if (!esn) {
 		if (oseq > x->replay.oseq)
-			x->replay.oseq = oseq;
+			WRITE_ONCE(x->replay.oseq, oseq);
 	} else if (x->props.flags & XFRM_STATE_ESN) {
 		if (oseq > ((u64)esn->oseq_hi << 32 | esn->oseq)) {
-			esn->oseq = lower_32_bits(oseq);
-			esn->oseq_hi = upper_32_bits(oseq);
+			WRITE_ONCE(esn->oseq_hi, upper_32_bits(oseq));
+			WRITE_ONCE(esn->oseq, lower_32_bits(oseq));
 		}
 	} else if (oseq > esn->oseq) {
-		esn->oseq = oseq;
+		WRITE_ONCE(esn->oseq, oseq);
 	}
 }
 
@@ -11718,47 +11790,79 @@ static void ft_ipsec_publish_oseq(struct xfrm_state *x, u64 oseq, u64 sent)
  * scorecard says goes into the state's bitmap instead, in xfrm's orientation
  * (ft_ipsec_replay_bit()). Only forward: a window behind the state's is not
  * applied, one level with it only adds what SEC has seen since, and one ahead
- * replaces it. Caller holds x->lock.
+ * replaces it. The new bitmap is built whole before any word of it is stored,
+ * so the state never holds a cleared one waiting to be refilled.
+ *
+ * Locking as ft_ipsec_publish_oseq(). Nothing orders the bitmap's stores
+ * against the top's for a reader without x->lock, which can pair a new bitmap
+ * with the old top or the other way about; a re-add read that way is folded
+ * forward from where SEC left the old SA all the same.
  */
 static void ft_ipsec_publish_window(struct xfrm_state *x,
 				    const struct cdx_ipsec_counters *counters)
 {
 	struct xfrm_replay_state_esn *esn = x->replay_esn;
 	u32 window = esn ? esn->replay_window : x->props.replay_window;
+	u32 ring[CDX_IPSEC_REPLAY_WINDOW_MAX / 32] = {};
 	u32 top = lower_32_bits(counters->seq);
+	u32 k, bit, words;
+	bool ahead;
 	u64 now;
-	u32 k, bit;
 
 	if (!window || !counters->seq)
 		return;
 	if (!esn) {
+		u32 seen = counters->seen[0] &
+			   (window < 32 ? (1U << window) - 1 : ~0U);
+
 		if (counters->seq < x->replay.seq)
 			return;
 		if (counters->seq > x->replay.seq) {
-			x->replay.seq = top;
-			x->replay.bitmap = 0;
+			WRITE_ONCE(x->replay.bitmap, seen);
+			WRITE_ONCE(x->replay.seq, top);
+		} else {
+			WRITE_ONCE(x->replay.bitmap, x->replay.bitmap | seen);
 		}
-		x->replay.bitmap |= counters->seen[0] &
-				    (window < 32 ? (1U << window) - 1 : ~0U);
 		return;
 	}
+	/* An inbound SA's window is at most CDX_IPSEC_REPLAY_WINDOW_MAX
+	 * (ft_ipsec_spec()), so the ring's live words fit here; any beyond
+	 * them xfrm never reads. */
+	if (window > CDX_IPSEC_REPLAY_WINDOW_MAX)
+		return;
+	words = min_t(u32, DIV_ROUND_UP(window, 32), esn->bmp_len);
 	now = esn->seq;
 	if (x->props.flags & XFRM_STATE_ESN)
 		now |= (u64)esn->seq_hi << 32;
 	if (counters->seq < now)
 		return;
-	if (counters->seq > now) {
-		esn->seq = top;
-		if (x->props.flags & XFRM_STATE_ESN)
-			esn->seq_hi = upper_32_bits(counters->seq);
-		memset(esn->bmp, 0, esn->bmp_len * sizeof(esn->bmp[0]));
-	}
-	for (k = 0; k < min_t(u32, window, CDX_IPSEC_REPLAY_WINDOW_MAX); k++) {
+	ahead = counters->seq > now;
+	if (!ahead)
+		memcpy(ring, esn->bmp, words * sizeof(ring[0]));
+	for (k = 0; k < window; k++) {
 		if (!(counters->seen[k / 32] & (1U << (k % 32))))
 			continue;
 		bit = ft_ipsec_replay_bit(top, window, k);
-		esn->bmp[bit / 32] |= 1U << (bit % 32);
+		ring[bit / 32] |= 1U << (bit % 32);
 	}
+	for (k = 0; k < words; k++)
+		WRITE_ONCE(esn->bmp[k], ring[k]);
+	if (ahead) {
+		if (x->props.flags & XFRM_STATE_ESN)
+			WRITE_ONCE(esn->seq_hi, upper_32_bits(counters->seq));
+		WRITE_ONCE(esn->seq, top);
+	}
+}
+
+/* Publish one reading of SEC's into the state, the direction's own way.
+ * Locking as ft_ipsec_publish_oseq(). */
+static void ft_ipsec_publish(struct xfrm_state *x,
+			     const struct cdx_ipsec_counters *counters)
+{
+	if (x->xso.dir == XFRM_DEV_OFFLOAD_OUT)
+		ft_ipsec_publish_oseq(x, counters->oseq);
+	else
+		ft_ipsec_publish_window(x, counters);
 }
 
 /* ------------------------------------------------- what SEC refused, for xfrm
@@ -11914,6 +12018,13 @@ static void ft_sec_refusals_fold(void)
  * would only rearm the timer that is deleting it. x->lock is held across the
  * test and everything after it, and __xfrm_state_delete() runs under the same
  * lock, so a state seen VALID here stays so until the lock drops.
+ *
+ * The replay state is published under ft_ipsec_retired_lock as well, taken
+ * inside x->lock as deletion takes it, because ft_xdo_state_update_stats()
+ * publishes it too, from callers that do not hold x->lock. The SA's rate,
+ * which a re-add of an outbound SA is carried past the old one by
+ * (ft_ipsec_fold_oseq()), is kept under the same lock. The lock is dropped
+ * before xfrm judges: xfrm_state_check_expire() asks that op again.
  */
 static void ft_ipsec_account(struct ft_ipsec_retirement *owned,
 			     const struct cdx_ipsec_counters *counters)
@@ -11937,10 +12048,10 @@ static void ft_ipsec_account(struct ft_ipsec_retirement *owned,
 		x->curlft.packets += carried;
 		owned->published.packets = counters->packets;
 	}
-	if (x->xso.dir == XFRM_DEV_OFFLOAD_OUT)
-		ft_ipsec_publish_oseq(x, counters->oseq, carried);
-	else
-		ft_ipsec_publish_window(x, counters);
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	owned->sent = max(carried, owned->sent / 2);
+	ft_ipsec_publish(x, counters);
+	spin_unlock_bh(&ft_ipsec_retired_lock);
 	/* An SA that has carried nothing has nothing to judge, and asking
 	 * anyway would stamp use_time on it -- the moment its use-based
 	 * lifetimes count from. */
@@ -11954,6 +12065,44 @@ static void ft_ipsec_account(struct ft_ipsec_retirement *owned,
 	}
 out:
 	spin_unlock_bh(&x->lock);
+}
+
+/* xfrm is about to read the state: publish where SEC has the SA's sequence
+ * space now, rather than where the last accounting pass found it.
+ *
+ * Every caller either holds x->lock (the state timer,
+ * xfrm_state_check_expire(), XFRM_MSG_GETAE, xfrm_state_migrate()) or reads
+ * the state without it (XFRM_MSG_GETSA, dumps and notifications, some under
+ * xfrm_state_lock, some in atomic context), so this neither sleeps nor takes
+ * x->lock. What serialises the publications is ft_ipsec_retired_lock, which
+ * every one of them takes, inside x->lock where that is held -- the order
+ * deletion takes the two in.
+ *
+ * The same lock is what keeps the SA installed while it is read. Deletion
+ * clears the handle before it moves the SA's entry off ft_ipsec_owned under
+ * this lock, and only the retirement that follows, and takes the entry from
+ * there, frees the SA -- descriptor, PDB and all. So a handle still set,
+ * read under the lock, names an SA whose entry is still owned, and it stays
+ * so until the lock drops; nothing has to be looked up to know it. A state
+ * whose deletion has begun reads no handle and publishes nothing: its last
+ * word is kept for a re-add instead (ft_ipsec_fold()).
+ *
+ * The lifetime is left to the accounting pass (see "what SEC counted, for
+ * xfrm" above). A reader without x->lock can meet a publication midway, as
+ * it can any update xfrm makes under that lock (ft_ipsec_publish_oseq());
+ * forward-only publication and the fold a re-add gets keep that from ever
+ * starting a new SA behind the old one.
+ */
+static void ft_xdo_state_update_stats(struct xfrm_state *x)
+{
+	struct cdx_ipsec_counters now;
+	struct cdx_ipsec_sa *sa;
+
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	sa = (struct cdx_ipsec_sa *)READ_ONCE(x->xso.offload_handle);
+	if (sa && cdx_ipsec_sa_replay_state(sa, &now))
+		ft_ipsec_publish(x, &now);
+	spin_unlock_bh(&ft_ipsec_retired_lock);
 }
 
 /* Ask after every SA's path, and mark for the follow work only the watches
@@ -12066,11 +12215,243 @@ static void ft_ipsec_stats_work(struct work_struct *work)
 	}
 }
 
+/* Who the SA a spec describes is, for a re-add of it to find
+ * (struct ft_ipsec_identity). The digest covers each key with its algorithm,
+ * width and ICV length, as the spec carries them, and nothing of them
+ * outlives the call but the digest. */
+static void ft_ipsec_identify(const struct cdx_ipsec_sa_spec *spec,
+			      struct ft_ipsec_identity *id)
+{
+	struct {
+		struct cdx_ipsec_key auth;
+		struct cdx_ipsec_key crypt;
+	} keys;
+
+	get_random_once(&ft_ipsec_digest_key, sizeof(ft_ipsec_digest_key));
+	memset(id, 0, sizeof(*id));
+	id->daddr = spec->dst;
+	id->spi = spec->spi;
+	id->replay_window = spec->replay_window;
+	id->family = spec->family;
+	id->dir = spec->dir;
+	id->esn = spec->esn;
+	keys.auth = spec->auth;
+	keys.crypt = spec->crypt;
+	id->digest = siphash(&keys, sizeof(keys), &ft_ipsec_digest_key);
+	memzero_explicit(&keys, sizeof(keys));
+}
+
+/* Whether two identities are the same SA: the same SPI and direction under
+ * the same keys, and numbering the same way, wherever each is bound. */
+static bool ft_ipsec_same(const struct ft_ipsec_identity *a,
+			  const struct ft_ipsec_identity *b)
+{
+	return a->dir == b->dir && a->spi == b->spi && a->digest == b->digest &&
+	       a->esn == b->esn;
+}
+
+/* Whether an SA being installed has to wait for another to be out of the
+ * hardware first: the same SA, whose last state it is to be carried on from,
+ * or any SA whose classifier entry would take this one's key -- the same
+ * direction, SPI and destination -- which the hash table refuses. */
+static bool ft_ipsec_in_the_way(const struct ft_ipsec_identity *a,
+				const struct ft_ipsec_identity *b)
+{
+	return ft_ipsec_same(a, b) ||
+	       (a->dir == b->dir && a->spi == b->spi && a->family == b->family &&
+		!memcmp(&a->daddr, &b->daddr, sizeof(a->daddr)));
+}
+
+/* Whether an SA in the way of `id` has been deleted and is not yet out of the
+ * hardware. A retirement stays on ft_ipsec_retired until it has finished. */
+static bool ft_ipsec_retiring_in_the_way(const struct ft_ipsec_identity *id)
+{
+	struct ft_ipsec_retirement *retiring;
+	bool found = false;
+
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	list_for_each_entry(retiring, &ft_ipsec_retired, list) {
+		if (ft_ipsec_in_the_way(&retiring->id, id)) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_bh(&ft_ipsec_retired_lock);
+	return found;
+}
+
+/* Keep a retired SA's entry as the record of where SEC left it, in place of
+ * any older record of the same SA, and forget whatever is too old or one too
+ * many. An SA SEC left nothing of -- an outbound one that sent nothing, an
+ * inbound one checking no window -- has nothing to keep. Caller holds
+ * ft_ipsec_retired_lock; true when the entry is kept, and is no longer the
+ * caller's to free. */
+static bool ft_ipsec_remember(struct ft_ipsec_retirement *retired)
+{
+	struct ft_ipsec_retirement *old, *next;
+
+	if (!retired->last.oseq && !retired->last.seq)
+		return false;
+	/* The state is xfrm's to free from here on; nothing reads it again. */
+	retired->x = NULL;
+	retired->retired = jiffies;
+	list_for_each_entry_safe(old, next, &ft_ipsec_remembered, list) {
+		if (!ft_ipsec_same(&old->id, &retired->id) &&
+		    time_before(retired->retired, old->retired + FT_IPSEC_REMEMBER_FOR))
+			continue;
+		list_del(&old->list);
+		ft_ipsec_remembered_count--;
+		kfree(old);
+	}
+	while (ft_ipsec_remembered_count >= FT_IPSEC_REMEMBERED) {
+		old = list_first_entry(&ft_ipsec_remembered,
+				       struct ft_ipsec_retirement, list);
+		list_del(&old->list);
+		ft_ipsec_remembered_count--;
+		kfree(old);
+	}
+	list_add_tail(&retired->list, &ft_ipsec_remembered);
+	ft_ipsec_remembered_count++;
+	return true;
+}
+
+/* Forget every retired SA. Only once no retirement can run any more. */
+static void ft_ipsec_forget_all(void)
+{
+	struct ft_ipsec_retirement *old, *next;
+
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	list_for_each_entry_safe(old, next, &ft_ipsec_remembered, list) {
+		list_del(&old->list);
+		kfree(old);
+	}
+	ft_ipsec_remembered_count = 0;
+	spin_unlock_bh(&ft_ipsec_retired_lock);
+}
+
+/* Whether a window whose highest number is `top`, with `seen` in the spec's
+ * orientation (bit k for top - k) over `window` numbers, would refuse `n`:
+ * as seen, or as too old for it. A number above its top it has not seen. */
+static bool ft_ipsec_refuses(u64 top, const u32 *seen, u32 window, u64 n)
+{
+	u64 behind;
+
+	if (n > top)
+		return false;
+	behind = top - n;
+	if (behind >= window)
+		return true;
+	return seen[behind / 32] & (1U << (behind % 32));
+}
+
+/* An inbound spec's window, moved on to cover a retired SA's too: the higher
+ * of the two tops, every number either refuses marked seen. Past the spec's
+ * own width is marked seen too, as ft_ipsec_replay_seen() marks it. */
+static void ft_ipsec_fold_window(struct cdx_ipsec_sa_spec *spec,
+				 const struct cdx_ipsec_counters *last,
+				 u32 last_window)
+{
+	u32 seen[ARRAY_SIZE(spec->replay_seen)] = {};
+	u64 top = max(spec->seq, last->seq);
+	u32 k;
+
+	for (k = 0; k < CDX_IPSEC_REPLAY_WINDOW_MAX; k++)
+		if (k >= spec->replay_window ||
+		    ft_ipsec_refuses(spec->seq, spec->replay_seen,
+				     spec->replay_window, top - k) ||
+		    ft_ipsec_refuses(last->seq, last->seen, last_window, top - k))
+			seen[k / 32] |= 1U << (k % 32);
+	spec->seq = top;
+	memcpy(spec->replay_seen, seen, sizeof(seen));
+}
+
+/* An outbound spec's number when it re-adds a retired SA: past the higher of
+ * the number it carried and the old SA's last, by twice what the old SA sent
+ * in its last period and by FT_IPSEC_OSEQ_FLOOR at the least.
+ *
+ * A margin that would run past the last number SEC sends -- FFFFFFFE, or
+ * FFFFFFFF:FFFFFFFE with ESN (SEC RM table 9-2) -- stops at it. Starting
+ * there leaves the SA nothing to send, and the backend refuses it with
+ * -EINVAL (cdx_ipsec_validate()): an old SA that close to the end of its
+ * space leaves a re-add no number it could send without reusing one, so the
+ * re-add fails, and the rekey the old SA's soft expiry asked for long before
+ * is what carries the tunnel on.
+ *
+ * The old SA's last number was read once it was out of the hardware, so the
+ * margin only has to cover what SEC may still have been holding of it then,
+ * which the floor alone does many times over; a busy SA is skipped further
+ * because skipping costs its peer nothing -- a gap in the sequence is what
+ * loss looks like -- and reusing a number costs it the frame. This is the one
+ * place a number goes ahead of SEC's: what is published is SEC's own
+ * (ft_ipsec_publish_oseq()), and an add that re-adds nothing starts exactly
+ * where it asked to. */
+static void ft_ipsec_fold_oseq(struct cdx_ipsec_sa_spec *spec, u64 oseq, u64 sent)
+{
+	u64 last = spec->esn ? U64_MAX - 1 : U32_MAX - 1;
+	u64 ahead = max(2 * sent, FT_IPSEC_OSEQ_FLOOR);
+
+	oseq = max(spec->seq, oseq);
+	spec->seq = oseq < last - min(last, ahead) ? oseq + ahead : last;
+}
+
+/* Carry a retired SA's last state into a re-add of it.
+ *
+ * A keying daemon that moves an SA to a new address -- strongSwan's MOBIKE
+ * update, or a NAT's new mapping -- reads the state, deletes it and adds it
+ * again with the same SPI and keys, carrying over the replay state it read.
+ * That reading is as fresh as xdo_dev_state_update_stats() makes it, but SEC
+ * goes on taking and sending the old SA's frames until its retirement takes
+ * it out of the hardware: an inbound frame taken after the reading would be
+ * taken once more by the new SA, and an outbound number sent after it would
+ * be sent again. The retirement records where SEC left the SA
+ * (ft_ipsec_remember()), and this carries that forward into the spec: the
+ * higher window top with everything either window refuses, or the higher
+ * outbound number and a margin past it (ft_ipsec_fold_oseq()).
+ *
+ * Into the same SA only: the same SPI and direction under the same keys,
+ * wherever the re-add binds it -- a MOBIKE move changes one direction's
+ * destination, and can change its family. A new SA reusing an SPI has other
+ * keys and starts where it asked to. The same SA added again with nothing
+ * carried is carried forward all the same: an inbound SA that had taken
+ * nothing when it was read exports nothing, and still takes frames until it
+ * is out of the hardware; and under the same keys a number the old SA took
+ * or sent is one the new one must not take or send again, however it is
+ * added (RFC 4303 3.3.3 lets a sequence number cycle only under a new SA).
+ * Which is what manual keying with a window has to live with: an inbound SA
+ * re-added within FT_IPSEC_REMEMBER_FOR under the same SPI and keys refuses a
+ * peer that restarted at 1 until the peer passes the old top. With no window,
+ * iproute2's default, nothing inbound is folded.
+ * Only ever forward, so the spec never ends up behind what it brought.
+ * Refusing the carried state instead would fail the re-add, and packet
+ * offload has no software to fall back on: every MOBIKE update would take
+ * the child SA down with it.
+ */
+static void ft_ipsec_fold(struct cdx_ipsec_sa_spec *spec,
+			  const struct ft_ipsec_identity *id)
+{
+	struct ft_ipsec_retirement *old;
+
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	list_for_each_entry(old, &ft_ipsec_remembered, list) {
+		if (!ft_ipsec_same(&old->id, id) ||
+		    !time_before(jiffies, old->retired + FT_IPSEC_REMEMBER_FOR))
+			continue;
+		if (spec->dir == CDX_IPSEC_DIR_OUT)
+			ft_ipsec_fold_oseq(spec, old->last.oseq, old->sent);
+		else if (spec->replay_window && old->last.seq)
+			ft_ipsec_fold_window(spec, &old->last,
+					     old->id.replay_window);
+		break;
+	}
+	spin_unlock_bh(&ft_ipsec_retired_lock);
+}
+
 static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack)
 {
 	struct ft_ipsec_watch *watch = NULL;
 	struct ft_ipsec_retirement *retirement;
 	struct cdx_ipsec_sa_spec spec;
+	struct ft_ipsec_identity id;
 	struct ft_ipsec_route route;
 	struct cdx_ipsec_sa *sa;
 	s64 changes;
@@ -12104,23 +12485,47 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 		NL_SET_ERR_MSG(extack, "cdx: only tunnel and transport mode can be offloaded");
 		return -EOPNOTSUPP;
 	}
+	/* From here on the spec holds the SA's keys, which go no further than
+	 * the backend's own copy: it is wiped on every way out. */
 	rc = ft_ipsec_spec(x, &spec, extack);
 	if (rc)
-		return rc;
+		goto wipe;
+	ft_ipsec_identify(&spec, &id);
 	/* Before the hardware, so that an SA nothing could follow is never
 	 * installed at all. An outbound SA's next hop is written into its
 	 * entry and never re-read, so the watch is part of installing one
 	 * rather than an improvement on it. */
 	if (spec.dir == CDX_IPSEC_DIR_OUT) {
 		watch = kzalloc(sizeof(*watch), GFP_KERNEL);
-		if (!watch)
-			return -ENOMEM;
+		if (!watch) {
+			rc = -ENOMEM;
+			goto wipe;
+		}
 	}
 	retirement = kzalloc(sizeof(*retirement), GFP_KERNEL);
 	if (!retirement) {
-		kfree(watch);
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto free_watch;
 	}
+	/* The same SA may still be on its way out of the hardware: deleted a
+	 * moment ago by a keying daemon now adding it again at a new address.
+	 * Its retirement is finished first. That is what makes where SEC left
+	 * it final for the fold below, and what keeps the two SAs from taking
+	 * frames at once. With the destination unchanged, an ESP entry's key
+	 * -- destination and SPI -- is the old one's, which the hash table
+	 * refuses, failing this SA whatever its keys; with a new destination,
+	 * or under NAT-T a new peer address or port, the keys differ, and both
+	 * SAs would take frames, each against its own window, so a frame one
+	 * had taken the other would take again. Waited for, not flushed, and
+	 * not forever: see FT_IPSEC_RETIRE_WAIT. */
+	if (!wait_event_timeout(ft_ipsec_retired_wait,
+				!ft_ipsec_retiring_in_the_way(&id),
+				FT_IPSEC_RETIRE_WAIT)) {
+		NL_SET_ERR_MSG(extack, "cdx: an SA with this SPI is still leaving the hardware");
+		rc = -EBUSY;
+		goto free_retirement;
+	}
+	ft_ipsec_fold(&spec, &id);
 	cdx_ft_begin();
 	/* Before the build reads the port's egress, which an egress change
 	 * updates before counting itself. */
@@ -12132,15 +12537,15 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	}
 	cdx_ft_end();
 	if (rc) {
-		kfree(retirement);
-		kfree(watch);
 		if (rc == -EADDRNOTAVAIL)
 			NL_SET_ERR_MSG(extack, "cdx: an inbound SA's local address must be on the device it is offloaded to");
 		NL_SET_ERR_MSG_WEAK(extack, "cdx: the hardware refused this SA");
-		return rc;
+		goto free_retirement;
 	}
+	memzero_explicit(&spec, sizeof(spec));
 	retirement->sa = sa;
 	retirement->x = x;
+	retirement->id = id;
 	spin_lock_bh(&ft_ipsec_retired_lock);
 	list_add_tail(&retirement->list, &ft_ipsec_owned);
 	spin_unlock_bh(&ft_ipsec_retired_lock);
@@ -12154,16 +12559,26 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	x->xso.offload_handle = (unsigned long)sa;
 	/* Publish the hardware's own name for this SA as well.
 	 *
-	 * The datapath works in handles rather than pointers, because that is
-	 * all a frame can carry: SEC stamps the handle into a decrypted
-	 * frame's trailer, and the transmit path looks the frame queue up by
-	 * it. Setting it here, before the state is inserted, is what puts the
+	 * The datapath works in handles rather than pointers. A frame SEC hands
+	 * back to the CPU carries nothing of its SA, but it arrives on the SA's
+	 * own exception queue, whose id names the handle
+	 * (get_netdev_of_SA_by_fqid()), and the state is found by that; the
+	 * transmit path looks the SA's frame queue up by it too. Setting it
+	 * here, before the state is inserted, is what puts the
 	 * state in the kernel's handle index at all: xfrm_state_insert_byh()
 	 * indexes only states whose driver has set a handle, so the index holds
 	 * nothing but the handles the hardware knows.
 	 */
 	x->handle = cdx_ipsec_sa_handle(sa);
 	return 0;
+
+free_retirement:
+	kfree(retirement);
+free_watch:
+	kfree(watch);
+wipe:
+	memzero_explicit(&spec, sizeof(spec));
+	return rc;
 }
 
 /* Whether the SAs are all gone: none owned, and no retirement still queued. */
@@ -12177,18 +12592,27 @@ static bool ft_ipsec_none_left(void)
 	return none;
 }
 
+/* Take deleted SAs out of the hardware, oldest first.
+ *
+ * Each stays on ft_ipsec_retired until it is out, so an add it is in the way
+ * of can tell it is still on its way and wait for it (ft_xdo_state_add()),
+ * woken on ft_ipsec_retired_wait as each one finishes.
+ * Only this work takes entries off that list, and one instance of it runs at
+ * a time, so the first entry is this pass's to finish. Where SEC left the SA
+ * is read as it goes (cdx_ipsec_sa_del()) and kept for a re-add of it
+ * (ft_ipsec_remember()).
+ */
 static void ft_ipsec_retire_work(struct work_struct *work)
 {
 	struct ft_ipsec_retirement *retirement;
 	struct cdx_ft_entry *entry, *next;
+	bool kept;
 	u16 handle;
 
 	for (;;) {
 		spin_lock_bh(&ft_ipsec_retired_lock);
 		retirement = list_first_entry_or_null(&ft_ipsec_retired,
 						      struct ft_ipsec_retirement, list);
-		if (retirement)
-			list_del(&retirement->list);
 		spin_unlock_bh(&ft_ipsec_retired_lock);
 		if (!retirement)
 			return;
@@ -12212,17 +12636,23 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 			cdx_ft_end();
 			msleep(20);
 		}
-		cdx_ipsec_sa_del(&retirement->sa);
+		cdx_ipsec_sa_del(&retirement->sa, &retirement->last);
 		/* Out of the hardware: an egress drain waiting on it may now
 		 * say so, having taken this transaction to look. */
 		atomic_dec(&ft_ipsec_retiring);
+		spin_lock_bh(&ft_ipsec_retired_lock);
+		list_del(&retirement->list);
+		kept = ft_ipsec_remember(retirement);
+		spin_unlock_bh(&ft_ipsec_retired_lock);
+		wake_up_all(&ft_ipsec_retired_wait);
 		/* The accounting pass stops once no SA is owned. The last one
 		 * out counts what SEC refused up to its going, so that is not
 		 * left waiting for the next SA to be installed. */
 		if (ft_ipsec_none_left())
 			ft_sec_refusals_fold();
 		cdx_ft_end();
-		kfree(retirement);
+		if (!kept)
+			kfree(retirement);
 	}
 }
 
@@ -12575,6 +13005,7 @@ static const struct xfrmdev_ops ft_xfrmdev_ops = {
 	.xdo_dev_state_add	= ft_xdo_state_add,
 	.xdo_dev_state_delete	= ft_xdo_state_delete,
 	.xdo_dev_state_free	= ft_xdo_state_free,
+	.xdo_dev_state_update_stats = ft_xdo_state_update_stats,
 	.xdo_dev_offload_ok	= ft_xdo_offload_ok,
 	.xdo_dev_policy_add	= ft_xdo_policy_add,
 	.xdo_dev_policy_delete	= ft_xdo_policy_delete,
@@ -13596,6 +14027,7 @@ netdev:
 	/* Idle for that reason, and drained anyway: each costs nothing when
 	 * there is nothing queued, and none may outlive this text. */
 	flush_work(&ft_ipsec_retire);
+	ft_ipsec_forget_all();
 	cancel_delayed_work_sync(&ft_ipsec_stats);
 	cancel_work_sync(&ft_ipsec_follow);
 	ft_ipsec_watch_flush();
@@ -13675,8 +14107,10 @@ static void __exit ask_flowtable_exit(void)
 	/* Detaching stops new retirements being queued; this drains the ones
 	 * already queued. Both are needed before the work item's own code can
 	 * be unmapped, and this order is the only one that ends with an empty
-	 * list. */
+	 * list. What the retirements kept for a re-add goes with them: no SA
+	 * can be added through this module again. */
 	flush_work(&ft_ipsec_retire);
+	ft_ipsec_forget_all();
 	/* The accounting pass requeues itself only while an SA is owned, and
 	 * none is by now: every offloaded state pins this module through its
 	 * ops, and xfrm deletes a state before it lets it go. */

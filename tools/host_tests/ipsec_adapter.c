@@ -95,6 +95,7 @@ static void list_del(struct list_head *e)
 
 #define list_first_entry_or_null(head, type, member) \
 	((head)->next == (head) ? NULL : list_entry((head)->next, type, member))
+#define list_first_entry(head, type, member) list_entry((head)->next, type, member)
 static bool list_empty(const struct list_head *h) { return h->next == h; }
 static void list_move_tail(struct list_head *e, struct list_head *head)
 { list_del(e); list_add_tail(e, head); }
@@ -655,6 +656,36 @@ static const char *sa_add_message;
 static int sa_next_hop_error;
 static unsigned sa_next_hop_calls;
 
+/* The clock a retired SA's record ages by, which a case moves on. */
+static unsigned long jiffies = 100000;
+/* The queue an add waits on for a retirement in its way. */
+#define DECLARE_WAIT_QUEUE_HEAD(name) int name
+#define time_before(a, b) ((long)((a) - (b)) < 0)
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+#define memzero_explicit(p, n) memset((p), 0, (n))
+/* The digest's key, which the adapter must draw before its first digest, and
+ * a keyed hash standing in for SipHash: the cases need equal keys to digest
+ * equal and different ones not to. */
+typedef struct { u64 key[2]; } siphash_key_t;
+static bool digest_keyed;
+static void get_random_once(void *buf, size_t len)
+{
+	if (!digest_keyed)
+		memset(buf, 0x5a, len);
+	digest_keyed = true;
+}
+static u64 siphash(const void *data, size_t len, const siphash_key_t *key)
+{
+	const u8 *p = data;
+	u64 h = 0xcbf29ce484222325ULL ^ key->key[0] ^ (key->key[1] << 1);
+
+	assert(digest_keyed);
+	for (size_t i = 0; i < len; i++)
+		h = (h ^ p[i]) * 0x100000001b3ULL;
+	return h;
+}
+
 #include "ipsec_types.inc"
 
 static bool cdx_ipsec_port_supported(struct net_device *dev);
@@ -667,6 +698,13 @@ static u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa)
 }
 struct netlink_ext_ack;
 static void backend_says(struct netlink_ext_ack *extack, const char *msg);
+/* The control-plane transaction, defined with its operations below. */
+static int ft_transaction;
+/* The last spec the backend was handed, and how many SAs were out of the
+ * hardware when it was. */
+static struct cdx_ipsec_sa_spec installed_spec;
+static unsigned deleted_before_install;
+static int cdx_ipsec_validate(const struct cdx_ipsec_sa_spec *spec);
 static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
 			    struct xfrm_state *x, struct cdx_ipsec_sa **result,
 			    struct netlink_ext_ack *extack)
@@ -675,10 +713,13 @@ static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
 
 	(void)x;
 	*result = NULL;
-	/* The backend's own first check: a port the engine cannot serve is
-	 * refused before anything is built. */
-	if (!cdx_ipsec_port_supported(spec->dev))
-		return -EOPNOTSUPP;
+	/* The backend's own first check, compiled: what it refuses -- a port
+	 * the engine cannot serve, a window or a sequence number it cannot
+	 * carry -- is refused before anything is built. */
+	int rc = cdx_ipsec_validate(spec);
+
+	if (rc)
+		return rc;
 	if (sa_add_error) {
 		/* What the backend says when it knows why, as it does when
 		 * SEC fails the split-key job. */
@@ -701,14 +742,25 @@ static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
 	ether_addr_copy(sa->dst_mac, spec->dst_mac);
 	sa->path_mtu = spec->path_mtu;
 	sa_installed++;
+	installed_spec = *spec;
+	deleted_before_install = sa_deleted;
 	*result = sa;
 	return 0;
 }
-static void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
+/* A deletion reads where SEC left the SA as it goes: the figures the case
+ * gave the SA are SEC's last. */
+static void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa, struct cdx_ipsec_counters *last)
 {
+	memset(last, 0, sizeof(*last));
 	if (!*sa)
 		return;
-	assert(!retirement_flows && !retirement_barriers);
+	assert(!retirement_flows && !retirement_barriers && ft_transaction);
+	if ((*sa)->outbound) {
+		last->oseq = (*sa)->oseq;
+	} else {
+		last->seq = (*sa)->seq;
+		memcpy(last->seen, (*sa)->seen, sizeof(last->seen));
+	}
 	(*sa)->live = false;
 	*sa = NULL;
 	sa_deleted++;
@@ -773,6 +825,23 @@ static void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	       sizeof(counters->seen));
 }
 
+/* SEC's sequence space alone, read the way the backend allows it: with no
+ * transaction, from an SA kept installed by the owned list's lock -- the
+ * promise the op makes by reading the handle under it. Only the three
+ * sequence fields are the reader's. */
+static unsigned replay_state_reads;
+static bool cdx_ipsec_sa_replay_state(const struct cdx_ipsec_sa *sa,
+				      struct cdx_ipsec_counters *state)
+{
+	assert(ft_ipsec_retired_lock && sa && sa->live);
+	replay_state_reads++;
+	state->oseq = sa->outbound ? sa->oseq : 0;
+	state->seq = sa->outbound ? 0 : sa->seq;
+	memcpy(state->seen, sa->outbound ? (u32[4]){ 0 } : sa->seen,
+	       sizeof(state->seen));
+	return sa->outbound || sa->seq;
+}
+
 /* What the FMan microcode counted of the frames SEC refused, read the whole
  * way the kernel reads it: the SDK's reader over the microcode's own table,
  * through the SDK's own big-endian load, and the backend's sorting of it into
@@ -815,7 +884,7 @@ static void km_state_expired(struct xfrm_state *x, int hard, u32 portid)
 	else
 		soft_expires++;
 }
-static void xfrm_dev_state_update_stats(struct xfrm_state *x) { assert(x->lock); }
+static void xfrm_dev_state_update_stats(struct xfrm_state *x);
 static int kernel_xfrm_state_check_expire(struct xfrm_state *x);
 /* Counted, and asked the questions the pass's locking has to answer: x->lock
  * held, the owned list's lock not -- deletion takes that one under x->lock --
@@ -857,6 +926,27 @@ static void schedule_work(int *work)
 		assert(0);
 }
 struct work_struct { int dummy; };
+/* Waiting for a retirement is running the retirement work to the end, here:
+ * it drains the whole queue, waking the waiter -- unless a case has it stuck,
+ * as a wedged classifier keeps it, when the wait times out. Nothing may be
+ * held that the work takes, and the condition is asked first, as the kernel
+ * asks it. */
+static void ft_ipsec_retire_work(struct work_struct *work);
+static bool retirement_stuck;
+static unsigned retire_waits, retire_wakes;
+#define wait_event_timeout(wq, condition, timeout) ({				\
+	assert(&(wq) == &ft_ipsec_retired_wait && (timeout) == FT_IPSEC_RETIRE_WAIT); \
+	assert(!ft_transaction && !ft_ipsec_retired_lock);			\
+	bool met_ = (condition);						\
+	if (!met_) {								\
+		retire_waits++;							\
+		if (!retirement_stuck)						\
+			ft_ipsec_retire_work(NULL);				\
+		met_ = (condition);						\
+	}									\
+	met_ ? 1L : 0L;								\
+})
+#define wake_up_all(wq) do { assert((wq) == &ft_ipsec_retired_wait); retire_wakes++; } while (0)
 
 struct netlink_ext_ack { const char *_msg; };
 /* The kernel's table, member for member, so that the adapter's own instance
@@ -869,11 +959,25 @@ struct xfrmdev_ops {
 	void (*xdo_dev_state_delete)(struct xfrm_state *x);
 	void (*xdo_dev_state_free)(struct xfrm_state *x);
 	bool (*xdo_dev_offload_ok)(struct sk_buff *skb, struct xfrm_state *xs);
+	void (*xdo_dev_state_update_stats)(struct xfrm_state *x);
 	int (*xdo_dev_policy_add)(struct xfrm_policy *x,
 				  struct netlink_ext_ack *extack);
 	void (*xdo_dev_policy_delete)(struct xfrm_policy *x);
 	void (*xdo_dev_policy_free)(struct xfrm_policy *x);
 };
+/* xfrm's own call of that op, as include/net/xfrm.h makes it, from the one
+ * caller of it compiled here: xfrm_state_check_expire(), which holds x->lock
+ * as all its callers do. */
+static unsigned update_stats_calls;
+static void xfrm_dev_state_update_stats(struct xfrm_state *x)
+{
+	const struct xfrmdev_ops *ops = x->xso.dev ? x->xso.dev->xfrmdev_ops : NULL;
+
+	assert(x->lock);
+	update_stats_calls++;
+	if (ops && ops->xdo_dev_state_update_stats)
+		ops->xdo_dev_state_update_stats(x);
+}
 #define NL_SET_ERR_MSG(extack, msg) do { \
 	static const char __msg[] = msg; \
 	struct netlink_ext_ack *__e = (extack); \
@@ -1145,6 +1249,7 @@ static void bench_reset(void)
 	probe_answers = false;
 	auth_key.alg_key_len = 160;
 	auth_key.alg_trunc_len = 96;
+	retirement_stuck = false;
 	assert(neigh_refs == 0);
 	assert(xfrm_state_refs == 0);
 	assert(dev_holds == 0);
@@ -1168,6 +1273,8 @@ static void bench_clear_sas(void)
 		list_del(&r->list);
 		kfree(r);
 	}
+	ft_ipsec_forget_all();
+	assert(!ft_ipsec_remembered_count && ft_ipsec_remembered.next == &ft_ipsec_remembered);
 	ft_ipsec_watch_flush();
 	memset(sa_pool, 0, sizeof(sa_pool));
 	sa_installed = 0;
@@ -3366,49 +3473,49 @@ static void test_publish_oseq(void)
 	bmp_out = install_accounted(&bmp_state, true, 0);
 	in = install_accounted(&in_state, false, 0);
 
-	/* An SA that has sent nothing reads back as installed, which moves
-	 * nothing. */
+	/* SEC's own number, as it is: an SA that has sent nothing reads back
+	 * as installed, and what `ip xfrm state` and the exhaustion check see
+	 * is a number SEC has sent. However busy the SA, nothing is projected
+	 * ahead of SEC here; a re-add is carried past the old SA instead. */
 	sa_of(out)->oseq = 0;
 	ft_ipsec_stats_work(NULL);
 	assert(out->replay.oseq == 0);
-
-	/* The legacy shape takes the number as it is, when nothing was sent in
-	 * the period behind it. */
 	sa_of(out)->oseq = 4096;
 	ft_ipsec_stats_work(NULL);
 	assert(out->replay.oseq == 4096);
+	sa_of(out)->packets = 100000;
+	sa_of(out)->oseq = 105000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 105000);
+	/* The rate is kept for that re-add, though. */
+	assert(list_entry(ft_ipsec_owned.next, struct ft_ipsec_retirement, list)->sent == 100000);
+	/* A reading behind the published one takes nothing back, and the same
+	 * reading again, however often, moves nothing. */
+	sa_of(out)->oseq = 104000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 105000);
+	sa_of(out)->oseq = 106000;
+	ft_ipsec_stats_work(NULL);
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 106000);
 
-	/* Ahead by twice what the SA sent in the last period: SEC goes on
-	 * numbering until the SA is deleted, and a re-add must start past
-	 * wherever it got to. */
-	sa_of(out)->packets = 1000;
-	sa_of(out)->oseq = 5000;
-	ft_ipsec_stats_work(NULL);
-	assert(out->replay.oseq == 7000);
-	/* A quiet period after it holds the number published, rather than
-	 * taking it back to SEC's. */
-	sa_of(out)->oseq = 6000;
-	ft_ipsec_stats_work(NULL);
-	assert(out->replay.oseq == 7000);
-	sa_of(out)->packets = 1500;
-	sa_of(out)->oseq = 8000;
-	ft_ipsec_stats_work(NULL);
-	assert(out->replay.oseq == 9000);
-
-	/* ESN splits it across both words, the margin carrying into the high
-	 * one. */
+	/* ESN splits it across both words. */
 	sa_of(esn_out)->packets = 16;
 	sa_of(esn_out)->oseq = (3ULL << 32) | 0xfffffff0;
 	ft_ipsec_stats_work(NULL);
-	assert(esn.oseq == 0x10 && esn.oseq_hi == 4);
+	assert(esn.oseq_hi == 3 && esn.oseq == 0xfffffff0);
+	sa_of(esn_out)->oseq = (4ULL << 32) | 0x10;
+	ft_ipsec_stats_work(NULL);
+	assert(esn.oseq_hi == 4 && esn.oseq == 0x10);
 
 	/* Only forward: a value set by other means is not undone by a reading
 	 * behind it. */
-	out->replay.oseq = 10000;
+	out->replay.oseq = 1000000;
 	ft_ipsec_stats_work(NULL);
-	assert(out->replay.oseq == 10000);
+	assert(out->replay.oseq == 1000000);
 
-	/* Not ESN but in the wide shape: the low word alone. */
+	/* Not ESN but in the wide shape: the low word alone, up to the last
+	 * number SEC sends. */
 	{
 		struct xfrm_replay_state_esn wide = { .bmp_len = 4, .oseq_hi = 9 };
 
@@ -3416,11 +3523,8 @@ static void test_publish_oseq(void)
 		sa_of(bmp_out)->oseq = 77;
 		ft_ipsec_stats_work(NULL);
 		assert(wide.oseq == 77 && wide.oseq_hi == 9);
-		/* And a margin past the end of a 32-bit space stops at the
-		 * last number SEC will send, FFFFFFFE -- the truth about an SA
-		 * that close. */
 		sa_of(bmp_out)->packets = 200;
-		sa_of(bmp_out)->oseq = 0xffffff00;
+		sa_of(bmp_out)->oseq = 0xfffffffe;
 		ft_ipsec_stats_work(NULL);
 		assert(wide.oseq == 0xfffffffe && wide.oseq_hi == 9);
 		bmp_out->replay_esn = NULL;
@@ -3429,15 +3533,15 @@ static void test_publish_oseq(void)
 	/* An inbound SA has no sequence of its own to publish, whatever it is
 	 * handed. */
 	test_lock(&in->lock);
-	ft_ipsec_publish_oseq(in, 555, 10);
+	ft_ipsec_publish_oseq(in, 555);
 	test_unlock(&in->lock);
 	assert(in->replay.oseq == 0);
 
-	/* Not VALID: nothing goes back. */
+	/* Not VALID: nothing goes back from the pass. */
 	out->km.state = XFRM_STATE_EXPIRED;
-	sa_of(out)->oseq = 20000;
+	sa_of(out)->oseq = 2000000;
 	ft_ipsec_stats_work(NULL);
-	assert(out->replay.oseq == 10000);
+	assert(out->replay.oseq == 1000000);
 
 	delete_state(out);
 	delete_state(esn_out);
@@ -3695,6 +3799,400 @@ static void test_replay_round_trip(void)
 	free(second->replay_esn);
 	second->replay_esn = NULL;
 	delete_state(second);
+	bench_clear_sas();
+}
+
+/* xfrm asks the driver to publish right before it reads a state -- GETSA,
+ * GETAE, dumps, the state timer, its own expiry check -- from wherever it
+ * is, x->lock held or not. What goes back is SEC's reading of that moment,
+ * never behind what was published, and nothing once deletion has begun. */
+static void test_update_stats(void)
+{
+	struct xfrm_state out_state, in_state;
+	struct xfrm_state *out, *in;
+	struct cdx_ipsec_sa *gone;
+	unsigned calls, reads;
+
+	bench_reset();
+	bench_clear_sas();
+	/* Attached, so xfrm's own expiry check reaches the op too. */
+	WAN.xfrmdev_ops = &ft_xfrmdev_ops;
+	out = install_accounted(&out_state, true, 0);
+	in = install_accounted(&in_state, false, 0);
+	in->props.replay_window = 32;
+	in->repl_mode = XFRM_REPLAY_MODE_LEGACY;
+
+	/* As GETSA calls it, without x->lock: SEC's number of that moment,
+	 * nothing added. */
+	sa_of(out)->oseq = 1000;
+	ft_xfrmdev_ops.xdo_dev_state_update_stats(out);
+	assert(out->replay.oseq == 1000);
+	assert(!ft_ipsec_retired_lock && !out->lock && !ft_transaction);
+	/* The same reading again, as a dump of every state gives it, moves
+	 * nothing; a reading behind it takes nothing back. */
+	ft_xfrmdev_ops.xdo_dev_state_update_stats(out);
+	assert(out->replay.oseq == 1000);
+	sa_of(out)->oseq = 900;
+	ft_xfrmdev_ops.xdo_dev_state_update_stats(out);
+	assert(out->replay.oseq == 1000);
+	/* As the state timer and GETAE call it, under x->lock: it takes no
+	 * lock of the state's, which would deadlock there. */
+	sa_of(out)->oseq = 2000;
+	test_lock(&out->lock);
+	ft_xfrmdev_ops.xdo_dev_state_update_stats(out);
+	test_unlock(&out->lock);
+	assert(out->replay.oseq == 2000);
+
+	/* Between passes, the live number, however busy the SA. */
+	sa_of(out)->packets = 100000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->replay.oseq == 2000);
+	sa_of(out)->oseq = 50000;
+	ft_xfrmdev_ops.xdo_dev_state_update_stats(out);
+	assert(out->replay.oseq == 50000);
+
+	/* Inbound: the window as SEC has it now, in xfrm's orientation. */
+	sa_of(in)->seq = 500;
+	sa_of(in)->seen[0] = 0x5;
+	ft_xfrmdev_ops.xdo_dev_state_update_stats(in);
+	assert(in->replay.seq == 500 && in->replay.bitmap == 0x5);
+	assert(!accepts(in, 500) && accepts(in, 499) && !accepts(in, 498));
+
+	/* The pass's own judge asks again, under x->lock, with the owned
+	 * list's lock already dropped -- the stubs assert both. */
+	calls = update_stats_calls;
+	reads = replay_state_reads;
+	sa_of(in)->packets = 3;
+	sa_of(in)->seq = 510;
+	ft_ipsec_stats_work(NULL);
+	assert(update_stats_calls > calls && replay_state_reads > reads);
+	assert(in->replay.seq == 510);
+
+	/* Deleted: the handle is gone, and with it every publication. */
+	gone = sa_of(out);
+	delete_state(out);
+	gone->oseq = 900000;
+	reads = replay_state_reads;
+	ft_xfrmdev_ops.xdo_dev_state_update_stats(out);
+	assert(replay_state_reads == reads && out->replay.oseq == 50000);
+
+	delete_state(in);
+	bench_clear_sas();
+	WAN.xfrmdev_ops = NULL;
+}
+
+/* Whether SEC's scorecard, top and window refuse n: seen, or too old. */
+static bool sec_refuses(const u32 *seen, u64 top, u32 window, u64 n)
+{
+	if (n > top)
+		return false;
+	return top - n >= window || seen_bit(seen, (u32)(top - n));
+}
+
+/* An inbound state in the ring shape, the fixture's SPI and keys. */
+static struct xfrm_state *inbound_ring(struct xfrm_state *x, u32 window)
+{
+	*x = *outbound_state();
+	x->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	x->replay_esn = ring_alloc(window);
+	x->repl_mode = XFRM_REPLAY_MODE_BMP;
+	return x;
+}
+
+/* A keying daemon moving an SA to a new address reads the state, deletes it
+ * and adds it again with the same SPI and keys and the replay state it read.
+ * The re-add starts past where SEC left the old SA, whatever the reading
+ * missed; a re-add that is not the same SA starts where it asked to. */
+static void test_readd_fold(void)
+{
+	static const u64 missing[] = { 990, 971, 950 };
+	const u32 pattern[4] = { 0xfffff0ff, 0x0f0f0f0f, 0, 0 };
+	struct xfrm_state s1, s2, s3, s4, s5;
+	struct xfrm_state *first, *second, *third, *fourth, *fifth;
+	struct netlink_ext_ack ack = { NULL };
+	unsigned waits, deleted, installed;
+
+	/* Still on its way out when the re-add comes: its retirement is waited
+	 * for, then folded in -- the higher top, and everything the read state
+	 * or SEC refuses. */
+	bench_reset();
+	bench_clear_sas();
+	first = inbound_ring(&s1, 64);
+	assert(ft_xdo_state_add(first, &ack) == 0);
+	sa_of(first)->seq = 1040;
+	memcpy(sa_of(first)->seen, pattern, sizeof(pattern));
+	second = inbound_ring(&s2, 64);
+	receive(second, 937, 1000, missing, 3);
+	delete_state(first);
+	waits = retire_waits;
+	deleted = sa_deleted;
+	assert(ft_xdo_state_add(second, &ack) == 0);
+	assert(retire_waits == waits + 1 && deleted_before_install == deleted + 1);
+	assert(retire_wakes > 0);
+	assert(installed_spec.seq == 1040 && installed_spec.replay_window == 64);
+	for (u32 k = 0; k < 128; k++) {
+		u64 n = 1040 - k;
+
+		assert(seen_bit(installed_spec.replay_seen, k) ==
+		       (k >= 64 || !accepts(second, n) || sec_refuses(pattern, 1040, 64, n)));
+	}
+	/* 990 had not reached the state that was read, but SEC took it after
+	 * the reading: the re-add refuses it. 1032 neither had seen, and it
+	 * is still to be taken. */
+	assert(accepts(second, 990) && seen_bit(installed_spec.replay_seen, 1040 - 990));
+	assert(seen_bit(installed_spec.replay_seen, 0) && !seen_bit(installed_spec.replay_seen, 8));
+	delete_state(second);
+
+	/* A MOBIKE move of this end changes the inbound SA's destination: the
+	 * same SA all the same, waited for and carried on from. */
+	third = inbound_ring(&s3, 64);
+	assert(ft_xdo_state_add(third, &ack) == 0);
+	sa_of(third)->seq = 2000;
+	memcpy(sa_of(third)->seen, pattern, sizeof(pattern));
+	delete_state(third);
+	fourth = inbound_ring(&s4, 64);
+	fourth->id.daddr.a4 = 0x7b01a8c0;	/* 192.168.1.123 */
+	receive(fourth, 1937, 1990, missing, 0);
+	waits = retire_waits;
+	assert(ft_xdo_state_add(fourth, &ack) == 0);
+	assert(retire_waits == waits + 1 && installed_spec.seq == 2000);
+	assert(installed_spec.dst.ip == 0x7b01a8c0);
+	delete_state(fourth);
+	free(first->replay_esn);
+	free(second->replay_esn);
+	free(third->replay_esn);
+	free(fourth->replay_esn);
+	bench_clear_sas();
+
+	/* Already out of the hardware: its record is what is folded. */
+	bench_reset();
+	first = inbound_ring(&s1, 64);
+	assert(ft_xdo_state_add(first, &ack) == 0);
+	sa_of(first)->seq = 1040;
+	memcpy(sa_of(first)->seen, pattern, sizeof(pattern));
+	delete_state(first);
+	bench_drain_retirements();
+	assert(ft_ipsec_remembered_count == 1);
+	waits = retire_waits;
+	second = inbound_ring(&s2, 64);
+	receive(second, 937, 1000, missing, 3);
+	assert(ft_xdo_state_add(second, &ack) == 0);
+	assert(retire_waits == waits && installed_spec.seq == 1040);
+	delete_state(second);
+	bench_drain_retirements();
+
+	/* The same SPI under other keys is another SA: nothing carried. */
+	third = inbound_ring(&s3, 64);
+	receive(third, 937, 1000, missing, 3);
+	cipher_key.alg_key[0] ^= 0xff;
+	assert(ft_xdo_state_add(third, &ack) == 0);
+	cipher_key.alg_key[0] ^= 0xff;
+	assert(installed_spec.seq == 1000);
+	delete_state(third);
+	bench_drain_retirements();
+	/* The same SA added again with nothing carried is carried on from all
+	 * the same: under the same keys, a number taken once is a replay. */
+	fourth = inbound_ring(&s4, 64);
+	assert(ft_xdo_state_add(fourth, &ack) == 0);
+	assert(installed_spec.seq == 1040);
+	for (u32 k = 0; k < 128; k++)
+		assert(seen_bit(installed_spec.replay_seen, k) ==
+		       (k >= 64 || sec_refuses(pattern, 1040, 64, 1040 - k)));
+	delete_state(fourth);
+	bench_drain_retirements();
+	/* Nothing from a record gone stale. */
+	jiffies += FT_IPSEC_REMEMBER_FOR;
+	fifth = inbound_ring(&s5, 64);
+	receive(fifth, 937, 1000, missing, 3);
+	assert(ft_xdo_state_add(fifth, &ack) == 0);
+	assert(installed_spec.seq == 1000);
+	delete_state(fifth);
+	free(first->replay_esn);
+	free(second->replay_esn);
+	free(third->replay_esn);
+	free(fourth->replay_esn);
+	free(fifth->replay_esn);
+	bench_clear_sas();
+
+	/* Another SA whose entry would take the retiring one's key -- the same
+	 * SPI and destination, other keys -- waits for it too, and carries
+	 * nothing from it. */
+	bench_reset();
+	first = inbound_ring(&s1, 64);
+	assert(ft_xdo_state_add(first, &ack) == 0);
+	sa_of(first)->seq = 1040;
+	delete_state(first);
+	second = inbound_ring(&s2, 64);
+	receive(second, 937, 1000, missing, 3);
+	cipher_key.alg_key[0] ^= 0xff;
+	waits = retire_waits;
+	assert(ft_xdo_state_add(second, &ack) == 0);
+	cipher_key.alg_key[0] ^= 0xff;
+	assert(retire_waits == waits + 1 && installed_spec.seq == 1000);
+	delete_state(second);
+	bench_drain_retirements();
+	/* A retirement that cannot finish is not waited for forever: the add
+	 * holds xfrm_cfg_mutex. It is refused, with nothing installed. */
+	third = inbound_ring(&s3, 64);
+	assert(ft_xdo_state_add(third, &ack) == 0);
+	sa_of(third)->seq = 3000;
+	delete_state(third);
+	retirement_stuck = true;
+	fourth = inbound_ring(&s4, 64);
+	installed = sa_installed;
+	ack._msg = NULL;
+	assert(ft_xdo_state_add(fourth, &ack) == -EBUSY);
+	assert(ack._msg && strstr(ack._msg, "still leaving the hardware"));
+	assert(sa_installed == installed && !fourth->xso.offload_handle && !fourth->handle);
+	retirement_stuck = false;
+	bench_drain_retirements();
+	free(first->replay_esn);
+	free(second->replay_esn);
+	free(third->replay_esn);
+	free(fourth->replay_esn);
+	bench_clear_sas();
+
+	/* Outbound, and no SA of its before: an add starts exactly where it
+	 * asked to, however far along that is. */
+	bench_reset();
+	s1 = *outbound_state();
+	s1.replay.oseq = 0x1000;
+	assert(ft_xdo_state_add(&s1, &ack) == 0);
+	assert(installed_spec.seq == 0x1000);
+	delete_state(&s1);
+	bench_drain_retirements();
+	bench_clear_sas();
+
+	/* A re-add: past the higher of the number it carried and the old SA's
+	 * last, by the floor, which covers what SEC may still have held of
+	 * the old SA when it was read. */
+	bench_reset();
+	s1 = *outbound_state();
+	assert(ft_xdo_state_add(&s1, &ack) == 0);
+	sa_of(&s1)->oseq = 7000;
+	delete_state(&s1);
+	bench_drain_retirements();
+	s2 = *outbound_state();
+	s2.replay.oseq = 5000;
+	assert(ft_xdo_state_add(&s2, &ack) == 0);
+	assert(installed_spec.seq == 7000 + FT_IPSEC_OSEQ_FLOOR);
+	/* That SA sent nothing, so its own deletion leaves the record be. */
+	delete_state(&s2);
+	bench_drain_retirements();
+	assert(ft_ipsec_remembered_count == 1);
+	/* A number carried ahead of the old SA's goes on from there. */
+	s3 = *outbound_state();
+	s3.replay.oseq = 1000000;
+	assert(ft_xdo_state_add(&s3, &ack) == 0);
+	assert(installed_spec.seq == 1000000 + FT_IPSEC_OSEQ_FLOOR);
+	delete_state(&s3);
+	/* One the peer's move sent elsewhere, or added with nothing carried,
+	 * is the same SA, and starts past it too. */
+	s4 = *outbound_state();
+	s4.id.daddr.a4 = 0x7c01a8c0;		/* 192.168.1.124 */
+	assert(ft_xdo_state_add(&s4, &ack) == 0);
+	assert(installed_spec.seq == 7000 + FT_IPSEC_OSEQ_FLOOR);
+	delete_state(&s4);
+	s5 = *outbound_state();
+	assert(ft_xdo_state_add(&s5, &ack) == 0);
+	assert(installed_spec.seq == 7000 + FT_IPSEC_OSEQ_FLOOR);
+	delete_state(&s5);
+	bench_clear_sas();
+
+	/* A busy old SA is skipped past by twice what it sent in its last
+	 * period; and never past the last number SEC sends. */
+	bench_reset();
+	s1 = *outbound_state();
+	s1.km.state = XFRM_STATE_VALID;
+	assert(ft_xdo_state_add(&s1, &ack) == 0);
+	sa_of(&s1)->packets = 300000;
+	sa_of(&s1)->oseq = 400000;
+	ft_ipsec_stats_work(NULL);
+	delete_state(&s1);
+	bench_drain_retirements();
+	s2 = *outbound_state();
+	s2.replay.oseq = 350000;
+	assert(ft_xdo_state_add(&s2, &ack) == 0);
+	assert(installed_spec.seq == 400000 + 600000);
+	delete_state(&s2);
+	bench_drain_retirements();
+	bench_clear_sas();
+	bench_reset();
+	s1 = *outbound_state();
+	assert(ft_xdo_state_add(&s1, &ack) == 0);
+	sa_of(&s1)->oseq = 0xfffff000;
+	delete_state(&s1);
+	bench_drain_retirements();
+	/* An old SA that close to the end of its space leaves a re-add no
+	 * number it could send without reusing one: the margin stops at the
+	 * last one, and the backend refuses to start there. */
+	s2 = *outbound_state();
+	s2.replay.oseq = 0xffff0000;
+	installed = sa_installed;
+	ack._msg = NULL;
+	assert(ft_xdo_state_add(&s2, &ack) == -EINVAL);
+	assert(sa_installed == installed && !s2.xso.offload_handle);
+	assert(ack._msg && !strcmp(ack._msg, "cdx: the hardware refused this SA"));
+	{
+		struct cdx_ipsec_sa_spec spec;
+
+		memset(&spec, 0, sizeof(spec));
+		spec.esn = false;
+		spec.seq = 0xfffff000;
+		ft_ipsec_fold_oseq(&spec, 0xfffff000, 0);
+		assert(spec.seq == U32_MAX - 1);
+	}
+	bench_clear_sas();
+}
+
+/* Retired SAs are remembered one record each, for a while, and never more
+ * than FT_IPSEC_REMEMBERED of them. */
+static void test_remembered_bound(void)
+{
+	struct ft_ipsec_retirement *r;
+
+	bench_reset();
+	bench_clear_sas();
+	for (u32 i = 0; i < FT_IPSEC_REMEMBERED + 10; i++) {
+		r = calloc(1, sizeof(*r));
+		r->id.family = AF_INET;
+		r->id.spi = i + 1;
+		r->last.seq = 1;
+		test_lock(&ft_ipsec_retired_lock);
+		assert(ft_ipsec_remember(r));
+		test_unlock(&ft_ipsec_retired_lock);
+	}
+	assert(ft_ipsec_remembered_count == FT_IPSEC_REMEMBERED);
+	r = list_entry(ft_ipsec_remembered.next, struct ft_ipsec_retirement, list);
+	assert(r->id.spi == 11);
+	/* The same SA again replaces its record rather than adding one. */
+	r = calloc(1, sizeof(*r));
+	r->id.family = AF_INET;
+	r->id.spi = 100;
+	r->last.oseq = 5;
+	test_lock(&ft_ipsec_retired_lock);
+	assert(ft_ipsec_remember(r));
+	test_unlock(&ft_ipsec_retired_lock);
+	assert(ft_ipsec_remembered_count == FT_IPSEC_REMEMBERED);
+	unsigned same = 0;
+	list_for_each_entry(r, &ft_ipsec_remembered, list)
+		same += r->id.spi == 100;
+	assert(same == 1);
+	/* An SA SEC left nothing of is not kept. */
+	r = calloc(1, sizeof(*r));
+	test_lock(&ft_ipsec_retired_lock);
+	assert(!ft_ipsec_remember(r));
+	test_unlock(&ft_ipsec_retired_lock);
+	free(r);
+	/* And the rest age out as the next one comes. */
+	jiffies += FT_IPSEC_REMEMBER_FOR;
+	r = calloc(1, sizeof(*r));
+	r->id.spi = 7;
+	r->last.seq = 9;
+	test_lock(&ft_ipsec_retired_lock);
+	assert(ft_ipsec_remember(r));
+	test_unlock(&ft_ipsec_retired_lock);
+	assert(ft_ipsec_remembered_count == 1);
 	bench_clear_sas();
 }
 
@@ -3962,6 +4460,9 @@ int main(void)
 	test_replay_seeding();
 	test_publish_window();
 	test_replay_round_trip();
+	test_update_stats();
+	test_readd_fold();
+	test_remembered_bound();
 	test_sec_refusals();
 	assert(dev_holds == 0 && neigh_refs == 0 && xfrm_state_refs == 0);
 	printf("ipsec adapter: ok\n");
