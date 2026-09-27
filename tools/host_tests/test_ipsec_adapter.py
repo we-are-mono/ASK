@@ -64,7 +64,11 @@ def test_ipsec_adapter(tmp_path):
         # bounds of the pass that accounts for them, again up to that pass's
         # work item.
         + source[source.index("struct ft_ipsec_identity {"):
-                 source.index("static void ft_ipsec_stats_work(struct work_struct")])
+                 source.index("static void ft_ipsec_stats_work(struct work_struct")]
+        # What a receiving end asks the SAs that could have decrypted its
+        # frames, and how many of them it asks.
+        + source[source.index("/* The receiving end of a direction, as the SAs"):
+                 source.index("static unsigned int ft_ipsec_inbound_candidates(")])
     # Which authenticators SEC produces: the one table that decides it and
     # the backend's predicate over it, with SEC's operation codes as cdx
     # defines them.
@@ -83,8 +87,9 @@ def test_ipsec_adapter(tmp_path):
     # source a function happens to sit.
     names = [
         "ft_ipsec_esp_mtu", "ft_ipsec_bound",
-        "ft_ipsec_offloaded", "ft_ipsec_paired_inbound", "ft_ipsec_record",
-        "ft_ipsec_resolve", "ft_ipsec_flowi", "ft_ipsec_receiving", "ft_ipsec_handle",
+        "ft_ipsec_offloaded", "ft_ipsec_inbound_candidates", "ft_ipsec_paired_inbound",
+        "ft_ipsec_record", "ft_ipsec_resolve", "ft_ipsec_flowi", "ft_ipsec_receiver",
+        "ft_ipsec_receiving", "ft_ipsec_handle",
         "ft_ipsec_mark", "ft_ipsec_watch_find", "ft_ipsec_watch_unsampled",
         "ft_ipsec_path_moved",
         "ft_ipsec_neigh_moved", "ft_ipsec_route_moved",

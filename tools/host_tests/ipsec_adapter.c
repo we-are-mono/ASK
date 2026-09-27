@@ -87,6 +87,10 @@ static void list_del(struct list_head *e)
 	for (pos = list_entry((head)->next, __typeof__(*pos), member); \
 	     &pos->member != (head); \
 	     pos = list_entry(pos->member.next, __typeof__(*pos), member))
+#define list_for_each_entry_reverse(pos, head, member) \
+	for (pos = list_entry((head)->prev, __typeof__(*pos), member); \
+	     &pos->member != (head); \
+	     pos = list_entry(pos->member.prev, __typeof__(*pos), member))
 #define list_for_each_entry_safe(pos, n, head, member) \
 	for (pos = list_entry((head)->next, __typeof__(*pos), member), \
 	     n = list_entry(pos->member.next, __typeof__(*pos), member); \
@@ -446,7 +450,7 @@ struct xfrm_state {
 	} props;
 	const struct xfrm_type *type;
 	void *data;
-	struct { u32 v; } mark;
+	struct { u32 v, m; } mark;
 	struct { u8 state; u8 dying; } km;
 	u8 repl_mode;
 	struct { u32 replay_window, replay, integrity_failed; } stats;
@@ -2013,57 +2017,183 @@ static void test_offloaded(void)
 	inner.xfrm = NULL;
 }
 
+/* The adapter's own list of the SAs it holds, as ft_xdo_state_add() keeps it:
+ * each added at the tail, so the tail is the most recently installed. */
+static struct ft_ipsec_retirement owned_slots[FT_IPSEC_PAIRED_MAX + 2];
+static void own(unsigned slot, struct xfrm_state *x)
+{
+	owned_slots[slot].x = x;
+	owned_slots[slot].sa = (struct cdx_ipsec_sa *)x->xso.offload_handle;
+	list_add_tail(&owned_slots[slot].list, &ft_ipsec_owned);
+}
+static void disown_all(void)
+{
+	while (!list_empty(&ft_ipsec_owned))
+		list_del(ft_ipsec_owned.next);
+}
+
+/* An offloaded inbound half of `out` on `dev`, for child SA `reqid`. */
+static void inbound_half(struct xfrm_state *in, const struct xfrm_state *out,
+			 struct net_device *dev, struct cdx_ipsec_sa *sa, u16 handle,
+			 u32 reqid)
+{
+	memset(in, 0, sizeof(*in));
+	in->props.saddr = out->id.daddr;
+	in->id.daddr = out->props.saddr;
+	in->props.family = out->props.family;
+	in->props.mode = XFRM_MODE_TUNNEL;
+	in->props.reqid = reqid;
+	in->id.proto = IPPROTO_ESP;
+	in->id.spi = 0x0b000000 | reqid;
+	in->xso.type = XFRM_DEV_OFFLOAD_PACKET;
+	in->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	in->xso.dev = dev;
+	in->xso.offload_handle = (unsigned long)sa;
+	sa->handle = handle;
+	in->km.state = XFRM_STATE_VALID;
+}
+
+/* The forwarding policy for the receiving end's tuple, whose one template
+ * takes child SA `reqid` between the two ends of `in`. */
+static void forwarding_policy(struct xfrm_policy *pol, const struct xfrm_state *in, u32 reqid)
+{
+	memset(pol, 0, sizeof(*pol));
+	pol->xfrm_nr = 1;
+	pol->xfrm_vec[0] = (struct xfrm_tmpl){ .mode = XFRM_MODE_TUNNEL, .reqid = reqid,
+		.id.proto = IPPROTO_ESP, .allalgs = true };
+	pol->xfrm_vec[0].id.daddr = in->id.daddr;
+	pol->xfrm_vec[0].saddr = in->props.saddr;
+	receiving_policy = pol;
+	receiving_family = AF_INET;
+	receiving_oif = WAN.ifindex;
+}
+
+static u16 paired(const struct xfrm_state *out, const struct ft_ipsec_receiver *recv,
+		  bool *ok)
+{
+	struct xfrm_state *received = NULL;
+	u16 handle = 0xffff;
+
+	*ok = ft_ipsec_paired_inbound(out, recv, &handle, &received);
+	/* The state named comes back held, and only when one is named. */
+	assert(!!received == (*ok && handle));
+	if (received)
+		xfrm_state_put(received);
+	assert(xfrm_state_refs == 0);
+	return handle;
+}
+
 static void test_paired_inbound(void)
 {
 	struct xfrm_state *out = outbound_state();
-	struct xfrm_state in;
-	u16 handle = 0xffff;
+	struct ft_ipsec_receiver recv = { .in = &LAN, .family = AF_INET };
+	struct xfrm_state older, newer, many[FT_IPSEC_PAIRED_MAX + 1];
+	struct cdx_ipsec_sa many_sa[FT_IPSEC_PAIRED_MAX + 1];
+	struct xfrm_policy pol;
+	bool ok;
 
 	bench_reset();
+	disown_all();
+	recv.fl.flowi_oif = WAN.ifindex;
 
 	/* No inbound half at all: the far end sends in the clear, which is
 	 * unusual but legal, and the direction installs with no handle. */
 	paired_state = NULL;
-	assert(ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
-	assert(handle == 0);
+	assert(paired(out, &recv, &ok) == 0 && ok);
 
-	/* The mirrored half, offloaded on the ingress port. */
-	memset(&in, 0, sizeof(in));
-	in.props.saddr.a4 = PEER_IP;
-	in.id.daddr.a4 = LOCAL_IP;
-	in.xso.type = XFRM_DEV_OFFLOAD_PACKET;
-	in.xso.dir = XFRM_DEV_OFFLOAD_IN;
-	in.xso.dev = &LAN;
-	in.xso.offload_handle = (unsigned long)&sa_pool[0];
-	sa_pool[0].handle = 7;
-	in.km.state = XFRM_STATE_VALID;
-	paired_state = &in;
-	assert(ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
-	assert(handle == 7);
-	assert(xfrm_state_refs == 0);	/* the lookup's reference is given back */
+	/* The mirrored half, offloaded on the ingress port and taking the
+	 * tuple: the forwarding policy's template is its child SA. */
+	inbound_half(&older, out, &LAN, &sa_pool[0], 7, 42);
+	own(0, &older);
+	forwarding_policy(&pol, &older, 42);
+	assert(paired(out, &recv, &ok) == 7 && ok);
+	assert(!pol.refs);
+
+	/* One whose selector does not cover the tuple is not the SA the kernel
+	 * would accept it from. With no other, xfrm's own index still names an
+	 * offloaded half, so the direction is a plain one to the caller, whose
+	 * policy check then decides; the entry is never keyed on an SA that
+	 * does not take the tuple. */
+	older.sel.mismatch = true;
+	paired_state = &older;
+	assert(paired(out, &recv, &ok) == 0 && ok);
+	older.sel.mismatch = false;
+
+	/* Two child SAs between the same endpoints, the newer for other
+	 * traffic selectors: the one named is the one the policy takes, not
+	 * the most recent. xfrm's own index would have answered the newer. */
+	inbound_half(&newer, out, &LAN, &sa_pool[1], 8, 43);
+	own(1, &newer);
+	paired_state = &newer;
+	assert(paired(out, &recv, &ok) == 7 && ok);
+
+	/* A rekey: both halves of one child SA take the tuple, and the newer
+	 * is the one the peer moves to. */
+	newer.props.reqid = 42;
+	assert(paired(out, &recv, &ok) == 8 && ok);
+
+	/* The newer one already being deleted has no handle to name any more;
+	 * the older one still does. */
+	newer.xso.offload_handle = 0;
+	assert(paired(out, &recv, &ok) == 7 && ok);
+	newer.xso.offload_handle = (unsigned long)&sa_pool[1];
+
+	/* Dead, or behind a mark the outbound SA's own would not select, is
+	 * not a candidate either. */
+	newer.km.state = XFRM_STATE_DEAD;
+	assert(paired(out, &recv, &ok) == 7 && ok);
+	newer.km.state = XFRM_STATE_VALID;
+	newer.mark.m = 0xff;
+	newer.mark.v = 2;
+	assert(paired(out, &recv, &ok) == 7 && ok);
+	newer.mark.m = newer.mark.v = 0;
+
+	/* The receiving policy refusing every half leaves nothing named. */
+	pol.action = 1;
+	assert(paired(out, &recv, &ok) == 0 && ok);
+	pol.action = 0;
+	disown_all();
+
+	/* No more than FT_IPSEC_PAIRED_MAX, newest first: past that the
+	 * oldest's flows stay in software rather than grow the admission. */
+	for (unsigned i = 0; i <= FT_IPSEC_PAIRED_MAX; i++) {
+		memset(&many_sa[i], 0, sizeof(many_sa[i]));
+		inbound_half(&many[i], out, &LAN, &many_sa[i], 100 + i, i ? 50 : 42);
+		own(i, &many[i]);
+	}
+	paired_state = &many[FT_IPSEC_PAIRED_MAX];
+	assert(paired(out, &recv, &ok) == 0 && ok);
+	many[1].props.reqid = 42;
+	assert(paired(out, &recv, &ok) == 101 && ok);
+	disown_all();
+	receiving_policy = NULL;
 
 	/* One that exists and cannot be named is a refusal, not an absence:
 	 * its frames are decrypted before they could match this tuple, so an
 	 * entry keyed on the physical port would be installed, counted, and
-	 * never match a frame. */
-	in.xso.type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
-	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
-	assert(handle == 0);
-	in.xso.type = XFRM_DEV_OFFLOAD_PACKET;
+	 * never match a frame. A software state is never one of the adapter's
+	 * own; xfrm's index is what finds it. */
+	older.xso.type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
+	paired_state = &older;
+	assert(paired(out, &recv, &ok) == 0 && !ok);
+	older.xso.type = XFRM_DEV_OFFLOAD_PACKET;
 
-	/* On another port, dead, or facing the wrong way is the same refusal. */
-	in.xso.dev = &WAN;
-	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
-	in.xso.dev = &LAN;
-	in.km.state = XFRM_STATE_DEAD;
-	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
-	in.km.state = XFRM_STATE_VALID;
-	in.xso.dir = XFRM_DEV_OFFLOAD_OUT;
-	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
+	/* On another port, dead, or facing the wrong way is the same refusal,
+	 * whether or not the adapter holds it. */
+	own(0, &older);
+	older.xso.dev = &WAN;
+	assert(paired(out, &recv, &ok) == 0 && !ok);
+	older.xso.dev = &LAN;
+	older.km.state = XFRM_STATE_DEAD;
+	assert(paired(out, &recv, &ok) == 0 && !ok);
+	older.km.state = XFRM_STATE_VALID;
+	older.xso.dir = XFRM_DEV_OFFLOAD_OUT;
+	assert(paired(out, &recv, &ok) == 0 && !ok);
+	disown_all();
 
 	assert(xfrm_state_refs == 0);
 	paired_state = NULL;
-	sa_pool[0].handle = 0;
+	sa_pool[0].handle = sa_pool[1].handle = 0;
 }
 
 static void test_resolve(void)
@@ -2071,6 +2201,7 @@ static void test_resolve(void)
 	struct xfrm_state *x = outbound_state();
 	struct dst_entry plain = { .ops = &v4_ops, .refs = 1 };
 	struct dst_entry bundle = { .ops = &v4_ops, .xfrm = x };
+	struct ft_ipsec_receiver recv = { .in = &LAN, .family = AF_INET };
 	struct flowi fl;
 	u16 handle;
 
@@ -2122,7 +2253,7 @@ static void test_resolve(void)
 
 	/* The same answer at the receiving end is not a refusal: nothing has
 	 * been decrypted, so nothing is arriving that this tuple could miss. */
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, NULL, NULL));
 	policy_error = 0;
 
 	/* A policy resolving to a transform the hardware cannot carry refuses
@@ -2134,7 +2265,7 @@ static void test_resolve(void)
 	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
 	assert(plain.refs == 1 && bundle.refs == 0);
 	bundle.refs = 0;
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, NULL, NULL));
 	assert(handle == 0 && plain.refs == 1 && bundle.refs == 0);
 	x->xso.type = XFRM_DEV_OFFLOAD_PACKET;
 	sa_pool[0].handle = 0;
@@ -2362,17 +2493,26 @@ static void test_handle_and_flowi(void)
 	memset(&in, 0, sizeof(in));
 	in.props.saddr.a4 = back.id.daddr.a4;
 	in.id.daddr.a4 = back.props.saddr.a4;
+	in.props.family = AF_INET;
+	in.id.proto = IPPROTO_ESP;
 	in.xso.type = XFRM_DEV_OFFLOAD_PACKET;
 	in.xso.dir = XFRM_DEV_OFFLOAD_IN;
 	in.xso.dev = &LAN;
 	in.xso.offload_handle = (unsigned long)&sa_pool[1];
 	sa_pool[1].handle = 9;
 	in.km.state = XFRM_STATE_VALID;
+	own(0, &in);
 	paired_state = &in;
 	bundle.refs = back_bundle.refs = 0;
 	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
 	assert(rule.sa_handle == 5 && rule.in_sa_handle == 9);
 	assert(forward.refs == 1 && reverse.refs == 1);
+	/* Asked about the tuple as it arrives: what the peer addressed, on its
+	 * way in by the ingress port and out by the egress one. */
+	assert(receiving_query.u.ip4.saddr == rule.src.ip &&
+	       receiving_query.u.ip4.daddr == rule.dst.ip);
+	assert(receiving_query.flowi_iif == LAN.ifindex &&
+	       receiving_query.flowi_oif == WAN.ifindex);
 
 	/* An inbound SA that exists and cannot be named refuses the whole
 	 * direction rather than installing an entry nothing will match: its
@@ -2383,6 +2523,7 @@ static void test_handle_and_flowi(void)
 	assert(!ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
 	assert(forward.refs == 1 && reverse.refs == 1);
 
+	disown_all();
 	paired_state = NULL;
 	sa_pool[0].handle = sa_pool[1].handle = sa_pool[2].handle = 0;
 }

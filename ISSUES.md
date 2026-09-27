@@ -319,6 +319,9 @@ file's git history.
 - [x] **A287.** Outbound-SA entries on the offline port were keyed the same way, so a decrypted inner ESP or NAT-T UDP packet could match one and the gateway emit a frame a peer forged toward a third party —
   fixed (_:/^cdx: bind a decrypted flow's classifier entry to its SA_).
 
+- [x] **A288.** `ft_ipsec_paired_inbound()` chose a decrypted flow's inbound SA by address (the most recent), so a rekey with non-overlapping selectors bound the entry to an SA the peer does not use and left the flow in software —
+  fixed (_:/^cdx: choose a decrypted flow's inbound SA by its selector_).
+
 - [x] **A275.** Routed multicast copies left with the egress port's MAC rather than their oif's (a VLAN or bridge VIF), as ipmr sends them, and no chain followed an oif's MAC change —
   fixed (_:/^flowtable: send a routed multicast copy from its oif's address_).
 

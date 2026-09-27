@@ -1093,51 +1093,94 @@ static struct xfrm_state *ft_ipsec_offloaded(const struct dst_entry *bundle,
 	return x;
 }
 
-/* Name the offloaded inbound SA paired with an outbound one.
+/* The receiving end of a direction, as the SAs that could have decrypted its
+ * frames are asked about it: the port those frames arrive by, and the tuple
+ * they carry once decrypted, in the flow's own family. */
+struct ft_ipsec_receiver {
+	struct net_device *in;
+	struct flowi fl;
+	u16 family;
+};
+
+/* How many inbound SAs one pair of endpoints is asked about, newest first:
+ * one per child SA between the two, and two for each while a rekey overlaps.
+ * A pair with more carries the flows of the oldest in software. */
+#define FT_IPSEC_PAIRED_MAX	16
+
+static unsigned int ft_ipsec_inbound_candidates(const struct xfrm_state *out,
+						const struct net_device *in,
+						struct xfrm_state **held,
+						unsigned int max);
+
+/* Name the offloaded inbound SA paired with an outbound one, for the tuple the
+ * receiving end is asked about.
  *
  * A child SA is installed as a pair with mirrored endpoints, so the inbound
- * half of `out` is the state whose destination is our local endpoint and whose
- * source is the peer. Asking xfrm's own index for it beats keeping a second
- * one here: the pair is the kernel's fact, not this adapter's, and a private
- * copy would have to be kept in step with every rekey.
+ * halves of `out` are the states whose destination is our local endpoint and
+ * whose source is the peer. There can be several: one per child SA the two
+ * endpoints negotiated, each for its own traffic selectors, and two for one
+ * child while a rekey overlaps. The one named is the one the kernel itself
+ * would accept this tuple from -- its selector covers the tuple and the
+ * forwarding policy's templates take it (xfrm_flowtable_policy_check()) -- and
+ * of those the most recently installed, which is the one a peer moves its
+ * traffic to after a rekey. That choice is binding, not advisory: the entry is
+ * keyed on the SA (cdx_ipsec_key_tag()), and matches only frames that SA
+ * decrypted.
  *
- * Three outcomes. No such state leaves the receiving handle unset; the
- * caller must still prove that forwarding policy permits plaintext before
- * admitting the connection. A usable one is
- * named. One that exists and is not usable -- software, another port's, dead
- * -- is a refusal: its frames are decrypted before they could match this
- * tuple, so the entry would be installed, counted and never matched.
+ * Three outcomes. A usable one is named. With none among this adapter's SAs,
+ * xfrm's own index decides as it always has: no state for the pair at all, or
+ * only offloaded ones that do not take this tuple, leaves the receiving handle
+ * unset, and the caller must still prove that forwarding policy permits
+ * plaintext before admitting the connection. One that exists and is not usable
+ * -- software, another port's, dead -- is a refusal: its frames are decrypted
+ * before they could match this tuple, so the entry would be installed, counted
+ * and never matched.
  *
- * A rekey briefly leaves two inbound states for one pair; the lookup answers
- * with the most recently installed, which is the one a fresh flow should name.
- * The older one keeps its own classifier entry until it is deleted, and that
- * deletion retires whatever still depends on it.
+ * A flow named for the older SA of a rekey is in software from the moment the
+ * peer moves to the newer one until the older one is deleted, whose deletion
+ * retires it; it is admitted again, and named for the newer SA, from its next
+ * packet. Before its entry was keyed on the SA, frames from either matched it.
  */
 static bool ft_ipsec_paired_inbound(const struct xfrm_state *out,
-				    struct net_device *in, u16 *handle,
-				    struct xfrm_state **received)
+				    const struct ft_ipsec_receiver *recv,
+				    u16 *handle, struct xfrm_state **received)
 {
-	struct xfrm_state *x;
-	bool ok = false;
+	struct xfrm_state *held[FT_IPSEC_PAIRED_MAX], *x, *named = NULL;
+	unsigned int count, i;
+	bool usable;
 
 	*handle = 0;
+	count = ft_ipsec_inbound_candidates(out, recv->in, held, ARRAY_SIZE(held));
+	for (i = 0; i < count; i++) {
+		x = held[i];
+		if (!named && x->km.state == XFRM_STATE_VALID &&
+		    xfrm_flowtable_policy_check(&init_net, &recv->fl, recv->family, x)) {
+			*handle = cdx_ipsec_sa_handle(
+				(struct cdx_ipsec_sa *)READ_ONCE(x->xso.offload_handle));
+			if (*handle) {
+				named = x;
+				continue;
+			}
+		}
+		xfrm_state_put(x);
+	}
+	if (named) {
+		if (received)
+			*received = named;
+		else
+			xfrm_state_put(named);
+		return true;
+	}
 	x = xfrm_state_lookup_byaddr(&init_net, out->mark.v, &out->props.saddr,
 				     &out->id.daddr, IPPROTO_ESP,
 				     out->props.family);
 	if (!x)
 		return true;		/* caller checks receiving policy */
-	if (x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
-	    x->xso.dir == XFRM_DEV_OFFLOAD_IN && x->xso.offload_handle &&
-	    x->xso.dev == in && x->km.state == XFRM_STATE_VALID) {
-		*handle = cdx_ipsec_sa_handle(
-			(struct cdx_ipsec_sa *)READ_ONCE(x->xso.offload_handle));
-		ok = *handle != 0;
-	}
-	if (ok && received)
-		*received = x;
-	else
-		xfrm_state_put(x);
-	return ok;
+	usable = x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
+		 x->xso.dir == XFRM_DEV_OFFLOAD_IN && x->xso.offload_handle &&
+		 x->xso.dev == recv->in && x->km.state == XFRM_STATE_VALID;
+	xfrm_state_put(x);
+	return usable;			/* and the caller checks receiving policy */
 }
 
 /* Record the handle this end of the direction needs, and say whether the
@@ -1147,15 +1190,16 @@ static bool ft_ipsec_paired_inbound(const struct xfrm_state *out,
  * state's inbound half instead. A missing half is usable only if the caller
  * proves the receiving policy allows plaintext; one-way tunnels remain legal.
  */
-static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_in,
+static bool ft_ipsec_record(const struct xfrm_state *x,
+			    const struct ft_ipsec_receiver *recv,
 			    u16 *handle, struct xfrm_state **received)
 {
-	if (!pair_in) {
+	if (!recv) {
 		*handle = cdx_ipsec_sa_handle(
 			(struct cdx_ipsec_sa *)READ_ONCE(x->xso.offload_handle));
 		return *handle != 0;
 	}
-	return ft_ipsec_paired_inbound(x, pair_in, handle, received);
+	return ft_ipsec_paired_inbound(x, recv, handle, received);
 }
 
 /* What transform covers `fl` leaving `dev`, and which SA handle this direction
@@ -1164,13 +1208,13 @@ static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_
  * Two questions share this one lookup, because they are the same question
  * asked from opposite ends of a direction:
  *
- *   `pair_in == NULL` -- what encrypts the frames this direction *sends*.
+ *   `recv == NULL` -- what encrypts the frames this direction *sends*.
  *     *handle receives that outbound SA's handle.
- *   `pair_in != NULL` -- what the frames this direction *receives* were
+ *   `recv != NULL` -- what the frames this direction *receives* were
  *     encrypted by. The tuple passed is the reversed one, so the policy found
  *     is the one that would transform those frames had this gateway sent them,
  *     and the SA that actually decrypted them is that policy's inbound half on
- *     `pair_in`. *handle receives its handle.
+ *     `recv->in` that takes `recv->fl`. *handle receives its handle.
  *
  * The question has to be asked of the policy, not only of the borrowed
  * destination. A transformed dst reaches the flowtable only when the packet
@@ -1203,7 +1247,8 @@ static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_
  * and `sa_expansion` when given (ft_ipsec_bound()).
  */
 static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
-			     struct net_device *dev, struct net_device *pair_in,
+			     struct net_device *dev,
+			     const struct ft_ipsec_receiver *recv,
 			     u16 *handle, struct xfrm_state **received,
 			     u16 *sa_mtu, u8 *sa_expansion)
 {
@@ -1240,7 +1285,7 @@ static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 		 * software path make whatever decision the policy asks for --
 		 * an acquire, a block, or a drop. Receiving is unaffected:
 		 * nothing has been decrypted, so nothing is arriving. */
-		return !!pair_in;
+		return !!recv;
 	}
 	if (bundle == dst) {
 		/* No policy: an ordinary plain end. Nothing consumed the
@@ -1250,8 +1295,8 @@ static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 	}
 
 	x = ft_ipsec_offloaded(bundle, dev);
-	ok = x ? ft_ipsec_record(x, pair_in, handle, received) : !!pair_in;
-	if (ok && x && !pair_in && sa_mtu &&
+	ok = x ? ft_ipsec_record(x, recv, handle, received) : !!recv;
+	if (ok && x && !recv && sa_mtu &&
 	    !ft_ipsec_bound(x, xfrm_dst_child(bundle), sa_mtu, sa_expansion))
 		ok = false;
 	/* Releases the whole chain, including the reference the bundle took
@@ -1291,11 +1336,14 @@ static void ft_ipsec_flowi(const struct cdx_ft_rule *rule, bool reverse,
 	fl->flowi_oif = out->ifindex;
 }
 
-static bool ft_ipsec_receiving(const struct flow_cls_offload *cls,
-			   const struct cdx_ft_rule *rule, bool reverse,
-			       struct xfrm_state *received)
+/* The receiving end of a direction, or with `reverse` of the other one: the
+ * physical port its frames arrive by, and the tuple they carry as the
+ * forwarding policy judges it. */
+static void ft_ipsec_receiver(const struct flow_cls_offload *cls,
+			      const struct cdx_ft_rule *rule, bool reverse,
+			      struct ft_ipsec_receiver *recv)
 {
-	struct flowi fl = {};
+	struct flowi *fl = &recv->fl;
 	const union nf_inet_addr *src = reverse ? &rule->new_dst : &rule->src;
 	const union nf_inet_addr *dst = reverse ? &rule->new_src : &rule->dst;
 	__be16 sport = reverse ? rule->new_dport : rule->sport;
@@ -1303,22 +1351,31 @@ static bool ft_ipsec_receiving(const struct flow_cls_offload *cls,
 	struct net_device *in = reverse ? rule->out_logical : rule->in_logical;
 	struct net_device *out = reverse ? rule->in_logical : rule->out_logical;
 
+	memset(recv, 0, sizeof(*recv));
+	recv->in = reverse ? rule->out : rule->in;
+	recv->family = rule->family;
 	if (rule->family == AF_INET) {
-		fl.u.ip4.saddr = src->ip;
-		fl.u.ip4.daddr = dst->ip;
-		fl.u.ip4.fl4_sport = sport;
-		fl.u.ip4.fl4_dport = dport;
+		fl->u.ip4.saddr = src->ip;
+		fl->u.ip4.daddr = dst->ip;
+		fl->u.ip4.fl4_sport = sport;
+		fl->u.ip4.fl4_dport = dport;
 	} else {
-		fl.u.ip6.saddr = src->in6;
-		fl.u.ip6.daddr = dst->in6;
-		fl.u.ip6.fl6_sport = sport;
-		fl.u.ip6.fl6_dport = dport;
+		fl->u.ip6.saddr = src->in6;
+		fl->u.ip6.daddr = dst->in6;
+		fl->u.ip6.fl6_sport = sport;
+		fl->u.ip6.fl6_dport = dport;
 	}
-	fl.flowi_proto = rule->proto;
-	fl.flowi_iif = in->ifindex;
-	fl.flowi_oif = out->ifindex;
-	fl.flowi_mark = READ_ONCE(cls->nf_ct->mark);
-	return xfrm_flowtable_policy_check(&init_net, &fl, rule->family, received);
+	fl->flowi_proto = rule->proto;
+	fl->flowi_iif = in->ifindex;
+	fl->flowi_oif = out->ifindex;
+	fl->flowi_mark = READ_ONCE(cls->nf_ct->mark);
+}
+
+static bool ft_ipsec_receiving(const struct ft_ipsec_receiver *recv,
+			       struct xfrm_state *received)
+{
+	return xfrm_flowtable_policy_check(&init_net, &recv->fl, recv->family,
+					   received);
 }
 
 /* Both ends of one direction: what encrypts what it sends, and what decrypted
@@ -1330,6 +1387,7 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 			    struct cdx_ft_rule *rule, struct net_device *out,
 			    struct net_device *in)
 {
+	struct ft_ipsec_receiver recv;
 	struct xfrm_state *received = NULL;
 	struct flowi fl;
 	u16 reverse_in;
@@ -1342,19 +1400,21 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 	/* Both directions share one Linux generation. Validate both receiving
 	 * ends even when their SAs exist: policy may now require a different
 	 * transform, or forbid the tuple altogether. */
-	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, rule->out, &reverse_in,
+	ft_ipsec_receiver(cls, rule, true, &recv);
+	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, &recv, &reverse_in,
 			     &received, NULL, NULL))
 		goto denied;
-	allowed = ft_ipsec_receiving(cls, rule, true, received);
+	allowed = ft_ipsec_receiving(&recv, received);
 	if (received)
 		xfrm_state_put(received);
 	if (!allowed)
 		goto denied;
 	ft_ipsec_flowi(rule, true, in, &fl);
-	if (!ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, rule->in,
+	ft_ipsec_receiver(cls, rule, false, &recv);
+	if (!ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, &recv,
 			     &rule->in_sa_handle, &received, NULL, NULL))
 		goto denied;
-	allowed = ft_ipsec_receiving(cls, rule, false, received);
+	allowed = ft_ipsec_receiving(&recv, received);
 	if (received)
 		xfrm_state_put(received);
 	if (allowed)
@@ -12925,6 +12985,41 @@ static bool ft_ipsec_names_owned(const struct net_device *dev,
 			return true;
 	}
 	return false;
+}
+
+/* The inbound halves of `out` this adapter holds on `in`, newest first, each
+ * with a reference the caller puts: the states whose destination is `out`'s
+ * source and whose source is its destination, with its protocol, family and
+ * a mark its own would select, as xfrm_state_lookup_byaddr() matches them. At
+ * most `max`; ft_ipsec_paired_inbound() judges which takes a tuple, outside
+ * the lock, since that judgement takes xfrm's own policy locks. */
+static unsigned int ft_ipsec_inbound_candidates(const struct xfrm_state *out,
+						const struct net_device *in,
+						struct xfrm_state **held,
+						unsigned int max)
+{
+	struct ft_ipsec_retirement *owned;
+	unsigned int count = 0;
+	struct xfrm_state *x;
+
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	list_for_each_entry_reverse(owned, &ft_ipsec_owned, list) {
+		if (count == max)
+			break;
+		x = owned->x;
+		if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET ||
+		    x->xso.dir != XFRM_DEV_OFFLOAD_IN || x->xso.dev != in ||
+		    x->props.family != out->props.family ||
+		    x->id.proto != IPPROTO_ESP ||
+		    (out->mark.v & x->mark.m) != x->mark.v ||
+		    !xfrm_addr_equal(&x->id.daddr, &out->props.saddr, x->props.family) ||
+		    !xfrm_addr_equal(&x->props.saddr, &out->id.daddr, x->props.family))
+			continue;
+		xfrm_state_hold(x);
+		held[count++] = x;
+	}
+	spin_unlock_bh(&ft_ipsec_retired_lock);
+	return count;
 }
 
 /* Whether every SA an outbound policy names by SPI is one this adapter holds
