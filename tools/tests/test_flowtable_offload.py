@@ -28,6 +28,7 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.counters import kernel_tx_packets
 from ask_orch.uart import Console
+from _ioctl import _IOR
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, kernel_rx_packets, lan_run_python
 
 WAN_IP = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
@@ -1431,6 +1432,24 @@ print(json.dumps({{'sent': sent-first, 'received': len(received),
     return json.loads(result.stdout.strip())
 
 
+# The two 10G receive ports' enable bits, read through each port's own ioctl
+# over the console: a terminal failure stops classification there while a
+# fixed link keeps its carrier, and takes the agent's path with it.
+RX_PORTS_SCRIPT = f'''
+import fcntl, json, os
+states = {{}}
+for port in (6, 7):
+    fd = os.open('/dev/fm0-port-rx%d' % port, os.O_RDWR)
+    try:
+        value = bytearray(1)
+        fcntl.ioctl(fd, {_IOR(0xe1, 70 + 44, 1)}, value)
+        states[str(port)] = value[0]
+    finally:
+        os.close(fd)
+print(json.dumps(states))
+'''
+
+
 @pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TERMINAL") not in {"unload", "unlink"},
                     reason="explicit terminal lifecycle test; fresh boot required")
 async def test_flowtable_offload_terminal(rig):
@@ -1440,12 +1459,19 @@ async def test_flowtable_offload_terminal(rig):
     r.recovery_console = Console.target(log_path=str(ARTIFACTS / "terminal-uart.log"))
     con = r.recovery_console
     await asyncio.to_thread(con.login, "root", None)
+    # Recovery reports from a worker after the delete has returned, and a
+    # printk landing inside a console read corrupts that read. dmesg keeps
+    # every line for the assertions; the level is put back at the end.
+    printk = (await console_command(con, "cat", "/proc/sys/kernel/printk"))["stdout"].split()
+    await console_command(con, "sysctl", "-w", "kernel.printk=1 4 1 7")
     await r.table()
     await r.exchange(128)
     initial = await r.wait(lambda s: s["entries"] == 2)
     assert all(int(f["packets"]) > 0 for f in initial["flows"]), initial
     baseline = len(r.echo.received)
-    traffic = asyncio.create_task(terminal_stream(r, duration=24 if kind == "unlink" else 12))
+    # The sender has to outlast every console check before the stopped-port
+    # observation at the end: about 45 s of UART round trips for unlink.
+    traffic = asyncio.create_task(terminal_stream(r, duration=75 if kind == "unlink" else 12))
     unloaded = False
     try:
         deadline = time.monotonic() + 5
@@ -1462,21 +1488,7 @@ async def test_flowtable_offload_terminal(rig):
         if kind == "unlink":
             # Read physical receive-port enable state, not netdev carrier:
             # fixed links can retain carrier while classification is stopped.
-            from _ioctl import _IOR
-            port_script = f'''
-import fcntl, json, os
-states = {{}}
-for port in (6, 7):
-    fd = os.open('/dev/fm0-port-rx%d' % port, os.O_RDWR)
-    try:
-        value = bytearray(1)
-        fcntl.ioctl(fd, {_IOR(0xe1, 70 + 44, 1)}, value)
-        states[str(port)] = value[0]
-    finally:
-        os.close(fd)
-print(json.dumps(states))
-'''
-            before_ports = await console_python(con, port_script)
+            before_ports = await console_python(con, RX_PORTS_SCRIPT)
             assert json.loads(before_ports["stdout"]) == {"6": 1, "7": 1}
             await console_python(con, "from pathlib import Path; Path('/sys/module/cdx/parameters/flowtable_fail_unlink').write_text('1')")
             await console_command(con, "nft", "delete", "table", "inet", TABLE)
@@ -1507,7 +1519,7 @@ print(json.dumps(states))
             assert refused["rearms"] == live["rearms"] and refused["errors"] == stopped["errors"]
             r.record("unlink-rearm-passive", {"state": refused, "nft": attempted})
             await console_command(con, "nft", "delete", "table", "inet", TABLE)
-            ports = await console_python(con, port_script)
+            ports = await console_python(con, RX_PORTS_SCRIPT)
             assert json.loads(ports["stdout"]) == {"6": 0, "7": 0}, ports
             knob = await console_command(con, "cat", "/sys/module/cdx/parameters/flowtable_fail_unlink")
             assert knob["stdout"].strip() == "N", knob
@@ -1526,7 +1538,7 @@ print(json.dumps(states))
                 for field in ("fatal", "invalidated", "invalidation_done", "rearm_ready", "entries", "bindings",
                               "installs", "deletes", "rearms", "errors", "quarantine"):
                     assert held[field] == stopped[field], (field, held, stopped)
-                ports = json.loads((await console_python(con, port_script))["stdout"])
+                ports = json.loads((await console_python(con, RX_PORTS_SCRIPT))["stdout"])
                 assert ports == {"6": 0, "7": 0}, ports
                 mtu_checks.append({"dev": dev, "state": held, "ports": ports})
             r.record("unlink-mtu-refused", mtu_checks)
@@ -1537,7 +1549,7 @@ print(json.dumps(states))
                 assert restart["rc"] != 0 and "Input/output error" in restart["stdout"], restart
                 link = json.loads((await console_command(con, "ip", "-j", "link", "show", "dev", dev))["stdout"])[0]
                 assert "UP" not in link["flags"], link
-                ports = json.loads((await console_python(con, port_script))["stdout"])
+                ports = json.loads((await console_python(con, RX_PORTS_SCRIPT))["stdout"])
                 assert ports == {"6": 0, "7": 0}, ports
                 restart_checks.append({"dev": dev, "restart": restart, "ports": ports})
             r.record("unlink-port-restart-refused", restart_checks)
@@ -1572,7 +1584,7 @@ print(json.dumps(states))
                 for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
                     restart = await console_command(con, "ip", "link", "set", "dev", dev, "up", check=False)
                     assert restart["rc"] != 0 and "Input/output error" in restart["stdout"], restart
-                ports = json.loads((await console_python(con, port_script))["stdout"])
+                ports = json.loads((await console_python(con, RX_PORTS_SCRIPT))["stdout"])
                 assert ports == {"6": 0, "7": 0}, ports
                 r.record("unlink-provider-guard-retained", {"ports": ports, "adapter_absent": True})
                 await console_command(con, "rmmod", "cdx", timeout=25)
@@ -1594,3 +1606,4 @@ print(json.dumps(states))
     await r.exchange(64)
     r.record(f"{kind}-complete", {"module_absent": True, "post_unload_echoes": 64,
                                 "boot_id": await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")})
+    await console_command(con, "sysctl", "-w", "kernel.printk=" + " ".join(printk[:4]))

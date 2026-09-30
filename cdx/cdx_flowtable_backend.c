@@ -126,10 +126,11 @@ static void ft_fatal_work_fn(struct work_struct *work)
 		schedule_delayed_work(&ft_fatal_work, HZ);
 }
 
-/* Latch terminal failure from outside the unicast delete path. A multicast
- * classifier root that could not be provably unlinked may still resolve in
- * hardware and replicate through a leaked listener chain, which is exactly
- * the state unicast's -EIO latches. The same latch refuses new entries and
+/* Latch terminal failure from outside the unicast delete path. A multicast or
+ * IPsec classifier root that could not be provably unlinked may still resolve
+ * in hardware -- replicating through a leaked listener chain, or enqueueing to
+ * a deleted SA's queues -- which is exactly the state unicast's -EIO
+ * latches. The same latch refuses new entries and
  * groups, blocks port restart and makes the drain demand a reset, and the work
  * above stops the ports, so a possibly-still-linked root fail-stops the
  * datapath rather than forwarding on unnoticed. One-way, so a lockless

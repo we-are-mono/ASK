@@ -586,8 +586,9 @@ int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
 	 * this attempt. The delete frees its software bookkeeping whichever
 	 * way it went, so a later attempt would find no entry to remove, skip
 	 * the removal, and add the same key again on top of the one still
-	 * linked. The SA keeps classifying on the framing it has -- which is
-	 * the state it was already in -- until it is deleted and reinstalled. */
+	 * linked. The delete itself has latched terminal failure
+	 * (cdx_ipsec_delete_fp_entry()), so the ports stop and no reinstall
+	 * can put the key in beside the one still linked. */
 	if (entry->ct && entry->ct->handle) {
 		rc = cdx_ipsec_delete_fp_entry(entry);
 		if (rc && rc != EN_EHASH_DELETE_UNSYNCED) {

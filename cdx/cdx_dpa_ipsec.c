@@ -75,6 +75,7 @@
 #include "fm_ehash.h"
 #include "dpa_control_mc.h"
 #include "fe.h"
+#include "cdx_flowtable_backend.h"
 
 //#define CDX_DPA_DEBUG	1
 
@@ -665,13 +666,27 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 		 * is safe and leaves no stale pointer to a handle this SA no
 		 * longer owns.
 		 *
-		 * The rc is still reported (negative on failure) so callers can
-		 * log; none takes a different action on it - since the teardown
-		 * here is complete, there is nothing left to defer. */
+		 * What the entry names is another matter, and this is the only
+		 * place that knows: both callers -- the SA delete and an
+		 * outbound next-hop rebuild, after which the SA holds no entry
+		 * for its own delete to find -- come through here. A key that
+		 * may still be linked may still resolve, so the ports stop, as
+		 * any such key demands. An inbound SA's entry enqueues to its
+		 * TO_SEC FQID, so those FQIDs are held past the SA's release as
+		 * well; an outbound one's enqueues to the egress port. The
+		 * unsynced arm is out of the table and parked; it needs
+		 * neither. */
 		rc = cdx_ehash_delete_entry(pSA->ct->td, pSA->ct->index,
 				pSA->ct->handle);
 		if (rc)
 			DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
+		if (rc && rc != EN_EHASH_DELETE_UNSYNCED) {
+			if (pSA->direction == CDX_DPA_IPSEC_INBOUND &&
+			    pSA->pSec_sa_context &&
+			    pSA->pSec_sa_context->dpa_ipsecsa_handle)
+				cdx_dpa_ipsecsa_keep_fqids(pSA->pSec_sa_context->dpa_ipsecsa_handle);
+			cdx_ft_fatal();
+		}
 		pSA->ct->handle =  NULL;
 		hwct = pSA->ct;
 		pSA->ct = NULL;
@@ -757,7 +772,8 @@ void cdx_ipsec_release_sa_resources(PSAEntry pSA)
 	/* Delete the hash table entry. On failure the callee has already
 	 * disposed of ct/handle under the ehash tri-state (quarantine or
 	 * loud leak) and cleared pSA->ct - nothing is deferred to the
-	 * release timer any more. */
+	 * release timer any more. An inbound entry that may still be linked
+	 * has pinned the FQIDs the release below would otherwise free. */
 	cdx_ipsec_delete_fp_entry(pSA);
 
 	/* change frame queues states */

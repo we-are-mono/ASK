@@ -38,15 +38,15 @@ import time
 
 import pytest
 
-from _ioctl import _IOR
 from _mcast_windows import (COUNT, MulticastRig, bridge_settings, delivered, dut_console, in_hardware,
                             in_software, learn, mcast_rows, mdb, members, moved, mroute_row,
                             multicast_rig, packets, stream, streamed, summary,  # noqa: F401
                             wire_interface)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
-from test_flowtable_offload import (HEALTH_BASELINE, command, console_command, console_python,  # noqa: F401
-                                    hardware_proof, read, rig, status_text, stop_boot_daemon)
+from test_flowtable_offload import (HEALTH_BASELINE, RX_PORTS_SCRIPT, command, console_command,  # noqa: F401
+                                    console_python, hardware_proof, read, rig, status_text,
+                                    stop_boot_daemon)
 from test_mcast_e2e import _exec, dut_mac, mcast_bridge, wan_source_address  # noqa: F401
 from test_mroute_capacity import _daemon
 
@@ -382,21 +382,6 @@ async def test_flowtable_service_multicast_quarantine_released_without_multicast
 
 
 UNLINK_FAULT = "/sys/module/cdx/parameters/ehash_fail_unlink"
-# The two 10G receive ports. Their enable bit, read through the port's own
-# ioctl, sees classification stop where carrier on a fixed link would not.
-RX_PORTS_SCRIPT = f'''
-import fcntl, json, os
-states = {{}}
-for port in (6, 7):
-    fd = os.open('/dev/fm0-port-rx%d' % port, os.O_RDWR)
-    try:
-        value = bytearray(1)
-        fcntl.ioctl(fd, {_IOR(0xe1, 70 + 44, 1)}, value)
-        states[str(port)] = value[0]
-    finally:
-        os.close(fd)
-print(json.dumps(states))
-'''
 
 
 @pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TERMINAL") != "mcast-unlink",

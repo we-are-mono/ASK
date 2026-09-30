@@ -369,9 +369,9 @@ void cdx_ft_assert_held(void);
 int cdx_ft_claim(void);
 int cdx_ft_release(void);
 bool cdx_ft_failed(void);
-/* Latch terminal failure: a root outside the unicast delete path, such as a
- * multicast group's, that could not be provably unlinked and may still forward
- * in hardware. Refuses new entries and groups, blocks port restart, stops the
+/* Latch terminal failure: a root outside the unicast delete path -- a
+ * multicast group's or an IPsec SA's -- that could not be provably unlinked
+ * and may still forward in hardware. Refuses new entries and groups, blocks port restart, stops the
  * ports, and makes the drain demand a reset. */
 void cdx_ft_fatal(void);
 unsigned int cdx_ft_pending(void);

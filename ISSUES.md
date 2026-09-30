@@ -178,6 +178,16 @@ result independently of those temporary files.
   multicast, then install a hardware group and make the same change with no nft/MFC change;
   require zero unauthorized cleartext on every egress. IPv4/IPv6, normal + bridge/VLAN oifs.
 
+- [ ] **A291 — FMan enqueues QMan rejects leak their buffers.** No DCP ERN handler is
+  registered (`qman_set_dc_ern` is never called), so a frame FMan enqueues to an FQ that
+  rejects it -- out of service, or retired -- ends in QMan's "Leaking DCP ERNs!" path and its
+  BMan buffer is never returned. Known trigger: a classifier key left linked after an
+  unproven delete (IPsec SA, multicast group) keeps enqueueing to the deleted SA's queues
+  until the terminal latch stops the ports, milliseconds normally, unbounded while RTNL stays
+  contended. Any other rejected FMan enqueue leaks the same way. Fix: register a DC ERN
+  handler that releases the frame's buffer to its pool and counts it. Regression: enqueue
+  to an out-of-service FQ from FMan (OH port) and require the pool's free count to recover.
+
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN

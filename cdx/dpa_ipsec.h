@@ -94,6 +94,9 @@ void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle);
 int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td, 
 			uint32_t* portid);
 int cdx_dpa_ipsecsa_release(void *handle) ;
+/* Leave the SA's FQIDs allocated when its queues are released: a classifier
+ * entry naming one may still be linked. */
+void cdx_dpa_ipsecsa_keep_fqids(void *handle);
 uint32_t get_fqid_to_sec(void *handle);
 uint32_t ipsec_get_to_cp_fqid(void *handle);
 
