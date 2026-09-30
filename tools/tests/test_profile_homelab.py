@@ -49,6 +49,7 @@ Bench furniture this profile needs, none of it created here:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -1136,8 +1137,10 @@ async def homelab(target_agent, lan):
             addresses = json.loads((await command(ctx.target, ctx.session, "ip", "-j",
                                                   "-4", "addr", "show",
                                                   "dev", TARGET_WAN_IF))["stdout"])[0]
-            ctx.wan_address = next(a["local"] for a in addresses["addr_info"]
-                                   if a["family"] == "inet")
+            wan_info = next(a for a in addresses["addr_info"]
+                            if a["family"] == "inet")
+            ctx.wan_address = wan_info["local"]
+            ctx.wan_prefixlen = wan_info["prefixlen"]
             ctx.dut_wan_mac = (await read(ctx.target, ctx.session,
                                           f"/sys/class/net/{TARGET_WAN_IF}/address")).strip()
             orch = json.loads((await command(ctx.wan, ctx.session, "ip", "-j", "-4",
@@ -1167,15 +1170,32 @@ async def homelab(target_agent, lan):
                                                "route", "show", "default"))["stdout"])
             ctx.first_gateway = next(
                 (r["gateway"] for r in routes if r.get("dev") == TARGET_WAN_IF), None)
-            assert ctx.first_gateway, ("the WAN port has no default route to move",
-                                       routes)
+            # The test image boots the WAN port with a static management address
+            # and no gateway; a deployment's WAN always has one, and the
+            # lifecycle case needs a distinct next hop to move away from and back
+            # to. When none is present, synthesize an on-link first hop -- the
+            # first host of the WAN subnet, skipping the port's own address. It
+            # carries no traffic (every WAN flow uses second_gateway below), so
+            # it only has to be a valid on-link address; cleanup then removes the
+            # route rather than restoring one that was never there.
+            synthetic_default = ctx.first_gateway is None
+            if synthetic_default:
+                wan_net = ipaddress.ip_interface(
+                    f"{ctx.wan_address}/{ctx.wan_prefixlen}").network
+                ctx.first_gateway = str(next(
+                    h for h in wan_net.hosts() if str(h) != ctx.wan_address))
             ctx.second_gateway = orchestrator_source()
             await command(ctx.wan, ctx.session, "ip", "addr", "add",
                           f"{INTERNET}/32", "dev", "lo", check=False)
             cleanup.append((ctx.wan, ["ip", "addr", "del", f"{INTERNET}/32",
                                       "dev", "lo"]))
-            cleanup.append((ctx.target, ["ip", "route", "replace", "default", "via",
-                                         ctx.first_gateway, "dev", TARGET_WAN_IF]))
+            if synthetic_default:
+                cleanup.append((ctx.target, ["ip", "route", "del", "default",
+                                             "dev", TARGET_WAN_IF]))
+            else:
+                cleanup.append((ctx.target, ["ip", "route", "replace", "default",
+                                             "via", ctx.first_gateway, "dev",
+                                             TARGET_WAN_IF]))
             await command(ctx.target, ctx.session, "ip", "route", "replace", "default",
                           "via", ctx.second_gateway, "dev", TARGET_WAN_IF)
 
