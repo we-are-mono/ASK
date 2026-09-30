@@ -498,10 +498,51 @@ silently broken one: the matched frame never reaches the bridge, so a listener
 left out of the hardware set does not fall back to software, it stops
 receiving. The shipping shape is a Wi-Fi VAP on `br-lan`: a phone joining the
 stream a set-top box is already watching puts an uncarriable port in the
-answer, and the flow goes back to the bridge in its entirety. A flow the bridge
-forwards nowhere — every listener behind its ingress, or blocking its source —
-has nothing to replicate and stays with the bridge too. `/proc` says
-`refused-listener` for all of these.
+answer, and the flow goes back to the bridge in its entirety. `/proc` says
+`refused-listener` for these.
+
+**A flow the bridge forwards nowhere is dropped in hardware.** Its last listener
+has left, every listener sits behind its ingress, or every one blocks its
+source; upstream may keep sending for as long as it takes to process the leave,
+and a stream nothing wants would otherwise reach the CPU frame by frame only for
+the bridge to drop it there. So the flow keeps its classifier key and its root
+entry replicates to one discard member instead: a listener's entry built on the
+flow's own ingress port, enqueueing to a parked queue that tail-drops at zero
+bytes (`cdx_discard_fqid()`), whose rejected FMan enqueues QMan discards. It
+reads `discarding`, `packets` keeps counting what it drops, and
+`mcast_discarding` counts such entries. Its enqueue counts nothing against the
+ingress port's transmit statistics, which would otherwise read every dropped
+frame as one sent. Going from listeners to discarding and back is a chain
+replace under a key that never leaves the table, so no frame reaches the CPU
+across it; a viewer changing back to the channel waits for one worker pass, in
+which the stream is still dropped where before the bridge would have forwarded
+it at once. The 1,000,000-frame rig case
+`test_flowtable_service_multicast_bridged_discard_keeps_every_buffer` finds
+every BMan pool at its count again afterwards: QMan's discard of a rejected
+FMan enqueue returns the buffer.
+
+It needs the bridge's own snooping answer: `br_multicast_list_ports()` reports
+`BR_MCAST_SNOOPED` beside its reasons, and an empty port set it gave because it
+could not say -- the bridge down, the VID missing, the ingress not forwarding --
+is not a drop. Nothing else may want the frames: no reason at all to hand them
+up to the host (joined, flooding, a multicast router, promiscuous), no route
+riding the flow, and nothing refusing every flow (a bridge filter hook, the
+multicast switch off). A querier timing out raises no event; the five-second
+refresh finds it, the bound every installed entry already has.
+
+Nothing names such a flow once its membership has gone, so it is kept only
+while its entry is installed and discardable, and ages out on its own clock:
+the first refresh that counts nothing -- a live stream is never five seconds
+without a frame -- rather than the membership interval, so a run of channel
+changes does not leave an entry per channel. A stream that
+starts again after that is not learned again -- nothing names it -- and reaches
+the CPU as before the flow existed. A flow a membership still names but that
+forwards nowhere -- every listener behind the ingress, or blocking the source --
+is dropped the same way, and relearned from the next frame of a bursty sender
+after it ages out; holding an entry, it no longer gives way to a named source
+when its group is at `FT_MC_MAX_FLOWS`. The routed learner has no analogue: a
+negative MFC entry is a daemon's policy with its own lifetime, and
+`refused-listener` there also covers shapes that are not empty.
 
 **The tag stack.** A bridged group carries the MDB entry's `vid`. Each
 listener's egress framing is resolved from that vid and the port's own
@@ -879,7 +920,9 @@ The dependency watches: MDB delete, listener or ingress port down or
 unregistered, bridge VLAN configuration change, and the idle timer for a source
 that stopped. Each retires the group and returns it to pending or to nothing.
 A group that loses one listener is reinstalled with the remainder rather than
-being torn down, which is what the backend's replace operation is for.
+being torn down, which is what the backend's replace operation is for; one that
+loses its last, while the bridge's snooping says the stream is dropped, is
+replaced by a discard and retired once its stream stops.
 
 ### 8. Parity
 

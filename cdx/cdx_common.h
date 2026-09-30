@@ -260,6 +260,9 @@ struct dpa_l2hdr_info {
 		 * registered one. */
 		uint32_t vlan_flow_ifstats:1;
 		uint32_t add_eth_type:1;
+		/* The enqueue counts nothing against the port: its frames go to
+		 * the discard queue and are dropped there, not sent. */
+		uint32_t no_tx_stats:1;
 	};
 	uint32_t fqid;
 	uint8_t rspid;

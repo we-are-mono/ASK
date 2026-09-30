@@ -314,6 +314,8 @@ static void cdx_module_deinit(void)
 		cdx_flowtable_quiesced();
 		/* Reclaim queued TX frames while dependent pools are still alive. */
 		qm_quiesce();
+		/* And the frame the discard queue may hold, for the same reason. */
+		cdx_discard_exit();
 		cdx_ctrl_unlock_with_rtnl();
 	}
 

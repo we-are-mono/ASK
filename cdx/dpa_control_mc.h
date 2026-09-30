@@ -112,11 +112,13 @@ struct cdx_mc_member_frame {
  * the netdev whose MTU the enqueue carries, borrowed for the call. `encap`
  * names the tags this listener's frames leave with, or is NULL to take them
  * from the egress interface. The scratch state is the builder's own; see the
- * definition for why that is not merely tidiness. */
+ * definition for why that is not merely tidiness. A nonzero `discard_fqid`
+ * builds a discard member instead: the same entry, enqueueing there. */
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
 	POnifDesc onif_desc, struct net_device *dev, const struct cdx_l2_encap *encap,
 	const struct cdx_mc_member_frame *frame,
-	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type);
+	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type,
+	uint32_t discard_fqid);
 
 /* Module init/exit functions */
 int mc4_init(void);

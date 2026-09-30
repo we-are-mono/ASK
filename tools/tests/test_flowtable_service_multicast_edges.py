@@ -613,7 +613,7 @@ async def test_flowtable_service_multicast_reload_bridged_blocked_source(multica
     def settled(state):
         kept, refused = row(state, allowed), row(state, blocked)
         return (bool(kept) and kept["state"] == "installed" and members(kept, "ports") == {port}
-                and bool(refused) and refused["state"] == "refused-listener"
+                and bool(refused) and refused["state"] == "discarding"
                 and refused["ports"] == "-")
 
     async def window(label, adapter=True):
@@ -644,7 +644,9 @@ async def test_flowtable_service_multicast_reload_bridged_blocked_source(multica
         await learn(r, streams, settled, "the allowed source carried, the blocked one not")
         before = await window("before")
         assert moved(before, lambda s: row(s, allowed)) == COUNT, summary(before["after"])
-        assert before["stream_cpu"] < COUNT * 1.1, (before["stream_cpu"], before["cpu"], before["idle"])
+        # The blocked source is dropped where it is matched, not on the CPU.
+        assert moved(before, lambda s: row(s, blocked)) == COUNT, summary(before["after"])
+        in_hardware(before, streams=2)
 
         async def unloaded():
             out = await window("unloaded", adapter=False)
@@ -654,14 +656,15 @@ async def test_flowtable_service_multicast_reload_bridged_blocked_source(multica
             return await learn(r, streams, settled, "the blocked source standing across the reload")
 
         relearned = await reload_adapter(r, f"mcast-reload-blocked-v{family}", standing, unloaded)
-        assert relearned["mcast_installed"] == r.initial["mcast_installed"] + 1, summary(relearned)
+        # The allowed source carried and the blocked one discarding.
+        assert relearned["mcast_installed"] == r.initial["mcast_installed"] + 2, summary(relearned)
         after = await window("after")
         assert moved(after, lambda s: row(s, allowed)) == COUNT, summary(after["after"])
-        assert moved(after, lambda s: row(s, blocked)) == 0, summary(after["after"])
-        assert after["stream_cpu"] < COUNT * 1.1, (after["stream_cpu"], after["cpu"], after["idle"])
+        assert moved(after, lambda s: row(s, blocked)) == COUNT, summary(after["after"])
+        in_hardware(after, streams=2)
     final = await r.settle(lambda s: not mcast_rows(s, group) and
                            s["mcast_installed"] == r.initial["mcast_installed"],
-                           "removed after the reload", timeout=15)
+                           "removed after the reload", timeout=20)
     assert final["quarantine"] == 0, summary(final)
 
 

@@ -201,7 +201,11 @@ async def transfer(r, p, label, target=True, probe_target=True):
             current = row(after, group, r.multicast_kind)
             # smcrouted may install a negative MFC after traffic requests a
             # withdrawn route. It has no listeners and must stay in software.
-            assert current is None or (current['state'] == 'refused-listener' and current['listeners'] == '-'), after
+            # A bridged stream nobody wants any more is dropped in hardware.
+            assert current is None or (
+                current['state'] == 'discarding' and current['ports'] == '-'
+                if r.multicast_kind == 'mcast' else
+                current['state'] == 'refused-listener' and current['listeners'] == '-'), after
     r.record(label, {'before': before, 'after': after, 'received': results})
     return after
 

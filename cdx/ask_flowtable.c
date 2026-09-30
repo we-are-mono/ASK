@@ -5082,6 +5082,11 @@ struct ft_mc_flow {
 	u8 src_mac[ETH_ALEN];
 	bool in_tagged;
 	struct cdx_mc_group *hw;
+	/* `hw` drops what it matches rather than replicating it: the bridge
+	 * forwards the flow nowhere; see ft_mc_discardable(). It names no port
+	 * and so no port's queues, which is what keeps it out of an egress
+	 * rebuild, and it ages at the first refresh that counts nothing. */
+	bool hw_discard;
 	/* The flow in another shape reached the CPU while an entry was
 	 * installed -- the only way it can, because the entry's own frames
 	 * never do: a sender whose MAC changed, a tag the port now carries. It
@@ -5175,6 +5180,7 @@ struct ft_mc_flow {
  * answer from the bridge starts the count again. */
 #define FT_MC_MAX_RETRIES 4
 
+
 /* Sources one group may have in hardware on one bridge. An IPTV channel has
  * one; a group every host on a LAN sends to -- SSDP's 239.255.255.250 is the
  * common one -- has as many as there are hosts, and each would take an entry
@@ -5185,6 +5191,9 @@ static LIST_HEAD(ft_mc_groups);
 static LIST_HEAD(ft_mc_flows);
 static DEFINE_MUTEX(ft_mc_lock);
 static unsigned int ft_mc_count, ft_mc_flow_count, ft_mc_installed;
+/* Of ft_mc_installed, the entries that discard; under the transaction, as
+ * ft_mc_installed is. */
+static unsigned int ft_mc_discarding;
 static u64 ft_mc_refused, ft_mc_install_errors;
 /* Installed groups of either learner marked for a rebuild because a port they
  * copy out of changed its egress; see ft_mc_egress_changed(). A build racing
@@ -5895,16 +5904,30 @@ static bool ft_mc_installable(const struct ft_mc_flow *f)
 	       ft_mc_carriable(f) && ft_mc_mtu_bounded(f);
 }
 
-/* The hardware group a flow becomes: the ports the bridge forwards it to, and
- * the copies of the route riding it. Called with ft_mc_lock held on a flow
- * ft_mc_installable() accepts. The devices are borrowed; the caller holds its
- * own for the hardware call. */
-static void ft_mc_flow_spec(const struct ft_mc_flow *f,
-			    struct cdx_mc_group_spec *spec)
+/* Whether a flow's frames are ones the bridge drops, so the hardware can drop
+ * them where they are matched instead of every one reaching the CPU to be
+ * dropped there -- what a stream still arriving after its last listener left
+ * would otherwise cost, until upstream stops sending it.
+ *
+ * Only on the bridge's own snooping answer (BR_MCAST_SNOOPED): an empty port
+ * set it gave because it could not say -- the bridge down, the VID missing,
+ * the ingress not forwarding -- is not a drop. Nothing else may want the
+ * frames either: no port, no route riding the flow, no reason at all to hand
+ * them up to the host, not even one only a VIF would act on, and nothing that
+ * refuses every flow. Called with ft_mc_lock held. */
+static bool ft_mc_discardable(const struct ft_mc_flow *f)
 {
-	const struct ft_mc_route *r = ft_mc_live_route(f);
-	u8 i;
+	return READ_ONCE(ft_mc_enabled) && !ft_mc_filtered &&
+	       f->derived && f->in && !f->gone && !f->error &&
+	       !f->ports && !f->routed_host && !ft_mc_live_route(f) &&
+	       f->local == BR_MCAST_SNOOPED;
+}
 
+/* The key a flow's hardware group is installed under: its port, its stream
+ * and the one ingress shape the root accepts. Called with ft_mc_lock held. */
+static void ft_mc_flow_key(const struct ft_mc_flow *f,
+			   struct cdx_mc_group_spec *spec)
+{
 	lockdep_assert_held(&ft_mc_lock);
 	memset(spec, 0, sizeof(*spec));
 	spec->in = f->in;
@@ -5926,6 +5949,19 @@ static void ft_mc_flow_spec(const struct ft_mc_flow *f,
 		spec->in_vlan[0].id = f->addr.vid;
 		spec->in_vlans = 1;
 	}
+}
+
+/* The hardware group a flow becomes: the ports the bridge forwards it to, and
+ * the copies of the route riding it. Called with ft_mc_lock held on a flow
+ * ft_mc_installable() accepts. The devices are borrowed; the caller holds its
+ * own for the hardware call. */
+static void ft_mc_flow_spec(const struct ft_mc_flow *f,
+			    struct cdx_mc_group_spec *spec)
+{
+	const struct ft_mc_route *r = ft_mc_live_route(f);
+	u8 i;
+
+	ft_mc_flow_key(f, spec);
 	/* The bridge's copies, as its answer named them: never the ingress,
 	 * which br_multicast_list_ports() leaves out as should_deliver() does. */
 	for (i = 0; i < f->ports; i++)
@@ -5938,6 +5974,17 @@ static void ft_mc_flow_spec(const struct ft_mc_flow *f,
 		spec->listener[spec->listeners] = r->listener[i];
 		spec->listener[spec->listeners++].routed = true;
 	}
+}
+
+/* The hardware group a flow ft_mc_discardable() accepts becomes: its key, and
+ * no listener, dropping what it matches. The same key a replicating group has,
+ * so the one becomes the other by a replace that never takes the key out of
+ * the table. Called with ft_mc_lock held. */
+static void ft_mc_discard_spec(const struct ft_mc_flow *f,
+			       struct cdx_mc_group_spec *spec)
+{
+	ft_mc_flow_key(f, spec);
+	spec->discard = true;
 }
 
 /* Record `spec` as the chain the flow's entry was built from, for the egress
@@ -6012,7 +6059,16 @@ static void ft_mc_retire(struct list_head *dead, struct list_head *gone)
 		retired = true;
 	}
 	list_for_each_entry_safe(f, ftmp, &ft_mc_flows, list) {
-		if (!f->gone && ft_mc_flow_named(f))
+		/* Nothing names a stream its last listener left, but it may
+		 * still be arriving: an installed flow the bridge would drop is
+		 * kept, and its entry turned into a discard, until the stream
+		 * stops and it ages out. Retired straight away it would reach
+		 * the CPU, frame by frame, with nothing to learn it again. So
+		 * is one whose membership went after this pass asked the bridge
+		 * about it: its answer is stale, and the next pass, which the
+		 * membership's event queued, asks again. */
+		if (!f->gone && (ft_mc_flow_named(f) ||
+				 (f->hw && (f->dirty || ft_mc_discardable(f)))))
 			continue;
 		list_move(&f->list, gone);
 		ft_mc_flow_count--;
@@ -7092,6 +7148,8 @@ static void ft_mc_work_fn(struct work_struct *work)
 			 * drains, so nobody else would ever see it. */
 			cdx_mc_group_del(&f->hw);
 			ft_mc_installed--;
+			ft_mc_discarding -= f->hw_discard;
+			f->hw_discard = false;
 		}
 	}
 	cdx_ft_end();
@@ -7121,7 +7179,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		struct ft_mc_route *route = NULL;
 		struct ft_mc_flow *target = NULL;
 		bool swap = false, swapped = false, withdrew = false;
-		bool added = false, paused;
+		bool added = false, paused, build;
 		struct cdx_mc_group *hw;
 		s64 changes;
 		int rc = 0;
@@ -7137,9 +7195,11 @@ static void ft_mc_work_fn(struct work_struct *work)
 			 * either is taken out below rather than left carrying
 			 * stale ports. */
 			if (!f->hw) {
-				f->contested = ft_mc_installable(f) &&
-					       ft_mc_key_contested(f);
-				if (!ft_mc_installable(f) || f->contested) {
+				bool wanted = ft_mc_installable(f) ||
+					      ft_mc_discardable(f);
+
+				f->contested = wanted && ft_mc_key_contested(f);
+				if (!wanted || f->contested) {
 					f->stale = false;
 					continue;
 				}
@@ -7171,12 +7231,17 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * no part in this transaction -- and a route's by the routed
 		 * learner. Borrowing either would leave the spec naming a
 		 * device whose last reference had just gone. */
-		if (!target->contested && ft_mc_installable(target) &&
-		    target->retries < FT_MC_MAX_RETRIES)
-			ft_mc_flow_spec(target, &spec);
-		if (spec.listeners) {
+		if (!target->contested && target->retries < FT_MC_MAX_RETRIES) {
+			if (ft_mc_installable(target))
+				ft_mc_flow_spec(target, &spec);
+			else if (ft_mc_discardable(target))
+				ft_mc_discard_spec(target, &spec);
+		}
+		/* Something to program: listeners, or a discard. */
+		build = spec.listeners || spec.discard;
+		if (build) {
 			/* The route whose copies the spec carries, if any. */
-			if (ft_mc_live_route(target))
+			if (spec.listeners && ft_mc_live_route(target))
 				route = target->route;
 			dev_hold(spec.in);
 			for (i = 0; i < spec.listeners; i++)
@@ -7206,16 +7271,18 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * the spec was taken before it, and a stop that has read nothing
 		 * installed must not see this pass's add land afterwards. With no
 		 * entry left, everything recorded below follows from hw alone. */
-		paused = spec.listeners && !READ_ONCE(ft_mc_enabled);
+		paused = build && !READ_ONCE(ft_mc_enabled);
 		if (swap && hw) {
 			cdx_mc_group_del(&hw);
 			ft_mc_installed--;
 			swapped = true;
 		}
-		if (!spec.listeners || paused) {
+		if (!build || paused) {
 			/* Became ineligible: take it out of hardware and keep
 			 * the flow, which may become installable again when the
-			 * host leaves, a port returns or a route arrives. */
+			 * host leaves, a port returns or a route arrives. A
+			 * discard that has become a listener set, or the other
+			 * way, is not this: it is the replace below. */
 			if (hw) {
 				cdx_mc_group_del(&hw);
 				ft_mc_installed--;
@@ -7254,17 +7321,23 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * spec was being taken has already cleared the flow's pointer and
 		 * marked it for another pass, and must not be recorded: its owner
 		 * is free to release it the moment it is off the list. */
-		if (spec.listeners && !rc)
+		if (build && !rc)
 			target->carried_route = route && target->route == route ?
 						route : NULL;
 		if (!hw)
 			target->carried_route = NULL;
+		ft_mc_discarding -= target->hw_discard;
+		target->hw_discard = hw && spec.discard;
+		ft_mc_discarding += target->hw_discard;
 		/* And the chain itself, whole, for the egress drain to replace
 		 * the entry with, holding what it names; nothing is recorded for
-		 * an entry this pass took out, or one it could not build. */
+		 * an entry this pass took out, or one it could not build. Nor
+		 * for a discard, which names no port's queue to rebuild for --
+		 * and a chain left recorded from before it would have the drain
+		 * rebuild the entry to replicate to listeners that left. */
 		if (hw && spec.listeners && !rc)
 			ft_mc_chain_record(target, &spec);
-		else if (!hw)
+		else if (!hw || target->hw_discard)
 			ft_mc_chain_forget(target);
 		/* A new entry has counted nothing yet, is not idle until a
 		 * whole refresh says so, and ages from now. */
@@ -7277,8 +7350,9 @@ static void ft_mc_work_fn(struct work_struct *work)
 		/* A chain built whole after the last egress change is current;
 		 * one built across a change is not, and is built again -- the
 		 * change could not mark a flow that had no entry yet. Nothing
-		 * installed is nothing stale. */
-		if (!hw) {
+		 * installed is nothing stale, and nor is a discard, whose queue
+		 * is no port's. */
+		if (!hw || target->hw_discard) {
 			target->egress_stale = false;
 		} else if (atomic64_read(&ft_egress_changes) != changes) {
 			target->egress_stale = true;
@@ -7286,7 +7360,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		} else if (spec.listeners && !rc) {
 			target->egress_stale = false;
 		}
-		if (spec.listeners && rc) {
+		if (build && rc) {
 			/* Tried again at the next refresh, not now: a port
 			 * that lost carrier, or room another entry is about to
 			 * give back, needs time rather than repetition. See
@@ -7303,7 +7377,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 			ft_mc_forget_seen();
 		mutex_unlock(&ft_mc_lock);
 		cdx_ft_end();
-		if (spec.listeners) {
+		if (build) {
 			dev_put(spec.in);
 			for (i = 0; i < spec.listeners; i++)
 				dev_put(spec.listener[i].dev);
@@ -7427,8 +7501,14 @@ static void ft_mc_flow_counted(struct ft_mc_flow *f,
 	if (f->idle && f->has_next)
 		f->stale = true;
 	/* Aged only on a sample that answers: one below the baseline cannot
-	 * tell a stream that stopped from one that is running. */
-	if (counted && f->age && time_after(now, f->active + f->age))
+	 * tell a stream that stopped from one that is running. A discard goes
+	 * at the first refresh that counts nothing, not on the membership
+	 * interval an entry with listeners ages on: nothing wants the stream,
+	 * a live one is never a whole refresh without a frame, and a channel
+	 * changed back and forth should not leave an entry for every one it
+	 * passed through. */
+	if (counted && ((f->hw_discard && !packets) ||
+			(f->age && time_after(now, f->active + f->age))))
 		f->gone = true;
 }
 
@@ -7816,6 +7896,10 @@ static bool ft_mc_flow_hw_lists(const struct ft_mc_flow *f,
 	u8 i;
 
 	lockdep_assert_held(&ft_mc_lock);
+	/* A discard copies out of no port, and records nothing for that
+	 * reason rather than for having lost a device. */
+	if (f->hw_discard)
+		return false;
 	if (!f->hw_spec.listeners)
 		return true;
 	for (i = 0; i < f->hw_spec.listeners; i++)
@@ -7963,6 +8047,7 @@ static void ft_mc_exit(void)
 	ft_mc_count = 0;
 	ft_mc_flow_count = 0;
 	ft_mc_installed = 0;
+	ft_mc_discarding = 0;
 }
 
 /* Why a flow is not being replicated, for an operator looking at a stream
@@ -7986,6 +8071,15 @@ static const char *ft_mc_state(const struct ft_mc_flow *f)
 	/* The host routes this stream and no route of it can ride the flow. */
 	if (f->routed_host && !ft_mc_live_route(f))
 		return "refused-routed";
+	/* Nowhere to forward it and nothing else wanting it: the bridge drops
+	 * it, and the hardware does instead -- or will, once installed. */
+	if (ft_mc_discardable(f)) {
+		if (f->contested)
+			return "refused-contested";
+		if (f->retries >= FT_MC_MAX_RETRIES)
+			return "refused-failed";
+		return f->hw && f->hw_discard ? "discarding" : "pending";
+	}
 	/* A port the hardware cannot carry, more of them than it can, or none
 	 * at all: every listener is behind the ingress, or blocks the source. */
 	if (!ft_mc_carriable(f) || (!f->ports && !ft_mc_live_route(f)))
@@ -7996,7 +8090,8 @@ static const char *ft_mc_state(const struct ft_mc_flow *f)
 		return "refused-contested";
 	if (f->retries >= FT_MC_MAX_RETRIES)
 		return "refused-failed";
-	if (f->hw)
+	/* Still a discard until the replace that brings the listeners in. */
+	if (f->hw && !f->hw_discard)
 		return "installed";
 	return "pending";
 }
@@ -13925,6 +14020,9 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mc_count, ft_mc_flow_count, ft_mc_installed, ft_mc_refused,
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
+	/* Of those installed, the flows the bridge forwards nowhere, whose
+	 * entries drop their stream rather than hand it to the CPU. */
+	seq_printf(seq, "mcast_discarding %u\n", ft_mc_discarding);
 	/* Installed groups of either learner marked for a rebuild because a
 	 * port they copy out of changed its egress -- its queues or its DSCP
 	 * map; see ft_mc_egress_changed(). */

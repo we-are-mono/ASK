@@ -247,7 +247,10 @@ Two further rules, both `refused-listener`:
 At most `CDX_MC_MAX_LISTENERS` listeners in total, which is eight — counted in
 copies rather than in ports, since one port can be several of them. An oif
 whose VIF has been removed is dropped rather than refused, because what is left
-is a shorter replication list; an empty one is `refused-listener`. A VIF whose
+is a shorter replication list; an empty one is `refused-listener`, and stays in
+software -- unlike a bridged flow nobody wants, which is dropped in hardware
+(see [the bridged design](multicast.md)): an MFC entry with no oif is a
+routing daemon's own policy with its own lifetime, not a stream's. A VIF whose
 device is no longer registered in `init_net` counts as removed even before the
 `FIB_EVENT_VIF_DEL` saying so has reached the learner: ipmr and ip6mr delete a
 device's VIFs in the RTNL hold that unregisters it or moves it to another

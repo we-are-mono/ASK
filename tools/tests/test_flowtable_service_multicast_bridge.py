@@ -357,7 +357,7 @@ async def test_flowtable_service_multicast_bridge_keeps_the_sender(multicast_bri
         assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
     finally:
         await _mdb(r, TARGET_LAN_IF, group, add=False)
-        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=20)
 
 
 async def test_flowtable_service_multicast_bridge_tagged_ingress(multicast_bridge_service):
@@ -389,7 +389,7 @@ async def test_flowtable_service_multicast_bridge_tagged_ingress(multicast_bridg
         assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
     finally:
         await _mdb(r, TARGET_WAN_IF, group, add=False)
-        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=20)
 
 
 FILTER_TABLE = 'ask_ft_mc_filter'
@@ -446,7 +446,7 @@ async def test_flowtable_service_multicast_bridge_yields_to_a_bridge_filter(mult
             await command(r.target, r.session, 'nft', 'delete', 'table', 'bridge',
                           FILTER_TABLE, check=False)
         await _mdb(r, TARGET_LAN_IF, group, add=False)
-        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=20)
 
 
 # ---- one stream, bridged and routed ----------------------------------------
@@ -599,7 +599,7 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
                 label='multicast_bridge_routed_listener_cleanup', timeout=15)
             if result.rc:
                 failures.append(result.stdout)
-        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=20)
         assert not failures, failures
 
 
@@ -690,7 +690,7 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
         # And the route goes: nothing names the group, and it retires.
         await route.ctl('remove', route.iptv_dev, source, group)
         await r.wait(lambda s: _iptv_row(s, group) is None
-                     and _mroute_row(s, group) is None, timeout=15)
+                     and _mroute_row(s, group) is None, timeout=20)
 
 
 # Long enough for the bridged learner to sample its entries into the route and
@@ -785,7 +785,7 @@ async def test_flowtable_service_multicast_bridge_route_count_across_a_bridge_bo
         await route.ctl('remove', route.iptv_dev, source, group)
         await _mdb(r, TARGET_LAN_IF, group, add=False)
         await r.wait(lambda s: _iptv_row(s, group) is None
-                     and _mroute_row(s, group) is None, timeout=15)
+                     and _mroute_row(s, group) is None, timeout=20)
 
 
 # ---- a member port's egress queues change under an installed group --------
@@ -887,4 +887,4 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
                 await tc('qdisc', 'del', 'dev', TARGET_WAN_IF, 'root', check=False)
             await _mdb(r, TARGET_WAN_IF, group, add=False)
             await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']),
-                         timeout=12)
+                         timeout=20)

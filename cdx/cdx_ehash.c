@@ -2343,6 +2343,12 @@ static int create_enque_hm(struct ins_entry_info *info)
 		word |= (uint32_t)info->l2_info.rspid << 24;
 		param->word = cpu_to_be32(word);
 		param->fqid = cpu_to_be32(info->l2_info.fqid);
+	} else if (info->l2_info.no_tx_stats) {
+		/* Counted at enqueue, before QMan rejects it: a dropped frame
+		 * would read as one the port transmitted. No storage profile
+		 * either, which is the rest of the word. */
+		param->word = 0;
+		param->fqid = cpu_to_be32(info->l2_info.fqid);
 	} else {
 #ifdef INCLUDE_ETHER_IFSTATS
 		uint8_t offset;
@@ -2588,7 +2594,8 @@ static int create_member_hop_hm(struct ins_entry_info *info)
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
 	POnifDesc onif_desc, struct net_device *dev, const struct cdx_l2_encap *encap,
 	const struct cdx_mc_member_frame *frame,
-	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type)
+	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type,
+	uint32_t discard_fqid)
 {
 	struct ins_entry_info *pInsEntryInfo;
 	struct dpa_l2hdr_info *pL2Info;
@@ -2670,6 +2677,17 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 		goto err_ret;
 	mcast_member_frame(pInsEntryInfo, frame);
 	pL2Info->mtu = dev->mtu;
+	/* A discard member: the entry a listener's would be, built on the
+	 * group's own ingress port, enqueueing to the discard queue instead of
+	 * the port's. No frame of any size is excepted to the CPU, which is what
+	 * the member exists to spare, and the DSCP map, which picks a queue of
+	 * the port's, stays out of it. */
+	if (discard_fqid) {
+		pL2Info->fqid = discard_fqid;
+		pL2Info->is_dscp_fq_map = 0;
+		pL2Info->mtu = 0xffff;
+		pL2Info->no_tx_stats = 1;
+	}
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s:: mtu %d\n", __func__, dev->mtu);
 #endif

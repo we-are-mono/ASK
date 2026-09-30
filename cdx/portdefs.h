@@ -159,6 +159,11 @@ struct dpa_iface_info {
 int find_pcd_fq_info(uint32_t fqid);
 void add_pcd_fq_info(struct dpa_fq *fq_info);
 void cdx_destroy_fq(struct qman_fq *fq);
+/* A parked, tail-dropping queue an entry enqueues to in order to drop what it
+ * matches; see devman.c. The id, created on first use, under the control lock;
+ * torn down at unload after the ports stop. */
+int cdx_discard_fqid(uint32_t *fqid);
+void cdx_discard_exit(void);
 void cdx_drain_fq_list(struct dpa_fq *head);
 void cdx_destroy_fq_list(struct dpa_fq **head);
 void cdx_reset_offline_ports(void);

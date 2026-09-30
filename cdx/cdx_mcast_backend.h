@@ -112,6 +112,12 @@ struct cdx_mc_group_spec {
 	/* A bridge preserves IP hop counts and Ethernet addresses; a router
 	 * decrements the one and rewrites the other. */
 	bool bridged;
+	/* No listener at all: the stream is dropped where it is matched rather
+	 * than reach the CPU, as a bridge drops one its snooping says nobody
+	 * wants. Bridged only, with `listeners` 0. The root keeps its key and
+	 * counts what it drops, and a replace swaps listeners back in without
+	 * the key leaving the table. */
+	bool discard;
 	struct cdx_mc_listener listener[CDX_MC_MAX_LISTENERS];
 };
 

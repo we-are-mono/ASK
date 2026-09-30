@@ -948,9 +948,13 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
 	unsigned int ii, jj;
 	int rc;
 
-	if (!spec->in || !spec->listeners ||
-	    spec->listeners > CDX_MC_MAX_LISTENERS ||
+	if (!spec->in || spec->listeners > CDX_MC_MAX_LISTENERS ||
 	    spec->in_vlans > CDX_FT_VLAN_MAX)
+		return -EOPNOTSUPP;
+	/* A group has listeners or is a discard, never both and never neither.
+	 * Discard is a bridged group's: what a bridge drops is a stream its
+	 * snooping says nobody wants, and only the bridged learner knows that. */
+	if (spec->discard ? spec->listeners || !spec->bridged : !spec->listeners)
 		return -EOPNOTSUPP;
 	rc = cdx_mc_check_group(spec);
 	if (rc)
@@ -1020,7 +1024,8 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
 static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
 		const struct cdx_mc_listener *listener,
 		const struct cdx_mc_member_frame *frame,
-		struct en_exthash_tbl_entry *prev, uint32_t tbl_type)
+		struct en_exthash_tbl_entry *prev, uint32_t tbl_type,
+		uint32_t discard_fqid)
 {
 	struct cdx_l2_encap encap = {};
 	struct dpa_iface_info *iface;
@@ -1058,7 +1063,8 @@ static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
 	return create_exthash_entry4mcast_member(pRtEntry, onif_desc,
 						 listener->dev,
 						 listener->vlans ? &encap : NULL,
-						 frame, prev, tbl_type);
+						 frame, prev, tbl_type,
+						 discard_fqid);
 }
 
 /* Builds a whole listener chain into `grp`, threaded head to tail, and leaves
@@ -1073,9 +1079,26 @@ static int cdx_mc_build_listeners(struct mcast_group_info *grp,
 	RouteEntry RtEntry, *pRtEntry = &RtEntry;
 	uint8_t arrived[ETH_ALEN], mapped[ETH_ALEN];
 	struct cdx_mc_member_frame frame = {};
+	/* A discard group's one member: a listener on its own ingress port,
+	 * which has the table the root's type needs, enqueueing to the discard
+	 * queue instead. The root keeps replicating -- one copy, dropped -- so
+	 * a replace that brings listeners back swaps the chain under a key that
+	 * never left the table, and the root goes on counting what it drops. */
+	struct cdx_mc_listener discard = { .dev = spec->in };
+	unsigned int ii, count = spec->listeners;
+	uint32_t discard_fqid = 0;
 	uint32_t tbl_type;
-	unsigned int ii;
 
+	if (spec->discard) {
+		if (cdx_discard_fqid(&discard_fqid)) {
+			/* As a failed entry below leaves it. */
+			cdx_free_exthash_mcast_members(grp);
+			grp->uiListenerCnt = 0;
+			grp->grpid = -1;
+			return -EIO;
+		}
+		count = 1;
+	}
 	memset(&RtEntry, 0, sizeof(RouteEntry));
 	cdx_mcast_compute_mac(grp, arrived);
 	cdx_mcast_group_mac(grp, mapped);
@@ -1090,8 +1113,9 @@ static int cdx_mc_build_listeners(struct mcast_group_info *grp,
 					 IPV4_MULTICAST_TABLE;
 	}
 
-	for (ii = 0; ii < spec->listeners; ii++) {
-		const struct cdx_mc_listener *listener = &spec->listener[ii];
+	for (ii = 0; ii < count; ii++) {
+		const struct cdx_mc_listener *listener =
+			spec->discard ? &discard : &spec->listener[ii];
 		struct cdx_mc_member_frame copy = frame;
 		uint8_t routed_pair[2 * ETH_ALEN];
 
@@ -1114,7 +1138,8 @@ static int cdx_mc_build_listeners(struct mcast_group_info *grp,
 			memcpy(pRtEntry->dstmac, mapped, ETH_ALEN);
 		}
 		tbl_entry = cdx_mc_listener_entry(pRtEntry, listener, &copy,
-						  tbl_entry, tbl_type);
+						  tbl_entry, tbl_type,
+						  discard_fqid);
 		if (!tbl_entry) {
 			/* Releases the entries built so far and clears their
 			 * slots. It also hands back the group id, so a caller
@@ -1127,7 +1152,7 @@ static int cdx_mc_build_listeners(struct mcast_group_info *grp,
 		grp->members[ii].bIsValidEntry = 1;
 		grp->members[ii].member_id = ii;
 		grp->members[ii].tbl_entry = tbl_entry;
-		strncpy(grp->members[ii].if_info, spec->listener[ii].dev->name,
+		strncpy(grp->members[ii].if_info, listener->dev->name,
 			IF_NAME_SIZE - 1);
 		grp->uiListenerCnt++;
 	}

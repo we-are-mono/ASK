@@ -225,13 +225,29 @@ static struct {
     uint32_t tbl_type;
     uint8_t header[2 * ETHER_ADDR_LEN];
     bool hop;
+    uint32_t discard_fqid;
+    /* By value: a discard's listener lives in the builder's frame. */
+    struct net_device *dev;
+    uint8_t vlans;
 } copies[MC_MAX_LISTENERS_PER_GROUP];
 static unsigned copies_built;
+
+/* The discard queue, or its creation failing. */
+#define DISCARD_FQID 0x7a1
+static bool discard_fails;
+static int cdx_discard_fqid(uint32_t *fqid)
+{
+    if (discard_fails)
+        return -EIO;
+    *fqid = DISCARD_FQID;
+    return 0;
+}
 
 static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
         const struct cdx_mc_listener *copy,
         const struct cdx_mc_member_frame *frame,
-        struct en_exthash_tbl_entry *prev, uint32_t tbl_type)
+        struct en_exthash_tbl_entry *prev, uint32_t tbl_type,
+        uint32_t discard_fqid)
 {
     struct ins_entry_info info;
     struct entry e;
@@ -266,6 +282,9 @@ static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
     memcpy(copies[at].header, header, sizeof(copies[at].header));
     copies[at].listener = copy;
     copies[at].tbl_type = tbl_type;
+    copies[at].discard_fqid = discard_fqid;
+    copies[at].dev = copy->dev;
+    copies[at].vlans = copy->vlans;
     return (struct en_exthash_tbl_entry *)&copies[at];
 }
 
@@ -685,6 +704,42 @@ int main(void)
         memcpy(spec.listener[0].src_mac, vif2, ETH_ALEN);
         assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
         assert(!freed);
+        for (unsigned i = 0; i < 3; i++)
+            assert(!copies[i].discard_fqid);
+
+        /* A discard: no listener, one member on the group's own ingress
+         * port, from the bridged table, writing back the pair the root
+         * matched -- the entry a bridged copy is -- and enqueueing to the
+         * discard queue. */
+        memset(spec.listener, 0, sizeof(spec.listener));
+        spec.listeners = 0;
+        spec.discard = true;
+        assert(cdx_mc_check(&spec) == 0);
+        assert(build(&grp, &spec) == 0 && copies_built == 1 && grp.uiListenerCnt == 1);
+        assert(copies[0].dev == &in && !copies[0].vlans);
+        assert(copies[0].discard_fqid == DISCARD_FQID && !copies[0].hop);
+        assert(copies[0].tbl_type == IPV4_BRIDGED_MULTICAST_TABLE);
+        assert(!memcmp(copies[0].header, arrived, ETH_ALEN));
+        assert(!memcmp(copies[0].header + ETH_ALEN, sender, ETH_ALEN));
+        assert(grp.members[0].bIsValidEntry && !grp.members[1].bIsValidEntry);
+        /* Listeners and a discard both, a routed discard, and a group with
+         * neither: refused. */
+        spec.listener[0] = copy_to(&out, 289, false, NULL);
+        spec.listeners = 1;
+        assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
+        spec.listeners = 0;
+        spec.bridged = false;
+        assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
+        spec.bridged = true;
+        spec.discard = false;
+        assert(cdx_mc_check(&spec) == -EOPNOTSUPP);
+        /* No discard queue: nothing built, the group left as a failed
+         * listener leaves it. */
+        spec.discard = true;
+        discard_fails = true;
+        assert(build(&grp, &spec) == -EIO && copies_built == 0);
+        assert(freed == 1 && grp.grpid == -1 && !grp.uiListenerCnt);
+        discard_fails = false;
     }
 
     printf("ok\n");

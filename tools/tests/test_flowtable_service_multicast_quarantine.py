@@ -170,8 +170,14 @@ async def withdrawal(r, learner, family):
         await learner.remove(target)
         # The count drops after the delete returns, and /proc reads under the
         # same transaction, so whatever the delete parked is visible by then.
-        parked = await r.settle(lambda s: s[installed] == before[installed] - 1,
-                                f"{target} withdrawn from hardware")
+        # A bridged group nobody wants any more is first swapped to a discard
+        # and deleted at the first refresh that counts nothing, up to two
+        # refreshes on, which is the delete that meets the barrier.
+        # This group's own row, not the total alone: the WAN segment's own
+        # multicast has flows whose entries come and go meanwhile.
+        parked = await r.settle(lambda s: learner.withdrawn(s, target) and
+                                s[installed] <= before[installed] - 1,
+                                f"{target} withdrawn from hardware", timeout=30)
         assert await remaining(r, DELETE_BARRIER) == "armed=0", "the delete never reached its barrier"
     assert learner.withdrawn(parked, target), summary(parked)
     # The classifier key and its one listener entry: unlinked, not freed.

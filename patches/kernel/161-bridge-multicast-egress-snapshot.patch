@@ -27,7 +27,10 @@ the ingress is never selected, an isolated ingress reaches no isolated
 port, a hairpin or locked ingress is refused, and the caller learns whether
 the bridge also hands the data up -- the host joined the group, the bridge
 is a multicast router for this family in the live context, nothing snoops
-and the data floods, or the bridge device is promiscuous. Without one the
+and the data floods, or the bridge device is promiscuous -- and whether the
+answer is snooping's at all, so an empty set the bridge drops data for can
+be told from one it returned because it could not say (bridge down, VID
+missing, ingress not forwarding). Without one the
 locally originated model is unchanged. Export the same context's group
 membership interval, so state learned from the traffic can age on the
 bridge's clock.
@@ -39,15 +42,15 @@ router re-reads the snapshot on its own schedule.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/linux/if_bridge.h |  26 ++++
- net/bridge/br_multicast.c | 260 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 286 insertions(+)
+ include/linux/if_bridge.h |  30 +++++
+ net/bridge/br_multicast.c | 262 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 292 insertions(+)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
-index c5fe3b2a53e8..67b9405a489d 100644
+index c5fe3b2a53e8..f8b2b2939627 100644
 --- a/include/linux/if_bridge.h
 +++ b/include/linux/if_bridge.h
-@@ -69,6 +69,13 @@ void brioctl_set(int (*hook)(struct net *net, unsigned int cmd,
+@@ -69,6 +69,17 @@ void brioctl_set(int (*hook)(struct net *net, unsigned int cmd,
  			     void __user *uarg));
  int br_ioctl_call(struct net *net, unsigned int cmd, void __user *uarg);
  
@@ -57,11 +60,15 @@ index c5fe3b2a53e8..67b9405a489d 100644
 +#define BR_MCAST_TO_HOST_ROUTER	(1U << 1)	/* the bridge is a multicast router */
 +#define BR_MCAST_TO_HOST_FLOOD	(1U << 2)	/* no snooping or querier: flooded */
 +#define BR_MCAST_TO_HOST_PROMISC (1U << 3)	/* the bridge device is promiscuous */
++/* Not a reason: the answer is the snooping one -- the ingress forwards in the
++ * VID, the bridge is up and snooping with a querier -- so a port set left
++ * empty means the bridge drops the data, not that it could not say. */
++#define BR_MCAST_SNOOPED	(1U << 4)
 +
  #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_BRIDGE_IGMP_SNOOPING)
  int br_multicast_list_adjacent(struct net_device *dev,
  			       struct list_head *br_ip_list);
-@@ -77,6 +84,11 @@ bool br_multicast_has_querier_adjacent(struct net_device *dev, int proto);
+@@ -77,6 +88,11 @@ bool br_multicast_has_querier_adjacent(struct net_device *dev, int proto);
  bool br_multicast_has_router_adjacent(struct net_device *dev, int proto);
  bool br_multicast_enabled(const struct net_device *dev);
  bool br_multicast_router(const struct net_device *dev);
@@ -73,7 +80,7 @@ index c5fe3b2a53e8..67b9405a489d 100644
  #else
  static inline int br_multicast_list_adjacent(struct net_device *dev,
  					     struct list_head *br_ip_list)
-@@ -104,6 +116,20 @@ static inline bool br_multicast_enabled(const struct net_device *dev)
+@@ -104,6 +120,20 @@ static inline bool br_multicast_enabled(const struct net_device *dev)
  {
  	return false;
  }
@@ -95,10 +102,10 @@ index c5fe3b2a53e8..67b9405a489d 100644
  {
  	return false;
 diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
-index d43b39ed61c7..fa0b639f97d5 100644
+index d43b39ed61c7..1c0213c1e6b3 100644
 --- a/net/bridge/br_multicast.c
 +++ b/net/bridge/br_multicast.c
-@@ -5071,6 +5071,266 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
+@@ -5071,6 +5071,268 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
  }
  EXPORT_SYMBOL_GPL(br_multicast_has_router_adjacent);
  
@@ -228,6 +235,8 @@ index d43b39ed61c7..fa0b639f97d5 100644
 +		break;
 +	}
 +	if (local) {
++		if (snoop)
++			*local |= BR_MCAST_SNOOPED;
 +		if (!snoop)
 +			*local |= BR_MCAST_TO_HOST_FLOOD;
 +		if (snoop && mdb && mdb->host_joined)

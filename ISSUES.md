@@ -178,15 +178,24 @@ result independently of those temporary files.
   multicast, then install a hardware group and make the same change with no nft/MFC change;
   require zero unauthorized cleartext on every egress. IPv4/IPv6, normal + bridge/VLAN oifs.
 
-- [ ] **A291 — FMan enqueues QMan rejects leak their buffers.** No DCP ERN handler is
-  registered (`qman_set_dc_ern` is never called), so a frame FMan enqueues to an FQ that
-  rejects it -- out of service, or retired -- ends in QMan's "Leaking DCP ERNs!" path and its
-  BMan buffer is never returned. Known trigger: a classifier key left linked after an
-  unproven delete (IPsec SA, multicast group) keeps enqueueing to the deleted SA's queues
-  until the terminal latch stops the ports, milliseconds normally, unbounded while RTNL stays
-  contended. Any other rejected FMan enqueue leaks the same way. Fix: register a DC ERN
-  handler that releases the frame's buffer to its pool and counts it. Regression: enqueue
-  to an out-of-service FQ from FMan (OH port) and require the pool's free count to recover.
+- [x] **A291 — FMan enqueues QMan rejects were thought to leak buffers.** Not a bug: FMan portals
+  run ED=1, so QMan discards and frees them itself; 1e6 discards left every pool at its count (_:/^cdx: drop a bridged multicast stream nobody wants_).
+
+- [ ] **A292 — a discarding multicast entry has no bound.** A bridged stream nobody wants is
+  dropped in hardware until it stops (`ft_mc_discardable()`, `cdx/ask_flowtable.c`); one that
+  never stops -- a static upstream, a misbehaving sender -- keeps its classifier key and group
+  id (512 per family) for good, and enough of them starve replicating adds, which fail
+  `-ENOSPC` and end `refused-failed`. Fix: evict a discard when an add fails for room, or cap
+  discards per bridge. Regression: fill the id space with discards, then join a listener and
+  require it installed.
+
+- [ ] **A293 — patch 161 needs a to-host reason on the next kernel rebase.** Upstream
+  `a496d2f0fd61` (after 6.12; in 6.18) hands every multicast frame up to the host when the
+  bridge has `IFF_ALLMULTI`, which ipmr sets on each VIF device. `br_multicast_list_ports()`
+  models 6.12.103, which does not; rebased as is it would report `BR_MCAST_SNOOPED` alone for
+  such a bridge and the bridged learner would discard frames ipmr routes. Fix at rebase: a
+  `BR_MCAST_TO_HOST_*` reason for `IFF_ALLMULTI` in patch 161. Regression: a VIF on the bridge,
+  last bridged listener gone, require the routed copy still delivered.
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**

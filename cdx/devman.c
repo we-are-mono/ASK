@@ -53,6 +53,7 @@
 #include "control_tx.h"
 #include "procfs.h"
 #include "cdx_flowtable_hw.h"
+#include "cdx_flowtable_backend.h"
 
 //#define DEVMAN_DEBUG	1
 
@@ -1696,6 +1697,63 @@ void cdx_destroy_fq(struct qman_fq *fq)
 	synchronize_net();
 	cdx_remove_fqid_info_in_procfs(fq->fqid);
 	qman_destroy_fq(fq, 0);
+}
+
+/* The queue a classifier entry enqueues to when what it matched is to be
+ * dropped in hardware rather than reach the CPU.
+ *
+ * Parked, so nothing ever dequeues it, and tail-dropping at zero bytes, so
+ * QMan rejects every enqueue once it holds a frame. An FMan enqueue it rejects
+ * is discarded by QMan with no ERN, both FMan portals being set up that way at
+ * boot (qman_config.c) -- the path a CEETM class's tail drop takes. A parked
+ * queue raises no error on an enqueue, where one out of service would. At most
+ * the one frame is held, and its buffers go back to their pool when the queue
+ * is torn down, by the drain callback every forwarding queue here uses.
+ *
+ * Created on first use, under the control lock, so a box that never drops a
+ * stream this way never allocates it. */
+static struct qman_fq cdx_discard_fq;
+static bool cdx_discard_ready;
+
+int cdx_discard_fqid(uint32_t *fqid)
+{
+	struct qman_fq *fq = &cdx_discard_fq;
+	struct qm_mcc_initfq opts;
+
+	cdx_ft_assert_held();
+	if (!cdx_discard_ready) {
+		memset(fq, 0, sizeof(*fq));
+		fq->cb.dqrr = fwd_tx_drain_dqrr;
+		if (qman_create_fq(0, QMAN_FQ_FLAG_DYNAMIC_FQID, fq))
+			return -ENOMEM;
+		memset(&opts, 0, sizeof(opts));
+		opts.fqid = fq->fqid;
+		opts.count = 1;
+		opts.we_mask = QM_INITFQ_WE_FQCTRL | QM_INITFQ_WE_TDTHRESH;
+		opts.fqd.fq_ctrl = QM_FQCTRL_TDE;
+		qm_fqd_taildrop_set(&opts.fqd.td, 0, 0);
+		/* No QMAN_INITFQ_FLAG_SCHED: parked. */
+		if (qman_init_fq(fq, 0, &opts)) {
+			DPA_ERROR("%s::qman_init_fq failed for fqid %u\n",
+				  __func__, fq->fqid);
+			qman_destroy_fq(fq, 0);
+			return -EIO;
+		}
+		cdx_discard_ready = true;
+	}
+	*fqid = fq->fqid;
+	return 0;
+}
+
+/* Unload only, once the ports are stopped and before the pools a held frame
+ * came from are released. The adapter that built the entries naming the queue
+ * pins CDX, so they went with it. */
+void cdx_discard_exit(void)
+{
+	if (!cdx_discard_ready)
+		return;
+	cdx_destroy_fq(&cdx_discard_fq);
+	cdx_discard_ready = false;
 }
 
 void cdx_drain_fq_list(struct dpa_fq *head)
