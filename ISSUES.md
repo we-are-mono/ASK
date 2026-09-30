@@ -264,14 +264,18 @@ file's git history.
   fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
 
 - [ ] **A280 / A287.** With shared offline-port classification a decrypted flow's entry keys on
-  the port id and inner 5-tuple alone, so a second offloaded SA that encrypts (A280) or matches
-  (A287) that tuple can have SEC's output forwarded as the flow's, or make the gateway emit a
-  frame a peer forged toward a third party (inherited from NXP). Per-SA classification isolated
-  this but folded the SA's FQID into the KeyGen key, stranding an offline-port task on a miss
-  (A276) and perturbing the fragmenter (oversized-ESP ICV), so it was reverted to match
-  CMM/CDX-5.03.1, which never isolated cross-SA. Accepted while VPN deployments use distinct
-  inner subnets; revisit if overlapping-inner-subnet SAs are required
-  (_:/^cdx: revert per-SA offline-port classification_).
+  the port id and inner 5-tuple alone, so a hardware forwarding hit does not prove which SA
+  decrypted the packet. A second authenticated peer can forge the first peer's inner tuple under
+  its own SA: SEC decrypts it, the shared entry forwards it, and the software secpath/policy check
+  the hardware path skips never runs -- reaching a peer's inbound flow (A280) or an outbound
+  ESP/NAT-T root (A287). Distinct inner subnets do NOT close it: the attacker chooses the forged
+  tuple. The exposure needs a second malicious authenticated peer with per-peer policy
+  differentiation; a single-peer or uniform-policy VPN is unaffected, and it matches how
+  CMM/CDX-5.03.1 shipped. Per-SA classification isolated this but folded the SA's FQID into the
+  KeyGen key, stranding an offline-port task on a miss (A276) and perturbing the fragmenter
+  (oversized-ESP ICV), so it was reverted. Accepted for now; a hardware-preserving fix candidate
+  (a SEC-stamped source-MAC identity extracted as an ordinary Ethernet field) is researched in
+  `docs/flowtable/ipsec-sa-provenance.md` (_:/^cdx: revert per-SA offline-port classification_).
 
 - [x] **A288.** `ft_ipsec_paired_inbound()` chose a decrypted flow's inbound SA by address (the most recent), so a rekey with non-overlapping selectors bound the entry to an SA the peer does not use and left the flow in software —
   fixed (_:/^cdx: choose a decrypted flow's inbound SA by its selector_).
