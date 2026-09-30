@@ -339,6 +339,7 @@ struct cdx_police_filter {
 	u8			family;		/* AF_INET or AF_INET6 */
 	u8			proto;
 	bool			proto_masked;
+	bool			is_pipe;	/* conform continues (pipe) vs accept */
 	union nf_inet_addr	src, src_mask, dst, dst_mask;
 	__be16			sport, sport_mask, dport, dport_mask;
 	struct cdx_police_counters base;
@@ -395,6 +396,35 @@ static bool cdx_police_filter_matches(const struct cdx_police_filter *f,
 		return false;
 	return cdx_police_addr_eq(&rule->src, &f->src, &f->src_mask) &&
 	       cdx_police_addr_eq(&rule->dst, &f->dst, &f->dst_mask);
+}
+
+/* Two filters overlap if some flow could match both: same port and family, and
+ * for every field the two constraints agree wherever both mask it in. Lookup
+ * picks a single profile, so two overlapping filters cannot both meter a flow
+ * in hardware -- which is why a `pipe` conform, that in software would continue
+ * from the first into the second, has no hardware form when they overlap. */
+static bool cdx_police_overlap(const struct cdx_police_filter *a,
+			       const struct cdx_police_filter *b)
+{
+	int i;
+
+	if (a->dev != b->dev || a->family != b->family)
+		return false;
+	if (a->proto_masked && b->proto_masked && a->proto != b->proto)
+		return false;
+	if ((a->sport ^ b->sport) & a->sport_mask & b->sport_mask)
+		return false;
+	if ((a->dport ^ b->dport) & a->dport_mask & b->dport_mask)
+		return false;
+	for (i = 0; i < 4; i++) {
+		if ((a->src.all[i] ^ b->src.all[i]) &
+		    a->src_mask.all[i] & b->src_mask.all[i])
+			return false;
+		if ((a->dst.all[i] ^ b->dst.all[i]) &
+		    a->dst_mask.all[i] & b->dst_mask.all[i])
+			return false;
+	}
+	return true;
 }
 
 /* The profile an admitted flow should meter against, as a cdx_ft_rule.qos
@@ -534,6 +564,14 @@ static int cdx_police_flower_replace(struct net_device *dev,
 	bool byte_mode;
 	int profile, rc;
 
+	/* A filter in a non-zero chain is only reached by a `goto chain` from
+	 * chain 0. The offload binds by tuple lookup and cannot see that jump, so
+	 * it would apply the meter to flows software never routes there. Decline
+	 * it, as the flowtable admission path does. */
+	if (f->common.chain_index) {
+		NL_SET_ERR_MSG_MOD(extack, "flower: only chain 0 is supported");
+		return -EOPNOTSUPP;
+	}
 	if (!flow_offload_has_one_action(&rule->action)) {
 		NL_SET_ERR_MSG_MOD(extack, "flower: exactly one action is supported");
 		return -EOPNOTSUPP;
@@ -563,11 +601,33 @@ static int cdx_police_flower_replace(struct net_device *dev,
 	filter->dev = dev;
 	filter->cookie = f->cookie;
 	filter->prio = f->common.prio;
+	filter->is_pipe = act->police.notexceed.act_id == FLOW_ACTION_PIPE;
 	rc = cdx_police_parse(f, filter);
 	if (rc)
 		goto err_free;
 
 	spin_lock_irqsave(&cdx_police_lock, flags);
+	/* A pipe conform means "meter here and continue", which composes with any
+	 * filter that overlaps it. Lookup applies one profile, so that composition
+	 * cannot be represented: decline the offload and leave both to software TC,
+	 * which evaluates the chain whole, rather than metering one and claiming
+	 * the rest ran. A filter's own replacement (same cookie) is not a conflict. */
+	{
+		const struct cdx_police_filter *e;
+
+		list_for_each_entry(e, &cdx_police_filters, list) {
+			if (e->dev == dev && e->cookie == f->cookie)
+				continue;
+			if ((filter->is_pipe || e->is_pipe) &&
+			    cdx_police_overlap(filter, e)) {
+				spin_unlock_irqrestore(&cdx_police_lock, flags);
+				NL_SET_ERR_MSG_MOD(extack,
+					"flower: a pipe policer overlaps another filter and cannot compose in hardware");
+				rc = -EOPNOTSUPP;
+				goto err_free;
+			}
+		}
+	}
 	profile = cdx_police_profile_get();
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 	if (profile < 0) {

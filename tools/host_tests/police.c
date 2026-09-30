@@ -493,6 +493,27 @@ int main(void)
     assert(cdx_police_lookup(&flow) == hipri);             /* winner survives */
     assert(flower_del(&dev, 11) == 0 && cdx_police_lookup(&flow) == 0);
 
+    /* A filter in a non-zero chain is only reached by a goto software makes;
+     * the tuple-bound offload cannot see it, so it is declined. */
+    fr = flower_rule();
+    assert(flower_add_prio(&dev, 20, &fr, 0, 1) == -EOPNOTSUPP);
+
+    /* A pipe conform composes with any overlapping filter, which one profile
+     * cannot represent. A lone pipe is fine; a second overlapping filter --
+     * either order -- is declined, but a disjoint one is not. */
+    fr = flower_rule(); fr.action.entries[0].police.notexceed.act_id = FLOW_ACTION_PIPE;
+    assert(flower_add(&dev, 21, &fr) == 0);                /* lone pipe: accepted */
+    fr = flower_rule();
+    assert(flower_add(&dev, 22, &fr) == -EOPNOTSUPP);      /* overlapping accept: declined */
+    fr = flower_rule(); fr.ports.dst = 9999; fr.action.entries[0].police.notexceed.act_id = FLOW_ACTION_PIPE;
+    assert(flower_add(&dev, 23, &fr) == 0);                /* disjoint pipe: accepted */
+    assert(flower_del(&dev, 21) == 0 && flower_del(&dev, 23) == 0);
+    fr = flower_rule();
+    assert(flower_add(&dev, 24, &fr) == 0);                /* accept first */
+    fr = flower_rule(); fr.action.entries[0].police.notexceed.act_id = FLOW_ACTION_PIPE;
+    assert(flower_add(&dev, 25, &fr) == -EOPNOTSUPP);      /* overlapping pipe: declined */
+    assert(flower_del(&dev, 24) == 0);
+
     /* A prefix is what per-subscriber policing is made of: mask off the host
      * bits and every address in the subnet meets the same meter. */
     fr = flower_rule();

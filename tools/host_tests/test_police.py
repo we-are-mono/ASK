@@ -40,6 +40,7 @@ def test_police_offload(tmp_path):
              "cdx_police_port_stats", "cdx_police_matchall",
              "cdx_police_profile_get", "cdx_police_profile_put",
              "cdx_police_addr_eq", "cdx_police_filter_matches",
+             "cdx_police_overlap",
              "cdx_police_lookup", "cdx_police_filter_find", "cdx_police_parse",
              "cdx_police_flower_replace", "cdx_police_flower_destroy",
              "cdx_police_flower_stats", "cdx_police_flower"]
