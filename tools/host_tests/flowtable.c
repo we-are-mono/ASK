@@ -467,6 +467,8 @@ static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
     return NOTIFY_DONE;
 }
 static void ft_mr_kick(void) { mroute_kicks++; }
+/* XFRM policy changes the routed learner was kicked for. */
+static atomic64_t ft_mr_xfrm_changes;
 static void ft_mr_device_gone(struct net_device *dev)
 {
     (void)dev;
@@ -6031,10 +6033,15 @@ static void test_ipsec_generation_retirement(void)
         cls.nf_xfrm_genid = xfrm_genid;
         assert(ft_replace(&binding, &cls) == 0);
         struct net foreign = {0};
+        unsigned kicks = mroute_kicks;
+        u64 changes = ft_mr_xfrm_changes;
         ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &foreign);
-        assert(!handle.invalid);
+        assert(!handle.invalid && mroute_kicks == kicks && ft_mr_xfrm_changes == changes);
         ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &init_net);
         assert(handle.invalid && ft_count == 1);
+        /* And every routed group is asked again: an output policy can
+         * govern a multicast copy, which nothing else would report. */
+        assert(mroute_kicks == kicks + 1 && ft_mr_xfrm_changes == changes + 1);
         ft_retire_workfn(NULL);
         assert(!ft_count && !live_hw && !allocated && !ft_handle_refs && !ft_neighbour_refs);
     }

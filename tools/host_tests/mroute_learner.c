@@ -193,7 +193,18 @@ static bool ether_addr_equal(const u8 *a, const u8 *b)
 
 #define NETREG_REGISTERED 1
 #define NETREG_UNREGISTERING 2
-struct net { int unused; };
+#define XFRM_POLICY_OUT 1
+#define XFRM_POLICY_MAX 3
+#define XFRM_USERPOLICY_BLOCK 1
+#define XFRM_USERPOLICY_ACCEPT 2
+/* The two numbers the XFRM check's fast path reads: output policies by
+ * direction, and what a lookup meeting none of them answers. */
+struct net {
+    struct {
+        unsigned int policy_count[XFRM_POLICY_MAX * 2];
+        u8 policy_default[XFRM_POLICY_MAX];
+    } xfrm;
+};
 static struct net init_net, other_net;
 __attribute__((unused))
 static struct net *dev_net(const struct net_device *d) { return d->nd_net; }
@@ -453,6 +464,60 @@ __attribute__((unused)) static unsigned int ft_mr_installed;
 __attribute__((unused)) static u64 ft_mr_refused;
 __attribute__((unused)) static u64 ft_mr_install_errors;
 
+/* --- the output route and policy an IPv4 copy meets ------------------- */
+#define DST_NOXFRM 0x0002
+#define IPPROTO_IPIP 4
+#define ENETUNREACH 101
+#define ERR_PTR(e) ((void *)(long)(e))
+#define IS_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095)
+struct flowi4 { u32 daddr; u8 flowi4_proto; int flowi4_oif; };
+struct flowi { struct flowi4 ip4; };
+struct dst_entry { struct net_device *dev; unsigned short flags; };
+struct rtable { struct dst_entry dst; };
+static struct flowi *flowi4_to_flowi(struct flowi4 *fl4) { return (struct flowi *)fl4; }
+
+static struct net_device *dev_by_index(int ifindex);
+/* How the route answers: through the oif it names unless `route_via` says
+ * otherwise, marked DST_NOXFRM through `route_noxfrm`, or not at all. */
+static struct rtable route;
+static struct net_device *route_via, *route_noxfrm;
+static bool route_fails;
+static unsigned route_lookups, route_held;
+static struct rtable *__ip_route_output_key(struct net *net, struct flowi4 *fl4)
+{
+    /* The lookup ipmr_queue_xmit() makes: to the group, IPIP, no ports. */
+    assert(net == &init_net && fl4->flowi4_proto == IPPROTO_IPIP && fl4->daddr);
+    route_lookups++;
+    if (route_fails)
+        return ERR_PTR(-ENETUNREACH);
+    route.dst.dev = route_via ? route_via : dev_by_index(fl4->flowi4_oif);
+    route.dst.flags = route.dst.dev == route_noxfrm ? DST_NOXFRM : 0;
+    route_held++;
+    return &route;
+}
+static void ip_rt_put(struct rtable *rt) { assert(rt == &route && route_held--); }
+
+/* The output policy, as patch 140 answers it: one device's flows meet a
+ * blocking or bundling policy, another's an allowing one with no template,
+ * and a flow no policy matches meets the default. The generation moves with
+ * every policy change. */
+static int xfrm_governed, xfrm_allowed;
+static unsigned policy_asks;
+static u64 xfrm_genid = 1;
+static bool xfrm_flowtable_out_plain(struct net *net, const struct flowi *fl, u16 family)
+{
+    /* Asked of the flow the route rewrote, with the route put back. */
+    assert(net == &init_net && family == AF_INET && !route_held);
+    assert(fl->ip4.flowi4_oif == route.dst.dev->ifindex);
+    policy_asks++;
+    if (fl->ip4.flowi4_oif == xfrm_governed)
+        return false;
+    if (fl->ip4.flowi4_oif == xfrm_allowed)
+        return true;
+    return net->xfrm.policy_default[XFRM_POLICY_OUT] != XFRM_USERPOLICY_BLOCK;
+}
+static u64 xfrm_flowtable_genid(struct net *net) { return xfrm_genid; }
+
 /* The VIF table is declared inside the generated include, between the struct
  * it is an array of and the functions that read it. */
 #include "mroute_learner.inc"
@@ -463,6 +528,18 @@ static struct net_device WAN, LAN, LAN2, LAN3, SOFT, PPP, BR, VWAN, VLAN_LAN,
 	QINQ;
 static struct mfc_cache MFC;
 static struct mfc6_cache MFC6;
+
+static struct net_device *dev_by_index(int ifindex)
+{
+    struct net_device *all[] = { &WAN, &LAN, &LAN2, &LAN3, &SOFT, &PPP, &BR,
+                                 &VWAN, &VLAN_LAN, &QINQ };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(all); i++)
+        if (all[i]->ifindex == ifindex)
+            return all[i];
+    assert(!"no such device");
+    return NULL;
+}
 
 static void dev_init(struct net_device *d, const char *name, int ifindex)
 {
@@ -615,6 +692,14 @@ static void reset(void)
     memset(ft_mr_vif, 0, sizeof(ft_mr_vif));
     memset(ft_mr_policy, 0, sizeof(ft_mr_policy));
     ft_mc_enabled = true;
+    /* No policy, and the defaults a namespace starts with. */
+    memset(&init_net.xfrm, 0, sizeof(init_net.xfrm));
+    for (unsigned i = 0; i < XFRM_POLICY_MAX; i++)
+        init_net.xfrm.policy_default[i] = XFRM_USERPOLICY_ACCEPT;
+    route_via = route_noxfrm = NULL;
+    route_fails = false;
+    xfrm_governed = xfrm_allowed = 0;
+    assert(route_held == 0);
     memset(memberships, 0, sizeof(memberships));
     membership_count = 0;
     vlan_enabled = false;
@@ -784,6 +869,90 @@ int main(void)
     /* And it is per family: an IPv6 rule does not refuse IPv4. */
     ft_mr_policy[ft_mr_idx(AF_INET6)] = 1;
     assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    free(g);
+
+    /* ---- the XFRM output policy ------------------------------------- */
+
+    reset();
+    g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+    vif_set(AF_INET, 0, &WAN, 0);
+    vif_set(AF_INET, 1, &LAN, 0);
+    vif_set(AF_INET, 2, &LAN2, 0);
+    oif(g, 1, 1);
+    oif(g, 2, 1);
+    /* No output policy under an accepting default: nothing is routed, and
+     * the plan carries the generation the answer was given under. */
+    xfrm_governed = LAN.ifindex;
+    route_lookups = policy_asks = 0;
+    xfrm_genid = 7;
+    assert(derive(g, &plan) == FT_MR_PENDING && plan.xfrm_genid == 7);
+    assert(!route_lookups && !policy_asks);
+    ft_mr_plan_put(&plan);
+    /* A policy anywhere: every oif's copy is routed as ipmr routes it, and
+     * one governed oif keeps the whole group in software. Its oifs are
+     * still named for the confirmations. */
+    init_net.xfrm.policy_count[XFRM_POLICY_OUT] = 1;
+    assert(refuse(g) == FT_MR_REFUSED_XFRM && route_lookups && !route_held);
+    assert(derive(g, &plan) == FT_MR_REFUSED_XFRM && plan.oifs_known && plan.oif_count == 2);
+    xfrm_governed = SOFT.ifindex;
+    route_lookups = policy_asks = 0;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(route_lookups == 2 && policy_asks == 2);
+    ft_mr_plan_put(&plan);
+    /* The policy is asked of the device the route chose, as
+     * ip_route_output_flow() rewrites the flow's oif. */
+    route_via = &SOFT;
+    assert(refuse(g) == FT_MR_REFUSED_XFRM);
+    route_via = NULL;
+    /* A route through a disable_xfrm device skips the policies and meets
+     * only the default. */
+    xfrm_governed = LAN.ifindex;
+    route_noxfrm = &LAN;
+    policy_asks = 0;
+    assert(derive(g, &plan) == FT_MR_PENDING && policy_asks == 1);
+    ft_mr_plan_put(&plan);
+    /* The other oif allowed by a policy of its own, so only the bypassed
+     * one's default can refuse. */
+    xfrm_allowed = LAN2.ifindex;
+    init_net.xfrm.policy_default[XFRM_POLICY_OUT] = XFRM_USERPOLICY_BLOCK;
+    policy_asks = 0;
+    assert(refuse(g) == FT_MR_REFUSED_XFRM && policy_asks == 0);
+    route_noxfrm = NULL;
+    /* A blocking default alone takes the slow path too: a copy no policy
+     * allows meets it. */
+    xfrm_governed = 0;
+    init_net.xfrm.policy_count[XFRM_POLICY_OUT] = 0;
+    policy_asks = 0;
+    assert(refuse(g) == FT_MR_REFUSED_XFRM && policy_asks);
+    /* A copy with no route is one Linux never sends. */
+    init_net.xfrm.policy_default[XFRM_POLICY_OUT] = XFRM_USERPOLICY_ACCEPT;
+    init_net.xfrm.policy_count[XFRM_POLICY_OUT] = 1;
+    route_fails = true;
+    assert(refuse(g) == FT_MR_REFUSED_XFRM && !route_held);
+    route_fails = false;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    /* Asked last: a group the rest of the contract refuses keeps its own
+     * word under any policy -- here an IPIP oif. */
+    xfrm_governed = LAN.ifindex;
+    init_net.xfrm.policy_count[XFRM_POLICY_OUT] = 1;
+    vif_set(AF_INET, 2, &LAN2, VIFF_TUNNEL);
+    route_lookups = 0;
+    assert(refuse(g) == FT_MR_REFUSED_LISTENER && !route_lookups);
+    free(g);
+    /* IPv6: ip6mr's output route takes no XFRM step, so no policy governs
+     * a copy either way, and none is asked. */
+    reset();
+    g = group6(&MFC6, ip6(0xfc00, 0x99), ip6(0xff1e, 0x05), 0);
+    vif_set(AF_INET6, 0, &WAN, 0);
+    vif_set(AF_INET6, 1, &LAN, 0);
+    oif(g, 1, 1);
+    init_net.xfrm.policy_count[XFRM_POLICY_OUT] = 1;
+    init_net.xfrm.policy_default[XFRM_POLICY_OUT] = XFRM_USERPOLICY_BLOCK;
+    xfrm_governed = LAN.ifindex;
+    route_lookups = policy_asks = 0;
+    assert(derive(g, &plan) == FT_MR_PENDING && !route_lookups && !policy_asks);
     ft_mr_plan_put(&plan);
     free(g);
 
@@ -1829,7 +1998,8 @@ int main(void)
             FT_MR_REFUSED_POLICY, FT_MR_REFUSED_WILDCARD,
             FT_MR_REFUSED_SCOPE, FT_MR_REFUSED_INGRESS, FT_MR_REFUSED_HOST,
             FT_MR_REFUSED_THRESHOLD, FT_MR_REFUSED_LISTENER,
-            FT_MR_REFUSED_MTU, FT_MR_REFUSED_FILTER, FT_MR_REFUSED_CONTESTED,
+            FT_MR_REFUSED_MTU, FT_MR_REFUSED_XFRM, FT_MR_REFUSED_FILTER,
+            FT_MR_REFUSED_CONTESTED,
             FT_MR_REFUSED_FAILED, FT_MR_REFUSED_RESYNC,
         };
 

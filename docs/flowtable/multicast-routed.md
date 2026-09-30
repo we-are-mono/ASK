@@ -290,6 +290,37 @@ one the filter would not deliver costs only the offload. Neither check is
 exported, so the learner walks `__in_dev_get_rcu(dev)->mc_list` and
 `__in6_dev_get(dev)->mc_list` under RCU.
 
+**XFRM policy.** The derivation's last test, asked of oifs every other test
+has let through. ipmr
+routes each IPv4 copy with an output lookup of its own, and that lookup's XFRM
+step applies the output policy. The lookup goes to the group, with the source
+chosen by the route, `IPPROTO_IPIP`, ports zero, through the VIF's device. A
+block drops the copy. A template bundles it into a transform, or drops it when
+there is no state. A hardware copy takes no route, so the derivation rebuilds
+that lookup for every oif and asks the output policy of it
+(`xfrm_flowtable_out_plain()`, patch 140). Two answers leave the group
+eligible:
+
+- no policy, under an accepting default;
+- an allowing policy with no template.
+
+Anything else keeps the group in software as `refused-xfrm`, and so does a copy
+with no route at all.
+
+- **`disable_xfrm`:** a route through a device with this set skips the
+  policies and meets only the default, as `xfrm_lookup_with_ifid()` does.
+- **The generation:** it is taken with the answer and checked again inside the
+  transaction that installs or replaces the group's entry. An unchanged
+  installed group, or one routed through a bridge, has no such transaction, so
+  it takes the next pass, which the policy change itself queued.
+- **Unevented changes:** an oif's address, which a policy's source selector may
+  match, and its `disable_xfrm` switch raise no XFRM event. The five-second
+  refresh finds them.
+
+IPv6 needs nothing. ip6mr's output lookup takes no XFRM step, and neither does
+a bridge, so an ip6 policy governs no forwarded copy in software and none in
+hardware alike.
+
 **The key.** A routed root is keyed on its port and address pair, and the key
 names no VLAN. Two MFC entries for one `(S,G)` whose parents are two VLANs of
 one port — `eth4` and `eth4.10` — are one classifier entry whose root can
@@ -641,6 +672,7 @@ family over:
 | Its parent or thresholds | `FIB_EVENT_ENTRY_REPLACE` | re-derived; a changed ingress is a delete and an add, because the port is part of the key and `cdx_mc_group_replace()` refuses a changed one |
 | A VIF added or removed | `FIB_EVENT_VIF_*` | every group of that family re-derived: an index only means anything against the table it indexes |
 | A policy rule | `FIB_EVENT_RULE_*` | the family's count moves and every group re-derived |
+| An XFRM policy or default added, changed, expired or flushed | `NETEVENT_XFRM_POLICY_UPDATE` (patch 140) | every group re-derived and `mroute_xfrm_changes` counted; an IPv4 group whose copy an output policy governs goes to software as `refused-xfrm`, and one the transaction finds judged under an older generation waits for the next pass |
 | The multicast switch flipped (the service stopping, disabled, or enabled again) | the `multicast` parameter's setter, which wakes both learners | every group re-derived: off, each is `refused-paused` and out of hardware -- rechecked inside the transaction, so a stop that read nothing installed sees nothing added after -- with its watch still armed; on, each is carried again as its contract allows |
 | A port down or unregistering | the netdev chain, beside `ft_mc_device_gone()` | the group's references on it released synchronously and the group re-derived. A port the group copies out of takes only the copies half of the set with it — the listeners and the recorded spec that borrows them — and the ingress stays, so when what is left can still be carried the re-derivation swaps the chain under the same root rather than reading a released ingress as a new key. That is a port that went away with its VIF. One that is only down, or has lost carrier, is still an oif ipmr forwards to and still a listener of the set, and a set with a port that cannot carry is refused whole (`cdx_mc_port_supported()`): the group leaves hardware and is tried again at each refresh up to the retry ceiling, and whenever a port comes back up. The ingress's own port releases the whole set; the installed entry keeps its own hold on the ingress until the worker deletes it, because the backend deletes through that device, so unregistration waits only for the worker it scheduled |
 | A port coming back up | the netdev chain | re-derived; nothing else would ever reconsider a refused group, because the MFC entry does not change and no frame re-offers it |
@@ -751,6 +783,7 @@ mroute_refused 1
 mroute_install_errors 0
 mroute_policy_rules 0
 mroute_lost 0
+mroute_xfrm_changes 0
 mroute_ruleset_changes 3
 mroute_ruleset_settled 1
 mroute_confirm_errors 0

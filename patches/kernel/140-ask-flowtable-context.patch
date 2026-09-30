@@ -1,4 +1,4 @@
-From 679de5b1f43a2e7acb14b8a63fa586abb4b7bf68 Mon Sep 17 00:00:00 2001
+From 1c01ce06a28513f8cc39a32f18dee6d1ceba1d49 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
@@ -12,7 +12,7 @@ Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
  include/net/netevent.h                |  31 +++++++
  include/net/netfilter/nf_flow_table.h |  49 +++++++++++
  include/net/netns/xfrm.h              |   2 +
- include/net/xfrm.h                    |  83 ++++++++++++++++---
+ include/net/xfrm.h                    |  90 +++++++++++++++++---
  net/ipv4/fib_trie.c                   |  20 +++++
  net/ipv4/route.c                      |   3 +-
  net/ipv6/ip6_fib.c                    |  23 ++++++
@@ -21,13 +21,13 @@ Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
  net/netfilter/nf_flow_table_offload.c | 113 +++++++++++++++++++++++++-
  net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++++++----
  net/xfrm/xfrm_device.c                |  29 +++++--
- net/xfrm/xfrm_policy.c                |  77 +++++++++++++++++-
+ net/xfrm/xfrm_policy.c                | 104 +++++++++++++++++++++++-
  net/xfrm/xfrm_state.c                 |  25 ++++--
  net/xfrm/xfrm_user.c                  |   6 ++
- 19 files changed, 704 insertions(+), 77 deletions(-)
+ 19 files changed, 738 insertions(+), 77 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
-index 2919329..a6780e8 100644
+index 2919329a8c20..a6780e8dca2d 100644
 --- a/drivers/net/bonding/bond_main.c
 +++ b/drivers/net/bonding/bond_main.c
 @@ -425,6 +425,18 @@ static int bond_vlan_rx_kill_vid(struct net_device *bond_dev,
@@ -78,7 +78,7 @@ index 2919329..a6780e8 100644
  	if (!err) {
  		xs->xso.real_dev = real_dev;
  		ipsec->xs = xs;
-@@ -522,6 +536,7 @@ out:
+@@ -522,6 +536,7 @@ static int bond_ipsec_add_sa(struct xfrm_state *xs,
  
  static void bond_ipsec_add_sa_all(struct bonding *bond)
  {
@@ -107,7 +107,7 @@ index 2919329..a6780e8 100644
  			slave_warn(bond_dev, real_dev, "%s: failed to add SA\n", __func__);
  			continue;
  		}
-@@ -564,6 +580,7 @@ out:
+@@ -564,6 +580,7 @@ static void bond_ipsec_add_sa_all(struct bonding *bond)
   **/
  static void bond_ipsec_del_sa(struct xfrm_state *xs)
  {
@@ -134,7 +134,7 @@ index 2919329..a6780e8 100644
  out:
  	netdev_put(real_dev, &tracker);
  	mutex_lock(&bond->ipsec_lock);
-@@ -612,6 +630,7 @@ out:
+@@ -612,6 +630,7 @@ static void bond_ipsec_del_sa(struct xfrm_state *xs)
  
  static void bond_ipsec_del_sa_all(struct bonding *bond)
  {
@@ -188,7 +188,7 @@ index 2919329..a6780e8 100644
  out:
  	netdev_put(real_dev, &tracker);
  }
-@@ -684,6 +706,7 @@ out:
+@@ -684,6 +706,7 @@ static void bond_ipsec_free_sa(struct xfrm_state *xs)
   **/
  static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
  {
@@ -213,7 +213,7 @@ index 2919329..a6780e8 100644
  out:
  	rcu_read_unlock();
  	return ok;
-@@ -709,6 +733,7 @@ out:
+@@ -709,6 +733,7 @@ static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
   **/
  static void bond_advance_esn_state(struct xfrm_state *xs)
  {
@@ -239,7 +239,7 @@ index 2919329..a6780e8 100644
  out:
  	rcu_read_unlock();
  }
-@@ -733,6 +759,7 @@ out:
+@@ -733,6 +759,7 @@ static void bond_advance_esn_state(struct xfrm_state *xs)
   **/
  static void bond_xfrm_update_stats(struct xfrm_state *xs)
  {
@@ -266,7 +266,7 @@ index 2919329..a6780e8 100644
  	rcu_read_unlock();
  }
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index c658c03..83cab6e 100644
+index 1591778c36f8..26990c9dd9b0 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -981,6 +981,8 @@ struct netdev_bpf {
@@ -279,7 +279,7 @@ index c658c03..83cab6e 100644
  	void	(*xdo_dev_state_delete) (struct xfrm_state *x);
  	void	(*xdo_dev_state_free) (struct xfrm_state *x);
 diff --git a/include/net/flow.h b/include/net/flow.h
-index 335bbc5..5e373db 100644
+index 335bbc52171c..5e373dbaa397 100644
 --- a/include/net/flow.h
 +++ b/include/net/flow.h
 @@ -38,6 +38,8 @@ struct flowi_common {
@@ -292,7 +292,7 @@ index 335bbc5..5e373db 100644
  	kuid_t  flowic_uid;
  	__u32		flowic_multipath_hash;
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f..7bfe51f 100644
+index 292cd8f4b762..7bfe51fe316d 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
 @@ -688,7 +688,41 @@ struct flow_cls_common_offload {
@@ -338,7 +338,7 @@ index 292cd8f..7bfe51f 100644
  	enum flow_cls_command command;
  	bool use_act_stats;
 diff --git a/include/net/netevent.h b/include/net/netevent.h
-index 1be3757..11b7d12 100644
+index 1be3757a8b7f..11b7d121af84 100644
 --- a/include/net/netevent.h
 +++ b/include/net/netevent.h
 @@ -2,6 +2,9 @@
@@ -401,7 +401,7 @@ index 1be3757..11b7d12 100644
  
  int register_netevent_notifier(struct notifier_block *nb);
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 1a6fca0..7888c0b 100644
+index 1a6fca013165..7888c0b68089 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -84,6 +84,12 @@ struct nf_flowtable {
@@ -499,7 +499,7 @@ index 1a6fca0..7888c0b 100644
  nf_flow_table_offload_add_cb(struct nf_flowtable *flow_table,
  			     flow_setup_cb_t *cb, void *cb_priv)
 diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
-index 9c7c975..fb0cfde 100644
+index 9c7c9758e5e1..fb0cfde4c05d 100644
 --- a/include/net/netns/xfrm.h
 +++ b/include/net/netns/xfrm.h
 @@ -2,6 +2,7 @@
@@ -519,7 +519,7 @@ index 9c7c975..fb0cfde 100644
  	struct hlist_head	*policy_byidx;
  	unsigned int		policy_idx_hmask;
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index ff47f65..714ae9b 100644
+index 2412c22ce0a6..4f61e50f2b70 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
 @@ -12,6 +12,7 @@
@@ -548,12 +548,14 @@ index ff47f65..714ae9b 100644
  };
  
  struct xfrm_mode {
-@@ -1218,6 +1223,28 @@ static inline struct xfrm_offload *xfrm_offload(struct sk_buff *skb)
+@@ -1199,6 +1204,30 @@ static inline struct xfrm_offload *xfrm_offload(struct sk_buff *skb)
  #ifdef CONFIG_XFRM
  int __xfrm_policy_check(struct sock *, int dir, struct sk_buff *skb,
  			unsigned short family);
 +bool xfrm_flowtable_policy_check(struct net *net, const struct flowi *fl,
 +				u16 family, struct xfrm_state *received);
++bool xfrm_flowtable_out_plain(struct net *net, const struct flowi *fl,
++			      u16 family);
 +void xfrm_flowtable_policy_changed(struct net *net);
 +
 +static inline u64 xfrm_flowtable_genid(struct net *net)
@@ -577,7 +579,7 @@ index ff47f65..714ae9b 100644
  
  static inline bool __xfrm_check_nopolicy(struct net *net, struct sk_buff *skb,
  					 int dir)
-@@ -1375,6 +1402,14 @@ static inline void xfrm_sk_free_policy(struct sock *sk)
+@@ -1356,6 +1385,19 @@ static inline void xfrm_sk_free_policy(struct sock *sk)
  #else
  
  static inline void xfrm_sk_free_policy(struct sock *sk) {}
@@ -587,12 +589,17 @@ index ff47f65..714ae9b 100644
 +{
 +	return true;
 +}
++static inline bool xfrm_flowtable_out_plain(struct net *net,
++					    const struct flowi *fl, u16 family)
++{
++	return true;
++}
 +static inline u64 xfrm_flowtable_genid(struct net *net) { return 0; }
 +static inline bool xfrm_flowtable_enabled(struct net *net) { return true; }
  static inline int xfrm_sk_clone_policy(struct sock *sk, const struct sock *osk) { return 0; }
  static inline int xfrm6_route_forward(struct sk_buff *skb) { return 1; }
  static inline int xfrm4_route_forward(struct sk_buff *skb) { return 1; }
-@@ -1673,14 +1708,40 @@ struct xfrm_state *xfrm_state_lookup_byspi(struct net *net, __be32 spi,
+@@ -1654,14 +1696,40 @@ struct xfrm_state *xfrm_state_lookup_byspi(struct net *net, __be32 spi,
  int xfrm_state_check_expire(struct xfrm_state *x);
  void xfrm_state_update_stats(struct net *net);
  #ifdef CONFIG_XFRM_OFFLOAD
@@ -636,7 +643,7 @@ index ff47f65..714ae9b 100644
  
  }
  #else
-@@ -2043,8 +2104,8 @@ static inline void xfrm_dev_state_advance_esn(struct xfrm_state *x)
+@@ -2024,8 +2092,8 @@ static inline void xfrm_dev_state_advance_esn(struct xfrm_state *x)
  	struct xfrm_dev_offload *xso = &x->xso;
  	struct net_device *dev = READ_ONCE(xso->dev);
  
@@ -647,7 +654,7 @@ index ff47f65..714ae9b 100644
  }
  
  static inline bool xfrm_dst_offload_ok(struct dst_entry *dst)
-@@ -2070,8 +2131,8 @@ static inline void xfrm_dev_policy_delete(struct xfrm_policy *x)
+@@ -2051,8 +2119,8 @@ static inline void xfrm_dev_policy_delete(struct xfrm_policy *x)
  	struct xfrm_dev_offload *xdo = &x->xdo;
  	struct net_device *dev = xdo->dev;
  
@@ -658,7 +665,7 @@ index ff47f65..714ae9b 100644
  }
  
  static inline void xfrm_dev_policy_free(struct xfrm_policy *x)
-@@ -2079,11 +2140,13 @@ static inline void xfrm_dev_policy_free(struct xfrm_policy *x)
+@@ -2060,11 +2128,13 @@ static inline void xfrm_dev_policy_free(struct xfrm_policy *x)
  	struct xfrm_dev_offload *xdo = &x->xdo;
  	struct net_device *dev = xdo->dev;
  
@@ -676,7 +683,7 @@ index ff47f65..714ae9b 100644
  }
  #else
 diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
-index 3d2df1d..a9f5bbc 100644
+index 3d2df1d435ae..a9f5bbc3acfb 100644
 --- a/net/ipv4/fib_trie.c
 +++ b/net/ipv4/fib_trie.c
 @@ -70,9 +70,26 @@
@@ -731,7 +738,7 @@ index 3d2df1d..a9f5bbc 100644
  			alias_free_mem_rcu(fa);
  			found++;
 diff --git a/net/ipv4/route.c b/net/ipv4/route.c
-index 2b8c29a..e96b8d0 100644
+index 2b8c29a29c4a..e96b8d035fc4 100644
 --- a/net/ipv4/route.c
 +++ b/net/ipv4/route.c
 @@ -2771,7 +2771,8 @@ struct rtable *ip_route_output_key_hash_rcu(struct net *net, struct flowi4 *fl4,
@@ -745,7 +752,7 @@ index 2b8c29a..e96b8d0 100644
  			/* Apparently, routing tables are wrong. Assume,
  			 * that the destination is on link.
 diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
-index 5b94cb8..2c1b9df 100644
+index 5b94cb8df8d8..2c1b9df1937a 100644
 --- a/net/ipv6/ip6_fib.c
 +++ b/net/ipv6/ip6_fib.c
 @@ -32,6 +32,7 @@
@@ -800,7 +807,7 @@ index 5b94cb8..2c1b9df 100644
  }
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index df72b03..19dcf5a 100644
+index df72b0376970..19dcf5a339f9 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
 @@ -9,6 +9,7 @@
@@ -935,7 +942,7 @@ index df72b03..19dcf5a 100644
  	flow_block_init(&flowtable->flow_block);
  	init_rwsem(&flowtable->flow_block_lock);
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
-index 98edcaa..ff35d60 100644
+index 98edcaa37b38..ff35d601699a 100644
 --- a/net/netfilter/nf_flow_table_ip.c
 +++ b/net/netfilter/nf_flow_table_ip.c
 @@ -13,6 +13,7 @@
@@ -1014,7 +1021,7 @@ index 98edcaa..ff35d60 100644
  	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
  	if (ret < 0)
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f5..7ffa064 100644
+index 4f346f51d7d7..7ffa064bbdb1 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -12,6 +12,7 @@
@@ -1214,7 +1221,7 @@ index 4f346f5..7ffa064 100644
  }
  
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 7dbbd89..d7e5ddf 100644
+index 7dbbd892e197..d7e5ddf54ec0 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
 @@ -15,6 +15,7 @@
@@ -1423,10 +1430,10 @@ index 7dbbd89..d7e5ddf 100644
  	if (tcph)
  		flow_offload_ct_tcp(ct);
 diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
-index 7744ed8..ee88242 100644
+index d55c0cfeb929..7c7150474044 100644
 --- a/net/xfrm/xfrm_device.c
 +++ b/net/xfrm/xfrm_device.c
-@@ -237,6 +237,7 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
+@@ -261,6 +261,7 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
  	int err;
  	struct dst_entry *dst;
  	struct net_device *dev;
@@ -1434,7 +1441,7 @@ index 7744ed8..ee88242 100644
  	struct xfrm_dev_offload *xso = &x->xso;
  	xfrm_address_t *saddr;
  	xfrm_address_t *daddr;
-@@ -294,20 +295,24 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
+@@ -318,20 +319,24 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
  		dst_release(dst);
  	}
  
@@ -1461,7 +1468,7 @@ index 7744ed8..ee88242 100644
  	xso->dev = dev;
  	netdev_tracker_alloc(dev, &xso->dev_tracker, GFP_ATOMIC);
  	xso->real_dev = dev;
-@@ -322,13 +327,15 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
+@@ -346,13 +351,15 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
  	else
  		xso->type = XFRM_DEV_OFFLOAD_CRYPTO;
  
@@ -1478,7 +1485,7 @@ index 7744ed8..ee88242 100644
  
  		/* User explicitly requested packet offload mode and configured
  		 * policy in addition to the XFRM state. So be civil to users,
-@@ -350,6 +357,7 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+@@ -374,6 +381,7 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
  {
  	struct xfrm_dev_offload *xdo = &xp->xdo;
  	struct net_device *dev;
@@ -1486,7 +1493,7 @@ index 7744ed8..ee88242 100644
  	int err;
  
  	if (!xuo->flags || xuo->flags & ~XFRM_OFFLOAD_PACKET) {
-@@ -364,13 +372,16 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+@@ -388,13 +396,16 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
  	if (!dev)
  		return -EINVAL;
  
@@ -1504,7 +1511,7 @@ index 7744ed8..ee88242 100644
  	xdo->dev = dev;
  	netdev_tracker_alloc(dev, &xdo->dev_tracker, GFP_ATOMIC);
  	xdo->type = XFRM_DEV_OFFLOAD_PACKET;
-@@ -387,16 +398,20 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+@@ -411,16 +422,20 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
  	default:
  		xdo->dev = NULL;
  		netdev_put(dev, &xdo->dev_tracker);
@@ -1526,7 +1533,7 @@ index 7744ed8..ee88242 100644
  		NL_SET_ERR_MSG_WEAK(extack, "Device failed to offload this policy");
  		return err;
  	}
-@@ -430,8 +445,8 @@ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+@@ -454,8 +469,8 @@ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
  	return false;
  
  ok:
@@ -1538,7 +1545,7 @@ index 7744ed8..ee88242 100644
  	return true;
  }
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index 40e3676..33d9b3d 100644
+index e033390e7785..df9194e6566a 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
 @@ -34,6 +34,7 @@
@@ -1549,7 +1556,7 @@ index 40e3676..33d9b3d 100644
  #include <net/ip.h>
  #include <net/gre.h>
  #if IS_ENABLED(CONFIG_IPV6_MIP6)
-@@ -2238,8 +2239,18 @@ static struct xfrm_policy *xfrm_policy_lookup(struct net *net,
+@@ -2228,8 +2229,18 @@ static struct xfrm_policy *xfrm_policy_lookup(struct net *net,
  		return pol;
  #endif
  	return xfrm_policy_lookup_bytype(net, XFRM_POLICY_TYPE_MAIN, fl, family,
@@ -1569,7 +1576,7 @@ index 40e3676..33d9b3d 100644
  
  static struct xfrm_policy *xfrm_sk_policy_lookup(const struct sock *sk, int dir,
  						 const struct flowi *fl,
-@@ -2333,6 +2344,8 @@ static void __xfrm_policy_link(struct xfrm_policy *pol, int dir)
+@@ -2323,6 +2334,8 @@ static void __xfrm_policy_link(struct xfrm_policy *pol, int dir)
  	list_add(&pol->walk.all, &net->xfrm.policy_all);
  	WRITE_ONCE(net->xfrm.policy_count[dir], net->xfrm.policy_count[dir] + 1);
  	xfrm_pol_hold(pol);
@@ -1578,7 +1585,7 @@ index 40e3676..33d9b3d 100644
  }
  
  static struct xfrm_policy *__xfrm_policy_unlink(struct xfrm_policy *pol,
-@@ -2351,6 +2364,8 @@ static struct xfrm_policy *__xfrm_policy_unlink(struct xfrm_policy *pol,
+@@ -2341,6 +2354,8 @@ static struct xfrm_policy *__xfrm_policy_unlink(struct xfrm_policy *pol,
  
  	list_del_init(&pol->walk.all);
  	WRITE_ONCE(net->xfrm.policy_count[dir], net->xfrm.policy_count[dir] - 1);
@@ -1587,7 +1594,7 @@ index 40e3676..33d9b3d 100644
  
  	return pol;
  }
-@@ -3583,6 +3598,60 @@ static inline int secpath_has_nontransport(const struct sec_path *sp, int k, int
+@@ -3537,6 +3552,87 @@ static inline int secpath_has_nontransport(const struct sec_path *sp, int k, int
  	return 0;
  }
  
@@ -1645,10 +1652,37 @@ index 40e3676..33d9b3d 100644
 +}
 +EXPORT_SYMBOL_GPL(xfrm_flowtable_policy_check);
 +
++/* Whether a packet with this flow leaves untransformed and unblocked by the
++ * output policy: what a hardware copy that never takes the output route can
++ * stand in for. No policy and an accepting default, or a main-type policy
++ * that allows with no template. Anything else -- a block, a template, a
++ * sub policy, a lookup error -- is not. Policy only: states are never
++ * resolved, so no acquire is sent and the answer does not move with SAs. */
++bool xfrm_flowtable_out_plain(struct net *net, const struct flowi *fl,
++			      u16 family)
++{
++	struct xfrm_policy *pol;
++	bool plain;
++
++	pol = xfrm_policy_lookup(net, fl, family, XFRM_POLICY_OUT, 0);
++	if (IS_ERR(pol))
++		return false;
++	if (!pol)
++		return READ_ONCE(net->xfrm.policy_default[XFRM_POLICY_OUT]) !=
++			XFRM_USERPOLICY_BLOCK;
++	read_lock_bh(&pol->lock);
++	plain = !pol->walk.dead && pol->type == XFRM_POLICY_TYPE_MAIN &&
++		pol->action == XFRM_POLICY_ALLOW && !pol->xfrm_nr;
++	read_unlock_bh(&pol->lock);
++	xfrm_pol_put(pol);
++	return plain;
++}
++EXPORT_SYMBOL_GPL(xfrm_flowtable_out_plain);
++
  static bool icmp_err_packet(const struct flowi *fl, unsigned short family)
  {
  	const struct flowi4 *fl4 = &fl->u.ip4;
-@@ -3862,7 +3931,8 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+@@ -3816,7 +3912,8 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
  			tpp = stp;
  		}
  
@@ -1658,7 +1692,7 @@ index 40e3676..33d9b3d 100644
  			/* This policy template was already checked by HW
  			 * and secpath was removed in __xfrm_policy_check2.
  			 */
-@@ -4372,6 +4442,7 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4301,6 +4398,7 @@ static int __net_init xfrm_net_init(struct net *net)
  
  	/* Initialize the per-net locks here */
  	spin_lock_init(&net->xfrm.xfrm_state_lock);
@@ -1666,7 +1700,7 @@ index 40e3676..33d9b3d 100644
  	spin_lock_init(&net->xfrm.xfrm_policy_lock);
  	seqcount_spinlock_init(&net->xfrm.xfrm_policy_hash_generation, &net->xfrm.xfrm_policy_lock);
  	mutex_init(&net->xfrm.xfrm_cfg_mutex);
-@@ -4670,6 +4741,8 @@ static int xfrm_policy_migrate(struct xfrm_policy *pol,
+@@ -4580,6 +4678,8 @@ static int xfrm_policy_migrate(struct xfrm_policy *pol,
  		}
  	}
  
@@ -1676,10 +1710,10 @@ index 40e3676..33d9b3d 100644
  
  	if (!n)
 diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
-index 82646af..be0f550 100644
+index 02188558bd1c..4d3d473682f8 100644
 --- a/net/xfrm/xfrm_state.c
 +++ b/net/xfrm/xfrm_state.c
-@@ -639,6 +639,11 @@ static const struct xfrm_mode *xfrm_get_mode(unsigned int encap, int family)
+@@ -592,6 +592,11 @@ static const struct xfrm_mode *xfrm_get_mode(unsigned int encap, int family)
  
  void xfrm_state_free(struct xfrm_state *x)
  {
@@ -1691,7 +1725,7 @@ index 82646af..be0f550 100644
  	kmem_cache_free(xfrm_state_cache, x);
  }
  EXPORT_SYMBOL(xfrm_state_free);
-@@ -831,7 +836,7 @@ void xfrm_dev_state_delete(struct xfrm_state *x)
+@@ -778,7 +783,7 @@ void xfrm_dev_state_delete(struct xfrm_state *x)
  	struct net_device *dev = READ_ONCE(xso->dev);
  
  	if (dev) {
@@ -1700,7 +1734,7 @@ index 82646af..be0f550 100644
  		spin_lock_bh(&xfrm_state_dev_gc_lock);
  		hlist_add_head(&x->dev_gclist, &xfrm_state_dev_gc_list);
  		spin_unlock_bh(&xfrm_state_dev_gc_lock);
-@@ -844,14 +849,14 @@ void xfrm_dev_state_free(struct xfrm_state *x)
+@@ -791,14 +796,14 @@ void xfrm_dev_state_free(struct xfrm_state *x)
  	struct xfrm_dev_offload *xso = &x->xso;
  	struct net_device *dev = READ_ONCE(xso->dev);
  
@@ -1718,7 +1752,7 @@ index 82646af..be0f550 100644
  		WRITE_ONCE(xso->dev, NULL);
  		xso->type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
  		netdev_put(dev, &xso->dev_tracker);
-@@ -1623,17 +1628,27 @@ found:
+@@ -1563,17 +1568,27 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
  			struct xfrm_dev_offload *xdo = &pol->xdo;
  			struct xfrm_dev_offload *xso = &x->xso;
  
@@ -1748,10 +1782,10 @@ index 82646af..be0f550 100644
  				to_put = x;
  				x = NULL;
 diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
-index ede28c1..5f447b2 100644
+index 41a8cadb7ce9..063817151129 100644
 --- a/net/xfrm/xfrm_user.c
 +++ b/net/xfrm/xfrm_user.c
-@@ -2438,6 +2438,7 @@ static int xfrm_set_default(struct sk_buff *skb, struct nlmsghdr *nlh,
+@@ -2434,6 +2434,7 @@ static int xfrm_set_default(struct sk_buff *skb, struct nlmsghdr *nlh,
  	struct net *net = sock_net(skb->sk);
  	struct xfrm_userpolicy_default *up = nlmsg_data(nlh);
  
@@ -1759,7 +1793,7 @@ index ede28c1..5f447b2 100644
  	if (xfrm_userpolicy_is_valid(up->in))
  		WRITE_ONCE(net->xfrm.policy_default[XFRM_POLICY_IN], up->in);
  
-@@ -2447,6 +2448,8 @@ static int xfrm_set_default(struct sk_buff *skb, struct nlmsghdr *nlh,
+@@ -2443,6 +2444,8 @@ static int xfrm_set_default(struct sk_buff *skb, struct nlmsghdr *nlh,
  	if (xfrm_userpolicy_is_valid(up->out))
  		WRITE_ONCE(net->xfrm.policy_default[XFRM_POLICY_OUT], up->out);
  
@@ -1768,7 +1802,7 @@ index ede28c1..5f447b2 100644
  	rt_genid_bump_all(net);
  
  	xfrm_notify_userpolicy(net);
-@@ -2984,6 +2987,9 @@ static int xfrm_add_acquire(struct sk_buff *skb, struct nlmsghdr *nlh,
+@@ -3007,6 +3010,9 @@ static int xfrm_add_acquire(struct sk_buff *skb, struct nlmsghdr *nlh,
  	}
  
  	xfrm_state_free(x);

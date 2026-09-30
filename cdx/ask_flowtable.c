@@ -4168,6 +4168,9 @@ static void ft_mc_port_moved(struct net_device *dev, struct net_device *left);
 static void ft_mr_device_gone(struct net_device *dev);
 static void ft_mc_kick_all(void);
 static void ft_mr_kick(void);
+/* XFRM policy changes the routed learner re-derived every group for, counted
+ * from the atomic netevent. */
+static atomic64_t ft_mr_xfrm_changes = ATOMIC64_INIT(0);
 /* The multicast halves of the egress hook: every group copying out of a port
  * whose egress changed is marked for its learner's worker, and a drain
  * rebuilds what is still marked in place. See ft_mc_egress_changed(). */
@@ -4440,6 +4443,11 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 		list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
 			ft_handle_invalidate(entry->handle, &ft_ipsec_policy_invalidations);
 		spin_unlock_bh(&ft_watch_lock);
+		/* An output policy can govern a routed multicast copy, which
+		 * nothing else about the group changes to report: every group
+		 * is asked again. The kick only queues work. */
+		atomic64_inc(&ft_mr_xfrm_changes);
+		ft_mr_kick();
 		return NOTIFY_DONE;
 	}
 	if (event == NETEVENT_IPV4_ROUTE_UPDATE)
@@ -8341,6 +8349,8 @@ enum ft_mr_state {
 	FT_MR_REFUSED_THRESHOLD,
 	FT_MR_REFUSED_LISTENER,
 	FT_MR_REFUSED_MTU,
+	/* An XFRM output policy governs an IPv4 copy; see ft_mr_xfrm_plain(). */
+	FT_MR_REFUSED_XFRM,
 	/* A copy leaves through a bridge whose own output hooks would see it;
 	 * see ft_mr_admit(). */
 	FT_MR_REFUSED_FILTER,
@@ -8369,6 +8379,7 @@ static const char *ft_mr_state_text(enum ft_mr_state state)
 	case FT_MR_REFUSED_THRESHOLD:	return "refused-threshold";
 	case FT_MR_REFUSED_LISTENER:	return "refused-listener";
 	case FT_MR_REFUSED_MTU:		return "refused-mtu";
+	case FT_MR_REFUSED_XFRM:	return "refused-xfrm";
 	case FT_MR_REFUSED_FILTER:	return "refused-filter";
 	case FT_MR_REFUSED_CONTESTED:	return "refused-contested";
 	case FT_MR_REFUSED_FAILED:	return "refused-failed";
@@ -8520,6 +8531,9 @@ struct ft_mr_plan {
 	u8 oif_count;
 	bool oifs_known;
 	bool out_bridged;
+	/* The XFRM policy generation the derivation judged the oifs under;
+	 * rechecked in the transaction, as the switch is. */
+	u64 xfrm_genid;
 };
 
 /* What the atomic handler hands the worker. The mfc and the device are held
@@ -8996,6 +9010,73 @@ static struct net_device *ft_mr_vif_dev(unsigned int idx, int ct)
 	return dev;
 }
 
+/* Whether every IPv4 copy of a group leaves untransformed and unblocked by
+ * XFRM, which a hardware copy -- one that never takes the output route -- is.
+ *
+ * ipmr_queue_xmit() routes each copy with an output lookup of its own: to the
+ * group, source chosen by the route, IPPROTO_IPIP, ports zero, through the
+ * VIF's device. That lookup's XFRM step applies the output policy, which can
+ * block the copy or bundle it into a transform (dropped for want of a state,
+ * or encrypted). The lookup is rebuilt here as ipmr makes it, the flow's oif
+ * rewritten to the route's device as ip_route_output_flow() does, and the
+ * output policy asked for it. A route through a device with disable_xfrm set
+ * skips the policies, and meets only the default. A tunnel or register VIF
+ * encapsulates before that lookup, which this does not model, so it counts as
+ * governed; and a copy with no route at all, which Linux never sends.
+ *
+ * Nothing reports a change of what the lookup reads besides the policies --
+ * an oif's address, which a policy's source selector may match, or its
+ * disable_xfrm switch -- and the five-second refresh finds it.
+ *
+ * IPv6 needs nothing: ip6mr routes its copies with a lookup that takes no
+ * XFRM step, and a bridge takes none either, so an ip6 policy governs no
+ * forwarded copy in software and none in hardware alike. Called under RTNL. */
+static bool ft_mr_xfrm_plain(const struct ft_mr_group *g)
+{
+	struct net *net = &init_net;
+	struct mr_mfc *mfc = g->mfc;
+	bool blocked, bypass;
+	int ct;
+
+	ASSERT_RTNL();
+	if (g->family != AF_INET)
+		return true;
+	/* No output policy and an accepting default: every lookup passes. */
+	blocked = READ_ONCE(net->xfrm.policy_default[XFRM_POLICY_OUT]) ==
+		  XFRM_USERPOLICY_BLOCK;
+	if (!READ_ONCE(net->xfrm.policy_count[XFRM_POLICY_OUT]) && !blocked)
+		return true;
+	for (ct = mfc->mfc_un.res.minvif; ct < mfc->mfc_un.res.maxvif; ct++) {
+		struct net_device *oif = ft_mr_vif_dev(0, ct);
+		struct flowi4 fl4 = {};
+		struct rtable *rt;
+
+		if (mfc->mfc_un.res.ttls[ct] == 255 || !oif)
+			continue;
+		if (ft_mr_vif[0][ct].flags & (VIFF_TUNNEL | VIFF_REGISTER))
+			return false;
+		fl4.daddr = g->dst.ip;
+		fl4.flowi4_proto = IPPROTO_IPIP;
+		fl4.flowi4_oif = oif->ifindex;
+		rt = __ip_route_output_key(net, &fl4);
+		if (IS_ERR(rt))
+			return false;
+		fl4.flowi4_oif = rt->dst.dev->ifindex;
+		bypass = rt->dst.flags & DST_NOXFRM;
+		ip_rt_put(rt);
+		/* xfrm_lookup_with_ifid() takes such a route straight to its
+		 * no-policy answer. */
+		if (bypass) {
+			if (blocked)
+				return false;
+			continue;
+		}
+		if (!xfrm_flowtable_out_plain(net, flowi4_to_flowi(&fl4), AF_INET))
+			return false;
+	}
+	return true;
+}
+
 /* The whole contract, in the order an operator would want it answered.
  *
  * Runs under RTNL with neither learner mutex held, and touches no hardware.
@@ -9154,6 +9235,13 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	 * copy for it to hold against that. */
 	if (spec.in && out_mtu < ft_mc_link_mtu(vif_dev, g->family))
 		return FT_MR_REFUSED_MTU;
+	/* An XFRM output policy Linux would apply to a copy, which hardware
+	 * cannot. Asked last, of oifs every test above has let through. The
+	 * generation is taken first, so a policy change after it is caught by
+	 * the transaction's recheck. */
+	plan->xfrm_genid = xfrm_flowtable_genid(&init_net);
+	if (!ft_mr_xfrm_plain(g))
+		return FT_MR_REFUSED_XFRM;
 
 	spec.family = g->family;
 	spec.src = g->src;
@@ -10883,6 +10971,12 @@ again:
 			 * takes the delete below and records like any other. */
 			if (state == FT_MR_PENDING && !READ_ONCE(ft_mc_enabled))
 				state = FT_MR_REFUSED_PAUSED;
+			/* And an XFRM policy that changed since the contract
+			 * was answered: this pass is refused, and the next,
+			 * which the change queued, asks again. */
+			if (state == FT_MR_PENDING && target->family == AF_INET &&
+			    xfrm_flowtable_genid(&init_net) != plan.xfrm_genid)
+				state = FT_MR_REFUSED_XFRM;
 			/* What an entry counted since the last fold goes with it
 			 * unless it is read first; it is folded as the outcome is
 			 * recorded, against the set it was installed with. */
@@ -14039,6 +14133,9 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mr_count, ft_mr_installed, ft_mr_refused,
 		   ft_mr_install_errors, ft_mr_policy[0] + ft_mr_policy[1],
 		   ft_mr_lost);
+	/* XFRM policy changes every routed group was asked again for; an IPv4
+	 * group a policy governs reads refused-xfrm. */
+	seq_printf(seq, "mroute_xfrm_changes %lld\n", atomic64_read(&ft_mr_xfrm_changes));
 	/* How many times an nftables commit took every routed group back to
 	 * software to be confirmed again; whether the ruleset has stood still
 	 * long enough since for copies to confirm under it -- followed only

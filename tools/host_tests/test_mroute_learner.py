@@ -64,6 +64,7 @@ def test_mroute_learner(tmp_path):
             "ft_mr_expand",
             "ft_mr_plan_put",
             "ft_mr_vif_dev",
+            "ft_mr_xfrm_plain",
             "ft_mr_derive",
             "ft_mr_plan_same",
             "ft_mr_find",
@@ -298,6 +299,10 @@ def test_the_contract_is_tested_in_the_order_it_is_written():
     # The thresholds and the listeners come last, because both walk the oif
     # list and the cheap tests have to be able to refuse before that.
     assert max(at) < body.index("FT_MR_REFUSED_THRESHOLD")
+    # Except the XFRM policy, which routes every oif and is asked only of
+    # oifs the rest has let through, so a tunnel, a wildcard or a narrow
+    # oif keeps its own word under any policy.
+    assert body.index("FT_MR_REFUSED_XFRM") > body.rindex("FT_MR_REFUSED_MTU")
 
 
 # ------------------------------------------------------------- references

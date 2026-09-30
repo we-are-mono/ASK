@@ -42,6 +42,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_flowtable_service_multicast_quarantine.py 323     (listener swap)
 #   test_mcast_member_mtu.py    324          (VLAN_ID_MCAST_MTU, narrow oif)
 #   test_flowtable_service_multicast_edges.py 325 (the oif a forward chain drops toward)
+#   test_flowtable_service_multicast_xfrm.py  326 (the oif an XFRM policy governs)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
 # orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access

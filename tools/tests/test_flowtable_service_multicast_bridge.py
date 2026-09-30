@@ -693,6 +693,77 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
                      and _mroute_row(s, group) is None, timeout=20)
 
 
+async def test_flowtable_service_multicast_bridge_route_follows_xfrm(multicast_bridge_service):
+    """An XFRM block policy on the routed VLAN, under a route riding the bridged group.
+
+    IPv4: ipmr's copy into VLAN 290 takes an output route whose XFRM step the
+    policy blocks. The route leaves hardware (refused-xfrm) with nothing but
+    the policy changed, and the bridged group it rode, whose VIF would be
+    starved without it, stays in software (refused-routed): the set-top box
+    receives the stream from the CPU and the routed LAN nothing, as Linux
+    decides. The policy gone, the route rides the group again. IPv6: ip6mr's
+    copy takes no XFRM step, and the route stays on."""
+    r = multicast_bridge_service
+    family = r.multicast_family
+    group = '239.9.5.7' if family == 4 else 'ff1e::9:5:7'
+    ipx = ['ip'] + (['-6'] if family == 6 else [])
+    selector = ['src', '0.0.0.0/0' if family == 4 else '::/0',
+                'dst', f'{group}/{32 if family == 4 else 128}',
+                'dev', f'{BRIDGE}.{ROUTED_VID}', 'dir', 'out']
+    policed = False
+    async with _bridge_and_route(r, group) as route:
+        source, egress_mac = route.source, route.egress_mac
+        try:
+            await _ride(r, group, source)
+            before = await r.state()
+            policed = True
+            await command(r.target, r.session, *ipx, 'xfrm', 'policy', 'add', *selector,
+                          'action', 'block')
+            if family == 4:
+                ruled = await r.wait(
+                    lambda s: (m := _mroute_row(s, group)) is not None
+                    and m['state'] == 'refused-xfrm'
+                    and (b := _iptv_row(s, group)) is not None
+                    and b['state'] == 'refused-routed' and b['routed'] == '-', timeout=20)
+                assert ruled['mroute_ruleset_changes'] == before['mroute_ruleset_changes'], \
+                    (before, ruled)
+            else:
+                ruled = await r.wait(
+                    lambda s: s['mroute_xfrm_changes'] > before['mroute_xfrm_changes'], timeout=20)
+                await asyncio.sleep(1)
+            result, _, after, cpu, idle = await _window(
+                r, group, source, r.lan, [LISTENER, ROUTED_LISTENER],
+                lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
+                'multicast-route-xfrm-policy')
+            _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
+            if family == 4:
+                assert not result[ROUTED_LISTENER]['seen'], result
+                assert cpu >= FRAMING_COUNT, (cpu, idle)
+            else:
+                _assert_routed_copy(result[ROUTED_LISTENER], egress_mac, group)
+                assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
+                assert _mroute_row(after, group)['state'] == 'installed', after
+
+            await command(r.target, r.session, *ipx, 'xfrm', 'policy', 'delete', *selector)
+            policed = False
+            await _ride(r, group, source)
+            result, _, _, cpu, idle = await _window(
+                r, group, source, r.lan, [LISTENER, ROUTED_LISTENER],
+                lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
+                'multicast-route-xfrm-lifted')
+            _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
+            _assert_routed_copy(result[ROUTED_LISTENER], egress_mac, group)
+            assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
+        finally:
+            if policed:
+                await command(r.target, r.session, *ipx, 'xfrm', 'policy', 'delete', *selector,
+                              check=False)
+        await route.ctl('remove', route.iptv_dev, source, group)
+        await _mdb(r, TARGET_LAN_IF, group, add=False)
+        await r.wait(lambda s: _iptv_row(s, group) is None
+                     and _mroute_row(s, group) is None, timeout=20)
+
+
 # Long enough for the bridged learner to sample its entries into the route and
 # the routed learner to fold the route into the MFC, each once: both run every
 # five seconds.

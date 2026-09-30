@@ -165,18 +165,8 @@ result independently of those temporary files.
   accept-one-port/drop-another for one `(S,G)`, warm only the allowed port, interleave unique
   payloads on both, require zero forbidden delivery; IPv4/IPv6, VLAN/bridge oifs.
 
-- [ ] **A290 — routed multicast does not follow XFRM policy.**
-  Unicast captures the XFRM generation (`cdx/ask_flowtable.c` `nf_xfrm_genid`), checks policy at
-  admission, and invalidates on `NETEVENT_XFRM_POLICY_UPDATE`. The routed and bridged multicast
-  learners hold no XFRM state: they track MFC/VIF + nft generation only, and the XFRM notifier
-  walks the unicast entries alone. So an XFRM block or required-transform policy installed under
-  a live multicast group does not stale it, and its hardware copies carry no policy check or
-  transform. Needs IPsec-on-forwarded-multicast to be a real deployment (rare) plus the output
-  ordering; confirm the leak on hardware before treating it as active. Fix: capture the XFRM
-  generation in the multicast contract and invalidate the group on an XFRM change, or keep such
-  groups in software. Regression: prove the matching XFRM policy governs equivalent software
-  multicast, then install a hardware group and make the same change with no nft/MFC change;
-  require zero unauthorized cleartext on every egress. IPv4/IPv6, normal + bridge/VLAN oifs.
+- [x] **A290 — routed multicast did not follow XFRM policy.** Fixed: an IPv4 group whose copy an
+  output policy governs is `refused-xfrm`, re-asked on every policy change; ip6mr and bridges apply none (_:/^cdx: keep a routed multicast group an XFRM policy governs_).
 
 - [x] **A291 — FMan enqueues QMan rejects were thought to leak buffers.** Not a bug: FMan portals
   run ED=1, so QMan discards and frees them itself; 1e6 discards left every pool at its count (_:/^cdx: drop a bridged multicast stream nobody wants_).

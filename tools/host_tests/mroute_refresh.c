@@ -135,6 +135,9 @@ static bool nft_commit_in_progress(const __typeof__(init_net) *net)
 {
     return net->nft.commit_applying;
 }
+/* The XFRM policy generation, which every policy change moves. */
+static u64 xfrm_genid = 1;
+static u64 xfrm_flowtable_genid(const __typeof__(init_net) *net) { return xfrm_genid; }
 /* A grace period only counts, unless a case has a commit land inside the
  * next one. */
 static unsigned grace_periods;
@@ -215,6 +218,9 @@ static bool out_bridged, commit_in_derive;
 /* The multicast switch turned off once the derivation has answered, as its
  * setter can between the contract and the worker's transaction. */
 static bool switch_in_derive;
+/* An XFRM policy changed once the derivation has answered under the
+ * generation before it. */
+static bool policy_in_derive;
 static void mutex_lock(int *m) { assert(!*m); *m = 1; }
 #define lockdep_assert_held(m) assert(*(m))
 static void mutex_unlock(int *m) { assert(*m); *m = 0; }
@@ -561,9 +567,16 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
         memcpy(p->spec.listener[i].src_mac, oif_addr[i], ETH_ALEN);
         dev_hold(&output[i]);
     }
+    /* The generation the answer is given under, taken as the contract's
+     * last test does. */
+    p->xfrm_genid = xfrm_flowtable_genid(&init_net);
     if (switch_in_derive) {
         switch_in_derive = false;
         ft_mc_enabled = false;
+    }
+    if (policy_in_derive) {
+        policy_in_derive = false;
+        xfrm_genid++;
     }
     return FT_MR_PENDING;
 }
@@ -1537,6 +1550,27 @@ int main(void)
         out_bridged = false;
     }
 
+    /* An XFRM policy that changes once the contract has answered, under the
+     * generation before it: the transaction finds the answer stale, and the
+     * entry comes out rather than being replaced with what the stale answer
+     * built. The next pass, which the policy change kicked, answers under
+     * the new generation and carries it again. */
+    {
+        unsigned x0 = adds, r0 = replaces, del0 = deletes;
+
+        wanted = 2;
+        policy_in_derive = true;
+        ft_mr_recheck = true;
+        run();
+        wanted = 1;
+        assert(!policy_in_derive && replaces == r0 && deletes == del0 + 1);
+        assert(!hardware.live && !g->offloaded && g->state == FT_MR_REFUSED_XFRM);
+        assert(!strcmp(ft_mr_state_text(g->state), "refused-xfrm"));
+        ft_mr_recheck = true;
+        run();
+        assert(adds == x0 + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+    }
+
     /* Deleting the route while a port it copies out of changes its egress:
      * the change marks the group, and a tc command's drain gets the
      * transaction before the worker's retirement does. The group leaves the
@@ -1755,6 +1789,22 @@ int main(void)
         ft_mr_recheck = true;
         run();
         assert(adds == x0 + 2 && hardware.live && g->state == FT_MR_INSTALLED);
+    }
+    /* An XFRM policy changing under an IPv6 group's pass is nothing to it:
+     * ip6mr's copies take no XFRM step, and the replace lands. */
+    {
+        unsigned r0 = replaces, del0 = deletes;
+
+        g->dirty = true;
+        wanted = 2;
+        policy_in_derive = true;
+        run();
+        wanted = 1;
+        assert(!policy_in_derive && replaces == r0 + 1 && deletes == del0);
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+        g->dirty = true;
+        run();
+        assert(replaces == r0 + 2 && hardware.live);
     }
     /* The entry the worker picked is deleted while it waits: it is retired
      * from hardware, and nothing is built for an entry ipmr no longer has --
