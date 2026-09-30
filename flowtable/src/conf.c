@@ -52,7 +52,7 @@ static int parse_cidr(struct ft_ctx *ctx, const char *field, const char *s, char
 		*slash = '\0';
 		errno = 0;
 		p = strtol(slash + 1, &end, 10);
-		if (errno || *end || p < 0 || p > 32)
+		if (end == slash + 1 || errno || *end || p < 0 || p > 32)
 			FAIL("%s: invalid prefix length", field);
 		pfx = (int)p;
 	}
@@ -111,7 +111,12 @@ static int next_token(const char **pp, const char *end, char *tok, size_t n)
 			if (o + 1 < n) tok[o++] = *p;
 			p++;
 		}
-		if (p < end && *p == '"') p++;
+		/* An unterminated quote is a truncated or hand-mangled line, not a
+		 * bare word: reject it rather than accept the run up to the newline
+		 * (which would read `scope "any` as `any`). -1 ends the caller's token
+		 * loop and trips its "expected a value"/empty-scope checks. */
+		if (p >= end || *p != '"') { *pp = p; return -1; }
+		p++;
 	} else {
 		while (p < end && *p != ' ' && *p != '\t' && *p != '#' && *p != '\n') {
 			if (o + 1 < n) tok[o++] = *p;
@@ -254,6 +259,7 @@ static int parse_match(struct ft_ctx *ctx, const char **pp, const char *end,
 		} else if (!strcmp(key, "mark")) {
 			char *slash = strchr(val, '/');
 			uint32_t value, mask;
+			if (m->has_mark) FAIL("match: duplicate mark");
 			if (!slash) FAIL("mark: expected value/mask");
 			*slash = '\0';
 			if (parse_u32(val, &value) || parse_u32(slash + 1, &mask))
@@ -268,8 +274,15 @@ static int parse_match(struct ft_ctx *ctx, const char **pp, const char *end,
 			FAIL("match: unknown selector '%s'", key);
 		}
 	}
-	if (exclusion && selectors == 0)
-		FAIL("exclusion: at least one selector is required");
+	/* A scope with no selectors (a bare "scope", or only a "name") would render
+	 * the match-all "flow add @fast" and silently offload everything, defeating
+	 * the very boundary a scope is for. "any" is the explicit way to say that
+	 * and returns above; anything else must carry at least one selector. */
+	if (selectors == 0) {
+		if (exclusion)
+			FAIL("exclusion: at least one selector is required");
+		FAIL("scope: at least one selector is required, or 'any'");
+	}
 	return 0;
 }
 
@@ -303,12 +316,16 @@ int ft_conf_parse(struct ft_ctx *ctx, const char *text, size_t len, struct ft_po
 			if (next_token(&lp, lend, val, sizeof(val)) <= 0 || strcmp(val, "1"))
 				FAIL("unsupported configuration version");
 			out->version = 1;
+			if (next_token(&lp, lend, val, sizeof(val)) > 0)
+				FAIL("version: takes a single value");
 		} else if (!strcmp(key, "enabled")) {
 			if (seen_enabled) FAIL("duplicate key: enabled");
 			seen_enabled = true;
 			if (next_token(&lp, lend, val, sizeof(val)) <= 0)
 				FAIL("enabled: expected yes or no");
 			if (parse_bool(ctx, val, &out->enabled)) return -1;
+			if (next_token(&lp, lend, val, sizeof(val)) > 0)
+				FAIL("enabled: takes a single value");
 		} else if (!strcmp(key, "devices")) {
 			if (seen_devices) FAIL("duplicate key: devices");
 			seen_devices = true;

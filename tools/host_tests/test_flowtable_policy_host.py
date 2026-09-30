@@ -97,6 +97,15 @@ def test_accepts(engine, conf):
     ("devices eth3 eth4\nscope badkey 5\n", "unknown selector"),
     ("enabled yes\nenabled no\ndevices eth3 eth4\nscope any\n", "duplicate key: enabled"),
     ("devices eth3 eth4\ndevices eth5 eth6\nscope any\n", "duplicate key: devices"),
+    # A scope must carry a selector or an explicit 'any'; a bare, name-only,
+    # or truncated (unterminated-quote) scope must not render match-all.
+    ("devices eth3 eth4\nscope\n", "at least one selector"),
+    ("devices eth3 eth4\nscope name broken\n", "at least one selector"),
+    ('devices eth3 eth4\nscope "any\n', "at least one selector"),
+    ("devices eth3 eth4\nscope saddr 0.0.0.0/\n", "prefix length"),      # empty prefix
+    ("version 1 extra\ndevices eth3 eth4\nscope any\n", "single value"),  # trailing token
+    ("enabled yes no\ndevices eth3 eth4\nscope any\n", "single value"),   # trailing token
+    ("devices eth3 eth4\nscope mark 0x1/0xff mark 0x2/0xff\n", "duplicate mark"),
 ])
 def test_rejects(engine, conf, msg):
     r = check(engine, conf)
