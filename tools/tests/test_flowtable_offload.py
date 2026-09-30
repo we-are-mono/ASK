@@ -448,6 +448,16 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
     transport = None
     try:
         await command(r.target, r.session, "modprobe", "xt_tcpudp")
+        # Hardware flows age on these, so a run cut short inside a fixture
+        # that shortens them -- connections sets 5 s -- would have every
+        # later test lose its flows on the first pause in traffic, and read
+        # as flows expiring under load. Tests that need other values set and
+        # restore them inside their own scope.
+        for proto in ("tcp", "udp"):
+            path = f"/proc/sys/net/netfilter/nf_flowtable_{proto}_timeout"
+            value = (await read(r.target, r.session, path)).strip()
+            assert value == "30", (f"fixture requires the default flowtable {proto} timeout; "
+                                   f"a stopped run left {value}", path)
         def lan_json(cmd):
             result = lan.run(cmd, timeout=10)
             assert result.rc == 0, result.stdout

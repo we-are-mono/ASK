@@ -16,7 +16,10 @@ cases fail that barrier on purpose while a control group stands, and require:
 Any completed barrier on the PCD releases the backlog, so parked counts are
 read straight after the failure. The windows between stay exact because the
 cases that watch them run no unicast offload: no admission or unicast delete
-can sync there.
+can sync there. Nor any other multicast: a stream nobody on a snooping bridge
+wants gets a discard entry of its own, whose add and age-out each end on a
+barrier, so the bridged cases keep the segments' own multicast -- a bench
+host's SSDP -- off the ports while they run.
 
 The image is KASAN, and the splat window fails a case whose CPU touches memory
 the quarantine should have kept. A walker in the microcode is not something
@@ -74,6 +77,29 @@ async def armed(r, knob, failures):
 
 async def remaining(r, knob):
     return (await read(r.target, r.session, knob)).split()[0]
+
+
+QUIET_TABLE = "ask_mc_quiet"
+
+
+@asynccontextmanager
+async def quiet(r, groups):
+    """Only the case's own groups, and link-local control, reach the bridge
+    from either port: everything else multicast is dropped at ingress, before
+    the bridge can learn it and the bridged learner discard it in hardware."""
+    v4 = ", ".join(["224.0.0.0/24"] + [g for g in groups if ":" not in g])
+    v6 = ", ".join(["ff02::/16"] + [g for g in groups if ":" in g])
+    chains = "\n".join(f''' chain {dev} {{ type filter hook ingress device "{dev}" priority -400; policy accept;
+  ip daddr 224.0.0.0/4 ip daddr != {{ {v4} }} drop
+  ip6 daddr ff00::/8 ip6 daddr != {{ {v6} }} drop
+ }}''' for dev in (TARGET_WAN_IF, TARGET_LAN_IF))
+    await command(r.target, r.session, "nft", "delete", "table", "netdev", QUIET_TABLE, check=False)
+    await command(r.target, r.session, "nft", f"table netdev {QUIET_TABLE} {{\n{chains}\n}}")
+    try:
+        yield
+    finally:
+        await command(r.target, r.session, "nft", "delete", "table", "netdev", QUIET_TABLE,
+                      check=False)
 
 
 class Routed:
@@ -228,8 +254,8 @@ async def test_flowtable_service_multicast_quarantine_routed(multicast_rig, fami
 async def test_flowtable_service_multicast_quarantine_bridged(multicast_rig, mcast_bridge, family):
     r = multicast_rig
     # A querier that counts in both families, so a withdrawn group is no
-    # longer flooded to the port it left.
-    async with bridge_settings(r, mcast_bridge):
+    # longer flooded to the port it left; and no other multicast on the ports.
+    async with bridge_settings(r, mcast_bridge), quiet(r, GROUPS[family]):
         await withdrawal(r, Bridged(r, mcast_bridge, family), family)
 
 
