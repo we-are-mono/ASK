@@ -168,7 +168,7 @@ struct tc_cls_matchall_offload {
     struct flow_stats stats;
 };
 struct flow_cls_offload {
-    struct { struct netlink_ext_ack *extack; } common;
+    struct { struct netlink_ext_ack *extack; u32 chain_index; u32 prio; } common;
     int command;
     unsigned long cookie;
     struct flow_rule *rule;
@@ -310,6 +310,17 @@ static struct flow_rule flower_rule(void)
 static int flower_add(struct net_device *d, unsigned long cookie, struct flow_rule *r)
 {
     struct flow_cls_offload f = { .common = { .extack = &ack },
+        .command = FLOW_CLS_REPLACE, .cookie = cookie, .rule = r };
+    r->match.dissector = &r->dis;
+    ack.msg = NULL;
+    return cdx_police_flower(d, &f);
+}
+
+static int flower_add_prio(struct net_device *d, unsigned long cookie,
+                           struct flow_rule *r, u32 prio, u32 chain)
+{
+    struct flow_cls_offload f = { .common = { .extack = &ack, .prio = prio,
+        .chain_index = chain },
         .command = FLOW_CLS_REPLACE, .cookie = cookie, .rule = r };
     r->match.dissector = &r->dis;
     ack.msg = NULL;
@@ -466,6 +477,21 @@ int main(void)
     assert(flower_del(&dev, 1) == 0 && prof.disabled == 1);
     assert(cdx_police_lookup(&flow) == 0);
     assert(flower_del(&dev, 1) == -ENOENT);
+
+    /* Priority, not insertion order: an operator who adds a higher-priority
+     * (lower tc prio) filter after a lower-priority one already exists must
+     * have the higher-priority meter picked -- the record is insertion-ordered,
+     * so first-match would pick the wrong one. */
+    fr = flower_rule();
+    assert(flower_add_prio(&dev, 10, &fr, 100, 0) == 0);   /* low priority, first */
+    unsigned lowpri = prof.last_profile;
+    fr = flower_rule();
+    assert(flower_add_prio(&dev, 11, &fr, 10, 0) == 0);    /* high priority, later */
+    unsigned hipri = prof.last_profile;
+    assert(lowpri != hipri && cdx_police_lookup(&flow) == hipri);
+    assert(flower_del(&dev, 10) == 0);                     /* drop the loser */
+    assert(cdx_police_lookup(&flow) == hipri);             /* winner survives */
+    assert(flower_del(&dev, 11) == 0 && cdx_police_lookup(&flow) == 0);
 
     /* A prefix is what per-subscriber policing is made of: mask off the host
      * bits and every address in the subnet meets the same meter. */

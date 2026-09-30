@@ -334,6 +334,7 @@ struct cdx_police_filter {
 	struct list_head	list;
 	struct net_device	*dev;
 	unsigned long		cookie;
+	u32			prio;		/* tc filter priority; lower wins */
 	u8			profile;	/* 1..CDX_FT_QOS_MAX_POLICER */
 	u8			family;		/* AF_INET or AF_INET6 */
 	u8			proto;
@@ -397,21 +398,28 @@ static bool cdx_police_filter_matches(const struct cdx_police_filter *f,
 }
 
 /* The profile an admitted flow should meter against, as a cdx_ft_rule.qos
- * policer nibble, or zero for the default. First match wins: tc evaluates
- * filters in priority order and hands them over in that order, so the first
- * one recorded is the first one that would have matched in software.
+ * policer nibble, or zero for the default. Among the filters that match, the
+ * highest-priority (lowest tc prio) one wins, which is the one software TC
+ * would have applied. The list is insertion-ordered -- fine on a block replay,
+ * where tp hands filters over in priority order, but not when an operator
+ * inserts a higher-priority filter after lower-priority ones already exist --
+ * so the selection reads the priority rather than trusting list order.
  */
 u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
 {
 	const struct cdx_police_filter *f;
 	unsigned long flags;
 	u8 profile = 0;
+	u32 best = 0;
+	bool found = false;
 
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	list_for_each_entry(f, &cdx_police_filters, list)
-		if (cdx_police_filter_matches(f, rule)) {
+		if (cdx_police_filter_matches(f, rule) &&
+		    (!found || f->prio < best)) {
 			profile = f->profile;
-			break;
+			best = f->prio;
+			found = true;
 		}
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 	return profile;
@@ -554,6 +562,7 @@ static int cdx_police_flower_replace(struct net_device *dev,
 		return -ENOMEM;
 	filter->dev = dev;
 	filter->cookie = f->cookie;
+	filter->prio = f->common.prio;
 	rc = cdx_police_parse(f, filter);
 	if (rc)
 		goto err_free;
