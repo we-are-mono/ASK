@@ -152,6 +152,32 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A289 — one accepted multicast packet authorizes other, forbidden UDP ports.**
+  The routed-multicast hardware root masks transport ports (`cdx/dpa_control_mc.c`, ports
+  zeroed in the match key), and the confirmation (`ft_mr_confirm_seen`, `cdx/ask_flowtable.c`)
+  records family/source/group/oif but no port and no predicate. So for a rule that accepts UDP
+  dport 5000 and drops 5001 on one `(S,G)`: port 5000 primes the confirmation and the hardware
+  entry, then 5001 shares its key and is replicated in hardware without passing the drop. Wider
+  than unicast, which is 5-tuple keyed. Needs an atypical per-L4-port multicast policy to bite;
+  the code documents the class ("a confirmation proves the ruleset forwards the stream there,
+  not what it does to each packet") but does not enforce it. Fix: key a multicast group on its
+  stream's ports too, or keep a port-discriminating `(S,G)` in software. Regression: preinstall
+  accept-one-port/drop-another for one `(S,G)`, warm only the allowed port, interleave unique
+  payloads on both, require zero forbidden delivery; IPv4/IPv6, VLAN/bridge oifs.
+
+- [ ] **A290 — routed multicast does not follow XFRM policy.**
+  Unicast captures the XFRM generation (`cdx/ask_flowtable.c` `nf_xfrm_genid`), checks policy at
+  admission, and invalidates on `NETEVENT_XFRM_POLICY_UPDATE`. The routed and bridged multicast
+  learners hold no XFRM state: they track MFC/VIF + nft generation only, and the XFRM notifier
+  walks the unicast entries alone. So an XFRM block or required-transform policy installed under
+  a live multicast group does not stale it, and its hardware copies carry no policy check or
+  transform. Needs IPsec-on-forwarded-multicast to be a real deployment (rare) plus the output
+  ordering; confirm the leak on hardware before treating it as active. Fix: capture the XFRM
+  generation in the multicast contract and invalidate the group on an XFRM change, or keep such
+  groups in software. Regression: prove the matching XFRM policy governs equivalent software
+  multicast, then install a hardware group and make the same change with no nft/MFC change;
+  require zero unauthorized cleartext on every egress. IPv4/IPv6, normal + bridge/VLAN oifs.
+
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN
