@@ -84,7 +84,10 @@ def test_mcast_learner(tmp_path):
             "ft_mc_match_routes",
             "ft_mc_host_wants",
             "ft_mc_installable",
+            "ft_mc_discardable",
+            "ft_mc_flow_key",
             "ft_mc_flow_spec",
+            "ft_mc_discard_spec",
             "ft_mc_chain_record",
             "ft_mc_flow_named",
             "ft_mc_retire",
@@ -517,7 +520,8 @@ def test_a_failed_install_is_tried_again_an_interval_apart():
     refresh is what tries again, one interval apart."""
     source = SOURCE.read_text()
     worker = function(source, "ft_mc_work_fn")
-    failed = worker[worker.index("if (spec.listeners && rc) {"):]
+    # A build is listeners or a discard, and either can fail.
+    failed = worker[worker.index("if (build && rc) {"):]
     failed = failed[:failed.index("} else if (!rc) {")]
     assert "target->retries++;" in failed and "stale" not in failed.split("*/")[-1]
     refresh = function(source, "ft_mc_refresh_fn")
@@ -608,9 +612,10 @@ def test_the_dedup_slots_are_forgotten_whenever_an_answer_may_change():
     observe = function(source, "ft_mc_observe")
     assert observe.index("ft_mc_drop_next(f);") < observe.index(forget)
     worker = function(source, "ft_mc_work_fn")
-    # An entry taken out of hardware and kept -- only one that was in it --
-    # or replaced by the shape waiting to take over.
-    withdraw = worker[worker.index("if (!spec.listeners) {"):]
+    # An entry taken out of hardware and kept -- only one that was in it,
+    # with nothing left to build or the switch off -- or replaced by the
+    # shape waiting to take over.
+    withdraw = worker[worker.index("if (!build || paused) {"):]
     withdraw = withdraw[:withdraw.index("} else if (hw) {")]
     assert withdraw.index("if (hw) {") < withdraw.index("withdrew = true;")
     assert "if (withdrew || swapped)\n\t\t\tft_mc_forget_seen();" in worker

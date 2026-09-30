@@ -189,6 +189,8 @@ static unsigned ft_mr_count, ft_mr_installed, ft_mr_policy[2];
 static u64 ft_mr_refused, ft_mr_install_errors;
 static bool ft_mr_stopping, ft_mr_recheck, ft_mr_key_freed, ft_mr_taps_stale;
 static bool ft_mr_ready;
+/* The `multicast` parameter both learners answer to, on at load. */
+static bool ft_mc_enabled = true;
 static unsigned long ft_mr_resync_pending;
 static unsigned ft_mr_idx(u8 family) { return family == AF_INET6; }
 static bool test_bit(unsigned n, const unsigned long *p) { return (*p >> n) & 1; }
@@ -210,6 +212,9 @@ static int planned[2] = { OIF_A, OIF_B };
 static unsigned planned_oifs = 1;
 static int planned_parent = PARENT_A;
 static bool out_bridged, commit_in_derive;
+/* The multicast switch turned off once the derivation has answered, as its
+ * setter can between the contract and the worker's transaction. */
+static bool switch_in_derive;
 static void mutex_lock(int *m) { assert(!*m); *m = 1; }
 #define lockdep_assert_held(m) assert(*(m))
 static void mutex_unlock(int *m) { assert(*m); *m = 0; }
@@ -525,6 +530,9 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
         p->oif[p->oif_count++] = planned[i];
     p->parent = planned_parent;
     p->oifs_known = true;
+    /* Switched off: refused once its oifs are named, as the contract does,
+     * so it goes on gathering confirmations in software. */
+    if (!ft_mc_enabled) return FT_MR_REFUSED_PAUSED;
     p->out_bridged = out_bridged;
     if (commit_in_derive) {
         commit_in_derive = false;
@@ -552,6 +560,10 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
         p->spec.listener[i].routed = true;
         memcpy(p->spec.listener[i].src_mac, oif_addr[i], ETH_ALEN);
         dev_hold(&output[i]);
+    }
+    if (switch_in_derive) {
+        switch_in_derive = false;
+        ft_mc_enabled = false;
     }
     return FT_MR_PENDING;
 }
@@ -1707,6 +1719,42 @@ int main(void)
         run();
         assert(!lost_after_resync && resyncs == s0 + 2 && !ft_mr_resync_pending);
         assert(deletes == del0 && hardware.live && g->state == FT_MR_INSTALLED);
+    }
+    /* Multicast acceleration switched off: the group is refused as paused
+     * and its entry comes out; back on, it is carried again at once, its
+     * confirmations kept. The switch is checked again inside the transaction,
+     * after the contract was answered: turned off between the two, neither a
+     * replace nor an add lands, so a stop that has read nothing installed
+     * under the transaction never finds an entry appear after. */
+    {
+        unsigned x0 = adds, r0 = replaces, del0 = deletes;
+
+        ft_mc_enabled = false;
+        ft_mr_recheck = true;
+        run();
+        assert(deletes == del0 + 1 && !hardware.live && !g->offloaded);
+        assert(g->state == FT_MR_REFUSED_PAUSED && ft_mr_refusal(g->state));
+        assert(!strcmp(ft_mr_state_text(g->state), "refused-paused"));
+        ft_mc_enabled = true;
+        ft_mr_recheck = true;
+        run();
+        assert(adds == x0 + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+        g->dirty = true;
+        wanted = 2;
+        switch_in_derive = true;
+        run();
+        wanted = 1;
+        assert(!switch_in_derive && !ft_mc_enabled && replaces == r0);
+        assert(deletes == del0 + 2 && !hardware.live && g->state == FT_MR_REFUSED_PAUSED);
+        ft_mc_enabled = true;
+        g->dirty = true;
+        switch_in_derive = true;
+        run();
+        assert(adds == x0 + 1 && !hardware.live && g->state == FT_MR_REFUSED_PAUSED);
+        ft_mc_enabled = true;
+        ft_mr_recheck = true;
+        run();
+        assert(adds == x0 + 2 && hardware.live && g->state == FT_MR_INSTALLED);
     }
     /* The entry the worker picked is deleted while it waits: it is retired
      * from hardware, and nothing is built for an entry ipmr no longer has --

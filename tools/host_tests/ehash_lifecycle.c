@@ -173,6 +173,7 @@ static struct { struct { bool mutex; } ctrl; } cdx_instance, *cdx_info = &cdx_in
 static unsigned unlocked;
 #define lockdep_assert_held(lock) do { if (!*(lock)) unlocked++; } while (0)
 #define SUCCESS 0
+#define FAILURE (-1)
 #define EN_EHASH_DELETE_UNSYNCED (-2)
 static unsigned hc_syncs;
 static void *synced_table;

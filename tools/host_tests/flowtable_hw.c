@@ -522,6 +522,62 @@ static void cdx_ft_ifstats_retention(unsigned *retained, u64 *deferred)
     *retained = 0;
     *deferred = 0;
 }
+/* An entry's hold on the ingress policer profile its rule names, so the
+ * profile's filter going cannot hand it to a new one while the entry still
+ * meters against it. The pool behind the count is the police harness's; here
+ * the count is the whole of it. Profile 0 is the default every flow meters
+ * against and is not counted, as in cdx_police.c. */
+static unsigned police_refs[CDX_FT_QOS_MAX_POLICER + 1];
+static void cdx_police_profile_ref(u8 profile)
+{
+    assert(profile <= CDX_FT_QOS_MAX_POLICER);
+    if (profile) police_refs[profile]++;
+}
+static void cdx_police_profile_unref(u8 profile)
+{
+    assert(profile <= CDX_FT_QOS_MAX_POLICER);
+    if (!profile) return;
+    assert(police_refs[profile]);
+    police_refs[profile]--;
+}
+/* The terminal latch's port-stop work. Queued is all the workqueue does here;
+ * running it is the test's call, as the workqueue's would be, and a disabled
+ * item queues nothing again. It takes the control lock, so it is never waited
+ * for under it. */
+struct work_struct { int unused; };
+struct delayed_work {
+    struct work_struct work;
+    void (*func)(struct work_struct *work);
+    bool queued, disabled;
+    unsigned long delay;
+};
+#define DECLARE_DELAYED_WORK(n, f) struct delayed_work n = { .func = (f) }
+static bool schedule_delayed_work(struct delayed_work *dwork, unsigned long delay)
+{
+    if (dwork->queued || dwork->disabled)
+        return false;
+    dwork->queued = true;
+    dwork->delay = delay;
+    return true;
+}
+static bool disable_delayed_work_sync(struct delayed_work *dwork)
+{
+    bool queued = dwork->queued;
+
+    assert(!cdx_info->ctrl.mutex);
+    dwork->queued = false;
+    dwork->disabled = true;
+    return queued;
+}
+static void run_delayed_work(struct delayed_work *dwork)
+{
+    assert(dwork->queued && !cdx_info->ctrl.mutex);
+    dwork->queued = false;
+    dwork->func(&dwork->work);
+}
+/* Declared by cdx_flowtable_backend.h, past the part this harness slices; the
+ * work above calls it ahead of its definition. */
+int cdx_ft_recover(void);
 #include "hardware_production.inc"
 #include "backend_production.inc"
 
@@ -797,6 +853,25 @@ static void test_backend(void)
     assert(!notifier_registered && !ft_guard_registered);
     cdx_flowtable_guard_exit();
     free(key); key=NULL; /* Only simulated hardware reset reclaims the live key. */
+    /* A root outside the unicast delete path -- a multicast group's or an
+     * SA's -- that could not be provably unlinked latches the same terminal
+     * state, with the transaction held, and queues the work that stops the
+     * ports: nothing else is guaranteed to drive recovery from there. The
+     * work waits for RTNL a second at a time rather than under the control
+     * lock. Unload disables it for good, so neither a later latch nor the
+     * work's own retry can queue it past the module. */
+    ft_failed = false; stopped = false; /* A fresh load, as far as the latch goes. */
+    unsigned stops = quiesces;
+    cdx_ft_begin(); cdx_ft_fatal(); assert(cdx_ft_failed()); cdx_ft_end();
+    assert(ft_fatal_work.queued && !ft_fatal_work.delay);
+    rtnl_busy = true; run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ && quiesces == stops && !stopped);
+    rtnl_busy = false; run_delayed_work(&ft_fatal_work);
+    assert(!ft_fatal_work.queued && quiesces == stops + 1 && stopped);
+    assert(!cdx_info->ctrl.mutex && !rtnl && !allocations);
+    cdx_ft_fatal(); assert(ft_fatal_work.queued);
+    cdx_ft_fatal_stop(); assert(!ft_fatal_work.queued && ft_fatal_work.disabled);
+    cdx_ft_fatal(); assert(!ft_fatal_work.queued);
 }
 
 int main(void)
@@ -842,7 +917,9 @@ int main(void)
                         (channel << CDX_FT_QOS_CHANNEL_SHIFT) |
                         (policer << CDX_FT_QOS_POLICER_SHIFT);
                 assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+                assert(police_refs[policer] == !!policer);
                 assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+                assert(!police_refs[policer]);
             }
     rule.qos = expected_qos = 0;
     for (unsigned i = 0; i < 16; i++) {
@@ -1186,25 +1263,32 @@ int main(void)
      * that settles it once retired, or quiescence whichever way its delete
      * failed. A record back in the pool early is a free-list link the
      * microcode can still overwrite, and a record the next device is handed
-     * while the old entry still counts into it. */
+     * while the old entry still counts into it. The policer profile the rule
+     * names is held the same way, and for the same reason: a profile back in
+     * the pool early is reprogrammed for a new filter while the entry still
+     * meters against it. */
     {
         struct cdx_ft_stats_slot vlan_slot = { .rx_index = 0x10, .tx_index = 0x11 };
         struct cdx_ft_hw *live = NULL;
-        unsigned before;
+        unsigned before, policer = 3;
 
         delete_result = 0;
         stats = (struct cdx_ft_stats_binding){
             .in_session = &ifstats_slot, .out_session = &ifstats_slot,
             .out_tunnel = &tunnel_slot,
             .in_vlan = { &vlan_slot }, .out_vlan = { NULL, &vlan_slot } };
+        rule.qos = expected_qos = policer << CDX_FT_QOS_POLICER_SHIFT;
         fail_insert = true;
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EIO && !hw);
         assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+        assert(!police_refs[policer]);
         fail_insert = false;
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
         assert(ifstats_slot.holds == 2 && tunnel_slot.holds == 1 && vlan_slot.holds == 2);
+        assert(police_refs[policer] == 1);
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
         assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+        assert(!police_refs[policer]);
 
         /* Retired: held through a barrier that fails, given back by the one
          * that completes. */
@@ -1213,9 +1297,11 @@ int main(void)
         assert(cdx_ft_hw_del(&hw) == -EAGAIN && ifstats_slot.holds == 2 && vlan_slot.holds == 2);
         fail_sync = true;
         assert(cdx_ft_hw_retry() == -EAGAIN && ifstats_slot.holds == 2 && tunnel_slot.holds == 1);
+        assert(police_refs[policer] == 1);
         fail_sync = false;
         assert(cdx_ft_hw_retry() == 0 && !cdx_ft_hw_pending() && !key);
         assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+        assert(!police_refs[policer]);
 
         /* And by a later delete's own sync, which proves it too. */
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && cdx_ft_hw_del(&hw) == -EAGAIN);
@@ -1233,8 +1319,10 @@ int main(void)
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && cdx_ft_hw_del(&hw) == -EIO);
         assert(cdx_ft_hw_retry() == -EAGAIN && !older && key->linked);
         assert(ifstats_slot.holds == 2 && vlan_slot.holds == 2 && cdx_ft_hw_pending() == 1);
+        assert(police_refs[policer] == 1);
         stopped = true; cdx_ft_hw_quiesced(); stopped = false;
         assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
+        assert(!police_refs[policer]);
         assert(!allocations && !cdx_ft_hw_pending() && key->linked);
         free(key); key = NULL;
 
@@ -1260,7 +1348,9 @@ int main(void)
         assert(key && ifstats_slot.holds == 2 && vlan_slot.holds == 2);
         assert(cdx_ft_hw_retry() == 0 && syncs == before + 1 && !key && !cdx_ft_hw_pending());
         assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds && !allocations);
+        assert(!police_refs[policer]);
         stats = (struct cdx_ft_stats_binding){};
+        rule.qos = expected_qos = 0;
     }
     test_backend();
     puts("Flowtable hardware: encoding, consuming delete, allocation-free retirement, barrier retry and quiescence passed");

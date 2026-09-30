@@ -69,6 +69,7 @@ union nf_inet_addr {
 #define BR_MCAST_TO_HOST_ROUTER (1U << 1)
 #define BR_MCAST_TO_HOST_FLOOD  (1U << 2)
 #define BR_MCAST_TO_HOST_PROMISC (1U << 3)
+#define BR_MCAST_SNOOPED (1U << 4)
 #define IFF_PROMISC 0x100
 #define IPV6_ADDR_SCOPE_LINKLOCAL 0x02
 
@@ -153,9 +154,14 @@ static unsigned long long ft_mc_refused;
 /* What the worker last found of the bridge filter hooks; the cases set it
  * as the worker would. */
 static bool ft_mc_filtered;
+/* The `multicast` parameter, on at load; the cases switch it as the offload
+ * service would, and wake the learner as its setter does. */
+static bool ft_mc_enabled = true;
 /* Read only by the worker and /proc, neither of which is compiled here. */
 __attribute__((unused)) static unsigned int ft_mc_installed;
 __attribute__((unused)) static unsigned long long ft_mc_install_errors;
+/* Of the entries the worker installed, those that discard. */
+static unsigned int ft_mc_discarding;
 
 static unsigned holds;   /* net-device references outstanding, all devices */
 static void dev_hold(struct net_device *d) { holds++; d->refs++; }
@@ -263,8 +269,9 @@ static int __ipv6_addr_src_scope(int type) { return type >> 16; }
 
 /* The bridge's answer, scripted per flow: which ports a frame of this source
  * arriving on this port in this VLAN goes to, and why it also goes up. A flow
- * nothing scripted gets no port at all -- the bridge's answer for a group with
- * no listener but the ingress. */
+ * nothing scripted gets no port at all, and no BR_MCAST_SNOOPED either: an
+ * empty set that is not snooping's verdict, which drops nothing. A case
+ * wanting snooping's own "nowhere" scripts the bit. */
 static struct snap {
     struct net_device *in;
     uint32_t source;
@@ -551,6 +558,13 @@ static void built(struct cdx_mc_group *hw, const struct cdx_mc_group_spec *spec)
     }
 }
 
+/* What the backend accepts: listeners, or a discard -- bridged, and naming
+ * none -- never neither. */
+static bool buildable(const struct cdx_mc_group_spec *spec)
+{
+    return spec->discard ? spec->bridged && !spec->listeners : spec->listeners;
+}
+
 /* Only the worker adds and deletes, and it does the hardware with the
  * transaction alone: the MDB handler and the netdev events, which take
  * ft_mc_lock under RTNL, must never wait behind a hardware call. The drain
@@ -558,7 +572,7 @@ static void built(struct cdx_mc_group *hw, const struct cdx_mc_group_spec *spec)
 static int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
                             struct cdx_mc_group **result)
 {
-    assert(in_transaction && !ft_mc_lock && spec->listeners);
+    assert(in_transaction && !ft_mc_lock && buildable(spec));
     adds++;
     *result = NULL;
     if (add_rc)
@@ -597,7 +611,7 @@ static int replace_rc;
 static int cdx_mc_group_replace(struct cdx_mc_group *hw,
                                 const struct cdx_mc_group_spec *spec)
 {
-    assert(hw && in_transaction && spec->listeners);
+    assert(hw && in_transaction && buildable(spec));
     assert(!ft_mc_lock == !caller_rtnl);
     replaced = *spec;
     replaces++;
@@ -739,7 +753,8 @@ static void free_lists(struct list_head *dead, struct list_head *gone)
 
 /* One run of the worker, less the hardware: drain what the hook recorded,
  * ask the bridge about every flow marked for it, match routes, retire, and
- * put every stale flow the pick accepts "in hardware". */
+ * put every stale flow the pick accepts "in hardware" -- replicating, or
+ * discarding a stream the bridge forwards nowhere. */
 static void pass(void)
 {
     struct ft_mc_flow *f;
@@ -757,8 +772,10 @@ static void pass(void)
         if (!f->stale)
             continue;
         if (!f->hw) {
-            f->contested = ft_mc_installable(f) && ft_mc_key_contested(f);
-            if (!ft_mc_installable(f) || f->contested) {
+            bool wanted = ft_mc_installable(f) || ft_mc_discardable(f);
+
+            f->contested = wanted && ft_mc_key_contested(f);
+            if (!wanted || f->contested) {
                 f->stale = false;
                 continue;
             }
@@ -766,17 +783,26 @@ static void pass(void)
         f->stale = false;
         f->contested = ft_mc_key_contested(f);
         /* The worker records the chain it built, whole, with the entry,
-         * and a build is current against every egress change before it. */
+         * and a build is current against every egress change before it. A
+         * discard names no port, and records no chain. */
         if (!f->contested && ft_mc_installable(f) &&
             f->retries < FT_MC_MAX_RETRIES) {
             struct cdx_mc_group_spec spec;
 
             f->hw = FAKE_HW;
+            f->hw_discard = false;
             f->carried_route = ft_mc_live_route(f) ? f->route : NULL;
             ft_mc_flow_spec(f, &spec);
             ft_mc_chain_record(f, &spec);
+        } else if (!f->contested && ft_mc_discardable(f) &&
+                   f->retries < FT_MC_MAX_RETRIES) {
+            f->hw = FAKE_HW;
+            f->hw_discard = true;
+            f->carried_route = NULL;
+            ft_mc_chain_forget(f);
         } else {
             f->hw = NULL;
+            f->hw_discard = false;
             f->carried_route = NULL;
             ft_mc_chain_forget(f);
         }
@@ -1368,13 +1394,15 @@ static void the_bridge_decides(void)
     /* The listener BLOCKs S1. The bridge announces the (S1,G) port group
      * again, blocked, which the handler hands on as a leave of that
      * membership -- and every flow of the group is asked again. The bridge
-     * now forwards S1 nowhere: the flow leaves hardware and stays, named by
+     * now forwards S1 nowhere, snooping's own answer: the flow's entry drops
+     * the stream where it is matched instead, and the flow stays, named by
      * the (*,G) membership, for as long as that stands. */
     assert(!ft_mc_membership(&BR, &P2, &sg1, false, false));
     assert(f->dirty && f2->dirty);
-    answer(&P1, S1, 0, 0, 0);
+    answer(&P1, S1, 0, BR_MCAST_SNOOPED, 0);
     pass();
-    assert(!f->hw && !f->ports && !strcmp(ft_mc_state(f), "refused-listener"));
+    assert(f->hw && f->hw_discard && !f->ports && !f->hw_spec.listeners);
+    assert(!strcmp(ft_mc_state(f), "discarding"));
     assert(ft_mc_count == 1 && ft_mc_flow_count == 2);
 
     /* ASM and SSM listeners of one group: P3 in EXCLUDE{} for any source,
@@ -2482,6 +2510,147 @@ static void the_worker_records_what_the_drain_replays(void)
     reset();
 }
 
+static void switch_off(void) { ft_mc_enabled = false; }
+
+static void a_stream_nobody_wants_is_dropped_in_hardware(void)
+{
+    const uint32_t G = 0x190007ef, S = 0x0100000a;
+    struct br_ip any = group_v4(G, 0, 0);
+    struct cdx_mc_group *hw;
+    struct ft_mc_flow *f;
+    unsigned r0;
+
+    /* The last listener leaves while upstream keeps sending, as an ISP does
+     * until it processes the leave. Snooping's own answer now forwards the
+     * stream nowhere and hands the host nothing: the bridge drops every
+     * frame. The entry becomes one that drops them where they are matched,
+     * by a replace under the same key -- never out of the table, where each
+     * frame would reach the CPU to be dropped there -- and the flow is kept
+     * though nothing names it. The worker itself, against the backend. */
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, BR_MCAST_SNOOPED, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    adds = dels = replaces = 0;
+    ft_mc_work_fn(NULL);
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && f->hw != FAKE_HW && adds == 1 && !f->hw_discard);
+    assert(!strcmp(ft_mc_state(f), "installed") && !ft_mc_discarding);
+    hw = f->hw;
+    assert(!ft_mc_membership(&BR, &P2, &any, false, false));
+    answer(&P1, S, 0, BR_MCAST_SNOOPED, 0);
+    ft_mc_work_fn(NULL);
+    assert(flow(&P1, S, 0) == f && f->hw == hw && f->hw_discard && !ft_mc_count);
+    assert(adds == 1 && !dels && replaces == 1);
+    assert(hw->chain.discard && hw->chain.bridged && !hw->chain.listeners);
+    assert(!strcmp(ft_mc_state(f), "discarding") && ft_mc_discarding == 1);
+    /* It copies out of no port: no chain recorded, nothing held for one,
+     * and no port's egress change rebuilds it. */
+    assert(!f->hw_spec.listeners && !P2.refs);
+    tc_begin();
+    r0 = replaces;
+    egress_changed(&P1);
+    assert(!f->egress_stale && !ft_mc_egress_drain(&P1) && replaces == r0);
+    tc_end();
+
+    /* A listener joins again: the listeners come back by a replace, and the
+     * key never left the table. */
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, BR_MCAST_SNOOPED, 1, &P2);
+    ft_mc_work_fn(NULL);
+    assert(f->hw == hw && !f->hw_discard && adds == 1 && !dels && replaces == 2);
+    assert(!strcmp(ft_mc_state(f), "installed") && !ft_mc_discarding);
+    assert(f->hw_spec.listeners == 1 && same_chain(&f->hw_spec, &hw->chain));
+
+    /* An empty set that is not snooping's -- the bridge down, the VID
+     * missing, the ingress not forwarding -- says nothing about the data and
+     * is no drop: the entry comes out, and the flow, named still, waits in
+     * software. */
+    answer(&P1, S, 0, 0, 0);
+    f->dirty = true;
+    ft_mc_work_fn(NULL);
+    assert(!f->hw && !f->hw_discard && dels == 1 && !ft_mc_discarding);
+    assert(!strcmp(ft_mc_state(f), "refused-listener"));
+
+    /* Nor is a stream the host wants, or one only a VIF would act on. */
+    answer(&P1, S, 0, BR_MCAST_SNOOPED | BR_MCAST_TO_HOST_ROUTER, 0);
+    f->dirty = true;
+    ft_mc_work_fn(NULL);
+    assert(!f->hw && adds == 1 && !strcmp(ft_mc_state(f), "refused-listener"));
+
+    /* Named still, but every listener behind the ingress or blocking the
+     * source: snooping forwards it nowhere, and it goes in as a discard from
+     * software. It goes at the first refresh that counts nothing, not on the
+     * membership interval: a live stream is never a whole refresh without a
+     * frame. */
+    answer(&P1, S, 0, BR_MCAST_SNOOPED, 0);
+    f->dirty = true;
+    ft_mc_work_fn(NULL);
+    assert(f->hw && f->hw_discard && adds == 2 && ft_mc_discarding == 1);
+    /* Switched off, the discard comes out with everything else; back on,
+     * it goes in again. */
+    ft_mc_enabled = false;
+    ft_mc_recheck = true;
+    ft_mc_work_fn(NULL);
+    assert(!f->hw && dels == 2 && !ft_mc_discarding);
+    assert(!strcmp(ft_mc_state(f), "refused-paused"));
+    ft_mc_enabled = true;
+    ft_mc_recheck = true;
+    ft_mc_work_fn(NULL);
+    assert(f->hw && f->hw_discard && adds == 3 && ft_mc_discarding == 1);
+    stats_now = (struct cdx_ft_counters){ .packets = 5, .bytes = 320 };
+    ft_mc_refresh_fn(NULL);
+    ft_mc_work_fn(NULL);
+    assert(!f->gone && f->hw && f->hw_discard);
+    ft_mc_refresh_fn(NULL);
+    assert(f->gone);
+    ft_mc_work_fn(NULL);
+    assert(!flow(&P1, S, 0) && dels == 3 && !ft_mc_discarding && !ft_mc_flow_count);
+    stats_now = (struct cdx_ft_counters){ 0 };
+
+    /* Multicast acceleration switched off: nothing stays in hardware and
+     * nothing goes in, each flow saying why; the setter wakes the learner
+     * with every flow to reconsider. Back on, each is carried again. */
+    reset();
+    adds = dels = 0;
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, BR_MCAST_SNOOPED, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    ft_mc_work_fn(NULL);
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && adds == 1);
+    ft_mc_enabled = false;
+    ft_mc_recheck = true;
+    ft_mc_work_fn(NULL);
+    assert(!f->hw && dels == 1 && !strcmp(ft_mc_state(f), "refused-paused"));
+    ft_mc_enabled = true;
+    ft_mc_recheck = true;
+    ft_mc_work_fn(NULL);
+    assert(f->hw && adds == 2 && !strcmp(ft_mc_state(f), "installed"));
+
+    /* Switched off after the pass took its spec but before its transaction:
+     * the add does not land, so a stop that has read nothing installed under
+     * the transaction never sees one appear after. */
+    ft_mc_enabled = false;
+    ft_mc_recheck = true;
+    ft_mc_work_fn(NULL);
+    assert(!f->hw && dels == 2);
+    ft_mc_enabled = true;
+    ft_mc_recheck = true;
+    before_begin = switch_off;
+    before_begin_skip = 1;
+    ft_mc_work_fn(NULL);
+    assert(!before_begin && !ft_mc_enabled && !f->hw && adds == 2);
+    assert(!strcmp(ft_mc_state(f), "refused-paused"));
+    ft_mc_enabled = true;
+    ft_mc_recheck = true;
+    ft_mc_work_fn(NULL);
+    assert(f->hw && adds == 3);
+    assert(!in_transaction && !ft_mc_lock && !rtnl);
+    reset();
+}
+
 static void rows_speak_for_memberships(void)
 {
     const uint32_t G = 0x140007ef, S1 = 0x0100000a;
@@ -2894,6 +3063,7 @@ int main(void)
     the_dedup_slots();
     devices_and_bridges_change();
     the_worker_records_what_the_drain_replays();
+    a_stream_nobody_wants_is_dropped_in_hardware();
     rows_speak_for_memberships();
     replayed_memberships();
     a_bridge_filter_refuses_every_flow();

@@ -445,6 +445,8 @@ static LIST_HEAD(ft_mr_groups);
 static int ft_mr_lock;
 static unsigned int ft_mr_count;
 static unsigned int ft_mr_policy[2];
+/* The `multicast` parameter both learners answer to, on at load. */
+static bool ft_mc_enabled = true;
 /* Set by a VIF change for the worker, which is not compiled here. */
 static bool ft_mr_taps_stale;
 __attribute__((unused)) static unsigned int ft_mr_installed;
@@ -612,6 +614,7 @@ static void reset(void)
 {
     memset(ft_mr_vif, 0, sizeof(ft_mr_vif));
     memset(ft_mr_policy, 0, sizeof(ft_mr_policy));
+    ft_mc_enabled = true;
     memset(memberships, 0, sizeof(memberships));
     membership_count = 0;
     vlan_enabled = false;
@@ -754,7 +757,20 @@ int main(void)
     assert(refuse(g) == FT_MR_REFUSED_TABLE);
     /* Its VIF indexes are another table's, so it names no oif to watch. */
     assert(derive(g, &plan) == FT_MR_REFUSED_TABLE && !plan.oifs_known);
+    /* Before the switch, too: switched off, it is still another table's. */
+    ft_mc_enabled = false;
+    assert(refuse(g) == FT_MR_REFUSED_TABLE);
     g->table = RT_TABLE_DEFAULT;
+    /* Multicast acceleration switched off keeps every group in software,
+     * ahead of the policy. Its oifs are named all the same, so Linux
+     * forwarding it meanwhile confirms it for the moment the switch comes
+     * back on. */
+    ft_mr_policy[ft_mr_idx(AF_INET)] = 1;
+    assert(refuse(g) == FT_MR_REFUSED_PAUSED);
+    ft_mr_policy[ft_mr_idx(AF_INET)] = 0;
+    assert(derive(g, &plan) == FT_MR_REFUSED_PAUSED);
+    assert(plan.oifs_known && plan.oif_count == 1 && plan.oif[0] == LAN.ifindex);
+    ft_mc_enabled = true;
     /* A non-default rule anywhere in the family keeps the whole family out
      * of hardware, because an entry that matches at the classifier is never
      * offered to the rule that would have redirected it. */
@@ -1809,7 +1825,7 @@ int main(void)
          * ten different questions the same way. */
         static const enum ft_mr_state all[] = {
             FT_MR_PENDING, FT_MR_INSTALLED, FT_MR_BRIDGED, FT_MR_UNCONFIRMED,
-            FT_MR_REFUSED_TABLE,
+            FT_MR_REFUSED_TABLE, FT_MR_REFUSED_PAUSED,
             FT_MR_REFUSED_POLICY, FT_MR_REFUSED_WILDCARD,
             FT_MR_REFUSED_SCOPE, FT_MR_REFUSED_INGRESS, FT_MR_REFUSED_HOST,
             FT_MR_REFUSED_THRESHOLD, FT_MR_REFUSED_LISTENER,

@@ -286,6 +286,7 @@ def test_the_contract_is_tested_in_the_order_it_is_written():
     body = function(SOURCE.read_text(), "ft_mr_derive")
     order = [
         "FT_MR_REFUSED_TABLE",
+        "FT_MR_REFUSED_PAUSED",
         "FT_MR_REFUSED_POLICY",
         "FT_MR_REFUSED_WILDCARD",
         "FT_MR_REFUSED_SCOPE",

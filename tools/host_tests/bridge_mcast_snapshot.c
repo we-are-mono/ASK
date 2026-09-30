@@ -31,6 +31,7 @@ typedef uint16_t u16;
 #define BR_MCAST_TO_HOST_ROUTER (1U << 1)
 #define BR_MCAST_TO_HOST_FLOOD (1U << 2)
 #define BR_MCAST_TO_HOST_PROMISC (1U << 3)
+#define BR_MCAST_SNOOPED (1U << 4)
 #define MDB_PG_FLAGS_BLOCKED 1
 #define MCAST_INCLUDE 1
 #define BROPT_VLAN_ENABLED 0
@@ -347,9 +348,11 @@ int main(void)
             present[0] = true;              /* the (*,G) entry: ports 0, 1 */
             mdb[0].ports = &pg[0];
             pg[0].next = &pg[1];
-            /* Never back out of the ingress, member or not. */
+            /* Never back out of the ingress, member or not. The answer is
+             * snooping's, which is what lets a caller read an empty set as
+             * data the bridge drops. */
             n = received(0, 8);
-            assert(n == 1 && listed(n, 1) && local == 0);
+            assert(n == 1 && listed(n, 1) && local == BR_MCAST_SNOOPED);
             /* Router ports too, the ingress excepted. */
             add_router(2, family);
             add_router(0, family);
@@ -379,11 +382,15 @@ int main(void)
             dev[9].port = &port[9];
             /* An ingress that is not forwarding forwards nothing, and hands
              * the host nothing: a learning port learns the source and drops
-             * the frame. */
+             * the frame. Nor is that empty set snooping's answer, and a
+             * caller must not read it as one; nor is a down bridge's. */
             mdb[0].host_joined = true;
             port[0].state = BR_STATE_LEARNING;
             assert(received(0, 8) == 0 && local == 0);
             port[0].state = BR_STATE_FORWARDING;
+            bridge.running = false;
+            assert(received(0, 8) == 0 && local == 0);
+            bridge.running = true;
             mdb[0].host_joined = false;
             port[0].mst = true;
             assert(received(0, 8) == -EOPNOTSUPP);
@@ -392,13 +399,13 @@ int main(void)
                 /* Nor one whose VLAN is not forwarding, not usable, or not
                  * the port's at all. */
                 port[0].vlan.state = BR_STATE_LEARNING;
-                assert(received(0, 8) == 0);
+                assert(received(0, 8) == 0 && local == 0);
                 port[0].vlan.state = BR_STATE_FORWARDING;
                 port[0].vlan.usable = false;
-                assert(received(0, 8) == 0);
+                assert(received(0, 8) == 0 && local == 0);
                 port[0].vlan.usable = true;
                 port[0].vlan.vid = 43;
-                assert(received(0, 8) == 0);
+                assert(received(0, 8) == 0 && local == 0);
                 port[0].vlan.vid = 42;
                 /* The bridge itself outside the VLAN: what it sends goes
                  * nowhere, but a port's data is forwarded port to port. */
@@ -413,17 +420,20 @@ int main(void)
              * permanently or by a query heard for this family only; or
              * nobody snoops, so everything floods and goes up. */
             mdb[0].host_joined = true;
-            assert(received(0, 8) == 2 && local == BR_MCAST_TO_HOST_JOINED);
+            assert(received(0, 8) == 2 &&
+                   local == (BR_MCAST_SNOOPED | BR_MCAST_TO_HOST_JOINED));
             mdb[0].host_joined = false;
             ctx()->multicast_router = MDB_RTR_TYPE_PERM;
-            assert(received(0, 8) == 2 && local == BR_MCAST_TO_HOST_ROUTER);
+            assert(received(0, 8) == 2 &&
+                   local == (BR_MCAST_SNOOPED | BR_MCAST_TO_HOST_ROUTER));
             ctx()->multicast_router = MDB_RTR_TYPE_TEMP_QUERY;
             ctx()->router_timer[!family] = true;
-            assert(received(0, 8) == 2 && local == 0);
+            assert(received(0, 8) == 2 && local == BR_MCAST_SNOOPED);
             ctx()->router_timer[family] = true;
-            assert(received(0, 8) == 2 && local == BR_MCAST_TO_HOST_ROUTER);
+            assert(received(0, 8) == 2 &&
+                   local == (BR_MCAST_SNOOPED | BR_MCAST_TO_HOST_ROUTER));
             ctx()->multicast_router = MDB_RTR_TYPE_DISABLED;
-            assert(received(0, 8) == 2 && local == 0);
+            assert(received(0, 8) == 2 && local == BR_MCAST_SNOOPED);
             ctx()->multicast_router = MDB_RTR_TYPE_PERM;
             mdb[0].host_joined = true;
             ctx()->querier[family] = false;
@@ -438,8 +448,8 @@ int main(void)
             /* A promiscuous bridge hands everything up besides. */
             bridge.flags = IFF_PROMISC;
             assert(received(0, 8) == 2 &&
-                   local == (BR_MCAST_TO_HOST_JOINED | BR_MCAST_TO_HOST_ROUTER |
-                             BR_MCAST_TO_HOST_PROMISC));
+                   local == (BR_MCAST_SNOOPED | BR_MCAST_TO_HOST_JOINED |
+                             BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC));
             bridge.flags = 0;
             mdb[0].host_joined = false;
             ctx()->multicast_router = MDB_RTR_TYPE_TEMP_QUERY;
@@ -462,8 +472,10 @@ int main(void)
             pg[3].flags = MDB_PG_FLAGS_BLOCKED;
             n = received(0, 8);
             assert(n == 1 && listed(n, 4));
+            /* Every port blocks the source: snooping forwards it nowhere
+             * and says so, an empty set the bridge drops the data for. */
             pg[4].flags = MDB_PG_FLAGS_BLOCKED;
-            assert(received(0, 8) == 0);
+            assert(received(0, 8) == 0 && local == BR_MCAST_SNOOPED);
             /* IGMPv2/MLDv1: the (*,G) entry alone, whatever its modes. */
             ctx()->include[family] = false;
             n = received(0, 8);

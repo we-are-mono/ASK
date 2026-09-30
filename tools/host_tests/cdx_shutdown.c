@@ -58,6 +58,25 @@ static void cdx_flowtable_quiesced(void)
 {
     assert(rtnl && cdx_info->ctrl.mutex && ports_safe && !callbacks_released);
 }
+/* The terminal latch's port-stop work takes the control lock and reads
+ * cdx_info, so it is disabled without the lock and before anything it reaches
+ * goes -- ahead of the deinit chain, whose multicast teardown may latch again
+ * and must not queue it. */
+static bool fatal_work_disabled;
+static void cdx_ft_fatal_stop(void)
+{
+    assert(!cdx_info->ctrl.mutex && !fatal_work_disabled);
+    assert(!ports_safe && !callbacks_released && !freed);
+    fatal_work_disabled = true;
+}
+/* The discard queue may hold a frame whose buffers belong to a pool the
+ * deinit chain releases: torn down once the ports are stopped, before that. */
+static unsigned discard_exits;
+static void cdx_discard_exit(void)
+{
+    assert(rtnl && cdx_info->ctrl.mutex && ports_safe && !callbacks_released);
+    discard_exits++;
+}
 static int ceetm_exit(void)
 {
     assert(rtnl && cdx_info->ctrl.mutex && ports_safe);
@@ -78,7 +97,7 @@ static void msleep(unsigned ms)
 static void release_callbacks(void)
 {
     assert(!rtnl && !cdx_info->ctrl.mutex && ports_safe && queues_safe);
-    assert(!freed);
+    assert(!freed && fatal_work_disabled && discard_exits == 1);
     cdx_ctrl_timer_stop();  /* Normal exit callback is idempotent. */
     callbacks_released = true;
 }
@@ -95,13 +114,13 @@ int main(void)
     for (port_failures = 0; port_failures <= 3; port_failures++) {
         for (queue_failures = 0; queue_failures <= 3; queue_failures++) {
             ports_safe = queues_safe = callbacks_released = freed = false;
-            ndo_released = false;
+            ndo_released = fatal_work_disabled = false; discard_exits = 0;
             sleeps = netlink_operations = port_attempts = queue_attempts = 0;
             lock_contention = 2; lock_waits = timer_stops = 0;
             timer_running = true; cdx_info->ctrl.timer_thread = &timer_running;
             cdx_module_deinit();
             assert(freed && !rtnl && !cdx_info->ctrl.mutex);
-            assert(ndo_released);
+            assert(ndo_released && fatal_work_disabled && discard_exits == 1);
             assert(timer_stops == 1 && !cdx_info->ctrl.timer_thread);
             assert(lock_waits == 2 + sleeps && !lock_contention);
             assert(port_attempts == port_failures + 1);

@@ -24,6 +24,7 @@ def controller(tmp_path):
     replacements = {
         "/proc/cdx_flowtable": str(tmp_path / "backend"),
         "/sys/module/cdx": str(tmp_path / "cdx"),
+        "/sys/module/ask_flowtable/parameters/multicast": str(tmp_path / "multicast"),
         "/run/lock/ask-flowtable.lock": str(tmp_path / "lock"),
         "/run/lock/ask-flowtable.paused": str(tmp_path / "paused"),
         "/etc/ask/offload.conf": str(tmp_path / "policy"),
@@ -93,7 +94,8 @@ int ft_enumerate(struct ft_policy *p) {
     (tmp_path / "backend").write_text(
         "bindings 0\nentries 0\nhandle_refs 0\nneighbour_refs 0\n"
         "quarantine 0\nfatal 0\nobserve 0\ninvalidated 0\n"
-        "installs 0\ndeletes 0\nrearms 0\nerrors 0\nqos_mark_mask 0\n")
+        "installs 0\ndeletes 0\nrearms 0\nerrors 0\nqos_mark_mask 0\n"
+        "mcast_enabled 1\nmcast_installed 0\nmroute_installed 0\n")
     os.mkfifo(tmp_path / "events")
     return Controller(tmp_path, binary)
 
@@ -310,6 +312,48 @@ def test_disabled_configuration_stays_disabled_and_can_be_enabled(controller):
         assert not c.status()["reconciliation_paused"]
         (c.root / "policy").write_text(POLICY)
         c.wait(c.ready)
+
+
+def test_stop_and_disabled_policy_withdraw_multicast(controller):
+    """Multicast follows no flowtable: an enabled policy switches the adapter's
+    multicast acceleration on after its table, and a stop or a disabled policy
+    switches it off first. A stop returns only once both learners' groups have
+    left hardware, and a disabled policy rewrites the switch on every check,
+    which is how an adapter reloaded with it on again is caught."""
+    c = controller
+    switch = c.root / "multicast"
+
+    def multicast():
+        """The parameter as last written, None before the first write."""
+        return switch.read_text() if switch.exists() else None
+
+    with c.daemon():
+        c.wait(lambda: c.ready() and multicast() == "Y\n")
+        c.backend(mcast_installed=2, mroute_installed=1)
+        stop = subprocess.Popen([str(c.binary), "stop"], env=c.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            c.wait(lambda: multicast() == "N\n")
+            c.backend(mcast_installed=0)
+            time.sleep(0.3)
+            assert stop.poll() is None  # a routed group is still in hardware
+            c.backend(mroute_installed=0)
+            out, err = stop.communicate(timeout=3)
+            assert stop.returncode == 0, err
+            drained = json.loads(out)["drained"]
+            assert drained["mcast_installed"] == drained["mroute_installed"] == 0, drained
+        finally:
+            if stop.poll() is None:
+                stop.kill()
+                stop.wait()
+        time.sleep(0.3)
+        assert multicast() == "N\n" and not c.ready()
+        c.run("resume")
+        c.wait(lambda: c.ready() and multicast() == "Y\n")
+        (c.root / "policy").write_text("enabled no\n")
+        c.wait(lambda: not c.ready() and multicast() == "N\n")
+        switch.write_text("Y\n")
+        c.wait(lambda: multicast() == "N\n")
 
 
 def test_malformed_configuration_preserves_policy_and_does_not_block_stop(controller):
