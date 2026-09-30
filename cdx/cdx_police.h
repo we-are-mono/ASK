@@ -22,4 +22,12 @@ int cdx_police_setup_block(struct net_device *dev, struct flow_block_offload *f)
  * per admitted flow while its hardware entry is being built. */
 u8 cdx_police_lookup(const struct cdx_ft_rule *rule);
 
+/* A profile is named by every flow admitted under its filter, which outlive the
+ * filter. The flowtable backend refs a profile when it installs a flow naming
+ * it and unrefs when it removes that flow, so a profile is not reprogrammed for
+ * a new filter while an old flow still meters against it. Profile 0 (the
+ * default) is ignored. */
+void cdx_police_profile_ref(u8 profile);
+void cdx_police_profile_unref(u8 profile);
+
 #endif /* _CDX_POLICE_H_ */

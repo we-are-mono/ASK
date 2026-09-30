@@ -40,6 +40,7 @@ typedef uint16_t __be16; typedef uint32_t __be32;
 #define IPPROTO_UDP 17
 #define BIT(n) (1UL << (n))
 #define BIT_ULL(n) (1ULL << (n))
+#define WARN_ON_ONCE(x) (x)
 #define FMAN_INDEX 0
 #define ENABLE_INGRESS_POLICER 1
 #define DISABLE_INGRESS_POLICER 0
@@ -513,6 +514,30 @@ int main(void)
     fr = flower_rule(); fr.action.entries[0].police.notexceed.act_id = FLOW_ACTION_PIPE;
     assert(flower_add(&dev, 25, &fr) == -EOPNOTSUPP);      /* overlapping pipe: declined */
     assert(flower_del(&dev, 24) == 0);
+
+    /* A profile a filter installed is named by flows that outlive the filter,
+     * so it must not be handed to a new filter -- and reprogrammed -- while an
+     * old flow still meters against it. The backend refs on install, unrefs on
+     * removal; here the refs stand in for that. */
+    fr = flower_rule();
+    assert(flower_add(&dev, 30, &fr) == 0);
+    unsigned held = prof.last_profile;                    /* a flow names it */
+    cdx_police_profile_ref(held);
+    assert(flower_del(&dev, 30) == 0);                    /* filter gone, flow not */
+    /* Every other profile can be filled, but the held one stays out. */
+    for (unsigned i = 0; i < CDX_FT_QOS_MAX_POLICER - 1; i++) {
+        fr = flower_rule(); fr.ports.dst = 7000 + i;
+        assert(flower_add(&dev, 40 + i, &fr) == 0 && prof.last_profile != held);
+    }
+    /* Held out of the pool, so the next filter has nowhere to go -- rather than
+     * reusing a profile a live flow still meters against. */
+    fr = flower_rule(); fr.ports.dst = 8000;
+    assert(flower_add(&dev, 50, &fr) == -EOPNOTSUPP);
+    cdx_police_profile_unref(held);                       /* the flow retires */
+    assert(flower_add(&dev, 50, &fr) == 0 && prof.last_profile == held);  /* now reusable */
+    assert(flower_del(&dev, 50) == 0);
+    for (unsigned i = 0; i < CDX_FT_QOS_MAX_POLICER - 1; i++)
+        assert(flower_del(&dev, 40 + i) == 0);
 
     /* A prefix is what per-subscriber policing is made of: mask off the host
      * bits and every address in the subnet meets the same meter. */

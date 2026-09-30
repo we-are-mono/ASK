@@ -349,6 +349,14 @@ static LIST_HEAD(cdx_police_filters);
 /* Profile 0 is the default every unclassified flow already meters against, so
  * the pool starts at 1. Bit n set means profile n is spoken for. */
 static unsigned long cdx_police_profiles;
+/* A profile a filter installed is named by every flow the flowtable admitted
+ * under it, and those flows outlive the filter. Count them so a profile freed
+ * by its filter's teardown is not handed to a new filter -- and reprogrammed --
+ * while an old flow still meters against it. `pending` marks a profile whose
+ * filter is gone but whose flows are not, held out of the pool until the last
+ * unref. All under cdx_police_lock. */
+static u32 cdx_police_profile_refs[CDX_FT_QOS_MAX_POLICER + 1];
+static unsigned long cdx_police_profile_pending;
 
 static int cdx_police_profile_get(void)
 {
@@ -366,6 +374,42 @@ static void cdx_police_profile_put(unsigned int n)
 {
 	cdx_police_profiles &= ~BIT(n);
 }
+
+/* The flowtable backend refs a profile when it installs a flow that names it
+ * and unrefs when it removes that flow. */
+void cdx_police_profile_ref(u8 profile)
+{
+	unsigned long flags;
+
+	if (!profile || profile > CDX_FT_QOS_MAX_POLICER)
+		return;
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	cdx_police_profile_refs[profile]++;
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_police_profile_ref, ASK_CDX_FLOWTABLE);
+
+void cdx_police_profile_unref(u8 profile)
+{
+	unsigned long flags;
+
+	if (!profile || profile > CDX_FT_QOS_MAX_POLICER)
+		return;
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	if (WARN_ON_ONCE(!cdx_police_profile_refs[profile])) {
+		spin_unlock_irqrestore(&cdx_police_lock, flags);
+		return;
+	}
+	/* The last flow of a profile whose filter is already gone: only now is it
+	 * safe to return to the pool for another filter to reprogram. */
+	if (--cdx_police_profile_refs[profile] == 0 &&
+	    (cdx_police_profile_pending & BIT(profile))) {
+		cdx_police_profile_pending &= ~BIT(profile);
+		cdx_police_profile_put(profile);
+	}
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_police_profile_unref, ASK_CDX_FLOWTABLE);
 
 /* A field the filter did not constrain has a zero mask and matches anything,
  * which is what flower means by leaving it out. */
@@ -678,7 +722,13 @@ static int cdx_police_flower_destroy(struct net_device *dev,
 	filter = cdx_police_filter_find(dev, f->cookie);
 	if (filter) {
 		profile = filter->profile;
-		cdx_police_profile_put(profile);
+		/* Return the profile to the pool only if no admitted flow still
+		 * names it; otherwise hold it out (pending) until the last such
+		 * flow is unref'd, so it is never reprogrammed under a live flow. */
+		if (cdx_police_profile_refs[profile])
+			cdx_police_profile_pending |= BIT(profile);
+		else
+			cdx_police_profile_put(profile);
 		list_del(&filter->list);
 	}
 	spin_unlock_irqrestore(&cdx_police_lock, flags);

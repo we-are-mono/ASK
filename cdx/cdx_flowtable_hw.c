@@ -22,6 +22,9 @@ struct cdx_ft_hw {
 	RouteEntry route;
 	struct list_head retired;
 	int delete_rc;
+	/* The ingress policer profile the rule named, kept so removal can unref
+	 * it against the pool; also in delete_rc's padding. */
+	u8 policer;
 	/* In the padding delete_rc leaves, so an entry naming no record takes
 	 * no more memory than one without the array. */
 	unsigned int nstats;
@@ -119,6 +122,7 @@ static void ft_hw_free(struct cdx_ft_hw *hw)
 
 	for (i = 0; i < hw->nstats; i++)
 		cdx_ft_ifstats_put(hw->stats[i]);
+	cdx_police_profile_unref(hw->policer);
 	kfree(hw);
 }
 
@@ -490,6 +494,13 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * above freed an owner that held nothing. */
 	for (i = 0; i < hw->nstats; i++)
 		cdx_ft_ifstats_hold(hw->stats[i]);
+	/* Hold the ingress policer profile this flow names so its filter's
+	 * teardown cannot hand the profile to a new filter -- reprogramming its
+	 * rate -- while this flow still meters against it. Released in ft_hw_free,
+	 * once the entry is proven gone. The error paths above freed an hw whose
+	 * policer is still zero, so their kfree needs no unref. */
+	hw->policer = (rule->qos & CDX_FT_QOS_POLICER_MASK) >> CDX_FT_QOS_POLICER_SHIFT;
+	cdx_police_profile_ref(hw->policer);
 	*result = hw;
 	return 0;
 }
