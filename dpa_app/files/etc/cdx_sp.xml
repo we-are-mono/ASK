@@ -2,13 +2,6 @@
 <protocol name="pppoeschema" longname="pppoe handler" prevproto="pppoe">
      <execute-code>
       <before>
-       <!-- Ethernet ports only. The offset below is an Ethernet port's CC
-            tree, whose PPPoE relay table sits there; the IPsec offline port
-            classifies with a tree of its own, where the same offset is one of
-            its per-SA tables, and an offline port frame this parses as PPPoE
-            is left to that port's own distributions. -->
-       <if expr="$logicalportid lt 9">
-        <if-true>
         <if expr="($FW[48:16]) == 0xc021">
           <if-false>
             <!-- PPPoE session packet, police the packet first -->
@@ -27,8 +20,6 @@
             <action type="exit" confirm="yes" nextproto="end_parse"/>
           </if-true>
         </if>
-        </if-true>
-       </if>
      </before>
      </execute-code>
 </protocol>

@@ -306,14 +306,12 @@ err_ret:
 	return FAILURE;
 }
 
-/* The FQ range the port's distribution at `index` (0 up to
- * get_ofport_max_dist()) enqueues to. By position, not by type: a port's
- * distributions are whatever its policy lists, and a type it lacks used to
- * leave the caller's range unwritten. */
-int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t index,
+int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t type,
 		uint32_t *pfqid, uint32_t *count) 
 {
+	uint32_t ii;
 	struct oh_iface_info *iface_info;
+	struct cdx_dist_info *dist;
 	struct oh_port_info *info;
 
 	if (fm_idx >= MAX_FRAME_MANAGERS) {
@@ -332,13 +330,14 @@ int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t index,
 		return -1;
 	}
 	iface_info = info->ohinfo;	
-	if (index >= iface_info->max_dist) {
-		DPA_ERROR("%s::ofport handle %d has no distribution %u\n",
-				__func__, handle, index);
-		return -1;
+	dist = iface_info->dist_info;
+	for (ii = 0; ii < iface_info->max_dist; ii++) {
+		if (dist->type == type) {
+			*pfqid = dist->base_fqid;
+			*count = dist->count;
+		}
+		dist++;
 	}
-	*pfqid = iface_info->dist_info[index].base_fqid;
-	*count = iface_info->dist_info[index].count;
 	return 0;
 }
 

@@ -79,12 +79,8 @@ def test_the_routed_tables_are_asked_first_in_every_policy():
     3-tuple tables, which the soft parser's PPPoE path counts from) keep their
     places."""
     tree = pcd()
-    # The IPsec offline port classifies with distributions of its own alone
-    # (test_pcd_ipsec_offline_port.py), and so has none of these.
-    policies = [p for p in tree.findall("policy")
-                if not all(d.get("name").startswith("cdx_sec_")
-                           for d in p.findall("dist_order/distributionref"))]
-    assert len(policies) == len(tree.findall("policy")) - 1, [p.get("name") for p in policies]
+    policies = tree.findall("policy")
+    assert policies
     for policy in policies:
         order = [d.get("name") for d in policy.findall("dist_order/distributionref")]
         at = order.index("cdx_ipv6multicast_dist")

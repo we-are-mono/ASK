@@ -79,23 +79,15 @@ def offline_ports():
 
 def consumer_types():
     """The table types the IPsec port's tables are looked up by: an SA's own
-    (get_tbl_type) and a flow's through an inbound SA, which is one of the
-    types get_table_type() files a flow under and the port keys on the SA
-    (cdx_ipsec_decrypted_table()); any other is refused before the lookup."""
+    (get_tbl_type) and a flow's through an inbound SA (get_table_type)."""
     sa = (ROOT / "cdx/cdx_dpa_ipsec.c").read_text()
     calls = re.findall(r"dpa_ipsec_ofport_td\(\s*\w+,\s*([\w>.-]+)", sa)
     assert sorted(calls) == ["info->tbl_type", "tbl_type"], calls
     assert re.search(r"tbl_type = get_tbl_type\(sa\);", sa)
     ehash = (ROOT / "cdx/cdx_ehash.c").read_text()
     assert "info->tbl_type = tbl_type;" in ehash
-    pattern = r"\b(IPV[46]_\w+_TABLE|ESP_IPV[46]_TABLE)\b"
-    fill = function(sa, "cdx_ipsec_fill_sec_info")
-    assert fill.index("if (!cdx_ipsec_decrypted_table(info->tbl_type))") < \
-        fill.index("dpa_ipsec_ofport_td("), fill
-    decrypted = set(re.findall(pattern, function(sa, "cdx_ipsec_decrypted_table")))
-    filed = set(re.findall(pattern, function(ehash, "get_table_type")))
-    assert decrypted and decrypted < filed, (decrypted, filed)
-    names = set(re.findall(pattern, function(sa, "get_tbl_type"))) | decrypted
+    names = set(re.findall(r"\b(IPV[46]_\w+_TABLE|ESP_IPV[46]_TABLE)\b",
+                           function(sa, "get_tbl_type") + function(ehash, "get_table_type")))
     assert names
     return names
 
@@ -111,23 +103,21 @@ def test_ofport_tables(tmp_path):
         re.match(r"#define\s+(\w+)\s+\((\d+) << (\d+)\)", d).groups() for d in flag_defines)}
     port_bits = flags["OF_FQID_VALID"] | flags["IN_USE"] | flags["PORT_VALID"] | flags["PORT_TYPE_MASK"]
 
-    # The Wi-Fi port carries the shared tables and the IPsec port its own, one
-    # of each type it classifies by (cdx_pcd.xml), and among them the ones
-    # whose type is a port flag's bit -- which is what made collecting them in
-    # the flags word wrong.
+    # Both offline ports carry the same tables, and among them the ones whose
+    # type is a port flag's bit -- which is what made collecting them in the
+    # flags word wrong.
     (ipsec_portid, ipsec_types), (wifi_portid, wifi_types) = ports["IPSEC"], ports["WIFI"]
-    assert len(ipsec_types) == len(set(ipsec_types)), ipsec_types
-    ipsec_shipped = sorted({values[name] for name in ipsec_types})
-    wifi_shipped = sorted({values[name] for name in wifi_types})
-    colliding = sorted(t for t in set(ipsec_shipped) | set(wifi_shipped) if port_bits & (1 << t))
+    assert ipsec_types == wifi_types
+    shipped = sorted({values[name] for name in ipsec_types})
+    colliding = [t for t in shipped if port_bits & (1 << t)]
     assert colliding == [8, 9, 12, 13], colliding
 
     # What the IPsec port's consumers ask for sits below every port flag, so
     # the change leaves their answers as they were; the harness checks the
-    # answers are the tables themselves, and that the port has every one.
+    # answers are the tables themselves.
     used = sorted({values[name] for name in consumer_types()})
     assert used and all(not (port_bits & (1 << t)) for t in used), used
-    assert set(used) <= set(ipsec_shipped), (used, ipsec_shipped)
+    assert set(used) <= set(shipped), (used, shipped)
 
     cdx_common = (ROOT / "cdx/cdx_common.h").read_text()
     ioctl = (ROOT / "cdx/cdx_ioctl.h").read_text()
@@ -148,8 +138,7 @@ def test_ofport_tables(tmp_path):
                              "get_ofport_info", "alloc_offline_port", "release_offline_port"))))
     (tmp_path / "ofport_config.inc").write_text(
         f"#define IPSEC_PORTID {ipsec_portid}\n#define WIFI_PORTID {wifi_portid}\n"
-        f"static const uint32_t ipsec_table_types[] = {{ {', '.join(map(str, ipsec_shipped))} }};\n"
-        f"static const uint32_t wifi_table_types[] = {{ {', '.join(map(str, wifi_shipped))} }};\n"
+        f"static const uint32_t oh_table_types[] = {{ {', '.join(map(str, shipped))} }};\n"
         f"static const uint32_t ipsec_used_types[] = {{ {', '.join(map(str, used))} }};\n"
         f"#define COLLIDING_TYPES {', '.join(map(str, colliding))}\n")
 

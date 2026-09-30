@@ -178,60 +178,10 @@ result independently of those temporary files.
   Captures, image identity and diagnostic scripts:
   `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
 
-- [ ] **A276 — the data plane wedged twice under a flooded ESP SA.**
-  During `test_flowtable_service_ipsec_shared_sequence` (CBC, build 4) and its GCM
-  variant in `test_flowtable_service_ipsec_replay.py` (build 5), each deep in a long
-  IPsec file sequence, the first 4 s flood of a newly admitted flow on a fresh SA left
-  both 10G Rx ports, eth4's Tx port and the HC port with every task held at enqueue, and
-  SEC busy with no traffic (SSTA `0x405`, healthy `0x406`). eth3's Tx still dequeued, and
-  QMan, BMan and FMan DMA reported nothing wrong. Thirty seconds later the flow's retire
-  timed out an HC command (`HC confirmation timed out; board reset required`), and only a
-  reset recovered. Best-fitting reading, unproven: a SEC job of the flooded SA hangs, and
-  FMan's in-order enqueue stream to QMan blocks behind that SA's to-SEC queue. Patch 106
-  (CPU- and FMan-fed jobs sharing one SERIAL descriptor) is the plausible trigger. Rate:
-  2 in ~14 shared-sequence runs on builds 4-5, 0 in ~34 on builds 6-7, including a
-  20-round re-admission stress and four back-to-back replay-file runs, so builds 6-7 may
-  not carry it; nothing there is known to fix it. At the next wedge, before any reset:
-  CAAM SSTA/QISTA/QIDESC/DECO debug registers (`0x1700FD4`, `0x177000C`,
-  `0x1770100-30`, `0x1780E00-18` per DECO), the FPM task table twice 10 s apart, the
-  QMI/BMI port registers, and one QMan FQ query at a time on a spare CPU, never
-  `qman/fqd/state_*` (it walks every FQ with interrupts off and starves RCU). Then flush
-  SEC's queue interface (`QICTL_LS`) and watch whether the Rx frame counters resume: that
-  shows which side is the head, and whether a runtime recovery exists.
-  Update 2026-09-27: now 2/2 on an image carrying the offline-port per-SA keying
-  (A280), 4/4 without it on the same image (A279+A283 present in both), 0/34 on the
-  two builds before A280 — so A280 makes this reliable. The new capture
-  (`wedge2-e2.txt`) is the same signature: all FPM tasks held across the 10G Rx/Tx
-  and OH ports, `hc.c:306 EnQFrm: Operation Timed Out`, and crucially no QMan ERN,
-  ECSR/ECIR/EADR 0 -- enqueues are not being rejected, frames are held inside FMan
-  before enqueue, which is the SEC/to-SEC head-of-line, not a bad FQID. Offline
-  against the fmc model and the SDK, A280's OH-port paths were eliminated as the
-  head: every OH frame class matches a scheme (all frames are Ethernet-framed, so
-  the `cdx_sec_ethernet` catch-all always matches); all seven OH distributions'
-  FQs (0x2900-0x2960, base | portid<<8) are created and scheduled by
-  `create_ipsec_pcd_fqs()` now that `get_oh_port_pcd_fqinfo()` indexes by position
-  (cdx/devoh.c) rather than by type, which would have skipped the Ethernet one;
-  every table's miss resolves on the OH port itself via `miss_scheme_on_port()`
-  (cdx/dpa_cfg.c) to `cdx_sec_ethernet` -> policer -> CP, with no cross-port scheme
-  and no loop back onto the OH channel; genuine decrypted and encrypted frames hit
-  their per-SA entries (the passing inbound-flow and transform-interop tests prove
-  the FQID extract and keying), and only never-offloaded classes (the test's
-  flooded ICMP echo replies) miss to CP, exactly as before A280. What A280 changes
-  is the per-frame work the OH port does on every FROM_SEC frame -- the added
-  enqueue-FQID generic extract and the per-SA CC lookup across its own tree -- which
-  is the plausible reason the pre-existing SEC/to-SEC race now closes reliably under
-  this ICMP-plus-blast mix. Next wedge, to pin the head with safe reads only (never
-  SEC registers -- a devmem of SSTA hung a CPU): decode fmfp_ts[0..127] against the
-  hardware port ids (BASE_OH_PORTID 0x2, 1G-Rx 0x8, 10G-Rx 0x10, 1G-Tx 0x28, 10G-Tx
-  0x30; fm_common.h) to see which port's tasks are held first; read each SA's
-  FROM_SEC and TO_SEC FQ depth from /proc (`cdx/.../pcd` and the SA dirs) to see
-  whether FROM_SEC is full (OH port not draining) or TO_SEC is full (SEC not
-  draining); and the QMI enqueue/dequeue-enable for the crypto channel. If FROM_SEC
-  is the full one, the OH port is the bottleneck and the mitigation is on the CDX
-  side (spread or relieve the OH exception path); if TO_SEC is full with FROM_SEC
-  empty, SEC is the head and this is patch 106's descriptor sharing, independent of
-  A280's keying. The A280 security fix is not reverted for this: it closes a
-  cross-SA forwarding hole, and the wedge is a pre-existing SEC race it exposes.
+- [x] **A276 — the data plane wedged twice under a flooded ESP SA.** An HC command
+  timed out ("board reset required") because 11aa150's per-SA offline-port classification
+  stranded an OH microcode task on a miss, starving the shared TNUM pool HC depends on
+  FM-wide — fixed by reverting it (_:/^cdx: revert per-SA offline-port classification_).
 
 ## Feature enablement (not bugs)
 
@@ -313,15 +263,18 @@ file's git history.
 - [x] **A286.** A transport-mode inbound SA with a 128-packet window got ARS128, which SEC's legacy transport protocol does not have —
   fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
 
-- [x] **A280.** A decrypted flow's offline-port entry keyed on the port id and inner 5-tuple alone, so any second offloaded inbound SA could encrypt that tuple and have SEC's output forwarded as the flow's (inherited from NXP) —
-  fixed (_:/^cdx: bind a decrypted flow's classifier entry to its SA_).
-
-- [x] **A287.** Outbound-SA entries on the offline port were keyed the same way, so a decrypted inner ESP or NAT-T UDP packet could match one and the gateway emit a frame a peer forged toward a third party —
-  fixed (_:/^cdx: bind a decrypted flow's classifier entry to its SA_).
+- [ ] **A280 / A287.** With shared offline-port classification a decrypted flow's entry keys on
+  the port id and inner 5-tuple alone, so a second offloaded SA that encrypts (A280) or matches
+  (A287) that tuple can have SEC's output forwarded as the flow's, or make the gateway emit a
+  frame a peer forged toward a third party (inherited from NXP). Per-SA classification isolated
+  this but folded the SA's FQID into the KeyGen key, stranding an offline-port task on a miss
+  (A276) and perturbing the fragmenter (oversized-ESP ICV), so it was reverted to match
+  CMM/CDX-5.03.1, which never isolated cross-SA. Accepted while VPN deployments use distinct
+  inner subnets; revisit if overlapping-inner-subnet SAs are required
+  (_:/^cdx: revert per-SA offline-port classification_).
 
 - [x] **A288.** `ft_ipsec_paired_inbound()` chose a decrypted flow's inbound SA by address (the most recent), so a rekey with non-overlapping selectors bound the entry to an SA the peer does not use and left the flow in software —
   fixed (_:/^cdx: choose a decrypted flow's inbound SA by its selector_).
-
 - [x] **A275.** Routed multicast copies left with the egress port's MAC rather than their oif's (a VLAN or bridge VIF), as ipmr sends them, and no chain followed an oif's MAC change —
   fixed (_:/^flowtable: send a routed multicast copy from its oif's address_).
 

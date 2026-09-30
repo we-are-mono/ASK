@@ -564,10 +564,17 @@ int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
 		return -EIO;
 	if (cdx_ft_failed())
 		return -EIO;
+	/* An outbound NAT-T entry shared with another SA on the same UDP
+	 * tuple, which a rekey overlap produces. Its delete only drops a
+	 * reference, leaving the entry -- and the address in its opcodes --
+	 * exactly as it was, and the reinstall would find the same entry and
+	 * take the reference back. Nothing would change and this would report
+	 * that it had, so refuse instead: when the other SA goes the count
+	 * falls to one and the next attempt rewrites it for real. */
+	if (IS_NATT_SA(entry) && entry->ct && entry->ct->natt_out_refcnt > 1)
+		return -EBUSY;
 
 	/* The old entry has to be provably out before the new one goes in.
-	 * It is this SA's alone: an outbound entry is keyed on its SA
-	 * (cdx_ipsec_key_tag()), NAT-T included, so no other SA shares it.
 	 * Both carry the same key, and a bucket holding two copies of one key
 	 * cannot be fully cleared afterwards -- so a delete that cannot prove
 	 * the key is gone refuses the rebuild rather than making the SA

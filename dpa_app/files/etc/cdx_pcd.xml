@@ -93,56 +93,6 @@
   </key>
 </classification>
 
-<!-- The IPsec offline port's own tables. Every frame this port classifies left
-     SEC by some SA's FROM_SEC queue, and the only thing that queue gives FMan
-     per SA is the FQID in its Context B: the SA's TO_CP queue, which the
-     Context A override makes the frame's enqueue FQID. So each key is its
-     Ethernet counterpart's with that FQID appended (3 bytes, last because the
-     key generator places generic extractions after the known fields): a flow
-     decrypted by one SA, or an SA's own encrypted frames, cannot match an entry
-     made for another SA. The catch-all holds no entries and needs no FQID. -->
-<classification name="cdx_sec_udp4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0x7fff" hashshift="0" keysize="17" aging="yes"/>
-  </key>
-</classification>
-
-<classification name="cdx_sec_tcp4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0x7fff" hashshift="0" keysize="17" aging="yes"/>
-  </key>
-</classification>
-
-<classification name="cdx_sec_udp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0x7fff" hashshift="0" keysize="41" aging="yes"/>
-  </key>
-</classification>
-
-<classification name="cdx_sec_tcp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0x7fff" hashshift="0" keysize="41" aging="yes"/>
-  </key>
-</classification>
-
-<classification name="cdx_sec_esp4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0xff" hashshift="0" keysize="13" aging="yes"/>
-  </key>
-</classification>
-
-<classification name="cdx_sec_esp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0xff" hashshift="0" keysize="25" aging="yes"/>
-  </key>
-</classification>
-
-<classification name="cdx_sec_ethernet_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0xff" hashshift="0" keysize="15" aging="yes"/>
-  </key>
-</classification>
-
 <distribution name="cdx_udp4_dist" shared="true">
   <protocols>
     <protocolref name="udp"/>
@@ -357,150 +307,6 @@
   <action type="classification" name="cdx_tuple3udp6_cc"/>
 </distribution>
 
-<!-- The IPsec offline port's distributions: its Ethernet counterparts' fields,
-     and the frame's enqueue FQID, which the SA's FROM_SEC queue sets from its
-     Context B. The FQID is 24 bits, the first three bytes of the key
-     generator's FQID area; source, offset and size are the only place the
-     discriminator is chosen, with cdx_ipsec_key_tag() on the cdx side. The
-     FQID is always present, so the not-from-data default each names is never
-     taken; the key generator still requires one for that extraction. Their
-     queue bases leave bits 8-11 free for the port id the combine ORs in. -->
-<distribution name="cdx_sec_esp4_dist" shared="true">
-  <protocols>
-    <protocolref name="ipv4"/>
-    <protocolref name="ipsec_esp"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv4.dst"/>
-    <fieldref name="ipv4.nextp"/>
-    <fieldref name="ipsec_esp.spi"/>
-    <nonheader source="fqid" offset="0" size="3"/>
-  </key>
-  <defaults>
-    <default type="not_from_data" select="gbl0"/>
-  </defaults>
-  <queue count="1" base="0x2000"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_sec_esp4_cc"/>
-</distribution>
-
-<distribution name="cdx_sec_esp6_dist" shared="true">
-  <protocols>
-    <protocolref name="ipv6"/>
-    <protocolref name="ipsec_esp"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv6.dst"/>
-    <fieldref name="ipv6.nexthdr"/>
-    <fieldref name="ipsec_esp.spi"/>
-    <nonheader source="fqid" offset="0" size="3"/>
-  </key>
-  <defaults>
-    <default type="not_from_data" select="gbl0"/>
-  </defaults>
-  <queue count="1" base="0x2010"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_sec_esp6_cc"/>
-</distribution>
-
-<distribution name="cdx_sec_udp4_dist" shared="true">
-  <protocols>
-    <protocolref name="udp"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv4.src" header_index="last"/>
-    <fieldref name="ipv4.dst" header_index="last"/>
-    <fieldref name="ipv4.nextp" header_index="last"/>
-    <fieldref name="udp.sport"/>
-    <fieldref name="udp.dport"/>
-    <nonheader source="fqid" offset="0" size="3"/>
-  </key>
-  <defaults>
-    <default type="not_from_data" select="gbl0"/>
-  </defaults>
-  <queue count="1" base="0x2020"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_sec_udp4_cc"/>
-</distribution>
-
-<distribution name="cdx_sec_tcp4_dist" shared="true">
-  <protocols>
-    <protocolref name="tcp"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv4.src" header_index="last"/>
-    <fieldref name="ipv4.dst" header_index="last"/>
-    <fieldref name="ipv4.nextp" header_index="last"/>
-    <fieldref name="tcp.sport"/>
-    <fieldref name="tcp.dport"/>
-    <nonheader source="fqid" offset="0" size="3"/>
-  </key>
-  <defaults>
-    <default type="not_from_data" select="gbl0"/>
-  </defaults>
-  <queue count="1" base="0x2030"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_sec_tcp4_cc"/>
-</distribution>
-
-<distribution name="cdx_sec_udp6_dist" shared="true">
-  <protocols>
-    <protocolref name="udp"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv6.src" header_index="last"/>
-    <fieldref name="ipv6.dst" header_index="last"/>
-    <fieldref name="ipv6.nexthdr" header_index="last"/>
-    <fieldref name="udp.sport"/>
-    <fieldref name="udp.dport"/>
-    <nonheader source="fqid" offset="0" size="3"/>
-  </key>
-  <defaults>
-    <default type="not_from_data" select="gbl0"/>
-  </defaults>
-  <queue count="1" base="0x2040"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_sec_udp6_cc"/>
-</distribution>
-
-<distribution name="cdx_sec_tcp6_dist" shared="true">
-  <protocols>
-    <protocolref name="tcp"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv6.src" header_index="last"/>
-    <fieldref name="ipv6.dst" header_index="last"/>
-    <fieldref name="ipv6.nexthdr" header_index="last"/>
-    <fieldref name="tcp.sport"/>
-    <fieldref name="tcp.dport"/>
-    <nonheader source="fqid" offset="0" size="3"/>
-  </key>
-  <defaults>
-    <default type="not_from_data" select="gbl0"/>
-  </defaults>
-  <queue count="1" base="0x2050"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_sec_tcp6_cc"/>
-</distribution>
-
-<!-- Every other frame the port sees: decrypted ICMP, fragments, anything no
-     table above can hold. Its table stays empty, and a miss in any of the
-     port's tables ends here, then at the exception policer, as a miss on an
-     Ethernet port ends at cdx_ethernet_dist. -->
-<distribution name="cdx_sec_ethernet_dist" shared="true">
-  <protocols>
-    <protocolref name="ethernet"/>
-  </protocols>
-  <key>
-    <fieldref name="ethernet.dst"/>
-    <fieldref name="ethernet.src"/>
-    <fieldref name="ethernet.type"/>
-  </key>
-  <queue count="1" base="0x2060"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_sec_ethernet_cc"/>
-</distribution>
-
 <policy name="cdx_ethport_0_policy">
   <dist_order>
     <distributionref name="cdx_esp4_dist"/>
@@ -654,22 +460,22 @@
 </policy>
 
 
-<!-- The IPsec offline port: its own distributions only. The key generator
-     takes the first scheme, by number, whose protocols a frame has, and fmc
-     numbers schemes in the order ports are applied, so every shared scheme is
-     numbered before these and would take this port's frames (a multicast one
-     has only ipv4). A shared distribution added here therefore unbinds the
-     decrypted flows from their SAs, and no port's other policy may name
-     these. -->
 <policy name="cdx_port_of2_policy">
   <dist_order>
-    <distributionref name="cdx_sec_esp4_dist"/>
-    <distributionref name="cdx_sec_esp6_dist"/>
-    <distributionref name="cdx_sec_udp4_dist"/>
-    <distributionref name="cdx_sec_tcp4_dist"/>
-    <distributionref name="cdx_sec_udp6_dist"/>
-    <distributionref name="cdx_sec_tcp6_dist"/>
-    <distributionref name="cdx_sec_ethernet_dist"/>
+    <distributionref name="cdx_esp4_dist"/>
+    <distributionref name="cdx_esp6_dist"/>
+    <distributionref name="cdx_udp4_dist"/>
+    <distributionref name="cdx_tcp4_dist"/>
+    <distributionref name="cdx_udp6_dist"/>
+    <distributionref name="cdx_tcp6_dist"/>
+    <distributionref name="cdx_ipv4multicast_dist"/>
+    <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
+    <distributionref name="cdx_tup3udp4_dist"/>
+    <distributionref name="cdx_tup3udp6_dist"/>
+    <distributionref name="cdx_pppoe_dist"/>
+    <distributionref name="cdx_ethernet_dist"/>
   </dist_order>
 </policy>
 

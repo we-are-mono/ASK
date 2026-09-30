@@ -107,8 +107,6 @@ struct dpa_ipsec_sainfo {
 	struct sec_descriptor *shared_desc;
 	struct dpa_fq sec_fq[NUM_FQS_PER_SA];
 	void *sa_proc_entry;
-	/* The FQIDs outlive the queues: see cdx_dpa_ipsecsa_keep_fqids(). */
-	bool keep_fqids;
 };
 
 struct ipsec_info {
@@ -595,9 +593,8 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 
 	for (jj = 0; jj < max_dist; jj++)
 	{
-		/* The FQ range of each of the port's distributions, by
-		 * position: the port has its own set (cdx_pcd.xml), not one
-		 * of every type. */
+		/* get FQbase and count used for each distribution
+			 with scheme sharing this is the only distribution that will be used */
 
 		if (get_oh_port_pcd_fqinfo(IPSEC_FMAN_IDX, info->ofport_handle,
 					jj , &fqbase, &fqcount)) {
@@ -996,11 +993,6 @@ int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td,
 	 * would fault in the table insert rather than fail it. */
 	if (!cdx_dpa_ipsec_ready())
 		return FAILURE;
-	/* A type the port's policy has no table for, which its own
-	 * distributions leave to most (cdx_pcd.xml), is a refusal rather than
-	 * a NULL descriptor for the caller to insert into. */
-	if (!info->ofport_td[table_type])
-		return FAILURE;
 	*td = info->ofport_td[table_type];
 	*portid = info->ofport_portid;
 	return SUCCESS;
@@ -1324,22 +1316,10 @@ int cdx_dpa_ipsecsa_release(void *handle)
 	 * create_ipsec_fqs frees it on partial-init failure; this is the
 	 * matching free on the normal release path. */
 	kfree(sainfo->shdesc_mem);
-	if (!sainfo->keep_fqids)
-		qman_release_fqid_range(sainfo->sec_fq[FQ_FROM_SEC].fqid, NUM_FQS_PER_SA);
+	qman_release_fqid_range(sainfo->sec_fq[FQ_FROM_SEC].fqid, NUM_FQS_PER_SA);
 	kfree(sainfo);
 	module_put(THIS_MODULE);
 	return SUCCESS;
-}
-
-/* The offline port's keys name the SA a frame left SEC by through the FQID
- * its FROM_SEC queue names in Context B (cdx_ipsec_key_tag()). An entry whose
- * delete could not prove it unlinked may still match, and a later SA given
- * the same FQIDs would feed it frames it was never admitted for; the FQIDs
- * are therefore left allocated when the queues go. Three per SA, and only
- * after a delete that already leaves its entry to a reboot. */
-void cdx_dpa_ipsecsa_keep_fqids(void *handle)
-{
-	((struct dpa_ipsec_sainfo *)handle)->keep_fqids = true;
 }
 
 int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num)

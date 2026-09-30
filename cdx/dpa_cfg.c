@@ -381,42 +381,6 @@ static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t 
 	return NULL;
 }
 
-/* The distribution a table's miss goes to, on the table's own port.
- *
- * A scheme reached from a miss looks its table up in the CC tree of the port
- * the frame came in by, at the group the scheme was built with, so the scheme
- * has to be one that port classifies with. The Ethernet ports and the Wi-Fi
- * offline port share one set of distributions, and for them the scheme found
- * by type is theirs. The IPsec offline port has distributions of its own and
- * none of the shared ones (cdx_pcd.xml): a miss on one of its tables goes to
- * that port's Ethernet distribution instead, whose table is empty and whose
- * miss is the exception policer, where a shared table's chain ends too. So
- * does a miss whose named distribution no port has at all.
- * fmc builds each table once per port, so a table serves a single port. */
-static void *miss_scheme_on_port(struct cdx_fman_info *finfo,
-				 const struct table_info *tbl_info, void *scheme)
-{
-	struct cdx_port_info *port_info = finfo->portinfo;
-	void *ethernet = NULL;
-	uint32_t ii, jj;
-
-	if (!tbl_info->port_idx)
-		return scheme;
-	for (ii = 0; ii < finfo->max_ports; ii++, port_info++) {
-		if (port_info->portid >= 32 ||
-		    !(tbl_info->port_idx & (1U << port_info->portid)))
-			continue;
-		for (jj = 0; jj < port_info->max_dist; jj++) {
-			if (scheme && port_info->dist_info[jj].handle == scheme)
-				return scheme;
-			if (port_info->dist_info[jj].type == ETHERNET_DIST)
-				ethernet = port_info->dist_info[jj].handle;
-		}
-		return ethernet;
-	}
-	return scheme;
-}
-
 //allocate and copy port releated info from uspace 
 static int get_port_info(struct cdx_fman_info *finfo,
 		void __user *uspace_fmans, uint32_t fm_idx)
@@ -734,12 +698,9 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 				break;
 
 		}
-		//adding miss action
+		//adding miss action 
 		//get ethernet distribution scheme handle
 		if((tbl_info->type != ETHERNET_TABLE) && (tbl_info->type != PPPOE_RELAY_TABLE)) {
-			miss_engine_params.params.kgParams.h_DirectScheme =
-				miss_scheme_on_port(finfo, tbl_info,
-					miss_engine_params.params.kgParams.h_DirectScheme);
 			if (miss_engine_params.params.kgParams.h_DirectScheme == NULL) {
 				DPA_ERROR("%s::error finding direct dist for table %s\n",
 						__func__, tbl_info->name);

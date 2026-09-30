@@ -55,8 +55,7 @@ def test_ipsec_lifecycle(tmp_path):
         + function(source, "create_ipsec_fqs")
         + source[source.index("void *cdx_dpa_ipsecsa_alloc("):
                  source.index("/* change the state of frame queues */")]
-        + function(source, "cdx_dpa_ipsecsa_release")
-        + function(source, "cdx_dpa_ipsecsa_keep_fqids"))
+        + function(source, "cdx_dpa_ipsecsa_release"))
     binary = tmp_path / "ipsec_lifecycle"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

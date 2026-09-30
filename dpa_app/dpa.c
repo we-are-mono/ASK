@@ -86,17 +86,7 @@ static struct ccnode_table_params table_params[] = {
 	{(char *)"cdx_tuple3udp4",	IPV4_3TUPLE_UDP_TABLE},
 	{(char *)"cdx_tuple3udp6", IPV6_3TUPLE_UDP_TABLE},
 	{(char *)"cdx_bridged_mcast4", IPV4_BRIDGED_MULTICAST_TABLE},
-	{(char *)"cdx_bridged_mcast6", IPV6_BRIDGED_MULTICAST_TABLE},
-	/* The IPsec offline port's own tables. cdx indexes a port's tables by
-	 * type, and this port has these in place of the shared ones, so they
-	 * take the types of the tables they replace there. */
-	{(char *)"cdx_sec_udp4",	IPV4_UDP_TABLE},
-	{(char *)"cdx_sec_tcp4",	IPV4_TCP_TABLE},
-	{(char *)"cdx_sec_udp6",	IPV6_UDP_TABLE},
-	{(char *)"cdx_sec_tcp6",	IPV6_TCP_TABLE},
-	{(char *)"cdx_sec_esp4",	ESP_IPV4_TABLE},
-	{(char *)"cdx_sec_esp6",	ESP_IPV6_TABLE},
-	{(char *)"cdx_sec_ethernet",	ETHERNET_TABLE}
+	{(char *)"cdx_bridged_mcast6", IPV6_BRIDGED_MULTICAST_TABLE}
 };
 #define MAX_TABLE_PARAMS\
 		(sizeof(table_params) / sizeof(struct ccnode_table_params))
@@ -117,13 +107,6 @@ static struct model_dist_params dist_name[] = {
 	{(char *)"cdx_tup3udp6_dist", 	IPV6_3TUPLE_UDP_DIST},
 	{(char *)"cdx_bridged_mcast4_dist", IPV4_BRIDGED_MULTICAST_DIST},
 	{(char *)"cdx_bridged_mcast6_dist", IPV6_BRIDGED_MULTICAST_DIST},
-	{(char *)"cdx_sec_udp4_dist",	IPV4_UDP_DIST},
-	{(char *)"cdx_sec_tcp4_dist",	IPV4_TCP_DIST},
-	{(char *)"cdx_sec_udp6_dist",	IPV6_UDP_DIST},
-	{(char *)"cdx_sec_tcp6_dist",	IPV6_TCP_DIST},
-	{(char *)"cdx_sec_esp4_dist",	IPV4_ESP_DIST},
-	{(char *)"cdx_sec_esp6_dist",	IPV6_ESP_DIST},
-	{(char *)"cdx_sec_ethernet_dist", ETHERNET_DIST},
 };
 #define MAX_DIST_PARAMS\
 		(sizeof(dist_name) / sizeof(struct model_dist_params))
@@ -648,33 +631,6 @@ static int set_table_types(struct fmc_model_t *model)
 			}
 			if (strstr(model->htnode_name[index], "cdx_bridged_mcast6")) {
 				model->htnode[index].table_type = IPV6_MULTICAST_TABLE;
-				break;
-			}
-			/* The IPsec offline port's tables are the classes of
-			 * the ones they stand in for; their catch-all falls
-			 * through to Ethernet (L2) like the shared one. */
-			if (strstr(model->htnode_name[index], "cdx_sec_udp4")) {
-				model->htnode[index].table_type = IPV4_UDP_TABLE;
-				break;
-			}
-			if (strstr(model->htnode_name[index], "cdx_sec_tcp4")) {
-				model->htnode[index].table_type = IPV4_TCP_TABLE;
-				break;
-			}
-			if (strstr(model->htnode_name[index], "cdx_sec_udp6")) {
-				model->htnode[index].table_type = IPV6_UDP_TABLE;
-				break;
-			}
-			if (strstr(model->htnode_name[index], "cdx_sec_tcp6")) {
-				model->htnode[index].table_type = IPV6_TCP_TABLE;
-				break;
-			}
-			if (strstr(model->htnode_name[index], "cdx_sec_esp4")) {
-				model->htnode[index].table_type = ESP_IPV4_TABLE;
-				break;
-			}
-			if (strstr(model->htnode_name[index], "cdx_sec_esp6")) {
-				model->htnode[index].table_type = ESP_IPV6_TABLE;
 				break;
 			}
 			model->htnode[index].table_type = ETHERNET_TABLE;
