@@ -407,6 +407,9 @@ references prevent CDX unload while the adapter is loaded.
 Healthy reload preserves provider configuration and owner. Existing nftables
 flowtables continue in software; recreate the table to bind the new adapter.
 Adapter counters reset on reload, while the provider seal and fatal latch persist.
+The multicast switch (the adapter's `multicast` parameter) comes back on, so a
+service that was stopped or paused has to stop again; see the
+[policy guide](policy.md).
 Actual physical-driver removal additionally needs full CDX teardown to release
 its configuration/queue pins. Drain the table, unload the adapter and any other
 dependent modules, unload CDX, then unbind the physical driver. Do not force

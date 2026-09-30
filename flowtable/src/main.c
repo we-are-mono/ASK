@@ -149,9 +149,11 @@ static int follow_devices(struct ft_ctx *ctx, const struct ft_policy *p,
 static bool holding, unreadable, beside;
 
 /* The apply transaction, mirroring the Python Runtime.apply(): drain the old
- * hardware before rebinding, never leave a foreign or half-applied table. */
-static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
-			int lock, bool reconcile)
+ * hardware before rebinding, never leave a foreign or half-applied table.
+ * `multicast` is set when the policy asks for multicast acceleration on; the
+ * caller switches it after the table, see apply_locked(). */
+static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
+		       int lock, bool reconcile, bool *multicast)
 {
 	struct ft_backend st, drained;
 	struct ft_devices installed;
@@ -184,6 +186,7 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			snprintf(ctx->err, sizeof(ctx->err), "hardware retirement failed; fresh boot required");
 			goto out;
 		}
+		*multicast = true;
 		bool held = holding;
 
 		holding = false;
@@ -270,16 +273,25 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 		}
 		if (ft_render(ctx, p, st.qos_mark_mask, script, sizeof(script)) < 0)
 			goto out;
-	} else if (reconcile && !present &&
-		   (!st.present || (!st.bindings && !st.entries && !st.handle_refs &&
-				   !st.neighbour_refs && !st.quarantine && !st.fatal))) {
-		return 0;
+	} else {
+		/* Disabled is disabled for multicast as well: switched off
+		 * first, so no group goes in while the rest drains, and drained
+		 * with it below. Rewritten on every check, which is how a
+		 * reloaded adapter, on again by default, is caught. */
+		if (ft_backend_multicast(ctx, false))
+			goto out;
+		if (reconcile && !present &&
+		    (!st.present || (!st.bindings && !st.entries && !st.handle_refs &&
+				     !st.neighbour_refs && !st.quarantine && !st.fatal &&
+				     !st.mcast_installed && !st.mroute_installed)))
+			return 0;
 	}
 
-	/* Remove our previous table and let the hardware drain before rebinding. */
+	/* Remove our previous table and let the hardware drain before rebinding;
+	 * a disabled policy drains multicast too. */
 	if (present && owned && ft_nft_delete(ctx, lock))
 		goto out;
-	if (ft_backend_drain(ctx, 15000))
+	if (ft_backend_drain(ctx, 15000, !p->enabled))
 		goto out;
 	if (ft_backend_read(ctx, &drained))  /* the post-remove state the CLI reports */
 		goto out;
@@ -296,7 +308,7 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 	/* --check can invoke backend binding callbacks; only after the drain. */
 	if (ft_nft_run(ctx, script, true, lock))
 		goto out;
-	if (ft_backend_drain(ctx, 15000))
+	if (ft_backend_drain(ctx, 15000, false))
 		goto out;
 	if (ft_nft_run(ctx, script, false, lock))
 		goto out;
@@ -311,6 +323,10 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 		snprintf(ctx->err, sizeof(ctx->err), "new policy did not acquire healthy backend bindings");
 		goto rollback;
 	}
+	/* Here rather than in the caller, so the result reports it. */
+	*multicast = false;
+	if (ft_backend_multicast(ctx, true) || (emit && ft_backend_read(ctx, &st)))
+		goto out;
 	rc = 0;
 	if (emit) {
 		ft_backend_json(&drained, dj, sizeof(dj));
@@ -325,8 +341,8 @@ rollback:
 		struct ft_ctx tmp;
 		char why[sizeof(ctx->err)];
 		snprintf(why, sizeof(why), "%s", ctx->err);
-		if (ft_nft_delete(&tmp, lock) == 0 && ft_backend_drain(&tmp, 15000) == 0) {
-			snprintf(ctx->err, sizeof(ctx->err), "apply failed, acceleration disabled: %.200s", why);
+		if (ft_nft_delete(&tmp, lock) == 0 && ft_backend_drain(&tmp, 15000, false) == 0) {
+			snprintf(ctx->err, sizeof(ctx->err), "apply failed, flowtable acceleration disabled: %.200s", why);
 		} else {
 			/* Left dirty: say so, mirroring the Python's compound error. */
 			snprintf(ctx->err, sizeof(ctx->err),
@@ -335,6 +351,29 @@ rollback:
 	}
 out:
 	return reconcile && !rc ? 1 : rc;
+}
+
+/* An enabled policy switches multicast acceleration on, whatever became of the
+ * table: multicast follows no flowtable, and only a stop or a disabled policy
+ * switches it off. After the table, though, never before it: installing the
+ * table is a ruleset commit, which takes back every routed group's
+ * confirmations, so groups carried ahead of it would go into hardware only to
+ * come straight back out. */
+static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
+			int lock, bool reconcile)
+{
+	bool multicast = false;
+	int rc = apply_table(ctx, p, emit, lock, reconcile, &multicast);
+
+	if (multicast) {
+		struct ft_ctx tmp;
+
+		if (ft_backend_multicast(&tmp, true) && rc >= 0) {
+			snprintf(ctx->err, sizeof(ctx->err), "%s", tmp.err);
+			rc = -1;
+		}
+	}
+	return rc;
 }
 
 int ft_apply(struct ft_ctx *ctx, struct ft_policy *p, bool emit)
@@ -371,9 +410,13 @@ int ft_stop(struct ft_ctx *ctx, bool emit)
 		snprintf(ctx->err, sizeof(ctx->err), "another flowtable owns the backend bindings");
 		goto out;
 	}
+	/* Stop is global: multicast acceleration goes off before the table
+	 * goes, and a successful stop has drained both learners' groups. */
+	if (ft_backend_multicast(ctx, false))
+		goto out;
 	if (present && owned && ft_nft_delete(ctx, lock))
 		goto out;
-	if (ft_backend_drain(ctx, 15000))
+	if (ft_backend_drain(ctx, 15000, true))
 		goto out;
 	if (emit && ft_backend_read(ctx, &drained))
 		goto out;
@@ -418,7 +461,8 @@ static int cmd_status(struct ft_ctx *ctx)
 	       "\"reconciliation_paused\": %s, "
 	       "\"admission_ready\": %s, \"backend\": {\"present\": %s, "
 	       "\"bindings\": %ld, \"entries\": %ld, \"handle_refs\": %ld, \"neighbour_refs\": %ld, "
-	       "\"quarantine\": %ld, \"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld}}\n",
+	       "\"quarantine\": %ld, \"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld, "
+	       "\"mcast_enabled\": %ld, \"mcast_installed\": %ld, \"mroute_installed\": %ld}}\n",
 	       owned ? "true" : "false",
 	       owned ? "\"" : "null", owned ? inhash : "", owned ? "\"" : "",
 	       devices,
@@ -426,7 +470,8 @@ static int cmd_status(struct ft_ctx *ctx)
 	       ready ? "true" : "false",
 	       st.present ? "true" : "false",
 	       st.bindings, st.entries, st.handle_refs, st.neighbour_refs, st.quarantine,
-	       st.fatal, st.invalidated, st.observe);
+	       st.fatal, st.invalidated, st.observe,
+	       st.mcast_enabled, st.mcast_installed, st.mroute_installed);
 	return 0;
 }
 

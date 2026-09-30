@@ -15,6 +15,22 @@ import json
 import pytest_asyncio
 
 
+# ---- the global switch -----------------------------------------------------
+
+MULTICAST_SWITCH = "/sys/module/ask_flowtable/parameters/multicast"
+
+
+async def multicast_on(target_agent, session) -> None:
+    """Multicast acceleration on, as a boot leaves it.
+
+    The offload service switches it off whenever it stops or its policy is
+    disabled -- and stopping the boot service is every controlled test's first
+    step -- so a case that expects multicast in hardware switches it on itself
+    rather than inherit whatever the test before it left."""
+    result = await target_agent.fs_write(session, MULTICAST_SWITCH, "Y")
+    assert result["errno"] == 0, (MULTICAST_SWITCH, result)
+
+
 # ---- the bridge's own querier ----------------------------------------------
 
 async def arm_bridge_querier(run, bridge: str) -> None:

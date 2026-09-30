@@ -1,9 +1,10 @@
 # Linux flowtable policy
 
 `ask-flowtable` manages admission policy for the native IPv4/IPv6 TCP/UDP
-backend. Linux still owns connection tracking, routing, firewall decisions and
-flow lifetimes. CDX supplies the hardware implementation; the flowtable adapter
-is its only hardware flow owner.
+backend, and the global on/off of multicast acceleration beside it. Linux
+still owns connection tracking, routing, firewall decisions and flow
+lifetimes. CDX supplies the hardware implementation; the flowtable adapter is
+its only hardware flow owner.
 
 See the [project overview](README.md) for supported scope and
 the [architecture](architecture.md) for provider and lifetime contracts.
@@ -88,21 +89,30 @@ instead; see [device membership](#device-membership).
 | --- | --- |
 | `daemon` | Maintain its configured policy in the foreground unless reconciliation is paused. A lifetime lock permits only one controller. |
 | `supervise` | Run the foreground supervisor, replacing a crashed controller with capped backoff. |
-| `stop` | Pause automatic reconciliation before removing the owned table and draining hardware. Works even with malformed configuration. A failed drain returns an error and leaves reconciliation paused. |
-| `apply [--config PATH]` | Validate a candidate, take manual control, and apply it once. Once the transaction starts, reconciliation stays paused on success or failure. Parse/load failures leave existing authority unchanged. |
-| `resume` | Release the pause under the transaction lock. The running daemon subsequently validates and reconciles its own configured policy. This command does not install a candidate, start the daemon, or certify recovery; observe `status` and traffic. |
-| `status` | Report table/backend state and `reconciliation_paused`. A manually installed table can have healthy admission while reconciliation is paused. |
+| `stop` | Pause automatic reconciliation, switch multicast acceleration off, remove the owned table and drain hardware -- unicast entries and both multicast learners' groups. Works even with malformed configuration. A failed drain returns an error and leaves reconciliation paused. |
+| `apply [--config PATH]` | Validate a candidate, take manual control, and apply it once. An enabled candidate switches multicast acceleration on; `enabled no` switches it off and drains it with the rest. Once the transaction starts, reconciliation stays paused on success or failure. Parse/load failures leave existing authority unchanged. |
+| `resume` | Release the pause under the transaction lock. The running daemon subsequently validates and reconciles its own configured policy, multicast switch included. This command does not install a candidate, start the daemon, or certify recovery; observe `status` and traffic. |
+| `status` | Report table/backend state, the multicast switch and both learners' installed groups (`mcast_enabled`, `mcast_installed`, `mroute_installed`), and `reconciliation_paused`. A manually installed table can have healthy admission while reconciliation is paused. |
 
 Manual control is recorded in `/run/lock/ask-flowtable.paused`, protected by
 the same `/run/lock/ask-flowtable.lock` as every table transaction. A stop
 waiting behind an install takes effect after it, and later checks cannot
 undo that stop. The pause survives daemon and service process restarts; it
-expires on reboot with `/run`. For a persistent disable, set `enabled no`.
+expires on reboot with `/run`. For a persistent disable, set `enabled no`,
+which the daemon reasserts for multicast at every check.
+
+The multicast switch is the adapter's `multicast` parameter
+(`/sys/module/ask_flowtable/parameters/multicast`), on at load. The service
+owns it while it runs: an enabled policy sets it on at every check, so a
+manual write does not last. Reloading the adapter module puts it back on; while
+the service is stopped or paused nothing switches it off again, so stop again
+after such a reload.
 
 Service `start` and `restart` preserve the pause. Service `stop` pauses and
-drains, propagating failure to its caller. Service `reload` explicitly resumes
-and starts the daemon if necessary. A fresh boot starts automatic maintenance
-of the configured policy. Hung `nft` operations are cancelled and retried.
+drains, multicast included, propagating failure to its caller. Service
+`reload` explicitly resumes and starts the daemon if necessary. A fresh boot
+starts automatic maintenance of the configured policy. Hung `nft` operations
+are cancelled and retried.
 
 The boot service now runs a supervisor. An unexpected controller exit, including
 exit status zero, restarts after 1, 2, 4, 8, 16 and then 30 seconds. A controller
@@ -175,7 +185,11 @@ as Linux flowtable caching requires.
 
 To revoke a cached flow after a firewall change, stop acceleration and require
 that stop to succeed, apply the firewall changes, publish the intended daemon
-policy and resume. Use a one-shot apply to remain under manual control instead.
+policy and resume. The stop covers multicast: bridged and routed groups leave
+hardware before it returns and stay in software, still learned, until an
+enabled policy is applied again (see
+[the global switch](multicast.md)). Use a one-shot apply to remain under manual
+control instead.
 For an exclusion
 change, `ask-flowtable apply` performs the retirement itself. Editing unrelated
 nftables rules does not revoke cached hardware. A configuration-file edit is
@@ -194,8 +208,11 @@ Completion requires the expected table hash and healthy backend bindings.
 
 This operation has a bounded software-forwarding interval. It preserves
 conntracks and sockets. Syntax/schema errors and missing devices leave the old
-policy untouched. A kernel rejection after retirement leaves acceleration
-disabled and reports an error; it does not restore an obsolete exclusion policy.
+policy untouched. A kernel rejection after retirement leaves flowtable
+acceleration disabled and reports an error; it does not restore an obsolete
+exclusion policy. Multicast stays on, since the policy asks for acceleration.
+Disabling the policy drains multicast too: the switch goes off first and the
+drain also waits for `mcast_installed` and `mroute_installed`.
 A retirement failure reports that recovery is required and never publishes a
 replacement. A fatal hardware failure still requires full provider teardown
 and a fresh boot. There is no automatic switch to CMM.
@@ -240,7 +257,7 @@ that boundary. Fatal hardware retirement still requires a fresh boot.
 | Fastforward protocol, tuple address/port exclusions | `exclude` selectors above; original/reply directions keep conntrack semantics |
 | CMM `port` shortcut | `port`, preserving its four tuple-port alternatives |
 | CMM `ip_v4_addr` shortcut | Four exclusion objects, one per original/reply address selector |
-| Global acceleration enable/disable | `enabled` and `apply`/`stop` |
+| Global acceleration enable/disable | `enabled` and `apply`/`stop`, for unicast and multicast alike |
 | Hardware UDP/TCP inactivity policy | Linux `net.netfilter.nf_flowtable_udp_timeout` / `nf_flowtable_tcp_timeout`; verify hardware behaviour when changing lifetime policy |
 | Connection table limits and protocol state timeouts | Native `net.netfilter.nf_conntrack_max` and protocol-specific conntrack sysctls |
 | Backend hardware capacity | 32,768-direction admission budget; see [capacity](capacity.md); no live resize guarantee |
@@ -252,6 +269,6 @@ Use normal persistent Linux sysctl configuration for native scalar settings.
 There is no need to duplicate those controls in the policy file or send them
 through FCI. A Linux conntrack capacity setting does not resize CDX hardware.
 Existing hardware lifetime changes should be applied across a policy stop/apply
-boundary when immediate retirement is required. IPv6, further NAT types,
-PPPoE, bridge/VLAN, multicast, IPsec and tunnel acceleration need their own
-feature increments.
+boundary when immediate retirement is required. IPv6, NAT, PPPoE,
+bridge/VLAN, multicast, IPsec and tunnel acceleration each have their own
+document under [the project overview](README.md).

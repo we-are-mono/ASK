@@ -13,9 +13,10 @@ import pytest_asyncio
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import peer
 from test_flowtable_failslab import same_service, slab_fault
-from test_flowtable_offload import command, console_command, console_python, read, rig, WAN_IP  # noqa: F401
+from test_flowtable_offload import command, console_command, console_json, console_python, read, rig, WAN_IP  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, unchanged, warm
-from test_flowtable_service import FAULT_DIR, FIRST, FLOWS, managed_service, supervision_status
+from test_flowtable_service import (CONF, DAEMON, FAULT_DIR, FIRST, FLOWS, INIT, managed_service,
+                                    supervision_status, wait_service)
 from test_flowtable_service_vlan import attempts, balanced, denied
 
 IDENTITY = 'ask-recovery-mcast'
@@ -296,3 +297,133 @@ async def recover(r, fault):
 @pytest.mark.parametrize('fault', ['withdrawal', 'install-failslab', 'add-event-failslab', 'delete-event-failslab', 'group-failslab'])
 async def test_flowtable_service_multicast_recovery(multicast_service, fault):
     await recover(multicast_service, fault)
+
+
+# Every public way to stop acceleration: the controller's own stop, the init
+# script's, a policy that says `enabled no` applied by hand, and the same
+# policy written to the service's configuration for it to reconcile.
+STOPS = ['stop', 'service-stop', 'disabled', 'disabled-config']
+# A group first learned while acceleration is stopped, per learner and family.
+STOPPED_GROUP = {('mroute', 4): '239.9.4.3', ('mroute', 6): 'ff1e::9:4:3',
+                 ('mcast', 4): '239.9.5.3', ('mcast', 6): 'ff1e::9:5:3'}
+DISABLED_CONF = FAULT_DIR + '/disabled.conf'
+
+
+async def stop_acceleration(r, how):
+    """Stop acceleration the way `how` names; returns what it said it drained,
+    where it says so."""
+    if how == 'stop':
+        result = await console_command(r.service_console, DAEMON, 'stop', timeout=40)
+        return console_json(result['stdout'])['drained']
+    if how == 'service-stop':
+        await console_command(r.service_console, INIT, 'stop', timeout=45)
+        return None
+    if how == 'disabled-config':
+        # Nothing returns: the running service picks the edit up at its next
+        # check, within its five-second health interval, and drains then.
+        r.enabled_conf = await read(r.target, r.session, CONF)
+        result = await r.target.fs_write(r.session, CONF, 'enabled no\n')
+        assert result['errno'] == 0, result
+        await r.wait(lambda s: s['mcast_enabled'] == 0 and s['bindings'] == s['entries'] == 0 and
+                     s['mcast_installed'] == s['mroute_installed'] == 0, timeout=25)
+        return None
+    result = await r.target.fs_write(r.session, DISABLED_CONF, 'enabled no\n')
+    assert result['errno'] == 0, result
+    result = await console_command(r.service_console, DAEMON, 'apply', '--config', DISABLED_CONF, timeout=40)
+    return console_json(result['stdout'])['drained']
+
+
+async def restart_acceleration(r, how):
+    """Undo stop_acceleration(r, how) the way an operator would: resume the
+    controller, which reconciles its configured (enabled) policy, or reload the
+    service, which resumes it and starts it again."""
+    if how == 'service-stop':
+        await console_command(r.service_console, INIT, 'reload', timeout=45)
+    elif how == 'disabled-config':
+        result = await r.target.fs_write(r.session, CONF, r.enabled_conf)
+        assert result['errno'] == 0, result
+    else:
+        await console_command(r.service_console, DAEMON, 'resume')
+    await wait_service(r, timeout=20)
+    # The table the restart installed is a ruleset commit, which takes back
+    # every routed group's confirmations; a group is carried again only once
+    # the ruleset has stood still, so the windows below start from there.
+    if r.multicast_kind == 'mroute':
+        await r.wait(lambda s: s['mroute_ruleset_settled'] == 1, timeout=10)
+
+
+async def stopped_window(r, p, groups, label):
+    """Every stream still reaches its listener -- Linux forwarding it, since
+    nothing of either learner is in hardware -- and each group says why."""
+    before = await r.state()
+    window = r.multicast_window
+    r.multicast_window += 1
+    await asyncio.gather(asyncio.to_thread(send, r, groups, window, 64),
+                         p.batch([0, 1], count=64, interval=0.01))
+    await asyncio.sleep(0.2)
+    after = await r.state()
+    r.record(label, {'before': before, 'after': after})
+    assert after['mcast_enabled'] == 0, after
+    assert after['mcast_installed'] == after['mroute_installed'] == 0, after
+    for group in groups:
+        result = await p.rpc('multicast', changes={'action': 'status', 'group': group})
+        assert not result['errors'], result
+        sample = result['windows'].get(str(window), {'received': 0})
+        assert sample['received'] == 64 and sample['duplicates'] == 0, (group, sample)
+        current = row(after, group, r.multicast_kind)
+        assert current and current['state'] == 'refused-paused', (group, current)
+
+
+async def acceleration_stopped(r, how):
+    """A stop, by any public route, is global: when it returns, neither
+    learner has anything in hardware, streams keep flowing through Linux, and a
+    group learned meanwhile stays there too. Restarting acceleration carries
+    them all again without the memberships or routes being touched."""
+    flows = [{**f, 'lan': r.lan_ip} for f in FLOWS]
+    label = f'{r.multicast_kind}-{r.multicast_family}-{how}'
+    new = STOPPED_GROUP[r.multicast_kind, r.multicast_family]
+    installed = r.multicast_kind + '_installed'
+    async with peer(r, flows, initial_ids=[0, 1, 3], lease=300) as p:
+        await warm(r, p, [0, 1], label + '-control-warm', flows[:2])
+        await hardware(r, p, label + '-controls', flows[:2])
+        for group in r.multicast_groups:
+            await p.rpc('multicast', changes={'action': 'join', 'group': group, 'iface': r.multicast_listener, 'port': PORT})
+            await route(r, group)
+            await wait_group(r, group, True)
+        await transfer(r, p, label + '-baseline')
+
+        drained = await stop_acceleration(r, how)
+        stopped = await r.state()
+        r.record(label + '-stopped', {'drained': drained, 'state': stopped})
+        # Already true when the stop returns: that is what it promises.
+        if drained is not None:
+            assert drained['mcast_enabled'] == drained['mcast_installed'] == drained['mroute_installed'] == 0, drained
+        assert stopped['mcast_enabled'] == 0 and stopped[installed] == 0, stopped
+        assert stopped['entries'] == stopped['bindings'] == 0, stopped
+        await stopped_window(r, p, r.multicast_groups, label + '-software')
+
+        # Learned while stopped: in software from the start, and saying why.
+        await p.rpc('multicast', changes={'action': 'join', 'group': new, 'iface': r.multicast_listener, 'port': PORT})
+        try:
+            await route(r, new)
+            await offer(r, new)
+            await stopped_window(r, p, [*r.multicast_groups, new], label + '-learned-stopped')
+
+            await restart_acceleration(r, how)
+            for group in [*r.multicast_groups, new]:
+                await wait_group(r, group, True)
+            after = await transfer(r, p, label + '-restarted')
+            assert after['mcast_enabled'] == 1 and after[installed] >= 3, after
+            await hardware(r, p, label + '-controls-restarted', flows[:2])
+        finally:
+            await route(r, new, False)
+            await p.rpc('multicast', changes={'action': 'leave', 'group': new})
+        for group in r.multicast_groups:
+            await route(r, group, False)
+            await wait_group(r, group, False)
+            await p.rpc('multicast', changes={'action': 'leave', 'group': group})
+
+
+@pytest.mark.parametrize('how', STOPS)
+async def test_flowtable_service_multicast_stops_with_acceleration(multicast_service, how):
+    await acceleration_stopped(multicast_service, how)

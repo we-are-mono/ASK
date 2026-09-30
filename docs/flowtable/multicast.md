@@ -592,6 +592,25 @@ does not see at all: an nftables `netdev` ingress chain and a tc ingress
 filter on a bridge port run before the bridge and are bypassed by a carried
 flow like any other software step.
 
+**The global switch.** Multicast acceleration, bridged and routed together, is
+on or off as a whole: `/sys/module/ask_flowtable/parameters/multicast`, `Y` at
+load. The offload service switches it off when it stops (`ask-flowtable stop`,
+the init script's `stop`) or applies a policy with `enabled no`, before it
+drains, and waits for `mcast_installed` and `mroute_installed` to reach zero
+along with the unicast counters, so a successful stop is a global drain. An
+enabled policy switches it on again, so `resume` and a reload carry the groups
+back. Off, both learners keep learning -- memberships, routes and
+confirmations are the kernel's and are left alone -- but every flow comes out
+of hardware and none goes in, each reading `refused-paused`, which is tested
+ahead of every other refusal. `/proc` reports the switch as `mcast_enabled`. A
+consumer without the service, such as OpenWrt's fw4, leaves it on and carries
+multicast as before. The rig cases
+`test_flowtable_service_multicast_stops_with_acceleration` and
+`..._bridge_stops_with_acceleration` stop by each route with live unicast and
+both learners' groups installed, require nothing of either in hardware when
+the stop returns, streams still delivered through Linux, a group learned
+meanwhile held in software, and everything carried again once restarted.
+
 **The host as a router.** A bridge that is a multicast router for the flow's
 family — `mcast_router 2`, or a query heard from the host itself — hands every
 group to the host as well, and so does a promiscuous one: a bridge has no
@@ -619,7 +638,8 @@ group that is not being replicated must be able to tell "refused" from "not yet
 seen". `/proc` prints one `mcast` row per flow, with `member_src` the source of
 the most specific membership naming it, and one per membership that names no
 flow yet, as `pending-source`. `mcast_groups` counts memberships and
-`mcast_flows` flows; `mcast_installed` counts flows in hardware.
+`mcast_flows` flows; `mcast_installed` counts flows in hardware, and
+`mcast_enabled` is the global switch both learners answer to.
 
 **Capacity.** 512 group ids per family (`MAX_MC4_ENTRIES`), and one id per
 flow — per `(S,G,ingress)` triple — rather than per membership. Exhaustion is

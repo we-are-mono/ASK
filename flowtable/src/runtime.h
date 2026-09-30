@@ -9,6 +9,7 @@
 
 #define FT_PROC        "/proc/cdx_flowtable"
 #define FT_CDX_MODULE  "/sys/module/cdx"
+#define FT_MULTICAST   "/sys/module/ask_flowtable/parameters/multicast"
 #define FT_LOCK      "/run/lock/ask-flowtable.lock"
 #define FT_PAUSED      "/run/lock/ask-flowtable.paused"
 #define FT_DEFAULT_CONF "/etc/ask/offload.conf"
@@ -26,6 +27,9 @@ struct ft_backend {
 	long     bindings, entries, handle_refs, neighbour_refs, quarantine;
 	long     fatal, observe, invalidated;
 	long     installs, deletes, rearms, errors;   /* observability, for the CLI result */
+	/* Multicast acceleration: the adapter's global switch and what both of
+	 * its learners have in hardware, which only a disable drains. */
+	long     mcast_enabled, mcast_installed, mroute_installed;
 	uint32_t qos_mark_mask;
 };
 
@@ -36,9 +40,15 @@ int ft_backend_json(const struct ft_backend *b, char *buf, size_t n);
  * -1 with ctx->err on a malformed/partial read. */
 int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b);
 
-/* Poll until the DRAIN_FIELDS are zero or the adapter is gone. 0 on drained,
- * -1 on timeout/fatal (ctx->err set). */
-int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms);
+/* Turn the adapter's multicast acceleration on or off. Multicast follows no
+ * flowtable: the policy's global enable and the stop that overrides it are its
+ * only controls. 0 when done or the adapter is absent, -1 with ctx->err. */
+int ft_backend_multicast(struct ft_ctx *ctx, bool on);
+
+/* Poll until the DRAIN_FIELDS are zero -- with `multicast`, both learners'
+ * installed groups as well -- or the adapter is gone. 0 on drained, -1 on
+ * timeout/fatal (ctx->err set). */
+int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms, bool multicast);
 
 /* Resolve "devices auto" against the live interface set: up fsl_dpa ports,
  * sorted. Fills p->devices/ndevices, leaves devices_auto set for status.

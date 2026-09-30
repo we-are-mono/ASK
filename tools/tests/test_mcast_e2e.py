@@ -58,6 +58,7 @@ from _mcast_helpers import (  # noqa: F401  (fixture imported for resolution)
     arm_bridge_querier,
     capture_parallel_window,
     kill_parallel_tcpdumps,
+    multicast_on,
     pcap_cleanup_lan,
     read_pcap_count,
     spawn_parallel_tcpdumps,
@@ -152,6 +153,7 @@ async def mcast_bridge(aiohttp_session, target_agent):
     address is moved rather than duplicated, so there is exactly one route to
     the segment at any moment.
     """
+    await multicast_on(target_agent, aiohttp_session)
     stack = TopologyStack()
     console = Console.target(log_path=str(ARTIFACTS / "mcast-bridge-uart.log"))
     # A fresh boot leaves the console at a login prompt, and every command
@@ -641,6 +643,7 @@ async def smcrouted(aiohttp_session, target_agent):
     daemon starts, because smcroute matches a phyint by name at startup.
     """
     started: list[bool] = []
+    await multicast_on(target_agent, aiohttp_session)
 
     async def start(ifaces: list[str]):
         if started:

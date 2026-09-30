@@ -106,6 +106,8 @@ async def stop(con):
     result = await console_command(con, "/usr/sbin/ask-flowtable", "stop", timeout=40)
     state = console_json(result["stdout"])["drained"]
     assert all(state[k] == 0 for k in DRAIN_FIELDS), state
+    # A stop is global: multicast is switched off and drained with the rest.
+    assert state["mcast_enabled"] == state["mcast_installed"] == state["mroute_installed"] == 0, state
 
 
 async def installed(con):

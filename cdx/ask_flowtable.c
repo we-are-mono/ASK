@@ -5203,6 +5203,15 @@ static DECLARE_DELAYED_WORK(ft_mc_refresh, ft_mc_refresh_fn);
 /* Set once the adapter is tearing down, so a queued worker that runs during
  * exit does nothing rather than reaching a backend that is going away. */
 static bool ft_mc_stopping;
+/* Multicast acceleration as a whole, bridged and routed: the global switch
+ * the offload service turns off when it stops or its policy is disabled, and
+ * on again when it applies an enabled one (the `multicast` parameter below).
+ * Off, both learners go on learning -- memberships, routes and confirmations
+ * are the kernel's and stay exactly as they are -- but every group they have
+ * in hardware goes back to software, and none goes in, each saying
+ * refused-paused; on, each is asked again and carried as before. On at load,
+ * so a consumer with no service carries multicast as it always did. */
+static bool ft_mc_enabled = true;
 /* Something outside this learner changed an answer it had already given, with
  * no membership event to say so: a device MTU changed, and a flow whose ports
  * no longer bound its ingress has to leave hardware rather than wait for its
@@ -5874,12 +5883,13 @@ static bool ft_mc_host_wants(const struct ft_mc_flow *f)
  * forwards nowhere -- every listener is behind the port it arrives on, or
  * blocks its source -- has nothing to replicate: it stays with the bridge,
  * which drops it. And no flow is carried while a bridge filter hook would see
- * its frames; see ft_mc_bridge_filtered(). */
+ * its frames; see ft_mc_bridge_filtered(). Nor while multicast acceleration
+ * is switched off; see ft_mc_enabled. */
 static bool ft_mc_installable(const struct ft_mc_flow *f)
 {
 	const struct ft_mc_route *r = ft_mc_live_route(f);
 
-	return !ft_mc_filtered &&
+	return READ_ONCE(ft_mc_enabled) && !ft_mc_filtered &&
 	       f->derived && f->in && !f->gone && !ft_mc_host_wants(f) &&
 	       (f->ports || r) && (r || !f->routed_host) &&
 	       ft_mc_carriable(f) && ft_mc_mtu_bounded(f);
@@ -7111,7 +7121,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		struct ft_mc_route *route = NULL;
 		struct ft_mc_flow *target = NULL;
 		bool swap = false, swapped = false, withdrew = false;
-		bool added = false;
+		bool added = false, paused;
 		struct cdx_mc_group *hw;
 		s64 changes;
 		int rc = 0;
@@ -7192,12 +7202,17 @@ static void ft_mc_work_fn(struct work_struct *work)
 		hw = target->hw;
 		/* Before anything is built: see ft_egress_changes. */
 		changes = atomic64_read_acquire(&ft_egress_changes);
+		/* The switch again, under the transaction /proc is read through:
+		 * the spec was taken before it, and a stop that has read nothing
+		 * installed must not see this pass's add land afterwards. With no
+		 * entry left, everything recorded below follows from hw alone. */
+		paused = spec.listeners && !READ_ONCE(ft_mc_enabled);
 		if (swap && hw) {
 			cdx_mc_group_del(&hw);
 			ft_mc_installed--;
 			swapped = true;
 		}
-		if (!spec.listeners) {
+		if (!spec.listeners || paused) {
 			/* Became ineligible: take it out of hardware and keep
 			 * the flow, which may become installable again when the
 			 * host leaves, a port returns or a route arrives. */
@@ -7960,8 +7975,10 @@ static const char *ft_mc_state(const struct ft_mc_flow *f)
 	/* Before "installed", deliberately: a flow whose answer has just
 	 * changed is still in the table for one more worker pass, and what an
 	 * operator needs to read in that window is the reason it is about to
-	 * come out. A bridge filter hook first: it refuses every flow, and
-	 * removing it is what would let this one in. */
+	 * come out. The global switch first, then a bridge filter hook: each
+	 * refuses every flow, and undoing it is what would let this one in. */
+	if (!READ_ONCE(ft_mc_enabled))
+		return "refused-paused";
 	if (ft_mc_filtered)
 		return "refused-filter";
 	if (ft_mc_host_wants(f))
@@ -8219,6 +8236,8 @@ enum ft_mr_state {
 	 * tests them. ft_mr_refusal() depends on the four above staying below
 	 * the first of them. */
 	FT_MR_REFUSED_TABLE,
+	/* Multicast acceleration is switched off; see ft_mc_enabled. */
+	FT_MR_REFUSED_PAUSED,
 	FT_MR_REFUSED_POLICY,
 	FT_MR_REFUSED_WILDCARD,
 	FT_MR_REFUSED_SCOPE,
@@ -8246,6 +8265,7 @@ static const char *ft_mr_state_text(enum ft_mr_state state)
 	case FT_MR_BRIDGED:		return "pending-bridged";
 	case FT_MR_UNCONFIRMED:		return "pending-confirm";
 	case FT_MR_REFUSED_TABLE:	return "refused-table";
+	case FT_MR_REFUSED_PAUSED:	return "refused-paused";
 	case FT_MR_REFUSED_POLICY:	return "refused-policy";
 	case FT_MR_REFUSED_WILDCARD:	return "refused-wildcard";
 	case FT_MR_REFUSED_SCOPE:	return "refused-scope";
@@ -8927,6 +8947,11 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	vif_dev = ft_mr_vif_dev(idx, mfc->mfc_parent);
 	plan->parent = vif_dev ? vif_dev->ifindex : 0;
 	plan->oifs_known = true;
+	/* Switched off: in software, still gathering its confirmations, so the
+	 * switch coming back on carries it at once if the ruleset has not
+	 * moved -- and a ruleset commit meanwhile takes them back as ever. */
+	if (!READ_ONCE(ft_mc_enabled))
+		return FT_MR_REFUSED_PAUSED;
 	/* A policy rule that is not the default one can send a stream to a
 	 * table this learner does not read, and the hardware entry would keep
 	 * matching whatever the rule decided afterwards. One such rule
@@ -10756,6 +10781,13 @@ again:
 			/* Before anything is built: see ft_egress_changes. */
 			changes = atomic64_read_acquire(&ft_egress_changes);
 			touched = true;
+			/* The switch again, under the transaction /proc is read
+			 * through: the contract was answered before it, and a
+			 * stop that has read nothing installed must not see
+			 * this pass's add land afterwards. As a refusal, it
+			 * takes the delete below and records like any other. */
+			if (state == FT_MR_PENDING && !READ_ONCE(ft_mc_enabled))
+				state = FT_MR_REFUSED_PAUSED;
 			/* What an entry counted since the last fold goes with it
 			 * unless it is read first; it is folded as the outcome is
 			 * recorded, against the set it was installed with. */
@@ -10818,8 +10850,10 @@ again:
 
 		/* Routed through a bridge: the copies are the bridged group's to
 		 * carry, and whether it does is this group's state. It takes
-		 * ft_mc_lock, so it runs under no lock of this learner. */
-		if (via) {
+		 * ft_mc_lock, so it runs under no lock of this learner. Not once
+		 * the transaction found the switch off: the next pass, which the
+		 * switch queued, takes the route back. */
+		if (via && state == FT_MR_PENDING) {
 			rc = ft_mr_publish(target, &plan);
 			if (rc < 0)
 				ft_mr_install_errors++;
@@ -10957,6 +10991,55 @@ static void ft_mr_exit(void)
 	ft_mr_policy[0] = 0;
 	ft_mr_policy[1] = 0;
 }
+
+/* Have both learners reconsider every group they know: the bridged one
+ * through its installable test, the routed one through its contract. Each is
+ * woken under its own lock, where its exit sets the stopping flag before
+ * cancelling its worker, so no wake can queue a worker exit has already
+ * drained. The parameter stays writable through exit and until the module is
+ * freed. */
+static void ft_mc_switched(void)
+{
+	mutex_lock(&ft_mc_lock);
+	if (!ft_mc_stopping) {
+		WRITE_ONCE(ft_mc_recheck, true);
+		schedule_work(&ft_mc_work);
+	}
+	mutex_unlock(&ft_mc_lock);
+	mutex_lock(&ft_mr_lock);
+	if (!ft_mr_stopping) {
+		WRITE_ONCE(ft_mr_recheck, true);
+		schedule_work(&ft_mr_work);
+	}
+	mutex_unlock(&ft_mr_lock);
+}
+
+/* Woken only once initialization has both learners running; a value set
+ * before that is read by their passes, and initialization wakes them once
+ * more when it is done, for a flip that fell between. The barrier pairs with
+ * the one queueing that wake implies, so one of the two sees the other's
+ * store. Writers are serialized by the parameter lock. */
+static int ft_mc_enabled_set(const char *val, const struct kernel_param *kp)
+{
+	bool was = READ_ONCE(ft_mc_enabled);
+	int rc = param_set_bool(val, kp);
+
+	if (rc || READ_ONCE(ft_mc_enabled) == was)
+		return rc;
+	pr_info("cdx flowtable: multicast acceleration %s\n",
+		READ_ONCE(ft_mc_enabled) ? "on" : "off; every group returns to software");
+	smp_mb();
+	if (READ_ONCE(ft_ready))
+		ft_mc_switched();
+	return 0;
+}
+
+static const struct kernel_param_ops ft_mc_enabled_ops = {
+	.set = ft_mc_enabled_set,
+	.get = param_get_bool,
+};
+module_param_cb(multicast, &ft_mc_enabled_ops, &ft_mc_enabled, 0644);
+MODULE_PARM_DESC(multicast, "Multicast acceleration: N returns every bridged and routed group to software and carries none until Y");
 
 /* The oifs Linux has not yet been seen forwarding the group to under the
  * ruleset in force: what keeps a pending-confirm group in software. Written
@@ -13829,6 +13912,10 @@ static int ft_show(struct seq_file *seq, void *v)
 	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, false);
 	seq_printf(seq, "tunnel_records %u\ntunnel_slots %u\n", tunnel_records, tunnel_slots);
 	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, true);
+	/* The global switch both learners answer to (the `multicast`
+	 * parameter); at 0 nothing of either is in hardware once they have
+	 * both passed. */
+	seq_printf(seq, "mcast_enabled %u\n", READ_ONCE(ft_mc_enabled));
 	/* Memberships the bridge reported, and the flows learned from traffic
 	 * that they and the routed learner's routes name; `installed` counts
 	 * flows, each one classifier entry. */
@@ -14037,6 +14124,9 @@ static int __init ask_flowtable_init(void)
 	 * standing are asked for instead. */
 	ft_mc_replay();
 	WRITE_ONCE(ft_ready, true);
+	/* The multicast switch wakes both learners only from here on; one
+	 * flipped while they were starting is answered by this wake. */
+	ft_mc_switched();
 	rc = ft_init_fault(5) ? -ENOMEM : flow_indr_dev_register(ft_bind, NULL);
 	if (rc)
 		goto not_ready;

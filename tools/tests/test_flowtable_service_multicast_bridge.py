@@ -22,7 +22,7 @@ from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mcast_wire_capture import multicast_mac
 from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read, rig  # noqa: F401
 from test_flowtable_service import managed_service, wait_service
-from test_flowtable_service_multicast import recover
+from test_flowtable_service_multicast import STOPS, acceleration_stopped, recover
 from test_mcast_e2e import dut_mac, mroute_line
 from test_mroute_capacity import _daemon
 
@@ -177,6 +177,11 @@ except BaseException:
 @pytest.mark.parametrize('fault', ['withdrawal', 'install-failslab'])
 async def test_flowtable_service_multicast_bridge_recovery(multicast_bridge_service, fault):
     await recover(multicast_bridge_service, fault)
+
+
+@pytest.mark.parametrize('how', STOPS)
+async def test_flowtable_service_multicast_bridge_stops_with_acceleration(multicast_bridge_service, how):
+    await acceleration_stopped(multicast_bridge_service, how)
 
 
 # ---- what a bridged replica looks like on the wire --------------------------

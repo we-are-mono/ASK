@@ -19,6 +19,7 @@ import pytest
 
 from ask_orch.counters import kernel_rx_packets
 from _mcast_cpu import cpu_frames, stream_cpu_counters
+from _mcast_helpers import multicast_on
 from _topology import (
     LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
     VLAN_IDS_MROUTE_LIMIT, VLAN_ID_PPPOE_WAN,
@@ -111,6 +112,7 @@ for suffix in ('.pid', '.ready', '.json', '.log', '.py'):
 
 @asynccontextmanager
 async def _daemon(target, session, interfaces):
+    await multicast_on(target, session)
     name = "ask-smcroute-" + uuid.uuid4().hex[:8]
     config = f"/tmp/{name}.conf"
     text = "".join(f"phyint {dev} enable\n" for dev in interfaces)

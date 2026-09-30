@@ -106,6 +106,13 @@ opposite conclusion**: IPv4's is `RT_TABLE_DEFAULT`, 253, while IPv6's
 of 253 in an IPv4 row and 254 in an IPv6 one are both the default. An entry in
 any other table is `refused-table`.
 
+**The global switch.** With multicast acceleration switched off -- the offload
+service does so when it stops or its policy is disabled; see
+[the global switch](multicast.md) in the bridged design -- every group is
+`refused-paused` and out of hardware. Its oifs are still listed first and its
+confirmations still gathered, so switching back on carries it at once if the
+ruleset has not moved since.
+
 **Policy rules.** A multicast policy rule that is not the kernel's own default
 can send a stream to a table this learner does not read. A hardware entry
 matches at the classifier and is never offered to the rule that would have
@@ -631,6 +638,7 @@ family over:
 | Its parent or thresholds | `FIB_EVENT_ENTRY_REPLACE` | re-derived; a changed ingress is a delete and an add, because the port is part of the key and `cdx_mc_group_replace()` refuses a changed one |
 | A VIF added or removed | `FIB_EVENT_VIF_*` | every group of that family re-derived: an index only means anything against the table it indexes |
 | A policy rule | `FIB_EVENT_RULE_*` | the family's count moves and every group re-derived |
+| The multicast switch flipped (the service stopping, disabled, or enabled again) | the `multicast` parameter's setter, which wakes both learners | every group re-derived: off, each is `refused-paused` and out of hardware -- rechecked inside the transaction, so a stop that read nothing installed sees nothing added after -- with its watch still armed; on, each is carried again as its contract allows |
 | A port down or unregistering | the netdev chain, beside `ft_mc_device_gone()` | the group's references on it released synchronously and the group re-derived. A port the group copies out of takes only the copies half of the set with it — the listeners and the recorded spec that borrows them — and the ingress stays, so when what is left can still be carried the re-derivation swaps the chain under the same root rather than reading a released ingress as a new key. That is a port that went away with its VIF. One that is only down, or has lost carrier, is still an oif ipmr forwards to and still a listener of the set, and a set with a port that cannot carry is refused whole (`cdx_mc_port_supported()`): the group leaves hardware and is tried again at each refresh up to the retry ceiling, and whenever a port comes back up. The ingress's own port releases the whole set; the installed entry keeps its own hold on the ingress until the worker deletes it, because the backend deletes through that device, so unregistration waits only for the worker it scheduled |
 | A port coming back up | the netdev chain | re-derived; nothing else would ever reconsider a refused group, because the MFC entry does not change and no frame re-offers it |
 | A device MTU | `NETDEV_CHANGEMTU` | every group re-derived, installed ones included; a copy narrower than its parent VIF takes the group out as `refused-mtu` |
@@ -764,7 +772,8 @@ including the listener-less entries `smcrouted` adds for whatever its WAN VIF
 hears. A group routed through a bridge rides the bridged group's entry and
 adds none of its own, so its count stays where it was.
 The states are `installed`, `pending`, `pending-bridged`,
-`pending-confirm`, and the refusals above plus `refused-filter`, each distinct
+`pending-confirm`, and the refusals above (`refused-paused` among them) plus
+`refused-filter`, each distinct
 so an operator can tell them apart. While a routed group exists,
 `mroute_ruleset_settled` is 0 for the second after a commit, and for as long
 as the commit is still being applied. Meanwhile no copy confirms anything, and

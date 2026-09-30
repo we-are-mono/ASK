@@ -54,10 +54,13 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 		else if (!strcmp(key, "rearms"))         { b->rearms = v; }
 		else if (!strcmp(key, "errors"))         { b->errors = v; }
 		else if (!strcmp(key, "qos_mark_mask"))  { b->qos_mark_mask = (uint32_t)strtoul(sval, NULL, 0); }
+		else if (!strcmp(key, "mcast_enabled"))    { b->mcast_enabled = v; seen |= 128; }
+		else if (!strcmp(key, "mcast_installed"))  { b->mcast_installed = v; seen |= 256; }
+		else if (!strcmp(key, "mroute_installed")) { b->mroute_installed = v; seen |= 512; }
 	}
 	int error = ferror(f);
 	fclose(f);
-	if (error || seen != 127) {
+	if (error || seen != 1023) {
 		snprintf(ctx->err, sizeof(ctx->err), "incomplete backend diagnostics");
 		return -1;
 	}
@@ -70,14 +73,38 @@ int ft_backend_json(const struct ft_backend *b, char *buf, size_t n)
 		"{\"present\": %s, \"bindings\": %ld, \"entries\": %ld, "
 		"\"handle_refs\": %ld, \"neighbour_refs\": %ld, \"quarantine\": %ld, "
 		"\"installs\": %ld, \"deletes\": %ld, \"rearms\": %ld, \"errors\": %ld, "
-		"\"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld}",
+		"\"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld, "
+		"\"mcast_enabled\": %ld, \"mcast_installed\": %ld, \"mroute_installed\": %ld}",
 		b->present ? "true" : "false", b->bindings, b->entries,
 		b->handle_refs, b->neighbour_refs, b->quarantine,
 		b->installs, b->deletes, b->rearms, b->errors,
-		b->fatal, b->invalidated, b->observe);
+		b->fatal, b->invalidated, b->observe,
+		b->mcast_enabled, b->mcast_installed, b->mroute_installed);
 }
 
-int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms)
+int ft_backend_multicast(struct ft_ctx *ctx, bool on)
+{
+	FILE *f = fopen(FT_MULTICAST, "w");
+	int error;
+
+	if (!f) {
+		if (errno == ENOENT)
+			return 0;   /* adapter not loaded: nothing is accelerated */
+		snprintf(ctx->err, sizeof(ctx->err), "cannot switch multicast acceleration: %s",
+			 strerror(errno));
+		return -1;
+	}
+	error = fputs(on ? "Y\n" : "N\n", f) < 0;
+	error |= fclose(f) != 0;
+	if (error) {
+		snprintf(ctx->err, sizeof(ctx->err), "cannot switch multicast acceleration: %s",
+			 strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms, bool multicast)
 {
 	long deadline = now_ms() + timeout_ms;
 	for (;;) {
@@ -91,7 +118,8 @@ int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms)
 				 "hardware retirement failed; full teardown and fresh boot required");
 			return -1;
 		}
-		if (!b.bindings && !b.entries && !b.handle_refs && !b.neighbour_refs && !b.quarantine)
+		if (!b.bindings && !b.entries && !b.handle_refs && !b.neighbour_refs && !b.quarantine &&
+		    (!multicast || (!b.mcast_installed && !b.mroute_installed)))
 			return 0;
 		if (now_ms() >= deadline) {
 			snprintf(ctx->err, sizeof(ctx->err),

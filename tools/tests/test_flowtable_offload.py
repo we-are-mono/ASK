@@ -29,6 +29,7 @@ from ask_orch.client import Agent
 from ask_orch.counters import kernel_tx_packets
 from ask_orch.uart import Console
 from _ioctl import _IOR
+from _mcast_helpers import MULTICAST_SWITCH
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, kernel_rx_packets, lan_run_python
 
 WAN_IP = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
@@ -418,10 +419,14 @@ async def stop_boot_daemon():
     policy themselves, so they stop the boot daemon first -- the init script
     kills it and removes its table, draining the hardware to an unbound state.
     Every rig does this itself rather than rely on an earlier test having done
-    it, so a test run on its own after a boot sees the same start."""
+    it, so a test run on its own after a boot sees the same start.
+
+    The stop switches multicast acceleration off with the rest. A controlled
+    test owns that switch as well, and starts from it on, as a boot leaves it."""
     with Console.target(log_path=str(ARTIFACTS / "boot-daemon-stop.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         await console_command(con, "/etc/init.d/ask-flowtable", "stop", check=False, timeout=45)
+        await console_command(con, "sh", "-c", f"echo Y > {MULTICAST_SWITCH}")
 
 
 @pytest_asyncio.fixture
