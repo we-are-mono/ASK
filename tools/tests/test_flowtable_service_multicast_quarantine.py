@@ -30,19 +30,24 @@ armed, and both are disarmed on the way out whatever happened.
 """
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
+import json
+import os
 import time
 
 import pytest
 
-from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware, in_software, learn,
-                            mcast_rows, mdb, members, moved, mroute_row, multicast_rig, packets,  # noqa: F401
-                            stream, streamed, summary)
+from _ioctl import _IOR
+from _mcast_windows import (COUNT, MulticastRig, bridge_settings, delivered, dut_console, in_hardware,
+                            in_software, learn, mcast_rows, mdb, members, moved, mroute_row,
+                            multicast_rig, packets, stream, streamed, summary,  # noqa: F401
+                            wire_interface)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
-from test_flowtable_offload import (HEALTH_BASELINE, command, console_command, hardware_proof, read,  # noqa: F401
-                                    rig)
-from test_mcast_e2e import mcast_bridge, wan_source_address  # noqa: F401
+from test_flowtable_offload import (HEALTH_BASELINE, command, console_command, console_python,  # noqa: F401
+                                    hardware_proof, read, rig, status_text, stop_boot_daemon)
+from test_mcast_e2e import _exec, dut_mac, mcast_bridge, wan_source_address  # noqa: F401
 from test_mroute_capacity import _daemon
 
 DELETE_BARRIER = "/proc/fm_ehash_hcsync_fail"
@@ -374,3 +379,107 @@ async def test_flowtable_service_multicast_quarantine_released_without_multicast
         HEALTH_BASELINE["errors"] = reloaded["errors"]
         m.record("mcast-quarantine-released", {"parked": summary(parked), "admitted": summary(admitted),
                                                "unloaded": between["stdout"], "reloaded": summary(reloaded)})
+
+
+UNLINK_FAULT = "/sys/module/cdx/parameters/ehash_fail_unlink"
+# The two 10G receive ports. Their enable bit, read through the port's own
+# ioctl, sees classification stop where carrier on a fixed link would not.
+RX_PORTS_SCRIPT = f'''
+import fcntl, json, os
+states = {{}}
+for port in (6, 7):
+    fd = os.open('/dev/fm0-port-rx%d' % port, os.O_RDWR)
+    try:
+        value = bytearray(1)
+        fcntl.ioctl(fd, {_IOR(0xe1, 70 + 44, 1)}, value)
+        states[str(port)] = value[0]
+    finally:
+        os.close(fd)
+print(json.dumps(states))
+'''
+
+
+@pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TERMINAL") != "mcast-unlink",
+                    reason="explicit terminal lifecycle test; fresh boot required")
+async def test_flowtable_service_multicast_unproven_delete_is_terminal(target_agent, aiohttp_session, lan):
+    """A group delete that cannot prove its unlink fail-stops the datapath.
+
+    The cases above fail the barrier after the key has left the table, so its
+    entries can be parked. This one fails the delete before the unlink
+    (ehash_fail_unlink): the root may still resolve and replicate through a
+    listener chain nothing owns any more -- the state a unicast -EIO latches --
+    so it must latch the same way: terminal, with the ports stopped, rather
+    than a leaked root replicating to a revoked listener while /proc calls the
+    group gone.
+
+    Terminal: the ports stop and take the management path with them, so every
+    read after the withdrawal goes over the UART and nothing is restored; the
+    reset the DUT then demands is the restoration. No fixture that tears down
+    over the agent is used, and smcrouted is left to that reset."""
+    await stop_boot_daemon()
+    r = MulticastRig(target_agent, aiohttp_session, lan)
+    r.initial = await r.proc()
+    assert r.initial["fatal"] == r.initial["mroute_groups"] == 0, summary(r.initial)
+    # No unicast binding either: its invalidation pass also drives recovery,
+    # and would stop the ports even if the multicast latch never did.
+    assert r.initial["bindings"] == r.initial["entries"] == 0, summary(r.initial)
+    present = await r.target.fs_read(r.session, UNLINK_FAULT)
+    if present["errno"]:
+        pytest.fail(f"{UNLINK_FAULT} is missing: this is not the fault-injection test image")
+    r.wire = wire_interface()
+    r.dut_lan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_LAN_IF)
+    name = "ask-smcroute-terminal"
+    config = f"/tmp/{name}.conf"
+    result = await r.target.fs_write(r.session, config, "".join(
+        f"phyint {dev} enable\n" for dev in (TARGET_WAN_IF, TARGET_LAN_IF)))
+    assert result.get("errno", 0) == 0, result
+    await _exec(r.target, r.session, "smcrouted", "-N", "-i", name, "-f", config, "-l", "notice")
+
+    async def ctl(*args, check=True):
+        return await _exec(r.target, r.session, "smcroutectl", "-i", name, *args, check=check)
+
+    for _ in range(30):
+        if (await ctl("show", "routes", check=False))["rc"] == 0:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise AssertionError("smcrouted failed to own the default routing table")
+
+    family = 4
+    target, control = GROUPS[family]
+    learner = Routed(r, ctl, family)
+    live = await learner.add(target, control)
+    assert learner.installed(live, target) and learner.installed(live, control), summary(live)
+    # The ports stop from a work item, after the withdrawal returns, and its
+    # printk would land inside whichever console read is running then. dmesg
+    # keeps every line for the assertions below; the reset restores the level.
+    await command(r.target, r.session, "sysctl", "-w", "kernel.printk=1 4 1 7")
+    console = await dut_console("mcast-terminal")
+    try:
+        assert json.loads((await console_python(console, RX_PORTS_SCRIPT))["stdout"]) == {"6": 1, "7": 1}
+        # Armed over the agent while it still reaches the DUT; the withdrawal
+        # that consumes it is the last command the management path carries.
+        result = await r.target.fs_write(r.session, UNLINK_FAULT, "1")
+        assert result["errno"] == 0, result
+        await learner.remove(target)
+        deadline = time.monotonic() + 15
+        while True:
+            stopped = status_text((await console_command(console, "cat", "/proc/cdx_flowtable"))["stdout"].strip())
+            ports = json.loads((await console_python(console, RX_PORTS_SCRIPT))["stdout"])
+            if stopped["fatal"] == 1 and ports == {"6": 0, "7": 0}:
+                break
+            assert time.monotonic() < deadline, (summary(stopped), ports)
+            await asyncio.sleep(0.2)
+        # The adapter let the withdrawn group go; the hardware may not have,
+        # which is why the stopped ports and not /proc are the proof.
+        assert stopped["mroute_installed"] == live["mroute_installed"] - 1, summary(stopped)
+        knob = (await console_command(console, "cat", UNLINK_FAULT))["stdout"].strip()
+        assert knob == "0", knob
+        log = (await console_command(console, "dmesg"))["stdout"]
+        assert log.count("classifier delete failed pre-unlink") == 1, log
+        assert "hardware stopped after unproven deletion; reboot required" in log, log
+        assert "BUG: KASAN" not in log, log
+        r.record("mcast-terminal", {"live": summary(live), "stopped": summary(stopped),
+                                    "ports": ports, "dmesg": log})
+    finally:
+        console.close()

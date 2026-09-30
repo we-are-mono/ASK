@@ -702,6 +702,11 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 		 * wrapper. */
 		DPA_ERROR("%s::classifier delete failed pre-unlink (rc %d), leaking %u listener entries + the classifier entry\n",
 			  __func__, rc, leaked);
+		/* The root may still be linked and replicate through the leaked
+		 * listener chain. Latch terminal failure, as the unicast delete
+		 * does on -EIO, so the datapath fail-stops and demands a reset
+		 * rather than forwarding to a revoked listener on unnoticed. */
+		cdx_ft_fatal();
 	}
 	if (pMcastGrpInfo->pCtEntry)
 	{
@@ -1277,6 +1282,11 @@ int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
 
 	cdx_ft_assert_held();
 	*result = NULL;
+	/* After a root that may still be linked left the group list, the key
+	 * check below can no longer see it: a re-learned (S,G) would insert a
+	 * second copy beside it. The latch refuses every key, as unicast's does. */
+	if (cdx_ft_failed())
+		return -EIO;
 	rc = cdx_mc_check(spec);
 	if (rc)
 		return rc;
@@ -1425,6 +1435,10 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 	cdx_ft_assert_held();
 	if (!group || !group->info)
 		return -EINVAL;
+	/* Nor build listener chains for a datapath that is stopping; the
+	 * caller withdraws the group instead. */
+	if (cdx_ft_failed())
+		return -EIO;
 	grp = group->info;
 	if (!grp->pCtEntry || !grp->pCtEntry->ct)
 		return -EINVAL;

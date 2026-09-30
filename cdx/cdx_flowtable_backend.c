@@ -4,6 +4,7 @@
 #include <linux/if_arp.h>
 #include <linux/module.h>
 #include <linux/rtnetlink.h>
+#include <linux/workqueue.h>
 #include "portdefs.h"
 #include "cdx.h"
 #include "cdx_flowtable.h"
@@ -104,6 +105,51 @@ bool cdx_ft_failed(void)
 	return ft_failed;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_failed, ASK_CDX_FLOWTABLE);
+
+static void ft_fatal_work_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ft_fatal_work, ft_fatal_work_fn);
+
+/* cdx_ft_fatal() latches from paths the adapter's invalidation pass never
+ * visits -- a multicast root belongs to its learner, and that pass only runs
+ * while a flowtable is bound -- so nothing else is guaranteed to drive
+ * cdx_ft_recover() to the port quiescence the latch promises. Do it here, in a
+ * context that holds neither lock, retrying each second while RTNL is
+ * contended; recovery returns zero once the ports are stopped. */
+static void ft_fatal_work_fn(struct work_struct *work)
+{
+	int rc;
+
+	cdx_ft_begin();
+	rc = cdx_ft_recover();
+	cdx_ft_end();
+	if (rc == -EAGAIN)
+		schedule_delayed_work(&ft_fatal_work, HZ);
+}
+
+/* Latch terminal failure from outside the unicast delete path. A multicast
+ * classifier root that could not be provably unlinked may still resolve in
+ * hardware and replicate through a leaked listener chain, which is exactly
+ * the state unicast's -EIO latches. The same latch refuses new entries and
+ * groups, blocks port restart and makes the drain demand a reset, and the work
+ * above stops the ports, so a possibly-still-linked root fail-stops the
+ * datapath rather than forwarding on unnoticed. One-way, so a lockless
+ * WRITE_ONCE is enough; safe to call with the transaction held. */
+void cdx_ft_fatal(void)
+{
+	WRITE_ONCE(ft_failed, true);
+	schedule_delayed_work(&ft_fatal_work, 0);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_fatal, ASK_CDX_FLOWTABLE);
+
+/* Unload stops the ports itself; the work must not outlive the module or run
+ * against a freed cdx_info. Disabled rather than cancelled: the deinit chain
+ * after this still destroys multicast groups, and a failure there must latch
+ * without queueing the work again, as must the work's own retry while this
+ * waits for it. Called without the control lock, which the work takes. */
+void cdx_ft_fatal_stop(void)
+{
+	disable_delayed_work_sync(&ft_fatal_work);
+}
 
 unsigned int cdx_ft_pending(void)
 {

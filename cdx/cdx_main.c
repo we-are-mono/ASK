@@ -296,6 +296,9 @@ static void cdx_module_deinit(void)
 	/* Stop the remaining internal writer before terminal retries release
 	 * both locks. Timer storage survives until its normal exit callback. */
 	cdx_ctrl_timer_stop();
+	/* And the terminal-failure port-stop work: unload quiesces the ports
+	 * below itself, and the work takes the control lock and cdx_info. */
+	cdx_ft_fatal_stop();
 
 	/* Stop classification before any dependent subsystem releases queues.
 	 * Keep both locks available between retries and release them before

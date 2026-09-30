@@ -99,6 +99,8 @@ void cdx_unregister_ft_egress(void);
 int cdx_flowtable_guard_init(void);
 void cdx_flowtable_guard_exit(void);
 void cdx_flowtable_quiesced(void);
+/* Cancel the port-stop work cdx_ft_fatal() schedules; unload only, unlocked. */
+void cdx_ft_fatal_stop(void);
 /* Once claimed, adapter detach must never reopen configuration mutation. */
 bool cdx_flowtable_config_sealed(void);
 

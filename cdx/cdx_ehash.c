@@ -635,6 +635,28 @@ int cdx_ehash_quarantine_retry(void)
 	return list_empty(&cdx_ehash_pending_frees) ? 0 : -EAGAIN;
 }
 
+#ifdef CDX_DEBUG_FLOWTABLE
+/* Test-only. Classifier deletes to fail before the unlink, for the roots that
+ * delete through here -- multicast groups and IPsec SAs; unicast flowtable
+ * entries delete directly and have flowtable_fail_unlink. Each leaves its key
+ * linked, exactly as the not-provably-unlinked arm below describes, and only a
+ * reboot clears that. */
+static unsigned int ehash_fail_unlink;
+module_param_named(ehash_fail_unlink, ehash_fail_unlink, uint, 0600);
+MODULE_PARM_DESC(ehash_fail_unlink, "Multicast/IPsec classifier deletes to fail before unlink, leaving the key linked; reboot required");
+#endif
+
+static bool cdx_ehash_unlink_fault(void)
+{
+#ifdef CDX_DEBUG_FLOWTABLE
+	unsigned int left = READ_ONCE(ehash_fail_unlink);
+
+	return left && cmpxchg(&ehash_fail_unlink, left, left - 1) == left;
+#else
+	return false;
+#endif
+}
+
 /* Delete one key from an external hash table and dispose of its table
  * entry per the ExternalHashTableDeleteKey() tri-state (fm_ehash.h).
  *
@@ -657,7 +679,8 @@ int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle)
 	if (!handle)
 		return SUCCESS;
 
-	rc = ExternalHashTableDeleteKey(td, index, handle);
+	rc = cdx_ehash_unlink_fault() ? FAILURE :
+		ExternalHashTableDeleteKey(td, index, handle);
 	if (rc == SUCCESS)
 	{
 		ExternalHashTableEntryFree(handle);
