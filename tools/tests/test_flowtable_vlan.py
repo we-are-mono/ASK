@@ -183,7 +183,16 @@ async def _both_directions(r):
     """Admission is directional, so one direction refused leaves the other
     accelerated and the difference is invisible in a throughput number. When
     the count is wrong, say what Linux and the adapter each thought."""
+    # Admission is asynchronous and takes rtnl_trylock, so a direction can be
+    # deferred a second or two when the bench's own ip commands hold RTNL; give
+    # the deferred readmission that window before treating a missing direction
+    # as a refusal. A genuine refusal still fails, just after the wait.
     state = await r.state()
+    for _ in range(100):
+        if len(state["flows"]) == 2:
+            break
+        await asyncio.sleep(0.1)
+        state = await r.state()
     if len(state["flows"]) != 2:
         conntrack = await command(r.target, r.session, "conntrack", "-L", "-o", "extended",
                                   check=False)

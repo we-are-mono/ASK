@@ -875,7 +875,11 @@ async def _tcp_carried(r, label):
     async with GatedTcp(r.run_peer, source=r.lan_ip, sport=SPORT, peer=INNER_LOCAL,
                         dport=DPORT, label=label) as transfer:
         await transfer.warmed()
-        before = await r.state()
+        # Admission is asynchronous (rtnl_trylock, deferred a second or two
+        # under RTNL contention), so warmed()'s brief settle can miss a late
+        # direction; wait both in before reading the baseline the record and
+        # the direction check share.
+        before = await r.wait(lambda s: len(s["flows"]) == 2)
         flows = await _both_directions(r, before)
         record = _session_halves(before, r.session_identity)
         link = await _ppp_link(r)

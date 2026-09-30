@@ -810,7 +810,11 @@ async def test_flowtable_tunnel_tcp(tunnel_rig):
     async with GatedTcp(run, source=r.lan_address, sport=shape.sport, peer=shape.inner_orch,
                         dport=shape.dport, label="flowtable_tunnel_tcp") as transfer:
         await transfer.warmed()
-        before = await r.state()
+        # Admission is asynchronous (rtnl_trylock, deferred a second or two
+        # under RTNL contention), so warmed()'s brief settle can miss a late
+        # direction; wait admission in before reading the baseline the record
+        # and the direction check share.
+        before = await r.wait(lambda s: len(s["flows"]) == _expected(r, "tcp"))
         flows = await _both_directions(r, "tcp", before)
         record = _tunnel_record(r, before)
         link = await _tunnel_counters(r)

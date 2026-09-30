@@ -595,10 +595,19 @@ async def test_ipsec_replay_state_read_live(ipsec_service):
     records = []
     for n in range(2):
         await send_out(r, seconds=LIVE_BLAST_SECONDS)
-        read_sa = await getsa(r.target, r, out)
-        read_ae = await sa_replay_state(r.target, r.session, dst=WAN_IP, spi=r.ipsec.active["out"])
-        # The peer's own SA: the highest number it has taken from the DUT.
-        received = await getsa(r.ipsec.wan, r, out)
+        # The device's oseq is published by a periodic accounting pass, so it
+        # can trail the peer's received count by up to a pass right after a
+        # blast; wait the pass out before comparing. A genuine shortfall -- the
+        # device never reaching what the peer took -- still fails, after the
+        # wait, with the same record.
+        for _ in range(100):
+            read_sa = await getsa(r.target, r, out)
+            read_ae = await sa_replay_state(r.target, r.session, dst=WAN_IP, spi=r.ipsec.active["out"])
+            # The peer's own SA: the highest number it has taken from the DUT.
+            received = await getsa(r.ipsec.wan, r, out)
+            if read_sa["oseq"] >= received["seq"] and read_ae["oseq"] >= received["seq"]:
+                break
+            await asyncio.sleep(0.1)
         record = {"round": n, "getsa": read_sa, "getae": read_ae, "peer": received}
         records.append(record)
         r.record("ipsec-replay-read-live-out", records)
@@ -683,6 +692,18 @@ async def readd_outbound(r, ifindex, keys, label):
     its peer, keeping its own SA, has to take."""
     out_spi = r.ipsec.active["out"]
     out = r.ipsec.state("out", out_spi)
+    # After a blast the accounting pass is still catching oseq up to SEC's real
+    # counter; the assertions below pin the read to the first frame sent after
+    # it, so read only once oseq has stopped climbing. Traffic has stopped by
+    # here, so a short run of equal reads means the pass has caught up.
+    previous, stable = None, 0
+    for _ in range(100):
+        current = (await getsa(r.target, r, out))["oseq"]
+        stable = stable + 1 if current == previous else 0
+        if stable >= 3:
+            break
+        previous = current
+        await asyncio.sleep(0.2)
     async with esp_capture(r, f"ipsec-readd-{label}-old") as old_wire:
         read_sa = await getsa(r.target, r, out)
         read_ae = await sa_replay_state(r.target, r.session, dst=WAN_IP, spi=out_spi)
