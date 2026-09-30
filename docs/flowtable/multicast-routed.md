@@ -403,6 +403,50 @@ once the bridge has handed the stream up, before its copies are published to
 the bridged flow that carries them. That covers a bridge `input` chain on the
 way up too.
 
+**Every packet alike.** A copy seen leaving proves that the ruleset forwarded
+that copy. The classifier key stops at the address pair, so every other packet
+of the `(S,G)` rides the same entry, a stream on another UDP port among them.
+Under a rule that accepts port 5000 of a group and drops 5001, the 5000 copies
+would confirm the group and the 5001 stream would be replicated in hardware
+past its drop. So a confirmed group is carried only when the ruleset treats
+every packet of it alike, which `nft_port_dependent()` (kernel patch 148)
+judges from the ruleset rather than from packets. It walks the chains a copy
+crosses in hook order: netdev ingress on the parent VIF and every device below
+it, prerouting with its NAT chains, forward, postrouting, and netdev egress on
+each oif and every device below it. The stream is taken as UDP,
+`PACKET_MULTICAST`, unmarked and conntracked as new, with its family,
+addresses, input and outputs known and its ports not. The answer is 0 only
+when every path accepts at every hook with the same effects. Any of the
+following makes it 1 and the group `refused-ports`:
+
+- a rule that reads the ports;
+- a limit, quota or meter, such as banIP's UDP flood rule at prerouting,
+  which every multicast packet meets as new;
+- a lookup in a set the datapath updates or whose elements time out;
+- a `fib` lookup a path can drop on, which is how an RPF check
+  (`fib saddr . iif oif missing drop`) is written;
+- an xt match or target, which is what iptables-nft rules (a Docker host's,
+  say) are made of;
+- any translation, one that rewrites nothing but ports included, since the
+  hardware copy applies none;
+- a bridge-family chain on a bridged path;
+- a device the walk cannot follow through: PPP, an IP tunnel, VXLAN, veth, and
+  so a bridge with any such port.
+
+fw4's default ruleset answers 0 for a group sourced on the WAN. Its ISAKMP
+accept reads the port, but both paths it splits accept the group all the same. A group sourced on the LAN answers 1 while a UDP conntrack helper is
+loaded (none is by default), because fw4 assigns helpers per port in the LAN
+zone's prerouting. The walk runs last, once the confirmations are complete, and
+again at every worker pass, which is at least every five seconds. So what it
+reads that changes without a commit, such as an interface name or a bridge's
+ports, is followed within one refresh.
+
+- A commit before or during the walk means no answer. The group waits in
+  software and is asked again a tenth of a second on, by the ruleset poll,
+  rather than in a loop while the commit is being prepared.
+- A ruleset too large for the walk's bounds, or no memory for it, leaves the
+  group `refused-ports` and counts `mroute_port_probe_errors`.
+
 **The ruleset.** Confirmations are good for the ruleset they were made under:
 nftables' commit counter `init_net.nft.base_seq`, and the cursor
 `init_net.nft.gencursor` the packet path reads rules through, which the commit
@@ -452,20 +496,21 @@ flowtable flow on a commit, only when the flowtable itself goes. A routed
 multicast stream lives for hours, no conntrack timeout bounds it, and a
 blocklist entry added for its source has to stop it.
 
-**What it does not cover.** A confirmation proves that the ruleset forwards the
-stream to that oif, not what it does to each packet:
+**What it does not cover.** The confirmations and the port walk read nftables
+alone:
 
-- A rate limit, a quota, a counter, or a match that differs from one packet to
-  the next stops applying once the group is carried, as it does for a
+- A counter stops counting once the group is carried, as it does for a
   flowtable flow.
-- Verdicts that change without a commit are not followed:
-  - ipset membership (`iptables-nft -m set`) and stateful xt matches;
-  - set elements added by the datapath (`add @s`, `update @s`) or expiring
-    by timeout;
-  - `fib`-based rules after a route change;
-  - an interface renamed, or moved between groups, under an `iifname`,
-    `oifname`, `iifgroup` or `oifgroup` rule -- the parent VIF's name counts
-    as much as an oif's, since a confirmation holds for its parent;
+- A tc filter or action, at ingress or egress, and an iptables-legacy rule are
+  not read at all. For a port-selective one this is wider than it is for a
+  flowtable flow, whose key names its ports: a drop of one port's stream, with
+  another port's copies confirming the group, is bypassed by the one entry
+  both streams ride. See A294.
+- Verdicts that change without a commit, and that the walk does not read
+  either, are not followed:
+  - ipset membership (`iptables-nft -m set`) and stateful xt matches, which
+    the walk cannot read into -- it answers 1 for an xt match on the path,
+    so only one it rules out by an earlier match is left;
   - a table owned by a netlink socket (`flags owner`, not `persist`), which
     nf_tables releases when that socket closes, and every table, which it
     releases when its module is unloaded. Neither is a commit. Both only take
@@ -475,10 +520,6 @@ stream to that oif, not what it does to each packet:
     else takes it back to software.
 - A copy queued to userspace (NFQUEUE) before a commit and reinjected after
   the re-arm is observed under the new pair.
-- Anything after `POST_ROUTING` is not seen at all: an nftables `netdev`
-  egress chain, and a tc egress filter or action. Creating such a chain is a
-  commit. The next copy is seen at `POST_ROUTING` all the same, and is dropped
-  only in software after that.
 - iptables-legacy tables are replaced with no generation a module can read, so
   a legacy rule change is followed only once something else takes the group
   back: an MFC change, a device change, or an nftables commit. iptables-nft is
@@ -688,6 +729,7 @@ family over:
 | The MFC entry's parent replaced | the FIB chain | a new watch with nothing confirmed; to software until copies from the new parent are seen |
 | A bridge hook registered at `output` or `postrouting` | nothing reports it: asked at every derivation | a group with an oif through a bridge is `refused-filter` |
 | An nftables chain after the observer at `POST_ROUTING` | nothing reports it: asked at every derivation, and creating a chain is a commit | the family's groups are `refused-filter` |
+| A rule that could treat two packets of a group apart -- by port, rate or anything the port walk does not model -- or a device it cannot follow joining a VIF's stack | a commit, which takes every confirmation back; a stack change is found by the walk itself, run at every derivation of a confirmed group | `refused-ports` once the group is confirmed again |
 | The host joining the group on the parent VIF or an oif | nothing reports it | `refused-host` at the next derivation; the five-second refresh finds it |
 | A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |
@@ -787,6 +829,7 @@ mroute_xfrm_changes 0
 mroute_ruleset_changes 3
 mroute_ruleset_settled 1
 mroute_confirm_errors 0
+mroute_port_probe_errors 0
 ```
 
 — and one row per group:
@@ -809,7 +852,7 @@ hears. A group routed through a bridge rides the bridged group's entry and
 adds none of its own, so its count stays where it was.
 The states are `installed`, `pending`, `pending-bridged`,
 `pending-confirm`, and the refusals above (`refused-paused` among them) plus
-`refused-filter`, each distinct
+`refused-filter` and `refused-ports`, each distinct
 so an operator can tell them apart. While a routed group exists,
 `mroute_ruleset_settled` is 0 for the second after a commit, and for as long
 as the commit is still being applied. Meanwhile no copy confirms anything, and
@@ -819,7 +862,9 @@ the learner, so the value can still read 1 across a commit until the first
 group appears and the next pass reads the pair. Read it beside a group's
 state, never alone. `mroute_confirm_errors`
 counts failures to register the observer or to allocate a group's watch, each
-of which keeps groups in software. A group
+of which keeps groups in software. `mroute_port_probe_errors` counts the port
+walks that gave up, too large a ruleset or no memory, which leave a group
+`refused-ports` like an answer of 1 would. A group
 routed through a bridge names the bridge as `in`: the port its stream arrives
 on is the bridged group's to know, and that row — `mcast … routed=eth3/287` —
 names it, with its own copies beside the routed ones. `mroute_policy_rules`

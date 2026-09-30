@@ -47,6 +47,9 @@ from test_mcast_e2e import dut_mac, wan_source_address
 from test_mroute_capacity import _capture, _finish, _python
 
 COUNT, PPS, PORT = 256, 320, 47420
+# A second stream of the same (S,G), for a case that needs two told apart by
+# port. Counted at the CPU with the first.
+OTHER_PORT = PORT + 1
 MEMBER_SOURCE = Path(__file__).with_name("multicast_member.py").read_text()
 # The capture's own payload and group MAC, so a LAN-side sender cannot drift
 # from the oracle that decodes what it sent.
@@ -115,10 +118,20 @@ def summary(state: dict) -> dict:
     return {**{k: state[k] for k in keys}, "mcast": state["mcast"], "mroute": state["mroute"]}
 
 
-def stream(family: int, group: str, *, hops: int, source: str | None = None) -> dict:
-    """One numbered stream, in the shape mroute_capture.py decodes."""
+def stream(family: int, group: str, *, hops: int, source: str | None = None,
+           port: int = PORT) -> dict:
+    """One numbered stream, in the shape mroute_capture.py decodes. `port` is
+    both UDP ports of its frames."""
     return {"family": family, "source": source or wan_source_address(family), "group": group,
-            "port": PORT, "count": COUNT, "token": uuid.uuid4().hex, "hops": hops}
+            "port": port, "count": COUNT, "token": uuid.uuid4().hex, "hops": hops}
+
+
+def stream_key(config: dict) -> str:
+    """Where a window files a stream's deliveries: its group and source, and
+    its port where that is not the usual one, so two ports of one (S,G) sent
+    in one window are counted apart."""
+    key = config["group"] + "/" + config["source"]
+    return key if config["port"] == PORT else f"{key}/{config['port']}"
 
 
 def frames(config: dict) -> list:
@@ -210,7 +223,7 @@ class MulticastRig:
             counted = await cpu_frames(self.target, self.session, ingress) - counted
         received = {}
         for config, capture in captures:
-            received.setdefault(config["group"] + "/" + config["source"], {}).update(await _finish(capture))
+            received.setdefault(stream_key(config), {}).update(await _finish(capture))
         after = await self.proc() if adapter else None  # also folds the routed counters
         result = {"streams": streams, "received": received, "stream_cpu": counted,
                   "cpu": cpu, "idle": idle,
@@ -223,11 +236,14 @@ class MulticastRig:
         (ARTIFACTS / f"{name}.json").write_text(json.dumps(data, indent=2, default=str) + "\n")
 
 
-def streamed(window: dict, group: str, source: str | None = None) -> dict:
-    """The config a window sent for `group` (and `source`, where it had two)."""
+def streamed(window: dict, group: str, source: str | None = None,
+             port: int | None = None) -> dict:
+    """The config a window sent for `group` (and `source`, and `port`, where
+    it had two)."""
     configs = [c for c in window["streams"] if same(c["group"], group) and
-               (source is None or same(c["source"], source))]
-    assert len(configs) == 1, (group, source, window["streams"])
+               (source is None or same(c["source"], source)) and
+               (port is None or c["port"] == port)]
+    assert len(configs) == 1, (group, source, port, window["streams"])
     return configs[0]
 
 
@@ -241,7 +257,7 @@ def moved(window: dict, row) -> int:
 
 def seen(window: dict, config: dict, iface: str) -> list[int]:
     """The sequences one stream delivered at one interface; exact or it fails."""
-    result = window["received"][config["group"] + "/" + config["source"]][iface]
+    result = window["received"][stream_key(config)][iface]
     assert result["duplicates"] == 0 and not result["errors"], (iface, result)
     return result["seen"]
 
@@ -519,7 +535,7 @@ async def multicast_rig(target_agent, aiohttp_session, lan, splat_window):
     r.wire = wire_interface()
     r.dut_lan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_LAN_IF)
     r.dut_wan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_WAN_IF)
-    async with stream_cpu_counters(target_agent, aiohttp_session, (PORT,)):
+    async with stream_cpu_counters(target_agent, aiohttp_session, (PORT, OTHER_PORT)):
         try:
             yield r
         finally:

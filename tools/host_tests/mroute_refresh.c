@@ -195,6 +195,18 @@ static bool ft_mr_ready;
 /* The `multicast` parameter both learners answer to, on at load. */
 static bool ft_mc_enabled = true;
 static unsigned long ft_mr_resync_pending;
+/* The ruleset's answer for a confirmed group, as nft_port_dependent() gives
+ * it: whether its packets could fare apart from the copies that confirmed
+ * it -- 0 alike, 1 not, negative not judged. It asks under RTNL, of the
+ * parent and oifs the plan names. */
+static int ports_answer;
+static unsigned ports_asks;
+static int ft_mr_ports_matter(const struct ft_mr_group *g, const struct ft_mr_plan *plan)
+{
+    assert(rtnl && plan->oifs_known && plan->oif_count);
+    ports_asks++;
+    return ports_answer;
+}
 static unsigned ft_mr_idx(u8 family) { return family == AF_INET6; }
 static bool test_bit(unsigned n, const unsigned long *p) { return (*p >> n) & 1; }
 static struct work_struct ft_mr_work, ft_mr_stats;
@@ -1569,6 +1581,58 @@ int main(void)
         ft_mr_recheck = true;
         run();
         assert(adds == x0 + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+    }
+
+    /* A ruleset that may treat the group's other packets apart from the
+     * copies that confirmed it -- another UDP port, a rate limit -- takes a
+     * carried group out of hardware as refused-ports, confirmations and all
+     * standing; an answer of 0 carries it again. A walk that gave up keeps
+     * it out as well, and counts; one a commit interrupted is no answer,
+     * and the group waits for the re-arm, with the worker woken for it. */
+    {
+        unsigned x0 = adds, del0 = deletes, asks = ports_asks;
+        u64 errors = ft_mr_port_probe_errors;
+
+        ports_answer = 1;
+        ft_mr_recheck = true;
+        run();
+        assert(ports_asks == asks + 1 && deletes == del0 + 1 && !hardware.live);
+        assert(!g->offloaded && g->state == FT_MR_REFUSED_PORTS);
+        assert(ft_mr_refusal(g->state));
+        assert(!strcmp(ft_mr_state_text(g->state), "refused-ports"));
+        assert(ft_mr_port_probe_errors == errors && g->watch->seen == 1);
+        ports_answer = -E2BIG;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->state == FT_MR_REFUSED_PORTS);
+        assert(ft_mr_port_probe_errors == errors + 1);
+        /* Not asked again at once, which would spin the worker for as long
+         * as a commit takes to land, but when the ruleset poll comes back
+         * a short while on. */
+        ports_answer = -EAGAIN;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->state == FT_MR_UNCONFIRMED);
+        assert(!ft_mr_work.queued && !ft_mr_recheck && ft_mr_probe_again);
+        assert(ft_mr_ruleset.queued && ruleset_delay == FT_MR_RULESET_APPLYING);
+        assert(ft_mr_port_probe_errors == errors + 1);
+        ports_answer = 0;
+        poll_ruleset();
+        assert(!ft_mr_probe_again && ft_mr_work.queued && ft_mr_recheck);
+        run();
+        assert(adds == x0 + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+        assert(!ft_mr_probe_again);
+        /* Not asked of a group that is not confirmed: the walk is the
+         * costliest test and the last. */
+        asks = ports_asks;
+        planned_oifs = 2;
+        g->dirty = true;
+        run();
+        assert(ports_asks == asks && g->state == FT_MR_UNCONFIRMED && !hardware.live);
+        planned_oifs = 1;
+        g->dirty = true;
+        run();
+        assert(ports_asks == asks + 1 && hardware.live && g->state == FT_MR_INSTALLED);
     }
 
     /* Deleting the route while a port it copies out of changes its egress:

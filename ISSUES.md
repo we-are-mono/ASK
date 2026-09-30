@@ -152,18 +152,8 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A289 — one accepted multicast packet authorizes other, forbidden UDP ports.**
-  The routed-multicast hardware root masks transport ports (`cdx/dpa_control_mc.c`, ports
-  zeroed in the match key), and the confirmation (`ft_mr_confirm_seen`, `cdx/ask_flowtable.c`)
-  records family/source/group/oif but no port and no predicate. So for a rule that accepts UDP
-  dport 5000 and drops 5001 on one `(S,G)`: port 5000 primes the confirmation and the hardware
-  entry, then 5001 shares its key and is replicated in hardware without passing the drop. Wider
-  than unicast, which is 5-tuple keyed. Needs an atypical per-L4-port multicast policy to bite;
-  the code documents the class ("a confirmation proves the ruleset forwards the stream there,
-  not what it does to each packet") but does not enforce it. Fix: key a multicast group on its
-  stream's ports too, or keep a port-discriminating `(S,G)` in software. Regression: preinstall
-  accept-one-port/drop-another for one `(S,G)`, warm only the allowed port, interleave unique
-  payloads on both, require zero forbidden delivery; IPv4/IPv6, VLAN/bridge oifs.
+- [x] **A289 — one accepted multicast packet authorized other, forbidden UDP ports.** Fixed: a
+  confirmed routed group is carried only if `nft_port_dependent()` (patch 148) finds every packet treated alike, else `refused-ports` (_:/^cdx: keep a routed multicast group the ruleset tells apart by port_).
 
 - [x] **A290 — routed multicast did not follow XFRM policy.** Fixed: an IPv4 group whose copy an
   output policy governs is `refused-xfrm`, re-asked on every policy change; ip6mr and bridges apply none (_:/^cdx: keep a routed multicast group an XFRM policy governs_).
@@ -186,6 +176,18 @@ result independently of those temporary files.
   such a bridge and the bridged learner would discard frames ipmr routes. Fix at rebase: a
   `BR_MCAST_TO_HOST_*` reason for `IFF_ALLMULTI` in patch 161. Regression: a VIF on the bridge,
   last bridged listener gone, require the routed copy still delivered.
+
+- [ ] **A294 — a port-selective iptables-legacy rule or tc filter is bypassed by a routed
+  multicast group.** A289's port walk (`nft_port_dependent()`, patch 148) reads nftables only
+  (iptables-nft included). An iptables-legacy `-p udp --dport 5001 -j DROP`, or a tc ingress
+  filter dropping one port, is still passed by the copies of another port that confirm the
+  `(S,G)`, and the one L3-keyed entry then replicates the dropped port too. A unicast flow is
+  5-tuple keyed, so there it costs nothing. The meta-ask image registers iptables-legacy nat
+  (`test_profile_homelab.py`). Fix: refuse routed groups while an x_tables table hooks
+  PRE/FORWARD/POST (`ipt_do_table`/`ip6t_do_table` in the hook entries -- without making cdx
+  depend on ip_tables), and while a tc ingress or egress block sits on a device in the parent's
+  or an oif's stack. Regression: legacy FORWARD drop of one port, two-port window as in
+  `test_flowtable_service_multicast_ports.py`, require zero delivery of the dropped port.
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**

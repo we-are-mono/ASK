@@ -8354,6 +8354,9 @@ enum ft_mr_state {
 	/* A copy leaves through a bridge whose own output hooks would see it;
 	 * see ft_mr_admit(). */
 	FT_MR_REFUSED_FILTER,
+	/* The ruleset may judge the group's packets apart from the copies that
+	 * confirmed it -- by their ports, first of all; see ft_mr_ports_matter(). */
+	FT_MR_REFUSED_PORTS,
 	FT_MR_REFUSED_CONTESTED,
 	FT_MR_REFUSED_FAILED,
 	FT_MR_REFUSED_RESYNC,
@@ -8381,6 +8384,7 @@ static const char *ft_mr_state_text(enum ft_mr_state state)
 	case FT_MR_REFUSED_MTU:		return "refused-mtu";
 	case FT_MR_REFUSED_XFRM:	return "refused-xfrm";
 	case FT_MR_REFUSED_FILTER:	return "refused-filter";
+	case FT_MR_REFUSED_PORTS:	return "refused-ports";
 	case FT_MR_REFUSED_CONTESTED:	return "refused-contested";
 	case FT_MR_REFUSED_FAILED:	return "refused-failed";
 	case FT_MR_REFUSED_RESYNC:	return "refused-resync";
@@ -9325,12 +9329,21 @@ static bool ft_mr_plan_same(const struct ft_mr_group *g,
  * unconfirmed one Linux still forwards to. A group waits in software,
  * pending-confirm, until every MFC oif has been seen.
  *
- * A confirmation proves that the ruleset forwards the stream there, not what
- * it does to each packet: a rate limit, a quota, a counter or a match that
- * differs from packet to packet stops applying once the group is carried, as
- * it does for a flowtable flow. Nor does it see past the observer: an
- * nftables chain that runs after it at POST_ROUTING keeps the group in
- * software, and a chain at a device's egress is not seen at all.
+ * A confirmation proves that the ruleset forwards the copies seen there, not
+ * what it does to every other packet of the group. The key the classifier
+ * matches stops at L3, so a stream on another UDP port rides the same entry,
+ * and one a rule drops -- or sends elsewhere, rate-limits, meters -- would be
+ * replicated regardless. That the ruleset treats every packet of the group
+ * alike is judged from the ruleset itself: nft_port_dependent() walks each
+ * nftables chain a copy crosses, netdev ingress and egress on the devices
+ * below the VIFs included, with everything about the stream known but its
+ * ports, and a group whose packets could fare differently stays in software,
+ * refused-ports. Nor does a confirmation see past the observer: an nftables
+ * chain that runs after it at POST_ROUTING keeps the group in software too.
+ * What neither reads -- a tc filter, an iptables-legacy rule -- stops applying
+ * once the group is carried, as it does for a flowtable flow; and a
+ * port-selective one more widely than it does there, since a flow's key names
+ * its ports and the group's does not (A294).
  *
  * A ruleset change takes every confirmation back. An nftables commit --
  * iptables-nft included -- moves init_net's base_seq and then the cursor the
@@ -9381,6 +9394,12 @@ static bool ft_mr_gen_open, ft_mr_gen_armed;
 /* Commits that took confirmations back; failures to register the observer
  * or to allocate a watch, each of which keeps groups in software. */
 static u64 ft_mr_ruleset_changes, ft_mr_confirm_errors;
+/* Rulesets nft_port_dependent() could not judge for a group -- too large for
+ * its bounds, or no memory -- each of which kept the group in software. */
+static u64 ft_mr_port_probe_errors;
+/* A port walk a commit interrupted, whose group the ruleset poll has the
+ * worker ask again. Set by the worker, taken by the poll. */
+static bool ft_mr_probe_again;
 /* How soon a rule added under a carried group takes effect: the ruleset is
  * looked at this often while any group exists. Two loads. */
 #define FT_MR_RULESET_INTERVAL	HZ
@@ -9767,6 +9786,43 @@ static bool ft_mr_observer_followed(u8 family)
 	return followed;
 }
 
+/* Whether the ruleset could treat two packets of a group differently, where
+ * the copies that confirmed it tell nothing of the rest: 0 when it treats
+ * them all alike, 1 when it may not, or negative when it could not be judged
+ * (see nft_port_dependent()). The stream is what the contract has made it:
+ * UDP to a group address -- ipmr and ip6mr forward nothing else in hardware
+ * -- arriving by the parent VIF and sent out of every oif, none of them a
+ * tunnel or a register VIF. Called under RTNL, which keeps every VIF device
+ * registered. */
+static int ft_mr_ports_matter(const struct ft_mr_group *g,
+			      const struct ft_mr_plan *plan)
+{
+	const struct net_device *out[MAXVIFS];
+	struct nft_port_probe probe = {
+		.family = g->family == AF_INET6 ? NFPROTO_IPV6 : NFPROTO_IPV4,
+		.saddr = g->src,
+		.daddr = g->dst,
+		.out = out,
+	};
+	int rc = 1;
+	u8 i;
+
+	ASSERT_RTNL();
+	rcu_read_lock();
+	probe.in = dev_get_by_index_rcu(&init_net, plan->parent);
+	for (i = 0; i < plan->oif_count; i++) {
+		out[i] = dev_get_by_index_rcu(&init_net, plan->oif[i]);
+		if (!out[i])
+			goto unlock;
+	}
+	probe.nout = plan->oif_count;
+	if (probe.in)
+		rc = nft_port_dependent(&init_net, &probe);
+unlock:
+	rcu_read_unlock();
+	return rc;
+}
+
 /* Whether a group the contract accepts may be carried now. Called by the
  * worker under RTNL, after an accepting derivation has armed its watch.
  *
@@ -9774,10 +9830,14 @@ static bool ft_mr_observer_followed(u8 family)
  * into a bridge then passes the bridge's own LOCAL_OUT and POST_ROUTING hooks
  * after it was confirmed, so any hook there keeps the group in software, as a
  * bridge hook keeps a bridged flow; and so does a chain that runs after the
- * observer at POST_ROUTING itself. */
+ * observer at POST_ROUTING itself. And a confirmed group is carried only if
+ * the ruleset would treat every other packet of it as it did the copies that
+ * confirmed it; see what Linux itself forwarded. */
 static enum ft_mr_state ft_mr_admit(struct ft_mr_group *g,
 				    const struct ft_mr_plan *plan)
 {
+	int rc;
+
 	if (plan->out_bridged &&
 	    ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)))
 		return FT_MR_REFUSED_FILTER;
@@ -9792,6 +9852,22 @@ static enum ft_mr_state ft_mr_admit(struct ft_mr_group *g,
 	if (!g->watch || !READ_ONCE(ft_mr_gen_open) ||
 	    !ft_mr_watch_complete(g->watch))
 		return FT_MR_UNCONFIRMED;
+	/* Last, as the costliest test and one only a confirmed group needs.
+	 * Its answer is for the ruleset the confirmations were made under: a
+	 * commit before or during the walk is one they are not good for
+	 * either. One that has not moved the pair yet -- still being prepared,
+	 * or about to publish -- leaves the next pass nothing to ask, so every
+	 * group is asked again once it has had time to land; see
+	 * ft_mr_probe_again. */
+	rc = ft_mr_ports_matter(g, plan);
+	if (rc == -EAGAIN) {
+		WRITE_ONCE(ft_mr_probe_again, true);
+		return FT_MR_UNCONFIRMED;
+	}
+	if (rc < 0)
+		ft_mr_port_probe_errors++;
+	if (rc)
+		return FT_MR_REFUSED_PORTS;
 	return FT_MR_PENDING;
 }
 
@@ -9803,6 +9879,8 @@ static void ft_mr_ruleset_fn(struct work_struct *work)
 {
 	if (READ_ONCE(ft_mr_stopping))
 		return;
+	if (xchg(&ft_mr_probe_again, false))
+		ft_mr_kick();
 	if (!ft_mr_ruleset_current() || !READ_ONCE(ft_mr_gen_open))
 		schedule_work(&ft_mr_work);
 	if (READ_ONCE(ft_mr_count))
@@ -11078,6 +11156,12 @@ again:
 		else
 			mod_delayed_work(system_wq, &ft_mr_ruleset,
 					 ft_mr_ruleset_wait());
+		/* A port walk a commit interrupted is asked again a short while
+		 * on, not at once: a commit being prepared can take a while to
+		 * land, and asking in a loop meanwhile would spin the worker. */
+		if (READ_ONCE(ft_mr_probe_again))
+			mod_delayed_work(system_wq, &ft_mr_ruleset,
+					 FT_MR_RULESET_APPLYING);
 	}
 	if ((ft_mr_count || READ_ONCE(ft_mr_resync_pending)) &&
 	    !READ_ONCE(ft_mr_stopping))
@@ -14147,6 +14231,9 @@ static int ft_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "mroute_ruleset_changes %llu\nmroute_ruleset_settled %d\nmroute_confirm_errors %llu\n",
 		   READ_ONCE(ft_mr_ruleset_changes), READ_ONCE(ft_mr_gen_open),
 		   READ_ONCE(ft_mr_confirm_errors));
+	/* How often a confirmed group's ruleset was too much for the port
+	 * probe to judge, which reads refused-ports all the same. */
+	seq_printf(seq, "mroute_port_probe_errors %llu\n", READ_ONCE(ft_mr_port_probe_errors));
 	/* How many AP-mode devices this module currently has registered, and
 	 * how many it looked at and did not. The second is what separates "no
 	 * Wi-Fi offload because nothing asked" from "no Wi-Fi offload because

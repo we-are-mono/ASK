@@ -572,8 +572,9 @@ def test_proc_reports_a_row_and_a_summary():
     assert "ft_mr_rows(seq);" in show
     for key in ("mroute_groups", "mroute_installed", "mroute_refused",
                 "mroute_install_errors", "mroute_policy_rules",
-                "mroute_ruleset_changes", "mroute_ruleset_settled",
-                "mroute_confirm_errors"):
+                "mroute_xfrm_changes", "mroute_ruleset_changes",
+                "mroute_ruleset_settled", "mroute_confirm_errors",
+                "mroute_port_probe_errors"):
         assert key in show, f"{key} missing from the summary"
     rows = function(source, "ft_mr_rows")
     for field in ("family=", "table=", "group=", "src=", "in=", "oifs=",

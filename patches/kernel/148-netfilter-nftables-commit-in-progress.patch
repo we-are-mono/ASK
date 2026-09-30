@@ -1,4 +1,4 @@
-From cc3cf03c231bcd12bab7690ff5dd5530264c201c Mon Sep 17 00:00:00 2001
+From be6f613bc4674c2519102d2ceac318eadb0b3037 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 24 Sep 2026 01:55:38 +0200
 Subject: [PATCH] netfilter: nf_tables: say when a commit is still being
@@ -20,18 +20,83 @@ clear sees that commit fully applied. The field sits in the padding
 after gencursor, so struct net does not grow, and the reader is an
 inline load with no dependency on the nf_tables module.
 
+An offload that keys streams on their addresses alone -- routed
+multicast, carried under source and group -- also needs to know whether
+the ruleset could tell two such streams apart by their ports: once one
+is seen forwarded, the others ride the same entry. Add
+nft_port_dependent(), which judges that from the ruleset without a
+packet, bracketed by base_seq and the applying mark. It walks netdev
+ingress up the input device's stack, prerouting (NAT chains included),
+forward, postrouting and netdev egress down each output's stack, in hook
+order, reading each chain's rule blob for the current generation as
+nft_do_chain() does, with everything about the stream known but its
+ports. An expression that reads the ports, a limit or quota, a lookup in
+a set that changes without a commit, all split the walk. The answer is 0
+only when every path accepts at every hook, for every output, with the
+same effects, a conntrack helper among them, and no translation -- an
+address-keyed offload applies none, and one of the ports alone leaves
+the addresses as they were; a path that drops, anything the walk does
+not model, a bridge family chain on a bridged path, and a device in
+either stack that is not Ethernet, or is but has no parent or lower
+device -- whose underlay the walk cannot follow -- make it 1. The
+stream's first packet is followed, then later ones without the NAT
+chains and with the conntrack mark the earlier one left. It lives in
+nf_tables because the per-net table list, where NAT chains are found, is
+private to it.
+
+For it to read them, the private data of cmp, range, bitwise, byteorder,
+lookup and objref maps moves to nf_tables_core.h, that of nat, masq and
+redir to a new nft_nat.h, and the ct expression records whether it
+stores into the conntrack, which its ops do not tell apart. A set a
+dynset binds to is marked as updated from the packet path, which its
+flags need not say.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/net/netfilter/nf_tables.h | 19 +++++++++++++++++++
- include/net/netns/nftables.h      |  2 ++
- net/netfilter/nf_tables_api.c     | 10 ++++++++++
- 3 files changed, 31 insertions(+)
+ include/net/netfilter/nf_tables.h      |   72 +
+ include/net/netfilter/nf_tables_core.h |   56 +
+ include/net/netfilter/nft_nat.h        |   34 +
+ include/net/netns/nftables.h           |    2 +
+ net/netfilter/Makefile                 |    2 +-
+ net/netfilter/nf_tables_api.c          |   10 +
+ net/netfilter/nf_tables_port_probe.c   | 2346 ++++++++++++++++++++++++
+ net/netfilter/nft_bitwise.c            |   10 -
+ net/netfilter/nft_byteorder.c          |    8 -
+ net/netfilter/nft_cmp.c                |    7 -
+ net/netfilter/nft_ct.c                 |    2 +
+ net/netfilter/nft_dynset.c             |    5 +
+ net/netfilter/nft_lookup.c             |    9 -
+ net/netfilter/nft_masq.c               |    7 +-
+ net/netfilter/nft_nat.c                |   11 +-
+ net/netfilter/nft_objref.c             |    6 -
+ net/netfilter/nft_range.c              |    8 -
+ net/netfilter/nft_redir.c              |    7 +-
+ 18 files changed, 2531 insertions(+), 71 deletions(-)
+ create mode 100644 include/net/netfilter/nft_nat.h
+ create mode 100644 net/netfilter/nf_tables_port_probe.c
 
 diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
-index f4b59915a49c..f8301f226852 100644
+index f4b59915a49c..a064721a36d3 100644
 --- a/include/net/netfilter/nf_tables.h
 +++ b/include/net/netfilter/nf_tables.h
-@@ -1937,4 +1937,23 @@ static inline u64 nft_net_tstamp(const struct net *net)
+@@ -563,6 +563,8 @@ struct nft_set_elem_expr {
+  * 	@klen: key length
+  * 	@dlen: data length
+  *	@num_exprs: numbers of exprs
++ *	@packet_updated: a dynset expression was bound to it, so the packet
++ *		path may add and delete elements whatever @flags say; never cleared
+  *	@exprs: stateful expression
+  *	@catchall_list: list of catch-all set element
+  * 	@data: private set data
+@@ -598,6 +600,7 @@ struct nft_set {
+ 	u8				klen;
+ 	u8				dlen;
+ 	u8				num_exprs;
++	bool				packet_updated;
+ 	struct nft_expr			*exprs[NFT_SET_EXPR_MAX];
+ 	struct list_head		catchall_list;
+ 	unsigned char			data[]
+@@ -1937,4 +1940,73 @@ static inline u64 nft_net_tstamp(const struct net *net)
  	return nft_pernet(net)->tstamp;
  }
  
@@ -54,7 +119,171 @@ index f4b59915a49c..f8301f226852 100644
 +	return smp_load_acquire(&net->nft.commit_applying);
 +}
 +
++/**
++ * struct nft_port_probe - a forwarded UDP stream, as far as it is known
++ * @family: NFPROTO_IPV4 or NFPROTO_IPV6
++ * @saddr: the stream's source address
++ * @daddr: the stream's destination address
++ * @in: the device the stream arrives on
++ * @out: the devices copies of it leave through
++ * @nout: how many entries @out has
++ *
++ * Everything about the stream but its transport ports: an offload that keys
++ * on the addresses alone asks whether the ruleset could tell two of its
++ * streams apart by port.
++ *
++ * What the caller vouches for, and nft_port_dependent() takes as given: the
++ * stream is UDP; its destination is a group address, so on an Ethernet input
++ * its packets are PACKET_MULTICAST; they reach nf_tables with no mark, as
++ * nothing outside it (tc, x_tables) marks, filters or mangles them; and every
++ * device in @in and @out is one the packet is received or sent on, not a
++ * register (pimreg) VIF that hands it to userspace.
++ *
++ * Frames are followed through Ethernet devices and the devices linked below
++ * them: VLANs, bridges and their ports, bonds. A stream whose input or
++ * outputs, or a device below them, is anything else -- PPP, an IP tunnel,
++ * WireGuard, or an Ethernet device with neither a parent device nor a lower
++ * one, as VXLAN, geneve, gretap and veth are -- is judged dependent: the
++ * underlay those carry it over has no link to them, so its hooks, and the
++ * outer packet's output and postrouting chains, are not walked.
++ */
++struct nft_port_probe {
++	u8				family;
++	union nf_inet_addr		saddr;
++	union nf_inet_addr		daddr;
++	const struct net_device		*in;
++	const struct net_device * const	*out;
++	unsigned int			nout;
++};
++
++#if IS_ENABLED(CONFIG_NF_TABLES)
++int nft_port_dependent(struct net *net, const struct nft_port_probe *probe);
++#else
++/* Without nf_tables whatever filters the stream cannot be read: the answer is
++ * the one that keeps a stream the kernel judges per packet.
++ */
++static inline int nft_port_dependent(struct net *net,
++				     const struct nft_port_probe *probe)
++{
++	return 1;
++}
++#endif
++
  #endif /* _NET_NF_TABLES_H */
+diff --git a/include/net/netfilter/nf_tables_core.h b/include/net/netfilter/nf_tables_core.h
+index 04699eac5b52..3ff5af4cc605 100644
+--- a/include/net/netfilter/nf_tables_core.h
++++ b/include/net/netfilter/nf_tables_core.h
+@@ -69,6 +69,10 @@ struct nft_ct {
+ 		u8		dreg;
+ 		u8		sreg;
+ 	};
++	/* "ct ... set": sreg is written into the conntrack. Otherwise the
++	 * expression loads the key into dreg.
++	 */
++	bool			store;
+ };
+ 
+ struct nft_payload {
+@@ -78,6 +82,58 @@ struct nft_payload {
+ 	u8			dreg;
+ };
+ 
++/* The private data of the expressions below is read outside the file that
++ * evaluates them by nft_port_dependent(), which judges a ruleset without a
++ * packet.
++ */
++struct nft_cmp_expr {
++	struct nft_data		data;
++	u8			sreg;
++	u8			len;
++	enum nft_cmp_ops	op:8;
++};
++
++struct nft_range_expr {
++	struct nft_data		data_from;
++	struct nft_data		data_to;
++	u8			sreg;
++	u8			len;
++	enum nft_range_ops	op:8;
++};
++
++struct nft_bitwise {
++	u8			sreg;
++	u8			dreg;
++	enum nft_bitwise_ops	op:8;
++	u8			len;
++	struct nft_data		mask;
++	struct nft_data		xor;
++	struct nft_data		data;
++};
++
++struct nft_byteorder {
++	u8			sreg;
++	u8			dreg;
++	enum nft_byteorder_ops	op:8;
++	u8			len;
++	u8			size;
++};
++
++struct nft_lookup {
++	struct nft_set			*set;
++	u8				sreg;
++	u8				dreg;
++	bool				dreg_set;
++	bool				invert;
++	struct nft_set_binding		binding;
++};
++
++struct nft_objref_map {
++	struct nft_set		*set;
++	u8			sreg;
++	struct nft_set_binding	binding;
++};
++
+ extern const struct nft_expr_ops nft_payload_fast_ops;
+ 
+ extern const struct nft_expr_ops nft_bitwise_fast_ops;
+diff --git a/include/net/netfilter/nft_nat.h b/include/net/netfilter/nft_nat.h
+new file mode 100644
+index 000000000000..faf9a762bd5c
+--- /dev/null
++++ b/include/net/netfilter/nft_nat.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _NFT_NAT_H_
++#define _NFT_NAT_H_
++
++#include <net/netfilter/nf_nat.h>
++
++/* The private data of the nat, masq and redir expressions. Read outside the
++ * files that evaluate them by nft_port_dependent(), which checks the
++ * registers a translation takes its range from. A register of zero is not
++ * used.
++ */
++struct nft_nat {
++	u8			sreg_addr_min;
++	u8			sreg_addr_max;
++	u8			sreg_proto_min;
++	u8			sreg_proto_max;
++	enum nf_nat_manip_type  type:8;
++	u8			family;
++	u16			flags;
++};
++
++struct nft_masq {
++	u32			flags;
++	u8			sreg_proto_min;
++	u8			sreg_proto_max;
++};
++
++struct nft_redir {
++	u8			sreg_proto_min;
++	u8			sreg_proto_max;
++	u16			flags;
++};
++
++#endif
 diff --git a/include/net/netns/nftables.h b/include/net/netns/nftables.h
 index 99dd166c5d07..9fb5adf835f0 100644
 --- a/include/net/netns/nftables.h
@@ -68,6 +297,19 @@ index 99dd166c5d07..9fb5adf835f0 100644
  };
  
  #endif
+diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
+index f0aa4d7ef499..0ebadc026948 100644
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@ -92,7 +92,7 @@ nf_tables-objs := nf_tables_core.o nf_tables_api.o nft_chain_filter.o \
+ 		  nft_counter.o nft_objref.o nft_inner.o \
+ 		  nft_chain_route.o nf_tables_offload.o \
+ 		  nft_set_hash.o nft_set_bitmap.o nft_set_rbtree.o \
+-		  nft_set_pipapo.o
++		  nft_set_pipapo.o nf_tables_port_probe.o
+ 
+ ifdef CONFIG_X86_64
+ ifndef CONFIG_UML
 diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
 index 03dd9d1db12f..5c30a237a3a5 100644
 --- a/net/netfilter/nf_tables_api.c
@@ -96,6 +338,2568 @@ index 03dd9d1db12f..5c30a237a3a5 100644
  	nft_commit_notify(net, NETLINK_CB(skb).portid);
  	nf_tables_gen_notify(net, skb, NFT_MSG_NEWGEN);
  	nf_tables_commit_audit_log(&adl, nft_base_seq(net));
+diff --git a/net/netfilter/nf_tables_port_probe.c b/net/netfilter/nf_tables_port_probe.c
+new file mode 100644
+index 000000000000..8859fd5f812c
+--- /dev/null
++++ b/net/netfilter/nf_tables_port_probe.c
+@@ -0,0 +1,2346 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Whether nf_tables could tell two UDP streams apart by their ports.
++ *
++ * An offload that forwards streams under a key without their transport ports
++ * -- routed multicast keyed on source and group is one -- carries every stream
++ * of that key once one of them has been seen forwarded. That is only right
++ * when the ruleset forwards all of them alike. nft_port_dependent() decides it
++ * from the ruleset alone, with no packet: it evaluates the chains such a
++ * stream crosses with everything about the stream known except its ports, and
++ * reports whether two of them could fare differently.
++ *
++ * The evaluation is symbolic. Registers hold bits that are either known or not.
++ * Loads of what the stream fixes -- its addresses and protocol, the devices,
++ * the packet type, the conntrack state, the marks -- are known; loads of the
++ * transport header and of anything else that varies between packets are not.
++ * A match on known bits decides. A match that reads unknown ones splits the
++ * walk into the packets it matches and those it does not, and both are
++ * followed; so do statements that may or may not let a packet through, such
++ * as limits and quotas.
++ *
++ * The answer is 0 only when every path, for every output, accepts at every
++ * hook, from the input device's stack to the output devices', and all of them
++ * end with the same effects: marks, NAT, other packet and conntrack
++ * attributes. A path that drops is enough for 1, even when every path drops:
++ * the offload carries a stream once Linux was seen forwarding it, so a model
++ * that drops where Linux accepts would put every port of it in hardware.
++ *
++ * Paths meet again at every rule. The distinct states that reach a rule are
++ * kept as a small set, so a chain of N rules that each split costs N
++ * evaluations per distinct state, not 2^N; a path that splits and ends up
++ * doing the same thing either way costs nothing extra.
++ *
++ * What cannot be modelled counts as dependent: an expression type this file
++ * does not know (it could read the ports and set any verdict), a queue verdict
++ * (userspace decides per packet), payload mangling, bridge family chains on a
++ * bridged path. Sets that change without a commit -- elements that time out,
++ * sets the packet path updates -- are read as if their key were unknown. The
++ * work is bounded; past a bound, or when a commit ran under the walk, the
++ * answer is an error, which callers treat as dependent as well.
++ *
++ * Only nf_tables is read: x_tables rules and tc are the caller's to rule out.
++ * And only Ethernet device stacks are followed: a stream carried over PPP, a
++ * tunnel or WireGuard crosses hooks on an underlay the walk cannot see.
++ */
++
++#include <linux/kernel.h>
++#include <linux/if_arp.h>
++#include <linux/if_ether.h>
++#include <linux/if_packet.h>
++#include <linux/if_vlan.h>
++#include <linux/in.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/netdevice.h>
++#include <linux/rculist.h>
++#include <linux/siphash.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv4.h>
++#include <linux/netfilter_ipv6.h>
++#include <linux/netfilter/nf_tables.h>
++#include <linux/netfilter/nf_conntrack_common.h>
++#include <net/dsa.h>
++#include <net/ipv6.h>
++#include <net/netfilter/nf_tables.h>
++#include <net/netfilter/nf_tables_core.h>
++#include <net/netfilter/nft_meta.h>
++#include <net/netfilter/nft_nat.h>
++
++/* Rule evaluations and set elements looked at by one probe. */
++#define NFT_PROBE_MAX_VISITS	4096
++/* Distinct states that may reach one rule of one chain invocation. */
++#define NFT_PROBE_MAX_STATES	4
++/* Verdicts one lookup with an unknown key may yield, across nested rules. */
++#define NFT_PROBE_MAX_VERDICTS	32
++/* Base chains nf_tables may have at one hook. */
++#define NFT_PROBE_MAX_BASE	32
++/* Devices copies of a stream may leave through: the size of a VIF table. */
++#define NFT_PROBE_MAX_OUT	32
++/* Devices stacked below one input or output device. */
++#define NFT_PROBE_MAX_LOWER	16
++/* Packets of one stream followed: the first, then later ones until the
++ * conntrack mark settles.
++ */
++#define NFT_PROBE_MAX_PASSES	4
++/* The base chain and every chain it may jump or go to. */
++#define NFT_PROBE_FRAMES	(NFT_JUMP_STACK_SIZE + 1)
++
++#define NFT_PROBE_REG_BYTES	(NFT_REG32_NUM * NFT_REG32_SIZE)
++
++/* What evaluating one expression did. Any of them may come with
++ * ctx->xbreak: the rule may break there as well.
++ */
++enum nft_probe_res {
++	NFT_PROBE_MATCH,	/* it passes: on to the next expression */
++	NFT_PROBE_NOMATCH,	/* it breaks the rule */
++	NFT_PROBE_EITHER,	/* it may pass or break, depending on unknowns */
++	NFT_PROBE_VERDICT,	/* it set the verdict */
++	NFT_PROBE_VERDICTS,	/* several verdicts, on the verdict stack */
++	NFT_PROBE_ACCEPTED,	/* it accepted the packet, ending the chain */
++	NFT_PROBE_STOP,		/* the probe has its answer: ctx->stop */
++};
++
++/* Whether a chain sees the conntrack entry of the stream. */
++enum nft_probe_ct {
++	NFT_PROBE_CT_ABSENT,	/* not attached yet: ingress, raw prerouting */
++	NFT_PROBE_CT_PRESENT,
++	NFT_PROBE_CT_UNKNOWN,
++};
++
++enum nft_probe_hook {
++	NFT_PROBE_INGRESS,
++	NFT_PROBE_PRE,
++	NFT_PROBE_FORWARD,
++	NFT_PROBE_POST,
++	NFT_PROBE_EGRESS,
++};
++
++/* Effects a path takes that it carries no value of, folded into its
++ * signature in the order taken.
++ */
++enum nft_probe_effect {
++	NFT_PROBE_FX_NAT = 1,
++	NFT_PROBE_FX_META,
++	NFT_PROBE_FX_CT,
++	NFT_PROBE_FX_OBJ,
++	NFT_PROBE_FX_DYNSET,
++};
++
++/* State flags: what the path wrote, and the addresses NAT translated. A mark
++ * written with the value it had still counts as written.
++ */
++#define NFT_PROBE_MARKED	BIT(0)
++#define NFT_PROBE_CTMARKED	BIT(1)
++#define NFT_PROBE_DNAT		BIT(2)
++#define NFT_PROBE_SNAT		BIT(3)
++
++/* Everything a path carries from one rule to the next that can make two
++ * paths end differently.
++ */
++struct nft_probe_state {
++	u64	sig;		/* the other effects, see nft_probe_fold() */
++	u32	mark;		/* skb->mark */
++	u32	ctmark;		/* the conntrack mark */
++	u32	flags;		/* NFT_PROBE_* */
++};
++
++struct nft_probe_set {
++	unsigned int		n;
++	struct nft_probe_state	s[NFT_PROBE_MAX_STATES];
++};
++
++/* One chain invocation. The rule being walked works on @st and ends with @v
++ * here rather than on the stack: chains nest sixteen deep, and what the walk
++ * keeps per level is what bounds its stack.
++ */
++struct nft_probe_frame {
++	struct nft_probe_set	cur;	/* states reaching the rule being walked */
++	struct nft_probe_set	next;	/* states going on to the rule after it */
++	struct nft_probe_set	ret;	/* states returning to the caller */
++	struct nft_probe_state	st;
++	struct nft_verdict	v;
++};
++
++/* The registers of the rule being walked, as struct nft_regs lays them out.
++ * Each rule starts with none known: what an earlier rule left there is not
++ * what nf_tables rules read.
++ */
++struct nft_probe_regs {
++	u32	data[NFT_REG32_NUM];
++	u32	known[NFT_REG32_NUM];	/* the bits of data[] that are known */
++};
++
++/* A base chain at the hook being walked. */
++struct nft_probe_base {
++	const struct nft_chain	*chain;
++	int			prio;	/* where the hook runs it */
++	int			sub;	/* order among NAT chains: one hook runs them */
++	u8			pf;	/* the family its packets carry */
++	bool			nat;
++};
++
++/* A device below an input or output device. */
++struct nft_probe_lower {
++	const struct net_device	*dev;
++	/* The frame may carry a VLAN or switch tag inline there: its headers
++	 * are not where the stream's are.
++	 */
++	bool			opaque;
++};
++
++struct nft_probe_ctx {
++	struct net			*net;
++	const struct nft_port_probe	*probe;
++	u8				genbit;
++	u8				genmask;
++	/* 0 while walking; 1 once dependent; negative when it cannot tell. */
++	int				stop;
++	unsigned int			visits;
++
++	/* The hook and the base chain being walked. */
++	enum nft_probe_hook		hook;
++	const struct net_device		*in, *out;
++	bool				in_unknown;
++	bool				opaque;
++	u8				pf;
++	enum nft_probe_ct		ct;
++
++	/* The packet being walked. */
++	struct nft_probe_state		st;
++	bool				saddr_known, daddr_known;
++	/* A later packet of the stream: NAT chains saw the first one only. */
++	bool				steady;
++	/* The first packet went through NAT chains. */
++	bool				nat_walked;
++	/* The first packet was translated: at prerouting, per output. */
++	bool				nat_pre;
++	bool				nat_post[NFT_PROBE_MAX_OUT];
++	/* Some packet was translated: conntrack status NAT bits vary. */
++	bool				nat_seen;
++	/* A device the stream crosses is a bridge or a bridge port. */
++	bool				bridged;
++
++	/* What every path through the base chain accepted with so far. */
++	bool				have_outcome;
++	struct nft_probe_state		outcome;
++
++	struct nft_probe_regs		regs;
++	/* A network header load being built, value and known bits. */
++	u8				nh_val[NFT_PROBE_REG_BYTES];
++	u8				nh_known[NFT_PROBE_REG_BYTES];
++	bool				xbreak;
++	unsigned int			vbase, vtop;
++	struct nft_verdict		vstack[NFT_PROBE_MAX_VERDICTS];
++	unsigned int			nbase;
++	struct nft_probe_base		base[NFT_PROBE_MAX_BASE];
++	unsigned int			nlower;
++	struct nft_probe_lower		lower[NFT_PROBE_MAX_LOWER];
++	/* The state the devices below the one walked have to leave alone. */
++	struct nft_probe_state		below;
++	struct nft_probe_frame		frame[NFT_PROBE_FRAMES];
++};
++
++/* Signatures only have to tell effects apart within one probe. */
++static const siphash_key_t nft_probe_sipkey;
++static const u8 nft_probe_none[NFT_PROBE_REG_BYTES];
++
++static enum nft_probe_res nft_probe_stop(struct nft_probe_ctx *ctx, int why)
++{
++	if (!ctx->stop)
++		ctx->stop = why;
++	return NFT_PROBE_STOP;
++}
++
++/* What cannot be modelled may read the ports and do anything with them. */
++static enum nft_probe_res nft_probe_opaque(struct nft_probe_ctx *ctx)
++{
++	return nft_probe_stop(ctx, 1);
++}
++
++/* A path that drops, rejects or queues. The offload carries a stream once
++ * Linux was seen forwarding it: a model that drops where Linux accepts would
++ * put every port in hardware. Only streams every path forwards are judged.
++ */
++static void nft_probe_dropped(struct nft_probe_ctx *ctx)
++{
++	nft_probe_stop(ctx, 1);
++}
++
++static bool nft_probe_state_eq(const struct nft_probe_state *a,
++			       const struct nft_probe_state *b)
++{
++	return a->sig == b->sig && a->mark == b->mark &&
++	       a->ctmark == b->ctmark && a->flags == b->flags;
++}
++
++static void nft_probe_add(struct nft_probe_ctx *ctx, struct nft_probe_set *set,
++			  const struct nft_probe_state *st)
++{
++	unsigned int i;
++
++	for (i = 0; i < set->n; i++)
++		if (nft_probe_state_eq(&set->s[i], st))
++			return;
++	if (set->n == NFT_PROBE_MAX_STATES) {
++		nft_probe_stop(ctx, -E2BIG);
++		return;
++	}
++	set->s[set->n++] = *st;
++}
++
++/* Fold an effect into the path's signature. A value effect -- a priority, a
++ * label -- is the same whichever rule takes it, so @site is NULL for those;
++ * one the probe cannot see the value of, such as a NAT target, is told apart
++ * by the expression that takes it.
++ */
++static void nft_probe_fold(struct nft_probe_state *st, u32 kind, u32 key,
++			   const void *site, const void *val, unsigned int len)
++{
++	struct {
++		u64	sig;
++		u64	site;
++		u32	kind;
++		u32	key;
++		u8	val[NFT_REG_SIZE];
++	} fx;
++
++	memset(&fx, 0, sizeof(fx));
++	fx.sig = st->sig;
++	fx.site = (unsigned long)site;
++	fx.kind = kind;
++	fx.key = key;
++	if (val)
++		memcpy(fx.val, val, min_t(unsigned int, len, sizeof(fx.val)));
++	st->sig = siphash(&fx, sizeof(fx), &nft_probe_sipkey);
++}
++
++/* Registers. */
++
++static bool nft_probe_span(unsigned int reg, unsigned int len)
++{
++	return reg < NFT_REG32_NUM &&
++	       len <= (NFT_REG32_NUM - reg) * NFT_REG32_SIZE;
++}
++
++/* Store @len bytes at @reg the way the loads and nft_data_copy() do: a
++ * partial last word is zeroed first. A NULL @val stores zeroes, a NULL @known
++ * makes every bit known.
++ */
++static bool nft_probe_put(struct nft_probe_ctx *ctx, unsigned int reg,
++			  unsigned int len, const void *val, const void *known)
++{
++	struct nft_probe_regs *regs = &ctx->regs;
++
++	if (!nft_probe_span(reg, len)) {
++		nft_probe_stop(ctx, -EINVAL);
++		return false;
++	}
++	if (len % NFT_REG32_SIZE) {
++		regs->data[reg + len / NFT_REG32_SIZE] = 0;
++		regs->known[reg + len / NFT_REG32_SIZE] = ~0U;
++	}
++	if (val)
++		memcpy(&regs->data[reg], val, len);
++	else
++		memset(&regs->data[reg], 0, len);
++	if (known)
++		memcpy(&regs->known[reg], known, len);
++	else
++		memset(&regs->known[reg], 0xff, len);
++	return true;
++}
++
++static bool nft_probe_put_unknown(struct nft_probe_ctx *ctx, unsigned int reg,
++				  unsigned int len)
++{
++	return nft_probe_put(ctx, reg, len, NULL, nft_probe_none);
++}
++
++/* Known stores of a word, a half and a byte, as nft_reg_store16() and
++ * nft_reg_store8() pad them.
++ */
++static void nft_probe_put32(struct nft_probe_ctx *ctx, unsigned int reg,
++			    u32 val)
++{
++	if (!nft_probe_span(reg, sizeof(u32))) {
++		nft_probe_stop(ctx, -EINVAL);
++		return;
++	}
++	ctx->regs.data[reg] = val;
++	ctx->regs.known[reg] = ~0U;
++}
++
++static void nft_probe_put16(struct nft_probe_ctx *ctx, unsigned int reg,
++			    u16 val)
++{
++	if (!nft_probe_span(reg, sizeof(u32))) {
++		nft_probe_stop(ctx, -EINVAL);
++		return;
++	}
++	nft_reg_store16(&ctx->regs.data[reg], val);
++	ctx->regs.known[reg] = ~0U;
++}
++
++static void nft_probe_put8(struct nft_probe_ctx *ctx, unsigned int reg, u8 val)
++{
++	if (!nft_probe_span(reg, sizeof(u32))) {
++		nft_probe_stop(ctx, -EINVAL);
++		return;
++	}
++	nft_reg_store8(&ctx->regs.data[reg], val);
++	ctx->regs.known[reg] = ~0U;
++}
++
++/* A device or link kind name, as strscpy_pad() leaves it. */
++static void nft_probe_put_name(struct nft_probe_ctx *ctx, unsigned int reg,
++			       const char *name)
++{
++	if (!nft_probe_span(reg, IFNAMSIZ)) {
++		nft_probe_stop(ctx, -EINVAL);
++		return;
++	}
++	strscpy_pad((char *)&ctx->regs.data[reg], name, IFNAMSIZ);
++	memset(&ctx->regs.known[reg], 0xff, IFNAMSIZ);
++}
++
++/* A load whose destination the probe cannot see: forget every register. */
++static void nft_probe_clobber(struct nft_probe_ctx *ctx)
++{
++	memset(ctx->regs.known, 0, sizeof(ctx->regs.known));
++}
++
++static bool nft_probe_known(const struct nft_probe_regs *regs,
++			    unsigned int reg, unsigned int len)
++{
++	return nft_probe_span(reg, len) &&
++	       !memchr_inv(&regs->known[reg], 0xff, len);
++}
++
++static enum nft_probe_res nft_probe_not(enum nft_probe_res r)
++{
++	switch (r) {
++	case NFT_PROBE_MATCH:
++		return NFT_PROBE_NOMATCH;
++	case NFT_PROBE_NOMATCH:
++		return NFT_PROBE_MATCH;
++	default:
++		return r;
++	}
++}
++
++/* Whether @len bytes at @reg equal @data under @mask (NULL: every bit):
++ * MATCH, NOMATCH, or EITHER when an unknown bit decides.
++ */
++static enum nft_probe_res nft_probe_eq(const struct nft_probe_regs *regs,
++				       unsigned int reg, const void *data,
++				       const void *mask, unsigned int len)
++{
++	const u8 *d = (const u8 *)&regs->data[reg];
++	const u8 *k = (const u8 *)&regs->known[reg];
++	const u8 *v = data, *m = mask;
++	bool unknown = false;
++	unsigned int i;
++
++	for (i = 0; i < len; i++) {
++		u8 bits = m ? m[i] : 0xff;
++
++		if ((d[i] ^ v[i]) & bits & k[i])
++			return NFT_PROBE_NOMATCH;
++		if (bits & ~k[i])
++			unknown = true;
++	}
++	return unknown ? NFT_PROBE_EITHER : NFT_PROBE_MATCH;
++}
++
++/* memcmp() of @len bytes at @reg with @data, if the known bytes decide it. */
++static bool nft_probe_memcmp(const struct nft_probe_regs *regs,
++			     unsigned int reg, const void *data,
++			     unsigned int len, int *res)
++{
++	const u8 *d = (const u8 *)&regs->data[reg];
++	const u8 *k = (const u8 *)&regs->known[reg];
++	const u8 *v = data;
++	unsigned int i;
++
++	for (i = 0; i < len; i++) {
++		if (k[i] != 0xff)
++			return false;
++		if (d[i] != v[i]) {
++			*res = d[i] < v[i] ? -1 : 1;
++			return true;
++		}
++	}
++	*res = 0;
++	return true;
++}
++
++/* Matches. */
++
++static enum nft_probe_res nft_probe_cmp(struct nft_probe_ctx *ctx,
++					const struct nft_expr *expr)
++{
++	const struct nft_cmp_expr *priv = nft_expr_priv(expr);
++	enum nft_probe_res r;
++	int d;
++
++	if (!nft_probe_span(priv->sreg, priv->len))
++		return nft_probe_stop(ctx, -EINVAL);
++
++	switch (priv->op) {
++	case NFT_CMP_EQ:
++	case NFT_CMP_NEQ:
++		r = nft_probe_eq(&ctx->regs, priv->sreg, &priv->data, NULL,
++				 priv->len);
++		return priv->op == NFT_CMP_EQ ? r : nft_probe_not(r);
++	default:
++		break;
++	}
++
++	if (!nft_probe_memcmp(&ctx->regs, priv->sreg, &priv->data, priv->len,
++			      &d))
++		return NFT_PROBE_EITHER;
++
++	switch (priv->op) {
++	case NFT_CMP_LT:
++		return d < 0 ? NFT_PROBE_MATCH : NFT_PROBE_NOMATCH;
++	case NFT_CMP_LTE:
++		return d <= 0 ? NFT_PROBE_MATCH : NFT_PROBE_NOMATCH;
++	case NFT_CMP_GT:
++		return d > 0 ? NFT_PROBE_MATCH : NFT_PROBE_NOMATCH;
++	case NFT_CMP_GTE:
++		return d >= 0 ? NFT_PROBE_MATCH : NFT_PROBE_NOMATCH;
++	default:
++		return NFT_PROBE_EITHER;
++	}
++}
++
++static enum nft_probe_res nft_probe_cmp_fast(struct nft_probe_ctx *ctx,
++					     const struct nft_expr *expr)
++{
++	const struct nft_cmp_fast_expr *priv = nft_expr_priv(expr);
++	enum nft_probe_res r;
++
++	if (!nft_probe_span(priv->sreg, sizeof(u32)))
++		return nft_probe_stop(ctx, -EINVAL);
++	r = nft_probe_eq(&ctx->regs, priv->sreg, &priv->data, &priv->mask,
++			 sizeof(u32));
++	return priv->inv ? nft_probe_not(r) : r;
++}
++
++static enum nft_probe_res nft_probe_cmp16_fast(struct nft_probe_ctx *ctx,
++					       const struct nft_expr *expr)
++{
++	const struct nft_cmp16_fast_expr *priv = nft_expr_priv(expr);
++	enum nft_probe_res r;
++
++	if (!nft_probe_span(priv->sreg, sizeof(priv->data)))
++		return nft_probe_stop(ctx, -EINVAL);
++	r = nft_probe_eq(&ctx->regs, priv->sreg, &priv->data, &priv->mask,
++			 sizeof(priv->data));
++	return priv->inv ? nft_probe_not(r) : r;
++}
++
++static enum nft_probe_res nft_probe_range(struct nft_probe_ctx *ctx,
++					  const struct nft_expr *expr)
++{
++	const struct nft_range_expr *priv = nft_expr_priv(expr);
++	bool in;
++	int d1, d2;
++
++	if (!nft_probe_span(priv->sreg, priv->len))
++		return nft_probe_stop(ctx, -EINVAL);
++	if (!nft_probe_memcmp(&ctx->regs, priv->sreg, &priv->data_from,
++			      priv->len, &d1) ||
++	    !nft_probe_memcmp(&ctx->regs, priv->sreg, &priv->data_to,
++			      priv->len, &d2))
++		return NFT_PROBE_EITHER;
++
++	in = d1 >= 0 && d2 <= 0;
++	switch (priv->op) {
++	case NFT_RANGE_EQ:
++		return in ? NFT_PROBE_MATCH : NFT_PROBE_NOMATCH;
++	case NFT_RANGE_NEQ:
++		return in ? NFT_PROBE_NOMATCH : NFT_PROBE_MATCH;
++	default:
++		return NFT_PROBE_EITHER;
++	}
++}
++
++/* Register arithmetic. */
++
++static enum nft_probe_res nft_probe_bitwise_fast(struct nft_probe_ctx *ctx,
++						 const struct nft_expr *expr)
++{
++	const struct nft_bitwise_fast_expr *priv = nft_expr_priv(expr);
++	struct nft_probe_regs *regs = &ctx->regs;
++	u32 val, known;
++
++	if (!nft_probe_span(priv->sreg, sizeof(u32)) ||
++	    !nft_probe_span(priv->dreg, sizeof(u32)))
++		return nft_probe_stop(ctx, -EINVAL);
++
++	/* A bit the mask clears is known, whatever it was. */
++	val = (regs->data[priv->sreg] & priv->mask) ^ priv->xor;
++	known = regs->known[priv->sreg] | ~priv->mask;
++	regs->data[priv->dreg] = val;
++	regs->known[priv->dreg] = known;
++	return NFT_PROBE_MATCH;
++}
++
++static enum nft_probe_res nft_probe_bitwise(struct nft_probe_ctx *ctx,
++					    const struct nft_expr *expr)
++{
++	const struct nft_bitwise *priv = nft_expr_priv(expr);
++	struct nft_probe_regs *regs = &ctx->regs;
++	unsigned int n = DIV_ROUND_UP(priv->len, sizeof(u32)), i;
++	u32 *src = &regs->data[priv->sreg], *dst = &regs->data[priv->dreg];
++	u32 shift = priv->data.data[0], carry = 0;
++
++	if (!nft_probe_span(priv->sreg, n * sizeof(u32)) ||
++	    !nft_probe_span(priv->dreg, n * sizeof(u32)))
++		return nft_probe_stop(ctx, -EINVAL);
++
++	switch (priv->op) {
++	case NFT_BITWISE_MASK_XOR:
++		for (i = 0; i < n; i++) {
++			u32 s = src[i], ks = regs->known[priv->sreg + i];
++
++			dst[i] = (s & priv->mask.data[i]) ^ priv->xor.data[i];
++			regs->known[priv->dreg + i] = ks | ~priv->mask.data[i];
++		}
++		break;
++	case NFT_BITWISE_LSHIFT:
++	case NFT_BITWISE_RSHIFT:
++		/* Exactly as nft_bitwise_eval() when every source bit is
++		 * known; otherwise nothing of the result is.
++		 */
++		if (!nft_probe_known(regs, priv->sreg, n * sizeof(u32)) ||
++		    !shift || shift >= BITS_PER_TYPE(u32)) {
++			memset(&regs->known[priv->dreg], 0, n * sizeof(u32));
++			break;
++		}
++		if (priv->op == NFT_BITWISE_LSHIFT) {
++			for (i = n; i > 0; i--) {
++				u32 s = src[i - 1];
++
++				dst[i - 1] = (s << shift) | carry;
++				carry = s >> (BITS_PER_TYPE(u32) - shift);
++			}
++		} else {
++			for (i = 0; i < n; i++) {
++				u32 s = src[i];
++
++				dst[i] = carry | (s >> shift);
++				carry = s << (BITS_PER_TYPE(u32) - shift);
++			}
++		}
++		memset(&regs->known[priv->dreg], 0xff, n * sizeof(u32));
++		break;
++	default:
++		memset(&regs->known[priv->dreg], 0, n * sizeof(u32));
++		break;
++	}
++	return NFT_PROBE_MATCH;
++}
++
++/* nft_byteorder_eval() on one register array. A byte swap moves whole bytes,
++ * so the same moves applied to the known bits keep them with their values.
++ */
++static void nft_probe_byteorder_apply(u32 *dst, const u32 *src,
++				      const struct nft_byteorder *priv)
++{
++	u16 *d16 = (void *)dst;
++	const u16 *s16 = (const void *)src;
++	unsigned int i;
++
++	switch (priv->size) {
++	case 8: {
++		u64 *dst64 = (void *)dst;
++		u64 src64;
++
++		for (i = 0; i < priv->len / 8; i++) {
++			src64 = nft_reg_load64(&src[i]);
++			if (priv->op == NFT_BYTEORDER_NTOH)
++				src64 = be64_to_cpu((__force __be64)src64);
++			else
++				src64 = (__force u64)cpu_to_be64(src64);
++			nft_reg_store64(&dst64[i], src64);
++		}
++		break;
++	}
++	case 4:
++		for (i = 0; i < priv->len / 4; i++) {
++			if (priv->op == NFT_BYTEORDER_NTOH)
++				dst[i] = ntohl((__force __be32)src[i]);
++			else
++				dst[i] = (__force u32)htonl(src[i]);
++		}
++		break;
++	case 2:
++		for (i = 0; i < priv->len / 2; i++) {
++			if (priv->op == NFT_BYTEORDER_NTOH)
++				d16[i] = ntohs((__force __be16)s16[i]);
++			else
++				d16[i] = (__force u16)htons(s16[i]);
++		}
++		break;
++	}
++}
++
++static enum nft_probe_res nft_probe_byteorder(struct nft_probe_ctx *ctx,
++					      const struct nft_expr *expr)
++{
++	const struct nft_byteorder *priv = nft_expr_priv(expr);
++	struct nft_probe_regs *regs = &ctx->regs;
++
++	/* Every size reads and writes within the first len bytes. */
++	if (!nft_probe_span(priv->sreg, priv->len) ||
++	    !nft_probe_span(priv->dreg, priv->len))
++		return nft_probe_stop(ctx, -EINVAL);
++
++	nft_probe_byteorder_apply(&regs->data[priv->dreg],
++				  &regs->data[priv->sreg], priv);
++	nft_probe_byteorder_apply(&regs->known[priv->dreg],
++				  &regs->known[priv->sreg], priv);
++	return NFT_PROBE_MATCH;
++}
++
++static enum nft_probe_res nft_probe_immediate(struct nft_probe_ctx *ctx,
++					      const struct nft_expr *expr,
++					      struct nft_verdict *v)
++{
++	const struct nft_immediate_expr *priv = nft_expr_priv(expr);
++
++	if (priv->dreg == NFT_REG_VERDICT) {
++		*v = priv->data.verdict;
++		return NFT_PROBE_VERDICT;
++	}
++	if (!nft_probe_put(ctx, priv->dreg, priv->dlen, &priv->data, NULL))
++		return NFT_PROBE_STOP;
++	return NFT_PROBE_MATCH;
++}
++
++/* Loads. */
++
++/* The network header bytes the stream fixes, bit by bit. Returns whether a
++ * load of them can fail on a packet of the stream: past the fixed header it
++ * reads what a packet may not have.
++ */
++static bool nft_probe_nh(const struct nft_probe_ctx *ctx, unsigned int off,
++			 unsigned int len, u8 *val, u8 *known)
++{
++	const struct nft_port_probe *p = ctx->probe;
++	unsigned int hlen, soff, doff, alen, pos, i;
++	const u8 *saddr = (const u8 *)&p->saddr;
++	const u8 *daddr = (const u8 *)&p->daddr;
++	u8 version;
++
++	if (p->family == NFPROTO_IPV4) {
++		hlen = sizeof(struct iphdr);
++		soff = offsetof(struct iphdr, saddr);
++		doff = offsetof(struct iphdr, daddr);
++		alen = sizeof(struct in_addr);
++		version = 0x40;
++	} else {
++		hlen = sizeof(struct ipv6hdr);
++		soff = offsetof(struct ipv6hdr, saddr);
++		doff = offsetof(struct ipv6hdr, daddr);
++		alen = sizeof(struct in6_addr);
++		version = 0x60;
++	}
++
++	memset(val, 0, len);
++	memset(known, 0, len);
++	for (i = 0; i < len; i++) {
++		pos = off + i;
++		if (pos == 0) {
++			val[i] = version;
++			known[i] = 0xf0;
++		} else if (p->family == NFPROTO_IPV4 &&
++			   pos == offsetof(struct iphdr, protocol)) {
++			val[i] = IPPROTO_UDP;
++			known[i] = 0xff;
++		} else if (pos >= soff && pos < soff + alen &&
++			   ctx->saddr_known) {
++			val[i] = saddr[pos - soff];
++			known[i] = 0xff;
++		} else if (pos >= doff && pos < doff + alen &&
++			   ctx->daddr_known) {
++			val[i] = daddr[pos - doff];
++			known[i] = 0xff;
++		}
++	}
++	return off + len > hlen;
++}
++
++static enum nft_probe_res nft_probe_payload(struct nft_probe_ctx *ctx,
++					    const struct nft_expr *expr)
++{
++	const struct nft_payload *priv = nft_expr_priv(expr);
++	bool may_fail;
++
++	/* Only the load: payload set mangles what the probe knows. */
++	if (expr->ops->eval != nft_payload_eval)
++		return nft_probe_opaque(ctx);
++	if (!nft_probe_span(priv->dreg, priv->len))
++		return nft_probe_stop(ctx, -EINVAL);
++
++	if (priv->base != NFT_PAYLOAD_NETWORK_HEADER || ctx->opaque) {
++		/* The transport header holds the ports; link layer and inner
++		 * headers are not the stream's, nor is anything behind an
++		 * inline tag. A load may also fail on a fragment or a short
++		 * packet.
++		 */
++		nft_probe_put_unknown(ctx, priv->dreg, priv->len);
++		return NFT_PROBE_EITHER;
++	}
++
++	may_fail = nft_probe_nh(ctx, priv->offset, priv->len, ctx->nh_val,
++				ctx->nh_known);
++	nft_probe_put(ctx, priv->dreg, priv->len, ctx->nh_val, ctx->nh_known);
++	return may_fail ? NFT_PROBE_EITHER : NFT_PROBE_MATCH;
++}
++
++/* The device skb->dev names when a chain runs, if the probe knows it. */
++static const struct net_device *
++nft_probe_skbdev(const struct nft_probe_ctx *ctx)
++{
++	switch (ctx->hook) {
++	case NFT_PROBE_INGRESS:
++	case NFT_PROBE_PRE:
++		return ctx->in;
++	case NFT_PROBE_FORWARD:
++		/* IPv4 still has the input device there, IPv6 the output
++		 * one: known only where the two agree.
++		 */
++		return ctx->in->type == ctx->out->type ? ctx->in : NULL;
++	default:
++		return ctx->out;
++	}
++}
++
++/* meta iif, oif and the other device keys, the way nft_meta_get_eval()
++ * stores them for @dev.
++ */
++static enum nft_probe_res nft_probe_meta_dev(struct nft_probe_ctx *ctx,
++					     unsigned int reg, u32 key,
++					     const struct net_device *dev)
++{
++	switch (key) {
++	case NFT_META_IIF:
++	case NFT_META_OIF:
++		nft_probe_put32(ctx, reg, dev ? dev->ifindex : 0);
++		return NFT_PROBE_MATCH;
++	case NFT_META_IIFNAME:
++	case NFT_META_OIFNAME:
++		nft_probe_put_name(ctx, reg, dev ? dev->name : "");
++		return NFT_PROBE_MATCH;
++	case NFT_META_IFTYPE:
++	case __NFT_META_IIFTYPE:
++	case NFT_META_OIFTYPE:
++		if (!dev)
++			return NFT_PROBE_NOMATCH;
++		nft_probe_put16(ctx, reg, dev->type);
++		return NFT_PROBE_MATCH;
++	case NFT_META_IIFGROUP:
++	case NFT_META_OIFGROUP:
++		if (!dev)
++			return NFT_PROBE_NOMATCH;
++		nft_probe_put32(ctx, reg, dev->group);
++		return NFT_PROBE_MATCH;
++	case NFT_META_IIFKIND:
++	case NFT_META_OIFKIND:
++		if (!dev || !dev->rtnl_link_ops)
++			return NFT_PROBE_NOMATCH;
++		nft_probe_put_name(ctx, reg, dev->rtnl_link_ops->kind);
++		return NFT_PROBE_MATCH;
++	}
++	return nft_probe_stop(ctx, -EINVAL);
++}
++
++static bool nft_probe_multicast(const struct nft_port_probe *p)
++{
++	if (p->family == NFPROTO_IPV4)
++		return ipv4_is_multicast(p->daddr.ip);
++	return ipv6_addr_is_multicast(&p->daddr.in6);
++}
++
++static enum nft_probe_res nft_probe_meta_get(struct nft_probe_ctx *ctx,
++					     const struct nft_expr *expr,
++					     const struct nft_probe_state *st)
++{
++	const struct nft_meta *priv = nft_expr_priv(expr);
++	const struct nft_port_probe *p = ctx->probe;
++	unsigned int reg = priv->dreg;
++	const struct net_device *dev;
++
++	switch (priv->key) {
++	case NFT_META_PROTOCOL:
++		if (ctx->opaque)
++			break;
++		nft_probe_put16(ctx, reg,
++				(__force u16)htons(p->family == NFPROTO_IPV4 ?
++						   ETH_P_IP : ETH_P_IPV6));
++		return NFT_PROBE_MATCH;
++	case NFT_META_NFPROTO:
++		nft_probe_put8(ctx, reg, ctx->pf);
++		return NFT_PROBE_MATCH;
++	case NFT_META_L4PROTO:
++		if (ctx->opaque)
++			break;
++		nft_probe_put8(ctx, reg, IPPROTO_UDP);
++		return NFT_PROBE_MATCH;
++	case NFT_META_MARK:
++		nft_probe_put32(ctx, reg, st->mark);
++		return NFT_PROBE_MATCH;
++	case NFT_META_PKTTYPE:
++		/* What eth_type_trans() makes of a group address. */
++		if (ctx->opaque || p->in->type != ARPHRD_ETHER ||
++		    !nft_probe_multicast(p))
++			break;
++		nft_probe_put8(ctx, reg, PACKET_MULTICAST);
++		return NFT_PROBE_MATCH;
++	case NFT_META_IIF:
++	case NFT_META_IIFNAME:
++	case __NFT_META_IIFTYPE:
++	case NFT_META_IIFGROUP:
++	case NFT_META_IIFKIND:
++		if (ctx->in_unknown)
++			break;
++		return nft_probe_meta_dev(ctx, reg, priv->key, ctx->in);
++	case NFT_META_OIF:
++	case NFT_META_OIFNAME:
++	case NFT_META_OIFTYPE:
++	case NFT_META_OIFGROUP:
++	case NFT_META_OIFKIND:
++		return nft_probe_meta_dev(ctx, reg, priv->key, ctx->out);
++	case NFT_META_IFTYPE:
++		dev = nft_probe_skbdev(ctx);
++		if (!dev)
++			break;
++		return nft_probe_meta_dev(ctx, reg, priv->key, dev);
++	default:
++		break;
++	}
++
++	/* Length, priority, time, cpu, socket owner, ...: per packet, or
++	 * nothing the probe knows. Some of these fail on a forwarded packet.
++	 */
++	nft_probe_put_unknown(ctx, reg, priv->len);
++	return NFT_PROBE_EITHER;
++}
++
++static enum nft_probe_res nft_probe_meta_set(struct nft_probe_ctx *ctx,
++					     const struct nft_expr *expr,
++					     struct nft_probe_state *st)
++{
++	const struct nft_meta *priv = nft_expr_priv(expr);
++	const struct nft_probe_regs *regs = &ctx->regs;
++	u32 val;
++
++	if (priv->key == NFT_META_NFTRACE)
++		return NFT_PROBE_MATCH;
++	if (!nft_probe_known(regs, priv->sreg, sizeof(u32)))
++		return nft_probe_opaque(ctx);
++	val = regs->data[priv->sreg];
++
++	switch (priv->key) {
++	case NFT_META_MARK:
++		st->mark = val;
++		st->flags |= NFT_PROBE_MARKED;
++		return NFT_PROBE_MATCH;
++	case NFT_META_PRIORITY:
++	case NFT_META_SECMARK:
++		nft_probe_fold(st, NFT_PROBE_FX_META, priv->key, NULL, &val,
++			       sizeof(val));
++		return NFT_PROBE_MATCH;
++	default:
++		/* The packet type: what later loads of it read. */
++		return nft_probe_opaque(ctx);
++	}
++}
++
++/* The conntrack status bits a stream's entry is known not to carry: it has
++ * not seen a reply, came from no expectation, and has no NAT unless some
++ * packet was translated. The rest -- confirmed, NAT done, helper, offload --
++ * differ between its first packet and the later ones, or are not the
++ * ruleset's to say.
++ */
++static u32 nft_probe_ct_status_known(const struct nft_probe_ctx *ctx)
++{
++	u32 known = IPS_EXPECTED | IPS_SEEN_REPLY | IPS_ASSURED;
++
++	if (!ctx->nat_seen)
++		known |= IPS_NAT_MASK;
++	return known;
++}
++
++static enum nft_probe_res nft_probe_ct_get(struct nft_probe_ctx *ctx,
++					   const struct nft_ct *priv,
++					   const struct nft_probe_state *st)
++{
++	const struct nft_port_probe *p = ctx->probe;
++	struct nft_probe_regs *regs = &ctx->regs;
++	unsigned int reg = priv->dreg, alen;
++	const union nf_inet_addr *addr;
++
++	if (priv->key == NFT_CT_STATE) {
++		/* Before conntrack runs the packet may carry a template -- a
++		 * zone was set -- that reads as new; otherwise it reads as
++		 * invalid. After it, a stream no reply comes back for stays
++		 * new.
++		 */
++		if (ctx->ct != NFT_PROBE_CT_PRESENT) {
++			nft_probe_put_unknown(ctx, reg, sizeof(u32));
++			return NFT_PROBE_MATCH;
++		}
++		nft_probe_put32(ctx, reg, NF_CT_STATE_BIT(IP_CT_NEW));
++		return NFT_PROBE_MATCH;
++	}
++
++	switch (ctx->ct) {
++	case NFT_PROBE_CT_ABSENT:
++		/* No entry, or only a template: every other key breaks. */
++		return NFT_PROBE_NOMATCH;
++	case NFT_PROBE_CT_UNKNOWN:
++		nft_probe_put_unknown(ctx, reg, priv->len);
++		return NFT_PROBE_EITHER;
++	default:
++		break;
++	}
++
++	switch (priv->key) {
++	case NFT_CT_DIRECTION:
++		nft_probe_put8(ctx, reg, IP_CT_DIR_ORIGINAL);
++		return NFT_PROBE_MATCH;
++	case NFT_CT_STATUS:
++		nft_probe_put32(ctx, reg, 0);
++		if (!ctx->stop)
++			regs->known[reg] = nft_probe_ct_status_known(ctx);
++		return NFT_PROBE_MATCH;
++	case NFT_CT_MARK:
++		nft_probe_put32(ctx, reg, st->ctmark);
++		return NFT_PROBE_MATCH;
++	case NFT_CT_L3PROTOCOL:
++		/* nf_ct_l3num(): the NFPROTO value is the AF one. */
++		nft_probe_put8(ctx, reg, p->family);
++		return NFT_PROBE_MATCH;
++	case NFT_CT_PROTOCOL:
++		nft_probe_put8(ctx, reg, IPPROTO_UDP);
++		return NFT_PROBE_MATCH;
++	case NFT_CT_SRC:
++	case NFT_CT_DST:
++	case NFT_CT_SRC_IP:
++	case NFT_CT_DST_IP:
++	case NFT_CT_SRC_IP6:
++	case NFT_CT_DST_IP6:
++		break;
++	default:
++		/* Ports, counters, timeouts, labels, zone, helper name: the
++		 * helper load fails without one.
++		 */
++		nft_probe_put_unknown(ctx, reg, priv->len);
++		return NFT_PROBE_EITHER;
++	}
++
++	/* Addresses. */
++	if (((priv->key == NFT_CT_SRC_IP || priv->key == NFT_CT_DST_IP) &&
++	     p->family != NFPROTO_IPV4) ||
++	    ((priv->key == NFT_CT_SRC_IP6 || priv->key == NFT_CT_DST_IP6) &&
++	     p->family != NFPROTO_IPV6))
++		return NFT_PROBE_NOMATCH;
++	if (priv->len > sizeof(union nf_inet_addr) ||
++	    !nft_probe_span(reg, round_up(priv->len, NFT_REG32_SIZE)))
++		return nft_probe_stop(ctx, -EINVAL);
++	/* The original tuple is the stream as it arrived and never changes;
++	 * the reply one depends on what NAT made of it.
++	 */
++	if (priv->dir != IP_CT_DIR_ORIGINAL) {
++		nft_probe_put_unknown(ctx, reg, priv->len);
++		return NFT_PROBE_MATCH;
++	}
++	switch (priv->key) {
++	case NFT_CT_SRC:
++	case NFT_CT_SRC_IP:
++	case NFT_CT_SRC_IP6:
++		addr = &p->saddr;
++		break;
++	default:
++		addr = &p->daddr;
++		break;
++	}
++	/* A tuple is zero past its address. */
++	alen = p->family == NFPROTO_IPV4 ? sizeof(struct in_addr) :
++					   sizeof(struct in6_addr);
++	nft_probe_put(ctx, reg, priv->len, NULL, NULL);
++	memcpy(&regs->data[reg], addr, min_t(unsigned int, priv->len, alen));
++	return NFT_PROBE_MATCH;
++}
++
++static enum nft_probe_res nft_probe_ct_set(struct nft_probe_ctx *ctx,
++					   const struct nft_ct *priv,
++					   struct nft_probe_state *st)
++{
++	const struct nft_probe_regs *regs = &ctx->regs;
++
++	/* Setting the zone attaches a template before conntrack runs; every
++	 * other key needs the entry, and is skipped without one.
++	 */
++	if (priv->key != NFT_CT_ZONE) {
++		if (ctx->ct == NFT_PROBE_CT_ABSENT)
++			return NFT_PROBE_MATCH;
++		if (ctx->ct == NFT_PROBE_CT_UNKNOWN)
++			return nft_probe_opaque(ctx);
++	}
++	if (!nft_probe_known(regs, priv->sreg, priv->len))
++		return nft_probe_opaque(ctx);
++
++	switch (priv->key) {
++	case NFT_CT_MARK:
++		st->ctmark = regs->data[priv->sreg];
++		st->flags |= NFT_PROBE_CTMARKED;
++		return NFT_PROBE_MATCH;
++	case NFT_CT_LABELS:
++	case NFT_CT_EVENTMASK:
++	case NFT_CT_SECMARK:
++	case NFT_CT_ZONE:
++		nft_probe_fold(st, NFT_PROBE_FX_CT, priv->key, NULL,
++			       &regs->data[priv->sreg], priv->len);
++		return NFT_PROBE_MATCH;
++	default:
++		return nft_probe_opaque(ctx);
++	}
++}
++
++static enum nft_probe_res nft_probe_ct(struct nft_probe_ctx *ctx,
++				       const struct nft_expr *expr,
++				       struct nft_probe_state *st)
++{
++	const struct nft_ct *priv = nft_expr_priv(expr);
++
++	if (priv->store)
++		return nft_probe_ct_set(ctx, priv, st);
++	return nft_probe_ct_get(ctx, priv, st);
++}
++
++/* Sets and maps. */
++
++/* A set whose contents change without a commit: its elements time out, or
++ * the packet path adds and deletes them -- a dynset may do so from a hook the
++ * probe does not walk, whatever the set's flags. What a lookup finds there
++ * now says nothing of later packets.
++ */
++static bool nft_probe_set_dynamic(const struct nft_set *set)
++{
++	return (set->flags & (NFT_SET_TIMEOUT | NFT_SET_EVAL)) ||
++	       READ_ONCE(set->packet_updated);
++}
++
++/* Whether the expressions an element carries may break the rule: a limit or a
++ * quota of its own.
++ */
++static bool nft_probe_elem_breaks(const struct nft_set_ext *ext)
++{
++	const struct nft_set_elem_expr *elem_expr;
++	const struct nft_expr *expr;
++	u32 size;
++
++	if (!nft_set_ext_exists(ext, NFT_SET_EXT_EXPRESSIONS))
++		return false;
++	elem_expr = nft_set_ext_expr(ext);
++	nft_setelem_expr_foreach(expr, elem_expr, size) {
++		if (expr->ops->type != &nft_counter_type &&
++		    expr->ops->type != &nft_last_type)
++			return true;
++	}
++	return false;
++}
++
++static bool nft_probe_verdict_eq(const struct nft_verdict *a,
++				 const struct nft_verdict *b)
++{
++	if (a->code != b->code)
++		return false;
++	return (a->code != NFT_JUMP && a->code != NFT_GOTO) ||
++	       a->chain == b->chain;
++}
++
++static int nft_probe_push(struct nft_probe_ctx *ctx,
++			  const struct nft_verdict *v)
++{
++	unsigned int i;
++
++	for (i = ctx->vbase; i < ctx->vtop; i++)
++		if (nft_probe_verdict_eq(&ctx->vstack[i], v))
++			return 0;
++	if (ctx->vtop == NFT_PROBE_MAX_VERDICTS)
++		return -E2BIG;
++	ctx->vstack[ctx->vtop++] = *v;
++	return 0;
++}
++
++struct nft_probe_walk {
++	struct nft_set_iter	iter;
++	struct nft_probe_ctx	*ctx;
++	unsigned int		sreg;
++	/* Elements whose key the known bits rule out are left out: only
++	 * where an element is a single key, not a range.
++	 */
++	bool			filter;
++};
++
++static int nft_probe_elem(const struct nft_ctx *nctx, struct nft_set *set,
++			  const struct nft_set_iter *iter,
++			  struct nft_elem_priv *elem_priv)
++{
++	const struct nft_probe_walk *w =
++		container_of_const(iter, struct nft_probe_walk, iter);
++	const struct nft_set_ext *ext = nft_set_elem_ext(set, elem_priv);
++	struct nft_probe_ctx *ctx = w->ctx;
++
++	/* Every element counts against the bound, the ones skipped too. */
++	if (++ctx->visits > NFT_PROBE_MAX_VISITS)
++		return -E2BIG;
++	if (!nft_set_elem_active(ext, iter->genmask) ||
++	    nft_set_elem_expired(ext) || nft_set_elem_is_dead(ext))
++		return 0;
++	if (nft_set_ext_exists(ext, NFT_SET_EXT_FLAGS) &&
++	    (*nft_set_ext_flags(ext) & NFT_SET_ELEM_INTERVAL_END))
++		return 0;
++	if (!nft_set_ext_exists(ext, NFT_SET_EXT_DATA))
++		return 0;
++	if (w->filter &&
++	    nft_probe_eq(&ctx->regs, w->sreg, nft_set_ext_key(ext), NULL,
++			 set->klen) == NFT_PROBE_NOMATCH)
++		return 0;
++	if (nft_probe_elem_breaks(ext))
++		ctx->xbreak = true;
++	return nft_probe_push(ctx, &nft_set_ext_data(ext)->verdict);
++}
++
++/* A verdict map read with a key the probe does not know, or one that changes
++ * without a commit: any element may be the one, and so may none.
++ */
++static enum nft_probe_res nft_probe_vmap(struct nft_probe_ctx *ctx,
++					 const struct nft_lookup *priv)
++{
++	struct nft_set *set = priv->set;
++	struct nft_ctx nctx = {
++		.net	= ctx->net,
++		.table	= set->table,
++		.family	= set->table->family,
++	};
++	struct nft_probe_walk w = {
++		.iter	= {
++			.genmask	= ctx->genmask,
++			.type		= NFT_ITER_READ,
++			.fn		= nft_probe_elem,
++		},
++		.ctx	= ctx,
++		.sreg	= priv->sreg,
++		.filter	= !(set->flags & NFT_SET_INTERVAL),
++	};
++	const struct nft_set_ext *catchall;
++	int err;
++
++	/* The rhashtable walker takes a lock its other users hold with bottom
++	 * halves enabled: not from interrupt context.
++	 */
++	if (in_interrupt() && set->ops == &nft_set_rhash_type.ops)
++		return nft_probe_opaque(ctx);
++
++	set->ops->walk(&nctx, set, &w.iter);
++	if (w.iter.err < 0)
++		return nft_probe_stop(ctx, w.iter.err);
++
++	/* A key no element holds takes the catch-all, or breaks the rule;
++	 * so does any key once a timed catch-all is gone.
++	 */
++	catchall = nft_set_catchall_lookup(ctx->net, set);
++	if (catchall) {
++		err = nft_probe_push(ctx, &nft_set_ext_data(catchall)->verdict);
++		if (err)
++			return nft_probe_stop(ctx, err);
++		if (nft_probe_elem_breaks(catchall))
++			ctx->xbreak = true;
++	}
++	if (!catchall || nft_probe_set_dynamic(set))
++		ctx->xbreak = true;
++	return NFT_PROBE_VERDICTS;
++}
++
++static enum nft_probe_res nft_probe_lookup(struct nft_probe_ctx *ctx,
++					   const struct nft_expr *expr,
++					   struct nft_verdict *v)
++{
++	const struct nft_lookup *priv = nft_expr_priv(expr);
++	const struct nft_set *set = priv->set;
++	const struct nft_set_ext *ext;
++	const struct nft_data *data;
++	bool found;
++
++	if (!nft_probe_span(priv->sreg, set->klen))
++		return nft_probe_stop(ctx, -EINVAL);
++
++	if (!nft_probe_set_dynamic(set) &&
++	    nft_probe_known(&ctx->regs, priv->sreg, set->klen)) {
++		/* As nft_lookup_eval() does. */
++		ext = nft_set_do_lookup(ctx->net, set,
++					&ctx->regs.data[priv->sreg]);
++		if (!ext)
++			ext = nft_set_catchall_lookup(ctx->net, set);
++		found = !!ext ^ priv->invert;
++		if (!found)
++			return NFT_PROBE_NOMATCH;
++		if (!ext)
++			return NFT_PROBE_MATCH;
++		if (nft_probe_elem_breaks(ext))
++			ctx->xbreak = true;
++		if (!priv->dreg_set)
++			return NFT_PROBE_MATCH;
++		data = nft_set_ext_data(ext);
++		if (priv->dreg == NFT_REG_VERDICT) {
++			*v = data->verdict;
++			return NFT_PROBE_VERDICT;
++		}
++		if (!nft_probe_put(ctx, priv->dreg, set->dlen, data, NULL))
++			return NFT_PROBE_STOP;
++		return NFT_PROBE_MATCH;
++	}
++
++	if (priv->dreg_set && priv->dreg == NFT_REG_VERDICT)
++		return nft_probe_vmap(ctx, priv);
++	/* An inverted lookup of a set every key is in, for good, never
++	 * matches; any other may go either way.
++	 */
++	if (priv->invert && !nft_probe_set_dynamic(set) &&
++	    nft_set_catchall_lookup(ctx->net, set))
++		return NFT_PROBE_NOMATCH;
++	if (priv->dreg_set &&
++	    !nft_probe_put_unknown(ctx, priv->dreg, set->dlen))
++		return NFT_PROBE_STOP;
++	return NFT_PROBE_EITHER;
++}
++
++/* Stateful objects: counters and timeout policies only annotate, limits and
++ * quotas may break the rule. A conntrack helper parses, rewrites and drops
++ * in software what an offload would carry past it, and a secmark labels the
++ * packet: both are effects, told apart by the object. The rest are not
++ * modelled. @site is the object, NULL when which one is not known.
++ */
++static enum nft_probe_res nft_probe_obj_type(struct nft_probe_ctx *ctx,
++					     u32 type, const void *site,
++					     struct nft_probe_state *st)
++{
++	switch (type) {
++	case NFT_OBJECT_COUNTER:
++	case NFT_OBJECT_CT_TIMEOUT:
++		return NFT_PROBE_MATCH;
++	case NFT_OBJECT_QUOTA:
++	case NFT_OBJECT_LIMIT:
++		return NFT_PROBE_EITHER;
++	case NFT_OBJECT_CT_HELPER:
++	case NFT_OBJECT_SECMARK:
++		if (!site)
++			return nft_probe_opaque(ctx);
++		nft_probe_fold(st, NFT_PROBE_FX_OBJ, type, site, NULL, 0);
++		return NFT_PROBE_MATCH;
++	default:
++		return nft_probe_opaque(ctx);
++	}
++}
++
++static enum nft_probe_res nft_probe_objref(struct nft_probe_ctx *ctx,
++					   const struct nft_expr *expr,
++					   struct nft_probe_state *st)
++{
++	const struct nft_objref_map *map;
++	const struct nft_set_ext *ext;
++	const struct nft_object *obj;
++
++	if (expr->ops->eval == nft_objref_eval) {
++		obj = nft_expr_obj(expr);
++		return nft_probe_obj_type(ctx, obj->ops->type->type, obj, st);
++	}
++	if (expr->ops->eval != nft_objref_map_eval)
++		return nft_probe_opaque(ctx);
++
++	map = nft_expr_priv(expr);
++	if (!nft_probe_span(map->sreg, map->set->klen))
++		return nft_probe_stop(ctx, -EINVAL);
++	if (nft_probe_set_dynamic(map->set) ||
++	    !nft_probe_known(&ctx->regs, map->sreg, map->set->klen)) {
++		/* Which object is unknown, and maybe none: harmless only if
++		 * all of them are.
++		 */
++		if (nft_probe_obj_type(ctx, map->set->objtype, NULL, st) ==
++		    NFT_PROBE_STOP)
++			return NFT_PROBE_STOP;
++		return NFT_PROBE_EITHER;
++	}
++	ext = nft_set_do_lookup(ctx->net, map->set,
++				&ctx->regs.data[map->sreg]);
++	if (!ext)
++		ext = nft_set_catchall_lookup(ctx->net, map->set);
++	if (!ext)
++		return NFT_PROBE_NOMATCH;
++	obj = *nft_set_ext_obj(ext);
++	return nft_probe_obj_type(ctx, obj->ops->type->type, obj, st);
++}
++
++/* Statements that end the chain. */
++
++/* Whether the registers a translation takes its range from are known. They
++ * may have been stored by an earlier rule, and each rule starts with none
++ * known, so a range carried across rules is not.
++ */
++static bool nft_probe_range_known(const struct nft_probe_ctx *ctx, u8 min,
++				  u8 max, unsigned int len)
++{
++	return !min || (nft_probe_known(&ctx->regs, min, len) &&
++			nft_probe_known(&ctx->regs, max, len));
++}
++
++static enum nft_probe_res nft_probe_nat(struct nft_probe_ctx *ctx,
++					const struct nft_expr *expr,
++					const char *name,
++					struct nft_probe_state *st)
++{
++	bool known;
++
++	if (!strcmp(name, "nat")) {
++		const struct nft_nat *priv = nft_expr_priv(expr);
++
++		/* In an inet table, a translation for the other family is
++		 * skipped and the rule goes on (nft_nat_inet_eval()).
++		 */
++		if (priv->family != NFPROTO_INET && priv->family != ctx->pf)
++			return NFT_PROBE_MATCH;
++		known = nft_probe_range_known(ctx, priv->sreg_addr_min,
++					      priv->sreg_addr_max,
++					      priv->family == NFPROTO_IPV4 ?
++					      sizeof(struct in_addr) :
++					      sizeof(struct in6_addr)) &&
++			nft_probe_range_known(ctx, priv->sreg_proto_min,
++					      priv->sreg_proto_max, sizeof(u16));
++	} else if (!strcmp(name, "masq")) {
++		const struct nft_masq *priv = nft_expr_priv(expr);
++
++		known = nft_probe_range_known(ctx, priv->sreg_proto_min,
++					      priv->sreg_proto_max, sizeof(u16));
++	} else {
++		const struct nft_redir *priv = nft_expr_priv(expr);
++
++		known = nft_probe_range_known(ctx, priv->sreg_proto_min,
++					      priv->sreg_proto_max, sizeof(u16));
++	}
++	if (!known ||
++	    (ctx->hook != NFT_PROBE_PRE && ctx->hook != NFT_PROBE_POST))
++		return nft_probe_opaque(ctx);
++
++	st->flags |= ctx->hook == NFT_PROBE_PRE ? NFT_PROBE_DNAT :
++						  NFT_PROBE_SNAT;
++	nft_probe_fold(st, NFT_PROBE_FX_NAT, 0, expr, NULL, 0);
++	return NFT_PROBE_ACCEPTED;
++}
++
++static bool nft_probe_named(const char *name, const char * const *names,
++			    unsigned int n)
++{
++	unsigned int i;
++
++	for (i = 0; i < n; i++)
++		if (!strcmp(name, names[i]))
++			return true;
++	return false;
++}
++
++/* Loads of what the probe does not model, into a register it cannot see. */
++static const char * const nft_probe_loads[] = {
++	"numgen", "hash", "fib", "socket", "osf", "xfrm", "tunnel",
++};
++
++/* Statements that may break the rule and decide nothing else: limits and
++ * quotas once their budget is spent, and the like.
++ */
++static const char * const nft_probe_breaks[] = {
++	"limit", "quota", "connlimit", "flow_offload",
++};
++
++/* Not inlined: the handlers' buffers stay out of the frames nft_probe_rule()
++ * keeps across jumps.
++ */
++static noinline enum nft_probe_res nft_probe_expr(struct nft_probe_ctx *ctx,
++						  const struct nft_expr *expr,
++						  struct nft_probe_state *st,
++						  struct nft_verdict *v)
++{
++	const struct nft_expr_ops *ops = expr->ops;
++	const struct nft_expr_type *type = ops->type;
++	const char *name;
++
++	if (ops == &nft_cmp_fast_ops)
++		return nft_probe_cmp_fast(ctx, expr);
++	if (ops == &nft_cmp16_fast_ops)
++		return nft_probe_cmp16_fast(ctx, expr);
++	if (ops == &nft_bitwise_fast_ops)
++		return nft_probe_bitwise_fast(ctx, expr);
++	if (type == &nft_payload_type)
++		return nft_probe_payload(ctx, expr);
++	if (type == &nft_cmp_type)
++		return nft_probe_cmp(ctx, expr);
++	if (type == &nft_imm_type)
++		return nft_probe_immediate(ctx, expr, v);
++	if (type == &nft_bitwise_type)
++		return nft_probe_bitwise(ctx, expr);
++	if (type == &nft_byteorder_type)
++		return nft_probe_byteorder(ctx, expr);
++	if (type == &nft_range_type)
++		return nft_probe_range(ctx, expr);
++	if (type == &nft_lookup_type)
++		return nft_probe_lookup(ctx, expr, v);
++	if (type == &nft_meta_type) {
++		if (ops->eval == nft_meta_get_eval)
++			return nft_probe_meta_get(ctx, expr, st);
++		if (ops->eval == nft_meta_set_eval)
++			return nft_probe_meta_set(ctx, expr, st);
++		return nft_probe_opaque(ctx);
++	}
++	if (type == &nft_objref_type)
++		return nft_probe_objref(ctx, expr, st);
++	if (type == &nft_counter_type || type == &nft_last_type)
++		return NFT_PROBE_MATCH;
++	if (type == &nft_dynset_type) {
++		/* It may fail, or a meter's own limit break; and what it
++		 * adds or deletes changes what later packets find, so a
++		 * path through it is not one that skips it.
++		 */
++		nft_probe_fold(st, NFT_PROBE_FX_DYNSET, 0, expr, NULL, 0);
++		return NFT_PROBE_EITHER;
++	}
++	if (type == &nft_rt_type) {
++		nft_probe_clobber(ctx);
++		return NFT_PROBE_EITHER;
++	}
++	/* exthdr may mangle as well as load; inner reparses the packet. */
++	if (type == &nft_exthdr_type || type == &nft_inner_type)
++		return nft_probe_opaque(ctx);
++
++	/* Types that live in modules of their own. */
++	name = type->name;
++	if (!strcmp(name, "ct"))
++		return nft_probe_ct(ctx, expr, st);
++	if (!strcmp(name, "log"))
++		return NFT_PROBE_MATCH;
++	if (nft_probe_named(name, nft_probe_loads,
++			    ARRAY_SIZE(nft_probe_loads))) {
++		nft_probe_clobber(ctx);
++		return NFT_PROBE_EITHER;
++	}
++	if (nft_probe_named(name, nft_probe_breaks,
++			    ARRAY_SIZE(nft_probe_breaks)))
++		return NFT_PROBE_EITHER;
++	if (!strcmp(name, "nat") || !strcmp(name, "masq") ||
++	    !strcmp(name, "redir"))
++		return nft_probe_nat(ctx, expr, name, st);
++	/* reject, queue, notrack, fwd, dup, tproxy, synproxy, xt match and
++	 * target, and whatever is not listed here.
++	 */
++	return nft_probe_opaque(ctx);
++}
++
++/* Chains. */
++
++/* A path accepted. Every path through one base chain has to accept with the
++ * same state.
++ */
++static void nft_probe_accept(struct nft_probe_ctx *ctx,
++			     const struct nft_probe_state *st)
++{
++	if (!ctx->have_outcome) {
++		ctx->outcome = *st;
++		ctx->have_outcome = true;
++		return;
++	}
++	if (!nft_probe_state_eq(&ctx->outcome, st))
++		nft_probe_stop(ctx, 1);
++}
++
++static void nft_probe_chain(struct nft_probe_ctx *ctx,
++			    const struct nft_chain *chain, unsigned int depth);
++
++/* Jump or go to @chain with @st; the states it returns go to @into. This and
++ * nft_probe_verdict() fold into nft_probe_chain(), so that each level of
++ * nesting costs the walk one frame.
++ */
++static __always_inline void nft_probe_call(struct nft_probe_ctx *ctx,
++					   const struct nft_chain *chain,
++					   const struct nft_probe_state *st,
++					   unsigned int depth,
++					   struct nft_probe_set *into)
++{
++	struct nft_probe_frame *callee;
++	unsigned int i;
++
++	if (depth + 1 >= NFT_PROBE_FRAMES) {
++		nft_probe_stop(ctx, -EMLINK);
++		return;
++	}
++	callee = &ctx->frame[depth + 1];
++	callee->cur.n = 0;
++	nft_probe_add(ctx, &callee->cur, st);
++	nft_probe_chain(ctx, chain, depth + 1);
++	if (ctx->stop)
++		return;
++	for (i = 0; i < callee->ret.n; i++)
++		nft_probe_add(ctx, into, &callee->ret.s[i]);
++}
++
++/* Apply the verdict a rule ended with, as nft_do_chain() does. */
++static __always_inline void nft_probe_verdict(struct nft_probe_ctx *ctx,
++					      const struct nft_verdict *v,
++					      const struct nft_probe_state *st,
++					      unsigned int depth)
++{
++	struct nft_probe_frame *f = &ctx->frame[depth];
++
++	switch (v->code) {
++	case NFT_CONTINUE:
++	case NFT_BREAK:
++		nft_probe_add(ctx, &f->next, st);
++		return;
++	case NFT_RETURN:
++		nft_probe_add(ctx, &f->ret, st);
++		return;
++	case NFT_JUMP:
++		nft_probe_call(ctx, v->chain, st, depth, &f->next);
++		return;
++	case NFT_GOTO:
++		nft_probe_call(ctx, v->chain, st, depth, &f->ret);
++		return;
++	}
++
++	switch (v->code & NF_VERDICT_MASK) {
++	case NF_ACCEPT:
++		nft_probe_accept(ctx, st);
++		return;
++	case NF_DROP:
++		nft_probe_dropped(ctx);
++		return;
++	default:
++		/* Queue hands the verdict to userspace. */
++		nft_probe_opaque(ctx);
++		return;
++	}
++}
++
++/* Walk one rule for the state in ctx->frame[depth].st. */
++static void nft_probe_rule(struct nft_probe_ctx *ctx,
++			   const struct nft_rule_dp *rule, unsigned int depth)
++{
++	struct nft_probe_frame *f = &ctx->frame[depth];
++	const struct nft_expr *expr, *last;
++	unsigned int base = ctx->vtop, i;
++	enum nft_probe_res r;
++
++	memset(ctx->regs.known, 0, sizeof(ctx->regs.known));
++	ctx->vbase = base;
++	f->v.code = NFT_CONTINUE;
++	f->v.chain = NULL;
++
++	last = (const struct nft_expr *)&rule->data[rule->dlen];
++	for (expr = (const struct nft_expr *)rule->data; expr != last;
++	     expr = nft_expr_next(expr)) {
++		ctx->xbreak = false;
++		r = nft_probe_expr(ctx, expr, &f->st, &f->v);
++		/* The packets it does not let through go on to the next rule,
++		 * with what the rule did to them so far.
++		 */
++		if (r == NFT_PROBE_EITHER || r == NFT_PROBE_NOMATCH ||
++		    (ctx->xbreak && r != NFT_PROBE_STOP))
++			nft_probe_add(ctx, &f->next, &f->st);
++
++		switch (r) {
++		case NFT_PROBE_MATCH:
++		case NFT_PROBE_EITHER:
++		case NFT_PROBE_VERDICT:
++			break;
++		case NFT_PROBE_NOMATCH:
++		case NFT_PROBE_STOP:
++			return;
++		case NFT_PROBE_VERDICTS:
++			/* A continue from the map would go on with the rest of
++			 * the rule: fine when the map is the rule's end. The
++			 * verdicts stay put below ctx->vtop while each is
++			 * followed.
++			 */
++			for (i = base; i < ctx->vtop && !ctx->stop; i++) {
++				if (ctx->vstack[i].code == NFT_CONTINUE &&
++				    nft_expr_next(expr) != last) {
++					nft_probe_opaque(ctx);
++					break;
++				}
++				nft_probe_verdict(ctx, &ctx->vstack[i], &f->st,
++						  depth);
++			}
++			ctx->vtop = base;
++			return;
++		case NFT_PROBE_ACCEPTED:
++			nft_probe_accept(ctx, &f->st);
++			return;
++		}
++		if (ctx->stop)
++			return;
++		if (f->v.code != NFT_CONTINUE)
++			break;
++	}
++	nft_probe_verdict(ctx, &f->v, &f->st, depth);
++}
++
++/* Walk @chain for the states in ctx->frame[depth].cur; the states that fall
++ * off its end or return are left in ctx->frame[depth].ret.
++ */
++static void nft_probe_chain(struct nft_probe_ctx *ctx,
++			    const struct nft_chain *chain, unsigned int depth)
++{
++	struct nft_probe_frame *f = &ctx->frame[depth];
++	const struct nft_rule_blob *blob;
++	const struct nft_rule_dp *rule;
++	unsigned int i;
++
++	f->ret.n = 0;
++	/* The rules of the current generation, as nft_do_chain() picks them. */
++	if (ctx->genbit)
++		blob = rcu_dereference(chain->blob_gen_1);
++	else
++		blob = rcu_dereference(chain->blob_gen_0);
++	if (!blob) {
++		nft_probe_stop(ctx, -EAGAIN);
++		return;
++	}
++
++	for (rule = (const struct nft_rule_dp *)blob->data;
++	     !rule->is_last && f->cur.n; rule = nft_rule_next(rule)) {
++		f->next.n = 0;
++		for (i = 0; i < f->cur.n; i++) {
++			if (++ctx->visits > NFT_PROBE_MAX_VISITS) {
++				nft_probe_stop(ctx, -E2BIG);
++				return;
++			}
++			f->st = f->cur.s[i];
++			nft_probe_rule(ctx, rule, depth);
++			if (ctx->stop)
++				return;
++		}
++		f->cur = f->next;
++	}
++	for (i = 0; i < f->cur.n; i++)
++		nft_probe_add(ctx, &f->ret, &f->cur.s[i]);
++}
++
++/* Walk a base chain for ctx->st. What every path accepted with is left in
++ * ctx->outcome.
++ */
++static void nft_probe_base_chain(struct nft_probe_ctx *ctx,
++				 const struct nft_chain *chain)
++{
++	struct nft_probe_frame *f = &ctx->frame[0];
++	unsigned int i;
++
++	ctx->have_outcome = false;
++	ctx->vtop = 0;
++	f->cur.n = 0;
++	nft_probe_add(ctx, &f->cur, &ctx->st);
++	nft_probe_chain(ctx, chain, 0);
++
++	/* Falling off the end and returning both take the policy. */
++	f->v.code = READ_ONCE(nft_base_chain(chain)->policy);
++	f->v.chain = NULL;
++	for (i = 0; i < f->ret.n && !ctx->stop; i++)
++		nft_probe_verdict(ctx, &f->v, &f->ret.s[i], 0);
++	if (!ctx->stop && !ctx->have_outcome)
++		nft_probe_stop(ctx, -EINVAL);
++}
++
++/* Hooks. */
++
++static bool nft_probe_on_dev(const struct nft_base_chain *basechain,
++			     const struct net_device *dev)
++{
++	const struct nft_hook *hook;
++
++	list_for_each_entry_rcu(hook, &basechain->hook_list, list)
++		if (hook->ops.dev == dev)
++			return true;
++	return false;
++}
++
++/* Whether @basechain of a table of @family runs at the hook being walked. */
++static bool nft_probe_at_hook(const struct nft_probe_ctx *ctx, int family,
++			      const struct nft_base_chain *basechain)
++{
++	unsigned int hooknum = basechain->ops.hooknum;
++
++	switch (ctx->hook) {
++	case NFT_PROBE_INGRESS:
++		if (family == NFPROTO_NETDEV)
++			return hooknum == NF_NETDEV_INGRESS &&
++			       nft_probe_on_dev(basechain, ctx->in);
++		return family == NFPROTO_INET && hooknum == NF_INET_INGRESS &&
++		       nft_probe_on_dev(basechain, ctx->in);
++	case NFT_PROBE_EGRESS:
++		return family == NFPROTO_NETDEV &&
++		       hooknum == NF_NETDEV_EGRESS &&
++		       nft_probe_on_dev(basechain, ctx->out);
++	case NFT_PROBE_PRE:
++		return family != NFPROTO_NETDEV &&
++		       hooknum == NF_INET_PRE_ROUTING;
++	case NFT_PROBE_FORWARD:
++		return family != NFPROTO_NETDEV && hooknum == NF_INET_FORWARD;
++	case NFT_PROBE_POST:
++		return family != NFPROTO_NETDEV &&
++		       hooknum == NF_INET_POST_ROUTING;
++	}
++	return false;
++}
++
++static bool nft_probe_before(const struct nft_probe_base *a,
++			     const struct nft_probe_base *b)
++{
++	return a->prio < b->prio || (a->prio == b->prio && a->sub < b->sub);
++}
++
++/* Two chains the hook may run in either order: netfilter orders equal
++ * priorities by registration, which the probe cannot see. NAT chains run
++ * from one hook, by their own priority.
++ */
++static bool nft_probe_tied(const struct nft_probe_base *a,
++			   const struct nft_probe_base *b)
++{
++	return a->prio == b->prio && (!(a->nat && b->nat) || a->sub == b->sub);
++}
++
++/* Whether @table's hooks are registered: not dormant. A transaction in
++ * flight registering or unregistering them makes it -EAGAIN.
++ */
++static int nft_probe_table_live(const struct nft_probe_ctx *ctx,
++				const struct nft_table *table)
++{
++	if (!nft_active_genmask(table, ctx->genmask))
++		return 0;
++	if (table->flags & ~NFT_TABLE_F_MASK)
++		return -EAGAIN;
++	return !(table->flags & NFT_TABLE_F_DORMANT);
++}
++
++/* Gather the base chains at the hook being walked, in the order it runs
++ * them. The tables are nf_tables' own: NAT chains are registered with the
++ * NAT core, not on the hook. Not inlined, so that its frame is gone before
++ * the walk nests.
++ */
++static noinline int nft_probe_collect(struct nft_probe_ctx *ctx)
++{
++	const struct nftables_pernet *nft_net = nft_pernet(ctx->net);
++	const struct nft_base_chain *basechain;
++	const struct nft_chain *chain;
++	const struct nft_table *table;
++	struct nft_probe_base *b;
++	unsigned int n = 0, i, j;
++	int live;
++
++	list_for_each_entry_rcu(table, &nft_net->tables, list) {
++		if (table->family != ctx->probe->family &&
++		    table->family != NFPROTO_INET &&
++		    table->family != NFPROTO_NETDEV)
++			continue;
++		live = nft_probe_table_live(ctx, table);
++		if (live < 0)
++			return live;
++		if (!live)
++			continue;
++
++		list_for_each_entry_rcu(chain, &table->chains, list) {
++			if (!nft_is_base_chain(chain) ||
++			    !nft_active_genmask(chain, ctx->genmask))
++				continue;
++			basechain = nft_base_chain(chain);
++			if (!nft_probe_at_hook(ctx, table->family, basechain))
++				continue;
++			if (n == NFT_PROBE_MAX_BASE)
++				return -E2BIG;
++
++			b = &ctx->base[n++];
++			b->chain = chain;
++			b->nat = basechain->type->type == NFT_CHAIN_T_NAT;
++			b->pf = table->family == NFPROTO_NETDEV ?
++				NFPROTO_NETDEV : ctx->probe->family;
++			b->sub = basechain->ops.priority;
++			b->prio = b->sub;
++			if (b->nat)
++				b->prio = ctx->hook == NFT_PROBE_PRE ?
++					  NF_IP_PRI_NAT_DST : NF_IP_PRI_NAT_SRC;
++		}
++	}
++
++	for (i = 1; i < n; i++) {
++		struct nft_probe_base cur = ctx->base[i];
++
++		for (j = i; j > 0 && nft_probe_before(&cur, &ctx->base[j - 1]);
++		     j--)
++			ctx->base[j] = ctx->base[j - 1];
++		ctx->base[j] = cur;
++	}
++	ctx->nbase = n;
++	return 0;
++}
++
++static enum nft_probe_ct nft_probe_ct_mode(const struct nft_probe_ctx *ctx,
++					   const struct nft_probe_base *b)
++{
++	/* One set of priorities serves both families. */
++	BUILD_BUG_ON((int)NF_IP_PRI_CONNTRACK != (int)NF_IP6_PRI_CONNTRACK);
++	BUILD_BUG_ON((int)NF_IP_PRI_NAT_DST != (int)NF_IP6_PRI_NAT_DST ||
++		     (int)NF_IP_PRI_NAT_SRC != (int)NF_IP6_PRI_NAT_SRC);
++
++	switch (ctx->hook) {
++	case NFT_PROBE_INGRESS:
++		return NFT_PROBE_CT_ABSENT;
++	case NFT_PROBE_PRE:
++		/* Conntrack attaches the entry at its own priority. */
++		if (b->prio < NF_IP_PRI_CONNTRACK)
++			return NFT_PROBE_CT_ABSENT;
++		if (b->prio == NF_IP_PRI_CONNTRACK)
++			return NFT_PROBE_CT_UNKNOWN;
++		return NFT_PROBE_CT_PRESENT;
++	case NFT_PROBE_EGRESS:
++		/* Whether conntrack runs for the family is not the netdev
++		 * table's to say.
++		 */
++		return NFT_PROBE_CT_UNKNOWN;
++	default:
++		return NFT_PROBE_CT_PRESENT;
++	}
++}
++
++/* Walk the hook for ctx->st: every base chain, in order, has to accept.
++ * ctx->st is what the packet carries on.
++ */
++static void nft_probe_hook(struct nft_probe_ctx *ctx, enum nft_probe_hook hook,
++			   const struct net_device *in,
++			   const struct net_device *out, unsigned int oif)
++{
++	u32 bound = hook == NFT_PROBE_PRE ? NFT_PROBE_DNAT : NFT_PROBE_SNAT;
++	unsigned int i;
++	int err;
++
++	ctx->hook = hook;
++	ctx->in = in;
++	ctx->out = out;
++	/* The input device at POST_ROUTING differs by family and path. */
++	ctx->in_unknown = hook == NFT_PROBE_POST;
++
++	err = nft_probe_collect(ctx);
++	if (err) {
++		nft_probe_stop(ctx, err);
++		return;
++	}
++
++	for (i = 0; i < ctx->nbase; i++) {
++		const struct nft_probe_base *b = &ctx->base[i];
++		struct nft_probe_state before;
++
++		if (ctx->steady) {
++			/* Later packets of the stream take the first one's
++			 * binding where the NAT hook runs, and skip its chains.
++			 */
++			if (hook == NFT_PROBE_PRE && ctx->nat_pre &&
++			    b->prio >= NF_IP_PRI_NAT_DST)
++				ctx->daddr_known = false;
++			if (hook == NFT_PROBE_POST && ctx->nat_post[oif] &&
++			    b->prio >= NF_IP_PRI_NAT_SRC)
++				ctx->saddr_known = false;
++			if (b->nat)
++				continue;
++		} else if (b->nat) {
++			/* Once a chain binds, the NAT core applies the binding
++			 * and asks no further chain.
++			 */
++			if (ctx->st.flags & bound)
++				continue;
++			ctx->nat_walked = true;
++		}
++
++		ctx->pf = b->pf;
++		ctx->ct = nft_probe_ct_mode(ctx, b);
++		before = ctx->st;
++		nft_probe_base_chain(ctx, b->chain);
++		if (ctx->stop)
++			return;
++		ctx->st = ctx->outcome;
++
++		/* What this chain changed, a chain it may run before or after
++		 * would read differently.
++		 */
++		if (ctx->st.mark != before.mark ||
++		    ctx->st.ctmark != before.ctmark ||
++		    ctx->st.flags != before.flags) {
++			if ((i > 0 && nft_probe_tied(b, b - 1)) ||
++			    (i + 1 < ctx->nbase && nft_probe_tied(b, b + 1))) {
++				nft_probe_stop(ctx, 1);
++				return;
++			}
++		}
++		/* A translation is applied as the chain accepts. */
++		if ((ctx->st.flags & ~before.flags) & NFT_PROBE_DNAT)
++			ctx->daddr_known = false;
++		if ((ctx->st.flags & ~before.flags) & NFT_PROBE_SNAT)
++			ctx->saddr_known = false;
++		if (ctx->st.flags & (NFT_PROBE_DNAT | NFT_PROBE_SNAT))
++			ctx->nat_seen = true;
++	}
++}
++
++/* Device stacks. */
++
++static bool nft_probe_bridged(const struct net_device *dev)
++{
++	return netif_is_bridge_master(dev) || netif_is_bridge_port(dev);
++}
++
++/* Gather the devices below @dev into ctx->lower. @vlans counts the VLAN
++ * devices above @dev on the way down: a frame keeps all their tags inline
++ * but the outermost, which the receive path moves into the skb, and a
++ * switch conduit sees its tag.
++ */
++static int nft_probe_lower_walk(struct nft_probe_ctx *ctx,
++				struct net_device *dev, unsigned int vlans,
++				unsigned int depth)
++{
++	struct net_device *lower;
++	struct list_head *iter;
++	unsigned int i;
++	int err;
++
++	if (depth > MAX_NEST_DEV)
++		return -E2BIG;
++	if (is_vlan_dev(dev))
++		vlans++;
++
++	iter = &dev->adj_list.lower;
++	while ((lower = netdev_next_lower_dev_rcu(dev, &iter))) {
++		for (i = 0; i < ctx->nlower && ctx->lower[i].dev != lower; i++)
++			;
++		if (i == ctx->nlower) {
++			if (ctx->nlower == NFT_PROBE_MAX_LOWER)
++				return -E2BIG;
++			ctx->lower[ctx->nlower++] =
++				(struct nft_probe_lower){ .dev = lower };
++		}
++		if (vlans > 1 || netdev_uses_dsa(lower))
++			ctx->lower[i].opaque = true;
++		err = nft_probe_lower_walk(ctx, lower, vlans, depth + 1);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
++/* Whether the probe can follow a frame through @dev. A device that is not
++ * Ethernet -- PPP, an IP tunnel, WireGuard -- carries the stream over an
++ * underlay it has no adjacency link to: the underlay device's hooks, and the
++ * outer packet's output and postrouting chains, are out of the walk. So does
++ * an Ethernet one with nothing under it but software -- VXLAN, geneve,
++ * gretap, veth -- which has neither a parent device nor a lower one. A bridge,
++ * a bond or a VLAN has its ports, slaves or real device as lower devices,
++ * which are walked in turn.
++ */
++static bool nft_probe_followed(const struct net_device *dev)
++{
++	if (dev->type != ARPHRD_ETHER)
++		return false;
++	return dev->dev.parent || !list_empty(&dev->adj_list.lower);
++}
++
++/* The netdev hooks of the devices below @top: a frame is received through,
++ * or its copies sent out through, one or more of them before or after @top's
++ * own. Each is walked on its own and has to accept and change nothing a later
++ * chain reads: the order a stack runs them in is not modelled.
++ */
++static void nft_probe_below(struct nft_probe_ctx *ctx, enum nft_probe_hook hook,
++			    const struct net_device *top, unsigned int oif)
++{
++	const struct net_device *dev;
++	unsigned int i;
++	int err;
++
++	ctx->below = ctx->st;
++
++	if (!nft_probe_followed(top)) {
++		nft_probe_stop(ctx, 1);
++		return;
++	}
++	if (nft_probe_bridged(top))
++		ctx->bridged = true;
++
++	/* netdev_next_lower_dev_rcu() only reads the adjacency lists. */
++	ctx->nlower = 0;
++	err = nft_probe_lower_walk(ctx, (struct net_device *)top, 0, 0);
++	if (err) {
++		nft_probe_stop(ctx, err);
++		return;
++	}
++
++	for (i = 0; i < ctx->nlower; i++) {
++		dev = ctx->lower[i].dev;
++		if (!nft_probe_followed(dev)) {
++			nft_probe_stop(ctx, 1);
++			return;
++		}
++		if (nft_probe_bridged(dev))
++			ctx->bridged = true;
++		ctx->opaque = ctx->lower[i].opaque;
++		if (hook == NFT_PROBE_INGRESS)
++			nft_probe_hook(ctx, hook, dev, NULL, oif);
++		else
++			nft_probe_hook(ctx, hook, NULL, dev, oif);
++		ctx->opaque = false;
++		if (ctx->stop)
++			return;
++		if (!nft_probe_state_eq(&ctx->st, &ctx->below)) {
++			nft_probe_stop(ctx, 1);
++			return;
++		}
++	}
++}
++
++/* Bridge family chains see what a bridge carries, routed copies it sends out
++ * included, and the probe does not walk them: any of them makes a stream
++ * through a bridge dependent.
++ */
++static void nft_probe_bridge_chains(struct nft_probe_ctx *ctx)
++{
++	const struct nftables_pernet *nft_net = nft_pernet(ctx->net);
++	const struct nft_table *table;
++	const struct nft_chain *chain;
++	int live;
++
++	list_for_each_entry_rcu(table, &nft_net->tables, list) {
++		if (table->family != NFPROTO_BRIDGE)
++			continue;
++		live = nft_probe_table_live(ctx, table);
++		if (live < 0) {
++			nft_probe_stop(ctx, live);
++			return;
++		}
++		if (!live)
++			continue;
++		list_for_each_entry_rcu(chain, &table->chains, list) {
++			if (nft_is_base_chain(chain) &&
++			    nft_active_genmask(chain, ctx->genmask)) {
++				nft_probe_stop(ctx, 1);
++				return;
++			}
++		}
++	}
++}
++
++/* Packets. */
++
++/* Follow one packet of the stream: ingress up the input's stack and
++ * prerouting once, then forward, postrouting and egress down each output's
++ * stack for each copy. Returns the conntrack mark the packet leaves on the
++ * entry.
++ */
++static u32 nft_probe_packet(struct nft_probe_ctx *ctx, u32 ctmark)
++{
++	const struct nft_port_probe *p = ctx->probe;
++	struct nft_probe_state pre;
++	bool saddr_known, daddr_known;
++	u32 left;
++	unsigned int i;
++
++	ctx->st = (struct nft_probe_state){ .ctmark = ctmark };
++	ctx->saddr_known = true;
++	ctx->daddr_known = true;
++
++	nft_probe_below(ctx, NFT_PROBE_INGRESS, p->in, 0);
++	if (ctx->stop)
++		return ctmark;
++	nft_probe_hook(ctx, NFT_PROBE_INGRESS, p->in, NULL, 0);
++	if (ctx->stop)
++		return ctmark;
++	nft_probe_hook(ctx, NFT_PROBE_PRE, p->in, NULL, 0);
++	if (ctx->stop)
++		return ctmark;
++	if (!ctx->steady)
++		ctx->nat_pre = ctx->st.flags & NFT_PROBE_DNAT;
++
++	pre = ctx->st;
++	saddr_known = ctx->saddr_known;
++	daddr_known = ctx->daddr_known;
++	left = pre.ctmark;
++	for (i = 0; i < p->nout; i++) {
++		ctx->st = pre;
++		ctx->saddr_known = saddr_known;
++		ctx->daddr_known = daddr_known;
++
++		nft_probe_hook(ctx, NFT_PROBE_FORWARD, p->in, p->out[i], i);
++		if (ctx->stop)
++			return ctmark;
++		nft_probe_hook(ctx, NFT_PROBE_POST, NULL, p->out[i], i);
++		if (ctx->stop)
++			return ctmark;
++		if (!ctx->steady) {
++			ctx->nat_post[i] = ctx->st.flags & NFT_PROBE_SNAT;
++			/* The copies share one entry: the NAT chains of the
++			 * first one out bind it for all, and which copy is
++			 * first is not modelled.
++			 */
++			if (ctx->nat_post[i] && p->nout > 1) {
++				nft_probe_stop(ctx, 1);
++				return ctmark;
++			}
++		}
++		nft_probe_hook(ctx, NFT_PROBE_EGRESS, NULL, p->out[i], i);
++		if (ctx->stop)
++			return ctmark;
++		nft_probe_below(ctx, NFT_PROBE_EGRESS, p->out[i], i);
++		if (ctx->stop)
++			return ctmark;
++
++		/* The copies share one entry, one after the other: what one
++		 * copy's chains write there, the next one's read.
++		 */
++		if (ctx->st.ctmark != pre.ctmark) {
++			if (p->nout > 1) {
++				nft_probe_stop(ctx, 1);
++				return ctmark;
++			}
++			left = ctx->st.ctmark;
++		}
++	}
++	return left;
++}
++
++/* NAT chains see the first packet of a stream alone, and a conntrack mark
++ * outlives the packet that set it. Follow the first packet, then later ones
++ * -- without the NAT chains, with the first one's binding -- until one starts
++ * with the conntrack mark its predecessor left.
++ */
++static void nft_probe_stream(struct nft_probe_ctx *ctx)
++{
++	u32 ctmark = 0, left;
++	unsigned int pass;
++
++	for (pass = 0; pass < NFT_PROBE_MAX_PASSES; pass++) {
++		ctx->steady = pass > 0;
++		left = nft_probe_packet(ctx, ctmark);
++		if (ctx->stop)
++			return;
++		if (!ctx->steady && ctx->bridged) {
++			nft_probe_bridge_chains(ctx);
++			if (ctx->stop)
++				return;
++		}
++		if (left == ctmark && (ctx->steady || !ctx->nat_walked))
++			return;
++		ctmark = left;
++	}
++	nft_probe_stop(ctx, -E2BIG);
++}
++
++/**
++ * nft_port_dependent - whether a UDP stream's fate could depend on its ports
++ * @net: the network namespace the stream is forwarded in
++ * @probe: the stream, all but its ports
++ *
++ * Evaluates the nf_tables ruleset in force for a forwarded UDP stream whose
++ * source and destination ports are unknown and everything else about it is
++ * as @probe says (see struct nft_port_probe for what the caller vouches for):
++ * it arrives on @probe->in, copies leave through each of @probe->out, it is
++ * conntracked as new with no reply, and it carries no mark. The chains walked
++ * are netdev ingress on the input device and the devices below it,
++ * prerouting (filter and NAT alike), then forward, postrouting and netdev
++ * egress on each output and the devices below it; ip or ip6 tables as the
++ * family says, and inet ones. The first packet of the stream is followed,
++ * then later ones as far as NAT chains and conntrack marks make them differ.
++ *
++ * Return: 0 when every path accepts the stream at every hook, for every
++ * output, with the same effects and no translation; 1 when two streams
++ * differing in ports may fare differently, when some path drops, when the
++ * stream is translated, when a device in either stack is one the walk cannot
++ * follow, or when something they cross is not modelled; negative when the
++ * ruleset could not be judged -- more work than the bounds allow (-E2BIG), a
++ * commit before or during the walk (-EAGAIN), no memory -- or the probe is
++ * malformed, no outputs included (-EINVAL). Callers treat negative as 1.
++ *
++ * Context: process or softirq, under rcu_read_lock(); it does not sleep. The
++ * answer is for the ruleset generation it ran against, which no commit
++ * changed while it ran: a caller that caches it asks again after the next.
++ */
++int nft_port_dependent(struct net *net, const struct nft_port_probe *probe)
++{
++	struct nft_probe_ctx *ctx;
++	unsigned int i, seq;
++	u8 cursor;
++	int ret;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
++			 "ruleset probed outside rcu_read_lock()");
++
++	/* A stream that leaves nowhere is not one to judge. */
++	if (!probe || !probe->in ||
++	    (probe->family != NFPROTO_IPV4 && probe->family != NFPROTO_IPV6) ||
++	    !probe->nout || probe->nout > NFT_PROBE_MAX_OUT || !probe->out)
++		return -EINVAL;
++	for (i = 0; i < probe->nout; i++)
++		if (!probe->out[i])
++			return -EINVAL;
++
++	/* The generation walked, bracketed: a commit bumps base_seq with a
++	 * release store while its applying mark is up, and drops the mark
++	 * once everything a packet sees of it is in place.
++	 */
++	seq = smp_load_acquire(&net->nft.base_seq);
++	if (nft_commit_in_progress(net))
++		return -EAGAIN;
++
++	/* From a slab cache: a page allocation this large may fail without
++	 * waiting.
++	 */
++	BUILD_BUG_ON(sizeof(*ctx) > KMALLOC_MAX_CACHE_SIZE);
++	ctx = kzalloc(sizeof(*ctx), GFP_NOWAIT | __GFP_NOWARN);
++	if (!ctx)
++		return -ENOMEM;
++
++	cursor = READ_ONCE(net->nft.gencursor);
++	ctx->net = net;
++	ctx->probe = probe;
++	ctx->genbit = cursor;
++	ctx->genmask = 1 << cursor;
++
++	nft_probe_stream(ctx);
++
++	/* A translation, however unconditional, is one an offload that keys
++	 * the stream on its addresses and sends it on as it arrived does not
++	 * apply; and one that rewrites the ports alone leaves the addresses it
++	 * keys on as they were.
++	 */
++	ret = ctx->stop;
++	if (!ret && ctx->nat_seen)
++		ret = 1;
++	kfree(ctx);
++
++	if (nft_commit_in_progress(net))
++		return -EAGAIN;
++	/* Pairs with the release store in nf_tables_commit(), as the load
++	 * above does: a commit that ran while the walk did shows here.
++	 */
++	if (smp_load_acquire(&net->nft.base_seq) != seq)
++		return -EAGAIN;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(nft_port_dependent);
+diff --git a/net/netfilter/nft_bitwise.c b/net/netfilter/nft_bitwise.c
+index 0fc21b729eba..b3fbff4484de 100644
+--- a/net/netfilter/nft_bitwise.c
++++ b/net/netfilter/nft_bitwise.c
+@@ -15,16 +15,6 @@
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_offload.h>
+ 
+-struct nft_bitwise {
+-	u8			sreg;
+-	u8			dreg;
+-	enum nft_bitwise_ops	op:8;
+-	u8			len;
+-	struct nft_data		mask;
+-	struct nft_data		xor;
+-	struct nft_data		data;
+-};
+-
+ static void nft_bitwise_eval_mask_xor(u32 *dst, const u32 *src,
+ 				      const struct nft_bitwise *priv)
+ {
+diff --git a/net/netfilter/nft_byteorder.c b/net/netfilter/nft_byteorder.c
+index 744878773dac..dcc724e69b94 100644
+--- a/net/netfilter/nft_byteorder.c
++++ b/net/netfilter/nft_byteorder.c
+@@ -15,14 +15,6 @@
+ #include <net/netfilter/nf_tables_core.h>
+ #include <net/netfilter/nf_tables.h>
+ 
+-struct nft_byteorder {
+-	u8			sreg;
+-	u8			dreg;
+-	enum nft_byteorder_ops	op:8;
+-	u8			len;
+-	u8			size;
+-};
+-
+ void nft_byteorder_eval(const struct nft_expr *expr,
+ 			struct nft_regs *regs,
+ 			const struct nft_pktinfo *pkt)
+diff --git a/net/netfilter/nft_cmp.c b/net/netfilter/nft_cmp.c
+index b61dc9c3383e..8f93d7254d61 100644
+--- a/net/netfilter/nft_cmp.c
++++ b/net/netfilter/nft_cmp.c
+@@ -16,13 +16,6 @@
+ #include <net/netfilter/nf_tables_offload.h>
+ #include <net/netfilter/nf_tables.h>
+ 
+-struct nft_cmp_expr {
+-	struct nft_data		data;
+-	u8			sreg;
+-	u8			len;
+-	enum nft_cmp_ops	op:8;
+-};
+-
+ void nft_cmp_eval(const struct nft_expr *expr,
+ 		  struct nft_regs *regs,
+ 		  const struct nft_pktinfo *pkt)
+diff --git a/net/netfilter/nft_ct.c b/net/netfilter/nft_ct.c
+index 277fc60c3372..a26514238ead 100644
+--- a/net/netfilter/nft_ct.c
++++ b/net/netfilter/nft_ct.c
+@@ -389,6 +389,7 @@ static int nft_ct_get_init(const struct nft_ctx *ctx,
+ 
+ 	priv->key = ntohl(nla_get_be32(tb[NFTA_CT_KEY]));
+ 	priv->dir = IP_CT_DIR_MAX;
++	priv->store = false;
+ 	switch (priv->key) {
+ 	case NFT_CT_DIRECTION:
+ 		if (tb[NFTA_CT_DIRECTION] != NULL)
+@@ -548,6 +549,7 @@ static int nft_ct_set_init(const struct nft_ctx *ctx,
+ 
+ 	priv->dir = IP_CT_DIR_MAX;
+ 	priv->key = ntohl(nla_get_be32(tb[NFTA_CT_KEY]));
++	priv->store = true;
+ 	switch (priv->key) {
+ #ifdef CONFIG_NF_CONNTRACK_MARK
+ 	case NFT_CT_MARK:
+diff --git a/net/netfilter/nft_dynset.c b/net/netfilter/nft_dynset.c
+index 0d78de9d2d75..6fc6408481c1 100644
+--- a/net/netfilter/nft_dynset.c
++++ b/net/netfilter/nft_dynset.c
+@@ -335,6 +335,11 @@ static int nft_dynset_init(const struct nft_ctx *ctx,
+ 	if (set->size == 0)
+ 		set->size = 0xffff;
+ 
++	/* Whatever its flags, the set now changes without a commit: see
++	 * nft_port_dependent().
++	 */
++	WRITE_ONCE(set->packet_updated, true);
++
+ 	priv->set = set;
+ 	return 0;
+ 
+diff --git a/net/netfilter/nft_lookup.c b/net/netfilter/nft_lookup.c
+index 699254cb3ecd..b7a7f6a40d79 100644
+--- a/net/netfilter/nft_lookup.c
++++ b/net/netfilter/nft_lookup.c
+@@ -15,15 +15,6 @@
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_core.h>
+ 
+-struct nft_lookup {
+-	struct nft_set			*set;
+-	u8				sreg;
+-	u8				dreg;
+-	bool				dreg_set;
+-	bool				invert;
+-	struct nft_set_binding		binding;
+-};
+-
+ static const struct nft_set_ext *
+ __nft_set_do_lookup(const struct net *net, const struct nft_set *set,
+ 		    const u32 *key)
+diff --git a/net/netfilter/nft_masq.c b/net/netfilter/nft_masq.c
+index 2b01128737a3..e8d471eecfc9 100644
+--- a/net/netfilter/nft_masq.c
++++ b/net/netfilter/nft_masq.c
+@@ -12,12 +12,7 @@
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_nat.h>
+ #include <net/netfilter/nf_nat_masquerade.h>
+-
+-struct nft_masq {
+-	u32			flags;
+-	u8			sreg_proto_min;
+-	u8			sreg_proto_max;
+-};
++#include <net/netfilter/nft_nat.h>
+ 
+ static const struct nla_policy nft_masq_policy[NFTA_MASQ_MAX + 1] = {
+ 	[NFTA_MASQ_FLAGS]		=
+diff --git a/net/netfilter/nft_nat.c b/net/netfilter/nft_nat.c
+index e32cd9fbc7c2..586ed2014380 100644
+--- a/net/netfilter/nft_nat.c
++++ b/net/netfilter/nft_nat.c
+@@ -18,18 +18,9 @@
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_nat.h>
+ #include <net/netfilter/nf_tables.h>
++#include <net/netfilter/nft_nat.h>
+ #include <net/ip.h>
+ 
+-struct nft_nat {
+-	u8			sreg_addr_min;
+-	u8			sreg_addr_max;
+-	u8			sreg_proto_min;
+-	u8			sreg_proto_max;
+-	enum nf_nat_manip_type  type:8;
+-	u8			family;
+-	u16			flags;
+-};
+-
+ static void nft_nat_setup_addr(struct nf_nat_range2 *range,
+ 			       const struct nft_regs *regs,
+ 			       const struct nft_nat *priv)
+diff --git a/net/netfilter/nft_objref.c b/net/netfilter/nft_objref.c
+index 633cce69568f..82b012e865cd 100644
+--- a/net/netfilter/nft_objref.c
++++ b/net/netfilter/nft_objref.c
+@@ -125,12 +125,6 @@ static const struct nft_expr_ops nft_objref_ops = {
+ 	.validate	= nft_objref_validate,
+ };
+ 
+-struct nft_objref_map {
+-	struct nft_set		*set;
+-	u8			sreg;
+-	struct nft_set_binding	binding;
+-};
+-
+ void nft_objref_map_eval(const struct nft_expr *expr,
+ 			 struct nft_regs *regs,
+ 			 const struct nft_pktinfo *pkt)
+diff --git a/net/netfilter/nft_range.c b/net/netfilter/nft_range.c
+index cbb02644b836..adf2d4aea6e8 100644
+--- a/net/netfilter/nft_range.c
++++ b/net/netfilter/nft_range.c
+@@ -12,14 +12,6 @@
+ #include <net/netfilter/nf_tables_core.h>
+ #include <net/netfilter/nf_tables.h>
+ 
+-struct nft_range_expr {
+-	struct nft_data		data_from;
+-	struct nft_data		data_to;
+-	u8			sreg;
+-	u8			len;
+-	enum nft_range_ops	op:8;
+-};
+-
+ void nft_range_eval(const struct nft_expr *expr,
+ 		    struct nft_regs *regs, const struct nft_pktinfo *pkt)
+ {
+diff --git a/net/netfilter/nft_redir.c b/net/netfilter/nft_redir.c
+index 58ae802db8f5..36864002a3c8 100644
+--- a/net/netfilter/nft_redir.c
++++ b/net/netfilter/nft_redir.c
+@@ -12,12 +12,7 @@
+ #include <net/netfilter/nf_nat.h>
+ #include <net/netfilter/nf_nat_redirect.h>
+ #include <net/netfilter/nf_tables.h>
+-
+-struct nft_redir {
+-	u8			sreg_proto_min;
+-	u8			sreg_proto_max;
+-	u16			flags;
+-};
++#include <net/netfilter/nft_nat.h>
+ 
+ static const struct nla_policy nft_redir_policy[NFTA_REDIR_MAX + 1] = {
+ 	[NFTA_REDIR_REG_PROTO_MIN]	= { .type = NLA_U32 },
 -- 
 2.47.3
 
