@@ -203,6 +203,29 @@ def test_a_withdrawn_group_parks_against_its_own_table():
         "members are parked against the table they were given, not one read now")
 
 
+def test_a_root_that_may_be_linked_keeps_its_listeners_for_the_restart():
+    """A group whose classifier entry could not be proven unlinked may still
+    replicate through its listener chain, so none of the chain may be freed or
+    parked -- a parked entry goes on the next barrier, which proves nothing
+    about a chain a linked root still reaches. The root itself is recorded by
+    cdx_ehash_delete_entry(); every listener is recorded behind it, for the
+    datapath restart to free once the root is settled, and the latch that
+    brings that restart about is raised. Each listener is handed over once,
+    before its slot is cleared."""
+    body = code("cdx_mcast_group_destroy")
+    unsynced = body.index("rc == EN_EHASH_DELETE_UNSYNCED")
+    failure = body[body.index("else", body.index("mc_quarantine_members(", unsynced)):
+                   body.index("if (pMcastGrpInfo->pCtEntry)")]
+    assert failure.count("cdx_ehash_abandon_dependent(pMcastGrpInfo->members[ii].tbl_entry);") == 1
+    assert failure.index("cdx_ehash_abandon_dependent(") < \
+        failure.index("pMcastGrpInfo->members[ii].tbl_entry = NULL;"), (
+            "a listener must be recorded before its slot forgets it")
+    assert "cdx_ft_fatal();" in failure
+    for forbidden in ("ExternalHashTableEntryFree", "cdx_ehash_quarantine_entry",
+                      "cdx_free_exthash_mcast_members", "mc_quarantine_members"):
+        assert forbidden not in failure, f"{forbidden} on a chain a linked root may reach"
+
+
 def test_a_group_is_keyed_on_its_device_not_its_name():
     """Nothing in cdx handles NETDEV_CHANGENAME. A group keyed on the ingress
     interface's name would, after a rename, stop recognising itself: every

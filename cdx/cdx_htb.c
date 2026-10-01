@@ -1217,6 +1217,20 @@ int cdx_ft_egress_drain(struct net_device *dev)
 	return rc;
 }
 
+/* Tell the adapter the datapath restarted. A no-op with none registered: an
+ * adapter loading later starts from the restarted state anyway. */
+void cdx_ft_egress_restarted(void)
+{
+	const struct cdx_ft_egress_ops *ops;
+	int idx;
+
+	idx = srcu_read_lock(&cdx_ft_egress_srcu);
+	ops = srcu_dereference(cdx_ft_egress_ops, &cdx_ft_egress_srcu);
+	if (ops)
+		ops->restarted();
+	srcu_read_unlock(&cdx_ft_egress_srcu, idx);
+}
+
 static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *opt)
 {
 	struct cdx_htb_port *port = cdx_htb_port_of(dev);
@@ -1251,7 +1265,7 @@ int cdx_register_ft_egress(const struct cdx_ft_egress_ops *ops)
 {
 	int rc = 0;
 
-	if (!ops || !ops->changed || !ops->drain)
+	if (!ops || !ops->changed || !ops->drain || !ops->restarted)
 		return -EINVAL;
 	mutex_lock(&cdx_ft_egress_lock);
 	if (rcu_access_pointer(cdx_ft_egress_ops))

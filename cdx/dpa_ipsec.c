@@ -38,6 +38,7 @@
 #include "dpa_ipsec.h"
 #include "cdx_ioctl.h"
 #include "cdx.h"
+#include "cdx_flowtable.h"
 #include "misc.h"
 #include "dpaa_eth_common.h"
 #include "dpa_wifi.h"
@@ -107,9 +108,21 @@ struct dpa_ipsec_sainfo {
 	struct sec_descriptor *shared_desc;
 	struct dpa_fq sec_fq[NUM_FQS_PER_SA];
 	void *sa_proc_entry;
-	/* The FQIDs outlive the queues: see cdx_dpa_ipsecsa_keep_fqids(). */
-	bool keep_fqids;
+	/* Nonzero when the FQIDs outlive the queues: the datapath epoch in
+	 * which a classifier entry naming them could not be proven gone. See
+	 * cdx_dpa_ipsecsa_keep_fqids(). */
+	u32 keep_epoch;
 };
+
+/* FQID ranges an SA released while an entry that may still be linked named
+ * them, until the datapath restart that settles the entry. Under the control
+ * mutex: the SA's release runs on the CDX timer, which holds it, and so does
+ * the restart. */
+struct dpa_ipsec_held_fqids {
+	struct list_head list;
+	u32 base;
+};
+static LIST_HEAD(dpa_ipsec_held);
 
 struct ipsec_info {
 	uint32_t crypto_channel_id;
@@ -1268,6 +1281,30 @@ int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num)
 	return ret;
 }
 
+/* An SA's FQIDs going back with its queues: at once, unless a classifier entry
+ * that may still be linked named them in this datapath epoch, when they are
+ * held for the restart that ends it. One kept in an earlier epoch has been
+ * settled by the restart since, whether its release came before that restart
+ * (held, then released by it) or after. */
+static void dpa_ipsec_release_fqids(struct dpa_ipsec_sainfo *sainfo)
+{
+	u32 base = sainfo->sec_fq[FQ_FROM_SEC].fqid;
+	struct dpa_ipsec_held_fqids *held;
+
+	if (!sainfo->keep_epoch || sainfo->keep_epoch != cdx_ft_epoch()) {
+		qman_release_fqid_range(base, NUM_FQS_PER_SA);
+		return;
+	}
+	held = kmalloc(sizeof(*held), GFP_KERNEL);
+	if (!held) {
+		pr_err("cdx: IPsec SA FQIDs 0x%x-0x%x leaked: a classifier entry may still name them and they could not be held\n",
+		       base, base + NUM_FQS_PER_SA - 1);
+		return;
+	}
+	held->base = base;
+	list_add_tail(&held->list, &dpa_ipsec_held);
+}
+
 int cdx_dpa_ipsecsa_release(void *handle)
 {
 	struct dpa_ipsec_sainfo *sainfo;
@@ -1318,12 +1355,7 @@ int cdx_dpa_ipsecsa_release(void *handle)
 	 * create_ipsec_fqs frees it on partial-init failure; this is the
 	 * matching free on the normal release path. */
 	kfree(sainfo->shdesc_mem);
-	if (!sainfo->keep_fqids)
-		qman_release_fqid_range(sainfo->sec_fq[FQ_FROM_SEC].fqid, NUM_FQS_PER_SA);
-	else
-		pr_err("cdx: IPsec SA FQIDs 0x%x-0x%x held until reset: a classifier entry may still name them\n",
-		       sainfo->sec_fq[FQ_FROM_SEC].fqid,
-		       sainfo->sec_fq[FQ_FROM_SEC].fqid + NUM_FQS_PER_SA - 1);
+	dpa_ipsec_release_fqids(sainfo);
 	kfree(sainfo);
 	module_put(THIS_MODULE);
 	return SUCCESS;
@@ -1333,10 +1365,43 @@ int cdx_dpa_ipsecsa_release(void *handle)
  * and enqueue to this SA's TO_SEC FQID. The queues themselves still go -- an
  * out-of-service FQ rejects the enqueue -- but a later SA or any other queue
  * given the same FQIDs would be fed frames it was never admitted for, so the
- * FQIDs stay allocated until the reboot the delete already demands. */
+ * FQIDs stay allocated until the datapath restart that settles the entry, or
+ * the reboot that replaces it when none can. */
 void cdx_dpa_ipsecsa_keep_fqids(void *handle)
 {
-	((struct dpa_ipsec_sainfo *)handle)->keep_fqids = true;
+	((struct dpa_ipsec_sainfo *)handle)->keep_epoch = cdx_ft_epoch();
+}
+
+unsigned int cdx_dpa_ipsec_release_held_fqids(void)
+{
+	struct dpa_ipsec_held_fqids *held, *next;
+	unsigned int released = 0;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	list_for_each_entry_safe(held, next, &dpa_ipsec_held, list) {
+		qman_release_fqid_range(held->base, NUM_FQS_PER_SA);
+		list_del(&held->list);
+		kfree(held);
+		released++;
+	}
+	return released;
+}
+
+void cdx_dpa_ipsec_held_fqids_exit(bool settled)
+{
+	struct dpa_ipsec_held_fqids *held, *next;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	if (settled) {
+		cdx_dpa_ipsec_release_held_fqids();
+		return;
+	}
+	list_for_each_entry_safe(held, next, &dpa_ipsec_held, list) {
+		pr_err("cdx: IPsec SA FQIDs 0x%x-0x%x stay allocated until reset: a classifier entry may still name them\n",
+		       held->base, held->base + NUM_FQS_PER_SA - 1);
+		list_del(&held->list);
+		kfree(held);
+	}
 }
 
 int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num)
@@ -1526,6 +1591,9 @@ void cdx_dpa_ipsec_exit(void)
 #endif
 	release_ipsec_bpool(&ipsecinfo);
 	release_ipsec_sg_pools();
+	/* Held FQIDs stay listed: what becomes of them is decided once CDX has
+	 * settled what it recorded as possibly linked, after this
+	 * (cdx_dpa_ipsec_held_fqids_exit()). */
 	return;
 }
 #else
@@ -1537,5 +1605,12 @@ struct dpa_bp* get_ipsec_bp(void)
 bool cdx_dpa_ipsec_ready(void)
 {
 	return false;
+}
+unsigned int cdx_dpa_ipsec_release_held_fqids(void)
+{
+	return 0;
+}
+void cdx_dpa_ipsec_held_fqids_exit(bool settled)
+{
 }
 #endif

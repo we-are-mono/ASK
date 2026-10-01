@@ -64,15 +64,20 @@ struct cdx_ipsec_sa {
 	 * entry still linked under a key we no longer track" -- and a later
 	 * rebuild would add that key a second time, which is exactly the
 	 * duplicate bucket the delete refuses to risk. Once set, this SA's
-	 * framing stops being rewritable. */
+	 * framing stops being rewritable -- until the datapath restart that
+	 * settles that key, which installs the entry again
+	 * (cdx_ipsec_sa_restarted()). */
 	bool stranded;
+	/* On cdx_ipsec_sa_list while installed. */
+	struct list_head list;
 };
 
 /* Rotating hint for the handle search below. Static because the handle space
  * is per-instance in exactly the way the SA cache is, and both are global. */
 static u16 cdx_ipsec_next_handle = 1;
-/* SAs installed through this interface and not yet deleted. Under the
- * transaction. */
+/* SAs installed through this interface and not yet deleted, and how many.
+ * Under the transaction. */
+static LIST_HEAD(cdx_ipsec_sa_list);
 static unsigned int cdx_ipsec_sa_owned;
 
 unsigned int cdx_ipsec_sa_count(void)
@@ -463,6 +468,7 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 	owner->entry = sa;
 	owner->handle = handle;
 	owner->dev = spec->dev;
+	list_add_tail(&owner->list, &cdx_ipsec_sa_list);
 	cdx_ipsec_sa_owned++;
 	*result = owner;
 	return 0;
@@ -523,6 +529,7 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa, struct cdx_ipsec_counters *last)
 	if (!owner)
 		return;
 	*sa = NULL;
+	list_del(&owner->list);
 	if (!WARN_ON_ONCE(!cdx_ipsec_sa_owned))
 		cdx_ipsec_sa_owned--;
 	rc = M_ipsec_sa_cache_delete(owner->handle);
@@ -582,13 +589,14 @@ int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
 	 * in the quarantine, provably out of the table, so a rebuild over it
 	 * is safe.
 	 *
-	 * A hard failure is terminal for this SA's framing rather than merely
+	 * A hard failure strands this SA's framing rather than failing merely
 	 * this attempt. The delete frees its software bookkeeping whichever
 	 * way it went, so a later attempt would find no entry to remove, skip
 	 * the removal, and add the same key again on top of the one still
-	 * linked. The delete itself has latched terminal failure
-	 * (cdx_ipsec_delete_fp_entry()), so the ports stop and no reinstall
-	 * can put the key in beside the one still linked. */
+	 * linked. The delete itself has latched the failure
+	 * (cdx_ipsec_delete_fp_entry()), so the ports stop and nothing can put
+	 * the key in beside the one still linked until the restart has settled
+	 * it and installs this SA's entry again (cdx_ipsec_sa_restarted()). */
 	if (entry->ct && entry->ct->handle) {
 		rc = cdx_ipsec_delete_fp_entry(entry);
 		if (rc && rc != EN_EHASH_DELETE_UNSYNCED) {
@@ -622,6 +630,32 @@ int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
 	return -EIO;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_set_next_hop, ASK_CDX_FLOWTABLE);
+
+/* The datapath restarted: every classifier key a failed delete may have left
+ * linked has been settled, so an SA stranded by one gets its entry back, on the
+ * next hop it last had -- the adapter's follow pass moves it from there if its
+ * peer has moved since. Nothing else is touched: a live SA's entry, its SEC
+ * context and a NAT-T entry it shares stay as they are. Called by the restart
+ * with the transaction and RTNL held and the ports still stopped. An install
+ * that fails strands the SA again, as a failed rebuild does. */
+void cdx_ipsec_sa_restarted(void)
+{
+	struct cdx_ipsec_sa *sa;
+
+	cdx_ft_assert_held();
+	list_for_each_entry(sa, &cdx_ipsec_sa_list, list) {
+		if (!sa->stranded)
+			continue;
+		sa->stranded = false;
+		if (sa->entry->ct)
+			continue;
+		if (ipsec_install_fp_entry(sa->entry)) {
+			sa->stranded = true;
+			pr_err("cdx: IPsec SA handle %u could not install its classifier entry again after the datapath restart; its tunnel carries nothing until the SA is reinstalled\n",
+			       sa->handle);
+		}
+	}
+}
 
 u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa)
 {

@@ -248,7 +248,13 @@ Use directional hardware counters, software interface TX counters and CPU
 measurements to prove execution. Global invalidation may leave the policy
 installed while admission is stopped. The daemon performs a full transaction
 to recover it automatically; under manual control, applying it again performs
-that boundary. Fatal hardware retirement still requires a fresh boot.
+that boundary. While CDX restarts the datapath after a hardware retirement it
+could not prove (`fatal 1`, `fatal_terminal 0`), the daemon leaves the table
+alone and checks again every second until the restart is done; only a terminal
+one (`fatal_terminal 1`) still requires a fresh boot. `status` reports the
+restarts so far and `resume_failures`, the classifier ports a restart could
+not start again; the kernel log names each. A receive port starts again with
+its netdev; an offline port only when CDX is reloaded or the board reboots.
 
 ## Carrying useful CMM settings forward
 

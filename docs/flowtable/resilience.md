@@ -23,7 +23,7 @@ being retired; new coverage must use the native interfaces.
 | Acceleration is intentionally disabled or stopped for maintenance | Respect the stop. Recovery must not race firewall updates or recreate admission while an authorized stop is in effect. |
 | Desired configuration is malformed | Reject it and report the error. Follow the existing transaction contract for preserving the previous policy or leaving acceleration disabled; do not invent configuration or restore an obsolete security policy. Recover when valid desired configuration is supplied. |
 | Another owner controls a table or backend binding | Refuse the conflict and report it; do not take ownership by deleting foreign objects. Reconcile when the conflict is legitimately resolved. |
-| Hardware deletion cannot be proven | Fence unsafe hardware and preserve diagnostics. The current fatal-state contract requires provider teardown and a fresh boot; automatic restoration would require an explicitly implemented, bounded reset/reboot policy. |
+| Hardware deletion cannot be proven | Stop and fence the classifier ports, settle the possibly linked key with them idle, and restart the datapath in the same boot (a second or two; see the [architecture](architecture.md#datapath-restart)). Only what a restart cannot prove safe -- a key that could not be recorded, a malformed table, a failed host-command channel, ports outside the configuration, or a spent restart budget -- stays stopped for provider teardown and a fresh boot. |
 
 Automatic recovery cannot make an invalid topology valid or repair a permanent
 hardware fault. Its responsibilities are to reach a safe state, report why
@@ -671,6 +671,7 @@ A bind the hardware cannot take now never fails the transaction:
 | --- | --- | --- |
 | Invalidation latched, old bindings still bound or hardware not drained | Parked: counted in `bindings` and `parked`, every flow declined | Software, until rearm |
 | Invalidation latched and drained | Rearmed at once, as the first bind after a detach always was | Hardware |
+| Deletion failure CDX is restarting after | Parked if an invalidation is latched, else live; every flow declined until the restart | Software, until the restart rearms it |
 | Terminal deletion failure (fresh boot required) | Passive (`passive`), never rearmed | Software |
 | Past the binding bound | Passive | Software |
 | First binding after a detach, candidate table not empty | Refused, as before | - |
@@ -685,7 +686,9 @@ again and it enters hardware with no reload. While an XFRM policy exists
 Netfilter bypasses the software fast path, so the offer waits for the flow to
 expire, up to the 30-second flowtable timeout. If only an unproven hardware
 deletion remains, the parked binding retries that barrier every second until it
-completes. Terminal failure and the binding bound are passive rather than parked
+completes. A deletion that could not be proven at all holds the rearm back until
+CDX has restarted the datapath, and the restart asks for the rearm itself.
+Terminal failure and the binding bound are passive rather than parked
 because nothing in the boot lifts them. A parked binding would wait for a rearm
 that never comes, and one past the bound could not be flushed by the
 invalidation worker.
@@ -763,7 +766,8 @@ Start with deterministic cases that expose missing recovery mechanisms.
 | Next | Remove/recreate VLANs, flap links, change routes/neighbours, and exhaust/release admission resources | Stale forwarding stops; unaffected traffic follows its contract; eligible flows return to hardware after prerequisites recover. |
 | Next | Supply malformed policy, disable policy, request maintenance stop, or introduce foreign ownership | Recovery respects intent and ownership; it resumes only when the relevant blocking condition is resolved. |
 | Later | Repeat faults, combine events in recorded sequences, and restart with incomplete runtime state | No cumulative leak, retry storm, stale state or dependence on a pristine fixture. |
-| Separate destructive suite | Force unproven hardware deletion or an unrecoverable backend failure | Hardware is fenced, evidence survives, and the defined reset policy runs with a retry/boot-loop limit. |
+| Same boot | Force unproven hardware deletion of each kind -- a flow, a multicast group, an IPsec SA | The ports stop and stay stopped while the test image's hold is set; released, the datapath restarts within two seconds and forwarding returns in hardware. |
+| Separate destructive suite | CDX unload, or an unproven deletion past the restart budget (`ASK_FLOWTABLE_TERMINAL=unload` or `budget`) | Hardware is fenced, evidence survives, and only provider teardown and a fresh boot recover. |
 
 Deleting the owned table is a deliberate fault test. It does not make arbitrary
 external edits to that table a supported interface. Its configuration-hash

@@ -110,7 +110,23 @@ struct dpa_bp {
     struct bman_pool *pool; int refs; void (*free_buf_cb)(void *);
 };
 struct port_bman_pool_info { unsigned pool_id; };
-struct list_head { struct list_head *next; };
+/* Singly linked where CDX threads its queue lists by hand; the kernel's own
+ * list where it keeps held FQID ranges. */
+struct list_head { struct list_head *next, *prev; };
+#define LIST_HEAD(n) struct list_head n = { &n, &n }
+#define list_entry(p, t, m) ((t *)((char *)(p) - __builtin_offsetof(t, m)))
+#define list_for_each_entry_safe(p, n, h, m) \
+    for (p = list_entry((h)->next, __typeof__(*p), m), n = list_entry(p->m.next, __typeof__(*p), m); \
+         &p->m != (h); p = n, n = list_entry(n->m.next, __typeof__(*n), m))
+static void list_add_tail(struct list_head *e, struct list_head *h)
+{ e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
+static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->prev = e->prev; }
+/* The datapath epoch, which a restart moves on, read under the control
+ * mutex. */
+static struct { struct { bool mutex; } ctrl; } cdx_instance = { { true } }, *cdx_info = &cdx_instance;
+#define lockdep_assert_held(m) assert(*(m))
+static unsigned datapath_epoch = 1;
+static unsigned cdx_ft_epoch(void) { assert(cdx_info->ctrl.mutex); return datapath_epoch; }
 enum qman_fq_state { qman_fq_state_oos, qman_fq_state_sched, qman_fq_state_retired };
 struct qman_fq {
     unsigned fqid, flags, pending; bool acquired, proc;
@@ -454,6 +470,36 @@ static unsigned sa_lifecycle(void)
     assert(!module_refs && !sa_range && !ipsecinfo.ipsec_exception_fq);
     assert(allocs == baseline && queues == 12);
 
+    /* An SA whose classifier entry could not be proven gone holds its FQIDs
+     * past its release, until the datapath restart that settles the entry:
+     * that restart gives them back when the SA went first, and an SA that
+     * goes after it gives them back at once. */
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa);
+    cdx_dpa_ipsecsa_keep_fqids(sa);
+    sa_retired(sa);
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
+    assert(!module_refs && sa_range && allocs == baseline + 1);
+    assert(cdx_dpa_ipsec_release_held_fqids() == 1 && !sa_range && allocs == baseline);
+    assert(!cdx_dpa_ipsec_release_held_fqids());
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa);
+    cdx_dpa_ipsecsa_keep_fqids(sa);
+    datapath_epoch++;
+    sa_retired(sa);
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && !sa_range && allocs == baseline);
+    /* Held with nothing to record them in, they are lost with the SA rather
+     * than handed to the next one. Only a reset gets them back. */
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa);
+    cdx_dpa_ipsecsa_keep_fqids(sa);
+    sa_retired(sa);
+    seed_failure = "head"; seed_step = 0; seed_fail = 1;
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && sa_range && allocs == baseline);
+    seed_failure = NULL; seed_step = seed_fail = 0;
+    assert(!cdx_dpa_ipsec_release_held_fqids() && sa_range);
+    sa_range = false;
+
     for (unsigned fail = 1; fail <= count; fail++) {
         steps = 0; fail_step = fail; pauses = 0;
         retires_failed = oos_failed = 2;
@@ -462,11 +508,34 @@ static unsigned sa_lifecycle(void)
         assert(allocs == baseline && queues == 12 && !callbacks);
     }
     fail_step = retires_failed = oos_failed = 0;
+    /* An unload that has settled every key that may have named them gives
+     * what is held back. */
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa);
+    cdx_dpa_ipsecsa_keep_fqids(sa);
+    sa_retired(sa);
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && sa_range && allocs == baseline + 1);
+    cdx_dpa_ipsec_held_fqids_exit(true);
+    assert(!sa_range && allocs == baseline);
+    /* One that has not keeps it allocated, giving back only the record of
+     * it -- and the IPsec exit, which runs before that is known, keeps both
+     * for it to decide. */
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa);
+    cdx_dpa_ipsecsa_keep_fqids(sa);
+    sa_retired(sa);
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && sa_range && allocs == baseline + 1);
     module_going = true;
     assert(!cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42));
-    assert(!module_refs && allocs == baseline);
-    exit_callback(); clean();
-    return count + 2;
+    assert(!module_refs && allocs == baseline + 1);
+    exit_callback();
+    unsigned exited = allocs;
+    assert(sa_range && exited);
+    cdx_dpa_ipsec_held_fqids_exit(false);
+    assert(sa_range && allocs == exited - 1);
+    sa_range = false;
+    clean();
+    return count + 3;
 }
 
 int main(void)

@@ -55,12 +55,13 @@ line validates requests but declines installation; CDX owns the read-only
 initramfs; production packaging and persistent deployment remain separate work.
 
 The adapter acquires an exclusive provider claim before publishing callbacks.
-Claim is refused after terminal failure, while another claim or
-live directions exist, or while retirement is pending. The first successful
+Claim is refused while CDX's latch holds (until CDX restarts the datapath, or
+for good once the latch is terminal), while another claim or live directions
+exist, or while retirement is pending. The first successful
 claim permanently seals provider configuration for that CDX instance, even if
 adapter initialization subsequently fails. SET_PARAMS rechecks the seal under
 the control lock. Release requires zero live directions; it cannot clear the
-seal, quarantine or terminal latch.
+seal, quarantine or latch.
 
 ## Native context and admission
 
@@ -339,7 +340,9 @@ expiry checks remain in effect for software caches.
 Global invalidation retires hardware, resolves pending barriers, flushes native
 flowtable work outside the transaction, then publishes `invalidation_done` as
 its final state change. This is distinct from selective generation retirement.
-An unproven hardware unlink also latches provider terminal failure.
+An unproven hardware unlink also latches the provider's failure, which stops the
+datapath until CDX has settled the key and restarted it (see
+[Datapath restart](#datapath-restart)).
 
 Healthy global recovery requires zero old bindings, entries, handle/neighbour
 references and retirement quarantine, and completed invalidation work. A binding
@@ -359,9 +362,11 @@ allocate a binding neither parks nor rearms. Counters remain cumulative. The
 first binding after a full detach still requires an empty candidate flowtable: a
 table whose hooks were detached can still contain cached flows, so pointer
 identity or reattachment alone is insufficient. Binding never waits for the
-worker while holding Netfilter locks. No recovery operation clears terminal
-failure; after one, and past the binding bound, a bind is accepted passively
-(`passive`) so the transaction still commits.
+worker while holding Netfilter locks. No adapter recovery operation clears
+CDX's latch: only CDX's own datapath restart does, and it then asks the adapter
+to rearm. While CDX is restarting, a bind is made as usual and declines every
+flow; once the latch is terminal, and past the binding bound, a bind is
+accepted passively (`passive`) so the transaction still commits.
 
 ## Hardware deletion and shutdown
 
@@ -369,7 +374,7 @@ failure; after one, and past the binding bound, a bind is accepted passively
 | --- | --- |
 | Unlinked and synchronized | Free hardware and its owner |
 | Unlinked, barrier unproven | Retain existing owner/storage; retry the barrier without another destructive unlink |
-| Unlink unproven | Latch terminal failure; retry datapath quiescence; retain possibly linked hardware storage until reset |
+| Unlink unproven | Latch the failure; stop every classifier port; record the possibly linked storage; with the ports idle, settle it and restart the datapath -- or, when that cannot be proven safe, keep the ports stopped until reset |
 
 Every result consumes the adapter's hardware handle. A null handle is not proof
 of retirement. The failure path uses the already allocated backend owner and
@@ -391,12 +396,66 @@ Inside the table API the same rule covers the cumulative nodes of a colliding
 bucket. A node that a delete or an add displaced while its sync failed is
 parked there, and the first later sync on the PCD that completes frees it.
 
-Terminal recovery stops the datapath; completion does not establish usable
-software fallback. A provider `NETDEV_PRE_UP` guard prevents physical ports
-from restarting while that CDX instance retains unproven hardware state. The
-guard survives adapter removal. Full provider teardown detaches the classifier
-and permits software port operation again; a fresh boot is required for offload.
-Possibly linked storage must not be freed into a live hardware hash chain.
+### Datapath restart
+
+The latch stops the datapath; completion does not establish usable software
+fallback. A provider `NETDEV_PRE_UP` guard, and a fence in the SDK that refuses
+every other enable of a stopped port, keep the classifier ports stopped while
+the latch holds; the guard survives adapter removal. Possibly linked storage
+must not be freed into a live hardware hash chain -- but once no port walks the
+tables, nothing is live to free it into.
+
+So CDX restarts the datapath itself. Its stop disables every classifier port
+(Rx and offline) and waits until the registers report none still finishing a
+frame; it never detaches a port or drains a queue, so the ports can be started
+again exactly as they were. The stop also proves that no other port reaches a
+classifier, and the host-command port, which no PCD can be set on, stays up to
+carry the barriers. The fence and the enable it refuses share the port's lock,
+so no enable that found the fence open lands after the stop. A barrier then
+completes behind the stopped ports, so no frame they let go of is still inside
+the controller; nothing is freed before it. With the ports idle, every
+recorded key -- a flow's, a multicast group's with its listener chain behind
+it, an SA's -- is looked up in its table and deleted again, or freed when no
+bucket links it; every arm of the table's delete that fails does so before
+changing anything, so such a key is linked where it was or nowhere. A second
+barrier then releases everything parked, FQIDs held for a deleted SA go back,
+an SA stranded by the failed delete gets its entry again, and, under the same
+RTNL hold, the latch clears and the ports that were running start again (an Rx
+port only if its netdev, in whatever namespace, is still up). The adapter is
+then told: both multicast learners reconsider their groups, every SA has its
+peer resolved again, and a parked binding rearms. Live entries are never
+touched. The kernel log records `datapath restarted after unproven deletion`
+with what it settled and how long the ports were stopped, and
+`/proc/cdx_flowtable` counts `restarts`. A port the restart cannot start again
+is named in the log and counted in `resume_failures`; the latch stays clear,
+since the tables are settled. A receive port starts again with its netdev; an
+offline port, which has none, only when CDX is reloaded or the board reboots.
+
+A restart that has to wait -- RTNL contended, a port still busy, a key the
+table still refuses, a failed barrier, or the test image's
+`flowtable_restart_hold` -- is retried and the ports stay stopped; RTNL and
+the hold at a steady short interval, the rest with backoff up to thirty
+seconds. Whatever it waits for, after thirty seconds it says once that it has
+stalled, and why. A key whose delete the table refuses on eight restart
+attempts (for want of memory, most likely) is taken as never going. One that
+cannot be
+proven safe makes the latch terminal (`fatal_terminal`), logs
+`reboot required` with the reason, and keeps the ports stopped: a port outside
+the configuration with a classifier of its own, a key that could not be
+recorded, a malformed table, a key refused eight times, a host-command channel
+that has failed for good, or more than `flowtable_restart_limit` restarts
+(three by default) within ten minutes. A limit of zero leaves every latch for
+a reboot. Where nothing can
+prove the classifier done with what was retired -- that foreign port, or the
+failed channel -- the retired entries stay allocated with the statistics
+records and policer they name, for the reset. Full provider teardown still
+detaches the classifier and permits software port operation again, restoring
+each port as the stop found it (an Rx port only if its netdev is still up),
+and settles a recorded key only when no other port reaches a classifier. That
+teardown -- `rmmod cdx`, a path the test image exercises and production never
+takes -- now waits for every classifier port to report itself idle before it
+detaches one, retrying once a second, where it used to detach on the
+disable's own bounded wait.
 
 Adapter exit invalidates its shared handles, removes procfs/notifiers, cancels
 work, unregisters indirect callbacks and completes safe hardware retirement
@@ -406,7 +465,8 @@ references prevent CDX unload while the adapter is loaded.
 
 Healthy reload preserves provider configuration and owner. Existing nftables
 flowtables continue in software; recreate the table to bind the new adapter.
-Adapter counters reset on reload, while the provider seal and fatal latch persist.
+Adapter counters reset on reload, while the provider seal persists, and so does
+CDX's latch until CDX restarts the datapath: a load meanwhile is refused.
 The multicast switch (the adapter's `multicast` parameter) comes back on, so a
 service that was stopped or paused has to stop again; see the
 [policy guide](policy.md).
@@ -485,7 +545,9 @@ are 1 before allocation, 2 before hardware, 3 after hardware with rollback, and
 4 matching contention after the peer direction installs. Load-only initialization
 stages are 1 procfs, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration,
 6 nexthop-object registration, 7 bridge FDB and 8 bridge VLAN objects. The provider's test-only unlink fault leaves a
-real key linked; it is a terminal test requiring a fresh boot afterward.
+real key linked; CDX restarts the datapath after it, and the test-only
+`flowtable_restart_hold` keeps the ports stopped, for inspection, until it is
+cleared.
 
 Verification combines production-code host checks, relevant KASAN/lockdep DUT
 tests, exact endpoint delivery and independent hardware/software counters. SDK

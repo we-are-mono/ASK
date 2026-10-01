@@ -40,5 +40,9 @@ bool cdx_htb_resolve_class(struct tQM_context_ctl *qm_ctx, u32 *channel, u32 *cq
  * callers hold. */
 void cdx_ft_egress_changed(struct net_device *dev);
 int cdx_ft_egress_drain(struct net_device *dev);
+/* The datapath restarted after a latch: whatever was refused or left undone
+ * while it was stopped is asked for again. May sleep; called with neither the
+ * control mutex nor RTNL held. */
+void cdx_ft_egress_restarted(void);
 
 #endif /* CDX_HTB_H */

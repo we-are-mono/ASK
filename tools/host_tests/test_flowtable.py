@@ -64,7 +64,7 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
              "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
              "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire",
              "ft_port_stopped", "ft_stopped_clean", "ft_stopped_workfn", "ft_netdev_event",
-             "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_egress_drain", "ft_block_drain", "ft_hw_settle", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit", "ft_position", "ft_start", "ft_next", "ft_stop"]
+             "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_egress_drain", "ft_egress_restarted", "ft_block_drain", "ft_hw_settle", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit", "ft_position", "ft_start", "ft_next", "ft_stop"]
     (tmp_path / "flowtable_production.inc").write_text(
         # The stopped-port sweep's queue, lock and work item, as declared.
         source[source.index("struct ft_stopped {"):source.index("static void ft_port_stopped(")]

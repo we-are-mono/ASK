@@ -171,7 +171,10 @@ static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->pr
 static bool list_empty(const struct list_head *h) { return h->next == h; }
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define GFP_KERNEL 0
-#define kmalloc(size, flags) allocate(size)
+/* Bookkeeping allocations, which a case can fail. */
+static bool kmalloc_fails;
+static void *kmalloc_stub(size_t size) { return kmalloc_fails ? NULL : allocate(size); }
+#define kmalloc(size, flags) kmalloc_stub(size)
 #define DPA_ERROR(...) ((void)0)
 /* The control mutex every quarantine mutator requires, and lockdep's check
  * of it, counted rather than fatal so a case can prove the check is made. */
@@ -188,8 +191,22 @@ static int delete_rc;
 static int ExternalHashTableFmPcdHcSync(void *td)
 { assert(td); hc_syncs++; synced_table = td; return hc_fail ? -1 : 0; }
 static void ExternalHashTableEntryFree(void *entry) { release(entry); }
+/* Which bucket a delete was told the key is in, and how many it was asked. */
+static unsigned deletes, deleted_from;
 static int ExternalHashTableDeleteKey(void *td, uint16_t index, void *entry)
-{ assert(td && entry); return delete_rc; }
+{ assert(td && entry); deletes++; deleted_from = index; return delete_rc; }
+/* Where the table says an entry is linked: in the bucket a case names, in
+ * none (-ENOENT), or nowhere it can tell for a malformed chain (-EUCLEAN). */
+static int find_rc;
+static uint16_t found_in;
+static unsigned finds;
+static int ExternalHashTableFindEntry(void *td, void *entry, uint16_t *index)
+{
+    assert(td && entry && index);
+    finds++;
+    if (!find_rc) *index = found_in;
+    return find_rc;
+}
 /* Declared by cdx_common.h in the module; one calls another defined below it. */
 int cdx_ehash_quarantine_retry(void);
 #include "quarantine_production.inc"
@@ -239,11 +256,17 @@ static void check_quarantine(void)
     delete_rc = SUCCESS;
     assert(cdx_ehash_delete_entry(first, 2, allocate(8)) == SUCCESS);
     assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 3);
-    /* A key that may still be linked is never parked: nothing makes it free. */
+    /* A key that may still be linked is never parked: no barrier makes it
+     * free. It is recorded for the restart that settles it (exercised in
+     * check_abandoned()); here unload, with the ports never stopped, leaks
+     * it and gives back only the record. */
     delete_rc = -1;
     entry = allocate(8);
     assert(cdx_ehash_delete_entry(first, 4, entry) == -1 && !cdx_ehash_quarantine_pending());
-    assert(allocations == held + 1);
+    assert(allocations == held + 2);
+    unsigned asked = deletes;
+    assert(!cdx_ehash_abandoned_exit(false));
+    assert(allocations == held + 1 && !finds && deletes == asked);
     release(entry); /* Only a hardware reset reclaims it. */
     /* Module exit tries one last barrier of its own, which releases the
      * backlog when it completes... */
@@ -262,6 +285,111 @@ static void check_quarantine(void)
     cdx_info->ctrl.mutex = false;
     FreeEnEhashInfo(first);
     FreeEnEhashInfo(second);
+}
+
+/* CDX's record of keys a delete could not prove gone, and the resolver the
+ * datapath restart runs over it with every port stopped. Each entry is freed
+ * once -- ASan's double-free and leak checks are the other half of the
+ * oracle -- and never while a key it names may still be linked. */
+static void check_abandoned(void)
+{
+    t_FmPcd pcd = {0};
+    struct en_exthash_info *table_ = table(&pcd);
+    unsigned held = allocations, resolved;
+    void *root, *other, *member[2];
+
+    cdx_info->ctrl.mutex = true;
+    /* A delete refused before the unlink records its key as a root, with
+     * the table and bucket it was added to, and parks nothing. */
+    delete_rc = FAILURE;
+    root = allocate(8);
+    assert(cdx_ehash_delete_entry(table_, 5, root) == FAILURE);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held + 2 && !cdx_ehash_abandoned_lost());
+    /* Behind it, the listeners only it reaches. */
+    member[0] = allocate(8); member[1] = allocate(8);
+    cdx_ehash_abandon_dependent(member[0]);
+    cdx_ehash_abandon_dependent(member[1]);
+    cdx_ehash_abandon_dependent(NULL);
+    assert(allocations == held + 6);
+    /* Still linked where it was added, and still refused, most likely for a
+     * cumulative node: the restart waits, keeping everything. */
+    find_rc = 0; found_in = 5;
+    unsigned asked = deletes;
+    assert(cdx_ehash_resolve_abandoned(&resolved) == -EAGAIN && !resolved);
+    assert(deletes == asked + 1 && deleted_from == 5 && allocations == held + 6);
+    /* Linked from another bucket than it was added to: deleted there. Its
+     * dependents go only now, with every root settled. */
+    delete_rc = SUCCESS; found_in = 9;
+    assert(cdx_ehash_resolve_abandoned(&resolved) == 0 && resolved == 1);
+    assert(deletes == asked + 2 && deleted_from == 9 && allocations == held);
+    /* An unlink whose barrier failed is final too, with nothing walking. */
+    delete_rc = FAILURE;
+    root = allocate(8);
+    assert(cdx_ehash_delete_entry(table_, 2, root) == FAILURE);
+    delete_rc = EN_EHASH_DELETE_UNSYNCED; found_in = 2;
+    assert(cdx_ehash_resolve_abandoned(&resolved) == 0 && resolved == 1 && allocations == held);
+    /* Linked from no bucket at all: freed without a delete. */
+    delete_rc = FAILURE;
+    root = allocate(8);
+    assert(cdx_ehash_delete_entry(table_, 3, root) == FAILURE);
+    find_rc = -ENOENT; asked = deletes;
+    assert(cdx_ehash_resolve_abandoned(&resolved) == 0 && resolved == 1);
+    assert(deletes == asked && allocations == held);
+    /* Nothing recorded: nothing to do. */
+    assert(cdx_ehash_resolve_abandoned(&resolved) == 0 && !resolved);
+    /* A root still linked after every try the restart gives it, or a table
+     * the search finds malformed, is beyond a restart: nothing is freed,
+     * dependents included. Two roots: the first settled one goes at once,
+     * whatever the other does. */
+    root = allocate(8); other = allocate(8);
+    assert(cdx_ehash_delete_entry(table_, 1, root) == FAILURE);
+    assert(cdx_ehash_delete_entry(table_, 1, other) == FAILURE);
+    member[0] = allocate(8);
+    cdx_ehash_abandon_dependent(member[0]);
+    find_rc = 0; found_in = 1;
+    unsigned tries = 0;
+    int rc;
+    while ((rc = cdx_ehash_resolve_abandoned(&resolved)) == -EAGAIN)
+        tries++;
+    assert(rc == -ENOTRECOVERABLE && tries == CDX_EHASH_RESOLVE_ATTEMPTS - 1);
+    assert(allocations == held + 6);
+    find_rc = -EUCLEAN;
+    assert(cdx_ehash_resolve_abandoned(&resolved) == -ENOTRECOVERABLE && allocations == held + 6);
+    /* Unload with the ports stopped settles what will go and leaks the
+     * rest, giving back only the records -- which here is everything, the
+     * table being malformed. */
+    assert(!cdx_ehash_abandoned_exit(true));
+    assert(allocations == held + 3);
+    release(root); release(other); release(member[0]);
+    /* And with a table that answers, unload frees them all. */
+    root = allocate(8);
+    assert(cdx_ehash_delete_entry(table_, 1, root) == FAILURE);
+    member[0] = allocate(8);
+    cdx_ehash_abandon_dependent(member[0]);
+    find_rc = 0; delete_rc = SUCCESS;
+    assert(cdx_ehash_abandoned_exit(true));
+    assert(allocations == held);
+    /* A record that cannot be made loses track of a key that may still be
+     * linked, which no restart can then be proven safe without, and unload
+     * frees no dependent while that is so. A dependent's own record failing
+     * costs only that entry. */
+    delete_rc = FAILURE;
+    root = allocate(8);
+    kmalloc_fails = true;
+    assert(cdx_ehash_delete_entry(table_, 1, root) == FAILURE && cdx_ehash_abandoned_lost());
+    member[1] = allocate(8);
+    cdx_ehash_abandon_dependent(member[1]);
+    kmalloc_fails = false;
+    member[0] = allocate(8);
+    cdx_ehash_abandon_dependent(member[0]);
+    assert(allocations == held + 4);
+    asked = deletes;
+    assert(!cdx_ehash_abandoned_exit(true));
+    assert(allocations == held + 3 && deletes == asked);
+    release(root); release(member[0]); release(member[1]);
+    assert(allocations == held);
+    cdx_info->ctrl.mutex = false;
+    FreeEnEhashInfo(table_);
 }
 
 int main(void)
@@ -341,6 +469,7 @@ int main(void)
     assert(FM_PCD_CcRootModifyNextEngine((void *)1, 0, 0, (void *)1) == E_NOT_SUPPORTED);
     assert(FmPcdCcModifyNextEngineParamTree((void *)1, (void *)1, 0, 0, (void *)1) == E_NOT_SUPPORTED);
     check_quarantine();
+    check_abandoned();
     assert(!allocations);
     puts("EHASH teardown, unsupported retargeting, native/compat cookie ownership and quarantine checks passed");
 }

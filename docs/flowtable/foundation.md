@@ -52,7 +52,8 @@ for operating the supported flowtable/CDX path.
 | Healthy adapter unload | Drain hardware; existing sockets forward in Linux; reload and recreate the table to regain hardware |
 | Actual physical driver removal | Retire flow references; full CDX teardown releases remaining configuration/queue pins before driver removal completes |
 | Recoverable hardware barrier failure | Retry safe retirement according to the provider contract; quarantine remains accounted for |
-| Terminal hardware failure | Preserve the stop and quarantine; administrative UP and adapter reload cannot bypass it; full provider teardown and fresh boot are required |
+| Unproven hardware deletion | Stop the classifier ports; administrative UP and adapter reload cannot bypass it; CDX settles the key with the ports idle and restarts the datapath in the same boot |
+| Terminal hardware failure (a restart cannot be proven safe, or the restart budget is spent) | Preserve the stop and quarantine; administrative UP and adapter reload cannot bypass it; full provider teardown and fresh boot are required |
 | Exclusion/policy replacement | Delete the owned table and prove hardware/reference drain before publishing the new policy |
 
 The [policy guide](policy.md) specifies CLI use, useful CMM setting

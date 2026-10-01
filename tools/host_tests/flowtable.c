@@ -872,6 +872,10 @@ static unsigned stats_in_use(void)
 static int cdx_ft_admission_begin(void) { return rtnl_trylock() ? 0 : -EAGAIN; }
 static void cdx_ft_admission_end(void) { rtnl_unlock(); }
 static bool cdx_ft_failed(void) { return ft_fatal; }
+/* A latch CDX will restart the datapath after, rather than one left for a
+ * reboot. Cases that say nothing get the reboot. */
+static bool ft_restarting;
+static bool cdx_ft_terminal(void) { assert(cdx_info->ctrl.mutex); return ft_fatal && !ft_restarting; }
 static bool cdx_ft_observing(void) { return ft_observe; }
 static unsigned cdx_ft_pending(void) { return private_pending + legacy_pending; }
 /* The barrier a retry issues, and whether it completes. A completed one proves
@@ -901,8 +905,11 @@ static unsigned rearm_retries;
  * only means something across a stretch a case clears it for -- a load that
  * fails, which must leave nothing queued against text about to go. */
 static bool work_queued_invalidate, work_queued_retire, work_queued_rearm, work_queued_dev_stats;
+/* A rearm asked for at once, as CDX's restart does, rather than retried. */
+static unsigned rearm_kicks;
 static void schedule_delayed_work(int *work, unsigned delay)
 {
+    if (work == &ft_rearm_work && !delay) { rearm_kicks++; work_queued_rearm = true; return; }
     if (work == &ft_rearm_work) { assert(delay == HZ); rearm_retries++; work_queued_rearm = true; return; }
     assert(work == &ft_work);
     scheduled++;
@@ -1268,14 +1275,17 @@ static int registered_egress_changed;
 struct cdx_ft_egress_ops {
     void (*changed)(struct net_device *dev);
     int (*drain)(struct net_device *dev);
+    void (*restarted)(void);
 };
 static void ft_egress_changed(struct net_device *dev);
 static int ft_egress_drain(struct net_device *dev);
+static void ft_egress_restarted(void);
 static struct net_device *egress_change_on_add;
 /* File-scope data in the adapter, so defined here beside what it points at. */
 static const struct cdx_ft_egress_ops ft_egress_ops = {
     .changed = ft_egress_changed,
     .drain = ft_egress_drain,
+    .restarted = ft_egress_restarted,
 };
 static int cdx_register_ft_egress(const struct cdx_ft_egress_ops *ops)
 {
@@ -4839,6 +4849,37 @@ static void test_rearm(void)
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
     assert(!ft_passive && !allocated && !ft_invalid && ft_rearms == rearms);
     assert(block.cb_list.next == &block.cb_list && ft_block_list.next == &ft_block_list);
+    /* A latch CDX is restarting the datapath after is not that. A bind
+     * under it is an ordinary one -- parked behind the invalidation the
+     * failed delete raised -- and declines every flow while the latch
+     * holds; a repeat invalidation pass is not skipped either, since the
+     * parked table's flows go live after the restart and must have been
+     * flushed first. The restart asks for everything the stop refused:
+     * both learners reconsider their groups, every SA its peer, and the
+     * parked binding is rearmed at once rather than at the next retry. */
+    ft_restarting = true; ft_invalid = 1;
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+    assert(!ft_passive && ft_bound == 1 && ft_parked == 1 && bound_to(&block, &in)->parked);
+    assert(ft_replace(bound_to(&block, &in), &cls) == -EOPNOTSUPP && !live_hw);
+    unsigned flushes = flushed, recovered = recoveries;
+    ft_invalidate_work(NULL);
+    assert(flushed == flushes + 1 && recoveries == recovered + 1 && ft_invalid_done);
+    ft_rearm_workfn(NULL);
+    assert(ft_parked == 1 && ft_rearms == rearms);
+    unsigned rechecks = mc_rechecks, kicks = mroute_kicks, marked = ipsec_marked_all;
+    unsigned follows = follow_scheduled, rearming = rearm_kicks;
+    ft_fatal = false; /* The restart CDX did, which clears its latch. */
+    ft_egress_restarted();
+    assert(mc_rechecks == rechecks + 1 && mroute_kicks == kicks + 1);
+    assert(ipsec_marked_all == marked + 1 && follow_scheduled == follows + 1);
+    assert(rearm_kicks == rearming + 1);
+    ft_rearm_workfn(NULL);
+    assert(!ft_parked && !ft_invalid && ft_rearms == rearms + 1 && !bound_to(&block, &in)->parked);
+    rearms = ft_rearms;
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && !ft_bound && !allocated && !in.refs);
+    ft_restarting = false;
+    /* A table of a fresh load, which has never been bound. */
+    table.use_neigh = table.use_hw_handles = false;
     ft_fatal = false; /* Simulated fresh module/boot, never a recovery action. */
     ft_invalid_done = false;
     deletion_error = 0;

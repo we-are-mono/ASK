@@ -28,7 +28,7 @@ def test_sdk_hc_transport(tmp_path):
     (tmp_path / "hc_production.inc").write_text("\n".join(function(hc, name) for name in [
         "FillBufPool", "GetBuf", "PutBuf", "EnQFrm", "FmHcQuiesce", "FmHcFree",
         "FmHcSetFramesDataMemory", "FmHcTxConf", "FmHcPcdSync",
-        "FmAllowHcUsage", "FmIsHcUsageAllowed",
+        "FmAllowHcUsage", "FmIsHcUsageAllowed", "FmHcIsFailed",
     ]))
     (tmp_path / "hc_wrapper.inc").write_text("\n".join(function(wrapper, name) for name in [
         "hc_swap_frame", "qm_tx_conf_dqrr_cb", "QmEnqueueCB",

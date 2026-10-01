@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+from test_ehash_cumulative import function as definition
 from test_sdk_port_pcd import ROOT, function
 
 
@@ -19,10 +20,20 @@ def test_sdk_port_state(tmp_path, compat):
     if not (sdk / "inc").exists() or not (fmlib / "src/fm_lib.c").exists():
         pytest.fail("build the ASK kernel/fmlib or set their source overrides")
     port = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
+    flib = (sdk / "Peripherals/FM/Port/fman_port.c").read_text()
     wrapper = (sdk / "src/wrapper/lnxwrp_ioctls_fm.c").read_text()
     start = wrapper.index("        case FM_PORT_IOC_DISABLE:")
     end = wrapper.index("        case FM_PORT_IOC_SET_ERRORS_ROUTE:", start)
     production = function(port, "FM_PORT_GetEnabled")
+    # Whether a port has finished stopping, as the registers say; whether it
+    # hands frames to a PCD; and the fence its owner keeps it stopped by,
+    # with the enable that honours it (renamed: the ioctl cases below script
+    # their own).
+    production += (definition(flib, "fman_port_is_stopped") + definition(flib, "fman_port_enable")
+                   + function(port, "FM_PORT_GetStopped") + function(port, "FM_PORT_IsPcdAttached")
+                   + function(port, "FM_PORT_SetFenced")
+                   + function(port, "FM_PORT_Enable").replace(
+                       "t_Error FM_PORT_Enable(", "static t_Error sdk_port_enable(", 1))
     production += "static t_Error port_ioctl(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned cmd, unsigned long arg, bool compat) { t_Error err = E_OK; switch (cmd) {\n"
     production += wrapper[start:end] + "default: return E_INVALID_SELECTION; } }\n"
     (tmp_path / "port_state.inc").write_text(production)

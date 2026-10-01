@@ -451,6 +451,26 @@ int cdx_ehash_quarantine_retry(void);
 void cdx_ehash_quarantine_abandon(void);
 unsigned int cdx_ehash_quarantine_pending(void);
 
+/* Table entries a delete could not prove it unlinked, kept for the datapath
+ * restart that settles them (cdx_ehash.c). A root is an entry a bucket may
+ * still link, named with the table and the bucket it was added to; a dependent
+ * is reachable only through a root -- a multicast group's listener -- and goes
+ * once every root is settled. Same serialization as the quarantine. */
+void cdx_ehash_abandon(void *td, uint16_t index, void *tbl_entry);
+void cdx_ehash_abandon_dependent(void *tbl_entry);
+/* A root could not be recorded: it may still be linked and nothing knows where,
+ * so no restart can be proven safe. */
+bool cdx_ehash_abandoned_lost(void);
+/* Settle every root, with every port that walks the tables stopped and idle:
+ * delete one still linked, free one no bucket links. 0 when none is left,
+ * with *resolved counting the roots settled by this call; -EAGAIN when one is
+ * still linked, most likely for want of memory, and worth trying again;
+ * -ENOTRECOVERABLE when a table is malformed or a root will not go. */
+int cdx_ehash_resolve_abandoned(unsigned int *resolved);
+/* Unload: settle what can be when the ports were stopped, and leak the rest.
+ * True when nothing that may still be linked is left. */
+bool cdx_ehash_abandoned_exit(bool stopped);
+
 int cdx_set_expt_rate(uint32_t fm_index, uint32_t type, uint32_t limit, uint32_t burst_size);
 bool cdx_expt_rate_is_packet_mode(uint32_t fm_index);
 int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,

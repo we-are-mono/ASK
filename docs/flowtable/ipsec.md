@@ -585,6 +585,17 @@ Proof: `ip xfrm state add … offload packet dev ethN` succeeds, the SA appears
 in CDX's cache, `ethtool -k ethN` reports `esp-hw-offload: on`, and deleting
 the state releases the SEC context.
 
+**A delete that cannot prove the SA's classifier entry gone holds its FQIDs.**
+The entry enqueues to the SA's TO_SEC FQID, and while it may still be linked a
+later SA given the same FQIDs would be fed frames it was never admitted for.
+The queues still go -- an out-of-service FQ rejects the enqueue -- but the
+release that follows on its one-second timer keeps the range, recorded against
+the datapath epoch the failure happened in. The failure stops the datapath,
+and CDX's restart settles the entry with the ports idle, gives every held
+range back and moves the epoch on, so a release that comes after the restart
+gives its range back at once. Nothing else an SA owns is touched by the
+restart: live SAs keep their entries and their SEC contexts.
+
 #### Proved on hardware, 2026-09-18
 
 `tools/tests/test_ipsec_xfrm_offload.py`, both cases, on a KASAN flowtable
@@ -1542,14 +1553,16 @@ state fails to insert, with softirqs enabled. The watch list is walked from
 softirq by the neighbour notifier, so a plain `spin_lock` on that path would
 deadlock against an ARP reply landing on the same CPU.
 
-**A rebuild that fails is terminal for that SA's framing, not just for the
-attempt.** The delete frees the entry's software bookkeeping whichever way it
-went, so after a hard failure nothing distinguishes "no entry" from "an entry
-still linked under a key we no longer track" — and a second attempt would add
-that key on top of the one the hardware still holds, which is the duplicate
-bucket the delete refuses to risk in the first place. So such an SA is marked
-and never moved again; it keeps classifying on the framing it has until it is
-deleted and reinstalled. An outbound NAT-T entry shared with another SA on the
+**A rebuild that fails strands that SA's framing, not just the attempt.** The
+delete frees the entry's software bookkeeping whichever way it went, so after a
+hard failure nothing distinguishes "no entry" from "an entry still linked under
+a key we no longer track" — and a second attempt would add that key on top of
+the one the hardware still holds, which is the duplicate bucket the delete
+refuses to risk in the first place. So such an SA is marked and not moved
+again. The hard failure also latches CDX's failure, which stops the datapath;
+the restart that follows settles the possibly linked key with the ports idle,
+and only then installs the stranded SA's entry again, on the framing it last
+had, for the next follow pass to move. An outbound NAT-T entry shared with another SA on the
 same UDP tuple is refused for a different reason: its delete only drops a
 reference, so a rebuild would change nothing and claiming otherwise would be a
 lie. That one is retried once the twin is gone.

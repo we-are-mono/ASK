@@ -916,8 +916,9 @@ static void ft_retire_workfn(struct work_struct *work)
 	cdx_ft_begin();
 	list_for_each_entry_safe(entry, next, &ft_entries, list) {
 		/* A failed retirement escalates to the existing global recovery.
-		 * That worker proves a barrier or quiesces the datapath before
-		 * reporting completion. Never rearm a terminal hardware failure. */
+		 * That worker proves a barrier or stops the datapath before
+		 * reporting completion. Nothing rearms while CDX's latch holds:
+		 * it clears only once CDX has restarted the datapath. */
 		if (ft_stopping || atomic_read(&ft_invalid))
 			break;
 		if (!nf_flow_offload_handle_valid(entry->handle))
@@ -3374,15 +3375,18 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		 * far worse than a port forwarding in software. A port the
 		 * classifier cannot program is bound passively, and so are two
 		 * refusals that nothing in this boot will lift. A failed deletion
-		 * latches admission off until a fresh boot, so a parked binding
-		 * would wait for a rearm that never comes. A binding past the bound
-		 * could not be flushed by ft_invalidate_work(), whose device
-		 * snapshot that bound sizes; passive bindings are not counted in
-		 * it. An invalidation is different, because it recovers in this
-		 * boot once the bindings it caught are gone: a binding made under
-		 * one is parked below and takes over by itself. */
+		 * CDX cannot settle latches admission off until a fresh boot, so a
+		 * parked binding would wait for a rearm that never comes; one CDX
+		 * is restarting the datapath after is different, and its bindings
+		 * are made as any other's, every flow declined until the restart
+		 * and the rearm it asks for. A binding past the bound could not be
+		 * flushed by ft_invalidate_work(), whose device snapshot that bound
+		 * sizes; passive bindings are not counted in it. An invalidation
+		 * recovers in this boot once the bindings it caught are gone: a
+		 * binding made under one is parked below and takes over by
+		 * itself. */
 		passive = !cdx_ft_port_supported(dev) ? "not a classifier port" :
-			  cdx_ft_failed() ? "admission stopped until reboot" : NULL;
+			  cdx_ft_terminal() ? "admission stopped until reboot" : NULL;
 		if (passive) {
 			rc = ft_bind_passive(dev, bo, flowtable, indirect, sch, cleanup,
 					     passive);
@@ -3536,17 +3540,19 @@ static void ft_invalidate_work(struct work_struct *work)
 	/* Sampled before anything is retired or snapshotted: an event counted
 	 * after this has queued a pass of its own. */
 	seq = atomic_read(&ft_invalid_seq);
-	/* After a terminal failure nothing is ever admitted again, so a repeat
-	 * pass has no flow to protect. */
-	if (ft_invalid_done && cdx_ft_failed()) {
+	/* After a failure CDX cannot settle nothing is ever admitted again, so a
+	 * repeat pass has no flow to protect. One it is restarting after is
+	 * not that: the parked tables' flows go live after the restart, and the
+	 * pass has to have flushed them first. */
+	if (ft_invalid_done && cdx_ft_terminal()) {
 		ft_done_seq = seq;
 		cdx_ft_end();
 		return;
 	}
 	list_for_each_entry_safe(entry, next, &ft_entries, list)
 		ft_remove(entry);
-	/* CDX retains failed deletions and owns the terminal hardware latch.
-	 * Retry until a barrier or datapath quiescence makes retirement safe. */
+	/* CDX retains failed deletions and owns the hardware latch. Retry until
+	 * a barrier or the stopped datapath makes retirement safe. */
 	if (cdx_ft_recover()) {
 		cdx_ft_end();
 		if (!READ_ONCE(ft_stopping))
@@ -4841,9 +4847,28 @@ static int ft_egress_drain(struct net_device *dev)
 	return ft_mr_egress_drain(dev) ?: rc;
 }
 
+/* CDX restarted the datapath after a deletion it could not prove (struct
+ * cdx_ft_egress_ops). While it was stopped every flow was declined, every
+ * multicast group and SA rebuild refused, and a binding parked behind an
+ * invalidation held back, since none of that drains while the latch is held.
+ * Flows come back on their next offer by themselves; the rest is asked for
+ * here: both learners reconsider every group, every SA has its peer looked up
+ * again -- which rebuilds only the ones that need it -- and a parked binding is
+ * rearmed if its invalidation has drained. Each queues its own work and takes
+ * no lock of CDX's here. */
+static void ft_egress_restarted(void)
+{
+	ft_mc_kick_all();
+	ft_mr_kick();
+	ft_ipsec_all_moved();
+	schedule_work(&ft_ipsec_follow);
+	schedule_delayed_work(&ft_rearm_work, 0);
+}
+
 static const struct cdx_ft_egress_ops ft_egress_ops = {
 	.changed = ft_egress_changed,
 	.drain = ft_egress_drain,
+	.restarted = ft_egress_restarted,
 };
 
 /* ------------------------------------------- The multicast learners' streams
@@ -14602,6 +14627,12 @@ static int ft_show(struct seq_file *seq, void *v)
 	/* Control frames sent as unclassified traffic because their port's
 	 * control budget was spent. */
 	seq_printf(seq, "qos_control_overruns %llu\n", cdx_ft_qos_control_overruns());
+	/* fatal is CDX's latch, held from a deletion it could not prove until
+	 * it has restarted the datapath; fatal_terminal says it never will in
+	 * this boot, restarts counts the ones it has done, and resume_failures
+	 * the classifier ports they could not start again. */
+	seq_printf(seq, "fatal_terminal %u\nrestarts %u\nresume_failures %u\n",
+		   cdx_ft_terminal(), cdx_ft_restarts(), cdx_ft_resume_failures());
 	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nparked %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
@@ -14780,7 +14811,8 @@ static void ft_block_drain(void)
  * can count on the invalidation worker for it: ft_invalidate() does nothing
  * once ft_stopping is set. It cannot fail, so it waits, releasing the
  * transaction between attempts so configuration and other kernel work can
- * progress. A fatal state stays in CDX, and a later load cannot clear it. */
+ * progress. A latch stays in CDX: a later load is refused until CDX has
+ * restarted the datapath, and for good when it cannot. */
 static void ft_hw_settle(void)
 {
 	int rc;

@@ -635,15 +635,200 @@ int cdx_ehash_quarantine_retry(void)
 	return list_empty(&cdx_ehash_pending_frees) ? 0 : -EAGAIN;
 }
 
+/* Table entries a delete could not prove it unlinked.
+ *
+ * Every arm of ExternalHashTableDeleteKey() that returns -1 does so before it
+ * changes anything, and the test knob below fails a delete without calling it
+ * at all, so such an entry is linked exactly where it was or in no bucket. No
+ * barrier makes freeing it safe while a port walks the tables. Once every port
+ * that does is stopped and idle (dpa_cfg_stop()), though, nothing races a
+ * second look: the delete is tried again, and an entry no bucket links any
+ * more can simply go. That is what lets the datapath restart rather than wait
+ * for a reboot (cdx_ft_restart()).
+ *
+ * A root is an entry the tables may link -- a flow's, a multicast group's, an
+ * SA's -- recorded with the table and the bucket it was added to. A dependent
+ * is one only a root reaches -- a multicast group's listeners, chained behind
+ * the group's entry -- and goes once every root has been settled.
+ *
+ * A record is allocated when the delete fails, and that can fail too. A root
+ * without one may still be linked with nothing that knows where, so no restart
+ * can be proven safe, and the latch is left for a reboot as before these
+ * records existed. A dependent without one is leaked: whatever reached it is a
+ * root, settled or not.
+ *
+ * Same serialization as the quarantine above.
+ */
+struct cdx_ehash_abandoned {
+	struct list_head list;
+	void *td;
+	void *tbl_entry;
+	uint16_t index;
+	/* Deletes the table refused this root during a restart. */
+	unsigned int attempts;
+};
+
+static LIST_HEAD(cdx_ehash_abandoned_roots);
+static LIST_HEAD(cdx_ehash_abandoned_dependents);
+static bool cdx_ehash_abandoned_unrecorded;
+
+/* How many restarts a root still linked may hold up, its delete refused each
+ * time, most likely for want of a cumulative node, before the doubt is taken as
+ * permanent. */
+#define CDX_EHASH_RESOLVE_ATTEMPTS	8
+
+static struct cdx_ehash_abandoned *cdx_ehash_abandoned_record(void *td,
+		uint16_t index, void *tbl_entry, struct list_head *list)
+{
+	struct cdx_ehash_abandoned *node;
+
+	node = kmalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return NULL;
+	node->td = td;
+	node->tbl_entry = tbl_entry;
+	node->index = index;
+	node->attempts = 0;
+	list_add_tail(&node->list, list);
+	return node;
+}
+
+void cdx_ehash_abandon(void *td, uint16_t index, void *tbl_entry)
+{
+	cdx_ehash_quarantine_assert_held();
+	if (!tbl_entry || cdx_ehash_abandoned_record(td, index, tbl_entry,
+						     &cdx_ehash_abandoned_roots))
+		return;
+	DPA_ERROR("%s::cannot record possibly linked tbl_entry %p; only a reboot frees it\n",
+			__func__, tbl_entry);
+	cdx_ehash_abandoned_unrecorded = true;
+}
+
+void cdx_ehash_abandon_dependent(void *tbl_entry)
+{
+	cdx_ehash_quarantine_assert_held();
+	if (!tbl_entry || cdx_ehash_abandoned_record(NULL, 0, tbl_entry,
+						     &cdx_ehash_abandoned_dependents))
+		return;
+	DPA_ERROR("%s::cannot record tbl_entry %p behind a possibly linked root, leaking it\n",
+			__func__, tbl_entry);
+}
+
+bool cdx_ehash_abandoned_lost(void)
+{
+	cdx_ehash_quarantine_assert_held();
+	return cdx_ehash_abandoned_unrecorded;
+}
+
+/* One root, with nothing walking the tables: 0 once it is unlinked, or found
+ * in no bucket, and its entry the caller's to free. Asks the SDK directly,
+ * never through the knob that fails deletes, so an armed knob cannot hold a
+ * restart up. */
+static int cdx_ehash_resolve_root(struct cdx_ehash_abandoned *node)
+{
+	uint16_t where = node->index;
+	int rc;
+
+	rc = ExternalHashTableFindEntry(node->td, node->tbl_entry, &where);
+	if (rc == -ENOENT)
+		return 0;
+	if (rc) {
+		DPA_ERROR("%s::table %p is malformed (%d) around tbl_entry %p\n",
+				__func__, node->td, rc, node->tbl_entry);
+		return -ENOTRECOVERABLE;
+	}
+	if (where != node->index)
+		DPA_ERROR("%s::tbl_entry %p is linked from bucket %u, added to %u\n",
+				__func__, node->tbl_entry, where, node->index);
+	rc = ExternalHashTableDeleteKey(node->td, where, node->tbl_entry);
+	/* With no walker in the tables an unlink needs no barrier to be
+	 * final; the restart issues one anyway before anything starts. */
+	if (rc == SUCCESS || rc == EN_EHASH_DELETE_UNSYNCED)
+		return 0;
+	if (++node->attempts < CDX_EHASH_RESOLVE_ATTEMPTS)
+		return -EAGAIN;
+	DPA_ERROR("%s::tbl_entry %p still linked after %u deletes\n",
+			__func__, node->tbl_entry, node->attempts);
+	return -ENOTRECOVERABLE;
+}
+
+int cdx_ehash_resolve_abandoned(unsigned int *resolved)
+{
+	struct cdx_ehash_abandoned *node, *tmp;
+	int rc, ret = 0;
+
+	cdx_ehash_quarantine_assert_held();
+	*resolved = 0;
+	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_roots, list)
+	{
+		rc = cdx_ehash_resolve_root(node);
+		if (rc == -ENOTRECOVERABLE)
+			return rc;
+		if (rc) {
+			ret = rc;
+			continue;
+		}
+		list_del(&node->list);
+		ExternalHashTableEntryFree(node->tbl_entry);
+		kfree(node);
+		(*resolved)++;
+	}
+	if (ret)
+		return ret;
+	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_dependents, list)
+	{
+		list_del(&node->list);
+		ExternalHashTableEntryFree(node->tbl_entry);
+		kfree(node);
+	}
+	return 0;
+}
+
+/* Unload. With the ports stopped every root that will go is settled and freed,
+ * as a restart would; whatever is left, or everything when the ports could not
+ * be stopped, stays allocated for the reset that alone can free it, and only
+ * the bookkeeping is released. Runs where cdx_ehash_quarantine_abandon() does,
+ * with the tables still configured. True when nothing that may still be linked
+ * is left, recorded or not. */
+bool cdx_ehash_abandoned_exit(bool stopped)
+{
+	struct cdx_ehash_abandoned *node, *tmp;
+	unsigned int resolved, leaked = 0;
+
+	cdx_ehash_quarantine_assert_held();
+	if (stopped && !cdx_ehash_abandoned_unrecorded)
+		/* Every refusal counts toward the root's attempts, so this
+		 * ends. */
+		while (cdx_ehash_resolve_abandoned(&resolved) == -EAGAIN)
+			;
+	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_roots, list)
+	{
+		list_del(&node->list);
+		kfree(node);
+		leaked++;
+	}
+	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_dependents, list)
+	{
+		list_del(&node->list);
+		kfree(node);
+		leaked++;
+	}
+	if (leaked)
+		DPA_ERROR("%s::leaking %u possibly linked table entries until reset\n",
+				__func__, leaked);
+	return !leaked && !cdx_ehash_abandoned_unrecorded;
+}
+
 #ifdef CDX_DEBUG_FLOWTABLE
 /* Test-only. Classifier deletes to fail before the unlink, for the roots that
  * delete through here -- multicast groups and IPsec SAs; unicast flowtable
  * entries delete directly and have flowtable_fail_unlink. Each leaves its key
- * linked, exactly as the not-provably-unlinked arm below describes, and only a
- * reboot clears that. */
+ * linked, exactly as the not-provably-unlinked arm below describes, until the
+ * datapath restart settles it -- which asks the SDK directly, so an armed count
+ * never fails the restart's own deletes. */
 static unsigned int ehash_fail_unlink;
 module_param_named(ehash_fail_unlink, ehash_fail_unlink, uint, 0600);
-MODULE_PARM_DESC(ehash_fail_unlink, "Multicast/IPsec classifier deletes to fail before unlink, leaving the key linked; reboot required");
+MODULE_PARM_DESC(ehash_fail_unlink, "Multicast/IPsec classifier deletes to fail before unlink, leaving the key linked; the datapath stops and restarts");
 #endif
 
 static bool cdx_ehash_unlink_fault(void)
@@ -697,12 +882,15 @@ int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle)
 		cdx_ehash_quarantine_entry(td, handle);
 		return rc;
 	}
-	/* Not provably unlinked, and there is no second unlink to retry: a
-	 * live chain may still resolve to this entry forever. Freeing it -
-	 * now, or later through the quarantine - is a use-after-free the
-	 * hardware commits, so the memory is abandoned deliberately. */
-	DPA_ERROR("%s::DeleteKey rc %d, leaking tbl_entry %p: not provably unlinked, freeing it would be a use-after-free\n",
+	/* Not provably unlinked, and nothing may retry the unlink while the
+	 * ports run: a live chain may still resolve to this entry. Freeing it
+	 * - now, or later through the quarantine - is a use-after-free the
+	 * hardware commits, so it is recorded for the restart that stops the
+	 * ports and settles it (cdx_ehash_resolve_abandoned()); the caller
+	 * latches the failure that brings that restart about. */
+	DPA_ERROR("%s::DeleteKey rc %d, keeping tbl_entry %p: not provably unlinked\n",
 			__func__, rc, handle);
+	cdx_ehash_abandon(td, index, handle);
 	return rc;
 }
 

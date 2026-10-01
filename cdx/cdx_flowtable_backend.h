@@ -364,15 +364,30 @@ void cdx_ft_assert_held(void);
 
 /* All operations below require a transaction unless explicitly stated.
  * Claim is exclusive. Release requires zero live directions, but CDX keeps any retired hardware
- * storage and its terminal failure state. Neither operation resets hardware.
+ * storage and its failure latch, which only a datapath restart or a reboot
+ * clears. Neither operation resets hardware.
  */
 int cdx_ft_claim(void);
 int cdx_ft_release(void);
+/* A deletion could not be proven and the datapath is stopped, or about to be,
+ * until CDX has settled it and restarted. */
 bool cdx_ft_failed(void);
-/* Latch terminal failure: a root outside the unicast delete path -- a
- * multicast group's or an IPsec SA's -- that could not be provably unlinked
- * and may still forward in hardware. Refuses new entries and groups, blocks port restart, stops the
- * ports, and makes the drain demand a reset. */
+/* The failure cannot be settled in this boot: the datapath stays stopped and
+ * only a reboot clears it. Implies cdx_ft_failed(). */
+bool cdx_ft_terminal(void);
+/* How many times the datapath has restarted after a failure since CDX loaded. */
+unsigned int cdx_ft_restarts(void);
+/* How many classifier ports those restarts could not start again. The latch
+ * stays clear -- the tables are settled -- and each port is named in the log:
+ * a receive port starts again with its netdev, an offline port only with
+ * CDX's reload or a reboot. */
+unsigned int cdx_ft_resume_failures(void);
+/* Latch the failure for a root outside the unicast delete path -- a multicast
+ * group's or an IPsec SA's -- that could not be provably unlinked and may
+ * still forward in hardware. Refuses new entries and groups, blocks port
+ * restart and stops the ports; once they are stopped CDX settles the root and
+ * restarts the datapath, unless that cannot be proven safe (cdx_ft_terminal()).
+ * Also what a failed unicast delete latches, through cdx_ft_del(). */
 void cdx_ft_fatal(void);
 unsigned int cdx_ft_pending(void);
 
@@ -490,13 +505,16 @@ void cdx_ft_stats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
 void cdx_ft_stats_unpublish(struct cdx_ft_stats_slot *slot);
 void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
 /* Always consumes *hw. -EAGAIN: unlinked storage awaits a barrier. -EIO:
- * unlink is unproven; CDX latches a terminal failure and must quiesce hardware.
- * Both errors require the adapter to stop admission and start global recovery.
+ * unlink is unproven; CDX latches the failure (cdx_ft_fatal()) and stops the
+ * datapath until it has settled the key and restarted. Both errors require the
+ * adapter to stop admission and start global recovery.
  */
 int cdx_ft_del(struct cdx_ft_hw **hw);
-/* Retry retired storage; after terminal failure, first try to quiesce the
- * datapath. -EAGAIN means retry later. Success never clears terminal failure.
- * Never report software fallback ready before this operation succeeds.
+/* Retry retired storage; after a failure, first make sure the datapath is
+ * stopped. -EAGAIN means retry later. Success never clears the failure: the
+ * restart that does is CDX's own, and is reported through the egress ops'
+ * restarted(). Never report software fallback ready before this operation
+ * succeeds.
  */
 int cdx_ft_recover(void);
 

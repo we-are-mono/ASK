@@ -175,6 +175,9 @@ print('SENT')
 class MulticastRig:
     def __init__(self, target, session, lan):
         self.target, self.session, self.lan = target, session, lan
+        # CDX's restart limit as a case found it, while the case has it
+        # raised (_flowtable_restart.restart_budget()).
+        self.restart_limit = None
 
     async def proc(self) -> dict:
         return status_text(await read(self.target, self.session, "/proc/cdx_flowtable"))
@@ -563,8 +566,20 @@ async def multicast_rig(target_agent, aiohttp_session, lan, splat_window):
         try:
             yield r
         finally:
+            # A case whose console could not put CDX's restart limit back
+            # leaves it here, to go back once no restart is pending: CDX
+            # checks the limit on every attempt, and the boot's own could find
+            # its budget spent and stop the ports for good.
+            restored = None
+            if r.restart_limit is not None:
+                cleared = await r.settle(lambda s: not s["fatal"], "CDX's latch clear", timeout=10)
+                restored = await target_agent.fs_write(
+                    aiohttp_session, "/sys/module/cdx/parameters/flowtable_restart_limit", r.restart_limit)
+                r.restart_limit = None
+                r.record("mcast-restart-limit-restored", summary(cleared))
             drained = await r.settle(
                 lambda s: s["mcast_groups"] == s["mroute_groups"] == 0 and
                 s["mcast_installed"] == s["mroute_installed"] == 0 and s["quarantine"] == 0,
                 "multicast state drained after the case", timeout=15)
             r.record("mcast-drained", summary(drained))
+            assert restored is None or not restored["errno"], ("CDX's restart limit not restored", restored)

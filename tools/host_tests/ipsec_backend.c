@@ -114,6 +114,17 @@ typedef struct _tRouteEntry {
 static bool transaction = true;
 static void cdx_ft_assert_held(void) { assert(transaction); }
 
+/* The list the backend keeps its SAs on. */
+struct list_head { struct list_head *next, *prev; };
+#define LIST_HEAD(n) struct list_head n = { &n, &n }
+#define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define list_for_each_entry(p, h, m) \
+	for (p = list_entry((h)->next, typeof(*p), m); &p->m != (h); \
+	     p = list_entry(p->m.next, typeof(*p), m))
+static void list_add_tail(struct list_head *e, struct list_head *h)
+{ e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
+static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->prev = e->prev; }
+
 /* The classifier entry an outbound SA's frames leave SEC by. Removal answers
  * as scripted, EN_EHASH_DELETE_UNSYNCED being the arm that parks the key
  * provably out of the table (the value the ehash patch gives it); each
@@ -1001,6 +1012,50 @@ static void test_set_next_hop(void)
 #undef REARM
 }
 
+/* The datapath restart settles every key a failed delete may have left
+ * linked, so an SA such a delete stranded -- its entry gone from software,
+ * possibly not from the table -- has the entry installed again, on the framing
+ * it last had. An SA whose entry is in place, stranded or not, is left alone,
+ * and an install that fails strands it again. */
+static void test_restarted(void)
+{
+	struct net_device port = { .mtu = 1500 };
+	struct hw_ct ct = { .handle = &ct };
+	SAEntry lost_entry = { 0 }, live_entry = { .ct = &ct }, kept_entry = { .ct = &ct };
+	struct cdx_ipsec_sa lost = { .entry = &lost_entry, .dev = &port, .handle = 1, .stranded = true };
+	struct cdx_ipsec_sa live = { .entry = &live_entry, .dev = &port, .handle = 2 };
+	struct cdx_ipsec_sa kept = { .entry = &kept_entry, .dev = &port, .handle = 3, .stranded = true };
+
+	lost_entry.pRtEntry = &lost.route;
+	live_entry.pRtEntry = &live.route;
+	kept_entry.pRtEntry = &kept.route;
+	lost.route.mtu = 1400;
+	lost.route.dstmac[5] = 9;
+	list_add_tail(&lost.list, &cdx_ipsec_sa_list);
+	list_add_tail(&live.list, &cdx_ipsec_sa_list);
+	list_add_tail(&kept.list, &cdx_ipsec_sa_list);
+	fp_installs = fp_deletes = 0;
+	memset(fp_install_rc, 0, sizeof(fp_install_rc));
+	cdx_ipsec_sa_restarted();
+	assert(fp_installs == 1 && !fp_deletes && fp_installed[0].mtu == 1400);
+	assert(fp_installed[0].dstmac[5] == 9);
+	assert(!lost.stranded && !live.stranded && !kept.stranded);
+	/* Nothing stranded: nothing installed. */
+	cdx_ipsec_sa_restarted();
+	assert(fp_installs == 1);
+	lost.stranded = true;
+	fp_install_rc[1] = -1;
+	cdx_ipsec_sa_restarted();
+	assert(fp_installs == 2 && lost.stranded && !kept.stranded);
+	/* And the next restart tries again. */
+	cdx_ipsec_sa_restarted();
+	assert(fp_installs == 3 && !lost.stranded);
+	list_del(&lost.list);
+	list_del(&live.list);
+	list_del(&kept.list);
+	memset(fp_install_rc, 0, sizeof(fp_install_rc));
+}
+
 int main(void)
 {
 	test_packet_total();
@@ -1016,6 +1071,7 @@ int main(void)
 	test_stats_layout();
 	test_validate();
 	test_set_next_hop();
+	test_restarted();
 	printf("ipsec backend: ok\n");
 	return 0;
 }

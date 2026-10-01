@@ -680,32 +680,33 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 		/* The classifier key was NOT provably unlinked (invalid table
 		 * state, or no memory for a replacement cumulative node), so
 		 * the ucode may still resolve it and replicate through the
-		 * listener chain indefinitely. These entries must never reach
-		 * the allocator - not now, and not via the quarantine, whose
-		 * backlog is freed on the next successful sync. Leak them
-		 * loudly and clear the slots so nothing else can. The group id
-		 * is software bookkeeping and is released regardless. */
-		unsigned int ii, leaked = 0;
+		 * listener chain. These entries must not reach the allocator
+		 * while it can - not now, and not via the quarantine, whose
+		 * backlog is freed on the next successful sync. They are
+		 * recorded behind the classifier's own entry, which
+		 * delete_entry_from_classif_table() recorded as a root and
+		 * whose software-only hw_ct wrapper it released, and the slots
+		 * cleared so nothing else can reach them. The group id is
+		 * software bookkeeping and is released regardless. */
+		unsigned int ii, kept = 0;
 
 		FreeMcastGrpID(pMcastGrpInfo->mctype, pMcastGrpInfo->grpid);
 		for (ii = 0; ii < MC_MAX_LISTENERS_PER_GROUP; ii++)
 		{
 			if (!pMcastGrpInfo->members[ii].bIsValidEntry)
 				continue;
+			cdx_ehash_abandon_dependent(pMcastGrpInfo->members[ii].tbl_entry);
 			pMcastGrpInfo->members[ii].tbl_entry = NULL;
 			pMcastGrpInfo->members[ii].bIsValidEntry = 0;
-			leaked++;
+			kept++;
 		}
-		/* The classifier's own table entry leaks with the members (it
-		 * may still be linked); delete_entry_from_classif_table()
-		 * already abandoned it and released its software-only hw_ct
-		 * wrapper. */
-		DPA_ERROR("%s::classifier delete failed pre-unlink (rc %d), leaking %u listener entries + the classifier entry\n",
-			  __func__, rc, leaked);
-		/* The root may still be linked and replicate through the leaked
-		 * listener chain. Latch terminal failure, as the unicast delete
-		 * does on -EIO, so the datapath fail-stops and demands a reset
-		 * rather than forwarding to a revoked listener on unnoticed. */
+		DPA_ERROR("%s::classifier delete failed pre-unlink (rc %d), keeping %u listener entries + the classifier entry\n",
+			  __func__, rc, kept);
+		/* The root may still be linked and replicate through the
+		 * listener chain. Latch the failure, as the unicast delete
+		 * does on -EIO: the datapath stops rather than forwarding to a
+		 * revoked listener unnoticed, and restarts once the root is
+		 * settled, freeing these with it. */
 		cdx_ft_fatal();
 	}
 	if (pMcastGrpInfo->pCtEntry)

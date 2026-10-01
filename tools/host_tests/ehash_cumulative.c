@@ -11,6 +11,7 @@
  * on the table's spare, so it unlinks the key however the allocator does, and
  * fails only when the spare is gone too -- then with the bucket untouched. */
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -86,9 +87,15 @@ static void XX_FreeSmart(void *p)
     live_nodes--;
     free(p);
 }
+/* Every key hashes to the bucket a case names: the first, unless it says. */
+static uint16_t add_bucket;
 static void get_indexed_hash_bucket(uint8_t size, uint8_t *key, uint8_t shift, uint16_t mask,
                                     uint16_t *index)
-{ (void)size; (void)key; (void)shift; (void)mask; *index = 0; }
+{ (void)size; (void)key; (void)shift; assert(add_bucket <= mask); *index = add_bucket; }
+/* The PCD's host-command channel, as far as whether it has failed for good. */
+static bool hc_failed;
+static t_Handle FmPcdGetHcHandle(t_Handle pcd) { return pcd; }
+static bool FmHcIsFailed(t_Handle hc) { assert(hc); return hc_failed; }
 
 /* The PCD's host-command sync. A delete's goes through the DeleteKey fault
  * knob first, as in the test image. */
@@ -195,6 +202,119 @@ static void park_late(void)
 {
     late = ExternalHashTableAllocCumulativeEntry(&info);
     ehash_park_node(&info, late);
+}
+
+/* Where an entry is linked, for an owner whose delete could not prove it
+ * gone: looked for first where it was added, then everywhere, and answered
+ * from the chains as the delete and the microcode both walk them -- or refused
+ * when the two disagree, or a chain does not end. */
+static uint16_t where(struct en_exthash_info *table, struct en_exthash_tbl_entry *e,
+                      uint16_t hint, int expect)
+{
+    uint16_t index = hint;
+
+    assert(ExternalHashTableFindEntry(table, e, &index) == expect && !bucket_locked);
+    if (expect)
+        assert(index == hint);
+    return index;
+}
+static void check_find(void)
+{
+    struct en_exthash_tbl_entry *e[12], *stranger = entry(999);
+    struct en_exthash_bucket buckets[4] = { 0 };
+    void *locks[4] = { (void *)1, (void *)2, (void *)3, (void *)4 };
+    struct en_exthash_info wide = { .table_base = buckets, .pSpinlock = locks, .pcd = &pcd,
+                                    .hashmask = 3 };
+    unsigned before;
+
+    /* An empty table links nothing; nor does a malformed request. */
+    assert(!bucket.h);
+    where(&info, stranger, 0, -ENOENT);
+    uint16_t index = 0;
+    assert(ExternalHashTableFindEntry(NULL, stranger, &index) == -EINVAL);
+    assert(ExternalHashTableFindEntry(&info, NULL, &index) == -EINVAL);
+    assert(ExternalHashTableFindEntry(&info, stranger, NULL) == -EINVAL);
+    /* A delete of a key no bucket links finds no node in an empty bucket,
+     * rather than reading one at address zero; it changes nothing. */
+    before = reports;
+    assert(ExternalHashTableDeleteKey(&info, 0, stranger) == -1 && reports == before + 1);
+    assert(!bucket.h && !bucket_locked);
+    /* The bucket's head, a cumulative node's slot, and a node further down a
+     * chain: each found where it was added. One never added is in none. */
+    e[0] = entry(800); add(e[0]);
+    assert(direct(e[0]) && !where(&info, e[0], 0, 0));
+    where(&info, stranger, 0, -ENOENT);
+    for (unsigned i = 1; i < 11; i++) { e[i] = entry(800 + i); add(e[i]); }
+    assert(chained() == 2);
+    for (unsigned i = 0; i < 11; i++) assert(!where(&info, e[i], 0, 0));
+    where(&info, stranger, 0, -ENOENT);
+    /* A hint past the table is no reason not to look. */
+    assert(!where(&info, e[5], 7, 0) && !bucket_locked);
+    /* A chain whose software link and the microcode's disagree, a flag that
+     * promises a node the software does not have, and a chain that never
+     * ends are all malformed: no answer would hold for both walkers. */
+    struct en_cumulative_tbl_entry *front = (void *)head();
+    uint64_t addr = front->cumulative_entry.next_entry_addr;
+    front->cumulative_entry.next_entry_addr = 0;
+    where(&info, e[1], 0, -EUCLEAN);
+    front->cumulative_entry.next_entry_addr = addr;
+    struct en_cumulative_tbl_entry *back = front->next_entry;
+    back->cumulative_entry.flags |= EN_NEXT_CUMULATIVE_NODE;
+    where(&info, stranger, 0, -EUCLEAN);
+    back->next_entry = back;
+    back->cumulative_entry.next_entry_addr = SwapUint64(XX_VirtToPhys(back));
+    where(&info, stranger, 0, -EUCLEAN);
+    back->next_entry = NULL;
+    back->cumulative_entry.next_entry_addr = 0;
+    back->cumulative_entry.flags &= ~EN_NEXT_CUMULATIVE_NODE;
+    assert(!where(&info, e[10], 0, 0));
+    /* So is a node no add or delete leaves: one holding no key, or a lone
+     * node holding a single key, whose delete is refused however often it
+     * is asked. A chain's head holding a single key is neither. */
+    uint8_t keys = back->cumulative_entry.num_key_entries;
+    back->cumulative_entry.num_key_entries = 0;
+    where(&info, stranger, 0, -EUCLEAN);
+    back->cumulative_entry.num_key_entries = keys;
+    assert(front->cumulative_entry.num_key_entries == 1 &&
+           ehash_node_entry(&front->cumulative_entry, 0) == e[10]);
+    front->next_entry = NULL;
+    front->cumulative_entry.next_entry_addr = 0;
+    front->cumulative_entry.flags &= ~EN_NEXT_CUMULATIVE_NODE;
+    where(&info, e[10], 0, -EUCLEAN);
+    for (unsigned i = 0; i < 2; i++) {
+        before = reports;
+        assert(ExternalHashTableDeleteKey(&info, 0, e[10]) == -1 && reports == before + 1);
+        assert(head() == (void *)front && !bucket_locked &&
+               !(front->cumulative_entry.flags & EN_INVALID_CUMULATIVE_NODE));
+    }
+    front->next_entry = back;
+    front->cumulative_entry.next_entry_addr = addr;
+    front->cumulative_entry.flags |= EN_NEXT_CUMULATIVE_NODE;
+    assert(!where(&info, e[10], 0, 0));
+    for (unsigned i = 0; i < 11; i++) removed(e[i]);
+    assert(!bucket.h);
+    /* An entry linked from another bucket than the one it was named with is
+     * found there, and a delete given that bucket unlinks it. */
+    add_bucket = 2;
+    e[0] = entry(900); e[1] = entry(901);
+    assert(ExternalHashTableAddKey(&wide, KEY, e[0]) == 2);
+    assert(ExternalHashTableAddKey(&wide, KEY, e[1]) == 2);
+    add_bucket = 0;
+    assert(where(&wide, e[1], 0, 0) == 2 && !buckets[0].h && buckets[2].h);
+    where(&wide, stranger, 0, -ENOENT);
+    assert(ExternalHashTableDeleteKey(&wide, 2, e[1]) == 0);
+    where(&wide, e[1], 0, -ENOENT);
+    release_entry(e[1]);
+    assert(where(&wide, e[0], 3, 0) == 2);
+    assert(ExternalHashTableDeleteKey(&wide, 2, e[0]) == 0 && !buckets[2].h);
+    release_entry(e[0]);
+    /* Whether the channel the barriers go through has failed for good. */
+    assert(!ExternalHashTableHcFailed(&info) && !ExternalHashTableHcFailed(NULL));
+    hc_failed = true;
+    assert(ExternalHashTableHcFailed(&info));
+    hc_failed = false;
+    release_entry(stranger);
+    if (wide.spare) ExternalHashTableCumulativeEntryFree(wide.spare);
 }
 
 int main(void)
@@ -510,10 +630,13 @@ int main(void)
     assert(ExternalHashTableFmPcdHcSync(&info) == -1 && sync_failed_lines == failed + 2);
     assert(ExternalHashTableFmPcdHcSync(&info) == 0 && sync_recovered_lines == recovered + 2);
 
+    check_find();
+
     /* The table's destruction frees its spare, and with it the last node. */
     ExternalHashTableCumulativeEntryFree(xchg(&info.spare, NULL));
     assert(!live_nodes && !live_entries);
     puts("EHASH cumulative delete: every displaced node parked until a completed barrier, none leaked; "
-         "a failed allocation falls back on the spare, and fails a delete only with the bucket untouched");
+         "a failed allocation falls back on the spare, and fails a delete only with the bucket untouched; "
+         "a possibly linked entry is found wherever a bucket links it");
     return 0;
 }

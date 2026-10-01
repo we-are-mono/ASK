@@ -20,18 +20,9 @@ being pinned here is that an SA can be described, accepted and withdrawn.
 
 from __future__ import annotations
 
-import asyncio
-import json
-import os
-import time
-
 import pytest
 
-from ask_orch.uart import Console
-from _ipsec_helpers import endpoints_up, iface_index, sa_add
 from _topology import TARGET_WAN_IF
-from test_flowtable_offload import (ARTIFACTS, RX_PORTS_SCRIPT, command, console_command, console_python,
-                                    read, status_text, stop_boot_daemon)
 
 # Documentation-range addresses (RFC 2544 benchmarking block), distinct from
 # every other IPsec file's so the tests can run in any order.
@@ -128,97 +119,3 @@ async def test_packet_offload_sa_install(aiohttp_session, target_agent):
         await _run(aiohttp_session, target_agent, *delete, expect_rc=None)
         for argv in teardown:
             await _run(aiohttp_session, target_agent, *argv, expect_rc=None)
-
-
-UNLINK_FAULT = "/sys/module/cdx/parameters/ehash_fail_unlink"
-# Which inbound SA's classifier delete fails before its unlink, by the value of
-# ASK_FLOWTABLE_TERMINAL: bare ESP keys its entry on the SPI; NAT-T keys it on
-# the UDP pair and picks the SA by SPI inside it.
-TERMINAL = {"ipsec-unlink": None, "ipsec-natt-unlink": (4500, 4500)}
-TERMINAL_LOCAL = "198.18.91.1"
-TERMINAL_PEER = "198.18.91.2"
-TERMINAL_PEER_MAC = "02:00:00:00:91:02"
-TERMINAL_SPI = 0x4d6f6e70
-TERMINAL_REQID = 49101
-
-
-@pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TERMINAL") not in TERMINAL,
-                    reason="explicit terminal lifecycle test; fresh boot required")
-async def test_packet_offload_sa_unproven_delete_is_terminal(aiohttp_session, target_agent):
-    """An SA delete that cannot prove its entry unlinked fail-stops the
-    datapath and keeps the SA's FQIDs.
-
-    The entry enqueues to the SA's TO_SEC FQID. If it may still be linked, the
-    queues can go -- an out-of-service FQ rejects the enqueue -- but the FQIDs
-    cannot: a later SA or any other queue given them would be fed frames it
-    was never admitted for. So the delete must latch terminal failure, stop
-    the ports, and the release that follows must hold the FQIDs rather than
-    return them.
-
-    Terminal: the ports stop and take the management path with them, so the
-    delete and every read after it go over the UART and nothing is restored;
-    the reset the DUT then demands is the restoration."""
-    natt = TERMINAL[os.environ["ASK_FLOWTABLE_TERMINAL"]]
-    await stop_boot_daemon()
-    initial = status_text(await read(target_agent, aiohttp_session, "/proc/cdx_flowtable"))
-    assert initial["fatal"] == 0, initial
-    # No unicast binding: its invalidation pass also drives recovery, and would
-    # stop the ports even if the IPsec latch never did.
-    assert initial["bindings"] == initial["entries"] == 0, initial
-    present = await target_agent.fs_read(aiohttp_session, UNLINK_FAULT)
-    if present["errno"]:
-        pytest.fail(f"{UNLINK_FAULT} is missing: this is not the fault-injection test image")
-
-    ifindex = await iface_index(target_agent, aiohttp_session, TARGET_WAN_IF)
-    await endpoints_up(target_agent, aiohttp_session, iface=TARGET_WAN_IF,
-                       local=TERMINAL_LOCAL, peer=TERMINAL_PEER, lladdr=TERMINAL_PEER_MAC)
-    reply = await sa_add(target_agent, aiohttp_session, src=TERMINAL_PEER, dst=TERMINAL_LOCAL,
-                         spi=TERMINAL_SPI, reqid=TERMINAL_REQID, ifindex=ifindex, inbound=True,
-                         natt=natt)
-    assert reply.ok, reply
-    installed = status_text(await read(target_agent, aiohttp_session, "/proc/cdx_flowtable"))
-    assert installed["ipsec_sas"] == initial["ipsec_sas"] + 1, installed
-
-    # The release's printk lands after the delete returns, inside whichever
-    # console read runs then. dmesg keeps every line for the assertions below.
-    await command(target_agent, aiohttp_session, "sysctl", "-w", "kernel.printk=1 4 1 7")
-    con = Console.target(log_path=str(ARTIFACTS / "ipsec-terminal-uart.log"))
-    try:
-        await asyncio.to_thread(con.login, "root", None)
-        assert json.loads((await console_python(con, RX_PORTS_SCRIPT))["stdout"]) == {"6": 1, "7": 1}
-        # Armed over the agent while it still reaches the DUT; the delete that
-        # consumes it goes over the console, since the ports may stop before
-        # an agent reply could leave.
-        result = await target_agent.fs_write(aiohttp_session, UNLINK_FAULT, "1")
-        assert result["errno"] == 0, result
-        await console_command(con, "ip", "xfrm", "state", "delete", "src", TERMINAL_PEER,
-                              "dst", TERMINAL_LOCAL, "proto", "esp", "spi", hex(TERMINAL_SPI))
-        deadline = time.monotonic() + 15
-        while True:
-            stopped = status_text((await console_command(con, "cat", "/proc/cdx_flowtable"))["stdout"].strip())
-            ports = json.loads((await console_python(con, RX_PORTS_SCRIPT))["stdout"])
-            if stopped["fatal"] == 1 and ports == {"6": 0, "7": 0}:
-                break
-            assert time.monotonic() < deadline, (stopped, ports)
-            await asyncio.sleep(0.2)
-        assert stopped["ipsec_sas"] == initial["ipsec_sas"], stopped
-        knob = (await console_command(con, "cat", UNLINK_FAULT))["stdout"].strip()
-        assert knob == "0", knob
-        # The queues retire on a one-second timer before the release that
-        # would return the FQIDs; it has to have run to have held them.
-        # Counted on the DUT: the whole KASAN boot log is slow at 115200 baud.
-        held = "held until reset: a classifier entry may still name them"
-        deadline = time.monotonic() + 45
-        while True:
-            count = (await console_command(con, "sh", "-c", f"dmesg | grep -c '{held}' || true"))["stdout"]
-            if count.strip() != "0":
-                break
-            assert time.monotonic() < deadline, "the SA's release never ran"
-            await asyncio.sleep(1)
-        log = (await console_command(con, "dmesg"))["stdout"]
-        assert log.count("unable to remove entry from hash table") == 1, log
-        assert log.count(held) == 1, log
-        assert "hardware stopped after unproven deletion; reboot required" in log, log
-        assert "BUG: KASAN" not in log, log
-    finally:
-        con.close()

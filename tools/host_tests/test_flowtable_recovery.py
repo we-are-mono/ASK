@@ -431,6 +431,65 @@ def test_inactive_or_fatal_backend_is_not_rearmed(controller, field, value):
             c.wait(c.ready)
 
 
+def test_restarting_datapath_is_waited_for_not_backed_off(controller):
+    """CDX restarts the datapath after a deletion it could not prove, which
+    takes a second or two: the controller leaves its table alone meanwhile,
+    asks again at the shortest interval rather than backing off, says so once,
+    and is ready as soon as the latch clears. A latch that is terminal is a
+    reboot's, as before."""
+    c = controller
+    with c.daemon():
+        c.wait(c.ready)
+        installs = len(c.calls("-f"))
+        c.backend(fatal=1, fatal_terminal=0)
+        c.wait(lambda: not c.ready())
+        time.sleep(0.2)
+        checks = len(c.calls("list"))
+        time.sleep(1.2)
+        # Backing off from 50 ms would allow five checks in this window; the
+        # shortest interval allows two dozen, and a loaded host still well
+        # over the bound.
+        assert len(c.calls("list")) - checks >= 10
+        assert not c.calls("delete") and len(c.calls("-f")) == installs
+        assert c.log().count("datapath restarting after an unproven deletion") == 1
+        status = c.status()["backend"]
+        assert status["fatal"] == 1 and status["fatal_terminal"] == 0
+        c.backend(fatal=0, restarts=1, resume_failures=1)
+        c.wait(c.ready)
+        # A port that would not start again is reported, and holds nothing up:
+        # the tables are settled, and the netdev is the operator's to restart.
+        status = c.status()["backend"]
+        assert status["restarts"] == 1 and status["resume_failures"] == 1
+        assert not c.calls("delete") and len(c.calls("-f")) == installs
+        c.backend(fatal=1, fatal_terminal=1)
+        time.sleep(0.4)
+        assert "fresh boot required" in c.log()
+        assert not c.calls("delete") and len(c.calls("-f")) == installs
+
+
+def test_drain_waits_out_a_restart(controller):
+    """A stop while CDX restarts the datapath waits for the restart like any
+    other drain rather than failing, as it fails on a terminal latch."""
+    c = controller
+    c.run("apply")
+    c.backend(fatal=1, fatal_terminal=0)
+
+    def restarted():
+        time.sleep(0.3)
+        c.backend(fatal=0, restarts=1)
+
+    worker = threading.Thread(target=restarted)
+    started = time.monotonic()
+    worker.start()
+    c.run("stop")
+    worker.join()
+    assert time.monotonic() - started >= 0.3
+    c.run("apply")
+    c.backend(fatal=1, fatal_terminal=1)
+    result = c.run("stop", check=False)
+    assert result.returncode != 0 and "fresh boot required" in result.stderr
+
+
 def test_absent_adapter_is_retried_until_it_returns(controller):
     """CDX without the adapter (e.g. across an ask_flowtable reload) keeps
     the controller running: it installs nothing, then recovers by itself."""

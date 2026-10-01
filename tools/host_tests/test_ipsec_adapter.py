@@ -494,7 +494,10 @@ def test_ipsec_backend(tmp_path):
         + function(backend, "cdx_ipsec_sa_stats")
         # The rebuild that moves an SA's framing: its peer, its path's MTU.
         + re.search(r"^#define IS_NATT_SA\(.*$", control, re.M).group() + "\n"
-        + function(backend, "cdx_ipsec_sa_set_next_hop"))
+        + function(backend, "cdx_ipsec_sa_set_next_hop")
+        # And the datapath restart's, over every SA installed here.
+        + re.search(r"^static LIST_HEAD\(cdx_ipsec_sa_list\);$", backend, re.M).group() + "\n"
+        + function(backend, "cdx_ipsec_sa_restarted"))
     binary = tmp_path / "ipsec_backend"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

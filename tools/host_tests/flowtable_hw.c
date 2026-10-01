@@ -1,5 +1,6 @@
 /* Verify actual backend encoding and ownership across real failure boundaries. */
 #include <assert.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -104,7 +105,43 @@ static union nf_inet_addr v6(u32 tail)
 }
 #define ether_addr_copy(a,b) memcpy(a,b,6)
 #define lockdep_assert_held(m) assert(*(m))
-#define pr_err(...) ((void)0)
+/* Lines the latch writes: a terminal one, the stopped ports, a restart, a
+ * stall, retired entries kept for the reset and ports a restart could not
+ * start each count, so a case can require one of each and no more, and the
+ * last terminal, restart, stall and unstarted-port lines are kept for what
+ * they say. */
+static unsigned terminal_lines, stopped_lines, restart_lines, stall_lines, kept_lines, resume_lines;
+static char terminal_line[256], restart_line[256], stall_line[256], resume_line[256];
+__attribute__((format(printf, 1, 2)))
+static void host_log(const char *format, ...)
+{
+    char line[256];
+    va_list ap;
+
+    va_start(ap, format);
+    vsnprintf(line, sizeof(line), format, ap);
+    va_end(ap);
+    if (strstr(line, "reboot required")) {
+        terminal_lines++;
+        memcpy(terminal_line, line, sizeof(line));
+    }
+    stopped_lines += !!strstr(line, "ports stopped");
+    if (strstr(line, "datapath restarted")) {
+        restart_lines++;
+        memcpy(restart_line, line, sizeof(line));
+    }
+    if (strstr(line, "stalled")) {
+        stall_lines++;
+        memcpy(stall_line, line, sizeof(line));
+    }
+    kept_lines += !!strstr(line, "until reset");
+    if (strstr(line, "did not start again")) {
+        resume_lines++;
+        memcpy(resume_line, line, sizeof(line));
+    }
+}
+#define pr_err(...) host_log(__VA_ARGS__)
+#define pr_warn(...) host_log(__VA_ARGS__)
 #define pr_err_ratelimited(...) ((void)0)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, value) ((x) = (value))
@@ -244,8 +281,8 @@ typedef struct { struct itf *itf; unsigned flags; } OnifDesc, *POnifDesc;
 static OnifDesc in_onif = {&in_itf, ENTRY_VALID}, out_onif = {&out_itf, ENTRY_VALID};
 static POnifDesc get_onif_by_index(unsigned id) { assert(id==1 || id==2); return id==1 ? &in_onif : &out_onif; }
 static struct { struct { bool mutex; } ctrl; } instance = {{true}}, *cdx_info = &instance;
-static bool rtnl, rtnl_busy, quiesce_fail;
-static unsigned legacy_pending, quiesces;
+static bool rtnl, rtnl_busy;
+static unsigned legacy_pending;
 static void mutex_lock(bool *m) { assert(!*m); *m = true; }
 static void mutex_unlock(bool *m) { assert(*m); *m = false; }
 static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
@@ -275,6 +312,11 @@ static unsigned int cdx_ipsec_sa_count(void) { assert(cdx_info->ctrl.mutex); ret
 static unsigned int cdx_mc_group_count(void) { assert(cdx_info->ctrl.mutex); return mc_owned; }
 static unsigned allocations, deletes, syncs;
 static bool fail_alloc, fail_insert, fail_sync, stopped;
+/* A barrier has completed since the ports were last found stopped: what a
+ * stop let go of may be freed only then. fail_next_sync fails the sync that
+ * counts it down to zero, the ones before it completing. */
+static bool settled;
+static unsigned fail_next_sync;
 static int delete_result;
 static union nf_inet_addr expected_src, expected_dst;
 static u8 expected_family = AF_INET;
@@ -399,35 +441,46 @@ static void barrier(void)
     if (key && !key->linked) key->safe = true;
     if (older && !older->linked) older->safe = true;
     legacy_proven = true;
+    if (stopped) settled = true;
 }
 static int ExternalHashTableDeleteKey(void *td, unsigned index, struct key *handle)
 {
-    assert(td == &in_itf && index == 1 && handle == key && key->linked);
+    assert(td == &in_itf && index == 1 && handle && (handle == key || handle == older) &&
+           handle->linked);
     deletes++;
-    if (delete_result == 0 || delete_result == EN_EHASH_DELETE_UNSYNCED) key->linked = false;
+    if (delete_result == 0 || delete_result == EN_EHASH_DELETE_UNSYNCED) handle->linked = false;
     if (!delete_result) barrier();
     return delete_result;
 }
 static int ExternalHashTableFmPcdHcSync(void *td)
 {
     assert(td == &in_itf);
-    /* Only ever asked for while something unlinked waits on it. */
-    assert((key && !key->linked) || (older && !older->linked) || legacy_pending);
+    /* Only ever asked for while something unlinked waits on it, or behind
+     * stopped ports, which it proves done with the tables. */
+    assert((key && !key->linked) || (older && !older->linked) || legacy_pending || stopped);
     syncs++;
-    if (fail_sync) return -1;
+    if (fail_sync || (fail_next_sync && !--fail_next_sync)) return -1;
     barrier();
     return 0;
+}
+/* Whether the host-command channel has failed for good: a sync that fails
+ * then can never complete. */
+static bool hc_failed;
+static bool ExternalHashTableHcFailed(void *td)
+{
+    assert(td == &in_itf && cdx_info->ctrl.mutex);
+    return hc_failed;
 }
 static void ExternalHashTableEntryFree(struct key *handle)
 {
     assert(handle && (handle == key || handle == older));
-    assert(!handle->linked && (handle->safe || stopped));
+    assert(!handle->linked && (handle->safe || (stopped && settled)));
     if (handle == key) key = NULL; else older = NULL;
     free(handle);
 }
 static void cdx_ehash_quarantine_free_all(void)
 {
-    assert(!legacy_pending || legacy_proven || stopped);
+    assert(!legacy_pending || legacy_proven || (stopped && settled));
     legacy_freed += legacy_pending;
     legacy_pending = 0;
 }
@@ -441,13 +494,110 @@ static int cdx_ehash_quarantine_retry(void)
     return 0;
 }
 static void hw_ct_get_active(struct hw_ct *ct) { ct->pkts = 99; ct->bytes = 12345; ct->timestamp = 321; }
-static int dpa_cfg_quiesce(void)
+/* The classifier ports. A stop answers what a case sets -- stopped and idle,
+ * a port still finishing a frame, or ports no stop can vouch for -- and only
+ * the first marks them stopped. A resume starts them again; it may only follow
+ * a stop, under the RTNL hold that cleared the latch. */
+static int stop_result;
+static unsigned stops, resumes;
+static bool ft_latched(void);
+static int dpa_cfg_stop(void)
 {
     assert(rtnl && cdx_info->ctrl.mutex);
-    quiesces++;
-    if (quiesce_fail) return -EIO;
+    stops++;
+    settled = false;
+    if (stop_result == -EBUSY) return stop_result;
     stopped = true;
+    return stop_result;
+}
+static int resume_result;
+static int dpa_cfg_resume(void)
+{
+    assert(rtnl && cdx_info->ctrl.mutex && stopped && !ft_latched());
+    resumes++;
+    stopped = settled = false;
+    return resume_result;
+}
+/* The table a barrier goes through when the restart has none of its own. With
+ * none configured, no frame walks one, and the stop alone settles them. */
+static bool no_table;
+static void *dpa_get_ehash_td(void)
+{
+    assert(cdx_info->ctrl.mutex);
+    if (no_table && stopped) settled = true;
+    return no_table ? NULL : &in_itf;
+}
+/* CDX's record of keys a delete could not prove gone (cdx_ehash.c, exercised
+ * in ehash_lifecycle.c): here a list of the keys, the one flag that a record
+ * could not be made, and a resolver that answers what a case sets and
+ * otherwise unlinks and frees every key -- only with the ports stopped. */
+static struct key *abandoned[4];
+static unsigned nabandoned, resolver_calls;
+static bool record_fails, record_lost;
+static int resolve_result;
+static void cdx_ehash_abandon(void *td, uint16_t index, struct key *handle)
+{
+    /* Linked, or unlinked behind a barrier that cannot be had (stranded). */
+    assert(cdx_info->ctrl.mutex && td == &in_itf && index == 1 && handle &&
+           (handle->linked || !handle->safe));
+    if (record_fails) { record_lost = true; return; }
+    assert(nabandoned < sizeof(abandoned) / sizeof(abandoned[0]));
+    abandoned[nabandoned++] = handle;
+}
+static bool cdx_ehash_abandoned_lost(void) { assert(cdx_info->ctrl.mutex); return record_lost; }
+static int cdx_ehash_resolve_abandoned(unsigned int *resolved)
+{
+    assert(cdx_info->ctrl.mutex && rtnl && stopped && settled);
+    resolver_calls++;
+    *resolved = 0;
+    if (resolve_result) return resolve_result;
+    while (nabandoned) {
+        struct key *gone = abandoned[--nabandoned];
+
+        gone->linked = false;
+        ExternalHashTableEntryFree(gone);
+        (*resolved)++;
+    }
     return 0;
+}
+/* IPsec's part of a restart: the FQID ranges held for a possibly linked key,
+ * and the SAs a failed delete stranded. Both before the latch clears. */
+static unsigned held_fqids, sa_restarts;
+static unsigned cdx_dpa_ipsec_release_held_fqids(void)
+{
+    unsigned released = held_fqids;
+
+    assert(cdx_info->ctrl.mutex && rtnl && stopped && ft_latched());
+    held_fqids = 0;
+    return released;
+}
+static void cdx_ipsec_sa_restarted(void)
+{
+    assert(cdx_info->ctrl.mutex && rtnl && stopped && ft_latched());
+    sa_restarts++;
+}
+/* The adapter's restarted(), which takes the transaction itself. */
+static unsigned notified;
+static void cdx_ft_egress_restarted(void)
+{
+    assert(!cdx_info->ctrl.mutex && !rtnl);
+    notified++;
+}
+#define time_after(a, b) time_before(b, a)
+#define jiffies_to_msecs(j) ((unsigned)((j) * 1000 / HZ))
+/* What the restart's resolver does with every recorded key once the ports are
+ * stopped and a barrier has completed behind them, for the cases that
+ * exercise the encoder rather than the latch: a possibly linked key is
+ * recorded, never freed, until then. */
+static void settle_abandoned(void)
+{
+    assert(stopped && settled);
+    while (nabandoned) {
+        struct key *gone = abandoned[--nabandoned];
+
+        gone->linked = false;
+        ExternalHashTableEntryFree(gone);
+    }
 }
 #include "physical_production.inc"
 /* The outer header the egress tunnel inserts is built by the same function
@@ -514,7 +664,8 @@ static void cdx_ft_ifstats_hold(struct cdx_ft_stats_slot *slot)
 }
 static void cdx_ft_ifstats_put(struct cdx_ft_stats_slot *slot)
 {
-    assert(cdx_info->ctrl.mutex && slot->holds);
+    /* With the ports stopped, only after a barrier behind them. */
+    assert(cdx_info->ctrl.mutex && slot->holds && (!stopped || settled));
     slot->holds--;
 }
 static void cdx_ft_ifstats_retention(unsigned *retained, u64 *deferred)
@@ -537,7 +688,7 @@ static void cdx_police_profile_unref(u8 profile)
 {
     assert(profile <= CDX_FT_QOS_MAX_POLICER);
     if (!profile) return;
-    assert(police_refs[profile]);
+    assert(police_refs[profile] && (!stopped || settled));
     police_refs[profile]--;
 }
 /* The terminal latch's port-stop work. Queued is all the workqueue does here;
@@ -576,10 +727,266 @@ static void run_delayed_work(struct delayed_work *dwork)
     dwork->func(&dwork->work);
 }
 /* Declared by cdx_flowtable_backend.h, past the part this harness slices; the
- * work above calls it ahead of its definition. */
+ * work and the restart call them ahead of their definitions. */
 int cdx_ft_recover(void);
+unsigned int cdx_ft_pending(void);
 #include "hardware_production.inc"
 #include "backend_production.inc"
+
+static bool ft_latched(void) { return ft_failed; }
+
+/* A root outside the unicast delete path -- a multicast group's or an SA's --
+ * that could not be provably unlinked: its owner records it and latches the
+ * same failure, with the transaction held. */
+static void latch_root(void)
+{
+    assert(!key && !ft_fatal_work.queued);
+    key = calloc(1, sizeof(*key));
+    assert(key);
+    key->linked = true;
+    cdx_ft_begin();
+    cdx_ehash_abandon(&in_itf, 1, key);
+    cdx_ft_fatal();
+    assert(cdx_ft_failed());
+    cdx_ft_end();
+    assert(ft_fatal_work.queued && !ft_fatal_work.delay);
+}
+
+/* Run the work the way the workqueue would, until it stops queueing itself. */
+static void run_until_idle(void)
+{
+    for (unsigned i = 0; ft_fatal_work.queued && i < 32; i++)
+        run_delayed_work(&ft_fatal_work);
+    assert(!ft_fatal_work.queued && !cdx_info->ctrl.mutex && !rtnl);
+}
+
+/* A latch that went terminal: the ports stay stopped, everything stays
+ * refused, it says why once, and nothing queues the work again. Then a reboot,
+ * as far as the latch goes: the key a failed delete may have left linked is
+ * the reset's to reclaim. */
+static void expect_terminal(const char *why, unsigned restarts)
+{
+    assert(ft_failed && ft_terminal && stopped && ft_restarts == restarts);
+    assert(terminal_lines == 1 && strstr(terminal_line, why));
+    cdx_ft_begin();
+    assert(cdx_ft_terminal() && cdx_ft_claim() == -EOPNOTSUPP);
+    cdx_ft_end();
+    cdx_ft_begin(); cdx_ft_fatal(); cdx_ft_end();
+    run_until_idle();
+    assert(ft_terminal && stopped && ft_restarts == restarts && terminal_lines == 1);
+    if (key && nabandoned) {
+        assert(nabandoned == 1 && abandoned[0] == key);
+        nabandoned = 0;
+    }
+    free(key); key = NULL;
+    ft_failed = ft_terminal = record_lost = false;
+    stopped = settled = false; terminal_lines = kept_lines = 0;
+    ft_episode_start = ft_stopped_at = 0;
+    ft_episode_resolved = 0;
+    ft_stall_reported = false;
+    ft_restart_backoff = HZ;
+}
+
+/* Every way a restart is refused for the rest of the boot, the budget that
+ * bounds how often one happens, its report when it stalls, the order it frees
+ * in, and unload. */
+static void test_restart_root(struct net_device *in, struct net_device *out,
+                              struct netdev_notifier_info *info, const struct cdx_ft_rule *rule,
+                              const struct cdx_ft_stats_binding *stats)
+{
+    unsigned restarts = ft_restarts;
+
+    /* A root latched from outside the unicast path restarts the same way:
+     * here it is the root's own record the restart settles. */
+    latch_root();
+    run_until_idle();
+    assert(!ft_failed && !key && !nabandoned && ft_restarts == ++restarts && notified == 2);
+    /* A record that could not be made leaves a key that may be linked and
+     * that nothing knows of, so no restart can be proven safe: the ports stop
+     * and stay stopped. The guard then keeps every port shut, with or
+     * without an adapter, by object identity rather than by name. */
+    unsigned resolves = resolver_calls, resumed = resumes;
+
+    record_fails = true;
+    latch_root();
+    record_fails = false;
+    run_until_idle();
+    assert(!nabandoned && key->linked && resolver_calls == resolves && resumes == resumed);
+    strcpy(out->name, "renamed");
+    info->dev = out;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, info) == -EIO);
+    assert(cdx_ft_netdev_event(NULL, 999, info) == NOTIFY_DONE);
+    struct net_device unrelated = *out;
+    info->dev = &unrelated;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, info) == NOTIFY_DONE);
+    info->dev = in;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, info) == -EIO);
+    dpa_interface_info = NULL;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, info) == NOTIFY_DONE);
+    dpa_interface_info = &in_iface;
+    strcpy(out->name, "out");
+    expect_terminal("a possibly linked key could not be recorded", restarts);
+    /* A table the resolver finds malformed. */
+    latch_root();
+    resolve_result = -ENOTRECOVERABLE;
+    run_until_idle();
+    resolve_result = 0;
+    assert(resumes == resumed && key->linked);
+    expect_terminal("a possibly linked key could not be settled", restarts);
+    /* A host-command channel that has failed for good: no barrier will ever
+     * complete, so a failed one is not worth waiting for. One that merely
+     * failed is (above). */
+    latch_root();
+    fail_sync = true; hc_failed = true;
+    run_until_idle();
+    fail_sync = false; hc_failed = false;
+    expect_terminal("the host-command channel has failed", restarts);
+    /* Ports that were detached: stopped, but never to be started again. The
+     * adapter's recovery says the same, and still settles what they let go
+     * of behind a barrier. */
+    latch_root();
+    stop_result = -ENOTRECOVERABLE;
+    run_until_idle();
+    cdx_ft_begin();
+    assert(cdx_ft_recover() == 0 && settled);
+    cdx_ft_end();
+    stop_result = 0;
+    expect_terminal("cannot be started again", restarts);
+    /* A port outside CDX's configuration reaching a classifier: no stop of
+     * CDX's own vouches for the tables, now or later. */
+    resolves = resolver_calls;
+    latch_root();
+    stop_result = -EXDEV;
+    run_until_idle();
+    assert(!settled && resolver_calls == resolves && key->linked);
+    stop_result = 0;
+    expect_terminal("a port CDX did not configure reaches the classifier", restarts);
+    /* Without a table to barrier through, the restart has nothing parked to
+     * prove either; it starts the ports all the same, and ports that will not
+     * start are counted and reported without holding the others up or the
+     * latch: the tables are settled. */
+    unsigned unstarted = ft_resume_failures, unstarted_lines = resume_lines;
+    no_table = true; resume_result = 2;
+    latch_root();
+    run_until_idle();
+    assert(!ft_failed && resumes == resumed + 1 && ft_restarts == ++restarts);
+    cdx_ft_begin();
+    assert(cdx_ft_resume_failures() == unstarted + 2 && resume_lines == unstarted_lines + 1);
+    cdx_ft_end();
+    assert(strstr(resume_line, "2 classifier ports did not start again"));
+    no_table = false; resume_result = 0;
+    /* The budget: as many restarts as the limit allows within a window,
+     * counted from the first -- three so far, the unicast one included --
+     * and then the latch is for a reboot. A window that has passed allows
+     * them again. */
+    assert(ft_restart_limit == 3 && ft_window_restarts == 3 && restarts == 3);
+    latch_root();
+    run_until_idle();
+    expect_terminal("restart budget exhausted", restarts);
+    jiffies += FT_RESTART_WINDOW + 1;
+    latch_root();
+    run_until_idle();
+    assert(!ft_failed && ft_restarts == ++restarts && ft_window_restarts == 1);
+    /* A limit of zero allows none: the old behaviour, by choice. */
+    ft_restart_limit = 0;
+    latch_root();
+    run_until_idle();
+    expect_terminal("datapath restarts are disabled", restarts);
+    ft_restart_limit = 3;
+    jiffies += FT_RESTART_WINDOW + 1;
+    /* A restart still waiting after half a minute says so, once, and keeps
+     * trying; the restart that finally comes resets the report. */
+    latch_root();
+    resolve_result = -EAGAIN;
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_failed && !stall_lines);
+    jiffies += FT_RESTART_STALL + 1;
+    run_delayed_work(&ft_fatal_work);
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_failed && stall_lines == 1);
+    /* However long it stalls, the retries never space out past the bound. */
+    for (unsigned i = 0; i < 8; i++)
+        run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.delay == FT_RESTART_BACKOFF_MAX && stall_lines == 1);
+    resolve_result = 0;
+    run_until_idle();
+    assert(!ft_failed && ft_restarts == ++restarts && stall_lines == 1 && !ft_stall_reported);
+    /* Whatever holds it up: RTNL contended for as long, or the test image's
+     * hold, is reported the same way, once, naming what it waits for, at the
+     * steady interval each is retried at. */
+    latch_root();
+    rtnl_busy = true;
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == FT_RESTART_RTNL_RETRY && stall_lines == 1);
+    jiffies += FT_RESTART_STALL + 1;
+    run_delayed_work(&ft_fatal_work);
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.delay == FT_RESTART_RTNL_RETRY && stall_lines == 2);
+    assert(strstr(stall_line, "RTNL is contended") && ft_failed && !ft_terminal);
+    rtnl_busy = false;
+    run_until_idle();
+    assert(!ft_failed && ft_restarts == ++restarts);
+    latch_root();
+    ft_restart_hold = true;
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == FT_RESTART_HOLD_RETRY && stall_lines == 2);
+    jiffies += FT_RESTART_STALL + 1;
+    run_delayed_work(&ft_fatal_work);
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.delay == FT_RESTART_HOLD_RETRY && stall_lines == 3);
+    assert(strstr(stall_line, "flowtable_restart_hold") && ft_failed && !ft_terminal);
+    ft_restart_hold = false;
+    run_until_idle();
+    assert(!ft_failed && ft_restarts == ++restarts && !ft_stall_reported);
+    jiffies += FT_RESTART_WINDOW + 1;
+    /* The restart frees nothing its stop let go of until a barrier has
+     * completed behind the stopped ports: stop, then barrier, then any free.
+     * Here it finds both kinds of retired entry itself, nothing having
+     * recovered first -- one unlinked whose barrier failed, and one whose
+     * delete may have left it linked. */
+    {
+        struct cdx_ft_hw *first = NULL, *second = NULL;
+        unsigned before;
+
+        cdx_ft_begin();
+        assert(cdx_ft_claim() == 0 && cdx_ft_admission_begin() == 0);
+        assert(cdx_ft_add(rule, stats, &first) == 0 && cdx_ft_add(rule, stats, &second) == 0);
+        cdx_ft_admission_end();
+        assert(older && key);
+        fail_sync = true;
+        delete_result = EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_del(&first) == -EAGAIN && !older->linked && !older->safe);
+        delete_result = -1;
+        assert(cdx_ft_del(&second) == -EIO && key->linked && cdx_ft_failed());
+        assert(cdx_ft_pending() == 2 && cdx_ft_release() == 0);
+        cdx_ft_end();
+        fail_sync = false; delete_result = 0;
+        before = syncs;
+        run_until_idle();
+        assert(!ft_failed && ft_restarts == ++restarts && !key && !older && !nabandoned);
+        assert(syncs == before + 2 && !allocations && !stopped);
+    }
+    /* Unload disables the work for good, held in the middle of a restart or
+     * not: neither a later latch nor the work's own retry can queue it past
+     * the module, and the ports stay stopped for unload's own quiesce. */
+    latch_root();
+    ft_restart_hold = true;
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && stopped && ft_failed);
+    cdx_ft_fatal_stop();
+    assert(!ft_fatal_work.queued && ft_fatal_work.disabled);
+    cdx_ft_begin(); cdx_ft_fatal(); cdx_ft_end();
+    assert(!ft_fatal_work.queued && ft_failed && stopped && ft_restarts == restarts);
+    ft_restart_hold = false;
+    /* Unload's own quiesce then frees the retiring storage and records the
+     * key; the module's exit settles or leaks it (ehash_lifecycle.c). */
+    nabandoned = 0;
+    free(key); key = NULL;
+    cdx_flowtable_guard_exit();
+    assert(!notifier_registered && !ft_guard_registered);
+    cdx_flowtable_guard_exit();
+    assert(!cdx_info->ctrl.mutex && !rtnl && !allocations);
+}
 
 static void test_backend(void)
 {
@@ -801,18 +1208,29 @@ static void test_backend(void)
     assert(cdx_ft_admission_begin() == 0);
     assert(cdx_ft_add(&rule,&stats,&hw) == 0);
     cdx_ft_admission_end();
+    /* A delete that cannot be proven latches the failure, and the latch
+     * queues the work that stops the datapath and then restarts it. The
+     * adapter's own recovery only ever stops it: once the ports are stopped
+     * and idle the retiring owner goes, and its key, which may still be
+     * linked, is recorded rather than freed. A port still finishing a frame
+     * frees and records nothing. */
     delete_result=-EIO;
     assert(cdx_ft_del(&hw) == -EIO && !hw && !ft_live && cdx_ft_failed());
+    assert(ft_fatal_work.queued && !ft_fatal_work.delay);
     assert(cdx_ft_del(&hw) == 0 && cdx_ft_failed());
-    rtnl_busy=true; assert(cdx_ft_recover() == -EAGAIN && !quiesces && key->linked);
-    rtnl_busy=false; quiesce_fail=true;
-    assert(cdx_ft_recover() == -EAGAIN && quiesces == 1 && !stopped && key->linked);
-    quiesce_fail=false;
-    assert(cdx_ft_recover() == 0 && stopped && quiesces == 2 && key->linked);
-    assert(!allocations && !cdx_ft_pending() && cdx_ft_failed());
-    /* After a terminal failure nothing new is handed out, statistics
-     * included: the adapter is on its way to a global recovery and a record
-     * claimed now would be one nothing is going to return. */
+    rtnl_busy=true; assert(cdx_ft_recover() == -EAGAIN && !stops && key->linked);
+    rtnl_busy=false; stop_result=-EBUSY;
+    assert(cdx_ft_recover() == -EAGAIN && stops == 1 && !stopped && key->linked);
+    assert(cdx_ft_pending() == 1 && !nabandoned && !stopped_lines);
+    stop_result=0;
+    assert(cdx_ft_recover() == 0 && stopped && stops == 2 && key->linked);
+    assert(nabandoned == 1 && abandoned[0] == key && stopped_lines == 1);
+    assert(!allocations && !cdx_ft_pending() && cdx_ft_failed() && !cdx_ft_terminal());
+    assert(cdx_ft_recover() == 0 && stops == 3 && nabandoned == 1 && stopped_lines == 1);
+    assert(!resumes && !resolver_calls);
+    /* While it is stopped nothing new is handed out, statistics included:
+     * the adapter is on its way to a global recovery and a record claimed
+     * now would be one nothing is going to return. */
     {
         struct cdx_ft_stats_slot *slot = (void *)1;
 
@@ -824,9 +1242,71 @@ static void test_backend(void)
     assert(cdx_ft_admission_begin() == 0);
     assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
     cdx_ft_admission_end();
-    cdx_flowtable_quiesced();
     cdx_ft_end();
+    /* Nor can a port be opened under it, with an adapter or without one. */
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == -EIO);
+    /* The work restarts it. Contended RTNL is tried again soon, at a steady
+     * interval, and changes nothing. */
+    rtnl_busy = true; run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ / 10 && stops == 3 && !resumes);
+    rtnl_busy = false;
+    /* A port still busy holds it up, the retries backing off, and nothing
+     * is settled meanwhile. */
+    stop_result = -EBUSY; run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ && !resolver_calls && key->linked);
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == 2 * HZ && !resolver_calls);
+    stop_result = 0;
+    /* The test image's hold keeps the ports stopped, every key recorded, at
+     * a steady poll that does not add to the backoff. */
+    ft_restart_hold = true; run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ / 4 && stopped);
+    assert(!resolver_calls && key->linked && ft_failed);
+    ft_restart_hold = false;
+    /* A key the table still links -- its delete refused, for want of
+     * memory most likely -- waits for the next try. */
+    resolve_result = -EAGAIN; run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == 4 * HZ && resolver_calls == 1);
+    assert(key->linked && !resumes && ft_failed);
+    resolve_result = 0;
+    /* The barrier behind the stopped ports fails: a frame they let go of may
+     * still be in the controller, so nothing is settled or freed, and they
+     * stay stopped. */
+    unsigned before = syncs;
+    fail_sync = true; run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == 8 * HZ && syncs == before + 1);
+    assert(key->linked && nabandoned == 1 && resolver_calls == 1 && !resumes && ft_failed);
+    fail_sync = false;
+    /* Settled behind a completed one, but the barrier after it fails, so the
+     * ports stay stopped. */
+    before = syncs;
+    fail_next_sync = 2; run_delayed_work(&ft_fatal_work);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == 16 * HZ && syncs == before + 2);
+    assert(!key && !nabandoned && resolver_calls == 2 && !resumes && ft_failed);
+    /* With the barrier the restart completes in one transaction and one
+     * RTNL hold: what CDX parked for a barrier is released, the FQIDs held
+     * for the key go back, the epoch moves on, a stranded SA is installed
+     * again, and the latch clears as the ports start. The adapter is told
+     * once, after both locks are gone. */
+    held_fqids = 2; park_legacy(1);
+    unsigned epoch = ft_epoch;
+    run_delayed_work(&ft_fatal_work);
+    assert(!ft_fatal_work.queued && !ft_failed && !ft_terminal && resumes == 1 && !stopped);
+    assert(ft_restarts == 1 && ft_epoch == epoch + 1 && notified == 1 && sa_restarts == 1);
+    assert(!held_fqids && !legacy_pending && !terminal_lines && restart_lines == 1);
+    assert(strstr(restart_line, "(1 keys resolved, 2 FQID ranges released, stopped "));
     assert(!cdx_info->ctrl.mutex && !rtnl && !allocations);
+    /* And everything is open again: a port, the claim, admission. */
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
+    cdx_ft_begin();
+    assert(cdx_ft_claim() == 0 && !cdx_ft_failed() && cdx_ft_restarts() == 1);
+    assert(cdx_ft_admission_begin() == 0);
+    delete_result = 0;
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && hw && key);
+    cdx_ft_admission_end();
+    assert(cdx_ft_del(&hw) == 0 && !key && !allocations);
+    assert(cdx_ft_release() == 0);
+    cdx_ft_end();
     /* With no adapter registered to ask, CDX asks this whether anything the
      * adapter installed is still in the hardware -- a direction, or an SA or
      * a multicast group, which an adapter on its way out retires only after
@@ -836,42 +1316,25 @@ static void test_backend(void)
     mc_owned = 1; assert(!cdx_ft_idle()); mc_owned = 0;
     legacy_pending = 1; assert(!cdx_ft_idle()); legacy_pending = 0;
     assert(cdx_ft_idle() && !cdx_info->ctrl.mutex);
-    /* A released adapter cannot bypass the provider's terminal guard.
-     * The callback runs without a backend transaction and uses object identity. */
-    strcpy(out.name,"renamed");
-    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == -EIO);
-    assert(cdx_ft_netdev_event(NULL, 999, &info) == NOTIFY_DONE);
-    struct net_device unrelated = out;
-    info.dev=&unrelated;
-    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
-    info.dev=&in;
-    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == -EIO);
-    dpa_interface_info=NULL;
-    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
-    dpa_interface_info=&in_iface;
-    cdx_flowtable_guard_exit();
-    assert(!notifier_registered && !ft_guard_registered);
-    cdx_flowtable_guard_exit();
-    free(key); key=NULL; /* Only simulated hardware reset reclaims the live key. */
-    /* A root outside the unicast delete path -- a multicast group's or an
-     * SA's -- that could not be provably unlinked latches the same terminal
-     * state, with the transaction held, and queues the work that stops the
-     * ports: nothing else is guaranteed to drive recovery from there. The
-     * work waits for RTNL a second at a time rather than under the control
-     * lock. Unload disables it for good, so neither a later latch nor the
-     * work's own retry can queue it past the module. */
-    ft_failed = false; stopped = false; /* A fresh load, as far as the latch goes. */
-    unsigned stops = quiesces;
-    cdx_ft_begin(); cdx_ft_fatal(); assert(cdx_ft_failed()); cdx_ft_end();
-    assert(ft_fatal_work.queued && !ft_fatal_work.delay);
-    rtnl_busy = true; run_delayed_work(&ft_fatal_work);
-    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ && quiesces == stops && !stopped);
-    rtnl_busy = false; run_delayed_work(&ft_fatal_work);
-    assert(!ft_fatal_work.queued && quiesces == stops + 1 && stopped);
-    assert(!cdx_info->ctrl.mutex && !rtnl && !allocations);
-    cdx_ft_fatal(); assert(ft_fatal_work.queued);
-    cdx_ft_fatal_stop(); assert(!ft_fatal_work.queued && ft_fatal_work.disabled);
-    cdx_ft_fatal(); assert(!ft_fatal_work.queued);
+    /* A port outside CDX's configuration reaching the classifier: the latch
+     * cannot restart, and the adapter's recovery keeps what was retired,
+     * records and all, rather than freeing it on a stop that proves nothing.
+     * The backend lets go of it, so nothing waits on it either. */
+    cdx_ft_begin();
+    assert(cdx_ft_claim() == 0 && cdx_ft_admission_begin() == 0);
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && key);
+    cdx_ft_admission_end();
+    delete_result = -1;
+    assert(cdx_ft_del(&hw) == -EIO && cdx_ft_failed() && cdx_ft_pending() == 1);
+    stop_result = -EXDEV;
+    assert(cdx_ft_recover() == 0 && ft_terminal && !settled && kept_lines == 1);
+    assert(key->linked && nabandoned == 1 && abandoned[0] == key && !cdx_ft_pending());
+    assert(!allocations && cdx_ft_release() == 0);
+    cdx_ft_end();
+    run_until_idle();
+    stop_result = 0; delete_result = 0;
+    expect_terminal("a port CDX did not configure reaches the classifier", ft_restarts);
+    test_restart_root(&in, &out, &info, &rule, &stats);
 }
 
 int main(void)
@@ -1178,22 +1641,27 @@ int main(void)
     fail_sync=false; assert(cdx_ft_hw_retry()==0 && !key && !allocations && deletes==old);
     fail_alloc=false;
     assert(cdx_ft_hw_add(&rule,&stats,&hw)==0); assert(cdx_ft_hw_del(&hw)==-EAGAIN);
-    stopped=true; cdx_ft_hw_quiesced(); stopped=false;
+    /* Stopped ports, and a barrier completed behind them. */
+    stopped=settled=true; cdx_ft_hw_quiesced(); stopped=settled=false;
     assert(!key && !allocations && !cdx_ft_hw_pending());
     assert(cdx_ft_hw_add(&rule,&stats,&hw)==0); delete_result=-1;
     assert(cdx_ft_hw_del(&hw)==-EIO && key->linked && cdx_ft_hw_pending()==1);
     old=syncs; assert(cdx_ft_hw_retry()==-EAGAIN && syncs==old && key->linked);
-    stopped=true; cdx_ft_hw_quiesced(); assert(!allocations && key->linked);
-    /* Reset owns the potentially linked allocation, never the retiring owner. */
-    free(key); key=NULL;
-    stopped=false; delete_result=0;
+    /* The stopped ports free the retiring owner and record the potentially
+     * linked allocation, which only the restart's resolver frees. */
+    stopped=settled=true; cdx_ft_hw_quiesced(); assert(!allocations && key->linked);
+    assert(nabandoned == 1 && abandoned[0] == key);
+    cdx_ft_hw_quiesced(); assert(nabandoned == 1);
+    settle_abandoned(); assert(!key);
+    stopped=settled=false; delete_result=0;
     assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);
     ft_fail_unlink=true; old=deletes;
     assert(cdx_ft_hw_del(&hw)==-EIO && !hw && !ft_fail_unlink);
     assert(deletes==old && key->linked && cdx_ft_hw_pending()==1);
     old=syncs; assert(cdx_ft_hw_retry()==-EAGAIN && syncs==old && key->linked);
-    stopped=true; cdx_ft_hw_quiesced(); assert(!allocations && key->linked);
-    free(key); key=NULL; stopped=false;
+    stopped=settled=true; cdx_ft_hw_quiesced(); assert(!allocations && key->linked);
+    assert(nabandoned == 1 && abandoned[0] == key);
+    settle_abandoned(); stopped=settled=false;
     assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);
     assert(cdx_ft_hw_del(&hw)==0 && !hw && !key && !allocations);
     /* One completed barrier proves every unlink before it -- the backend's
@@ -1252,9 +1720,12 @@ int main(void)
         delete_result=0;
         assert(cdx_ft_hw_add(&rule,&stats,&live)==0 && older && older->linked);
         assert(cdx_ft_hw_del(&live)==0 && !key && older->linked && cdx_ft_hw_pending()==1);
-        stopped=true; cdx_ft_hw_quiesced(); stopped=false;
+        stopped=settled=true; cdx_ft_hw_quiesced();
         assert(!allocations && !cdx_ft_hw_pending() && older->linked);
-        free(older); older=NULL; /* Reset owns the possibly linked allocation. */
+        /* Recorded for the restart, whose resolver alone frees it. */
+        assert(nabandoned == 1 && abandoned[0] == older);
+        settle_abandoned(); stopped=settled=false;
+        assert(!older);
     }
     /* Every record an entry's opcodes can name is held by the entry itself for
      * as long as the microcode may walk it, whatever the adapter does with its
@@ -1311,8 +1782,8 @@ int main(void)
         assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
 
         /* No barrier releases a key a hard failure may have left linked,
-         * and so none releases its records; quiescence releases both kinds,
-         * keeping only the key itself for the reset. */
+         * and so none releases its records; stopped ports release both
+         * kinds, keeping only the key itself, recorded for the restart. */
         delete_result = EN_EHASH_DELETE_UNSYNCED;
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && cdx_ft_hw_del(&hw) == -EAGAIN);
         delete_result = -1;
@@ -1320,11 +1791,35 @@ int main(void)
         assert(cdx_ft_hw_retry() == -EAGAIN && !older && key->linked);
         assert(ifstats_slot.holds == 2 && vlan_slot.holds == 2 && cdx_ft_hw_pending() == 1);
         assert(police_refs[policer] == 1);
-        stopped = true; cdx_ft_hw_quiesced(); stopped = false;
+        stopped = settled = true; cdx_ft_hw_quiesced();
         assert(!ifstats_slot.holds && !tunnel_slot.holds && !vlan_slot.holds);
         assert(!police_refs[policer]);
         assert(!allocations && !cdx_ft_hw_pending() && key->linked);
-        free(key); key = NULL;
+        assert(nabandoned == 1 && abandoned[0] == key);
+        settle_abandoned(); stopped = settled = false;
+
+        /* With nothing that can prove the classifier done with them -- a
+         * port CDX did not configure still walking it, or a host-command
+         * channel gone for good -- every retired entry stays allocated with
+         * the records and profile it names, recorded as possibly linked
+         * however its delete failed; only the backend lets go of it. The
+         * reset alone reclaims the rest. */
+        delete_result = EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && cdx_ft_hw_del(&hw) == -EAGAIN);
+        delete_result = -1;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && cdx_ft_hw_del(&hw) == -EIO);
+        assert(cdx_ft_hw_pending() == 2 && !older->linked && key->linked);
+        cdx_ft_hw_strand();
+        assert(!cdx_ft_hw_pending() && !allocations && kept_lines == 1);
+        assert(nabandoned == 2 && abandoned[0] == older && abandoned[1] == key);
+        assert(ifstats_slot.holds == 4 && tunnel_slot.holds == 2 && vlan_slot.holds == 4);
+        assert(police_refs[policer] == 2);
+        cdx_ft_hw_strand(); assert(nabandoned == 2 && kept_lines == 1);
+        ifstats_slot.holds = tunnel_slot.holds = vlan_slot.holds = 0;
+        police_refs[policer] = 0;
+        stopped = settled = true; settle_abandoned(); stopped = settled = false;
+        assert(!key && !older);
+        kept_lines = 0;
 
         /* The debug knob's withheld proof: a delete that completed reports
          * its barrier failed, and each retry after it fails without issuing
@@ -1334,8 +1829,9 @@ int main(void)
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
         ft_fail_sync = 1;
         assert(cdx_ft_hw_del(&hw) == -EIO && ft_fail_sync == 1 && key->linked);
-        stopped = true; cdx_ft_hw_quiesced(); stopped = false;
-        free(key); key = NULL;
+        stopped = settled = true; cdx_ft_hw_quiesced(); settle_abandoned();
+        stopped = settled = false;
+        assert(!key);
         delete_result = 0;
         ft_fail_sync = 3;
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);

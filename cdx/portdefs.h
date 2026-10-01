@@ -199,8 +199,21 @@ struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid);
 int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq);
 int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry);
 void dpa_release_iflist(void);
+/* The classifier ports CDX configured, stopped and started again around a
+ * repair of the tables they walk; see dpa_cfg.c. RTNL and the control mutex
+ * held for each. Stop never detaches a port or drains a queue, so resume puts
+ * every port back exactly as it was; quiesce does both, for unload, and leaves
+ * the ports for good. Resume returns how many ports would not start, or a
+ * negative errno. */
+int dpa_cfg_stop(void);
+int dpa_cfg_resume(void);
 int dpa_cfg_quiesce(void);
+bool dpa_cfg_covered(void);
 void dpa_cfg_deinit(void);
+/* An external hash table of the configuration, to issue a PCD barrier through
+ * when the caller has none of its own; NULL before one is configured. Caller
+ * holds the control mutex. */
+void *dpa_get_ehash_td(void);
 /* Caller holds the control mutex. */
 uint32_t dpa_get_num_fmans(void);
 /* Caller holds the control mutex and RTNL; RTNL is dropped during retry waits. */

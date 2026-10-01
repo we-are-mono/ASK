@@ -26,6 +26,11 @@ struct ft_backend {
 	bool     present;
 	long     bindings, entries, handle_refs, neighbour_refs, quarantine;
 	long     fatal, observe, invalidated;
+	/* fatal is CDX's latch, which a datapath restart clears; fatal_terminal
+	 * says none will in this boot. An adapter that does not report it is
+	 * one whose every latch was terminal. restarts counts the restarts, and
+	 * resume_failures the ports one could not start again. */
+	long     fatal_terminal, restarts, resume_failures;
 	long     installs, deletes, rearms, errors;   /* observability, for the CLI result */
 	/* Multicast acceleration: the adapter's global switch and what both of
 	 * its learners have in hardware, which only a disable drains. */
@@ -45,9 +50,15 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b);
  * only controls. 0 when done or the adapter is absent, -1 with ctx->err. */
 int ft_backend_multicast(struct ft_ctx *ctx, bool on);
 
+/* What an apply or a drain returns instead of -1 while CDX is restarting the
+ * datapath after a latch: nothing is wrong that waiting will not mend, so the
+ * daemon retries soon rather than backing off. */
+#define FT_RESTARTING (-2)
+
 /* Poll until the DRAIN_FIELDS are zero -- with `multicast`, both learners'
  * installed groups as well -- or the adapter is gone. 0 on drained, -1 on
- * timeout/fatal (ctx->err set). */
+ * timeout or a terminal latch, FT_RESTARTING while CDX restarts the datapath
+ * past the deadline (ctx->err set). */
 int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms, bool multicast);
 
 /* Resolve "devices auto" against the live interface set: up fsl_dpa ports,

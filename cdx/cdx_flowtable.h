@@ -86,12 +86,19 @@ u64 cdx_ft_qos_control_overruns(void);
  * drain() itself rather than waited for, since the learners' workers take
  * RTNL.
  *
+ * restarted() says the datapath has restarted after a latch (cdx_ft_fatal()):
+ * every port runs again and admission is open. While it was stopped, flows
+ * were declined, multicast groups and SA rebuilds refused, and parked bindings
+ * held back; this asks for all of it again. Called once per restart, with no
+ * lock of CDX's held. It may sleep.
+ *
  * Registration is a one-shot claim, and unregistration waits out every call
- * already inside either op, so the module that registered can go once it
+ * already inside any op, so the module that registered can go once it
  * returns. */
 struct cdx_ft_egress_ops {
 	void (*changed)(struct net_device *dev);
 	int (*drain)(struct net_device *dev);
+	void (*restarted)(void);
 };
 int cdx_register_ft_egress(const struct cdx_ft_egress_ops *ops);
 void cdx_unregister_ft_egress(void);
@@ -109,8 +116,13 @@ bool cdx_tc_filter_mirrored(struct net_device *dev, bool ingress,
 int cdx_flowtable_guard_init(void);
 void cdx_flowtable_guard_exit(void);
 void cdx_flowtable_quiesced(void);
-/* Cancel the port-stop work cdx_ft_fatal() schedules; unload only, unlocked. */
+/* Cancel the work cdx_ft_fatal() schedules, which stops the ports and restarts
+ * them; unload only, unlocked. */
 void cdx_ft_fatal_stop(void);
+/* Datapath restarts so far, counted from one: a hold taken in one epoch on
+ * behalf of a possibly linked classifier key is released by the restart that
+ * ends it. Caller holds the control mutex. */
+u32 cdx_ft_epoch(void);
 /* Once claimed, adapter detach must never reopen configuration mutation. */
 bool cdx_flowtable_config_sealed(void);
 

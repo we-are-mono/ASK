@@ -160,7 +160,7 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 	bool present, owned;
 	char inhash[65], script[FT_RENDER_MAX + 1];
 	char dj[512], bj[512], hash[65];
-	int rc = -1;
+	int rc = -1, drain;
 	memset(&drained, 0, sizeof(drained));
 
 	if (ft_nft_inspect(ctx, &present, &owned, inhash, &installed, lock))
@@ -182,8 +182,15 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			snprintf(ctx->err, sizeof(ctx->err), "an active flowtable provider is required");
 			goto out;
 		}
-		if (st.fatal) {
+		if (st.fatal && st.fatal_terminal) {
 			snprintf(ctx->err, sizeof(ctx->err), "hardware retirement failed; fresh boot required");
+			goto out;
+		}
+		/* Left as it is: whatever the table needs once CDX has restarted
+		 * the datapath, the next check sees it. */
+		if (st.fatal) {
+			snprintf(ctx->err, sizeof(ctx->err), "datapath restarting after an unproven deletion");
+			rc = FT_RESTARTING;
 			goto out;
 		}
 		*multicast = true;
@@ -291,8 +298,11 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 	 * a disabled policy drains multicast too. */
 	if (present && owned && ft_nft_delete(ctx, lock))
 		goto out;
-	if (ft_backend_drain(ctx, 15000, !p->enabled))
+	drain = ft_backend_drain(ctx, 15000, !p->enabled);
+	if (drain) {
+		rc = drain;
 		goto out;
+	}
 	if (ft_backend_read(ctx, &drained))  /* the post-remove state the CLI reports */
 		goto out;
 
@@ -308,8 +318,11 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 	/* --check can invoke backend binding callbacks; only after the drain. */
 	if (ft_nft_run(ctx, script, true, lock))
 		goto out;
-	if (ft_backend_drain(ctx, 15000, false))
+	drain = ft_backend_drain(ctx, 15000, false);
+	if (drain) {
+		rc = drain;
 		goto out;
+	}
 	if (ft_nft_run(ctx, script, false, lock))
 		goto out;
 
@@ -461,7 +474,8 @@ static int cmd_status(struct ft_ctx *ctx)
 	       "\"reconciliation_paused\": %s, "
 	       "\"admission_ready\": %s, \"backend\": {\"present\": %s, "
 	       "\"bindings\": %ld, \"entries\": %ld, \"handle_refs\": %ld, \"neighbour_refs\": %ld, "
-	       "\"quarantine\": %ld, \"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld, "
+	       "\"quarantine\": %ld, \"fatal\": %ld, \"fatal_terminal\": %ld, \"restarts\": %ld, "
+	       "\"resume_failures\": %ld, \"invalidated\": %ld, \"observe\": %ld, "
 	       "\"mcast_enabled\": %ld, \"mcast_installed\": %ld, \"mroute_installed\": %ld}}\n",
 	       owned ? "true" : "false",
 	       owned ? "\"" : "null", owned ? inhash : "", owned ? "\"" : "",
@@ -470,7 +484,8 @@ static int cmd_status(struct ft_ctx *ctx)
 	       ready ? "true" : "false",
 	       st.present ? "true" : "false",
 	       st.bindings, st.entries, st.handle_refs, st.neighbour_refs, st.quarantine,
-	       st.fatal, st.invalidated, st.observe,
+	       st.fatal, st.fatal_terminal, st.restarts, st.resume_failures,
+	       st.invalidated, st.observe,
 	       st.mcast_enabled, st.mcast_installed, st.mroute_installed);
 	return 0;
 }
@@ -528,7 +543,7 @@ static int cmd_daemon(const char *conf)
 	int nl;
 	int retry_ms = FT_RETRY_MIN_MS;
 	int64_t due = 0;
-	bool failed = false;
+	bool failed = false, restarting = false;
 
 	if (!ft_cdx_present()) {
 		fprintf(stderr, "ask-flowtable: cdx not loaded; idle\n");
@@ -551,7 +566,16 @@ static int cmd_daemon(const char *conf)
 		if (now_ms() >= due) {
 			int rc = reconcile(&ctx, conf);
 			failed = rc < 0;
-			if (failed) {
+			if (rc == FT_RESTARTING) {
+				/* Over in a second or two, so retried at the
+				 * shortest interval rather than backed off, and
+				 * said once per restart. */
+				if (!restarting) {
+					fprintf(stderr, "ask-flowtable: reconciliation deferred: %s\n", ctx.err);
+					ft_log(LOG_NOTICE, "reconciliation deferred: %s", ctx.err);
+				}
+				due = now_ms() + FT_RETRY_MIN_MS;
+			} else if (failed) {
 				fprintf(stderr, "ask-flowtable: reconciliation deferred: %s; retry in %d ms\n",
 					ctx.err, retry_ms);
 				ft_log(LOG_WARNING, "reconciliation deferred: %s; retry in %d ms", ctx.err, retry_ms);
@@ -566,6 +590,7 @@ static int cmd_daemon(const char *conf)
 				retry_ms = FT_RETRY_MIN_MS;
 				due = now_ms() + FT_HEALTH_MS;
 			}
+			restarting = rc == FT_RESTARTING;
 			if (nl < 0)
 				nl = ft_nl_open();   /* timers still work while event delivery is unavailable */
 		}

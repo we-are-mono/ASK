@@ -178,19 +178,8 @@ result independently of those temporary files.
 - [x] **A295 — memory pressure could make a classifier delete terminal.** Fixed: a delete that rebuilds a crowded
   bucket's node takes it outside the lock, from the allocator or a per-table spare every unreachable node refills (_:/^fm_ehash: back a classifier delete's node_).
 
-- [ ] **A296 — a terminal latch should restart the datapath, not demand a reboot.** Once
-  `cdx_ft_fatal()` has stopped the ports (`cdx_ft_recover()` → `dpa_cfg_quiesce()`), the FMan
-  has no reader of the classifier tables, so an entry that "may still be linked" can no longer
-  be reached. The doubt the latch exists for is gone, yet the latch never clears and
-  `cdx_flowtable_backend.c` logs "reboot required". Fix: after quiescence, rebuild every
-  external hash table from empty (freeing abandoned and quarantined entries), release held
-  FQIDs, clear `ft_failed`, restart the ports, and let the learners re-offer from their own
-  state: flowtable flows, routed and bridged multicast (they have resync), and IPsec SAs
-  (needs a re-install path). The outage becomes a second or two instead of a reboot, and the
-  terminal tests (`ASK_FLOWTABLE_TERMINAL`) become ordinary same-boot tests. To prove: the
-  quiesce covers the offline ports and host commands, and no frame is in flight in the
-  classifier when the tables are rebuilt. Regression: each terminal kind, followed on the same
-  boot by forwarding restored in hardware for unicast, multicast and IPsec.
+- [x] **A296 — a terminal latch should restart the datapath, not demand a reboot.** Fixed: with every classifier port
+  stopped and idle, CDX settles each possibly linked key, frees what it held and restarts the ports; terminal only when unprovable (_:/^cdx: restart the datapath after an unproven delete_).
 
 - [ ] **A297 — more than eight interleaved unwanted streams wake the bridged learner per frame.**
   The bridge hook remembers the streams it last handed the worker in eight slots
@@ -222,6 +211,17 @@ result independently of those temporary files.
   does. Regression: a bridged two-port window with a tc ingress drop of one UDP port on the
   ingress port, and an egress drop on one listener port; require `refused-tc`, zero delivery of
   the dropped port, and the flow carried again once the filter is gone.
+
+- [ ] **A299 — a restart that never completes never goes terminal.** `cdx_ft_restart()`
+  (`cdx/cdx_flowtable_backend.c`) retries without bound when a port never reports idle
+  (`dpa_cfg_stop()` -EBUSY: BMI/QMI busy for good) or a barrier keeps failing on a channel that
+  has not failed for good (`ExternalHashTableHcFailed()` false: recurring rejections or an
+  exhausted frame pool). It warns once after 30 s and backs off to 30 s; the ports stay
+  stopped, so it is safe, but the latch reads `fatal 1, fatal_terminal 0` forever and the
+  daemon reports "restarting" instead of asking for a reboot. Fix: bound the episode
+  (`ft_episode_start`; say ten minutes) and then `cdx_ft_set_terminal()` with what it waited
+  for -- not for the test hold. Regression: `flowtable_hw.c` with `stop_result = -EBUSY`, then
+  `fail_sync`, each held past the bound, requires `expect_terminal()` with that reason.
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**

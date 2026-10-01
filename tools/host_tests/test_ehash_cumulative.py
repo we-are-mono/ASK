@@ -62,15 +62,18 @@ def test_ehash_cumulative(tmp_path):
             "en_exthash_info", "en_exthash_tbl_entry", "en_exthash_bucket")))
     (tmp_path / "ehash_production.inc").write_text(
         # The parked list's own state, as declared, and the delete's private
-        # return code.
+        # return code and the search's bound.
         pcd[pcd.index("static DEFINE_SPINLOCK(ehash_parked_lock);"):pcd.index("static void ehash_park_node(")]
         + re.search(r"^#define\s+EHASH_DELETE_NEEDS_NODE\s.*$", pcd, re.M).group() + "\n"
+        + re.search(r"^#define\s+EHASH_CHAIN_MAX\s.*$", pcd, re.M).group() + "\n"
         + "".join(function(pcd, name) for name in (
-            "find_entry_in_bucket", "ExternalHashTableAllocCumulativeEntry",
+            "find_entry_in_bucket", "ehash_node_entry", "ExternalHashTableAllocCumulativeEntry",
             "ExternalHashTableCumulativeEntryFree", "ehash_node_take_spare", "ehash_node_alloc",
             "ehash_node_release",
             "ehash_park_node", "ehash_barrier", "ExternalHashTableAddKey",
-            "ExternalHashTableFmPcdHcSync", "ehash_delete_key", "ExternalHashTableDeleteKey")))
+            "ExternalHashTableFmPcdHcSync", "ehash_delete_key", "ExternalHashTableDeleteKey",
+            "ehash_bucket_links", "ExternalHashTableFindEntry",
+            "ExternalHashTableHcFailed")))
     binary = tmp_path / "ehash_cumulative"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wno-unused-function",

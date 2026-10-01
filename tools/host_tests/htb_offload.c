@@ -555,6 +555,7 @@ static atomic64_t cdx_htb_control_overruns = ATOMIC64_INIT(0);
 struct cdx_ft_egress_ops {
 	void (*changed)(struct net_device *dev);
 	int (*drain)(struct net_device *dev);
+	void (*restarted)(void);
 };
 #define __rcu
 #define srcu_dereference(p, s)	({ assert((s)->readers > 0); (p); })
@@ -580,9 +581,12 @@ static int egress_drain(struct net_device *dev)
 	egress_drains++;
 	return egress_drain_rc;
 }
+static unsigned egress_restarts;
+static void egress_restarted(void) { egress_restarts++; }
 static const struct cdx_ft_egress_ops egress_ops = {
 	.changed = egress_hook,
 	.drain = egress_drain,
+	.restarted = egress_restarted,
 };
 
 /* The filter layers, which own what a police action and a DSCP filter mean.
@@ -2590,13 +2594,22 @@ static void test_egress_changed(void)
 	unsigned n;
 
 	reset_world();
-	/* Both ops or nothing: a registrant that cannot drain would let the
-	 * DSCP map move while entries still read it. */
+	/* Every op or nothing: a registrant that cannot drain would let the
+	 * DSCP map move while entries still read it, and one that cannot hear
+	 * of a datapath restart would leave what the stop refused refused. */
 	static const struct cdx_ft_egress_ops no_drain = { .changed = egress_hook };
+	static const struct cdx_ft_egress_ops no_restart = { .changed = egress_hook,
+							     .drain = egress_drain };
 	assert(cdx_register_ft_egress(NULL) == -EINVAL);
 	assert(cdx_register_ft_egress(&no_drain) == -EINVAL);
+	assert(cdx_register_ft_egress(&no_restart) == -EINVAL);
+	/* A restart with nobody registered tells nobody. */
+	cdx_ft_egress_restarted();
+	assert(!egress_restarts);
 	assert(!cdx_register_ft_egress(&egress_ops));
 	assert(cdx_register_ft_egress(&egress_ops) == -EBUSY);
+	cdx_ft_egress_restarted();
+	assert(egress_restarts == 1);
 	assert(!create(dev, 1, 20));
 	assert(egress_changes == 1 && egress_changed_dev == dev);
 	assert(!add_leaf(dev, 1, 0, 0, 0, 125000000, 125000000, &qid1));

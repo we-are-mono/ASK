@@ -166,6 +166,9 @@ static void rejection_and_completion(void)
     for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
         assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
         assert(!hc->nextSeqNumLocation && !hc->failed && !delays);
+        /* A refused sync can complete next time: the channel has not
+         * failed, and an owner waiting on a barrier waits for it. */
+        assert(!FmHcIsFailed(hc));
         t_HcFrame expected = {.opcode = HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC};
         assert(!memcmp(hc->p_Frm[0], &expected, sizeof(expected)));
         /* A run of rejections reports its first only: neither a later
@@ -202,8 +205,12 @@ static void timeout_and_late_confirmation(bool before_return)
         assert(!FmIsHcUsageAllowed(hc));
     }
     unsigned reported = reports;
+    assert(!FmHcIsFailed(hc));
     assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_TIMEOUT);
     assert(hc->failed && delays == HC_CONFIRM_POLLS && submissions == 1);
+    /* One that timed out unconfirmed has failed the channel until reset,
+     * which is what an owner asks before it stops waiting on barriers. */
+    assert(FmHcIsFailed(hc));
     assert(hc->nextSeqNumLocation == (before_return ? 0 : 1));
     /* The timeout that failed the channel is reported unconditionally, and
      * starts the run every retry after it belongs to. */
@@ -237,7 +244,7 @@ static void timeout_and_late_confirmation(bool before_return)
         /* SDK rejects a duplicate CPU-order confirmation without double free. */
         FmHcTxConf(hc, (t_DpaaFD *)&pending.fd);
     }
-    assert(!hc->nextSeqNumLocation && hc->failed);
+    assert(!hc->nextSeqNumLocation && hc->failed && FmHcIsFailed(hc));
     refuses_teardown(hc); /* A late confirmation does not repair caller state. */
     dispose(hc);
 }
@@ -301,6 +308,8 @@ static void independent_commands_and_invalid_confirmation(void)
 int main(void)
 {
     _Static_assert(sizeof(struct qm_fd) == sizeof(t_DpaaFD), "QMan / SDK FD layout");
+    /* A PCD without a channel has none to fail. */
+    assert(!FmHcIsFailed(NULL));
     rejection_and_completion();
     timeout_and_late_confirmation(false);
     timeout_and_late_confirmation(true);

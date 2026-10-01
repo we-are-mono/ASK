@@ -321,6 +321,10 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa, struct cdx_ipsec_counters *last)
  * that added them. Transaction held. */
 unsigned int cdx_ipsec_sa_count(void);
 
+/* CDX's own, for the datapath restart: install again the entry of every SA a
+ * failed delete stranded. Transaction and RTNL held. */
+void cdx_ipsec_sa_restarted(void);
+
 /* Point an outbound SA's egress framing at a different next hop.
  *
  * The peer's Ethernet address is not consulted per frame. It is written into

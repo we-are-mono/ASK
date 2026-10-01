@@ -19,16 +19,28 @@
 #define FM_MAX_NUM_OF_1G_RX_PORTS 2
 #define FM_MAX_NUM_OF_10G_RX_PORTS 2
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-#define DPA_ERROR(...) do { } while (0)
+/* Errors, counted: a port a resume could not start is reported by name. */
+static unsigned dpa_errors;
+static char dpa_error_line[128];
+#define DPA_ERROR(...) do { dpa_errors++; snprintf(dpa_error_line, sizeof(dpa_error_line), __VA_ARGS__); } while (0)
 #define pr_err(...) do { } while (0)
+#define pr_err_ratelimited(...) do { } while (0)
+/* The coverage warning at setup, counted. */
+static unsigned coverage_warnings;
+#define pr_warn(...) (coverage_warnings++)
 #define display_dpa_cfg() do { } while (0)
 typedef void *t_Handle;
 typedef int t_Error;
 
 #define FMAN_INDEX 0
-struct port { bool enabled, detached; };
+/* A port as the SDK keeps it: enabled, detached from its PCD, fenced against
+ * enables, still finishing frames for so many more looks, given a PCD of its
+ * own (for a port CDX did not configure), and whether the netdev owning an Rx
+ * port is up. */
+struct port { bool enabled, detached, fenced, pcd, netdev_down, fail_enable; unsigned busy; };
 struct device { unsigned id; };
-typedef struct { bool active; t_Handle h_Dev; } t_LnxWrpFmPortDev;
+typedef struct { bool active; t_Handle h_Dev; char name[20]; } t_LnxWrpFmPortDev;
+#define IFNAMSIZ 16
 typedef struct {
     unsigned id;
     t_LnxWrpFmPortDev opPorts[2], rxPorts[4];
@@ -102,10 +114,34 @@ static int FM_PORT_GetEnabled(void *p, bool *enabled)
 static int FM_PORT_DetachPCD(void *p)
 { assert(!((struct port *)p)->enabled); ((struct port *)p)->detached = true; return 0; }
 static int FM_PORT_Disable(void *p) { ((struct port *)p)->enabled = false; return 0; }
+static unsigned refused_enables;
 static int FM_PORT_Enable(void *p)
 {
+    if (((struct port *)p)->fenced) { refused_enables++; return -EBUSY; }
+    if (((struct port *)p)->fail_enable) return -EIO;
     if (!((struct port *)p)->detached && (!stats || queues != 4)) unsafe_enable = true;
     ((struct port *)p)->enabled = true; return 0;
+}
+static int FM_PORT_SetFenced(void *p, bool fenced) { ((struct port *)p)->fenced = fenced; return 0; }
+static unsigned stopped_looks;
+static int FM_PORT_GetStopped(void *p, bool *stopped)
+{
+    struct port *port = p;
+
+    stopped_looks++;
+    *stopped = !port->enabled && !port->busy;
+    if (port->busy) port->busy--;
+    return 0;
+}
+static int FM_PORT_IsPcdAttached(void *p, bool *attached) { *attached = ((struct port *)p)->pcd; return 0; }
+static unsigned waits;
+static void usleep_range(unsigned min, unsigned max) { assert(min && max >= min); waits++; }
+#define ASSERT_RTNL() assert(rtnl)
+static bool dpa_rx_port_wanted(t_Handle handle, char name[IFNAMSIZ])
+{
+    assert(rtnl);
+    snprintf(name, IFNAMSIZ, "eth%u", (unsigned)((struct port *)handle - ports));
+    return !((struct port *)handle)->netdev_down;
 }
 static int cdxdrv_get_fman_handles(struct cdx_fman_info *f, t_LnxWrpFmDev **wrapper)
 {
@@ -246,6 +282,8 @@ static void setup(void)
         wrappers[i].dev = &fman_devices[i];
         wrappers[i].opPorts[0] = (t_LnxWrpFmPortDev){ true, &ports[2 * i] };
         wrappers[i].rxPorts[2] = (t_LnxWrpFmPortDev){ true, &ports[2 * i + 1] };
+        snprintf(wrappers[i].opPorts[0].name, sizeof(wrappers[i].opPorts[0].name), "fm%u-port-oh1", i);
+        snprintf(wrappers[i].rxPorts[2].name, sizeof(wrappers[i].rxPorts[2].name), "fm%u-port-rx2", i);
         ports[2 * i] = (struct port){.enabled = !!(port_up_mask & (1U << (2 * i)))};
         ports[2 * i + 1] = (struct port){.enabled = !!(port_up_mask & (1U << (2 * i + 1)))};
     }
@@ -279,6 +317,125 @@ static void retry(void)
     assert(cdx_ioc_set_dpa_params((unsigned long)&request) == -EBUSY);
     clean_success();
 }
+/* The restartable stop, from a configured datapath. ports[0]/[2] are offline
+ * ports, ports[1]/[3] Rx ports (setup()), all enabled by default. */
+static int locked_stop(void)
+{
+    cdx_ctrl_lock_with_rtnl();
+    int rc = dpa_cfg_stop();
+    cdx_ctrl_unlock_with_rtnl();
+    return rc;
+}
+static int locked_resume(void)
+{
+    cdx_ctrl_lock_with_rtnl();
+    int rc = dpa_cfg_resume();
+    cdx_ctrl_unlock_with_rtnl();
+    return rc;
+}
+static void check_stop_resume(void)
+{
+    static struct port foreign;
+
+    port_up_mask = 15;
+    setup(); assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
+    /* A stop disables and fences every port and waits until none has a
+     * frame in hand; nothing is detached or drained. An enable from anyone
+     * else is refused while it holds. Stopping again changes nothing. */
+    ports[2].busy = 3;
+    assert(!locked_stop() && stopped() && dpa_active_ports.state == DPA_PORTS_STOPPED);
+    for (unsigned i = 0; i < 4; i++)
+        assert(ports[i].fenced && !ports[i].detached);
+    assert(waits == 3 && !ports[2].busy);
+    for (struct dpa_fq *fq = dpa_pcd_fq; fq; fq = (struct dpa_fq *)fq->list.next)
+        assert(fq->fq_base.id != 1);
+    unsigned refused = refused_enables;
+    assert(FM_PORT_Enable(&ports[1]) == -EBUSY && !ports[1].enabled && refused_enables == refused + 1);
+    assert(!locked_stop() && stopped());
+    /* A port still finishing a frame after the bounded wait is reported
+     * busy: disabled and fenced all the same, asked again later. */
+    ports[0].busy = 1000; waits = 0;
+    assert(locked_stop() == -EBUSY && stopped() && ports[0].fenced);
+    assert(waits == DPA_STOP_WAIT_US / DPA_STOP_POLL_US && dpa_active_ports.state == DPA_PORTS_STOPPED);
+    ports[0].busy = 0;
+    assert(!locked_stop());
+    /* A resume starts what the first stop found enabled: an Rx port only if
+     * its netdev is still up. Every fence comes off. */
+    ports[3].netdev_down = true;
+    assert(!locked_resume() && dpa_active_ports.state == DPA_PORTS_RUNNING);
+    assert(ports[0].enabled && ports[1].enabled && ports[2].enabled && !ports[3].enabled);
+    for (unsigned i = 0; i < 4; i++)
+        assert(!ports[i].fenced && !ports[i].detached);
+    assert(!locked_resume() && !ports[3].enabled);
+    /* What a stop records is what was enabled when the datapath first
+     * stopped, however many stops follow it. */
+    ports[3].netdev_down = false;
+    assert(!locked_stop() && !locked_stop() && !locked_resume());
+    assert(ports[0].enabled && ports[1].enabled && ports[2].enabled && !ports[3].enabled);
+    /* A port that will not start is named -- its own name and, for a receive
+     * port, its netdev's -- and counted; the others start all the same, its
+     * fence comes off with theirs, and the ports count as running. Its netdev
+     * restarts it. */
+    ports[1].fail_enable = true;
+    unsigned errors = dpa_errors;
+    assert(!locked_stop() && locked_resume() == 1 && dpa_active_ports.state == DPA_PORTS_RUNNING);
+    assert(dpa_errors == errors + 1 && strstr(dpa_error_line, "fm0-port-rx2 of eth1"));
+    assert(ports[0].enabled && !ports[1].enabled && ports[2].enabled && !ports[1].fenced);
+    ports[1].fail_enable = false;
+    assert(!FM_PORT_Enable(&ports[1]) && ports[1].enabled);
+    /* A port CDX did not configure that reaches a classifier: the stop
+     * stops CDX's own ports but cannot vouch for the tables, and says so
+     * apart from ports that only cannot be resumed. */
+    foreign = (struct port){ .enabled = true, .pcd = true };
+    wrappers[1].opPorts[1] = (t_LnxWrpFmPortDev){ true, &foreign };
+    assert(locked_stop() == -EXDEV && stopped() && foreign.enabled && !dpa_cfg_covered());
+    foreign.pcd = false;
+    assert(!locked_stop() && dpa_cfg_covered() && !locked_resume());
+    wrappers[1].opPorts[1] = (t_LnxWrpFmPortDev){ 0 };
+    /* Quiesce after a stop detaches and drains, keeping what the stop
+     * recorded; nothing resumes from there and no stop vouches for it. */
+    ports[3].enabled = true;
+    assert(!locked_stop());
+    cdx_ctrl_lock_with_rtnl();
+    assert(!dpa_cfg_quiesce() && dpa_active_ports.state == DPA_PORTS_QUIESCED);
+    for (unsigned i = 0; i < 4; i++)
+        assert(ports[i].detached && !ports[i].enabled);
+    for (struct dpa_fq *fq = dpa_pcd_fq; fq; fq = (struct dpa_fq *)fq->list.next)
+        assert(fq->fq_base.id == 1);
+    assert(dpa_cfg_resume() == -ENOTRECOVERABLE && dpa_cfg_stop() == -ENOTRECOVERABLE);
+    for (unsigned i = 0; i < 4; i++)
+        assert(!ports[i].enabled);
+    /* A foreign port reaching a classifier still says so once detached:
+     * an unload settles nothing it could walk to. */
+    foreign = (struct port){ .enabled = true, .pcd = true };
+    wrappers[0].opPorts[1] = (t_LnxWrpFmPortDev){ true, &foreign };
+    assert(dpa_cfg_stop() == -EXDEV && !ports[0].enabled);
+    cdx_ctrl_unlock_with_rtnl();
+    assert(!dpa_cfg_covered());
+    wrappers[0].opPorts[1] = (t_LnxWrpFmPortDev){ 0 };
+    /* Unload takes the fences off and gives the stack its ports back, but
+     * not an Rx port whose netdev went down while they were stopped. */
+    ports[1].netdev_down = true;
+    dpa_cfg_deinit();
+    for (unsigned i = 0; i < 4; i++)
+        assert(ports[i].enabled == (i != 1) && !ports[i].fenced);
+    assert(!fman_info && !live_allocs && !slots && !queues);
+    /* Ports a failed setup could not detach (cdx_ioc_set_dpa_params()'s
+     * -EUCLEAN arm) are never resumed either. */
+    setup(); assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
+    dpa_active_ports.state = DPA_PORTS_DETACHING;
+    assert(locked_stop() == -ENOTRECOVERABLE && stopped() && locked_resume() == -ENOTRECOVERABLE);
+    clean_success();
+    /* A setup that finds a foreign port with a classifier says so once. */
+    foreign = (struct port){ .enabled = true, .pcd = true };
+    wrappers[0].rxPorts[0] = (t_LnxWrpFmPortDev){ true, &foreign };
+    unsigned warned = coverage_warnings;
+    setup(); assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
+    assert(coverage_warnings == warned + 1);
+    wrappers[0].rxPorts[0] = (t_LnxWrpFmPortDev){ 0 };
+    clean_success();
+}
+
 int main(void)
 {
     /* The FMAN count is bounded before any lock, allocation or hardware
@@ -346,6 +503,8 @@ int main(void)
         assert(cdx_ioc_set_dpa_params((unsigned long)&request));
         retry();
     }
-    printf("CDX startup fault points passed: %u allocations, %u stages, partial copies and retry\n", allocations, steps);
+    check_stop_resume();
+    printf("CDX startup fault points passed: %u allocations, %u stages, partial copies and retry; "
+           "restartable stop and resume\n", allocations, steps);
     return 0;
 }

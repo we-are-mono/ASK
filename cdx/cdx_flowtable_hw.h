@@ -99,7 +99,7 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
 /* Always consumes *hw. 0: removed and synchronized. -EAGAIN: unlinked but
  * quarantined. -EIO: removal unproven; caller must stop further admission and
- * quiesce the datapath. The backend retains failed deletions without allocating
+ * stop the datapath. The backend retains failed deletions without allocating
  * new storage, and a retained entry keeps its holds on the statistics records
  * it names until the same proof releases it. A repeated delete with
  * *hw == NULL does not erase prior errors. */
@@ -108,7 +108,13 @@ unsigned int cdx_ft_hw_pending(void);
 /* One barrier for every unproven unlink, CDX's parked backlog included; see
  * the definition for what the return value does and does not cover. */
 int cdx_ft_hw_retry(void);
-/* Only after dpa_cfg_quiesce has succeeded; requires the control mutex. */
+/* Only once dpa_cfg_stop() or dpa_cfg_quiesce() has found every classifier
+ * port stopped and idle, and a PCD barrier has completed after that; requires
+ * the control mutex. Frees what is unlinked and records what may not be
+ * (cdx_ehash_abandon()). */
 void cdx_ft_hw_quiesced(void);
+/* When neither can be had for good: keeps every retired entry allocated with
+ * its holds, recorded as possibly linked; requires the control mutex. */
+void cdx_ft_hw_strand(void);
 
 #endif

@@ -184,15 +184,24 @@ static void cdx_subsys_exit(void)
 
 static void cdx_ctrl_deinit(void)
 {
+	bool stopped, settled;
+
 	cdx_ctrl_lock_with_rtnl();
-	if (dpa_cfg_quiesce())
+	stopped = !dpa_cfg_quiesce();
+	if (!stopped)
 		pr_err("cdx: cannot quiesce DPA ports before control teardown\n");
 	cdx_subsys_exit();
 	/* Last on purpose: the exit chain above (the multicast and IPsec
 	 * teardowns included) can still park entries whose delete failed,
-	 * so the abandon must run after every subsystem's teardown, not
-	 * from an individual _exit hook partway down the chain. */
+	 * or record ones it could not prove unlinked, so both dispositions
+	 * run after every subsystem's teardown, not from an individual _exit
+	 * hook partway down the chain. */
 	cdx_ehash_quarantine_abandon();
+	/* A key is settled only with nothing left to walk to it: CDX's ports
+	 * detached, and no other port reaching a classifier. The FQIDs held
+	 * for an SA whose key may still be linked go back only once none is. */
+	settled = cdx_ehash_abandoned_exit(stopped && dpa_cfg_covered());
+	cdx_dpa_ipsec_held_fqids_exit(settled);
 	cdx_ctrl_unlock_with_rtnl();
 }
 
@@ -296,8 +305,9 @@ static void cdx_module_deinit(void)
 	/* Stop the remaining internal writer before terminal retries release
 	 * both locks. Timer storage survives until its normal exit callback. */
 	cdx_ctrl_timer_stop();
-	/* And the terminal-failure port-stop work: unload quiesces the ports
-	 * below itself, and the work takes the control lock and cdx_info. */
+	/* And the work that stops the ports after an unproven deletion and
+	 * restarts them: unload quiesces the ports below itself, and the work
+	 * takes the control lock and cdx_info. */
 	cdx_ft_fatal_stop();
 
 	/* Stop classification before any dependent subsystem releases queues.

@@ -960,6 +960,15 @@ loses its last, while the bridge's snooping says the stream is dropped, is
 replaced by a discard and retired once its stream stops -- or sooner, giving its
 group id up, when a stream somebody wants finds none left.
 
+A group delete that cannot prove its classifier entry unlinked -- the delete
+failed before it changed anything -- may leave the root replicating through
+its listener chain. Neither is freed: the root and every listener behind it are
+recorded, and the failure stops the datapath. With the ports idle CDX settles
+the root, frees the chain behind it and restarts; both learners then
+reconsider every group, so one refused while the ports were stopped is
+installed again from its next traffic, and the withdrawn group can join again
+with the same key.
+
 ### 8. Parity
 
 A paired boot against CMM on an IPTV-shaped stream, in the roadmap's format.
