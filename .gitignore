@@ -16,8 +16,6 @@
 dist/
 
 # Built binaries
-cmm/src/cmm
-cmm/src/cmm_rtnl_fuzzer
 flowtable/src/ask-flowtable
 dpa_app/dpa_app
 

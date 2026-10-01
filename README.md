@@ -28,10 +28,10 @@ The components:
   `dpa_app` (loads the FMAN classification rules), `fmc` (NXP's FMAN config
   compiler).
 - **Supporting libraries** — `fmlib`.
-- **Reference sources** — `cmm/`, `fci/` (with `libfci`) and `auto_bridge/`
-  hold the retired CMM daemon, its FCI control channel and the L2 bridge flow
-  detector. They are kept for reference while the move to Linux flowtables
-  completes; nothing builds or ships them.
+- **Retired** — the CMM daemon, its FCI control channel (`libfci`) and the
+  `auto_bridge` L2 flow detector are gone from the tree; Linux flowtables
+  replaced them. Their sources remain in the `mono-1.0.x` release tags, which
+  is what docs citing `cmm/`, `fci/` or `auto_bridge/` paths refer to.
 - **Kernel side** — the `patches/kernel/` stack (`010`–`130`: the vendored
   DPAA/FMAN SDK, ASK's hooks, and board drivers, applied onto stock mainline
   6.12) and the board device tree in `dts/`. See
@@ -173,8 +173,8 @@ line; releases are tagged (`mono-1.0.0`). See [docs/versioning.md](docs/versioni
 for the full branch model.
 
 The `feat/linux-flowtable-offload` branch replaces CMM flow management with
-Linux's native flowtables. The test image boots only that path; `cmm/`, `fci/`
-and `auto_bridge/` remain as unbuilt reference sources. The
+Linux's native flowtables. The test image boots only that path, and the CMM,
+FCI and auto_bridge sources have been removed (see the release tags). The
 [project overview](docs/flowtable/README.md) links the current
 architecture, supported features, operating guides, and historical validation
 evidence.

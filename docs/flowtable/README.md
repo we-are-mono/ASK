@@ -5,9 +5,10 @@
 The bounded CMM-retirement foundation and IPv4 TCP/UDP NAT
 increments are implemented and verified. Native Linux flowtables and the loadable
 `ask_flowtable` adapter control CDX hardware without CMM or FCI. This is the
-only offload path the test image boots; CMM, FCI and auto_bridge are no longer
-built, and their `cmm/`, `fci/` and `auto_bridge/` sources remain in the tree
-only as reference while the transition completes.
+only offload path the test image boots. CMM, FCI and auto_bridge have been
+removed from the tree; where these documents cite `cmm/`, `fci/` or
+`auto_bridge/` source, they mean the tree as of the `mono-1.0.x` release tags
+(for example `git show mono-1.0.7:cmm/src/module_ipsec.c`).
 
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
 Current checkpoint: IPv6, 802.1Q VLAN, bridging, PPPoE, IPv4 TCP/UDP NAT and
