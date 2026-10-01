@@ -55,28 +55,52 @@ the kernel hook refuses every one of these, so they never reach the adapter.
 
 ## The two halves
 
-A connection through a tunnel is two hardware entries, and they are not
-mirror images.
+A connection through a tunnel has separate hardware state for each admitted
+direction.
 
 **Egress inserts the outer header.** The direction whose frames leave by the
 tunnel is PPPoE-shaped: the walk records the tunnel hop, the encoder emits the
 `INSERT_L3_HDR` opcode with the header the tunnel device would have built, and
 everything below the tunnel — a VLAN tag, a bridge, even a PPPoE session on the
-WAN link — is walked and encapsulated as usual. The classifier key is
-unchanged, the physical port plus the inner 5-tuple, so the tunnel reaches the
-hardware only as the header it inserts.
+WAN link — is walked and encapsulated as usual. Its classifier key matches the
+physical port and inner 5-tuple, plus fields identifying an unencapsulated
+packet.
 
 **Ingress strips it.** The reverse direction arrives on the physical port as an
-outer packet addressed to the tunnel's local endpoint, and the hardware has to
-remove that outer header before the inner tuple can match. Netfilter describes
+outer packet addressed to the tunnel's local endpoint. The hardware matches
+the inner tuple together with the outer source, destination and protocol,
+then removes the outer header. Netfilter describes
 this direction with *nothing* — there is no pop action and no dissector key for
 a tunnel, exactly as there is none for an ingress session — so the rule for it
 is byte-for-byte the rule an unencapsulated flow produces, and only the reverse
 destination being a tunnel device says otherwise. The encoder emits
 `REMOVE_FIRST_IP_HDR`, which the SDK already carried and CMM already drove; the
-description reaching it is what is new. Because the ingress half is the one
+description also supplies the receive endpoints, reversed from the tunnel's
+transmit configuration. Because the ingress half is the one
 Netfilter hides, it is the half most likely to be silently refused, which is
 why every hardware case below asserts both directions separately.
+
+The loader appends these fields in C to the physical TCP/UDP classification
+schemes. IPv6 keys are 48 bytes and IPv4 keys are 49 bytes; SEC's private
+tables keep their original keys. The module rejects a loader configuration
+with the old physical key sizes. Ordinary flows and inbound NAT-T roots use
+the native IP protocol and zero tunnel fields, so an encapsulated packet
+cannot borrow an ordinary flow's key.
+
+A 4o6 receive direction owns two hardware matches: next header 4 directly,
+and next header 60 followed by a destination-options header whose next
+header is 4. This covers Linux's tunnel encapsulation-limit option. The direct
+form also checks the inner IPv4 version/IHL byte against the plain header
+supported by the native flowtable. Both matches share the tunnel
+statistics record, and their flow counters are summed. Each keeps its resource
+references until hardware retirement is proved. Other extension chains miss
+these entries and return to Linux.
+
+Admission also checks the inbound XFRM policy for the outer remote-to-local
+packet. A matching block, a required transform, or a blocking default leaves
+receive processing in Linux. An unrelated policy or a plain allow policy
+still permits hardware decapsulation. Policy changes retire the old flow
+generation and readmission repeats the check.
 
 The ingress half is also the one Linux never offers again by itself. Its tuple
 names the port below the tunnel, as the hardware needs, and there the software
@@ -240,11 +264,21 @@ Beyond the rules a routed flow already satisfies:
   rule every logical device satisfies, imposed here on the device the outer
   packet actually leaves by.
 - A tunnel and an IPsec transform may not appear on the same flow.
+- The outer receive packet must be allowed by inbound XFRM policy without a
+  transform.
 - A tunnel the kernel's walk crossed but the adapter's did not reach is refused
   rather than dropped from the description, which would forward with no outer
   header at all.
 
 ## Verification
+
+`tools/tests/test_flowtable_security.py` verifies on the DUT that correct
+6o4 and 4o6 replies increment hardware counters, while changing only the outer
+source, destination or encapsulation protocol produces neither delivery nor
+hardware counter increments. It exercises 4o6 both directly and with
+destination options. It also changes inbound XFRM policy after offload,
+checks block, ESP requirement, blocking default and device selectors, then
+checks recovery and policies that permit hardware forwarding.
 
 Host-side, `tools/host_tests/flowtable.c::test_tunnel` compiles the production
 decoder against a simulated kernel and covers a 6o4 and a 4o6 tunnel on each
@@ -268,11 +302,11 @@ which the counters alone cannot show:
 
 | Case | Both modes | Evidence beyond the counters |
 | --- | --- | --- |
-| Routed UDP | yes | 64 hardware packets each direction; the tunnel named on the insert and the strip and on neither LAN half; the forward MTU is the tunnel's; the captured outer header matches the device's, DF absent |
-| Full-MTU datagram | yes | a datagram filling the tunnel MTU is carried in hardware, so the microcode's size check counts the outer header |
-| TCP | 6o4 | half a megabyte on one connection, the cookies unchanged, so it was never readmitted against a changed tunnel |
+| Routed UDP | yes | 64 hardware packets per admitted direction (4o6 upload stays in software); tunnel identity and captured outer header match the device's configuration, DF absent |
+| Full-MTU datagram | yes | a datagram filling the tunnel MTU is carried in each admitted hardware direction, so the microcode's size check counts the outer header |
+| TCP | yes | half a megabyte on one connection with both directions in hardware and the cookies unchanged |
 | Reconfigure under load | 6o4 | `ip tunnel change` of the TTL retires the flow through the link watch, and the flow readmitted afterwards carries the new TTL on the wire |
-| Delete under load | 6o4 | deleting the tunnel device retires both directions and leaves the bindings up, so the next flow is judged against whatever tunnel exists then |
+| Delete under load | yes | deleting the tunnel device retires both directions and leaves the bindings up, so the next flow is judged against whatever tunnel exists then |
 | Over a PPPoE session | yes | `test_flowtable_pppoe.py::test_flowtable_pppoe_tunnel`: the insert carries the outer header, the session header and the WAN tag, the strip removes all three; the outer frames reach the concentrator's ppp device, which only a frame addressed to it and to this session does; one session and one tunnel record, each held by both directions |
 
 Both directions of both modes offload at the path's line rate: measured LAN VM

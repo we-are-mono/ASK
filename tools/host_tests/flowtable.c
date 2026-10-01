@@ -1059,6 +1059,21 @@ static u16 ipsec_sa, ipsec_in_sa;
  * so a case that wants either has to configure a policy first. That is also
  * what sends a table's packets past the software fast path, and so what stops
  * Linux offering its flows again. */
+#define LOOPBACK_IFINDEX 1
+static bool tunnel_policy_allowed = true;
+struct flowi {
+    union {
+        struct { struct in6_addr saddr, daddr; u8 flowi6_proto; int flowi6_iif, flowi6_oif; } ip6;
+        struct { __be32 saddr, daddr; u8 flowi4_proto; int flowi4_iif, flowi4_oif; } ip4;
+    } u;
+};
+static struct flowi last_tunnel_policy;
+static bool xfrm_flowtable_in_plain(struct net *net, const struct flowi *flow, u16 family)
+{
+    assert(net == &init_net && (family == AF_INET || family == AF_INET6));
+    last_tunnel_policy = *flow;
+    return tunnel_policy_allowed;
+}
 static bool xfrm_policies;
 static bool xfrm_flowtable_enabled(struct net *net)
 {
@@ -1508,6 +1523,10 @@ static void msleep(unsigned ms)
     unload_sleeps++;
     if (!--unload_failures) { retry_error=0; quiesce_fail=false; }
 }
+#define NF_BR_LOCAL_OUT 3
+#define NF_BR_POST_ROUTING 4
+static unsigned bridge_hooks;
+static bool ft_bridge_hooked(unsigned hooks) { return bridge_hooks & hooks; }
 #include "flowtable_production.inc"
 
 static struct net_device in = { .ifindex = 5, .mtu = 1500, .type = ARPHRD_ETHER,
@@ -2422,6 +2441,30 @@ static void test_bridge(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     br.mst = false;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+
+    for (unsigned hook = NF_BR_LOCAL_OUT; hook <= NF_BR_POST_ROUTING; hook++) {
+        bridge_hooks = BIT(hook);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        bridge_hooks = 0;
+        for (unsigned stats = 0; stats < 2; stats++) {
+            bridge_out_fixture();
+            cls.command = FLOW_CLS_REPLACE;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+            u64 invalidations = ft_admission_invalidations;
+            bridge_hooks = BIT(hook);
+            cls.command = stats ? FLOW_CLS_STATS : FLOW_CLS_REPLACE;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+            assert(handle.invalid && ft_admission_invalidations == invalidations + 1);
+            ft_retire_workfn(NULL);
+            assert(!ft_count && !allocated);
+            bridge_hooks = 0;
+        }
+    }
+    /* Bridge hooks do not forbid a direction with no egress bridge. */
+    fixture();
+    bridge_hooks = BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    bridge_hooks = 0;
 
     /* br-lan.100 over a bridge whose egress port is tagged for 100: the tag
      * comes from the VLAN device and the bridge keeps it. */
@@ -3778,6 +3821,15 @@ static void test_tunnel(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.in_tunnel.present && !decoded.out_tunnel.present);
     assert(decoded.in_tunnel.mode == CDX_FT_TUNNEL_6O4);
+    assert(last_tunnel_policy.u.ip4.saddr == ingress_tunnel.daddr.ip);
+    assert(last_tunnel_policy.u.ip4.daddr == ingress_tunnel.saddr.ip);
+    assert(last_tunnel_policy.u.ip4.flowi4_proto == IPPROTO_IPV6);
+    assert(last_tunnel_policy.u.ip4.flowi4_iif == ingress_tunnel.lower_ifindex);
+    assert(last_tunnel_policy.u.ip4.flowi4_oif == LOOPBACK_IFINDEX);
+    tunnel_policy_allowed = false;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    tunnel_policy_allowed = true;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.in_tunnel.header_size == 20);
     assert(decoded.in_tunnel.ifindex == in_sit.ifindex);
     assert(decoded.in_tunnel.lower_ifindex == in.ifindex);
@@ -3815,6 +3867,15 @@ static void test_tunnel(void)
     ingress_tunnel.flags = CDX_FT_TUNNEL_DSCP_COPY;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.in_tunnel.present && decoded.in_tunnel.mode == CDX_FT_TUNNEL_4O6);
+    assert(!memcmp(&last_tunnel_policy.u.ip6.saddr, &ingress_tunnel.daddr.in6, 16));
+    assert(!memcmp(&last_tunnel_policy.u.ip6.daddr, &ingress_tunnel.saddr.in6, 16));
+    assert(last_tunnel_policy.u.ip6.flowi6_proto == IPPROTO_IPIP);
+    assert(last_tunnel_policy.u.ip6.flowi6_iif == ingress_tunnel.lower_ifindex);
+    assert(last_tunnel_policy.u.ip6.flowi6_oif == LOOPBACK_IFINDEX);
+    tunnel_policy_allowed = false;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    tunnel_policy_allowed = true;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.in_tunnel.flags == CDX_FT_TUNNEL_DSCP_COPY);
     assert(decoded.in_tunnel.header_size == 40 && !decoded.out_tunnel.present);
     assert(decoded.in_logical == &in_ip6tnl);

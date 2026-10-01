@@ -17,6 +17,7 @@
 #include "cdx_police.h"
 
 struct cdx_ft_hw {
+	struct cdx_ft_hw *options;
 	CtEntry entry;
 	CtEntry twin;
 	RouteEntry route;
@@ -180,9 +181,9 @@ static bool ft_hw_egress_onif(U8 type)
 	       type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL);
 }
 
-int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
+static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 		  const struct cdx_ft_stats_binding *stats,
-		  struct cdx_ft_hw **result)
+		  struct cdx_ft_hw **result, bool options)
 {
 	POnifDesc in, out;
 	struct dpa_iface_info *in_iface, *out_iface;
@@ -407,6 +408,25 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		ingress->header_size = tunnel->header_size;
 		ingress->flags = tunnel->flags & CDX_FT_TUNNEL_DSCP_COPY ? DSCP_COPY : 0;
 		ingress->stats_index = stats->in_tunnel ? stats->in_tunnel->rx_index : 0;
+		/* Receive endpoints are the reverse of the configured transmit
+		 * header. The classifier matches these before executing the strip. */
+		if (tunnel->family == AF_INET) {
+			struct iphdr header = {
+				.protocol = IPPROTO_IPV6,
+				.saddr = tunnel->remote.ip,
+				.daddr = tunnel->local.ip,
+			};
+
+			memcpy(ingress->header, &header, sizeof(header));
+		} else {
+			struct ipv6hdr header = {
+				.nexthdr = options ? IPPROTO_DSTOPTS : IPPROTO_IPIP,
+				.saddr = tunnel->remote.in6,
+				.daddr = tunnel->local.in6,
+			};
+
+			memcpy(ingress->header, &header, sizeof(header));
+		}
 	}
 	/* The shared encoder reads this on its way to cdx_get_txfqid(), which
 	 * resolves the pair to a CEETM logical FQ and bakes that FQID into the
@@ -505,6 +525,27 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	return 0;
 }
 
+int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
+		  const struct cdx_ft_stats_binding *stats,
+		  struct cdx_ft_hw **result)
+{
+	int rc = ft_hw_add_one(rule, stats, result, false);
+
+	if (rc || !rule->in_tunnel.present || rule->in_tunnel.family != AF_INET6)
+		return rc;
+	/* Linux may send an encapsulation-limit destination option. Match
+	 * its next-header byte too, so another encapsulation cannot borrow
+	 * this entry merely by starting with a destination-options header. */
+	rc = ft_hw_add_one(rule, stats, &(*result)->options, true);
+	if (rc) {
+		int retired = cdx_ft_hw_del(result);
+
+		if (retired && retired != -EAGAIN)
+			cdx_ft_fatal();
+	}
+	return rc;
+}
+
 void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 {
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
@@ -512,6 +553,15 @@ void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 	stats->packets = hw->entry.ct->pkts;
 	stats->bytes = hw->entry.ct->bytes;
 	stats->lastused = hw->entry.ct->timestamp;
+	if (hw->options) {
+		struct cdx_ft_counters extra;
+
+		cdx_ft_hw_stats(hw->options, &extra);
+		stats->packets += extra.packets;
+		stats->bytes += extra.bytes;
+		if ((s32)(extra.lastused - stats->lastused) > 0)
+			stats->lastused = extra.lastused;
+	}
 }
 
 /* Everything unlinked before a barrier that has just completed: the retired
@@ -539,11 +589,13 @@ int cdx_ft_hw_del(struct cdx_ft_hw **entry)
 {
 	struct cdx_ft_hw *hw = *entry;
 	struct hw_ct *ct;
-	int rc;
+	int rc, options_rc = 0;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	if (!hw)
 		return 0;
+	if (hw->options)
+		options_rc = cdx_ft_hw_del(&hw->options);
 	ct = hw->entry.ct;
 	/* Preserve the real linked allocation to exercise fatal retirement.
 	 * Never inject a hard error after a successful destructive unlink; a
@@ -560,11 +612,11 @@ int cdx_ft_hw_del(struct cdx_ft_hw **entry)
 		/* DeleteKey synced the PCD before reporting success, after
 		 * every earlier unlink, so the same barrier settles those. */
 		ft_hw_release_synced();
-		return 0;
+		return options_rc == -EIO ? -EIO : 0;
 	}
 	hw->delete_rc = rc;
 	list_add_tail(&hw->retired, &ft_retired);
-	if (rc == EN_EHASH_DELETE_UNSYNCED)
+	if (rc == EN_EHASH_DELETE_UNSYNCED && options_rc != -EIO)
 		return -EAGAIN;
 	return -EIO;
 }

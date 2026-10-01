@@ -2397,6 +2397,18 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 				__func__);
 		goto err_ret;
 	}
+	/* Inbound NAT-T uses the physical port's UDP table, whose key also
+	 * identifies a native first IP header. Outbound roots use SEC's own
+	 * tables and keep the original tuple. */
+	if (IS_NATT_SA(sa) && sa_dir_in) {
+		unsigned int size = sa->family == PROTO_IPV4 ?
+			CDX_UNICAST4_KEY_SIZE : CDX_UNICAST_KEY_SIZE;
+
+		memset(tbl_entry->hashentry.key + key_size, 0,
+		       size - key_size);
+		tbl_entry->hashentry.key[key_size] = IPPROTO_UDP;
+		key_size = size;
+	}
 	/* An outbound SA's entry is on the offline port, where every SA's
 	 * output and every decrypted frame is classified: it matches only
 	 * what this SA encrypted, and never a decrypted packet built to look

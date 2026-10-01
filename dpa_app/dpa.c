@@ -71,6 +71,73 @@ char *sp_file = DEFAULT_SP_FILE;
 //fmc model from xml files
 static struct fmc_model_t cmodel;
 
+/* Keep the inner tuple, then append first-header fields using generic
+ * extraction (known fields are reordered by KeyGen): tuple, native protocol,
+ * opposite-family protocol/endpoints. IPv6 keys use 48 bytes; IPv4 keys use
+ * 49, including the next-header byte after an outer IPv6 header.
+ * An absent header extracts zero. Thus ordinary traffic cannot hit a tunnel
+ * entry, nor can an unsupported encapsulation hit an ordinary entry. */
+static void tunnel_extract(t_FmPcdKgKeyExtractAndHashParams *key,
+			   e_NetHeaderType family, unsigned offset, unsigned size)
+{
+	t_FmPcdExtractEntry *extract = &key->extractArray[key->numOfUsedExtracts++];
+
+	memset(extract, 0, sizeof(*extract));
+	extract->type = e_FM_PCD_EXTRACT_BY_HDR;
+	extract->extractByHdr.hdr = family;
+	extract->extractByHdr.hdrIndex = e_FM_PCD_HDR_INDEX_1;
+	extract->extractByHdr.type = e_FM_PCD_EXTRACT_FROM_HDR;
+	extract->extractByHdr.extractByHdrType.fromHdr.offset = offset;
+	extract->extractByHdr.extractByHdrType.fromHdr.size = size;
+}
+
+static int set_tunnel_keys(struct fmc_model_t *model)
+{
+	unsigned i, j;
+
+	for (i = 0; i < model->scheme_count; i++) {
+		const char *name = model->scheme_name[i];
+		t_FmPcdKgKeyExtractAndHashParams *key =
+			&model->scheme[i].keyExtractAndHashParams;
+		bool v4 = strstr(name, "cdx_udp4_dist") || strstr(name, "cdx_tcp4_dist");
+		bool v6 = strstr(name, "cdx_udp6_dist") || strstr(name, "cdx_tcp6_dist");
+
+		if (!v4 && !v6)
+			continue;
+		if (key->numOfUsedExtracts + 5 >= FM_PCD_KG_MAX_NUM_OF_EXTRACTS_PER_KEY)
+			return -1;
+		for (j = 0; j < key->numOfUsedDflts; j++)
+			if (key->dflts[j].type == e_FM_PCD_KG_GENERIC_FROM_DATA)
+				break;
+		if (j == key->numOfUsedDflts) {
+			if (j == FM_PCD_KG_NUM_OF_DEFAULT_GROUPS)
+				return -1;
+			key->numOfUsedDflts++;
+		}
+		key->privateDflt1 = 0;
+		key->dflts[j].type = e_FM_PCD_KG_GENERIC_FROM_DATA;
+		key->dflts[j].dfltSelect = e_FM_PCD_KG_DFLT_PRIVATE_1;
+		tunnel_extract(key, v4 ? HEADER_TYPE_IPv4 : HEADER_TYPE_IPv6, v4 ? 9 : 6, 1);
+		tunnel_extract(key, v4 ? HEADER_TYPE_IPv6 : HEADER_TYPE_IPv4, v4 ? 6 : 9, 1);
+		tunnel_extract(key, v4 ? HEADER_TYPE_IPv6 : HEADER_TYPE_IPv4, v4 ? 8 : 12, v4 ? 16 : 8);
+		if (v4) {
+			tunnel_extract(key, HEADER_TYPE_IPv6, 24, 16);
+			/* Next header of destination options, or the first byte of
+			 * the inner IPv4 header when no extension is present. */
+			tunnel_extract(key, HEADER_TYPE_IPv6, 40, 1);
+		}
+	}
+	for (i = 0; i < model->htnode_count; i++) {
+		const char *name = model->htnode_name[i];
+
+		if (strstr(name, "cdx_udp4") || strstr(name, "cdx_tcp4"))
+			model->htnode[i].matchKeySize = CDX_UNICAST4_KEY_SIZE;
+		else if (strstr(name, "cdx_udp6") || strstr(name, "cdx_tcp6"))
+			model->htnode[i].matchKeySize = CDX_UNICAST_KEY_SIZE;
+	}
+	return 0;
+}
+
 //mapping CC tables names to types
 static struct ccnode_table_params table_params[] = {
 	{(char *)"cdx_udp4", 	IPV4_UDP_TABLE},
@@ -760,7 +827,7 @@ int dpa_init(void)
 		if (get_port_info(finfo))
 			goto out;
 	}
-	if (set_table_types(&cmodel))
+	if (set_table_types(&cmodel) || set_tunnel_keys(&cmodel))
 		goto out;
 	for (ii = 0; ii < params.num_fmans; ii++) {
 		if (set_fm_adv_options(params.fman_info[ii].index))

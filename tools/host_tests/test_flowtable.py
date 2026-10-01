@@ -56,7 +56,7 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
              "ft_dev_stats_reap", "ft_dev_stats_drop_all", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",
              "ft_l2_overhead", "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
-             "ft_vlan_lower", "ft_bridge_vlan", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_ipv6_mtu_bounded", "ft_ipv4_arriving", "ft_ipv4_mtu_carried", "ft_mtu_refused", "ft_parse", "ft_same_key", "ft_key_hash",
+             "ft_vlan_lower", "ft_bridge_vlan", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_ipv6_mtu_bounded", "ft_ipv4_arriving", "ft_ipv4_mtu_carried", "ft_mtu_refused", "ft_bridge_egress_filtered", "ft_tunnel_inbound_allowed", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_targets", "ft_software_reoffers", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
              "ft_invalid_complete", "ft_drained", "ft_can_rearm", "ft_rearm", "ft_rearm_workfn",
              "ft_release",
@@ -119,7 +119,9 @@ def test_flowtable_hardware_ownership(tmp_path):
         function((ROOT / "cdx/cdx_hal.h").read_text(), "__WRITE_UNALIGNED_INT")
         + "#define WRITE_UNALIGNED_INT(var, val) __WRITE_UNALIGNED_INT(&(var), (val))\n"
         + function((ROOT / "cdx/control_tunnel.c").read_text(), "tnl_build_header"))
-    (tmp_path / "hardware_production.inc").write_text(source[source.index("struct cdx_ft_hw {"):])
+    (tmp_path / "hardware_production.inc").write_text(
+        function((ROOT / "cdx/cdx_ehash.c").read_text(), "fill_tunnel_key")
+        + source[source.index("struct cdx_ft_hw {"):])
     backend = (ROOT / "cdx/cdx_flowtable_backend.c").read_text()
     (tmp_path / "backend_production.inc").write_text(backend[backend.index("static bool ft_observe"):])
     binary = tmp_path / "flowtable_hw"

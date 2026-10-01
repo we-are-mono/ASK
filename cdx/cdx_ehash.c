@@ -1316,6 +1316,27 @@ static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap
 	return SUCCESS;
 }
 
+/* Mirrors dpa_app's generic first-header extraction, after the known inner
+ * tuple fields. SEC's private tables retain their existing keys. */
+static unsigned int fill_tunnel_key(PCtEntry entry, const struct cdx_l2_encap *encap,
+				   uint8_t *key)
+{
+	const struct cdx_tunnel_encap *tunnel = encap ? &encap->ingress_tunnel : NULL;
+	bool ipv6 = IS_IPV6_FLOW(entry);
+	unsigned int size = ipv6 ? 10 : 35;
+
+	memset(key, 0, size);
+	if (tunnel && tunnel->present) {
+		key[1] = tunnel->header[ipv6 ? 9 : 6];
+		memcpy(key + 2, tunnel->header + (ipv6 ? 12 : 8), ipv6 ? 8 : 32);
+		if (!ipv6)
+			key[34] = key[1] == IPPROTO_DSTOPTS ? IPPROTO_IPIP : 0x45;
+	} else {
+		key[0] = entry->proto;
+	}
+	return size;
+}
+
 int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap)
 {
 	struct ins_entry_info *info;
@@ -1470,6 +1491,10 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 				__func__);
 		goto err_ret;
 	}	
+	if (!info->l3_info.ipsec_inbound_flow &&
+	    (tbl_type == IPV4_TCP_TABLE || tbl_type == IPV4_UDP_TABLE ||
+	     tbl_type == IPV6_TCP_TABLE || tbl_type == IPV6_UDP_TABLE))
+		key_size += fill_tunnel_key(entry, encap, tbl_entry->hashentry.key + key_size);
 
 	//round off keysize to next 4 bytes boundary 
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];          

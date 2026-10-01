@@ -202,9 +202,12 @@ static TCP/UDP SNAT increment does not establish every NAT exception combination
 | Hardware owner | CDX retains it until synchronized removal or safe terminal teardown |
 | Provider module | Pinned by the adapter's imported symbols throughout load, use and exit |
 
-Each direction has a private encoding entry, synthetic twin and embedded route.
+Each hardware match has a private encoding entry, synthetic twin and embedded route.
+A 4o6 receive direction owns two matches for its supported outer-header forms.
 They never join legacy connection/route hashes, ageing or CMM notification paths.
-The hardware match remains the ingress tuple; for NAT the twin is the inverse
+The hardware match includes the ingress tuple and first-header fields that
+distinguish ordinary traffic from a tunnel's outer endpoints and protocol
+([tunnels](tunnels.md#the-two-halves)). For NAT the twin is the inverse
 translated tuple. The [NAT guide](nat.md#mapping-and-dependencies)
 defines mapping validation and dependency addresses.
 
@@ -229,8 +232,10 @@ A fully offloaded flow, which is never offered again, relies on exactly that.
 The conntrack mark and a police filter are sampled once at admission, as for
 any offloaded flow ([QoS](qos.md)). What no event reports is rechecked on the
 offer: the policy generation and the two borrowed routes, as before any parse,
-and the IPv6 ingress MTU, a sysctl, as on every statistics pass. A pending
-global latch sends the offer through admission as before.
+and the IPv6 ingress MTU and bridge output hooks, as on every statistics pass.
+A newly registered bridge `LOCAL_OUT` or `POST_ROUTING` hook retires a
+generation with an egress bridge. A pending global latch sends the offer
+through admission as before.
 
 An offer that loses `rtnl_trylock()` is declined with `-EAGAIN` and counted as
 busy. Where software will offer the direction again it retires nothing: the

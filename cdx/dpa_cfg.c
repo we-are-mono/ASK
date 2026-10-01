@@ -572,6 +572,18 @@ static int get_cctbl_info(struct cdx_fman_info *finfo,
 		/* name[] is copied verbatim and several callers print it
 		 * with %s; userspace need not have terminated it. */
 		tbl_info[ii].name[TABLE_NAME_SIZE - 1] = '\0';
+		/* A loader predating outer-header keys must not activate entries
+		 * whose hardware comparison would stop at the inner tuple. */
+		if (((strstr(tbl_info[ii].name, "cdx_udp4") ||
+		      strstr(tbl_info[ii].name, "cdx_tcp4")) &&
+		     tbl_info[ii].key_size != CDX_UNICAST4_KEY_SIZE) ||
+		    ((strstr(tbl_info[ii].name, "cdx_udp6") ||
+		      strstr(tbl_info[ii].name, "cdx_tcp6")) &&
+		     tbl_info[ii].key_size != CDX_UNICAST_KEY_SIZE)) {
+			DPA_ERROR("%s: table %s lacks outer-header keys\n",
+				  __func__, tbl_info[ii].name);
+			return -EINVAL;
+		}
 
 		handle = fm_pcd_cookie_lookup(
 				(uint64_t)(uintptr_t)tbl_info[ii].id, type);

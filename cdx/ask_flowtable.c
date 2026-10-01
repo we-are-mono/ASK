@@ -2340,6 +2340,40 @@ static bool ft_mtu_refused(const struct flow_cls_offload *cls)
 	return refused;
 }
 
+static bool ft_bridge_hooked(unsigned int hooks);
+
+static bool ft_tunnel_inbound_allowed(const struct cdx_ft_tunnel *tunnel)
+{
+	struct flowi flow = {};
+
+	if (!tunnel->present)
+		return true;
+	/* Decapsulation receives a plaintext outer packet. A policy requiring
+	 * transport ESP, a block or a blocking default cannot be bypassed by
+	 * a hardware inner-tuple hit. The normal policy generation check also
+	 * retires this direction when that answer changes. */
+	if (tunnel->family == AF_INET6) {
+		flow.u.ip6.saddr = tunnel->remote.in6;
+		flow.u.ip6.daddr = tunnel->local.in6;
+		flow.u.ip6.flowi6_proto = tunnel->proto;
+		flow.u.ip6.flowi6_iif = tunnel->lower_ifindex;
+		flow.u.ip6.flowi6_oif = LOOPBACK_IFINDEX;
+	} else {
+		flow.u.ip4.saddr = tunnel->remote.ip;
+		flow.u.ip4.daddr = tunnel->local.ip;
+		flow.u.ip4.flowi4_proto = tunnel->proto;
+		flow.u.ip4.flowi4_iif = tunnel->lower_ifindex;
+		flow.u.ip4.flowi4_oif = LOOPBACK_IFINDEX;
+	}
+	return xfrm_flowtable_in_plain(&init_net, &flow, tunnel->family);
+}
+
+static bool ft_bridge_egress_filtered(const struct cdx_ft_rule *rule)
+{
+	return rule->out_bridge &&
+	       ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING));
+}
+
 /* Exact masks preserve every selector. Native flowtables supply routing
  * semantics (including TTL decrement), four Ethernet mangle words, an
  * encapsulation block, optional translation/checksum actions and a final
@@ -2492,6 +2526,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	if (vlans < 0)
 		return vlans;
 	out->in_vlans = vlans;
+	if (ft_bridge_egress_filtered(out) || !ft_tunnel_inbound_allowed(&out->in_tunnel))
+		return ask_refuse(-EOPNOTSUPP);
 	/* A tunnel carries one family inside the other, and the mode the device
 	 * decided has to be the one the flow's family asks for: a sit device
 	 * with an IPv4 flow through it is IPv4 in IPv4, which the hardware does
@@ -2862,12 +2898,15 @@ static unsigned int ft_l2_overhead(const struct cdx_ft_rule *rule)
 	       (rule->in_tunnel.present ? rule->in_tunnel.header_size : 0);
 }
 
-/* Whether an installed direction still holds its IPv6 ingress bound, retiring
- * its generation when it does not. The one admission condition no event
- * reports, so it is asked whenever Linux touches the direction again. Needs
- * no RTNL: the entry holds its ingress logical device. */
+/* Recheck admission conditions with no device notification on every offer
+ * and stats pass. Needs no RTNL: the entry holds its devices and hook lookup
+ * uses RCU. Retiring the generation also prevents its sibling keeping it alive. */
 static bool ft_entry_bounded(struct cdx_ft_entry *entry)
 {
+	if (ft_bridge_egress_filtered(&entry->rule)) {
+		ft_handle_invalidate(entry->handle, &ft_admission_invalidations);
+		return false;
+	}
 	if (entry->rule.family != AF_INET6 ||
 	    ft_ipv6_mtu_bounded(entry->rule.in_logical, entry->rule.mtu))
 		return true;
@@ -2968,8 +3007,8 @@ static bool ft_software_reoffers(const struct flow_cls_offload *cls)
  * a fully offloaded flow, which is never offered again at all. The conntrack
  * mark and a police filter are sampled once, at admission, which is all a fully
  * offloaded flow ever gets of them either. What ft_replace() checks ahead of
- * any parse still applies, through ft_offer_current(), and so does the one
- * admission bound no event reports, through ft_entry_bounded(). */
+ * any parse still applies, through ft_offer_current(), as do the
+ * admission conditions no event reports, through ft_entry_bounded(). */
 static bool ft_offer_installed(const struct cdx_ft_entry *entry,
 			       const struct flow_cls_offload *cls)
 {

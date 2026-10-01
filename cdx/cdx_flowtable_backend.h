@@ -91,7 +91,8 @@ enum cdx_ft_tunnel_mode {
  * session. present says the direction crosses one; the rest describes the
  * outer header the direction inserts -- endpoints local first, TTL, TOS or
  * traffic class, flow label -- or, for an ingress tunnel, the header it
- * strips, which the strip validates no more than a session strip does. mac is
+ * strips. The hardware key validates its endpoints and protocol before
+ * stripping it. mac is
  * the outer next hop's Ethernet address and nexthop its IP address on the
  * device below the tunnel, which is what an egress direction resolves its
  * destination through instead of a neighbour on the tunnel device, a tunnel

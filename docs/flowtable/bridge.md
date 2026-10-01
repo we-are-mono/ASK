@@ -10,6 +10,20 @@ explains the mechanism behind it; the [VLAN guide](vlan.md) covers
 the logical/physical device split and the device walk, which this increment
 widens rather than replaces.
 
+## Bridge output filters
+
+A routed unicast entry that leaves through a bridge is refused while any
+bridge-family `LOCAL_OUT` or `POST_ROUTING` hook is registered. Hardware sends
+directly to the port queue and cannot execute those hooks. The software
+flowtable's neighbour output traverses the bridge and applies them.
+
+The adapter rechecks these hooks on each installed offer and statistics poll.
+If a hook appears after admission, it retires the flow generation, including
+its other hardware direction. This follows the flowtable polling cadence;
+retirement is asynchronous. Once the hook is removed, traffic can be admitted
+again. `test_unicast_bridge_egress_filter` covers both hooks before admission
+and after a flow is already installed, with packet delivery and drop counters.
+
 ## Why the transmit type had to change
 
 `nft_dev_path_info()` forces `FLOW_OFFLOAD_XMIT_DIRECT` inside its

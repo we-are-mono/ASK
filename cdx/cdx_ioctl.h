@@ -27,6 +27,11 @@
 //table create ioctl
 #define CDX_CTRL_PORT_NAME_LEN	32	
 
+/* Physical-port TCP/UDP keys include first-header protocol/endpoints.
+ * SEC's private tables retain their original 14/38-byte tuple keys. */
+#define CDX_UNICAST_KEY_SIZE 48
+#define CDX_UNICAST4_KEY_SIZE 49
+
 //max number of fwd manip nodes
 //max number of nat addr translation manip nodes
 //max number of nat port translation manip nodes

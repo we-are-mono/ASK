@@ -9,9 +9,12 @@
 #include <string.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 typedef uint8_t u8;
 typedef uint16_t u16, __be16;
 typedef uint32_t u32, __be32;
+typedef int32_t s32;
 typedef uint64_t u64;
 typedef u8 U8;
 typedef u16 U16;
@@ -32,6 +35,7 @@ typedef u32 U32;
 #define NETREG_REGISTERED 1
 #define FFTYPE_IPV4 1
 #define FFTYPE_IPV6 2
+#define IS_IPV6_FLOW(entry) ((entry)->fftype == FFTYPE_IPV6)
 #define CONNTRACK_ORIG 1
 #define CONNTRACK_DNAT 0x10
 #define CONNTRACK_NAT 0x20
@@ -312,6 +316,7 @@ static unsigned int cdx_ipsec_sa_count(void) { assert(cdx_info->ctrl.mutex); ret
 static unsigned int cdx_mc_group_count(void) { assert(cdx_info->ctrl.mutex); return mc_owned; }
 static unsigned allocations, deletes, syncs;
 static bool fail_alloc, fail_insert, fail_sync, stopped;
+static unsigned fail_insert_after;
 /* A barrier has completed since the ports were last found stopped: what a
  * stop let go of may be freed only then. fail_next_sync fails the sync that
  * counts it down to zero, the ones before it completing. */
@@ -427,7 +432,7 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     assert(ct->sec_expansion == expected_expansion);
     assert(!(ct->status & CONNTRACK_SEC) == !(expected_sa || expected_in_sa));
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));
-    if (fail_insert) return -1;
+    if (fail_insert || (fail_insert_after && !--fail_insert_after)) return -1;
     ct->ct = kzalloc(sizeof(*ct->ct), GFP_KERNEL); assert(ct->ct);
     if (key) { assert(!older); older = key; }
     key = calloc(1,sizeof(*key)); assert(key); key->linked = true;
@@ -730,6 +735,9 @@ static void run_delayed_work(struct delayed_work *dwork)
  * work and the restart call them ahead of their definitions. */
 int cdx_ft_recover(void);
 unsigned int cdx_ft_pending(void);
+struct cdx_ft_hw;
+int cdx_ft_hw_del(struct cdx_ft_hw **hw);
+void cdx_ft_fatal(void);
 #include "hardware_production.inc"
 #include "backend_production.inc"
 
@@ -1414,8 +1422,44 @@ static void test_backend(void)
     test_restart_root(&in, &out, &info, &rule, &stats);
 }
 
+static void test_tunnel_keys(void)
+{
+    for (unsigned ipv6 = 0; ipv6 < 2; ipv6++) {
+        CtEntry ct = { .fftype = ipv6 ? FFTYPE_IPV6 : FFTYPE_IPV4, .proto = IPPROTO_UDP };
+        struct cdx_l2_encap encap = {0};
+        uint8_t key[36], changed[36];
+        unsigned size = ipv6 ? 10 : 35, offset = ipv6 ? 12 : 8, addresses = ipv6 ? 8 : 32;
+
+        memset(key, 0xff, sizeof(key));
+        assert(fill_tunnel_key(&ct, NULL, key) == size);
+        assert(key[0] == IPPROTO_UDP && key[size] == 0xff);
+        for (unsigned i = 1; i < size; i++) assert(!key[i]);
+        encap.ingress_tunnel.present = 1;
+        encap.ingress_tunnel.header[ipv6 ? 9 : 6] = ipv6 ? IPPROTO_IPV6 : IPPROTO_IPIP;
+        for (unsigned i = 0; i < addresses; i++) encap.ingress_tunnel.header[offset + i] = i + 1;
+        assert(fill_tunnel_key(&ct, &encap, key) == size);
+        assert(!key[0] && key[1] == (ipv6 ? IPPROTO_IPV6 : IPPROTO_IPIP));
+        for (unsigned i = 0; i < addresses; i++) {
+            assert(key[i + 2] == i + 1);
+            encap.ingress_tunnel.header[offset + i] ^= 0x80;
+            assert(fill_tunnel_key(&ct, &encap, changed) == size);
+            assert(memcmp(changed, key, size));
+            encap.ingress_tunnel.header[offset + i] ^= 0x80;
+        }
+        if (!ipv6) {
+            assert(key[34] == 0x45);
+            encap.ingress_tunnel.header[6] = IPPROTO_DSTOPTS;
+            assert(fill_tunnel_key(&ct, &encap, changed) == size);
+            assert(changed[1] == IPPROTO_DSTOPTS && changed[34] == IPPROTO_IPIP);
+            assert(!memcmp(key + 2, changed + 2, 32));
+        }
+        assert(key[size] == 0xff);
+    }
+}
+
 int main(void)
 {
+    test_tunnel_keys();
     /* The ports carry the address the rule claims as its source. That is not
      * decoration: admission refuses any direction whose src_mac is not the
      * egress port's current address, so a fixture where they disagree
@@ -1640,10 +1684,8 @@ int main(void)
         assert(egress->header[0] == 0x45 && egress->header[9] == 41);
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
 
-        /* The ingress side: a strip validates nothing, so it takes the mode,
-         * the size, the DSCP-propagation flag and its receive record, and no
-         * header at all. It expands nothing this port transmits, so the bound
-         * stays the flow's. */
+        /* Ingress carries the receiving endpoints for the classifier and
+         * the strip's mode, size, DSCP flag and receive record. */
         rule.out_tunnel = (struct cdx_ft_tunnel){};
         rule.in_tunnel = (struct cdx_ft_tunnel){
             .local = local4, .remote = remote4, .ifindex = 19,
@@ -1658,6 +1700,9 @@ int main(void)
         assert(ingress->flags == DSCP_COPY);
         assert(ingress->stats_index == tunnel_slot.rx_index);
         assert(!ingress->header[0]);
+        assert(ingress->header[9] == IPPROTO_IPV6);
+        assert(!memcmp(ingress->header + 12, &remote4.ip, 4));
+        assert(!memcmp(ingress->header + 16, &local4.ip, 4));
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
         stats.in_tunnel = NULL;
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
@@ -1695,6 +1740,36 @@ int main(void)
         assert(!egress->flags && egress->header[0] == 0x62);
         assert(!egress->header[1] && !egress->header[2] && !egress->header[3]);
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+
+        /* Both receive forms are owned together, count together, and hold
+         * the shared receive record until both hardware keys are gone. */
+        struct cdx_ft_tunnel saved_tunnel = rule.out_tunnel;
+        rule.in_tunnel = saved_tunnel;
+        rule.out_tunnel = (struct cdx_ft_tunnel){};
+        expected_mtu = rule.mtu;
+        stats.in_tunnel = &tunnel_slot;
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == 0 && hw->options);
+        assert(key && older && tunnel_slot.holds == 2);
+        assert(ingress->header[6] == IPPROTO_DSTOPTS);
+        assert(!memcmp(ingress->header + 8, remote6.ip6, 16));
+        assert(!memcmp(ingress->header + 24, local6.ip6, 16));
+        struct cdx_ft_counters combined;
+        cdx_ft_hw_stats(hw, &combined);
+        assert(combined.packets == 198 && combined.bytes == 24690 && combined.lastused == 321);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !older && !allocations && !tunnel_slot.holds);
+        fail_insert_after = 2;
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == -EIO && !hw);
+        assert(!key && !older && !allocations && !tunnel_slot.holds);
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == 0);
+        delete_result = EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_hw_del(&hw) == -EAGAIN && !hw && cdx_ft_hw_pending() == 2);
+        assert(tunnel_slot.holds == 2);
+        delete_result = 0;
+        assert(cdx_ft_hw_retry() == 0 && !key && !older && !allocations && !tunnel_slot.holds);
+        stats.in_tunnel = NULL;
+        rule.out_tunnel = saved_tunnel;
+        rule.in_tunnel = (struct cdx_ft_tunnel){};
+        expected_mtu = rule.mtu + 40;
 
         /* A size the builder disagrees with means admission and the encoder
          * are describing different headers, which is refused rather than

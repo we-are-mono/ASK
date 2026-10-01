@@ -148,8 +148,8 @@ struct cdx_l2_encap {
 	/* An IP-in-IP tunnel on either side, outside every L2 header. The
 	 * egress side carries the outer header the insert writes, built as
 	 * the legacy tunnel interface builds its own, with the per-packet
-	 * fields left zero; the ingress side carries only what the strip
-	 * needs, which is the mode and the header size. Each names its
+	 * fields left zero. Ingress carries the receiving endpoints and
+	 * protocol for the key, plus the strip's mode and header size. Each names its
 	 * record in the plain statistics pool, or zero for none, exactly as
 	 * a tag does. */
 	struct cdx_tunnel_encap {
