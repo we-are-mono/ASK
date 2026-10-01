@@ -25,7 +25,7 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import by_key, peer
+from test_flowtable_connections import by_key, consistent, peer
 from test_flowtable_failslab import same_service, slab_fault
 from test_flowtable_offload import ARTIFACTS, DPORT, Echo, WAN_IP, command, console_command, read, rig  # noqa: F401
 from test_flowtable_selective_neighbour import keys, unchanged, warm
@@ -493,7 +493,8 @@ async def test_flowtable_service_ipsec_admission_churn(ipsec_service):
                 await command(r.target, r.session, "conntrack", "-D", "-f", "ipv4", "-p", "udp",
                               "--orig-src", LAN_INNER, "--orig-dst", INNER,
                               "--sport", str(FIRST), "--dport", str(DPORT))
-                retired = await r.wait(lambda s: not (by_key(s).keys() & keys([2], flows)), timeout=5)
+                retired = await r.wait(lambda s: consistent(s) and not (by_key(s).keys() & keys([2], flows)),
+                                       timeout=5)
                 unchanged(initial, retired, [0, 1, 3], flows)
                 await p.rpc("open", [2])
                 await warm(r, p, [0, 1, 2, 3], f"admission-churn-{cycle}", flows[:4])

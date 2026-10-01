@@ -47,9 +47,16 @@ def keys(r, ids):
 # `bindings`; a caller that holds one passes the total it expects.
 def healthy(state, bindings=2):
     assert state["bindings"] == bindings and state["max_entries"] == 32768, state
-    assert state["entries"] == state["neighbour_refs"] == state["handle_refs"] == len(state["flows"]), state
+    assert consistent(state), state
     assert state["invalidated"] == state["fatal"] == state["quarantine"] == 0, state
     assert state["errors"] == HEALTH_BASELINE["errors"], (state, HEALTH_BASELINE)
+
+
+# /proc/cdx_flowtable is read a page at a time, and each page is a fresh
+# look: the counters at its head and the rows after them can straddle a
+# delete. A wait for rows to go also waits for the counters to agree.
+def consistent(state):
+    return state["entries"] == state["neighbour_refs"] == state["handle_refs"] == len(state["flows"])
 
 
 def unchanged(r, before, after, ids):

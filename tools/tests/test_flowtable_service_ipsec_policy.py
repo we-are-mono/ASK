@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from test_flowtable_connections import by_key, peer
+from test_flowtable_connections import by_key, consistent, peer
 from test_flowtable_failslab import same_service
 from test_flowtable_offload import DPORT, command, console_command, rig  # noqa: F401
 from test_flowtable_offload import console_python, read
@@ -141,7 +141,8 @@ async def test_flowtable_service_ipsec_policy_recovery(ipsec_service, change):
                     await update(r, direction, required(r, direction, reqid="49399", offload=offloaded))
                 else:
                     await update(r, direction, ["priority", "1000", "action", "block"])
-                retired = await r.wait(lambda s: not (by_key(s).keys() & keys([2, 3], flows)), timeout=5)
+                retired = await r.wait(lambda s: consistent(s) and not (by_key(s).keys() & keys([2, 3], flows)),
+                                       timeout=5)
                 retire_seconds = time.monotonic() - started
                 assert retire_seconds < 5
                 assert retired["ipsec_policy_invalidations"] > before["ipsec_policy_invalidations"], (before, retired)
@@ -267,7 +268,8 @@ async def test_flowtable_service_ipsec_policy_expiry(ipsec_service):
         try:
             await command(r.target, r.session, "ip", "xfrm", "policy", "add", *identity,
                           "priority", "1", "action", "block", "limit", "time-hard", "12")
-            retired = await r.wait(lambda s: not (by_key(s).keys() & keys([2], flows)), timeout=5)
+            retired = await r.wait(lambda s: consistent(s) and not (by_key(s).keys() & keys([2], flows)),
+                                   timeout=5)
             await asyncio.sleep(0.2)
             stopped = await p.rpc("status")
             held = time.monotonic()
