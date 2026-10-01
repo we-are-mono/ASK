@@ -62,6 +62,7 @@ union nf_inet_addr {
 #define EINVAL 22
 #define EAGAIN 11
 #define ENOMEM 12
+#define ENOSPC 28
 #define E2BIG 7
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 /* As include/linux/if_bridge.h has them with patch 161. */
@@ -157,11 +158,13 @@ static bool ft_mc_filtered;
 /* The `multicast` parameter, on at load; the cases switch it as the offload
  * service would, and wake the learner as its setter does. */
 static bool ft_mc_enabled = true;
-/* Read only by the worker and /proc, neither of which is compiled here. */
-__attribute__((unused)) static unsigned int ft_mc_installed;
-__attribute__((unused)) static unsigned long long ft_mc_install_errors;
-/* Of the entries the worker installed, those that discard. */
+/* Kept by the worker and the eviction; a fresh learner has nothing installed. */
+static unsigned int ft_mc_installed;
+static unsigned long long ft_mc_install_errors;
+/* Of the entries the worker installed, those that discard, and how many gave
+ * their group id to a stream somebody wants. */
 static unsigned int ft_mc_discarding;
+static u64 ft_mc_discards_evicted;
 
 static unsigned holds;   /* net-device references outstanding, all devices */
 static void dev_hold(struct net_device *d) { holds++; d->refs++; }
@@ -433,6 +436,8 @@ static void cdx_ft_begin(void)
     in_transaction = 1;
 }
 static void cdx_ft_end(void) { assert(in_transaction); in_transaction = 0; }
+static void cdx_ft_assert_held(void) { assert(in_transaction); }
+#define U64_MAX UINT64_MAX
 static bool cdx_mc_group_stats(const struct cdx_mc_group *hw, struct cdx_ft_counters *c);
 struct cdx_mc_group_spec;
 static int cdx_mc_group_replace(struct cdx_mc_group *hw,
@@ -451,10 +456,21 @@ static s64 atomic64_read_acquire(const s64 *v) { return *v; }
 static bool ft_mc_recheck;
 static bool bridge_hooked;
 static bool ft_mc_bridge_filtered(void) { return bridge_hooked; }
-static void ft_mc_hook_sync(bool want) { (void)want; }
+/* The worker's last step, so every run of it is checked here for a flow it
+ * picked and never recorded. */
+static void no_flow_busy(void);
+static void ft_mc_hook_sync(bool want) { (void)want; no_flow_busy(); }
 #define pr_info(...) ((void)0)
 
 #include "mcast_learner.inc"
+
+static void no_flow_busy(void)
+{
+    const struct ft_mc_flow *f;
+
+    list_for_each_entry(f, &ft_mc_flows, list)
+        assert(!f->busy);
+}
 
 /* A port's egress changing, as the adapter's hook has it: counted, then
  * every installed flow copying out of the port marked. */
@@ -509,10 +525,23 @@ struct cdx_mc_group {
     struct cdx_mc_group_spec chain;
     s64 built_at;
 };
-static struct cdx_mc_group entries[4];
+static struct cdx_mc_group entries[16];
 static struct cdx_mc_group *const FAKE_HW = (struct cdx_mc_group *)0x1000;
 static unsigned adds, dels;
 static int add_rc;
+/* Group ids, which the backend hands out per family: an add that finds every
+ * one of its family's held is refused for room, as GetNewMcastGrpId() refuses
+ * it, and a delete gives its id back. A case narrows it to fill the family. */
+static unsigned id_slots = ARRAY_SIZE(entries);
+
+static unsigned ids_held(u8 family)
+{
+    unsigned n = 0;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(entries); i++)
+        n += entries[i].live && entries[i].key.family == family;
+    return n;
+}
 /* A port's egress changing after a build has read it and before the worker
  * records it: counted, and marking what it can at once, since the worker
  * holds no learner lock while it builds. */
@@ -577,6 +606,8 @@ static int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
     *result = NULL;
     if (add_rc)
         return add_rc;
+    if (ids_held(spec->family) >= id_slots)
+        return -ENOSPC;
     for (unsigned i = 0; i < ARRAY_SIZE(entries); i++)
         if (!entries[i].live) {
             entries[i].live = true;
@@ -844,6 +875,11 @@ static void reset(void)
     ft_mc_last_next = 0;
     ft_mc_ring_head = ft_mc_ring_tail = 0;
     ft_mc_count = ft_mc_flow_count = 0;
+    /* And a fresh backend: the flows freed above took their entries, and
+     * their ids, with them. */
+    memset(entries, 0, sizeof(entries));
+    id_slots = ARRAY_SIZE(entries);
+    ft_mc_installed = ft_mc_discarding = 0;
     membership_count = 0;
     membership_interval = 260 * HZ;
     pvid_count = 0;
@@ -2651,6 +2687,401 @@ static void a_stream_nobody_wants_is_dropped_in_hardware(void)
     reset();
 }
 
+/* A flow of `group` from `source` on P1, the bridge forwarding it to P2,
+ * installed by the worker itself; then, with `drop`, its membership gone and
+ * snooping forwarding it nowhere, so the same pass turns it into a discard. */
+static struct ft_mc_flow *installed_flow(uint32_t group, uint32_t source, bool drop)
+{
+    struct br_ip any = group_v4(group, 0, 0);
+    struct ft_mc_flow *f;
+
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, source, 0, BR_MCAST_SNOOPED, 1, &P2);
+    see(seen_v4(&BR, &P1, group, source, 0, false, SENDER));
+    ft_mc_work_fn(NULL);
+    f = flow(&P1, source, 0);
+    assert(f && f->hw && f->hw != FAKE_HW && !f->hw_discard);
+    if (drop) {
+        assert(!ft_mc_membership(&BR, &P2, &any, false, false));
+        answer(&P1, source, 0, BR_MCAST_SNOOPED, 0);
+        ft_mc_work_fn(NULL);
+        assert(f->hw && f->hw_discard);
+    }
+    return f;
+}
+
+static void a_discard_gives_its_id_to_a_listener(void)
+{
+    const uint32_t D = 0x1a0007ef, G = 0x1b0007ef, S1 = 0x0100000a, S2 = 0x0200000a;
+    unsigned long long errors;
+    struct ft_mc_flow *dropped, *wanted;
+    unsigned a0, d0;
+    u64 evicted;
+
+    /* Every group id of the family is held by a discard: a stream nobody
+     * wants, which upstream goes on sending. A stream somebody wants arrives,
+     * and its add finds no id. The discard gives its id up -- its stream
+     * reaches the CPU again, where the bridge drops it as it did before the
+     * discard existed -- and the listener's add, made again at once in the
+     * same pass, takes it. Nothing failed, so nothing is counted as failing
+     * or waits for a refresh to be tried again. */
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    id_slots = 1;
+    dropped = installed_flow(D, S1, true);
+    assert(ft_mc_discarding == 1 && ft_mc_installed == 1 && ids_held(AF_INET) == 1);
+    a0 = adds;
+    d0 = dels;
+    errors = ft_mc_install_errors;
+    evicted = ft_mc_discards_evicted;
+    wanted = installed_flow(G, S2, false);
+    assert(wanted->hw && !wanted->hw_discard && !wanted->retries);
+    assert(adds == a0 + 2 && dels == d0 + 1 && ft_mc_install_errors == errors);
+    assert(ft_mc_discards_evicted == evicted + 1);
+    assert(!dropped->hw && !dropped->hw_discard && !ft_mc_discarding);
+    assert(ft_mc_installed == 1 && dropped->retries == 1);
+    assert(!strcmp(ft_mc_state(wanted), "installed"));
+    /* A new entry has no interval counted yet. */
+    assert(wanted->interval_packets == U64_MAX);
+    /* Named by nothing, the flow that gave way is retired at the next pass,
+     * which the eviction asked for; it was out of the hardware already. */
+    ft_mc_work_fn(NULL);
+    assert(!flow(&P1, S1, 0) && dels == d0 + 1 && ids_held(AF_INET) == 1);
+    assert(flow(&P1, S2, 0) == wanted && wanted->hw);
+    assert(!in_transaction && !ft_mc_lock && !rtnl);
+    reset();
+}
+
+/* A refresh's sample of one entry: `packets` frames more than the last. */
+static void sampled(struct ft_mc_flow *f, u64 packets)
+{
+    struct cdx_ft_counters c;
+
+    memset(&c, 0, sizeof(c));
+    c.packets = f->hw_packets + packets;
+    c.bytes = f->hw_bytes + packets * 64;
+    ft_mc_flow_counted(f, &c, jiffies);
+}
+
+/* A flow of `group` from `source` on P1 that a membership on P2 names and
+ * snooping forwards nowhere -- its one listener behind the ingress -- which
+ * the worker installs as a discard from the start. */
+static struct ft_mc_flow *named_discard(uint32_t group, uint32_t source)
+{
+    struct br_ip any = group_v4(group, 0, 0);
+    struct ft_mc_flow *f;
+
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, source, 0, BR_MCAST_SNOOPED, 0);
+    see(seen_v4(&BR, &P1, group, source, 0, false, SENDER));
+    ft_mc_work_fn(NULL);
+    f = flow(&P1, source, 0);
+    assert(f && f->hw && f->hw != FAKE_HW && f->hw_discard);
+    return f;
+}
+
+static void the_discard_that_saves_least_gives_way(void)
+{
+    const uint32_t S[4] = { 0x0100000a, 0x0200000a, 0x0300000a, 0x0400000a };
+    const uint32_t G = 0x1c0007ef;
+    struct ft_mc_flow *d[3], *wanted;
+    struct cdx_ft_counters low;
+    unsigned i;
+
+    /* What a discard saves is what its entry counted over the last whole
+     * refresh interval: the frames it would hand the CPU back. The first
+     * sample after the add covers only the part of an interval since the
+     * add, and ranks nothing; each later refresh writes the interval's own
+     * count, not the entry's total; and a sample below the baseline, which
+     * answers nothing, leaves it as it was. */
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    for (i = 0; i < 3; i++) {
+        d[i] = installed_flow(0x200007ef + (i << 24), S[i], true);
+        assert(d[i]->interval_packets == U64_MAX && !d[i]->interval_whole);
+        sampled(d[i], 7);
+        assert(d[i]->interval_packets == U64_MAX && d[i]->interval_whole);
+    }
+    sampled(d[0], 30);
+    assert(d[0]->interval_packets == 30);
+    sampled(d[0], 100);
+    assert(d[0]->interval_packets == 100 && d[0]->hw_packets == 137);
+    memset(&low, 0, sizeof(low));
+    low.packets = 1;
+    low.bytes = 64;
+    ft_mc_flow_counted(d[0], &low, jiffies);
+    assert(d[0]->count_suspect && d[0]->interval_packets == 100 && !d[0]->gone);
+    sampled(d[1], 5);
+    sampled(d[2], 50);
+
+    /* Three discards hold every id, and a listener's add takes the one of
+     * the discard that counted fewest. */
+    id_slots = ids_held(AF_INET);
+    wanted = installed_flow(G, S[3], false);
+    assert(!d[1]->hw && d[0]->hw && d[2]->hw && ft_mc_discarding == 2);
+    assert(wanted->hw && !wanted->hw_discard);
+
+    /* One the refresh has not counted over a whole interval ranks after
+     * every one it has: it had no interval to count, whatever it saves. */
+    reset();
+    d[0] = installed_flow(0x200007ef, S[0], true);
+    d[1] = installed_flow(0x210007ef, S[1], true);
+    sampled(d[1], 400);
+    sampled(d[1], 1000);
+    id_slots = ids_held(AF_INET);
+    wanted = installed_flow(G, S[2], false);
+    assert(d[0]->hw && !d[1]->hw && wanted->hw);
+
+    /* Nor does the part of an interval since its add rank it: a stream of
+     * 1000 frames a second added a fifth of a refresh before one counts 200,
+     * less than a stream of 50 a second counts over a whole one, and the
+     * heavier stream would go back to the CPU on it. */
+    reset();
+    d[0] = installed_flow(0x200007ef, S[0], true);
+    d[1] = installed_flow(0x210007ef, S[1], true);
+    sampled(d[0], 60);
+    sampled(d[0], 250);
+    sampled(d[1], 200);
+    assert(d[1]->interval_packets == U64_MAX);
+    id_slots = ids_held(AF_INET);
+    wanted = installed_flow(G, S[2], false);
+    assert(!d[0]->hw && d[1]->hw && wanted->hw);
+
+    /* None counted yet: the one learned first. */
+    reset();
+    d[0] = installed_flow(0x200007ef, S[0], true);
+    d[1] = installed_flow(0x210007ef, S[1], true);
+    id_slots = ids_held(AF_INET);
+    wanted = installed_flow(G, S[2], false);
+    assert(!d[0]->hw && d[1]->hw && wanted->hw);
+    reset();
+}
+
+static void a_discard_never_displaces_another(void)
+{
+    const uint32_t D = 0x1d0007ef, N = 0x1e0007ef, S1 = 0x0100000a, S2 = 0x0200000a;
+    unsigned long long errors;
+    struct ft_mc_flow *held, *f;
+    struct br_ip named = group_v4(N, 0, 0);
+    unsigned a0, d0;
+    u64 evicted;
+
+    /* Two streams nobody wants, and one id: the first keeps it. A discard
+     * saves the CPU frames; another discard saving others in its place
+     * would gain nothing, so its add fails as one out of room always did. */
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    id_slots = 1;
+    held = installed_flow(D, S1, true);
+    a0 = adds;
+    d0 = dels;
+    errors = ft_mc_install_errors;
+    evicted = ft_mc_discards_evicted;
+    assert(ft_mc_membership(&BR, &P2, &named, true, false));
+    answer(&P1, S2, 0, BR_MCAST_SNOOPED, 0);
+    see(seen_v4(&BR, &P1, N, S2, 0, false, SENDER));
+    ft_mc_work_fn(NULL);
+    f = flow(&P1, S2, 0);
+    assert(f && ft_mc_discardable(f) && !f->hw && f->retries == 1);
+    assert(adds == a0 + 1 && dels == d0 && ft_mc_install_errors == errors + 1);
+    assert(held->hw && held->hw_discard && ft_mc_discards_evicted == evicted);
+    assert(!strcmp(ft_mc_state(f), "pending"));
+    reset();
+}
+
+static void a_family_short_of_ids_takes_none_from_the_other(void)
+{
+    const uint32_t G1 = 0x220007ef, G2 = 0x230007ef;
+    const uint32_t S1 = 0x0100000a, S2 = 0x0200000a, S6 = 0x0600000a;
+    static const u8 V6_GROUP_MAC[ETH_ALEN] = { 0x33, 0x33, 0, 0, 0, 0x01 };
+    struct br_ip any6 = group_v6(0x0e, 0), any = group_v4(G2, 0, 0);
+    struct ft_mc_flow *carried, *six, *f;
+    unsigned long long errors;
+    struct ft_mc_seen o;
+    unsigned a0, i;
+    u64 evicted;
+
+    /* Each family has ids of its own. IPv4's only one is held by a stream
+     * somebody wants; IPv6's by a discard. An IPv4 listener's add finds
+     * none, and no IPv4 discard to give one: it fails as an add out of room
+     * always has, tried again a refresh apart and then refused, and the
+     * IPv6 discard is never asked -- its id could not have served. */
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    id_slots = 1;
+    carried = installed_flow(G1, S1, false);
+    assert(ft_mc_membership(&BR, &P2, &any6, true, false));
+    answer(&P1, S6, 0, BR_MCAST_SNOOPED, 1, &P2);
+    memset(&o, 0, sizeof(o));
+    o.bridge_ifindex = BR.ifindex;
+    o.in_ifindex = P1.ifindex;
+    o.addr = any6;
+    o.src.ip = S6;              /* the address's first word, which answer() and flow() read */
+    memcpy(o.dst_mac, V6_GROUP_MAC, ETH_ALEN);
+    memcpy(o.src_mac, SENDER, ETH_ALEN);
+    see(o);
+    ft_mc_work_fn(NULL);
+    six = flow(&P1, S6, 0);
+    assert(six && six->hw && ft_mc_family(&six->addr) == AF_INET6);
+    assert(!ft_mc_membership(&BR, &P2, &any6, false, false));
+    answer(&P1, S6, 0, BR_MCAST_SNOOPED, 0);
+    ft_mc_work_fn(NULL);
+    assert(six->hw && six->hw_discard && ids_held(AF_INET6) == 1);
+
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S2, 0, BR_MCAST_SNOOPED, 1, &P2);
+    see(seen_v4(&BR, &P1, G2, S2, 0, false, SENDER));
+    a0 = adds;
+    errors = ft_mc_install_errors;
+    evicted = ft_mc_discards_evicted;
+    ft_mc_work_fn(NULL);
+    f = flow(&P1, S2, 0);
+    assert(f && !f->hw && f->retries == 1);
+    assert(adds == a0 + 1 && ft_mc_install_errors == errors + 1);
+    /* The ladder as it always was: one add a refresh apart, then refused.
+     * Every entry counts frames meanwhile, so the discard stands. */
+    for (i = 2; i <= FT_MC_MAX_RETRIES; i++) {
+        stats_now.packets += 10;
+        stats_now.bytes += 640;
+        ft_mc_refresh_fn(NULL);
+        ft_mc_work_fn(NULL);
+        assert(adds == a0 + i && f->retries == i && !f->hw);
+    }
+    assert(!strcmp(ft_mc_state(f), "refused-failed"));
+    stats_now.packets += 10;
+    stats_now.bytes += 640;
+    ft_mc_refresh_fn(NULL);
+    ft_mc_work_fn(NULL);
+    assert(adds == a0 + FT_MC_MAX_RETRIES);
+    assert(ft_mc_install_errors == errors + FT_MC_MAX_RETRIES);
+    assert(six->hw && six->hw_discard && carried->hw);
+    assert(ft_mc_discards_evicted == evicted);
+    stats_now = (struct cdx_ft_counters){ 0 };
+    reset();
+}
+
+static void a_named_discard_waits_for_an_id(void)
+{
+    const uint32_t N = 0x240007ef, G = 0x250007ef, S1 = 0x0100000a, S2 = 0x0200000a;
+    unsigned long long errors;
+    struct ft_mc_flow *named, *wanted;
+    unsigned a0;
+    u64 evicted;
+
+    /* A discard a membership still names -- its listener behind the ingress
+     * -- gives its id up all the same, and stays a flow. It is tried again
+     * a refresh apart, as a failed install is; as a discard it takes nothing
+     * from the listener, and it goes back in once an id frees. */
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    id_slots = 1;
+    named = named_discard(N, S1);
+    evicted = ft_mc_discards_evicted;
+    wanted = installed_flow(G, S2, false);
+    assert(!named->hw && named->retries == 1 && ft_mc_discards_evicted == evicted + 1);
+    assert(!strcmp(ft_mc_state(named), "pending"));
+    /* The pass the eviction asked for keeps it, and does not try it yet. */
+    a0 = adds;
+    errors = ft_mc_install_errors;
+    ft_mc_work_fn(NULL);
+    assert(flow(&P1, S1, 0) == named && adds == a0);
+    stats_now.packets += 10;
+    stats_now.bytes += 640;
+    ft_mc_refresh_fn(NULL);
+    ft_mc_work_fn(NULL);
+    assert(adds == a0 + 1 && !named->hw && named->retries == 2);
+    assert(ft_mc_install_errors == errors + 1);
+    assert(wanted->hw && ft_mc_discards_evicted == evicted + 1);
+    /* The listener's stream ends, and its id is free. */
+    wanted->gone = true;
+    ft_mc_work_fn(NULL);
+    assert(!flow(&P1, S2, 0) && !ids_held(AF_INET));
+    stats_now.packets += 10;
+    stats_now.bytes += 640;
+    ft_mc_refresh_fn(NULL);
+    ft_mc_work_fn(NULL);
+    assert(named->hw && named->hw_discard && !named->retries && ft_mc_discarding == 1);
+    assert(!strcmp(ft_mc_state(named), "discarding"));
+    stats_now = (struct cdx_ft_counters){ 0 };
+    reset();
+}
+
+/* The routed worker's add, short of an id, inside a transaction of its own:
+ * run as the transaction's next taker, between the bridged worker's pick and
+ * its build. */
+static bool routed_evicted;
+static void routed_add_evicts(void)
+{
+    in_transaction = 1;
+    routed_evicted = ft_mc_evict_discard(AF_INET);
+    in_transaction = 0;
+}
+
+static void what_a_discard_never_gives_up(void)
+{
+    const uint32_t D = 0x260007ef, E = 0x270007ef, S1 = 0x0100000a, S2 = 0x0200000a;
+    struct ft_mc_flow *held, *other;
+    unsigned a0, d0, works0, holds0;
+    struct ft_mc_seen o;
+    u64 evicted;
+
+    /* The bridged worker has picked a discard to move to the shape its
+     * stream now arrives in: the old entry goes and the new one is added,
+     * in its transaction, and until it records, the flow's entry is the
+     * pass's -- after the delete, freed memory. The routed worker gets the
+     * transaction first and asks for an id. The picked discard saves least,
+     * yet the other one gives way. */
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    held = named_discard(D, S1);
+    other = named_discard(E, S2);
+    sampled(held, 1);
+    held->idle = true;
+    see(seen_v4(&BR, &P1, D, S1, 0, false, OTHER_SENDER));
+    assert(held->has_next && held->stale);
+    a0 = adds;
+    d0 = dels;
+    evicted = ft_mc_discards_evicted;
+    before_begin = routed_add_evicts;
+    before_begin_skip = 1;
+    ft_mc_work_fn(NULL);
+    assert(!before_begin && routed_evicted && ft_mc_discards_evicted == evicted + 1);
+    assert(!other->hw && other->retries == 1);
+    assert(held->hw && held->hw_discard && !held->has_next);
+    assert(!memcmp(held->src_mac, OTHER_SENDER, ETH_ALEN));
+    assert(adds == a0 + 1 && dels == d0 + 2 && ft_mc_discarding == 1);
+
+    /* Nor one marked for the worker's next pass, which may be making it
+     * replicate again; nor anything once the learner is stopping; nor one of
+     * the other family. Otherwise it goes, out of the books and the
+     * hardware, its frames free to be recorded again and the worker asked
+     * to retire or retry it, with every reference it took let go of. */
+    in_transaction = 1;
+    held->stale = true;
+    assert(!ft_mc_evict_discard(AF_INET));
+    held->stale = false;
+    ft_mc_stopping = true;
+    assert(!ft_mc_evict_discard(AF_INET));
+    ft_mc_stopping = false;
+    assert(!ft_mc_evict_discard(AF_INET6));
+    assert(held->hw && ft_mc_discards_evicted == evicted + 1);
+    o = seen_v4(&BR, &P1, D, S1, 0, false, SENDER);
+    ft_mc_record(&o);
+    works0 = works;
+    holds0 = holds;
+    d0 = dels;
+    assert(ft_mc_evict_discard(AF_INET));
+    in_transaction = 0;
+    assert(!held->hw && !held->hw_discard && held->retries == 1);
+    assert(dels == d0 + 1 && !ft_mc_discarding && ft_mc_discards_evicted == evicted + 2);
+    assert(works == works0 + 1 && holds == holds0);
+    for (unsigned i = 0; i < FT_MC_SEEN_SLOTS; i++)
+        assert(!ft_mc_last[i].in_ifindex);
+    ft_mc_drain();
+    assert(!in_transaction && !ft_mc_lock && !rtnl);
+    reset();
+}
+
 static void rows_speak_for_memberships(void)
 {
     const uint32_t G = 0x140007ef, S1 = 0x0100000a;
@@ -3064,6 +3495,12 @@ int main(void)
     devices_and_bridges_change();
     the_worker_records_what_the_drain_replays();
     a_stream_nobody_wants_is_dropped_in_hardware();
+    a_discard_gives_its_id_to_a_listener();
+    the_discard_that_saves_least_gives_way();
+    a_discard_never_displaces_another();
+    a_family_short_of_ids_takes_none_from_the_other();
+    a_named_discard_waits_for_an_id();
+    what_a_discard_never_gives_up();
     rows_speak_for_memberships();
     replayed_memberships();
     a_bridge_filter_refuses_every_flow();

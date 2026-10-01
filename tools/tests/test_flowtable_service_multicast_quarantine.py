@@ -43,7 +43,7 @@ import pytest
 
 from _mcast_windows import (COUNT, MulticastRig, bridge_settings, delivered, dut_console, in_hardware,
                             in_software, learn, mcast_rows, mdb, members, moved, mroute_row,
-                            multicast_rig, packets, stream, streamed, summary,  # noqa: F401
+                            multicast_rig, packets, quiet, stream, streamed, summary,  # noqa: F401
                             wire_interface)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
@@ -77,29 +77,6 @@ async def armed(r, knob, failures):
 
 async def remaining(r, knob):
     return (await read(r.target, r.session, knob)).split()[0]
-
-
-QUIET_TABLE = "ask_mc_quiet"
-
-
-@asynccontextmanager
-async def quiet(r, groups):
-    """Only the case's own groups, and link-local control, reach the bridge
-    from either port: everything else multicast is dropped at ingress, before
-    the bridge can learn it and the bridged learner discard it in hardware."""
-    v4 = ", ".join(["224.0.0.0/24"] + [g for g in groups if ":" not in g])
-    v6 = ", ".join(["ff02::/16"] + [g for g in groups if ":" in g])
-    chains = "\n".join(f''' chain {dev} {{ type filter hook ingress device "{dev}" priority -400; policy accept;
-  ip daddr 224.0.0.0/4 ip daddr != {{ {v4} }} drop
-  ip6 daddr ff00::/8 ip6 daddr != {{ {v6} }} drop
- }}''' for dev in (TARGET_WAN_IF, TARGET_LAN_IF))
-    await command(r.target, r.session, "nft", "delete", "table", "netdev", QUIET_TABLE, check=False)
-    await command(r.target, r.session, "nft", f"table netdev {QUIET_TABLE} {{\n{chains}\n}}")
-    try:
-        yield
-    finally:
-        await command(r.target, r.session, "nft", "delete", "table", "netdev", QUIET_TABLE,
-                      check=False)
 
 
 class Routed:

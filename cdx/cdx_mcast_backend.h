@@ -225,6 +225,13 @@ void cdx_mc_group_del(struct cdx_mc_group **group);
  * module that added them. Transaction held. */
 unsigned int cdx_mc_group_count(void);
 
+/* How many group ids of `family` are held, and in *slots, unless it is NULL,
+ * how many the family has. Every group of the family holds one, whichever
+ * caller added it -- the bridged and the routed groups draw on one space --
+ * and an add that finds none free is refused with -ENOSPC. Transaction
+ * held. */
+unsigned int cdx_mc_group_ids(u8 family, unsigned int *slots);
+
 /* What the classifier counted for this group: frames matched on ingress, once
  * each, not once per replica. A caller reporting per-listener delivery wants
  * the port's own counters instead -- the replication happens below this entry

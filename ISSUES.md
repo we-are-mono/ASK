@@ -161,13 +161,8 @@ result independently of those temporary files.
 - [x] **A291 — FMan enqueues QMan rejects were thought to leak buffers.** Not a bug: FMan portals
   run ED=1, so QMan discards and frees them itself; 1e6 discards left every pool at its count (_:/^cdx: drop a bridged multicast stream nobody wants_).
 
-- [ ] **A292 — a discarding multicast entry has no bound.** A bridged stream nobody wants is
-  dropped in hardware until it stops (`ft_mc_discardable()`, `cdx/ask_flowtable.c`); one that
-  never stops -- a static upstream, a misbehaving sender -- keeps its classifier key and group
-  id (512 per family) for good, and enough of them starve replicating adds, which fail
-  `-ENOSPC` and end `refused-failed`. Fix: evict a discard when an add fails for room, or cap
-  discards per bridge. Regression: fill the id space with discards, then join a listener and
-  require it installed.
+- [x] **A292 — a discarding multicast entry had no bound.** Fixed: a replicating add that finds no group id evicts the
+  discard of its family that counted the fewest frames and retries at once; discards never displace each other (_:/^cdx: give a bridged discard's group id to a stream somebody wants_).
 
 - [ ] **A293 — patch 161 needs a to-host reason on the next kernel rebase.** Upstream
   `a496d2f0fd61` (after 6.12; in 6.18) hands every multicast frame up to the host when the
@@ -205,6 +200,19 @@ result independently of those temporary files.
   quiesce covers the offline ports and host commands, and no frame is in flight in the
   classifier when the tables are rebuilt. Regression: each terminal kind, followed on the same
   boot by forwarding restored in hardware for unicast, multicast and IPsec.
+
+- [ ] **A297 — more than eight interleaved unwanted streams wake the bridged learner per frame.**
+  The bridge hook remembers the streams it last handed the worker in eight slots
+  (`ft_mc_record()`, `FT_MC_SEEN_SLOTS`, `cdx/ask_flowtable.c`) so a stream is queued once, not
+  per frame. Streams nobody names -- no membership, or one the learner turned away -- are seen
+  again on every frame, and more than eight interleaved miss every slot: each frame queues the
+  worker, and every pass takes the transaction (`cdx_ft_begin()`), contending `ctrl.mutex` with
+  the other learners and the backend. A discard that gives up its id for a listener hands its
+  stream back to exactly this path. Found by reading, not yet seen on the rig. Fix: remember a
+  turned-away key with a timestamp in a bounded table (or rank by key hash into more slots), so
+  an unnamed stream is looked at once per refresh interval rather than per frame. Regression:
+  32 interleaved unnamed streams at 1 kpps on a snooping bridge; worker passes per second and
+  `ctrl.mutex` hold time stay bounded (expose a pass counter in `/proc/cdx_flowtable`).
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**

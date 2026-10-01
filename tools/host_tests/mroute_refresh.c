@@ -572,6 +572,7 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
             p->in_tags = 1;
         }
     }
+    p->spec.family = g->family;
     p->spec.listeners = wanted;
     for (unsigned i = 0; i < wanted; i++) {
         p->spec.listener[i].dev = &output[i];
@@ -592,6 +593,9 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
     }
     return FT_MR_PENDING;
 }
+/* Every group id of the family held -- by the bridged learner's discards,
+ * when a case says one can be given up. */
+static bool ids_full;
 /* The worker programs the hardware with the transaction alone: the netdev
  * events and the egress mark, which take ft_mr_lock under RTNL, must never
  * wait behind a hardware call. Only the drain, under its tc command's RTNL,
@@ -601,6 +605,7 @@ static int cdx_mc_group_add(const struct cdx_mc_group_spec *s, struct cdx_mc_gro
     assert(ctrl && !ft_mr_lock && !hardware.live && s->in);
     adds++;
     if (fail_add) return -ENOMEM;
+    if (ids_full) return -ENOSPC;
     if (queues_move_during_add) {
         queues_move_during_add = false;
         ft_egress_changes++;
@@ -645,6 +650,23 @@ static void cdx_mc_group_del(struct cdx_mc_group **hw)
     deletes++;
     (*hw)->live = false;
     *hw = NULL;
+}
+/* The bridged learner giving up a discard's group id, as the routed worker
+ * asks for one: inside its transaction, holding neither its own lock nor RTNL,
+ * so that ft_mc_lock can be taken there. `evictable` is whether a discard of
+ * the family is there to give one up; giving it frees the id. */
+static bool evictable;
+static unsigned evictions;
+static u8 evicted_family;
+static bool ft_mc_evict_discard(u8 family)
+{
+    assert(ctrl && !ft_mr_lock && !rtnl && !ft_mc_lock);
+    evictions++;
+    evicted_family = family;
+    if (!evictable)
+        return false;
+    evictable = ids_full = false;
+    return true;
 }
 static struct cdx_ft_counters hw_count;
 /* A read the backend could not make: zero, and said so. */
@@ -849,6 +871,69 @@ int main(void)
     /* Withdrawn and put back: an entry added again, which the group counts,
      * where only the failed tries did not. */
     assert(g->adds == 2);
+    /* None of those failures was one of room, and none asked the bridged
+     * learner for an id. */
+    assert(!evictions);
+
+    /* Every group id of the family held, one by a bridged discard. The add
+     * finds none, asks for the discard's inside the transaction, and is made
+     * again at once: carried in the one pass, with nothing counted as having
+     * failed and no retry spent. */
+    {
+        u64 errors = ft_mr_install_errors;
+        unsigned a0;
+        u32 own;
+
+        refuse = true;
+        refresh();
+        assert(!hardware.live && !g->hw);
+        refuse = false;
+        own = g->adds;
+        a0 = adds;
+        ids_full = evictable = true;
+        ft_mr_recheck = true;
+        run();
+        assert(adds == a0 + 2 && evictions == 1 && evicted_family == AF_INET);
+        assert(hardware.live && g->hw && g->state == FT_MR_INSTALLED && g->offloaded);
+        assert(ft_mr_install_errors == errors && !g->retries && g->adds == own + 1);
+
+        /* No discard to give one up: the add fails as one out of room always
+         * did, tried again a refresh apart -- asking each time, since a
+         * discard may have been installed meanwhile -- until it is refused. */
+        refuse = true;
+        refresh();
+        refuse = false;
+        a0 = adds;
+        ids_full = true;
+        ft_mr_recheck = true;
+        run();
+        assert(adds == a0 + 1 && evictions == 2 && !hardware.live);
+        assert(g->retries == 1 && ft_mr_install_errors == errors + 1);
+        for (unsigned i = 2; i <= FT_MR_MAX_RETRIES; i++) {
+            refresh();
+            assert(adds == a0 + i && evictions == 1 + i && g->retries == i);
+        }
+        assert(g->state == FT_MR_REFUSED_FAILED && !g->offloaded);
+        refresh();
+        assert(adds == a0 + FT_MR_MAX_RETRIES && evictions == 1 + FT_MR_MAX_RETRIES);
+        ids_full = false;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED && g->offloaded);
+        /* And memory running out is not room running out: no id is asked
+         * for. */
+        refuse = true;
+        refresh();
+        refuse = false;
+        fail_add = true;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->retries == 1 && evictions == 1 + FT_MR_MAX_RETRIES);
+        fail_add = false;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED && g->offloaded);
+    }
 
     /* An uncarriable router withdraws the whole chain. A timer discovers
      * restored eligibility even while no group is installed. What the entry

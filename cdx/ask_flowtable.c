@@ -4989,7 +4989,10 @@ struct ft_mc_tap {
  * the transaction, the order the routed learner's drain explains, and the
  * worker never waits for RTNL while it holds the transaction. The drain holds
  * ft_mc_lock across its rebuilds, which delays nothing under RTNL: its caller
- * holds RTNL.
+ * holds RTNL. And a discard giving up its group id to an add that found none,
+ * which either learner's worker asks for from inside its transaction
+ * (ft_mc_evict_discard()), takes the lock there too, and deletes with the
+ * transaction alone once it has let go of it.
  */
 
 /* The largest packet `dev` carries for `family`, in the units the forwarding
@@ -5111,6 +5114,14 @@ struct ft_mc_flow {
 	u64 hw_bytes;
 	bool count_suspect;
 	bool idle;
+	/* What the entry counted between the last two refreshes, or U64_MAX
+	 * until two refreshes have counted it -- the first sample after an add
+	 * covers only the part of an interval since the add: how much a discard
+	 * saves, which is what it is ranked by when a stream somebody wants
+	 * needs its group id. `interval_whole` is set by the first sample, from
+	 * when the next covers a whole interval. See ft_mc_evict_discard(). */
+	u64 interval_packets;
+	bool interval_whole;
 	/* When the entry last counted a frame, or was added, and how long it
 	 * may then count nothing before the stream is taken to have stopped:
 	 * the bridge's group membership interval for the flow's VLAN, read at
@@ -5155,6 +5166,11 @@ struct ft_mc_flow {
 	bool dirty;
 	bool stale;
 	bool gone;
+	/* The worker has picked the flow and not yet recorded what it built.
+	 * Until it has, the entry is the worker's alone -- after a swap it is
+	 * already deleted -- and nothing else takes it away. Under
+	 * ft_mc_lock. */
+	bool busy;
 	/* The chain `hw` was built from, whole -- the routed copies riding it
 	 * included -- recorded with `hw` inside the transaction that built it,
 	 * and what the egress drain replaces it with. It holds a reference on
@@ -5202,6 +5218,9 @@ static unsigned int ft_mc_count, ft_mc_flow_count, ft_mc_installed;
 /* Of ft_mc_installed, the entries that discard; under the transaction, as
  * ft_mc_installed is. */
 static unsigned int ft_mc_discarding;
+/* Discards taken out of hardware to give their group id to a stream somebody
+ * wants; see ft_mc_evict_discard(). Under the transaction. */
+static u64 ft_mc_discards_evicted;
 static u64 ft_mc_refused, ft_mc_install_errors;
 /* Installed groups of either learner marked for a rebuild because a port they
  * copy out of changed its egress; see ft_mc_egress_changed(). A build racing
@@ -7069,6 +7088,83 @@ static void ft_mc_drain(void)
 	}
 }
 
+/* Give a group id to a stream somebody wants: an add of `family` that
+ * replicates found none free. One discard of the family leaves the hardware,
+ * and the caller adds again at once, in the same transaction hold. Returns
+ * whether one did.
+ *
+ * Both learners' groups take ids from one space per family, and a discard
+ * holds its id for as long as its stream keeps arriving -- for good, from a
+ * static upstream or a sender that never stops. Enough of them would starve
+ * every stream that has a listener, so a discard gives way, and it gives way
+ * at once rather than at the next refresh: the stream it drops reaches the CPU
+ * again, where the bridge drops it in software, while a listener refused would
+ * wait with nothing to watch. The one that goes is the one that saves least:
+ * the fewest frames counted over the last whole refresh interval. One not yet
+ * counted over a whole interval ranks after every one that has, so a discard
+ * just added does not go on a count it had no time to make, and ties go to
+ * the flow learned first. Discards never displace each
+ * other, and nothing displaces a group that replicates: only an add that
+ * replicates asks.
+ *
+ * Never the flow the bridged worker holds between its pick and its record,
+ * whose entry is its own -- after a swap, one already deleted -- nor one
+ * marked for the worker's next pass, which may be about to make it replicate.
+ * The flow that gave way stays a flow. Named by nothing, the next pass,
+ * asked for here, retires it; named still -- every listener behind its
+ * ingress, or blocking its source -- it is tried again a refresh apart, as a
+ * failed install is, and goes back in if an id frees before its tries run
+ * out.
+ *
+ * Called by either worker inside the transaction, holding no learner lock and
+ * no RTNL. ft_mc_lock is taken inside the transaction, /proc's order, and the
+ * entry is deleted with the transaction alone, as the worker deletes. It
+ * leaves the books under the lock, so whatever takes the lock or the
+ * transaction next finds the flow without an entry; the delete holds the
+ * ingress it unsubscribes through, which an exit draining the flows may let go
+ * of meanwhile. */
+static bool ft_mc_evict_discard(u8 family)
+{
+	struct ft_mc_flow *f, *victim = NULL;
+	struct cdx_mc_group *hw;
+	struct net_device *in;
+
+	cdx_ft_assert_held();
+	mutex_lock(&ft_mc_lock);
+	if (!ft_mc_stopping) {
+		list_for_each_entry(f, &ft_mc_flows, list) {
+			if (!f->hw || !f->hw_discard || f->busy || f->stale ||
+			    ft_mc_family(&f->addr) != family)
+				continue;
+			if (!victim || f->interval_packets < victim->interval_packets)
+				victim = f;
+		}
+	}
+	if (!victim) {
+		mutex_unlock(&ft_mc_lock);
+		return false;
+	}
+	hw = victim->hw;
+	victim->hw = NULL;
+	victim->hw_discard = false;
+	ft_mc_installed--;
+	ft_mc_discarding--;
+	ft_mc_discards_evicted++;
+	/* Spent as a failed install is: a flow still named waits for the
+	 * refresh to try it again, and one named by nothing is retired first. */
+	victim->retries++;
+	in = victim->in;
+	dev_hold(in);
+	/* Its frames reach the CPU again, and one recorded while the entry
+	 * dropped them has to be able to be recorded again. */
+	ft_mc_forget_seen();
+	schedule_work(&ft_mc_work);
+	mutex_unlock(&ft_mc_lock);
+	cdx_mc_group_del(&hw);
+	dev_put(in);
+	return true;
+}
+
 /* The worker. Runs outside RTNL except while it asks the bridge, so it may
  * take the transaction -- and never while holding ft_mc_lock or RTNL, which is
  * the ordering obligation stated above; ft_mc_lock it takes inside it.
@@ -7220,6 +7316,9 @@ static void ft_mc_work_fn(struct work_struct *work)
 			break;
 		}
 		target->stale = false;
+		/* Its entry is this pass's until the record below; see
+		 * ft_mc_evict_discard(). */
+		target->busy = true;
 		/* The installed key has carried nothing for a whole refresh while
 		 * the flow reached the CPU in another shape: that shape takes
 		 * over. The old entry comes out first -- it matches nothing, so
@@ -7314,6 +7413,13 @@ static void ft_mc_work_fn(struct work_struct *work)
 			}
 		} else {
 			rc = cdx_mc_group_add(&spec, &hw);
+			/* No group id left for a stream with somebody to send
+			 * it to: a discard gives its own up, and the add is made
+			 * again now rather than a refresh on. A discard asks
+			 * for none. */
+			if (rc == -ENOSPC && !spec.discard &&
+			    ft_mc_evict_discard(spec.family))
+				rc = cdx_mc_group_add(&spec, &hw);
 			if (rc) {
 				ft_mc_install_errors++;
 				hw = NULL;
@@ -7324,6 +7430,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		}
 
 		mutex_lock(&ft_mc_lock);
+		target->busy = false;
 		target->hw = hw;
 		/* What the entry was built with. A route withdrawn while the
 		 * spec was being taken has already cleared the flow's pointer and
@@ -7348,12 +7455,15 @@ static void ft_mc_work_fn(struct work_struct *work)
 		else if (!hw || target->hw_discard)
 			ft_mc_chain_forget(target);
 		/* A new entry has counted nothing yet, is not idle until a
-		 * whole refresh says so, and ages from now. */
+		 * whole refresh says so, ages from now, and has not been
+		 * counted over any interval. */
 		if (added) {
 			target->hw_packets = target->hw_bytes = 0;
 			target->count_suspect = false;
 			target->idle = false;
 			target->active = jiffies;
+			target->interval_packets = U64_MAX;
+			target->interval_whole = false;
 		}
 		/* A chain built whole after the last egress change is current;
 		 * one built across a change is not, and is built again -- the
@@ -7475,6 +7585,10 @@ static bool ft_mc_count_delta(u64 *base_packets, u64 *base_bytes,
  * learned it the first time. Only an entry's own count says so; a flow never
  * in hardware has none, and is bounded by the group's flows instead.
  *
+ * The interval's count is kept, too: it is what a discard saves, and the
+ * discard that saves least is the one that gives its group id up when a stream
+ * somebody wants finds none (ft_mc_evict_discard()).
+ *
  * Called with the transaction and ft_mc_lock held. */
 static void ft_mc_flow_counted(struct ft_mc_flow *f,
 			       const struct cdx_ft_counters *stats,
@@ -7504,6 +7618,9 @@ static void ft_mc_flow_counted(struct ft_mc_flow *f,
 			f->active = now;
 		f->hw_packets = stats->packets;
 		f->hw_bytes = stats->bytes;
+		if (f->interval_whole)
+			f->interval_packets = packets;
+		f->interval_whole = true;
 	}
 	f->idle = counted && !packets;
 	if (f->idle && f->has_next)
@@ -8293,7 +8410,11 @@ static void ft_mc_rows(struct seq_file *seq)
  *   - ft_mr_lock and ft_mc_lock are never nested. The bridged side only
  *     kicks this worker; the routed side reads bridge state from the kernel,
  *     and publishes its routes and taps through functions that take
- *     ft_mc_lock themselves, called with ft_mr_lock released.
+ *     ft_mc_lock themselves, called with ft_mr_lock released. One of them is
+ *     called inside the transaction: an add that finds no group id asks the
+ *     bridged learner for one a discard holds (ft_mc_evict_discard()), with
+ *     ft_mr_lock and RTNL both released -- the transaction then ft_mc_lock,
+ *     /proc's order.
  */
 
 /* Enough to ride out a transient -- a port bouncing, a moment of capacity
@@ -11081,6 +11202,14 @@ again:
 					}
 				} else {
 					rc = cdx_mc_group_add(&plan.spec, &hw);
+					/* The ids are both learners': one a
+					 * bridged discard holds is given up
+					 * for this group's copies, and the add
+					 * made again at once. ft_mr_lock and
+					 * RTNL are both let go of here. */
+					if (rc == -ENOSPC &&
+					    ft_mc_evict_discard(plan.spec.family))
+						rc = cdx_mc_group_add(&plan.spec, &hw);
 					if (rc) {
 						hw = NULL;
 					} else {
@@ -14065,6 +14194,7 @@ static int ft_show(struct seq_file *seq, void *v)
 	struct cdx_ft_counters stats;
 	unsigned int session_records = 0, session_slots = 0, vlan_records = 0, vlan_slots = 0;
 	unsigned int tunnel_records = 0, tunnel_slots = 0, stats_retained;
+	unsigned int ids4, ids6, id_slots;
 	u64 stats_deferred;
 	char in_vlan[16], out_vlan[16];
 	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
@@ -14199,8 +14329,18 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
 	/* Of those installed, the flows the bridge forwards nowhere, whose
-	 * entries drop their stream rather than hand it to the CPU. */
-	seq_printf(seq, "mcast_discarding %u\n", ft_mc_discarding);
+	 * entries drop their stream rather than hand it to the CPU; and how
+	 * many such entries have given their group id up to a stream somebody
+	 * wants. */
+	seq_printf(seq, "mcast_discarding %u\nmcast_discards_evicted %llu\n",
+		   ft_mc_discarding, ft_mc_discards_evicted);
+	/* The group ids both learners' groups hold, per family, and how many
+	 * each family has -- the same number for both: what a group that finds
+	 * none left, and reads refused-failed, ran out of. */
+	ids4 = cdx_mc_group_ids(AF_INET, &id_slots);
+	ids6 = cdx_mc_group_ids(AF_INET6, NULL);
+	seq_printf(seq, "mcast_group_ids4 %u\nmcast_group_ids6 %u\nmcast_group_id_slots %u\n",
+		   ids4, ids6, id_slots);
 	/* Installed groups of either learner marked for a rebuild because a
 	 * port they copy out of changed its egress -- its queues or its DSCP
 	 * map; see ft_mc_egress_changed(). */

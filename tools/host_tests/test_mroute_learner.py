@@ -239,6 +239,17 @@ def test_the_two_learners_never_nest_their_locks():
                             "mutex_unlock(&ft_mr_lock)")
     _assert_not_inside(source, regions, "mutex_lock(&ft_mc_lock)",
                        "ft_mc_lock must never be taken under ft_mr_lock")
+    # The one call into the bridged learner made inside this worker's
+    # transaction asks for a discard's group id, with ft_mr_lock and RTNL both
+    # released: the transaction then ft_mc_lock, /proc's order.
+    worker = re.sub(r"/\*.*?\*/", "", function(source, "ft_mr_work_fn"), flags=re.S)
+    for lock, unlock in (("mutex_lock(&ft_mr_lock)", "mutex_unlock(&ft_mr_lock)"),
+                         ("rtnl_lock()", "rtnl_unlock()")):
+        _assert_not_inside(worker, _held_regions(worker, lock, unlock),
+                           "ft_mc_evict_discard(", f"{lock} is held across the eviction")
+    asked = worker.index("ft_mc_evict_discard(")
+    begin = worker.rindex("cdx_ft_begin();", 0, asked)
+    assert "cdx_ft_end();" not in worker[begin:asked]
     # The bridged handler's only coupling to this learner.
     swdev = function(source, "ft_mc_swdev_obj")
     assert "ft_mr_kick()" in swdev, (
@@ -574,8 +585,22 @@ def test_proc_reports_a_row_and_a_summary():
                 "mroute_install_errors", "mroute_policy_rules",
                 "mroute_xfrm_changes", "mroute_ruleset_changes",
                 "mroute_ruleset_settled", "mroute_confirm_errors",
-                "mroute_port_probe_errors"):
+                "mroute_port_probe_errors",
+                # The group ids both learners draw on, per family, and how
+                # many there are: what a refused-failed group ran out of.
+                "mcast_group_ids4", "mcast_group_ids6", "mcast_group_id_slots"):
         assert key in show, f"{key} missing from the summary"
+    assert "cdx_mc_group_ids(AF_INET, &id_slots)" in show
+    assert "cdx_mc_group_ids(AF_INET6, NULL)" in show
+    # Read under the transaction every add and delete runs under, from the
+    # arrays GetNewMcastGrpId() hands ids out of, and none once exit freed
+    # them.
+    backend = (ROOT / "cdx/dpa_control_mc.c").read_text()
+    ids = function(backend, "cdx_mc_group_ids")
+    for needle in ("cdx_ft_assert_held();", "ids = mc6grp_ids;", "n = max_mc6grp_ids;",
+                   "ids = mc4grp_ids;", "n = max_mc4grp_ids;", "if (!ids)\n\t\tn = 0;"):
+        assert needle in ids, needle
+    assert "EXPORT_SYMBOL_NS_GPL(cdx_mc_group_ids, ASK_CDX_FLOWTABLE);" in backend
     rows = function(source, "ft_mr_rows")
     for field in ("family=", "table=", "group=", "src=", "in=", "oifs=",
                   "listeners=", "state=", "unconfirmed=", "adds=", "packets=",

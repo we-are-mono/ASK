@@ -1207,6 +1207,33 @@ unsigned int cdx_mc_group_count(void)
 	return cdx_mc_groups_owned;
 }
 
+/* The ids GetNewMcastGrpId() hands out are a byte each, set while a group
+ * holds it. Read under the transaction, which every add and delete that takes
+ * or gives one back runs under. */
+unsigned int cdx_mc_group_ids(u8 family, unsigned int *slots)
+{
+	const uint8_t *ids;
+	unsigned int held = 0, n, ii;
+
+	cdx_ft_assert_held();
+	if (family == AF_INET6) {
+		ids = mc6grp_ids;
+		n = max_mc6grp_ids;
+	} else {
+		ids = mc4grp_ids;
+		n = max_mc4grp_ids;
+	}
+	/* Not allocated, or already let go of at exit: there are none. */
+	if (!ids)
+		n = 0;
+	for (ii = 0; ii < n; ii++)
+		held += !!ids[ii];
+	if (slots)
+		*slots = n;
+	return held;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_ids, ASK_CDX_FLOWTABLE);
+
 /* Fill in everything about a group its root entry is built from: the family,
  * the addresses, the ingress and what the group's frames arrive as. Shared by
  * add and by replace's scratch group, so the two can never describe one key

@@ -333,7 +333,15 @@ left.
 failure is not permanent — a port that lost carrier gets it back — but tried
 again at once, in the same pass, nothing could have changed, and retrying
 forever against a group that cannot be carried would spin the worker.
-Anything that could change the answer resets the count.
+Anything that could change the answer resets the count. The one failure that
+is answered at once is an add that finds no group id free: both learners draw
+on one set of ids per family, and a bridged discard of the family -- a stream
+nobody wants, dropped where it is matched -- gives its id up, the one that
+counted fewest frames, and the add is made again in the same pass. The worker
+asks with `ft_mr_lock` and RTNL released, inside its transaction, which takes
+`ft_mc_lock` there in `/proc`'s order. With no discard of the family to give one
+up, the add fails as it always did. See
+[the bridged contract](multicast.md#the-eligibility-contract).
 
 **Linux forwards it.** A group the contract accepts is carried only once Linux
 has been seen forwarding it to every oif, under the ruleset in force. Until
@@ -702,7 +710,10 @@ for its flows; see [bridged multicast](multicast.md).
 `ft_mc_lock` is held and `ft_mc_lock` is never taken while `ft_mr_lock` is held.
 The routed worker reads the kernel's bridge snapshot under RTNL, with its own
 lock released. The bridged side's MDB handler only calls `ft_mr_kick()`, which
-sets a flag and schedules.
+sets a flag and schedules. The one call into the bridged learner made inside
+the routed worker's transaction, an add's request for a discard's group id
+(`ft_mc_evict_discard()`), is made with `ft_mr_lock` and RTNL both released and
+takes `ft_mc_lock` inside the transaction: `/proc`'s order.
 
 **Dependencies and retirement.** The same classes the bridged learner has, one
 family over:

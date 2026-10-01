@@ -547,6 +547,33 @@ when its group is at `FT_MC_MAX_FLOWS`. The routed learner has no analogue: a
 negative MFC entry is a daemon's policy with its own lifetime, and
 `refused-listener` there also covers shapes that are not empty.
 
+**A discard gives its group id up to a stream somebody wants.** A discard holds
+one of the 512 group ids of its family, which both learners draw on, for as
+long as its stream keeps arriving -- for good, from a static upstream or a
+sender that never stops. Enough of them would starve every stream with a
+listener, each refused for room and ending `refused-failed`. So an add that
+replicates, a bridged flow's or a routed group's, and finds no id free takes
+one (`ft_mc_evict_discard()`): the discard of its family that counted the fewest
+frames over the last whole refresh interval leaves the hardware, and the add is
+made again at once, in the same transaction hold, with nothing counted as
+failing. A discard not yet counted over a whole interval -- the first sample
+after its add covers only the part since the add -- ranks after every one that
+has, so one just added does not go on a count it had no time to make; ties go
+to the flow learned first. The stream it dropped reaches the CPU again, where the bridge
+drops it in software. Discards never displace each other -- a discard's add
+fails for room as any add always did -- and nothing displaces a group that
+replicates. Never taken either: the flow the bridged worker holds between its
+pick and its record, and one marked for its next pass, which may be about to
+make it replicate. The flow that gave way stays a flow: named by nothing, the
+next pass retires it; named still, it is tried again a refresh apart, as a
+failed install is, and goes back in if an id frees before its tries run out.
+`mcast_discards_evicted` counts them, and `mcast_group_ids4`,
+`mcast_group_ids6` and `mcast_group_id_slots` say how many ids each family
+holds and how many it has. The rig
+case `test_flowtable_service_multicast_discard_gives_its_id_to_a_listener`
+fills a family with discards and then joins a listener, whose stream has to be
+carried at once and stay carried, with exactly one discard gone.
+
 **The tag stack.** A bridged group carries the MDB entry's `vid`. Each
 listener's egress framing is resolved from that vid and the port's own
 membership: untagged in the vid means no tag, tagged means one 802.1Q tag with
@@ -686,11 +713,16 @@ flow yet, as `pending-source`. `mcast_groups` counts memberships and
 `mcast_enabled` is the global switch both learners answer to.
 
 **Capacity.** 512 group ids per family (`MAX_MC4_ENTRIES`), and one id per
-flow — per `(S,G,ingress)` triple — rather than per membership. Exhaustion is
-an ordinary outcome: the flow stays in software and says so, exactly as an
-exhausted statistics pool does for a PPPoE session. A failed install is tried
-again at each of the next refreshes, five seconds apart, up to four times, and
-then reads `refused-failed` until the bridge's answer for the flow changes.
+flow — per `(S,G,ingress)` triple — rather than per membership; the routed
+learner's groups take theirs from the same ids. A discard holds one too, and
+gives it up to a flow or a routed group that replicates and finds none (see
+the discard above), so what can exhaust them is streams somebody wants.
+Exhaustion is an ordinary outcome: the flow stays in software and says so,
+exactly as an exhausted statistics pool does for a PPPoE session. A failed
+install is tried again at each of the next refreshes, five seconds apart, up to
+four times, and then reads `refused-failed` until the bridge's answer for the
+flow changes. `/proc` shows how many ids each family holds against how many it
+has (`mcast_group_ids4`, `mcast_group_ids6`, `mcast_group_id_slots`).
 
 **Dependencies.** A multicast flow is the sixth dependency class. Its
 memberships come from the MDB and are retired by it, and a flow nothing names
@@ -925,7 +957,8 @@ that stopped. Each retires the group and returns it to pending or to nothing.
 A group that loses one listener is reinstalled with the remainder rather than
 being torn down, which is what the backend's replace operation is for; one that
 loses its last, while the bridge's snooping says the stream is dropped, is
-replaced by a discard and retired once its stream stops.
+replaced by a discard and retired once its stream stops -- or sooner, giving its
+group id up, when a stream somebody wants finds none left.
 
 ### 8. Parity
 

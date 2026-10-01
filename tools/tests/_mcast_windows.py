@@ -491,6 +491,30 @@ for suffix in ('.py', '.pid', '.json', '.tmp', '.command', '.command-new', '.log
 """)
 
 
+QUIET_TABLE = "ask_mc_quiet"
+
+
+@asynccontextmanager
+async def quiet(r: MulticastRig, groups):
+    """Only the case's own groups, and link-local control, reach the bridge
+    from either port: everything else multicast is dropped at ingress, before
+    the bridge can learn it and the bridged learner discard it in hardware.
+    A group may be a prefix, for a case with more groups than it names."""
+    v4 = ", ".join(["224.0.0.0/24"] + [g for g in groups if ":" not in g])
+    v6 = ", ".join(["ff02::/16"] + [g for g in groups if ":" in g])
+    chains = "\n".join(f''' chain {dev} {{ type filter hook ingress device "{dev}" priority -400; policy accept;
+  ip daddr 224.0.0.0/4 ip daddr != {{ {v4} }} drop
+  ip6 daddr ff00::/8 ip6 daddr != {{ {v6} }} drop
+ }}''' for dev in (TARGET_WAN_IF, TARGET_LAN_IF))
+    await command(r.target, r.session, "nft", "delete", "table", "netdev", QUIET_TABLE, check=False)
+    await command(r.target, r.session, "nft", f"table netdev {QUIET_TABLE} {{\n{chains}\n}}")
+    try:
+        yield
+    finally:
+        await command(r.target, r.session, "nft", "delete", "table", "netdev", QUIET_TABLE,
+                      check=False)
+
+
 @asynccontextmanager
 async def silenced(lan, iface: str):
     """The host behind `iface` stops answering queries, without leaving.

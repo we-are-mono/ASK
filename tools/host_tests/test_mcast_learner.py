@@ -116,6 +116,8 @@ def test_mcast_learner(tmp_path):
             "ft_mc_refresh_fn",
             "ft_mc_key_contested",
             "ft_mc_drain",
+            # What gives a discard's group id to a stream somebody wants.
+            "ft_mc_evict_discard",
             "ft_mc_flow_names_dev",
             "ft_mc_device_gone",
             "ft_mc_bridge_changed",
@@ -543,6 +545,55 @@ def test_a_blocked_source_is_the_bridges_answer_not_a_listener():
     assert blocked.index("adding = false;") < blocked.index("ft_mc_membership(")
     # The link-local test on the hook shares the handler's rule.
     assert "ft_mc_link_local(&seen.addr)" in function(source, "ft_mc_hook")
+
+
+def test_a_discard_gives_its_group_id_only_to_a_stream_somebody_wants():
+    """Both learners' groups draw on one space of group ids per family, and a
+    discard holds its id for as long as its stream arrives. An add that
+    replicates and finds none takes one from a discard and is made again at
+    once; nothing else asks -- not a discard's own add, not a failure of any
+    other kind. The discard leaves the hardware the way the worker takes an
+    entry out: off the books under ft_mc_lock inside the transaction, deleted
+    with the transaction alone, and never the flow the worker holds."""
+    source = SOURCE.read_text()
+    evict = function(source, "ft_mc_evict_discard")
+    assert "cdx_ft_assert_held();" in evict
+    for guard in ("!f->hw_discard", "f->busy", "f->stale",
+                  "ft_mc_family(&f->addr) != family", "if (!ft_mc_stopping)"):
+        assert guard in evict, guard
+    assert evict.count("mutex_lock(&ft_mc_lock)") == 1
+    unlock = evict.rindex("mutex_unlock(&ft_mc_lock);")
+    assert evict.index("victim->hw = NULL;") < unlock < evict.index("cdx_mc_group_del(&hw);")
+    assert evict.index("dev_hold(in);") < unlock < evict.index("dev_put(in);")
+    # The ingress is held until the delete that unsubscribes through it.
+    assert evict.index("cdx_mc_group_del(&hw);") < evict.index("dev_put(in);")
+    for worker, spec, guard in (("ft_mc_work_fn", "spec", "!spec.discard &&"),
+                                ("ft_mr_work_fn", "plan.spec", "")):
+        body = re.sub(r"/\*.*?\*/", "", function(source, worker), flags=re.S)
+        add = f"rc = cdx_mc_group_add(&{spec}, &hw);"
+        assert body.count(add) == 2 and body.count("ft_mc_evict_discard(") == 1, worker
+        # Room is asked for in the add's own family.
+        assert f"ft_mc_evict_discard({spec}.family)" in body, worker
+        first = body.index(add)
+        asked = body.index("ft_mc_evict_discard(")
+        assert first < asked < body.index(add, first + 1), worker
+        gate = " ".join(body[first + len(add):asked].split())
+        assert gate == " ".join(f"if (rc == -ENOSPC && {guard}".split()), (worker, gate)
+    # The worker's own target is its until it records, whichever way the
+    # build went.
+    worker = re.sub(r"/\*.*?\*/", "", function(source, "ft_mc_work_fn"), flags=re.S)
+    held = worker[worker.index("target->busy = true;"):worker.index("target->busy = false;")]
+    for leave in ("continue;", "break;", "return", "goto"):
+        assert leave not in held, leave
+    assert re.search(r"mutex_lock\(&ft_mc_lock\);\s+target->busy = false;", worker)
+    # What a discard saves: every refresh's count over its interval, and none
+    # yet for an entry just added.
+    counted = function(source, "ft_mc_flow_counted")
+    block = counted[counted.index("if (counted) {"):]
+    assert "f->interval_packets = packets;" in block[:block.index("\n\t}\n")]
+    added = worker[worker.index("if (added) {"):]
+    assert "target->interval_packets = U64_MAX;" in added[:added.index("}")]
+    assert "mcast_discards_evicted" in function(source, "ft_show")
 
 
 def test_a_failed_chain_swap_takes_the_flow_out_of_hardware():
