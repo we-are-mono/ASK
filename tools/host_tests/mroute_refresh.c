@@ -232,6 +232,7 @@ struct nft_port_probe {
     const struct net_device *in;
     const struct net_device * const *out;
     unsigned int nout;
+    bool bridged;
 };
 static int rcu_depth;
 static void rcu_read_lock(void) { rcu_depth++; }

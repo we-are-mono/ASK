@@ -94,6 +94,19 @@ struct net_device {
     bool mrouter;
     struct net_device *master;
     unsigned int flags;
+    /* tc runs something in software on what the device receives -- XDP
+     * included -- or on what it sends, as ft_dev_stack_tc_soft() asks. */
+    bool tc_ingress;
+    bool tc_egress;
+    /* A netfilter chain runs at its netdev ingress hook, as
+     * ft_dev_nf_ingress_hooked() asks of a bridge and its VLAN devices. */
+    bool nf_ingress;
+    /* A netdev chain at its ingress, or at its egress, that tells a group's
+     * streams apart, as nft_port_dependent() judges a bridged stream. */
+    bool chain_in;
+    bool chain_out;
+    /* The device it sits on, for a VLAN device or a macvlan. */
+    struct net_device *vlan_of;
     /* References the learner holds on it: a device going away waits for
      * these, and one nothing holds may be freed. */
     unsigned refs;
@@ -247,6 +260,26 @@ static bool br_multicast_router(const struct net_device *br) { return br->mroute
  * in jiffies; the learner ages an idle entry by the same. */
 #define HZ 100
 #define time_after(a, b) ((long)((b) - (a)) < 0)
+#define time_before(a, b) time_after(b, a)
+
+/* The adapter's hash seed, and a hash that mixes every word it is given, so
+ * that which set of dedup slots a fact goes to depends on all of its stream.
+ * A case wanting facts that share a set finds them by asking
+ * ft_mc_seen_set(). */
+static u32 ft_hash_seed = 0x5eed;
+static u32 jhash2(const u32 *k, u32 length, u32 initval)
+{
+    u32 h = initval ^ 0x9e3779b9;
+
+    for (u32 i = 0; i < length; i++) {
+        h ^= k[i];
+        h *= 0x01000193;
+        h ^= h >> 15;
+    }
+    return h;
+}
+
+#define BUILD_BUG_ON(c) _Static_assert(!(c), #c)
 static unsigned long membership_interval = 260 * HZ;
 static unsigned long br_multicast_membership_interval(const struct net_device *br,
                                                       uint16_t vid)
@@ -461,6 +494,93 @@ static bool ft_mc_bridge_filtered(void) { return bridge_hooked; }
 static void no_flow_busy(void);
 static void ft_mc_hook_sync(bool want) { (void)want; no_flow_busy(); }
 #define pr_info(...) ((void)0)
+
+/* The devices the derivation asks tc about: every bridge and bridge port,
+ * walked under RTNL. */
+static struct net_device *netdevs[8];
+#define for_each_netdev(net, d) \
+    for (unsigned _i = ((void)(net), 0); _i < ARRAY_SIZE(netdevs); _i++) \
+        if (((d) = netdevs[_i]) != NULL)
+static bool netif_is_bridge_port(const struct net_device *d)
+{
+    return d->master && d->master->bridge_master;
+}
+#define kcalloc(n, s, f) kzalloc_stub((n) * (s))
+
+/* The devices right above `dev`: those that sit on it. */
+#define netdev_for_each_upper_dev_rcu(dev, updev, iter) \
+    for (unsigned _u = ((void)&(iter), 0); _u < ARRAY_SIZE(netdevs); _u++) \
+        if (((updev) = netdevs[_u]) != NULL && (updev)->vlan_of == (dev))
+
+/* A bridge hook at LOCAL_IN, which sees what the bridge hands up. */
+#define BIT(n) (1U << (n))
+#define NF_BR_LOCAL_IN 1
+static bool bridge_local_in;
+static bool ft_bridge_hooked(unsigned int hooks)
+{
+    return (hooks & BIT(NF_BR_LOCAL_IN)) && bridge_local_in;
+}
+
+/* What tc runs in software on a device, and on it and every device below it;
+ * the devices here have none below. Asked under RTNL and never under the
+ * group lock: a classifier walk can destroy a filter, whose destruction
+ * reaches the egress mark, which takes the group lock. */
+static bool ft_dev_tc_soft(struct net_device *dev, bool ingress)
+{
+    assert(rtnl && !ft_mc_lock);
+    return ingress ? dev->tc_ingress : dev->tc_egress;
+}
+static bool ft_dev_stack_tc_soft(struct net_device *dev, bool ingress)
+{
+    return ft_dev_tc_soft(dev, ingress);
+}
+
+/* Whether a netfilter chain runs at a device's netdev ingress hook;
+ * mcast_bridge_filter.c reads the hook lists themselves. */
+static bool ft_dev_nf_ingress_hooked(const struct net_device *dev)
+{
+    assert(rtnl);
+    return dev->nf_ingress;
+}
+
+/* The ruleset's verdict on a stream, as nft_port_dependent() gives it: a
+ * port's own chain that tells the group's streams apart where the stream
+ * arrives or where a copy leaves, or what a case forces -- a commit
+ * interrupting the walk, a ruleset too large to judge. The last probe asked
+ * is kept for a case to read. */
+#define NFPROTO_IPV4 2
+#define NFPROTO_IPV6 10
+struct nft_port_probe {
+    u8 family;
+    union nf_inet_addr saddr;
+    union nf_inet_addr daddr;
+    const struct net_device *in;
+    const struct net_device *const *out;
+    unsigned int nout;
+    bool bridged;
+};
+static int probe_rc;
+static struct nft_port_probe probed;
+static const struct net_device *probed_out[CDX_MC_MAX_LISTENERS];
+static unsigned probes;
+static int nft_port_dependent(int *net, const struct nft_port_probe *probe)
+{
+    int rc = 0;
+
+    assert(net == &init_net && probe->bridged && probe->in);
+    assert(probe->nout <= CDX_MC_MAX_LISTENERS && (!probe->nout || probe->out));
+    probes++;
+    probed = *probe;
+    memcpy(probed_out, probe->out, probe->nout * sizeof(probe->out[0]));
+    probed.out = probed_out;
+    if (probe_rc)
+        return probe_rc;
+    rc = probe->in->chain_in;
+    for (unsigned i = 0; i < probe->nout; i++)
+        rc |= probe->out[i]->chain_out;
+    return rc;
+}
+static unsigned long long ft_mc_port_probe_errors;
 
 #include "mcast_learner.inc"
 
@@ -699,6 +819,8 @@ static struct net_device P2   = { .name = "eth4", .ifindex = 12, .physical = tru
 static struct net_device P3   = { .name = "eth5", .ifindex = 13, .physical = true, .master = &BR };
 static struct net_device SOFT = { .name = "vx0",  .ifindex = 14, .physical = false, .master = &BR };
 static struct net_device BR2  = { .name = "br1",  .ifindex = 15, .bridge_master = true };
+/* The bridge's VLAN device, which what it hands up in that VLAN goes on to. */
+static struct net_device BRV  = { .name = "br0.289", .ifindex = 16, .vlan_of = &BR };
 
 static const u8 GROUP_MAC[ETH_ALEN] = { 0x01, 0, 0x5e, 0x07, 0, 0x01 };
 static const u8 SENDER[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x51 };
@@ -789,13 +911,18 @@ static void free_lists(struct list_head *dead, struct list_head *gone)
 static void pass(void)
 {
     struct ft_mc_flow *f;
+    struct ft_mc_soft soft;
     LIST_HEAD(dead);
     LIST_HEAD(gone);
 
     ft_mc_drain();
-    list_for_each_entry(f, &ft_mc_flows, list)
-        if (f->dirty)
-            ft_mc_flow_derive(f);
+    rtnl_lock();
+    if (ft_mc_soft_ask(&soft))
+        list_for_each_entry(f, &ft_mc_flows, list)
+            if (f->dirty)
+                ft_mc_flow_derive(f, &soft);
+    rtnl_unlock();
+    ft_mc_soft_free(&soft);
     ft_mc_match_routes();
     ft_mc_retire(&dead, &gone);
     free_lists(&dead, &gone);
@@ -870,10 +997,15 @@ static void reset(void)
     BR.mrouter = BR2.mrouter = false;
     BR.flags = BR2.flags = 0;
     P1.mtu = P2.mtu = P3.mtu = 0;
+    P1.tc_ingress = P2.tc_ingress = P3.tc_ingress = false;
+    P1.tc_egress = P2.tc_egress = P3.tc_egress = false;
+    P1.chain_in = P2.chain_in = P3.chain_in = false;
+    P1.chain_out = P2.chain_out = P3.chain_out = false;
+    probe_rc = 0;
     /* A fresh learner: an empty ring and nothing recorded. */
     memset(ft_mc_last, 0, sizeof(ft_mc_last));
-    ft_mc_last_next = 0;
     ft_mc_ring_head = ft_mc_ring_tail = 0;
+    ft_mc_deferred = 0;
     ft_mc_count = ft_mc_flow_count = 0;
     /* And a fresh backend: the flows freed above took their entries, and
      * their ids, with them. */
@@ -889,8 +1021,19 @@ static void reset(void)
     by_index[1] = &P2;
     by_index[2] = &P3;
     by_index[3] = &SOFT;
+    memset(netdevs, 0, sizeof(netdevs));
+    netdevs[0] = &BR;
+    netdevs[1] = &P1;
+    netdevs[2] = &P2;
+    netdevs[3] = &P3;
+    netdevs[4] = &SOFT;
+    netdevs[5] = &BR2;
+    netdevs[6] = &BRV;
+    BR.tc_ingress = BR2.tc_ingress = BRV.tc_ingress = false;
+    BR.nf_ingress = BR2.nf_ingress = BRV.nf_ingress = false;
     vlan_enabled = false;
     vlan_proto = ETH_P_8021Q;
+    bridge_local_in = false;
     ft_mc_refused = 0;
     assert(holds == 0);
 }
@@ -1125,6 +1268,7 @@ static void frames_become_flows(void)
     struct br_ip any = group_v4(G, 0, 0);
     struct br_ip sourced = group_v4(G, S1, 0);
     struct ft_mc_flow *f;
+    struct ft_mc_seen o;
 
     /* A (*,G) membership names every source of its group: the first frame
      * of each is a flow, pinned to its ingress and its bridge. */
@@ -1331,13 +1475,18 @@ static void frames_become_flows(void)
     }
 
     /* An allocation that fails leaves nothing behind but the promise that
-     * the next frame is asked about again. */
+     * the frame is asked about again, once its record lapses -- not every
+     * stream's record at once, which a run of failures would make news on
+     * every frame. */
     reset();
     assert(ft_mc_membership(&BR, &P2, &any, true, false));
     fail_alloc = true;
-    see(seen_v4(&BR, &P1, G, S1, 0, false, SENDER));
+    o = seen_v4(&BR, &P1, G, S1, 0, false, SENDER);
+    see(o);
     assert(!ft_mc_flow_count && holds == 2);
-    see(seen_v4(&BR, &P1, G, S1, 0, false, SENDER));
+    assert(!ft_mc_record(&o));
+    jiffies += FT_MC_REFRESH_INTERVAL;
+    see(o);
     assert(flow(&P1, S1, 0));
 
     /* ---- the shape a flow arrives in ------------------------------------
@@ -1356,8 +1505,13 @@ static void frames_become_flows(void)
     see(seen_v4(&BR, &P1, G, S1, 0, false, OTHER_SENDER));
     assert(!memcmp(f->src_mac, OTHER_SENDER, ETH_ALEN) && !f->has_next);
     assert(!f->dirty && f->stale && ft_mc_flow_count == 1);
-    /* And the shape it had is a new fact again. */
-    see(seen_v4(&BR, &P1, G, S1, 0, false, SENDER));
+    /* And the shape it had is a fact again once its record lapses, an
+     * interval after it was made -- not at once, which a stream arriving
+     * in both shapes would turn into news on every frame. */
+    o = seen_v4(&BR, &P1, G, S1, 0, false, SENDER);
+    assert(!ft_mc_record(&o));
+    jiffies += FT_MC_REFRESH_INTERVAL;
+    see(o);
     assert(!memcmp(f->src_mac, SENDER, ETH_ALEN));
     f->hw = FAKE_HW;
     f->idle = false;
@@ -1417,7 +1571,15 @@ static void the_bridge_decides(void)
      * flow is not marked for the install pass, and retries spent stand. */
     f->retries = 2;
     f->dirty = true;
-    ft_mc_flow_derive(f);
+    {
+        struct ft_mc_soft soft;
+
+        rtnl_lock();
+        ft_mc_soft_ask(&soft);
+        ft_mc_flow_derive(f, &soft);
+        rtnl_unlock();
+        ft_mc_soft_free(&soft);
+    }
     assert(!f->stale && f->retries == 2);
     f->retries = 0;
     /* The same object twice is the bridge restating it: every flow of the
@@ -2063,26 +2225,165 @@ static void the_dedup_slots(void)
     assert(flow(&P1, S, 0));
     withdraw(&r1);
 
-    /* Several slots: two streams interleaving are each recorded once, and a
-     * slot is reused only after FT_MC_SEEN_SLOTS others. */
+    /* As many streams as there are slots, interleaving -- streams nothing
+     * names, which reach the hook on every frame: each is recorded once,
+     * and none again however many frames of each follow. Slots holding only
+     * the last few facts would be pushed out by the others on every frame,
+     * and every frame would be a pass of the worker. */
     reset();
     {
-        struct ft_mc_seen p = seen_v4(&BR, &P1, G, S + 0x01000000, 0, false, SENDER);
+        static struct ft_mc_seen many[FT_MC_SEEN_SETS * FT_MC_SEEN_WAYS];
+        unsigned in_set[FT_MC_SEEN_SETS] = { 0 }, n = 0;
+        u64 observed = ft_mc_observed;
 
-        assert(ft_mc_record(&o) && ft_mc_record(&p));
-        assert(!ft_mc_record(&o) && !ft_mc_record(&p));
-        for (unsigned i = 0; i < FT_MC_SEEN_SLOTS - 1; i++) {
-            struct ft_mc_seen q = seen_v4(&BR, &P1, G, S + ((i + 2) << 24), 0,
+        for (uint32_t i = 0; n < ARRAY_SIZE(many); i++) {
+            struct ft_mc_seen q = seen_v4(&BR, &P1, G, htonl(0x0a010000 + i), 0,
                                           false, SENDER);
-            ft_mc_drain();
-            /* Still known while a slot is left for each newer fact. */
-            assert(!ft_mc_record(&o));
-            assert(ft_mc_record(&q));
+            unsigned set = ft_mc_seen_set(&q);
+
+            assert(i < 1 << 20 && set < FT_MC_SEEN_SETS);
+            if (in_set[set] == FT_MC_SEEN_WAYS)
+                continue;
+            in_set[set]++;
+            many[n++] = q;
         }
-        /* The oldest slot went to the last of them. */
+        for (unsigned round = 0; round < 4; round++)
+            for (unsigned i = 0; i < n; i++) {
+                assert(ft_mc_record(&many[i]) == !round);
+                ft_mc_drain();
+            }
+        assert(ft_mc_observed - observed == n && !ft_mc_deferred && !ft_mc_flow_count);
+    }
+
+    /* One more stream than a set holds, all of them interleaving. The set's
+     * facts were recorded within the last refresh interval, and the newest
+     * waits rather than push one of them out, which would make that one news
+     * again on its next frame -- and so on round the set, every frame. Once
+     * the oldest was recorded an interval ago it gives its slot up: however
+     * many streams share a set, it records no more facts in an interval than
+     * it has slots, and a stream waits at most an interval. */
+    reset();
+    {
+        struct ft_mc_seen crowd[FT_MC_SEEN_WAYS + 1];
+        unsigned set = ft_mc_seen_set(&o), n = 0, recorded = 0;
+
+        for (uint32_t i = 0; n < ARRAY_SIZE(crowd); i++) {
+            struct ft_mc_seen q = seen_v4(&BR, &P1, G, htonl(0x0a020000 + i), 0,
+                                          false, SENDER);
+
+            assert(i < 1 << 20);
+            if (ft_mc_seen_set(&q) == set)
+                crowd[n++] = q;
+        }
+        for (unsigned i = 0; i < FT_MC_SEEN_WAYS; i++) {
+            assert(ft_mc_record(&crowd[i]));
+            ft_mc_drain();
+        }
+        for (unsigned round = 0; round < 8; round++)
+            for (unsigned i = 0; i < ARRAY_SIZE(crowd); i++)
+                assert(!ft_mc_record(&crowd[i]));
+        assert(ft_mc_deferred == 8);
+        jiffies += FT_MC_REFRESH_INTERVAL;
+        for (unsigned round = 0; round < 8; round++)
+            for (unsigned i = 0; i < ARRAY_SIZE(crowd); i++) {
+                recorded += ft_mc_record(&crowd[i]);
+                ft_mc_drain();
+            }
+        assert(recorded == FT_MC_SEEN_WAYS);
+        /* The waiting one first, into the slot recorded longest ago. */
+        assert(!ft_mc_record(&crowd[FT_MC_SEEN_WAYS]));
+        /* And a change that may answer them differently lets every one of
+         * them be recorded again at once. */
+        mutex_lock(&ft_mc_lock);
+        ft_mc_forget_seen();
+        mutex_unlock(&ft_mc_lock);
+        for (unsigned i = 0; i < FT_MC_SEEN_WAYS; i++) {
+            assert(ft_mc_record(&crowd[i]));
+            ft_mc_drain();
+        }
+    }
+
+    /* A shape kept from an installed phase is another answer too once the
+     * flow, out of hardware, takes a third: its record lapses as the old
+     * shape's does, and its next frame after that can take the flow back. */
+    reset();
+    {
+        struct ft_mc_seen b = o, c = o;
+        struct ft_mc_flow *f;
+
+        memcpy(b.src_mac, OTHER_SENDER, ETH_ALEN);
+        c.src_mac[5] = 0x53;
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        see(o);
+        f = flow(&P1, S, 0);
+        f->hw = FAKE_HW;
+        f->idle = false;
+        see(b);
+        assert(f->has_next && !memcmp(f->next.src_mac, OTHER_SENDER, ETH_ALEN));
+        f->hw = NULL;
+        see(c);
+        assert(!f->has_next && f->src_mac[5] == 0x53);
+        assert(!ft_mc_record(&o) && !ft_mc_record(&b));
+        jiffies += FT_MC_REFRESH_INTERVAL;
+        assert(ft_mc_record(&b));
         ft_mc_drain();
-        assert(ft_mc_record(&o));
+        assert(!memcmp(f->src_mac, OTHER_SENDER, ETH_ALEN));
+    }
+
+    /* A source turned away while the host's join refused its group is news
+     * once the host leaves: nothing else would let it be recorded again. */
+    reset();
+    {
+        const uint32_t H = 0x1b0007ef, LATE = htonl(0x0a0000ff);
+        struct br_ip any_h = group_v4(H, 0, 0), named = group_v4(H, LATE, 0);
+        struct ft_mc_seen late = seen_v4(&BR, &P1, H, LATE, 0, false, SENDER);
+
+        assert(ft_mc_membership(&BR, &P2, &any_h, true, false));
+        assert(ft_mc_membership(&BR, &P3, &named, true, false));
+        for (uint32_t i = 0; i < FT_MC_MAX_FLOWS; i++)
+            see(seen_v4(&BR, &P1, H, htonl(0x0a000001 + i), 0, false, SENDER));
+        assert(!ft_mc_membership(&BR, &BR, &any_h, true, true));
+        see(late);
+        assert(!flow(&P1, LATE, 0) && !ft_mc_record(&late));
+        assert(!ft_mc_membership(&BR, &BR, &any_h, false, true));
+        see(late);
+        assert(flow(&P1, LATE, 0));
+    }
+
+    /* A flow nothing has installed takes the shape it is seen in, and the
+     * shape it had may come back. A stream arriving in two shapes at once --
+     * two senders of one source -- is news once an interval for each shape
+     * rather than on every frame, and makes no other stream news. */
+    reset();
+    {
+        struct ft_mc_seen b = o;
+        struct ft_mc_seen other = seen_v4(&BR, &P3, G + 0x01000000, S, 0, false, SENDER);
+        unsigned recorded = 0;
+        struct ft_mc_flow *f;
+
+        memcpy(b.src_mac, OTHER_SENDER, ETH_ALEN);
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        see(o);
+        f = flow(&P1, S, 0);
+        assert(f && ether_addr_equal(f->src_mac, SENDER));
+        assert(ft_mc_record(&other));
         ft_mc_drain();
+        see(b);
+        assert(ether_addr_equal(f->src_mac, OTHER_SENDER));
+        for (unsigned round = 0; round < 8; round++) {
+            recorded += ft_mc_record(&o) + ft_mc_record(&b) + ft_mc_record(&other);
+            ft_mc_drain();
+        }
+        assert(!recorded);
+        /* An interval on, the shape it had takes it back, and the shape
+         * that had it was recorded long enough ago to take it back again;
+         * the next return waits for another interval. */
+        jiffies += FT_MC_REFRESH_INTERVAL;
+        for (unsigned round = 0; round < 8; round++) {
+            recorded += ft_mc_record(&o) + ft_mc_record(&b) + ft_mc_record(&other);
+            ft_mc_drain();
+        }
+        assert(recorded == 2 && ether_addr_equal(f->src_mac, OTHER_SENDER));
     }
     /* Every fact of the frame counts: a sender's MAC, the tag, the port,
      * the VLAN, the source. */
@@ -3075,8 +3376,9 @@ static void what_a_discard_never_gives_up(void)
     assert(!held->hw && !held->hw_discard && held->retries == 1);
     assert(dels == d0 + 1 && !ft_mc_discarding && ft_mc_discards_evicted == evicted + 2);
     assert(works == works0 + 1 && holds == holds0);
-    for (unsigned i = 0; i < FT_MC_SEEN_SLOTS; i++)
-        assert(!ft_mc_last[i].in_ifindex);
+    for (unsigned i = 0; i < FT_MC_SEEN_SETS; i++)
+        for (unsigned j = 0; j < FT_MC_SEEN_WAYS; j++)
+            assert(!ft_mc_last[i][j].seen.in_ifindex);
     ft_mc_drain();
     assert(!in_transaction && !ft_mc_lock && !rtnl);
     reset();
@@ -3220,6 +3522,285 @@ static void a_bridge_filter_refuses_every_flow(void)
     list_for_each_entry(f, &ft_mc_flows, list)
         assert(!f->gone);
     ft_mc_filtered = false;
+}
+
+static void tc_keeps_a_flow_in_software(void)
+{
+    const uint32_t G = 0x190007ef, S = 0x0100000a;
+    struct br_ip any = group_v4(G, 0, 0);
+    unsigned long long refused;
+    struct ft_mc_flow *f;
+
+    /* tc runs on every frame the bridge forwards in software and on none an
+     * entry replicates, and the entry's key stops at the addresses: one
+     * filter dropping one UDP port of the group would be bypassed for every
+     * port of it. So a filter where the stream arrives -- XDP included -- or
+     * where a copy leaves takes a carried flow out of hardware, and the flow
+     * says why. Nothing announces a filter: each refresh asks every flow of
+     * the bridge again, which is what marks it here, and the flow goes back
+     * in once the filter has gone. */
+    reset();
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, 0, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && !strcmp(ft_mc_state(f), "installed"));
+    refused = ft_mc_refused;
+
+    P1.tc_ingress = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !ft_mc_installable(f));
+    assert(!strcmp(ft_mc_state(f), "refused-tc"));
+    /* Counted once, however often it is asked again. */
+    assert(ft_mc_refused == refused + 1);
+    f->dirty = true;
+    pass();
+    assert(!f->hw && ft_mc_refused == refused + 1);
+    P1.tc_ingress = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* On the way out, only where a copy leaves: not a port the bridge does
+     * not copy to, nor the ingress's own egress. */
+    P3.tc_egress = P1.tc_egress = true;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    P2.tc_egress = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-tc"));
+    assert(ft_mc_refused == refused + 2);
+    P1.tc_egress = P2.tc_egress = P3.tc_egress = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* The bridge's own way in is crossed only by what it hands up: a flow
+     * it forwards to ports alone never meets the bridge device's tc, and
+     * one it also hands up -- a multicast router, here -- loses that copy
+     * to a carried entry. */
+    BR.tc_ingress = true;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    answer(&P1, S, 0, BR_MCAST_TO_HOST_ROUTER, 1, &P2);
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-tc"));
+    BR.tc_ingress = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    /* And so is the VLAN device it hands the copy on to. */
+    BRV.tc_ingress = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-tc"));
+    BRV.tc_ingress = false;
+    answer(&P1, S, 0, 0, 1, &P2);
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* A table there was no memory for says nothing: the flows stay as they
+     * were, marked for the next pass that can ask. */
+    fail_alloc = true;
+    P1.tc_ingress = true;
+    f->dirty = true;
+    pass();
+    assert(!fail_alloc && f->hw && f->dirty && !f->tc_soft);
+    pass();
+    assert(!f->hw && !f->dirty && !strcmp(ft_mc_state(f), "refused-tc"));
+    P1.tc_ingress = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* A stream the bridge forwards nowhere is dropped there only after tc
+     * has run on it -- a mirror, a police, a counter -- so it is not dropped
+     * in hardware either. */
+    reset();
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, BR_MCAST_SNOOPED, 0);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && f->hw_discard && !strcmp(ft_mc_state(f), "discarding"));
+    P1.tc_ingress = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !ft_mc_discardable(f) && !strcmp(ft_mc_state(f), "refused-tc"));
+    P1.tc_ingress = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && f->hw_discard && !strcmp(ft_mc_state(f), "discarding"));
+}
+
+static void a_netdev_chain_keeps_a_flow_in_software(void)
+{
+    const uint32_t G = 0x1a0007ef, S = 0x0100000a;
+    struct br_ip any = group_v4(G, 0, 0);
+    unsigned long long refused;
+    struct ft_mc_flow *f;
+
+    /* A port's own netdev hooks see its frames before the bridge does, or
+     * after it forwarded them, and the ruleset is asked, about a bridged
+     * stream, what its chains there do to the flow's: one that could tell
+     * its streams apart, drop them or translate them is netfilter seeing
+     * them as a bridge hook would, and the flow goes out of hardware as it
+     * would for one -- but only the flows crossing that port. */
+    reset();
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, 0, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && !strcmp(ft_mc_state(f), "installed"));
+    /* Asked of the flow's own stream, bridged, through the ports it
+     * leaves by. */
+    assert(probed.family == NFPROTO_IPV4 && probed.in == &P1 && probed.bridged);
+    assert(probed.saddr.ip == S && probed.daddr.ip == G);
+    assert(probed.nout == 1 && probed.out[0] == &P2);
+    refused = ft_mc_refused;
+
+    P1.chain_in = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && f->nf_hooked && !f->tc_soft && !ft_mc_installable(f));
+    assert(!strcmp(ft_mc_state(f), "refused-filter") && ft_mc_refused == refused + 1);
+    /* tc too: one refusal, counted once, and netfilter's is the one named. */
+    P1.tc_ingress = true;
+    f->dirty = true;
+    pass();
+    assert(f->tc_soft && ft_mc_refused == refused + 1);
+    assert(!strcmp(ft_mc_state(f), "refused-filter"));
+    P1.chain_in = P1.tc_ingress = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* On the way out, only where a copy leaves. */
+    P3.chain_out = P1.chain_out = true;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    P2.chain_out = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-filter"));
+    P1.chain_out = P2.chain_out = P3.chain_out = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* A walk a commit interrupted says nothing: a flow keeps the answer it
+     * had, whichever it was, until it is asked again. */
+    probe_rc = -EAGAIN;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !f->nf_hooked && !strcmp(ft_mc_state(f), "installed"));
+    probe_rc = 0;
+    P2.chain_out = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && f->nf_hooked);
+    P2.chain_out = false;
+    probe_rc = -EAGAIN;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && f->nf_hooked);
+    /* And a ruleset it could not judge keeps the flow out, and says so. */
+    probe_rc = -E2BIG;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && f->nf_hooked && ft_mc_port_probe_errors == 1);
+    probe_rc = 0;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    ft_mc_port_probe_errors = 0;
+
+    /* Where the bridge hands the frames up -- the bridge device and the
+     * VLAN device above it -- any chain counts, and only for a flow it
+     * hands up. */
+    BR.nf_ingress = true;
+    f->dirty = true;
+    pass();
+    assert(f->hw);
+    answer(&P1, S, 0, BR_MCAST_TO_HOST_PROMISC, 1, &P2);
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-filter"));
+    BR.nf_ingress = false;
+    BRV.nf_ingress = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-filter"));
+    BRV.nf_ingress = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    /* And the bridge's own LOCAL_IN hook, which only the copy it hands up
+     * crosses: a bridge chain there no forwarded frame meets. */
+    bridge_local_in = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-filter"));
+    answer(&P1, S, 0, 0, 1, &P2);
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    bridge_local_in = false;
+
+    /* A walk a commit interrupted, or without memory, answers nothing for
+     * a port set the flow did not have: the new port's chains are unjudged,
+     * and the flow waits for the refresh. */
+    probe_rc = -ENOMEM;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !f->nf_hooked && !ft_mc_port_probe_errors);
+    answer(&P1, S, 0, 0, 2, &P2, &P3);
+    f->dirty = true;
+    pass();
+    assert(!f->hw && f->nf_hooked && !strcmp(ft_mc_state(f), "refused-filter"));
+    probe_rc = 0;
+    f->dirty = true;
+    pass();
+    assert(f->hw && f->ports == 2 && !strcmp(ft_mc_state(f), "installed"));
+
+    /* A flow first asked while a commit interrupts the walk has no answer
+     * to keep, and stays out until it has one. */
+    reset();
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, 0, 1, &P2);
+    probe_rc = -EAGAIN;
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && !f->hw && f->nf_hooked);
+    probe_rc = 0;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* And a discard: the chain sees the stream before the bridge drops it,
+     * and the ruleset is asked about the input alone. */
+    reset();
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, BR_MCAST_SNOOPED, 0);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && f->hw_discard && probed.nout == 0 && probed.in == &P1);
+    P1.chain_in = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !ft_mc_discardable(f) && !strcmp(ft_mc_state(f), "refused-filter"));
+    P1.chain_in = false;
 }
 
 static void a_port_moves_between_bridges(void)
@@ -3504,6 +4085,8 @@ int main(void)
     rows_speak_for_memberships();
     replayed_memberships();
     a_bridge_filter_refuses_every_flow();
+    tc_keeps_a_flow_in_software();
+    a_netdev_chain_keeps_a_flow_in_software();
     a_port_moves_between_bridges();
     idle_flows_age_out();
 

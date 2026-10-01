@@ -1,4 +1,4 @@
-From 30e1dd3597068bbd20d30b6bba680d7e047ad662 Mon Sep 17 00:00:00 2001
+From 94bcb357162cd9892846649cc1ba471824fdb75f Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 24 Sep 2026 01:55:38 +0200
 Subject: [PATCH] netfilter: nf_tables: say when a commit is still being
@@ -44,6 +44,13 @@ chains and with the conntrack mark the earlier one left. It lives in
 nf_tables because the per-net table list, where NAT chains are found, is
 private to it.
 
+A stream a bridge forwards, keyed the same way, crosses only the netdev
+hooks of its ports, and nothing conntracks it. A bridged probe walks
+netdev ingress up the input's stack and netdev egress down each
+output's, of which there may be none; the bridge's own chains are left
+to the caller, which knows which of its hooks a forwarded frame
+crosses, and x_tables answers 0 for it.
+
 For it to read them, the private data of cmp, range, bitwise, byteorder,
 lookup and objref maps moves to nf_tables_core.h, that of nat, masq and
 redir to a new nft_nat.h, and the ct expression records whether it
@@ -65,7 +72,9 @@ the netfilter core, so the caller depends on neither. Their hooks are
 typed NF_HOOK_OP_XTABLES, mangle running its table through a wrapper of
 its own, and the NAT core's NF_HOOK_OP_NAT: the iptables-legacy NAT
 tables are registered with it and found only through its private data,
-which moves to nf_nat.h. The NAT core now frees its hook ops after a
+which moves to nf_nat.h. A base chain's hook that a chain update adds
+for another device is typed NF_HOOK_OP_NF_TABLES, as the chain's first
+ones are, rather than left untyped like a flowtable's. The NAT core now frees its hook ops after a
 grace period, as it already freed that data, and the registration error
 paths that unregister hooks again -- ip_tables', ip6_tables', the NAT
 core's and the NAT tables' own -- wait one before freeing what they
@@ -84,21 +93,21 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/linux/netfilter.h              |    6 +
  include/linux/netfilter/x_tables.h     |    3 +
  include/net/netfilter/nf_nat.h         |   11 +
- include/net/netfilter/nf_port_probe.h  |  101 +
+ include/net/netfilter/nf_port_probe.h  |  111 ++
  include/net/netfilter/nf_tables.h      |   40 +
  include/net/netfilter/nf_tables_core.h |   56 +
  include/net/netfilter/nft_nat.h        |   34 +
  include/net/netns/netfilter.h          |    5 +
  include/net/netns/nftables.h           |    2 +
- net/ipv4/netfilter/ip_tables.c         |  307 +++-
+ net/ipv4/netfilter/ip_tables.c         |  307 ++-
  net/ipv4/netfilter/iptable_nat.c       |    8 +-
  net/ipv6/netfilter/ip6_tables.c        |  349 +++-
  net/ipv6/netfilter/ip6table_nat.c      |    8 +-
  net/netfilter/Makefile                 |    2 +-
- net/netfilter/core.c                   |   50 +
+ net/netfilter/core.c                   |   53 +
  net/netfilter/nf_nat_core.c            |   19 +-
- net/netfilter/nf_tables_api.c          |   10 +
- net/netfilter/nf_tables_port_probe.c   | 2349 ++++++++++++++++++++++++
+ net/netfilter/nf_tables_api.c          |   11 +
+ net/netfilter/nf_tables_port_probe.c   | 2365 ++++++++++++++++++++++++
  net/netfilter/nfnetlink_hook.c         |    2 +
  net/netfilter/nft_bitwise.c            |   10 -
  net/netfilter/nft_byteorder.c          |    8 -
@@ -112,7 +121,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/netfilter/nft_range.c              |    8 -
  net/netfilter/nft_redir.c              |    7 +-
  net/netfilter/x_tables.c               |   58 +
- 31 files changed, 3412 insertions(+), 88 deletions(-)
+ 31 files changed, 3442 insertions(+), 88 deletions(-)
  create mode 100644 include/net/netfilter/nf_port_probe.h
  create mode 100644 include/net/netfilter/nft_nat.h
  create mode 100644 net/netfilter/nf_tables_port_probe.c
@@ -172,10 +181,10 @@ index 9877f064548a..71112fad66ce 100644
  	       const struct nf_hook_state *state);
 diff --git a/include/net/netfilter/nf_port_probe.h b/include/net/netfilter/nf_port_probe.h
 new file mode 100644
-index 000000000000..5832d124b58a
+index 000000000000..c6ecb4b67d41
 --- /dev/null
 +++ b/include/net/netfilter/nf_port_probe.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,111 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _NF_PORT_PROBE_H
 +#define _NF_PORT_PROBE_H
@@ -194,11 +203,20 @@ index 000000000000..5832d124b58a
 + * @in: the device the stream arrives on
 + * @out: the devices copies of it leave through
 + * @nout: how many entries @out has
++ * @bridged: a bridge forwards it, not the IP stack
 + *
 + * Everything about the stream but its transport ports: an offload that keys
 + * on the addresses alone asks whether the ruleset could tell two of its
 + * streams apart by port. nft_port_dependent() answers for nf_tables and
 + * nf_xt_port_dependent() for x_tables.
++ *
++ * A bridged stream arrives on a bridge port and leaves through others, and a
++ * bridge forwards a frame between its ports without the IP stack: it crosses
++ * netdev ingress up @in's stack and netdev egress down each output's, and no
++ * prerouting, forward or postrouting chain, no conntrack and no x_tables. One
++ * the bridge forwards nowhere may have no output at all. The bridge's own
++ * hooks are the caller's to rule out, as tc is: only some of them see a
++ * forwarded frame, and nft_port_dependent() leaves bridge family chains to it.
 + *
 + * What the caller vouches for, and both take as given: the stream is UDP; its
 + * destination is a group address, so on an Ethernet input its packets are
@@ -223,6 +241,7 @@ index 000000000000..5832d124b58a
 +	const struct net_device		*in;
 +	const struct net_device * const	*out;
 +	unsigned int			nout;
++	bool				bridged;
 +};
 +
 +/**
@@ -1370,7 +1389,7 @@ index f0aa4d7ef499..0ebadc026948 100644
  ifdef CONFIG_X86_64
  ifndef CONFIG_UML
 diff --git a/net/netfilter/core.c b/net/netfilter/core.c
-index b9f551f02c81..8801a4323072 100644
+index b9f551f02c81..463e27c82fbd 100644
 --- a/net/netfilter/core.c
 +++ b/net/netfilter/core.c
 @@ -23,6 +23,7 @@
@@ -1381,7 +1400,7 @@ index b9f551f02c81..8801a4323072 100644
  #include <net/netfilter/nf_queue.h>
  #include <net/sock.h>
  
-@@ -684,6 +685,55 @@ EXPORT_SYMBOL_GPL(nf_defrag_v4_hook);
+@@ -684,6 +685,58 @@ EXPORT_SYMBOL_GPL(nf_defrag_v4_hook);
  const struct nf_defrag_hook __rcu *nf_defrag_v6_hook __read_mostly;
  EXPORT_SYMBOL_GPL(nf_defrag_v6_hook);
  
@@ -1420,6 +1439,9 @@ index b9f551f02c81..8801a4323072 100644
 +	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
 +			 "x_tables probed outside rcu_read_lock()");
 +
++	/* No x_tables hook sees what a bridge forwards. */
++	if (probe->bridged)
++		return 0;
 +	switch (probe->family) {
 +	case NFPROTO_IPV4:
 +		hook = rcu_dereference(nf_ipt_probe_hook);
@@ -1489,10 +1511,18 @@ index 041ab3733baa..f7737e648b06 100644
  unlock:
  	mutex_unlock(&nf_nat_proto_mutex);
 diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
-index 03dd9d1db12f..5c30a237a3a5 100644
+index 03dd9d1db12f..7a6d0496c161 100644
 --- a/net/netfilter/nf_tables_api.c
 +++ b/net/netfilter/nf_tables_api.c
-@@ -10303,6 +10303,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+@@ -2655,6 +2655,7 @@ static int nf_tables_updchain(struct nft_ctx *ctx, u8 genmask, u8 policy,
+ 				h->ops.priority	= basechain->ops.priority;
+ 				h->ops.priv	= basechain->ops.priv;
+ 				h->ops.hook	= basechain->ops.hook;
++				h->ops.hook_ops_type = basechain->ops.hook_ops_type;
+ 
+ 				if (nft_hook_list_find(&basechain->hook_list, h)) {
+ 					list_del(&h->list);
+@@ -10303,6 +10304,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
  	while (++base_seq == 0)
  		;
  
@@ -1504,7 +1534,7 @@ index 03dd9d1db12f..5c30a237a3a5 100644
  	/* pairs with smp_load_acquire in nft_lookup_eval */
  	smp_store_release(&net->nft.base_seq, base_seq);
  
-@@ -10534,6 +10539,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+@@ -10534,6 +10540,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
  
  	nft_set_commit_update(&set_update_list);
  
@@ -1518,10 +1548,10 @@ index 03dd9d1db12f..5c30a237a3a5 100644
  	nf_tables_commit_audit_log(&adl, nft_base_seq(net));
 diff --git a/net/netfilter/nf_tables_port_probe.c b/net/netfilter/nf_tables_port_probe.c
 new file mode 100644
-index 000000000000..3ab80ef7f49d
+index 000000000000..a28859d6f108
 --- /dev/null
 +++ b/net/netfilter/nf_tables_port_probe.c
-@@ -0,0 +1,2349 @@
+@@ -0,0 +1,2365 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Whether nf_tables could tell two UDP streams apart by their ports.
@@ -3443,9 +3473,12 @@ index 000000000000..3ab80ef7f49d
 +			return NFT_PROBE_CT_UNKNOWN;
 +		return NFT_PROBE_CT_PRESENT;
 +	case NFT_PROBE_EGRESS:
-+		/* Whether conntrack runs for the family is not the netdev
-+		 * table's to say.
++		/* Nothing conntracks what a bridge forwards. Otherwise, whether
++		 * conntrack runs for the family is not the netdev table's to
++		 * say.
 +		 */
++		if (ctx->probe->bridged)
++			return NFT_PROBE_CT_ABSENT;
 +		return NFT_PROBE_CT_UNKNOWN;
 +	default:
 +		return NFT_PROBE_CT_PRESENT;
@@ -3678,8 +3711,8 @@ index 000000000000..3ab80ef7f49d
 +
 +/* Follow one packet of the stream: ingress up the input's stack and
 + * prerouting once, then forward, postrouting and egress down each output's
-+ * stack for each copy. Returns the conntrack mark the packet leaves on the
-+ * entry.
++ * stack for each copy -- for a bridged stream, ingress and egress alone.
++ * Returns the conntrack mark the packet leaves on the entry.
 + */
 +static u32 nft_probe_packet(struct nft_probe_ctx *ctx, u32 ctmark)
 +{
@@ -3699,9 +3732,11 @@ index 000000000000..3ab80ef7f49d
 +	nft_probe_hook(ctx, NFT_PROBE_INGRESS, p->in, NULL, 0);
 +	if (ctx->stop)
 +		return ctmark;
-+	nft_probe_hook(ctx, NFT_PROBE_PRE, p->in, NULL, 0);
-+	if (ctx->stop)
-+		return ctmark;
++	if (!p->bridged) {
++		nft_probe_hook(ctx, NFT_PROBE_PRE, p->in, NULL, 0);
++		if (ctx->stop)
++			return ctmark;
++	}
 +	if (!ctx->steady)
 +		ctx->nat_pre = ctx->st.flags & NFT_PROBE_DNAT;
 +
@@ -3714,13 +3749,15 @@ index 000000000000..3ab80ef7f49d
 +		ctx->saddr_known = saddr_known;
 +		ctx->daddr_known = daddr_known;
 +
-+		nft_probe_hook(ctx, NFT_PROBE_FORWARD, p->in, p->out[i], i);
-+		if (ctx->stop)
-+			return ctmark;
-+		nft_probe_hook(ctx, NFT_PROBE_POST, NULL, p->out[i], i);
-+		if (ctx->stop)
-+			return ctmark;
-+		if (!ctx->steady) {
++		if (!p->bridged) {
++			nft_probe_hook(ctx, NFT_PROBE_FORWARD, p->in, p->out[i], i);
++			if (ctx->stop)
++				return ctmark;
++			nft_probe_hook(ctx, NFT_PROBE_POST, NULL, p->out[i], i);
++			if (ctx->stop)
++				return ctmark;
++		}
++		if (!p->bridged && !ctx->steady) {
 +			ctx->nat_post[i] = ctx->st.flags & NFT_PROBE_SNAT;
 +			/* The copies share one entry: the NAT chains of the
 +			 * first one out bind it for all, and which copy is
@@ -3767,7 +3804,10 @@ index 000000000000..3ab80ef7f49d
 +		left = nft_probe_packet(ctx, ctmark);
 +		if (ctx->stop)
 +			return;
-+		if (!ctx->steady && ctx->bridged) {
++		/* A bridged stream's caller rules the bridge's own hooks out
++		 * itself, by the hooks a forwarded frame crosses.
++		 */
++		if (!ctx->steady && ctx->bridged && !ctx->probe->bridged) {
 +			nft_probe_bridge_chains(ctx);
 +			if (ctx->stop)
 +				return;
@@ -3792,8 +3832,10 @@ index 000000000000..3ab80ef7f49d
 + * are netdev ingress on the input device and the devices below it,
 + * prerouting (filter and NAT alike), then forward, postrouting and netdev
 + * egress on each output and the devices below it; ip or ip6 tables as the
-+ * family says, and inet ones. The first packet of the stream is followed,
-+ * then later ones as far as NAT chains and conntrack marks make them differ.
++ * family says, and inet ones. For a bridged stream (@probe->bridged), netdev
++ * ingress and egress alone, with no conntrack attached, and no output needed.
++ * The first packet of the stream is followed, then later ones as far as NAT
++ * chains and conntrack marks make them differ.
 + *
 + * Return: 0 when every path accepts the stream at every hook, for every
 + * output, with the same effects and no translation; 1 when two streams
@@ -3802,7 +3844,8 @@ index 000000000000..3ab80ef7f49d
 + * follow, or when something they cross is not modelled; negative when the
 + * ruleset could not be judged -- more work than the bounds allow (-E2BIG), a
 + * commit before or during the walk (-EAGAIN), no memory -- or the probe is
-+ * malformed, no outputs included (-EINVAL). Callers treat negative as 1.
++ * malformed, a routed stream with no outputs included (-EINVAL). Callers
++ * treat negative as 1.
 + *
 + * Context: process or softirq, under rcu_read_lock(); it does not sleep. The
 + * answer is for the ruleset generation it ran against, which no commit
@@ -3818,10 +3861,13 @@ index 000000000000..3ab80ef7f49d
 +	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
 +			 "ruleset probed outside rcu_read_lock()");
 +
-+	/* A stream that leaves nowhere is not one to judge. */
++	/* A routed stream that leaves nowhere is not one to judge. A bridged
++	 * one the bridge forwards nowhere still crosses the input's hooks.
++	 */
 +	if (!probe || !probe->in ||
 +	    (probe->family != NFPROTO_IPV4 && probe->family != NFPROTO_IPV6) ||
-+	    !probe->nout || probe->nout > NFT_PROBE_MAX_OUT || !probe->out)
++	    (!probe->nout && !probe->bridged) ||
++	    probe->nout > NFT_PROBE_MAX_OUT || (probe->nout && !probe->out))
 +		return -EINVAL;
 +	for (i = 0; i < probe->nout; i++)
 +		if (!probe->out[i])

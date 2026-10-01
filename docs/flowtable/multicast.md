@@ -658,10 +658,69 @@ an nftables bridge base chain even when it is empty with an accept policy.
 per-namespace sysctls live in its own private state and the per-bridge option
 in the bridge's, neither of which a module can read, and its hooks cannot be
 told from an nftables chain at the same priority; the setting also defaults to
-on. A host that wants bridged multicast offloaded unloads it. Hooks the check
-does not see at all: an nftables `netdev` ingress chain and a tc ingress
-filter on a bridge port run before the bridge and are bypassed by a carried
-flow like any other software step.
+on. A host that wants bridged multicast offloaded unloads it.
+
+**What runs on the ports themselves.** A bridge port's frames cross more than
+the bridge's hooks. tc runs on every port's way in and way out, and so does
+netfilter at the port's own `netdev` hooks. Both run on every frame the bridge
+forwards in software and on none an installed entry replicates. An entry's key
+stops at the addresses, so a filter that drops one UDP port of a group would
+be bypassed for every port of it once the group is carried.
+
+A flow therefore stays in software while either runs anything where the flow
+arrives or where a bridged copy leaves:
+
+- **Where it arrives:** a tc ingress or clsact filter, a tcx program or an XDP
+  program on the ingress port, or an nftables `netdev` ingress chain (or an
+  `inet` one at ingress).
+- **Where a copy leaves:** a tc egress filter, a filter on any class of the
+  port's qdisc tree, or a `netdev` egress chain.
+- **Where the bridge hands it up:** for a flow the bridge also hands up to the
+  host as a multicast router or a promiscuous bridge, the copy it hands up
+  crosses the bridge's own `input` hook, the bridge device's ingress and that
+  of every device above it (a VLAN device, a macvlan). A frame the bridge
+  forwards crosses nothing else of the bridge device's, and the bridge's ports,
+  below it, are each judged on their own.
+
+tc uses the routed learner's own predicate (`ft_dev_stack_tc_soft()`): a filter
+that skips software, or one the hardware applies as it is, counts for nothing,
+and `/proc` says `refused-tc`. A port's `netdev` chains are judged the way the
+routed learner judges its groups', by `nft_port_dependent()` (patch 148). The
+flow is asked about as a bridged stream, which walks netdev ingress up the
+input's stack and netdev egress down each listener port's, with no conntrack
+and no x_tables. The bridge's own chains are left to the learner, which knows
+which bridge hooks a forwarded frame crosses. Only a chain that could tell the
+group's streams apart by port, drop them or translate them refuses the flow,
+and `/proc` says `refused-filter`, as for a bridge hook. A chain that only
+counts them or never looks at them keeps nothing out: the rig's own per-port
+CPU counter and its quiet chain are both of that kind. A walk a commit
+interrupted, or that found no memory, keeps the flow's last answer for the
+same listener ports until the next refresh; a flow with none, or with new
+ports, stays out. A ruleset the walk could not judge refuses the flow and
+counts in `mcast_port_probe_errors`. Where the bridge hands a flow up, any
+chain counts, asked by hook type, and so does any bridge `input` chain. A
+flowtable's hook (fw4's and the offload service's) sits at the same ingress
+hooks and counts nowhere: it acts only on the conntrack flows a rule offered
+it, and 6.12 gives it no type. Patch 148 types the hook a chain update adds for
+another device, as a chain's first ones already are, so a chain extended onto
+the bridge later is found too. A discard is refused the same way: the bridge
+drops the stream only after tc and a `netdev` ingress chain have run on it, and
+a tc mirror, redirect or police there, or a chain that could tell its streams
+apart, would stop seeing it.
+
+The worker asks tc about every bridge and bridge port under RTNL before it
+takes the learner's lock, never under it. Walking a tc filter block can drop
+the last reference to a classifier being deleted. Its destruction can reach
+the egress hook, which takes that lock. The chains are walked under RCU.
+Nothing reports a filter or a chain added or removed, so the refresh asks
+every flow again every five seconds. If there is no memory for the table of
+what each port runs, the pass derives nothing and the flows wait for the next.
+
+The rig cases `test_flowtable_service_multicast_bridge_yields_to_tc` and
+`..._yields_to_a_netdev_chain` drop one of two UDP ports of a carried group,
+first at the WAN port's ingress and then at the set-top box port's egress. Each
+time the flow comes out and the dropped port stops arriving while the other is
+still delivered. Both are carried again once the filter or the table goes.
 
 **The global switch.** Multicast acceleration, bridged and routed together, is
 on or off as a whole: `/sys/module/ask_flowtable/parameters/multicast`, `Y` at
@@ -948,6 +1007,33 @@ groups are marked offloaded.
 
 This is the first step that makes an observable promise, so this is where the
 failing test comes first.
+
+The hook runs in softirq. It records into a small ring and wakes the worker,
+and every pass of the worker takes the transaction. While any membership or
+route stands, the hook stays registered and every frame of every multicast
+stream on the bridge reaches it. That includes streams the worker can do
+nothing with: one nobody joined, a source turned away at the group's flow cap,
+a flow refused. So the hook remembers what it recorded and records a stream
+again only when something forgets it, that is, when a change may have altered
+the answer the stream got. A flow nothing has installed takes the shape a new
+frame arrives in. Only the old shape's own record lapses then, an interval
+after it was made, so a stream arriving in two shapes at once is not news on
+every frame.
+
+The records are a 64 × 4 set-associative table, set by a seeded hash of the
+stream. A new stream takes a free slot, or the slot recorded longest ago, but
+only one at least a refresh interval old. If none is that old, the frame
+waits, counted in `mcast_deferred`, and its next frame asks again. So
+however many streams share a set, it records at most four of them per
+interval. A stream waits only while every slot of its set is younger than
+that, and a slot that lapses goes to the first frame that asks for it. With
+more streams than slots in one set, which the hash makes rare, each gets a
+slot within a few intervals. `/proc` counts the worker's runs as
+`mcast_passes`. The rig case
+`test_flowtable_service_multicast_bridge_unwanted_streams_wake_it_once`
+interleaves 32 unjoined streams at about 1 kpps. Each is recorded once
+(`mcast_observed`), and the worker runs about once per stream rather than
+once per frame.
 
 ### 7. Retirement
 

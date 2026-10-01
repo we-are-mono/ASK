@@ -5172,6 +5172,13 @@ struct ft_mc_flow {
 	unsigned int local;
 	int error;
 	bool derived;
+	/* tc runs something in software where the flow's frames arrive, where a
+	 * copy of them leaves, or where the bridge hands them up; and a netdev
+	 * chain there could tell its streams apart, or any netfilter hook sees
+	 * what the bridge hands up. Asked with the rest of the answer; see what
+	 * runs in software on a bridged flow's ports. */
+	bool tc_soft;
+	bool nf_hooked;
 	/* The routed half of the flow's stream; see the section on the
 	 * learners' streams above. `route` is the published route whose
 	 * source and bridge VLAN are this flow's, matched by the worker and
@@ -5251,6 +5258,10 @@ static unsigned int ft_mc_discarding;
  * wants; see ft_mc_evict_discard(). Under the transaction. */
 static u64 ft_mc_discards_evicted;
 static u64 ft_mc_refused, ft_mc_install_errors;
+/* Netdev chains nft_port_dependent() could not judge for a flow -- too large
+ * for its bounds, or a probe it refused -- each of which kept the flow in
+ * software. */
+static u64 ft_mc_port_probe_errors;
 /* Installed groups of either learner marked for a rebuild because a port they
  * copy out of changed its egress; see ft_mc_egress_changed(). A build racing
  * the change compares ft_egress_changes instead. */
@@ -5948,13 +5959,16 @@ static bool ft_mc_host_wants(const struct ft_mc_flow *f)
  * forwards nowhere -- every listener is behind the port it arrives on, or
  * blocks its source -- has nothing to replicate: it stays with the bridge,
  * which drops it. And no flow is carried while a bridge filter hook would see
- * its frames; see ft_mc_bridge_filtered(). Nor while multicast acceleration
- * is switched off; see ft_mc_enabled. */
+ * its frames; see ft_mc_bridge_filtered(). Nor while tc or a netdev chain
+ * runs anything in software where it arrives or where a copy leaves; see what
+ * runs in software on a bridged flow's ports. Nor while multicast
+ * acceleration is switched off; see ft_mc_enabled. */
 static bool ft_mc_installable(const struct ft_mc_flow *f)
 {
 	const struct ft_mc_route *r = ft_mc_live_route(f);
 
 	return READ_ONCE(ft_mc_enabled) && !ft_mc_filtered &&
+	       !f->tc_soft && !f->nf_hooked &&
 	       f->derived && f->in && !f->gone && !ft_mc_host_wants(f) &&
 	       (f->ports || r) && (r || !f->routed_host) &&
 	       ft_mc_carriable(f) && ft_mc_mtu_bounded(f);
@@ -5970,10 +5984,14 @@ static bool ft_mc_installable(const struct ft_mc_flow *f)
  * the ingress not forwarding -- is not a drop. Nothing else may want the
  * frames either: no port, no route riding the flow, no reason at all to hand
  * them up to the host, not even one only a VIF would act on, and nothing that
- * refuses every flow. Called with ft_mc_lock held. */
+ * refuses every flow. Nor tc where they arrive, which runs before the bridge
+ * drops them -- a mirror, a redirect or a police would stop seeing the stream
+ * -- nor a netdev chain there that could tell its streams apart. Called with
+ * ft_mc_lock held. */
 static bool ft_mc_discardable(const struct ft_mc_flow *f)
 {
 	return READ_ONCE(ft_mc_enabled) && !ft_mc_filtered &&
+	       !f->tc_soft && !f->nf_hooked &&
 	       f->derived && f->in && !f->gone && !f->error &&
 	       !f->ports && !f->routed_host && !ft_mc_live_route(f) &&
 	       f->local == BR_MCAST_SNOOPED;
@@ -6231,8 +6249,12 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 		 * freshly created mdb entry, so the host membership is emitted
 		 * *before* any port group for that address. */
 		if (!adding) {
-			if (g)
+			/* A source turned away while the host's join refused
+			 * the group may be one a flow is learned from now. */
+			if (g && g->host) {
 				g->host = false;
+				ft_mc_forget_seen();
+			}
 			return false;
 		}
 		if (!g)
@@ -6312,23 +6334,50 @@ struct ft_mc_seen {
 static struct ft_mc_seen ft_mc_ring[FT_MC_RING];
 static unsigned int ft_mc_ring_head, ft_mc_ring_tail;
 static DEFINE_SPINLOCK(ft_mc_ring_lock);
-/* The last few things recorded, so streams at line rate do not fill the ring
- * with restatements of the same facts between two runs of the worker. Several,
- * because the hook stays registered while flows are refused: two refused
- * streams interleaving would otherwise each restate itself on every frame.
+/* What was recorded, so streams at line rate do not fill the ring with
+ * restatements of the same facts between two runs of the worker -- and so
+ * streams the worker can do nothing with do not wake it on every frame. The
+ * hook stays registered while any membership or route stands, and a stream
+ * nothing names, one turned away at FT_MC_MAX_FLOWS, a flow refused, each
+ * reaches it on every frame; every fact recorded is a pass of the worker,
+ * which takes the transaction. So there are slots for as many streams as a
+ * LAN sends, not only the last few: more streams interleaving than the slots
+ * hold would push each other out, and each would be news on every frame.
  *
  * That makes them a promise as well as a filter: the same frame is not
- * recorded again until the slots are forgotten, however long the stream runs.
- * So they are forgotten (ft_mc_forget_seen()) whenever the answer a recorded
- * frame got may have changed -- a membership or a route created that could
- * now name it, a flow retired, an entry taken out of hardware -- and at no
- * other time: forgetting them after every drain would record every frame of a
- * stream that never installs. A cleared slot names ifindex zero, which no
- * frame arrives on. */
-#define FT_MC_SEEN_SLOTS 8
-static struct ft_mc_seen ft_mc_last[FT_MC_SEEN_SLOTS];
-static unsigned int ft_mc_last_next;
-static u64 ft_mc_observed, ft_mc_dropped, ft_mc_hook_errors;
+ * recorded again, however long the stream runs, until the slots are forgotten
+ * or its slot goes to another fact. So they are forgotten (ft_mc_forget_seen())
+ * whenever the answer a recorded frame got may have changed -- a membership or
+ * a route created that could now name it, a flow retired, an entry taken out
+ * of hardware -- and at no other time: forgetting them after every drain would
+ * record every frame of a stream that never installs. A change that concerns
+ * one fact supersedes its slot alone (ft_mc_supersede()). A cleared slot names
+ * ifindex zero, which no frame arrives on.
+ *
+ * A fact is kept in one set of slots, chosen by a seeded hash of its stream,
+ * and takes a free slot there or the one recorded longest ago -- but only one
+ * recorded at least a refresh interval ago. Facts that each took their slot
+ * within the interval are not pushed out by a newer one, which would make
+ * them news again on their next frame; the newer one waits, counted in
+ * mcast_deferred, and its next frame asks again. However many streams share a
+ * set, it records no more facts in an interval than it has slots. A stream
+ * waits only while every slot of its set holds a fact younger than that, and
+ * a slot that lapses goes to the first frame that asks for it: with more
+ * streams than slots in a set, each takes a slot within a few intervals. */
+#define FT_MC_SEEN_SETS 64
+#define FT_MC_SEEN_WAYS 4
+struct ft_mc_seen_slot {
+	struct ft_mc_seen seen;
+	/* When it was recorded, and whether the answer it got has since
+	 * changed in a way only its next frame can tell: it then lapses an
+	 * interval after it was recorded, and that frame is recorded again. */
+	unsigned long at;
+	bool superseded;
+};
+static struct ft_mc_seen_slot ft_mc_last[FT_MC_SEEN_SETS][FT_MC_SEEN_WAYS];
+static u64 ft_mc_observed, ft_mc_dropped, ft_mc_deferred, ft_mc_hook_errors;
+/* Runs of the worker. */
+static u64 ft_mc_passes;
 static bool ft_mc_hooked;
 static DEFINE_MUTEX(ft_mc_hook_lock);
 
@@ -6353,6 +6402,62 @@ static bool ft_mc_seen_eq(const struct ft_mc_seen *a, const struct ft_mc_seen *b
 	       ether_addr_equal(a->dst_mac, b->dst_mac) &&
 	       ether_addr_equal(a->src_mac, b->src_mac) &&
 	       a->tagged == b->tagged;
+}
+
+/* The set of slots a fact is kept in: by its stream -- the port, the VLAN, the
+ * group and the source -- under the adapter's seed, so no sender can choose
+ * the streams that share one. */
+static unsigned int ft_mc_seen_set(const struct ft_mc_seen *seen)
+{
+	u32 key[2 + 2 * sizeof(seen->src) / sizeof(u32)];
+
+	BUILD_BUG_ON(sizeof(seen->addr.dst) != sizeof(seen->src));
+	BUILD_BUG_ON(FT_MC_SEEN_SETS & (FT_MC_SEEN_SETS - 1));
+	key[0] = seen->in_ifindex;
+	key[1] = seen->addr.vid;
+	memcpy(key + 2, &seen->addr.dst, sizeof(seen->addr.dst));
+	memcpy(key + 2 + sizeof(seen->src) / sizeof(u32), &seen->src, sizeof(seen->src));
+	return jhash2(key, ARRAY_SIZE(key), ft_hash_seed) & (FT_MC_SEEN_SETS - 1);
+}
+
+/* The answer `seen` got has changed, and only its next frame can say whether
+ * it still holds: its slot lapses an interval after it was recorded, and the
+ * next frame after that is recorded again. Not sooner, and not by forgetting
+ * every slot: a stream that arrives in two shapes at once -- two senders of
+ * one source, a port carrying it both tagged and untagged -- would otherwise
+ * be news on every frame, and make every other stream news with it. Called
+ * with ft_mc_lock held. */
+static void ft_mc_supersede(const struct ft_mc_seen *seen)
+{
+	struct ft_mc_seen_slot *set = ft_mc_last[ft_mc_seen_set(seen)];
+	unsigned int i;
+
+	lockdep_assert_held(&ft_mc_lock);
+	spin_lock_bh(&ft_mc_ring_lock);
+	for (i = 0; i < FT_MC_SEEN_WAYS; i++)
+		if (ft_mc_seen_eq(seen, &set[i].seen))
+			set[i].superseded = true;
+	spin_unlock_bh(&ft_mc_ring_lock);
+}
+
+/* What the hook records for a frame of `f` in `shape`: the inverse of
+ * ft_mc_seen_key(), byte for byte, so it finds the slot that frame took. */
+static void ft_mc_flow_seen(const struct ft_mc_flow *f,
+			    const struct ft_mc_stream *shape,
+			    struct ft_mc_seen *seen)
+{
+	memset(seen, 0, sizeof(*seen));
+	seen->bridge_ifindex = f->bridge->ifindex;
+	seen->in_ifindex = f->in->ifindex;
+	seen->addr = f->addr;
+	memset(&seen->addr.src, 0, sizeof(seen->addr.src));
+	if (f->addr.proto == htons(ETH_P_IPV6))
+		seen->src.in6 = f->addr.src.ip6;
+	else
+		seen->src.ip = f->addr.src.ip4;
+	ether_addr_copy(seen->dst_mac, shape->dst_mac);
+	ether_addr_copy(seen->src_mac, shape->src_mac);
+	seen->tagged = shape->tagged;
 }
 
 /* The VLAN this frame is on, as the bridge will resolve it a moment later in
@@ -6388,18 +6493,41 @@ static u16 ft_mc_frame_vid(struct net_device *bridge, struct net_device *port,
 	return vid;
 }
 
-/* Put one observation in the ring for the worker, unless it restates one of
- * the last recorded or the ring is full. Returns whether it was recorded.
- * Called from the hook, in softirq. */
+/* Put one observation in the ring for the worker, unless it restates one
+ * recorded, its set of slots has none to give it yet, or the ring is full.
+ * Returns whether it was recorded. Called from the hook, in softirq. */
 static bool ft_mc_record(const struct ft_mc_seen *seen)
 {
-	bool recorded = false;
+	struct ft_mc_seen_slot *set = ft_mc_last[ft_mc_seen_set(seen)];
+	struct ft_mc_seen_slot *slot = NULL;
+	unsigned long now = jiffies;
+	bool recorded = false, again = false;
 	unsigned int next, i;
 
 	spin_lock(&ft_mc_ring_lock);
-	for (i = 0; i < FT_MC_SEEN_SLOTS; i++)
-		if (ft_mc_seen_eq(seen, &ft_mc_last[i]))
-			goto out;	/* recorded already, and nothing has changed since */
+	for (i = 0; i < FT_MC_SEEN_WAYS; i++) {
+		struct ft_mc_seen_slot *s = &set[i];
+
+		if (ft_mc_seen_eq(seen, &s->seen)) {
+			/* Recorded already, and nothing has changed since --
+			 * or something has, and the record has not lapsed. */
+			if (!s->superseded ||
+			    time_before(now, s->at + FT_MC_REFRESH_INTERVAL))
+				goto out;
+			slot = s;
+			again = true;
+			break;
+		}
+		/* A free slot first, then the one recorded longest ago. */
+		if (!slot || (slot->seen.in_ifindex &&
+			      (!s->seen.in_ifindex || time_before(s->at, slot->at))))
+			slot = s;
+	}
+	if (!again && slot->seen.in_ifindex &&
+	    time_before(now, slot->at + FT_MC_REFRESH_INTERVAL)) {
+		ft_mc_deferred++;
+		goto out;
+	}
 	next = (ft_mc_ring_head + 1) % FT_MC_RING;
 	if (next == ft_mc_ring_tail) {
 		ft_mc_dropped++;
@@ -6407,8 +6535,9 @@ static bool ft_mc_record(const struct ft_mc_seen *seen)
 	}
 	ft_mc_ring[ft_mc_ring_head] = *seen;
 	ft_mc_ring_head = next;
-	ft_mc_last[ft_mc_last_next] = *seen;
-	ft_mc_last_next = (ft_mc_last_next + 1) % FT_MC_SEEN_SLOTS;
+	slot->seen = *seen;
+	slot->at = now;
+	slot->superseded = false;
 	ft_mc_observed++;
 	recorded = true;
 	schedule_work(&ft_mc_work);
@@ -6575,6 +6704,36 @@ static bool ft_bridge_hooked(unsigned int hooks)
 				hooked = true;
 				break;
 			}
+	}
+	rcu_read_unlock();
+	return hooked;
+#else
+	return false;
+#endif
+}
+
+/* Whether netfilter runs a chain on what `dev` receives, at its own netdev
+ * ingress hook: an nftables netdev chain, or an inet one at ingress -- and a
+ * netfilter BPF program, which 6.12 attaches to no netdev hook but would read
+ * what it liked. A flowtable's hook, the one other user of the hook, does not
+ * count: it acts only on the conntrack flows a rule offered it. Asked by type,
+ * as nfnetlink_hook tells them apart, rather than by excluding the
+ * flowtable's, which this kernel does not label. Under RCU or RTNL. */
+static bool ft_dev_nf_ingress_hooked(const struct net_device *dev)
+{
+#if IS_ENABLED(CONFIG_NETFILTER_INGRESS)
+	const struct nf_hook_entries *e;
+	struct nf_hook_ops **ops;
+	bool hooked = false;
+	unsigned int i;
+
+	rcu_read_lock();
+	e = rcu_dereference(dev->nf_hooks_ingress);
+	if (e) {
+		ops = nf_hook_entries_get_hook_ops(e);
+		for (i = 0; i < e->num_hook_entries && !hooked; i++)
+			hooked = ops[i]->hook_ops_type == NF_HOOK_OP_NF_TABLES ||
+				 ops[i]->hook_ops_type == NF_HOOK_OP_BPF;
 	}
 	rcu_read_unlock();
 	return hooked;
@@ -6785,6 +6944,7 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 {
 	bool counted = false, shared = false;
 	struct net_device *bridge, *in;
+	struct ft_mc_seen other;
 	struct ft_mc_flow *f, *o;
 	unsigned int flows = 0;
 	struct br_ip key;
@@ -6825,8 +6985,20 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 		}
 		/* With nothing installed there is nothing to wait for: the flow
 		 * takes the shape it is seen in, and one kept from an installed
-		 * phase is stale. The shape it had is a different answer now,
-		 * and its next frame has to be able to say so. */
+		 * phase is stale. The shape it had, and the one it kept, are a
+		 * different answer now, and their next frames have to be able
+		 * to say so. */
+		other = *seen;
+		ether_addr_copy(other.dst_mac, f->dst_mac);
+		ether_addr_copy(other.src_mac, f->src_mac);
+		other.tagged = f->in_tagged;
+		ft_mc_supersede(&other);
+		if (f->has_next && !ft_mc_same_shape(&f->next, seen)) {
+			ether_addr_copy(other.dst_mac, f->next.dst_mac);
+			ether_addr_copy(other.src_mac, f->next.src_mac);
+			other.tagged = f->next.tagged;
+			ft_mc_supersede(&other);
+		}
 		ft_mc_drop_next(f);
 		if (seen->tagged != f->in_tagged)
 			f->dirty = true;
@@ -6835,7 +7007,6 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 		f->in_tagged = seen->tagged;
 		f->retries = 0;
 		f->stale = true;
-		ft_mc_forget_seen();
 		return;
 	}
 
@@ -6898,8 +7069,10 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 	f = kzalloc(sizeof(*f), GFP_KERNEL);
 	if (!f) {
 		dev_put(in);
-		/* Nothing else would ask for the frame again. */
-		ft_mc_forget_seen();
+		/* Nothing else would ask for the frame again: its record
+		 * lapses, rather than every record now, which a run of
+		 * failures would make news on every frame. */
+		ft_mc_supersede(seen);
 		return;
 	}
 	dev_hold(bridge);
@@ -6977,6 +7150,187 @@ static bool ft_mc_listeners_same(const struct cdx_mc_listener *a,
 	return true;
 }
 
+/* ---- what runs in software on a bridged flow's ports -----------------------
+ *
+ * A bridge port's frames cross more than the bridge's own hooks. tc runs on
+ * the way in and on the way out of every port, and so does netfilter at the
+ * port's own netdev hooks: on every frame the bridge forwards in software, and
+ * on none an installed entry replicates. And the entry's key, which stops at
+ * the addresses, cannot tell apart what a filter there reads -- the UDP port
+ * above all: one filter dropping one port of a group would be bypassed for
+ * every port of it.
+ *
+ * tc keeps a flow in software, refused-tc, while it runs anything in software
+ * where the flow arrives -- a filter, a tcx program, XDP -- or where a bridged
+ * copy leaves, by the routed learner's own predicate, ft_dev_stack_tc_soft().
+ * A netdev chain -- or an inet one at ingress -- is judged as the routed
+ * learner judges its groups', by nft_port_dependent() asked about a bridged
+ * stream: the chains of the input's stack at ingress and of each output's at
+ * egress, refusing only what could tell the group's streams apart, drop them
+ * or translate them. One that only counts them, or never looks at them, keeps
+ * nothing out, and nor does a flowtable's hook, which is no chain. That is
+ * refused-filter, as a bridge hook is.
+ *
+ * And the bridge's own way in, for a flow the bridge also hands up to the host
+ * as a multicast router or a promiscuous bridge does: the copy it hands up
+ * crosses the bridge device and a VLAN device above it, and a carried flow
+ * takes that copy away, so anything tc or a chain runs there keeps the flow
+ * out. Only those devices: what the ports below the bridge run is the ports'
+ * own question, and a frame the bridge forwards crosses nothing of the bridge
+ * device's. Nothing reports a filter or a chain added or removed; the refresh
+ * asks every flow again.
+ *
+ * tc is asked of every bridge and bridge port under RTNL before the derivation
+ * takes ft_mc_lock, and never under it: walking a tc block can drop the last
+ * reference to a classifier being deleted, whose destruction can reach the
+ * egress hook, ft_egress_changed(), and through it ft_mc_egress_mark(), which
+ * takes ft_mc_lock. The chains are walked under RCU, which no lock minds.
+ */
+struct ft_mc_soft_dev {
+	const struct net_device *dev;
+	/* A port's tc on what it receives and what it sends, the devices
+	 * below it included; a bridge's on what it hands up, and netfilter's
+	 * there, it and the VLAN devices above it. */
+	bool tc_in;
+	bool tc_out;
+	bool nf_in;
+};
+
+struct ft_mc_soft {
+	struct ft_mc_soft_dev *dev;
+	unsigned int devs;
+};
+
+/* With the routed learner, below. */
+static bool ft_dev_tc_soft(struct net_device *dev, bool ingress);
+static bool ft_dev_stack_tc_soft(struct net_device *dev, bool ingress);
+
+static bool ft_mc_soft_bridged(const struct net_device *dev)
+{
+	return netif_is_bridge_port(dev) || netif_is_bridge_master(dev);
+}
+
+/* What a bridge's hand-up copy crosses: the bridge's own LOCAL_IN hook, the
+ * bridge device's way in, and that of the devices above it -- a VLAN device, a
+ * macvlan -- which the receive path hands it on to. Under RTNL, which keeps
+ * the upper list as RCU would, and lets the tc walk sleep. */
+static void ft_mc_soft_bridge(struct ft_mc_soft_dev *d, struct net_device *br)
+{
+	struct net_device *upper;
+	struct list_head *iter;
+
+	ASSERT_RTNL();
+	d->tc_in = ft_dev_tc_soft(br, true);
+	d->nf_in = ft_dev_nf_ingress_hooked(br) ||
+		   ft_bridge_hooked(BIT(NF_BR_LOCAL_IN));
+	netdev_for_each_upper_dev_rcu(br, upper, iter) {
+		d->tc_in |= ft_dev_tc_soft(upper, true);
+		d->nf_in |= ft_dev_nf_ingress_hooked(upper);
+	}
+}
+
+/* Ask about every bridge and bridge port. Returns false when there was no
+ * memory for the table: the derivation waits for a pass that can ask, rather
+ * than take every flow out of hardware for want of an answer. Called by the
+ * worker with RTNL held and no learner lock; ft_mc_soft_free() lets the table
+ * go. */
+static bool ft_mc_soft_ask(struct ft_mc_soft *soft)
+{
+	struct ft_mc_soft_dev *d;
+	struct net_device *dev;
+	unsigned int n = 0;
+
+	ASSERT_RTNL();
+	soft->devs = 0;
+	for_each_netdev(&init_net, dev)
+		n += ft_mc_soft_bridged(dev);
+	soft->dev = n ? kcalloc(n, sizeof(*soft->dev), GFP_KERNEL) : NULL;
+	if (n && !soft->dev)
+		return false;
+	for_each_netdev(&init_net, dev) {
+		if (!ft_mc_soft_bridged(dev) || soft->devs == n)
+			continue;
+		d = &soft->dev[soft->devs++];
+		d->dev = dev;
+		if (netif_is_bridge_master(dev)) {
+			ft_mc_soft_bridge(d, dev);
+			continue;
+		}
+		d->tc_in = ft_dev_stack_tc_soft(dev, true);
+		d->tc_out = ft_dev_stack_tc_soft(dev, false);
+	}
+	return true;
+}
+
+static void ft_mc_soft_free(struct ft_mc_soft *soft)
+{
+	kfree(soft->dev);
+	soft->dev = NULL;
+	soft->devs = 0;
+}
+
+/* Add what the table says runs in software on what `dev` receives, or sends:
+ * tc to *tc, a bridge's netfilter to *nf. A device the table does not name is
+ * one nothing can be said of. */
+static void ft_mc_soft_on(const struct ft_mc_soft *soft, const struct net_device *dev,
+			  bool ingress, bool *tc, bool *nf)
+{
+	const struct ft_mc_soft_dev *d;
+	unsigned int i;
+
+	for (i = 0; i < soft->devs; i++) {
+		d = &soft->dev[i];
+		if (d->dev != dev)
+			continue;
+		*tc |= ingress ? d->tc_in : d->tc_out;
+		*nf |= ingress && d->nf_in;
+		return;
+	}
+	*tc = *nf = true;
+}
+
+/* Whether a netdev chain where the flow's frames arrive, or where a copy
+ * leaves, could tell its streams apart -- by their ports above all -- drop
+ * them or translate them, as the routed learner asks of its groups. A walk a
+ * commit interrupted, or that found no memory, says nothing: the flow keeps
+ * the answer it had for the same ports (`same`), or is refused, until the
+ * refresh asks again. Called with RTNL and ft_mc_lock held; the walk takes
+ * neither, and does not sleep. */
+static bool ft_mc_netdev_dependent(const struct ft_mc_flow *f,
+				   const struct cdx_mc_listener *port, u8 ports,
+				   bool same)
+{
+	const struct net_device *out[CDX_MC_MAX_LISTENERS];
+	struct nft_port_probe probe = {
+		.in = f->in,
+		.out = out,
+		.nout = ports,
+		.bridged = true,
+	};
+	int rc;
+	u8 i;
+
+	if (ft_mc_family(&f->addr) == AF_INET6) {
+		probe.family = NFPROTO_IPV6;
+		probe.saddr.in6 = f->addr.src.ip6;
+		probe.daddr.in6 = f->addr.dst.ip6;
+	} else {
+		probe.family = NFPROTO_IPV4;
+		probe.saddr.ip = f->addr.src.ip4;
+		probe.daddr.ip = f->addr.dst.ip4;
+	}
+	for (i = 0; i < ports; i++)
+		out[i] = port[i].dev;
+	rcu_read_lock();
+	rc = nft_port_dependent(&init_net, &probe);
+	rcu_read_unlock();
+	if (rc == -EAGAIN || rc == -ENOMEM)
+		return !same || f->nf_hooked;
+	if (rc < 0)
+		ft_mc_port_probe_errors++;
+	return rc != 0;
+}
+
 /* Ask the bridge what it does with this flow's frames, and keep the answer.
  *
  * br_multicast_list_ports() models the bridge's own receive path for a frame
@@ -6995,12 +7349,15 @@ static bool ft_mc_listeners_same(const struct cdx_mc_listener *a,
  *
  * Called from the worker with RTNL, which the snapshot and the bridge VLAN
  * lookups need, and then ft_mc_lock -- the order the switchdev handler takes
- * them in. The ports the bridge names are borrowed until RTNL is released;
- * the flow pins the ones it keeps. */
-static void ft_mc_flow_derive(struct ft_mc_flow *f)
+ * them in -- with what runs in software on the ports, asked under the same
+ * RTNL before the lock. The ports the bridge names are borrowed until RTNL is
+ * released; the flow pins the ones it keeps. */
+static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *soft)
 {
 	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
 	struct cdx_mc_listener port[CDX_MC_MAX_LISTENERS];
+	bool tc_soft = false, nf_hooked = false, same;
+	struct ft_mc_seen seen;
 	unsigned int local = 0;
 	int n, error = 0;
 	u8 ports = 0, i;
@@ -7017,8 +7374,13 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f)
 		return;
 	}
 	if (f->has_next &&
-	    !ft_mc_shape_resolves(f->bridge, f->in, f->next.tagged, f->addr.vid))
+	    !ft_mc_shape_resolves(f->bridge, f->in, f->next.tagged, f->addr.vid)) {
+		/* Its frames are another VLAN's now; should they become this
+		 * one's again, they have to be able to say so. */
+		ft_mc_flow_seen(f, &f->next, &seen);
+		ft_mc_supersede(&seen);
 		ft_mc_drop_next(f);
+	}
 	/* Read at every derivation, and so followed within a refresh when
 	 * whoever configures the bridge changes it; it changes nothing the
 	 * hardware holds. Never shorter than two refreshes: the count is read
@@ -7054,10 +7416,25 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f)
 		memset(port, 0, sizeof(port));
 		ports = 0;
 	}
-	if (f->derived && error == f->error && local == f->local &&
-	    ports == f->ports && ft_mc_listeners_same(port, f->port, ports))
+	/* Where the frames arrive, where each copy leaves, and where the bridge
+	 * hands them up; see what runs in software on a bridged flow's ports.
+	 * A host that joined, or a bridge flooding everything up, refuses the
+	 * flow whatever runs there. */
+	ft_mc_soft_on(soft, f->in, true, &tc_soft, &nf_hooked);
+	if (local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC))
+		ft_mc_soft_on(soft, f->bridge, true, &tc_soft, &nf_hooked);
+	for (i = 0; i < ports; i++)
+		ft_mc_soft_on(soft, port[i].dev, false, &tc_soft, &nf_hooked);
+	same = f->derived && ports == f->ports &&
+	       ft_mc_listeners_same(port, f->port, ports);
+	if (ft_mc_netdev_dependent(f, port, ports, same))
+		nf_hooked = true;
+	if (same && error == f->error && local == f->local &&
+	    tc_soft == f->tc_soft && nf_hooked == f->nf_hooked)
 		return;
-	if (error && (!f->derived || !f->error))
+	/* Refused where it was not, for whichever reasons: one refusal. */
+	if ((error || tc_soft || nf_hooked) &&
+	    (!f->derived || !(f->error || f->tc_soft || f->nf_hooked)))
 		ft_mc_refused++;
 	ft_mc_flow_release_ports(f);
 	for (i = 0; i < ports; i++)
@@ -7066,6 +7443,8 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f)
 	f->ports = ports;
 	f->local = local;
 	f->error = error;
+	f->tc_soft = tc_soft;
+	f->nf_hooked = nf_hooked;
 	f->derived = true;
 	/* A changed answer is a new question: retries spent against the old
 	 * one say nothing about this one. */
@@ -7204,8 +7583,12 @@ static void ft_mc_work_fn(struct work_struct *work)
 	struct ft_mc_group *g, *gtmp;
 	struct ft_mc_flow *f, *ftmp;
 	struct ft_mc_route *r;
+	struct ft_mc_soft soft;
 	LIST_HEAD(dead);
 	LIST_HEAD(gone);
+
+	/* Every pass takes the transaction; see ft_mc_record(). */
+	WRITE_ONCE(ft_mc_passes, ft_mc_passes + 1);
 
 	/* Something outside this learner changed an answer it gave -- a device
 	 * MTU, or a bridge filter hook registered or gone -- so every answer is
@@ -7231,6 +7614,9 @@ static void ft_mc_work_fn(struct work_struct *work)
 			f->retries = 0;
 			f->stale = true;
 		}
+		/* And a source turned away under the old answer -- a filter
+		 * hook refusing its group -- may be learned under this one. */
+		ft_mc_forget_seen();
 		mutex_unlock(&ft_mc_lock);
 	}
 
@@ -7239,19 +7625,26 @@ static void ft_mc_work_fn(struct work_struct *work)
 	/* Ask the bridge about every flow whose answer may have changed. The
 	 * snapshot and the VLAN lookups need RTNL, taken before ft_mc_lock as
 	 * the switchdev handler takes them, and neither is held across the
-	 * transaction below. */
+	 * transaction below. What runs in software on the ports is asked under
+	 * the same RTNL, before the lock; see what runs in software on a bridged
+	 * flow's ports. */
 	mutex_lock(&ft_mc_lock);
 	list_for_each_entry(f, &ft_mc_flows, list)
 		derive |= f->dirty;
 	mutex_unlock(&ft_mc_lock);
 	if (derive) {
 		rtnl_lock();
-		mutex_lock(&ft_mc_lock);
-		list_for_each_entry(f, &ft_mc_flows, list)
-			if (f->dirty && !ft_mc_stopping)
-				ft_mc_flow_derive(f);
-		mutex_unlock(&ft_mc_lock);
+		/* With no answer to give, the flows stay marked for the next
+		 * pass that has one -- the refresh's, at the latest. */
+		if (ft_mc_soft_ask(&soft)) {
+			mutex_lock(&ft_mc_lock);
+			list_for_each_entry(f, &ft_mc_flows, list)
+				if (f->dirty && !ft_mc_stopping)
+					ft_mc_flow_derive(f, &soft);
+			mutex_unlock(&ft_mc_lock);
+		}
 		rtnl_unlock();
+		ft_mc_soft_free(&soft);
 	}
 
 	/* Match the routed learner's routes against the answers just derived,
@@ -8225,6 +8618,12 @@ static const char *ft_mc_state(const struct ft_mc_flow *f)
 	/* The host routes this stream and no route of it can ride the flow. */
 	if (f->routed_host && !ft_mc_live_route(f))
 		return "refused-routed";
+	/* What runs on the flow's own ports: a netdev chain is netfilter
+	 * seeing its frames as a bridge hook would, and tc the same of tc. */
+	if (f->nf_hooked)
+		return "refused-filter";
+	if (f->tc_soft)
+		return "refused-tc";
 	/* Nowhere to forward it and nothing else wanting it: the bridge drops
 	 * it, and the hardware does instead -- or will, once installed. */
 	if (ft_mc_discardable(f)) {
@@ -14688,6 +15087,14 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mc_count, ft_mc_flow_count, ft_mc_installed, ft_mc_refused,
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
+	/* Frames whose set of dedup slots had none to give them yet, which
+	 * their next frame asks for again; and the bridged worker's runs, each
+	 * of which takes the transaction. See ft_mc_record(). */
+	seq_printf(seq, "mcast_deferred %llu\nmcast_passes %llu\n",
+		   ft_mc_deferred, READ_ONCE(ft_mc_passes));
+	/* Flows whose ports' netdev chains could not be judged; see
+	 * ft_mc_netdev_dependent(). */
+	seq_printf(seq, "mcast_port_probe_errors %llu\n", ft_mc_port_probe_errors);
 	/* Of those installed, the flows the bridge forwards nowhere, whose
 	 * entries drop their stream rather than hand it to the CPU; and how
 	 * many such entries have given their group id up to a stream somebody

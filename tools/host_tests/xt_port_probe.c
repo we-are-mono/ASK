@@ -267,6 +267,7 @@ struct nft_port_probe {
 	const struct net_device *in;
 	const struct net_device * const *out;
 	unsigned int nout;
+	bool bridged;
 };
 
 struct nf_xt_probe_hook {
@@ -882,6 +883,19 @@ static void dispatch(void)
 
 		rcu_depth++;
 		assert(nf_xt_port_dependent(&net, &probe) == 1);
+		rcu_depth--;
+	}
+	/* What a bridge forwards crosses no x_tables hook, whatever the
+	 * tables drop, and needs no output to be judged. */
+	{
+		const struct net_device *out = &eth3;
+		struct nft_port_probe probe = { .family = NFPROTO_IPV4, .in = &eth4,
+						.out = &out, .nout = 1, .bridged = true };
+
+		rcu_depth++;
+		assert(nf_xt_port_dependent(&net, &probe) == 0);
+		probe.nout = 0;
+		assert(nf_xt_port_dependent(&net, &probe) == 0);
 		rcu_depth--;
 	}
 	/* A stream that leaves nowhere is not one to judge. */

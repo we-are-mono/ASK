@@ -47,6 +47,10 @@ def test_mcast_learner(tmp_path):
         # them.
         + source[source.index("#define FT_MC_RING"):
                  source.index("static bool ft_mc_seen_eq(")]
+        # What runs in software on every bridge and bridge port, which the
+        # derivation reads.
+        + source[source.index("struct ft_mc_soft_dev {"):
+                 source.index("static bool ft_mc_soft_bridged(")]
         + "\n".join(function(source, name) for name in [
             "ft_mc_family",
             "ft_mc_link_local",
@@ -96,6 +100,9 @@ def test_mcast_learner(tmp_path):
             "ft_mc_group_new",
             "ft_mc_membership",
             "ft_mc_seen_eq",
+            "ft_mc_seen_set",
+            "ft_mc_supersede",
+            "ft_mc_flow_seen",
             "ft_mc_record",
             "ft_mc_seen_key",
             "ft_mc_same_shape",
@@ -107,9 +114,16 @@ def test_mcast_learner(tmp_path):
             "ft_mc_same_key",
             "ft_mc_observe",
             "ft_mc_adopt_next",
-            # The bridge's answer, and what the flow makes of it.
+            # The bridge's answer, what runs in software on its ports beside
+            # it, and what the flow makes of them.
             "ft_mc_shape_resolves",
             "ft_mc_listeners_same",
+            "ft_mc_soft_bridged",
+            "ft_mc_soft_bridge",
+            "ft_mc_soft_ask",
+            "ft_mc_soft_free",
+            "ft_mc_soft_on",
+            "ft_mc_netdev_dependent",
             "ft_mc_flow_derive",
             "ft_mc_count_delta",
             "ft_mc_flow_counted",
@@ -196,7 +210,7 @@ def test_the_bridge_is_asked_under_rtnl_and_never_across_hardware():
     derive = worker[worker.index("rtnl_lock();"):]
     derive = derive[:derive.index("rtnl_unlock();")]
     assert derive.index("rtnl_lock();") < derive.index("mutex_lock(&ft_mc_lock);")
-    assert "ft_mc_flow_derive(f)" in derive
+    assert "ft_mc_flow_derive(f, &soft)" in derive
     assert worker.count("rtnl_lock();") == 1, "one place the bridge is asked"
     _assert_not_inside(worker, _held_regions(worker, "rtnl_lock()", "rtnl_unlock()"),
                        "cdx_ft_begin()", "RTNL must be released before the transaction")
@@ -456,7 +470,7 @@ def test_an_idle_entry_ages_on_the_bridges_clock():
     assert "f->age = br_multicast_membership_interval(f->bridge, f->addr.vid);" in derive
     # Before the early return for an unchanged answer, so a changed
     # interval is followed without touching the hardware.
-    assert derive.index("f->age =") < derive.index("if (f->derived && error == f->error")
+    assert derive.index("f->age =") < derive.index("if (same && error == f->error")
     refresh = function(source, "ft_mc_refresh_fn")
     assert "ft_mc_flow_counted(f, &stats, jiffies);" in refresh
     counted = function(source, "ft_mc_flow_counted")
@@ -490,7 +504,8 @@ def test_a_bridge_filter_hook_keeps_bridged_multicast_in_software(tmp_path):
     and the worker asks at every pass because nothing announces a hook."""
     source = SOURCE.read_text()
     (tmp_path / "mcast_bridge_filter.inc").write_text(
-        function(source, "ft_bridge_hooked") + function(source, "ft_mc_bridge_filtered"))
+        function(source, "ft_bridge_hooked") + function(source, "ft_mc_bridge_filtered")
+        + function(source, "ft_dev_nf_ingress_hooked"))
     binary = tmp_path / "mcast_bridge_filter"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
@@ -513,6 +528,151 @@ def test_a_bridge_filter_hook_keeps_bridged_multicast_in_software(tmp_path):
     assert 'return "refused-filter";' in function(source, "ft_mc_state")
     # Nothing gives up a place for a source the filter would refuse too.
     assert "ft_mc_filtered" in function(source, "ft_mc_observe")
+
+
+def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
+    """tc and netfilter's netdev hooks run on every frame the bridge forwards
+    in software and on none an installed entry replicates, and the entry's key
+    stops at the addresses, so a filter dropping one port of the group would
+    be bypassed for all of them. A flow stays in software while either runs
+    anything where it arrives -- XDP included -- or where a bridged copy
+    leaves: refused-tc by the routed learner's own predicate, refused-filter
+    for a chain, as for a bridge hook. Both are asked under the RTNL the
+    derivation holds, before the group lock, and every refresh asks again
+    because nothing announces a filter or a chain."""
+    from test_mroute_learner import _assert_not_inside, _held_regions
+    source = SOURCE.read_text()
+    derive = function(source, "ft_mc_flow_derive")
+    for asked in ("ft_mc_soft_on(soft, f->in, true, &tc_soft, &nf_hooked);",
+                  "ft_mc_soft_on(soft, port[i].dev, false, &tc_soft, &nf_hooked);",
+                  "ft_mc_soft_on(soft, f->bridge, true, &tc_soft, &nf_hooked);",
+                  "ft_mc_netdev_dependent(f, port, ports, same)"):
+        assert asked in derive, asked
+    # The bridge device only for a copy it hands up that a carried flow
+    # takes away: a host that joined, or flooding, refuses the flow anyway.
+    hands_up = derive[:derive.index("ft_mc_soft_on(soft, f->bridge")]
+    assert "if (local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC))" in hands_up
+    # A changed answer is one the install pass has to hear of.
+    unchanged = derive[derive.index("if (same && error == f->error"):]
+    unchanged = unchanged[:unchanged.index("return;")]
+    assert "tc_soft == f->tc_soft" in unchanged and "nf_hooked == f->nf_hooked" in unchanged
+    assert "same = f->derived && ports == f->ports &&" in derive
+    assert derive.index("ft_mc_netdev_dependent(f, port, ports, same)") < \
+        derive.index("if (same && error == f->error")
+    assert "f->tc_soft = tc_soft;" in derive and "f->nf_hooked = nf_hooked;" in derive
+    # Refused for one reason or several at once: one refusal.
+    assert derive.count("ft_mc_refused++;") == 1
+    for forbidden in ("ft_dev_stack_tc_soft", "ft_dev_tc_soft", "ft_dev_nf_ingress_hooked"):
+        assert forbidden not in derive, forbidden
+    # A port's chains are judged for what they do to a bridged stream, as
+    # the routed learner judges its groups', and a walk a commit interrupted
+    # keeps the answer the flow had -- or refuses one that had none.
+    probe = function(source, "ft_mc_netdev_dependent")
+    assert ".bridged = true," in probe and ".in = f->in," in probe and ".nout = ports," in probe
+    assert "rc = nft_port_dependent(&init_net, &probe);" in probe
+    assert probe.index("rcu_read_lock();") < probe.index("nft_port_dependent(") < \
+        probe.index("rcu_read_unlock();")
+    assert "if (rc == -EAGAIN || rc == -ENOMEM)\n\t\treturn !same || f->nf_hooked;" in probe
+    assert "ft_mc_port_probe_errors++;" in probe
+    assert "mcast_port_probe_errors" in function(source, "ft_show")
+    # Asked under RTNL and before the group lock, never under it: a block
+    # walk can destroy a classifier, whose destruction reaches the egress
+    # mark, which takes the group lock.
+    ask = function(source, "ft_mc_soft_ask")
+    assert "ASSERT_RTNL();" in ask
+    for asked in ("ft_dev_stack_tc_soft(dev, true)", "ft_dev_stack_tc_soft(dev, false)",
+                  "ft_mc_soft_bridge(d, dev);"):
+        assert asked in ask, asked
+    assert "ft_mc_lock" not in ask
+    # A bridge's hand-up copy crosses the bridge's LOCAL_IN hook, the bridge
+    # device and every device above it, and nothing below it: every port of
+    # the bridge is below it.
+    bridge = function(source, "ft_mc_soft_bridge")
+    assert "ft_dev_tc_soft(br, true)" in bridge and "ft_dev_nf_ingress_hooked(br)" in bridge
+    assert "ft_bridge_hooked(BIT(NF_BR_LOCAL_IN))" in bridge
+    assert "netdev_for_each_upper_dev_rcu(br, upper, iter)" in bridge
+    assert "ft_dev_stack_tc_soft" not in bridge and "ASSERT_RTNL();" in bridge
+    worker = function(source, "ft_mc_work_fn")
+    derived = worker[worker.index("rtnl_lock();"):worker.index("rtnl_unlock();")]
+    assert derived.index("if (ft_mc_soft_ask(&soft)) {") < derived.index("mutex_lock(&ft_mc_lock);")
+    assert "ft_mc_flow_derive(f, &soft)" in derived
+    code = re.sub(r"/\*.*?\*/", "", worker, flags=re.S)
+    _assert_not_inside(code, _held_regions(code, "mutex_lock(&ft_mc_lock)",
+                                           "mutex_unlock(&ft_mc_lock)"),
+                       "ft_mc_soft_ask(", "tc must be asked outside ft_mc_lock")
+    assert "ft_mc_soft_free(&soft);" in worker[worker.index("rtnl_unlock();"):]
+    # A device the table does not name is one nothing can be said of.
+    assert "*tc = *nf = true;" in function(source, "ft_mc_soft_on")
+    # Declared ahead of the bridged learner, defined with the routed one.
+    for name in ("ft_dev_tc_soft", "ft_dev_stack_tc_soft"):
+        assert source.index(f"static bool {name}(struct net_device *dev, bool ingress);") < \
+            source.index("static void ft_mc_flow_derive(")
+    # A flowtable's hook is not a chain: chains and BPF programs are asked
+    # for by type, which this kernel gives a flowtable none of.
+    hooked = function(source, "ft_dev_nf_ingress_hooked")
+    for kind in ("NF_HOOK_OP_NF_TABLES", "NF_HOOK_OP_BPF"):
+        assert f"ops[i]->hook_ops_type == {kind}" in hooked, kind
+    assert "NF_HOOK_OP_UNDEFINED" not in hooked and "!=" not in hooked
+    for name in ("ft_mc_installable", "ft_mc_discardable"):
+        body = function(source, name)
+        assert "!f->tc_soft" in body and "!f->nf_hooked" in body, name
+    # The flow's own ports after every refusal that would hold whatever
+    # they ran, and before the discard.
+    state = function(source, "ft_mc_state")
+    assert state.index("if (ft_mc_filtered)\n\t\treturn \"refused-filter\";") < \
+        state.index('return "refused-host";') < state.index('return "refused-routed";') < \
+        state.index("if (f->nf_hooked)\n\t\treturn \"refused-filter\";") < \
+        state.index('return "refused-tc";') < state.index("if (ft_mc_discardable(f))")
+    # Patch 148's bridged probe: netdev hooks alone, no conntrack, no
+    # x_tables, and a stream the bridge forwards nowhere still asked about.
+    patch = (ROOT / "patches/kernel/148-netfilter-nftables-commit-in-progress.patch").read_text()
+    sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
+    assert "+\tbool\t\t\t\tbridged;" in sections["include/net/netfilter/nf_port_probe.h"]
+    walk = sections["net/netfilter/nf_tables_port_probe.c"]
+    packet = walk[walk.index("+static u32 nft_probe_packet("):]
+    packet = packet[:packet.index("\n+}\n")]
+    assert packet.index("+\tif (!p->bridged) {\n+\t\tnft_probe_hook(ctx, NFT_PROBE_PRE,") > 0
+    assert "+\t\tif (!p->bridged) {\n+\t\t\tnft_probe_hook(ctx, NFT_PROBE_FORWARD," in packet
+    assert "+\t\tnft_probe_hook(ctx, NFT_PROBE_EGRESS, NULL, p->out[i], i);" in packet
+    assert "+\t\tif (ctx->probe->bridged)\n+\t\t\treturn NFT_PROBE_CT_ABSENT;" in walk
+    assert "+\t    (!probe->nout && !probe->bridged) ||" in walk
+    assert "+\tif (probe->bridged)\n+\t\treturn 0;" in sections["net/netfilter/core.c"]
+    # The bridge's own chains are the caller's: only some of its hooks see a
+    # forwarded frame, which the learner asks itself.
+    assert "+\t\tif (!ctx->steady && ctx->bridged && !ctx->probe->bridged) {" in walk
+    # A netdev chain's hook a chain update adds is typed as the chain's
+    # first ones are, so the learner's type check finds it.
+    assert "+\t\t\t\th->ops.hook_ops_type = basechain->ops.hook_ops_type;" in \
+        sections["net/netfilter/nf_tables_api.c"]
+    assert "f->dirty = true;" in function(source, "ft_mc_refresh_fn")
+
+
+def test_streams_the_worker_can_do_nothing_with_wake_it_once():
+    """A stream nothing names, one turned away at the group's flow cap, a flow
+    refused: each reaches the hook on every frame. The dedup slots keep one
+    from being recorded again until something forgets them; a fact goes to one
+    set of slots by a seeded hash of its stream, and pushes out only one that
+    was recorded at least a refresh interval ago, so more streams than a set
+    holds wait rather than each being news on every frame. Every pass of the
+    worker takes the transaction, and /proc counts the passes and the facts
+    that waited."""
+    source = SOURCE.read_text()
+    record = function(source, "ft_mc_record")
+    assert "ft_mc_seen_set(seen)" in record
+    assert "time_before(now, slot->at + FT_MC_REFRESH_INTERVAL)" in record
+    assert "ft_mc_deferred++;" in record
+    # The slot is claimed only once the fact is in the ring: a fact the full
+    # ring dropped is asked again on its next frame.
+    assert record.index("ft_mc_dropped++;") < record.index("slot->seen = *seen;")
+    assert "ft_hash_seed" in function(source, "ft_mc_seen_set")
+    worker = function(source, "ft_mc_work_fn")
+    assert worker.index("WRITE_ONCE(ft_mc_passes, ft_mc_passes + 1);") < \
+        worker.index("cdx_ft_begin();")
+    show = function(source, "ft_show")
+    assert "mcast_passes" in show and "mcast_deferred" in show
+    # Seeded before the hook can be registered.
+    init = function(source, "ask_flowtable_init")
+    assert init.index("ft_hash_seed = get_random_u32();") < init.index("ft_mc_replay();")
 
 
 def test_a_failed_install_is_tried_again_an_interval_apart():
@@ -658,10 +818,19 @@ def test_the_dedup_slots_are_forgotten_whenever_an_answer_may_change():
     assert forget in function(source, "ft_mc_group_new"), "a membership created"
     assert forget in function(source, "ft_mc_route_publish"), "a route published"
     assert forget in function(source, "ft_mc_retire"), "a flow or membership retired"
-    # A flow that took another shape: the old shape's frames are another
-    # answer now.
+    # A flow that took another shape: the old shape's frames, and the kept
+    # one's, are another answer now -- their own slots lapse, and nothing
+    # else is forgotten, or a stream arriving in two shapes would make every
+    # stream news on every frame.
     observe = function(source, "ft_mc_observe")
-    assert observe.index("ft_mc_drop_next(f);") < observe.index(forget)
+    reshape = observe[observe.index("With nothing installed"):]
+    reshape = reshape[:reshape.index("return;")]
+    assert reshape.count("ft_mc_supersede(&other);") == 2
+    assert reshape.index("ft_mc_supersede(&other);") < reshape.index("ft_mc_drop_next(f);")
+    assert forget not in reshape
+    supersede = function(source, "ft_mc_supersede")
+    assert "set[i].superseded = true;" in supersede and "memset" not in supersede
+    assert "lockdep_assert_held(&ft_mc_lock)" in supersede
     worker = function(source, "ft_mc_work_fn")
     # An entry taken out of hardware and kept -- only one that was in it,
     # with nothing left to build or the switch off -- or replaced by the

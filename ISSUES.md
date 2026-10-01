@@ -181,36 +181,11 @@ result independently of those temporary files.
 - [x] **A296 — a terminal latch should restart the datapath, not demand a reboot.** Fixed: with every classifier port
   stopped and idle, CDX settles each possibly linked key, frees what it held and restarts the ports; terminal only when unprovable (_:/^cdx: restart the datapath after an unproven delete_).
 
-- [ ] **A297 — more than eight interleaved unwanted streams wake the bridged learner per frame.**
-  The bridge hook remembers the streams it last handed the worker in eight slots
-  (`ft_mc_record()`, `FT_MC_SEEN_SLOTS`, `cdx/ask_flowtable.c`) so a stream is queued once, not
-  per frame. Streams nobody names -- no membership, or one the learner turned away -- are seen
-  again on every frame, and more than eight interleaved miss every slot: each frame queues the
-  worker, and every pass takes the transaction (`cdx_ft_begin()`), contending `ctrl.mutex` with
-  the other learners and the backend. A discard that gives up its id for a listener hands its
-  stream back to exactly this path. Found by reading, not yet seen on the rig. Fix: remember a
-  turned-away key with a timestamp in a bounded table (or rank by key hash into more slots), so
-  an unnamed stream is looked at once per refresh interval rather than per frame. Regression:
-  32 interleaved unnamed streams at 1 kpps on a snooping bridge; worker passes per second and
-  `ctrl.mutex` hold time stay bounded (expose a pass counter in `/proc/cdx_flowtable`).
+- [x] **A297 — interleaved unwanted streams woke the bridged learner on every frame.** Fixed: 64×4 seeded dedup slots,
+  one given up only an interval after it was taken; 32 interleaved streams cost 32 passes, not 1280 (_:/^cdx: bound the bridged learner's wakeups and respect port filters_).
 
-- [ ] **A298 — a tc filter or XDP program on a bridge port is bypassed by a bridged multicast
-  flow.** The bridged learner refuses every flow while a bridge netfilter hook is registered
-  (`ft_mc_bridge_filtered()`, `cdx/ask_flowtable.c`), but nothing looks at tc or XDP on the
-  port a stream arrives by or on a listener's port: `ft_mc_installable()` and
-  `ft_mc_discardable()` never ask. A tc ingress filter on the ingress port (a port-selective
-  `flower ... dst_port X action drop`, a `mirred` to an ifb for SQM, a non-`skip_sw` police), an
-  egress filter or qdisc-class filter on a listener port, a tcx program, or XDP on the ingress
-  port runs on every frame the bridge forwards in software and on none the classifier
-  replicates, and the entry's key stops at L3, so one rule is bypassed for every port of the
-  group. The routed learner already refuses this (`refused-tc`, `ft_mr_tc_filtered()`). Fix:
-  in the flow's derivation, which holds RTNL, ask `ft_dev_stack_tc_soft()` of the ingress port
-  (ingress, XDP included) and of each listener port (egress), keep the answer on the flow
-  (the predicates are also read without RTNL, from /proc), refuse it in both, report it as
-  `refused-tc` in `ft_mc_state()`, and let the refresh re-ask it as the routed learner
-  does. Regression: a bridged two-port window with a tc ingress drop of one UDP port on the
-  ingress port, and an egress drop on one listener port; require `refused-tc`, zero delivery of
-  the dropped port, and the flow carried again once the filter is gone.
+- [x] **A298 — tc, XDP or a netdev chain on a bridge port was bypassed by a bridged multicast flow.** Fixed: tc on a flow's
+  ports is `refused-tc`; its netdev chains go to patch 148's bridged probe, `refused-filter` (_:/^cdx: bound the bridged learner's wakeups and respect port filters_).
 
 - [x] **A299 — a restart that never completed never went terminal.** Fixed: a port not idle or a barrier rejected is retried
   every 250 ms, and twelve unanswered tries in a restart (seconds) make the latch terminal; RTNL and the hold never count (_:/^cdx: give up a restart the hardware stops answering_).
@@ -231,6 +206,16 @@ result independently of those temporary files.
   needed a physical power-cycle. Regression: the test image with the parameter forced on, a
   terminal kind reboots within the timeout and the next boot reads the persisted reason; a
   forced hang (sysrq hard lockup) is reset by the watchdog; the cap holds after three loops.
+
+- [ ] **A301 — a bridged flow the bridge hands up as a router or a promiscuous bridge is carried past
+  the IP stack's hooks.** With `BR_MCAST_TO_HOST_ROUTER` or `_PROMISC` and no route riding the flow,
+  `ft_mc_installable()` carries it, and the copy the bridge hands up never reaches `ip_rcv()` on the
+  bridge or a device above it: inet `prerouting`/`input` chains (counters, logs, `ct` matches) and
+  conntrack stop seeing the stream. The hand-up check (`ft_mc_soft_bridge()`, `cdx/ask_flowtable.c`)
+  covers tc, netdev chains and the bridge `input` hook only. Fix: refuse such a flow while an inet
+  chain at prerouting or input would see the hand-up copy, or refuse a hand-up no route rides
+  outright as `refused-host`. Regression: `mcast_router 2` on the bridge device, no ipmr VIF, an inet
+  prerouting counter on the group; require the counter to keep counting.
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**

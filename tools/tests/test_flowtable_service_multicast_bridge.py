@@ -449,6 +449,258 @@ async def test_flowtable_service_multicast_bridge_yields_to_a_bridge_filter(mult
         await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=20)
 
 
+# The UDP port the filters below drop; FRAMING_PORT is the one they keep.
+TC_DROPPED = FRAMING_PORT + 1
+
+
+def _tc_drop(family, tagged):
+    """A filter that drops TC_DROPPED in software alone. A tag is metadata by
+    the time tc sees the frame -- the receive path takes it off the wire, the
+    bridge keeps a copy's there -- and tc then takes the tag's protocol for
+    the frame's."""
+    l3 = 'ip' if family == 4 else 'ipv6'
+    match = (['protocol', '802.1q', 'flower', 'skip_hw', 'vlan_id', str(IPTV_VID),
+              'vlan_ethtype', l3] if tagged else ['protocol', l3, 'flower', 'skip_hw'])
+    return [*match, 'ip_proto', 'udp', 'dst_port', str(TC_DROPPED), 'action', 'drop']
+
+
+async def _split_window(r, group, source, label, refused):
+    """Both UDP ports of the group from the WAN wire, each read off the
+    set-top box's wire. `refused` is the state the flow holds while a filter
+    drops TC_DROPPED where it runs in software alone: the kept port still
+    arrives, through the CPU, and nothing of the dropped one. None is a flow
+    carried again: both arrive whole, and the classifier made them."""
+    family = r.multicast_family
+    vlan = IPTV_VID if IPTV_TAGGED else None
+
+    def row(state):
+        return next((g for g in state['mcast'] if g['group'] == group), None)
+
+    kept = new_config(family, source, group, FRAMING_PORT, [LISTENER])
+    other = new_config(family, source, group, TC_DROPPED, [LISTENER])
+    before = await r.state()
+    async with capture(r.lan, kept) as kept_handle, capture(r.lan, other) as other_handle:
+        both = zip(frames(kept, {1: 512}, FRAMING_COUNT, source_mac=r.wan_mac, vlan=vlan),
+                   frames(other, {1: 512}, FRAMING_COUNT, source_mac=r.wan_mac, vlan=vlan))
+        await asyncio.to_thread(send, [frame for pair in both for frame in pair],
+                                r.multicast_send_if)
+        await asyncio.sleep(0.5)
+    after = await r.state()
+    r.record(label, {'kept': kept_handle['result'], 'dropped': other_handle['result'],
+                     'before': row(before), 'after': row(after)})
+    _assert_bridged_copy(kept_handle['result'][LISTENER], r.wan_mac, group)
+    moved = _packets(after, group) - _packets(before, group)
+    if refused:
+        dropped = other_handle['result'][LISTENER]
+        assert not dropped['errors'] and not dropped['seen'], dropped
+        assert row(after)['state'] == refused and not moved, (row(before), row(after))
+    else:
+        _assert_bridged_copy(other_handle['result'][LISTENER], r.wan_mac, group)
+        assert moved >= 2 * FRAMING_COUNT * 0.95, (row(before), row(after))
+
+
+async def test_flowtable_service_multicast_bridge_yields_to_tc(multicast_bridge_service):
+    """IPTV bridged from the WAN port to the set-top box, on two UDP ports of
+    one (S,G). A tc filter dropping one of them -- where the stream arrives,
+    then where the copy leaves -- runs on every frame the bridge forwards in
+    software and on none an entry replicates, and the entry's key cannot tell
+    the two ports apart. So while it stands the flow is out of hardware and
+    says refused-tc, the set-top box receives the kept port and nothing of the
+    dropped one, and once it goes the flow is carried again, both ports."""
+    r = multicast_bridge_service
+    family = r.multicast_family
+    group = '239.9.5.7' if family == 4 else 'ff1e::9:5:7'
+    source = r.multicast_source
+    filtered = set()
+
+    async def window(label, dropping):
+        await _split_window(r, group, source, label, 'refused-tc' if dropping else None)
+
+    await _mdb(r, TARGET_LAN_IF, group)
+    with Console.target(log_path=str(ARTIFACTS / 'multicast-bridge-tc-uart.log')) as con:
+        await asyncio.to_thread(con.login, 'root', None)
+
+        async def tc(*argv, check=True):
+            # tc is not in the agent's allowlist; the console carries it.
+            return await console_command(con, 'tc', *argv, check=check, timeout=30)
+
+        async def place(dev, direction, tagged):
+            filtered.add(dev)
+            # A killed run's qdisc, if any, goes with whatever it held.
+            await tc('qdisc', 'del', 'dev', dev, 'clsact', check=False)
+            await tc('qdisc', 'add', 'dev', dev, 'clsact')
+            await tc('filter', 'add', 'dev', dev, direction, *_tc_drop(family, tagged))
+            # Nothing announces a filter: the refresh finds it.
+            await _bridged_row(r, group, lambda g: g['state'] == 'refused-tc')
+
+        async def lift(dev):
+            await tc('qdisc', 'del', 'dev', dev, 'clsact')
+            filtered.discard(dev)
+            await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+
+        try:
+            await _from_wan(r, new_config(family, source, group, FRAMING_PORT, []), 16,
+                            r.wan_mac)
+            await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+
+            # Where the stream arrives: the WAN wire's own framing.
+            await place(TARGET_WAN_IF, 'ingress', IPTV_TAGGED)
+            await window('multicast-bridge-tc-ingress', dropping=True)
+            await lift(TARGET_WAN_IF)
+            await window('multicast-bridge-tc-ingress-lifted', dropping=False)
+
+            # Where the copy leaves: tagged, to the set-top box's VLAN.
+            await place(TARGET_LAN_IF, 'egress', True)
+            await window('multicast-bridge-tc-egress', dropping=True)
+            await lift(TARGET_LAN_IF)
+            await window('multicast-bridge-tc-egress-lifted', dropping=False)
+        finally:
+            for dev in sorted(filtered):
+                await tc('qdisc', 'del', 'dev', dev, 'clsact', check=False)
+            await _mdb(r, TARGET_LAN_IF, group, add=False)
+            await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']),
+                         timeout=20)
+
+
+NETDEV_TABLE = 'ask_ft_mc_netdev'
+
+
+async def test_flowtable_service_multicast_bridge_yields_to_a_netdev_chain(
+        multicast_bridge_service):
+    """IPTV bridged from the WAN port to the set-top box, on two UDP ports of
+    one (S,G). An nftables netdev chain dropping one of them -- at the WAN
+    port's ingress hook, then at the set-top box port's egress hook -- sees
+    every frame the bridge forwards in software and none an entry replicates,
+    and no bridge hook is involved. So while it stands the flow is out of
+    hardware and says refused-filter, the set-top box receives the kept port
+    and nothing of the dropped one, and once the table goes the flow is
+    carried again, both ports. The image's own flowtable sits on the same
+    ingress hooks and keeps nothing out."""
+    r = multicast_bridge_service
+    family = r.multicast_family
+    group = '239.9.5.8' if family == 4 else 'ff1e::9:5:8'
+    source = r.multicast_source
+    placed = False
+
+    async def nft(*argv, check=True):
+        return await command(r.target, r.session, 'nft', *argv, check=check)
+
+    async def place(hook, dev):
+        nonlocal placed
+        placed = True
+        # A killed run's table, if any, goes first.
+        await nft('delete', 'table', 'netdev', NETDEV_TABLE, check=False)
+        await nft('add', 'table', 'netdev', NETDEV_TABLE)
+        await nft('add', 'chain', 'netdev', NETDEV_TABLE, hook,
+                  f'{{ type filter hook {hook} device "{dev}" priority 0; policy accept; }}')
+        await nft('add', 'rule', 'netdev', NETDEV_TABLE, hook,
+                  'udp', 'dport', str(TC_DROPPED), 'drop')
+        # Nothing announces a chain: the refresh finds it.
+        await _bridged_row(r, group, lambda g: g['state'] == 'refused-filter')
+
+    async def lift():
+        nonlocal placed
+        await nft('delete', 'table', 'netdev', NETDEV_TABLE)
+        placed = False
+        await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+
+    await _mdb(r, TARGET_LAN_IF, group)
+    try:
+        await _from_wan(r, new_config(family, source, group, FRAMING_PORT, []), 16, r.wan_mac)
+        await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+        # The service's flowtable hooks both ports' ingress, and the flow is
+        # carried beside it.
+        assert (await r.state())['bindings'] > 0
+
+        await place('ingress', TARGET_WAN_IF)
+        await _split_window(r, group, source, 'multicast-bridge-netdev-ingress',
+                            'refused-filter')
+        await lift()
+        await _split_window(r, group, source, 'multicast-bridge-netdev-ingress-lifted', None)
+
+        await place('egress', TARGET_LAN_IF)
+        await _split_window(r, group, source, 'multicast-bridge-netdev-egress',
+                            'refused-filter')
+        await lift()
+        await _split_window(r, group, source, 'multicast-bridge-netdev-egress-lifted', None)
+    finally:
+        if placed:
+            await nft('delete', 'table', 'netdev', NETDEV_TABLE, check=False)
+        await _mdb(r, TARGET_LAN_IF, group, add=False)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=20)
+
+
+# Streams nobody joined, more of them interleaving than a few dedup slots would
+# hold, and how many frames of each.
+UNWANTED, UNWANTED_ROUNDS = 32, 40
+# What else the segment sends the hook in a window: a handful of streams.
+BACKGROUND = 16
+
+
+async def test_flowtable_service_multicast_bridge_unwanted_streams_wake_it_once(
+        multicast_bridge_service):
+    """Thirty-two streams nobody joined, interleaved at about 1 kpps, while a
+    membership of another group keeps the learner's hook registered. Each
+    reaches the hook on every frame, and the worker can do nothing with any
+    of them. Each is recorded once, and wakes the worker once: slots holding
+    only the last few facts would record every one of them on every frame,
+    each a pass of the worker taking the transaction. A stream somebody
+    joined, arriving among them, is still learned and carried."""
+    r = multicast_bridge_service
+    family = r.multicast_family
+    wanted = '239.9.6.1' if family == 4 else 'ff1e::9:6:1'
+    unwanted = [f'239.9.7.{i + 1}' if family == 4 else f'ff1e::9:7:{i + 1:x}'
+                for i in range(UNWANTED)]
+    source = r.multicast_source
+    vlan = IPTV_VID if IPTV_TAGGED else None
+
+    def interleaved(configs, rounds):
+        batches = [frames(c, {1: 128}, rounds, source_mac=r.wan_mac, vlan=vlan)
+                   for c in configs]
+        return [frame for each in zip(*batches) for frame in each]
+
+    await _mdb(r, TARGET_LAN_IF, wanted)
+    try:
+        await r.wait(lambda s: s['mcast_hooked'] == 1, timeout=10)
+        configs = [new_config(family, source, g, FRAMING_PORT, []) for g in unwanted]
+        before = await r.state()
+        await asyncio.to_thread(send, interleaved(configs, UNWANTED_ROUNDS),
+                                r.multicast_send_if, 1000)
+        await asyncio.sleep(1)
+        after = await r.state()
+        delta = {key: after[key] - before[key] for key in after
+                 if key.startswith('mcast_') and isinstance(after[key], int)
+                 and isinstance(before.get(key), int)}
+        r.record('multicast-bridge-unwanted', {'delta': delta, 'after': after})
+        # No stream was named, so none became a flow; each was recorded once.
+        # The segment's own multicast -- discovery from the office hosts on
+        # the WAN side -- reaches the hook too, a few streams' worth; every
+        # frame of the 1280 would be news without the slots.
+        assert after['mcast_flows'] == before['mcast_flows'], delta
+        assert delta['mcast_observed'] <= UNWANTED + BACKGROUND, delta
+        assert delta['mcast_passes'] <= UNWANTED + BACKGROUND, delta
+
+        # The wanted stream among them: learned and carried, and the others
+        # are not news again -- across both runs each stream is recorded at
+        # most once. Sent until it is in: its set of slots may be full of
+        # facts recorded under an interval ago, which it waits out.
+        configs.append(new_config(family, source, wanted, FRAMING_PORT, []))
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            await asyncio.to_thread(send, interleaved(configs, 8), r.multicast_send_if, 1000)
+            row = next((g for g in (await r.state())['mcast'] if g['group'] == wanted), None)
+            if row and row['state'] == 'installed':
+                break
+            assert asyncio.get_running_loop().time() < deadline, row
+        last = await r.state()
+        assert last['mcast_observed'] - before['mcast_observed'] <= \
+            UNWANTED + 1 + BACKGROUND, \
+            (before['mcast_observed'], after['mcast_observed'], last['mcast_observed'])
+    finally:
+        await _mdb(r, TARGET_LAN_IF, wanted, add=False)
+        await r.wait(lambda s: not any(g['group'] == wanted for g in s['mcast']), timeout=20)
+
+
 # ---- one stream, bridged and routed ----------------------------------------
 #
 # The IPTV VLAN bridged to the set-top box and routed to the rest of the house.
