@@ -782,7 +782,7 @@ static void expect_terminal(const char *why, unsigned restarts)
     ft_failed = ft_terminal = record_lost = false;
     stopped = settled = false; terminal_lines = kept_lines = 0;
     ft_episode_start = ft_stopped_at = 0;
-    ft_episode_resolved = 0;
+    ft_episode_resolved = ft_hw_tries = 0;
     ft_stall_reported = false;
     ft_restart_backoff = HZ;
 }
@@ -841,6 +841,59 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     run_until_idle();
     fail_sync = false; hc_failed = false;
     expect_terminal("the host-command channel has failed", restarts);
+    /* Hardware that stops answering without saying so: a port that never
+     * goes idle, or a barrier the channel keeps rejecting though it has not
+     * failed for good. Each is retried a quarter-second apart, and the
+     * dozenth unanswered try in an episode -- a few seconds in, long before
+     * a stall would be reported -- leaves the latch for a reboot, saying what
+     * it waited for. Recovery then keeps stopping the port until it does go
+     * idle, as it always did. */
+    unsigned stalls = stall_lines;
+
+    latch_root();
+    stop_result = -EBUSY;
+    for (unsigned i = 1; i < FT_RESTART_HW_TRIES; i++) {
+        run_delayed_work(&ft_fatal_work);
+        assert(ft_fatal_work.queued && ft_fatal_work.delay == FT_RESTART_HW_RETRY);
+        assert(ft_hw_tries == i && !ft_terminal && !terminal_lines);
+    }
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_terminal && terminal_lines == 1 && stall_lines == stalls && key->linked);
+    /* Terminal with the port still busy: recovery keeps trying to stop it,
+     * but ever more rarely -- each try holds RTNL through the whole wait for
+     * idle -- and between tries asks nothing of RTNL. */
+    unsigned tries = stops;
+    assert(ft_recover_backoff == HZ);
+    for (unsigned i = 0; i < 5; i++)
+        run_delayed_work(&ft_fatal_work);
+    assert(stops == tries && ft_fatal_work.queued);
+    jiffies += HZ + 1;
+    run_delayed_work(&ft_fatal_work);
+    assert(stops == tries + 1 && ft_recover_backoff == 2 * HZ);
+    jiffies += 2 * HZ + 1;
+    run_delayed_work(&ft_fatal_work);
+    assert(stops == tries + 2 && ft_recover_backoff == 4 * HZ);
+    for (unsigned i = 0; i < 10; i++) {
+        jiffies += FT_RESTART_BACKOFF_MAX + 1;
+        run_delayed_work(&ft_fatal_work);
+    }
+    assert(ft_recover_backoff == FT_RESTART_BACKOFF_MAX && ft_terminal);
+    stop_result = 0;
+    jiffies += FT_RESTART_BACKOFF_MAX + 1;
+    run_until_idle();
+    assert(!ft_recover_next && !ft_recover_backoff);
+    expect_terminal("a port would not stop and go idle", restarts);
+    latch_root();
+    fail_sync = true;
+    for (unsigned i = 1; i < FT_RESTART_HW_TRIES; i++) {
+        run_delayed_work(&ft_fatal_work);
+        assert(ft_fatal_work.delay == FT_RESTART_HW_RETRY && !ft_terminal);
+    }
+    run_delayed_work(&ft_fatal_work);
+    assert(ft_terminal && stall_lines == stalls && key->linked);
+    fail_sync = false;
+    run_until_idle();
+    expect_terminal("the PCD barrier kept failing", restarts);
     /* Ports that were detached: stopped, but never to be started again. The
      * adapter's recovery says the same, and still settles what they let go
      * of behind a barrier. */
@@ -938,6 +991,23 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     ft_restart_hold = false;
     run_until_idle();
     assert(!ft_failed && ft_restarts == ++restarts && !ft_stall_reported);
+    jiffies += FT_RESTART_WINDOW + 1;
+    /* RTNL contended between the hardware's tries counts for nothing,
+     * however long: one try short of the bound, a hundred contended passes,
+     * and the port that then goes idle still restarts the datapath. The next
+     * episode starts with no tries spent. */
+    latch_root();
+    stop_result = -EBUSY;
+    for (unsigned i = 1; i < FT_RESTART_HW_TRIES; i++)
+        run_delayed_work(&ft_fatal_work);
+    stop_result = 0;
+    rtnl_busy = true;
+    for (unsigned i = 0; i < 100; i++)
+        run_delayed_work(&ft_fatal_work);
+    assert(ft_hw_tries == FT_RESTART_HW_TRIES - 1 && !ft_terminal && ft_failed);
+    rtnl_busy = false;
+    run_until_idle();
+    assert(!ft_failed && !ft_terminal && ft_restarts == ++restarts && !ft_hw_tries);
     jiffies += FT_RESTART_WINDOW + 1;
     /* The restart frees nothing its stop let go of until a barrier has
      * completed behind the stopped ports: stop, then barrier, then any free.
@@ -1223,6 +1293,10 @@ static void test_backend(void)
     assert(cdx_ft_recover() == -EAGAIN && stops == 1 && !stopped && key->linked);
     assert(cdx_ft_pending() == 1 && !nabandoned && !stopped_lines);
     stop_result=0;
+    /* A stop that found a port busy is not tried again at once: each try
+     * holds RTNL through the whole wait for idle, and the adapter polls. */
+    assert(cdx_ft_recover() == -EAGAIN && stops == 1 && !stopped);
+    jiffies += FT_RESTART_HW_RETRY + 1;
     assert(cdx_ft_recover() == 0 && stopped && stops == 2 && key->linked);
     assert(nabandoned == 1 && abandoned[0] == key && stopped_lines == 1);
     assert(!allocations && !cdx_ft_pending() && cdx_ft_failed() && !cdx_ft_terminal());
@@ -1250,12 +1324,13 @@ static void test_backend(void)
     rtnl_busy = true; run_delayed_work(&ft_fatal_work);
     assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ / 10 && stops == 3 && !resumes);
     rtnl_busy = false;
-    /* A port still busy holds it up, the retries backing off, and nothing
-     * is settled meanwhile. */
+    /* A port still busy holds it up, retried soon at a steady interval --
+     * the hardware answers in moments or not at all -- and nothing is
+     * settled meanwhile. */
     stop_result = -EBUSY; run_delayed_work(&ft_fatal_work);
-    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ && !resolver_calls && key->linked);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ / 4 && !resolver_calls && key->linked);
     run_delayed_work(&ft_fatal_work);
-    assert(ft_fatal_work.queued && ft_fatal_work.delay == 2 * HZ && !resolver_calls);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ / 4 && !resolver_calls && ft_hw_tries == 2);
     stop_result = 0;
     /* The test image's hold keeps the ports stopped, every key recorded, at
      * a steady poll that does not add to the backoff. */
@@ -1264,9 +1339,10 @@ static void test_backend(void)
     assert(!resolver_calls && key->linked && ft_failed);
     ft_restart_hold = false;
     /* A key the table still links -- its delete refused, for want of
-     * memory most likely -- waits for the next try. */
+     * memory most likely -- waits for the next try, backing off: memory
+     * comes back on its own time, not the hardware's. */
     resolve_result = -EAGAIN; run_delayed_work(&ft_fatal_work);
-    assert(ft_fatal_work.queued && ft_fatal_work.delay == 4 * HZ && resolver_calls == 1);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ && resolver_calls == 1);
     assert(key->linked && !resumes && ft_failed);
     resolve_result = 0;
     /* The barrier behind the stopped ports fails: a frame they let go of may
@@ -1274,14 +1350,15 @@ static void test_backend(void)
      * stay stopped. */
     unsigned before = syncs;
     fail_sync = true; run_delayed_work(&ft_fatal_work);
-    assert(ft_fatal_work.queued && ft_fatal_work.delay == 8 * HZ && syncs == before + 1);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ / 4 && syncs == before + 1);
     assert(key->linked && nabandoned == 1 && resolver_calls == 1 && !resumes && ft_failed);
     fail_sync = false;
     /* Settled behind a completed one, but the barrier after it fails, so the
      * ports stay stopped. */
     before = syncs;
     fail_next_sync = 2; run_delayed_work(&ft_fatal_work);
-    assert(ft_fatal_work.queued && ft_fatal_work.delay == 16 * HZ && syncs == before + 2);
+    assert(ft_fatal_work.queued && ft_fatal_work.delay == HZ / 4 && syncs == before + 2);
+    assert(ft_hw_tries == 4);
     assert(!key && !nabandoned && resolver_calls == 2 && !resumes && ft_failed);
     /* With the barrier the restart completes in one transaction and one
      * RTNL hold: what CDX parked for a barrier is released, the FQIDs held
