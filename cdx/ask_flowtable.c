@@ -5982,12 +5982,15 @@ static void ft_mc_match_routes(void)
 	}
 }
 
-/* Whether the bridge also hands this flow's frames to the host for a reason no
- * route can stand in for: the host joined the group, or nothing is snooping
- * and the bridge floods it up with everything else. */
+/* Whether the bridge needs a local copy: the host joined, flooding sends it
+ * one, or router/promiscuous delivery has no routing consumer. A known VIF
+ * or route is checked separately: only an offloaded route can replace that
+ * copy. Host delivery must reach Linux even if Linux ultimately drops it. */
 static bool ft_mc_host_wants(const struct ft_mc_flow *f)
 {
-	return f->local & (BR_MCAST_TO_HOST_JOINED | BR_MCAST_TO_HOST_FLOOD);
+	return (f->local & (BR_MCAST_TO_HOST_JOINED | BR_MCAST_TO_HOST_FLOOD)) ||
+	       ((f->local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC)) &&
+		!f->routed_host);
 }
 
 /* Whether a flow can go into hardware as it stands, short of the key check

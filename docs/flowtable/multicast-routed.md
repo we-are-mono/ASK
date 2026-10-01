@@ -683,6 +683,11 @@ which keeps every such group in software until a resync completes. Before this,
 the bridged learner ignored a bridge that was a multicast router, installed the
 box's copy alone and starved ipmr: the routed half was silently lost.
 
+A router or promiscuous bridge with no receiving VIF or route still needs its
+local copy delivered to Linux. That case is `refused-host`, so offload cannot
+skip the IP hooks and conntrack simply because no multicast routing consumer
+is present.
+
 **What does not merge**, each with its reason:
 
 - The union has to fit `CDX_MC_MAX_LISTENERS`: `refused-listener`.

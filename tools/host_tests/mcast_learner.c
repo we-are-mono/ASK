@@ -1642,25 +1642,28 @@ static void the_bridge_decides(void)
      * holds the ingress and both copies again. */
     assert(holds == 2 + 2 + 2 + 2 + 3);
 
-    /* Why the bridge also hands a frame up. The host joined, or nothing is
-     * snooping and the frame floods: refused, since the entry would starve
-     * the host. The bridge a multicast router with no VIF on the VLAN: the
-     * host drops what it is handed, and the flow is carried. */
-    reset();
-    assert(ft_mc_membership(&BR, &P2, &any, true, false));
-    answer(&P1, S1, 0, BR_MCAST_TO_HOST_JOINED, 1, &P2);
-    see(seen_v4(&BR, &P1, G, S1, 0, false, SENDER));
-    pass();
-    f = flow(&P1, S1, 0);
-    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-host"));
-    answer(&P1, S1, 0, BR_MCAST_TO_HOST_FLOOD, 1, &P2);
-    f->dirty = true;
-    pass();
-    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-host"));
-    answer(&P1, S1, 0, BR_MCAST_TO_HOST_ROUTER, 1, &P2);
-    f->dirty = true;
-    pass();
-    assert(f->hw && !f->routed_host && !strcmp(ft_mc_state(f), "installed"));
+    /* Every local copy needs Linux, including router/promiscuous delivery
+     * with no VIF or route. Check admission and retirement of an installed
+     * flow when that delivery starts; forwarding resumes when it stops. */
+    const unsigned host_copies[] = { BR_MCAST_TO_HOST_JOINED, BR_MCAST_TO_HOST_FLOOD,
+                                    BR_MCAST_TO_HOST_ROUTER, BR_MCAST_TO_HOST_PROMISC };
+    for (unsigned i = 0; i < ARRAY_SIZE(host_copies); i++) {
+        reset();
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        answer(&P1, S1, 0, host_copies[i], 1, &P2);
+        see(seen_v4(&BR, &P1, G, S1, 0, false, SENDER));
+        pass();
+        f = flow(&P1, S1, 0);
+        assert(!f->routed_host && !f->hw && !strcmp(ft_mc_state(f), "refused-host"));
+        answer(&P1, S1, 0, 0, 1, &P2);
+        f->dirty = true;
+        pass();
+        assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+        answer(&P1, S1, 0, host_copies[i], 1, &P2);
+        f->dirty = true;
+        pass();
+        assert(!f->hw && !strcmp(ft_mc_state(f), "refused-host"));
+    }
 
     /* What the bridge says instead of a port set -- a hairpin ingress, a
      * port converting to unicast, too many ports -- refuses the flow and is
@@ -2048,7 +2051,7 @@ static void one_stream_both_learners(void)
     assert(f->routed_host && !f->hw);
     ft_mc_taps_publish(NULL, 0, false);
     pass();
-    assert(!f->routed_host && f->hw);
+    assert(!f->routed_host && !f->hw && !strcmp(ft_mc_state(f), "refused-host"));
 
     /* ---- where a VIF on a bridge receives ------------------------------ */
     reset();
@@ -2446,8 +2449,9 @@ static void devices_and_bridges_change(void)
     route_want(&want, 289, S, G, &P3, 287);
     ft_mc_route_publish(&r1, &want);
     answer(&P1, S, 289, BR_MCAST_TO_HOST_ROUTER, 1, &P2);
+    answer(&P1, S + 1, 289, 0, 1, &P2);
     see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
-    see(seen_v4(&BR, &P1, G + 1, S, 289, true, SENDER));
+    see(seen_v4(&BR, &P1, G + 1, S + 1, 289, true, SENDER));
     pass();
     f = NULL;
     h = NULL;
@@ -2914,7 +2918,7 @@ static void a_stream_nobody_wants_is_dropped_in_hardware(void)
     answer(&P1, S, 0, BR_MCAST_SNOOPED | BR_MCAST_TO_HOST_ROUTER, 0);
     f->dirty = true;
     ft_mc_work_fn(NULL);
-    assert(!f->hw && adds == 1 && !strcmp(ft_mc_state(f), "refused-listener"));
+    assert(!f->hw && adds == 1 && !strcmp(ft_mc_state(f), "refused-host"));
 
     /* Named still, but every listener behind the ingress or blocking the
      * source: snooping forwards it nowhere, and it goes in as a discard from
@@ -3528,6 +3532,7 @@ static void tc_keeps_a_flow_in_software(void)
 {
     const uint32_t G = 0x190007ef, S = 0x0100000a;
     struct br_ip any = group_v4(G, 0, 0);
+    struct ft_mc_route want, route = {};
     unsigned long long refused;
     struct ft_mc_flow *f;
 
@@ -3587,6 +3592,9 @@ static void tc_keeps_a_flow_in_software(void)
     f->dirty = true;
     pass();
     assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    route_want(&want, 0, S, G, &P3, 0);
+    want.tagged = false;
+    ft_mc_route_publish(&route, &want);
     answer(&P1, S, 0, BR_MCAST_TO_HOST_ROUTER, 1, &P2);
     f->dirty = true;
     pass();
@@ -3594,7 +3602,7 @@ static void tc_keeps_a_flow_in_software(void)
     BR.tc_ingress = false;
     f->dirty = true;
     pass();
-    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    assert(f->hw && route.carried && !strcmp(ft_mc_state(f), "installed"));
     /* And so is the VLAN device it hands the copy on to. */
     BRV.tc_ingress = true;
     f->dirty = true;
@@ -3605,6 +3613,7 @@ static void tc_keeps_a_flow_in_software(void)
     f->dirty = true;
     pass();
     assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    withdraw(&route);
 
     /* A table there was no memory for says nothing: the flows stay as they
      * were, marked for the next pass that can ask. */
@@ -3644,6 +3653,7 @@ static void a_netdev_chain_keeps_a_flow_in_software(void)
 {
     const uint32_t G = 0x1a0007ef, S = 0x0100000a;
     struct br_ip any = group_v4(G, 0, 0);
+    struct ft_mc_route want, route = {};
     unsigned long long refused;
     struct ft_mc_flow *f;
 
@@ -3731,6 +3741,9 @@ static void a_netdev_chain_keeps_a_flow_in_software(void)
     f->dirty = true;
     pass();
     assert(f->hw);
+    route_want(&want, 0, S, G, &P3, 0);
+    want.tagged = false;
+    ft_mc_route_publish(&route, &want);
     answer(&P1, S, 0, BR_MCAST_TO_HOST_PROMISC, 1, &P2);
     f->dirty = true;
     pass();
@@ -3743,7 +3756,7 @@ static void a_netdev_chain_keeps_a_flow_in_software(void)
     BRV.nf_ingress = false;
     f->dirty = true;
     pass();
-    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+    assert(f->hw && route.carried && !strcmp(ft_mc_state(f), "installed"));
     /* And the bridge's own LOCAL_IN hook, which only the copy it hands up
      * crosses: a bridge chain there no forwarded frame meets. */
     bridge_local_in = true;
@@ -3755,6 +3768,7 @@ static void a_netdev_chain_keeps_a_flow_in_software(void)
     pass();
     assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
     bridge_local_in = false;
+    withdraw(&route);
 
     /* A walk a commit interrupted, or without memory, answers nothing for
      * a port set the flow did not have: the new port's chains are unjudged,

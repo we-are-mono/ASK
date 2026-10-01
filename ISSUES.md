@@ -207,15 +207,8 @@ result independently of those temporary files.
   terminal kind reboots within the timeout and the next boot reads the persisted reason; a
   forced hang (sysrq hard lockup) is reset by the watchdog; the cap holds after three loops.
 
-- [ ] **A301 — a bridged flow the bridge hands up as a router or a promiscuous bridge is carried past
-  the IP stack's hooks.** With `BR_MCAST_TO_HOST_ROUTER` or `_PROMISC` and no route riding the flow,
-  `ft_mc_installable()` carries it, and the copy the bridge hands up never reaches `ip_rcv()` on the
-  bridge or a device above it: inet `prerouting`/`input` chains (counters, logs, `ct` matches) and
-  conntrack stop seeing the stream. The hand-up check (`ft_mc_soft_bridge()`, `cdx/ask_flowtable.c`)
-  covers tc, netdev chains and the bridge `input` hook only. Fix: refuse such a flow while an inet
-  chain at prerouting or input would see the hand-up copy, or refuse a hand-up no route rides
-  outright as `refused-host`. Regression: `mcast_router 2` on the bridge device, no ipmr VIF, an inet
-  prerouting counter on the group; require the counter to keep counting.
+- [x] **A301.** Keep local multicast copies in Linux; routed forwarding remains eligible. 50 host tests pass.
+  (_:/^cdx: keep local multicast delivery in software_).
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**

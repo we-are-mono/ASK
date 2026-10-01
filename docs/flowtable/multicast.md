@@ -622,6 +622,14 @@ silently. This is a refusal rather than a gap to fill later only because
 filling it means a listener whose egress is the host's own receive queue,
 which nothing in the encoder expresses today. `/proc` says `refused-host`.
 
+Router and promiscuous delivery obey the same rule even when no VIF exists:
+the copy must reach Linux and its IP hooks, including counters and conntrack,
+whether Linux ultimately accepts or drops it. Such a flow is `refused-host`.
+When a VIF or multicast route does receive the stream, it stays
+`refused-routed` until an offloaded route accounts for that copy. The worker
+also removes an installed entry when local delivery starts, and can readmit
+the flow once it stops.
+
 **Bridge filtering.** A carried flow is replicated at the classifier, before
 any bridge netfilter hook runs. An nftables `bridge` chain, an ebtables table,
 or `br_netfilter` handing bridged traffic to iptables would stop seeing the
