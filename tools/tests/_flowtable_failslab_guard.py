@@ -44,6 +44,9 @@ TARGETS = {
     "multicast-install": ("cdx_mc_group_add", "cdx", SOFTIRQ),
     "mroute-event": ("ft_fib_event", "ask_flowtable", SOFTIRQ),
     "mroute-group": ("ft_mr_apply", "ask_flowtable", SOFTIRQ),
+    # Built in: the classifier delete, whose only slab allocation is the node
+    # that rebuilds a crowded bucket without the key.
+    "ehash-delete": ("ExternalHashTableDeleteKey", None, SOFTIRQ),
 }
 KNOBS = ("probability", "times", "interval", "space", "verbose", "task-filter",
          "ignore-gfp-wait", "cache-filter", "stacktrace-depth", "require-start",
@@ -93,7 +96,7 @@ def drain_kmsg(fd):
 def run(root, target, *, lease=20, continuous=False, debugfs=Path("/sys/kernel/debug/failslab"),
         kallsyms=Path("/proc/kallsyms"), backend=Path("/proc/cdx_flowtable"),
         lock_path=Path("/run/lock/ask-flowtable-failslab.lock"), kmsg=Path("/dev/kmsg")):
-    assert 0 < lease <= 30
+    assert 0 < lease <= 60
     root.mkdir(exist_ok=True)
     snapshot, result, records = {}, {"target": target, "consumed": False, "continuous": continuous}, []
     fd = None
@@ -173,4 +176,5 @@ if __name__ == "__main__":
     root = Path(sys.argv[1])
     # TERM requests the same bounded cleanup as a normal cancellation.
     signal.signal(signal.SIGTERM, lambda *_: (root / "cancel").touch())
-    run(root, sys.argv[2], continuous=len(sys.argv) > 3 and sys.argv[3] == "continuous")
+    run(root, sys.argv[2], continuous=len(sys.argv) > 3 and sys.argv[3] == "continuous",
+        lease=int(sys.argv[4]) if len(sys.argv) > 4 else 20)

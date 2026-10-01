@@ -40,10 +40,12 @@ struct en_exthash_node {
     uint32_t word_1, word_2, table_base_lo;
 };
 struct en_exthash_bucket { uint64_t h, pad; };
+struct en_cumulative_tbl_entry;
 struct en_exthash_info {
     void *table_base, **pSpinlock, *h_Ad, *pcd;
     unsigned tree_owners, hashmask, num_keys;
     struct en_exthash_node node;
+    struct en_cumulative_tbl_entry *spare;
 };
 typedef struct { uintptr_t physicalMuramBase; unsigned env_owners; } t_FmPcd;
 enum { e_FM_PCD_CC, e_FM_PCD_FR, e_FM_PCD_DONE };
@@ -66,6 +68,7 @@ static void release(void *p) { assert(p && allocations); allocations--; free(p);
 #define XX_FreeSpinlock release
 #define XX_FreeSmart release
 #define kfree release
+static void ExternalHashTableCumulativeEntryFree(void *node) { release(node); }
 static void *FmPcdGetMuramHandle(void *pcd) { assert(pcd); return pcd; }
 static void FM_MURAM_FreeMem(void *muram, void *p) { assert(muram); release(p); }
 static void FmPcdDecNetEnvOwners(t_FmPcd *pcd, unsigned id) { assert(pcd->env_owners); pcd->env_owners--; }
@@ -75,6 +78,8 @@ static void FmPcdReleaseLock(void *p, void *lock) { assert(!lock); }
 static void DeleteTree(t_FmPcdCcTree *tree, t_FmPcd *pcd) { release((void *)tree->ccTreeBaseAddr); release(tree); }
 #include "ehash_production.inc"
 
+/* A table as its creation leaves it, down to the spare cumulative node a
+ * delete falls back on; teardown has to give every piece back. */
 static struct en_exthash_info *table(t_FmPcd *pcd)
 {
     struct en_exthash_info *t = allocate(sizeof(*t));
@@ -82,6 +87,7 @@ static struct en_exthash_info *table(t_FmPcd *pcd)
     t->table_base = allocate(2 * sizeof(struct en_exthash_bucket));
     t->pSpinlock = allocate(2 * sizeof(void *));
     for (unsigned i = 0; i < 2; i++) t->pSpinlock[i] = allocate(1);
+    t->spare = allocate(1);
     return t;
 }
 static t_FmPcdCcTree *root(t_FmPcd *pcd, struct en_exthash_info *t)

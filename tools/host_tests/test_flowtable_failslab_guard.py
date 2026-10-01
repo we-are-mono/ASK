@@ -121,7 +121,8 @@ def test_task_context_faults_exclude_softirq_stacks(tmp_path, knobs, target):
 
 # Where each target's owner keeps its source: the ASK modules in cdx/, the
 # kernel's own in the tree ASK_KERNEL_SOURCE names.
-KERNEL_DIRS = {None: "net/core", "nf_flow_table": "net/netfilter"}
+KERNEL_DIRS = {None: ("net/core", "drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd"),
+               "nf_flow_table": ("net/netfilter",)}
 
 
 @pytest.mark.parametrize("target", sorted(guard.TARGETS))
@@ -135,7 +136,8 @@ def test_every_target_names_a_function_its_module_defines(target):
         kernel = os.environ.get("ASK_KERNEL_SOURCE")
         if not kernel:
             pytest.skip("ASK_KERNEL_SOURCE names no kernel tree")
-        files = sorted((Path(kernel) / KERNEL_DIRS[module]).glob("*.c"))
+        files = sorted(path for directory in KERNEL_DIRS[module]
+                       for path in (Path(kernel) / directory).glob("*.c"))
     definition = re.compile(rf"(?m)^(?:[A-Za-z_][\w \t*]*[\s*])?{re.escape(name)}\([^;{{]*\)\s*\{{")
     assert any(definition.search(path.read_text(errors="replace")) for path in files), (target, name)
 
@@ -188,7 +190,7 @@ async def test_lost_launch_acknowledgement_still_cancels_guard(monkeypatch, canc
             assert args[1].endswith("/cancel")
             cancelled = True
         else:
-            assert args[0] == "mkdir"
+            assert args[0] in ("mkdir", "rm")
 
     async def launch(*args):
         nonlocal active

@@ -1,4 +1,4 @@
-From 9be812ec7b68c338cd7cef84f16f1e849d486edd Mon Sep 17 00:00:00 2001
+From dff773266a7fecf4976bbfddc3d0fd4853442a77 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -77,6 +77,18 @@ Copy the layout-checked scheme tail through its containing objects so
 FORTIFY retains the full source and destination bounds. Bound compat
 union copies by the source member and reject reserved reassembly conversion.
 
+A classifier delete that rebuilds a shared bucket's cumulative node takes
+the replacement outside the bucket lock, from the allocator or from a
+per-table spare that every node proven unreachable refills. It fails for
+memory only if an earlier rebuild on the table took the spare and its
+barrier failed, leaving the node it replaced parked, the allocator fails
+now, and a fresh barrier to release that node fails too -- or if that
+node was released through another table's barrier instead, or a
+concurrent delete on the table holds the spare.
+
+Order the stores that fill a table entry or cumulative node before the
+store that links it for the FMan (dma_wmb()).
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  Makefile                                      |    5 +
@@ -99,7 +111,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 ++-----
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 ++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1225 +++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1346 ++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +---------
@@ -120,7 +132,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +--
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1484 ++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1490 ++++++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
@@ -160,7 +172,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 81 files changed, 9027 insertions(+), 5159 deletions(-)
+ 81 files changed, 9154 insertions(+), 5159 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -5217,16 +5229,16 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..83df80d458e1
+index 000000000000..b09d25feea9d
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1225 @@
+@@ -0,0 +1,1346 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
 + */
 +
-+/**
++/*
 + * @file                fm_ehash.c
 + * @description         DPAA enhanced external hash functions
 + */
@@ -5237,6 +5249,7 @@ index 000000000000..83df80d458e1
 +#include <linux/kernel.h>
 +#include <linux/slab.h>
 +#include <linux/spinlock.h>
++#include <linux/atomic.h>
 +#include "fm_common.h"
 +#include "fm_muram_ext.h"
 +#include "fm_ehash.h"
@@ -5257,7 +5270,6 @@ index 000000000000..83df80d458e1
 +	        uint8_t crc_shift, uint16_t mask, uint16_t *bucket_index);
 +
 +#ifdef CONFIG_FSL_SDK_FMAN_EHASH_SYNC_FAULT
-+#include <linux/atomic.h>
 +#include <linux/proc_fs.h>
 +#include <linux/seq_file.h>
 +#include <linux/uaccess.h>
@@ -5411,9 +5423,6 @@ index 000000000000..83df80d458e1
 +void *ExternalHashTableAllocCumulativeEntry(t_Handle h_HashTbl)
 +{
 +	void *entry;
-+	struct en_exthash_info *info;
-+
-+	info = (struct en_exthash_info *) h_HashTbl;
 +
 +	entry = XX_MallocSmart(sizeof(struct en_cumulative_tbl_entry), 0 /*info->dataMemId not used */, EN_EHASH_ENTRY_ALIGN);
 +	if (entry)
@@ -5427,6 +5436,59 @@ index 000000000000..83df80d458e1
 +void ExternalHashTableCumulativeEntryFree(void *entry)
 +{
 +	XX_FreeSmart(entry);
++}
++
++/* The table's spare, if it holds one. A released node keeps whatever its
++ * chain or the parked list last wrote into it, so it is zeroed like a new one:
++ * the rebuild that links it sets only the links its neighbours need. */
++static struct en_cumulative_tbl_entry *ehash_node_take_spare(struct en_exthash_info *info)
++{
++	struct en_cumulative_tbl_entry *node = xchg(&info->spare, NULL);
++
++	if (node)
++		memset(node, 0, sizeof(*node));
++	return node;
++}
++
++/* The replacement cumulative node a delete needs when it rebuilds a crowded
++ * bucket's node without the key. The allocator is atomic and can fail under
++ * memory pressure, and a delete that fails for want of the node leaves the
++ * key linked: the caller then has to abandon the entry, which CDX treats as
++ * terminal. So a delete that finds, under the bucket lock, that it needs one
++ * drops the lock without changing anything, takes one here -- from the
++ * allocator or, when that fails, from the table's spare -- and starts over
++ * (ExternalHashTableDeleteKey()).
++ *
++ * The spare is refilled by the first node released on the table after it was
++ * taken (ehash_node_release()): every node a completed barrier proves
++ * unreachable -- the one a rebuild replaced, the ones a shrinking chain
++ * dropped, and the parked ones, which go to the table the barrier was issued
++ * through -- and a node a delete took but did not link. A rebuild that took
++ * the spare releases the node it replaced once its barrier completes, so the
++ * spare is back before the next delete however long the allocator keeps
++ * failing, as long as the barriers complete. The add path never takes it: a
++ * failed add links nothing, so its allocations may fail. */
++static struct en_cumulative_tbl_entry *ehash_node_alloc(struct en_exthash_info *info)
++{
++	struct en_cumulative_tbl_entry *node;
++
++	node = XX_MallocSmart(sizeof(*node), 0 /*info->dataMemId not used */,
++			      EN_EHASH_ENTRY_ALIGN);
++	if (node) {
++		memset(node, 0, sizeof(*node));
++		return node;
++	}
++	return ehash_node_take_spare(info);
++}
++
++/* A cumulative node nothing can reach any more: one a completed barrier proved
++ * the microcode has left, or one never linked. It refills the table's spare if
++ * that is empty, and goes back to the allocator otherwise. */
++static void ehash_node_release(struct en_exthash_info *info,
++			       struct en_cumulative_tbl_entry *node)
++{
++	if (node && cmpxchg(&info->spare, NULL, node))
++		ExternalHashTableCumulativeEntryFree(node);
 +}
 +
 +/* Cumulative nodes an add or a delete took out of a bucket's chain when the
@@ -5505,7 +5567,7 @@ index 000000000000..83df80d458e1
 +		while (parked) {
 +			node = parked;
 +			parked = node->next_entry;
-+			ExternalHashTableCumulativeEntryFree(node);
++			ehash_node_release(info, node);
 +		}
 +		return 0;
 +	}
@@ -5549,6 +5611,16 @@ index 000000000000..83df80d458e1
 +}
 +EXPORT_SYMBOL(ExternalHashTableEntryGetStatsAndTS);
 +
++/* The FMan walks these tables coherently, but nothing orders its reads
++ * against the CPU's stores: a table entry or cumulative node filled just
++ * before the store that links it -- the bucket head, or the previous node's
++ * next_entry_addr -- could be seen linked before its contents are. The add
++ * and the delete therefore issue dma_wmb() before every store that links
++ * memory written just before it, the caller's table entry included. A store
++ * that links something the FMan could already reach needs none, except the
++ * one unlink that clears a node's next-node flag and then its address: the
++ * two are ordered the same way, so the FMan never follows a cleared
++ * address. */
 +int ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize,
 +                                      struct en_exthash_tbl_entry *tbl_entry)
 +{
@@ -5600,6 +5672,7 @@ index 000000000000..83df80d458e1
 +		new_entry->next =  NULL;
 +		//change the head pointer in the bucket
 +		phyaddr = XX_VirtToPhys(new_entry);
++		dma_wmb();
 +		bucket->h = SwapUint64(phyaddr);
 +	}
 +	else
@@ -5657,6 +5730,7 @@ index 000000000000..83df80d458e1
 +					cumulative_tbl_entry->next_entry->prev_entry = tmp_tbl_entry;
 +				// initiate host command
 +				FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
++				dma_wmb();
 +				if (cumulative_tbl_entry->prev_entry)
 +				{
 +					phyaddr =  XX_VirtToPhys(tmp_tbl_entry);
@@ -5692,7 +5766,7 @@ index 000000000000..83df80d458e1
 +					ehash_park_node(info, cumulative_tbl_entry);
 +					return retval;
 +				}
-+				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
++				ehash_node_release(info, cumulative_tbl_entry);
 +				return retval;
 +			}
 +			else
@@ -5725,6 +5799,7 @@ index 000000000000..83df80d458e1
 +				
 +				//change the head pointer in the bucket
 +				phyaddr = XX_VirtToPhys(tmp_tbl_entry);
++				dma_wmb();
 +				bucket->h = SwapUint64(phyaddr);
 +			}
 +		}
@@ -5761,6 +5836,7 @@ index 000000000000..83df80d458e1
 +			//change the head pointer in the bucket
 +			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +			phyaddr = XX_VirtToPhys(cumulative_tbl_entry);
++			dma_wmb();
 +			bucket->h = SwapUint64(phyaddr);
 +			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		}
@@ -5793,6 +5869,8 @@ index 000000000000..83df80d458e1
 +		}
 +		if (info->table_base)
 +			XX_FreeSmart(info->table_base);
++		if (info->spare)
++			ExternalHashTableCumulativeEntryFree(info->spare);
 +		kfree(info);
 +	}
 +}
@@ -5918,6 +5996,11 @@ index 000000000000..83df80d458e1
 +    	}
 +	//clear table
 +	memset(info->table_base, 0, info->tablesize);
++	/* The node a delete falls back on when the allocator fails it
++	 * (ehash_node_alloc()). */
++	info->spare = ExternalHashTableAllocCumulativeEntry(info);
++	if (!info->spare)
++		goto err_ret;
 +	info->keysize = p_Param->matchKeySize;
 +        info->hashshift = p_Param->hashShift;
 +	/* Flow timestamps are always on: the cdx fast path reads them. */
@@ -6085,20 +6168,30 @@ index 000000000000..83df80d458e1
 +}
 +EXPORT_SYMBOL(ExternalHashTableFmPcdHcSync);
 +
-+int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
++/* ehash_delete_key() asking for a replacement node; never returned by
++ * ExternalHashTableDeleteKey(). */
++#define EHASH_DELETE_NEEDS_NODE	1
++
++/* The delete proper, for ExternalHashTableDeleteKey(). *node is a zeroed
++ * cumulative node taken outside the bucket lock, or NULL. The one arm that
++ * rebuilds a node without the key links *node and clears it; with *node NULL
++ * it returns EHASH_DELETE_NEEDS_NODE instead, before changing anything and
++ * with the lock dropped, so the caller can take one and start over. A node
++ * still in *node on return is the caller's to release. */
++static int ehash_delete_key(struct en_exthash_info *info, uint16_t index,
++			    void *tbl_entry, struct en_cumulative_tbl_entry **node)
 +{
 +	t_Handle *h_Spinlock;
 +	uint32_t intFlags;
 +	uint64_t phyaddr;
-+	struct en_exthash_info *info;
 +	struct en_exthash_bucket *bucket;
 +	struct en_exthash_tbl_entry *entry;
 +	struct en_exthash_tbl_entry *temp_entry;
 +	struct en_cumulative_entry *cumulative_entry, *tmp;
 +	struct en_cumulative_tbl_entry *cumulative_tbl_entry, *tmp_tbl_entry = NULL;
 +	uint8_t ii, match=0, flags;
++	bool rebuild;
 +
-+	info = (struct en_exthash_info *)h_HashTbl;
 +	bucket = ((struct en_exthash_bucket *)info->table_base + index);
 +	entry = (struct en_exthash_tbl_entry *)tbl_entry;
 +	h_Spinlock = *(info->pSpinlock + index);
@@ -6158,28 +6251,26 @@ index 000000000000..83df80d458e1
 +		if (match) // if found
 +		{
 +			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
++			rebuild = cumulative_entry->num_key_entries > 2 ||
++				  (cumulative_entry->num_key_entries == 2 &&
++				   (cumulative_tbl_entry->prev_entry ||
++				    cumulative_tbl_entry->next_entry));
++			if (rebuild && !*node) {
++				/* Nothing is changed yet, not even the invalid
++				 * flag below, which must never stay set on a node
++				 * that stays linked: it would blackhole every
++				 * co-resident key if the ucode honors the bit. */
++				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
++				return EHASH_DELETE_NEEDS_NODE;
++			}
 +			// cumulative entry might have the next entry, in that case, get the last table entry in last cumulative entry
 +			// and overwrite it with to-be-deleted table entry
 +			flags =  cumulative_entry->flags | EN_INVALID_CUMULATIVE_NODE;
 +			cumulative_entry->flags = flags;
-+			if ((cumulative_entry->num_key_entries > 2) ||
-+				((cumulative_entry->num_key_entries == 2) &&
-+				  ((cumulative_tbl_entry->prev_entry) || (cumulative_tbl_entry->next_entry))))
++			if (rebuild)
 +			{
-+				tmp_tbl_entry = ExternalHashTableAllocCumulativeEntry (h_HashTbl);
-+				if (!tmp_tbl_entry)
-+				{
-+					REPORT_ERROR(MAJOR, E_NO_MEMORY,
-+								 ("en_cumulative_entry"));
-+					/* The invalid flag was applied above to a node
-+					 * that stays linked on this bail-out; leaving
-+					 * it set would blackhole every co-resident key
-+					 * if the ucode honors the bit. Restore the
-+					 * live state before returning. */
-+					cumulative_entry->flags &= ~EN_INVALID_CUMULATIVE_NODE;
-+					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+					return -1;
-+				}
++				tmp_tbl_entry = *node;
++				*node = NULL;
 +				FM_EHASH_PRINT(" case 1 num keys > 1 %s(%d)\n",__func__,__LINE__);
 +				tmp = &tmp_tbl_entry->cumulative_entry;
 +				tmp->flags = cumulative_entry->flags & 0xbf; 
@@ -6212,6 +6303,7 @@ index 000000000000..83df80d458e1
 +					cumulative_tbl_entry->next_entry->prev_entry = tmp_tbl_entry;
 +				}
 +				phyaddr = SwapUint64(XX_VirtToPhys(tmp_tbl_entry));
++				dma_wmb();
 +				if (cumulative_tbl_entry->prev_entry)
 +				{
 +					FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
@@ -6232,7 +6324,8 @@ index 000000000000..83df80d458e1
 +					ehash_park_node(info, cumulative_tbl_entry);
 +					return EN_EHASH_DELETE_UNSYNCED;
 +				}
-+				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
++				/* Refills the spare if this delete took it. */
++				ehash_node_release(info, cumulative_tbl_entry);
 +			}
 +			else  // if only one entry in list and there is next pointer
 +			{
@@ -6289,9 +6382,8 @@ index 000000000000..83df80d458e1
 +						ehash_park_node(info, cumulative_tbl_entry);
 +						return EN_EHASH_DELETE_UNSYNCED;
 +					}
-+					if (tmp_tbl_entry)
-+						ExternalHashTableCumulativeEntryFree(tmp_tbl_entry);
-+					ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
++					ehash_node_release(info, tmp_tbl_entry);
++					ehash_node_release(info, cumulative_tbl_entry);
 +				}
 +				else if (!cumulative_tbl_entry->prev_entry) // this is the first cumulative entry in list
 +				{
@@ -6307,16 +6399,17 @@ index 000000000000..83df80d458e1
 +							ehash_park_node(info, cumulative_tbl_entry);
 +							return EN_EHASH_DELETE_UNSYNCED;
 +						}
-+						ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
++						ehash_node_release(info, cumulative_tbl_entry);
 +					}
 +					else // no next node , no prev node , only table entry in node ==> invalid case
 +					{
 +						FM_EHASH_PRINT("%s(%d)no next node , no prev node , only table entry in node ==> invalid case\n",__func__,__LINE__);
 +						REPORT_ERROR(MAJOR, E_INVALID_STATE,
 +									 ("Invalid state"));
-+						/* Same restore as the E_NO_MEMORY bail: the
-+						 * node stays linked, so the invalid flag set
-+						 * on entry to the match arm must not stick. */
++						/* The node stays linked, so the invalid
++						 * flag set on entry to the match arm must
++						 * not stick: it would blackhole every
++						 * co-resident key if the ucode honors it. */
 +						cumulative_entry->flags &= ~EN_INVALID_CUMULATIVE_NODE;
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +						return -1;
@@ -6339,6 +6432,7 @@ index 000000000000..83df80d458e1
 +						FM_EHASH_PRINT("%s(%d) update the next cumulative node with prev entry\n",__func__,__LINE__);
 +						cumulative_tbl_entry->prev_entry->cumulative_entry.flags = flags;
 +						cumulative_tbl_entry->prev_entry->next_entry =	NULL;
++						dma_wmb();
 +						cumulative_tbl_entry->prev_entry->cumulative_entry.next_entry_addr = 0;
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
@@ -6346,7 +6440,7 @@ index 000000000000..83df80d458e1
 +						ehash_park_node(info, cumulative_tbl_entry);
 +						return EN_EHASH_DELETE_UNSYNCED;
 +					}
-+					ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
++					ehash_node_release(info, cumulative_tbl_entry);
 +				}
 +			}
 +		}// match not found
@@ -6361,6 +6455,45 @@ index 000000000000..83df80d458e1
 +	}
 +
 +	return 0;
++}
++
++int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
++{
++	struct en_exthash_info *info = (struct en_exthash_info *)h_HashTbl;
++	struct en_cumulative_tbl_entry *node = NULL;
++	int rc;
++
++	rc = ehash_delete_key(info, index, tbl_entry, &node);
++	if (rc == EHASH_DELETE_NEEDS_NODE) {
++		node = ehash_node_alloc(info);
++		/* The spare is empty after a rebuild on this table took it
++		 * while the allocator was failing and then parked the node it
++		 * replaced on a failed barrier (EN_EHASH_DELETE_UNSYNCED). A
++		 * barrier that completes now releases that node into this
++		 * table's spare, as ehash_barrier() does every parked node. */
++		if (!node && READ_ONCE(ehash_parked) && !ehash_barrier(info, false))
++			node = ehash_node_take_spare(info);
++		if (!node) {
++			/* So a delete fails for memory only when the allocator
++			 * fails now, an earlier rebuild on this table left the
++			 * spare empty as above, and this barrier fails too.
++			 * Two rarer ways leave the spare empty with nothing
++			 * parked to refill it: a barrier issued through
++			 * another table has released the parked node there,
++			 * or another delete on this table holds the spare at
++			 * this moment, which CDX's serialized deletes never
++			 * do. The bucket is untouched and the key still
++			 * linked, as -1 tells the caller. */
++			REPORT_ERROR(MAJOR, E_NO_MEMORY, ("en_cumulative_entry"));
++			return -1;
++		}
++		/* With a node in hand the delete cannot ask again. */
++		rc = ehash_delete_key(info, index, tbl_entry, &node);
++	}
++	/* A node is left over only if the bucket changed while the lock was
++	 * dropped and the delete no longer rebuilt one. */
++	ehash_node_release(info, node);
++	return rc;
 +}
 +
 +EXPORT_SYMBOL(ExternalHashTableDeleteKey);
@@ -11695,10 +11828,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..93772fb0842e
+index 000000000000..e1d36939f13a
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1484 @@
+@@ -0,0 +1,1490 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -12346,6 +12479,11 @@ index 000000000000..93772fb0842e
 +	uint32_t max_collisions;//max collisions in the table that occured anytime upto now.
 +	void *pcd;		//pcd handle
 +	uint32_t type;		//table type
++	/* A cumulative node held back for a delete that cannot allocate the
++	 * replacement node it needs. Filled when the table is created, taken
++	 * and refilled with xchg()/cmpxchg() because deletes on different
++	 * buckets do not share a lock; see ehash_node_alloc() in fm_ehash.c. */
++	struct en_cumulative_tbl_entry *spare;
 +};
 +
 +struct en_exthash_tbl_entry {
@@ -13167,8 +13305,9 @@ index 000000000000..93772fb0842e
 +/* ExternalHashTableDeleteKey() return contract. 0 means the key was
 + * unlinked AND a host-command sync completed, so no ucode walker can
 + * still reach the entry -- the caller may free it. -1 means the key
-+ * was NOT provably unlinked (invalid table state, allocation failure
-+ * for a replacement cumulative node, or no matching node): the entry
++ * was NOT provably unlinked (invalid table state, no matching node, or
++ * no replacement cumulative node -- only when the allocation fails, the
++ * table's spare is empty and a barrier to refill it fails): the entry
 + * memory may still be referenced by a live chain and must be leaked,
 + * never freed -- not even later. EN_EHASH_DELETE_UNSYNCED means the
 + * unlink surgery completed but the sync failed (transient HC-channel

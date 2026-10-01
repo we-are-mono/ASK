@@ -4,7 +4,12 @@
  * the delete hands the caller its table entry to park, and any cumulative node
  * the unlink displaced is parked inside -- never freed before a later sync on
  * the PCD completes, and never lost either. LeakSanitizer is the second half of
- * that oracle: a displaced node nobody parked is a leak at exit. */
+ * that oracle: a displaced node nobody parked is a leak at exit.
+ *
+ * The other thing checked is what a failed allocation leaves: a delete that
+ * rebuilds a node takes the replacement outside the bucket lock and falls back
+ * on the table's spare, so it unlinks the key however the allocator does, and
+ * fails only when the spare is gone too -- then with the bucket untouched. */
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,7 +20,8 @@
 typedef void *t_Handle;
 typedef int t_Error;
 #define FM_EHASH_PRINT(...) ((void)0)
-#define REPORT_ERROR(level, err, msg) ((void)0)
+static unsigned reports;
+#define REPORT_ERROR(level, err, msg) (reports++)
 #define SANITY_CHECK_RETURN_ERROR(p, e) do { if (!(p)) return -1; } while (0)
 #define printk(...) ((void)0)
 /* The barrier's own lines, counted: a run of failed barriers reports its
@@ -27,6 +33,17 @@ static unsigned sync_failed_lines, sync_recovered_lines;
 #define XX_PhysToVirt(a) ((void *)(uintptr_t)(a))
 #define SwapUint64(v) __builtin_bswap64(v)
 #define DEFINE_SPINLOCK(name) bool name
+/* The spare's atomics, with the kernel's results: xchg() the old value,
+ * cmpxchg() the old value whether or not it stored the new one. */
+#define xchg(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define cmpxchg(p, o, n) ({ __typeof__(*(p)) old_ = (o); \
+    __atomic_compare_exchange_n((p), &old_, (n), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); \
+    old_; })
+#define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
+/* The barrier that makes what a store links visible to the FMan before the
+ * store itself, counted: a case checks which operations issue one. */
+static unsigned link_barriers;
+#define dma_wmb() ((void)link_barriers++)
 static unsigned warnings;
 #define WARN_ONCE(cond, ...) ({ bool warned_ = (cond); if (warned_) warnings++; warned_; })
 
@@ -42,11 +59,20 @@ static void XX_UnlockIntrSpinlock(t_Handle lock, uint32_t flags)
 #define spin_unlock_irqrestore(lock, flags) do { assert(*(lock)); *(lock) = false; (void)(flags); } while (0)
 
 /* Table entries and cumulative nodes come from the same allocator; the
- * sizes tell them apart, which is how a case counts the nodes. */
-static unsigned live_entries, live_nodes;
+ * sizes tell them apart, which is how a case counts the nodes. A case can
+ * fail the next node allocations, as an atomic allocation fails under memory
+ * pressure, and run a hook at the next one; the allocations made under a
+ * bucket lock are counted, since a delete must make none. */
+static unsigned live_entries, live_nodes, fail_node_allocs, locked_node_allocs;
+static void (*during_node_alloc)(void);
 static void *XX_MallocSmart(uint32_t size, int mem, uint32_t align)
 {
     (void)mem;
+    if (size == sizeof(struct en_cumulative_tbl_entry)) {
+        if (during_node_alloc) { void (*hook)(void) = during_node_alloc; during_node_alloc = NULL; hook(); }
+        locked_node_allocs += bucket_locked;
+        if (fail_node_allocs) { fail_node_allocs--; return NULL; }
+    }
     void *p = aligned_alloc(align, (size + align - 1) / align * align);
     assert(p);
     if (size == sizeof(struct en_cumulative_tbl_entry)) live_nodes++; else live_entries++;
@@ -128,19 +154,41 @@ static unsigned chained(void)
         n++;
     return n;
 }
-/* A delete that succeeds; the caller may then free its entry. */
+/* The cumulative nodes the table holds on its chain or parked: every one
+ * allocated, less the table's spare. */
+static unsigned nodes(void) { return live_nodes - (info.spare != NULL); }
+/* A delete that succeeds; the caller may then free its entry. Whatever it
+ * allocated, it allocated outside the bucket lock, and a completed barrier
+ * always leaves the spare full: a delete that took it relinks the node it
+ * replaced, or gives back the one it did not link. */
 static void removed(struct en_exthash_tbl_entry *e)
 {
+    unsigned locked = locked_node_allocs;
+
     assert(ExternalHashTableDeleteKey(&info, 0, e) == 0 && !found(e));
+    assert(locked_node_allocs == locked && info.spare);
     release_entry(e);
 }
 /* A delete whose barrier fails: the entry is out of the chain but not yet
  * the caller's to free. */
 static void unsynced(struct en_exthash_tbl_entry *e)
 {
+    unsigned locked = locked_node_allocs;
+
     fail_delete_syncs = 1;
     assert(ExternalHashTableDeleteKey(&info, 0, e) == EN_EHASH_DELETE_UNSYNCED);
-    assert(!fail_delete_syncs && !found(e));
+    assert(!fail_delete_syncs && !found(e) && locked_node_allocs == locked);
+}
+/* Other deletes on the same bucket while one has dropped its lock to take a
+ * node, with the allocator working for them. */
+static struct en_exthash_tbl_entry *meanwhile[2];
+static void delete_meanwhile(void)
+{
+    unsigned failing = fail_node_allocs;
+
+    fail_node_allocs = 0;
+    for (unsigned i = 0; i < 2; i++) { removed(meanwhile[i]); meanwhile[i] = NULL; }
+    fail_node_allocs = failing;
 }
 static struct en_cumulative_tbl_entry *late;
 static void park_late(void)
@@ -154,23 +202,27 @@ int main(void)
     struct en_exthash_tbl_entry *e[24];
     unsigned before;
 
+    /* The table's spare, which its creation fills. */
+    info.spare = ExternalHashTableAllocCumulativeEntry(&info);
+    assert(info.spare && live_nodes == 1 && !nodes());
+
     /* Three keys in one cumulative node; the third add replaced the node the
      * second made, behind a sync. */
     for (unsigned i = 0; i < 3; i++) { e[i] = entry(i); add(e[i]); }
-    assert(chained() == 1 && live_nodes == 1 && found(e[0]) && found(e[1]) && found(e[2]));
+    assert(chained() == 1 && nodes() == 1 && found(e[0]) && found(e[1]) && found(e[2]));
 
     /* A delete that rebuilds the node without the key: the node it replaced
      * is parked, the caller's entry comes back unsynced. */
     unsynced(e[2]);
-    assert(parked() == 1 && live_nodes == 2 && chained() == 1 && found(e[0]) && found(e[1]));
+    assert(parked() == 1 && nodes() == 2 && chained() == 1 && found(e[0]) && found(e[1]));
     assert(sync_failed_lines == 1 && !sync_recovered_lines);
     /* A barrier that fails keeps it; one that completes frees it, and the
      * caller may then free its own entry. The failure continues the delete's
      * run, so it adds no line; the completion ends it with one. */
     fail_syncs = 1;
-    assert(ExternalHashTableFmPcdHcSync(&info) == -1 && parked() == 1 && live_nodes == 2);
+    assert(ExternalHashTableFmPcdHcSync(&info) == -1 && parked() == 1 && nodes() == 2);
     assert(sync_failed_lines == 1 && !sync_recovered_lines);
-    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked() && live_nodes == 1);
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked() && nodes() == 1);
     assert(sync_failed_lines == 1 && sync_recovered_lines == 1);
     release_entry(e[2]);
 
@@ -178,25 +230,25 @@ int main(void)
      * the node is parked. A node parked while a later sync is in flight was
      * unlinked too late for it, and waits for the next. */
     unsynced(e[1]);
-    assert(direct(e[0]) && parked() == 1 && live_nodes == 1);
+    assert(direct(e[0]) && parked() == 1 && nodes() == 1);
     during_sync = park_late;
     removed(e[0]);
-    assert(!bucket.h && parked() == 1 && ehash_parked == late && live_nodes == 1);
+    assert(!bucket.h && parked() == 1 && ehash_parked == late && nodes() == 1);
     release_entry(e[1]);
-    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked() && !live_nodes);
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked() && !nodes());
 
     /* A chain: ten keys fill a node, the eleventh starts one in front. The
      * front node going, with the one behind still holding ten, moves the
      * bucket to the one behind and parks the front. */
     for (unsigned i = 0; i < 11; i++) { e[i] = entry(100 + i); add(e[i]); }
-    assert(chained() == 2 && live_nodes == 2);
+    assert(chained() == 2 && nodes() == 2);
     unsynced(e[10]);
-    assert(chained() == 1 && parked() == 1 && live_nodes == 2);
+    assert(chained() == 1 && parked() == 1 && nodes() == 2);
     /* A delete that syncs is the same barrier: it frees what it replaced and
      * what was parked before it. */
     before = syncs;
     removed(e[0]);
-    assert(syncs == before + 1 && !parked() && live_nodes == 1 && chained() == 1);
+    assert(syncs == before + 1 && !parked() && nodes() == 1 && chained() == 1);
     release_entry(e[10]);
 
     /* Not the front node, and down to its last key: the node before it is
@@ -213,19 +265,19 @@ int main(void)
     assert(!parked());
     release_entry(e[10]);
     removed(e[12]);
-    assert(!bucket.h && !live_nodes);
+    assert(!bucket.h && !nodes());
 
     /* Two single-key nodes in a chain. Either one going leaves the bucket
      * holding the other's entry directly, and both nodes are parked. */
     for (unsigned front = 0; front < 2; front++) {
         for (unsigned i = 0; i < 11; i++) { e[i] = entry(200 + i); add(e[i]); }
         for (unsigned i = 1; i < 10; i++) removed(e[i]);
-        assert(chained() == 2 && live_nodes == 2);
+        assert(chained() == 2 && nodes() == 2);
         struct en_exthash_tbl_entry *gone = front ? e[10] : e[0], *kept = front ? e[0] : e[10];
         unsynced(gone);
-        assert(direct(kept) && parked() == 2 && live_nodes == 2);
+        assert(direct(kept) && parked() == 2 && nodes() == 2);
         removed(kept);
-        assert(!bucket.h && !parked() && !live_nodes);
+        assert(!bucket.h && !parked() && !nodes());
         release_entry(gone);
     }
 
@@ -235,8 +287,8 @@ int main(void)
     e[2] = entry(302);
     fail_syncs = 1;
     add(e[2]);
-    assert(found(e[2]) && parked() == 1 && live_nodes == 2);
-    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked() && live_nodes == 1);
+    assert(found(e[2]) && parked() == 1 && nodes() == 2);
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked() && nodes() == 1);
 
     /* One sync proves nothing about a second PCD's walkers, so a node from
      * one is refused a place beside this PCD's and left alone. */
@@ -244,17 +296,205 @@ int main(void)
     assert(parked() == 1);
     struct en_exthash_info other = info;
     other.pcd = &other_pcd;
+    other.spare = NULL;
     struct en_cumulative_tbl_entry *stray = ExternalHashTableAllocCumulativeEntry(&other);
     ehash_park_node(&other, stray);
     assert(warnings == 1 && parked() == 1);
     /* Nor does a sync on the second PCD free this one's. */
-    assert(ExternalHashTableFmPcdHcSync(&other) == 0 && parked() == 1);
+    assert(ExternalHashTableFmPcdHcSync(&other) == 0 && parked() == 1 && !other.spare);
     XX_FreeSmart(stray);
     removed(e[1]);
     assert(!parked());
     release_entry(e[2]);
     removed(e[0]);
-    assert(!bucket.h && !live_nodes && !live_entries && !bucket_locked);
+    assert(!bucket.h && !nodes() && !live_entries && !bucket_locked);
+
+    /* The allocator failing a delete that rebuilds a node: the delete looks
+     * under the lock, finds it needs one, drops the lock without touching
+     * the bucket and takes the table's spare instead. The key is unlinked,
+     * nothing is reported, and the node it replaced, once the barrier
+     * proves it unreachable, is the new spare. */
+    struct en_cumulative_tbl_entry *spare, *replaced;
+    for (unsigned i = 0; i < 5; i++) { e[i] = entry(400 + i); add(e[i]); }
+    assert(chained() == 1 && nodes() == 1);
+    spare = info.spare;
+    replaced = (void *)head();
+    before = reports;
+    fail_node_allocs = 1;
+    removed(e[4]);
+    assert(!fail_node_allocs && reports == before);
+    assert((void *)head() == spare && info.spare == replaced && nodes() == 1 && !parked());
+    for (unsigned i = 0; i < 4; i++) assert(found(e[i]));
+
+    /* The same with the barrier failing too: the key is unlinked all the
+     * same and the delete unsynced, with the node it replaced parked, so the
+     * spare stays empty until a node is next released on the table. */
+    spare = info.spare;
+    replaced = (void *)head();
+    fail_node_allocs = 1;
+    unsynced(e[3]);
+    assert(!fail_node_allocs && reports == before);
+    assert((void *)head() == spare && !info.spare && ehash_parked == replaced && parked() == 1);
+    for (unsigned i = 0; i < 3; i++) assert(found(e[i]));
+
+    /* Inside that window, a second rebuild while the allocator still fails
+     * issues one barrier of its own, which would release the parked node
+     * into the spare. When that barrier fails too, this is the one delete
+     * that still fails for memory -- reported, the bucket untouched, the key
+     * still resolving, no invalid flag left on the node that holds it, and
+     * the parked node still parked. */
+    struct en_cumulative_tbl_entry *holder = (void *)head();
+    uint64_t chain = bucket.h;
+    unsigned reported = reports;
+    before = syncs;
+    fail_node_allocs = 1;
+    fail_syncs = 1;
+    assert(ExternalHashTableDeleteKey(&info, 0, e[2]) == -1);
+    assert(!fail_node_allocs && !fail_syncs && syncs == before + 1);
+    assert(reports == reported + 1 && !bucket_locked);
+    assert(bucket.h == chain && (void *)head() == holder && found(e[2]) && chained() == 1);
+    assert(holder->cumulative_entry.num_key_entries == 3);
+    assert(!(holder->cumulative_entry.flags & EN_INVALID_CUMULATIVE_NODE));
+    assert(!info.spare && ehash_parked == replaced && parked() == 1);
+
+    /* The same delete when that barrier completes: the parked node is the
+     * spare again, the delete takes it and succeeds, and its own barrier
+     * releases the node it replaced into the spare in turn. The entry the
+     * unsynced delete handed back is proven gone with it. */
+    before = syncs;
+    fail_node_allocs = 1;
+    removed(e[2]);
+    assert(!fail_node_allocs && reports == reported + 1 && syncs == before + 2);
+    assert((void *)head() == replaced && info.spare == holder && !parked());
+    assert(chained() == 1 && nodes() == 1 && found(e[0]) && found(e[1]));
+    release_entry(e[3]);
+
+    /* An add that rebuilds a node refills an empty spare the same way, with
+     * the node it replaced once its barrier completes. */
+    spare = xchg(&info.spare, NULL);
+    replaced = (void *)head();
+    e[5] = entry(405);
+    add(e[5]);
+    assert(info.spare == replaced && (void *)head() != replaced && !parked());
+    assert(chained() == 1 && nodes() == 2 && found(e[5]));      /* and the one set aside */
+
+    /* With nothing parked, no barrier could refill the spare, so none is
+     * issued and the delete fails at once: how the spare is left when a
+     * barrier through another table released its node there. */
+    struct en_cumulative_tbl_entry *aside = xchg(&info.spare, NULL);
+    holder = (void *)head();
+    chain = bucket.h;
+    reported = reports;
+    before = syncs;
+    fail_node_allocs = 1;
+    assert(ExternalHashTableDeleteKey(&info, 0, e[5]) == -1);
+    assert(!fail_node_allocs && syncs == before && reports == reported + 1);
+    assert(bucket.h == chain && found(e[5]) && chained() == 1);
+    assert(!(holder->cumulative_entry.flags & EN_INVALID_CUMULATIVE_NODE));
+    info.spare = aside;
+    ExternalHashTableCumulativeEntryFree(spare);
+    removed(e[5]);
+    assert(found(e[0]) && found(e[1]) && chained() == 1 && nodes() == 1);
+
+    /* A delete that does not rebuild a node allocates nothing, so neither a
+     * failing allocator nor an empty spare can stop it: two keys and no
+     * neighbour, then the last key alone. The node the first one drops is
+     * the next released on the table, and fills the empty spare. */
+    holder = (void *)head();
+    spare = xchg(&info.spare, NULL);
+    fail_node_allocs = 1;
+    unsigned allocated = live_nodes;
+    assert(ExternalHashTableDeleteKey(&info, 0, e[1]) == 0 && !found(e[1]) && direct(e[0]));
+    release_entry(e[1]);
+    assert(info.spare == holder);
+    assert(ExternalHashTableDeleteKey(&info, 0, e[0]) == 0 && !bucket.h);
+    release_entry(e[0]);
+    assert(fail_node_allocs == 1 && live_nodes == allocated && info.spare == holder);
+    fail_node_allocs = 0;
+    ExternalHashTableCumulativeEntryFree(spare);
+    assert(!nodes() && !live_entries);
+
+    /* A node the delete took but no longer needs, the bucket having changed
+     * while the lock was dropped: here other deletes take the rest of the
+     * node's keys meanwhile, so the first finds its key alone in the bucket.
+     * The node goes back to the spare it came from. */
+    for (unsigned i = 0; i < 3; i++) { e[i] = entry(500 + i); add(e[i]); }
+    spare = info.spare;
+    fail_node_allocs = 1;
+    during_node_alloc = delete_meanwhile;
+    meanwhile[0] = e[1];
+    meanwhile[1] = e[0];
+    removed(e[2]);
+    assert(!during_node_alloc && !fail_node_allocs && !meanwhile[0] && !meanwhile[1]);
+    assert(info.spare == spare && !bucket.h && !parked() && !nodes());
+    assert(!live_entries && !bucket_locked);
+
+    /* A node released into the spare still holds the links its chain and the
+     * parked list last wrote, so taking it has to zero it: a rebuild through
+     * it links only what its neighbours need. Here the node behind a front
+     * node is rebuilt twice with both barriers failing, so the second node
+     * parked carries a chain link to the front node and a parked link to the
+     * first; a barrier then releases it into the empty spare and frees the
+     * first. */
+    for (unsigned i = 0; i < 11; i++) { e[i] = entry(600 + i); add(e[i]); }
+    assert(chained() == 2);
+    struct en_cumulative_tbl_entry *front = (void *)head(), *first, *stale;
+    spare = xchg(&info.spare, NULL);
+    unsynced(e[9]);
+    first = ehash_parked;
+    unsynced(e[8]);
+    stale = ehash_parked;
+    assert(parked() == 2 && stale->next_entry == first && stale->prev_entry == front);
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked() && info.spare == stale);
+    assert(stale->next_entry && stale->prev_entry == front);
+    release_entry(e[9]);
+    release_entry(e[8]);
+    /* The node behind, with eight keys and the front node before it, rebuilt
+     * through that spare while the allocator fails: the new node has the
+     * front node before it and nothing after it. A link left from the parked
+     * list would lead the chain into the node the barrier freed. */
+    fail_node_allocs = 1;
+    removed(e[7]);
+    assert(!fail_node_allocs && front->next_entry == stale && chained() == 2);
+    assert(stale->prev_entry == front && !stale->next_entry);
+    assert(!stale->cumulative_entry.next_entry_addr);
+    assert(!(stale->cumulative_entry.flags & EN_NEXT_CUMULATIVE_NODE));
+    ExternalHashTableCumulativeEntryFree(spare);
+    for (unsigned i = 0; i < 7; i++) removed(e[i]);
+    removed(e[10]);
+    assert(!bucket.h && !parked() && !nodes() && !live_entries);
+
+    /* Each add or delete that links memory it has just written issues the
+     * barrier before the linking store; one that only unlinks issues none,
+     * except the unlink that clears a node's next-node flag and then its
+     * address, which orders the two with it. */
+    before = link_barriers;
+    e[0] = entry(700); add(e[0]);               /* an empty bucket takes the entry */
+    assert(link_barriers == before + 1);
+    e[1] = entry(701); add(e[1]);               /* a new node for the two keys */
+    assert(link_barriers == before + 2);
+    e[2] = entry(702); add(e[2]);               /* the node rebuilt with three */
+    assert(link_barriers == before + 3);
+    removed(e[2]);                              /* and rebuilt with two */
+    assert(link_barriers == before + 4);
+    removed(e[1]);                              /* the bucket takes the last entry */
+    removed(e[0]);                              /* and then nothing */
+    assert(link_barriers == before + 4);
+    for (unsigned i = 0; i < 11; i++) { e[i] = entry(710 + i); add(e[i]); }
+    assert(chained() == 2 && link_barriers == before + 4 + 11);  /* the last a front node */
+    e[11] = entry(721); add(e[11]);             /* the front node rebuilt with two */
+    for (unsigned i = 0; i < 8; i++) removed(e[i]);
+    before = link_barriers;
+    removed(e[8]);                              /* the node behind rebuilt with one */
+    assert(link_barriers == before + 1);
+    removed(e[9]);                              /* and unhooked from the front node */
+    assert(link_barriers == before + 2 && chained() == 1);
+    struct en_cumulative_tbl_entry *last = (void *)head();
+    assert(!(last->cumulative_entry.flags & EN_NEXT_CUMULATIVE_NODE));
+    assert(!last->cumulative_entry.next_entry_addr && !last->next_entry);
+    removed(e[10]);
+    removed(e[11]);
+    assert(link_barriers == before + 2 && !bucket.h && !nodes() && !live_entries);
 
     /* A barrier retried once a second while the channel stays down reports
      * the first failure of the run only, however long it lasts; the barrier
@@ -269,6 +509,11 @@ int main(void)
     fail_syncs = 1;
     assert(ExternalHashTableFmPcdHcSync(&info) == -1 && sync_failed_lines == failed + 2);
     assert(ExternalHashTableFmPcdHcSync(&info) == 0 && sync_recovered_lines == recovered + 2);
-    puts("EHASH cumulative delete: every displaced node parked until a completed barrier, none leaked");
+
+    /* The table's destruction frees its spare, and with it the last node. */
+    ExternalHashTableCumulativeEntryFree(xchg(&info.spare, NULL));
+    assert(!live_nodes && !live_entries);
+    puts("EHASH cumulative delete: every displaced node parked until a completed barrier, none leaked; "
+         "a failed allocation falls back on the spare, and fails a delete only with the bucket untouched");
     return 0;
 }

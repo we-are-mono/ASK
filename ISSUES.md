@@ -189,21 +189,8 @@ result independently of those temporary files.
   or an oif's stack. Regression: legacy FORWARD drop of one port, two-port window as in
   `test_flowtable_service_multicast_ports.py`, require zero delivery of the dropped port.
 
-- [ ] **A295 — memory pressure can make a classifier delete terminal.** Deleting a key that
-  shares its bucket with others rebuilds the bucket's cumulative node, and
-  `ExternalHashTableDeleteKey()` (`fm_ehash.c`, patch 010) allocates the replacement with
-  `XX_MallocSmart()` while holding the bucket's spinlock. If that atomic allocation fails, the
-  delete returns FAILURE with the key still linked. `cdx_ehash_delete_entry()` then abandons the
-  entry, and the unicast, multicast or IPsec caller latches `cdx_ft_fatal()`: ports stopped,
-  reboot required. It is the one way to reach the terminal latch without fault injection, and
-  it needs only a busy box and a crowded bucket. NXP's code logged the same failure and freed
-  the entry anyway (`control_ipv4.c` `CONNTRACK_DEL_FAILED`), a silent hardware use-after-free.
-  Fix: allocate the replacement node before taking the lock, sleeping allowed where the caller
-  can sleep, and hand it to the delete; the delete fails only for a table inconsistency. The add
-  path's allocations can stay, since a failed add links nothing. Regression: a harness case that
-  fails the allocator on a cumulative-bucket delete and requires the key unlinked and no latch;
-  on the DUT, a fault knob at the allocator, deleting from a shared bucket, requiring no
-  `fatal`.
+- [x] **A295 — memory pressure could make a classifier delete terminal.** Fixed: a delete that rebuilds a crowded
+  bucket's node takes it outside the lock, from the allocator or a per-table spare every unreachable node refills (_:/^fm_ehash: back a classifier delete's node_).
 
 - [ ] **A296 — a terminal latch should restart the datapath, not demand a reboot.** Once
   `cdx_ft_fatal()` has stopped the ports (`cdx_ft_recover()` → `dpa_cfg_quiesce()`), the FMan

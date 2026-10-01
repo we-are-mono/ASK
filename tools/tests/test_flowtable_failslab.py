@@ -64,7 +64,8 @@ class Fault:
 
 
 @asynccontextmanager
-async def slab_fault(r, target, label, *, continuous=False):
+async def slab_fault(r, target, label, *, continuous=False, lease=20, console=None):
+    console = console or r.service_console
     config = await r.target.fs_read(r.session, "/proc/config.gz")
     assert config["errno"] == 0, config
     config = gzip.decompress(bytes.fromhex(config["content_hex"])).decode()
@@ -74,7 +75,10 @@ async def slab_fault(r, target, label, *, continuous=False):
     root = FAULT_DIR + "/failslab-" + target
     # Stage while management is healthy. A long paced-UART upload here would
     # outlive the traffic peer's idle lease; fault cleanup still uses UART.
-    await console_command(r.service_console, "mkdir", root)
+    # The service fixture makes and removes FAULT_DIR; any other caller's
+    # lease makes it here and removes its own root once the result is read.
+    await console_command(console, "mkdir", "-p", FAULT_DIR)
+    await console_command(console, "mkdir", root)
     staged = await r.target.fs_write(r.session, root + "/guard.py", script)
     assert staged["errno"] == 0, staged
     assert await read(r.target, r.session, root + "/guard.py") == script
@@ -82,14 +86,14 @@ async def slab_fault(r, target, label, *, continuous=False):
     try:
         # Launch can succeed even when its UART acknowledgement is lost.
         # Keep cancellation protected from the moment the child may exist.
-        await console_python(r.service_console, f'''
+        await console_python(console, f'''
 from pathlib import Path
 import subprocess
 root = Path({root!r})
 script = root / 'guard.py'
 with (root / 'guard.log').open('w') as log:
     child = subprocess.Popen(['/usr/bin/python3', str(script), str(root), {target!r},
-                              {'continuous' if continuous else 'once'!r}],
+                              {'continuous' if continuous else 'once'!r}, {str(lease)!r}],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                              close_fds=True, start_new_session=True)
 (root / 'pid').write_text(str(child.pid))
@@ -106,13 +110,17 @@ with (root / 'guard.log').open('w') as log:
         except Exception:
             # UART remains the fallback when the fault disrupts management;
             # HTTP avoids a lost command boundary amid kernel diagnostics.
-            await console_command(r.service_console, "touch", root + "/cancel")
+            await console_command(console, "touch", root + "/cancel")
         try:
             result = await wait_json(r, root + "/result.json", timeout=5)
             r.record(label + "-guard-final", result)
             assert not result["restore_errors"] and result.get("restored") == result.get("original"), result
+            # A continuous lease's result exists only now; Fault.hit() reads
+            # it from here once the root is gone.
+            fault.result = fault.result or result
+            await console_command(console, "rm", "-rf", root)
         except BaseException:
-            await console_python(r.service_console, f'''
+            await console_python(console, f'''
 from pathlib import Path
 import json
 root = Path({root!r})
