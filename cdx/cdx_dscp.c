@@ -49,6 +49,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
+#include <linux/rculist.h>
 #include <linux/rtnetlink.h>
 #include <linux/slab.h>
 #include <net/flow_offload.h>
@@ -79,7 +80,10 @@
  * resolves to, because the tree can be rebuilt underneath and the filter still
  * means the same class afterwards. */
 struct cdx_dscp_filter {
+	/* Changed under the mutex; walked under RCU by cdx_dscp_mirrored(),
+	 * which reads the cookie alone. */
 	struct list_head	list;
+	struct rcu_head		rcu;
 	unsigned long		cookie;
 	u32			classid;
 	/* Which filter this is, apart from its cookie: the tc instance it
@@ -110,6 +114,9 @@ enum cdx_dscp_state {
 
 struct cdx_dscp_port {
 	struct list_head	filters;
+	/* The device and the state are written under the mutex and read
+	 * without it by cdx_dscp_mirrored(): the device is published after
+	 * the list it names is initialised. */
 	struct net_device	*dev;
 	enum cdx_dscp_state	state;
 	/* What the software Tx path reads, and the only part of this structure
@@ -151,7 +158,7 @@ static struct cdx_dscp_port *cdx_dscp_port_of(struct net_device *dev)
 	lockdep_assert_held(&cdx_dscp_mutex);
 	if (port && !port->dev) {
 		INIT_LIST_HEAD(&port->filters);
-		port->dev = dev;
+		smp_store_release(&port->dev, dev);
 	}
 	return port;
 }
@@ -315,7 +322,7 @@ static int cdx_dscp_finish_retiring(void)
 	if (ceetm_dscp_map_release(cdx_dscp_port_ctx(port)) != CEETM_SUCCESS)
 		pr_warn("cdx: %s did not hand the hardware DSCP map back cleanly\n",
 			netdev_name(port->dev));
-	port->state = CDX_DSCP_OFF;
+	WRITE_ONCE(port->state, CDX_DSCP_OFF);
 	cdx_dscp_retiring = NULL;
 	return 0;
 }
@@ -352,7 +359,7 @@ static int cdx_dscp_claim(struct cdx_dscp_port *port,
 				   "the hardware DSCP map serves one port at a time, and another port holds it");
 		return -EBUSY;
 	}
-	port->state = CDX_DSCP_CLAIMED;
+	WRITE_ONCE(port->state, CDX_DSCP_CLAIMED);
 	return 0;
 }
 
@@ -364,7 +371,7 @@ static void cdx_dscp_unclaim(struct cdx_dscp_port *port)
 	if (port->state != CDX_DSCP_CLAIMED)
 		return;
 	ceetm_dscp_map_release(cdx_dscp_port_ctx(port));
-	port->state = CDX_DSCP_OFF;
+	WRITE_ONCE(port->state, CDX_DSCP_OFF);
 }
 
 /* The first filter is programmed: publish the map, so new entries on the port
@@ -376,7 +383,7 @@ static void cdx_dscp_turn_on(struct cdx_dscp_port *port)
 	ceetm_dscp_map_publish(cdx_dscp_port_ctx(port));
 	if (cdx_dscp_retiring == port)
 		cdx_dscp_retiring = NULL;
-	port->state = CDX_DSCP_ON;
+	WRITE_ONCE(port->state, CDX_DSCP_ON);
 	cdx_ft_egress_changed(port->dev);
 }
 
@@ -388,7 +395,7 @@ static void cdx_dscp_turn_off(struct cdx_dscp_port *port)
 	__must_hold(&cdx_dscp_mutex)
 {
 	ceetm_dscp_map_unpublish(cdx_dscp_port_ctx(port));
-	port->state = CDX_DSCP_RETIRING;
+	WRITE_ONCE(port->state, CDX_DSCP_RETIRING);
 	cdx_dscp_retiring = port;
 	cdx_dscp_retire_gen++;
 	cdx_ft_egress_changed(port->dev);
@@ -568,7 +575,7 @@ static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 		existing->dscp = dscp;
 		kfree(filter);
 	} else {
-		list_add_tail(&filter->list, &port->filters);
+		list_add_tail_rcu(&filter->list, &port->filters);
 	}
 	cdx_dscp_publish(port);
 	if (port->state != CDX_DSCP_ON)
@@ -597,7 +604,7 @@ static int cdx_dscp_destroy(struct net_device *dev, struct flow_cls_offload *f)
 	}
 	filter = cdx_dscp_find(port, f->cookie);
 	if (filter) {
-		list_del(&filter->list);
+		list_del_rcu(&filter->list);
 		/* A replacement still holding the codepoint -- the old filter
 		 * going after its successor was offloaded, or the successor
 		 * going because flower failed after offloading it -- answers
@@ -620,7 +627,7 @@ static int cdx_dscp_destroy(struct net_device *dev, struct flow_cls_offload *f)
 	mutex_unlock(&cdx_dscp_mutex);
 	if (!filter)
 		return -ENOENT;
-	kfree(filter);
+	kfree_rcu(filter, rcu);
 	return 0;
 }
 
@@ -657,15 +664,15 @@ void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
 	 * ours. A drain running for this port sees it gone and releases
 	 * nothing. */
 	list_for_each_entry_safe(filter, next, &port->filters, list) {
-		list_del(&filter->list);
-		kfree(filter);
+		list_del_rcu(&filter->list);
+		kfree_rcu(filter, rcu);
 	}
 	if (cdx_dscp_retiring == port)
 		cdx_dscp_retiring = NULL;
-	port->state = CDX_DSCP_OFF;
+	WRITE_ONCE(port->state, CDX_DSCP_OFF);
 	cdx_dscp_publish(port);
 	/* The context slot may next belong to a different netdevice. */
-	port->dev = NULL;
+	WRITE_ONCE(port->dev, NULL);
 out:
 	mutex_unlock(&cdx_dscp_mutex);
 }
@@ -689,6 +696,41 @@ u16 cdx_dscp_class(struct tQM_context_ctl *qm_ctx, u8 dscp)
 	if (!port || dscp >= CDX_DSCP_COUNT)
 		return 0;
 	return READ_ONCE(port->dscp_class[dscp]);
+}
+
+/* Whether `cookie' is one of `dev''s filters while its map is published.
+ *
+ * Asked by the routed multicast learner, under RTNL, of a filter it found
+ * running in software on a device a group's copies leave by: a DSCP filter
+ * there selects the queue a frame leaves by, and a listener entry on a port
+ * whose map is published reads the same table per frame, so a stream carried
+ * in hardware is queued as it would have been in software. Any device may be
+ * asked, a DPAA port or not, so the slot is found by its device rather than
+ * through netdev_priv(). A filter is taken off the list before tc frees it,
+ * and the list is walked under RCU, so a cookie found here is never one a
+ * newer filter reuses.
+ */
+bool cdx_dscp_mirrored(struct net_device *dev, unsigned long cookie)
+{
+	struct cdx_dscp_filter *f;
+	struct cdx_dscp_port *port;
+	bool found = false;
+	unsigned int i;
+
+	rcu_read_lock();
+	for (i = 0; i < ARRAY_SIZE(cdx_dscp_ports) && !found; i++) {
+		port = &cdx_dscp_ports[i];
+		if (smp_load_acquire(&port->dev) != dev ||
+		    READ_ONCE(port->state) != CDX_DSCP_ON)
+			continue;
+		list_for_each_entry_rcu(f, &port->filters, list)
+			if (f->cookie == cookie) {
+				found = true;
+				break;
+			}
+	}
+	rcu_read_unlock();
+	return found;
 }
 
 static int cdx_dscp_flower(struct net_device *dev, struct flow_cls_offload *f)

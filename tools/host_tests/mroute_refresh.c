@@ -129,11 +129,18 @@ static unsigned long jiffies = 1000;
 #define time_after(a, b) time_before(b, a)
 static struct {
     struct { unsigned int base_seq; u8 gencursor; u8 commit_applying; } nft;
+    struct { unsigned int xt_seq; } nf;
 } init_net;
 /* The kernel's reader of the mark a commit holds while it applies itself. */
 static bool nft_commit_in_progress(const __typeof__(init_net) *net)
 {
     return net->nft.commit_applying;
+}
+/* And of the count every x_tables table registration, replacement and
+ * removal moves. */
+static unsigned int nf_xt_seq(const __typeof__(init_net) *net)
+{
+    return net->nf.xt_seq;
 }
 /* The XFRM policy generation, which every policy change moves. */
 static u64 xfrm_genid = 1;
@@ -169,12 +176,14 @@ static u32 jhash2(const u32 *k, unsigned n, u32 seed)
 enum { NF_BR_PRE_ROUTING, NF_BR_LOCAL_IN, NF_BR_FORWARD, NF_BR_LOCAL_OUT,
        NF_BR_POST_ROUTING };
 /* A hook on a bridge's output, which a copy routed into the bridge passes
- * after it was confirmed. */
-static bool bridge_out_hooked;
+ * after it was confirmed; and one on its input, which a stream arriving
+ * through the bridge passes on its way up to ipmr. */
+static bool bridge_out_hooked, bridge_in_hooked;
 static bool ft_bridge_hooked(unsigned int hooks)
 {
-    return bridge_out_hooked &&
-           (hooks & (BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)));
+    return (bridge_out_hooked &&
+            (hooks & (BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)))) ||
+           (bridge_in_hooked && (hooks & BIT(NF_BR_LOCAL_IN)));
 }
 /* An nftables chain or BPF program running after the observer at
  * POST_ROUTING, which mroute_confirm_order.c finds in the real hook lists. */
@@ -182,6 +191,13 @@ static bool observer_followed;
 static bool ft_mr_observer_followed(u8 family)
 {
     return observer_followed;
+}
+/* A netfilter BPF program where a copy passes, which the same harness finds
+ * in the real hook lists. */
+static bool bpf_hooked;
+static bool ft_mr_bpf_hooked(u8 family)
+{
+    return bpf_hooked;
 }
 #include "mroute_confirm_types.inc"
 static LIST_HEAD(ft_mr_groups);
@@ -201,11 +217,45 @@ static unsigned long ft_mr_resync_pending;
  * parent and oifs the plan names. */
 static int ports_answer;
 static unsigned ports_asks;
-static int ft_mr_ports_matter(const struct ft_mr_group *g, const struct ft_mr_plan *plan)
+/* What iptables-legacy makes of the same stream, as nf_xt_port_dependent()
+ * answers it -- the same three answers, never -EAGAIN. xt_port_probe.c runs
+ * the real walk. The learner's own ft_mr_ports_matter() asks both, so the
+ * order it asks them in and the word it gives each answer are its own. */
+static int xtables_answer;
+static unsigned xtables_asks;
+#define NFPROTO_IPV4 2
+#define NFPROTO_IPV6 10
+struct nft_port_probe {
+    u8 family;
+    union nf_inet_addr saddr;
+    union nf_inet_addr daddr;
+    const struct net_device *in;
+    const struct net_device * const *out;
+    unsigned int nout;
+};
+static int rcu_depth;
+static void rcu_read_lock(void) { rcu_depth++; }
+static void rcu_read_unlock(void) { assert(rcu_depth > 0); rcu_depth--; }
+/* The VIF devices, by the ifindex a plan names them with; one a case has
+ * unregistered is not found. */
+static struct net_device vif_dev[64];
+static int vif_gone;
+static struct net_device *dev_get_by_index_rcu(const void *net, int ifindex)
+{
+    assert(net == &init_net && rcu_depth);
+    assert(ifindex > 0 && ifindex < (int)ARRAY_SIZE(vif_dev));
+    return ifindex == vif_gone ? NULL : &vif_dev[ifindex];
+}
+/* Whether tc runs something in software where the stream arrives or a copy
+ * leaves, which mroute_tc.c finds in real device stacks. Asked under RTNL of
+ * the parent and oifs the plan names. */
+static bool tc_answer;
+static unsigned tc_asks;
+static bool ft_mr_tc_filtered(const struct ft_mr_plan *plan)
 {
     assert(rtnl && plan->oifs_known && plan->oif_count);
-    ports_asks++;
-    return ports_answer;
+    tc_asks++;
+    return tc_answer;
 }
 static unsigned ft_mr_idx(u8 family) { return family == AF_INET6; }
 static bool test_bit(unsigned n, const unsigned long *p) { return (*p >> n) & 1; }
@@ -233,6 +283,32 @@ static bool switch_in_derive;
 /* An XFRM policy changed once the derivation has answered under the
  * generation before it. */
 static bool policy_in_derive;
+/* The stream both walks are asked about, as the plan describes it, under RCU
+ * and RTNL. */
+static void probe_is_the_plan(const struct nft_port_probe *p)
+{
+    assert(rtnl && rcu_depth);
+    assert(p->in == &vif_dev[planned_parent] && p->nout == planned_oifs);
+    for (unsigned i = 0; i < planned_oifs; i++)
+        assert(p->out[i] == &vif_dev[planned[i]]);
+}
+static u8 probed_family;
+static int nf_xt_port_dependent(const void *net, const struct nft_port_probe *p)
+{
+    assert(net == &init_net && xtables_answer != -EAGAIN);
+    probe_is_the_plan(p);
+    probed_family = p->family;
+    xtables_asks++;
+    return xtables_answer;
+}
+static int nft_port_dependent(const void *net, const struct nft_port_probe *p)
+{
+    assert(net == &init_net);
+    probe_is_the_plan(p);
+    probed_family = p->family;
+    ports_asks++;
+    return ports_answer;
+}
 static void mutex_lock(int *m) { assert(!*m); *m = 1; }
 #define lockdep_assert_held(m) assert(*(m))
 static void mutex_unlock(int *m) { assert(*m); *m = 0; }
@@ -1408,6 +1484,36 @@ int main(void)
         assert(withdrawals == withdrawn + 1 && folds == folding + 1);
         assert(folded.packets == bridged_count.packets && !gone.refs);
     }
+    /* A stream arriving through a bridge passes the bridge's input hook on
+     * its way up to ipmr, which the copies that confirmed it passed but
+     * which may judge the rest apart: a hook there -- an ebtables INPUT
+     * port drop -- keeps such a group in software, its route taken back. A
+     * group arriving on a port passes no bridge input, and keeps its entry. */
+    {
+        unsigned published = publishes;
+
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+        bridge_in_hooked = true;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+        through_bridge = true;
+        carried = true;
+        ft_mr_recheck = true;
+        run();
+        assert(g->state == FT_MR_REFUSED_FILTER && !g->offloaded && !hardware.live);
+        assert(!g->route->linked && publishes == published);
+        bridge_in_hooked = false;
+        ft_mr_recheck = true;
+        run();
+        assert(g->state == FT_MR_INSTALLED && g->route->linked && !hardware.live);
+        assert(publishes == published + 1);
+        through_bridge = false;
+        carried = false;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED && !g->route->linked);
+    }
 
     /* ---- a ruleset commit ---------------------------------------------
      *
@@ -1566,6 +1672,17 @@ int main(void)
         ft_mr_recheck = true;
         run();
         assert(hardware.live && g->state == FT_MR_INSTALLED);
+        /* A netfilter BPF program where a copy passes, which no walk
+         * reads, does the same. */
+        bpf_hooked = true;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->state == FT_MR_REFUSED_FILTER);
+        assert(g->watch->seen == 1);
+        bpf_hooked = false;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
     }
 
     /* ---- a watch that cannot be allocated --------------------------------
@@ -1720,6 +1837,142 @@ int main(void)
         assert(ports_asks == asks + 1 && hardware.live && g->state == FT_MR_INSTALLED);
     }
 
+    /* An iptables-legacy rule that may treat the group's other packets apart
+     * from the copies that confirmed it takes a carried group out of hardware
+     * just as an nftables one does, under a word of its own, its
+     * confirmations standing; the nftables walk is not made. A walk that gave
+     * up keeps it out as well, and counts. With x_tables neutral the nftables
+     * answer is the one given again. */
+    {
+        unsigned x0 = adds, del0 = deletes, asks = ports_asks, xasks = xtables_asks;
+        u64 errors = ft_mr_port_probe_errors;
+
+        xtables_answer = 1;
+        ft_mr_recheck = true;
+        run();
+        assert(deletes == del0 + 1 && !hardware.live && !g->offloaded);
+        assert(g->state == FT_MR_REFUSED_XTABLES && ft_mr_refusal(g->state));
+        assert(!strcmp(ft_mr_state_text(g->state), "refused-xtables"));
+        assert(xtables_asks == xasks + 1 && ports_asks == asks);
+        assert(ft_mr_port_probe_errors == errors && g->watch->seen == 1);
+        assert(probed_family == NFPROTO_IPV4 && !rcu_depth);
+        /* A VIF device gone from under the plan is nothing either walk can
+         * be asked about: the group stays out, and neither is asked. */
+        vif_gone = OIF_A;
+        ft_mr_recheck = true;
+        run();
+        assert(g->state == FT_MR_REFUSED_PORTS && !hardware.live);
+        assert(xtables_asks == xasks + 1 && ports_asks == asks);
+        vif_gone = PARENT_A;
+        ft_mr_recheck = true;
+        run();
+        assert(g->state == FT_MR_REFUSED_PORTS && xtables_asks == xasks + 1);
+        vif_gone = 0;
+        ft_mr_recheck = true;
+        run();
+        assert(g->state == FT_MR_REFUSED_XTABLES && xtables_asks == xasks + 2);
+        assert(ports_asks == asks && ft_mr_port_probe_errors == errors);
+        xtables_answer = -E2BIG;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->state == FT_MR_REFUSED_XTABLES);
+        assert(ft_mr_port_probe_errors == errors + 1 && ports_asks == asks);
+        xtables_answer = 0;
+        ports_answer = 1;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->state == FT_MR_REFUSED_PORTS);
+        assert(ports_asks == asks + 1 && ft_mr_port_probe_errors == errors + 1);
+        ports_answer = 0;
+        ft_mr_recheck = true;
+        run();
+        assert(adds == x0 + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+        /* Neither walk is made for a group that is not confirmed. */
+        asks = ports_asks;
+        xasks = xtables_asks;
+        xtables_answer = 1;
+        planned_oifs = 2;
+        g->dirty = true;
+        run();
+        assert(!hardware.live && g->state == FT_MR_UNCONFIRMED);
+        assert(ports_asks == asks && xtables_asks == xasks);
+        xtables_answer = 0;
+        planned_oifs = 1;
+        g->dirty = true;
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+    }
+
+    /* tc running something in software where the stream arrives or a copy
+     * leaves keeps the group out whatever its confirmations say -- a group
+     * not even confirmed reads refused-tc -- and before either walk is made.
+     * A carried group's entry comes out; the filter gone, it is carried
+     * again, its confirmations kept. */
+    {
+        unsigned x0 = adds, del0 = deletes, asks = ports_asks, xasks = xtables_asks;
+        unsigned tasks = tc_asks;
+
+        tc_answer = true;
+        ft_mr_recheck = true;
+        run();
+        assert(deletes == del0 + 1 && !hardware.live && !g->offloaded);
+        assert(g->state == FT_MR_REFUSED_TC && ft_mr_refusal(g->state));
+        assert(!strcmp(ft_mr_state_text(g->state), "refused-tc"));
+        assert(tc_asks == tasks + 1 && ports_asks == asks && xtables_asks == xasks);
+        assert(g->watch->seen == 1);
+        planned_oifs = 2;
+        g->dirty = true;
+        run();
+        assert(g->state == FT_MR_REFUSED_TC && g->watch->oifs == 2);
+        planned_oifs = 1;
+        tc_answer = false;
+        g->dirty = true;
+        run();
+        assert(adds == x0 + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+        assert(tc_asks == tasks + 3);
+    }
+
+    /* An iptables-legacy table registered, replaced or removed: the ruleset
+     * poll sees the count move and wakes the worker, which asks every group
+     * again and counts the change -- once, and only while a group exists.
+     * No confirmation is taken back for it and the ruleset stays open: the
+     * walk itself says whether x_tables now tells the packets apart. */
+    {
+        unsigned d0 = derives, x0 = adds, del0 = deletes;
+        unsigned long seen_before = g->watch->seen;
+        u64 changes = ft_mr_xtables_changes, commits = ft_mr_ruleset_changes;
+        struct ft_mr_watch *watch = g->watch;
+
+        ft_mr_work.queued = false;
+        poll_ruleset();
+        assert(!ft_mr_work.queued);                 /* nothing moved */
+        init_net.nf.xt_seq++;
+        poll_ruleset();
+        assert(ft_mr_work.queued && !ft_mr_recheck);
+        run();
+        assert(ft_mr_xtables_changes == changes + 1 && ft_mr_xt_seen == init_net.nf.xt_seq);
+        assert(derives == d0 + 1 && !g->dirty);
+        assert(adds == x0 && deletes == del0 && hardware.live && g->state == FT_MR_INSTALLED);
+        assert(g->watch == watch && g->watch->seen == seen_before);
+        assert(ft_mr_gen_open && ft_mr_ruleset_changes == commits);
+        /* Asked again once, not on every pass after. */
+        run();
+        assert(ft_mr_xtables_changes == changes + 1 && derives == d0 + 1);
+        /* A rule the change brought in is the walk's to find. */
+        init_net.nf.xt_seq++;
+        xtables_answer = 1;
+        poll_ruleset();
+        run();
+        assert(ft_mr_xtables_changes == changes + 2);
+        assert(deletes == del0 + 1 && !hardware.live && g->state == FT_MR_REFUSED_XTABLES);
+        xtables_answer = 0;
+        init_net.nf.xt_seq++;
+        poll_ruleset();
+        run();
+        assert(ft_mr_xtables_changes == changes + 3);
+        assert(adds == x0 + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+    }
+
     /* Deleting the route while a port it copies out of changes its egress:
      * the change marks the group, and a tc command's drain gets the
      * transaction before the worker's retirement does. The group leaves the
@@ -1773,6 +2026,8 @@ int main(void)
     seen(g, OIF_A);
     run();
     assert(hardware.live && g->state == FT_MR_INSTALLED);
+    /* Both walks were asked about the family's own tables. */
+    assert(probed_family == NFPROTO_IPV6);
     init_net.nft.base_seq++;
     run();
     assert(!hardware.live && g->state == FT_MR_UNCONFIRMED);

@@ -38,7 +38,7 @@ def test_dscp_map(tmp_path):
              "cdx_dscp_unclaim", "cdx_dscp_turn_on", "cdx_dscp_turn_off",
              "cdx_dscp_parse", "cdx_dscp_action", "cdx_dscp_replace",
              "cdx_dscp_destroy", "cdx_dscp_tree_changed", "cdx_dscp_port_gone",
-             "cdx_dscp_class", "cdx_dscp_flower"]
+             "cdx_dscp_class", "cdx_dscp_mirrored", "cdx_dscp_flower"]
     (tmp_path / "dscp_production.inc").write_text(
         # The filter record and the per-port state are file-scope, so they are
         # sliced rather than lifted by name: what the map ends up holding

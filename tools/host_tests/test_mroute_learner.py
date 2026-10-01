@@ -23,6 +23,28 @@ def _between(source, start, end):
     return source[source.index(start):source.index(end)]
 
 
+def _hunks(section):
+    """A patch section's hunks, each with the function its header names."""
+    parts = re.split(r"^@@ [^@]* @@ ?(.*)$", section, flags=re.M)
+    return list(zip(parts[1::2], parts[2::2]))
+
+
+def _hunk_in(section, function_head):
+    """The one hunk of a section inside the function `function_head` begins."""
+    found = [text for head, text in _hunks(section) if function_head in head]
+    assert len(found) == 1, (function_head, len(found))
+    return found[0]
+
+
+def _ordered(text, *lines):
+    """Each line in `text`, once, and in the order given."""
+    at = []
+    for line in lines:
+        assert text.count(line) == 1, (line, text.count(line))
+        at.append(text.index(line))
+    assert at == sorted(at), lines
+
+
 def test_mroute_learner(tmp_path):
     source = SOURCE.read_text()
     # The real state, not a restatement: a field added or resized on any of
@@ -585,7 +607,7 @@ def test_proc_reports_a_row_and_a_summary():
                 "mroute_install_errors", "mroute_policy_rules",
                 "mroute_xfrm_changes", "mroute_ruleset_changes",
                 "mroute_ruleset_settled", "mroute_confirm_errors",
-                "mroute_port_probe_errors",
+                "mroute_port_probe_errors", "mroute_xtables_changes",
                 # The group ids both learners draw on, per family, and how
                 # many there are: what a refused-failed group ran out of.
                 "mcast_group_ids4", "mcast_group_ids6", "mcast_group_id_slots"):
@@ -690,7 +712,7 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
         worker.index("state = ft_mr_admit(target, &plan)") < worker.index("same = installed &&")
     admit = function(source, "ft_mr_admit")
     assert "ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING))" in admit
-    assert "if (ft_mr_observer_followed(g->family))" in admit
+    assert "if (ft_mr_observer_followed(g->family) || ft_mr_bpf_hooked(g->family))" in admit
     assert "return FT_MR_UNCONFIRMED;" in admit and "ft_mr_watch_complete(g->watch)" in admit
     # A ruleset commit is looked for while any group exists, and a settling
     # ruleset when it will have settled.
@@ -735,16 +757,149 @@ def test_the_kernel_marks_a_commit_until_it_is_applied():
     assert "148" in listed and listed == sorted(listed)
 
 
+def test_legacy_tables_and_tc_are_judged_as_well():
+    """A confirmed group is carried only if nothing outside nftables could
+    tell its packets apart either. iptables-legacy is walked by the kernel,
+    first, under the same RCU section as the nftables walk, and its tables
+    are read the way the packet path reads them, inside an xt_recseq section
+    a replacement waits out; every table change moves a count the learner
+    follows. tc is judged by the learner, before any walk and whatever the
+    confirmations say, since neither confirms nor generation describes it."""
+    source = SOURCE.read_text()
+    admit = function(source, "ft_mr_admit")
+    at = [admit.index(s) for s in (
+        "if (plan->via && ft_bridge_hooked(BIT(NF_BR_LOCAL_IN)))",
+        "ft_mr_observer_followed(g->family) || ft_mr_bpf_hooked(g->family)",
+        "ft_mr_tc_filtered(plan)",
+        "if (!ft_mr_ruleset_current())", "ft_mr_watch_complete(g->watch)",
+        "ft_mr_ports_matter(g, plan, &why)")]
+    assert at == sorted(at)
+    assert "return FT_MR_REFUSED_TC;" in admit and "return why;" in admit
+    matter = function(source, "ft_mr_ports_matter")
+    assert matter.index("rcu_read_lock();") < \
+        matter.index("rc = nf_xt_port_dependent(&init_net, &probe);") < \
+        matter.index("*why = FT_MR_REFUSED_XTABLES;") < \
+        matter.index("rc = nft_port_dependent(&init_net, &probe);") < \
+        matter.index("rcu_read_unlock();")
+    # The count is read before the worker walks anything, so a change after
+    # the read moves it again; the poll wakes the worker when it moved, and
+    # the learner starts from the tables as they stand.
+    worker = function(source, "ft_mr_work_fn")
+    assert worker.index("xt_seq = nf_xt_seq(&init_net);") < \
+        worker.index("WRITE_ONCE(ft_mr_recheck, true);\n\t}") < \
+        worker.index("state = ft_mr_admit(target, &plan)")
+    assert "ft_mr_xtables_changes++;" in worker
+    assert "nf_xt_seq(&init_net) != READ_ONCE(ft_mr_xt_seen)" in \
+        function(source, "ft_mr_ruleset_fn")
+    assert "ft_mr_xt_seen = nf_xt_seq(&init_net);" in source
+    # tc's stack walk: the input side ingress, every output egress, every
+    # device below either, XDP on the input side alone.
+    filtered = function(source, "ft_mr_tc_filtered")
+    assert "ft_dev_stack_tc_soft(dev, true)" in filtered
+    assert "ft_dev_stack_tc_soft(dev, false)" in filtered
+    assert "netdev_walk_all_lower_dev(dev, ft_tc_lower, &priv);" in \
+        function(source, "ft_dev_stack_tc_soft")
+    dev = function(source, "ft_dev_tc_soft")
+    assert dev.index("if (ingress)") < dev.index("dev_xdp_prog_count(dev)")
+    # Only an egress DSCP filter is the hardware's own: the port's rate
+    # limiter never meters a multicast frame.
+    htb = (ROOT / "cdx/cdx_htb.c").read_text()
+    assert "return !ingress && cdx_dscp_mirrored(dev, cookie);" in \
+        function(htb, "cdx_tc_filter_mirrored")
+
+    patch = (ROOT / "patches/kernel/148-netfilter-nftables-commit-in-progress.patch").read_text()
+    sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
+    for path, prefix in (("net/ipv4/netfilter/ip_tables.c", "ipt"),
+                         ("net/ipv6/netfilter/ip6_tables.c", "ip6t")):
+        body = sections[path]
+        walk = body[body.index(f"+static int {prefix}_probe_table("):]
+        walk = walk[:walk.index("\n+}\n")]
+        assert walk.index("+\t\tlocal_bh_disable();") < \
+            walk.index("+\t\taddend = xt_write_recseq_begin();") < \
+            walk.index("+\t\tprivate = READ_ONCE(table->private);") < \
+            walk.index("+\t\txt_write_recseq_end(addend);") < \
+            walk.index("+\t\tlocal_bh_enable();")
+        # Every change to the family's tables is counted, each where nothing
+        # reads what it changed any more, and nowhere else: a replacement
+        # once xt_replace_table() has waited out the old table's readers, a
+        # registration once its hooks are in -- the NAT table's with none of
+        # its own at once -- and a removal once the table is freed.
+        counted = "+\tnf_xt_changed(net);"
+        assert body.count("nf_xt_changed(net);") == 4, path
+        replace = _hunk_in(body, "__do_replace(")
+        _ordered(replace, " \toldinfo = xt_replace_table(t, num_counters, newinfo, &ret);",
+                 " \t\tgoto put_module;", counted)
+        _ordered(_hunk_in(body, f"__{prefix}_unregister_table("),
+                 " \txt_free_table_info(private);", counted)
+        register = [h for h in _hunks(body) if f"int {prefix}_register_table(" in h[0]]
+        nat = next(h for _, h in register if "template_ops" in h)
+        _ordered(nat, "+\tif (!template_ops) {", "+\t\tnf_xt_changed(net);", " \t\treturn 0;")
+        hooked = next(h for _, h in register if "nf_register_net_hooks" in h)
+        hooked = hooked[hooked.index(" \tret = nf_register_net_hooks(net, ops, num_ops);"):]
+        # A registration that fails halfway waits out the readers of the
+        # hooks it did register before the table and its ops are freed.
+        _ordered(hooked, " \tret = nf_register_net_hooks(net, ops, num_ops);",
+                 "+\tif (ret != 0) {", "+\t\tsynchronize_rcu();", " \t\tgoto out_free;",
+                 counted, " \treturn ret;")
+        assert "+\t\tops[i].hook_ops_type = NF_HOOK_OP_XTABLES;" in body
+        hook = f"nf_{prefix}_probe_hook"
+        assert f"+\trcu_assign_pointer({hook}, &{prefix}_probe_hook);" in body
+        unpublish = body.index(f"+\tRCU_INIT_POINTER({hook}, NULL);")
+        assert unpublish < body.index("+\tsynchronize_rcu();", unpublish)
+    # A match or statement that drops a packet itself cannot be taken for
+    # one that only decides, in either walk: x_tables' hashlimit drops one it
+    # has no bucket for, connlimit and nftables' ct count one they cannot
+    # count, recent one it cannot record.
+    xt = sections["net/netfilter/x_tables.c"]
+    pure = xt[xt.index("+static const char *const xt_probe_pure[] = {"):]
+    pure = pure[:pure.index("+};")]
+    assert '"limit"' in pure
+    for name in ("hashlimit", "connlimit", "recent", "connlabel", "socket"):
+        assert f'"{name}"' not in pure, name
+    probe = sections["net/netfilter/nf_tables_port_probe.c"]
+    breaks = probe[probe.index("+static const char * const nft_probe_breaks[] = {"):]
+    breaks = breaks[:breaks.index("+};")]
+    assert '"limit"' in breaks and '"connlimit"' not in breaks
+    core = sections["net/netfilter/core.c"]
+    assert "+EXPORT_SYMBOL_GPL(nf_xt_port_dependent);" in core
+    assert "+\treturn hook ? hook->port_dependent(net, probe) : 0;" in core
+    nat = sections["net/netfilter/nf_nat_core.c"]
+    assert "+\t\t\tnat_ops[i].hook_ops_type = NF_HOOK_OP_NAT;" in nat
+    assert "-struct nf_nat_lookup_hook_priv {" in nat
+    # The NAT core's hook ops go after a grace period, on unregistration and
+    # when a registration fails halfway, as its private data always did.
+    failed = next(text for head, text in _hunks(nat) if "nf_nat_register_fn(" in head and
+                  "nf_register_net_hooks" in text)
+    _ordered(failed, " \t\tret = nf_register_net_hooks(net, nat_ops, ops_count);",
+             " \t\t\tmutex_unlock(&nf_nat_proto_mutex);", "+\t\t\tsynchronize_rcu();",
+             " \t\t\t\tkfree(nat_ops[i].priv);", " \t\t\tkfree(nat_ops);")
+    _ordered(nat, "-\t\tkfree(nat_ops);", "+\t\tkvfree_rcu_mightsleep(nat_ops);")
+    # And a NAT table whose lookups failed halfway is freed only once the
+    # readers of the lookups that did register are gone.
+    for path, prefix in (("net/ipv4/netfilter/iptable_nat.c", "ipt"),
+                         ("net/ipv6/netfilter/ip6table_nat.c", "ip6t")):
+        _ordered(sections[path], f" \tret = {prefix}_nat_register_lookups(net);",
+                 "+\tif (ret < 0) {", "+\t\tsynchronize_rcu();",
+                 f" \t\t{prefix}_unregister_table_exit(net, \"nat\");")
+    dump = sections["net/netfilter/nfnetlink_hook.c"]
+    assert "+\tcase NF_HOOK_OP_XTABLES:" in dump and "+\tcase NF_HOOK_OP_NAT:" in dump
+    assert "+\tatomic_t xt_seq;" in sections["include/net/netns/netfilter.h"]
+    assert "+\tatomic_inc_return_release(&net->nf.xt_seq);" in \
+        sections["include/net/netfilter/nf_port_probe.h"]
+
+
 def test_nothing_that_can_drop_a_copy_runs_after_the_observer(tmp_path):
     """The observer is last by priority, but at an equal priority netfilter
     puts a later registration first, so an nftables chain that held the last
     priority when the observer registered runs after it and can still drop
     what it confirmed. Such a chain keeps the group in software; conntrack's
     confirmation, the kernel's own, does not. No BPF program can be there: a
-    netfilter BPF link refuses the last priority."""
+    netfilter BPF link refuses the last priority. But one anywhere a copy
+    passes can judge it by its ports, and nothing reads it, so it keeps the
+    family's groups in software wherever it is."""
     source = SOURCE.read_text()
     (tmp_path / "mroute_confirm_order.inc").write_text(
-        function(source, "ft_mr_observer_followed"))
+        function(source, "ft_mr_observer_followed") + function(source, "ft_mr_bpf_hooked"))
     binary = tmp_path / "mroute_confirm_order"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

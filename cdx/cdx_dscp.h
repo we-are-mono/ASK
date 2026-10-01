@@ -30,6 +30,12 @@ void cdx_dscp_tree_changed(struct net_device *dev);
  * change. */
 u16 cdx_dscp_class(struct tQM_context_ctl *qm_ctx, u8 dscp);
 
+/* Whether `cookie' names a filter of this port's while its map is published,
+ * which every entry installed on the port reads per frame, as the software
+ * Tx path reads the same filter's class. Lock-free and never sleeps, for a
+ * caller under RTNL that may not take this file's lock. */
+bool cdx_dscp_mirrored(struct net_device *dev, unsigned long cookie);
+
 /* Forget a port's filters without touching hardware, for a caller already
  * tearing that interface's CEETM context down. Must be called before
  * cdx_htb_port_gone() rather than from inside it: a filter add takes this

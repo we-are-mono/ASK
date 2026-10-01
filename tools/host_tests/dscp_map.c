@@ -58,6 +58,18 @@ static bool list_empty(const struct list_head *h) { return h->next == h; }
 
 #define READ_ONCE(x)  (*(volatile typeof(x) *)&(x))
 #define WRITE_ONCE(x, v) (*(volatile typeof(x) *)&(x) = (v))
+#define smp_store_release(p, v) WRITE_ONCE(*(p), v)
+#define smp_load_acquire(p) READ_ONCE(*(p))
+
+/* RCU as one thread sees it: a reader's section only counts, and a record
+ * is freed at once, since no reader runs beside the writer here. */
+struct rcu_head { int unused; };
+static int rcu_depth;
+static void rcu_read_lock(void) { rcu_depth++; }
+static void rcu_read_unlock(void) { assert(rcu_depth > 0); rcu_depth--; }
+#define list_add_tail_rcu list_add_tail
+#define list_del_rcu list_del
+#define list_for_each_entry_rcu list_for_each_entry
 
 typedef int mutex_t;
 #define DEFINE_MUTEX(x) mutex_t x
@@ -68,6 +80,7 @@ static void mutex_unlock(mutex_t *m) { assert(*m); *m = 0; }
 static unsigned allocations;
 static void *kzalloc(size_t n, int f) { (void)f; allocations++; return calloc(1, n); }
 static void kfree(void *p) { if (p) { assert(allocations); allocations--; } free(p); }
+#define kfree_rcu(p, f) kfree(p)
 
 /* --- the offload vocabulary ---------------------------------------------- */
 enum flow_action_id { FLOW_ACTION_DROP, FLOW_ACTION_PRIORITY, FLOW_ACTION_MANGLE };
@@ -365,6 +378,7 @@ static void test_transitions(void)
     assert(!add_on(&lan, 20, 46));
     assert(HAPPENED(from, EV_CLAIM, EV_PROGRAM, EV_PUBLISH, EV_CHANGED));
     assert(events[from + 3].ctx == &gQMCtx[3]);
+    assert(cdx_dscp_mirrored(&lan, 20) && !cdx_dscp_mirrored(&wan, 20));
 
     /* Editing one codepoint while the map stays on retires nothing: an
      * entry reads the table per frame. */
@@ -421,9 +435,12 @@ static void test_transitions(void)
     drain_rc = -EAGAIN;
     assert(!del_on(&lan, 24));
     drain_rc = 0;
+    /* Retiring, nothing on the port is the hardware's to apply. */
+    assert(!cdx_dscp_mirrored(&lan, 24));
     from = nevents;
     assert(!add_on(&lan, 25, 46));
     assert(HAPPENED(from, EV_PROGRAM, EV_PUBLISH, EV_CHANGED) && hw.on);
+    assert(cdx_dscp_mirrored(&lan, 25));
     from = nevents;
     assert(!del_on(&lan, 25));
     assert(HAPPENED(from, EV_UNPUBLISH, EV_CHANGED, EV_DRAIN, EV_RELEASE));
@@ -450,6 +467,8 @@ static void test_transitions(void)
     assert(concurrent_rc == -EBUSY);
     assert(HAPPENED(from, EV_UNPUBLISH, EV_CHANGED, EV_DRAIN, EV_RELEASE));
     assert(!hw.owner && !lan.refs);
+    /* Gone, its slot names no device for a filter to be found under. */
+    assert(!cdx_dscp_mirrored(&lan, 28) && !rcu_depth);
     assert(!add_on(&wan, 32, 46) && hw.owner == &gQMCtx[4]);
     assert(!del_on(&wan, 32) && !hw.owner);
 
@@ -511,6 +530,23 @@ int main(void)
     assert(hw.fq[10] == ((1 << 8) | 3));
     assert(hw.enabled == 1);                            /* enabled once */
     assert(cdx_dscp_class(&gQMCtx[3], 10) == ((1 << 4) | 3));
+
+    /* ---- what the hardware applies as it is ----
+     *
+     * A filter of the port's, while its map is published, is one every
+     * listener entry on the port applies per frame, so the routed multicast
+     * learner may carry a group past it. Any other cookie is not, and nor is
+     * any other device -- even one whose private area points at the same
+     * context, since the learner asks of VLANs and bridges as well and the
+     * slot is found by its device rather than through netdev_priv(). */
+    assert(cdx_dscp_mirrored(&dev, 1) && cdx_dscp_mirrored(&dev, 2));
+    assert(!cdx_dscp_mirrored(&dev, 3));
+    {
+        struct net_device stranger = { .priv.qm_ctx = &gQMCtx[3] };
+
+        assert(!cdx_dscp_mirrored(&stranger, 1));
+    }
+    assert(!rcu_depth);
 
     /* ---- what it refuses ---- */
 
@@ -653,12 +689,14 @@ int main(void)
     assert(del(1) == 0);
     assert(hw.fq[46] == -1);
     assert(hw.on);                      /* one filter left */
+    assert(!cdx_dscp_mirrored(&dev, 1) && cdx_dscp_mirrored(&dev, 2));
     assert(del(1) == -ENOENT);
     assert(del(2) == 0);
     /* The last filter takes the map with it, so the port classifies as it
      * did before one existed -- and hands the microcode's single table back
      * to whichever port asks next. */
     assert(!hw.on && hw.disabled == 1);
+    assert(!cdx_dscp_mirrored(&dev, 2) && !rcu_depth);
 
     /* A port that cannot have the map is told so rather than left thinking
      * it has one. */

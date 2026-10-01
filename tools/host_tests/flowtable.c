@@ -460,6 +460,14 @@ static unsigned mroute_events, mroute_kicks, mroute_devices_gone;
 static unsigned long ft_mr_resync_pending;
 static bool ft_mr_ready;
 static int ft_mr_work;
+/* The count of x_tables table changes, which the learner starts from: the
+ * tables as they stand at load are no change to follow. */
+static unsigned int ft_mr_xt_seen, xt_changes = 7;
+static unsigned int nf_xt_seq(const struct net *net)
+{
+    assert(net == &init_net);
+    return xt_changes;
+}
 static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
 {
     (void)event; (void)info;
@@ -6974,9 +6982,11 @@ static void test_qos_decode(void)
     fixture();
     ft_qos_mark_mask = CDX_FT_QOS_MASK; ft_qos_default_class = 0;
     sec_refusal_folds = 0;
+    ft_mr_xt_seen = 0;
     assert(ask_flowtable_init() == 0);
     /* Counting what SEC refused starts at load and ends at unload. */
     assert(sec_refusal_folds == 1);
+    assert(ft_mr_xt_seen == xt_changes);
     ask_flowtable_exit();
     assert(sec_refusal_folds == 2);
     ft_ready=ft_stopping=false; registration_step=canceled=0;

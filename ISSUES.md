@@ -172,17 +172,8 @@ result independently of those temporary files.
   `BR_MCAST_TO_HOST_*` reason for `IFF_ALLMULTI` in patch 161. Regression: a VIF on the bridge,
   last bridged listener gone, require the routed copy still delivered.
 
-- [ ] **A294 — a port-selective iptables-legacy rule or tc filter is bypassed by a routed
-  multicast group.** A289's port walk (`nft_port_dependent()`, patch 148) reads nftables only
-  (iptables-nft included). An iptables-legacy `-p udp --dport 5001 -j DROP`, or a tc ingress
-  filter dropping one port, is still passed by the copies of another port that confirm the
-  `(S,G)`, and the one L3-keyed entry then replicates the dropped port too. A unicast flow is
-  5-tuple keyed, so there it costs nothing. The meta-ask image registers iptables-legacy nat
-  (`test_profile_homelab.py`). Fix: refuse routed groups while an x_tables table hooks
-  PRE/FORWARD/POST (`ipt_do_table`/`ip6t_do_table` in the hook entries -- without making cdx
-  depend on ip_tables), and while a tc ingress or egress block sits on a device in the parent's
-  or an oif's stack. Regression: legacy FORWARD drop of one port, two-port window as in
-  `test_flowtable_service_multicast_ports.py`, require zero delivery of the dropped port.
+- [x] **A294 — a port-selective iptables-legacy rule or tc filter was bypassed by a routed multicast group.** Fixed:
+  `nf_xt_port_dependent()` (patch 148) walks x_tables (`refused-xtables`); software tc on the parent's or an oif's stack is `refused-tc` (_:/^cdx: keep a routed multicast group legacy iptables or tc tells apart in software_).
 
 - [x] **A295 — memory pressure could make a classifier delete terminal.** Fixed: a delete that rebuilds a crowded
   bucket's node takes it outside the lock, from the allocator or a per-table spare every unreachable node refills (_:/^fm_ehash: back a classifier delete's node_).
@@ -213,6 +204,24 @@ result independently of those temporary files.
   an unnamed stream is looked at once per refresh interval rather than per frame. Regression:
   32 interleaved unnamed streams at 1 kpps on a snooping bridge; worker passes per second and
   `ctrl.mutex` hold time stay bounded (expose a pass counter in `/proc/cdx_flowtable`).
+
+- [ ] **A298 — a tc filter or XDP program on a bridge port is bypassed by a bridged multicast
+  flow.** The bridged learner refuses every flow while a bridge netfilter hook is registered
+  (`ft_mc_bridge_filtered()`, `cdx/ask_flowtable.c`), but nothing looks at tc or XDP on the
+  port a stream arrives by or on a listener's port: `ft_mc_installable()` and
+  `ft_mc_discardable()` never ask. A tc ingress filter on the ingress port (a port-selective
+  `flower ... dst_port X action drop`, a `mirred` to an ifb for SQM, a non-`skip_sw` police), an
+  egress filter or qdisc-class filter on a listener port, a tcx program, or XDP on the ingress
+  port runs on every frame the bridge forwards in software and on none the classifier
+  replicates, and the entry's key stops at L3, so one rule is bypassed for every port of the
+  group. The routed learner already refuses this (`refused-tc`, `ft_mr_tc_filtered()`). Fix:
+  in the flow's derivation, which holds RTNL, ask `ft_dev_stack_tc_soft()` of the ingress port
+  (ingress, XDP included) and of each listener port (egress), keep the answer on the flow
+  (the predicates are also read without RTNL, from /proc), refuse it in both, report it as
+  `refused-tc` in `ft_mc_state()`, and let the refresh re-ask it as the routed learner
+  does. Regression: a bridged two-port window with a tc ingress drop of one UDP port on the
+  ingress port, and an egress drop on one listener port; require `refused-tc`, zero delivery of
+  the dropped port, and the flow carried again once the filter is gone.
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**

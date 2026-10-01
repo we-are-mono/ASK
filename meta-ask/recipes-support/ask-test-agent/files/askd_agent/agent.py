@@ -526,6 +526,10 @@ async def ioctl_send(request: web.Request) -> web.Response:
 _EXEC_ARGV0_ALLOWED = {
     "ip", "ethtool", "iptables", "modprobe", "rmmod", "insmod",
     "sysctl", "conntrack", "bridge", "tcpdump", "nft",
+    # The IPv6 half of iptables, with the same surface: rules, nothing that
+    # starts a program. tc is not listed, and stays on the console: `tc exec
+    # bpf import ... run` starts whatever it is given.
+    "ip6tables",
     # Reading the kernel log. Several subsystems say what they did only
     # there -- VWD logs the classifier hooks appearing and going, and those
     # hooks have no sysfs or procfs face at all -- so without this the only

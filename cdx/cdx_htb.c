@@ -2217,6 +2217,22 @@ static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
 	}
 }
 
+/* The two halves TC_SETUP_BLOCK serves above, as a multicast stream the
+ * classifier replicates meets them. An egress DSCP filter does exactly what
+ * it does in software: every listener entry on a port whose map is published
+ * reads the map per frame (cdx_dscp_mirrored()). An ingress filter never
+ * does. A matchall police is the port's rate limiter, but the soft parser
+ * hands that profile only unicast TCP, UDP and ESP frames: it stops parsing a
+ * multicast frame at the IP header and leaves it to the classifier unmetered,
+ * where the software path would police it. And flower's per-flow profiles
+ * are bound to flowtable entries, which a multicast entry is not. */
+bool cdx_tc_filter_mirrored(struct net_device *dev, bool ingress,
+			    unsigned long cookie)
+{
+	return !ingress && cdx_dscp_mirrored(dev, cookie);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_tc_filter_mirrored, ASK_CDX_FLOWTABLE);
+
 int cdx_htb_init(void)
 {
 	unsigned int ii;

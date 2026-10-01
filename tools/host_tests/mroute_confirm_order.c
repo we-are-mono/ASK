@@ -23,6 +23,7 @@ typedef uint16_t u16;
 #define rcu_read_lock() ((void)0)
 #define rcu_read_unlock() ((void)0)
 #define rcu_dereference(p) (p)
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
 /* As include/uapi/linux/netfilter.h and include/linux/netfilter.h have them. */
 enum { NF_INET_PRE_ROUTING, NF_INET_LOCAL_IN, NF_INET_FORWARD,
@@ -66,8 +67,39 @@ static struct nf_hook_ops nft_filter = { 0, NF_HOOK_OP_NF_TABLES };
 static struct nf_hook_ops nft_last = { INT_MAX, NF_HOOK_OP_NF_TABLES };
 static struct nf_hook_ops bpf_last = { INT_MAX, NF_HOOK_OP_BPF };
 
-/* The family's POST_ROUTING list, in the order given: the order netfilter
- * would run them in. */
+/* What a netfilter BPF link registers: typed, at a priority of its own. */
+static struct nf_hook_ops bpf_filter = { 10, NF_HOOK_OP_BPF };
+
+/* The family's list at `hook`, in the order given: the order netfilter would
+ * run them in. */
+static void registered_at(u8 family, unsigned hook, unsigned n, __builtin_va_list ap)
+{
+    struct nf_hook_entries **slot = family == AF_INET6 ?
+        &init_net.nf.hooks_ipv6[hook] : &init_net.nf.hooks_ipv4[hook];
+    struct nf_hook_entries *e;
+
+    free(*slot);
+    *slot = NULL;
+    if (!n)
+        return;
+    e = calloc(1, sizeof(*e) + n * (sizeof(e->hooks[0]) + sizeof(void *)));
+    assert(e);
+    e->num_hook_entries = n;
+    for (unsigned i = 0; i < n; i++)
+        nf_hook_entries_get_hook_ops(e)[i] = __builtin_va_arg(ap, struct nf_hook_ops *);
+    *slot = e;
+}
+
+static void at(u8 family, unsigned hook, unsigned n, ...)
+{
+    __builtin_va_list ap;
+
+    __builtin_va_start(ap, n);
+    registered_at(family, hook, n, ap);
+    __builtin_va_end(ap);
+}
+
+/* The family's POST_ROUTING list. */
 static void registered(u8 family, unsigned n, ...)
 {
     struct nf_hook_entries **slot = family == AF_INET6 ?
@@ -125,5 +157,34 @@ int main(void)
 
     registered(AF_INET, 0);
     registered(AF_INET6, 0);
+
+    /* A netfilter BPF program anywhere a copy passes -- prerouting, forward,
+     * postrouting, before the observer as much as after it -- can judge it
+     * by its ports, and nothing reads it. Elsewhere, and in the other
+     * family, it is nothing to the group; and no hook that is not one is
+     * taken for one. */
+    assert(!ft_mr_bpf_hooked(AF_INET) && !ft_mr_bpf_hooked(AF_INET6));
+    at(AF_INET, NF_INET_PRE_ROUTING, 2, &nft_filter, &nat);
+    at(AF_INET, NF_INET_POST_ROUTING, 3, &nft_filter, v4, &conntrack_confirm);
+    assert(!ft_mr_bpf_hooked(AF_INET));
+    static const unsigned crossed[] = {
+        NF_INET_PRE_ROUTING, NF_INET_FORWARD, NF_INET_POST_ROUTING,
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(crossed); i++) {
+        at(AF_INET, crossed[i], 3, &nft_filter, &bpf_filter, &nat);
+        assert(ft_mr_bpf_hooked(AF_INET) && !ft_mr_bpf_hooked(AF_INET6));
+        at(AF_INET, crossed[i], 1, &nft_filter);
+        assert(!ft_mr_bpf_hooked(AF_INET));
+        at(AF_INET6, crossed[i], 1, &bpf_filter);
+        assert(ft_mr_bpf_hooked(AF_INET6) && !ft_mr_bpf_hooked(AF_INET));
+        at(AF_INET6, crossed[i], 0);
+    }
+    at(AF_INET, NF_INET_LOCAL_IN, 1, &bpf_filter);
+    at(AF_INET, NF_INET_LOCAL_OUT, 1, &bpf_filter);
+    assert(!ft_mr_bpf_hooked(AF_INET));
+    for (unsigned h = 0; h < NF_INET_NUMHOOKS; h++) {
+        at(AF_INET, h, 0);
+        at(AF_INET6, h, 0);
+    }
     return 0;
 }

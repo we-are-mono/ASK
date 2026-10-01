@@ -388,7 +388,10 @@ that family's `POST_ROUTING`, its groups are `refused-filter`. Conntrack's
 confirmation also sits at that priority. It is the kernel's own, registered
 with no hook type, and drops a copy only when it cannot insert its entry, so it
 does not count. No BPF program can be there at all: a netfilter BPF link
-refuses the last priority, which it leaves to conntrack.
+refuses the last priority, which it leaves to conntrack. But a netfilter BPF
+program anywhere else a copy passes -- prerouting, forward, postrouting -- can
+judge it by its ports as a chain can, and neither port walk reads it, so while
+one is attached the family's groups are `refused-filter` too.
 
 **All or nothing.** A root consumes every frame it matches, and no listener the
 encoder expresses delivers to the CPU; the bridged learner's `refused-host` is
@@ -409,7 +412,12 @@ there. A group routed *through* a bridge,
 with its parent VIF on one, is confirmed the same way, from what ipmr forwards
 once the bridge has handed the stream up, before its copies are published to
 the bridged flow that carries them. That covers a bridge `input` chain on the
-way up too.
+way up too, for the copies that confirm the group, but not for the rest of
+its packets: an `ebtables -A INPUT` drop of one UDP port would let the other
+port's copies confirm the group and the dropped port ride its entry. So a
+group whose parent VIF is on a bridge is `refused-filter` while any hook is
+registered at the bridge's `input`: ebtables, br_netfilter, or an nftables
+bridge chain, which the port walk below would refuse as well.
 
 **Every packet alike.** A copy seen leaving proves that the ruleset forwarded
 that copy. The classifier key stops at the address pair, so every other packet
@@ -430,6 +438,8 @@ following makes it 1 and the group `refused-ports`:
 - a rule that reads the ports;
 - a limit, quota or meter, such as banIP's UDP flood rule at prerouting,
   which every multicast packet meets as new;
+- a `ct count` limit, which drops a packet whose connection -- whose pair of
+  ports -- it cannot count;
 - a lookup in a set the datapath updates or whose elements time out;
 - a `fib` lookup a path can drop on, which is how an RPF check
   (`fib saddr . iif oif missing drop`) is written;
@@ -454,6 +464,87 @@ ports, is followed within one refresh.
   rather than in a loop while the commit is being prepared.
 - A ruleset too large for the walk's bounds, or no memory for it, leaves the
   group `refused-ports` and counts `mroute_port_probe_errors`.
+
+**iptables-legacy.** A legacy rule splits a group's ports as surely as an
+nftables one, and legacy tables are not rare: the meta-ask image's own setup
+installs FORWARD accepts and a WAN `MASQUERADE` with `iptables-legacy`. So
+their presence cannot be what refuses a group, and the rules are read instead.
+`nf_xt_port_dependent()`, also in kernel patch 148, is asked first, by the same
+derivation. It walks every ip_tables or ip6_tables table a copy crosses at
+prerouting, forward and postrouting as `ipt_do_table()` would, for all of the
+stream's packets at once, inside an `xt_recseq` section so that a replacement
+cannot free the table under it. The devices are the ones ipmr and ip6mr hand
+the hooks: the parent VIF at prerouting, it and each oif at forward, each oif
+at postrouting -- as the output, and for IPv6 as the input as well, since
+ip6mr has made it the copy's device before `ip6_output()` runs the hook. A
+rule whose header -- addresses, devices, protocol, the `-f` flag -- matches
+every packet applies. An IPv6 rule naming a protocol may not: a later fragment
+with an extension header after its fragment header shows no protocol to
+`ip6_packet_match()`. One with a match may or may not apply either, and both
+ways are followed. A match outside the list of those that only decide makes the
+answer 1. Not on it are a match that drops a packet itself -- `hashlimit` one
+it has no room to give a bucket, which with `--hashlimit-mode dstport` is a
+drop by port, `connlimit` one it cannot count, `recent` one it cannot record
+-- and one that writes what nftables may read: `connlabel`'s `--set` the
+conntrack's labels, `socket`'s `--restore-skmark` the packet's mark. What the
+rest keep, counters and token buckets shared between rules included, only
+decides other x_tables matches, which the walk takes both ways as well. Any
+verdict or target on a path but `ACCEPT`, a `RETURN` that reaches an
+accepting policy, `LOG`, `NFLOG` and `TRACE` makes the answer 1 too. The NAT
+tables are found through the NAT core, which runs them for a
+connection's first packet: iptable_nat registers them with the core rather than
+with netfilter. To find them, and the tables behind their hooks whatever
+function runs them -- mangle runs its own through a wrapper -- the patch types
+the NAT core's hooks `NF_HOOK_OP_NAT` and the tables' `NF_HOOK_OP_XTABLES`,
+neither of which userspace sees. A group the rules could tell apart is
+`refused-xtables`. A walk past its bounds -- 4096 rules per table, hook and oif,
+32768 per group, 32 nested chains -- counts `mroute_port_probe_errors` and
+refuses it the same way.
+
+The image's own legacy ruleset answers 0 for a group from the WAN to the LAN.
+Its `RELATED,ESTABLISHED` accept and the IPv6 conntrack accept are matches, so
+they may or may not apply, and the `ACCEPT` policy takes whatever they do not;
+the `MASQUERADE` names the WAN port, which no LAN oif is. A group routed out of
+the WAN port itself answers 1, since the hardware copy would not be
+masqueraded.
+
+A legacy table has no generation of its own, so the patch adds one:
+`net->nf.xt_seq`, moved with a release store by every table registration, by
+every replacement once `xt_replace_table()` has waited out the packets still
+reading the old table, and by every removal. The learner reads it every second
+while any group exists and at every worker pass, and a move asks every group
+again and counts `mroute_xtables_changes`. No confirmation is taken back for
+it. The walk's 0 says x_tables accepts every packet of the group untouched,
+whatever the copies that confirmed it met, and its 1 keeps the group in
+software regardless.
+
+**tc.** A filter runs on a device: on every packet Linux forwards through it,
+and on none the classifier replicates. Nothing about a confirmation says what
+it read. So tc is ruled out per device rather than per rule, and ahead of the
+confirmations: a group is `refused-tc` while anything tc runs in software sits
+on the parent VIF's device or a device below it, on the way in, or on an oif's
+or one below it, on the way out. That is a filter in a clsact or ingress block
+that runs in software, an egress filter on any class of a qdisc tree, a tcx BPF
+program, and on the input side an XDP program. A block runs in software when
+its `useswcnt` is not zero, which is what `tc_run()` bypasses it on, so a block
+of `skip_sw` filters alone counts for nothing. Every device of a stack counts,
+because a frame crosses each of them; a bridge oif therefore counts all its
+ports.
+
+One filter is exempt: an egress DSCP filter that cdx offloads
+(`flower ip_dscp N action skbedit priority`), on a port whose map is published.
+Every listener entry on such a port reads the map per frame, as the software
+Tx path reads the same filter's class, so a carried stream is queued as it
+would have been in software. An ingress `matchall` police is not exempt. It
+programs the port's rate limiter, but the soft parser hands that profile only
+unicast TCP, UDP and ESP frames -- it stops parsing a multicast frame at the IP
+header -- so a replicated stream would skip a meter the software path applies.
+A `skip_sw` police, like the homelab profile's, runs nowhere in software and is
+not counted at all.
+
+Nothing reports a filter added or removed. The derivation asks at every pass,
+and the five-second refresh re-derives every group, so a filter added under a
+carried group takes it out within one refresh, and one removed lets it back.
 
 **The ruleset.** Confirmations are good for the ruleset they were made under:
 nftables' commit counter `init_net.nft.base_seq`, and the cursor
@@ -504,16 +595,17 @@ flowtable flow on a commit, only when the flowtable itself goes. A routed
 multicast stream lives for hours, no conntrack timeout bounds it, and a
 blocklist entry added for its source has to stop it.
 
-**What it does not cover.** The confirmations and the port walk read nftables
-alone:
+**What it does not cover.** The confirmations read nftables alone, the port
+walks nftables and iptables-legacy rules, and tc is judged by where it runs:
 
 - A counter stops counting once the group is carried, as it does for a
   flowtable flow.
-- A tc filter or action, at ingress or egress, and an iptables-legacy rule are
-  not read at all. For a port-selective one this is wider than it is for a
-  flowtable flow, whose key names its ports: a drop of one port's stream, with
-  another port's copies confirming the group, is bypassed by the one entry
-  both streams ride. See A294.
+- A tc filter added under a carried group goes unenforced until the next
+  refresh, at most five seconds.
+- The bridged learner does not look at tc or XDP at all: a filter on a bridged
+  stream's ingress port or on a listener port stops applying once the flow is
+  in hardware. A routed group whose parent VIF or oif is a bridge is covered
+  by its own check, which counts every port below the bridge. See A298.
 - Verdicts that change without a commit, and that the walk does not read
   either, are not followed:
   - ipset membership (`iptables-nft -m set`) and stateful xt matches, which
@@ -528,10 +620,6 @@ alone:
     else takes it back to software.
 - A copy queued to userspace (NFQUEUE) before a commit and reinjected after
   the re-arm is observed under the new pair.
-- iptables-legacy tables are replaced with no generation a module can read, so
-  a legacy rule change is followed only once something else takes the group
-  back: an MFC change, a device change, or an nftables commit. iptables-nft is
-  nftables and is followed.
 
 ## One stream, both learners
 
@@ -740,7 +828,11 @@ family over:
 | The MFC entry's parent replaced | the FIB chain | a new watch with nothing confirmed; to software until copies from the new parent are seen |
 | A bridge hook registered at `output` or `postrouting` | nothing reports it: asked at every derivation | a group with an oif through a bridge is `refused-filter` |
 | An nftables chain after the observer at `POST_ROUTING` | nothing reports it: asked at every derivation, and creating a chain is a commit | the family's groups are `refused-filter` |
+| A netfilter BPF link at `PRE_ROUTING`, `FORWARD` or `POST_ROUTING` | nothing reports it: asked at every derivation | the family's groups are `refused-filter` |
+| A bridge hook registered at `input` -- ebtables, br_netfilter, an nftables bridge chain | nothing reports it: asked at every derivation | a group whose parent VIF is on a bridge is `refused-filter` |
 | A rule that could treat two packets of a group apart -- by port, rate or anything the port walk does not model -- or a device it cannot follow joining a VIF's stack | a commit, which takes every confirmation back; a stack change is found by the walk itself, run at every derivation of a confirmed group | `refused-ports` once the group is confirmed again |
+| An iptables-legacy table registered, replaced or removed | the kernel's count `net->nf.xt_seq` (patch 148): read every second while any group exists, and at every worker pass | every group re-derived and `mroute_xtables_changes` counted, no confirmation taken back; a confirmed group whose packets the legacy rules could tell apart is `refused-xtables` |
+| A tc filter, qdisc tree filter, tcx program or XDP program on a device of the parent's or an oif's stack | nothing reports it: asked at every derivation, which the five-second refresh runs for every group | `refused-tc`, confirmed or not, unless the filter is an offloaded DSCP filter on a port whose map is published |
 | The host joining the group on the parent VIF or an oif | nothing reports it | `refused-host` at the next derivation; the five-second refresh finds it |
 | A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |
@@ -841,6 +933,7 @@ mroute_ruleset_changes 3
 mroute_ruleset_settled 1
 mroute_confirm_errors 0
 mroute_port_probe_errors 0
+mroute_xtables_changes 0
 ```
 
 — and one row per group:
@@ -863,8 +956,8 @@ hears. A group routed through a bridge rides the bridged group's entry and
 adds none of its own, so its count stays where it was.
 The states are `installed`, `pending`, `pending-bridged`,
 `pending-confirm`, and the refusals above (`refused-paused` among them) plus
-`refused-filter` and `refused-ports`, each distinct
-so an operator can tell them apart. While a routed group exists,
+`refused-filter`, `refused-tc`, `refused-xtables` and `refused-ports`, each
+distinct so an operator can tell them apart. While a routed group exists,
 `mroute_ruleset_settled` is 0 for the second after a commit, and for as long
 as the commit is still being applied. Meanwhile no copy confirms anything, and
 every group reads `pending-confirm` with all its oifs unconfirmed. With no
@@ -874,8 +967,11 @@ group appears and the next pass reads the pair. Read it beside a group's
 state, never alone. `mroute_confirm_errors`
 counts failures to register the observer or to allocate a group's watch, each
 of which keeps groups in software. `mroute_port_probe_errors` counts the port
-walks that gave up, too large a ruleset or no memory, which leave a group
-`refused-ports` like an answer of 1 would. A group
+walks that gave up, nftables' or x_tables', for too large a ruleset or no
+memory, which leave a group `refused-ports` or `refused-xtables` like an answer
+of 1 would. `mroute_xtables_changes` counts the iptables-legacy table changes
+seen while a routed group existed, each of which asked every group again. A
+group
 routed through a bridge names the bridge as `in`: the port its stream arrives
 on is the bridged group's to know, and that row — `mcast … routed=eth3/287` —
 names it, with its own copies beside the routed ones. `mroute_policy_rules`
@@ -968,12 +1064,32 @@ caught up with confirms nothing and wakes it. So does a commit between the
 pass's sync and its admission. An oif Linux never forwards to keeps the group
 in software through any number of refreshes, and is carried once seen. An oif
 removed leaves the rest confirmed. A new parent starts from nothing. A bridge
-output hook, or a hook after the observer, refuses the group. A watch that
+output hook, a bridge input hook under a parent on a bridge, a hook after the
+observer, or a netfilter BPF program refuses the group. A watch that
 cannot be allocated admits nothing and is counted. The same happens for IPv6
 in a table of its own. It also runs two MFC entries on one port's two VLANs,
-the second `refused-contested` until the first retires.
+the second `refused-contested` until the first retires. And it runs the two
+refusals that are not nftables'. A legacy answer of 1 takes a carried group out
+as `refused-xtables` without the nftables walk being asked, and a legacy walk
+that gave up counts; a move of the kernel's x_tables count asks every group
+again, taking no confirmation back, and counts `mroute_xtables_changes` only
+while a group exists. tc refuses a group as `refused-tc` ahead of any
+confirmation, and lets it back once gone.
 `mroute_confirm_order.c` runs the real walk of the `POST_ROUTING` list, where
-only an nftables chain after the observer counts.
+only an nftables chain after the observer counts, and of the three lists a copy
+crosses, where any netfilter BPF program does. `mroute_tc.c` runs the real
+device-stack check against stub devices, blocks and qdiscs: an empty clsact and
+a `skip_sw`-only block count for nothing, a software filter, a tcx program and
+XDP on the input side do, a DSCP filter the port mirrors does not unless a
+foreign one sits beside it, and the direction, the devices below a VIF and the
+classes of an egress qdisc are each where they belong. `xt_port_probe.c`
+compiles the kernel's own x_tables walkers out of patch 148 and runs them
+against tables built from the uapi structures, for both families: the image's
+own tables, a port drop toward every oif or one, a policy behind a definite or
+a matched accept, jumps, gotos and returns, `LOG`, `MARK`, the matches that
+drop or write (`recent`, `hashlimit`, `connlimit`, `socket`), fragments, the
+IPv6 postrouting input, the NAT tables found only through the NAT core, and
+the bounds.
 `mcast_learner.c` runs the bridged half: the union and its
 ceiling, a duplicate framing, the MTU bound, retention while either learner
 names a group, the group a route creates for itself and the join that fills
@@ -1054,6 +1170,25 @@ both, and the classifier counts the whole window. Adding the chain back is a
 commit: `mroute_ruleset_changes` moves and the group leaves hardware. Once
 `mroute_ruleset_settled` is back, the port is confirmed again from the stream,
 and the VLAN peer receives nothing.
+
+`tools/tests/test_flowtable_service_multicast_ports.py` sends two streams of
+one `(S,G)` on two UDP ports from the WAN to the LAN port and a VLAN device on
+it, for both families. `test_flowtable_service_multicast_routed_follows_ports`
+puts an nftables rule in front of them that splits the ports at forward or
+prerouting, toward both oifs or one: the group reads `refused-ports`, both
+streams reach the CPU, and exactly the (port, oif) pairs Linux drops receive
+nothing. fw4's shape, with a port-reading accept ahead of the group's own, is
+carried from the start. `test_flowtable_service_multicast_routed_follows_legacy_and_tc`
+does the same with what is not nftables. An iptables-legacy FORWARD drop of
+the second port, toward both oifs or only the tagged one, reads
+`refused-xtables`; a software tc drop of it at the WAN ingress or at the VLAN
+device's egress reads `refused-tc`. The image's own legacy tables with a
+port-reading accept and a chain that only returns added to them, and a
+`skip_sw` matchall police on the uplink, are carried with both ports from the
+start. In every case the rule gone -- `mroute_xtables_changes` moving for a
+legacy one -- both ports are carried to both oifs, and the classifier counts
+both streams whole. tc runs on the DUT's console: the agent does not list it,
+because `tc exec bpf import` starts any program.
 
 ## Proved on hardware
 

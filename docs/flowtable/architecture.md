@@ -26,7 +26,7 @@ CMM or per-flow FCI commands. `dpa_app`/FMC still initialize the hardware once.
 | Responsibility | Source |
 | --- | --- |
 | Native callback context, shared handles and route integration | [Kernel patch 140](../../patches/kernel/140-ask-flowtable-context.patch) |
-| Whether an nftables commit is still being applied, for routed multicast confirmation | [Kernel patch 148](../../patches/kernel/148-netfilter-nftables-commit-in-progress.patch) |
+| Whether an nftables commit is still being applied, for routed multicast confirmation; whether nf_tables (`nft_port_dependent()`) or iptables-legacy (`nf_xt_port_dependent()`, an ip_tables/ip6_tables walker reached through hooks typed `NF_HOOK_OP_XTABLES` and the NAT core's `NF_HOOK_OP_NAT`) could tell a routed group's streams apart by port; and `net->nf.xt_seq`, the count of x_tables table changes a caller re-asks on | [Kernel patch 148](../../patches/kernel/148-netfilter-nftables-commit-in-progress.patch) |
 | Rule decoding, binding, dependency watches and work | [ask_flowtable.c](../../cdx/ask_flowtable.c) |
 | Private source interface | [cdx_flowtable_backend.h](../../cdx/cdx_flowtable_backend.h) |
 | Transactions, claim, port checks and fatal guard | [cdx_flowtable_backend.c](../../cdx/cdx_flowtable_backend.c) |

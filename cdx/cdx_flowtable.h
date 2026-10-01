@@ -96,6 +96,16 @@ struct cdx_ft_egress_ops {
 int cdx_register_ft_egress(const struct cdx_ft_egress_ops *ops);
 void cdx_unregister_ft_egress(void);
 
+/* Whether the tc filter offloaded to `dev' under `cookie', on its ingress or
+ * its egress, is one the hardware applies as it is to every frame of a
+ * multicast stream the classifier replicates through the port, so that the
+ * stream fares in hardware as it would through the software path that runs
+ * the filter. For the routed multicast learner, which keeps a group in
+ * software while any other filter runs there. Lock-free and never sleeps:
+ * called from a classifier's walk, under RTNL. */
+bool cdx_tc_filter_mirrored(struct net_device *dev, bool ingress,
+			    unsigned long cookie);
+
 int cdx_flowtable_guard_init(void);
 void cdx_flowtable_guard_exit(void);
 void cdx_flowtable_quiesced(void);

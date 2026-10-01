@@ -1,4 +1,4 @@
-From be6f613bc4674c2519102d2ceac318eadb0b3037 Mon Sep 17 00:00:00 2001
+From 30e1dd3597068bbd20d30b6bba680d7e047ad662 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 24 Sep 2026 01:55:38 +0200
 Subject: [PATCH] netfilter: nf_tables: say when a commit is still being
@@ -51,15 +51,55 @@ stores into the conntrack, which its ops do not tell apart. A set a
 dynset binds to is marked as updated from the packet path, which its
 flags need not say.
 
+x_tables can tell such streams apart too, and its hooks being there
+says nothing: a router's own iptables-legacy FORWARD and NAT rules would
+refuse every stream. Add nf_xt_port_dependent(), which walks the
+ip_tables or ip6_tables tables a forwarded copy crosses at prerouting,
+forward and postrouting as ipt_do_table() would, for all the stream's
+packets at once, inside an xt_recseq section: a rule whose header
+matches applies, one with a match may or may not, and a match that does
+more than decide, or any verdict or target but ACCEPT, RETURN to an
+accepting policy, LOG, NFLOG and TRACE on a path, makes the answer 1.
+ip_tables and ip6_tables publish their walkers through RCU pointers in
+the netfilter core, so the caller depends on neither. Their hooks are
+typed NF_HOOK_OP_XTABLES, mangle running its table through a wrapper of
+its own, and the NAT core's NF_HOOK_OP_NAT: the iptables-legacy NAT
+tables are registered with it and found only through its private data,
+which moves to nf_nat.h. The NAT core now frees its hook ops after a
+grace period, as it already freed that data, and the registration error
+paths that unregister hooks again -- ip_tables', ip6_tables', the NAT
+core's and the NAT tables' own -- wait one before freeing what they
+named: a reader of the hook list under RCU, the probe as much as the
+hook dump, may hold a pointer into them. The pure-match and
+passing-target lists live in x_tables.c, for both families.
+
+An x_tables table has no generation a reader could compare. Add
+net->nf.xt_seq, moved with a release by every table registration, by
+every replacement once xt_replace_table() has waited out the packets
+reading the table it replaced, and by every removal, so that a caller
+that cached the answer asks again when it moves.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/net/netfilter/nf_tables.h      |   72 +
+ include/linux/netfilter.h              |    6 +
+ include/linux/netfilter/x_tables.h     |    3 +
+ include/net/netfilter/nf_nat.h         |   11 +
+ include/net/netfilter/nf_port_probe.h  |  101 +
+ include/net/netfilter/nf_tables.h      |   40 +
  include/net/netfilter/nf_tables_core.h |   56 +
  include/net/netfilter/nft_nat.h        |   34 +
+ include/net/netns/netfilter.h          |    5 +
  include/net/netns/nftables.h           |    2 +
+ net/ipv4/netfilter/ip_tables.c         |  307 +++-
+ net/ipv4/netfilter/iptable_nat.c       |    8 +-
+ net/ipv6/netfilter/ip6_tables.c        |  349 +++-
+ net/ipv6/netfilter/ip6table_nat.c      |    8 +-
  net/netfilter/Makefile                 |    2 +-
+ net/netfilter/core.c                   |   50 +
+ net/netfilter/nf_nat_core.c            |   19 +-
  net/netfilter/nf_tables_api.c          |   10 +
- net/netfilter/nf_tables_port_probe.c   | 2346 ++++++++++++++++++++++++
+ net/netfilter/nf_tables_port_probe.c   | 2349 ++++++++++++++++++++++++
+ net/netfilter/nfnetlink_hook.c         |    2 +
  net/netfilter/nft_bitwise.c            |   10 -
  net/netfilter/nft_byteorder.c          |    8 -
  net/netfilter/nft_cmp.c                |    7 -
@@ -71,15 +111,185 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/netfilter/nft_objref.c             |    6 -
  net/netfilter/nft_range.c              |    8 -
  net/netfilter/nft_redir.c              |    7 +-
- 18 files changed, 2531 insertions(+), 71 deletions(-)
+ net/netfilter/x_tables.c               |   58 +
+ 31 files changed, 3412 insertions(+), 88 deletions(-)
+ create mode 100644 include/net/netfilter/nf_port_probe.h
  create mode 100644 include/net/netfilter/nft_nat.h
  create mode 100644 net/netfilter/nf_tables_port_probe.c
 
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+index 2b8aac2c70ad..42ac5238fc3c 100644
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -92,6 +92,12 @@ enum nf_hook_ops_type {
+ 	NF_HOOK_OP_UNDEFINED,
+ 	NF_HOOK_OP_NF_TABLES,
+ 	NF_HOOK_OP_BPF,
++	/* An ip_tables or ip6_tables table; priv is its struct xt_table. */
++	NF_HOOK_OP_XTABLES,
++	/* The NAT core, which runs the NAT tables registered with it; priv is
++	 * its struct nf_nat_lookup_hook_priv.
++	 */
++	NF_HOOK_OP_NAT,
+ };
+ 
+ struct nf_hook_ops {
+diff --git a/include/linux/netfilter/x_tables.h b/include/linux/netfilter/x_tables.h
+index 5897f3dbaf7c..84fcad81c91b 100644
+--- a/include/linux/netfilter/x_tables.h
++++ b/include/linux/netfilter/x_tables.h
+@@ -449,6 +449,9 @@ xt_get_per_cpu_counter(struct xt_counters *cnt, unsigned int cpu)
+ 
+ struct nf_hook_ops *xt_hook_ops_alloc(const struct xt_table *, nf_hookfn *);
+ 
++bool xt_probe_pure_match(const struct xt_match *match);
++bool xt_probe_passing_target(const struct xt_target *target);
++
+ int xt_register_template(const struct xt_table *t, int(*table_init)(struct net *net));
+ void xt_unregister_template(const struct xt_table *t);
+ 
+diff --git a/include/net/netfilter/nf_nat.h b/include/net/netfilter/nf_nat.h
+index 9877f064548a..71112fad66ce 100644
+--- a/include/net/netfilter/nf_nat.h
++++ b/include/net/netfilter/nf_nat.h
+@@ -100,6 +100,17 @@ void nf_nat_ipv6_unregister_fn(struct net *net, const struct nf_hook_ops *ops);
+ int nf_nat_inet_register_fn(struct net *net, const struct nf_hook_ops *ops);
+ void nf_nat_inet_unregister_fn(struct net *net, const struct nf_hook_ops *ops);
+ 
++/* The private data of a NAT core hook, which is typed NF_HOOK_OP_NAT: the
++ * NAT tables registered with it, which it runs for a connection's first
++ * packet. Read under RCU by the x_tables port probe, which finds the
++ * iptables-legacy NAT tables there and nowhere else.
++ */
++struct nf_nat_lookup_hook_priv {
++	struct nf_hook_entries __rcu *entries;
++
++	struct rcu_head rcu_head;
++};
++
+ unsigned int
+ nf_nat_inet_fn(void *priv, struct sk_buff *skb,
+ 	       const struct nf_hook_state *state);
+diff --git a/include/net/netfilter/nf_port_probe.h b/include/net/netfilter/nf_port_probe.h
+new file mode 100644
+index 000000000000..5832d124b58a
+--- /dev/null
++++ b/include/net/netfilter/nf_port_probe.h
+@@ -0,0 +1,101 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _NF_PORT_PROBE_H
++#define _NF_PORT_PROBE_H
++
++#include <linux/atomic.h>
++#include <linux/netfilter.h>
++#include <net/net_namespace.h>
++
++struct net_device;
++
++/**
++ * struct nft_port_probe - a forwarded UDP stream, as far as it is known
++ * @family: NFPROTO_IPV4 or NFPROTO_IPV6
++ * @saddr: the stream's source address
++ * @daddr: the stream's destination address
++ * @in: the device the stream arrives on
++ * @out: the devices copies of it leave through
++ * @nout: how many entries @out has
++ *
++ * Everything about the stream but its transport ports: an offload that keys
++ * on the addresses alone asks whether the ruleset could tell two of its
++ * streams apart by port. nft_port_dependent() answers for nf_tables and
++ * nf_xt_port_dependent() for x_tables.
++ *
++ * What the caller vouches for, and both take as given: the stream is UDP; its
++ * destination is a group address, so on an Ethernet input its packets are
++ * PACKET_MULTICAST; they reach netfilter with no mark, as nothing outside it
++ * marks, filters or mangles them -- tc is the caller's to rule out; and every
++ * device in @in and @out is one the packet is received or sent on, not a
++ * register (pimreg) VIF that hands it to userspace.
++ *
++ * nft_port_dependent() follows frames through Ethernet devices and the
++ * devices linked below them: VLANs, bridges and their ports, bonds. A stream
++ * whose input or outputs, or a device below them, is anything else -- PPP, an
++ * IP tunnel, WireGuard, or an Ethernet device with neither a parent device nor
++ * a lower one, as VXLAN, geneve, gretap and veth are -- is judged dependent:
++ * the underlay those carry it over has no link to them, so its hooks, and the
++ * outer packet's output and postrouting chains, are not walked. x_tables has
++ * no device hooks, and its tables see @in and @out by name alone.
++ */
++struct nft_port_probe {
++	u8				family;
++	union nf_inet_addr		saddr;
++	union nf_inet_addr		daddr;
++	const struct net_device		*in;
++	const struct net_device * const	*out;
++	unsigned int			nout;
++};
++
++/**
++ * struct nf_xt_probe_hook - the port probe of one x_tables family
++ * @port_dependent: nf_xt_port_dependent() for that family's tables
++ *
++ * ip_tables and ip6_tables publish theirs while they are loaded, so that the
++ * caller depends on neither module: one not loaded has no table to judge.
++ */
++struct nf_xt_probe_hook {
++	int (*port_dependent)(struct net *net, const struct nft_port_probe *probe);
++};
++
++extern const struct nf_xt_probe_hook __rcu *nf_ipt_probe_hook;
++extern const struct nf_xt_probe_hook __rcu *nf_ip6t_probe_hook;
++
++#if IS_ENABLED(CONFIG_NETFILTER)
++int nf_xt_port_dependent(struct net *net, const struct nft_port_probe *probe);
++#else
++static inline int nf_xt_port_dependent(struct net *net,
++				       const struct nft_port_probe *probe)
++{
++	return 0;
++}
++#endif
++
++/**
++ * nf_xt_changed - say that the x_tables tables in @net changed
++ * @net: the network namespace
++ *
++ * Called once a table is registered with its hooks, once a replacement is in
++ * place and no packet reads the table it replaced, and once a table is gone.
++ * An x_tables table carries no generation of its own a reader could compare,
++ * so a reader that caches nf_xt_port_dependent()'s answer asks again whenever
++ * nf_xt_seq() moves. Lossless: the families do not share a lock.
++ */
++static inline void nf_xt_changed(struct net *net)
++{
++	atomic_inc_return_release(&net->nf.xt_seq);
++}
++
++/**
++ * nf_xt_seq - how many times the x_tables tables in @net have changed
++ * @net: the network namespace
++ *
++ * Read with an acquire the bump's release pairs with: a walk after a read
++ * sees every table as it was when that value was published, or later.
++ */
++static inline unsigned int nf_xt_seq(const struct net *net)
++{
++	return atomic_read_acquire(&net->nf.xt_seq);
++}
++
++#endif /* _NF_PORT_PROBE_H */
 diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
-index f4b59915a49c..a064721a36d3 100644
+index f4b59915a49c..e2ad2c2cc78c 100644
 --- a/include/net/netfilter/nf_tables.h
 +++ b/include/net/netfilter/nf_tables.h
-@@ -563,6 +563,8 @@ struct nft_set_elem_expr {
+@@ -11,6 +11,7 @@
+ #include <linux/u64_stats_sync.h>
+ #include <linux/rhashtable.h>
+ #include <net/netfilter/nf_flow_table.h>
++#include <net/netfilter/nf_port_probe.h>
+ #include <net/netlink.h>
+ #include <net/flow_offload.h>
+ #include <net/netns/generic.h>
+@@ -563,6 +564,8 @@ struct nft_set_elem_expr {
   * 	@klen: key length
   * 	@dlen: data length
   *	@num_exprs: numbers of exprs
@@ -88,7 +298,7 @@ index f4b59915a49c..a064721a36d3 100644
   *	@exprs: stateful expression
   *	@catchall_list: list of catch-all set element
   * 	@data: private set data
-@@ -598,6 +600,7 @@ struct nft_set {
+@@ -598,6 +601,7 @@ struct nft_set {
  	u8				klen;
  	u8				dlen;
  	u8				num_exprs;
@@ -96,7 +306,7 @@ index f4b59915a49c..a064721a36d3 100644
  	struct nft_expr			*exprs[NFT_SET_EXPR_MAX];
  	struct list_head		catchall_list;
  	unsigned char			data[]
-@@ -1937,4 +1940,73 @@ static inline u64 nft_net_tstamp(const struct net *net)
+@@ -1937,4 +1941,40 @@ static inline u64 nft_net_tstamp(const struct net *net)
  	return nft_pernet(net)->tstamp;
  }
  
@@ -119,43 +329,10 @@ index f4b59915a49c..a064721a36d3 100644
 +	return smp_load_acquire(&net->nft.commit_applying);
 +}
 +
-+/**
-+ * struct nft_port_probe - a forwarded UDP stream, as far as it is known
-+ * @family: NFPROTO_IPV4 or NFPROTO_IPV6
-+ * @saddr: the stream's source address
-+ * @daddr: the stream's destination address
-+ * @in: the device the stream arrives on
-+ * @out: the devices copies of it leave through
-+ * @nout: how many entries @out has
-+ *
-+ * Everything about the stream but its transport ports: an offload that keys
-+ * on the addresses alone asks whether the ruleset could tell two of its
-+ * streams apart by port.
-+ *
-+ * What the caller vouches for, and nft_port_dependent() takes as given: the
-+ * stream is UDP; its destination is a group address, so on an Ethernet input
-+ * its packets are PACKET_MULTICAST; they reach nf_tables with no mark, as
-+ * nothing outside it (tc, x_tables) marks, filters or mangles them; and every
-+ * device in @in and @out is one the packet is received or sent on, not a
-+ * register (pimreg) VIF that hands it to userspace.
-+ *
-+ * Frames are followed through Ethernet devices and the devices linked below
-+ * them: VLANs, bridges and their ports, bonds. A stream whose input or
-+ * outputs, or a device below them, is anything else -- PPP, an IP tunnel,
-+ * WireGuard, or an Ethernet device with neither a parent device nor a lower
-+ * one, as VXLAN, geneve, gretap and veth are -- is judged dependent: the
-+ * underlay those carry it over has no link to them, so its hooks, and the
-+ * outer packet's output and postrouting chains, are not walked.
++/* The stream is described by struct nft_port_probe. A mark x_tables could
++ * leave on it, or a verdict it could give, is the caller's to rule out with
++ * nf_xt_port_dependent(), and tc the caller's own.
 + */
-+struct nft_port_probe {
-+	u8				family;
-+	union nf_inet_addr		saddr;
-+	union nf_inet_addr		daddr;
-+	const struct net_device		*in;
-+	const struct net_device * const	*out;
-+	unsigned int			nout;
-+};
-+
 +#if IS_ENABLED(CONFIG_NF_TABLES)
 +int nft_port_dependent(struct net *net, const struct nft_port_probe *probe);
 +#else
@@ -284,6 +461,28 @@ index 000000000000..faf9a762bd5c
 +};
 +
 +#endif
+diff --git a/include/net/netns/netfilter.h b/include/net/netns/netfilter.h
+index a6a0bf4a247e..aa8d6d05927e 100644
+--- a/include/net/netns/netfilter.h
++++ b/include/net/netns/netfilter.h
+@@ -3,6 +3,7 @@
+ #define __NETNS_NETFILTER_H
+ 
+ #include <linux/netfilter_defs.h>
++#include <linux/types.h>
+ 
+ struct proc_dir_entry;
+ struct nf_logger;
+@@ -33,5 +34,9 @@ struct netns_nf {
+ #if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
+ 	unsigned int defrag_ipv6_users;
+ #endif
++	/* Moved by every x_tables table registration, replacement and
++	 * removal; see nf_xt_changed().
++	 */
++	atomic_t xt_seq;
+ };
+ #endif
 diff --git a/include/net/netns/nftables.h b/include/net/netns/nftables.h
 index 99dd166c5d07..9fb5adf835f0 100644
 --- a/include/net/netns/nftables.h
@@ -297,6 +496,866 @@ index 99dd166c5d07..9fb5adf835f0 100644
  };
  
  #endif
+diff --git a/net/ipv4/netfilter/ip_tables.c b/net/ipv4/netfilter/ip_tables.c
+index 0ba456c4c634..32ee2bdf7c94 100644
+--- a/net/ipv4/netfilter/ip_tables.c
++++ b/net/ipv4/netfilter/ip_tables.c
+@@ -25,6 +25,8 @@
+ #include <linux/netfilter/x_tables.h>
+ #include <linux/netfilter_ipv4/ip_tables.h>
+ #include <net/netfilter/nf_log.h>
++#include <net/netfilter/nf_nat.h>
++#include <net/netfilter/nf_port_probe.h>
+ #include "../../netfilter/xt_repldata.h"
+ 
+ MODULE_LICENSE("GPL");
+@@ -218,6 +220,9 @@ struct ipt_entry *ipt_next_entry(const struct ipt_entry *entry)
+ 	return (void *)entry + entry->next_offset;
+ }
+ 
++/* The name a hook with no input or output device matches against. */
++static const char nulldevname[IFNAMSIZ] __aligned(sizeof(long));
++
+ /* Returns one of the generic firewall policies, like NF_ACCEPT. */
+ unsigned int
+ ipt_do_table(void *priv,
+@@ -226,7 +231,6 @@ ipt_do_table(void *priv,
+ {
+ 	const struct xt_table *table = priv;
+ 	unsigned int hook = state->hook;
+-	static const char nulldevname[IFNAMSIZ] __attribute__((aligned(sizeof(long))));
+ 	const struct iphdr *ip;
+ 	/* Initializing verdict to NF_DROP keeps gcc happy. */
+ 	unsigned int verdict = NF_DROP;
+@@ -361,6 +365,281 @@ ipt_do_table(void *priv,
+ 	else return verdict;
+ }
+ 
++/* ---- whether the tables could tell two UDP streams apart -------------------
++ *
++ * nf_xt_port_dependent() for IPv4: every table a forwarded copy of a stream
++ * crosses, walked for all the packets the stream could carry, with everything
++ * about them known but their ports. A rule's header -- addresses, devices,
++ * protocol, the fragment flag -- is decided as ipt_do_table() decides it,
++ * once for whole packets and first fragments and once for later ones. A rule
++ * with a match may or may not apply, as any match may read the ports, and one
++ * whose match does more than decide makes the stream dependent. A rule that
++ * may apply is followed both ways: its verdict for the packets it takes, the
++ * rest of the chain for the others.
++ *
++ * The stream is independent of its ports only when every path is accepted --
++ * by ACCEPT, or by the end of a chain whose policy accepts -- with nothing on
++ * the way but LOG, NFLOG and TRACE. Any other verdict or target on a path, a
++ * drop, a queue, a mark, a translation, a conntrack template, makes it
++ * dependent, even one every packet meets: an offload that keys the stream on
++ * its addresses applies none of them.
++ */
++
++/* Rules looked at for one table, hook and output; for one probe; and chains
++ * nested by jumps. Past any of them the answer is -E2BIG.
++ */
++#define IPT_PROBE_VISITS	4096
++#define IPT_PROBE_PROBE_VISITS	32768
++#define IPT_PROBE_DEPTH		32
++
++/* ACCEPT, as a standard target stores its verdict. */
++#define IPT_PROBE_ACCEPT	(-NF_ACCEPT - 1)
++
++/* What a rule makes of the stream's packets. */
++enum ipt_probe_match {
++	IPT_PROBE_NONE,		/* applies to none of them */
++	IPT_PROBE_SOME,		/* may apply to some and not to others */
++	IPT_PROBE_ALL,		/* applies to every one that reaches it */
++	IPT_PROBE_OPAQUE,	/* a match does more than decide */
++};
++
++/* One walk: a table at a hook, for one output. */
++struct ipt_probe {
++	const void *base;
++	unsigned int hook;
++	struct iphdr iph;
++	const char *indev;
++	const char *outdev;
++	unsigned int visits;
++	unsigned int *left;
++};
++
++/* A chain a jump or goto entered: the rule that entered it, whether that
++ * rule may not have applied, and whether some packets have returned from it.
++ * The base chain's frame has no rule.
++ */
++struct ipt_probe_frame {
++	const struct ipt_entry *call;
++	bool some;
++	bool returns;
++};
++
++static enum ipt_probe_match ipt_probe_rule(const struct ipt_probe *p,
++					   const struct ipt_entry *e)
++{
++	const struct xt_entry_match *ematch;
++	enum ipt_probe_match m;
++	bool whole, later;
++
++	whole = ip_packet_match(&p->iph, p->indev, p->outdev, &e->ip, 0);
++	later = ip_packet_match(&p->iph, p->indev, p->outdev, &e->ip, 1);
++	if (!whole && !later)
++		return IPT_PROBE_NONE;
++	m = whole && later ? IPT_PROBE_ALL : IPT_PROBE_SOME;
++	xt_ematch_foreach(ematch, e) {
++		if (!xt_probe_pure_match(ematch->u.kernel.match))
++			return IPT_PROBE_OPAQUE;
++		m = IPT_PROBE_SOME;
++	}
++	return m;
++}
++
++/* The policy that a base chain's returning packets meet. */
++static int ipt_probe_policy(const struct ipt_probe *p,
++			    const struct xt_table_info *private)
++{
++	const struct xt_standard_target *t = (const void *)
++		ipt_get_target_c(get_entry(p->base, private->underflow[p->hook]));
++
++	return t->verdict == IPT_PROBE_ACCEPT ? 0 : 1;
++}
++
++/* Walk the table's base chain at the hook, and every chain it may jump or go
++ * to, as ipt_do_table() would for each packet of the stream. 0, 1 or -E2BIG.
++ * The table is the one in force, read inside the caller's xt_recseq section.
++ */
++static int ipt_probe_chain(struct ipt_probe *p,
++			   const struct xt_table_info *private)
++{
++	struct ipt_probe_frame frame[IPT_PROBE_DEPTH];
++	const struct ipt_probe_frame *done;
++	const struct xt_entry_target *t;
++	const struct ipt_entry *e;
++	enum ipt_probe_match m;
++	unsigned int depth = 0;
++	int v;
++
++	frame[0] = (struct ipt_probe_frame){};
++	e = get_entry(p->base, private->hook_entry[p->hook]);
++	for (;;) {
++		if (!p->visits || !*p->left)
++			return -E2BIG;
++		p->visits--;
++		(*p->left)--;
++
++		m = ipt_probe_rule(p, e);
++		if (m == IPT_PROBE_OPAQUE)
++			return 1;
++		if (m == IPT_PROBE_NONE) {
++			e = ipt_next_entry(e);
++			continue;
++		}
++		t = ipt_get_target_c(e);
++		if (t->u.kernel.target->target) {
++			if (!xt_probe_passing_target(t->u.kernel.target))
++				return 1;
++			e = ipt_next_entry(e);
++			continue;
++		}
++		v = ((const struct xt_standard_target *)t)->verdict;
++		if (v >= 0) {
++			/* A rule with no target goes on to the next. */
++			if (p->base + v == ipt_next_entry(e)) {
++				e = ipt_next_entry(e);
++				continue;
++			}
++			if (++depth == IPT_PROBE_DEPTH)
++				return -E2BIG;
++			frame[depth] = (struct ipt_probe_frame){
++				.call = e,
++				.some = m == IPT_PROBE_SOME,
++			};
++			e = get_entry(p->base, v);
++			continue;
++		}
++		if (v == XT_RETURN)
++			frame[depth].returns = true;
++		else if (v != IPT_PROBE_ACCEPT)
++			return 1;
++		if (m == IPT_PROBE_SOME) {
++			e = ipt_next_entry(e);
++			continue;
++		}
++
++		/* Every packet that reached the rule leaves the chain here,
++		 * accepted or returned. The chain that entered this one goes
++		 * on after the rule that did, for the packets that returned or
++		 * that the rule may not have taken; with neither, it is done
++		 * as well, and so on up.
++		 */
++		for (;;) {
++			if (!depth)
++				return frame[0].returns ?
++				       ipt_probe_policy(p, private) : 0;
++			done = &frame[depth--];
++			/* A goto pushed nothing: what returns from the chain
++			 * it went to returns from the chain that went.
++			 */
++			if (done->call->ip.flags & IPT_F_GOTO) {
++				if (done->returns)
++					frame[depth].returns = true;
++				if (done->some)
++					break;
++			} else if (done->returns || done->some) {
++				break;
++			}
++		}
++		e = ipt_next_entry(done->call);
++	}
++}
++
++/* Walk a table at the hook, once at prerouting and once for each output at
++ * forward and postrouting, with the devices each hook names. Each walk reads
++ * the table as the packet path does: xt_replace_table() waits for the
++ * section before it frees the table it replaced.
++ */
++static int ipt_probe_table(struct ipt_probe *p,
++			   const struct nft_port_probe *probe,
++			   const struct xt_table *table)
++{
++	unsigned int i, outputs = p->hook == NF_INET_PRE_ROUTING ? 1 : probe->nout;
++	const struct xt_table_info *private;
++	unsigned int addend;
++	int ret = 0;
++
++	p->indev = p->hook == NF_INET_POST_ROUTING ? nulldevname : probe->in->name;
++	for (i = 0; i < outputs && !ret; i++) {
++		p->outdev = p->hook == NF_INET_PRE_ROUTING ?
++			    nulldevname : probe->out[i]->name;
++		p->visits = IPT_PROBE_VISITS;
++		local_bh_disable();
++		addend = xt_write_recseq_begin();
++		private = READ_ONCE(table->private);
++		p->base = private->entries;
++		ret = ipt_probe_chain(p, private);
++		xt_write_recseq_end(addend);
++		local_bh_enable();
++	}
++	return ret;
++}
++
++/* The NAT tables the NAT core runs at the hook for a connection's first
++ * packet, which are on no hook of their own: iptable_nat registers them with
++ * the core rather than with netfilter.
++ */
++static int ipt_probe_nat(struct ipt_probe *p,
++			 const struct nft_port_probe *probe,
++			 const struct nf_nat_lookup_hook_priv *nat)
++{
++	const struct nf_hook_entries *e = rcu_dereference(nat->entries);
++	unsigned int i;
++	int ret;
++
++	for (i = 0; e && i < e->num_hook_entries; i++) {
++		if (e->hooks[i].hook != ipt_do_table)
++			continue;
++		ret = ipt_probe_table(p, probe, e->hooks[i].priv);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int ipt_port_dependent(struct net *net,
++			      const struct nft_port_probe *probe)
++{
++	static const u8 hooks[] = {
++		NF_INET_PRE_ROUTING, NF_INET_FORWARD, NF_INET_POST_ROUTING,
++	};
++	unsigned int left = IPT_PROBE_PROBE_VISITS, i, j;
++	struct ipt_probe p = { .left = &left };
++	const struct nf_hook_entries *e;
++	struct nf_hook_ops **ops;
++	int ret;
++
++	if (!probe->in || !probe->nout || !probe->out)
++		return -EINVAL;
++	for (i = 0; i < probe->nout; i++)
++		if (!probe->out[i])
++			return -EINVAL;
++
++	p.iph.saddr = probe->saddr.ip;
++	p.iph.daddr = probe->daddr.ip;
++	p.iph.protocol = IPPROTO_UDP;
++	for (i = 0; i < ARRAY_SIZE(hooks); i++) {
++		e = rcu_dereference(net->nf.hooks_ipv4[hooks[i]]);
++		if (!e)
++			continue;
++		ops = nf_hook_entries_get_hook_ops(e);
++		p.hook = hooks[i];
++		for (j = 0; j < e->num_hook_entries; j++) {
++			if (ops[j]->hook_ops_type == NF_HOOK_OP_XTABLES)
++				ret = ipt_probe_table(&p, probe, e->hooks[j].priv);
++			else if (ops[j]->hook_ops_type == NF_HOOK_OP_NAT)
++				ret = ipt_probe_nat(&p, probe, e->hooks[j].priv);
++			else
++				continue;
++			if (ret)
++				return ret;
++		}
++	}
++	return 0;
++}
++
++static const struct nf_xt_probe_hook ipt_probe_hook = {
++	.port_dependent = ipt_port_dependent,
++};
++
+ /* Figures out from what hook each rule can be called: returns 0 if
+    there are loops.  Puts hook bitmask in comefrom. */
+ static int
+@@ -1062,6 +1341,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
+ 	oldinfo = xt_replace_table(t, num_counters, newinfo, &ret);
+ 	if (!oldinfo)
+ 		goto put_module;
++	/* In place, and no packet reads the table it replaced. */
++	nf_xt_changed(net);
+ 
+ 	/* Update module usage count based on number of rules */
+ 	if ((oldinfo->number > oldinfo->initial_entries) ||
+@@ -1715,6 +1996,7 @@ static void __ipt_unregister_table(struct net *net, struct xt_table *table)
+ 	if (private->number > private->initial_entries)
+ 		module_put(table_owner);
+ 	xt_free_table_info(private);
++	nf_xt_changed(net);
+ }
+ 
+ int ipt_register_table(struct net *net, const struct xt_table *table,
+@@ -1755,8 +2037,10 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
+ 	/* No template? No need to do anything. This is used by 'nat' table, it registers
+ 	 * with the nat core instead of the netfilter core.
+ 	 */
+-	if (!template_ops)
++	if (!template_ops) {
++		nf_xt_changed(net);
+ 		return 0;
++	}
+ 
+ 	num_ops = hweight32(table->valid_hooks);
+ 	if (num_ops == 0) {
+@@ -1770,15 +2054,27 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
+ 		goto out_free;
+ 	}
+ 
+-	for (i = 0; i < num_ops; i++)
++	/* Typed, so that the port probe finds the table behind the hook,
++	 * whichever function the table's module runs it with.
++	 */
++	for (i = 0; i < num_ops; i++) {
+ 		ops[i].priv = new_table;
++		ops[i].hook_ops_type = NF_HOOK_OP_XTABLES;
++	}
+ 
+ 	new_table->ops = ops;
+ 
+ 	ret = nf_register_net_hooks(net, ops, num_ops);
+-	if (ret != 0)
++	if (ret != 0) {
++		/* The hooks that did register were unregistered again, but a
++		 * reader of the hook list under RCU may still hold them, the
++		 * table behind them and their ops, which go below.
++		 */
++		synchronize_rcu();
+ 		goto out_free;
++	}
+ 
++	nf_xt_changed(net);
+ 	return ret;
+ 
+ out_free:
+@@ -1865,6 +2161,7 @@ static int __init ip_tables_init(void)
+ 	if (ret < 0)
+ 		goto err4;
+ 
++	rcu_assign_pointer(nf_ipt_probe_hook, &ipt_probe_hook);
+ 	return 0;
+ 
+ err4:
+@@ -1877,6 +2174,8 @@ static int __init ip_tables_init(void)
+ 
+ static void __exit ip_tables_fini(void)
+ {
++	RCU_INIT_POINTER(nf_ipt_probe_hook, NULL);
++	synchronize_rcu();
+ 	nf_unregister_sockopt(&ipt_sockopts);
+ 
+ 	xt_unregister_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
+diff --git a/net/ipv4/netfilter/iptable_nat.c b/net/ipv4/netfilter/iptable_nat.c
+index a5db7c67d61b..61e71912c96a 100644
+--- a/net/ipv4/netfilter/iptable_nat.c
++++ b/net/ipv4/netfilter/iptable_nat.c
+@@ -119,8 +119,14 @@ static int iptable_nat_table_init(struct net *net)
+ 	}
+ 
+ 	ret = ipt_nat_register_lookups(net);
+-	if (ret < 0)
++	if (ret < 0) {
++		/* Lookups that did register were unregistered again, but a
++		 * reader of the NAT core's hook under RCU may still hold the
++		 * table they named.
++		 */
++		synchronize_rcu();
+ 		ipt_unregister_table_exit(net, "nat");
++	}
+ 
+ 	kfree(repl);
+ 	return ret;
+diff --git a/net/ipv6/netfilter/ip6_tables.c b/net/ipv6/netfilter/ip6_tables.c
+index 6c5022242cf0..b2489b95b17b 100644
+--- a/net/ipv6/netfilter/ip6_tables.c
++++ b/net/ipv6/netfilter/ip6_tables.c
+@@ -29,6 +29,8 @@
+ #include <linux/netfilter_ipv6/ip6_tables.h>
+ #include <linux/netfilter/x_tables.h>
+ #include <net/netfilter/nf_log.h>
++#include <net/netfilter/nf_nat.h>
++#include <net/netfilter/nf_port_probe.h>
+ #include "../../netfilter/xt_repldata.h"
+ 
+ MODULE_LICENSE("GPL");
+@@ -243,6 +245,9 @@ ip6t_next_entry(const struct ip6t_entry *entry)
+ 	return (void *)entry + entry->next_offset;
+ }
+ 
++/* The name a hook with no input or output device matches against. */
++static const char nulldevname[IFNAMSIZ] __aligned(sizeof(long));
++
+ /* Returns one of the generic firewall policies, like NF_ACCEPT. */
+ unsigned int
+ ip6t_do_table(void *priv, struct sk_buff *skb,
+@@ -250,7 +255,6 @@ ip6t_do_table(void *priv, struct sk_buff *skb,
+ {
+ 	const struct xt_table *table = priv;
+ 	unsigned int hook = state->hook;
+-	static const char nulldevname[IFNAMSIZ] __attribute__((aligned(sizeof(long))));
+ 	/* Initializing verdict to NF_DROP keeps gcc happy. */
+ 	unsigned int verdict = NF_DROP;
+ 	const char *indev, *outdev;
+@@ -379,6 +383,323 @@ ip6t_do_table(void *priv, struct sk_buff *skb,
+ 	else return verdict;
+ }
+ 
++/* ---- whether the tables could tell two UDP streams apart -------------------
++ *
++ * nf_xt_port_dependent() for IPv6, as ip_tables walks its own: every table a
++ * forwarded copy of a stream crosses, for all the packets the stream could
++ * carry, with everything about them known but their ports. A rule's header
++ * is decided as ip6_packet_match() decides it. Its protocol test finds UDP in
++ * every packet of the stream but a later fragment whose fragment header is
++ * followed by another extension header, which it finds nothing in: a rule
++ * that names a protocol and would take UDP may therefore not take all of
++ * them. A rule with a match may or may not apply, as any match may read the
++ * ports, and one whose match does more than decide makes the stream
++ * dependent. A rule that may apply is followed both ways.
++ *
++ * The stream is independent of its ports only when every path is accepted --
++ * by ACCEPT, or by the end of a chain whose policy accepts -- with nothing on
++ * the way but LOG, NFLOG and TRACE. Any other verdict or target on a path
++ * makes it dependent, even one every packet meets: an offload that keys the
++ * stream on its addresses applies none of them.
++ */
++
++/* Rules looked at for one table, hook and output; for one probe; and chains
++ * nested by jumps. Past any of them the answer is -E2BIG.
++ */
++#define IP6T_PROBE_VISITS	4096
++#define IP6T_PROBE_PROBE_VISITS	32768
++#define IP6T_PROBE_DEPTH	32
++
++/* ACCEPT, as a standard target stores its verdict. */
++#define IP6T_PROBE_ACCEPT	(-NF_ACCEPT - 1)
++
++/* What a rule makes of the stream's packets. */
++enum ip6t_probe_match {
++	IP6T_PROBE_NONE,	/* applies to none of them */
++	IP6T_PROBE_SOME,	/* may apply to some and not to others */
++	IP6T_PROBE_ALL,		/* applies to every one that reaches it */
++	IP6T_PROBE_OPAQUE,	/* a match does more than decide */
++};
++
++/* One walk: a table at a hook, for one output. */
++struct ip6t_probe {
++	const void *base;
++	unsigned int hook;
++	struct in6_addr saddr;
++	struct in6_addr daddr;
++	const char *indev;
++	const char *outdev;
++	unsigned int visits;
++	unsigned int *left;
++};
++
++/* A chain a jump or goto entered: the rule that entered it, whether that
++ * rule may not have applied, and whether some packets have returned from it.
++ * The base chain's frame has no rule.
++ */
++struct ip6t_probe_frame {
++	const struct ip6t_entry *call;
++	bool some;
++	bool returns;
++};
++
++/* ip6_packet_match() for the packets of the stream, which have no skb: the
++ * addresses and devices as the walk knows them, and for the protocol UDP --
++ * or, in a later fragment with an extension header after its fragment
++ * header, nothing, which no rule naming a protocol takes.
++ */
++static enum ip6t_probe_match ip6_probe_match(const struct ip6t_probe *p,
++					     const struct ip6t_ip6 *ip6info)
++{
++	unsigned long ret;
++
++	if (NF_INVF(ip6info, IP6T_INV_SRCIP,
++		    ipv6_masked_addr_cmp(&p->saddr, &ip6info->smsk,
++					 &ip6info->src)) ||
++	    NF_INVF(ip6info, IP6T_INV_DSTIP,
++		    ipv6_masked_addr_cmp(&p->daddr, &ip6info->dmsk,
++					 &ip6info->dst)))
++		return IP6T_PROBE_NONE;
++
++	ret = ifname_compare_aligned(p->indev, ip6info->iniface,
++				     ip6info->iniface_mask);
++	if (NF_INVF(ip6info, IP6T_INV_VIA_IN, ret != 0))
++		return IP6T_PROBE_NONE;
++
++	ret = ifname_compare_aligned(p->outdev, ip6info->outiface,
++				     ip6info->outiface_mask);
++	if (NF_INVF(ip6info, IP6T_INV_VIA_OUT, ret != 0))
++		return IP6T_PROBE_NONE;
++
++	if (!(ip6info->flags & IP6T_F_PROTO))
++		return IP6T_PROBE_ALL;
++	if (ip6info->proto == IPPROTO_UDP) {
++		if (ip6info->invflags & IP6T_INV_PROTO)
++			return IP6T_PROBE_NONE;
++	} else if (ip6info->proto != 0 &&
++		   !(ip6info->invflags & IP6T_INV_PROTO)) {
++		/* '-p all' matches whatever protocol is found. */
++		return IP6T_PROBE_NONE;
++	}
++	return IP6T_PROBE_SOME;
++}
++
++static enum ip6t_probe_match ip6t_probe_rule(const struct ip6t_probe *p,
++					     const struct ip6t_entry *e)
++{
++	const struct xt_entry_match *ematch;
++	enum ip6t_probe_match m;
++
++	m = ip6_probe_match(p, &e->ipv6);
++	if (m == IP6T_PROBE_NONE)
++		return m;
++	xt_ematch_foreach(ematch, e) {
++		if (!xt_probe_pure_match(ematch->u.kernel.match))
++			return IP6T_PROBE_OPAQUE;
++		m = IP6T_PROBE_SOME;
++	}
++	return m;
++}
++
++/* The policy that a base chain's returning packets meet. */
++static int ip6t_probe_policy(const struct ip6t_probe *p,
++			     const struct xt_table_info *private)
++{
++	const struct xt_standard_target *t = (const void *)
++		ip6t_get_target_c(get_entry(p->base, private->underflow[p->hook]));
++
++	return t->verdict == IP6T_PROBE_ACCEPT ? 0 : 1;
++}
++
++/* Walk the table's base chain at the hook, and every chain it may jump or go
++ * to, as ip6t_do_table() would for each packet of the stream. 0, 1 or -E2BIG.
++ * The table is the one in force, read inside the caller's xt_recseq section.
++ */
++static int ip6t_probe_chain(struct ip6t_probe *p,
++			    const struct xt_table_info *private)
++{
++	struct ip6t_probe_frame frame[IP6T_PROBE_DEPTH];
++	const struct ip6t_probe_frame *done;
++	const struct xt_entry_target *t;
++	const struct ip6t_entry *e;
++	enum ip6t_probe_match m;
++	unsigned int depth = 0;
++	int v;
++
++	frame[0] = (struct ip6t_probe_frame){};
++	e = get_entry(p->base, private->hook_entry[p->hook]);
++	for (;;) {
++		if (!p->visits || !*p->left)
++			return -E2BIG;
++		p->visits--;
++		(*p->left)--;
++
++		m = ip6t_probe_rule(p, e);
++		if (m == IP6T_PROBE_OPAQUE)
++			return 1;
++		if (m == IP6T_PROBE_NONE) {
++			e = ip6t_next_entry(e);
++			continue;
++		}
++		t = ip6t_get_target_c(e);
++		if (t->u.kernel.target->target) {
++			if (!xt_probe_passing_target(t->u.kernel.target))
++				return 1;
++			e = ip6t_next_entry(e);
++			continue;
++		}
++		v = ((const struct xt_standard_target *)t)->verdict;
++		if (v >= 0) {
++			/* A rule with no target goes on to the next. */
++			if (p->base + v == ip6t_next_entry(e)) {
++				e = ip6t_next_entry(e);
++				continue;
++			}
++			if (++depth == IP6T_PROBE_DEPTH)
++				return -E2BIG;
++			frame[depth] = (struct ip6t_probe_frame){
++				.call = e,
++				.some = m == IP6T_PROBE_SOME,
++			};
++			e = get_entry(p->base, v);
++			continue;
++		}
++		if (v == XT_RETURN)
++			frame[depth].returns = true;
++		else if (v != IP6T_PROBE_ACCEPT)
++			return 1;
++		if (m == IP6T_PROBE_SOME) {
++			e = ip6t_next_entry(e);
++			continue;
++		}
++
++		/* Every packet that reached the rule leaves the chain here,
++		 * accepted or returned. The chain that entered this one goes
++		 * on after the rule that did, for the packets that returned or
++		 * that the rule may not have taken; with neither, it is done
++		 * as well, and so on up.
++		 */
++		for (;;) {
++			if (!depth)
++				return frame[0].returns ?
++				       ip6t_probe_policy(p, private) : 0;
++			done = &frame[depth--];
++			/* A goto pushed nothing: what returns from the chain
++			 * it went to returns from the chain that went.
++			 */
++			if (done->call->ipv6.flags & IP6T_F_GOTO) {
++				if (done->returns)
++					frame[depth].returns = true;
++				if (done->some)
++					break;
++			} else if (done->returns || done->some) {
++				break;
++			}
++		}
++		e = ip6t_next_entry(done->call);
++	}
++}
++
++/* Walk a table at the hook, once at prerouting and once for each output at
++ * forward and postrouting, with the devices each hook names. ip6mr hands a
++ * copy to forward with the device it arrived on as its input, and has made
++ * the output its device by then, which ip6_output() hands postrouting as the
++ * input. Each walk reads the table as the packet path does:
++ * xt_replace_table() waits for the section before it frees the table it
++ * replaced.
++ */
++static int ip6t_probe_table(struct ip6t_probe *p,
++			    const struct nft_port_probe *probe,
++			    const struct xt_table *table)
++{
++	unsigned int i, outputs = p->hook == NF_INET_PRE_ROUTING ? 1 : probe->nout;
++	const struct xt_table_info *private;
++	unsigned int addend;
++	int ret = 0;
++
++	for (i = 0; i < outputs && !ret; i++) {
++		p->outdev = p->hook == NF_INET_PRE_ROUTING ?
++			    nulldevname : probe->out[i]->name;
++		p->indev = p->hook == NF_INET_POST_ROUTING ?
++			   p->outdev : probe->in->name;
++		p->visits = IP6T_PROBE_VISITS;
++		local_bh_disable();
++		addend = xt_write_recseq_begin();
++		private = READ_ONCE(table->private);
++		p->base = private->entries;
++		ret = ip6t_probe_chain(p, private);
++		xt_write_recseq_end(addend);
++		local_bh_enable();
++	}
++	return ret;
++}
++
++/* The NAT tables the NAT core runs at the hook for a connection's first
++ * packet, which are on no hook of their own: ip6table_nat registers them
++ * with the core rather than with netfilter.
++ */
++static int ip6t_probe_nat(struct ip6t_probe *p,
++			  const struct nft_port_probe *probe,
++			  const struct nf_nat_lookup_hook_priv *nat)
++{
++	const struct nf_hook_entries *e = rcu_dereference(nat->entries);
++	unsigned int i;
++	int ret;
++
++	for (i = 0; e && i < e->num_hook_entries; i++) {
++		if (e->hooks[i].hook != ip6t_do_table)
++			continue;
++		ret = ip6t_probe_table(p, probe, e->hooks[i].priv);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int ip6t_port_dependent(struct net *net,
++			       const struct nft_port_probe *probe)
++{
++	static const u8 hooks[] = {
++		NF_INET_PRE_ROUTING, NF_INET_FORWARD, NF_INET_POST_ROUTING,
++	};
++	unsigned int left = IP6T_PROBE_PROBE_VISITS, i, j;
++	struct ip6t_probe p = { .left = &left };
++	const struct nf_hook_entries *e;
++	struct nf_hook_ops **ops;
++	int ret;
++
++	if (!probe->in || !probe->nout || !probe->out)
++		return -EINVAL;
++	for (i = 0; i < probe->nout; i++)
++		if (!probe->out[i])
++			return -EINVAL;
++
++	p.saddr = probe->saddr.in6;
++	p.daddr = probe->daddr.in6;
++	for (i = 0; i < ARRAY_SIZE(hooks); i++) {
++		e = rcu_dereference(net->nf.hooks_ipv6[hooks[i]]);
++		if (!e)
++			continue;
++		ops = nf_hook_entries_get_hook_ops(e);
++		p.hook = hooks[i];
++		for (j = 0; j < e->num_hook_entries; j++) {
++			if (ops[j]->hook_ops_type == NF_HOOK_OP_XTABLES)
++				ret = ip6t_probe_table(&p, probe, e->hooks[j].priv);
++			else if (ops[j]->hook_ops_type == NF_HOOK_OP_NAT)
++				ret = ip6t_probe_nat(&p, probe, e->hooks[j].priv);
++			else
++				continue;
++			if (ret)
++				return ret;
++		}
++	}
++	return 0;
++}
++
++static const struct nf_xt_probe_hook ip6t_probe_hook = {
++	.port_dependent = ip6t_port_dependent,
++};
++
+ /* Figures out from what hook each rule can be called: returns 0 if
+    there are loops.  Puts hook bitmask in comefrom. */
+ static int
+@@ -1079,6 +1400,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
+ 	oldinfo = xt_replace_table(t, num_counters, newinfo, &ret);
+ 	if (!oldinfo)
+ 		goto put_module;
++	/* In place, and no packet reads the table it replaced. */
++	nf_xt_changed(net);
+ 
+ 	/* Update module usage count based on number of rules */
+ 	if ((oldinfo->number > oldinfo->initial_entries) ||
+@@ -1724,6 +2047,7 @@ static void __ip6t_unregister_table(struct net *net, struct xt_table *table)
+ 	if (private->number > private->initial_entries)
+ 		module_put(table_owner);
+ 	xt_free_table_info(private);
++	nf_xt_changed(net);
+ }
+ 
+ int ip6t_register_table(struct net *net, const struct xt_table *table,
+@@ -1761,8 +2085,10 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
+ 		return PTR_ERR(new_table);
+ 	}
+ 
+-	if (!template_ops)
++	if (!template_ops) {
++		nf_xt_changed(net);
+ 		return 0;
++	}
+ 
+ 	num_ops = hweight32(table->valid_hooks);
+ 	if (num_ops == 0) {
+@@ -1776,15 +2102,27 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
+ 		goto out_free;
+ 	}
+ 
+-	for (i = 0; i < num_ops; i++)
++	/* Typed, so that the port probe finds the table behind the hook,
++	 * whichever function the table's module runs it with.
++	 */
++	for (i = 0; i < num_ops; i++) {
+ 		ops[i].priv = new_table;
++		ops[i].hook_ops_type = NF_HOOK_OP_XTABLES;
++	}
+ 
+ 	new_table->ops = ops;
+ 
+ 	ret = nf_register_net_hooks(net, ops, num_ops);
+-	if (ret != 0)
++	if (ret != 0) {
++		/* The hooks that did register were unregistered again, but a
++		 * reader of the hook list under RCU may still hold them, the
++		 * table behind them and their ops, which go below.
++		 */
++		synchronize_rcu();
+ 		goto out_free;
++	}
+ 
++	nf_xt_changed(net);
+ 	return ret;
+ 
+ out_free:
+@@ -1872,6 +2210,7 @@ static int __init ip6_tables_init(void)
+ 	if (ret < 0)
+ 		goto err4;
+ 
++	rcu_assign_pointer(nf_ip6t_probe_hook, &ip6t_probe_hook);
+ 	return 0;
+ 
+ err4:
+@@ -1884,6 +2223,8 @@ static int __init ip6_tables_init(void)
+ 
+ static void __exit ip6_tables_fini(void)
+ {
++	RCU_INIT_POINTER(nf_ip6t_probe_hook, NULL);
++	synchronize_rcu();
+ 	nf_unregister_sockopt(&ip6t_sockopts);
+ 
+ 	xt_unregister_targets(ip6t_builtin_tg, ARRAY_SIZE(ip6t_builtin_tg));
+diff --git a/net/ipv6/netfilter/ip6table_nat.c b/net/ipv6/netfilter/ip6table_nat.c
+index e119d4f090cc..2417720dfbc7 100644
+--- a/net/ipv6/netfilter/ip6table_nat.c
++++ b/net/ipv6/netfilter/ip6table_nat.c
+@@ -121,8 +121,14 @@ static int ip6table_nat_table_init(struct net *net)
+ 	}
+ 
+ 	ret = ip6t_nat_register_lookups(net);
+-	if (ret < 0)
++	if (ret < 0) {
++		/* Lookups that did register were unregistered again, but a
++		 * reader of the NAT core's hook under RCU may still hold the
++		 * table they named.
++		 */
++		synchronize_rcu();
+ 		ip6t_unregister_table_exit(net, "nat");
++	}
+ 
+ 	kfree(repl);
+ 	return ret;
 diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
 index f0aa4d7ef499..0ebadc026948 100644
 --- a/net/netfilter/Makefile
@@ -310,6 +1369,125 @@ index f0aa4d7ef499..0ebadc026948 100644
  
  ifdef CONFIG_X86_64
  ifndef CONFIG_UML
+diff --git a/net/netfilter/core.c b/net/netfilter/core.c
+index b9f551f02c81..8801a4323072 100644
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -23,6 +23,7 @@
+ #include <linux/mm.h>
+ #include <linux/rcupdate.h>
+ #include <net/net_namespace.h>
++#include <net/netfilter/nf_port_probe.h>
+ #include <net/netfilter/nf_queue.h>
+ #include <net/sock.h>
+ 
+@@ -684,6 +685,55 @@ EXPORT_SYMBOL_GPL(nf_defrag_v4_hook);
+ const struct nf_defrag_hook __rcu *nf_defrag_v6_hook __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_defrag_v6_hook);
+ 
++const struct nf_xt_probe_hook __rcu *nf_ipt_probe_hook __read_mostly;
++EXPORT_SYMBOL_GPL(nf_ipt_probe_hook);
++
++const struct nf_xt_probe_hook __rcu *nf_ip6t_probe_hook __read_mostly;
++EXPORT_SYMBOL_GPL(nf_ip6t_probe_hook);
++
++/**
++ * nf_xt_port_dependent - whether x_tables could tell two UDP streams apart
++ * @net: the network namespace
++ * @probe: the stream, known but for its ports
++ *
++ * Walks the ip_tables or ip6_tables tables, as @probe->family says, that a
++ * forwarded copy of the stream crosses at prerouting, forward and
++ * postrouting, with the NAT tables the NAT core runs for a connection's first
++ * packet among them; see struct nft_port_probe for what the caller vouches
++ * for. A family whose module is not loaded has no table.
++ *
++ * Return: 0 when every packet of the stream is accepted by every table
++ * unchanged, whatever its ports; 1 when two streams differing in ports may
++ * fare differently, when some path drops, or when a rule the walk does not
++ * model is reached; -E2BIG when the tables are larger than the walk's bounds,
++ * and -EINVAL for a probe missing its input or an output. Callers treat
++ * negative as 1. Never -EAGAIN: a walk reads each table as the packet path
++ * does, and a replacement during it is seen by the caller's next read of
++ * nf_xt_seq().
++ *
++ * Context: under rcu_read_lock(); it does not sleep.
++ */
++int nf_xt_port_dependent(struct net *net, const struct nft_port_probe *probe)
++{
++	const struct nf_xt_probe_hook *hook;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
++			 "x_tables probed outside rcu_read_lock()");
++
++	switch (probe->family) {
++	case NFPROTO_IPV4:
++		hook = rcu_dereference(nf_ipt_probe_hook);
++		break;
++	case NFPROTO_IPV6:
++		hook = rcu_dereference(nf_ip6t_probe_hook);
++		break;
++	default:
++		return 1;
++	}
++	return hook ? hook->port_dependent(net, probe) : 0;
++}
++EXPORT_SYMBOL_GPL(nf_xt_port_dependent);
++
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ u8 nf_ctnetlink_has_listener;
+ EXPORT_SYMBOL_GPL(nf_ctnetlink_has_listener);
+diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
+index 041ab3733baa..f7737e648b06 100644
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -39,12 +39,6 @@ static struct hlist_head *nf_nat_bysource __read_mostly;
+ static unsigned int nf_nat_htable_size __read_mostly;
+ static siphash_aligned_key_t nf_nat_hash_rnd;
+ 
+-struct nf_nat_lookup_hook_priv {
+-	struct nf_hook_entries __rcu *entries;
+-
+-	struct rcu_head rcu_head;
+-};
+-
+ struct nf_nat_hooks_net {
+ 	struct nf_hook_ops *nat_hook_ops;
+ 	unsigned int users;
+@@ -1231,6 +1225,8 @@ int nf_nat_register_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
+ 		}
+ 
+ 		for (i = 0; i < ops_count; i++) {
++			/* So that what reads the hook knows its priv. */
++			nat_ops[i].hook_ops_type = NF_HOOK_OP_NAT;
+ 			priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+ 			if (priv) {
+ 				nat_ops[i].priv = priv;
+@@ -1246,6 +1242,10 @@ int nf_nat_register_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
+ 		ret = nf_register_net_hooks(net, nat_ops, ops_count);
+ 		if (ret < 0) {
+ 			mutex_unlock(&nf_nat_proto_mutex);
++			/* As on unregistration: the hooks that did register
++			 * may still be held by a reader of the hook list.
++			 */
++			synchronize_rcu();
+ 			for (i = 0; i < ops_count; i++)
+ 				kfree(nat_ops[i].priv);
+ 			kfree(nat_ops);
+@@ -1312,7 +1312,12 @@ void nf_nat_unregister_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
+ 		}
+ 
+ 		nat_proto_net->nat_hook_ops = NULL;
+-		kfree(nat_ops);
++		/* After a grace period, as the private data is: a reader of the
++		 * hook list under RCU -- the hook dump, the x_tables port probe
++		 * -- may hold a pointer into the array, which the unregistration
++		 * only replaces in the list it leaves behind.
++		 */
++		kvfree_rcu_mightsleep(nat_ops);
+ 	}
+ unlock:
+ 	mutex_unlock(&nf_nat_proto_mutex);
 diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
 index 03dd9d1db12f..5c30a237a3a5 100644
 --- a/net/netfilter/nf_tables_api.c
@@ -340,10 +1518,10 @@ index 03dd9d1db12f..5c30a237a3a5 100644
  	nf_tables_commit_audit_log(&adl, nft_base_seq(net));
 diff --git a/net/netfilter/nf_tables_port_probe.c b/net/netfilter/nf_tables_port_probe.c
 new file mode 100644
-index 000000000000..8859fd5f812c
+index 000000000000..3ab80ef7f49d
 --- /dev/null
 +++ b/net/netfilter/nf_tables_port_probe.c
-@@ -0,0 +1,2346 @@
+@@ -0,0 +1,2349 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Whether nf_tables could tell two UDP streams apart by their ports.
@@ -385,9 +1563,10 @@ index 000000000000..8859fd5f812c
 + * work is bounded; past a bound, or when a commit ran under the walk, the
 + * answer is an error, which callers treat as dependent as well.
 + *
-+ * Only nf_tables is read: x_tables rules and tc are the caller's to rule out.
-+ * And only Ethernet device stacks are followed: a stream carried over PPP, a
-+ * tunnel or WireGuard crosses hooks on an underlay the walk cannot see.
++ * Only nf_tables is read: x_tables rules are nf_xt_port_dependent()'s to
++ * judge, and tc is the caller's to rule out. And only Ethernet device stacks
++ * are followed: a stream carried over PPP, a tunnel or WireGuard crosses hooks
++ * on an underlay the walk cannot see.
 + */
 +
 +#include <linux/kernel.h>
@@ -1810,10 +2989,12 @@ index 000000000000..8859fd5f812c
 +};
 +
 +/* Statements that may break the rule and decide nothing else: limits and
-+ * quotas once their budget is spent, and the like.
++ * quotas once their budget is spent, and the like. Not connlimit, which
++ * drops a packet whose connection it cannot count, one connection -- one
++ * pair of ports -- at a time.
 + */
 +static const char * const nft_probe_breaks[] = {
-+	"limit", "quota", "connlimit", "flow_offload",
++	"limit", "quota", "flow_offload",
 +};
 +
 +/* Not inlined: the handlers' buffers stay out of the frames nft_probe_rule()
@@ -2690,6 +3871,19 @@ index 000000000000..8859fd5f812c
 +	return ret;
 +}
 +EXPORT_SYMBOL_GPL(nft_port_dependent);
+diff --git a/net/netfilter/nfnetlink_hook.c b/net/netfilter/nfnetlink_hook.c
+index ade8ee1988b1..abd08ac814f6 100644
+--- a/net/netfilter/nfnetlink_hook.c
++++ b/net/netfilter/nfnetlink_hook.c
+@@ -220,6 +220,8 @@ static int nfnl_hook_dump_one(struct sk_buff *nlskb,
+ 	case NF_HOOK_OP_BPF:
+ 		ret = nfnl_hook_put_bpf_prog_info(nlskb, ctx, seq, ops->priv);
+ 		break;
++	case NF_HOOK_OP_XTABLES:
++	case NF_HOOK_OP_NAT:
+ 	case NF_HOOK_OP_UNDEFINED:
+ 		break;
+ 	default:
 diff --git a/net/netfilter/nft_bitwise.c b/net/netfilter/nft_bitwise.c
 index 0fc21b729eba..b3fbff4484de 100644
 --- a/net/netfilter/nft_bitwise.c
@@ -2900,6 +4094,75 @@ index 58ae802db8f5..36864002a3c8 100644
  
  static const struct nla_policy nft_redir_policy[NFTA_REDIR_MAX + 1] = {
  	[NFTA_REDIR_REG_PROTO_MIN]	= { .type = NLA_U32 },
+diff --git a/net/netfilter/x_tables.c b/net/netfilter/x_tables.c
+index efe7b7d71e7f..29cfd9a8872b 100644
+--- a/net/netfilter/x_tables.c
++++ b/net/netfilter/x_tables.c
+@@ -1782,6 +1782,64 @@ xt_hook_ops_alloc(const struct xt_table *table, nf_hookfn *fn)
+ }
+ EXPORT_SYMBOL_GPL(xt_hook_ops_alloc);
+ 
++/* Matches that do nothing but decide. Whatever a packet's ports make of one,
++ * the rule it sits in applies or does not, and the walk follows both. What
++ * one keeps -- a counter, a token bucket, a set's counters, shared between
++ * rules or not -- only ever decides x_tables matches, which the walk takes
++ * the same way, and none of them drops a well-formed packet itself. Not among
++ * them: hashlimit, which drops a packet it has no room to give a bucket --
++ * per port, with --hashlimit-mode dstport -- connlimit, which drops one it
++ * cannot count, and recent, which drops one it cannot record; connlabel,
++ * whose --set writes the conntrack's labels, and socket, whose
++ * --restore-skmark writes the packet's mark, either of which nf_tables may
++ * read; and any match this list does not know.
++ */
++static const char *const xt_probe_pure[] = {
++	"udp", "tcp", "icmp", "icmp6", "multiport", "comment", "state",
++	"conntrack", "mark", "connmark", "set", "iprange", "pkttype",
++	"addrtype", "physdev", "mac", "length", "dscp", "tos", "ttl", "hl",
++	"policy", "helper", "u32", "string", "time", "limit",
++	"quota", "connbytes", "statistic", "rpfilter", "esp",
++	"ah", "devgroup", "owner", "cgroup", "nfacct", "realm",
++	"ecn", "ipv6header", "frag", "hbh", "dst", "rt", "mh", "eui64", "srh",
++	"sctp", "dccp", "cpu", "cluster", "rateest", "ipvs", "osf", "l2tp",
++	"ipcomp", "bpf",
++};
++
++/**
++ * xt_probe_pure_match - whether a match does nothing but decide
++ * @match: the match
++ *
++ * For the port probes of ip_tables and ip6_tables, which judge a stream known
++ * but for its ports and evaluate no match: a rule with a pure one may or may
++ * not apply, and any other makes the stream dependent.
++ */
++bool xt_probe_pure_match(const struct xt_match *match)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(xt_probe_pure); i++)
++		if (!strcmp(match->name, xt_probe_pure[i]))
++			return true;
++	return false;
++}
++EXPORT_SYMBOL_GPL(xt_probe_pure_match);
++
++/**
++ * xt_probe_passing_target - whether a target leaves the packet to the next rule
++ * @target: an extension target
++ *
++ * LOG, NFLOG and TRACE report the packet and return XT_CONTINUE, changing
++ * nothing a later rule or the packet's fate reads. Any other target decides
++ * the packet or changes something about it.
++ */
++bool xt_probe_passing_target(const struct xt_target *target)
++{
++	return !strcmp(target->name, "LOG") || !strcmp(target->name, "NFLOG") ||
++	       !strcmp(target->name, "TRACE");
++}
++EXPORT_SYMBOL_GPL(xt_probe_passing_target);
++
+ int xt_register_template(const struct xt_table *table,
+ 			 int (*table_init)(struct net *net))
+ {
 -- 
 2.47.3
 
