@@ -16,6 +16,9 @@ from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_service import (FAULT_DIR, FLOWS, blocked_probe,
                                     service, service_status, supervision_status, wait_service)  # noqa: F401
 
+# Where a fault lease lives for a caller without the service fixture.
+SLAB_FAULT_DIR = "/tmp/ask-flowtable-slab-fault"
+
 
 async def wait_json(r, path, timeout=25):
     deadline = time.monotonic() + timeout
@@ -65,6 +68,10 @@ class Fault:
 
 @asynccontextmanager
 async def slab_fault(r, target, label, *, continuous=False, lease=20, console=None):
+    # The service fixture makes and removes FAULT_DIR, and checks that it starts
+    # without one. Any other caller's lease lives under a directory of its
+    # own, made here and removed whole once the result is read.
+    base = FAULT_DIR if console is None else SLAB_FAULT_DIR
     console = console or r.service_console
     config = await r.target.fs_read(r.session, "/proc/config.gz")
     assert config["errno"] == 0, config
@@ -72,12 +79,11 @@ async def slab_fault(r, target, label, *, continuous=False, lease=20, console=No
     for option in ("CONFIG_KASAN=y", "CONFIG_FAILSLAB=y", "CONFIG_FAULT_INJECTION_STACKTRACE_FILTER=y"):
         assert option in config.splitlines(), f"rebuild/stage a KASAN image with {option}"
     script = Path(__file__).with_name("_flowtable_failslab_guard.py").read_text()
-    root = FAULT_DIR + "/failslab-" + target
+    root = base + "/failslab-" + target
     # Stage while management is healthy. A long paced-UART upload here would
     # outlive the traffic peer's idle lease; fault cleanup still uses UART.
-    # The service fixture makes and removes FAULT_DIR; any other caller's
-    # lease makes it here and removes its own root once the result is read.
-    await console_command(console, "mkdir", "-p", FAULT_DIR)
+    if base != FAULT_DIR:
+        await console_command(console, "mkdir", "-p", base)
     await console_command(console, "mkdir", root)
     staged = await r.target.fs_write(r.session, root + "/guard.py", script)
     assert staged["errno"] == 0, staged
@@ -118,7 +124,7 @@ with (root / 'guard.log').open('w') as log:
             # A continuous lease's result exists only now; Fault.hit() reads
             # it from here once the root is gone.
             fault.result = fault.result or result
-            await console_command(console, "rm", "-rf", root)
+            await console_command(console, "rm", "-rf", root if base == FAULT_DIR else base)
         except BaseException:
             await console_python(console, f'''
 from pathlib import Path
