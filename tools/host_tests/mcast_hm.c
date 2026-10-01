@@ -61,6 +61,7 @@ typedef uint32_t U32;
  * production struct: what is under test is that the cursor is per entry, and a
  * local definition makes the test say so rather than inherit it. */
 struct ins_entry_info {
+    uint16_t sec_tag;
     unsigned opc_count, param_size, eth_type, flags;
     uint8_t *paramptr, *opcptr;
     uint32_t *vlan_hdrs;

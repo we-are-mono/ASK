@@ -2,6 +2,11 @@
 <protocol name="pppoeschema" longname="pppoe handler" prevproto="pppoe">
      <execute-code>
       <before>
+       <!-- This offset belongs to the shared CC tree, including Wi-Fi's.
+            The IPsec offline port (9) has its own tree, where that offset
+            names a different table: leave its frames to its distributions. -->
+       <if expr="$logicalportid != 9">
+        <if-true>
         <if expr="($FW[48:16]) == 0xc021">
           <if-false>
             <!-- PPPoE session packet, police the packet first -->
@@ -20,6 +25,8 @@
             <action type="exit" confirm="yes" nextproto="end_parse"/>
           </if-true>
         </if>
+        </if-true>
+       </if>
      </before>
      </execute-code>
 </protocol>
@@ -40,6 +47,29 @@
                     <action type="exit" confirm="no" nextproto="ipv6"/>
               </if-true>
             </if> 
+          </if-true>
+        </if>
+        <action type="exit" nextproto="return"/>
+      </before>
+   </execute-code>
+</protocol>
+<protocol name="vlanschema" longname="SEC identity VLAN family correction" prevproto="vlan">
+    <execute-code>
+      <before>
+        <if expr="($logicalportid == 9) and (vlan.type == 0x0800 or vlan.type == 0x86dd)">
+	  <if-true>
+            <if expr="($FW[32:8] bitwand 0xF0) == 0x40">
+              <if-true>
+                    <nextproto proto="#ip4"/>
+                    <action type="exit" confirm="no" nextproto="ipv4"/>
+              </if-true>
+            </if>
+            <if expr="($FW[32:8] bitwand 0xF0) == 0x60">
+              <if-true>
+                    <nextproto proto="#ip6"/>
+                    <action type="exit" confirm="no" nextproto="ipv6"/>
+              </if-true>
+            </if>
           </if-true>
         </if>
         <action type="exit" nextproto="return"/>

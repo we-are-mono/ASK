@@ -1128,13 +1128,10 @@ static unsigned int ft_ipsec_inbound_candidates(const struct xfrm_state *out,
  * would accept this tuple from -- its selector covers the tuple and the
  * forwarding policy's templates take it (xfrm_flowtable_policy_check()) -- and
  * of those the most recently installed, which is the one a peer moves its
- * traffic to after a rekey. That choice drives the software forwarding-policy
- * check and the flow's SA lifecycle, not the data plane: the offline-port entry
- * is keyed on the inner tuple alone (shared classification), so any offloaded
- * SA that decrypts a frame to this tuple matches it. Binding the hardware lookup
- * to the decrypting SA was reverted with the per-SA classification that wedged
- * the host-command channel; the residual cross-SA exposure is ISSUES.md
- * A280/A287, and docs/flowtable/ipsec-sa-provenance.md researches a safe fix.
+ * traffic to after a rekey. The offline-port lookup uses the inner tuple, and
+ * its forwarding action validates the decrypting SA's SEC-inserted VLAN tag.
+ * Another SA's frame goes to Linux with its own secpath for a fresh policy
+ * check, even when the tuple matches this entry (A280/A287).
  *
  * Three outcomes. A usable one is named. With none among this adapter's SAs,
  * xfrm's own index decides as it always has: no state for the pair at all, or
@@ -1145,11 +1142,11 @@ static unsigned int ft_ipsec_inbound_candidates(const struct xfrm_state *out,
  * before they could match this tuple, so the entry would be installed, counted
  * and never matched.
  *
- * A flow named for the older SA of a rekey keeps its shared entry across the
- * peer's move to the newer one: frames from either SA of the rekey match that
- * tuple, so the move is software bookkeeping -- the newer SA is named from its
- * next admission -- rather than a data-plane change. (When the entry was keyed
- * on the SA it fell to software for that window instead.)
+ * A flow named for the older SA of a rekey keeps validating that SA until
+ * its retirement. The newer SA's frames take the CPU exception during that
+ * overlap; after withdrawal and readmission the entry validates the newer
+ * SA. Both can deliver legitimate traffic, and neither inherits the other's
+ * policy authorization through a tuple collision.
  */
 static bool ft_ipsec_paired_inbound(const struct xfrm_state *out,
 				    const struct ft_ipsec_receiver *recv,
@@ -2850,6 +2847,11 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
  */
 static unsigned int ft_l2_overhead(const struct cdx_ft_rule *rule)
 {
+	/* The post-SEC hit sees the decrypted packet with only Ethernet and
+	 * the internal identity VLAN. Ingress encapsulation was removed on
+	 * the way to SEC; do not charge it or the shim to conntrack. */
+	if (rule->in_sa_handle)
+		return ETH_HLEN + VLAN_HLEN;
 	/* An ingress tunnel's outer header is stripped before the inner packet
 	 * is what Netfilter would count, so it is framing here too, one layer
 	 * up. A peer that adds an encapsulation-limit option to its IPv6 outer

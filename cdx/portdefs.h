@@ -184,7 +184,7 @@ int get_ofport_info(uint32_t fm_idx, uint32_t handle, uint32_t *channel, void **
 int get_ofport_max_dist(uint32_t fm_idx, uint32_t handle, uint32_t* max_dist);
 int get_phys_port_poolinfo_bysize(uint32_t size, struct port_bman_pool_info *pool_info);
 int alloc_offline_port(uint32_t fm_idx, uint32_t type, qman_cb_dqrr defa_rx, qman_cb_dqrr err_rx);
-int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t type,
+int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t index,
 			uint32_t *pfqid, uint32_t *count);
 int release_offline_port(uint32_t fm_idx, int handle);
 int get_dpa_oh_iface_info(struct oh_iface_info *iface_info, char *name);

@@ -6,7 +6,9 @@
  * used to collect the types present on the port as bits of that same word: a
  * PPPoE (8), Ethernet (9), IPv6 3-tuple UDP (12) or bridged IPv6 multicast (13)
  * table landed on a port flag, and every bit stayed after its table went. The
- * shipped PCD attaches all four to both offline ports. So the checks below are
+ * shipped PCD attaches all four to the Wi-Fi port, and an Ethernet table of its
+ * own to the IPsec port, whose tables are otherwise its own set of the types
+ * its consumers ask for. So the checks below are
  * that the flags come back as they went in, that each table type is reported
  * exactly while its table is attached, and that the types the IPsec port's
  * consumers ask for are reported as the tables themselves. Every check runs
@@ -122,12 +124,12 @@ int main(void)
 	static const uint32_t colliding[] = { COLLIDING_TYPES };
 	int handle;
 
-	/* The shipped configuration: every table on both offline ports. */
+	/* The shipped configuration: each offline port with its own tables. */
 	register_ports();
-	attach(oh_table_types, ARRAY_LEN(oh_table_types), (1u << IPSEC_PORTID) | (1u << WIFI_PORTID));
+	attach(ipsec_table_types, ARRAY_LEN(ipsec_table_types), 1u << IPSEC_PORTID);
 	handle = alloc_offline_port(0, PORT_TYPE_IPSEC, NULL, NULL);
 	CHECK(handle == IPSEC_HANDLE, "IPsec claim got %d", handle);
-	expect(IPSEC_HANDLE, oh_table_types, ARRAY_LEN(oh_table_types), "IPsec, shipped tables");
+	expect(IPSEC_HANDLE, ipsec_table_types, ARRAY_LEN(ipsec_table_types), "IPsec, shipped tables");
 	CHECK((offline_port_info[0][IPSEC_HANDLE].flags & PORT_TYPE_MASK) == PORT_TYPE_IPSEC,
 	      "IPsec port type 0x%x", offline_port_info[0][IPSEC_HANDLE].flags & PORT_TYPE_MASK);
 
@@ -152,7 +154,8 @@ int main(void)
 	CHECK(handle == IPSEC_HANDLE, "IPsec claimed again got %d", handle);
 	handle = alloc_offline_port(0, PORT_TYPE_WIFI, NULL, NULL);
 	CHECK(handle == WIFI_HANDLE, "Wi-Fi claim got %d", handle);
-	expect(WIFI_HANDLE, oh_table_types, ARRAY_LEN(oh_table_types), "Wi-Fi, shipped tables");
+	attach(wifi_table_types, ARRAY_LEN(wifi_table_types), 1u << WIFI_PORTID);
+	expect(WIFI_HANDLE, wifi_table_types, ARRAY_LEN(wifi_table_types), "Wi-Fi, shipped tables");
 	CHECK(release_offline_port(0, WIFI_HANDLE) == 0, "Wi-Fi release");
 	handle = alloc_offline_port(0, PORT_TYPE_WIFI, NULL, NULL);
 	CHECK(handle == WIFI_HANDLE, "Wi-Fi claimed again got %d", handle);

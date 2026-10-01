@@ -145,6 +145,11 @@ void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa)
 			 * on every iteration and never filtering entries.) */
 			if (!IS_NATT_SA(pEntry))
 				continue;
+			/* Only a twin in the same direction shares an entry:
+			 * an inbound one's parameters are its SPI table, an
+			 * outbound one's its enqueue, in one union. */
+			if (pEntry->direction != sa->direction)
+				continue;
 #ifdef CONTROL_IPSEC_DEBUG
 			printk("%x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x\n", \
 				pEntry->natt.sport,  sa->natt.sport, pEntry->natt.dport,  \
@@ -472,7 +477,8 @@ int M_ipsec_sa_cache_delete(U16 handle)
  * be copied out before unlocking. The returned net_device's own
  * lifetime is the SA teardown discipline's concern (NETDEV_UNREGISTER
  * handling), not this lock's. */
-struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
+struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt,
+					 uint16_t *tag)
 {
 	PSAEntry sa_ptr;
 	struct slist_entry *tmp;
@@ -497,6 +503,7 @@ struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
 		if (sa_ptr->pSec_sa_context->to_cp_fqid ==  fqid)
 		{
 			*sagd_pkt = sa_ptr->handle;
+			*tag = cdx_ipsec_key_tag_of(sa_ptr);
 			netdev = sa_ptr->netdev;
 			break;
 		}

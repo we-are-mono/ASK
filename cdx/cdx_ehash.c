@@ -65,7 +65,7 @@
 
 #define L2_HDR_OPS(l2_info) ((l2_info.vlan_present) || (l2_info.pppoe_present) || (l2_info.num_egress_vlan_hdrs) || (l2_info.add_pppoe_hdr)) 
 #define L3_HDR_OPS(l3_info) (l3_info.tnl_header_present || l3_info.add_tnl_header || l3_info.ipsec_inbound_flow)
-#define L2_L3_HDR_OPS(info) (L3_HDR_OPS(info->l3_info) || L2_HDR_OPS(info->l2_info))
+#define L2_L3_HDR_OPS(info) (info->sec_tag || L3_HDR_OPS(info->l3_info) || L2_HDR_OPS(info->l2_info))
 #define IS_IPV4_NAT(entry) ( IS_IPV4(entry) && (entry->status & CONNTRACK_NAT) )
 #define IS_IPV6_NAT(entry) ( IS_IPV6(entry) && ( entry->status & ( CONNTRACK_SNAT | CONNTRACK_DNAT) ))
 
@@ -1969,8 +1969,20 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 	uint32_t word;
 	int i = 0;
 
+	if (info->opc_count >= MAX_OPCODES)
+		return FAILURE;
 	param = (struct en_ehash_strip_all_vlan_hdrs *)info->paramptr;
 	param_size = sizeof(struct en_ehash_strip_all_vlan_hdrs);
+	if (info->sec_tag) {
+		/* SEC already removed the ingress encapsulation. Validate and
+		 * strip only its internal identity; no user VLAN statistics. */
+		if (param_size > info->param_size)
+			return FAILURE;
+		memset(param, 0, param_size);
+		param->vlan_id[0] = cpu_to_be16(info->sec_tag);
+		goto emit_strip_vlan;
+	}
+
 #ifdef INCLUDE_VLAN_IFSTATS
 	if (info->l2_info.vlan_flow_ifstats) {
 		/* The flow names its own records, or none. The list is laid out
@@ -2041,6 +2053,7 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 		}
 	}
 
+emit_strip_vlan:
 	//add opcode
 	*(info->opcptr) = STRIP_ALL_VLAN_HDRS;
 	//adjust opc, param ptrs and size
@@ -2628,6 +2641,9 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			if (create_strip_eth_hm(info ))
 				return FAILURE;
 		}
+
+		if (info->sec_tag && insert_remove_vlan_hm(info, 0, 0))
+			return FAILURE;
 
 		if (info->l3_info.add_tnl_header) {
 			/* Insert Tnl header */

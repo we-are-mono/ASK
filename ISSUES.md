@@ -328,7 +328,7 @@ file's git history.
 - [x] **A286.** A transport-mode inbound SA with a 128-packet window got ARS128, which SEC's legacy transport protocol does not have —
   fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
 
-- [ ] **A280 / A287.** With shared offline-port classification a decrypted flow's entry keys on
+- [x] **A280 / A287.** With shared offline-port classification a decrypted flow's entry keys on
   the port id and inner 5-tuple alone, so a hardware forwarding hit does not prove which SA
   decrypted the packet. A second authenticated peer can forge the first peer's inner tuple under
   its own SA: SEC decrypts it, the shared entry forwards it, and the software secpath/policy check
@@ -337,10 +337,18 @@ file's git history.
   tuple. The exposure needs a second malicious authenticated peer with per-peer policy
   differentiation; a single-peer or uniform-policy VPN is unaffected, and it matches how
   CMM/CDX-5.03.1 shipped. Per-SA classification isolated this but folded the SA's FQID into the
-  KeyGen key, stranding an offline-port task on a miss (A276) and perturbing the fragmenter
-  (oversized-ESP ICV), so it was reverted. Accepted for now; a hardware-preserving fix candidate
-  (a SEC-stamped source-MAC identity extracted as an ordinary Ethernet field) is researched in
-  `docs/flowtable/ipsec-sa-provenance.md` (_:/^cdx: revert per-SA offline-port classification_).
+  KeyGen key, stranding an offline-port task on a miss (A276), so it was reverted.
+  Fixed on this hardware: SEC inserts an allocated SA identity in a private VLAN;
+  FMan validates and removes it after the ordinary tuple lookup. CPU misses preserve
+  both MACs and pass the executing SA to Linux's policy check. Identities remain
+  reserved through queue/SEC/PCD retirement and uncertain deletion; rekey sharing
+  and bounded exhaustion are handled. The hardened image passed 37 DUT regressions;
+  five final-image checks also passed, including exact byte accounting and CBC/GCM
+  iperf. Four-stream GCM reached 2.50 Gbit/s; CBC at a 1.50 Gbit/s aggregate target
+  passed below Vision's diagnosed cryptd-queue saturation, both with no peer XFRM
+  errors. Evidence and limits are in section 14 of
+  `docs/flowtable/ipsec-sa-provenance.md` —
+  fixed (_:/^cdx: bind post-SEC forwarding to the executing SA_).
 
 - [x] **A288.** `ft_ipsec_paired_inbound()` chose a decrypted flow's inbound SA by address (the most recent), so a rekey with non-overlapping selectors bound the entry to an SA the peer does not use and left the flow in software —
   fixed (_:/^cdx: choose a decrypted flow's inbound SA by its selector_).

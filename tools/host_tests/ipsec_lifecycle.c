@@ -94,6 +94,7 @@ static int ipsec_bpid = -1;
 #define QMAN_CGR_FLAG_USE_INIT 1
 
 typedef uint32_t u32;
+typedef uint16_t u16;
 typedef uint8_t u8;
 typedef uintptr_t dma_addr_t;
 typedef int cpumask_t;
@@ -149,6 +150,27 @@ struct qm_mcc_initcgr {
     unsigned we_mask;
     struct { unsigned cscn_en, mode, cstd_en; struct threshold cs_thres; } cgr;
 };
+/* A bounded allocator and checked refs model the kernel APIs, including
+ * exhaustion and reuse. The lifecycle and tag-sharing code is compiled. */
+#define VLAN_N_VID 4096
+#define VLAN_VID_MASK 4095
+#define DEFINE_IDA(n) struct { bool used[VLAN_N_VID]; } n
+static unsigned tags;
+static bool fault(void);
+static int tag_alloc(bool *used, unsigned lo, unsigned hi)
+{
+    if (fault()) return -ENOMEM;
+    for (unsigned i = lo; i <= hi; i++)
+        if (!used[i]) { used[i] = true; tags++; return i; }
+    return -ENOSPC;
+}
+#define ida_alloc_range(p, lo, hi, flags) tag_alloc((p)->used, lo, hi)
+#define ida_free(p, i) do { assert((p)->used[i] && tags); (p)->used[i] = false; tags--; } while (0)
+#define ida_destroy(p) do { assert(!tags); } while (0)
+typedef unsigned refcount_t;
+static void refcount_set(refcount_t *r, unsigned n) { assert(!*r); *r = n; }
+static void refcount_inc(refcount_t *r) { assert(*r); ++*r; }
+static bool refcount_dec_and_test(refcount_t *r) { assert(*r); return !--*r; }
 #include "ipsec_types.inc"
 static bool dpa_ipsec_ready;
 static unsigned sec_congestion, qm_channel_caam;
@@ -296,6 +318,7 @@ static void ipsec_exception_pkt_handler(void) { }
 static void dpa_ipsec_ern_cb(void) { }
 static bool try_module_get(void *module)
 { if (module_going) return false; module_refs++; return true; }
+static void __module_get(void *module) { assert(module_refs); module_refs++; }
 static void module_put(void *module)
 {
     assert(module_refs && !callbacks);
@@ -397,6 +420,25 @@ static void qman_release_cgrid(unsigned id) { assert(cgrid && !cgr); cgrid = fal
 static bool cdx_dpa_init_fault(void) { return fault(); }
 static void register_cdx_deinit_func(void (*cb)(void))
 { registrations++; exit_callback = cb; }
+static bool sec_busy;
+static bool cdx_ipsec_wait_sec_idle(void)
+{
+    for (unsigned i = 512; i < 515; i++)
+        assert(fq_registry[i] && fq_registry[i]->state == qman_fq_state_oos);
+    return !sec_busy;
+}
+static bool barrier_fail, fatal;
+static unsigned barriers;
+static void *dpa_get_ehash_td(void) { return &iface; }
+static int ExternalHashTableFmPcdHcSync(void *td)
+{
+    assert(td == &iface && !callbacks);
+    for (unsigned i = 512; i < 515; i++) assert(!fq_registry[i]);
+    barriers++;
+    return barrier_fail ? -EIO : 0;
+}
+static void cdx_ft_fatal(void) { fatal = true; }
+static bool cdx_ft_failed(void) { return fatal; }
 void cdx_dpa_ipsec_exit(void);
 #include "ipsec_lifecycle.inc"
 
@@ -407,7 +449,7 @@ static void clean(void)
     for (unsigned id = 2; id < 64; id++) assert(!dpa_bp_array[id]);
     assert(!port && !cgr && !cgrid && !preempt_count && !dpa_bp_array[2] && !cdx_dpa_ipsec_ready());
     assert(!ipsecinfo.ipsec_bp && !ipsecinfo.ipsec_pcd_fqs && ipsec_bpid == -1);
-    assert(!module_refs && !sa_range && !ipsecinfo.ipsec_exception_fq);
+    assert(!module_refs && !sa_range && !tags && !ipsecinfo.ipsec_exception_fq);
     assert(!ipsecinfo.expt_fq_count && ipsecinfo.ofport_handle < 0);
     for (unsigned i = 0; i < MAX_MATCH_TABLES; i++) assert(!ipsecinfo.ofport_td[i]);
 }
@@ -467,8 +509,20 @@ static unsigned sa_lifecycle(void)
     assert(cdx_dpa_ipsecsa_release(sa) == FAILURE);
     assert(module_refs == 1 && sa_range && ipsecinfo.ipsec_exception_fq);
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
-    assert(!module_refs && !sa_range && !ipsecinfo.ipsec_exception_fq);
+    assert(!module_refs && !sa_range && !tags && !ipsecinfo.ipsec_exception_fq);
     assert(allocs == baseline && queues == 12);
+
+    /* Queue retirement does not prove that SEC finished its accepted job.
+     * No descriptor, queue, tag or module ownership can go on a failed proof. */
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa); sa_retired(sa); sec_busy = true;
+    unsigned retained_allocs = allocs;
+    assert(cdx_dpa_ipsecsa_release(sa) == FAILURE);
+    assert(module_refs == 1 && tags == 1 && sa_range && queues == 15);
+    assert(allocs == retained_allocs && ipsecinfo.ipsec_exception_fq);
+    /* Model a hardware reset solely to release the harness's allocations. */
+    sec_busy = false; callbacks = 0; sa_retired(sa);
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && !tags);
 
     /* An SA whose classifier entry could not be proven gone holds its FQIDs
      * past its release, until the datapath restart that settles the entry:
@@ -479,7 +533,7 @@ static unsigned sa_lifecycle(void)
     cdx_dpa_ipsecsa_keep_fqids(sa);
     sa_retired(sa);
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
-    assert(!module_refs && sa_range && allocs == baseline + 1);
+    assert(module_refs == 1 && tags == 1 && sa_range && allocs == baseline + 1);
     assert(cdx_dpa_ipsec_release_held_fqids() == 1 && !sa_range && allocs == baseline);
     assert(!cdx_dpa_ipsec_release_held_fqids());
     sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
@@ -498,13 +552,46 @@ static unsigned sa_lifecycle(void)
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && sa_range && allocs == baseline);
     seed_failure = NULL; seed_step = seed_fail = 0;
     assert(!cdx_dpa_ipsec_release_held_fqids() && sa_range);
-    sa_range = false;
+    assert(module_refs == 1 && tags == 1);
+    /* Simulate the reboot required after an unrecordable hold. */
+    module_refs = 0; sa_range = false;
+    for (unsigned i = 1; i < VLAN_VID_MASK; i++)
+        if (ipsec_key_tags.used[i]) ipsec_put_key_tag(i);
+
+    /* An empty FROM_SEC queue is insufficient: a failed PCD barrier pins
+     * the tag, FQIDs and module until restart. It cannot be reused. */
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa);
+    u16 held_tag = sa->key_tag;
+    sa_retired(sa); barrier_fail = true;
+    unsigned previous_barriers = barriers;
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
+    assert(fatal && barriers == previous_barriers + 1 && module_refs == 1);
+    assert(sa_range && tags == 1 && ipsec_key_tags.used[held_tag]);
+    int another = ida_alloc_range(&ipsec_key_tags, 1, VLAN_VID_MASK - 1, 0);
+    assert(another > 0 && another != held_tag);
+    ida_free(&ipsec_key_tags, another);
+    barrier_fail = fatal = false;
+    assert(cdx_dpa_ipsec_release_held_fqids() == 1);
+    assert(!module_refs && !tags && !sa_range);
+    another = ida_alloc_range(&ipsec_key_tags, 1, VLAN_VID_MASK - 1, 0);
+    assert(another == held_tag);
+    ida_free(&ipsec_key_tags, another);
+
+    /* An uncertain dependent-flow delete also pins the identity, even
+     * when the SA root and its final barrier both succeed. */
+    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
+    assert(sa); sa_retired(sa); fatal = true;
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
+    assert(module_refs == 1 && tags == 1 && sa_range);
+    fatal = false;
+    assert(cdx_dpa_ipsec_release_held_fqids() == 1 && !module_refs && !tags);
 
     for (unsigned fail = 1; fail <= count; fail++) {
         steps = 0; fail_step = fail; pauses = 0;
         retires_failed = oos_failed = 2;
         assert(!cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42));
-        assert(!module_refs && !sa_range && !ipsecinfo.ipsec_exception_fq);
+        assert(!module_refs && !sa_range && !tags && !ipsecinfo.ipsec_exception_fq);
         assert(allocs == baseline && queues == 12 && !callbacks);
     }
     fail_step = retires_failed = oos_failed = 0;
@@ -517,29 +604,48 @@ static unsigned sa_lifecycle(void)
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && sa_range && allocs == baseline + 1);
     cdx_dpa_ipsec_held_fqids_exit(true);
     assert(!sa_range && allocs == baseline);
-    /* One that has not keeps it allocated, giving back only the record of
-     * it -- and the IPsec exit, which runs before that is known, keeps both
-     * for it to decide. */
+    /* A held tag pins the module: restart must settle it before unload. */
     sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
     assert(sa);
     cdx_dpa_ipsecsa_keep_fqids(sa);
     sa_retired(sa);
-    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && sa_range && allocs == baseline + 1);
+    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && module_refs == 1);
+    assert(cdx_dpa_ipsec_release_held_fqids() == 1 && !module_refs);
     module_going = true;
     assert(!cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42));
-    assert(!module_refs && allocs == baseline + 1);
     exit_callback();
-    unsigned exited = allocs;
-    assert(sa_range && exited);
-    cdx_dpa_ipsec_held_fqids_exit(false);
-    assert(sa_range && allocs == exited - 1);
-    sa_range = false;
+    cdx_dpa_ipsec_held_fqids_exit(true);
     clean();
     return count + 3;
 }
 
+static void tag_lifecycle(void)
+{
+    reset();
+    struct dpa_ipsec_sainfo owner = {0}, peer = {0};
+    owner.key_tag = ida_alloc_range(&ipsec_key_tags, 1, VLAN_VID_MASK - 1, 0);
+    peer.key_tag = ida_alloc_range(&ipsec_key_tags, 1, VLAN_VID_MASK - 1, 0);
+    refcount_set(&ipsec_key_tag_refs[owner.key_tag], 1);
+    refcount_set(&ipsec_key_tag_refs[peer.key_tag], 1);
+    ipsec_share_key_tag(&peer, &owner);
+    assert(tags == 1 && ipsec_get_key_tag(&peer) == owner.key_tag);
+    ipsec_share_key_tag(&peer, &owner); /* idempotent before descriptor build */
+    ipsec_put_key_tag(owner.key_tag);
+    assert(tags == 1 && ipsec_key_tags.used[peer.key_tag]);
+    ipsec_put_key_tag(peer.key_tag);
+    assert(!tags);
+    /* Exhaustion rejects admission, including full SA construction, rather
+     * than wrapping to an active tag or using reserved VLAN IDs 0/4095. */
+    for (unsigned i = 1; i < VLAN_VID_MASK; i++)
+        assert(ida_alloc_range(&ipsec_key_tags, 1, VLAN_VID_MASK - 1, 0) == (int)i);
+    assert(!cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42) && !module_refs && !sa_range);
+    for (unsigned i = 1; i < VLAN_VID_MASK; i++) ida_free(&ipsec_key_tags, i);
+    clean();
+}
+
 int main(void)
 {
+    tag_lifecycle();
     /* An SG receiver frees the secondary skb shell after taking a page
      * reference. Exercise that lifetime with an actually seeded buffer. */
     reset();

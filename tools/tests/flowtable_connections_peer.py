@@ -34,7 +34,8 @@ class WireProbe:
         self.sample_limit = 0
         self.samples = []
 
-    def rpc(self, action, iface=None, marker=None, samples=0, promiscuous=False):
+    def rpc(self, action, iface=None, marker=None, samples=0, promiscuous=False,
+            incoming_only=False):
         if action == 'start':
             assert self.sock is None
             self.marker = bytes.fromhex(marker)
@@ -45,6 +46,10 @@ class WireProbe:
             self.samples = []
             self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
             self.sock.bind((iface, 0))
+            if incoming_only:
+                # PACKET_IGNORE_OUTGOING: ICMP errors can quote our marker;
+                # a sender's reply is not another delivered test frame.
+                self.sock.setsockopt(263, 23, 1)
             if samples:
                 self.sock.setsockopt(263, 8, 1)  # PACKET_AUXDATA
             if promiscuous:

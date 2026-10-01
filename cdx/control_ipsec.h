@@ -227,7 +227,8 @@ extern struct slist_head sa_cache_by_h[];
 
 void sa_remove_from_list_fqid(PSAEntry pSA);
 void sa_free(PSAEntry pSA);
-struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt);
+struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt,
+					 uint16_t *tag);
 
 int ipsec_init(void);
 void ipsec_exit(void);

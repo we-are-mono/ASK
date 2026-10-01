@@ -18,6 +18,9 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/if_ether.h>
+#include <linux/if_vlan.h>
+#include <linux/idr.h>
+#include <linux/refcount.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
@@ -39,6 +42,7 @@
 #include "cdx_ioctl.h"
 #include "cdx.h"
 #include "cdx_flowtable.h"
+#include "cdx_flowtable_backend.h"
 #include "misc.h"
 #include "dpaa_eth_common.h"
 #include "dpa_wifi.h"
@@ -112,6 +116,7 @@ struct dpa_ipsec_sainfo {
 	 * which a classifier entry naming them could not be proven gone. See
 	 * cdx_dpa_ipsecsa_keep_fqids(). */
 	u32 keep_epoch;
+	u16 key_tag;
 };
 
 /* FQID ranges an SA released while an entry that may still be linked named
@@ -121,8 +126,37 @@ struct dpa_ipsec_sainfo {
 struct dpa_ipsec_held_fqids {
 	struct list_head list;
 	u32 base;
+	u16 key_tag;
 };
 static LIST_HEAD(dpa_ipsec_held);
+static DEFINE_IDA(ipsec_key_tags);
+static refcount_t ipsec_key_tag_refs[VLAN_N_VID];
+
+static void ipsec_put_key_tag(u16 tag)
+{
+	if (refcount_dec_and_test(&ipsec_key_tag_refs[tag]))
+		ida_free(&ipsec_key_tags, tag);
+}
+
+uint32_t ipsec_get_key_tag(void *handle)
+{
+	return ((struct dpa_ipsec_sainfo *)handle)->key_tag;
+}
+
+/* Only before this SA's descriptor is built, under ctrl.mutex. Outbound
+ * NAT-T rekeying SAs share a root; the tag outlives all of their queues. */
+void ipsec_share_key_tag(void *handle, void *other)
+{
+	struct dpa_ipsec_sainfo *sa = handle, *owner = other;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	if (sa->key_tag == owner->key_tag)
+		return;
+	refcount_inc(&ipsec_key_tag_refs[owner->key_tag]);
+	ipsec_put_key_tag(sa->key_tag);
+	sa->key_tag = owner->key_tag;
+}
+
 
 struct ipsec_info {
 	uint32_t crypto_channel_id;
@@ -307,7 +341,7 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 
 
 extern 	struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,
-		uint16_t *sagd_pkt);
+		uint16_t *sagd_pkt, uint16_t *tag);
 static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *qm,
 		struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
@@ -322,6 +356,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	struct dpa_percpu_priv_s        *percpu_priv;
 	unsigned short eth_type;
 	unsigned short sagd_pkt;
+	uint16_t tag;
 	struct sec_path *sp;
 	struct xfrm_state *x;
 	bool use_gro;
@@ -334,7 +369,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;
 	/* The exception queue identifies the receiving SA and device. */
-	net_dev = get_netdev_of_SA_by_fqid(dq->fqid, &sagd_pkt);
+	net_dev = get_netdev_of_SA_by_fqid(dq->fqid, &sagd_pkt, &tag);
 
 	if(!net_dev ){
 #ifdef DPA_IPSEC_DEBUG
@@ -380,6 +415,13 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		goto rel_fd;
 	}
 
+	/* Output-root misses carry ciphertext. They must never be labelled
+	 * as an authenticated inbound packet when returned to Linux. */
+	if (unlikely(x->xso.dir != XFRM_DEV_OFFLOAD_IN)) {
+		xfrm_state_put(x);
+		goto rel_fd;
+	}
+
 	priv = netdev_priv(net_dev); 
 	DPA_BUG_ON(!priv);
 	/* IRQ handler, non-migratable; safe to use raw_cpu_ptr here */
@@ -415,8 +457,15 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 
 	pool_balance--;
 	ipsec_pool_consumed(-pool_balance);
-	if (unlikely(!pskb_may_pull(skb, ETH_HLEN + 1)))
+	if (unlikely(!pskb_may_pull(skb, ETH_HLEN + VLAN_HLEN + 1)))
 		goto pkt_drop;
+	/* This tag was inserted by the executing SEC descriptor. Remove
+	 * exactly that shim, preserving both original per-packet MACs. */
+	if (unlikely(((struct vlan_ethhdr *)skb->data)->h_vlan_proto != htons(ETH_P_8021Q) ||
+		     ((struct vlan_ethhdr *)skb->data)->h_vlan_TCI != htons(tag)))
+		goto pkt_drop;
+	memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
+	skb_pull(skb, VLAN_HLEN);
 	ptr = skb->data;
 	/*  When V6 SA is applied to v4 packet and vice versa, since ether header is
 	 *  copied from input packet, it will be wrong. Below logic is added just
@@ -1008,6 +1057,9 @@ int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td,
 	 * would fault in the table insert rather than fail it. */
 	if (!cdx_dpa_ipsec_ready())
 		return FAILURE;
+	/* The IPsec policy has only SA-bound unicast tables and a catch-all. */
+	if (!info->ofport_td[table_type])
+		return FAILURE;
 	*td = info->ofport_td[table_type];
 	*portid = info->ofport_portid;
 	return SUCCESS;
@@ -1238,6 +1290,7 @@ int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size)
 void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle)
 {
 	struct dpa_ipsec_sainfo *sainfo;
+	int tag;
 
 	/* An SA can still own SEC work while its deferred deletion runs.
 	 * Keep the pool and callback text loaded until all its queues are
@@ -1253,8 +1306,19 @@ void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle)
 		return NULL;
 	}
 	memset(sainfo, 0, sizeof(struct dpa_ipsec_sainfo));
+	/* One 12-bit VLAN identity per inbound SA or outbound root. Refuse
+	 * exhaustion; never alias an active or retained identity. */
+	tag = ida_alloc_range(&ipsec_key_tags, 1, VLAN_VID_MASK - 1, GFP_KERNEL);
+	if (tag < 0) {
+		kfree(sainfo);
+		module_put(THIS_MODULE);
+		return NULL;
+	}
+	sainfo->key_tag = tag;
+	refcount_set(&ipsec_key_tag_refs[tag], 1);
 	//create fqs in scheduled state
 	if (create_ipsec_fqs(sainfo, 1, handle)) {
+		ipsec_put_key_tag(sainfo->key_tag);
 		kfree(sainfo);
 		module_put(THIS_MODULE);
 		return NULL;
@@ -1290,11 +1354,30 @@ static void dpa_ipsec_release_fqids(struct dpa_ipsec_sainfo *sainfo)
 {
 	u32 base = sainfo->sec_fq[FQ_FROM_SEC].fqid;
 	struct dpa_ipsec_held_fqids *held;
+	void *td = dpa_get_ehash_td();
+
+	/* FROM_SEC can be empty while FMan still holds its last packet.
+	 * After every SA queue is OOS, a PCD barrier proves that packet no
+	 * longer carries this tag or exception FQID. A failed proof pins both
+	 * until a stopped-port restart completes the barrier. */
+	if (!td || ExternalHashTableFmPcdHcSync(td)) {
+		cdx_ft_fatal();
+	}
+	/* A failed dependent-flow delete can leave a tag-validating entry
+	 * linked even when this SA's own root deleted cleanly. Admission is
+	 * stopped by that latch; retain the namespace across module unload
+	 * too, until restart has settled all such entries. */
+	if (cdx_ft_failed())
+		sainfo->keep_epoch = cdx_ft_epoch();
 
 	if (!sainfo->keep_epoch || sainfo->keep_epoch != cdx_ft_epoch()) {
 		qman_release_fqid_range(base, NUM_FQS_PER_SA);
+		ipsec_put_key_tag(sainfo->key_tag);
 		return;
 	}
+	/* The tag allocator is module-local. Reloading it while a stale
+	 * classifier may still carry a tag would make that tag reusable. */
+	__module_get(THIS_MODULE);
 	held = kmalloc(sizeof(*held), GFP_KERNEL);
 	if (!held) {
 		pr_err("cdx: IPsec SA FQIDs 0x%x-0x%x leaked: a classifier entry may still name them and they could not be held\n",
@@ -1302,6 +1385,7 @@ static void dpa_ipsec_release_fqids(struct dpa_ipsec_sainfo *sainfo)
 		return;
 	}
 	held->base = base;
+	held->key_tag = sainfo->key_tag;
 	list_add_tail(&held->list, &dpa_ipsec_held);
 }
 
@@ -1337,6 +1421,18 @@ int cdx_dpa_ipsecsa_release(void *handle)
 				fq->fqid);
 			return FAILURE;
 		}
+	}
+	/* SEC can still be processing a job dequeued before TO_SEC retired.
+	 * Keep its descriptor, keys, callbacks, FQIDs and tag together unless
+	 * the hardware proves that job finished. The caller retains the key
+	 * mappings on failure, and this SA's module reference prevents unload. */
+	if (!cdx_ipsec_wait_sec_idle()) {
+		pr_warn_ratelimited("cdx: SEC did not become idle after SA queues stopped; retaining SA resources until reboot\n");
+		return FAILURE;
+	}
+	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
+		dpa_fq = &sainfo->sec_fq[ii];
+		fq = &dpa_fq->fq_base;
 		/* QMan can publish the retired state before its last callback
 		 * returns. Retain both the embedded queue and the module. */
 		synchronize_net();
@@ -1380,8 +1476,10 @@ unsigned int cdx_dpa_ipsec_release_held_fqids(void)
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	list_for_each_entry_safe(held, next, &dpa_ipsec_held, list) {
 		qman_release_fqid_range(held->base, NUM_FQS_PER_SA);
+		ipsec_put_key_tag(held->key_tag);
 		list_del(&held->list);
 		kfree(held);
+		module_put(THIS_MODULE);
 		released++;
 	}
 	return released;
@@ -1394,6 +1492,7 @@ void cdx_dpa_ipsec_held_fqids_exit(bool settled)
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	if (settled) {
 		cdx_dpa_ipsec_release_held_fqids();
+		ida_destroy(&ipsec_key_tags);
 		return;
 	}
 	list_for_each_entry_safe(held, next, &dpa_ipsec_held, list) {

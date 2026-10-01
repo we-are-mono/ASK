@@ -124,6 +124,12 @@ static void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext ctx)
 	free(ctx);
 }
 
+static U16 cdx_ipsec_key_tag_of(PSAEntry sa)
+{
+    assert(sa_lock_held);
+    return sa->handle + 100;
+}
+
 static struct qman_fq to_sec_fq;
 static struct qman_fq *get_to_sec_fq(void *handle)
 {
@@ -166,7 +172,7 @@ int main(void)
 {
 	struct net_device dev_a = { 1 }, dev_b = { 2 };
 	PSAEntry a, b;
-	U16 got;
+	U16 got, tag;
 	int takes;
 	unsigned links, unlinks;
 
@@ -207,10 +213,10 @@ int main(void)
 	assert(!M_ipsec_sa_cache_lookup_by_h(3 + 2 * NUM_SA_ENTRIES));
 
 	/* The portal callback's walk resolves each queue to its own SA. */
-	assert(get_netdev_of_SA_by_fqid(0x200 + 5, &got) == &dev_a && got == 3);
-	assert(get_netdev_of_SA_by_fqid(0x200 + 5 + NUM_SA_ENTRIES, &got) == &dev_b &&
-	       got == 3 + NUM_SA_ENTRIES);
-	assert(!get_netdev_of_SA_by_fqid(0x200 + 5 + 2 * NUM_SA_ENTRIES, &got));
+	assert(get_netdev_of_SA_by_fqid(0x200 + 5, &got, &tag) == &dev_a && got == 3 && tag == 103);
+	assert(get_netdev_of_SA_by_fqid(0x200 + 5 + NUM_SA_ENTRIES, &got, &tag) == &dev_b &&
+	       got == 3 + NUM_SA_ENTRIES && tag == 103 + NUM_SA_ENTRIES);
+	assert(!get_netdev_of_SA_by_fqid(0x200 + 5 + 2 * NUM_SA_ENTRIES, &got, &tag));
 	assert(!sa_lock_held);
 
 	/* The submit hook finds a live SA's queue, and not a dying one's. */
@@ -218,8 +224,8 @@ int main(void)
 	b->flags |= SA_DELETE;
 	assert(!cdx_get_to_sec_fq_handler(3 + NUM_SA_ENTRIES));
 	/* A dying SA is skipped, and its bucket neighbour still resolves. */
-	assert(!get_netdev_of_SA_by_fqid(0x200 + 5 + NUM_SA_ENTRIES, &got));
-	assert(get_netdev_of_SA_by_fqid(0x200 + 5, &got) == &dev_a && got == 3);
+	assert(!get_netdev_of_SA_by_fqid(0x200 + 5 + NUM_SA_ENTRIES, &got, &tag));
+	assert(get_netdev_of_SA_by_fqid(0x200 + 5, &got, &tag) == &dev_a && got == 3 && tag == 103);
 	b->flags &= ~SA_DELETE;
 	assert(!sa_lock_held);
 
@@ -238,8 +244,8 @@ int main(void)
 	assert(M_ipsec_sa_cache_entries() == 1);
 	assert(!M_ipsec_sa_cache_lookup_by_h(3));
 	assert(M_ipsec_sa_cache_lookup_by_h(3 + NUM_SA_ENTRIES) == b);
-	assert(!get_netdev_of_SA_by_fqid(0x200 + 5, &got));
-	assert(get_netdev_of_SA_by_fqid(0x200 + 5 + NUM_SA_ENTRIES, &got) == &dev_b);
+	assert(!get_netdev_of_SA_by_fqid(0x200 + 5, &got, &tag));
+	assert(get_netdev_of_SA_by_fqid(0x200 + 5 + NUM_SA_ENTRIES, &got, &tag) == &dev_b);
 
 	released = NULL;
 	assert(M_ipsec_sa_cache_delete(3 + NUM_SA_ENTRIES) == NO_ERR);

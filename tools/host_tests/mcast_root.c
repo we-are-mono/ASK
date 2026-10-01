@@ -33,6 +33,7 @@ typedef struct ct *PCtEntry;
 #define IS_IPV4(e) (!IS_IPV6(e))
 struct dpa_iface_info { int unused; };
 struct ins_entry_info {
+    uint16_t sec_tag;
     unsigned flags, nat_sport, nat_dport, vlan_ids[2], eth_type;
     unsigned num_mcast_members, to_sec_fqid;
     void *replicate_params, *paramptr;

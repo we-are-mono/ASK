@@ -97,6 +97,19 @@ int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id,
 int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			uint32_t sa_dir_in);
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info);
+
+/* An internal VLAN carries the executing SA installation. Its ID is owned
+ * alongside the SA queues; it is removed before Linux or wire delivery. */
+uint32_t cdx_ipsec_key_tag_of(PSAEntry sa);
+
+static inline void cdx_ipsec_vlan_tag(uint8_t *vlan, uint32_t tag)
+{
+	vlan[0] = 0x81;
+	vlan[1] = 0x00;
+	vlan[2] = (tag >> 8) & 0xff;
+	vlan[3] = tag & 0xff;
+}
+
 int cdx_ipsec_delete_fp_entry(PSAEntry pSA);
 void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes);
 u64 get_oseq_from_sa(PSAEntry sa);

@@ -499,10 +499,35 @@ bool cdx_ipsec_sa_outbound(u16 handle)
 	return sa && sa->direction == CDX_DPA_IPSEC_OUTBOUND;
 }
 
+/* Allocation is shared by both directions and retained with the queues. */
+uint32_t cdx_ipsec_key_tag_of(PSAEntry sa)
+{
+	return ipsec_get_key_tag(sa->pSec_sa_context->dpa_ipsecsa_handle);
+}
+
+/* The tables a decrypted flow may be classified in on the offline port: the
+ * ones whose forwarding actions validate the SA VLAN. The shared
+ * encoder files a UDP flow without ports under multicast, which that port has
+ * no table for, so such a flow stays in software. */
+static bool cdx_ipsec_decrypted_table(uint32_t tbl_type)
+{
+	return tbl_type == IPV4_TCP_TABLE || tbl_type == IPV4_UDP_TABLE ||
+	       tbl_type == IPV6_TCP_TABLE || tbl_type == IPV6_UDP_TABLE;
+}
+
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 {
 	int i;
 	PSAEntry sa;
+
+	/* A handle the SA cache does not hold is a refusal, not a direction
+	 * without that SA: a decrypted direction skipped here would be
+	 * installed on its physical port, keyed to match the same tuple in
+	 * the clear, and an encrypted one would leave unencrypted. */
+	for (i = 0; i < SA_MAX_OP; i++)
+		if (entry->hSAEntry[i] &&
+		    !M_ipsec_sa_cache_lookup_by_h(entry->hSAEntry[i]))
+			return -1;
   
 	for (i=0;i < SA_MAX_OP;i++)
 	{ 
@@ -520,7 +545,13 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 				printk(KERN_CRIT "%s OutBound SA info->to_sec_fqid  = %d\n", __func__,info->to_sec_fqid );
 #endif				
 			}else{
+				/* Every SA reaches this offline port. A tuple hit
+				 * must validate the tag of the SA for which Linux
+				 * admitted the decrypted flow. */
+				if (!cdx_ipsec_decrypted_table(info->tbl_type))
+					return -1;
 				info->l3_info.ipsec_inbound_flow = 1;
+				info->sec_tag = cdx_ipsec_key_tag_of(sa);
 				if (dpa_ipsec_ofport_td(ipsec_instance,
 					info->tbl_type, &info->td, &info->port_id))
 					return -1;
@@ -531,6 +562,27 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 		}
 	}
 	return 0;
+}
+
+/* Call after the SA's request queue is OOS. SEC RM CSTA[IDLE] proves that
+ * jobs already dequeued by QI have also finished; QMan retirement alone does
+ * not. A busy or wedged SEC is not permission to reuse a descriptor or tag.
+ * Other SAs may continue running: one idle observation is sufficient once
+ * this SA can no longer submit work. */
+bool cdx_ipsec_wait_sec_idle(void)
+{
+	struct caam_drv_private *ctrlpriv;
+	unsigned int tries;
+
+	if (!jrdev_g)
+		return false;
+	ctrlpriv = dev_get_drvdata(jrdev_g->parent);
+	for (tries = 0; tries < 100; tries++) {
+		if (rd_reg32(&ctrlpriv->ctrl->perfmon.status) & BIT(1))
+			return true;
+		usleep_range(100, 200);
+	}
+	return false;
 }
 
 void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
@@ -635,17 +687,16 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 		__func__,__LINE__,(pSA->direction)?"INBOUND":"OUTBOUND",
 		pSA->handle,
 		pSA->pSec_sa_context ? pSA->pSec_sa_context->to_sec_fqid : 0);
-	/* WE need to lock below section of code */
+	/* A NAT-T root remains installed until its last SA owner leaves. */
 	if (IS_NATT_SA(pSA) && pSA->ct && (pSA->ct->handle))
 	{
 		natt_tbl_entry = pSA->ct->handle;
-		if ( (pSA->direction == CDX_DPA_IPSEC_OUTBOUND) && (pSA->ct->natt_out_refcnt > 1))
-		{
+		if (pSA->direction == CDX_DPA_IPSEC_OUTBOUND && pSA->ct->natt_out_refcnt > 1) {
 			pSA->ct->natt_out_refcnt--;
 			pSA->ct = NULL;
 			return 0;
 		}
-		else if ((pSA->direction == CDX_DPA_IPSEC_INBOUND) && (pSA->ct->natt_in_refcnt > 1))
+		if ((pSA->direction == CDX_DPA_IPSEC_INBOUND) && (pSA->ct->natt_in_refcnt > 1))
 		{
 			ipsec_preempt_params = ( struct en_ehash_ipsec_preempt_op *)natt_tbl_entry->ipsec_preempt_params;
 			pSA->ct->natt_in_refcnt--;
@@ -672,8 +723,8 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 		 * for its own delete to find -- come through here. A key that
 		 * may still be linked may still resolve, so the ports stop, as
 		 * any such key demands. An inbound SA's entry enqueues to its
-		 * TO_SEC FQID, so those FQIDs are held past the SA's release as
-		 * well; an outbound one's enqueues to the egress port. The
+		 * TO_SEC FQID, and an outbound one validates its SEC tag: both
+		 * identities must stay reserved past the SA's release. The
 		 * unsynced arm is out of the table and parked; it needs
 		 * neither. */
 		rc = cdx_ehash_delete_entry(pSA->ct->td, pSA->ct->index,
@@ -681,8 +732,7 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 		if (rc)
 			DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
 		if (rc && rc != EN_EHASH_DELETE_UNSYNCED) {
-			if (pSA->direction == CDX_DPA_IPSEC_INBOUND &&
-			    pSA->pSec_sa_context &&
+			if (pSA->pSec_sa_context &&
 			    pSA->pSec_sa_context->dpa_ipsecsa_handle)
 				cdx_dpa_ipsecsa_keep_fqids(pSA->pSec_sa_context->dpa_ipsecsa_handle);
 			cdx_ft_fatal();
@@ -772,8 +822,8 @@ void cdx_ipsec_release_sa_resources(PSAEntry pSA)
 	/* Delete the hash table entry. On failure the callee has already
 	 * disposed of ct/handle under the ehash tri-state (quarantine or
 	 * loud leak) and cleared pSA->ct - nothing is deferred to the
-	 * release timer any more. An inbound entry that may still be linked
-	 * has pinned the FQIDs the release below would otherwise free. */
+	 * release timer any more. An entry that may still be linked has pinned
+	 * the FQIDs and SEC identity the release below would otherwise free. */
 	cdx_ipsec_delete_fp_entry(pSA);
 
 	/* change frame queues states */
@@ -1120,26 +1170,28 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 	if (bytes_to_copy == 0)
 		goto skip_byte_copy;
 
-	/* Copy L2 header from the original packet to the outer packet */
+	if (bytes_to_copy != ETH_HDR_LEN)
+		return -EINVAL;
+	{
+		u8 vlan[4];
+		u32 math0_bytes = LDST_CLASS_DECO | (0x38 << LDST_SRCDST_SHIFT);
+		u32 math2_bytes = LDST_CLASS_DECO | (0x3a << LDST_SRCDST_SHIFT);
 
-	/* ld: deco-deco-ctrl len=0 offs=8 imm -auto-nfifo-entries */
-	append_cmd(desc, CMD_LOAD | DISABLE_AUTO_INFO_FIFO);
-
-	/* seqfifold: both msgdata-last2-last1-flush1 len=4 */
-	append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_TYPE_MSG |
-			FIFOLD_CLASS_BOTH | FIFOLD_TYPE_LAST1 |
-			FIFOLD_TYPE_LAST2 | FIFOLD_TYPE_FLUSH1);
-
-	/* ld: deco-deco-ctrl len=0 offs=4 imm +auto-nfifo-entries */
-	append_cmd(desc, CMD_LOAD | ENABLE_AUTO_INFO_FIFO);
-
-	/* move: ififo->deco-alnblk -> ofifo, len=4 */
-	append_move(desc, MOVE_SRC_INFIFO | MOVE_DEST_OUTFIFO | bytes_to_copy);
-
-	/* seqfifostr: msgdata len=4 */
-	append_seq_fifo_store(desc, FIFOST_TYPE_MESSAGE_DATA, bytes_to_copy);
-
-	/* Done coping L2 header from the original packet to the outer packet */
+		/* SEC RM table 7-18: assemble MACs, internal VLAN, EtherType
+		 * contiguously in Math0..2, then push them in one FIFO move
+		 * (separate unaligned pushes would introduce gaps, RM 7.7.6).
+		 * Consume 14 bytes and emit 18; IPsec starts at the same input.
+		 */
+		cdx_ipsec_vlan_tag(vlan, cdx_ipsec_key_tag_of(sa));
+		append_seq_load(desc, 12, math0_bytes);
+		append_seq_load(desc, 2, math2_bytes);
+		append_load_as_imm(desc, vlan, sizeof(vlan),
+				   LDST_CLASS_DECO | (0x39 << LDST_SRCDST_SHIFT) |
+				   (4 << LDST_OFFSET_SHIFT));
+		append_move(desc, MOVE_SRC_MATH0 | MOVE_DEST_OUTFIFO |
+			    MOVE_WAITCOMP | (ETH_HDR_LEN + 4));
+		append_seq_fifo_store(desc, FIFOST_TYPE_MESSAGE_DATA, ETH_HDR_LEN + 4);
+	}
 
 skip_byte_copy:
 
@@ -1652,10 +1704,10 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	 * another DECO's update of it (RM 7.3.1, save_sa_state_in_external_mem()),
 	 * and the number read back for xfrm stayed where the SA was installed,
 	 * so a keying daemon re-adding the SA from it restarted it behind
-	 * numbers its peer had already seen. Nothing admitted comes near the
-	 * limit: the largest descriptor, CBC or CCM with a split HMAC key
-	 * behind an IPv6 NAT-T outer header, builds 48 of the 50 words (GCM,
-	 * with no authentication key, 45). An SA that overflows is therefore
+	 * numbers its peer had already seen. The internal VLAN leaves only
+	 * one word below the rejection threshold: CBC or CCM with a split
+	 * HMAC key behind an IPv6 NAT-T outer header builds 49 words (GCM,
+	 * with no authentication key, 46). An SA that overflows is therefore
 	 * a change to the builder, said loudly, and the SA is refused rather
 	 * than installed on a descriptor that cannot keep its sequence.
 	 */
@@ -2064,6 +2116,11 @@ static int get_tbl_type(PSAEntry sa)
  - Checks if there are any NATT SAs with the matched 5-tuple entries
  - If found and already programmed to Fast path, update the array mask and fill the new spi's in the fast path entry
 -- If not found then add the new entry as UDP tuple entry
+
+Inbound SAs share their UDP classifier but retain distinct SEC tags; the SPI
+selects the decrypting SA. Outbound rekeying SAs share both the UDP output root
+and its tag. That tag is reserved exclusively for authenticated encrypted
+output of this tunnel, and is never assigned to an inbound SA.
 */
 
 int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
@@ -2080,6 +2137,27 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 
 	if (natt_sa && natt_sa->ct)
 	{
+		/* An output root authorizes encrypted output for this exact
+		 * UDP tunnel, not an inbound SA's plaintext. Rekeying SAs may
+		 * share that root and tag; inbound identities never share it.
+		 * A built descriptor cannot change identity under queued work. */
+		if (sa->direction == CDX_DPA_IPSEC_OUTBOUND) {
+			/* The shared action also owns the egress framing and MTU. */
+			if (sa->netdev != natt_sa->netdev ||
+			    !sa->pRtEntry || !natt_sa->pRtEntry ||
+			    sa->pRtEntry->itf != natt_sa->pRtEntry->itf ||
+			    sa->pRtEntry->mtu != natt_sa->pRtEntry->mtu ||
+			    memcmp(sa->pRtEntry->dstmac, natt_sa->pRtEntry->dstmac,
+				   ETHER_ADDR_LEN))
+				goto err_ret;
+			if (sa->flags & SA_SH_DESC_BUILT) {
+				if (cdx_ipsec_key_tag_of(sa) != cdx_ipsec_key_tag_of(natt_sa))
+					goto err_ret;
+			} else {
+				ipsec_share_key_tag(sa->pSec_sa_context->dpa_ipsecsa_handle,
+						    natt_sa->pSec_sa_context->dpa_ipsecsa_handle);
+			}
+		}
 		if (sa->direction == CDX_DPA_IPSEC_INBOUND)
 			sa_addr = &sa->id.daddr.a6[0];
 		else
@@ -2319,6 +2397,12 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 				__func__);
 		goto err_ret;
 	}
+	/* An outbound SA's entry is on the offline port, where every SA's
+	 * output and every decrypted frame is classified: it matches only
+	 * what this SA encrypted, and never a decrypted packet built to look
+	 * like it. */
+	if (!sa_dir_in)
+		info->sec_tag = cdx_ipsec_key_tag_of(sa);
 
 	/*round off keysize to next 4 bytes boundary */
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];

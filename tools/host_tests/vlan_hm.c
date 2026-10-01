@@ -36,7 +36,7 @@ typedef uint32_t U32;
 #include "vlan_hm_types.inc"
 
 struct ins_entry_info {
-    unsigned opc_count, param_size, eth_type, flags;
+    unsigned opc_count, param_size, eth_type, flags, sec_tag;
     uint8_t *paramptr, *opcptr;
     uint32_t *vlan_hdrs;
     struct dpa_l2hdr_info l2_info;
@@ -318,6 +318,25 @@ int main(void)
     assert(insert_remove_vlan_hm(&info, 5, 5) == FAILURE);
     assert(!strip_params()->vlan_id[0] && !strip_params()->word);
     guards_intact(PARAMS + 12);
+
+    /* SEC's internal tag overrides the already stripped ingress VLAN stack
+     * and must validate exactly one tag, without borrowing its statistics. */
+    info = ingress(12, 2, qinq, both, 1, opcode);
+    info.sec_tag = 0x345;
+    assert(insert_remove_vlan_hm(&info, 5, 5) == SUCCESS);
+    assert(be16_to_cpu(strip_params()->vlan_id[0]) == 0x345);
+    assert(!strip_params()->vlan_id[1] && !strip_params()->word && !strip_params()->op_flags);
+    assert(opcode[0] == STRIP_ALL_VLAN_HDRS && info.opc_count == 2 && !info.param_size);
+    assert(!lookups);
+    guards_intact(PARAMS + 12);
+    info = ingress(11, 0, NULL, NULL, 0, opcode);
+    info.sec_tag = 1;
+    assert(insert_remove_vlan_hm(&info, 5, 5) == FAILURE);
+    assert(info.opc_count == 1 && info.param_size == 11 && opcode[0] == 0xa5);
+    info = ingress(12, 0, NULL, NULL, 0, opcode);
+    info.sec_tag = 4094; info.opc_count = MAX_OPCODES;
+    assert(insert_remove_vlan_hm(&info, 5, 5) == FAILURE);
+    assert(info.paramptr == PARAMS && opcode[0] == 0xa5 && !lookups);
 
     /* ---- what puts the records into the description ---------------------
      *

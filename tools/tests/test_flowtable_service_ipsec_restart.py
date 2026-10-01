@@ -32,7 +32,7 @@ from test_flowtable_service_ipsec import INNER, Transform, flows_for, hardware, 
 from test_flowtable_service_ipsec_natt import NATT
 from test_flowtable_service_ipsec_replay import sa_state
 
-# The SA whose delete fails: inbound, on documentation-range endpoints of its
+# The SA whose delete fails: inbound or outbound, on documentation-range endpoints of its
 # own, beside the fixture's pair. Its peer does not exist and sends nothing.
 LOCAL, PEER = "198.18.91.1", "198.18.91.2"
 PEER_MAC = "02:00:00:00:91:02"
@@ -42,8 +42,11 @@ REQID = 49101
 
 # NAT-T on the suite's own ports: the orchestrator's IKE daemon holds 4500.
 @pytest.mark.parametrize("ipsec_service", [Transform(), NATT], ids=["esp", "natt"], indirect=True)
-async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service):
+@pytest.mark.parametrize("direction", ["in", "out"])
+async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service, direction):
     r, flows = ipsec_service, flows_for(ipsec_service)
+    src, dst = (PEER, LOCAL) if direction == "in" else (LOCAL, PEER)
+    inbound = direction == "in"
     await require_knobs(r.target, r.session, ROOT_FAULT)
     natt = r.ipsec.transform.encap
     con = r.service_console
@@ -60,8 +63,8 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service):
             baseline = await hardware(r, p, "restart-baseline-hardware", flows[:4])
             sas = dict(r.ipsec.active)
             sec_before = {direction: await sa_state(r, spi, direction) for direction, spi in sas.items()}
-            reply = await sa_add(r.target, r.session, src=PEER, dst=LOCAL, spi=SPI, reqid=REQID,
-                                 ifindex=ifindex, inbound=True, natt=natt)
+            reply = await sa_add(r.target, r.session, src=src, dst=dst, spi=SPI, reqid=REQID,
+                                 ifindex=ifindex, inbound=inbound, natt=natt)
             assert reply.ok, reply
             installed = await r.state()
             assert installed["ipsec_sas"] == baseline["ipsec_sas"] + 1, installed
@@ -77,7 +80,7 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service):
             # before an agent reply could leave.
             result = await r.target.fs_write(r.session, ROOT_FAULT, "1")
             assert result["errno"] == 0, result
-            await console_command(con, "ip", "xfrm", "state", "delete", "src", PEER, "dst", LOCAL,
+            await console_command(con, "ip", "xfrm", "state", "delete", "src", src, "dst", dst,
                                   "proto", "esp", "spi", hex(SPI))
             stopped, _ = await wait_stopped(con, installed)
             assert stopped["ipsec_sas"] == baseline["ipsec_sas"], stopped
@@ -100,24 +103,24 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service):
             await hardware(r, p, "restart-hardware", flows[:4])
             # The accounting pass publishes SEC's per-SA counters once a second.
             await asyncio.sleep(1.5)
-            for direction, spi in sas.items():
-                after = await sa_state(r, spi, direction)
-                assert after and after["packets"] - sec_before[direction]["packets"] >= 256, (
-                    direction, sec_before[direction], after)
+            for sa_dir, spi in sas.items():
+                after = await sa_state(r, spi, sa_dir)
+                assert after and after["packets"] - sec_before[sa_dir]["packets"] >= 256, (
+                    sa_dir, sec_before[sa_dir], after)
         # The deleted SA installs again with the same SPI and addresses: the
         # restart settled its entry, so the key is free.
-        reply = await sa_add(r.target, r.session, src=PEER, dst=LOCAL, spi=SPI, reqid=REQID,
-                             ifindex=ifindex, inbound=True, natt=natt)
+        reply = await sa_add(r.target, r.session, src=src, dst=dst, spi=SPI, reqid=REQID,
+                             ifindex=ifindex, inbound=inbound, natt=natt)
         assert reply.ok, reply
         again = await r.state()
         assert again["ipsec_sas"] == baseline["ipsec_sas"] + 1, again
         assert again["fatal"] == 0 and again["restarts"] == installed["restarts"] + 1, again
         assert again["resume_failures"] == installed["resume_failures"], again
-        reply = await sa_del(r.target, r.session, dst=LOCAL, spi=SPI)
+        reply = await sa_del(r.target, r.session, dst=dst, spi=SPI)
         assert reply.ok, reply
         final = await r.wait(lambda s: s["ipsec_sas"] == baseline["ipsec_sas"])
         assert final["fatal"] == 0, final
     finally:
-        await sa_del(r.target, r.session, dst=LOCAL, spi=SPI)
+        await sa_del(r.target, r.session, dst=dst, spi=SPI)
         await endpoints_down(r.target, r.session, iface=TARGET_WAN_IF, local=LOCAL, peer=PEER)
         await command(r.target, r.session, "sysctl", "-w", "kernel.printk=" + " ".join(printk[:4]))

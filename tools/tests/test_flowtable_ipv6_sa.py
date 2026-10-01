@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 import secrets
 import socket
 
@@ -126,6 +127,7 @@ async def test_flowtable_ipv6_sa_oversized(ipv6_rig):
         for size in (FITS, FITS + 1, 1452):
             payload = bytes([size % 251]) * size
             before, frags = await r.state(), await fragments_sent(r)
+            peer_before = xfrm_mib(Path("/proc/net/xfrm_stat").read_text())
             counts = {f["cookie"]: int(f["packets"]) for f in before["flows"]}
             script = f'''
 import json
@@ -145,6 +147,14 @@ print(json.dumps({{"too_big": [a[ICMPv6PacketTooBig].mtu for a in answers]}}))
             results[size] = {"lan": json.loads(result.stdout.strip().splitlines()[-1]),
                              "delivered": echo.received[payload], "hardware": moved,
                              "fragments": {k: sent[k] - frags[k] for k in sent}}
+            peer_after = xfrm_mib(Path("/proc/net/xfrm_stat").read_text())
+            results[size]["peer_xfrm_delta"] = {
+                key: value - peer_before[key] for key, value in peer_after.items()
+                if value != peer_before[key]
+            }
+            # Keep the failing size and peer refusal counters even when the
+            # assertion below prevents the final aggregate from being written.
+            r.record(f"ipv6-sa-oversized-{size}", results[size])
             observed = results[size]
             assert observed["delivered"] == 1 and observed["lan"]["too_big"] == [], (size, observed)
             assert moved[forward["cookie"]] == 1, (size, observed)

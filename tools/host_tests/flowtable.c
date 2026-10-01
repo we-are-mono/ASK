@@ -6633,6 +6633,10 @@ static void test_counter_accounting(void)
     assert(ft_l2_overhead(&framing) == ETH_HLEN + 2 * VLAN_HLEN + PPPOE_SES_HLEN);
     framing.in_vlans = 0;
     assert(ft_l2_overhead(&framing) == ETH_HLEN + PPPOE_SES_HLEN);
+    /* SEC removed the ingress stack and inserted one private identity tag. */
+    framing.in_vlans = 2;
+    framing.in_sa_handle = 1;
+    assert(ft_l2_overhead(&framing) == ETH_HLEN + VLAN_HLEN);
     /* An egress tag is pushed after the hit was counted and changes nothing. */
     framing = (struct cdx_ft_rule){ .out_vlans = 2, .out_session = { .present = true } };
     assert(ft_l2_overhead(&framing) == ETH_HLEN);
@@ -6660,6 +6664,13 @@ static void test_counter_accounting(void)
     e->hw->stats.bytes += 4;
     cls.stats = (struct flow_stats){0};
     assert(ft_stats(e, &cls) == 0 && cls.stats.pkts == 1 && cls.stats.bytes == 0);
+    /* The hardware counts the internal shim; conntrack counts only IP. */
+    e->rule.in_sa_handle = 1;
+    e->hw->stats.packets += 32;
+    e->hw->stats.bytes += 32 * (256 + ETH_HLEN + VLAN_HLEN);
+    cls.stats = (struct flow_stats){0};
+    assert(ft_stats(e, &cls) == 0 && cls.stats.pkts == 32 && cls.stats.bytes == 32 * 256);
+    e->rule.in_sa_handle = 0;
     assert(ft_remove(e) == 0 && !ft_count && !allocated && !live_hw);
     cls.nf_counter = false;
 }

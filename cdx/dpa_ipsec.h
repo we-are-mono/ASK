@@ -108,6 +108,9 @@ unsigned int cdx_dpa_ipsec_release_held_fqids(void);
 void cdx_dpa_ipsec_held_fqids_exit(bool settled);
 uint32_t get_fqid_to_sec(void *handle);
 uint32_t ipsec_get_to_cp_fqid(void *handle);
+uint32_t ipsec_get_key_tag(void *handle);
+void ipsec_share_key_tag(void *handle, void *other);
+bool cdx_ipsec_wait_sec_idle(void);
 
 struct sec_descriptor *get_shared_desc(void *handle);
 

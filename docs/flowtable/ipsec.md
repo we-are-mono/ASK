@@ -662,10 +662,10 @@ interface, 50 words. NXP's extended encapsulation descriptor, which an
 outbound SA overflowing that used to get, never stored its PDB back after a
 job: its counters stayed at zero, nothing ordered SEC's refetch of the
 sequence number against another DECO's update of it, and the number read back
-for xfrm never moved. It is gone. Nothing admitted comes near the limit, the
+for xfrm never moved. It is gone. With the internal SA-identity VLAN, the
 largest descriptor (CBC or CCM with a split HMAC key behind an IPv6 NAT-T
-outer header) taking 48 words, so an SA that would overflow it is a change to
-the builder: `cdx_ipsec_create_shareddescriptor()` warns once and refuses it.
+outer header) takes 49 words, leaving one word below the rejection threshold.
+An SA that would overflow it is a change to the builder: `cdx_ipsec_create_shareddescriptor()` warns once and refuses it.
 Every SA has counters, whatever its outer family, despite old
 comments in the builder that said IPv4 only. `cdx_ipsec_pdb_len()` places them
 past the outer header the encapsulation PDB carries: 20 or 40 bytes, plus 8

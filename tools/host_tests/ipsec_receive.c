@@ -26,6 +26,12 @@ typedef int gro_result_t;
 #define ETHERTYPE_IPV4 0x0800
 #define ETHERTYPE_IPV6 0x86dd
 #define ETH_HLEN 14
+#define ETH_ALEN 6
+#define VLAN_HLEN 4
+#define ETH_P_8021Q 0x8100
+struct ethhdr { unsigned char dst[6], src[6]; uint16_t h_proto; } __attribute__((packed));
+struct vlan_ethhdr { unsigned char dst[6], src[6]; uint16_t h_vlan_proto, h_vlan_TCI, h_vlan_encapsulated_proto; } __attribute__((packed));
+#define XFRM_DEV_OFFLOAD_IN 1
 #define raw_cpu_ptr(p) (p)
 #define phys_to_virt(a) ((void *)(uintptr_t)(a))
 #define qm_fd_contig 0
@@ -69,7 +75,7 @@ struct net_device {
     void *priv; unsigned long rx_dropped;
 };
 struct dpa_bp { unsigned count; void *dev; unsigned size; };
-struct xfrm_state { struct { long long use_time; } curlft; };
+struct xfrm_state { struct { long long use_time; } curlft; struct { unsigned dir; } xso; };
 struct sec_path { int len, olen, verified_cnt; struct xfrm_state *xvec[6]; unsigned ovec[24]; };
 struct sk_buff { struct net_device *dev; unsigned protocol, mac_len; struct sec_path path; bool has_path; unsigned char *data; };
 static unsigned refs, fd_releases, skb_frees, delivered, converted, sg_buffers, added, concurrent, unmapped;
@@ -95,7 +101,9 @@ static struct dpa_bp *dpa_bpid2pool(unsigned id) { (void)id; return &pool; }
 static void dma_unmap_single(void *dev, uintptr_t addr, unsigned size, int direction)
 { (void)dev; (void)addr; (void)size; (void)direction; assert(!unmapped && !converted); unmapped++; }
 static bool pskb_may_pull(struct sk_buff *skb, unsigned bytes)
-{ assert(skb->data && bytes == ETH_HLEN + 1); return !short_frame; }
+{ assert(skb->data && bytes == ETH_HLEN + VLAN_HLEN + 1); return !short_frame; }
+static unsigned char *skb_pull(struct sk_buff *skb, unsigned bytes)
+{ skb->data += bytes; return skb->data; }
 static struct { struct dpa_bp *ipsec_bp; } ipsecinfo = { .ipsec_bp = &pool };
 static void ipsec_pool_consumed(unsigned int count);
 static int dpaa_bp_alloc_n_add_buffs(struct dpa_bp *p, unsigned count, bool skb)
@@ -120,8 +128,8 @@ static void *skb_ext_find(struct sk_buff *skb, int kind)
 { (void)kind; return skb->has_path ? &skb->path : NULL; }
 static void *skb_ext_add(struct sk_buff *skb, int kind)
 { (void)kind; if (secpath_fail) return NULL; skb->has_path = true; return &skb->path; }
-static struct net_device *get_netdev_of_SA_by_fqid(unsigned fqid, unsigned short *handle)
-{ (void)fqid; *handle = 7; return no_device ? NULL : sa_device; }
+static struct net_device *get_netdev_of_SA_by_fqid(unsigned fqid, unsigned short *handle, unsigned short *tag)
+{ (void)fqid; *handle = 7; *tag = 0x345; return no_device ? NULL : sa_device; }
 static void *dev_net(struct net_device *dev) { return dev; }
 static struct xfrm_state *xfrm_state_lookup_byhandle(void *net, unsigned handle)
 { (void)net; assert(handle == 7); if (no_state) return NULL; refs++; return &state; }
@@ -162,6 +170,8 @@ static void netif_receive_skb(struct sk_buff *skb)
     assert(skb->path.olen == 0 && skb->path.verified_cnt == 0);
     for (unsigned i = 0; i < sizeof(skb->path.ovec) / sizeof(skb->path.ovec[0]); i++)
         assert(skb->path.ovec[i] == 0);
+    for (unsigned i = 0; i < 12; i++) assert(skb->data[i] == i + 1);
+    assert(skb->data == received_data + VLAN_HLEN);
     delivered++;
     dev_kfree_skb(skb);
 }
@@ -210,6 +220,11 @@ static void reset(void)
     refs = fd_releases = skb_frees = delivered = converted = unmapped = errors_logged = 0;
     no_device = no_state = napi_defer = refill_fail = secpath_fail = short_frame = false;
     memset(&packet, 0, sizeof(packet));
+    state.xso.dir = XFRM_DEV_OFFLOAD_IN;
+    for (unsigned i = 0; i < 12; i++) received_data[i] = i + 1;
+    received_data[12] = 0x81; received_data[13] = 0;
+    received_data[14] = 0x03; received_data[15] = 0x45;
+    received_data[16] = 8; received_data[17] = 0; received_data[18] = 0x45;
     memset(&packet.path, 0xa5, sizeof(packet.path));
     bp_count = 640;
     pool.count = 512;
@@ -238,18 +253,21 @@ int main(void)
         dq.fd.format = sg;
         dq.fd.addr = (uintptr_t)(sg ? table : frame);
         device.features = gro ? NETIF_F_GRO : 0;
-        for (unsigned fault = 0; fault < 8; fault++) {
+        for (unsigned fault = 0; fault < 11; fault++) {
             reset();
             no_device = fault == 1; no_state = fault == 2;
             refill_fail = fault == 3; secpath_fail = fault == 4;
             short_frame = fault == 7;
+            if (fault == 8) frame[15] ^= 1; /* another SA's tag */
+            if (fault == 9) frame[12] = 8;  /* absent shim */
+            if (fault == 10) state.xso.dir = 2; /* encrypted output miss */
             dq.fd.status = fault == 5 ? FM_FD_RX_STATUS_ERR_NON_FM : 0;
             dq.stat = fault == 6 ? 0 : QM_DQRR_STAT_FD_VALID;
             assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_consume);
             assert(!refs);
             if (!fault || fault == 3) assert(delivered == 1 && skb_frees == 1 && !fd_releases);
-            if (fault == 4 || fault == 7) assert(!delivered && skb_frees == 1 && !fd_releases);
-            if (fault == 1 || fault == 2 || fault == 5) assert(fd_releases == 1 && !skb_frees);
+            if (fault == 4 || (fault >= 7 && fault <= 9)) assert(!delivered && skb_frees == 1 && !fd_releases);
+            if (fault == 1 || fault == 2 || fault == 5 || fault == 10) assert(fd_releases == 1 && !skb_frees && !delivered);
             if (fault == 6) assert(!fd_releases && !skb_frees);
             /* A frame SEC refused is not expected here at all -- FMan counts
              * and drops those -- so one that arrives is said out loud. */
@@ -269,8 +287,8 @@ int main(void)
         }
         for (unsigned v6 = 0; v6 < 2; v6++) {
             reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0;
-            frame[12] = v6 ? 8 : 0x86; frame[13] = v6 ? 0 : 0xdd;
-            frame[14] = v6 ? 0x60 : 0x45;
+            frame[16] = v6 ? 8 : 0x86; frame[17] = v6 ? 0 : 0xdd;
+            frame[18] = v6 ? 0x60 : 0x45;
             assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_consume);
             assert(delivered == 1 && packet.protocol == htons(v6 ? ETHERTYPE_IPV6 : ETHERTYPE_IPV4));
             for (unsigned i = 0; i < sizeof(table); i++) assert(table[i] == 0);
