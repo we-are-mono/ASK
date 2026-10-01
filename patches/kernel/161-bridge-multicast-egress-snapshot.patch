@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 3474d9590ce8779022a9c9a92c8f7140f6361f5a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 18:49:36 +0200
 Subject: [PATCH] bridge: snapshot multicast data egress ports for L3 offload
@@ -35,6 +35,16 @@ locally originated model is unchanged. Export the same context's group
 membership interval, so state learned from the traffic can age on the
 bridge's clock.
 
+A source-specific entry that has just lost its last port group, and has
+no host membership, is answered as (*,G): its expiry is armed for the
+next tick and nothing reports it going, so reading it would report no
+port for a source the (*,G) EXCLUDE ports want, and the answer would
+outlive the entry. An empty entry that no expiry will ever reach -- left
+behind by a failed port-group allocation, or a deletion while the bridge
+was down -- is answered the same way: the hardware then delivers to the
+(*,G) EXCLUDE ports what the software path keeps dropping, which is the
+side RFC 3810 is on.
+
 PORT_MROUTER is left as it is: one boolean for both families, sent only
 when that union changes, which is what drivers count references by. A
 caller that needs one family's router change while the other remains a
@@ -43,8 +53,8 @@ router re-reads the snapshot on its own schedule.
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  include/linux/if_bridge.h |  30 +++++
- net/bridge/br_multicast.c | 262 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 292 insertions(+)
+ net/bridge/br_multicast.c | 272 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 302 insertions(+)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
 index c5fe3b2a53e8..f8b2b2939627 100644
@@ -102,10 +112,10 @@ index c5fe3b2a53e8..f8b2b2939627 100644
  {
  	return false;
 diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
-index d43b39ed61c7..1c0213c1e6b3 100644
+index d43b39ed61c7..837de8feda62 100644
 --- a/net/bridge/br_multicast.c
 +++ b/net/bridge/br_multicast.c
-@@ -5071,6 +5071,268 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
+@@ -5071,6 +5071,278 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
  }
  EXPORT_SYMBOL_GPL(br_multicast_has_router_adjacent);
  
@@ -212,6 +222,16 @@ index d43b39ed61c7..1c0213c1e6b3 100644
 +	if (snoop) {
 +		if (include)
 +			mdb = br_mdb_ip_get(br, &key);
++		/* An (S,G) entry with no port group and no host membership is
++		 * one br_multicast_del_pg() or the host leave has just emptied:
++		 * its expiry is armed for the next tick, and nothing reports it
++		 * going. Answer as the bridge will from then on, from (*,G);
++		 * read now, it would say no port wants a source the (*,G)
++		 * EXCLUDE ports all do, and the answer would stand until
++		 * something else asked again. A blocked source keeps its port
++		 * group, flagged, so it is not this. */
++		if (mdb && !mlock_dereference(mdb->ports, br) && !mdb->host_joined)
++			mdb = NULL;
 +		if (!mdb) {
 +			memset(&key.src, 0, sizeof(key.src));
 +			mdb = br_mdb_ip_get(br, &key);

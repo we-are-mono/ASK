@@ -480,8 +480,11 @@ MAC changed, a port that now carries the tag.
 **The listeners are the bridge's answer.** Where a flow's frames go is not read
 off the memberships. The bridge decides it per frame, and a switchdev object
 carries none of what it decides by: an `(S,G)` entry is looked up before the
-`(*,G)` one under IGMPv3 and MLDv2, a `(*,G)` INCLUDE port group is skipped, a
-port that blocks the source is skipped, multicast router ports receive
+`(*,G)` one under IGMPv3 and MLDv2 -- except an `(S,G)` entry just emptied of
+its last port group, which the bridge deletes on its next tick and which is
+read as the `(*,G)` it gives way to, since nothing reports its going -- a
+`(*,G)` INCLUDE port group is skipped, a port that blocks the source is
+skipped, multicast router ports receive
 everything, the ingress never receives its own frame, and an isolated port
 does not forward to another. So the worker asks the bridge, under RTNL,
 through `br_multicast_list_ports()` with the flow's ingress (patch 161), and

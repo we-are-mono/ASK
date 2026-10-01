@@ -29,6 +29,7 @@ import asyncio
 from collections import namedtuple
 from contextlib import AsyncExitStack, asynccontextmanager
 import json
+import time
 
 import pytest
 import pytest_asyncio
@@ -662,6 +663,97 @@ async def test_flowtable_service_multicast_bridged_ssm_beside_asm(multicast_rig,
         in_hardware(after, streams=2)
     # A discard ages out only once its stream has stood still for a whole
     # refresh, which a count taken just after its last frame does not show.
+    final = await r.settle(lambda s: not mcast_rows(s, group) and
+                           lan_groups(s) == lan_groups(r.initial),
+                           f"v{family}: no record left", timeout=30)
+    assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)
+
+
+# A query every two seconds: each round has both hosts report again.
+CHURN_QUERY_INTERVAL = 200
+CHURN_ROUNDS = 10
+
+
+async def s1_listed(r, bridge, group, source, port=TARGET_LAN_IF):
+    """Whether the bridge holds `source` for `group` on `port`: an (S,G) port
+    group of its own, or an entry on the (*,G) port group's source list."""
+    entries = json.loads((await command(r.target, r.session, "bridge", "-j", "-d", "mdb", "show",
+                                        "dev", bridge))["stdout"] or "[]")
+    for block in entries:
+        for entry in block.get("mdb", []):
+            if entry.get("port") != port or not same(entry.get("grp", ""), group):
+                continue
+            if entry.get("src") and same(entry["src"], source):
+                return True
+            if any(same(s.get("address", ""), source) for s in entry.get("source_list", [])):
+                return True
+    return False
+
+
+@pytest.mark.parametrize("family", [4, 6])
+async def test_flowtable_service_multicast_bridged_ssm_beside_asm_through_queries(multicast_rig,
+                                                                                  mcast_bridge, family):
+    """The same two hosts, through round after round of queries.
+
+    Each round the SSM host's INCLUDE{S1} puts S1 back on the port's source
+    list and the ASM host's EXCLUDE{} takes it off again -- RFC 3810's
+    EXCLUDE (X,Y) + IS_EX (A) deletes X-A -- so the bridge's (S1,G) entry
+    loses its last port group every round. For a tick after that the bridge
+    still holds the emptied entry, expiring; the learner re-derives on the
+    port group's removal. The port wants S1 all along, through (*,G)
+    EXCLUDE{}, and S1 has to be carried to it at every sample: never a
+    discard. Read from the emptied entry, the snapshot would say no port wants
+    S1, and S1 would stay dropped in hardware until the next re-derivation --
+    the SSM host's next report, or the refresh. The bridge's own table is
+    sampled beside the adapter's, and the rounds have to be seen taking S1
+    off the port, or the case proved nothing."""
+    r = multicast_rig
+    group, first, second = FILTER_GROUP[family], wan_source_address(family), OTHER_SOURCE[family]
+    version = FILTER_VERSION[family]
+    configs = [stream(family, group, hops=64, source=s) for s in (first, second)]
+    async with AsyncExitStack() as stack:
+        # The restarted querier sends its startup queries first, and their
+        # interval was fixed when the bridge was made, at a quarter of the
+        # default query interval: half a minute, longer than all the rounds.
+        await stack.enter_async_context(bridge_settings(r, mcast_bridge, **FILTER_TIMERS,
+                                                        query_interval=CHURN_QUERY_INTERVAL,
+                                                        startup_query_interval=CHURN_QUERY_INTERVAL))
+        other = await stack.enter_async_context(second_host(r.lan))
+        await stack.enter_async_context(host(
+            r.lan, family=family, group=group, iface=LAN_NIC, mode="ssm", version=version,
+            source=first))
+        await stack.enter_async_context(host(
+            r.lan, family=family, group=group, iface=other, mode="asm", version=version))
+        await learn(r, configs, lambda s: carried_to(s, group, first) and carried_to(s, group, second),
+                    f"v{family}: both sources carried")
+        samples, seconds = [], CHURN_ROUNDS * CHURN_QUERY_INTERVAL / 100
+        listed, removals = await s1_listed(r, mcast_bridge, group, first), 0
+        deadline = time.monotonic() + seconds
+        keep = asyncio.create_task(trickle(r, configs, seconds))
+        try:
+            while time.monotonic() < deadline:
+                state = await r.proc()
+                row = flow_row(state, group, first)
+                samples.append(row and row["state"])
+                assert carried_to(state, group, first), (f"v{family}: S1 left the port", row,
+                                                         samples[-5:])
+                # S1 on the port's source list, or its own port group: what
+                # each ASM report takes away.
+                now = await s1_listed(r, mcast_bridge, group, first)
+                removals += listed and not now
+                listed = now
+                await asyncio.sleep(0.1)
+        finally:
+            keep.cancel()
+            await asyncio.gather(keep, return_exceptions=True)
+        r.record(f"ssm-asm-queries-v{family}", {"samples": samples, "removals": removals})
+        assert len(samples) >= CHURN_ROUNDS, samples
+        assert removals >= 3, (f"v{family}: the rounds never took S1 off the port", removals)
+        together = await r.window(configs, [(r.lan, {LAN_NIC: None})], ingress=TARGET_WAN_IF,
+                                  label=f"ssm-asm-queries-v{family}")
+        for source in (first, second):
+            assert delivered(together, streamed(together, group, source), LAN_NIC), source
+        in_hardware(together, streams=2)
     final = await r.settle(lambda s: not mcast_rows(s, group) and
                            lan_groups(s) == lan_groups(r.initial),
                            f"v{family}: no record left", timeout=30)
