@@ -281,7 +281,7 @@ static int cdx_create_fq_in_procfs(struct qman_fq *fq,
 	else
 		snprintf(node->name, sizeof(node->name), "%d", fq->fqid);
 	node->fq = fq;
-	node->proc_fs = proc_create_data(node->name, 0444,proc_dir,  &proc_fqid_stats, node);
+	node->proc_fs = proc_create_data(node->name, 0400,proc_dir,  &proc_fqid_stats, node);
 	if (!node->proc_fs)
 	{
 		kfree(node);

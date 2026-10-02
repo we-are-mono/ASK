@@ -25,7 +25,9 @@ import time
 
 import pytest
 
+from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
+from test_flowtable_offload import ARTIFACTS, console_python
 
 # Documentation-range addresses (RFC 2544 benchmarking block), distinct from
 # every other IPsec file's so the tests can run in any order.
@@ -45,6 +47,32 @@ async def _run(session, agent, *argv, expect_rc=0):
     if expect_rc is not None:
         assert result["rc"] == expect_rc, (argv, result)
     return result
+
+
+async def _check_queue_permissions():
+    script = """
+import os
+from pathlib import Path
+paths = list(Path('/proc/fqid_stats/sa').glob('*/*_to_sec'))
+assert paths, 'no SEC queues to inspect'
+for path in paths:
+    assert path.stat().st_mode & 0o777 == 0o400, path
+    assert path.stat().st_uid == 0, path
+    assert 'contexta' in path.read_text(), path
+os.setgroups([])
+os.setgid(65534)
+os.setuid(65534)
+for path in paths:
+    try:
+        path.read_text()
+    except PermissionError:
+        continue
+    raise AssertionError('unprivileged read succeeded: ' + str(path))
+print('root can read SEC queues; nobody is denied')
+"""
+    with Console.target(log_path=str(ARTIFACTS / "sec-proc-permissions-uart.log")) as con:
+        await asyncio.to_thread(con.login, "root", None)
+        await console_python(con, script)
 
 
 async def test_esp_hw_offload_advertised(aiohttp_session, target_agent):
@@ -149,6 +177,7 @@ async def test_packet_offload_sa_install(aiohttp_session, target_agent, update_s
                                "src", LOCAL, "dst", PEER, "proto", "esp", "spi", SPI)
             out = shown["stdout"]
         assert "crypto offload parameters" in out and TARGET_WAN_IF in out and "packet" in out, out
+        await _check_queue_permissions()
     finally:
         await _run(aiohttp_session, target_agent, *delete, expect_rc=None)
         for argv in teardown:
