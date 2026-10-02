@@ -20,6 +20,8 @@ SRCS := \
 	nft.c \
 	nft_process.c \
 	supervisor.c \
+	health.c \
+	recovery.c \
 	log.c \
 	enumerate.c \
 	netlink.c \

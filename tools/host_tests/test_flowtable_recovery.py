@@ -24,6 +24,7 @@ def controller(tmp_path):
     replacements = {
         "/run/ask-flowtable": str(tmp_path),
         "/proc/cdx_flowtable": str(tmp_path / "backend"),
+        "/proc/sys/kernel/random/boot_id": str(tmp_path / "boot_id"),
         "/sys/module/cdx": str(tmp_path / "cdx"),
         "/sys/module/ask_flowtable/parameters/multicast": str(tmp_path / "multicast"),
         "/run/ask-flowtable/policy.lock": str(tmp_path / "lock"),
@@ -86,6 +87,7 @@ int ft_enumerate(struct ft_policy *p) {
         "-DFT_SUPERVISOR_MIN_MS=60", "-DFT_SUPERVISOR_MAX_MS=240",
         "-DFT_SUPERVISOR_STABLE_MS=600", "-DFT_SUPERVISOR_STOP_MS=100",
         "-DFT_SERVICE_WAIT_MS=1500",
+        "-DFT_HEALTH_TIMEOUT_MS=500",
         *map(str, sorted(src.glob("*.c"))), "-o", str(binary),
     ], check=True)
     shutil.copyfile(Path(__file__).with_name("flowtable_nft.py"), tmp_path / "nft")
@@ -177,6 +179,82 @@ def test_quiet_network_retries_failed_apply(controller):
         c.wait(lambda: (c.root / "fault-consumed").exists())
         c.wait(c.ready)
         assert len(c.calls("-f")) == 2
+
+
+def test_platform_health_and_reboot_budget(controller):
+    """The OS owns resets; ASK spends a persistent attempt once per boot."""
+    c = controller
+    c.run("health")
+    c.backend(fatal=1, fatal_terminal=0)
+    c.run("health")  # an in-place restart does not require a reboot
+    c.backend(fatal_terminal=1)
+    reason = c.root / "cdx/parameters/flowtable_terminal_reason"
+    reason.parent.mkdir()
+    reason.write_text("restart budget exhausted\n")
+    failed = c.run("health", check=False)
+    assert failed.returncode == 1 and "restart budget exhausted" in failed.stderr
+    (c.root / "backend").unlink()
+    assert c.run("health", check=False).returncode == 1  # CDX still owns the latch
+    reason.write_text("")
+    c.run("health")  # deliberately unloaded ASK, ordinary Linux networking
+    (c.root / "backend").write_text("fatal_terminal 0\n")
+    assert c.run("health", check=False).returncode == 1
+    (c.root / "backend").unlink()
+    os.mkfifo(c.root / "backend")
+    started = time.monotonic()
+    failed = c.run("health", check=False)
+    assert failed.returncode == 1 and "deadline" in failed.stderr
+    assert time.monotonic() - started < 2
+    reason.write_text("restart budget exhausted\n")
+
+    # Both utilities share one stand-in environment. Script input must contain
+    # only the ASK key; the firmware's rollback state must survive every update.
+    for name in ("fw_printenv", "fw_setenv"):
+        tool = c.root / name
+        tool.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ["FT_TEST_ROOT"])
+if (root / "env-error").exists(): sys.exit(1)
+path = root / "environment"
+env = json.loads(path.read_text())
+if pathlib.Path(sys.argv[0]).name == "fw_printenv":
+    for key, value in env.items(): print(f"{key}={value}")
+else:
+    assert sys.argv[1] == "ask_recovery" and len(sys.argv) == 3
+    env["ask_recovery"] = sys.argv[2]
+    path.write_text(json.dumps(env))
+    with (root / "env-writes").open("a") as out: out.write("write\\n")
+''')
+        tool.chmod(0o755)
+    platform = {"bootcount": "2", "bootlimit": "3", "upgrade_available": "1", "slot": "b"}
+    envfile = c.root / "environment"
+    envfile.write_text(json.dumps(platform))
+    for boot in range(1, 5):
+        (c.root / "boot_id").write_text(f"00000000-0000-0000-0000-{boot:012d}\n")
+        result = c.run("recovery-arm", check=False)
+        assert result.returncode == (2 if boot == 4 else 0), result.stderr
+        if boot < 4:
+            writes = (c.root / "env-writes").read_text()
+            c.run("recovery-arm")
+            assert (c.root / "env-writes").read_text() == writes
+            c.run("recovery-failed")
+        record = json.loads(envfile.read_text())
+        assert record["ask_recovery"].split(" ", 2)[0] == str(min(boot, 3))
+        assert record["ask_recovery"].split(" ", 2)[2] == "restart budget exhausted"
+        assert {key: record[key] for key in platform} == platform
+    c.run("recovery-clear")
+    writes = (c.root / "env-writes").read_text()
+    c.run("recovery-clear")
+    c.run("recovery-arm")
+    assert (c.root / "env-writes").read_text() == writes
+    record = json.loads(envfile.read_text())
+    assert record["ask_recovery"].split(" ", 2)[0] == "0"
+    for bad in ("-1", "4", "junk", ""):
+        record["ask_recovery"] = bad + " " + record["ask_recovery"].split(" ", 1)[1]
+        envfile.write_text(json.dumps(record))
+        assert c.run("recovery-arm", check=False).returncode == 1
+    (c.root / "env-error").touch()
+    assert c.run("recovery-arm", check=False).returncode == 1
 
 
 def test_hung_install_cannot_commit_after_timeout(controller):

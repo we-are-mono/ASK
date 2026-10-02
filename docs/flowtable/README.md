@@ -21,6 +21,7 @@ Current checkpoint: IPv6, 802.1Q VLAN, bridging, PPPoE, IPv4 TCP/UDP NAT and
 | Current interfaces, ownership, locking and lifetime contracts | [Architecture](architecture.md) |
 | Accepted foundation, recovery matrix and verification limits | [Foundation checkpoint](foundation.md) |
 | Controller recovery, fault-injection coverage and remaining resilience work | [Resilience test plan](resilience.md) |
+| OS watchdog configuration and the U-Boot reboot budget | [Platform integration](../../integration/README.md) |
 | Configure scope/exclusions, revoke active flows, migrate CMM settings | [Policy guide](policy.md) |
 | Supported NAT mappings and their focused proof | [NAT guide](nat.md) |
 | IPv6 eligibility, what the family really changes, and its proof | [IPv6 guide](ipv6.md) |

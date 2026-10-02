@@ -1,0 +1,12 @@
+[Unit]
+Description=Check ASK recovery budget before enabling hardware offload
+Before=ask-recovery.service ask-flowtable.service
+
+[Service]
+Type=oneshot
+# Refuse to start protected ASK unless PID 1 actually owns the watchdog.
+ExecStartPre=/bin/sh -c 'readlink /proc/1/fd/* | grep -qx /dev/watchdog0'
+ExecStart=/usr/sbin/ask-flowtable recovery-arm
+RemainAfterExit=yes
+# Let fw_setenv complete its flash transaction.
+TimeoutStartSec=infinity

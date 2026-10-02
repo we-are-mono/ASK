@@ -1,0 +1,15 @@
+[Unit]
+Description=Monitor ASK datapath health
+Requires=ask-recovery-budget.service
+After=ask-recovery-budget.service
+Before=ask-flowtable.service
+OnFailure=ask-recovery-reboot.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/libexec/ask-recovery-monitor systemd
+WatchdogSec=15s
+WatchdogSignal=SIGKILL
+TimeoutStartSec=10s
+TimeoutStopSec=1s

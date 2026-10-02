@@ -628,7 +628,7 @@ static int cmd_daemon(const char *conf)
 
 static int usage(void)
 {
-	fprintf(stderr, "usage: ask-flowtable {apply|stop|resume|status|check|render|daemon|supervise|service-start|service-stop|service-restart|service-status} [--config PATH]\n");
+	fprintf(stderr, "usage: ask-flowtable {apply|stop|resume|status|check|render|daemon|health|recovery-arm|recovery-failed|recovery-clear|supervise|service-start|service-stop|service-restart|service-status} [--config PATH]\n");
 	return 2;
 }
 
@@ -660,6 +660,13 @@ int main(int argc, char **argv)
 	 * parse error): take a clean error from run(), not SIGPIPE death. */
 	signal(SIGPIPE, SIG_IGN);
 
+	if (!strcmp(cmd, "health"))
+		return ft_health(&ctx) ? (fprintf(stderr, "ask-flowtable: %s\n", ctx.err), 1) : 0;
+	if (!strncmp(cmd, "recovery-", 9)) {
+		int rc = ft_recovery(&ctx, cmd + 9);
+		if (rc) fprintf(stderr, "ask-flowtable: %s\n", ctx.err);
+		return rc;
+	}
 	if (!strcmp(cmd, "daemon"))
 		return cmd_daemon(conf);
 	if (!strcmp(cmd, "supervise"))

@@ -190,22 +190,8 @@ result independently of those temporary files.
 - [x] **A299 — a restart that never completed never went terminal.** Fixed: a port not idle or a barrier rejected is retried
   every 250 ms, and twelve unanswered tries in a restart (seconds) make the latch terminal; RTNL and the hold never count (_:/^cdx: give up a restart the hardware stops answering_).
 
-- [ ] **A300 — a terminal latch, or a hang, waits for a person to reboot the box.** A terminal
-  latch (`fatal_terminal 1`, `cdx/cdx_flowtable_backend.c`) leaves the classifier ports stopped
-  and logs "reboot required"; the box forwards nothing on them until someone reboots it. Worse,
-  a CPU hard-locked holding RTNL (seen with a wedged DPAA port) or a stuck workqueue leaves no
-  software able to reboot at all. Fix, two layers: (1) on terminal, `orderly_reboot()` behind
-  a module parameter -- on in production builds, off on the test image, whose budget and unload
-  kinds go terminal on purpose -- with a reboot-loop cap (say 3 per hour, counted across boots)
-  after which it stays down and says so, and the terminal reason persisted first (pstore/ramoops
-  or flash) so the evidence survives the reset; (2) a hardware watchdog for what (1) cannot
-  reach: the LS1046A's SP805s (`sp805_wdt`; check the gateway-dk DT enables them and what a
-  timeout resets), fed from userspace (procd on OpenWrt, systemd or busybox on Armbian) behind a
-  health check that stops feeding on `fatal_terminal` or an unresponsive RTNL. Verify on the DUT
-  first that a watchdog reset reboots the board cleanly: an earlier OP-TEE warm-reset panic
-  needed a physical power-cycle. Regression: the test image with the parameter forced on, a
-  terminal kind reboots within the timeout and the next boot reads the persisted reason; a
-  forced hang (sysrq hard lockup) is reset by the watchdog; the cap holds after three loops.
+- [x] **A300.** Bounded terminal/RTNL health checks and a three-boot U-Boot budget; OS watchdog configurations live in `integration/`.
+  DUT: terminal failure, RTNL hard lock and stopped feeder reset cleanly; fourth attempt refused (_:/^flowtable: integrate datapath recovery with platform watchdogs_).
 
 - [x] **A301.** Keep local multicast copies in Linux; routed forwarding remains eligible. 50 host tests pass.
   (_:/^cdx: keep local multicast delivery in software_).

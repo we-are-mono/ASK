@@ -84,6 +84,7 @@ IMAGE_INSTALL = " \
 # Kept separate so it's obvious what the test image adds on top of the base.
 IMAGE_INSTALL:append = " \
     ask-test-agent \
+    libubootenv-bin \
     kernel-module-dummy \
     kernel-module-act-mirred \
     kernel-module-nft-meta-bridge \

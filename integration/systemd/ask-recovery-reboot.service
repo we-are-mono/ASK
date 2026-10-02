@@ -1,0 +1,10 @@
+[Unit]
+Description=Record ASK failure and reboot
+SuccessAction=reboot-immediate
+FailureAction=reboot-immediate
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/sbin/ask-flowtable recovery-failed
+TimeoutStartSec=10s
+TimeoutStopSec=1s

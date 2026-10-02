@@ -39,6 +39,12 @@ struct ft_backend {
 	uint32_t qos_mark_mask;
 };
 
+/* Read-only probe with a five-second deadline, including blocked kernel reads. */
+int ft_health(struct ft_ctx *ctx);
+bool ft_terminal_reason(char *reason, size_t n);
+/* Optional U-Boot budget hooks for the platform watchdog manager. */
+int ft_recovery(struct ft_ctx *ctx, const char *verb);
+
 /* Emit a backend state as a JSON object (no trailing newline) to a buffer. */
 int ft_backend_json(const struct ft_backend *b, char *buf, size_t n);
 

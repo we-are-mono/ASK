@@ -47,6 +47,9 @@ static unsigned int ft_live;
  * start again. All under the control mutex; ft_terminal is also read without
  * it. */
 static bool ft_terminal, ft_restart_notify, ft_stall_reported;
+static char ft_terminal_reason[128];
+module_param_string(flowtable_terminal_reason, ft_terminal_reason, sizeof(ft_terminal_reason), 0444);
+MODULE_PARM_DESC(flowtable_terminal_reason, "Reason the datapath requires a reboot");
 static unsigned int ft_restarts, ft_window_restarts, ft_episode_resolved, ft_hw_tries;
 static unsigned int ft_resume_failures;
 static u32 ft_epoch = 1;
@@ -212,6 +215,7 @@ static void cdx_ft_set_terminal(const char *why)
 {
 	if (ft_terminal)
 		return;
+	strscpy(ft_terminal_reason, why, sizeof(ft_terminal_reason));
 	WRITE_ONCE(ft_terminal, true);
 	pr_err("cdx flowtable: hardware stopped after unproven deletion; reboot required (%s)\n",
 	       why);
