@@ -3045,6 +3045,38 @@ static void test_bridge_fdb(void)
     netdev_registry_len = 0;
     set.attr = NULL;
 
+    /* switchdev's chain is global. Foreign-namespace bridge changes must
+     * never reach init_net's learners or queue stopped-port cleanup. Use
+     * the same device identity to make every missing guard observable. */
+    struct net foreign_bridge_net = {0};
+    unsigned foreign_kicks = mroute_kicks, foreign_bridges = mc_bridge_changes;
+    unsigned foreign_objects = mc_objects, foreign_sweeps = stopped_scheduled;
+    u64 foreign_invalidations = ft_stp_invalidations;
+    out.net = &foreign_bridge_net;
+    set.info.dev = &out;
+    const struct switchdev_attr *foreign_attrs[] = {
+        &filtering, &protocol, &msti, &vlan_state, &remap, &mst_off,
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(foreign_attrs); i++) {
+        set.attr = foreign_attrs[i];
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(!set.handled);
+    }
+    struct switchdev_obj *foreign_objs[] = { &vlan_obj, &mdb_obj };
+    obj.info.dev = &out;
+    for (unsigned i = 0; i < ARRAY_SIZE(foreign_objs); i++) {
+        obj.obj = foreign_objs[i];
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_DEL, &obj) == NOTIFY_DONE);
+        assert(!obj.handled);
+    }
+    assert(mroute_kicks == foreign_kicks && mc_bridge_changes == foreign_bridges);
+    assert(mc_objects == foreign_objects && stopped_scheduled == foreign_sweeps);
+    assert(ft_stp_invalidations == foreign_invalidations && !atomic_read(&ft_invalid));
+    assert(!handle.invalid && allocated == records && out.refs == out_refs);
+    out.net = NULL;
+    set.attr = NULL;
+
     /* A port whose egress queues changed under it -- an HTB tree coming or
      * going -- re-installs everything that transmits on it: its flows are
      * retired to be readmitted against the new queues, and its SAs and

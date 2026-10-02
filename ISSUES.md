@@ -216,6 +216,9 @@ result independently of those temporary files.
 - [x] **A303.** Software-SA updates already release temporary hardware SAs in the pinned kernel; DUT regression verifies cleanup and reuse.
   (_:/^tests: verify offload cleanup when updating a software SA_).
 
+- [x] **A304.** Ignore switchdev events outside init_net; host tests and DUT bridge churn preserve both hardware directions.
+  (_:/^cdx: ignore switchdev events from foreign network namespaces_).
+
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN

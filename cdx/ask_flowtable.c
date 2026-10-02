@@ -4708,6 +4708,9 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 	const struct switchdev_notifier_port_obj_info *obj;
 	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
 
+	if (!dev || !net_eq(dev_net(dev), &init_net))
+		return NOTIFY_DONE;
+
 	switch (event) {
 	case SWITCHDEV_PORT_OBJ_ADD:
 	case SWITCHDEV_PORT_OBJ_DEL:
@@ -4750,10 +4753,8 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 			 * learner, a flow's ports and host delivery for the
 			 * bridged one. The kernel snapshot, not the event's
 			 * coarse boolean, is authority for both. */
-			if (dev && net_eq(dev_net(dev), &init_net)) {
-				ft_mr_kick();
-				ft_mc_bridge_changed(dev);
-			}
+			ft_mr_kick();
+			ft_mc_bridge_changed(dev);
 			/* A port STP takes out of FORWARDING carries nothing in
 			 * the bridge from here on, while its hardware entries
 			 * would forward on in both directions under the shared
@@ -4766,7 +4767,7 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 			 * MST events, on the bridge itself, retire every port of
 			 * it; admission keeps such a bridge out of hardware, so
 			 * what they reach is software. */
-			if (dev && ft_stp_stopped(attr->attr)) {
+			if (ft_stp_stopped(attr->attr)) {
 				ft_device_retire(dev, &ft_stp_invalidations);
 				ft_port_stopped(dev);
 			}
@@ -4781,8 +4782,6 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 	default:
 		return NOTIFY_DONE;
 	}
-	if (!dev)
-		return NOTIFY_DONE;
 	/* A routed group that expands through a bridge derives every
 	 * listener's tag from exactly the three settings this case carries, so
 	 * a change to any of them makes its recorded set describe something
