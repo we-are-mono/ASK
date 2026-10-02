@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <linux/if_ether.h>
 
 typedef uint8_t u8;
 typedef uint32_t u32;
@@ -35,7 +37,12 @@ static bool test_bit(unsigned nr, const unsigned long *addr) { return (*addr >> 
 
 enum flow_offload_tuple_dir { FLOW_OFFLOAD_DIR_ORIGINAL, FLOW_OFFLOAD_DIR_REPLY,
                               FLOW_OFFLOAD_DIR_MAX };
-struct flow_offload_tuple { enum flow_offload_tuple_dir dir; unsigned mtu; };
+struct nf_flow_session { int lower_ifindex; uint16_t id; u8 h_dest[ETH_ALEN]; };
+struct flow_offload_tuple {
+    enum flow_offload_tuple_dir dir;
+    unsigned mtu;
+    struct nf_flow_session session;
+};
 struct flow_offload_tuple_rhash { struct flow_offload_tuple tuple; };
 struct flow_offload {
     struct flow_offload_tuple_rhash tuplehash[FLOW_OFFLOAD_DIR_MAX];
@@ -54,8 +61,14 @@ struct ipv6hdr { u8 nexthdr, hop_limit; };
 struct sk_buff {
     unsigned len;
     unsigned long _nfct;
+    uint16_t protocol;
+    bool mac_header_set;
+    struct ethhdr ethernet;
     union { struct iphdr ip; struct ipv6hdr ip6; } header;
 };
+static bool skb_mac_header_was_set(const struct sk_buff *skb) { return skb->mac_header_set; }
+static const struct ethhdr *eth_hdr(const struct sk_buff *skb) { return &skb->ethernet; }
+static bool ether_addr_equal(const u8 *a, const u8 *b) { return !memcmp(a, b, ETH_ALEN); }
 static unsigned char *skb_network_header(struct sk_buff *skb) { return (unsigned char *)&skb->header; }
 static struct iphdr *ip_hdr(struct sk_buff *skb) { return &skb->header.ip; }
 static struct ipv6hdr *ipv6_hdr(struct sk_buff *skb) { return &skb->header.ip6; }
@@ -182,6 +195,32 @@ static void family(forward_fn fn)
     }
     assert(flow.torn_down && rewritten == 5);
     assert(ct.ct_general.use == 1 && other.ct_general.use == 1);
+
+    /* PPPoE uses the opposite tuple's concentrator identity. Rejected frames
+     * must retain their original conntrack and take no new reference. */
+    const u8 peer[ETH_ALEN] = { 2, 3, 4, 5, 6, 7 };
+    for (unsigned dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
+        struct nf_flow_session *session = &flow.tuplehash[!dir].tuple.session;
+        skb.protocol = htons(ETH_P_PPP_SES);
+        memcpy(skb.ethernet.h_source, peer, ETH_ALEN);
+        memcpy(session->h_dest, peer, ETH_ALEN);
+        for (unsigned invalid = 0; invalid < 3; invalid++) {
+            session->lower_ifindex = invalid == 0 ? 0 : in.ifindex;
+            skb.mac_header_set = invalid != 1;
+            skb.ethernet.h_source[5] = peer[5] ^ (invalid == 2);
+            before = accounted;
+            nf_conntrack_get(&other.ct_general);
+            nf_ct_set(&skb, &other, IP_CT_ESTABLISHED);
+            assert(forward(fn, &table, &flow, dir, &skb) == 0);
+            assert(skb_nfct(&skb) == &other.ct_general && other.ct_general.use == 2);
+            assert(ct.ct_general.use == 1 && accounted == before);
+            nf_reset_ct(&skb);
+        }
+        skb.ethernet.h_source[5] = peer[5];
+        assert(forward(fn, &table, &flow, dir, &skb) == 1);
+        assert(skb_nfct(&skb) == &ct.ct_general && ct.ct_general.use == 2);
+        nf_reset_ct(&skb);
+    }
 }
 
 int main(void)

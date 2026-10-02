@@ -1,8 +1,12 @@
-"""SEC identity stays out of the lookup key and is encoded as a private VLAN."""
+"""IPsec classifier keys match the physical and SEC port layouts."""
 import os
 from pathlib import Path
+import re
+import struct
 import subprocess
 import xml.etree.ElementTree as ET
+
+from test_qos_lifecycle import function
 
 ROOT = Path(__file__).resolve().parents[2]
 FIELDS = {"ethernet.src": 6, "ethernet.dst": 6, "ethernet.type": 2,
@@ -59,3 +63,63 @@ def test_soft_parser_scope():
     assert pppoe.get('expr') == '$logicalportid != 9'
     vlan = tree.find("protocol[@name='vlanschema']/execute-code/before/if")
     assert vlan.get('expr').startswith('($logicalportid == 9) and ')
+
+
+def test_natt_keys_match_the_physical_and_sec_tables(tmp_path):
+    common = (ROOT / "cdx/cdx_common.h").read_text()
+    control = (ROOT / "cdx/control_ipsec.h").read_text()
+    ioctl = (ROOT / "cdx/cdx_ioctl.h").read_text()
+    source = tmp_path / "natt_key.c"
+    source.write_text(r"""
+#include <arpa/inet.h>
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define DPA_PACKED __attribute__((packed))
+#define cpu_to_be16 htons
+#define PROTO_IPV4 4
+""" + common[common.index("struct ipv4_tcpudp_key{"):
+             common.index("#define MAX_KEY_SIZE")]
+        + "\n".join(re.findall(r"^#define CDX_UNICAST\w*KEY_SIZE\s.*$", ioctl, re.M)) + "\n"
+        + "\n".join(re.findall(r"^#define CDX_DPA_IPSEC_(?:IN|OUT)BOUND\s.*$", control, re.M))
+        + r"""
+typedef struct {
+    int family, direction;
+    struct { uint32_t saddr[4]; struct { uint32_t a6[4]; } daddr; } id;
+    struct { uint16_t sport, dport; } natt;
+} SAEntry, *PSAEntry;
+struct en_exthash_tbl_entry { struct { uint8_t key[64]; } hashentry; };
+""" + function((ROOT / "cdx/cdx_dpa_ipsec.c").read_text(), "fill_natt_key_info")
+        + r"""
+int main(void) {
+    for (int family = 4; family <= 6; family += 2) {
+        for (int inbound = 0; inbound <= 1; inbound++) {
+            SAEntry sa = {.family = family, .direction = inbound ?
+                CDX_DPA_IPSEC_INBOUND : CDX_DPA_IPSEC_OUTBOUND, .natt = {4500, 31000}};
+            struct en_exthash_tbl_entry entry;
+            for (int i = 0; i < 16; i++) {
+                ((uint8_t *)sa.id.saddr)[i] = i + 1;
+                ((uint8_t *)sa.id.daddr.a6)[i] = i + 17;
+            }
+            memset(&entry, 0xa5, sizeof(entry));
+            int size = fill_natt_key_info(&sa, &entry, 7);
+            assert(size > 0 && size < 64 && entry.hashentry.key[size] == 0xa5);
+            for (int i = 0; i < size; i++) printf("%02x", entry.hashentry.key[i]);
+            puts("");
+        }
+    }
+}
+""")
+    binary = tmp_path / "natt_key"
+    subprocess.run([os.environ.get("HOSTCC", "cc"), "-Wall", "-Wextra", "-Werror",
+                    "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+                    str(source), "-o", str(binary)], check=True)
+    actual = subprocess.check_output([str(binary)], text=True).splitlines()
+    expected = []
+    for address_size, guard_size in ((4, 42), (16, 17)):
+        addresses = bytes(range(1, address_size + 1)) + bytes(range(17, 17 + address_size))
+        ports = struct.pack("!HH", 4500, 31000)
+        expected.extend((b"\x07" + addresses + b"\x11" + ports,
+                         b"\x07" + addresses + ports + b"\x11" + bytes(guard_size)))
+    assert actual == [key.hex() for key in expected]

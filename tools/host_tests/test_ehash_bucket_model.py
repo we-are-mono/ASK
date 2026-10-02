@@ -59,14 +59,14 @@ def test_bucket_model_matches_the_sdk(tmp_path):
     run = kernel_hash(tmp_path)
     rng = random.Random(295)
     cases = [(bytes(rng.randrange(256) for _ in range(size)), mask, shift)
-             for size in (10, 14, 22, 38) for mask in (0x7FFF, 0xFF, 0xF) for shift in (0, 1, 2)
+             for size in (10, 14, 22, 38, 56) for mask in (0x7FFF, 0xFF, 0xF) for shift in (0, 1, 2)
              for _ in range(20)]
     assert run(cases) == [model.bucket(key, mask, shift) for key, mask, shift in cases]
 
 
 def test_crowded_ipv4_ports_share_a_bucket_whatever_surrounds_them(tmp_path):
     run = kernel_hash(tmp_path)
-    pairs = model.crowded_ipv4([48271, 48273, 48275, 48277])
+    pairs = model.crowded_ipv4([48271, 48274, 48275, 48277])
     assert len({s for s, _ in pairs}) == 4 and all(1024 <= s < 32768 for s, _ in pairs)
     rng = random.Random(1)
     for _ in range(16):

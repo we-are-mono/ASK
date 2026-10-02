@@ -242,11 +242,15 @@ async def recover(r, fault):
             unchanged(initial, retired, [0, 1], flows)
             held = time.monotonic()
             while time.monotonic() - held < 6:
-                # Traffic can make smcrouted create a negative MFC. Keep the
-                # target quiet in ADD-allocation cases so restoration really
-                # adds a missing group rather than replacing a known MFC.
+                # Traffic can create a negative MFC or a hardware discard
+                # entry. Keep allocation cases quiet so restoration adds a
+                # missing group instead of updating an existing entry.
                 await transfer(r, p, label + '-unavailable', target=False,
-                               probe_target=fault not in ('add-event-failslab', 'group-failslab'))
+                               probe_target=fault not in ('install-failslab', 'add-event-failslab', 'group-failslab'))
+            if fault == 'install-failslab' and r.multicast_kind == 'mcast':
+                # An idle discard retires at the next refresh. Require that
+                # before arming an ADD fault; a live entry uses REPLACE.
+                await r.wait(lambda s: row(s, target, 'mcast') is None, timeout=12)
             # Restoration touches only the MFC owner. No apply, rearm, daemon
             # restart, traffic socket replacement, or module reload occurs.
             started = time.monotonic()

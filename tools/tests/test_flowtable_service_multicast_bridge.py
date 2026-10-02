@@ -21,6 +21,7 @@ from _mcast_wire import capture, frames, new_config, send
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mcast_wire_capture import multicast_mac
 from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read, rig  # noqa: F401
+from test_flowtable_identity import set_mac
 from test_flowtable_service import managed_service, wait_service
 from test_flowtable_service_multicast import STOPS, acceleration_stopped, recover
 from test_mcast_e2e import dut_mac, mroute_line
@@ -79,8 +80,11 @@ async def multicast_bridge_service(rig, request):
                                   'mcast_igmp_version', '3', 'mcast_mld_version', '2')
             bridge_created = True
             await console_command(con, 'ip', 'link', 'set', BRIDGE, 'address', r.dut_wan_mac, 'up')
-            for dev, logical, vid, mac in [(TARGET_LAN_IF, LAN_L3, LAN_VID, r.dut_lan_mac),
-                                           (TARGET_WAN_IF, WAN_L3, WAN_PVID, r.dut_wan_mac)]:
+            # Routed controls need the logical and physical egress MACs to
+            # agree. Announce this fixture's common MAC, then restore it below.
+            await set_mac(con, TARGET_LAN_IF, r.lan_gateway, r.dut_wan_mac)
+            for dev, logical, vid in [(TARGET_LAN_IF, LAN_L3, LAN_VID),
+                                      (TARGET_WAN_IF, WAN_L3, WAN_PVID)]:
                 for address in original[dev]:
                     await console_command(con, 'ip', 'addr', 'del', address, 'dev', dev)
                 await console_command(con, 'ip', 'link', 'set', dev, 'master', BRIDGE)
@@ -90,7 +94,9 @@ async def multicast_bridge_service(rig, request):
                 await console_command(con, 'bridge', 'link', 'set', 'dev', dev, 'mcast_flood', 'off', 'mcast_router', '0')
                 await console_command(con, 'bridge', 'vlan', 'add', 'dev', BRIDGE, 'vid', str(vid), 'self')
                 await console_command(con, 'ip', 'link', 'add', 'link', BRIDGE, 'name', logical, 'type', 'vlan', 'id', str(vid))
-                await console_command(con, 'ip', 'link', 'set', logical, 'address', mac, 'up')
+                # Inherit the bridge MAC: a distinct upper MAC makes the
+                # bridge promiscuous and requests a CPU copy of every stream.
+                await console_command(con, 'ip', 'link', 'set', logical, 'up')
                 for address in original[dev]:
                     await console_command(con, 'ip', 'addr', 'add', address, 'dev', logical)
             for address, logical, mac in [(r.lan_ip, LAN_L3, r.lan_mac), (WAN_IP, WAN_L3, r.wan_mac)]:
@@ -158,6 +164,10 @@ except BaseException:
                 for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
                     for address in original[dev]:
                         await undo('ip', 'addr', 'replace', address, 'dev', dev)
+                try:
+                    await set_mac(con, TARGET_LAN_IF, r.lan_gateway, r.dut_lan_mac)
+                except Exception as error:
+                    failures.append(repr(error))
                 for address, dev, mac in [(r.lan_ip, TARGET_LAN_IF, r.lan_mac), (WAN_IP, TARGET_WAN_IF, r.wan_mac)]:
                     await undo('ip', 'route', 'replace', address + '/32', 'dev', dev)
                     await undo('ip', 'neigh', 'replace', address, 'lladdr', mac, 'nud', 'permanent', 'dev', dev)
@@ -784,6 +794,9 @@ async def _bridge_and_route(r, group, routed_on=BRIDGE):
                                str(ROUTED_VID), 'self'])
         await run('ip', 'link', 'add', 'link', routed_on, 'name', routed_dev, 'type', 'vlan',
                   'id', str(ROUTED_VID), reverse=['ip', 'link', 'del', routed_dev])
+        if via_bridge:
+            # Keep the routed copy's source distinct from the shared port MAC.
+            await run('ip', 'link', 'set', routed_dev, 'address', r.dut_lan_mac)
         await run('ip', 'link', 'set', routed_dev, 'up')
         # The bridge a multicast router: it hands the IPTV stream to the host.
         await run('ip', 'link', 'set', 'dev', BRIDGE, 'type', 'bridge', 'mcast_router', '2',
@@ -806,9 +819,8 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
         lan_created = True
         # ipmr builds the routed copy's header on the VLAN device it sends it
         # through, and the bridge forwards it unchanged: its source is that
-        # device's address, the bridge's on br-ftmcast.290, which is the WAN
-        # port's here and not the port the copy leaves by. On eth3.290 it is
-        # the port's own.
+        # device's address. The VLAN over the bridge has its own MAC so the
+        # wire check can distinguish it from the physical egress port.
         egress_mac = await dut_mac(r.target, r.session, routed_dev)
         if via_bridge:
             assert egress_mac != await dut_mac(r.target, r.session, TARGET_LAN_IF), (
@@ -883,8 +895,7 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
 
     Both copies come out of one classifier entry. The bridged one keeps the
     sender's MAC and hop count; the routed one leaves with br-ftmcast.290's
-    address -- the bridge's, as ipmr sends it, not the port's it leaves by --
-    and one hop fewer, taken off in its own listener entry because the root
+    address and one hop fewer, taken off in its own listener entry because the root
     keeps the count for the bridged copy. That per-copy decrement is the part
     no earlier run has measured: a replica sharing its IP header with its
     siblings would show here as 63 on both, or 62 on the routed one. The

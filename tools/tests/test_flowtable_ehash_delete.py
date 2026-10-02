@@ -11,7 +11,7 @@ from test_flowtable_failslab import slab_fault
 from test_flowtable_offload import ARTIFACTS, DPORT, TABLE, WAN_IP, Echo, command, rig  # noqa: F401
 
 # DPORT + 1 is the traffic peer's control port.
-SERVERS = [DPORT, DPORT + 2, DPORT + 4, DPORT + 6]
+SERVERS = [DPORT, DPORT + 3, DPORT + 4, DPORT + 6]
 COUNT = 256
 
 

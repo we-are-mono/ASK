@@ -1848,43 +1848,55 @@ async def test_profile_isp_redial_readmits_every_flow(isp, splat_window):
     await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL, dport=PORT_MAIN,
                      sport=PORT_MAIN, label="redial-before")
     before = await ctx.state()
-    group_before = await hardware_group(ctx, GROUPS[0])
     first = ctx.session_identity
+    # This case owns a live viewer; a previous test's socket has already
+    # closed and its membership can legitimately have disappeared.
+    viewer = asyncio.create_task(_watch(ctx, CHANNELS[:1], 20,
+                                         "profile_isp_redial_iptv"))
+    try:
+        await ctx.wait(lambda s: any(g["group"] == GROUPS[0] and g["state"] == "installed"
+                                    for g in s["mcast"]), timeout=10)
+        group_before = await hardware_group(ctx, GROUPS[0])
+        await _hangup(ctx.console)
+        retired = await ctx.wait(
+            lambda s: s["route_invalidations"] >= before["route_invalidations"] + 1
+            and not [f for f in s["flows"] if f["out_ppp"] != "-" or f["in_ppp"] != "-"],
+            timeout=40)
+        # Selective, and that is the result: the table is untouched, so admission
+        # was never disabled and nothing has to be rebuilt to get it back.
+        assert retired["bindings"] == 2, retired
+        assert retired["invalidated"] == 0 and retired["invalidation_done"] == 0, retired
+        assert retired["rearms"] == before["rearms"], retired
+        assert retired["errors"] == before["errors"], retired
+        group_retired = await hardware_group(ctx, GROUPS[0])
+        assert group_retired and group_retired["state"] == "installed", group_retired
+        # The device is gone, so /proc/net/pppoe has nothing left to describe.
+        assert not (await read(ctx.target, ctx.session, "/proc/net/pppoe")).splitlines()[1:]
 
-    await _hangup(ctx.console)
-    retired = await ctx.wait(
-        lambda s: s["route_invalidations"] >= before["route_invalidations"] + 1
-        and not [f for f in s["flows"] if f["out_ppp"] != "-" or f["in_ppp"] != "-"],
-        timeout=40)
-    # Selective, and that is the result: the table is untouched, so admission
-    # was never disabled and nothing has to be rebuilt to get it back.
-    assert retired["bindings"] == 2, retired
-    assert retired["invalidated"] == 0 and retired["invalidation_done"] == 0, retired
-    assert retired["rearms"] == before["rearms"], retired
-    assert retired["errors"] == before["errors"], retired
-    group_retired = await hardware_group(ctx, GROUPS[0])
-    assert group_retired and group_retired["state"] == "installed", group_retired
-    # The device is gone, so /proc/net/pppoe has nothing left to describe.
-    assert not (await read(ctx.target, ctx.session, "/proc/net/pppoe")).splitlines()[1:]
-
-    ctx.ppp_if, ctx.ppp_pid = await _dial(ctx.console, ctx.ppp_lower, ipv6=True)
-    ctx.session_identity = await _session_identity(ctx)
-    # A redial takes the next address out of the concentrator's pool, so the
-    # cases that run after this one have to be told what it is.
-    ctx.ppp_local = await _session_address(ctx)
-    # The device went and took its addresses and rules with it. Restated only
-    # where it is missing, so a redial onto the same device name does not leave
-    # the same rule twice.
-    for subnet in (LAN_SUBNET, GUEST_SUBNET):
-        nat = ["POSTROUTING", "-s", subnet, "-o", ctx.ppp_if, "-j", "MASQUERADE"]
-        present = await command(ctx.target, ctx.session, "iptables", "-t", "nat", "-C",
-                                *nat, check=False)
-        if present["rc"]:
-            await command(ctx.target, ctx.session, "iptables", "-t", "nat", "-I", *nat)
-    # The concentrator's own device went too, and with it the only route to the
-    # subscriber's IPv6 prefix. Restated here rather than left to the fixture,
-    # so what the profile carried before the drop it carries after it.
-    await _session_ipv6(ctx, [])
+        ctx.ppp_if, ctx.ppp_pid = await _dial(ctx.console, ctx.ppp_lower, ipv6=True)
+        ctx.session_identity = await _session_identity(ctx)
+        # A redial takes the next address out of the concentrator's pool, so the
+        # cases that run after this one have to be told what it is.
+        ctx.ppp_local = await _session_address(ctx)
+        # The device went and took its addresses and rules with it. Restated only
+        # where it is missing, so a redial onto the same device name does not leave
+        # the same rule twice.
+        for subnet in (LAN_SUBNET, GUEST_SUBNET):
+            nat = ["POSTROUTING", "-s", subnet, "-o", ctx.ppp_if, "-j", "MASQUERADE"]
+            present = await command(ctx.target, ctx.session, "iptables", "-t", "nat", "-C",
+                                    *nat, check=False)
+            if present["rc"]:
+                await command(ctx.target, ctx.session, "iptables", "-t", "nat", "-I", *nat)
+        # The concentrator's own device went too, and with it the only route to the
+        # subscriber's IPv6 prefix. Restated here rather than left to the fixture,
+        # so what the profile carried before the drop it carries after it.
+        await _session_ipv6(ctx, [])
+    finally:
+        # The viewer owns the LAN console until its bounded window ends.
+        # Join it before the unicast probes or fixture cleanup use that UART.
+        observed = await viewer
+    _assert_replicated(GROUPS[0], observed)
+    ctx.record("isp-redial-iptv", observed)
     await _reachable(ctx, BY_NAME["main"], INNER_LOCAL)
 
     _, download = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL,

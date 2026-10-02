@@ -84,7 +84,9 @@ async def test_flowtable_link_recovery(connections):
                 assert await read(r.target, r.session, "/proc/sys/kernel/random/boot_id") == boot_id
         finally:
             await command(r.target, r.session, "iptables", "-t", "nat", "-D", *control_nat)
-        log = (await console_command(con, "dmesg"))["stdout"]
+        # The restored management path can carry a full overnight kernel log;
+        # a 115200-baud UART cannot drain it within a command's timeout.
+        log = (await command(r.target, r.session, "dmesg"))["stdout"]
         # (?<!DE): "ASK-DEBUG:" is admission tracing, not a BUG.
         assert not re.search(r"(?<!DE)BUG:|WARNING:|KASAN:|Oops:|Kernel panic|inconsistent lock state", log), log
         r.record("link-complete", {"state": await r.state(), "table": identity, "boot_id": boot_id,

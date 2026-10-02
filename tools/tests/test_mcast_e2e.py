@@ -696,8 +696,8 @@ async def mroute_lan_bridge(aiohttp_session, target_agent):
                         TARGET_LAN_IF, "up", check=False)
         stack.push(_cleanup)
 
-        await _exec(target_agent, aiohttp_session, "ip", "addr", "flush", "dev",
-                    TARGET_LAN_IF)
+        await _exec(target_agent, aiohttp_session, "ip", "addr", "del",
+                    "192.168.1.1/24", "dev", TARGET_LAN_IF)
         await _exec(target_agent, aiohttp_session, "ip", "link", "set",
                     TARGET_LAN_IF, "master", MROUTE_BRIDGE)
         await _exec(target_agent, aiohttp_session, "ip", "addr", "replace",

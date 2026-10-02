@@ -2056,6 +2056,23 @@ static int fill_natt_key_info(PSAEntry sa, struct en_exthash_tbl_entry *tbl_entr
 		key->ipv6_tcpudp_key.ipv6_sport = cpu_to_be16(sa->natt.sport);
 		key->ipv6_tcpudp_key.ipv6_dport = cpu_to_be16(sa->natt.dport);
 	}
+	/* Inbound NAT-T uses the physical port's UDP table, whose key also
+	 * identifies a native first IP header. Outbound roots use SEC's own
+	 * tables and keep the original tuple. */
+	if (sa->direction == CDX_DPA_IPSEC_INBOUND) {
+		unsigned int size = sa->family == PROTO_IPV4 ?
+			CDX_UNICAST4_KEY_SIZE : CDX_UNICAST_KEY_SIZE;
+		unsigned int protocol = sa->family == PROTO_IPV4 ? 9 : 33;
+
+		/* KeyGen extracts the ports before the first-header guard. */
+		memmove(tbl_entry->hashentry.key + protocol,
+			tbl_entry->hashentry.key + protocol + 1, 4);
+		key_size--;
+		memset(tbl_entry->hashentry.key + key_size, 0,
+		       size - key_size);
+		tbl_entry->hashentry.key[key_size] = IPPROTO_UDP;
+		key_size = size;
+	}
 	return(key_size);
 }
 
@@ -2396,18 +2413,6 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		DPA_ERROR("%s::unable to compose key\n",
 				__func__);
 		goto err_ret;
-	}
-	/* Inbound NAT-T uses the physical port's UDP table, whose key also
-	 * identifies a native first IP header. Outbound roots use SEC's own
-	 * tables and keep the original tuple. */
-	if (IS_NATT_SA(sa) && sa_dir_in) {
-		unsigned int size = sa->family == PROTO_IPV4 ?
-			CDX_UNICAST4_KEY_SIZE : CDX_UNICAST_KEY_SIZE;
-
-		memset(tbl_entry->hashentry.key + key_size, 0,
-		       size - key_size);
-		tbl_entry->hashentry.key[key_size] = IPPROTO_UDP;
-		key_size = size;
 	}
 	/* An outbound SA's entry is on the offline port, where every SA's
 	 * output and every decrypted frame is classified: it matches only

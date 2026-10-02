@@ -250,6 +250,7 @@ def test_flowtable_software_path_carries_the_conntrack(tmp_path):
         for start in ("enum ip_conntrack_info {", "enum ip_conntrack_status {")))
     (tmp_path / "flowtable_ct_production.inc").write_text(
         function(source, "nf_flow_ct_set")
+        + function(source, "nf_flow_pppoe_peer_valid")
         + function(source, "nf_flow_offload_forward")
         + function(source, "nf_flow_offload_ipv6_forward"))
     binary = tmp_path / "flowtable_ct"

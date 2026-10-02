@@ -7,10 +7,10 @@ CRC is affine, so whether two keys of one length share a bucket depends on
 their difference alone: the ports chosen here collide whatever the port id
 and addresses around them.
 
-CDX's IPv4 TCP/UDP key (fill_key_info(), cdx_ehash.c) is 14 bytes: the
-logical port id, source and destination address, protocol, source and
-destination port, network order. cdx_pcd.xml gives those tables 32768
-buckets and hashshift 0.
+CDX's native IPv4 TCP/UDP key (insert_entry_in_classif_table_encap(),
+cdx_ehash.c) is 56 bytes: the logical port id, addresses, ports, protocol,
+34 zero bytes for outer tunnel checks and eight for the PPPoE identity.
+The protocol tables have 32768 buckets and hashshift 0.
 """
 from __future__ import annotations
 
@@ -37,8 +37,9 @@ def bucket(key: bytes, mask: int = IPV4_MASK, shift: int = 0) -> int:
 
 
 def ipv4_key(portid: int, source: bytes, destination: bytes, proto: int, sport: int, dport: int) -> bytes:
-    return (bytes([portid]) + source + destination + bytes([proto])
-            + sport.to_bytes(2, "big") + dport.to_bytes(2, "big"))
+    return (bytes([portid]) + source + destination
+            + sport.to_bytes(2, "big") + dport.to_bytes(2, "big")
+            + bytes([proto]) + bytes(42))
 
 
 def _ports_bucket(sport: int, dport: int) -> int:
