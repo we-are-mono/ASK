@@ -91,6 +91,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://146-xfrm-packet-offload-mixed-family-child-route.patch \
            file://147-netfilter-flowtable-attach-conntrack.patch \
            file://148-netfilter-nftables-commit-in-progress.patch \
+           file://149-netfilter-flowtable-ipv6-prefix-translation.patch \
            file://150-sdk_dpaa-hardware-qdisc.patch \
            file://160-bridge-switchdev-mdb-group.patch \
            file://161-bridge-multicast-egress-snapshot.patch \

@@ -69,6 +69,28 @@ Beyond the IPv4 rules, which all still apply:
 - A direction's MTU may not be below its ingress interface's IPv6 MTU; see
   the next section.
 
+## Stateless prefix translation
+
+TCP and UDP connections translated by `ip6t_NPT` retain translation in both
+software and hardware flowtables. The target records the translated address
+in conntrack's reply tuple without setting the stateful NAT flags. Patch 149
+therefore also compares the original and inverse reply addresses when it
+builds a flow. Its existing IPv6 rewrite path uses the complete learned
+address, including NPT's checksum-neutral suffix adjustment.
+
+The adapter validates those same tuple-derived rewrites against the native
+actions. CDX already encodes IPv6 source and destination address replacement,
+so no firmware change is needed. Conntrack's NAT status is unchanged and
+packets outside the flowtable still traverse the ordinary NPT targets.
+Patch 030's restriction to unconfirmed conntracks remains in place.
+
+`test_flowtable_npt.py` checks source, destination and combined translation
+for TCP and UDP, through software and hardware flowtables. The remote endpoint
+checks the translated address; the hardware cases require packet counters in
+both directions, and the software cases require an offloaded conntrack with
+no hardware entries. Neither may send measured traffic through the forward
+chain. Prefixes with different sums exercise the suffix adjustment too.
+
 ## Packets larger than the path
 
 The microcode fragments any forwarded packet larger than its entry's MTU, and

@@ -210,6 +210,9 @@ result independently of those temporary files.
 - [x] **A301.** Keep local multicast copies in Linux; routed forwarding remains eligible. 50 host tests pass.
   (_:/^cdx: keep local multicast delivery in software_).
 
+- [x] **A302.** Preserve NPT in software and hardware flowtables; 12 NPT and four IPv6 DUT cases pass.
+  (_:/^flowtable: preserve IPv6 prefix translation in both directions_).
+
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN

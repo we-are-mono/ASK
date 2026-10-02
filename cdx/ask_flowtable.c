@@ -1737,7 +1737,7 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	const struct flow_action *actions = &cls->rule->action;
 	const struct flow_action_entry *csum;
 	unsigned long status = READ_ONCE(ct->status), nat = status & IPS_NAT_MASK;
-	unsigned int edits = !!(nat & IPS_SRC_NAT) + !!(nat & IPS_DST_NAT);
+	unsigned int edits;
 	/* Four Ethernet mangles, then one action per ingress tag popped and
 	 * per egress tag pushed, then the translation, then the redirect. IPv4
 	 * spends two actions per edit and appends one checksum action; IPv6
@@ -1754,11 +1754,22 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	out->new_dst = out->dst;
 	out->new_sport = out->sport;
 	out->new_dport = out->dport;
+	if (((nat & IPS_SRC_NAT) && !(status & IPS_SRC_NAT_DONE)) ||
+	    ((nat & IPS_DST_NAT) && !(status & IPS_DST_NAT_DONE)))
+		return false;
+	/* ip6t_NPT records the translated addresses in the reply tuple without
+	 * setting IPS_NAT. Match the flowtable's tuple-derived address rewrites;
+	 * Linux's NAT status must stay untouched for normal NPT forwarding. */
+	if (out->family == AF_INET6) {
+		if (!nf_inet_addr_cmp(&orig->src.u3, &reply->dst.u3))
+			nat |= IPS_SRC_NAT;
+		if (!nf_inet_addr_cmp(&orig->dst.u3, &reply->src.u3))
+			nat |= IPS_DST_NAT;
+	}
+	edits = !!(nat & IPS_SRC_NAT) + !!(nat & IPS_DST_NAT);
 	if (!nat)
 		return actions->num_entries == 5 + encaps;
-	if (((nat & IPS_SRC_NAT) && !(status & IPS_SRC_NAT_DONE)) ||
-	    ((nat & IPS_DST_NAT) && !(status & IPS_DST_NAT_DONE)) ||
-	    (out->proto != IPPROTO_UDP && out->proto != IPPROTO_TCP) ||
+	if ((out->proto != IPPROTO_UDP && out->proto != IPPROTO_TCP) ||
 	    actions->num_entries != fixed + encaps + per_edit * edits)
 		return false;
 	forward = ft_tuple_matches(out, orig);

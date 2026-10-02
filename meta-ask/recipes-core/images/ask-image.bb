@@ -62,6 +62,7 @@ IMAGE_INSTALL = " \
     kernel-module-ip6-tables \
     kernel-module-ip6table-filter \
     kernel-module-ip6table-mangle \
+    kernel-module-ip6t-npt \
     dpa-app \
     dnsmasq \
     fmc \

@@ -1,0 +1,34 @@
+From: Tomaz Zaman <tomaz@mono.si>
+Subject: [PATCH] netfilter: preserve IPv6 prefix translation in flowtables
+
+ASK's ip6t_NPT updates the reply tuple with the translated address without
+setting IPS_NAT. Derive the flow's address rewrites from those tuples too,
+so both software flowtable forwarding and hardware actions keep translating.
+Conntrack status stays unchanged; ordinary forwarding still uses ip6t_NPT.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -124,6 +124,21 @@
+ 		__set_bit(NF_FLOW_SNAT, &flow->flags);
+ 	if (ct->status & IPS_DST_NAT)
+ 		__set_bit(NF_FLOW_DNAT, &flow->flags);
++
++	/* ip6t_NPT publishes the translated address in the reply tuple but
++	 * does not use the stateful NAT status bits. Preserve that mapping in
++	 * both software forwarding and the hardware actions. Leave conntrack
++	 * status alone: the ordinary path still performs stateless NPT. */
++	if (nf_ct_l3num(ct) == NFPROTO_IPV6) {
++		const struct nf_conntrack_tuple *orig, *reply;
++
++		orig = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
++		reply = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
++		if (!nf_inet_addr_cmp(&orig->src.u3, &reply->dst.u3))
++			__set_bit(NF_FLOW_SNAT, &flow->flags);
++		if (!nf_inet_addr_cmp(&orig->dst.u3, &reply->src.u3))
++			__set_bit(NF_FLOW_DNAT, &flow->flags);
++	}
+ 
+ 	return flow;
+ }

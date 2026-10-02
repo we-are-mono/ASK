@@ -1865,6 +1865,56 @@ static void test_ipv6(void)
     NAT6_REJECT(rule.action.num_entries = 9);
 #undef NAT6_REJECT
 
+    /* Stateless NPT has no IPS_NAT bits. Both directions must validate
+     * the tuple-derived rewrites, including unchanged transport ports. */
+    for (unsigned translated = 1; translated <= 3; translated++) {
+        for (unsigned variant = 0; variant < 4; variant++) {
+            bool reverse = variant & 1, tcp = variant & 2;
+            fixture6();
+            if (tcp) tcp_flow();
+            if (translated & 1)
+                ct.tuplehash[1].tuple.dst.u3.in6 = addr6(0xfc00abcd, V6_LAN);
+            if (translated & 2)
+                ct.tuplehash[1].tuple.src.u3.in6 = addr6(0xfc00abcd, V6_WAN);
+            const struct nf_conntrack_tuple *match = &ct.tuplehash[reverse].tuple;
+            const struct nf_conntrack_tuple *other = &ct.tuplehash[!reverse].tuple;
+            i6k.src = match->src.u3.in6; i6k.dst = match->dst.u3.in6;
+            pk.src = match->src.u.all; pk.dst = match->dst.u.all;
+            neighbour.primary_key = other->src.u3;
+            unsigned n = 4;
+            for (unsigned which = 0; which < 2; which++) {
+                if (!(translated & (1U << which))) continue;
+                bool source = which == reverse;
+                union nf_inet_addr addr = source ? other->dst.u3 : other->src.u3;
+                for (unsigned word = 0; word < 4; word++)
+                    rule.action.entries[n++] = (struct flow_action_entry){
+                        .id = FLOW_ACTION_MANGLE,
+                        .mangle = { .htype = FLOW_ACT_MANGLE_HDR_TYPE_IP6,
+                            .offset = (source ? offsetof(struct ipv6hdr, saddr) :
+                                               offsetof(struct ipv6hdr, daddr)) + 4 * word,
+                            .val = addr.all[word] } };
+                rule.action.entries[n++] = (struct flow_action_entry){
+                    .id = FLOW_ACTION_MANGLE,
+                    .mangle = { .htype = tcp ? FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP,
+                        .mask = source ? ~htonl(0xffff0000) : ~htonl(0xffff),
+                        .val = source ? htonl((u32)ntohs(pk.src) << 16) : htonl(ntohs(pk.dst)) } };
+            }
+            rule.action.entries[n++] = (struct flow_action_entry){ .id = FLOW_ACTION_REDIRECT, .dev = &out };
+            rule.action.num_entries = n;
+            assert(!(ct.status & IPS_NAT_MASK));
+            assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+            assert(nf_inet_addr_cmp(&decoded.new_src, &other->dst.u3));
+            assert(nf_inet_addr_cmp(&decoded.new_dst, &other->src.u3));
+            assert(decoded.new_sport == pk.src && decoded.new_dport == pk.dst);
+            rule.action.entries[4].mangle.val ^= 1;
+            assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+            /* An old kernel's untranslated rule must never be accepted. */
+            rule.action.entries[4] = rule.action.entries[n - 1];
+            rule.action.num_entries = 5;
+            assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        }
+    }
+
     /* Installed IPv6 flows answer their own route notifications. */
     fixture6();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);

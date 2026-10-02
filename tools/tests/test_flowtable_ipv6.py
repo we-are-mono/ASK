@@ -129,18 +129,18 @@ class Connection:
 
 
 @asynccontextmanager
-async def _tcp_connection(r, sport, dport):
+async def _tcp_connection(r, sport, dport, *, destination=WAN_IPV6, expect_source=LAN_IPV6):
     accepted = asyncio.Queue()
     server = await asyncio.start_server(
         lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IPV6, dport, family=socket.AF_INET6)
-    script = (f"LAN_IPV6={LAN_IPV6!r}; WAN_IPV6={WAN_IPV6!r}; SPORT={sport}; DPORT={dport}\n" +
+    script = (f"LAN_IPV6={LAN_IPV6!r}; WAN_IPV6={destination!r}; SPORT={sport}; DPORT={dport}\n" +
               Path(__file__).with_name("flowtable_ipv6_tcp_peer.py").read_text())
     peer = asyncio.create_task(lan_run_python(r.lan, script, timeout=180,
                                               label="flowtable_v6_tcp"))
     writer = None
     try:
         reader, writer = await asyncio.wait_for(accepted.get(), 20)
-        assert writer.get_extra_info("peername")[:2] == (LAN_IPV6, sport)
+        assert writer.get_extra_info("peername")[:2] == (expect_source, sport)
         assert json.loads(await asyncio.wait_for(reader.readline(), 10)) == {"ready": True}
         yield Connection(reader, writer, peer)
     finally:
