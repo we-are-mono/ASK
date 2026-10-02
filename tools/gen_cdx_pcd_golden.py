@@ -12,6 +12,7 @@ docs/in-kernel-pcd.md for building the host-mode fmc that produces the input.
     tools/gen_cdx_pcd_golden.py <fmc_config_data.c> tools/host_tests/golden/cdx_pcd_model.json
 """
 
+import copy
 import json
 import re
 import sys
@@ -57,13 +58,16 @@ def load(path):
             "portid": scalar(text, chunk + r"portid =\s*(\d+),", int),
             "prs_private_info": scalar(
                 text, chunk + r"prsParam\.prsResultPrivateInfo =\s*(\d+),", int),
+            "units": re.findall(chunk + r"distinctionUnits\.units\[\d+\]\.hdrs\[0\]\.hdr =\s*(\w+)", text),
+            "schemes": [int(v) for v in re.findall(chunk + r"schemes\[\d+\] =\s*(\d+)", text)],
+            "parser_labels": scalar(text, chunk + r"prsParam\.numOfHdrsWithAdditionalParams =\s*(\d+),", int),
             "ccroot": [int(v) for v in re.findall(chunk + r"ccroot\[\d+\] =\s*(\d+)", text)],
         })
     model["ports"] = ports
 
-    # Hash tables of port 0; every other port repeats the same twelve shapes.
+    # Keep every port: the SEC port has a different table set.
     tables = []
-    for idx in range(len(ports[0]["ccroot"])):
+    for idx in range(model["counts"]["htnode_count"]):
         chunk = r"htnode\[%d\]\." % idx
         tables.append({
             "name": scalar(text, r'htnode_name\[%d\] = "[^"]*ccnode/(\w+)"' % idx),
@@ -76,7 +80,7 @@ def load(path):
         })
     model["tables"] = tables
 
-    # Schemes, keyed by the group they dispatch into.
+    # Schemes, keyed by their model index; policies reuse group numbers.
     schemes = {}
     for idx in range(model["counts"]["scheme_count"]):
         chunk = r"scheme\[%d\]\." % idx
@@ -90,7 +94,8 @@ def load(path):
                 r".*?fullField\.(\w+)\s*=(\w+),", block, re.S)
         ]
         grp = scalar(text, chunk + r"kgNextEngineParams\.cc\.grpId =\s*(\d+),", int)
-        schemes[grp] = {
+        schemes[idx] = {
+            "group": grp,
             "name": scalar(text, r'scheme_name\[%d\] = "fm0/dist/(\w+)"' % idx),
             "base_fqid": scalar(text, chunk + r"baseFqid =\s*(\d+),", int),
             "num_fqids": scalar(
@@ -120,7 +125,48 @@ def load(path):
         raise SystemExit("apply order lists %d schemes, model has %d"
                          % (len(model["scheme_priority"]),
                             model["counts"]["scheme_count"]))
+    add_receive_identity(model)
     return model
+
+
+def add_receive_identity(model):
+    """The loader's post-FMC tuple/PPPoE adjustments (9b5ecd7, 59b29ea).
+
+    Keep this transformation independent of the kernel descriptors: XML still
+    describes the base tuples, and this records the former loader's final model.
+    """
+    original = len(model["schemes"])
+    for idx in range(original):
+        scheme = model["schemes"][idx]
+        match = re.fullmatch(r"cdx_(tcp|udp)([46])_dist", scheme["name"])
+        if not match:
+            continue
+        family = int(match[2])
+        scheme["extracts"] = [e for e in scheme["extracts"]
+                              if e["field"] not in ("NET_HEADER_FIELD_IPv4_PROTO",
+                                                    "NET_HEADER_FIELD_IPv6_NEXT_HDR")]
+        generic = [("IPv4", 9, 1), ("IPv6", 6, 1), ("IPv6", 8, 16),
+                   ("IPv6", 24, 16), ("IPv6", 40, 1)] if family == 4 else [
+                   ("IPv6", 6, 1), ("IPv4", 9, 1), ("IPv4", 12, 8)]
+        scheme["generic"] = [["HEADER_TYPE_" + h, o, n] for h, o, n in generic]
+        scheme["generic"].append(["HEADER_TYPE_PPPoE", 0, 8])
+        clone = copy.deepcopy(scheme)
+        clone["name"] += "_pppoe"
+        clone["generic"][-1:] = [["HEADER_TYPE_ETH", 6, 6], ["HEADER_TYPE_PPPoE", 2, 2]]
+        clone["units"].append(model["units"].index("HEADER_TYPE_PPPoE"))
+        clone_idx = len(model["schemes"])
+        model["schemes"].append(clone)
+        at = model["scheme_priority"].index(idx)
+        model["scheme_priority"].insert(at, clone_idx)
+        for port in model["ports"]:
+            if idx in port["schemes"]:
+                at = port["schemes"].index(idx)
+                port["schemes"].insert(at, clone_idx)
+        table_name = scheme["name"].replace("_dist", "_cc")
+        for table in model["tables"]:
+            if table["name"] == table_name:
+                table["key_size"] = 56 if family == 4 else 55
+    model["counts"]["scheme_count"] = len(model["schemes"])
 
 
 def main():
@@ -130,7 +176,7 @@ def main():
     with open(sys.argv[2], "w") as handle:
         json.dump(model, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    print("%s: %d ports, %d groups, %d schemes"
+    print("%s: %d ports, %d tables, %d schemes"
           % (sys.argv[2], len(model["ports"]), len(model["tables"]),
              len(model["schemes"])))
 

@@ -1,0 +1,91 @@
+From: Tomaz Zaman <tomaz@mono.si>
+Subject: [PATCH] netfilter: attribute flowtable teardowns to their cause
+
+The garbage collector retires a flow when any of four independent
+conditions holds, and they are evaluated in a single expression:
+
+	if (flow_offload_hw_invalid(flow) || nf_flow_has_expired(flow) ||
+	    nf_ct_is_dying(flow->ct) || nf_flow_custom_gc(flow_table, flow))
+		flow_offload_teardown(flow);
+
+Once a flow is owned by hardware, a spurious retirement is expensive: it
+drops the flow to software, tears down its hardware entry and readmits it
+on the next packet. Diagnosing that needs to know which of the four fired,
+and neither counters nor a function tracer can tell them apart — there is
+one call site, and three of the four predicates are inlined.
+
+Count each condition separately and publish the totals alongside the
+existing work-queue depths in /proc/net/stat/nf_flowtable. The counters
+are per-CPU and incremented only on the retirement path, which runs at
+most once per flow.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+--- a/include/net/netns/flow_table.h
++++ b/include/net/netns/flow_table.h
+@@ -6,6 +6,10 @@
+ 	unsigned int count_wq_add;
+ 	unsigned int count_wq_del;
+ 	unsigned int count_wq_stats;
++	unsigned int count_gc_hw_invalid;
++	unsigned int count_gc_expired;
++	unsigned int count_gc_dying;
++	unsigned int count_gc_custom;
+ };
+ 
+ struct netns_ft {
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -473,9 +473,24 @@
+ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 				    struct flow_offload *flow, void *data)
+ {
+-	if (flow_offload_hw_invalid(flow) || nf_flow_has_expired(flow) ||
+-	    nf_ct_is_dying(flow->ct) ||
+-	    nf_flow_custom_gc(flow_table, flow))
++	struct net *net = nf_ct_net(flow->ct);
++	bool retire = true;
++
++	/* Evaluate each condition separately so that a retirement can be
++	 * attributed to its cause. Order and short-circuiting are unchanged.
++	 */
++	if (flow_offload_hw_invalid(flow))
++		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_gc_hw_invalid);
++	else if (nf_flow_has_expired(flow))
++		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_gc_expired);
++	else if (nf_ct_is_dying(flow->ct))
++		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_gc_dying);
++	else if (nf_flow_custom_gc(flow_table, flow))
++		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_gc_custom);
++	else
++		retire = false;
++
++	if (retire)
+ 		flow_offload_teardown(flow);
+ 
+ 	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
+--- a/net/netfilter/nf_flow_table_procfs.c
++++ b/net/netfilter/nf_flow_table_procfs.c
+@@ -45,14 +45,19 @@
+ 	const struct nf_flow_table_stat *st = v;
+ 
+ 	if (v == SEQ_START_TOKEN) {
+-		seq_puts(seq, "wq_add   wq_del   wq_stats\n");
++		seq_puts(seq,
++			 "wq_add   wq_del   wq_stats gc_hw_invalid gc_expired gc_dying gc_custom\n");
+ 		return 0;
+ 	}
+ 
+-	seq_printf(seq, "%8d %8d %8d\n",
++	seq_printf(seq, "%8d %8d %8d %13d %10d %8d %9d\n",
+ 		   st->count_wq_add,
+ 		   st->count_wq_del,
+-		   st->count_wq_stats
++		   st->count_wq_stats,
++		   st->count_gc_hw_invalid,
++		   st->count_gc_expired,
++		   st->count_gc_dying,
++		   st->count_gc_custom
+ 		);
+ 	return 0;
+ }

@@ -20,9 +20,9 @@ static struct proc_dir_entry *proc_pcd_dir = NULL ;
 static struct proc_dir_entry *proc_sa_dir = NULL ;
 static struct fqid_file_list_node_s *fqid_files_g = NULL;
 /* Guards the fqid_files_g list. Its mutators span two serialization
- * domains (FCI dispatch and the rtnl-held vwd ioctl paths), all
- * process context — plain spin_lock; list ops only under it, the
- * sleeping proc_create/proc_remove run outside. */
+ * domains (ctrl.mutex and the rtnl-held VAP paths), all process
+ * context — plain spin_lock; list ops only under it, the sleeping
+ * proc_create/proc_remove run outside. */
 static DEFINE_SPINLOCK(fqid_files_lock);
 
 static int proc_fqid_stats_show(struct seq_file *m, void *v)
@@ -281,7 +281,7 @@ static int cdx_create_fq_in_procfs(struct qman_fq *fq,
 	else
 		snprintf(node->name, sizeof(node->name), "%d", fq->fqid);
 	node->fq = fq;
-	node->proc_fs = proc_create_data(node->name, 0444,proc_dir,  &proc_fqid_stats, node);
+	node->proc_fs = proc_create_data(node->name, 0400,proc_dir,  &proc_fqid_stats, node);
 	if (!node->proc_fs)
 	{
 		kfree(node);

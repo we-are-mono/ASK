@@ -13,23 +13,8 @@
 
 #include "fe.h"
 #include "dpa_ipsec.h"
-//#include "common_hdrs.h"        /* For ipv4 header structure */
-
-/* Codes for proto_family:
-It copies from linux and equal to AF_INET/AF_INET6
-*/
-#define	PROTO_FAMILY_IPV4 2
-#define PROTO_FAMILY_IPV6 10
 
 #define IPSEC_MAX_KEY_SIZE (512 /8)
-#define IPSEC_MAX_NUM_KEYS 2
-
-/******************************
- * * IPSec API Command strutures
- * *
- * ******************************/
-
-
 
 /* Authentication algorithms */
 #define SADB_AALG_NONE                  0
@@ -66,201 +51,14 @@ It copies from linux and equal to AF_INET/AF_INET6
 #define SADB_X_EALG_SERPENTCBC  252     /* draft-ietf-ipsec-ciph-aes-cbc-00 */
 #define SADB_X_EALG_TWOFISHCBC  253     /* draft-ietf-ipsec-ciph-aes-cbc-00 */
 
-typedef struct _tIPSec_said {
-	unsigned int spi;
-	unsigned char sa_type;
-	unsigned char proto_family;
-	unsigned char replay_window;
-#define NLKEY_SAFLAGS_ESN       0x1
-#define NLKEY_SAFLAGS_INBOUND   0x2
-	unsigned char flags;
-	unsigned int dst_ip[4];
-	unsigned int src_ip[4];		// added for NAT-T transport mode
-	unsigned short mtu;
-	unsigned short dev_mtu;
-}IPSec_said, *PIPSec_said;
-
-typedef struct _tIPSec_key_desc {
-	unsigned short key_bits;
-	unsigned char key_alg;
-	unsigned char  key_type;
-	unsigned char key[IPSEC_MAX_KEY_SIZE];
-}IPSec_key_desc, *PIPSec_key_desc;
-
-typedef struct _tIPSec_lifetime {
-	unsigned int allocations;
-	unsigned int bytes[2];
-}IPSec_lifetime, *PIPSec_lifetime;
-
-
-typedef struct _tCommandIPSecCreateSA {
-	unsigned short sagd;
-	unsigned short rsvd;
-	IPSec_said said;
-}CommandIPSecCreateSA, *PCommandIPSecCreateSA;
-
-typedef struct _tCommandIPSecDeleteSA {
-	unsigned short sagd;
-	unsigned short rsvd;
-}CommandIPSecDeleteSA, *PCommandIPSecDeleteSA;
-
-typedef struct _tCommandIPSecSetKey {
-	unsigned short sagd;
-	unsigned short rsvd;
-	unsigned short num_keys;
-	unsigned short rsvd2;
-	IPSec_key_desc keys[IPSEC_MAX_NUM_KEYS];
-}CommandIPSecSetKey, *PCommandIPSecSetKey;
-
-typedef struct _tCommandIPSecSetNatt {
-	unsigned short sagd;
-	unsigned short sport;
-	unsigned short dport;
-	unsigned short rsvd;
-}CommandIPSecSetNatt, *PCommandIPSecSetNatt;
-
-typedef struct _tCommandIPSecSetState {
-	unsigned short sagd;
-	unsigned short rsvd;
-	unsigned short state;
-	unsigned short rsvd2;
-}CommandIPSecSetState, *PCommandIPSecSetState;
-
-typedef struct _tCommandIPSecSetTunnel {
-	unsigned short sagd;
-	unsigned char rsvd;
-	unsigned char proto_family;
-	union {
-		ipv4_hdr_t   ipv4h;
-		ipv6_hdr_t   ipv6h;
-	} h;
-}CommandIPSecSetTunnel, *PCommandIPSecSetTunnel;
-
-typedef struct _tCommandIPSecSetTunnelRoute {
-        unsigned short sagd;
-        unsigned short route_id;
-}CommandIPSecSetTunnelRoute, *PCommandIPSecSetTunnelRoute;
-
-
-typedef struct _tCommandIPSecSetLifetime{
-	unsigned short sagd;
-	unsigned short rsvd;
-	IPSec_lifetime  hard_time;
-	IPSec_lifetime  soft_time;
-	IPSec_lifetime  current_time;
-}CommandIPSecSetLifetime, *PCommandIPSecSetLifetime;
-
-
-typedef struct _tCommandIPSecExpireNotify{
-	unsigned short sagd;
-	unsigned short rsvd;
-	unsigned int  action;
-}CommandIPSecExpireNotify, *PCommandIPSecExpireNotify;
-
-typedef struct _tSAQueryCommand {
-  unsigned short action;
-  unsigned short handle; /* handle */ 
-  /*SPI information */
-  unsigned short mtu;    /* mtu configured */ 
-  unsigned short rsvd1;
-  unsigned int spi;      /* spi */ 
-  unsigned char sa_type; /* SA TYPE Prtocol ESP/AH */
-  unsigned char family; /* Protocol Family */
-  unsigned char mode; /* Tunnel/Transport mode */
-  unsigned char replay_window; /* Replay Window */
-  unsigned int dst_ip[4];
-  unsigned int src_ip[4];
-  
-  /* Key information */
-  unsigned char cipher_key_len; /* place the value in terms of bytes. */
-  unsigned char state; /* SA VALID /EXPIRED / DEAD/ DYING */
-  unsigned short flags; /* ESP AH enabled /disabled */
-  
-  unsigned char cipher_key[64];
-  unsigned char auth_key[64];
-     
-  /* Tunnel Information */
-  unsigned char tunnel_proto_family;
-  unsigned char cipher_algo;
-  unsigned char auth_algo;
-  unsigned char auth_key_len; /* place the value in terms of bytes. */
-  union  {
-	struct {
-		unsigned int   daddr;
-		unsigned int   saddr;
-		unsigned char  tos;
-		unsigned char  protocol;
-		unsigned short total_length;
-	}ipv4;
-	struct {
-		unsigned int   traffic_class_hi:4;
-		unsigned int   version:4;
-		unsigned int   flow_label_high:4;
-		unsigned int   traffic_class:4;
-		unsigned int   flow_label_lo:16;
-		unsigned int   daddr[4];
-		unsigned int   saddr[4];
-	}ipv6;
-  } __attribute__((packed)) tnl;
-
-  U64	soft_byte_limit;
-  U64	hard_byte_limit;
-  U64	soft_packet_limit;
-  U64	hard_packet_limit;
-  
-} __attribute__((packed)) SAQueryCommand, *PSAQueryCommand;
-
-
-
-
-
-
-/****** IPSEC related common structures *****/
-static __inline U16 HASH_SA(U32 *Daddr, U32 spi, U16 Proto, U8 family)
-{
-        U16 sum;
-        U32 tmp32;
-
-        tmp32 = ntohl(Daddr[0]) ^ ntohl(Daddr[1]) ^ ntohl(spi);
-        sum = (tmp32 >> 16) + (tmp32 & 0xffff) + Proto;
-        return ((sum ^ (sum >> 8)) & (NUM_SA_ENTRIES - 1));
-}
-
-
 #define SA_MAX_OP		2	// maximum of stackable SA (ESP+AH)
-
-
-
-
-
 
 #define SA_MODE_TUNNEL 0x1
 #define SA_MODE_TRANSPORT 0x0
 
 #define IS_NATT_SA(entry) (entry->natt.sport && entry->natt.dport)
 
-typedef struct _tSA_lft_conf {
-	U64	soft_byte_limit;
-	U64	hard_byte_limit;
-	U64	soft_packet_limit;
-	U64	hard_packet_limit;
-} SA_lft_conf, *PSA_lft_conf;
-
-typedef struct _tSAStatEntry {
-       U32 total_pkts_processed;
-       U32 last_pkts_processed;
-       U64 total_bytes_processed;
-       U64 last_bytes_processed;
-}SAStatEntry , *PSAStatEntry;
-
-
-typedef struct _tSA_lft_cur {
-        U64     bytes;
-        U64     packets;
-}SA_lft_cur, *PSA_lft_cur;
-
-
-typedef struct _tSAID {	
+typedef struct _tSAID {
 	union
 	{
 	       /*Unused	U32		a4; */
@@ -271,14 +69,7 @@ typedef struct _tSAID {
 	U32		spi;
 	U8		proto;
 	U8		unused[3];
-} SAID, *PSAID;	
-
-
-#define SA_STATE_INIT		0x1
-#define SA_STATE_VALID		0x2
-#define SA_STATE_DEAD		0x3
-#define SA_STATE_EXPIRED	0x4
-#define SA_STATE_DYING		0x5
+} SAID, *PSAID;
 
 
 /*
@@ -293,9 +84,13 @@ typedef struct _tSAID {
 #define SA_ALLOW_SEQ_ROLL 0x20
 #define SA_ALLOW_EXT_SEQ_NUM 0x40
 /* flag to indicate in SA whether the shared descriptor already built or not */
-#define SA_SH_DESC_BUILT	0x80 
+#define SA_SH_DESC_BUILT	0x80
 #define SA_DELETE		0x100
 #define SA_FQ_WAIT_B4_FREE	0x400 /* reserve 3 bits starting from 0x400 */
+
+/* Words of anti-replay scorecard in the ESP decapsulation PDB, enough for
+ * SEC's widest, 128-entry window (struct ipsec_decap_pdb's anti_replay). */
+#define SA_REPLAY_SEEN_WORDS	4
 
 #define SA_HDR_COPY_TOS  1
 #define SA_HDR_DEC_TTL   2
@@ -344,11 +139,6 @@ typedef struct dpa_sec_sa_context_s{
                                           * computed the SEC 4.x descriptor
                                           * according to the SA information.
                                           * do not free this pointer!         */
-        U32  *sec_desc_extra_cmds_unaligned;
-        U32   *sec_desc_extra_cmds; /* aligned to CORE cache line size     */
-        U8  job_desc_len; /* Number of words CAAM Job Descriptor occupies
-                                * form the CAAM Descriptor length
-                                * MAX_CAAM_DESCSIZE                           */
 
 	/* The descriptor's KEY commands DMA-read these bus addresses on
 	 * every SEC job, so the mappings must live as long as the SA —
@@ -359,22 +149,16 @@ typedef struct dpa_sec_sa_context_s{
 } DpaSecSAContext , *PDpaSecSAContext;
 
 typedef struct _tSAEntry {
-	struct slist_entry      list_spi;
 	struct slist_entry      list_h;
 	struct slist_entry      list_fqid;
-	TIMER_ENTRY 		deletion_timer;	/* should be the first member */
+	TIMER_ENTRY 		deletion_timer;
 	U32			deletion_iter;	/* A24b: poll count for FQ-retire wait; capped via SA_RELEASE_MAX_ITER */
 	U16			hash_by_h;
-	U16			hash_by_spi;
 	struct _tSAID           id;             // SA 3-tuple
 	U8                      family;         // v4/v6
 	U8                      header_len;     // ipv4/ipv6 tunnel header
 	U8                      mode;           // Tunnel / transport mode
-	struct _tSA_lft_cur lft_cur;
-	struct _tSA_lft_conf lft_conf;
 	U8                      direction;      // inbound / outbound
-	U8			state:7;          // valid / expired / dead / dying
-	U8			notify:1;
 	U8                      blocksz;
 	U8			icvsz;
 	U16                      flags;          // ECN, TOS ...
@@ -386,66 +170,67 @@ typedef struct _tSAEntry {
 		ipv6_hdr_t      ip6;
 	} tunnel;
 	U16			dev_mtu;
-	U8			seq_overflow;
 	/*NAT-T modifications*/
 	struct
 	{
 		unsigned short sport;
 		unsigned short dport;
-		void*          socket;
 	}natt;
 	int			natt_arr_index;    /* Array index to spi info in inbound table entry*/
 	PDpaSecSAContext 	pSec_sa_context;    /*pointer to the context entry for fqid pair */
-	U32 			route_id;
 	PRouteEntry 		pRtEntry;
 	U64 			seq;
-	U8                      enable_stats;
-	U8                      hdr_flags;          // copy DF,TOS  
+	/* The anti-replay window an inbound SA asked for, in packets, when
+	 * SA_ALLOW_SEQ_ROLL is clear. Zero only with SA_ALLOW_SEQ_ROLL set:
+	 * cdx_ipsec_backend.c asks for no replay checking exactly when the
+	 * state has no window. */
+	U16			replay_window;
+	/* The anti-replay scorecard an inbound SA starts from, in the
+	 * orientation SEC keeps it: bit k of word k / 32 stands for seq - k.
+	 * Clear unless its creator carried history in with it; the
+	 * decapsulation PDB holds SA_REPLAY_SEEN_WORDS of them. */
+	U32			replay_seen[SA_REPLAY_SEEN_WORDS];
+	U8                      hdr_flags;          // copy DF,TOS
+	/* Where the per-SA counters sit in the shared descriptor, in bytes:
+	 * past the PDB, which SEC stores back with them after every job
+	 * (cdx_ipsec_stats_offset()). Set when the descriptor is built. */
 	U16                     stats_offset;
 	struct hw_ct 		*ct;
-	U16                    	stats_indx;
-	U16                    	next_cmd_indx;
-	void 			*netdev; 
-	void			*xfrm_state;
-	SAStatEntry		stats;
+	/* The DPAA port the SA is bound to, whose private area the SA's
+	 * exception queue borrows to deliver what SEC returns. Its creator
+	 * sets it and holds the device for the SA's life. */
+	void 			*netdev;
 } SAEntry, *PSAEntry;
 
-void* M_ipsec_sa_cache_lookup_by_spi(U32 *daddr, U32 spi, U8 proto, U8 family);
 void* M_ipsec_sa_cache_lookup_by_h(U16 handle);
 void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa);
-extern struct slist_head sa_cache_by_spi[];
+
+/* SA construction, which cdx_ipsec_backend.c drives in one pass from a
+ * complete description, under the control mutex. Keys are named in the
+ * PF_KEY numbering (SADB_AALG_* / SADB_EALG_*). */
+void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto,
+			      U8 family, U16 handle, U8 replay, U8 esn,
+			      U16 mtu, U16 dev_mtu, U8 dir);
+int M_ipsec_sa_cache_delete(U16 handle);
+unsigned int M_ipsec_sa_cache_entries(void);
+/* An authenticator is its algorithm and the ICV it truncates to, in bits;
+ * cdx_ipsec_auth_op() is the one list of pairs SEC produces. */
+int cdx_ipsec_auth_op(u16 alg, unsigned int icv_bits);
+/* Whether a handle names an outbound SA the cache still holds. Control
+ * mutex. */
+bool cdx_ipsec_sa_outbound(u16 handle);
+int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, unsigned int icv_bits,
+			      U16 key_bits, U8 *key);
+int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8 *key);
+int ipsec_install_fp_entry(PSAEntry sa);
 extern struct slist_head sa_cache_by_h[];
-
-
-
-
-
-
- 
-/****** IPSEC HW related common structures *****/
-
-
-
-/* SA notifications */
-#define IPSEC_SOFT_EXPIRE 0
-#define IPSEC_HARD_EXPIRE 1
-
 
 void sa_remove_from_list_fqid(PSAEntry pSA);
 void sa_free(PSAEntry pSA);
-struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt);
-
+struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt,
+					 uint16_t *tag);
 
 int ipsec_init(void);
 void ipsec_exit(void);
-
-int IPsec_get_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len);
-int IPsec_reset_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len);
-
-/* Query functions */
-int IPsec_Get_Next_SAEntry(PSAQueryCommand pSAQueryCmd, int reset_action);
-struct _tStatIpsecEntryResponse;
-int stat_Get_Next_SAEntry(struct _tStatIpsecEntryResponse *pSACmd, int reset_action);
-void reset_stats_of_sa(PSAEntry pEntry);
 
 #endif

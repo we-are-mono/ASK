@@ -1,0 +1,34 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ask-flowtable
+# Required-Start:    ask-modules gateway-setup
+# Default-Start:     S
+# Short-Description: ASK default-on hardware flow-offload service
+### END INIT INFO
+
+# Lifecycle commands serialize control and address the supervisor through its
+# protected socket. PID files are diagnostics, never authority for signalling.
+DAEMON=/usr/sbin/ask-flowtable
+
+case "$1" in
+    start|"")
+        exec "$DAEMON" service-start
+        ;;
+    stop)
+        exec "$DAEMON" service-stop
+        ;;
+    reload)
+        "$DAEMON" resume || exit $?
+        exec "$DAEMON" service-start
+        ;;
+    restart)
+        exec "$DAEMON" service-restart
+        ;;
+    status)
+        exec "$DAEMON" status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|reload|restart|status}" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,614 @@
+From 491deb25f225417ca05ac976c9c30289519ede57 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Wed, 23 Sep 2026 19:08:09 +0200
+Subject: [PATCH] sdk_dpaa: let this netdev host a hardware qdisc
+
+A hardware qdisc gives each leaf class a netdev queue index, and sch_htb
+turns the index a driver returns straight into netdev_get_tx_queue() with no
+bounds check. Reserving those slots means knowing how many queues exist, and
+this driver did not: DPAA_ETH_TX_QUEUES was NR_CPUS, so the same code offered
+16 queues under one kernel configuration and 64 under another, sizing
+egress_fqs[] and conf_fqs[] to match. A budget that moves with someone else's
+Kconfig cannot be part of an interface contract.
+
+Pin the direct queues at sixteen and reserve DPAA_ETH_CEETM_LEAF_QUEUES more
+above them, one per CEETM class queue on a channel. Sixteen is not a new
+number - it is what the more constrained configuration already ran, so that
+Tx path is untouched and the other moves down to a count already in service.
+It stays a power of two because the Tx paths index conf_fqs[] with & (N - 1).
+The count is not derived from the core count: these queues carry only what the
+CPU sends, an offloaded flow reaches none of them, and with no XPS maps here a
+queue is picked by flow hash rather than by CPU.
+
+netif_set_real_num_tx_queues() then reports only the direct queues as usable -
+the first such call this driver has made - so a leaf class is invisible until
+the module that hands one out says otherwise. Nothing allocates an egress FQ
+for a reserved slot: a leaf class sends through a CEETM logical FQ that the
+scheduler owns.
+
+Add the ndo_setup_tc that hands those slots out, as a handler the offload
+module registers, since a built-in driver cannot link against one.
+
+That ndo is load-bearing beyond tc. Netfilter chooses how to bind a hardware
+flowtable on whether the netdev has an ndo_setup_tc at all
+(nf_flow_table_offload_setup), so from here every such bind arrives through
+this callback rather than through the module's indirect registration. With no
+handler registered the binds are refused, where previously they were served;
+the module registers one at init, and keeps its indirect registration too so
+it still works on a kernel without this patch.
+
+Add the data path that makes a leaf class reachable, as a second pair of
+callbacks the same module registers. ndo_select_queue asks it which leaf a
+frame belongs to, and cpe_fp_tx() then reads the class back out of the queue
+index rather than resolving the frame's mark a second time - which is what
+stops the software and hardware paths deciding a flow's class independently
+and disagreeing. A frame that named no class keeps the stack's own queue
+choice, folded back below the leaf range so ordinary traffic cannot land on a
+class queue by hashing into it.
+
+On a port the module's tree owns, the module also decides where such a frame
+goes: txq_fq is handed the skb and answers for the ordinary queues as well,
+and only a port without a tree answers NULL. The driver's own resolution -
+the class in skb->mark, then its DSCP table - is reached there and nowhere
+else. On a port with a tree that reading picked queues the tree never set
+up: class queue 7 for every frame with no mark, eligible only for excess
+tokens that a saturated class never leaves over. The gateway's own frames
+starved behind a busy class, and a frame's software queue disagreed with the
+one the hardware rule gave its flow.
+
+Confirm on the queue that sent the frame while here. cpe_fp_tx() indexed
+conf_fqs[] with queuenum, which in the CEETM branch is a class-queue id and
+not a Tx queue at all: a DSCP-classified frame, whose queuenum is always zero,
+confirmed on conf_fqs[0] whichever core sent it. That is a pre-existing defect
+rather than a consequence of this work, but the correct index is the one this
+patch makes meaningful.
+
+Report what the leaf classes dequeued through ethtool, because nothing else
+can. A leaf class has a software qdisc too and tc reports that one, but an
+offloaded flow produces no skb and never enqueues there, so `tc -s class show`
+reads approximately zero for precisely the traffic being accelerated. The
+counters that describe it are CEETM's own, and the module that owns the tree
+reads them.
+
+One set per leaf slot rather than per class in the tree, so the number of
+statistics is a compile-time constant: ethtool fetches the names and the values
+in separate ioctls, and a count that moved with `tc class add` would leave
+userspace lining one up against the other. Then one set each for the two
+queues a frame that names no leaf takes, where unclassified traffic goes and
+where control traffic goes: no leaf need hold either, and without these that
+traffic is invisible.
+
+Both registrations point into the module's text, so both unregisters wait
+for the calls already inside it. The ndo_setup_tc handler sleeps, and runs
+in an SRCU read-side section the unregister synchronizes against; without
+that, a tc command or flowtable bind racing the module's unload or its
+failed-init unwind ran in freed text. The data-path callbacks may not
+sleep and are each called inside an rcu_read_lock() the driver takes
+itself, since ndo_select_queue is not always entered with one held --
+AF_PACKET's qdisc bypass calls it from plain process context, which under
+PREEMPT_RCU is no reader -- and the unregister waits for a grace period.
+---
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 173 +++++++++++++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |  33 +++-
+ .../freescale/sdk_dpaa/dpaa_eth_common.h      |  69 +++++++
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  30 ++-
+ .../freescale/sdk_dpaa/dpaa_ethtool.c         |  65 ++++++-
+ 5 files changed, 360 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+index 063302116911..54c0b10296ba 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+@@ -57,6 +57,7 @@
+ #include <linux/if_ether.h>	/* ETH_P_IP and ETH_P_IPV6 */
+ #include <linux/highmem.h>
+ #include <linux/percpu.h>
++#include <linux/srcu.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/fsl_bman.h>
+ #ifdef CONFIG_SOC_BUS
+@@ -684,6 +685,141 @@ static void dpaa_eth_poll_controller(struct net_device *net_dev)
+ }
+ #endif
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++/* Set by the offload module; a built-in driver cannot link against one. The
++ * handler sleeps, so its calls are counted by an SRCU domain rather than by
++ * RCU: the unregister waits for the ones already inside it. */
++static dpa_setup_tc_handler dpa_setup_tc_func;
++DEFINE_STATIC_SRCU(dpa_setup_tc_srcu);
++
++int dpa_register_setup_tc(dpa_setup_tc_handler handler)
++{
++	if (!handler)
++		return -EINVAL;
++	if (cmpxchg(&dpa_setup_tc_func, NULL, handler))
++		return -EBUSY;
++	return 0;
++}
++EXPORT_SYMBOL(dpa_register_setup_tc);
++
++/* Returns once no call is inside the handler, so the module's text -- and
++ * the state the handler reaches, its own SRCU domains among it -- may be freed
++ * after. Must not be called from inside the handler, nor with anything held
++ * that a handler call waits for. */
++void dpa_unregister_setup_tc(void)
++{
++	WRITE_ONCE(dpa_setup_tc_func, NULL);
++	synchronize_srcu(&dpa_setup_tc_srcu);
++}
++EXPORT_SYMBOL(dpa_unregister_setup_tc);
++
++/* Read the handler once, inside the read-side section the unregister waits
++ * for: an unregister can NULL it concurrently, and a call that began before
++ * it must finish before the module's text goes.
++ *
++ * Refusing when nothing is registered is deliberate rather than convenient.
++ * Netfilter has already chosen this route over the module's indirect
++ * registration by the time it gets here, so answering anything but an error
++ * would claim a binding no one is going to service.
++ */
++static int dpa_setup_tc(struct net_device *dev, enum tc_setup_type type,
++			void *type_data)
++{
++	dpa_setup_tc_handler handler;
++	int idx, rc;
++
++	idx = srcu_read_lock(&dpa_setup_tc_srcu);
++	handler = READ_ONCE(dpa_setup_tc_func);
++	rc = handler ? handler(dev, type, type_data) : -EOPNOTSUPP;
++	srcu_read_unlock(&dpa_setup_tc_srcu, idx);
++	return rc;
++}
++
++/* The data-path half, published and retired as one pointer so a frame never
++ * sees one callback without the other. */
++static const struct dpa_qdisc_ops *dpa_qdisc;
++
++int dpa_register_qdisc_ops(const struct dpa_qdisc_ops *ops)
++{
++	if (!ops || !ops->select_queue || !ops->txq_fq || !ops->class_stats)
++		return -EINVAL;
++	/* release-publish so a frame cannot see the pointer before the queue
++	 * map it walks is initialized */
++	if (cmpxchg_release(&dpa_qdisc, NULL, ops))
++		return -EBUSY;
++	return 0;
++}
++EXPORT_SYMBOL(dpa_register_qdisc_ops);
++
++/* Waits for a grace period before returning, so the callbacks' module text
++ * may be freed once it does. Every caller below takes its own rcu_read_lock()
++ * around the pointer and the call, so that holds whatever context it was
++ * entered from. */
++void dpa_unregister_qdisc_ops(void)
++{
++	WRITE_ONCE(dpa_qdisc, NULL);
++	synchronize_net();
++}
++EXPORT_SYMBOL(dpa_unregister_qdisc_ops);
++
++/* The frame queue answered is used for the enqueue after this returns, which
++ * cpe_fp_tx() keeps inside its own read-side section. */
++struct qman_fq *dpa_qdisc_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb)
++{
++	const struct dpa_qdisc_ops *ops;
++	struct qman_fq *fq = NULL;
++
++	rcu_read_lock();
++	ops = READ_ONCE(dpa_qdisc);
++	if (ops)
++		fq = ops->txq_fq(qm_ctx, txq, skb);
++	rcu_read_unlock();
++	return fq;
++}
++
++/* Always answers, so the count of statistics this driver reports is a
++ * compile-time constant rather than something that changes when a module
++ * loads. Unclaimed leaf slots, and every value when nothing is registered,
++ * read zero. */
++void dpa_qdisc_class_stats(void *qm_ctx, u64 *data)
++{
++	const struct dpa_qdisc_ops *ops;
++
++	memset(data, 0, (DPAA_ETH_CEETM_LEAF_QUEUES + DPA_CEETM_IMPLICIT_QUEUES) *
++			DPA_CEETM_CLASS_STATS * sizeof(*data));
++	rcu_read_lock();
++	ops = READ_ONCE(dpa_qdisc);
++	if (ops && qm_ctx)
++		ops->class_stats(qm_ctx, data);
++	rcu_read_unlock();
++}
++
++/* Not always entered with a read-side section held: AF_PACKET's qdisc bypass
++ * calls ndo_select_queue from plain process context, which under PREEMPT_RCU
++ * is no reader at all. So the section is taken here. */
++static u16 dpa_qdisc_select_queue(struct net_device *dev, struct sk_buff *skb,
++				  struct net_device *sb_dev)
++{
++	const struct dpa_qdisc_ops *ops;
++	u16 queue = DPA_SELECT_QUEUE_NONE;
++
++	rcu_read_lock();
++	ops = READ_ONCE(dpa_qdisc);
++	if (ops)
++		queue = ops->select_queue(dev, skb);
++	rcu_read_unlock();
++	if (queue != DPA_SELECT_QUEUE_NONE)
++		return queue;
++	/* Traffic that named no class keeps the stack's own choice -- socket
++	 * affinity and XPS included -- folded back into the queues that carry
++	 * it. The fold is what keeps it off the leaf classes above them, which
++	 * real_num_tx_queues now covers and which are reached only by naming
++	 * one; DPAA_ETH_TX_QUEUES is a power of two for exactly this kind of
++	 * masking. */
++	return netdev_pick_tx(dev, skb, sb_dev) & (DPAA_ETH_TX_QUEUES - 1);
++}
++#endif
++
+ static const struct net_device_ops dpa_private_ops = {
+ 	.ndo_open = dpa_eth_priv_start,
+ 	.ndo_start_xmit = dpa_tx,
+@@ -692,8 +828,13 @@ static const struct net_device_ops dpa_private_ops = {
+ 	.ndo_get_stats64 = dpa_get_stats64,
+ 	.ndo_set_mac_address = dpa_set_mac_address,
+ 	.ndo_validate_addr = eth_validate_addr,
+-#ifdef CONFIG_FMAN_PFC
++#if defined(CONFIG_FMAN_PFC)
+ 	.ndo_select_queue = dpa_select_queue,
++#elif defined(CONFIG_CPE_FAST_PATH)
++	/* Load-bearing beyond the qdisc: the leaf-class queues live above
++	 * real_num_tx_queues' probe-time value, and once one is in service the
++	 * stack's own hash would otherwise spread ordinary traffic across it. */
++	.ndo_select_queue = dpa_qdisc_select_queue,
+ #endif
+ 	.ndo_set_rx_mode = dpa_set_rx_mode,
+ 	.ndo_init = dpa_ndo_init,
+@@ -703,6 +844,9 @@ static const struct net_device_ops dpa_private_ops = {
+ #endif
+ 	.ndo_set_features = dpa_set_features,
+ 	.ndo_fix_features = dpa_fix_features,
++#ifdef CONFIG_CPE_FAST_PATH
++	.ndo_setup_tc = dpa_setup_tc,
++#endif
+ };
+ 
+ static int dpa_private_napi_add(struct net_device *net_dev)
+@@ -779,6 +923,15 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
+ 				NETIF_F_RXCSUM;
+ 	net_dev->lltx               = true;
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++	/* tc_can_offload() gates every hardware qdisc on this bit, and it has
++	 * to be in features rather than only in hw_features to be on by
++	 * default. Offered alongside ndo_setup_tc, since neither is any use
++	 * without the other. */
++	net_dev->hw_features |= NETIF_F_HW_TC;
++	net_dev->features |= NETIF_F_HW_TC;
++#endif
++
+ 	/* Advertise S/G and HIGHDMA support for private interfaces */
+ 	net_dev->hw_features |= NETIF_F_SG | NETIF_F_HIGHDMA;
+ 	/* Recent kernels enable GSO automatically, if
+@@ -953,11 +1106,25 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
+ 	/* Allocate this early, so we can store relevant information in
+ 	 * the private area (needed by 1588 code in dpa_mac_probe)
+ 	 */
+-	net_dev = alloc_etherdev_mq(sizeof(*priv), DPAA_ETH_TX_QUEUES);
++	/* Allocate the leaf-class headroom up front, the way every other
++	 * hardware-qdisc driver does: sch_htb turns the qid a driver hands back
++	 * straight into netdev_get_tx_queue() with no bounds check, so those
++	 * slots have to exist before a class can name one. Only the direct
++	 * queues are live until then; see the real_num_tx_queues call below. */
++	net_dev = alloc_etherdev_mq(sizeof(*priv), DPAA_ETH_TX_QUEUES_MAX);
+ 	if (!net_dev) {
+ 		dev_err(dev, "alloc_etherdev_mq() failed\n");
+ 		goto alloc_etherdev_mq_failed;
+ 	}
++	/* alloc_etherdev_mq() reports every allocated queue as usable. Narrow
++	 * that to the queues that actually have an egress FQ behind them, so
++	 * ordinary traffic never hashes into the reserved range and a later
++	 * qdisc sees an honest count of pre-existing direct queues. */
++	err = netif_set_real_num_tx_queues(net_dev, DPAA_ETH_TX_QUEUES);
++	if (err) {
++		dev_err(dev, "netif_set_real_num_tx_queues() = %d\n", err);
++		goto netif_set_real_num_tx_queues_failed;
++	}
+ 
+ 	/* Do this here, so we can be verbose early */
+ 	SET_NETDEV_DEV(net_dev, dev);
+@@ -1152,6 +1319,8 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
+ alloc_failed:
+ mac_probe_failed:
+ 	dev_set_drvdata(dev, NULL);
++	/* Reached before drvdata is set, so it has nothing to undo. */
++netif_set_real_num_tx_queues_failed:
+ 	free_netdev(net_dev);
+ alloc_etherdev_mq_failed:
+ 	if (atomic_read(&dpa_bp->refs) == 0)
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
+index b83261780d96..80350d0a1a64 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
+@@ -194,13 +194,42 @@ increased buffer size from 2048 to 2176, to accomodate them in contiguous fd */
+ #define fm_l4_frame_is_tcp(parse_result_ptr) \
+ 	((parse_result_ptr)->l4r & FM_L4_PARSE_RESULT_TCP)
+ 
+-/* number of Tx queues to FMan */
++/* Number of Tx queues to FMan that carry ordinary, unclassified traffic.
++ *
++ * These are the queues the CPU sends through: locally generated traffic, flows
++ * that were never offloaded, and the punt path. A hardware-offloaded flow
++ * never reaches one, so this count says nothing about offload capacity.
++ *
++ * It was NR_CPUS, which is a distribution's build-time ceiling rather than a
++ * property of the board: the same driver offered 16 queues under one kernel
++ * configuration and 64 under another, and sized egress_fqs[] and conf_fqs[] to
++ * match. A hardware qdisc allocates its leaf classes out of the queues above
++ * this count, so a budget that moves with someone else's Kconfig cannot be
++ * part of an interface contract.
++ *
++ * Sixteen is chosen because it is what the more constrained of those two
++ * configurations already ran, which makes this a fixed number rather than a
++ * new one. It stays a power of two because the Tx paths index conf_fqs[] with
++ * & (DPAA_ETH_TX_QUEUES - 1). Queues are picked by flow hash rather than by
++ * CPU -- this driver installs no XPS maps -- so the count trades qdisc
++ * contention between concurrent software senders against the frame queues each
++ * one costs, and is not bounded by the core count in either direction.
++ */
+ #ifdef CONFIG_FMAN_PFC
+ #define DPAA_ETH_TX_QUEUES	(NR_CPUS * CONFIG_FMAN_PFC_COS_COUNT)
+ #else
+-#define DPAA_ETH_TX_QUEUES	NR_CPUS
++#define DPAA_ETH_TX_QUEUES	16
+ #endif
+ 
++/* Headroom above the direct queues, one slot per CEETM class queue on a
++ * channel, reserved so a hardware qdisc can hand sch_htb a real and
++ * exclusively owned netdev_queue index for each leaf class. Nothing allocates
++ * an egress FQ for these: a leaf's frames leave through a CEETM logical FQ
++ * that the scheduler owns, not through egress_fqs[].
++ */
++#define DPAA_ETH_CEETM_LEAF_QUEUES	16
++#define DPAA_ETH_TX_QUEUES_MAX	(DPAA_ETH_TX_QUEUES + DPAA_ETH_CEETM_LEAF_QUEUES)
++
+ #define DPAA_ETH_RX_QUEUES	128
+ #define DPAA_IP_VERSION_4  4
+ 
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
+index 46816dcda3cb..f775104c3ae1 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
+@@ -111,6 +111,75 @@ typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint
+ typedef struct qman_fq *(*cdx_get_ceetm_dscp_fq)(void *, uint8_t dscp);
+ int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func);
+ void dpa_unregister_ceetm_get_egress_fq(void);
++
++/* Handler for the netdev's ndo_setup_tc, registered by the offload module
++ * because a built-in driver cannot link against one.
++ *
++ * Registering is not optional once the ndo exists. Netfilter picks its
++ * flowtable binding route on whether the netdev has an ndo_setup_tc at all
++ * (nf_flow_table_offload_setup), so from the moment this driver offers one,
++ * every hardware flowtable bind arrives here instead of through the module's
++ * indirect registration. With no handler those binds are refused, where before
++ * they were served.
++ *
++ * The handler sleeps -- it takes the module's own locks and can wait on RTNL --
++ * so calls are held in an SRCU read-side section, and the unregister returns
++ * only once every call already inside the handler has left it: the module's
++ * text, and anything of its own the handler touches, may go after that.
++ */
++typedef int (*dpa_setup_tc_handler)(struct net_device *dev,
++				    enum tc_setup_type type, void *type_data);
++int dpa_register_setup_tc(dpa_setup_tc_handler handler);
++void dpa_unregister_setup_tc(void);
++
++/* The data-path half of the hardware qdisc, which only the module that hands
++ * out leaf classes can answer.
++ *
++ * select_queue turns a frame into the Tx queue of the leaf class it belongs
++ * to, or DPA_SELECT_QUEUE_NONE when it belongs to none, which leaves the
++ * stack's own choice in place -- folded below the leaf range by the caller,
++ * because real_num_tx_queues covers those queues once a class is using one and
++ * nothing but a named class may be sent there.
++ *
++ * txq_fq then names the CEETM frame queue a frame on that Tx queue leaves by.
++ * For a leaf's queue that is the leaf's class queue: reading the class from
++ * the queue index rather than resolving the mark a second time is what keeps
++ * the software path on the same class the hardware path put the flow on. For
++ * an ordinary queue it is where a frame that named no class goes on a port the
++ * module's tree owns, which the module decides from the frame itself -- so it
++ * is handed the skb. NULL means the module has no tree on the port, and only
++ * then does the driver resolve the frame from its own mark: on a port with a
++ * tree that reading would pick queues the tree never configured.
++ *
++ * class_stats fills the hardware counters for every leaf slot, in slot order,
++ * DPA_CEETM_CLASS_STATS values each, and then for the DPA_CEETM_IMPLICIT_QUEUES
++ * queues traffic that names no leaf takes: the one unclassified traffic goes
++ * to, then the one control traffic goes to. It fills all of them whatever the
++ * tree currently looks like, zeroing what nothing holds, because ethtool's
++ * string set is fixed length: names and values arrive in separate ioctls, so a
++ * count that moved with tc would leave userspace reading one against the other.
++ *
++ * None of the three may sleep. Each is called inside an rcu_read_lock() the
++ * driver takes itself -- ndo_select_queue has callers that hold none, AF_PACKET's
++ * qdisc bypass among them -- and the unregister waits for a grace period, so
++ * the module may free its text and state once it returns. A frame queue txq_fq
++ * answers with has to stay valid for the enqueue that follows, which the
++ * transmit path keeps inside its own read-side section.
++ */
++#define DPA_SELECT_QUEUE_NONE	((u16)~0U)
++/* dequeued frames, dequeued bytes, rejected frames */
++#define DPA_CEETM_CLASS_STATS	3
++/* the unclassified queue, then the control queue, after the leaf slots */
++#define DPA_CEETM_IMPLICIT_QUEUES	2
++struct dpa_qdisc_ops {
++	u16 (*select_queue)(struct net_device *dev, struct sk_buff *skb);
++	struct qman_fq *(*txq_fq)(void *qm_ctx, u16 txq, struct sk_buff *skb);
++	void (*class_stats)(void *qm_ctx, u64 *data);
++};
++void dpa_qdisc_class_stats(void *qm_ctx, u64 *data);
++int dpa_register_qdisc_ops(const struct dpa_qdisc_ops *ops);
++void dpa_unregister_qdisc_ops(void);
++struct qman_fq *dpa_qdisc_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb);
+ #endif
+ 
+ 
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+index 62fc7105e9c9..903a88e95aad 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+@@ -1454,9 +1454,9 @@ EXPORT_SYMBOL(skb_to_sg_fd);
+ #define EMAC_QUEUENUM_MASK 0xff
+ 
+ #ifdef CONFIG_CPE_FAST_PATH
+-/* Resolve a frame's CEETM class from the skb mark. This is the fallback for
+- * frames the qdisc layer did not already place on a leaf class's Tx queue;
+- * a frame that did carries its class in the queue index instead.
++/* Resolve a frame's CEETM class from the skb mark. This is the resolution for
++ * a port with no hardware qdisc; on a port with one, the qdisc module names
++ * every frame's queue itself (dpa_qdisc_txq_fq()).
+  */
+ static int pfe_eth_get_queuenum( struct sk_buff *skb )
+ {
+@@ -1917,9 +1917,22 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 		egress_fq = NULL;
+ 		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when the frame names
+ 						no class and the DSCP map answers */
++		/* A hardware qdisc has already decided this frame's class, in
++		 * ndo_select_queue and from the same key the hardware rule used,
++		 * and put the frame on that leaf's Tx queue. Reading the class
++		 * back out of the queue index is what stops the two paths
++		 * resolving it twice and disagreeing. A frame on an ordinary
++		 * queue named no class, and on a port the qdisc owns the qdisc
++		 * decides where it goes too, from the frame. Only a port with no
++		 * qdisc answers NULL, and the mark and DSCP paths below are
++		 * reached there exactly as before -- and nowhere else. */
++		egress_fq = dpa_qdisc_txq_fq(priv->qm_ctx, skb_get_queue_mapping(skb),
++					     skb);
++		if (egress_fq)
++			get_ceetm_cm_egress_fq = 0;
+ 		/* No class named, so take the DSCP from the frame and let the
+ 		 * map choose the egress fq. */
+-		if (!markval && ceetm_get_dscp_fq) {
++		if (get_ceetm_cm_egress_fq && !markval && ceetm_get_dscp_fq) {
+ 			skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
+ 			if (skb_nh)
+ 			{
+@@ -1961,7 +1974,14 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+ 			queuenum = queuenum % DPAA_ETH_TX_QUEUES;
+ 		egress_fq = priv->egress_fqs[queuenum];
+ 	}
+-	conf_fq = priv->conf_fqs[queuenum  & (DPAA_ETH_TX_QUEUES-1)];
++	/* Confirm on the queue that sent the frame. This indexed conf_fqs[] with
++	 * queuenum, which in the CEETM branch is a class-queue id and not a Tx
++	 * queue at all -- so a DSCP-classified frame, whose queuenum is always
++	 * zero, confirmed on conf_fqs[0] whichever core sent it, and a marked
++	 * one confirmed on whichever conf queue its class happened to number.
++	 * Neither is the queue whose Tx ring the frame left by, which is what
++	 * confirmation accounting and completion affinity both assume. */
++	conf_fq = priv->conf_fqs[skb_get_queue_mapping(skb) & (DPAA_ETH_TX_QUEUES - 1)];
+ 	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
+ }
+ 
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
+index 95f6db29416b..6ff76952144f 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
+@@ -93,6 +93,45 @@ static char dpa_stats_global[][ETH_GSTRING_LEN] = {
+ #define DPA_STATS_PERCPU_LEN ARRAY_SIZE(dpa_stats_percpu)
+ #define DPA_STATS_GLOBAL_LEN ARRAY_SIZE(dpa_stats_global)
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++/* What a hardware qdisc's leaf classes actually dequeued and dropped.
++ *
++ * These are the only counters that describe accelerated traffic. A leaf class
++ * has a software qdisc too, and tc reports that one, but an offloaded flow
++ * produces no skb and never enqueues there -- so `tc -s class show` reads
++ * approximately zero for precisely the traffic being accelerated, and this is
++ * where the rest of the link is.
++ *
++ * One entry per leaf slot rather than per class in the tree, so the count is a
++ * constant: ethtool fetches the names and the values in separate ioctls, and a
++ * count that moved with `tc class add` would leave userspace lining one up
++ * against the other. A slot no class holds reads zero.
++ *
++ * Then the two queues traffic that names no leaf takes, which a leaf may or
++ * may not hold: [default], where unclassified traffic goes, and [control],
++ * where the frames that keep the link and the gateway itself running go. A
++ * leaf holding one reports the same queue under its own slot too.
++ */
++static const char dpa_stats_ceetm[][ETH_GSTRING_LEN] = {
++	"ceetm dequeued frames",
++	"ceetm dequeued bytes",
++	"ceetm rejected frames",
++};
++
++/* In the order dpa_qdisc_ops.class_stats fills them, after the leaf slots. */
++static const char * const dpa_stats_ceetm_implicit[] = { "default", "control" };
++static_assert(ARRAY_SIZE(dpa_stats_ceetm_implicit) == DPA_CEETM_IMPLICIT_QUEUES,
++	      "one name per queue the qdisc module reports beyond the leaves");
++
++#define DPA_STATS_CEETM_LEN \
++	((DPAA_ETH_CEETM_LEAF_QUEUES + DPA_CEETM_IMPLICIT_QUEUES) * \
++	 ARRAY_SIZE(dpa_stats_ceetm))
++static_assert(ARRAY_SIZE(dpa_stats_ceetm) == DPA_CEETM_CLASS_STATS,
++	      "one name per value the qdisc module reports");
++#else
++#define DPA_STATS_CEETM_LEN 0
++#endif
++
+ static int __cold dpa_get_ksettings(struct net_device *net_dev,
+ 		struct ethtool_link_ksettings *cmd)
+ {
+@@ -359,7 +398,8 @@ static int dpa_get_sset_count(struct net_device *net_dev, int type)
+ 	unsigned int total_stats, num_stats;
+ 
+ 	num_stats   = num_online_cpus() + 1;
+-	total_stats = num_stats * DPA_STATS_PERCPU_LEN + DPA_STATS_GLOBAL_LEN;
++	total_stats = num_stats * DPA_STATS_PERCPU_LEN + DPA_STATS_GLOBAL_LEN +
++		      DPA_STATS_CEETM_LEN;
+ 
+ 	switch (type) {
+ 	case ETH_SS_STATS:
+@@ -482,6 +522,14 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
+ 	data[offset++] = cg_time;
+ 	data[offset++] = cg_num;
+ 	data[offset++] = cg_status;
++
++#ifdef CONFIG_CPE_FAST_PATH
++	/* Read rather than accumulated: these are hardware counters, and they
++	 * are read without the clear flag so repeated calls report totals and
++	 * not deltas. A control plane that clears them -- CMD_QM_QUERY_QUEUE
++	 * can -- moves the baseline underneath this. */
++	dpa_qdisc_class_stats(priv->qm_ctx, data + offset);
++#endif
+ }
+ 
+ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
+@@ -505,6 +553,21 @@ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
+ 		strings += ETH_GSTRING_LEN;
+ 	}
+ 	memcpy(strings, dpa_stats_global, size);
++	strings += size;
++
++#ifdef CONFIG_CPE_FAST_PATH
++	/* Leaf i is Tx queue DPAA_ETH_TX_QUEUES + i, which is what
++	 * TC_HTB_LEAF_QUERY_QUEUE answers for a classid. Every name fits
++	 * ETH_GSTRING_LEN, the longest -- "ceetm rejected frames [leaf 15]" and
++	 * "ceetm dequeued frames [default]" -- with no room to spare. */
++	for (i = 0; i < DPAA_ETH_CEETM_LEAF_QUEUES; i++)
++		for (j = 0; j < ARRAY_SIZE(dpa_stats_ceetm); j++)
++			ethtool_sprintf(&strings, "%s [leaf %u]", dpa_stats_ceetm[j], i);
++	for (i = 0; i < ARRAY_SIZE(dpa_stats_ceetm_implicit); i++)
++		for (j = 0; j < ARRAY_SIZE(dpa_stats_ceetm); j++)
++			ethtool_sprintf(&strings, "%s [%s]", dpa_stats_ceetm[j],
++					dpa_stats_ceetm_implicit[i]);
++#endif
+ }
+ 
+ static int dpaa_get_ts_info(struct net_device *net_dev,
+-- 
+2.47.3
+

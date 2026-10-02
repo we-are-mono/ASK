@@ -10,11 +10,11 @@
 
 /*
  * Concurrency:
- *   The IPsec SA lifecycle (add, remove, update) is driven by
- *   netlink from userspace through the FCI command path, which
- *   serializes ioctl dispatch through cdx_cmdhandler via
- *   ctrl->mutex (see cdx_main.c). SA state mutations therefore
- *   run single-threaded with respect to each other.
+ *   The IPsec SA lifecycle (add, remove, update) is driven by the
+ *   flowtable adapter's XFRM provider through cdx_ipsec_backend.c,
+ *   inside the flowtable transaction, which holds ctrl->mutex (see
+ *   cdx_main.c). SA state mutations therefore run single-threaded
+ *   with respect to each other.
  *
  *   Per-SA DMA maps (auth_key_dma, crypto_key_dma, shared_desc):
  *      - Maps/unmaps happen inside a single call to
@@ -38,20 +38,27 @@
  *        command path.
  *
  * Contexts:
- *   cdx_ipsec_add/remove/update_*     - process, FCI command.
+ *   cdx_ipsec_add/remove/update_*     - process, flowtable transaction.
  *   cdx_ipsec_sec_sa_context_*        - process, under command path.
- *   split_key_done (CAAM callback)    - softirq; touches only the
- *                                       per-call completion atomic_t.
+ *   split_key_done (CAAM callback)    - softirq; the kernel's own, it
+ *                                       touches only the per-call
+ *                                       split_key_result, which
+ *                                       cdx_ipsec_generate_split_key()
+ *                                       keeps alive until it completes.
  */
 #ifdef DPA_IPSEC_OFFLOAD
 #include <linux/delay.h>
 #include <linux/udp.h>
+#include <linux/random.h>
 #include <linux/reboot.h>
 #include "error.h"
 #include "desc.h"
 #include "jr.h"
 #include "pdb.h"
 #include "desc_constr.h"
+/* The kernel's split-key job completion and pad lengths; after
+ * desc_constr.h, whose struct alginfo it names. */
+#include "key_gen.h"
 /* intern.h needs compat.h and regs.h in scope first; pdb.h and
  * desc_constr.h above already pull them in, so it goes last. */
 #include "intern.h"
@@ -61,8 +68,6 @@
 #include "cdx_common.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
-#include "control_pppoe.h"
-#include "control_socket.h"
 #include "layer2.h"
 #include "control_ipsec.h"
 
@@ -70,6 +75,7 @@
 #include "fm_ehash.h"
 #include "dpa_control_mc.h"
 #include "fe.h"
+#include "cdx_flowtable_backend.h"
 
 //#define CDX_DPA_DEBUG	1
 
@@ -290,39 +296,15 @@ static inline void cdx_ipsec_capture_post_free(void *p, size_t n) { }
 
 
 
-/*
- * to retrieve a 256 byte aligned buffer address from an address
- * we need to copy only the first 7 bytes
- */
-#define ALIGNED_PTR_ADDRESS_SZ  (CAAM_PTR_SZ - 1)
-
-#define JOB_DESC_HDR_LEN        CAAM_CMD_SZ
-#define SEQ_OUT_PTR_SGF_MASK    0x01000000;
-
 #define SEQ_NUM_HI_MASK         0xFFFFFFFF00000000
 #define SEQ_NUM_LOW_MASK        0x00000000FFFFFFFF
 
 #define POST_SEC_OUT_DATA_OFFSET 128 //bytes multiple of 64
 #define POST_SEC_IN_DATA_OFFSET  128 //bytes multiple of 64
 
-/* relative offset where the input pointer should be updated in the descriptor*/
-#define IN_PTR_REL_OFF          4 /* words from current location */
-
-/* dummy pointer value */
-#define DUMMY_PTR_VAL           0x00000000
-#define PTR_LEN                 2       /* Descriptor is created only for 8 byte
-                                         * pointer. PTR_LEN is in words. */
-#define ETH_HDR_LEN		14 
+#define ETH_HDR_LEN		14
 #define PPPOE_HDR_LEN		8 
 #define UDP_HEADER_LEN          8
-
-extern int gIPSecStatQueryTimer;
-/*Here 1300000 value came based on 128 packet size max packets getting fastforwarded
- * is 921828. On safe side increased it to 1300000.
- */
-#define MAX_IPSEC_PKTS_FWD_PSEC	1300000
-#define SEQ_NUM_SOFT_LIMIT	(0xFFFFFFFF - (MAX_IPSEC_PKTS_FWD_PSEC * gIPSecStatQueryTimer))
-#define SEQ_NUM_ESN_SOFT_LIMIT	(0xFFFFFFFFFFFFFFFF - (MAX_IPSEC_PKTS_FWD_PSEC * gIPSecStatQueryTimer))
 
 struct ipsec_info *ipsec_instance;
 int sec_era;
@@ -335,8 +317,7 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
 {
 	return cipher_type == OP_PCL_IPSEC_AES_GCM8 ||
 	       cipher_type == OP_PCL_IPSEC_AES_GCM12 ||
-	       cipher_type == OP_PCL_IPSEC_AES_GCM16 ||
-	       cipher_type == OP_PCL_IPSEC_AES_GMAC;
+	       cipher_type == OP_PCL_IPSEC_AES_GCM16;
 }
 
 /*
@@ -374,7 +355,7 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
  *    1390 bytes) and line-rate TCP bursts overrun it and tail-drop
  *    (measured 65 Mbit/s with ~1000 retransmits on a 10 s stream).
  *
- * GCM/GMAC therefore run SERIAL without SAVECTX; the other ciphers
+ * GCM therefore runs SERIAL without SAVECTX; the other ciphers
  * keep the SERIAL+SAVECTX arrangement they have always shipped with.
  * The paired half of the fix is in save_sa_state_in_external_mem():
  * RM §7.3.1 requires every job of a WAIT/SERIAL flow to STORE the PDB
@@ -385,13 +366,15 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
  * ICV failures per 12 s at blast load; SERIAL without SAVECTX plus
  * the PDB store produces zero ICV failures and 2.55 Gbit/s TCP with
  * 20 retransmits — ahead of the CBC+HMAC production path on the same
- * boot (2.37 Gbit/s, 842 retransmits). The residual ESP-level
- * replay-window rejections (~0.45 % at full TCP rate) do not surface
- * as TCP loss (9805 rejections vs 20 retransmits in the same run):
- * the rejected frames are redundant wire duplicates the peer's
- * anti-replay window discards by design, a platform-wide DPAA/SEC
- * trait the CBC path shares (0.154 % at blast scale). NEVER sharing
- * is documented by the RM itself to duplicate sequence numbers.
+ * boot (2.37 Gbit/s, 842 retransmits). The ESP-level replay-window
+ * rejections still measured then (~0.45 % at full TCP rate, 0.154 %
+ * on CBC at blast scale, and the WAIT figure above) were distinct
+ * frames sharing a sequence number, not wire duplicates. SEC orders
+ * an SA's jobs only among frames carrying the same ICID (RM §7.3.2),
+ * and FMan-fed frames carried ICID 0 against the CPU portals' 63
+ * until the SDK FMan driver kept the firmware's port ICIDs (kernel
+ * patch 106). NEVER sharing is documented by the RM itself to
+ * duplicate sequence numbers.
  */
 static uint32_t cdx_ipsec_sh_desc_hdr_flags(PSAEntry sa)
 {
@@ -400,8 +383,6 @@ static uint32_t cdx_ipsec_sh_desc_hdr_flags(PSAEntry sa)
 
 	return HDR_SAVECTX | HDR_SHARE_SERIAL;
 }
-
-extern void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
 
 extern int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num);
 
@@ -433,6 +414,20 @@ static void cdx_ipsec_release_jr(void)
 
 	if (jrdev)
 		caam_jr_free(jrdev);
+}
+
+/* Whether an SA can be built at all: the DPA side (offline port, pool,
+ * frame queues) and the SEC side (a job ring) are both claimed at module
+ * init, and either can be missing on a board whose device tree does not
+ * describe it. Consulted before anything that would touch either -- SA
+ * admission by both owners, the xfrmdev attachment that advertises the
+ * capability, the table descriptors the encoder arms with -- so that the
+ * absence is a refusal at the entry rather than a fault several layers in.
+ * The job ring is also given back by the reboot notifier, which makes this
+ * false for the shutdown as well. */
+bool cdx_ipsec_ready(void)
+{
+	return cdx_dpa_ipsec_ready() && READ_ONCE(jrdev_g);
 }
 
 static int cdx_ipsec_reboot_notify(struct notifier_block *nb,
@@ -487,10 +482,52 @@ void cdx_ipsec_deinit(void)
 }
 
 
+/* How many bytes larger than what it is handed an outbound SA's frames leave
+ * SEC: its port's MTU less its own, the whole of ESP's overhead (A227), as
+ * they stood when the SA was installed. A flowtable direction carries its own,
+ * from its outer path at admission (CtEntry.sec_expansion); this is what an
+ * entry without one gets. */
+static u16 cdx_ipsec_expansion_of(PSAEntry sa)
+{
+	return sa->dev_mtu > sa->mtu ? sa->dev_mtu - sa->mtu : 0;
+}
+
+bool cdx_ipsec_sa_outbound(u16 handle)
+{
+	PSAEntry sa = M_ipsec_sa_cache_lookup_by_h(handle);
+
+	return sa && sa->direction == CDX_DPA_IPSEC_OUTBOUND;
+}
+
+/* Allocation is shared by both directions and retained with the queues. */
+uint32_t cdx_ipsec_key_tag_of(PSAEntry sa)
+{
+	return ipsec_get_key_tag(sa->pSec_sa_context->dpa_ipsecsa_handle);
+}
+
+/* The tables a decrypted flow may be classified in on the offline port: the
+ * ones whose forwarding actions validate the SA VLAN. The shared
+ * encoder files a UDP flow without ports under multicast, which that port has
+ * no table for, so such a flow stays in software. */
+static bool cdx_ipsec_decrypted_table(uint32_t tbl_type)
+{
+	return tbl_type == IPV4_TCP_TABLE || tbl_type == IPV4_UDP_TABLE ||
+	       tbl_type == IPV6_TCP_TABLE || tbl_type == IPV6_UDP_TABLE;
+}
+
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 {
 	int i;
 	PSAEntry sa;
+
+	/* A handle the SA cache does not hold is a refusal, not a direction
+	 * without that SA: a decrypted direction skipped here would be
+	 * installed on its physical port, keyed to match the same tuple in
+	 * the clear, and an encrypted one would leave unencrypted. */
+	for (i = 0; i < SA_MAX_OP; i++)
+		if (entry->hSAEntry[i] &&
+		    !M_ipsec_sa_cache_lookup_by_h(entry->hSAEntry[i]))
+			return -1;
   
 	for (i=0;i < SA_MAX_OP;i++)
 	{ 
@@ -502,15 +539,23 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 				info->to_sec_fqid = 
 				sa->pSec_sa_context->to_sec_fqid;
 				info->sa_family = sa->family ;
-				info->tnl_hdr_size = (sa->dev_mtu - sa->mtu); /* Gives you the header expansion size */
+				info->tnl_hdr_size = entry->sec_expansion ?:
+						     cdx_ipsec_expansion_of(sa);
 #ifdef CDX_DPA_DEBUG	
 				printk(KERN_CRIT "%s OutBound SA info->to_sec_fqid  = %d\n", __func__,info->to_sec_fqid );
 #endif				
 			}else{
+				/* Every SA reaches this offline port. A tuple hit
+				 * must validate the tag of the SA for which Linux
+				 * admitted the decrypted flow. */
+				if (!cdx_ipsec_decrypted_table(info->tbl_type))
+					return -1;
 				info->l3_info.ipsec_inbound_flow = 1;
-				dpa_ipsec_ofport_td(ipsec_instance, 
-					info->tbl_type, &info->td, &info->port_id );
-#ifdef CDX_DPA_DEBUG	
+				info->sec_tag = cdx_ipsec_key_tag_of(sa);
+				if (dpa_ipsec_ofport_td(ipsec_instance,
+					info->tbl_type, &info->td, &info->port_id))
+					return -1;
+#ifdef CDX_DPA_DEBUG
 //			printk(KERN_CRIT "%s InBound SA info->td  = %d\n", __func__,info->td );
 #endif
 			}
@@ -519,13 +564,34 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 	return 0;
 }
 
+/* Call after the SA's request queue is OOS. SEC RM CSTA[IDLE] proves that
+ * jobs already dequeued by QI have also finished; QMan retirement alone does
+ * not. A busy or wedged SEC is not permission to reuse a descriptor or tag.
+ * Other SAs may continue running: one idle observation is sufficient once
+ * this SA can no longer submit work. */
+bool cdx_ipsec_wait_sec_idle(void)
+{
+	struct caam_drv_private *ctrlpriv;
+	unsigned int tries;
+
+	if (!jrdev_g)
+		return false;
+	ctrlpriv = dev_get_drvdata(jrdev_g->parent);
+	for (tries = 0; tries < 100; tries++) {
+		if (rd_reg32(&ctrlpriv->ctrl->perfmon.status) & BIT(1))
+			return true;
+		usleep_range(100, 200);
+	}
+	return false;
+}
+
 void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 {
 	/*
 	 * A24b: if cdx_dpa_ipsecsa_release fails (qman_oos_fq did not move
 	 * the FQ to OOS), QMan still owns the sainfo memory and may invoke
 	 * dqrr/ern callbacks on it. Freeing the per-SA crypto material below
-	 * — cipher_key, auth_key, split_key, extra_cmds — would
+	 * — cipher_key, auth_key, split_key — would
 	 * UAF those buffers from the SEC pipeline (they are DMA-mapped while
 	 * any in-flight op is still resident). Leak the sec_context entirely
 	 * and let the operator restart to recover the resources. The leak is
@@ -577,8 +643,6 @@ void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 		kfree_sensitive(pdpa_sec_context->auth_data.auth_key);
 	if(pdpa_sec_context->auth_data.split_key)
 		kfree_sensitive(pdpa_sec_context->auth_data.split_key);
-	if(pdpa_sec_context->sec_desc_extra_cmds_unaligned)
-		kfree(pdpa_sec_context->sec_desc_extra_cmds_unaligned);
 	kfree(pdpa_sec_context);
 }
 
@@ -623,17 +687,16 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 		__func__,__LINE__,(pSA->direction)?"INBOUND":"OUTBOUND",
 		pSA->handle,
 		pSA->pSec_sa_context ? pSA->pSec_sa_context->to_sec_fqid : 0);
-	/* WE need to lock below section of code */
+	/* A NAT-T root remains installed until its last SA owner leaves. */
 	if (IS_NATT_SA(pSA) && pSA->ct && (pSA->ct->handle))
 	{
 		natt_tbl_entry = pSA->ct->handle;
-		if ( (pSA->direction == CDX_DPA_IPSEC_OUTBOUND) && (pSA->ct->natt_out_refcnt > 1))
-		{
+		if (pSA->direction == CDX_DPA_IPSEC_OUTBOUND && pSA->ct->natt_out_refcnt > 1) {
 			pSA->ct->natt_out_refcnt--;
 			pSA->ct = NULL;
 			return 0;
 		}
-		else if ((pSA->direction == CDX_DPA_IPSEC_INBOUND) && (pSA->ct->natt_in_refcnt > 1))
+		if ((pSA->direction == CDX_DPA_IPSEC_INBOUND) && (pSA->ct->natt_in_refcnt > 1))
 		{
 			ipsec_preempt_params = ( struct en_ehash_ipsec_preempt_op *)natt_tbl_entry->ipsec_preempt_params;
 			pSA->ct->natt_in_refcnt--;
@@ -654,13 +717,26 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 		 * is safe and leaves no stale pointer to a handle this SA no
 		 * longer owns.
 		 *
-		 * The rc is still reported (negative on failure) so callers can
-		 * log; none takes a different action on it - since the teardown
-		 * here is complete, there is nothing left to defer. */
+		 * What the entry names is another matter, and this is the only
+		 * place that knows: both callers -- the SA delete and an
+		 * outbound next-hop rebuild, after which the SA holds no entry
+		 * for its own delete to find -- come through here. A key that
+		 * may still be linked may still resolve, so the ports stop, as
+		 * any such key demands. An inbound SA's entry enqueues to its
+		 * TO_SEC FQID, and an outbound one validates its SEC tag: both
+		 * identities must stay reserved past the SA's release. The
+		 * unsynced arm is out of the table and parked; it needs
+		 * neither. */
 		rc = cdx_ehash_delete_entry(pSA->ct->td, pSA->ct->index,
 				pSA->ct->handle);
 		if (rc)
 			DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
+		if (rc && rc != EN_EHASH_DELETE_UNSYNCED) {
+			if (pSA->pSec_sa_context &&
+			    pSA->pSec_sa_context->dpa_ipsecsa_handle)
+				cdx_dpa_ipsecsa_keep_fqids(pSA->pSec_sa_context->dpa_ipsecsa_handle);
+			cdx_ft_fatal();
+		}
 		pSA->ct->handle =  NULL;
 		hwct = pSA->ct;
 		pSA->ct = NULL;
@@ -731,9 +807,6 @@ static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 	/* delete from list_fq */
 	sa_remove_from_list_fqid(pSA);
 
-	/* remove xfrm_state */
-	if (pSA->xfrm_state)
-		cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(pSA->xfrm_state);
 	sa_context = pSA->pSec_sa_context;
 	cdx_ipsec_sec_sa_context_free(sa_context);
 	pSA->pSec_sa_context = NULL;
@@ -749,7 +822,8 @@ void cdx_ipsec_release_sa_resources(PSAEntry pSA)
 	/* Delete the hash table entry. On failure the callee has already
 	 * disposed of ct/handle under the ehash tri-state (quarantine or
 	 * loud leak) and cleared pSA->ct - nothing is deferred to the
-	 * release timer any more. */
+	 * release timer any more. An entry that may still be linked has pinned
+	 * the FQIDs and SEC identity the release below would otherwise free. */
 	cdx_ipsec_delete_fp_entry(pSA);
 
 	/* change frame queues states */
@@ -809,25 +883,6 @@ PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc(uint32_t handle)
 	}
 	memset(pdpa_sec_context->auth_data.split_key, 0, MAX_AUTH_KEY_LEN);
 
-	/* Allocate space for extra material space in case when the
-	 * descriptor is greater than 64 words */
-	pdpa_sec_context->sec_desc_extra_cmds_unaligned =
-		kzalloc(2 * MAX_EXTRA_DESC_COMMANDS + L1_CACHE_BYTES,
-				GFP_KERNEL);
-	if (!pdpa_sec_context->sec_desc_extra_cmds_unaligned) {
-		log_err("Allocation failed for CAAM extra commands\n");
-		cdx_ipsec_sec_sa_context_free(pdpa_sec_context); 
-		return NULL;
-	}
-	memset(pdpa_sec_context->sec_desc_extra_cmds_unaligned, 0,(2* MAX_EXTRA_DESC_COMMANDS + L1_CACHE_BYTES));
-
-	pdpa_sec_context->sec_desc_extra_cmds =
-		PTR_ALIGN(pdpa_sec_context->sec_desc_extra_cmds_unaligned,
-				L1_CACHE_BYTES);
-	if (pdpa_sec_context->sec_desc_extra_cmds_unaligned ==
-			pdpa_sec_context->sec_desc_extra_cmds)
-		pdpa_sec_context->sec_desc_extra_cmds += L1_CACHE_BYTES / 4;
-
 	pdpa_sec_context->dpa_ipsecsa_handle  = cdx_dpa_ipsecsa_alloc(NULL, handle);
 	if(pdpa_sec_context->dpa_ipsecsa_handle){
 		pdpa_sec_context->sec_desc =
@@ -844,11 +899,41 @@ PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc(uint32_t handle)
 	return pdpa_sec_context;	
 }
 
+/* How much of the shared descriptor the PDB takes, the per-SA counters that
+ * trail it included.
+ *
+ * The encapsulation PDB carries the outer header it prepends after its fixed
+ * part -- 20 bytes for IPv4, 40 for IPv6, 8 more for the UDP header of NAT-T
+ * -- rounded up to whole words, and ip_hdr_len says how much. The
+ * decapsulation PDB has no header of its own to carry: its length, and so the
+ * counters' place, is the same for either family.
+ */
+static size_t cdx_ipsec_pdb_len(PSAEntry sa)
+{
+	struct sec_descriptor *sec_desc = sa->pSec_sa_context->sec_desc;
+	size_t len = CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
+
+	if (sa->direction == CDX_DPA_IPSEC_OUTBOUND)
+		return len + sizeof(struct ipsec_encap_pdb) +
+		       ((caam32_to_cpu(sec_desc->pdb_en.ip_hdr_len) + 3) & ~3);
+	return len + sizeof(struct ipsec_decap_pdb);
+}
+
+/* Where the per-SA counters sit in the shared descriptor, in bytes: the last
+ * CDX_DPA_IPSEC_STATS_LEN words of the PDB area, which starts behind the
+ * descriptor's header word. The descriptor's MOVE commands address them by
+ * this offset, and get_stats_from_sa() reads them there. */
+static uint32_t cdx_ipsec_stats_offset(size_t pdb_len)
+{
+	return sizeof(((struct sec_descriptor *)NULL)->hdr_word) + pdb_len -
+	       CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
+}
+
 static  void build_stats_descriptor_part(PSAEntry sa, size_t pdb_len)
 {
 	uint32_t *desc;
 	uint32_t stats_offset;
-	PDpaSecSAContext pSec_sa_context ; 
+	PDpaSecSAContext pSec_sa_context ;
 
 
 	BUG_ON(!sa);
@@ -856,7 +941,7 @@ static  void build_stats_descriptor_part(PSAEntry sa, size_t pdb_len)
 	pSec_sa_context= sa->pSec_sa_context;
 	desc = (u32 *) pSec_sa_context->sec_desc->shared_desc;
 
-	stats_offset = sizeof(pSec_sa_context->sec_desc->hdr_word) + pdb_len - CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
+	stats_offset = cdx_ipsec_stats_offset(pdb_len);
 	sa->stats_offset = stats_offset;
 	memset((u8 *)desc + stats_offset, 0, CDX_DPA_IPSEC_STATS_LEN * sizeof(u32));
 
@@ -898,12 +983,11 @@ static  void build_stats_descriptor_part(PSAEntry sa, size_t pdb_len)
 			((stats_offset + 8) << MOVE_OFFSET_SHIFT) | sizeof(u64));
 }
 
-void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow)
+void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes)
 {
 	uint32_t *desc;
 	uint32_t *stats_desc;
 	uint64_t* bytes_desc;
-	uint64_t  ullCurSeqNum;
 
 	PDpaSecSAContext pSec_sa_context = sa->pSec_sa_context;
 
@@ -912,44 +996,83 @@ void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow)
 
 	stats_desc++;
 	*pkts =  be32_to_cpu(*stats_desc);
-	if ((pSeqOverflow) && (!sa->seq_overflow))
-	{
-		if (sa->direction  == CDX_DPA_IPSEC_OUTBOUND)
-		{
-			ullCurSeqNum = be32_to_cpu(sa->pSec_sa_context->sec_desc->pdb_en.seq_num_ext_hi);
-			ullCurSeqNum <<= 32;
-			ullCurSeqNum |= be32_to_cpu(sa->pSec_sa_context->sec_desc->pdb_en.seq_num);
-		}
-		else
-		{
-			ullCurSeqNum = be32_to_cpu(sa->pSec_sa_context->sec_desc->pdb_dec.seq_num_ext_hi);
-			ullCurSeqNum <<= 32;
-			ullCurSeqNum |= be32_to_cpu(sa->pSec_sa_context->sec_desc->pdb_dec.seq_num); 
-		}
-
-		if (sa->flags & SA_ALLOW_EXT_SEQ_NUM)
-		{
-			if (ullCurSeqNum > SEQ_NUM_ESN_SOFT_LIMIT)
-			{
-				*pSeqOverflow = 1;
-				sa->seq_overflow = 1;
-			}
-		}
-		else
-		{
-			if (ullCurSeqNum > SEQ_NUM_SOFT_LIMIT)
-			{
-				*pSeqOverflow = 1;
-				sa->seq_overflow = 1;
-			}
-		}
-	}
 	/* increment 8 bytes to go to byte cnt */
 	stats_desc++;
 	bytes_desc = (uint64_t*)stats_desc;
 	*bytes = be64_to_cpu(*bytes_desc);
 
 	return;
+}
+
+/* The next ESN sequence number an outbound SA will send, high word then low,
+ * each read once. */
+static u64 cdx_ipsec_next_esn(struct sec_descriptor *sec_desc)
+{
+	u64 hi = caam32_to_cpu(READ_ONCE(sec_desc->pdb_en.seq_num_ext_hi));
+
+	return hi << 32 | caam32_to_cpu(READ_ONCE(sec_desc->pdb_en.seq_num));
+}
+
+/* How many readings of an ESN number to take before settling for one. */
+#define CDX_IPSEC_OSEQ_TRIES 8
+
+/* The last sequence number an outbound SA put on the wire, in the units xfrm's
+ * own oseq counts. The PDB holds the next one to send -- SEC sends the stored
+ * value and then increments it, which is why cdx_ipsec_build_out_sa_pdb()
+ * seeds it one past sa->seq -- so this is that value less one.
+ *
+ * Without ESN only the low word exists: one aligned load, and the difference
+ * taken in 32 bits to match. With ESN the number spans two words that SEC's
+ * store rewrites one after the other, and a reading across the carry can pair
+ * either word's new value with the other's old one -- 2^32 out, high or low.
+ * Re-reading the high word around the low one does not settle it, since the
+ * store may write either word first; so the whole number is read until two
+ * readings agree. One that never holds still is reported as the lower of its
+ * last two readings: the number is only ever published forward, where low
+ * errs safe and high would have a re-added SA skip 2^32 numbers.
+ */
+u64 get_oseq_from_sa(PSAEntry sa)
+{
+	struct sec_descriptor *sec_desc = sa->pSec_sa_context->sec_desc;
+	unsigned int tries;
+	u64 next, again, low;
+
+	if (!(sa->flags & SA_ALLOW_EXT_SEQ_NUM))
+		return (u32)(caam32_to_cpu(READ_ONCE(sec_desc->pdb_en.seq_num)) - 1);
+	next = cdx_ipsec_next_esn(sec_desc);
+	low = next;
+	for (tries = 0; tries < CDX_IPSEC_OSEQ_TRIES; tries++) {
+		again = cdx_ipsec_next_esn(sec_desc);
+		if (again == next)
+			return next - 1;
+		low = min(next, again);
+		next = again;
+	}
+	return low - 1;
+}
+
+static_assert(sizeof_field(struct ipsec_decap_pdb, anti_replay) ==
+	      SA_REPLAY_SEEN_WORDS * sizeof(u32));
+
+/* Where an inbound SA's anti-replay window stands, as SEC keeps it in the
+ * PDB: the highest sequence number received, with the ESN high word when the
+ * SA has one, and the scorecard. SEC keeps the scorecard with the newest
+ * number in the least significant bit of its first word and each bit to the
+ * left one older, carrying on into the next word (SEC RM, IPsec anti-replay
+ * checking) -- so bit k of word k / 32 stands for seq - k. Each word is read
+ * once here; the caller reads twice to know the reading did not straddle a
+ * store.
+ */
+void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen)
+{
+	struct sec_descriptor *sec_desc = sa->pSec_sa_context->sec_desc;
+	unsigned int i;
+
+	*seq = caam32_to_cpu(READ_ONCE(sec_desc->pdb_dec.seq_num));
+	if (sa->flags & SA_ALLOW_EXT_SEQ_NUM)
+		*seq |= (u64)caam32_to_cpu(READ_ONCE(sec_desc->pdb_dec.seq_num_ext_hi)) << 32;
+	for (i = 0; i < SA_REPLAY_SEEN_WORDS; i++)
+		seen[i] = caam32_to_cpu((__force u32)READ_ONCE(sec_desc->pdb_dec.anti_replay[i]));
 }
 
 static inline void save_sa_state_in_external_mem(PSAEntry sa)
@@ -995,8 +1118,7 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 {
 	uint32_t *desc, *key_jump_cmd;
 	//uint32_t  copy_ptr_index = 0;
-	int opthdrsz;
-	size_t pdb_len = 0;
+	size_t pdb_len;
 	uint32_t sa_op;
 	uint32_t hdr_flags;
 	PDpaSecSAContext pSec_sa_context;
@@ -1004,27 +1126,17 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 	pSec_sa_context =sa->pSec_sa_context;
 
 	desc = (u32 *) pSec_sa_context->sec_desc->shared_desc;
-	/* Reserve 2 words for statistics */
-	pdb_len = CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
+	pdb_len = cdx_ipsec_pdb_len(sa);
 
 	/* Sharing policy is correctness-critical for the stateful PDB —
 	 * see cdx_ipsec_sh_desc_hdr_flags(). */
 	hdr_flags = cdx_ipsec_sh_desc_hdr_flags(sa);
 
-	if (sa->direction  == CDX_DPA_IPSEC_OUTBOUND) {
-		/* Compute optional header size, rounded up to descriptor
-		 * word size */
-		opthdrsz =
-			(caam32_to_cpu(pSec_sa_context->sec_desc->pdb_en.ip_hdr_len) +
-			 3) & ~3;
-		pdb_len += sizeof(struct ipsec_encap_pdb) + opthdrsz;
-		init_sh_desc_pdb(desc, hdr_flags, pdb_len);
+	init_sh_desc_pdb(desc, hdr_flags, pdb_len);
+	if (sa->direction  == CDX_DPA_IPSEC_OUTBOUND)
 		sa_op = OP_TYPE_ENCAP_PROTOCOL;
-	} else {
-		pdb_len += sizeof(struct ipsec_decap_pdb);
-		init_sh_desc_pdb(desc, hdr_flags, pdb_len);
+	else
 		sa_op = OP_TYPE_DECAP_PROTOCOL;
-	}
 
 	/* Key jump */
 	if (((pSec_sa_context->auth_data.split_key_len) || 
@@ -1058,31 +1170,35 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 	if (bytes_to_copy == 0)
 		goto skip_byte_copy;
 
-	/* Copy L2 header from the original packet to the outer packet */
+	if (bytes_to_copy != ETH_HDR_LEN)
+		return -EINVAL;
+	{
+		u8 vlan[4];
+		u32 math0_bytes = LDST_CLASS_DECO | (0x38 << LDST_SRCDST_SHIFT);
+		u32 math2_bytes = LDST_CLASS_DECO | (0x3a << LDST_SRCDST_SHIFT);
 
-	/* ld: deco-deco-ctrl len=0 offs=8 imm -auto-nfifo-entries */
-	append_cmd(desc, CMD_LOAD | DISABLE_AUTO_INFO_FIFO);
-
-	/* seqfifold: both msgdata-last2-last1-flush1 len=4 */
-	append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_TYPE_MSG |
-			FIFOLD_CLASS_BOTH | FIFOLD_TYPE_LAST1 |
-			FIFOLD_TYPE_LAST2 | FIFOLD_TYPE_FLUSH1);
-
-	/* ld: deco-deco-ctrl len=0 offs=4 imm +auto-nfifo-entries */
-	append_cmd(desc, CMD_LOAD | ENABLE_AUTO_INFO_FIFO);
-
-	/* move: ififo->deco-alnblk -> ofifo, len=4 */
-	append_move(desc, MOVE_SRC_INFIFO | MOVE_DEST_OUTFIFO | bytes_to_copy);
-
-	/* seqfifostr: msgdata len=4 */
-	append_seq_fifo_store(desc, FIFOST_TYPE_MESSAGE_DATA, bytes_to_copy);
-
-	/* Done coping L2 header from the original packet to the outer packet */
+		/* SEC RM table 7-18: assemble MACs, internal VLAN, EtherType
+		 * contiguously in Math0..2, then push them in one FIFO move
+		 * (separate unaligned pushes would introduce gaps, RM 7.7.6).
+		 * Consume 14 bytes and emit 18; IPsec starts at the same input.
+		 */
+		cdx_ipsec_vlan_tag(vlan, cdx_ipsec_key_tag_of(sa));
+		append_seq_load(desc, 12, math0_bytes);
+		append_seq_load(desc, 2, math2_bytes);
+		append_load_as_imm(desc, vlan, sizeof(vlan),
+				   LDST_CLASS_DECO | (0x39 << LDST_SRCDST_SHIFT) |
+				   (4 << LDST_OFFSET_SHIFT));
+		append_move(desc, MOVE_SRC_MATH0 | MOVE_DEST_OUTFIFO |
+			    MOVE_WAITCOMP | (ETH_HDR_LEN + 4));
+		append_seq_fifo_store(desc, FIFOST_TYPE_MESSAGE_DATA, ETH_HDR_LEN + 4);
+	}
 
 skip_byte_copy:
 
-	/* Enable Stats only for IPv4  TODO-IPV6 */
-
+	/* The per-SA counters, for either outer family: cdx_ipsec_pdb_len()
+	 * places them past whatever outer header the PDB carries. Outbound
+	 * they count the input before the protocol runs, inbound what it left
+	 * after. */
 	if (sa->direction  != CDX_DPA_IPSEC_INBOUND)
 	{
 #ifdef PRINT_DESC
@@ -1121,7 +1237,6 @@ skip_byte_copy:
 #endif
 	}
 
-	/* Enable Stats only for IPv4  TODO-IPV6 */
 	save_sa_state_in_external_mem(sa);
 
 #ifdef PRINT_DESC
@@ -1142,400 +1257,76 @@ skip_byte_copy:
 	return 0;
 }
 
-static int built_encap_extra_material(PSAEntry sa,
-		dma_addr_t auth_key_dma,
-		dma_addr_t crypto_key_dma,
-		unsigned int move_size)
+/* The anti-replay window SEC keeps for an inbound SA, as PDB options, or
+ * -EOPNOTSUPP for a width it keeps no window of.
+ *
+ * The ESP decapsulation PDB names three widths in its ARS bits -- 32, 64 and
+ * 128 entries (RM table 9-10) -- and ipsec_decap_pdb always has room for the
+ * widest scorecard. SEC's stand-alone anti-replay command takes any width up
+ * to 128, but the ESP protocol does not expose it, and the 128-entry window
+ * is the tunnel-mode protocol's alone: a transport SA runs the legacy one
+ * (OP_PCLID_IPSEC), for which ARS128 is not a width. Each width maps to its
+ * own window and nothing else maps at all. Linux refuses a number
+ * replay_window or more behind the top, so a width carried on a wider window
+ * would take late frames the state refuses, and on a narrower one would drop
+ * frames it takes. The backend refuses such an SA when it is added
+ * (cdx_ipsec_replay_window_supported()); this will not build one either. A
+ * zero width comes with SA_ALLOW_SEQ_ROLL, which is anti-replay off.
+ */
+static int cdx_ipsec_ars(PSAEntry sa)
 {
-	uint32_t *extra_cmds, *padding_jump, *key_jump_cmd;
-	uint32_t len, off_b, off_w, off, opt;
-	unsigned char job_desc_len, block_size;
-
-	PDpaSecSAContext pSec_sa_context; 
-
-	pSec_sa_context =sa->pSec_sa_context; 
-	/*
-	 * sec_desc_extra_cmds is the address were the first SEC extra command
-	 * is located, from here SEC will overwrite Job descriptor part. Need
-	 * to insert a dummy command because the LINUX CAAM API uses first word
-	 * for storing the length of the descriptor.
-	 */
-	extra_cmds = pSec_sa_context->sec_desc_extra_cmds - 1;
-
-	/*
-	 * Dummy command - will not be executed at all. Only for setting to 1
-	 * the length of the extra_cmds descriptor so that first extra material
-	 * command will be located exactly at sec_desc_extra_cmds address.
-	 */
-	append_cmd(extra_cmds, 0xdead0000);
-
-	/* Start Extra Material Group 1 */
-	/* Load from the input address 64 bytes into internal register */
-	/* load the data to be moved - insert dummy pointer */
-	opt = LDST_CLASS_2_CCB | LDST_SRCDST_WORD_CLASS_CTX;
-	off = 0 << LDST_OFFSET_SHIFT;
-	len = move_size << LDST_LEN_SHIFT;
-	append_load(extra_cmds, DUMMY_PTR_VAL, len, opt | off);
-
-	/* Wait to finish previous operation */
-	opt = JUMP_COND_CALM | (1 << JUMP_OFFSET_SHIFT);
-	append_jump(extra_cmds, opt);
-
-	/* Store the data to the output FIFO - insert dummy pointer */
-	opt = LDST_CLASS_2_CCB | LDST_SRCDST_WORD_CLASS_CTX;
-	off = 0 << LDST_OFFSET_SHIFT;
-	len = move_size << LDST_LEN_SHIFT;
-	append_store(extra_cmds, DUMMY_PTR_VAL, len, opt | off);
-
-	/* Fix LIODN */
-	opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
-	off = 0x80 << LDST_OFFSET_SHIFT; /* NON_SEQ LIODN */
-	append_cmd(extra_cmds, CMD_LOAD | opt | off);
-
-	/* MATH0 += 1 (packet counter) */
-	append_math_add(extra_cmds, REG0, REG0, ONE, MATH_LEN_8BYTE);
-
-	/* Overwrite the job-desc location (word 51 or 53) with the second
-	 * group (10 words) */
-	job_desc_len = pSec_sa_context->job_desc_len;
-	opt   = MOVE_SRC_INFIFO | MOVE_DEST_DESCBUF | MOVE_WAITCOMP;
-	off_w = MAX_CAAM_DESCSIZE - job_desc_len;
-	off_b = off_w * sizeof(uint32_t); /* calculate off in bytes */
-	len   = (10 * sizeof(uint32_t)) << MOVE_LEN_SHIFT;
-	append_move(extra_cmds, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/*
-	 * Jump to the beginning of the JOB Descriptor to start executing
-	 * the extra material group 2
-	 */
-	append_cmd(extra_cmds, 0xa00000f6);
-
-	/* End of Extra Material Group 1 */
-
-	/* Start Extra Material Group 2 */
-	/* MATH REG 2 = Sequence in length + 2; 2 for pad-len and NH field */
-	append_math_add_imm_u32(extra_cmds, REG2, SEQINLEN, IMM, 2);
-
-	switch (pSec_sa_context->cipher_data.cipher_type) {
-		case OP_PCL_IPSEC_3DES:
-			block_size = 8; /* block size in bytes */
-			break;
-		case OP_PCL_IPSEC_AES_CBC:
-		case OP_PCL_IPSEC_AES_CTR:
-		case OP_PCL_IPSEC_AES_XTS:
-		case OP_PCL_IPSEC_AES_CCM8:
-		case OP_PCL_IPSEC_AES_CCM12:
-		case OP_PCL_IPSEC_AES_CCM16:
-		case OP_PCL_IPSEC_AES_GCM8:
-		case OP_PCL_IPSEC_AES_GCM12:
-		case OP_PCL_IPSEC_AES_GCM16:
-		case OP_PCL_IPSEC_AES_GMAC:
-			block_size = 16; /* block size in bytes */
-			break;
-		default:
-			pr_crit("Invalid cipher algorithm for SA with spi %d\n", 
-					sa->id.spi);
-			return -EINVAL;
+	if (sa->flags & SA_ALLOW_SEQ_ROLL)
+		return PDBOPTS_ESP_ARSNONE;
+	switch (sa->replay_window) {
+	case 32:
+		return PDBOPTS_ESP_ARS32;
+	case 64:
+		return PDBOPTS_ESP_ARS64;
+	case 128:
+		if (sa->mode == SA_MODE_TUNNEL)
+			return PDBOPTS_ESP_ARS128;
+		break;
 	}
-
-	/* Adding padding to byte counter */
-	append_math_and_imm_u32(extra_cmds, REG3, REG2, IMM, block_size - 1);
-
-	/* Previous operation result is 0 i.e padding added to bytes count */
-	padding_jump = append_jump(extra_cmds, CLASS_BOTH | JUMP_TEST_ALL |
-			JUMP_COND_MATH_Z);
-
-	/* MATH REG 2 = MATH REG 2 + 1 */
-	append_math_add(extra_cmds, REG2, REG2, ONE, MATH_LEN_4BYTE);
-
-	/* jump back to adding padding i.e jump back 4 words */
-	off = (-4) & 0x000000FF;
-	append_jump(extra_cmds, (off << JUMP_OFFSET_SHIFT));
-
-	set_jump_tgt_here(extra_cmds, padding_jump);
-	/* Done adding padding to byte counter */
-
-	/*
-	 * Perform 32-bit left shift of DEST and concatenate with left 32 bits
-	 * of SRC1 i.e MATH REG 2 = 0x00bytecount_00000000
-	 */
-	append_math_ldshift(extra_cmds, REG2, REG0, REG2, MATH_LEN_8BYTE);
-
-	/* MATH REG 0  = MATH REG 0 + MATH REG 2 */
-	append_math_add(extra_cmds, REG0, REG0, REG2, MATH_LEN_8BYTE);
-
-	/*
-	 * Overwrite the job-desc location (word 51 or 53) with the third
-	 * group (11 words)
-	 */
-	opt   = MOVE_SRC_INFIFO | MOVE_DEST_DESCBUF | MOVE_WAITCOMP;
-	off_w = MAX_CAAM_DESCSIZE - job_desc_len;
-	off_b = off_w * sizeof(uint32_t); /* calculate off in bytes */
-	len   = (11 * sizeof(uint32_t)) << MOVE_LEN_SHIFT;
-	append_move(extra_cmds, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/*
-	 * Jump to the beginning of the JOB Descriptor to start executing
-	 * the extra material group 3. The command for jumping back is already
-	 * here from extra material group 1
-	 */
-
-	/* End of Extra Material Group 2 */
-
-	/* Start Extra Material Group 3 */
-
-	if (sa->enable_stats) {
-		/* Store statistics in the CAAM internal descriptor */
-		off_b = sa->stats_indx * CAAM_CMD_SZ;
-		append_move(extra_cmds, MOVE_SRC_MATH0 | MOVE_DEST_DESCBUF |
-				(off_b << MOVE_OFFSET_SHIFT) |
-				sizeof(uint64_t));
-	} else {
-		/* Statistics are disabled. Do not update descriptor counter */
-		append_cmd(extra_cmds, 0xA0000001); /* NOP for SEC */
-	}
-
-	/* Key jump */
-	key_jump_cmd = append_jump(extra_cmds, CLASS_BOTH | JUMP_TEST_ALL |
-			JUMP_COND_SHRD);
-
-	/* check whether a split of a normal key is used */
-	if (pSec_sa_context->auth_data.split_key_len)
-		/* Append split authentication key */
-		append_key(extra_cmds, auth_key_dma,
-				pSec_sa_context->auth_data.split_key_len,
-				CLASS_2 | KEY_ENC | KEY_DEST_MDHA_SPLIT);
-	else if (pSec_sa_context->auth_data.auth_key_len)
-		/* Append normal authentication key */
-		append_key(extra_cmds, auth_key_dma, pSec_sa_context->auth_data.auth_key_len,
-				CLASS_2 | KEY_DEST_CLASS_REG);
-
-	/* Append cipher key */
-	append_key(extra_cmds, crypto_key_dma, 
-			pSec_sa_context->cipher_data.cipher_key_len,
-			CLASS_1 | KEY_DEST_CLASS_REG);
-
-	set_jump_tgt_here(extra_cmds, key_jump_cmd);
-
-	/* Protocol specific operation */
-	append_operation(extra_cmds, OP_PCLID_IPSEC | OP_TYPE_ENCAP_PROTOCOL |
-			pSec_sa_context->cipher_data.cipher_type | 
-			pSec_sa_context->auth_data.auth_type);
-
-	if (sa->enable_stats) {
-		/*
-		 * Store command: in the case of the Descriptor Buffer the
-		 * length is specified in 4-byte words, but in all other cases
-		 * the length is specified in bytes. Offset in 4 byte words
-		 */
-		off_w = sa->stats_indx;
-		append_store(extra_cmds, 0, CDX_DPA_IPSEC_STATS_LEN,
-				LDST_CLASS_DECO | (off_w << LDST_OFFSET_SHIFT) |
-				LDST_SRCDST_WORD_DESCBUF_SHARED);
-	} else {
-		/* Do not store lifetime counter in external memory */
-		append_cmd(extra_cmds, 0xA0000001); /* NOP for SEC */
-	}
-
-	/* Jump with CALM to be sure previous operation was finished */
-	append_jump(extra_cmds, JUMP_TYPE_HALT_USER | JUMP_COND_CALM);
-
-	/* End of Extra Material Group 3 */
-#ifdef PRINT_DESC
-	cdx_ipsec_print_desc ( extra_cmds,__func__,__LINE__);
-#endif
-
-	return 0;
+	return -EOPNOTSUPP;
 }
 
-static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
-		dma_addr_t auth_key_dma,
-		dma_addr_t crypto_key_dma,
-		U32 bytes_to_copy)
+/* The decapsulation PDB's replay state: where the window stands, whether its
+ * numbers are extended, how wide it is, and the scorecard it starts from --
+ * clear for a fresh SA, the history a re-added state brought with it
+ * otherwise, so nothing it accepted before is accepted again. Options are left
+ * in CPU order, as the rest of the builder keeps them until it converts the
+ * word.
+ *
+ * With ESN the stored high word is the window top's. The SEC RM says SEC
+ * holds its own stored ESN back after a rollover until the whole window is
+ * past it (IPsec ESP decapsulation, "Optional use of ESN"), which in the
+ * first window-width of numbers after a rollover is one below the top's. It
+ * does not say which it expects of a window seeded there, nor how it tells
+ * that stretch from the start of a fresh SA, whose window reaches below
+ * number zero in the same way. The rig check in docs/flowtable/ipsec.md
+ * settles it; until then, a state re-added inside that stretch is the case
+ * to watch.
+ *
+ * A width SEC keeps no window of builds nothing (cdx_ipsec_ars()).
+ */
+static int cdx_ipsec_build_in_replay(PSAEntry sa, struct ipsec_decap_pdb *pdb)
 {
-	U32 *desc, *no_sg_jump, *extra_cmds;
-	U32  len, off_b, off_w, opt, stats_off_b, sg_mask;
-	unsigned int extra_cmds_len;
-	unsigned char job_desc_len;
-	dma_addr_t dma_extra_cmds;
-	int ret;
-	PDpaSecSAContext pSec_sa_context; 
+	int ars = cdx_ipsec_ars(sa);
+	unsigned int i;
 
-	pSec_sa_context =sa->pSec_sa_context; 
-
-	desc = (U32 *)pSec_sa_context->sec_desc->shared_desc;
-
-	if (sa->enable_stats)
-		sa->stats_indx = 28;
-	sa->next_cmd_indx = 30;
-
-	/* This code only works when SEC is configured to use PTR on 64 bit
-	 * so the Job Descriptor length is 13 words long when DPOWRD is set */
-	job_desc_len = 13;
-
-	/* Set CAAM Job Descriptor length */
-	pSec_sa_context->job_desc_len = job_desc_len;
-
-	/* Set lifetime counter stats offset */
-	sa->stats_offset = sa->stats_indx * sizeof(uint32_t);
-
-	ret = built_encap_extra_material(sa, auth_key_dma, crypto_key_dma, 64);
-	if (ret < 0) {
-		log_err("Failed to create extra CAAM commands\n");
-		return -EAGAIN;
+	if (ars < 0)
+		return ars;
+	pdb->seq_num = cpu_to_caam32(sa->seq & SEQ_NUM_LOW_MASK);
+	if (sa->flags & SA_ALLOW_EXT_SEQ_NUM) {
+		pdb->seq_num_ext_hi =
+			cpu_to_caam32((sa->seq & SEQ_NUM_HI_MASK) >> 32);
+		pdb->options |= PDBOPTS_ESP_ESN;
 	}
-
-	extra_cmds = pSec_sa_context->sec_desc_extra_cmds - 1;
-	extra_cmds_len = desc_len(extra_cmds) - 1;
-
-	/* get the jr device  */
-
-	dma_extra_cmds = dma_map_single(jrdev_g,
-			pSec_sa_context->sec_desc_extra_cmds,
-			extra_cmds_len * sizeof(uint32_t),
-			DMA_TO_DEVICE);
-	if (dma_mapping_error(jrdev_g, dma_extra_cmds)) {
-		log_err("Could not DMA map extra CAAM commands\n");
-		return -ENXIO;
-	}
-
-	init_sh_desc_pdb(desc, cdx_ipsec_sh_desc_hdr_flags(sa),
-			(sa->next_cmd_indx - 1) * sizeof(uint32_t));
-
-	/* ????? */
-	opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
-	len = 0x10 << LDST_LEN_SHIFT;
-	append_cmd(desc, CMD_LOAD | opt | len);
-
-	/*
-	 * load in IN FIFO the S/G Entry located in the 5th reg after
-	 * MATH3 -> offset = sizeof(GT_REG) * 4 + offset_math3_to_GT_REG
-	 * len = sizeof(S/G entry)
-	 */
-	opt   = MOVE_SRC_MATH3 | MOVE_DEST_INFIFO_NOINFO;
-	off_b = 127 << MOVE_OFFSET_SHIFT;
-	len   = 49 << MOVE_LEN_SHIFT;
-	append_move(desc, opt | off_b | len);
-
-	/*
-	 * L2 part 1
-	 * Load from input packet to INPUT DATA FIFO first bytes_to_copy
-	 * bytes. No information FIFO entry even if automatic
-	 * iNformation FIFO entries are enabled.
-	 */
-	append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_CLASS_BOTH |
-			FIFOLD_TYPE_NOINFOFIFO);
-
-	/*
-	 * Extra word part 1
-	 * Load extra words for this descriptor into the INPUT DATA FIFO
-	 */
-	append_fifo_load(desc, dma_extra_cmds,
-			extra_cmds_len * sizeof(uint32_t),
-			FIFOLD_CLASS_BOTH | FIFOLD_TYPE_NOINFOFIFO);
-
-	/*
-	 * throw away the first part of the S/G table and keep only the buffer
-	 * address;
-	 * offset = undefined memory after MATH3; Refers to the destination.
-	 * len = 41 bytes to discard
-	 */
-	opt   = MOVE_SRC_INFIFO | MOVE_DEST_MATH3;
-	off_b = 8 << MOVE_OFFSET_SHIFT;
-	len   = 41 << MOVE_LEN_SHIFT;
-	append_move(desc, opt | off_b | len);
-
-	/* put the buffer address (still in the IN FIFO) in MATH2 */
-	opt   = MOVE_SRC_INFIFO | MOVE_DEST_MATH3;
-	off_b = 0 << MOVE_OFFSET_SHIFT;
-	len   = 8 << MOVE_LEN_SHIFT;
-	append_move(desc, opt | off_b | len);
-
-	/* copy 15 bytes starting at 4 bytes before the OUT-PTR-CMD in
-	 * the job-desc into math1
-	 * i.e. in the low-part of math1 we have the out-ptr-cmd and
-	 * in the math2 we will have the address of the out-ptr
-	 */
-	opt = MOVE_SRC_DESCBUF | MOVE_DEST_MATH1;
-	off_b = (MAX_CAAM_DESCSIZE - job_desc_len + PTR_LEN) * sizeof(uint32_t);
-	len = (8 + 4 * PTR_LEN - 1) << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/* Copy 7 bytes of the in-ptr into math0 */
-	opt   = MOVE_SRC_DESCBUF | MOVE_DEST_MATH0;
-	off_w = MAX_CAAM_DESCSIZE - job_desc_len + 1 + 3 + 2 * PTR_LEN;
-	off_b = off_w * sizeof(uint32_t); /* calculate off in bytes */
-	len   = ALIGNED_PTR_ADDRESS_SZ << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/*
-	 * the SEQ OUT PTR command is now in math reg 1, so the SGF bit can be
-	 * checked using a math command;
-	 */
-	sg_mask = SEQ_OUT_PTR_SGF_MASK;
-	append_math_and_imm_u32(desc, NONE, REG1, IMM, sg_mask);
-
-	opt = CLASS_NONE | JUMP_TYPE_LOCAL | JUMP_COND_MATH_Z | JUMP_TEST_ALL;
-	no_sg_jump = append_jump(desc, opt);
-
-	append_math_add(desc, REG2, ZERO, REG3, MATH_LEN_8BYTE);
-
-	/* update no S/G jump location */
-	set_jump_tgt_here(desc, no_sg_jump);
-
-	/* seqfifostr: msgdata len=4 */
-	append_seq_fifo_store(desc, FIFOST_TYPE_MESSAGE_DATA, bytes_to_copy);
-
-	/* move: ififo->deco-alnblk -> ofifo, len=4 */
-	append_move(desc, MOVE_SRC_INFIFO | MOVE_DEST_OUTFIFO | bytes_to_copy);
-
-	/* Overwrite the job-desc location (word 51 or 53) with the first
-	 * group (11 words)*/
-	opt   = MOVE_SRC_INFIFO | MOVE_DEST_DESCBUF;
-	off_w = MAX_CAAM_DESCSIZE - job_desc_len;
-	off_b = off_w * sizeof(uint32_t); /* calculate off in bytes */
-	len   = (11 * sizeof(uint32_t)) << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/*
-	 * Copy the context of math0 (input address) to words 52+53 or 54+56
-	 * depending where the Job Descriptor starts.
-	 * They will be used later by the load command.
-	 */
-	opt = MOVE_SRC_MATH0 | MOVE_DEST_DESCBUF;
-	off_w = MAX_CAAM_DESCSIZE - job_desc_len + 1; /* 52 + 53 or 54 + 55 */
-	off_b = off_w * sizeof(uint32_t);
-	len = ALIGNED_PTR_ADDRESS_SZ << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/*
-	 * Copy the context of math2 (output address) to words 56+57 or 58+59
-	 * depending where the Job Descriptor starts.
-	 * They will be used later by the store command.
-	 */
-	opt = MOVE_SRC_MATH2 | MOVE_DEST_DESCBUF;
-	off_w = MAX_CAAM_DESCSIZE - job_desc_len + 5; /* 56 + 57 or 58 + 59 */
-	off_b = off_w * sizeof(uint32_t);
-	len = ALIGNED_PTR_ADDRESS_SZ << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/* Fix LIODN - OFFSET[0:1] - 01 = SEQ LIODN */
-	opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
-	off_b = 0x40; /* SEQ LIODN */
-	append_cmd(desc, CMD_LOAD | opt | (off_b << LDST_OFFSET_SHIFT));
-
-	/* Copy the context of the counters from word 29 into math0 */
-	/* Copy from descriptor to MATH REG 0 the current statistics */
-	stats_off_b = sa->stats_indx * CAAM_CMD_SZ;
-	append_move(desc, MOVE_SRC_DESCBUF | MOVE_DEST_MATH0 |
-			(stats_off_b << MOVE_OFFSET_SHIFT) | sizeof(uint64_t));
-
-	dma_unmap_single(jrdev_g, dma_extra_cmds,
-			extra_cmds_len * sizeof(uint32_t), DMA_TO_DEVICE);
-
-#ifdef PRINT_DESC
-	cdx_ipsec_print_desc ( desc,__func__,__LINE__);
-#endif
+	pdb->options |= ars;
+	if (!(sa->flags & SA_ALLOW_SEQ_ROLL))
+		for (i = 0; i < SA_REPLAY_SEEN_WORDS; i++)
+			pdb->anti_replay[i] =
+				(__force __be32)cpu_to_caam32(sa->replay_seen[i]);
 	return 0;
 }
 
@@ -1545,31 +1336,16 @@ static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 	PDpaSecSAContext psec_as_context;
 	struct decap_ccm_opt *ccm_opt;
 	uint8_t *salt;
+	int rc;
 	/*struct iphdr *outer_ip_hdr;*/
 
 	psec_as_context = sa->pSec_sa_context;
-	sec_desc= psec_as_context->sec_desc; 
+	sec_desc= psec_as_context->sec_desc;
 	memset(&sec_desc->pdb_dec, 0, sizeof(sec_desc->pdb_dec));
 
-	sec_desc->pdb_dec.seq_num =
-		cpu_to_caam32(sa->seq & SEQ_NUM_LOW_MASK);
-
-
-	if ( sa->flags & SA_ALLOW_EXT_SEQ_NUM ) {
-		sec_desc->pdb_dec.seq_num_ext_hi =
-			cpu_to_caam32((sa->seq & SEQ_NUM_HI_MASK) >> 32);
-		sec_desc->pdb_dec.options |= PDBOPTS_ESP_ESN;
-	}
-
-
-	if (sa->flags & SA_ALLOW_SEQ_ROLL  ) {
-		sec_desc->pdb_dec.options |= PDBOPTS_ESP_ARSNONE;
-	}else{
-		/* assuming anti reply window of 64 defult. This is not
-		   known through cmm-cdx command */
-		/*sa->sec_desc->pdb_dec.options |= PDBOPTS_ESP_ARS32; */
-		sec_desc->pdb_dec.options |= PDBOPTS_ESP_ARS64;
-	}
+	rc = cdx_ipsec_build_in_replay(sa, &sec_desc->pdb_dec);
+	if (rc)
+		return rc;
 
 	if(sa->mode == SA_MODE_TUNNEL)
 	{
@@ -1624,8 +1400,7 @@ static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 						sa->pSec_sa_context->cipher_data.cipher_key_len;
 	if ((sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM8) ||
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM12) ||
-			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16) ||
-			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC))
+			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16))
 	{
 		memcpy(sec_desc->pdb_dec.gcm.salt, salt, AES_GCM_SALT_LEN);
 	}
@@ -1702,12 +1477,32 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 		cpu_to_caam32(next_seq & SEQ_NUM_LOW_MASK);
 
 
-	//if (!sa->init_vector)
-	sec_desc->pdb_en.options |= PDBOPTS_ESP_IVSRC;
-	/*else
-	  memcpy(&sec_desc->pdb_en.cbc,
-	  sa->init_vector->init_vector,
-	  sa->.init_vector->length);*/
+	/* The counter modes need an IV that never repeats under the key, and
+	 * SEC's random ones are 64 bits: two collide after about 2^32 frames,
+	 * and one GCM collision gives away the authentication key. Without
+	 * IVSRC, SEC sends the PDB's IV and counts it up per frame, and the
+	 * PDB store carries it from job to job. Each SA starts at a random
+	 * point, as Linux's seqiv salts each instance, so a re-add with the
+	 * same key and a stale sequence number cannot repeat one either. CBC
+	 * keeps SEC's random IVs: it needs them unpredictable, not unique. */
+	switch (psec_as_context->cipher_data.cipher_type) {
+	case OP_PCL_IPSEC_AES_GCM8:
+	case OP_PCL_IPSEC_AES_GCM12:
+	case OP_PCL_IPSEC_AES_GCM16:
+		sec_desc->pdb_en.gcm.iv = cpu_to_caam64(get_random_u64());
+		break;
+	case OP_PCL_IPSEC_AES_CCM8:
+	case OP_PCL_IPSEC_AES_CCM12:
+	case OP_PCL_IPSEC_AES_CCM16:
+		sec_desc->pdb_en.ccm.iv = cpu_to_caam64(get_random_u64());
+		break;
+	case OP_PCL_IPSEC_AES_CTR:
+		sec_desc->pdb_en.ctr.iv = cpu_to_caam64(get_random_u64());
+		break;
+	default:
+		sec_desc->pdb_en.options |= PDBOPTS_ESP_IVSRC;
+		break;
+	}
 
 	if(sa->mode == SA_MODE_TUNNEL)
 	{
@@ -1799,13 +1594,12 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 		__func__,__LINE__,salt[0],salt[1],salt[2],salt[3]); */
 	if ((sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM8) ||
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM12) ||
-			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16) ||
-			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC))
+			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16))
 	{
 		memcpy(sec_desc->pdb_en.gcm.salt, salt,  AES_GCM_SALT_LEN);
 	}
 
-	/* CTR — RFC 3686. Per-packet 8-byte iv is filled by SEC under PDBOPTS_ESP_IVSRC. */
+	/* CTR — RFC 3686. The per-packet 8-byte iv counts up from the PDB's. */
 	else if (sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_CTR)
 	{
 		memcpy(sec_desc->pdb_en.ctr.ctr_nonce, salt, AES_CTR_SALT_LEN);
@@ -1860,11 +1654,12 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	if (cdx_dpa_get_ipsec_pool_info(&bpid, &buf_size))
 		return -EIO;
 	psec_sa_context = sa->pSec_sa_context;
-	if(sa->direction == CDX_DPA_IPSEC_OUTBOUND ){
-		cdx_ipsec_build_out_sa_pdb( sa);
-	}else{
-		cdx_ipsec_build_in_sa_pdb(sa);
-	}
+	if (sa->direction == CDX_DPA_IPSEC_OUTBOUND)
+		ret = cdx_ipsec_build_out_sa_pdb(sa);
+	else
+		ret = cdx_ipsec_build_in_sa_pdb(sa);
+	if (ret)
+		return ret;
 
 	/* check whether a split or a normal key is used */
 	if (psec_sa_context->auth_data.split_key_len) {
@@ -1899,73 +1694,35 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	}
 
 	/*
-	 * Build the shared descriptor and see if its length is less than
-	 * 64 words. If build_shared_descriptor returns -EPERM than it is
-	 * required to build the extended shared descriptor in order to have
-	 * all the SA features that were required.
-	 * Forth argument is passed was l2_hdr_size. Since we already removed
-	 * L2 header before passing to sec , I am passing zero.
-	 * This need to be revisited and corrected if required.
+	 * The shared descriptor, which has to fit in the words SEC's queue
+	 * interface leaves it (MAX_CAAM_SHARED_DESCSIZE).
+	 *
+	 * There is no second, larger form. NXP's extended builder took an
+	 * outbound SA that overflowed this one by loading the rest of its
+	 * program from a side buffer, and it never stored the PDB back after
+	 * a job: nothing ordered SEC's refetch of the sequence number against
+	 * another DECO's update of it (RM 7.3.1, save_sa_state_in_external_mem()),
+	 * and the number read back for xfrm stayed where the SA was installed,
+	 * so a keying daemon re-adding the SA from it restarted it behind
+	 * numbers its peer had already seen. The internal VLAN leaves only
+	 * one word below the rejection threshold: CBC or CCM with a split
+	 * HMAC key behind an IPv6 NAT-T outer header builds 49 words (GCM,
+	 * with no authentication key, 46). An SA that overflows is therefore
+	 * a change to the builder, said loudly, and the SA is refused rather
+	 * than installed on a descriptor that cannot keep its sequence.
 	 */
-
 	ret = cdx_ipsec_build_shared_descriptor(sa, auth_key_dma, crypto_key_dma,
 			bytes_to_copy);
-	switch (ret) {
-		case 0:
-			goto done_shared_desc;
-		case -EPERM:
-			/* The extended builders lack the per-job PDB store
-			 * that keeps GCM sequence state coherent across
-			 * DECOs. A GCM descriptor fits the normal builder
-			 * (worst case, IPv6 tunnel + NAT-T with L2 copy,
-			 * builds ~45 words against the 50-word limit), so
-			 * this is unreachable today; refuse loudly rather
-			 * than corrupt quietly if that ever changes. The SA
-			 * then stays on kernel xfrm. */
-			if (cdx_ipsec_cipher_is_gcm(
-					psec_sa_context->cipher_data.cipher_type)) {
-				log_err("GCM SA spi %d needs an extended descriptor; not supported\n",
-						sa->id.spi);
-				ret = -EFAULT;
-				goto err_unmap_crypto;
-			}
-			/* Decap has no extended path at all. The builder that
-			 * used to serve it sized its header-strip math from a
-			 * per-cipher IV/ICV/max-pad table that NXP shipped
-			 * disabled, so every length it fed the SEC program was
-			 * zero; and it never gained the per-job PDB store the
-			 * normal decap path relies on to keep sequence and ICV
-			 * state coherent across DECOs. Emitting such a
-			 * descriptor would corrupt silently on the wire, so an
-			 * inbound SA that overflows the normal builder is
-			 * refused here and stays on the kernel software path. */
-			if (sa->direction == CDX_DPA_IPSEC_INBOUND) {
-				log_err("Inbound SA spi %d needs an extended descriptor; not supported\n",
-						sa->id.spi);
-				ret = -EFAULT;
-				goto err_unmap_crypto;
-			}
-			goto build_extended_shared_desc;
-		default:
-			log_err("Failed to create SEC descriptor for SA with   spi %d\n", sa->id.spi);
-			ret = -EFAULT;
-			goto err_unmap_crypto;
-	}
-
-build_extended_shared_desc:
-	/* Build the extended shared descriptor. Outbound only: inbound SAs
-	 * that need it were refused above. */
-	ret = cdx_ipsec_build_extended_encap_shared_descriptor(sa,
-			auth_key_dma,
-			crypto_key_dma, 0);
-	if (ret < 0) {
-		log_err("Failed to create SEC descriptor for SA with spi %d\n",
-				sa->id.spi);
+	if (ret) {
+		WARN_ONCE(ret == -EPERM,
+			  "cdx: IPsec SA spi %#x overflows the %d-word shared descriptor\n",
+			  be32_to_cpu((__force __be32)sa->id.spi), MAX_CAAM_SHARED_DESCSIZE);
+		log_err("Failed to create SEC descriptor for SA with spi %#x\n",
+			be32_to_cpu((__force __be32)sa->id.spi));
 		ret = -EFAULT;
 		goto err_unmap_crypto;
 	}
 
-done_shared_desc:
 	sec_desc = psec_sa_context->sec_desc;
 	/* setup preheader */
 
@@ -2022,27 +1779,104 @@ err_unmap_auth:
 	return ret;
 }
 
-static void split_key_done(struct device *dev, u32 *desc, u32 err,
-		void *context)
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+/*
+ * Split-key fault injection -- DEBUG-ONLY, NOT FOR PRODUCTION.
+ *
+ * Deriving an SA's HMAC split key is a SEC job, and one that fails on real
+ * hardware means a full or faulted job ring -- not reproducible on demand.
+ * Write a decimal count to /proc/cdx_split_key_fail and that many of the
+ * following split-key jobs halt on SEC with a user status before doing
+ * anything else (a JUMP of type "halt with user-specified status", SEC RM
+ * 7.20.1.5), so the job completes with an error through the same callback
+ * a real failure takes. Reading the file back reports how many are still
+ * armed.
+ *
+ * Production (Armbian) builds DO NOT define CDX_DEBUG_SPLIT_KEY_FAIL. The
+ * flag is set only in the meta-ask test image, and the probe pr_warn_once's
+ * at init so an accidental enable surfaces loudly.
+ */
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
+
+#define SPLIT_KEY_FAIL_PROC_NAME "cdx_split_key_fail"
+/* What an armed job reports: any non-zero LOCAL OFFSET is an error. */
+#define CDX_SPLIT_KEY_FAULT_STATUS 0x5a
+
+static atomic_t split_key_fail_countdown = ATOMIC_INIT(0);
+static struct proc_dir_entry *split_key_fail_proc;
+
+/* Whether this job is one of the armed ones, consuming it if so. */
+static bool cdx_ipsec_split_key_fault(void)
 {
-	register atomic_t *done = context;
-	//printk(KERN_ERR "%s: Job ring  err  value =%d\n", __func__, err);
-
-	if (err)
-		caam_jr_strstatus(dev, err);
-
-	atomic_set(done, 1);
+	/* atomic_dec_if_positive() returns the post-decrement value, so
+	 * >= 0 means an armed job was actually taken. */
+	return atomic_dec_if_positive(&split_key_fail_countdown) >= 0;
 }
 
-/* determine the HASH algorithm and the coresponding split key length */
+static int split_key_fail_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "armed=%d\n", atomic_read(&split_key_fail_countdown));
+	return 0;
+}
+
+static int split_key_fail_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, split_key_fail_show, NULL);
+}
+
+static ssize_t split_key_fail_write(struct file *file, const char __user *buf,
+				    size_t len, loff_t *ppos)
+{
+	char kbuf[16];
+	unsigned int n;
+
+	if (len == 0 || len >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+	if (kstrtouint(strim(kbuf), 0, &n))
+		return -EINVAL;
+	/* The countdown is an atomic_t, so anything that would not survive
+	 * the cast is rejected rather than silently wrapped negative. */
+	if (n > (unsigned int)INT_MAX)
+		return -EINVAL;
+	atomic_set(&split_key_fail_countdown, (int)n);
+	return len;
+}
+
+static const struct proc_ops split_key_fail_proc_ops = {
+	.proc_open    = split_key_fail_open,
+	.proc_read    = seq_read,
+	.proc_write   = split_key_fail_write,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+int cdx_ipsec_init_split_key_fail_probe(void)
+{
+	pr_warn_once("cdx: CDX_DEBUG_SPLIT_KEY_FAIL is on - /proc/%s can fail IPsec split-key jobs; do not ship\n",
+		     SPLIT_KEY_FAIL_PROC_NAME);
+	split_key_fail_proc = proc_create(SPLIT_KEY_FAIL_PROC_NAME, 0600, NULL,
+					  &split_key_fail_proc_ops);
+	return split_key_fail_proc ? 0 : -ENOMEM;
+}
+
+void cdx_ipsec_remove_split_key_fail_probe(void)
+{
+	if (split_key_fail_proc) {
+		proc_remove(split_key_fail_proc);
+		split_key_fail_proc = NULL;
+	}
+}
+#endif /* CDX_DEBUG_SPLIT_KEY_FAIL */
+
+/* The MDHA algorithm an authenticator's split key is derived with, or 0 when
+ * it has none: XCBC derives its keys inside the protocol operation. */
 static int cdx_ipsec_get_split_key_info(struct auth_params *auth_param, u32 *hmac_alg)
 {
-	/*
-	 * Sizes for MDHA pads (*not* keys): MD5, SHA1, 224, 256, 384, 512
-	 * Running digest size
-	 */
-	const u8 mdpadlen[] = {16, 20, 32, 32, 64, 64};
-
 	switch (auth_param->auth_type) {
 		case OP_PCL_IPSEC_HMAC_MD5_96:
 		case OP_PCL_IPSEC_HMAC_MD5_128:
@@ -2063,27 +1897,39 @@ static int cdx_ipsec_get_split_key_info(struct auth_params *auth_param, u32 *hma
 			break;
 		case OP_PCL_IPSEC_AES_XCBC_MAC_96:
 			*hmac_alg = 0;
-			auth_param->split_key_len = 0;
 			break;
 		default:
 			log_err("Unsupported authentication algorithm\n");
 			return -EINVAL;
 	}
-
-	if (*hmac_alg)
-		auth_param->split_key_len =
-			mdpadlen[(*hmac_alg & OP_ALG_ALGSEL_SUBMASK) >>
-			OP_ALG_ALGSEL_SHIFT] * 2;
-
 	return 0;
 }
+
+/* Derive the SA's HMAC split key: the key's inner and outer pads, which SEC
+ * writes encrypted under its job-descriptor key-encryption key and which the
+ * shared descriptor then loads for every frame (KEY_ENC | KEY_DEST_MDHA_SPLIT).
+ *
+ * Returns 0 once the key is in place, and otherwise a negative errno with no
+ * split key recorded: -ENOMEM when the job could not be built or mapped,
+ * -EBUSY when the job ring had no room for it, -EIO when SEC failed it. An SA
+ * whose split key was never written would carry a key SEC never derived, and
+ * every frame it authenticated would fail its peer's check or SEC's own.
+ *
+ * The job is waited for without a bound, as the kernel's gen_split_key()
+ * waits. A job the ring accepted always completes, and the descriptor, both
+ * buffers and the result it reports into must all outlive it: giving up
+ * early would leave SEC reading a freed descriptor and its completion
+ * writing into a returned stack frame. Every caller is in process context.
+ */
 int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 {
+	struct split_key_result result;
 	dma_addr_t dma_addr_in, dma_addr_out;
-	u32 *desc, timeout = 1000000, alg_sel = 0;
-	atomic_t done;
-	int ret = 0;
+	u32 *desc, alg_sel = 0, key_len, pad_len;
+	int ret;
 
+	auth_param->split_key_len = 0;
+	auth_param->split_key_pad_len = 0;
 	if (!jrdev_g)
 		return -ENODEV;
 
@@ -2091,7 +1937,8 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 	/* exit if error or there is no need to compute a split key */
 	if (ret < 0 || alg_sel == 0)
 		return ret;
-
+	key_len = split_key_len(alg_sel);
+	pad_len = split_key_pad_len(alg_sel);
 
 	desc = kmalloc(CAAM_CMD_SZ * 6 + CAAM_PTR_SZ * 2, GFP_KERNEL | GFP_DMA);
 	if (!desc) {
@@ -2099,27 +1946,28 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 		return -ENOMEM;
 	}
 
-	auth_param->split_key_pad_len = ALIGN(auth_param->split_key_len, 16);
-
 	dma_addr_in = dma_map_single(jrdev_g, auth_param->auth_key,
 			auth_param->auth_key_len, DMA_TO_DEVICE);
 	if (dma_mapping_error(jrdev_g, dma_addr_in)) {
 		dev_err(jrdev_g, "Unable to DMA map the input key address\n");
-		kfree(desc);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_free;
 	}
 
-	dma_addr_out = dma_map_single(jrdev_g, auth_param->split_key,
-			auth_param->split_key_pad_len,
+	dma_addr_out = dma_map_single(jrdev_g, auth_param->split_key, pad_len,
 			DMA_FROM_DEVICE);
 	if (dma_mapping_error(jrdev_g, dma_addr_out)) {
 		dev_err(jrdev_g, "Unable to DMA map the output key address\n");
-		dma_unmap_single(jrdev_g, dma_addr_in, auth_param->auth_key_len,
-				DMA_TO_DEVICE);
-		kfree(desc);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_unmap_in;
 	}
 	init_job_desc(desc, 0);
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+	/* First, so an armed job does nothing but fail. */
+	if (cdx_ipsec_split_key_fault())
+		append_jump(desc, JUMP_TYPE_HALT_USER | JUMP_TEST_ALL |
+			    CDX_SPLIT_KEY_FAULT_STATUS);
+#endif
 
 	append_key(desc, dma_addr_in, auth_param->auth_key_len,
 			CLASS_2 | KEY_DEST_CLASS_REG);
@@ -2137,25 +1985,39 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 
 	/* FIFO_STORE with the explicit split-key content store
 	 * (0x26 output type) */
-	append_fifo_store(desc, dma_addr_out, auth_param->split_key_len,
+	append_fifo_store(desc, dma_addr_out, key_len,
 			LDST_CLASS_2_CCB | FIFOST_TYPE_SPLIT_KEK);
 
-	atomic_set(&done, 0);
-	ret = caam_jr_enqueue(jrdev_g, desc, split_key_done, &done);
-
-	while (!atomic_read(&done) && --timeout) {
-		udelay(1);
-		cpu_relax();
+	/* The kernel's own completion for split-key jobs: split_key_done()
+	 * reports SEC's status through caam_jr_strstatus() and completes. */
+	result.err = 0;
+	init_completion(&result.completion);
+	ret = caam_jr_enqueue(jrdev_g, desc, split_key_done, &result);
+	if (ret == -EINPROGRESS) {
+		wait_for_completion(&result.completion);
+		ret = result.err ? -EIO : 0;
+	} else {
+		/* Nothing was queued, so there is nothing to wait for. A full
+		 * ring is busy rather than out of space, and a descriptor it
+		 * could not map is out of memory like ours above. */
+		log_err("split key job not queued: %d\n", ret);
+		ret = ret == -ENOSPC ? -EBUSY : ret == -EIO ? -ENOMEM : ret;
 	}
 
-	if (timeout == 0)
-		log_err("Timeout waiting for job ring to complete\n");
-
-	dma_unmap_single(jrdev_g, dma_addr_out, auth_param->split_key_pad_len,
-			DMA_FROM_DEVICE);
+	dma_unmap_single(jrdev_g, dma_addr_out, pad_len, DMA_FROM_DEVICE);
+out_unmap_in:
 	dma_unmap_single(jrdev_g, dma_addr_in, auth_param->auth_key_len,
 			DMA_TO_DEVICE);
+out_free:
 	kfree(desc);
+	if (!ret) {
+		auth_param->split_key_len = key_len;
+		auth_param->split_key_pad_len = pad_len;
+	} else {
+		/* A job SEC failed may have stored part of a key before it
+		 * stopped; none of it is kept. */
+		memzero_explicit(auth_param->split_key, pad_len);
+	}
 	return ret;
 }
 
@@ -2193,6 +2055,23 @@ static int fill_natt_key_info(PSAEntry sa, struct en_exthash_tbl_entry *tbl_entr
 		key->ipv6_tcpudp_key.ipv6_protocol = IPPROTO_UDP;
 		key->ipv6_tcpudp_key.ipv6_sport = cpu_to_be16(sa->natt.sport);
 		key->ipv6_tcpudp_key.ipv6_dport = cpu_to_be16(sa->natt.dport);
+	}
+	/* Inbound NAT-T uses the physical port's UDP table, whose key also
+	 * identifies a native first IP header. Outbound roots use SEC's own
+	 * tables and keep the original tuple. */
+	if (sa->direction == CDX_DPA_IPSEC_INBOUND) {
+		unsigned int size = sa->family == PROTO_IPV4 ?
+			CDX_UNICAST4_KEY_SIZE : CDX_UNICAST_KEY_SIZE;
+		unsigned int protocol = sa->family == PROTO_IPV4 ? 9 : 33;
+
+		/* KeyGen extracts the ports before the first-header guard. */
+		memmove(tbl_entry->hashentry.key + protocol,
+			tbl_entry->hashentry.key + protocol + 1, 4);
+		key_size--;
+		memset(tbl_entry->hashentry.key + key_size, 0,
+		       size - key_size);
+		tbl_entry->hashentry.key[key_size] = IPPROTO_UDP;
+		key_size = size;
 	}
 	return(key_size);
 }
@@ -2254,6 +2133,11 @@ static int get_tbl_type(PSAEntry sa)
  - Checks if there are any NATT SAs with the matched 5-tuple entries
  - If found and already programmed to Fast path, update the array mask and fill the new spi's in the fast path entry
 -- If not found then add the new entry as UDP tuple entry
+
+Inbound SAs share their UDP classifier but retain distinct SEC tags; the SPI
+selects the decrypting SA. Outbound rekeying SAs share both the UDP output root
+and its tag. That tag is reserved exclusively for authenticated encrypted
+output of this tunnel, and is never assigned to an inbound SA.
 */
 
 int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
@@ -2270,13 +2154,34 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 
 	if (natt_sa && natt_sa->ct)
 	{
+		/* An output root authorizes encrypted output for this exact
+		 * UDP tunnel, not an inbound SA's plaintext. Rekeying SAs may
+		 * share that root and tag; inbound identities never share it.
+		 * A built descriptor cannot change identity under queued work. */
+		if (sa->direction == CDX_DPA_IPSEC_OUTBOUND) {
+			/* The shared action also owns the egress framing and MTU. */
+			if (sa->netdev != natt_sa->netdev ||
+			    !sa->pRtEntry || !natt_sa->pRtEntry ||
+			    sa->pRtEntry->itf != natt_sa->pRtEntry->itf ||
+			    sa->pRtEntry->mtu != natt_sa->pRtEntry->mtu ||
+			    memcmp(sa->pRtEntry->dstmac, natt_sa->pRtEntry->dstmac,
+				   ETHER_ADDR_LEN))
+				goto err_ret;
+			if (sa->flags & SA_SH_DESC_BUILT) {
+				if (cdx_ipsec_key_tag_of(sa) != cdx_ipsec_key_tag_of(natt_sa))
+					goto err_ret;
+			} else {
+				ipsec_share_key_tag(sa->pSec_sa_context->dpa_ipsecsa_handle,
+						    natt_sa->pSec_sa_context->dpa_ipsecsa_handle);
+			}
+		}
 		if (sa->direction == CDX_DPA_IPSEC_INBOUND)
 			sa_addr = &sa->id.daddr.a6[0];
 		else
 			sa_addr = &sa->id.saddr[0];
 
-		if( dpa_get_iface_info_by_ipaddress(sa->family, sa_addr, NULL, 
-					NULL , NULL, &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
+		if( dpa_get_iface_info_by_ipaddress(sa->family, sa_addr, NULL,
+					NULL , NULL, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
 					__func__);
@@ -2400,8 +2305,11 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 #ifdef CDX_DPA_DEBUG
 		printk("%s::inbound sa\n", __func__);
 #endif
+		/* The port the local endpoint is on keys the classifier entry.
+		 * The SA's device is not looked up here: it is the port the SA
+		 * is bound to (sa->netdev), set by its creator. */
 		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.daddr.a6[0], NULL,
-					&itf_id , &info->port_id, &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
+					&itf_id , &info->port_id, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n",
 					__func__);
@@ -2421,7 +2329,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		 * May also can be used for orginal interface stats also.
 		 */
 		info->sa_itf_id = itf_id;
-		dpa_get_l2l3_info_by_itf_id( itf_id, &info->l2_info, &info->l3_info, &sa_dir_in );
+		dpa_get_l2l3_info_by_itf_id( itf_id, &info->l2_info, &info->l3_info);
 #ifdef CDX_DPA_DEBUG
 		/*       printk("%s:: Got the table id for portid %d and key type %d as %p \n",
 					__func__, info->port_id, key_info->type, sa->ct->td); */
@@ -2432,38 +2340,24 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		printk("%s::outbound sa\n", __func__);
 #endif
 		sa_dir_in = 0;
-		dpa_ipsec_ofport_td(ipsec_instance, tbl_type, &sa->ct->td,
-				&info->port_id);
+		if (dpa_ipsec_ofport_td(ipsec_instance, tbl_type, &sa->ct->td,
+				&info->port_id)) {
+			DPA_ERROR("%s::no IPsec offline port for the ESP table\n",
+					__func__);
+			goto err_ret;
+		}
 
 		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.saddr[0], NULL,
-					NULL , NULL,  &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
+					NULL , NULL, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n",
 					__func__);
 			goto err_ret;
 		}
 
-/*
-		if(!sa->pRtEntry)
-		{
-			DPA_ERROR("%s:: NULL ROUTE for out SA  finding outbound interface by ipaddress\n",
-					__func__);
-			if (dpa_get_iface_info_by_ipaddress(sa->family,
-						((sa->family == PROTO_IPV4) ?  &sa->tunnel.ip4.SourceAddress : 
-						 &sa->tunnel.ip6.SourceAddress[0]),
-						&info->l2_info.fqid, &itf_id, 
-						NULL, NULL, (uint32_t) sa->handle) != SUCCESS)
-			{
-				DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
-						__func__);
-				goto err_ret;
-			}
-			dpa_get_l2l3_info_by_itf_id( itf_id,
-					&info->l2_info, &info->l3_info,sa_dir_in );
-		} else {
-*/
 		if (dpa_get_out_tx_info_by_itf_id(sa->pRtEntry,
-					&info->l2_info, &info->l3_info)) {
+					&info->l2_info, &info->l3_info,
+					(uint32_t)sa->handle)) {
 			DPA_ERROR("%s:: dpa_get_out_tx_info_by_itf_id returned error\n",
 					__func__);
 			goto err_ret;
@@ -2520,6 +2414,12 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 				__func__);
 		goto err_ret;
 	}
+	/* An outbound SA's entry is on the offline port, where every SA's
+	 * output and every decrypted frame is classified: it matches only
+	 * what this SA encrypted, and never a decrypted packet built to look
+	 * like it. */
+	if (!sa_dir_in)
+		info->sec_tag = cdx_ipsec_key_tag_of(sa);
 
 	/*round off keysize to next 4 bytes boundary */
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];
@@ -2600,28 +2500,4 @@ err_ret:
 	return FAILURE;
 }
 
-int IPsec_get_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len)
-{
-	fpp_sec_failure_stats_query_cmd_t *pStats;
-	int retval;
-
-	if (cmd_len < sizeof(fpp_sec_failure_stats_query_cmd_t))
-	{
-		return ERR_WRONG_COMMAND_SIZE;
-	}
-
-	pStats = (fpp_sec_failure_stats_query_cmd_t *)pcmd;
-	retval = ExternalHashGetSECfailureStats(&pStats->SEC_failure_stats);
-
-	if (retval)
-		return ERR_WRONG_COMMAND_PARAM;
-
-	return cmd_len;
-}
-
-int IPsec_reset_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len)
-{
-	ExternalHashResetSECfailureStats();
-	return 0;
-}
 #endif /* DPA_IPSEC_OFFLOAD */

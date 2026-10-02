@@ -3,7 +3,7 @@
 # Provides:          debugfs
 # Required-Start:    mountvirtfs
 # Default-Start:     S
-# Short-Description: Mount debugfs (needed by kmemleak, failslab, etc.)
+# Short-Description: Mount debugfs and tracefs (kmemleak, failslab, ftrace)
 ### END INIT INFO
 
 # /proc and /sys are mounted by mountvirtfs (busybox-inittab). debugfs,
@@ -24,6 +24,11 @@ case "$1" in
     start|"")
         if ! mountpoint -q /sys/kernel/debug; then
             mount -t debugfs debugfs /sys/kernel/debug
+        fi
+        # ftrace and kprobe events live on tracefs, which nothing else here
+        # mounts either.
+        if ! mountpoint -q /sys/kernel/tracing; then
+            mount -t tracefs tracefs /sys/kernel/tracing
         fi
         ;;
     stop)

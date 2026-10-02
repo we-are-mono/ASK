@@ -1,9 +1,8 @@
 """CDX startup rollback, driven from a boot where CDX has not loaded yet.
 
 Run separately from tools/tests: these cases require an unconfigured FMAN, so
-boot an image with cdx and fci commented out of config/ask-modules.conf (fci
-depends on cdx and would pull it back in). The final checks load and unload CDX
-successfully in the same boot.
+boot an image with cdx commented out of config/ask-modules.conf. The final
+checks load and unload CDX successfully in the same boot.
 """
 
 import base64
@@ -13,6 +12,7 @@ import re
 import shlex
 
 from ask_orch.uart import Console
+from ask_orch.artifacts import artifact_dir
 
 # Check each resource class, partial queue batches and the final handoff.
 FAULTS = [
@@ -29,8 +29,7 @@ FAULTS = [
     ("cdxdrv_create_of_fqs", 4),
     ("cdxdrv_create_missaction_policer_profiles", 1),
     ("cdxdrv_create_ingress_qos_policer_profiles", 9),
-    ("dpa_cfg_install", 9),        # all CEETM policers
-    ("dpa_cfg_install", 10),       # classifier miss actions
+    ("dpa_cfg_install", 9),        # classifier miss actions
 ]
 SPLATS = re.compile(r"BUG:|WARNING: CPU:|Oops:|Kernel panic|possible circular locking|"
                     r"inconsistent lock state|sleeping function called|did not drain|"
@@ -40,6 +39,7 @@ SPLATS = re.compile(r"BUG:|WARNING: CPU:|Oops:|Kernel panic|possible circular lo
 
 
 def test_dpa_init_rollback(tmp_path):
+    tmp_path = artifact_dir()
     with Console.target(log_path=str(tmp_path / "uart.log")) as con:
         con.login("root", None)
 
@@ -50,7 +50,7 @@ def test_dpa_init_rollback(tmp_path):
 
         run("stty cols 240 -echo")
         # The only precondition that matters is an FMAN nothing has configured
-        # yet. Boot an image with cdx and fci left out of
+        # yet. Boot an image with cdx left out of
         # /etc/modules-load.d/ask.conf; the sweep loads and unloads cdx itself.
         assert not re.search(r"^cdx ", run("cat /proc/modules"), re.M), \
             "boot an image with cdx left out of the autoload list"
@@ -91,19 +91,12 @@ print(json.dumps(states, sort_keys=True))
                 kernel = run("dmesg")
                 (tmp_path / f"{site}-{step}.log").write_text(result.stdout + kernel)
                 assert result.rc != 0, f"fault checkpoint not reached: {site}:{step}"
-                assert f"injecting DPA startup failure at {site} step {step}" in result.stdout
+                assert f"injecting DPA startup failure at {site} step {step}" in kernel[len(dmesg_before):]
                 assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
                 assert not re.search(r"^cdx ", run("cat /proc/modules"), re.M)
                 assert run(muram_command) == muram_before, (site, step, "MURAM leaked")
                 assert json.loads(run(port_state_command)) == ports_before, (site, step, "port state changed")
                 run("test ! -e /proc/fqid_stats")
-                # Each failed install leaks ~930k bucket allocations that this
-                # build cannot reclaim (ISSUES.md A138). Left to accumulate,
-                # fifteen cycles reach ~14M objects: the scan below grows by
-                # ~6s per cycle and the report becomes too large to move over
-                # the console. Clear per cycle so the final scan is about the
-                # load/unload path. Drop this once A138 is fixed.
-                run("echo clear > /sys/kernel/debug/kmemleak", timeout=120)
                 results.append({"site": site, "step": step, "muram": muram_before})
                 print(f"rollback passed: {site}:{step}", flush=True)
             # A clean scan is ~5s; allow generous headroom so a slow one is
@@ -132,6 +125,7 @@ print(json.dumps(states, sort_keys=True))
             assert run("cat /proc/sys/kernel/random/boot_id") == boot
             assert json.loads(run(port_state_command)) == ports_before
             kernel = run("dmesg")
+            assert kernel.startswith(dmesg_before), "kernel log truncated during startup test"
             assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
             print("normal initialization passed in the same boot", flush=True)
             muram_loaded = run(muram_command)
@@ -141,6 +135,7 @@ print(json.dumps(states, sort_keys=True))
             assert json.loads(run(port_state_command)) == ports_before
             muram_unloaded = run(muram_command)
             kernel = run("dmesg")
+            assert kernel.startswith(dmesg_before), "kernel log truncated during startup test"
             assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
             (tmp_path / "unload-dmesg.txt").write_text(kernel)
             print("normal unload preserved port state without kernel diagnostics", flush=True)

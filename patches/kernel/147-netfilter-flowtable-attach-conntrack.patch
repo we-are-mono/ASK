@@ -1,0 +1,108 @@
+From c606c04f83a92d77e077a02493182ad296736c97 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Wed, 23 Sep 2026 23:04:04 +0200
+Subject: [PATCH] netfilter: flowtable: attach the conntrack to
+ software-forwarded frames
+
+A frame the software flowtable forwards leaves without the stack, and
+until now without its conntrack too. Whatever reads the connection
+downstream took it for an untracked frame: an egress qdisc classifying
+by the connection's mark found no mark, and a flow the hardware
+declined, or one never offered to it, lost its class the moment the
+flowtable took it over. On the XFRM path the postrouting hooks saw an
+untracked frame where the stack would have shown them an established
+one.
+
+Attach it the way act_ct does for its own flowtable: once the frame is
+committed to the fast path, drop any conntrack it arrived with, take a
+reference and set IP_CT_ESTABLISHED, or IP_CT_ESTABLISHED_REPLY in the
+reply direction (IP_CT_NEW for an original-direction frame before the
+reply has been seen, as act_ct). The flow's reference keeps the
+conntrack alive until an RCU grace period after the flow is freed and
+the hook runs under RCU, so the increment cannot race the last put; the
+skb drops its own reference when it is freed.
+
+Nothing is counted twice: the flowtable already updates the conntrack's
+accounting, and no hook between here and the wire does -- conntrack's
+postrouting confirm finds the entry confirmed, and NAT rewrites the
+addresses the flowtable has already rewritten to the values they hold.
+
+The cost is the reference each frame takes and drops, the same one the
+stack's own conntrack lookup takes per frame.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ net/netfilter/nf_flow_table_ip.c | 36 ++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index ff35d601699a..97b5afbf87bb 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -15,6 +15,7 @@
+ #include <net/neighbour.h>
+ #include <net/xfrm.h>
+ #include <net/netfilter/nf_flow_table.h>
++#include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
+ /* For layer 4 checksum field offset. */
+ #include <linux/tcp.h>
+@@ -272,6 +273,39 @@ static inline bool nf_flow_dst_check(const struct nf_flowtable *flowtable,
+ 	return dst_check(tuple->dst_cache, tuple->dst_cookie);
+ }
+ 
++/* Give a frame this path forwards the conntrack the stack would have given
++ * it, the way act_ct does for its own flowtable. Without one, whatever reads
++ * the connection downstream -- a qdisc classifying by its mark, a postrouting
++ * hook on the XFRM path -- takes an established flow's frame for an
++ * untracked one, and a flow declined by the hardware or not offered to it
++ * loses its class the moment the flowtable takes it over.
++ *
++ * Called once the frame is committed to this path, so every way back to the
++ * stack leaves the skb as it came. The flow's own reference keeps the
++ * conntrack alive until an RCU grace period after the flow is freed and this
++ * runs under RCU, so the count taken here cannot race the last put; the skb
++ * drops it when it is freed. Nothing is counted: the flowtable accounts the
++ * frame itself, and no hook between here and the wire updates conntrack
++ * accounting. A conntrack the frame arrived with -- one it carried out of a
++ * tunnel, say -- describes some other connection and is dropped first.
++ */
++static void nf_flow_ct_set(struct sk_buff *skb, struct flow_offload *flow,
++			   enum flow_offload_tuple_dir dir)
++{
++	struct nf_conn *ct = flow->ct;
++	enum ip_conntrack_info ctinfo;
++
++	if (dir == FLOW_OFFLOAD_DIR_ORIGINAL)
++		ctinfo = test_bit(IPS_SEEN_REPLY_BIT, &ct->status) ?
++			 IP_CT_ESTABLISHED : IP_CT_NEW;
++	else
++		ctinfo = IP_CT_ESTABLISHED_REPLY;
++
++	nf_reset_ct(skb);
++	nf_conntrack_get(&ct->ct_general);
++	nf_ct_set(skb, ct, ctinfo);
++}
++
+ static unsigned int nf_flow_xmit_xfrm(struct sk_buff *skb,
+ 				      const struct nf_hook_state *state,
+ 				      struct dst_entry *dst)
+@@ -415,6 +449,7 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+ 		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
++	nf_flow_ct_set(skb, flow, dir);
+ 
+ 	return 1;
+ }
+@@ -700,6 +735,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+ 
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+ 		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
++	nf_flow_ct_set(skb, flow, dir);
+ 
+ 	return 1;
+ }
+-- 
+2.47.3
+

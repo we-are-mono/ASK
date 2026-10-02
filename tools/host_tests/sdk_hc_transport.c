@@ -14,8 +14,13 @@
 #undef RETURN_ERROR
 #undef DBG
 #define ASSERT_COND assert
-#define REPORT_ERROR(level, err, msg) ((void)0)
-#define RETURN_ERROR(level, err, msg) return ERROR_CODE(err)
+/* Every line the transport would print, counted: a run of failures a caller
+ * retries on a timer must report its first only, and the command that ends
+ * the run one line more. */
+static unsigned reports, recoveries;
+#define REPORT_ERROR(level, err, msg) (reports++)
+#define RETURN_ERROR(level, err, msg) do { reports++; return ERROR_CODE(err); } while (0)
+#define pr_info(...) (recoveries++)
 #define DBG(level, msg) ((void)0)
 #include "hc_layout.inc"
 
@@ -156,16 +161,31 @@ static void refuses_teardown(t_FmHc *hc)
 static void rejection_and_completion(void)
 {
     t_FmHc *hc = setup();
+    unsigned reported = reports, recovered = recoveries;
     reject = true;
     for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
         assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
         assert(!hc->nextSeqNumLocation && !hc->failed && !delays);
+        /* A refused sync can complete next time: the channel has not
+         * failed, and an owner waiting on a barrier waits for it. */
+        assert(!FmHcIsFailed(hc));
         t_HcFrame expected = {.opcode = HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC};
         assert(!memcmp(hc->p_Frm[0], &expected, sizeof(expected)));
+        /* A run of rejections reports its first only: neither a later
+         * rejection nor the sync it failed adds a line. */
+        assert(reports == reported + 1 && hc->failures == n + 1 && recoveries == recovered);
     }
     reject = false;
     inline_confirm = true;
     assert(FmHcPcdSync(hc) == E_OK && !hc->nextSeqNumLocation && !delays);
+    /* The command that ends the run says so, once, and a new run reports
+     * again from its first failure. */
+    assert(recoveries == recovered + 1 && !hc->failures && reports == reported + 1);
+    assert(FmHcPcdSync(hc) == E_OK && recoveries == recovered + 1);
+    reject = true;
+    assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE && reports == reported + 2);
+    reject = false;
+    assert(FmHcPcdSync(hc) == E_OK && recoveries == recovered + 2 && reports == reported + 2);
     inline_confirm = false;
     confirm_at = HC_CONFIRM_POLLS; /* Completion at the deadline wins. */
     assert(FmHcPcdSync(hc) == E_OK && !hc->failed);
@@ -184,15 +204,26 @@ static void timeout_and_late_confirmation(bool before_return)
         assert(FmAllowHcUsage(hc, false) == E_OK);
         assert(!FmIsHcUsageAllowed(hc));
     }
+    unsigned reported = reports;
+    assert(!FmHcIsFailed(hc));
     assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_TIMEOUT);
     assert(hc->failed && delays == HC_CONFIRM_POLLS && submissions == 1);
+    /* One that timed out unconfirmed has failed the channel until reset,
+     * which is what an owner asks before it stops waiting on barriers. */
+    assert(FmHcIsFailed(hc));
     assert(hc->nextSeqNumLocation == (before_return ? 0 : 1));
+    /* The timeout that failed the channel is reported unconditionally, and
+     * starts the run every retry after it belongs to. */
+    assert(reports == reported + 1 && hc->failures == 1);
     refuses_teardown(hc);
     t_HcFrame snapshot = *hc->p_Frm[0];
+    reported = reports;
     for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
         assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
         assert(submissions == 1);
         if (!before_return) assert(!memcmp(hc->p_Frm[0], &snapshot, sizeof(snapshot)));
+        /* A retry of a failed channel adds no line of its own. */
+        assert(reports == reported && hc->failures == n + 2);
     }
     if (!before_return) {
         /* Exhaust all remaining buffers and return them out of order. The
@@ -213,7 +244,7 @@ static void timeout_and_late_confirmation(bool before_return)
         /* SDK rejects a duplicate CPU-order confirmation without double free. */
         FmHcTxConf(hc, (t_DpaaFD *)&pending.fd);
     }
-    assert(!hc->nextSeqNumLocation && hc->failed);
+    assert(!hc->nextSeqNumLocation && hc->failed && FmHcIsFailed(hc));
     refuses_teardown(hc); /* A late confirmation does not repair caller state. */
     dispose(hc);
 }
@@ -236,6 +267,23 @@ static void pool_and_cleanup(void)
     hc->h_HcPortDev = hc;
     assert(FmHcFree(hc) == E_OK && port_frees == 1 && frees == HC_CMD_POOL_SIZE);
     active = NULL;
+}
+static void exhausted_pool(void)
+{
+    t_FmHc *hc = setup();
+    t_HcFrame *borrowed[HC_CMD_POOL_SIZE];
+    uint32_t seq[HC_CMD_POOL_SIZE];
+    unsigned reported = reports, recovered = recoveries;
+    for (unsigned n = 0; n < HC_CMD_POOL_SIZE; n++) assert((borrowed[n] = GetBuf(hc, &seq[n])));
+    /* No frame to build a sync in fails every retry the same way, and the
+     * run reports its first only. */
+    for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++)
+        assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_NO_MEMORY && reports == reported + 1);
+    assert(!submissions && recoveries == recovered);
+    for (unsigned n = 0; n < HC_CMD_POOL_SIZE; n++) PutBuf(hc, borrowed[n], seq[n]);
+    inline_confirm = true;
+    assert(FmHcPcdSync(hc) == E_OK && recoveries == recovered + 1 && !hc->failures);
+    dispose(hc);
 }
 static void independent_commands_and_invalid_confirmation(void)
 {
@@ -260,11 +308,14 @@ static void independent_commands_and_invalid_confirmation(void)
 int main(void)
 {
     _Static_assert(sizeof(struct qm_fd) == sizeof(t_DpaaFD), "QMan / SDK FD layout");
+    /* A PCD without a channel has none to fail. */
+    assert(!FmHcIsFailed(NULL));
     rejection_and_completion();
     timeout_and_late_confirmation(false);
     timeout_and_late_confirmation(true);
     pool_and_cleanup();
+    exhausted_pool();
     independent_commands_and_invalid_confirmation();
-    puts("SDK HC transport: rejection/retry, deadline, timeout, late confirmation, pool and teardown passed");
+    puts("SDK HC transport: rejection/retry, deadline, timeout, late confirmation, pool, teardown and failure reporting passed");
     return 0;
 }

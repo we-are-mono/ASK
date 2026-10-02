@@ -27,8 +27,6 @@
 					* 2 words for packets
 					* 2 words for bytes
 					*/
-/* The maximum length (in bytes) for the CAAM extra commands */
-#define MAX_EXTRA_DESC_COMMANDS         (64 * sizeof(U32))
 
 
 
@@ -81,14 +79,9 @@
 #define FRAG_DISABLE				(1<<3)
 
 
-/* defined in fpp.h */
-typedef struct fpp_sec_failure_stats_query_cmd {
-	uint16_t	action;
-	en_SEC_failure_stats	SEC_failure_stats;
-} __attribute__((__packed__)) fpp_sec_failure_stats_query_cmd_t;
-
 int cdx_ipsec_init(void);
 void cdx_ipsec_deinit(void);
+bool cdx_ipsec_ready(void);
 
 PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc (uint32_t);
 void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context ) ;
@@ -100,12 +93,27 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param);
 void cdx_ipsec_release_sa_resources(PSAEntry pSA);
 int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id,
 				struct dpa_l2hdr_info *l2_info,
-				struct dpa_l3hdr_info *l3_info, uint32_t *dir_in);
+				struct dpa_l3hdr_info *l3_info);
 int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			uint32_t sa_dir_in);
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info);
+
+/* An internal VLAN carries the executing SA installation. Its ID is owned
+ * alongside the SA queues; it is removed before Linux or wire delivery. */
+uint32_t cdx_ipsec_key_tag_of(PSAEntry sa);
+
+static inline void cdx_ipsec_vlan_tag(uint8_t *vlan, uint32_t tag)
+{
+	vlan[0] = 0x81;
+	vlan[1] = 0x00;
+	vlan[2] = (tag >> 8) & 0xff;
+	vlan[3] = tag & 0xff;
+}
+
 int cdx_ipsec_delete_fp_entry(PSAEntry pSA);
-void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow);
+void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes);
+u64 get_oseq_from_sa(PSAEntry sa);
+void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen);
 
 #ifdef CDX_DEBUG_KEY_ZEROING
 /* H2 regression tripwire — see cdx_dpa_ipsec.c for design rationale.
@@ -114,6 +122,15 @@ void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow);
  */
 int  cdx_ipsec_init_key_zeroing_probe(void);
 void cdx_ipsec_remove_key_zeroing_probe(void);
+#endif
+
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+/* Split-key fault-injection knob - see cdx_dpa_ipsec.c. Both functions
+ * exist only when CDX_DEBUG_SPLIT_KEY_FAIL is defined; the meta-ask test
+ * image sets it via CFG_FLAGS, production builds do not.
+ */
+int  cdx_ipsec_init_split_key_fail_probe(void);
+void cdx_ipsec_remove_split_key_fail_probe(void);
 #endif
 
 #endif

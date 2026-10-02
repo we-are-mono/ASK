@@ -27,6 +27,11 @@
 //table create ioctl
 #define CDX_CTRL_PORT_NAME_LEN	32	
 
+/* Physical-port TCP/UDP keys include tunnel endpoints and PPPoE identity.
+ * SEC's private tables retain their original 14/38-byte tuple keys. */
+#define CDX_UNICAST_KEY_SIZE 55
+#define CDX_UNICAST4_KEY_SIZE 56
+
 //max number of fwd manip nodes
 //max number of nat addr translation manip nodes
 //max number of nat port translation manip nodes
@@ -46,14 +51,42 @@ enum {
 	ETHERNET_DIST,
 #ifdef CDX_RTP_RELAY // RTP relay feature
 	IPV4_3TUPLE_UDP_DIST,
-	IPV4_3TUPLE_TCP_DIST,	//unused, reserved to keep the numbering stable
-	IPV6_3TUPLE_UDP_DIST,
-	IPV6_3TUPLE_TCP_DIST,	//unused, reserved to keep the numbering stable
 #endif //CDX_RTP_RELAY
+	/* The bridged multicast distributions take the two slots the vendor
+	 * reserved for 3-tuple TCP, which nothing ever defined, so every other
+	 * type keeps its number. See the table aliases below. */
+	IPV4_BRIDGED_MULTICAST_DIST,
+#ifdef CDX_RTP_RELAY // RTP relay feature
+	IPV6_3TUPLE_UDP_DIST,
+#endif //CDX_RTP_RELAY
+	IPV6_BRIDGED_MULTICAST_DIST,
 	IPV4_FRAG_DIST,
 	IPV6_FRAG_DIST,
 	MAX_DIST_TYPES
 };
+
+/* The bridged multicast table types published by dpa_cfg_publish().
+ *
+ * A bridge has to forward a frame with the Ethernet addresses it arrived
+ * with, and successive frames of one (S,G) can come from different senders,
+ * so a bridged group is keyed on the frame's own MAC pair as well as its
+ * (S,G) -- ingress port, destination MAC, source MAC, source, group and
+ * protocol, the order the key generator extracts them in -- and each listener
+ * rebuilds Ethernet with exactly the pair its root matched. A routed group
+ * cannot carry that key: the upstream router's address is no fact of the MFC.
+ * One table cannot mix the two key layouts, so the bridged groups get tables
+ * of their own, reached from a routed multicast table's miss. See
+ * docs/flowtable/multicast-hardware.md.
+ *
+ * cdx indexes a port's tables by this type, so it needs two numbers no other
+ * table uses: the 3-tuple TCP slots the vendor reserved and nothing creates.
+ * The SDK sees these tables as the multicast types they are -- the builder
+ * hands FM_PCD_HashTableSet() IPV4_MULTICAST_TABLE and IPV6_MULTICAST_TABLE
+ * for them -- because the kernel reads a table type for one thing only, the
+ * microcode class of the table, and these are multicast (L3) tables exactly
+ * like the routed ones. */
+#define IPV4_BRIDGED_MULTICAST_TABLE	IPV4_3TUPLE_TCP_TABLE
+#define IPV6_BRIDGED_MULTICAST_TABLE	IPV6_3TUPLE_TCP_TABLE
 
 //port distribution info
 struct cdx_dist_info {
@@ -167,7 +200,9 @@ struct cdx_fman_info {
 	uint32_t max_ports;	//max ports with this fman
 	uint32_t num_tables;	//max tables for this fman
 	uint32_t fmMuramMemSize; 
-	uint32_t expt_ratelim_mode;       //0 bytes mode, 1 pkt mode
+	/* EXPT_PKT_LIM_PLCR_MODE_PKT (0) or _BYTE (1). The comment here used to
+	 * say the opposite of what the defines above it spell. */
+	uint32_t expt_ratelim_mode;
 	uint32_t expt_ratelim_burst_size; //bytes or packets
 };
 
@@ -207,13 +242,7 @@ int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *finfo);
 int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs);
 int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no);
 int cdxdrv_enable_or_disable_ingress_policer(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t oper);
-int cdxdrv_ingress_policer_reset(struct cdx_fman_info *finfo);
-int cdxdrv_ingress_policer_stats(struct cdx_fman_info *finfo,uint32_t queue_no,void *stats, uint32_t clear);
-#ifdef SEC_PROFILE_SUPPORT
-int cdxdrv_sec_policer_reset(struct cdx_fman_info *finfo);
-#endif /* endif for SEC_PROFILE_SUPPORT */
 #endif
 
 struct cdx_port_info *get_dpa_port_info(char *name);
-char *get_dpa_port_name(uint32_t portid);
 #endif

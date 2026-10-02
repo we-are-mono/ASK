@@ -120,10 +120,12 @@
 		compatible = "mono,sfp-led";
 
 		port@0 {
+			compatible = "mono,sfp-led-port";
 			sfp = <&sfp_xfi0>;
 			leds = <&led_sfp0_link>, <&led_sfp0_activity>;
 		};
 		port@1 {
+			compatible = "mono,sfp-led-port";
 			sfp = <&sfp_xfi1>;
 			leds = <&led_sfp1_link>, <&led_sfp1_activity>;
 		};

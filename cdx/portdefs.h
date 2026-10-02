@@ -77,9 +77,9 @@ struct eth_iface_info {
 	qman_cb_dqrr dqrr;
 	uint32_t num_pools;	//pools used by port
 	struct port_bman_pool_info pool_info[MAX_PORT_BMAN_POOLS]; //pool info
-	uint8_t mac_addr[ETH_ALEN];	//mac address
-	uint8_t br_mac_addr[ETH_ALEN];	//bridge mac address
-	uint8_t is_bridged;		// flag to check if interface is bridged or not
+	/* No mac_addr here: a physical port's own address is net_dev's, read
+	 * where the Ethernet header is encoded, rather than a cached copy that
+	 * goes stale the moment anyone changes it. */
 	uint32_t max_dist;		//max PCD distributions
 	struct cdx_dist_info *dist_info;//pointer to array of pcd dist
 	struct dpa_fq *defa_rx_dpa_fq; //default rx fq pointer
@@ -97,52 +97,17 @@ struct oh_iface_info {
         struct cdx_dist_info *dist_info;//pointer to array of pcd dist
 };
 
-//vlan device information
-struct vlan_iface_info {
-	struct dpa_iface_info *parent;
-	uint16_t vlan_id;
-	uint8_t is_bridged; 		/* Flag to check if interface is bridged or not */
-	uint8_t pad;  			/* not used */
-	uint8_t mac_addr[ETH_ALEN]; 	/* Vlan interface mac address */
-	uint8_t br_mac_addr[ETH_ALEN]; 	/* Bridge mac address stored if interface is part of bridge group */
-};
-
-//pppoe device information
-struct pppoe_iface_info {
-	struct dpa_iface_info *parent;
-	uint16_t session_id;
-	uint8_t mac_addr[ETH_ALEN];
-};
-
 struct wlan_iface_info {
+	/* The device this VAP rides, so a netdev can be resolved back to its
+	 * iface the way an ethernet port can. Borrowed, never dereferenced --
+	 * only compared -- and cleared when the VAP is retired, which is what
+	 * the ethernet arm's own net_dev does. */
+	struct net_device *net_dev;
 	uint16_t vap_id;
-	uint8_t is_bridged;		/* Flag to check if interface is bridged or not */
-	uint8_t pad;			/* not used */
 	uint8_t mac_addr[ETH_ALEN];	/* Wlan interface mac address */
-	uint8_t br_mac_addr[ETH_ALEN];	/* Bridge mac address stored if interface is part of bridge group */
 	uint32_t fman_idx;
 	uint32_t port_idx;
 	uint32_t portid;
-};
-
-
-//tunnel device information
-struct tunnel_iface_info {
-
-	struct dpa_iface_info *parent;
-	uint8_t mode; /*4o6/6o4/remote_any*/
-	uint8_t proto;
-	uint8_t flags;
-	uint8_t  pad;
-	uint16_t header_size;
-	uint32_t local_ip[4];
-	uint32_t remote_ip[4];
-	uint8_t dstmac[ETH_ALEN];
-	union {
-		uint8_t   header[40];
-		ipv4_hdr_t header_v4;
-		ipv6_hdr_t header_v6;
-	};
 };
 
 struct iface_stats {
@@ -161,11 +126,11 @@ struct dpa_iface_info {
 	uint32_t mtu;		//iface mtu
 
 	uint8_t name[IF_NAME_SIZE]; //name as seen by OS
+	/* Only physical ports register: Ethernet ports, Wi-Fi VAPs and the
+	 * offline ports. A VLAN, PPPoE session or tunnel in front of one is
+	 * described by the flow that crosses it. */
 	union {
 		struct eth_iface_info eth_info; //info if iface type is eth
-		struct vlan_iface_info vlan_info; //info if type is vlan
-		struct pppoe_iface_info pppoe_info; //info if type is pppoe
-		struct tunnel_iface_info tunnel_info; //info if type is tunnel
 		struct wlan_iface_info wlan_info; //internal wlan  info
 		struct oh_iface_info oh_info; //internal oh parsing port info
 
@@ -194,6 +159,11 @@ struct dpa_iface_info {
 int find_pcd_fq_info(uint32_t fqid);
 void add_pcd_fq_info(struct dpa_fq *fq_info);
 void cdx_destroy_fq(struct qman_fq *fq);
+/* A parked, tail-dropping queue an entry enqueues to in order to drop what it
+ * matches; see devman.c. The id, created on first use, under the control lock;
+ * torn down at unload after the ports stop. */
+int cdx_discard_fqid(uint32_t *fqid);
+void cdx_discard_exit(void);
 void cdx_drain_fq_list(struct dpa_fq *head);
 void cdx_destroy_fq_list(struct dpa_fq **head);
 void cdx_reset_offline_ports(void);
@@ -204,26 +174,48 @@ int get_ofport_fman_and_portindex(uint32_t fm_index, uint32_t handle, uint32_t* 
 int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface);
 void cdx_deinit_iface_stats(void *muram_handle);
 void free_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface);
+/* The periodic read that keeps every record's packet count exact past the
+ * firmware's 32 bits. Paired with the dev_get_stats hook, from module init to
+ * module exit; stop may sleep. */
+void cdx_ifstats_start(void);
+void cdx_ifstats_stop(void);
 int get_ofport_portid(uint32_t fm_idx, uint32_t handle, uint32_t *portid);
 int get_ofport_info(uint32_t fm_idx, uint32_t handle, uint32_t *channel, void **td);
 int get_ofport_max_dist(uint32_t fm_idx, uint32_t handle, uint32_t* max_dist);
 int get_phys_port_poolinfo_bysize(uint32_t size, struct port_bman_pool_info *pool_info);
 int alloc_offline_port(uint32_t fm_idx, uint32_t type, qman_cb_dqrr defa_rx, qman_cb_dqrr err_rx);
-int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t type,
+int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t index,
 			uint32_t *pfqid, uint32_t *count);
-int ohport_set_ofne(uint32_t handle, uint32_t nia_val);
 int release_offline_port(uint32_t fm_idx, int handle);
 int get_dpa_oh_iface_info(struct oh_iface_info *iface_info, char *name);
 int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags);
 int dpa_add_port_to_list(struct dpa_iface_info *iface_info);
 struct dpa_iface_info *dpa_get_ifinfo_by_itfid(uint32_t itf_id);
+struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev);
+bool dpa_netdev_is_physical(const struct net_device *dev);
+bool dpa_netdev_is_dpaa(const struct net_device *dev);
+extern spinlock_t dpa_devlist_lock;
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid);
-void display_iface_info(struct dpa_iface_info *iface_info);
 int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq);
 int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry);
 void dpa_release_iflist(void);
+/* The classifier ports CDX configured, stopped and started again around a
+ * repair of the tables they walk; see dpa_cfg.c. RTNL and the control mutex
+ * held for each. Stop never detaches a port or drains a queue, so resume puts
+ * every port back exactly as it was; quiesce does both, for unload, and leaves
+ * the ports for good. Resume returns how many ports would not start, or a
+ * negative errno. */
+int dpa_cfg_stop(void);
+int dpa_cfg_resume(void);
 int dpa_cfg_quiesce(void);
+bool dpa_cfg_covered(void);
 void dpa_cfg_deinit(void);
+/* An external hash table of the configuration, to issue a PCD barrier through
+ * when the caller has none of its own; NULL before one is configured. Caller
+ * holds the control mutex. */
+void *dpa_get_ehash_td(void);
+/* Caller holds the control mutex. */
+uint32_t dpa_get_num_fmans(void);
 /* Caller holds the control mutex and RTNL; RTNL is dropped during retry waits. */
 void qm_quiesce(void);
 uint32_t get_logical_ifstats_base(void);
@@ -231,9 +223,7 @@ void *dpa_get_fm_MURAM_handle(uint32_t fm_idx, uint64_t *phyBaseAddr,
 					uint32_t *MuramSize);
 int dpaa_vwd_init(void);
 void dpaa_vwd_exit(void);
-U16 dpa_iface_stats_get( struct dpa_iface_info *iface_info, struct iface_stats *ifstats);
-void  dpa_iface_stats_reset(struct dpa_iface_info *iface_info, struct iface_stats *stats);
-struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *markval);
+uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *markval);
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void *markval);
 int dpaa_is_oh_port(uint32_t portid);
 #endif

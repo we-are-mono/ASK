@@ -15,418 +15,20 @@
 #include <dpaa_eth_common.h>
 
 #include "cdx.h"
-#include "cdx_cmd_validator.h"
 #include "cdx_ioctl.h"
 #include "portdefs.h"
 #include "module_qm.h"
 #include "cdx_ceetm_app.h"
+#include "cdx_htb.h"
+#include "cdx_dscp.h"
+#include "cdx_devlink.h"
 #include "misc.h"
 
 QM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
-
-
-/** QOS command executer.
- * This function is the QOS handler function / the entry point
- * to process the qos commands
- *
- * @param cmd_code   Command code.
- * @param cmd_len    Command length.
- * @param p          Command structure.
- *
- */
-
-#ifdef ENABLE_EGRESS_QOS
-static U16 qm_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosResetCommand qcmd = (PQosResetCommand)pcmd;
-	struct cdx_port_info *port_info;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-	port_info = get_dpa_port_info(qcmd->ifname);
-	if (!port_info)
-		return CMD_ERR;
-	if (ceetm_reset_qos(QM_GET_CONTEXT(port_info->portid)))
-		return CMD_ERR;
-	return CMD_OK;
-}
-
-static U16 qm_qosenable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosEnableCommand qcmd = (PQosEnableCommand)pcmd;
-	struct cdx_port_info *port_info;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-	port_info = get_dpa_port_info(qcmd->ifname);
-	if (!port_info)
-		return QOS_ENERR_INVAL_PARAM;
-	return (U16)ceetm_enable_or_disable_qos(QM_GET_CONTEXT(port_info->portid),
-						qcmd->enable_flag);
-}
-
-static U16 qm_shaper_config_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)cmd_len;
-	(void)out_reply_len;
-	if (ceetm_configure_shaper((PQosShaperConfigCommand)pcmd))
-		return CMD_ERR;
-	return CMD_OK;
-}
-
-static U16 qm_wbfq_config_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)cmd_len;
-	(void)out_reply_len;
-	if (ceetm_configure_wbfq((PQosWbfqConfigCommand)pcmd))
-		return CMD_ERR;
-	return CMD_OK;
-}
-
-static U16 qm_cq_config_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)cmd_len;
-	(void)out_reply_len;
-	if (ceetm_configure_cq((PQosCqConfigCommand)pcmd))
-		return CMD_ERR;
-	return CMD_OK;
-}
-
-static U16 qm_chnl_assign_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosChnlAssignCommand qcmd = (PQosChnlAssignCommand)pcmd;
-	struct cdx_port_info *port_info;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-	port_info = get_dpa_port_info(qcmd->ifname);
-	if (!port_info)
-		return CMD_ERR;
-	if (ceetm_assign_chnl(QM_GET_CONTEXT(port_info->portid), qcmd->channel_num))
-		return CMD_ERR;
-	return CMD_OK;
-}
-
-/*
- * CMD_QM_DSCP_Q_MAP_STATUS / _CFG / _RESET all share a common
- * preamble (look up port, require qos_enabled). The old cmdproc
- * had them in a combined case body with `cmd_code == ...` inner
- * dispatch; split into three handlers with a shared helper.
- */
-static U16 qm_dscp_q_map_common(PQosDscpChnlClsq_mapCmd qcmd,
-				int (*op)(struct tQM_context_ctl *, PQosDscpChnlClsq_mapCmd))
-{
-	struct cdx_port_info *port_info;
-	struct tQM_context_ctl *qm_ctx;
-
-	port_info = get_dpa_port_info(qcmd->ifname);
-	if (!port_info) {
-		DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n",
-			  __func__, __LINE__, QOS_ENERR_INVAL_PARAM);
-		return QOS_ENERR_INVAL_PARAM;
-	}
-	qm_ctx = QM_GET_CONTEXT(port_info->portid);
-	if (!qm_ctx->qos_enabled) {
-		DPA_ERROR("%s()::%d QoS not enabled on this interface <%s>\n",
-			  __func__, __LINE__, qm_ctx->iface_info->name);
-		return QOS_ENERR_NOT_CONFIGURED;
-	}
-	if (op(qm_ctx, qcmd)) {
-		DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n",
-			  __func__, __LINE__, CMD_ERR);
-		return CMD_ERR;
-	}
-	return CMD_OK;
-}
-
-static int qm_dscp_status_op(struct tQM_context_ctl *ctx, PQosDscpChnlClsq_mapCmd c)
-{
-	return ceetm_enable_disable_dscp_fq_map(ctx, c->status);
-}
-
-static int qm_dscp_cfg_op(struct tQM_context_ctl *ctx, PQosDscpChnlClsq_mapCmd c)
-{
-	return ceetm_dscp_fq_map(ctx, c->dscp, c->channel_num, c->clsqueue_num);
-}
-
-static int qm_dscp_reset_op(struct tQM_context_ctl *ctx, PQosDscpChnlClsq_mapCmd c)
-{
-	return ceetm_dscp_fq_unmap(ctx, c->dscp);
-}
-
-static U16 qm_dscp_q_map_status_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)cmd_len;
-	(void)out_reply_len;
-	return qm_dscp_q_map_common((PQosDscpChnlClsq_mapCmd)pcmd, qm_dscp_status_op);
-}
-
-static U16 qm_dscp_q_map_cfg_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)cmd_len;
-	(void)out_reply_len;
-	return qm_dscp_q_map_common((PQosDscpChnlClsq_mapCmd)pcmd, qm_dscp_cfg_op);
-}
-
-static U16 qm_dscp_q_map_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)cmd_len;
-	(void)out_reply_len;
-	return qm_dscp_q_map_common((PQosDscpChnlClsq_mapCmd)pcmd, qm_dscp_reset_op);
-}
-#endif /* ENABLE_EGRESS_QOS */
-
-static U16 qm_expt_rate_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosExptRateCommand pexptrate = (PQosExptRateCommand)pcmd;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-#ifdef QM_DEBUG
-	printk("%s::interface %d, rate pkts/s %d burst_size :%d\n", __func__,
-	       pexptrate->expt_iftype, pexptrate->pkts_per_sec, pexptrate->burst_size);
-#endif
-	if (cdx_set_expt_rate(FMAN_INDEX, pexptrate->expt_iftype,
-			      pexptrate->pkts_per_sec, pexptrate->burst_size))
-		return CMD_ERR;
-	return CMD_OK;
-}
-
-static U16 qm_ff_rate_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosFFRateCommand prate = (PQosFFRateCommand)pcmd;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-	if (cdx_set_ff_rate(prate->interface, prate->cir, prate->pir))
-		return CMD_ERR;
-	return CMD_OK;
-}
-
-#ifdef ENABLE_EGRESS_QOS
-static U16 qm_query_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	pQosQueryCmd qcmd = (pQosQueryCmd)pcmd;
-	struct cdx_port_info *port_info;
-
-	(void)cmd_len;
-	port_info = get_dpa_port_info(qcmd->interface);
-	if (!port_info)
-		return CMD_ERR;
-	if (ceetm_get_qos_cfg(QM_GET_CONTEXT(port_info->portid), qcmd))
-		return CMD_ERR;
-	*out_reply_len = sizeof(QosQueryCmd);
-	return CMD_OK;
-}
-
-static U16 qm_query_queue_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)cmd_len;
-	if (ceetm_get_cq_query((pQosCqQueryCmd)pcmd))
-		return CMD_ERR;
-	*out_reply_len = sizeof(QosCqQueryCmd);
-	return CMD_OK;
-}
-#endif
-
-static U16 qm_query_ff_rate_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosFFRateCommand prate = (PQosFFRateCommand)pcmd;
-
-	(void)cmd_len;
-	if (cdx_get_ff_rate(prate))
-		return CMD_ERR;
-	*out_reply_len = sizeof(QosFFRateCommand);
-#ifdef QM_DEBUG
-	printk("%s::port %s cir rate pkts/s %d, pir rate %d\n", __func__,
-	       prate->interface, prate->cir, prate->pir);
-#endif
-	return CMD_OK;
-}
-
-static U16 qm_query_expt_rate_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosExptRateCommand pexptrate = (PQosExptRateCommand)pcmd;
-
-	(void)cmd_len;
-	if (cdx_get_expt_rate(pexptrate))
-		return CMD_ERR;
-	*out_reply_len = sizeof(QosExptRateCommand);
-	return CMD_OK;
-}
-
-#ifdef ENABLE_INGRESS_QOS
-static U16 qm_query_iface_dscp_fqid_map_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosIfaceDscpFqidMapCommand pDscpFqMap = (PQosIfaceDscpFqidMapCommand)pcmd;
-	struct cdx_port_info *port_info;
-	struct tQM_context_ctl *qm_ctx;
-
-	(void)cmd_len;
-	port_info = get_dpa_port_info(pDscpFqMap->ifname);
-	if (!port_info)
-		return CMD_ERR;
-	qm_ctx = QM_GET_CONTEXT(port_info->portid);
-	if (!qm_ctx->qos_enabled) {
-		DPA_ERROR("%s()::%d QoS not enabled on this interface <%s>\n",
-			  __func__, __LINE__, qm_ctx->iface_info->name);
-		return QOS_ENERR_NOT_CONFIGURED;
-	}
-	pDscpFqMap->enable = qm_ctx->dscp_fq_map ? 1 : 0;
-	if (ceetm_get_dscp_fq_map(qm_ctx, pDscpFqMap))
-		return CMD_ERR;
-	*out_reply_len = sizeof(QosIfaceDscpFqidMapCommand);
-	DPA_INFO("retlen %u \n", (unsigned int)sizeof(QosIfaceDscpFqidMapCommand));
-	return CMD_OK;
-}
-
-static U16 qm_ingress_policer_enable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PIngressQosEnableCommand qcmd = (PIngressQosEnableCommand)pcmd;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-	return (U16)cdx_ingress_enable_or_disable_qos(FMAN_INDEX, qcmd->queue_no, qcmd->enable_flag);
-}
-
-static U16 qm_ingress_policer_config_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PIngressQosCfgCommand qcmd = (PIngressQosCfgCommand)pcmd;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-	return (U16)cdx_ingress_policer_modify_config(FMAN_INDEX, qcmd->queue_no,
-						      qcmd->cir, qcmd->pir,
-						      DEFAULT_INGRESS_BYTE_MODE_CBS,
-						      DEFAULT_INGRESS_BYTE_MODE_PBS);
-}
-
-static U16 qm_ingress_policer_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)pcmd;
-	(void)cmd_len;
-	(void)out_reply_len;
-	if (cdx_ingress_policer_reset(FMAN_INDEX))
-		return CMD_ERR;
-	return CMD_OK;
-}
-
-static U16 qm_ingress_policer_query_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	pIngressQosStatCmd qcmd = (pIngressQosStatCmd)pcmd;
-	uint32_t ii;
-
-	(void)cmd_len;
-	for (ii = 0; ii < INGRESS_FLOW_POLICER_QUEUES; ii++)
-		cdx_ingress_policer_stats(FMAN_INDEX, ii,
-					  &qcmd->policer_stats[ii], qcmd->clear);
-	*out_reply_len = sizeof(IngressQosStat) * INGRESS_FLOW_POLICER_QUEUES;
-	return CMD_OK;
-}
-
-#ifdef SEC_PROFILE_SUPPORT
-static U16 qm_sec_policer_config_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PQosSecRateCommand qcmd = (PQosSecRateCommand)pcmd;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-	return (U16)cdx_ingress_policer_modify_config(FMAN_INDEX,
-						      INGRESS_SEC_POLICER_QUEUE_NUM,
-						      qcmd->cir, qcmd->pir,
-						      qcmd->cbs, qcmd->pbs);
-}
-
-static U16 qm_sec_policer_query_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	pSecQosStatCmd qcmd = (pSecQosStatCmd)pcmd;
-
-	(void)cmd_len;
-	cdx_ingress_policer_stats(FMAN_INDEX, INGRESS_SEC_POLICER_QUEUE_NUM,
-				  &qcmd->policer_stats, qcmd->clear);
-	*out_reply_len = sizeof(IngressQosStat);
-	return CMD_OK;
-}
-
-static U16 qm_sec_policer_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)pcmd;
-	(void)cmd_len;
-	(void)out_reply_len;
-	if (cdx_sec_policer_reset(FMAN_INDEX))
-		return CMD_ERR;
-	return CMD_OK;
-}
-#endif /* SEC_PROFILE_SUPPORT */
-#endif /* ENABLE_INGRESS_QOS */
-
-/*
- * Lower bounds were tightened from the previous CDX_CMD_VAR(0, U16_MAX)
- * permissive entries (ISSUES.md A1b item 6). Each handler casts pcmd to
- * a specific request struct and dereferences fields without checking
- * cmd_len, so an undersized input would read uninit bytes from the
- * shared FCI rbuf. Setting min == sizeof(request struct) makes the
- * dispatcher reject those before they reach the handler. Max stays at
- * U16_MAX because libfci callers may pre-size the buffer for a larger
- * response struct and we don't want to break that — the FCI inbound
- * path already caps cmd_len at FCI_MSG_MAX_PAYLOAD.
- *
- * Two RESET-style handlers (CMD_QM_INGRESS_POLICER_RESET,
- * CMD_QM_SEC_POLICER_RESET) take no input — they `(void)pcmd; (void)cmd_len;`
- * and call the underlying reset directly. No read-uninit risk, so they
- * stay at (0, U16_MAX) for compatibility with senders that pad with
- * zero bytes.
- */
-static const struct cdx_cmd_spec qm_cmd_table[] = {
-#ifdef ENABLE_EGRESS_QOS
-	CDX_CMD_VAR(CMD_QM_RESET,              sizeof(QosResetCommand),         U16_MAX, NULL, qm_reset_handle),
-	CDX_CMD_VAR(CMD_QM_QOSENABLE,          sizeof(QosEnableCommand),        U16_MAX, NULL, qm_qosenable_handle),
-	CDX_CMD_VAR(CMD_QM_SHAPER_CONFIG,      sizeof(QosShaperConfigCommand),  U16_MAX, NULL, qm_shaper_config_handle),
-	CDX_CMD_VAR(CMD_QM_WBFQ_CONFIG,        sizeof(QosWbfqConfigCommand),    U16_MAX, NULL, qm_wbfq_config_handle),
-	CDX_CMD_VAR(CMD_QM_CQ_CONFIG,          sizeof(QosCqConfigCommand),      U16_MAX, NULL, qm_cq_config_handle),
-	CDX_CMD_VAR(CMD_QM_CHNL_ASSIGN,        sizeof(QosChnlAssignCommand),    U16_MAX, NULL, qm_chnl_assign_handle),
-	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_STATUS,  sizeof(QosDscpChnlClsq_mapCmd),  U16_MAX, NULL, qm_dscp_q_map_status_handle),
-	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_CFG,     sizeof(QosDscpChnlClsq_mapCmd),  U16_MAX, NULL, qm_dscp_q_map_cfg_handle),
-	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_RESET,   sizeof(QosDscpChnlClsq_mapCmd),  U16_MAX, NULL, qm_dscp_q_map_reset_handle),
-#endif
-	CDX_CMD_VAR(CMD_QM_EXPT_RATE,          sizeof(QosExptRateCommand),      U16_MAX, NULL, qm_expt_rate_handle),
-	CDX_CMD_VAR(CMD_QM_FF_RATE,            sizeof(QosFFRateCommand),        U16_MAX, NULL, qm_ff_rate_handle),
-#ifdef ENABLE_EGRESS_QOS
-	CDX_CMD_VAR(CMD_QM_QUERY,              sizeof(QosQueryCmd),             U16_MAX, NULL, qm_query_handle),
-	CDX_CMD_VAR(CMD_QM_QUERY_QUEUE,        sizeof(QosCqQueryCmd),           U16_MAX, NULL, qm_query_queue_handle),
-#endif
-	CDX_CMD_VAR(CMD_QM_QUERY_FF_RATE,      sizeof(QosFFRateCommand),        U16_MAX, NULL, qm_query_ff_rate_handle),
-	CDX_CMD_VAR(CMD_QM_QUERY_EXPT_RATE,    sizeof(QosExptRateCommand),      U16_MAX, NULL, qm_query_expt_rate_handle),
-#ifdef ENABLE_INGRESS_QOS
-	CDX_CMD_VAR(CMD_QM_QUERY_IFACE_DSCP_FQID_MAP, sizeof(QosIfaceDscpFqidMapCommand), U16_MAX, NULL, qm_query_iface_dscp_fqid_map_handle),
-	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_ENABLE,    sizeof(IngressQosEnableCommand),    U16_MAX, NULL, qm_ingress_policer_enable_handle),
-	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_CONFIG,    sizeof(IngressQosCfgCommand),       U16_MAX, NULL, qm_ingress_policer_config_handle),
-	/* INGRESS_POLICER_RESET ignores pcmd entirely — see comment above. */
-	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_RESET,       0,                                U16_MAX, NULL, qm_ingress_policer_reset_handle),
-	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_QUERY_STATS, sizeof(IngressQosStatCmd),        U16_MAX, NULL, qm_ingress_policer_query_stats_handle),
-#ifdef SEC_PROFILE_SUPPORT
-	CDX_CMD_VAR(CMD_QM_SEC_POLICER_CONFIG,       sizeof(QosSecRateCommand),           U16_MAX, NULL, qm_sec_policer_config_handle),
-	CDX_CMD_VAR(CMD_QM_SEC_POLICER_QUERY_STATS,  sizeof(SecQosStatCmd),               U16_MAX, NULL, qm_sec_policer_query_stats_handle),
-	/* SEC_POLICER_RESET ignores pcmd entirely — see comment above. */
-	CDX_CMD_VAR(CMD_QM_SEC_POLICER_RESET,        0,                                   U16_MAX, NULL, qm_sec_policer_reset_handle),
-#endif
-#endif
-};
-
-static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
-{
-#ifdef QM_DEBUG
-	printk(KERN_INFO "%s: cmd_code=0x%x\n", __func__, cmd_code);
-#endif
-	return cdx_dispatch_cmd(qm_cmd_table, ARRAY_SIZE(qm_cmd_table),
-				cmd_code, cmd_len, p);
-}
-
 /** QOS init function.
- * This function initializes the qos control context with default configuration
- * and sends the same configuration to TMU.
- *
+ * Clears every port's QoS context and builds the CEETM channels and class
+ * queues the hardware qdisc and the flowtable's class word configure.
  */
 int qm_init(void)
 {
@@ -441,23 +43,22 @@ int qm_init(void)
 	if (ret)
 		return ret;
 #endif
-	set_cmd_handler(EVENT_QM, M_qm_cmdproc);
 	return NO_ERR;
 }
 /* Module init failure/unload only: returning with registered FQs would
  * leave QMan callbacks pointing into freed module text and static storage.
  * Ordinary interface/control drains remain bounded and report failure.
- * Caller holds the control mutex and RTNL; keep the mutex throughout but
- * drop RTNL between attempts so a hardware fault cannot pin it forever. */
+ * Caller holds the control mutex and RTNL, with the timer stopped and external
+ * users gone. Release both between attempts, before reacquiring either. */
 void qm_quiesce(void)
 {
 #ifdef ENABLE_EGRESS_QOS
 	ASSERT_RTNL();
 	while (ceetm_exit()) {
-		rtnl_unlock();
+		cdx_ctrl_unlock_with_rtnl();
 		pr_warn_ratelimited("cdx: waiting for QoS shutdown; reboot if hardware cannot recover\n");
 		msleep(1000);
-		rtnl_lock();
+		cdx_ctrl_lock_with_rtnl();
 	}
 #endif
 }
@@ -467,13 +68,21 @@ void qm_quiesce(void)
 void qm_exit(void)
 {
 	printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
-	set_cmd_handler(EVENT_QM, NULL);
+	/* Before the hardware below it goes: an instance outliving its own
+	 * device is a handle onto nothing. */
+	cdx_devlink_detach();
 	qm_quiesce();
 	return;
 }
 
-#if MAX_SCHEDULER_QUEUES > DPAA_ETH_TX_QUEUES
-#error MAX_SCHEDULER_QUEUES exceeds DPAA_ETH_TX_QUEUES
+/* CEETM class queues and netdev Tx queues are separate index spaces. This
+ * used to compare the scheduler's queue count against DPAA_ETH_TX_QUEUES,
+ * which held only because both happened to be sized from NR_CPUS; the Tx path
+ * masks a class-queue id into conf_fqs[] regardless, so nothing was actually
+ * protected. What has to hold is that the netdev reserves a queue slot for
+ * every class a hardware qdisc could give away. */
+#if MAX_SCHEDULER_QUEUES > DPAA_ETH_CEETM_LEAF_QUEUES
+#error MAX_SCHEDULER_QUEUES exceeds the reserved leaf-class queue headroom
 #endif
 
 int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
@@ -495,7 +104,8 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 		return FAILURE;
 	}
 
-	qm_ctx->dscp_fq_map = NULL;
+	RCU_INIT_POINTER(qm_ctx->dscp_fq_map, NULL);
+	qm_ctx->dscp_fq_claimed = NULL;
 
 	qm_ctx->iface_info = iface_info;
 	qm_ctx->port_info = port_info;
@@ -527,8 +137,14 @@ int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 	int ii;
 
 	for (ii = 0; ii < ARRAY_SIZE(gQMCtx); ii++) {
-		if (gQMCtx[ii].iface_info == iface_info)
+		if (gQMCtx[ii].iface_info == iface_info) {
+			/* The hardware below is about to go; drop what names
+			 * it first, the filters before the tree they name
+			 * classes in. */
+			cdx_dscp_port_gone(&gQMCtx[ii]);
+			cdx_htb_port_gone(&gQMCtx[ii]);
 			return ceetm_release_iface(&gQMCtx[ii]);
+		}
 	}
 #endif
 	return SUCCESS;

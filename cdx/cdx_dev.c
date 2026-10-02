@@ -24,6 +24,7 @@
 #include "portdefs.h"
 #include "misc.h"
 #include "cdx.h"
+#include "cdx_flowtable.h"
 #include "cdx_ioctl.h"
 #include "lnxwrp_fm.h"
 
@@ -119,19 +120,8 @@ func_ret:
 #endif
 
 /*
- * Table-driven ioctl dispatch, matching the validator-table
- * idiom that FCI cmdprocs use (cdx_cmd_validator.h). The ioctl
- * ABI is different enough from FCI's (cmd, cmd_len, pcmd)
- * that we keep a file-local spec here rather than reusing
- * cdx_dispatch_cmd: ioctl commands don't carry a cmd_len and
- * the handler communicates back via copy_to_user instead of an
- * in/out buffer. What we do preserve is the single lookup
- * surface so adding, removing, or gating a new ioctl is a
- * single-line table edit.
- *
- * Production builds have no ioctls at all -- nothing programs the classifier
- * from userspace. The table is empty unless a debug build adds one, so it is
- * compiled away entirely rather than declared zero-length.
+ * Production builds have no classifier ioctls. Debug builds retain the
+ * MURAM reader.
  */
 #ifdef DPAA_DEBUG_ENABLE
 struct cdx_ioctl_spec {
@@ -213,5 +203,4 @@ int cdx_driver_init(void)
 	register_cdx_deinit_func(cdx_driver_deinit);
 	return 0;
 }
-
 

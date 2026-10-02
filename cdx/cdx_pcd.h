@@ -3,8 +3,9 @@
  * Description of the ASK FMan PCD.
  *
  * The shape is fixed by the microcode and by cdx_sp.xml, not by board layout:
- * twelve classification groups, one KeyGen scheme per group shared by every
- * port, and one external hash table per group per port.
+ * fourteen shared classification groups and seven SEC groups, with one
+ * external hash table per group per port. Four PPPoE schemes share the native
+ * tuple tables. Schemes are shared by ports with the same policy.
  *
  * Group order is load bearing. A scheme's kgNextEngineParams.cc.grpId selects
  * a group in the port's CC root tree, and cdx_sp.xml addresses the PPPoE relay
@@ -21,10 +22,14 @@
 #include "fm_eh_types.h"
 #include "cdx_ioctl.h"
 
-/* One classification group: a hash table replicated per port, plus the single
- * shared scheme that dispatches into it. */
-#define CDX_PCD_NUM_GROUPS	12
-/* Widest key in cdx_pcd_groups[] is five extracts (the 5-tuple schemes). */
+/* One classification group: a hash table replicated per participating port. */
+#define CDX_PCD_SHARED_GROUPS	14
+#define CDX_PCD_SEC_GROUPS	7
+#define CDX_PCD_NUM_GROUPS	(CDX_PCD_SHARED_GROUPS + CDX_PCD_SEC_GROUPS)
+#define CDX_PCD_TUPLE_FIRST	8
+#define CDX_PCD_TUPLE_COUNT	4
+#define CDX_PCD_NUM_SCHEMES	(CDX_PCD_NUM_GROUPS + CDX_PCD_TUPLE_COUNT)
+/* At most five full-field extracts; tunnel/PPPoE bytes are appended separately. */
 #define CDX_PCD_MAX_EXTRACTS	5
 /* Widest protocol set is two (an L3 header plus its L4 or ESP header). */
 #define CDX_PCD_MAX_UNITS	2
@@ -62,9 +67,11 @@ struct cdx_pcd_group {
 	const char		*table_name;
 	u16			key_size;	/* matchKeySize */
 	u16			hash_res_mask;	/* hashResMask */
-	u8			table_type;	/* enum in fm_eh_types.h */
+	u8			table_type;	/* CDX lookup type */
+	u8			hw_table_type;	/* microcode class */
+	u8			tunnel_family;	/* 4/6 for native + PPPoE tuple schemes */
 
-	/* KeyGen scheme, instantiated once and shared by every port. */
+	/* KeyGen scheme, shared by ports using this policy. */
 	const char		*scheme_name;
 	u32			base_fqid;
 	u16			num_fqids;	/* hashDistributionNumOfFqids */
@@ -75,7 +82,7 @@ struct cdx_pcd_group {
 	struct cdx_pcd_extract	extracts[CDX_PCD_MAX_EXTRACTS];
 };
 
-/* Indexed by group id: cdx_pcd_groups[n] is CC root group n on every port. */
+/* Shared policy first, then SEC; each policy starts at CC root group zero. */
 extern const struct cdx_pcd_group cdx_pcd_groups[CDX_PCD_NUM_GROUPS];
 extern const e_NetHeaderType cdx_pcd_units[CDX_PCD_NUM_UNITS];
 
@@ -122,7 +129,9 @@ int cdx_pcd_enumerate_ports(u8 fm_index, struct cdx_pcd_port *ports,
 /* Everything the builder created, and everything teardown needs to undo. */
 struct cdx_pcd_port_state {
 	t_Handle	h_port;
-	t_Handle	tables[CDX_PCD_NUM_GROUPS];
+	t_Handle	tables[CDX_PCD_SHARED_GROUPS];
+	unsigned int	first_group;
+	unsigned int	group_count;
 	unsigned int	num_tables;
 	t_Handle	cctree;
 	bool		was_enabled;
@@ -141,8 +150,8 @@ struct cdx_pcd_state {
 	void			*fm_dev;	/* t_LnxWrpFmDev * */
 	t_Handle		h_fm;
 	t_Handle		h_pcd;
-	t_Handle		net_env;
-	t_Handle		schemes[CDX_PCD_NUM_GROUPS];
+	t_Handle		net_env[2];
+	t_Handle		schemes[CDX_PCD_NUM_SCHEMES];
 	unsigned int		num_schemes;
 	unsigned int		num_ports;
 	struct cdx_pcd_port	ports[CDX_PCD_MAX_PORTS];
@@ -159,13 +168,8 @@ struct cdx_pcd_state {
  */
 int cdx_pcd_build(u8 fm_index, struct cdx_pcd_state *state);
 
-/*
- * Detach and release what can be released: ports, schemes, trees, net env.
- * The external hash tables are not reclaimable -- the SDK has no working delete
- * for them under USE_ENHANCED_EHASH (ISSUES.md A138) -- so a failed or
- * torn-down build leaks them and the FMan needs a reboot before the classifier
- * can be installed again.
- */
+/* Detach ports and release schemes, trees, external tables and environments.
+ * If a port cannot detach, retain its dependencies and require a reboot. */
 void cdx_pcd_teardown(struct cdx_pcd_state *state);
 
 #endif /* CDX_PCD_H */

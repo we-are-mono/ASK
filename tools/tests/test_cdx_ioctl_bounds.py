@@ -1,18 +1,4 @@
-"""C6/C7/C8/C9b: /dev/cdx_ctrl ioctl input bounds.
-
-C6: dpa_cfg.c allocations driven by userspace `num_fmans`, `max_ports`,
-    `max_dist`, `num_tables`. Post-fix they're capped at CDX_MAX_* and
-    use kmalloc_array/kcalloc for overflow-safe scaling.
-C7: off-by-one `fm_index > num_fmans` (should be `>=`).
-C8: `queue_no` / `port_idx` / `dscp` bound checks.
-C9b: CDX_CTRL_DPA_CONNADD was deleted — invoking it must return ENOTTY.
-
-Only C6 is driven via CDX_CTRL_DPA_SET_PARAMS and thus testable at the
-ioctl layer. C7/C8 are reachable only via specific control_*.c paths
-that would need a valid params setup first — they're covered by the
-FCI fuzzer's payload-mutation pass (test_fci_fuzz.py). This file just
-exercises the ioctl-surface bounds: C6 + C9b.
-"""
+"""Retired classifier ioctls reject calls without reading their payloads."""
 
 from __future__ import annotations
 
@@ -21,14 +7,7 @@ import struct
 
 import pytest
 
-from _ioctl import (
-    CDX_CTRL_DPA_SET_PARAMS,
-    CDX_CTRL_DPA_CONNADD_LEGACY,
-    CDX_CTRL_DPA_GET_MURAM_DATA,
-    CDX_CTRL_UNKNOWN_NR,
-    SIZEOF_CDX_CTRL_SET_DPA_PARAMS,
-    SIZEOF_CDX_CTRL_GET_MURAM_DATA,
-)
+from _ioctl import CDX_CTRL_DPA_SET_PARAMS, CDX_CTRL_DPA_CONNADD_LEGACY, CDX_CTRL_DPA_GET_MURAM_DATA, CDX_CTRL_UNKNOWN_NR, SIZEOF_CDX_CTRL_GET_MURAM_DATA
 
 
 DEVICE = "/dev/cdx_ctrl"
@@ -42,36 +21,23 @@ CDX_MAX_FMANS = 16
 
 
 @pytest.mark.parametrize("num_fmans", [
-    0xFFFFFFFF,        # wraps most signed comparisons
-    10_000,            # 625× the cap
+    0,                 # would leave fman_info unset
+    1,                 # well-formed count, still a reconfiguration
     CDX_MAX_FMANS + 1, # just past the cap
+    10_000,            # 625× the cap
+    0xFFFFFFFF,        # wraps most signed comparisons
 ])
-async def test_c6_num_fmans_above_cap_rejected(
+async def test_set_params_ioctl_removed(
     aiohttp_session, target_agent, splat_window, num_fmans,
 ):
-    """CDX_MAX_FMANS=16; anything larger must be rejected before alloc."""
+    """The in-kernel builder removed userspace classifier installation."""
     data = _set_params_struct(num_fmans=num_fmans)
     r = await target_agent.ioctl_send(
         aiohttp_session,
         device=DEVICE, cmd=CDX_CTRL_DPA_SET_PARAMS, data=data,
     )
-    assert r.get("errno") == errno.EINVAL, (
-        f"num_fmans={num_fmans}: expected EINVAL before allocation, got {r}"
-    )
-
-
-async def test_c6_num_fmans_zero_rejected(
-    aiohttp_session, target_agent, splat_window,
-):
-    """0 fmans is also rejected — `fman_info` gets dereferenced unconditionally
-    in the post-alloc path (see dpa_cfg.c commit comment)."""
-    data = _set_params_struct(num_fmans=0)
-    r = await target_agent.ioctl_send(
-        aiohttp_session,
-        device=DEVICE, cmd=CDX_CTRL_DPA_SET_PARAMS, data=data,
-    )
-    assert r.get("errno") != 0, (
-        f"num_fmans=0: expected rejection, got rc={r.get('rc')} data={r}"
+    assert r.get("errno") == errno.ENOTTY, (
+        f"num_fmans={num_fmans}: expected the retired ioctl to refuse, got {r}"
     )
 
 

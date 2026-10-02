@@ -13,13 +13,17 @@
  * @description         dpa configuration routines.
  */
 #include <linux/device.h>
+#include <linux/delay.h>
 #include <linux/ioctl.h>
+#include <linux/if_arp.h>
 #include <linux/compat.h>
 #include <linux/mutex.h>
+#include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
 #include <linux/slab.h>
 //#include <linux/fsl_dpa_classifier.h>
 #include "dpaa_eth.h"
+#include "mac.h"
 
 #include "cdx.h"
 #include "portdefs.h"
@@ -28,6 +32,8 @@
 #include "cdx_ceetm_gdef.h"
 #include "layer2.h"
 #include "cdx_pcd.h"
+#include "cdx_flowtable.h"
+#include "cdx_devlink.h"
 
 //#define DPA_CFG_DEBUG 	1
 
@@ -38,15 +44,7 @@ struct cdx_fman_info *fman_info;
 //frame queue list created
 static struct dpa_fq *dpa_pcd_fq;
 
-/* Sanity caps on user-supplied counts via CDX_CTRL_DPA_SET_PARAMS.
- * Real LS104x config today: 1 FMAN, <=9 ports/FMAN, 16 dist types,
- * 64 tables (userspace MAX_TABLES). Caps below give 4x-16x headroom
- * so future growth is fine, while still rejecting the wild values a
- * misbehaving caller could drive into these kernel allocations. */
 #define CDX_MAX_FMANS		16
-#define CDX_MAX_PORTS		128
-#define CDX_MAX_DIST		256
-#define CDX_MAX_TABLES		256
 
 /* table_info.dpa_type. The two hash flavours are FM_PCD_HashTableSet objects;
  * indexed and exact-match tables are FM_PCD_MatchTableSet CC nodes. cdx only
@@ -59,16 +57,21 @@ static struct dpa_fq *dpa_pcd_fq;
 
 /*
  * Concurrency:
- *   cdx_info->ctrl.mutex, then RTNL, then dpa_cfg_lock
- *      - Excludes FCI commands and timers while startup publishes or
- *        unwinds interfaces and classifier metadata.
+ *   cdx_ctrl_lock_with_rtnl(), then dpa_cfg_lock
+ *      - Acquires RTNL and ctrl.mutex without waiting on one while
+ *        holding the other; contention restarts before any state change.
+ *      - Excludes the flowtable transaction and timers while startup
+ *        publishes or unwinds interfaces and classifier metadata.
  *
  *   dpa_cfg_lock (file-local mutex)
  *      - Serializes the one-shot install of the DPA configuration
  *        (fman_info, num_fmans, associated port/table/
  *        distribution sub-allocations). Held for the whole body of
- *        dpa_cfg_install(). release_cfg_info() assumes it is held
- *        by the caller.
+ *        dpa_cfg_install(). release_cfg_info() assumes it
+ *        is held by the caller.
+ *      - Serializes every change to the classifier ports CDX
+ *        configured (dpa_active_ports): the stop and resume of a
+ *        datapath restart, the quiesce and restore of unload.
  *
  *   fman_info, num_fmans (file-scope globals)
  *      - Populated exactly once, in dpa_cfg_install() under
@@ -208,8 +211,8 @@ int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags
 		 * tables and silently dropped multi-port/OH ones. */
 		if (tinfo->port_idx & (1U << portid))
 		{
-			/* type is copied verbatim from the user-supplied
-			 * table_info (CDX_CTRL_DPA_SET_PARAMS) and is used
+			/* type comes from the table_info populated by
+			 * dpa_cfg_publish() and is used
 			 * both to index td[] and as a shift count for flags.
 			 * A malformed config carrying type >= MAX_MATCH_TABLES
 			 * would write past td[MAX_MATCH_TABLES] and shift out
@@ -289,7 +292,13 @@ static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t 
 		case IPV4_MULTICAST_TABLE:
 			table_distrb_type =  IPV4_MULTICAST_DIST;
 			break;
-	}	
+		case IPV4_BRIDGED_MULTICAST_TABLE:
+			table_distrb_type =  IPV4_BRIDGED_MULTICAST_DIST;
+			break;
+		case IPV6_BRIDGED_MULTICAST_TABLE:
+			table_distrb_type =  IPV6_BRIDGED_MULTICAST_DIST;
+			break;
+	}
 	port_info = finfo->portinfo;
 	for (ii = 0; ii < finfo->max_ports; ii++) {
 		dist = port_info->dist_info;
@@ -306,7 +315,88 @@ static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t 
 	return NULL;
 }
 
+/* The distribution a table's miss goes to, on the table's own port.
+ *
+ * A scheme reached from a miss looks its table up in the CC tree of the port
+ * the frame came in by, at the group the scheme was built with, so the scheme
+ * has to be one that port classifies with. The Ethernet ports and the Wi-Fi
+ * offline port share one set of distributions, and for them the scheme found
+ * by type is theirs. The IPsec offline port has distributions of its own and
+ * none of the shared ones (cdx_pcd.xml): a miss on one of its tables goes to
+ * that port's Ethernet distribution instead, whose table is empty and whose
+ * miss is the exception policer, where a shared table's chain ends too. So
+ * does a miss whose named distribution no port has at all.
+ * The builder creates each table once per port, so it serves a single port. */
+static void *miss_scheme_on_port(struct cdx_fman_info *finfo,
+				 const struct table_info *tbl_info, void *scheme)
+{
+	struct cdx_port_info *port_info = finfo->portinfo;
+	void *ethernet = NULL;
+	uint32_t ii, jj;
 
+	if (!tbl_info->port_idx)
+		return scheme;
+	for (ii = 0; ii < finfo->max_ports; ii++, port_info++) {
+		if (port_info->portid >= 32 ||
+		    !(tbl_info->port_idx & (1U << port_info->portid)))
+			continue;
+		for (jj = 0; jj < port_info->max_dist; jj++) {
+			if (scheme && port_info->dist_info[jj].handle == scheme)
+				return scheme;
+			if (port_info->dist_info[jj].type == ETHERNET_DIST)
+				ethernet = port_info->dist_info[jj].handle;
+		}
+		return ethernet;
+	}
+	return scheme;
+}
+
+
+/* Whether the punt profile meters packets rather than bytes. A devlink trap
+ * policer's rate is packets per second, so a caller speaking that unit has to
+ * know which one the profile was configured for rather than assume it. */
+bool cdx_expt_rate_is_packet_mode(uint32_t fm_index)
+{
+	if (fm_index >= num_fmans)
+		return false;
+	return (fman_info + fm_index)->expt_ratelim_mode != EXPT_PKT_LIM_PLCR_MODE_BYTE;
+}
+
+/* What the punt profile of one exception type was programmed with: a limit and
+ * the burst every type shares, in whichever unit expt_ratelim_mode says. Only a
+ * profile that exists answers -- a type configured DISABLE_EXPT_PROFILE was
+ * never created -- so a caller reporting it never reports a meter that is not
+ * there. */
+int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,
+			 uint32_t *burst)
+{
+	struct cdx_fman_info *finfo;
+
+	if (fm_index >= num_fmans || type >= CDX_EXPT_MAX_EXPT_LIMIT_TYPES)
+		return FAILURE;
+	finfo = (fman_info + fm_index);
+	if (!finfo->expt_rate_limit_info[type].handle)
+		return FAILURE;
+	*limit = finfo->expt_rate_limit_info[type].limit;
+	*burst = finfo->expt_ratelim_burst_size;
+	return SUCCESS;
+}
+
+/* The colours the punt profile counted. Read without clearing, as everywhere
+ * else. */
+int cdx_expt_rate_counters(uint32_t fm_index, uint32_t type,
+			   struct cdx_police_counters *out)
+{
+	struct cdx_fman_info *finfo;
+
+	if (fm_index >= num_fmans || type >= CDX_EXPT_MAX_EXPT_LIMIT_TYPES)
+		return FAILURE;
+	finfo = (fman_info + fm_index);
+	if (!finfo->expt_rate_limit_info[type].handle)
+		return FAILURE;
+	cdx_plcr_colours(finfo->expt_rate_limit_info[type].handle, out);
+	return SUCCESS;
+}
 
 int cdx_set_expt_rate(uint32_t fm_index, uint32_t type, uint32_t limit, uint32_t burst_size)
 {
@@ -389,18 +479,41 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 				break;
 			case IPV4_MULTICAST_TABLE:
 			case IPV6_MULTICAST_TABLE:
+				/* A frame no routed group claims is offered to
+				 * the bridged groups next, whose key carries the
+				 * frame's Ethernet pair and so cannot share this
+				 * table. A routed group's ingress is never a
+				 * bridge port and a bridged group's always is,
+				 * so no frame is a candidate for both. A
+				 * configuration without the bridged tables falls
+				 * straight through to Ethernet, as it always did,
+				 * and bridged groups then cannot be installed. */
+				miss_engine_params.params.kgParams.h_DirectScheme =
+					get_dist_info_by_fman_params(finfo,
+						tbl_info->type == IPV4_MULTICAST_TABLE ?
+						IPV4_BRIDGED_MULTICAST_TABLE :
+						IPV6_BRIDGED_MULTICAST_TABLE);
+				if (!miss_engine_params.params.kgParams.h_DirectScheme)
+					miss_engine_params.params.kgParams.h_DirectScheme =
+						get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);
+				break;
+			case IPV4_BRIDGED_MULTICAST_TABLE:
+			case IPV6_BRIDGED_MULTICAST_TABLE:
 			case IPV4_3TUPLE_UDP_TABLE:
 			case IPV6_TCP_TABLE:
 			case IPV4_TCP_TABLE:
 			case IPV6_3TUPLE_UDP_TABLE:
-				miss_engine_params.params.kgParams.h_DirectScheme = 
+				miss_engine_params.params.kgParams.h_DirectScheme =
 					get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);
 				break;
 
 		}
-		//adding miss action 
+		//adding miss action
 		//get ethernet distribution scheme handle
 		if((tbl_info->type != ETHERNET_TABLE) && (tbl_info->type != PPPOE_RELAY_TABLE)) {
+			miss_engine_params.params.kgParams.h_DirectScheme =
+				miss_scheme_on_port(finfo, tbl_info,
+					miss_engine_params.params.kgParams.h_DirectScheme);
 			if (miss_engine_params.params.kgParams.h_DirectScheme == NULL) {
 				DPA_ERROR("%s::error finding direct dist for table %s\n",
 						__func__, tbl_info->name);
@@ -441,23 +554,103 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 
 struct dpa_init_port {
 	t_Handle handle;
+	/* The port's own name (fm0-port-rx6, ...), for a report. */
+	const char *name;
 	bool enabled;
+	/* An Rx port belongs to a netdev, whose own state also decides whether
+	 * a resume enables it again; an offline port has none. */
+	bool rx;
+};
+
+/* Where the classifier ports CDX configured stand. A stopped port is only
+ * disabled, so it can be enabled again exactly as it was. Detaching one is not
+ * undone the same way -- FM_PORT_DetachPCD() drops the actions reattaching it
+ * would need -- and draining retires its queues, so a port that has been
+ * through either stays stopped until unload. */
+enum dpa_ports_state {
+	DPA_PORTS_RUNNING,
+	DPA_PORTS_STOPPED,	/* disabled and fenced, resumable */
+	DPA_PORTS_DETACHING,	/* detach attempted; never resumed */
+	DPA_PORTS_QUIESCED,	/* detached and drained, for good */
 };
 
 struct dpa_init_ports {
 	struct dpa_init_port *entries;
 	uint32_t count;
-	bool stopped;
-	bool quiesced;
+	enum dpa_ports_state state;
+	/* The FMans the ports are on, whose other ports a stop has to prove
+	 * reach no classifier either. */
+	t_LnxWrpFmDev *fms[CDX_MAX_FMANS];
+	uint32_t num_fms;
 };
 
 static struct dpa_init_ports dpa_active_ports;
+
+/* How long a stop waits for the ports to finish the frames they have in hand
+ * before it reports them busy, and how often it looks. */
+#define DPA_STOP_WAIT_US	200000
+#define DPA_STOP_POLL_US	1000
+
+static bool dpa_port_listed(const struct dpa_init_ports *ports, t_Handle handle)
+{
+	uint32_t ii;
+
+	for (ii = 0; ii < ports->count; ii++)
+		if (ports->entries[ii].handle == handle)
+			return true;
+	return false;
+}
+
+/* A port in use that is not one of CDX's own and hands its frames to a PCD,
+ * which would walk the classifier tables however CDX's ports stood. One that
+ * cannot say is counted as one that does. */
+static bool dpa_port_uncovered(const struct dpa_init_ports *ports,
+		const t_LnxWrpFmPortDev *port)
+{
+	bool attached;
+
+	if (!port->active || !port->h_Dev || dpa_port_listed(ports, port->h_Dev))
+		return false;
+	if (FM_PORT_IsPcdAttached(port->h_Dev, &attached))
+		return true;
+	return attached;
+}
+
+/* Whether stopping CDX's own ports stops everything that reaches a
+ * classifier: no other Rx or offline port on their FMans has a PCD. The
+ * host-command port is in neither array and needs no proof -- no PCD can be
+ * set on it -- so it stays enabled to carry the barriers. Names the first port
+ * that breaks the rule. */
+static bool dpa_ports_cover(const struct dpa_init_ports *ports,
+		const char **kind, uint32_t *index)
+{
+	uint32_t ii, jj;
+
+	for (ii = 0; ii < ports->num_fms; ii++) {
+		const t_LnxWrpFmDev *fm = ports->fms[ii];
+
+		for (jj = 0; jj < ARRAY_SIZE(fm->opPorts); jj++)
+			if (dpa_port_uncovered(ports, &fm->opPorts[jj])) {
+				*kind = "offline";
+				*index = jj + 1;
+				return false;
+			}
+		for (jj = 0; jj < ARRAY_SIZE(fm->rxPorts); jj++)
+			if (dpa_port_uncovered(ports, &fm->rxPorts[jj])) {
+				*kind = "rx";
+				*index = jj;
+				return false;
+			}
+	}
+	return true;
+}
 
 /* Resolve every port before stopping any of them. These are the same port
  * indices used by FMC's device nodes; the OH host-command port is excluded. */
 static int dpa_prepare_ports(t_LnxWrpFmDev **wrappers,
 		struct dpa_init_ports *ports)
 {
+	const char *kind;
 	uint32_t ii, jj, count = 0;
 
 	for (ii = 0; ii < num_fmans; ii++)
@@ -468,6 +661,7 @@ static int dpa_prepare_ports(t_LnxWrpFmDev **wrappers,
 	for (ii = 0; ii < num_fmans; ii++) {
 		t_LnxWrpFmDev *fm = wrappers[ii];
 
+		ports->fms[ports->num_fms++] = fm;
 		for (jj = 0; jj < fman_info[ii].max_ports; jj++) {
 			struct cdx_port_info *info = &fman_info[ii].portinfo[jj];
 			t_LnxWrpFmPortDev *port;
@@ -497,11 +691,18 @@ static int dpa_prepare_ports(t_LnxWrpFmDev **wrappers,
 			if (!port->active || !port->h_Dev)
 				return -ENODEV;
 			ports->entries[ports->count].handle = port->h_Dev;
+			ports->entries[ports->count].name = port->name;
+			ports->entries[ports->count].rx = info->type != 0;
 			if (FM_PORT_GetEnabled(port->h_Dev, &ports->entries[ports->count].enabled))
 				return -EIO;
 			ports->count++;
 		}
 	}
+	/* Said once, here, rather than only when a stop needs it: such a port
+	 * leaves every unproven deletion to a reboot. */
+	if (!dpa_ports_cover(ports, &kind, &jj))
+		pr_warn("cdx: %s port %u reaches a classifier CDX did not configure; a failed classifier deletion will need a reboot\n",
+			kind, jj);
 	return 0;
 }
 
@@ -537,6 +738,9 @@ static int dpa_rollback_resources(void)
 	uint32_t ii;
 	int ret;
 
+	/* First, while every profile it programs and counts still exists: its
+	 * callbacks reach them through handles released further down. */
+	cdx_devlink_detach();
 	dpa_release_pcd_fqs();
 	for (ii = 0; ii < MAX_PHY_PORTS; ii++) {
 		if (phy_port[ii].flags) {
@@ -546,10 +750,6 @@ static int dpa_rollback_resources(void)
 		}
 	}
 	ret = cdxdrv_release_port_policer_slots();
-#ifdef ENABLE_EGRESS_QOS
-	if (ceetm_exit_cq_plcr())
-		ret = -EIO;
-#endif
 	for (ii = 0; ii < num_fmans; ii++)
 		if (cdxdrv_release_shared_policers(&fman_info[ii]))
 			ret = -EIO;
@@ -559,7 +759,7 @@ static int dpa_rollback_resources(void)
 
 
 /* Detach the classifier before releasing its FQs. Restored ports can then
- * use the Linux default path while FMC removes the failed configuration. */
+ * use the Linux default path while the builder removes the failed configuration. */
 static int dpa_detach_ports(struct dpa_init_ports *ports)
 {
 	uint32_t ii;
@@ -571,33 +771,225 @@ static int dpa_detach_ports(struct dpa_init_ports *ports)
 	return ret;
 }
 
-/* Caller holds RTNL and the control mutex; preserve current stack state. */
-int dpa_cfg_quiesce(void)
+/* While fenced, nothing but CDX can enable a port: not the netdev's open, a
+ * resume or the FMan character device. */
+static void dpa_ports_fence(struct dpa_init_ports *ports, bool fenced)
 {
-	struct dpa_init_ports *ports = &dpa_active_ports;
 	uint32_t ii;
-	int ret = 0;
 
-	mutex_lock(&dpa_cfg_lock);
-	if (ports->quiesced)
-		goto out;
-	if (!ports->stopped) {
+	for (ii = 0; ii < ports->count; ii++)
+		if (FM_PORT_SetFenced(ports->entries[ii].handle, fenced))
+			DPA_ERROR("%s::cannot %sfence port %u\n", __func__,
+					fenced ? "" : "un", ii);
+}
+
+/* Wait until no port has a frame in hand. FM_PORT_Disable() waits a bounded
+ * time for that and then reports success anyway, so a disabled port is not yet
+ * a stopped one. */
+static int dpa_ports_wait_stopped(struct dpa_init_ports *ports)
+{
+	unsigned int waited = 0;
+	uint32_t ii;
+	bool stopped;
+
+	for (;;) {
 		for (ii = 0; ii < ports->count; ii++) {
-			if (FM_PORT_GetEnabled(ports->entries[ii].handle, &ports->entries[ii].enabled)) {
-				ret = -EIO;
+			if (FM_PORT_GetStopped(ports->entries[ii].handle, &stopped))
+				return -EIO;
+			if (!stopped)
+				break;
+		}
+		if (ii == ports->count)
+			return 0;
+		if (waited >= DPA_STOP_WAIT_US)
+			return -EBUSY;
+		usleep_range(DPA_STOP_POLL_US, 2 * DPA_STOP_POLL_US);
+		waited += DPA_STOP_POLL_US;
+	}
+}
+
+/* Disable every port and wait until none has a frame in hand. The first stop
+ * records which ports were enabled, for whoever starts them again. The ports
+ * are fenced before they are disabled, and every call disables them all again,
+ * which also stops one an enable racing the fence switched back on. */
+static int dpa_ports_stop(struct dpa_init_ports *ports)
+{
+	uint32_t ii;
+
+	if (ports->state == DPA_PORTS_RUNNING) {
+		for (ii = 0; ii < ports->count; ii++)
+			if (FM_PORT_GetEnabled(ports->entries[ii].handle,
+					       &ports->entries[ii].enabled))
+				return -EIO;
+		ports->state = DPA_PORTS_STOPPED;
+	}
+	dpa_ports_fence(ports, true);
+	if (dpa_set_ports_enabled(ports, false))
+		return -EIO;
+	return dpa_ports_wait_stopped(ports);
+}
+
+/* Whether the netdev an Rx port belongs to is up, in whichever namespace it
+ * now lives, with its name copied out for a report. One an operator took down
+ * while the port was stopped had the port disabled by its own stop, and
+ * nothing starts it again under the netdev; a port no netdev owns (name left
+ * empty) is left to what the stop recorded. RTNL held, which keeps every
+ * netdev where it is; the namespaces are walked under RCU. */
+static bool dpa_rx_port_wanted(t_Handle handle, char name[IFNAMSIZ])
+{
+	struct net_device *dev;
+	struct net *net;
+	bool wanted = true;
+
+	ASSERT_RTNL();
+	name[0] = '\0';
+	rcu_read_lock();
+	for_each_net_rcu(net) {
+		for_each_netdev_rcu(net, dev) {
+			struct dpa_priv_s *priv;
+
+			if (dev->type != ARPHRD_ETHER || !dpa_netdev_is_dpaa(dev))
+				continue;
+			priv = netdev_priv(dev);
+			if (priv->mac_dev && priv->mac_dev->port_dev[RX] &&
+			    fm_port_get_handle(priv->mac_dev->port_dev[RX]) == handle) {
+				wanted = netif_running(dev);
+				strscpy(name, dev->name, IFNAMSIZ);
 				goto out;
 			}
 		}
-		ports->stopped = true;
 	}
-	if (dpa_set_ports_enabled(ports, false) || dpa_detach_ports(ports)) {
+out:
+	rcu_read_unlock();
+	return wanted;
+}
+
+/* Take the fence down and start the ports as a stop found them: an offline
+ * port if it was enabled then, an Rx port if it was and its netdev is still
+ * up. Returns how many would not start, each named in the log; the others
+ * start all the same. RTNL and dpa_cfg_lock held. */
+static unsigned int dpa_ports_start(struct dpa_init_ports *ports)
+{
+	unsigned int failed = 0;
+	uint32_t ii;
+
+	dpa_ports_fence(ports, false);
+	for (ii = 0; ii < ports->count; ii++) {
+		struct dpa_init_port *port = &ports->entries[ii];
+		char name[IFNAMSIZ] = "";
+
+		if (!port->enabled || (port->rx && !dpa_rx_port_wanted(port->handle, name)))
+			continue;
+		if (FM_PORT_Enable(port->handle)) {
+			DPA_ERROR("cdx: cannot start port %s%s%s again\n", port->name,
+				  name[0] ? " of " : "", name);
+			failed++;
+		}
+	}
+	return failed;
+}
+
+/* Stop the classifier ports for a repair of the tables they walk, keeping what
+ * starting them again needs. Never detaches a port or drains a queue. RTNL and
+ * the control mutex held; idempotent.
+ *
+ * 0: every port is disabled and fenced and has no frame in hand, and no port
+ * CDX did not configure reaches a classifier, so nothing but host commands
+ * walks the tables until dpa_cfg_resume(). -EBUSY: disabled, but a port is
+ * still finishing a frame; ask again. -EXDEV: another port reaches a
+ * classifier, and stopping CDX's own proves nothing about the tables.
+ * -ENOTRECOVERABLE: stopped, and with no such port, but the ports have been
+ * detached and can never be resumed. */
+int dpa_cfg_stop(void)
+{
+	struct dpa_init_ports *ports = &dpa_active_ports;
+	const char *kind;
+	uint32_t index;
+	int ret = 0;
+
+	mutex_lock(&dpa_cfg_lock);
+	if (ports->state != DPA_PORTS_QUIESCED) {
+		ret = dpa_ports_stop(ports);
+		if (ret)
+			goto out;
+	}
+	if (!dpa_ports_cover(ports, &kind, &index)) {
+		pr_err_ratelimited("cdx: %s port %u reaches a classifier CDX did not configure; stopping CDX's ports does not stop it\n",
+				   kind, index);
+		ret = -EXDEV;
+	} else if (ports->state != DPA_PORTS_STOPPED) {
+		ret = -ENOTRECOVERABLE;
+	}
+out:
+	mutex_unlock(&dpa_cfg_lock);
+	return ret;
+}
+
+/* Whether CDX's own ports are every port that reaches a classifier, for an
+ * unload that has detached them and would settle what the tables may still
+ * link. */
+bool dpa_cfg_covered(void)
+{
+	const char *kind;
+	uint32_t index;
+	bool covered;
+
+	mutex_lock(&dpa_cfg_lock);
+	covered = dpa_ports_cover(&dpa_active_ports, &kind, &index);
+	mutex_unlock(&dpa_cfg_lock);
+	return covered;
+}
+
+/* Start the ports a stop left, as they were before it: an offline port if it
+ * was enabled then, an Rx port if it was and its netdev is still up. The fence
+ * comes off first. RTNL and the control mutex held. -ENOTRECOVERABLE for ports
+ * that have been detached, which this would start on a path nothing
+ * configured; otherwise how many ports would not start, each named in the log,
+ * the others started all the same. */
+int dpa_cfg_resume(void)
+{
+	struct dpa_init_ports *ports = &dpa_active_ports;
+	int ret = 0;
+
+	ASSERT_RTNL();
+	mutex_lock(&dpa_cfg_lock);
+	if (ports->state == DPA_PORTS_RUNNING)
+		goto out;
+	if (ports->state != DPA_PORTS_STOPPED) {
+		ret = -ENOTRECOVERABLE;
+		goto out;
+	}
+	ret = dpa_ports_start(ports);
+	ports->state = DPA_PORTS_RUNNING;
+out:
+	mutex_unlock(&dpa_cfg_lock);
+	return ret;
+}
+
+/* Stop the ports for good, for unload: stopped as dpa_cfg_stop() stops them,
+ * keeping what an earlier stop recorded, then detached from the classifier and
+ * their queues drained. Caller holds RTNL and the control mutex; preserve
+ * current stack state. */
+int dpa_cfg_quiesce(void)
+{
+	struct dpa_init_ports *ports = &dpa_active_ports;
+	int ret = 0;
+
+	mutex_lock(&dpa_cfg_lock);
+	if (ports->state == DPA_PORTS_QUIESCED)
+		goto out;
+	ret = dpa_ports_stop(ports);
+	if (ret)
+		goto out;
+	ports->state = DPA_PORTS_DETACHING;
+	if (dpa_detach_ports(ports)) {
 		ret = -EIO;
 		goto out;
 	}
 	/* Wi-Fi still holds these FQ pointers until its exit callback restores
 	 * their drain callbacks. Reclaim frames now, retain storage until then. */
 	cdx_drain_fq_list(dpa_pcd_fq);
-	ports->quiesced = true;
+	ports->state = DPA_PORTS_QUIESCED;
 out:
 	mutex_unlock(&dpa_cfg_lock);
 	return ret;
@@ -605,8 +997,7 @@ out:
 
 void dpa_cfg_deinit(void)
 {
-	mutex_lock(&cdx_info->ctrl.mutex);
-	rtnl_lock();
+	cdx_ctrl_lock_with_rtnl();
 	if (dpa_cfg_quiesce()) {
 		pr_err("cdx: cannot quiesce DPA resources; reboot required\n");
 		goto out;
@@ -615,7 +1006,10 @@ void dpa_cfg_deinit(void)
 	if (fman_info) {
 		if (dpa_rollback_resources())
 			pr_err("cdx: DPA resource cleanup failed\n");
-		if (dpa_set_ports_enabled(&dpa_active_ports, true))
+		/* Detached, so back to Linux's own path; nothing CDX does
+		 * keeps them stopped any more. A netdev taken down while they
+		 * were stopped keeps its Rx port down. */
+		if (dpa_ports_start(&dpa_active_ports))
 			pr_err("cdx: cannot restore port state\n");
 		release_cfg_info();
 	}
@@ -623,8 +1017,7 @@ void dpa_cfg_deinit(void)
 	memset(&dpa_active_ports, 0, sizeof(dpa_active_ports));
 	mutex_unlock(&dpa_cfg_lock);
 out:
-	rtnl_unlock();
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ctrl_unlock_with_rtnl();
 }
 
 
@@ -677,7 +1070,8 @@ static int dpa_cfg_publish(struct cdx_pcd_state *state)
 				  GFP_KERNEL);
 	if (!finfo->portinfo)
 		return -ENOMEM;
-	finfo->num_tables = state->num_ports * CDX_PCD_NUM_GROUPS;
+	for (i = 0; i < state->num_ports; i++)
+		finfo->num_tables += state->port_state[i].num_tables;
 	finfo->tbl_info = kcalloc(finfo->num_tables, sizeof(*finfo->tbl_info),
 				  GFP_KERNEL);
 	if (!finfo->tbl_info)
@@ -686,13 +1080,15 @@ static int dpa_cfg_publish(struct cdx_pcd_state *state)
 	tbl = finfo->tbl_info;
 	for (i = 0; i < state->num_ports; i++) {
 		struct cdx_port_info *pinfo = &finfo->portinfo[i];
+		struct cdx_pcd_port_state *ps = &state->port_state[i];
 		struct cdx_dist_info *dist;
 
 		pinfo->fm_index = state->fm_index;
 		pinfo->index = state->ports[i].number;
 		pinfo->portid = state->ports[i].portid;
 		pinfo->type = state->ports[i].speed;
-		pinfo->max_dist = CDX_PCD_NUM_GROUPS;
+		pinfo->max_dist = ps->num_tables +
+			(ps->first_group ? 0 : CDX_PCD_TUPLE_COUNT);
 		strscpy(pinfo->name, state->ports[i].name, sizeof(pinfo->name));
 
 		/* port_idx is a bitmap of the ports a table serves, and
@@ -703,18 +1099,25 @@ static int dpa_cfg_publish(struct cdx_pcd_state *state)
 			return -EINVAL;
 		}
 
-		dist = kcalloc(CDX_PCD_NUM_GROUPS, sizeof(*dist), GFP_KERNEL);
+		dist = kcalloc(pinfo->max_dist, sizeof(*dist), GFP_KERNEL);
 		if (!dist)
 			return -ENOMEM;
 		pinfo->dist_info = dist;
 
-		for (grp = 0; grp < CDX_PCD_NUM_GROUPS; grp++) {
-			const struct cdx_pcd_group *g = &cdx_pcd_groups[grp];
+		for (grp = 0; grp < ps->num_tables; grp++) {
+			const struct cdx_pcd_group *g = &cdx_pcd_groups[ps->first_group + grp];
 
-			dist[grp].type = g->dist_type;
-			dist[grp].handle = state->schemes[grp];
-			dist[grp].base_fqid = g->base_fqid;
-			dist[grp].count = g->num_fqids;
+			dist->type = g->dist_type;
+			dist->handle = state->schemes[ps->first_group + grp];
+			dist->base_fqid = g->base_fqid;
+			dist->count = g->num_fqids;
+			if (g->tunnel_family) {
+				dist[1] = dist[0];
+				dist->handle = state->schemes[CDX_PCD_NUM_GROUPS +
+					grp - CDX_PCD_TUPLE_FIRST];
+				dist++;
+			}
+			dist++;
 
 			tbl->id = state->port_state[i].tables[grp];
 			tbl->dpa_type = CDX_DPA_TBL_EXTERNAL_HASH;
@@ -752,8 +1155,7 @@ int dpa_cfg_install(void)
 	if (!state)
 		return -ENOMEM;
 
-	mutex_lock(&cdx_info->ctrl.mutex);
-	rtnl_lock();
+	cdx_ctrl_lock_with_rtnl();
 	mutex_lock(&dpa_cfg_lock);
 	if (fman_info) {
 		DPA_ERROR("%s::classifier already installed\n", __func__);
@@ -822,14 +1224,13 @@ int dpa_cfg_install(void)
 		goto err_ret;
 	}
 #endif
-#ifdef ENABLE_EGRESS_QOS
-	if (ceetm_init_cq_plcr() || cdx_dpa_init_fault()) {
-		retval = -EIO;
-		goto err_ret;
-	}
-#endif
-	/* Miss actions point at schemes, which point at the trees that hold the
-	 * tables, so they can only be patched in once everything exists. */
+	/* Both device-wide meters exist from here, so devlink can be told what
+	 * they run rather than a placeholder. A failure costs the operator the
+	 * verb and not the port, so it is reported rather than fatal; the
+	 * rollback below detaches it either way, before the profiles go. */
+	if (cdx_devlink_attach(wrapper->dev))
+		DPA_ERROR("%s::unable to register the devlink instance\n", __func__);
+	/* Patch miss actions after their schemes and trees exist. */
 	for (ii = 0; ii < num_fmans; ii++) {
 		if (cdxdrv_set_miss_action(ii) || cdx_dpa_init_fault()) {
 			retval = -EIO;
@@ -842,8 +1243,7 @@ int dpa_cfg_install(void)
 	display_dpa_cfg();
 	dpa_active_ports = ports;
 	mutex_unlock(&dpa_cfg_lock);
-	rtnl_unlock();
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ctrl_unlock_with_rtnl();
 	kfree(state);
 	return 0;
 
@@ -853,7 +1253,7 @@ err_ret:
 		if (dpa_set_ports_enabled(&ports, false) || dpa_detach_ports(&ports)) {
 			pr_err("cdx: cannot detach failed DPA setup; reboot required\n");
 			dpa_active_ports = ports;
-			dpa_active_ports.stopped = true;
+			dpa_active_ports.state = DPA_PORTS_DETACHING;
 			retval = -EUCLEAN;
 			goto unlock;
 		}
@@ -869,8 +1269,7 @@ err_ret:
 	cdx_pcd_teardown(state);
 unlock:
 	mutex_unlock(&dpa_cfg_lock);
-	rtnl_unlock();
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ctrl_unlock_with_rtnl();
 	kfree(state);
 	return retval;
 }
@@ -980,30 +1379,6 @@ struct cdx_port_info *get_dpa_port_info(char *name)
 	return NULL;
 }
 
-/* get port name by port id */
-char *get_dpa_port_name(uint32_t portid)
-{
-	uint32_t ii;
-	struct cdx_fman_info *finfo;
-
-	finfo = fman_info;
-	for (ii = 0; ii < num_fmans; ii++) {
-		struct cdx_port_info *port_info;
-		uint32_t jj;
-		port_info = finfo->portinfo;
-		/* seach for port in fman structures*/
-		for (jj = 0; jj < finfo->max_ports; jj++) {
-			if (port_info->portid == portid) {
-				return port_info->name;
-			}
-			port_info++;
-		}
-		finfo++;
-	}
-	DPA_ERROR("%s::could not find port name for port %u\n", __func__, portid);
-	return NULL;
-}
-
 //get kernel pcd dev handle by fman index
 void *dpa_get_pcdhandle(uint32_t fm_index)
 {
@@ -1018,7 +1393,35 @@ void *dpa_get_pcdhandle(uint32_t fm_index)
 	}
 	return NULL;
 }
-EXPORT_SYMBOL(dpa_get_pcdhandle); 
+EXPORT_SYMBOL(dpa_get_pcdhandle);
+
+/* The FMans, and so the FMan PCDs, the installed configuration spans. Every
+ * write of the count holds the control mutex, so a holder reads a settled one. */
+uint32_t dpa_get_num_fmans(void)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	return num_fmans;
+}
+
+/* The first external hash table configured, which any PCD barrier can be
+ * issued through: they all live on the one PCD (cdx_ft_claim() refuses more).
+ * Read under the control mutex, which every change of the configuration
+ * holds. */
+void *dpa_get_ehash_td(void)
+{
+	uint32_t ii, jj;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	for (ii = 0; ii < num_fmans; ii++) {
+		if (!fman_info[ii].tbl_info)
+			continue;
+		for (jj = 0; jj < fman_info[ii].num_tables; jj++)
+			if (fman_info[ii].tbl_info[jj].dpa_type == CDX_DPA_TBL_EXTERNAL_HASH &&
+			    fman_info[ii].tbl_info[jj].id)
+				return fman_info[ii].tbl_info[jj].id;
+	}
+	return NULL;
+}
 
 //get channel and workque id infor given a fqid
 int dpa_get_tx_chnl_info(uint32_t fqid, uint32_t *ch_id, uint32_t *wq_id)
@@ -1147,49 +1550,45 @@ int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32
 
 	return cdxdrv_modify_ingress_qos_policer_profile(finfo,queue_no,cir,pir,cbs,pbs);
 }
-int cdx_ingress_policer_reset(uint32_t fm_index)
-{
-	struct cdx_fman_info *finfo;
 
-	if (fm_index >= num_fmans)
-		return -1;
-
-	finfo = (fman_info + fm_index);
-	cdxdrv_ingress_policer_reset(finfo);
-	return 0;
-}
-
-#ifdef SEC_PROFILE_SUPPORT
-int cdx_sec_policer_reset(uint32_t fm_index)
-{
-	struct cdx_fman_info *finfo;
-
-	if (fm_index >= num_fmans)
-		return -1;
-
-	finfo = (fman_info + fm_index);
-	cdxdrv_sec_policer_reset(finfo);
-	return 0;
-}
-#endif /* endif for SEC_PROFILE_SUPPORT */
-
-int cdx_ingress_policer_stats(uint32_t fm_index,uint32_t queue_no,void *stats,uint32_t clear)
+/* The peak rate and burst one ingress profile enforces, when it is metering at
+ * all. A profile whose green and yellow share an action drops on the peak pair
+ * alone, so this pair is what it actually holds traffic to. A disabled profile
+ * does not answer: it passes everything, and it refuses a new rate until it is
+ * enabled again. */
+int cdx_ingress_policer_peak(uint32_t fm_index, uint32_t queue_no,
+			     uint32_t *pir, uint32_t *pbs)
 {
 	struct cdx_fman_info *finfo;
 
 	if (fm_index >= num_fmans || queue_no >= INGRESS_ALL_POLICER_QUEUES)
-		return -1;
+		return FAILURE;
+	finfo = (fman_info + fm_index);
+	if (!finfo->ingress_policer_info[queue_no].handle ||
+	    finfo->ingress_policer_info[queue_no].policer_on != ENABLE_INGRESS_POLICER)
+		return FAILURE;
+	*pir = finfo->ingress_policer_info[queue_no].pir_value;
+	*pbs = finfo->ingress_policer_info[queue_no].pbs;
+	return SUCCESS;
+}
+
+/* The colours one ingress profile counted. Read without clearing, so every
+ * other reader's baseline stays where it was; a caller wanting deltas keeps
+ * its own. */
+int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
+				 struct cdx_police_counters *out)
+{
+	struct cdx_fman_info *finfo;
+
+	if (fm_index >= num_fmans || queue_no >= INGRESS_ALL_POLICER_QUEUES)
+		return FAILURE;
 
 	finfo = (fman_info + fm_index);
 
 	if (!finfo->ingress_policer_info[queue_no].handle)
-	{
-		printk("%s::policer handle is NULL\n", __func__);
-		return -1;
-	}
+		return FAILURE;
 
-	cdxdrv_ingress_policer_stats(finfo,queue_no,stats,clear);
-
-	return 0;
+	cdx_plcr_colours(finfo->ingress_policer_info[queue_no].handle, out);
+	return SUCCESS;
 }
 #endif

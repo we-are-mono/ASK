@@ -5,16 +5,18 @@ The `sfp-led` kernel module monitors both Mono Gateway SFP cages every
 
 | State | Green | Orange |
 | --- | --- | --- |
-| No module responding on I²C | Off | Off |
+| No module (MOD_DEF0 released) | Off | Off |
 | Module present, no physical link or interface down | Off | Solid |
 | Module present, interface up, physical link established | On | Blinks on traffic |
 
-The driver reads the module's mandatory EEPROM at address `0x50`, byte 0,
-to detect presence. It reads the associated XFI PCS through the existing
-MDIO controller to determine link state. This works the same way for DACs
-and optical modules: it requires no optional module diagnostics and does
-not classify or cache cable types. An I²C or MDIO error is retried on the
-next poll. An unanswered MDIO read (`0xffff`) cannot assert link.
+The driver reads the cage's MOD_DEF0 line to detect presence and touches
+nothing on I²C: a module caught mid-transfer by a reset holds SDA low until
+it loses power, and that port's LEDs, and its neighbour's on the shared
+bus, must keep working. It reads the associated XFI PCS through the
+existing MDIO controller to determine link state. This works the same way
+for DACs and optical modules: it requires no optional module diagnostics
+and does not classify or cache cable types. An MDIO error is retried on
+the next poll. An unanswered MDIO read (`0xffff`) cannot assert link.
 
 The PCS register is clause 45 device 3, register 1 (`MDIO_STAT1`), bit 2
 (`MDIO_STAT1_LSTATUS`). Two reads under the MDIO bus lock clear its
@@ -31,21 +33,35 @@ A user-selected LED trigger takes precedence on either LED.
 
 The configuration uses existing properties in
 [`mono-gateway-dk.dts`](../dts/mono-gateway-dk.dts): each `mono,sfp-led`
-child references its SFP and two LEDs. The driver finds the matching
+child is a `mono,sfp-led-port` device of its own, referencing its SFP and
+two LEDs; the controller only populates them. The driver finds the matching
 `fsl,fman-memac` node by its `sfp` reference and selects the `xfi` entry
 from `pcs-handle-names` and `pcs-handle`. Both board ports use a 10 Gb/s
 fixed-link configuration.
 
-Every enabled port must acquire its I²C adapter, MDIO bus and both LEDs
-before polling starts. Missing providers defer the whole probe; failure
-releases any resources acquired for earlier ports. Disabled children are
-ignored. A device link stops the monitor before MDIO controller removal.
+MOD_DEF0 is the SFP node's `mod-def0-gpios`, which the `sfp` driver owns.
+A port defers until the sfp driver is bound to that node, because sfp
+requests the line only once it has its I²C adapter and requests it
+exclusively: a port that took the line first would leave the cage without
+an sfp driver. The port then borrows the descriptor non-exclusively and
+never releases it: gpiolib gives a second consumer no reference of its
+own, so a release would take the line, and its active-low polarity, away
+from the sfp driver and drop a device reference the port never took. A
+port releases the line only on a board whose sfp driver left it untaken.
 
-Netdev lookup and packet-counter access occur under RTNL on each poll.
-The driver retains no netdev reference between polls, so netdev removal
-can complete and a replacement device can be discovered. A busy RTNL
-lock postpones that sample. Driver removal cancels all polling before
-releasing the corresponding resources.
+Every port must acquire its MOD_DEF0 line, MDIO bus and both LEDs before
+polling starts. A missing provider defers that port alone; failure
+releases what the port acquired. Disabled children are ignored. A device
+link stops the monitor before MDIO controller removal.
+
+Each poll resolves the netdev under RCU and holds a reference only for
+the PCS read and the packet-counter read; it never takes RTNL. The offload
+backend admits flows by trying RTNL under its own transaction and retires
+an admission when the try fails, so a monitor holding RTNL ten times a
+second per port would turn a share of every flow admission into a
+retirement. No reference is kept between polls, so netdev removal can
+complete and a replacement device can be discovered. Driver removal
+cancels all polling before releasing the corresponding resources.
 
 The LED monitor does not change the DPAA fixed PHY's carrier state.
 Consequently, `ethtool` and `operstate` can still report the configured

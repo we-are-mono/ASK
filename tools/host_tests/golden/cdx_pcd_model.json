@@ -2,11 +2,11 @@
   "counts": {
     "ccnode_count": 0,
     "fman_count": 1,
-    "htnode_count": 84,
+    "htnode_count": 91,
     "policer_count": 0,
     "port_count": 7,
     "replicator_count": 0,
-    "scheme_count": 12
+    "scheme_count": 25
   },
   "ports": [
     {
@@ -22,17 +22,47 @@
         8,
         9,
         10,
-        11
+        11,
+        12,
+        13
       ],
       "number": 1,
+      "parser_labels": 8,
       "portid": 1,
       "prs_private_info": 1,
-      "type": "1g"
+      "schemes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        21,
+        8,
+        22,
+        9,
+        23,
+        10,
+        24,
+        11,
+        12,
+        13
+      ],
+      "type": "1g",
+      "units": [
+        "HEADER_TYPE_ETH",
+        "HEADER_TYPE_IPSEC_ESP",
+        "HEADER_TYPE_IPv4",
+        "HEADER_TYPE_IPv6",
+        "HEADER_TYPE_PPPoE",
+        "HEADER_TYPE_TCP",
+        "HEADER_TYPE_UDP"
+      ]
     },
     {
       "ccroot": [
-        12,
-        13,
         14,
         15,
         16,
@@ -42,19 +72,49 @@
         20,
         21,
         22,
-        23
-      ],
-      "number": 4,
-      "portid": 4,
-      "prs_private_info": 4,
-      "type": "1g"
-    },
-    {
-      "ccroot": [
+        23,
         24,
         25,
         26,
-        27,
+        27
+      ],
+      "number": 4,
+      "parser_labels": 8,
+      "portid": 4,
+      "prs_private_info": 4,
+      "schemes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        21,
+        8,
+        22,
+        9,
+        23,
+        10,
+        24,
+        11,
+        12,
+        13
+      ],
+      "type": "1g",
+      "units": [
+        "HEADER_TYPE_ETH",
+        "HEADER_TYPE_IPSEC_ESP",
+        "HEADER_TYPE_IPv4",
+        "HEADER_TYPE_IPv6",
+        "HEADER_TYPE_PPPoE",
+        "HEADER_TYPE_TCP",
+        "HEADER_TYPE_UDP"
+      ]
+    },
+    {
+      "ccroot": [
         28,
         29,
         30,
@@ -62,35 +122,57 @@
         32,
         33,
         34,
-        35
-      ],
-      "number": 5,
-      "portid": 5,
-      "prs_private_info": 5,
-      "type": "1g"
-    },
-    {
-      "ccroot": [
+        35,
         36,
         37,
         38,
         39,
         40,
-        41,
+        41
+      ],
+      "number": 5,
+      "parser_labels": 8,
+      "portid": 5,
+      "prs_private_info": 5,
+      "schemes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        21,
+        8,
+        22,
+        9,
+        23,
+        10,
+        24,
+        11,
+        12,
+        13
+      ],
+      "type": "1g",
+      "units": [
+        "HEADER_TYPE_ETH",
+        "HEADER_TYPE_IPSEC_ESP",
+        "HEADER_TYPE_IPv4",
+        "HEADER_TYPE_IPv6",
+        "HEADER_TYPE_PPPoE",
+        "HEADER_TYPE_TCP",
+        "HEADER_TYPE_UDP"
+      ]
+    },
+    {
+      "ccroot": [
         42,
         43,
         44,
         45,
         46,
-        47
-      ],
-      "number": 0,
-      "portid": 6,
-      "prs_private_info": 6,
-      "type": "10g"
-    },
-    {
-      "ccroot": [
+        47,
         48,
         49,
         50,
@@ -98,19 +180,49 @@
         52,
         53,
         54,
-        55,
-        56,
-        57,
-        58,
-        59
+        55
       ],
-      "number": 1,
-      "portid": 7,
-      "prs_private_info": 7,
-      "type": "10g"
+      "number": 0,
+      "parser_labels": 8,
+      "portid": 6,
+      "prs_private_info": 6,
+      "schemes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        21,
+        8,
+        22,
+        9,
+        23,
+        10,
+        24,
+        11,
+        12,
+        13
+      ],
+      "type": "10g",
+      "units": [
+        "HEADER_TYPE_ETH",
+        "HEADER_TYPE_IPSEC_ESP",
+        "HEADER_TYPE_IPv4",
+        "HEADER_TYPE_IPv6",
+        "HEADER_TYPE_PPPoE",
+        "HEADER_TYPE_TCP",
+        "HEADER_TYPE_UDP"
+      ]
     },
     {
       "ccroot": [
+        56,
+        57,
+        58,
+        59,
         60,
         61,
         62,
@@ -120,40 +232,139 @@
         66,
         67,
         68,
-        69,
-        70,
-        71
+        69
       ],
       "number": 1,
-      "portid": 9,
-      "prs_private_info": 9,
-      "type": "offline"
+      "parser_labels": 8,
+      "portid": 7,
+      "prs_private_info": 7,
+      "schemes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        21,
+        8,
+        22,
+        9,
+        23,
+        10,
+        24,
+        11,
+        12,
+        13
+      ],
+      "type": "10g",
+      "units": [
+        "HEADER_TYPE_ETH",
+        "HEADER_TYPE_IPSEC_ESP",
+        "HEADER_TYPE_IPv4",
+        "HEADER_TYPE_IPv6",
+        "HEADER_TYPE_PPPoE",
+        "HEADER_TYPE_TCP",
+        "HEADER_TYPE_UDP"
+      ]
     },
     {
       "ccroot": [
+        70,
+        71,
         72,
         73,
         74,
         75,
-        76,
+        76
+      ],
+      "number": 1,
+      "parser_labels": 8,
+      "portid": 9,
+      "prs_private_info": 9,
+      "schemes": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "type": "offline",
+      "units": [
+        "HEADER_TYPE_ETH",
+        "HEADER_TYPE_IPSEC_ESP",
+        "HEADER_TYPE_IPv4",
+        "HEADER_TYPE_IPv6",
+        "HEADER_TYPE_TCP",
+        "HEADER_TYPE_UDP"
+      ]
+    },
+    {
+      "ccroot": [
         77,
         78,
         79,
         80,
         81,
         82,
-        83
+        83,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89,
+        90
       ],
       "number": 2,
+      "parser_labels": 8,
       "portid": 10,
       "prs_private_info": 10,
-      "type": "offline"
+      "schemes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        21,
+        8,
+        22,
+        9,
+        23,
+        10,
+        24,
+        11,
+        12,
+        13
+      ],
+      "type": "offline",
+      "units": [
+        "HEADER_TYPE_ETH",
+        "HEADER_TYPE_IPSEC_ESP",
+        "HEADER_TYPE_IPv4",
+        "HEADER_TYPE_IPv6",
+        "HEADER_TYPE_PPPoE",
+        "HEADER_TYPE_TCP",
+        "HEADER_TYPE_UDP"
+      ]
     }
   ],
   "scheme_priority": [
+    13,
+    12,
+    24,
     11,
+    23,
     10,
+    22,
     9,
+    21,
     8,
     7,
     6,
@@ -162,7 +373,14 @@
     3,
     2,
     1,
-    0
+    0,
+    20,
+    19,
+    18,
+    17,
+    16,
+    15,
+    14
   ],
   "schemes": [
     {
@@ -189,6 +407,7 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "group": 0,
       "name": "cdx_ethernet_dist",
       "num_fqids": 128,
       "shared": 1,
@@ -220,6 +439,7 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "group": 1,
       "name": "cdx_pppoe_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -252,6 +472,7 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "group": 2,
       "name": "cdx_tup3udp6_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -284,12 +505,99 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "group": 3,
       "name": "cdx_tup3udp4_dist",
       "num_fqids": 1,
       "shared": 1,
       "units": [
         2,
         6
+      ]
+    },
+    {
+      "base_fqid": 4304,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_ETH_DA",
+          "hdr": "HEADER_TYPE_ETH",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_ETH_SA",
+          "hdr": "HEADER_TYPE_ETH",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_DST_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_NEXT_HDR",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 4,
+      "name": "cdx_bridged_mcast6_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        0,
+        3
+      ]
+    },
+    {
+      "base_fqid": 4288,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_ETH_DA",
+          "hdr": "HEADER_TYPE_ETH",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_ETH_SA",
+          "hdr": "HEADER_TYPE_ETH",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_DST_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_PROTO",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 5,
+      "name": "cdx_bridged_mcast4_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        0,
+        2
       ]
     },
     {
@@ -316,6 +624,7 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "group": 6,
       "name": "cdx_ipv6multicast_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -347,6 +656,7 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "group": 7,
       "name": "cdx_ipv4multicast_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -373,11 +683,6 @@
           "index": "e_FM_PCD_HDR_INDEX_LAST"
         },
         {
-          "field": "NET_HEADER_FIELD_IPv6_NEXT_HDR",
-          "hdr": "HEADER_TYPE_IPv6",
-          "index": "e_FM_PCD_HDR_INDEX_LAST"
-        },
-        {
           "field": "NET_HEADER_FIELD_TCP_PORT_SRC",
           "hdr": "HEADER_TYPE_TCP",
           "index": "e_FM_PCD_HDR_INDEX_NONE"
@@ -388,6 +693,29 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "generic": [
+        [
+          "HEADER_TYPE_IPv6",
+          6,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv4",
+          9,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv4",
+          12,
+          8
+        ],
+        [
+          "HEADER_TYPE_PPPoE",
+          0,
+          8
+        ]
+      ],
+      "group": 8,
       "name": "cdx_tcp6_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -415,11 +743,6 @@
           "index": "e_FM_PCD_HDR_INDEX_LAST"
         },
         {
-          "field": "NET_HEADER_FIELD_IPv6_NEXT_HDR",
-          "hdr": "HEADER_TYPE_IPv6",
-          "index": "e_FM_PCD_HDR_INDEX_LAST"
-        },
-        {
           "field": "NET_HEADER_FIELD_UDP_PORT_SRC",
           "hdr": "HEADER_TYPE_UDP",
           "index": "e_FM_PCD_HDR_INDEX_NONE"
@@ -430,6 +753,29 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "generic": [
+        [
+          "HEADER_TYPE_IPv6",
+          6,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv4",
+          9,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv4",
+          12,
+          8
+        ],
+        [
+          "HEADER_TYPE_PPPoE",
+          0,
+          8
+        ]
+      ],
+      "group": 9,
       "name": "cdx_udp6_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -457,11 +803,6 @@
           "index": "e_FM_PCD_HDR_INDEX_LAST"
         },
         {
-          "field": "NET_HEADER_FIELD_IPv4_PROTO",
-          "hdr": "HEADER_TYPE_IPv4",
-          "index": "e_FM_PCD_HDR_INDEX_LAST"
-        },
-        {
           "field": "NET_HEADER_FIELD_TCP_PORT_SRC",
           "hdr": "HEADER_TYPE_TCP",
           "index": "e_FM_PCD_HDR_INDEX_NONE"
@@ -472,6 +813,39 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "generic": [
+        [
+          "HEADER_TYPE_IPv4",
+          9,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          6,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          8,
+          16
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          24,
+          16
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          40,
+          1
+        ],
+        [
+          "HEADER_TYPE_PPPoE",
+          0,
+          8
+        ]
+      ],
+      "group": 10,
       "name": "cdx_tcp4_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -499,11 +873,6 @@
           "index": "e_FM_PCD_HDR_INDEX_LAST"
         },
         {
-          "field": "NET_HEADER_FIELD_IPv4_PROTO",
-          "hdr": "HEADER_TYPE_IPv4",
-          "index": "e_FM_PCD_HDR_INDEX_LAST"
-        },
-        {
           "field": "NET_HEADER_FIELD_UDP_PORT_SRC",
           "hdr": "HEADER_TYPE_UDP",
           "index": "e_FM_PCD_HDR_INDEX_NONE"
@@ -514,6 +883,39 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "generic": [
+        [
+          "HEADER_TYPE_IPv4",
+          9,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          6,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          8,
+          16
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          24,
+          16
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          40,
+          1
+        ],
+        [
+          "HEADER_TYPE_PPPoE",
+          0,
+          8
+        ]
+      ],
+      "group": 11,
       "name": "cdx_udp4_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -546,6 +948,7 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "group": 12,
       "name": "cdx_esp6_dist",
       "num_fqids": 1,
       "shared": 1,
@@ -578,12 +981,567 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "group": 13,
       "name": "cdx_esp4_dist",
       "num_fqids": 1,
       "shared": 1,
       "units": [
         1,
         2
+      ]
+    },
+    {
+      "base_fqid": 8288,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_ETH_DA",
+          "hdr": "HEADER_TYPE_ETH",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_ETH_SA",
+          "hdr": "HEADER_TYPE_ETH",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_ETH_TYPE",
+          "hdr": "HEADER_TYPE_ETH",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 0,
+      "name": "cdx_sec_ethernet_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        0
+      ]
+    },
+    {
+      "base_fqid": 8272,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv6_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_DST_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_NEXT_HDR",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_TCP_PORT_SRC",
+          "hdr": "HEADER_TYPE_TCP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_TCP_PORT_DST",
+          "hdr": "HEADER_TYPE_TCP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 1,
+      "name": "cdx_sec_tcp6_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        3,
+        4
+      ]
+    },
+    {
+      "base_fqid": 8256,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv6_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_DST_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_NEXT_HDR",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_UDP_PORT_SRC",
+          "hdr": "HEADER_TYPE_UDP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_UDP_PORT_DST",
+          "hdr": "HEADER_TYPE_UDP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 2,
+      "name": "cdx_sec_udp6_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        3,
+        5
+      ]
+    },
+    {
+      "base_fqid": 8240,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv4_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_DST_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_PROTO",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_TCP_PORT_SRC",
+          "hdr": "HEADER_TYPE_TCP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_TCP_PORT_DST",
+          "hdr": "HEADER_TYPE_TCP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 3,
+      "name": "cdx_sec_tcp4_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        2,
+        4
+      ]
+    },
+    {
+      "base_fqid": 8224,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv4_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_DST_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_PROTO",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_UDP_PORT_SRC",
+          "hdr": "HEADER_TYPE_UDP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_UDP_PORT_DST",
+          "hdr": "HEADER_TYPE_UDP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 4,
+      "name": "cdx_sec_udp4_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        2,
+        5
+      ]
+    },
+    {
+      "base_fqid": 8208,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv6_DST_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_NEXT_HDR",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPSEC_ESP_SPI",
+          "hdr": "HEADER_TYPE_IPSEC_ESP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 5,
+      "name": "cdx_sec_esp6_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        1,
+        3
+      ]
+    },
+    {
+      "base_fqid": 8192,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv4_DST_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_PROTO",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPSEC_ESP_SPI",
+          "hdr": "HEADER_TYPE_IPSEC_ESP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "group": 6,
+      "name": "cdx_sec_esp4_dist",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        1,
+        2
+      ]
+    },
+    {
+      "base_fqid": 4144,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv6_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_DST_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_TCP_PORT_SRC",
+          "hdr": "HEADER_TYPE_TCP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_TCP_PORT_DST",
+          "hdr": "HEADER_TYPE_TCP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "generic": [
+        [
+          "HEADER_TYPE_IPv6",
+          6,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv4",
+          9,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv4",
+          12,
+          8
+        ],
+        [
+          "HEADER_TYPE_ETH",
+          6,
+          6
+        ],
+        [
+          "HEADER_TYPE_PPPoE",
+          2,
+          2
+        ]
+      ],
+      "group": 8,
+      "name": "cdx_tcp6_dist_pppoe",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        3,
+        5,
+        4
+      ]
+    },
+    {
+      "base_fqid": 4128,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv6_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv6_DST_IP",
+          "hdr": "HEADER_TYPE_IPv6",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_UDP_PORT_SRC",
+          "hdr": "HEADER_TYPE_UDP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_UDP_PORT_DST",
+          "hdr": "HEADER_TYPE_UDP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "generic": [
+        [
+          "HEADER_TYPE_IPv6",
+          6,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv4",
+          9,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv4",
+          12,
+          8
+        ],
+        [
+          "HEADER_TYPE_ETH",
+          6,
+          6
+        ],
+        [
+          "HEADER_TYPE_PPPoE",
+          2,
+          2
+        ]
+      ],
+      "group": 9,
+      "name": "cdx_udp6_dist_pppoe",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        3,
+        6,
+        4
+      ]
+    },
+    {
+      "base_fqid": 4112,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv4_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_DST_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_TCP_PORT_SRC",
+          "hdr": "HEADER_TYPE_TCP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_TCP_PORT_DST",
+          "hdr": "HEADER_TYPE_TCP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "generic": [
+        [
+          "HEADER_TYPE_IPv4",
+          9,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          6,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          8,
+          16
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          24,
+          16
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          40,
+          1
+        ],
+        [
+          "HEADER_TYPE_ETH",
+          6,
+          6
+        ],
+        [
+          "HEADER_TYPE_PPPoE",
+          2,
+          2
+        ]
+      ],
+      "group": 10,
+      "name": "cdx_tcp4_dist_pppoe",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        2,
+        5,
+        4
+      ]
+    },
+    {
+      "base_fqid": 4096,
+      "extracted_or": {
+        "bit_offset_in_fqid": 16,
+        "mask": 15,
+        "type": "e_FM_PCD_KG_EXTRACT_PORT_PRIVATE_INFO"
+      },
+      "extracts": [
+        {
+          "field": "NET_HEADER_FIELD_IPv4_SRC_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_IPv4_DST_IP",
+          "hdr": "HEADER_TYPE_IPv4",
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
+        },
+        {
+          "field": "NET_HEADER_FIELD_UDP_PORT_SRC",
+          "hdr": "HEADER_TYPE_UDP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        },
+        {
+          "field": "NET_HEADER_FIELD_UDP_PORT_DST",
+          "hdr": "HEADER_TYPE_UDP",
+          "index": "e_FM_PCD_HDR_INDEX_NONE"
+        }
+      ],
+      "generic": [
+        [
+          "HEADER_TYPE_IPv4",
+          9,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          6,
+          1
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          8,
+          16
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          24,
+          16
+        ],
+        [
+          "HEADER_TYPE_IPv6",
+          40,
+          1
+        ],
+        [
+          "HEADER_TYPE_ETH",
+          6,
+          6
+        ],
+        [
+          "HEADER_TYPE_PPPoE",
+          2,
+          2
+        ]
+      ],
+      "group": 11,
+      "name": "cdx_udp4_dist_pppoe",
+      "num_fqids": 1,
+      "shared": 1,
+      "units": [
+        2,
+        6,
+        4
       ]
     }
   ],
@@ -627,6 +1585,24 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
+      "key_size": 46,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
       "key_size": 34,
       "max_keys": 512,
       "name": "cdx_multicast6_cc",
@@ -645,7 +1621,7 @@
     {
       "hash_res_mask": 32767,
       "hash_shift": 0,
-      "key_size": 38,
+      "key_size": 55,
       "max_keys": 512,
       "name": "cdx_tcp6_cc",
       "prefilled_entries": 0,
@@ -654,7 +1630,7 @@
     {
       "hash_res_mask": 32767,
       "hash_shift": 0,
-      "key_size": 38,
+      "key_size": 55,
       "max_keys": 512,
       "name": "cdx_udp6_cc",
       "prefilled_entries": 0,
@@ -663,7 +1639,7 @@
     {
       "hash_res_mask": 32767,
       "hash_shift": 0,
-      "key_size": 14,
+      "key_size": 56,
       "max_keys": 512,
       "name": "cdx_tcp4_cc",
       "prefilled_entries": 0,
@@ -672,7 +1648,700 @@
     {
       "hash_res_mask": 32767,
       "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_esp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_esp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 15,
+      "max_keys": 512,
+      "name": "cdx_ethernet_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 15,
+      "hash_shift": 0,
+      "key_size": 11,
+      "max_keys": 512,
+      "name": "cdx_pppoe_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 20,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 8,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 46,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 34,
+      "max_keys": 512,
+      "name": "cdx_multicast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_multicast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_tcp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_tcp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_esp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_esp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 15,
+      "max_keys": 512,
+      "name": "cdx_ethernet_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 15,
+      "hash_shift": 0,
+      "key_size": 11,
+      "max_keys": 512,
+      "name": "cdx_pppoe_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 20,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 8,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 46,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 34,
+      "max_keys": 512,
+      "name": "cdx_multicast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_multicast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_tcp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_tcp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_esp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_esp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 15,
+      "max_keys": 512,
+      "name": "cdx_ethernet_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 15,
+      "hash_shift": 0,
+      "key_size": 11,
+      "max_keys": 512,
+      "name": "cdx_pppoe_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 20,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 8,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 46,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 34,
+      "max_keys": 512,
+      "name": "cdx_multicast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_multicast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_tcp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_tcp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_esp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_esp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 15,
+      "max_keys": 512,
+      "name": "cdx_ethernet_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 15,
+      "hash_shift": 0,
+      "key_size": 11,
+      "max_keys": 512,
+      "name": "cdx_pppoe_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 20,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 8,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 46,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 34,
+      "max_keys": 512,
+      "name": "cdx_multicast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_multicast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_tcp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_tcp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_esp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_esp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 15,
+      "max_keys": 512,
+      "name": "cdx_sec_ethernet_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 38,
+      "max_keys": 512,
+      "name": "cdx_sec_tcp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 38,
+      "max_keys": 512,
+      "name": "cdx_sec_udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
       "key_size": 14,
+      "max_keys": 512,
+      "name": "cdx_sec_tcp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 14,
+      "max_keys": 512,
+      "name": "cdx_sec_udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_sec_esp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_sec_esp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 15,
+      "max_keys": 512,
+      "name": "cdx_ethernet_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 15,
+      "hash_shift": 0,
+      "key_size": 11,
+      "max_keys": 512,
+      "name": "cdx_pppoe_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 20,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 8,
+      "max_keys": 512,
+      "name": "cdx_tuple3udp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 46,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 22,
+      "max_keys": 512,
+      "name": "cdx_bridged_mcast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 34,
+      "max_keys": 512,
+      "name": "cdx_multicast6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 255,
+      "hash_shift": 0,
+      "key_size": 10,
+      "max_keys": 512,
+      "name": "cdx_multicast4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_tcp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 55,
+      "max_keys": 512,
+      "name": "cdx_udp6_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
+      "max_keys": 512,
+      "name": "cdx_tcp4_cc",
+      "prefilled_entries": 0,
+      "statistics_mode": 2
+    },
+    {
+      "hash_res_mask": 32767,
+      "hash_shift": 0,
+      "key_size": 56,
       "max_keys": 512,
       "name": "cdx_udp4_cc",
       "prefilled_entries": 0,

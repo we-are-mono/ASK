@@ -18,11 +18,11 @@
 /*
  * Concurrency (module-level):
  *   cdx_info->ctrl.mutex
- *      - Module-global mutex covering the FCI command handler
- *        table (see cdx_cmdhandler.c), the cmdhandler init/exit
- *        sequence here, and the timer wheels (see cdx_timer.c —
- *        the timer kthread and every wheel mutator take this same
- *        mutex; there is no separate wheel spinlock).
+ *      - Module-global mutex covering the subsystem init/exit
+ *        sequence here, the flowtable transaction (see
+ *        cdx_flowtable_backend.c) and the timer wheels (see
+ *        cdx_timer.c — the timer kthread and every wheel mutator
+ *        take this same mutex; there is no separate wheel spinlock).
  *   cdx_info->ctrl.timer_thread
  *      - kthread started under ctrl->mutex in cdx_ctrl_init;
  *        consumes the timer wheels under ctrl->mutex.
@@ -39,7 +39,12 @@
 #include <linux/rtnetlink.h>
 #include <linux/delay.h>
 #include "cdx.h"
-#include "cdx_cmdhandler.h"
+#include "cdx_flowtable.h"
+#include "cdx_htb.h"
+#include "control_tx.h"
+#include "module_qm.h"
+#include "control_ipsec.h"
+#include "dpa_control_mc.h"
 #include "dpa_ipsec.h"
 
 #ifdef CDX_DEBUG_KEY_ZEROING
@@ -62,6 +67,14 @@ int  cdx_mc_init_hcsync_fail_probe(void);
 void cdx_mc_remove_hcsync_fail_probe(void);
 #endif
 
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+/* IPsec split-key fault-injection knob - see cdx_dpa_ipsec.c for design
+ * rationale. Forward-declared for the include-order reason above.
+ */
+int  cdx_ipsec_init_split_key_fail_probe(void);
+void cdx_ipsec_remove_split_key_fail_probe(void);
+#endif
+
 /* Quarantine terminal disposition (cdx_ehash.c) — forward-declared for the
  * include-order reason above; the full contract lives in cdx_common.h. */
 void cdx_ehash_quarantine_abandon(void);
@@ -74,6 +87,28 @@ void cdx_ehash_quarantine_abandon(void);
 static uint32_t init_level;
 static cdx_deinit_func deinit_fn[MAX_CDX_INIT_FUNCTIONS];
 
+/* Configuration and final teardown need both locks. RTNL holders may flush
+ * flowtable callbacks which need ctrl.mutex, and the flowtable's admission
+ * path takes RTNL with ctrl.mutex held (it only trylocks, for this reason).
+ * Never wait for either lock while holding the other. */
+void cdx_ctrl_lock_with_rtnl(void)
+{
+	for (;;) {
+		rtnl_lock();
+		if (mutex_trylock(&cdx_info->ctrl.mutex))
+			return;
+		rtnl_unlock();
+		mutex_lock(&cdx_info->ctrl.mutex);
+		mutex_unlock(&cdx_info->ctrl.mutex);
+	}
+}
+
+void cdx_ctrl_unlock_with_rtnl(void)
+{
+	mutex_unlock(&cdx_info->ctrl.mutex);
+	rtnl_unlock();
+}
+
 void register_cdx_deinit_func(cdx_deinit_func func)
 {
 	if (init_level == MAX_CDX_INIT_FUNCTIONS) {
@@ -85,22 +120,87 @@ void register_cdx_deinit_func(cdx_deinit_func func)
 	return;
 }
 
+/* The subsystems whose state the flowtable backends drive: the physical
+ * ports, the CEETM channels and class queues, the IPsec SA caches with the
+ * SEC job ring and datapath frame-queue hook, and the multicast group
+ * tables. Each is torn down only if it came up, in the reverse order. */
+static bool cdx_tx_up, cdx_qm_up, cdx_mc4_up, cdx_mc6_up;
+#ifdef DPA_IPSEC_OFFLOAD
+static bool cdx_ipsec_up;
+#endif
+
+static int __init cdx_subsys_init(void)
+{
+	int rc;
+
+	rc = tx_init();
+	if (rc < 0)
+		return rc;
+	cdx_tx_up = true;
+	rc = qm_init();
+	if (rc < 0)
+		return rc;
+	cdx_qm_up = true;
+#ifdef DPA_IPSEC_OFFLOAD
+	rc = ipsec_init();
+	if (rc < 0)
+		return rc;
+	cdx_ipsec_up = true;
+#endif
+	rc = mc4_init();
+	if (rc < 0)
+		return rc;
+	cdx_mc4_up = true;
+	rc = mc6_init();
+	if (rc < 0)
+		return rc;
+	cdx_mc6_up = true;
+	return 0;
+}
+
+/* Forwarding state first, then the QoS queues and interfaces it names. */
+static void cdx_subsys_exit(void)
+{
+	if (cdx_mc6_up)
+		mc6_exit();
+	cdx_mc6_up = false;
+	if (cdx_mc4_up)
+		mc4_exit();
+	cdx_mc4_up = false;
+#ifdef DPA_IPSEC_OFFLOAD
+	if (cdx_ipsec_up)
+		ipsec_exit();
+	cdx_ipsec_up = false;
+#endif
+	if (cdx_qm_up)
+		qm_exit();
+	cdx_qm_up = false;
+	if (cdx_tx_up)
+		tx_exit();
+	cdx_tx_up = false;
+}
+
 static void cdx_ctrl_deinit(void)
 {
-	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
+	bool stopped, settled;
 
-	mutex_lock(&ctrl->mutex);
-	rtnl_lock();
-	if (dpa_cfg_quiesce())
+	cdx_ctrl_lock_with_rtnl();
+	stopped = !dpa_cfg_quiesce();
+	if (!stopped)
 		pr_err("cdx: cannot quiesce DPA ports before control teardown\n");
-	cdx_cmdhandler_exit();
-	/* Last on purpose: the exit chain above (ipsec/socket/ipv4/ipv6
-	 * resets included) can still park entries whose delete failed, so
-	 * the abandon must run after every subsystem's teardown, not from
-	 * an individual _exit hook partway down the chain. */
+	cdx_subsys_exit();
+	/* Last on purpose: the exit chain above (the multicast and IPsec
+	 * teardowns included) can still park entries whose delete failed,
+	 * or record ones it could not prove unlinked, so both dispositions
+	 * run after every subsystem's teardown, not from an individual _exit
+	 * hook partway down the chain. */
 	cdx_ehash_quarantine_abandon();
-	rtnl_unlock();
-	mutex_unlock(&ctrl->mutex);
+	/* A key is settled only with nothing left to walk to it: CDX's ports
+	 * detached, and no other port reaching a classifier. The FQIDs held
+	 * for an SA whose key may still be linked go back only once none is. */
+	settled = cdx_ehash_abandoned_exit(stopped && dpa_cfg_covered());
+	cdx_dpa_ipsec_held_fqids_exit(settled);
+	cdx_ctrl_unlock_with_rtnl();
 }
 
 static int __init cdx_ctrl_init(struct _cdx_info *cdx_info)
@@ -115,8 +215,7 @@ static int __init cdx_ctrl_init(struct _cdx_info *cdx_info)
 	if (rc)
 		goto error;
 	mutex_lock(&ctrl->mutex);
-	/* Initialize interface to fci */
-	rc = cdx_cmdhandler_init();
+	rc = cdx_subsys_init();
 	mutex_unlock(&ctrl->mutex);
 	if (!rc)
 		wake_up_process(ctrl->timer_thread);
@@ -157,22 +256,40 @@ static void cdx_module_deinit(void)
 {
 	int ii;
 
+	/* A loaded flowtable adapter pins CDX. Its callbacks and hardware
+	 * have drained before provider shutdown can run. */
+	/* Give up the netdev's ndo_setup_tc before anything it reaches is torn
+	 * down. The driver holds a pointer into this module's text rather than a
+	 * symbol reference, so a tc command can arrive right up to here; running
+	 * this ahead of the deinit chain is deliberate, because that chain runs
+	 * after the QoS objects a qdisc command would configure have gone.
+	 * Safe on the initialization-failure path too, where nothing registered. */
+	cdx_htb_exit();
+	/* Stop the remaining internal writer before terminal retries release
+	 * both locks. Timer storage survives until its normal exit callback. */
+	cdx_ctrl_timer_stop();
+	/* And the work that stops the ports after an unproven deletion and
+	 * restarts them: unload quiesces the ports below itself, and the work
+	 * takes the control lock and cdx_info. */
+	cdx_ft_fatal_stop();
+
 	/* Stop classification before any dependent subsystem releases queues.
-	 * Keep RTNL available between retries and release it before callbacks
-	 * which unregister netdevices. The control mutex excludes FCI updates. */
+	 * Keep both locks available between retries and release them before
+	 * callbacks which unregister netdevices. External users pin the module. */
 	if (fman_info) {
-		mutex_lock(&cdx_info->ctrl.mutex);
-		rtnl_lock();
+		cdx_ctrl_lock_with_rtnl();
 		while (dpa_cfg_quiesce()) {
-			rtnl_unlock();
+			cdx_ctrl_unlock_with_rtnl();
 			pr_warn_ratelimited("cdx: waiting for DPA port shutdown; reboot if hardware cannot recover\n");
 			msleep(1000);
-			rtnl_lock();
+			cdx_ctrl_lock_with_rtnl();
 		}
+		cdx_flowtable_quiesced();
 		/* Reclaim queued TX frames while dependent pools are still alive. */
 		qm_quiesce();
-		rtnl_unlock();
-		mutex_unlock(&cdx_info->ctrl.mutex);
+		/* And the frame the discard queue may hold, for the same reason. */
+		cdx_discard_exit();
+		cdx_ctrl_unlock_with_rtnl();
 	}
 
 	for (ii = init_level - 1; ii >= 0; ii--) {
@@ -250,11 +367,24 @@ static int __init cdx_module_init(void)
 		printk("%s::cdx_init_device failed\n", __func__);
 		goto exit;
 	}
+	rc = cdx_flowtable_guard_init();
+	if (rc)
+		goto exit;
+	/* Keep the failed-port guard until the configuration cleanup below has
+	 * detached PCD and released physical interface records. */
+	register_cdx_deinit_func(cdx_flowtable_guard_exit);
 	/* Run after control teardown, while FMAN metadata is still available. */
 	register_cdx_deinit_func(dpa_cfg_deinit);
 	rc = cdx_ctrl_init(cdx_info);
 	if (rc != 0) {
 		printk("%s::cdx_ctrl_init failed\n", __func__);
+		goto exit;
+	}
+	/* After cdx_ctrl_init, which is where qm_init builds every CEETM
+	 * channel and class queue a qdisc command can configure. */
+	rc = cdx_htb_init();
+	if (rc != 0) {
+		printk("%s::cdx_htb_init failed\n", __func__);
 		goto exit;
 	}
 	rc = devman_init_linux_stats();
@@ -282,6 +412,12 @@ static int __init cdx_module_init(void)
 	else
 		printk(KERN_WARNING "%s::cdx_mc_init_hcsync_fail_probe failed\n", __func__);
 #endif
+#ifdef CDX_DEBUG_SPLIT_KEY_FAIL
+	if (cdx_ipsec_init_split_key_fail_probe() == 0)
+		register_cdx_deinit_func(cdx_ipsec_remove_split_key_fail_probe);
+	else
+		printk(KERN_WARNING "%s::cdx_ipsec_init_split_key_fail_probe failed\n", __func__);
+#endif
 	/* Build the FMan classifier and everything that hangs off it. */
 	rc = dpa_cfg_install();
 	if (rc != 0)  {
@@ -289,10 +425,23 @@ static int __init cdx_module_init(void)
 		goto exit;
 	}
 #ifdef CFG_WIFI_OFFLOAD
+	/* What this claims is the offline port the board declared for Wi-Fi
+	 * (dpa-fman0-oh@3, sized for it in the device tree), its buffer pools
+	 * and the per-VAP frame-queue machinery. Without it the absence surfaces
+	 * several layers away, as a frame queue that cannot be resolved, with
+	 * nothing in the message naming Wi-Fi. */
 	rc = dpaa_vwd_init();
 	if (rc != 0)  {
-		printk("%s::vwd_driver_init failed\n", __func__);
-		goto exit;
+		/* Not fatal. What failed is a claim on board-specific resources
+		 * -- the Wi-Fi offline port, its buffer pool, the first Ethernet
+		 * port's private data -- and a board without them is a gateway
+		 * without Wi-Fi offload, not a gateway without offload.
+		 * dpaa_vwd_ready() stays false, so cdx_wifi_vap_supported()
+		 * refuses every VAP and dpaa_vwd_vap_cmd() refuses any that
+		 * reaches it; nothing else here depends on it. */
+		pr_warn("%s: Wi-Fi offload unavailable, VWD init failed (%d)\n",
+			__func__, rc);
+		rc = 0;
 	}
 #endif
 	// initialize global fragmentation params
@@ -303,23 +452,25 @@ static int __init cdx_module_init(void)
 	}
 
 #ifdef DPA_IPSEC_OFFLOAD
+	/* This builds the offline port, the SEC buffer pool and the PCD frame
+	 * queues -- resources no control plane can substitute for. Without them
+	 * SEC has nowhere to put a frame, and the first symptom is a shared
+	 * descriptor that cannot be created, several layers away from the
+	 * cause. */
 	if (cdx_dpa_ipsec_init()) {
-		printk("%s::dpa_ipsec start failed\n", __func__);
-		rc = -EIO;
-		goto exit;
+		/* Not fatal, for the reason the Wi-Fi failure above is not: what
+		 * failed is a claim on board-specific resources -- the IPsec
+		 * offline port, its buffer pool, the PCD frame queues -- and a
+		 * board without them is a gateway without IPsec offload, not a
+		 * gateway without offload. cdx_ipsec_ready() stays false, so
+		 * the XFRM provider refuses every SA and the encoder never arms;
+		 * nothing else here depends on it. */
+		pr_warn("%s: IPsec offload unavailable, DPA IPsec init failed\n",
+			__func__);
 	}
 
-	if (cdx_init_scatter_gather_bpool()) {
-		printk("%s::cdx_init_scatter_gather_bpool failed\n",__func__);
-		rc = -ENOMEM;
-		goto exit;
-	}
-	if (cdx_init_skb_2bfreed_bpool()) {
-		printk("%s(%d) : cdx_init_skb_2bfreed_bpool failed\n", __func__,__LINE__);
-		rc = -ENOMEM;
-		goto exit;
-	}
 #endif
+	return 0;
 
 exit:
 	if (rc) {

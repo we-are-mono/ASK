@@ -16,8 +16,7 @@
 dist/
 
 # Built binaries
-cmm/src/cmm
-cmm/src/cmm_rtnl_fuzzer
+flowtable/src/ask-flowtable
 
 # Kbuild temporaries
 .*.cmd
@@ -37,6 +36,7 @@ __pycache__/
 
 # Local setup notes — environment-specific, not part of the codebase
 IPSEC.md
+.ask-test.mk
 
 # Private NXP documentation and investigation notes
 /pdf/

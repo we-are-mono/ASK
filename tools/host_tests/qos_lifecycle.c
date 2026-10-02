@@ -24,12 +24,6 @@ static int atomic_read(atomic_t *p) { return p->value; }
 #define MAX_PHY_PORTS 10
 #define GEM_PORTS 8
 #define DPAA_ETH_TX_QUEUES 16
-#define CDX_INGRESS_ALL_PROFILES 8
-#define DEFAULT_CQ_CIR_VALUE 100
-#define DEFAULT_CQ_PIR_VALUE 100
-#define DEFAULT_CQ_BYTE_MODE_CBS 2000
-#define DEFAULT_CQ_BYTE_MODE_PBS 2000
-#define DISABLE_POLICER 0
 #define KERN_INFO ""
 #define printk(...) ((void)0)
 #define ceetm_err(...) ((void)0)
@@ -106,6 +100,9 @@ static unsigned shutdown_waits;
 static bool rtnl;
 static void rtnl_lock(void) { assert(!rtnl); rtnl = true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
+/* The control-lock contention contract is covered by cdx_shutdown.c. */
+static void cdx_ctrl_lock_with_rtnl(void) { rtnl_lock(); }
+static void cdx_ctrl_unlock_with_rtnl(void) { rtnl_unlock(); }
 #define ASSERT_RTNL() assert(rtnl)
 static unsigned pop_by_queue[16], query_by_queue[16];
 static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
@@ -126,26 +123,16 @@ struct dpa_iface_info {
     struct { struct net_device *net_dev; unsigned tx_channel_id; } eth_info;
 };
 #define netdev_priv(dev) (&(dev)->priv)
+/* The DSCP map's slow-path table is published under RCU and freed after a
+ * grace period; there are no readers here to wait for. */
+#define __rcu
+struct rcu_head { void *next; };
+#define RCU_INIT_POINTER(p, v) ((p) = (v))
+#define kfree_rcu(p, field) kfree(p)
 #include "qos_types.inc"
 QM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
-typedef void *t_Handle;
-typedef struct {
-    struct { struct { unsigned profileType, relativeProfileId; } newParams; } id;
-    unsigned algSelection, colorMode, nextEngineOnGreen, nextEngineOnYellow, nextEngineOnRed;
-    struct { unsigned dfltColor, override; } color;
-    struct { unsigned action; } paramsOnGreen, paramsOnYellow, paramsOnRed;
-    struct {
-        unsigned rateMode, committedInfoRate, peakOrExcessInfoRate;
-        unsigned committedBurstSize, peakOrExcessBurstSize;
-        struct { unsigned frameLengthSelection, rollBackFrameSelection; } byteModeParams;
-    } nonPassthroughAlgParams;
-} t_FmPcdPlcrProfileParams;
-enum { e_FM_PCD_PLCR_RFC_2698, e_FM_PCD_PLCR_COLOR_BLIND, e_FM_PCD_PLCR_RED,
-       e_FM_PCD_PLCR_BYTE_MODE, e_FM_PCD_PLCR_FULL_FRM_LEN, e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN,
-       e_FM_PCD_DONE, e_FM_PCD_ENQ_FRAME, e_FM_PCD_DROP_FRAME, e_FM_PCD_PLCR_SHARED };
-
-static unsigned fail_at, step, allocations, channels, lfqs, fqs, profiles;
+static unsigned fail_at, step, allocations, channels, lfqs, fqs;
 static unsigned next_channel, mapping_id;
 static unsigned pending_enqueues, pending_frames, pending_erns, queries;
 static unsigned long jiffies;
@@ -162,6 +149,19 @@ static void *kzalloc(size_t size, int flags)
     p = calloc(1, size); assert(p); allocations++; return p;
 }
 static void kfree(void *p) { if (p) { assert(allocations); allocations--; free(p); } }
+/* CEETM mode on a Tx sub-portal, which is a register bit rather than a claim.
+ * Counted both ways so a teardown that leaves it set is visible here rather
+ * than only on hardware, where it presents as a port that accepts frames,
+ * counts them and transmits nothing. */
+static int sp_ceetm_mode;
+static int qman_sp_enable_ceetm_mode(int portal, uint16_t sp)
+{
+    (void)portal; (void)sp; sp_ceetm_mode++; return 0;
+}
+static int qman_sp_disable_ceetm_mode(int portal, uint16_t sp)
+{
+    (void)portal; (void)sp; sp_ceetm_mode--; return 0;
+}
 static int qman_alloc_ceetm0_channel(unsigned *id)
 {
     if (hw_step()) return -ENOSPC;
@@ -255,16 +255,6 @@ static int dpa_register_ceetm_get_egress_fq(void *a, void *b)
     assert(!callbacks); callbacks = true; return 0;
 }
 static void dpa_unregister_ceetm_get_egress_fq(void) { assert(callbacks); callbacks = false; }
-static void *dpa_get_pcdhandle(unsigned fm) { return hw_step() ? NULL : (void *)1; }
-static void *FM_PCD_PlcrProfileSet(void *pcd, t_FmPcdPlcrProfileParams *params)
-{
-    void *p = kzalloc(1, 0);
-    if (p) profiles++;
-    return p;
-}
-static unsigned FmPcdPlcrProfileGetAbsoluteId(void *p) { return profiles; }
-static int FM_PCD_PlcrProfileDelete(void *p)
-{ assert(profiles); profiles--; kfree(p); return release_error ? -EIO : 0; }
 static int qman_ceetm_sp_claim(struct qm_ceetm_sp **out, unsigned fm, unsigned index)
 {
     if (hw_step()) return -ENOMEM;
@@ -283,6 +273,30 @@ static int qman_ceetm_sp_release(struct qm_ceetm_sp *p)
 static int qman_ceetm_configure_mapping_shaper_tcfc(struct qm_mcc_ceetm_mapping_shaper_tcfc_config *cfg)
 { mapping_id = cfg->cid & ~CEETM_COMMAND_CHANNEL_MAPPING; return hw_step(); }
 static void dpa_disable_ceetm(struct net_device *dev) { dev->priv.ceetm_en = false; }
+/* Bookkeeping only, and covered by htb_offload.c; here it just has to be
+ * called before the context it names is released. */
+static unsigned htb_ports_dropped, dscp_ports_dropped;
+static void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
+{
+    assert(qm_ctx);
+    /* The filters naming classes in the tree go first, so this must already
+     * have happened by the time the tree itself is dropped. */
+    assert(dscp_ports_dropped > htb_ports_dropped);
+    htb_ports_dropped++;
+}
+static void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
+{
+    assert(qm_ctx);
+    dscp_ports_dropped++;
+}
+
+/* The devlink instance the device-wide meters live on. It is registered by the
+ * DPA configuration once their profiles exist (devlink_policer.c and
+ * cdx_startup.c), not as an interface comes up, so nothing here may register
+ * it: there is deliberately no attach stub to call. Module exit still detaches
+ * it, idempotently, before the hardware goes. */
+static unsigned devlink_detaches;
+static void cdx_devlink_detach(void) { devlink_detaches++; }
 static void synchronize_net(void) {}
 static int ceetm_enable_or_disable_qos(QM_context_ctl *ctx, unsigned enable)
 { assert(!enable); ctx->qos_enabled = 0; return 0; }
@@ -331,7 +345,19 @@ static struct cdx_port_info *get_dpa_port_info(char *name) { return &port; }
 #define qman_ceetm_ratio2wbfs(...) hw_step()
 #define qman_ceetm_set_queue_weight(...) hw_step()
 #define qman_ceetm_lfq_set_context(...) hw_step()
-#define qman_ceetm_channel_set_group(...) hw_step()
+/* Where the weighted group is placed among a channel's strict class queues,
+ * in the hardware's numbering: prio_a N puts group A after CQ N. Counted
+ * rather than kept per channel, because every placement has to be the same. */
+static unsigned group_a_placed, group_a_misplaced;
+static int qman_ceetm_channel_set_group(struct qm_ceetm_channel *channel, int group_b,
+                                        unsigned prio_a, unsigned prio_b)
+{
+    if (hw_step()) return -EIO;
+    assert(channel && !group_b && prio_a < 8);
+    group_a_placed++;
+    group_a_misplaced += prio_a != NUM_PQS - 2;
+    return 0;
+}
 #define qman_ceetm_ccg_set(...) hw_step()
 #define EVENT_QM 1
 static void M_qm_cmdproc(void) {}
@@ -352,16 +378,14 @@ static void shutdown_qos(void)
 
 static void empty(void)
 {
-    assert(!allocations && !channels && !lfqs && !fqs && !profiles);
+    assert(!allocations && !channels && !lfqs && !fqs);
     assert(!callbacks && !command_handler && !lni.claimed && !sp.claimed);
     for (unsigned i = 0; i < MAX_PHY_PORTS; i++) assert(!gQMCtx[i].net_dev);
 }
 static int start(void)
 {
     int ret = qm_init();
-    if (ret) { empty(); return ret; }
-    ret = ceetm_init_cq_plcr();
-    if (ret) assert(!profiles);
+    if (ret) empty();
     return ret;
 }
 static unsigned cycle(unsigned failure)
@@ -384,6 +408,11 @@ int main(void)
     for (unsigned i = 1; i <= count; i++) { cycle(i); cycle(0); }
     fail_at = 0;
     assert(start() == 0);
+    /* The weighted group sits just above hardware CQ7, which is class queue
+     * 0: where unclassified traffic goes, and eligible for committed tokens,
+     * so below it a backlogged unclassified flow would pre-empt every
+     * weighted leaf on the channel. */
+    assert(group_a_placed >= CDX_CEETM_MAX_CHANNELS && !group_a_misplaced);
     struct net_device dev = {0};
     struct dpa_iface_info iface = {.name = "eth0", .eth_info = {&dev, 1}};
     port.portid = MAX_PHY_PORTS - 1;
@@ -397,27 +426,30 @@ int main(void)
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
     assert(cdx_enable_ceetm_on_iface(&iface) < 0);
     QM_context_ctl *ctx = &gQMCtx[port.portid];
-    assert(!ceetm_get_egressfq(ctx, 0, 0, 0));
-    assert(!ceetm_get_egressfq(NULL, 1, 0, 0));
+    assert(!ceetm_get_egressfq(ctx, 0, 0));
+    assert(!ceetm_get_egressfq(NULL, 1, 0));
     fail_at = step + 1;
     assert(ceetm_assign_chnl(ctx, 0) < 0);
     assert(!ctx->chnl_map && !qm_chnl_info[0].qm_ctx && list_empty(&lni.channels));
     fail_at = 0;
     assert(ceetm_assign_chnl(ctx, 0) == 0);
     assert(mapping_id == qm_chnl_info[0].channel->idx);
-    assert(ceetm_get_egressfq(ctx, 0, 0, 0) == &qm_chnl_info[0].cq_info[0].ceetmfq.egress_fq);
-    assert(!ceetm_get_egressfq(ctx, 2, 0, 0));
-    assert(!ceetm_get_egressfq(ctx, CDX_CEETM_MAX_CHANNELS + 1, 0, 0));
-    assert(!ceetm_get_egressfq(ctx, 1, MAX_SCHEDULER_QUEUES, 0));
-    assert(!ceetm_get_egressfq(&gQMCtx[0], 1, 0, 0));
-    ctx->dscp_fq_map = kzalloc(sizeof(*ctx->dscp_fq_map), 0);
+    assert(ceetm_get_egressfq(ctx, 0, 0) == &qm_chnl_info[0].cq_info[0].ceetmfq.egress_fq);
+    assert(!ceetm_get_egressfq(ctx, 2, 0));
+    assert(!ceetm_get_egressfq(ctx, CDX_CEETM_MAX_CHANNELS + 1, 0));
+    assert(!ceetm_get_egressfq(ctx, 1, MAX_SCHEDULER_QUEUES));
+    assert(!ceetm_get_egressfq(&gQMCtx[0], 1, 0));
+    /* A DSCP map claimed and published: the context release gives both
+     * back, whichever stage it had reached. */
+    ctx->dscp_fq_claimed = kzalloc(sizeof(*ctx->dscp_fq_claimed), 0);
+    ctx->dscp_fq_map = ctx->dscp_fq_claimed;
     dev.priv.ceetm_en = true;
     ctx->qos_enabled = true;
     pending_enqueues = pending_frames = pending_erns = 4;
     assert(cdx_disable_ceetm_on_iface(&iface) == 0);
     assert(!dev.priv.ceetm_en && !dev.priv.qm_ctx && !ctx->chnl_map);
     assert(!qm_chnl_info[0].qm_ctx && list_empty(&qm_chnl_info[0].channel->node));
-    assert(!ceetm_get_egressfq(ctx, 0, 0, 0));
+    assert(!ceetm_get_egressfq(ctx, 0, 0));
     assert(!pop_calls && queries >= MAX_SCHEDULER_QUEUES);
     assert(!pending_enqueues && !pending_frames && !pending_erns);
     for (unsigned i = 0; i < MAX_SCHEDULER_QUEUES; i++)
@@ -486,7 +518,7 @@ int main(void)
         shutdown_qos(); empty();
     }
     /* A failed interface drain may outlive the interface context. Keep the
-     * CQ device references and policers until a later successful cleanup. */
+     * CQ device references until a later successful cleanup. */
     assert(start() == 0);
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
     assert(ceetm_assign_chnl(ctx, 0) == 0);
@@ -498,7 +530,6 @@ int main(void)
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
     assert(ceetm_assign_chnl(ctx, 0) < 0);
     assert(cdx_disable_ceetm_on_iface(&iface) == 0);
-    assert(ceetm_exit_cq_plcr() < 0 && profiles);
     assert(ceetm_exit() < 0 && dev.refs && packet_live[0]);
     recover_on_shutdown_wait = true;
     rtnl_lock();

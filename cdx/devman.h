@@ -15,25 +15,19 @@ int dpa_get_fm_port_index(uint32_t itf_index, uint32_t underlying_iif_index ,
 int dpa_get_iface_stats_entries(uint32_t iif_index,
 			uint32_t underlying_iif_index, uint8_t *offset,
 			uint32_t stats_type, uint32_t iface_type);
-int dpa_get_tx_l2info_by_itf(struct dpa_l2hdr_info *l2_info, POnifDesc itf, uint32_t hash);
-int dpa_check_for_logical_iface_types(struct _itf *input_itf, 
-			struct _itf *underlying_input_itf,
-			struct dpa_l2hdr_info *l2_info,
-			struct dpa_l3hdr_info *l3_info);
-int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry , 
+int dpa_check_for_logical_iface_types(struct _itf *input_itf,
+			struct dpa_l2hdr_info *l2_info);
+int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				struct dpa_l2hdr_info *l2_info,
-				struct dpa_l3hdr_info *l3_info);
+				struct dpa_l3hdr_info *l3_info, uint32_t hash);
 int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * tx_fqid,
-		uint32_t * itf_id, uint32_t * portid , void **netdev, uint32_t hash);
+		uint32_t * itf_id, uint32_t * portid, uint32_t hash);
+struct dpa_priv_s *dpa_first_eth_priv(void);
 int dpa_get_mac_addr(char *name, char *mac_addr);
 uint32_t dpa_get_timestamp_addr(uint32_t id);
 
-int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf); 
-int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf, 
-		uint8_t *mac_addr, uint16_t session_id);
-int dpa_add_vlan_if(char *name, struct _itf *itf, struct _itf *phys_itf, uint16_t vlan_id, uint8_t *mac_addr);
+int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf);
 int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char* mac);
-int dpa_set_bridged_itf(uint8_t* ifname, uint8_t is_bridged, uint8_t* br_mac_addr);
 void dpa_release_interface(uint32_t itf_id);
 
 int cdx_create_port_fqs(void);
@@ -44,8 +38,6 @@ void *create_ddr_and_copy_from_muram(void *muramptr, void **ddrptr, U32 size);
 void copy_ddr_to_muram_and_free_ddr(void *muramptr, void **ddrptr, U32 size);
 struct dpa_bp* get_ipsec_bp(void);
 struct dpa_bp* get_frag_bp(void);
-int cdx_check_rx_iface_type_vlan(struct _itf *input_itf);
 void dpa_update_timestamp(uint32_t ts);
-struct dpa_priv_s* get_eth_priv(unsigned char* name);
 int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
-		struct dpa_l3hdr_info *l3_info, uint32_t *dir_in);
+		struct dpa_l3hdr_info *l3_info);

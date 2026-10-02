@@ -1,0 +1,50 @@
+From: Tomaz Zaman <tomaz@mono.si>
+Subject: [PATCH] sdk_dpaa: report buffer seed failures and free each head once
+
+The pool seeder returns the number of completed buffers on failure, but
+zero means success to its callers. Failure on the first allocation thus
+admits an empty IPsec pool. Return a negative errno for every failure,
+leaving previously released buffers in BMan for the caller's unwind.
+
+A failed DMA mapping of an skb-backed buffer also frees its head twice:
+kfree_skb() already owns the backing storage. Free the raw head only for
+buffers which were not wrapped in an skb.
+
+Upstream-Status: Pending
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+@@ -153,6 +153,7 @@
+ 	char *new_buf, *ptr_buf;
+ 	dma_addr_t addr;
+ 	int ii,entries_in_bmb,buffs2fill;
++	int err = -ENOMEM;
+ 	struct device *dev = dpa_bp->dev;
+ 	struct sk_buff *skb = NULL, **skbh;
+ 	uint32_t bufsize;
+@@ -215,10 +216,10 @@
+ 				pr_err_ratelimited("%s(%d) ii %d buffs2fill %d dma_mapping_error failed \n",
+ 						__func__,__LINE__,ii,buffs2fill);
+ 				if (act_skb)
+-				{
+ 					kfree_skb(skb);
+-				}
+-				kfree(new_buf);
++				else
++					kfree(new_buf);
++				err = -EIO;
+ 				goto handle_fail;
+ 			}
+ 			bm_buffer_set64(&bmb[ii], addr);
+@@ -237,7 +238,9 @@
+ 		while (unlikely(bman_release(dpa_bp->pool, bmb, ii, 0)))
+ 			cpu_relax();
+ 	}
+-	return ii+buffs2fill;
++	/* Zero buffers seeded is still a failure. The caller owns every
++	 * buffer already released to BMan and must drain its pool. */
++	return err;
+ 
+ }
+ EXPORT_SYMBOL(dpaa_bp_alloc_n_add_buffs);

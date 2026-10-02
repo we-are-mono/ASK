@@ -1,26 +1,9 @@
-"""Topology + counter helpers shared across data-plane edge tests.
+"""Topology helpers shared across data-plane tests.
 
-Three concerns colocated here, in order of increasing scope:
-
-  1. RX-path classification + golden-file tripwires. The edge-case
-     tests don't know in advance whether HW silently drops, punts to
-     the kernel slow path, or fast-paths the edge-case packet — so
-     they classify what *did* happen via the physical ingress driver's
-     software RX counter from ethtool, pin the classification in a golden,
-     and assert equality on subsequent runs. A behaviour shift (PCD config
-     change, ucode change) fails the test loudly.
-
-  2. ICMP-egress observation. The ICMP edge-case tests assert "the
-     kernel emitted an ICMP error" by tcpdumping the DUT's egress
-     interface and grep'ing the summary line. tcpdump is already in
-     the exec_cmd allowlist; -c 1 + the agent's per-call timeout
-     bound the wait without needing a new endpoint.
-
-  3. Multi-listener + multi-port-bridge fixtures. These need
-     N parallel VLAN subifs (multi-listener) and a Linux bridge with N
-     VLAN-pseudo-port members (multi-port-bridge). Built on the same
-     finalizer-stack discipline as test_vlan_data_plane.py — partial
-     setup tears down whatever did come up.
+Bench port roles, VLAN ID claims, LAN-VM scripting and composable
+topology fixtures: VLAN subifs on either side and the IPv6 topology,
+built on a finalizer stack so a partial setup tears down whatever did
+come up.
 
 By design: no new agent endpoints, no new exec_cmd allowlist
 entries, no /pkt/inject, no pcap storage. Everything here runs on
@@ -28,18 +11,12 @@ existing primitives.
 """
 
 from __future__ import annotations
-
 import asyncio
-import json
 import os
-import pathlib
-import re
-import warnings
-from typing import Any, Awaitable, Callable
-
+import shlex
 import aiohttp
 import pytest_asyncio
-
+from ask_orch.lifecycle import CleanupStack, checked
 from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 
 
@@ -48,306 +25,54 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # Every test that creates VLAN subinterfaces on the LAN segment claims its
 # IDs here so they don't collide. pytest runs serially, but teardown races
 # and shared-segment capture still make overlap worth tracking. Claims:
-#   test_vlan_data_plane.py     100          (ASK_VLAN_ID)
-#   test_mcast_pagination.py    201..208     (ASK_MCAST_BASE_VID) + 300 transient
-#   test_mcast_failslab.py      231/232      (ASK_MCAST_FAILSLAB_VID)
-#   test_mcast_concurrent.py    241+         (ASK_MCAST_CONCURRENT_VID)
-#   test_mcast_replication.py   241/242/243  (VLAN_IDS_MCAST)
-#   test_vlan_failslab.py       251          (ASK_VLAN_FAILSLAB_VID)
-#   test_mcast_hcsync_quarantine.py 261..264 (ASK_MCAST_HCSYNC_BASE_VID)
-#   bridge helpers              231/232      (VLAN_IDS_BRIDGE)
+#   test_flowtable_vlan.py      271/272      (ASK_FLOWTABLE_VLAN_ID, +1 inner)
+#   test_flowtable_bridge.py    273/274/275  (ASK_FLOWTABLE_BRIDGE_VID, +1, +2)
+#   test_flowtable_pppoe.py     276          (ASK_FLOWTABLE_PPPOE_LAN_VID)
+#   test_flowtable_service_vlan.py 284      (service VLAN recovery)
+#   test_flowtable_service_bridge.py 285/286 (trusted/guest bridge membership,
+#                                            port and VLAN forwarding state)
+#   test_flowtable_service_multicast_bridge.py 287/288/289/290
+#                               (LAN, WAN, IPTV, and the VLAN IPTV is routed into)
+#   test_mcast_e2e.py           244          (VLAN_ID_MROUTE, routed oif)
+#   test_mroute_capacity.py     311..319     (nine LAN listeners)
+#   test_flowtable_service_multicast_leave.py      321/322 (routed via a snooping bridge)
+#   test_flowtable_service_multicast_quarantine.py 323     (listener swap)
+#   test_mcast_member_mtu.py    324          (VLAN_ID_MCAST_MTU, narrow oif)
+#   test_flowtable_service_multicast_edges.py 325 (the oif a forward chain drops toward)
+#   test_flowtable_service_multicast_xfrm.py  326 (the oif an XFRM policy governs)
+#   test_flowtable_service_multicast_ports.py 327 (the oif a port rule drops toward)
 #
-# Overlaps that are safe only because the pairs never run concurrently and
-# both sides tear down in finalizers: bridge 231/232 vs mcast_failslab
-# 231/232; mcast_replication 241/242/243 vs mcast_concurrent 241+.
-VLAN_IDS_MCAST: tuple[int, int, int]  = (241, 242, 243)
-VLAN_IDS_BRIDGE: tuple[int, int]      = (231, 232)
+# 3900 is not a claim on that segment but a standing bench VLAN: the
+# orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access
+# concentrator binds to it, so test_flowtable_pppoe.py builds eth4.3900 on the
+# DUT to meet it and never creates or deletes anything on the orchestrator
+# side. Do not reuse 3900 for a test that does.
+# test_mroute_capacity.py also receives a tagged WAN replica on that existing
+# device using a temporary packet-socket membership, without reconfiguring it,
+# and test_flowtable_service_multicast_edges.py does the same.
+VLAN_ID_MROUTE: int                   = 244
+VLAN_IDS_MROUTE_LIMIT: tuple[int, ...] = tuple(range(311, 320))
+VLAN_ID_MCAST_MTU: int                = 324
+VLAN_ID_PPPOE_WAN: int                = 3900
 
 # Bench wiring: the DUT's eth3 faces the LAN client VM, eth4 faces the
 # WAN/orchestrator segment. Every test that needs a role-scoped DUT port
 # imports these two symbols rather than hardcoding a netdev name, so a
 # re-cable is a one-line change here (or an env override at run time).
 TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth3")
-LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "enp4s0")
+LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "")
+
+# The largest IPv4 packet an Ethernet port delivers, whatever MTU the DUT gives
+# the port: the MAC's receive frame length is fixed at init, and the sending
+# host is never told the DUT's setting. The flowtable adapter installs a
+# non-TCP IPv4 direction only where its path carries this much from its
+# ingress, so a UDP direction into any smaller path stays in Linux.
+FULL_FRAME = 1500
 
 
-# ---- 1. RX-path classification -------------------------------------------
-#
-# Earlier revisions built golden signatures from /proc/fqid_stats
-# "frame count" deltas. That counter is *instantaneous queue occupancy*,
-# not cumulative: queues drain between the before/after snapshots, every
-# delta was zero, and all recorded goldens were vacuous {} — the
-# tripwire could never fire. Netdev totals are also unsuitable: ASK adds
-# hardware interface counts to them in dev_get_stats() (ISSUES.md A136).
-#
-# kernel_rx_packets reads the SDK driver's private "rx packets [TOTAL]"
-# directly from ethtool -S. It excludes hardware interface counts and
-# fails if the driver does not expose that exact counter. A low delta
-# alone does not distinguish hardware forwarding from an early drop;
-# these edge goldens pin software-RX visibility, not successful delivery.
-# Injection counts must dominate background traffic (ND, mDNS): use >= 20.
+# ---- composable topology primitives --------------------------------------
 
-
-def classify_rx_path(kernel_rx_delta: int, injected: int) -> str:
-    """Return historical golden labels for software RX visibility.
-
-    'kernel' means ~all frames were counted by software RX; 'hardware'
-    means ~none were. The latter also includes early drops, so delivery
-    needs a separate check when testing forwarding. Reject intermediate
-    deltas rather than recording a noise-dependent golden.
-    """
-    assert injected > 0, "RX classification requires injected traffic"
-    assert kernel_rx_delta >= 0, "software RX counter reset during measurement"
-    if kernel_rx_delta >= injected:
-        return "kernel"
-    if kernel_rx_delta <= injected // 4:
-        return "hardware"
-    raise AssertionError(
-        f"ambiguous RX path: kernel rx +{kernel_rx_delta} for "
-        f"{injected} injected frames — neither ~all (punt) nor ~none "
-        f"(hardware); rerun on a quieter segment or raise the count"
-    )
-
-
-def assert_counter_signature(
-    observed: dict[str, Any],
-    *,
-    golden_path: pathlib.Path,
-    label: str,
-) -> None:
-    """Compare observed signature to golden[label]; assert byte-equality.
-
-    Set ASK_REGEN_GOLDEN=1 to record observed as the new golden
-    and pass — used on first run and after an intentional behaviour
-    change. Never pass this flag in CI: a regression would be silently
-    overwritten.
-    """
-    regen = os.environ.get("ASK_REGEN_GOLDEN") == "1"
-
-    golden: dict[str, dict[str, int]] = {}
-    if golden_path.exists():
-        try:
-            golden = json.loads(golden_path.read_text())
-        except json.JSONDecodeError as e:
-            raise AssertionError(
-                f"golden file {golden_path} is malformed: {e}"
-            )
-
-    if regen:
-        golden[label] = observed
-        golden_path.parent.mkdir(parents=True, exist_ok=True)
-        golden_path.write_text(
-            json.dumps(golden, indent=2, sort_keys=True) + "\n"
-        )
-        return
-
-    expected = golden.get(label)
-    if expected is None:
-        raise AssertionError(
-            f"no golden entry for label={label!r} in {golden_path}; "
-            f"first run? regenerate with ASK_REGEN_GOLDEN=1"
-        )
-    assert observed == expected, (
-        f"counter signature for label={label!r} drifted from golden "
-        f"({golden_path.name}):\n"
-        f"  expected: {expected}\n"
-        f"  observed: {observed}\n"
-        f"  changed keys:\n"
-        + "\n".join(
-            f"    {k}: {expected.get(k)!r} -> {observed.get(k)!r}"
-            for k in sorted(set(observed) | set(expected))
-            if observed.get(k) != expected.get(k)
-        )
-    )
-
-
-# ---- 2. ICMP-egress observation ------------------------------------------
-
-# Substring needles for tcpdump summary output. Used as belt-and-braces
-# verification that the BPF-matched frame really is the ICMP we expected
-# (a stray same-type-different-code frame would otherwise satisfy the
-# BPF and confuse the test).
-ICMP4_FRAG_NEEDED       = "unreachable - need to frag"   # type=3 code=4
-ICMP4_TIME_EXCEEDED     = "time exceeded"                # type=11
-ICMP6_PACKET_TOO_BIG    = "packet too big"               # type=2
-ICMP6_TIME_EXCEEDED     = "time exceeded"                # type=3
-
-
-def _build_icmp_bpf(ip_ver: int, icmp_type: int, icmp_code: int | None) -> str:
-    """Construct a tight BPF filter for the specific ICMP type/code so
-    a stray ICMP frame (echo request, RA, unrelated unreachable) can't
-    win the tcpdump -c 1 race.
-
-    IPv4 uses raw byte offsets icmp[0]/icmp[1] for portability across
-    tcpdump versions (the 'icmptype'/'icmpcode' name macros were added
-    later and aren't universal). IPv6 uses ip6[40] which is reliable
-    when the response itself has no extension headers — true for
-    DUT-emitted ICMPv6 errors but not for arbitrary IPv6 traffic.
-    """
-    if ip_ver == 6:
-        bpf = f"icmp6 and ip6[40] = {icmp_type}"
-        if icmp_code is not None:
-            bpf += f" and ip6[41] = {icmp_code}"
-        return bpf
-    bpf = f"icmp and icmp[0] = {icmp_type}"
-    if icmp_code is not None:
-        bpf += f" and icmp[1] = {icmp_code}"
-    return bpf
-
-
-async def expect_icmp_egress(
-    target,                  # ask_orch.client.Agent
-    session: aiohttp.ClientSession,
-    *,
-    iface: str,
-    icmp_type: int,
-    icmp_code: int | None = None,
-    expect_substr: str | None = None,
-    ip_ver: int = 4,
-    timeout_s: float = 2.0,
-) -> str:
-    """Run `tcpdump -c 1 -nn -i <iface> '<tight icmp filter>'` on the DUT.
-
-    BPF filter is constructed to match the specific (ip_ver, icmp_type,
-    icmp_code) tuple — no stray ICMP frame can satisfy `-c 1` ahead of
-    the one we actually want. `expect_substr` is an optional secondary
-    check on tcpdump's summary line (e.g. "need to frag" for IPv4
-    type=3 code=4) that catches mis-tcpdumps where the BPF passes but
-    the parsed output reports something unexpected.
-
-    NOTE: expect_substr runs alongside (not replacing) the
-    icmp_type/icmp_code BPF — both layers run for defense-in-depth.
-
-    Returns tcpdump's summary line on success. Raises AssertionError
-    if no matching frame is captured within `timeout_s`. The agent-side
-    subprocess timeout bounds the wait without needing a new endpoint.
-    """
-    bpf = _build_icmp_bpf(ip_ver, icmp_type, icmp_code)
-    timeout_ms = int(timeout_s * 1000) + 500
-    try:
-        r = await target.exec_cmd(
-            session,
-            ["tcpdump", "-c", "1", "-nn", "-i", iface, bpf],
-            timeout_ms=timeout_ms,
-        )
-    except aiohttp.ClientResponseError as e:
-        if e.status == 504:
-            raise AssertionError(
-                f"no ICMP{'v6' if ip_ver == 6 else ''} type={icmp_type}"
-                + (f" code={icmp_code}" if icmp_code is not None else "")
-                + f" frame captured on {iface} within {timeout_s}s"
-            )
-        raise
-
-    rc = r.get("rc", -1)
-    stdout = r.get("stdout", "") or ""
-    stderr = r.get("stderr", "") or ""
-
-    if rc != 0:
-        raise AssertionError(
-            f"tcpdump on {iface} exited rc={rc}; stderr={stderr.strip()!r}"
-        )
-
-    if not stdout.strip():
-        raise AssertionError(
-            f"tcpdump on {iface} matched filter but produced no output: "
-            f"stderr={stderr!r}"
-        )
-
-    # Pick the first non-header line as the captured frame's summary.
-    summary_lines = [
-        ln for ln in stdout.splitlines()
-        if ln.strip() and not ln.startswith("listening on")
-    ]
-    if not summary_lines:
-        raise AssertionError(
-            f"tcpdump output had no summary line; stdout={stdout!r}"
-        )
-    summary = summary_lines[0]
-
-    if expect_substr is not None and expect_substr not in summary:
-        raise AssertionError(
-            f"tcpdump on {iface} captured an ICMP frame matching the "
-            f"BPF (type={icmp_type}, code={icmp_code}) but the summary "
-            f"didn't contain {expect_substr!r}: {summary!r}"
-        )
-    return summary
-
-
-# ---- 3. fixtures ----------------------------------------------------------
-
-@pytest_asyncio.fixture
-async def dut_egress_mtu(target_agent, aiohttp_session):
-    """Yields a callable `await set(iface, mtu)`. Restores all touched
-    interfaces' MTUs at teardown via addfinalizer-equivalent cleanup, so
-    a SIGKILL between setup and the test body doesn't leave the DUT with
-    a half-applied MTU change.
-
-    Reads the original MTU at first call per interface so multiple
-    set()s on the same iface within one test still restore correctly.
-    """
-    saved: dict[str, int] = {}
-
-    async def _read_mtu(iface: str) -> int:
-        r = await target_agent.exec_cmd(
-            aiohttp_session, ["ip", "-o", "link", "show", iface],
-        )
-        # `ip -o link show <iface>` line contains "mtu 1500".
-        m = re.search(r"\bmtu\s+(\d+)", r.get("stdout", ""))
-        if not m:
-            raise RuntimeError(
-                f"couldn't read MTU of {iface}: rc={r.get('rc')}, "
-                f"out={r.get('stdout', '')[:200]!r}"
-            )
-        return int(m.group(1))
-
-    async def set_mtu(iface: str, mtu: int) -> None:
-        if iface not in saved:
-            saved[iface] = await _read_mtu(iface)
-        r = await target_agent.exec_cmd(
-            aiohttp_session, ["ip", "link", "set", iface, "mtu", str(mtu)],
-        )
-        assert r.get("rc") == 0, (
-            f"ip link set {iface} mtu {mtu} failed: rc={r.get('rc')}, "
-            f"stderr={r.get('stderr', '')!r}"
-        )
-
-    try:
-        yield set_mtu
-    finally:
-        for iface, original in saved.items():
-            try:
-                await target_agent.exec_cmd(
-                    aiohttp_session,
-                    ["ip", "link", "set", iface, "mtu", str(original)],
-                )
-            except Exception as e:
-                warnings.warn(f"failed to restore MTU on {iface}: {e}")
-
-
-# ---- 3. composable topology primitives ----------------------------------
-
-class TopologyStack:
-    """Per-fixture LIFO of teardown callables.
-
-    Pushes happen as each setup step succeeds; the matching `teardown()`
-    walks the stack in reverse so a partial setup tears down only what
-    actually came up. Failures during teardown emit a warning rather
-    than raising — one cleanup failure shouldn't mask the rest.
-    """
-
-    def __init__(self) -> None:
-        self._cleanups: list[Callable[[], Awaitable[None]]] = []
-
-    def push(self, cleanup: Callable[[], Awaitable[None]]) -> None:
-        self._cleanups.append(cleanup)
-
-    async def teardown(self, label: str = "topology") -> None:
-        for c in reversed(self._cleanups):
-            try:
-                await c()
-            except Exception as e:
-                warnings.warn(f"{label} cleanup failed: {e}")
+TopologyStack = CleanupStack
 
 
 async def dut_vlan_subif(
@@ -372,10 +97,11 @@ async def dut_vlan_subif(
     """
     iface = name or f"{parent}.{vid}"
 
-    async def _exec(*argv: str):
-        return await target_agent.exec_cmd(session, list(argv))
+    async def _exec(*argv: str, check=True):
+        result = await target_agent.exec_cmd(session, list(argv))
+        return checked(result) if check else result
 
-    await _exec("ip", "link", "del", iface)  # idempotent
+    await _exec("ip", "link", "del", iface, check=False)  # idempotent
 
     r = await _exec(
         "ip", "link", "add", "link", parent,
@@ -430,7 +156,7 @@ async def lan_vlan_subif(
     assert r.rc == 0, f"LAN vlan add {iface} (vid {vid}): {r.stdout!r}"
 
     async def _cleanup():
-        await lan_run(lan, f"ip link del {iface} 2>/dev/null", 5.0)
+        checked(await lan_run(lan, f"ip link del {iface}", 5.0))
     stack.push(_cleanup)
 
     if ipv4:
@@ -447,9 +173,9 @@ async def lan_vlan_subif(
         # `replace`, not `add`: a leftover route from a crashed prior run
         # (same prefix, stale nexthop) would make `add` fail "File exists"
         # and keep the stale route; replace keeps setup idempotent.
-        await lan_run(lan, f"ip route replace {spec}", 5.0)
+        checked(await lan_run(lan, f"ip route replace {spec}", 5.0))
         async def _del_route(_first=spec.split()[0]):
-            await lan_run(lan, f"ip route del {_first} 2>/dev/null", 5.0)
+            checked(await lan_run(lan, f"ip route del {_first}", 5.0))
         stack.push(_del_route)
 
     return iface
@@ -492,16 +218,39 @@ async def lan_run_python(
     path = f"/tmp/ask_lan_{label}_{os.getpid()}_{int(time.monotonic() * 1e6)}.py"
     b64 = base64.b64encode(script.encode()).decode()
 
-    stage = lan.run(
-        f"echo {b64} | base64 -d > {path} && echo STAGED",
-        timeout=10,
-    )
+    # Off the event loop like the run itself: a console another operation
+    # holds would otherwise stall every task the test has in flight.
+    stage = await lan_run(lan, f"echo {b64} | base64 -d > {path} && echo STAGED", 10)
     if stage.rc != 0 or "STAGED" not in stage.stdout:
         raise AssertionError(
             f"failed to stage Python script on LAN at {path}: "
             f"rc={stage.rc}, stdout={stage.stdout!r}"
         )
-    return await lan_run(lan, f"python3 {path}", timeout)
+    try:
+        return await lan_run(lan, f"python3 {path}", timeout)
+    finally:
+        checked(await lan_run(lan, f"rm -f {path}", 5))
+
+
+async def lan_ipv6_default(stack, lan, gateway, device):
+    """Set a temporary default route and restore iproute2's original snapshot."""
+    snapshot = checked(await lan_run_python(lan, """
+import base64, subprocess
+saved = subprocess.run(["ip", "-6", "route", "save", "default"],
+                       stdout=subprocess.PIPE, check=True, timeout=5).stdout
+print(base64.b64encode(saved).decode())
+""", label="save_ipv6_default"))
+    saved = snapshot.stdout.strip()
+
+    async def restore():
+        cleanup = CleanupStack()
+        cleanup.push(lambda: lan_run(lan, "printf %s " + shlex.quote(saved) +
+                                     " | base64 -d | ip -6 route restore", 5))
+        cleanup.push(lambda: lan_run(lan, f"ip -6 route del default via {gateway} dev {device}", 5))
+        await cleanup.teardown("LAN IPv6 default route")
+
+    stack.push(restore)
+    checked(await lan_run(lan, f"ip -6 route replace default via {gateway} dev {device}", 5))
 
 
 # DUT and LAN IPv6 addresses for the IPv6 tests. Two ULA /64s
@@ -513,7 +262,32 @@ async def lan_run_python(
 DUT_IPV6_LAN  = "fc00:dead::1"
 DUT_IPV6_WAN  = "fc00:beef::1"
 LAN_IPV6      = "fc00:dead::2"
+# The offload tests give the WAN host this address for real bidirectional
+# traffic, so their endpoint answers rather than only provoking an ICMPv6
+# error. VIRT_IPV6 is an unassigned address in the same /64, used as the
+# pre-translation destination of a DNAT flow.
+WAN_IPV6      = os.environ.get("ASK_WAN_IPV6", "fc00:beef::99")
+VIRT_IPV6     = os.environ.get("ASK_VIRT_IPV6", "fc00:beef::dd")
 TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth4")
+
+# A third ULA /64, claimed by test_flowtable_pppoe.py for the addresses a PPPoE
+# session carries inside itself. It is deliberately neither of the two above:
+# the session's endpoints are not on the LAN or the WAN segment, they are on
+# the point-to-point link between the two ppp devices, and giving them an
+# address out of a segment /64 would make a routing mistake look like a
+# working path. The concentrator takes ::1 and the DUT ::2, matching the
+# INNER_LOCAL/INNER_REMOTE convention the IPv4 side of that session uses.
+# ("babe" rather than a spelling like "ppp" because p is not a hex digit and
+# the address would not parse.)
+#
+# Only the session's own /64 is new. Its LAN side reuses DUT_IPV6_LAN and
+# LAN_IPV6 above, which it configures itself rather than through
+# ipv6_topology -- that fixture also addresses the WAN port, which is where
+# the session stands. Sharing those two with test_flowtable_ipv6.py is safe
+# only because pytest runs serially and both tear down in finalizers, the same
+# basis as the VLAN id overlaps recorded above.
+PPPOE_IPV6_LOCAL  = os.environ.get("ASK_PPPOE_INNER_LOCAL6", "fc00:babe::1")
+PPPOE_IPV6_REMOTE = os.environ.get("ASK_PPPOE_INNER_REMOTE6", "fc00:babe::2")
 
 
 @pytest_asyncio.fixture
@@ -534,13 +308,15 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
     next-hop attempt, and 2a/2d/2e tripwire on counter deltas
     irrespective of forward outcome.
     """
-    cleanups: list[Callable[[], Awaitable[None]]] = []
+    cleanup = CleanupStack()
 
-    async def _exec(*argv: str):
-        return await target_agent.exec_cmd(aiohttp_session, list(argv))
+    async def _exec(*argv: str, check=True):
+        result = await target_agent.exec_cmd(aiohttp_session, list(argv))
+        return checked(result) if check else result
 
-    async def _lan(cmd: str, timeout_s: float = 5.0):
-        return await lan_run(lan, cmd, timeout_s)
+    async def _lan(cmd: str, timeout_s: float = 5.0, check=True):
+        result = await lan_run(lan, cmd, timeout_s)
+        return checked(result) if check else result
 
     try:
         # ---- DUT sysctl: enable IPv6 forwarding ----
@@ -550,7 +326,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
 
         async def _restore_all_fwd(v=prev_all_fwd):
             await _exec("sysctl", "-w", f"net.ipv6.conf.all.forwarding={v}")
-        cleanups.append(_restore_all_fwd)
+        cleanup.push(_restore_all_fwd)
 
         r = await _exec("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
         assert r["rc"] == 0, f"enable v6 forwarding: {r}"
@@ -559,7 +335,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         # Idempotent: del before add so a re-run after a botched teardown
         # doesn't trip "already exists".
         await _exec("ip", "-6", "addr", "del",
-                    f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF)
+                    f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF, check=False)
         r = await _exec("ip", "-6", "addr", "add",
                         f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF, "nodad")
         assert r["rc"] == 0, f"DUT {TARGET_LAN_IF} v6 addr: {r}"
@@ -567,10 +343,10 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         async def _del_dut_lan():
             await _exec("ip", "-6", "addr", "del",
                         f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF)
-        cleanups.append(_del_dut_lan)
+        cleanup.push(_del_dut_lan)
 
         await _exec("ip", "-6", "addr", "del",
-                    f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
+                    f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, check=False)
         r = await _exec("ip", "-6", "addr", "add",
                         f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, "nodad")
         assert r["rc"] == 0, f"DUT {TARGET_WAN_IF} v6 addr: {r}"
@@ -578,10 +354,10 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         async def _del_dut_wan():
             await _exec("ip", "-6", "addr", "del",
                         f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
-        cleanups.append(_del_dut_wan)
+        cleanup.push(_del_dut_wan)
 
         # ---- LAN address + default route ----
-        await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null")
+        await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null", check=False)
         # nodad: static ULA on a point-to-point test segment — DAD would
         # leave the address tentative ~1.5 s and the first test flow of
         # the session silently fails to come up.
@@ -590,21 +366,9 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
 
         async def _del_lan_addr():
             await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null")
-        cleanups.append(_del_lan_addr)
+        cleanup.push(_del_lan_addr)
 
-        # `replace`, not `add`: loki may already carry a v6 default route
-        # from the DUT's router advertisements (via a link-local next-hop),
-        # so a plain `add` fails with "File exists". replace is idempotent —
-        # it adds when absent and overwrites any existing default regardless
-        # of its next-hop.
-        r = await _lan(
-            f"ip -6 route replace default via {DUT_IPV6_LAN} dev {LAN_NIC}"
-        )
-        assert r.rc == 0, f"LAN v6 default route: {r.stdout!r}"
-
-        async def _del_lan_route():
-            await _lan(f"ip -6 route del default via {DUT_IPV6_LAN} 2>/dev/null")
-        cleanups.append(_del_lan_route)
+        await lan_ipv6_default(cleanup, lan, DUT_IPV6_LAN, LAN_NIC)
 
         # Populate the LAN's IPv6 neighbor cache for the DUT. Without
         # this, scapy's first send falls back to broadcast L2 MAC
@@ -624,92 +388,4 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
             "lan_v6":     LAN_IPV6,
         }
     finally:
-        for cleanup in reversed(cleanups):
-            try:
-                await cleanup()
-            except Exception as e:
-                warnings.warn(f"ipv6_topology cleanup failed: {e}")
-
-
-@pytest_asyncio.fixture
-async def multi_listener_subifs(aiohttp_session, target_agent, lan):
-    """N=3 VLAN subifs on the DUT's LAN-facing port (TARGET_LAN_IF,
-    eth3 by default) + matching subifs on the LAN VM.
-
-    Yields list of (target_iface, lan_iface, vlan_id) tuples. CMM picks
-    up the target-side NEWLINK netlink events and registers each VLAN
-    in the FMAN onif table — prerequisite for mcast ADD's
-    get_onif_by_name(listener) resolution.
-    """
-    stack = TopologyStack()
-    listeners: list[tuple[str, str, int]] = []
-    try:
-        for vid in VLAN_IDS_MCAST:
-            t = await dut_vlan_subif(
-                stack, target_agent, aiohttp_session,
-                parent=TARGET_LAN_IF, vid=vid,
-            )
-            l = await lan_vlan_subif(
-                stack, lan, parent=LAN_NIC, vid=vid,
-            )
-            listeners.append((t, l, vid))
-
-        # Let CMM/netlink propagate the NEWLINKs.
-        await asyncio.sleep(1.0)
-        yield listeners
-    finally:
-        await stack.teardown("multi_listener_subifs")
-
-
-@pytest_asyncio.fixture
-async def bridge_with_n_ports(aiohttp_session, target_agent):
-    """Linux bridge `br_test_abm` on the DUT with N=2 VLAN-pseudo-port
-    members on TARGET_LAN_IF. Yields (bridge_name, [port_iface, ...]).
-
-    Single-physical-link constraint applies — a stimulus-validity gate
-    must run before this fixture is used to assert anything about
-    BREVENT_PORT_DOWN behaviour.
-    """
-    bridge = "br_test_abm"
-    stack = TopologyStack()
-
-    async def _exec(*argv: str):
-        return await target_agent.exec_cmd(aiohttp_session, list(argv))
-
-    ports: list[str] = []
-    try:
-        await _exec("ip", "link", "del", bridge)  # idempotent
-        r = await _exec("ip", "link", "add", "name", bridge, "type", "bridge")
-        assert r["rc"] == 0, f"bridge add {bridge}: {r}"
-
-        async def _cleanup_bridge():
-            await _exec("ip", "link", "del", bridge)
-        stack.push(_cleanup_bridge)
-
-        r = await _exec("ip", "link", "set", bridge, "up")
-        assert r["rc"] == 0, f"bridge up {bridge}: {r}"
-
-        for vid in VLAN_IDS_BRIDGE:
-            port = await dut_vlan_subif(
-                stack, target_agent, aiohttp_session,
-                parent=TARGET_LAN_IF, vid=vid, master=bridge,
-            )
-            ports.append(port)
-
-        await asyncio.sleep(0.5)
-        yield bridge, ports
-    finally:
-        await stack.teardown("bridge_with_n_ports")
-
-
-# ---- helpers for golden-file paths ----------------------------------------
-
-GOLDEN_DIR = pathlib.Path(__file__).parent / "golden"
-
-
-def golden_for(label_file: str) -> pathlib.Path:
-    """Construct the standard golden path for a test file.
-
-    e.g. golden_for('ipv4_edge_options.json') -> tools/tests/golden/ipv4_edge_options.json
-    """
-    return GOLDEN_DIR / label_file
+        await cleanup.teardown("ipv6_topology")

@@ -1,3 +1,4 @@
+-include .ask-test.mk
 include build/deploy.mk
 
 # ============================================================================
@@ -14,7 +15,7 @@ include build/deploy.mk
 #             server). Usually localhost.
 #    target — the DUT (ls1046a-class gateway) under test.
 #    lan    — LAN-side traffic generator (typically a libvirt VM) behind
-#             the DUT's NAT, reachable from wan via a control-plane NIC.
+#             the DUT's NAT, reached through its serial console.
 #
 #  Workflow (per-run):
 #    1. make ask-image     — build the Yocto test image (kas).
@@ -25,13 +26,12 @@ include build/deploy.mk
 #                              booti ${loadaddr} - ${fdtaddr}
 #                            Board boots into the test image in ~15s;
 #                            askd-agent starts automatically via S70askd-agent.
-#    4. make deploy-agents — rsync askd-agent + orchestrator to wan + lan,
-#                            enable systemd units. Requires agent up on DUT.
-#    5. make ask-test      — run the test suite. Assumes agents are up;
+#    4. make deploy-agents — install the WAN agent and runner dependencies.
+#    5. make test          — run the test suite. Assumes agents are up;
 #                            exits non-zero on failure.
 # ============================================================================
 
-.PHONY: setup ask-image stage-image deploy-agent-wan deploy-agents ask-test help
+.PHONY: setup ask-image stage-image deploy-agent-wan deploy-agents ask-test test test-host test-dut test-startup test-env help
 
 # Install the host tools the kas build needs: kas itself, BitBake's host
 # dependencies, and the en_US.UTF-8 locale BitBake requires. Debian 13
@@ -73,10 +73,8 @@ stage-image:
 	@echo "    matching device tree: mono-gateway-dk.dtb"
 	@echo "    at U-Boot: tftpboot \$${loadaddr} <name>; booti ..."
 
-# Install askd-agent onto the WAN host (local) and the LAN host (SSH over
-# the control-plane bridge). Does not touch the DUT — its copy ships
-# inside the Yocto image. Split into per-node targets so each can be
-# tested in isolation.
+# Install askd-agent onto the local WAN host. The DUT copy ships in the
+# Yocto image; the LAN client is driven over UART.
 
 deploy-agent-wan:
 	@echo "==> deploy-agent: wan (local)"
@@ -87,38 +85,35 @@ deploy-agent-wan:
 	    echo "==> wan: bootstrapping venv"; \
 	    sudo python3 -m venv $(WAN_PREFIX)/venv; \
 	fi
-	sudo $(WAN_PREFIX)/venv/bin/pip install --quiet --upgrade $(ASKD_REQUIREMENTS)
+	sudo $(WAN_PREFIX)/venv/bin/pip install --quiet $(ASKD_REQUIREMENTS)
 	sudo systemctl daemon-reload
 	sudo systemctl enable --now askd-agent.service
 	@echo "==> deploy-agent-wan: done. curl http://127.0.0.1:9110/health to verify."
 
 deploy-agents: deploy-agent-wan
 
-# Run the end-to-end test suite. Does NOT auto-deploy — assumes the DUT
-# is already on the test image; the conftest's autouse reachability
-# fixture fail-fasts the whole run if the agent doesn't respond.
-#
-# sudo is needed because tests drive the LAN VM over the libvirt PTY
-# (/dev/pts/N, owned by libvirt-qemu:tty 0600) and can drive the DUT
-# over /dev/ttyUSB0 (root:plugdev 0660). Running pytest against the
-# source tree (PYTHONPATH=tools) rather than the installed venv means
-# test edits pick up without a redeploy.
-#
-# Pass extra pytest args via ASK_TEST_ARGS, e.g.:
-#   make ask-test ASK_TEST_ARGS='-k iperf --junit-xml=/tmp/out.xml'
-#
-# sudo resets the environment, so ASK_* configuration variables
-# (ASK_WAN_IP, ASK_REGEN_GOLDEN, ...) are re-stated explicitly on the
-# sudo command line — without this they silently fall back to their
-# in-tree defaults.
-# Space-free values only (they're IPs/ifnames/flags) — a value with
-# spaces would word-split on the sudo command line. ASK_TEST_ARGS is
-# pytest arguments, not test configuration, and is passed separately.
-ASK_ENV := $(shell env | grep -E '^ASK_[A-Za-z0-9_]+=[^ ]*$$' | grep -v '^ASK_TEST_ARGS=' | tr '\n' ' ')
-ask-test:
-	sudo $(ASK_ENV) PYTHONPATH=$(CURDIR)/tools $(WAN_PREFIX)/venv/bin/pytest \
-	    -c $(CURDIR)/tools/pyproject.toml \
-	    $(CURDIR)/tools/host_tests $(CURDIR)/tools/tests $(ASK_TEST_ARGS)
+# Keep environment and make-command-line settings identical. The Python
+# adapter forwards arguments through sudo without shell interpolation.
+export $(filter ASK_%,$(.VARIABLES))
+export DUT_IP WAN_IP WAN_AGENT_IP K ARGS
+
+test:
+	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" all
+
+ask-test: test
+
+test-host:
+	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" host
+
+test-dut:
+	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" dut
+
+test-startup:
+	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" startup
+
+test-env:
+	sudo python3 -m venv "$(WAN_PREFIX)/venv"
+	sudo "$(WAN_PREFIX)/venv/bin/pip" install -r "$(CURDIR)/tools/requirements.txt"
 
 # ============================================================================
 #  Help
@@ -128,5 +123,10 @@ help:
 	@echo "make setup         - install host build deps + locale (one-time, sudo)"
 	@echo "make ask-image     - build the Yocto test image via kas"
 	@echo "make stage-image   - copy the built image into the TFTP root"
-	@echo "make deploy-agents - install askd-agent on the WAN (+ LAN) host"
-	@echo "make ask-test      - run the end-to-end pytest suite"
+	@echo "make deploy-agents - install askd-agent on the WAN host"
+	@echo "make test          - host + DUT suite; DUT_IP=... WAN_IP=... K='ipsec or mcast'"
+	@echo "make test-host     - host suite without sudo or hardware; ARGS='-vv'"
+	@echo "make test-dut      - DUT suite; WAN_AGENT_IP overrides the WAN control address"
+	@echo "make test-startup  - dedicated rdinit=/bin/sh startup suite"
+	@echo "make test-env      - install pinned runner dependencies without deploying agents"
+	@echo "make ask-test      - alias for make test; ASK_* settings remain supported"

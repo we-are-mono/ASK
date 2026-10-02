@@ -32,7 +32,6 @@
 #include "cdx.h"
 #include "cdx_common.h"
 #include "fe.h"
-#include "control_pppoe.h"
 #include "control_tunnel.h"
 #include "control_ipv6.h"
 #include "procfs.h"
@@ -43,8 +42,7 @@
 struct oh_port_info {
 	char name[64];
 	uint32_t fm_idx;
-	uint32_t flags; //fqid valid and tdesc valid bits
-	void *td[MAX_MATCH_TABLES];//td for tables attached to this port
+	uint32_t flags; //OF_FQID_VALID, IN_USE, PORT_VALID and the PORT_TYPE_*
 	uint32_t channel;
 	struct oh_iface_info *ohinfo; //iface info from config
 	struct dpa_fq *rx_dpa_fq;
@@ -72,7 +70,6 @@ void cdx_reset_offline_ports(void)
 	memset(offline_port_info, 0, sizeof(offline_port_info));
 }
 
-extern int FM_PORT_SetOhPortOfne(uint32_t fmidx, uint32_t portidx, uint32_t nia_val);
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq);
 
@@ -125,16 +122,19 @@ int get_ofport_info(uint32_t fm_idx, uint32_t handle, uint32_t *channel, void **
 	}
 	info = &offline_port_info[fm_idx][handle];
 	if (info->flags & IN_USE) {
+		void *tables[MAX_MATCH_TABLES] = { NULL };
+		int present = 0;
 		uint32_t ii;
 
 		*channel = info->channel;
-		get_tableInfo_by_portid(fm_idx, info->ohinfo->portid, info->td, &info->flags); 
-		for (ii = 0; ii < MAX_MATCH_TABLES; ii++) {
-			if (info->flags & (1 << ii))
-				*(td + ii) = info->td[ii];
-			else
-				*(td + ii) = NULL;
-		}
+		/* The tables attached to this port now, by type, gathered into a
+		 * mask of their own. Types run up to MAX_MATCH_TABLES, and as bits
+		 * of info->flags they would land on OF_FQID_VALID, IN_USE and the
+		 * port type -- a type 12 table on the IPsec port made it a Wi-Fi
+		 * port as well -- and would outlive the tables they stood for. */
+		get_tableInfo_by_portid(fm_idx, info->ohinfo->portid, tables, &present);
+		for (ii = 0; ii < MAX_MATCH_TABLES; ii++)
+			td[ii] = (present & (1 << ii)) ? tables[ii] : NULL;
 		return 0;
 	}
 	DPA_ERROR("%s::ofport handle %d not in use\n",
@@ -256,8 +256,9 @@ int dpa_add_oh_if(char *name)
 	iface_info->name[IF_NAME_SIZE - 1] = '\0';
 
 	iface_info->if_flags = IF_TYPE_OFPORT;
-	/* OFPORT fixtures have no onif id; use a sentinel that no FCI
-	 * itf_id can equal so by-id lookups can never alias them */
+	/* OFPORT fixtures have no onif id; use a sentinel that no
+	 * logical interface id can equal so by-id lookups can never
+	 * alias them */
 	iface_info->itf_id = ~0U;
 	iface_info->oh_info.channel_id = info.channel_id;
 	iface_info->oh_info.fman_idx = fman_idx;
@@ -296,9 +297,6 @@ int dpa_add_oh_if(char *name)
 				__func__); 
 		goto err_ret;
 	}
-#ifdef DEVOH_DEBUG
-	display_iface_info(iface_info);
-#endif
 	return SUCCESS;
 err_ret:
 	cdx_remove_dir_in_procfs(&iface_info->tx_proc_entry);
@@ -308,12 +306,14 @@ err_ret:
 	return FAILURE;
 }
 
-int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t type,
+/* The FQ range the port's distribution at `index` (0 up to
+ * get_ofport_max_dist()) enqueues to. By position, not by type: a port's
+ * distributions are whatever its policy lists, and a type it lacks used to
+ * leave the caller's range unwritten. */
+int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t index,
 		uint32_t *pfqid, uint32_t *count) 
 {
-	uint32_t ii;
 	struct oh_iface_info *iface_info;
-	struct cdx_dist_info *dist;
 	struct oh_port_info *info;
 
 	if (fm_idx >= MAX_FRAME_MANAGERS) {
@@ -332,109 +332,61 @@ int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t type,
 		return -1;
 	}
 	iface_info = info->ohinfo;	
-	dist = iface_info->dist_info;
-	for (ii = 0; ii < iface_info->max_dist; ii++) {
-		if (dist->type == type) {
-			*pfqid = dist->base_fqid;
-			*count = dist->count;
-		}
-		dist++;
+	if (index >= iface_info->max_dist) {
+		DPA_ERROR("%s::ofport handle %d has no distribution %u\n",
+				__func__, handle, index);
+		return -1;
 	}
+	*pfqid = iface_info->dist_info[index].base_fqid;
+	*count = iface_info->dist_info[index].count;
 	return 0;
 }
 
+/* A frame on an offline port's own default or error queue is one no owner
+ * took; on a port nothing feeds, the Wi-Fi one, it should not happen at all.
+ * Each is reported with its parse result and, for a contiguous frame, its
+ * payload, but no more often than the network rate limit allows: a port that
+ * does start receiving must not turn every frame into a console dump. The
+ * buffer goes back to its pool either way, a scatter-gather frame's table and
+ * segments included. */
+static void ofport_rx_report(const char *handler, const struct qm_fd *fd,
+			     uint32_t fqid)
+{
+	uint8_t *ptr;
+	uint32_t len = fd->length20;
+
+	if (!net_ratelimit())
+		return;
+	pr_err("%s::fqid %x(%d), bpid %d, status %08x, len %d, offset %d, format %s\n",
+	       handler, fqid, fqid, fd->bpid, fd->status, len, fd->offset,
+	       (fd->format == qm_fd_sg) ? "SGlist" : "simple");
+	if (!len)
+		return;
+	ptr = (uint8_t *)phys_to_virt(qm_fd_addr(fd));
+	pr_err("Displaying parse result:\n");
+	display_buff_data(ptr, 0x70);
+	if (fd->format != qm_fd_sg) {
+		pr_err("Displaying the packet:\n");
+		display_buff_data(ptr + fd->offset, len);
+	}
+}
 
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
 {
-
-	const struct qm_fd *fd;
-	uint8_t *ptr;
-	uint32_t len;
-
-	len = dq->fd.length20;
-
-	fd = &dq->fd;
-	printk("%s::fqid %x(%d), bpid %d, len %d, offset %d  addr %llx status: %x\n", __func__,
-			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
-			dq->fd.offset, (uint64_t)dq->fd.addr, dq->fd.status);
-	if(len)
-	{	
-		ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr));
-		printk("Dispalying parse result:\n");
-		display_buff_data(ptr, 0x70);
-		ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr) + dq->fd.offset);
-		printk("Displaying the packet: \n");
-		display_buff_data(ptr, len);
-	}	
-	if (dq->fd.bpid) {
-		if (fd->format != qm_fd_sg) {
-			struct bm_buffer bmb;
-			struct dpa_bp *dpa_bp;
-			dpa_bp = dpa_bpid2pool(fd->bpid);
-			if (dpa_bp) {
-				printk(KERN_CRIT "%s::releasing buffer to pool %d\n", 
-						__func__, fd->bpid);
-				memset(&bmb, 0, sizeof(struct bm_buffer));
-				bm_buffer_set64(&bmb, dq->fd.addr);
-				while (bman_release(dpa_bp->pool, &bmb, 1, 0))
-					cpu_relax();
-			}
-		} else {
-			printk(KERN_CRIT "%s::cannot handle sg buffers now\n", __func__);
-		}
-	}
+	ofport_rx_report(__func__, &dq->fd, dq->fqid);
+	if (dq->fd.bpid)
+		dpa_fd_release(NULL, &dq->fd);
 	return qman_cb_dqrr_consume;
 }
 
 static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq) 
 {
-	const struct qm_fd *fd;
-	struct dpa_bp *dpa_bp;
-	struct bm_buffer bmb;
-	uint8_t *ptr;
-	uint32_t len;
-
-	len = dq->fd.length20;
-	fd = &dq->fd;
-	printk("%s::fqid %x(%d), bpid %d status %08x, len %d(0x%x), format %s\n", __func__,
-			fq->fqid, fq->fqid, fd->bpid, fd->status,len,len,
-			(fd->format == qm_fd_sg) ? "SGlist" : "simple");
-	if(len)	
-	{	
-		ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr));
-		printk("Dispalying parse result:\n");
-		display_buff_data(ptr, 0x70);
-		if (fd->format != qm_fd_sg)
-		{
-			ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr) + dq->fd.offset);
-			printk("Displaying the packet: \n");
-			display_buff_data(ptr, len);
-		}
-		else
-		{
-			printk("have to print data in SG case\n");
-		}
-	}	
-	if (dq->fd.bpid) {
-		if (fd->format != qm_fd_sg) {
-			dpa_bp = dpa_bpid2pool(fd->bpid);
-			if (dpa_bp) {
-				printk(KERN_CRIT "%s::releasing buffer to pool %d\n", 
-						__func__, fd->bpid);
-				memset(&bmb, 0, sizeof(struct bm_buffer));
-				bm_buffer_set64(&bmb, dq->fd.addr);
-				while (bman_release(dpa_bp->pool, &bmb, 1, 0))
-					cpu_relax();
-			}
-		} else {
-			printk(KERN_CRIT "%s::freeing sg buffers now\n", __func__);
-			dpa_fd_release(NULL, fd);
-		}
-	}
+	ofport_rx_report(__func__, &dq->fd, fq->fqid);
+	if (dq->fd.bpid)
+		dpa_fd_release(NULL, &dq->fd);
 	return qman_cb_dqrr_consume;
-
 }
 
 //routine to create all FQs required by distribution in xml file
@@ -519,19 +471,6 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 	} 		
 	offline_port_info[iface_info->fman_idx][iface_info->port_idx].flags |=
 		(OF_FQID_VALID | PORT_VALID);
-	return 0;
-}
-
-int ohport_set_ofne(uint32_t handle, uint32_t nia_val)
-{
-	uint32_t fm_idx;
-	uint32_t port_idx;
-	uint32_t portid;
-
-	if (get_ofport_fman_and_portindex(0, handle, &fm_idx, &port_idx, &portid))
-		return -1;
-	if (FM_PORT_SetOhPortOfne(fm_idx, port_idx, nia_val))
-		return -1;
 	return 0;
 }
 

@@ -68,36 +68,22 @@ typedef struct _tCtEntry {
 
 	/* End of fields used by hardware */
 
-	U32 route_id;
 	PRouteEntry pRtEntry;
 	union ctentry_qosmark qosmark;
 	U16 status;
-	cdx_timer_t last_ct_timer;
 
-	U16 ip_chksm_corr;
-	U16 tcp_udp_chksm_corr;
-
-	PRouteEntry tnl_route;
 	U16 hSAEntry[SA_MAX_OP];
-	
-	U8	rtpqos_slot;
-	U8 fftype;
+	/* What SEC adds to a frame of this entry's, as the flowtable adapter
+	 * worked it out for the direction's outer path; zero takes the
+	 * outbound SA's own, from its install. */
+	U8 sec_expansion;
 
-	U16 socket;
+	U8 fftype;
 
 	struct _tCtEntry *twin;
 	struct hw_ct *ct;       /** pointer to the hardware conntrack */
 
 }CtEntry, *PCtEntry;
-
-
-
-typedef struct _ctPair
-{
-	CtEntry	orig;
-	CtEntry	repl;
-	TIMER_ENTRY timer;
-} CT_PAIR, *PCT_PAIR;
 
 /* Conntrack status */
 #define CONNTRACK_4O6			0x4000
@@ -119,53 +105,68 @@ typedef struct _ctPair
 #define	FFTYPE_IPV4	0x01
 #define FFTYPE_IPV6	0x02
 
-
-static inline U8 GET_PROTOCOL(PCtEntry pCtEntry)
-{
-	return pCtEntry->proto; 
-}
-
-static inline void SET_PROTOCOL(PCtEntry pCtEntry_orig,PCtEntry pCtEntry_rep, U8 Proto)
-{
-	pCtEntry_orig->proto = Proto;
-	pCtEntry_rep->proto  = Proto;
-}
-
-
 #define CT_TWIN(pentry)		(((PCtEntry)(pentry))->twin)
-#define CT_ORIG(pentry)		((((PCtEntry)(pentry))->status & CONNTRACK_ORIG) ? (PCtEntry)(pentry) : ((PCtEntry)(pentry))->twin)
-#define CT_REPLY_BIT(pentry)	(!(((PCtEntry)(pentry))->status & CONNTRACK_ORIG))
 
-#define IS_BIDIR(pEntry_orig, pEntry_repl) (!(pEntry_orig->status & CONNTRACK_FF_DISABLED) &&	\
-						!(pEntry_repl->status & CONNTRACK_FF_DISABLED))
+/* Layer 2 encapsulation supplied by the caller instead of derived from a
+ * registered VLAN interface. The Linux flowtable owner has no such interface:
+ * the kernel hands it a physical redirect plus a tag stack, so the tags come
+ * from the flow. Innermost first, matching dpa_l2hdr_info, which is the
+ * reverse of the order the wire and Netfilter use. Ingress tags are validated
+ * and stripped; egress tags are inserted. */
+struct cdx_l2_encap {
+	U32 num_ingress;
+	U32 num_egress;
+	struct vlan_header ingress[DPA_CLS_HM_MAX_VLANs];
+	struct vlan_header egress[DPA_CLS_HM_MAX_VLANs];
+	/* A PPPoE session on either side, the same way. It sits inside every
+	 * VLAN tag on the wire, which is the order the opcodes are already
+	 * emitted in and needs nothing said here. The classifier validates the
+	 * ingress identity before STRIP_PPPoE_HDR; the egress insert writes it.
+	 * session_id is in host order, which is what the opcode word is built
+	 * from before it is converted whole. */
+	U8 ingress_pppoe;
+	U8 egress_pppoe;
+	U16 ingress_session_id;
+	U8 ingress_session_mac[ETHER_ADDR_LEN];
+	U16 egress_session_id;
+	U8 egress_session_mac[ETHER_ADDR_LEN];
+	/* Where each side counts, as an index into the firmware's statistics
+	 * area. The legacy owner looks these up from a registered interface;
+	 * this one holds its own record and names it here. Zero means the
+	 * session has no record -- never a record at index zero, which belongs
+	 * to someone else and is exactly the aliasing this field replaces. */
+	U8 ingress_stats_index;
+	U8 egress_stats_index;
+	/* The same for each tag, indexed like ingress[] and egress[] -- innermost
+	 * first -- in the plain pool's units. A VLAN device's record counts what
+	 * the strip removed into its receive half and what the insert added into
+	 * its transmit half. Zero is again no record. The opcodes take all of a
+	 * stack's records or none: their list form has no way to skip one tag,
+	 * and naming index zero for it would count into someone else's. */
+	U8 ingress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
+	U8 egress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
+	/* An IP-in-IP tunnel on either side, outside every L2 header. The
+	 * egress side carries the outer header the insert writes, built as
+	 * the legacy tunnel interface builds its own, with the per-packet
+	 * fields left zero. Ingress carries the receiving endpoints and
+	 * protocol for the key, plus the strip's mode and header size. Each names its
+	 * record in the plain statistics pool, or zero for none, exactly as
+	 * a tag does. */
+	struct cdx_tunnel_encap {
+		U8 present;
+		U8 mode;		/* TNL_MODE_6O4 or TNL_MODE_4O6 */
+		U8 header_size;
+		U8 flags;		/* INHERIT_TC, DSCP_COPY */
+		U8 stats_index;
+		U8 header[40];
+	} ingress_tunnel, egress_tunnel;
+};
 
-U32 get_timeout_value(U32 Proto,int sam_flag, int bidir_flag);
-#define GET_TIMEOUT_VALUE(CtEntry,bidir_flag) get_timeout_value(CtEntry->proto,CtEntry->status & (CONNTRACK_4O6 | CONNTRACK_SEC),bidir_flag)
-
-PCT_PAIR ct_alloc(void);
-void ct_free(PCtEntry pEntry_orig);
-void ct_free_unresolved(PCtEntry pEntry_orig);
-void ct_timer_update(PCT_PAIR ppair);
-int ct_add(PCtEntry pEntry_orig, TIMER_HANDLER handler);
-void ct_update(PCtEntry pEntry_orig);
-void ct_remove(PCtEntry pEntry_orig);
-
-int ct_aging_handler(TIMER_ENTRY *timer);
-
-int ipv4_init(void);
-void ipv4_exit(void);
-
-int IPv4_delete_CTpair(PCtEntry ctEntry);
-void IP_deleteCt_from_onif_index(U32 if_index);
-PRouteEntry IP_Check_Route(PCtEntry pCtEntry);
-void IP_delete_CT_route(PCtEntry pCtEntry);
-U64 IP_get_qosconnmark(PCtEntry pOrigEntry, PCtEntry pReplEntry);
-cdx_timer_t ct_get_time_remaining(PCT_PAIR ppair);
-
-int insert_entry_in_classif_table(PCtEntry entry);
+/* Insert a direction's classifier entry. A NULL encap derives the L2 framing
+ * from the registered interfaces alone; a flow that carries tags, a PPPoE
+ * session or a tunnel names them in encap. */
+int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap);
 int delete_entry_from_classif_table(PCtEntry entry);
-
-PCtEntry IPv4_find_ctentry(U32 saddr, U32 daddr, U16 sport, U16 dport, U8 proto);
 
 void display_ctentry(PCtEntry entry);
 void display_route_entry(PRouteEntry entry);

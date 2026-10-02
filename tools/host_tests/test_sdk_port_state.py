@@ -1,12 +1,14 @@
 """Exercise port-state queries and enable errors through native/compat ioctls."""
+
+from ask_orch.process import run_process
 from pathlib import Path
 import os
 import shutil
-import subprocess
 
 import pytest
 
-from test_sdk_port_pcd import ROOT, function
+from _host_ehash_cumulative import (function as definition)
+from _host_sdk_port_pcd import (ROOT, function)
 
 
 @pytest.mark.parametrize("compat", [False, True])
@@ -19,10 +21,20 @@ def test_sdk_port_state(tmp_path, compat):
     if not (sdk / "inc").exists() or not (fmlib / "src/fm_lib.c").exists():
         pytest.fail("build the ASK kernel/fmlib or set their source overrides")
     port = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
+    flib = (sdk / "Peripherals/FM/Port/fman_port.c").read_text()
     wrapper = (sdk / "src/wrapper/lnxwrp_ioctls_fm.c").read_text()
     start = wrapper.index("        case FM_PORT_IOC_DISABLE:")
     end = wrapper.index("        case FM_PORT_IOC_SET_ERRORS_ROUTE:", start)
     production = function(port, "FM_PORT_GetEnabled")
+    # Whether a port has finished stopping, as the registers say; whether it
+    # hands frames to a PCD; and the fence its owner keeps it stopped by,
+    # with the enable that honours it (renamed: the ioctl cases below script
+    # their own).
+    production += (definition(flib, "fman_port_is_stopped") + definition(flib, "fman_port_enable")
+                   + function(port, "FM_PORT_GetStopped") + function(port, "FM_PORT_IsPcdAttached")
+                   + function(port, "FM_PORT_SetFenced")
+                   + function(port, "FM_PORT_Enable").replace(
+                       "t_Error FM_PORT_Enable(", "static t_Error sdk_port_enable(", 1))
     production += "static t_Error port_ioctl(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned cmd, unsigned long arg, bool compat) { t_Error err = E_OK; switch (cmd) {\n"
     production += wrapper[start:end] + "default: return E_INVALID_SELECTION; } }\n"
     (tmp_path / "port_state.inc").write_text(production)
@@ -47,7 +59,7 @@ def test_sdk_port_state(tmp_path, compat):
     for inc in [uapi, uapi / "Peripherals", uapi / "integrations"]:
         command += ["-I", str(inc)]
     binary = tmp_path / "port_state"
-    subprocess.run(command + [str(Path(__file__).with_name("sdk_port_state.c")), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process(command + [str(Path(__file__).with_name("sdk_port_state.c")), "-o", str(binary)], check=True)
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

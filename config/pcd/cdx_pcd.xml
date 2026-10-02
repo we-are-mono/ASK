@@ -50,6 +50,25 @@
   </key>
 </classification>
 
+<!-- Bridged multicast groups, keyed on the frame's own Ethernet pair as well as
+     its (S,G): port id, destination MAC, source MAC, source, group, protocol
+     (1 + 6 + 6 + 4 + 4 + 1 and 1 + 6 + 6 + 16 + 16 + 1). A bridge forwards a
+     frame with the addresses it arrived with, and the listeners can only write
+     back addresses the root matched. One table cannot hold two key layouts, so
+     these are reached from the routed multicast tables' miss, and the routed
+     groups keep their own. -->
+<classification name="cdx_bridged_mcast4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0xff" hashshift="0" keysize="22" aging="no"/>
+  </key>
+</classification>
+
+<classification name="cdx_bridged_mcast6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0xff" hashshift="0" keysize="46" aging="no"/>
+  </key>
+</classification>
+
 <classification name="cdx_ethernet_cc" max="512" masks="yes" shared="true" statistics="byteframe">
   <key>
      <hashtable external="yes" mask="0xff" hashshift="0" keysize="15" aging="yes"/>
@@ -71,6 +90,52 @@
 <classification name="cdx_tuple3udp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
   <key>
      <hashtable external="yes" mask="0xff" hashshift="0" keysize="20" aging="yes"/>
+  </key>
+</classification>
+
+<!-- SEC inserts its SA identity in an internal VLAN. These own offline-port
+     tables keep the original tuple keys; each hit validates the SA VLAN.
+     The catch-all has no entries and sends misses to the receiving SA's CPU
+     queue. Physical ingress keeps the original shared table layouts. -->
+<classification name="cdx_sec_udp4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0x7fff" hashshift="0" keysize="14" aging="yes"/>
+  </key>
+</classification>
+
+<classification name="cdx_sec_tcp4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0x7fff" hashshift="0" keysize="14" aging="yes"/>
+  </key>
+</classification>
+
+<classification name="cdx_sec_udp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0x7fff" hashshift="0" keysize="38" aging="yes"/>
+  </key>
+</classification>
+
+<classification name="cdx_sec_tcp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0x7fff" hashshift="0" keysize="38" aging="yes"/>
+  </key>
+</classification>
+
+<classification name="cdx_sec_esp4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0xff" hashshift="0" keysize="10" aging="yes"/>
+  </key>
+</classification>
+
+<classification name="cdx_sec_esp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0xff" hashshift="0" keysize="22" aging="yes"/>
+  </key>
+</classification>
+
+<classification name="cdx_sec_ethernet_cc" max="512" masks="yes" shared="true" statistics="byteframe">
+  <key>
+     <hashtable external="yes" mask="0xff" hashshift="0" keysize="15" aging="yes"/>
   </key>
 </classification>
 
@@ -166,6 +231,42 @@
   <action type="classification" name="cdx_multicast6_cc"/>
 </distribution>
 
+<!-- Reached only as a routed multicast table's miss: listed after the routed
+     multicast distribution in every policy, which matches the same frames
+     first, the way the 3-tuple UDP distributions sit behind the 5-tuple ones.
+     The key generator orders the extraction by field, Ethernet first. -->
+<distribution name="cdx_bridged_mcast4_dist" shared="true">
+  <protocols>
+    <protocolref name="ipv4"/>
+  </protocols>
+  <key>
+    <fieldref name="ethernet.dst"/>
+    <fieldref name="ethernet.src"/>
+    <fieldref name="ipv4.src"/>
+    <fieldref name="ipv4.dst"/>
+    <fieldref name="ipv4.nextp"/>
+  </key>
+  <queue count="1" base="0x10c0"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_bridged_mcast4_cc"/>
+</distribution>
+
+<distribution name="cdx_bridged_mcast6_dist" shared="true">
+  <protocols>
+    <protocolref name="ipv6"/>
+  </protocols>
+  <key>
+    <fieldref name="ethernet.dst"/>
+    <fieldref name="ethernet.src"/>
+    <fieldref name="ipv6.src"/>
+    <fieldref name="ipv6.dst"/>
+    <fieldref name="ipv6.nexthdr"/>
+  </key>
+  <queue count="1" base="0x10d0"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_bridged_mcast6_cc"/>
+</distribution>
+
 <distribution name="cdx_pppoe_dist" shared="true">
   <protocols>
     <protocolref name="pppoe"/>
@@ -252,6 +353,120 @@
   <action type="classification" name="cdx_tuple3udp6_cc"/>
 </distribution>
 
+<!-- Keep the ordinary tuple extraction; the forwarding action checks the VLAN.
+     The queue bases leave bits 8-11 free for the combined port id. -->
+<distribution name="cdx_sec_esp4_dist" shared="true">
+  <protocols>
+    <protocolref name="ipv4"/>
+    <protocolref name="ipsec_esp"/>
+  </protocols>
+  <key>
+    <fieldref name="ipv4.dst"/>
+    <fieldref name="ipv4.nextp"/>
+    <fieldref name="ipsec_esp.spi"/>
+  </key>
+  <queue count="1" base="0x2000"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_sec_esp4_cc"/>
+</distribution>
+
+<distribution name="cdx_sec_esp6_dist" shared="true">
+  <protocols>
+    <protocolref name="ipv6"/>
+    <protocolref name="ipsec_esp"/>
+  </protocols>
+  <key>
+    <fieldref name="ipv6.dst"/>
+    <fieldref name="ipv6.nexthdr"/>
+    <fieldref name="ipsec_esp.spi"/>
+  </key>
+  <queue count="1" base="0x2010"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_sec_esp6_cc"/>
+</distribution>
+
+<distribution name="cdx_sec_udp4_dist" shared="true">
+  <protocols>
+    <protocolref name="udp"/>
+  </protocols>
+  <key>
+    <fieldref name="ipv4.src" header_index="last"/>
+    <fieldref name="ipv4.dst" header_index="last"/>
+    <fieldref name="ipv4.nextp" header_index="last"/>
+    <fieldref name="udp.sport"/>
+    <fieldref name="udp.dport"/>
+  </key>
+  <queue count="1" base="0x2020"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_sec_udp4_cc"/>
+</distribution>
+
+<distribution name="cdx_sec_tcp4_dist" shared="true">
+  <protocols>
+    <protocolref name="tcp"/>
+  </protocols>
+  <key>
+    <fieldref name="ipv4.src" header_index="last"/>
+    <fieldref name="ipv4.dst" header_index="last"/>
+    <fieldref name="ipv4.nextp" header_index="last"/>
+    <fieldref name="tcp.sport"/>
+    <fieldref name="tcp.dport"/>
+  </key>
+  <queue count="1" base="0x2030"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_sec_tcp4_cc"/>
+</distribution>
+
+<distribution name="cdx_sec_udp6_dist" shared="true">
+  <protocols>
+    <protocolref name="udp"/>
+  </protocols>
+  <key>
+    <fieldref name="ipv6.src" header_index="last"/>
+    <fieldref name="ipv6.dst" header_index="last"/>
+    <fieldref name="ipv6.nexthdr" header_index="last"/>
+    <fieldref name="udp.sport"/>
+    <fieldref name="udp.dport"/>
+  </key>
+  <queue count="1" base="0x2040"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_sec_udp6_cc"/>
+</distribution>
+
+<distribution name="cdx_sec_tcp6_dist" shared="true">
+  <protocols>
+    <protocolref name="tcp"/>
+  </protocols>
+  <key>
+    <fieldref name="ipv6.src" header_index="last"/>
+    <fieldref name="ipv6.dst" header_index="last"/>
+    <fieldref name="ipv6.nexthdr" header_index="last"/>
+    <fieldref name="tcp.sport"/>
+    <fieldref name="tcp.dport"/>
+  </key>
+  <queue count="1" base="0x2050"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_sec_tcp6_cc"/>
+</distribution>
+
+<!-- Every other frame the port sees: decrypted ICMP, fragments, anything no
+     table above can hold. Its table stays empty, and a miss in any of the
+     port's tables ends here, then at the exception policer, as a miss on an
+     Ethernet port ends at cdx_ethernet_dist. -->
+<distribution name="cdx_sec_ethernet_dist" shared="true">
+  <protocols>
+    <protocolref name="ethernet"/>
+  </protocols>
+  <key>
+    <fieldref name="ethernet.dst"/>
+    <fieldref name="ethernet.src"/>
+    <fieldref name="ethernet.type"/>
+  </key>
+  <queue count="1" base="0x2060"/>
+  <combine portid="true" offset="16" mask="0xF"/>
+  <action type="classification" name="cdx_sec_ethernet_cc"/>
+</distribution>
+
 <policy name="cdx_ethport_0_policy">
   <dist_order>
     <distributionref name="cdx_esp4_dist"/>
@@ -262,6 +477,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
@@ -279,6 +496,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
@@ -296,6 +515,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
@@ -313,6 +534,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
@@ -330,6 +553,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
@@ -347,6 +572,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
@@ -364,6 +591,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
@@ -381,6 +610,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
@@ -389,20 +620,22 @@
 </policy>
 
 
+<!-- The IPsec offline port: its own distributions only. The key generator
+     takes the first scheme, by number, whose protocols a frame has, and fmc
+     numbers schemes in the order ports are applied, so every shared scheme is
+     numbered before these and would take this port's frames (a multicast one
+     has only ipv4). A shared distribution added here therefore unbinds the
+     decrypted flows from their SAs, and no port's other policy may name
+     these. -->
 <policy name="cdx_port_of2_policy">
   <dist_order>
-    <distributionref name="cdx_esp4_dist"/>
-    <distributionref name="cdx_esp6_dist"/>
-    <distributionref name="cdx_udp4_dist"/>
-    <distributionref name="cdx_tcp4_dist"/>
-    <distributionref name="cdx_udp6_dist"/>
-    <distributionref name="cdx_tcp6_dist"/>
-    <distributionref name="cdx_ipv4multicast_dist"/>
-    <distributionref name="cdx_ipv6multicast_dist"/>
-    <distributionref name="cdx_tup3udp4_dist"/>
-    <distributionref name="cdx_tup3udp6_dist"/>
-    <distributionref name="cdx_pppoe_dist"/>
-    <distributionref name="cdx_ethernet_dist"/>
+    <distributionref name="cdx_sec_esp4_dist"/>
+    <distributionref name="cdx_sec_esp6_dist"/>
+    <distributionref name="cdx_sec_udp4_dist"/>
+    <distributionref name="cdx_sec_tcp4_dist"/>
+    <distributionref name="cdx_sec_udp6_dist"/>
+    <distributionref name="cdx_sec_tcp6_dist"/>
+    <distributionref name="cdx_sec_ethernet_dist"/>
   </dist_order>
 </policy>
 
@@ -416,6 +649,8 @@
     <distributionref name="cdx_tcp6_dist"/>
     <distributionref name="cdx_ipv4multicast_dist"/>
     <distributionref name="cdx_ipv6multicast_dist"/>
+    <distributionref name="cdx_bridged_mcast4_dist"/>
+    <distributionref name="cdx_bridged_mcast6_dist"/>
     <distributionref name="cdx_tup3udp4_dist"/>
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>

@@ -1,0 +1,45 @@
+From bd6e1d896485e807ad30fe8a194c3d6b153e9278 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 20 Sep 2026 03:59:10 +0200
+Subject: [PATCH 4/4] moal: do not copy every transmitted skb by default
+
+tx_skb_clone defaulted to 1 on every platform, which sets
+EXT_TX_SKB_CLONE and makes woal_start_xmit() take
+skb_realloc_headroom() unconditionally. With enough headroom already
+present that call is pskb_copy(): a new skb and a full copy of the frame,
+then a free of the original, for every packet, on the single TX worker.
+On the 88W9098 that worker is the throughput ceiling, and a profile of a
+wire-to-Wi-Fi transfer showed the copy and the free as the two largest
+items on it.
+
+The predicate the flag bypasses already handles the case it was added
+for -- a cloned skb, or one short of the TxPD headroom, is still copied.
+Default to 0; the parameter remains for platforms that want the copy.
+
+Upstream-Status: Pending
+---
+ mlinux/moal_init.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/mlinux/moal_init.c b/mlinux/moal_init.c
+index 5e1bfb1..e96e067 100644
+--- a/mlinux/moal_init.c
++++ b/mlinux/moal_init.c
+@@ -208,7 +208,13 @@ static int rps = 0x0F;
+  * Default value of 0 keeps edmac disabled by default
+  */
+ static int edmac_ctrl = 0;
+-static int tx_skb_clone = 1;
++/* Off: woal_start_xmit() already copies an skb that is cloned or short of
++ * headroom, which is the case this flag was added for. Set, it forces a
++ * full copy of every transmitted frame (skb_realloc_headroom on an skb with
++ * enough headroom is pskb_copy), which on a single-threaded TX worker is
++ * the largest per-packet cost in the driver.
++ */
++static int tx_skb_clone = 0;
+ 
+ #ifdef IMX_SUPPORT
+ static int pmqos = 1;
+-- 
+2.47.3
+

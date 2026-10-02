@@ -1,28 +1,19 @@
 """Run the SDK's port setup and classification-plan transactions on the host."""
+
+from ask_orch.process import run_process
+
+from _host_sdk_port_pcd import (ROOT, function)
 from pathlib import Path
 import os
 import re
 import shutil
-import subprocess
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def function(source, name):
-    match = re.search(r"^(?:static )?(?:t_Error|t_Handle|void|uint32_t|int) " + name
-                      + r"\([^;]*?\)\s*\{", source, re.M)
-    assert match, name
-    end, depth = match.end(), 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[match.start():end] + "\n"
-
 
 @pytest.mark.parametrize("unit", ["port_pcd", "port_api", "port_ioctl", "port_ioctl_native",
-                                  "port_free", "port_free_legacy", "kg_plan", "reassembly"])
+                                  "port_free", "port_free_legacy", "kg_plan", "reassembly",
+                                  "ehash_create"])
 def test_sdk_port_pcd(tmp_path, unit):
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
@@ -37,6 +28,19 @@ def test_sdk_port_pcd(tmp_path, unit):
         (tmp_path / "linux/compat.h").write_text(
             "#include <stdint.h>\ntypedef uint32_t compat_uptr_t;\n"
             "#define compat_ptr(p) ((void *)(uintptr_t)(p))\n")
+    elif unit == "ehash_create":
+        layout = (sdk / "inc/Peripherals/fm_ehash.h").read_text().split("static inline void display_mcast_member_tbl_entry", 1)[0]
+        (tmp_path / "ehash_layout.h").write_text(layout + "\n#endif\n")
+        ehash = (sdk / "Peripherals/FM/Pcd/fm_ehash.c").read_text()
+        # The bucket count comes from aarch64's 64-bit count of leading zeros,
+        # written as inline assembly; the host has it as a builtin.
+        creation, count = re.subn(r"#ifdef CONFIG_FMAN_ARM\n.*?#endif\n",
+                                  "num_of_zeroes = __builtin_clzll(ii);\n",
+                                  function(ehash, "ExternalHashTableSet"), flags=re.S)
+        assert count == 1
+        production = "".join(function(ehash, name) for name in (
+            "ExternalHashTableAllocCumulativeEntry", "ExternalHashTableCumulativeEntryFree",
+            "FreeEnEhashInfo")) + creation
     elif unit == "reassembly":
         layout = (sdk / "inc/Peripherals/fm_ehash.h").read_text().split("static inline void display_mcast_member_tbl_entry", 1)[0]
         (tmp_path / "ehash_layout.h").write_text(layout + "\n#endif\n")
@@ -91,7 +95,7 @@ def test_sdk_port_pcd(tmp_path, unit):
     if unit == "port_ioctl_native":
         command.append("-DTEST_NO_COMPAT")
     command.extend([str(Path(__file__).with_name(f"sdk_{fixture}.c")), "-o", str(binary)])
-    subprocess.run(command, check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process(command, check=True)
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

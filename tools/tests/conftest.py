@@ -5,36 +5,38 @@ Design notes:
     loop that created it; pytest-asyncio's default test loop is
     function-scoped).
   - The LAN-side UART console is session-scoped. Logging in over serial
-    takes ~0.5s; with ~720 fuzz cases coming up we can't afford to
-    re-login per test. Trade-off: tests share the shell — they must
+    takes ~0.5s, which is not worth paying again for every test.
+    Trade-off: tests share the shell — they must
     leave it at a clean prompt (Console.run() already does).
   - `splat_window` is per-test: opens a dmesg/counters capture on entry,
-    asserts no new KASAN/BUG/UBSAN/lockdep splats on exit. Any test
-    that uses it gets free sanitizer gating.
+    asserts no new KASAN/BUG/UBSAN/lockdep splats on exit, including
+    function fixture setup and teardown.
   - `_target_reachable` is autouse: fail-fast if the target agent is
     down, rather than every test flailing against 5s HTTP timeouts.
 
-Environment variables (all with sensible defaults for the primary dev
-site; override for other deployments):
+Bench settings come from the environment (or Make's ignored .ask-test.mk):
 
-    ASK_TARGET_IP       agent HTTP host (default 10.0.0.62)
-    ASK_TARGET_DEV      target serial device (default /dev/ttyUSB0)
-    ASK_LAN_VM          libvirt domain for LAN UART (default "loki")
+    ASK_TARGET_IP       agent HTTP host
+    ASK_TARGET_DEV      target serial device
+    ASK_LAN_VM          libvirt domain for LAN UART
     ASK_LAN_USER        LAN VM serial login user (default root)
-    ASK_LAN_PASSWORD    LAN VM serial login password (default password)
+    ASK_LAN_PASSWORD    LAN VM serial login password (optional)
     ASK_WAN_IP          WAN-side agent HTTP host (default 127.0.0.1)
-    ASK_WAN_IPERF_IP    iperf3 server on the WAN side (default 10.0.0.141)
+    ASK_WAN_IPERF_IP    iperf3 server on the WAN side
 
 The LAN VM is reached only via libvirt PTY (Console.lan()) — it sits
 behind the DUT's NAT and has no IP path from the orchestrator, by
 design. Tests drive LAN-side work through the UART; parallel-shape
 work uses backgrounded shell processes coordinated via filesystem
-state (see test_mcast_replication.py for the pattern).
+state (see _mcast_helpers.py for the pattern).
 """
 
 from __future__ import annotations
 
 import os
+
+from ask_orch.artifacts import artifact_dir, record
+from ask_orch.capture import capture_window, verify_capture
 
 import aiohttp
 import pytest
@@ -43,12 +45,12 @@ import pytest_asyncio
 from ask_orch import client
 from ask_orch.uart import Console
 
-from _dmesg_allowlist import filter_splats, load_allowlist
-from _topology import TARGET_LAN_IF, TARGET_WAN_IF
+
+from _dmesg_allowlist import load_allowlist
 
 
 LAN_USER     = os.environ.get("ASK_LAN_USER",     "root")
-LAN_PASSWORD = os.environ.get("ASK_LAN_PASSWORD", "password")
+LAN_PASSWORD = os.environ.get("ASK_LAN_PASSWORD", "")
 
 
 # ---- per-test aiohttp ---------------------------------------------------
@@ -61,20 +63,41 @@ LAN_PASSWORD = os.environ.get("ASK_LAN_PASSWORD", "password")
 # each test does.
 @pytest_asyncio.fixture
 async def aiohttp_session():
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
         yield s
 
 
 @pytest.fixture(scope="session")
-def target_agent():
+def target_agent(bench_health):
     return client.TARGET
 
 
 # Loaded once per session. An expired entry raises here, failing the suite
-# at collection rather than letting a stale suppressor mask a regression.
+# before hardware setup rather than letting a stale suppressor mask a regression.
 @pytest.fixture(scope="session")
 def dmesg_allowlist():
     return load_allowlist()
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def bench_health(request, hardware_bench, dmesg_allowlist):
+    """Check firmware, logging and selected release capabilities before mutations."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        health = await client.TARGET.health(session)
+        record("dut", health, nodeid="session")
+        assert health.get("ok") and health.get("capture_protocol") == 2, (
+            "DUT needs the current test agent with reliable kernel capture", health)
+        boot = await client.TARGET.boot_log(session)
+        record("boot-kernel", boot, nodeid="session")
+        verify_capture(boot, "boot", dmesg_allowlist)
+        if request.config.getoption("--release"):
+            required = {"ip", "nft", "conntrack"}
+            for item in request.session.items:
+                for marker in item.iter_markers("requires"):
+                    required.update(marker.args)
+            missing = required - set(health.get("binaries", []))
+            assert not missing, f"release firmware lacks required tools: {sorted(missing)}"
+        return {"health": health, "boot": boot}
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -90,22 +113,23 @@ async def _target_reachable(aiohttp_session, target_agent):
 
 
 @pytest.fixture(scope="session")
-def lan():
+def lan(hardware_bench):
     """Pre-logged-in UART console to the LAN-side traffic-generator VM.
 
     Session-scoped to amortize the login cost across all tests. Tests
     should leave the shell at a clean prompt (the Console.run() path
     already handles that).
     """
-    con = Console.lan()
-    con.login(LAN_USER, LAN_PASSWORD)
-    yield con
-    con.close()
+    with Console.lan(log_path=str(artifact_dir("session") / "lan-uart.log")) as con:
+        con.login(LAN_USER, LAN_PASSWORD)
+        con.send("stty cols 1000 rows 200\r")
+        con.sync_prompt()
+        yield con
 
 
 # ---- per-test ------------------------------------------------------------
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(autouse=True)
 async def splat_window(request, aiohttp_session, target_agent, dmesg_allowlist):
     """Wrap a test in a capture window; fail if new kernel splats appear.
 
@@ -118,13 +142,27 @@ async def splat_window(request, aiohttp_session, target_agent, dmesg_allowlist):
     allowlist (golden/dmesg_allowlist.yaml). Test authors should *not*
     add inline filters here — extend the YAML.
     """
-    cap_id = await target_agent.capture_start(
-        aiohttp_session, ifaces=[TARGET_WAN_IF, TARGET_LAN_IF])
-    yield cap_id
-    result = await target_agent.capture_stop(aiohttp_session, cap_id)
-    raw = result.get("splats", [])
-    splats = filter_splats(raw, request.node.nodeid, dmesg_allowlist)
-    assert not splats, (
-        f"kernel splats during test ({len(splats)}): "
-        + "; ".join(s.strip() for s in splats[:3])
-    )
+    async with capture_window(target_agent, aiohttp_session, request.node.nodeid, dmesg_allowlist) as cap_id:
+        yield cap_id
+
+
+# Shared fixtures are registered here; test modules declare dependencies by name.
+from _flowtable_connections import connections  # noqa: F401
+from _flowtable_ipv6 import hairpin6, ipv6_rig  # noqa: F401
+from _flowtable_pppoe import pppoe_rig  # noqa: F401
+from _flowtable_qos import qos  # noqa: F401
+from _flowtable_rig import rig  # noqa: F401
+from _flowtable_selective_neighbour import selective  # noqa: F401
+from _flowtable_service import service  # noqa: F401
+from _flowtable_service_bridge import bridge_service, bridge_software  # noqa: F401
+from _flowtable_service_ipsec import ipsec_service  # noqa: F401
+from _flowtable_service_multicast import multicast_service  # noqa: F401
+from _flowtable_service_multicast_leave import listener_bridge  # noqa: F401
+from _flowtable_service_vlan import vlan_service  # noqa: F401
+from _flowtable_tcp_snat import tcp_snat  # noqa: F401
+from _flowtable_tunnel import tunnel_rig  # noqa: F401
+from _flowtable_vlan import vlan_rig  # noqa: F401
+from _mcast_e2e import mcast_bridge, mroute_lan_bridge, smcrouted, stream_cpu  # noqa: F401
+from _mcast_helpers import pcap_cleanup_lan  # noqa: F401
+from _mcast_windows import multicast_rig  # noqa: F401
+from _topology import ipv6_topology  # noqa: F401

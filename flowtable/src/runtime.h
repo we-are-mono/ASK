@@ -1,0 +1,116 @@
+/* Runtime side of the offload daemon: backend state, nft I/O, device
+ * enumeration, netlink. SPDX-License-Identifier: GPL-2.0+ */
+#ifndef ASK_FLOWTABLE_RUNTIME_H
+#define ASK_FLOWTABLE_RUNTIME_H
+
+#include "policy.h"
+#include <stdbool.h>
+#include <stdint.h>
+
+#define FT_PROC        "/proc/cdx_flowtable"
+#define FT_CDX_MODULE  "/sys/module/cdx"
+#define FT_MULTICAST   "/sys/module/ask_flowtable/parameters/multicast"
+#define FT_RUNTIME     "/run/ask-flowtable"
+#define FT_LOCK      "/run/ask-flowtable/policy.lock"
+#define FT_PAUSED      "/run/ask-flowtable/paused"
+#define FT_DEFAULT_CONF "/etc/ask/offload.conf"
+#define FT_DAEMON_LOCK  "/run/ask-flowtable/daemon.lock"
+#define FT_SERVICE_LOCK "/run/ask-flowtable/service.lock"
+#define FT_CONTROL_LOCK "/run/ask-flowtable/control.lock"
+#define FT_SERVICE_SOCKET "/run/ask-flowtable/service.sock"
+#define FT_WORKER_PID "/run/ask-flowtable/worker.pid"
+#define FT_SUPERVISOR_PID "/run/ask-flowtable/supervisor.pid"
+
+/* The header of /proc/cdx_flowtable. present=false means the adapter is not
+ * loaded. The DRAIN_FIELDS must all be zero before a rebind. */
+struct ft_backend {
+	bool     present;
+	long     bindings, entries, handle_refs, neighbour_refs, quarantine;
+	long     fatal, observe, invalidated;
+	/* fatal is CDX's latch, which a datapath restart clears; fatal_terminal
+	 * says none will in this boot. An adapter that does not report it is
+	 * one whose every latch was terminal. restarts counts the restarts, and
+	 * resume_failures the ports one could not start again. */
+	long     fatal_terminal, restarts, resume_failures;
+	long     installs, deletes, rearms, errors;   /* observability, for the CLI result */
+	/* Multicast acceleration: the adapter's global switch and what both of
+	 * its learners have in hardware, which only a disable drains. */
+	long     mcast_enabled, mcast_installed, mroute_installed;
+	uint32_t qos_mark_mask;
+};
+
+/* Read-only probe with a five-second deadline, including blocked kernel reads. */
+int ft_health(struct ft_ctx *ctx);
+bool ft_terminal_reason(char *reason, size_t n);
+/* Optional U-Boot budget hooks for the platform watchdog manager. */
+int ft_recovery(struct ft_ctx *ctx, const char *verb);
+
+/* Emit a backend state as a JSON object (no trailing newline) to a buffer. */
+int ft_backend_json(const struct ft_backend *b, char *buf, size_t n);
+
+/* Read the /proc header. Returns 0 (b filled, b->present per availability) or
+ * -1 with ctx->err on a malformed/partial read. */
+int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b);
+
+/* Turn the adapter's multicast acceleration on or off. Multicast follows no
+ * flowtable: the policy's global enable and the stop that overrides it are its
+ * only controls. 0 when done or the adapter is absent, -1 with ctx->err. */
+int ft_backend_multicast(struct ft_ctx *ctx, bool on);
+
+/* What an apply or a drain returns instead of -1 while CDX is restarting the
+ * datapath after a latch: nothing is wrong that waiting will not mend, so the
+ * daemon retries soon rather than backing off. */
+#define FT_RESTARTING (-2)
+
+/* Poll until the DRAIN_FIELDS are zero -- with `multicast`, both learners'
+ * installed groups as well -- or the adapter is gone. 0 on drained, -1 on
+ * timeout or a terminal latch, FT_RESTARTING while CDX restarts the datapath
+ * past the deadline (ctx->err set). */
+int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms, bool multicast);
+
+/* Resolve "devices auto" against the live interface set: up fsl_dpa ports,
+ * sorted. Fills p->devices/ndevices, leaves devices_auto set for status.
+ * Returns the count (>=0). */
+int ft_enumerate(struct ft_policy *p);
+
+/* Internal process boundary: bounded I/O, execution and lease lifetime. */
+int ft_nft_exec(char *const argv[], const char *input, char *out, size_t outlen, int keepfd);
+
+/* nft interactions (shell out to the shipped nft). All return 0/-1 (ctx->err). */
+int ft_nft_run(struct ft_ctx *ctx, const char *script, bool check_only, int keepfd);
+int ft_nft_delete(struct ft_ctx *ctx, int keepfd);  /* delete our table if present */
+/* Inspect our table: present, whether it carries our marker (owned) vs a
+ * foreign table of the same name, the marker hash and, when devices is not
+ * NULL, the devices an owned table's flowtable is bound to. */
+int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65],
+		   struct ft_devices *devices, int keepfd);
+
+/* flock the single-flight lock for the duration of an operation. Returns an fd
+ * (>=0) to close when done, or -1 (ctx->err). */
+int ft_lock(struct ft_ctx *ctx, int timeout_ms);
+int ft_path_lock(struct ft_ctx *ctx, const char *path, int timeout_ms);
+/* Runtime state belongs to the service uid (root in production). Refuse
+ * symlinks, shared files and special files before using any existing state. */
+int ft_runtime_open(const char *path, int flags);
+
+/* Foreground supervisor and serialized init-service lifecycle commands. */
+int ft_supervise(const char *conf, int readyfd);
+int ft_service(struct ft_ctx *ctx, const char *verb, const char *conf);
+void ft_log(int priority, const char *format, ...) __attribute__((format(printf, 2, 3)));
+
+/* Whether CDX is loaded. Without it there is no ASK hardware to own and the
+ * daemon idles. The adapter on top of it may come and go; the controller
+ * retries until it is back rather than giving up. */
+bool ft_cdx_present(void);
+
+/* Load policy: parse the conf file, or, when absent, the built-in default
+ * (enabled, devices auto, ALG excludes). Returns 0/-1 (ctx->err). */
+int ft_load_policy(struct ft_ctx *ctx, const char *path, struct ft_policy *p);
+
+/* Apply / stop, mirroring the retired Python CLI. When emit is set, print the
+ * JSON result (enabled, policy_hash, drained{}, backend{}) to stdout, which the
+ * test harness consumes. Return 0/-1. */
+int ft_apply(struct ft_ctx *ctx, struct ft_policy *p, bool emit);
+int ft_stop(struct ft_ctx *ctx, bool emit);
+
+#endif

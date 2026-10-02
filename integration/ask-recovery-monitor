@@ -1,0 +1,35 @@
+#!/bin/sh
+# The service manager owns the watchdog. This process only reports ASK health.
+set -eu
+platform=$1
+read -r uptime rest < /proc/uptime
+started=${uptime%%.*}
+cleared=0
+
+while ask-flowtable health; do
+	case "$platform" in
+		systemd) systemd-notify --ready WATCHDOG=1 ;;
+		openwrt) ubus -t 5 call service watchdog \
+			'{"name":"ask-recovery","instance":"monitor","timeout":15}' >/dev/null ;;
+		*) exit 2 ;;
+	esac
+	read -r uptime rest < /proc/uptime
+	if [ "$cleared" = 0 ] && [ "$((${uptime%%.*} - started))" -ge 3600 ]; then
+		# One attempt to clear after an hour of successful probes. A write
+		# failure leaves the conservative boot budget in place for repair.
+		ask-flowtable recovery-clear || logger -t ask-recovery 'could not clear boot budget'
+		cleared=1
+	fi
+	sleep 5
+done
+
+if [ "$platform" = openwrt ]; then
+	# Persist what can be read without RTNL; a stuck flash operation must not
+	# postpone the reset. procd closes without magic-close, so hardware expires.
+	ask-flowtable recovery-failed &
+	ubus -t 5 call system watchdog '{"magicclose":false,"stop":true}' || reboot -f
+	logger -t ask-recovery 'ASK failed; waiting for hardware watchdog reset'
+	while :; do sleep 60; done
+fi
+# systemd's OnFailure unit records the reason and requests the reboot.
+exit 1

@@ -6,9 +6,15 @@
 	#address-cells = <1>;
 	#size-cells = <1>;
 
-	i2c: i2c {
-		#address-cells = <1>;
-		#size-cells = <0>;
+	gpio: gpio {
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+
+	/* A controller no chip ever registers for: its consumers defer. */
+	gpio_absent: gpio-absent {
+		gpio-controller;
+		#gpio-cells = <2>;
 	};
 
 	mdio {
@@ -20,8 +26,18 @@
 		};
 	};
 
+	/* Active-low, as the board declares its cages. */
 	sfp: sfp {
-		i2c-bus = <&i2c>;
+		mod-def0-gpios = <&gpio 0 1>;
+	};
+
+	sfp_nogpio: sfp-nogpio {
+		mod-def0-gpios = <&gpio_absent 0 1>;
+	};
+
+	/* A cage whose MOD_DEF0 its sfp stand-in requests and releases. */
+	sfp_1g: sfp-1g {
+		mod-def0-gpios = <&gpio 1 1>;
 	};
 
 	mac: mac {
@@ -32,22 +48,64 @@
 		pcs-handle-names = "xfi";
 	};
 
+	mac2: mac2 {
+		compatible = "fsl,fman-memac";
+		sfp = <&sfp_nogpio>;
+		phy-connection-type = "xgmii";
+		pcs-handle = <&pcs>;
+		pcs-handle-names = "xfi";
+	};
+
+	/*
+	 * A 10G MAC whose lane the RCW runs at 1G: U-Boot switches it to
+	 * 1000base-x, and the base dtsi points "sgmii" and "xfi" at one PCS.
+	 */
+	mac_1g: mac-1g {
+		compatible = "fsl,fman-memac";
+		sfp = <&sfp_1g>;
+		phy-connection-type = "1000base-x";
+		pcs-handle = <&pcs>, <&pcs>;
+		pcs-handle-names = "sgmii", "xfi";
+	};
+
 	dpaa {
 		fsl,fman-mac = <&mac>;
+	};
+
+	dpaa-1g {
+		fsl,fman-mac = <&mac_1g>;
 	};
 
 	link: link-led {};
 	activity: activity-led {};
 	late: late-led {};
 
+	/* Registered by a provider that frees them on unbind, as gpio-leds does. */
+	leds {
+		link_1g: link {};
+		activity_1g: activity {};
+	};
+
 	controller {
 		port0 {
+			compatible = "mono,sfp-led-port";
 			sfp = <&sfp>;
 			leds = <&link>, <&activity>;
 		};
 		port1 {
+			compatible = "mono,sfp-led-port";
 			sfp = <&sfp>;
 			leds = <&link>, <&late>;
+		};
+		port2 {
+			compatible = "mono,sfp-led-port";
+			sfp = <&sfp_nogpio>;
+			leds = <&link>, <&activity>;
+		};
+		port3 {
+			compatible = "mono,sfp-led-port";
+			sfp = <&sfp_1g>;
+			leds = <&link_1g>, <&activity_1g>;
 		};
 	};
 };

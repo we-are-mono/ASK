@@ -111,7 +111,7 @@ def build(tmp_path):
 
     binary = tmp_path / "cdx_pcd_build"
     command = [os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
-               "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+               "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie",
                "-Werror=implicit-function-declaration",
                # error_ext.h names the errno constants but reaches them through
                # core_ext.h, which the fixture suppresses for <linux/smp.h>.
@@ -129,7 +129,7 @@ def build(tmp_path):
 
 def parse(dump):
     """Turn the harness dump into the same shape as the golden."""
-    got = {"tables": [], "schemes": [], "units": [], "setpcd": []}
+    got = {"tables": [], "schemes": [], "environments": [], "setpcd": []}
     scheme = None
     for line in dump.splitlines():
         if m := re.match(r"calls netenv=(\d+) prs=(\d+) adv=(\d+) "
@@ -140,20 +140,22 @@ def parse(dump):
             got["counts"] = [int(v) for v in m.groups()]
         elif m := re.match(r"softparse base=(\d+) size=(\d+) labels=(\d+)", line):
             got["softparse"] = [int(v) for v in m.groups()]
+        elif line.startswith("netenv "):
+            got["environments"].append([])
         elif m := re.match(r"  unit \d+ (\w+)", line):
-            got["units"].append(m.group(1))
+            got["environments"][-1].append(m.group(1))
         elif m := re.match(r"table \d+ keys=(\d+) stats=(\d+) keysize=(\d+) "
                            r"mask=(\d+) shift=(\d+) type=(\d+)", line):
-            keys, stats, keysize, mask, shift, _ = (int(v) for v in m.groups())
+            keys, stats, keysize, mask, shift, kind = (int(v) for v in m.groups())
             got["tables"].append({"max_keys": keys, "statistics_mode": stats,
                                   "key_size": keysize, "hash_res_mask": mask,
-                                  "hash_shift": shift})
+                                  "hash_shift": shift, "type": kind})
         elif m := re.match(r"scheme \d+ relid=(\d+) grp=(\d+) fqid=(\d+) nfq=(\d+) "
                            r"shared=(\d+) units=(\d+) extracts=(\d+)", line):
             relid, grp, fqid, nfq, shared, _, _ = (int(v) for v in m.groups())
             scheme = {"relid": relid, "grp": grp, "base_fqid": fqid,
                       "num_fqids": nfq, "shared": shared,
-                      "units": [], "extracts": []}
+                      "units": [], "extracts": [], "generic": []}
             got["schemes"].append(scheme)
         elif m := re.match(r"    unit (\d+)", line):
             scheme["units"].append(int(m.group(1)))
@@ -161,6 +163,14 @@ def parse(dump):
             scheme["extracts"].append({"hdr": m.group(1), "index": int(m.group(2)),
                                        "field": int(m.group(3)),
                                        "fulltype": int(m.group(4))})
+        elif m := re.match(r"    generic (\w+) offset=(\d+) size=(\d+)", line):
+            scheme["generic"].append([m[1], int(m[2]), int(m[3])])
+        elif m := re.match(r"    defaults n=(\d+) type=(\d+) select=(\d+) value=(\d+)", line):
+            scheme["defaults"] = list(map(int, m.groups()))
+        elif m := re.match(r"    (environment|root) (\d+)", line):
+            scheme[m[1]] = int(m[2])
+        elif m := re.match(r"    bound (\d+)", line):
+            got["setpcd"][-1].setdefault("bound", []).append(int(m[1]))
         elif m := re.match(r"    or type=(\d+) mask=(\d+) bitoffset=(\d+) n=(\d+)", line):
             scheme["or"] = [int(v) for v in m.groups()]
         elif m := re.match(r"tree \d+ groups=(\d+) own_tables_in_group_order=(\d+)", line):
@@ -180,60 +190,43 @@ def test_cdx_pcd_build(tmp_path):
     got = parse(build(tmp_path))
 
     ports = want["counts"]["port_count"]
-    groups = len(want["tables"])
+    assert got["once"] == [2, 1, 1, 1, 1]
+    assert got["counts"] == [want["counts"]["htnode_count"],
+                              want["counts"]["scheme_count"], ports, ports, ports]
+    environments = []
+    for port in want["ports"]:
+        if port["units"] not in environments:
+            environments.append(port["units"])
+    assert got["environments"] == environments
+    assert got["trees"] == [[len(p["ccroot"]), 1] for p in want["ports"]]
+    for actual, expected in zip(got["tables"], want["tables"], strict=True):
+        for key in ("max_keys", "statistics_mode", "key_size", "hash_res_mask", "hash_shift"):
+            assert actual[key] == expected[key], (expected["name"], key)
 
-    # One soft parser, one net env, one advanced-offload selection per FMan.
-    assert got["once"] == [1, 1, 1, 1, 1], got["once"]
-    assert got["counts"] == [ports * groups, groups, ports, ports, ports]
-    assert got["counts"][0] == want["counts"]["htnode_count"]
-    assert got["counts"][1] == want["counts"]["scheme_count"]
+    # Creation order is match priority. Check each scheme's full and generic
+    # extraction, including the zero defaults that isolate tunnel/PPPoE keys.
+    for priority, idx in enumerate(want["scheme_priority"]):
+        expected = want["schemes"][idx]
+        actual = got["schemes"][priority]
+        assert actual["relid"] == priority
+        assert actual["grp"] == expected["group"]
+        for key in ("base_fqid", "num_fqids", "shared", "units"):
+            assert actual[key] == expected[key], (expected["name"], key)
+        for a, b in zip(actual["extracts"], expected["extracts"], strict=True):
+            assert a["hdr"] == b["hdr"], expected["name"]
+            assert INDEX_NAMES[a["index"]] == b["index"], expected["name"]
+            assert a["field"] == fields[b["field"]], (expected["name"], b["field"])
+        assert actual["generic"] == expected.get("generic", []), expected["name"]
+        if actual["generic"]:
+            assert actual["defaults"][0] == 1 and actual["defaults"][3] == 0
+        assert actual["or"][1:] == [15, 16, 1]
+        owner = next(i for i, p in enumerate(want["ports"]) if idx in p["schemes"])
+        assert actual["root"] == owner
+        assert actual["environment"] == environments.index(want["ports"][owner]["units"])
 
-    assert got["units"] == want["units"]
-
-    # Every port's CC root tree holds that port's own twelve tables, in group
-    # order -- what a scheme's grpId indexes and what cdx_sp.xml offsets past.
-    # The golden records the same as contiguous per-port ccroot runs.
-    assert got["trees"] == [[groups, 1]] * ports, got["trees"]
-    for i, port in enumerate(want["ports"]):
-        assert port["ccroot"] == list(range(i * groups, (i + 1) * groups)), i
-
-    # Tables: every port repeats the same twelve shapes, so compare the first
-    # twelve against the golden and assert the rest are identical to them.
-    for i, table in enumerate(want["tables"]):
-        for key in ("max_keys", "statistics_mode", "key_size", "hash_res_mask",
-                    "hash_shift"):
-            assert got["tables"][i][key] == table[key], (i, key, table["name"])
-
-    # Schemes come out in group order; the golden is keyed the same way.
-    for grp, scheme in enumerate(want["schemes"]):
-        mine = got["schemes"][grp]
-        assert mine["grp"] == grp
-        assert mine["base_fqid"] == scheme["base_fqid"], scheme["name"]
-        assert mine["num_fqids"] == scheme["num_fqids"], scheme["name"]
-        assert mine["shared"] == scheme["shared"], scheme["name"]
-        assert mine["units"] == scheme["units"], scheme["name"]
-        assert len(mine["extracts"]) == len(scheme["extracts"]), scheme["name"]
-        for a, b in zip(mine["extracts"], scheme["extracts"]):
-            assert a["hdr"] == b["hdr"], scheme["name"]
-            assert INDEX_NAMES[a["index"]] == b["index"], (scheme["name"], b)
-            # The field constant is what actually selects the bytes hashed, so
-            # compare the value the builder programmed against the value the
-            # name in fmc's model resolves to.
-            assert a["field"] == fields[b["field"]], (scheme["name"], b["field"])
-        # The port id is OR'd into FQID bits 16-19 on every scheme.
-        assert mine["or"][1:] == [15, 16, 1], scheme["name"]
-
-    # The relative scheme id is the KeyGen's match priority, and fmc set it from
-    # the policy dist_order -- the reverse of group order. Getting this backwards
-    # would let the catch-all L2 scheme outrank every specific one.
-    priority = [s["grp"] for s in sorted(got["schemes"], key=lambda s: s["relid"])]
-    assert priority == want["scheme_priority"], priority
-
-    # Each port is programmed with its own logical port id, which is what
-    # cdx_sp.xml reads as $logicalportid.
-    expected_ids = [p["prs_private_info"] for p in want["ports"]]
-    assert [p["prs_private"] for p in got["setpcd"]] == expected_ids
-    for entry in got["setpcd"]:
-        assert entry["first"] == "HEADER_TYPE_ETH"
-        assert entry["schemes"] == groups
-        assert entry["addl"] == len(want["units"])
+    for actual, port in zip(got["setpcd"], want["ports"], strict=True):
+        assert actual["prs_private"] == port["prs_private_info"]
+        assert actual["first"] == "HEADER_TYPE_ETH"
+        assert actual["addl"] == port["parser_labels"]
+        assert actual["schemes"] == len(port["schemes"])
+        assert actual["bound"] == [want["scheme_priority"].index(s) for s in port["schemes"]]

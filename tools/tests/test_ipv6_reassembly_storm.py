@@ -17,10 +17,7 @@ import textwrap
 
 import pytest
 
-from _topology import (
-    ipv6_topology,  # noqa: F401  (fixture)
-    lan_run_python,
-)
+from _topology import (lan_run_python)
 
 
 # Same filter set as the IPv4 storm — reassembly is IPv4/IPv6-shared.

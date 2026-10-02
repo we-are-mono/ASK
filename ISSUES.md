@@ -152,95 +152,89 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A138 — every classifier install leaks ~930k allocations, one per hash
-  bucket, and nothing can reclaim them.** Under `USE_ENHANCED_EHASH` — ASK's
-  build mode — `FM_PCD_HashTableSet()` unconditionally routes to
-  `ExternalHashTableSet()`, but the matching delete was never written:
+- [x] **A289 — one accepted multicast packet authorized other, forbidden UDP ports.** Fixed: a
+  confirmed routed group is carried only if `nft_port_dependent()` (patch 148) finds every packet treated alike, else `refused-ports` (_:/^cdx: keep a routed multicast group the ruleset tells apart by port_).
 
-  ```c
-  /* sdk_fman/Peripherals/FM/Pcd/fm_cc.c, FM_PCD_HashTableDelete() */
-  #else
-          return -1; /* delete table code not added for USE_ENHANCED_EHASH */
-  #endif
-  ```
+- [x] **A290 — routed multicast did not follow XFRM policy.** Fixed: an IPv4 group whose copy an
+  output policy governs is `refused-xfrm`, re-asked on every policy change; ip6mr and bridges apply none (_:/^cdx: keep a routed multicast group an XFRM policy governs_).
 
-  `lnxwrp_exp_sym.h` also drops the `EXPORT_SYMBOL` inside
-  `#ifndef USE_ENHANCED_EHASH`, so modules cannot link against even the stub.
-  Inherited, not introduced: `fmc_clean()` reached the same stub through the
-  ioctl shim, which is why `dpa_app` printed *"FMC rollback failed; reboot
-  before retrying"*.
+- [x] **A291 — FMan enqueues QMan rejects were thought to leak buffers.** Not a bug: FMan portals
+  run ED=1, so QMan discards and frees them itself; 1e6 discards left every pool at its count (_:/^cdx: drop a bridged multicast stream nobody wants_).
 
-  **Measured on the rig (2026-09-15).** The cost is not 84 tables, it is the
-  per-bucket spinlocks — `fm_ehash.c:806` allocates one `XX_InitSpinlock()` for
-  every bucket of every table:
+- [x] **A292 — a discarding multicast entry had no bound.** Fixed: a replicating add that finds no group id evicts the
+  discard of its family that counted the fewest frames and retries at once; discards never displace each other (_:/^cdx: give a bridged discard's group id to a stream somebody wants_).
 
-  ```
-  4 tables/port @ 32768 buckets (tcp4 tcp6 udp4 udp6) = 131,072
-  7 tables/port @   256 buckets                       =   1,792
-  1 table /port @    16 buckets (pppoe)               =      16
-                                per port = 132,880  x 7 ports = 930,160
-  ```
+- [ ] **A293 — patch 161 needs a to-host reason on the next kernel rebase.** Upstream
+  `a496d2f0fd61` (after 6.12; in 6.18) hands every multicast frame up to the host when the
+  bridge has `IFF_ALLMULTI`, which ipmr sets on each VIF device. `br_multicast_list_ports()`
+  models 6.12.103, which does not; rebased as is it would report `BR_MCAST_SNOOPED` alone for
+  such a bridge and the bridged learner would discard frames ipmr routes. Fix at rebase: a
+  `BR_MCAST_TO_HOST_*` reason for `IFF_ALLMULTI` in patch 161. Regression: a VIF on the bridge,
+  last bridged listener gone, require the routed copy still delivered.
 
-  kmemleak reports `929,571 new suspected memory leaks` per failed install —
-  within 0.1% of that. Each cycle adds ~6s to a kmemleak scan (5s baseline,
-  linear, no object-pool exhaustion through ~4.6M objects).
+- [x] **A294 — a port-selective iptables-legacy rule or tc filter was bypassed by a routed multicast group.** Fixed:
+  `nf_xt_port_dependent()` (patch 148) walks x_tables (`refused-xtables`); software tc on the parent's or an oif's stack is `refused-tc` (_:/^cdx: keep a routed multicast group legacy iptables or tc tells apart in software_).
 
-  **Corrections to the original filing, both established by experiment:**
-  - *Reinstalling works.* After five failed installs a plain `modprobe cdx`
-    still reports `classifier installed on 7 ports, 84 tables` and completes.
-    This is a leak, not a wedge; the reboot reclaims memory, it is not needed to
-    retry. `cdx_pcd_teardown()`'s message was corrected to match.
-  - *MURAM is not leaked.* `fm_muram_free_size` returns to baseline after every
-    rollback — the leak is the DDR-side bucket allocations.
+- [x] **A295 — memory pressure could make a classifier delete terminal.** Fixed: a delete that rebuilds a crowded
+  bucket's node takes it outside the lock, from the allocator or a per-table spare every unreachable node refills (_:/^fm_ehash: back a classifier delete's node_).
 
-  **Scope is smaller than it looks: most of the teardown already exists.**
-  `Delete_EnEhashInfo()` (`fm_ehash.c:594`) already walks and frees every bucket
-  spinlock, the handle array and the info struct; it is called today only from
-  `ExternalHashTableSet()`'s init-failure path. What is missing:
+- [x] **A296 — a terminal latch should restart the datapath, not demand a reboot.** Fixed: with every classifier port
+  stopped and idle, CDX settles each possibly linked key, frees what it held and restarts the ports; terminal only when unprovable (_:/^cdx: restart the datapath after an unproven delete_).
 
-  1. `XX_FreeSmart(info->table_base)` — the DDR table. `Delete_EnEhashInfo()`
-     does not free it, so today's init-failure path leaks it too.
-  2. A public `ExternalHashTableDelete()`. `fm_cc.c:8539` already calls one in
-     the non-enhanced branch, so the call site and signature exist.
-  3. Wire `FM_PCD_HashTableDelete()` to it, replacing `return -1`.
-  4. Move the `EXPORT_SYMBOL` out of the `#ifndef USE_ENHANCED_EHASH` block.
+- [x] **A297 — interleaved unwanted streams woke the bridged learner on every frame.** Fixed: 64×4 seeded dedup slots,
+  one given up only an interval after it was taken; 32 interleaved streams cost 32 passes, not 1280 (_:/^cdx: bound the bridged learner's wakeups and respect port filters_).
 
-  Open questions to settle before writing it: whether the delete walks and
-  releases live key entries or requires an emptied table (after a failed install
-  `htentry_count` is 0, but a normal unload may hold entries); freeing the MURAM
-  AD (`info->h_Ad`); and removing the node from the lazy registry the ASK patch
-  adds, or the next lookup finds freed memory.
+- [x] **A298 — tc, XDP or a netdev chain on a bridge port was bypassed by a bridged multicast flow.** Fixed: tc on a flow's
+  ports is `refused-tc`; its netdev chains go to patch 148's bridged probe, `refused-filter` (_:/^cdx: bound the bridged learner's wakeups and respect port filters_).
 
-  Needs KASAN and a rig sweep — it is a free path over hardware-visible memory.
-  Do it on its own branch: it is SDK code in patch 010 and wants its own
-  validation cycle.
+- [x] **A299 — a restart that never completed never went terminal.** Fixed: a port not idle or a barrier rejected is retried
+  every 250 ms, and twelve unanswered tries in a restart (seconds) make the latch terminal; RTNL and the hold never count (_:/^cdx: give up a restart the hardware stops answering_).
 
-- [ ] **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
-  local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
-  → ____cmmCtRegister`) reaches `__cmm_ct_get_SA`, which on an SPI-mismatch
-  rekey `list_del`s (and may head-`list_add` onto another SA) the
-  `list_by_sa` node the outer walk saved as `next` — so the next
-  `container_of` walks a moved/foreign node. **Investigated (2026-08-20):
-  no safe localized fix.** ct *objects* are pointer-stable (the reprogram
-  path never frees a ctTable — only the deregister path does), so this is
-  list-node movement, not UAF. The current node is already `list_del`'d
-  before the reprogram; the hazard is the saved-next. Exposed walks:
-  `cmmUpdateFlows` and `cmmUpdateCtEntriesInFlowNoSAList` (both hold a
-  saved-next across the reprogram); `cmmUpdateFlowsWithNewSAInfo`'s own loop
-  is safe (touches no list) but funnels into `cmmUpdateFlows`. "Re-fetch
-  next from the head" fails: `list_add` is head-insert, so a ct re-added by
-  the recursion is re-read — terminates for the three `SA_DELETE` paths
-  (the `SA_DELETE` gate refuses re-link) but infinite-loops the two
-  non-delete cases (flow_no_sa re-add, rekey-to-old-SA). A snapshot needs
-  per-node re-validation that it still references this SA/direction plus a
-  dynamically-sized copy of an unbounded list. Fix shape (design): a
-  per-pass generation/visited marker on `ctTable`, or a walk-in-progress
-  guard that stops the A76 recursion from re-entering a list being walked —
-  new struct field, deliberate change. **Decision (2026-09-01): keep open and
-  documented, do not fix** — a rare, non-UAF mis-iteration behind a contrived
-  trigger does not justify a deliberate hot-path change with its own regression
-  risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
-  only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
+- [x] **A300.** Bounded terminal/RTNL health checks and a three-boot U-Boot budget; OS watchdog configurations live in `integration/`.
+  DUT: terminal failure, RTNL hard lock and stopped feeder reset cleanly; fourth attempt refused (_:/^flowtable: integrate datapath recovery with platform watchdogs_).
+
+- [x] **A301.** Keep local multicast copies in Linux; routed forwarding remains eligible. 50 host tests pass.
+  (_:/^cdx: keep local multicast delivery in software_).
+
+- [x] **A302.** Preserve NPT in software and hardware flowtables; 12 NPT and four IPv6 DUT cases pass.
+  (_:/^flowtable: preserve IPv6 prefix translation in both directions_).
+
+- [x] **A303.** Software-SA updates already release temporary hardware SAs in the pinned kernel; DUT regression verifies cleanup and reuse.
+  (_:/^tests: verify offload cleanup when updating a software SA_).
+
+- [x] **A304.** Ignore switchdev events outside init_net; host tests and DUT bridge churn preserve both hardware directions.
+  (_:/^cdx: ignore switchdev events from foreign network namespaces_).
+
+- [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
+  16,384 connections. **Investigated (2026-09-15), deferred at user request:**
+  outside the CMM-retirement work; no fix or tuning retained. On the KASAN
+  image for `507c404`, restart 8,192 TCP and 8,192 UDP connections together
+  after a route-MTU change retires their flow entries. With CMM off throughout,
+  hardware flow offload lost 5,953 of 197,970 UDP exchanges (3.01%); the
+  software-only Linux flowtable control lost 8,739 of 206,479 (4.23%), with
+  zero hardware flow entries installed. TCP records arrived intact and the
+  WAN UDP receiver reported no socket drops. Hardware occupancy recovered to
+  all 32,768 directions in 16.6 seconds. This establishes that the loss does
+  not require hardware-flow admission; a legacy-CMM comparison was not run.
+  Follow-up measurements found FMan RX buffer-exhaustion and filter counters
+  increasing without MAC errors. The existing Ethernet miss policer is active
+  at 195,312 packets/s with a 64-packet burst (`dpa_app/dpa.c`,
+  `cdx/cdx_qos.c`); receive-buffer exhaustion has its own
+  `port_rx_out_of_buffers_discard` counter and can occur with
+  `port_discard_frame` and Linux drop traces nearly silent. These observations
+  identify slow-path constraints, but their individual contributions to the
+  UDP loss were not isolated. RPS across four CPUs and serializing the flow
+  admission workqueue did not resolve it; both settings were restored.
+  The accepted paced-capacity result remains recorded in
+  [capacity validation](docs/flowtable/capacity.md). If revisited, measure RX
+  buffer and miss-policer drops separately before changing either mechanism.
+  Captures, image identity and diagnostic scripts:
+  `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
+
+- [x] **A276 — the data plane wedged twice under a flooded ESP SA.** An HC command
+  timed out ("board reset required") because 11aa150's per-SA offline-port classification
+  stranded an OH microcode task on a miss, starving the shared TNUM pool HC depends on
+  FM-wide — fixed by reverting it (_:/^cdx: revert per-SA offline-port classification_).
 
 ## Feature enablement (not bugs)
 
@@ -250,20 +244,12 @@ Each path either never executes in this deployment or fails cleanly if invoked
 the product decides to enable that feature. The enabling recipe is kept with
 each so the open bug list stays honest.
 
-- [ ] **A33 — routed multicast through a vlan-aware bridge.** The routed-mcast
-  offload path resolves interfaces via `get_onif_by_name`, which returns NULL
-  for `br-lan.N`, so routed mcast through a vlan-aware bridge would fail like the
-  unicast A32 case. Not applicable to the Mono Gateway, which does not route
-  multicast — IPTV is L2-bridged (`br-iptv`: `eth0.3999` ↔ `br-lan.3999`, IGMP
-  snooping), a separate ABM/L2-flow path. To enable: mirror A32 (physical-port
-  fallback in `dpa_control_mc.c` / `insert_mcast_entry_in_classif_table`).
-
-- [ ] **A38 — macvlan hardware offload.** cmm already sends
+- [ ] **A38 — macvlan hardware offload.** CMM sent
   FPP_CMD_MACVLAN_ENTRY/RESET on macvlan interface events (`itf.c`
-  cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx has no
-  FC_MACVLAN/EVENT_MACVLAN handler, so a send returns ERR_UNKNOWN_COMMAND. The
-  gateway creates no macvlan netdevs today (CONFIG_MACVLAN built but unused), so
-  it is inert; the cmm sender is deliberately kept.
+  cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx never had an
+  FC_MACVLAN/EVENT_MACVLAN handler, and the flowtable adapter has no macvlan
+  path either. The gateway creates no macvlan netdevs today (CONFIG_MACVLAN
+  built but unused).
   **Decision (2026-09-11): defer.** Traffic terminating on a local macvlan
   endpoint still needs kernel and application processing; a separate MAC
   does not make it an offloadable forwarding path. No concrete forwarding
@@ -293,6 +279,12 @@ each so the open bug list stays honest.
   Whole-tree replacement (`PcdCcModifyTree`) is deliberately unsupported
   under A113 and is excluded from this enablement work.
 
+- [x] **A150.** The CEETM tree was built in flowtable mode with no consumer, and the choice
+  was to gate `qm_init()` or give the flowtable a way to use it —
+  resolved by the second: the tree is the pool `tc` HTB offload claims from
+  (`cdx_htb.c:6`, "nothing new is claimed here"), with the ingress policers and the DSCP
+  map drawing on it too. Gating it would now break those. Not a resource spent on nothing.
+
 ---
 
 <a name="archive"></a>
@@ -301,13 +293,469 @@ each so the open bug list stays honest.
 Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
-## Startup
-
-- [x] **A137.** `find_osdev_by_fman_params` typed `netdev_priv` off any Ethernet
-  device and picked 10G by a fixed-link heuristic — deleted with its only caller
-  when cdx took over classifier startup (_70f7085_).
-
 ## Gating
+
+- [x] **A279.** A VLAN/PPPoE/tunnel stats record went back to its LIFO pool while an entry whose delete was unproven still named it, so a late microcode write could corrupt the free list or count into the next device's record —
+  fixed (_:/^cdx: hold a stats record until every entry naming it is proven gone_).
+
+- [x] **A283.** SEC drew random 64-bit IVs for offloaded GCM, CCM and CTR SAs, which collide after about 2^32 frames and, under GCM, give away the authentication key —
+  fixed (_:/^cdx: count counter-mode IVs up from a random start per SA_).
+
+- [x] **A281.** A keying daemon re-adding an offloaded SA (MOBIKE, a NAT float) read its replay state up to a second stale, and SEC ran on until the retirement, so the new SA re-took accepted inbound frames and reused outbound numbers —
+  fixed (_:/^cdx: carry an SA's replay state across a re-add from where SEC has it_).
+
+- [x] **A284.** XFRM_MSG_NEWAE rewrote a packet-offloaded SA's replay state in xfrm's copy alone, which SEC never learns of and forward-only publication would have kept —
+  fixed (_:/^patches: read an offloaded SA's replay state from its device, never write it_).
+
+- [x] **A285.** An outbound SA overflowing the shared descriptor got NXP's extended one, which never stored its PDB back, so its sequence state was unordered across DECOs and never reached xfrm —
+  fixed (_:/^cdx: build every SA on the descriptor that stores its PDB back_).
+
+- [x] **A282.** An inbound SA's replay window between SEC's widths was carried on the next wider one, so SEC took late frames xfrm's check of the same state refuses —
+  fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
+
+- [x] **A286.** A transport-mode inbound SA with a 128-packet window got ARS128, which SEC's legacy transport protocol does not have —
+  fixed (_:/^cdx: keep an inbound SA's replay window at exactly its width_).
+
+- [x] **A280 / A287.** With shared offline-port classification a decrypted flow's entry keys on
+  the port id and inner 5-tuple alone, so a hardware forwarding hit does not prove which SA
+  decrypted the packet. A second authenticated peer can forge the first peer's inner tuple under
+  its own SA: SEC decrypts it, the shared entry forwards it, and the software secpath/policy check
+  the hardware path skips never runs -- reaching a peer's inbound flow (A280) or an outbound
+  ESP/NAT-T root (A287). Distinct inner subnets do NOT close it: the attacker chooses the forged
+  tuple. The exposure needs a second malicious authenticated peer with per-peer policy
+  differentiation; a single-peer or uniform-policy VPN is unaffected, and it matches how
+  CMM/CDX-5.03.1 shipped. Per-SA classification isolated this but folded the SA's FQID into the
+  KeyGen key, stranding an offline-port task on a miss (A276), so it was reverted.
+  Fixed on this hardware: SEC inserts an allocated SA identity in a private VLAN;
+  FMan validates and removes it after the ordinary tuple lookup. CPU misses preserve
+  both MACs and pass the executing SA to Linux's policy check. Identities remain
+  reserved through queue/SEC/PCD retirement and uncertain deletion; rekey sharing
+  and bounded exhaustion are handled. The hardened image passed 37 DUT regressions;
+  five final-image checks also passed, including exact byte accounting and CBC/GCM
+  iperf. Four-stream GCM reached 2.50 Gbit/s; CBC at a 1.50 Gbit/s aggregate target
+  passed below Vision's diagnosed cryptd-queue saturation, both with no peer XFRM
+  errors. Evidence and limits are in section 14 of
+  `docs/flowtable/ipsec-sa-provenance.md` —
+  fixed (_:/^cdx: bind post-SEC forwarding to the executing SA_).
+
+- [x] **A288.** `ft_ipsec_paired_inbound()` chose a decrypted flow's inbound SA by address (the most recent), so a rekey with non-overlapping selectors bound the entry to an SA the peer does not use and left the flow in software —
+  fixed (_:/^cdx: choose a decrypted flow's inbound SA by its selector_).
+- [x] **A275.** Routed multicast copies left with the egress port's MAC rather than their oif's (a VLAN or bridge VIF), as ipmr sends them, and no chain followed an oif's MAC change —
+  fixed (_:/^flowtable: send a routed multicast copy from its oif's address_).
+
+- [x] **A273.** A software ESP SA routed out a noqueue device (dummy, bridge, VLAN, veth) returned -ENOMEM to local senders for every packet async SEC encryption took, so they resent it; upstream's 7.2 fix never reached 6.12.y —
+  fixed (_:/^kernel: backport xfrm's -EINPROGRESS from validate_xmit_xfrm_).
+
+- [x] **A274.** Offloaded ESP transforms were admitted without ever being proven against a peer —
+  each is now proven interoperable with a Linux software peer (_:/^tests: prove every offloaded ESP transform against a software peer_).
+
+- [x] **A236.** A cdx build with `DEVOH_DEBUG` failed at modpost: `display_iface_info()` was declared but never defined, and only devman.c's empty macro stood in for it —
+  fixed (_:/^cdx: drop a debug helper that was declared and never defined_).
+
+- [x] **A235.** Mark-steered uplinks: an inbound SA is offloaded only when the unmarked route to its peer leaves by its port, the one signal there is when it is added; it fails safe, and a source rule for the local address makes it hold —
+  documented contract (_:/^cdx: offload a child SA whole or leave it to software_).
+
+- [x] **A234.** The follow work set a watch stale again only after probing its unresolved peer, so an answer arriving in between was lost and the SA kept framing it had not been rebuilt for (a moved path MTU) until something else moved —
+  fixed (_:/^cdx: look again at an SA's peer that answers the follow's own probe_).
+
+- [x] **A233.** Under strongSwan's `hw_offload = auto`, a child SA whose outbound SA cdx refused came up with that SA in software, its outbound policy offloaded and its inbound SA in hardware: up and dead —
+  fixed (_:/^cdx: offload a child SA whole or leave it to software_).
+
+- [x] **A232.** An offloaded inbound SA's ESP that SEC was not given (another device or port, a refused queue, GRO) was decrypted in software against xfrm's copy of SEC's replay window, which SEC never learns from —
+  fixed (_:/^xfrm: receive a hardware-held inbound SA through SEC alone_).
+
+- [x] **A231.** An SA's MTU and expansion were fixed at install from the port's MTU, so a narrower hop to the peer (a route MTU, a PMTU learned later) or a lowered port left DF packets Linux answers crossing in hardware into frames the path drops —
+  fixed (_:/^cdx: bound an SA's directions by its path's MTU, not the port's_).
+
+- [x] **A230.** A direction into an SA was bounded by the port's MTU, not the flow's, so DF packets over an inner route's MTU (1401–1438 under a 1400 route) crossed in hardware where Linux answers Fragmentation Needed —
+  fixed (_:/^cdx: bound a direction into an SA by the bundle's MTU_).
+
+- [x] **A229.** get_ofport_info() collected an offline port's table types as bits of its flags word, where types 8, 9, 12 and 13 are OF_FQID_VALID, IN_USE and the port type —
+  fixed (_:/^cdx: keep an offline port's table types out of its flags_).
+
+- [x] **A228.** A group leaving a bridge, or freed, dropped its route's count since the last fold, and unload dropped its entry's, so `ip -s mroute` under-counted —
+  fixed (_:/^flowtable: fold a routed group's last count when it stops being carried_).
+
+- [x] **A227.** An SA added over netlink got an MTU less only its headers (the state is not yet valid then), so the DF check sent IPv4 DF packets up to ICV, trailer and padding over the SA's MTU to SEC and out larger than the port —
+  fixed (_:/^cdx: program an SA's expansion as the whole of ESP's_).
+
+- [x] **A226.** A failed split-key job (full ring, unmappable job, SEC error) still installed the HMAC SA with a key SEC never wrote, and its ~1 s timeout freed a descriptor the ring still owned —
+  fixed (_:/^cdx: refuse an SA whose HMAC split key SEC failed to derive_).
+
+- [x] **A225.** A group routed through a bridge took its fold baseline from zero when it derived the bridge again, so a bridge going down and back added the still-published route's whole count to `ip -s mroute` a second time —
+  fixed (_:/^flowtable: fold a routed group's bridge count from where it stood_).
+
+- [x] **A224.** Inbound IPsec read another driver's netdev private area as a DPAA port's: the driver's submit for ESP arriving on a bridge, VLAN-over-bridge or veth, and the exception queue for an SA whose local endpoint was on a Wi-Fi VAP —
+  fixed (_:/^sdk_dpaa, cdx: take a DPAA port's private area only from a DPAA port_).
+
+- [x] **A223.** The adapter ignored an HMAC's truncation, so an SA at a length SEC has no operation for (SHA-256 at 96 bits) failed the ICV check both ways, and `cmac(aes)`, which has no PF_KEY number, was offloaded unauthenticated —
+  fixed (_:/^cdx: carry an HMAC's truncation, refusing lengths SEC lacks_).
+
+- [x] **A222.** A routed group was decided without the events queued while the worker waited for RTNL, so a removed VIF, a new policy rule or the entry's own delete reached hardware a pass late —
+  fixed (_:/^flowtable: apply what the chain queued before deciding a routed group_).
+
+- [x] **A221.** Deleting one oif's device took its whole routed multicast group out of hardware and re-added it, instead of swapping the chain —
+  fixed (_:/^flowtable: swap a routed multicast chain when one of its oifs goes_).
+
+- [x] **A220.** An offloaded AES-GMAC (`rfc4543`) SA failed the ICV check both ways: SEC's GMAC leaves out the IV that RFC 4543 authenticates —
+  refused for packet offload (_:/^cdx: refuse GMAC offload, whose SEC ICV leaves out the IV_).
+
+- [x] **A194.** cdx and the kernel patches still carried CMM's dead FCI control plane, Wi-Fi fast path and bridge/conntrack hooks —
+  removed (_:/^cdx: remove the FCI control plane_).
+
+- [x] **A254.** Turning a port's DSCP map on or off retired nothing: flows and SAs (a deleted one too) kept reading it on whichever port took it next, and `cpe_fp_tx()` raced its free —
+  fixed (_:/^flowtable: hold the DSCP map while a deleted SA is still in hardware_).
+
+- [x] **A261.** Multicast listener entries kept the queue and DSCP-map bit of when they were built, so an HTB tree or DSCP map change left groups on a dead queue or another port's map —
+  fixed (_:/^flowtable: retire a multicast entry in the transaction that unlists it_).
+
+- [x] **A272.** Routed multicast in hardware reached every MFC oif, bypassing forward-chain drops (fw4's WAN-to-LAN policy) and a host membership's loopback copy —
+  fixed (_:/^flowtable: never take a ruleset still being applied as settled_).
+
+- [x] **A271.** Bridged multicast in hardware bypassed bridge netfilter (nftables bridge chains, ebtables, br_netfilter), so a drop rule stopped applying once a flow was offloaded —
+  fixed (_:/^flowtable: keep bridged multicast in software while a bridge hook filters_).
+
+- [x] **A270.** A port moved straight to another bridge kept its memberships, a reference and a listener, on the bridge it left —
+  fixed (_:/^flowtable: drop a port's memberships on the bridge it leaves_).
+
+- [x] **A269.** On NETDEV_UNREGISTER the multicast learners released a group's ingress before the worker deleted the entry that unsubscribes through it —
+  fixed (_:/^flowtable: hold a multicast entry's ingress until the entry is deleted_).
+
+- [x] **A268.** Patch 161 sent PORT_MROUTER=true on every per-family router transition, leaking a reference per extra true in drivers that count them (mlxsw) —
+  fixed (_:/^patches: send PORT_MROUTER only when the bridge's union changes_).
+
+- [x] **A267.** A failed routed multicast install spent all four retries within one worker pass and went refused-failed before anything could change —
+  fixed (_:/^flowtable: retry a failed routed multicast install once per refresh_).
+
+- [x] **A266.** Bridged memberships standing when the adapter loaded were never offloaded until joined afresh (nothing replayed them, and patch 160's replay could be dropped) —
+  fixed (_:/^cdx: offload the bridged memberships standing when the adapter loads_).
+
+- [x] **A265.** Bridged multicast ignored IGMPv3/MLDv2 source filters, so a source the bridge stopped forwarding to a port still reached it in hardware —
+  fixed (_:/^cdx: ask the bridge where a bridged multicast flow's frames go_).
+
+- [x] **A264.** A bridged group whose chain swap failed stayed counted installed on its old listener set, its route reported carried and the MFC flagged offloaded —
+  fixed (_:/^flowtable: take a bridged multicast group out when its chain swap fails_).
+
+- [x] **A263.** The multicast hook's dedup slot kept a frame recorded while no group matched, so a group created later stayed pending-source for as long as the stream ran —
+  fixed (_:/^flowtable: forget the multicast hook's last frame when its answer changes_).
+
+- [x] **A262.** Removing the multicast hook did not wait for frames inside it, which could rewrite the cleared dedup slot or queue the worker after exit cancelled it —
+  fixed (_:/^flowtable: wait out the multicast hook's readers when it is removed_).
+
+- [x] **A188.** A group both bridged and routed was carried by whichever learner claimed it first, leaving the other half in software —
+  fixed (_:/^cdx: carry a stream both bridged and routed as one hardware group_).
+
+- [x] **A191.** Bridged multicast rewrote the source MAC to the egress port's and sent tagged ingress to the CPU —
+  fixed (_:/^cdx: bridge multicast with the sender's MAC and its ingress tag_).
+
+- [x] **A196.** The microcode fragmented multicast replicas over a listener's MTU, where Linux sends Packet Too Big or drops —
+  fixed (_:/^flowtable: keep a multicast group that could fragment in software_).
+
+- [x] **A260.** CDX read any Ethernet netdev's private area as a DPAA port's, bridges and VLAN devices included, in registration, the FMan-port walk and the queue lookups —
+  fixed (_:/^cdx: read netdev_priv as a DPAA port's only for a DPAA port_).
+
+- [x] **A259.** ip6t_NPT rewrote a confirmed conntrack's reply tuple in place, so a related ICMPv6 error could leave a hashed entry holding a tuple it is not hashed under —
+  fixed (_:/^netfilter: rewrite an NPT connection's reply tuple only before confirmation_).
+
+- [x] **A258.** CPU-forwarded frames lost their QoS class (the software flowtable dropped the conntrack, PPPoE and tunnels scrubbed it) and took queue 7 above the tree, unremarked —
+  fixed (_:/^cdx: classify frames by their headers, not by what a scrub left_).
+
+- [x] **A255.** Traffic naming no HTB leaf took an unconfigured, excess-only queue 7 (a saturated leaf starved ARP, LCP and DHCP) or an unshaped claimed channel; `default` was ignored —
+  fixed (_:/^cdx: keep unclassified traffic on a channel a class holds_).
+
+- [x] **A243.** Unregistering a hook (`ndo_setup_tc`, TC_SETUP_FT, the Tx and SEC hooks) waited for no caller, so a racing tc command, bind or frame could run freed text —
+  fixed (_:/^sdk_dpaa, cdx: wait out every call into a hook before its module goes_).
+
+- [x] **A257.** `tc filter replace` of a DSCP filter was refused as a duplicate, and the old filter's destroy then unmapped the codepoint —
+  fixed (_:/^cdx: keep a DSCP codepoint across tc filter replace_).
+
+- [x] **A256.** A class's DSCP remark was applied only in hardware, so a flow changed codepoint when offloaded and one never offloaded was never remarked —
+  fixed (_:/^cdx: remark forwarded frames in software as the hardware does_).
+
+- [x] **A253.** A refused RED change left the old curve running under a qdisc showing the new one, stats cleared `offloaded`, and a RED could program an unrelated leaf's queue —
+  fixed (_:/^cdx: make a RED qdisc's offload state what the class queue runs_).
+
+- [x] **A252.** The devlink policers reported their ranges' ceilings until first set, so restoring what `show` reported switched both meters off —
+  fixed (_:/^cdx: register the devlink policers with what the meters run_).
+
+- [x] **A251.** `xfrm_state_update()` moved a packet-offloaded SA's NAT-T ports or output mark in place without telling the driver, leaving the hardware on the old ones —
+  fixed (_:/^xfrm: refuse changing a packet-offloaded state's output mark in place_).
+
+- [x] **A249.** Frames SEC never got were counted as sent (`tx toenc`, the Wi-Fi local path's count) and freed without a drop count, and every failed submit printed —
+  fixed (_:/^sdk_dpaa: rate-limit SEC submit failures; count Wi-Fi SEC frames given_).
+
+- [x] **A250.** SA peer lookups dropped the output mark, VRF, protocol and NAT-T ports (plain ESP took stale ports), so hardware and Linux could pick different next hops —
+  fixed (_:/^xfrm: route plain ESP without the stack's leftovers for ports_).
+
+- [x] **A248.** A transport-mode SA's frames were given the tunnel's DPOVRD, so SEC encrypted their IP header, named IPIP in the trailer and no peer could decode them —
+  fixed (_:/^sdk_dpaa: describe a transport-mode frame's own IP header to SEC_).
+
+- [x] **A247.** A bundle of two packet-offloaded transforms left with only the first applied —
+  fixed (_:/^xfrm: refuse a nested packet-offload bundle_).
+
+- [x] **A246.** GSO packets for a packet-offloaded SA hit `skb_checksum_help()`'s WARN and were dropped: all local TCP and GRO-merged forwarded traffic on the software path —
+  fixed (_:/^xfrm: segment GSO packets for a packet-offloaded SA in software_).
+
+- [x] **A245.** IPv6-in-IPv4 over a packet-offloaded SA failed every bundle without an IPv6 default route: the SA's IPv4 endpoints were looked up as IPv6 —
+  fixed (_:/^xfrm: route a cross-family packet-offload tunnel by the flow_).
+
+- [x] **A244.** A packet-offloaded SA's plaintext left in the clear by whatever device the bundle's route named once the peer route moved off the SA's port —
+  fixed (_:/^xfrm: keep packet-offload plaintext on the SA's port_).
+
+- [x] **A242.** A wedged host-command channel logged every failed sync retry, several lines each, for as long as the board ran —
+  fixed (_:/^sdk_fman: report a run of HC sync failures once, and its end_).
+
+- [x] **A241.** A failed ehash barrier leaked the cumulative node its delete or rebuilding add displaced, one per failure (A98's accepted residue) —
+  fixed (_:/^sdk_fman: park the cumulative nodes a failed ehash barrier displaces_).
+
+- [x] **A240.** Teardown left Netfilter able to call freed adapter text: a passive binding's indirect callback outlived unload, and a failed load kept its direct binds and works —
+  fixed (_:/^flowtable: unwind a failed load's binds and work as unload does_).
+
+- [x] **A239.** Flowtable mode never released entries a failed multicast or IPsec barrier parked, refusing unicast offload, the parked rearm and the adapter's load —
+  fixed (_:/^cdx: release parked ehash entries on any completed barrier_).
+
+- [x] **A238.** `display_pppoehdr_insert_opc()` decoded the big-endian PPPoE insert words through bitfields: session id byte-swapped, stats pointer byte-reversed —
+  fixed (_:/^sdk_fman: decode the PPPoE insert opcode's big-endian words by shift_).
+
+- [x] **A237.** A flowtable bound while an invalidation was latched was refused, so every atomic reload (fw4's included) failed whole and offload never rearmed —
+  fixed (_:/^flowtable: park binds made during an invalidation instead of refusing them_).
+
+- [x] **A219.** ask-flowtable took a second flowtable bound beside its own for a table to repair, and replaced its own into a drain the other held up —
+  fixed (_:/^flowtable: keep the daemon's table while another is bound beside it_).
+
+- [x] **A218.** Linux never asked for a partially offloaded flow's hardware counters while software kept refreshing it —
+  fixed (_:/^netfilter: poll a partially offloaded flow's hardware counters_).
+
+- [x] **A217.** A partially offloaded flow's periodic re-offer took RTNL for its installed half, and a lost trylock retired the whole generation —
+  fixed (_:/^flowtable: answer a re-offered installed direction without RTNL_).
+
+- [x] **A216.** Devices a path crosses without naming (a VLAN device under a session or tunnel, the ppp device under a tunnel) were neither held nor watched —
+  fixed (_:/^flowtable: hold and watch the devices a path crosses without naming_).
+
+- [x] **A202.** The microcode's IPv4 fragments of a frame received on an Ethernet port carry an all-zero payload, and a UDP direction into a smaller path was offloaded —
+  fixed (_:/^flowtable: keep non-TCP IPv4 out of a path smaller than its ingress_).
+
+- [x] **A215.** An MSTI remap or MST switched off stopped bridge ports without naming them, and their software flows were never swept —
+  fixed (_:/^cdx: sweep a bridge whose MST events stop ports without saying which_).
+
+- [x] **A214.** Software flows already through a port that stopped forwarding were never swept, and kept bypassing the bridge —
+  fixed (_:/^cdx: sweep software flows off a port that stops forwarding_).
+
+- [x] **A213.** The bridge's forward-path walk resolved a port STP or a VLAN state had stopped, so the software flowtable forwarded through it —
+  fixed (_:/^bridge: keep flow offload off ports that are not forwarding_).
+
+- [x] **A193.** Multicast quarantine on a failed hardware delete had no flowtable-mode driver —
+  covered (_:/^tests: prove a failed multicast barrier parks and the next one frees_).
+
+- [x] **A212.** The routed multicast fold wrote hardware counts over the MFC's, erasing ipmr's own and running `ip -s mroute` backwards —
+  fixed (_:/^flowtable: take no multicast sample from a counter read that failed_).
+
+- [x] **A201.** Oversized IPv6 into an SA was unmeasured — measured: SEC encrypts it whole and only the outer IPv4 packet is fragmented, so no bound
+  is needed (_:/^tests: measure what an oversized IPv6 packet into an SA becomes_).
+
+- [x] **A211.** IPsec frames SEC refused were counted nowhere Linux could see: FMan's microcode tallies and drops them globally, and nothing read the tally —
+  fixed (_:/^cdx: count SEC's refusals from the FMan microcode's own tally_).
+
+- [x] **A210.** Offloaded SAs started at sequence zero with a fixed 64-entry window, and SEC's numbering never reached xfrm —
+  fixed (_:/^cdx: carry the IPsec starting sequence and replay window to SEC_).
+
+- [x] **A209.** Offloaded IPsec SAs never accounted into xfrm's lifetimes, so byte and packet expiry never fired —
+  fixed (_:/^cdx: account offloaded IPsec SAs into xfrm lifetimes_).
+
+- [x] **A208.** Under `devices auto` any port's link change replaced the daemon's table, draining every offloaded flow —
+  fixed (_:/^flowtable: follow auto device membership without replacing the table_).
+
+- [x] **A207.** Interface packet counts stepped back by 2^32 at the firmware's 32-bit packet wrap —
+  fixed (_:/^cdx: carry interface packet counts past the firmware's 32 bits_).
+
+- [x] **A200.** Consumers did not advertise a smaller upstream's IPv6 MTU, so LAN-to-WAN IPv6 behind PPPoE or 6in4 stayed in software —
+  documented as the integrating distribution's contract (_:/^docs: state what an integration owes an IPv6 LAN behind a narrower uplink_).
+
+- [x] **A192.** VLAN and PPPoE admissions had no allocation-failure coverage —
+  covered (_:/^tests: fail the allocations of tagged and session admissions_).
+
+- [x] **A186.** A 6o4/4o6 tunnel whose outer packets leave by a PPPoE session was refused rather than offloaded —
+  fixed (_:/^flowtable: offload a tunnel over a PPPoE session_).
+
+- [x] **A206.** A flow admitted through a bridge port went on being bridged in hardware after STP blocked the port —
+  fixed (_:/^flowtable: retire flows bridged through a port STP stops_).
+
+- [x] **A205.** Hardware entries kept enqueuing to a port's old frame queues after an HTB tree switched it to or from CEETM —
+  fixed (_:/^cdx: retire flows when a port's egress queues change_).
+
+- [x] **A204.** A second flowtable bound at once was refused with EBUSY, failing every atomic reload and silently sending fw4's probe to software offload —
+  fixed (_:/^flowtable: let a consumer reload its table in one transaction_).
+
+- [x] **A203.** Every offloaded NAT-T SA sent and expected byte-swapped UDP ports, and a transport-mode one would have left as bare ESP —
+  fixed (_:/^cdx: store NAT-T ports in host order, refuse transport-mode NAT-T_).
+
+- [x] **A181.** ask-flowtable could validate a maximal policy and then refuse it at apply for overflowing the render buffer —
+  fixed (_:/^flowtable: size the render buffer to what the validator accepts_).
+
+- [x] **A187.** `display_l3hdr_insert_opc()` decoded the tunnel insert word's flag bits and stats pointer wrongly —
+  fixed (_:/^cdx: decode the tunnel insert word's flag bits and stats pointer_).
+
+- [x] **A197.** Two later upstream flowtable lifetime fixes (2014ac62df9d, e75a9fa1d44b) were missing from the tree —
+  backported as patch 145 (_:/^netfilter: backport two upstream flowtable lifetime fixes_).
+
+- [x] **A199.** CPU- and FMan-fed jobs of one SA reused ESP sequence numbers (the SDK zeroed the firmware's FMan port ICIDs) —
+  fixed (_:/^sdk_fman: keep the boot firmware's port ICIDs_).
+
+- [x] **A198.** The microcode fragmented forwarded IPv6 into a smaller path instead of Packet Too Big —
+  fixed (_:/^flowtable: keep an IPv6 direction into a smaller path in software_).
+
+- [x] **A195.** An offloaded flow's conntrack could expire under it (only gc_worker extended it) —
+  fixed (_:/^flowtable: extend offloaded conntrack timeouts from the flowtable GC_).
+
+- [x] **A190.** IPsec skipped the opposite LAN bridge/VLAN path and prevented flow offload —
+  fixed (_:/^flowtable: resolve bridged LAN paths beside IPsec_).
+
+- [x] **A158.** Multicast listener ceiling and replication across physical ports —
+  hardware validation completed 2026-09-21 on a rebuilt, staged and TFTP-booted
+  KASAN flowtable image. All four IPv4/IPv6 cases passed: eight exact hardware
+  copies, whole-group software fallback at nine, recovery to eight, and simultaneous
+  LAN/WAN replicas. Every expected receiver got all 256 sequences once per window;
+  no malformed copies or kernel reports, and teardown left no test routes or devices.
+  WAN replication uses the existing VLAN 3900 because this bench filters VLAN 320.
+  See [measurements and artifacts](docs/flowtable/multicast-routed.md#a158-hardware-completion--2026-09-21).
+
+- [x] **A189.** Routed bridge oifs omitted multicast router ports — fixed in kernel patch
+  161 and `ft_mr_expand_bridge()`: snapshot the live MDB/router union per protocol and
+  VLAN, deduplicate ports, and honour querier, forwarding and VLAN state. Router changes
+  refresh the set; the five-second worker covers unreported changes without rebuilding
+  unchanged chains. Unsupported/overflowing sets and failed replacements return the whole
+  stream to software. No router cache or additional device references. Validation:
+  154 ASan/UBSan snapshot scenarios, worker refresh/failure/device-removal/teardown cases,
+  ten rejected regression mutations, 158 host tests, ARM64 `-Werror` checks and a full
+  KASAN image build. The image was staged and booted for A158; its plain VLAN-oif
+  cases do not cover A189's bridge/router semantics, whose DUT validation remains pending.
+  See [routed multicast](docs/flowtable/multicast-routed.md#a189-follow-up--2026-09-21).
+
+- [x] **A140.** Repeated teardown of a retiring flow cleared a newer flow's conntrack
+  offload bit and shortened its timeout — fixed in _6e50c4f_: kernel patch 142 hands the
+  conntrack back only on the first `NF_FLOW_TEARDOWN` transition. The 16,384-connection
+  churn proof passed with zero conntracks reaped (82 before). Stale open entry archived
+  2026-09-21; the patch remains included by the kernel recipe.
+
+- [x] **A141.** The claim that `tx_init()` was never called was stale: current
+  `cdx_cmdhandler_init()` starts with `CMD_INIT(tx)`, which registers the TX handler,
+  seeds physical port IDs and sets `gDscpVlanPcpMapCtx.portid = NO_TX_PORT`.
+  Closed on source verification 2026-09-21; no code change needed.
+
+- [x] **A178.** moal could lose or double-complete scan requests during cancellation, timeout
+  and teardown — fixed in driver patch 0008: all accepted scans (including cached scans and
+  ACS) have an interface owner and generation under `scan_req_lock`; queued results carry
+  that generation. Request preparation failures reject without completing, and accepted
+  submission failures complete without also returning an error. Real timeouts complete even
+  when firmware recovery is suppressed. Cleanup drains timer and result work before queue or
+  interface removal, reset reopens admission, and competing firmware/cancel paths release the
+  scan semaphore once. Validation: 134 ASan/UBSan scenarios, nine rejected regression mutations,
+  155 host tests and full ARM64 `-Werror` Wi-Fi module build; DUT validation remains pending.
+
+- [x] **A177.** IPsec exit and partial-init unwind left PCD queues and seeded buffers live —
+  fixed (this commit): separate allocated PCD queues from embedded SA queues; drain callbacks
+  before releasing the port, skb-backed pool and BPID mapping. SAs pin CDX until their queues
+  are freed; failed SA creation now waits for retirement. CGR deletion runs on its owning CPU
+  and retains resources on error. SDK patch 105 fixes zero-buffer seed failures and DMA-error
+  double frees. Validation: 194 ASan/UBSan lifecycle cases, 154 host tests and ARM64 `-Werror`
+  compilation of CDX and the SDK seeder; DUT validation remains pending.
+
+- [x] **A33.** Routed multicast resolved listeners through `get_onif_by_name`, NULL for a `br-lan.N` —
+  superseded: the flowtable learner hands the encoder ports and tag stacks, so there is no name (_pending_).
+
+- [x] **A185.** `test_flowtable_bridge_fdb_roaming` (from da0b00a) read the bridge FDB once after the
+  roam, but the parent carries the same MAC and its background traffic relearns the entry, so the
+  single snapshot raced — fixed (this commit): re-send the tagged probe and poll until the roam port shows.
+
+- [x] **A184.** sfp-led probing before sfp.c held MOD_DEF0 (sfp requests it only after its I²C adapter)
+  won the line, and sfp's exclusive retry then failed for good — fixed (this commit): a port defers until
+  the sfp device is bound, so it only ever borrows; KUnit `sfp_unbound` took the line without it.
+
+- [x] **A183.** sfp-led put a borrowed MOD_DEF0 descriptor on deferred probe and unload: the sfp driver's
+  line and active-low flag were released under it and a device ref it never took dropped — fixed (this
+  commit): borrow without devm, put only an owned line; KUnit `shared_gpio` crashed UML without it.
+
+- [x] **A182.** `test_flowtable_ipv6_mtu_recovery` flaked in the full suite: a readmission that lost
+  `rtnl_trylock` (the sfp-led poll held RTNL 18×/s) needs two GC ticks, more than ten quick rounds — fixed
+  (this commit): deadline settles with the busy path injected every run; the LED poll no longer takes RTNL.
+
+- [x] **A176.** `moal_init_lock()` gave every mlan spinlock the one lockdep class of its single
+  `spin_lock_init()` site, so the first client's ADDBA (command lock inside the TX ralist lock) reported
+  "possible recursive locking" and switched lockdep off for the run — fixed (this commit): driver patch
+  0006, a dynamic key per lock.
+
+- [x] **A173.** moal reported scan results to cfg80211 under `scan_req_lock` (irqsave): GFP_KERNEL allocs,
+  `bss_lock` taken `_bh`, and the first scan's waited ioctl — fixed (this commit): driver patch 0005
+  reports outside the lock and completes only the request it took.
+
+- [x] **A167.** `cdx_dpa_ipsec_init()` failing refused to load `cdx.ko`, so a board without the IPsec
+  offline port or a SEC job ring had no offload at all — fixed (this commit): non-fatal, with
+  `cdx_ipsec_ready()` refusing SA admission by both owners, the xfrmdev attachment and the encoder's
+  table lookup; proved with `cdx.dpa_init_fail_site=cdx_dpa_ipsec_init`.
+
+- [x] **A159.** A bound flowtable stopped the port's rx counters: the SDK driver counted a frame only
+  when `netif_receive_skb()` returned other than `NET_RX_DROP`, which a frame stolen on the ingress
+  hook always does — fixed (this commit): patch 104 counts before the handoff; hardware-forwarded
+  frames come from the firmware records `dev_get_stats()` folds in, see `docs/flowtable/statistics.md`.
+
+- [x] **A165.** The "single TX worker is the wire-to-Wi-Fi ceiling" was an instrumentation artifact:
+  a production-config kernel (no KASAN/lockdep/kmemleak) with the flow offloaded runs 654 Mbit/s median,
+  666 peak on VHT80 2x2 — the air ceiling, not the worker. The 160–201 figures were KASAN+lockdep
+  roughly halving a CPU-borne path plus offload not engaged. Lock-churn lever landed in _c14ecd5_
+  (patch 0007); the single-worker structural limit is dormant below a faster PHY. Numbers in memory.
+
+- [x] **A175.** `ft_wifi_exit()` blocked on RTNL with the CDX transaction held, the reverse of the bind
+  path's order (transaction under RTNL via `dpa_setup_tc`) — a lock inversion lockdep reports at unload
+  once a table has been bound; hidden until A174 restored lockdep — fixed (this commit): RTNL first.
+
+- [x] **A174.** The netlink cb_mutex lockdep name table stopped at 33 while `MAX_LINKS` is 64, and moal's
+  socket sits at 63: a nameless class WARNs, `debug_locks_off()` disables lockdep and sets the console
+  to level 15 on every test-image boot since the radio was added — fixed (this commit): patch 093 names
+  every slot.
+
+- [x] **A172.** VWD drained its queues through `eth0`'s NAPI, which is enabled only while `eth0` is
+  open — never, on this board — so the portal's dequeue interrupt stayed masked and only the WAN port's
+  transmit confirmations kept the path moving — fixed (this commit): VWD owns a NAPI per CPU and portal.
+
+- [x] **A166.** `dpaa_get_vap_fwd_fq()` dereferenced a slot whose queues may not exist yet (legacy
+  owner creates the record before the open) — fixed (this commit): failing return, all callers check.
+
+- [x] **A164.** `process_vap_rx_fwd_pkt()` took the global `vaplock` and a `dev_hold`/`dev_put` pair per
+  frame — fixed (this commit): RCU read section; the retire path publishes with release semantics.
+
+- [x] **A171.** A non-DPAA device in an offload flowtable (a VAP, which fw4 always lists once Wi-Fi
+  is in the LAN bridge) was refused, which fails the whole table and drops every port to software —
+  fixed (this commit): bound passively, its flows declined into the software fast path.
+
+- [x] **A170.** `dpa_get_ifinfo_by_netdev()` matched a VAP record by address alone, and the record
+  outlives its device by one workqueue hop — fixed (this commit): VWD must still own the device.
+
+- [x] **A169.** The VAP-id allocator rotated through all 32 slots before reusing one, and each slot's
+  65 frame queues live until module exit, so restarts grew the table to 2080 queues —
+  fixed (this commit): prefer a free slot whose queues exist, bounded by peak concurrent VAPs.
+
+- [x] **A168.** `dpaa_vwd_init()` failing refused to load `cdx.ko`, so a board without the Wi-Fi
+  offline port had no offload at all — fixed (this commit): non-fatal; `dpaa_vwd_ready()` gates
+  every later use.
+
+- [x] **A163.** The IPsec egress encoder passed hash 0 to `dpaa_get_vap_fwd_fq()`, pinning every
+  encrypted flow to a VAP onto queue 0 and one CPU — fixed (this commit): spread by SA handle.
+
+- [x] **A162.** `moal` defaulted `tx_skb_clone=1` and so `pskb_copy`'d every transmitted frame on
+  its single TX worker, the second-largest item on the pegged core — fixed (this commit): default 0,
+  the cloned/headroom predicate it bypassed still copies what needs copying (patch 0004).
+
+- [x] **A161.** Use-after-free in the Wi-Fi driver's transmit path: `wlan_dequeue_tx_packet()` read
+  `ptr->sta` after the send helpers dropped `ra_list_spinlock`, racing `wlan_wmm_delete_peer_ralist()`
+  on a station leaving under load — fixed (this commit): re-validate under the lock (patch 0003).
+
+- [x] **A160.** Read Wi-Fi RX descriptors before handing off or freeing their skb (patch 0002); 64 EasyMesh drop callbacks pass under DUT KASAN.
+  (_:/^mwifiex: read receive ownership before freeing the packet_).
+
+- [x] **A157.** Bridged multicast looked installed-but-never-matching on the
+  first rig run; not a defect — the injector used a plain UDP socket, whose
+  default multicast TTL of 1 the soft parser excepts before classification.
+  With TTL 64 the group matches every frame (_9550336_).
 
 - [x] **G1.** `/dev/cdx_ctrl` ioctl dispatcher was ungated — added a CAP_NET_ADMIN
   check ahead of the command-table lookup (_815a0ca_).
@@ -545,6 +993,29 @@ file's git history.
   boot on eth4 rx>0 with static neighbors). Reopen if it recurs.
 
 ## Corrections to the original review (wontfix / not-a-bug)
+
+- [-] **A142 (wontfix, CMM retirement).** Interface-statistics offsets truncating
+  past record 121 — reachable only through CMM's interface registration, now retired (this commit).
+
+- [-] **A79 (wontfix, CMM retirement).** `cmmUpdateFlows` iterator invalidation —
+  CMM no longer runs; the source is kept only as reference (this commit).
+
+- [-] **A156 (wontfix, CMM retirement).** A failed legacy multicast UPDATE in
+  `cdx_update_mcast_group()` leaves listeners from earlier in the batch live,
+  so FCI receives failure while hardware keeps the partial update. Closed on
+  2026-09-21 under the CMM retirement decision: its callers are the IPv4/IPv6
+  FCI handlers and the legacy ADD-on-existing-group path. Flowtable ownership
+  rejects FCI dispatch in `comcerto_fpp_send_command()`. Both flowtable multicast
+  learners instead call `cdx_mc_group_replace()`, which builds the new chain
+  unpublished, frees it on build failure, and publishes only after all listeners
+  succeed. The legacy defect is retained until that control path is removed.
+
+- [-] **A155 (wontfix, CMM retirement).** One DUT reset was observed during a
+  CMM-owned IPsec UDP transfer (400 Mb/s, 1300-byte datagrams, WAN to LAN,
+  non-KASAN image). No console trace was captured, and the LAN segment was
+  flapping; the root cause remains unconfirmed. Closed by scope decision on
+  2026-09-21: CMM is being retired, so further legacy-mode reproduction and
+  repair are out of scope.
 
 - [-] **N20 (not a bug).** "Same-SPI reinstall blackholes the tunnel" was a test
   artifact — reinstalling one peer's SA rewinds ESP seq to 1, the other peer
@@ -1114,3 +1585,55 @@ file's git history.
 
 - [x] **A136.** Tests mistook combined netdev statistics for software counters —
   fixed (this commit): use SDK ethtool software RX plus delivery; retain totals for accounting and preserve capture names.
+
+- [x] **A143.** Enabling QoS drove the excess rate of an already-shaped channel to
+  zero, starving every class queue on it —
+  fixed (this commit): hold the excess rate in `shaper_info` so all five programming sites pass the same value.
+
+- [x] **A144.** Disabling QoS left the LNI shaper enabled, so a port could only ever be
+  enabled once; the second attempt failed inside `ceetm_setup_lni` with the port half committed —
+  fixed (this commit): disable the shaper on the way out, which is what makes a qdisc rebuild or a QOSENABLE toggle work.
+
+- [x] **A145.** `cpe_fp_tx()` confirmed on a frame queue chosen by class-queue id rather than
+  by sending Tx queue, so every DSCP-classified frame confirmed on `conf_fqs[0]` whichever core sent it —
+  fixed (this commit): index by `skb_get_queue_mapping()`, which is what the non-CEETM branch already used.
+
+- [x] **A147.** Ingress policer rates had no surface in flowtable mode (the FCI
+  family that reaches them is sealed and its only client does not run there) —
+  fixed (this commit): `tc action police` offloads via `TC_SETUP_BLOCK`, `matchall`
+  onto the port profile and `flower` onto the seven per-flow profiles, bound to
+  flows at admission; the per-flow path was also discarding the caller's burst.
+
+- [x] **A146.** The libnetfilter-conntrack ASK patches still declared `ATTR_QOSCONNMARK`,
+  `CTA_QOSCONNMARK` and their build/parse/copy/compare/print helpers, mirroring a kernel
+  attribute that no longer exists, which made it look as though rebuilding cmm with
+  `-DUSE_QOSCONNMARK` would still work —
+  fixed (this commit): both patches regenerated against their upstream tags with the QoS
+  hunks dropped, verified by applying each to a pristine tree and diffing the result.
+
+- [x] **A153.** Counter-enabled flowtables were refused, which refuses every flow under the
+  configuration consumers ship — OpenWrt renders `counter` unconditionally —
+  fixed (this commit): `ft_l2_overhead()` restates each delta in Netfilter's units.
+
+- [x] **A152.** The adapter refused a third binding (`ft_bound >= 2`, the proof of concept's
+  acceptance limit), and invalidation snapshotted bound devices into a two-element array —
+  fixed (this commit): both sized by `CDX_FT_MAX_BINDINGS`, asserted equal to `MAX_PHY_PORTS`.
+
+- [x] **A151.** The DSCP egress map was unreachable on both paths: the hardware enable tested the
+  whole `qosmark` word, which `cdx_ft_hw_add()` never leaves zero because it always raises
+  `iqid_valid`, and the software branch tested `pfe_eth_get_queuenum()`, which answers
+  `QOS_DEFAULT_QUEUE` for an unmarked frame —
+  fixed (this commit): the hardware enable reads the egress nibbles only, and the software path is
+  served from `ndo_select_queue` off the same published table rather than from `dpa_tx()`.
+
+- [x] **A149.** `ceetm_get_egressfq()` ORed the class-queue policer's profile number into the
+  shared `qman_fq`'s own fqid, where the clearing branch could not undo it and the software Tx
+  path would have enqueued to it — the DSCP map stored the pointer from one call and the value
+  from the next —
+  fixed (this commit): the fqid is composed by value in `ceetm_egress_fqid()`, the lookup no
+  longer writes, and one channel resolver serves both readings. Was filed as a second A141.
+
+- [x] **A148.** Unload left the flow_block_cb of a direct bind in a live flowtable, so the next
+  offload work called freed module text (`flow_offload_work_handler` oops) — latent since the
+  driver grew an `ndo_setup_tc` and `flow_indr_dev_unregister()` unwinds only indirect binds —
+  fixed (this commit): drain the driver block list on exit under each table's `flow_block_lock`.

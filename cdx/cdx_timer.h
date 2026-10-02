@@ -90,5 +90,6 @@ void cdx_timer_del(TIMER_ENTRY *timer);
 
 int cdx_ctrl_timer(void *data);
 int cdx_ctrl_timer_init(struct _cdx_ctrl *ctrl);
+void cdx_ctrl_timer_stop(void);
 
 #endif /* _CDX_TIMER_H_ */

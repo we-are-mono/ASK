@@ -12,11 +12,15 @@ IMAGE_INSTALL = " \
     \
     ethtool \
     iproute2 \
+    iproute2-bridge \
+    iproute2-tc \
+    iproute2-devlink \
     iputils \
     iptables \
     nftables \
     bridge-utils \
     conntrack-tools \
+    smcroute \
     ppp \
     ppp-oe \
     kernel-module-ppp-generic \
@@ -41,26 +45,45 @@ IMAGE_INSTALL = " \
     \
     \
     cdx \
-    fci \
-    auto-bridge \
     sfp-led \
     lp5812-driver \
     config \
     kernel-module-nf-conntrack-netlink \
+    kernel-module-ask-flowtable \
+    kernel-module-nft-flow-offload \
+    kernel-module-nf-flow-table-inet \
+    kernel-module-nft-ct \
+    kernel-module-nft-nat \
+    kernel-module-nft-masq \
+    kernel-module-nft-chain-nat \
+    kernel-module-xt-tcpudp \
     kernel-module-xt-conntrack \
     kernel-module-xt-masquerade \
     kernel-module-ip6-tables \
     kernel-module-ip6table-filter \
     kernel-module-ip6table-mangle \
-    cmm \
+    kernel-module-ip6t-npt \
     dnsmasq \
     lmsensors-sensors \
+    \
+    \
+    nxp-mwifiex \
+    nxp-wifi-firmware \
+    kernel-module-cfg80211 \
+    hostapd \
+    wpa-supplicant \
+    iw \
+    wireless-regdb-static \
 "
 
 # Test harness (agent + python fuzzing/orchestration tooling + stress tools).
 # Kept separate so it's obvious what the test image adds on top of the base.
 IMAGE_INSTALL:append = " \
     ask-test-agent \
+    libubootenv-bin \
+    kernel-module-dummy \
+    kernel-module-act-mirred \
+    kernel-module-nft-meta-bridge \
     python3-core \
     python3-aiohttp \
     python3-pyroute2 \
@@ -91,6 +114,22 @@ ROOTFS_POSTPROCESS_COMMAND += "disable_conntrackd_init;"
 # and empty /etc/dnsmasq.conf would just race and fail. Strip them.
 ROOTFS_POSTPROCESS_COMMAND += "disable_dnsmasq_default_init;"
 
+# smcroute is here so the routed-multicast tests have a real consumer writing
+# ipmr's MFC. They own the daemon's lifecycle: each case starts it with `-N`
+# and a generated config, so the VIF set is exactly the interfaces that case
+# names. A daemon started at boot would enable every multicast-capable
+# interface it could find and shift every VIF index out from under them. The
+# recipe registers no init script today; this is the guard against one
+# arriving with a version bump.
+ROOTFS_POSTPROCESS_COMMAND += "disable_smcroute_init;"
+
+# S35wifi-ap starts hostapd itself, on uap0 with /etc/hostapd-ask.conf, and
+# only when the board has a radio. The package's own init script starts it
+# on wlan0 from the stock /etc/hostapd.conf -- a device no board here has --
+# so it fails on every boot, with or without a radio. Strip its rc links; the
+# init script stays for anyone starting it by hand.
+ROOTFS_POSTPROCESS_COMMAND += "disable_hostapd_default_init;"
+
 disable_conntrackd_init() {
     rm -f ${IMAGE_ROOTFS}/etc/init.d/conntrackd
     rm -f ${IMAGE_ROOTFS}/etc/rcS.d/*conntrackd*
@@ -100,6 +139,16 @@ disable_conntrackd_init() {
 disable_dnsmasq_default_init() {
     rm -f ${IMAGE_ROOTFS}/etc/rcS.d/*dnsmasq*
     rm -f ${IMAGE_ROOTFS}/etc/rc*.d/*dnsmasq*
+}
+
+disable_smcroute_init() {
+    rm -f ${IMAGE_ROOTFS}/etc/init.d/smcroute
+    rm -f ${IMAGE_ROOTFS}/etc/rc*.d/*smcroute*
+}
+
+disable_hostapd_default_init() {
+    rm -f ${IMAGE_ROOTFS}/etc/rcS.d/*hostapd*
+    rm -f ${IMAGE_ROOTFS}/etc/rc*.d/*hostapd*
 }
 
 inherit image

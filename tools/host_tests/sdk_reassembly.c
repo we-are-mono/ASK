@@ -13,6 +13,7 @@ static unsigned allocations, control_calls, reported;
 /* Stop supported requests at their first allocation. Unsupported requests
  * must return before reaching either allocation/control boundary. */
 #define kzalloc(size, flags) (allocations++, (void *)NULL)
+#define ExternalHashTableAllocCumulativeEntry(...) (allocations++, (void *)NULL)
 #define ehash_hcsync_fault_proc_init() (control_calls++)
 #define ManipOrStatsSetNode(...) (allocations++, (t_FmPcdManip *)NULL)
 #define FreeEnEhashInfo(...) ((void)0)

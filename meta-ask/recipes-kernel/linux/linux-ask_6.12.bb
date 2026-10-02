@@ -57,17 +57,14 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://ask-kasan.cfg \
            file://mono-gateway-dk.dts \
            file://010-ask-fman-dpaa-ehash.patch \
-           file://020-ask-bridge-hooks.patch \
            file://030-ask-ipv4-ipv6-forwarding.patch \
            file://040-ask-xfrm-ipsec-offload.patch \
-           file://050-ask-conntrack-offload.patch \
-           file://060-ask-netfilter-qosmark.patch \
            file://070-ask-ppp-hooks.patch \
            file://080-wext-core-restore-ndo_do_ioctl.patch \
            file://090-qbman-dpa_alloc-preallocate-nodes.patch \
            file://091-sdk_dpaa-dpa_get_channel-use-mutex.patch \
            file://092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch \
-           file://093-netlink-name-L2FLOW-cb-mutex.patch \
+           file://093-netlink-name-every-cb-mutex-class.patch \
            file://094-sdk-fman-dpaa-qbman-kasan-sanitize-off.patch \
            file://096-sdk_fman-mac-hash-alloc-null-check.patch \
            file://097-xfrm-trans-queue-force-dst-refcount.patch \
@@ -77,9 +74,29 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://101-sdk_fman-sysfs-restore-irqs-on-early-return.patch \
            file://102-sdk_dpaa-extend-stop-drain-delays.patch \
            file://103-qbman-ceetm-lfq-unwind.patch \
+           file://104-sdk_dpaa-rx-stats-before-stack-verdict.patch \
+           file://105-sdk_dpaa-buffer-seed-failure.patch \
+           file://106-sdk_fman-keep-firmware-port-icids.patch \
+           file://107-sdk_dpaa-offload-hooks-under-rcu.patch \
+           file://108-xfrm-validate-xmit-einprogress.patch \
            file://110-sdk-mainline-build-compat.patch \
            file://120-emc2305-dt-fan-control.patch \
            file://130-thermal-linear-governor.patch \
+           file://140-ask-flowtable-context.patch \
+           file://141-ask-flowtable-teardown-attribution.patch \
+           file://142-ask-flowtable-teardown-handback-once.patch \
+           file://143-ask-flowtable-tunnel-path.patch \
+           file://144-ask-flowtable-extend-ct-timeout.patch \
+           file://145-netfilter-flowtable-upstream-lifetime-fixes.patch \
+           file://146-xfrm-packet-offload-mixed-family-child-route.patch \
+           file://147-netfilter-flowtable-attach-conntrack.patch \
+           file://148-netfilter-nftables-commit-in-progress.patch \
+           file://149-netfilter-flowtable-ipv6-prefix-translation.patch \
+           file://150-sdk_dpaa-hardware-qdisc.patch \
+           file://151-netfilter-flowtable-pppoe-peer.patch \
+           file://160-bridge-switchdev-mdb-group.patch \
+           file://161-bridge-multicast-egress-snapshot.patch \
+           file://162-bridge-forward-path-forwarding-state.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

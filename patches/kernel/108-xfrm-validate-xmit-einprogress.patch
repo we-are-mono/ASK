@@ -1,0 +1,98 @@
+From acb6d2a6fc5aa8a971b600a2177daf3f321a9d21 Mon Sep 17 00:00:00 2001
+From: Petr Wozniak <petr.wozniak@gmail.com>
+Date: Sun, 21 Jun 2026 12:03:26 +0200
+Subject: [PATCH] xfrm: propagate -EINPROGRESS from validate_xmit_xfrm()
+
+validate_xmit_xfrm() returns NULL both when a packet is dropped and
+when it is stolen by async crypto (-EINPROGRESS from ->xmit()).
+Callers cannot distinguish the two cases.
+
+f53c723902d1 ("net: Add asynchronous callbacks for xfrm on layer 2.")
+changed the semantics of a NULL return from "dropped" to "stolen or
+dropped", but __dev_queue_xmit() was not updated.  On virtual/bridge
+interfaces (noqueue qdisc) __dev_queue_xmit() initialises rc=-ENOMEM
+and jumps to out: when skb is NULL, returning -ENOMEM to the caller
+even though the packet will be delivered correctly via xfrm_dev_resume().
+
+Return ERR_PTR(-EINPROGRESS) from validate_xmit_xfrm() for the async
+case so callers can tell it apart from a real drop.  Update
+__dev_queue_xmit() to handle ERR_PTR(-EINPROGRESS) from
+validate_xmit_skb() correctly.  Update validate_xmit_skb_list() to
+use IS_ERR_OR_NULL() so that ERR_PTR(-EINPROGRESS) is not mistakenly
+added to the transmitted list.
+
+Fixes: f53c723902d1 ("net: Add asynchronous callbacks for xfrm on layer 2.")
+Suggested-by: Sabrina Dubroca <sd@queasysnail.net>
+Signed-off-by: Petr Wozniak <petr.wozniak@gmail.com>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+
+(cherry picked from commit 6860b467f569f732b11cbc588ae7e195e90e7e23)
+[ Backport to 6.12: context only; 6.12 has no sk_validate_xmit_skb()
+  or validate_xmit_unreadable_skb() ahead of validate_xmit_skb(). ]
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ net/core/dev.c         | 10 ++++++++--
+ net/xfrm/xfrm_device.c |  4 ++--
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 40936205ea54..cc7f9a48cb0c 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3765,6 +3765,9 @@ int skb_csum_hwoffload_help(struct sk_buff *skb,
+ }
+ EXPORT_SYMBOL(skb_csum_hwoffload_help);
+ 
++/* Returns the skb on success, NULL if dropped, or ERR_PTR(-EINPROGRESS)
++ * if stolen by async xfrm crypto (delivered via xfrm_dev_resume()).
++ */
+ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev, bool *again)
+ {
+ 	netdev_features_t features;
+@@ -3842,7 +3845,7 @@ struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *d
+ 		skb->prev = skb;
+ 
+ 		skb = validate_xmit_skb(skb, dev, again);
+-		if (!skb)
++		if (IS_ERR_OR_NULL(skb))
+ 			continue;
+ 
+ 		if (!head)
+@@ -4548,8 +4551,11 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
+ 				goto recursion_alert;
+ 
+ 			skb = validate_xmit_skb(skb, dev, &again);
+-			if (!skb)
++			if (IS_ERR_OR_NULL(skb)) {
++				if (PTR_ERR(skb) == -EINPROGRESS)
++					rc = NET_XMIT_SUCCESS;
+ 				goto out;
++			}
+ 
+ 			HARD_TX_LOCK(dev, txq, cpu);
+ 
+diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
+index f2a7fa2704a4..d55c0cfeb929 100644
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -208,7 +208,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 		err = x->type_offload->xmit(x, skb, esp_features);
+ 		if (err) {
+ 			if (err == -EINPROGRESS)
+-				return NULL;
++				return ERR_PTR(-EINPROGRESS);
+ 
+ 			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
+ 			kfree_skb(skb);
+@@ -250,7 +250,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 		pskb = skb2;
+ 	}
+ 
+-	return skb;
++	return skb ? skb : ERR_PTR(-EINPROGRESS);
+ }
+ EXPORT_SYMBOL_GPL(validate_xmit_xfrm);
+ 
+-- 
+2.47.3
+

@@ -4,28 +4,28 @@ include $(srctree)/drivers/net/ethernet/freescale/sdk_fman/ncsw_config.mk
 FMAN_DRIVER_PATH = $(srctree)/drivers/net/ethernet/freescale/sdk_fman
 ccflags-y += -I$(FMAN_DRIVER_PATH)/src/wrapper
 ccflags-y += -I$(srctree)/drivers/crypto/caam
-ccflags-y += -DSEC_PROFILE_SUPPORT -DVLAN_FILTER -DWIFI_ENABLE -DENABLE_EGRESS_QOS
+ccflags-y += -DSEC_PROFILE_SUPPORT -DVLAN_FILTER -DENABLE_EGRESS_QOS
 ccflags-y += -DDPA_IPSEC_OFFLOAD
 ccflags-y += -Werror -I$(src) -DENDIAN_LITTLE -DGCC_TOOLCHAIN
 # CFG_FLAGS is forwarded by cdx/Makefile from the outer make invocation
 # (kbuild prefers Kbuild over Makefile when both exist, so the latter's
 # ccflags-y += $(CFG_FLAGS) line never runs in this build path).
 # meta-ask's recipe sets CFG_FLAGS to the debug tripwire defines
-# (CDX_DEBUG_KEY_ZEROING, CDX_DEBUG_MC_HCSYNC_FAIL, CDX_DEBUG_IPSEC_TEST_XFRM,
-# CDX_DEBUG_DPA_INIT)
+# (CDX_DEBUG_KEY_ZEROING, CDX_DEBUG_MC_HCSYNC_FAIL, CDX_DEBUG_DPA_INIT,
+# CDX_DEBUG_FLOWTABLE, CDX_DEBUG_SPLIT_KEY_FAIL)
 # that the rig tests need; production builds leave it empty.
 ccflags-y += $(CFG_FLAGS)
 
-obj-$(CONFIG_ASK_CDX) += cdx.o
+obj-$(CONFIG_ASK_CDX) += cdx.o ask_flowtable.o
 
-cdx-y += cdx_main.o cdx_hal.o cdx_timer.o cdx_cmdhandler.o layer2.o \
-	control_tx.o control_ipv4.o control_ipv6.o \
-	control_vlan.o control_pppoe.o control_socket.o control_bridge.o \
-	control_stat.o control_ipsec.o query_Rx.o control_tunnel.o \
-	control_qm.o control_wifi.o \
+cdx-y += cdx_main.o cdx_hal.o cdx_timer.o layer2.o \
+	control_tx.o control_ipsec.o control_tunnel.o control_qm.o \
 	devman.o cdx_debug.o dpa_cfg.o cdx_dev.o \
 	cdx_dpa.o cdx_ehash.o devoh.o cdx_ceetm_app.o \
-	dpa_control_mc.o cdx_mc_query.o dpa_ipsec.o cdx_dpa_ipsec.o \
-	query_ipsec.o cdx_ifstats.o control_rtp_relay.o \
+	dpa_control_mc.o dpa_ipsec.o cdx_dpa_ipsec.o \
+	cdx_ifstats.o \
 	dpa_wifi.o cdx_qos.o vsp_cfg.o procfs.o \
-	cdx_cmd_validator.o cdx_pcd_desc.o cdx_pcd_ports.o cdx_pcd.o
+	cdx_flowtable_backend.o cdx_flowtable_hw.o \
+	cdx_ipsec_backend.o cdx_wifi_backend.o \
+	cdx_htb.o cdx_police.o cdx_dscp.o cdx_devlink.o \
+	cdx_pcd_desc.o cdx_pcd_ports.o cdx_pcd.o

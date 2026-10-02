@@ -1,0 +1,352 @@
+/* Compile the receive callback and secpath initializer with poisoned metadata
+ * and independently accounted FD, skb and SA ownership. A device that is not a
+ * DPAA port keeps its private area on a page nothing may read or write, so the
+ * callback borrowing it as a port's fails the run by name. */
+#include <assert.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <errno.h>
+
+typedef int gro_result_t;
+#define likely(x) (x)
+#define unlikely(x) (x)
+#define DPAIPSEC_ERROR(...) do {} while (0)
+#define DPA_BUG_ON(x) assert(!(x))
+#define QM_DQRR_STAT_FD_VALID 1
+#define FM_FD_RX_STATUS_ERR_NON_FM 2
+#define NETIF_F_GRO 1
+#define SKB_EXT_SEC_PATH 1
+#define THRESHOLD_IPSEC_BPOOL_REFILL 10
+#define ETHERTYPE_IPV4 0x0800
+#define ETHERTYPE_IPV6 0x86dd
+#define ETH_HLEN 14
+#define ETH_ALEN 6
+#define VLAN_HLEN 4
+#define ETH_P_8021Q 0x8100
+struct ethhdr { unsigned char dst[6], src[6]; uint16_t h_proto; } __attribute__((packed));
+struct vlan_ethhdr { unsigned char dst[6], src[6]; uint16_t h_vlan_proto, h_vlan_TCI, h_vlan_encapsulated_proto; } __attribute__((packed));
+#define XFRM_DEV_OFFLOAD_IN 1
+#define raw_cpu_ptr(p) (p)
+#define phys_to_virt(a) ((void *)(uintptr_t)(a))
+#define qm_fd_contig 0
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define smp_load_acquire(p) (*(p))
+#define smp_store_release(p, v) (*(p) = (v))
+#define DMA_BIDIRECTIONAL 0
+#define qm_fd_addr(p) ((p)->addr)
+typedef int atomic_t;
+#define ATOMIC_INIT(v) (v)
+static int atomic_read(atomic_t *p) { return *p; }
+static void atomic_set(atomic_t *p, int v) { *p = v; }
+static int atomic_add_return(int v, atomic_t *p) { *p += v; return *p; }
+static void atomic_dec(atomic_t *p) { assert(*p > 0); --*p; }
+struct work_struct { int unused; };
+struct delayed_work { struct work_struct work; bool queued; unsigned long delay; };
+#define DECLARE_DELAYED_WORK(name, fn) struct delayed_work name
+static unsigned long msecs_to_jiffies(unsigned long ms) { return ms; }
+static bool schedule_delayed_work(struct delayed_work *w, unsigned long delay)
+{ if (w->queued) return false; w->queued = true; w->delay = delay; return true; }
+#define system_wq NULL
+static bool mod_delayed_work(void *q, struct delayed_work *w, unsigned long delay)
+{ w->queued = true; w->delay = delay; return true; }
+static void cancel_delayed_work_sync(struct delayed_work *w) { w->queued = false; }
+
+enum qman_cb_dqrr_result { qman_cb_dqrr_consume, qman_cb_dqrr_stop };
+struct qman_portal { int unused; };
+struct qman_fq { int unused; };
+struct qm_fd { uintptr_t addr; unsigned offset, length20, bpid, status, format; };
+struct qm_dqrr_entry { struct qm_fd fd; unsigned stat, fqid; };
+struct qman_portal_config { unsigned index; };
+struct dpa_napi_portal { struct qman_portal *p; int napi; };
+struct dpa_percpu_priv_s { unsigned rx_sg; struct dpa_napi_portal np[1]; };
+struct dpa_priv_s { struct dpa_percpu_priv_s *percpu_priv; int *percpu_count; };
+struct net_device;
+struct net_device_ops { int (*ndo_init)(struct net_device *dev); };
+/* priv is what netdev_priv() answers: a struct dpa_priv_s behind a port. */
+struct net_device {
+    unsigned features; const char *name; const struct net_device_ops *netdev_ops;
+    void *priv; unsigned long rx_dropped;
+};
+struct dpa_bp { unsigned count; void *dev; unsigned size; };
+struct xfrm_state { struct { long long use_time; } curlft; struct { unsigned dir; } xso; };
+struct sec_path { int len, olen, verified_cnt; struct xfrm_state *xvec[6]; unsigned ovec[24]; };
+struct sk_buff { struct net_device *dev; unsigned protocol, mac_len; struct sec_path path; bool has_path; unsigned char *data; };
+static unsigned refs, fd_releases, skb_frees, delivered, converted, sg_buffers, added, concurrent, unmapped;
+static unsigned char *received_data;
+static unsigned int reaped;
+static unsigned int dpaa_sec_sg_reap(unsigned int budget)
+{ assert(budget == 64); reaped++; return 0; }
+
+static bool no_device, no_state, napi_defer, refill_fail, secpath_fail, short_frame;
+static struct xfrm_state state;
+static struct sk_buff packet;
+/* The one member of the DPAA driver's ops the driver exports. */
+static int dpa_ndo_init(struct net_device *dev) { (void)dev; return 0; }
+static int other_ndo_init(struct net_device *dev) { (void)dev; return 0; }
+static const struct net_device_ops dpa_ops = { .ndo_init = dpa_ndo_init };
+static const struct net_device_ops bridge_ops = { .ndo_init = other_ndo_init };
+static const struct net_device_ops wifi_ops = { .ndo_init = NULL };
+static struct net_device device = { .name = "eth4", .netdev_ops = &dpa_ops };
+/* The device the SA names. */
+static struct net_device *sa_device = &device;
+static struct dpa_bp pool;
+static struct dpa_bp *dpa_bpid2pool(unsigned id) { (void)id; return &pool; }
+static void dma_unmap_single(void *dev, uintptr_t addr, unsigned size, int direction)
+{ (void)dev; (void)addr; (void)size; (void)direction; assert(!unmapped && !converted); unmapped++; }
+static bool pskb_may_pull(struct sk_buff *skb, unsigned bytes)
+{ assert(skb->data && bytes == ETH_HLEN + VLAN_HLEN + 1); return !short_frame; }
+static unsigned char *skb_pull(struct sk_buff *skb, unsigned bytes)
+{ skb->data += bytes; return skb->data; }
+static struct { struct dpa_bp *ipsec_bp; } ipsecinfo = { .ipsec_bp = &pool };
+static void ipsec_pool_consumed(unsigned int count);
+static int dpaa_bp_alloc_n_add_buffs(struct dpa_bp *p, unsigned count, bool skb)
+{
+    assert(p == &pool && count == 1 && skb);
+    if (refill_fail) return -ENOMEM;
+    if (concurrent) {
+        assert(pool.count >= concurrent);
+        pool.count -= concurrent;
+        ipsec_pool_consumed(concurrent);
+        concurrent = 0;
+    }
+    assert(pool.count < 512);
+    pool.count++; added++;
+    return 0;
+}
+static struct dpa_percpu_priv_s cpu;
+static int bp_count;
+static struct dpa_priv_s priv = { .percpu_priv = &cpu, .percpu_count = &bp_count };
+static inline void dev_core_stats_rx_dropped_inc(struct net_device *dev) { dev->rx_dropped++; }
+static void *skb_ext_find(struct sk_buff *skb, int kind)
+{ (void)kind; return skb->has_path ? &skb->path : NULL; }
+static void *skb_ext_add(struct sk_buff *skb, int kind)
+{ (void)kind; if (secpath_fail) return NULL; skb->has_path = true; return &skb->path; }
+static struct net_device *get_netdev_of_SA_by_fqid(unsigned fqid, unsigned short *handle, unsigned short *tag)
+{ (void)fqid; *handle = 7; *tag = 0x345; return no_device ? NULL : sa_device; }
+static void *dev_net(struct net_device *dev) { return dev; }
+static struct xfrm_state *xfrm_state_lookup_byhandle(void *net, unsigned handle)
+{ (void)net; assert(handle == 7); if (no_state) return NULL; refs++; return &state; }
+static void xfrm_state_put(struct xfrm_state *x) { assert(x == &state && refs); refs--; }
+static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return dev->priv; }
+#ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
+static bool dpaa_eth_napi_schedule(struct dpa_percpu_priv_s *p, struct qman_portal *q)
+{ (void)p; (void)q; return napi_defer; }
+#endif
+static struct sk_buff *contig_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd, bool *gro, bool ts)
+{ (void)p; (void)fd; (void)gro; (void)ts; assert(unmapped && !converted && pool.count); pool.count--; converted++; packet.data = received_data; return &packet; }
+static struct sk_buff *sg_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd, bool *gro, int *count, bool ts)
+{
+    struct sk_buff *skb = contig_fd_to_skb(p, fd, gro, ts);
+    assert(count != priv.percpu_count && pool.count >= sg_buffers - 1);
+    pool.count -= sg_buffers - 1;
+    *count -= sg_buffers;
+    ++*count; /* The SGT returns to BMan. */
+    return skb;
+}
+static unsigned eth_type_trans(struct sk_buff *skb, struct net_device *dev)
+{ unsigned short type; (void)dev; memcpy(&type, skb->data + 12, 2); return type; }
+static long long ktime_get_real_seconds(void) { return 1; }
+static const struct qman_portal_config *qman_p_get_portal_config(struct qman_portal *q)
+{ static struct qman_portal_config pc; (void)q; return &pc; }
+static void dev_kfree_skb(struct sk_buff *skb)
+{
+    assert(skb == &packet && converted == 1 && !skb_frees && !fd_releases);
+    skb_frees++;
+    if (skb->has_path) {
+        assert(skb->path.len >= 0 && skb->path.len <= 1);
+        if (skb->path.len) xfrm_state_put(skb->path.xvec[0]);
+    }
+}
+static void netif_receive_skb(struct sk_buff *skb)
+{
+    assert(skb->path.len == 1 && skb->path.xvec[0] == &state);
+    assert(skb->path.olen == 0 && skb->path.verified_cnt == 0);
+    for (unsigned i = 0; i < sizeof(skb->path.ovec) / sizeof(skb->path.ovec[0]); i++)
+        assert(skb->path.ovec[i] == 0);
+    for (unsigned i = 0; i < 12; i++) assert(skb->data[i] == i + 1);
+    assert(skb->data == received_data + VLAN_HLEN);
+    delivered++;
+    dev_kfree_skb(skb);
+}
+static int napi_gro_receive(int *napi, struct sk_buff *skb)
+{ (void)napi; netif_receive_skb(skb); return 0; }
+static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
+{ (void)dev; (void)fd; assert(!unmapped && !converted && !skb_frees && !fd_releases); fd_releases++; }
+static unsigned errors_logged;
+static void pr_err_ratelimited(const char *fmt, ...) { (void)fmt; errors_logged++; }
+#include "ipsec_receive_production.inc"
+
+/* The page behind every device that is not a port. */
+static void *guard;
+static size_t page;
+
+static void fault(int sig, siginfo_t *info, void *context)
+{
+    static const char touched[] =
+        "FAIL: the callback touched the private area of a device that is not a DPAA port\n";
+    static const char other[] = "FAIL: segmentation fault outside the guard page\n";
+    uintptr_t at = (uintptr_t)info->si_addr, base = (uintptr_t)guard;
+
+    (void)sig; (void)context;
+    if (at >= base && at < base + page)
+        (void)!write(2, touched, sizeof(touched) - 1);
+    else
+        (void)!write(2, other, sizeof(other) - 1);
+    _exit(3);
+}
+
+static void setup_devices(void)
+{
+    struct sigaction sa = { .sa_sigaction = fault, .sa_flags = SA_SIGINFO };
+
+    page = (size_t)sysconf(_SC_PAGESIZE);
+    guard = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(guard != MAP_FAILED);
+    sigemptyset(&sa.sa_mask);
+    assert(!sigaction(SIGSEGV, &sa, NULL) && !sigaction(SIGBUS, &sa, NULL));
+    device.priv = &priv;
+}
+
+static void reset(void)
+{
+    assert(!refs);
+    refs = fd_releases = skb_frees = delivered = converted = unmapped = errors_logged = 0;
+    no_device = no_state = napi_defer = refill_fail = secpath_fail = short_frame = false;
+    memset(&packet, 0, sizeof(packet));
+    state.xso.dir = XFRM_DEV_OFFLOAD_IN;
+    for (unsigned i = 0; i < 12; i++) received_data[i] = i + 1;
+    received_data[12] = 0x81; received_data[13] = 0;
+    received_data[14] = 0x03; received_data[15] = 0x45;
+    received_data[16] = 8; received_data[17] = 0; received_data[18] = 0x45;
+    memset(&packet.path, 0xa5, sizeof(packet.path));
+    bp_count = 640;
+    pool.count = 512;
+    added = concurrent = 0;
+    sg_buffers = 3;
+    ipsec_refill_work.queued = false;
+    ipsec_pool_refill_start();
+}
+static void run_refill(void)
+{
+    assert(ipsec_refill_work.queued);
+    ipsec_refill_work.queued = false;
+    ipsec_pool_refill_work(&ipsec_refill_work.work);
+}
+int main(void)
+{
+    unsigned char frame[64] = { [12] = 8, [14] = 0x45 };
+    unsigned char table[64] = {0};
+    received_data = frame;
+    struct qm_dqrr_entry dq = { .stat = QM_DQRR_STAT_FD_VALID,
+        .fd = { .addr = (uintptr_t)frame, .length20 = sizeof(frame) } };
+    struct qman_portal portal;
+    struct qman_fq fq;
+    setup_devices();
+    for (unsigned sg = 0; sg < 2; sg++) for (unsigned gro = 0; gro < 2; gro++) {
+        dq.fd.format = sg;
+        dq.fd.addr = (uintptr_t)(sg ? table : frame);
+        device.features = gro ? NETIF_F_GRO : 0;
+        for (unsigned fault = 0; fault < 11; fault++) {
+            reset();
+            no_device = fault == 1; no_state = fault == 2;
+            refill_fail = fault == 3; secpath_fail = fault == 4;
+            short_frame = fault == 7;
+            if (fault == 8) frame[15] ^= 1; /* another SA's tag */
+            if (fault == 9) frame[12] = 8;  /* absent shim */
+            if (fault == 10) state.xso.dir = 2; /* encrypted output miss */
+            dq.fd.status = fault == 5 ? FM_FD_RX_STATUS_ERR_NON_FM : 0;
+            dq.stat = fault == 6 ? 0 : QM_DQRR_STAT_FD_VALID;
+            assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_consume);
+            assert(!refs);
+            if (!fault || fault == 3) assert(delivered == 1 && skb_frees == 1 && !fd_releases);
+            if (fault == 4 || (fault >= 7 && fault <= 9)) assert(!delivered && skb_frees == 1 && !fd_releases);
+            if (fault == 1 || fault == 2 || fault == 5 || fault == 10) assert(fd_releases == 1 && !skb_frees && !delivered);
+            if (fault == 6) assert(!fd_releases && !skb_frees);
+            /* A frame SEC refused is not expected here at all -- FMan counts
+             * and drops those -- so one that arrives is said out loud. */
+            assert(errors_logged == (fault == 4 || fault == 5));
+            assert(bp_count == 640);
+            if (converted) {
+                unsigned consumed = sg ? sg_buffers : 1;
+                assert(pool.count == 512 - consumed && ipsec_pool_debt == (int)consumed);
+                run_refill();
+                if (refill_fail) {
+                    assert(!added && ipsec_refill_work.queued && ipsec_refill_work.delay == 20);
+                    refill_fail = false;
+                    run_refill();
+                }
+                assert(pool.count == 512 && added == consumed && !ipsec_pool_debt);
+            }
+        }
+        for (unsigned v6 = 0; v6 < 2; v6++) {
+            reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0;
+            frame[16] = v6 ? 8 : 0x86; frame[17] = v6 ? 0 : 0xdd;
+            frame[18] = v6 ? 0x60 : 0x45;
+            assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_consume);
+            assert(delivered == 1 && packet.protocol == htons(v6 ? ETHERTYPE_IPV6 : ETHERTYPE_IPV4));
+            for (unsigned i = 0; i < sizeof(table); i++) assert(table[i] == 0);
+            run_refill();
+        }
+#ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
+        reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0; napi_defer = true;
+        assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_stop);
+        assert(!refs && !converted && !fd_releases && !skb_frees);
+#endif
+    }
+    /* An SA naming a device that is not a DPAA port: a bridge, a Wi-Fi VAP,
+     * a device with no ops at all. Nothing is built from its private area:
+     * the frame goes back to BMan and is counted as the device's drop, with
+     * no SA reference taken and the IPsec pool untouched. */
+    struct net_device bridge = { .name = "br-lan", .netdev_ops = &bridge_ops, .priv = guard };
+    struct net_device vap = { .name = "wlan0", .netdev_ops = &wifi_ops, .priv = guard };
+    struct net_device no_ops = { .name = "dummy0", .priv = guard };
+    struct net_device *others[] = { &bridge, &vap, &no_ops };
+    for (unsigned i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0;
+        dq.fd.format = qm_fd_contig; dq.fd.addr = (uintptr_t)frame;
+        sa_device = others[i];
+        assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_consume);
+        assert(fd_releases == 1 && !unmapped && !converted && !skb_frees && !delivered);
+        assert(!refs && others[i]->rx_dropped == 1 && errors_logged == 1);
+        assert(pool.count == 512 && !ipsec_pool_debt && bp_count == 640);
+        sa_device = &device;
+    }
+    assert(!device.rx_dropped);
+    /* Exhaust the whole pool under allocation pressure. Only the queued
+     * worker can recover it: no receive event or SA recreation follows. */
+    reset();
+    pool.count = 0;
+    ipsec_pool_consumed(512);
+    refill_fail = true;
+    for (unsigned retry = 0; retry < 5; retry++) {
+        run_refill();
+        assert(!pool.count && ipsec_pool_debt == 512 && ipsec_refill_work.delay == 20);
+    }
+    refill_fail = false;
+    while (ipsec_pool_debt) run_refill();
+    assert(pool.count == 512 && added == 512 && !ipsec_pool_debt);
+    assert(ipsec_refill_work.queued && ipsec_refill_work.delay == 20);
+    unsigned int previous_reaped = reaped;
+    run_refill();
+    assert(reaped == previous_reaped + 1 && ipsec_refill_work.queued);
+    assert(ipsec_refill_work.delay == 20);
+    /* New receive debt during refill is neither lost nor counted twice. */
+    pool.count -= 8;
+    ipsec_pool_consumed(8);
+    assert(ipsec_refill_work.queued && ipsec_refill_work.delay == 0);
+    concurrent = 5;
+    while (ipsec_pool_debt) run_refill();
+    assert(pool.count == 512 && added == 525 && !ipsec_pool_debt);
+    ipsec_pool_consumed(1);
+    ipsec_pool_refill_stop();
+    assert(!ipsec_refill_work.queued);
+    ipsec_pool_refill_work(&ipsec_refill_work.work);
+    assert(added == 525);
+}

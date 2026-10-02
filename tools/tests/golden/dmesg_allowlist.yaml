@@ -19,3 +19,7 @@ allowlist:
     reason: "CONFIG_PROVE_RCU boot announcement; not a real splat. Belt-and-braces in case SPLAT_RE broadens."
     expires: "2027-01-01"
 
+  - pattern: "ASK-DEBUG: "
+    reason: "ASK-DEBUG admission tracing (360a75c) is a per-flow pr_info the test image turns on; SPLAT_RE matches the BUG inside its name. Not a splat."
+    expires: "2027-03-01"
+

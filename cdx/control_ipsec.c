@@ -11,12 +11,9 @@
 #ifdef DPA_IPSEC_OFFLOAD
 #include "dpaa_eth_common.h"
 #include "cdx.h"
-#include "cdx_cmd_validator.h"
 #include "cdx_common.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
-#include "control_pppoe.h"
-#include "control_socket.h"
 #include "layer2.h"
 #include "control_ipsec.h"
 #include "cdx_dpa_ipsec.h"
@@ -24,24 +21,8 @@
 
 //#define CONTROL_IPSEC_DEBUG 1
 
-TIMER_ENTRY sa_timer;
-int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action);
-
-U16 M_ipsec_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd);
-static int IPsec_handle_CREATE_SA(U16 *p, U16 Length);
-static int IPsec_handle_DELETE_SA(U16 *p, U16 Length);
-static int IPsec_handle_FLUSH_SA(U16 *p, U16 Length);
-static int IPsec_handle_SA_SET_KEYS(U16 *p, U16 Length);
-static int IPsec_handle_SA_SET_TUNNEL(U16 *p, U16 Length);
-static int IPsec_handle_SA_SET_NATT(U16 *p, U16 Length);
-static int IPsec_handle_SA_SET_STATE(U16 *p, U16 Length);
-static int IPsec_handle_SA_SET_LIFETIME(U16 *p, U16 Length);
-struct slist_head sa_cache_by_spi[NUM_SA_ENTRIES];
 struct slist_head sa_cache_by_h[NUM_SA_ENTRIES];
 struct slist_head sa_cache_by_fqid[NUM_SA_ENTRIES];
-
-extern void * cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle);
-extern void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
 
 void sa_free(PSAEntry pSA)
 {
@@ -64,14 +45,21 @@ static PSAEntry sa_alloc(void)
  * walks by_h from the DPAA submit paths (softirq). Both race the SA
  * add/remove sites, which run in process context under ctrl.mutex and
  * free the SAEntry right after unlinking. This irqsave spinlock closes
- * both races: writers take it around every list mutation (by_h, by_spi,
- * by_fqid — the by_spi wrap costs nothing at those sites and keeps the
- * rule simple), the two atomic readers take it across their walk and
+ * both races: writers take it around every list mutation (by_h and
+ * by_fqid), the two atomic readers take it across their walk and
  * copy out what they need before unlocking. Walkers already under
  * ctrl.mutex are serialized against the writers by the mutex and stay
  * lock-free. Never nests inside another lock; contention is nil
  * (writers are SA install/teardown only). */
 static DEFINE_SPINLOCK(sa_cache_lock);
+/* SAs in the handle table. Written under sa_cache_lock beside the link it
+ * counts. */
+static unsigned int sa_cache_entries;
+
+unsigned int M_ipsec_sa_cache_entries(void)
+{
+	return READ_ONCE(sa_cache_entries);
+}
 
 static int sa_add(PSAEntry pSA)
 {
@@ -79,7 +67,7 @@ static int sa_add(PSAEntry pSA)
 
 	spin_lock_irqsave(&sa_cache_lock, irqflags);
 	slist_add(&sa_cache_by_h[pSA->hash_by_h], &pSA->list_h);
-	slist_add(&sa_cache_by_spi[pSA->hash_by_spi], &pSA->list_spi);
+	WRITE_ONCE(sa_cache_entries, sa_cache_entries + 1);
 	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 
 	return NO_ERR;
@@ -98,19 +86,20 @@ void sa_remove_from_list_fqid(PSAEntry pSA)
 	slist_remove(&sa_cache_by_fqid[hash], &pSA->list_fqid);
 	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 }
-static void sa_remove(PSAEntry pSA, U32 hash_by_h, U32 hash_by_spi)
+static void sa_remove(PSAEntry pSA)
 {
 	unsigned long irqflags;
 
-	L2_route_put(pSA->pRtEntry);
+	/* The route is the owner's, embedded in it (cdx_ipsec_backend.c);
+	 * nothing is released through the pointer. */
 	pSA->pRtEntry = NULL;
 
 	/* Unlink under the lock so the softirq by_h walker
 	 * (cdx_get_to_sec_fq_handler) can never hold this entry across the
 	 * release/free chain that follows. */
 	spin_lock_irqsave(&sa_cache_lock, irqflags);
-	slist_remove(&sa_cache_by_h[hash_by_h], &pSA->list_h);
-	slist_remove(&sa_cache_by_spi[hash_by_spi], &pSA->list_spi);
+	slist_remove(&sa_cache_by_h[pSA->hash_by_h], &pSA->list_h);
+	WRITE_ONCE(sa_cache_entries, sa_cache_entries - 1);
 	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 
 	/*
@@ -156,6 +145,11 @@ void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa)
 			 * on every iteration and never filtering entries.) */
 			if (!IS_NATT_SA(pEntry))
 				continue;
+			/* Only a twin in the same direction shares an entry:
+			 * an inbound one's parameters are its SPI table, an
+			 * outbound one's its enqueue, in one union. */
+			if (pEntry->direction != sa->direction)
+				continue;
 #ifdef CONTROL_IPSEC_DEBUG
 			printk("%x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x\n", \
 				pEntry->natt.sport,  sa->natt.sport, pEntry->natt.dport,  \
@@ -184,80 +178,87 @@ void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa)
 	return NULL;
 }
 
-void* M_ipsec_sa_cache_lookup_by_spi(U32 *daddr, U32 spi, U8 proto, U8 family)
+
+/* The SEC protocol operation that authenticates as PF_KEY algorithm `alg`
+ * with an ICV of `icv_bits`, or -1 when SEC has none.
+ *
+ * PF_KEY numbers an authenticator by its algorithm alone, but the ICV it
+ * leaves on each frame is the SA's own truncation, and peers choose it: RFC
+ * 4868 gives SHA-2 half its digest, while older Linux and strongSwan's
+ * sha256_96 cut SHA-256 to 96 bits. SEC's IPsec protocol fixes the ICV in the
+ * operation itself (SEC RM table 7-54, PROTINFO[7:0]), so each pair below is
+ * one operation and no pair missing from it can be carried: the frames would
+ * leave with an ICV of the wrong length and every one received would fail
+ * SEC's check. Null authentication leaves no ICV at all. */
+int cdx_ipsec_auth_op(u16 alg, unsigned int icv_bits)
 {
-	U32     hash_key_sa;
-	PSAEntry pEntry;
-	struct slist_entry *entry;
+	static const struct {
+		u16 alg;
+		u16 icv_bits;
+		u16 op;
+	} ops[] = {
+		{ SADB_AALG_MD5HMAC,		 96, OP_PCL_IPSEC_HMAC_MD5_96 },
+		{ SADB_AALG_MD5HMAC,		128, OP_PCL_IPSEC_HMAC_MD5_128 },
+		{ SADB_AALG_SHA1HMAC,		 96, OP_PCL_IPSEC_HMAC_SHA1_96 },
+		{ SADB_AALG_SHA1HMAC,		160, OP_PCL_IPSEC_HMAC_SHA1_160 },
+		{ SADB_X_AALG_SHA2_256HMAC,	128, OP_PCL_IPSEC_HMAC_SHA2_256_128 },
+		{ SADB_X_AALG_SHA2_384HMAC,	192, OP_PCL_IPSEC_HMAC_SHA2_384_192 },
+		{ SADB_X_AALG_SHA2_512HMAC,	256, OP_PCL_IPSEC_HMAC_SHA2_512_256 },
+		{ SADB_X_AALG_AES_XCBC_MAC,	 96, OP_PCL_IPSEC_AES_XCBC_MAC_96 },
+		{ SADB_X_AALG_NULL,		  0, OP_PCL_IPSEC_HMAC_NULL },
+	};
+	unsigned int i;
 
-	hash_key_sa = HASH_SA(daddr, spi, proto, family);
-	slist_for_each(pEntry, entry, &sa_cache_by_spi[hash_key_sa], list_spi)
-	{
-		/* SPI + destination + protocol is the SA identity, so the
-		 * first match is the only match worth reporting. */
-		if ( (pEntry->id.proto == proto) &&
-				(pEntry->id.spi == spi) &&
-				(pEntry->id.daddr.a6[0] == daddr[0]) &&
-				(pEntry->id.daddr.a6[1] == daddr[1]) &&
-				(pEntry->id.daddr.a6[2] == daddr[2]) &&
-				(pEntry->id.daddr.a6[3] == daddr[3])&&
-				(pEntry->family == family))
-			return pEntry;
-	}
-
-	return NULL;
+	for (i = 0; i < ARRAY_SIZE(ops); i++)
+		if (ops[i].alg == alg && ops[i].icv_bits == icv_bits)
+			return ops[i].op;
+	return -1;
 }
 
-
-static int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
+/* Program the SA's authenticator. -EOPNOTSUPP when SEC cannot carry it; any
+ * other error is SEC failing to derive the split key, and leaves the SA with
+ * no authenticator rather than one whose key was never written. */
+int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, unsigned int icv_bits,
+			      U16 key_bits, U8 *key)
 {
-	U16      algo;
+	struct auth_params *auth = &sa->pSec_sa_context->auth_data;
+	int      algo, rc;
 
 	if ((key_bits/8) > IPSEC_MAX_KEY_SIZE)
 	{
 		DPA_ERROR("%s (%d) key_bits %u higher than max key size\n",__func__,__LINE__, key_bits);
-		return -1;
+		return -EOPNOTSUPP;
 	}
 
-	switch (key_alg) {
-		case SADB_AALG_MD5HMAC:
-			algo =OP_PCL_IPSEC_HMAC_MD5_96;
-			break;
-		case SADB_AALG_SHA1HMAC:
-			algo = OP_PCL_IPSEC_HMAC_SHA1_96;
-			break;
-		case SADB_X_AALG_SHA2_256HMAC:
-			algo = OP_PCL_IPSEC_HMAC_SHA2_256_128;
-			break;
-		case SADB_X_AALG_SHA2_384HMAC:
-			algo = OP_PCL_IPSEC_HMAC_SHA2_384_192;
-			break;
-		case SADB_X_AALG_SHA2_512HMAC:
-			algo = OP_PCL_IPSEC_HMAC_SHA2_512_256;
-			break;
-		case SADB_X_AALG_AES_XCBC_MAC:
-			algo = OP_PCL_IPSEC_AES_XCBC_MAC_96;
-			break;
-		case SADB_X_AALG_NULL:
-			algo  =OP_PCL_IPSEC_HMAC_NULL;
-			break;
-		default:
-			return -1;
-	}
-	sa->pSec_sa_context->auth_data.auth_type = algo;
-	sa->pSec_sa_context->auth_data.auth_key_len = (key_bits/8);
-	memcpy(sa->pSec_sa_context->auth_data.auth_key,	key, (key_bits/8));
+	algo = cdx_ipsec_auth_op(key_alg, icv_bits);
+	if (algo < 0)
+		return -EOPNOTSUPP;
+	auth->auth_type = algo;
+	auth->auth_key_len = (key_bits/8);
+	memcpy(auth->auth_key, key, (key_bits/8));
 	/* Generate the split key from the normal auth key. XCBC-MAC derives
 	 * its keys inside the SEC program and null auth has no key at all, so
 	 * neither has a split key to compute. Compare in the OP_PCL namespace
-	 * that the switch above produced, not the SADB one it consumed. */
-	if (algo != OP_PCL_IPSEC_AES_XCBC_MAC_96 && algo != OP_PCL_IPSEC_HMAC_NULL)
-		cdx_ipsec_generate_split_key(&sa->pSec_sa_context->auth_data );
+	 * that the mapping above produced, not the SADB one it consumed. A
+	 * truncation changes only the operation, never the split key: MD5 and
+	 * SHA-1 derive the same one at either ICV length. */
+	if (algo != OP_PCL_IPSEC_AES_XCBC_MAC_96 && algo != OP_PCL_IPSEC_HMAC_NULL) {
+		rc = cdx_ipsec_generate_split_key(auth);
+		if (rc) {
+			/* The generator has already cleared whatever part of a
+			 * split key the failed job stored; the key it was
+			 * derived from goes with it. */
+			auth->auth_type = OP_PCL_IPSEC_HMAC_NULL;
+			auth->auth_key_len = 0;
+			memzero_explicit(auth->auth_key, key_bits / 8);
+			return rc;
+		}
+	}
 	return 0;
 }
 
 
-static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
+int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
 {
 	U16      algo;
 	uint8_t	 comb_mode=0, extra_size=0;
@@ -303,11 +304,15 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 			sa->icvsz = 16;
 			sa->pSec_sa_context->auth_data.split_key_len = 0;
 			break;
-		/* GCM/GMAC offload re-enabled: the shared-descriptor sharing
+		/* GCM offload re-enabled: the shared-descriptor sharing
 		 * policy now keeps GHASH context and PDB.seq coherent across
 		 * DECOs — see cdx_ipsec_sh_desc_hdr_flags() in
-		 * cdx_dpa_ipsec.c. RFC 4106/4543: 4-byte salt trails the AES
-		 * key, hence comb_mode with extra_size 4. */
+		 * cdx_dpa_ipsec.c. RFC 4106: 4-byte salt trails the AES
+		 * key, hence comb_mode with extra_size 4.
+		 *
+		 * SADB_X_EALG_NULL_AES_GMAC has no arm: SEC's AES-GMAC leaves
+		 * out of its ICV the IV that RFC 4543 authenticates, so no
+		 * peer would accept a frame it produced (ft_ipsec_spec()). */
 		case SADB_X_EALG_AES_GCM_ICV8:
 			algo = OP_PCL_IPSEC_AES_GCM8;
 			sa->blocksz = 16;
@@ -326,14 +331,6 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 			break;
 		case SADB_X_EALG_AES_GCM_ICV16:
 			algo = OP_PCL_IPSEC_AES_GCM16;
-			sa->blocksz = 16;
-			comb_mode = 1;
-			extra_size = 4;
-			sa->icvsz = 16;
-			sa->pSec_sa_context->auth_data.split_key_len = 0;
-			break;
-		case SADB_X_EALG_NULL_AES_GMAC:
-			algo = OP_PCL_IPSEC_AES_GMAC;
 			sa->blocksz = 16;
 			comb_mode = 1;
 			extra_size = 4;
@@ -366,20 +363,13 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 	return 0;
 }
 
-static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, U8 family, U16 handle, U8 replay, U8 esn, U16 mtu, U16 dev_mtu, U8 dir)
+void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, U8 family, U16 handle, U8 replay, U8 esn, U16 mtu, U16 dev_mtu, U8 dir)
 {
-	U32     hash_key_sa;
 	PSAEntry sa;
 
-
-	//sa = Heap_Alloc_ARAM(sizeof(SAEntry));
 	sa = sa_alloc();
 	if (sa) {
 		memset(sa, 0, sizeof(SAEntry));
-		hash_key_sa = HASH_SA(daddr, spi, proto, family);
-#ifdef CONTROL_IPSEC_DEBUG
-		printk(KERN_INFO "%s hash_key_sa:%d\n", __func__,hash_key_sa);
-#endif
 		sa->id.saddr[0] = saddr[0];
 		sa->id.saddr[1] = saddr[1];
 		sa->id.saddr[2] = saddr[2];
@@ -395,16 +385,10 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 		sa->handle = handle;
 		sa->mtu = mtu;
 		sa->dev_mtu = dev_mtu;
-		sa->state = SA_STATE_INIT;
 		if (dir)
 			sa->direction = CDX_DPA_IPSEC_INBOUND;
 		else
-		{
 			sa->direction = CDX_DPA_IPSEC_OUTBOUND;
-			/* setting an option to set flag to copy DF bit from inner IP hdr to outer IP hdr */
-			if (sa->family == PROTO_IPV4)
-				sa->hdr_flags |= SA_HDR_COPY_DF;
-		}
 #ifdef CONTROL_IPSEC_DEBUG
 		printk("%s(%d) dir %s, handle %x\n",
 				__func__,__LINE__,(dir)?"INBOUND" : "OUTBOUND", sa->handle);
@@ -428,12 +412,11 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 		sa->pSec_sa_context->cipher_data.cipher_type =OP_PCL_IPSEC_NULL_ENC;
 		if(esn)
 			sa->flags |= SA_ALLOW_EXT_SEQ_NUM;
-		sa->hash_by_spi = hash_key_sa;
 		sa->hash_by_h   =  handle & (NUM_SA_ENTRIES - 1);
 
 		/* The fqid list is what the data path walks to find an SA, so it
-		 * is linked last: until the entry is in the handle and SPI tables
-		 * it cannot be looked up or torn down by the control path, and a
+		 * is linked last: until the entry is in the handle table it
+		 * cannot be looked up or torn down by the control path, and a
 		 * failure here has to leave nothing behind for either path to
 		 * reach. */
 		if (sa_add(sa) != NO_ERR)
@@ -471,82 +454,20 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 	return sa;
 }
 
-static int M_ipsec_sa_cache_delete(U16 handle)
+int M_ipsec_sa_cache_delete(U16 handle)
 {
-	U32     hash_key_sa_by_spi;
-	U32	hash_key_sa_by_h = handle & (NUM_SA_ENTRIES-1);
 	PSAEntry pSA;
-
 
 	pSA = M_ipsec_sa_cache_lookup_by_h(handle);
 	if (!pSA)
 		return ERR_SA_UNKNOWN;
-	hash_key_sa_by_spi = HASH_SA(pSA->id.daddr.top, pSA->id.spi, pSA->id.proto, pSA->family);
 
-	sa_remove(pSA , hash_key_sa_by_h , hash_key_sa_by_spi);
+	sa_remove(pSA);
 	return NO_ERR;
 }
 
 
-int IPsec_handle_CREATE_SA(U16 *p, U16 Length)
-{
-	CommandIPSecCreateSA cmd;
-	U8 family;
 
-	/* Check length */
-	if (Length != sizeof(CommandIPSecCreateSA))
-		return ERR_WRONG_COMMAND_SIZE;
-
-	memset(&cmd, 0, sizeof(CommandIPSecCreateSA));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s sagd %d\n", __func__, cmd.sagd);
-#endif
-	family = (cmd.said.proto_family == PROTO_FAMILY_IPV4) ? PROTO_IPV4 : PROTO_IPV6;
-	if (M_ipsec_sa_cache_lookup_by_spi((U32*) cmd.said.dst_ip , cmd.said.spi, cmd.said.sa_type , family)) {
-		return ERR_SA_DUPLICATED;
-	}
-	if (M_ipsec_sa_cache_lookup_by_h(cmd.sagd)) {
-		return ERR_SA_DUPLICATED;
-	}
-
-	if (M_ipsec_sa_cache_create((U32*)cmd.said.src_ip, (U32*)cmd.said.dst_ip , cmd.said.spi, cmd.said.sa_type , family, cmd.sagd, cmd.said.replay_window, (cmd.said.flags & NLKEY_SAFLAGS_ESN), cmd.said.mtu, cmd.said.dev_mtu, (cmd.said.flags & NLKEY_SAFLAGS_INBOUND))) {
-#ifdef CONTROL_IPSEC_DEBUG
-		printk(KERN_CRIT "%s::spi %x, type %d, dstip %08x, sagd %d family %d flags %d\n",
-				__func__, cmd.said.spi, cmd.said.sa_type, cmd.said.dst_ip[0], 
-				cmd.sagd, cmd.said.proto_family, cmd.said.flags);
-#endif
-		return NO_ERR;
-	}
-	else
-		return ERR_CREATION_FAILED;
-
-}
-
-
-
-static int IPsec_handle_DELETE_SA(U16 *p, U16 Length)
-{
-	CommandIPSecDeleteSA cmd;
-	int rc;
-
-	/* Check length */
-	if (Length != sizeof(CommandIPSecDeleteSA))
-		return ERR_WRONG_COMMAND_SIZE;
-	memset(&cmd, 0, sizeof(CommandIPSecDeleteSA));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s::sagd %d\n", __func__,
-			cmd.sagd);
-#endif
-
-	rc = M_ipsec_sa_cache_delete(cmd.sagd);
-
-	return (rc);
-
-}
 
 /* Called from the QMan portal dqrr callback (atomic context) — one of
  * the two SA-cache readers outside ctrl.mutex (see sa_cache_lock's
@@ -556,7 +477,8 @@ static int IPsec_handle_DELETE_SA(U16 *p, U16 Length)
  * be copied out before unlocking. The returned net_device's own
  * lifetime is the SA teardown discipline's concern (NETDEV_UNREGISTER
  * handling), not this lock's. */
-struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
+struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt,
+					 uint16_t *tag)
 {
 	PSAEntry sa_ptr;
 	struct slist_entry *tmp;
@@ -581,6 +503,7 @@ struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
 		if (sa_ptr->pSec_sa_context->to_cp_fqid ==  fqid)
 		{
 			*sagd_pkt = sa_ptr->handle;
+			*tag = cdx_ipsec_key_tag_of(sa_ptr);
 			netdev = sa_ptr->netdev;
 			break;
 		}
@@ -589,720 +512,18 @@ struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
 	return netdev;
 }
 
-
-static int IPsec_handle_FLUSH_SA(U16 *p, U16 Length)
+/* Install the SA's classifier entry: the UDP-encapsulated one for a NAT-T SA,
+ * the ESP one otherwise. */
+int ipsec_install_fp_entry(PSAEntry sa)
 {
-	PSAEntry pEntry;
-	int i;
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s::\n", __func__);
-#endif
-	// scan sa_cache and delete sa
-	for(i = 0; i < NUM_SA_ENTRIES; i++)
-	{
-		struct slist_entry *entry;
-		slist_for_each_safe(pEntry, entry, &sa_cache_by_h[i], list_h)
-		{
-			U32  hash_key_sa_by_h = pEntry->handle & (NUM_SA_ENTRIES-1);
-			U32  hash_key_sa_by_spi = HASH_SA(pEntry->id.daddr.top, pEntry->id.spi, pEntry->id.proto, pEntry->family);
-
-			sa_remove(pEntry, hash_key_sa_by_h, hash_key_sa_by_spi);
-		}
-	}
-	{
-		unsigned long irqflags;
-
-		/* The per-SA removes above already emptied the lists; this
-		 * re-zero of the heads is belt-and-braces and still follows
-		 * the sa_cache_lock rule for list mutation so the softirq
-		 * walkers never observe an unlocked write. */
-		spin_lock_irqsave(&sa_cache_lock, irqflags);
-		memset(sa_cache_by_h, 0, sizeof(struct slist_head)*NUM_SA_ENTRIES);
-		memset(sa_cache_by_spi, 0, sizeof(struct slist_head)*NUM_SA_ENTRIES);
-		spin_unlock_irqrestore(&sa_cache_lock, irqflags);
-	}
-	return NO_ERR;
-}
-
-int IPsec_handle_SA_SET_KEYS(U16 *p, U16 Length)
-{
-	CommandIPSecSetKey cmd;
-	PIPSec_key_desc key;
-	PSAEntry sa;
-	int i;
-
-	/* Check length */
-	if (Length != sizeof(CommandIPSecSetKey))
-		return ERR_WRONG_COMMAND_SIZE;
-	memset(&cmd, 0, sizeof(CommandIPSecSetKey));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s sagd %d, numkeys %d\n", __func__, cmd.sagd,cmd.num_keys);
-#endif
-	sa = M_ipsec_sa_cache_lookup_by_h(cmd.sagd);
-	if (sa == NULL)
-		return ERR_SA_UNKNOWN;
-	sa->pSec_sa_context->auth_data.auth_type = 0;
-	for (i = 0;i<cmd.num_keys;i++) {
-		key = (PIPSec_key_desc)&cmd.keys[i];
-#ifdef CONTROL_IPSEC_DEBUG
-		printk("%s(%d) key type %d, key alg %d, key bits %d \n",
-				__func__,__LINE__, key->key_type, key->key_alg,key->key_bits);
-#endif
-		if (key->key_type) {
-			if (M_ipsec_sa_set_cipher_key(sa, key->key_alg, key->key_bits, key->key))
-			{
-				DPA_ERROR("%s (%d) M_ipsec_sa_set_cipher_key failed\n",__func__,__LINE__);
-				return ERR_SA_INVALID_CIPHER_KEY;
-			}
-		}
-		else if (M_ipsec_sa_set_digest_key(sa, key->key_alg, key->key_bits, key->key))
-		{
-			DPA_ERROR("%s (%d) M_ipsec_sa_set_digest_keyfailed\n",__func__,__LINE__);
-			return ERR_SA_INVALID_DIGEST_KEY;
-		}
-	}
-
-	return NO_ERR;
-}
-
-int IPsec_handle_SA_SET_TUNNEL(U16 *p, U16 Length)
-{
-	CommandIPSecSetTunnel cmd;
-	PSAEntry sa;
-
-	/* Check length */
-	if (Length != sizeof(CommandIPSecSetTunnel))
-		return ERR_WRONG_COMMAND_SIZE;
-	memset(&cmd, 0, sizeof(CommandIPSecSetTunnel));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s sagd %d\n", __func__, cmd.sagd);
-#endif
-	sa = M_ipsec_sa_cache_lookup_by_h(cmd.sagd);
-
-	if (sa == NULL)
-		return ERR_SA_UNKNOWN;
-	if (cmd.proto_family == PROTO_FAMILY_IPV4) {
-		sa->header_len = IPV4_HDR_SIZE;
-		memcpy(&sa->tunnel.ip4, &cmd.h.ipv4h, sa->header_len);
-		sa->tunnel.ip4.Protocol = IPPROTOCOL_ESP;
-#ifdef CONTROL_IPSEC_DEBUG
-		printk(KERN_ERR "%s IPV4 Tunnel header, length= %d \n", __func__,sa->header_len);
-		printk(KERN_ERR " version %02x tos  %02x length  %04x \n ",cmd.h.ipv4h.Version_IHL,cmd.h.ipv4h.TypeOfService, cmd.h.ipv4h.TotalLength);
-		printk(KERN_ERR " Identification  %04x Flag_Frag %04x \n",cmd.h.ipv4h.Identification,cmd.h.ipv4h.Flags_FragmentOffset);
-		printk(KERN_ERR " TTL %02x protocol  %02x header check sum  %04x\n ",cmd.h.ipv4h.TTL,cmd.h.ipv4h.Protocol, cmd.h.ipv4h.HeaderChksum );
-		printk(KERN_ERR " Source %08x \n dest %08x \n ",cmd.h.ipv4h.SourceAddress,cmd.h.ipv4h.DestinationAddress );
-#endif
-	}
-	else {
-		sa->header_len = IPV6_HDR_SIZE;
-		memcpy(&sa->tunnel.ip6, &cmd.h.ipv6h, sa->header_len);
-		sa->tunnel.ip6.NextHeader = IPPROTOCOL_ESP;
-	}
-
-	sa->mode = SA_MODE_TUNNEL;
-	return NO_ERR;
-
-}
-
-static int IPsec_handle_SA_SET_NATT(U16 *p, U16 Length)
-{
-	CommandIPSecSetNatt  cmd;
-	PSAEntry sa;
-
-	/* Check length */
-	if (Length != sizeof(CommandIPSecSetNatt))
-		return ERR_WRONG_COMMAND_SIZE;
-
-	// NAT-T modifications
-	memset(&cmd, 0, sizeof(CommandIPSecSetNatt));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s::sagd %d\n", __func__,
-			cmd.sagd);
-#endif
-	sa = M_ipsec_sa_cache_lookup_by_h(cmd.sagd);
-
-	if (sa == NULL)
-		return ERR_SA_UNKNOWN;
-
-	// Add the socket information
-	sa->natt.sport = htons(cmd.sport);
-	sa->natt.dport = htons(cmd.dport);
-	sa->natt.socket = NULL;
-
-	return NO_ERR;
-}
-
-
-#ifdef CDX_DEBUG_IPSEC_TEST_XFRM
-#include <linux/socket.h>	/* AF_INET / AF_INET6 */
-#include <linux/in.h>		/* IPPROTO_ESP */
-#include <linux/netdevice.h>	/* struct net_device */
-#include <net/net_namespace.h>	/* dev_net */
-#include <net/xfrm.h>		/* xfrm_state_lookup, xfrm_address_t */
-
-/*
- * TEST-ONLY, NOT FOR PRODUCTION (meta-ask test image only; ISSUES.md H5).
- *
- * Production resolves an SA's kernel xfrm_state by handle alone
- * (cdx_get_xfrm_state_of_sa -> xfrm_state_lookup_byhandle), the handle
- * being the sagd strongSwan stamped into the state. A synthetic FCI SA
- * (no strongSwan) has no such state, so its push always fails the gate
- * below and cdx_ipsec_delete_fp_entry nulls its ct -- which makes the
- * NAT-T per-flow SPI-array path (cdx_dpa_ipsec.c:2290..2322) unreachable
- * to a host-only test: no same-flow SA ever keeps a populated ct for the
- * next to accumulate against.
- *
- * This fallback lets a test that pre-created a matching `ip xfrm state`
- * (same daddr + spi, proto ESP) clear the gate with a genuine, ref-held
- * xfrm_state, so the SPI-array fill and the :2322 bounds check run as
- * real code under a real ref. Nothing else changes: the bounds check and
- * all NAT-T bookkeeping remain the production paths.
- *
- * Byte order: sa->id.spi is host-order (the CREATE spi copied verbatim
- * on LE; cf. the un-converted spi_param[].spi store at
- * cdx_dpa_ipsec.c:2332), whereas xfrm_state_lookup matches x->id.spi
- * which the kernel holds as the on-wire __be32 -- hence cpu_to_be32().
- * sa->id.daddr already holds the address network-order (its union aliases
- * xfrm_address_t). Inbound only: the if-branch reaching :2322 is inbound
- * (cdx_dpa_ipsec.c:2316), keyed on daddr.
- *
- * Ref discipline: xfrm_state_lookup takes a reference
- * (__xfrm_state_lookup -> xfrm_state_hold_rcu), exactly like the
- * by-handle path, so the existing puts (route-repush put below, final
- * release via cdx_dpa_ipsec_xfrm_state_dec_ref_cnt) stay balanced.
- */
-static void *cdx_test_xfrm_lookup_by_sa(PSAEntry sa)
-{
-	unsigned short family;
-
-	if (!sa->netdev)
-		return NULL;
-	family = (sa->family == PROTO_IPV4) ? AF_INET : AF_INET6;
-	return xfrm_state_lookup(dev_net((struct net_device *)sa->netdev), 0,
-				 (const xfrm_address_t *)&sa->id.daddr,
-				 cpu_to_be32(sa->id.spi), IPPROTO_ESP, family);
-}
-#endif /* CDX_DEBUG_IPSEC_TEST_XFRM */
-
-static int ipsec_push_sa_to_fast_path(PSAEntry sa)
-{
-	void *xfrm_state;
 	int rc;
-
 
 	if (IS_NATT_SA(sa))
-	{
 		rc = cdx_ipsec_process_udp_classification_table_entry(sa);
-		if (rc)
-			return ERR_CREATION_FAILED;
-	}
-	else {
+	else
 		rc = cdx_ipsec_add_classification_table_entry(sa);
-		if (rc)
-			return ERR_CREATION_FAILED;
-	}
 
-	/* The classification entry install is what resolves sa->netdev, so
-	 * the state lookup can only run after it. If the lookup fails the
-	 * entry just installed has to come back out: leaving it behind would
-	 * classify traffic into a SEC context with no xfrm state to handle
-	 * the exceptions it raises. */
-	xfrm_state = cdx_get_xfrm_state_of_sa(sa->netdev, sa->handle);
-#ifdef CDX_DEBUG_IPSEC_TEST_XFRM
-	/* Test image only: fall back to a real by-SPI xfrm lookup so a
-	 * synthetic NAT-T SA whose matching `ip xfrm state` was pre-created
-	 * clears this gate with a ref-held state, making the H5 SPI-array
-	 * path reachable. See cdx_test_xfrm_lookup_by_sa above. */
-	if (!xfrm_state)
-		xfrm_state = cdx_test_xfrm_lookup_by_sa(sa);
-#endif
-	if (!xfrm_state)
-	{
-		printk(KERN_ERR "%s(%d) : cdx_get_xfrm_state_of_sa failed\n",
-				__func__,__LINE__);
-		cdx_ipsec_delete_fp_entry(sa);
-		return ERR_CREATION_FAILED;
-	}
-
-	/* A route update re-pushes an already VALID SA through here; the
-	 * lookup takes a reference each time, so hand back the one the
-	 * previous push stored before overwriting it. The only other put is
-	 * at final SA release. */
-	if (sa->xfrm_state)
-		cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(sa->xfrm_state);
-	sa->xfrm_state = xfrm_state;
-	sa->flags |= SA_ENABLED;
-	sa->lft_cur.bytes = 0;
-	sa->lft_cur.packets = 0;
-	return NO_ERR;
-}
-
-
-static int IPsec_handle_SA_SET_TNL_ROUTE(U16 *p, U16 Length)
-{
-	CommandIPSecSetTunnelRoute  cmd;
-	PSAEntry sa;
-	PRouteEntry NewRtEntry = NULL;
-
-	/* Check length */
-	if (Length != sizeof(CommandIPSecSetTunnelRoute))
-		return ERR_WRONG_COMMAND_SIZE;
-
-	memset(&cmd, 0, sizeof(CommandIPSecSetTunnelRoute));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s sagd %d\n", __func__, cmd.sagd);
-#endif
-	sa = M_ipsec_sa_cache_lookup_by_h(cmd.sagd);
-
-	if (sa == NULL)
-		return ERR_SA_UNKNOWN;
-
-	if (sa->mode != SA_MODE_TUNNEL)
-		return ERR_SA_INVALID_MODE;
-
-	/* Resolve the new route before the SA is touched: the fast path is
-	 * torn down and rebuilt below and cannot be failed out of, so an id
-	 * that cannot be resolved has to be rejected while the SA still holds
-	 * its previous route -- no later command would repair an SA left
-	 * routeless here. The old reference is kept until the new one is in
-	 * hand, because re-taking it on failure can itself fail on a
-	 * saturated reference count. A route id of 0 is how a withdrawn route
-	 * is signalled and detaches the SA by design. */
-	if (cmd.route_id)
-	{
-		NewRtEntry = L2_route_get(cmd.route_id);
-		if (!NewRtEntry)
-			return ERR_RT_ENTRY_NOT_FOUND;
-	}
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s : new route id = %d new route Entry = %p \n ",__func__ ,cmd.route_id,NewRtEntry);
-#endif
-
-	if (NewRtEntry == sa->pRtEntry) {
-		/* Same route as the SA already holds, or a repeated detach:
-		 * hand back the duplicate reference and leave the fast path
-		 * alone, so a re-sent route event costs no traffic. */
-		L2_route_put(NewRtEntry);
-		sa->route_id = cmd.route_id;
-		return NO_ERR;
-	}
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk("%s::replacing rtentry %p by %p in sa %p  dir %d\n",
-			__func__, sa->pRtEntry, NewRtEntry, sa, sa->direction);
-#endif
-	L2_route_put(sa->pRtEntry);
-	sa->pRtEntry = NewRtEntry; /* changing to new route entry */
-	sa->route_id = cmd.route_id;
-
-	if (sa->direction == CDX_DPA_IPSEC_INBOUND)
-		return NO_ERR;
-
-	/* remove the old fastpath entry */
-	if ((sa->ct) && (sa->ct->handle)) {
-		int del_rc = cdx_ipsec_delete_fp_entry(sa);
-
-		/* If the old classifier key was not provably unlinked, the
-		 * re-push below would add the same key again and build a
-		 * duplicate-key bucket that no later delete can fully clear.
-		 * Refuse the re-push and report it: the stale entry is
-		 * abandoned (not provably unlinked, so it cannot be freed) and
-		 * keeps classifying with its previous route, but a second copy
-		 * could not improve that and would make it unrecoverable. The unsynced arm leaves the key
-		 * provably out (parked in the quarantine), so the re-push is
-		 * safe there; the non-delete arms (nothing installed, or a
-		 * shared NAT-T entry only dropping a reference) return 0. */
-		if (del_rc && del_rc != EN_EHASH_DELETE_UNSYNCED)
-			return ERR_CREATION_FAILED;
-	}
-
-	/* The push dereferences the route, so it only runs when the SA
-	 * actually has one: a detach legitimately ends here with the fast
-	 * path torn down. */
-	if ((sa->state == SA_STATE_VALID) && (sa->pRtEntry)) {
-#ifdef CONTROL_IPSEC_DEBUG
-		printk("%s::route updated on outbound sa %p, pushing entry to fp\n",
-				__func__, sa);
-#endif
-		return(ipsec_push_sa_to_fast_path(sa));
-	}
-
-	return NO_ERR;
-}
-
-int IPsec_handle_SA_SET_STATE(U16 *p, U16 Length)
-{
-	CommandIPSecSetState cmd;
-	PSAEntry sa;
-
-	/* Check length */
-	if (Length != sizeof(CommandIPSecSetState))
-		return ERR_WRONG_COMMAND_SIZE;
-	memset(&cmd, 0, sizeof(CommandIPSecSetState));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s sagd %d\n", __func__, cmd.sagd);
-#endif
-
-	sa = M_ipsec_sa_cache_lookup_by_h(cmd.sagd);
-
-	if (sa == NULL)
-		return ERR_SA_UNKNOWN;
-#ifdef CONTROL_IPSEC_DEBUG
-	printk("%s::cmd state :%x sa state %x sa %p, dir %d\n", 
-			__func__, cmd.state, sa->state, sa, sa->direction);
-#endif
-
-	if ((cmd.state == XFRM_STATE_VALID) &&  (sa->state == SA_STATE_INIT)) {
-#ifdef CONTROL_IPSEC_DEBUG
-		printk(KERN_INFO "valid:\n");
-#endif
-		sa->state = SA_STATE_VALID;
-		/* SA information is populated in various commands.
-		 * This will be the final command in the sequnce.
-		 * So here we can push all the relevent information to DPAA.
-		 * a) populate  algorithm, key, tunnel header to shared descriptor.
-		 * b) create flow entry for encrypted traffic.
-		 * For ipsec enabled traffic there will be total of 4 flows (considering  both
-		 * directions). Two flows will get added during  SA creation time.
-		 * Other two will get added when the connection tracker add the flow.
-		 * The entry added during sa will be used by all the connections which will
-		 * use this SA.
-		 *       - for inbound SA flow entry  will be added to WAN interface's ESP
-		 *	  classification table.
-		 *	- for outbound SA,flow entry will be added to offline port's ESP
-		 *         classification table.
-		 */
-		if ((sa->direction == CDX_DPA_IPSEC_OUTBOUND) && (!sa->pRtEntry)) {
-#ifdef CONTROL_IPSEC_DEBUG
-			printk("%s::no route on outbound sa skip adding sagd %d entry to fast path\n",
-					__func__, cmd.sagd);
-#endif
-			return NO_ERR;
-
-		}
-		return (ipsec_push_sa_to_fast_path(sa));
-	}
-	else if (cmd.state != XFRM_STATE_VALID) {
-#ifdef CONTROL_IPSEC_DEBUG
-		printk(KERN_INFO "not valid:\n");
-#endif
-		sa->state = SA_STATE_DEAD;
-		sa->flags &= ~SA_ENABLED;
-		M_ipsec_sa_cache_delete(sa->handle);
-		return NO_ERR;
-	}
-	return NO_ERR;
-}
-
-
-int IPsec_handle_SA_SET_LIFETIME(U16 *p, U16 Length)
-{
-	CommandIPSecSetLifetime cmd;
-	PSAEntry sa;
-
-	/* Check length */
-	if (Length != sizeof(CommandIPSecSetLifetime))
-		return ERR_WRONG_COMMAND_SIZE;
-
-	memset(&cmd, 0, sizeof(CommandIPSecSetLifetime));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s::sagd %d\n", __func__,
-			cmd.sagd);
-#endif
-	sa = M_ipsec_sa_cache_lookup_by_h(cmd.sagd);
-
-	if (sa == NULL)
-		return ERR_SA_UNKNOWN;
-
-	sa->lft_conf.soft_byte_limit =  (U64)cmd.soft_time.bytes[0] + ((U64)cmd.soft_time.bytes[1] << 32);
-	sa->lft_conf.soft_packet_limit = cmd.soft_time.allocations;
-	sa->lft_conf.hard_byte_limit =  (U64)cmd.hard_time.bytes[0] + ((U64)cmd.hard_time.bytes[1] << 32);
-	sa->lft_conf.hard_packet_limit = cmd.hard_time.allocations;
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk (KERN_INFO "set_lifetime:bytes:%llu - %llu\n",sa->lft_conf.soft_byte_limit, sa->lft_conf.hard_byte_limit);
-#endif
-	return NO_ERR;
-}
-
-/**
- * M_ipsec_cmdproc
- *
- *
- *
- */
-static U16 ipsec_create_sa_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_CREATE_SA(pcmd, cmd_len);
-}
-
-static U16 ipsec_delete_sa_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_DELETE_SA(pcmd, cmd_len);
-}
-
-static U16 ipsec_flush_sa_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_FLUSH_SA(pcmd, cmd_len);
-}
-
-static U16 ipsec_set_keys_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_SA_SET_KEYS(pcmd, cmd_len);
-}
-
-static U16 ipsec_set_tunnel_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_SA_SET_TUNNEL(pcmd, cmd_len);
-}
-
-static U16 ipsec_set_tnl_route_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_SA_SET_TNL_ROUTE(pcmd, cmd_len);
-}
-
-static U16 ipsec_set_natt_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_SA_SET_NATT(pcmd, cmd_len);
-}
-
-static U16 ipsec_set_state_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_SA_SET_STATE(pcmd, cmd_len);
-}
-
-static U16 ipsec_set_lifetime_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_SA_SET_LIFETIME(pcmd, cmd_len);
-}
-
-/*
- * Query/query-cont split (dispatcher doesn't forward cmd_code):
- *   QUERY     → reset_action = 1
- *   QUERY_CONT → reset_action = 0
- * On NO_ERR, reply_len = sizeof(U16) + sizeof(SAQueryCommand)
- * (VLAN/IPv4-style wire contract). The old cmdproc did not
- * length-check the query arms, so preserve via CDX_CMD_VAR(0,
- * U16_MAX).
- */
-static U16 ipsec_query_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	U16 rc;
-
-	(void)cmd_len;
-	rc = (U16)IPsec_Get_Next_SAEntry((PSAQueryCommand)pcmd, 1);
-	if (rc == NO_ERR)
-		*out_reply_len = sizeof(U16) + sizeof(SAQueryCommand);
-	return rc;
-}
-
-static U16 ipsec_query_cont_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	U16 rc;
-
-	(void)cmd_len;
-	rc = (U16)IPsec_Get_Next_SAEntry((PSAQueryCommand)pcmd, 0);
-	if (rc == NO_ERR)
-		*out_reply_len = sizeof(U16) + sizeof(SAQueryCommand);
-	return rc;
-}
-
-/*
- * CMD_IPSEC_SEC_FAILURE_STATS: inner returns positive stats-buffer
- * length on success (not a U16 status), or ERR_WRONG_COMMAND_SIZE /
- * ERR_WRONG_COMMAND_PARAM on failure. The old cmdproc treated
- * any rc > 0 as "payload length present" and did retlen += rc.
- * Reproduce exactly: bump reply_len on any rc > 0 (including error
- * paths — the pre-migration behavior is that the error codes are
- * small positive numbers so retlen would grow by a handful of
- * bytes), and let the dispatcher stamp pcmd[0] with the returned
- * value. On the success path pcmd[0] holds the byte count, NOT
- * NO_ERR — that's the pre-existing wire contract.
- */
-static U16 ipsec_sec_failure_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	int rc;
-
-	rc = IPsec_get_SEC_failure_stats((uint16_t *)pcmd, cmd_len);
-	if (rc > 0)
-		*out_reply_len = sizeof(U16) + (U16)rc;
-	return (U16)rc;
-}
-
-static U16 ipsec_reset_sec_failure_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_reset_SEC_failure_stats((uint16_t *)pcmd, cmd_len);
-}
-
-static const struct cdx_cmd_spec ipsec_cmd_table[] = {
-	CDX_CMD    (CMD_IPSEC_SA_CREATE,                CommandIPSecCreateSA,       ipsec_create_sa_handle),
-	CDX_CMD    (CMD_IPSEC_SA_DELETE,                CommandIPSecDeleteSA,       ipsec_delete_sa_handle),
-	CDX_CMD_VAR(CMD_IPSEC_SA_FLUSH,                 0, U16_MAX, NULL,           ipsec_flush_sa_handle),
-	CDX_CMD    (CMD_IPSEC_SA_SET_KEYS,              CommandIPSecSetKey,         ipsec_set_keys_handle),
-	CDX_CMD    (CMD_IPSEC_SA_SET_TUNNEL,            CommandIPSecSetTunnel,      ipsec_set_tunnel_handle),
-	CDX_CMD    (CMD_IPSEC_SA_SET_TNL_ROUTE,         CommandIPSecSetTunnelRoute, ipsec_set_tnl_route_handle),
-	CDX_CMD    (CMD_IPSEC_SA_SET_NATT,              CommandIPSecSetNatt,        ipsec_set_natt_handle),
-	CDX_CMD    (CMD_IPSEC_SA_SET_STATE,             CommandIPSecSetState,       ipsec_set_state_handle),
-	CDX_CMD    (CMD_IPSEC_SA_SET_LIFETIME,          CommandIPSecSetLifetime,    ipsec_set_lifetime_handle),
-	/* QUERY/QUERY_CONT cast pcmd to PSAQueryCommand and write
-	 * sizeof(SAQueryCommand) into it; min == sizeof(SAQueryCommand)
-	 * ensures the buffer is large enough. ISSUES.md A1b item 6. */
-	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY,          sizeof(SAQueryCommand), U16_MAX, NULL,           ipsec_query_handle),
-	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY_CONT,     sizeof(SAQueryCommand), U16_MAX, NULL,           ipsec_query_cont_handle),
-	CDX_CMD_VAR(CMD_IPSEC_SEC_FAILURE_STATS,        0, U16_MAX, NULL,           ipsec_sec_failure_stats_handle),
-	CDX_CMD_VAR(CMD_IPSEC_RESET_SEC_FAILURE_STATS,  0, U16_MAX, NULL,           ipsec_reset_sec_failure_stats_handle),
-};
-
-U16 M_ipsec_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
-{
-	return cdx_dispatch_cmd(ipsec_cmd_table, ARRAY_SIZE(ipsec_cmd_table),
-				cmd_code, cmd_len, pcmd);
-}
-
-static __inline int M_ipsec_sa_expire_notify(PSAEntry sa, int hard)
-{
-	struct _tCommandIPSecExpireNotify *message;
-	HostMessage *pmsg;
-
-	pmsg = msg_alloc();
-	if (!pmsg)
-		goto err;
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "sending an event:%x:%x\n",hard,sa->handle);
-#endif
-	message = (struct _tCommandIPSecExpireNotify *)	pmsg->data;
-
-	/*Prepare indication message*/
-	message->sagd = sa->handle;
-	message->action = (hard) ? IPSEC_HARD_EXPIRE : IPSEC_SOFT_EXPIRE;
-	pmsg->code = CMD_IPSEC_SA_NOTIFY;
-	pmsg->length = sizeof(*message);
-
-	if (msg_send(pmsg) < 0)
-		goto err;
-
-	return 0;
-
-err:
-	return 1;
-}
-
-
-static int M_ipsec_sa_timer(struct timer_entry_t *timer_node)
-{
-	PSAEntry pEntry;
-	int i;
-	struct en_tbl_entry_stats stats;
-
-	/* Check if classification table entire's  byte/packet count exceed the limit
-	 * set in SA 
-	 */
-	for(i = 0; i < NUM_SA_ENTRIES; i++)
-	{
-		struct slist_entry *entry;
-
-		slist_for_each(pEntry, entry, &sa_cache_by_h[i], list_h)
-		{
-			if ((pEntry->ct) &&
-					(pEntry->lft_conf.hard_byte_limit ||
-					 pEntry->lft_conf.hard_packet_limit ||
-					 pEntry->lft_conf.soft_packet_limit ||
-					 pEntry->lft_conf.soft_byte_limit))
-			{
-				/* stats is reused across the walk and the getter
-				 * only writes pkts/bytes when the entry has stats
-				 * enabled - without this reset an SA could be
-				 * expired off the PREVIOUS entry's counters (or
-				 * stack garbage on the first pass). Zeroed
-				 * counters make every limit comparison below
-				 * false, so a failed or stats-less read enforces
-				 * nothing - and the notify retry at the tail of
-				 * this loop still runs for every entry, which a
-				 * skip here would break. */
-				memset(&stats, 0, sizeof(stats));
-				ExternalHashTableEntryGetStatsAndTS(
-						pEntry->ct->handle, &stats);
-
-				if ((pEntry->state == SA_STATE_VALID ||
-							pEntry->state == SA_STATE_DYING) && 
-						((pEntry->lft_conf.hard_byte_limit && 
-							(stats.bytes >= pEntry->lft_conf.hard_byte_limit))||
-						 (pEntry->lft_conf.hard_packet_limit && 
-							(stats.pkts >= pEntry->lft_conf.hard_packet_limit)))) 
-				{
-#ifdef CONTROL_IPSEC_DEBUG
-					printk("%s:: entry pkt count = %lu and byte count = %lu\n SA pkt count = %lu and byte count = %lu \n",__func__,
-							(unsigned long)stats.pkts,(unsigned long)stats.bytes , (unsigned long)pEntry->lft_conf.hard_packet_limit,(unsigned long) pEntry->lft_conf.hard_byte_limit);
-					printk(KERN_INFO "E");
-#endif
-					pEntry->state = SA_STATE_EXPIRED;
-					pEntry->notify = 1;
-				}
-				if ((pEntry->state == SA_STATE_VALID) && 
-						((pEntry->lft_conf.soft_byte_limit && 
-							(stats.bytes >= pEntry->lft_conf.soft_byte_limit))
-						 ||(pEntry->lft_conf.soft_packet_limit &&
-							 (stats.pkts >= pEntry->lft_conf.soft_packet_limit))))
-				{
-#ifdef CONTROL_IPSEC_DEBUG
-					printk("%s:: entry pkt count = %lu and byte count = %lu\n SA pkt count = %lu and byte count = %lu \n",__func__,
-							(unsigned long)stats.pkts,(unsigned long)stats.bytes , (unsigned long)pEntry->lft_conf.soft_packet_limit,(unsigned long) pEntry->lft_conf.soft_byte_limit);
-					printk(KERN_INFO "D");
-#endif
-					pEntry->state = SA_STATE_DYING;
-					pEntry->notify = 1;
-				}
-			}
-
-			if (pEntry->notify)
-			{
-				int rc;
-
-				if (pEntry->state == SA_STATE_EXPIRED)
-					rc = M_ipsec_sa_expire_notify(pEntry, 1);
-				else if (pEntry->state == SA_STATE_DYING)
-					rc = M_ipsec_sa_expire_notify(pEntry, 0);
-				else
-					rc = 0;
-
-				if (rc == 0)
-					pEntry->notify = 0;
-			}
-		}
-
-	}
-	//printk("%s initializing timer \n", __func__);
-	/*
-	 * Please check whether adding the same timer node in the timer 
-	 * hanler is an issue or not.
-	 */
-	cdx_timer_add(&sa_timer, SA_TIMER_INTERVAL);
-	return 0;
+	return rc ? ERR_CREATION_FAILED : NO_ERR;
 }
 
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
@@ -1344,28 +565,16 @@ int ipsec_init(void)
 	for (i = 0; i < NUM_SA_ENTRIES; i++)
 	{
 		slist_head_init(&sa_cache_by_h[i]);
-		slist_head_init(&sa_cache_by_spi[i]);
 		slist_head_init(&sa_cache_by_fqid[i]);
 	}
-	/* TODO
-	 *  Here We need to add logic for following 
-	 *       - Add function cdx_dpa.c  which will pre allocate fqid pair and shared desriptor for Max number of SA 
-	 *       - Allocate DPA Sec SA context stuture and store these fqid pair and shared desciptor and put it in a single linked list
-	 *       - Initialise sa_cache_by h and sa_achceby spi linted list table.  
-	 */
-
-	/* initialize a singled list for puting the sec sa context with the pair of fqid
-	 * and the shared descriptor and other memory if any required by Sec.
-	 */
+	/* Not fatal. What failed is the CAAM job ring, and a board without one
+	 * is a gateway without IPsec offload, not a gateway without offload:
+	 * cdx_ipsec_ready() stays false, so the XFRM provider refuses every SA
+	 * and nothing below ever reaches SEC. The rest of this init is
+	 * bookkeeping that ipsec_exit() expects to find in place. */
 	if (cdx_ipsec_init())
-		return -1;
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s timer is initialized \n", __func__);
-#endif
-	cdx_timer_init(&sa_timer, M_ipsec_sa_timer);
-	cdx_timer_add(&sa_timer, SA_TIMER_INTERVAL);
-
-	set_cmd_handler(EVENT_IPS_IN, M_ipsec_cmdproc);
+		pr_warn("%s: IPsec offload unavailable, no SEC job ring\n",
+			__func__);
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 	//register hook function for intercepting ipsec packets from ethernet driver
 	if (dpa_register_ipsec_fq_handler(cdx_get_to_sec_fq_handler)) {
@@ -1374,7 +583,6 @@ int ipsec_init(void)
 		/* ipsec_exit() won't run when init fails — release the JR
 		 * and the reboot notifier here or the notifier would point
 		 * into freed module text after an unload. */
-		cdx_timer_del(&sa_timer);
 		cdx_ipsec_deinit();
 		return -1;
 	}
@@ -1392,7 +600,6 @@ void ipsec_exit(void)
 	 * text and every later load failed here until reboot. */
 	dpa_unregister_ipsec_fq_handler();
 #endif
-	cdx_timer_del(&sa_timer);
 	cdx_ipsec_deinit();
 }
 #endif  // DPA_IPSEC_OFFLOAD

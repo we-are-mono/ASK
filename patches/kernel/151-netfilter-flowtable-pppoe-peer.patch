@@ -1,0 +1,63 @@
+From: Tomaz Zaman <tomaz@mono.si>
+Subject: [PATCH] netfilter: validate the PPPoE peer before flowtable forwarding
+
+A matching session ID and inner tuple do not authenticate the Ethernet
+sender. Check the concentrator recorded by the reverse forward path before
+IPv4 or IPv6 software acceleration can bypass pppoe_rcv(). This also covers
+packets rejected by the hardware classifier and returned to Linux.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -8,6 +8,7 @@
+ #include <linux/ipv6.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_ether.h>
++#include <linux/etherdevice.h>
+ #include <net/gso.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+@@ -406,6 +407,24 @@
+ 	return flow_offload_lookup(flow_table, &tuple);
+ }
+ 
++/* The tuple lookup checks the PPPoE session ID. Match the concentrator too,
++ * as pppoe_rcv() does, before bypassing the ordinary PPP receive path.
++ * The reverse tuple carries the session used to send back to this peer.
++ */
++static bool nf_flow_pppoe_peer_valid(const struct flow_offload *flow,
++				    enum flow_offload_tuple_dir dir,
++				    const struct sk_buff *skb)
++{
++	const struct nf_flow_session *session;
++
++	if (skb->protocol != htons(ETH_P_PPP_SES))
++		return true;
++
++	session = &flow->tuplehash[!dir].tuple.session;
++	return session->lower_ifindex && skb_mac_header_was_set(skb) &&
++	       ether_addr_equal(eth_hdr(skb)->h_source, session->h_dest);
++}
++
+ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 				   struct nf_flowtable *flow_table,
+ 				   struct flow_offload_tuple_rhash *tuplehash,
+@@ -418,6 +437,8 @@
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	if (!nf_flow_pppoe_peer_valid(flow, dir, skb))
++		return 0;
+ 
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+@@ -705,6 +726,8 @@
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	if (!nf_flow_pppoe_peer_valid(flow, dir, skb))
++		return 0;
+ 
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))

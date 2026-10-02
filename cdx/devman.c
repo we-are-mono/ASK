@@ -42,7 +42,6 @@
 #include "cdx_common.h"
 #include "module_qm.h"
 #include "fe.h"
-#include "control_pppoe.h"
 #include "control_tunnel.h"
 #include "control_ipv6.h"
 #include "endian_ext.h" 
@@ -53,6 +52,8 @@
 #include "devman.h"
 #include "control_tx.h"
 #include "procfs.h"
+#include "cdx_flowtable_hw.h"
+#include "cdx_flowtable_backend.h"
 
 //#define DEVMAN_DEBUG	1
 
@@ -63,47 +64,40 @@
  * Concurrency:
  *   dpa_devlist_lock (spinlock, exported)
  *      - Guards the dpa_interface_info singly-linked list of
- *        registered interfaces, plus their eth/vlan/tunnel/pppoe
+ *        registered interfaces, plus their eth/wlan/oh
  *        sub-structures in place. Taken by readers (e.g.
  *        dpa_get_ifinfo_by_itfid callers, virt_iface_stats_callback)
  *        and writers (interface add/remove) alike. All takers run
- *        in process context (FCI dispatch / dev_get_stats), which
- *        is why plain spin_lock() is sufficient — there are no
- *        softirq takers; do not add one without switching the
- *        discipline to _bh.
+ *        in process context (the flowtable transaction /
+ *        dev_get_stats), which is why plain spin_lock() is
+ *        sufficient — there are no softirq takers; do not add one
+ *        without switching the discipline to _bh.
  *        Serialization invariant (remove-side): every UNLINK/FREE
- *        of a live node holds the FCI dispatcher's ctrl mutex
- *        (dpa_release_interface's only caller chain is FCI
- *        cmdprocs; the deinit-path tx_exit runs under the same
- *        mutex via cdx_ctrl_deinit). ADDS are not all
+ *        of a live node holds the ctrl mutex
+ *        (dpa_release_interface runs from remove_onif_by_index,
+ *        whose callers are the Wi-Fi VAP backend, inside the
+ *        flowtable transaction, and the deinit-path tx_exit, under
+ *        the same mutex via cdx_ctrl_deinit). ADDS are not all
  *        mutex-covered — the boot-time set_dpa_params injection
  *        ioctl publishes fresh nodes under dpa_cfg_lock only — but
  *        fresh-node publication can't invalidate a reader. The
  *        spinlock covers readers outside the mutex
- *        (virt_iface_stats_callback via dev_get_stats) and any FCI
- *        reader that wants local invariants. Lock-free lookups in
- *        FCI-only paths lean on the remove-side invariant; see
- *        dpa_get_iface_stats_entries. The former non-FCI lock-free
- *        walkers (dpa_get_ohifinfo_by_portid,
- *        cdx_copy_eth_rx_channel_info) now take the spinlock.
- *        Classifier startup (dpa_cfg_install) adds entries outside
- *        the ctrl mutex, but it runs exactly once, synchronously
- *        inside cdx module init (re-runs rejected with -EBUSY) —
- *        before fci.ko can even load — so those adds cannot overlap
- *        FCI dispatch. (The ctrl timer thread does run during
- *        injection, under ctrl->mutex, but its handlers touch only
- *        the then-empty SA/CT tables, not this list.) The u8 iface
- *        counters are therefore mutator-serialized in every
- *        reachable schedule.
+ *        (virt_iface_stats_callback via dev_get_stats) and any
+ *        reader that wants local invariants. Lock-free lookups
+ *        under the mutex lean on the remove-side invariant; see
+ *        dpa_get_iface_stats_entries. The lock-free walkers that
+ *        run outside it (dpa_get_ohifinfo_by_portid,
+ *        cdx_copy_eth_rx_channel_info) take the spinlock.
+ *        Classifier startup runs under the control mutex and RTNL before
+ *        the flowtable adapter loads.
  *   dpa_interface_info (file-scope head pointer)
  *      - Protected by dpa_devlist_lock.
  *
  * Cross-file users:
- *   control_vlan.c, control_tunnel.c, control_pppoe.c all take
- *   dpa_devlist_lock in their stats helpers; that's the only lock
- *   held across that call. No ordering constraints vs. the
- *   per-file query mutexes elsewhere because dpa_devlist_lock is
- *   always the innermost lock taken.
+ *   dpa_devlist_lock is the innermost lock its takers hold. The one
+ *   lock taken inside it is cdx_ifstats.c's dpa_statslist_lock, by
+ *   virt_iface_stats_callback reading a record; nothing holding
+ *   that lock takes this one.
  *
  * Contexts:
  *   dpa_add_*, dpa_remove_*    - process, ioctl configuration.
@@ -113,10 +107,8 @@
 DEFINE_SPINLOCK(dpa_devlist_lock);
 struct dpa_iface_info *dpa_interface_info;
 
-static int dpa_get_tx_l2info_by_iface(struct dpa_iface_info *iface_info,
-		struct dpa_l2hdr_info *l2_info, uint32_t hash);
 static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
-		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, void **netdev, uint32_t hash);
+		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, uint32_t hash);
 
 extern struct net init_net;
 extern int fm_port_get_hwid(const struct fm_port *port);
@@ -124,15 +116,9 @@ extern int fm_port_get_hwid(const struct fm_port *port);
 
 struct dpa_iface_info *dpa_get_phys_iface(struct dpa_iface_info *iface_info);
 
-/*count for physical,vlan,tunnel interfaces.*/
+/*count for registered interfaces.*/
 uint8_t iface_count;
-
-/*count for ppoe interfaces.*/
-uint8_t iface_pppoe_count;
 #define PORTID_SHIFT_VAL	8
-
-
-#define display_iface_info(x)
 
 
 static enum qman_cb_dqrr_result fwd_tx_drain_dqrr(struct qman_portal *portal,
@@ -254,6 +240,15 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 		DPA_ERROR("%s::could not find device %s\n", __func__, name);
 		return FAILURE;
 	}
+	/* Every later reading of this port's netdev_priv() -- queue
+	 * resolution, statistics, teardown -- relies on this record naming a
+	 * DPAA port, so a device of another driver by that name is refused
+	 * here, once. */
+	if (!dpa_netdev_is_dpaa(device)) {
+		DPA_ERROR("%s::%s is not a DPAA Ethernet port\n", __func__, name);
+		dev_put(device);
+		return FAILURE;
+	}
 	priv = netdev_priv(device);
 	//set as ethernet interface
 	iface_info->if_flags = (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL);
@@ -265,10 +260,13 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 	//os interface id
 	iface_info->osid = device->ifindex;
 	eth_info = &iface_info->eth_info;
-	//save netdev
+	/* Save the netdev. It is the source of this port's hardware address
+	 * too, read where the header is encoded rather than copied here: the
+	 * only value that was ever available to copy is perm_addr, which by
+	 * definition does not follow `ip link set ... address`, and nothing
+	 * else ever refreshed it. The reference taken above is held for the
+	 * life of this record, so the read is always safe. */
 	eth_info->net_dev = device;
-	//copy iface mac address 
-	memcpy(eth_info->mac_addr, device->perm_addr, ETH_ALEN);
 	//copy speed, mtu and others
 	eth_info->speed = priv->mac_dev->max_speed;
 	eth_info->rx_channel_id = priv->channel;
@@ -397,13 +395,71 @@ struct dpa_iface_info *dpa_get_ifinfo_by_itfid(uint32_t itf_id)
 	return iface_info;
 }
 
+/* Whether `dev' is a port of the DPAA Ethernet driver, and so has a struct
+ * dpa_priv_s as its private area. netdev_priv() of anything else is some other
+ * driver's state -- a bridge's, a VLAN device's -- and reading it as a DPAA
+ * port's follows garbage. The driver's ops are its own static table; the one
+ * member of it the driver exports is dpa_ndo_init, and no other driver's ops
+ * carry it. */
+bool dpa_netdev_is_dpaa(const struct net_device *dev)
+{
+	return dev && dev->netdev_ops && dev->netdev_ops->ndo_init == dpa_ndo_init;
+}
+
+/* Physical identity survives an OS rename. The control transaction prevents
+ * interface removal; all physical records exist before adapter claim. */
+struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev)
+{
+	struct dpa_iface_info *iface;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	/* Both arms that carry a device, because both can be named as a flow's
+	 * egress. The union means the field has to be chosen by if_flags
+	 * rather than read blindly. */
+	for (iface = dpa_interface_info; iface; iface = iface->next) {
+		if ((iface->if_flags & IF_TYPE_ETHERNET) &&
+		    iface->eth_info.net_dev == dev)
+			return iface;
+		/* The WLAN record outlives its device by one workqueue hop
+		 * (the retire path frees it from ft_wifi_work_fn), so a match
+		 * by address alone could name a netdev that was freed and
+		 * reallocated inside that hop. VWD clears its own binding
+		 * synchronously, so ask it as well. */
+		if ((iface->if_flags & IF_TYPE_WLAN) &&
+		    iface->wlan_info.net_dev == dev &&
+		    dpaa_vwd_vap_owns(iface->wlan_info.vap_id, dev))
+			return iface;
+	}
+	return NULL;
+}
+
+/* Notifier-safe identity check: never retain storage after dropping the lock
+ * or take the control mutex while the caller owns RTNL. */
+bool dpa_netdev_is_physical(const struct net_device *dev)
+{
+	struct dpa_iface_info *iface;
+	bool found = false;
+
+	spin_lock(&dpa_devlist_lock);
+	for (iface = dpa_interface_info; iface; iface = iface->next) {
+		if ((iface->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL)) ==
+		    (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) &&
+		    iface->eth_info.net_dev == dev) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock(&dpa_devlist_lock);
+	return found;
+}
+
 /* get dpa_info by portid */
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid)
 {
 	struct dpa_iface_info *iface_info;
 
-	/* Called from vwd init and the vwd char-dev ioctl — outside the
-	 * FCI dispatcher mutex — so walk under the list lock. The
+	/* Called from vwd init, outside the ctrl mutex, as well as from
+	 * the VAP command path, so walk under the list lock. The
 	 * returned pointer stays valid without it: OFPORT entries are
 	 * never released (dpa_release_interface skips them), so their
 	 * lifetime is the module's. The type check matters — oh_info
@@ -421,43 +477,6 @@ struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid)
 	return iface_info;
 }
 
-int cdx_check_rx_iface_type_vlan(struct _itf *input_itf)
-{
-	struct dpa_iface_info *iface_info, *parent;
-	int num_vlan_entries =0;
-
-	/* Callers pass a route's itf, which is NULL once that route has been
-	 * quarantined by an interface removal: no vlan headers to count. */
-	if (!input_itf)
-		return 0;
-
-	iface_info = dpa_interface_info;
-	while(iface_info) {
-		if (iface_info->itf_id  == input_itf->index){
-			if (iface_info->if_flags & IF_TYPE_VLAN)
-			{
-				num_vlan_entries ++;
-				parent = iface_info->vlan_info.parent;
-				while (parent)
-				{
-					if (parent->if_flags & IF_TYPE_VLAN)
-					{
-						num_vlan_entries ++;
-						parent = parent->vlan_info.parent;
-					}
-					else
-						return num_vlan_entries;
-				}
-				return num_vlan_entries;
-			}
-			else
-				return 0;
-		}
-		iface_info = iface_info->next;
-	}
-	return 0;
-}
-
 /*
  * Get the fqid from ethernet interface.
  */
@@ -465,29 +484,33 @@ static inline int dpa_get_fqid_from_eth(struct eth_iface_info *eth_info,
 		uint32_t *tx_fqid,
 		void  *info)
 {
-	struct qman_fq *egress_fq;
+	uint32_t fqid;
 	U32 mark = 0; /* Default queue */
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)&mark;
 	if(info)
 		qosmark = info;
-	egress_fq = cdx_get_txfq(eth_info, qosmark);
+	fqid = cdx_get_txfqid(eth_info, qosmark);
 
-	if (!egress_fq) {
+	if (!fqid) {
 		DPA_ERROR("%s::unable to get ceetm fqid for chnl %d queue %d\n",
 				__func__, qosmark->chnl_id, qosmark->queue);
 		return FAILURE;
-	} 
-	*tx_fqid = egress_fq->fqid;
+	}
+	*tx_fqid = fqid;
 	return SUCCESS;
 }
 
 /*
- * This function gets the tx fqid, portid and netdev of the interface.
+ * This function gets the tx fqid and portid of the interface.
  * Return value: In success case return SUCCESS and parameters gets updated.
- *               In failure case it returns FAILURE. 
+ *               In failure case it returns FAILURE.
+ *
+ * It names no device. A WLAN interface's would be a Wi-Fi VAP, which has no
+ * struct dpa_priv_s behind it, so a caller that needs a port to borrow one
+ * from names that port itself, as an IPsec SA names the one it is bound to.
  */
 static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
-		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, void **netdev, uint32_t hash)
+		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, uint32_t hash)
 {
 	uint32_t ohport_handle;
 
@@ -502,10 +525,6 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 
 	if (iface_info->if_flags & IF_TYPE_WLAN)
 	{
-		if ((netdev))
-		{
-			dpaa_get_wifi_dev(iface_info->wlan_info.vap_id,netdev);
-		}
 		if (portid)
 		{
 			dpaa_get_wifi_ohport_handle(&ohport_handle);
@@ -517,7 +536,8 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 
 		if(fqid)
 		{
-			dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, fqid, hash);
+			if (dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, fqid, hash))
+				return FAILURE;
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s:: wlan tx fqid :%d: %x\n", __func__, *fqid, *fqid);
 #endif
@@ -544,148 +564,23 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 				return FAILURE;
 			}
 		}
-
-		if(netdev)
-			*netdev = (void*)eth_info->net_dev;
 	}
 
-	return SUCCESS;
-}
-
-/*
- * This function gets the tx l2info of the interface, it includes vlan, pppoe
- and fqid.
- * Return value: In success case return SUCCESS and l2_info parameter gets updated.
- *               In failure case it returns FAILURE. 
- */
-static int dpa_get_tx_l2info_by_iface(struct dpa_iface_info *iface_info,
-		struct dpa_l2hdr_info *l2_info, uint32_t hash)
-{
-	struct dpa_iface_info *iface = iface_info;
-
-	while(iface) {
-		if (iface->if_flags & IF_TYPE_VLAN) {
-			if (l2_info->num_egress_vlan_hdrs == DPA_CLS_HM_MAX_VLANs) {
-				DPA_INFO("%s::too many vlan headers \n", __func__);
-				break;
-			}
-			l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = 0x8100;
-			l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci =
-				iface->vlan_info.vlan_id;
-#ifdef INCLUDE_VLAN_IFSTATS
-			/* get stats index also */
-			l2_info->vlan_stats_offsets[l2_info->num_egress_vlan_hdrs] =
-				iface->txstats_index;
-#ifdef DEVMAN_DEBUG
-			printk("%s::vlan tx stats offset %d\n", __func__,
-					iface->txstats_index);
-#endif
-#endif
-			l2_info->num_egress_vlan_hdrs++;
-			/* move to parent interface */
-			iface = iface->vlan_info.parent;
-#ifdef DEVMAN_DEBUG
-			DPA_INFO("%s::moving to parent iface %s id %d\n",
-					__func__, iface->name, iface->itf_id);
-#endif
-		}
-		else if (iface->if_flags & IF_TYPE_PPPOE) {
-			l2_info->pppoe_sess_id =
-				iface->pppoe_info.session_id;
-			l2_info->add_pppoe_hdr = 1;
-			memcpy(&l2_info->ac_mac_addr[0],
-					iface->pppoe_info.mac_addr, ETH_ALEN);
-#ifdef INCLUDE_PPPoE_IFSTATS
-			/* save index for tx stats */
-			l2_info->pppoe_stats_offset = iface->txstats_index;
-#endif
-			/* move to parent interface */
-			iface = iface->pppoe_info.parent;
-#ifdef DEVMAN_DEBUG
-			DPA_INFO("%s::moving to parent iface %s id %d\n",
-					__func__, iface->name, iface->itf_id);
-#endif
-		}
-		else if (iface->if_flags & IF_TYPE_ETHERNET ) {
-			l2_info->ether_stats_offset = iface->txstats_index;
-			l2_info->dscp_vlanpcp_map_enable = 
-				cdx_get_tx_dscp_vlanpcp_map_enable(iface->eth_info.portid);
-			if ((l2_info->dscp_vlanpcp_map_enable) &&
-				(!l2_info->num_egress_vlan_hdrs))
-			{
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci = 0;
-				l2_info->num_egress_vlan_hdrs++;
-	
-			}
-			break;
-		}
-		else if (iface->if_flags & IF_TYPE_WLAN) {
-			l2_info->is_wlan_iface = 1;
-			break;
-		}
-		else {
-			DPA_ERROR("%s::iface type %x not supported \n",
-					__func__, iface->if_flags);
-			return FAILURE;
-		}
-	}
-
-	/* Get tx fqid*/
-	if (dpa_get_tx_fqid_devinfo_by_iface(iface_info, &(l2_info->fqid), &(l2_info->is_dscp_fq_map), NULL, NULL, hash)) {
-		DPA_ERROR("%s::faied to get tx fqid iface(%s)\n",
-				__func__, iface_info->name);
-		return FAILURE;
-	}
-
-	return SUCCESS;
-}
-
-/*
- * This function gets the tx l2info using itf, it includes vlan, pppoe
- and fqid.
- * Return value: In success case return SUCCESS and l2_info parameter gets updated.
- *               In failure case it returns FAILURE. 
- */
-int dpa_get_tx_l2info_by_itf(struct dpa_l2hdr_info *l2_info, POnifDesc itf, uint32_t hash)
-{
-	uint32_t itf_id;
-	struct dpa_iface_info *iface_info;
-
-	spin_lock(&dpa_devlist_lock);
-
-	itf_id = itf->itf->index;
-	iface_info = dpa_get_ifinfo_by_itfid(itf_id);
-
-	if (!iface_info) {
-		spin_unlock(&dpa_devlist_lock);
-		DPA_ERROR("%s::iface(%s) is NULL\n", __func__, itf->name);
-		return FAILURE;
-	}
-
-	if (dpa_get_tx_l2info_by_iface(iface_info, l2_info, hash)) {
-		spin_unlock(&dpa_devlist_lock);
-		DPA_ERROR("%s::Failed to get iface(%s) l2info\n", __func__, itf->name);
-		return FAILURE;
-	}
-
-	spin_unlock(&dpa_devlist_lock);
 	return SUCCESS;
 }
 
 int dpa_check_for_logical_iface_types(struct _itf *input_itf,
-		struct _itf *underlying_input_itf,
-		struct dpa_l2hdr_info *l2_info,
-		struct dpa_l3hdr_info *l3_info)
+		struct dpa_l2hdr_info *l2_info)
 {
-	struct dpa_iface_info *iface_info, *parent;
+	struct dpa_iface_info *iface_info;
 
-	l2_info->vlan_present = 0;
-	l2_info->pppoe_present = 0;
+	/* Only physical ports register: Ethernet ports and Wi-Fi VAPs. A VLAN,
+	 * PPPoE or tunnel in front of one is described by the flow instead
+	 * (apply_l2_encap()), so the interface itself is all there is to
+	 * check. */
 	iface_info = dpa_interface_info;
 	while(iface_info) {
 		if (iface_info->itf_id  == input_itf->index){
-check_parent:
 			if (iface_info->if_flags & IF_TYPE_ETHERNET)
 			{
 				if(iface_info->eth_info.vsp_h)
@@ -694,67 +589,17 @@ check_parent:
 			}
 			if (iface_info->if_flags & IF_TYPE_WLAN)
 				return SUCCESS;
-			if (iface_info->if_flags & IF_TYPE_VLAN)
-			{
-				l2_info->vlan_present = 1;
-				if (l2_info->num_ingress_vlan_hdrs >=
-						DPA_CLS_HM_MAX_VLANs) {
-					DPA_INFO("%s::too many vlan "
-							"headers \n",
-							__func__);
-					break;
-				}
-				l2_info->ingress_vlan_hdrs[l2_info->num_ingress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
-				l2_info->ingress_vlan_hdrs[l2_info->num_ingress_vlan_hdrs].tci =
-					iface_info->vlan_info.vlan_id;
-				l2_info->num_ingress_vlan_hdrs++;
-				iface_info = iface_info->vlan_info.parent;
-				goto check_parent;
-			}
-			if (iface_info->if_flags & IF_TYPE_PPPOE)
-			{
-				l2_info->pppoe_present = 1;
-				l2_info->pppoe_sess_id =
-					iface_info->pppoe_info.session_id;
-				memcpy(&l2_info->ac_mac_addr[0], 
-						&iface_info->pppoe_info.mac_addr,
-						ETH_ALEN);
-				iface_info = iface_info->pppoe_info.parent;
-				goto check_parent;
-			}
-			if ((iface_info->if_flags & IF_TYPE_TUNNEL) && (underlying_input_itf))
-			{
-				l3_info->tnl_header_present = 1;
-				l3_info->header_size = iface_info->tunnel_info.header_size;
-				l3_info->proto = iface_info->tunnel_info.proto;
-				l3_info->mode = iface_info->tunnel_info.mode;
-				l3_info->tunnel_flags = iface_info->tunnel_info.flags;
-				memcpy(l3_info->local_ip, iface_info->tunnel_info.local_ip, IPV6_ADDRESS_LENGTH);
-				memcpy(l3_info->remote_ip, iface_info->tunnel_info.remote_ip, IPV6_ADDRESS_LENGTH);
-				parent = dpa_get_ifinfo_by_itfid(underlying_input_itf->index);
-				if ((!parent) || (parent == iface_info))
-				{
-					DPA_ERROR("%s(%d) iface_info %p, parent %p \n",
-							__func__,__LINE__,iface_info, parent);
-					DPA_ERROR("%s(%d)INVALID CONFIGURATION \n",
-							__func__,__LINE__);
-					return FAILURE;
-				}
-				iface_info = parent;
-				goto check_parent;	
-
-			}
 			DPA_ERROR("%s::unsupported type 0x%x\n",
 					__func__, iface_info->if_flags);
 			break;
-		} 
+		}
 		iface_info = iface_info->next;
 	}
 	return FAILURE;
 }
 
 int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * tx_fqid,
-		uint32_t * itf_id, uint32_t * portid , void **netdev, uint32_t hash)
+		uint32_t * itf_id, uint32_t * portid, uint32_t hash)
 {
 	struct dpa_iface_info *iface_info;
 	struct net_device* device = NULL;
@@ -763,7 +608,7 @@ int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * 
 	spin_lock(&dpa_devlist_lock);
 	iface_info = dpa_interface_info;
 	while(iface_info) {
-		if (iface_info->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_PPPOE | IF_TYPE_VLAN | IF_TYPE_WLAN)){
+		if (iface_info->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_WLAN)){
 
 			device = dev_get_by_name(&init_net, iface_info->name);
 			if (!device)
@@ -787,7 +632,7 @@ int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * 
 						if (if_info->ifa_local == *daddr)
 						{
 							ret = dpa_get_tx_fqid_devinfo_by_iface(iface_info,
-									tx_fqid, NULL, portid, netdev, hash);
+									tx_fqid, NULL, portid, hash);
 							if (ret < 0)
 							{
 								printk("%s:: Could not get portid and tx_fqid for : %s \n",__func__, iface_info->name);
@@ -818,7 +663,7 @@ int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * 
 						if (!(memcmp(&ifp->addr, daddr, 16 )))
 						{
 							ret = dpa_get_tx_fqid_devinfo_by_iface(iface_info,
-									tx_fqid, NULL, portid, netdev, hash);
+									tx_fqid, NULL, portid, hash);
 							if (ret < 0)
 							{
 								printk("%s:: Could not get portid and tx_fqid for : %s \n",__func__, iface_info->name);
@@ -852,7 +697,7 @@ end:
 	return ret;
 }
 int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
-		struct dpa_l3hdr_info *l3_info, uint32_t * dir_in)
+		struct dpa_l3hdr_info *l3_info)
 {
 
 	struct dpa_iface_info *iface_info;
@@ -862,112 +707,36 @@ int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
 
 	spin_lock(&dpa_devlist_lock);
 	iface_info = dpa_get_ifinfo_by_itfid(itf_id);
-	while (1) {
-		if (!iface_info)
-			break;
+	if (!iface_info)
+		goto out;
 
-		//search list for matching id
-		if (iface_info->if_flags & IF_TYPE_ETHERNET ) {
-			l2_info->mtu = iface_info->mtu;
-			l2_info->dscp_vlanpcp_map_enable = 
-				cdx_get_tx_dscp_vlanpcp_map_enable(iface_info->eth_info.portid);
-			if ((l2_info->dscp_vlanpcp_map_enable) &&
-				(!l2_info->num_egress_vlan_hdrs))
-			{
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci = 0;
-				l2_info->num_egress_vlan_hdrs++;
-	
-			}
+	//search list for matching id
+	if (iface_info->if_flags & IF_TYPE_ETHERNET ) {
+		l2_info->mtu = iface_info->mtu;
 #ifdef INCLUDE_ETHER_IFSTATS
-			l2_info->ether_stats_offset = iface_info->txstats_index;
+		l2_info->ether_stats_offset = iface_info->txstats_index;
 #endif
-			retval = SUCCESS;
-			break;
-		} 
-		if (iface_info->if_flags &  IF_TYPE_WLAN) {
-			l2_info->mtu = iface_info->mtu;
-			l2_info->is_wlan_iface = 1;
-			retval = SUCCESS;
-			break;
-		} 
-		if (iface_info->if_flags & IF_TYPE_VLAN) {
-			if (dir_in) {
-				l2_info->vlan_present = 1;
-				if (l2_info->num_ingress_vlan_hdrs >= DPA_CLS_HM_MAX_VLANs) {
-					DPA_INFO("%s::too many vlan " "headers \n",__func__);
-					retval = FAILURE;
-					break;
-				}
-				l2_info->ingress_vlan_hdrs[l2_info->num_ingress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
-				l2_info->ingress_vlan_hdrs[l2_info->num_ingress_vlan_hdrs].tci = iface_info->vlan_info.vlan_id;
-				l2_info->num_ingress_vlan_hdrs++;
-
-			}
-			else {
-				if (l2_info->num_egress_vlan_hdrs == DPA_CLS_HM_MAX_VLANs) {
-					DPA_INFO("%s::too many vlan " "headers \n", __func__); 
-					retval = FAILURE;
-					break;
-				}
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci = iface_info->vlan_info.vlan_id;
-				l2_info->num_egress_vlan_hdrs++;
-			}
-
-			//move to parent interface
-			iface_info = iface_info->vlan_info.parent;
-			continue;
-		} 
-
-		if (iface_info->if_flags & IF_TYPE_PPPOE) {
-			if (dir_in)
-				l2_info->pppoe_present = 1;
-			else
-				l2_info->add_pppoe_hdr = 1;
-
-			l2_info->pppoe_sess_id =
-				iface_info->pppoe_info.session_id;
-			memcpy(&l2_info->ac_mac_addr[0], 
-					&iface_info->pppoe_info.mac_addr,
-					ETH_ALEN);
-			//move to parent interface
-			iface_info = iface_info->pppoe_info.parent;
-			continue;
-		}
-		if (iface_info->if_flags & IF_TYPE_TUNNEL) {
-			if (dir_in)
-				l3_info->tnl_header_present = 1;
-			else
-				l3_info->add_tnl_header = 1;
-
-			l3_info->header_size = iface_info->tunnel_info.header_size;
-			l3_info->proto = iface_info->tunnel_info.proto;
-			l3_info->mode = iface_info->tunnel_info.mode;
-			l3_info->tunnel_flags = iface_info->tunnel_info.flags;
-			memcpy(l3_info->local_ip, iface_info->tunnel_info.local_ip, IPV6_ADDRESS_LENGTH);
-			memcpy(l3_info->remote_ip, iface_info->tunnel_info.remote_ip, IPV6_ADDRESS_LENGTH);
-			iface_info = iface_info->tunnel_info.parent;
-			continue;
-
-		} else {
-			DPA_INFO("%s::iface type %x not "
-					"supported \n",
-					__func__, iface_info->if_flags);
-			break;
-		}
+		retval = SUCCESS;
+	} else if (iface_info->if_flags &  IF_TYPE_WLAN) {
+		l2_info->mtu = iface_info->mtu;
+		l2_info->is_wlan_iface = 1;
+		retval = SUCCESS;
+	} else {
+		DPA_INFO("%s::iface type %x not "
+				"supported \n",
+				__func__, iface_info->if_flags);
 	}
+out:
 	spin_unlock(&dpa_devlist_lock);
 	return retval;
 }
 
-int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry , 
+int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 		struct dpa_l2hdr_info *l2_info,
-		struct dpa_l3hdr_info *l3_info)
+		struct dpa_l3hdr_info *l3_info, uint32_t hash)
 {
 
 	struct dpa_iface_info *iface_info;
-	struct dpa_iface_info *parent;
 	int retval = FAILURE;
 	uint32_t itf_id;
 	unsigned char* src_mac = NULL;
@@ -986,8 +755,8 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 	 * a cleared pointer. */
 	if (!rt_entry->itf)
 	{
-		DPA_ERROR("%s::route %u has no egress interface\n",
-				__func__, rt_entry->id);
+		DPA_ERROR("%s::route has no egress interface\n",
+				__func__);
 		return retval;
 	}
 	itf_id = rt_entry->itf->index;
@@ -1007,14 +776,17 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 						ETHER_ADDR_LEN);
 			if (!src_mac)
 			{
-				if (wlan_info->is_bridged)
-					src_mac = wlan_info->br_mac_addr;
-				else
-					src_mac = wlan_info->mac_addr;
+				src_mac = wlan_info->mac_addr;
 			}
 
-			/* Always using queue 0 for outbound ESP packets */
-			dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, 0);
+			/* A VAP's forwarding queues are spread over the CPU
+			 * portals, and the dequeue callback runs on the CPU
+			 * whose portal the queue lands on. Spread by the
+			 * caller's hash rather than pinning every SA to
+			 * queue 0, which put all encrypted Wi-Fi egress on
+			 * one core. */
+			if (dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, hash))
+				break;
 
 			l2_info->is_wlan_iface = 1;
 			retval = SUCCESS;
@@ -1032,10 +804,11 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 						ETHER_ADDR_LEN);
 			if (!src_mac)
 			{
-				if (eth_info->is_bridged)
-					src_mac = eth_info->br_mac_addr;
-				else
-					src_mac = eth_info->mac_addr;
+				/* The port's own address is the netdev's,
+				 * read now rather than from a copy taken at
+				 * registration that never followed a
+				 * change. */
+				src_mac = (unsigned char *)eth_info->net_dev->dev_addr;
 			}
 			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, NULL))
 				break;
@@ -1044,120 +817,16 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				DPA_ERROR("%s::unable to get ceetm dscp fq map\n", __func__);
 				break;
 			}
-			l2_info->dscp_vlanpcp_map_enable = 
-				cdx_get_tx_dscp_vlanpcp_map_enable(eth_info->portid);
-			if ((l2_info->dscp_vlanpcp_map_enable) &&
-				(!l2_info->num_egress_vlan_hdrs))
-			{
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci = 0;
-				l2_info->num_egress_vlan_hdrs++;
-	
-			}
-				
 #ifdef INCLUDE_ETHER_IFSTATS
 			l2_info->ether_stats_offset = iface_info->txstats_index;
 #endif
 			retval = SUCCESS;
 			break;
-		} 
-		if (iface_info->if_flags & IF_TYPE_VLAN) {
-			if (l2_info->num_egress_vlan_hdrs ==
-					DPA_CLS_HM_MAX_VLANs) {
-				DPA_INFO("%s::too many vlan "
-						"headers \n",
-						__func__); 
-				break;
-			}
-			//move to parent interface
-			parent = iface_info->vlan_info.parent;
-#ifdef DEVMAN_DEBUG
-			DPA_INFO("%s::moving to parent "
-					"iface %s id %d\n",
-					__func__, parent->name,
-					parent->itf_id);
-#endif
-			if (!src_mac)
-			{
-				if (iface_info->vlan_info.is_bridged)
-					src_mac = iface_info->vlan_info.br_mac_addr;
-				else
-					src_mac = iface_info->vlan_info.mac_addr;
-			}
-
-			l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = 0x8100;
-			l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci = iface_info->vlan_info.vlan_id;
-			l2_info->num_egress_vlan_hdrs++;
-			iface_info = parent;
-			continue;
-		} 
-
-		if (iface_info->if_flags & IF_TYPE_PPPOE) {
-			//move to parent interface
-			parent = iface_info->pppoe_info.parent;
-#ifdef DEVMAN_DEBUG
-			DPA_INFO("%s::moving to parent "
-					"iface %s id %d\n",
-					__func__, parent->name,
-					parent->itf_id);
-#endif
-			l2_info->pppoe_sess_id = 
-				iface_info->pppoe_info.session_id;
-			l2_info->add_pppoe_hdr = 1;
-			memcpy(&l2_info->ac_mac_addr[0], 
-					iface_info->pppoe_info.mac_addr, ETH_ALEN);
-			iface_info = parent;
-			continue;
 		}
-		if (iface_info->if_flags & IF_TYPE_TUNNEL) {
-			parent = iface_info->tunnel_info.parent;
-			if (!parent || (iface_info == parent))
-			{
-				DPA_ERROR("%s(%d) SOME THING WRONG , parent(%p) and iface(%p) are same \n",
-						__func__,__LINE__,iface_info, iface_info->pppoe_info.parent);
-				break; // If and When more tunnels are introduced, the parent needs to be used for on floating tunnels.
-			}
-			DPA_INFO("%s::moving to parent "
-					"iface %s id %d\n",
-					__func__, parent->name,
-					parent->itf_id);
-			l3_info->add_tnl_header = 1;
-			l3_info->header_size = iface_info->tunnel_info.header_size;
-			l3_info->proto = iface_info->tunnel_info.proto;
-			l3_info->mode = iface_info->tunnel_info.mode;
-			l3_info->tunnel_flags = iface_info->tunnel_info.flags;
-			memcpy(l3_info->header, iface_info->tunnel_info.header, l3_info->header_size);
-			memcpy(l3_info->local_ip, iface_info->tunnel_info.local_ip, IPV6_ADDRESS_LENGTH);
-			memcpy(l3_info->remote_ip, iface_info->tunnel_info.remote_ip, IPV6_ADDRESS_LENGTH);
-			if(iface_info->tunnel_info.mode == TNL_MODE_4O6)
-			{
-				//if(is_ipv6_addr_any(l3_info->remote_ip))
-			}
-			/*
-				 else if (iface_info->tunnel_info.mode == TNL_MODE_6O4)
-				 {
-				 if(!l3_info->remote_ip[0]) // Remote address ANY
-				 memcpy(&l3_info->header_v4.DestinationAddress, &tnl_rt_entry->Daddr_v4, sizeof(unsigned int));
-
-				 }
-			 */
-			/*
-				 if(tnl_rt_entry) // Floating tunnel, tunnel route part of per connection information
-				 memcpy(&l2_info->l2hdr[0], tnl_rt_entry->dstmac,
-				 ETHER_ADDR_LEN);
-				 else // Static tunnel, tunnel route part of the tunnel when created
-			 */
-			memcpy(&l2_info->l2hdr[0], iface_info->tunnel_info.dstmac,
-					ETHER_ADDR_LEN);
-			iface_info = parent;
-			continue;
-
-		} else {
-			DPA_INFO("%s::iface type %x not "
-					"supported \n",
-					__func__, iface_info->if_flags);
-			break;
-		}
+		DPA_INFO("%s::iface type %x not "
+				"supported \n",
+				__func__, iface_info->if_flags);
+		break;
 	}
 	if (src_mac)
 		memcpy(&l2_info->l2hdr[ETHER_ADDR_LEN], src_mac, ETHER_ADDR_LEN);
@@ -1169,48 +838,16 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 int dpa_get_num_vlan_iface_stats_entries(uint32_t iif, uint32_t underlying_iif,
 		uint32_t *num_entries)
 {
-	struct dpa_iface_info *iface_info, *parent;
+	struct dpa_iface_info *iface_info;
 
+	/* No VLAN interface registers -- a flow names its own tags -- so a
+	 * registered port has none to count, and anything else is refused. */
 	iface_info = dpa_interface_info;
 	*num_entries = 0;
 	while(iface_info) {
 		if (iface_info->itf_id  == iif) {
-check_parent:
-			if (iface_info->if_flags & IF_TYPE_ETHERNET) {
+			if (iface_info->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_WLAN))
 				return SUCCESS;
-			}
-			if (iface_info->if_flags & IF_TYPE_WLAN) {
-				return SUCCESS;		
-			}
-			if (iface_info->if_flags & IF_TYPE_VLAN)
-			{
-				(*num_entries)++;
-				iface_info = iface_info->vlan_info.parent;
-				goto check_parent;
-			}
-			if (iface_info->if_flags & IF_TYPE_PPPOE)
-			{
-#ifdef DEVMAN_DEBUG
-				printk("%s::pppoe if\n", __func__);
-#endif
-				iface_info = iface_info->pppoe_info.parent;
-				goto check_parent;
-			}
-			if ((iface_info->if_flags & IF_TYPE_TUNNEL) && (underlying_iif))
-			{
-#ifdef DEVMAN_DEBUG
-				printk("%s::tunnel if\n", __func__);
-#endif
-				parent = dpa_get_ifinfo_by_itfid(underlying_iif);
-				if(!parent || (iface_info == parent))
-				{
-					DPA_ERROR("%s(%d) SOME THING WRONG , parent(%p) and iface(%p) are same \n",
-							__func__,__LINE__,iface_info, iface_info->pppoe_info.parent);
-					return FAILURE;
-				}
-				iface_info = parent;
-				goto check_parent;	
-			}
 			DPA_ERROR("%s::unsupported type 0x%x\n",
 					__func__, iface_info->if_flags);
 			break;
@@ -1222,21 +859,16 @@ check_parent:
 
 
 int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
-		struct dpa_l3hdr_info *l3_info, PRouteEntry tnl_rt_entry,
-		void *qosinfo, uint32_t hash)
+		struct dpa_l3hdr_info *l3_info, void *qosinfo, uint32_t hash)
 {
 
 	uint32_t itf_id;
 	struct dpa_iface_info *iface_info;
-	struct dpa_iface_info *parent;
 	int retval = FAILURE;
-	union ctentry_qosmark *qosmark;
 	unsigned char* src_mac = NULL;
 
-	qosmark = (union ctentry_qosmark *)qosinfo;
 	memset(l2_info, 0, sizeof(struct dpa_l2hdr_info));
 	memset(l3_info, 0, sizeof(struct dpa_l3hdr_info));
-	//decide if vlan strip hm is required
 	spin_lock(&dpa_devlist_lock);
 	if(!rt_entry->underlying_input_itf)
 	{
@@ -1249,8 +881,8 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 	 * referenced; such a route can no longer describe an egress path. */
 	if (!rt_entry->itf)
 	{
-		DPA_ERROR("%s::route %u has no egress interface\n",
-				__func__, rt_entry->id);
+		DPA_ERROR("%s::route has no egress interface\n",
+				__func__);
 		goto err_ret;
 	}
 
@@ -1259,24 +891,13 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 	 * the real classification key, so fall back to it. */
 	if (dpa_check_for_logical_iface_types(
 				rt_entry->input_itf ? rt_entry->input_itf : rt_entry->underlying_input_itf,
-				rt_entry->underlying_input_itf,
-				l2_info, l3_info)) {
+				l2_info)) {
 		DPA_ERROR("%s::get_iface_type failed iface %d\n",
 				__func__,
 				rt_entry->input_itf ? rt_entry->input_itf->index :
 						rt_entry->underlying_input_itf->index);
 		goto err_ret;
 	}
-
-#ifdef VLAN_FILTER
-	/*Overwrite ingress vlan id's if vlan filtering is enabled */
-	if(rt_entry->vlan_filter_flags & VLAN_INGRESS_FILTERED)
-	{
-		l2_info->ingress_vlan_hdrs[0].tpid = ETHERTYPE_VLAN;
-		l2_info->ingress_vlan_hdrs[0].tci = rt_entry->underlying_vid;
-		l2_info->num_ingress_vlan_hdrs = 1;
-	}
-#endif
 
 	itf_id = rt_entry->itf->index;
 	iface_info = dpa_get_ifinfo_by_itfid(itf_id);
@@ -1294,13 +915,11 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 						ETHER_ADDR_LEN);
 			if (!src_mac)
 			{
-				if (wlan_info->is_bridged)
-					src_mac = wlan_info->br_mac_addr;
-				else
-					src_mac = wlan_info->mac_addr;
+				src_mac = wlan_info->mac_addr;
 			}
 
-			dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, hash);
+			if (dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, hash))
+				break;
 
 			l2_info->is_wlan_iface = 1;
 			retval = SUCCESS;
@@ -1323,10 +942,9 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 
 			if (!src_mac)
 			{
-				if (eth_info->is_bridged)
-					src_mac = eth_info->br_mac_addr;
-				else
-					src_mac = eth_info->mac_addr;
+				/* As above: the netdev's current address, not
+				 * a registration-time copy of perm_addr. */
+				src_mac = (unsigned char *)eth_info->net_dev->dev_addr;
 			}
 
 			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, qosinfo))
@@ -1336,167 +954,13 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 				DPA_ERROR("%s::unable to get ceetm dscp fq map\n", __func__);
 				goto err_ret;
 			}
-			l2_info->dscp_vlanpcp_map_enable = 
-				cdx_get_tx_dscp_vlanpcp_map_enable(eth_info->portid);
-			if ((l2_info->dscp_vlanpcp_map_enable) &&
-				(!l2_info->num_egress_vlan_hdrs))
-			{
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
-				l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci = 0;
-				l2_info->num_egress_vlan_hdrs++;
-			}
-#ifdef VLAN_FILTER
-			if(!l2_info->num_egress_vlan_hdrs && rt_entry->vlan_filter_flags & VLAN_FILTERED)
-			{
-				if (!(rt_entry->vlan_filter_flags & VLAN_UNTAGGED)) {
-					l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
-					l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci = rt_entry->egress_vid;
-					l2_info->num_egress_vlan_hdrs++;
-				}
-			}
-#endif
 			retval = SUCCESS;
 			break;
-		} 
-		if (iface_info->if_flags & IF_TYPE_VLAN) {
-			if (l2_info->num_egress_vlan_hdrs ==
-					DPA_CLS_HM_MAX_VLANs) {
-				DPA_INFO("%s::too many vlan "
-						"headers \n",
-						__func__); 
-				break;
-			}
-			//move to parent interface
-			parent = iface_info->vlan_info.parent;
-#ifdef DEVMAN_DEBUG
-			DPA_INFO("%s::moving to parent "
-					"iface %s id %d\n",
-					__func__, parent->name,
-					parent->itf_id);
-#endif
-			if (!src_mac)
-			{
-				if (iface_info->vlan_info.is_bridged)
-					src_mac = iface_info->vlan_info.br_mac_addr;
-				else
-					src_mac = iface_info->vlan_info.mac_addr;
-			}
-
-			l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = 0x8100;
-			l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tci = 
-				iface_info->vlan_info.vlan_id;
-#ifdef INCLUDE_VLAN_IFSTATS
-			//get stats index also
-			l2_info->vlan_stats_offsets[l2_info->num_egress_vlan_hdrs] = 
-				iface_info->txstats_index;	
-#ifdef DEVMAN_DEBUG
-			printk("%s::vlan tx stats offset %d\n", __func__,
-					iface_info->txstats_index);
-#endif
-#endif
-			l2_info->num_egress_vlan_hdrs++;
-			iface_info = parent;
-			continue;
-		} 
-
-		if (iface_info->if_flags & IF_TYPE_PPPOE) {
-			//move to parent interface
-			parent = iface_info->pppoe_info.parent;
-#ifdef DEVMAN_DEBUG
-			DPA_INFO("%s::moving to parent "
-					"iface %s id %d\n",
-					__func__, parent->name,
-					parent->itf_id);
-#endif
-			l2_info->pppoe_sess_id = 
-				iface_info->pppoe_info.session_id;
-			l2_info->add_pppoe_hdr = 1;
-			memcpy(&l2_info->ac_mac_addr[0], 
-					iface_info->pppoe_info.mac_addr, ETH_ALEN);
-#ifdef INCLUDE_PPPoE_IFSTATS
-			/* save index for tx stats */
-			l2_info->pppoe_stats_offset = iface_info->txstats_index;
-#endif
-			iface_info = parent;
-			continue;
 		}
-		if (iface_info->if_flags & IF_TYPE_TUNNEL) {
-			/* The tunnel route is a held reference: interface removal
-			 * may have quarantined it (itf cleared) after this entry
-			 * was created, so it cannot be dereferenced blindly. */
-			if (tnl_rt_entry && !tnl_rt_entry->itf) {
-				DPA_ERROR("%s::tunnel route %u has no egress interface\n",
-						__func__, tnl_rt_entry->id);
-				goto err_ret;
-			}
-			if(tnl_rt_entry)
-				parent = dpa_get_ifinfo_by_itfid(tnl_rt_entry->itf->index);
-			else if(iface_info->tunnel_info.parent)
-				parent = iface_info->tunnel_info.parent;
-			else
-				break; // If and When more tunnels are introduced, the parent needs to be used for on floating tunnels.
-#ifdef DEVMAN_DEBUG
-			DPA_INFO("%s::moving to parent "
-					"iface %s id %d\n",
-					__func__, parent->name,
-					parent->itf_id);
-#endif
-			if (iface_info == parent)
-			{
-				DPA_ERROR("%s(%d) SOME THING WRONG , parent(%p) and iface(%p) are same \n",
-						__func__,__LINE__,iface_info, parent);
-				retval = FAILURE;
-				goto err_ret;
-			}
-			l3_info->add_tnl_header = 1;
-			l3_info->header_size = iface_info->tunnel_info.header_size;
-			// In case of tunneling , interface MTU was reduced with tunnel header size
-			// In ucode , as we are checking the total packet size with MTU after tunneling ,
-			// We need to program MTU size in ucode including the tunnel header size.
-			l2_info->mtu += l3_info->header_size;
-			l3_info->proto = iface_info->tunnel_info.proto;
-			l3_info->mode = iface_info->tunnel_info.mode;
-			memcpy(l3_info->header, iface_info->tunnel_info.header, l3_info->header_size);
-			memcpy(l3_info->local_ip, iface_info->tunnel_info.local_ip, IPV6_ADDRESS_LENGTH);
-			memcpy(l3_info->remote_ip, iface_info->tunnel_info.remote_ip, IPV6_ADDRESS_LENGTH);
-			if(iface_info->tunnel_info.mode == TNL_MODE_4O6)
-			{
-				if(is_ipv6_addr_any(l3_info->remote_ip)) {
-					if(!tnl_rt_entry) {
-						DPA_ERROR("%s(%d)  tnl_rt_entry is NULL\n",__func__,__LINE__);
-						retval = FAILURE;
-						goto err_ret;
-					}
-					memcpy(&l3_info->header_v6.DestinationAddress, tnl_rt_entry->Daddr_v6, IPV6_ADDRESS_LENGTH);
-				}
-				l3_info->tunnel_flags = iface_info->tunnel_info.flags;
-			}
-			else if (iface_info->tunnel_info.mode == TNL_MODE_6O4)
-			{
-				if(!l3_info->remote_ip[0]) { // Remote address ANY
-					if(!tnl_rt_entry) {
-						DPA_ERROR("%s(%d)  tnl_rt_entry is NULL\n",__func__,__LINE__);
-						retval = FAILURE;
-						goto err_ret;
-					}
-					memcpy(&l3_info->header_v4.DestinationAddress, &tnl_rt_entry->Daddr_v4, sizeof(unsigned int));
-				}
-			}
-			if(tnl_rt_entry) // Floating tunnel, tunnel route part of per connection information
-				memcpy(&l2_info->l2hdr[0], tnl_rt_entry->dstmac,
-						ETHER_ADDR_LEN);
-			else // Static tunnel, tunnel route part of the tunnel when created
-				memcpy(&l2_info->l2hdr[0], iface_info->tunnel_info.dstmac,
-						ETHER_ADDR_LEN);
-			iface_info = parent;
-			continue;
-
-		} else {
-			DPA_INFO("%s::iface type %x not "
-					"supported \n",
-					__func__, iface_info->if_flags);
-			break;
-		}
+		DPA_INFO("%s::iface type %x not "
+				"supported \n",
+				__func__, iface_info->if_flags);
+		break;
 	}
 	if (src_mac)
 		memcpy(&l2_info->l2hdr[ETHER_ADDR_LEN], src_mac, ETHER_ADDR_LEN);
@@ -1538,48 +1002,33 @@ int dpa_get_iface_hwid_by_name_and_type(char *name, uint32_t type)
 
 struct dpa_iface_info *dpa_get_phys_iface(struct dpa_iface_info *iface_info)
 {
-	while (1) {
-		if (!iface_info)
-			break;
-		if ((iface_info->if_flags & IF_TYPE_ETHERNET) || (iface_info->if_flags & IF_TYPE_WLAN))
-			break;
-		else if (iface_info->if_flags & IF_TYPE_VLAN)
-			iface_info = iface_info->vlan_info.parent;
-		else if (iface_info->if_flags & IF_TYPE_PPPOE)
-			iface_info = iface_info->pppoe_info.parent;
-		else
-			return NULL;
-	}
-	return iface_info;
+	if (iface_info &&
+	    (iface_info->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_WLAN)))
+		return iface_info;
+	return NULL;
 }
 
-static int dpa_get_iface_stats(struct dpa_iface_info *iface_info,
-		uint8_t **offset, uint32_t stats_type,
-		uint32_t iface_type)
+static void dpa_get_iface_stats(struct dpa_iface_info *iface_info,
+		uint8_t *offset, uint32_t stats_type)
 {
-	if (stats_type == TX_IFSTATS) {
-		**offset = iface_info->txstats_index;
-		if (iface_type == IF_TYPE_VLAN)
-			(*offset)--;
-	} else {
-		**offset = iface_info->rxstats_index;
-		if (iface_type == IF_TYPE_VLAN)
-			(*offset)++;
-	}
-
-	return SUCCESS;
+	if (stats_type == TX_IFSTATS)
+		*offset = iface_info->txstats_index;
+	else
+		*offset = iface_info->rxstats_index;
 }
 
+/* The record a registered port counts in. Only Ethernet ports and Wi-Fi VAPs
+ * register; a VLAN device, PPPoE session or tunnel has its record named by
+ * the flow that crosses it, never looked up here. */
 int dpa_get_iface_stats_entries(uint32_t iif_index,
 		uint32_t underlying_iif_index, uint8_t *offset,
 		uint32_t stats_type, uint32_t iface_type)
 {
-	struct dpa_iface_info *iface_info, *parent;
+	struct dpa_iface_info *iface_info;
 
-	/* lock-free lookups and parent-chain walks are safe here: this
-	 * runs only from FCI-dispatched hw-entry creation, and every
-	 * unlink/free of a live node is likewise FCI-dispatched — the
-	 * dispatcher's ctrl mutex serializes us against the frees
+	/* lock-free lookups are safe here: this runs only from hw-entry
+	 * creation under the ctrl mutex, and every unlink/free of a live
+	 * node holds it too, so it serializes us against the frees
 	 * (non-mutex adds only publish fresh nodes). */
 	iface_info = dpa_get_ifinfo_by_itfid(iif_index);
 	if (!iface_info) {
@@ -1589,59 +1038,12 @@ int dpa_get_iface_stats_entries(uint32_t iif_index,
 
 	switch(iface_type)
 	{
-		case IF_TYPE_PPPOE:
-			if (iface_info->if_flags & IF_TYPE_PPPOE)
-			{
-				dpa_get_iface_stats(iface_info, &offset, stats_type, iface_type);
-				return SUCCESS;
-			}
-			return FAILURE;
-
-		case IF_TYPE_TUNNEL:
-			if (iface_info->if_flags & IF_TYPE_TUNNEL)
-			{
-				dpa_get_iface_stats(iface_info, &offset, stats_type, iface_type);
-				return SUCCESS;
-			}
-			return FAILURE;
-
 		case IF_TYPE_ETHERNET:
 		case IF_TYPE_WLAN:
-		case IF_TYPE_VLAN:
-check_parent:
-			if (iface_info->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_WLAN)) {
-				if ((iface_type == IF_TYPE_ETHERNET) ||
-						(iface_type == IF_TYPE_WLAN)) {
-					dpa_get_iface_stats(iface_info, &offset, stats_type, iface_type);
-				}
-				return SUCCESS;
-			}
-			if (iface_info->if_flags & IF_TYPE_VLAN)
-			{
-				if (iface_type == IF_TYPE_VLAN) {
-					dpa_get_iface_stats(iface_info, &offset, stats_type, iface_type);
-				}
-				iface_info = iface_info->vlan_info.parent;
-				goto check_parent;
-			}
-			if (iface_info->if_flags & IF_TYPE_PPPOE)
-			{
-				iface_info = iface_info->pppoe_info.parent;
-				goto check_parent;
-			}
-			if ((iface_info->if_flags & IF_TYPE_TUNNEL) && (underlying_iif_index))
-			{
-				parent = dpa_get_ifinfo_by_itfid(underlying_iif_index);
-				if(!parent || (parent == iface_info))
-				{
-					DPA_ERROR("%s(%d) SOME THING WRONG , parent(%p) and iface(%p) are same \n",
-							__func__,__LINE__,iface_info, iface_info->pppoe_info.parent);
-					return FAILURE;
-				}
-				iface_info = parent;
-				goto check_parent;	
-			}
-			return FAILURE;
+			if (!(iface_info->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_WLAN)))
+				return FAILURE;
+			dpa_get_iface_stats(iface_info, offset, stats_type);
+			return SUCCESS;
 	}
 	return FAILURE;
 }
@@ -1679,7 +1081,6 @@ void dpa_release_iflist(void)
 		spin_lock(&dpa_devlist_lock);
 	}
 	iface_count = 0;
-	iface_pppoe_count = 0;
 	spin_unlock(&dpa_devlist_lock);
 
 	/* every stats slot is back on the freelist now; release the MURAM
@@ -1697,18 +1098,6 @@ void dpa_release_iflist(void)
 static void free_stats(struct dpa_iface_info *info)
 {
 
-	if(info->if_flags & IF_TYPE_PPPOE) {
-		free_iface_stats(IF_TYPE_PPPOE, info);
-		return;
-	}
-	if(info->if_flags & IF_TYPE_VLAN) {
-		free_iface_stats(IF_TYPE_VLAN, info);
-		return;
-	}
-	if(info->if_flags & IF_TYPE_TUNNEL) {
-		free_iface_stats(IF_TYPE_TUNNEL, info);
-		return;
-	}
 	if(info->if_flags & IF_TYPE_ETHERNET) {
 		free_iface_stats(IF_TYPE_ETHERNET, info);
 		return;
@@ -1732,7 +1121,7 @@ void dpa_release_interface(uint32_t itf_id)
 	while (curr_info) {
 		/* OFPORT fixtures are injection-created, carry no onif id
 		 * (historically 0 from kzalloc, now the ~0U sentinel) and
-		 * are never FCI-released; skip them so a legitimate itf_id
+		 * are never released; skip them so a legitimate itf_id
 		 * can't alias one */
 		if (!(curr_info->if_flags & IF_TYPE_OFPORT) &&
 				(curr_info->itf_id == itf_id))
@@ -1750,15 +1139,12 @@ void dpa_release_interface(uint32_t itf_id)
 	else
 		dpa_interface_info = curr_info->next;
 
-	if (curr_info->if_flags & IF_TYPE_PPPOE)
-		iface_pppoe_count--;
-	else
-		iface_count--;
+	iface_count--;
 	spin_unlock(&dpa_devlist_lock);
 
 	/* Unlinked: the dev_get_stats reader can no longer reach the
-	 * node, and every other unlink/free holds the FCI dispatcher
-	 * mutex we are called under — so the slow HW teardown (the
+	 * node, and every other unlink/free holds the ctrl mutex we
+	 * are called under — so the slow HW teardown (the
 	 * FM_PCD HC path busy-waits up to ~10ms) and the frees run
 	 * without holding the spinlock. */
 #ifdef DEVMAN_DEBUG
@@ -1802,7 +1188,13 @@ void dpa_release_interface(uint32_t itf_id)
 }
 
 
-//get mac address by name
+/* Get a port's hardware address by interface name.
+ *
+ * Reads the netdev rather than any stored copy, for the reason
+ * get_eth_iface_info() gives: the only value ever stored was perm_addr, and
+ * nothing refreshed it. The record holds a reference to the device for its
+ * whole life, so the dereference is safe under the list lock.
+ */
 int dpa_get_mac_addr(char *name, char *mac_addr)
 {
 	struct dpa_iface_info *iface_info;
@@ -1816,8 +1208,9 @@ int dpa_get_mac_addr(char *name, char *mac_addr)
 		if (iface_info->if_flags & IF_TYPE_ETHERNET) {
 			//match name
 			if (strcmp (name, iface_info->name) == 0) {
-				memcpy(mac_addr, iface_info->eth_info.mac_addr,
-						ETH_ALEN);
+				memcpy(mac_addr,
+				       iface_info->eth_info.net_dev->dev_addr,
+				       ETH_ALEN);
 				retval = 0;
 				break;
 			}
@@ -1828,7 +1221,7 @@ int dpa_get_mac_addr(char *name, char *mac_addr)
 	return retval;
 }
 
-#ifdef DPA_IPSEC_OFFLOAD 
+#ifdef DPA_IPSEC_OFFLOAD
 /*
 * This function reconfiguring the discard mask by clearing the FM_FD_ERR_PRS_HDR_ERR
 * and FM_FD_ERR_BLOCK_LIMIT_EXCEEDED error bit flags from FM_RFSDM_DEFAULT macro.
@@ -1964,9 +1357,6 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	dpa_update_eth_if(priv);
 	iface_info->if_flags |= IF_STATS_ENABLED;
 #endif
-#ifdef DEVMAN_DEBUG
-	display_iface_info(iface_info);
-#endif
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
@@ -2055,161 +1445,6 @@ err_ret:
 	return FAILURE;
 }
 
-int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf, 
-		uint8_t *mac_addr, uint16_t session_id) 
-{
-	struct dpa_iface_info *iface_info;
-	struct dpa_iface_info *parent;
-
-	if(iface_pppoe_count >= MAX_PPPoE_INTERFACES)
-	{
-		DPA_ERROR("%s::Number of pppoe interfaces support in fast path is only %d\n",
-				__func__,
-				MAX_PPPoE_INTERFACES);
-		return FAILURE;
-	}
-
-	if (!(phys_itf)) {
-		DPA_ERROR("%s::null dev for phys_itf\n", 
-				__func__); 
-		return FAILURE;
-	}
-	if (!(itf->phys)) {
-		DPA_ERROR("%s::null dev for lower iface\n", 
-				__func__); 
-		return FAILURE;
-	}
-
-	iface_info = (struct dpa_iface_info *)
-		kzalloc(sizeof(struct dpa_iface_info), GFP_KERNEL);  
-	if (!iface_info) {
-		DPA_ERROR("%s::no mem for pppoe dev info size %d\n", 
-				__func__, 
-				(uint32_t)sizeof(struct dpa_iface_info));
-		return FAILURE;
-	}
-	memset(iface_info, 0, sizeof(struct dpa_iface_info));
-	iface_info->itf_id = itf->index;
-	iface_info->if_flags = itf->type;
-	strncpy(&iface_info->name[0], name, IF_NAME_SIZE);
-
-	iface_info->pppoe_info.session_id = htons(session_id);
-	memcpy(&iface_info->pppoe_info.mac_addr[0], mac_addr, ETH_ALEN);
-	spin_lock(&dpa_devlist_lock);
-	parent = dpa_get_ifinfo_by_itfid(itf->phys->index);
-	if (!parent) {
-		DPA_ERROR("%s::no ifinfo for dev idx %d\n", 
-				__func__, itf->index);
-		spin_unlock(&dpa_devlist_lock);
-		goto err_ret;
-	}
-	iface_info->pppoe_info.parent = parent;
-	/* inherit parents mtu as default */
-	iface_info->mtu = parent->mtu;
-	spin_unlock(&dpa_devlist_lock);
-#ifdef INCLUDE_PPPoE_IFSTATS
-	if (alloc_iface_stats(itf->type, iface_info) != SUCCESS) {
-		DPA_ERROR("%s:: alloc_iface_stats failed\n", __func__);
-		goto err_ret;
-	}
-	iface_info->if_flags |= IF_STATS_ENABLED;
-#endif
-#ifdef DEVMAN_DEBUG
-	display_iface_info(iface_info);
-#endif
-	//add to list
-	if (dpa_add_port_to_list(iface_info)) {
-		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
-				__func__);
-		if (iface_info->if_flags & IF_STATS_ENABLED)
-			free_stats(iface_info);
-		goto err_ret;
-	}
-	iface_pppoe_count++;
-	return SUCCESS;
-err_ret:
-	kfree(iface_info);
-	return FAILURE;
-}
-
-int dpa_add_vlan_if(char *name, struct _itf *itf, struct _itf *phys_itf, uint16_t vlan_id, uint8_t* mac ) 
-{
-	struct dpa_iface_info *iface_info;
-	struct dpa_iface_info *parent;
-
-	if(iface_count >= (MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES))
-	{
-		DPA_ERROR("%s::Number of interfaces support in fast path is only %d\n",
-				__func__,
-				(MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES));
-		return FAILURE;
-	}
-
-	if (!(phys_itf)) {
-		DPA_ERROR("%s::null dev for phys_itf\n", 
-				__func__); 
-		return FAILURE;
-	}
-	if (!(itf->phys)) {
-		DPA_ERROR("%s::null dev for lower iface\n", 
-				__func__); 
-		return FAILURE;
-	}
-
-	//ethernet/physical iface type
-	iface_info = (struct dpa_iface_info *)
-		kzalloc(sizeof(struct dpa_iface_info), GFP_KERNEL);  
-	if (!iface_info) {
-		DPA_ERROR("%s::no mem for eth dev info size %d\n", 
-				__func__, 
-				(uint32_t)sizeof(struct dpa_iface_info));
-		return FAILURE;
-	}
-	memset(iface_info, 0, sizeof(struct dpa_iface_info));
-	iface_info->itf_id = itf->index;
-	iface_info->if_flags = itf->type;
-	strncpy(&iface_info->name[0], name, IF_NAME_SIZE);
-
-	iface_info->vlan_info.vlan_id = htons(vlan_id);
-	memcpy(iface_info->vlan_info.mac_addr, mac, ETH_ALEN);
-	spin_lock(&dpa_devlist_lock);
-	parent = dpa_get_ifinfo_by_itfid(itf->phys->index);
-	if (!parent) {
-		DPA_ERROR("%s::no ifinfo for dev idx %d\n", 
-				__func__, itf->index);
-		spin_unlock(&dpa_devlist_lock);
-		goto err_ret;
-	}
-	iface_info->vlan_info.parent = parent;
-	/* inherit parents mtu as default */
-	iface_info->mtu = parent->mtu;
-	spin_unlock(&dpa_devlist_lock);
-	/* allocate interface statistics memory */
-#ifdef INCLUDE_VLAN_IFSTATS
-	if (alloc_iface_stats(itf->type, iface_info) != SUCCESS) {
-		DPA_ERROR("%s:: alloc_iface_stats failed\n", __func__);
-		goto err_ret;
-	}
-	iface_info->if_flags |= IF_STATS_ENABLED;
-#endif
-#ifdef DEVMAN_DEBUG
-	display_iface_info(iface_info);
-#endif
-	//add to list
-	if (dpa_add_port_to_list(iface_info)) {
-		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
-				__func__);
-		if (iface_info->if_flags & IF_STATS_ENABLED)
-			free_stats(iface_info);
-		goto err_ret;
-	}
-	iface_count++;
-	return SUCCESS;
-err_ret:
-	kfree(iface_info);
-	return FAILURE;
-}
-
 //get interface information from OS device priv structure
 static int get_wlan_iface_info(struct dpa_iface_info *iface_info)
 {
@@ -2223,6 +1458,10 @@ static int get_wlan_iface_info(struct dpa_iface_info *iface_info)
 		return FAILURE;
 	}
 	iface_info->mtu = device->mtu;
+	/* Borrowed, exactly as the ethernet arm borrows its own: compared to
+	 * resolve a netdev back to this iface, never dereferenced, and gone
+	 * when the VAP is retired. */
+	iface_info->wlan_info.net_dev = device;
 	dev_put(device);
 
 	dpaa_get_wifi_ohport_handle(&ohport_handle);
@@ -2270,9 +1509,6 @@ int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char
 		goto err_ret;
 	}
 
-#ifdef DEVMAN_DEBUG
-	display_iface_info(iface_info);
-#endif
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
@@ -2290,39 +1526,6 @@ err_ret:
 	return FAILURE;
 }
 
-/* This function sets the interface with its bridged status
- * if the interface is part of bridge
- and it's corresponding bridge mac address */
-
-int dpa_set_bridged_itf(uint8_t* ifname, uint8_t is_bridged, uint8_t* br_mac_addr)
-{
-	struct dpa_iface_info *iface_info;
-
-	iface_info = dpa_get_iface_by_name(ifname);
-	if (!iface_info)
-		return -1;
-
-	if (iface_info->if_flags & IF_TYPE_ETHERNET) {
-		iface_info->eth_info.is_bridged = is_bridged;
-		if (is_bridged)
-			memcpy(iface_info->eth_info.br_mac_addr, br_mac_addr, ETH_ALEN);
-	}
-	else if (iface_info->if_flags & IF_TYPE_VLAN){
-		iface_info->vlan_info.is_bridged = is_bridged;
-		if (is_bridged)
-			memcpy(iface_info->vlan_info.br_mac_addr, br_mac_addr, ETH_ALEN);
-	}
-	else if (iface_info->if_flags & IF_TYPE_WLAN){
-		iface_info->wlan_info.is_bridged = is_bridged;
-		if (is_bridged)
-			memcpy(iface_info->wlan_info.br_mac_addr, br_mac_addr, ETH_ALEN);
-	}
-	else 
-		return -1;
-
-	return 0;
-
-}
 //get fm and port index from itf_index
 int dpa_get_fm_port_index(uint32_t itf_index, uint32_t underlying_iif_index , 
 		uint32_t *fm_index, uint32_t *port_index,
@@ -2336,7 +1539,6 @@ int dpa_get_fm_port_index(uint32_t itf_index, uint32_t underlying_iif_index ,
 			break;
 		/* match itf index */
 		if (iface_info->itf_id == itf_index) {
-check_parent:
 			if (iface_info->if_flags & IF_TYPE_ETHERNET) {
 				/* ensure it is ethernet and return params */
 				*fm_index = iface_info->eth_info.fman_idx;
@@ -2353,214 +1555,13 @@ check_parent:
 					*portid = iface_info->wlan_info.portid;
 				return 0;
 			}
-
-			if (iface_info->if_flags & IF_TYPE_VLAN) {
-				iface_info = iface_info->vlan_info.parent;
-				itf_index = iface_info->itf_id;
-#ifdef DEVMAN_DEBUG
-				DPA_INFO("%s::moving to parent iface %s id %d\n",
-						__func__, iface_info->name, itf_index);
-#endif
-				goto check_parent;
-			}
-			if (iface_info->if_flags & IF_TYPE_PPPOE) {
-				iface_info = iface_info->pppoe_info.parent;
-				itf_index = iface_info->itf_id;
-#ifdef DEVMAN_DEBUG
-				DPA_INFO("%s::moving to parent iface %s id %d\n",
-						__func__, iface_info->name, itf_index);
-#endif
-				goto check_parent;
-			}
-			if ((iface_info->if_flags & IF_TYPE_TUNNEL) && (underlying_iif_index))
-			{
-				if(underlying_iif_index == itf_index)
-				{
-					DPA_ERROR("%s::underlying iface info cannot be same as itf_index\n",
-							__func__);
-					return FAILURE;
-				}
-
-				spin_lock(&dpa_devlist_lock);
-				if((iface_info = dpa_get_ifinfo_by_itfid(underlying_iif_index)) == NULL)
-				{
-					DPA_ERROR("%s::iface info does not exist\n", __func__);
-					spin_unlock(&dpa_devlist_lock);
-					return FAILURE;
-				}
-				spin_unlock(&dpa_devlist_lock);
-
-				itf_index = iface_info->itf_id;
-#ifdef DEVMAN_DEBUG
-				DPA_INFO("%s::moving to parent iface %s id %d\n",
-						__func__, iface_info->name, itf_index);
-#endif
-				goto check_parent;
-			}  else {
-				DPA_ERROR("%s::unsupported type 0x%x\n",
-						__func__, iface_info->if_flags);
-				break;
-			}
+			DPA_ERROR("%s::unsupported type 0x%x\n",
+					__func__, iface_info->if_flags);
+			break;
 		}
 		iface_info = iface_info->next;
 	}
 	return -1;
-}
-
-int dpa_update_tunnel_if(itf_t *itf,  itf_t *phys_itf, PTnlEntry pTunnelEntry)
-{
-#ifdef TUNNEL_IF_SUPPORT
-	struct dpa_iface_info *iface_info;	
-	struct dpa_iface_info *parent;	
-
-	if (!(itf)) {
-		DPA_ERROR("%s::null dev for tunnel _itf\n", 
-				__func__); 
-		return FAILURE;
-	}
-
-	spin_lock(&dpa_devlist_lock);
-	if((iface_info = dpa_get_ifinfo_by_itfid(itf->index)) == NULL){
-
-		DPA_ERROR("%s::iface info does not exist\n", 
-				__func__); 
-		spin_unlock(&dpa_devlist_lock);
-		return FAILURE;
-	}
-	iface_info->tunnel_info.mode = pTunnelEntry->mode;
-	if (iface_info->tunnel_info.mode == TNL_MODE_6O4)
-		iface_info->tunnel_info.proto = PROTO_IPV4; 
-	if (iface_info->tunnel_info.mode == TNL_MODE_4O6)
-	{
-		iface_info->tunnel_info.proto = PROTO_IPV6; 
-		iface_info->tunnel_info.flags = pTunnelEntry->flags;
-	}
-	iface_info->tunnel_info.header_size = pTunnelEntry->header_size;
-	memcpy(&iface_info->tunnel_info.local_ip, pTunnelEntry->local, IPV6_ADDRESS_LENGTH);
-	memcpy(&iface_info->tunnel_info.remote_ip, pTunnelEntry->remote, IPV6_ADDRESS_LENGTH);
-	memcpy(&iface_info->tunnel_info.header, pTunnelEntry->header, pTunnelEntry->header_size);
-	if(phys_itf)
-	{
-		parent = dpa_get_ifinfo_by_itfid(phys_itf->index);
-		if (!parent) {
-			DPA_ERROR("%s::no ifinfo for dev idx %d\n", 
-					__func__, pTunnelEntry->itf.phys->index);
-			spin_unlock(&dpa_devlist_lock);
-			return FAILURE;
-		}
-		iface_info->tunnel_info.parent = parent;
-		//inherit parents mtu as default
-		iface_info->mtu = parent->mtu;
-
-		if(pTunnelEntry->pRtEntry)
-			memcpy(&iface_info->tunnel_info.dstmac,
-					pTunnelEntry->pRtEntry->dstmac, ETH_ALEN);
-	}
-	else
-	{
-		iface_info->tunnel_info.parent = NULL;
-		iface_info->mtu = pTunnelEntry->tnl_mtu;
-	}
-
-	spin_unlock(&dpa_devlist_lock);
-	return SUCCESS;
-#endif
-}
-
-int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
-{
-#ifdef TUNNEL_IF_SUPPORT
-	struct dpa_iface_info *iface_info;	
-	struct dpa_iface_info *parent;	
-
-	if(iface_count >= (MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES))
-	{
-		DPA_ERROR("%s::Number of interfaces support in fast path is only %d\n",
-				__func__,
-				(MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES));
-		return FAILURE;
-	}
-
-
-	if (!(itf)) {
-		DPA_ERROR("%s::null dev for tunnel _itf\n", 
-				__func__); 
-		return FAILURE;
-	}
-	iface_info = (struct dpa_iface_info *)
-		kzalloc(sizeof(struct dpa_iface_info), GFP_KERNEL);  
-	if (!iface_info) {
-		DPA_ERROR("%s::no mem for tunnel dev info size %d\n", 
-				__func__, 
-				(uint32_t)sizeof(struct dpa_iface_info));
-		return FAILURE;
-	}
-	memset(iface_info, 0, sizeof(struct dpa_iface_info));
-	iface_info->itf_id = itf->index;
-	iface_info->if_flags = itf->type;
-	strncpy(iface_info->name, pTunnelEntry->tnl_name, IF_NAME_SIZE);
-	iface_info->name[IF_NAME_SIZE - 1] = '\0';
-
-	iface_info->tunnel_info.mode = pTunnelEntry->mode;
-	if (iface_info->tunnel_info.mode == TNL_MODE_6O4)
-		iface_info->tunnel_info.proto = PROTO_IPV4; 
-	if (iface_info->tunnel_info.mode == TNL_MODE_4O6)
-	{
-		iface_info->tunnel_info.proto = PROTO_IPV6; 
-		iface_info->tunnel_info.flags = pTunnelEntry->flags;
-	}
-	iface_info->tunnel_info.header_size = pTunnelEntry->header_size;
-	memcpy(&iface_info->tunnel_info.local_ip, pTunnelEntry->local, IPV6_ADDRESS_LENGTH);
-	memcpy(&iface_info->tunnel_info.remote_ip, pTunnelEntry->remote, IPV6_ADDRESS_LENGTH);
-	memcpy(&iface_info->tunnel_info.header, pTunnelEntry->header, pTunnelEntry->header_size);
-	spin_lock(&dpa_devlist_lock);
-	if(phys_itf)
-	{
-		parent = dpa_get_ifinfo_by_itfid(phys_itf->index);
-		if (!parent || (parent == iface_info)) {
-			DPA_ERROR("%s::no ifinfo (%p) for dev idx %d, or matching with parent(%p)\n", 
-					__func__, iface_info,pTunnelEntry->itf.phys->index,  parent);
-			spin_unlock(&dpa_devlist_lock);
-			goto err_ret;
-		}
-		iface_info->tunnel_info.parent = parent;
-		//inherit parents mtu as default
-		iface_info->mtu = parent->mtu;
-
-		if(pTunnelEntry->pRtEntry)
-			memcpy(&iface_info->tunnel_info.dstmac, 
-					pTunnelEntry->pRtEntry->dstmac, ETH_ALEN);
-	}
-	else
-	{
-		iface_info->tunnel_info.parent = NULL;
-		iface_info->mtu = pTunnelEntry->tnl_mtu;
-	}
-	spin_unlock(&dpa_devlist_lock);
-#ifdef INCLUDE_TUNNEL_IFSTATS
-	if (alloc_iface_stats(itf->type, iface_info) != SUCCESS) {
-		DPA_ERROR("%s:: alloc_iface_stats failed\n", __func__);
-		goto err_ret;
-	}
-	iface_info->if_flags |= IF_STATS_ENABLED;
-#endif
-#ifdef DEVMAN_DEBUG
-	display_iface_info(iface_info);
-#endif
-	//add to list
-	if (dpa_add_port_to_list(iface_info)) {
-		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
-				__func__);
-		if (iface_info->if_flags & IF_STATS_ENABLED)
-			free_stats(iface_info);
-		goto err_ret;
-	}
-	iface_count++;
-	return SUCCESS;
-err_ret:
-	kfree(iface_info);
-	return FAILURE;
-#endif
 }
 
 void dpa_update_timestamp(uint32_t ts)
@@ -2578,9 +1579,9 @@ int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq)
 {
 	struct dpa_iface_info *iface_info;
 
-	/* reachable from vwd init/ioctl and the injection path — outside
-	 * the FCI dispatcher mutex — so walk and copy under the list
-	 * lock; the caller keeps only the copied channel id */
+	/* reachable from vwd init and the injection path — outside the
+	 * ctrl mutex — so walk and copy under the list lock; the caller
+	 * keeps only the copied channel id */
 	spin_lock(&dpa_devlist_lock);
 	iface_info = dpa_interface_info;
 	while(1) {
@@ -2647,6 +1648,63 @@ void cdx_destroy_fq(struct qman_fq *fq)
 	synchronize_net();
 	cdx_remove_fqid_info_in_procfs(fq->fqid);
 	qman_destroy_fq(fq, 0);
+}
+
+/* The queue a classifier entry enqueues to when what it matched is to be
+ * dropped in hardware rather than reach the CPU.
+ *
+ * Parked, so nothing ever dequeues it, and tail-dropping at zero bytes, so
+ * QMan rejects every enqueue once it holds a frame. An FMan enqueue it rejects
+ * is discarded by QMan with no ERN, both FMan portals being set up that way at
+ * boot (qman_config.c) -- the path a CEETM class's tail drop takes. A parked
+ * queue raises no error on an enqueue, where one out of service would. At most
+ * the one frame is held, and its buffers go back to their pool when the queue
+ * is torn down, by the drain callback every forwarding queue here uses.
+ *
+ * Created on first use, under the control lock, so a box that never drops a
+ * stream this way never allocates it. */
+static struct qman_fq cdx_discard_fq;
+static bool cdx_discard_ready;
+
+int cdx_discard_fqid(uint32_t *fqid)
+{
+	struct qman_fq *fq = &cdx_discard_fq;
+	struct qm_mcc_initfq opts;
+
+	cdx_ft_assert_held();
+	if (!cdx_discard_ready) {
+		memset(fq, 0, sizeof(*fq));
+		fq->cb.dqrr = fwd_tx_drain_dqrr;
+		if (qman_create_fq(0, QMAN_FQ_FLAG_DYNAMIC_FQID, fq))
+			return -ENOMEM;
+		memset(&opts, 0, sizeof(opts));
+		opts.fqid = fq->fqid;
+		opts.count = 1;
+		opts.we_mask = QM_INITFQ_WE_FQCTRL | QM_INITFQ_WE_TDTHRESH;
+		opts.fqd.fq_ctrl = QM_FQCTRL_TDE;
+		qm_fqd_taildrop_set(&opts.fqd.td, 0, 0);
+		/* No QMAN_INITFQ_FLAG_SCHED: parked. */
+		if (qman_init_fq(fq, 0, &opts)) {
+			DPA_ERROR("%s::qman_init_fq failed for fqid %u\n",
+				  __func__, fq->fqid);
+			qman_destroy_fq(fq, 0);
+			return -EIO;
+		}
+		cdx_discard_ready = true;
+	}
+	*fqid = fq->fqid;
+	return 0;
+}
+
+/* Unload only, once the ports are stopped and before the pools a held frame
+ * came from are released. The adapter that built the entries naming the queue
+ * pins CDX, so they went with it. */
+void cdx_discard_exit(void)
+{
+	if (!cdx_discard_ready)
+		return;
+	cdx_destroy_fq(&cdx_discard_fq);
+	cdx_discard_ready = false;
 }
 
 void cdx_drain_fq_list(struct dpa_fq *head)
@@ -2880,24 +1938,36 @@ int get_phys_port_poolinfo_bysize(uint32_t size, struct port_bman_pool_info *poo
 	return -1;
 }
 
-struct dpa_priv_s* get_eth_priv(unsigned char* name)
+/* The first physical Ethernet port on record, held. For consumers that need
+ * a DPAA port's private data for what every port shares -- the buffer layout
+ * and errata handling -- rather than for any one port in particular. Pairs
+ * with dev_put() on the returned priv's net_dev. */
+struct dpa_priv_s *dpa_first_eth_priv(void)
 {
-	struct net_device *device;
-	struct dpa_priv_s *priv;
+	struct dpa_iface_info *iface;
+	struct net_device *device = NULL;
 
-	device = dev_get_by_name(&init_net, name);
+	spin_lock(&dpa_devlist_lock);
+	for (iface = dpa_interface_info; iface; iface = iface->next) {
+		if ((iface->if_flags & IF_TYPE_ETHERNET) && iface->eth_info.net_dev) {
+			device = iface->eth_info.net_dev;
+			dev_hold(device);
+			break;
+		}
+	}
+	spin_unlock(&dpa_devlist_lock);
 	if (!device) {
-		DPA_INFO("%s::could not find device %s\n", __func__, name);
+		DPA_INFO("%s::no Ethernet port on record\n", __func__);
 		return NULL;
 	}
-	priv = netdev_priv(device);
-	return priv;
+	return netdev_priv(device);
 }
 
 
 static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_stats64 *storage)
 {
 	struct dpa_iface_info *iface_info;
+	struct cdx_ft_stats rx, tx;
 
 	spin_lock(&dpa_devlist_lock);
 	iface_info = dpa_interface_info;
@@ -2907,51 +1977,57 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 		if (!iface_info)
 			break;		
 		//check if this the iface we want
-		if (strcmp(dev->name, iface_info->name)) {
+		if ((iface_info->if_flags & IF_TYPE_ETHERNET) ?
+		    iface_info->eth_info.net_dev != dev :
+		    strcmp(dev->name, iface_info->name)) {
 			iface_info = iface_info->next;
 			continue;
 		}
 		//if stats is disabled on the iface do nothing
 		if (!(iface_info->if_flags & IF_STATS_ENABLED))
 			break;
-		if(iface_info->if_flags & IF_TYPE_PPPOE) {
-			struct en_ehash_ifstats_with_ts *stats;
-			//printk("%s::returning pppoe iface stats\n", __func__);
-			stats = (struct en_ehash_ifstats_with_ts *)iface_info->stats;
-			storage->rx_packets += cpu_to_be32(stats->rxstats.pkts);
-			storage->rx_bytes += cpu_to_be64(stats->rxstats.bytes);
-			storage->tx_packets += cpu_to_be32(stats->txstats.pkts);
-			storage->tx_bytes += cpu_to_be64(stats->txstats.bytes);
-			break;
-		} 
-		if(iface_info->if_flags & (IF_TYPE_TUNNEL | IF_TYPE_VLAN | IF_TYPE_ETHERNET)) {
-			struct en_ehash_ifstats *stats;
-			//printk("%s::returning other iface stats\n", __func__);
-			stats = (struct en_ehash_ifstats *)iface_info->stats;
-			storage->rx_packets += cpu_to_be32(stats->rxstats.pkts);
-			storage->rx_bytes += cpu_to_be64(stats->rxstats.bytes);
-			storage->tx_packets += cpu_to_be32(stats->txstats.pkts);
-			storage->tx_bytes += cpu_to_be64(stats->txstats.bytes);
+		/* Every arm reads its record through cdx_ifstats_read(), which
+		 * carries the firmware's 32-bit packet count past its wrap; the
+		 * raw count would step the device's packets back by 2^32 there.
+		 * That nests dpa_statslist_lock inside this lock. */
+		if (iface_info->if_flags & IF_TYPE_ETHERNET) {
+			/* The port's record: what UPDATE_ETH_RX_STATS counted on
+			 * ingress and the enqueue counted on egress, both as
+			 * whole frames. The driver's own rx_bytes excludes the
+			 * Ethernet header, so the record is restated to match
+			 * before the two are added; transmit already agrees. */
+			cdx_ifstats_read(iface_info->stats, &rx, &tx);
+			cdx_ifstats_fold(storage, rx.bytes, rx.packets,
+					 tx.bytes, tx.packets,
+					 CDX_IFSTATS_PORT_RX_OVERHEAD, 0);
 			break;
 		}
-		printk("%s::unknown iface type,no stats available\n", 
+		printk("%s::unknown iface type,no stats available\n",
 				__func__);
 		iface_info = iface_info->next;
 	}
 	spin_unlock(&dpa_devlist_lock);
+	/* The flowtable owner registers no logical interfaces, so its VLAN
+	 * devices are not on the list above; their records are published to the
+	 * device by index and folded here. Outside the device-list lock: the two
+	 * are independent, and nothing needs them nested. */
+	cdx_ft_ifstats_fold(dev, storage);
 }
 
 static void devman_deinit_linux_stats(void)
 {
 	dev_fp_stats_get_deregister();
+	cdx_ifstats_stop();
 	return;
 }
 
 int devman_init_linux_stats(void)
 {
 	dev_fp_stats_get_register(virt_iface_stats_callback);
+	/* The records the hook folds count packets in 32 bits, which wrap in
+	 * minutes at line rate; the sampler reads them often enough that no
+	 * wrap goes unseen, for as long as the hook can be called. */
+	cdx_ifstats_start();
 	register_cdx_deinit_func(devman_deinit_linux_stats);
-	/* init number active connecions counter */
-	atomic_set(&num_active_connections, 0);
 	return 0;
 }

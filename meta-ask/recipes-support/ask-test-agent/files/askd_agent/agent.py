@@ -14,10 +14,10 @@ import re
 import secrets
 import select
 import signal
+import shutil
 import socket
 import struct
 import subprocess
-import threading
 import time
 from pathlib import Path
 
@@ -27,30 +27,9 @@ from . import __version__, counters, dmesg
 
 KMEMLEAK_PATH = Path("/sys/kernel/debug/kmemleak")
 
-# NETLINK_FF is the protocol number FCI uses (see fci/fci.h:44,
-# fci/lib/src/libfci.c:27). Matches the kernel uapi header where the
-# ASK patch bundle installs NETLINK_FF=30.
-NETLINK_FF = 30
-
 # struct nlmsghdr is 16 bytes on all 64-bit Linux: u32 len, u16 type,
 # u16 flags, u32 seq, u32 pid.
 _NLMSGHDR_SIZE = 16
-
-# Whitelist of cmm -c query sub-commands the orchestrator is allowed to run.
-# Keeps the HTTP surface from becoming an RCE by bounding exactly what cmm
-# invocations are accepted. Extend as we add more protocol coverage.
-CMM_QUERY_TABLES = {
-    "connections",          # IPv4 conntrack
-    "v6-connections",       # IPv6 conntrack
-    "tunnels",
-    "vlan",
-    "pppoe",
-    "ipsec-sa",
-    "mcast",
-    "bridge",
-    "mc4",                  # IPv4 multicast group entries (FCI mc4)
-    "mc6",                  # IPv6 multicast group entries (FCI mc6)
-}
 
 
 def _new_capture_id() -> str:
@@ -63,6 +42,11 @@ async def health(request: web.Request) -> web.Response:
         "version": __version__,
         "host": platform.node(),
         "uptime_s": _read_uptime(),
+        "kernel": platform.release(),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "capture_protocol": 2,
+        "binaries": [name for name in ("ip", "nft", "conntrack", "iperf3", "pppd", "smcrouted")
+                     if shutil.which(name)],
     })
 
 
@@ -78,15 +62,40 @@ async def counters_get(request: web.Request) -> web.Response:
     return web.json_response(counters.snapshot(ifaces))
 
 
+# A window whose stop never arrives would otherwise hold its descriptor for
+# the life of the agent. Tests open one per test, so a small bound is plenty
+# and keeps a crashed run from exhausting the descriptor table.
+MAX_OPEN_CAPTURES = 64
+
+
 async def capture_start(request: web.Request) -> web.Response:
-    ifaces = (await _maybe_json(request)).get("ifaces") or ["eth3", "eth4"]
+    body = await _maybe_json(request)
+    ifaces = body.get("ifaces") or ["eth3", "eth4"]
+    # Opt-in, because it is not free: the snapshot walks every file under
+    # /proc/fqid_stats -- 779 of them on this image -- and each read is a live
+    # QMan frame-queue query, about a second per snapshot and two snapshots per
+    # window. Callers that only want the splat window should not pay it. Ask
+    # for it with {"counters": true} when the deltas are actually read.
+    want_counters = bool(body.get("counters"))
+    captures = request.app["captures"]
+    while len(captures) >= MAX_OPEN_CAPTURES:
+        stale = captures.pop(next(iter(captures)))
+        dmesg.close(stale["kmsg_fd"])
     cap_id = _new_capture_id()
-    request.app["captures"][cap_id] = {
-        "kmsg_cursor": dmesg.read_kmsg_seq(),
-        "counters": counters.snapshot(ifaces),
-        "ifaces": ifaces,
-    }
-    return web.json_response({"capture_id": cap_id})
+    try:
+        fd = dmesg.open_at_tail()
+    except OSError as error:
+        return web.json_response({"complete": False, "error": str(error)}, status=503)
+    try:
+        captures[cap_id] = {
+            "kmsg_fd": fd,
+            "counters": counters.snapshot(ifaces) if want_counters else None,
+            "ifaces": ifaces,
+        }
+    except BaseException:
+        dmesg.close(fd)
+        raise
+    return web.json_response({"capture_id": cap_id, "complete": True})
 
 
 async def capture_stop(request: web.Request) -> web.Response:
@@ -94,65 +103,31 @@ async def capture_stop(request: web.Request) -> web.Response:
     cap = request.app["captures"].pop(cap_id, None)
     if cap is None:
         return web.json_response({"error": "unknown capture_id"}, status=404)
-    new_cursor, new_lines = dmesg.read_since(cap["kmsg_cursor"])
-    after = counters.snapshot(cap["ifaces"])
+    try:
+        window = dmesg.drain(cap["kmsg_fd"])
+    finally:
+        dmesg.close(cap["kmsg_fd"])
+    new_lines = window["lines"]
     splats = dmesg.has_splat(new_lines)
+    before = cap["counters"]
+    delta = (counters.diff_numeric(before, counters.snapshot(cap["ifaces"]))
+             if before is not None else None)
     return web.json_response({
+        "complete": window["complete"],
+        "error": window["error"],
         "dmesg": new_lines,
         "splats": splats,
-        "kmsg_cursor_end": new_cursor,
-        "counters_delta": counters.diff_numeric(cap["counters"], after),
+        "counters_delta": delta,
     })
 
 
 async def dmesg_delta(request: web.Request) -> web.Response:
     body = await _maybe_json(request)
     cursor = body.get("cursor")
-    new_cursor, lines = dmesg.read_since(cursor)
+    window = dmesg.read_since(cursor)
     return web.json_response({
-        "cursor": new_cursor,
-        "lines": lines,
-        "splats": dmesg.has_splat(lines),
-    })
-
-
-async def cmm_query(request: web.Request) -> web.Response:
-    """Run `cmm -c "query <table>"` and return stdout/stderr/rc.
-
-    No parsing yet — orchestrator handles output. Table name is whitelisted
-    so an orchestrator bug can't get arbitrary shell out of this endpoint.
-    """
-    body = await _maybe_json(request)
-    table = body.get("table", "connections")
-    if table not in CMM_QUERY_TABLES:
-        return web.json_response(
-            {"error": f"unknown table {table!r}; allowed: {sorted(CMM_QUERY_TABLES)}"},
-            status=400,
-        )
-    try:
-        # Use argv form (no shell=True) — no injection risk even before the
-        # whitelist, and cmm -c takes the query as a single argument.
-        # Capture as bytes (text=False) and decode with errors='replace':
-        # cmm's query output occasionally embeds non-UTF-8 bytes (binary
-        # fields, raw memory in name buffers), which under text=True makes
-        # subprocess raise UnicodeDecodeError mid-_communicate and the
-        # handler returns 500 to the caller.
-        r = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: subprocess.run(
-                ["cmm", "-c", f"query {table}"],
-                capture_output=True, timeout=5, check=False,
-            ),
-        )
-    except FileNotFoundError:
-        return web.json_response({"error": "cmm not installed"}, status=501)
-    except subprocess.TimeoutExpired:
-        return web.json_response({"error": "cmm timed out"}, status=504)
-    return web.json_response({
-        "table":  table,
-        "rc":     r.returncode,
-        "stdout": r.stdout.decode("utf-8", errors="replace"),
-        "stderr": r.stderr.decode("utf-8", errors="replace"),
+        **window,
+        "splats": dmesg.has_splat(window["lines"]),
     })
 
 
@@ -170,7 +145,7 @@ def _netlink_send_sync(
     kernel's input handler sees. By default the nlmsghdr's nlmsg_len
     matches the actual on-wire bytes (16 + len(body)); tests can lie
     via `nlmsg_len_override` to probe handlers' own length validation
-    (e.g. C2 fix in fci.c checks skb->len vs nlmsg_len).
+    (skb->len vs nlmsg_len).
     """
     sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, protocol)
     try:
@@ -255,15 +230,15 @@ def _netlink_send_failslab(
     failslab_times: int,
 ) -> dict:
     """Fork a child, open the netlink socket there, arm failslab scoped to
-    the child only, send the FCI message, then disarm. The fork isolates
+    the child only, send the message, then disarm. The fork isolates
     make-it-fail from the parent agent — otherwise arming would fault the
     agent's own kmallocs (aiohttp handlers, JSON serialization) and wedge
     the service.
 
     Arming *after* socket creation means the `times=N` counter is spent on
     kmallocs during the send/recv syscall path and whatever they call into
-    (FCI inbound handler, cdx dispatcher, mcast handlers) — not on the
-    bookkeeping overhead of opening the socket itself.
+    (e.g. an XFRM NEWSA's xdo_dev_state_add() into the cdx SA allocator) —
+    not on the bookkeeping overhead of opening the socket itself.
     """
     import pickle
 
@@ -380,86 +355,6 @@ def _netlink_send_failslab(
         return pickle.loads(buf)
     except Exception as e:
         return {"error": f"child produced no result: {e}"}
-
-
-def _parse_fci_reply(result: dict) -> dict:
-    """Overlay FCI_MSG interpretation on a generic netlink send result."""
-    body_hex = result.get("body_hex", "")
-    if not body_hex:
-        return result
-    body = bytes.fromhex(body_hex)
-    if len(body) >= 4:
-        result["fcode_echo"]   = int.from_bytes(body[0:2], "little")
-        result["reply_length"] = int.from_bytes(body[2:4], "little")
-    if len(body) >= 6:
-        result["reply_rc"]    = int.from_bytes(body[4:6], "little")
-        result["payload_hex"] = body[4:].hex()
-    return result
-
-
-async def fci_send(request: web.Request) -> web.Response:
-    """POST {fcode, length, payload_hex, [nlmsg_len_override], [timeout_ms],
-             [uid], [userns]}
-    -> FCI kernel reply.
-
-    Designed for fuzzing the A1 validator tables AND the C2 length-
-    validation defense: pass `nlmsg_len_override` to lie about the
-    netlink header's length field independent of the body bytes sent.
-
-    `uid` / `userns` fork a child that drops privilege before opening
-    the netlink socket (the in-kernel netlink_capable gate checks the
-    socket opener's credentials), for capability-gate tests.
-    """
-    body = await _maybe_json(request)
-    try:
-        fcode   = int(body["fcode"])  & 0xFFFF
-        length  = int(body["length"]) & 0xFFFF
-        payload = bytes.fromhex(body.get("payload_hex", ""))
-    except (KeyError, ValueError, TypeError) as e:
-        return web.json_response(
-            {"error": f"bad request: {e}"}, status=400,
-        )
-    nlmsg_len_override = body.get("nlmsg_len_override")
-    timeout_s = float(body.get("timeout_ms", 500)) / 1000.0
-    failslab_times = body.get("failslab_times")
-    uid = body.get("uid")
-    if uid is not None:
-        uid = int(uid)
-    userns = bool(body.get("userns", False))
-
-    fci_body = struct.pack("<HH", fcode, length) + payload
-    try:
-        if uid is not None or userns:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: _run_isolated(
-                    lambda: _netlink_send_sync(
-                        NETLINK_FF, fci_body, nlmsg_len_override,
-                        0, 0, timeout_s,
-                    ),
-                    uid, timeout_s, userns=userns,
-                ),
-            )
-        elif failslab_times is None:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                _netlink_send_sync,
-                NETLINK_FF, fci_body, nlmsg_len_override, 0, 0, timeout_s,
-            )
-        else:
-            # Fork-isolated path: failslab make-it-fail can only safely
-            # target a throwaway child, otherwise the agent's own aiohttp
-            # response path also faults and the service hangs.
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                _netlink_send_failslab,
-                NETLINK_FF, fci_body, nlmsg_len_override, 0, 0, timeout_s,
-                int(failslab_times),
-            )
-    except OSError as e:
-        return web.json_response({"error": f"socket error: {e}"}, status=500)
-    result = _parse_fci_reply(result)
-    return web.json_response(result)
 
 
 _CLONE_NEWUSER = 0x10000000
@@ -648,10 +543,32 @@ async def ioctl_send(request: web.Request) -> web.Response:
 
 _EXEC_ARGV0_ALLOWED = {
     "ip", "ethtool", "iptables", "modprobe", "rmmod", "insmod",
-    "sysctl", "conntrack", "bridge", "tcpdump",
-    # Fuzz harness for cmm's RTNL parser; built from cmm/test/ via
-    # `make -C cmm fuzzer`, packaged into the test image alongside cmm.
-    "cmm_rtnl_fuzzer",
+    "sysctl", "conntrack", "bridge", "tcpdump", "nft",
+    # The IPv6 half of iptables, with the same surface: rules, nothing that
+    # starts a program. tc is not listed, and stays on the console: `tc exec
+    # bpf import ... run` starts whatever it is given.
+    "ip6tables",
+    # Reading the kernel log. Several subsystems say what they did only
+    # there -- VWD logs the classifier hooks appearing and going, and those
+    # hooks have no sysfs or procfs face at all -- so without this the only
+    # way to see a transition is a UART session, which cannot be scripted
+    # alongside the HTTP fixtures the rest of a test uses.
+    "dmesg", "lsmod",
+    # Wi-Fi. A VAP's lifecycle is driven by these and by nothing else on
+    # this image: hostapd owns the AP interface, so it is what has to stop
+    # before the interface can unregister, and `iw` is the only way to
+    # change an interface's type or take one down to a station. Without
+    # them the registration half of the VAP work is testable and the
+    # retirement half is not.
+    "iw", "hostapd", "hostapd_cli", "wpa_supplicant", "wpa_cli",
+    # Routed multicast. ipmr's MFC has no /proc or netlink write surface a
+    # test could use: an entry is installed by a process holding an MRT_INIT
+    # socket and by nothing else, so the consumer is the control plane and
+    # has to be driven directly.
+    "smcrouted", "smcroutectl",
+    # Stopping the above. argv[0] stays the gate, so this buys the ability
+    # to signal a named process and nothing more.
+    "kill", "killall",
 }
 
 
@@ -675,10 +592,10 @@ async def exec_cmd(request: web.Request) -> web.Response:
         )
     timeout_s = float(body.get("timeout_ms", 5000)) / 1000.0
     try:
-        # bytes + errors='replace' decode — same rationale as cmm_query:
-        # any allowlisted command can emit non-UTF-8 bytes (tcpdump -X
-        # output, iptables names with high-byte chars, etc.) and the
-        # default text=True path raises UnicodeDecodeError → 500.
+        # bytes + errors='replace' decode: any allowlisted command can emit
+        # non-UTF-8 bytes (tcpdump -X output, iptables names with high-byte
+        # chars, etc.) and the default text=True path raises
+        # UnicodeDecodeError → 500.
         r = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: subprocess.run(
@@ -729,8 +646,8 @@ async def fs_read(request: web.Request) -> web.Response:
 async def fs_write(request: web.Request) -> web.Response:
     """POST {path, content, [uid], [timeout_ms]} -> write attempt result.
 
-    Used for sysctl / /proc / /sys write tests that care about capability
-    enforcement (e.g. H8: abm_sysctl_l3_filtering rejects non-CAP_NET_ADMIN).
+    Used for sysctl / /proc / /sys writes, including tests that care about
+    capability enforcement (`uid` drops privilege before the open).
     """
     body = await _maybe_json(request)
     try:
@@ -759,137 +676,27 @@ async def fs_write(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
-# Multicast subscription via setsockopt() — kernel uapi value, not in
-# the Python `socket` module on every distro we run against.
-_SOL_NETLINK            = 270
-_NETLINK_ADD_MEMBERSHIP = 1
-
-
-class _NetlinkListener:
-    """Per-id state for /netlink-listen-{start,stop}.
-
-    A blocking AF_NETLINK socket is read by a daemon thread that appends
-    each received frame to `frames` under `lock`. Stop closes the socket
-    (which unblocks recv with EBADF/0) and joins the thread.
-    """
-
-    def __init__(self, sock: socket.socket) -> None:
-        self.sock = sock
-        self.frames: list[bytes] = []
-        self.lock = threading.Lock()
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self) -> None:
-        while not self.stop.is_set():
-            try:
-                # 64K is the max netlink datagram size; truncation
-                # would lose part of a notification we'd then fail to
-                # parse. Use MSG_TRUNC if you need to know it happened.
-                buf = self.sock.recv(65536)
-            except OSError:
-                # Socket closed by stop() — exit cleanly.
-                return
-            if not buf:
-                return
-            with self.lock:
-                self.frames.append(buf)
-
-    def drain(self) -> list[bytes]:
-        with self.lock:
-            out, self.frames = self.frames, []
-        return out
-
-    def shutdown(self) -> None:
-        self.stop.set()
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-        self.thread.join(timeout=2.0)
-
-
-async def netlink_listen_start(request: web.Request) -> web.Response:
-    """POST {protocol, group} -> {listener_id}.
-
-    Opens an AF_NETLINK socket on `protocol`, joins multicast `group`,
-    and spawns a daemon thread that buffers received frames. Pair with
-    /netlink-listen-stop/{listener_id} to drain + close. The thread-
-    based capture mirrors the tcpdump capture pattern: socket I/O off
-    the asyncio loop so the event-loop thread stays responsive.
-    """
-    body = await _maybe_json(request)
-    try:
-        protocol = int(body["protocol"])
-        group    = int(body["group"])
-    except (KeyError, ValueError, TypeError) as e:
-        return web.json_response({"error": f"bad request: {e}"}, status=400)
-    # Group 0 is meaningless for netlink multicast (groups are 1-indexed).
-    # The upper bound is just a sanity guard against negative ints
-    # silently wrapping into a huge unsigned setsockopt value; the
-    # kernel rejects unknown groups with -ENOENT against the protocol's
-    # configured ngroups, so we don't need a tight ceiling here.
-    if group < 1 or group > 0x7fffffff:
-        return web.json_response(
-            {"error": f"group must be a positive 32-bit int, got {group}"},
-            status=400,
-        )
-    try:
-        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, protocol)
-        # bind(0, 0) — kernel allocates pid; nl_groups bitmask 0 means
-        # we don't ask for any groups via the legacy bind path. The
-        # NETLINK_ADD_MEMBERSHIP setsockopt below is the modern way
-        # (works for group ids beyond the 32-bit nl_groups bitmask).
-        sock.bind((0, 0))
-        sock.setsockopt(_SOL_NETLINK, _NETLINK_ADD_MEMBERSHIP, group)
-    except OSError as e:
-        return web.json_response(
-            {"error": f"netlink socket setup failed: errno={e.errno} {e.strerror}"},
-            status=500,
-        )
-    listener = _NetlinkListener(sock)
-    listener.thread.start()
-    listener_id = secrets.token_hex(8)
-    request.app["netlink_listeners"][listener_id] = listener
-    return web.json_response({"listener_id": listener_id})
-
-
-async def netlink_listen_stop(request: web.Request) -> web.Response:
-    """POST /netlink-listen-stop/{listener_id} -> {messages: [hex,...], count}.
-
-    Drains the buffered frames, closes the socket, joins the reader
-    thread. Frames are returned as hex strings so the JSON transport
-    is text-clean.
-    """
-    listener_id = request.match_info["listener_id"]
-    listener = request.app["netlink_listeners"].pop(listener_id, None)
-    if listener is None:
-        return web.json_response({"error": "unknown listener_id"}, status=404)
-    # shutdown() blocks on socket.close() + thread.join(); offload so
-    # the asyncio loop isn't stalled if the reader is mid-recv.
-    await asyncio.get_event_loop().run_in_executor(None, listener.shutdown)
-    frames = listener.drain()
-    return web.json_response({
-        "messages": [f.hex() for f in frames],
-        "count":    len(frames),
-    })
-
-
 async def netlink_send(request: web.Request) -> web.Response:
     """POST {protocol, body_hex, [nlmsg_type, nlmsg_flags,
                                   nlmsg_len_override, timeout_ms,
-                                  uid, userns]}
+                                  failslab_times, uid, userns]}
     -> raw kernel reply.
 
-    Lower-level than /fci/send: the agent prepends a netlink header but
-    everything else is the caller's bytes verbatim. Use this to target
-    netlink protocols that aren't FCI (e.g. NETLINK_L2FLOW=33 for
-    auto_bridge) or to probe layers that wrap FCI with their own
-    structure (like libfci's nlmsg_len trickery from the C2 write-up).
+    The agent prepends a netlink header; everything else is the caller's
+    bytes verbatim, so any netlink protocol can be targeted (XFRM,
+    rtnetlink, ...). `nlmsg_len_override` lies about the header's length
+    field independent of the body bytes sent, to probe a handler's own
+    length validation.
 
     `uid` / `userns` fork a child that drops privilege before opening
     the netlink socket (the in-kernel netlink_capable gate checks the
     socket opener's credentials), for capability-gate tests.
+
+    `failslab_times` forks a child and arms per-task fail-nth around exactly
+    one send (see _netlink_send_failslab): an armed window that covers one
+    send is the only way to drive a specific allocation on the handler's
+    side to NULL. An XFRM NEWSA, for one, reaches the cdx IPsec SA
+    allocator through xdo_dev_state_add().
     """
     body = await _maybe_json(request)
     try:
@@ -901,6 +708,7 @@ async def netlink_send(request: web.Request) -> web.Response:
     nlmsg_flags = int(body.get("nlmsg_flags", 0))
     nlmsg_len_override = body.get("nlmsg_len_override")
     timeout_s = float(body.get("timeout_ms", 500)) / 1000.0
+    failslab_times = body.get("failslab_times")
     uid = body.get("uid")
     if uid is not None:
         uid = int(uid)
@@ -916,6 +724,13 @@ async def netlink_send(request: web.Request) -> web.Response:
                     ),
                     uid, timeout_s, userns=userns,
                 ),
+            )
+        elif failslab_times is not None:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _netlink_send_failslab,
+                protocol, msg, nlmsg_len_override,
+                nlmsg_type, nlmsg_flags, timeout_s, int(failslab_times),
             )
         else:
             result = await asyncio.get_event_loop().run_in_executor(
@@ -1000,7 +815,7 @@ def _kmemleak_filter(blocks: list[str], needles: list[str]) -> list[str]:
 
 
 async def kmemleak_scan(request: web.Request) -> web.Response:
-    """GET ?filter=cdx_,fci_,abm_ -> filtered kmemleak report.
+    """GET ?filter=[cdx],cdx_ -> filtered kmemleak report.
 
     Without `filter`, returns the full report (all ~16k baseline DPAA
     false-positives included) — backward-compatible with callers that
@@ -1090,10 +905,16 @@ async def _maybe_json(request: web.Request) -> dict:
     return {}
 
 
+async def close_captures(app):
+    while app["captures"]:
+        _, capture = app["captures"].popitem()
+        dmesg.close(capture["kmsg_fd"])
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app["captures"] = {}
-    app["netlink_listeners"] = {}
+    app.on_cleanup.append(close_captures)
     app.router.add_get("/health",            health)
     app.router.add_get("/counters",          counters_get)
     app.router.add_post("/capture-start",    capture_start)
@@ -1101,11 +922,7 @@ def build_app() -> web.Application:
     app.router.add_post("/dmesg-delta",      dmesg_delta)
     app.router.add_get("/kmemleak-scan",     kmemleak_scan)
     app.router.add_post("/kmemleak-clear",   kmemleak_clear)
-    app.router.add_post("/cmm/query",        cmm_query)
-    app.router.add_post("/fci/send",         fci_send)
     app.router.add_post("/netlink/send",     netlink_send)
-    app.router.add_post("/netlink-listen-start", netlink_listen_start)
-    app.router.add_post("/netlink-listen-stop/{listener_id}", netlink_listen_stop)
     app.router.add_post("/ioctl/send",       ioctl_send)
     app.router.add_post("/fs/read",          fs_read)
     app.router.add_post("/fs/write",         fs_write)

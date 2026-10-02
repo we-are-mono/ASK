@@ -13,9 +13,7 @@ get EBUSY.
 from __future__ import annotations
 
 import errno
-import struct
 
-import pytest
 
 from _ioctl import (
     CDX_CTRL_DPA_SET_PARAMS,
@@ -55,9 +53,7 @@ async def test_g1_unprivileged_cannot_reconfigure_dpa(
 async def test_g1_root_gets_past_capability_gate(
     aiohttp_session, target_agent, splat_window,
 ):
-    """Sanity: as root, the capability check passes. The ioctl itself
-    will fail somewhere downstream (NULL fman_info pointer → whatever
-    the handler does with it) but the error must NOT be EPERM."""
+    """Root passes the capability gate and receives ENOTTY for the retired command."""
     data = b"\x00" * SIZEOF_CDX_CTRL_SET_DPA_PARAMS
     r = await target_agent.ioctl_send(
         aiohttp_session,
@@ -66,7 +62,7 @@ async def test_g1_root_gets_past_capability_gate(
         data=data,
         # uid=None → agent stays as root
     )
-    assert r.get("errno") != errno.EPERM, (
+    assert r.get("errno") == errno.ENOTTY, (
         f"root hit the capability gate (regression!): {r}"
     )
 

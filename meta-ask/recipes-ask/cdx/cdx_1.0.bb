@@ -1,4 +1,4 @@
-SUMMARY = "ASK CDX data-plane kernel module (cdx.ko)"
+SUMMARY = "ASK CDX hardware backend and Linux flowtable adapter modules"
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://${ASK_SRCROOT}/LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 
@@ -23,17 +23,15 @@ EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX
 #   CDX_DEBUG_KEY_ZEROING    - cdx_dpa_ipsec.c freed-key snapshot;
 #                              see tools/tests/test_ipsec_key_zeroing.py
 #   CDX_DEBUG_MC_HCSYNC_FAIL - dpa_control_mc.c HC-sync fault injection;
-#                              see tools/tests/test_mcast_hcsync_quarantine.py
-#   CDX_DEBUG_IPSEC_TEST_XFRM - control_ipsec.c by-SPI xfrm fallback so a
-#                              synthetic NAT-T SA can clear the fast-path
-#                              gate with a real, pre-created `ip xfrm`
-#                              state; see tools/tests/test_ipsec_natt_spi_bounds.py
+#                              no flowtable-mode driver yet (ISSUES.md A193)
 #   CDX_DEBUG_DPA_INIT      - startup acquisition fault injection;
 #                              see tools/startup_tests/test_dpa_init.py
+#   CDX_DEBUG_SPLIT_KEY_FAIL - cdx_dpa_ipsec.c split-key job fault
+#                              injection; see tools/tests/test_ipsec_split_key.py
 # Single quotes are load-bearing: bitbake inlines EXTRA_OEMAKE verbatim
 # into the generated shell command, so without them the space would split
 # CFG_FLAGS across two make arguments and the second define would be lost.
-EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL=1 -DCDX_DEBUG_IPSEC_TEST_XFRM=1 -DCDX_DEBUG_DPA_INIT=1'"
+EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL=1 -DCDX_DEBUG_DPA_INIT=1 -DCDX_DEBUG_FLOWTABLE=1 -DCDX_DEBUG_SPLIT_KEY_FAIL=1'"
 
 # Silence the [buildpaths] QA warning on the split kernel-module sub-package.
 # cdx.ko embeds a handful of TMPDIR-prefixed header paths in its .rodata
@@ -65,7 +63,7 @@ do_compile:prepend() {
 
 fakeroot do_install() {
     install -d ${D}${nonarch_base_libdir}/modules/${KERNEL_VERSION}/extra/ask
-    install -m 0644 ${S}/cdx.ko \
+    install -m 0644 ${S}/cdx.ko ${S}/ask_flowtable.ko \
         ${D}${nonarch_base_libdir}/modules/${KERNEL_VERSION}/extra/ask/
 
     # Publish Module.symvers under the name module.bbclass looks for

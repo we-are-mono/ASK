@@ -37,7 +37,6 @@
 #include "cdx_ctrl.h"
 #include "cdx_ioctl.h"
 #include "cdx_timer.h"
-#include "cdx_cmdhandler.h"
 #include "layer2.h"
 #include "globals.h"
 #include "devman.h"
@@ -48,37 +47,10 @@
 #define MAX_CDX_INIT_FUNCTIONS  16
 typedef void (*cdx_deinit_func)(void);
 void register_cdx_deinit_func(cdx_deinit_func func);
-extern atomic_t num_active_connections;
+/* Enter/leave a configuration or terminal teardown transaction; entry must
+ * hold neither RTNL nor ctrl.mutex. Runtime callbacks use the backend API. */
+void cdx_ctrl_lock_with_rtnl(void);
+void cdx_ctrl_unlock_with_rtnl(void);
 extern struct cdx_fman_info *fman_info;
-
-/* qosconnmark definitions */
-#define CHID_MASK       0xf     /* channel id mask for originator */
-#define REPLIER_CONNMARK_VALID  ((uint64_t)1 << 63) /* valid bit for replier qosconnmark */
-
-#define CONN_ORIG		1
-#define CONN_REPLIER		0
-
-/* function to determine ct entry version of connmark from iptable qosconnmark value */
-/* currently handles only chid and cqid bits */ 
-static inline uint32_t get_ctentry_qosmark_from_qosconnmark(uint64_t qosconnmark, uint32_t direction)
-{
-	uint32_t markval;
-
-	if (direction == CONN_ORIG) {
-		markval = (qosconnmark & 0xffffffff);
-	} else {
-		if (qosconnmark & REPLIER_CONNMARK_VALID) {
-			markval = (qosconnmark >> 32);
-		} else 
-			markval = 0;
-	}
-	if (direction == CONN_ORIG) {
-		DPRINT(KERN_ERR "%s:originator: qosmark %llx markval %x\n", __func__, qosconnmark, markval);
-	} else {
-		DPRINT(KERN_ERR "%s:replier: qosmark %llx markval %x\n", __func__, qosconnmark, markval);
-	}
-	return markval;
-}
-
 
 #endif /* _CDX_H_ */

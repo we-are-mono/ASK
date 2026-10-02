@@ -8,6 +8,7 @@
  *
  */
 
+#include <linux/types.h>
 #include "pdb.h"
 
 #ifndef DPA_IPSEC_H
@@ -93,8 +94,23 @@ void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle);
 int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td, 
 			uint32_t* portid);
 int cdx_dpa_ipsecsa_release(void *handle) ;
+/* Hold the SA's FQIDs when its queues are released: a classifier entry naming
+ * one may still be linked. The hold lasts until the datapath restart that
+ * settles that entry; control mutex held. */
+void cdx_dpa_ipsecsa_keep_fqids(void *handle);
+/* The restart's part: give back every FQID range held so far. Returns how many
+ * ranges went back. Control mutex held. */
+unsigned int cdx_dpa_ipsec_release_held_fqids(void);
+/* Unload, after CDX has settled what it recorded as possibly linked: settled,
+ * every range still held goes back, since nothing can name it any more;
+ * otherwise each stays allocated for the reset that alone can prove its entry
+ * gone, and only the bookkeeping goes. Control mutex held. */
+void cdx_dpa_ipsec_held_fqids_exit(bool settled);
 uint32_t get_fqid_to_sec(void *handle);
 uint32_t ipsec_get_to_cp_fqid(void *handle);
+uint32_t ipsec_get_key_tag(void *handle);
+void ipsec_share_key_tag(void *handle, void *other);
+bool cdx_ipsec_wait_sec_idle(void);
 
 struct sec_descriptor *get_shared_desc(void *handle);
 
@@ -103,16 +119,13 @@ struct qman_fq *get_to_sec_fq(void *handle);
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size);
 int cdx_dpa_ipsec_init(void);
 void cdx_dpa_ipsec_exit(void);
+bool cdx_dpa_ipsec_ready(void);
 
 int cdx_init_scatter_gather_bpool(void);
 int cdx_init_skb_2bfreed_bpool(void);
 
 int cdx_init_fqid_procfs(void);
 void cdx_deinit_fqid_procfs(void);
-
-/* Exception packet handling */
-void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle);
-void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
 
 /* SA frame queue management */
 int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num);

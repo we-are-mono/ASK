@@ -1,12 +1,13 @@
 """Fault the actual SDK HC transport and Linux enqueue/confirmation wrapper."""
+
+from ask_orch.process import run_process
 from pathlib import Path
 import os
 import shutil
-import subprocess
 
 import pytest
 
-from test_sdk_scheme_delete import ROOT, function
+from _host_sdk_scheme_delete import (ROOT, function)
 
 
 def test_sdk_hc_transport(tmp_path):
@@ -28,7 +29,7 @@ def test_sdk_hc_transport(tmp_path):
     (tmp_path / "hc_production.inc").write_text("\n".join(function(hc, name) for name in [
         "FillBufPool", "GetBuf", "PutBuf", "EnQFrm", "FmHcQuiesce", "FmHcFree",
         "FmHcSetFramesDataMemory", "FmHcTxConf", "FmHcPcdSync",
-        "FmAllowHcUsage", "FmIsHcUsageAllowed",
+        "FmAllowHcUsage", "FmIsHcUsageAllowed", "FmHcIsFailed",
     ]))
     (tmp_path / "hc_wrapper.inc").write_text("\n".join(function(wrapper, name) for name in [
         "hc_swap_frame", "qm_tx_conf_dqrr_cb", "QmEnqueueCB",
@@ -43,7 +44,7 @@ def test_sdk_hc_transport(tmp_path):
                 "Peripherals/FM/inc", "Peripherals/FM/Pcd"]:
         command.extend(["-I", str(sdk / inc)])
     command.extend([str(Path(__file__).with_name("sdk_hc_transport.c")), "-o", str(binary)])
-    subprocess.run(command, check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process(command, check=True)
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

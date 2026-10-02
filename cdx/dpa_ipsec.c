@@ -18,6 +18,9 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/if_ether.h>
+#include <linux/if_vlan.h>
+#include <linux/idr.h>
+#include <linux/refcount.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
@@ -26,6 +29,7 @@
 #include <linux/ppp_defs.h>
 #include <linux/highmem.h>
 #include <linux/proc_fs.h>
+#include <linux/workqueue.h>
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 #include <net/xfrm.h>
 #endif
@@ -37,6 +41,8 @@
 #include "dpa_ipsec.h"
 #include "cdx_ioctl.h"
 #include "cdx.h"
+#include "cdx_flowtable.h"
+#include "cdx_flowtable_backend.h"
 #include "misc.h"
 #include "dpaa_eth_common.h"
 #include "dpa_wifi.h"
@@ -88,6 +94,8 @@
 struct cgr_priv {
 /*	bool use_ingress_cgr;*/
 	struct qman_cgr ingress_cgr;
+	int cpu;
+	int delete_result;
 };
 /* The following macro is used as default value before introducing module param */
 
@@ -104,7 +112,51 @@ struct dpa_ipsec_sainfo {
 	struct sec_descriptor *shared_desc;
 	struct dpa_fq sec_fq[NUM_FQS_PER_SA];
 	void *sa_proc_entry;
+	/* Nonzero when the FQIDs outlive the queues: the datapath epoch in
+	 * which a classifier entry naming them could not be proven gone. See
+	 * cdx_dpa_ipsecsa_keep_fqids(). */
+	u32 keep_epoch;
+	u16 key_tag;
 };
+
+/* FQID ranges an SA released while an entry that may still be linked named
+ * them, until the datapath restart that settles the entry. Under the control
+ * mutex: the SA's release runs on the CDX timer, which holds it, and so does
+ * the restart. */
+struct dpa_ipsec_held_fqids {
+	struct list_head list;
+	u32 base;
+	u16 key_tag;
+};
+static LIST_HEAD(dpa_ipsec_held);
+static DEFINE_IDA(ipsec_key_tags);
+static refcount_t ipsec_key_tag_refs[VLAN_N_VID];
+
+static void ipsec_put_key_tag(u16 tag)
+{
+	if (refcount_dec_and_test(&ipsec_key_tag_refs[tag]))
+		ida_free(&ipsec_key_tags, tag);
+}
+
+uint32_t ipsec_get_key_tag(void *handle)
+{
+	return ((struct dpa_ipsec_sainfo *)handle)->key_tag;
+}
+
+/* Only before this SA's descriptor is built, under ctrl.mutex. Outbound
+ * NAT-T rekeying SAs share a root; the tag outlives all of their queues. */
+void ipsec_share_key_tag(void *handle, void *other)
+{
+	struct dpa_ipsec_sainfo *sa = handle, *owner = other;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	if (sa->key_tag == owner->key_tag)
+		return;
+	refcount_inc(&ipsec_key_tag_refs[owner->key_tag]);
+	ipsec_put_key_tag(sa->key_tag);
+	sa->key_tag = owner->key_tag;
+}
+
 
 struct ipsec_info {
 	uint32_t crypto_channel_id;
@@ -114,17 +166,38 @@ struct ipsec_info {
 	void *ofport_td[MAX_MATCH_TABLES];
 	uint32_t expt_fq_count ;
 	struct dpa_bp *ipsec_bp;
-	struct dpa_fq		*ipsec_exception_fq;
+	/* PCD wrappers are individually allocated; SA queues are embedded in
+	 * dpa_ipsec_sainfo and must only be freed by their SA owner. */
+	struct dpa_fq *ipsec_pcd_fqs;
+	struct dpa_fq *ipsec_exception_fq;
 	struct port_bman_pool_info parent_pool_info;
 #ifdef CS_TAIL_DROP
 	struct cgr_priv	cgr;
+	bool cgr_initialized;
 #endif
 };
 
-static struct ipsec_info ipsecinfo;
+static struct ipsec_info ipsecinfo = { .ofport_handle = -1 };
+
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 extern struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
 #endif
+
+/* The dedicated SEC pool's BPID, which BMan hands out at runtime; -1 while
+ * there is no pool. Published so BMan's count for it can be found without
+ * the boot log, which a long-running system overwrites. A copy rather than a
+ * read through ipsecinfo.ipsec_bp, which is freed on release. */
+static int ipsec_bpid = -1;
+
+static int ipsec_bpid_get(char *buffer, const struct kernel_param *kp)
+{
+	return sysfs_emit(buffer, "%d\n", READ_ONCE(ipsec_bpid));
+}
+
+static const struct kernel_param_ops ipsec_bpid_ops = {
+	.get = ipsec_bpid_get,
+};
+module_param_cb(ipsec_bpid, &ipsec_bpid_ops, NULL, 0444);
 
 /* Forward declarations for internal functions */
 static int cdx_find_ipsec_pcd_fqinfo(int fqid, struct ipsec_info *info);
@@ -133,6 +206,63 @@ static void ipsec_addfq_to_exceptionfq_list(struct dpa_fq *frameq,
 static void ipsec_delfq_from_exceptionfq_list(uint32_t fqid,
 		struct ipsec_info *info);
 
+/* Only buffers transferred permanently to Linux need replacing. Hardware
+ * acquisitions are temporary and must not inflate the pool while in flight.
+ * This accounting is independent of every Ethernet port's receive pool. */
+static atomic_t ipsec_pool_debt = ATOMIC_INIT(0);
+static bool ipsec_refill_enabled;
+static void ipsec_pool_refill_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ipsec_refill_work, ipsec_pool_refill_work);
+
+static void ipsec_pool_refill_work(struct work_struct *work)
+{
+	unsigned int budget = 64;
+	unsigned long delay = 0;
+
+	if (!smp_load_acquire(&ipsec_refill_enabled))
+		return;
+	/* Completed input skbs may carry the last reference to a deleted SA.
+	 * Reap them even when no further traffic arrives to reuse their SGT. */
+	dpaa_sec_sg_reap(64);
+	while (budget-- && atomic_read(&ipsec_pool_debt)) {
+		/* A one-buffer request cannot partially succeed. Retain its debt
+		 * on any allocation/DMA failure and retry even if SEC has no
+		 * buffers left to generate another receive callback. */
+		if (dpaa_bp_alloc_n_add_buffs(ipsecinfo.ipsec_bp, 1, true)) {
+			delay = msecs_to_jiffies(20);
+			break;
+		}
+		atomic_dec(&ipsec_pool_debt);
+	}
+	/* Retry a spent refill budget immediately; idle polling and allocation
+	 * failures wait so neither an empty pool nor an idle tunnel spins. */
+	if (!atomic_read(&ipsec_pool_debt))
+		delay = msecs_to_jiffies(20);
+	if (smp_load_acquire(&ipsec_refill_enabled))
+		schedule_delayed_work(&ipsec_refill_work, delay);
+}
+
+static void ipsec_pool_consumed(unsigned int count)
+{
+	/* New debt must not wait behind idle reaping. Further receive events
+	 * retain the failure backoff while outstanding debt is already queued. */
+	if (atomic_add_return(count, &ipsec_pool_debt) == (int)count &&
+	    smp_load_acquire(&ipsec_refill_enabled))
+		mod_delayed_work(system_wq, &ipsec_refill_work, 0);
+}
+
+static void ipsec_pool_refill_start(void)
+{
+	atomic_set(&ipsec_pool_debt, 0);
+	smp_store_release(&ipsec_refill_enabled, true);
+	schedule_delayed_work(&ipsec_refill_work, 0);
+}
+
+static void ipsec_pool_refill_stop(void)
+{
+	WRITE_ONCE(ipsec_refill_enabled, false);
+	cancel_delayed_work_sync(&ipsec_refill_work);
+}
 struct dpa_bp* get_ipsec_bp(void)
 {
 	return (ipsecinfo.ipsec_bp);
@@ -191,64 +321,14 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 			fq->fqid, msg->ern.rc, fd->bpid,
 			(unsigned long long)qm_fd_addr_get64(fd), n);
 
-	/*
-	 * Software-built SGT FDs (dpaa_submit_{inb,outb}_pkt_to_SEC) carry
-	 * the skb_2bfreed pool's bpid and still own their skb and DMA
-	 * mappings when the enqueue is rejected: skb_fraglist_to_sg_fd()
-	 * stashed the skb pointer in the SGT's trailing opaque slot for
-	 * deferred freeing after SEC consumption, and mapped the SGT plus
-	 * every data segment DMA_TO_DEVICE. Hardware never consumed this
-	 * frame, so unwind it all here like the submitters' synchronous
-	 * enqueue-failure paths do: unmap, free the skb now (leaving it to
-	 * the deferred protocol would pin it in the pool buffer until the
-	 * next builder acquire, which may never come once traffic stops),
-	 * clear the opaque slot, and return the buffer to the clean SG pool.
-	 */
+	/* A rejected software input still owns its skb and payload mappings.
+	 * Share completion with normal reuse and the idle reaper. */
 	if (fd->format == qm_fd_sg && skb_2bfreed_bpool_g && sg_bpool_g &&
 	    fd->bpid == skb_2bfreed_bpool_g->bpid) {
-		struct qm_sg_entry *sgt = phys_to_virt(qm_fd_addr(fd));
-		struct device *dev = skb_2bfreed_bpool_g->dev;
-		struct sk_buff *skb;
-		int i, idx = 0;
-
-		/* Bounded walk to the final data entry. The builder caps data
-		 * entries at DPA_SGT_MAX_ENTRIES (final bit at most at index
-		 * DPA_SGT_MAX_ENTRIES - 1, opaque skb slot right after it), so
-		 * a final bit not found below that bound means a malformed
-		 * SGT whose opaque slot cannot be trusted. */
-		while (idx < DPA_SGT_MAX_ENTRIES &&
-		       !qm_sg_entry_get_final(&sgt[idx]))
-			idx++;
-		if (idx >= DPA_SGT_MAX_ENTRIES)
-			goto plain_release;
-
-		/* Builder mapped the SGT for (data entries + opaque) slots.
-		 * Unmap it first, then each data mapping straight from the
-		 * SGT's recorded addr/len (head entries were mapped with
-		 * dma_map_single, page frags with skb_frag_dma_map; the
-		 * unmap is the same operation for both). The exact mapping
-		 * device isn't recoverable per-frame here; the pool's dev
-		 * is the same coherent-DMA parent the submitters map with.
-		 */
-		dma_unmap_single(dev, qm_fd_addr(fd),
-				 sizeof(struct qm_sg_entry) * (idx + 2),
-				 DMA_TO_DEVICE);
-		for (i = 0; i <= idx; i++)
-			dma_unmap_page(dev, qm_sg_addr(&sgt[i]),
-				       qm_sg_entry_get_len(&sgt[i]),
-				       DMA_TO_DEVICE);
-		skb = (struct sk_buff *)sgt[idx + 1].opaque;
-		if (skb)
-			dev_kfree_skb_any(skb);
-		sgt[idx + 1].opaque = 0;
-		bmb.opaque = 0;
-		bm_buffer_set64(&bmb, qm_fd_addr(fd));
-		while (unlikely(bman_release(sg_bpool_g->pool, &bmb, 1, 0)))
-			cpu_relax();
+		dpaa_sec_sg_release(fd, true);
 		return;
 	}
 
-plain_release:
 	bp = dpa_bpid2pool(fd->bpid);
 	if (bp) {
 		bmb.opaque = 0;
@@ -260,52 +340,15 @@ plain_release:
 
 
 
-void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle)
-{
-	struct xfrm_state *x;
-	struct net_device *netdev = (struct net_device *)dev;
-
-	if ((x = xfrm_state_lookup_byhandle(dev_net(netdev), handle)) == NULL)
-	{
-		DPAIPSEC_ERROR("(%s)xfrm_state not found for handle %x\n",
-				__func__, handle);
-		return NULL;
-	}
-	return x;
-}
-
-void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state)
-{
-	if (xfrm_state)
-	{
-		xfrm_state_put((struct xfrm_state *)xfrm_state);
-	}
-	return;
-}
-
 extern 	struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,
-		uint16_t *sagd_pkt);
+		uint16_t *sagd_pkt, uint16_t *tag);
 static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *qm,
 		struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
 {
 
-	/*
-	 * ASK A22 defensive: if the dq'd fd is an IPsec output buffer
-	 * (BPID == ipsec_bp), this is a SEC encrypt result that should have
-	 * been consumed by the OH port hardware (channel 0x80a) and routed
-	 * through the cdx_esp4_cc PCD chain to the WAN eth port's TX. It hit our CPU cb
-	 * instead — meaning the OH-port channel binding is broken (A22).
-	 *
-	 * The default code path below assumes Ethernet-RX-pool semantics
-	 * (skb pointer embedded before the buffer), which is wrong for
-	 * pool 37: contig_fd_to_skb walks off into poison memory.
-	 *
-	 * Log, release the buffer back to the IPsec pool, and consume.
-	 * This keeps the system alive while we work the OH-port issue.
-	 */
+	/* Decrypted frames that missed hardware forwarding re-enter Linux. */
 	uint8_t *ptr;
-	uint32_t len;
 	struct sk_buff *skb;
 	struct net_device *net_dev;
 	struct dpa_bp *dpa_bp;
@@ -313,65 +356,20 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	struct dpa_percpu_priv_s        *percpu_priv;
 	unsigned short eth_type;
 	unsigned short sagd_pkt;
+	uint16_t tag;
 	struct sec_path *sp;
 	struct xfrm_state *x;
-	struct timespec64 ktime;
-#ifdef DPA_IPSEC_DEBUG
-	unsigned short sagd; 
-#endif
 	bool use_gro;
-	int *percpu_bp_cnt;
-	unsigned short protocol;
-	int no_l2_itf_dev;
+	int pool_balance = 0;
 	gro_result_t gro_result;
 	const struct qman_portal_config *pc;
 	struct dpa_napi_portal *np;
-#ifdef DPA_IPSEC_DEBUG
-	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, \n offset %d sts %08x\n", __func__,
-			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
-			dq->fd.offset, dq->fd.status);
 
-	/* for debugging */
-	ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr));
-	printk("Dispalying parse result:\n");
-	display_buff_data(ptr, 0x70);
-#endif /* DPA_IPSEC_DEBUG */
-
-	/* len = (dq->fd.length20 - 4); */
-	len = dq->fd.length20;
-	ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr) + dq->fd.offset);
-#ifdef DPA_IPSEC_DEBUG
-	/* for debugging printing packet*/
-	if (len >= 64)
-	{
-		display_buff_data(ptr, 64);
-	}
-	else
-	{
-		display_buff_data(ptr, len);
-	} 
-#endif /*DPA_IPSEC_DEBUG */
-	/* 
-	 * extract sagd from the end of packet. That sagd is used for two purpose.
-	 * 1) After the Sec processes since a new buffer is used for decrypted input 
-	 *    packets, the port information on which the orginal packet reached is lost.
-	 *    When giving the packet to the stack this information is required. Earlier
-	 *    we used a hardcoded logic of identifying one of the port as WAN port  by name
-	 *    or adding ESP table to only one of the port in configuration file, and hard code 
-	 *    that port as incoming ipsec packet before submitting the packet. With this change
-	 *    now we store the incoing interface netdev structure in SA structure itself and 
-	 *    extract incoming for by using the sagd copied into the end of packet.
-	 *  2) We need dpa_priv pointer from the net_dev for calling dpaa_eth_napi_schedule ()
-	 *     We do not want the complete pkt processing happen in irq context. 
-	 *     dpaa_eth_napi_schedule () schdule a soft irq and ensure this function is called
-	 *     again soft irq. 
-	 *  3) We need to find xrfm state by using this sagd and put that into skb
-	 *     beofe submitting into stack. If the there is a coresponding inbound 
-	 *     ipsec policy only this packet will be allowed otherwise stack will
-	 *     drop the packet.   
-	 */
-	dpa_bp = dpa_bpid2pool(dq->fd.bpid);
-	net_dev = get_netdev_of_SA_by_fqid(dq->fqid, &sagd_pkt);
+	/* A volatile dequeue may finish without a frame descriptor. */
+	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
+		return qman_cb_dqrr_consume;
+	/* The exception queue identifies the receiving SA and device. */
+	net_dev = get_netdev_of_SA_by_fqid(dq->fqid, &sagd_pkt, &tag);
 
 	if(!net_dev ){
 #ifdef DPA_IPSEC_DEBUG
@@ -380,6 +378,27 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		goto rel_fd;
 	}
 
+	/* The frame is delivered below through this device's receive context,
+	 * read from its private area as a DPAA port's. The SA's device is the
+	 * port it is bound to, which admission accepts only when it is one;
+	 * any other device's private area is some other driver's state, so
+	 * the frame is dropped rather than built from it. */
+	if (unlikely(!dpa_netdev_is_dpaa(net_dev))) {
+		dev_core_stats_rx_dropped_inc(net_dev);
+		pr_err_ratelimited(
+			"cdx: IPsec SA 0x%x is bound to %s, not a DPAA port - dropping\n",
+			sagd_pkt, net_dev->name);
+		goto rel_fd;
+	}
+
+	/* A frame SEC refused, which this queue is not expected to carry: the
+	 * offline port's microcode checks SEC's status on the way here, counts
+	 * a refusal and drops the frame in FMan (see the adapter's
+	 * ft_sec_refusals_fold()). One that got through anyway would still be
+	 * SEC's output for a job it refused -- for a replay the whole decrypted
+	 * packet, since SEC checks the ICV before the window -- and delivering
+	 * it would pass it off as authenticated. Dropped, and said out loud,
+	 * because it means FMan no longer does what the accounting counts on. */
 	if (unlikely(dq->fd.status & FM_FD_RX_STATUS_ERR_NON_FM)) {
 		pr_err_ratelimited(
 			"cdx: IPsec SEC error on %s, fqid=0x%x sagd=0x%x status=0x%08x - dropping\n",
@@ -396,6 +415,13 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		goto rel_fd;
 	}
 
+	/* Output-root misses carry ciphertext. They must never be labelled
+	 * as an authenticated inbound packet when returned to Linux. */
+	if (unlikely(x->xso.dir != XFRM_DEV_OFFLOAD_IN)) {
+		xfrm_state_put(x);
+		goto rel_fd;
+	}
+
 	priv = netdev_priv(net_dev); 
 	DPA_BUG_ON(!priv);
 	/* IRQ handler, non-migratable; safe to use raw_cpu_ptr here */
@@ -405,12 +431,42 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	{
 		DPAIPSEC_ERROR("%s(%d) dpaa_eth_napi_schedule failed\n",
 				__func__,__LINE__);
+		xfrm_state_put(x);
 		return qman_cb_dqrr_stop;
 	}
 #endif /* CONFIG_FSL_ASK_QMAN_PORTAL_NAPI */
 
-	no_l2_itf_dev = vwd_is_no_l2_itf_device(net_dev);
-	percpu_bp_cnt =	raw_cpu_ptr(priv->percpu_count);
+	/* sg_fd_to_skb accounts each data buffer and the recycled SGT in
+	 * this packet-local balance. It must never touch the Ethernet count. */
+	dpa_bp = dpa_bpid2pool(dq->fd.bpid);
+	if (unlikely(!dpa_bp)) {
+		xfrm_state_put(x);
+		goto rel_fd;
+	}
+	/* Conversion owns the buffer from here. SG conversion also returns
+	 * the table to BMan after remapping it, so unmap its old mapping first. */
+	dma_unmap_single(dpa_bp->dev, qm_fd_addr(&dq->fd), dpa_bp->size,
+			 DMA_BIDIRECTIONAL);
+
+	if (likely(dq->fd.format == qm_fd_contig)) {
+		skb = contig_fd_to_skb(priv, &dq->fd, &use_gro, false);
+	} else {
+		skb = sg_fd_to_skb(priv, &dq->fd, &use_gro, &pool_balance, false);
+		percpu_priv->rx_sg++;
+	}
+
+	pool_balance--;
+	ipsec_pool_consumed(-pool_balance);
+	if (unlikely(!pskb_may_pull(skb, ETH_HLEN + VLAN_HLEN + 1)))
+		goto pkt_drop;
+	/* This tag was inserted by the executing SEC descriptor. Remove
+	 * exactly that shim, preserving both original per-packet MACs. */
+	if (unlikely(((struct vlan_ethhdr *)skb->data)->h_vlan_proto != htons(ETH_P_8021Q) ||
+		     ((struct vlan_ethhdr *)skb->data)->h_vlan_TCI != htons(tag)))
+		goto pkt_drop;
+	memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
+	skb_pull(skb, VLAN_HLEN);
+	ptr = skb->data;
 	/*  When V6 SA is applied to v4 packet and vice versa, since ether header is
 	 *  copied from input packet, it will be wrong. Below logic is added just
 	 *  make the required correction in this case.
@@ -426,65 +482,29 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		ptr[12]= 0x08;
 		ptr[13] = 0x00;
 	}
-	protocol =  *((unsigned short*) (ptr + 12));
-#ifdef DPA_IPSEC_DEBUG
-	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, offset %d netdev %p dev %s temp_dev =%s addr %llx sts %08x\n", __func__,
-			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
-			dq->fd.offset, net_dev, net_dev->name,net_dev->name, (uint64_t)dq->fd.addr, dq->fd.status);
-	DPAIPSEC_INFO(" sagd extracted from packet = %d \n",sagd_pkt);
-	//display_buff_data(ptr, len);	
-	//goto rel_fd;
-#endif
-
-	if (likely(dq->fd.format == qm_fd_contig)) {
-		skb = contig_fd_to_skb(priv, &dq->fd, &use_gro, false);
-	} else {
-		skb = sg_fd_to_skb(priv, &dq->fd, &use_gro, percpu_bp_cnt, false);
-		percpu_priv->rx_sg++;
-	}
-
-	(*percpu_bp_cnt)--;
-	if (unlikely(dpaa_eth_refill_bpools(dpa_bp, percpu_bp_cnt,
-			THRESHOLD_IPSEC_BPOOL_REFILL))) {
-		//if we cant refill give this up
-		goto pkt_drop;
-	}
-
-
 
 	skb->dev = net_dev;
-//	skb_reset_tail_pointer(skb);
-	if (no_l2_itf_dev)
-	{
-#ifndef UNIT_TEST
-		skb_pull(skb, ETH_HLEN);
-		skb_reset_network_header(skb);
-		skb->mac_len = 0;
-		skb->protocol = protocol;
-#else
-		skb->protocol = eth_type_trans(skb, net_dev);
-#endif
-	}
-	else
-	{
-		skb->protocol = eth_type_trans(skb, net_dev);
-	}
+	skb->protocol = eth_type_trans(skb, net_dev);
 
-	sp = skb_ext_add(skb, SKB_EXT_SEC_PATH);
+	/* SEC has decrypted the packet, but has not checked the complete
+	 * receiving policy. Initialize the secpath with olen/verified_cnt zero
+	 * so Linux validates it rather than trusting stale offload metadata. */
+	sp = secpath_set(skb);
 
 	if (!sp)
 	{
-		DPAIPSEC_ERROR("No sec_path. Dropping pkt\n");
+		pr_err_ratelimited("cdx: unable to allocate IPsec security path\n");
 		goto pkt_drop;
 	}
 
 	sp->xvec[0] = x;
 
-	if (!x->curlft.use_time)
-	{
-		ktime_get_real_ts64(&ktime);
-		x->curlft.use_time = (unsigned long)ktime.tv_sec;
-	}
+	/* First use, stamped without x->lock: this runs per frame in the
+	 * portal callback, while the SA's accounting pass and the state timer
+	 * read the field under the lock. One marked load and store, as
+	 * xfrm_state_check_expire() makes its own. */
+	if (!READ_ONCE(x->curlft.use_time))
+		WRITE_ONCE(x->curlft.use_time, ktime_get_real_seconds());
 	sp->len = 1;
 
 #ifdef DPA_IPSEC_DEBUG
@@ -501,14 +521,27 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		(void)gro_result; /* Result no longer checked - GRO_DROP removed in kernel 6.12 */
 
 	}
-	else if ( (netif_receive_skb(skb) == NET_RX_DROP)) /* (netif_rx(skb) != NET_RX_SUCCESS) */
-		DPAIPSEC_ERROR("%s::packet dropped\n", __func__);
+	else
+		/* NET_RX_DROP here does not mean the frame was dropped, so it
+		 * is deliberately not reported. __netif_receive_skb_core()
+		 * leaves its return at NET_RX_DROP whenever an ingress hook
+		 * takes the frame, and the flowtable's is exactly such a hook:
+		 * every decrypted frame it forwards in software comes back
+		 * through here looking like a loss. Measured on the bench:
+		 * fifty-nine of sixty "dropped" frames were delivered. A
+		 * counter that cannot tell a loss from a steal is worse than
+		 * none, and at line rate it is also a log flood. */
+		netif_receive_skb(skb);
 	return qman_cb_dqrr_consume;
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 pkt_drop:
 #endif
-	if (skb) 
-		dev_kfree_skb(skb);
+	/* Conversion transferred the FD buffers to the skb. Returning the FD
+	 * to BMan here would recycle memory the skb has just freed. The SA has
+	 * not yet been transferred to a secpath on either failure branch. */
+	xfrm_state_put(x);
+	dev_kfree_skb(skb);
+	return qman_cb_dqrr_consume;
 rel_fd:
 	dpa_fd_release(net_dev, &dq->fd);
 	return qman_cb_dqrr_consume;
@@ -519,7 +552,7 @@ rel_fd:
 
 static int cdx_find_ipsec_pcd_fqinfo(int fqid, struct ipsec_info *info)
 {
-	struct dpa_fq *list = info->ipsec_exception_fq;
+	struct dpa_fq *list = info->ipsec_pcd_fqs;
 	while (list)
 	{
 		if (list->fqid == fqid)
@@ -654,8 +687,7 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			dpa_fq = kzalloc((sizeof(struct dpa_fq)), GFP_KERNEL);
 			if (!dpa_fq) {
 				DPAIPSEC_ERROR("%s::unable to alloc mem for dpa_fq\n", __func__) ;
-				/* nothing to free for this iteration (dpa_fq is NULL);
-				 * err_ret unwinds the FQs from earlier iterations. */
+				/* The caller drains all previously published queues. */
 				goto err_ret;
 			}
 
@@ -688,8 +720,8 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 					DPAIPSEC_ERROR("%s::qman_create_fq failed for fqid 0x%x (%d): err=%d, dist=%d\n",
 							__func__, dpa_fq->fqid, dpa_fq->fqid,
 							qrc, jj);
-					/* not on the exception-fq list yet; free the
-					 * wrapper here so err_ret doesn't have to. */
+					/* Not on the PCD list yet; the caller cannot
+					 * release this wrapper for us. */
 					kfree(dpa_fq);
 					goto err_ret;
 				}
@@ -711,17 +743,17 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 							__func__, dpa_fq->fqid, dpa_fq->fqid,
 							qrc, jj, fqbase & 0xFFFF, portid, dpa_fq->channel);
 					qman_destroy_fq(fq, 0);
-					/* not on the exception-fq list yet; the FQ is
+					/* Not on the PCD list yet; the FQ is
 					 * already destroyed, so just free the wrapper. */
 					kfree(dpa_fq);
 					goto err_ret;
 				}
 			}
 			cdx_create_type_fqid_info_in_procfs(fq, PCD_DIR, oh_iface_info->pcd_proc_entry, NULL);
-			/* FQ is fully created, initialised and registered in procfs;
-			 * only now put it on the exception-fq list so err_ret never
-			 * walks a half-built or already-destroyed FQ. */
-			ipsec_addfq_to_exceptionfq_list(dpa_fq, info);
+			/* Track only fully initialized queues. The common cleanup
+			 * retains them and the buffer pool until draining completes. */
+			dpa_fq->list.next = (struct list_head *)info->ipsec_pcd_fqs;
+			info->ipsec_pcd_fqs = dpa_fq;
 #ifdef DPA_IPSEC_DEBUG
 			DPAIPSEC_INFO("%s::created pcd fq %x(%d) for wlan packets "
 					"channel 0x%x\n", __func__,
@@ -730,39 +762,13 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			/* next FQ */
 			fqbase++;
 			info->expt_fq_count++;
+			if (cdx_dpa_init_fault())
+				goto err_ret;
 		}
 	}
 	return SUCCESS;
 err_ret:
-	/*
-	 * Unwind every FQ that an earlier iteration fully set up and placed on
-	 * the exception-fq list. The current (failing) FQ is never on the list
-	 * — it is added only after procfs registration — so it can't be double-
-	 * retired or double-freed here; its wrapper is already freed at the goto
-	 * site. Mirrors the SA-path err_ret3 teardown, plus the kfree these
-	 * kzalloc'd wrappers need (the SA path uses a fixed sec_fq[] array). A
-	 * retire/oos failure leaves the FQ un-OOS, so we must not destroy it
-	 * (QMan would keep a dangling pointer for later callbacks — UAF); bail
-	 * out and leak the remainder deliberately, as the SA teardown does.
-	 */
-	while (info->ipsec_exception_fq) {
-		dpa_fq = info->ipsec_exception_fq;
-		fq = &dpa_fq->fq_base;
-		ipsec_delfq_from_exceptionfq_list(dpa_fq->fqid, info);
-		if (qman_retire_fq(fq, NULL)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		if (qman_oos_fq(fq)) {
-			DPAIPSEC_ERROR("%s::Failed to oos FQ %x(%d)\n",
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		cdx_remove_fqid_info_in_procfs(fq->fqid);
-		qman_destroy_fq(fq, 0);
-		kfree(dpa_fq);
-	}
+	/* Includes failures between distributions, not just inside a batch. */
 	return FAILURE;
 }
 
@@ -978,19 +984,11 @@ err_ret3:
 	for (; ii>0 ; ii--)
 	{
 		fq = &(ipsecsa_info->sec_fq[ii-1].fq_base);
+		/* No caller has received this SA, so no producer can submit to
+		 * it. Wait out asynchronous retirement before releasing the
+		 * embedded queues, shared descriptor or module reference. */
+		cdx_destroy_fq(fq);
 		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
-		if (qman_retire_fq(fq, NULL)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		if (qman_oos_fq(fq)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		cdx_remove_fqid_info_in_procfs(fq->fqid);
-		qman_destroy_fq(fq, 0);
 	}
 	if (ipsecsa_info->sa_proc_entry) {
 		proc_remove(((cdx_proc_dir_entry_t *)(ipsecsa_info->sa_proc_entry))->proc_dir);
@@ -1015,7 +1013,7 @@ static int ipsec_init_ohport(struct ipsec_info *info)
 {
 
 	/* Get OH port for this driver */
-	info->ofport_handle = alloc_offline_port(IPSEC_FMAN_IDX, PORT_TYPE_IPSEC, 
+	info->ofport_handle = alloc_offline_port(IPSEC_FMAN_IDX, PORT_TYPE_IPSEC,
 			NULL, NULL);
 	if (info->ofport_handle < 0)
 	{
@@ -1025,17 +1023,21 @@ static int ipsec_init_ohport(struct ipsec_info *info)
 #ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s: allocated oh port %d\n", __func__, info->ofport_handle);
 #endif
-	if (get_ofport_info(IPSEC_FMAN_IDX, info->ofport_handle, &info->ofport_channel, 
+	if (get_ofport_info(IPSEC_FMAN_IDX, info->ofport_handle, &info->ofport_channel,
 				&info->ofport_td[0])) {
 		DPAIPSEC_ERROR("%s: Error in getting OH port info\n", __func__);
-		return FAILURE;
+		goto release;
 	}
 	if (get_ofport_portid(IPSEC_FMAN_IDX, info->ofport_handle, &info->ofport_portid)) {
 		DPAIPSEC_ERROR("%s: Error in getting OH port id\n", __func__);
-		return FAILURE;
+		goto release;
 	}
 	printk("%s:: ipsec of port id = %d\n ", __func__, info->ofport_portid);
 	return SUCCESS;
+
+release:
+	/* The common init unwind releases the tracked port claim. */
+	return FAILURE;
 }
 
 void *  dpa_get_ipsec_instance(void)
@@ -1043,13 +1045,21 @@ void *  dpa_get_ipsec_instance(void)
 	return &ipsecinfo; 
 }
 
-int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td, 
+int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td,
 		uint32_t* portid)
 {
 	if (table_type >= MAX_MATCH_TABLES) {
 		DPAIPSEC_ERROR("%s::invalid table type %d\n", __func__, table_type);
 		return FAILURE;
 	}
+	/* No port, no tables: the descriptors below are only filled in by a
+	 * successful cdx_dpa_ipsec_init(), and a NULL one handed out here
+	 * would fault in the table insert rather than fail it. */
+	if (!cdx_dpa_ipsec_ready())
+		return FAILURE;
+	/* The IPsec policy has only SA-bound unicast tables and a catch-all. */
+	if (!info->ofport_td[table_type])
+		return FAILURE;
 	*td = info->ofport_td[table_type];
 	*portid = info->ofport_portid;
 	return SUCCESS;
@@ -1059,6 +1069,31 @@ extern int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp,
 		uint32_t nbuffs, bool act_skb);
 #define CDX_MAX_SG_BUFF_SIZE 1024
 #define CDX_MAX_SG_BUFF_COUNT 512
+
+static void ipsec_free_sg_buffer(void *addr)
+{
+	kfree(addr);
+}
+
+static void release_ipsec_sg_pools(void)
+{
+	struct dpa_bp *clean = sg_bpool_g;
+	struct dpa_bp *done = skb_2bfreed_bpool_g;
+
+	/* The caller has stopped producers, portal callbacks and the worker. */
+	dpaa_sec_sg_reap(CDX_MAX_SG_BUFF_COUNT);
+	WRITE_ONCE(skb_2bfreed_bpool_g, NULL);
+	WRITE_ONCE(sg_bpool_g, NULL);
+	if (done) {
+		_dpa_bp_free(done);
+		kfree(done);
+	}
+	if (clean) {
+		_dpa_bp_free(clean);
+		kfree(clean);
+	}
+}
+
 int cdx_init_skb_2bfreed_bpool(void)
 {
 	struct dpa_bp *bp, *bp_parent;
@@ -1091,7 +1126,7 @@ int cdx_init_skb_2bfreed_bpool(void)
 	}
 	DPAIPSEC_INFO("%s::bp->size :%zu, bpid %d\n", 
 			__func__, bp->size, bp->bpid);
-	skb_2bfreed_bpool_g = bp;
+	smp_store_release(&skb_2bfreed_bpool_g, bp);
 	return 0;
 }
 
@@ -1109,6 +1144,7 @@ int cdx_init_scatter_gather_bpool(void)
 	}
 	bp->size = CDX_MAX_SG_BUFF_SIZE;
 	bp->config_count = CDX_MAX_SG_BUFF_COUNT;
+	bp->free_buf_cb = ipsec_free_sg_buffer;
 
 	//find pools used by ethernet devices and borrow buffers from it
 	if (get_phys_port_poolinfo_bysize(bp->size, &parent_pool_info)) {
@@ -1132,13 +1168,42 @@ int cdx_init_scatter_gather_bpool(void)
 	}
 	DPAIPSEC_INFO("%s::bp->size :%zu, bpid %d\n", 
 			__func__, bp->size, bp->bpid);
-	sg_bpool_g = bp;
-
 	ret = dpaa_bp_alloc_n_add_buffs(bp, CDX_MAX_SG_BUFF_COUNT, 0);
+	if (ret) {
+		_dpa_bp_free(bp);
+		kfree(bp);
+		return ret;
+	}
+	smp_store_release(&sg_bpool_g, bp);
 	DPAIPSEC_INFO("%s(%d) buffers added to ipsec pool %d info size %zu \n", 
 			__func__,__LINE__,sg_bpool_g->bpid,
 			sg_bpool_g->size);
 	return 0;
+}
+
+static void ipsec_free_pool_buffer(void *addr)
+{
+	struct sk_buff *skb, **skbh;
+
+	/* The pool seeder stores an skb immediately before the DMA buffer.
+	 * Freeing that skb releases its backing pages too. */
+	DPA_READ_SKB_PTR(skb, skbh, addr, -1);
+	dev_kfree_skb_any(skb);
+}
+
+static void release_ipsec_bpool(struct ipsec_info *info)
+{
+	struct dpa_bp *bp = info->ipsec_bp;
+
+	if (!bp)
+		return;
+	ipsec_pool_refill_stop();
+	WRITE_ONCE(ipsec_bpid, -1);
+	/* Unmap and drain through free_buf_cb, then remove the BPID lookup
+	 * before recycling it. bman_free_pool alone does neither. */
+	_dpa_bp_free(bp);
+	kfree(bp);
+	info->ipsec_bp = NULL;
 }
 
 static int add_ipsec_bpool(struct ipsec_info *info)
@@ -1172,7 +1237,7 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	bp->dev = bp_parent->dev;
 	bp->size = IPSEC_BUFSIZE;
 	bp->config_count = IPSEC_BUFCOUNT;
-	bp->free_buf_cb = _dpa_bp_free_pf;
+	bp->free_buf_cb = ipsec_free_pool_buffer;
 	if (dpa_bp_alloc(bp, bp->dev)) {
 		DPAIPSEC_ERROR("%s::dpa_bp_alloc failed for ipsec\n",
 				__func__);
@@ -1184,6 +1249,7 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	printk (KERN_INFO"\n ################## %s::bp->size :%zu, bpid %d\n",
 			__func__, bp->size, bp->bpid);
 	info->ipsec_bp = bp;
+	WRITE_ONCE(ipsec_bpid, bp->bpid);
 
 	/*
 	 * Seed the BMan pool. dpa_bp_alloc only registers the pool with BMan;
@@ -1201,21 +1267,13 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	if (dpaa_bp_alloc_n_add_buffs(bp, IPSEC_BUFCOUNT, 1)) {
 		DPAIPSEC_ERROR("%s::dpaa_bp_alloc_n_add_buffs failed for ipsec\n",
 				__func__);
-		bman_free_pool(bp->pool);
-		kfree(bp);
-		info->ipsec_bp = NULL;
+		/* Earlier batches (and part of the last one) are already in
+		 * BMan. The caller drains them through the common unwind. */
 		return -1;
 	}
+	ipsec_pool_refill_start();
 
-	return 0;
-}
-static int release_ipsec_bpool(struct ipsec_info *info)
-{
-	struct dpa_bp *bp =  info->ipsec_bp ;
-	bman_free_pool(bp->pool);
-	kfree(bp);
-	info->ipsec_bp = NULL; 
-	return 0;
+	return cdx_dpa_init_fault() ? FAILURE : SUCCESS;
 }
 
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size)
@@ -1232,18 +1290,37 @@ int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size)
 void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle)
 {
 	struct dpa_ipsec_sainfo *sainfo;
+	int tag;
 
+	/* An SA can still own SEC work while its deferred deletion runs.
+	 * Keep the pool and callback text loaded until all its queues are
+	 * gone, including SAs retained after a failed retirement. */
+	if (!try_module_get(THIS_MODULE))
+		return NULL;
 	sainfo = (struct dpa_ipsec_sainfo *)
 		kzalloc(sizeof(struct dpa_ipsec_sainfo), GFP_KERNEL);
 	if (!sainfo) {
 		DPAIPSEC_ERROR("%s::Error in allocating sainfo\n",
 				__func__);
+		module_put(THIS_MODULE);
 		return NULL;
 	}
 	memset(sainfo, 0, sizeof(struct dpa_ipsec_sainfo));
+	/* One 12-bit VLAN identity per inbound SA or outbound root. Refuse
+	 * exhaustion; never alias an active or retained identity. */
+	tag = ida_alloc_range(&ipsec_key_tags, 1, VLAN_VID_MASK - 1, GFP_KERNEL);
+	if (tag < 0) {
+		kfree(sainfo);
+		module_put(THIS_MODULE);
+		return NULL;
+	}
+	sainfo->key_tag = tag;
+	refcount_set(&ipsec_key_tag_refs[tag], 1);
 	//create fqs in scheduled state
 	if (create_ipsec_fqs(sainfo, 1, handle)) {
+		ipsec_put_key_tag(sainfo->key_tag);
 		kfree(sainfo);
+		module_put(THIS_MODULE);
 		return NULL;
 	}
 	return sainfo;
@@ -1268,6 +1345,50 @@ int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num)
 	return ret;
 }
 
+/* An SA's FQIDs going back with its queues: at once, unless a classifier entry
+ * that may still be linked named them in this datapath epoch, when they are
+ * held for the restart that ends it. One kept in an earlier epoch has been
+ * settled by the restart since, whether its release came before that restart
+ * (held, then released by it) or after. */
+static void dpa_ipsec_release_fqids(struct dpa_ipsec_sainfo *sainfo)
+{
+	u32 base = sainfo->sec_fq[FQ_FROM_SEC].fqid;
+	struct dpa_ipsec_held_fqids *held;
+	void *td = dpa_get_ehash_td();
+
+	/* FROM_SEC can be empty while FMan still holds its last packet.
+	 * After every SA queue is OOS, a PCD barrier proves that packet no
+	 * longer carries this tag or exception FQID. A failed proof pins both
+	 * until a stopped-port restart completes the barrier. */
+	if (!td || ExternalHashTableFmPcdHcSync(td)) {
+		cdx_ft_fatal();
+	}
+	/* A failed dependent-flow delete can leave a tag-validating entry
+	 * linked even when this SA's own root deleted cleanly. Admission is
+	 * stopped by that latch; retain the namespace across module unload
+	 * too, until restart has settled all such entries. */
+	if (cdx_ft_failed())
+		sainfo->keep_epoch = cdx_ft_epoch();
+
+	if (!sainfo->keep_epoch || sainfo->keep_epoch != cdx_ft_epoch()) {
+		qman_release_fqid_range(base, NUM_FQS_PER_SA);
+		ipsec_put_key_tag(sainfo->key_tag);
+		return;
+	}
+	/* The tag allocator is module-local. Reloading it while a stale
+	 * classifier may still carry a tag would make that tag reusable. */
+	__module_get(THIS_MODULE);
+	held = kmalloc(sizeof(*held), GFP_KERNEL);
+	if (!held) {
+		pr_err("cdx: IPsec SA FQIDs 0x%x-0x%x leaked: a classifier entry may still name them and they could not be held\n",
+		       base, base + NUM_FQS_PER_SA - 1);
+		return;
+	}
+	held->base = base;
+	held->key_tag = sainfo->key_tag;
+	list_add_tail(&held->list, &dpa_ipsec_held);
+}
+
 int cdx_dpa_ipsecsa_release(void *handle)
 {
 	struct dpa_ipsec_sainfo *sainfo;
@@ -1283,7 +1404,6 @@ int cdx_dpa_ipsecsa_release(void *handle)
 	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
 		dpa_fq = &sainfo->sec_fq[ii];
 		fq = &dpa_fq->fq_base;
-		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
 		if (qman_oos_fq(fq)) {
 			/*
 			 * FQ is left in qman_fq_state_retired (not OOS).
@@ -1301,6 +1421,22 @@ int cdx_dpa_ipsecsa_release(void *handle)
 				fq->fqid);
 			return FAILURE;
 		}
+	}
+	/* SEC can still be processing a job dequeued before TO_SEC retired.
+	 * Keep its descriptor, keys, callbacks, FQIDs and tag together unless
+	 * the hardware proves that job finished. The caller retains the key
+	 * mappings on failure, and this SA's module reference prevents unload. */
+	if (!cdx_ipsec_wait_sec_idle()) {
+		pr_warn_ratelimited("cdx: SEC did not become idle after SA queues stopped; retaining SA resources until reboot\n");
+		return FAILURE;
+	}
+	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
+		dpa_fq = &sainfo->sec_fq[ii];
+		fq = &dpa_fq->fq_base;
+		/* QMan can publish the retired state before its last callback
+		 * returns. Retain both the embedded queue and the module. */
+		synchronize_net();
+		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 	}
@@ -1315,9 +1451,56 @@ int cdx_dpa_ipsecsa_release(void *handle)
 	 * create_ipsec_fqs frees it on partial-init failure; this is the
 	 * matching free on the normal release path. */
 	kfree(sainfo->shdesc_mem);
-	qman_release_fqid_range(sainfo->sec_fq[FQ_FROM_SEC].fqid, NUM_FQS_PER_SA);
+	dpa_ipsec_release_fqids(sainfo);
 	kfree(sainfo);
+	module_put(THIS_MODULE);
 	return SUCCESS;
+}
+
+/* A classifier entry whose delete could not prove it unlinked may still match
+ * and enqueue to this SA's TO_SEC FQID. The queues themselves still go -- an
+ * out-of-service FQ rejects the enqueue -- but a later SA or any other queue
+ * given the same FQIDs would be fed frames it was never admitted for, so the
+ * FQIDs stay allocated until the datapath restart that settles the entry, or
+ * the reboot that replaces it when none can. */
+void cdx_dpa_ipsecsa_keep_fqids(void *handle)
+{
+	((struct dpa_ipsec_sainfo *)handle)->keep_epoch = cdx_ft_epoch();
+}
+
+unsigned int cdx_dpa_ipsec_release_held_fqids(void)
+{
+	struct dpa_ipsec_held_fqids *held, *next;
+	unsigned int released = 0;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	list_for_each_entry_safe(held, next, &dpa_ipsec_held, list) {
+		qman_release_fqid_range(held->base, NUM_FQS_PER_SA);
+		ipsec_put_key_tag(held->key_tag);
+		list_del(&held->list);
+		kfree(held);
+		module_put(THIS_MODULE);
+		released++;
+	}
+	return released;
+}
+
+void cdx_dpa_ipsec_held_fqids_exit(bool settled)
+{
+	struct dpa_ipsec_held_fqids *held, *next;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	if (settled) {
+		cdx_dpa_ipsec_release_held_fqids();
+		ida_destroy(&ipsec_key_tags);
+		return;
+	}
+	list_for_each_entry_safe(held, next, &dpa_ipsec_held, list) {
+		pr_err("cdx: IPsec SA FQIDs 0x%x-0x%x stay allocated until reset: a classifier entry may still name them\n",
+		       held->base, held->base + NUM_FQS_PER_SA - 1);
+		list_del(&held->list);
+		kfree(held);
+	}
 }
 
 int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num)
@@ -1380,8 +1563,12 @@ static int cdx_dpaa_ingress_cgr_init(struct cgr_priv *cgr)
 	initcgr.we_mask |= QM_CGR_WE_CSTD_EN;
 	initcgr.cgr.cstd_en = QM_CGR_EN;
 
+	/* Deletion must use this same affine portal, even after migration. */
+	preempt_disable();
+	cgr->cpu = smp_processor_id();
 	err = qman_create_cgr(&cgr->ingress_cgr, QMAN_CGR_FLAG_USE_INIT,
 			&initcgr);
+	preempt_enable();
 	if (err < 0) {
 		pr_err("Error %d creating ingress CGR with ID %d\n", err,
 				cgr->ingress_cgr.cgrid);
@@ -1396,61 +1583,116 @@ out_error:
 	return err;
 }
 
+static void ipsec_delete_cgr_on_cpu(void *arg)
+{
+	struct cgr_priv *cgr = arg;
+
+	cgr->delete_result = qman_delete_cgr(&cgr->ingress_cgr);
+}
+
 static void cdx_dpaa_ingress_cgr_exit(struct cgr_priv *cgr)
 {
-	int iRet = 0;
+	int ret;
 
-	if ((iRet = qman_delete_cgr(&cgr->ingress_cgr)))
-		printk("Deletion of CGR failed: %d\n", iRet);
-	else
-		qman_release_cgrid(cgr->ingress_cgr.cgrid);
-
-	return;
+	/* qman_delete_cgr_safe() discards errors. Keep callback storage and
+	 * module text alive until deletion on the owning portal succeeds. */
+	for (;;) {
+		ret = smp_call_function_single(cgr->cpu, ipsec_delete_cgr_on_cpu,
+					       cgr, 1);
+		if (!ret)
+			ret = cgr->delete_result;
+		if (!ret)
+			break;
+		pr_warn_ratelimited("cdx: cannot delete IPsec CGR: %d\n", ret);
+		usleep_range(1000, 2000);
+	}
+	qman_release_cgrid(cgr->ingress_cgr.cgrid);
 }
 #endif
 
+
+/* Whether the DPA side of IPsec -- the offline port, its tables, the SEC
+ * buffer pool and the PCD frame queues -- is there to be used. False until
+ * cdx_dpa_ipsec_init() has finished, and again as soon as teardown starts.
+ * A board whose device tree lacks the IPsec offline port leaves it false for
+ * the module's whole life, and that is the only way the rest of the module
+ * learns of it: every path that would touch this state asks here first,
+ * through cdx_ipsec_ready(). */
+static bool dpa_ipsec_ready;
+
+bool cdx_dpa_ipsec_ready(void)
+{
+	/* Paired with the release below: a reader that sees true also sees
+	 * the table descriptors and pools stored before it. */
+	return smp_load_acquire(&dpa_ipsec_ready);
+}
 
 int cdx_dpa_ipsec_init(void)
 {
 
 	DPAIPSEC_INFO("%s::\n", __func__);
 	ipsecinfo.crypto_channel_id = qm_channel_caam;
-	ipsecinfo.ipsec_exception_fq = NULL;
-	if (ipsec_init_ohport(&ipsecinfo)) {
-		return FAILURE;
-	}
-	if (add_ipsec_bpool(&ipsecinfo)) {
-		return FAILURE;
-	}
+	/* Each step undoes the ones before it on failure. The module carries
+	 * on without IPsec, so a half-built claim on the port or the pool
+	 * would otherwise be held for nothing. The fault hook is the same one
+	 * the other startup acquisitions expose, so a test can boot a board
+	 * "without" the port and prove the rest still comes up. */
+	if (cdx_dpa_init_fault() || ipsec_init_ohport(&ipsecinfo))
+		goto failure;
+	if (add_ipsec_bpool(&ipsecinfo))
+		goto failure;
+	if (cdx_init_scatter_gather_bpool() || cdx_init_skb_2bfreed_bpool())
+		goto failure;
 #ifdef CS_TAIL_DROP
 	if (sec_congestion){
 		if (cdx_dpaa_ingress_cgr_init(&ipsecinfo.cgr)) {
-			return FAILURE;
+			goto failure;
 		}
+		ipsecinfo.cgr_initialized = true;
 	}
 #endif
 	if (create_ipsec_pcd_fqs(&ipsecinfo, 1)) {
-		goto ipsec_pcd_fq_failure;
+		goto failure;
 	}
 	register_cdx_deinit_func(cdx_dpa_ipsec_exit);
+	/* Last, once everything a reader could reach through it exists, and
+	 * ordered after it: a reader that sees the flag must see all of it. */
+	smp_store_release(&dpa_ipsec_ready, true);
 	return SUCCESS;
 
-ipsec_pcd_fq_failure:
-#ifdef CS_TAIL_DROP
-	if(sec_congestion)
-		cdx_dpaa_ingress_cgr_exit(&ipsecinfo.cgr);
-#endif
+failure:
+	cdx_dpa_ipsec_exit();
 	return FAILURE;
 }
 
 void cdx_dpa_ipsec_exit(void)
 {
 	DPAIPSEC_INFO("%s::\n", __func__);
+	/* First, so that nothing admitted from here on finds state that is
+	 * being torn down below it. */
+	WRITE_ONCE(dpa_ipsec_ready, false);
+	/* Live and retiring SAs pin the module; module shutdown stops the
+	 * producer ports before this callback. Init rollback admits no SA.
+	 * Retain the pool while queues retire, return pending frames and
+	 * finish portal callbacks. */
+	cdx_destroy_fq_list(&ipsecinfo.ipsec_pcd_fqs);
+	ipsecinfo.expt_fq_count = 0;
+	if (ipsecinfo.ofport_handle >= 0) {
+		release_offline_port(IPSEC_FMAN_IDX, ipsecinfo.ofport_handle);
+		ipsecinfo.ofport_handle = -1;
+	}
+	memset(ipsecinfo.ofport_td, 0, sizeof(ipsecinfo.ofport_td));
 #ifdef CS_TAIL_DROP
-	if(sec_congestion)
+	if (ipsecinfo.cgr_initialized) {
 		cdx_dpaa_ingress_cgr_exit(&ipsecinfo.cgr);
+		ipsecinfo.cgr_initialized = false;
+	}
 #endif
 	release_ipsec_bpool(&ipsecinfo);
+	release_ipsec_sg_pools();
+	/* Held FQIDs stay listed: what becomes of them is decided once CDX has
+	 * settled what it recorded as possibly linked, after this
+	 * (cdx_dpa_ipsec_held_fqids_exit()). */
 	return;
 }
 #else
@@ -1458,5 +1700,16 @@ void cdx_dpa_ipsec_exit(void)
 struct dpa_bp* get_ipsec_bp(void)
 {
 	return NULL;
+}
+bool cdx_dpa_ipsec_ready(void)
+{
+	return false;
+}
+unsigned int cdx_dpa_ipsec_release_held_fqids(void)
+{
+	return 0;
+}
+void cdx_dpa_ipsec_held_fqids_exit(bool settled)
+{
 }
 #endif

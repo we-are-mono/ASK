@@ -9,7 +9,25 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 asyncio_default_test_loop_scope    = "function"
 
-# -ra: summary of non-passing results. -x: stop after first failure
-# (comment out when triaging a suite run). --tb=short: compact tracebacks.
-addopts = "-ra -x --tb=short"
+# Native pytest status lines, captured successful-test output and final totals.
+# Hardware commands add -x; host runs collect all failures.
+addopts = "-v -ra --tb=short --strict-markers --strict-config"
 testpaths = ["host_tests", "tests"]
+pythonpath = [".", "tests"]
+required_plugins = ["pytest-asyncio==1.3.0", "pytest-timeout==2.4.0"]
+markers = [
+    "host: runs without the physical bench",
+    "hardware: requires exclusive ownership of the physical bench",
+    "smoke: agent health and boot checks",
+    "slow: profiles, throughput or sustained traffic",
+    "destructive: changes boot state or requires a fresh boot afterwards",
+    "requires(*binaries): DUT tools required before release-test setup",
+]
+# Last-resort watchdog around the test body. Cleanup has its own operation
+# budgets and is allowed to finish after this timer fires.
+timeout = 900
+timeout_method = "signal"
+timeout_func_only = true
+junit_family = "xunit2"
+junit_logging = "all"
+junit_log_passing_tests = false

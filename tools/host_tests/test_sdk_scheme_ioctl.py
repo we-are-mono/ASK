@@ -1,12 +1,13 @@
 """Run scheme ioctl/SDK validation, compat conversion and fmlib serialization."""
+
+from ask_orch.process import run_process
 from pathlib import Path
 import os
 import shutil
-import subprocess
 
 import pytest
 
-from test_sdk_scheme_delete import ROOT, function
+from _host_sdk_scheme_delete import (ROOT, function)
 
 
 def test_sdk_scheme_ioctl(tmp_path):
@@ -48,7 +49,7 @@ def test_sdk_scheme_ioctl(tmp_path):
     for inc in [uapi, uapi / "Peripherals", uapi / "integrations"]:
         command += ["-I", str(inc)]
     binary = tmp_path / "scheme_ioctl"
-    subprocess.run(command + [str(Path(__file__).with_name("sdk_scheme_ioctl.c")), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process(command + [str(Path(__file__).with_name("sdk_scheme_ioctl.c")), "-o", str(binary)], check=True)
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

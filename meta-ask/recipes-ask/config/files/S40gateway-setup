@@ -11,6 +11,9 @@
 
 LAN_IF=eth3
 LAN_ADDR=192.168.1.1/24
+# The Wi-Fi AP's interface. Addressed and brought up by S35wifi-ap; named
+# here only so its forwarding rules can be stated alongside the wired ones.
+WLAN_IF=uap0
 WAN_IF=eth4
 # Test image: pin WAN to a stable static address so the orchestrator has
 # a fixed POST target and installed FMAN offload rules can't go stale
@@ -29,8 +32,7 @@ WAN_ADDR6=fc00:beef::1/64
 DNSMASQ_CONF=/etc/dnsmasq-gateway.conf
 
 start_loopback() {
-    # cmm's CLI listener binds 127.0.0.1:2103; if lo is down the bind fails
-    # with EADDRNOTAVAIL and cmm tears down its IPC msgqs and exits(1).
+    # Nothing else in this initramfs brings loopback up.
     ip link set lo up
 }
 
@@ -88,6 +90,14 @@ start_nat() {
     add_rule -t nat POSTROUTING -o "$WAN_IF" -j MASQUERADE
     add_rule FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
     add_rule FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+    # The Wi-Fi AP's subnet, on its own interface rather than bridged into
+    # the LAN (see S35wifi-ap for why). MASQUERADE above is already
+    # interface-agnostic on the way in, so only the forward pair is needed.
+    # Added unconditionally: iptables accepts rules naming an interface that
+    # does not exist yet, and a board with no radio simply never matches them.
+    add_rule FORWARD -i "$WLAN_IF" -o "$WAN_IF" -j ACCEPT
+    add_rule FORWARD -i "$WAN_IF" -o "$WLAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
 }
 
 start_filter6() {
@@ -95,7 +105,7 @@ start_filter6() {
     # the ISP delegation in production. We still need an ip6tables
     # FORWARD rule with `-m conntrack` so the kernel engages IPv6
     # conntrack tracking on forwarded flows. Without it, no v6 flow
-    # gets tracked, CMM has nothing to mirror, and FMAN never offloads
+    # gets tracked, the flowtable has nothing to offload, and FMAN never offloads
     # the tunnel encap egress (the whole point of this image's
     # tunnel-offload tests).
     #
@@ -112,8 +122,8 @@ start_filter6() {
 }
 
 start_dnsmasq() {
-    # dnsmasq's bind-interfaces requires the LAN address to exist, which
-    # start_lan above guarantees. Exit early if a dnsmasq is already running.
+    # dnsmasq binds the LAN address, which start_lan above guarantees exists.
+    # Exit early if a dnsmasq is already running.
     if pidof dnsmasq >/dev/null 2>&1; then
         return 0
     fi

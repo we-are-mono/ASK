@@ -43,6 +43,7 @@ async def test_software_count_excludes_hardware_and_percpu_duplicates():
      tx packets [TOTAL]: 2000000
 """)
     assert await counter.kernel_rx_packets(agent, None, "eth4") == 7
+    assert await counter.kernel_tx_packets(agent, None, "eth4") == 2000000
 
 
 @pytest.mark.parametrize("output,rc", [
@@ -56,6 +57,8 @@ async def test_software_count_excludes_hardware_and_percpu_duplicates():
 async def test_missing_or_ambiguous_software_counter_fails(output, rc):
     with pytest.raises(AssertionError):
         await counter.kernel_rx_packets(Agent(output, rc), None, "eth4")
+    with pytest.raises(AssertionError):
+        await counter.kernel_tx_packets(Agent(output.replace("rx", "tx"), rc), None, "eth4")
 
 
 def test_capture_keeps_sdk_counter_names(monkeypatch):

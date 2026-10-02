@@ -79,18 +79,24 @@ Structure and Macro definitions
 #define CEETM_DEFA_BSIZE        0x2000
 /* default value to add for shaper calculations */
 #define CEETM_DEFA_OAL          24
-/* default priority of WBFQs as programmed from cmm, 0-6 */
-#define CEETM_DEFA_WBFQ_PRIORITY 0
+/* Where the weighted group sits among a channel's eight strict class queues,
+ * in the configuration numbering where 0 is the lowest (GET_CEETM_PRIORITY()
+ * inverts it for the hardware). One places the group directly above class
+ * queue 0 -- hardware CQ7 -- and below the six queues above that.
+ *
+ * Class queue 0 is where a frame that names no class goes on a port whose
+ * tree has no `default', in both paths, and it competes for committed tokens
+ * so that traffic cannot starve outright. Below it, as 0 placed the group, a
+ * backlogged unclassified flow pre-empted every weighted leaf on the channel;
+ * a weighted leaf is one that asked to share its level, not to wait for
+ * traffic nobody classified. A strict leaf at `prio 7' holds class queue 0 and
+ * so sits below the group too. */
+#define CEETM_DEFA_WBFQ_PRIORITY 1
 /* max values for shaper fields */
 #define CEETM_TOKEN_WHOLE_MAXVAL        0x7ff
 #define CEETM_TOKEN_FRAC_MAXVAL         0x1fff
 /* default TD value */
 #define DEFAULT_CQ_DEPTH        8
-
-/* shaper types */
-#define CHANNEL_SHAPER_TYPE	0		
-#define PORT_SHAPER_TYPE	1
-
 
 /**********************************************************************************************************************
    Function Prototypes
@@ -104,17 +110,37 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx);
 int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper);
-int ceetm_configure_shaper(void *cfg);
-int ceetm_configure_wbfq(void *cfg);
-int ceetm_configure_cq(void *cfg);
 int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num);
-int ceetm_get_qos_cfg(struct tQM_context_ctl *qm_ctx, pQosQueryCmd cmd);
-int ceetm_get_cq_query(pQosCqQueryCmd cmd);
 int ceetm_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, uint8_t channel_num, uint8_t clsqueue_num);
 int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp);
+
+/* The hardware qdisc's half (cdx_htb.c). These return negative error codes
+ * rather than CEETM_FAILURE, because tc reports them to the operator. */
+struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
+			       uint32_t quenum);
+uint32_t ceetm_egress_fqid(void *ctx, uint32_t channel, uint32_t classque);
+int ceetm_class_counters(uint32_t channel_num, uint32_t quenum,
+			 uint64_t *deq_frames, uint64_t *deq_bytes,
+			 uint64_t *rej_frames);
+int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
+			 uint32_t max, uint32_t probability, uint32_t limit);
+int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth);
+int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num);
+int ceetm_set_channel_rates(uint32_t channel_num, uint64_t cir_bps, uint64_t eir_bps);
+int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight,
+			  uint32_t depth);
+int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum);
+int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx);
 #ifdef ENABLE_EGRESS_QOS
 int ceetm_exit(void);
 #endif
 
 extern int qman_sp_enable_ceetm_mode(enum qm_dc_portal portal, u16 sub_portal);
+/* Its pair, which this file needs and did not declare. Enabling CEETM mode on
+ * a Tx sub-portal moves its dequeues from the dedicated channel every ordinary
+ * egress frame queue of that port sits on, over to the LNI scheduler. Leaving
+ * it enabled after the scheduling tree is gone therefore strands the port: the
+ * software path is put back on those frame queues, QMan accepts every enqueue
+ * and nothing ever dequeues them. */
+extern int qman_sp_disable_ceetm_mode(enum qm_dc_portal portal, u16 sub_portal);
 #endif

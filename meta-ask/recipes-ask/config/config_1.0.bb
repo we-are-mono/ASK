@@ -7,16 +7,21 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI = "file://S03debugfs \
            file://S05ask-modules \
            file://S20status-leds \
+           file://S35wifi-ap \
            file://S40gateway-setup \
-           file://S50cmm \
+           file://S50ask-flowtable \
            file://dnsmasq-gateway.conf \
+           file://hostapd-ask.conf \
+           file://ask-flowtable-qos.conf \
           "
 
 # No source tree — just config files, referenced via UNPACKDIR below.
 # Point S at UNPACKDIR so bitbake doesn't warn about a missing ${BP}.
 S = "${UNPACKDIR}"
 
-RDEPENDS:${PN} += "dnsmasq iptables iproute2 cmm"
+# The flowtable offload service is now the C ask-flowtable daemon (its own
+# package); the Python helper and its python3-* runtime are gone.
+RDEPENDS:${PN} += "dnsmasq iptables iproute2 nftables hostapd ask-flowtable"
 
 # These files are installed from ${ASK_SRCROOT} (outside SRC_URI's reach).
 # Without listing them as task input checksums, bitbake's sstate signature for
@@ -26,7 +31,7 @@ RDEPENDS:${PN} += "dnsmasq iptables iproute2 cmm"
 # any content change.
 do_install[file-checksums] += " \
     ${ASK_SRCROOT}/config/ask-modules.conf:True \
-    ${ASK_SRCROOT}/config/fastforward:True \
+    ${ASK_SRCROOT}/config/offload.conf:True \
 "
 
 fakeroot do_install() {
@@ -37,8 +42,16 @@ fakeroot do_install() {
     install -m 0644 ${ASK_SRCROOT}/config/ask-modules.conf \
         ${D}${sysconfdir}/modules-load.d/ask.conf
 
-    install -d ${D}${sysconfdir}/config
-    install -m 0644 ${ASK_SRCROOT}/config/fastforward ${D}${sysconfdir}/config/fastforward
+    # Test image only: turn on mark classification so the suite exercises
+    # the hardware HTB path rather than skipping it.
+    install -d ${D}${sysconfdir}/modprobe.d
+    install -m 0644 ${UNPACKDIR}/ask-flowtable-qos.conf \
+        ${D}${sysconfdir}/modprobe.d/ask-flowtable-qos.conf
+
+    # The default offload policy. The ask-flowtable daemon (its own package)
+    # falls back to identical built-in defaults when this file is absent.
+    install -d ${D}${sysconfdir}/ask
+    install -m 0644 ${ASK_SRCROOT}/config/offload.conf ${D}${sysconfdir}/ask/offload.conf
 
     install -d ${D}${sysconfdir}/init.d
     install -d ${D}${sysconfdir}/rcS.d
@@ -54,6 +67,13 @@ fakeroot do_install() {
     install -m 0755 ${UNPACKDIR}/S05ask-modules ${D}${sysconfdir}/init.d/ask-modules
     ln -sf ../init.d/ask-modules ${D}${sysconfdir}/rcS.d/S05ask-modules
 
+    # The `ask-test` access point. Ordered before gateway-setup so uap0 has
+    # its address by the time that script starts dnsmasq with
+    # bind-interfaces, which would otherwise refuse to serve the AP subnet.
+    install -m 0755 ${UNPACKDIR}/S35wifi-ap ${D}${sysconfdir}/init.d/wifi-ap
+    ln -sf ../init.d/wifi-ap ${D}${sysconfdir}/rcS.d/S35wifi-ap
+    install -m 0644 ${UNPACKDIR}/hostapd-ask.conf ${D}${sysconfdir}/hostapd-ask.conf
+
     # Gateway networking (WAN=eth4 static 10.0.0.62/24, LAN=eth3 static 192.168.1.1/24,
     # iptables MASQUERADE, dnsmasq DHCP server). Runs in rcS so the board
     # is gateway-ready by the time multi-user services (dropbear) come up.
@@ -61,12 +81,11 @@ fakeroot do_install() {
     ln -sf ../init.d/gateway-setup ${D}${sysconfdir}/rcS.d/S40gateway-setup
     install -m 0644 ${UNPACKDIR}/dnsmasq-gateway.conf ${D}${sysconfdir}/dnsmasq-gateway.conf
 
-    # CMM (ASK connection manager) — depends on cdx/fci being loaded first.
-    install -m 0755 ${UNPACKDIR}/S50cmm ${D}${sysconfdir}/init.d/cmm
-    ln -sf ../init.d/cmm ${D}${sysconfdir}/rcS.d/S50cmm
+    install -m 0755 ${UNPACKDIR}/S50ask-flowtable ${D}${sysconfdir}/init.d/ask-flowtable
+    ln -sf ../init.d/ask-flowtable ${D}${sysconfdir}/rcS.d/S50ask-flowtable
 
     # Status LED config — runs after modules-load.d brings up leds-lp5812
-    # (S05ask-modules), but before the gateway/CMM bring-up so the cue is
+    # (S05ask-modules), but before the gateway/offload bring-up so the cue is
     # visible from early boot.
     install -m 0755 ${UNPACKDIR}/S20status-leds ${D}${sysconfdir}/init.d/status-leds
     ln -sf ../init.d/status-leds ${D}${sysconfdir}/rcS.d/S20status-leds
@@ -74,16 +93,20 @@ fakeroot do_install() {
 
 FILES:${PN} = " \
     ${sysconfdir}/modules-load.d/ask.conf \
-    ${sysconfdir}/config/fastforward \
+    ${sysconfdir}/modprobe.d/ask-flowtable-qos.conf \
+    ${sysconfdir}/ask/offload.conf \
     ${sysconfdir}/init.d/debugfs \
     ${sysconfdir}/rcS.d/S03debugfs \
     ${sysconfdir}/init.d/ask-modules \
     ${sysconfdir}/rcS.d/S05ask-modules \
+    ${sysconfdir}/init.d/wifi-ap \
+    ${sysconfdir}/rcS.d/S35wifi-ap \
+    ${sysconfdir}/hostapd-ask.conf \
     ${sysconfdir}/init.d/gateway-setup \
     ${sysconfdir}/rcS.d/S40gateway-setup \
     ${sysconfdir}/dnsmasq-gateway.conf \
-    ${sysconfdir}/init.d/cmm \
-    ${sysconfdir}/rcS.d/S50cmm \
+    ${sysconfdir}/init.d/ask-flowtable \
+    ${sysconfdir}/rcS.d/S50ask-flowtable \
     ${sysconfdir}/init.d/status-leds \
     ${sysconfdir}/rcS.d/S20status-leds \
 "

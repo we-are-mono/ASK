@@ -22,15 +22,17 @@ no "ASK distro" and nothing here runs on its own.
 The components:
 
 - **Kernel modules** — `cdx` (the core offload engine: hardware flow tables,
-  IPsec offload, and QoS via DPAA/FMAN), `fci` (control channel to the CMM
-  daemon), `auto_bridge` (L2 bridge flow detection).
-- **Userspace** — `cmm` (offloads netfilter conntrack flows to the classifier).
-  `fmc` (NXP's FMAN config compiler) is a build-time tool only: `cdx` builds the
-  FMAN classification rules itself, and `fmc` is used to regenerate the
-  checked-in artifacts under `config/pcd/`. See
+  IPsec offload, and QoS via DPAA/FMAN) and `ask_flowtable` (the adapter that
+  lets Linux's native flowtables drive CDX).
+- **Userspace** — `ask-flowtable` (the default-on offload policy daemon),
+  with classifier construction inside `cdx`. `fmc` is used on the build host
+  to regenerate the soft parser and classifier test reference. See
   [in-kernel PCD](docs/in-kernel-pcd.md).
-- **Supporting libraries** — `libfci`, `fmlib`, `libcli`, and ASK-patched
-  `libnfnetlink` / `libnetfilter_conntrack` (CMM's fast-path conntrack).
+- **Supporting libraries** — `fmlib`.
+- **Retired** — the CMM daemon, its FCI control channel (`libfci`) and the
+  `auto_bridge` L2 flow detector are gone from the tree; Linux flowtables
+  replaced them. Their sources remain in the `mono-1.0.x` release tags, which
+  is what docs citing `cmm/`, `fci/` or `auto_bridge/` paths refer to.
 - **Kernel side** — the `patches/kernel/` stack (`010`–`130`: the vendored
   DPAA/FMAN SDK, ASK's hooks, and board drivers, applied onto stock mainline
   6.12) and the board device tree in `dts/`. See
@@ -47,10 +49,9 @@ reference:
 
 | Component | Recipe |
 |-----------|--------|
-| `cdx`, `fci`, `auto_bridge` (kernel modules) | `meta-ask/recipes-ask/{cdx,fci,auto-bridge}/` |
-| `cmm` (userspace), `fmc` (build-time tool) | `meta-ask/recipes-ask/{cmm,fmc}/` |
-| `libfci`, `fmlib`, `libcli` (libraries) | `meta-ask/recipes-ask/{libfci,fmlib,libcli}/` |
-| patched `libnfnetlink` / `libnetfilter-conntrack` | `meta-ask/recipes-ask/{libnfnetlink,libnetfilter-conntrack}/` |
+| `cdx`, `ask_flowtable` (kernel modules) | `meta-ask/recipes-ask/cdx/` |
+| `ask-flowtable` (userspace), `fmc` (build-time tool) | `meta-ask/recipes-ask/{flowtable,fmc}/` |
+| `fmlib` (library) | `meta-ask/recipes-ask/fmlib/` |
 | kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_6.12.bb` |
 | bootable showcase image | `meta-ask/recipes-core/images/ask-image.bb` |
 
@@ -162,8 +163,19 @@ harness — it does not build ASK components standalone.
 | `make setup` | install host build deps + locale (one-time, sudo) |
 | `make ask-image` | build the test image via kas |
 | `make stage-image` | copy the built image and matching DTB into the TFTP root |
-| `make deploy-agents` | install the askd test agent on the WAN/LAN hosts |
-| `make ask-test` | run the end-to-end pytest suite |
+| `make test-env` | install the pinned Python runner dependencies |
+| `make deploy-agents` | install the askd test agent and runner dependencies on the WAN host |
+| `make test` | run host and DUT tests using ignored `.ask-test.mk` bench settings |
+| `make test-host` | run host tests without the physical bench |
+| `make test-dut` | run the DUT suite |
+| `make test-startup` | run startup tests on their dedicated boot |
+| `make ask-test` | alias for `make test` |
+
+The [test dependency guide](docs/testing.md#runner-dependencies-and-installation)
+covers the Python environment, system packages, source trees, and DUT/LAN
+requirements. Python package versions are pinned in
+[`tools/requirements.txt`](tools/requirements.txt). Filter a run with
+`make test K='ipsec or mcast'`; extra pytest options go in `ARGS`.
 
 ## Versioning and branches
 
@@ -171,6 +183,13 @@ ASK is versioned per kernel-compatibility line. In short: `master` is active
 development for the newest supported kernel; `mono-6.12` is the 6.12 maintenance
 line; releases are tagged (`mono-1.0.0`). See [docs/versioning.md](docs/versioning.md)
 for the full branch model.
+
+The `feat/linux-flowtable-offload` branch replaces CMM flow management with
+Linux's native flowtables. The test image boots only that path, and the CMM,
+FCI and auto_bridge sources have been removed (see the release tags). The
+[project overview](docs/flowtable/README.md) links the current
+architecture, supported features, operating guides, and historical validation
+evidence.
 
 ## License
 

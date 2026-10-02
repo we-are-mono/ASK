@@ -33,12 +33,8 @@
 #include "control_ipv6.h"
 #include "control_ipsec.h"
 #include "control_tunnel.h"
-#include "control_bridge.h"
 #include "fm_ehash.h"
 #include "dpa_control_mc.h"
-#include "control_pppoe.h"
-#include "control_socket.h"
-#include "module_rtp_relay.h"
 #include "cdx_dpa_ipsec.h"
 #include "dpa_wifi.h"
 #include "module_qm.h"
@@ -63,19 +59,13 @@
 #define NAT_HM_VALID            ( NAT_HM_REPLACE_SIP | NAT_HM_REPLACE_DIP | NAT_HM_REPLACE_SPORT | NAT_HM_REPLACE_DPORT)
 #define VLAN_STRIP_HM_VALID     (1 << 5)
 #define VLAN_ADD_HM_VALID       (1 << 6)
-#define EHASH_BRIDGE_FLOW       (1 << 7)
 #define PPPoE_STRIP_HM_VALID    (1 << 8)
 #define NAT_V6	                (1 << 10)
 #define EHASH_IPV6_FLOW		(1 << 11)
 
-#ifdef VLAN_FILTER
-#define ROUTE_FLOW_VLAN_FIL_EN  (1 << 12) /* Flag indicating vlan filter is enabled on a bridge that involves in routing */
-#define ROUTE_FLOW_PVID_SET     (1 << 13) /* Flag indicating PVID is set on rx interface in bridge, which will be set to route flow*/
-#endif
-
 #define L2_HDR_OPS(l2_info) ((l2_info.vlan_present) || (l2_info.pppoe_present) || (l2_info.num_egress_vlan_hdrs) || (l2_info.add_pppoe_hdr)) 
 #define L3_HDR_OPS(l3_info) (l3_info.tnl_header_present || l3_info.add_tnl_header || l3_info.ipsec_inbound_flow)
-#define L2_L3_HDR_OPS(info) (L3_HDR_OPS(info->l3_info) || L2_HDR_OPS(info->l2_info))
+#define L2_L3_HDR_OPS(info) (info->sec_tag || L3_HDR_OPS(info->l3_info) || L2_HDR_OPS(info->l2_info))
 #define IS_IPV4_NAT(entry) ( IS_IPV4(entry) && (entry->status & CONNTRACK_NAT) )
 #define IS_IPV6_NAT(entry) ( IS_IPV6(entry) && ( entry->status & ( CONNTRACK_SNAT | CONNTRACK_DNAT) ))
 
@@ -96,10 +86,7 @@ static int create_replicate_hm(struct ins_entry_info *info);
 static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info *info);
 static int create_tunnel_remove_hm(struct ins_entry_info *info);
 static int create_pppoe_ins_hm(struct ins_entry_info *info);
-static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_index);
-#ifdef VLAN_FILTER
-static int insert_remove_outer_vlan_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index);
-#endif
+static int insert_remove_pppoe_hm(struct ins_entry_info *info);
 static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index);
 static int create_vlan_ins_hm(struct ins_entry_info *info);
 static int create_eth_rx_stats_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index);
@@ -268,70 +255,6 @@ int disable_dscp_fqid_map(uint32_t portid)
 	return SUCCESS;
 }
 
-/*
- * This function sets dscp vlan pcp mapping configuration.
- * In failure case it returns -1(nonzero).
-*/
-int set_dscp_vlan_pcp_map_cfg(uint8_t dscp, uint8_t vlan_pcp)
-{
-	en_dscp_vlanpcp_map_cfg	dscp_vlanpcp_map;
-
-	if (dscp >= ARRAY_SIZE(dscp_vlanpcp_map.dscp_vlanpcp))
-		return FAILURE;
-
-	if (ExternalHashGetDscpVlanpcpMapCfg(&dscp_vlanpcp_map) != 0)
-	{
-		DPA_ERROR("%s()::%d Failed to disable DSCP VLANPCP MAP configuration:\n",
-								__func__, __LINE__);
-		return FAILURE;
-	}
-
-	dscp_vlanpcp_map.dscp_vlanpcp[dscp] = vlan_pcp;
-	if (ExternalHashSetDscpVlanpcpMapCfg(&dscp_vlanpcp_map) != 0)
-	{
-		DPA_ERROR("%s()::%d Failed to disable DSCP VLANPCP MAP configuration:\n", 
-								__func__, __LINE__);
-		return FAILURE;
-	}
-	
-	return SUCCESS;
-}
-
-/*
- * This function gets dscp vlan pcp mapping configuration.
- * In failure case it returns -1(nonzero).
-*/
-int get_dscp_vlan_pcp_map_cfg(PQueryDSCPVlanPCPMapCmd pDscpVlanPcpMap)
-{
-	if (ExternalHashGetDscpVlanpcpMapCfg((en_dscp_vlanpcp_map_cfg *)pDscpVlanPcpMap->vlan_pcp) != 0)
-	{
-		DPA_ERROR("%s()::%d Failed to disable DSCP VLANPCP MAP configuration:\n", 
-								__func__, __LINE__);
-		return FAILURE;
-	}
-
-	return SUCCESS;
-}
-
-/*
- * This function resets dscp vlan pcp mapping configuration.
- * In failure case it returns -1(nonzero).
-*/
-int reset_dscp_vlan_pcp_map_cfg(void)
-{
-	en_dscp_vlanpcp_map_cfg	dscp_vlanpcp_map;
-
-	memset(&dscp_vlanpcp_map, 0, sizeof(en_dscp_vlanpcp_map_cfg));
-	if (ExternalHashSetDscpVlanpcpMapCfg(&dscp_vlanpcp_map) != 0)
-	{
-		DPA_ERROR("%s()::%d Failed to reset DSCP VLANPCP MAP configuration:\n", 
-								__func__, __LINE__);
-		return FAILURE;
-	}
-	
-	return SUCCESS;
-}
-
 #define PTR_TO_UINT(_ptr)           ((uintptr_t)(_ptr))
 uint64_t XX_VirtToPhys(void * addr)
 {
@@ -340,12 +263,15 @@ uint64_t XX_VirtToPhys(void * addr)
 
 static int Get_Tnl_Ethertype(int mode )
 {
+	/* Unsigned literals: 0x86dd << 16 does not fit a signed int, and the
+	 * caller keeps only the low half anyway (the inner ethertype the strip
+	 * exposes). */
 	switch(mode)
 	{
 		case TNL_MODE_6O4:
-			return ( (0x0800 << 16) | 0x86dd);
-		case TNL_MODE_4O6:		
-			return ( (0x86dd << 16) | 0x0800);
+			return ( (0x0800u << 16) | 0x86ddu);
+		case TNL_MODE_4O6:
+			return ( (0x86ddu << 16) | 0x0800u);
 		default:
 			return 0;
 	}
@@ -454,20 +380,66 @@ static int fill_key_info(PCtEntry entry, uint8_t *keymem, uint32_t port_id)
 	return key_size;
 }
 
-/* check activity */
-void hw_ct_get_active(struct hw_ct *ct)
+/* A bridged multicast root's key: the port, the frame's own Ethernet pair, and
+ * the routed multicast key's fields, in the key generator's extraction order.
+ *
+ * The pair is part of the key rather than something read at replication time
+ * because the listeners rebuild Ethernet with a literal header: the only way a
+ * listener can write the sender's source address back is to have matched on
+ * it. A frame of the same (S,G) from another sender misses this entry and is
+ * bridged in software, which is what a second source MAC deserves until the
+ * learner has an entry for it. `mac_pair` is the destination then the source,
+ * the order the header carries them in. */
+static uint32_t fill_mcast_mac_key(PCtEntry entry, const uint8_t *mac_pair,
+				   uint8_t *keymem, uint32_t port_id)
+{
+	union dpa_key *key = (union dpa_key *)keymem;
+
+	key->portid = port_id;
+	if (IS_IPV6_FLOW(entry)) {
+		struct ipv6_mcast_mac_key *k = &key->ipv6_mcast_mac_key;
+
+		memcpy(k->ether_da, mac_pair, ETHER_ADDR_LEN);
+		memcpy(k->ether_sa, mac_pair + ETHER_ADDR_LEN, ETHER_ADDR_LEN);
+		memcpy(k->ipv6_saddr, entry->Saddr_v6, IPV6_ADDRESS_LENGTH);
+		memcpy(k->ipv6_daddr, entry->Daddr_v6, IPV6_ADDRESS_LENGTH);
+		k->ipv6_protocol = entry->proto;
+		return sizeof(*k) + 1;
+	}
+	memcpy(key->ipv4_mcast_mac_key.ether_da, mac_pair, ETHER_ADDR_LEN);
+	memcpy(key->ipv4_mcast_mac_key.ether_sa, mac_pair + ETHER_ADDR_LEN,
+	       ETHER_ADDR_LEN);
+	key->ipv4_mcast_mac_key.ipv4_saddr = entry->Saddr_v4;
+	key->ipv4_mcast_mac_key.ipv4_daddr = entry->Daddr_v4;
+	key->ipv4_mcast_mac_key.ipv4_protocol = entry->proto;
+	return sizeof(key->ipv4_mcast_mac_key) + 1;
+}
+
+/* check activity
+ *
+ * Returns 0 when the entry's counters were read, and a negative errno when
+ * there was no entry or it keeps none. The fields are written either way, as
+ * they always were -- zero where nothing was read -- so a caller taking deltas
+ * has to know which it got: a zero standing in for a count reads as one that
+ * went backwards. */
+int hw_ct_get_active(struct hw_ct *ct)
 {
 	struct en_tbl_entry_stats stats;
+	int rc;
+
 	memset(&stats, 0, sizeof(struct en_tbl_entry_stats));
-	ExternalHashTableEntryGetStatsAndTS(ct->handle, &stats);
+	rc = ExternalHashTableEntryGetStatsAndTS(ct->handle, &stats);
 	ct->pkts = stats.pkts;
 	ct->bytes = stats.bytes;
 	ct->timestamp = stats.timestamp;
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::ct %p pkts %lu, bytes %lu, timestamp %x jiffies %x\n", 
+	DPA_INFO("%s::ct %p pkts %lu, bytes %lu, timestamp %x jiffies %x\n",
 		__func__, ct, (unsigned long)ct->pkts, (unsigned long)ct->bytes, ct->timestamp,
 		JIFFIES32);
 #endif
+	if (rc)
+		return -ENOENT;
+	return (stats.flags & STATS_VALID) ? 0 : -ENODATA;
 }
 
 /* Pending-free quarantine for external-hash table entries (ISSUES.md
@@ -491,24 +463,39 @@ void hw_ct_get_active(struct hw_ct *ct)
  * One successful sync clears the whole backlog:
  * ExternalHashTableFmPcdHcSync() syncs the table handle's PCD, and
  * LS1046A runs a single FMAN PCD, so a success reached via any table or
- * any flow is a valid barrier for every entry unlinked before it.
+ * any flow is a valid barrier for every entry unlinked before it. With a
+ * second PCD it would not be. Every entry that reaches here was programmed
+ * through the flowtable backend, and its cdx_ft_claim() refuses such a
+ * configuration.
+ *
+ * Each parked entry records the table it was unlinked from, so the backlog
+ * can issue its own barrier (cdx_ehash_quarantine_retry()) for a caller
+ * that has no table to hand: the flowtable backend refuses admission while
+ * anything is parked, and would otherwise wait on some unrelated delete.
  *
  * Concurrency: the quarantine carries no lock of its own. Every touch
- * runs either from an FCI command handler - serialized by ctrl.mutex in
- * cdx_cmdhandler.c, with the multicast callers additionally holding
- * mc_mutators_mutex - from the CT aging kthread, which takes that same
- * ctrl.mutex, or from module exit with no handler in flight. The query
- * walkers never see it, so no softirq-safe variant is needed. Callers
- * must not hold a spinlock: the barriers reached from here busy-wait on
- * host-command completion.
+ * runs under ctrl.mutex: the flowtable backend and its multicast and
+ * IPsec callers (the multicast ones additionally holding
+ * mc_mutators_mutex), and module exit, which tears down under
+ * cdx_ctrl_deinit()'s hold. Each mutator asserts
+ * it (cdx_ehash_quarantine_assert_held()). Nothing in softirq touches
+ * it, so no softirq-safe variant is needed.
+ * Callers must not hold a spinlock: the barriers reached from here
+ * busy-wait on host-command completion.
  */
 struct cdx_ehash_pending_free {
 	struct list_head list;
+	void *td;
 	void *tbl_entry;
 };
 
 static LIST_HEAD(cdx_ehash_pending_frees);
 static unsigned int cdx_ehash_pending_free_cnt;
+
+static void cdx_ehash_quarantine_assert_held(void)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+}
 
 /* Advisory snapshot for the debug proc readers, which run outside the
  * mutator serialization. */
@@ -517,10 +504,14 @@ unsigned int cdx_ehash_quarantine_pending(void)
 	return READ_ONCE(cdx_ehash_pending_free_cnt);
 }
 
-void cdx_ehash_quarantine_entry(void *tbl_entry)
+/* td is the table tbl_entry was unlinked from. Any table on this PCD
+ * would do for the barrier; recording the entry's own keeps the handle
+ * one whose lifetime the entry already depended on. */
+void cdx_ehash_quarantine_entry(void *td, void *tbl_entry)
 {
 	struct cdx_ehash_pending_free *node;
 
+	cdx_ehash_quarantine_assert_held();
 	if (!tbl_entry)
 		return;
 
@@ -536,6 +527,7 @@ void cdx_ehash_quarantine_entry(void *tbl_entry)
 				__func__, tbl_entry);
 		return;
 	}
+	node->td = td;
 	node->tbl_entry = tbl_entry;
 	list_add_tail(&node->list, &cdx_ehash_pending_frees);
 	/* WRITE_ONCE pairs with the debug proc reader's READ_ONCE - the
@@ -552,6 +544,7 @@ void cdx_ehash_quarantine_free_all(void)
 {
 	struct cdx_ehash_pending_free *node, *tmp;
 
+	cdx_ehash_quarantine_assert_held();
 	list_for_each_entry_safe(node, tmp, &cdx_ehash_pending_frees, list)
 	{
 		list_del(&node->list);
@@ -563,16 +556,19 @@ void cdx_ehash_quarantine_free_all(void)
 
 /* Module-exit disposition of a backlog no drain could clear. cdx does
  * NOT tear down the FMAN PCD on unload (sdk_fman owns it and stays
- * loaded), so there is no barrier here either: by this point every
- * teardown has already retried the sync and failed, meaning the HC
- * channel is wedged and the ucode may still be walking the parked
- * memory. Leaking a handful of entries at rmmod (test images only; cdx
- * is never unloaded in production) is the only safe terminal state. */
+ * loaded), so the only barrier left is one more sync of its own: nothing
+ * guarantees an earlier teardown tried one after the last entry was
+ * parked. If that fails too, the HC channel is wedged and the ucode may
+ * still be walking the parked memory. Leaking a handful of entries at
+ * rmmod (test images only; cdx is never unloaded in production) is then
+ * the only safe terminal state. The tables the entries name are still
+ * configured here: this runs before the DPA configuration is torn down. */
 void cdx_ehash_quarantine_abandon(void)
 {
 	struct cdx_ehash_pending_free *node, *tmp;
 
-	if (!READ_ONCE(cdx_ehash_pending_free_cnt))
+	cdx_ehash_quarantine_assert_held();
+	if (!READ_ONCE(cdx_ehash_pending_free_cnt) || !cdx_ehash_quarantine_retry())
 		return;
 
 	DPA_ERROR("%s::HC channel never recovered, leaking %u quarantined entries\n",
@@ -599,6 +595,7 @@ void cdx_ehash_quarantine_abandon(void)
  * which is the common case. */
 void cdx_ehash_quarantine_drain(void *td)
 {
+	cdx_ehash_quarantine_assert_held();
 	if (list_empty(&cdx_ehash_pending_frees))
 		return;
 
@@ -609,6 +606,240 @@ void cdx_ehash_quarantine_drain(void *td)
 		return;
 	}
 	cdx_ehash_quarantine_free_all();
+}
+
+/* The same retry for a caller with no table of its own to issue the
+ * barrier through: one sync through the first parked entry's recorded
+ * table. A direct sync, deliberately not routed through the multicast
+ * fault knob's funnel, so an armed knob never keeps a backlog alive.
+ * Returns 0 when nothing is parked any more, -EAGAIN when the sync
+ * failed and everything stays parked. Quiet on failure: the sync itself
+ * already logs, and a caller that retries on a timer should not add a
+ * line per attempt. */
+int cdx_ehash_quarantine_retry(void)
+{
+	struct cdx_ehash_pending_free *node;
+
+	cdx_ehash_quarantine_assert_held();
+	list_for_each_entry(node, &cdx_ehash_pending_frees, list)
+	{
+		if (!node->td)
+			continue;
+		if (ExternalHashTableFmPcdHcSync(node->td))
+			return -EAGAIN;
+		cdx_ehash_quarantine_free_all();
+		return 0;
+	}
+	/* Nothing parked, or nothing that named a table to sync through:
+	 * the latter waits for a barrier from a caller that has one. */
+	return list_empty(&cdx_ehash_pending_frees) ? 0 : -EAGAIN;
+}
+
+/* Table entries a delete could not prove it unlinked.
+ *
+ * Every arm of ExternalHashTableDeleteKey() that returns -1 does so before it
+ * changes anything, and the test knob below fails a delete without calling it
+ * at all, so such an entry is linked exactly where it was or in no bucket. No
+ * barrier makes freeing it safe while a port walks the tables. Once every port
+ * that does is stopped and idle (dpa_cfg_stop()), though, nothing races a
+ * second look: the delete is tried again, and an entry no bucket links any
+ * more can simply go. That is what lets the datapath restart rather than wait
+ * for a reboot (cdx_ft_restart()).
+ *
+ * A root is an entry the tables may link -- a flow's, a multicast group's, an
+ * SA's -- recorded with the table and the bucket it was added to. A dependent
+ * is one only a root reaches -- a multicast group's listeners, chained behind
+ * the group's entry -- and goes once every root has been settled.
+ *
+ * A record is allocated when the delete fails, and that can fail too. A root
+ * without one may still be linked with nothing that knows where, so no restart
+ * can be proven safe, and the latch is left for a reboot as before these
+ * records existed. A dependent without one is leaked: whatever reached it is a
+ * root, settled or not.
+ *
+ * Same serialization as the quarantine above.
+ */
+struct cdx_ehash_abandoned {
+	struct list_head list;
+	void *td;
+	void *tbl_entry;
+	uint16_t index;
+	/* Deletes the table refused this root during a restart. */
+	unsigned int attempts;
+};
+
+static LIST_HEAD(cdx_ehash_abandoned_roots);
+static LIST_HEAD(cdx_ehash_abandoned_dependents);
+static bool cdx_ehash_abandoned_unrecorded;
+
+/* How many restarts a root still linked may hold up, its delete refused each
+ * time, most likely for want of a cumulative node, before the doubt is taken as
+ * permanent. */
+#define CDX_EHASH_RESOLVE_ATTEMPTS	8
+
+static struct cdx_ehash_abandoned *cdx_ehash_abandoned_record(void *td,
+		uint16_t index, void *tbl_entry, struct list_head *list)
+{
+	struct cdx_ehash_abandoned *node;
+
+	node = kmalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return NULL;
+	node->td = td;
+	node->tbl_entry = tbl_entry;
+	node->index = index;
+	node->attempts = 0;
+	list_add_tail(&node->list, list);
+	return node;
+}
+
+void cdx_ehash_abandon(void *td, uint16_t index, void *tbl_entry)
+{
+	cdx_ehash_quarantine_assert_held();
+	if (!tbl_entry || cdx_ehash_abandoned_record(td, index, tbl_entry,
+						     &cdx_ehash_abandoned_roots))
+		return;
+	DPA_ERROR("%s::cannot record possibly linked tbl_entry %p; only a reboot frees it\n",
+			__func__, tbl_entry);
+	cdx_ehash_abandoned_unrecorded = true;
+}
+
+void cdx_ehash_abandon_dependent(void *tbl_entry)
+{
+	cdx_ehash_quarantine_assert_held();
+	if (!tbl_entry || cdx_ehash_abandoned_record(NULL, 0, tbl_entry,
+						     &cdx_ehash_abandoned_dependents))
+		return;
+	DPA_ERROR("%s::cannot record tbl_entry %p behind a possibly linked root, leaking it\n",
+			__func__, tbl_entry);
+}
+
+bool cdx_ehash_abandoned_lost(void)
+{
+	cdx_ehash_quarantine_assert_held();
+	return cdx_ehash_abandoned_unrecorded;
+}
+
+/* One root, with nothing walking the tables: 0 once it is unlinked, or found
+ * in no bucket, and its entry the caller's to free. Asks the SDK directly,
+ * never through the knob that fails deletes, so an armed knob cannot hold a
+ * restart up. */
+static int cdx_ehash_resolve_root(struct cdx_ehash_abandoned *node)
+{
+	uint16_t where = node->index;
+	int rc;
+
+	rc = ExternalHashTableFindEntry(node->td, node->tbl_entry, &where);
+	if (rc == -ENOENT)
+		return 0;
+	if (rc) {
+		DPA_ERROR("%s::table %p is malformed (%d) around tbl_entry %p\n",
+				__func__, node->td, rc, node->tbl_entry);
+		return -ENOTRECOVERABLE;
+	}
+	if (where != node->index)
+		DPA_ERROR("%s::tbl_entry %p is linked from bucket %u, added to %u\n",
+				__func__, node->tbl_entry, where, node->index);
+	rc = ExternalHashTableDeleteKey(node->td, where, node->tbl_entry);
+	/* With no walker in the tables an unlink needs no barrier to be
+	 * final; the restart issues one anyway before anything starts. */
+	if (rc == SUCCESS || rc == EN_EHASH_DELETE_UNSYNCED)
+		return 0;
+	if (++node->attempts < CDX_EHASH_RESOLVE_ATTEMPTS)
+		return -EAGAIN;
+	DPA_ERROR("%s::tbl_entry %p still linked after %u deletes\n",
+			__func__, node->tbl_entry, node->attempts);
+	return -ENOTRECOVERABLE;
+}
+
+int cdx_ehash_resolve_abandoned(unsigned int *resolved)
+{
+	struct cdx_ehash_abandoned *node, *tmp;
+	int rc, ret = 0;
+
+	cdx_ehash_quarantine_assert_held();
+	*resolved = 0;
+	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_roots, list)
+	{
+		rc = cdx_ehash_resolve_root(node);
+		if (rc == -ENOTRECOVERABLE)
+			return rc;
+		if (rc) {
+			ret = rc;
+			continue;
+		}
+		list_del(&node->list);
+		ExternalHashTableEntryFree(node->tbl_entry);
+		kfree(node);
+		(*resolved)++;
+	}
+	if (ret)
+		return ret;
+	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_dependents, list)
+	{
+		list_del(&node->list);
+		ExternalHashTableEntryFree(node->tbl_entry);
+		kfree(node);
+	}
+	return 0;
+}
+
+/* Unload. With the ports stopped every root that will go is settled and freed,
+ * as a restart would; whatever is left, or everything when the ports could not
+ * be stopped, stays allocated for the reset that alone can free it, and only
+ * the bookkeeping is released. Runs where cdx_ehash_quarantine_abandon() does,
+ * with the tables still configured. True when nothing that may still be linked
+ * is left, recorded or not. */
+bool cdx_ehash_abandoned_exit(bool stopped)
+{
+	struct cdx_ehash_abandoned *node, *tmp;
+	unsigned int resolved, leaked = 0;
+
+	cdx_ehash_quarantine_assert_held();
+	if (stopped && !cdx_ehash_abandoned_unrecorded)
+		/* Every refusal counts toward the root's attempts, so this
+		 * ends. */
+		while (cdx_ehash_resolve_abandoned(&resolved) == -EAGAIN)
+			;
+	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_roots, list)
+	{
+		list_del(&node->list);
+		kfree(node);
+		leaked++;
+	}
+	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_dependents, list)
+	{
+		list_del(&node->list);
+		kfree(node);
+		leaked++;
+	}
+	if (leaked)
+		DPA_ERROR("%s::leaking %u possibly linked table entries until reset\n",
+				__func__, leaked);
+	return !leaked && !cdx_ehash_abandoned_unrecorded;
+}
+
+#ifdef CDX_DEBUG_FLOWTABLE
+/* Test-only. Classifier deletes to fail before the unlink, for the roots that
+ * delete through here -- multicast groups and IPsec SAs; unicast flowtable
+ * entries delete directly and have flowtable_fail_unlink. Each leaves its key
+ * linked, exactly as the not-provably-unlinked arm below describes, until the
+ * datapath restart settles it -- which asks the SDK directly, so an armed count
+ * never fails the restart's own deletes. */
+static unsigned int ehash_fail_unlink;
+module_param_named(ehash_fail_unlink, ehash_fail_unlink, uint, 0600);
+MODULE_PARM_DESC(ehash_fail_unlink, "Multicast/IPsec classifier deletes to fail before unlink, leaving the key linked; the datapath stops and restarts");
+#endif
+
+static bool cdx_ehash_unlink_fault(void)
+{
+#ifdef CDX_DEBUG_FLOWTABLE
+	unsigned int left = READ_ONCE(ehash_fail_unlink);
+
+	return left && cmpxchg(&ehash_fail_unlink, left, left - 1) == left;
+#else
+	return false;
+#endif
 }
 
 /* Delete one key from an external hash table and dispose of its table
@@ -633,7 +864,8 @@ int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle)
 	if (!handle)
 		return SUCCESS;
 
-	rc = ExternalHashTableDeleteKey(td, index, handle);
+	rc = cdx_ehash_unlink_fault() ? FAILURE :
+		ExternalHashTableDeleteKey(td, index, handle);
 	if (rc == SUCCESS)
 	{
 		ExternalHashTableEntryFree(handle);
@@ -647,15 +879,18 @@ int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle)
 	{
 		/* Out of the chain, but no proof the ucode has left it. Park
 		 * it for the next successful sync on this PCD. */
-		cdx_ehash_quarantine_entry(handle);
+		cdx_ehash_quarantine_entry(td, handle);
 		return rc;
 	}
-	/* Not provably unlinked, and there is no second unlink to retry: a
-	 * live chain may still resolve to this entry forever. Freeing it -
-	 * now, or later through the quarantine - is a use-after-free the
-	 * hardware commits, so the memory is abandoned deliberately. */
-	DPA_ERROR("%s::DeleteKey rc %d, leaking tbl_entry %p: not provably unlinked, freeing it would be a use-after-free\n",
+	/* Not provably unlinked, and nothing may retry the unlink while the
+	 * ports run: a live chain may still resolve to this entry. Freeing it
+	 * - now, or later through the quarantine - is a use-after-free the
+	 * hardware commits, so it is recorded for the restart that stops the
+	 * ports and settles it (cdx_ehash_resolve_abandoned()); the caller
+	 * latches the failure that brings that restart about. */
+	DPA_ERROR("%s::DeleteKey rc %d, keeping tbl_entry %p: not provably unlinked\n",
 			__func__, rc, handle);
+	cdx_ehash_abandon(td, index, handle);
 	return rc;
 }
 
@@ -666,7 +901,7 @@ int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle)
  * cdx_ehash_delete_entry() on every arm; what this function owns is the
  * hw_ct wrapper, which is pure software with no hardware reference and
  * so is always released. Keeping ct alive past a failed delete bought
- * nothing and is what let ct_remove() free an already-disposed handle
+ * nothing and once let a later release free an already-disposed handle
  * (ISSUES.md A95). */
 int delete_entry_from_classif_table(PCtEntry entry)
 {
@@ -691,60 +926,6 @@ int delete_entry_from_classif_table(PCtEntry entry)
 
 	kfree(entry->ct);
 	entry->ct = NULL;
-	return rc;
-}
-
-/* delete classif entry from table.
- *
- * The handle's disposition is cdx_ehash_delete_entry()'s. The software
- * flow is torn down on SUCCESS and on the unsynced arm (the key is out
- * of the table on both); on a hard FAILURE the flow survives intact as
- * a tombstone - see the comment at that arm. Returns the delete rc so
- * the caller can distinguish the arms. */
-int delete_l2br_entry_classif_table(struct L2Flow_entry *entry)
-{
-	struct hw_ct *ct = entry->ct;
-	int rc = SUCCESS;
-
-	if (ct) {
-		if (ct->handle) {
-			if (ct->td) {
-				rc = cdx_ehash_delete_entry(ct->td, ct->index,
-						ct->handle);
-				if (rc) {
-					DPA_ERROR("%s::unable to remove entry from hash table\n",
-							__func__);
-				}
-				/* Hard failure: the key was not provably
-				 * unlinked, so the software flow must survive
-				 * as a tombstone - it keeps ACTION_REGISTER of
-				 * the same tuple answering ALREADY_EXISTS
-				 * (re-adding a possibly-live key would build a
-				 * duplicate-key bucket), and a later
-				 * DEREGISTER retries this delete (the timer is
-				 * already off the wheel; cdx_timer_del is
-				 * idempotent). ct/handle stay allocated: the
-				 * ucode may still walk them, and the query
-				 * path keeps sampling them safely. */
-				if (rc == FAILURE)
-					return rc;
-			} else {
-				/* No table descriptor: the entry was never
-				 * linked into a chain, so the allocation is
-				 * ours to release outright. */
-				ExternalHashTableEntryFree(ct->handle);
-			}
-			ct->handle = NULL;
-		}
-		kfree(ct);
-		entry->ct = NULL;
-	}
-	/* Unlinked from hardware (or unsynced and parked in the quarantine):
-	 * the software flow is torn down on this arm either way; a later
-	 * lookup can no longer resolve to a flow whose hardware entry is
-	 * gone or pending release. */
-	hlist_del(&entry->node);
-	kfree(entry);
 	return rc;
 }
 
@@ -787,7 +968,7 @@ static int get_table_type(PCtEntry entry, uint32_t *type)
 	return FAILURE;
 }
 
-static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
+static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed)
 {
 	PCtEntry twin_entry;
 	uint32_t ii; 
@@ -806,8 +987,6 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 #endif
 	twin_entry = CT_TWIN(entry);
 
-	//routing and ttl decr are mandatory
-
 	//mask it as ipv6 flow if required
 	if (IS_IPV6_FLOW(entry))
 	{
@@ -815,7 +994,9 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 		ethertype   =  ETHERTYPE_IPV6;
 	}
 
-	info->flags |= TTL_HM_VALID;
+	/* Bridged multicast reaches this encoder too, but crosses no IP hop. */
+	if (routed)
+		info->flags |= TTL_HM_VALID;
 
 	//strip vlan on ingress if incoming iface is vlan
 	if (info->l2_info.vlan_present)
@@ -825,14 +1006,6 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 	if (info->l2_info.pppoe_present)
 		info->flags |= PPPoE_STRIP_HM_VALID;
 
-#ifdef VLAN_FILTER
-	if(entry->pRtEntry->vlan_filter_flags & VLAN_INGRESS_FILTERED)
-	{
-		info->flags |= ROUTE_FLOW_VLAN_FIL_EN;
-		if(entry->pRtEntry->vlan_filter_flags & VLAN_PVID)
-			info->flags |= ROUTE_FLOW_PVID_SET;
-	}
-#endif
 	//perform NAT where required
 	{
 		if (IS_IPV4_NAT(entry) || IS_IPV6_NAT(entry)) {
@@ -940,15 +1113,8 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 			break;
 
 		if (info->l2_info.pppoe_present) {
-			struct _itf *itf = NULL;
-
-			if ((entry->pRtEntry->input_itf) && (entry->pRtEntry->input_itf->type & IF_TYPE_PPPOE))
-				itf = entry->pRtEntry->input_itf;
-			else
-				itf = entry->pRtEntry->underlying_input_itf;
-
 			/* strip pppoe hdrs */
-			if (insert_remove_pppoe_hm(info, itf->index))
+			if (insert_remove_pppoe_hm(info))
 				break;
 		}
 
@@ -1021,8 +1187,164 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 	return FAILURE;
 }
 
-/* insert classif entry into table */
-int insert_entry_in_classif_table(PCtEntry entry)
+/* Apply a caller-supplied VLAN stack and PPPoE session to the L2 description
+ * derived from the interfaces. Only the Linux flowtable owner uses this: its
+ * egress is a physical port with the encapsulation named by the flow, so
+ * dpa_get_tx_info_by_itf() has no VLAN or PPPoE interface to walk and returns
+ * a bare description.
+ *
+ * The statistics indices come from the description too, and nowhere else:
+ * the record the caller allocated for the session, tunnel or tag, or zero for
+ * one that has none, which the opcodes then emit as no pointer at all rather
+ * than as another owner's record zero. vlan_flow_ifstats marks a VLAN stack as
+ * described here, because the strip also runs for a flow that described none.
+ *
+ * The session's Ethernet destination is written to ac_mac_addr because that is
+ * where create_ethernet_hm() reads a PPPoE flow's destination from. It is the
+ * same address the route already carries in l2hdr, since a flow reaching here
+ * has the concentrator as its destination MAC; writing both keeps this path
+ * exercising exactly the branch an interface-derived session does.
+ *
+ * Refusing a description that already carries tags or a session is a guard:
+ * VLAN and PPPoE interfaces no longer register, so the interface walk never
+ * fills one in, and a flow naming its own on top of one would describe two.
+ */
+#ifdef INCLUDE_VLAN_IFSTATS
+/* Whether a flow-described stack names a record for every one of its tags.
+ * All or none: the opcodes' list form has no way to skip a tag, and zero is
+ * not "no record" there but another owner's record. A stack with no tags at
+ * all names nothing and so gets nothing, which is the same answer. */
+static int vlan_flow_stats_named(const uint8_t *indices, uint32_t count)
+{
+	uint32_t i;
+
+	if (!count)
+		return 0;
+	for (i = 0; i < count; i++)
+		if (!indices[i])
+			return 0;
+	return 1;
+}
+#endif
+
+static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap *encap)
+{
+	struct dpa_l2hdr_info *l2_info = &info->l2_info;
+
+	if (encap->num_ingress > DPA_CLS_HM_MAX_VLANs ||
+	    encap->num_egress > DPA_CLS_HM_MAX_VLANs) {
+		DPA_ERROR("%s::encapsulation deeper than the hardware supports\n", __func__);
+		return FAILURE;
+	}
+	if (l2_info->num_ingress_vlan_hdrs || l2_info->num_egress_vlan_hdrs ||
+	    l2_info->vlan_present || l2_info->pppoe_present || l2_info->add_pppoe_hdr) {
+		DPA_ERROR("%s::interfaces already describe an encapsulation\n", __func__);
+		return FAILURE;
+	}
+	memcpy(l2_info->ingress_vlan_hdrs, encap->ingress,
+	       encap->num_ingress * sizeof(*encap->ingress));
+	l2_info->num_ingress_vlan_hdrs = encap->num_ingress;
+	l2_info->vlan_present = !!encap->num_ingress;
+	memcpy(l2_info->egress_vlan_hdrs, encap->egress,
+	       encap->num_egress * sizeof(*encap->egress));
+	l2_info->num_egress_vlan_hdrs = encap->num_egress;
+	l2_info->vlan_flow_ifstats = 1;
+#ifdef INCLUDE_VLAN_IFSTATS
+	memcpy(l2_info->ingress_vlan_stats_offsets, encap->ingress_vlan_stats_index,
+	       sizeof(l2_info->ingress_vlan_stats_offsets));
+	memcpy(l2_info->vlan_stats_offsets, encap->egress_vlan_stats_index,
+	       sizeof(l2_info->vlan_stats_offsets));
+#endif
+	if (encap->ingress_pppoe)
+		l2_info->pppoe_present = 1;
+	if (encap->egress_pppoe) {
+		l2_info->add_pppoe_hdr = 1;
+		l2_info->pppoe_sess_id = encap->egress_session_id;
+		memcpy(l2_info->ac_mac_addr, encap->egress_session_mac,
+		       ETHER_ADDR_LEN);
+	}
+#ifdef INCLUDE_PPPoE_IFSTATS
+	if (encap->ingress_pppoe || encap->egress_pppoe) {
+		l2_info->pppoe_rx_stats_offset = encap->ingress_stats_index;
+		l2_info->pppoe_stats_offset = encap->egress_stats_index;
+	}
+#endif
+	if (encap->ingress_tunnel.present || encap->egress_tunnel.present) {
+		struct dpa_l3hdr_info *l3_info = &info->l3_info;
+
+		/* The same refusal as for a tag: a route whose interfaces
+		 * already describe a tunnel and a flow naming one on top of
+		 * it would describe two. */
+		if (l3_info->add_tnl_header || l3_info->tnl_header_present) {
+			DPA_ERROR("%s::interfaces already describe a tunnel\n", __func__);
+			return FAILURE;
+		}
+		/* One mode and one header size per direction. Both sides of a
+		 * direction carry the same inner family, so a direction that
+		 * strips one tunnel and inserts another -- a router between two
+		 * tunnels -- has the same mode on both, and the encoder's single
+		 * description of it is not a limitation. */
+		if (encap->ingress_tunnel.present && encap->egress_tunnel.present &&
+		    (encap->ingress_tunnel.mode != encap->egress_tunnel.mode ||
+		     encap->ingress_tunnel.header_size != encap->egress_tunnel.header_size)) {
+			DPA_ERROR("%s::a direction strips one tunnel mode and inserts another\n",
+				  __func__);
+			return FAILURE;
+		}
+		if (encap->ingress_tunnel.present) {
+			l3_info->tnl_header_present = 1;
+			l3_info->mode = encap->ingress_tunnel.mode;
+			l3_info->header_size = encap->ingress_tunnel.header_size;
+			l3_info->tunnel_flags |= encap->ingress_tunnel.flags;
+			l3_info->tunnel_rx_stats_offset = encap->ingress_tunnel.stats_index;
+		}
+		if (encap->egress_tunnel.present) {
+			if (encap->egress_tunnel.header_size > sizeof(l3_info->header)) {
+				DPA_ERROR("%s::tunnel header larger than the hardware inserts\n",
+					  __func__);
+				return FAILURE;
+			}
+			l3_info->add_tnl_header = 1;
+			l3_info->mode = encap->egress_tunnel.mode;
+			l3_info->header_size = encap->egress_tunnel.header_size;
+			memcpy(l3_info->header, encap->egress_tunnel.header,
+			       encap->egress_tunnel.header_size);
+			l3_info->tunnel_flags |= encap->egress_tunnel.flags;
+			l3_info->tunnel_stats_offset = encap->egress_tunnel.stats_index;
+		}
+	}
+	return SUCCESS;
+}
+
+/* Mirrors cdx_pcd_tunnel_key()'s generic first-header extraction, after the known inner
+ * tuple fields. SEC's private tables retain their existing keys. */
+static unsigned int fill_tunnel_key(PCtEntry entry, const struct cdx_l2_encap *encap,
+				   uint8_t *key)
+{
+	const struct cdx_tunnel_encap *tunnel = encap ? &encap->ingress_tunnel : NULL;
+	bool ipv6 = IS_IPV6_FLOW(entry);
+	unsigned int size = ipv6 ? 10 : 35;
+
+	memset(key, 0, size);
+	if (tunnel && tunnel->present) {
+		key[1] = tunnel->header[ipv6 ? 9 : 6];
+		memcpy(key + 2, tunnel->header + (ipv6 ? 12 : 8), ipv6 ? 8 : 32);
+		if (!ipv6)
+			key[34] = key[1] == IPPROTO_DSTOPTS ? IPPROTO_IPIP : 0x45;
+	} else {
+		key[0] = entry->proto;
+	}
+	memset(key + size, 0, 8);
+	if (encap && encap->ingress_pppoe) {
+		__be16 session = cpu_to_be16(encap->ingress_session_id);
+
+		memcpy(key + size, encap->ingress_session_mac, ETHER_ADDR_LEN);
+		memcpy(key + size + ETHER_ADDR_LEN, &session, sizeof(session));
+	}
+	return size + 8;
+}
+
+int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap)
 {
 	struct ins_entry_info *info;
 	struct en_exthash_tbl_entry *tbl_entry;
@@ -1049,8 +1371,8 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	 * interface has since been removed while the route stayed referenced. */
 	underlying_input_itf = entry->pRtEntry->underlying_input_itf;
 	if (!underlying_input_itf) {
-		DPA_ERROR("%s::route %u has no underlying input interface\n",
-				__func__, entry->pRtEntry->id);
+		DPA_ERROR("%s::route has no underlying input interface\n",
+				__func__);
 		goto err_ret1;
 	}
 	//clear hw entry pointer
@@ -1097,11 +1419,14 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	}
 
 	if (dpa_get_tx_info_by_itf(entry->pRtEntry, &info->l2_info,
-				&info->l3_info, entry->tnl_route, &entry->qosmark, (uint32_t)entry->hash)) {
+				&info->l3_info, &entry->qosmark, (uint32_t)entry->hash)) {
 		DPA_ERROR("%s::unable to get tx params\n",
 				__func__);
 		goto err_ret;
 	}
+
+	if (encap && apply_l2_encap(info, encap))
+		goto err_ret;
 
 #ifdef DPA_IPSEC_OFFLOAD
 	/* if the connection is a secure one  and  SA direction is inbound
@@ -1173,6 +1498,17 @@ int insert_entry_in_classif_table(PCtEntry entry)
 				__func__);
 		goto err_ret;
 	}	
+	if (!info->l3_info.ipsec_inbound_flow &&
+	    (tbl_type == IPV4_TCP_TABLE || tbl_type == IPV4_UDP_TABLE ||
+	     tbl_type == IPV6_TCP_TABLE || tbl_type == IPV6_UDP_TABLE)) {
+		/* The scheme's protocol match selects a TCP or UDP table. */
+		unsigned int protocol = IS_IPV6_FLOW(entry) ? 33 : 9;
+
+		memmove(tbl_entry->hashentry.key + protocol,
+			tbl_entry->hashentry.key + protocol + 1, 4);
+		key_size--;
+		key_size += fill_tunnel_key(entry, encap, tbl_entry->hashentry.key + key_size);
+	}
 
 	//round off keysize to next 4 bytes boundary 
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];          
@@ -1192,7 +1528,7 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	info->paramptr = ptr;
 	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
 			GET_PARAM_OFFSET(flags));
-	if (fill_actions(entry, info)) {
+	if (fill_actions(entry, info, true)) {
 		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
@@ -1223,9 +1559,21 @@ err_ret1:
 	return FAILURE;
 }
 
-int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry, 
+/* A multicast group's root entry: the classifier key, the ingress validation,
+ * and REPLICATE_PKT naming the head of the listener chain.
+ *
+ * `mac_pair`, when given, keys the root on the frame's own Ethernet pair
+ * (destination then source) in the bridged multicast table instead of the
+ * routed one; see fill_mcast_mac_key(). `in_encap`, when it names ingress
+ * tags, is what the root validates and strips: without it STRIP_ALL_VLAN_HDRS
+ * expects an untagged frame, so a tagged one matched the key and was then
+ * handed to Linux -- which is how tagged ingress fell back before a group
+ * could say what it arrives with. Only its ingress half is read. */
+int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 					unsigned int num_members, uint64_t first_member_flow_addr,
-					void *first_listener_entry)
+					void *first_listener_entry, bool bridged,
+					const uint8_t *mac_pair,
+					const struct cdx_l2_encap *in_encap)
 {
 	struct ins_entry_info *info;
 	struct en_exthash_tbl_entry *tbl_entry;
@@ -1249,7 +1597,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 		return FAILURE;
 	
 	info->entry = entry;
-	// same as above function insert_entry_in_classif_table, FOLLOWING TWO LINES ADDED ADDITIONALLY
+	/* The root entry also carries the head of the listener chain. */
 	info->first_member_flow_addr_hi = cpu_to_be16((first_member_flow_addr >> 32) & 0xffff);
 	info->first_member_flow_addr_lo = cpu_to_be32(first_member_flow_addr  & 0xffffffff);
 	info->num_mcast_members = num_members;
@@ -1258,8 +1606,8 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	 * interface has since been removed while the route stayed referenced. */
 	underlying_input_itf = entry->pRtEntry->underlying_input_itf;
 	if (!underlying_input_itf) {
-		DPA_ERROR("%s::route %u has no underlying input interface\n",
-				__func__, entry->pRtEntry->id);
+		DPA_ERROR("%s::route has no underlying input interface\n",
+				__func__);
 		goto err_ret1;
 	}
 	//clear hw entry pointer
@@ -1294,7 +1642,10 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 							__func__);
 		goto err_ret;
 	}
-	
+	if (mac_pair)
+		tbl_type = IS_IPV6_FLOW(entry) ? IPV6_BRIDGED_MULTICAST_TABLE :
+						 IPV4_BRIDGED_MULTICAST_TABLE;
+
 	//get table descriptor based on type and port
 	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, tbl_type);
 	if (info->td == NULL) {
@@ -1322,12 +1673,21 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	}
 	
 	if (dpa_get_tx_info_by_itf(entry->pRtEntry, &info->l2_info,
-			&info->l3_info, entry->tnl_route, &entry->qosmark, (uint32_t)entry->hash)) {
+			&info->l3_info, &entry->qosmark, (uint32_t)entry->hash)) {
 		DPA_ERROR("%s::unable to get tx params\n",
 									__func__);
 		goto err_ret;
 	}
-	
+	/* After the interface walk, as for a flow: the root route names a
+	 * physical port, so the walk found no tag and the group's own
+	 * description is the only one. An untagged ingress passes nothing and
+	 * is validated as untagged. */
+	if (in_encap && in_encap->num_ingress &&
+	    apply_l2_encap(info, in_encap)) {
+		DPA_ERROR("%s::unable to apply the ingress tags\n", __func__);
+		goto err_ret;
+	}
+
 	//allocate hash table entry
 	DPA_INFO("%s::info->td %p\n", __func__, info->td);
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
@@ -1349,32 +1709,37 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	SET_STATS_ENABLE(flags);
 #endif
 //fill key information from entry
-	key_size = fill_key_info(entry, &tbl_entry->hashentry.key[0], info->port_id);
+	if (mac_pair)
+		key_size = fill_mcast_mac_key(entry, mac_pair,
+					      &tbl_entry->hashentry.key[0],
+					      info->port_id);
+	else
+		key_size = fill_key_info(entry, &tbl_entry->hashentry.key[0],
+					 info->port_id);
 	if (!key_size) {
 		DPA_ERROR("%s::unable to compose key\n",
 								__func__);
 		goto err_ret;
-	}	
-		
-	//round off keysize to next 4 bytes boundary 
-	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];			
+	}
+	//round off keysize to next 4 bytes boundary
+	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];
 	ptr += ALIGN(key_size, TBLENTRY_OPC_ALIGN);
-	//set start of opcode list 
+	//set start of opcode list
 	info->opcptr = ptr;
 	//ptr now after opcode section
 	ptr += MAX_OPCODES;
 
 	//set offset to first opcode
 	SET_OPC_OFFSET(flags, (uint32_t)(info->opcptr - (uint8_t *)tbl_entry));
-	//set param offset 
+	//set param offset
 	SET_PARAM_OFFSET(flags, (uint32_t)(ptr - (uint8_t *)tbl_entry));
 	//param_ptr now points after timestamp location
 	tbl_entry->hashentry.flags = cpu_to_be16(flags);
 	//param pointer and opcode pointer now valid
 	info->paramptr = ptr;
-	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
+	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE -
 		GET_PARAM_OFFSET(flags));
-	if (fill_actions(entry, info)) {
+	if (fill_actions(entry, info, !bridged)) {
 		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
@@ -1419,269 +1784,23 @@ err_ret1:
 	return FAILURE;
 }
 
-static int fill_bridge_actions(struct ins_entry_info *info, POnifDesc ifdesc)
+#ifdef INCLUDE_PPPoE_IFSTATS
+/* The address of one timestamped statistics record half, from the index a
+ * header manipulation carries. Index zero is never a record a PPPoE session
+ * owns -- STATS_WITH_TS is always set on a real one -- so it is the caller's
+ * way of saying there is none, and the opcode takes a null pointer instead. */
+static uint32_t pppoe_stats_pointer(uint8_t index)
 {
-	struct L2Flow_entry *entry;
-	int ii;
-	int rebuild_l2_hdr = 0;
-
-	entry = (struct L2Flow_entry *)info->entry;
-	info->flags |= EHASH_BRIDGE_FLOW;
-#ifdef INCLUDE_ETHER_IFSTATS
-
-	if (create_eth_rx_stats_hm(info, ifdesc->itf->index, 0)) 
-		return FAILURE;
-#endif
-#ifdef VLAN_FILTER
-	if ((entry->l2flow.vlan_flags & VLAN_FILTERED) || info->l2_info.vlan_present)
-#endif
-	{
-		info->flags |= VLAN_STRIP_HM_VALID;
-	}
-
-#ifdef VLAN_FILTER
-	if ((entry->l2flow.vlan_flags & VLAN_FILTERED)) {
-		info->l2_info.vlan_filtering = 1;
-		if (!(entry->l2flow.vlan_flags & VLAN_UNTAGGED)) {
-			/* Add tag */
-			info->flags |= VLAN_ADD_HM_VALID;
-			info->l2_info.num_egress_vlan_hdrs = 1;
-			info->l2_info.egress_vlan_hdrs[0].tpid = ETHERTYPE_VLAN;
-			info->l2_info.egress_vlan_hdrs[0].tci = entry->l2flow.vid;
-			info->vlan_ids[0] = info->l2_info.egress_vlan_hdrs[0].tci;
-			/* For egress tagged, if inner vlan present, then it is double tagged.
-			   info->ethtype is set accordingly to use it further while filling insert_remove_vlan_hm */
-			if (entry->l2flow.cvlan_tag) {
-				info->eth_type = ETHERTYPE_VLAN;
-			}
-		}
-		else {
-			/* Do not add the tag*/
-			info->l2_info.num_egress_vlan_hdrs = 0;
-			/* For egress untagged, if  vlan present, then it is double tagged.
-			   info->ethtype is set accordingly to use it further while filling create_ethernet_hm*/
-			if (entry->l2flow.svlan_tag) {
-				info->eth_type = ETHERTYPE_VLAN;
-			}
-		}
-	}
-	else if (info->l2_info.num_egress_vlan_hdrs)
-#endif
-	{
-
-		info->flags |= VLAN_ADD_HM_VALID;
-		for (ii = 0; ii < info->l2_info.num_egress_vlan_hdrs; ii++) {
-			info->vlan_ids[ii] =
-				(info->l2_info.egress_vlan_hdrs[ii].tci);
-		}
-	}
-
-	if(info->flags & (VLAN_STRIP_HM_VALID | VLAN_ADD_HM_VALID))
-		rebuild_l2_hdr = 1;
-
-
-	if(rebuild_l2_hdr) { 
-		/* strip Eth hdr */
-		if (create_strip_eth_hm(info ))
-			return FAILURE;
-	}
-	/* strip vlan headers in the ingress packet */
-#ifdef VLAN_FILTER
-	if ((entry->l2flow.vlan_flags & VLAN_FILTERED)) {
-		/* Always try to strip outer vlan header if present */
-		if (insert_remove_outer_vlan_hm(info, ifdesc->itf->index, 0 )) {
-			DPA_ERROR("%s::unable to strip outer vlan header\n", __func__);
-			return FAILURE;
-		}
-	}
-	else {
-#endif
-		if (insert_remove_vlan_hm(info, ifdesc->itf->index, 0 )) {
-			DPA_ERROR("%s::unable to strip vlan header\n", __func__);
-			return FAILURE;
-		}
-	}
-
-	if (info->l2_info.num_egress_vlan_hdrs) {
-		printk("VLAN hm insert\n");
-		if (create_vlan_ins_hm(info))
-			return FAILURE;
-	}
-
-
-	if(rebuild_l2_hdr)
-		if(create_ethernet_hm(info, rebuild_l2_hdr))
-			return FAILURE;
-
-	if(create_enque_hm(info))
-		return FAILURE;
-	return SUCCESS;
+	if (!index)
+		return 0;
+	return get_logical_ifstats_base() +
+		((index & ~STATS_WITH_TS) * sizeof(struct en_ehash_stats_with_ts));
 }
-
-int add_l2flow_to_hw(struct L2Flow_entry *entry)
-{
-	int retval;
-	POnifDesc ifdesc, oifdesc; 
-	uint32_t flags;
-	uint32_t fm_idx;
-	uint32_t port_idx;
-	void *td;
-	uint8_t *ptr;
-	struct ins_entry_info *info;
-	struct hw_ct *ct;
-	uint32_t portid;
-	struct en_exthash_tbl_entry *tbl_entry;
-
-	if((ifdesc = get_onif_by_name(&entry->in_ifname[0])) == NULL) {
-		DPA_ERROR("%s::%d unable to validate in iface %s\n", 
-				__func__, __LINE__, &entry->in_ifname[0]);
-		return FAILURE;
-	}
-	if (dpa_get_fm_port_index(ifdesc->itf->index,0, &fm_idx,
-				&port_idx, &portid)) {
-		DPA_ERROR("%s::%d unable to get fmindex for iface %s\n",
-				__func__, __LINE__, &entry->in_ifname[0]);
-		return FAILURE;
-	}
-
-	//get table handle	
-	td = dpa_get_tdinfo(fm_idx, portid, ETHERNET_TABLE);
-	if (td == NULL) {
-		DPA_ERROR("%s::%d unable to get td for out iface %s\n",
-				__func__, __LINE__, &entry->in_ifname[0]); 
-		return FAILURE;
-	}
-
-	if((oifdesc = get_onif_by_name(&entry->out_ifname[0])) == NULL){
-		DPA_ERROR("%s::unable to validate iface %s\n", __func__,
-				&entry->out_ifname[0]);
-		return FAILURE;
-	}
-
-	info = kzalloc(sizeof(struct ins_entry_info), GFP_KERNEL);
-	if (!info) {
-		DPA_ERROR("%s::unable to allocate mem for info\n",
-				__func__);
-		return FAILURE;
-	}
-	info->td = td;
-	tbl_entry = NULL;
-	info->entry = entry;
-	//allocate hw entry
-	entry->ct = (struct hw_ct *)kzalloc(sizeof(struct hw_ct) , GFP_KERNEL);
-	if (!entry->ct) {
-		DPA_ERROR("%s::unable to alloc mem for hw_ct\n",
-				__func__);
-		goto err_ret;
-	}
-	ct = entry->ct;
-	ct->handle = NULL;
-	ct->td = td;
-
-	/* Get ingress l2 information */
-	if (dpa_check_for_logical_iface_types(ifdesc->itf, NULL, &info->l2_info, NULL)) {
-		DPA_ERROR("%s::get_iface_type failed iface %d\n", __func__,  ifdesc->itf->index);
-		goto err_ret;
-	} 
-
-	/* Get egress l2 information */
-	if (dpa_get_tx_l2info_by_itf(&info->l2_info, oifdesc, (uint32_t)entry->hash))
-	{
-		DPA_ERROR("%s::unable to get tx params\n",__func__);
-		goto err_ret;
-	}
-
-	//allocate hash table entry
-	tbl_entry = ExternalHashTableAllocEntry(info->td);
-	if (!tbl_entry) {
-		DPA_ERROR("%s::unable to alloc hash tbl memory\n",
-				__func__);
-		goto err_ret;
-	}
-#ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: hash tbl entry %p\n", __func__, tbl_entry);
 #endif
-	{
-		union dpa_key *key;
-
-		//fill key info
-		key = (union dpa_key *)&tbl_entry->hashentry.key[0];
-		//portid added to key
-		key->portid = portid;
-		//fill mac addresses and type
-		memcpy(&key->ether_key.ether_da[0], &entry->l2flow.da[0], ETH_ALEN);
-		memcpy(&key->ether_key.ether_sa[0], &entry->l2flow.sa[0], ETH_ALEN);
-		key->ether_key.ether_type = (entry->l2flow.ethertype); 
-		memcpy(&info->l2_info.l2hdr[0], &entry->l2flow.da[0], ETH_ALEN);
-		memcpy(&info->l2_info.l2hdr[ETH_ALEN], &entry->l2flow.sa[0], ETH_ALEN);
-	}
-	//round off keysize to next 4 bytes boundary
-	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];
-	ptr += ALIGN((sizeof(struct ethernet_key) + 1), TBLENTRY_OPC_ALIGN);
-	//set start of opcode list
-	info->opcptr = ptr;
-	//ptr now after opcode section
-	ptr += MAX_OPCODES;
-
-	flags = 0;
-	//set offset to first opcode
-	SET_OPC_OFFSET(flags, (uint32_t)(info->opcptr - (uint8_t *)tbl_entry));
-	//set param offset
-	SET_PARAM_OFFSET(flags, (uint32_t)(ptr - (uint8_t *)tbl_entry));
-#ifdef ENABLE_FLOW_TIME_STAMPS
-	SET_TIMESTAMP_ENABLE(flags);
-	tbl_entry->hashentry.timestamp_counter = 
-		cpu_to_be32(dpa_get_timestamp_addr(EXTERNAL_TIMESTAMP_TIMERID));
-	tbl_entry->hashentry.timestamp = cpu_to_be32(JIFFIES32);
-	entry->ct->timestamp = JIFFIES32;
-#endif
-#ifdef ENABLE_FLOW_STATISTICS
-	SET_STATS_ENABLE(flags);
-#endif
-	//param_ptr now points after timestamp location
-	tbl_entry->hashentry.flags = cpu_to_be16(flags);
-	//param pointer and opcode pointer now valid
-	info->paramptr = ptr;
-	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - GET_PARAM_OFFSET(flags));
-	//disable frag
-	info->l2_info.mtu = 0xffff;
-	info->eth_type = ntohs(entry->l2flow.ethertype);
-	info->port_id = portid;
-
-	/* fill actions required by entry*/
-	if (fill_bridge_actions(info, ifdesc)) {
-		DPA_ERROR("%s::unable to fill actions\n", __func__);
-		goto err_ret;
-	}
-	/* add entry to table */
-	retval = ExternalHashTableAddKey(info->td, 
-			(sizeof(struct ethernet_key) + 1), tbl_entry);
-	if (retval == -1) {
-		DPA_ERROR("%s::unable to add table entry\n", __func__);
-		goto err_ret;
-	}
-	entry->ct->index = retval;
-	/* save handle for delete */
-	ct->handle = tbl_entry;
-	kfree(info);
-	return SUCCESS;
-err_ret:
-	if (tbl_entry) {
-		ExternalHashTableEntryFree(tbl_entry);
-	}
-	if (entry->ct) {
-		kfree(entry->ct);
-		/* Same reason as the CT sibling: a stale pointer here is a UAF
-		 * for anything that later inspects or tears down the flow. */
-		entry->ct = NULL;
-	}
-	kfree(info);
-	return FAILURE;
-}
 
 static int create_pppoe_ins_hm(struct ins_entry_info *info)
 {
-	struct en_ehash_insert_pppoe_hdr *param;	
+	struct en_ehash_insert_pppoe_hdr *param;
 	uint32_t word;
 
 	if (info->opc_count == MAX_OPCODES)
@@ -1697,18 +1816,13 @@ static int create_pppoe_ins_hm(struct ins_entry_info *info)
 	/* Update the Ethertype now PPPoE is the outermost header  */
 	info->eth_type = ETHERTYPE_PPPOE;
 #ifdef INCLUDE_PPPoE_IFSTATS
-	{
-		uint8_t offset;
-
-		offset = (info->l2_info.pppoe_stats_offset & ~STATS_WITH_TS);
-		word = (get_logical_ifstats_base() + 
-				(offset * sizeof(struct en_ehash_stats_with_ts)));
-		param->stats_ptr = cpu_to_be32(word);
-	}
+	/* The session names its own record in the description, or names none. */
+	param->stats_ptr =
+		cpu_to_be32(pppoe_stats_pointer(info->l2_info.pppoe_stats_offset));
 #else
-	param->stats_ptr = 0;	
+	param->stats_ptr = 0;
 #endif
-	word = ((PPPoE_VERSION << 28) | (PPPoE_TYPE << 24) | (PPPoE_CODE << 16) | 
+	word = ((PPPoE_VERSION << 28) | (PPPoE_TYPE << 24) | (PPPoE_CODE << 16) |
 			(info->l2_info.pppoe_sess_id));
 	param->word = cpu_to_be32(word);
 	return SUCCESS;
@@ -1730,14 +1844,11 @@ static int create_vlan_ins_hm(struct ins_entry_info *info)
 	l2_info = &(info->l2_info);
 	param = (struct en_ehash_insert_vlan_hdr *)info->paramptr;
 	num_egress_vlan_hdrs = l2_info->num_egress_vlan_hdrs;
-	/* dscp vlan pcp mapping enabled. */
-	if (l2_info->dscp_vlanpcp_map_enable) {
-		word = (1 << 30); /* Enable dscp vlanpcp map_enable bit in opcode */
-	}
-	else
-		word = 0; /* Disable dscp vlanpcp map_enable bit in opcode */
+	/* Bit 30, the microcode's DSCP-to-PCP rewrite, stays clear: nothing
+	 * programs that map. */
+	word = 0;
 
-	param_size = (sizeof(struct en_ehash_insert_vlan_hdr) + 
+	param_size = (sizeof(struct en_ehash_insert_vlan_hdr) +
 			(num_egress_vlan_hdrs * sizeof(uint32_t)));
 	if (param_size > info->param_size)
 		return FAILURE;
@@ -1758,9 +1869,10 @@ static int create_vlan_ins_hm(struct ins_entry_info *info)
 	/* already set to 0(NULL), so we can skip the stats.*/
 	if (!l2_info->egress_vlan_hdrs[0].tci)
 		goto skip_stats;
-#ifdef VLAN_FILTER
-	if (!l2_info->vlan_filtering)
-#endif
+	/* Only a flow describes egress tags (apply_l2_encap()), and it names
+	 * a record for every tag or names none. */
+	if (!vlan_flow_stats_named(l2_info->vlan_stats_offsets, num_egress_vlan_hdrs))
+		goto skip_stats;
 	{
 		uint8_t *st_ptr;
 
@@ -1769,14 +1881,19 @@ static int create_vlan_ins_hm(struct ins_entry_info *info)
 			st_ptr = (uint8_t *)((uint32_t *)ptr + (num_egress_vlan_hdrs ));
 			param_size = ALIGN(param_size + num_egress_vlan_hdrs, sizeof(uint32_t));
 			if (param_size > info->param_size)
-				return FAILURE;	
+				return FAILURE;
 			/* add stats base */
 			word |= (get_logical_ifstats_base());
-			for (ii = num_egress_vlan_hdrs - 1 ; ii >=0 ; ii--) {
-				*st_ptr = l2_info->vlan_stats_offsets[ii];
-				/* save offset reversed order so that uCode can update easily */
-				st_ptr++;
-			}
+			/* The ucode inserts the innermost header first and counts
+			 * the k-th record with the frame as it stands after the
+			 * k-th insertion (measured: a frame ending at 306 bytes
+			 * reads 302 in the first record and 306 in the second).
+			 * Listing the records innermost first therefore gives each
+			 * VLAN device the frame with its own tag on and the tags
+			 * inside it, which is what the device's own transmit
+			 * counter would have shown. */
+			for (ii = 0; ii < (int32_t)num_egress_vlan_hdrs; ii++)
+				*st_ptr++ = l2_info->vlan_stats_offsets[ii];
 		} else {
 			/* single Vlan header, add stats ptr directly */
 			word |= (get_logical_ifstats_base() + 
@@ -1854,34 +1971,20 @@ static int create_ethernet_hm(struct ins_entry_info *info, uint32_t update_ethty
 	return SUCCESS;
 }
 
-static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_index)
+static int insert_remove_pppoe_hm(struct ins_entry_info *info)
 {
 	uint32_t param_size;
 	struct en_ehash_strip_pppoe_hdr *param;
 	uint32_t stats_ptr;
-	PCtEntry ctentry;
 
 	param = (struct en_ehash_strip_pppoe_hdr *)info->paramptr;
 	param_size = sizeof(struct en_ehash_strip_pppoe_hdr);
 	if (param_size > info->param_size)
 		return FAILURE;
-	ctentry = info->entry;
 #ifdef INCLUDE_PPPoE_IFSTATS
-	{
-		uint8_t offset;
-
-		if (dpa_get_iface_stats_entries(itf_index, 0, &offset, RX_IFSTATS, IF_TYPE_PPPOE)) {
-			DPA_ERROR("%s::unable to get stats offset on pppoe iface on ingress\n",
-					__func__);
-			return FAILURE;
-		}
-		offset &= ~STATS_WITH_TS;
-		stats_ptr = (get_logical_ifstats_base() + 
-				(offset * sizeof(struct en_ehash_stats_with_ts)));
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __func__, stats_ptr);
-#endif
-	}
+	/* The session names its receive record in the description, or names
+	 * none. */
+	stats_ptr = pppoe_stats_pointer(info->l2_info.pppoe_rx_stats_offset);
 #else
 	stats_ptr = 0;
 	DPA_INFO("%s:PPPoE ingress stats disabled\n", __func__);
@@ -1897,35 +2000,6 @@ static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_inde
 	return SUCCESS;
 }
 
-#ifdef VLAN_FILTER
-static int insert_remove_outer_vlan_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index)
-{
-	uint32_t param_size;
-	struct en_ehash_strip_first_vlan_hdr *param;
-	struct L2Flow_entry *entry;
-
-	param = (struct en_ehash_strip_first_vlan_hdr *)info->paramptr;
-	param_size = sizeof(struct en_ehash_strip_first_vlan_hdr);
-
-	if (param_size > info->param_size)
-                return FAILURE;
-
-	entry = (struct L2Flow_entry *)info->entry;
-
-	param->stats_ptr = 0;
-	param->vlan_id = cpu_to_be16(entry->l2flow.vid);
-
-	/* add opcode */
-	*(info->opcptr) = STRIP_FIRST_VLAN_HDR;
-	/* adjust opc, param ptrs and size */
-	info->opc_count++;
-	info->opcptr++;
-	info->param_size -= param_size;
-	info->paramptr += param_size;
-	return SUCCESS;
-}
-#endif
-
 static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index)
 {
 	uint32_t param_size;
@@ -1934,51 +2008,72 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 	uint32_t word;
 	int i = 0;
 
+	if (info->opc_count >= MAX_OPCODES)
+		return FAILURE;
 	param = (struct en_ehash_strip_all_vlan_hdrs *)info->paramptr;
 	param_size = sizeof(struct en_ehash_strip_all_vlan_hdrs);
+	if (info->sec_tag) {
+		/* SEC already removed the ingress encapsulation. Validate and
+		 * strip only its internal identity; no user VLAN statistics. */
+		if (param_size > info->param_size)
+			return FAILURE;
+		memset(param, 0, param_size);
+		param->vlan_id[0] = cpu_to_be16(info->sec_tag);
+		goto emit_strip_vlan;
+	}
+
 #ifdef INCLUDE_VLAN_IFSTATS
-	{
+	if (info->l2_info.vlan_flow_ifstats) {
+		/* The flow names its own records, or none. The list is laid out
+		 * outermost first, the order vlan_id[] below uses: the ucode
+		 * strips the outer tag first and counts the k-th record with
+		 * the frame as it stands after the k-th strip (measured: a
+		 * 306-byte double-tagged frame reads 302 in the first record
+		 * and 298 in the second), so this order gives each VLAN device
+		 * the frame with its own tag off, which is what the device's own
+		 * receive counter would have shown once the Ethernet header is
+		 * taken off too. Without records the word is the vendor's own
+		 * statistics-disabled encoding. */
 		uint32_t padding;
+
+		num_entries = info->l2_info.num_ingress_vlan_hdrs;
+		if (!vlan_flow_stats_named(info->l2_info.ingress_vlan_stats_offsets,
+					   num_entries))
+			num_entries = 0;
+		if (num_entries > 1) {
+			padding = PAD(num_entries, sizeof(uint32_t));
+			param_size += (padding + num_entries);
+			if (param_size > info->param_size)
+				return FAILURE;
+			for (i = 0; i < num_entries; i++)
+				param->stats_offsets[i] =
+					info->l2_info.ingress_vlan_stats_offsets[num_entries - 1 - i];
+			word = ((padding << 30) | (num_entries << 24) | get_logical_ifstats_base());
+		} else {
+			if (param_size > info->param_size)
+				return FAILURE;
+			word = 0;
+			if (num_entries == 1)
+				word = ((1 << 24) | (get_logical_ifstats_base() +
+					(info->l2_info.ingress_vlan_stats_offsets[0] *
+					 sizeof(struct en_ehash_stats))));
+		}
+	} else {
+		/* A flow that named no encapsulation at all, or a multicast group
+		 * with an untagged ingress: nothing to strip and no record to
+		 * count. The port must still be a registered one, which has no
+		 * VLAN records of its own (dpa_get_num_vlan_iface_stats_entries()
+		 * counts none and refuses anything else), so the word is the
+		 * statistics base with a count of zero. */
 		if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
 					&num_entries)) {
 			DPA_ERROR("%s::unable to get number on vlan iface on ingress\n",
 					__func__);
 			return FAILURE;
 		}
-		if (num_entries > 1) {
-			padding = PAD(num_entries, sizeof(uint32_t));
-			param_size += (padding + num_entries);
-			//check if we have room
-			if (param_size > info->param_size)
-				return FAILURE;
-			word = ((padding << 30) | (num_entries << 24)| get_logical_ifstats_base());
-			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
-						&param->stats_offsets[0], RX_IFSTATS, IF_TYPE_VLAN)) {
-				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__func__);
-				return FAILURE;
-			}
-		} else {
-			uint8_t offset;
-
-			padding = 0;
-			//check if we have room
-			if (param_size > info->param_size)
-				return FAILURE;
-			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index,
-						&offset, RX_IFSTATS, IF_TYPE_VLAN)) {
-				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__func__);
-				return FAILURE;
-			}
-			word = ((num_entries << 24) |
-					(get_logical_ifstats_base() + 
-					 (offset * sizeof(struct en_ehash_stats))));
-		}
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::padding %d, stats ptr %x, num_entries %d\n", \
-				__func__, padding, (word & 0xffffff), num_entries);
-#endif
+		if (param_size > info->param_size)
+			return FAILURE;
+		word = get_logical_ifstats_base();
 	}
 #else
 	if (param_size > info->param_size)
@@ -1997,24 +2092,7 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 		}
 	}
 
-	/* Physical interface(non-vlan interface) that is part of bridge can accept packets having without vlan tags.
-	   where as in routing, untagged packets should not be accepted by VLAN logical interface.*/
-	if(info->flags & EHASH_BRIDGE_FLOW)
-	{
-		if (!info->l2_info.vlan_present)
-			param->op_flags |= OP_SKIP_VLAN_VALIDATE;
-	}
-
-#ifdef VLAN_FILTER
-	/* When vlan filtering is enabled on a bridge(rx) and PVID is set for that flow, packets are allowed to forward*/
-	if(info->flags & ROUTE_FLOW_VLAN_FIL_EN)
-	{
-		param->op_flags |= OP_VLAN_FILTER_EN;
-		if(info->flags & ROUTE_FLOW_PVID_SET)
-			param->op_flags |= OP_VLAN_FILTER_PVID_SET;
-	}
-#endif
-
+emit_strip_vlan:
 	//add opcode
 	*(info->opcptr) = STRIP_ALL_VLAN_HDRS;
 	//adjust opc, param ptrs and size
@@ -2026,59 +2104,31 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 }
 
 
-/* Removes all logical headers retaining the Ethernet header as required by Sec, While stripping the headers,
- *  stats is also handled */
-
+/* Strip every header between the Ethernet header, which SEC wants kept, and
+ * the outer IP one. Only an inbound SA's entry takes this, and nothing
+ * describes a tag or a session for one -- dpa_get_l2l3_info_by_itf_id() fills
+ * in neither -- so there are no VLAN ids to validate and no records to list:
+ * the word is the statistics base with a count of zero, on a port that must be
+ * a registered one. */
 static int insert_remove_l2_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index)
 {
 	uint32_t param_size;
 	struct en_ehash_strip_l2_hdrs *param;
 	uint32_t num_entries;
 	uint32_t word;
-	uint8_t i = 0;
 
 	param = (struct en_ehash_strip_l2_hdrs*)info->paramptr;
 	param_size = sizeof(struct en_ehash_strip_l2_hdrs);
 #ifdef INCLUDE_VLAN_IFSTATS
-	{
-		uint32_t padding;
-		if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
-					&num_entries)) {
-			DPA_ERROR("%s::unable to get number on vlan iface on ingress\n",
-					__func__);
-			return FAILURE;
-		}
-		if (num_entries > 0) {
-			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
-						&param->stats_offsets[0], RX_IFSTATS, IF_TYPE_VLAN)) {
-				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__func__);
-				return FAILURE;
-			}
-		} 
-		if(info->l2_info.pppoe_present){
-			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
-						&param->stats_offsets[num_entries], RX_IFSTATS, IF_TYPE_PPPOE)) {
-				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__func__);
-				return FAILURE;
-			}
-			param->stats_offsets[num_entries++] &= ~STATS_WITH_TS;
-		}
-
-		padding = PAD(num_entries, sizeof(uint32_t));
-		param_size += (padding + num_entries);
-		/* check if we have room */
-		if (param_size > info->param_size)
-			return FAILURE;
-
-		word = ((padding << 30) | (num_entries << 24)| get_logical_ifstats_base());
-
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::padding %d, stats ptr %x, num_entries %d\n", \
-				__func__, padding, (word & 0xffffff), num_entries);
-#endif
+	if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
+				&num_entries)) {
+		DPA_ERROR("%s::unable to get number on vlan iface on ingress\n",
+				__func__);
+		return FAILURE;
 	}
+	if (param_size > info->param_size)
+		return FAILURE;
+	word = get_logical_ifstats_base();
 #else
 	if (param_size > info->param_size)
 		return FAILURE;
@@ -2086,15 +2136,6 @@ static int insert_remove_l2_hm(struct ins_entry_info *info, uint32_t iif_index, 
 	DPA_INFO("%s::Vlan / PPPoE ingress stats disabled\n", __func__);
 #endif
 	param->word = cpu_to_be32(word);
-	if( info->l2_info.num_ingress_vlan_hdrs)
-	{
-		/* Outer vlan id is stored first in param ptr and then inner vlan id.
-		This is for convenience in writing ucode to validate the vlan's.
-		In ucode first outer vlan is validated and then inner vlan */
-		for (i = 0 ; i < info->l2_info.num_ingress_vlan_hdrs; i++) {
-			param->vlan_id[i] = cpu_to_be16(info->l2_info.ingress_vlan_hdrs[info->l2_info.num_ingress_vlan_hdrs-i-1].tci);
-		}
-	}
 	*(info->opcptr) = STRIP_L2_HDR;
 	info->opc_count++;
 	info->opcptr++;
@@ -2255,7 +2296,20 @@ static int create_nat_hm(struct ins_entry_info *info)
 	info->opcptr++;
 	return ret;
 }
-static int create_tunnel_insert_hm(struct ins_entry_info *info) 
+#ifdef INCLUDE_TUNNEL_IFSTATS
+/* The statistics pointer a flow-described tunnel's opcodes carry: the record
+ * at the given index of the plain pool, or the null pointer for no record.
+ * Index zero is another owner's record, never "none". */
+static uint32_t tunnel_stats_pointer(uint8_t index)
+{
+	if (!index)
+		return 0;
+	return (get_logical_ifstats_base() +
+		(index * sizeof(struct en_ehash_stats))) & 0xffffff;
+}
+#endif
+
+static int create_tunnel_insert_hm(struct ins_entry_info *info)
 {
 	uint32_t size;
 	uint32_t word;
@@ -2296,28 +2350,8 @@ static int create_tunnel_insert_hm(struct ins_entry_info *info)
 	//TODO: routing destination offset is now 0
 	word = 0;
 #ifdef INCLUDE_TUNNEL_IFSTATS
-	{
-		uint8_t offset;
-		PCtEntry ctentry;
-
-		ctentry = info->entry;
-		if ((!ctentry) || (!ctentry->pRtEntry) || (!ctentry->pRtEntry->itf)) {
-			DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on egress\n",
-					__func__, __LINE__);
-			return FAILURE;
-		}
-		if (dpa_get_iface_stats_entries(ctentry->pRtEntry->itf->index, 0,
-					&offset, TX_IFSTATS, IF_TYPE_TUNNEL)) {
-			DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on egress\n",
-					__func__, __LINE__);
-			return FAILURE;
-		}
-		word |= ((get_logical_ifstats_base() +
-					(offset * sizeof(struct en_ehash_stats))) & 0xffffff);
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __func__, (word & 0xffffff));
-#endif
-	}
+	/* The tunnel names its own record in the description, or names none. */
+	word |= tunnel_stats_pointer(info->l3_info.tunnel_stats_offset);
 #endif
 	info->tnl_hdr_size += info->l3_info.header_size;
 	ptr->word_1 = cpu_to_be32(word);
@@ -2331,7 +2365,6 @@ static int create_tunnel_insert_hm(struct ins_entry_info *info)
 
 static int create_tunnel_remove_hm(struct ins_entry_info *info)
 {
-	PCtEntry ctentry;
 	struct en_ehash_remove_first_ip_hdr *param;
 	uint32_t word = 0;
 
@@ -2339,30 +2372,12 @@ static int create_tunnel_remove_hm(struct ins_entry_info *info)
 		return FAILURE;
 	if (sizeof(struct en_ehash_remove_first_ip_hdr) > info->param_size)
 		return FAILURE;
-	ctentry = info->entry;
 	param = (struct en_ehash_remove_first_ip_hdr *)info->paramptr;
 
-	if ((!ctentry) || (!ctentry->pRtEntry) || (!ctentry->pRtEntry->input_itf)) {
-		DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on ingress\n",
-				__func__, __LINE__);
-		return FAILURE;
-	}
-
 #ifdef INCLUDE_TUNNEL_IFSTATS
-	{
-		uint8_t offset;
-		if (dpa_get_iface_stats_entries(ctentry->pRtEntry->input_itf->index, 0,
-					&offset, RX_IFSTATS, IF_TYPE_TUNNEL)) {
-			DPA_ERROR("%s::unable to get stats offset on tunnel iface on ingress\n",
-					__func__);
-			return FAILURE;
-		}
-		word |= ((get_logical_ifstats_base() +
-                                (offset * sizeof(struct en_ehash_stats))) & 0xffffff);
-		DPA_INFO("%s::stats ptr %x\n", __func__, word);
-	}
-#else
-	word = 0;
+	/* The tunnel names its receive record in the description, or names
+	 * none. */
+	word |= tunnel_stats_pointer(info->l3_info.tunnel_rx_stats_offset);
 #endif
 	info->eth_type = Get_Tnl_Ethertype(info->l3_info.mode) & 0xFFFF;	
 	if (info->l3_info.tunnel_flags & DSCP_COPY)
@@ -2568,6 +2583,12 @@ static int create_enque_hm(struct ins_entry_info *info)
 		word |= (uint32_t)info->l2_info.rspid << 24;
 		param->word = cpu_to_be32(word);
 		param->fqid = cpu_to_be32(info->l2_info.fqid);
+	} else if (info->l2_info.no_tx_stats) {
+		/* Counted at enqueue, before QMan rejects it: a dropped frame
+		 * would read as one the port transmitted. No storage profile
+		 * either, which is the rest of the word. */
+		param->word = 0;
+		param->fqid = cpu_to_be32(info->l2_info.fqid);
 	} else {
 #ifdef INCLUDE_ETHER_IFSTATS
 		uint8_t offset;
@@ -2593,37 +2614,6 @@ static int create_enque_hm(struct ins_entry_info *info)
 	info->opcptr++;
 	info->param_size -= sizeof(struct en_ehash_enqueue_param);
 	info->paramptr += sizeof(struct en_ehash_enqueue_param);
-	return SUCCESS;
-}
-
-static int create_rtprelay_process_opcode(struct ins_entry_info *info, 
-				uint32_t *in_sockstats_ptr, uint32_t *rtpinfo_ptr,
-				uint32_t *out_sockstats_ptr, uint8_t opcode)
-{
-	struct en_ehash_rtprelay_param *param;
-	uint32_t ptr_val;
-	
-	if (info->opc_count == MAX_OPCODES)
-		return FAILURE;
-	if (sizeof(struct en_ehash_rtprelay_param) > info->param_size)
-		return FAILURE;
-	param = (struct en_ehash_rtprelay_param *)info->paramptr;
-	/* These are MURAM offsets consumed by the ucode, not kernel VAs: convert
-	 * via the MURAM base instead of truncating the 64-bit pointer. rtpinfo_ptr
-	 * is non-NULL by construction (its MURAM alloc is NULL-checked before the
-	 * flow is programmed); the two socket-stats pointers can be NULL (stats
-	 * disabled) and must map to 0 so the ucode reads "no pointer" —
-	 * MURAM_VIRT_TO_PHYS_ADDR(NULL) would yield a bogus non-zero offset. */
-	ptr_val = MURAM_VIRT_TO_PHYS_ADDR(rtpinfo_ptr);
-	param->rtpinfo_ptr =  cpu_to_be32(ptr_val);
-	ptr_val = in_sockstats_ptr ? MURAM_VIRT_TO_PHYS_ADDR(in_sockstats_ptr) : 0;
-	param->in_sock_stats_ptr =  cpu_to_be32(ptr_val);
-	ptr_val = out_sockstats_ptr ? MURAM_VIRT_TO_PHYS_ADDR(out_sockstats_ptr) : 0;
-	param->out_sock_stats_ptr =  cpu_to_be32(ptr_val);
-	*(info->opcptr) = opcode;
-	info->opcptr++;
-	info->param_size -= sizeof(struct en_ehash_rtprelay_param);
-	info->paramptr += sizeof(struct en_ehash_rtprelay_param);
 	return SUCCESS;
 }
 
@@ -2690,6 +2680,9 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			if (create_strip_eth_hm(info ))
 				return FAILURE;
 		}
+
+		if (info->sec_tag && insert_remove_vlan_hm(info, 0, 0))
+			return FAILURE;
 
 		if (info->l3_info.add_tnl_header) {
 			/* Insert Tnl header */
@@ -2762,43 +2755,129 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 	return SUCCESS;
 }
 
-struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
-	struct ins_entry_info *pInsEntryInfo, MC4Output	*pListener, struct en_exthash_tbl_entry* prev_tbl_entry, 
-	uint32_t tbl_type)
+/* Apply what a listener's copy owes to something other than its egress
+ * interface to the description create_ethernet_hm() writes the header from.
+ *
+ * A copy's Ethernet pair -- the one a bridged copy's root matched, or a routed
+ * copy's own, from the device ipmr sends it through -- replaces the egress
+ * port's address and the group's mapped destination the interface walk filled
+ * in. It is written over the walk's result rather than instead of the walk,
+ * because the walk still decides the transmit queue and the tags. A routed
+ * copy in a group whose root kept the hop count decrements it itself; see
+ * fill_mcast_member_actions(). */
+static void mcast_member_frame(struct ins_entry_info *info,
+			       const struct cdx_mc_member_frame *frame)
 {
-	POnifDesc onif_desc;
-	int fm_idx, port_idx;
+	if (!frame)
+		return;
+	if (frame->mac_pair)
+		memcpy(info->l2_info.l2hdr, frame->mac_pair, 2 * ETHER_ADDR_LEN);
+	if (frame->hop)
+		info->flags |= TTL_HM_VALID;
+}
+
+/* One copy's own hop-count decrement.
+ *
+ * The same opcode a routed root emits, emitted per copy instead: the root of
+ * a group that also bridges preserves the hop count for its bridged copies,
+ * so a routed copy in it has to take its hop off in its own entry. It runs
+ * first, while the frame still starts at its IP header -- the root stripped
+ * Ethernet and every insert below moves the start. The opcode's parameter is
+ * also the DSCP marking a flow's conntrack mark can ask for, which a replica
+ * has none of, so it is written zero, as a routed root without a mark writes
+ * it. */
+static int create_member_hop_hm(struct ins_entry_info *info)
+{
+	struct en_ehash_update_dscp *param;
+
+	if (info->param_size < sizeof(*param))
+		return FAILURE;
+	if (insert_opcodeonly_hm(info, (info->flags & EHASH_IPV6_FLOW) ?
+				 UPDATE_HOPLIMIT : UPDATE_TTL))
+		return FAILURE;
+	param = (struct en_ehash_update_dscp *)info->paramptr;
+	param->dscp = 0;
+	info->paramptr += sizeof(*param);
+	info->param_size -= sizeof(*param);
+	return SUCCESS;
+}
+
+/* Builds one listener's entry in a multicast group's replication chain.
+ *
+ * The scratch state is allocated here rather than supplied by the caller, and
+ * that is load-bearing rather than tidiness. struct ins_entry_info carries the
+ * write cursor into *one* entry's fixed opcode and parameter area -- opcptr,
+ * paramptr, param_size and opc_count together -- so it describes the entry
+ * being built and nothing that outlives it. Both mcast callers used to declare
+ * one on the stack, memset it once, and hand the same pointer to every listener
+ * in the group; three quarters of that cursor were then re-based per entry and
+ * opc_count was not, so the opcode budget of a 16-slot area was shared across
+ * every listener of the group. It never tripped, because each command that
+ * built a group then named at most five listeners and came with a fresh
+ * struct -- but the headroom was six opcodes and the accounting was wrong.
+ *
+ * Owning it here removes the class rather than the four instances of it:
+ * tnl_hdr_size accumulates with +=, flags is only ever OR-ed, and preempt_params
+ * would be left pointing into the previous listener's entry for any future path
+ * that emitted a preemptive check. Every other entry builder in this file
+ * already allocates its own; this was the only loop that did not.
+ *
+ * `encap` names the VLAN tags this listener's frames leave with, or is NULL to
+ * take them from the egress interface. No VLAN interface is registered for a
+ * tagged listener to walk, so the caller says what it wants instead -- the same
+ * reasoning, and the same struct, as a flowtable direction's tag stack.
+ *
+ * The listener arrives already resolved, as an onif and the netdev whose MTU
+ * the enqueue opcode carries: the caller holds a netdev and finds the onif by
+ * index. `dev` is borrowed and the caller holds it across the call.
+ *
+ * `frame` is what the copy's framing owes to something other than its egress
+ * interface; see struct cdx_mc_member_frame.
+ */
+struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
+	POnifDesc onif_desc, struct net_device *dev, const struct cdx_l2_encap *encap,
+	const struct cdx_mc_member_frame *frame,
+	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type,
+	uint32_t discard_fqid)
+{
+	struct ins_entry_info *pInsEntryInfo;
 	struct dpa_l2hdr_info *pL2Info;
 	struct dpa_l3hdr_info *pL3Info;
 	struct en_exthash_tbl_entry *tbl_entry = NULL;
-	struct net_device *dev;
 	uint64_t phyaddr;
 	uint16_t flags;
 	uint8_t *ptr;
 
-	DPA_INFO("%s(%d) listener output device %s\n",__func__,__LINE__,pListener->output_device_str);
-	onif_desc = get_onif_by_name(pListener->output_device_str); 
-	if (!onif_desc)
-	{
-		DPA_ERROR("%s::unable to get onif for iface %s\n", __func__, pListener->output_device_str);
-		goto err_ret;
-	}
+	if (!onif_desc || !onif_desc->itf || !dev)
+		return NULL;
 
+	pInsEntryInfo = kzalloc(sizeof(struct ins_entry_info), GFP_KERNEL);
+	if (!pInsEntryInfo)
+		return NULL;
 
+	DPA_INFO("%s(%d) listener output device %s\n",__func__,__LINE__,dev->name);
 	DPA_INFO("%s(%d) onif_desc->itf->index %d\n",__func__,__LINE__,onif_desc->itf->index);
-	if(dpa_get_fm_port_index(onif_desc->itf->index,0, &fm_idx, &port_idx, &pInsEntryInfo->port_id))
+	/* Into the struct's own fields, not into locals copied over afterwards:
+	 * dpa_get_tdinfo() below reads fm_idx, and the copy used to happen ten
+	 * lines later. Every entry therefore selected its table descriptor with
+	 * the previous listener's FMAN index, or with zero on the first one.
+	 * Invisible on a single-FMAN part and wrong on any other. */
+	if(dpa_get_fm_port_index(onif_desc->itf->index, 0, &pInsEntryInfo->fm_idx,
+				&pInsEntryInfo->port_idx, &pInsEntryInfo->port_id))
 	{
 		DPA_ERROR("%s::unable to get fmindex for itfid %d\n",__func__, onif_desc->itf->index);
 		goto err_ret;
 	}
 
-	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__func__,__LINE__,fm_idx, port_idx, pInsEntryInfo->port_id);
-	pInsEntryInfo->fm_pcd = dpa_get_pcdhandle(fm_idx);
+	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__func__,__LINE__,
+			pInsEntryInfo->fm_idx, pInsEntryInfo->port_idx, pInsEntryInfo->port_id);
+	pInsEntryInfo->fm_pcd = dpa_get_pcdhandle(pInsEntryInfo->fm_idx);
 	if (!pInsEntryInfo->fm_pcd)
 	{
-		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__func__, fm_idx);
+		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__func__,
+				pInsEntryInfo->fm_idx);
 		goto err_ret;
-	} 
+	}
 
 	DPA_INFO("%s(%d) fm_pcd %p \n",__func__,__LINE__, pInsEntryInfo->fm_pcd);
 	//get table descriptor based on type and port
@@ -2812,8 +2891,6 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 
 	//Code to create hm for mcast single member
 
-	pInsEntryInfo->fm_idx = fm_idx;
-	pInsEntryInfo->port_idx = port_idx;
 	pL2Info = &pInsEntryInfo->l2_info;
 	pL3Info = &pInsEntryInfo->l3_info;
 
@@ -2829,25 +2906,35 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 		union ctentry_qosmark qosmark;
 
 		qosmark.markval = 0;
-		if (dpa_get_tx_info_by_itf(pRtEntry, pL2Info, pL3Info, NULL, &qosmark, 0))
+		if (dpa_get_tx_info_by_itf(pRtEntry, pL2Info, pL3Info, &qosmark, 0))
 		{
 			DPA_ERROR("%s::unable to get tx params\n",__func__);
 			goto err_ret;
 		}
 	}
 	DPA_INFO("dpa_get_tx_info_by_itf success\n");
-	dev = dev_get_by_name(&init_net, pListener->output_device_str);
-	if(dev == NULL)
-	{
+	/* After the interface walk, which is what apply_l2_encap() refuses to
+	 * overwrite: a listener either names its tags or is described by an
+	 * interface that carries them, never both. */
+	if (encap && apply_l2_encap(pInsEntryInfo, encap))
 		goto err_ret;
-	}
-
+	mcast_member_frame(pInsEntryInfo, frame);
 	pL2Info->mtu = dev->mtu;
+	/* A discard member: the entry a listener's would be, built on the
+	 * group's own ingress port, enqueueing to the discard queue instead of
+	 * the port's. No frame of any size is excepted to the CPU, which is what
+	 * the member exists to spare, and the DSCP map, which picks a queue of
+	 * the port's, stays out of it. */
+	if (discard_fqid) {
+		pL2Info->fqid = discard_fqid;
+		pL2Info->is_dscp_fq_map = 0;
+		pL2Info->mtu = 0xffff;
+		pL2Info->no_tx_stats = 1;
+	}
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s:: mtu %d\n", __func__, dev->mtu);
 #endif
 
-	dev_put(dev);
 	//allocate hash table entry
 	tbl_entry = ExternalHashTableAllocEntry(pInsEntryInfo->td);
 	if (!tbl_entry) {
@@ -2874,9 +2961,12 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 	tbl_entry->hashentry.flags = cpu_to_be16(flags);
 	//param pointer and opcode pointer now valid
 	pInsEntryInfo->paramptr = ptr;
-	pInsEntryInfo->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
+	pInsEntryInfo->param_size = (MAX_EN_EHASH_ENTRY_SIZE -
 			GET_PARAM_OFFSET(flags));
-	if(tbl_type == IPV6_MULTICAST_TABLE)
+	/* The family is the table's, and a bridged group's listeners come from
+	 * the bridged tables: the rebuilt header's EtherType is chosen by it. */
+	if (tbl_type == IPV6_MULTICAST_TABLE ||
+	    tbl_type == IPV6_BRIDGED_MULTICAST_TABLE)
 		pInsEntryInfo->flags |= EHASH_IPV6_FLOW;
 
 	if (fill_mcast_member_actions(pRtEntry, pInsEntryInfo)) {
@@ -2897,8 +2987,10 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 		prev_tbl_entry->hashentry.next_entry_hi = cpu_to_be16((phyaddr >> 32) & 0xffff);
 		prev_tbl_entry->hashentry.next_entry_lo = cpu_to_be32((phyaddr & 0xffffffff));
 	}
+	kfree(pInsEntryInfo);
 	return tbl_entry;
 err_ret:
+	kfree(pInsEntryInfo);
 	if (tbl_entry)
 		ExternalHashTableEntryFree(tbl_entry);
 	return NULL;
@@ -2915,8 +3007,6 @@ static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info
 	DPA_INFO("%s:: entry %p, opc_ptr %p, param_ptr %p, size %d\n", 
 			__func__, pRtEntry, info->opcptr, info->paramptr, info->param_size);
 #endif
-
-	//routing and ttl decr are mandatory
 
 	/*  Addition of IP header requires the header to be inserted at the start of the packet.
 			So we need to strip and rebuild the l2 header after tunnel header insertion. */
@@ -2939,9 +3029,13 @@ static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info
 	}
 	//fill all opcodes and parameters
 	while(1) {
+		/* A routed copy of a group whose root kept the hop count. */
+		if ((info->flags & TTL_HM_VALID) && create_member_hop_hm(info))
+			break;
+
 		if (info->l3_info.add_tnl_header) {
 			/* Insert Tnl header */
-			if (create_tunnel_insert_hm(info)) 
+			if (create_tunnel_insert_hm(info))
 				break;
 		}
 
@@ -3260,687 +3354,3 @@ void cdx_deinit_fragment_bufpool()
 	}
 	return;
 }
-
-static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket,
-						PRTPflow pFlow, struct ins_entry_info *info)
-{
-	uint32_t ii; 
-	uint32_t rebuild_l2_hdr = 0;
-	uint8_t opcode;
-	uint32_t iif_index = 0, underlying_iif_index = 0;
-
-
-#ifdef CDX_DPA_DEBUG
-	DPA_INFO(" opc_ptr %p, param_ptr %p, size %d dport %d , (pToSocket->Dport mod 2) %d\n", 
-			info->opcptr, info->paramptr, info->param_size,
-			htons(pToSocket->Dport), (htons(pToSocket->Dport) % 2));
-#endif
-
-
-	//routing and ttl decr are mandatory
-
-	//mask it as ipv6 flow if required
-	if (pFromSocket->SocketFamily == PROTO_IPV6)
-		info->flags |= EHASH_IPV6_FLOW;
-	// setting TTL bit
-	info->flags |= TTL_HM_VALID;
-
-	if (!pFromSocket->pRtEntry)
-	{
-		DPA_ERROR("%s(%d) socket route entry is NULL.\n",
-				__func__, __LINE__);
-		return FAILURE;
-	}
-	//strip vlan on ingress if incoming iface is vlan
-	//	if (info->l2_info.vlan_present)
-	if (cdx_check_rx_iface_type_vlan(pFromSocket->pRtEntry->itf))
-		info->flags |= VLAN_STRIP_HM_VALID;
-
-	//strip pppoe on ingress if incoming iface is pppoe 
-	if (info->l2_info.pppoe_present)
-		info->flags |= PPPoE_STRIP_HM_VALID;
-
-	if(L2_L3_HDR_OPS(info))
-		rebuild_l2_hdr = 1;
-
-	info->flags |= NAT_HM_REPLACE_SPORT;
-	info->flags |= NAT_HM_REPLACE_DPORT;
-	info->flags |= NAT_HM_REPLACE_SIP;
-	info->flags |= NAT_HM_REPLACE_DIP;
-	switch(pFromSocket->proto) 
-	{
-		case IPPROTOCOL_TCP:
-		case IPPROTOCOL_UDP:
-			info->nat_sport = pToSocket->Dport;
-			info->nat_dport = pToSocket->Sport;
-			break;
-		default:
-			break; 
-	}
-
-	//ip replacement have to be done
-	//nat sip if required
-
-	if (pFromSocket->SocketFamily == PROTO_IPV6)
-	{
-		memcpy(info->v6.nat_sip, pToSocket->Daddr_v6 ,IPV6_ADDRESS_LENGTH);
-		memcpy(info->v6.nat_dip, pToSocket->Saddr_v6 ,IPV6_ADDRESS_LENGTH);
-	}
-	else 
-	{
-		info->v4.nat_sip = pToSocket->Daddr_v4;
-		info->v4.nat_dip = pToSocket->Saddr_v4;
-	}
-	if (info->l2_info.num_egress_vlan_hdrs)
-	{
-
-		info->flags |= VLAN_ADD_HM_VALID;
-		for (ii = 0; ii < info->l2_info.num_egress_vlan_hdrs; ii++) {
-			info->vlan_ids[ii] =
-				(info->l2_info.egress_vlan_hdrs[ii].tci);
-		}
-	}
-	//fill all opcodes and parameters
-	while(1)
-	{
-		if ((!pFromSocket->pRtEntry->input_itf) || (!pFromSocket->pRtEntry->underlying_input_itf)) {
-			DPA_ERROR("%s::%d input itf OR underlying input itf is NULL\n",
-					__func__, __LINE__);
-			break;
-		}
-		iif_index = pFromSocket->pRtEntry->input_itf->index;
-		underlying_iif_index = pFromSocket->pRtEntry->underlying_input_itf->index;
-
-#ifdef INCLUDE_ETHER_IFSTATS
-		DPA_INFO("%s(%d) calling cdx_rtpflow_create_eth_rx_stats_hm\n",
-				__func__, __LINE__);
-
-		if (create_eth_rx_stats_hm(info, iif_index, underlying_iif_index)) 
-			break;
-#endif
-		if (rebuild_l2_hdr){
-			if (create_strip_eth_hm(info))
-				break;
-		}
-
-		if (info->l2_info.pppoe_present)
-		{
-			struct _itf *itf = NULL;
-
-			DPA_INFO("%s(%d) \n", __func__, __LINE__);
-
-			/* strip pppoe hdrs */
-			if ((pFromSocket->pRtEntry->input_itf) && (pFromSocket->pRtEntry->input_itf->type & IF_TYPE_PPPOE))
-				itf = pFromSocket->pRtEntry->input_itf;
-			else
-				itf = pFromSocket->pRtEntry->underlying_input_itf;
-
-			if (insert_remove_pppoe_hm(info, itf->index))
-				break;
-		}
-		if (cdx_check_rx_iface_type_vlan(pFromSocket->pRtEntry->itf))
-		{
-			DPA_INFO("%s(%d) \n", __func__, __LINE__);
-
-			/* strip vlan hdrs */
-			if (insert_remove_vlan_hm(info, iif_index, underlying_iif_index))
-				break;
-		}
-		/* create RTP_PROCESS opcode */
-		pFlow->hw_flow->ehash_rtp_relay_params =  info->paramptr;
-		if ((htons(pToSocket->Dport)) % 2)
-			opcode = PROCESS_RTCP_PAYLOAD;
-		else
-			opcode = PROCESS_RTP_PAYLOAD;
-
-		DPA_INFO("%s(%d) opcode %x \n", __func__, __LINE__, opcode);
-
-		if (create_rtprelay_process_opcode(info, pFromSocket->hw_stats, 
-					(uint32_t *)pFlow->hw_flow->rtp_info,
-					pToSocket->hw_stats, opcode))
-		{
-			DPA_ERROR("%s(%d) create_rtprelay_process_opcode failed\n",__func__, __LINE__);
-			break;
-		}
-
-
-		DPA_INFO("%s(%d) \n", __func__, __LINE__);
-
-		if (info->l2_info.num_egress_vlan_hdrs)
-			pFlow->hw_flow->vlan_hdr_ptr = info->vlan_hdrs;
-		pFlow->hw_flow->num_vlan_hdrs = info->l2_info.num_egress_vlan_hdrs;
-		if (info->flags & NAT_HM_VALID)
-		{
-			if(create_nat_hm(info))
-				break;
-		}
-		else
-		{
-		//may need only TTL hm
-			if (info->flags & TTL_HM_VALID)
-			{
-				if (info->flags & EHASH_IPV6_FLOW) 
-				{
-					DPA_INFO("%s(%d) \n",
-							__func__, __LINE__);
-					if (create_hoplimit_hm(info))
-						break;
-				} 
-				else
-				{
-					DPA_INFO("%s(%d) \n",
-							__func__, __LINE__);
-					if (create_ttl_hm(info))
-						break;
-				}
-			}
-		}
-		//enqueue
-		DPA_INFO("%s(%d) \n",
-				__func__, __LINE__);
-
-
-		if (info->l2_info.add_pppoe_hdr)  {
-			/* insert PPPoE header */
-			if (create_pppoe_ins_hm(info))
-				break;
-		}
-
-		if (info->l2_info.num_egress_vlan_hdrs) {
-			/* insert vlan header */
-			if (create_vlan_ins_hm(info))
-				break;
-		}
-		if (create_ethernet_hm(info, rebuild_l2_hdr))
-			break;
-		if(create_enque_hm(info))
-			break;
-		return SUCCESS;
-	}
-	return FAILURE;
-}
-
-static int get_rtp_classif_table_type(PSockEntry pSocket, uint32_t *type)
-{
-	switch (pSocket->proto) {
-		case IPPROTOCOL_TCP:
-			/* An unconnected socket is classified on the
-			 * destination address, protocol and destination port
-			 * only. The PCD provides such a table for UDP but not
-			 * for TCP, so an unconnected TCP socket cannot be
-			 * offloaded and has to stay on the software path. */
-			if (pSocket->unconnected)
-			{
-				DPA_ERROR("%s::no classification table for "
-						"unconnected TCP sockets\n",
-						__func__);
-				break;
-			}
-			if (pSocket->SocketFamily == PROTO_IPV4)
-				*type = IPV4_TCP_TABLE;
-			else
-				*type = IPV6_TCP_TABLE;
-			return SUCCESS;
-
-		case IPPROTOCOL_UDP:
-			if (pSocket->SocketFamily == PROTO_IPV4)
-			{
-				if (!pSocket->unconnected)
-					*type = IPV4_UDP_TABLE;
-				else
-					*type = IPV4_3TUPLE_UDP_TABLE;
-			}
-			else
-			{
-				if (!pSocket->unconnected)
-					*type = IPV6_UDP_TABLE;
-				else
-					*type = IPV6_3TUPLE_UDP_TABLE;
-			}
-			return SUCCESS;
-		default:
-			DPA_ERROR("%s::protocol %d not supported\n",
-					__func__, pSocket->proto);
-			break;
-	}
-	return FAILURE;
-}
-
-static int cdx_rtpflow_fill_key_info(PSockEntry pSocket, uint8_t *keymem, uint32_t port_id)
-{
-	union dpa_key *key;
-	unsigned char *saddr, *daddr;
-	int i;
-	uint32_t key_size;
-
-	key = (union dpa_key *)keymem;
-	//portid added to key
-	key->portid = port_id;
-	switch (pSocket->SocketFamily) {
-		case PROTO_IPV4: 
-			if (pSocket->unconnected) // unconnected, key = daddr + proto + dport
-			{
-				key_size = (sizeof(struct ipv4_3tuple_tcpudp_key) + 1);
-				key->ipv4_3tuple_tcpudp_key.ipv4_daddr = pSocket->Daddr_v4;
-				key->ipv4_3tuple_tcpudp_key.ipv4_protocol = pSocket->proto;
-				key->ipv4_3tuple_tcpudp_key.ipv4_dport = pSocket->Dport;
-			}
-			else
-			{
-				key_size = (sizeof(struct ipv4_tcpudp_key) + 1);
-				key->ipv4_tcpudp_key.ipv4_saddr = pSocket->Saddr_v4;
-				key->ipv4_tcpudp_key.ipv4_daddr = pSocket->Daddr_v4;
-				key->ipv4_tcpudp_key.ipv4_protocol = pSocket->proto;
-				key->ipv4_tcpudp_key.ipv4_sport = pSocket->Sport;
-				key->ipv4_tcpudp_key.ipv4_dport = pSocket->Dport;
-			}
-			break;
-
-		case PROTO_IPV6:
-			// in case of connected , key will have 5 tuples, 
-			// in case of unconnected, key will have only 3 tuples
-			if (!pSocket->unconnected)
-			{
-				saddr = (unsigned char*)pSocket->Saddr_v6;
-				daddr = (unsigned char*)pSocket->Daddr_v6;
-				key_size = (sizeof(struct ipv6_tcpudp_key) + 1);
-				for (i = 0; i < 16; i++)
-					key->ipv6_tcpudp_key.ipv6_saddr[i] = saddr[i];
-				for (i = 0; i < 16; i++)
-					key->ipv6_tcpudp_key.ipv6_daddr[i] = daddr[i];
-
-				key->ipv6_tcpudp_key.ipv6_protocol = pSocket->proto;
-				key->ipv6_tcpudp_key.ipv6_sport = pSocket->Sport;
-				key->ipv6_tcpudp_key.ipv6_dport = pSocket->Dport;
-			}
-			else
-			{
-				daddr = (unsigned char*)pSocket->Daddr_v6;
-				key_size = (sizeof(struct ipv6_3tuple_tcpudp_key) + 1);
-				for (i = 0; i < 16; i++)
-					key->ipv6_3tuple_tcpudp_key.ipv6_daddr[i] = daddr[i];
-
-				key->ipv6_3tuple_tcpudp_key.ipv6_protocol = pSocket->proto;
-				key->ipv6_3tuple_tcpudp_key.ipv6_dport = pSocket->Dport;
-			}
-			break;
-		default:
-			DPA_ERROR("%s::protocol %d not supported\n",
-					__func__, pSocket->proto);
-			key_size = 0;
-	}
-#ifdef CDX_DPA_DEBUG
-	if (key_size) {
-		DPA_INFO("keysize %d\n", key_size);
-		display_buf(key, key_size);
-	}
-#endif
-	return key_size;
-}
-
-#ifdef CDX_DPA_DEBUG
-//display socket entries
-void display_SockEntries(PSockEntry SockA, PSockEntry SockB)
-{
-	printk("SockA unconnected \t%x SockB unconnected \t%x\n\n", SockA->unconnected, SockB->unconnected);
-	if (SockA->SocketFamily == PROTO_IPV6) {
-		printk("SOCK_A ipv6 entry\n");
-		printk("source ip	\t");
-		display_ipv6_addr((uint8_t *)SockA->Saddr_v6);
-		printk("dest ip		\t");
-		display_ipv6_addr((uint8_t *)SockA->Daddr_v6);
-		
-		printk("SOCK_B ipv6 entry\n");
-		printk("source ip	\t");
-		display_ipv6_addr((uint8_t *)SockB->Saddr_v6);
-		printk("dest ip		\t");
-		display_ipv6_addr((uint8_t *)SockB->Daddr_v6);
-	} else {
-		printk("SOCK_A ipv4 entry\n");
-		printk("source ip	\t");
-		display_ipv4_addr(SockA->Saddr_v4);
-		printk("dest ip		\t");
-		display_ipv4_addr(SockA->Daddr_v4);
-		printk("SOCK_B ipv4 entry\n");
-		printk("source ip	\t");
-		display_ipv4_addr(SockB->Saddr_v4);
-		printk("dest ip		\t");
-		display_ipv4_addr(SockB->Daddr_v4);
-	}
-	if ((SockA->proto == IPPROTOCOL_UDP) ||
-			(SockA->proto == IPPROTOCOL_TCP)) {
-		printk("SOCK_A protocol	\t%d\n", SockA->proto);
-		printk("SOCK_A sport		\t%d\n", htons(SockA->Sport));
-		printk("SOCK_A dport		\t%d\n", htons(SockA->Dport));
-		printk("SOCK_B protocol	\t%d\n", SockA->proto);
-		printk("SOCK_B sport		\t%d\n", htons(SockA->Sport));
-		printk("SOCK_B dport		\t%d\n", htons(SockA->Dport));
-	}
-	printk("SOCK_A Route entry	\t%p\n", SockA->pRtEntry);
-	if (SockA->pRtEntry) {
-		display_route_entry(SockA->pRtEntry);
-	}
-	else
-	{
-		printk("No route entry\n");
-	}
-	printk("SOCK_B Route entry	\t%p\n", SockB->pRtEntry);
-	if (SockB->pRtEntry)
-	{
-		display_route_entry(SockB->pRtEntry);
-	}
-	else 
-	{
-		printk("No route entry\n");
-	}
-	printk(">>>>>\n");
-}
-#endif /* CDX_DPA_DEBUG */
-
-
-int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket, PSockEntry pToSocket)
-{
-	struct ins_entry_info *info;
-	struct en_exthash_tbl_entry *tbl_entry;
-	struct _itf *underlying_input_itf;
-	uint32_t tbl_type;
-	uint16_t flags;
-	uint32_t key_size;
-	uint8_t *ptr;
-	int retval;
-
-#ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s(%d)\n", __func__, __LINE__);
-	display_SockEntries(pFromSocket, pToSocket);
-#endif
-
-	tbl_entry = NULL;	
-
-	if (!pFromSocket->pRtEntry)
-	{
-		DPA_INFO("%s(%d)\n",__func__,__LINE__);
-		return FAILURE;
-	}
-
-	info = kzalloc(sizeof(struct ins_entry_info), GFP_KERNEL);
-	if (!info)
-		return FAILURE;
-
-	DPA_INFO("%s(%d)\n", __func__, __LINE__);
-	info->entry = pFlow;
-
-	// This can never be NULL for connection routes.
-	if (pFromSocket->pRtEntry->underlying_input_itf)
-		underlying_input_itf = pFromSocket->pRtEntry->underlying_input_itf;
-	else
-	{
-		underlying_input_itf = pFromSocket->pRtEntry->itf ;
-		pFromSocket->pRtEntry->underlying_input_itf = pFromSocket->pRtEntry->itf;
-	}
-
-	if (!pFromSocket->pRtEntry->input_itf)
-		pFromSocket->pRtEntry->input_itf = pFromSocket->pRtEntry->itf;
-	DPA_INFO("%s(%d)\n", __func__, __LINE__);
-
-	//clear hw entry pointer
-	if ((!pFromSocket->pRtEntry) || ( (!pFromSocket->pRtEntry->input_itf) 
-				&& (!pFromSocket->pRtEntry->itf)))
-	{
-		DPA_ERROR("%s(%d)::unable to get interface \n",__func__,
-				__LINE__);
-		goto err_ret;
-	}
-	if (!pFromSocket->pRtEntry->input_itf) 
-		pFlow->inPhyPortNum = pFromSocket->pRtEntry->itf->index;
-	else
-		pFlow->inPhyPortNum = pFromSocket->pRtEntry->input_itf->index;
-
-	DPA_INFO("%s(%d)\n", __func__, __LINE__);
-	//get fman index and port index and port id where this entry need to be added
-	if (dpa_get_fm_port_index(pFlow->inPhyPortNum, underlying_input_itf->index, &info->fm_idx,
-				&info->port_idx, &info->port_id))
-	{
-		DPA_ERROR("%s(%d)::unable to get fmindex for itfid %d\n",
-				__func__, __LINE__, pFlow->inPhyPortNum);
-		goto err_ret;
-	}
-	DPA_INFO("%s(%d)\n", __func__, __LINE__);
-#ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s(%d) inPhyPortNum 0x%x, underlying_input_itf->index %d, fm_idx 0x%x, port_idx %d port_id %d\n",
-			__func__, __LINE__, pFlow->inPhyPortNum, underlying_input_itf->index,
-			info->fm_idx, info->port_idx, info->port_id);
-#endif // CDX_DPA_DEBUG
-	//get pcd handle based on determined fman
-	info->fm_pcd = dpa_get_pcdhandle(info->fm_idx);
-	if (!info->fm_pcd)
-	{
-		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",
-				__func__, info->fm_idx);
-		goto err_ret;
-	}
-	if (get_rtp_classif_table_type(pFromSocket, &tbl_type))
-	{
-		DPA_ERROR("%s::unable to get table type\n",
-				__func__);
-		goto err_ret;
-	}
-	info->tbl_type = tbl_type;
-
-	//get table descriptor based on type and port based on incoming packet Socket A
-	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, tbl_type);
-	if (info->td == NULL)
-	{
-		DPA_ERROR("%s::unable to get td for itfid %d, type %d\n",
-				__func__, pFlow->inPhyPortNum,
-				tbl_type);
-		goto err_ret;
-	}
-
-#ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: td info :%p\n", __func__, info->td);
-#endif
-
-	//save table descriptor for entry release
-	pFlow->hw_flow->td = info->td;
-	//get fm context
-	pFlow->hw_flow->fm_ctx = dpa_get_fm_ctx(info->fm_idx);
-	if (pFlow->hw_flow->fm_ctx == NULL)
-	{
-		DPA_ERROR("%s::failed to get ctx fro fm idx %d\n",
-				__func__, info->fm_idx);
-		goto err_ret;
-	}
-	if (!pToSocket->pRtEntry)
-	{
-		DPA_ERROR("%s:: No route entry for to_socket \n",
-				__func__);
-		goto err_ret;
-	}
-	if (!pToSocket->pRtEntry->input_itf)
-	{
-		DPA_INFO("%s(%d) pToSocket->pRtEntry->itf %p\n",
-				__func__, __LINE__, pToSocket->pRtEntry->itf);
-		pToSocket->pRtEntry->input_itf =  pToSocket->pRtEntry->itf;
-	}
-
-	if (!pToSocket->pRtEntry->underlying_input_itf)
-	{
-		DPA_INFO("%s(%d) pToSocket->pRtEntry->itf %p\n",
-				__func__, __LINE__, pToSocket->pRtEntry->itf);
-		pToSocket->pRtEntry->underlying_input_itf = pToSocket->pRtEntry->itf;
-	}
-	{
-		union ctentry_qosmark qosmark;
-
-		qosmark.markval = 0;
-		qosmark.queue = pToSocket->queue;
-		if (dpa_get_tx_info_by_itf(pToSocket->pRtEntry, &info->l2_info,
-					&info->l3_info, NULL, &qosmark, (uint32_t)pToSocket->hash))
-		{	
-			DPA_ERROR("%s::unable to get tx params\n",
-					__func__);
-			goto err_ret;
-		}
-	}
-
-	//allocate hash table entry
-#ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::info->td %p\n", __func__, info->td);
-#endif
-	tbl_entry = ExternalHashTableAllocEntry(info->td);
-	if (!tbl_entry)
-	{
-		DPA_ERROR("%s::unable to alloc hash tbl memory\n",
-				__func__);
-		goto err_ret;
-	}
-#ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: hash tbl entry %p\n", __func__, tbl_entry);
-#endif
-	flags = 0;
-#ifdef ENABLE_FLOW_TIME_STAMPS
-	SET_TIMESTAMP_ENABLE(flags);
-	tbl_entry->hashentry.timestamp_counter = 
-		cpu_to_be32(dpa_get_timestamp_addr(EXTERNAL_TIMESTAMP_TIMERID));
-	tbl_entry->hashentry.timestamp = cpu_to_be32(JIFFIES32);
-	pFlow->hw_flow->timestamp = JIFFIES32;
-#endif
-#ifdef ENABLE_FLOW_STATISTICS
-	SET_STATS_ENABLE(flags);
-#endif
-	//fill key information from entry
-	key_size = cdx_rtpflow_fill_key_info(pFromSocket, &tbl_entry->hashentry.key[0], info->port_id);
-	if (!key_size)
-	{
-		DPA_ERROR("%s::unable to compose key\n",
-				__func__);
-		goto err_ret;
-	}	
-
-	//round off keysize to next 4 bytes boundary 
-	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];			
-	ptr += ALIGN(key_size, TBLENTRY_OPC_ALIGN);
-	//set start of opcode list 
-	info->opcptr = ptr;
-	//ptr now after opcode section
-	ptr += MAX_OPCODES;
-
-	//set offset to first opcode
-	SET_OPC_OFFSET(flags, (uint32_t)(info->opcptr - (uint8_t *)tbl_entry));
-	//set param offset 
-	SET_PARAM_OFFSET(flags, (uint32_t)(ptr - (uint8_t *)tbl_entry));
-	//param_ptr now points after timestamp location
-	tbl_entry->hashentry.flags = cpu_to_be16(flags);
-	//param pointer and opcode pointer now valid
-	info->paramptr = ptr;
-	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - GET_PARAM_OFFSET(flags));
-	if (cdx_rtpflow_fill_actions(pFromSocket, pToSocket, pFlow, info))
-	{
-		DPA_ERROR("%s::unable to fill actions\n", __func__);
-		goto err_ret;
-	}
-	tbl_entry->enqueue_params = info->enqueue_params;
-	pFlow->hw_flow->eeh_entry_handle = tbl_entry;
-#ifdef CDX_DPA_DEBUG
-	display_ehash_tbl_entry(&tbl_entry->hashentry, key_size);
-#endif // CDX_DPA_DEBUG
-	//insert entry into hash table
-	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry); 
-	if (retval == -1) {
-		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
-		goto err_ret;
-	}	
-	pFlow->hw_flow->eeh_entry_index = (uint16_t)retval;
-	kfree(info);
-	return SUCCESS;
-err_ret:
-	//release all allocated items
-	if (tbl_entry)
-		ExternalHashTableEntryFree(tbl_entry);
-	/* The handle was published on the flow before AddKey; leaving the
-	 * stale pointer behind hands freed memory to the next
-	 * rtp_flow_unlink() -> cdx_ehash_delete_entry(). Same reset the CT
-	 * and L2-bridge inserts do on their error paths. */
-	if (pFlow->hw_flow)
-		pFlow->hw_flow->eeh_entry_handle = NULL;
-	kfree(info);
-	return FAILURE;
-}
-
-void cdx_ehash_set_rtp_info_params(uint8_t *rtp_relay_param, PRTPflow pFlow, PSockEntry pSocket)
-{
-	struct en_ehash_rtprelay_param *param;
-	uint16_t rtp_flags;
-
-	param = (struct en_ehash_rtprelay_param *)rtp_relay_param;
-
-	rtp_flags = 0;
-
-	if (pSocket->unconnected == SOCKET_UNCONNECTED)
-	{
-		if (pSocket->SocketFamily == PROTO_IPV4)
-		{
-			param->src_ipv4_val = pSocket->Saddr_v4;
-			//			param->src_ipv4_val = cpu_to_be32(pSocket->Saddr_v4);
-		}
-		else
-		{
-			param->src_ipv6_val[0] = pSocket->Saddr_v6[0];
-			param->src_ipv6_val[1] = pSocket->Saddr_v6[1];
-			param->src_ipv6_val[2] = pSocket->Saddr_v6[2];
-			param->src_ipv6_val[3] = pSocket->Saddr_v6[3];
-			//			param->src_ipv6_val[0] = cpu_to_be32(pSocket->Saddr_v6[0]);
-			//		param->src_ipv6_val[1] = cpu_to_be32(pSocket->Saddr_v6[1]);
-			//	param->src_ipv6_val[2] = cpu_to_be32(pSocket->Saddr_v6[2]);
-			//param->src_ipv6_val[3] = cpu_to_be32(pSocket->Saddr_v6[3]);
-		}
-	}
-	param->TimeStampIncr =  cpu_to_be32(pFlow->TimeStampIncr);
-	param->seq_base =  cpu_to_be16(pFlow->Seq);
-	param->egress_socketID = cpu_to_be16(pFlow->egress_socketID);
-	param->DTMF_PT[0] =  gDTMF_PT[0];
-	param->DTMF_PT[1] =  gDTMF_PT[1];
-	param->SSRC_1 =  cpu_to_be32(pFlow->SSRC_1);
-	if (pSocket->expt_flag == 1)
-	{
-		rtp_flags |= EEH_RTP_SEND_FIRST_PACKET_TO_CP;
-	}
-
-	if (pFlow->pkt_dup_enable)
-	{
-		rtp_flags |= EEH_RTP_DUPLICATE_PKT_SEND_TO_CP;
-	}
-
-	if (pFlow->hw_flow->flags & RTP_RELAY_ENABLE_VLAN_P_BIT_LEARNING)
-	{
-		rtp_flags |= EEH_RTP_ENABLE_VLAN_P_BIT_LEARN;
-		DPA_INFO("%s(%d) enabling VLAN p bit learning feature in UCODE\n",
-				__func__,__LINE__);
-	}
-
-	param->rtp_flags = cpu_to_be16(rtp_flags);
-}
-
-void cdx_ehash_update_rtp_info_params(uint8_t *rtp_relay_param, uint32_t *rtpinfo_ptr)
-{
-	struct en_ehash_rtprelay_param *param;
-	uint32_t ptr_val;
-	
-	param = (struct en_ehash_rtprelay_param *)rtp_relay_param;
-	/* MURAM offset for the ucode, not a kernel VA; rtpinfo_ptr is non-NULL by
-	 * construction (allocated and NULL-checked before this update runs). */
-	ptr_val = MURAM_VIRT_TO_PHYS_ADDR(rtpinfo_ptr);
-	param->rtpinfo_ptr =  cpu_to_be32(ptr_val);
-	return;
-}
-
-void cdx_ehash_update_dtmf_rtp_info_params(uint8_t *rtp_relay_param, uint8_t *DTMF_PT)
-{
-	struct en_ehash_rtprelay_param *param;
-	
-	param = (struct en_ehash_rtprelay_param *)rtp_relay_param;
-	param->DTMF_PT[0] = DTMF_PT[0];
-	param->DTMF_PT[1] = DTMF_PT[1];
-	return;
-}
-

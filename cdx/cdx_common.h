@@ -187,6 +187,28 @@ struct ipv6_esp_key{
 	uint32_t spi;   //spi
 }DPA_PACKED;
 
+/* A bridged multicast group's key, in the bridged multicast tables: the
+ * frame's own Ethernet pair ahead of the routed key's fields. The order is the
+ * key generator's, which extracts by hardware field id rather than in the
+ * order the distribution names them -- the Ethernet fields come first. With
+ * the port id ahead of it that is 22 bytes for IPv4 and 46 for IPv6, which is
+ * what cdx_pcd.xml sizes the two tables for. */
+struct ipv4_mcast_mac_key {
+	uint8_t ether_da[6];
+	uint8_t ether_sa[6];
+	uint32_t ipv4_saddr;
+	uint32_t ipv4_daddr;
+	uint8_t ipv4_protocol;
+}DPA_PACKED;
+
+struct ipv6_mcast_mac_key {
+	uint8_t ether_da[6];
+	uint8_t ether_sa[6];
+	uint8_t ipv6_saddr[16];
+	uint8_t ipv6_daddr[16];
+	uint8_t ipv6_protocol;
+}DPA_PACKED;
+
 
 
 //possible key combinations
@@ -203,6 +225,8 @@ union dpa_key {
 			struct ipv6_esp_key ipv6_esp_key;
 			struct ipv4_3tuple_tcpudp_key ipv4_3tuple_tcpudp_key;
 			struct ipv6_3tuple_tcpudp_key ipv6_3tuple_tcpudp_key;
+			struct ipv4_mcast_mac_key ipv4_mcast_mac_key;
+			struct ipv6_mcast_mac_key ipv6_mcast_mac_key;
 		};
 	}DPA_PACKED;
 	char key_array[0];
@@ -223,14 +247,22 @@ struct vlan_header {
 struct dpa_l2hdr_info {
 	struct {
 		uint32_t vlan_present:1;
-#ifdef VLAN_FILTER
-		uint32_t vlan_filtering:1;
-#endif
 		uint32_t pppoe_present:1;
 		uint32_t is_wlan_iface:1;
 		uint32_t add_pppoe_hdr:1;
+		/* Set when a flow described its own encapsulation
+		 * (apply_l2_encap()), the only way tags reach this description.
+		 * The two VLAN header manipulations then read
+		 * vlan_stats_offsets (insert) and ingress_vlan_stats_offsets
+		 * (strip), one index per tag, and emit no pointer at all unless
+		 * every tag in the stack names a record. Clear, there are no
+		 * tags, and the strip only checks that the port is a
+		 * registered one. */
+		uint32_t vlan_flow_ifstats:1;
 		uint32_t add_eth_type:1;
-		uint32_t dscp_vlanpcp_map_enable:1;
+		/* The enqueue counts nothing against the port: its frames go to
+		 * the discard queue and are dropped there, not sent. */
+		uint32_t no_tx_stats:1;
 	};
 	uint32_t fqid;
 	uint8_t rspid;
@@ -242,12 +274,20 @@ struct dpa_l2hdr_info {
 	struct vlan_header ingress_vlan_hdrs[DPA_CLS_HM_MAX_VLANs];
 #ifdef INCLUDE_VLAN_IFSTATS
 	uint8_t vlan_stats_offsets[DPA_CLS_HM_MAX_VLANs];
+	/* Receive halves for the strip, innermost first like everything
+	 * else here. */
+	uint8_t ingress_vlan_stats_offsets[DPA_CLS_HM_MAX_VLANs];
 #endif
 	uint8_t l2hdr[6 * 2];
 	uint8_t ac_mac_addr[6];
 	uint16_t pppoe_sess_id;
 #ifdef INCLUDE_PPPoE_IFSTATS
+	/* The session's record: the transmit half for the insert and the
+	 * receive half for the strip. Zero is no record, and both emit a null
+	 * pointer, which is what the vendor's own INCLUDE_PPPoE_IFSTATS-disabled
+	 * arms write; index zero itself belongs to someone else. */
 	uint8_t pppoe_stats_offset;
+	uint8_t pppoe_rx_stats_offset;
 #endif
 #ifdef INCLUDE_ETHER_IFSTATS
 	uint8_t ether_stats_offset;
@@ -263,6 +303,13 @@ struct dpa_l3hdr_info {
 		uint8_t ipsec_inbound_flow:1; /* Flag to identify ipsec inbound flow */
 	};
 	uint8_t tunnel_flags; /* used in dscp propagation */
+	/* The tunnel's record, from the flow's description: the transmit half
+	 * for the insert and the receive half for the strip. Zero is no record
+	 * and emits a null pointer, which is what the
+	 * INCLUDE_TUNNEL_IFSTATS-disabled arms write; index zero itself belongs
+	 * to someone else. */
+	uint8_t tunnel_stats_offset;
+	uint8_t tunnel_rx_stats_offset;
 	uint8_t pad;
 
 	uint16_t proto;
@@ -316,6 +363,8 @@ struct ins_entry_info {
 	uint32_t opc_count;
 	uint32_t tbl_type;
 	uint32_t to_sec_fqid;
+	/* SEC identity checked by STRIP_ALL_VLAN_HDRS on offline-port hits. */
+	uint32_t sec_tag;
 	uint16_t tnl_hdr_size;
 	uint16_t sa_family;
 	uint16_t eth_type;
@@ -372,7 +421,7 @@ int dpa_add_oh_if(char *name);
 int cdx_init_frag_module(void);
 void cdx_deinit_frag_module(void);
 
-void hw_ct_get_active(struct hw_ct *ct);
+int hw_ct_get_active(struct hw_ct *ct);
 
 /* External-hash entry disposition (ISSUES.md A95; implemented in
  * cdx_ehash.c, where the full rationale lives).
@@ -387,31 +436,70 @@ void hw_ct_get_active(struct hw_ct *ct);
  * The quarantine entry points below are for the paths that splice an
  * entry out by hand instead of calling DeleteKey (multicast listener
  * REMOVE/UPDATE in dpa_control_mc.c) and therefore have to place and
- * retire the barrier themselves.
+ * retire the barrier themselves, and for a waiter with no table of its
+ * own that needs the backlog released (cdx_ehash_quarantine_retry()).
  *
- * Serialization: no lock of their own. Callers run under the FCI
- * ctrl.mutex (cdx_cmdhandler.c) - the multicast ones additionally hold
+ * Serialization: no lock of their own. Callers run under ctrl.mutex -
+ * the flowtable backend and the timer kthread both take it, and the multicast
+ * mutators additionally hold
  * mc_mutators_mutex - or at module exit with no handler in flight. Not
  * callable under a spinlock: the barriers busy-wait on host-command
  * completion. */
 int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle);
-void cdx_ehash_quarantine_entry(void *tbl_entry);
+void cdx_ehash_quarantine_entry(void *td, void *tbl_entry);
 void cdx_ehash_quarantine_free_all(void);
 void cdx_ehash_quarantine_drain(void *td);
+int cdx_ehash_quarantine_retry(void);
 void cdx_ehash_quarantine_abandon(void);
 unsigned int cdx_ehash_quarantine_pending(void);
 
+/* Table entries a delete could not prove it unlinked, kept for the datapath
+ * restart that settles them (cdx_ehash.c). A root is an entry a bucket may
+ * still link, named with the table and the bucket it was added to; a dependent
+ * is reachable only through a root -- a multicast group's listener -- and goes
+ * once every root is settled. Same serialization as the quarantine. */
+void cdx_ehash_abandon(void *td, uint16_t index, void *tbl_entry);
+void cdx_ehash_abandon_dependent(void *tbl_entry);
+/* A root could not be recorded: it may still be linked and nothing knows where,
+ * so no restart can be proven safe. */
+bool cdx_ehash_abandoned_lost(void);
+/* Settle every root, with every port that walks the tables stopped and idle:
+ * delete one still linked, free one no bucket links. 0 when none is left,
+ * with *resolved counting the roots settled by this call; -EAGAIN when one is
+ * still linked, most likely for want of memory, and worth trying again;
+ * -ENOTRECOVERABLE when a table is malformed or a root will not go. */
+int cdx_ehash_resolve_abandoned(unsigned int *resolved);
+/* Unload: settle what can be when the ports were stopped, and leak the rest.
+ * True when nothing that may still be linked is left. */
+bool cdx_ehash_abandoned_exit(bool stopped);
+
 int cdx_set_expt_rate(uint32_t fm_index, uint32_t type, uint32_t limit, uint32_t burst_size);
-int cdx_get_expt_rate(void *cmd);
-int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir);
-int cdx_get_ff_rate(void *cmd);
-void get_plcr_counter(void *handle, uint32_t *counterval, uint32_t clear);
+bool cdx_expt_rate_is_packet_mode(uint32_t fm_index);
+int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,
+			 uint32_t *burst);
+struct cdx_police_counters;
+int cdx_expt_rate_counters(uint32_t fm_index, uint32_t type,
+			   struct cdx_police_counters *out);
+int cdx_port_police_set(char *ifname, bool byte_mode,
+			uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs);
+int cdx_port_police_clear(char *ifname);
+
+/* What an RFC-2698 profile counts: frames per output colour, and nothing
+ * else. There is no byte counter in the hardware. Green and yellow are
+ * enqueued, red is dropped, so the frames the meter saw are the sum of the
+ * three and the ones it discarded are the red ones. */
+struct cdx_police_counters {
+	uint32_t	green;
+	uint32_t	yellow;
+	uint32_t	red;
+};
+void cdx_plcr_colours(void *handle, struct cdx_police_counters *out);
+int cdx_port_police_counters(char *ifname, struct cdx_police_counters *out);
+int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
+				 struct cdx_police_counters *out);
+int cdx_ingress_policer_peak(uint32_t fm_index, uint32_t queue_no,
+			     uint32_t *pir, uint32_t *pbs);
 int cdx_get_policer_profile_id(uint32_t fm_index, uint32_t queue_no);
 int cdx_ingress_enable_or_disable_qos(uint32_t fm_index,uint32_t queue_no,uint32_t oper);
 int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs);
-int cdx_ingress_policer_reset(uint32_t fm_index);
-int cdx_ingress_policer_stats(uint32_t fm_index,uint32_t queue_no,void *stats,uint32_t clear);
-#ifdef SEC_PROFILE_SUPPORT
-int cdx_sec_policer_reset(uint32_t fm_index);
-#endif /* endif for SEC_PROFILE_SUPPORT */
 #endif

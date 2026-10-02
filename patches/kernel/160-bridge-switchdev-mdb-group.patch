@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Fri, 18 Sep 2026 13:20:00 +0200
+Subject: [PATCH] bridge: carry the multicast group into the MDB switchdev object
+
+br_switchdev_mdb_populate() converts a group to a multicast MAC with
+ip_eth_mc_map() and hands the driver nothing else, so the L3 group the
+bridge learned is discarded at the boundary.
+
+For a driver that keys on a MAC that is merely lossy -- 28 bits of IPv4
+group fold into 23 bits of address, so 32 groups share one and the
+driver delivers the union of their port sets. For a driver whose
+classifier keys on the group itself it is not a coarser answer but the
+wrong field: ASK's FMAN classifier composes an exact-match key from the
+source and group addresses, and a multicast MAC cannot be recovered
+into one.
+
+A blocked port group needs saying too. A driver that replicates in
+hardware takes the forwarding decision away from br_forward(), which
+skips a port group an IGMPv3 or MLDv2 source filter excludes this
+source for. A driver that could not see that would deliver exactly what
+the filter excluded, and with the frame no longer reaching the bridge
+there is no software path left to correct it. Reported as a switchdev
+flag of its own rather than as MDB_PG_FLAGS_*, whose values are
+bridge-private and not an interface.
+
+A driver loaded after the fact asks for both through
+switchdev_bridge_port_replay(), so the replay translates the port
+group's flags with the same helper as the notification; it used to
+build its objects from the entry alone and replay a blocked port group
+as a member. And switchdev_obj_eq() compares the group and the flags as
+well as the MAC and VID: a replay elided because a deferred event for
+another group sharing that MAC -- or the same group's (*,G) or (S,G)
+twin -- was queued was one nothing would ever deliver.
+
+Additive: existing drivers read addr[] and vid as before and need not
+know either field exists.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ include/net/switchdev.h   | 37 +++++++++++++++++++++++++++++++++++++
+ net/bridge/br_switchdev.c | 24 +++++++++++++++++++++---
+ net/switchdev/switchdev.c |  8 +++++++-
+ 3 files changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 8346b0d29542..da9e6370ed0f 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -10,6 +10,8 @@
+ #include <linux/netdevice.h>
+ #include <linux/notifier.h>
+ #include <linux/list.h>
++/* For struct br_ip, embedded by value in switchdev_obj_port_mdb. */
++#include <linux/if_bridge.h>
+ #include <net/ip_fib.h>
+ 
+ #define SWITCHDEV_F_NO_RECURSE		BIT(0)
+@@ -109,11 +111,46 @@ struct switchdev_obj_port_vlan {
+ #define SWITCHDEV_OBJ_PORT_VLAN(OBJ) \
+ 	container_of((OBJ), struct switchdev_obj_port_vlan, obj)
+ 
++/* An IGMPv3 or MLDv2 source filter excludes this source for this port, so the
++ * bridge does not forward it there. A driver replicating in hardware must not
++ * either. */
++#define SWITCHDEV_OBJ_MDB_F_BLOCKED	BIT(0)
++
+ /* SWITCHDEV_OBJ_ID_PORT_MDB */
+ struct switchdev_obj_port_mdb {
+ 	struct switchdev_obj obj;
+ 	unsigned char addr[ETH_ALEN];
+ 	u16 vid;
++	/* The group as the bridge holds it, before ip_eth_mc_map() folded it
++	 * into addr[] above.
++	 *
++	 * That folding is lossy and not merely imprecise: 28 bits of IPv4
++	 * group become 23 bits of Ethernet address, so 32 groups share one
++	 * MAC and a driver matching on addr[] delivers the union of their
++	 * port sets. A classifier keyed on the L3 group cannot use addr[] at
++	 * all -- it is not a coarser version of what such a driver needs, it
++	 * is a different field.
++	 *
++	 * The bridge has mp->addr at the point it discards it, so it is
++	 * carried here instead. Drivers that key on the MAC are unaffected
++	 * and need not read this; proto is zero on the paths that do not
++	 * populate it.
++	 */
++	struct br_ip group;
++	/* SWITCHDEV_OBJ_MDB_F_*, translated from the port group's own flags
++	 * rather than copied: MDB_PG_FLAGS_* are bridge-private and their
++	 * values are not an interface.
++	 *
++	 * A driver that replicates in hardware needs this because it is taking
++	 * the forwarding decision away from br_forward(), which consults the
++	 * port group's flags. A driver that could not see them would deliver
++	 * to a port the bridge would have skipped, with no software path left
++	 * to correct it.
++	 *
++	 * Zero on the paths that do not populate it, which is also the value
++	 * that means "an ordinary member".
++	 */
++	u8 flags;
+ };
+ 
+ #define SWITCHDEV_OBJ_PORT_MDB(OBJ) \
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+index f10bd6a233dc..8c97125d45c8 100644
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -540,6 +540,21 @@ static void br_switchdev_mdb_populate(struct switchdev_obj_port_mdb *mdb,
+ 		ether_addr_copy(mdb->addr, mp->addr.dst.mac_addr);
+ 
+ 	mdb->vid = mp->addr.vid;
++	/* And the group itself, which the conversion above cannot express: a
++	 * driver whose classifier keys on the L3 group needs the address the
++	 * bridge learned, not the multicast MAC 32 of them share. */
++	mdb->group = mp->addr;
++}
++
++/* A port group's flags as a driver may read them. Translated, not copied:
++ * MDB_PG_FLAGS_* are ours and their values are not an interface. What a
++ * driver replicating in hardware needs is what br_forward() would have done,
++ * and for a blocked port group that is to skip it. Shared by the notification
++ * and the replay, so a driver loaded after the port group was blocked hears
++ * the same thing as one that was there when it happened. */
++static u8 br_switchdev_mdb_flags(const struct net_bridge_port_group *pg)
++{
++	return pg->flags & MDB_PG_FLAGS_BLOCKED ? SWITCHDEV_OBJ_MDB_F_BLOCKED : 0;
+ }
+ 
+ static void br_switchdev_host_mdb_one(struct net_device *dev,
+@@ -602,6 +617,7 @@ static int br_switchdev_mdb_queue_one(struct list_head *mdb_list,
+ 				      unsigned long action,
+ 				      enum switchdev_obj_id id,
+ 				      const struct net_bridge_mdb_entry *mp,
++				      const struct net_bridge_port_group *pg,
+ 				      struct net_device *orig_dev)
+ {
+ 	struct switchdev_obj_port_mdb mdb = {
+@@ -613,6 +629,8 @@ static int br_switchdev_mdb_queue_one(struct list_head *mdb_list,
+ 	struct switchdev_obj_port_mdb *pmdb;
+ 
+ 	br_switchdev_mdb_populate(&mdb, mp);
++	if (pg)
++		mdb.flags = br_switchdev_mdb_flags(pg);
+ 
+ 	if (action == SWITCHDEV_PORT_OBJ_ADD &&
+ 	    switchdev_port_obj_act_is_deferred(dev, action, &mdb.obj)) {
+@@ -652,7 +670,7 @@ void br_switchdev_mdb_notify(struct net_device *dev,
+ 		return br_switchdev_host_mdb(dev, mp, type);
+ 
+ 	br_switchdev_mdb_populate(&mdb, mp);
+-
++	mdb.flags = br_switchdev_mdb_flags(pg);
+ 	mdb.obj.orig_dev = pg->key.port->dev;
+ 	switch (type) {
+ 	case RTM_NEWMDB:
+@@ -720,7 +738,7 @@ br_switchdev_mdb_replay(struct net_device *br_dev, struct net_device *dev,
+ 		if (mp->host_joined) {
+ 			err = br_switchdev_mdb_queue_one(&mdb_list, dev, action,
+ 							 SWITCHDEV_OBJ_ID_HOST_MDB,
+-							 mp, br_dev);
++							 mp, NULL, br_dev);
+ 			if (err) {
+ 				spin_unlock_bh(&br->multicast_lock);
+ 				goto out_free_mdb;
+@@ -734,7 +752,7 @@ br_switchdev_mdb_replay(struct net_device *br_dev, struct net_device *dev,
+ 
+ 			err = br_switchdev_mdb_queue_one(&mdb_list, dev, action,
+ 							 SWITCHDEV_OBJ_ID_PORT_MDB,
+-							 mp, dev);
++							 mp, p, dev);
+ 			if (err) {
+ 				spin_unlock_bh(&br->multicast_lock);
+ 				goto out_free_mdb;
+diff --git a/net/switchdev/switchdev.c b/net/switchdev/switchdev.c
+index 4d5fbacef496..3c94766bfcc1 100644
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -39,8 +39,14 @@ static bool switchdev_obj_eq(const struct switchdev_obj *a,
+ 	case SWITCHDEV_OBJ_ID_HOST_MDB:
+ 		ma = SWITCHDEV_OBJ_PORT_MDB(a);
+ 		mb = SWITCHDEV_OBJ_PORT_MDB(b);
++		/* The group and the flags too: 32 IPv4 groups share one MAC,
++		 * and a group's (*,G) and (S,G) entries share MAC and VID, so
++		 * a replay elided on those alone could be one no queued event
++		 * restates. */
+ 		return ma->vid == mb->vid &&
+-			ether_addr_equal(ma->addr, mb->addr);
++			ether_addr_equal(ma->addr, mb->addr) &&
++			ma->flags == mb->flags &&
++			!memcmp(&ma->group, &mb->group, sizeof(ma->group));
+ 	default:
+ 		break;
+ 	}
+-- 
+2.47.3
+

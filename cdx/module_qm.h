@@ -26,23 +26,25 @@ struct ceetm_fq {
 #define NUM_CHANNEL_SHAPERS	8
 #define MAX_SCHEDULER_QUEUES	(NUM_PQS + NUM_WBFQS)
 #define GET_CEETM_PRIORITY(x)	((x) < NUM_PQS) ? ((x) ^ (NUM_PQS - 1)) : (x)
-#define EGRESS_MAX_CQ_PROFILES  (MAX_SCHEDULER_QUEUES * NUM_CHANNEL_SHAPERS)
 
 
 /* For byte mode this is the max expected pkt size */
 #define DEFAULT_INGRESS_BYTE_MODE_CBS 2000
 #define DEFAULT_INGRESS_BYTE_MODE_PBS 2000
 
-enum {
-	CDX_EGRESS_MIN_CQ_PROFILE=CDX_INGRESS_ALL_PROFILES + 1,
-	CDX_EGRESS_MAX_CQ_PROFILES=(CDX_EGRESS_MIN_CQ_PROFILE + (EGRESS_MAX_CQ_PROFILES -1))
-};
-
 struct shaper_info {
 	uint64_t rate;
 	uint32_t enable;
 	uint32_t bsize;
 	struct qm_ceetm_rate token_cr;
+	/* The excess rate belongs with the committed one. It used to be a local
+	 * in each programming site, always zero for an LNI and always the
+	 * maximum for a channel -- except in ceetm_enable_or_disable_qos(),
+	 * which passed zero for a channel whose shaper was already enabled and
+	 * so took away the excess bandwidth its class queues are eligible for.
+	 * Holding it here is what makes every site program the same value, and
+	 * lets a qdisc name a ceil that is neither of those two. */
+	struct qm_ceetm_rate token_er;
 };
 
 struct classque_info {
@@ -58,15 +60,13 @@ struct classque_info {
 		uint32_t weight;	/* for WBFQs */
 	};
 	uint32_t qdepth;		/* CQ depths */
-	uint32_t shaper_rate;	/* shaper rate in Kbps */
-	uint32_t cq_shaper_enable;	/* cq shaper */
-	uint8_t  pp_num;		/* policer profile number */
-	void     *pp_handle;	/* policer profile handle */
-	void     *pcd_handle;       /* handle to fm_pcd device for this fman */
 };
 
 #define MAX_DSCP	64
+/* The software Tx path's copy of a port's DSCP map. Freed after a grace
+ * period: cpe_fp_tx() reads it under the transmit path's RCU-bh section. */
 struct qm_dscp_fq_map {
+	struct rcu_head rcu;
 	struct qman_fq  *dscp_fq[MAX_DSCP];
 };
 
@@ -81,7 +81,16 @@ typedef struct tQM_context_ctl {
 	struct net_device *net_dev;
 	struct qm_ceetm_lni *lni;
 	struct qm_ceetm_sp *sp;
-	struct qm_dscp_fq_map *dscp_fq_map;
+	/* The DSCP map, in two stages. `dscp_fq_claimed' is the table this
+	 * port owns while it holds the microcode's single map, from the claim
+	 * to the release; the per-DSCP setters write into it. `dscp_fq_map' is
+	 * the same table once published, and NULL otherwise: it is what the
+	 * software Tx path reads, and whether it is set is what gives a new
+	 * classifier entry the microcode's DSCP bit. A port can hold the claim
+	 * unpublished -- before its first filter is programmed, and after its
+	 * last is gone while entries installed under it are still retiring. */
+	struct qm_dscp_fq_map __rcu *dscp_fq_map;
+	struct qm_dscp_fq_map *dscp_fq_claimed;
 	uint32_t qos_enabled;		/* port qos control */
 	uint32_t chnl_map;
 	struct shaper_info shaper_info; /* port shaper config */
@@ -92,246 +101,28 @@ struct ceetm_chnl_info {
 	uint32_t idx;
 	uint32_t wbfq_priority;
 	uint32_t wbfq_chshaper;
-	void *pcd_handle;	/* handle to fm_pcd device for this fman */
-	struct shaper_info shaper_info; 
+	struct shaper_info shaper_info;
 	PQM_context_ctl qm_ctx;
 	struct classque_info cq_info[MAX_SCHEDULER_QUEUES]; 
 };
 #define QM_GET_CONTEXT(output_port) (&gQMCtx[output_port])
 
-// commands
-typedef struct _tQosResetCommand {
-	uint16_t status;
-	uint16_t reserved;
-	unsigned char ifname[IFNAMSIZ];
-}QosResetCommand, *PQosResetCommand;
-
 /* return values */
 #define QOS_ENERR_NOT_CONFIGURED 	1
 #define QOS_ENERR_IO	          	2
-#define QOS_ENERR_INVAL_PARAM    	3
-typedef struct _tQosEnableCommand {
-	uint16_t status;
-	uint16_t reserved;
-	unsigned char ifname[IFNAMSIZ];
-	unsigned short enable_flag;
-}QosEnableCommand, *PQosEnableCommand;
-
-#define PORT_SHAPER_CFG         (1 << 2)
-#define SHAPER_CFG_VALID        (1 << 3)
 
 #define SHAPER_ON               1
 #define SHAPER_OFF              2
 
-#define DISABLE_POLICER         0
-#define DEFAULT_CQ_CIR_VALUE 0xffffffff
-#define DEFAULT_CQ_PIR_VALUE 0xffffffff
-/* For byte mode this is the max expected pkt size */
-#define DEFAULT_CQ_BYTE_MODE_CBS 2000
-#define DEFAULT_CQ_BYTE_MODE_PBS 2000
-
-typedef struct _tQosShaperConfigCommand {
-	uint16_t status;
-	uint16_t reserved;
-	union {
-		uint8_t ifname[IFNAMSIZ];
-		uint32_t channel_num;
-	};
-	uint32_t enable;
-	uint32_t cfg_flags;
-	uint32_t rate;
-	uint32_t bsize;
-}__attribute__((__packed__)) QosShaperConfigCommand, *PQosShaperConfigCommand;
-
-
-#define WBFQ_PRIORITY_VALID     (1 << 0)
-#define WBFQ_SHAPER_VALID     (1 << 1)
-typedef struct _tQosWbfqConfigCommand {
-	uint16_t status;
-	uint16_t reserved;
-	uint32_t channel_num;
-	uint32_t priority;
-	uint32_t wbfq_chshaper;
-	uint32_t cfg_flags;
-} __attribute__((__packed__)) QosWbfqConfigCommand, *PQosWbfqConfigCommand;
-
-
-#define CQ_SHAPER_CFG_VALID (1 << 0)
-#define CQ_WEIGHT_VALID (1 << 1)
-#define CQ_TDINFO_VALID (1 << 2)    
-#define CQ_RATE_VALID   (1 << 4)
-
-typedef struct _tQosCqConfigCommand {
-	uint16_t status;
-	uint16_t reserved;
-	uint32_t channel_num;
-	uint32_t quenum;
-	uint32_t tdthresh;
-	uint32_t cfg_flags;
-	union { 
-		uint32_t ch_shaper_en;
-		uint32_t weight;
-	};
-	uint32_t cq_shaper_on;
-	uint32_t shaper_rate;
-} __attribute__((__packed__)) QosCqConfigCommand, *PQosCqConfigCommand;
-
-
-typedef struct _tQosChnlAssignCommand {
-	uint16_t status;
-	uint16_t reserved;
-	uint8_t ifname[IFNAMSIZ];
-	uint32_t channel_num;
-} __attribute__((__packed__)) QosChnlAssignCommand, *PQosChnlAssignCommand;
-
-typedef struct _tQosDscpChnlClsq_mapCmd {
-	uint8_t channel_num;
-	uint8_t clsqueue_num;
-	uint8_t dscp;
-	uint8_t status;
-	uint8_t ifname[IFNAMSIZ];
-} __attribute__((__packed__)) QosDscpChnlClsq_mapCmd, *PQosDscpChnlClsq_mapCmd;
-
-/* structure passed from CMM to QM containing Fast forward Rate Limiting configuration */
-enum ratelim_counter {
-	RED_TOTAL,
-	YELLOW_TOTAL,
-	GREEN_TOTAL,
-	RED_RECOLORED,
-	YELLOW_RECOLORED,
-	MAX_RATLIM_CNTR
-};
-
-typedef struct _tQosExptRateCommand {
-        uint16_t status;
-	unsigned short expt_iftype; // WIFI or ETH or PCAP
-	unsigned int pkts_per_sec;
-	uint32_t burst_size;
-	uint32_t clear;
-	uint32_t counterval[MAX_RATLIM_CNTR];
-}QosExptRateCommand, *PQosExptRateCommand;
-
-typedef struct _tQosIfaceDscpFqidMapCommand {
-	uint16_t	status;
-	uint8_t		pad;
-	uint8_t		enable;
-	uint8_t		ifname[IFNAMSIZ];
-	uint32_t	fqid[MAX_DSCP];
-}QosIfaceDscpFqidMapCommand, *PQosIfaceDscpFqidMapCommand;
-
-typedef struct _tQosFFRateCommand {
-	uint16_t status;
-	uint16_t reserved;
-	uint8_t interface[IFNAMSIZ];    /* interface name */
-	unsigned int cir;
-	unsigned int pir;
-	uint32_t clear;
-	uint32_t counterval[MAX_RATLIM_CNTR];
-}__attribute__((__packed__)) QosFFRateCommand, *PQosFFRateCommand;
-
-
-
-struct QosChnlShaperInfo {
-	uint32_t valid;
-	uint32_t shaper_enabled;    	/* port shaper enable */
-	uint32_t rate;			/* port shaper rate */
-	uint32_t bsize;			/* port shaper bucket size */
-};
-
-typedef struct _tQosQueryCommand
-{
-	uint16_t status;
-	uint16_t reserved;
-	uint8_t interface[IFNAMSIZ];    /* interface name */
-	uint32_t if_qos_enabled;        /* global qos enabled */
-	uint32_t shaper_enabled;    	/* port shaper enable */
-	uint32_t rate;			/* port shaper rate */
-	uint32_t bsize;			/* port shaper bucket size */
-	struct QosChnlShaperInfo chnl_shaper_info[NUM_CHANNEL_SHAPERS];
-}__attribute__((packed)) QosQueryCmd, *pQosQueryCmd;
-
-typedef struct _tQosCqQueryCommand {
-	uint16_t status;
-	uint16_t reserved;
-	uint32_t channel_num;
-	uint32_t queuenum;              /* que num 0 -15, if >15 for port */
-	uint32_t clear_stats;
-	uint32_t wbfq_priority;         /* priority if wbfq class que */
-	uint32_t wbfq_chshaper;         /* wbfq channel shaper */
-	union { 
-		uint32_t cq_ch_shaper;    	/* class que shaper enable */
-		uint32_t weight;                /* weight for WBFQ queues */
-	};
-	uint32_t qdepth;                /* TD threshold for queues */
-	uint32_t fqid;                  /* FQID for queue */
-	uint32_t frm_count;
-	uint32_t deque_pkts_high;
-	uint32_t deque_pkts_lo;
-	uint32_t deque_bytes_high;
-	uint32_t deque_bytes_lo;
-	uint32_t reject_pkts_high;
-	uint32_t reject_pkts_lo;
-	uint32_t reject_bytes_high;
-	uint32_t reject_bytes_lo;
-	uint32_t cq_shaper_on;
-	uint32_t cir;
-	uint32_t counterval[MAX_RATLIM_CNTR];
-}__attribute__((packed)) QosCqQueryCmd, *pQosCqQueryCmd;
-
-#ifdef ENABLE_INGRESS_QOS
-typedef struct _tIngressQosEnableCommand {
-	uint16_t queue_no;
-	uint16_t enable_flag;
-}__attribute__((__packed__))IngressQosEnableCommand, *PIngressQosEnableCommand;
-
-/* structure passed from CMM to QM containing Ingress policing configuration */
-typedef struct _tIngressQosConfigCommand {
-        uint16_t status;
-        uint16_t queue_no;
-        uint32_t cir;
-        uint32_t pir;
-}__attribute__((__packed__)) IngressQosCfgCommand, *PIngressQosCfgCommand;
-
-typedef struct _tIngressQosStat {
-	uint32_t policer_on;
-        uint32_t cir;
-        uint32_t pir;
-        uint32_t cbs;
-        uint32_t pbs;
-	uint32_t counterval[MAX_RATLIM_CNTR];
-}__attribute__((packed)) IngressQosStat, *pIngressQosStat;
-
-typedef struct _tIngressQosStatCommand {
-	uint32_t clear;
-	struct _tIngressQosStat policer_stats[INGRESS_FLOW_POLICER_QUEUES];
-}__attribute__((packed)) IngressQosStatCmd, *pIngressQosStatCmd;
-
-#ifdef SEC_PROFILE_SUPPORT
-typedef struct _tSecQosStatCommand {
-	uint32_t clear;
-	struct _tIngressQosStat policer_stats;
-}__attribute__((packed)) SecQosStatCmd, *pSecQosStatCmd;
-
-typedef struct _tQosSecRateCommand {
-	uint16_t status;
-	uint16_t reserved;
-	unsigned int cir;
-	unsigned int pir;
-	uint32_t cbs;
-	uint32_t pbs;
-	uint32_t clear;
-	uint32_t counterval[MAX_RATLIM_CNTR];
-}__attribute__((__packed__)) QosSecRateCommand, *PQosSecRateCommand;
-#endif /* endif for SEC_PROFILE_SUPPORT */
-
-#endif
 int qm_init(void);
 void qm_exit(void);
 extern QM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
 cdx_dscp_fqid_t* get_dscp_fqid_map(uint32_t portid);
-int ceetm_get_dscp_fq_map(struct tQM_context_ctl *qm_ctx, PQosIfaceDscpFqidMapCommand cmd);
-int ceetm_enable_disable_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t status); 
+int ceetm_dscp_map_claim(struct tQM_context_ctl *qm_ctx);
+void ceetm_dscp_map_publish(struct tQM_context_ctl *qm_ctx);
+void ceetm_dscp_map_unpublish(struct tQM_context_ctl *qm_ctx);
+int ceetm_dscp_map_release(struct tQM_context_ctl *qm_ctx);
 int enable_dscp_fqid_map(uint32_t portid);
 int disable_dscp_fqid_map(uint32_t portid);
 int reset_dscp_fq_map_ff(cdx_dscp_fqid_t *muram_dscp_fqid_map, uint8_t dscp);

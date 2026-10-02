@@ -1,51 +1,83 @@
-From f2d1e600520fe10bcf08893ddf084c5164c470ae Mon Sep 17 00:00:00 2001
+From 2a5c7e5d3d6b0930b1b4cd9261eef54b3efed437 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
 
-Adds the IPsec fast-path offload: a new net/xfrm/ipsec_flow.c/.h pair
-wiring xfrm_state into the FMAN SEC (CAAM) engine, plus hook points in
-xfrm_input.c/xfrm_output.c/xfrm_policy.c/xfrm_state.c/xfrm_user.c and
-the IPv4/IPv6 policy glue (xfrm4_policy.c, xfrm6_policy.c). New Kconfigs
+Adds the IPsec packet offload to the FMAN SEC (CAAM) engine: hook points
+in xfrm_input.c, xfrm_output.c, xfrm_device.c and xfrm_state.c. New Kconfigs
 INET_IPSEC_OFFLOAD (net/ipv4/Kconfig) and INET6_IPSEC_OFFLOAD
 (net/ipv6/Kconfig), both depending on CPE_FAST_PATH from 010.
 
 Also the CAAM PDB struct packing (drivers/crypto/caam/pdb.h) required
-for SEC's view of the IPsec descriptor layout, the net/key/af_key.c
-integration, and xfrm.h/netns/xfrm.h additions (xfrm_state.handle/byh,
-netns_xfrm.state_byh, xfrm_input_shared) plus pfkeyv2.h UAPI.
+for SEC's view of the IPsec descriptor layout, the xfrm_state handle and
+its byh index (xfrm.h, netns/xfrm.h), and the PF_KEY ESN flag
+(pfkeyv2.h, af_key.c).
 
-GCM/GMAC SAs offload like every other supported cipher; the shared
+The handle is the driver's: xdo_dev_state_add() sets it before the state
+is inserted, and the state is indexed by it so that the driver can
+resolve a frame SEC has decrypted back to its state. A state no driver
+took has no handle and is not indexed.
+
+GCM SAs offload like every other supported cipher; the shared
 descriptor sharing policy that made them unsafe is fixed on the cdx
-side (DNCPE-2358).
+side (DNCPE-2358). GMAC does not offload: SEC's GMAC ICV leaves out the
+IV that RFC 4543 authenticates, so the cdx adapter refuses it.
 
-Compiles warning-free: the offload entry points are declared in
-include/net/xfrm.h instead of per-file externs and
-__xfrm_state_lookup_byhandle is static.
+A packet-offloaded SA's frames leave only by the SA's own device, the
+one that hands them to SEC: a bundle routed to another device is dropped
+and counted as XfrmOutBundleCheckError, and validate_xmit_xfrm() drops a
+frame moved off it later. A bundle of more than one transform is dropped
+the same way, since the driver applies only the first. Tunnel mode goes
+to the device directly with an Ethernet header the IPsec offline port
+rewrites, so no neighbour of the inner family is resolved; the SA's own
+next hop is still used per packet, as neighbour output used it, so Linux
+keeps that entry resolved. A GSO packet is segmented in software first,
+checksums finished, so SEC gets one packet per ESP. The frame's DPOVRD
+follows the SA's mode: a tunnel's names the inner protocol, a transport
+SA's the frame's own IP header length and next-header offset. A frame
+the driver could not give SEC is counted as a transmit drop, not in
+`tx toenc`. An update that would change a packet-offloaded state's
+encapsulation ports or output mark in place is refused: no driver hears
+of an update, and the hardware SA carries the ports and was addressed by
+a route looked up with the mark, so deleting and adding the state is
+what programs new ones.
+
+A state with a handle is received through SEC and nothing else: SEC
+keeps its anti-replay window, and xfrm's copy of it is refreshed from
+SEC but never written back. xfrm_input() hands its ESP to the driver,
+which takes only a frame that arrived on the state's own device, and
+drops whatever SEC is not given -- another device's or another port's
+ESP, a frame the driver could not queue, ESP delivered by GRO -- as
+XfrmInStateMismatch rather than decrypt it against a second window. A
+state another driver offloads is received as upstream receives it.
+
+A packet-offloaded state's sequence numbers and anti-replay window move in
+its device, so xfrm's copy of them is the driver's to publish.
+XFRM_MSG_GETAE and xfrm_state_migrate() ask it to
+(xdo_dev_state_update_stats()) before they read that copy, as
+XFRM_MSG_GETSA already does, and XFRM_MSG_NEWAE refuses to write it: no
+driver hears of an update, so the state would report a replay state its
+device never had.
+
+Compiles warning-free: xfrm_state_lookup_byhandle() is declared in
+include/net/xfrm.h and __xfrm_state_lookup_byhandle is static.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- drivers/crypto/caam/pdb.h    |  12 +-
- include/net/ip6_tunnel.h     |   4 +-
- include/net/netns/xfrm.h     |   3 +
- include/net/xfrm.h           |  30 ++
- include/uapi/linux/pfkeyv2.h |   1 +
- net/ipv4/Kconfig             |   6 +
- net/ipv4/xfrm4_policy.c      |  13 +
- net/ipv6/Kconfig             |   6 +
- net/ipv6/xfrm6_policy.c      |  10 +
- net/key/af_key.c             | 896 +++++++++++++++++++++++++++++++++++
- net/xfrm/Makefile            |   1 +
- net/xfrm/ipsec_flow.c        | 231 +++++++++
- net/xfrm/ipsec_flow.h        |  31 ++
- net/xfrm/xfrm_input.c        |  20 +
- net/xfrm/xfrm_output.c       | 114 +++++
- net/xfrm/xfrm_policy.c       |  90 ++++
- net/xfrm/xfrm_state.c        | 218 +++++++++
- net/xfrm/xfrm_user.c         |   4 +
- 18 files changed, 1683 insertions(+), 7 deletions(-)
- create mode 100644 net/xfrm/ipsec_flow.c
- create mode 100644 net/xfrm/ipsec_flow.h
+ drivers/crypto/caam/pdb.h                     |  12 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 126 +++++++--
+ include/net/netns/xfrm.h                      |   3 +
+ include/net/xfrm.h                            |  11 +
+ include/uapi/linux/pfkeyv2.h                  |   1 +
+ net/ipv4/Kconfig                              |   6 +
+ net/ipv6/Kconfig                              |   6 +
+ net/key/af_key.c                              |   8 +
+ net/xfrm/xfrm_device.c                        |  24 ++
+ net/xfrm/xfrm_input.c                         |  48 ++++
+ net/xfrm/xfrm_output.c                        | 248 ++++++++++++++++++
+ net/xfrm/xfrm_state.c                         | 202 ++++++++++++++
+ net/xfrm/xfrm_user.c                          |  27 ++
+ 13 files changed, 691 insertions(+), 31 deletions(-)
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac..1669e0d267e3 100644
@@ -105,21 +137,209 @@ index 4b1bcf53f7ac..1669e0d267e3 100644
  
  /*
   * IPSec ESP Datapath Protocol Override Register (DPOVRD)
-diff --git a/include/net/ip6_tunnel.h b/include/net/ip6_tunnel.h
-index 17913fca5445..43a3a1ef0e5e 100644
---- a/include/net/ip6_tunnel.h
-+++ b/include/net/ip6_tunnel.h
-@@ -52,7 +52,9 @@ struct ip6_tnl {
- 	struct flowi fl;	/* flowi template for xmit */
- 	struct dst_cache dst_cache;	/* cached dst */
- 	struct gro_cells gro_cells;
--
-+#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	u32 genid;
-+#endif
- 	int err_count;
- 	unsigned long err_time;
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+index f1609f46faba..dc012b4dd1e2 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+@@ -58,6 +58,7 @@
+ #include <uapi/linux/ppp_defs.h>
+ #include <uapi/linux/if_pppox.h>
+ #include <linux/if_vlan.h>
++#include <net/ipv6.h>
+ #include <net/xfrm.h>
+ #endif
  
+@@ -1478,17 +1479,90 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 	}
+ }
+ 
+-static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
++/* The DPOVRD value SEC encrypts a frame for `x` with; false if the frame's IP
++ * header is one it cannot be told about.
++ *
++ * With the override bit set SEC takes the IP header length, the next-header
++ * offset and the next header from here instead of from the SA's PDB. A
++ * tunnel's is the inner packet's own protocol for the ESP trailer, IPIP or
++ * IPv6. A transport SA's describes the frame's own IP header: SEC copies the
++ * protocol it finds at the next-header offset into the trailer, writes ESP
++ * there instead, and encrypts only what follows the header. Given a tunnel's
++ * value -- offset and length zero -- a transport frame has its IP header
++ * encrypted and IPIP named in the trailer, which no peer decodes. The PDB's
++ * own values fit only a header of the plain length, so a transport frame's
++ * are taken from the frame, IPv4 options and IPv6 extension headers
++ * included.
++ */
++static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
++			     unsigned int len, u32 *dpovrd)
++{
++	unsigned int hdr_len, nh_offset;
++
++	if (x->props.mode != XFRM_MODE_TRANSPORT) {
++		*dpovrd = DPOVRD_ENABLE |
++			  ((*nh >> 4) == IPVERSION ? IPPROTO_IPIP : IPPROTO_IPV6);
++		return true;
++	}
++	if ((*nh >> 4) == IPVERSION) {
++		hdr_len = (nh[0] & 0xf) * 4;
++		if (hdr_len < sizeof(struct iphdr) || hdr_len > len)
++			return false;
++		/* Any non-zero offset names byte 9 of an IPv4 header. */
++		nh_offset = 1;
++	} else {
++		unsigned int at = offsetof(struct ipv6hdr, nexthdr);
++		bool routing = false;
++		u8 next;
++
++		hdr_len = sizeof(struct ipv6hdr);
++		if (hdr_len > len)
++			return false;
++		next = nh[at];
++		/* ESP follows hop-by-hop options, a routing header and any
++		 * destination options ahead of one, where ip6_find_1stfragopt()
++		 * puts the transport header. */
++		for (;;) {
++			if (next == NEXTHDR_ROUTING)
++				routing = true;
++			else if (next != NEXTHDR_HOP &&
++				 (next != NEXTHDR_DEST || routing))
++				break;
++			if (hdr_len + 2 > len)
++				return false;
++			at = hdr_len;
++			next = nh[at];
++			hdr_len += (nh[at + 1] + 1) * 8;
++			if (hdr_len > len)
++				return false;
++		}
++		/* SEC reads byte 6 for an offset of one and eight times the
++		 * offset otherwise, which is where every extension header,
++		 * starting on an eight-byte boundary, keeps its own. */
++		nh_offset = at == offsetof(struct ipv6hdr, nexthdr) ? 1 : at / 8;
++	}
++	/* Both are eight-bit fields. */
++	if (hdr_len > 0xff)
++		return false;
++	*dpovrd = DPOVRD_ENABLE | hdr_len << 16 | nh_offset << 8 | IPPROTO_ESP;
++	return true;
++}
++
++/* Hand a frame for a packet-offloaded SA to SEC. 0 means SEC has it; anything
++ * else means it was freed here instead and counted as dropped on net_dev, so
++ * a caller counting what it gave SEC counts only a 0.
++ */
++static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+ {
+ 	struct xfrm_state *x;
+ 	struct qman_fq *egress_fq = NULL;
+ 	struct qm_fd		 fd;
+-	int err = 0,ii;
++	int err = -ENOENT, ii;
+ 	int new_ethhdr_end, old_ethhdr_end;
+ 	unsigned short l3_proto, l3_offset;
+ 	unsigned char* skb_nh ;
+ 	struct sec_path *sp;
+-	unsigned int dpovrd = 0;
++	u32 dpovrd = 0;
+ 	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
+ 	 * concurrently; never read the global twice */
+ 	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
+@@ -1505,9 +1579,9 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
+ 		use the below code */
+ 		if (!egress_fq)
+ 		{
+-			printk("%s(%d) egress frame queue not found \n",
+-			__func__, __LINE__);
+-			goto sec_submit_failed;	
++			net_err_ratelimited("%s: no SEC queue for SA handle %u\n",
++					    __func__, x->handle);
++			goto sec_submit_failed;
+ 		}
+ 
+ 		/*
+@@ -1528,7 +1602,8 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
+ 				 * offload interface), COW it first so the capture is not
+ 				 * corrupted. skb_cow_head() is a cheap branch when the skb is
+ 				 * not cloned; on failure drop the packet like the paths below. */
+-				if (skb_cow_head(skb, 0))
++				err = skb_cow_head(skb, 0);
++				if (err)
+ 					goto sec_submit_failed;
+ 				/* skb_cow_head() may have reallocated skb->head, so the cached
+ 				 * network-header pointer is now stale; re-derive it against the
+@@ -1544,22 +1619,20 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
+ 				skb->data = skb->data + l3_offset - ETH_HDR_SIZE;
+ 				skb->len = skb->len - l3_offset + ETH_HDR_SIZE;
+ 			}
+-			if ((*skb_nh >> 4) == IPVERSION) /* Extracting ip version from network header */
+-			{
+-				dpovrd = IPPROTO_IPIP; /* ESP trailer NH type. Here traffic is IPv4 */
+-			}
+-			else
+-			{
+-				dpovrd = IPPROTO_IPV6; /* ESP trailer NH type. Here traffic is IPv4 */
++			if (!dpa_ipsec_dpovrd(x, skb_nh,
++					      skb_headlen(skb) - (skb_nh - skb->data),
++					      &dpovrd)) {
++				err = -EINVAL;
++				goto sec_submit_failed;
+ 			}
+-			dpovrd |= DPOVRD_ENABLE; /* OVRD enable */
+ 		}
+ 
+ 
+ 		err =  skb_fraglist_to_sg_fd(dpa_bp->dev, net_dev, skb, &fd, dpovrd);
+ 		if (unlikely(err < 0))
+ 		{
+-			printk("%s(%d) skb_fraglist_to_sg_fd \n",__func__,__LINE__);
++			net_err_ratelimited("%s: no S/G frame for SEC: %d\n",
++					    __func__, err);
+ 			goto sec_submit_failed;
+ 		}
+ 
+@@ -1617,12 +1690,12 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
+ 
+ 		/* sucessful transmit to CAAM */
+ 		netif_trans_update(net_dev);
+-		return;
++		return 0;
+ 	}
+ sec_submit_failed:
+-	dev_kfree_skb(skb);
+-	return;
+-
++	dev_core_stats_tx_dropped_inc(net_dev);
++	kfree_skb(skb);
++	return err;
+ }
+ 
+ /* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
+@@ -1753,8 +1826,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+ 		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, 0);
+ 		if (unlikely(err < 0))
+ 		{
+-			printk("%s(%d) skb_fraglist_to_sg_fd failed\n",
+-					__func__,__LINE__);
++			net_err_ratelimited("%s: no S/G frame for SEC: %d\n",
++					    __func__, err);
+ 			goto err_giveback; /* give packet to linux */
+ 		}
+ 
+@@ -1860,9 +1933,12 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+ #ifdef CONFIG_XFRM
+ #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+ 	if(skb->ipsec_offload) {
+-		dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp);
+-		percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+-		percpu_priv->tx_caam_enc++;
++		/* tx toenc counts frames SEC was given; one freed instead is
++		 * already counted as dropped. */
++		if (!dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp)) {
++			percpu_priv = raw_cpu_ptr(priv->percpu_priv);
++			percpu_priv->tx_caam_enc++;
++		}
+ 		return NETDEV_TX_OK;
+ 	}
+ #endif
 diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
 index 23dd647fe024..9c7c9758e5e1 100644
 --- a/include/net/netns/xfrm.h
@@ -135,10 +355,10 @@ index 23dd647fe024..9c7c9758e5e1 100644
  	struct hlist_head	 __percpu *state_cache_input;
  	unsigned int		state_hmask;
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index a20a01dd6f98..ff47f65c19bd 100644
+index a20a01dd6f98..2412c22ce0a6 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
-@@ -183,6 +183,12 @@ struct xfrm_state {
+@@ -183,6 +183,11 @@ struct xfrm_state {
  		struct hlist_node	bysrc;
  	};
  	struct hlist_node	byspi;
@@ -146,45 +366,19 @@ index a20a01dd6f98..ff47f65c19bd 100644
 +	struct hlist_node	byh;
 +	u16			handle;
 +	u16			in_byh_hash;
-+	u16			parent_sa_handle; /*handle of the old SA from which this SA is created using rekey*/
 +#endif
  	struct hlist_node	byseq;
  	struct hlist_node	state_cache;
  	struct hlist_node	state_cache_input;
-@@ -300,6 +306,11 @@ struct xfrm_state {
- 	/* Private data of this transformer, format is opaque,
- 	 * interpreted by xfrm_type methods. */
- 	void			*data;
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	/* Intended direction of this state, used for offloading */
-+	int	offloaded;
-+	u64	curr_time;
-+#endif
- 	u8			dir;
- };
- 
-@@ -320,6 +331,25 @@ enum {
+@@ -320,6 +325,12 @@ enum {
  	XFRM_STATE_EXPIRED,
  	XFRM_STATE_DEAD
  };
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+enum {
-+	 XFRM_STATE_DIR_UNKNOWN,
-+	 XFRM_STATE_DIR_IN,
-+	 XFRM_STATE_DIR_OUT,
-+};
-+
-+/* ASK IPsec offload glue (xfrm_policy.c, xfrm_state.c, ipsec_flow.c,
-+ * af_key.c); some symbols also consumed by the out-of-tree cdx module. */
-+int xfrm_get_tos(const struct flowi *fl, int family);
++/* The packet-offloaded state the driver knows by this handle, held; for the
++ * out-of-tree cdx module, which gets the handle back from SEC with each
++ * decrypted frame. */
 +struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
-+int ipsec_flow_init(struct net *net);
-+void ipsec_flow_fini(struct net *net);
-+void flow_cache_remove(const struct flowi *fl, unsigned short family,
-+		unsigned short dir);
-+int ipsec_nlkey_flow(u16 xfrm_nr, u16 *xfrm_handle, const struct flowi *fl,
-+		u16 family, u16 dir, u16 ignore_neigh);
-+int ipsec_nlkey_flow_remove(struct flowi *fl, u16 family, u16 dir);
 +#endif
  
  /* callback structure passed from either netlink or pfkey */
@@ -218,30 +412,6 @@ index 4cfd87b28c04..8871e4f90f2c 100644
  config INET_IPCOMP
  	tristate "IP: IPComp transformation"
  	select INET_XFRM_TUNNEL
-diff --git a/net/ipv4/xfrm4_policy.c b/net/ipv4/xfrm4_policy.c
-index 7e1c2faed1ff..985934c2e331 100644
---- a/net/ipv4/xfrm4_policy.c
-+++ b/net/ipv4/xfrm4_policy.c
-@@ -33,6 +33,19 @@ static struct dst_entry *__xfrm4_dst_lookup(struct flowi4 *fl4,
- 	fl4->flowi4_proto = params->ipproto;
- 	fl4->uli = params->uli;
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	/*
-+	 * For IPsec packets with directly connected IPv4 tunnel end points,
-+	 * neighbor resolution is done for inner destination since we do not
-+	 * add tunnel headers in slow path to IPsec packets. To fix this issue,
-+	 * flag "FLOWI_FLAG_KNOWN_NH" is passed during tunnel route lookup.
-+	 * This flag will ensure that if the src and dst are directly connected
-+	 * then a new route entry is created with "rt_gateway" set to dst
-+	 * address (tunnel dst address).
-+	 */
-+	fl4->flowi4_flags |= FLOWI_FLAG_KNOWN_NH;
-+#endif
-+
- 	rt = __ip_route_output_key(params->net, fl4);
- 	if (!IS_ERR(rt))
- 		return &rt->dst;
 diff --git a/net/ipv6/Kconfig b/net/ipv6/Kconfig
 index 1c9c686d9522..396a081a12b9 100644
 --- a/net/ipv6/Kconfig
@@ -259,1758 +429,470 @@ index 1c9c686d9522..396a081a12b9 100644
  config INET6_IPCOMP
  	tristate "IPv6: IPComp transformation"
  	select INET6_XFRM_TUNNEL
-diff --git a/net/ipv6/xfrm6_policy.c b/net/ipv6/xfrm6_policy.c
-index 3b749475f6ed..470e0590d480 100644
---- a/net/ipv6/xfrm6_policy.c
-+++ b/net/ipv6/xfrm6_policy.c
-@@ -40,6 +40,16 @@ static struct dst_entry *xfrm6_dst_lookup(const struct xfrm_dst_lookup_params *p
- 	fl6.flowi4_proto = params->ipproto;
- 	fl6.uli = params->uli;
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	/*
-+	 * For IPsec packets with directly connected tunnel end points,
-+	 * neighbor resolution is done for inner destination since we do not
-+	 * add tunnel headers in slow path to IPsec packets. To fix this issue,
-+	 * flag "FLOWI_FLAG_KNOWN_NH" is passed during tunnel route lookup.
-+	 */
-+	fl6.flowi6_flags |= FLOWI_FLAG_KNOWN_NH;
-+#endif
-+
- 	dst = ip6_route_output(params->net, NULL, &fl6);
- 
- 	err = dst->error;
 diff --git a/net/key/af_key.c b/net/key/af_key.c
-index c1731bbd85d7..3a59223cb528 100644
+index c1731bbd85d7..ff8887654f1d 100644
 --- a/net/key/af_key.c
 +++ b/net/key/af_key.c
-@@ -26,8 +26,178 @@
- #include <net/net_namespace.h>
- #include <net/netns/generic.h>
- #include <net/xfrm.h>
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD)|| defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+#include <net/netlink.h>
-+#endif
- 
- #include <net/sock.h>
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD)|| defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+#include <net/ip6_route.h>
-+#define NLKEY_SUPPORT 1
-+#else 
-+#undef NLKEY_SUPPORT
-+#endif 
-+
-+#ifdef NLKEY_SUPPORT
-+#include <net/dsfield.h>
-+#include <net/inet_ecn.h>
-+#include <net/ipv6.h>
-+
-+
-+#define	NLKEY_SA_CREATE		0x0A01
-+#define NLKEY_SA_DELETE		0x0A02
-+#define NLKEY_SA_FLUSH 		0x0A03
-+#define NLKEY_SA_SET_KEYS	0x0A04
-+#define NLKEY_SA_SET_TUNNEL	0x0A05
-+#define NLKEY_SA_SET_NATT	0x0A06
-+#define	NLKEY_SA_SET_STATE	0x0A07
-+#define	NLKEY_SA_SET_LIFETIME	0x0A08
-+#define	NLKEY_SA_NOTIFY		0x0A09
-+#define NLKEY_SA_INFO_UPDATE	0x0A0C
-+#define NLKEY_SA_SET_OFFLOAD	0x0A0D
-+#define	NLKEY_FLOW_ADD		0x0A11
-+#define NLKEY_FLOW_REMOVE	0x0A12
-+#define NLKEY_FLOW_NOTIFY	0x0A13
-+#define NLKEY_NULL_MSG		0x0000
-+
-+#define NLKEY_HDR_LEN		4
-+#define NLKEY_MSG_LEN 		256
-+
-+#define NLKEY_MAX_NUM_KEYS	2
-+#define NLKEY_MAX_KEY_LEN	(512 / 8)
-+
-+struct nlkey_msg {
-+	/* message data */
-+	unsigned short fcode;
-+	unsigned short length;
-+	unsigned short payload[(NLKEY_MSG_LEN /sizeof(unsigned short))];
-+};
-+/* sizeof(nlkey_msg) = 4 + 256 */
-+
-+struct nlkey_sa_id {
-+	unsigned int spi;
-+	unsigned char sa_type;
-+	unsigned char proto_family;
-+	unsigned char replay_window;
-+#define NLKEY_SAFLAGS_ESN	0x1
-+#define NLKEY_SAFLAGS_INBOUND	0x2
-+	unsigned char flags;
-+	unsigned int dst_ip[4];
-+	unsigned int src_ip[4];
-+	unsigned short mtu;
-+	unsigned short dev_mtu;
-+
-+};
-+/* sizeof(nlkey_sa_id) = 24 */
-+
-+struct nlkey_sa_create {
-+	unsigned short sagd;
-+	unsigned short parent_sa_sagd; /*sagd value of old SA from which this SA is rekeyed.*/
-+	struct nlkey_sa_id said;
-+};
-+/* sizeof(nlkey_sa_delete) = 28 */
-+
-+struct nlkey_sa_delete {
-+	unsigned short sagd;
-+	unsigned short rsvd;
-+};
-+/* sizeof(nlkey_sa_delete) = 4 */
-+
-+struct nlkey_sa_set_tunnel {
-+	unsigned short sagd;
-+	unsigned char rsvd;
-+	unsigned char proto_family;
-+	union {
-+		struct iphdr 	 ipv4h;
-+		struct ipv6hdr ipv6h;
-+	} h;
-+};
-+/* sizeof(nlkey_sa_set_tunnel) = 36 */
-+
-+struct nlkey_sa_set_natt {
-+	unsigned short sagd;
-+	unsigned short sport;
-+	unsigned short dport;
-+	unsigned short rsvd;
-+};
-+/* sizeof(nlkey_sa_set_natt) = 4 */
-+
-+struct nlkey_sa_set_state {
-+	unsigned short sagd;
-+	unsigned short parent_sa_sagd;
-+	unsigned short state;
-+	unsigned short rsvd2;
-+};
-+/* sizeof(nlkey_sa_set_natt) = 8 */
-+
-+struct nlkey_key_desc {
-+	unsigned short key_bits;
-+	unsigned char key_alg;
-+	unsigned char  key_type;
-+	unsigned char key[NLKEY_MAX_KEY_LEN]; 
-+};
-+/* sizeof(nlkey_key_desc) =  36 */
-+
-+struct nlkey_sa_set_keys {
-+	unsigned short sagd;
-+	unsigned short rsvd;	
-+	unsigned short num_keys;
-+	unsigned short rsvd2;
-+	struct nlkey_key_desc keys[NLKEY_MAX_NUM_KEYS];
-+};
-+/* sizeof(nlkey_sa_set_keys) =  80 */
-+
-+struct nlkey_lifetime_desc {
-+	unsigned int allocations;
-+	unsigned int bytes[2];
-+};
-+/* sizeof(nlkey_sa_set_lifetime) =  12 */
-+
-+struct nlkey_sa_set_lifetime {
-+	unsigned short sagd;
-+	unsigned short rsvd;
-+	struct nlkey_lifetime_desc hard_time;
-+	struct nlkey_lifetime_desc soft_time;
-+	struct nlkey_lifetime_desc current_time;
-+};
-+/* sizeof(nlkey_sa_set_lifetime) =  40 */
-+
-+/* SA notifications */
-+#define IPSEC_SOFT_EXPIRE 0
-+#define IPSEC_HARD_EXPIRE 1
-+
-+struct nlkey_sa_notify {
-+	unsigned short sagd;
-+	unsigned short rsvd;
-+	unsigned int  action;
-+};
-+/* sizeof(nlkey_sa_notify) = 8 */
-+
-+/* SA Info update */
-+
-+struct nlkey_sa_info {
-+        unsigned short sagd;
-+        unsigned short rsvd;
-+        unsigned long long bytes;
-+        unsigned long long packets;
-+};
-+/* sizeof(nlkey_sa_info) =  */
-+
-+
-+static int ipsec_nlkey_send(struct net *net, struct xfrm_state *x, const struct km_event *c);
-+static void ipsec_nlkey_rcv(struct sk_buff *skb);
-+static void ipsec_nlkey_init(void);
-+static unsigned short ipsec_sacode_to_nlkeycode(unsigned short sa_code);
-+static struct sk_buff * ipsec_xfrm2nlkey (struct net *net, struct xfrm_state *x, 
-+					const struct km_event *c, unsigned short *msg_id);
-+static int ipsec_nlkey_set_said(struct net *net, struct xfrm_state *x, const struct km_event *c, struct nlkey_sa_id *said);
-+
-+/* netlink NETLINK_KEY socket */
-+struct sock *nlkey_socket = NULL;
-+
-+#endif
-+/************************************************************************************/
-+
- 
- #define _X2KEY(x) ((x) == XFRM_INF ? 0 : (x))
- #define _KEY2X(x) ((x) == 0 ? XFRM_INF : (x))
-@@ -892,6 +1062,10 @@ static struct sk_buff *__pfkey_xfrm_state2msg(const struct xfrm_state *x,
+@@ -892,6 +892,10 @@ static struct sk_buff *__pfkey_xfrm_state2msg(const struct xfrm_state *x,
  		sa->sadb_sa_flags |= SADB_SAFLAGS_DECAP_DSCP;
  	if (x->props.flags & XFRM_STATE_NOPMTUDISC)
  		sa->sadb_sa_flags |= SADB_SAFLAGS_NOPMTUDISC;
-+#ifdef NLKEY_SUPPORT
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 +	if (x->props.flags & XFRM_STATE_ESN)
 +		sa->sadb_sa_flags |= SADB_SAFLAGS_ESN;
 +#endif
  
  	/* hard time */
  	if (hsc & 2) {
-@@ -924,6 +1098,11 @@ static struct sk_buff *__pfkey_xfrm_state2msg(const struct xfrm_state *x,
- 	lifetime->sadb_lifetime_bytes = x->curlft.bytes;
- 	lifetime->sadb_lifetime_addtime = x->curlft.add_time;
- 	lifetime->sadb_lifetime_usetime = x->curlft.use_time;
-+
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD)|| defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	lifetime->sadb_lifetime_usetime = x->curr_time;
-+#endif
-+
- 	/* src address */
- 	addr = skb_put(skb, sizeof(struct sadb_address) + sockaddr_size);
- 	addr->sadb_address_len =
-@@ -1149,6 +1328,10 @@ static struct xfrm_state * pfkey_msg2xfrm_state(struct net *net,
+@@ -1149,6 +1153,10 @@ static struct xfrm_state * pfkey_msg2xfrm_state(struct net *net,
  		x->props.flags |= XFRM_STATE_DECAP_DSCP;
  	if (sa->sadb_sa_flags & SADB_SAFLAGS_NOPMTUDISC)
  		x->props.flags |= XFRM_STATE_NOPMTUDISC;
-+#ifdef NLKEY_SUPPORT
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 +	if (sa->sadb_sa_flags & SADB_SAFLAGS_ESN)
 +		x->props.flags |= XFRM_STATE_ESN;
 +#endif
  
  	lifetime = ext_hdrs[SADB_EXT_LIFETIME_HARD - 1];
  	if (lifetime != NULL) {
-@@ -3093,6 +3276,12 @@ static int pfkey_send_notify(struct xfrm_state *x, const struct km_event *c)
- 	struct net *net = x ? xs_net(x) : c->net;
- 	struct netns_pfkey *net_pfkey = net_generic(net, pfkey_net_id);
+diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
+index 7744ed8e4c83..f2a7fa2704a4 100644
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -122,6 +122,30 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 	struct net_device *dev = skb->dev;
+ 	struct sec_path *sp;
  
-+
-+#ifdef NLKEY_SUPPORT
-+	/* send message to the user space through NETLINK_KEY socket*/
-+	ipsec_nlkey_send(net, x, c);
-+#endif
-+
- 	if (atomic_read(&net_pfkey->socks_nr) == 0)
- 		return 0;
- 
-@@ -3885,6 +4074,702 @@ static struct xfrm_mgr pfkeyv2_mgr =
- 	.is_alive	= pfkey_is_alive,
- };
- 
-+
-+#ifdef NLKEY_SUPPORT
-+
-+static unsigned short ipsec_sacode_to_nlkeycode(unsigned short sa_code)
-+{
-+	unsigned nlkey_code;
-+
-+	switch (sa_code) 
-+	{
-+		case XFRM_MSG_DELSA:
-+			nlkey_code = NLKEY_SA_DELETE;
-+			break;
-+		case XFRM_MSG_NEWSA:
-+		case XFRM_MSG_UPDSA:
-+			nlkey_code = NLKEY_SA_CREATE;
-+			break;
-+		case XFRM_MSG_FLUSHSA:
-+			nlkey_code = NLKEY_SA_FLUSH;
-+			break;
-+		case XFRM_MSG_EXPIRE:
-+			nlkey_code = NLKEY_SA_SET_STATE;
-+			break;
-+		default:
-+			nlkey_code = NLKEY_NULL_MSG;
-+			break;
-+	}
-+
-+	return nlkey_code;
-+}
-+
-+static void ipsec_nlkey_rcv(struct sk_buff *skb)
-+{
-+	struct nlmsghdr *nlh = NULL;
-+	struct nlkey_msg *msg = NULL;
-+	struct flowi flow;
-+	unsigned short *p;
-+	unsigned short family, dir;
-+	struct xfrm_state *x;
-+	struct nlkey_sa_notify sa_notify_msg;
-+	struct nlkey_sa_info sa_info_msg;
-+	unsigned int payload_len;
-+
-+	/* Reconfiguring IPsec offload is a host-wide datapath operation:
-+	 * expiring SAs, forging byte/packet counters and toggling offload
-+	 * all act on init-net xfrm state. Require CAP_NET_ADMIN in the
-+	 * initial user namespace so a process in an unprivileged netns or
-+	 * userns cannot drive it. Binding NETLINK_KEY needs no capability,
-+	 * so the check must be per-message against the sender's socket. */
-+	if (!netlink_capable(skb, CAP_NET_ADMIN))
-+		return;
-+
-+	/* This is a raw .input callback, so the netlink core does not
-+	 * validate message length for us. Reject anything too short to carry
-+	 * the nlkey header, and bound every per-command payload access below
-+	 * against the bytes the skb actually holds rather than msg->length,
-+	 * which the sender controls. */
-+	if (skb->len < NLMSG_HDRLEN + NLKEY_HDR_LEN)
-+		return;
-+
-+	/* extract message from skb */
-+	nlh = (struct nlmsghdr *)skb->data;
-+
-+	msg = (struct nlkey_msg *)NLMSG_DATA(nlh);
-+	payload_len = skb->len - NLMSG_HDRLEN - NLKEY_HDR_LEN;
-+
-+
-+	/* process command received from user space */
-+	switch(msg->fcode)
-+	{
-+		case NLKEY_FLOW_REMOVE:
-+			if (payload_len < sizeof(struct flowi) + 2 * sizeof(unsigned short))
-+				break;
-+			p = msg->payload;
-+			memcpy(&flow, p, sizeof(struct flowi)); p += sizeof(struct flowi)/2;
-+			family = *p; p++;
-+			dir = *p; p++;
-+			flow_cache_remove(&flow, family, dir);
-+			break;
-+
-+		case NLKEY_SA_NOTIFY:
-+			if (payload_len < sizeof(struct nlkey_sa_notify))
-+				break;
-+			memcpy(&sa_notify_msg, msg->payload, sizeof(struct nlkey_sa_notify));
-+			x = xfrm_state_lookup_byhandle(&init_net, sa_notify_msg.sagd);
-+			if (x) {
-+				spin_lock_bh(&x->lock);
-+
-+				if (sa_notify_msg.action) {
-+					// hard expired
-+					x->km.state = XFRM_STATE_EXPIRED;
-+					hrtimer_start(&x->mtimer, ktime_set(0,0), HRTIMER_MODE_REL_SOFT);
-+				}
-+				else if (!x->km.dying) {
-+					 x->km.dying = 1;
-+					 km_state_expired(x, 0, 0);
-+				}
-+
-+				spin_unlock_bh(&x->lock);
-+				xfrm_state_put(x);
-+			}
-+			break;
-+
-+		case NLKEY_SA_INFO_UPDATE:
-+			if (payload_len < sizeof(struct nlkey_sa_info))
-+				break;
-+			memcpy(&sa_info_msg, msg->payload, sizeof(struct nlkey_sa_info));
-+
-+			x = xfrm_state_lookup_byhandle(&init_net,sa_info_msg.sagd);
-+			if (x) {
-+				spin_lock_bh(&x->lock);
-+
-+				if (x->curlft.bytes != sa_info_msg.bytes)
-+					x->curr_time = ktime_get_real_seconds();
-+
-+				x->curlft.bytes = sa_info_msg.bytes;
-+				x->curlft.packets = sa_info_msg.packets;
-+
-+				spin_unlock_bh(&x->lock);
-+				xfrm_state_put(x);
-+			}
-+			break;
-+
-+		case NLKEY_SA_SET_OFFLOAD:
-+			if (payload_len < sizeof(struct nlkey_sa_notify))
-+				break;
-+			memcpy(&sa_notify_msg, msg->payload, sizeof(struct nlkey_sa_notify));
-+			x = xfrm_state_lookup_byhandle(&init_net,sa_notify_msg.sagd);
-+			if (x) {
-+				spin_lock_bh(&x->lock);
-+				/* Only a live SA may be marked offloaded.
-+				 * __xfrm_state_delete() flips km.state to
-+				 * XFRM_STATE_DEAD before it unlinks the SA from
-+				 * the byh hash, so a lookup racing that window
-+				 * hands us a DEAD SA whose hardware context is
-+				 * already being torn down; setting the flag here
-+				 * would resurrect it. km.state is written under
-+				 * x->lock, which we already hold, so the test is
-+				 * serialised against the delete. Clearing stays
-+				 * unconditional - it is never wrong to drop the
-+				 * flag. */
-+				if (!sa_notify_msg.action)
-+					x->offloaded = 0;
-+				else if (x->km.state == XFRM_STATE_VALID)
-+					x->offloaded = 1;
-+				spin_unlock_bh(&x->lock);
-+				xfrm_state_put(x);
-+			}
-+			break;
-+		default:
-+			break;
-+	}
-+
-+}
-+static int ipsec_nlkey_set_said(struct net *net, struct xfrm_state *x, 
-+				const struct km_event *c, struct nlkey_sa_id *said)
-+{
-+
-+	struct flowi fl;
-+	int tos;
-+	xfrm_address_t saddr, daddr;
-+	struct dst_entry *dst;
-+	struct rt6_info  *rt;
-+	int rc = 0;
-+	int oif = 0;
-+
-+	memset(&fl, 0, sizeof(struct flowi));
-+
-+	/* SPI */
-+	said->spi = x->id.spi;
-+	/* SA Type (AH or ESP) */
-+	said->sa_type = x->id.proto;
-+	/* Protocol Family (IPv4 or IPv6) */
-+	said->proto_family = x->props.family;
-+	/* Replay window */
-+	said->replay_window = x->props.replay_window;
-+	/* Destination IP Address */
-+	if(x->props.family == AF_INET6) {
-+		memcpy(&said->dst_ip, x->id.daddr.a6, sizeof(struct in6_addr));
-+		fl.u.ip6.daddr = *(struct in6_addr *)x->id.daddr.a6;
-+		memcpy(&said->src_ip, x->props.saddr.a6, sizeof(struct in6_addr));
-+	}
-+	else {
-+		said->dst_ip[0] = x->id.daddr.a4;
-+		fl.u.ip4.daddr = x->id.daddr.a4;
-+		said->src_ip[0] = x->props.saddr.a4;
-+	}
-+	said->mtu = 0;
-+
-+	if(x->props.flags & XFRM_STATE_ESN)
-+		said->flags = NLKEY_SAFLAGS_ESN;
-+	xfrm_flowi_addr_get(&fl, &saddr, &daddr, x->props.family);
-+
-+	tos = xfrm_get_tos(&fl, x->props.family);
-+	if (tos < 0) {
-+		pr_err_ratelimited("ipsec_nlkey: xfrm_get_tos failed (family %u)\n", x->props.family);
-+		rc = -1;
-+		goto error;
-+	}
-+	
-+	switch (x->props.family)
-+	{
-+		case AF_INET:
-+			if (!__ip_route_output_key(net, &(fl.u.ip4)))
-+			{
-+				pr_err_ratelimited("ipsec_nlkey: IPv4 route lookup failed\n");
-+				rc = -1;
-+				goto error;
-+			}
-+			oif = fl.u.ip4.flowi4_oif;
-+			break;
-+
-+		case AF_INET6:
-+			rt = rt6_lookup(net, &fl.u.ip6.daddr, NULL, 0, NULL, 0);
-+			if ((!rt) || (!rt->dst.dev))
-+			{
-+				pr_err_ratelimited("ipsec_nlkey: IPv6 route lookup failed\n");
-+				rc = -1;
-+				goto error;
-+			}
-+			oif = rt->dst.dev->ifindex;
-+			break;
-+	}
-+
-+	{
-+		struct xfrm_dst_lookup_params params = {
-+			.net = net,
-+			.tos = tos,
-+			.oif = oif,
-+			.saddr = NULL,
-+			.daddr = &daddr,
-+			.mark = xfrm_smark_get(0, x),
-+		};
-+		dst = __xfrm_dst_lookup(x->props.family, &params);
-+	}
-+	if (IS_ERR(dst)) {
-+		pr_err_ratelimited("ipsec_nlkey: xfrm dst lookup failed (%ld)\n", PTR_ERR(dst));
-+		rc = -1;
-+		goto error;
-+	}
-+
-+	if (strcmp(dst->dev->name, "lo") == 0)
-+		said->flags |= NLKEY_SAFLAGS_INBOUND;
-+
-+	said->dev_mtu = dst_mtu(dst);
-+	said->mtu = xfrm_state_mtu(x,dst_mtu(dst));	
-+
-+	dst_release(dst);
-+error:
-+	return rc;
-+}
-+
-+static struct sk_buff * ipsec_xfrm2nlkey (struct net *net, struct xfrm_state *x, 
-+					const struct km_event *c, unsigned short *msg_id)
-+{
-+	struct nlkey_sa_id sa_id_msg;
-+	struct nlkey_sa_create sa_create_msg;
-+	struct nlkey_sa_delete sa_delete_msg;
-+	struct nlkey_sa_set_keys sa_set_keys_msg;
-+	struct nlkey_sa_set_tunnel sa_set_tunnel_msg;
-+	struct nlkey_sa_set_natt sa_set_natt_msg;
-+	struct nlkey_sa_set_state sa_set_state_msg;
-+	struct nlkey_sa_set_lifetime sa_set_lifetime_msg;
-+	struct nlkey_msg msg;
-+	struct sk_buff *skb = NULL;
-+	struct nlmsghdr *nlh = NULL;
-+	gfp_t allocation = GFP_ATOMIC; //This may called from atomic context
-+	unsigned char tunnel, keys, natt, state, lifetime;
-+
-+	/* supported SA informations */
-+	keys = 1; state = 1; tunnel = 1; lifetime = 1; natt = 1; 
-+
-+	/* next message to build */
-+	memset(&msg, 0, sizeof(struct nlkey_msg));
-+	msg.fcode = *msg_id;
-+	
-+
-+	switch (msg.fcode)
-+	{
-+		case NLKEY_SA_CREATE:
-+			if(x) {
-+				/* some check before builing message */
-+				if(x->id.proto != IPPROTO_ESP) {
-+					printk(KERN_ERR "protocol %d not supported in fast path.\n", x->id.proto);
-+					*msg_id = NLKEY_NULL_MSG;
-+					goto exit;
-+				}
-+
-+				memset(&sa_create_msg, 0, sizeof(struct nlkey_sa_create));
-+
-+				/* SA global handler */
-+				sa_create_msg.sagd = x->handle;
-+
-+				sa_create_msg.parent_sa_sagd = x->parent_sa_handle;
-+
-+				/* SA identifier */
-+				if(ipsec_nlkey_set_said(net, x, c, &sa_create_msg.said) < 0)
-+				{
-+					printk(KERN_ERR "%s: set sa ID failed\n", __func__);
-+					*msg_id = NLKEY_NULL_MSG; /* next message */
-+					goto exit;
-+				}
-+				memcpy(msg.payload, &sa_create_msg, sizeof(struct nlkey_sa_create));
-+				msg.length = sizeof(struct nlkey_sa_create);
-+				*msg_id = NLKEY_SA_SET_KEYS; /* next message */
-+			} else {
-+				*msg_id = NLKEY_NULL_MSG; /* next message */
-+				goto exit;
-+			}
-+			
-+			break;
-+
-+		case NLKEY_SA_SET_KEYS:
-+			if(keys) {
-+				memset(&sa_set_keys_msg, 0, sizeof(struct nlkey_sa_set_keys));
-+
-+				/* SA global handler */
-+				sa_set_keys_msg.sagd = x->handle; 
-+				
-+				/* auth key */
-+				if(x->aalg) {
-+					if (x->aalg->alg_key_len) {
-+						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits = x->aalg->alg_key_len;
-+						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = x->props.aalgo;
-+						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_type = 0;
-+						memcpy(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key, x->aalg->alg_key,(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits / 8));
-+						sa_set_keys_msg.num_keys++;
-+					}
-+				}
-+				/* encrypt key */
-+				if(x->ealg) {
-+					if (x->ealg->alg_key_len) {
-+
-+						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits = x->ealg->alg_key_len;
-+						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = x->props.ealgo;
-+						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_type = 1;
-+						memcpy(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key, x->ealg->alg_key,(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits / 8));
-+						sa_set_keys_msg.num_keys++;
-+					}
-+				}
-+				/* combined key */
-+				if (x->aead) {
-+					if (x->aead->alg_key_len) {
-+						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits = x->aead->alg_key_len;
-+						if (strstr(x->aead->alg_name, "rfc4106(gcm"))	/* AES GCM support */
-+						{
-+							if (x->aead->alg_icv_len == 64)
-+								sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = SADB_X_EALG_AES_GCM_ICV8;
-+							else if (x->aead->alg_icv_len == 96)
-+								sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = SADB_X_EALG_AES_GCM_ICV12;
-+							else if (x->aead->alg_icv_len == 128)
-+								sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = SADB_X_EALG_AES_GCM_ICV16;
-+						}
-+						else if (strstr(x->aead->alg_name, "ccm")) /* AES CCM */
-+						{
-+							if (x->aead->alg_icv_len == 64)
-+								sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = SADB_X_EALG_AES_CCM_ICV8;
-+							else if (x->aead->alg_icv_len == 96)
-+								sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = SADB_X_EALG_AES_CCM_ICV12;
-+							else if (x->aead->alg_icv_len == 128)
-+								sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = SADB_X_EALG_AES_CCM_ICV16;
-+						}
-+						else if (strstr(x->aead->alg_name, "rfc4543(gcm"))	/* AES GMAC defined in RFC 4543 derived from AES GCM */
-+						{
-+							sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = SADB_X_EALG_NULL_AES_GMAC;
-+						}
-+						
-+						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_type = 1;
-+						memcpy(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key, x->aead->alg_key,(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits/ 8));
-+						/*
-+						printk(KERN_INFO "ipsec_xfrm2nlkey: ENCRYPT -alg name %s algo %d key %d bits\n",
-+							x->aead->alg_name, sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg, sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits); 
-+						*/
-+						sa_set_keys_msg.num_keys++;
-+					}
-+				}
-+	
-+				memcpy(msg.payload, &sa_set_keys_msg, sizeof(struct nlkey_sa_set_keys));
-+				msg.length = sizeof(struct nlkey_sa_set_keys);
-+				*msg_id = NLKEY_SA_SET_TUNNEL; /* next message */
-+			} else {
-+				*msg_id = NLKEY_SA_SET_TUNNEL; /* next message */
-+				goto exit;
-+			}
-+			break;
-+
-+		case NLKEY_SA_SET_TUNNEL:
-+			if(tunnel && (x->props.mode == XFRM_MODE_TUNNEL)) {
-+				memset(&sa_set_tunnel_msg, 0, sizeof(struct nlkey_sa_set_tunnel));
-+
-+				/* SA global handler */
-+				sa_set_tunnel_msg.sagd = x->handle; 
-+
-+				/* Tunnel */
-+				sa_set_tunnel_msg.proto_family = x->props.family;
-+				if(x->props.family == AF_INET6) {
-+					struct ipv6hdr *top_iph = &sa_set_tunnel_msg.h.ipv6h;
-+					int dsfield;
-+					top_iph->version = 6;
-+					top_iph->priority = 0;
-+					top_iph->flow_lbl[0] = 0;
-+					top_iph->flow_lbl[1] = 0;
-+					top_iph->flow_lbl[2] = 0;
-+					top_iph->nexthdr = IPPROTO_IPIP;	
-+					dsfield = ipv6_get_dsfield(top_iph);
-+					dsfield = INET_ECN_encapsulate(dsfield, dsfield);
-+					if (x->props.flags & XFRM_STATE_NOECN)
-+						dsfield &= ~INET_ECN_MASK;
-+					ipv6_change_dsfield(top_iph, 0, dsfield);
-+					top_iph->hop_limit = 64;
-+					memcpy(&top_iph->daddr, x->id.daddr.a6, sizeof(struct in6_addr));
-+					memcpy(&top_iph->saddr, x->props.saddr.a6, sizeof(struct in6_addr));
-+					//(KERN_INFO "src: %x %x %x %x\n", x->props.saddr.a6[0], x->props.saddr.a6[1], x->props.saddr.a6[2], x->props.saddr.a6[3]);
-+				}
-+				else {
-+					struct iphdr *top_iph = &sa_set_tunnel_msg.h.ipv4h;
-+					top_iph->ihl = 5;
-+					top_iph->version = 4;
-+					top_iph->tos = 0;
-+					top_iph->frag_off = 0; 
-+					top_iph->ttl = 64;
-+					top_iph->saddr = x->props.saddr.a4;
-+					top_iph->daddr = x->id.daddr.a4;
-+				}
-+				memcpy(msg.payload, &sa_set_tunnel_msg, sizeof(struct nlkey_sa_set_tunnel));
-+				msg.length = sizeof(struct nlkey_sa_set_tunnel);
-+				*msg_id = NLKEY_SA_SET_NATT; /* next message */
-+			} else {
-+				*msg_id = NLKEY_SA_SET_NATT; /* next message */
-+				goto exit;	
-+			} 
-+			break;
-+
-+		case NLKEY_SA_SET_NATT:
-+			if((natt) && (x->encap)){
-+				memset(&sa_set_natt_msg, 0, sizeof(struct nlkey_sa_set_natt));
-+
-+				/* SA global handler */
-+				sa_set_natt_msg.sagd = x->handle; 
-+				sa_set_natt_msg.sport = x->encap->encap_sport;
-+				sa_set_natt_msg.dport = x->encap->encap_dport;
-+				memcpy(msg.payload, &sa_set_natt_msg, sizeof(struct nlkey_sa_set_natt));
-+				msg.length = sizeof(struct nlkey_sa_set_natt);
-+				*msg_id = NLKEY_SA_SET_LIFETIME; /* next message */
-+			} else {
-+				*msg_id = NLKEY_SA_SET_LIFETIME; /* next message */
-+				goto exit;	
-+			}
-+			break;
-+
-+		case NLKEY_SA_SET_LIFETIME:
-+			if(lifetime) {
-+				memset(&sa_set_lifetime_msg, 0, sizeof(struct nlkey_sa_set_lifetime));
-+
-+				/* SA global handler */
-+				sa_set_lifetime_msg.sagd = x->handle;
-+
-+				/* hard time */
-+				sa_set_lifetime_msg.hard_time.allocations =  _X2KEY(x->lft.hard_packet_limit);
-+				if(_X2KEY(x->lft.hard_byte_limit))
-+					memcpy(sa_set_lifetime_msg.hard_time.bytes, &x->lft.hard_byte_limit, sizeof(uint64_t));
-+
-+				/* soft time */
-+				sa_set_lifetime_msg.soft_time.allocations =  _X2KEY(x->lft.soft_packet_limit);
-+				if(_X2KEY(x->lft.soft_byte_limit))
-+					memcpy(sa_set_lifetime_msg.soft_time.bytes, &x->lft.soft_byte_limit, sizeof(uint64_t));
-+
-+				/* current time */
-+				sa_set_lifetime_msg.current_time.allocations = x->curlft.packets;
-+				memcpy(sa_set_lifetime_msg.current_time.bytes, &x->curlft.bytes, sizeof(uint64_t));
-+
-+				memcpy(msg.payload, &sa_set_lifetime_msg, sizeof(struct nlkey_sa_set_lifetime));
-+				msg.length = sizeof(struct nlkey_sa_set_lifetime);
-+				*msg_id = NLKEY_SA_SET_STATE; /* next message */
-+			} else {
-+				*msg_id = NLKEY_SA_SET_STATE; /* next message */
-+				goto exit;	
-+			}
-+			break;
-+
-+		case NLKEY_SA_SET_STATE:
-+			if(state) {
-+				memset(&sa_set_state_msg, 0, sizeof(struct nlkey_sa_set_state));
-+				memset(&sa_id_msg, 0, sizeof(struct nlkey_sa_id));
-+
-+				/* SA global handler */
-+				sa_set_state_msg.sagd = x->handle; 
-+				sa_set_state_msg.parent_sa_sagd = x->parent_sa_handle;
-+				/* State */
-+				sa_set_state_msg.state = x->km.state;
-+
-+				memcpy(msg.payload, &sa_set_state_msg, sizeof(struct nlkey_sa_set_state));
-+				msg.length = sizeof(struct nlkey_sa_set_state);
-+				*msg_id = NLKEY_NULL_MSG; /* next message */
-+			} else {
-+				*msg_id = NLKEY_NULL_MSG; /* next message */
-+				goto exit;
-+			}
-+			break;
-+		
-+		case NLKEY_SA_DELETE:
-+			memset(&sa_delete_msg, 0, sizeof(struct nlkey_sa_delete));
-+			
-+			/* SA global handler */
-+			sa_delete_msg.sagd = x->handle;
-+			memcpy(msg.payload, &sa_delete_msg, sizeof(struct nlkey_sa_delete));
-+			msg.length = sizeof(struct nlkey_sa_delete);
-+
-+
-+			*msg_id = NLKEY_NULL_MSG; /* next message */
-+			break;
-+
-+		case NLKEY_SA_FLUSH:
-+			/* No data required for flush SA command */
-+
-+			*msg_id = NLKEY_NULL_MSG; /* next message */
-+			break;
-+
-+		default:
-+			printk(KERN_ERR "ipsec_xfrm2nlkey: event 0x%x not supported\n", c->event);
-+			*msg_id = NLKEY_NULL_MSG; /* next message */
-+			break;
-+	}
-+
-+	/* prepare netlink message for kernel to user space direction */
-+	if(msg.length > NLKEY_MSG_LEN)
-+	{
-+		printk(KERN_ERR "ipsec_xfrm2nlkey: maximum message size reached (%d bytes)\n", msg.length);
-+		goto exit;
-+	}
-+
-+	skb = alloc_skb(NLMSG_SPACE(NLKEY_MSG_LEN + NLKEY_HDR_LEN), allocation);
-+	if (skb == NULL)
-+		goto exit;
-+		
-+	nlh = (struct nlmsghdr *)skb_put(skb, NLMSG_SPACE(NLKEY_HDR_LEN + msg.length));
-+	memcpy(NLMSG_DATA(nlh), (unsigned char *)&msg, (NLKEY_HDR_LEN + msg.length));
-+	
-+	/* whole length of the message i.e. header + payload */
-+	nlh->nlmsg_len = NLMSG_SPACE(NLKEY_HDR_LEN + msg.length);
-+
-+	/* from kernel */
-+	nlh->nlmsg_pid = 0;
-+	nlh->nlmsg_flags = 0;
-+        nlh->nlmsg_type = 0;
-+	NETLINK_CB(skb).portid = 0;
-+	NETLINK_CB(skb).dst_group = 1;
-+exit:
-+	return skb;
-+}
-+
-+static int ipsec_nlkey_send(struct net *net, struct xfrm_state *x, const struct km_event *c)
-+{
-+	struct sk_buff *skb;
-+	unsigned short msg_type;
-+	int rc = 0;
-+
-+	/* We may generate more than one message when adding new SA (sa_create + sa_set_state + sa_set_tunnel...) */
-+	msg_type = ipsec_sacode_to_nlkeycode((unsigned short)c->event);
-+
-+	while(msg_type != NLKEY_NULL_MSG)
-+	{
-+		/* build nlkey message */
-+		skb = ipsec_xfrm2nlkey(net, x, c, &msg_type);
-+
-+		if(skb != NULL)
-+			if((rc = netlink_broadcast(nlkey_socket, skb, 0, 1, GFP_ATOMIC)) < 0)
-+				return rc;
-+	}
-+
-+	return rc;
-+}
-+
-+
-+int ipsec_nlkey_flow(u16 xfrm_nr, u16 *xfrm_handle, const struct flowi *fl, u16 family, u16 dir, u16 ignore_neigh)
-+{
-+	struct sk_buff *skb;
-+	struct nlkey_msg msg;
-+	struct nlmsghdr *nlh = NULL;
-+	unsigned short *p;
-+	gfp_t allocation = GFP_ATOMIC; //This may called from atomic context
-+
-+
-+	/* next message to build */
-+	memset(&msg, 0, sizeof(struct nlkey_msg));
-+	msg.fcode = NLKEY_FLOW_ADD;
-+
-+	// Number of SA for this flow
-+	p = msg.payload;
-+	*p++ = xfrm_nr;
-+	msg.length += sizeof(unsigned short);
-+	// SA handles list
-+	memcpy(p, xfrm_handle, xfrm_nr*sizeof(unsigned short));
-+	msg.length += xfrm_nr*sizeof(unsigned short);
-+	p+=xfrm_nr;
-+	// flow family
-+	*p++ = family;
-+	msg.length += sizeof(unsigned short);
-+	// flow family
-+	*p++ = dir;
-+	msg.length += sizeof(unsigned short);
-+	// flow mode
-+	*p++ = ignore_neigh;
-+	msg.length += sizeof(unsigned short);
-+	// flow descriptor
-+	memcpy(p, fl, sizeof(struct flowi));
-+	msg.length +=sizeof(struct flowi);
-+	p+=sizeof(struct flowi) / sizeof(u16);
-+
-+	skb = alloc_skb(NLMSG_SPACE(NLKEY_MSG_LEN + NLKEY_HDR_LEN), allocation);
-+	if (skb == NULL)
-+		return -ENOMEM;
-+
-+	/* prepare netlink message for kernel to user space direction */
-+	nlh = (struct nlmsghdr *)skb_put(skb, NLMSG_SPACE(NLKEY_HDR_LEN + msg.length));
-+	memcpy(NLMSG_DATA(nlh), (unsigned char *)&msg, (NLKEY_HDR_LEN + msg.length));
-+
-+	/* whole length of the message i.e. header + payload */
-+	nlh->nlmsg_len = NLMSG_SPACE(NLKEY_HDR_LEN + msg.length);
-+
-+	/* from kernel */
-+	nlh->nlmsg_pid = 0; 
-+	nlh->nlmsg_flags = 0;
-+        nlh->nlmsg_type = 0;
-+	NETLINK_CB(skb).portid = 0;
-+	NETLINK_CB(skb).dst_group = 1;
-+
-+	return(netlink_broadcast(nlkey_socket, skb, 0, 1, allocation));
-+}
-+EXPORT_SYMBOL(ipsec_nlkey_flow);
-+
-+
-+int ipsec_nlkey_flow_remove(struct flowi *fl, u16 family, u16 dir)
-+{
-+	struct sk_buff *skb;
-+	struct nlkey_msg msg;
-+	struct nlmsghdr *nlh = NULL;
-+	unsigned short *p;
-+	gfp_t allocation = GFP_ATOMIC; //This may called from atomic context
-+
-+	
-+
-+	/* next message to build */
-+	memset(&msg, 0, sizeof(struct nlkey_msg));
-+	msg.fcode = NLKEY_FLOW_REMOVE;
-+
-+	p = msg.payload;
-+	// flow family
-+	*p++ = family;
-+	msg.length += sizeof(unsigned short);
-+	// flow family
-+	*p++ = dir;
-+	msg.length += sizeof(unsigned short);
-+	// flow descriptor
-+	memcpy(p, fl, sizeof(struct flowi));
-+	msg.length +=sizeof(struct flowi);
-+	p+=sizeof(struct flowi) / sizeof(u16);
-+
-+	skb = alloc_skb(NLMSG_SPACE(NLKEY_MSG_LEN + NLKEY_HDR_LEN), allocation);
-+	if (skb == NULL)
-+		return -ENOMEM;
-+
-+	/* prepare netlink message for kernel to user space direction */
-+	nlh = (struct nlmsghdr *)skb_put(skb, NLMSG_SPACE(NLKEY_HDR_LEN + msg.length));
-+	memcpy(NLMSG_DATA(nlh), (unsigned char *)&msg, (NLKEY_HDR_LEN + msg.length));
-+	
-+	/* whole length of the message i.e. header + payload */
-+	nlh->nlmsg_len = NLMSG_SPACE(NLKEY_HDR_LEN + msg.length);
-+
-+	/* from kernel */
-+	nlh->nlmsg_pid = 0; 
-+	nlh->nlmsg_flags = 0;
-+        nlh->nlmsg_type = 0;
-+	NETLINK_CB(skb).portid = 0;
-+	NETLINK_CB(skb).dst_group = 1;	
-+
-+		
-+        return(netlink_broadcast(nlkey_socket, skb, 0, 1, allocation));
-+
-+	
-+}
-+EXPORT_SYMBOL(ipsec_nlkey_flow_remove);
-+
-+
-+
-+static void ipsec_nlkey_init(void)
-+{
-+	struct netlink_kernel_cfg cfg = {
-+		.groups	  = 1,
-+		.input	  = ipsec_nlkey_rcv,
-+	};
-+	printk(KERN_INFO "Initializing NETLINK_KEY socket\n");
-+	nlkey_socket = netlink_kernel_create(&init_net, NETLINK_KEY, &cfg);
-+}
-+#endif
-+
-+
- static int __net_init pfkey_net_init(struct net *net)
- {
- 	struct netns_pfkey *net_pfkey = net_generic(net, pfkey_net_id);
-@@ -3919,6 +4804,11 @@ static void __exit ipsec_pfkey_exit(void)
- 	sock_unregister(PF_KEY);
- 	unregister_pernet_subsys(&pfkey_net_ops);
- 	proto_unregister(&key_proto);
-+
-+#ifdef NLKEY_SUPPORT
-+	/* release NETLINK_KEY socket */
-+	sock_release(nlkey_socket->sk_socket);
-+#endif
- }
- 
- static int __init ipsec_pfkey_init(void)
-@@ -3935,6 +4825,12 @@ static int __init ipsec_pfkey_init(void)
- 	if (err != 0)
- 		goto out_unregister_pernet;
- 	xfrm_register_km(&pfkeyv2_mgr);
-+
-+#ifdef NLKEY_SUPPORT
-+	/* create NETLINK_KEY socket for IPSec offload on Comcerto */
-+	ipsec_nlkey_init();
-+#endif
-+
- out:
- 	return err;
- 
-diff --git a/net/xfrm/Makefile b/net/xfrm/Makefile
-index 512e0b2f8514..e8e13e0fd593 100644
---- a/net/xfrm/Makefile
-+++ b/net/xfrm/Makefile
-@@ -23,3 +23,4 @@ obj-$(CONFIG_XFRM_IPCOMP) += xfrm_ipcomp.o
- obj-$(CONFIG_XFRM_INTERFACE) += xfrm_interface.o
- obj-$(CONFIG_XFRM_ESPINTCP) += espintcp.o
- obj-$(CONFIG_DEBUG_INFO_BTF) += xfrm_state_bpf.o
-+obj-$(CONFIG_INET_IPSEC_OFFLOAD) += ipsec_flow.o
-diff --git a/net/xfrm/ipsec_flow.c b/net/xfrm/ipsec_flow.c
-new file mode 100644
-index 000000000000..61e8b22f23fa
---- /dev/null
-+++ b/net/xfrm/ipsec_flow.c
-@@ -0,0 +1,231 @@
-+// SPDX-License-Identifier: GPL-2.0+
-+/* Maintain IPSec flow table for ASK fast path
-+ *
-+ * Copyright 2019 NXP
-+ */
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+#include <linux/kernel.h>
-+#include <linux/module.h>
-+#include <linux/list.h>
-+#include <linux/jhash.h>
-+#include <linux/interrupt.h>
-+#include <linux/mm.h>
-+#include <linux/random.h>
-+#include <linux/init.h>
-+#include <linux/slab.h>
-+#include <linux/smp.h>
-+#include <linux/completion.h>
-+#include <linux/percpu.h>
-+#include <linux/bitops.h>
-+#include <linux/notifier.h>
-+#include <linux/cpu.h>
-+#include <linux/cpumask.h>
-+#include <linux/mutex.h>
-+#include <net/xfrm.h>
-+#include <linux/atomic.h>
-+#include <linux/security.h>
-+#include <net/net_namespace.h>
-+#include "ipsec_flow.h"
-+
-+/* Type for flow comparison (from removed flow cache) */
-+typedef unsigned long flow_compare_t;
-+
-+/* Return the flow key size in units of flow_compare_t for a given address family */
-+static inline size_t flow_key_size(unsigned short family)
-+{
-+	switch (family) {
-+	case AF_INET:
-+		return sizeof(struct flowi4) / sizeof(flow_compare_t);
-+	case AF_INET6:
-+		return sizeof(struct flowi6) / sizeof(flow_compare_t);
-+	}
-+	return 0;
-+}
-+
-+#define IPSEC_FLOW_TABLE_SIZE  1024
-+static struct kmem_cache *ipsec_flow_cachep __read_mostly;
-+struct flow_table ipsec_flow_table_global;
-+
-+static u32 flow_hash_code(const struct flowi *flow, size_t keysize)
-+{
-+	const u32 *k = (const u32 *)flow;
-+	const u32 length = keysize * sizeof(flow_compare_t) / sizeof(u32);
-+	const u32 hash_random = 0; /*FIXME */
-+
-+
-+	return jhash2(k, length, hash_random);
-+}
-+
-+static int ipsec_flow_compare(const struct flowi *key1, const struct flowi *key2,
-+       size_t keysize)
-+{
-+	const flow_compare_t *k1, *k1_lim, *k2;
-+
-+	k1 = (const flow_compare_t *) key1;
-+	k1_lim = k1 + keysize;
-+
-+	k2 = (const flow_compare_t *) key2;
-+
-+	do {
-+		if (*k1++ != *k2++)
-+			return 1;
-+	} while (k1 < k1_lim);
-+
-+	return 0;
-+}
-+
-+/*
-++* return 1 for new flow 0 for existing flow
-++*/
-+int ipsec_flow_add(struct net *net, const struct flowi *flow, u16 family, u8 dir, u16 *xfrm_handle)
-+{
-+	size_t keysize;
-+	struct flow_entry *tfle, *fle;
-+	struct flow_table *ft;
-+	u32 hash;
-+	u16 index, update = 0;
-+
-+	ft = &ipsec_flow_table_global;
-+
-+
-+	keysize = flow_key_size(family);
-+	if(!keysize)
-+		return 0;
-+
-+	hash = (flow_hash_code(flow, keysize) &  (IPSEC_FLOW_TABLE_SIZE - 1));
-+
-+	spin_lock_bh(&ft->ipsec_flow_lock);
-+	hlist_for_each_entry(tfle, &ft->hash_table[hash], hlist) {
-+		if(tfle->net ==  net &&
-+				tfle->family == family &&
-+				tfle->dir == dir &&
-+				(ipsec_flow_compare(flow, &tfle->flow, keysize) == 0)) {
-+			/*Flow found */
-+			for (index = 0; index < XFRM_POLICY_TYPE_MAX; index++) {
-+				if (tfle->xfrm_handle[index] != xfrm_handle[index]) {
-+					/*pr_info("%s()::%d flow handle updating from 0x%x to 0x%x\n",
-+					  __func__, __LINE__, tfle->xfrm_handle[index], xfrm_handle[index]);*/
-+					tfle->xfrm_handle[index] = xfrm_handle[index];
-+					update = 1;
-+				}
-+			}
-+			spin_unlock_bh(&ft->ipsec_flow_lock);
-+			if (update) {
-+				return 1;
-+			}
-+			else
-+				return 0;
-+
-+		}
-+	}
-+	spin_unlock_bh(&ft->ipsec_flow_lock);
-+	/* Insert flow into flow table */
-+	fle = kmem_cache_alloc(ipsec_flow_cachep, GFP_ATOMIC);
-+	if(fle) {
-+		fle->net = net;
-+		fle->family = family;
-+		fle->dir = dir;
-+		memcpy(&fle->flow, flow, keysize * sizeof(flow_compare_t));
-+		memcpy(fle->xfrm_handle, xfrm_handle, XFRM_POLICY_TYPE_MAX*sizeof(u16));
-+		spin_lock_bh(&ft->ipsec_flow_lock);
-+		hlist_add_head(&fle->hlist, &ft->hash_table[hash]);
-+		ft->flow_cnt++;
-+		spin_unlock_bh(&ft->ipsec_flow_lock);
-+		/*pr_info("%s flow added, xfrm_handle <0x%x 0x%x> fle->xfrm_handle <0x%x 0x%x>\n",
-+		  __func__, xfrm_handle[0], xfrm_handle[1], fle->xfrm_handle[0], fle->xfrm_handle[1]);*/
-+
-+	}else {
-+		pr_err("%s:  Failed to alloc memory, flow is not pushed\n", __func__);
-+		return 0;
-+	}
-+
-+	return 1;
-+}
-+EXPORT_SYMBOL(ipsec_flow_add);
-+
-+static int ipsec_flow_remove(const struct flowi *flow, u16 family, u8 dir)
-+{
-+	size_t keysize;
-+	struct flow_entry *tfle;
-+	struct flow_table *ft;
-+	u32 hash;
-+
-+	ft = &ipsec_flow_table_global;
-+
-+	/*
-+	 * The IPsec flow-cache is dead scaffolding: ipsec_flow_init() only runs
-+	 * under #ifdef IPSEC_FLOW_CACHE, which is defined nowhere, so hash_table
-+	 * stays NULL. NLKEY_FLOW_REMOVE (fcode 0x0A12) is the one caller not
-+	 * itself behind that ifdef — guard it so a CAP_NET_ADMIN sender can't
-+	 * oops the kernel walking a NULL table.
++	/* A frame for a packet-offloaded SA carries its state without olen
++	 * (see xfrm_output()), so xo is NULL for it and the wrong-device
++	 * check below never sees it. It is still plaintext, and only the
++	 * SA's own device hands it to SEC: sent anywhere else it would leave
++	 * in the clear. xfrm_output() refuses a bundle routed elsewhere; this
++	 * catches a frame moved after that, by a hook, a qdisc action or a
++	 * device it was handed on to.
 +	 */
-+	if (!ft->hash_table)
-+		return 0;
-+
-+
-+	keysize = flow_key_size(family);
-+	if(!keysize)
-+		goto ignore_flow;
-+
-+	hash = (flow_hash_code(flow, keysize) &  (IPSEC_FLOW_TABLE_SIZE - 1));
-+
-+	spin_lock_bh(&ft->ipsec_flow_lock);
-+	hlist_for_each_entry(tfle, &ft->hash_table[hash], hlist) {
-+		if(tfle->family == family &&
-+				tfle->dir == dir &&
-+				(ipsec_flow_compare(flow, &tfle->flow, keysize) == 0)) {
-+			/*Flow found */
-+			hlist_del(&tfle->hlist);
-+			kmem_cache_free(ipsec_flow_cachep, tfle);
-+			ft->flow_cnt--;
-+			spin_unlock_bh(&ft->ipsec_flow_lock);
-+			return 1;
++	if (skb->ipsec_offload && !xo) {
++		sp = skb_sec_path(skb);
++		x = sp && sp->len ? sp->xvec[sp->len - 1] : NULL;
++		if (x && x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
++		    x->xso.dir == XFRM_DEV_OFFLOAD_OUT &&
++		    READ_ONCE(x->xso.dev) != dev) {
++			XFRM_INC_STATS(dev_net(dev),
++				       LINUX_MIB_XFRMOUTBUNDLECHECKERROR);
++			dev_core_stats_tx_dropped_inc(dev);
++			kfree_skb_list(skb);
++			return NULL;
 +		}
 +	}
-+
-+	spin_unlock_bh(&ft->ipsec_flow_lock);
-+ignore_flow:
-+	pr_err("%s: Failed to remove flow\n", __func__);
-+	return 0;
-+}
-+
-+void flow_cache_remove(const struct flowi *key,    unsigned short family,
-+       unsigned short dir)
-+{
-+
-+	ipsec_flow_remove(key, family, dir);
-+}
-+
-+int ipsec_flow_init(struct net *net)
-+{
-+	struct flow_table *ft;
-+
-+	pr_info("%s \n",__func__);
-+	ft = &ipsec_flow_table_global;
-+
-+	if (!ipsec_flow_cachep)
-+		ipsec_flow_cachep = kmem_cache_create("ipsec_flow_cache",
-+				sizeof(struct flow_entry),
-+				0, SLAB_PANIC, NULL);
-+	ft->hash_table = kzalloc(sizeof(struct hlist_head) * IPSEC_FLOW_TABLE_SIZE, GFP_KERNEL);
-+	if(!ft->hash_table) {
-+		pr_err("%s: failed to allocate memory\n", __func__);
-+		return -ENOMEM;
-+	}
-+	ft->flow_cnt = 0;
-+	spin_lock_init(&ft->ipsec_flow_lock);
-+	return 0;
-+}
-+EXPORT_SYMBOL(ipsec_flow_init);
-+
-+void ipsec_flow_fini(struct net *net)
-+{
-+	struct flow_table *ft;
-+
-+	pr_info("%s \n",__func__);
-+	ft = &ipsec_flow_table_global;
-+	kfree(ft->hash_table);
-+}
-+EXPORT_SYMBOL(ipsec_flow_fini);
 +#endif
 +
-diff --git a/net/xfrm/ipsec_flow.h b/net/xfrm/ipsec_flow.h
-new file mode 100644
-index 000000000000..ee8a7fa571b8
---- /dev/null
-+++ b/net/xfrm/ipsec_flow.h
-@@ -0,0 +1,31 @@
-+// SPDX-License-Identifier: GPL-2.0+
-+/* Maintain IPSec flow table for ASK fast path
-+ *
-+ * Copyright 2019 NXP
-+ */
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+#include <linux/kernel.h>
-+#include <linux/list.h>
-+#include <linux/mutex.h>
-+#include <net/xfrm.h>
-+#include <net/net_namespace.h>
-+
-+struct flow_table {
-+	struct hlist_head   *hash_table;
-+	spinlock_t      ipsec_flow_lock;
-+	int             flow_cnt;
-+};
-+
-+struct flow_entry {
-+	struct hlist_node   hlist;
-+	struct flowi        flow;
-+	struct net      *net;
-+	u16         family;
-+	u16             xfrm_handle[XFRM_POLICY_TYPE_MAX];
-+	u8          dir;
-+
-+};
-+
-+int ipsec_flow_add(struct net *net, const struct flowi *flow, u16 family, u8 dir, u16 *xfrm_handle);
-+#endif
-+
+ 	if (!xo || (xo->flags & XFRM_XMIT))
+ 		return skb;
+ 
 diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
-index 5d3633ce6ba3..8e4f6b42c6fb 100644
+index 5d3633ce6ba3..d0e39279123c 100644
 --- a/net/xfrm/xfrm_input.c
 +++ b/net/xfrm/xfrm_input.c
-@@ -44,6 +44,10 @@ struct xfrm_trans_cb {
+@@ -44,6 +44,27 @@ struct xfrm_trans_cb {
  
  #define XFRM_TRANS_SKB_CB(__skb) ((struct xfrm_trans_cb *)&((__skb)->cb[0]))
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+extern int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd);
++extern int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb,
++				      const struct xfrm_state *x);
++
++/*
++ * Whether @x is received through SEC and nothing else: a packet-offloaded
++ * state the DPAA offload module took, the one driver that gives a state a
++ * handle (from xdo_dev_state_add(), before the state is inserted). SEC keeps
++ * such a state's anti-replay window. xfrm's own is a copy the driver
++ * refreshes now and then, and nothing tells SEC what software accepted, so
++ * decrypting a frame here would check it against a second window, each
++ * accepting what the other had already seen. What SEC is not given is
++ * dropped instead. A state another driver offloads has no handle and is
++ * received as upstream receives it.
++ */
++static bool xfrm_state_sec_only(const struct xfrm_state *x)
++{
++	return x->xso.type == XFRM_DEV_OFFLOAD_PACKET && x->handle;
++}
 +#endif /* IPSEC */
 +
  static DEFINE_SPINLOCK(xfrm_input_afinfo_lock);
  static struct xfrm_input_afinfo const __rcu *xfrm_input_afinfo[2][AF_INET6 + 1];
  
-@@ -599,6 +603,22 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+@@ -599,6 +620,19 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
  			goto drop;
  		}
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+		/*net_crit_ratelimited("%s(%d) x->handle %d, mac hdr %p, data %p\n",
-+			__func__,__LINE__, x->handle, skb_mac_header(skb), skb->data);  */
-+		/* check if the corresponding SA is offloaded,
-+		   then submit the packet to SEC engine */
-+
 +		/*
-+		 * Only hand the packet to SEC for a live SA. A deleted/expired SA
-+		 * goes XFRM_STATE_DEAD before the km.state check below; submitting
-+		 * its stale handle would target a hardware SA context cmm may have
-+		 * already torn down (or reused).
++		 * A packet-offloaded SA's frames are decrypted by SEC, and only
++		 * a live SA's: a deleted/expired SA goes XFRM_STATE_DEAD before
++		 * the km.state check below, and submitting its stale handle
++		 * would target a hardware SA context the driver may already
++		 * have torn down (or reused).
 +		 */
-+		if ((x->offloaded) && (x->km.state == XFRM_STATE_VALID) &&
-+		    !(dpaa_submit_inb_pkt_to_SEC(skb, x->handle)))
++		if (xfrm_state_sec_only(x) &&
++		    x->km.state == XFRM_STATE_VALID &&
++		    !dpaa_submit_inb_pkt_to_SEC(skb, x))
 +			return 0;
 +#endif /* IPSEC offload end */
  lock:
  		spin_lock(&x->lock);
  
+@@ -611,6 +645,20 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+ 			goto drop_unlock;
+ 		}
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/*
++		 * Whatever of such a state SEC was not given: ESP that arrived
++		 * on another device or another port, ESP the driver could not
++		 * queue, and ESP that GRO brought straight here. The state is
++		 * valid and the frame may be genuine, but it did not come the
++		 * way this state receives, as with the encapsulation below.
++		 */
++		if (xfrm_state_sec_only(x)) {
++			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMISMATCH);
++			goto drop_unlock;
++		}
++#endif
++
+ 		if ((x->encap ? x->encap->encap_type : 0) != encap_type) {
+ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMISMATCH);
+ 			goto drop_unlock;
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index a5b5d82bd755..be5729975dfd 100644
+index a5b5d82bd755..8c4d265b7f47 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
-@@ -67,6 +67,10 @@ static int xfrm4_transport_output(struct xfrm_state *x, struct sk_buff *skb)
- 	struct iphdr *iph = ip_hdr(skb);
- 	int ihl = iph->ihl * 4;
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD)
-+	if(skb->ipsec_offload)
-+		return 0;
-+#endif
- 	skb_set_inner_transport_header(skb, skb_transport_offset(skb));
- 
- 	skb_set_network_header(skb, -x->props.header_len);
-@@ -167,6 +171,10 @@ static int xfrm6_transport_output(struct xfrm_state *x, struct sk_buff *skb)
- 	u8 *prevhdr;
- 	int hdr_len;
- 
-+#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if(skb->ipsec_offload)
-+		return 0;
-+#endif
- 	iph = ipv6_hdr(skb);
- 	skb_set_inner_transport_header(skb, skb_transport_offset(skb));
- 
-@@ -413,6 +421,10 @@ static int xfrm4_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
- 	IPCB(skb)->flags |= IPSKB_XFRM_TUNNEL_SIZE;
- 	skb->protocol = htons(ETH_P_IP);
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if (skb->ipsec_offload)
-+		return 0;
-+#endif
- 	switch (x->props.mode) {
- 	case XFRM_MODE_BEET:
- 		return xfrm4_beet_encap_add(x, skb);
-@@ -436,6 +448,10 @@ static int xfrm6_prepare_output(struct xfrm_state *x, struct sk_buff *skb)
- 	skb->ignore_df = 1;
- 	skb->protocol = htons(ETH_P_IPV6);
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if (skb->ipsec_offload)
-+		return 0;
-+#endif
- 	switch (x->props.mode) {
- 	case XFRM_MODE_BEET:
- 		return xfrm6_beet_encap_add(x, skb);
-@@ -492,11 +508,40 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
- 	struct dst_entry *dst = skb_dst(skb);
- 	struct xfrm_state *x = dst->xfrm;
- 	struct net *net = xs_net(x);
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	struct xfrm_state *xfrm_vec[XFRM_MAX_DEPTH];
-+	int xfrm_nr = 0;
-+	int i;
-+	struct sec_path *sp;
-+#endif
- 
- 	if (err <= 0 || x->xso.type == XFRM_DEV_OFFLOAD_PACKET)
- 		goto resume;
- 
- 	do {
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+		if (x->offloaded) {
-+			if (xfrm_nr == XFRM_MAX_DEPTH) {
-+				err = -ENOBUFS;
-+				goto error_nolock;
-+			}
-+
-+			if (!x->curlft.use_time)
-+				x->curlft.use_time = ktime_get_real_seconds();
-+
-+			xfrm_state_hold(x);
-+			xfrm_vec[xfrm_nr++] = x;
-+			skb->ipsec_offload = 1;
-+
-+			err = xfrm_outer_mode_output(x, skb);
-+			if (err) {
-+				XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEMODEERROR);
-+				goto error_nolock;
-+			}
-+			goto next_dst;
-+		}
-+#endif
-+
- 		err = xfrm_skb_check_space(skb);
- 		if (err) {
- 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-@@ -551,8 +596,27 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
- 			skb->encapsulation = 0;
- 
- 			err = x->type->output(x, skb);
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+			if (err == -EINPROGRESS) {
-+				/* Async crypto suspends the walk here and the
-+				 * completion re-enters xfrm_output_one() with a
-+				 * fresh invocation whose xfrm_vec starts empty,
-+				 * so any offload refs collected by THIS
-+				 * invocation would leak. Such a mixed bundle
-+				 * (offloaded inner SA + software outer SA going
-+				 * async) cannot occur under the whole-flow
-+				 * offload model, so releasing the refs -- not
-+				 * transferring them to the sec_path -- is the
-+				 * correct hardening for the invalid case.
-+				 */
-+				for (i = 0; i < xfrm_nr; i++)
-+					xfrm_state_put(xfrm_vec[i]);
-+				goto out;
-+			}
-+#else
- 			if (err == -EINPROGRESS)
- 				goto out;
-+#endif
- 		}
- 
- resume:
-@@ -561,6 +625,9 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
- 			goto error_nolock;
- 		}
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+next_dst:
-+#endif
- 		dst = skb_dst_pop(skb);
- 		if (!dst) {
- 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-@@ -571,11 +638,40 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
- 		x = dst->xfrm;
- 	} while (x && !(x->outer_mode.flags & XFRM_MODE_FLAG_TUNNEL));
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if (!(sp = skb_sec_path(skb))) {
-+
-+		sp = secpath_set(skb);
-+		if (!sp)
-+			goto error_nolock;
-+	}
-+
-+	/* Hub and spoke changes: Resetting the POLICY_IN SA and setting only the 
-+	   POLICY_OUT SA */
-+	if (skb->ipsec_xfrm_dir & ( 1 << XFRM_POLICY_IN))
-+	{
-+		sp->len = 0;
-+		skb->ipsec_xfrm_dir &= ~ ( 1 << XFRM_POLICY_IN);
-+	}
-+
-+	if (xfrm_nr + sp->len > XFRM_MAX_DEPTH)
-+		goto error_nolock;
-+
-+	memcpy(sp->xvec + sp->len, xfrm_vec,
-+			xfrm_nr * sizeof(xfrm_vec[0]));
-+	sp->len += xfrm_nr;
-+#endif
-+
-+
- 	return 0;
- 
- error:
- 	spin_unlock_bh(&x->lock);
- error_nolock:
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	for (i = 0; i < xfrm_nr; i++)
-+		xfrm_state_put(xfrm_vec[i]);
-+#endif
- 	kfree_skb(skb);
- out:
- 	return err;
-@@ -866,10 +962,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
- 	if (err)
- 		return err;
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if (skb->ipsec_offload == 0) {
-+		XFRM_MODE_SKB_CB(skb)->protocol = ip_hdr(skb)->protocol;
-+		xfrm4_extract_header(skb);
-+		return 0;
-+	} else {
-+		return 0;
-+	}
-+#else
- 	XFRM_MODE_SKB_CB(skb)->protocol = ip_hdr(skb)->protocol;
- 
- 	xfrm4_extract_header(skb);
- 	return 0;
-+#endif
- }
- 
- #if IS_ENABLED(CONFIG_IPV6)
-@@ -914,10 +1020,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
- 	if (err)
- 		return err;
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if (skb->ipsec_offload == 0) {
-+		XFRM_MODE_SKB_CB(skb)->protocol = ipv6_hdr(skb)->nexthdr;
-+		xfrm6_extract_header(skb);
-+	}
-+	return 0;
-+#else
- 	XFRM_MODE_SKB_CB(skb)->protocol = ipv6_hdr(skb)->nexthdr;
- 
- 	xfrm6_extract_header(skb);
- 	return 0;
-+#endif
- #else
- 	WARN_ON_ONCE(1);
- 	return -EAFNOSUPPORT;
-diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index e033390e7785..40e367641f53 100644
---- a/net/xfrm/xfrm_policy.c
-+++ b/net/xfrm/xfrm_policy.c
-@@ -48,6 +48,11 @@
- #include <net/inet_dscp.h>
- 
- #include "xfrm_hash.h"
-+#ifdef IPSEC_FLOW_CACHE
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+#include "ipsec_flow.h"
-+#endif
-+#endif
- 
- #define XFRM_QUEUE_TMO_MIN ((unsigned)(HZ/10))
- #define XFRM_QUEUE_TMO_MAX ((unsigned)(60*HZ))
-@@ -179,6 +184,11 @@ static struct xfrm_policy_afinfo const __rcu *xfrm_policy_afinfo[AF_INET6 + 1]
- 
- static struct kmem_cache *xfrm_dst_cache __ro_after_init;
- 
-+#ifdef IPSEC_FLOW_CACHE
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+#endif
-+#endif
-+
- static struct rhashtable xfrm_policy_inexact_table;
- static const struct rhashtable_params xfrm_pol_inexact_params;
- 
-@@ -2584,7 +2594,11 @@ xfrm_tmpl_resolve(struct xfrm_policy **pols, int npols, const struct flowi *fl,
- 
+@@ -644,6 +644,102 @@ static int xfrm_dev_direct_output(struct sock *sk, struct xfrm_state *x,
+ 	return dev_queue_xmit(skb);
  }
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+int xfrm_get_tos(const struct flowi *fl, int family)
-+#else
- static int xfrm_get_tos(const struct flowi *fl, int family)
++/* Use a packet-offloaded tunnel SA's next hop as neighbour output would use
++ * it for every packet: that keeps the entry from ageing out, moves a stale one
++ * on to a probe and starts resolution for one that is gone. Linux's entry is
++ * what refreshes the address the SA was programmed with and what lets its
++ * flows back into hardware; the frame does not wait for it.
++ *
++ * `path` is the bundle's route, which is the route to the SA's endpoint when
++ * the two share a family, so its neighbour for that endpoint is the next hop,
++ * found exactly as neighbour output would find it. Returns false if the SA's
++ * endpoint no longer routes by the SA's device; for an SA of the flow's family
++ * the caller has already proved that it does, by checking `path` itself.
++ */
++static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
++{
++	struct neighbour *n = NULL;
++
++	if (path->ops->family == x->props.family)
++		n = dst_neigh_lookup(path, &x->id.daddr);
++	if (n) {
++		neigh_event_send(n, NULL);
++		neigh_release(n);
++	}
++	return true;
++}
++
++/* Hand a tunnel-mode packet for a packet-offloaded SA straight to the SA's
++ * device, as xfrm_dev_direct_output() does for forwarded ones, but with the
++ * Ethernet header the SEC path is built around rather than uninitialised
++ * space.
++ *
++ * The driver reads that header's ethertype to find the inner packet, and SEC
++ * copies its fourteen bytes ahead of the tunnel header it builds. The IPsec
++ * offline port then rewrites both addresses and the ethertype from the SA's
++ * own next hop and outer family. So the header has to be well formed and
++ * name the inner protocol, which is all the neighbour path contributed to the
++ * frame: the inner family has no neighbour for a tunnel endpoint of the other
++ * family, and a link carrying only IPv4 has no IPv6 neighbours at all.
++ *
++ * The SA's next hop is still used, by xfrm_dev_sec_next_hop() before the
++ * packet gets here.
++ *
++ * Unlike xfrm_dev_direct_output() this does not run the child route's
++ * local_out. The inner header is already final -- the forwarding path
++ * finished a forwarded packet, and a local one was finished by its protocol's
++ * output on the bundle before it reached xfrm_output() -- and with
++ * ipsec_offload set the child's local_out skips LOCAL_OUT and transmits
++ * through the child route's neighbour itself, which is the path this
++ * replaces.
++ */
++static int xfrm_dev_sec_output(struct xfrm_state *x, struct sk_buff *skb)
++{
++	/* The offline port writes both addresses. */
++	static const u8 unset[ETH_ALEN];
++	struct net *net = xs_net(x);
++	struct net_device *dev;
++	struct dst_entry *dst;
++	int err;
++
++	dst = skb_dst_pop(skb);
++	if (!dst) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return -EHOSTUNREACH;
++	}
++	skb_dst_set(skb, dst);
++	nf_reset_ct(skb);
++
++	rcu_read_lock();
++	dev = READ_ONCE(x->xso.dev);
++	if (unlikely(!dev)) {
++		err = -ENODEV;
++		goto drop;
++	}
++	if (unlikely(skb_cow_head(skb, LL_RESERVED_SPACE(dev)))) {
++		err = -ENOMEM;
++		goto drop;
++	}
++	if (unlikely(dev_hard_header(skb, dev, ntohs(skb->protocol), unset,
++				     NULL, skb->len) < 0)) {
++		err = -EINVAL;
++		goto drop;
++	}
++	skb->dev = dev;
++	err = dev_queue_xmit(skb);
++	rcu_read_unlock();
++	return err;
++
++drop:
++	rcu_read_unlock();
++	XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++	kfree_skb(skb);
++	return err;
++}
 +#endif
++
+ static int xfrm_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
  {
- 	if (family == AF_INET)
- 		return fl->u.ip4.flowi4_tos & INET_DSCP_MASK;
-@@ -2650,6 +2664,9 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
- 
- 	return err;
- }
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+EXPORT_SYMBOL(xfrm_get_tos);
-+#endif
- 
- 
- /* Allocate chain of dst_entry's, attach known xfrm's, calculate
-@@ -3284,6 +3301,35 @@ struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
- 		dst = dst_orig;
+ 	return xfrm_output_resume(sk, skb, 1);
+@@ -734,6 +830,127 @@ static void xfrm_get_inner_ipproto(struct sk_buff *skb, struct xfrm_state *x)
  	}
+ }
  
-+#ifdef IPSEC_FLOW_CACHE
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	{
-+		struct dst_entry *dst1 = dst;
-+		struct xfrm_state *x;
-+		u16 xfrm_handle[XFRM_POLICY_TYPE_MAX];
-+		u16 ignore_neigh = 0;
++/* Carry one packet for a packet-offloaded SA on to SEC. The caller has
++ * already checked that its bundle leaves by the SA's own port.
++ *
++ * The state travels with the frame instead of being looked up again: the
++ * transmit path needs the SA to pick a SEC frame queue, and the sec_path is
++ * where a driver is already expected to find it. The reference is released
++ * with the skb.
++ */
++static int xfrm_dev_sec_xmit(struct sock *sk, struct xfrm_state *x,
++			     struct sk_buff *skb)
++{
++	struct sec_path *sp;
++	int err;
 +
-+		num_xfrms = 0;
-+		memset(xfrm_handle, 0, XFRM_POLICY_TYPE_MAX * sizeof(u16));
-+		while (((x = dst1->xfrm) != NULL) && (num_xfrms < XFRM_POLICY_TYPE_MAX)) {
-+			xfrm_handle[num_xfrms++] = x->handle;
-+			if (x->props.mode == XFRM_MODE_TUNNEL)
-+				ignore_neigh = 1;
-+			dst1 = xfrm_dst_child(dst1);
-+
-+			if (dst1 == NULL) {
-+				err = -EHOSTUNREACH;
-+				goto error;
-+			}
-+		}
-+		if (ipsec_flow_add(net, fl, family, dir, xfrm_handle)) {
-+			/* sent flow notification to cmm with sa_handle */
-+			ipsec_nlkey_flow(num_xfrms, xfrm_handle, fl, family, (unsigned short)dir, ignore_neigh);
++	/* A forwarded packet decrypted by another SA still
++	 * carries that SA in its sec_path. The receive policy
++	 * has been checked by now, and the driver takes the
++	 * first entry as the SA to encrypt with, so start
++	 * from an empty one, as the software path does. */
++	secpath_reset(skb);
++	sp = secpath_set(skb);
++	if (!sp) {
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return -ENOMEM;
++	}
++	/* len only, deliberately not olen.
++	 *
++	 * xfrm_offload() answers non-NULL exactly when olen is
++	 * non-zero and equal to len, and a non-NULL answer is
++	 * what draws the frame into validate_xmit_xfrm() on
++	 * the way out -- which, on a device advertising
++	 * NETIF_F_HW_ESP, encrypts it in software and hands
++	 * the finished packet to the driver. SEC would then
++	 * never see it, and the only visible sign would be a
++	 * tunnel that works with the hardware counter at zero.
++	 * xfrm_output()'s crypto-offload branch does increment
++	 * olen, because that path wants exactly that fixup. This
++	 * one does not: it needs the state carried to the driver
++	 * and nothing else done to the frame. */
++	sp->xvec[sp->len++] = x;
++	xfrm_state_hold(x);
++	skb->ipsec_offload = 1;
++	/* Finish the inner checksum before SEC sees the frame.
++	 *
++	 * The engine encrypts what it is given, and ESP
++	 * authenticates the ciphertext rather than the payload
++	 * inside it -- so a locally generated packet still
++	 * carrying CHECKSUM_PARTIAL encrypts, traverses, and
++	 * decrypts perfectly at the far end, which then drops
++	 * the inner datagram for a bad checksum. The peer's SA
++	 * counters advance and nothing is delivered.
++	 *
++	 * xfrm_output()'s software path does this for the same
++	 * reason; it is only skipped for a device advertising
++	 * NETIF_F_HW_ESP_TX_CSUM, which computes the inner sum
++	 * itself. This one does not claim that. */
++	if (skb->ip_summed == CHECKSUM_PARTIAL) {
++		err = skb_checksum_help(skb);
++		if (err) {
++			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++			kfree_skb(skb);
++			return err;
 +		}
 +	}
-+#endif
++	/* A tunnel's inner destination is not the next hop,
++	 * and in a tunnel of the other family it has no
++	 * neighbour at all, so tunnel mode goes straight to
++	 * the device, locally generated packets included: the
++	 * offline port frames them from the SA, not from a
++	 * neighbour. Transport mode is addressed to the peer
++	 * itself and keeps the ordinary path. */
++	if (x->props.mode == XFRM_MODE_TUNNEL)
++		return xfrm_dev_sec_output(x, skb);
++	return xfrm_output_resume(sk, skb, 0);
++}
++
++/* A GSO packet is segmented here, in software and with every checksum
++ * finished, and each segment goes on as a packet of its own.
++ *
++ * SEC encrypts what it is handed as one ESP packet, so it has to be handed
++ * segments, and the inner checksums have to be complete before it sees them
++ * (see xfrm_dev_sec_xmit()). Left to the port, a GSO packet would be
++ * segmented with the port's own checksum offload, which finishes the sum on
++ * a transmit path that frames bound for SEC never take; and finishing it
++ * here with skb_checksum_help() refuses a GSO packet outright, with a
++ * warning. So this segments with no features at all, as xfrm_output_gso()
++ * does for a software transform. Every segment is sent whatever became of
++ * the one before, as ip_finish_output_gso() does, and the first failure is
++ * what is returned.
++ */
++static int xfrm_dev_sec_gso(struct sock *sk, struct xfrm_state *x,
++			    struct sk_buff *skb)
++{
++	struct sk_buff *segs, *nskb;
++	int ret = 0;
++
++	BUILD_BUG_ON(sizeof(*IPCB(skb)) > SKB_GSO_CB_OFFSET);
++	BUILD_BUG_ON(sizeof(*IP6CB(skb)) > SKB_GSO_CB_OFFSET);
++	segs = skb_gso_segment(skb, 0);
++	if (IS_ERR_OR_NULL(segs)) {
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return segs ? PTR_ERR(segs) : -EINVAL;
++	}
++	consume_skb(skb);
++
++	skb_list_walk_safe(segs, segs, nskb) {
++		int err;
++
++		skb_mark_not_on_list(segs);
++		err = xfrm_dev_sec_xmit(sk, x, segs);
++		if (err && !ret)
++			ret = err;
++	}
++
++	return ret;
++}
 +#endif
 +
- ok:
- 	xfrm_pols_put(pols, drop_pols);
- 	if (dst && dst->xfrm &&
-@@ -3847,6 +3893,31 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
- 			goto reject;
+ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct net *net = dev_net(skb_dst(skb)->dev);
+@@ -763,6 +980,37 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ 			return -EHOSTUNREACH;
  		}
  
-+#ifdef IPSEC_FLOW_CACHE
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/* The frame leaves as plaintext and only the SA's own device
++		 * hands it to SEC; on any other it would be sent in the
++		 * clear. So a bundle whose route leaves elsewhere is dropped
++		 * here. For an SA of the flow's family that route is the one
++		 * to the peer, moved off the SA's port by a failover, a more
++		 * specific route or a routing rule, and the SA has to be
++		 * installed again where it now leads. validate_xmit_xfrm()
++		 * backs this up for a frame sent elsewhere after this point.
++		 */
 +		{
-+			struct xfrm_state *x;
-+			u16 xfrm_handle[XFRM_POLICY_TYPE_MAX];
++			/* The driver hands SEC the frame with the first state
++			 * of its sec_path and nothing else, so a bundle of more
++			 * than one transform would leave with one applied. */
++			if (xfrm_dst_child(skb_dst(skb))->xfrm ||
++			    xfrm_dst_path(skb_dst(skb))->dev !=
++			    READ_ONCE(x->xso.dev) ||
++			    (x->props.mode == XFRM_MODE_TUNNEL &&
++			     !xfrm_dev_sec_next_hop(x, xfrm_dst_path(skb_dst(skb))))) {
++				XFRM_INC_STATS(net,
++					       LINUX_MIB_XFRMOUTBUNDLECHECKERROR);
++				kfree_skb(skb);
++				return -EHOSTUNREACH;
++			}
 +
-+			xfrm_nr = 0;
-+			memset(xfrm_handle, 0, XFRM_POLICY_TYPE_MAX * sizeof(u16));
-+			for (i = sp->len - 1; (i >= 0) && (xfrm_nr < XFRM_POLICY_TYPE_MAX); i--) {
-+				x = sp->xvec[i];
-+				xfrm_handle[xfrm_nr++] = x->handle;
-+			}
-+			if (ipsec_flow_add(net, (const struct flowi *)&fl, family, dir, xfrm_handle)) {
-+				/* sent flow notification to cmm with sa_handle */
-+				ipsec_nlkey_flow(xfrm_nr, xfrm_handle, (const struct flowi *)&fl, family, dir, 0);
-+			}
++			if (skb_is_gso(skb))
++				return xfrm_dev_sec_gso(sk, x, skb);
++			return xfrm_dev_sec_xmit(sk, x, skb);
 +		}
-+
-+		/* Hub and spoke changes: Setting the POLICY_IN direction in the packet */
-+		skb->ipsec_xfrm_dir |= (1 << XFRM_POLICY_IN);
-+
-+std_path:
-+#endif
 +#endif
 +
- out:
- 		xfrm_pols_put(pols, npols);
- 		sp->verified_cnt = k;
-@@ -4321,6 +4392,14 @@ static int __net_init xfrm_net_init(struct net *net)
- 	if (rv < 0)
- 		goto out_sysctl;
- 
-+#ifdef IPSEC_FLOW_CACHE
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	rv = ipsec_flow_init(net);
-+	if (rv < 0)
-+		goto out_ipsec_flow;
-+#endif
-+#endif
-+
- 	rv = xfrm_nat_keepalive_net_init(net);
- 	if (rv < 0)
- 		goto out_nat_keepalive;
-@@ -4328,6 +4407,12 @@ static int __net_init xfrm_net_init(struct net *net)
- 	return 0;
- 
- out_nat_keepalive:
-+#ifdef IPSEC_FLOW_CACHE
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	ipsec_flow_fini(net);
-+out_ipsec_flow:
-+#endif
-+#endif
- 	xfrm_sysctl_fini(net);
- out_sysctl:
- 	xfrm_policy_fini(net);
-@@ -4342,6 +4427,11 @@ static int __net_init xfrm_net_init(struct net *net)
- static void __net_exit xfrm_net_exit(struct net *net)
- {
- 	xfrm_nat_keepalive_net_fini(net);
-+#ifdef IPSEC_FLOW_CACHE
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	ipsec_flow_fini(net);
-+#endif
-+#endif
- 	xfrm_sysctl_fini(net);
- 	xfrm_policy_fini(net);
- 	xfrm_state_fini(net);
+ 		/* Exclusive direct xmit for tunnel mode, as
+ 		 * some filtering or matching rules may apply
+ 		 * in transport mode.
 diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
-index 792e5ef9361a..8a2005c50ee3 100644
+index 792e5ef9361a..02188558bd1c 100644
 --- a/net/xfrm/xfrm_state.c
 +++ b/net/xfrm/xfrm_state.c
-@@ -58,6 +58,57 @@ static inline bool xfrm_state_hold_rcu(struct xfrm_state __rcu *x)
+@@ -58,6 +58,28 @@ static inline bool xfrm_state_hold_rcu(struct xfrm_state __rcu *x)
  	return refcount_inc_not_zero(&x->refcnt);
  }
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+static unsigned short xfrm_state_handle;
-+
 +/*
-+ * Assign a unique IPsec-offload handle to x and insert it into the 'byh'
-+ * hash. The caller must hold net->xfrm.xfrm_state_lock -- every 'byh' insert
-+ * site does -- so the handle is chosen atomically with respect to insert and
-+ * delete and deduplicated against every live SA. Choosing it here (rather
-+ * than in xfrm_state_alloc(), which runs lockless -- and even under
-+ * xfrm_state_lock on the xfrm_find_acq path) is what stops two live SAs from
-+ * sharing a handle when the u16 counter wraps or two allocations race.
-+ * Handle 0 is reserved as "unassigned"; the hardware consumer
-+ * (km_state_notify -> ipsec_xfrm2nlkey) reads x->handle only after insert.
++ * Index a packet-offloaded state by the handle its driver gave it, so that
++ * the driver can find the state again from a frame SEC has decrypted: the
++ * handle is all such a frame carries. The driver allocates the handle,
++ * because it indexes the driver's own SA table, and sets it from
++ * xdo_dev_state_add(), which runs before the state is inserted. A state no
++ * driver took has no handle and is not indexed, so a handle can only ever
++ * resolve to the state the hardware holds. The caller holds
++ * net->xfrm.xfrm_state_lock -- every 'byh' insert site does.
 + */
 +static void xfrm_state_insert_byh(struct net *net, struct xfrm_state *x)
 +{
-+	struct xfrm_state *y;
-+	unsigned int h, tries;
-+	bool taken;
-+	u16 cand;
++	unsigned int h;
 +
-+	if (x->in_byh_hash)
++	if (x->in_byh_hash || !x->handle)
 +		return;
-+
-+	for (tries = 0; tries < 0x10000; tries++) {
-+		cand = xfrm_state_handle++;
-+		if (cand == 0)
-+			continue;
-+		h = cand & net->xfrm.state_hmask;
-+		taken = false;
-+		hlist_for_each_entry(y, net->xfrm.state_byh + h, byh) {
-+			if (y->handle == cand) {
-+				taken = true;
-+				break;
-+			}
-+		}
-+		if (taken)
-+			continue;
-+		x->handle = cand;
-+		hlist_add_head_rcu(&x->byh, net->xfrm.state_byh + h);
-+		x->in_byh_hash = 1;
-+		return;
-+	}
-+	/*
-+	 * All 65535 handles are live -- far beyond SEC/cdx capacity, so not
-+	 * expected. Leave the SA un-offloaded (handle 0, not in byh) rather
-+	 * than spin or alias a live handle.
-+	 */
-+	pr_warn_ratelimited("xfrm: IPsec offload handle space exhausted; SA not offloaded\n");
++	h = x->handle & net->xfrm.state_hmask;
++	hlist_add_head_rcu(&x->byh, net->xfrm.state_byh + h);
++	x->in_byh_hash = 1;
 +}
 +#endif
  static inline unsigned int xfrm_dst_hash(struct net *net,
  					 const xfrm_address_t *daddr,
  					 const xfrm_address_t *saddr,
-@@ -114,12 +165,22 @@ static unsigned int xfrm_seq_hash(struct net *net, u32 seq)
+@@ -114,12 +136,22 @@ static unsigned int xfrm_seq_hash(struct net *net, u32 seq)
  			hlist_add_before_rcu(_n, &_x->by);                 \
  	}
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+static void xfrm_hash_transfer(struct hlist_head *list,
-+			       struct hlist_head *ndsttable,
-+			       struct hlist_head *nsrctable,
-+			       struct hlist_head *nspitable,
-+			       struct hlist_head *nseqtable,
-+			       struct hlist_head *nhtable,
-+			       unsigned int nhashmask)
-+#else
  static void xfrm_hash_transfer(struct hlist_head *list,
  			       struct hlist_head *ndsttable,
  			       struct hlist_head *nsrctable,
  			       struct hlist_head *nspitable,
  			       struct hlist_head *nseqtable,
++			       struct hlist_head *nhtable,
  			       unsigned int nhashmask)
++#else
++static void xfrm_hash_transfer(struct hlist_head *list,
++			       struct hlist_head *ndsttable,
++			       struct hlist_head *nsrctable,
++			       struct hlist_head *nspitable,
++			       struct hlist_head *nseqtable,
++			       unsigned int nhashmask)
 +#endif
  {
  	struct hlist_node *tmp;
  	struct xfrm_state *x;
-@@ -150,6 +211,13 @@ static void xfrm_hash_transfer(struct hlist_head *list,
+@@ -150,6 +182,13 @@ static void xfrm_hash_transfer(struct hlist_head *list,
  			XFRM_STATE_INSERT(byseq, &x->byseq, nseqtable + h,
  					  x->xso.type);
  		}
@@ -2024,7 +906,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  	}
  }
  
-@@ -162,6 +230,9 @@ static void xfrm_hash_resize(struct work_struct *work)
+@@ -162,6 +201,9 @@ static void xfrm_hash_resize(struct work_struct *work)
  {
  	struct net *net = container_of(work, struct net, xfrm.state_hash_work);
  	struct hlist_head *ndst, *nsrc, *nspi, *nseq, *odst, *osrc, *ospi, *oseq;
@@ -2034,7 +916,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  	unsigned long nsize, osize;
  	unsigned int nhashmask, ohashmask;
  	int i;
-@@ -188,6 +259,16 @@ static void xfrm_hash_resize(struct work_struct *work)
+@@ -188,6 +230,16 @@ static void xfrm_hash_resize(struct work_struct *work)
  		xfrm_hash_free(nspi, nsize);
  		return;
  	}
@@ -2051,7 +933,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  
  	spin_lock_bh(&net->xfrm.xfrm_state_lock);
  	write_seqcount_begin(&net->xfrm.xfrm_state_hash_generation);
-@@ -195,17 +276,27 @@ static void xfrm_hash_resize(struct work_struct *work)
+@@ -195,17 +247,27 @@ static void xfrm_hash_resize(struct work_struct *work)
  	nhashmask = (nsize / sizeof(struct hlist_head)) - 1U;
  	odst = xfrm_state_deref_prot(net->xfrm.state_bydst, net);
  	for (i = net->xfrm.state_hmask; i >= 0; i--)
@@ -2079,7 +961,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  	net->xfrm.state_hmask = nhashmask;
  
  	write_seqcount_end(&net->xfrm.xfrm_state_hash_generation);
-@@ -219,6 +310,9 @@ static void xfrm_hash_resize(struct work_struct *work)
+@@ -219,6 +281,9 @@ static void xfrm_hash_resize(struct work_struct *work)
  	xfrm_hash_free(osrc, osize);
  	xfrm_hash_free(ospi, osize);
  	xfrm_hash_free(oseq, osize);
@@ -2089,7 +971,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  }
  
  static DEFINE_SPINLOCK(xfrm_state_afinfo_lock);
-@@ -682,6 +776,9 @@ struct xfrm_state *xfrm_state_alloc(struct net *net)
+@@ -682,6 +747,9 @@ struct xfrm_state *xfrm_state_alloc(struct net *net)
  		INIT_HLIST_NODE(&x->bysrc);
  		INIT_HLIST_NODE(&x->byspi);
  		INIT_HLIST_NODE(&x->byseq);
@@ -2099,35 +981,22 @@ index 792e5ef9361a..8a2005c50ee3 100644
  		hrtimer_init(&x->mtimer, CLOCK_BOOTTIME, HRTIMER_MODE_ABS_SOFT);
  		x->mtimer.function = xfrm_timer_handler;
  		timer_setup(&x->rtimer, xfrm_replay_timer_handler, 0);
-@@ -692,6 +789,16 @@ struct xfrm_state *xfrm_state_alloc(struct net *net)
+@@ -692,6 +760,10 @@ struct xfrm_state *xfrm_state_alloc(struct net *net)
  		x->lft.hard_packet_limit = XFRM_INF;
  		x->replay_maxage = 0;
  		x->replay_maxdiff = 0;
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+		/*
-+		 * The offload handle is assigned at 'byh' insert time (under
-+		 * xfrm_state_lock, deduplicated) by xfrm_state_insert_byh(), not
-+		 * here: xfrm_state_alloc() runs without that lock, the SA is not in
-+		 * any hash yet, and states that are never inserted (acquire / temp /
-+		 * freed-before-insert) must not burn a handle value.
-+		 */
++		/* The handle is the driver's, set when it takes the state. */
 +		x->in_byh_hash = 0;
 +#endif
  		x->pcpu_num = UINT_MAX;
  		spin_lock_init(&x->lock);
  	}
-@@ -766,6 +873,24 @@ int __xfrm_state_delete(struct xfrm_state *x)
+@@ -766,6 +838,17 @@ int __xfrm_state_delete(struct xfrm_state *x)
  
  		if (!hlist_unhashed(&x->byspi))
  			hlist_del_init_rcu(&x->byspi);
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+		/*
-+		 * The SA is going away: stop the datapath from treating it as
-+		 * offloaded (xfrm_input/xfrm_output gate the SEC submit on this
-+		 * flag). cmm cannot clear it via SET_OFFLOAD once we unlink it from
-+		 * byh below, so clear it here.
-+		 */
-+		x->offloaded = 0;
 +		/*
 +		 * if 'handle' value is assigned and xfrm_state is inserted
 +		 * into 'byh' hash table, remove it now and reset 'in_byh_hash'
@@ -2141,7 +1010,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  		net->xfrm.state_num--;
  		xfrm_nat_keepalive_state_updated(x);
  		spin_unlock(&net->xfrm.xfrm_state_lock);
-@@ -1524,6 +1649,15 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
+@@ -1524,6 +1607,15 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
  						  net->xfrm.state_byseq + h,
  						  x->xso.type);
  			}
@@ -2157,7 +1026,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  			x->lft.hard_add_expires_seconds = net->xfrm.sysctl_acq_expires;
  			hrtimer_start(&x->mtimer,
  				      ktime_set(net->xfrm.sysctl_acq_expires, 0),
-@@ -1694,6 +1828,15 @@ static void __xfrm_state_insert(struct xfrm_state *x)
+@@ -1694,6 +1786,15 @@ static void __xfrm_state_insert(struct xfrm_state *x)
  				  x->xso.type);
  	}
  
@@ -2173,37 +1042,75 @@ index 792e5ef9361a..8a2005c50ee3 100644
  	hrtimer_start(&x->mtimer, ktime_set(1, 0), HRTIMER_MODE_REL_SOFT);
  	if (x->replay_maxage)
  		mod_timer(&x->rtimer, jiffies + x->replay_maxage);
-@@ -1715,6 +1858,9 @@ static void __xfrm_state_bump_genids(struct xfrm_state *xnew)
- 	u32 mark = xnew->mark.v & xnew->mark.m;
- 	u32 if_id = xnew->if_id;
- 	u32 cpu_id = xnew->pcpu_num;
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	u16 parent_sa_handle = 0;
-+#endif
+@@ -2068,6 +2169,15 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+ {
+ 	struct xfrm_state *xc;
  
- 	h = xfrm_dst_hash(net, &xnew->id.daddr, &xnew->props.saddr, reqid, family);
- 	hlist_for_each_entry(x, net->xfrm.state_bydst+h, bydst) {
-@@ -1725,8 +1871,19 @@ static void __xfrm_state_bump_genids(struct xfrm_state *xnew)
- 		    (mark & x->mark.m) == x->mark.v &&
- 		    xfrm_addr_equal(&x->id.daddr, &xnew->id.daddr, family) &&
- 		    xfrm_addr_equal(&x->props.saddr, &xnew->props.saddr, family))
-+		{
- 			x->genid++;
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+			if (!parent_sa_handle)
-+			{
-+				parent_sa_handle = x->handle;
-+			}
++	/* The clone carries on from x's replay state, which for a
++	 * packet-offloaded x moves in its device and reaches xfrm's copy only
++	 * when the driver publishes it. Have it do so first, under x->lock as
++	 * the state timer asks, so the clone starts where the device is. */
++	spin_lock_bh(&x->lock);
++	xfrm_dev_state_update_stats(x);
++	spin_unlock_bh(&x->lock);
 +#endif
-+		}
- 	}
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	xnew->parent_sa_handle = parent_sa_handle;
-+#endif
- }
+ 	xc = xfrm_state_clone(x, encap);
+ 	if (!xc)
+ 		return NULL;
+@@ -2098,6 +2208,40 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+ EXPORT_SYMBOL(xfrm_state_migrate);
+ #endif
  
- void xfrm_state_insert(struct xfrm_state *x)
-@@ -2272,6 +2429,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++/* Whether an update may be copied into the packet-offloaded state @x1 in
++ * place. An update reaches no driver, so it may not change what the hardware
++ * SA was programmed from:
++ *
++ *  - the encapsulation ports, which SEC writes in front of every frame it
++ *    encrypts and the classifier keys the SA's inbound frames on;
++ *  - the output mark, which the peer's route was looked up with to address
++ *    the SA's frames, and is looked up with again whenever the peer moves.
++ *
++ * Changing either in place would leave the hardware on the old value while
++ * the state reports the new one, so that is refused; deleting the state and
++ * adding it again programs it. An update that keeps them, or names no mark
++ * at all and so keeps the state's, is unaffected, and so are the lifetimes,
++ * which this state's own expiry enforces from the counters the driver
++ * reports.
++ */
++static bool xfrm_state_update_offload_ok(const struct xfrm_state *x1,
++					 const struct xfrm_state *x)
++{
++	if (x1->xso.type != XFRM_DEV_OFFLOAD_PACKET)
++		return true;
++	if (x->encap && x1->encap &&
++	    (x->encap->encap_sport != x1->encap->encap_sport ||
++	     x->encap->encap_dport != x1->encap->encap_dport))
++		return false;
++	if ((x->props.smark.v || x->props.smark.m) &&
++	    (x->props.smark.v != x1->props.smark.v ||
++	     x->props.smark.m != x1->props.smark.m))
++		return false;
++	return true;
++}
++#endif
++
+ int xfrm_state_update(struct xfrm_state *x)
+ {
+ 	struct xfrm_state *x1, *to_put;
+@@ -2154,6 +2298,10 @@ int xfrm_state_update(struct xfrm_state *x)
+ 	err = -EINVAL;
+ 	spin_lock_bh(&x1->lock);
+ 	if (likely(x1->km.state == XFRM_STATE_VALID)) {
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		if (!xfrm_state_update_offload_ok(x1, x))
++			goto fail;
++#endif
+ 		if (x->encap && x1->encap &&
+ 		    x->encap->encap_type == x1->encap->encap_type)
+ 			memcpy(x1->encap, x->encap, sizeof(*x1->encap));
+@@ -2272,6 +2420,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
  }
  EXPORT_SYMBOL(xfrm_state_lookup_byaddr);
  
@@ -2240,7 +1147,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  struct xfrm_state *
  xfrm_find_acq(struct net *net, const struct xfrm_mark *mark, u8 mode, u32 reqid,
  	      u32 if_id, u32 pcpu_num, u8 proto, const xfrm_address_t *daddr,
-@@ -2521,6 +2708,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
+@@ -2521,6 +2699,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
  			x->id.spi = newspi;
  			h = xfrm_spi_hash(net, &x->id.daddr, newspi, x->id.proto, x->props.family);
  			XFRM_STATE_INSERT(byspi, &x->byspi, net->xfrm.state_byspi + h, x->xso.type);
@@ -2257,7 +1164,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  			spin_unlock_bh(&net->xfrm.xfrm_state_lock);
  			err = 0;
  			goto unlock;
-@@ -3207,6 +3404,19 @@ int __net_init xfrm_state_init(struct net *net)
+@@ -3207,6 +3395,12 @@ int __net_init xfrm_state_init(struct net *net)
  	if (!net->xfrm.state_byseq)
  		goto out_byseq;
  
@@ -2265,19 +1172,12 @@ index 792e5ef9361a..8a2005c50ee3 100644
 +	net->xfrm.state_byh = xfrm_hash_alloc(sz);
 +	if (!net->xfrm.state_byh)
 +		goto out_byh;
-+	/*
-+	 * xfrm_state_handle is a single global; seed it once (from init_net,
-+	 * the first netns) so a later namespace does not reseed -- and possibly
-+	 * rewind -- a counter other namespaces are already drawing from.
-+	 */
-+	if (net == &init_net)
-+		get_random_bytes(&xfrm_state_handle, sizeof(xfrm_state_handle));
 +#endif
 +
  	net->xfrm.state_cache_input = alloc_percpu(struct hlist_head);
  	if (!net->xfrm.state_cache_input)
  		goto out_state_cache_input;
-@@ -3221,6 +3431,10 @@ int __net_init xfrm_state_init(struct net *net)
+@@ -3221,6 +3415,10 @@ int __net_init xfrm_state_init(struct net *net)
  	return 0;
  
  out_state_cache_input:
@@ -2288,7 +1188,7 @@ index 792e5ef9361a..8a2005c50ee3 100644
  	xfrm_hash_free(net->xfrm.state_byseq, sz);
  out_byseq:
  	xfrm_hash_free(net->xfrm.state_byspi, sz);
-@@ -3251,6 +3465,10 @@ void xfrm_state_fini(struct net *net)
+@@ -3251,6 +3449,10 @@ void xfrm_state_fini(struct net *net)
  	xfrm_hash_free(net->xfrm.state_bysrc, sz);
  	WARN_ON(!hlist_empty(net->xfrm.state_bydst));
  	xfrm_hash_free(net->xfrm.state_bydst, sz);
@@ -2300,20 +1200,50 @@ index 792e5ef9361a..8a2005c50ee3 100644
  }
  
 diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
-index 9da6bb095888..ede28c1ed242 100644
+index 9da6bb095888..41a8cadb7ce9 100644
 --- a/net/xfrm/xfrm_user.c
 +++ b/net/xfrm/xfrm_user.c
-@@ -1070,6 +1070,10 @@ static void copy_to_user_state(struct xfrm_state *x, struct xfrm_usersa_info *p)
- 	if (x->xso.dev)
- 		xfrm_dev_state_update_stats(x);
- 	memcpy(&p->curlft, &x->curlft, sizeof(p->curlft));
+@@ -2709,6 +2709,16 @@ static int xfrm_get_ae(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	 * while we are still reading) - jhs
+ 	*/
+ 	spin_lock_bh(&x->lock);
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if (x->curr_time)
-+		p->curlft.use_time = x->curr_time;
++	/* A packet-offloaded state's sequence numbers and anti-replay window
++	 * move in its device, and xfrm's copy of them only when the driver
++	 * publishes it. Have it do so now, as XFRM_MSG_GETSA does before it
++	 * reports the lifetime (copy_to_user_state()): a keying daemon reads
++	 * this to carry the SA over when it re-adds it at a new address, and
++	 * a stale copy would start the new SA behind the old one. Under
++	 * x->lock, where the state timer asks too. */
++	xfrm_dev_state_update_stats(x);
 +#endif
- 	put_unaligned(x->stats.replay_window, &p->stats.replay_window);
- 	put_unaligned(x->stats.replay, &p->stats.replay);
- 	put_unaligned(x->stats.integrity_failed, &p->stats.integrity_failed);
+ 	c.data.aevent = p->flags;
+ 	c.seq = nlh->nlmsg_seq;
+ 	c.portid = nlh->nlmsg_pid;
+@@ -2769,6 +2779,23 @@ static int xfrm_new_ae(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (err)
+ 		goto out;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* A packet-offloaded state's replay state is its device's: the device
++	 * numbers and checks the frames, and no driver hears of an update.
++	 * Written here, it would change what the state reports and nothing
++	 * the device does -- and a driver publishing only forward would keep
++	 * anything moved ahead for its next re-add to start from. The state is
++	 * added again with the replay state it is to start from instead. The
++	 * message is refused whole, so a NEWAE that also names a lifetime or a
++	 * threshold changes nothing; one naming only those, which are xfrm's
++	 * own, still applies. */
++	if ((rp || re) && x->xso.type == XFRM_DEV_OFFLOAD_PACKET) {
++		NL_SET_ERR_MSG(extack, "The replay state of a packet-offloaded SA is its device's");
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++#endif
++
+ 	spin_lock_bh(&x->lock);
+ 	xfrm_update_ae_params(x, attrs, 1);
+ 	spin_unlock_bh(&x->lock);
 -- 
 2.47.3
 
