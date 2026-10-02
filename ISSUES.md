@@ -213,6 +213,9 @@ result independently of those temporary files.
 - [x] **A302.** Preserve NPT in software and hardware flowtables; 12 NPT and four IPv6 DUT cases pass.
   (_:/^flowtable: preserve IPv6 prefix translation in both directions_).
 
+- [x] **A303.** Software-SA updates already release temporary hardware SAs in the pinned kernel; DUT regression verifies cleanup and reuse.
+  (_:/^tests: verify offload cleanup when updating a software SA_).
+
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN

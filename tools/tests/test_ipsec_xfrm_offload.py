@@ -14,11 +14,14 @@
       with -EINVAL before any driver runs, so this is the first end-to-end
       assertion that the control plane exists.
 
-Neither test sends traffic. The datapath is the next increment; what is
-being pinned here is that an SA can be described, accepted and withdrawn.
+The update-software case also checks retirement of the temporary hardware
+SA created by UPDSA. These control-plane tests send no traffic.
 """
 
 from __future__ import annotations
+
+import asyncio
+import time
 
 import pytest
 
@@ -58,7 +61,8 @@ async def test_esp_hw_offload_advertised(aiohttp_session, target_agent):
 
 
 @pytest.mark.usefixtures("splat_window")
-async def test_packet_offload_sa_install(aiohttp_session, target_agent):
+@pytest.mark.parametrize("update_software", [False, True], ids=["new", "update-software"])
+async def test_packet_offload_sa_install(aiohttp_session, target_agent, update_software):
     # An outbound SA is not describable without egress framing, so the bench
     # has to supply what a real tunnel would have had from its IKE exchange:
     #
@@ -99,6 +103,15 @@ async def test_packet_offload_sa_install(aiohttp_session, target_agent):
     for argv in setup:
         await _run(aiohttp_session, target_agent, *argv)
     try:
+        if update_software:
+            # UPDSA updates the existing software state and discards the
+            # temporary offloaded one. Its hardware ownership must be
+            # retired before that temporary state can be freed.
+            # iproute2 also sets XFRMA_SA_DIR from the offload clause; the
+            # software state must match or UPDSA stops with ESRCH first.
+            await _run(aiohttp_session, target_agent, *add[:add.index("offload")],
+                       "dir", "out")
+            add[3] = "update"
         result = await _run(aiohttp_session, target_agent, *add, expect_rc=None)
         # Two gates gave -EINVAL before this increment, and the order matters
         # when reading a failure here. "Type doesn't support offload" is
@@ -112,9 +125,30 @@ async def test_packet_offload_sa_install(aiohttp_session, target_agent):
                            "ip", "-d", "xfrm", "state", "get",
                            "src", LOCAL, "dst", PEER, "proto", "esp", "spi", SPI)
         out = shown["stdout"]
-        assert "crypto offload parameters" in out, out
-        assert TARGET_WAN_IF in out, out
-        assert "packet" in out, out
+        if update_software:
+            assert "offload" not in out, out
+            deadline = time.monotonic() + 10
+            while True:
+                result = await target_agent.fs_read(aiohttp_session, "/proc/cdx_flowtable")
+                assert result["errno"] == 0, result
+                state = dict(line.split() for line in bytes.fromhex(result["content_hex"]).decode().splitlines()
+                             if len(line.split()) == 2)
+                if state["ipsec_sas"] == state["ipsec_sa_cache"] == "0":
+                    break
+                assert time.monotonic() < deadline, state
+                await asyncio.sleep(0.1)
+            # Several stats passes after retirement must never access the
+            # discarded state. splat_window catches a KASAN or lockdep fault.
+            await asyncio.sleep(3)
+            # Prove that the same hardware identity can be installed anew.
+            await _run(aiohttp_session, target_agent, *delete)
+            add[3] = "add"
+            await _run(aiohttp_session, target_agent, *add)
+            shown = await _run(aiohttp_session, target_agent,
+                               "ip", "-d", "xfrm", "state", "get",
+                               "src", LOCAL, "dst", PEER, "proto", "esp", "spi", SPI)
+            out = shown["stdout"]
+        assert "crypto offload parameters" in out and TARGET_WAN_IF in out and "packet" in out, out
     finally:
         await _run(aiohttp_session, target_agent, *delete, expect_rc=None)
         for argv in teardown:
