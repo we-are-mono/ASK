@@ -22,18 +22,19 @@ def controller(tmp_path):
     src = tmp_path / "src"
     src.mkdir()
     replacements = {
+        "/run/ask-flowtable": str(tmp_path),
         "/proc/cdx_flowtable": str(tmp_path / "backend"),
         "/sys/module/cdx": str(tmp_path / "cdx"),
         "/sys/module/ask_flowtable/parameters/multicast": str(tmp_path / "multicast"),
-        "/run/lock/ask-flowtable.lock": str(tmp_path / "lock"),
-        "/run/lock/ask-flowtable.paused": str(tmp_path / "paused"),
+        "/run/ask-flowtable/policy.lock": str(tmp_path / "lock"),
+        "/run/ask-flowtable/paused": str(tmp_path / "paused"),
         "/etc/ask/offload.conf": str(tmp_path / "policy"),
-        "/run/lock/ask-flowtable-daemon.lock": str(tmp_path / "daemon.lock"),
-        "/run/lock/ask-flowtable-service.lock": str(tmp_path / "service.lock"),
-        "/run/lock/ask-flowtable-control.lock": str(tmp_path / "control.lock"),
-        "/run/ask-flowtable.sock": str(tmp_path / "service.sock"),
-        "/var/run/ask-flowtable.pid": str(tmp_path / "daemon.pid"),
-        "/var/run/ask-flowtable-supervisor.pid": str(tmp_path / "supervisor.pid"),
+        "/run/ask-flowtable/daemon.lock": str(tmp_path / "daemon.lock"),
+        "/run/ask-flowtable/service.lock": str(tmp_path / "service.lock"),
+        "/run/ask-flowtable/control.lock": str(tmp_path / "control.lock"),
+        "/run/ask-flowtable/service.sock": str(tmp_path / "service.sock"),
+        "/run/ask-flowtable/worker.pid": str(tmp_path / "daemon.pid"),
+        "/run/ask-flowtable/supervisor.pid": str(tmp_path / "supervisor.pid"),
         "/dev/log": str(tmp_path / "log.sock"),
         "/dev/console": str(tmp_path / "console"),
     }
@@ -521,8 +522,50 @@ def test_pause_write_failure_prevents_stop_mutation(controller):
     (c.root / "paused").mkdir()
     result = c.run("stop", check=False)
     assert result.returncode != 0 and "cannot set reconciliation pause" in result.stderr
+    (c.root / "paused").rmdir()
     assert c.ready()
     assert not c.calls("delete")
+
+
+@pytest.mark.parametrize("name", ["lock", "paused", "daemon.lock", "control.lock", "service.lock"])
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "directory", "shared"])
+def test_runtime_files_refuse_untrusted_objects(controller, name, kind):
+    c = controller
+    path = c.root / name
+    victim = c.root / "victim"
+    victim.write_text("untouched")
+    victim.chmod(0o600)
+    if kind == "symlink":
+        path.symlink_to(victim)
+    elif kind == "hardlink":
+        os.link(victim, path)
+    elif kind == "fifo":
+        os.mkfifo(path, 0o600)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        path.touch(mode=0o666)
+        path.chmod(0o666)
+    verbs = {"lock": ("status",), "paused": ("status", "stop", "resume"),
+             "daemon.lock": ("daemon",), "control.lock": ("service-start",),
+             "service.lock": ("supervise",)}
+    for verb in verbs[name]:
+        result = c.run(verb, check=False)
+        assert result.returncode != 0, (verb, result)
+    assert victim.read_text() == "untouched"
+    assert not c.calls()
+
+
+def test_runtime_directory_permissions_are_not_repaired(controller):
+    c = controller
+    c.root.chmod(0o777)
+    try:
+        result = c.run("status", check=False)
+        assert result.returncode != 0 and "unsafe runtime directory" in result.stderr
+        assert c.root.stat().st_mode & 0o777 == 0o777
+        assert not c.calls()
+    finally:
+        c.root.chmod(0o700)
 
 
 def test_stop_waiting_for_install_cannot_be_undone_by_daemon(controller):

@@ -37,8 +37,9 @@
  * and its complete apply transaction. /run survives process restarts, not boot. */
 static int paused_read(struct ft_ctx *ctx, bool *paused)
 {
-	struct stat st;
-	if (lstat(FT_PAUSED, &st) == 0) {
+	int fd = ft_runtime_open(FT_PAUSED, O_RDONLY);
+	if (fd >= 0) {
+		close(fd);
 		*paused = true;
 		return 0;
 	}
@@ -53,10 +54,13 @@ static int paused_read(struct ft_ctx *ctx, bool *paused)
 static int paused_set(struct ft_ctx *ctx, bool paused)
 {
 	if (!paused) {
+		bool exists;
+		if (paused_read(ctx, &exists))
+			return -1;
 		if (unlink(FT_PAUSED) == 0 || errno == ENOENT)
 			return 0;
 	} else {
-		int fd = open(FT_PAUSED, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+		int fd = ft_runtime_open(FT_PAUSED, O_WRONLY | O_CREAT);
 		if (fd >= 0) {
 			close(fd);
 			return 0;

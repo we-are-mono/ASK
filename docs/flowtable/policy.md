@@ -94,12 +94,17 @@ instead; see [device membership](#device-membership).
 | `resume` | Release the pause under the transaction lock. The running daemon subsequently validates and reconciles its own configured policy, multicast switch included. This command does not install a candidate, start the daemon, or certify recovery; observe `status` and traffic. |
 | `status` | Report table/backend state, the multicast switch and both learners' installed groups (`mcast_enabled`, `mcast_installed`, `mroute_installed`), and `reconciliation_paused`. A manually installed table can have healthy admission while reconciliation is paused. |
 
-Manual control is recorded in `/run/lock/ask-flowtable.paused`, protected by
-the same `/run/lock/ask-flowtable.lock` as every table transaction. A stop
+Manual control is recorded in `/run/ask-flowtable/paused`, protected by
+the same `/run/ask-flowtable/policy.lock` as every table transaction. A stop
 waiting behind an install takes effect after it, and later checks cannot
 undo that stop. The pause survives daemon and service process restarts; it
 expires on reboot with `/run`. For a persistent disable, set `enabled no`,
 which the daemon reasserts for multicast at every check.
+
+All locks, the pause marker, socket and PID files live in the root-owned
+0700 `/run/ask-flowtable` directory. The controller refuses an unsafe directory
+or existing state file: symlinks, special files, extra hard links, a different
+owner, or group/other access. It never repairs an untrusted file in place.
 
 The multicast switch is the adapter's `multicast` parameter
 (`/sys/module/ask_flowtable/parameters/multicast`), on at load. The service
@@ -125,8 +130,8 @@ nft guardians retain their own cleanup and transaction leases.
 The init script calls `service-start`, `service-stop` and `service-restart`.
 These commands serialize lifecycle changes separately from policy transactions
 and address a protected local control socket. PID files are observational:
-`/var/run/ask-flowtable.pid` identifies the worker and
-`/var/run/ask-flowtable-supervisor.pid` identifies its supervisor. Stale files
+`/run/ask-flowtable/worker.pid` identifies the worker and
+`/run/ask-flowtable/supervisor.pid` identifies its supervisor. Stale files
 never authorize signalling a process. `ask-flowtable service-status` reports
 the current supervisor/worker PIDs, restart count, retry delay and stopping
 state; ordinary `status` continues to describe policy and backend health.
@@ -217,7 +222,7 @@ A retirement failure reports that recovery is required and never publishes a
 replacement. A fatal hardware failure still requires full provider teardown
 and a fresh boot. There is no automatic switch to CMM.
 
-Concurrent controller calls serialize on `/run/lock/ask-flowtable.lock`. Each
+Concurrent controller calls serialize on `/run/ask-flowtable/policy.lock`. Each
 `nft` invocation has a five-second monotonic deadline covering input, output
 and process exit. A guardian owns the child and inherited lease, and cancels
 the whole job on timeout or controller death, including adopted descendants

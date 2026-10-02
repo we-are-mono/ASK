@@ -56,7 +56,7 @@ def test_flowtable_service_preserves_authority_and_stop_errors(tmp_path, verb, s
     service = tmp_path / "service"
     text = (ROOT / "meta-ask/recipes-ask/config/files/S50ask-flowtable").read_text()
     text = text.replace("DAEMON=/usr/sbin/ask-flowtable", "DAEMON=" + shlex.quote(str(daemon)))
-    text = text.replace("PIDFILE=/var/run/ask-flowtable.pid", "PIDFILE=" + shlex.quote(str(tmp_path / "pid")))
+    text = text.replace("PIDFILE=/run/ask-flowtable/worker.pid", "PIDFILE=" + shlex.quote(str(tmp_path / "pid")))
     service.write_text(text)
     service.chmod(0o755)
     starter = tmp_path / "start-stop-daemon"

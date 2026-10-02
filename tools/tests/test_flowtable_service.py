@@ -157,9 +157,9 @@ compile(script, str(root / 'nft'), 'exec')
             await console_command(con, "sh", "-c", f'PATH={FAULT_DIR}:"$PATH" {INIT} start')
             await wait_service(r)
             r.service_boot = (await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")).strip()
-            r.service_pid = (await read(r.target, r.session, "/var/run/ask-flowtable.pid")).strip()
+            r.service_pid = (await read(r.target, r.session, "/run/ask-flowtable/worker.pid")).strip()
             r.service_hash = (await service_status(r))["policy_hash"]
-            r.supervisor_pid = (await read(r.target, r.session, "/var/run/ask-flowtable-supervisor.pid")).strip()
+            r.supervisor_pid = (await read(r.target, r.session, "/run/ask-flowtable/supervisor.pid")).strip()
             yield r
         finally:
             # Teardown occurs only after the recovery assertions (or failure
@@ -271,7 +271,7 @@ for pid in {list(pids.values())!r}:
         await hardware(r, p, f"service-{fault}-new-hardware", flows[:3])
         await blocked_probe(r, p)
         assert (await service_status(r))["policy_hash"] == r.service_hash
-        assert (await read(r.target, r.session, "/var/run/ask-flowtable.pid")).strip() == r.service_pid
+        assert (await read(r.target, r.session, "/run/ask-flowtable/worker.pid")).strip() == r.service_pid
         assert (await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")).strip() == r.service_boot
         r.record(f"service-{fault}-recovery", {"controller_seconds": elapsed,
                  "hardware_proof_seconds": hardware_seconds, "samples": samples,
@@ -293,7 +293,7 @@ async def test_flowtable_service_maintenance_stop(service):
         assert not (await service_status(r))["admission_ready"]
         await console_command(r.service_console, INIT, "restart", timeout=45)
         await asyncio.sleep(6)
-        restarted_pid = (await read(r.target, r.session, "/var/run/ask-flowtable.pid")).strip()
+        restarted_pid = (await read(r.target, r.session, "/run/ask-flowtable/worker.pid")).strip()
         assert int(restarted_pid) != replacement["worker_pid"], (replacement, restarted_pid)
         restarted = await supervision_status(r)
         assert restarted["supervisor_pid"] != replacement["supervisor_pid"], (replacement, restarted)
@@ -388,7 +388,7 @@ async def test_flowtable_service_intentional_stop(service):
         await console_command(r.service_console, INIT, "stop", timeout=45)
         await asyncio.sleep(6)
         assert not (await supervision_status(r))["running"]
-        for path in ("/var/run/ask-flowtable.pid", "/var/run/ask-flowtable-supervisor.pid"):
+        for path in ("/run/ask-flowtable/worker.pid", "/run/ask-flowtable/supervisor.pid"):
             assert (await r.target.fs_read(r.session, path))["errno"] != 0, path
         status = await service_status(r)
         assert status["reconciliation_paused"] and not status["policy_installed"], status

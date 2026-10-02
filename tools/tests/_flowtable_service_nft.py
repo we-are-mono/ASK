@@ -27,7 +27,7 @@ def crash(point):
         return
     armed.rename(root / "crash-consumed")
     child = run_real() if point in ("drain", "commit") else 0
-    controller = int(Path("/var/run/ask-flowtable.pid").read_text())
+    controller = int(Path("/run/ask-flowtable/worker.pid").read_text())
     guardian = os.getppid()
     # Prove the chosen fault targets this wrapper's actual controller.
     parent = int(Path(f"/proc/{guardian}/stat").read_text().rsplit(") ", 1)[1].split()[1])

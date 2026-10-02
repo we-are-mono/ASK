@@ -69,8 +69,9 @@ static int write_pid(const char *path, pid_t pid)
 	char temporary[PATH_MAX], text[32];
 	int n = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
 	if (n < 0 || (size_t)n >= sizeof(temporary)) { errno = ENAMETOOLONG; return -1; }
-	int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+	int fd = ft_runtime_open(temporary, O_WRONLY | O_CREAT);
 	if (fd < 0) return -1;
+	if (ftruncate(fd, 0)) { close(fd); return -1; }
 	n = snprintf(text, sizeof(text), "%ld\n", (long)pid);
 	int rc = write(fd, text, (size_t)n) == n ? 0 : -1;
 	if (close(fd)) rc = -1;

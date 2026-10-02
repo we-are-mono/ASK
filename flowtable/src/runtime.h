@@ -10,15 +10,16 @@
 #define FT_PROC        "/proc/cdx_flowtable"
 #define FT_CDX_MODULE  "/sys/module/cdx"
 #define FT_MULTICAST   "/sys/module/ask_flowtable/parameters/multicast"
-#define FT_LOCK      "/run/lock/ask-flowtable.lock"
-#define FT_PAUSED      "/run/lock/ask-flowtable.paused"
+#define FT_RUNTIME     "/run/ask-flowtable"
+#define FT_LOCK      "/run/ask-flowtable/policy.lock"
+#define FT_PAUSED      "/run/ask-flowtable/paused"
 #define FT_DEFAULT_CONF "/etc/ask/offload.conf"
-#define FT_DAEMON_LOCK  "/run/lock/ask-flowtable-daemon.lock"
-#define FT_SERVICE_LOCK "/run/lock/ask-flowtable-service.lock"
-#define FT_CONTROL_LOCK "/run/lock/ask-flowtable-control.lock"
-#define FT_SERVICE_SOCKET "/run/ask-flowtable.sock"
-#define FT_WORKER_PID "/var/run/ask-flowtable.pid"
-#define FT_SUPERVISOR_PID "/var/run/ask-flowtable-supervisor.pid"
+#define FT_DAEMON_LOCK  "/run/ask-flowtable/daemon.lock"
+#define FT_SERVICE_LOCK "/run/ask-flowtable/service.lock"
+#define FT_CONTROL_LOCK "/run/ask-flowtable/control.lock"
+#define FT_SERVICE_SOCKET "/run/ask-flowtable/service.sock"
+#define FT_WORKER_PID "/run/ask-flowtable/worker.pid"
+#define FT_SUPERVISOR_PID "/run/ask-flowtable/supervisor.pid"
 
 /* The header of /proc/cdx_flowtable. present=false means the adapter is not
  * loaded. The DRAIN_FIELDS must all be zero before a rebind. */
@@ -82,6 +83,9 @@ int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65]
  * (>=0) to close when done, or -1 (ctx->err). */
 int ft_lock(struct ft_ctx *ctx, int timeout_ms);
 int ft_path_lock(struct ft_ctx *ctx, const char *path, int timeout_ms);
+/* Runtime state belongs to the service uid (root in production). Refuse
+ * symlinks, shared files and special files before using any existing state. */
+int ft_runtime_open(const char *path, int flags);
 
 /* Foreground supervisor and serialized init-service lifecycle commands. */
 int ft_supervise(const char *conf, int readyfd);

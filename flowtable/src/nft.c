@@ -85,15 +85,44 @@ int ft_nft_delete(struct ft_ctx *ctx, int keepfd)
 	return 0;
 }
 
+static int runtime_dir(void)
+{
+	struct stat st;
+	if (mkdir(FT_RUNTIME, 0700) && errno != EEXIST)
+		return -1;
+	if (lstat(FT_RUNTIME, &st))
+		return -1;
+	if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) {
+		errno = EPERM;
+		return -1;
+	}
+	return 0;
+}
+
+int ft_runtime_open(const char *path, int flags)
+{
+	struct stat st;
+	int fd = open(path, flags | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+	if (fd < 0)
+		return -1;
+	if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
+	    st.st_nlink == 1 && !(st.st_mode & 077))
+		return fd;
+	close(fd);
+	errno = EPERM;
+	return -1;
+}
+
 int ft_path_lock(struct ft_ctx *ctx, const char *path, int timeout_ms)
 {
 	struct timespec ts;
 	long waited = 0;
 	int fd;
-	/* The lock lives under /run/lock, which a minimal image may not have yet
-	 * (the Python helper mkdir'd it too). Create it best-effort. */
-	mkdir("/run/lock", 0755);
-	fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+	if (runtime_dir()) {
+		snprintf(ctx->err, sizeof(ctx->err), "unsafe runtime directory: %s", strerror(errno));
+		return -1;
+	}
+	fd = ft_runtime_open(path, O_CREAT | O_RDWR);
 	if (fd < 0) {
 		snprintf(ctx->err, sizeof(ctx->err), "cannot open lock: %s", strerror(errno));
 		return -1;
@@ -120,4 +149,3 @@ int ft_lock(struct ft_ctx *ctx, int timeout_ms)
 {
 	return ft_path_lock(ctx, FT_LOCK, timeout_ms);
 }
-

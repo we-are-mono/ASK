@@ -46,7 +46,8 @@ int main(int argc, char **argv) {
     # production code, built with the same sanitizers as controller recovery.
     src = ROOT / "flowtable/src"
     (root / "runtime.h").write_text((src / "runtime.h").read_text().replace(
-        '"/run/lock/ask-flowtable.lock"', '"' + str(root / "lock") + '"'))
+        '"/run/ask-flowtable/policy.lock"', '"' + str(root / "lock") + '"').replace(
+        '"/run/ask-flowtable"', '"' + str(root) + '"'))
     for name in ("nft.c", "nft_process.c", "marker.c", "policy.h"):
         (root / name).write_text((src / name).read_text())
     subprocess.run(["cc", "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
