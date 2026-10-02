@@ -81,7 +81,8 @@ Netfilter hides, it is the half most likely to be silently refused, which is
 why every hardware case below asserts both directions separately.
 
 The loader appends these fields in C to the physical TCP/UDP classification
-schemes. IPv6 keys are 48 bytes and IPv4 keys are 49 bytes; SEC's private
+schemes. Including the PPPoE receive identity, IPv6 keys are 55 bytes and
+IPv4 keys are 56 bytes; SEC's private
 tables keep their original keys. The module rejects a loader configuration
 with the old physical key sizes. Ordinary flows and inbound NAT-T roots use
 the native IP protocol and zero tunnel fields, so an encapsulated packet

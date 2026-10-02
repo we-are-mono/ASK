@@ -350,6 +350,8 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 	ft_encap(rule->in_vlan, rule->in_vlans, encap.ingress, &encap.num_ingress);
 	ft_encap(rule->out_vlan, rule->out_vlans, encap.egress, &encap.num_egress);
 	encap.ingress_pppoe = rule->in_session.present;
+	encap.ingress_session_id = rule->in_session.id;
+	ether_addr_copy(encap.ingress_session_mac, rule->in_session.mac);
 	encap.egress_pppoe = rule->out_session.present;
 	encap.egress_session_id = rule->out_session.id;
 	ether_addr_copy(encap.egress_session_mac, rule->out_session.mac);

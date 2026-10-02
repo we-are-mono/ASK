@@ -120,14 +120,14 @@ struct cdx_l2_encap {
 	struct vlan_header egress[DPA_CLS_HM_MAX_VLANs];
 	/* A PPPoE session on either side, the same way. It sits inside every
 	 * VLAN tag on the wire, which is the order the opcodes are already
-	 * emitted in and needs nothing said here. The ingress side carries no
-	 * identity because the strip validates none: STRIP_PPPoE_HDR takes a
-	 * statistics pointer and nothing else, so an ingress session is one
-	 * bit. The egress side carries both, because the insert writes them.
+	 * emitted in and needs nothing said here. The classifier validates the
+	 * ingress identity before STRIP_PPPoE_HDR; the egress insert writes it.
 	 * session_id is in host order, which is what the opcode word is built
 	 * from before it is converted whole. */
 	U8 ingress_pppoe;
 	U8 egress_pppoe;
+	U16 ingress_session_id;
+	U8 ingress_session_mac[ETHER_ADDR_LEN];
 	U16 egress_session_id;
 	U8 egress_session_mac[ETHER_ADDR_LEN];
 	/* Where each side counts, as an index into the firmware's statistics

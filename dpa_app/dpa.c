@@ -73,8 +73,9 @@ static struct fmc_model_t cmodel;
 
 /* Keep the inner tuple, then append first-header fields using generic
  * extraction (known fields are reordered by KeyGen): tuple, native protocol,
- * opposite-family protocol/endpoints. IPv6 keys use 48 bytes; IPv4 keys use
- * 49, including the next-header byte after an outer IPv6 header.
+ * opposite-family protocol/endpoints, then the PPPoE peer and session.
+ * TCP and UDP have separate schemes and tables, so the inner protocol byte
+ * is redundant. Omitting it leaves the largest key at the 56-byte limit.
  * An absent header extracts zero. Thus ordinary traffic cannot hit a tunnel
  * entry, nor can an unsupported encapsulation hit an ordinary entry. */
 static void tunnel_extract(t_FmPcdKgKeyExtractAndHashParams *key,
@@ -99,6 +100,7 @@ static int set_tunnel_keys(struct fmc_model_t *model)
 		const char *name = model->scheme_name[i];
 		t_FmPcdKgKeyExtractAndHashParams *key =
 			&model->scheme[i].keyExtractAndHashParams;
+		bool removed = false;
 		bool v4 = strstr(name, "cdx_udp4_dist") || strstr(name, "cdx_tcp4_dist");
 		bool v6 = strstr(name, "cdx_udp6_dist") || strstr(name, "cdx_tcp6_dist");
 
@@ -117,6 +119,27 @@ static int set_tunnel_keys(struct fmc_model_t *model)
 		key->privateDflt1 = 0;
 		key->dflts[j].type = e_FM_PCD_KG_GENERIC_FROM_DATA;
 		key->dflts[j].dfltSelect = e_FM_PCD_KG_DFLT_PRIVATE_1;
+		/* The compiled scheme still requires this IP family and TCP or
+		 * UDP. Only its redundant byte in the key is removed. */
+		for (j = 0; j < key->numOfUsedExtracts; j++) {
+			t_FmPcdExtractEntry *extract = &key->extractArray[j];
+
+			if (extract->type != e_FM_PCD_EXTRACT_BY_HDR ||
+			    extract->extractByHdr.type != e_FM_PCD_EXTRACT_FULL_FIELD)
+				continue;
+			if ((v4 && extract->extractByHdr.hdr == HEADER_TYPE_IPv4 &&
+			     extract->extractByHdr.extractByHdrType.fullField.ipv4 == NET_HEADER_FIELD_IPv4_PROTO) ||
+			    (v6 && extract->extractByHdr.hdr == HEADER_TYPE_IPv6 &&
+			     extract->extractByHdr.extractByHdrType.fullField.ipv6 == NET_HEADER_FIELD_IPv6_NEXT_HDR)) {
+				removed = true;
+				key->numOfUsedExtracts--;
+				memmove(extract, extract + 1,
+					(key->numOfUsedExtracts - j) * sizeof(*extract));
+				break;
+			}
+		}
+		if (!removed)
+			return -1;
 		tunnel_extract(key, v4 ? HEADER_TYPE_IPv4 : HEADER_TYPE_IPv6, v4 ? 9 : 6, 1);
 		tunnel_extract(key, v4 ? HEADER_TYPE_IPv6 : HEADER_TYPE_IPv4, v4 ? 6 : 9, 1);
 		tunnel_extract(key, v4 ? HEADER_TYPE_IPv6 : HEADER_TYPE_IPv4, v4 ? 8 : 12, v4 ? 16 : 8);
@@ -126,6 +149,10 @@ static int set_tunnel_keys(struct fmc_model_t *model)
 			 * the inner IPv4 header when no extension is present. */
 			tunnel_extract(key, HEADER_TYPE_IPv6, 40, 1);
 		}
+		/* Absent PPPoE produces eight zeroes for a native flow. A PPPoE
+		 * frame starts with 0x11 here, which cannot equal a unicast MAC
+		 * in a session entry, even if this scheme is reached directly. */
+		tunnel_extract(key, HEADER_TYPE_PPPoE, 0, 8);
 	}
 	for (i = 0; i < model->htnode_count; i++) {
 		const char *name = model->htnode_name[i];
@@ -134,6 +161,71 @@ static int set_tunnel_keys(struct fmc_model_t *model)
 			model->htnode[i].matchKeySize = CDX_UNICAST4_KEY_SIZE;
 		else if (strstr(name, "cdx_udp6") || strstr(name, "cdx_tcp6"))
 			model->htnode[i].matchKeySize = CDX_UNICAST_KEY_SIZE;
+	}
+	return 0;
+}
+
+/* PPPoE schemes precede their native counterparts and select the same table.
+ * They add the exact peer MAC and session ID in place of the native zeroes.
+ * Keep the existing CC tree and soft-parser offsets unchanged. */
+static int set_pppoe_keys(struct fmc_model_t *model)
+{
+	unsigned original = model->scheme_count, i, p, j;
+
+	for (i = 0; i < original; i++) {
+		const char *name = model->scheme_name[i];
+		unsigned clone, unit = UINT_MAX;
+		t_FmPcdKgSchemeParams *scheme;
+		t_FmPcdKgKeyExtractAndHashParams *key;
+
+		if (!strstr(name, "cdx_udp4_dist") && !strstr(name, "cdx_tcp4_dist") &&
+		    !strstr(name, "cdx_udp6_dist") && !strstr(name, "cdx_tcp6_dist"))
+			continue;
+		if (model->scheme_count == FMC_SCHEMES_NUM)
+			return -1;
+		clone = model->scheme_count++;
+		scheme = &model->scheme[clone];
+		*scheme = model->scheme[i];
+		if (snprintf(model->scheme_name[clone], FMC_NAME_LEN, "%s_pppoe", name) >= FMC_NAME_LEN)
+			return -1;
+		for (p = 0; p < model->port_count; p++) {
+			fmc_port *port = &model->port[p];
+			unsigned member, candidate;
+
+			for (member = 0; member < port->schemes_count; member++)
+				if (port->schemes[member] == i)
+					break;
+			if (member == port->schemes_count)
+				continue;
+			for (candidate = 0; candidate < port->distinctionUnits.numOfDistinctionUnits; candidate++)
+				if (port->distinctionUnits.units[candidate].hdrs[0].hdr == HEADER_TYPE_PPPoE)
+					break;
+			if (candidate == port->distinctionUnits.numOfDistinctionUnits ||
+			    (unit != UINT_MAX && unit != candidate) || port->schemes_count == FMC_SCHEMES_NUM)
+				return -1;
+			unit = candidate;
+			memmove(&port->schemes[member + 1], &port->schemes[member],
+				(port->schemes_count++ - member) * sizeof(port->schemes[0]));
+			port->schemes[member] = clone;
+		}
+		if (unit == UINT_MAX || scheme->netEnvParams.numOfDistinctionUnits == FM_PCD_MAX_NUM_OF_DISTINCTION_UNITS)
+			return -1;
+		scheme->netEnvParams.unitIds[scheme->netEnvParams.numOfDistinctionUnits++] = unit;
+		key = &scheme->keyExtractAndHashParams;
+		key->numOfUsedExtracts--; /* replace the native PPPoE guard */
+		tunnel_extract(key, HEADER_TYPE_ETH, 6, 6);
+		tunnel_extract(key, HEADER_TYPE_PPPoE, 2, 2);
+		/* FMC assigns relative scheme IDs in apply order. The lower ID
+		 * wins when both the PPPoE and native protocol sets match. */
+		for (j = 0; j < model->apply_order_count; j++) {
+			if (model->apply_order[j].type != FMCScheme || model->apply_order[j].index != i)
+				continue;
+			if (model->apply_order_count == sizeof(model->apply_order) / sizeof(model->apply_order[0]))
+				return -1;
+			memmove(&model->apply_order[j + 1], &model->apply_order[j],
+				(model->apply_order_count++ - j) * sizeof(model->apply_order[0]));
+			model->apply_order[j++].index = clone;
+		}
 	}
 	return 0;
 }
@@ -820,6 +912,8 @@ int dpa_init(void)
 	if (!params.fman_info)
 		goto out;
 
+	if (set_table_types(&cmodel) || set_tunnel_keys(&cmodel) || set_pppoe_keys(&cmodel))
+		goto out;
 	for (ii = 0; ii < params.num_fmans; ii++) {
 		finfo = &params.fman_info[ii];
 		finfo->index = cmodel.fman[ii].number;
@@ -827,8 +921,6 @@ int dpa_init(void)
 		if (get_port_info(finfo))
 			goto out;
 	}
-	if (set_table_types(&cmodel) || set_tunnel_keys(&cmodel))
-		goto out;
 	for (ii = 0; ii < params.num_fmans; ii++) {
 		if (set_fm_adv_options(params.fman_info[ii].index))
 			goto out;

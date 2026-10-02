@@ -186,8 +186,25 @@ direction answers its own offer from its entry, so a partially offloaded flow
 costs no admission lock
 ([architecture.md](architecture.md#native-context-and-admission)).
 
-The classifier key is unchanged — the physical port plus the 5-tuple — so a
-session reaches the hardware only as the header it inserts or strips.
+## Receive identity
+
+Each receive entry matches the negotiated concentrator MAC and session ID,
+plus the physical port, inner addresses and ports, and tunnel fields. TCP and
+UDP select separate tables. The loader adds PPPoE schemes in C ahead of their
+native counterparts, sharing the existing tables; the XML stays unchanged.
+Native entries use eight zero bytes in place of the session identity, so a
+session frame cannot use a native entry. Physical IPv4 keys are 56 bytes and
+IPv6 keys are 55 bytes; SEC's private keys retain their original layout.
+
+Patch 151 also checks the concentrator MAC before IPv4 or IPv6 software
+flowtable forwarding. The software tuple already checks the session ID.
+This prevents a hardware miss from bypassing the ordinary PPP receiver's
+peer check in software. Both hardware directions remain eligible under the
+MTU rules above.
+
+`test_flowtable_pppoe_binding.py` tests both families with software and hardware
+flowtables: wrong IDs and peer MACs must deliver nothing, while valid replies
+before and after them must arrive and increment hardware counters when enabled.
 
 ## Per-session counters
 

@@ -1334,7 +1334,14 @@ static unsigned int fill_tunnel_key(PCtEntry entry, const struct cdx_l2_encap *e
 	} else {
 		key[0] = entry->proto;
 	}
-	return size;
+	memset(key + size, 0, 8);
+	if (encap && encap->ingress_pppoe) {
+		__be16 session = cpu_to_be16(encap->ingress_session_id);
+
+		memcpy(key + size, encap->ingress_session_mac, ETHER_ADDR_LEN);
+		memcpy(key + size + ETHER_ADDR_LEN, &session, sizeof(session));
+	}
+	return size + 8;
 }
 
 int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap)
@@ -1493,8 +1500,15 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 	}	
 	if (!info->l3_info.ipsec_inbound_flow &&
 	    (tbl_type == IPV4_TCP_TABLE || tbl_type == IPV4_UDP_TABLE ||
-	     tbl_type == IPV6_TCP_TABLE || tbl_type == IPV6_UDP_TABLE))
+	     tbl_type == IPV6_TCP_TABLE || tbl_type == IPV6_UDP_TABLE)) {
+		/* The scheme's protocol match selects a TCP or UDP table. */
+		unsigned int protocol = IS_IPV6_FLOW(entry) ? 33 : 9;
+
+		memmove(tbl_entry->hashentry.key + protocol,
+			tbl_entry->hashentry.key + protocol + 1, 4);
+		key_size--;
 		key_size += fill_tunnel_key(entry, encap, tbl_entry->hashentry.key + key_size);
+	}
 
 	//round off keysize to next 4 bytes boundary 
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];          

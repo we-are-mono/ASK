@@ -240,6 +240,15 @@ int fmc_compile(fmc_model *m, const char *a, const char *b, const char *c,
         m->htnode[i].maxNumOfKeys = 16; m->htnode[i].hashResMask = 3;
         m->scheme[i].alwaysDirect = TRUE;
         m->scheme[i].nextEngine = e_FM_PCD_CC;
+        m->scheme[i].netEnvParams.numOfDistinctionUnits = 2;
+        m->scheme[i].netEnvParams.unitIds[0] = 0;
+        m->scheme[i].netEnvParams.unitIds[1] = 1;
+        t_FmPcdKgKeyExtractAndHashParams *key = &m->scheme[i].keyExtractAndHashParams;
+        key->numOfUsedExtracts = 1;
+        key->extractArray[0].type = e_FM_PCD_EXTRACT_BY_HDR;
+        key->extractArray[0].extractByHdr.hdr = HEADER_TYPE_IPv4;
+        key->extractArray[0].extractByHdr.type = e_FM_PCD_EXTRACT_FULL_FIELD;
+        key->extractArray[0].extractByHdr.extractByHdrType.fullField.ipv4 = NET_HEADER_FIELD_IPv4_PROTO;
         m->replicator[i].numOfEntries = 2;
         m->policer[i].id.newParams.profileType = e_FM_PCD_PLCR_SHARED;
         apply(m, FMCEngineStart, i);
@@ -253,6 +262,10 @@ int fmc_compile(fmc_model *m, const char *a, const char *b, const char *c,
             snprintf(p->name, FMC_NAME_LEN, "fm%u/port/1G/%u", i, j + 1);
             p->schemes_count = p->ccnodes_count = p->htnodes_count = 1;
             p->schemes[0] = p->ccnodes[0] = p->htnodes[0] = i;
+            p->distinctionUnits.numOfDistinctionUnits = 3;
+            p->distinctionUnits.units[0].hdrs[0].hdr = HEADER_TYPE_IPv4;
+            p->distinctionUnits.units[1].hdrs[0].hdr = HEADER_TYPE_UDP;
+            p->distinctionUnits.units[2].hdrs[0].hdr = HEADER_TYPE_PPPoE;
             p->vspParam.numOfProfiles = 1;
             apply(m, FMCPortStart, n);
             if (!j) { apply(m, FMCHTNode, i); apply(m, FMCCCNode, i); }
@@ -289,6 +302,36 @@ int main(void)
 {
     reset();
     assert(dpa_init() == 0 && objects && open_fds && !cleaning);
+    /* Session schemes retain family/protocol, precede native schemes and
+     * share their tables; both forms keep the outer-tunnel guards. */
+    assert(cmodel.scheme_count == engines * 2);
+    for (unsigned i = 0; i < engines; i++) {
+        t_FmPcdKgSchemeParams *native = &cmodel.scheme[i];
+        t_FmPcdKgSchemeParams *ppp = &cmodel.scheme[i + engines];
+        assert(native->netEnvParams.numOfDistinctionUnits == 2);
+        assert(ppp->netEnvParams.numOfDistinctionUnits == 3);
+        assert(ppp->netEnvParams.unitIds[0] == 0 && ppp->netEnvParams.unitIds[1] == 1);
+        assert(ppp->netEnvParams.unitIds[2] == 2);
+        assert(ppp->baseFqid == native->baseFqid);
+        assert(ppp->kgNextEngineParams.cc.grpId == native->kgNextEngineParams.cc.grpId);
+        t_FmPcdKgKeyExtractAndHashParams *n = &native->keyExtractAndHashParams;
+        t_FmPcdKgKeyExtractAndHashParams *p = &ppp->keyExtractAndHashParams;
+        assert(n->numOfUsedExtracts == 6 && p->numOfUsedExtracts == 7);
+        assert(!memcmp(n->extractArray, p->extractArray, 5 * sizeof(n->extractArray[0])));
+        assert(n->extractArray[5].extractByHdr.hdr == HEADER_TYPE_PPPoE);
+        assert(n->extractArray[5].extractByHdr.extractByHdrType.fromHdr.size == 8);
+        assert(p->extractArray[5].extractByHdr.hdr == HEADER_TYPE_ETH);
+        assert(p->extractArray[5].extractByHdr.extractByHdrType.fromHdr.offset == 6);
+        assert(p->extractArray[5].extractByHdr.extractByHdrType.fromHdr.size == 6);
+        assert(p->extractArray[6].extractByHdr.hdr == HEADER_TYPE_PPPoE);
+        assert(p->extractArray[6].extractByHdr.extractByHdrType.fromHdr.offset == 2);
+        assert(p->extractArray[6].extractByHdr.extractByHdrType.fromHdr.size == 2);
+        for (unsigned j = 0; j < cmodel.apply_order_count; j++)
+            if (cmodel.apply_order[j].type == FMCScheme && cmodel.apply_order[j].index == i) {
+                assert(j && cmodel.apply_order[j - 1].type == FMCScheme);
+                assert(cmodel.apply_order[j - 1].index == i + engines);
+            }
+    }
     unsigned startup_steps = step;
     unsigned calls = hardware_calls;
     unsigned compiles = compile_calls;

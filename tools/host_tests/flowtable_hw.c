@@ -19,6 +19,7 @@ typedef uint64_t u64;
 typedef u8 U8;
 typedef u16 U16;
 typedef u32 U32;
+#define cpu_to_be16 htons
 #define BIT(n) (1UL << (n))
 #define ETH_ALEN 6
 #define IF_TYPE_ETHERNET 1
@@ -59,11 +60,11 @@ struct cdx_l2_encap {
     u32 num_ingress, num_egress;
     struct vlan_header ingress[DPA_CLS_HM_MAX_VLANs];
     struct vlan_header egress[DPA_CLS_HM_MAX_VLANs];
-    /* A session needs no reversal and no ordering of its own: there is at
-     * most one per direction and it is always the innermost header. The
-     * ingress side carries no identity because the strip validates none. */
+    /* At most one session per direction, with independent identities. */
     u8 ingress_pppoe;
     u8 egress_pppoe;
+    u16 ingress_session_id;
+    u8 ingress_session_mac[ETHER_ADDR_LEN];
     u16 egress_session_id;
     u8 egress_session_mac[ETHER_ADDR_LEN];
     /* Where each side counts. Zero means no record, never record zero. */
@@ -1427,8 +1428,8 @@ static void test_tunnel_keys(void)
     for (unsigned ipv6 = 0; ipv6 < 2; ipv6++) {
         CtEntry ct = { .fftype = ipv6 ? FFTYPE_IPV6 : FFTYPE_IPV4, .proto = IPPROTO_UDP };
         struct cdx_l2_encap encap = {0};
-        uint8_t key[36], changed[36];
-        unsigned size = ipv6 ? 10 : 35, offset = ipv6 ? 12 : 8, addresses = ipv6 ? 8 : 32;
+        uint8_t key[44], changed[44];
+        unsigned size = ipv6 ? 18 : 43, offset = ipv6 ? 12 : 8, addresses = ipv6 ? 8 : 32;
 
         memset(key, 0xff, sizeof(key));
         assert(fill_tunnel_key(&ct, NULL, key) == size);
@@ -1454,6 +1455,20 @@ static void test_tunnel_keys(void)
             assert(!memcmp(key + 2, changed + 2, 32));
         }
         assert(key[size] == 0xff);
+        encap.ingress_pppoe = 1;
+        encap.ingress_session_id = 0x1234;
+        memcpy(encap.ingress_session_mac, (uint8_t[]){2, 3, 4, 5, 6, 7}, 6);
+        assert(fill_tunnel_key(&ct, &encap, changed) == size);
+        assert(!memcmp(changed + size - 8, (uint8_t[]){2, 3, 4, 5, 6, 7, 0x12, 0x34}, 8));
+        for (unsigned i = 0; i < 6; i++) {
+            encap.ingress_session_mac[i] ^= 0x80;
+            assert(fill_tunnel_key(&ct, &encap, key) == size);
+            assert(memcmp(key, changed, size));
+            encap.ingress_session_mac[i] ^= 0x80;
+        }
+        encap.ingress_session_id++;
+        assert(fill_tunnel_key(&ct, &encap, key) == size);
+        assert(memcmp(key, changed, size));
     }
 }
 
@@ -1569,18 +1584,19 @@ int main(void)
 
     /* A PPPoE session on its own asks for an override even though it carries
      * no tag at all, which is the one shape a tag-count test would miss. The
-     * egress side passes its id and the concentrator's address through
-     * untouched; the ingress side is a bare flag, because the strip opcode
-     * takes no identity. */
+     * ingress and egress identities reach the encoder independently. */
     rule.out_session = (struct cdx_ft_session){ .mac = {2,0xac,0,0,0,1},
                                                 .id = 0x1234, .present = true };
-    rule.in_session = (struct cdx_ft_session){ .present = true };
+    rule.in_session = (struct cdx_ft_session){ .mac = {2,0xac,0,0,0,2},
+                                               .id = 0x5678, .present = true };
     assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
     assert(observed_encap_given);
     assert(!observed_encap.num_ingress && !observed_encap.num_egress);
     assert(observed_encap.egress_pppoe && observed_encap.ingress_pppoe);
     assert(observed_encap.egress_session_id == 0x1234);
     assert(!memcmp(observed_encap.egress_session_mac, (u8[]){2,0xac,0,0,0,1}, 6));
+    assert(observed_encap.ingress_session_id == 0x5678);
+    assert(!memcmp(observed_encap.ingress_session_mac, (u8[]){2,0xac,0,0,0,2}, 6));
     /* A session with no record leaves both indices at zero, which the opcodes
      * read as no record rather than as record zero. */
     assert(!observed_encap.ingress_stats_index && !observed_encap.egress_stats_index);
