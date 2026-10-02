@@ -763,8 +763,8 @@ file's git history.
   `ptr->sta` after the send helpers dropped `ra_list_spinlock`, racing `wlan_wmm_delete_peer_ralist()`
   on a station leaving under load — fixed (this commit): re-validate under the lock (patch 0003).
 
-- [x] **A160.** Use-after-free in the Wi-Fi driver's receive path: `moal_recv_packet()` read the skb
-  after `netif_rx()` consumed it — fixed: record the handoff, gate the epilogue (_f07beac_, patch 0002).
+- [x] **A160.** Read Wi-Fi RX descriptors before handing off or freeing their skb (patch 0002); 64 EasyMesh drop callbacks pass under DUT KASAN.
+  (_:/^mwifiex: read receive ownership before freeing the packet_).
 
 - [x] **A157.** Bridged multicast looked installed-but-never-matching on the
   first rig run; not a defect — the injector used a plain UDP socket, whose

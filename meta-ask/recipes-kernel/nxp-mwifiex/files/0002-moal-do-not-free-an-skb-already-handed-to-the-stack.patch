@@ -50,6 +50,10 @@ work under `done:` is only meaningful for a buffer that was *not* handed
 up, so gating the whole epilogue on that is both correct and narrower than
 the reads it removes.
 
+The drop paths can change PENDING back to FAILURE after detaching the skb.
+Read pbuf before freeing that skb too: the descriptor still lives in its
+head, and the caller must receive PENDING so it cannot free it again.
+
 Upstream-Status: Pending [reported to NXP; moal_recv_packet() dereferences
 the mlan_buffer after the skb it is embedded in has been given to the
 network stack, and frees that skb a second time]
@@ -106,10 +110,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 +	 * only ever meant anything for a buffer that was never handed up.
 +	 */
 +	if (status != MLAN_STATUS_PENDING) {
-+		if (pmbuf && !pmbuf->pdesc && skb)
-+			dev_kfree_skb(skb);
 +		if (pmbuf && !pmbuf->pbuf)
 +			status = MLAN_STATUS_PENDING;
++		if (pmbuf && !pmbuf->pdesc && skb)
++			dev_kfree_skb(skb);
 +	}
  	LEAVE();
  	return status;
