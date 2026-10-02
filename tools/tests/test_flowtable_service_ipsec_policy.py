@@ -12,16 +12,14 @@ import time
 
 import pytest
 
-from test_flowtable_connections import by_key, consistent, peer
-from test_flowtable_failslab import same_service
-from test_flowtable_offload import DPORT, command, console_command, rig  # noqa: F401
-from test_flowtable_offload import console_python, read
-from test_flowtable_selective_neighbour import keys, warm
-from test_flowtable_service import FIRST, service, supervision_status
-from test_flowtable_service_ipsec import (INNER, LAN_INNER, REQIDS, TARGET_LAN_IF,
-    TARGET_WAN_IF, WAN_IP, Wire, balanced, flows_for, hardware, ipsec_service,
-    negative, plaintext_probe)  # noqa: F401
-from test_flowtable_service_vlan import attempts
+from _flowtable_connections import (by_key, consistent, peer)
+from _flowtable_failslab import (same_service)
+from _flowtable_rig import (DPORT, command, console_command)
+from _flowtable_rig import (console_python, read)
+from _flowtable_selective_neighbour import (keys, warm)
+from _flowtable_service import (FIRST, supervision_status)
+from _flowtable_service_ipsec import (INNER, LAN_INNER, REQIDS, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IP, Wire, balanced, flows_for, hardware, negative, plaintext_probe)
+from _flowtable_service_vlan import (attempts)
 
 MARK_TABLE = "ask_recovery_xfrm_mark"
 
@@ -184,8 +182,8 @@ async def test_flowtable_service_ipsec_policy_recovery(ipsec_service, change):
 
 @pytest.mark.parametrize("direction", ["fwd", "out"])
 async def test_flowtable_service_xfrm_default_recovery(service, direction):
-    from test_flowtable_service import FLOWS, blocked_probe
-    from test_flowtable_selective_neighbour import hardware as plain_hardware
+    from _flowtable_service import (FLOWS, blocked_probe)
+    from _flowtable_selective_neighbour import (hardware as plain_hardware)
     import re
 
     r = service
@@ -303,7 +301,7 @@ async def test_flowtable_service_ipsec_policy_expiry(ipsec_service):
 
 
 async def test_flowtable_service_ipsec_receive_failslab(ipsec_service):
-    from test_flowtable_failslab import slab_fault
+    from _flowtable_failslab import (slab_fault)
 
     r, flows = ipsec_service, flows_for(ipsec_service)
     supervision, initial_attempts = await supervision_status(r), await attempts(r)
@@ -346,7 +344,7 @@ def configured(state):
 
 
 async def test_flowtable_service_ipsec_pool_recovery(ipsec_service):
-    from test_flowtable_failslab import slab_fault
+    from _flowtable_failslab import (slab_fault)
 
     r, flows = ipsec_service, flows_for(ipsec_service)
     supervision, initial_attempts = await supervision_status(r), await attempts(r)
@@ -438,8 +436,8 @@ print(json.dumps({'path': str(paths[0]), 'bpid': int(bpid)}))
 
 
 async def test_flowtable_service_ipsec_provider_lifetime(ipsec_service):
-    from test_flowtable_service import DAEMON, wait_service
-    from test_ipsec_inbound_flow_offload import sec_counter
+    from _flowtable_service import (DAEMON, wait_service)
+    from _ipsec_inbound_flow_offload import (sec_counter)
 
     r = ipsec_service
     await console_command(r.service_console, DAEMON, "stop", timeout=45)

@@ -6,11 +6,12 @@ from the backend is what keeps the narrow one from quietly widening along with
 the wide one, which no assertion about behaviour on the rig would catch.
 """
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
-import subprocess
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "cdx/cdx_flowtable_backend.c"
@@ -25,14 +26,14 @@ def test_wifi_admission(tmp_path):
             "cdx_ft_egress_supported",
         ]))
     binary = tmp_path / "wifi_admission"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("wifi_admission.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

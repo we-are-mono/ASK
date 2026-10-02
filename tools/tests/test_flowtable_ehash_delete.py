@@ -6,9 +6,9 @@ import asyncio
 from _ehash_bucket import crowded_ipv4
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from ask_orch.uart import Console
-from test_flowtable_connections import healthy, peer
-from test_flowtable_failslab import slab_fault
-from test_flowtable_offload import ARTIFACTS, DPORT, TABLE, WAN_IP, Echo, command, rig  # noqa: F401
+from _flowtable_connections import (healthy, peer)
+from _flowtable_failslab import (slab_fault)
+from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, Echo, command)
 
 # DPORT + 1 is the traffic peer's control port.
 SERVERS = [DPORT, DPORT + 3, DPORT + 4, DPORT + 6]
@@ -59,7 +59,7 @@ async def test_flowtable_ehash_delete_rebuilds_under_allocation_failure(rig):
                for port in SERVERS[1:]]
     # The fault lease is launched and cancelled over the UART, which also
     # carries the rig's own cleanup should a delete stop the datapath.
-    r.recovery_console = Console.target(log_path=str(ARTIFACTS / "ehash-delete-uart.log"))
+    r.recovery_console = Console.target(log_path=str(artifact_dir() / "ehash-delete-uart.log"))
     await asyncio.to_thread(r.recovery_console.login, "root", None)
 
     async def forget():

@@ -10,12 +10,13 @@ XfrmInStateMismatch, while every other state, another driver's packet-offloaded
 one included, is received exactly as upstream receives it.
 """
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -31,7 +32,7 @@ def test_xfrm_input_sec_only(tmp_path):
     (tmp_path / "xfrm_input_sec_only.inc").write_text(
         function(text, "xfrm_state_sec_only") + function(text, "xfrm_input"))
     binary = tmp_path / "xfrm_input_sec_only"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-Wno-unused-but-set-variable",
@@ -39,7 +40,7 @@ def test_xfrm_input_sec_only(tmp_path):
         "-I", str(tmp_path), str(Path(__file__).with_name("xfrm_input_sec_only.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

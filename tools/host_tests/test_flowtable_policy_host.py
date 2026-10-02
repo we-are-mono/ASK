@@ -5,10 +5,11 @@ validator, renderer, and ownership fingerprint into a small harness
 (flowtable_policy.c) and feeds it conf snippets, so the accept/reject surface,
 the injection guards, and the rendered nftables output are covered off the rig.
 """
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
 import re
-import subprocess
 
 import pytest
 
@@ -28,7 +29,7 @@ exclude tcp 21
 def engine(tmp_path_factory):
     out = tmp_path_factory.mktemp("ft") / "flowtable_policy"
     cc = os.environ.get("HOSTCC", "cc")
-    subprocess.run([
+    run_process([
         cc, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-I", str(ENGINE),
@@ -42,7 +43,7 @@ def engine(tmp_path_factory):
 def run(engine, conf, *args):
     env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
            "UBSAN_OPTIONS": "halt_on_error=1"}
-    return subprocess.run([str(engine), *args], input=conf, text=True,
+    return run_process([str(engine), *args], input=conf, text=True,
                           capture_output=True, env=env)
 
 

@@ -13,9 +13,7 @@ get EBUSY.
 from __future__ import annotations
 
 import errno
-import struct
 
-import pytest
 
 from _ioctl import (
     CDX_CTRL_DPA_SET_PARAMS,

@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import pytest
 
-from test_flowtable_connections import SPORT, connections, peer  # noqa: F401
-from test_flowtable_mtu import table_identity
-from test_flowtable_offload import read, rig  # noqa: F401
-from test_flowtable_selective_neighbour import hardware, warm
+from _flowtable_connections import (SPORT, peer)
+from _flowtable_mtu import (table_identity)
+from _flowtable_rig import (read)
+from _flowtable_selective_neighbour import (hardware, warm)
 
 
 @pytest.mark.parametrize("protocol", ["udp", "tcp"])

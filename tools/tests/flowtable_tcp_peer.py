@@ -25,8 +25,8 @@ def retransmits(sock):
 
 def peer_socket():
     # A socket retains the namespace where it was created. Return the process
-    # to loki's namespace so gateway ARP controls remain available over the
-    # same tested TCP connection, even when the endpoint sits behind loki.
+    # to the LAN VM's namespace so gateway ARP controls remain available over the
+    # same tested TCP connection, even when the endpoint sits behind the LAN VM.
     if PEER_NETNS is None:
         return socket.socket()
     with open('/proc/self/ns/net', 'rb') as original, open('/var/run/netns/' + PEER_NETNS, 'rb') as peer:

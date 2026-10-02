@@ -1,6 +1,6 @@
 """A foreign bridge's switchdev events leave the host's hardware flows alone."""
 
-from test_flowtable_offload import command, rig  # noqa: F401
+from _flowtable_rig import (command)
 
 
 async def test_switchdev_foreign_namespace(rig):

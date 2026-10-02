@@ -7,11 +7,10 @@ import re
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_connections import FLOWS, connections, healthy, peer  # noqa: F401
-from test_flowtable_mtu import table_identity
-from test_flowtable_offload import (ARTIFACTS, DPORT, WAN_IP, command, console_command, read, rig,  # noqa: F401
-                                    status_text)
-from test_flowtable_selective_neighbour import hardware, warm
+from _flowtable_connections import (FLOWS, healthy, peer)
+from _flowtable_mtu import (table_identity)
+from _flowtable_rig import (artifact_dir, DPORT, WAN_IP, command, console_command, read, status_text)
+from _flowtable_selective_neighbour import (hardware, warm)
 
 
 async def test_flowtable_link_recovery(connections):
@@ -20,7 +19,7 @@ async def test_flowtable_link_recovery(connections):
     identity = await table_identity(r)
     boot_id = await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")
     # WAN outages interrupt management HTTP; use the independent physical UART.
-    with Console.target(log_path=str(ARTIFACTS / "link-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "link-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
 
         async def state():

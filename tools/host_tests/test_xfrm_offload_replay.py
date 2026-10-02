@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import re
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /

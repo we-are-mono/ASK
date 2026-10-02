@@ -4,10 +4,10 @@ This document describes how to set up the ASK end-to-end test bench from
 scratch. It covers the physical/logical topology, what each machine needs,
 how to reach the console of each node, and how to run the suite.
 
-No addresses or hostnames appear here on purpose — every one is a
-configuration value with a sane default and an environment-variable
-override (see [Configuring the harness](#configuring-the-harness)). Fill in
-your own addresses when you wire the bench.
+Bench addresses, VM names and client interfaces are local configuration.
+Copy `.ask-test.mk.example` to `.ask-test.mk` and fill in your values;
+Git ignores `.ask-test.mk`. Hardware runs report missing settings before
+opening a console or changing the bench. Host tests need no bench settings.
 
 ---
 
@@ -65,6 +65,78 @@ work is scripted over the client's serial line.
 
 ## What each node needs
 
+### Runner dependencies and installation
+
+Use a Linux orchestrator with Python 3.13. The pinned environment was captured
+on Python 3.13.5; the harness uses Linux process locks, network namespaces and
+signal-based timeouts. Make runs `/opt/askd-agent/venv/bin/python`, so use that
+interpreter when inspecting or installing its packages.
+
+[`tools/requirements.txt`](../tools/requirements.txt) is the source of truth for
+all runner and WAN-agent Python package versions, including indirect dependencies.
+
+| Python package | Purpose |
+|---|---|
+| `pytest` | Discovery, fixtures, assertions, selection, terminal output and JUnit |
+| `pytest-asyncio` | Async tests and fixture event loops |
+| `pytest-timeout` | Test-body watchdog; required even for short selections |
+| `pytest-xdist` | Optional parallel execution of host tests; installed with the runner |
+| `aiohttp` | HTTP agent and orchestrator client |
+| `pyserial` | DUT and LAN serial consoles |
+| `scapy`, `pyroute2`, `cffi` | Packet and network tooling in the harness environment |
+| `PyYAML` | Kernel-log allowlist loading |
+
+On Debian 13, install the host prerequisites, then the pinned environment:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv make git sudo build-essential
+make test-env
+/opt/askd-agent/venv/bin/python -m pip check
+```
+
+`make test-env` creates or updates the virtualenv and installs the complete
+requirements file. It does not start tests or deploy an agent. The WAN service
+shares this environment, so update dependencies between bench runs.
+`make deploy-agent-wan` also installs the same requirements while deploying
+the WAN service. `make setup` prepares the Yocto build host; runner dependency
+installation is the separate `make test-env` step.
+
+Additional system dependencies depend on the selected suite:
+
+| Selection | Additional requirements |
+|---|---|
+| Python harness checks in `tools/host_tests/test_harness.py` | Runner environment only; no board or compiler |
+| Compiled host regressions | C/C++ compiler, headers, standard C++ library, AddressSanitizer and UndefinedBehaviorSanitizer; Debian's `build-essential` toolchain supplies these. `HOSTCC` selects a compiler instead of `cc`. |
+| SDK/FMC/FMLIB host regressions | Patched kernel and pinned vendor source trees from the image build. `ASK_KERNEL_SOURCE` overrides the kernel tree; it must contain the ASK patches and SDK headers. |
+| DUT traffic tests | WAN agent, `ip`/`bridge`/`tc`, `iptables`, `conntrack`, `ethtool`, `iperf3`, `tcpdump`, and access to the DUT and LAN consoles |
+| PPPoE tests and ISP profile | WAN-side `pppd` and `/usr/sbin/pppoe-server`, kernel PPPoE support, and the corresponding tools/modules in the DUT image |
+| Image building and booting | `make setup` build dependencies, kas, a TFTP server and the staged image/DTB |
+
+For a Debian WAN host running hardware tests, the system tools can be installed
+with:
+
+```sh
+sudo apt-get install -y rsync iproute2 iptables nftables conntrack ethtool \
+    iperf3 tcpdump ppp pppoe coreutils procps psmisc libvirt-clients
+```
+
+The WAN deployment target also requires systemd. An existing libvirt installation
+must manage the configured LAN VM; `libvirt-clients` supplies `virsh` but does
+not create that VM. Full host regression runs need the fetched vendor sources
+even though they do not need physical hardware. Build the ASK image once to
+populate those source trees; the tests name missing sources in their errors.
+
+When changing dependencies, update the pins together in a fresh Python 3.13
+environment, run `pip check`, and validate the affected test selections before
+deploying the updated environment. `pytest-asyncio` and `pytest-timeout` are
+also version-checked in [`tools/pyproject.toml`](../tools/pyproject.toml); update
+those entries when changing their pins. Every run records installed package
+versions in its session artifacts.
+
+If pytest reports `Missing required plugins`, rerun `make test-env`. Installing
+pytest into the system interpreter does not update the virtualenv Make uses.
+
 ### Orchestrator / WAN host
 
 Packages / services:
@@ -100,6 +172,19 @@ agent auto-starts at boot). You only need to:
 - Point its U-Boot `ask` boot flow at the orchestrator's TFTP server (see
   [Booting the image](#booting-the-image)).
 
+The DUT uses Yocto's packaged Python dependencies. Its package lists live in
+[`ask-image.bb`](../meta-ask/recipes-core/images/ask-image.bb) and the
+[`ask-test-agent` recipe](../meta-ask/recipes-support/ask-test-agent/ask-test-agent_1.0.bb).
+The host requirements file is installed on the orchestrator/WAN host only.
+The image supplies routing/firewall tools, `smcrouted`/`smcroutectl`, PPP/PPPoE,
+packet capture, traffic generators, ASK modules and the test agent.
+
+Use an agent built from the same checkout as the runner. Kernel capture requires
+`capture_protocol: 2` in `/health`, readable `/dev/kmsg`, and retained boot logs.
+After agent changes, rebuild, stage and boot the updated image. Preflight rejects
+an older agent; installing host packages cannot upgrade the agent inside the
+DUT's initramfs. Release runs also require the tools named by selected tests.
+
 ### LAN client
 
 A machine or VM on the DUT's LAN port, configured as a **DHCP client** so it
@@ -114,7 +199,23 @@ picks up its address, gateway, and DNS from the DUT. Install:
   frames.
 - **`iproute2`** (`ip`) — interface/route/neighbor manipulation.
 - **`python3`** — the harness stages small Python snippets to the client
-  over its serial line and runs them (see `lan_run_python`).
+  over its serial line and runs them (see `lan_run_python`). Namespace cases
+  need Python 3.12 or newer for `os.setns`; Python 3.13 matches the runner.
+- **Scapy for the LAN's system `python3`** — used by the staged ARP and packet
+  helpers. Installing it in the orchestrator's virtualenv does not install it
+  on the LAN client.
+- **`ethtool`, `coreutils`, `procps`, `psmisc`** — link statistics, script
+  staging, timeouts and process cleanup.
+
+For a Debian 13 LAN VM with its DHCP client already configured:
+
+```sh
+sudo apt-get install -y python3 python3-scapy iproute2 iputils-ping iperf3 \
+    tcpdump ethtool coreutils procps psmisc
+```
+
+The configured serial login must have root access for namespaces, interface
+changes and raw sockets.
 
 The client must also expose a **serial console** the orchestrator can open
 (see below). For a libvirt VM this is the domain's serial device; for a
@@ -209,21 +310,23 @@ confirm it responds before running tests.
 
 ## Configuring the harness
 
-Every node address is an environment variable with a default. Set the ones
-that differ from your bench. `make ask-test` re-states `ASK_*` variables
-across the `sudo` boundary automatically (use space-free values).
+Put the bench IPs, VM name and client NIC in the ignored `.ask-test.mk` so
+plain `make test` reuses them. Environment variables and make command-line
+assignments can override that file. `ASK_*` variables pass through sudo
+without shell interpolation, including values with spaces.
 
-| Variable | What it points at | Default meaning |
+| Variable | What it points at | Setting |
 |---|---|---|
-| `ASK_TARGET_IP` | DUT test-agent host (HTTP) | on-DUT agent |
-| `ASK_TARGET_DEV` | DUT serial device | USB-serial node |
-| `ASK_TARGET_LAN_IF` | DUT netdev facing the client | LAN-facing port |
-| `ASK_TARGET_WAN_IF` | DUT netdev facing the WAN | WAN-facing port |
-| `ASK_LAN_VM` | libvirt domain of the client (VM case) | client domain |
-| `ASK_LAN_USER` / `ASK_LAN_PASSWORD` | client serial login | client credentials |
-| `ASK_LAN_NIC` | client's LAN-facing NIC name | client NIC |
-| `ASK_WAN_IP` | WAN-side test-agent host (HTTP) | WAN host |
-| `ASK_WAN_IPERF_IP` | iperf3 server on the WAN network | WAN iperf server |
+| `DUT_IP` / `ASK_TARGET_IP` | DUT test-agent host (HTTP) | Required |
+| `ASK_TARGET_DEV` | DUT serial device | Required |
+| `ASK_TARGET_LAN_IF` | DUT netdev facing the client | Board default: `eth3` |
+| `ASK_TARGET_WAN_IF` | DUT netdev facing the WAN | Board default: `eth4` |
+| `ASK_LAN_VM` | libvirt domain of the client | Required |
+| `ASK_LAN_USER` / `ASK_LAN_PASSWORD` | client serial login | `root` / no password |
+| `ASK_LAN_NIC` | client's LAN-facing NIC name | Required |
+| `ASK_WAN_INJECT_IF` | WAN interface for packet injection | Required for multicast and profiles |
+| `WAN_AGENT_IP` / `ASK_WAN_IP` | WAN-side test-agent host (HTTP) | `WAN_IP`, or loopback for direct pytest |
+| `WAN_IP` / `ASK_WAN_IPERF_IP` | Traffic endpoint on the WAN network | Required |
 
 ## Running the suite
 
@@ -253,15 +356,83 @@ holding either serial console. The image boots only the flowtable offload
 path, so one boot runs the whole suite, `test_flowtable_*` included.
 
 ```sh
-# full suite (re-state your bench's addresses)
-ASK_WAN_IP=<wan-host> ASK_WAN_IPERF_IP=<wan-iperf> make ask-test
+# one-time runner setup (the dependency snapshot uses Python 3.13)
+make test-env
+test -e .ask-test.mk || cp .ask-test.mk.example .ask-test.mk
+# Edit .ask-test.mk: DUT_IP, WAN_IP, ASK_TARGET_DEV, ASK_LAN_VM, ASK_LAN_NIC.
 
-# a scoped subset while iterating
-make ask-test ASK_TEST_ARGS='-k "ipsec or mcast"'
+# ordinary host + DUT suites; ask-test remains an alias
+make test
 
-# QoS regressions
-make ask-test ASK_TEST_ARGS='-k qos'
+# -k is pytest's name expression, passed as one argument
+make test DUT_IP=<dut-address> WAN_IP=<wan-address> K='ipsec or mcast'
+make test-dut K=qos ARGS='-m "not slow"'
+make test-host K=qos
+make test-host ARGS='-n auto'
 ```
+
+`DUT_IP` sets `ASK_TARGET_IP`. `WAN_IP` sets both `ASK_WAN_IPERF_IP`
+(traffic endpoint) and `ASK_WAN_IP` (agent HTTP endpoint). Use
+`WAN_AGENT_IP=127.0.0.1` when the WAN agent is reached locally while traffic
+uses another address. Existing `ASK_*` settings and `ASK_TEST_ARGS` still work;
+the short aliases take precedence. `ARGS` adds ordinary pytest options.
+Make exports the settings through sudo as literal arguments. Direct pytest
+invocations need exported `ASK_*` variables; they do not read `.ask-test.mk`.
+
+The runner and WAN agent use `tools/requirements.txt`, pinned to specific
+versions. Update it deliberately. The kernel-capture protocol requires the
+current DUT agent: rebuild and boot the test image after updating it. An older
+agent fails preflight with an upgrade message. `make test-env` updates only
+the runner environment; it does not deploy or run tests.
+
+### Results and artifacts
+
+Every selected test uses pytest's standard `PASSED`, `FAILED`, `ERROR`, or
+`SKIPPED` status, followed by final totals. Successful-test stdout stays
+captured; failures include their diagnostics. `ARGS=-s` explicitly enables
+live output for debugging.
+
+Each invocation creates a unique directory under `/tmp/ask-tests-<uid>` (override
+with `ASK_TEST_ARTIFACTS`; `ASK_FLOWTABLE_ARTIFACTS` remains supported).
+The final output prints its path. It contains `junit.xml`, session metadata
+(revision, dependency versions, configured endpoints), DUT kernel/boot details,
+boot logs, and one directory per test with setup/call/teardown results and
+diagnostic artifacts. Test names include a hash so parameterized cases cannot
+overwrite each other. Shared module captures and the LAN UART transcript
+cover their corresponding fixture lifetimes. `ARGS='--junitxml=path.xml'`
+chooses another JUnit destination. Parallel host workers share the run directory.
+
+### Lifecycle and suite groups
+
+- Shared code lives in `ask_orch` and `_*.py` support modules. Register shared
+  fixtures in `conftest.py`; tests request fixtures by parameter name. Reuse
+  scenarios through support functions, preserving each test's own identity.
+- Register restoration immediately after acquiring a resource, before the
+  next mutation. `CleanupStack` runs every undo in reverse order with a
+  separate 45-second budget per callback and reports all failures. Commands
+  must check return codes or verify an explicit cleanup postcondition.
+- A hardware setup or teardown failure blocks later hardware cases in that
+  invocation. Recover the bench before starting a new run. Hardware commands
+  stop at the first failure by default; host commands report all failures.
+- Local process locks cover the DUT, serial device, LAN VM and WAN endpoint.
+  Overlapping invocations fail before setup; hardware xdist workers are
+  rejected. Locks cover runners on one orchestrator. A shared lab coordinator
+  is needed if several orchestrators can access the same physical bench.
+- Kernel capture is automatic around each DUT test and its function fixtures.
+  The two module-scoped profiles also capture setup and teardown. Missing
+  logs, ring overruns and sequence gaps fail the run. The boot gate checks
+  retained boot history; if it has been overwritten, reboot before running.
+- `pytest-timeout` gives test bodies 900 seconds; the churn case uses its
+  configured duration plus 300 seconds. `ARGS='--timeout=seconds'` changes
+  the default. Operation and cleanup deadlines are separate so a timed-out
+  body can still release resources. A hard-killed process cannot run cleanup.
+- Select `host`, `hardware`, `smoke`, `slow`, and `destructive` with `ARGS='-m
+  expression'`. Markers and configuration are checked strictly. Startup tests
+  remain a separate `make test-startup` command and require their special boot.
+- `ARGS=--release` checks required DUT tools before setup and fails on
+  unexpected skips. Explicitly disabled opt-in cases and expected xfails keep
+  their native status. Select the required release matrix explicitly, including
+  the appropriate environment settings for opt-in cases.
 
 The QoS host tests compile the production lifecycle functions with
 AddressSanitizer and UndefinedBehaviorSanitizer, inject each startup
@@ -338,7 +509,7 @@ unconfigured FMAN. Boot the staged test image with `rdinit=/bin/sh`, mount
 proc, sysfs, devtmpfs and debugfs, then run:
 
 ```sh
-sudo env PYTHONPATH=tools pytest -c tools/pyproject.toml tools/startup_tests
+make test-startup
 ```
 
 The cases use the Gateway DK's five Ethernet and two offline ports. They

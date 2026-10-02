@@ -16,12 +16,11 @@ import asyncio
 
 import pytest
 
-from _mcast_windows import (COUNT, delivered, in_hardware, in_software, learn, members,
-                            mroute_row, multicast_rig, stream, streamed, summary)  # noqa: F401
+from _mcast_windows import (COUNT, delivered, in_hardware, in_software, learn, members, mroute_row, stream, streamed, summary)
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif, lan_vlan_subif
-from test_flowtable_offload import command, read
-from test_mcast_e2e import wan_source_address
-from test_mroute_capacity import _daemon
+from _flowtable_rig import (command, read)
+from _mcast_e2e import (wan_source_address)
+from _mroute_capacity import (_daemon)
 
 XFRM_GROUP = {4: "239.9.10.1", 6: "ff1e::9:10:1"}
 # The governed oif, tagged on the LAN port; claimed in _topology.

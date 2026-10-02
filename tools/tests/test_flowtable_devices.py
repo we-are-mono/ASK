@@ -4,11 +4,11 @@ from __future__ import annotations
 import json
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_connections import FLOWS, by_key, connections, peer  # noqa: F401
-from test_flowtable_module import table
-from test_flowtable_offload import HEALTH_BASELINE, command, upper_roundtrip, rig  # noqa: F401
-from test_flowtable_selective_neighbour import hardware, unchanged, warm
-from test_flowtable_tcp import software_tx
+from _flowtable_connections import (FLOWS, by_key, peer)
+from _flowtable_module import (table)
+from _flowtable_rig import (HEALTH_BASELINE, command, upper_roundtrip)
+from _flowtable_selective_neighbour import (hardware, unchanged, warm)
+from _flowtable_tcp import (software_tx)
 
 DUMMY, RENAMED, BRIDGE = "askftdev0", "askftdev1", "askftdevbr"
 

@@ -1,12 +1,13 @@
 """Run actual scheme construction, ownership and HC transport with faults."""
+
+from ask_orch.process import run_process
 from pathlib import Path
 import os
 import shutil
-import subprocess
 
 import pytest
 
-from test_sdk_scheme_delete import ROOT, function
+from _host_sdk_scheme_delete import (ROOT, function)
 
 
 def test_sdk_scheme_set(tmp_path):
@@ -51,7 +52,7 @@ def test_sdk_scheme_set(tmp_path):
                 "Peripherals/FM/inc", "Peripherals/FM/Pcd"]:
         command.extend(["-I", str(sdk / inc)])
     command.extend([str(Path(__file__).with_name("sdk_scheme_set.c")), "-o", str(binary)])
-    subprocess.run(command, check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process(command, check=True)
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

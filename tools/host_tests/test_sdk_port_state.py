@@ -1,13 +1,14 @@
 """Exercise port-state queries and enable errors through native/compat ioctls."""
+
+from ask_orch.process import run_process
 from pathlib import Path
 import os
 import shutil
-import subprocess
 
 import pytest
 
-from test_ehash_cumulative import function as definition
-from test_sdk_port_pcd import ROOT, function
+from _host_ehash_cumulative import (function as definition)
+from _host_sdk_port_pcd import (ROOT, function)
 
 
 @pytest.mark.parametrize("compat", [False, True])
@@ -58,7 +59,7 @@ def test_sdk_port_state(tmp_path, compat):
     for inc in [uapi, uapi / "Peripherals", uapi / "integrations"]:
         command += ["-I", str(inc)]
     binary = tmp_path / "port_state"
-    subprocess.run(command + [str(Path(__file__).with_name("sdk_port_state.c")), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process(command + [str(Path(__file__).with_name("sdk_port_state.c")), "-o", str(binary)], check=True)
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

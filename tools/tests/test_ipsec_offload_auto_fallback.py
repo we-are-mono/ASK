@@ -37,9 +37,9 @@ import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
-from test_flowtable_offload import ARTIFACTS, console_command, read
-from test_flowtable_service_ipsec_replay import xfrm_mib
-from test_ipsec_inbound_flow_offload import crypto
+from _flowtable_rig import (artifact_dir, console_command, read)
+from _flowtable_service_ipsec_replay import (xfrm_mib)
+from _ipsec_inbound_flow_offload import (crypto)
 
 # Documentation-range addresses (RFC 2544 benchmarking block), distinct from
 # every other IPsec file's.
@@ -187,7 +187,7 @@ async def test_auto_peer_behind_another_device_works_in_software(aiohttp_session
         # `ping` is not in the agent's argv allowlist, so it runs on the
         # console. Nothing answers it; only the one packet leaving matters,
         # and a printk breaking the console's framing does not change that.
-        console = Console.target(log_path=str(ARTIFACTS / "ipsec-auto-uart.log"))
+        console = Console.target(log_path=str(artifact_dir() / "ipsec-auto-uart.log"))
         await asyncio.to_thread(console.login, "root", None)
         ping = await console_command(console, "ping", "-c", "1", "-W", "1", "-I", LOCAL, INNER,
                                      check=False, resync=True)

@@ -1,4 +1,6 @@
 """Real fork/exec, pipe and lease fault cases; no DUT or kernel mutation."""
+
+from ask_orch.process import run_process
 import ctypes
 import fcntl
 import json
@@ -50,7 +52,7 @@ int main(int argc, char **argv) {
         '"/run/ask-flowtable"', '"' + str(root) + '"'))
     for name in ("nft.c", "nft_process.c", "marker.c", "policy.h"):
         (root / name).write_text((src / name).read_text())
-    subprocess.run(["cc", "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+    run_process(["cc", "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
                     "-DFT_NFT_TIMEOUT_MS=500", "-DFT_NFT_CLEANUP_MS=500",
                     *map(str, root.glob("*.c")), "-o", str(root / "run")], check=True)
@@ -126,7 +128,7 @@ def wait_for(predicate, seconds=2):
 ])
 def test_nft_process_faults(runner, tmp_path, mode, message):
     started = time.monotonic()
-    result = subprocess.run([str(runner / "run"), mode], env=env(runner, tmp_path),
+    result = run_process([str(runner / "run"), mode], env=env(runner, tmp_path),
                             capture_output=True, text=True, timeout=2)
     assert time.monotonic() - started < 1.7
     assert "AddressSanitizer" not in result.stderr and "runtime error:" not in result.stderr

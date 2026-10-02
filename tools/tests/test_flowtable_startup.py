@@ -4,10 +4,10 @@ import asyncio
 import pytest
 
 from ask_orch.uart import Console
-from test_flowtable_connections import FLOWS, connections, peer  # noqa: F401
-from test_flowtable_module import table
-from test_flowtable_offload import ARTIFACTS, console_command, console_json, flowtable_json, read, rig  # noqa: F401
-from test_flowtable_selective_neighbour import hardware, warm
+from _flowtable_connections import (FLOWS, peer)
+from _flowtable_module import (table)
+from _flowtable_rig import (artifact_dir, console_command, console_json, flowtable_json, read)
+from _flowtable_selective_neighbour import (hardware, warm)
 
 
 async def test_flowtable_startup(connections):
@@ -20,7 +20,7 @@ async def test_flowtable_startup(connections):
 
     await loaded()
     await r.delete_table()
-    with Console.target(log_path=str(ARTIFACTS / "startup-independence-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "startup-independence-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         # The shipped offload service is default-on and needs no configuration:
         # its shipped policy parses, and starting/resuming it after the

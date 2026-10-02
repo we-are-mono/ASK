@@ -4,10 +4,11 @@ Run without the board fixtures:
     pytest tools/host_tests/test_devlink_policer.py
 """
 
+from ask_orch.process import run_process
+
 import os
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,14 +69,14 @@ def test_devlink_policer(tmp_path):
     (tmp_path / "devlink_policer_production.inc").write_text(
         devlink[devlink.index("/* The punt policer."):])
     binary = tmp_path / "devlink_policer"
-    subprocess.run([
+    run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-parameter", "-Wno-unused-function", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-Werror=implicit-function-declaration",
         "-I", str(tmp_path), "-I", str(ROOT / "cdx"),
         str(Path(__file__).with_name("devlink_policer.c")), "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30, env={
+    result = run_process([str(binary)], text=True, capture_output=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

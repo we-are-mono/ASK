@@ -1,7 +1,8 @@
 """Exercise the shipped platform hooks without changing a host watchdog."""
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
-import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -43,7 +44,7 @@ echo "${WDT_STATUS:-running}"
         uptime.write_text("0.0 0.0\n")
         (tmp_path / "probed").unlink(missing_ok=True)
         log.write_text("")
-        result = subprocess.run(["sh", str(monitor), platform], env=env, capture_output=True, timeout=5)
+        result = run_process(["sh", str(monitor), platform], env=env, capture_output=True, timeout=5)
         assert result.returncode == 1, result.stderr
         calls = log.read_text()
         assert calls.count("ask health") == 2 and calls.count("ask recovery-clear") == 1, calls
@@ -71,7 +72,7 @@ service_started
     for status, arm, start, allowed in [("running", "0", "offline", True), ("running", "2", "offline", False),
                                        ("offline", "0", "offline", False), ("offline", "0", "running", True)]:
         log.write_text("")
-        result = subprocess.run(["sh", "-c", wrapper],
+        result = run_process(["sh", "-c", wrapper],
                                 env={**env, "WDT_STATUS": status, "ARM_STATUS": arm, "WDT_START_STATUS": start},
                                 capture_output=True, timeout=5)
         assert (result.returncode == 0) == allowed, result.stderr

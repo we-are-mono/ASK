@@ -1,9 +1,10 @@
 """Exercise native admission allocation failures and their non-fault exits."""
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
-import subprocess
 
-from test_flowtable import function
+from _host_flowtable import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -23,9 +24,9 @@ def test_native_admission_allocation_recovery(tmp_path):
         + function(source[source.index("static struct flow_offload_work *nf_flow_offload_work_alloc"):],
                    "nf_flow_offload_work_alloc"))
     binary = tmp_path / "flowtable_allocations"
-    subprocess.run([os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
+    run_process([os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
                     "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
                     "-fno-pie", "-no-pie", "-I", str(tmp_path),
                     str(Path(__file__).with_name("flowtable_allocations.c")), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True, timeout=10, env={**os.environ,
+    run_process([str(binary)], check=True, timeout=10, env={**os.environ,
                    "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1", "UBSAN_OPTIONS": "halt_on_error=1"})

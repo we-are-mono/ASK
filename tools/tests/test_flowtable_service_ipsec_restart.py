@@ -25,12 +25,12 @@ from _flowtable_restart import (HOLD, ROOT_FAULT, RUNNING, assert_restarted_clea
                                 wait_running, wait_stopped, write)
 from _ipsec_helpers import endpoints_down, endpoints_up, iface_index, sa_add, sa_del
 from _topology import TARGET_WAN_IF
-from test_flowtable_connections import peer
-from test_flowtable_offload import command, console_command, read, rig  # noqa: F401
-from test_flowtable_selective_neighbour import warm
-from test_flowtable_service_ipsec import INNER, Transform, flows_for, hardware, ipsec_service  # noqa: F401
-from test_flowtable_service_ipsec_natt import NATT
-from test_flowtable_service_ipsec_replay import sa_state
+from _flowtable_connections import (peer)
+from _flowtable_rig import (command, console_command, read)
+from _flowtable_selective_neighbour import (warm)
+from _flowtable_service_ipsec import (INNER, Transform, flows_for, hardware)
+from _flowtable_service_ipsec_natt import (NATT)
+from _flowtable_service_ipsec_replay import (sa_state)
 
 # The SA whose delete fails: inbound or outbound, on documentation-range endpoints of its
 # own, beside the fixture's pair. Its peer does not exist and sends nothing.

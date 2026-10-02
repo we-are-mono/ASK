@@ -10,8 +10,7 @@ import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF
-from test_flowtable_offload import (ARTIFACTS, HEALTH_BASELINE, TABLE, command, console_command,
-                                    console_python, read, rig, terminal_stream)  # noqa: F401
+from _flowtable_rig import (artifact_dir, HEALTH_BASELINE, TABLE, command, console_command, console_python, read, terminal_stream)
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_UNREGISTER") != "1",
                                reason="explicit physical driver removal; fresh boot required")
@@ -19,7 +18,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_UNREGISTER") != "1
 
 async def test_flowtable_physical_unregister(rig):
     r = rig
-    r.recovery_console = Console.target(log_path=str(ARTIFACTS / "unregister-uart.log"))
+    r.recovery_console = Console.target(log_path=str(artifact_dir() / "unregister-uart.log"))
     con = r.recovery_console
     await asyncio.to_thread(con.login, "root", None)
     addresses = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr",

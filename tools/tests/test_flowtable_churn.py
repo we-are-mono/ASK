@@ -18,13 +18,23 @@ import time
 import pytest
 
 from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6
-from test_flowtable_capacity import (BASE, CAPACITY, CONNECTIONS, batch, delete_udp,
-                                     delivery, hardware_window, lan_counters,
-                                     socket_drops, start, unchanged, wait_entries)
-from test_flowtable_connections import by_key, healthy, peer
-from test_flowtable_ipv6 import ipv6_rig  # noqa: F401
-from test_flowtable_offload import DPORT, TABLE, WAN_IP, Echo, command, read, rig  # noqa: F401
-from test_flowtable_tcp import cpu, cpu_delta, software_tx
+from _flowtable_capacity import (
+    BASE,
+    CAPACITY,
+    CONNECTIONS,
+    batch,
+    delete_udp,
+    delivery,
+    hardware_window,
+    lan_counters,
+    socket_drops,
+    start,
+    unchanged,
+    wait_entries,
+)
+from _flowtable_connections import (by_key, healthy, peer)
+from _flowtable_rig import (DPORT, TABLE, WAN_IP, Echo, command, read)
+from _flowtable_tcp import (cpu, cpu_delta, software_tx)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ASK_FLOWTABLE_CHURN") != "1",

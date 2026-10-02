@@ -6,12 +6,13 @@ covers a direction, which SA it may name, what an xfrm_state translates to,
 and which installed SA has to be followed when its peer moves.
 """
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "cdx/ask_flowtable.c"
@@ -162,14 +163,14 @@ def test_ipsec_adapter(tmp_path):
                  source.index("/* Attach the ops to a CDX physical port")]
         + "\n".join(function(source, name) for name in attachment))
     binary = tmp_path / "ipsec_adapter"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("ipsec_adapter.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -209,13 +210,13 @@ def test_ipsec_backend_natt_order(tmp_path):
     source = (ROOT / "cdx/cdx_ipsec_backend.c").read_text()
     (tmp_path / "ipsec_backend_natt.inc").write_text(function(source, "cdx_ipsec_set_natt"))
     binary = tmp_path / "ipsec_backend_natt"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("ipsec_backend_natt.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -265,13 +266,13 @@ def test_sa_cache(tmp_path):
             "M_ipsec_sa_cache_delete", "get_netdev_of_SA_by_fqid",
             "cdx_get_to_sec_fq_handler")))
     binary = tmp_path / "sa_cache"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-I", str(tmp_path), str(Path(__file__).with_name("sa_cache.c")), "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30, env={
+    result = run_process([str(binary)], text=True, capture_output=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -321,7 +322,7 @@ def test_ipsec_keys(tmp_path):
         + function(control, "M_ipsec_sa_set_digest_key")
         + function(backend, "cdx_ipsec_set_keys"))
     binary = tmp_path / "ipsec_keys"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         # desc.h builds its command words by shifting into the sign bit,
@@ -331,7 +332,7 @@ def test_ipsec_keys(tmp_path):
         "-I", str(tmp_path), "-I", str(caam),
         str(Path(__file__).with_name("ipsec_keys.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -356,7 +357,7 @@ def test_ipsec_receive_ownership(tmp_path):
         + function(source, "ipsec_exception_pkt_handler"))
     for portal_napi in (False, True):
         binary = tmp_path / f"ipsec_receive_{portal_napi}"
-        subprocess.run([
+        run_process([
             os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
             "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter", "-Wno-unused-but-set-variable",
             "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
@@ -365,7 +366,7 @@ def test_ipsec_receive_ownership(tmp_path):
             "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_receive.c")), "-o", str(binary),
         ], check=True)
         # The harness reports a touch of its guard page itself, by name.
-        subprocess.run([str(binary)], check=True, timeout=30, env={
+        run_process([str(binary)], check=True, timeout=30, env={
             **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1:handle_segv=0",
             "UBSAN_OPTIONS": "halt_on_error=1",
         })
@@ -410,14 +411,14 @@ def test_ipsec_local_endpoint(tmp_path):
     (tmp_path / "ipsec_local_endpoint.inc").write_text(
         function(backend, "cdx_ipsec_local_on_port"))
     binary = tmp_path / "ipsec_local_endpoint"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_local_endpoint.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -499,7 +500,7 @@ def test_ipsec_backend(tmp_path):
         + re.search(r"^static LIST_HEAD\(cdx_ipsec_sa_list\);$", backend, re.M).group() + "\n"
         + function(backend, "cdx_ipsec_sa_restarted"))
     binary = tmp_path / "ipsec_backend"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         # The descriptor reader loads the 64-bit byte count wherever the
@@ -510,7 +511,7 @@ def test_ipsec_backend(tmp_path):
         "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_backend.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

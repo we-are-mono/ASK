@@ -1,9 +1,10 @@
 """Compile the DSCP egress-classification offload against a stub and drive it."""
 
+from ask_orch.process import run_process
+
 import os
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,14 +48,14 @@ def test_dscp_map(tmp_path):
                source.index("/* Indexed the way gQMCtx is")]
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "dscp_map"
-    subprocess.run([
+    run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-Werror=implicit-function-declaration",
         "-I", str(tmp_path),
         str(Path(__file__).with_name("dscp_map.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

@@ -1,26 +1,13 @@
 """Exercise SDK scheme deletion and its ownership helpers with command faults."""
+
+from ask_orch.process import run_process
+
+from _host_sdk_scheme_delete import (ROOT, function)
 from pathlib import Path
 import os
-import re
 import shutil
-import subprocess
 
 import pytest
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def function(source, name):
-    match = re.search(r"^(?:static\s+)?(?:__inline__\s+)?"
-                      r"(?:t_Error|t_Handle|t_(?:HcFrame|FmPcdLock)\s*\*|void|bool|uint(?:8|32)_t|"
-                      r"enum qman_cb_dqrr_result)\s*"
-                      + name + r"\s*\([^;]*?\)\s*\{", source, re.M)
-    assert match, name
-    end, depth = match.end(), 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[match.start():end] + "\n"
 
 
 def test_sdk_scheme_delete(tmp_path):
@@ -58,7 +45,7 @@ def test_sdk_scheme_delete(tmp_path):
                 "Peripherals/FM/inc", "Peripherals/FM/Pcd"]:
         command.extend(["-I", str(sdk / inc)])
     command.extend([str(Path(__file__).with_name("sdk_scheme_delete.c")), "-o", str(binary)])
-    subprocess.run(command, check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process(command, check=True)
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

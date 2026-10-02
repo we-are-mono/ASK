@@ -37,6 +37,7 @@ __pycache__/
 
 # Local setup notes — environment-specific, not part of the codebase
 IPSEC.md
+.ask-test.mk
 
 # Private NXP documentation and investigation notes
 /pdf/

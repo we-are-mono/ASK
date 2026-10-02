@@ -1,8 +1,9 @@
 """Exercise the installed module-loader and flowtable service scripts."""
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
 import shlex
-import subprocess
 
 import pytest
 
@@ -34,7 +35,7 @@ def test_flowtable_boot_modules(tmp_path, cmdline, fail, expected, rc):
     script = tmp_path / "loader"
     script.write_text(source.replace("CONF=/etc/modules-load.d/ask.conf", "CONF=" + shlex.quote(str(conf)))
                       .replace("cat /proc/cmdline", "cat " + shlex.quote(str(boot))))
-    result = subprocess.run(["sh", str(script), "start"], capture_output=True, text=True,
+    result = run_process(["sh", str(script), "start"], capture_output=True, text=True,
                             env={**os.environ, "PATH": str(tmp_path) + ":" + os.environ["PATH"],
                                  "CALLS": str(log), "FAIL": fail}, timeout=5)
     assert result.returncode == rc, result
@@ -62,7 +63,7 @@ def test_flowtable_service_preserves_authority_and_stop_errors(tmp_path, verb, s
     starter = tmp_path / "start-stop-daemon"
     starter.write_text("#!/bin/sh\nexit 0\n")
     starter.chmod(0o755)
-    result = subprocess.run([str(service), verb], capture_output=True, text=True,
+    result = run_process([str(service), verb], capture_output=True, text=True,
                             env={**os.environ, "PATH": str(tmp_path) + ":" + os.environ["PATH"],
                                  "CALLS": str(log), "STOP_RC": str(stop_rc)}, timeout=5)
     assert result.returncode == rc, result

@@ -11,10 +11,8 @@ import pytest
 
 from ask_orch.uart import Console
 from _topology import DUT_IPV6_LAN, DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6, lan_run
-from test_flowtable_offload import ARTIFACTS, command, console_command
-from test_flowtable_ipv6 import (Echo, TABLE, _assert_pair, _drive, _drop_tables, _endpoint,
-                                _hardware_delta, _nft, _tcp_connection, _udp_exchange,
-                                ipv6_rig)  # noqa: F401
+from _flowtable_rig import (artifact_dir, command, console_command)
+from _flowtable_ipv6 import (Echo, TABLE, _assert_pair, _drive, _drop_tables, _endpoint, _hardware_delta, _nft, _tcp_connection, _udp_exchange)
 
 
 def prefix(address):
@@ -42,7 +40,7 @@ async def translation(r, case):
     source = mapped(LAN_IPV6, 'fc00:1234::/64') if case in ('source', 'both') else LAN_IPV6
     destination = mapped(WAN_IPV6, 'fc00:4321::/64') if case in ('destination', 'both') else WAN_IPV6
     cleanup = []
-    with Console.target(log_path=str(ARTIFACTS / 'npt-uart.log')) as con:
+    with Console.target(log_path=str(artifact_dir() / 'npt-uart.log')) as con:
         await asyncio.to_thread(con.login, 'root', None)
 
         async def ip6tables(*args):

@@ -9,9 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from _topology import TARGET_WAN_IF
-from test_flowtable_offload import DPORT, SPORT, WAN_IP, command, rig  # noqa: F401
-from test_flowtable_service_bridge import bridge_software  # noqa: F401
-from test_flowtable_tunnel import DUT_WAN_IPV4, _offload_table, _udp_exchange, tunnel_rig  # noqa: F401
+from _flowtable_rig import (DPORT, SPORT, WAN_IP, command)
+from _flowtable_tunnel import (DUT_WAN_IPV4, _offload_table, _udp_exchange)
 
 
 async def warm_tunnel(r):

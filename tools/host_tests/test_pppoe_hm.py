@@ -1,43 +1,19 @@
 """Check the production PPPoE header manipulations and what feeds them."""
 
+from ask_orch.process import run_process
+
+from _host_pppoe_hm import (HEADER, ROOT, declaration, display, typedef)
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
-from test_qos_lifecycle import function
-
-ROOT = Path(__file__).resolve().parents[2]
-HEADER = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h"
-
-
-def declaration(source, name):
-    """One struct as written, brace-matched rather than pattern-matched, so a
-    field added inside it comes along instead of truncating the type."""
-    start = source.index("struct " + name + " {")
-    end, depth = source.index("{", start) + 1, 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[start:source.index(";", end) + 1] + "\n"
-
-
-def typedef(source, tag):
-    """A typedef'd struct, tag through to the name it is typedef'd to. The two
-    IP headers are declared this way and the L3 description embeds both."""
-    match = re.search(r"typedef struct\s+" + tag + r"\b.*?\}\s*\w+\s*;", source, re.S)
-    assert match, tag
-    return match.group() + "\n"
-
-
-def display(source, name):
-    body = source[source.index("static inline void *" + name + "("):]
-    return body[:body.index("\n}") + 3]
+from _host_qos_lifecycle import (function)
 
 
 def test_pppoe_hm(tmp_path):
     # The shipped patch, so this does not depend on a previously built kernel.
-    subprocess.run([
+    run_process([
         "git", "apply", f"--include={HEADER}",
         str(ROOT / "patches/kernel/010-ask-fman-dpaa-ehash.patch"),
     ], cwd=tmp_path, check=True)
@@ -76,7 +52,7 @@ def test_pppoe_hm(tmp_path):
         + display(header, "display_pppoehdr_insert_opc")
         + display(header, "display_strip_pppoe_hdr_opc"))
     binary = tmp_path / "pppoe_hm"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
@@ -84,7 +60,7 @@ def test_pppoe_hm(tmp_path):
         "-DINCLUDE_ETHER_IFSTATS=1", "-DVLAN_FILTER=1",
         str(Path(__file__).with_name("pppoe_hm.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

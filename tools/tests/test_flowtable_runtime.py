@@ -1,9 +1,9 @@
 """The running service keeps its control state outside unprivileged reach."""
 
-from test_flowtable_connections import peer
-from test_flowtable_offload import console_python, rig  # noqa: F401
-from test_flowtable_selective_neighbour import hardware, warm
-from test_flowtable_service import FLOWS, service  # noqa: F401
+from _flowtable_connections import (peer)
+from _flowtable_rig import (console_python)
+from _flowtable_selective_neighbour import (hardware, warm)
+from _flowtable_service import (FLOWS)
 
 
 async def test_flowtable_runtime_protection(service):

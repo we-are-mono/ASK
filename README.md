@@ -162,8 +162,19 @@ harness — it does not build ASK components standalone.
 | `make setup` | install host build deps + locale (one-time, sudo) |
 | `make ask-image` | build the test image via kas |
 | `make stage-image` | copy the built image and matching DTB into the TFTP root |
-| `make deploy-agents` | install the askd test agent on the WAN/LAN hosts |
-| `make ask-test` | run the end-to-end pytest suite |
+| `make test-env` | install the pinned Python runner dependencies |
+| `make deploy-agents` | install the askd test agent and runner dependencies on the WAN host |
+| `make test` | run host and DUT tests using ignored `.ask-test.mk` bench settings |
+| `make test-host` | run host tests without the physical bench |
+| `make test-dut` | run the DUT suite |
+| `make test-startup` | run startup tests on their dedicated boot |
+| `make ask-test` | alias for `make test` |
+
+The [test dependency guide](docs/testing.md#runner-dependencies-and-installation)
+covers the Python environment, system packages, source trees, and DUT/LAN
+requirements. Python package versions are pinned in
+[`tools/requirements.txt`](tools/requirements.txt). Filter a run with
+`make test K='ipsec or mcast'`; extra pytest options go in `ARGS`.
 
 ## Versioning and branches
 

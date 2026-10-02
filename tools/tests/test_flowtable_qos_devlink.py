@@ -37,9 +37,8 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run, lan_run_python
-from test_flowtable_offload import (ARTIFACTS, WAN_IP, command, console_command, console_json,
-                                    rig)  # noqa: F401
-from test_flowtable_qos import PORT, admit, lan_start, lan_stop, offload
+from _flowtable_rig import (artifact_dir, WAN_IP, command, console_command, console_json)
+from _flowtable_qos import (PORT, admit, lan_start, lan_stop, offload)
 
 POLICER_PUNT, POLICER_SEC = 1, 2
 # The ranges cdx_devlink.c declares. devlink refuses anything outside them
@@ -94,7 +93,7 @@ async def devlink_console():
     allowlist, and a meter set to a thousand packets a second also meters the
     agent's own traffic.
     """
-    con = Console.target(log_path=str(ARTIFACTS / "qos-devlink-uart.log"))
+    con = Console.target(log_path=str(artifact_dir() / "qos-devlink-uart.log"))
     await asyncio.to_thread(con.login, "root", None)
     handle, original = None, {}
     try:

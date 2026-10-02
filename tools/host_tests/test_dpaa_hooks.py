@@ -7,10 +7,11 @@ data path -- which only holds if the driver takes those read-side sections
 itself rather than trusting its caller's context.
 """
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 SDK = Path("drivers/net/ethernet/freescale/sdk_dpaa")
@@ -54,13 +55,13 @@ def test_dpaa_hooks(tmp_path):
             "dpa_register_ipsec_fq_handler", "dpa_unregister_ipsec_fq_handler",
             "dpaa_submit_outb_pkt_to_SEC", "dpaa_submit_inb_pkt_to_SEC", "cpe_fp_tx")))
     binary = tmp_path / "dpaa_hooks"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
         "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("dpaa_hooks.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

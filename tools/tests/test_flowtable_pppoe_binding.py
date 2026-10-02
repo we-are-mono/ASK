@@ -6,9 +6,8 @@ import pytest
 import pytest_asyncio
 
 from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_offload import DPORT, SPORT, TABLE, command, read, stop_boot_daemon
-from test_flowtable_pppoe import (DPORT6, INNER_LOCAL, INNER_LOCAL6, SERVER_IF,
-                                 SPORT6, _exchange6, pppoe_rig)  # noqa: F401
+from _flowtable_rig import (DPORT, SPORT, TABLE, command, read, stop_boot_daemon)
+from _flowtable_pppoe import (DPORT6, INNER_LOCAL, INNER_LOCAL6, SERVER_IF, SPORT6, _exchange6)
 
 
 @pytest_asyncio.fixture(autouse=True)

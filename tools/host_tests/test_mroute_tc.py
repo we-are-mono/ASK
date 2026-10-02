@@ -8,11 +8,12 @@ software, and a filter the hardware applies as it is, count for nothing. The
 helpers are the adapter's own, extracted as written, and every chain and
 classifier reference the iterators hand out has to be back by the end.
 """
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
-import subprocess
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -39,14 +40,14 @@ def test_mroute_tc(tmp_path):
         assert walker in section, walker
     (tmp_path / "mroute_tc.inc").write_text(section)
     binary = tmp_path / "tc"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-I", str(tmp_path), str(Path(__file__).with_name("mroute_tc.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

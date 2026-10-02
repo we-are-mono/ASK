@@ -41,14 +41,13 @@ import pytest
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
-from test_flowtable_ipv6_sa import fragments_sent
-from test_flowtable_offload import (ARTIFACTS, WAN_IP, Echo, command, console_python,  # noqa: F401
-                                   rig)
-from test_flowtable_service_ipsec import wire_interface
-from test_flowtable_service_ipsec_replay import PEER_ERRORS, xfrm_mib
-from test_ipsec_inbound_flow_offload import AUTH, CIPHER, sec_counter
-from test_ipsec_offload_egress_device import PEER, wan_outer
-from test_ipsec_packet_offload_traffic import decrypted_packets
+from _flowtable_ipv6_sa import (fragments_sent)
+from _flowtable_rig import (artifact_dir, WAN_IP, Echo, command, console_python)
+from _flowtable_service_ipsec import (wire_interface)
+from _flowtable_service_ipsec_replay import (PEER_ERRORS, xfrm_mib)
+from _ipsec_inbound_flow_offload import (AUTH, CIPHER, sec_counter)
+from _ipsec_offload_egress_device import (PEER, wan_outer)
+from _ipsec_packet_offload_traffic import (decrypted_packets)
 
 PORT = 48992
 FULL_PORT = 48993
@@ -163,7 +162,7 @@ async def test_offloaded_transport_sa_is_decrypted(rig):
 
         refused = xfrm_mib(Path("/proc/net/xfrm_stat").read_text())
         toenc = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc")
-        with Console.target(log_path=str(ARTIFACTS / "ipsec-offload-transport-uart.log")) as console:
+        with Console.target(log_path=str(artifact_dir() / "ipsec-offload-transport-uart.log")) as console:
             await asyncio.to_thread(console.login, "root", None)
             result = await console_python(console, sender(outer), timeout=30)
         assert "sent" in result["stdout"], result
@@ -241,7 +240,7 @@ async def test_offloaded_transport_sa_carries_full_size_frames(rig, policy_first
                                filter=f"ip and src host {outer} and dst host {PEER}")
         sniffer.start()
         assert await asyncio.to_thread(ready.wait, 5), "wire capture did not start"
-        with Console.target(log_path=str(ARTIFACTS / "ipsec-offload-transport-full-uart.log")) as console:
+        with Console.target(log_path=str(artifact_dir() / "ipsec-offload-transport-full-uart.log")) as console:
             await asyncio.to_thread(console.login, "root", None)
             result = await console_python(console, full_sender(outer, size), timeout=30)
         assert "sent" in result["stdout"], result

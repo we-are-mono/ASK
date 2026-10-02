@@ -13,14 +13,21 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import by_key, peer
-from test_flowtable_failslab import same_service, slab_fault
-from test_flowtable_offload import ARTIFACTS, DPORT, Echo, WAN_IP, command, console_command, read, rig  # noqa: F401
-from test_flowtable_selective_neighbour import keys, unchanged, warm
-from test_flowtable_service import FIRST, managed_service, supervision_status
-from test_flowtable_service_vlan import attempts, balanced, denied
-from test_flowtable_tcp import software_tx
-from test_flowtable_tunnel import Capture, Shape, _assert_outer, _assert_tunnel, _tunnel_text, _upload_refused
+from _flowtable_connections import (by_key, peer)
+from _flowtable_failslab import (same_service, slab_fault)
+from _flowtable_rig import (artifact_dir, DPORT, Echo, WAN_IP, command, console_command, read)
+from _flowtable_selective_neighbour import (keys, unchanged, warm)
+from _flowtable_service import (FIRST, managed_service, supervision_status)
+from _flowtable_service_vlan import (attempts, balanced, denied)
+from _flowtable_tcp import (software_tx)
+from _flowtable_tunnel import (
+    Capture,
+    Shape,
+    _assert_outer,
+    _assert_tunnel,
+    _tunnel_text,
+    _upload_refused,
+)
 
 
 async def create_tunnel(r, agent):
@@ -132,7 +139,7 @@ async def tunnel_service(rig, request):
         if transport:
             transport.close()
         failures = []
-        with Console.target(log_path=str(ARTIFACTS / 'service-tunnel-cleanup-uart.log')) as con:
+        with Console.target(log_path=str(artifact_dir() / 'service-tunnel-cleanup-uart.log')) as con:
             await asyncio.to_thread(con.login, 'root', None)
             for agent, argv in reversed(cleanup):
                 try:

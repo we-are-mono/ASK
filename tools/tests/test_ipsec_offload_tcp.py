@@ -32,11 +32,10 @@ import time
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_offload import (ARTIFACTS, command, console_command, console_json,  # noqa: F401
-                                   console_python, read, rig)
-from test_flowtable_service_ipsec_replay import xfrm_mib
-from test_ipsec_inbound_flow_offload import sec_counter
-from test_ipsec_offload_egress_device import INNER, install_tunnel, wan_outer
+from _flowtable_rig import (artifact_dir, command, console_command, console_json, console_python, read)
+from _flowtable_service_ipsec_replay import (xfrm_mib)
+from _ipsec_inbound_flow_offload import (sec_counter)
+from _ipsec_offload_egress_device import (INNER, install_tunnel, wan_outer)
 
 # The DUT's own inner address, on its loopback.
 DUT_INNER = "198.18.106.3"
@@ -158,7 +157,7 @@ async def test_offloaded_tunnel_carries_bulk_tcp(rig):
 
         transfers, gso = {}, {}
         before = await counters(r)
-        with Console.target(log_path=str(ARTIFACTS / "ipsec-offload-tcp-uart.log")) as console:
+        with Console.target(log_path=str(artifact_dir() / "ipsec-offload-tcp-uart.log")) as console:
             await asyncio.to_thread(console.login, "root", None)
             probe = enabled = False
             try:

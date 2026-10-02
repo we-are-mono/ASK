@@ -1,10 +1,12 @@
 """Exercise the patched receive epilogue with descriptor/skb shared storage."""
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
 import re
 import subprocess
 
-from test_flowtable import function
+from _host_flowtable import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -16,7 +18,7 @@ def test_mwifiex_rx_cleanup(tmp_path):
     path = tmp_path / "mlinux/moal_shim.c"
     path.parent.mkdir()
     path.write_bytes(subprocess.check_output(["git", "show", revision + ":mlinux/moal_shim.c"], cwd=source))
-    subprocess.run(["git", "apply", "--whitespace=error", str(recipe.parent / "files" /
+    run_process(["git", "apply", "--whitespace=error", str(recipe.parent / "files" /
         "0002-moal-do-not-free-an-skb-already-handed-to-the-stack.patch")], cwd=tmp_path, check=True)
     epilogue = function(path.read_text(), "moal_recv_packet").split("\ndone:\n")[1]
     harness = '''
@@ -43,7 +45,7 @@ int main(void) {
 '''
     (tmp_path / "test.c").write_text(harness)
     binary = tmp_path / "test"
-    subprocess.run(["cc", "-g", "-O1", "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+    run_process(["cc", "-g", "-O1", "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
                     str(tmp_path / "test.c"), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True, env={**os.environ,
+    run_process([str(binary)], check=True, env={**os.environ,
         "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1", "UBSAN_OPTIONS": "halt_on_error=1"})

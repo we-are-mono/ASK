@@ -11,15 +11,12 @@ existing primitives.
 """
 
 from __future__ import annotations
-
 import asyncio
 import os
-import warnings
-from typing import Awaitable, Callable
-
+import shlex
 import aiohttp
 import pytest_asyncio
-
+from ask_orch.lifecycle import CleanupStack, checked
 from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 
 
@@ -63,7 +60,7 @@ VLAN_ID_PPPOE_WAN: int                = 3900
 # imports these two symbols rather than hardcoding a netdev name, so a
 # re-cable is a one-line change here (or an env override at run time).
 TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth3")
-LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "enp4s0")
+LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "")
 
 # The largest IPv4 packet an Ethernet port delivers, whatever MTU the DUT gives
 # the port: the MAC's receive frame length is fixed at init, and the sending
@@ -75,27 +72,7 @@ FULL_FRAME = 1500
 
 # ---- composable topology primitives --------------------------------------
 
-class TopologyStack:
-    """Per-fixture LIFO of teardown callables.
-
-    Pushes happen as each setup step succeeds; the matching `teardown()`
-    walks the stack in reverse so a partial setup tears down only what
-    actually came up. Failures during teardown emit a warning rather
-    than raising — one cleanup failure shouldn't mask the rest.
-    """
-
-    def __init__(self) -> None:
-        self._cleanups: list[Callable[[], Awaitable[None]]] = []
-
-    def push(self, cleanup: Callable[[], Awaitable[None]]) -> None:
-        self._cleanups.append(cleanup)
-
-    async def teardown(self, label: str = "topology") -> None:
-        for c in reversed(self._cleanups):
-            try:
-                await c()
-            except Exception as e:
-                warnings.warn(f"{label} cleanup failed: {e}")
+TopologyStack = CleanupStack
 
 
 async def dut_vlan_subif(
@@ -120,10 +97,11 @@ async def dut_vlan_subif(
     """
     iface = name or f"{parent}.{vid}"
 
-    async def _exec(*argv: str):
-        return await target_agent.exec_cmd(session, list(argv))
+    async def _exec(*argv: str, check=True):
+        result = await target_agent.exec_cmd(session, list(argv))
+        return checked(result) if check else result
 
-    await _exec("ip", "link", "del", iface)  # idempotent
+    await _exec("ip", "link", "del", iface, check=False)  # idempotent
 
     r = await _exec(
         "ip", "link", "add", "link", parent,
@@ -178,7 +156,7 @@ async def lan_vlan_subif(
     assert r.rc == 0, f"LAN vlan add {iface} (vid {vid}): {r.stdout!r}"
 
     async def _cleanup():
-        await lan_run(lan, f"ip link del {iface} 2>/dev/null", 5.0)
+        checked(await lan_run(lan, f"ip link del {iface}", 5.0))
     stack.push(_cleanup)
 
     if ipv4:
@@ -195,9 +173,9 @@ async def lan_vlan_subif(
         # `replace`, not `add`: a leftover route from a crashed prior run
         # (same prefix, stale nexthop) would make `add` fail "File exists"
         # and keep the stale route; replace keeps setup idempotent.
-        await lan_run(lan, f"ip route replace {spec}", 5.0)
+        checked(await lan_run(lan, f"ip route replace {spec}", 5.0))
         async def _del_route(_first=spec.split()[0]):
-            await lan_run(lan, f"ip route del {_first} 2>/dev/null", 5.0)
+            checked(await lan_run(lan, f"ip route del {_first}", 5.0))
         stack.push(_del_route)
 
     return iface
@@ -248,7 +226,31 @@ async def lan_run_python(
             f"failed to stage Python script on LAN at {path}: "
             f"rc={stage.rc}, stdout={stage.stdout!r}"
         )
-    return await lan_run(lan, f"python3 {path}", timeout)
+    try:
+        return await lan_run(lan, f"python3 {path}", timeout)
+    finally:
+        checked(await lan_run(lan, f"rm -f {path}", 5))
+
+
+async def lan_ipv6_default(stack, lan, gateway, device):
+    """Set a temporary default route and restore iproute2's original snapshot."""
+    snapshot = checked(await lan_run_python(lan, """
+import base64, subprocess
+saved = subprocess.run(["ip", "-6", "route", "save", "default"],
+                       stdout=subprocess.PIPE, check=True, timeout=5).stdout
+print(base64.b64encode(saved).decode())
+""", label="save_ipv6_default"))
+    saved = snapshot.stdout.strip()
+
+    async def restore():
+        cleanup = CleanupStack()
+        cleanup.push(lambda: lan_run(lan, "printf %s " + shlex.quote(saved) +
+                                     " | base64 -d | ip -6 route restore", 5))
+        cleanup.push(lambda: lan_run(lan, f"ip -6 route del default via {gateway} dev {device}", 5))
+        await cleanup.teardown("LAN IPv6 default route")
+
+    stack.push(restore)
+    checked(await lan_run(lan, f"ip -6 route replace default via {gateway} dev {device}", 5))
 
 
 # DUT and LAN IPv6 addresses for the IPv6 tests. Two ULA /64s
@@ -306,13 +308,15 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
     next-hop attempt, and 2a/2d/2e tripwire on counter deltas
     irrespective of forward outcome.
     """
-    cleanups: list[Callable[[], Awaitable[None]]] = []
+    cleanup = CleanupStack()
 
-    async def _exec(*argv: str):
-        return await target_agent.exec_cmd(aiohttp_session, list(argv))
+    async def _exec(*argv: str, check=True):
+        result = await target_agent.exec_cmd(aiohttp_session, list(argv))
+        return checked(result) if check else result
 
-    async def _lan(cmd: str, timeout_s: float = 5.0):
-        return await lan_run(lan, cmd, timeout_s)
+    async def _lan(cmd: str, timeout_s: float = 5.0, check=True):
+        result = await lan_run(lan, cmd, timeout_s)
+        return checked(result) if check else result
 
     try:
         # ---- DUT sysctl: enable IPv6 forwarding ----
@@ -322,7 +326,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
 
         async def _restore_all_fwd(v=prev_all_fwd):
             await _exec("sysctl", "-w", f"net.ipv6.conf.all.forwarding={v}")
-        cleanups.append(_restore_all_fwd)
+        cleanup.push(_restore_all_fwd)
 
         r = await _exec("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
         assert r["rc"] == 0, f"enable v6 forwarding: {r}"
@@ -331,7 +335,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         # Idempotent: del before add so a re-run after a botched teardown
         # doesn't trip "already exists".
         await _exec("ip", "-6", "addr", "del",
-                    f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF)
+                    f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF, check=False)
         r = await _exec("ip", "-6", "addr", "add",
                         f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF, "nodad")
         assert r["rc"] == 0, f"DUT {TARGET_LAN_IF} v6 addr: {r}"
@@ -339,10 +343,10 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         async def _del_dut_lan():
             await _exec("ip", "-6", "addr", "del",
                         f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF)
-        cleanups.append(_del_dut_lan)
+        cleanup.push(_del_dut_lan)
 
         await _exec("ip", "-6", "addr", "del",
-                    f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
+                    f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, check=False)
         r = await _exec("ip", "-6", "addr", "add",
                         f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, "nodad")
         assert r["rc"] == 0, f"DUT {TARGET_WAN_IF} v6 addr: {r}"
@@ -350,10 +354,10 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         async def _del_dut_wan():
             await _exec("ip", "-6", "addr", "del",
                         f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
-        cleanups.append(_del_dut_wan)
+        cleanup.push(_del_dut_wan)
 
         # ---- LAN address + default route ----
-        await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null")
+        await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null", check=False)
         # nodad: static ULA on a point-to-point test segment — DAD would
         # leave the address tentative ~1.5 s and the first test flow of
         # the session silently fails to come up.
@@ -362,21 +366,9 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
 
         async def _del_lan_addr():
             await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null")
-        cleanups.append(_del_lan_addr)
+        cleanup.push(_del_lan_addr)
 
-        # `replace`, not `add`: loki may already carry a v6 default route
-        # from the DUT's router advertisements (via a link-local next-hop),
-        # so a plain `add` fails with "File exists". replace is idempotent —
-        # it adds when absent and overwrites any existing default regardless
-        # of its next-hop.
-        r = await _lan(
-            f"ip -6 route replace default via {DUT_IPV6_LAN} dev {LAN_NIC}"
-        )
-        assert r.rc == 0, f"LAN v6 default route: {r.stdout!r}"
-
-        async def _del_lan_route():
-            await _lan(f"ip -6 route del default via {DUT_IPV6_LAN} 2>/dev/null")
-        cleanups.append(_del_lan_route)
+        await lan_ipv6_default(cleanup, lan, DUT_IPV6_LAN, LAN_NIC)
 
         # Populate the LAN's IPv6 neighbor cache for the DUT. Without
         # this, scapy's first send falls back to broadcast L2 MAC
@@ -396,8 +388,4 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
             "lan_v6":     LAN_IPV6,
         }
     finally:
-        for cleanup in reversed(cleanups):
-            try:
-                await cleanup()
-            except Exception as e:
-                warnings.warn(f"ipv6_topology cleanup failed: {e}")
+        await cleanup.teardown("ipv6_topology")

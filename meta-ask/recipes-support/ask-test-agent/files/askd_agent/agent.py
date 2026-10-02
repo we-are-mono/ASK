@@ -14,6 +14,7 @@ import re
 import secrets
 import select
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -41,6 +42,11 @@ async def health(request: web.Request) -> web.Response:
         "version": __version__,
         "host": platform.node(),
         "uptime_s": _read_uptime(),
+        "kernel": platform.release(),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "capture_protocol": 2,
+        "binaries": [name for name in ("ip", "nft", "conntrack", "iperf3", "pppd", "smcrouted")
+                     if shutil.which(name)],
     })
 
 
@@ -76,12 +82,20 @@ async def capture_start(request: web.Request) -> web.Response:
         stale = captures.pop(next(iter(captures)))
         dmesg.close(stale["kmsg_fd"])
     cap_id = _new_capture_id()
-    captures[cap_id] = {
-        "kmsg_fd": dmesg.open_at_tail(),
-        "counters": counters.snapshot(ifaces) if want_counters else None,
-        "ifaces": ifaces,
-    }
-    return web.json_response({"capture_id": cap_id})
+    try:
+        fd = dmesg.open_at_tail()
+    except OSError as error:
+        return web.json_response({"complete": False, "error": str(error)}, status=503)
+    try:
+        captures[cap_id] = {
+            "kmsg_fd": fd,
+            "counters": counters.snapshot(ifaces) if want_counters else None,
+            "ifaces": ifaces,
+        }
+    except BaseException:
+        dmesg.close(fd)
+        raise
+    return web.json_response({"capture_id": cap_id, "complete": True})
 
 
 async def capture_stop(request: web.Request) -> web.Response:
@@ -89,13 +103,18 @@ async def capture_stop(request: web.Request) -> web.Response:
     cap = request.app["captures"].pop(cap_id, None)
     if cap is None:
         return web.json_response({"error": "unknown capture_id"}, status=404)
-    new_lines = dmesg.drain(cap["kmsg_fd"])
-    dmesg.close(cap["kmsg_fd"])
+    try:
+        window = dmesg.drain(cap["kmsg_fd"])
+    finally:
+        dmesg.close(cap["kmsg_fd"])
+    new_lines = window["lines"]
     splats = dmesg.has_splat(new_lines)
     before = cap["counters"]
     delta = (counters.diff_numeric(before, counters.snapshot(cap["ifaces"]))
              if before is not None else None)
     return web.json_response({
+        "complete": window["complete"],
+        "error": window["error"],
         "dmesg": new_lines,
         "splats": splats,
         "counters_delta": delta,
@@ -105,11 +124,10 @@ async def capture_stop(request: web.Request) -> web.Response:
 async def dmesg_delta(request: web.Request) -> web.Response:
     body = await _maybe_json(request)
     cursor = body.get("cursor")
-    new_cursor, lines = dmesg.read_since(cursor)
+    window = dmesg.read_since(cursor)
     return web.json_response({
-        "cursor": new_cursor,
-        "lines": lines,
-        "splats": dmesg.has_splat(lines),
+        **window,
+        "splats": dmesg.has_splat(window["lines"]),
     })
 
 
@@ -887,9 +905,16 @@ async def _maybe_json(request: web.Request) -> dict:
     return {}
 
 
+async def close_captures(app):
+    while app["captures"]:
+        _, capture = app["captures"].popitem()
+        dmesg.close(capture["kmsg_fd"])
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app["captures"] = {}
+    app.on_cleanup.append(close_captures)
     app.router.add_get("/health",            health)
     app.router.add_get("/counters",          counters_get)
     app.router.add_post("/capture-start",    capture_start)

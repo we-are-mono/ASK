@@ -1,12 +1,13 @@
 """Exercise the production CDX SET_PARAMS transaction under ASan/UBSan."""
 
+from ask_orch.process import run_process
+
 from pathlib import Path
 import os
-import subprocess
 
 import pytest
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -25,13 +26,13 @@ def test_cdx_shutdown(tmp_path):
         control_locks() + function(timer, "cdx_ctrl_timer_stop")
         + function(qos, "qm_quiesce") + function(main, "cdx_module_deinit"))
     binary = tmp_path / "cdx_shutdown"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-Werror=implicit-function-declaration", "-I", str(tmp_path),
         str(Path(__file__).with_name("cdx_shutdown.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})
 
@@ -48,7 +49,7 @@ def test_cdx_subsystems(tmp_path, ipsec):
     (tmp_path / "cdx_subsys.inc").write_text(
         flags + function(main, "cdx_subsys_init") + function(main, "cdx_subsys_exit"))
     binary = tmp_path / "cdx_subsys"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
@@ -56,7 +57,7 @@ def test_cdx_subsystems(tmp_path, ipsec):
         "-I", str(tmp_path), str(Path(__file__).with_name("cdx_subsys.c")),
         "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30,
+    result = run_process([str(binary)], text=True, capture_output=True, timeout=30,
                             env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                                  "UBSAN_OPTIONS": "halt_on_error=1"})
     assert result.returncode == 0, result.stdout + result.stderr
@@ -81,14 +82,14 @@ def test_cdx_startup(tmp_path):
         function(qos, "cdxdrv_release_port_policer_slots")
         + function(qos, "cdxdrv_release_shared_policers"))
     binary = tmp_path / "cdx_startup"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie",
         "-Werror=implicit-function-declaration", "-I", str(tmp_path),
         "-I", str(ROOT / "cdx"), str(Path(__file__).with_name("cdx_startup.c")),
         "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30,
+    result = run_process([str(binary)], text=True, capture_output=True, timeout=30,
                             env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                                  "UBSAN_OPTIONS": "halt_on_error=1"})
     assert result.returncode == 0, result.stdout + result.stderr
@@ -105,14 +106,14 @@ def test_cdx_startup_queues(tmp_path, queues):
         + function(source, "cdx_drain_fq_list") + function(source, "cdx_destroy_fq_list") + function(source, "create_fwd_tx_fqs")
         + function(source, "destroy_fwd_tx_fqs"))
     binary = tmp_path / "cdx_queues"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-Werror=implicit-function-declaration", "-I", str(tmp_path),
         f"-DDPAA_FWD_TX_QUEUES={queues}",
         str(Path(__file__).with_name("cdx_queues.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})
 
@@ -132,11 +133,11 @@ def test_cdx_startup_eqcr(tmp_path):
     (tmp_path / "cdx_eqcr.inc").write_text(text[start:end] + "\n"
         + text[cached:cached_end] + "\n" + function(high.read_text(), "qman_eqcr_is_empty"))
     binary = tmp_path / "cdx_eqcr"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("cdx_eqcr.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

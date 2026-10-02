@@ -45,15 +45,12 @@ import pytest
 from _flowtable_restart import (HOLD, ROOT_FAULT, RUNNING, assert_restarted_cleanly, dmesg_count, knob,
                                 log_marks, ports, require_knobs, restart_budget, restart_counts,
                                 wait_restarted, wait_running, wait_stopped, write)
-from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware,
-                            in_software, learn, mcast_rows, mdb, members, moved, mroute_row,
-                            multicast_rig, packets, quiet, stream, streamed, summary)  # noqa: F401
+from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware, in_software, learn, mcast_rows, mdb, members, moved, mroute_row, packets, quiet, stream, streamed, summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
-from test_flowtable_offload import (HEALTH_BASELINE, command, console_command,  # noqa: F401
-                                    hardware_proof, read, rig)
-from test_mcast_e2e import mcast_bridge, wan_source_address  # noqa: F401
-from test_mroute_capacity import _daemon
+from _flowtable_rig import (HEALTH_BASELINE, command, console_command, hardware_proof, read)
+from _mcast_e2e import (wan_source_address)
+from _mroute_capacity import (_daemon)
 
 DELETE_BARRIER = "/proc/fm_ehash_hcsync_fail"
 SPLICE_BARRIER = "/proc/cdx_mc_hcsync_fail"

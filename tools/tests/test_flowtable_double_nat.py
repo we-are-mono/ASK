@@ -8,13 +8,11 @@ import pytest_asyncio
 
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import healthy, peer
-from test_flowtable_dnat import (PUBLIC_PORT, hardware, warm,
-                                 test_flowtable_dnat as _dnat)
-from test_flowtable_offload import (ARTIFACTS, DPORT, HEALTH_BASELINE, SPORT, WAN_IP, command,
-                                   console_command, read, rig)  # noqa: F401
-from test_flowtable_policy import CONFIG, apply, candidate, stop
-from test_flowtable_tcp import software_tx
+from _flowtable_connections import (healthy, peer)
+from _flowtable_dnat import (PUBLIC_PORT, hardware, warm, dnat as _dnat)
+from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, command, console_command, read)
+from _flowtable_policy import (CONFIG, apply, candidate, stop)
+from _flowtable_tcp import (software_tx)
 
 GATEWAY = "198.18.42.1"
 CLIENT = {"netns": "ask-ft-hairpin-client", "iface": "askfthc", "lan": "198.18.42.2", "mac": "02:9d:99:b2:42:02"}
@@ -127,7 +125,7 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
     policy = candidate(r)
     policy["scope"] = [{"source": CLIENT["lan"], "destination": external,
                         "source_port": sport, "destination_port": PUBLIC_PORT}]
-    with Console.target(log_path=str(ARTIFACTS / f"{case}-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / f"{case}-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         async def conntracks():
             result = {}

@@ -11,15 +11,16 @@ consumer change moves the test with it.
 Run without the board fixtures:
     pytest tools/host_tests/test_ofport_tables.py
 """
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
 import re
-import subprocess
 import xml.etree.ElementTree as ET
 
 import pytest
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 FM_EH_TYPES = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h"
@@ -154,7 +155,7 @@ def test_ofport_tables(tmp_path):
         f"#define COLLIDING_TYPES {', '.join(map(str, colliding))}\n")
 
     binary = tmp_path / "ofport_tables"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter", "-Wno-unused-function",
         # As the kernel builds it: the flags word is a uint32_t and the table
@@ -164,7 +165,7 @@ def test_ofport_tables(tmp_path):
         "-Werror=implicit-function-declaration", "-I", str(tmp_path),
         str(Path(__file__).with_name("ofport_tables.c")), "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30, env={
+    result = run_process([str(binary)], text=True, capture_output=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

@@ -1,4 +1,4 @@
-"""Opt-in Loki-to-Vision throughput measurement for the SA provenance validation."""
+"""Opt-in LAN-to-WAN throughput measurement for the SA provenance validation."""
 import asyncio
 import json
 import os
@@ -7,12 +7,12 @@ from pathlib import Path
 import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import healthy
-from test_flowtable_offload import ARTIFACTS, command, console_command, read, rig  # noqa: F401
-from test_flowtable_service import CONF, INIT
-from test_flowtable_service_ipsec import INNER, LAN_INNER, Transform, ipsec_service  # noqa: F401
-from test_flowtable_service_ipsec_replay import AEAD, peer_errors, sa_state, xfrm_mib
-from test_flowtable_tcp import cpu, cpu_delta, software_tx
+from _flowtable_connections import (healthy)
+from _flowtable_rig import (artifact_dir, command, console_command, read)
+from _flowtable_service import (CONF, INIT)
+from _flowtable_service_ipsec import (INNER, LAN_INNER, Transform)
+from _flowtable_service_ipsec_replay import (AEAD, peer_errors, sa_state, xfrm_mib)
+from _flowtable_tcp import (cpu, cpu_delta, software_tx)
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASK_IPSEC_IPERF") != "1",
                                 reason="explicit lab throughput measurement")
@@ -50,7 +50,7 @@ async def test_ipsec_vlan_iperf(ipsec_service):
                 if os.environ.get("ASK_IPSEC_CAPTURE") == "1" and streams == 4:
                     capture = await asyncio.create_subprocess_exec(
                         "tcpdump", "-i", r.ipsec_wire_if, "-n", "-s", "0", "-c", "20000",
-                        "-w", str(ARTIFACTS / "iperf-4-esp.pcap"),
+                        "-w", str(artifact_dir() / "iperf-4-esp.pcap"),
                         f"src host {r.ipsec.outer} and ip proto 50",
                         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 argv = ["iperf3", "-c", INNER, "-B", LAN_INNER, "-p", str(PORT),

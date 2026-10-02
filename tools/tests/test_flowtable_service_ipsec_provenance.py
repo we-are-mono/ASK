@@ -4,6 +4,8 @@ Also exercise faithful CPU exceptions and legitimate rekey overlap.
 """
 from __future__ import annotations
 
+from _flowtable_service_ipsec_provenance import (COUNT, KEY, SPI_B, add_b, inject)
+
 import asyncio
 import json
 import re
@@ -11,58 +13,13 @@ import secrets
 
 import pytest
 
-from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_connections import by_key, healthy, peer
-from test_flowtable_offload import DPORT, WAN_IP, command, read, rig  # noqa: F401
-from test_flowtable_service import FIRST, OBSERVE_TABLE
-from test_flowtable_selective_neighbour import warm
-from test_flowtable_service_ipsec import (
-    INNER, LAN_INNER, Transform, Wire, flows_for, hardware, ipsec_service,  # noqa: F401
-)
-from test_flowtable_service_ipsec_replay import AEAD, esp, sa_state, xfrm_mib
-
-SPI_B = 0xB2800001
-COUNT = 32
-KEY = (TARGET_WAN_IF, "17", f"{INNER}:{DPORT}", f"{LAN_INNER}:{FIRST}")
-
-
-async def inject(r, p, spi, marker, *, sport=DPORT, size=256, seq=100000, source_mac=None):
-    from scapy.all import Ether, IP, UDP, Raw, sendp
-
-    inner = bytes(IP(src=INNER, dst=LAN_INNER) /
-                  UDP(sport=sport, dport=FIRST) /
-                  Raw(marker.ljust(size - 28, b".")))
-    frames = [Ether(src=source_mac or r.wan_mac, dst=r.dut_wan_mac) /
-              IP(src=WAN_IP, dst=r.ipsec.outer, proto=50) /
-              Raw(esp(r.ipsec.transform.algorithms, spi, seq + i, inner))
-              for i in range(COUNT)]
-    before = await sa_state(r, spi, "in")
-    state = await r.state()
-    forwarded = await r.software_forwarded()
-    await p.rpc("wire_probe", changes={"action": "start", "iface": LAN_NIC,
-                                       "marker": marker.hex(), "samples": 2,
-                                       "incoming_only": True})
-    try:
-        await asyncio.to_thread(sendp, frames, iface=r.wan_if, inter=0.01, verbose=False)
-        await asyncio.sleep(2)
-        wire = await p.rpc("wire_probe", changes={"action": "status"})
-    finally:
-        await p.rpc("wire_probe", changes={"action": "stop"})
-    after = await sa_state(r, spi, "in")
-    result = {"wire": wire, "sa_before": before, "sa_after": after,
-              "before": state, "after": await r.state(),
-              "software_forwarded": await r.software_forwarded() - forwarded}
-    r.record(f"provenance-{spi:x}-{sport}-{size}-{seq}", result)
-    assert after and before and after["packets"] - before["packets"] >= COUNT, result
-    return result
-
-
-async def add_b(r):
-    # A separate authenticated SA, with no forward policy authorizing A's tuple.
-    await r.ipsec.add(r.target, "state", r.ipsec.state("in", SPI_B),
-                     "mode", "tunnel", "reqid", "52801",
-                     *r.ipsec.transform.algorithms, "replay-window", "32",
-                     "offload", "packet", "dev", TARGET_WAN_IF, "dir", "in")
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF
+from _flowtable_connections import (by_key, healthy, peer)
+from _flowtable_rig import (DPORT, WAN_IP, command, read)
+from _flowtable_service import (FIRST, OBSERVE_TABLE)
+from _flowtable_selective_neighbour import (warm)
+from _flowtable_service_ipsec import (INNER, LAN_INNER, Transform, Wire, flows_for, hardware)
+from _flowtable_service_ipsec_replay import (AEAD, esp, sa_state, xfrm_mib)
 
 
 @pytest.mark.parametrize("ipsec_service", [Transform(), AEAD["rfc4106-icv16"]],

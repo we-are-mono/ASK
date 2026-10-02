@@ -28,9 +28,9 @@ from _topology import (
     LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, VLAN_ID_MCAST_MTU,
     dut_vlan_subif, lan_vlan_subif,
 )
-from test_flowtable_offload import read
-from test_mcast_e2e import _exec, mroute_line, mroute_proc_row, wan_source_address
-from test_mroute_capacity import _daemon, _preflight
+from _flowtable_rig import (read)
+from _mcast_e2e import (_exec, mroute_line, mroute_proc_row, wan_source_address)
+from _mroute_capacity import (_daemon, _preflight)
 
 pytestmark = pytest.mark.asyncio
 PORT = 47396

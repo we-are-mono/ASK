@@ -44,13 +44,12 @@ import struct
 import pytest
 
 from _topology import TARGET_WAN_IF
-from test_flowtable_connections import by_key, peer
-from test_flowtable_ipv6_sa import fragments_sent
-from test_flowtable_offload import WAN_IP, command, rig  # noqa: F401
-from test_flowtable_selective_neighbour import keys, unchanged, warm
-from test_flowtable_service_ipsec import (INNER, Transform, flows_for, ipsec_service,  # noqa: F401
-                                          sec_counter)
-from test_flowtable_service_ipsec_replay import AEAD
+from _flowtable_connections import (by_key, peer)
+from _flowtable_ipv6_sa import (fragments_sent)
+from _flowtable_rig import (WAN_IP, command)
+from _flowtable_selective_neighbour import (keys, unchanged, warm)
+from _flowtable_service_ipsec import (INNER, Transform, flows_for, sec_counter)
+from _flowtable_service_ipsec_replay import (AEAD)
 
 # What esp4 puts around a transform's payload: the cipher's block, which it
 # aligns to 4 bytes, and the IV it sends; GCM is a stream cipher with a block

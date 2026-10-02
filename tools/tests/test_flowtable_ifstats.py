@@ -29,10 +29,8 @@ import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif
 from ask_orch.uart import Console
-from test_flowtable_offload import (ARTIFACTS, TABLE, WAN_IP, command, console_command, read,
-                                    rearm_ready)
-from test_flowtable_vlan import (DUT_VLAN_ADDR, VLAN_ID, VLAN_INNER, _both_directions,  # noqa: F401
-                                 vlan_rig)
+from _flowtable_rig import artifact_dir, TABLE, command, console_command, read, rearm_ready
+from _flowtable_vlan import (DUT_VLAN_ADDR, VLAN_ID, _both_directions)
 
 PAYLOAD = 256
 COUNT = 64
@@ -60,7 +58,7 @@ def offload_service_stopped():
     asserts an unbound adapter, and only the offload test's own fixture stops
     the service. Stop it here too, over the console the init script needs."""
     async def stop():
-        with Console.target(log_path=str(ARTIFACTS / "ifstats-daemon-stop.log")) as con:
+        with Console.target(log_path=str(artifact_dir() / "ifstats-daemon-stop.log")) as con:
             await asyncio.to_thread(con.login, "root", None)
             await console_command(con, "/etc/init.d/ask-flowtable", "stop", check=False,
                                   timeout=45)

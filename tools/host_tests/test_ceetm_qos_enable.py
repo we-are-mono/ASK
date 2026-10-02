@@ -4,11 +4,12 @@ Run without the board fixtures:
     pytest tools/host_tests/test_ceetm_qos_enable.py
 """
 
+from ask_orch.process import run_process
+
 from pathlib import Path
 import os
 import re
 import shutil
-import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -32,13 +33,13 @@ def test_ceetm_qos_enable_is_symmetric(tmp_path):
     (tmp_path / "qos_enable_production.inc").write_text(
         "\n".join(function(source, name) for name in names))
     binary = tmp_path / "ceetm_qos_enable"
-    subprocess.run([
+    run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-Werror=implicit-function-declaration", "-I", str(tmp_path),
         str(Path(__file__).with_name("ceetm_qos_enable.c")), "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30,
+    result = run_process([str(binary)], text=True, capture_output=True, timeout=30,
                             env={**os.environ,
                                  "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                                  "UBSAN_OPTIONS": "halt_on_error=1"})

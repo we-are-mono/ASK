@@ -6,10 +6,11 @@ passing-target lists, the core's dispatcher -- and the kernel's own
 ip_packet_match() and ifname_compare_aligned() from the kernel tree, so the
 header test the walk applies to every rule is the packet path's, not a copy.
 """
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
 import re
-import subprocess
 
 import pytest
 
@@ -92,7 +93,7 @@ def test_xt_port_probe(tmp_path):
         assert "ops[i].hook_ops_type = NF_HOOK_OP_XTABLES;" in text, name
 
     binary = tmp_path / "xt_port_probe"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         # The kernel's own helpers pass unsigned interface masks as char
@@ -102,7 +103,7 @@ def test_xt_port_probe(tmp_path):
         "-I", str(tmp_path), str(Path(__file__).with_name("xt_port_probe.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=60, env={
+    run_process([str(binary)], check=True, timeout=60, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

@@ -7,11 +7,12 @@ essentially never unregisters. That is the path where the netdev pointer stops
 being safe to follow, so it is the path this compiles and runs under ASan.
 """
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
-import subprocess
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "cdx/ask_flowtable.c"
@@ -37,14 +38,14 @@ def test_wifi_adapter(tmp_path):
             "ft_wifi_exit",
         ]))
     binary = tmp_path / "wifi_adapter"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("wifi_adapter.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

@@ -1,4 +1,6 @@
 """IPsec classifier keys match the physical and SEC port layouts."""
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
 import re
@@ -6,7 +8,7 @@ import struct
 import subprocess
 import xml.etree.ElementTree as ET
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 FIELDS = {"ethernet.src": 6, "ethernet.dst": 6, "ethernet.type": 2,
@@ -51,10 +53,10 @@ int main(void) {
 }
 ''')
     binary = tmp_path / 'sec_tag'
-    subprocess.run([os.environ.get('HOSTCC', 'cc'), '-Wall', '-Wextra', '-Werror',
+    run_process([os.environ.get('HOSTCC', 'cc'), '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', '-fno-pie', '-no-pie',
                     str(source), '-o', str(binary)], check=True)
-    subprocess.run([str(binary)], check=True)
+    run_process([str(binary)], check=True)
 
 
 def test_soft_parser_scope():
@@ -112,7 +114,7 @@ int main(void) {
 }
 """)
     binary = tmp_path / "natt_key"
-    subprocess.run([os.environ.get("HOSTCC", "cc"), "-Wall", "-Wextra", "-Werror",
+    run_process([os.environ.get("HOSTCC", "cc"), "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
                     str(source), "-o", str(binary)], check=True)
     actual = subprocess.check_output([str(binary)], text=True).splitlines()

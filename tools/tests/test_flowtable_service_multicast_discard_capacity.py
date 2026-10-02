@@ -35,13 +35,10 @@ import time
 
 import pytest
 
-from _mcast_windows import (COUNT, PORT, bridge_settings, delivered, frames, host, in_hardware,
-                            learn, mcast_rows, members, moved, multicast_rig, quiet,  # noqa: F401
-                            stream, streamed)
+from _mcast_windows import (COUNT, PORT, bridge_settings, delivered, frames, host, in_hardware, learn, mcast_rows, members, moved, quiet, stream, streamed)
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_offload import command
-from test_flowtable_service_multicast_leave import FILTER_TIMERS, FILTER_VERSION
-from test_mcast_e2e import mcast_bridge  # noqa: F401
+from _flowtable_rig import (command)
+from _flowtable_service_multicast_leave import (FILTER_TIMERS, FILTER_VERSION)
 
 # Past the ids a family has, so the fill is refused for room and not for
 # anything else.

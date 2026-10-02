@@ -1,9 +1,10 @@
 """The rig's classifier bucket model agrees with the SDK's own hash."""
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
 import random
 import re
-import subprocess
 import sys
 
 import pytest
@@ -45,12 +46,12 @@ int main(void)
 }
 ''')
     binary = tmp_path / "bucket"
-    subprocess.run([os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-O1", "-I", str(tmp_path),
+    run_process([os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-O1", "-I", str(tmp_path),
                     "-I", str(pcd), str(tmp_path / "bucket.c"), "-o", str(binary)], check=True)
 
     def run(cases):
         lines = "".join(f"{shift} {mask} {len(key)} {key.hex()}\n" for key, mask, shift in cases)
-        out = subprocess.run([str(binary)], input=lines, capture_output=True, text=True, check=True)
+        out = run_process([str(binary)], input=lines, capture_output=True, text=True, check=True)
         return [int(x) for x in out.stdout.split()]
     return run
 

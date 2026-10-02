@@ -14,7 +14,7 @@ import asyncio
 import pytest
 
 from ask_orch.uart import Console
-from test_flowtable_offload import ARTIFACTS, console_command, console_json, flowtable_json, rig  # noqa: F401
+from _flowtable_rig import (artifact_dir, console_command, console_json, flowtable_json)
 
 INIT = "/etc/init.d/ask-flowtable"
 DAEMON = "/usr/sbin/ask-flowtable"
@@ -26,7 +26,7 @@ async def _status(con):
 
 
 async def test_boot_service_offloads_by_default():
-    with Console.target(log_path=str(ARTIFACTS / "default-on-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "default-on-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
 
         # Zero-config: the shipped default parses and is the catch-all. Its

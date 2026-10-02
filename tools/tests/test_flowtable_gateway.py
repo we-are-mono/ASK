@@ -9,11 +9,19 @@ import pytest
 
 from ask_orch.client import Agent
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_offload import DPORT, SPORT, WAN_IP, command, rig  # noqa: F401
-from test_flowtable_arp import (CHANGED_MAC, arp_environment, check_arp_trace, invalidated,
-                              lan_neighbour, observe, recover, udp_hardware,
-                              wait_neighbour)
-from test_flowtable_tcp import BLOCK, connection, hardware_transfer, installed
+from _flowtable_rig import (DPORT, SPORT, WAN_IP, command)
+from _flowtable_arp import (
+    CHANGED_MAC,
+    arp_environment,
+    check_arp_trace,
+    invalidated,
+    lan_neighbour,
+    observe,
+    recover,
+    udp_hardware,
+    wait_neighbour,
+)
+from _flowtable_tcp import (BLOCK, connection, hardware_transfer, installed)
 
 NETNS = "ask-ft-gateway"
 ROUTER_IF, PEER_IF = "askftgw", "askftpeer"
@@ -75,7 +83,7 @@ print(json.dumps({{'forwarding': old}}))
     assert result.rc == 0, result.stdout
     old_forwarding = json.loads(result.stdout.strip())["forwarding"]
     try:
-        # The gateway remains in loki; only the remote endpoint is namespaced.
+        # The gateway remains in the LAN VM; only the remote endpoint is namespaced.
         # Its physical MAC and the endpoint's veth MAC are distinct.
         for key, value in {"lan_ip": PEER_IP, "peer_netns": NETNS, "peer_if": PEER_IF,
                            "peer_mac": PEER_MAC, "peer_gateway_mac": ROUTER_MAC,

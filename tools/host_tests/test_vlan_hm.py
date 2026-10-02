@@ -1,13 +1,14 @@
 """Check the production VLAN header manipulations and what feeds them."""
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
-from test_ifstats import declaration as typed_declaration
-from test_pppoe_hm import display, typedef
-from test_qos_lifecycle import function
+from _host_ifstats import (declaration as typed_declaration)
+from _host_pppoe_hm import (display, typedef)
+from _host_qos_lifecycle import (function)
 
 
 def declaration(source, name):
@@ -20,7 +21,7 @@ HEADER = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h"
 
 def test_vlan_hm(tmp_path):
     # The shipped patch, so this does not depend on a previously built kernel.
-    subprocess.run([
+    run_process([
         "git", "apply", f"--include={HEADER}",
         str(ROOT / "patches/kernel/010-ask-fman-dpaa-ehash.patch"),
     ], cwd=tmp_path, check=True)
@@ -60,7 +61,7 @@ def test_vlan_hm(tmp_path):
         + display(header, "display_vlanhdr_insert_opc")
         + display(header, "display_strip_allvlan_hdr_opc"))
     binary = tmp_path / "vlan_hm"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         # Two warnings the kernel build does not enable and the vendor's
@@ -72,7 +73,7 @@ def test_vlan_hm(tmp_path):
         "-DINCLUDE_ETHER_IFSTATS=1", "-DVLAN_FILTER=1",
         str(Path(__file__).with_name("vlan_hm.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

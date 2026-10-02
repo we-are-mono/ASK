@@ -4,11 +4,12 @@ Run without the board fixtures:
     pytest tools/host_tests/test_htb_offload.py
 """
 
+from ask_orch.process import run_process
+
 from pathlib import Path
 import os
 import re
 import shutil
-import subprocess
 
 import pytest
 
@@ -104,13 +105,13 @@ def test_htb_offload(tmp_path):
     (tmp_path / "htb_production.inc").write_text(
         "\n".join(function(source, name) for name in names))
     binary = tmp_path / "htb_offload"
-    subprocess.run([
+    run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-omit-frame-pointer", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("htb_offload.c")), "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=60,
+    result = run_process([str(binary)], text=True, capture_output=True, timeout=60,
                             env={**os.environ,
                                  "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                                  "UBSAN_OPTIONS": "halt_on_error=1"})

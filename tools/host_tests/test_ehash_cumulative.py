@@ -2,41 +2,13 @@
 failed barrier or a failed allocation leaves behind in a bucket whose keys
 collide."""
 
+from ask_orch.process import run_process
+
+from _host_ehash_cumulative import (HEADER, PCD, ROOT, declaration, function)
+
 import os
 from pathlib import Path
 import re
-import subprocess
-
-ROOT = Path(__file__).resolve().parents[2]
-PCD = "drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c"
-HEADER = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h"
-
-
-def declaration(source, name):
-    """One struct as written, brace-matched, so a field added inside it comes
-    along instead of truncating the type."""
-    match = re.search(r"struct\s+" + name + r"\s*\{", source)
-    assert match, name
-    end, depth = match.end(), 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[match.start():source.index(";", end) + 1] + "\n"
-
-
-def function(source, name):
-    """A definition, whatever it returns: its parameter list is followed by a
-    brace, which a call or a prototype never is. A comment that names the
-    function is skipped: nothing in its prose need stop the search short of
-    the brace that follows it."""
-    match = re.search(r"^(?![ \t]*(?:/\*|\*|//))[^\n;{}]*\b" + name + r"\([^;{]*?\)\s*\{",
-                      source, re.M)
-    assert match, name
-    end, depth = match.end(), 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[match.start():end] + "\n"
 
 
 def test_ehash_cumulative(tmp_path):
@@ -47,7 +19,7 @@ def test_ehash_cumulative(tmp_path):
                 r"^diff --git a/(?:" + re.escape(PCD) + "|" + re.escape(HEADER) + ") ",
                 patch.read_text(), re.M):
             continue
-        subprocess.run(["git", "apply", "--whitespace=nowarn", f"--include={PCD}",
+        run_process(["git", "apply", "--whitespace=nowarn", f"--include={PCD}",
                         f"--include={HEADER}", str(patch)], cwd=tmp_path, check=True)
     header = (tmp_path / HEADER).read_text()
     pcd = (tmp_path / PCD).read_text()
@@ -75,7 +47,7 @@ def test_ehash_cumulative(tmp_path):
             "ehash_bucket_links", "ExternalHashTableFindEntry",
             "ExternalHashTableHcFailed")))
     binary = tmp_path / "ehash_cumulative"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wno-unused-function",
         "-Wno-unused-but-set-variable", "-Werror", "-fsanitize=address,undefined",
         # A cumulative node packs its entry addresses at odd offsets, which is
@@ -84,7 +56,7 @@ def test_ehash_cumulative(tmp_path):
         "-fno-omit-frame-pointer", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("ehash_cumulative.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

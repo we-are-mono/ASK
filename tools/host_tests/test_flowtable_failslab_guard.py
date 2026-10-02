@@ -157,7 +157,7 @@ def test_symbol_selection_requires_unique_visible_module_function():
 @pytest.mark.parametrize("cancel_transport", ["http", "uart"])
 async def test_lost_launch_acknowledgement_still_cancels_guard(monkeypatch, cancel_transport):
     monkeypatch.syspath_prepend(str(SOURCE.parent))
-    import test_flowtable_failslab as suite
+    import _flowtable_failslab as suite
 
     active = False
     cancelled = False

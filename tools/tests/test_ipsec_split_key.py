@@ -16,8 +16,8 @@ import pytest
 
 from _ipsec_helpers import endpoints_down, endpoints_up
 from _topology import TARGET_WAN_IF
-from test_flowtable_offload import command, read, status_text
-from test_flowtable_service_ipsec import Transform
+from _flowtable_rig import (command, read, status_text)
+from _flowtable_service_ipsec import (Transform)
 
 KNOB = "/proc/cdx_split_key_fail"
 # A pair, an SPI and a reqid of its own. Nothing is sent: the peer does not

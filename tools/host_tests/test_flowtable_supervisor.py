@@ -10,7 +10,6 @@ import time
 
 import pytest
 
-from test_flowtable_recovery import controller  # noqa: F401
 
 
 def service(c):

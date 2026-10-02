@@ -10,9 +10,9 @@ directly (`tio /dev/ttyUSB0` or `tio $(sudo virsh ttyconsole <vm>)`).
 
 Endpoints:
     target: USB-serial to the DUT. Path from $ASK_TARGET_DEV
-            (default /dev/ttyUSB0).
+            (required).
     lan:    libvirt-hosted LAN-side traffic generator VM. Domain name
-            from $ASK_LAN_VM (default "loki"). PTY resolved via
+            from $ASK_LAN_VM. PTY resolved via
             `virsh ttyconsole <domain>`.
 
 Both require root (or dialout + libvirt groups depending on distro).
@@ -37,8 +37,8 @@ from dataclasses import dataclass
 import serial
 
 
-DEFAULT_TARGET_DEV = os.environ.get("ASK_TARGET_DEV", "/dev/ttyUSB0")
-DEFAULT_LAN_VM     = os.environ.get("ASK_LAN_VM", "loki")
+DEFAULT_TARGET_DEV = os.environ.get("ASK_TARGET_DEV", "")
+DEFAULT_LAN_VM     = os.environ.get("ASK_LAN_VM", "")
 DEFAULT_BAUD       = 115200
 
 # One UART, one reader -- enforced here rather than left as a convention.
@@ -130,7 +130,12 @@ class Console:
         if log_path:
             os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
         self.log_fp    = open(log_path, "ab", buffering=0) if log_path else None
-        self.ser       = serial.Serial(port=port, baudrate=baud, timeout=0)
+        try:
+            self.ser = serial.Serial(port=port, baudrate=baud, timeout=0)
+        except BaseException:
+            if self.log_fp:
+                self.log_fp.close()
+            raise
         self.lock      = port_lock(port)
 
     # --- factory helpers ------------------------------------------------
@@ -142,11 +147,15 @@ class Console:
         # FIFO headroom and a scheduling gap; PTY-backed LAN consoles need
         # neither. Never replay a mutation after losing its result marker.
         kw.setdefault("write_chunk_bytes", 8)
+        if not DEFAULT_TARGET_DEV:
+            raise ValueError("set ASK_TARGET_DEV to the DUT serial device")
         return cls(port=DEFAULT_TARGET_DEV, **kw)
 
     @classmethod
     def lan(cls, domain: str | None = None, **kw) -> "Console":
         """Open the LAN-side VM's serial console by libvirt domain name."""
+        if not (domain or DEFAULT_LAN_VM):
+            raise ValueError("set ASK_LAN_VM to the LAN client libvirt domain")
         pty = _virsh_pty(domain or DEFAULT_LAN_VM)
         return cls(port=pty, **kw)
 

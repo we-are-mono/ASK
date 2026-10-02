@@ -8,13 +8,14 @@ table's key size, the C key the root is composed into, the names dpa_app maps
 to types, and the miss chain cdx programs -- and a mismatch in any of them is a
 key the hardware never matches, with nothing on the rig to say why.
 """
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
 import re
-import subprocess
 import xml.etree.ElementTree as ET
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 PCD = ROOT / "dpa_app/files/etc/cdx_pcd.xml"
@@ -149,9 +150,9 @@ def test_the_c_key_is_the_size_the_table_expects(tmp_path):
           "  assert(sizeof(struct ipv6_mcast_mac_key) + 1 == 46);\n"
           "  return 0;\n}\n")
     binary = tmp_path / "keys"
-    subprocess.run([os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-Wall", "-Werror",
+    run_process([os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-Wall", "-Werror",
                     str(source), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True)
+    run_process([str(binary)], check=True)
     # And the composer really returns that.
     ehash = (ROOT / "cdx/cdx_ehash.c").read_text()
     body = function(ehash, "fill_mcast_mac_key")

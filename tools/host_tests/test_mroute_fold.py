@@ -4,11 +4,12 @@ Run the adapter's own fold against an MFC entry that ipmr also counts into:
 before the group reaches hardware, while a refusal keeps it in software, and
 across a reinstall that starts a new hardware counter from zero.
 """
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
-import subprocess
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -24,14 +25,14 @@ def test_mroute_fold(tmp_path):
         function(source, "ft_mc_count_delta") + function(source, "ft_mr_fold")
         + function(source, "ft_mr_route_baseline"))
     binary = tmp_path / "fold"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-I", str(tmp_path), str(Path(__file__).with_name("mroute_fold.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

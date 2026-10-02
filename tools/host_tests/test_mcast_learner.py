@@ -1,12 +1,13 @@
 """The bridged multicast learner's decision logic."""
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
-from test_pppoe_hm import declaration
-from test_qos_lifecycle import function
+from _host_pppoe_hm import (declaration)
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "cdx/ask_flowtable.c"
@@ -151,14 +152,14 @@ def test_mcast_learner(tmp_path):
             "ft_mc_replay_event",
         ]))
     binary = tmp_path / "mcast_learner"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("mcast_learner.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -190,7 +191,7 @@ def test_the_worker_never_holds_the_group_lock_across_the_transaction():
     the transaction while holding ft_mc_lock would close a cycle with it. The
     worker snapshots under the lock, releases it, then does the hardware.
     """
-    from test_mroute_learner import _assert_not_inside, _held_regions
+    from _host_mroute_learner import (_assert_not_inside, _held_regions)
     body = function(SOURCE.read_text(), "ft_mc_work_fn")
     assert "cdx_ft_begin();" in body, "the worker is where the hardware happens"
     _assert_not_inside(body, _held_regions(body, "mutex_lock(&ft_mc_lock)",
@@ -204,7 +205,7 @@ def test_the_bridge_is_asked_under_rtnl_and_never_across_hardware():
     RTNL is never held across the transaction -- cdx_ctrl_lock_with_rtnl()'s
     standing rule -- and the refresh takes the transaction in /proc's order.
     """
-    from test_mroute_learner import _assert_not_inside, _held_regions
+    from _host_mroute_learner import (_assert_not_inside, _held_regions)
     source = SOURCE.read_text()
     worker = function(source, "ft_mc_work_fn")
     derive = worker[worker.index("rtnl_lock();"):]
@@ -507,13 +508,13 @@ def test_a_bridge_filter_hook_keeps_bridged_multicast_in_software(tmp_path):
         function(source, "ft_bridge_hooked") + function(source, "ft_mc_bridge_filtered")
         + function(source, "ft_dev_nf_ingress_hooked"))
     binary = tmp_path / "mcast_bridge_filter"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("mcast_bridge_filter.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -540,7 +541,7 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     for a chain, as for a bridge hook. Both are asked under the RTNL the
     derivation holds, before the group lock, and every refresh asks again
     because nothing announces a filter or a chain."""
-    from test_mroute_learner import _assert_not_inside, _held_regions
+    from _host_mroute_learner import (_assert_not_inside, _held_regions)
     source = SOURCE.read_text()
     derive = function(source, "ft_mc_flow_derive")
     for asked in ("ft_mc_soft_on(soft, f->in, true, &tc_soft, &nf_hooked);",
@@ -790,7 +791,7 @@ def test_no_worker_holds_its_learner_lock_across_the_hardware():
     every RTNL user behind them, for a whole build. The transaction is what
     keeps a half-built entry from being seen; the learner lock is only for
     the records."""
-    from test_mroute_learner import _assert_not_inside, _held_regions
+    from _host_mroute_learner import (_assert_not_inside, _held_regions)
     source = SOURCE.read_text()
     for worker, lock in (("ft_mc_work_fn", "ft_mc_lock"), ("ft_mr_work_fn", "ft_mr_lock")):
         # The code, not what its comments mention.

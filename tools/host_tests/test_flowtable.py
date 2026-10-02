@@ -3,26 +3,15 @@
 Only kernel infrastructure and the firmware boundary are simulated. Rule parsing,
 replace/remove, counter deltas, and invalidation are compiled from CDX itself.
 """
+
+from ask_orch.process import run_process
+
+from _host_flowtable import (ROOT, function)
 import os
 from pathlib import Path
 import re
-import subprocess
 
 import pytest
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def function(source, name):
-    # The line has to begin with a word, the return type: a comment line that
-    # names `foo()' would otherwise match and run on to the next definition.
-    match = re.search(r"^(?:static )?\w[^\n]*\b" + name + r"\([^;]*?\)\s*\{", source, re.M)
-    assert match, name
-    end, depth = match.end(), 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[match.start():end] + "\n"
 
 
 def test_flowtable_decoder_and_lifecycle(tmp_path):
@@ -70,13 +59,13 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
         source[source.index("struct ft_stopped {"):source.index("static void ft_port_stopped(")]
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
         "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -125,13 +114,13 @@ def test_flowtable_hardware_ownership(tmp_path):
     backend = (ROOT / "cdx/cdx_flowtable_backend.c").read_text()
     (tmp_path / "backend_production.inc").write_text(backend[backend.index("static bool ft_observe"):])
     binary = tmp_path / "flowtable_hw"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
         "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable_hw.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -150,12 +139,12 @@ def test_flowtable_neighbour_fallback(tmp_path):
         + function(offload, "nf_flow_offload_has_dst")
         + function(offload, "nf_flow_offload_dst"))
     binary = tmp_path / "flowtable_neigh"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
         "-Werror", "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable_neigh.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -174,7 +163,7 @@ def test_flowtable_stats_poll(tmp_path):
     (tmp_path / "stats_poll_production.inc").write_text(
         function(header, "nf_flow_timeout_delta") + stats)
     binary = tmp_path / "flowtable_stats_poll"
-    subprocess.run([
+    run_process([
         # Upstream compares the signed timeout delta with the unsigned
         # timeout, which the kernel's flags never warn about and -Wextra does.
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
@@ -182,7 +171,7 @@ def test_flowtable_stats_poll(tmp_path):
         "-Werror", "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable_stats_poll.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -225,13 +214,13 @@ def test_flowtable_qos_flow_class(tmp_path):
     (tmp_path / "qos_flow_class_production.inc").write_text(
         function(source, "ft_qos_class") + function(source, "ft_qos_flow_class"))
     binary = tmp_path / "qos_flow_class"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
         "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("qos_flow_class.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -254,13 +243,13 @@ def test_flowtable_software_path_carries_the_conntrack(tmp_path):
         + function(source, "nf_flow_offload_forward")
         + function(source, "nf_flow_offload_ipv6_forward"))
     binary = tmp_path / "flowtable_ct"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
         "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable_ct.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

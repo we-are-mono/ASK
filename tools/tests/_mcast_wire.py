@@ -8,7 +8,6 @@ through lan_run_python(); a `lan` of None means this host, for a replica the
 orchestrator receives itself.
 """
 from __future__ import annotations
-
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -16,7 +15,6 @@ import os
 from pathlib import Path
 import sys
 import uuid
-
 from _topology import lan_run_python
 from mcast_wire_capture import multicast_mac, payload
 
@@ -136,7 +134,7 @@ def send(frames_to_send: list, iface: str | None = None, pps: int = 200) -> None
     """Inject on the orchestrator's DUT-facing wire, at a rate the software
     path keeps up with so a loss is never the CPU's."""
     from scapy.all import conf
-    sock = conf.L2socket(iface=iface or os.environ.get("ASK_WAN_INJECT_IF", "br0"))
+    sock = conf.L2socket(iface=iface or os.environ.get("ASK_WAN_INJECT_IF", ""))
     try:
         import time
         for frame in frames_to_send:

@@ -22,7 +22,6 @@ cases here rather than in each of them:
     bridge's snooping cannot decide whether they reach the DUT at all.
 """
 from __future__ import annotations
-
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 import inspect
@@ -33,18 +32,16 @@ from pathlib import Path
 import re
 import time
 import uuid
-
 import pytest
 import pytest_asyncio
-
 from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
 from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mroute_capture import MAGIC, multicast_mac, payload
-from test_flowtable_offload import ARTIFACTS, command, read, status_text, stop_boot_daemon
-from test_mcast_e2e import dut_mac, wan_source_address
-from test_mroute_capacity import _capture, _finish, _python
+from _flowtable_rig import (artifact_dir, command, read, status_text, stop_boot_daemon)
+from _mcast_e2e import (dut_mac, wan_source_address)
+from _mroute_capacity import (_capture, _finish, _python)
 
 COUNT, PPS, PORT = 256, 320, 47420
 # A second stream of the same (S,G), for a case that needs two told apart by
@@ -66,7 +63,7 @@ def wire_interface() -> str:
     configured = os.environ.get("ASK_WAN_WIRE_IF")
     if configured:
         return configured
-    inject = os.environ.get("ASK_WAN_INJECT_IF", "br0")
+    inject = os.environ.get("ASK_WAN_INJECT_IF", "")
     members = Path("/sys/class/net", inject, "brif")
     if not members.exists():
         return inject
@@ -235,8 +232,8 @@ class MulticastRig:
         return {**result, "before": before, "after": after}
 
     def record(self, name: str, data) -> None:
-        ARTIFACTS.mkdir(parents=True, exist_ok=True)
-        (ARTIFACTS / f"{name}.json").write_text(json.dumps(data, indent=2, default=str) + "\n")
+        artifact_dir().mkdir(parents=True, exist_ok=True)
+        (artifact_dir() / f"{name}.json").write_text(json.dumps(data, indent=2, default=str) + "\n")
 
 
 def streamed(window: dict, group: str, source: str | None = None,
@@ -540,8 +537,12 @@ async def silenced(lan, iface: str):
 
 
 async def dut_console(label: str) -> Console:
-    console = Console.target(log_path=str(ARTIFACTS / f"{label}-uart.log"))
-    await asyncio.to_thread(console.login, "root", None)
+    console = Console.target(log_path=str(artifact_dir() / f"{label}-uart.log"))
+    try:
+        await asyncio.to_thread(console.login, "root", None)
+    except BaseException:
+        console.close()
+        raise
     return console
 
 

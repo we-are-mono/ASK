@@ -2,10 +2,11 @@
 connection's reply tuple only while the conntrack is unconfirmed, never a
 hashed entry in place."""
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -36,13 +37,13 @@ def test_npt_conntrack(tmp_path):
     (tmp_path / "npt_production.inc").write_text(
         target(source, "ip6t_snpt_tg") + target(source, "ip6t_dnpt_tg"))
     binary = tmp_path / "npt_conntrack"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
         "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("npt_conntrack.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

@@ -20,12 +20,12 @@ from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _mcast_wire import capture, frames, new_config, send
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mcast_wire_capture import multicast_mac
-from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read, rig  # noqa: F401
-from test_flowtable_identity import set_mac
-from test_flowtable_service import managed_service, wait_service
-from test_flowtable_service_multicast import STOPS, acceleration_stopped, recover
-from test_mcast_e2e import dut_mac, mroute_line
-from test_mroute_capacity import _daemon
+from _flowtable_rig import (artifact_dir, WAN_IP, command, console_command, read)
+from _flowtable_identity import (set_mac)
+from _flowtable_service import (managed_service, wait_service)
+from _flowtable_service_multicast import (STOPS, acceleration_stopped, recover)
+from _mcast_e2e import (dut_mac, mroute_line)
+from _mroute_capacity import (_daemon)
 
 BRIDGE = 'br-ftmcast'
 LAN_VID, WAN_VID, IPTV_VID = 287, 288, 289
@@ -69,7 +69,7 @@ async def multicast_bridge_service(rig, request):
         # profile. The LAN listener is tagged; ordinary LAN traffic retains
         # a separate PVID. A trunk can opt into tagged WAN injection.
         # UART carries the address move so management is never needed midway.
-        with Console.target(log_path=str(ARTIFACTS / 'multicast-bridge-setup-uart.log')) as con:
+        with Console.target(log_path=str(artifact_dir() / 'multicast-bridge-setup-uart.log')) as con:
             await asyncio.to_thread(con.login, 'root', None)
             # IGMPv3/MLDv2 queries, though this case's listener reports v2:
             # the LAN VM's other interfaces hear them too, and one v2 query
@@ -151,7 +151,7 @@ except BaseException:
     finally:
         failures = []
         if bridge_created:
-            with Console.target(log_path=str(ARTIFACTS / 'multicast-bridge-cleanup-uart.log')) as con:
+            with Console.target(log_path=str(artifact_dir() / 'multicast-bridge-cleanup-uart.log')) as con:
                 await asyncio.to_thread(con.login, 'root', None)
                 async def undo(*argv):
                     try:
@@ -527,7 +527,7 @@ async def test_flowtable_service_multicast_bridge_yields_to_tc(multicast_bridge_
         await _split_window(r, group, source, label, 'refused-tc' if dropping else None)
 
     await _mdb(r, TARGET_LAN_IF, group)
-    with Console.target(log_path=str(ARTIFACTS / 'multicast-bridge-tc-uart.log')) as con:
+    with Console.target(log_path=str(artifact_dir() / 'multicast-bridge-tc-uart.log')) as con:
         await asyncio.to_thread(con.login, 'root', None)
 
         async def tc(*argv, check=True):
@@ -1081,7 +1081,7 @@ async def test_flowtable_service_multicast_bridge_route_count_across_a_bridge_bo
         settled = await _mfc_packets(r, group, source)
         assert settled >= FRAMING_COUNT, settled
 
-        with Console.target(log_path=str(ARTIFACTS / 'multicast-bridge-bounce-uart.log')) as con:
+        with Console.target(log_path=str(artifact_dir() / 'multicast-bridge-bounce-uart.log')) as con:
             await asyncio.to_thread(con.login, 'root', None)
             await console_command(con, 'ip', 'link', 'set', BRIDGE, 'down')
             await asyncio.sleep(2)
@@ -1159,7 +1159,7 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
     capture_if = r.multicast_send_if
     tree = False
     await _mdb(r, TARGET_WAN_IF, group)
-    with Console.target(log_path=str(ARTIFACTS / 'multicast-egress-uart.log')) as con:
+    with Console.target(log_path=str(artifact_dir() / 'multicast-egress-uart.log')) as con:
         await asyncio.to_thread(con.login, 'root', None)
 
         async def tc(*argv, check=True):

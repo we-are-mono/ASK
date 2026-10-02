@@ -8,11 +8,11 @@ two concurrent `lan.run` calls would interleave.
 """
 
 from __future__ import annotations
-
 import asyncio
 import json
-
+import shlex
 import pytest_asyncio
+from ask_orch.lifecycle import checked
 
 
 # ---- the global switch -----------------------------------------------------
@@ -77,12 +77,11 @@ async def pcap_cleanup_lan(lan):
     UART has direct shell access — single rm call suffices.
     """
     paths: list[str] = []
-    yield paths
-    if paths:
-        try:
-            lan.run("rm -f " + " ".join(paths), timeout=5)
-        except Exception:
-            pass
+    try:
+        yield paths
+    finally:
+        if paths:
+            checked(await asyncio.to_thread(lan.run, shlex.join(["rm", "-f", *paths]), 5))
 
 
 def spawn_parallel_tcpdumps(
@@ -151,11 +150,13 @@ async def capture_parallel_window(
 
     The caller injects AFTER this returns from its start grace, not before.
     """
-    spawn_parallel_tcpdumps(lan, ifaces, capfiles, bpf)
-    # Tiny grace so tcpdumps are listening before any traffic arrives.
-    await asyncio.sleep(0.4)
-    await asyncio.sleep(window_s)
-    kill_parallel_tcpdumps(lan, ifaces)
+    try:
+        spawn_parallel_tcpdumps(lan, ifaces, capfiles, bpf)
+        # Tiny grace so tcpdumps are listening before any traffic arrives.
+        await asyncio.sleep(0.4)
+        await asyncio.sleep(window_s)
+    finally:
+        kill_parallel_tcpdumps(lan, ifaces)
     # Tiny pause for the pcap writer to flush on TERM.
     await asyncio.sleep(0.2)
     return {

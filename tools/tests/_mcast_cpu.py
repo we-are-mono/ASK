@@ -8,12 +8,10 @@ and discovery traffic in bursts larger than a hardware case's whole budget.
 """
 
 from __future__ import annotations
-
 from contextlib import asynccontextmanager
 import json
-
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_offload import command
+from _flowtable_rig import (command)
 
 CPU_TABLE = "ask_mc_cpu"
 

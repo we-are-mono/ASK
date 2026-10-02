@@ -13,12 +13,12 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import by_key, peer
-from test_flowtable_failslab import same_service, slab_fault
-from test_flowtable_offload import ARTIFACTS, DPORT, Echo, command, console_command, read, rig  # noqa: F401
-from test_flowtable_selective_neighbour import hardware, keys, unchanged, warm
-from test_flowtable_service import FIRST, managed_service, supervision_status, wait_service
-from test_flowtable_service_vlan import attempts, balanced, denied, received
+from _flowtable_connections import (by_key, peer)
+from _flowtable_failslab import (same_service, slab_fault)
+from _flowtable_rig import (artifact_dir, DPORT, Echo, command, console_command, read)
+from _flowtable_selective_neighbour import (hardware, keys, unchanged, warm)
+from _flowtable_service import (FIRST, managed_service, supervision_status, wait_service)
+from _flowtable_service_vlan import (attempts, balanced, denied, received)
 
 NETNS, LAN_IF = "ask-ft-service-ipv6", "askftsv6"
 LAN_GATEWAY, NEXT_HOP = "fd42:6173:6:1::1", "fd42:6173:6:1::2"
@@ -104,7 +104,7 @@ except BaseException:
             except Exception as error:
                 failures.append(repr(error))
 
-        with Console.target(log_path=str(ARTIFACTS / "service-ipv6-cleanup-uart.log")) as con:
+        with Console.target(log_path=str(artifact_dir() / "service-ipv6-cleanup-uart.log")) as con:
             await asyncio.to_thread(con.login, "root", None)
             await attempt(console_command(con, "ip", "-6", "neigh", "del", NEXT_HOP, "dev", TARGET_LAN_IF, check=False))
             for agent, args in reversed(cleanup):

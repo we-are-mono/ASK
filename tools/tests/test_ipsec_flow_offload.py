@@ -33,7 +33,6 @@ import time
 
 import pytest
 
-from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 
 LAN_INNER = "198.18.88.2"
@@ -156,7 +155,7 @@ async def test_tunnelled_flow_is_steered_to_sec(
         cleanup.append(lambda: dut("ip", "xfrm", "state", "flush", check=False))
 
         os.system(f"ip route replace {LAN_INNER}/32 via "
-                  + os.environ.get("ASK_TARGET_IP", "10.0.0.62") + " >/dev/null 2>&1")
+                  + os.environ.get("ASK_TARGET_IP", "") + " >/dev/null 2>&1")
 
         before = await toenc(session, target_agent, TARGET_LAN_IF)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

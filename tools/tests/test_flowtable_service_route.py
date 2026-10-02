@@ -12,11 +12,11 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import by_key, peer
-from test_flowtable_offload import ARTIFACTS, command, console_command, read, rig  # noqa: F401
-from test_flowtable_selective_neighbour import hardware, keys, unchanged, warm
-from test_flowtable_service import FIRST, managed_service, service_status, supervision_status
-from test_flowtable_service_vlan import attempts, balanced, denied, received
+from _flowtable_connections import (by_key, peer)
+from _flowtable_rig import (artifact_dir, command, console_command, read)
+from _flowtable_selective_neighbour import (hardware, keys, unchanged, warm)
+from _flowtable_service import (FIRST, managed_service, service_status, supervision_status)
+from _flowtable_service_vlan import (attempts, balanced, denied, received)
 
 NETNS, LAN_IF = "ask-ft-service-route", "askftroute"
 ADDRESS, NETWORK = "172.29.87.2", "172.29.87.0/24"
@@ -99,7 +99,7 @@ except BaseException:
 
         # Independent UART can remove the owned routes even if a fault left
         # management unavailable. Remove all other state after service drain.
-        with Console.target(log_path=str(ARTIFACTS / "service-route-cleanup-uart.log")) as con:
+        with Console.target(log_path=str(artifact_dir() / "service-route-cleanup-uart.log")) as con:
             await asyncio.to_thread(con.login, "root", None)
             for agent, args in reversed(cleanup):
                 if agent is r.target:

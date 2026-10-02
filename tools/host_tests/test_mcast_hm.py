@@ -1,12 +1,13 @@
 """The multicast listener's header manipulations, and who owns their cursor."""
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
-from test_pppoe_hm import declaration, typedef
-from test_qos_lifecycle import function
+from _host_pppoe_hm import (declaration, typedef)
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 HEADER = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h"
@@ -17,17 +18,17 @@ def test_mcast_root_hop_semantics(tmp_path):
     definitions = source[source.index("#define TTL_HM_VALID"):source.index("#define MURAM_VIRT_TO_PHYS_ADDR")]
     (tmp_path / "mcast_root.inc").write_text(definitions + function(source, "fill_actions"))
     binary = tmp_path / "mcast_root"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-but-set-variable", "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-DVLAN_FILTER", "-DINCLUDE_ETHER_IFSTATS", "-I", str(tmp_path),
         str(Path(__file__).with_name("mcast_root.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30)
+    run_process([str(binary)], check=True, timeout=30)
 
 
 def test_bridge_mode_reaches_root_and_cannot_change_on_replace():
-    from test_mcast_backend import code
+    from _host_mcast_backend import (code)
     adapter = (ROOT / "cdx/ask_flowtable.c").read_text()
     encoder = (ROOT / "cdx/cdx_ehash.c").read_text()
     # Set on the key every group of a bridged flow is built on, whether it
@@ -60,7 +61,7 @@ def loose_declaration(source, name):
 
 def test_mcast_hm(tmp_path):
     # The shipped patch, so this does not depend on a previously built kernel.
-    subprocess.run([
+    run_process([
         "git", "apply", f"--include={HEADER}",
         str(ROOT / "patches/kernel/010-ask-fman-dpaa-ehash.patch"),
     ], cwd=tmp_path, check=True)
@@ -145,7 +146,7 @@ def test_mcast_hm(tmp_path):
             "cdx_mcast_group_mac", "cdx_mcast_compute_mac", "cdx_mc_check_group",
             "cdx_mc_check", "cdx_mc_describe", "cdx_mc_build_listeners")))
     binary = tmp_path / "mcast_hm"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
         # The tag array inside the opcode parameter is a packed member and the
@@ -163,7 +164,7 @@ def test_mcast_hm(tmp_path):
         "-DINCLUDE_VLAN_IFSTATS=1", "-DVLAN_FILTER=1",
         str(Path(__file__).with_name("mcast_hm.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -215,7 +216,7 @@ def test_only_a_bridged_root_gives_a_routed_copy_its_own_hop():
     group's mapped address -- never the matched pair, and never the port's own
     address the interface walk writes (mcast_hm.c runs the builder).
     """
-    from test_mcast_backend import code
+    from _host_mcast_backend import (code)
     body = code("cdx_mc_build_listeners")
     guard = "if (!grp->mac_keyed || listener->routed) {"
     assert guard in body

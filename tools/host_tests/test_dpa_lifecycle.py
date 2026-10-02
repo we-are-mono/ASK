@@ -1,5 +1,7 @@
 """Exercise DPA, FMC and FMLIB startup against fault-injected device ioctls."""
 
+from ask_orch.process import run_process
+
 from pathlib import Path
 import io
 import os
@@ -27,7 +29,7 @@ def vendor_tree(name, tmp_path):
     target.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive)) as tf:
         tf.extractall(target, filter="data")
-    subprocess.run(["git", "apply", "--whitespace=nowarn",
+    run_process(["git", "apply", "--whitespace=nowarn",
                     str(ROOT / f"patches/{name}/01-mono-ask-extensions.patch")],
                    cwd=target, check=True)
     return target
@@ -73,8 +75,8 @@ def test_dpa_lifecycle(tmp_path):
                     str(fmc / "source/fmc_exec.c"), str(fmlib / "src/fm_lib.c"),
                     str(persistence), "-lstdc++",
                     "-o", str(binary)])
-    subprocess.run(command, check=True)
-    result = subprocess.run([str(binary)], cwd=tmp_path, capture_output=True, text=True, timeout=180,
+    run_process(command, check=True)
+    result = run_process([str(binary)], cwd=tmp_path, capture_output=True, text=True, timeout=180,
                             env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                                  "UBSAN_OPTIONS": "halt_on_error=1"})
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
@@ -123,12 +125,12 @@ def test_ehash_teardown(tmp_path):
         + "static t_Error hash_ioctl(t_LnxWrpFmDev *p_LnxWrpFmDev, unsigned cmd, unsigned long arg, bool compat) { t_Error err = E_OK; switch (cmd) {\n"
         + wrapper[start:end] + "default: return E_INVALID_SELECTION; } return err; }\n")
     binary = tmp_path / "ehash_lifecycle"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie",
         "-Werror=implicit-function-declaration", "-I", str(tmp_path),
         str(Path(__file__).with_name("ehash_lifecycle.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

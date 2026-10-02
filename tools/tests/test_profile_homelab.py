@@ -60,19 +60,26 @@ import aiohttp
 import pytest
 import pytest_asyncio
 
+from ask_orch.capture import capture_window
+from ask_orch.commands import remove_qdisc
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import (DUT_IPV6_WAN, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6,
                        TopologyStack, dut_vlan_subif, kernel_rx_packets, lan_run,
                        lan_run_python)
-from test_flowtable_offload import (ARTIFACTS, STATUS_ROWS, Rig, command,
-                                    console_command, read)
-from test_flowtable_policy import CONFIG, apply, stop
-from test_flowtable_tunnel import (Shape, _dut_tunnel, _orchestrator_tunnel,
-                                   _outer_segment, _tunnel_text)
-from test_ipsec_inbound_flow_offload import crypto, sec_counter
+from _flowtable_rig import (artifact_dir, STATUS_ROWS, Rig, command, console_command, read)
+from _flowtable_policy import (CONFIG, apply, stop)
+from _flowtable_tunnel import (
+    Shape,
+    _dut_tunnel,
+    _orchestrator_tunnel,
+    _outer_segment,
+    _tunnel_text,
+)
+from _ipsec_inbound_flow_offload import (crypto, sec_counter)
 
 pytestmark = [
+    pytest.mark.requires("smcrouted"),
     # Every case runs on the loop the profile fixture was built on. Without
     # this the suite's default function loop scope gives each test a loop of
     # its own, and the fixture's loop -- the one holding the echo endpoints the
@@ -154,14 +161,13 @@ POLICE_OFFERED_MBIT = POLICE_RATE_MBIT * 3
 FIREWALL_TABLE = "ask_profile_home"
 TUNNEL_DEVICE = os.environ.get("ASK_PROFILE_HOME_TUNNEL", "fthome6o4")
 ORCH_IPV4 = os.environ.get("ASK_WAN_IP", "127.0.0.1")
-INJECT_IF = os.environ.get("ASK_WAN_INJECT_IF", "br0")
+INJECT_IF = os.environ.get("ASK_WAN_INJECT_IF", "")
 
 
 def orchestrator_source():
     """The orchestrator's WAN address: the multicast source, the IPsec outer
-    peer and the DUT's alternate default gateway. The conftest default is stale
-    on most benches, so everything that needs it reads it from here."""
-    return os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
+    peer and the DUT's alternate default gateway, from the bench configuration."""
+    return os.environ.get("ASK_WAN_IPERF_IP", "")
 
 
 # ---- reading the adapter ---------------------------------------------------
@@ -503,10 +509,9 @@ async def _bridge_lan(ctx, stack):
     await dut("ip", "link", "del", BRIDGE, check=False)
     await dut("ip", "link", "add", "name", BRIDGE, "type", "bridge")
 
-    async def _drop_bridge():
-        await dut("ip", "link", "del", BRIDGE, check=False)
-        await dut("ip", "addr", "replace", original, "dev", TARGET_LAN_IF, check=False)
-    stack.push(_drop_bridge)
+    # Restore the address even if deleting the bridge fails.
+    stack.push(lambda: dut("ip", "addr", "replace", original, "dev", TARGET_LAN_IF))
+    stack.push(lambda: dut("ip", "link", "del", BRIDGE))
 
     await dut("ip", "link", "set", BRIDGE, "type", "bridge", "vlan_filtering", "1",
               "vlan_default_pvid", "0")
@@ -681,9 +686,11 @@ async def _peer_xfrm_add(ctx, kind, identity, *parameters):
 async def _clear_peer_ipsec(ctx):
     # The WAN host is shared. Remove only states and policies this fixture
     # successfully created, never flush its XFRM tables.
-    for kind, identity in reversed(ctx.ipsec_peer_objects):
-        await command(ctx.wan, ctx.session, "ip", "xfrm", kind, "delete",
-                      *identity, check=False)
+    cleanup = TopologyStack()
+    for kind, identity in ctx.ipsec_peer_objects:
+        cleanup.push(lambda k=kind, i=identity: command(
+            ctx.wan, ctx.session, "ip", "xfrm", k, "delete", *i))
+    await cleanup.teardown("WAN peer XFRM")
     ctx.ipsec_peer_objects.clear()
 
 
@@ -850,19 +857,10 @@ async def _smcroute(ctx, *oifs):
     """
     source, group = orchestrator_source(), GROUP
     if not oifs:
-        # Teardown, and the one caller that must not raise: `check=False` only
-        # skips the rc assertion, while a binary the image does not have comes
-        # back as HTTP 501 and aiohttp raises that. On an image without
-        # smcroute this is reached from the fixture's finally, where an
-        # exception would skip every remaining undo and leave the LAN port
-        # enslaved with no address.
         if getattr(ctx, "smcrouted", False):
-            for argv in (["smcroutectl", "remove", TARGET_WAN_IF, source, group],
-                         ["killall", "smcrouted"]):
-                try:
-                    await command(ctx.target, ctx.session, *argv, check=False)
-                except aiohttp.ClientResponseError:
-                    pass
+            # Stopping the daemon removes its routes too. Failure reaches the
+            # fixture's aggregate cleanup report without skipping other undo.
+            await command(ctx.target, ctx.session, "killall", "smcrouted")
             ctx.smcrouted = False
             await asyncio.sleep(1.0)
         return
@@ -1062,7 +1060,7 @@ async def _watch_routed(ctx, clients, seconds, label):
 # ---- the fixture -----------------------------------------------------------
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def homelab(target_agent, lan):
+async def homelab(target_agent, lan, request, dmesg_allowlist):
     """The whole homelab profile, built once for the file.
 
     Module-scoped deliberately: the build is a bridge that takes the LAN port,
@@ -1081,7 +1079,8 @@ async def homelab(target_agent, lan):
     deliberately off the WAN segment -- which is what gives the default-route
     lifecycle case something to move.
     """
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session, capture_window(
+            target_agent, session, request.node.nodeid, dmesg_allowlist, name="profile-kernel"):
         ctx = Profile()
         ctx.target, ctx.session, ctx.lan = target_agent, session, lan
         ctx.wan = Agent("wan", f"http://{ORCH_IPV4}:9110")
@@ -1095,7 +1094,7 @@ async def homelab(target_agent, lan):
         stack = TopologyStack()
         cleanup, endpoints = [], []
         ctx.endpoints = endpoints
-        console = Console.target(log_path=str(ARTIFACTS / "profile-home-uart.log"))
+        console = Console.target(log_path=str(artifact_dir(request.node.nodeid) / "profile-home-uart.log"))
         try:
             initial = await ctx.state()
             ctx.baseline_errors = initial["errors"]
@@ -1302,7 +1301,7 @@ async def homelab(target_agent, lan):
                 transport.close()
             failures = []
 
-            async def undo(step, label):
+            async def undo(step, label, timeout=60):
                 """Every undo runs, whatever the one before it did.
 
                 A teardown step that raises takes the whole rest of the cleanup
@@ -1314,33 +1313,34 @@ async def homelab(target_agent, lan):
                 looks at `check`.
                 """
                 try:
-                    await step()
-                except Exception as error:
+                    async with asyncio.timeout(timeout):
+                        await step()
+                except (Exception, pytest.fail.Exception) as error:
                     failures.append(f"{label}: {error}")
 
-            async def target(*argv):
-                await command(ctx.target, ctx.session, *argv, check=False)
+            async def target(*argv, check=True):
+                return await command(ctx.target, ctx.session, *argv, check=check)
 
             await undo(lambda: stop(console), "ask-flowtable stop")
             # Belt and braces: the multicast case stops its own daemon, and a
             # case that failed part-way through may not have.
             await undo(lambda: _smcroute(ctx), "smcroute")
-            await undo(lambda: console_command(console, "tc", "qdisc", "del", "dev",
-                                               TARGET_WAN_IF, "clsact", check=False,
-                                               timeout=30), "clsact")
+            await undo(lambda: remove_qdisc(console, TARGET_WAN_IF, "clsact", "clsact"), "qdisc")
             await undo(lambda: target("ip", "xfrm", "policy", "flush"), "xfrm policy")
             await undo(lambda: target("ip", "xfrm", "state", "flush"), "xfrm state")
-            await undo(lambda: target("ip", "route", "del", f"{IPSEC_INNER}/32"),
-                       "inner route")
-            await undo(lambda: _clear_peer_ipsec(ctx), "WAN peer xfrm")
+            async def remove_inner_route():
+                await target("ip", "route", "del", f"{IPSEC_INNER}/32", check=False)
+                routes = await target("ip", "-j", "route", "show", "exact", f"{IPSEC_INNER}/32")
+                assert not json.loads(routes["stdout"]), routes
+
+            await undo(remove_inner_route, "inner route")
+            await undo(lambda: _clear_peer_ipsec(ctx), "WAN peer xfrm", timeout=None)
             await undo(lambda: target("conntrack", "-F"), "conntrack")
             for agent, argv in reversed(cleanup):
-                await undo(lambda a=agent, v=argv: command(a, ctx.session, *v,
-                                                           check=False), " ".join(argv))
-            await undo(lambda: stack.teardown("profile-homelab"), "topology")
+                await undo(lambda a=agent, v=argv: command(a, ctx.session, *v), " ".join(argv))
+            await undo(lambda: stack.teardown("profile-homelab"), "topology", timeout=None)
             try:
-                await undo(lambda: console_command(console, "rm", "-f", CONFIG,
-                                                   check=False), "config")
+                await undo(lambda: console_command(console, "rm", "-f", CONFIG), "config")
                 # Last, because everything above drives the console.
                 if getattr(ctx, "printk", None):
                     await undo(lambda: target("sysctl", "-w",

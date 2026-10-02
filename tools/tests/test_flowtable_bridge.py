@@ -27,7 +27,7 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        dut_vlan_subif, lan_run, lan_vlan_subif)
-from test_flowtable_offload import (DPORT, Echo, SPORT, WAN_IP, Rig, command, read)
+from _flowtable_rig import (DPORT, Echo, SPORT, WAN_IP, Rig, command, read)
 
 BRIDGE = "br-ft"
 # Claimed in _topology.py's VLAN ID conventions block. 273 carries the access

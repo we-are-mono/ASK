@@ -4,41 +4,13 @@ Run without the board fixtures:
     pytest tools/host_tests/test_qos_lifecycle.py
 """
 
+from ask_orch.process import run_process
+
+from _host_qos_lifecycle import (ROOT, function)
+
 from pathlib import Path
 import os
-import re
 import shutil
-import subprocess
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def function(source, name):
-    # An explicit list of return types rather than "anything": it is what
-    # keeps a forward declaration or a call site from being mistaken for the
-    # definition. Widen it when a new one is needed.
-    match = re.search(r"^(?:static )?(?:inline )?(?:int\s+|void |bool |U8 |U16 |u8 |u16 |u32 |u64 |uint32_t |"
-                      r"unsigned int |unsigned long |size_t |const char \*|"
-                      r"struct qman_fq \*|struct en_exthash_tbl_entry ?\* ?|"
-                      r"struct net_device ?\* ?|struct ft_mc_group ?\* ?|"
-                      r"struct ft_mc_flow ?\* ?|const struct br_ip ?\* ?|"
-                      r"const struct ft_mc_route ?\* ?|"
-                      r"struct ft_mr_group ?\* ?|struct ft_mr_event ?\* ?|"
-                      r"struct xfrm_state ?\* ?|struct ft_ipsec_watch ?\* ?|const struct xfrmdev_ops ?\* ?|"
-                      r"struct ft_ipsec_retirement ?\* ?|"
-                      r"struct rtable ?\* ?|struct tcf_block ?\* ?|"
-                      r"enum ft_mr_state |enum qman_cb_dqrr_result )"
-                      # __init/__exit sit between the return type and the name.
-                      r"(?:__init |__exit )?"
-                      + name + r"\([^;]*?\)\s*\{", source, re.M)
-    assert match, name
-    start = match.start()
-    end = match.end()
-    depth = 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[start:end] + "\n"
 
 
 def test_qos_lifecycle(tmp_path):
@@ -76,13 +48,13 @@ def test_qos_lifecycle(tmp_path):
         ])
     )
     binary = tmp_path / "qos_lifecycle"
-    subprocess.run([
+    run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-fsanitize=address,undefined",
         "-fno-omit-frame-pointer", "-fno-pie", "-no-pie",
         "-Werror=implicit-function-declaration", "-I", str(tmp_path),
         str(Path(__file__).with_name("qos_lifecycle.c")), "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], text=True, capture_output=True,
+    result = run_process([str(binary)], text=True, capture_output=True,
                             env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                                  "UBSAN_OPTIONS": "halt_on_error=1"}, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -108,12 +80,12 @@ def test_qos_sdk_lifecycle(tmp_path):
     )
     compiler = os.environ.get("CC", "cc")
     binary = tmp_path / "ceetm_lfq"
-    subprocess.run([
+    run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("ceetm_lfq.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True,
+    run_process([str(binary)], check=True,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"}, timeout=10)
 
@@ -133,12 +105,12 @@ def test_qos_sdk_cq_pop(tmp_path):
         + function(source, "qman_ceetm_cq_peek_pop_xsfdrread")
         + function(source, "qman_ceetm_cq_pop"))
     binary = tmp_path / "ceetm_cq"
-    subprocess.run([
+    run_process([
         os.environ.get("CC", "cc"), "-std=gnu11", "-g", "-O1",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-Werror=implicit-function-declaration", "-I", str(tmp_path),
         str(Path(__file__).with_name("ceetm_cq.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=10,
+    run_process([str(binary)], check=True, timeout=10,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

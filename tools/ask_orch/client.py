@@ -42,7 +42,7 @@ ASK_KMEMLEAK_FILTER = [
 @dataclass
 class Agent:
     name: str           # human label, e.g. "target", "lan", "wan"
-    base_url: str       # e.g. "http://10.0.0.62:9110"
+    base_url: str       # e.g. "http://dut.example:9110"
 
     async def health(self, session: aiohttp.ClientSession) -> dict:
         async with session.get(f"{self.base_url}/health", timeout=aiohttp.ClientTimeout(total=5)) as r:
@@ -57,12 +57,22 @@ class Agent:
         a live frame-queue query. Ask for it only where the deltas are read;
         the splat window itself does not need them."""
         body = {"ifaces": ifaces or [], "counters": counters}
-        async with session.post(f"{self.base_url}/capture-start", json=body) as r:
+        async with session.post(f"{self.base_url}/capture-start", json=body,
+                                timeout=aiohttp.ClientTimeout(total=30)) as r:
             r.raise_for_status()
-            return (await r.json())["capture_id"]
+            result = await r.json()
+            assert result.get("complete") is True, ("agent lacks reliable capture; redeploy", result)
+            return result["capture_id"]
 
     async def capture_stop(self, session: aiohttp.ClientSession, cap_id: str) -> dict:
-        async with session.post(f"{self.base_url}/capture-stop/{cap_id}") as r:
+        async with session.post(f"{self.base_url}/capture-stop/{cap_id}",
+                                timeout=aiohttp.ClientTimeout(total=30)) as r:
+            r.raise_for_status()
+            return await r.json()
+
+    async def boot_log(self, session):
+        async with session.post(f"{self.base_url}/dmesg-delta", json={},
+                                timeout=aiohttp.ClientTimeout(total=30)) as r:
             r.raise_for_status()
             return await r.json()
 
@@ -138,7 +148,7 @@ class Agent:
             body["uid"] = int(uid)
         if userns:
             body["userns"] = True
-        async with session.post(f"{self.base_url}/netlink/send", json=body) as r:
+        async with session.post(f"{self.base_url}/netlink/send", json=body, timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000 + 5)) as r:
             r.raise_for_status()
             return await r.json()
 
@@ -172,7 +182,7 @@ class Agent:
             body["userns"] = True
         if drop_cap_net_admin:
             body["drop_cap_net_admin"] = True
-        async with session.post(f"{self.base_url}/ioctl/send", json=body) as r:
+        async with session.post(f"{self.base_url}/ioctl/send", json=body, timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000 + 5)) as r:
             r.raise_for_status()
             return await r.json()
 
@@ -186,6 +196,7 @@ class Agent:
         async with session.post(
             f"{self.base_url}/exec",
             json={"argv": argv, "timeout_ms": timeout_ms},
+            timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000 + 5),
         ) as r:
             r.raise_for_status()
             return await r.json()
@@ -205,7 +216,7 @@ class Agent:
         primary consumer.
         """
         body = {"path": path, "max_bytes": int(max_bytes)}
-        async with session.post(f"{self.base_url}/fs/read", json=body) as r:
+        async with session.post(f"{self.base_url}/fs/read", json=body, timeout=aiohttp.ClientTimeout(total=30)) as r:
             r.raise_for_status()
             return await r.json()
 
@@ -225,7 +236,7 @@ class Agent:
         }
         if uid is not None:
             body["uid"] = int(uid)
-        async with session.post(f"{self.base_url}/fs/write", json=body) as r:
+        async with session.post(f"{self.base_url}/fs/write", json=body, timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000 + 5)) as r:
             r.raise_for_status()
             return await r.json()
 
@@ -235,4 +246,4 @@ class Agent:
 # LAN-side scripting is driven by Console.lan() (libvirt PTY) instead.
 _DEFAULT_PORT = "9110"
 
-TARGET = Agent("target", f"http://{os.environ.get('ASK_TARGET_IP', '10.0.0.62')}:{_DEFAULT_PORT}")
+TARGET = Agent("target", f"http://{os.environ.get('ASK_TARGET_IP', '')}:{_DEFAULT_PORT}")

@@ -1,12 +1,12 @@
 """Compile the ingress-police offload against a stub kernel and exercise it."""
 
+from ask_orch.process import run_process
+
 import os
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -55,13 +55,13 @@ def test_police_offload(tmp_path):
                  source.index("static int cdx_police_profile_get")]
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "police"
-    subprocess.run([
+    run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("police.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

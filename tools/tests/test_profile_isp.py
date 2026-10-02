@@ -72,21 +72,33 @@ import aiohttp
 import pytest
 import pytest_asyncio
 
+from ask_orch.capture import capture_window
+from ask_orch.commands import remove_qdisc
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from ask_orch.counters import kernel_tx_packets
 from _gated_tcp import GatedTcp
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        dut_vlan_subif, kernel_rx_packets, lan_run_python)
-from test_flowtable_offload import (ARTIFACTS, STATUS_ROWS, Rig, assert_undisturbed, command,
-                                    console_command, read)
-from test_flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6,
-                                  INNER_REMOTE6, SESSION_MTU, SourceEcho, WAN_VID,
-                                  _dial, _hangup, _server_start, _server_stop,
-                                  _session_identity, _session_text)
-from test_flowtable_policy import CONFIG, apply, stop
+from _flowtable_rig import (artifact_dir, STATUS_ROWS, Rig, assert_undisturbed, command, console_command, read)
+from _flowtable_pppoe import (
+    INNER_LOCAL,
+    INNER_LOCAL6,
+    INNER_REMOTE6,
+    SESSION_MTU,
+    SourceEcho,
+    WAN_VID,
+    _dial,
+    _hangup,
+    _server_start,
+    _server_stop,
+    _session_identity,
+    _session_text,
+)
+from _flowtable_policy import (CONFIG, apply, stop)
 
 pytestmark = [
+    pytest.mark.requires("pppd", "smcrouted"),
     # Every case runs on the loop the profile fixture was built on. Without
     # this the suite's default function loop scope gives each test a loop of
     # its own, and the fixture's loop -- the one holding the echo endpoints the
@@ -172,15 +184,14 @@ ORCH_IPV4 = os.environ.get("ASK_WAN_IP", "127.0.0.1")
 # Where the multicast stream is put on the wire: the orchestrator's own bridge
 # on the shared WAN segment, which delivers untagged frames to the DUT's WAN
 # port. The switch between them does not trunk the IPTV VLAN today.
-INJECT_IF = os.environ.get("ASK_WAN_INJECT_IF", "br0")
+INJECT_IF = os.environ.get("ASK_WAN_INJECT_IF", "")
 IPTV_TAGGED = os.environ.get("ASK_PROFILE_IPTV_TAGGED") == "1"
 
 
 def orchestrator_source():
     """The source address the stream carries, and the one the classifier keys
-    on. The conftest default is stale on most benches; both the injector and the
-    consumer's source filter read it from here so they cannot disagree."""
-    return os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
+    on. The injector and consumer read the same configured traffic endpoint."""
+    return os.environ.get("ASK_WAN_IPERF_IP", "")
 
 
 # ---- reading the adapter ---------------------------------------------------
@@ -856,10 +867,9 @@ async def _bridge_lan(ctx, stack):
               "mcast_snooping", "1", "mcast_querier", "1",
               "mcast_igmp_version", "3", "mcast_mld_version", "2")
 
-    async def _drop_bridge():
-        await dut("ip", "link", "del", BRIDGE, check=False)
-        await dut("ip", "addr", "replace", original, "dev", TARGET_LAN_IF, check=False)
-    stack.push(_drop_bridge)
+    # Restore the address even if deleting the bridge fails.
+    stack.push(lambda: dut("ip", "addr", "replace", original, "dev", TARGET_LAN_IF))
+    stack.push(lambda: dut("ip", "link", "del", BRIDGE))
 
     await dut("ip", "link", "set", BRIDGE, "type", "bridge", "vlan_filtering", "1",
               "vlan_default_pvid", "0")
@@ -946,29 +956,30 @@ async def _bridge_wan_for_iptv(ctx, stack):
     # its membership reports from.
     steps.append(["ip", "addr", "add", f"{IPTV_GATEWAY}/24", "dev", iptv_dev])
 
-    async def _restore():
+    async def clear_management_neighbour():
         # This host's own cache first, and on this host, because it is the one
         # machine that is always reachable from here. Every step after it runs
         # on a console and may fail; if the repin outlived them it would send
         # this host's frames to the bridge's address after the bridge was gone,
         # which is a bench that cannot be recovered over the network at all.
-        await command(ctx.wan, ctx.session, "ip", "neigh", "del",
-                      management.split("/")[0], "dev", ctx.wan_if, check=False)
-        undo = [["ip", "link", "del", iptv_dev]] if iptv_dev != mgmt_dev else []
-        undo += [["ip", "link", "del", mgmt_dev],
-                 ["ip", "link", "set", TARGET_WAN_IF, "nomaster"],
-                 ["ip", "addr", "replace", management, "dev", TARGET_WAN_IF]]
-        if gateway:
-            undo.append(["ip", "route", "replace", "default", "via", gateway,
-                         "dev", TARGET_WAN_IF])
-        for argv in undo:
-            await console_command(console, *argv, check=False, timeout=30)
+        await command(ctx.wan, ctx.session, "ip", "neigh", "flush",
+                      "to", management.split("/")[0], "dev", ctx.wan_if)
+
+    undo = [["ip", "link", "del", iptv_dev]] if iptv_dev != mgmt_dev else []
+    undo += [["ip", "link", "del", mgmt_dev],
+             ["ip", "link", "set", TARGET_WAN_IF, "nomaster"],
+             ["ip", "addr", "replace", management, "dev", TARGET_WAN_IF]]
+    if gateway:
+        undo.append(["ip", "route", "replace", "default", "via", gateway,
+                     "dev", TARGET_WAN_IF])
 
     # Pushed before the first step rather than after the last. A step that fails
     # halfway leaves the management address on a device that cannot receive, and
     # the agent is reached on that address: there would be no way back except a
     # reboot, and every remaining test in the run would fail on the way there.
-    stack.push(_restore)
+    for argv in reversed(undo):
+        stack.push(lambda argv=argv: console_command(console, *argv, timeout=30))
+    stack.push(clear_management_neighbour)
     for argv in steps:
         await console_command(console, *argv, timeout=30)
 
@@ -1095,7 +1106,7 @@ async def _reachable(ctx, client, peer, attempts=25):
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def isp(target_agent, lan):
+async def isp(target_agent, lan, request, dmesg_allowlist):
     """The whole ISP profile, built once for the file.
 
     Module-scoped deliberately. The build is a PPPoE dial, a bridge that takes
@@ -1114,7 +1125,8 @@ async def isp(target_agent, lan):
     port is a configuration change the adapter answers with full invalidation.
     And the WAN port joins the bridge before the policy, for the same reason.
     """
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session, capture_window(
+            target_agent, session, request.node.nodeid, dmesg_allowlist, name="profile-kernel"):
         ctx = Profile()
         ctx.target, ctx.session, ctx.lan = target_agent, session, lan
         ctx.wan = Agent("wan", f"http://{ORCH_IPV4}:9110")
@@ -1123,7 +1135,7 @@ async def isp(target_agent, lan):
         stack = TopologyStack()
         cleanup, endpoints = [], []
         server = None
-        console = Console.target(log_path=str(ARTIFACTS / "profile-isp-uart.log"))
+        console = Console.target(log_path=str(artifact_dir(request.node.nodeid) / "profile-isp-uart.log"))
         try:
             initial = await ctx.state()
             ctx.baseline_errors = initial["errors"]
@@ -1253,7 +1265,7 @@ async def isp(target_agent, lan):
                 transport.close()
             failures = []
 
-            async def undo(step, label):
+            async def undo(step, label, timeout=60):
                 """Every undo runs, whatever the one before it did.
 
                 A teardown step that raises takes the whole rest of the cleanup
@@ -1264,30 +1276,32 @@ async def isp(target_agent, lan):
                 output marker before it ever looks at `check`.
                 """
                 try:
-                    await step()
-                except Exception as error:
+                    async with asyncio.timeout(timeout):
+                        await step()
+                except (Exception, pytest.fail.Exception) as error:
                     failures.append(f"{label}: {error}")
 
-            async def target(*argv):
-                await command(ctx.target, ctx.session, *argv, check=False)
+            async def target(*argv, check=True):
+                return await command(ctx.target, ctx.session, *argv, check=check)
 
             await undo(lambda: stop(console), "ask-flowtable stop")
+            async def remove_table(table):
+                await target("nft", "delete", "table", "inet", table, check=False)
+                remaining = await target("nft", "-j", "list", "tables")
+                assert not any(entry.get("table", {}).get("name") == table
+                               for entry in json.loads(remaining["stdout"])["nftables"]), remaining
+
             for table in (QOS_TABLE, NAT_TABLE):
-                await undo(lambda t=table: target("nft", "delete", "table", "inet", t),
-                           f"nft {table}")
-            await undo(lambda: console_command(console, "tc", "qdisc", "del", "dev",
-                                               TARGET_WAN_IF, "root", check=False,
-                                               timeout=30), "qdisc")
+                await undo(lambda t=table: remove_table(t), f"nft {table}")
+            await undo(lambda: remove_qdisc(console, TARGET_WAN_IF, "root", "htb"), "qdisc")
             await undo(lambda: target("conntrack", "-F"), "conntrack")
             for agent, argv in reversed(cleanup):
-                await undo(lambda a=agent, v=argv: command(a, ctx.session, *v,
-                                                           check=False), " ".join(argv))
-            await undo(lambda: stack.teardown("profile-isp"), "topology")
+                await undo(lambda a=agent, v=argv: command(a, ctx.session, *v), " ".join(argv))
+            await undo(lambda: stack.teardown("profile-isp"), "topology", timeout=None)
             if server:
                 _server_stop(server)
             try:
-                await undo(lambda: console_command(console, "rm", "-f", CONFIG,
-                                                   check=False), "config")
+                await undo(lambda: console_command(console, "rm", "-f", CONFIG), "config")
                 # Last, because everything above drives the console.
                 if getattr(ctx, "printk", None):
                     await undo(lambda: target("sysctl", "-w",

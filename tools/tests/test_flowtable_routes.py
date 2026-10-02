@@ -10,10 +10,10 @@ import pytest_asyncio
 
 from ask_orch.client import Agent
 from _topology import FULL_FRAME, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import by_key, peer
-from test_flowtable_offload import DPORT, SPORT, TABLE, WAN_IP, command, read, rig  # noqa: F401
-from test_flowtable_selective_neighbour import keys as peer_keys, unchanged as peer_unchanged
-from test_flowtable_selective_neighbour import warm as peer_warm, hardware as peer_hardware
+from _flowtable_connections import (by_key, peer)
+from _flowtable_rig import (DPORT, SPORT, TABLE, WAN_IP, command, read)
+from _flowtable_selective_neighbour import (keys as peer_keys, unchanged as peer_unchanged)
+from _flowtable_selective_neighbour import (warm as peer_warm, hardware as peer_hardware)
 
 PEERS = [dict(netns="ask-ft-route-a", iface="askftra", lan="198.18.30.2", mac="02:9d:99:b2:33:c1"),
          dict(netns="ask-ft-route-b", iface="askftrb", lan="198.18.31.2", mac="02:9d:99:b2:33:d1")]

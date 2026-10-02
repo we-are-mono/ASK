@@ -18,68 +18,23 @@ update reaches the driver.
 """
 from __future__ import annotations
 
+from _flowtable_service_ipsec_natt import LOCAL, MARK, OTHER_MARK, PEER
+
+from _flowtable_service_ipsec_natt import (Encapsulated, NATT, PORTS, REQID, encapsulations, natt)
+
 import asyncio
-from collections import Counter
-from pathlib import Path
 import re
 import secrets
-import struct
 
 import pytest
 
 from _ipsec_helpers import endpoints_down, endpoints_up
 from _topology import TARGET_WAN_IF
-from test_flowtable_connections import peer
-from test_flowtable_offload import ARTIFACTS, WAN_IP, command, rig  # noqa: F401
-from test_flowtable_selective_neighbour import warm
-from test_flowtable_service_ipsec import (INNER, Transform, flows_for, hardware, ipsec_service,  # noqa: F401
-                                          negative, plaintext_probe)
-from test_flowtable_service_ipsec_replay import sa_state
-from test_flowtable_tunnel import Capture
-
-# (DUT port, peer port). Neither is the other byte-swapped (0x1194 against
-# 0x7918), so a swap of either kind lands on a port nothing listens on.
-PORTS = (4500, 31000)
-NATT = Transform(encap=PORTS)
-
-
-class Encapsulated(Capture):
-    """ESP between the DUT and the peer in both directions, bare or in UDP,
-    taken below the WAN host's bridge."""
-    snaplen = 64
-
-    def __init__(self, r, label):
-        self.path = ARTIFACTS / (label + ".pcap")
-        self.interface = r.ipsec_wire_if
-        outer = r.ipsec.outer
-        self.filter = (f"(udp or ip proto 50) and ((src host {outer} and dst host {WAN_IP}) or "
-                       f"(src host {WAN_IP} and dst host {outer}))")
-
-
-def encapsulations(path, spis):
-    """How each SA's frames were carried: a count per (SPI, source MAC,
-    encapsulation), where encapsulation is the UDP port pair or "esp" for a
-    bare ESP frame. UDP whose payload does not start with one of `spis` is
-    something else between the two hosts and is ignored."""
-    seen, data, offset = Counter(), Path(path).read_bytes(), 24
-    while offset + 16 <= len(data):
-        length = struct.unpack_from("<I", data, offset + 8)[0]
-        frame = data[offset + 16:offset + 16 + length]
-        offset += 16 + length
-        l3 = 18 if frame[12:14] == b"\x81\x00" else 14
-        if len(frame) < l3 + 20:
-            continue
-        l4 = l3 + (frame[l3] & 0xF) * 4
-        source = frame[6:12].hex(":")
-        if frame[l3 + 9] == 50 and len(frame) >= l4 + 4:
-            spi, how = struct.unpack_from("!I", frame, l4)[0], "esp"
-        elif frame[l3 + 9] == 17 and len(frame) >= l4 + 12:
-            spi, how = struct.unpack_from("!I", frame, l4 + 8)[0], struct.unpack_from("!HH", frame, l4)
-        else:
-            continue
-        if spi in spis:
-            seen[(spi, source, how)] += 1
-    return seen
+from _flowtable_connections import (peer)
+from _flowtable_rig import (command)
+from _flowtable_selective_neighbour import (warm)
+from _flowtable_service_ipsec import (INNER, Transform, flows_for, hardware, negative, plaintext_probe)
+from _flowtable_service_ipsec_replay import (sa_state)
 
 
 @pytest.mark.parametrize("ipsec_service", [NATT], ids=["dut4500-peer31000"], indirect=True)
@@ -124,12 +79,6 @@ async def test_flowtable_service_ipsec_natt(ipsec_service):
         assert after[direction]["packets"] - before[direction]["packets"] >= 256, (direction, before, after)
 
 
-# A documentation-range pair of its own. Nothing is sent: the peer does not
-# exist, and its neighbour entry is invented.
-LOCAL, PEER = "198.18.104.1", "198.18.104.2"
-REQID = "49306"
-
-
 async def test_ipsec_natt_transport_refused(aiohttp_session, target_agent, splat_window):
     """Transport-mode ESP-in-UDP is refused with the adapter's reason, in both
     directions, and leaves no state. The same SA in tunnel mode installs,
@@ -164,15 +113,6 @@ async def test_ipsec_natt_transport_refused(aiohttp_session, target_agent, splat
         for identity in identities:
             await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "delete", *identity, check=False)
         await endpoints_down(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=LOCAL, peer=PEER)
-
-
-# Output marks for the update test. Nothing is sent over the SA; its peer
-# still has to route by the WAN port with the mark, as it does on the bench.
-MARK, OTHER_MARK = "0x10", "0x20"
-
-
-def natt(sport, dport):
-    return ["encap", "espinudp", str(sport), str(dport), "0.0.0.0"]
 
 
 async def test_ipsec_natt_update_keeps_hardware_ports(aiohttp_session, target_agent, splat_window):

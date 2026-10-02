@@ -60,11 +60,11 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
-from test_flowtable_offload import ARTIFACTS, WAN_IP, command
-from test_flowtable_qos import dut_ping
-from test_flowtable_service_ipsec import xfrm
-from test_flowtable_service_ipsec_replay import xfrm_mib
-from test_ipsec_inbound_flow_offload import sec_counter
+from _flowtable_rig import (artifact_dir, WAN_IP, command)
+from _flowtable_qos import (dut_ping)
+from _flowtable_service_ipsec import (xfrm)
+from _flowtable_service_ipsec_replay import (xfrm_mib)
+from _ipsec_inbound_flow_offload import (sec_counter)
 
 pytestmark = [
     # The fixture's aiohttp session belongs to the loop that built it, and the
@@ -295,8 +295,8 @@ class Interop:
             await asyncio.sleep(0.25)
 
     def record(self, name, data):
-        ARTIFACTS.mkdir(parents=True, exist_ok=True)
-        (ARTIFACTS / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
+        artifact_dir().mkdir(parents=True, exist_ok=True)
+        (artifact_dir() / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
@@ -364,7 +364,7 @@ async def interop(target_agent):
             for agent, argv, undo in steps:
                 await command(agent, session, *argv)
                 cleanup.append((agent, undo))
-            console = Console.target(log_path=str(ARTIFACTS / "ipsec-interop-uart.log"))
+            console = Console.target(log_path=str(artifact_dir() / "ipsec-interop-uart.log"))
             await asyncio.to_thread(console.login, "root", None)
             ctx.console = console
             yield ctx

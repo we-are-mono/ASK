@@ -1,5 +1,7 @@
 """A178: execute the patched driver's scan paths with competing completions."""
 
+from ask_orch.process import run_process
+
 import io
 import os
 from pathlib import Path
@@ -7,7 +9,7 @@ import re
 import subprocess
 import tarfile
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -23,7 +25,7 @@ def test_scan_lifecycle(tmp_path):
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(tmp_path, filter="data")
     for patch in re.findall(r"file://(\S+\.patch)", recipe.read_text()):
-        subprocess.run(["git", "apply", "--whitespace=error",
+        run_process(["git", "apply", "--whitespace=error",
                         str(recipe.parent / "files" / patch)],
                        cwd=tmp_path, check=True)
 
@@ -60,7 +62,7 @@ def test_scan_lifecycle(tmp_path):
     assert "evt->scan_generation" in function(main, "woal_evt_work_queue")
 
     binary = tmp_path / "scan_lifecycle"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-Wno-sign-compare", "-Wno-pointer-sign",
@@ -68,7 +70,7 @@ def test_scan_lifecycle(tmp_path):
         "-I", str(tmp_path), str(Path(__file__).with_name("scan_lifecycle.c")),
         "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], check=True, timeout=60,
+    result = run_process([str(binary)], check=True, timeout=60,
                             text=True, capture_output=True, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",

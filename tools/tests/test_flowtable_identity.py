@@ -1,70 +1,20 @@
 """Physical MAC and name changes preserve Linux ownership and current rewrites."""
 from __future__ import annotations
 
+from _flowtable_identity import (set_mac, wan_wire)
+
 import asyncio
 import json
-import socket
-import struct
 
 import pytest
 
 from ask_orch.counters import kernel_tx_packets
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_connections import FLOWS, connections, healthy, peer  # noqa: F401
-from test_flowtable_mtu import table_identity, udp_size, udp_warm
-from test_flowtable_offload import (ARTIFACTS, DPORT, TABLE, WAN_IP, command,  # noqa: F401
-                                    console_command, console_python, read, rig)
-from test_flowtable_selective_neighbour import hardware, warm
-
-
-async def set_mac(con, dev, address, mac):
-    # Announce the new receive address through ordinary ARP. Endpoints retain
-    # their existing sockets and learn the gateway's new address normally.
-    script = rf'''
-import socket, struct, subprocess
-subprocess.run(['ip', 'link', 'set', 'dev', {dev!r}, 'address', {mac!r}], check=True)
-mac = bytes.fromhex({mac.replace(':', '')!r})
-ip = socket.inet_aton({address!r})
-frame = b'\xff'*6 + mac + b'\x08\x06' + struct.pack('!HHBBH', 1, 0x800, 6, 4, 1) + mac + ip + b'\x00'*6 + ip
-with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x806)) as s:
-    s.bind(({dev!r}, 0))
-    s.send(frame); s.send(frame)
-'''
-    await console_python(con, script)
-
-
-async def wan_wire(r, sport, source_mac, operation):
-    raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x800))
-    raw.bind((r.wan_if, 0))
-    raw.setblocking(False)
-    loop = asyncio.get_running_loop()
-
-    async def capture():
-        count = 0
-        async with asyncio.timeout(15):
-            while count < 256:
-                frame = await loop.sock_recv(raw, 65536)
-                if len(frame) < 42 or frame[12:14] != b'\x08\x00' or frame[23] != 17:
-                    continue
-                if frame[26:30] != socket.inet_aton(r.lan_ip) or frame[30:34] != socket.inet_aton(WAN_IP):
-                    continue
-                ihl = (frame[14] & 15) * 4
-                if struct.unpack('!HH', frame[14 + ihl:18 + ihl]) != (sport, DPORT):
-                    continue
-                assert frame[6:12] == bytes.fromhex(source_mac.replace(':', '')), frame.hex()
-                assert frame[:6] == bytes.fromhex(r.wan_mac.replace(':', '')), frame.hex()
-                count += 1
-        return {"frames": count, "source_mac": source_mac}
-
-    task = asyncio.create_task(capture())
-    try:
-        result = await operation
-        return result, await task
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        raw.close()
+from _flowtable_connections import (FLOWS, healthy, peer)
+from _flowtable_mtu import (table_identity, udp_size, udp_warm)
+from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command)
+from _flowtable_selective_neighbour import (hardware, warm)
 
 
 async def test_flowtable_mac_recovery(connections):
@@ -76,7 +26,7 @@ async def test_flowtable_mac_recovery(connections):
     ips = {d: next(a["local"] for i in addresses if i["ifname"] == d for a in i["addr_info"])
            for d in original}
     identity = await table_identity(r)
-    with Console.target(log_path=str(ARTIFACTS / "mac-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "mac-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
 
         async def change(dev, mac):
@@ -140,7 +90,7 @@ async def test_flowtable_rename_identity(connections):
     flows = [{**f, "sport": f["sport"] + 1, "lan": r.lan_ip} for f in FLOWS[:2]]
     names = {d: d for d in (TARGET_LAN_IF, TARGET_WAN_IF)}
     temporary = "askftrename"
-    with Console.target(log_path=str(ARTIFACTS / "rename-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "rename-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         links = json.loads((await command(r.target, r.session, "ip", "-j", "link"))["stdout"])
         assert temporary not in {i["ifname"] for i in links}, links

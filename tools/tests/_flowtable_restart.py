@@ -18,19 +18,15 @@ the same boot more again, so each runs inside restart_budget(), which raises
 the limit for the case and puts it back after.
 """
 from __future__ import annotations
-
 import asyncio
 from contextlib import asynccontextmanager
 import json
 import re
 import shlex
 import time
-
 import pytest
-
 from _ioctl import _IOR
-from test_flowtable_offload import (CONSOLE_NOISE, RX_PORTS_SCRIPT, console_command, console_json,
-                                    console_python, status_text)
+from _flowtable_rig import (CONSOLE_NOISE, RX_PORTS_SCRIPT, console_command, console_json, console_python, status_text)
 
 # FM_PORT_IOC_GET_ENABLED, which RX_PORTS_SCRIPT reads each receive port by.
 PORT_ENABLED = _IOR(0xe1, 70 + 44, 1)

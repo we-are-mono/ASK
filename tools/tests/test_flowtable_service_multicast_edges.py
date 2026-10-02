@@ -22,16 +22,13 @@ import time
 import pytest
 
 from _mcast_helpers import arm_bridge_querier
-from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, host, in_hardware,
-                            in_software, kernel_mroute, learn, mcast_rows, mdb, members, moved,
-                            mroute_row, multicast_rig, packets, same, stream, streamed,  # noqa: F401
-                            summary)
+from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, host, in_hardware, in_software, kernel_mroute, learn, mcast_rows, mdb, members, moved, mroute_row, packets, same, stream, streamed, summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN, TopologyStack,
                        dut_vlan_subif, lan_vlan_subif)
 from mroute_capture import payload
-from test_flowtable_offload import HEALTH_BASELINE, command, console_command
-from test_mcast_e2e import mcast_bridge, wan_source_address  # noqa: F401
-from test_mroute_capacity import _daemon, _python
+from _flowtable_rig import (HEALTH_BASELINE, command, console_command)
+from _mcast_e2e import (wan_source_address)
+from _mroute_capacity import (_daemon, _python)
 
 MOVE_GROUP = {4: "239.9.9.1", 6: "ff1e::9:9:1"}
 TWO_SOURCE_GROUP = {4: "239.9.9.2", 6: "ff1e::9:9:2"}

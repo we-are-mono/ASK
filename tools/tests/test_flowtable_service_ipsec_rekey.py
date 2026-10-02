@@ -6,13 +6,12 @@ import secrets
 
 import pytest
 
-from test_flowtable_connections import by_key, healthy, peer
-from test_flowtable_offload import command, rig  # noqa: F401
-from test_flowtable_selective_neighbour import warm
-from test_flowtable_service_ipsec import (INNER, Transform, flows_for, hardware,
-                                         ipsec_service)  # noqa: F401
-from test_flowtable_service_ipsec_provenance import COUNT, KEY, inject
-from test_flowtable_service_ipsec_replay import AEAD, sa_state
+from _flowtable_connections import (by_key, healthy, peer)
+from _flowtable_rig import (command)
+from _flowtable_selective_neighbour import (warm)
+from _flowtable_service_ipsec import (INNER, Transform, flows_for, hardware)
+from _flowtable_service_ipsec_provenance import (COUNT, KEY, inject)
+from _flowtable_service_ipsec_replay import (AEAD, sa_state)
 
 
 @pytest.mark.parametrize("ipsec_service", [Transform(), AEAD["rfc4106-icv16"]],

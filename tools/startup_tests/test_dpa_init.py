@@ -11,6 +11,7 @@ import re
 import shlex
 
 from ask_orch.uart import Console
+from ask_orch.artifacts import artifact_dir
 
 # Check each resource class, partial queue batches and the final handoff.
 FAULTS = [
@@ -37,6 +38,7 @@ SPLATS = re.compile(r"BUG:|WARNING: CPU:|Oops:|Kernel panic|possible circular lo
 
 
 def test_dpa_init_rollback(tmp_path):
+    tmp_path = artifact_dir()
     with Console.target(log_path=str(tmp_path / "uart.log")) as con:
         con.login("root", None)
 
@@ -89,6 +91,7 @@ print(json.dumps(states, sort_keys=True))
                 log = run("cat /tmp/dpa-startup.log")
                 kernel = run("dmesg")
                 (tmp_path / f"{site}-{step}.log").write_text(result.stdout + log + kernel)
+                assert kernel.startswith(dmesg_before), "kernel log truncated during startup test"
                 assert result.rc != 0, f"fault checkpoint not reached: {site}:{step}"
                 assert f"injecting DPA startup failure at {site} step {step}" in result.stdout
                 assert "FMC rollback failed" not in log, log
@@ -123,6 +126,7 @@ print(json.dumps(states, sort_keys=True))
             assert run("cat /proc/sys/kernel/random/boot_id") == boot
             assert json.loads(run(port_state_command)) == ports_before
             kernel = run("dmesg")
+            assert kernel.startswith(dmesg_before), "kernel log truncated during startup test"
             assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
             print("normal initialization passed in the same boot", flush=True)
             muram_loaded = run(muram_command)
@@ -132,6 +136,7 @@ print(json.dumps(states, sort_keys=True))
             assert json.loads(run(port_state_command)) == ports_before
             muram_unloaded = run(muram_command)
             kernel = run("dmesg")
+            assert kernel.startswith(dmesg_before), "kernel log truncated during startup test"
             assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
             (tmp_path / "unload-dmesg.txt").write_text(kernel)
             print("normal unload preserved port state without kernel diagnostics", flush=True)
@@ -142,5 +147,7 @@ print(json.dumps(states, sort_keys=True))
                 "known_boot_pool_objects": len(known_pool),
                 "port_states_restored": ports_before}, indent=2))
         finally:
-            run("mv /usr/bin/dpa_app.startup-test /usr/bin/dpa_app")
-            run("stty echo")
+            try:
+                run("mv /usr/bin/dpa_app.startup-test /usr/bin/dpa_app")
+            finally:
+                run("stty echo")

@@ -7,11 +7,10 @@ import json
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_connections import FLOWS, SPORT, connections, peer  # noqa: F401
-from test_flowtable_offload import ARTIFACTS, DPORT, TABLE, WAN_IP, command, console_command, console_python, rig  # noqa: F401
-from test_flowtable_policy import apply, candidate, expected_hash, installed, policy_to_conf, stop
-from test_flowtable_selective_neighbour import hardware, keys, warm
-from test_flowtable_tcp import software_tx
+from _flowtable_connections import (FLOWS, SPORT, peer)
+from _flowtable_rig import (artifact_dir, WAN_IP, console_command, console_python)
+from _flowtable_policy import (apply, candidate, expected_hash, installed, policy_to_conf, stop)
+from _flowtable_selective_neighbour import hardware, warm
 
 
 async def test_flowtable_concurrent_policy_and_routes(connections):
@@ -21,7 +20,7 @@ async def test_flowtable_concurrent_policy_and_routes(connections):
     excluded = copy.deepcopy(policy)
     excluded["exclude"] = [{"protocol": "udp", "port": SPORT}]
     await r.delete_table()
-    with Console.target(log_path=str(ARTIFACTS / "pressure-policy-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "pressure-policy-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         try:
             await apply(con, policy, r=r)

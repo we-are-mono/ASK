@@ -1,35 +1,25 @@
 """Prove adapter unload/reload without replacing its CDX hardware provider."""
 from __future__ import annotations
 
+from _flowtable_module import (table)
+
 import asyncio
 import errno
 
 from ask_orch.uart import Console
 from _ioctl import CDX_CTRL_DPA_SET_PARAMS, SIZEOF_CDX_CTRL_SET_DPA_PARAMS
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_connections import FLOWS, SPORT, connections, peer  # noqa: F401
-from test_flowtable_offload import (ARTIFACTS, DPORT, HEALTH_BASELINE, TABLE, WAN_IP, console_command,  # noqa: F401
-                                    read, rig)
-from test_flowtable_selective_neighbour import hardware, warm
-from test_flowtable_tcp import software_tx
-
-
-async def table(r):
-    await r.nft(f'''table inet {TABLE} {{
- flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; }}
- chain forward {{ type filter hook forward priority 0; policy accept;
- ip saddr {r.lan_ip} ip daddr {WAN_IP} udp sport {SPORT} udp dport {DPORT} flow add @fast
- ip saddr {r.lan_ip} ip daddr {WAN_IP} tcp sport {SPORT} tcp dport {DPORT} flow add @fast
- }}
-}}''')
-    await r.wait(lambda s: s["bindings"] == 2)
+from _flowtable_connections import (FLOWS, peer)
+from _flowtable_rig import (artifact_dir, HEALTH_BASELINE, TABLE, console_command, read)
+from _flowtable_selective_neighbour import (hardware, warm)
+from _flowtable_tcp import (software_tx)
 
 
 async def test_flowtable_module_lifecycle(connections):
     r = connections
     flows = [{**f, "lan": r.lan_ip} for f in FLOWS[:2]]
     ids = [0, 1]
-    con = Console.target(log_path=str(ARTIFACTS / "module-uart.log"))
+    con = Console.target(log_path=str(artifact_dir() / "module-uart.log"))
     await asyncio.to_thread(con.login, "root", None)
     try:
         await console_command(con, "test", "-e", "/sys/module/cdx/holders/ask_flowtable")

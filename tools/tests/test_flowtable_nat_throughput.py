@@ -1,4 +1,4 @@
-"""Full-rate Loki-to-Vision TCP NAT check with hardware-path evidence."""
+"""Full-rate LAN-to-WAN TCP NAT check with hardware-path evidence."""
 import asyncio
 import json
 import os
@@ -9,11 +9,10 @@ from ask_orch.client import Agent
 
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import by_key, healthy
-from test_flowtable_offload import (ARTIFACTS, DPORT, HEALTH_BASELINE, WAN_IP, command,
-                                   console_command, rig)  # noqa: F401
-from test_flowtable_policy import CONFIG, apply, candidate, stop
-from test_flowtable_tcp import cpu, cpu_delta, software_tx
+from _flowtable_connections import (by_key, healthy)
+from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, WAN_IP, command, console_command)
+from _flowtable_policy import (CONFIG, apply, candidate, stop)
+from _flowtable_tcp import (cpu, cpu_delta, software_tx)
 
 PORT, STREAMS = DPORT + 3000, 4
 # Short enough for every suite run. The proof is structural -- every bulk
@@ -54,7 +53,7 @@ async def test_flowtable_nat_throughput(rate_path):
     nat = (f"table ip {nat_table} {{ chain postrouting {{ type nat hook postrouting priority 90; "
            f"ip saddr {r.lan_ip} ip daddr {WAN_IP} tcp dport {PORT} masquerade; }}; }}")
     server = lan_task = None
-    with Console.target(log_path=str(ARTIFACTS / "nat-rate-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "nat-rate-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         assert (await command(r.target, r.session, "nft", "list", "table", "ip", nat_table, check=False))["rc"] != 0
         await command(r.target, r.session, "nft", nat)

@@ -1,11 +1,12 @@
 """A189: execute the kernel's complete multicast egress snapshot."""
+
+from ask_orch.process import run_process
 import os
 from pathlib import Path
-import subprocess
 
 import pytest
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 PATCH = ROOT / "patches/kernel/161-bridge-multicast-egress-snapshot.patch"
@@ -25,7 +26,7 @@ def snapshot_source():
 def test_bridge_mcast_snapshot(tmp_path, ipv6):
     (tmp_path / "bridge_mcast_snapshot.inc").write_text(snapshot_source())
     binary = tmp_path / "snapshot"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-Wno-sign-compare", f"-DCONFIG_IPV6={ipv6}",
@@ -34,7 +35,7 @@ def test_bridge_mcast_snapshot(tmp_path, ipv6):
         str(Path(__file__).with_name("bridge_mcast_snapshot.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

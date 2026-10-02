@@ -23,7 +23,7 @@ FRAGMENT_LEAK_FILTER = [
 ]
 
 
-WAN_IPERF_IP = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
+WAN_IPERF_IP = os.environ.get("ASK_WAN_IPERF_IP", "")
 
 # Interleave many datagrams across flows, with several fragments per datagram.
 # The shuffled and duplicate variants exercise incomplete queues and expiry.

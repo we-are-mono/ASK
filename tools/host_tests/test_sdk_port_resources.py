@@ -1,9 +1,10 @@
 """Exercise FM resource allocation with the actual SDK and register helpers."""
+
+from ask_orch.process import run_process
 from pathlib import Path
 import os
 import re
 import shutil
-import subprocess
 
 import pytest
 
@@ -59,7 +60,7 @@ def test_sdk_port_resources(tmp_path, legacy):
     if legacy:
         command.extend(["-DFM_HAS_TOTAL_DMAS", "-DFM_LOW_END_RESTRICTION", "-DTEST_LEGACY"])
     command.extend([str(Path(__file__).with_name("sdk_port_resources.c")), "-o", str(binary)])
-    subprocess.run(command, check=True)
-    subprocess.run([str(binary)], check=True, timeout=30,
+    run_process(command, check=True)
+    run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})

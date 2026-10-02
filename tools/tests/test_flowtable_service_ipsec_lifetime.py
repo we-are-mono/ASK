@@ -25,13 +25,12 @@ import time
 import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_connections import by_key
-from test_flowtable_offload import DPORT, command, console_command, console_python, read, rig  # noqa: F401
-from test_flowtable_selective_neighbour import keys
-from test_flowtable_service import FIRST
-from test_flowtable_service_ipsec import (INNER, LAN_INNER, Wire, flows_for, ipsec_service,  # noqa: F401
-                                          sec_counter)
-from test_flowtable_service_ipsec_replay import peer_errors, sa_state, xfrm_mib
+from _flowtable_connections import (by_key)
+from _flowtable_rig import (DPORT, command, console_command, console_python, read)
+from _flowtable_selective_neighbour import (keys)
+from _flowtable_service import (FIRST)
+from _flowtable_service_ipsec import (INNER, LAN_INNER, Wire, flows_for, sec_counter)
+from _flowtable_service_ipsec_replay import (peer_errors, sa_state, xfrm_mib)
 
 # The accounting pass runs once a second, so a limit fires on the first pass
 # after it is crossed. This allows for that period and the jitter of a

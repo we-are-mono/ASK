@@ -7,42 +7,25 @@ the source: the three ordering rules this learner lives under cannot be
 observed from a passing test, only from code that never breaks them.
 """
 
+from ask_orch.process import run_process
+
+from _host_mroute_learner import (
+    ROOT,
+    SOURCE,
+    _assert_not_inside,
+    _between,
+    _held_regions,
+    _hunk_in,
+    _hunks,
+    _ordered,
+)
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
-from test_pppoe_hm import declaration
-from test_qos_lifecycle import function
-
-ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "cdx/ask_flowtable.c"
-
-
-def _between(source, start, end):
-    return source[source.index(start):source.index(end)]
-
-
-def _hunks(section):
-    """A patch section's hunks, each with the function its header names."""
-    parts = re.split(r"^@@ [^@]* @@ ?(.*)$", section, flags=re.M)
-    return list(zip(parts[1::2], parts[2::2]))
-
-
-def _hunk_in(section, function_head):
-    """The one hunk of a section inside the function `function_head` begins."""
-    found = [text for head, text in _hunks(section) if function_head in head]
-    assert len(found) == 1, (function_head, len(found))
-    return found[0]
-
-
-def _ordered(text, *lines):
-    """Each line in `text`, once, and in the order given."""
-    at = []
-    for line in lines:
-        assert text.count(line) == 1, (line, text.count(line))
-        at.append(text.index(line))
-    assert at == sorted(at), lines
+from _host_pppoe_hm import (declaration)
+from _host_qos_lifecycle import (function)
 
 
 def test_mroute_learner(tmp_path):
@@ -94,39 +77,17 @@ def test_mroute_learner(tmp_path):
             "ft_mr_apply",
         ]))
     binary = tmp_path / "mroute_learner"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("mroute_learner.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
-
-
-# ---------------------------------------------------------------- locking
-
-def _held_regions(body, lock, unlock):
-    """Offsets in `body` at which `lock` is held, as (start, end) pairs.
-
-    Each acquisition runs to the next release after it, or to the end of the
-    text when there is none. None of these locks is ever taken recursively, so
-    that is exact; an early-return arm with a release of its own only makes the
-    model wider than the truth, which is the safe direction for a test that
-    asserts something is *not* inside.
-    """
-    releases = [m.start() for m in re.finditer(re.escape(unlock), body)]
-    return [(m.start(), next((r for r in releases if r > m.start()), len(body)))
-            for m in re.finditer(re.escape(lock), body)]
-
-
-def _assert_not_inside(body, regions, needle, why):
-    for m in re.finditer(re.escape(needle), body):
-        for start, end in regions:
-            assert not (start < m.start() < end), why
 
 
 def test_the_fib_handler_only_queues():
@@ -901,13 +862,13 @@ def test_nothing_that_can_drop_a_copy_runs_after_the_observer(tmp_path):
     (tmp_path / "mroute_confirm_order.inc").write_text(
         function(source, "ft_mr_observer_followed") + function(source, "ft_mr_bpf_hooked"))
     binary = tmp_path / "mroute_confirm_order"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("mroute_confirm_order.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

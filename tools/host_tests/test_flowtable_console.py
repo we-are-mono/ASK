@@ -1,25 +1,20 @@
 """UART acknowledgement loss must retry staging, never a test operation."""
-import ast
-import asyncio
+from ask_orch import commands
 import base64
 import hashlib
-from pathlib import Path
-import re
 import shlex
-import time
 from types import SimpleNamespace
 
 import pytest
 
 
+@pytest.fixture
 def helpers():
-    source = Path(__file__).resolve().parents[1] / "tests/test_flowtable_offload.py"
-    parsed = ast.parse(source.read_text())
-    selected = [node for node in parsed.body if isinstance(node, ast.AsyncFunctionDef)
-                and node.name in {"console_command", "console_python"}]
-    namespace = {name: value for name, value in globals().items() if not name.startswith("__")}
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec"), namespace)
-    return namespace
+    original = commands.console_command
+    try:
+        yield vars(commands)
+    finally:
+        commands.console_command = original
 
 
 class Staging:
@@ -56,8 +51,8 @@ class Staging:
 
 
 @pytest.mark.parametrize("lost_ack", [TimeoutError, AssertionError])
-async def test_lost_staging_ack_restarts_before_execution(lost_ack):
-    namespace, staging, synced = helpers(), Staging(lost_ack=lost_ack), []
+async def test_lost_staging_ack_restarts_before_execution(lost_ack, helpers):
+    namespace, staging, synced = helpers, Staging(lost_ack=lost_ack), []
     namespace["console_command"] = staging.command
     script = "print('one operation')\n" * 20  # multiple staging chunks
     result = await namespace["console_python"](SimpleNamespace(sync_prompt=lambda: synced.append(True)), script)
@@ -67,8 +62,8 @@ async def test_lost_staging_ack_restarts_before_execution(lost_ack):
     assert synced == [True]
 
 
-async def test_unknown_execution_is_not_retried():
-    namespace, staging = helpers(), Staging(execution_error=True)
+async def test_unknown_execution_is_not_retried(helpers):
+    namespace, staging = helpers, Staging(execution_error=True)
     namespace["console_command"] = staging.command
     with pytest.raises(TimeoutError, match="operation executed"):
         await namespace["console_python"](object(), "print('one operation')")
@@ -76,8 +71,8 @@ async def test_unknown_execution_is_not_retried():
     assert staging.resets == 2
 
 
-async def test_staging_digest_must_match_before_execution():
-    namespace, staging = helpers(), Staging(corrupt=True)
+async def test_staging_digest_must_match_before_execution(helpers):
+    namespace, staging = helpers, Staging(corrupt=True)
     namespace["console_command"] = staging.command
     with pytest.raises(pytest.fail.Exception, match="staging failed 3 times"):
         await namespace["console_python"](object(), "print('one operation')")
@@ -86,14 +81,14 @@ async def test_staging_digest_must_match_before_execution():
 
 
 @pytest.mark.parametrize("resync", [False, True])
-async def test_timeout_resync_requires_explicit_idempotent_call(resync):
+async def test_timeout_resync_requires_explicit_idempotent_call(resync, helpers):
     synced = []
 
     def run(*args):
         raise TimeoutError("split marker")
 
     console = SimpleNamespace(run=run, sync_prompt=lambda: synced.append(True))
-    call = helpers()["console_command"](console, "true", resync=resync)
+    call = helpers["console_command"](console, "true", resync=resync)
     if resync:
         assert await call == {"rc": None, "stdout": "split marker"}
         assert synced == [True]

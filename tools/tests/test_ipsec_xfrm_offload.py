@@ -27,7 +27,7 @@ import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
-from test_flowtable_offload import ARTIFACTS, console_python
+from _flowtable_rig import (artifact_dir, console_python)
 
 # Documentation-range addresses (RFC 2544 benchmarking block), distinct from
 # every other IPsec file's so the tests can run in any order.
@@ -70,7 +70,7 @@ for path in paths:
     raise AssertionError('unprivileged read succeeded: ' + str(path))
 print('root can read SEC queues; nobody is denied')
 """
-    with Console.target(log_path=str(ARTIFACTS / "sec-proc-permissions-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "sec-proc-permissions-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         await console_python(con, script)
 

@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 
 from ask_orch.uart import Console
-from test_flowtable_offload import ARTIFACTS, command, console_command
+from _flowtable_rig import (artifact_dir, command, console_command)
 
 
 async def test_mwifiex_receive_drop(aiohttp_session, target_agent, splat_window):
@@ -28,7 +28,7 @@ async def test_mwifiex_receive_drop(aiohttp_session, target_agent, splat_window)
     encoded = base64.b64encode(module.read_bytes()).decode()
     result = await target_agent.fs_write(aiohttp_session, path + ".b64", encoded)
     assert result["errno"] == 0, result
-    with Console.target(log_path=str(ARTIFACTS / "mwifiex-rx-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "mwifiex-rx-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         try:
             await console_command(con, "sh", "-c", f"base64 -d {path}.b64 > {path}")

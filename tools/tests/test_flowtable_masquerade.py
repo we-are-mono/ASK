@@ -1,6 +1,5 @@
 """Native MASQUERADE translation and Linux-owned WAN mapping retirement."""
 import asyncio
-import json
 import os
 import re
 
@@ -10,14 +9,11 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_connections import FLOWS, connections, healthy, peer  # noqa: F401
-from test_flowtable_offload import (ARTIFACTS, DPORT, WAN_IP, command, console_command,
-                                   read, rig, status_text)  # noqa: F401
-from test_flowtable_policy import CONFIG, apply, candidate, stop
-from test_flowtable_snat import test_flowtable_udp_snat as _udp
-from test_flowtable_tcp import (cpu, cpu_delta, software_tx,
-                               test_flowtable_tcp_retransmit_withdraw_rst as _tcp)
-from test_flowtable_tcp_snat import tcp_snat  # noqa: F401
+from _flowtable_connections import (FLOWS, healthy, peer)
+from _flowtable_rig import (artifact_dir, DPORT, WAN_IP, command, console_command, status_text)
+from _flowtable_policy import (CONFIG, apply, candidate, stop)
+from _flowtable_snat import (udp_snat as _udp)
+from _flowtable_tcp import (cpu, cpu_delta, software_tx, tcp_retransmit_withdraw_rst as _tcp)
 
 ADDRESS, REPLACEMENT, ENDPOINT = "198.18.40.1", "198.18.40.3", "198.18.40.2"
 
@@ -38,7 +34,7 @@ async def masquerade_network(request, target_agent, aiohttp_session):
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     cleanup = []
     try:
-        for agent, dev, address in [(wan, "br0", ENDPOINT), (target_agent, TARGET_WAN_IF, ADDRESS)]:
+        for agent, dev, address in [(wan, os.environ["ASK_WAN_INJECT_IF"], ENDPOINT), (target_agent, TARGET_WAN_IF, ADDRESS)]:
             await command(agent, aiohttp_session, "ip", "addr", "add", address + "/24", "dev", dev)
             cleanup.append((agent, dev, address))
         yield cleanup
@@ -127,7 +123,7 @@ async def test_flowtable_masquerade_wan_lifecycle(connections, masquerade_networ
     nat = f"table ip {nat_table} {{ chain postrouting {{ type nat hook postrouting priority 90; {rules} }}; }}"
     await r.delete_table()
     control = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", "tcp", "--dport", str(DPORT + 1), "-j", "ACCEPT"]
-    with Console.target(log_path=str(ARTIFACTS / "masquerade-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "masquerade-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         async def ct(ids):
             result = {}

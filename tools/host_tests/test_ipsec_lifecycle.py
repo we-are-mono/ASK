@@ -1,10 +1,11 @@
 """A177: compile the IPsec acquisition/unwind and SDK buffer ownership code."""
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
-import subprocess
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 SDK_REL = Path("drivers/net/ethernet/freescale/sdk_dpaa")
@@ -20,10 +21,10 @@ def test_ipsec_lifecycle(tmp_path):
     staged.parent.mkdir(parents=True)
     staged.write_bytes((kernel / relative).read_bytes())
     patch = ROOT / "patches/kernel/105-sdk_dpaa-buffer-seed-failure.patch"
-    reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(patch)],
+    reverse = run_process(["git", "apply", "--reverse", "--check", str(patch)],
                              cwd=tmp_path, capture_output=True)
     if reverse.returncode:
-        subprocess.run(["git", "apply", str(patch)], cwd=tmp_path, check=True)
+        run_process(["git", "apply", str(patch)], cwd=tmp_path, check=True)
     sdk = (kernel / SDK_REL / "dpaa_eth_common.c").read_text()
     sdk = sdk.replace("__cold __attribute__((nonnull))\n", "")
     source = (ROOT / "cdx/dpa_ipsec.c").read_text()
@@ -64,7 +65,7 @@ def test_ipsec_lifecycle(tmp_path):
         # And at unload, once CDX knows whether anything may still name them.
         + function(source, "cdx_dpa_ipsec_held_fqids_exit"))
     binary = tmp_path / "ipsec_lifecycle"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-Wno-sign-compare", "-Wno-pointer-sign",
@@ -72,7 +73,7 @@ def test_ipsec_lifecycle(tmp_path):
         "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_lifecycle.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=60, env={
+    run_process([str(binary)], check=True, timeout=60, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

@@ -2,50 +2,20 @@
 records into a net device's counters, and the packet counts carried past the
 firmware's 32 bits, against a simulated MURAM and workqueue."""
 
+from ask_orch.process import run_process
+
+from _host_ifstats import (HEADER, ROOT, declaration, stats_fields)
+
 import os
 from pathlib import Path
 import re
-import subprocess
 
-from test_qos_lifecycle import function
-
-ROOT = Path(__file__).resolve().parents[2]
-HEADER = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h"
-
-
-def declaration(source, kind, name):
-    """One struct or enum as written, brace-matched rather than pattern-matched,
-    so a field added inside it comes along instead of truncating the type. The
-    opening brace is matched by regex rather than by literal text: the sources
-    this reads from put it on the next line, on the same line, and directly
-    against the name, all three."""
-    match = re.search(rf"\b{kind}\s+{name}\s*\{{", source)
-    assert match, (kind, name)
-    end, depth = match.end(), 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[match.start():source.index(";", end) + 1] + "\n"
-
-
-def stats_fields(source):
-    """The statistics tail of `struct dpa_iface_info`, taken verbatim with the
-    conditional it lives inside.
-
-    The rest of that structure is a union of six device descriptions and drags
-    in most of the driver's headers, none of which the allocator touches. What
-    it does touch is these four fields, so these four are the real ones and the
-    surrounding structure is not modelled at all -- a rename or a resize here
-    still has to fail, which is the whole point of not restating them.
-    """
-    body = declaration(source, "struct", "dpa_iface_info")
-    start = body.index("#ifdef INCLUDE_IFSTATS_SUPPORT")
-    return "struct dpa_iface_info {\n" + body[start:body.index("#endif", start) + 6] + "\n};\n"
+from _host_qos_lifecycle import (function)
 
 
 def test_ifstats(tmp_path):
     # The shipped patch, so this does not depend on a previously built kernel.
-    subprocess.run([
+    run_process([
         "git", "apply", f"--include={HEADER}",
         str(ROOT / "patches/kernel/010-ask-fman-dpaa-ehash.patch"),
     ], cwd=tmp_path, check=True)
@@ -111,7 +81,7 @@ def test_ifstats(tmp_path):
         + function(source, "cdx_ifstats_start")
         + function(source, "cdx_ifstats_stop"))
     binary = tmp_path / "ifstats"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
@@ -119,7 +89,7 @@ def test_ifstats(tmp_path):
         "-DINCLUDE_VLAN_IFSTATS=1", "-DINCLUDE_ETHER_IFSTATS=1",
         str(Path(__file__).with_name("ifstats.c")), "-o", str(binary),
     ], check=True)
-    result = subprocess.run([str(binary)], timeout=60, text=True,
+    result = run_process([str(binary)], timeout=60, text=True,
                             capture_output=True, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",

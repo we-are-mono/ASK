@@ -9,11 +9,12 @@ submit's answer decides what the port counts: `tx toenc` for a frame SEC was
 given, a transmit drop for one freed instead.
 """
 
+from ask_orch.process import run_process
+
 import os
 from pathlib import Path
-import subprocess
 
-from test_qos_lifecycle import function
+from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -27,14 +28,14 @@ def test_ipsec_sec_submit(tmp_path):
         source[source.index("#define ETH_HDR_SIZE"):
                source.index("/* Whether @dev is a port of this driver")])
     binary = tmp_path / "ipsec_sec_submit"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
         "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_sec_submit.c")),
         "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
@@ -62,7 +63,7 @@ def test_ipsec_inbound_submit_device(tmp_path):
         + function(source, "__dpaa_submit_inb_pkt_to_SEC")
         + function(source, "dpaa_submit_inb_pkt_to_SEC"))
     binary = tmp_path / "ipsec_inbound_submit"
-    subprocess.run([
+    run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
@@ -70,7 +71,7 @@ def test_ipsec_inbound_submit_device(tmp_path):
         "-o", str(binary),
     ], check=True)
     # The harness reports a touch of the guard page itself, by name.
-    subprocess.run([str(binary)], check=True, timeout=30, env={
+    run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1:handle_segv=0",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })

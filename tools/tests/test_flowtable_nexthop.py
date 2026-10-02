@@ -7,13 +7,12 @@ import time
 
 from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
-from test_flowtable_connections import FLOWS, connections, peer  # noqa: F401
-from test_flowtable_module import table
-from test_flowtable_mtu import table_identity
-from test_flowtable_offload import (ARTIFACTS, HEALTH_BASELINE, WAN_IP, command, console_command,
-                                    rig, status_text)  # noqa: F401
-from test_flowtable_selective_neighbour import hardware, warm
-from test_flowtable_tcp import software_tx
+from _flowtable_connections import (FLOWS, peer)
+from _flowtable_module import (table)
+from _flowtable_mtu import (table_identity)
+from _flowtable_rig import (artifact_dir, HEALTH_BASELINE, WAN_IP, command, console_command, status_text)
+from _flowtable_selective_neighbour import (hardware, warm)
+from _flowtable_tcp import (software_tx)
 
 NHID = "42135"
 
@@ -25,7 +24,7 @@ async def test_flowtable_nexthop_object_replacement(connections):
     assert not any(str(n["id"]) == NHID for n in existing), existing
     await r.delete_table()
     created = False
-    with Console.target(log_path=str(ARTIFACTS / "nexthop-uart.log")) as con:
+    with Console.target(log_path=str(artifact_dir() / "nexthop-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         try:
             await command(r.target, r.session, "ip", "-4", "nexthop", "add", "id", NHID, "dev", TARGET_WAN_IF)
