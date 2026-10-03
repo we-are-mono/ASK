@@ -550,7 +550,7 @@ async def _ipv6_session(r, stack, cleanup):
     # The LAN tells its hosts the session's MTU, the configuration a PPPoE LAN
     # needs for its IPv6 upload to be offloaded at all: the microcode would
     # fragment a larger packet instead of letting Linux send Packet Too Big
-    # (see test_flowtable_ipv6_mtu_bound).
+    # (see test_mtu_bound).
     key = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
     previous = (await target("sysctl", "-n", key))["stdout"].strip()
     cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))

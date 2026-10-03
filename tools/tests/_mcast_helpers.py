@@ -1,10 +1,8 @@
 """Shared multicast rig plumbing: capturing on the LAN VM, and the oracles
 that tell hardware replication apart from the bridge flooding in software.
 
-The LAN VM is behind the DUT's NAT and has no IP path from the orchestrator,
-so every one of these goes over the libvirt UART. Captures run as backgrounded
-processes coordinated through pidfiles, because UART is a single channel and
-two concurrent `lan.run` calls would interleave.
+LAN commands use the VM's guest-agent channel. Captures run as background
+processes coordinated through pidfiles, spanning multiple command calls.
 """
 
 from __future__ import annotations
@@ -65,7 +63,7 @@ async def arm_bridge_querier(run, bridge: str) -> None:
     await asyncio.sleep(2.0)
 
 
-# ---- capture (UART-driven, no LAN agent required) -------------------------
+# ---- capture ------------------------------------------------------------
 
 _TCPDUMP_PIDFILE_PREFIX = "/tmp/ask_mcast_tcpdump"
 

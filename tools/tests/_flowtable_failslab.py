@@ -77,8 +77,7 @@ async def slab_fault(r, target, label, *, continuous=False, lease=20, console=No
         assert option in config.splitlines(), f"rebuild/stage a KASAN image with {option}"
     script = Path(__file__).with_name("_flowtable_failslab_guard.py").read_text()
     root = base + "/failslab-" + target
-    # Stage while management is healthy. A long paced-UART upload here would
-    # outlive the traffic peer's idle lease; fault cleanup still uses UART.
+    # Stage and verify the guard before entering the measured window.
     if base != FAULT_DIR:
         await console_command(console, "mkdir", "-p", base)
     await console_command(console, "mkdir", root)
@@ -111,8 +110,7 @@ with (root / 'guard.log').open('w') as log:
             cancelled = await r.target.fs_write(r.session, root + "/cancel", "")
             assert cancelled["errno"] == 0, cancelled
         except Exception:
-            # UART remains the fallback when the fault disrupts management;
-            # HTTP avoids a lost command boundary amid kernel diagnostics.
+            # A failed file operation still permits the shell cleanup command.
             await console_command(console, "touch", root + "/cancel")
         try:
             result = await wait_json(r, root + "/result.json", timeout=5)

@@ -3,12 +3,11 @@
 # Provides:          askd-agent
 # Required-Start:    ask-flowtable gateway-setup
 # Default-Start:     S
-# Short-Description: ASK test-harness on-target HTTP/JSON agent
+# Short-Description: Retain ASK boot kernel evidence for the UART test agent
 ### END INIT INFO
 
-# Serves the orchestrator (running on the WAN host) over the WAN-facing
-# interface. Listens on all interfaces:9110 — reachable from both LAN
-# and WAN for consistency; not exposed outside the lab network.
+# DUT operations start on the root UART with --stdio. This boot service only
+# retains kernel evidence; the test image exposes no agent network listener.
 
 AGENT=/usr/bin/askd-agent
 # /var/log is a dangling symlink to volatile/log on the initramfs and
@@ -16,7 +15,6 @@ AGENT=/usr/bin/askd-agent
 # that's always mounted and writable.
 LOGFILE=/tmp/askd-agent.log
 PIDFILE=/var/run/askd-agent.pid
-PORT=9110
 
 case "$1" in
     start|"")
@@ -24,7 +22,7 @@ case "$1" in
         if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
             echo "askd-agent already running"; exit 0
         fi
-        ASKD_PORT="$PORT" "$AGENT" >>"$LOGFILE" 2>&1 &
+        "$AGENT" --record-kernel >>"$LOGFILE" 2>&1 &
         echo $! > "$PIDFILE"
         ;;
     stop)

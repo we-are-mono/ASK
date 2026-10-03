@@ -737,7 +737,7 @@ Matching DTB SHA-256:
 
 ### Requested Loki-to-Vision iperf3 measurement
 
-The opt-in `tools/tests/test_ipsec_vlan_iperf_probe.py` runs iperf3 3.18 from Loki's
+The opt-in `tools/tests/ipsec_vlan_iperf_probe.py` runs iperf3 3.18 from Loki's
 inner address `198.18.102.3` to Vision's `198.18.102.2` through the DUT. The tunnel
 uses AES-128-CBC plus HMAC-SHA256 with a 128-bit ICV, required XFRM policies and
 hardware flow admission. Each upload uses 15 measured seconds after 3 omitted

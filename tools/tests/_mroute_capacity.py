@@ -24,15 +24,15 @@ from _mcast_e2e import (
 from _mcast_helpers import multicast_on
 from _topology import TARGET_WAN_IF, lan_run_python
 from ask_orch.counters import kernel_rx_packets
-from mroute_capture import assert_results, multicast_mac, payload
+from _mroute_capture import assert_results, multicast_mac, payload
 
 COUNT, PPS, PORT = 256, 200, 47358
-CAPTURE_SOURCE = Path(__file__).with_name("mroute_capture.py").read_text()
+CAPTURE_SOURCE = Path(__file__).with_name("_mroute_capture.py").read_text()
 
 
 async def _python(lan, script):
     if lan is not None:
-        r = await lan_run_python(lan, script, label="mroute_capture", timeout=15)
+        r = await lan_run_python(lan, script, label="_mroute_capture", timeout=15)
         assert r.rc == 0, r.stdout
         return r.stdout
     proc = await asyncio.create_subprocess_exec(

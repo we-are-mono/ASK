@@ -57,7 +57,23 @@ async def bridge_topology(r, *, guest=True):
     async def dut(*args):
         return await command(r.target, r.session, *args)
 
+    async def lan(*args):
+        result = await asyncio.to_thread(r.lan.execute, list(args), timeout=10)
+        assert result.rc == 0, result.stdout
+        return result.stdout
+
+    old_neighbour = json.loads(await lan("ip", "-j", "neigh", "show", "to", r.lan_gateway, "dev", LAN_NIC))
+    restore_neighbour = ["ip", "neigh", "del", r.lan_gateway, "dev", LAN_NIC]
+    if old_neighbour and old_neighbour[0].get("lladdr"):
+        state = "permanent" if "PERMANENT" in old_neighbour[0]["state"] else "stale"
+        restore_neighbour = ["ip", "neigh", "replace", r.lan_gateway,
+                             "lladdr", old_neighbour[0]["lladdr"], "nud", state, "dev", LAN_NIC]
+    r.record("service-bridge-lan-neighbour", old_neighbour)
     try:
+        # Blocking also blocks ARP. Pin the trusted peer just like the DUT
+        # and guest so recovery measures forwarding, without ARP timeouts.
+        await lan("ip", "neigh", "replace", r.lan_gateway, "lladdr", r.dut_lan_mac,
+                  "nud", "permanent", "dev", LAN_NIC)
         await dut("ip", "link", "add", "name", BRIDGE, "type", "bridge")
         bridge_created = True
         await dut("ip", "link", "set", BRIDGE, "address", r.dut_lan_mac)
@@ -116,26 +132,29 @@ except BaseException:
             except Exception as error:
                 failures.append(repr(error))
 
-        if wan_route:
-            await attempt(command(wan, r.session, "ip", "route", "del", ADDRESS + "/32", "via", dut_ip, "dev", r.wan_if))
-        if bridge_created:
-            # Restore the base rig's L3 path before its own teardown. The
-            # independent console remains usable if bridge setup was partial.
-            with Console.target(log_path=str(artifact_dir() / "service-bridge-cleanup-uart.log")) as con:
-                await asyncio.to_thread(con.login, "root", None)
-                await attempt(console_command(con, "ip", "link", "set", TARGET_LAN_IF, "nomaster"))
-                await attempt(console_command(con, "ip", "link", "del", BRIDGE))
-                for address in original:
-                    await attempt(console_command(con, "ip", "addr", "replace", address, "dev", TARGET_LAN_IF))
-                await attempt(console_command(con, "ip", "route", "replace", r.lan_ip + "/32", "dev", TARGET_LAN_IF))
-                await attempt(console_command(con, "ip", "neigh", "replace", r.lan_ip, "lladdr", r.lan_mac,
-                                              "nud", "permanent", "dev", TARGET_LAN_IF))
-        if lan_created:
-            result = await attempt(lan_run_python(r.lan,
-                f"import subprocess\nsubprocess.run(['ip', 'netns', 'del', {NETNS!r}], check=True)\n",
-                label="service_bridge_cleanup", timeout=15))
-            if result and result.rc:
-                failures.append(result.stdout)
+        try:
+            if wan_route:
+                await attempt(command(wan, r.session, "ip", "route", "del", ADDRESS + "/32", "via", dut_ip, "dev", r.wan_if))
+            if bridge_created:
+                # Restore the base rig's L3 path before its own teardown. The
+                # independent console remains usable if bridge setup was partial.
+                with Console.target(log_path=str(artifact_dir() / "service-bridge-cleanup-uart.log")) as con:
+                    await asyncio.to_thread(con.login, "root", None)
+                    await attempt(console_command(con, "ip", "link", "set", TARGET_LAN_IF, "nomaster"))
+                    await attempt(console_command(con, "ip", "link", "del", BRIDGE))
+                    for address in original:
+                        await attempt(console_command(con, "ip", "addr", "replace", address, "dev", TARGET_LAN_IF))
+                    await attempt(console_command(con, "ip", "route", "replace", r.lan_ip + "/32", "dev", TARGET_LAN_IF))
+                    await attempt(console_command(con, "ip", "neigh", "replace", r.lan_ip, "lladdr", r.lan_mac,
+                                                  "nud", "permanent", "dev", TARGET_LAN_IF))
+            if lan_created:
+                result = await attempt(lan_run_python(r.lan,
+                    f"import subprocess\nsubprocess.run(['ip', 'netns', 'del', {NETNS!r}], check=True)\n",
+                    label="service_bridge_cleanup", timeout=15))
+                if result and result.rc:
+                    failures.append(result.stdout)
+        finally:
+            await attempt(lan(*restore_neighbour))
         final = await attempt(r.state())
         r.record("service-bridge-cleanup", final)
         if final and any(final[k] != baseline[k] for k in ("vlan_records", "vlan_slots", "errors")):
@@ -328,8 +347,7 @@ async def blocked_window(r, streams, sport, label, seconds=6, check=None):
     """Hold a block for `seconds` while both directions of every stream keep
     trying: the LAN side sends throughout, and the WAN side answers on each
     reply tuple. Neither may cross, nor may any of the connections be cached
-    in a flowtable. No RPC to the peer here -- its control connection may
-    cross the stopped port too."""
+    in a flowtable."""
     await settle(r, streams, sport)
     before = {ident: received(r, ident) for ident in streams}
     started, samples = time.monotonic(), []

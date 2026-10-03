@@ -38,7 +38,7 @@ async def sa_pair(r, cleanup, remote=WAN_IPV6):
     outer = next(a["local"] for i in json.loads((await command(
         r.target, r.session, "ip", "-j", "-4", "addr", "show", "dev", TARGET_WAN_IF))["stdout"])
         for a in i["addr_info"] if a["family"] == "inet")
-    peer = os.environ.get("ASK_WAN_IP", "127.0.0.1")
+    peer = os.environ["ASK_WAN_IPERF_IP"]
 
     async def add(agent, kind, identity, *options):
         await command(agent, r.session, "ip", "xfrm", kind, "add", *identity, *options)

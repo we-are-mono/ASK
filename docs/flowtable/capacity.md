@@ -67,14 +67,14 @@ proof.
 
 ```sh
 sudo PYTHONPATH=tools /opt/askd-agent/venv/bin/pytest -q \
-  tools/host_tests/test_flowtable.py \
-  tools/host_tests/test_flowtable_handle.py \
-  tools/host_tests/test_flowtable_route.py \
-  tools/host_tests/test_flowtable_policy_host.py
+  tools/host_tests/flowtable.py \
+  tools/host_tests/flowtable_handle.py \
+  tools/host_tests/flowtable_route.py \
+  tools/host_tests/flowtable_policy_host.py
 
 ASK_WAN_IPERF_IP=10.0.0.232 \
   ASK_FLOWTABLE_ARTIFACTS=/tmp/ask-flowtable-capacity/proof \
-  make ask-test ASK_TEST_ARGS='-q -k test_flowtable_capacity_overflow_and_reuse'
+  make ask-test ASK_TEST_ARGS='-q -k "flowtable_capacity and test_overflow_and_reuse"'
 ```
 
 The DUT test creates 8,192 TCP and 8,192 UDP connections through native

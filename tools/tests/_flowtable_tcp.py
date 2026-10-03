@@ -17,6 +17,8 @@ from _flowtable_rig import DPORT, SPORT, TABLE, WAN_IP, artifact_dir, command, r
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from ask_orch.client import Agent
 from ask_orch.counters import kernel_tx_packets
+from ask_orch.commands import console_python
+from ask_orch.uart import Console
 
 BLOCK = bytes(range(256)) * 256
 
@@ -81,12 +83,14 @@ class Connection:
 
 @asynccontextmanager
 async def connection(r):
+    # Stage the cached measurement script before a short-lived flow exists.
+    await transfer_counters()
     accepted = asyncio.Queue()
     server = await asyncio.start_server(lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IP, DPORT)
     script = (f"LAN_IP={r.lan_ip!r}; WAN_IP={WAN_IP!r}; SPORT={SPORT}; DPORT={DPORT}\n" +
               f"PEER_NETNS={getattr(r, 'peer_netns', None)!r}\n" +
-              Path(__file__).with_name("flowtable_neighbour_peer.py").read_text() + "\n" +
-              Path(__file__).with_name("flowtable_tcp_peer.py").read_text())
+              Path(__file__).with_name("_flowtable_neighbour_peer.py").read_text() + "\n" +
+              Path(__file__).with_name("_flowtable_tcp_peer.py").read_text())
     peer = asyncio.create_task(lan_run_python(r.lan, script, timeout=180, label="flowtable_tcp"))
     writer = None
     try:
@@ -210,24 +214,50 @@ async def capture_fin(r, conn):
                for p in packets if TCP in p), "endpoint's final ACK missing"
 
 
+async def transfer_counters(*, state=True):
+    """Keep measurement overhead below the TCP expiry test's idle timeout."""
+    result = await console_python(Console.target(), f'''
+import json, time
+from pathlib import Path
+from askd_agent.counters import _ethtool_stats
+from askd_agent.observe import read_state
+started = time.monotonic()
+state = read_state() if {state!r} else None
+tx = {{dev: _ethtool_stats(dev)['tx packets [TOTAL]']
+      for dev in {(TARGET_LAN_IF, TARGET_WAN_IF)!r}}}
+cpu = {{parts[0]: [int(x) for x in parts[1:9]]
+       for line in Path('/proc/stat').read_text().splitlines()
+       if (parts := line.split()) and parts[0].startswith('cpu')}}
+print(json.dumps({{'state': state, 'software_tx': tx, 'cpu': cpu,
+                  'at': started, 'span': time.monotonic() - started}}))
+''')
+    return json.loads(result["stdout"])
+
+
 async def hardware_transfer(r, conn, op, label=None):
-    before = await r.state()
-    tx_before, cpu_before = await software_tx(r), await cpu(r)
+    # Bookkeeping between transfers must not consume the four-second idle
+    # budget. Exclude this refresh from the measured packet deltas.
+    await conn.transfer("upload", size=len(BLOCK))
+    first = await transfer_counters()
     report = await conn.transfer(op, size=64 * MIB)
-    cpu_after, tx_after = await cpu(r), await software_tx(r)
-    after = await r.state()
+    last = await transfer_counters()
+    before, after = first["state"], last["state"]
+    tx = {dev: last["software_tx"][dev] - count for dev, count in first["software_tx"].items()}
+    report.update(software_tx=tx, cpu=cpu_delta(first["cpu"], last["cpu"]),
+                  before=before, after=after,
+                  measurements=[{k: sample[k] for k in ("at", "span")} for sample in (first, last)])
+    # Retain both snapshots even if the ownership assertion fails.
+    r.record(label or f"tcp-hardware-{op}", report)
     assert after["entries"] == 2 and after["installs"] == before["installs"], (before, after)
     old = {f["in"]: f for f in before["flows"]}
     deltas = {f["in"]: int(f["packets"]) - int(old[f["in"]]["packets"]) for f in after["flows"]}
     ingress = TARGET_LAN_IF if op == "upload" else TARGET_WAN_IF
     assert deltas[ingress] >= report["bytes"] // 1500, deltas
     assert deltas[TARGET_WAN_IF if op == "upload" else TARGET_LAN_IF] > 100, deltas
-    tx = {dev: tx_after[dev] - tx_before[dev] for dev in tx_before}
-    # Management HTTP uses WAN software TX too. Bound it far below the tens
-    # of thousands of data frames, while allowing control-plane traffic.
+    # Keep the existing allowance for ambient WAN traffic, far below the
+    # tens of thousands of measured data frames.
     assert 0 <= tx[TARGET_LAN_IF] <= 32 and 0 <= tx[TARGET_WAN_IF] <= 512, tx
-    report.update(hardware_packets=deltas, software_tx=tx, cpu=cpu_delta(cpu_before, cpu_after),
-                  before=before, after=after)
+    report.update(hardware_packets=deltas)
     r.record(label or f"tcp-hardware-{op}", report)
     return report
 

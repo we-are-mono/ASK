@@ -1,10 +1,12 @@
 # Copy to .ask-test.mk and fill in your bench. Git ignores the local file.
 # Shell environment and make command-line values override these ?= assignments.
+# Optional DUT traffic address; control uses ASK_TARGET_DEV.
 DUT_IP ?=
 WAN_IP ?=
 # Optional: separate HTTP control address for the WAN agent.
 WAN_AGENT_IP ?=
 ASK_TARGET_DEV ?=
+# libvirt VM with qemu-guest-agent and guest-exec enabled.
 ASK_LAN_VM ?=
 ASK_LAN_NIC ?=
 # WAN interface used by multicast and profile packet injection.
@@ -13,5 +15,3 @@ ASK_WAN_INJECT_IF ?=
 # Board port roles, independent of the orchestrator setup.
 ASK_TARGET_LAN_IF ?= eth3
 ASK_TARGET_WAN_IF ?= eth4
-ASK_LAN_USER ?= root
-ASK_LAN_PASSWORD ?=

@@ -88,20 +88,8 @@ async def mcast_bridge(aiohttp_session, target_agent):
     membership reports, the MDB stays empty, and the bridge floods every group
     to every port — which looks exactly like a working test and proves nothing.
 
-    **The enslavement cannot go over the agent, and an earlier revision of this
-    fixture tried.** The agent is reached on the WAN port's own address, and the
-    moment that port becomes a bridge port its address stops receiving — a
-    bridge port's frames go to the bridge, not to the port. Every later step,
-    including this fixture's own teardown, was then issued down a path that no
-    longer existed: the run hung at the first case and left the port enslaved,
-    recoverable only by a login on the serial console.
-
-    So the address follows the port into the bridge, as one sequence on the
-    console, and two details keep the orchestrator from noticing. The bridge is
-    created carrying the WAN port's own MAC rather than the lowest port's, so
-    the peer's neighbour entry stays correct and no repin is needed. And the
-    address is moved rather than duplicated, so there is exactly one route to
-    the segment at any moment.
+    The bridge inherits the WAN address and MAC for its querier and local
+    traffic. UART control remains available throughout the topology change.
     """
     await multicast_on(target_agent, aiohttp_session)
     stack = TopologyStack()
@@ -131,8 +119,8 @@ async def mcast_bridge(aiohttp_session, target_agent):
             if management:
                 break
         assert management, (
-            f"no IPv4 address on {TARGET_WAN_IF} or {BRIDGE} to manage the DUT "
-            f"by; this fixture moves that address and cannot start without it")
+            f"no IPv4 address on {TARGET_WAN_IF} or {BRIDGE} for the bridge querier; "
+            f"this fixture moves that address and cannot start without it")
         routes = json.loads((await _exec("ip", "-j", "route", "show",
                                          "default"))["stdout"] or "[]")
         gateway = next((r["gateway"] for r in routes
@@ -144,26 +132,12 @@ async def mcast_bridge(aiohttp_session, target_agent):
         assert r.get("errno") == 0, f"reading {TARGET_WAN_IF}'s address: {r}"
         mac = bytes.fromhex(r["content_hex"]).decode().strip()
 
-        # Put the tree back the way this fixture expects to find it, over the
-        # console and whether or not it is already that way. Deleting a stale
-        # bridge takes the management address with it, so the two have to
-        # happen together and the agent cannot be the one to do it.
+        # Restore a stale bridge before building the test topology.
         for argv in (["ip", "link", "del", BRIDGE],
                      ["ip", "addr", "replace", management, "dev", TARGET_WAN_IF],
                      ["ip", "link", "set", TARGET_WAN_IF, "up"],
                      ["ip", "link", "set", TARGET_LAN_IF, "up"]):
             await console_command(console, *argv, check=False, timeout=30)
-        for _ in range(40):
-            try:
-                if (await target_agent.health(aiohttp_session)).get("ok"):
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-        else:
-            pytest.fail(f"the agent did not answer after {management} was put "
-                        f"back on {TARGET_WAN_IF}")
-
         # IGMPv3 and MLDv2 from the first query: a host hears it on the LAN
         # port, and one IGMPv2 query keeps that host's interface in v2 mode
         # for minutes, where it neither reports sources nor sends a BLOCK.
@@ -199,17 +173,6 @@ async def mcast_bridge(aiohttp_session, target_agent):
                           "dev", BRIDGE])
         for argv in steps:
             await console_command(console, *argv, timeout=30)
-
-        for _ in range(40):
-            try:
-                if (await target_agent.health(aiohttp_session)).get("ok"):
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-        else:
-            pytest.fail("the agent did not answer after the ports joined the "
-                        f"bridge; {management} was moved to {BRIDGE}")
 
         # The querier's startup queries are spaced by
         # multicast_startup_query_interval; without waiting them out the first

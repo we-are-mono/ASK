@@ -114,7 +114,7 @@ this bench:
 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=54000 \
   make ask-test ASK_TEST_ARGS='-q -k test_flowtable_startup'
 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=54100 \
-  make ask-test ASK_TEST_ARGS='-q -k test_flowtable_capacity_overflow_and_reuse'
+  make ask-test ASK_TEST_ARGS='-q -k "flowtable_capacity and test_overflow_and_reuse"'
 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=54200 \
   make ask-test ASK_TEST_ARGS='-q -k test_flowtable_concurrent_policy_and_routes'
 ```

@@ -84,12 +84,7 @@ async def expected_hash(con, policy):
 
 
 async def apply(con, policy, *, check=True, r=None):
-    """Install a policy. Pass `r` to write the config over the agent instead of
-    the console: the write is setup, never inside a measurement window, and the
-    agent egresses on the WAN port where the software-TX bounds are loose --
-    the tight ones are all on the LAN port, which agent traffic never touches.
-    The CLI run stays on the console either way, because apply drains the
-    datapath and an HTTP reply in flight across that drain can be lost."""
+    """Write and apply a policy through the shared DUT UART session."""
     text = policy_to_conf(policy)
     if r is not None:
         written = await r.target.fs_write(r.session, CONFIG, text)

@@ -520,7 +520,7 @@ replace under a key that never leaves the table, so no frame reaches the CPU
 across it; a viewer changing back to the channel waits for one worker pass, in
 which the stream is still dropped where before the bridge would have forwarded
 it at once. The 1,000,000-frame rig case
-`test_flowtable_service_multicast_bridged_discard_keeps_every_buffer` finds
+`test_bridged_discard_keeps_every_buffer` finds
 every BMan pool at its count again afterwards: QMan's discard of a rejected
 FMan enqueue returns the buffer.
 
@@ -570,7 +570,7 @@ failed install is, and goes back in if an id frees before its tries run out.
 `mcast_discards_evicted` counts them, and `mcast_group_ids4`,
 `mcast_group_ids6` and `mcast_group_id_slots` say how many ids each family
 holds and how many it has. The rig
-case `test_flowtable_service_multicast_discard_gives_its_id_to_a_listener`
+case `test_gives_its_id_to_a_listener`
 fills a family with discards and then joins a listener, whose stream has to be
 carried at once and stay carried, with exactly one discard gone.
 
@@ -644,7 +644,7 @@ Nothing announces a registered hook, so the worker checks the hook lists at
 every pass, and the refresh runs a pass every five seconds while any flow
 exists. `/proc` says `refused-filter`, and the kernel log says so once each
 time the state changes. The rig case
-`test_flowtable_service_multicast_bridge_yields_to_a_bridge_filter` drops the
+`flowtable_service_multicast_bridge.py::test_yields_to_a_bridge_filter` drops the
 group in a bridge `forward` chain while it is carried: the flow comes out, the
 set-top box receives nothing, and the flow goes back in when the chain goes.
 
@@ -724,7 +724,7 @@ Nothing reports a filter or a chain added or removed, so the refresh asks
 every flow again every five seconds. If there is no memory for the table of
 what each port runs, the pass derives nothing and the flows wait for the next.
 
-The rig cases `test_flowtable_service_multicast_bridge_yields_to_tc` and
+The rig cases `flowtable_service_multicast_bridge.py::test_yields_to_tc` and
 `..._yields_to_a_netdev_chain` drop one of two UDP ports of a carried group,
 first at the WAN port's ingress and then at the set-top box port's egress. Each
 time the flow comes out and the dropped port stops arriving while the other is
@@ -743,7 +743,7 @@ of hardware and none goes in, each reading `refused-paused`, which is tested
 ahead of every other refusal. `/proc` reports the switch as `mcast_enabled`. A
 consumer without the service, such as OpenWrt's fw4, leaves it on and carries
 multicast as before. The rig cases
-`test_flowtable_service_multicast_stops_with_acceleration` and
+`flowtable_service_multicast.py::test_stops_with_acceleration` and
 `..._bridge_stops_with_acceleration` stop by each route with live unicast and
 both learners' groups installed, require nothing of either in hardware when
 the stop returns, streams still delivered through Linux, a group learned
@@ -1038,7 +1038,7 @@ that, and a slot that lapses goes to the first frame that asks for it. With
 more streams than slots in one set, which the hash makes rare, each gets a
 slot within a few intervals. `/proc` counts the worker's runs as
 `mcast_passes`. The rig case
-`test_flowtable_service_multicast_bridge_unwanted_streams_wake_it_once`
+`flowtable_service_multicast_bridge.py::test_unwanted_streams_wake_it_once`
 interleaves 32 unjoined streams at about 1 kpps. Each is recorded once
 (`mcast_observed`), and the worker runs about once per stream rather than
 once per frame.
@@ -1109,7 +1109,7 @@ replication, the chain swap a join or leave performs against an installed
 group, and the listener ceiling all need a second live listener port. And the
 managed switch upstream does not trunk VLAN 3999, so while the tag is derived
 correctly and reaches the encoder, a tagged frame has not been carried end to
-end. The encapsulation itself is covered by `tools/host_tests/test_mcast_hm.py`.
+end. The encapsulation itself is covered by `tools/host_tests/mcast_hm.py`.
 
 ## Tests
 

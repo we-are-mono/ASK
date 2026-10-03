@@ -22,7 +22,7 @@ from _flowtable_tcp import software_tx
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 
 CHANGED_MAC = "02:9d:99:b2:33:02"
-PEER = Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
+PEER = Path(__file__).with_name("_flowtable_neighbour_peer.py").read_text()
 
 
 async def lan_neighbour(r, **changes):

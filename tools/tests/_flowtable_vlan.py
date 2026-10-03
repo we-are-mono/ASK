@@ -69,7 +69,7 @@ async def _tagged_segment(r, stack, inner):
                                   vid=VLAN_ID, ipv4=f"{DUT_VLAN_ADDR}/24")
     lan_if = await lan_vlan_subif(stack, r.lan, parent=LAN_NIC, vid=VLAN_ID,
                                   ipv4=f"{LAN_VLAN_ADDR}/24",
-                                  routes=[f"{WAN_IP}/32 via {DUT_VLAN_ADDR} dev vlan{VLAN_ID}"])
+                                  routes=[] if inner else [f"{WAN_IP}/32 via {DUT_VLAN_ADDR} dev vlan{VLAN_ID}"])
     r.lan_ip, subnet = LAN_VLAN_ADDR, LAN_SUBNET
     if inner:
         dut_if = await dut_vlan_subif(stack, r.target, r.session, parent=dut_if,
@@ -214,15 +214,3 @@ async def _established(r, count=64):
     assert set(before) == set(after), ("a direction was readmitted mid-measurement",
                                        before, after)
     return flows, {c: after[c] - before[c] for c in before}
-
-
-async def _echo_stream(reader, writer):
-    try:
-        while True:
-            data = await reader.read(65536)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
-    finally:
-        writer.close()

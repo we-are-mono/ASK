@@ -2,7 +2,7 @@
 
 from contextlib import asynccontextmanager
 
-from ask_orch.artifacts import record
+from ask_orch.artifacts import artifact_dir, record
 
 
 def verify_capture(result, nodeid, allowlist):
@@ -15,11 +15,26 @@ def verify_capture(result, nodeid, allowlist):
 
 
 @asynccontextmanager
-async def capture_window(agent, session, nodeid, allowlist, *, name="kernel"):
+async def capture_window(agent, session, nodeid, allowlist, *, name="kernel", failed_check=lambda: False):
     cap_id = await agent.capture_start(session)
+    failed = False
     try:
         yield cap_id
+    except BaseException:
+        failed = True
+        raise
     finally:
         result = await agent.capture_stop(session, cap_id)
         record(name, result, nodeid=nodeid)
-        verify_capture(result, nodeid, allowlist)
+        try:
+            verify_capture(result, nodeid, allowlist)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            artifact = result.get("artifact")
+            if artifact:
+                if failed or failed_check():
+                    data = await agent.artifact(session, artifact["id"])
+                    (artifact_dir(nodeid) / f"{name}-log.json").write_bytes(data)
+                await agent.request(session, "artifact/release", {"id": artifact["id"]})

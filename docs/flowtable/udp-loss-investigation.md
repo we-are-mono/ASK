@@ -186,8 +186,8 @@ receiving PHY checked them, which is the medium, not the code.
 
 After re-terminating that run, 303,418 frames produced no new CRC, error or
 length increment, and the four tests whose failures had been attributed to
-this loss — `test_flowtable_connections_independent_lifetimes`,
-`test_flowtable_policy_revokes_live_connections`,
+this loss — `flowtable_connections.py::test_independent_lifetimes`,
+`flowtable_policy.py::test_revokes_live_connections`,
 `test_flowtable_selective_neighbour` and its barrier variant, along with both
 `test_flowtable_hairpin` parameters — passed in one run with no retries.
 

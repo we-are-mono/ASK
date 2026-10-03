@@ -225,7 +225,7 @@ hardware.
 
 ## Proof
 
-`tools/tests/test_flowtable_ifstats.py`, on the DK with the KASAN image, 64
+`tools/tests/flowtable_ifstats.py`, on the DK with the KASAN image, 64
 frames each way per case:
 
 - **One tag.** Both flow rows count 64 frames of 302 and 298 bytes; the
@@ -243,17 +243,17 @@ frames each way per case:
   not before patch 104; and the VLAN device's own transmit counter, fed by
   Linux alone here, reads 298 per 302-byte frame, which is the convention the
   hardware fold restates to.
-- **Session** (`test_flowtable_pppoe_session_counters`, a session over a tagged
+- **Session** (`flowtable_pppoe.py::test_session_counters`, a session over a tagged
   WAN). The record reads 64 × 302 received and 64 × 306 transmitted for 64
   frames of 284-byte payload; `ip -s link show ppp0` moves by 64 × 284 both
   ways plus the session's own LCP echoes; and retiring the connection leaves
   the record in place with no references, its totals intact.
 
-Host tests carry what the bench cannot show cheaply: `test_ifstats.py` the
+Host tests carry what the bench cannot show cheaply: `ifstats.py` the
 publication, fold, restatement and withdrawal against the real allocator on a
 simulated MURAM, and the packet count carried across a wrap by reads and the
-sampler in either order; `test_vlan_hm.py` the two opcodes' record lists, their order
-and the all-or-nothing rule against the shipped SDK header; `test_flowtable.py`
+sampler in either order; `vlan_hm.py` the two opcodes' record lists, their order
+and the all-or-nothing rule against the shipped SDK header; `flowtable.py`
 the record's lifetime across flows, unregistration and reuse of an index.
 
 `/proc/cdx_flowtable` gained `vlan_records` and `vlan_slots` in its header and

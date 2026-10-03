@@ -128,18 +128,16 @@ sstate cache turns a ~40-minute build into minutes.
 ### 3. Build
 
 ```sh
-make ask-image        # = cd meta-ask && kas build .config.yaml
+make ask-image        # builds the test image with KASAN enabled
 ```
 
 The image lands in `meta-ask/build/tmp/deploy/images/ask-ls1046a/` as
 `Image.gz-initramfs-ask-ls1046a.bin` (kernel + initramfs, ~104 MB). From an empty
 sstate cache the build takes ~40 minutes.
 
-For the KASAN sanitizer (memory-error instrumentation, off by default):
-
-```sh
-KASAN=1 make ask-image
-```
+Always prefer KASAN memory-error instrumentation for testing and debugging.
+It is required for all DUT test runs. `make ask-image`
+enables it, and the DUT suite checks the running kernel before any test setup.
 
 ### Deploying to the board
 

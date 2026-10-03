@@ -598,7 +598,7 @@ restart: live SAs keep their entries and their SEC contexts.
 
 #### Proved on hardware, 2026-09-18
 
-`tools/tests/test_ipsec_xfrm_offload.py`, both cases, on a KASAN flowtable
+`tools/tests/ipsec_xfrm_offload.py`, both cases, on a KASAN flowtable
 boot. Each was watched failing first: `esp-hw-offload: off [fixed]` before the
 ops were attached, and the SA refused before each gate below was cleared.
 
@@ -1088,9 +1088,9 @@ A frame the driver cannot give SEC — no SEC queue for its SA, a header the
 word cannot describe, no S/G table, a queue that refuses it — is freed and
 counted as the port's transmit drop (`ip -s link`), and `tx toenc` counts
 only the frames SEC was given. Before, every such frame vanished and was
-still counted as sent. `tools/host_tests/test_ipsec_sec_submit.py` compiles
+still counted as sent. `tools/host_tests/ipsec_sec_submit.py` compiles
 the word's choice and the submit out of the patched tree;
-`test_ipsec_offload_transport.py` has a software peer decrypt the DUT's
+`ipsec_offload_transport.py` has a software peer decrypt the DUT's
 transport traffic, half of it carrying IPv4 options.
 
 Proof: a tunnel carries traffic with no flowtable entry at all, with the SEC
@@ -1098,7 +1098,7 @@ counter advancing and an independent peer decrypting what it produced.
 
 #### Proved on hardware, 2026-09-18
 
-`tools/tests/test_ipsec_packet_offload_traffic.py`, on a KASAN flowtable boot.
+`tools/tests/ipsec_packet_offload_traffic.py`, on a KASAN flowtable boot.
 The tunnel runs between the DUT and the LAN VM; only the DUT is offloaded, so
 the peer's decryption is an independent check on what SEC emitted.
 
@@ -1301,7 +1301,7 @@ description reaching it is new.
 
 #### Proved on hardware, 2026-09-18
 
-`tools/tests/test_ipsec_inbound_flow_offload.py`, on a KASAN flowtable boot.
+`tools/tests/ipsec_inbound_flow_offload.py`, on a KASAN flowtable boot.
 Both halves of the tunnel are offloaded, the DUT forwards between the WAN-side
 orchestrator and an inner address on the LAN VM, and only the DUT is in
 hardware.
@@ -1415,7 +1415,7 @@ path changes after admission, the SA follows it (§8): its directions are
 retired, counted in `mtu_invalidations`, and readmitted under the new bound
 (A231).
 
-`test_flowtable_service_ipsec_mtu.py` sends DF datagrams across both windows,
+`flowtable_service_ipsec_mtu.py` sends DF datagrams across both windows,
 with the bound set four ways: by the SA's MTU on the port, with the inner route
 carrying no MTU; by an inner route MTU below the SA's; and by a 1492-byte hop
 to the peer, once as a route with that MTU and once as a PMTU learned from the
@@ -1609,7 +1609,7 @@ HMAC-SHA256-128 in transport mode, which the entry then held every full-size
 frame leaving SEC to. Without a state yet, as under a trap policy at install,
 the answer with the default `xfrm_larval_drop` was a blackhole on the loopback
 device, which refused the SA, and the lookup could send an ACQUIRE for a flow
-nothing had sent. `test_ipsec_offload_transport.py` sends full-size frames through such an
+nothing had sent. `ipsec_offload_transport.py` sends full-size frames through such an
 SA, installed before its policy and after it, and each must cross whole.
 
 A learned PMTU announces itself to nobody: `__ip_rt_update_pmtu()` and its
@@ -1662,7 +1662,7 @@ far this got before a `dump_stack()` in the delete callback named
 
 #### Proved off the hardware
 
-`tools/host_tests/test_ipsec_adapter.py`. The watch is the part a rig run
+`tools/host_tests/ipsec_adapter.py`. The watch is the part a rig run
 cannot show cheaply — a peer moves once, correctly, and the interesting cases
 either do not occur or occur once in a way nothing distinguishes from
 success — so the cases live in the harness: a neighbour that aged versus one
@@ -1714,7 +1714,7 @@ and QMan portals different ICIDs brings the reuse back.
 
 #### Proved on hardware, 2026-09-23
 
-`test_flowtable_service_ipsec_shared_sequence`: an offloaded UDP blast and a
+`flowtable_service_ipsec.py::test_shared_sequence`: an offloaded UDP blast and a
 CPU-path ICMP flood on one SA for 4 s, ESP captured at the peer. The DECO ICID
 row samples SEC's per-DECO debug register while only hardware traffic runs.
 
@@ -1925,7 +1925,7 @@ what would build either (A233):
 Under `packet` such a child SA failed at its outbound half and now fails at
 its inbound one. A policy added by hand before the SA it names by SPI is
 refused too, and has to follow the SA.
-`tools/tests/test_ipsec_offload_auto_fallback.py` drives strongSwan's sequence
+`tools/tests/ipsec_offload_auto_fallback.py` drives strongSwan's sequence
 with `ip xfrm`.
 
 **Mark-steered uplinks (A235, a documented contract).** The inbound check asks

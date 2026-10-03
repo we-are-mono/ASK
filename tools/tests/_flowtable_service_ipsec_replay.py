@@ -186,8 +186,8 @@ async def arrivals(r, spi, seen, expected):
 @contextlib.asynccontextmanager
 async def lan_listener(r, marker):
     """The LAN end's record of marked datagrams, for as long as the block runs.
-    A background process with a pidfile: the LAN console is one channel, and
-    the listener has to outlive the command that starts it."""
+    A background process with a pidfile lets the listener outlive the command
+    that starts it."""
     script = base64.b64encode(listener_script(marker).encode()).decode()
     started = await lan_run(r.lan, f"echo {script} | base64 -d > {LISTENER} && rm -f {DELIVERED} && "
                                    f"(nohup python3 {LISTENER} >/dev/null 2>&1 & echo $! > {LISTENER_PID}) && "

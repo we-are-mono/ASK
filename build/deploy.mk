@@ -1,6 +1,6 @@
 # Deploy config for the ASK test harness.
 # Installs the WAN agent and runner dependencies. The DUT agent ships
-# in the Yocto image, and the LAN client is driven over UART.
+# in the Yocto image, and the LAN client uses QEMU guest-agent control.
 
 # WAN host — the machine physically reachable from the DUT's WAN
 # interface. Runs the orchestrator + pytest. Usually localhost (the
@@ -8,7 +8,7 @@
 WAN_PREFIX  ?= /opt/askd-agent
 
 # Canonical agent source tree (same one the Yocto recipe ships).
-ASKD_AGENT_SRC := $(CURDIR)/meta-ask/recipes-support/ask-test-agent/files/askd_agent
+ASKD_AGENT_SRC := $(CURDIR)/tools/askd_agent
 ASKD_SERVICE   := $(CURDIR)/meta-ask/recipes-support/ask-test-agent/files/askd-agent.service
 
 # Agent and orchestrator share the pinned dependency set.

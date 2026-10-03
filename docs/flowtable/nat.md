@@ -139,7 +139,7 @@ parity.
 
 `test_flowtable_udp_masquerade` and `test_flowtable_tcp_masquerade` repeat the
 translation/lifetime proofs with native masquerade rules. The separate
-`test_flowtable_masquerade_wan_lifecycle` uses a temporary WAN subnet to remove
+`flowtable_masquerade.py::test_wan_lifecycle` uses a temporary WAN subnet to remove
 an active address, replace it, and take the WAN interface down/up. Both live TCP
 and UDP conntracks and hardware directions must disappear at each destructive
 transition. Fresh connections must use the replacement address and offload
@@ -147,7 +147,7 @@ without recreating the policy table. Its setup requires this endpoint address:
 
 ```sh
 ASK_WAN_IPERF_IP=198.18.40.2 ASK_FLOWTABLE_SPORT=55400 \
-  make ask-test ASK_TEST_ARGS='-q -k test_flowtable_masquerade_wan_lifecycle'
+  make ask-test ASK_TEST_ARGS='-q -k "flowtable_masquerade and test_wan_lifecycle"'
 ```
 
 See the [MASQUERADE validation record](history/masquerade.md).

@@ -639,7 +639,7 @@ Two defects in the hardware layer had to be fixed for any of this to work
 twice, both filed as A143 and A144 and both reachable from CMM as well:
 enabling QoS drove an already-shaped channel's excess rate to zero, starving
 every class queue on it, and disabling QoS left the LNI shaper enabled, so a
-port could only ever be enabled once. `tools/host_tests/test_ceetm_qos_enable.py`
+port could only ever be enabled once. `tools/host_tests/ceetm_qos_enable.py`
 cycles the pair and fails on either.
 
 *Proved on hardware, 2026-09-17.* Both ownership modes, on the KASAN image.
@@ -1026,7 +1026,7 @@ are not:
   requested, because `MaxTH` rounds down to an eight-bit mantissa and on a band
   that is narrow beside its own depth that rounding is most of the band.
 
-Both were caught by `tools/host_tests/test_ceetm_wred.py`, which asserts the
+Both were caught by `tools/host_tests/ceetm_wred.py`, which asserts the
 invariant that matters — the curve's *implied minimum* lands back on the
 minimum that was asked for — across seven shapes rather than checking that each
 field round-trips.
@@ -1521,7 +1521,7 @@ admission path. The filter is therefore looked up twice: once to decide which
 profile to read, and again afterwards to find the baseline, because it can be
 destroyed in between.
 
-`tools/host_tests/test_police.py` pins the arithmetic — the colour mapping, the
+`tools/host_tests/police.py` pins the arithmetic — the colour mapping, the
 delta, the cleared counter, the seeded baseline, per-filter independence and
 the unknown cookie. Two of those assertions were confirmed to fail without the
 code that satisfies them.
@@ -1986,9 +1986,9 @@ registered, never clamped.
 
 The attach no longer enables the SEC profile either. It was created enabled
 all along, so that call only ever returned an error nobody read.
-`tools/host_tests/test_devlink_policer.py` compiles the chain from the loader's
+`tools/host_tests/devlink_policer.py` compiles the chain from the loader's
 defaults through profile creation to the registered descriptors, and
-`test_cdx_startup.py` holds the instance to the profiles' lifetime through
+`cdx_startup.py` holds the instance to the profiles' lifetime through
 every startup fault point.
 
 **What this closes.** With the punt rate a trap policer and the SEC rate a
@@ -2149,7 +2149,7 @@ selection that already decodes the same class from the same mark:
 - **Before the DSCP map is consulted**, so the map reads the codepoint the
   frame leaves with. In hardware the rewrite is an opcode of the entry's
   header manipulation and the map is read by the enqueue that ends it, which
-  is the order this follows; `test_flowtable_qos_dscp_remark_agrees_in_software`
+  is the order this follows; `flowtable_qos.py::test_dscp_remark_agrees_in_software`
   checks it on the rig, and the order in `cdx_htb_select_queue()` is the one
   line to change if the hardware turns out to read the field first.
 
@@ -2170,11 +2170,11 @@ a flow leaving by a plain port. One leaving by a PPPoE session or a tunnel —
 with admission refusing a non-TCP IPv4 flow whose path MTU is below its ingress
 port's, every UDP upload over a PPPoE WAN is one — loses the conntrack again at
 `ppp_start_xmit()` or the tunnel's own scrub, and the port finds its connection
-by the packet's tuple instead; `test_flowtable_pppoe_qos_upload_keeps_its_class`
+by the packet's tuple instead; `flowtable_pppoe.py::test_qos_upload_keeps_its_class`
 checks that on the rig.
-`test_flowtable_software_path_carries_the_conntrack` compiles the kernel's
+`flowtable.py::test_software_path_carries_the_conntrack` compiles the kernel's
 forward step on the host, and
-`test_flowtable_qos_declined_flow_keeps_its_class_in_software` checks the leaf
+`flowtable_qos.py::test_declined_flow_keeps_its_class_in_software` checks the leaf
 counters on the rig.
 
 *Effort: 3–4 days.*

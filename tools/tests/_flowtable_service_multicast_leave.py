@@ -19,6 +19,8 @@ from _topology import (
     lan_vlan_subif,
 )
 from ask_orch.counters import kernel_tx_packets
+from ask_orch.commands import console_python
+from ask_orch.uart import Console
 
 # How a membership ends, and what the host does to end it. `mode` is the
 # filter mode it joined in; `end` is the socket call, or `silence` for a host
@@ -166,19 +168,19 @@ async def hardware_tx(r, dev):
 
 async def pool_contents(r):
     """Every BMan pool's free count, from its big-endian content register."""
-    script = ("for b in $(seq 0 63); do "
-              "echo $b $(devmem $(printf 0x%%x $((%d + 4*b))) 32); done" % BMAN_POOL_CONTENT)
-    # devmem is not the agent's to run; a namespace's shell is, and /dev/mem
-    # is the same in every one.
-    await command(r.target, r.session, "ip", "netns", "add", "ask-devmem", check=False)
-    out = (await command(r.target, r.session, "ip", "netns", "exec", "ask-devmem", "sh", "-c",
-                         script))["stdout"]
-    pools = {}
-    for line in out.splitlines():
-        bpid, value = line.split()
-        count = int.from_bytes(int(value, 16).to_bytes(4, "little"), "big")
-        if count:
-            pools[int(bpid)] = count
+    # Read locally in one operation. Spawning devmem for every pool takes
+    # most of a discard entry's five-second idle window before traffic starts.
+    result = await console_python(Console.target(), f'''
+import json, mmap, struct
+address = {BMAN_POOL_CONTENT}
+with open('/dev/mem', 'rb', buffering=0) as memory:
+    with mmap.mmap(memory.fileno(), mmap.PAGESIZE, flags=mmap.MAP_SHARED,
+                   prot=mmap.PROT_READ, offset=address & -mmap.PAGESIZE) as registers:
+        print(json.dumps({{b: struct.unpack_from('>I', registers,
+            address % mmap.PAGESIZE + 4*b)[0] for b in range(64)}}))
+''', timeout=10)
+    pools = {int(bpid): count for bpid, count in json.loads(result["stdout"]).items() if count}
+    assert pools, "BMan reported no populated buffer pools"
     return pools
 
 

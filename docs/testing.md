@@ -12,9 +12,7 @@ opening a console or changing the bench. Host tests need no bench settings.
 ---
 
 ## Topology
-The bench is three roles. They can be three physical machines, or (as we
-run it) one workstation acting as the orchestrator with the client as a
-local VM on it.
+The bench is three roles. The orchestrator hosts a libvirt LAN VM and connects to the physical DUT.
 
 ```
         ┌─────────────────────┐         WAN segment
@@ -28,7 +26,7 @@ local VM on it.
         │  · WAN test agent   │                      └──────┬───────┘
         └─────────┬───────────┘                      DUT LAN port
                   │ USB-serial to DUT                        │
-                  │ serial/PTY to client                     │ DHCP-served
+                  │ virtio/QGA to client                     │ DHCP-served
                   │                                          │ LAN segment
         ┌─────────┴───────────┐                              │
         │  LAN client         │◄─────────────────────────────┘
@@ -42,7 +40,7 @@ Roles:
 - **Orchestrator / WAN host** — builds the firmware image, serves it over
   TFTP, runs the pytest suite, hosts the WAN-side iperf3 server, and runs a
   WAN-side test agent. It sits on the DUT's **WAN** network. It also holds
-  the serial links to both the DUT and the client. In our lab this is a
+  the DUT serial link and the client VM's virtio channel. In our lab this is a
   single Linux workstation.
 
 - **DUT** — the LS1046A-class gateway under test. It runs the ASK test
@@ -53,13 +51,10 @@ Roles:
 - **LAN client** — a machine or VM cabled to the DUT's LAN port. It is a
   plain **DHCP client**: it takes its address from the DUT and lives behind
   the DUT's NAT. The traffic tests originate/sink here. In our lab this is a
-  libvirt VM on the orchestrator host, but any machine on the DUT's LAN port
-  works.
+  libvirt VM on the orchestrator host.
 
-The key asymmetry that shapes everything below: **the client is only
-reachable over its serial console, never over the network.** It sits behind
-the DUT's NAT, so the orchestrator has no IP route to it. All LAN-side test
-work is scripted over the client's serial line.
+DUT control uses UART; LAN control uses the VM's QEMU guest agent. Both stay
+available when a test interrupts forwarding, NAT, XFRM policy or a network link.
 
 ---
 
@@ -81,8 +76,8 @@ all runner and WAN-agent Python package versions, including indirect dependencie
 | `pytest-asyncio` | Async tests and fixture event loops |
 | `pytest-timeout` | Test-body watchdog; required even for short selections |
 | `pytest-xdist` | Optional parallel execution of host tests; installed with the runner |
-| `aiohttp` | HTTP agent and orchestrator client |
-| `pyserial` | DUT and LAN serial consoles |
+| `aiohttp` | WAN HTTP agent and client |
+| `pyserial` | DUT UART and manual console access |
 | `scapy`, `pyroute2`, `cffi` | Packet and network tooling in the harness environment |
 | `PyYAML` | Kernel-log allowlist loading |
 
@@ -106,10 +101,10 @@ Additional system dependencies depend on the selected suite:
 
 | Selection | Additional requirements |
 |---|---|
-| Python harness checks in `tools/host_tests/test_harness.py` | Runner environment only; no board or compiler |
+| Python harness checks in `tools/host_tests/harness.py` | Runner environment only; no board or compiler |
 | Compiled host regressions | C/C++ compiler, headers, standard C++ library, AddressSanitizer and UndefinedBehaviorSanitizer; Debian's `build-essential` toolchain supplies these. `HOSTCC` selects a compiler instead of `cc`. |
 | SDK/FMC/FMLIB host regressions | Patched kernel and pinned vendor source trees from the image build. `ASK_KERNEL_SOURCE` overrides the kernel tree; it must contain the ASK patches and SDK headers. |
-| DUT traffic tests | WAN agent, `ip`/`bridge`/`tc`, `iptables`, `conntrack`, `ethtool`, `iperf3`, `tcpdump`, and access to the DUT and LAN consoles |
+| DUT traffic tests | WAN agent, `ip`/`bridge`/`tc`, `iptables`, `conntrack`, `ethtool`, `iperf3`, `tcpdump`, and access to the DUT UART and LAN guest agent |
 | PPPoE tests and ISP profile | WAN-side `pppd` and `/usr/sbin/pppoe-server`, kernel PPPoE support, and the corresponding tools/modules in the DUT image |
 | Image building and booting | `make setup` build dependencies, kas, a TFTP server and the staged image/DTB |
 
@@ -149,7 +144,7 @@ Packages / services:
   root under the name U-Boot fetches.
 - **`iperf3`** — run as a server here (see [iperf3 server](#the-iperf3-server)).
 - **`libvirt` + `libvirt-clients`** — only if the client is a VM on this
-  host. `virsh` is used to open the client's serial console.
+  host. `virsh` reaches the client's QEMU guest agent.
 - **`python3` + `venv`** — for the WAN-side test agent and the pytest
   virtualenv (`make deploy-agent-wan` bootstraps the venv and installs the
   agent's requirements).
@@ -164,7 +159,7 @@ on loopback.
 ### DUT
 
 Nothing to install — the ASK test image carries everything (the on-DUT test
-agent auto-starts at boot). You only need to:
+kernel recorder auto-starts at boot). You only need to:
 
 - Wire its WAN port to the orchestrator/WAN segment and its LAN port to the
   client.
@@ -180,15 +175,18 @@ The image supplies routing/firewall tools, `smcrouted`/`smcroutectl`, PPP/PPPoE,
 packet capture, traffic generators, ASK modules and the test agent.
 
 Use an agent built from the same checkout as the runner. Kernel capture requires
-`capture_protocol: 2` in `/health`, readable `/dev/kmsg`, and retained boot logs.
+`capture_protocol: 2` and `serial_protocol: 1` in the UART health response,
+readable `/dev/kmsg`, and retained boot logs.
 After agent changes, rebuild, stage and boot the updated image. Preflight rejects
 an older agent; installing host packages cannot upgrade the agent inside the
 DUT's initramfs. Release runs also require the tools named by selected tests.
 
 ### LAN client
 
-A machine or VM on the DUT's LAN port, configured as a **DHCP client** so it
-picks up its address, gateway, and DNS from the DUT. Install:
+A libvirt VM on the DUT's LAN port, configured as a **DHCP client** so it
+picks up its address, gateway, and DNS from the DUT. The test image is the sole
+DHCP server on its LAN/AP subnets; authoritative mode lets clients renew after
+an initramfs reboot loses the server's lease database. Install:
 
 - A **DHCP client** (whatever your distro ships — `dhcpcd`, `udhcpc`,
   `dhclient`, `systemd-networkd`, or `NetworkManager`), bringing up the
@@ -198,8 +196,8 @@ picks up its address, gateway, and DNS from the DUT. Install:
 - **`tcpdump`** — the LAN-side capture tool the tests grep for expected
   frames.
 - **`iproute2`** (`ip`) — interface/route/neighbor manipulation.
-- **`python3`** — the harness stages small Python snippets to the client
-  over its serial line and runs them (see `lan_run_python`). Namespace cases
+- **`python3`** — the harness runs compressed snippets through the QEMU guest
+  agent (see `lan_run_python`). Namespace cases
   need Python 3.12 or newer for `os.setns`; Python 3.13 matches the runner.
 - **Scapy for the LAN's system `python3`** — used by the staged ARP and packet
   helpers. Installing it in the orchestrator's virtualenv does not install it
@@ -211,23 +209,25 @@ For a Debian 13 LAN VM with its DHCP client already configured:
 
 ```sh
 sudo apt-get install -y python3 python3-scapy iproute2 iputils-ping iperf3 \
-    tcpdump ethtool coreutils procps psmisc
+    tcpdump ethtool coreutils procps psmisc qemu-guest-agent
 ```
 
-The configured serial login must have root access for namespaces, interface
-changes and raw sockets.
+Expose a virtio channel named `org.qemu.guest_agent.0` in the libvirt domain
+and enable `qemu-guest-agent` inside the VM. It runs as root for namespaces,
+interface changes and raw sockets. `guest-exec` and `guest-exec-status` must be
+enabled. The harness checks them before LAN setup. Loki already provides this
+channel; no 9p mount or shared checkout is needed.
 
-The client must also expose a **serial console** the orchestrator can open
-(see below). For a libvirt VM this is the domain's serial device; for a
-physical client, a real serial port cabled to the orchestrator.
+[QEMU documents the command execution protocol](https://www.qemu.org/docs/master/interop/qemu-ga-ref.html#command-guest-exec).
+The harness sends source through `input-data`, checks output truncation, and
+uses a guest-side `timeout` so commands remain bounded if the runner stops.
 
 ---
 
 ## Console / serial access
 
-The harness bootstraps and drives both the DUT and the client over their
-**serial consoles**, with no network prerequisite. This is what makes it
-robust across reboots, NAT, and a downed network.
+The DUT uses its serial console for bootstrap, then a framed agent session on
+the same UART. The LAN VM uses its separate virtio guest-agent channel.
 
 ### DUT console
 
@@ -240,19 +240,12 @@ robust across reboots, NAT, and a downed network.
 
 ### Client console
 
-- If the client is a **libvirt VM**: its serial console is a host PTY,
-  resolved with `virsh ttyconsole <domain>` (which prints a `/dev/pts/N`
-  path). `QEMU:///system` needs root, so this typically runs under `sudo`.
-  Interactively: `tio $(sudo virsh ttyconsole <domain>)`.
-- If the client is **physical**: a serial cable to the orchestrator, same
-  idea as the DUT.
-- The harness opens it via `Console.lan()`.
+The VM's serial console remains available for manual recovery:
+`tio $(sudo virsh ttyconsole <domain>)`. Normal tests use QGA through libvirt.
 
-**One reader per serial line.** A serial console tolerates exactly one
-reader. If you leave an interactive terminal (or a stray `cat`) attached to
-a console, the harness's reads will come back garbled or time out. Detach
-any manual session before running the suite — the suite drives both
-consoles itself.
+**One reader per physical UART.** Detach manual terminals before running DUT
+tests. One session owns the UART; `Console.target()` handles used by individual
+tests borrow that session instead of opening another reader.
 
 ---
 
@@ -288,11 +281,10 @@ make stage-image    # copy the built image into the TFTP root
 `make ask-image` is a thin wrapper around `kas build` against the meta-ask
 manifest; `make stage-image` places the image where U-Boot fetches it.
 
-For a release-gate (memory-safety) run, build with KASAN instrumentation:
-
-```sh
-KASAN=1 make ask-image && make stage-image
-```
+Always prefer KASAN for testing and debugging. `make ask-image` always enables
+KASAN memory-error instrumentation. The DUT
+suite refuses to run on a kernel without `CONFIG_KASAN=y`. Direct kas builds
+must also set `KASAN=1`.
 
 ## Booting the image
 
@@ -303,8 +295,8 @@ boots it in RAM. Point U-Boot's environment at your TFTP server's address
 and the staged image name.
 
 The root filesystem is an initramfs, so **every boot is clean** — on-DUT
-changes do not persist across a reboot. The on-DUT test agent auto-starts;
-confirm it responds before running tests.
+changes do not persist across a reboot. The boot service retains the kernel
+log locally. Pytest starts the UART agent after logging into the root console.
 
 ---
 
@@ -317,18 +309,21 @@ without shell interpolation, including values with spaces.
 
 | Variable | What it points at | Setting |
 |---|---|---|
-| `DUT_IP` / `ASK_TARGET_IP` | DUT test-agent host (HTTP) | Required |
+| `DUT_IP` / `ASK_TARGET_IP` | DUT address used by traffic tests | Optional; tests usually discover interface addresses |
 | `ASK_TARGET_DEV` | DUT serial device | Required |
 | `ASK_TARGET_LAN_IF` | DUT netdev facing the client | Board default: `eth3` |
 | `ASK_TARGET_WAN_IF` | DUT netdev facing the WAN | Board default: `eth4` |
 | `ASK_LAN_VM` | libvirt domain of the client | Required |
-| `ASK_LAN_USER` / `ASK_LAN_PASSWORD` | client serial login | `root` / no password |
 | `ASK_LAN_NIC` | client's LAN-facing NIC name | Required |
 | `ASK_WAN_INJECT_IF` | WAN interface for packet injection | Required for multicast and profiles |
 | `WAN_AGENT_IP` / `ASK_WAN_IP` | WAN-side test-agent host (HTTP) | `WAN_IP`, or loopback for direct pytest |
 | `WAN_IP` / `ASK_WAN_IPERF_IP` | Traffic endpoint on the WAN network | Required |
 
 ## Running the suite
+
+Test files use plain names such as `tools/tests/flowtable_bridge.py` and
+`tools/host_tests/harness.py`. Helpers and staged peer scripts start with `_`;
+pytest discovers the other Python files. Test functions keep the `test_` prefix.
 
 ### Interpreting packet counters
 
@@ -352,7 +347,7 @@ presence and encapsulation overhead alone do not prove offload.
 
 Prerequisites: the DUT is on the test image with its agent responding, the
 WAN agent is deployed, the WAN iperf3 server is up, and no manual session is
-holding either serial console. The image boots only the flowtable offload
+holding the DUT serial console. The image boots only the flowtable offload
 path, so one boot runs the whole suite, `test_flowtable_*` included.
 
 ```sh
@@ -395,18 +390,27 @@ live output for debugging.
 Each invocation creates a unique directory under `/tmp/ask-tests-<uid>` (override
 with `ASK_TEST_ARTIFACTS`; `ASK_FLOWTABLE_ARTIFACTS` remains supported).
 The final output prints its path. It contains `junit.xml`, session metadata
-(revision, dependency versions, configured endpoints), DUT kernel/boot details,
+(revision, checkout fingerprint, dependency versions, configured endpoints), DUT kernel/boot details,
 boot logs, and one directory per test with setup/call/teardown results and
 diagnostic artifacts. Test names include a hash so parameterized cases cannot
-overwrite each other. Shared module captures and the LAN UART transcript
+overwrite each other. Shared module captures and the DUT UART transcript
 cover their corresponding fixture lifetimes. `ARGS='--junitxml=path.xml'`
 chooses another JUnit destination. Parallel host workers share the run directory.
+
+The checkout fingerprint covers tracked and untracked source files, deletions,
+symlinks and executable bits, while respecting Git's ignores. Firmware metadata
+records installed agent source hashes, kernel and module build-note hashes, and
+the paths and hashes of required tools. Release preflight rejects a DUT agent
+that differs from the checkout and checks each selected test's required tools.
 
 ### Lifecycle and suite groups
 
 - Shared code lives in `ask_orch` and `_*.py` support modules. Register shared
   fixtures in `conftest.py`; tests request fixtures by parameter name. Reuse
   scenarios through support functions, preserving each test's own identity.
+- Test filenames omit `test_`; test functions keep pytest's native `test_`
+  prefix and omit repeated module context. For example,
+  `flowtable_service_multicast_bridge.py::test_stops_with_acceleration[6-disabled]`.
 - Register restoration immediately after acquiring a resource, before the
   next mutation. `CleanupStack` runs every undo in reverse order with a
   separate 45-second budget per callback and reports all failures. Commands
@@ -422,17 +426,40 @@ chooses another JUnit destination. Parallel host workers share the run directory
   The two module-scoped profiles also capture setup and teardown. Missing
   logs, ring overruns and sequence gaps fail the run. The boot gate checks
   retained boot history; if it has been overwritten, reboot before running.
-- `pytest-timeout` gives test bodies 900 seconds; the churn case uses its
-  configured duration plus 300 seconds. `ARGS='--timeout=seconds'` changes
+- `pytest-timeout` gives test bodies 900 seconds; churn allows at least one hour
+  for its minimum soak and a complete tuple rotation, or its configured duration
+  plus 420 seconds if longer. `ARGS='--timeout=seconds'` changes
   the default. Operation and cleanup deadlines are separate so a timed-out
   body can still release resources. A hard-killed process cannot run cleanup.
 - Select `host`, `hardware`, `smoke`, `slow`, and `destructive` with `ARGS='-m
   expression'`. Markers and configuration are checked strictly. Startup tests
   remain a separate `make test-startup` command and require their special boot.
 - `ARGS=--release` checks required DUT tools before setup and fails on
-  unexpected skips. Explicitly disabled opt-in cases and expected xfails keep
-  their native status. Select the required release matrix explicitly, including
-  the appropriate environment settings for opt-in cases.
+  every selected skip, including disabled opt-in cases. Expected xfails keep
+  their native status. Select the required release matrix explicitly and enable
+  its opt-in cases. WAN address lifecycle needs its separate subnet invocation.
+- `ARGS='--module-order-seed=42'` shuffles whole modules with the standard
+  library. Test and parameter order within each module stays intact, including
+  the shared profile lifecycles. Session artifacts record the seed and complete
+  selection so a failing order can be repeated on the same boot.
+
+Native lifecycle tests use the actual protocol daemons: `flowtable_dhcp.py`
+checks unchanged renewal, renewal after the server loses its lease database,
+and a new WAN lease; `flowtable_slaac.py` checks
+advertised prefix deprecation, existing sockets and new source selection;
+`flowtable_ike.py` negotiates IKEv2, rekeys a child SA and restarts its owned
+peer. Their DHCP/RA segments and peer daemons are isolated test resources.
+The IKE case requires UDP 500/4500 and the DUT's charon PID file to be unused.
+
+`profile_homelab.py::test_mixed_traffic_survives_rekey` keeps the VLAN WAN paths,
+IPv6 tunnel, IPsec and multicast active together for a minute through a rekey.
+`flowtable_nat_throughput.py` checks a 9 Gbit/s TCP floor in separate forward and
+reverse runs, simultaneous TCP directions with endpoint kernel pacing at 9 Gbit/s
+and an 8 Gbit/s floor each, and 64-byte UDP payloads at 25 Mbit/s. Unpaced duplex
+can overflow DUT receive FIFOs; see `TODO.md`. Artifacts include native DUT MAC
+counters, endpoint NIC counters, UDP loss and receiver buffer errors. Native
+iperf's reverse-only UDP stream does not meet the service's established
+original-direction admission rule, so simultaneous throughput uses TCP.
 
 The QoS host tests compile the production lifecycle functions with
 AddressSanitizer and UndefinedBehaviorSanitizer, inject each startup
@@ -464,32 +491,23 @@ The SDK CQ-pop test checks command and
 descriptor byte order, portal-result lifetime, prefetch retries, errors,
 and a final response containing both a frame and the empty-queue flag.
 
-The DPA host lifecycle test compiles the pinned FMC and FMLIB sources with
-our patches and the production loader under ASan/UBSan. It injects startup
-allocation/device failures and cleanup failures, checks retries and shared
-object ownership, and exercises saved-model compatibility and one/two-FMAN
-table counts. The companion SDK test exercises external-table teardown,
-root ownership, shared cookies, busy refusals, and stale handles. Compat hash
-copy-out failures release new cookies; refused deletes and shared handles
-retain their mappings. Legacy root retargeting is rejected at the SDK and
-fmlib boundaries, as it already was at the ioctl boundary. SDK and
-fmlib tests reject hardware-reassembly creation/attachment before allocations
-or nested-handle access; native and compat ioctl tests cover reserved inputs.
-These tests require the fetched vendor Git repositories and the patched ASK
-kernel source. Run them with:
+The SDK host tests compile production port, scheme and state-query functions
+under ASan/UBSan. They check ownership, cleanup, busy refusals, native/compat
+ioctls and FMLIB state queries. They require the patched ASK kernel source;
+the state-query test also requires the fetched FMLIB source. Run them with:
 
 ```sh
-pytest -c tools/pyproject.toml tools/host_tests/test_dpa_lifecycle.py
+make test-host K='sdk_port or sdk_scheme'
 ```
 
-`tools/host_tests/test_sdk_port_pcd.py` also compiles the SDK port-setup and
+`tools/host_tests/sdk_port_pcd.py` also compiles the SDK port-setup and
 classification-plan functions with their real private types. It checks
 failures after classifier-root, plan and scheme binding, parser validation,
 plan allocation and programming, shared owners, and retry on the same port.
 These failures happen inside the SDK operations, beyond the ioctl boundary
 mocked by the loader lifecycle test.
 
-`tools/host_tests/test_sdk_port_resources.py` runs the actual FM allocator,
+`tools/host_tests/sdk_port_resources.py` runs the actual FM allocator,
 resource setters and register helpers under ASan/UBSan. It rejects exhausted
 task/FIFO/DMA and dequeue budgets, checks MTU error exits, preserves another
 port's allocations, and exercises retry, release, reset-derived DMA counts,
@@ -526,7 +544,7 @@ run traffic tests. A plain reboot may select the board's installed firmware.
 
 The fault controls `dpa_init_fail_site` and `dpa_init_fail_step` are built
 only into the test image. Production builds omit them. Host coverage in
-`tools/host_tests/test_cdx_startup.py` exercises the SET_PARAMS transaction,
+`tools/host_tests/cdx_startup.py` exercises the SET_PARAMS transaction,
 partial userspace copies, allocation failures and asynchronous queue
 retirement under ASan/UBSan. It also checks all initial port enable-state
 combinations, state restoration after rollback and unload, and the production
@@ -534,7 +552,7 @@ unload cleanup of PCD queues, private/shared policers and FMAN metadata.
 The SDK port API cases cover detach on policy-less and fully cleaned ports,
 while incomplete setup and real hardware detach errors must still fail.
 The FMC lifecycle test preserves initially disabled ports on both successful
-cleanup and failed loads. `test_sdk_port_state.py` compiles the port-state
+cleanup and failed loads. `sdk_port_state.py` compiles the port-state
 query API and ioctl dispatch for native and compat callers, checking the
 one-byte result and error propagation. The new `FM_PORT_IOC_GET_ENABLED`
 command uses port ioctl slot 44; existing encodings are unchanged. FMC saved
@@ -549,27 +567,45 @@ release nothing, for both 8- and 16-queue configurations.
 `make ask-test` runs pytest under `sudo` (it needs the serial PTYs and the
 USB-serial node) against the source tree, so test edits are picked up
 without a redeploy. An autouse fixture fail-fasts the whole run if the DUT
-agent does not answer, so a misconfigured `ASK_TARGET_IP` stops you
-immediately rather than deep into the run.
+UART agent does not answer. DUT control does not require an IP address.
 
 ---
 
 ## How the harness reaches each node
 
-Three transports, one purpose each — never cross them:
-
 | Node | Transport | Used for |
 |---|---|---|
-| DUT | HTTP test agent | DUT operations (exec allowlist, counters, kmemleak) |
-| WAN host | HTTP test agent | orchestrator-host operations |
-| LAN client | serial console only | all LAN-side work (no IP path exists) |
+| DUT | Persistent UART agent | Commands, counters, kernel windows and local observations |
+| WAN host | HTTP test agent | Orchestrator-host operations |
+| LAN client | QEMU guest agent over virtio | Commands, scripts and local peer RPC |
 
-Because the client has no IP route from the orchestrator, LAN-side steps go
-through its serial console: the harness stages a snippet to the client over
-serial and runs it (`lan_run_python` for Python; backgrounded shell
-processes coordinated through the client's filesystem for parallel-shape
-work). Do not look for an HTTP agent on the client — there isn't one, by
-design.
+The DUT opens no test-control TCP listener. The QoS control-traffic test creates
+an explicit temporary TCP listener for its handshake measurement and closes it
+at teardown. The multi-connection LAN peer uses a Unix socket for RPC inside
+the VM; its traffic sockets still exercise the DUT normally.
+QGA heartbeats keep that peer alive during quiet DUT measurements; its idle
+lease still ends traffic if the runner disappears.
+
+UART messages use compressed JSON, checked fragments and acknowledgements.
+Only damaged or unacknowledged fragments are retried. Completed request IDs are
+not executed again. Missing results fail with an unknown outcome; the harness
+does not replay a mutation. Scripts are cached by SHA-256 for the session.
+An idle agent exits after five minutes without requests or running operations,
+restoring the shell settings and console log level.
+
+Capacity and churn snapshots stay on the DUT in a bounded SQLite store. Every
+flow tuple, generation, counter and translation used by the assertions is
+checked locally; the host receives counts and bounded mismatch samples. Entry
+waits, tuple deletion batches and bulk-detach timing run locally too. Small
+flowtables still return rows for the existing host assertions. Snapshot reads
+are timed on the DUT.
+
+Kernel windows drain locally throughout each test and report completeness,
+sequence gaps and splat banners. Full logs stay in temporary artifacts; failed
+tests retrieve them in checked chunks. Capacity/churn failures also retrieve
+the last two retained raw snapshots as gzip files. Passing captures and released
+snapshots are deleted. Budget exhaustion fails explicitly. Session exit removes
+its temporary files; the boot recorder retains history separately.
 
 ## SDK host-command failure recovery
 
@@ -589,7 +625,7 @@ Failed scheme modification preserves the previous software state; failed
 creation leaves the scheme invalid. This does not establish hardware
 rollback after an HC timeout; the board-reset requirement still applies.
 
-`tools/host_tests/test_sdk_hc_transport.py` compiles the actual SDK pool,
+`tools/host_tests/sdk_hc_transport.py` compiles the actual SDK pool,
 enqueue, completion and cleanup helpers together with the Linux QMan wrapper
 under ASan/UBSan. It injects rejection, missing and late confirmations,
 completion at the deadline, overlapping commands, pool exhaustion and partial
@@ -600,7 +636,7 @@ transport timeout injections run on the host.
 
 ## SDK scheme programming failures
 
-`tools/host_tests/test_sdk_scheme_set.py` compiles the production register
+`tools/host_tests/sdk_scheme_set.py` compiles the production register
 builder, scheme set/delete paths, lock pool, netenv references and HC
 transport under ASan/UBSan. It exercises lock/spinlock allocation failure,
 early and late construction errors, extraction allocation failure, rejected
@@ -618,12 +654,12 @@ actual HC transport; the fixture allows hardware to have changed despite
 the timeout and verifies that retries cannot submit another command.
 
 On the DUT, the ordinary/direct scheme lifecycle regression in
-`tools/tests/test_dpa_startup.py` includes a late construction failure with
+`tools/tests/dpa_startup.py` includes a late construction failure with
 an out-of-range FQID. For an ordinary scheme the rejected candidate changes
 to direct mode; deleting the original immediately afterward must still
 release its original netenv reference. These are private, unbound schemes.
 
-`tools/host_tests/test_sdk_scheme_ioctl.py` checks native/compat conversion and
+`tools/host_tests/sdk_scheme_ioctl.py` checks native/compat conversion and
 fmlib serialization under ASan/UBSan, with compiler member-bound checks on
 every `memcpy`. It covers DONE, CC and policer next engines, the trailing
 scheme counter, public cookies, direct/shared flags and allocation failures.

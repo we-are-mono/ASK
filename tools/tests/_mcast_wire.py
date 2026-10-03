@@ -1,6 +1,6 @@
 """Staging the multicast wire oracle on a listener, and feeding it frames.
 
-The oracle itself is mcast_wire_capture.py, which runs unchanged on the host
+The oracle itself is _mcast_wire_capture.py, which runs unchanged on the host
 that receives the replicas; this module stages it there as a backgrounded
 process, collects its verdict, and builds the frames the orchestrator injects.
 The LAN VM is reachable over its console alone, so every step on it goes
@@ -16,9 +16,9 @@ from pathlib import Path
 import sys
 import uuid
 from _topology import lan_run_python
-from mcast_wire_capture import multicast_mac, payload
+from _mcast_wire_capture import multicast_mac, payload
 
-CAPTURE_SOURCE = Path(__file__).with_name("mcast_wire_capture.py").read_text()
+CAPTURE_SOURCE = Path(__file__).with_name("_mcast_wire_capture.py").read_text()
 
 
 async def run_python(lan, script: str, label: str = "mcast_wire") -> str:

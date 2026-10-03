@@ -135,10 +135,10 @@ module load failures. Three focused DUT tests pass on the corrected KASAN image:
 
 | Test | Verified result |
 | --- | --- |
-| `test_flowtable_module_lifecycle` | With inactive FCI removed, CDX unload is refused solely because `ask_flowtable` holds it. All five injected initialization failures leave no adapter, proc node or holder; the provider reference count returns to zero and a healthy load succeeds each time. SET_PARAMS remains rejected while the adapter is absent. |
+| `flowtable_module.py::test_lifecycle` | With inactive FCI removed, CDX unload is refused solely because `ask_flowtable` holds it. All five injected initialization failures leave no adapter, proc node or holder; the provider reference count returns to zero and a healthy load succeeds each time. SET_PARAMS remains rejected while the adapter is absent. |
 | Same lifecycle test, live traffic | TCP and UDP continue across healthy unload/reload and a second cycle failing all four directional deletion barriers. The same TCP socket survives both. Software TX advances while the adapter is absent. Reload leaves the existing table in software; recreating it restores four hardware directions. Eight further live UNBIND/rebind cycles pass. |
-| `test_flowtable_routes_selective` | Mixed TCP/UDP selective route replacement, more/less-specific routes, DSCP aliases and withdrawal/restoration still work. The unaffected peer retains its cookies and hardware counters. |
-| `test_flowtable_offload_terminal`, `ASK_FLOWTABLE_TERMINAL=unlink` | An unproven deletion stops receive ports 6/7 and rejects rearm. Unloading the adapter succeeds, but reloading it returns `EOPNOTSUPP` while the same CDX remains loaded. CDX unload then restores ordinary forwarding; all 64 subsequent echoes pass. |
+| `flowtable_routes.py::test_selective` | Mixed TCP/UDP selective route replacement, more/less-specific routes, DSCP aliases and withdrawal/restoration still work. The unaffected peer retains its cookies and hardware counters. |
+| `flowtable_offload.py::test_terminal`, `ASK_FLOWTABLE_TERMINAL=unlink` | An unproven deletion stops receive ports 6/7 and rejects rearm. Unloading the adapter succeeds, but reloading it returns `EOPNOTSUPP` while the same CDX remains loaded. CDX unload then restores ordinary forwarding; all 64 subsequent echoes pass. |
 
 Steady hardware windows transfer 256 UDP echoes and 4 MiB over TCP per connection.
 UDP hardware deltas remain exactly 256 packets and 76,288 bytes per direction.
@@ -240,14 +240,14 @@ busy usage varies from 2.28% to 27.01% on this instrumented image, so this proof
 does not claim zero CPU usage; hardware counters and software TX establish where
 the measured traffic was forwarded.
 
-`test_flowtable_module_lifecycle` passes in 110.74 seconds. It covers all five
+`flowtable_module.py::test_lifecycle` passes in 110.74 seconds. It covers all five
 adapter initialization failures, provider pinning and persistent configuration
 sealing, live healthy and barrier-failure unloads, software continuation and
 readmission after table recreation, and eight live UNBIND/rebind cycles. Device
 watches and all other adapter references drain on each removal. Both focused
 DUT tests finish without KASAN or lockdep reports.
 
-The third focused DUT test, `test_flowtable_offload_terminal` with
+The third focused DUT test, `flowtable_offload.py::test_terminal` with
 `ASK_FLOWTABLE_TERMINAL=unlink`, passes in 27.18 seconds. An injected unproven
 deletion stops both physical receive ports, refuses table rearm and adapter
 reload, and retains the fatal latch until CDX unload. Final provider shutdown

@@ -59,7 +59,7 @@ requires an empty table. Other tables and the default CMM mode retain their
 existing policy. This is a downstream kernel-internal extension, not a new
 userspace interface.
 
-The tests in `tools/tests/test_flowtable_arp.py` exercise cold ARP resolution
+The tests in `tools/tests/flowtable_arp.py` exercise cold ARP resolution
 after binding, sustained forwarding through natural ageing, a real endpoint
 MAC change announced through ARP, unsuccessful probes and recovery. Failure
 injection suppresses only LAN ARP replies while leaving IP traffic possible.

@@ -1,5 +1,5 @@
 /* Host harness for the ask-flowtable policy engine. Compiled by
- * test_flowtable_policy_host.py against the real flowtable/src sources so the
+ * flowtable_policy_host.py against the real flowtable/src sources so the
  * validator, renderer, and ownership fingerprint are tested natively without
  * the rig. Reads a conf policy on stdin.
  *

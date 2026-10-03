@@ -1,7 +1,7 @@
 """Exact multicast traffic windows for the flowtable multicast cases.
 
 Every window sends numbered streams and counts each sequence at every observer
-beneath the IP layer (mroute_capture.py), so a copy that is missing, doubled or
+beneath the IP layer (_mroute_capture.py), so a copy that is missing, doubled or
 still arriving after its listener left is a number rather than an impression.
 Beside it, a counter on the ingress port's netdev hook says how much of each
 stream the CPU carried: a replicated frame never reaches the host.
@@ -9,12 +9,11 @@ stream the CPU carried: a replicated frame never reaches the host.
 The rig traps that make a working offload read as dead are kept out of the
 cases here rather than in each of them:
 
-  - The LAN console is one channel. Captures and member hosts run on the LAN
-    VM as background processes coordinated through files, so no window holds
-    the console while traffic runs.
+  - Captures and member hosts run on the LAN VM as background processes,
+    coordinated through files across command calls.
   - An IPv4 join through ip_mreq names its interface by address and silently
     lands on the default route's device. Hosts join through the index-based
-    MCAST_* calls instead (multicast_member.py).
+    MCAST_* calls instead (_multicast_member.py).
   - `ip -s mroute` lags the hardware by up to one fold interval. Every read of
     the kernel's counters here follows a read of /proc/cdx_flowtable, which is
     itself a fold.
@@ -38,8 +37,8 @@ from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
 from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from mroute_capture import MAGIC, multicast_mac, payload
-from _flowtable_rig import (artifact_dir, command, read, status_text, stop_boot_daemon)
+from _mroute_capture import MAGIC, multicast_mac, payload
+from _flowtable_rig import (artifact_dir, command, read, stop_boot_daemon)
 from _mcast_e2e import (dut_mac, wan_source_address)
 from _mroute_capacity import (_capture, _finish, _python)
 
@@ -47,7 +46,7 @@ COUNT, PPS, PORT = 256, 320, 47420
 # A second stream of the same (S,G), for a case that needs two told apart by
 # port. Counted at the CPU with the first.
 OTHER_PORT = PORT + 1
-MEMBER_SOURCE = Path(__file__).with_name("multicast_member.py").read_text()
+MEMBER_SOURCE = Path(__file__).with_name("_multicast_member.py").read_text()
 # The capture's own payload and group MAC, so a LAN-side sender cannot drift
 # from the oracle that decodes what it sent.
 WIRE_HELPERS = ("import ipaddress, struct\n" + f"MAGIC = {MAGIC!r}\n"
@@ -117,7 +116,7 @@ def summary(state: dict) -> dict:
 
 def stream(family: int, group: str, *, hops: int, source: str | None = None,
            port: int = PORT) -> dict:
-    """One numbered stream, in the shape mroute_capture.py decodes. `port` is
+    """One numbered stream, in the shape _mroute_capture.py decodes. `port` is
     both UDP ports of its frames."""
     return {"family": family, "source": source or wan_source_address(family), "group": group,
             "port": port, "count": COUNT, "token": uuid.uuid4().hex, "hops": hops}
@@ -177,7 +176,7 @@ class MulticastRig:
         self.restart_limit = None
 
     async def proc(self) -> dict:
-        return status_text(await read(self.target, self.session, "/proc/cdx_flowtable"))
+        return await self.target.observe(self.session, "state")
 
     async def settle(self, predicate, what: str, timeout: float = 15) -> dict:
         deadline = time.monotonic() + timeout
@@ -194,7 +193,7 @@ class MulticastRig:
         """Send `streams` once and count every sequence at every observer.
 
         observers is [(peer, {interface: expected source MAC or None})]; peer
-        is the LAN console, or None for a capture on this host. `cpu` is the
+        is the LAN guest agent, or None for a capture on this host. `cpu` is the
         ingress port's software receive delta across the send, `idle` what the
         same counter moved by over an idle interval just before, scaled to the
         send's own length: a busy segment's background traffic grows with the
@@ -418,7 +417,7 @@ async def bridge_settings(r: MulticastRig, bridge: str, **values):
 
 
 class Host:
-    """One multicast listener on the LAN VM; see multicast_member.py."""
+    """One multicast listener on the LAN VM; see _multicast_member.py."""
 
     def __init__(self, lan, config: dict, path: str):
         self.lan, self.config, self.path, self.serial = lan, config, path, 0

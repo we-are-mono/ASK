@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import json
 import os
 import socket
 import struct
-import time
 from pathlib import Path
 
-import pytest
-from _flowtable_connections import by_key, healthy
-from _flowtable_rig import DPORT, HEALTH_BASELINE, WAN_IP, status_text
+from ask_orch.commands import console_python
+from ask_orch.uart import Console
+from _flowtable_connections import healthy
+from _flowtable_rig import DPORT, HEALTH_BASELINE, WAN_IP
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _topology import LAN_NIC
 
@@ -26,8 +25,7 @@ REPLACEMENTS = 256
 # about twice the measured time.
 DETACH_SECONDS = 60
 DETACH_BOUND_SECONDS = 30
-# Keep explicit data sockets below the lab's ephemeral port range, so opening
-# thousands of sockets cannot collide with the active control connection.
+# Keep explicit data sockets below the lab's ephemeral port range.
 BASE = 20000
 
 
@@ -41,10 +39,10 @@ def socket_drops(sock):
     raise AssertionError(("UDP socket missing", inode))
 
 
-async def delete_udp(r, sport, *, allow_missing=False, source=None, destination=None):
+async def delete_udp(r, sports, *, allow_missing=False, source=None, destination=None):
     # conntrack(8)'s filtered deletion dumps the entire table per invocation.
     # Use the existing agent's raw netlink transport for an exact original
-    # tuple deletion (nfnetlink_conntrack.h), checking its kernel ACK.
+    # tuple deletion (nfnetlink_conntrack.h), checking every kernel ACK locally.
     def attribute(kind, value):
         length = 4 + len(value)
         return struct.pack("=HH", length, kind) + value + bytes((-length) % 4)
@@ -55,21 +53,34 @@ async def delete_udp(r, sport, *, allow_missing=False, source=None, destination=
     kinds = (3, 4) if family == socket.AF_INET6 else (1, 2)
     ip = (attribute(kinds[0], socket.inet_pton(family, source))
           + attribute(kinds[1], socket.inet_pton(family, destination)))
-    proto = (attribute(1, bytes([socket.IPPROTO_UDP])) + attribute(2, struct.pack("!H", sport))
-             + attribute(3, struct.pack("!H", DPORT)))
-    original = attribute(0x8001, ip) + attribute(0x8002, proto)
-    body = struct.pack("!BBH", family, 0, 0) + attribute(0x8001, original)
-    result = await r.target.netlink_send(r.session, 12, body, nlmsg_type=0x102, nlmsg_flags=5)
-    reply = bytes.fromhex(result["reply_hex"])
-    assert len(reply) >= 20 and struct.unpack_from("=H", reply, 4)[0] == 2, result
-    error = struct.unpack_from("=i", reply, 16)[0]
-    # A conntrack Linux has already reclaimed leaves the intended postcondition
-    # in place. Callers that accept that must still count how often it happens;
-    # silently tolerating it everywhere would hide a table that never filled.
-    if allow_missing and error == -errno.ENOENT:
-        return False
-    assert error == 0, (sport, result)
-    return True
+    messages = []
+    for sport in sports:
+        proto = (attribute(1, bytes([socket.IPPROTO_UDP])) + attribute(2, struct.pack("!H", sport))
+                 + attribute(3, struct.pack("!H", DPORT)))
+        original = attribute(0x8001, ip) + attribute(0x8002, proto)
+        body = struct.pack("!BBH", family, 0, 0) + attribute(0x8001, original)
+        messages.append((sport, body.hex()))
+    result = await console_python(Console.target(), f'''
+import asyncio, errno, json, struct
+from askd_agent.agent import netlink_send
+async def main():
+    missing = 0
+    for sport, payload in {messages!r}:
+        result = await netlink_send({{'protocol': 12, 'body_hex': payload,
+                                     'nlmsg_type': 0x102, 'nlmsg_flags': 5,
+                                     'timeout_ms': 500}}, {{}})
+        reply = bytes.fromhex(result['reply_hex'])
+        assert len(reply) >= 20 and struct.unpack_from('=H', reply, 4)[0] == 2, (sport, result)
+        error = struct.unpack_from('=i', reply, 16)[0]
+        if {allow_missing!r} and error == -errno.ENOENT:
+            missing += 1
+        else:
+            assert error == 0, (sport, result)
+    print(json.dumps({{'missing': missing}}))
+asyncio.run(main())
+''', timeout=30)
+    # Already reclaimed tuples are counted, never silently accepted everywhere.
+    return json.loads(result["stdout"])["missing"]
 
 
 async def lan_counters(r):
@@ -82,44 +93,57 @@ async def lan_counters(r):
 
 
 async def summary(r):
-    # The counters and status rows come before the first flow row, and a full
-    # table runs to thousands of rows here, so only its head is read. The head
-    # ends at the first line that is a flow row: a counter can end in "flow"
-    # itself (ipsec_sec_refused_seq_overflow).
-    limit = 16384
-    result = await r.target.fs_read(r.session, "/proc/cdx_flowtable", max_bytes=limit)
-    assert result["errno"] == 0, result
-    head, row, _ = bytes.fromhex(result["content_hex"]).decode().partition("\nflow ")
-    assert row or result["size"] < limit, ("the table's head outgrew the read", result["size"])
-    return status_text(head)
+    return await r.target.observe(r.session, "summary")
 
 
 async def wait_entries(r, count, p, timeout=90):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        jobs = await p.rpc("status")
-        assert not jobs["errors"], jobs
-        state = await summary(r)
-        # Errors are cumulative for the boot; only this test's own count.
+    task = asyncio.create_task(r.target.observe(r.session, "wait_entries", count=count, timeout=timeout))
+    try:
+        while not task.done():
+            jobs = await p.rpc("status", compact=True)
+            assert not jobs["errors"], jobs
+            await asyncio.wait({task}, timeout=1)
+        state = await task
         assert state["errors"] == HEALTH_BASELINE["errors"], (state, HEALTH_BASELINE)
         assert not any(state[k] for k in ("fatal", "invalidated", "quarantine")), state
-        if state["entries"] == count:
-            return state
-        await asyncio.sleep(1)
-    r.record("capacity-unexpected", await r.state())
-    pytest.fail(f"expected {count} directions: {state}")
+        return state
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
-def unchanged(before, after, *, excluded=()):
+async def enable_snapshots(r, *, lan, wan, public, lan_if, wan_if, dport, base, count, survivors=0):
+    await r.target.observe(r.session, "workload", lan=lan, wan=wan, public=public,
+                           lan_if=lan_if, wan_if=wan_if, dport=dport, base=base,
+                           count=count, survivors=survivors)
+    r.bulk = True
+
+
+async def release(r, *states):
+    for state in states:
+        if "snapshot" in state:
+            await r.target.observe(r.session, "release", snapshot=state["snapshot"])
+
+
+async def check_rows(r, state, **options):
+    result = await r.target.observe(r.session, "check", snapshot=state["snapshot"], **options)
+    assert result["checked"] == state["flow_count"], result
+    assert result["missing_count"] == result["unexpected_count"] == 0, result
+    assert result["translation_errors"] == result["mtu_errors"] == 0, result
+    return result
+
+
+async def compare(r, before, after, **options):
+    return await r.target.observe(r.session, "compare", before=before["snapshot"],
+                                  after=after["snapshot"], **options)
+
+
+async def unchanged(r, before, after, **options):
     healthy(after)
-    old, new = by_key(before), by_key(after)
-    excluded = set(excluded)
-    for key, entry in old.items():
-        if entry["cookie"] in excluded:
-            continue
-        assert key in new, key
-        assert new[key]["cookie"] == entry["cookie"], key
-        assert int(new[key]["packets"]) >= int(entry["packets"]), key
+    result = await compare(r, before, after, **options)
+    assert result["unchanged_errors"] == 0, result
+    return result
 
 
 async def start(p, ids, *, count=0, interval=2):
@@ -172,27 +196,20 @@ async def hardware_window(r, before, label, *, turnover=0):
     await asyncio.sleep(10)
     cpu1, tx1 = await cpu(r), await software_tx(r)
     after = await r.state()
-    old, new = by_key(before), by_key(after)
     # A recycled cookie cannot identify a new generation on its own; a restarted
     # packet count can. See the same reasoning in the churn proof.
-    regenerated = {k for k in new.keys() & old.keys()
-                   if new[k]["cookie"] != old[k]["cookie"]
-                   or int(new[k]["packets"]) < int(old[k]["packets"])}
+    compared = await compare(r, before, after, allow_regenerated=True)
     tx = {dev: tx1[dev] - tx0[dev] for dev in tx0}
     # Record before asserting: a window that loses or turns over a flow is
     # exactly the one whose evidence is worth keeping.
     r.record(label, {"state": after, "software_tx": tx, "cpu": cpu_delta(cpu0, cpu1),
-                     "regenerated": sorted(regenerated),
-                     "missing": sorted(old.keys() - new.keys()),
-                     "unexpected": sorted(new.keys() - old.keys()),
+                     "comparison": compared,
                      "installs": after["installs"] - before["installs"],
                      "deletes": after["deletes"] - before["deletes"]})
-    assert new.keys() == old.keys(), sorted(set(new) ^ set(old))
-    assert len(regenerated) <= turnover, sorted(regenerated)
-    unchanged(before, after, excluded={old[k]["cookie"] for k in regenerated})
-    assert after["installs"] - before["installs"] == len(regenerated), (before, after)
-    assert after["deletes"] - before["deletes"] == len(regenerated), (before, after)
-    assert all(int(f["packets"]) > int(old[k]["packets"])
-               for k, f in new.items() if k not in regenerated)
+    assert compared["missing_count"] == compared["unexpected_count"] == 0, compared
+    assert compared["regenerated_count"] <= turnover, compared
+    assert compared["unchanged_errors"] == compared["progress_errors"] == 0, compared
+    assert after["installs"] - before["installs"] == compared["regenerated_count"], (before, after)
+    assert after["deletes"] - before["deletes"] == compared["regenerated_count"], (before, after)
     assert all(0 <= n <= 128 for n in tx.values()), tx
     return after

@@ -51,7 +51,7 @@ async def vlan_service(rig):
     try:
         await create_vlan(r)
         # The peer namespace routes its sockets over the VLAN while the
-        # control connection and unaffected sockets keep the normal LAN path.
+        # unaffected sockets keep the normal LAN path.
         setup = f'''
 from pathlib import Path
 import subprocess

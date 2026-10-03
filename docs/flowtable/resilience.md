@@ -49,14 +49,14 @@ policy; it does not select a candidate or certify that recovery has finished.
 The pause survives process restarts, protecting temporary policies and firewall
 maintenance. See the [command contract](policy.md#automatic-recovery-and-manual-control).
 
-[Host regressions](../../tools/host_tests/test_flowtable_recovery.py) exercise the
+[Host regressions](../../tools/host_tests/flowtable_recovery.py) exercise the
 real C controller, process I/O and locks under ASan/UBSan with isolated nft and
 backend boundaries. The original controller failed all three initial cases:
 quiet apply failure, missing table and invalidation. Additional cases cover
 healthy no-ops, disable/malformed policy, manual ownership, foreign objects,
 inspection errors, inactive/fatal providers, queued stops and event storms.
 
-The [DUT service suite](../../tools/tests/test_flowtable_service.py) uses the actual
+The [DUT service suite](../../tools/tests/flowtable_service.py) uses the actual
 boot service and configuration, surviving TCP/UDP sockets, new connections and
 negative firewall probes. It requires controller readiness within 12 seconds
 and completed directional hardware-counter proof within 35 seconds of fault
@@ -106,7 +106,7 @@ the pause, including after a lost reply. See the
 [process and transaction contract](policy.md#firewall-ordering-and-revocation)
 for Linux dependencies and failure semantics.
 
-The [process fault tests](../../tools/host_tests/test_flowtable_nft_process.py)
+The [process fault tests](../../tools/host_tests/flowtable_nft_process.py)
 exercise input backpressure, output before input, silent/continuous-output
 hangs, closed output with a live child, oversized output, early exit, partial
 errors, pipe-holding and detached descendants, controller death, and delayed
@@ -156,7 +156,7 @@ through a parent-death signal; automatically replacing the supervisor itself
 still requires PID 1 supervision, which the current BusyBox image does not
 provide. The nft guardians independently retain transaction cleanup authority.
 
-The [supervisor host tests](../../tools/host_tests/test_flowtable_supervisor.py)
+The [supervisor host tests](../../tools/host_tests/flowtable_supervisor.py)
 exercise crashes at retirement/install/commit boundaries, unexpected zero
 exits, paused-worker crashes, stop during backoff, concurrent lifecycle calls,
 stale PID files, inactive ownership, capped/resetting crash delays, failed drain,
@@ -226,7 +226,7 @@ connection. The admission table and unrelated hardware flows remain installed.
 Pending work, unsupported match/action construction, capacity refusal and
 statistics/deletion work allocation failures retain their existing behavior.
 
-The [failslab suite](../../tools/tests/test_flowtable_failslab.py) uses actual
+The [failslab suite](../../tools/tests/flowtable_failslab.py) uses actual
 kernel slab allocation failures. Stack filters target seven paths: physical
 binding, block callback, admission work, native rule, action array, adapter
 entry and hardware owner. This reaches softirq and worker allocations without
@@ -298,7 +298,7 @@ extensions of this recovery contract.
 
 ## Routed VLAN prerequisite recovery — 2026-09-21
 
-The [service VLAN test](../../tools/tests/test_flowtable_service_vlan.py) deletes
+The [service VLAN test](../../tools/tests/flowtable_service_vlan.py) deletes
 and recreates a routed LAN VLAN three times under the shipping service. It
 retains the same tagged TCP/UDP sockets and separate untagged control sockets.
 The VLAN stays absent for at least six seconds per cycle: affected hardware
@@ -341,7 +341,7 @@ sequences remain separate service-recovery cases.
 
 ## Bridge VLAN membership recovery — 2026-09-22
 
-The [service bridge test](../../tools/tests/test_flowtable_service_bridge.py) uses
+The [service bridge test](../../tools/tests/flowtable_service_bridge.py) uses
 a VLAN-aware bridge with untagged trusted traffic and tagged guest traffic on
 the same physical LAN port. It removes only the guest VLAN membership three
 times, retaining both VLAN interfaces, addresses, routes and pinned neighbours.
@@ -386,7 +386,7 @@ No reboot or counter reset was used.
 
 ## Route and next-hop recovery — 2026-09-22
 
-The [service route tests](../../tools/tests/test_flowtable_service_route.py) keep
+The [service route tests](../../tools/tests/flowtable_service_route.py) keep
 the shipping service running while one destination's route is withdrawn or
 its next hop stops answering ARP. The destination uses a loopback address in
 a LAN namespace reached through a distinct gateway address. Separate control
@@ -446,7 +446,7 @@ There was no reboot or counter reset.
 
 ## IPv6 recovery — 2026-09-22
 
-The [IPv6 service suite](../../tools/tests/test_flowtable_service_ipv6.py) keeps
+The [IPv6 service suite](../../tools/tests/flowtable_service_ipv6.py) keeps
 IPv4 TCP/UDP controls alongside routed IPv6 TCP/UDP connections. It exercises
 three cycles each of IPv6 route withdrawal, failed neighbour discovery and
 owned-table deletion, then one stack-filtered failslab hit during action
@@ -486,7 +486,7 @@ production defects and required booting rebuilt images for their validation.
 
 ## Routed multicast recovery — 2026-09-22
 
-The [routed multicast suite](../../tools/tests/test_flowtable_service_multicast.py)
+The [routed multicast suite](../../tools/tests/flowtable_service_multicast.py)
 passed all ten IPv4/IPv6 cases on a rebuilt KASAN image in 977.37 seconds:
 three withdrawal/restoration cycles per family, plus one actual failslab hit
 in each of hardware-key ownership, ADD notification, DELETE notification and
@@ -522,10 +522,10 @@ recovery appear successful. Bridged multicast has separate coverage.
 
 ## IPsec recovery implementation
 
-The [SA recovery suite](../../tools/tests/test_flowtable_service_ipsec.py) withdraws
+The [SA recovery suite](../../tools/tests/flowtable_service_ipsec.py) withdraws
 and restores each tunnel direction while the original TCP/UDP sockets remain
 open. It also injects SA-context allocation failures. The
-[policy suite](../../tools/tests/test_flowtable_service_ipsec_policy.py) changes
+[policy suite](../../tools/tests/flowtable_service_ipsec_policy.py) changes
 forwarding and output policies, required templates, packet marks, default
 policies and policy lifetimes. Unprotected controls, denied traffic and a
 plaintext injection probe run alongside the protected connections. Physical
@@ -710,8 +710,8 @@ An event raised while parked, one counted in the rearm's last window, and a
 non-empty table joining must each wait for a flushing pass, and a stale pass
 must do nothing. Both passive cases, a third table's refusal and reference and
 allocation balance on every path are covered too. The
-[rig case](../../tools/tests/test_flowtable_offload.py)
-`test_flowtable_offload_reload_invalidated` latches an invalidation by failing
+[rig case](../../tools/tests/flowtable_offload.py)
+`flowtable_offload.py::test_reload_invalidated` latches an invalidation by failing
 both deletions' retirement barriers with the table bound, then performs fw4's
 reload. The reload must commit and admission must reopen at commit, with exact
 hardware counters afterwards. It then latches again and replaces the table
@@ -731,18 +731,18 @@ The following observations motivated the work:
 - The [boot service](../../meta-ask/recipes-ask/config/files/S50ask-flowtable)
   previously backgrounded the daemon once with `start-stop-daemon`. The
   supervisor now replaces crashed controllers.
-- [Flowtable fault tests](../../tools/tests/test_flowtable_offload.py) already
+- [Flowtable fault tests](../../tools/tests/flowtable_offload.py) already
   exercise add failures, invalidation/rearm and terminal deletion failures.
   Their explicit table recreation and cleanup prove those operations, rather
   than autonomous service recovery. Global invalidation deliberately requires
   a fresh binding/reconciliation boundary; recovery must preserve that barrier.
   An atomic reload is such a boundary once the old bindings are gone (see
   [above](#atomic-reload-during-invalidation)).
-- The [homelab profile](../../tools/tests/test_profile_homelab.py) explicitly
+- The [homelab profile](../../tools/tests/profile_homelab.py) explicitly
   reapplies policy after bridge VLAN-membership invalidation. That is useful
   lifecycle coverage. The separate service bridge test above establishes
   recovery without a test-issued policy repair.
-- The [IPsec failslab sweep](../../tools/tests/test_ipsec_failslab.py) exercises
+- The [IPsec failslab sweep](../../tools/tests/ipsec_failslab.py) exercises
   native XFRM installation with isolated `fail-nth` injection. It is a useful
   pattern for allocation coverage, with additional recovery assertions needed.
 

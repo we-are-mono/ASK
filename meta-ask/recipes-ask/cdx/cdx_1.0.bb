@@ -21,13 +21,13 @@ EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX
 # reach the probe bodies + their cdx_main.c init hooks. Without them the
 # probe code compiles out entirely and no procfs file is created.
 #   CDX_DEBUG_KEY_ZEROING    - cdx_dpa_ipsec.c freed-key snapshot;
-#                              see tools/tests/test_ipsec_key_zeroing.py
+#                              see tools/tests/ipsec_key_zeroing.py
 #   CDX_DEBUG_MC_HCSYNC_FAIL - dpa_control_mc.c HC-sync fault injection;
 #                              no flowtable-mode driver yet (ISSUES.md A193)
 #   CDX_DEBUG_DPA_INIT      - startup acquisition fault injection;
-#                              see tools/startup_tests/test_dpa_init.py
+#                              see tools/startup_tests/dpa_init.py
 #   CDX_DEBUG_SPLIT_KEY_FAIL - cdx_dpa_ipsec.c split-key job fault
-#                              injection; see tools/tests/test_ipsec_split_key.py
+#                              injection; see tools/tests/ipsec_split_key.py
 # Single quotes are load-bearing: bitbake inlines EXTRA_OEMAKE verbatim
 # into the generated shell command, so without them the space would split
 # CFG_FLAGS across two make arguments and the second define would be lost.

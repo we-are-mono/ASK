@@ -439,7 +439,7 @@ async def _established(r, count=64, payload_size=64, name="routed"):
     # The record counts what the hardware did: every download it stripped,
     # and every upload it inserted -- none, where the upload is Linux's, whose
     # sends the device counted itself above. The fold of inserted frames into
-    # the device is test_flowtable_tunnel_tcp's to prove.
+    # the device is test_tcp's to prove.
     inserted = 0 if _upload_refused(r.shape) else count
     assert (record["rx_packets"], record["tx_packets"]) == (count, inserted), record
     _assert_outer(r, capture.packets(), count)

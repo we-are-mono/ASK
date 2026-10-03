@@ -413,7 +413,7 @@ async def sa_install_probe(
     Skipping is right for *these* files, whose subject is an unwind path
     rather than the install, but it means none of them goes red if offloaded
     SA install breaks outright. That tripwire is
-    test_ipsec_xfrm_offload.py::test_packet_offload_sa_install, which asserts
+    ipsec_xfrm_offload.py::test_packet_offload_sa_install, which asserts
     the same install through `ip` and fails rather than skips. Worth knowing,
     because nothing here says so on the day four files all skip at once.
     """

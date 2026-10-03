@@ -1,39 +1,17 @@
-"""Shared fixtures for the ASK test harness.
+"""Shared fixtures: session-owned DUT UART, LAN QGA, and WAN HTTP clients.
 
-Design notes:
-  - aiohttp session is function-scoped (ClientSession is bound to the
-    loop that created it; pytest-asyncio's default test loop is
-    function-scoped).
-  - The LAN-side UART console is session-scoped. Logging in over serial
-    takes ~0.5s, which is not worth paying again for every test.
-    Trade-off: tests share the shell — they must
-    leave it at a clean prompt (Console.run() already does).
-  - `splat_window` is per-test: opens a dmesg/counters capture on entry,
-    asserts no new KASAN/BUG/UBSAN/lockdep splats on exit, including
-    function fixture setup and teardown.
-  - `_target_reachable` is autouse: fail-fast if the target agent is
-    down, rather than every test flailing against 5s HTTP timeouts.
-
-Bench settings come from the environment (or Make's ignored .ask-test.mk):
-
-    ASK_TARGET_IP       agent HTTP host
-    ASK_TARGET_DEV      target serial device
-    ASK_LAN_VM          libvirt domain for LAN UART
-    ASK_LAN_USER        LAN VM serial login user (default root)
-    ASK_LAN_PASSWORD    LAN VM serial login password (optional)
-    ASK_WAN_IP          WAN-side agent HTTP host (default 127.0.0.1)
-    ASK_WAN_IPERF_IP    iperf3 server on the WAN side
-
-The LAN VM is reached only via libvirt PTY (Console.lan()) — it sits
-behind the DUT's NAT and has no IP path from the orchestrator, by
-design. Tests drive LAN-side work through the UART; parallel-shape
-work uses backgrounded shell processes coordinated via filesystem
-state (see _mcast_helpers.py for the pattern).
+Function-scoped aiohttp sessions follow pytest-asyncio's event loops. Kernel
+capture windows include fixture setup and teardown, retaining bulk evidence
+only on failures. Bench settings come from .ask-test.mk or ASK_* variables.
 """
 
 from __future__ import annotations
 
+import gzip
+import asyncio
+import json
 import os
+from pathlib import Path
 
 from ask_orch.artifacts import artifact_dir, record
 from ask_orch.capture import capture_window, verify_capture
@@ -43,14 +21,13 @@ import pytest
 import pytest_asyncio
 
 from ask_orch import client
-from ask_orch.uart import Console
+from ask_orch.uart import Console, set_target_session
+from ask_orch.serial import SerialSession
+from ask_orch.guest import Guest
+from ask_orch.provenance import agent_sources, firmware_script
 
 
 from _dmesg_allowlist import load_allowlist
-
-
-LAN_USER     = os.environ.get("ASK_LAN_USER",     "root")
-LAN_PASSWORD = os.environ.get("ASK_LAN_PASSWORD", "")
 
 
 # ---- per-test aiohttp ---------------------------------------------------
@@ -72,6 +49,21 @@ def target_agent(bench_health):
     return client.TARGET
 
 
+@pytest.fixture(scope="session")
+def dut_uart(hardware_bench):
+    """One physical reader for both agent operations and console helpers."""
+    with Console.target(raw=True, log_path=str(artifact_dir("session") / "dut-uart.log")) as console:
+        session = SerialSession(console)
+        set_target_session(session)
+        try:
+            yield session
+        finally:
+            try:
+                session.close()
+            finally:
+                set_target_session(None)
+
+
 # Loaded once per session. An expired entry raises here, failing the suite
 # before hardware setup rather than letting a stale suppressor mask a regression.
 @pytest.fixture(scope="session")
@@ -80,30 +72,52 @@ def dmesg_allowlist():
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
-async def bench_health(request, hardware_bench, dmesg_allowlist):
+async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
     """Check firmware, logging and selected release capabilities before mutations."""
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         health = await client.TARGET.health(session)
         record("dut", health, nodeid="session")
-        assert health.get("ok") and health.get("capture_protocol") == 2, (
+        assert health.get("ok") and health.get("capture_protocol") == 2 and health.get("serial_protocol") == 1, (
             "DUT needs the current test agent with reliable kernel capture", health)
+        required = {"ip", "nft", "conntrack", "python3"}
+        for item in request.session.items:
+            for marker in item.iter_markers("requires"):
+                required.update(marker.args)
+        result = await asyncio.to_thread(dut_uart.python, firmware_script(required))
+        assert result["rc"] == 0, result
+        firmware = json.loads(result["stdout"])
+        expected = agent_sources(Path(__file__).resolve().parents[1] / "askd_agent")
+        firmware["agent_matches_checkout"] = firmware["agent_sources"] == expected
+        record("firmware", firmware, nodeid="session")
+        config = await client.TARGET.fs_read(session, "/proc/config.gz")
+        assert config["errno"] == 0, config
+        kernel_config = gzip.decompress(bytes.fromhex(config["content_hex"])).decode()
+        assert "CONFIG_KASAN=y" in kernel_config.splitlines(), (
+            "DUT tests require KASAN; rebuild with make ask-image, stage and boot it")
         boot = await client.TARGET.boot_log(session)
         record("boot-kernel", boot, nodeid="session")
-        verify_capture(boot, "boot", dmesg_allowlist)
+        try:
+            verify_capture(boot, "boot", dmesg_allowlist)
+        except BaseException:
+            if boot.get("artifact"):
+                data = await client.TARGET.artifact(session, boot["artifact"]["id"])
+                (artifact_dir("session") / "boot-kernel-log.json").write_bytes(data)
+            raise
+        finally:
+            if boot.get("artifact"):
+                await client.TARGET.request(session, "artifact/release", {"id": boot["artifact"]["id"]})
         if request.config.getoption("--release"):
-            required = {"ip", "nft", "conntrack"}
-            for item in request.session.items:
-                for marker in item.iter_markers("requires"):
-                    required.update(marker.args)
-            missing = required - set(health.get("binaries", []))
-            assert not missing, f"release firmware lacks required tools: {sorted(missing)}"
+            assert not firmware["missing_binaries"], (
+                "release firmware lacks required tools", firmware["missing_binaries"])
+            assert firmware["agent_matches_checkout"], (
+                "DUT agent differs from this checkout; rebuild, stage and boot the current image")
         return {"health": health, "boot": boot}
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def _target_reachable(aiohttp_session, target_agent):
     """Fail-fast per-test if the target agent is unreachable. Cheaper
-    than every test flailing against 5s HTTP timeouts."""
+    than repeating commands against a lost UART session."""
     try:
         h = await target_agent.health(aiohttp_session)
     except Exception as e:
@@ -114,17 +128,10 @@ async def _target_reachable(aiohttp_session, target_agent):
 
 @pytest.fixture(scope="session")
 def lan(hardware_bench):
-    """Pre-logged-in UART console to the LAN-side traffic-generator VM.
-
-    Session-scoped to amortize the login cost across all tests. Tests
-    should leave the shell at a clean prompt (the Console.run() path
-    already handles that).
-    """
-    with Console.lan(log_path=str(artifact_dir("session") / "lan-uart.log")) as con:
-        con.login(LAN_USER, LAN_PASSWORD)
-        con.send("stty cols 1000 rows 200\r")
-        con.sync_prompt()
-        yield con
+    """Out-of-band LAN control through the VM's virtio guest-agent channel."""
+    guest = Guest(os.environ["ASK_LAN_VM"])
+    record("lan-agent", {"version": guest.check()}, nodeid="session")
+    return guest
 
 
 # ---- per-test ------------------------------------------------------------
@@ -142,7 +149,8 @@ async def splat_window(request, aiohttp_session, target_agent, dmesg_allowlist):
     allowlist (golden/dmesg_allowlist.yaml). Test authors should *not*
     add inline filters here — extend the YAML.
     """
-    async with capture_window(target_agent, aiohttp_session, request.node.nodeid, dmesg_allowlist) as cap_id:
+    async with capture_window(target_agent, aiohttp_session, request.node.nodeid, dmesg_allowlist,
+                              failed_check=lambda: getattr(request.node, "_ask_failed", False)) as cap_id:
         yield cap_id
 
 

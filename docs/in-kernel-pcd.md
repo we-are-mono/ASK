@@ -176,7 +176,7 @@ internal path, which that build mode never takes.
 
 ## Checking the builder without a board
 
-`tools/host_tests/test_cdx_pcd_build.py` compiles `cdx_pcd.c` and
+`tools/host_tests/cdx_pcd_build.py` compiles `cdx_pcd.c` and
 `cdx_pcd_desc.c` unmodified on the host, replaces only the FMan entry points with
 stubs that record their parameters, runs `cdx_pcd_build()`, and compares what it
 programmed against `tools/host_tests/golden/cdx_pcd_model.json`. Port discovery

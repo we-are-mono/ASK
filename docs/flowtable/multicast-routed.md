@@ -728,7 +728,7 @@ two streams carry one route.
 
 ## Locking
 
-Three rules, and `tools/host_tests/test_mroute_learner.py` greps the source for
+Three rules, and `tools/host_tests/mroute_learner.py` greps the source for
 each of them.
 
 **The handler only queues.** The FIB chain is atomic and every `mr_*` caller
@@ -1030,7 +1030,7 @@ the product does.
 
 ## Tests
 
-**Host** — `tools/host_tests/test_mroute_learner.py` and `mroute_learner.c`,
+**Host** — `tools/host_tests/mroute_learner.py` and `mroute_learner.c`,
 in the shape of the bridged pair. It compiles the decision functions out of
 `cdx/ask_flowtable.c` against stubs and drives every clause of the contract:
 each refusal, a VLAN-device iif resolving to its port, an oif expanded through
@@ -1103,8 +1103,8 @@ router, a VIF with no route (`refused-routed`), and a departing device.
 `mcast_hm.c` checks a routed copy's entry: the hop decrement first, a zero DSCP
 word, the header from the egress port.
 
-**Rig** — `test_flowtable_service_multicast_bridge.py::`
-`test_flowtable_service_multicast_bridge_and_route`, both families. IPTV in
+**Rig** — `flowtable_service_multicast_bridge.py::`
+`flowtable_service_multicast_bridge.py::test_bridge_and_route`, both families. IPTV in
 untagged on the WAN port, bridged to the set-top box on VLAN 289 and routed by
 `smcroute` from `br-ftmcast.289` into VLAN 290 on the same LAN port, with the
 bridge a multicast router. It asserts the one `mcast` row carries both
@@ -1117,7 +1117,7 @@ again, and `ip -s mroute` counting the stream. The box
 leaving keeps the routed copy in hardware alone; the route going retires the
 group.
 
-**Rig** — `tools/tests/test_mcast_e2e.py`, which grew a routed section beside
+**Rig** — `tools/tests/mcast_e2e.py`, which grew a routed section beside
 its bridged one. The DUT routes rather than bridges, which is its shipping
 configuration, and `smcroute` writes the MFC entries. Five cases: IPv4 and IPv6
 to the LAN port, IPv4 to a VLAN sub-interface on it, IPv4 to a bridge over it
@@ -1153,7 +1153,7 @@ Six oracles each, and the last two are ones a bridged case cannot produce:
 Teardown is an assertion too — removing the route has to take the hardware
 group, the `/proc` row and the kernel's flag with it.
 
-`tools/tests/test_mcast_member_mtu.py` proves the MTU clause on the wire, for
+`tools/tests/mcast_member_mtu.py` proves the MTU clause on the wire, for
 both families. The listener is a 1400-byte VLAN device behind a 1500-byte
 ingress. The group reads `refused-mtu`. Small datagrams arrive through
 software. 1448-byte ones, with DF for IPv4, arrive neither whole nor as
@@ -1164,8 +1164,8 @@ classifier counts them, and the fragment counters still do not move. Lowering
 it again takes the installed group back out. For IPv6, the IPv6 MTU sysctl
 alone does the same within the refresh interval.
 
-`test_flowtable_service_multicast_routed_firewall`, in
-`tools/tests/test_flowtable_service_multicast_edges.py`, proves the
+`test_routed_firewall`, in
+`tools/tests/flowtable_service_multicast_edges.py`, proves the
 confirmation for both families. The group has two oifs, the LAN port and a VLAN
 device on it, and an `inet` forward chain drops the group toward the VLAN
 device, as fw4's zone policy would. The group reads `pending-confirm` with the
@@ -1176,14 +1176,14 @@ commit: `mroute_ruleset_changes` moves and the group leaves hardware. Once
 `mroute_ruleset_settled` is back, the port is confirmed again from the stream,
 and the VLAN peer receives nothing.
 
-`tools/tests/test_flowtable_service_multicast_ports.py` sends two streams of
+`tools/tests/flowtable_service_multicast_ports.py` sends two streams of
 one `(S,G)` on two UDP ports from the WAN to the LAN port and a VLAN device on
-it, for both families. `test_flowtable_service_multicast_routed_follows_ports`
+it, for both families. `test_routed_follows_ports`
 puts an nftables rule in front of them that splits the ports at forward or
 prerouting, toward both oifs or one: the group reads `refused-ports`, both
 streams reach the CPU, and exactly the (port, oif) pairs Linux drops receive
 nothing. fw4's shape, with a port-reading accept ahead of the group's own, is
-carried from the start. `test_flowtable_service_multicast_routed_follows_legacy_and_tc`
+carried from the start. `test_routed_follows_legacy_and_tc`
 does the same with what is not nftables. An iptables-legacy FORWARD drop of
 the second port, toward both oifs or only the tagged one, reads
 `refused-xtables`; a software tc drop of it at the WAN ingress or at the VLAN
@@ -1200,7 +1200,7 @@ because `tc exec bpf import` starts any program.
 Flowtable boot, KASAN image, 2026-09-21. The DUT routes between its WAN and
 LAN ports — its shipping configuration, no bridge — and `smcrouted` writes the
 MFC. Streams are 1500 frames of 512 bytes at 500 pps from the orchestrator,
-TTL 64. The five cases of `test_routed_to_*` in `tools/tests/test_mcast_e2e.py`
+TTL 64. The five cases of `test_routed_to_*` in `tools/tests/mcast_e2e.py`
 all pass; the numbers below are from those runs and from a stepwise run of the
 same path with every counter read by hand.
 
@@ -1262,7 +1262,7 @@ and re-addition, then repeat with an overlapping MDB membership and IPv6.
 
 ## A158 hardware completion — 2026-09-21
 
-`tools/tests/test_mroute_capacity.py` passed all four rig cases in **48.13 s**,
+`tools/tests/mroute_capacity.py` passed all four rig cases in **48.13 s**,
 with no failures or skips, on the rebuilt KASAN flowtable image. Each shape
 passed for both IPv4 and IPv6:
 
@@ -1330,7 +1330,7 @@ if the source differs from `fc00:beef::99`. `ASK_MROUTE_WAN_IF` and
 sudo env PYTHONPATH=tools ASK_WAN_IPERF_IP=10.0.0.232 \
   ASK_FLOWTABLE_ARTIFACTS=/tmp/ask-a158-hardware-20260921/run2 \
   /opt/askd-agent/venv/bin/pytest -c tools/pyproject.toml \
-  tools/tests/test_mroute_capacity.py
+  tools/tests/mroute_capacity.py
 ```
 
 Artifacts on `vision`: `/tmp/ask-a158-hardware-20260921/` contains build/stage

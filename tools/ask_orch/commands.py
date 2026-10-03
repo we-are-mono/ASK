@@ -19,14 +19,20 @@ async def read(agent, session, path):
     return bytes.fromhex(result["content_hex"]).decode()
 
 
-async def command(agent, session, *argv, check=True, timeout_ms=15000):
-    result = await agent.exec_cmd(session, list(argv), timeout_ms=timeout_ms)
+async def command(agent, session, *argv, check=True, timeout_ms=15000, quiet=False):
+    result = await agent.exec_cmd(session, list(argv), timeout_ms=timeout_ms,
+                                  **({"quiet": True} if quiet else {}))
     if check:
         assert result["rc"] == 0, result
     return result
 
 
 async def console_command(console, *argv, check=True, timeout=20, resync=False):
+    if hasattr(console, "session"):
+        result = await asyncio.to_thread(console.run, shlex.join(argv), timeout)
+        if check:
+            assert result.rc == 0, result.stdout
+        return {"rc": result.rc, "stdout": result.stdout}
     # BusyBox line editing can wrap and redraw the echoed command. Frame
     # actual output rather than relying on the console's echo stripping.
     #
@@ -87,6 +93,10 @@ async def remove_qdisc(console, device, attachment, kind):
 
 
 async def console_python(console, script, *, timeout=20, attempts=3):
+    if hasattr(console, "python"):
+        result = await asyncio.to_thread(console.python, script, timeout)
+        assert result["rc"] == 0, result
+        return result
     # The physical UART can lose characters in long input lines, so stage short
     # chunks and verify the exact script before executing any test operation.
     # A dropped character corrupts the staged text, not the console, so retry

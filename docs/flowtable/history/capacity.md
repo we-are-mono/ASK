@@ -63,7 +63,7 @@ direction required to advance. UDP uses the normal five-second receive deadline.
 
 ## Accepted measurements
 
-`test_flowtable_capacity_overflow_and_reuse` passes in **139.96 seconds**, with
+`flowtable_capacity.py::test_overflow_and_reuse` passes in **139.96 seconds**, with
 artifacts under `/tmp/ask-flowtable-capacity/paced-recovery-proof/`. The configured
 budget stays at 32,768; no reduction was needed for this workload.
 
@@ -111,8 +111,8 @@ before allocator and classifier costs.
 Focused host validation passes **35 tests** in 1.65 seconds, covering decoder,
 index/iterator lifetime, full-budget pressure, hardware ownership, route handles
 and policy. Relevant C harnesses use ASan/UBSan and leak detection. On the same
-final image, `test_flowtable_connections_independent_lifetimes` and
-`test_flowtable_policy_revokes_live_connections` both pass in 154.94 seconds.
+final image, `flowtable_connections.py::test_independent_lifetimes` and
+`flowtable_policy.py::test_revokes_live_connections` both pass in 154.94 seconds.
 The complete capacity proof exercises the final generator deadline and pacing.
 
 After cleanup, all **287,335 installs equal 287,335 deletes** across this boot.

@@ -105,7 +105,7 @@ BLOCK = bytes(range(256)) * 16
 
 
 class Connection:
-    """Controller side of flowtable_ipv6_tcp_peer, speaking over the tested
+    """Controller side of _flowtable_ipv6_tcp_peer, speaking over the tested
     connection itself."""
 
     def __init__(self, reader, writer, peer):
@@ -141,7 +141,7 @@ async def _tcp_connection(r, sport, dport, *, destination=WAN_IPV6, expect_sourc
     server = await asyncio.start_server(
         lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IPV6, dport, family=socket.AF_INET6)
     script = (f"LAN_IPV6={LAN_IPV6!r}; WAN_IPV6={destination!r}; SPORT={sport}; DPORT={dport}\n" +
-              Path(__file__).with_name("flowtable_ipv6_tcp_peer.py").read_text())
+              Path(__file__).with_name("_flowtable_ipv6_tcp_peer.py").read_text())
     peer = asyncio.create_task(lan_run_python(r.lan, script, timeout=180,
                                               label="flowtable_v6_tcp"))
     writer = None
@@ -425,7 +425,7 @@ print(json.dumps({'left': left}))
 
 async def _hairpin_exchange(r, external, count):
     """Both endpoints live on the LAN VM in separate namespaces, so one script
-    owns the echo server and the client: the UART cannot carry two."""
+    owns the echo server and the client and stops both together."""
     script = _hairpin_script(f'''
 import json, os, socket, struct, time
 def enter(netns):

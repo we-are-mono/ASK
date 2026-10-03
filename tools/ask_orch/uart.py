@@ -2,8 +2,7 @@
 
 Lets the orchestrator drive the DUT and the LAN-side traffic generator
 over their serial consoles without any network prerequisite. Used before
-the HTTP agent is reachable (fresh boot, no control-plane NIC yet,
-post-panic recovery).
+the UART agent starts (fresh boot or post-panic recovery).
 
 Scripted command execution only — for an interactive terminal, use `tio`
 directly (`tio /dev/ttyUSB0` or `tio $(sudo virsh ttyconsole <vm>)`).
@@ -25,11 +24,13 @@ CLI usage (as root):
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import re
 import select
 import subprocess
 import sys
+import termios
 import threading
 import time
 from dataclasses import dataclass
@@ -40,6 +41,21 @@ import serial
 DEFAULT_TARGET_DEV = os.environ.get("ASK_TARGET_DEV", "")
 DEFAULT_LAN_VM     = os.environ.get("ASK_LAN_VM", "")
 DEFAULT_BAUD       = 115200
+
+_TARGET_SESSION = None
+
+
+def target_session():
+    if _TARGET_SESSION is None:
+        raise RuntimeError("DUT UART session is not open; request the target_agent fixture")
+    return _TARGET_SESSION
+
+
+def set_target_session(session):
+    global _TARGET_SESSION
+    if session is not None and _TARGET_SESSION is not None:
+        raise RuntimeError("DUT UART already has an owner")
+    _TARGET_SESSION = session
 
 # One UART, one reader -- enforced here rather than left as a convention.
 #
@@ -142,6 +158,10 @@ class Console:
 
     @classmethod
     def target(cls, **kw) -> "Console":
+        raw = kw.pop("raw", False)
+        if _TARGET_SESSION is not None and not raw:
+            from .serial import AgentConsole
+            return AgentConsole(_TARGET_SESSION)
         # The physical UART has no flow control. KASAN/fault tracing can delay
         # its receiver enough to overrun a continuous command line. Leave
         # FIFO headroom and a scheduling gap; PTY-backed LAN consoles need
@@ -170,7 +190,15 @@ class Console:
             chunk = self.write_chunk_bytes or max(1, len(data))
             for start in range(0, len(data), chunk):
                 self.ser.write(data[start:start + chunk])
-                self.ser.flush()
+                while True:
+                    try:
+                        self.ser.flush()
+                        break
+                    except termios.error as error:
+                        # tcdrain can be interrupted by a child exiting.
+                        # The bytes were written already; retry only the drain.
+                        if error.args[0] != errno.EINTR:
+                            raise
                 if start + chunk < len(data):
                     time.sleep(self.write_pause_s)
 

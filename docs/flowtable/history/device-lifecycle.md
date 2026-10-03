@@ -44,9 +44,9 @@ Three focused tests pass on the staged KASAN image:
 
 | Proof | Result |
 |---|---|
-| Automatic MTU recovery | `test_flowtable_mtu_recovery`, 88.41 seconds. One persistent TCP connection and one UDP tuple survive 1500 → 1400 → 1500 on each real port. The nft flowtable object and handle remain unchanged throughout. Each transition retires exactly four hardware directions, invalidates two generations, installs four current directions and leaves global rearm at zero. |
-| Global recovery boundary | `test_flowtable_offload_rearm`, 23.17 seconds. Rename, routing-policy change and injected retirement-barrier failures retain their global recovery boundary. MTU decrease/restore cannot reopen any of them. Table recreation then restores hardware forwarding, with 512 strict echoes and exactly 512 hardware hits per direction in each cycle. |
-| Fatal retirement boundary | `test_flowtable_offload_terminal` with `ASK_FLOWTABLE_TERMINAL=unlink`, 26.89 seconds. MTU decrease/restore on each physical port leaves the fatal latch set and both physical receive ports disabled while traffic is active. Table rearm and adapter reload remain refused. CDX unload completes and 64 software echoes pass afterward. |
+| Automatic MTU recovery | `flowtable_mtu.py::test_recovery`, 88.41 seconds. One persistent TCP connection and one UDP tuple survive 1500 → 1400 → 1500 on each real port. The nft flowtable object and handle remain unchanged throughout. Each transition retires exactly four hardware directions, invalidates two generations, installs four current directions and leaves global rearm at zero. |
+| Global recovery boundary | `flowtable_offload.py::test_rearm`, 23.17 seconds. Rename, routing-policy change and injected retirement-barrier failures retain their global recovery boundary. MTU decrease/restore cannot reopen any of them. Table recreation then restores hardware forwarding, with 512 strict echoes and exactly 512 hardware hits per direction in each cycle. |
+| Fatal retirement boundary | `flowtable_offload.py::test_terminal` with `ASK_FLOWTABLE_TERMINAL=unlink`, 26.89 seconds. MTU decrease/restore on each physical port leaves the fatal latch set and both physical receive ports disabled while traffic is active. Table rearm and adapter reload remain refused. CDX unload completes and 64 software echoes pass afterward. |
 
 The MTU proof uses fixture-owned routes without a fixed MTU override. After
 each transition, an eight-second hardware window delivers 256 UDP echoes and
@@ -113,7 +113,7 @@ alternative may affect routing even through another device. RTNL and both
 destination checks exclude stale queued admission. These notifications do not
 cover the separate nexthop-object API, which remains foundation audit work.
 
-`test_flowtable_link_recovery` passes in 106.39 seconds. It performs two down/up
+`flowtable_link.py::test_recovery` passes in 106.39 seconds. It performs two down/up
 cycles on each real port while keeping one TCP connection, one UDP socket and
 the same nft flowtable object alive. Each DOWN returns four hardware directions
 and all flow references to zero, keeps both bindings, and prevents further UDP

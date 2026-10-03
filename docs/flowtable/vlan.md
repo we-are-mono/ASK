@@ -124,7 +124,7 @@ Its `vlan_dev_real_dev()` shim reproduces the bottom-device behaviour, so a
 decoder that used it fails the QinQ case rather than passing and shipping.
 `flowtable_hw.c` asserts the innermost-first reversal tag by tag.
 
-On hardware, `tools/tests/test_flowtable_vlan.py` runs LAN VM → DUT → WAN host
+On hardware, `tools/tests/flowtable_vlan.py` runs LAN VM → DUT → WAN host
 with the LAN behind a tag and the WAN untagged, so one connection exercises
 the ingress strip and the egress insert at once:
 

@@ -15,7 +15,7 @@ include build/deploy.mk
 #             server). Usually localhost.
 #    target — the DUT (ls1046a-class gateway) under test.
 #    lan    — LAN-side traffic generator (typically a libvirt VM) behind
-#             the DUT's NAT, reached through its serial console.
+#             the DUT's NAT, reached through QEMU guest-agent control.
 #
 #  Workflow (per-run):
 #    1. make ask-image     — build the Yocto test image (kas).
@@ -25,7 +25,7 @@ include build/deploy.mk
 #                              tftpboot ${loadaddr} <wan_ip>:$(TFTP_IMAGE_NAME)
 #                              booti ${loadaddr} - ${fdtaddr}
 #                            Board boots into the test image in ~15s;
-#                            askd-agent starts automatically via S70askd-agent.
+#                            kernel recording starts via S70askd-agent.
 #    4. make deploy-agents — install the WAN agent and runner dependencies.
 #    5. make test          — run the test suite. Assumes agents are up;
 #                            exits non-zero on failure.
@@ -50,7 +50,7 @@ setup:
 # Build the Yocto test image via kas. Produces Image.gz with the ASK stack,
 # python3, askd-agent, and the KASAN/lockdep/kmemleak-enabled kernel.
 ask-image:
-	cd meta-ask && kas build .config.yaml
+	cd meta-ask && KASAN=1 kas build .config.yaml
 
 # Drop the bundled kernel+initramfs into the WAN host's TFTP root so
 # U-Boot on the DUT can pull it. Copies rather than symlinks because
@@ -74,7 +74,7 @@ stage-image:
 	@echo "    at U-Boot: tftpboot \$${loadaddr} <name>; booti ..."
 
 # Install askd-agent onto the local WAN host. The DUT copy ships in the
-# Yocto image; the LAN client is driven over UART.
+# Yocto image; the LAN client uses QEMU guest-agent control.
 
 deploy-agent-wan:
 	@echo "==> deploy-agent: wan (local)"

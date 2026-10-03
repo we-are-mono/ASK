@@ -3,6 +3,9 @@ from pathlib import Path
 
 import pytest
 
+# Fixture modules are loaded by pytest, but are not test modules themselves.
+collect_ignore_glob = ["**/conftest.py"]
+
 # Helpers keep pytest's detailed assertion messages after leaving test modules.
 pytest.register_assert_rewrite("ask_orch", *(
     path.stem for suite in ("tests", "host_tests")

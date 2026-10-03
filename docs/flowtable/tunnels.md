@@ -273,7 +273,7 @@ Beyond the rules a routed flow already satisfies:
 
 ## Verification
 
-`tools/tests/test_flowtable_security.py` verifies on the DUT that correct
+`tools/tests/flowtable_security.py` verifies on the DUT that correct
 6o4 and 4o6 replies increment hardware counters, while changing only the outer
 source, destination or encapsulation protocol produces neither delivery nor
 hardware counter increments. It exercises 4o6 both directly and with
@@ -294,7 +294,7 @@ insert word's mode, size and IP-identification start, and the flow-described
 statistics index the opcodes take from the description rather than from a
 registered interface.
 
-On hardware, `tools/tests/test_flowtable_tunnel.py` runs LAN VM → DUT → tunnel
+On hardware, `tools/tests/flowtable_tunnel.py` runs LAN VM → DUT → tunnel
 → orchestrator, with a real `sit` or `ip6_tnl` tunnel on both ends. Every
 routed case captures the outer frames the DUT put on the wire and reads the
 header back — the endpoints, protocol 41 or next header 4, the TTL, a correct
@@ -308,7 +308,7 @@ which the counters alone cannot show:
 | TCP | yes | half a megabyte on one connection with both directions in hardware and the cookies unchanged |
 | Reconfigure under load | 6o4 | `ip tunnel change` of the TTL retires the flow through the link watch, and the flow readmitted afterwards carries the new TTL on the wire |
 | Delete under load | yes | deleting the tunnel device retires both directions and leaves the bindings up, so the next flow is judged against whatever tunnel exists then |
-| Over a PPPoE session | yes | `test_flowtable_pppoe.py::test_flowtable_pppoe_tunnel`: the insert carries the outer header, the session header and the WAN tag, the strip removes all three; the outer frames reach the concentrator's ppp device, which only a frame addressed to it and to this session does; one session and one tunnel record, each held by both directions |
+| Over a PPPoE session | yes | `flowtable_pppoe.py::test_tunnel`: the insert carries the outer header, the session header and the WAN tag, the strip removes all three; the outer frames reach the concentrator's ppp device, which only a frame addressed to it and to this session does; one session and one tunnel record, each held by both directions |
 
 Both directions of both modes offload at the path's line rate: measured LAN VM
 → DUT → tunnel → orchestrator over four TCP streams, 6o4 ran 9.15 Gb/s

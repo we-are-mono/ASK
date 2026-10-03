@@ -202,7 +202,7 @@ This prevents a hardware miss from bypassing the ordinary PPP receiver's
 peer check in software. Both hardware directions remain eligible under the
 MTU rules above.
 
-`test_flowtable_pppoe_binding.py` tests both families with software and hardware
+`flowtable_pppoe_binding.py` tests both families with software and hardware
 flowtables: wrong IDs and peer MACs must deliver nothing, while valid replies
 before and after them must arrive and increment hardware counters when enabled.
 
@@ -310,7 +310,7 @@ two that were not were redundant guards subsumed by others, one of which was
 also the only thing bounding the walk; both were removed and the bound made
 structural instead.
 
-On hardware, `tools/tests/test_flowtable_pppoe.py` runs LAN VM → DUT → session
+On hardware, `tools/tests/flowtable_pppoe.py` runs LAN VM → DUT → session
 → orchestrator, with a real `pppoe-server` on the far end and `pppd` on the
 DUT over `eth4.3900`. Every case asserts the session id and concentrator the
 adapter recorded against `/proc/net/pppoe`, which is the kernel's own

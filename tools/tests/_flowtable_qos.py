@@ -136,8 +136,7 @@ while True:
 async def lan_start(r, *, iperf=(), echo=(), host=None, lifetime=240):
     """Start iperf3 servers and a UDP echo on the LAN VM, detached.
 
-    Detached because the LAN console is a single channel and the traffic that
-    follows is driven from this host while the servers run. Each process is its
+    Traffic is driven from this host while the servers run. Each process is its
     own session under `timeout`, so a run that dies without its teardown leaves
     nothing listening for longer than `lifetime`, and `lan_stop` kills each
     whole group. The servers speak JSON so a client asking for
@@ -323,9 +322,8 @@ async def egress(r, dev):
     what a rate over a window of a few seconds is taken against, and the call's
     length is kept: the counters were read somewhere inside it.
     """
-    started = time.monotonic()
-    text = (await command(r.target, r.session, "ethtool", "-S", dev))["stdout"]
-    ended = time.monotonic()
+    result = await command(r.target, r.session, "ethtool", "-S", dev)
+    text = result["stdout"]
     leaves = {}
     for name, slot, value in LEAF_COUNTER.findall(text):
         leaves.setdefault(int(slot), {})[LEAF_FIELDS[name]] = int(value)
@@ -333,7 +331,7 @@ async def egress(r, dev):
         leaves.setdefault(queue, {})[LEAF_FIELDS[name]] = int(value)
     software = SOFTWARE_TX.findall(text)
     assert len(leaves) == 18 and len(software) == 1, text
-    return {"at": (started + ended) / 2, "span": ended - started, "leaves": leaves,
+    return {"at": result["at"], "span": result["span"], "leaves": leaves,
             "software_tx": int(software[0])}
 
 

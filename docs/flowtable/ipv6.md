@@ -84,7 +84,7 @@ so no firmware change is needed. Conntrack's NAT status is unchanged and
 packets outside the flowtable still traverse the ordinary NPT targets.
 Patch 030's restriction to unconfirmed conntracks remains in place.
 
-`test_flowtable_npt.py` checks source, destination and combined translation
+`flowtable_npt.py` checks source, destination and combined translation
 for TCP and UDP, through software and hardware flowtables. The remote endpoint
 checks the translated address; the hardware cases require packet counters in
 both directions, and the software cases require an offloaded conntrack with
@@ -134,7 +134,7 @@ an IPv6 packet on size. So a packet that fits the port but not the bundle
 (1438 for AES-CBC and a 128-bit HMAC-SHA256 tag over IPv4) is taken by the
 hardware: SEC encrypts the inner packet whole and the microcode fragments the
 outer IPv4 packet, whose DF stays clear because an IPv6 inner packet has none
-to copy. Measured on the DK (`test_flowtable_ipv6_sa.py`): the peer reassembles
+to copy. Measured on the DK (`flowtable_ipv6_sa.py`): the peer reassembles
 and decrypts every such packet exactly once, the microcode counts two IPv4
 fragments and no IPv6 ones, and no Packet Too Big is sent. The inner packet is
 never fragmented, which is what bounding exists to prevent -- a router must not
@@ -209,7 +209,7 @@ against an IPv4-shaped one, and `ft_route6_event` selectivity.
 `flowtable_hw.c` reproduces the `CtEntry` union byte for byte, so its IPv6
 variants fail if any `twin_*` field is written over the destination address.
 
-On hardware, `tools/tests/test_flowtable_ipv6.py` runs LAN VM → DUT → WAN host
+On hardware, `tools/tests/flowtable_ipv6.py` runs LAN VM → DUT → WAN host
 over two ULA /64s and requires the classifier's own counters to account for
 every packet of the measurement burst:
 
@@ -228,13 +228,13 @@ each direction carries the MTU of the interface *it* leaves by, and one
 connection is one retirement because both directions share an invalidation
 handle. The WAN port is reduced to 1400 together with the LAN's IPv6 MTU, as
 an operator would, so both directions come back at 1400 in hardware.
-`test_flowtable_ipv6_mtu_bound` proves the bound itself: with the WAN route
+`flowtable_ipv6.py::test_mtu_bound` proves the bound itself: with the WAN route
 locked to 1280 and the LAN's IPv6 MTU at 1280, only the LAN-to-WAN direction
 is admitted; raising the LAN to 1500 retires it on the next stats pass or
 re-offer and the
 flow comes back with only the WAN-to-LAN direction in hardware; a 1448-byte
 datagram then gets Packet Too Big with MTU 1280 and the microcode's IPv6
-fragment counter does not move. `test_flowtable_ipv6_same_tuple_exceptions`
+fragment counter does not move. `flowtable_ipv6.py::test_same_tuple_exceptions`
 sends a hop limit of 1, hop-by-hop options, destination options, a chain of
 both and fragments down a tuple with both directions in hardware: the first is
 answered with Time Exceeded, the rest arrive intact, and the entries keep the

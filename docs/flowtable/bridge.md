@@ -240,7 +240,7 @@ port a flow leaves by, so a walk that descended it by adjacency fails rather
 than passing and shipping. Twenty-one mutations of the guards described here
 were reintroduced one at a time; each was caught.
 
-On hardware, `tools/tests/test_flowtable_bridge.py` runs LAN VM → DUT → WAN
+On hardware, `tools/tests/flowtable_bridge.py` runs LAN VM → DUT → WAN
 host with the LAN behind `br-ft` and the WAN unbridged, in three shapes:
 
 | Case | Hardware packets, each direction | Evidence beyond the counters |

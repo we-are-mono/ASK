@@ -1,20 +1,23 @@
-SUMMARY = "ASK test-harness on-node HTTP/JSON agent"
+SUMMARY = "ASK test-harness UART agent and WAN HTTP endpoint"
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://${ASK_SRCROOT}/LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 
-FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/tools:${THISDIR}/files:"
 
 SRC_URI = " \
     file://askd_agent \
     file://S70askd-agent \
 "
 
-# No upstream source — everything is in files/.
+# The host and image use the same agent package from tools/.
 S = "${UNPACKDIR}"
 
 RDEPENDS:${PN} += " \
     python3-core \
     python3-aiohttp \
+    python3-compression \
+    python3-sqlite3 \
+    python3-terminal \
 "
 
 do_install() {

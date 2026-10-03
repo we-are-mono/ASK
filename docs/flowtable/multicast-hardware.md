@@ -319,16 +319,16 @@ senders do not trade one entry. A bridge VLAN change re-derives every group
 on that bridge under RTNL: listener tags, listeners that left the VLAN, and
 whether the ingress shape still resolves to the group's VLAN.
 
-**What the rig asserts.** `test_flowtable_service_multicast_bridge.py` reads
+**What the rig asserts.** `flowtable_service_multicast_bridge.py` reads
 the replica's frame, not just its datagram, in both directions:
 
-- `test_flowtable_service_multicast_bridge_keeps_the_sender`: untagged in on
+- `flowtable_service_multicast_bridge.py::test_keeps_the_sender`: untagged in on
   the WAN port, tagged out to the LAN listener. The source MAC is the
   sender's, the destination is the group's MAC and the hop count is unchanged.
   The classifier counts at least 95% of the frames and the ingress CPU sees at
   most 10%. A second sender MAC then takes the key over once the first goes
   idle, with the same assertions for the new sender.
-- `test_flowtable_service_multicast_bridge_tagged_ingress`: tagged in on the
+- `flowtable_service_multicast_bridge.py::test_tagged_ingress`: tagged in on the
   LAN port, out of the WAN port to the orchestrator's wire. The same
   assertions hold, and the `/proc` row names the ingress tag.
 
@@ -366,7 +366,7 @@ The ASK guide describes zero-copy multicast, and nothing here establishes
 whether a replica's IP header is its own or shared with its siblings. If it is
 shared, a routed copy's decrement would reach the bridged copies too, or a
 second routed copy would decrement twice. The rig case
-`test_flowtable_service_multicast_bridge_and_route` is the discriminating
+`flowtable_service_multicast_bridge.py::test_bridge_and_route` is the discriminating
 test: the bridged copy must arrive with hop count 64 and the routed one with
 63, both whole, in one window. If it fails that way, the fallback is a refusal
 rather than a redesign — `ft_mc_carriable()` would refuse a group with both

@@ -141,7 +141,12 @@ class Rig:
     proto = "udp"
 
     async def state(self):
-        return status_text(await read(self.target, self.session, "/proc/cdx_flowtable"))
+        if getattr(self, "bulk", False):
+            summary = await self.target.observe(self.session, "summary")
+            if not summary["entries"]:
+                return summary
+            return await self.target.observe(self.session, "snapshot")
+        return await self.target.observe(self.session, "state")
 
     async def wait(self, predicate, timeout=10):
         deadline = time.monotonic() + timeout
@@ -176,6 +181,8 @@ class Rig:
     async def delete_table(self, timeout=10):
         # Unbinding retires every hardware entry one delete at a time before
         # nft returns, so a caller holding a full table passes a longer bound.
+        if getattr(self, "bulk", False):
+            return await self.target.observe(self.session, "delete_table", table=TABLE, timeout=max(timeout, 60))
         await command(self.target, self.session, "nft", "delete", "table", "inet", TABLE,
                       check=False, timeout_ms=max(15000, timeout * 1000))
         return await self.wait(lambda s: not s["bindings"] and not s["entries"], timeout=timeout)
@@ -363,7 +370,7 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
     try:
         await command(r.target, r.session, "modprobe", "xt_tcpudp")
         # Hardware flows age on these, so a run cut short inside a fixture
-        # that shortens them -- connections sets 5 s -- would have every
+        # that shortens them -- the lifetime test sets 5 s -- would have every
         # later test lose its flows on the first pause in traffic, and read
         # as flows expiring under load. Tests that need other values set and
         # restore them inside their own scope.
@@ -464,8 +471,7 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
             debug_knobs = [("cdx", "flowtable_fail_unlink"), ("cdx", "ehash_fail_unlink"),
                            ("cdx", "flowtable_restart_hold")]
             if r.recovery_console:
-                # Terminal cases remove CDX and may stop management traffic.
-                # Restoration must not depend on its procfs or HTTP.
+                # Terminal cases remove CDX; restore only knobs still present.
                 knobs = [("ask_flowtable", "flowtable_fail_stage"), *debug_knobs]
                 await console_python(r.recovery_console, f"""
 from pathlib import Path
@@ -504,6 +510,19 @@ for module, name in {knobs!r}:
                 failures.append(str(error))
         if r.recovery_console:
             r.recovery_console.close()
+        if getattr(r, "bulk", False):
+            try:
+                if failures or getattr(request.node, "_ask_failed", False):
+                    for evidence in await r.target.observe(r.session, "artifacts"):
+                        data = await r.target.artifact(r.session, evidence["id"])
+                        (artifact_dir() / f"flow-snapshot-{evidence['snapshot']}.txt.gz").write_bytes(data)
+                        await r.target.request(r.session, "artifact/release", {"id": evidence["id"]})
+            except Exception as error:
+                failures.append(f"collecting flow evidence: {error}")
+            try:
+                await r.target.observe(r.session, "reset")
+            except Exception as error:
+                failures.append(str(error))
         assert not failures, ("fixture restoration failed", failures)
 
 

@@ -663,7 +663,7 @@ file's git history.
 - [x] **A33.** Routed multicast resolved listeners through `get_onif_by_name`, NULL for a `br-lan.N` —
   superseded: the flowtable learner hands the encoder ports and tag stacks, so there is no name (_pending_).
 
-- [x] **A185.** `test_flowtable_bridge_fdb_roaming` (from da0b00a) read the bridge FDB once after the
+- [x] **A185.** `flowtable_bridge.py::test_fdb_roaming` (from da0b00a) read the bridge FDB once after the
   roam, but the parent carries the same MAC and its background traffic relearns the entry, so the
   single snapshot raced — fixed (this commit): re-send the tagged probe and poll until the roam port shows.
 
@@ -675,7 +675,7 @@ file's git history.
   line and active-low flag were released under it and a device ref it never took dropped — fixed (this
   commit): borrow without devm, put only an owned line; KUnit `shared_gpio` crashed UML without it.
 
-- [x] **A182.** `test_flowtable_ipv6_mtu_recovery` flaked in the full suite: a readmission that lost
+- [x] **A182.** `flowtable_ipv6.py::test_mtu_recovery` flaked in the full suite: a readmission that lost
   `rtnl_trylock` (the sfp-led poll held RTNL 18×/s) needs two GC ticks, more than ten quick rounds — fixed
   (this commit): deadline settles with the busy path injected every run; the LED poll no longer takes RTNL.
 

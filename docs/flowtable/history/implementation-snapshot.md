@@ -308,7 +308,7 @@ Host tests compile the production rule decoder and lifecycle code
 with fault-injected kernel/firmware boundaries under ASan and UBSan; hardware
 acceptance uses the real classifier and endpoint traffic.
 
-`tools/tests/test_flowtable_offload.py` is explicitly gated by
+`tools/tests/flowtable_offload.py` is explicitly gated by
 `ASK_FLOWTABLE_TESTS=1`. It supplies a selected-protocol NAT exemption, permanent DUT
 neighbours, a WAN host return route, and a numbered echo server, then restores
 the fixture. TCP tests reuse the topology with a TCP peer instead of the echo

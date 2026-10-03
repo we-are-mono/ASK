@@ -1,8 +1,8 @@
-"""HTTP client for askd-agent. Thin wrapper over aiohttp."""
+"""Shared device API: DUT UART and explicit WAN HTTP endpoints."""
 
 from __future__ import annotations
 
-import os
+import asyncio
 from dataclasses import dataclass
 import aiohttp
 
@@ -42,12 +42,45 @@ ASK_KMEMLEAK_FILTER = [
 @dataclass
 class Agent:
     name: str           # human label, e.g. "target", "lan", "wan"
-    base_url: str       # e.g. "http://dut.example:9110"
+    base_url: str = ""  # WAN HTTP endpoint; empty selects the shared DUT UART.
+
+    async def request(self, session, operation, body=None, *, timeout=30, check=True):
+        body = body or {}
+        if not self.base_url:
+            from .uart import target_session
+            return await asyncio.to_thread(target_session().request, operation, body, timeout, check)
+        path = operation
+        if operation == "capture-stop":
+            path += "/" + body["capture_id"]
+        method = "GET" if operation in {"health", "counters", "kmemleak-scan"} else "POST"
+        kwargs = {"params" if method == "GET" else "json": body}
+        async with session.request(method, f"{self.base_url}/{path}",
+                                   timeout=aiohttp.ClientTimeout(total=timeout), **kwargs) as response:
+            if check:
+                response.raise_for_status()
+            return await response.json()
+
+    async def observe(self, session, operation, **body):
+        return await self.request(session, "observe/" + operation, body,
+                                  timeout=float(body.get("timeout", 30)) + 10)
+
+    async def artifact(self, session, ident):
+        import base64
+        data = bytearray()
+        offset = 0
+        while True:
+            part = await self.request(session, "artifact/read", {"id": ident, "offset": offset})
+            data.extend(base64.b64decode(part["data"]))
+            offset = len(data)
+            if offset == part["size"]:
+                import hashlib
+                assert hashlib.sha256(data).hexdigest() == ident, "artifact digest mismatch"
+                return bytes(data)
+            assert offset < part["size"], part
+
 
     async def health(self, session: aiohttp.ClientSession) -> dict:
-        async with session.get(f"{self.base_url}/health", timeout=aiohttp.ClientTimeout(total=5)) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "health", {}, timeout=5)
 
     async def capture_start(self, session: aiohttp.ClientSession, ifaces: list[str] | None = None,
                             *, counters: bool = False) -> str:
@@ -57,33 +90,21 @@ class Agent:
         a live frame-queue query. Ask for it only where the deltas are read;
         the splat window itself does not need them."""
         body = {"ifaces": ifaces or [], "counters": counters}
-        async with session.post(f"{self.base_url}/capture-start", json=body,
-                                timeout=aiohttp.ClientTimeout(total=30)) as r:
-            r.raise_for_status()
-            result = await r.json()
-            assert result.get("complete") is True, ("agent lacks reliable capture; redeploy", result)
-            return result["capture_id"]
+        result = await self.request(session, "capture-start", body, timeout=30)
+        assert result.get("complete") is True, result
+        return result["capture_id"]
 
     async def capture_stop(self, session: aiohttp.ClientSession, cap_id: str) -> dict:
-        async with session.post(f"{self.base_url}/capture-stop/{cap_id}",
-                                timeout=aiohttp.ClientTimeout(total=30)) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "capture-stop", {"capture_id": cap_id}, timeout=30)
 
     async def boot_log(self, session):
-        async with session.post(f"{self.base_url}/dmesg-delta", json={},
-                                timeout=aiohttp.ClientTimeout(total=30)) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "dmesg-delta", {}, timeout=30)
 
     async def kmemleak(
         self,
         session: aiohttp.ClientSession,
         filter_substrs: list[str] | None = None,
     ) -> dict:
-        params = []
-        if filter_substrs:
-            params.append(("filter", ",".join(filter_substrs)))
         # If no filter: return everything. For "ASK-code only" callers,
         # pass ASK_KMEMLEAK_FILTER (defined at module top).
         # Timeout budget: the agent writes "scan" to /sys/kernel/debug/
@@ -92,12 +113,7 @@ class Agent:
         # can take 30-60s to complete a full heap walk), then reads +
         # serialises the report. 120s covers the worst-case first scan
         # on our DUT; steady-state subsequent scans are much faster.
-        async with session.get(
-            f"{self.base_url}/kmemleak-scan",
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as r:
-            return await r.json()
+        return await self.request(session, "kmemleak-scan", {"filter": ",".join(filter_substrs or [])}, timeout=120, check=False)
 
     async def kmemleak_clear(self, session: aiohttp.ClientSession) -> dict:
         # Clear now internally does `scan` + `clear` on the agent side so
@@ -105,12 +121,7 @@ class Agent:
         # cursor. The `scan` write is synchronous in the kernel and on a
         # first-boot image walking ~16k DPAA baseline objects it can run
         # 30-60s. Match the scan-timeout budget for consistency.
-        async with session.post(
-            f"{self.base_url}/kmemleak-clear",
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "kmemleak-clear", {}, timeout=120)
 
     async def netlink_send(
         self,
@@ -148,9 +159,7 @@ class Agent:
             body["uid"] = int(uid)
         if userns:
             body["userns"] = True
-        async with session.post(f"{self.base_url}/netlink/send", json=body, timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000 + 5)) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "netlink/send", body, timeout=timeout_ms / 1000 + 5)
 
     async def ioctl_send(
         self,
@@ -182,9 +191,7 @@ class Agent:
             body["userns"] = True
         if drop_cap_net_admin:
             body["drop_cap_net_admin"] = True
-        async with session.post(f"{self.base_url}/ioctl/send", json=body, timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000 + 5)) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "ioctl/send", body, timeout=timeout_ms / 1000 + 5)
 
     async def exec_cmd(
         self,
@@ -192,14 +199,10 @@ class Agent:
         argv: list[str],
         *,
         timeout_ms: int = 5000,
+        quiet: bool = False,
     ) -> dict:
-        async with session.post(
-            f"{self.base_url}/exec",
-            json={"argv": argv, "timeout_ms": timeout_ms},
-            timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000 + 5),
-        ) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "exec", {"argv": argv, "timeout_ms": timeout_ms, "quiet": quiet},
+                                  timeout=timeout_ms / 1000 + 5)
 
     async def fs_read(
         self,
@@ -216,9 +219,7 @@ class Agent:
         primary consumer.
         """
         body = {"path": path, "max_bytes": int(max_bytes)}
-        async with session.post(f"{self.base_url}/fs/read", json=body, timeout=aiohttp.ClientTimeout(total=30)) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "fs/read", body, timeout=30)
 
     async def fs_write(
         self,
@@ -236,14 +237,7 @@ class Agent:
         }
         if uid is not None:
             body["uid"] = int(uid)
-        async with session.post(f"{self.base_url}/fs/write", json=body, timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000 + 5)) as r:
-            r.raise_for_status()
-            return await r.json()
+        return await self.request(session, "fs/write", body, timeout=timeout_ms / 1000 + 5)
 
-# Node endpoints — overridable via env so the harness works on anyone's
-# lab setup. The orchestrator runs on the WAN-side host. The LAN VM
-# sits behind the DUT's NAT and has no IP path from the orchestrator;
-# LAN-side scripting is driven by Console.lan() (libvirt PTY) instead.
-_DEFAULT_PORT = "9110"
-
-TARGET = Agent("target", f"http://{os.environ.get('ASK_TARGET_IP', '')}:{_DEFAULT_PORT}")
+# DUT management has no network endpoint. WAN agents retain their explicit URL.
+TARGET = Agent("target")

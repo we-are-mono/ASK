@@ -91,7 +91,7 @@ int ft_enumerate(struct ft_policy *p) {
         "-DFT_HEALTH_TIMEOUT_MS=500",
         *map(str, sorted(src.glob("*.c"))), "-o", str(binary),
     ], check=True)
-    shutil.copyfile(Path(__file__).with_name("flowtable_nft.py"), tmp_path / "nft")
+    shutil.copyfile(Path(__file__).with_name("_flowtable_nft.py"), tmp_path / "nft")
     (tmp_path / "nft").chmod(0o755)
     (tmp_path / "cdx").mkdir()
     (tmp_path / "policy").write_text(POLICY)

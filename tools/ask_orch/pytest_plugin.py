@@ -2,7 +2,7 @@
 
 import importlib.metadata
 import os
-import subprocess
+import random
 import tempfile
 import time
 from pathlib import Path
@@ -11,6 +11,7 @@ import pytest
 
 from ask_orch.artifacts import artifact_dir, record
 from ask_orch.lifecycle import bench_lock
+from ask_orch.provenance import checkout
 
 
 def pytest_addoption(parser):
@@ -18,6 +19,10 @@ def pytest_addoption(parser):
         "--release",
         action="store_true",
         help="require hardware capabilities and reject unexpected skips",
+    )
+    parser.addoption(
+        "--module-order-seed", type=int,
+        help="shuffle modules reproducibly while preserving each module's test order",
     )
 
 
@@ -44,14 +49,7 @@ def pytest_configure(config):
     versions = {
         d.metadata["Name"]: d.version for d in importlib.metadata.distributions()
     }
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=Path(__file__).parent,
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
+    source = checkout(Path(__file__).resolve().parents[2])
     # Only bench settings: credentials and unrelated environment variables
     # never belong in a distributable test report.
     settings = {
@@ -67,13 +65,20 @@ def pytest_configure(config):
             "ASK_WAN_IPERF_IP",
             "ASK_WAN_INJECT_IF",
             "ASK_KERNEL_SOURCE",
+            "ASK_FLOWTABLE_CHURN",
+            "ASK_FLOWTABLE_CHURN_SECONDS",
+            "ASK_FLOWTABLE_BASELINE",
+            "ASK_FLOWTABLE_MIN_GBPS",
+            "ASK_IPSEC_IPERF",
+            "ASK_IPSEC_IPERF_BPS",
         )
         if os.environ.get(key)
     }
     record(
         "environment",
         {
-            "revision": revision.stdout.strip(),
+            "revision": source["revision"],
+            "checkout": source,
             "packages": versions,
             "bench": settings,
             "release": config.getoption("--release"),
@@ -94,34 +99,48 @@ def pytest_collection_modifyitems(config, items):
         item.add_marker("host" if suite == "host_tests" else "hardware")
         if suite == "startup_tests":
             item.add_marker("destructive")
-        if item.path.name == "test_smoke.py":
+        if item.path.name == "smoke.py":
             item.add_marker("smoke")
         if "pppoe_rig" in item.fixturenames:
             item.add_marker(pytest.mark.requires("pppd"))
         if "smcrouted" in item.fixturenames:
             item.add_marker(pytest.mark.requires("smcrouted"))
-        if item.path.name.startswith("test_profile_") or item.path.name in {
-            "test_flowtable_churn.py",
-            "test_ipsec_vlan_iperf_probe.py",
-            "test_reassembly_storm.py",
-            "test_ipv6_reassembly_storm.py",
+        if item.path.name.startswith("profile_") or item.path.name in {
+            "flowtable_churn.py",
+            "ipsec_vlan_iperf_probe.py",
+            "reassembly_storm.py",
+            "ipv6_reassembly_storm.py",
         }:
             item.add_marker("slow")
         if (
-            getattr(item, "originalname", None) == "test_flowtable_offload_terminal"
-            or item.path.name == "test_flowtable_unregister.py"
+            (item.path.name == "flowtable_offload.py"
+             and getattr(item, "originalname", None) == "test_terminal")
+            or item.path.name == "flowtable_unregister.py"
         ):
             item.add_marker("destructive")
-        if item.path.name == "test_flowtable_churn.py":
+        if item.path.name == "flowtable_churn.py":
+            # Churn requires both a minimum soak and a complete tuple rotation.
+            # UART round trips can make the latter longer than the soak. Leave
+            # an hour for that coverage, including setup, drain and leak scans.
             item.add_marker(
                 pytest.mark.timeout(
-                    int(os.environ.get("ASK_FLOWTABLE_CHURN_SECONDS", "900")) + 300,
+                    max(3600, int(os.environ.get("ASK_FLOWTABLE_CHURN_SECONDS", "900")) + 420),
                     func_only=True,
                 )
             )
     # pytest applies -k/-m inside this hook. Mark first; validate only the
     # remaining selection so `-m host -n auto` never reserves the bench.
     result = yield
+    seed = config.getoption("--module-order-seed")
+    if seed is not None:
+        modules = {}
+        for item in items:
+            modules.setdefault(item.path, []).append(item)
+        groups = list(modules.values())
+        random.Random(seed).shuffle(groups)
+        items[:] = [item for group in groups for item in group]
+    record("selection", {"module_order_seed": seed,
+                         "nodeids": [item.nodeid for item in items]}, nodeid="session")
     if any(item.get_closest_marker("hardware") for item in items):
         if getattr(config.option, "numprocesses", None) or hasattr(
             config, "workerinput"
@@ -140,7 +159,7 @@ def hardware_bench(request):
     required = {"ASK_TARGET_DEV"}
     if any(Path(item.path).parent.name == "tests" for item in request.session.items):
         required.update(
-            {"ASK_TARGET_IP", "ASK_WAN_IPERF_IP", "ASK_LAN_VM", "ASK_LAN_NIC"}
+            {"ASK_WAN_IPERF_IP", "ASK_LAN_VM", "ASK_LAN_NIC"}
         )
     if any(
         item.get_closest_marker("hardware")
@@ -187,18 +206,12 @@ def pytest_runtest_makereport(item, call):
         and item.config.getoption("--release")
         and not item.config._ask_broken
         and not getattr(report, "wasxfail", None)
-        and not (
-            report.when == "setup"
-            and any(
-                marker.args and marker.args[0] is True
-                for marker in item.iter_markers("skipif")
-            )
-        )
     ):
         report.outcome = "failed"
         report.longrepr = (
             f"release run cannot skip required coverage: {report.longrepr}"
         )
+    item._ask_failed = getattr(item, "_ask_failed", False) or report.failed
     if (
         report.failed
         and report.when in {"setup", "teardown"}

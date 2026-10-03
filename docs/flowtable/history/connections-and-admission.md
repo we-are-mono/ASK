@@ -55,8 +55,8 @@ The two initial test runs stopped on overly strict TIME_WAIT and CLOSE label
 assertions respectively. Those runs are excluded from complete acceptance;
 the replacement assertions establish delivery, visibility and bounded cleanup.
 
-`tools/tests/test_flowtable_tcp.py` uses a TCP variant of the shared fixture.
-The staged `flowtable_tcp_peer.py` keeps a single LAN console operation alive
+`tools/tests/flowtable_tcp.py` uses a TCP variant of the shared fixture.
+The staged `_flowtable_tcp_peer.py` keeps a single LAN console operation alive
 while commands and payloads travel over the tested TCP connection. Each payload
 block is checked and the complete transfer is hashed. Test-only endpoint packet
 loss and sysctl changes are restored in cleanup. The FIN test temporarily uses

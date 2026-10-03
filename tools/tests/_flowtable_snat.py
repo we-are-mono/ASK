@@ -14,8 +14,8 @@ from _flowtable_rig import DPORT, WAN_IP, artifact_dir, command, console_command
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 from ask_orch.uart import Console
-from flowtable_connections_peer import UDP_SIZE, payload
-from flowtable_udp_wire import udp_wire_payload
+from _flowtable_connections_peer import UDP_SIZE, payload
+from _flowtable_udp_wire import udp_wire_payload
 
 
 def snat_flows(r, state, external, port):

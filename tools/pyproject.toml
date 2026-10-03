@@ -13,6 +13,8 @@ asyncio_default_test_loop_scope    = "function"
 # Hardware commands add -x; host runs collect all failures.
 addopts = "-v -ra --tb=short --strict-markers --strict-config"
 testpaths = ["host_tests", "tests"]
+# Test directories contain plain test filenames and underscore-prefixed helpers.
+python_files = ["[!_]*.py"]
 pythonpath = [".", "tests"]
 required_plugins = ["pytest-asyncio==1.3.0", "pytest-timeout==2.4.0"]
 markers = [

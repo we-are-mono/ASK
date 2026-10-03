@@ -1580,7 +1580,7 @@ static void test_spec_mtu(void)
 	 * the bundle's, not the port's less the headers alone, and the
 	 * expansion the classifier gets carries the ICV, the trailer and the
 	 * padding. For AES-CBC with HMAC-SHA256-128 over IPv4 that is
-	 * 1500 - 1438 = 62 (tools/tests/test_flowtable_ipv6_sa.py), where xfrm
+	 * 1500 - 1438 = 62 (tools/tests/flowtable_ipv6_sa.py), where xfrm
 	 * answers a state not yet valid with 1456. */
 	x = outbound_state();
 	x->data = &geometries[1];

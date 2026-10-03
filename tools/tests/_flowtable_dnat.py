@@ -20,8 +20,8 @@ from _flowtable_rig import (
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 from ask_orch.uart import Console
-from flowtable_connections_peer import Flow
-from flowtable_udp_wire import udp_capture_socket, udp_wire_payload
+from _flowtable_connections_peer import Flow
+from _flowtable_udp_wire import udp_capture_socket, udp_wire_payload
 
 PUBLIC_PORT = DPORT + 1000
 

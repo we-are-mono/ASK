@@ -12,8 +12,8 @@ existing primitives.
 
 from __future__ import annotations
 import asyncio
+import errno
 import os
-import shlex
 import aiohttp
 import pytest_asyncio
 from ask_orch.lifecycle import CleanupStack, checked
@@ -25,31 +25,33 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # Every test that creates VLAN subinterfaces on the LAN segment claims its
 # IDs here so they don't collide. pytest runs serially, but teardown races
 # and shared-segment capture still make overlap worth tracking. Claims:
-#   test_flowtable_vlan.py      271/272      (ASK_FLOWTABLE_VLAN_ID, +1 inner)
-#   test_flowtable_bridge.py    273/274/275  (ASK_FLOWTABLE_BRIDGE_VID, +1, +2)
-#   test_flowtable_pppoe.py     276          (ASK_FLOWTABLE_PPPOE_LAN_VID)
-#   test_flowtable_service_vlan.py 284      (service VLAN recovery)
-#   test_flowtable_service_bridge.py 285/286 (trusted/guest bridge membership,
+#   flowtable_vlan.py      271/272      (ASK_FLOWTABLE_VLAN_ID, +1 inner)
+#   flowtable_bridge.py    273/274/275  (ASK_FLOWTABLE_BRIDGE_VID, +1, +2)
+#   flowtable_pppoe.py     276          (ASK_FLOWTABLE_PPPOE_LAN_VID)
+#   flowtable_service_vlan.py 284      (service VLAN recovery)
+#   flowtable_service_bridge.py 285/286 (trusted/guest bridge membership,
 #                                            port and VLAN forwarding state)
-#   test_flowtable_service_multicast_bridge.py 287/288/289/290
+#   flowtable_service_multicast_bridge.py 287/288/289/290
 #                               (LAN, WAN, IPTV, and the VLAN IPTV is routed into)
-#   test_mcast_e2e.py           244          (VLAN_ID_MROUTE, routed oif)
-#   test_mroute_capacity.py     311..319     (nine LAN listeners)
-#   test_flowtable_service_multicast_leave.py      321/322 (routed via a snooping bridge)
-#   test_flowtable_service_multicast_quarantine.py 323     (listener swap)
-#   test_mcast_member_mtu.py    324          (VLAN_ID_MCAST_MTU, narrow oif)
-#   test_flowtable_service_multicast_edges.py 325 (the oif a forward chain drops toward)
-#   test_flowtable_service_multicast_xfrm.py  326 (the oif an XFRM policy governs)
-#   test_flowtable_service_multicast_ports.py 327 (the oif a port rule drops toward)
+#   mcast_e2e.py           244          (VLAN_ID_MROUTE, routed oif)
+#   mroute_capacity.py     311..319     (nine LAN listeners)
+#   flowtable_service_multicast_leave.py      321/322 (routed via a snooping bridge)
+#   flowtable_service_multicast_quarantine.py 323     (listener swap)
+#   mcast_member_mtu.py    324          (VLAN_ID_MCAST_MTU, narrow oif)
+#   flowtable_service_multicast_edges.py 325 (the oif a forward chain drops toward)
+#   flowtable_service_multicast_xfrm.py  326 (the oif an XFRM policy governs)
+#   flowtable_service_multicast_ports.py 327 (the oif a port rule drops toward)
+#   flowtable_slaac.py     331          (isolated LAN router advertisements)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
 # orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access
-# concentrator binds to it, so test_flowtable_pppoe.py builds eth4.3900 on the
+# concentrator binds to it, so flowtable_pppoe.py builds eth4.3900 on the
 # DUT to meet it and never creates or deletes anything on the orchestrator
 # side. Do not reuse 3900 for a test that does.
-# test_mroute_capacity.py also receives a tagged WAN replica on that existing
+# mroute_capacity.py also receives a tagged WAN replica on that existing
 # device using a temporary packet-socket membership, without reconfiguring it,
-# and test_flowtable_service_multicast_edges.py does the same.
+# and flowtable_service_multicast_edges.py does the same. DHCP also borrows
+# it, creating only an owned macvlan child in a private server namespace.
 VLAN_ID_MROUTE: int                   = 244
 VLAN_IDS_MROUTE_LIMIT: tuple[int, ...] = tuple(range(311, 320))
 VLAN_ID_MCAST_MTU: int                = 324
@@ -110,7 +112,13 @@ async def dut_vlan_subif(
     assert r["rc"] == 0, f"DUT vlan add {iface} (vid {vid}): {r}"
 
     async def _cleanup():
-        await _exec("ip", "link", "del", iface)
+        result = await _exec("ip", "link", "del", iface, check=False)
+        if result["rc"]:
+            # Lifecycle tests may already have removed this device (or its
+            # parent). Only absence makes a failed delete harmless.
+            remaining = await target_agent.fs_read(session, f"/sys/class/net/{iface}/ifindex")
+            if remaining["errno"] != errno.ENOENT:
+                checked(result)
     stack.push(_cleanup)
 
     if ipv4:
@@ -156,7 +164,7 @@ async def lan_vlan_subif(
     assert r.rc == 0, f"LAN vlan add {iface} (vid {vid}): {r.stdout!r}"
 
     async def _cleanup():
-        checked(await lan_run(lan, f"ip link del {iface}", 5.0))
+        checked(await lan_run(lan, f"if [ -e /sys/class/net/{iface} ]; then ip link del {iface}; fi", 5.0))
     stack.push(_cleanup)
 
     if ipv4:
@@ -184,13 +192,7 @@ async def lan_vlan_subif(
 # ---- 4. low-level helpers -----------------------------------------------
 
 async def lan_run(lan, cmd: str, timeout: float = 10.0):
-    """Async wrapper around `Console.lan().run(...)`.
-
-    `Console.run` is blocking on serial I/O — bounce through
-    `asyncio.to_thread` so concurrent async work isn't stalled while
-    the UART round-trip is in flight. Use this from any async test
-    body or fixture; sync-only helpers can call `lan.run` directly.
-    """
+    """Run a LAN command without blocking the event loop on guest-agent I/O."""
     return await asyncio.to_thread(lan.run, cmd, timeout)
 
 
@@ -201,17 +203,9 @@ async def lan_run_python(
     timeout: float = 30.0,
     label: str = "script",
 ):
-    """Stage a Python script on the LAN VM via base64-over-UART, run it,
-    return the RunResult.
-
-    The script is written to a unique /tmp path so concurrent invocations
-    (or reruns within the same minute) don't collide. `label` is folded
-    into the path for debuggability — e.g. label="ipv4_options" produces
-    something like "/tmp/ask_lan_ipv4_options_<pid>_<usec>.py".
-
-    Single staging pattern across all LAN-injection tests so callers
-    don't reimplement the base64 boilerplate.
-    """
+    """Run a script through QGA; raw-console callers retain serial staging."""
+    if hasattr(lan, "python"):
+        return await asyncio.to_thread(lan.python, script, timeout)
     import base64
     import time
 
@@ -244,8 +238,15 @@ print(base64.b64encode(saved).decode())
 
     async def restore():
         cleanup = CleanupStack()
-        cleanup.push(lambda: lan_run(lan, "printf %s " + shlex.quote(saved) +
-                                     " | base64 -d | ip -6 route restore", 5))
+        # iproute2 seeks while restoring; a pipe cannot hold the snapshot.
+        cleanup.push(lambda: lan_run_python(lan, f"""
+import base64, subprocess, tempfile
+with tempfile.TemporaryFile() as routes:
+    routes.write(base64.b64decode({saved!r}))
+    routes.seek(0)
+    subprocess.run(["ip", "-6", "route", "restore"], stdin=routes,
+                   check=True, timeout=5)
+""", label="restore_ipv6_default"))
         cleanup.push(lambda: lan_run(lan, f"ip -6 route del default via {gateway} dev {device}", 5))
         await cleanup.teardown("LAN IPv6 default route")
 
@@ -270,7 +271,7 @@ WAN_IPV6      = os.environ.get("ASK_WAN_IPV6", "fc00:beef::99")
 VIRT_IPV6     = os.environ.get("ASK_VIRT_IPV6", "fc00:beef::dd")
 TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth4")
 
-# A third ULA /64, claimed by test_flowtable_pppoe.py for the addresses a PPPoE
+# A third ULA /64, claimed by flowtable_pppoe.py for the addresses a PPPoE
 # session carries inside itself. It is deliberately neither of the two above:
 # the session's endpoints are not on the LAN or the WAN segment, they are on
 # the point-to-point link between the two ppp devices, and giving them an
@@ -283,7 +284,7 @@ TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth4")
 # Only the session's own /64 is new. Its LAN side reuses DUT_IPV6_LAN and
 # LAN_IPV6 above, which it configures itself rather than through
 # ipv6_topology -- that fixture also addresses the WAN port, which is where
-# the session stands. Sharing those two with test_flowtable_ipv6.py is safe
+# the session stands. Sharing those two with flowtable_ipv6.py is safe
 # only because pytest runs serially and both tear down in finalizers, the same
 # basis as the VLAN id overlaps recorded above.
 PPPOE_IPV6_LOCAL  = os.environ.get("ASK_PPPOE_INNER_LOCAL6", "fc00:babe::1")

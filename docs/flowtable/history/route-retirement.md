@@ -20,7 +20,7 @@ and DSCP aliases. This is deliberately conservative within a prefix and does
 not claim complete policy-routing or device dependency tracking. Policy,
 nexthop-object and device events retain whole-table invalidation.
 
-`test_flowtable_routes_selective` creates two routed LAN peers, each with UDP
+`flowtable_routes.py::test_selective` creates two routed LAN peers, each with UDP
 and a persistent TCP connection, for eight hardware directions. It proves:
 
 - Replacing peer A's route changes its return MTU from 1200 to 1100; adding a
