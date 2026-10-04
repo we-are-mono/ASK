@@ -366,6 +366,17 @@ make test-host K=qos
 make test-host ARGS='-n auto'
 ```
 
+Service recovery loops repeat each ordinary transition twice to catch stale state on
+the second recovery. They retain baseline, per-recovery and new-connection
+hardware proofs. Multicast stop tests use eight complementary combinations:
+each stop method runs with both IP families and both routed and bridged
+forwarding across the two modules. Host tests cover the detailed stop logic.
+
+Capacity churn remains an explicit soak, enabled with `ASK_FLOWTABLE_CHURN=1`.
+Keep its default 900-second minimum and full tuple turnover for soak runs;
+`ASK_FLOWTABLE_CHURN_SECONDS=90` selects a shorter development check. Ordinary
+regression runs leave the soak disabled. See [capacity coverage](flowtable/capacity.md).
+
 `DUT_IP` sets `ASK_TARGET_IP`. `WAN_IP` sets both `ASK_WAN_IPERF_IP`
 (traffic endpoint) and `ASK_WAN_IP` (agent HTTP endpoint). Use
 `WAN_AGENT_IP=127.0.0.1` when the WAN agent is reached locally while traffic
@@ -492,13 +503,17 @@ descriptor byte order, portal-result lifetime, prefetch retries, errors,
 and a final response containing both a frame and the empty-queue flag.
 
 The SDK host tests compile production port, scheme and state-query functions
-under ASan/UBSan. They check ownership, cleanup, busy refusals, native/compat
-ioctls and FMLIB state queries. They require the patched ASK kernel source;
-the state-query test also requires the fetched FMLIB source. Run them with:
+under ASan/UBSan. They check ownership, cleanup, busy refusals and the
+port enable/stopped/fence queries. They require the patched ASK kernel source.
+Run them with:
 
 ```sh
 make test-host K='sdk_port or sdk_scheme'
 ```
+
+The userspace FMD ioctl plane these once also exercised is gone: cdx builds the
+PCD in-kernel, so the character devices and their native/compat ioctl handlers
+were removed with `fmc`/`fmlib`/`dpa_app`.
 
 `tools/host_tests/sdk_port_pcd.py` also compiles the SDK port-setup and
 classification-plan functions with their real private types. It checks
@@ -515,12 +530,11 @@ runtime FIFO resizing and guest failures. Every refusal must leave accounting,
 registers and caller parameters unchanged, with the original interrupt state
 restored. Both LS104x and legacy resource-accounting variants are compiled.
 
-On the DUT, DPA tests verify that repeated loader invocations stop at the
-initialization check, that the control device excludes a second opener,
-and that the new check obeys the per-ioctl capability gate. They also create
-and delete unused hash tables, reject stale cookies, and check that failed
-copy-out does not exhaust the cookie registry. Startup fault injection
-requires a dedicated boot before CDX is loaded.
+On the DUT, DPA tests verify that the control device `/dev/cdx_ctrl` excludes a
+second opener, and that no FMan userspace character device (`/dev/fm*`) or `fm`
+chardev major exists at all: the PCD is built in-kernel and the SDK's ioctl
+plane was removed. USDPAA (`/dev/fsl-usdpaa*`) is not built either. Startup
+fault injection requires a dedicated boot before CDX is loaded.
 
 CDX startup rollback has a separate hardware test because it needs an
 unconfigured FMAN. Boot the staged test image with `rdinit=/bin/sh`, mount
@@ -551,14 +565,11 @@ combinations, state restoration after rollback and unload, and the production
 unload cleanup of PCD queues, private/shared policers and FMAN metadata.
 The SDK port API cases cover detach on policy-less and fully cleaned ports,
 while incomplete setup and real hardware detach errors must still fail.
-The FMC lifecycle test preserves initially disabled ports on both successful
-cleanup and failed loads. `sdk_port_state.py` compiles the port-state
-query API and ioctl dispatch for native and compat callers, checking the
-one-byte result and error propagation. The new `FM_PORT_IOC_GET_ENABLED`
-command uses port ioctl slot 44; existing encodings are unchanged. FMC saved
-models use format version `0x108` to include the saved enable-state flags. Both partial-creation rollback and complete
-interface teardown must drain all transmit queues and finish callbacks
-before releasing their embedded FQ storage.
+`sdk_port_state.py` compiles the production `FM_PORT_GetEnabled`/`GetStopped`/
+`IsPcdAttached`/`SetFenced`/`Enable` functions directly, checking the port
+enable and stopped queries, PCD attachment and the fence. Both partial-creation
+rollback and complete interface teardown must drain all transmit queues and
+finish callbacks before releasing their embedded FQ storage.
 The queue model invokes the registered dequeue callback for contiguous and
 scatter/gather frames and for completions without a valid frame descriptor.
 It checks that every returned frame is released once and empty completions
@@ -652,19 +663,6 @@ modification and binding attempt with programming. Accepted commands with
 missing or late confirmations exercise the A117 reset requirement using the
 actual HC transport; the fixture allows hardware to have changed despite
 the timeout and verifies that retries cannot submit another command.
-
-On the DUT, the ordinary/direct scheme lifecycle regression in
-`tools/tests/dpa_startup.py` includes a late construction failure with
-an out-of-range FQID. For an ordinary scheme the rejected candidate changes
-to direct mode; deleting the original immediately afterward must still
-release its original netenv reference. These are private, unbound schemes.
-
-`tools/host_tests/sdk_scheme_ioctl.py` checks native/compat conversion and
-fmlib serialization under ASan/UBSan, with compiler member-bound checks on
-every `memcpy`. It covers DONE, CC and policer next engines, the trailing
-scheme counter, public cookies, direct/shared flags and allocation failures.
-Reverting either enclosing-object tail copy or the compat source-union bound
-must fail compilation, even when the host libc only checks whole objects.
 
 Kernel compilation must also be checked with `CONFIG_FORTIFY_SOURCE=y`,
 warnings treated as errors, and KASAN disabled. On arm64, a KASAN build routes

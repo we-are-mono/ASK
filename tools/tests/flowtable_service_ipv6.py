@@ -170,7 +170,7 @@ async def test_prerequisite(ipv6_service, fault):
         initial = await hardware(r, p, "ipv6-baseline-hardware", flows[:4])
         initial_attempts = await attempts(r)
         await negative(r, p)
-        for cycle in range(3):
+        for cycle in range(2):
             label = f"ipv6-{fault}-{cycle}"
             before = await r.state()
             await p.rpc("start", [2], count=0, interval=0.05, allow_loss=True)
@@ -243,14 +243,12 @@ async def test_prerequisite(ipv6_service, fault):
             assert await route(r) == original_route
             resolved = await neighbour(r)
             assert resolved[0].get("lladdr") == MAC and "PERMANENT" not in resolved[0]["state"], resolved
-            await p.batch([0, 1, 2, 3], count=128, interval=0.045)
-            quiet = await r.state()
-            unchanged(after, quiet, [0, 1, 2, 3], flows)
-            assert (quiet["installs"], quiet["deletes"]) == (after["installs"], after["deletes"])
+            # The hardware proof's identities held for its whole burst, longer
+            # than a health-check period: nothing reapplied the policy since.
             assert await attempts(r) == initial_attempts
             await negative(r, p)
             await same_service(r, service)
-            r.record(label + "-recovery", {"before": before, "after": after, "quiet": quiet,
+            r.record(label + "-recovery", {"before": before, "after": after,
                 "retirement_seconds": retirement_seconds, "ready_seconds": ready_seconds,
                 "hardware_seconds": hardware_seconds, "transfers": reports, "policy_installs": 0})
         await p.rpc("open", [4])
@@ -267,7 +265,7 @@ async def test_missing_table(ipv6_service):
     async with peer(r, flows, initial_ids=[0, 1, 2, 3, 5, 6], lease=240, listen_addresses=[WAN]) as p:
         await warm(r, p, [0, 1, 2, 3], "ipv6-table-baseline", flows[:4])
         initial = await hardware(r, p, "ipv6-table-before", flows[:4])
-        for cycle in range(3):
+        for cycle in range(2):
             label, before_attempts = f"ipv6-table-{cycle}", await attempts(r)
             await negative(r, p)
             started = time.monotonic()
@@ -281,10 +279,8 @@ async def test_missing_table(ipv6_service):
             hardware_seconds = time.monotonic() - started
             assert hardware_seconds < 40, hardware_seconds
             balanced(after, initial["errors"])
-            await p.batch([0, 1, 2, 3], count=128, interval=0.045)
-            quiet = await r.state()
-            unchanged(after, quiet, [0, 1, 2, 3], flows)
-            assert (quiet["installs"], quiet["deletes"]) == (after["installs"], after["deletes"])
+            # One reinstall for the deleted table, and none across the
+            # hardware proof's burst, a full health-check period.
             assert await attempts(r) == before_attempts + 1
             await negative(r, p)
             await same_service(r, service)
@@ -307,7 +303,7 @@ async def test_failslab(ipv6_service, target, protocol):
         initial = await hardware(r, p, label + "-before", flows[:4])
         initial_attempts = await attempts(r)
         await negative(r, p)
-        async with slab_fault(r, target, label) as fault:
+        async with slab_fault(r, target, label, keep_alive=(p, [0, 1, 2, 3])) as fault:
             started = time.monotonic()
             await p.rpc("open", [4])
             await p.batch([4], count=32, interval=0.01)

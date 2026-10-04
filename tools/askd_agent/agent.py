@@ -919,8 +919,14 @@ def build_app():
     from aiohttp import web
 
     app = web.Application()
-    app["captures"] = {}
-    app.on_cleanup.append(close_captures)
+    # The same plain state the serial transport keeps (stdio.py), rather than
+    # the application's own mapping, which aiohttp wants typed keys for.
+    state = {"captures": {}}
+
+    async def cleanup(_app):
+        await close_captures(state)
+
+    app.on_cleanup.append(cleanup)
 
     async def handle(request):
         body = await request.json() if request.can_read_body else {}
@@ -933,7 +939,7 @@ def build_app():
             body["capture_id"] = request.match_info["cap_id"]
         operation = next(op for op in OPERATIONS if op.replace("/", "-") == request.match_info.route.name)
         try:
-            return web.json_response(await OPERATIONS[operation](body, app))
+            return web.json_response(await OPERATIONS[operation](body, state))
         except AgentError as error:
             return web.json_response(error.detail, status=error.status)
 

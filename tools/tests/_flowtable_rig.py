@@ -14,7 +14,6 @@ from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
-from _ioctl import _IOR
 from _mcast_helpers import MULTICAST_SWITCH
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from ask_orch.artifacts import artifact_dir
@@ -654,18 +653,37 @@ print(json.dumps({{'sent': sent-first, 'received': len(received),
     return json.loads(result.stdout.strip())
 
 
-RX_PORTS_SCRIPT = f'''
-import fcntl, json, os
-states = {{}}
-for port in (6, 7):
-    fd = os.open('/dev/fm0-port-rx%d' % port, os.O_RDWR)
-    try:
-        value = bytearray(1)
-        fcntl.ioctl(fd, {_IOR(0xe1, 70 + 44, 1)}, value)
-        states[str(port)] = value[0]
-    finally:
-        os.close(fd)
-print(json.dumps(states))
+# Whether each receive port is enabled, read from its BMI configuration
+# register (bit 31, BMI_PORT_CFG_EN) in the SDK's register dump: the hardware's
+# own answer, whether or not cdx or the adapter is loaded; a stopped datapath
+# keeps carrier. The SDK names a 1G receive port fm0-port-rx<cell-index - 0x08>
+# and a 10G one fm0-port-rx<cell-index - 0x10 + 6>. Find the dumps once, then
+# read them as often as needed.
+RX_PORTS_CODE = '''
+import os, re
+def rx_port_dumps():
+    paths = {}
+    for directory, _, files in os.walk('/sys/devices'):
+        if 'fm_port_bmi_regs' not in files:
+            continue
+        node = os.path.join(directory, 'of_node')
+        compatible = open(os.path.join(node, 'compatible'), 'rb').read()
+        index = int.from_bytes(open(os.path.join(node, 'cell-index'), 'rb').read()[:4], 'big')
+        if b'fman-port-10g-rx' in compatible:
+            paths[str(index - 0x10 + 6)] = os.path.join(directory, 'fm_port_bmi_regs')
+        elif b'fman-port-1g-rx' in compatible:
+            paths[str(index - 0x08)] = os.path.join(directory, 'fm_port_bmi_regs')
+    return paths
+def rx_ports_enabled(paths, ports=('6', '7')):
+    states = {}
+    for port in ports:
+        match = re.search(r'0x([0-9a-fA-F]{8})\\s+fmbm_rcfg$', open(paths[port]).read(), re.M)
+        states[port] = int(match[1], 16) >> 31
+    return states
+'''
+RX_PORTS_SCRIPT = RX_PORTS_CODE + '''
+import json
+print(json.dumps(rx_ports_enabled(rx_port_dumps())))
 '''
 
 

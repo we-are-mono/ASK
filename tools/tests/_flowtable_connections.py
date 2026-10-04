@@ -23,6 +23,7 @@ from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_connections_peer import TCP_SIZE, UDP_SIZE, payload
 
 SPORT = BASE_SPORT + 32
+HEARTBEAT_INTERVAL = 10
 
 FLOWS = [{"id": i, "proto": "tcp" if i & 1 else "udp", "sport": SPORT + i // 2}
          for i in range(32)]
@@ -145,7 +146,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
         # DUT observations can outlast the peer's idle lease. QGA status calls
         # keep it alive without sending control traffic through the DUT.
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
             status = await self.rpc("status", compact=True)
             assert not status["errors"], status
 

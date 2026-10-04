@@ -16,6 +16,7 @@ import time
 
 TCP_SIZE = 16384
 UDP_SIZE = 256
+CONTROL_IDLE_TIMEOUT = 35
 # linux/in.h: a socket's DF policy, for probes on a flow's own tuple.
 IP_MTU_DISCOVER = 10
 IP_PMTUDISC_PROBE = 3
@@ -382,7 +383,7 @@ async def main(config):
                     await flows[ident].open(config)
 
             while True:
-                reader, control = await asyncio.wait_for(accepted.get(), 35)
+                reader, control = await asyncio.wait_for(accepted.get(), CONTROL_IDLE_TIMEOUT)
                 line = await asyncio.wait_for(reader.readline(), 5)
                 command = json.loads(line)
                 op, ids = command["op"], command.get("ids", [])

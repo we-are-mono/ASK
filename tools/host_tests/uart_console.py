@@ -17,6 +17,7 @@ import os
 import re
 import termios
 import threading
+from unittest.mock import call, patch
 
 import pytest
 
@@ -55,7 +56,7 @@ def test_lock_is_shared_per_device_not_per_instance(pty_port):
 
 @pytest.mark.parametrize("failure", [errno.EINTR, errno.EIO])
 def test_interrupted_drain_does_not_resend_bytes(pty_port, monkeypatch, failure):
-    master, path = pty_port
+    _, path = pty_port
     drain = termios.tcdrain
     calls = 0
 
@@ -67,15 +68,18 @@ def test_interrupted_drain_does_not_resend_bytes(pty_port, monkeypatch, failure)
         drain(fd)
 
     monkeypatch.setattr(termios, "tcdrain", interrupted)
-    with Console(path, write_chunk_bytes=4) as console:
+    # PTY reads may split a completed write. Observe each real write directly
+    # so both duplicate chunks and writes after a drain failure are detected.
+    with (Console(path, write_chunk_bytes=4) as console,
+          patch.object(console.ser, "write", wraps=console.ser.write) as write):
         if failure == errno.EINTR:
             console.send(b"command\n")
-            assert os.read(master, 100) == b"command\n"
+            assert write.call_args_list == [call(b"comm"), call(b"and\n")]
             assert calls == 3
         else:
             with pytest.raises(termios.error):
                 console.send(b"command\n")
-            assert os.read(master, 100) == b"comm"
+            assert write.call_args_list == [call(b"comm")]
             assert calls == 1
 
 

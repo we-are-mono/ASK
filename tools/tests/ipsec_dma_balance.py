@@ -136,7 +136,7 @@ async def test_ipsec_entry_build_dma_balance(
         await asyncio.sleep(SA_RELEASE_GRACE_S)
         report = await target_agent.kmemleak(
             aiohttp_session, filter_substrs=IPSEC_LEAK_FILTER)
-        leak_count = report.get("leak_count", 0)
+        leak_count = report["leak_count"]
         assert not leak_count, (
             f"faulting the last {len(window)} of {depth} install allocations "
             f"leaked {leak_count} ipsec object(s) on the unwind; "

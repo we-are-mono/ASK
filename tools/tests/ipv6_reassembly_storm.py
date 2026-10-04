@@ -94,7 +94,7 @@ async def test_ipv6_reassembly_storm(
     report = await target_agent.kmemleak(
         aiohttp_session, filter_substrs=REASSM_LEAK_FILTER,
     )
-    assert report.get("leak_count", 0) == 0, (
+    assert report["leak_count"] == 0, (
         f"kmemleak found {report['leak_count']} new leak(s) in ASK code "
         f"after IPv6 {label} storm ({out.strip().splitlines()[-1]}):\n"
         + report.get("report", "")[:4000]

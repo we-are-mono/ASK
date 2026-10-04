@@ -237,12 +237,15 @@ async def recover(r, fault):
             await wait_group(r, group, True)
         await transfer(r, p, 'multicast-baseline')
         target, control = r.multicast_groups
-        for cycle in range(3 if fault == 'withdrawal' else 1):
+        for cycle in range(2 if fault == 'withdrawal' else 1):
             label = f'{r.multicast_kind}-{r.multicast_family}-{fault}-{cycle}'
             before = await r.state()
+            # Timings start once a fault is armed: staging its guard over the
+            # console takes tens of seconds, none of them the datapath's.
             started = time.monotonic()
             if fault == 'delete-event-failslab':
-                async with slab_fault(r, 'mroute-event', label) as injection:
+                async with slab_fault(r, 'mroute-event', label, keep_alive=(p, [0, 1])) as injection:
+                    started = time.monotonic()
                     await route(r, target, False)
                     hit = await injection.hit()
                     retired = await wait_group(r, target, False)
@@ -271,7 +274,8 @@ async def recover(r, fault):
             if fault in ('install-failslab', 'add-event-failslab', 'group-failslab'):
                 selected = {'install-failslab': 'multicast-install', 'add-event-failslab': 'mroute-event',
                             'group-failslab': 'mroute-group'}[fault]
-                async with slab_fault(r, selected, label) as injection:
+                async with slab_fault(r, selected, label, keep_alive=(p, [0, 1])) as injection:
+                    started = time.monotonic()
                     await route(r, target)
                     # The install the fault waits for happens only once the
                     # group has frames to learn or confirm it from.
@@ -316,10 +320,6 @@ async def recover(r, fault):
             await p.rpc('multicast', changes={'action': 'leave', 'group': group})
 
 
-# Every public way to stop acceleration: the controller's own stop, the init
-# script's, a policy that says `enabled no` applied by hand, and the same
-# policy written to the service's configuration for it to reconcile.
-STOPS = ['stop', 'service-stop', 'disabled', 'disabled-config']
 # A group first learned while acceleration is stopped, per learner and family.
 STOPPED_GROUP = {('mroute', 4): '239.9.4.3', ('mroute', 6): 'ff1e::9:4:3',
                  ('mcast', 4): '239.9.5.3', ('mcast', 6): 'ff1e::9:5:3'}

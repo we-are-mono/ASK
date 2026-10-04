@@ -6,7 +6,7 @@ import asyncio
 import gzip
 import json
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -64,10 +64,32 @@ class Fault:
 
 
 @asynccontextmanager
-async def slab_fault(r, target, label, *, continuous=False, lease=20, console=None):
+async def _streaming(keep_alive):
+    """Traffic on established flows while the guard is staged and armed.
+
+    Staging the guard over the UART takes most of the flowtable's 30 s idle
+    timeout, and a hardware flow's timeout moves only with its own packets.
+    A caller that later proves those flows untouched needs them to stay alive
+    across the setup; otherwise Linux expires them, correctly, and they return
+    under new cookies before the fault has done anything."""
+    if not keep_alive:
+        yield
+        return
+    peer, ids = keep_alive
+    await peer.rpc("start", ids, count=0, interval=1.0)
+    try:
+        yield
+    finally:
+        await peer.rpc("stop", ids)
+
+
+@asynccontextmanager
+async def slab_fault(r, target, label, *, continuous=False, lease=20, console=None,
+                     keep_alive=None):
     # The service fixture makes and removes FAULT_DIR, and checks that it starts
     # without one. Any other caller's lease lives under a directory of its
-    # own, made here and removed whole once the result is read.
+    # own, made here and removed whole once the result is read. keep_alive is
+    # (peer, ids): flows to keep sending on until the fault is armed.
     base = FAULT_DIR if console is None else SLAB_FAULT_DIR
     console = console or r.service_console
     config = await r.target.fs_read(r.session, "/proc/config.gz")
@@ -77,13 +99,19 @@ async def slab_fault(r, target, label, *, continuous=False, lease=20, console=No
         assert option in config.splitlines(), f"rebuild/stage a KASAN image with {option}"
     script = Path(__file__).with_name("_flowtable_failslab_guard.py").read_text()
     root = base + "/failslab-" + target
-    # Stage and verify the guard before entering the measured window.
-    if base != FAULT_DIR:
-        await console_command(console, "mkdir", "-p", base)
-    await console_command(console, "mkdir", root)
-    staged = await r.target.fs_write(r.session, root + "/guard.py", script)
-    assert staged["errno"] == 0, staged
-    assert await read(r.target, r.session, root + "/guard.py") == script
+    keep = AsyncExitStack()
+    await keep.enter_async_context(_streaming(keep_alive))
+    try:
+        # Stage and verify the guard before entering the measured window.
+        if base != FAULT_DIR:
+            await console_command(console, "mkdir", "-p", base)
+        await console_command(console, "mkdir", root)
+        staged = await r.target.fs_write(r.session, root + "/guard.py", script)
+        assert staged["errno"] == 0, staged
+        assert await read(r.target, r.session, root + "/guard.py") == script
+    except BaseException:
+        await keep.aclose()
+        raise
     fault = Fault(r, target, label, root, continuous)
     try:
         # Launch can succeed even when its UART acknowledgement is lost.
@@ -102,7 +130,12 @@ with (root / 'guard.log').open('w') as log:
 ''')
         armed = await wait_json(r, root + "/armed.json", timeout=5)
         r.record(label + "-armed", armed)
+        # Armed: the measured window starts with every kept flow fresh.
+        await keep.aclose()
         yield fault
+    except BaseException:
+        await keep.aclose()
+        raise
     finally:
         # Only remove our fault. A missing result is a failed guard, never
         # permission to repair flowtables or discard the failed observation.

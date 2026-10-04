@@ -25,11 +25,8 @@ import re
 import shlex
 import time
 import pytest
-from _ioctl import _IOR
-from _flowtable_rig import (CONSOLE_NOISE, RX_PORTS_SCRIPT, console_command, console_json, console_python, status_text)
+from _flowtable_rig import (CONSOLE_NOISE, RX_PORTS_CODE, RX_PORTS_SCRIPT, console_command, console_json, console_python, status_text)
 
-# FM_PORT_IOC_GET_ENABLED, which RX_PORTS_SCRIPT reads each receive port by.
-PORT_ENABLED = _IOR(0xe1, 70 + 44, 1)
 HOLD = "/sys/module/cdx/parameters/flowtable_restart_hold"
 LIMIT = "/sys/module/cdx/parameters/flowtable_restart_limit"
 UNICAST_FAULT = "/sys/module/cdx/parameters/flowtable_fail_unlink"
@@ -254,18 +251,7 @@ def restart_counts(line: str) -> tuple[int, int, int]:
 # is no part of the measurement: from the delete's own command to the latch
 # gone, one more restart counted and both receive ports running again.
 TIMED_RESTART = '''
-import fcntl, json, os, subprocess, time
-def ports():
-    states = {{}}
-    for port in (6, 7):
-        fd = os.open('/dev/fm0-port-rx%d' % port, os.O_RDWR)
-        try:
-            value = bytearray(1)
-            fcntl.ioctl(fd, {ioctl}, value)
-            states[str(port)] = value[0]
-        finally:
-            os.close(fd)
-    return states
+import json, subprocess, time
 def proc():
     fields = {{}}
     for line in open('/proc/cdx_flowtable'):
@@ -273,6 +259,7 @@ def proc():
         if len(parts) == 2 and parts[1].isdigit():
             fields[parts[0]] = int(parts[1])
     return fields
+dumps = rx_port_dumps()
 first = proc()
 before = first['restarts']
 open({fault!r}, 'w').write('1')
@@ -280,7 +267,7 @@ start = time.monotonic()
 subprocess.run({trigger!r}, check=True)
 latched = False
 while time.monotonic() - start < 10:
-    state, rx = proc(), ports()
+    state, rx = proc(), rx_ports_enabled(dumps)
     latched |= bool(state['fatal'])
     if not state['fatal'] and state['restarts'] == before + 1 and rx == {{'6': 1, '7': 1}}:
         break
@@ -293,8 +280,8 @@ print(json.dumps({{'seconds': time.monotonic() - start, 'before': before, 'resta
 
 async def timed_restart(console, trigger: list[str], fault: str = UNICAST_FAULT) -> dict:
     """A restart nothing holds: within RESTART_BOUND of the failed delete."""
-    result = console_json((await console_python(console, TIMED_RESTART.format(
-        ioctl=PORT_ENABLED, fault=fault, trigger=trigger), timeout=30))["stdout"])
+    result = console_json((await console_python(console, RX_PORTS_CODE + TIMED_RESTART.format(
+        fault=fault, trigger=trigger), timeout=30))["stdout"])
     assert result["restarts"] == result["before"] + 1 and not result["fatal"], result
     assert result["ports"] == RUNNING and result["resume_failures"] == 0, result
     assert result["seconds"] <= RESTART_BOUND, result

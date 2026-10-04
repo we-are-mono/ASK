@@ -205,7 +205,6 @@ async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
 
         spawn_parallel_tcpdumps(lan, [lan_if], [capfile],
                                 f"udp port {MCAST_PORT}")
-        await asyncio.sleep(0.4)
         await asyncio.to_thread(
             send_stream_from_vision, group, 4, STREAM_S, STREAM_PPS,
         )

@@ -119,7 +119,7 @@ async def test_reassembly_fragment_storm(
     report = await target_agent.kmemleak(
         aiohttp_session, filter_substrs=FRAGMENT_LEAK_FILTER,
     )
-    assert report.get("leak_count", 0) == 0, (
+    assert report["leak_count"] == 0, (
         f"kmemleak found {report['leak_count']} new leak(s) in the software fragment path "
         f"after {label} storm ({out.strip().splitlines()[-1]}):\n"
         + report.get("report", "")[:4000]
@@ -207,7 +207,7 @@ async def test_with_concurrent_iperf(
     report = await target_agent.kmemleak(
         aiohttp_session, filter_substrs=FRAGMENT_LEAK_FILTER,
     )
-    assert report.get("leak_count", 0) == 0, (
+    assert report["leak_count"] == 0, (
         f"kmemleak found {report['leak_count']} new leak(s) after "
         f"storm+iperf concurrent run ({storm_out.strip().splitlines()[-1]}):\n"
         + report.get("report", "")[:4000]

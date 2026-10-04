@@ -188,7 +188,7 @@ ASK_FLOWTABLE_CHURN=1 ASK_WAN_IPERF_IP=10.0.0.232 \
 
 The default is **900 seconds of churn**, plus setup, final hardware verification,
 teardown and leak scanning. Every rotating tuple must be visited in the default
-run. `ASK_FLOWTABLE_CHURN_SECONDS=60` selects a development smoke check and does
+run. `ASK_FLOWTABLE_CHURN_SECONDS=90` selects a development smoke check and does
 not satisfy that acceptance duration or coverage. Rounds are paced, taking at
 least four seconds each; expiry and hardware convergence can take longer.
 This is a bounded lifecycle proof, not a maximum connection-admission-rate

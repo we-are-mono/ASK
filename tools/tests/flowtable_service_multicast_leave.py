@@ -227,11 +227,15 @@ async def test_bridged_leave(multicast_rig, mcast_bridge, mechanism):
         assert not delivered(none, streamed(none, group), LAN_NIC)
         assert moved(none, discarding) == COUNT, summary(none["after"])
         in_hardware(none)
-        # The stream stops, and its entry follows it out of hardware.
-        aged = await r.settle(lambda s: discarding(s) is None,
-                              f"{mechanism}: the stopped stream's entry aged out", timeout=30)
-        if spec["end"] != "block":
-            assert not mcast_rows(aged, group), summary(aged)
+        # The stream stops, and its entry follows it out of hardware. An aged
+        # entry reads `retiring` until the worker takes it out, so wait for
+        # what is left after that: nothing of the group, unless a block left
+        # the membership standing, and no row of this stream either way.
+        def aged_out(s):
+            if spec["end"] != "block":
+                return not mcast_rows(s, group)
+            return not [row for row in mcast_rows(s, group) if same(row["src"], source)]
+        await r.settle(aged_out, f"{mechanism}: the stopped stream's entry aged out", timeout=30)
     # Leaving the hosts' scope ended whatever membership was left.
     # This group's records, not the total: the WAN segment's own multicast
     # listeners come and go meanwhile.

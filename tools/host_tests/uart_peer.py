@@ -9,7 +9,10 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
+import pytest
+
 from _flowtable_rig import Echo
+from _flowtable_connections_peer import CONTROL_IDLE_TIMEOUT
 import _flowtable_connections as connections
 
 
@@ -20,7 +23,22 @@ class LocalGuest:
         return SimpleNamespace(rc=result.returncode, stdout=result.stdout + result.stderr)
 
 
-async def test_peer_control_is_independent_of_data_delivery(monkeypatch):
+@pytest.fixture
+def short_deadlines(monkeypatch):
+    # Keep the real sockets, process and heartbeat; shorten only their clocks.
+    assert 0 < connections.HEARTBEAT_INTERVAL < CONTROL_IDLE_TIMEOUT
+    original = connections.peer_script
+
+    def script(config):
+        return ("namespace = {'__name__': 'ask_peer'}\n"
+                f"exec({original(config)!r}, namespace)\n"
+                "namespace['CONTROL_IDLE_TIMEOUT'] = 3\n"
+                "namespace['asyncio'].run(namespace['main'](namespace['CONFIG']))\n")
+    monkeypatch.setattr(connections, 'peer_script', script)
+    monkeypatch.setattr(connections, 'HEARTBEAT_INTERVAL', 0.25)
+
+
+async def test_peer_control_is_independent_of_data_delivery(monkeypatch, short_deadlines):
     # A real local shell stands in for the LAN console; the production staging,
     # Unix socket, peer process and traffic protocol run unchanged.
     with socket.socket() as reservation:
@@ -46,16 +64,16 @@ async def test_peer_control_is_independent_of_data_delivery(monkeypatch):
             assert status["running"] == 1 and not status["errors"]
             stopped = await peer.rpc("stop", [0])
             assert stopped["0"]["lost"] > 0
-            # A quiet DUT measurement may exceed the peer's 35-second idle
-            # lease. Only the production heartbeat keeps this peer alive.
-            await asyncio.sleep(36)
+            # Wait past the shortened idle deadline. Only the production
+            # heartbeat keeps this peer alive.
+            await asyncio.sleep(4)
             assert (await peer.rpc("status", compact=True))["running"] == 0
         assert json.loads(records["connections-peer"]["stdout"])["closed"]
     finally:
         transport.close()
 
 
-async def test_peer_stops_traffic_when_its_controller_disappears():
+async def test_peer_stops_traffic_when_its_controller_disappears(short_deadlines):
     echo = Echo()
     transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
         lambda: echo, local_addr=("127.0.0.1", 0))
@@ -78,9 +96,9 @@ async def test_peer_stops_traffic_when_its_controller_disappears():
                 peer = connections.Peer(LocalGuest(), str(path), flows)
                 await peer.rpc("open", [0])
                 await peer.rpc("start", [0], count=0, interval=0.01)
-                # No heartbeat or further command. The production 35-second
-                # idle deadline must stop an otherwise unbounded transfer.
-                stdout, stderr = await asyncio.wait_for(process.communicate(), 40)
+                # No heartbeat or further command: the shortened idle deadline
+                # must stop an otherwise unbounded transfer.
+                stdout, stderr = await asyncio.wait_for(process.communicate(), 6)
                 assert process.returncode != 0 and b"TimeoutError" in stderr, (stdout, stderr)
                 assert not path.exists()
                 received = len(echo.received)

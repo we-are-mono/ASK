@@ -62,6 +62,7 @@ Bench furniture this profile needs, none of it created here:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import os
 import re
@@ -427,6 +428,52 @@ async def _software_rx(ctx):
             for dev in (TARGET_LAN_IF, TARGET_WAN_IF)}
 
 
+DOWNLOAD_CPU_TABLE = "ask_isp_cpu"
+
+
+@asynccontextmanager
+async def _download_cpu_counter(ctx, *, peer, dport):
+    """Count one UDP download's frames that reach the CPU on the WAN port.
+
+    The WAN port's own receive counter also moves for everything else on the
+    office LAN behind it, in bursts larger than a burst's whole budget, so it
+    cannot say whether a download stayed in hardware. A netdev ingress chain
+    on the port can: a frame the classifier forwards never gets there, and the
+    kernel has taken the carrier VLAN's tag off before it, which leaves the
+    PPPoE session header at the network header. Matched there, by the PPP
+    protocol, UDP and the far end's port, which NAT leaves alone; the
+    software flowtable's own hook comes after this one, so every CPU frame of
+    the download is counted, whichever path then forwards it.
+
+    Installed before the connection is admitted, so the commit cannot
+    readmit anything under the measurement."""
+    if ":" in peer:     # PPP IPv6, next header, UDP source port after 40 bytes
+        match = ["@nh,48,16", "0x0057", "@nh,112,8", "17", "@nh,384,16", str(dport)]
+    else:               # PPP IPv4 with a 20-byte header, protocol, source port
+        match = ["@nh,48,16", "0x0021", "@nh,64,8", "0x45", "@nh,136,8", "17",
+                 "@nh,224,16", str(dport)]
+    await command(ctx.target, ctx.session, "nft", "delete", "table", "netdev", DOWNLOAD_CPU_TABLE,
+                  check=False)
+    await command(ctx.target, ctx.session, "nft", "add", "table", "netdev", DOWNLOAD_CPU_TABLE)
+    try:
+        await command(ctx.target, ctx.session, "nft", "add", "chain", "netdev", DOWNLOAD_CPU_TABLE,
+                      TARGET_WAN_IF, "{", "type", "filter", "hook", "ingress", "device",
+                      TARGET_WAN_IF, "priority", "-500", ";", "policy", "accept", ";", "}")
+        await command(ctx.target, ctx.session, "nft", "add", "rule", "netdev", DOWNLOAD_CPU_TABLE,
+                      TARGET_WAN_IF, "meta", "protocol", "0x8864", *match, "counter")
+
+        async def frames():
+            listed = json.loads((await command(ctx.target, ctx.session, "nft", "-j", "list",
+                                               "chain", "netdev", DOWNLOAD_CPU_TABLE,
+                                               TARGET_WAN_IF))["stdout"])
+            return sum(e["counter"]["packets"] for item in listed["nftables"] if "rule" in item
+                       for e in item["rule"]["expr"] if "counter" in e)
+        yield frames
+    finally:
+        await command(ctx.target, ctx.session, "nft", "delete", "table", "netdev", DOWNLOAD_CPU_TABLE,
+                      check=False)
+
+
 async def _software_tx(ctx):
     """The transmit side of the same counters.
 
@@ -492,20 +539,24 @@ async def _accounted(ctx, client, *, peer, dport, sport, count=128, payload_size
     Three things are required of that burst and all three are needed: the rows
     are the same rows -- the cookies did not move and no offer took RTNL,
     so nothing was readmitted underneath the measurement -- the classifier
-    counted every frame, and the physical ports' software receive counters did
-    not. The WAN bound allows unrelated traffic on the shared segment. An
-    upload Linux keeps must leave the WAN port in software once per datagram;
-    the measured burst must stand clear of that background traffic.
+    counted every frame, and none of the download's own frames reached the CPU
+    (_download_cpu_counter); on the LAN side, the port's software receive
+    counter did not move for an upload in hardware. An upload Linux keeps must
+    leave the WAN port in software once per datagram.
     """
-    forward, reverse = await _admit(ctx, client, peer=peer, dport=dport, sport=sport,
-                                    label=label)
-    installed = await ctx.state()
-    before = {f["cookie"]: int(f["packets"]) for f in (forward, reverse) if f}
-    software_before, sent_before = await _software_rx(ctx), await _software_tx(ctx)
-    report = await _exchange(ctx, client, peer=peer, dport=dport, sport=sport,
-                             count=count, payload_size=payload_size, label=label)
-    software_after, sent_after = await _software_rx(ctx), await _software_tx(ctx)
-    state = await ctx.state()
+    initial = await ctx.state()
+    async with _download_cpu_counter(ctx, peer=peer, dport=dport) as download_cpu:
+        forward, reverse = await _admit(ctx, client, peer=peer, dport=dport, sport=sport,
+                                        label=label)
+        installed = await ctx.state()
+        admitted_cpu = await download_cpu()
+        before = {f["cookie"]: int(f["packets"]) for f in (forward, reverse) if f}
+        software_before, sent_before = await _software_rx(ctx), await _software_tx(ctx)
+        report = await _exchange(ctx, client, peer=peer, dport=dport, sport=sport,
+                                 count=count, payload_size=payload_size, label=label)
+        software_after, sent_after = await _software_rx(ctx), await _software_tx(ctx)
+        measured_cpu = await download_cpu() - admitted_cpu
+        state = await ctx.state()
     after = {f["cookie"]: int(f["packets"]) for f in state["flows"]
              if f["cookie"] in before}
     assert report == {"echoed": count, "lost": 0}, report
@@ -518,11 +569,14 @@ async def _accounted(ctx, client, *, peer, dport, sport, count=128, payload_size
     sent = {dev: sent_after[dev] - sent_before[dev] for dev in sent_before}
     ctx.record(f"isp-{label}", {"forward": forward, "reverse": reverse,
                                 "delta": delta, "software_rx": software,
-                                "software_tx": sent})
-    # A software-forwarded burst puts `count` frames through each port's
-    # receive path, so anything well under that says the hardware carried it.
-    # Allow background frames on the shared WAN segment. DUT control uses UART.
-    assert software[TARGET_WAN_IF] < count // 2, (software, count)
+                                "software_tx": sent, "download_cpu_admitted": admitted_cpu,
+                                "download_cpu_measured": measured_cpu})
+    # The counter's own proof that it matches the download: a download newly
+    # installed by this admission crossed the CPU at least once before it was.
+    if reverse["cookie"] not in {f["cookie"] for f in initial["flows"]}:
+        assert admitted_cpu >= 1, (admitted_cpu, reverse)
+    # Every frame of the measured burst in hardware, none of it on the CPU.
+    assert measured_cpu == 0, (measured_cpu, count, software)
     if forward:
         assert software[TARGET_LAN_IF] < count // 4, (software, count)
     else:

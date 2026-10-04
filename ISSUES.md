@@ -231,6 +231,27 @@ result independently of those temporary files.
   Captures, image identity and diagnostic scripts:
   `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
 
+- [ ] **A305 — both 10G ports stopped passing frames late in a same-boot run.** Seen twice, both
+  at the end of `flowtable_capacity.py::test_overflow_and_reuse` after a long same-boot sequence:
+  2026-09-23 (full suite, eth4 only) and 2026-10-04 (scoped run of 31 tests, eth3 and eth4;
+  KASAN image with the uncommitted 1.1.0 changes). The test body completed (32,768 entries
+  filled, 66k installs, drained to 0); the LAN peer's teardown then timed out waiting for a FIN.
+  State while wedged, read-only: carrier up on both ports; 10G Rx ports enabled
+  (`fmbm_rcfg` 0x80000000) but `fmbm_rfrc` frozen while the DUT pinged; Rx default/PCD and Tx
+  FQs empty; bpid 32 not depleted; nothing from the DUT's MAC on the wire; QMan portal IRQ counts
+  frozen; no kernel warning; `/proc/cdx_flowtable` not fatal or quarantined. So the stall is
+  below the BMI (mEMAC/PCS/SerDes) or in the FMan core, on both ports at once; I2C still answered.
+  Not reproduced since: capacity alone on a fresh boot, then the same 34-test sequence on that
+  boot, both passed (2 occurrences in 5 known runs). Next: loop the capacity test on one boot,
+  reading each 10G port's `fmbm_rfrc` and orchestrator ARP after every pass, and on a wedge read
+  the mEMAC registers (`/sys/class/net/ethN/mac_regs`) before anything else. **Never** run
+  `ethtool` or QMan debugfs queries (`query_fq_np_fields`) on a wedged board: the first
+  hard-locks a CPU under RTNL, the second pinned a CPU with no reply here. Recover with
+  serial-break sysrq `s`, `b`.
+
+- [x] **A307 — failslab tests saw unrelated flows reinstalled.** Test bug: they idled past the 30 s flow timeout while the
+  fault guard staged over the UART; now kept alive until armed (_:/^tests: harden lifecycle checks_).
+
 - [ ] **A314 — 1.1.0's bridged multicast flow caps keep a wanted stream out behind unwanted ones.** Regression found by
   `flowtable_service_multicast_discard_capacity.py` (run 2026-10-04) and confirmed by review. `ft_mc_observe()`
   (cdx/ask_flowtable.c) counts installed discards toward `FT_MC_MAX_PORT_FLOWS` (256) and `FT_MC_MAX_TOTAL_FLOWS` (512);
@@ -245,6 +266,20 @@ result independently of those temporary files.
   Confirm whether `ft_ipsec_genid` or the SA watch already retires such entries on an SA add. If not, retire entries a
   `use` template covers when a matching SA is added, or refuse admission under any optional template. Mostly an IPComp
   or hand-configured case: strongSwan installs `required` templates.
+
+- [ ] **A313 — offloaded egress queues are unbounded: bufferbloat whenever a port's egress is the bottleneck.** Diagnosed
+  2026-10-04; explains the unpaced duplex collapse (9.4/1.3-2.2 Gbit/s). `create_fwd_tx_fqs()` (cdx/devman.c) makes each
+  port's forwarding TX FQs with neither tail drop nor a congestion group (`fqctrl 1`); only the buffer pool bounds them.
+  Every offloaded flow leaving a port shares FQ 0 (eth4: FQID 503), and Linux's qdisc/AQM never sees these frames.
+  Evidence (KASAN image, `iperf3 -P4`, NAT, both directions offloaded): an unpaced LAN sender saturates eth4 egress and
+  CUBIC parks a standing ~7,500-frame / 11.5 MB queue there (`/proc/fqid_stats/tx/eth4/503`, ~9 ms at 10G). The reverse
+  flow's ACKs leave through that FIFO, its RTT goes 1 → 8.4 ms (`ss -ti`), and cwnd/RTT caps it at ~1.5-2 Gbit/s. Pacing
+  only the LAN sender (9 Gbit/s) leaves 6-11 frames queued and both directions at ~8.7-9.0; pacing only the WAN sender
+  does not help (9.37/3.63). The MAC RX FIFO drops in TODO's earlier notes rise with reverse traffic and are not the cause.
+  Production impact: a WAN slower than the LAN makes the DUT's egress the bottleneck, so offloaded uploads queue up to
+  the pool size — ~90 ms per 11.5 MB at 1G — with no AQM. Fix direction: one CGR per egress port over its forwarding FQs,
+  tail drop at ~1-2 ms of the link speed (re-set on speed change; QMan CGR thresholds are modifiable), WRED as a later
+  step; check the CEETM CCG thresholds the same way. Validate: unpaced `--bidir` reaches ~9/9 with reverse RTT ≈ 2 ms.
 
 - [ ] **A308 — an IPsec SA release that finds a queue non-empty or SEC busy leaks the SA for the boot.** Source-verified
   by the 1.1.0 audit, not reproduced. `cdx_dpa_ipsecsa_release()` (cdx/dpa_ipsec.c) gives up when a retired SA FQ still

@@ -23,7 +23,7 @@ from _mcast_wire_capture import multicast_mac
 from _flowtable_rig import (artifact_dir, WAN_IP, command, console_command, read)
 from _flowtable_identity import (set_mac)
 from _flowtable_service import (managed_service, wait_service)
-from _flowtable_service_multicast import (STOPS, acceleration_stopped, recover)
+from _flowtable_service_multicast import (acceleration_stopped, recover)
 from _mcast_e2e import (dut_mac, mroute_line)
 from _mroute_capacity import (_daemon)
 
@@ -189,7 +189,11 @@ async def test_recovery(multicast_bridge_service, fault):
     await recover(multicast_bridge_service, fault)
 
 
-@pytest.mark.parametrize('how', STOPS)
+# Complement the routed cases: each stop method covers both families and learners.
+@pytest.mark.parametrize('multicast_bridge_service,how', [
+    (4, 'service-stop'), (4, 'disabled-config'),
+    (6, 'stop'), (6, 'disabled'),
+], indirect=['multicast_bridge_service'])
 async def test_stops_with_acceleration(multicast_bridge_service, how):
     await acceleration_stopped(multicast_bridge_service, how)
 

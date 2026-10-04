@@ -58,7 +58,7 @@ async def test_admission_recovery(service, target, protocol):
         await warm(r, p, [0, 1], label + "-baseline", flows[:2])
         before = await hardware(r, p, label + "-before", flows[:2])
         await blocked_probe(r, p)
-        async with slab_fault(r, target, label) as fault:
+        async with slab_fault(r, target, label, keep_alive=(p, [0, 1])) as fault:
             started = time.monotonic()
             await p.rpc("open", [2])
             await p.batch([2], count=32, interval=0.01)

@@ -38,6 +38,9 @@ ASK_KMEMLEAK_FILTER = [
     "cdx_",
 ]
 
+# Seconds a kmemleak scan or clear may take on the DUT; see Agent.kmemleak().
+KMEMLEAK_TIMEOUT = 600
+
 
 @dataclass
 class Agent:
@@ -107,21 +110,23 @@ class Agent:
     ) -> dict:
         # If no filter: return everything. For "ASK-code only" callers,
         # pass ASK_KMEMLEAK_FILTER (defined at module top).
-        # Timeout budget: the agent writes "scan" to /sys/kernel/debug/
-        # kmemleak, waits for the scanner (which on a first-boot image
-        # with DPAA's ~16k baseline objects + the test storm's footprint
-        # can take 30-60s to complete a full heap walk), then reads +
-        # serialises the report. 120s covers the worst-case first scan
-        # on our DUT; steady-state subsequent scans are much faster.
-        return await self.request(session, "kmemleak-scan", {"filter": ",".join(filter_substrs or [])}, timeout=120, check=False)
+        # The agent writes "scan" to /sys/kernel/debug/kmemleak, which walks
+        # the heap synchronously, then reads and filters the whole report.
+        # The first scan after heavy traffic on a boot reports the DPAA
+        # buffer pools' ~12k false positives, and on a KASAN kernel reading
+        # that report has outrun 120 s. A scan that fails or times out is an
+        # error, never an empty report: callers assert on leak_count.
+        result = await self.request(session, "kmemleak-scan", {"filter": ",".join(filter_substrs or [])},
+                                    timeout=KMEMLEAK_TIMEOUT)
+        assert "leak_count" in result, f"kmemleak scan returned no report: {result}"
+        return result
 
     async def kmemleak_clear(self, session: aiohttp.ClientSession) -> dict:
-        # Clear now internally does `scan` + `clear` on the agent side so
+        # Clear internally does `scan` + `clear` on the agent side so
         # unclassified boot-time baseline objects don't slip past the
-        # cursor. The `scan` write is synchronous in the kernel and on a
-        # first-boot image walking ~16k DPAA baseline objects it can run
-        # 30-60s. Match the scan-timeout budget for consistency.
-        return await self.request(session, "kmemleak-clear", {}, timeout=120)
+        # cursor. The `scan` write is synchronous in the kernel, so it
+        # shares the scan's budget.
+        return await self.request(session, "kmemleak-clear", {}, timeout=KMEMLEAK_TIMEOUT)
 
     async def netlink_send(
         self,

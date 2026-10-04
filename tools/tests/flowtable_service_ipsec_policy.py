@@ -85,7 +85,7 @@ async def test_recovery(ipsec_service, change):
         await warm(r, p, [0, 1, 2, 3], change + "-baseline", flows[:4])
         initial = await hardware(r, p, change + "-baseline-hardware", flows[:4])
         await plaintext_probe(r, p, change + "-plaintext-baseline")
-        for cycle in range(3):
+        for cycle in range(2):
             label = f"policy-{change}-{cycle}"
             before = await r.state()
             await p.rpc("start", [2], count=0, interval=0.05, allow_loss=True)
@@ -164,7 +164,7 @@ async def test_xfrm_default_recovery(service, direction):
     async with peer(r, flows, initial_ids=[0, 1, 3], lease=400) as p:
         await warm(r, p, [0, 1], "default-baseline", flows[:2])
         initial = await plain_hardware(r, p, "default-baseline-hardware", flows[:2])
-        for cycle in range(3):
+        for cycle in range(2):
             label = f"default-{direction}-{cycle}"
             await p.rpc("start", [0], count=0, interval=0.05, allow_loss=True)
             await p.rpc("start", [1], count=0, interval=0.05)

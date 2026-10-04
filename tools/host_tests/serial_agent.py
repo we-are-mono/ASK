@@ -268,6 +268,20 @@ async def test_wan_http_uses_the_same_operations(tmp_path):
         assert bytes.fromhex(result["content_hex"]) == path.read_bytes()
 
 
+async def test_failed_kmemleak_scan_is_an_error_not_a_clean_report(monkeypatch, tmp_path):
+    from aiohttp import ClientResponseError, ClientSession
+    from aiohttp.test_utils import TestServer
+    from askd_agent import agent
+    from askd_agent.agent import build_app
+    from ask_orch.client import Agent
+
+    monkeypatch.setattr(agent, "KMEMLEAK_PATH", tmp_path / "absent")
+    async with TestServer(build_app()) as server, ClientSession() as http:
+        target = Agent("target", str(server.make_url("/")).rstrip("/"))
+        with pytest.raises(ClientResponseError):
+            await target.kmemleak(http, filter_substrs=["[cdx]"])
+
+
 async def test_slow_kernel_scan_keeps_the_agent_responsive(monkeypatch):
     import asyncio
     import threading

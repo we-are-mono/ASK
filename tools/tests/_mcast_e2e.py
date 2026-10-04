@@ -670,7 +670,6 @@ async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
     # This is the one that answers what the replicas look like on the wire.
     spawn_parallel_tcpdumps(lan, [lan_iface], [capfile],
                             f"udp port {MCAST_PORT}")
-    await asyncio.sleep(0.4)
     await asyncio.to_thread(
         send_stream_from_vision, group, family, STREAM_S, STREAM_PPS,
     )

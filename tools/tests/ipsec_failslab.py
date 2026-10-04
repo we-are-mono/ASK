@@ -128,7 +128,7 @@ async def test_ipsec_install_failslab_sweep(
         await asyncio.sleep(SA_RELEASE_GRACE_S)
         report = await target_agent.kmemleak(
             aiohttp_session, filter_substrs=IPSEC_LEAK_FILTER)
-        leak_count = report.get("leak_count", 0)
+        leak_count = report["leak_count"]
         assert not leak_count, (
             f"the failslab sweep (1..{NSWEEP}, install depth {depth!r}) leaked "
             f"{leak_count} ipsec-path object(s); {len(refused)} iteration(s) "

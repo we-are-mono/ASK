@@ -85,30 +85,48 @@ async def pcap_cleanup_lan(lan):
 def spawn_parallel_tcpdumps(
     lan, ifaces: list[str], capfiles: list[str], bpf: str,
 ) -> None:
-    """Launch one backgrounded tcpdump per (iface, capfile) on the LAN VM.
+    """Launch one backgrounded tcpdump per (iface, capfile) on the LAN VM and
+    return once every one of them is capturing.
 
     Plain `tcpdump -w file &` (no -G/-W) so behaviour is portable across
     tcpdump/libpcap versions. Each tcpdump's PID goes into a sidecar file so
     the later kill is precise instead of `pkill -f tcpdump`-broad.
 
-    A single UART command chains all spawns, so the round-trip is one shot
+    A single command chains all spawns, so the round-trip is one shot
     regardless of N — and, more importantly, the captures start together.
+    tcpdump prints "listening on" once its filter is attached, and the same
+    command waits for that line from each one: a fixed grace after the spawn
+    can let the start of a stream go uncaptured.
+
+    `--immediate-mode -U` keeps the end of a stream too. Without it libpcap's
+    ring hands packets over only when a block fills or its ~1 s timeout
+    retires it, and a SIGTERM shortly after the stream discards whatever the
+    open block holds.
     """
     chain = ""
+    logs = []
     for iface, capfile in zip(ifaces, capfiles):
         pidfile = f"{_TCPDUMP_PIDFILE_PREFIX}_{iface}.pid"
+        log = f"{_TCPDUMP_PIDFILE_PREFIX}_{iface}.log"
+        logs.append(log)
         # `-Q in` records inbound only — excludes the egress copy AF_PACKET
         # would otherwise capture, so the count is what arrived at the
         # listener rather than what the listener also sent.
         chain += (
-            f"nohup tcpdump -i {iface} -Q in -w {capfile} '{bpf}' "
-            f"</dev/null >/dev/null 2>&1 & "
+            f"nohup tcpdump -i {iface} -Q in --immediate-mode -U -w {capfile} '{bpf}' "
+            f"</dev/null >/dev/null 2>{log} & "
             f"echo $! > {pidfile}; "
         )
-    chain += "echo SPAWNED"
-    r = lan.run(chain, timeout=10)
+    chain += (
+        f"for i in $(seq 200); do ready=1; "
+        f"for log in {' '.join(logs)}; do "
+        f"grep -q 'listening on' $log || ready=0; done; "
+        f"[ $ready = 1 ] && break; sleep 0.05; done; "
+        f"[ $ready = 1 ] && echo SPAWNED || cat {' '.join(logs)}"
+    )
+    r = lan.run(chain, timeout=20)
     assert "SPAWNED" in r.stdout, (
-        f"failed to spawn tcpdumps via UART: rc={r.rc}, out={r.stdout!r}"
+        f"tcpdumps not capturing within 10 s: rc={r.rc}, out={r.stdout!r}"
     )
 
 
@@ -120,7 +138,7 @@ def kill_parallel_tcpdumps(lan, ifaces: list[str]) -> None:
         # A missing pidfile or an already-dead pid must not fail the chain.
         chain += (
             f"[ -f {pidfile} ] && kill -TERM $(cat {pidfile}) "
-            f"2>/dev/null; rm -f {pidfile}; "
+            f"2>/dev/null; rm -f {pidfile} {_TCPDUMP_PIDFILE_PREFIX}_{iface}.log; "
         )
     chain += "echo KILLED"
     r = lan.run(chain, timeout=10)
@@ -150,8 +168,6 @@ async def capture_parallel_window(
     """
     try:
         spawn_parallel_tcpdumps(lan, ifaces, capfiles, bpf)
-        # Tiny grace so tcpdumps are listening before any traffic arrives.
-        await asyncio.sleep(0.4)
         await asyncio.sleep(window_s)
     finally:
         kill_parallel_tcpdumps(lan, ifaces)
