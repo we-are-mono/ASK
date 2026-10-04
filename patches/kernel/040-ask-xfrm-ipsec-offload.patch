@@ -1,4 +1,4 @@
-From 2a5c7e5d3d6b0930b1b4cd9261eef54b3efed437 Mon Sep 17 00:00:00 2001
+From 739589b18f1566e5dfc3a3e7212082bf3ef87a0e Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -9,9 +9,13 @@ INET_IPSEC_OFFLOAD (net/ipv4/Kconfig) and INET6_IPSEC_OFFLOAD
 (net/ipv6/Kconfig), both depending on CPE_FAST_PATH from 010.
 
 Also the CAAM PDB struct packing (drivers/crypto/caam/pdb.h) required
-for SEC's view of the IPsec descriptor layout, the xfrm_state handle and
-its byh index (xfrm.h, netns/xfrm.h), and the PF_KEY ESN flag
-(pfkeyv2.h, af_key.c).
+for SEC's view of the IPsec descriptor layout, and the xfrm_state handle
+and its byh index (xfrm.h, netns/xfrm.h).
+
+PF_KEY gets no ESN flag. It has no way to carry the replay_esn state an
+ESN SA needs, so an imported flag left a valid state whose inbound
+replay check dereferences a NULL replay_esn. ESN SAs come from netlink,
+which validates and allocates that state.
 
 The handle is the driver's: xdo_dev_state_add() sets it before the state
 is inserted, and the state is indexed by it so that the driver can
@@ -68,16 +72,14 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 126 +++++++--
  include/net/netns/xfrm.h                      |   3 +
  include/net/xfrm.h                            |  11 +
- include/uapi/linux/pfkeyv2.h                  |   1 +
  net/ipv4/Kconfig                              |   6 +
  net/ipv6/Kconfig                              |   6 +
- net/key/af_key.c                              |   8 +
  net/xfrm/xfrm_device.c                        |  24 ++
  net/xfrm/xfrm_input.c                         |  48 ++++
  net/xfrm/xfrm_output.c                        | 248 ++++++++++++++++++
  net/xfrm/xfrm_state.c                         | 202 ++++++++++++++
  net/xfrm/xfrm_user.c                          |  27 ++
- 13 files changed, 691 insertions(+), 31 deletions(-)
+ 11 files changed, 682 insertions(+), 31 deletions(-)
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac..1669e0d267e3 100644
@@ -383,18 +385,6 @@ index a20a01dd6f98..2412c22ce0a6 100644
  
  /* callback structure passed from either netlink or pfkey */
  struct km_event {
-diff --git a/include/uapi/linux/pfkeyv2.h b/include/uapi/linux/pfkeyv2.h
-index 8abae1f6749c..e92494a1ac99 100644
---- a/include/uapi/linux/pfkeyv2.h
-+++ b/include/uapi/linux/pfkeyv2.h
-@@ -281,6 +281,7 @@ struct sadb_x_filter {
- #define SADB_SAFLAGS_NOPMTUDISC	0x20000000
- #define SADB_SAFLAGS_DECAP_DSCP	0x40000000
- #define SADB_SAFLAGS_NOECN	0x80000000
-+#define SADB_SAFLAGS_ESN	0x01000000
- 
- /* Security Association states */
- #define SADB_SASTATE_LARVAL	0
 diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
 index 4cfd87b28c04..8871e4f90f2c 100644
 --- a/net/ipv4/Kconfig
@@ -429,32 +419,6 @@ index 1c9c686d9522..396a081a12b9 100644
  config INET6_IPCOMP
  	tristate "IPv6: IPComp transformation"
  	select INET6_XFRM_TUNNEL
-diff --git a/net/key/af_key.c b/net/key/af_key.c
-index c1731bbd85d7..ff8887654f1d 100644
---- a/net/key/af_key.c
-+++ b/net/key/af_key.c
-@@ -892,6 +892,10 @@ static struct sk_buff *__pfkey_xfrm_state2msg(const struct xfrm_state *x,
- 		sa->sadb_sa_flags |= SADB_SAFLAGS_DECAP_DSCP;
- 	if (x->props.flags & XFRM_STATE_NOPMTUDISC)
- 		sa->sadb_sa_flags |= SADB_SAFLAGS_NOPMTUDISC;
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if (x->props.flags & XFRM_STATE_ESN)
-+		sa->sadb_sa_flags |= SADB_SAFLAGS_ESN;
-+#endif
- 
- 	/* hard time */
- 	if (hsc & 2) {
-@@ -1149,6 +1153,10 @@ static struct xfrm_state * pfkey_msg2xfrm_state(struct net *net,
- 		x->props.flags |= XFRM_STATE_DECAP_DSCP;
- 	if (sa->sadb_sa_flags & SADB_SAFLAGS_NOPMTUDISC)
- 		x->props.flags |= XFRM_STATE_NOPMTUDISC;
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	if (sa->sadb_sa_flags & SADB_SAFLAGS_ESN)
-+		x->props.flags |= XFRM_STATE_ESN;
-+#endif
- 
- 	lifetime = ext_hdrs[SADB_EXT_LIFETIME_HARD - 1];
- 	if (lifetime != NULL) {
 diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
 index 7744ed8e4c83..f2a7fa2704a4 100644
 --- a/net/xfrm/xfrm_device.c
