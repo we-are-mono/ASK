@@ -25,14 +25,15 @@ The components:
   IPsec offload, and QoS via DPAA/FMAN) and `ask_flowtable` (the adapter that
   lets Linux's native flowtables drive CDX).
 - **Userspace** — `ask-flowtable` (the default-on offload policy daemon),
-  with classifier construction inside `cdx`. `fmc` is used on the build host
-  to regenerate the soft parser and classifier test reference. See
+  with classifier construction inside `cdx`. See
   [in-kernel PCD](docs/in-kernel-pcd.md).
-- **Supporting libraries** — `fmlib`.
 - **Retired** — the CMM daemon, its FCI control channel (`libfci`) and the
   `auto_bridge` L2 flow detector are gone from the tree; Linux flowtables
-  replaced them. Their sources remain in the `mono-1.0.x` release tags, which
-  is what docs citing `cmm/`, `fci/` or `auto_bridge/` paths refer to.
+  replaced them. `fmc`, `fmlib` and `dpa_app` went with the in-kernel
+  classifier; the committed soft-parser header and classifier golden are now
+  the source of truth. Their sources remain in the `mono-1.0.x` release tags,
+  which is what docs citing `cmm/`, `fci/`, `auto_bridge/` or `patches/fmc`
+  paths refer to.
 - **Kernel side** — the `patches/kernel/` stack (`010`–`130`: the vendored
   DPAA/FMAN SDK, ASK's hooks, and board drivers, applied onto stock mainline
   6.12) and the board device tree in `dts/`. See
@@ -50,8 +51,7 @@ reference:
 | Component | Recipe |
 |-----------|--------|
 | `cdx`, `ask_flowtable` (kernel modules) | `meta-ask/recipes-ask/cdx/` |
-| `ask-flowtable` (userspace), `fmc` (build-time tool) | `meta-ask/recipes-ask/{flowtable,fmc}/` |
-| `fmlib` (library) | `meta-ask/recipes-ask/fmlib/` |
+| `ask-flowtable` (userspace) | `meta-ask/recipes-ask/flowtable/` |
 | kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_6.12.bb` |
 | bootable showcase image | `meta-ask/recipes-core/images/ask-image.bb` |
 

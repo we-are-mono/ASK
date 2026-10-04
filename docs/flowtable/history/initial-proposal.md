@@ -52,7 +52,7 @@ Useful starting points in this repository are:
 
 | Responsibility | Existing implementation |
 | --- | --- |
-| CMM event handling and registration | [cmm/src/conntrack.c](../../../cmm/src/conntrack.c) |
+| CMM event handling and registration | `cmm/src/conntrack.c` (since removed; `git show mono-1.0.7:cmm/src/conntrack.c`) |
 | FCI dispatch and control serialization | `cdx/cdx_cmdhandler.c` (since removed with the FCI plane; `git log -- cdx/cdx_cmdhandler.c`) |
 | Connection pairs, routes, installation, ageing | `cdx/control_ipv4.c` (since removed with the FCI plane; `git log -- cdx/control_ipv4.c`) |
 | Classifier entries, hardware actions, activity, safe deletion | [cdx/cdx_ehash.c](../../../cdx/cdx_ehash.c) |

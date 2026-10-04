@@ -265,19 +265,8 @@ each so the open bug list stays honest.
   era). To enable: add a transport-mode rig case and validate the path plus the
   AOFL-adjusted lengths before it ships.
 
-- [ ] **A103 — fmlib PCD-modify / FrmReplic / VSPAlloc verbs.** fmlib omits the
-  `DEV_TO_ID` handle→id conversion at several sites, so a userspace `t_Device *`
-  is sent where the kernel now expects a cookie:
-  `FM_PCD_CcRootBuild`/`FrmReplicSetGroup`/`AddMember` FR arm (`frm_replic_id`),
-  `PlcrProfileSet` modify-arm `p_profile`, `ManipNodeReplace` `p_next_manip`, the
-  two PORT modify verbs
-  (`PcdKgModifyInitialScheme`/`PcdPlcrModifyInitialProfile`) +
-  `VSPAlloc`. Post-A85 the kernel rejects these cleanly (`E_INVALID_SELECTION`) —
-  no corruption, the features are simply unusable until fixed. No rig config
-  exercises any of them. To enable: add the missing `DEV_TO_ID`/loop-bound
-  conversions in `sources/fmlib/src/fm_lib.c` (`patches/fmlib/`).
-  Whole-tree replacement (`PcdCcModifyTree`) is deliberately unsupported
-  under A113 and is excluded from this enablement work.
+- [x] **A103.** fmlib's PCD-modify/FrmReplic/VSPAlloc verbs skipped the handle→cookie conversion; moot, the ioctl
+  plane and fmlib are gone (_:/^fman: retire the userspace FMD ioctl plane_).
 
 - [x] **A150.** The CEETM tree was built in flowtable mode with no consumer, and the choice
   was to gate `qm_init()` or give the flowtable a way to use it —

@@ -193,6 +193,14 @@ released exactly once, with each port returned to its initial enabled state.
 
 ## Regenerating the golden
 
+`cdx/cdx_softparse.h` and `tools/host_tests/golden/cdx_pcd_model.json` are the
+source of truth. `fmc` and `fmlib` are no longer built or carried: their
+recipes and ASK patches were retired, and the last copies live in the
+`mono-1.0.x` tags (identical in `mono-1.0.7`). A change to `config/pcd/*.xml`
+that has to reach the hardware therefore means rebuilding them from there:
+nxp-qoriq `fmlib` at `7a58ecaf0d90` and `fmc` at `5b9f4b16a864`, each with
+`git show mono-1.0.7:patches/<fmlib|fmc>/01-mono-ask-extensions.patch` applied.
+
 `fmc` builds in a host-only mode that links against `FMCDummyDriver.c` instead
 of the ioctl shim, so the whole compile runs on the development host. Without
 `--apply` it writes `fmc_config_data.c`, the complete model as C initialisers,
@@ -209,7 +217,7 @@ tools/gen_cdx_pcd_golden.py fmc_config_data.c \
      tools/host_tests/golden/cdx_pcd_model.json
 ```
 
-Use the patched fmlib headers from the kas work tree, not `sources/fmlib`. The
+Use the patched fmlib headers, not a pristine `sources/fmlib`. The
 ASK `fmc` patch added `FM_PORT_GetEnabled` calls to `fmc_exec.c` without
 stubbing the symbol in `FMCDummyDriver.c`, so host mode needs that one stub
 added before it links.

@@ -23,7 +23,7 @@ memset_io/memcpy_toio/memcpy_fromio. That's ~80-200 call sites of
 mostly mechanical edits, but the audit surface is the entire vendored
 codebase — out of scope for the security-hardening pass.
 
-Instead, scope KASAN to the code we own: cdx, fci, auto_bridge, plus
+Instead, scope KASAN to the code we own: cdx and ask_flowtable, plus
 the rest of the kernel keep full instrumentation; the three vendored
 trees are skipped. KASAN_SANITIZE := n only suppresses compiler
 instrumentation — KASAN remains globally enabled, so callers that pass

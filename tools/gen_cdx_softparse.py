@@ -8,7 +8,7 @@ same data as a plain array plus a small descriptor it can hand to
 FM_PCD_PrsLoadSw, so this rewrites it.
 
 Regenerate after any change to config/pcd/cdx_sp.xml -- see docs/in-kernel-pcd.md for how
-to build the host-mode fmc that produces the input.
+to rebuild the retired host-mode fmc that produces the input.
 
     tools/gen_cdx_softparse.py <softparse.h> cdx/cdx_softparse.h
 """
@@ -62,8 +62,8 @@ def emit(sp, source):
  *
  * GENERATED FILE -- do not edit. Regenerate with:
  *     tools/gen_cdx_softparse.py <softparse.h> cdx/cdx_softparse.h
- * See docs/in-kernel-pcd.md for building the host-mode fmc that emits the
- * input, and keep this in step with %s.
+ * See docs/in-kernel-pcd.md for rebuilding the retired host-mode fmc that
+ * emits the input, and keep this in step with %s.
  */
 #ifndef CDX_SOFTPARSE_H
 #define CDX_SOFTPARSE_H

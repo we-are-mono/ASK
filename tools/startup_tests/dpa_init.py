@@ -59,22 +59,18 @@ def test_rollback(tmp_path):
         assert muram_paths, "FMAN MURAM accounting is required"
         muram_command = "cat " + " ".join(shlex.quote(p) for p in muram_paths)
         muram_before = run(muram_command)
-        port_state_code = """import errno, fcntl, glob, json, os
+        # Each FMan port's enable bit (BMI_PORT_CFG_EN, bit 31 of its BMI
+        # configuration register), from the SDK's own register dump: cdx is
+        # not loaded here, and the ports keep no other state readable.
+        port_state_code = """import json, os, re
 states = {}
-for path in sorted(glob.glob('/dev/fm0-port-*')):
-    try:
-        fd = os.open(path, os.O_RDWR)
-    except OSError as error:
-        if error.errno == errno.ENODEV:
-            continue
-        raise
-    try:
-        enabled = bytearray(1)
-        fcntl.ioctl(fd, 0x8001e172, enabled)
-        assert enabled[0] in (0, 1)
-        states[path] = enabled[0]
-    finally:
-        os.close(fd)
+for directory, _, files in os.walk('/sys/devices'):
+    if 'fm_port_bmi_regs' not in files:
+        continue
+    text = open(os.path.join(directory, 'fm_port_bmi_regs')).read()
+    match = re.search(r'0x([0-9a-fA-F]{8})\\s+fmbm_[rto]cfg$', text, re.M)
+    if match:
+        states[directory] = int(match[1], 16) >> 31
 assert states
 print(json.dumps(states, sort_keys=True))
 """

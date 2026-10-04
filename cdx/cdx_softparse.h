@@ -4,8 +4,8 @@
  *
  * GENERATED FILE -- do not edit. Regenerate with:
  *     tools/gen_cdx_softparse.py <softparse.h> cdx/cdx_softparse.h
- * See docs/in-kernel-pcd.md for building the host-mode fmc that emits the
- * input, and keep this in step with config/pcd/cdx_sp.xml.
+ * See docs/in-kernel-pcd.md for rebuilding the retired host-mode fmc that
+ * emits the input, and keep this in step with config/pcd/cdx_sp.xml.
  */
 #ifndef CDX_SOFTPARSE_H
 #define CDX_SOFTPARSE_H

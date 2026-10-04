@@ -1,45 +1,29 @@
-"""A running classifier must reject changes to the hardware underneath it."""
+"""Nothing outside the kernel may change the hardware underneath a running classifier."""
 
 import shlex
-
-import pytest
 
 from ask_orch.uart import Console
 
 
-async def test_port_tree_replacement_unsupported(splat_window):
-    # Reserved native (8-byte object) and compat (4-byte object) command
-    # numbers. Even unreadable arguments must be rejected before decoding.
+async def test_no_fman_userspace_interface(splat_window):
+    # cdx builds the classifier in the kernel. The SDK's /dev/fm*, /dev/fm*-pcd
+    # and /dev/fm*-port-* character devices, and every ioctl behind them, are
+    # gone: no FMan character device major is registered and no node exists.
+    # Nor is USDPAA built, whose /dev/fsl-usdpaa* hand a process raw QMan/BMan
+    # portals and DMA memory: nothing in ASK is a USDPAA application.
     script = """
-import errno, fcntl, glob, os
-devices = sorted(glob.glob('/dev/fm0-port-*'))
-assert devices, 'no FMAN port devices'
-checked = 0
-for device in devices:
-    try:
-        fd = os.open(device, os.O_RDWR)
-    except OSError as error:
-        if error.errno == errno.ENODEV:  # Static node for an inactive port.
-            continue
-        raise
-    try:
-        for command in (0x4008e162, 0x4004e162):
-            for argument in (0, 1):
-                try:
-                    fcntl.ioctl(fd, command, argument)
-                except OSError as error:
-                    assert error.errno == errno.EOPNOTSUPP, (device, hex(command), error)
-                else:
-                    raise AssertionError('whole-tree replacement accepted')
-        checked += 1
-    finally:
-        os.close(fd)
-assert checked, 'no active FMAN port devices'
-print('whole-tree replacement rejected on %d ports' % checked)
+import glob, re
+nodes = glob.glob('/dev/fm[0-9]*') + glob.glob('/dev/fsl-usdpaa*')
+assert not nodes, nodes
+majors = [line for line in open('/proc/devices') if re.fullmatch(r'\\s*\\d+ fm\\d+\\n', line)]
+assert not majors, majors
+misc = [line for line in open('/proc/misc') if 'usdpaa' in line]
+assert not misc, misc
+print('no FMan userspace interface')
 """
     with Console.target() as con:
         con.login("root", None)
-        result = con.run("python3 -c " + shlex.quote(script), timeout=20)
+        result = con.run("python3 -c " + shlex.quote(script), timeout=15)
         assert result.rc == 0, result.stdout
 
 
@@ -63,199 +47,4 @@ os.close(os.open('/dev/cdx_ctrl', os.O_RDWR))
     with Console.target() as con:
         con.login("root", None)
         result = con.run("python3 -c " + shlex.quote(script), timeout=15)
-        assert result.rc == 0, result.stdout
-
-
-async def test_dpa_unused_hash_table_teardown(splat_window):
-    # Native arm64 fm_pcd_ioctls.h: 120-byte hash parameters, id at 112.
-    # Use a private two-bucket Ethernet table with a drop miss action.
-    # It is never attached to a root or used by the running dataplane.
-    script = """
-import ctypes, errno, fcntl, mmap, os, struct
-create, delete = 0xc078e139, 0x4008e139
-params = bytearray(120)
-struct.pack_into('<H', params, 0, 2)   # max_num_of_keys
-struct.pack_into('<H', params, 10, 1)  # hash_res_mask
-params[13] = 12                       # match_key_size
-struct.pack_into('<I', params, 16, 1)  # next_engine = DONE
-struct.pack_into('<I', params, 24, 1)  # enqueue action = DROP
-struct.pack_into('<I', params, 68, 9)  # table_type = ETHERNET_TABLE
-fd = os.open('/dev/fm0-pcd', os.O_RDWR)
-try:
-    for _ in range(64):
-        data = bytearray(params)
-        fcntl.ioctl(fd, create, data)
-        cookie = data[112:120]
-        assert cookie != bytes(8)
-        fcntl.ioctl(fd, delete, cookie)
-        try:
-            fcntl.ioctl(fd, delete, cookie)
-        except OSError:
-            pass
-        else:
-            raise AssertionError('deleted hash cookie accepted twice')
-    # Fail copy_to_user after hardware creation. More than 1024 attempts
-    # exceed the cookie registry capacity if any attempt leaks its slot.
-    libc = ctypes.CDLL(None, use_errno=True)
-    page = mmap.mmap(-1, mmap.PAGESIZE)
-    page[:len(params)] = params
-    address = ctypes.addressof(ctypes.c_char.from_buffer(page))
-    assert libc.mprotect(ctypes.c_void_p(address), mmap.PAGESIZE, mmap.PROT_READ) == 0
-    try:
-        for _ in range(1100):
-            assert libc.ioctl(fd, ctypes.c_ulong(create), ctypes.c_void_p(address)) == -1
-    finally:
-        assert libc.mprotect(ctypes.c_void_p(address), mmap.PAGESIZE,
-                             mmap.PROT_READ | mmap.PROT_WRITE) == 0
-        page.close()
-    data = bytearray(params)
-    fcntl.ioctl(fd, create, data)
-    fcntl.ioctl(fd, delete, data[112:120])
-finally:
-    os.close(fd)
-"""
-    with Console.target() as con:
-        con.login("root", None)
-        result = con.run("python3 -c " + shlex.quote(script), timeout=45)
-        assert result.rc == 0, result.stdout
-
-
-async def test_hardware_reassembly_unsupported(splat_window):
-    # Native arm64 UAPI values/layouts are asserted by sdk_port_ioctl.c.
-    # Invalid nested pointers ensure rejection precedes cookie resolution.
-    script = """
-import errno, fcntl, glob, os, struct
-
-def rejected(fd, command, data):
-    before = bytes(data)
-    try:
-        fcntl.ioctl(fd, command, data)
-    except OSError as error:
-        assert error.errno == errno.EOPNOTSUPP, (hex(command), error)
-    else:
-        raise AssertionError('hardware reassembly accepted')
-    assert bytes(data) == before, 'rejected request changed its arguments'
-
-fd = os.open('/dev/fm0-pcd', os.O_RDWR)
-try:
-    data = bytearray(b'\\xff' * 464)
-    struct.pack_into('<I', data, 0, 1)  # MANIP_REASSEM; all headers unsupported.
-    rejected(fd, 0xc1d0e13f, data)
-    for table_type in (14, 15, 0xfffffffe, 0xffffffff):
-        data = bytearray(b'\\xff' * 120)
-        struct.pack_into('<I', data, 68, table_type)
-        rejected(fd, 0xc078e139, data)
-finally:
-    os.close(fd)
-checked = 0
-for device in sorted(glob.glob('/dev/fm0-port-*')):
-    try:
-        fd = os.open(device, os.O_RDWR)
-    except OSError as error:
-        if error.errno == errno.ENODEV:
-            continue
-        raise
-    try:
-        for ip, capwap in ((1, 0), (0, 1), (1, 1)):
-            data = bytearray(b'\\xff' * 64)
-            struct.pack_into('<QQ', data, 48, ip, capwap)
-            rejected(fd, 0x4040e15a, data)
-        checked += 1
-    finally:
-        os.close(fd)
-assert checked, 'no active FMAN ports'
-print('reassembly creation and attachment rejected on %d ports' % checked)
-"""
-    with Console.target() as con:
-        con.login("root", None)
-        result = con.run("python3 -c " + shlex.quote(script), timeout=20)
-        assert result.rc == 0, result.stdout
-
-
-@pytest.mark.parametrize("direct", [False, True], ids=["ordinary", "direct"])
-async def test_dpa_unused_scheme_teardown(splat_window, direct):
-    # Native arm64 layouts are checked by sdk_port_ioctl.c. Scheme 31 is
-    # outside the shipped FMC configuration; this test never binds it.
-    script = "direct = " + repr(direct) + "\n" + """
-import ctypes, os, struct
-libc = ctypes.CDLL(None, use_errno=True)
-fd = os.open('/dev/fm0-pcd', os.O_RDWR)
-
-def command(number, data, succeeds=True):
-    before = bytes(data)
-    buffer = (ctypes.c_ubyte * len(data)).from_buffer(data)
-    rc = libc.ioctl(fd, ctypes.c_ulong(number), ctypes.byref(buffer))
-    if succeeds:
-        assert rc == 0, (hex(number), ctypes.get_errno())
-    else:
-        assert rc == -1, ('unexpected success', hex(number))
-        assert bytes(data) == before, 'rejected request changed its arguments'
-
-scheme = env = None
-try:
-    for cycle in range(64):
-        if not direct:
-            params = bytearray(976)
-            params[0] = 1
-            struct.pack_into('<I', params, 4, 2)  # One Ethernet distinction unit.
-            command(0xc3d0e128, params)
-            env = params[968:976]
-            assert any(env)
-        params = bytearray(1368)
-        params[8] = 31
-        struct.pack_into('<I', params, 1080, 1)  # Nonzero base FQID; never used.
-        struct.pack_into('<I', params, 1320, 1)  # DONE
-        struct.pack_into('<I', params, 1328, 1)  # DROP
-        # An ordinary scheme without a netenv must fail before acquisition.
-        command(0xc558e12c, params, succeeds=False)
-        params[16] = int(direct)
-        params[17] = int(not direct)  # SDK flag padding is not a public flag.
-        if env is not None:
-            params[24:32] = env
-            params[32] = 1
-        command(0xc558e12c, params)
-        scheme = params[1360:1368]
-        assert any(scheme)
-        assert params[24:32] == (env if env is not None else bytes(8))
-        # Rejected modification must leave the existing scheme usable.
-        params[0] = 1
-        params[8:16] = scheme
-        invalid = bytearray(params)
-        invalid[16] = 0
-        invalid[24:32] = bytes(8)
-        command(0xc558e12c, invalid, succeeds=False)
-        command(0xc558e12c, params)
-        assert params[1360:1368] == scheme
-        assert params[8:16] == scheme  # Copy-out retains public cookies.
-        assert params[24:32] == (env if env is not None else bytes(8))
-        # Fail at the end of register construction, after it has built the
-        # candidate netenv/match vector. Delete immediately afterward: an
-        # in-place builder would lose the original netenv reference here.
-        invalid = bytearray(params)
-        invalid[16] = 1  # Candidate is direct even for an ordinary live scheme.
-        struct.pack_into('<I', invalid, 1080, 0x1000000)  # FQID exceeds 24 bits.
-        command(0xc558e12c, invalid, succeeds=False)
-        if env is not None:
-            command(0x4008e129, env, succeeds=False)  # Still owned by the scheme.
-        command(0x4008e12d, scheme)
-        stale = scheme
-        scheme = None
-        command(0x4008e12d, stale, succeeds=False)
-        if env is not None:
-            command(0x4008e129, env)
-            env = None
-    print('64 %s scheme create/modify/delete cycles passed, including missing-netenv rejection and stale cookies'
-          % ('direct' if direct else 'ordinary'))
-finally:
-    try:
-        if scheme is not None:
-            command(0x4008e12d, scheme)
-        if env is not None:
-            command(0x4008e129, env)
-    finally:
-        os.close(fd)
-"""
-    with Console.target() as con:
-        con.login("root", None)
-        result = con.run("python3 -c " + shlex.quote(script), timeout=45)
         assert result.rc == 0, result.stdout

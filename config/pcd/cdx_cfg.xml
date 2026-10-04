@@ -11,7 +11,7 @@
     <port type="10G" number="1" policy="cdx_ethport_7_policy" portid="7"/>
     <!-- OFFLINE ports for CDX -->
     <!-- number="1" -> dpa-fman0-oh@2 (IPsec), number="2" -> dpa-fman0-oh@3 (WiFi).
-         number is consumed by fmc/fmlib as the /dev/fm0-port-oh<number> handle.
+         number is the OH port's DT cell-index.
 
          portid=9/10 matches every NXP reference cdx_cfg variant. This is
          load-bearing: cdx_sp.xml's espschema/tcpschema/udpschema soft-parser

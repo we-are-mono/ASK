@@ -1167,10 +1167,9 @@ sent, and with `priv->ceetm_en` false `cdx_get_txfq()` returns
 mode, where `tc` builds the tree and `ct mark` selects the class. CMM mode has
 since been removed from the image altogether.
 
-The deliberate non-change is `ATTR_QOSCONNMARK` in the libnetfilter-conntrack
-ASK patch, which is now a dead declaration mirroring a kernel attribute that no
-longer exists. Removing it means regenerating two patches against upstream
-tarballs; filed as **A146**.
+The dead `ATTR_QOSCONNMARK` declaration in the libnetfilter-conntrack ASK patch
+went first (**A146**); the patch itself went with the rest of CMM's conntrack
+plumbing, which nothing in the flowtable stack links.
 
 *Proved on hardware, 2026-09-17.* See the increment 4 re-run below.
 

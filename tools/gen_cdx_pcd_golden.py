@@ -7,7 +7,8 @@ fmc_config_data.c to the parts the builder is responsible for and writes them as
 JSON, so the expectation survives fmc's removal.
 
 Regenerate after any change to cdx_pcd.xml or cdx_cfg.xml -- see
-docs/in-kernel-pcd.md for building the host-mode fmc that produces the input.
+docs/in-kernel-pcd.md for rebuilding the retired host-mode fmc that produces
+the input.
 
     tools/gen_cdx_pcd_golden.py <fmc_config_data.c> tools/host_tests/golden/cdx_pcd_model.json
 """
