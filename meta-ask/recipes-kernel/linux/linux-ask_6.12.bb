@@ -94,6 +94,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://149-netfilter-flowtable-ipv6-prefix-translation.patch \
            file://150-sdk_dpaa-hardware-qdisc.patch \
            file://151-netfilter-flowtable-pppoe-peer.patch \
+           file://152-netfilter-nftables-device-hook-transactions.patch \
            file://160-bridge-switchdev-mdb-group.patch \
            file://161-bridge-multicast-egress-snapshot.patch \
            file://162-bridge-forward-path-forwarding-state.patch \
