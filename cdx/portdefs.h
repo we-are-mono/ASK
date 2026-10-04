@@ -69,7 +69,13 @@ struct eth_iface_info {
 	t_Handle *vsp_h;			//VSP info for given eth interface
 	struct port_fq_info fqinfo[MAX_FQ_TYPES];	//fq info for defa types
 	struct port_fq_info eth_tx_fqinfo[DPAA_ETH_TX_QUEUES];	//ethdrv TX FQs 
-	struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES]; /* cctable TX FQs */ 
+	struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES]; /* cctable TX FQs */
+	/* Tail drop over fwd_tx_fqinfo[] once their backlog outlasts
+	 * fwd_queue_us at the link's speed (devman.c). fwd_cgr_speed is the
+	 * Mbit/s the threshold was sized for; zero until the group is set
+	 * up and again once it is torn down. */
+	struct qman_cgr fwd_cgr;
+	uint32_t fwd_cgr_speed;
 	uint32_t rx_channel_id;		//channel id rx
 	uint32_t tx_channel_id;		//channel id tx
 	uint32_t tx_wq;			//tx work queue
@@ -193,6 +199,7 @@ int dpa_add_port_to_list(struct dpa_iface_info *iface_info);
 struct dpa_iface_info *dpa_get_ifinfo_by_itfid(uint32_t itf_id);
 struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev);
 bool dpa_netdev_is_physical(const struct net_device *dev);
+void dpa_fwd_cgr_follow_link(struct net_device *dev);
 bool dpa_netdev_is_dpaa(const struct net_device *dev);
 extern spinlock_t dpa_devlist_lock;
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid);
@@ -224,7 +231,8 @@ void *dpa_get_fm_MURAM_handle(uint32_t fm_idx, uint64_t *phyBaseAddr,
 					uint32_t *MuramSize);
 int dpaa_vwd_init(void);
 void dpaa_vwd_exit(void);
-uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *markval);
+uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *markval,
+			uint32_t hash);
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void *markval);
 int dpaa_is_oh_port(uint32_t portid);
 #endif

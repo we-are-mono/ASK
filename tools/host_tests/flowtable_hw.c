@@ -194,6 +194,8 @@ static int dev_get_port_parent_id(struct net_device *d, struct netdev_phys_item_
 #define netif_running(d) ((d)->running)
 #define netif_carrier_ok(d) ((d)->carrier)
 #define NETDEV_PRE_UP 1
+#define NETDEV_UP 2
+#define NETDEV_CHANGE 3
 #define NOTIFY_DONE 0
 #define netdev_err(...) ((void)0)
 struct notifier_block { int (*notifier_call)(struct notifier_block *, unsigned long, void *); };
@@ -741,6 +743,10 @@ unsigned int cdx_ft_pending(void);
 struct cdx_ft_hw;
 int cdx_ft_hw_del(struct cdx_ft_hw **hw);
 void cdx_ft_fatal(void);
+/* devman.c's resizer of a port's egress bound, counted. */
+static unsigned follow_link_calls;
+static struct net_device *followed;
+static void dpa_fwd_cgr_follow_link(struct net_device *dev) { follow_link_calls++; followed = dev; }
 #include "hardware_production.inc"
 #include "backend_production.inc"
 
@@ -835,6 +841,24 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     dpa_interface_info = NULL;
     assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, info) == NOTIFY_DONE);
     dpa_interface_info = &in_iface;
+    /* A physical port's link coming up or changing speed resizes its egress
+     * bound, latch or not; a link without carrier or a foreign device does
+     * not. */
+    bool carrier = in->carrier;
+    unsigned follows = follow_link_calls;
+    in->carrier = true;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_UP, info) == NOTIFY_DONE);
+    assert(follow_link_calls == follows + 1 && followed == in);
+    assert(cdx_ft_netdev_event(NULL, NETDEV_CHANGE, info) == NOTIFY_DONE);
+    assert(follow_link_calls == follows + 2);
+    in->carrier = false;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_CHANGE, info) == NOTIFY_DONE);
+    info->dev = &unrelated;
+    unrelated.carrier = true;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_UP, info) == NOTIFY_DONE);
+    assert(follow_link_calls == follows + 2);
+    info->dev = in;
+    in->carrier = carrier;
     strcpy(out->name, "out");
     expect_terminal("a possibly linked key could not be recorded", restarts);
     /* A table the resolver finds malformed. */

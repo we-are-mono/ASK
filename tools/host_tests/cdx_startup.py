@@ -101,8 +101,12 @@ def test_cdx_startup(tmp_path):
 @pytest.mark.parametrize("queues", [8, 16])
 def test_queues(tmp_path, queues):
     source = (ROOT / "cdx/devman.c").read_text()
+    bound = "".join(line + "\n" for line in source.splitlines()
+                    if line.startswith(("#define FWD_CGR_", "static unsigned int fwd_queue_us")))
     (tmp_path / "cdx_queues.inc").write_text(
-        function(source, "fwd_tx_drain_dqrr")
+        bound + function(source, "fwd_tx_drain_dqrr") + function(source, "fwd_tx_ern")
+        + function(source, "fwd_cgr_bytes") + function(source, "fwd_cgr_set")
+        + function(source, "fwd_cgr_link_speed") + function(source, "fwd_cgr_release")
         + function(source, "cdx_drain_fq") + function(source, "cdx_destroy_fq")
         + function(source, "cdx_drain_fq_list") + function(source, "cdx_destroy_fq_list") + function(source, "create_fwd_tx_fqs")
         + function(source, "destroy_fwd_tx_fqs"))

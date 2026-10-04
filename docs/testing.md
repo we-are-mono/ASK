@@ -465,9 +465,9 @@ The IKE case requires UDP 500/4500 and the DUT's charon PID file to be unused.
 `profile_homelab.py::test_mixed_traffic_survives_rekey` keeps the VLAN WAN paths,
 IPv6 tunnel, IPsec and multicast active together for a minute through a rekey.
 `flowtable_nat_throughput.py` checks a 9 Gbit/s TCP floor in separate forward and
-reverse runs, simultaneous TCP directions with endpoint kernel pacing at 9 Gbit/s
-and an 8 Gbit/s floor each, and 64-byte UDP payloads at 25 Mbit/s. Unpaced duplex
-can overflow DUT receive FIFOs; see `TODO.md`. Artifacts include native DUT MAC
+reverse runs, simultaneous unpaced TCP directions with floors of 8 Gbit/s forward
+and 6 Gbit/s reverse (the offloaded egress bound, A313), and 64-byte UDP payloads
+at 25 Mbit/s. Artifacts include native DUT MAC
 counters, endpoint NIC counters, UDP loss and receiver buffer errors. Native
 iperf's reverse-only UDP stream does not meet the service's established
 original-direction admission rule, so simultaneous throughput uses TCP.

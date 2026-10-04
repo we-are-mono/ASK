@@ -114,8 +114,12 @@ static struct qman_fq *ceetm_egressfq_hook(void *ctx, uint32_t channel,
  * this driver's, and its private area is not a dpa_priv_s to read CEETM state
  * from. Registration refuses such a port (get_eth_iface_info()), so this is
  * the backstop for a record that did not come through it.
+ *
+ * hash is the flow's (zero where there is no single flow), which picks the
+ * forwarding queue on a port no hardware qdisc owns.
  */
-uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info)
+uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info,
+			uint32_t hash)
 {
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)info;
 	uint32_t quenum;
@@ -145,8 +149,13 @@ uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info)
 		return fqid;
 	}
 #endif
-	/* QOS not enabled on this interface */
-	quenum = (qosmark->queue & (DPAA_FWD_TX_QUEUES - 1));
+	/* No hardware qdisc. The port's forwarding queues share one work
+	 * queue, which QMan serves round-robin, so a mark's queue number
+	 * orders nothing here; spread flows over them by their hash instead.
+	 * A bulk flow then queues behind itself rather than in front of every
+	 * other flow's packets -- the ACKs of the opposite direction among
+	 * them (A313) -- and each flow keeps one queue, so its order holds. */
+	quenum = hash & (DPAA_FWD_TX_QUEUES - 1);
 	return eth_info->fwd_tx_fqinfo[quenum].fqid;
 }
 

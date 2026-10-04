@@ -26,6 +26,7 @@
 #include <uapi/linux/in6.h> 
 #include <linux/spinlock.h>
 #include <linux/if_arp.h>
+#include <linux/ethtool.h>
 #include "fm_vsp_ext.h"
 #include "fm_port_ext.h"
 #include "lnxwrp_fm.h"
@@ -94,15 +95,18 @@
  *      - Protected by dpa_devlist_lock.
  *
  * Cross-file users:
- *   dpa_devlist_lock is the innermost lock its takers hold. The one
- *   lock taken inside it is cdx_ifstats.c's dpa_statslist_lock, by
- *   virt_iface_stats_callback reading a record; nothing holding
- *   that lock takes this one.
+ *   dpa_devlist_lock is the innermost lock its takers hold. The locks
+ *   taken inside it are cdx_ifstats.c's dpa_statslist_lock, by
+ *   virt_iface_stats_callback reading a record, and the affine QMan
+ *   portal's, by fwd_cgr_set() resizing a port's egress bound; nothing
+ *   holding either takes this one.
  *
  * Contexts:
  *   dpa_add_*, dpa_remove_*    - process, ioctl configuration.
  *   dpa_get_ifinfo_by_itfid    - any context (stats callbacks).
  *   get_eth_iface_info         - process, ioctl.
+ *   fwd_queue_us_set           - process, the module parameter's sysfs write.
+ *   dpa_fwd_cgr_follow_link    - process, netdev notifier under RTNL.
  */
 DEFINE_SPINLOCK(dpa_devlist_lock);
 struct dpa_iface_info *dpa_interface_info;
@@ -133,18 +137,183 @@ static enum qman_cb_dqrr_result fwd_tx_drain_dqrr(struct qman_portal *portal,
 	return qman_cb_dqrr_consume;
 }
 
+static void fwd_tx_ern(struct qman_portal *portal, struct qman_fq *fq,
+		       const struct qm_mr_entry *msg)
+{
+	/* Only FMan enqueues here, and its portals take their own rejections
+	 * back (enqueue discard). A frame a software producer had rejected
+	 * would arrive here, and goes back to its pool. */
+	dpa_fd_release(NULL, &msg->ern.fd);
+}
+
+/* How long, at its link's speed, a port's offloaded egress may queue before
+ * QMan drops at the tail. These frames never meet a qdisc, so this is the only
+ * bound on their latency: unbounded, a saturated port held whatever its
+ * senders' windows allowed -- 11.5 MB, 9 ms at 10 Gbit/s -- and the ACKs of
+ * the other direction waited behind it (A313). */
+static unsigned int fwd_queue_us = 2000;
+
+/* A few jumbo frames, whatever the link reports. */
+#define FWD_CGR_MIN_BYTES	(64 * 1024)
+/* Preamble, inter-frame gap and FCS, which a frame descriptor's length leaves
+ * out: counted per frame, so the threshold is time on the wire for small
+ * frames too. */
+#define FWD_CGR_WIRE_OVERHEAD	24
+
+static u64 fwd_cgr_bytes(uint32_t speed)
+{
+	/* Mbit/s times microseconds is bits. */
+	return max_t(u64, (u64)speed * READ_ONCE(fwd_queue_us) / 8,
+		     FWD_CGR_MIN_BYTES);
+}
+
+/* Size the port's group for speed Mbit/s; init sets it up from scratch. The
+ * management command spins briefly and never sleeps, so callers may hold
+ * dpa_devlist_lock. */
+static int fwd_cgr_set(struct eth_iface_info *eth_info, uint32_t speed,
+		       bool init)
+{
+	struct qm_mcc_initcgr opts;
+
+	memset(&opts, 0, sizeof(opts));
+	opts.we_mask = QM_CGR_WE_CS_THRES;
+	if (init) {
+		/* Bytes, tail drop, and no state-change notifications: the
+		 * drop needs none, and a threshold this short would raise
+		 * one at every TCP sawtooth. */
+		opts.we_mask |= QM_CGR_WE_MODE | QM_CGR_WE_CSTD_EN |
+				QM_CGR_WE_CSCN_EN;
+		opts.cgr.mode = 0;
+		opts.cgr.cstd_en = QM_CGR_EN;
+	}
+	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres, fwd_cgr_bytes(speed), 1);
+	if (qman_modify_cgr(&eth_info->fwd_cgr,
+			    init ? QMAN_CGR_FLAG_USE_INIT : 0, &opts))
+		return -EIO;
+	eth_info->fwd_cgr_speed = speed;
+	return 0;
+}
+
+/* A physical DPAA port: the only kind dpa_add_eth_if() gives forwarding FQs,
+ * and so a group. */
+static bool fwd_cgr_owner(const struct dpa_iface_info *info)
+{
+	return (info->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL)) ==
+	       (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL);
+}
+
+static int fwd_queue_us_set(const char *val, const struct kernel_param *kp)
+{
+	struct dpa_iface_info *info;
+	unsigned int us;
+	int rc;
+
+	rc = kstrtouint(val, 0, &us);
+	if (rc)
+		return rc;
+	if (!us || us > 100 * USEC_PER_MSEC)
+		return -EINVAL;
+	WRITE_ONCE(fwd_queue_us, us);
+	spin_lock(&dpa_devlist_lock);
+	for (info = dpa_interface_info; info; info = info->next)
+		if (fwd_cgr_owner(info) && info->eth_info.fwd_cgr_speed &&
+		    fwd_cgr_set(&info->eth_info, info->eth_info.fwd_cgr_speed,
+				false))
+			pr_warn("cdx: %s: could not resize the egress queue bound\n",
+				info->name);
+	spin_unlock(&dpa_devlist_lock);
+	return 0;
+}
+
+static const struct kernel_param_ops fwd_queue_us_ops = {
+	.set = fwd_queue_us_set,
+	.get = param_get_uint,
+};
+module_param_cb(fwd_queue_us, &fwd_queue_us_ops, &fwd_queue_us, 0644);
+MODULE_PARM_DESC(fwd_queue_us,
+		 "Offloaded egress queued per port before tail drop, in microseconds at link speed");
+
+/* The speed the link runs at, or fallback while it has none or reports none.
+ * A port without a PHY reports none (dpa_get_ksettings()), so its bound is
+ * sized for the MAC's fastest even with a slower module fitted. RTNL held:
+ * reading a PHY may sleep, so never under dpa_devlist_lock. */
+static uint32_t fwd_cgr_link_speed(struct net_device *dev, uint32_t fallback)
+{
+	struct ethtool_link_ksettings ks;
+
+	if (netif_carrier_ok(dev) && !__ethtool_get_link_ksettings(dev, &ks) &&
+	    ks.base.speed && ks.base.speed != SPEED_UNKNOWN)
+		return ks.base.speed;
+	return fallback;
+}
+
+/* The link came up or changed speed: size the port's bound for the speed it
+ * now runs at. RTNL held. */
+void dpa_fwd_cgr_follow_link(struct net_device *dev)
+{
+	struct dpa_iface_info *info;
+	uint32_t speed = fwd_cgr_link_speed(dev, 0);
+
+	spin_lock(&dpa_devlist_lock);
+	for (info = dpa_interface_info; info; info = info->next) {
+		if (!fwd_cgr_owner(info) || info->eth_info.net_dev != dev)
+			continue;
+		if (!speed)
+			speed = info->eth_info.speed;
+		if (info->eth_info.fwd_cgr_speed &&
+		    info->eth_info.fwd_cgr_speed != speed &&
+		    fwd_cgr_set(&info->eth_info, speed, false))
+			netdev_warn(dev, "could not resize the offloaded egress queue bound\n");
+		break;
+	}
+	spin_unlock(&dpa_devlist_lock);
+}
+
+static void fwd_cgr_release(struct eth_iface_info *eth_info)
+{
+	struct qm_mcc_initcgr opts;
+
+	/* Its FQs are out of service by now, which the release requires. */
+	spin_lock(&dpa_devlist_lock);
+	eth_info->fwd_cgr_speed = 0;
+	spin_unlock(&dpa_devlist_lock);
+	memset(&opts, 0, sizeof(opts));
+	qman_modify_cgr(&eth_info->fwd_cgr, QMAN_CGR_FLAG_USE_INIT, &opts);
+	qman_release_cgrid(eth_info->fwd_cgr.cgrid);
+}
+
 //create frame queues for the port used to transmit packets from ENQ action
 static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 {
 	struct eth_iface_info *eth_info = &(iface_info->eth_info);
 	struct qman_fq *fq;
 	struct qm_mcc_initfq opts;
-	uint32_t ii, created = 0;
+	uint32_t ii, created = 0, speed;
+	int rc;
 
+	if (qman_alloc_cgrid(&eth_info->fwd_cgr.cgrid) < 0) {
+		DPA_ERROR("%s::no congestion group for %s\n", __func__,
+			  iface_info->name);
+		return FAILURE;
+	}
+	/* Sized for the link as it is now: a port already up below its
+	 * fastest raises no event to correct it later. The port is already
+	 * published, so set up under the lock the resizers take. RTNL held. */
+	speed = fwd_cgr_link_speed(eth_info->net_dev, eth_info->speed);
+	spin_lock(&dpa_devlist_lock);
+	rc = fwd_cgr_set(eth_info, speed, true);
+	spin_unlock(&dpa_devlist_lock);
+	if (rc) {
+		DPA_ERROR("%s::could not set up the congestion group for %s\n",
+			  __func__, iface_info->name);
+		qman_release_cgrid(eth_info->fwd_cgr.cgrid);
+		return FAILURE;
+	}
 	fq = &eth_info->fwd_tx_fqinfo[0];
 	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
 		memset(fq, 0, sizeof(struct qman_fq));
 		fq->cb.dqrr = fwd_tx_drain_dqrr;
+		fq->cb.ern = fwd_tx_ern;
 		//FQ for egress
 		if (qman_create_fq(0, 
 					(QMAN_FQ_FLAG_DYNAMIC_FQID | QMAN_FQ_FLAG_TO_DCPORTAL),
@@ -157,8 +326,12 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 		opts.fqid = fq->fqid;
 		opts.count = 1;
 		opts.we_mask = (QM_INITFQ_WE_FQCTRL | QM_INITFQ_WE_DESTWQ |
-				QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA);
-		opts.fqd.fq_ctrl = QM_FQCTRL_PREFERINCACHE;
+				QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA |
+				QM_INITFQ_WE_CGID | QM_INITFQ_WE_OAC);
+		opts.fqd.fq_ctrl = QM_FQCTRL_PREFERINCACHE | QM_FQCTRL_CGE;
+		opts.fqd.cgid = (u8)eth_info->fwd_cgr.cgrid;
+		opts.fqd.oac_init.oac = QM_OAC_CG;
+		opts.fqd.oac_init.oal = FWD_CGR_WIRE_OVERHEAD;
 		opts.fqd.dest.channel = eth_info->tx_channel_id;
 		opts.fqd.dest.wq = eth_info->tx_wq;
 		//OVFQ=1 - override FQ in tree
@@ -192,6 +365,7 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 err_ret:
 	while (created)
 		cdx_destroy_fq(&eth_info->fwd_tx_fqinfo[--created]);
+	fwd_cgr_release(eth_info);
 	return FAILURE;
 }
 
@@ -214,11 +388,12 @@ static void destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 #ifdef DEVMAN_DEBUG
-		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n", 
+		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n",
 				__func__, fq->fqid, eth_info->tx_channel_id);
 #endif
 		fq++;
 	}
+	fwd_cgr_release(eth_info);
 }
 
 
@@ -482,14 +657,14 @@ struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid)
  */
 static inline int dpa_get_fqid_from_eth(struct eth_iface_info *eth_info,
 		uint32_t *tx_fqid,
-		void  *info)
+		void  *info, uint32_t hash)
 {
 	uint32_t fqid;
 	U32 mark = 0; /* Default queue */
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)&mark;
 	if(info)
 		qosmark = info;
-	fqid = cdx_get_txfqid(eth_info, qosmark);
+	fqid = cdx_get_txfqid(eth_info, qosmark, hash);
 
 	if (!fqid) {
 		DPA_ERROR("%s::unable to get ceetm fqid for chnl %d queue %d\n",
@@ -553,7 +728,7 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 			*portid = eth_info->portid;
 
 		if(fqid)
-			if(dpa_get_fqid_from_eth(eth_info, fqid, NULL))
+			if(dpa_get_fqid_from_eth(eth_info, fqid, NULL, hash))
 				return FAILURE;
 
 		if (is_dscp_fq_map)
@@ -810,7 +985,7 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				 * change. */
 				src_mac = (unsigned char *)eth_info->net_dev->dev_addr;
 			}
-			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, NULL))
+			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, NULL, hash))
 				break;
 			if (cdx_get_tx_dscp_fq_map(eth_info, &l2_info->is_dscp_fq_map, NULL) != 0)
 			{
@@ -947,7 +1122,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 				src_mac = (unsigned char *)eth_info->net_dev->dev_addr;
 			}
 
-			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, qosinfo))
+			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, qosinfo, hash))
 				goto err_ret;
 			if (cdx_get_tx_dscp_fq_map(eth_info, &l2_info->is_dscp_fq_map, qosinfo) != 0)
 			{

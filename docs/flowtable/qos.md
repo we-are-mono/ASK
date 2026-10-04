@@ -2191,6 +2191,38 @@ rather than loudly. And increment 3's teardown paths run under a `sch_htb`
 that discards the return value of both destroy commands, in a file whose
 history — A21, A109, A122, A133 — is that exact failure mode.
 
+## A port without a hardware qdisc
+
+Offloaded frames never meet a qdisc, so on a port no HTB tree owns, cdx itself
+bounds and shares out their egress queue (A313):
+
+- **Bounded in time.** The port's forwarding FQs (`create_fwd_tx_fqs()`,
+  `cdx/devman.c`) belong to one QMan congestion group with tail drop at
+  `cdx.fwd_queue_us` (default 2000 µs) of the link's speed, counting wire bytes
+  (24 bytes of preamble, gap and FCS per frame), never below 64 KiB. The speed
+  is the link's at registration and follows `NETDEV_UP`/`NETDEV_CHANGE`; a port
+  without a PHY reports none and is sized for its MAC's fastest. The parameter
+  is writable at runtime and resizes every port.
+- **Shared per flow.** A classifier entry enqueues to the forwarding FQ its
+  flow's hash picks (`cdx_get_txfqid()`). The FQs share one work queue, served
+  round-robin, so a bulk flow queues behind itself and not in front of other
+  flows — the other direction's ACKs among them. A flow keeps one FQ, so its
+  order holds. Multicast replicas use FQ 0. The tail drop is the group's, not
+  each FQ's: while a bulk flow holds the group at its threshold, other flows'
+  frames are refused too, and cumulative ACKs absorb that. An FQ's own tail
+  drop cannot be added on top, since QMan keeps it in the field overhead
+  accounting uses.
+- **Counted at ingress.** A frame the group drops is counted in the BMI discard
+  counter of the port that enqueued it — the receiving port's `fmbm_rfdc`, or
+  the IPsec offline port's `fmbm_ofdc` for what SEC returned; flow and offloaded
+  TX counters were incremented before the enqueue and count it as sent.
+
+Unbounded, a saturated 10G port held a standing 11.5 MB (9 ms) and the reverse
+direction of a duplex transfer ran at 1.3–2.2 Gbit/s. Bounded at 2 ms and shared
+per flow, both directions ran unpaced at 9.1–9.3 and 6.9–8.0 Gbit/s, with the
+reverse RTT at 0.35 ms instead of 8.4. A port with an HTB tree uses its CEETM
+class queues instead, which have their own tail drop and WRED (sections 3 and 6).
+
 ## The consumer contract
 
 ASK is a dependency of several distributions — Armbian in production, OpenWrt

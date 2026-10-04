@@ -173,8 +173,10 @@ int main(void)
     /* No qdisc: a mark with no class is the port's own channel, queue 0, as
      * it has always been; a named pair is itself. */
     tree_live = false;
-    assert(cdx_get_txfqid(&eth, &none) == 0x000400);
-    assert(cdx_get_txfqid(&eth, &named) == 0x000107);
+    assert(cdx_get_txfqid(&eth, &none, 0) == 0x000400);
+    assert(cdx_get_txfqid(&eth, &named, 0) == 0x000107);
+    /* A flow's hash picks nothing on a port a qdisc owns. */
+    assert(cdx_get_txfqid(&eth, &named, 0x1234) == 0x000107);
     /* A qdisc owns the port: the entry is built with what the tree says a
      * class means there -- the default leaf, for no class -- which is the
      * queue the software path puts the same flow's frames on. That covers
@@ -183,16 +185,22 @@ int main(void)
     tree_channel = 3;
     tree_cq = 5;
     tree_asked = 0;
-    assert(cdx_get_txfqid(&eth, &none) == 0x000456);
-    assert(cdx_get_txfqid(&eth, &named) == 0x000107);
+    assert(cdx_get_txfqid(&eth, &none, 0) == 0x000456);
+    assert(cdx_get_txfqid(&eth, &named, 0x1234) == 0x000107);
     assert(tree_asked == 2);
     /* And the mark itself is never rewritten on the way. */
     assert(!none.chnl_id && !none.queue && named.chnl_id == 1 && named.queue == 7);
-    /* Without CEETM on the port neither the tree nor the channels apply. */
+    /* Without CEETM on the port neither the tree nor the channels apply,
+     * nor the mark's queue: the port's forwarding queues share one work
+     * queue, and a flow's hash spreads flows over them. */
     dev.priv.ceetm_en = false;
-    eth.fwd_tx_fqinfo[7].fqid = 0x77;
+    for (unsigned i = 0; i < DPAA_FWD_TX_QUEUES; i++)
+        eth.fwd_tx_fqinfo[i].fqid = 0x70 + i;
     tree_asked = 0;
-    assert(cdx_get_txfqid(&eth, &named) == 0x77 && !tree_asked);
+    assert(cdx_get_txfqid(&eth, &named, 0) == 0x70 && !tree_asked);
+    assert(cdx_get_txfqid(&eth, &named, 3) == 0x73);
+    assert(cdx_get_txfqid(&eth, &none, 0x7fff) == 0x70 + (0x7fff & (DPAA_FWD_TX_QUEUES - 1)));
+    assert(!tree_asked);
 
     /* A port whose netdev is not the DPAA driver's has no queue here, and
      * its private area is never read as a DPAA port's -- nor is that of a
@@ -201,11 +209,11 @@ int main(void)
                                   .priv = { .ceetm_en = true, .qm_ctx = &port } };
     struct eth_iface_info other_eth = { .net_dev = &foreign };
     other_eth.fwd_tx_fqinfo[7].fqid = 0x99;
-    assert(cdx_get_txfqid(&other_eth, &named) == 0 && !tree_asked && !foreign_reads);
+    assert(cdx_get_txfqid(&other_eth, &named, 7) == 0 && !tree_asked && !foreign_reads);
     foreign.netdev_ops = NULL;
-    assert(cdx_get_txfqid(&other_eth, &named) == 0 && !foreign_reads);
+    assert(cdx_get_txfqid(&other_eth, &named, 7) == 0 && !foreign_reads);
     other_eth.net_dev = NULL;
-    assert(cdx_get_txfqid(&other_eth, &named) == 0);
+    assert(cdx_get_txfqid(&other_eth, &named, 7) == 0);
     assert(dpa_netdev_is_dpaa(&dev) && !dpa_netdev_is_dpaa(NULL));
 
     puts("CEETM egress fq: channel resolution, bounds, an fqid reading that "

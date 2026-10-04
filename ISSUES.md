@@ -267,19 +267,8 @@ result independently of those temporary files.
   `use` template covers when a matching SA is added, or refuse admission under any optional template. Mostly an IPComp
   or hand-configured case: strongSwan installs `required` templates.
 
-- [ ] **A313 — offloaded egress queues are unbounded: bufferbloat whenever a port's egress is the bottleneck.** Diagnosed
-  2026-10-04; explains the unpaced duplex collapse (9.4/1.3-2.2 Gbit/s). `create_fwd_tx_fqs()` (cdx/devman.c) makes each
-  port's forwarding TX FQs with neither tail drop nor a congestion group (`fqctrl 1`); only the buffer pool bounds them.
-  Every offloaded flow leaving a port shares FQ 0 (eth4: FQID 503), and Linux's qdisc/AQM never sees these frames.
-  Evidence (KASAN image, `iperf3 -P4`, NAT, both directions offloaded): an unpaced LAN sender saturates eth4 egress and
-  CUBIC parks a standing ~7,500-frame / 11.5 MB queue there (`/proc/fqid_stats/tx/eth4/503`, ~9 ms at 10G). The reverse
-  flow's ACKs leave through that FIFO, its RTT goes 1 → 8.4 ms (`ss -ti`), and cwnd/RTT caps it at ~1.5-2 Gbit/s. Pacing
-  only the LAN sender (9 Gbit/s) leaves 6-11 frames queued and both directions at ~8.7-9.0; pacing only the WAN sender
-  does not help (9.37/3.63). The MAC RX FIFO drops in TODO's earlier notes rise with reverse traffic and are not the cause.
-  Production impact: a WAN slower than the LAN makes the DUT's egress the bottleneck, so offloaded uploads queue up to
-  the pool size — ~90 ms per 11.5 MB at 1G — with no AQM. Fix direction: one CGR per egress port over its forwarding FQs,
-  tail drop at ~1-2 ms of the link speed (re-set on speed change; QMan CGR thresholds are modifiable), WRED as a later
-  step; check the CEETM CCG thresholds the same way. Validate: unpaced `--bidir` reaches ~9/9 with reverse RTT ≈ 2 ms.
+- [x] **A313 — offloaded egress queues were unbounded and shared by every flow (unpaced duplex 9.4/1.3-2.2 Gbit/s).**
+  Fixed: per-port congestion group at `cdx.fwd_queue_us` of link speed, flows hashed over the FQs; now 9.2/7.0 (_:/^cdx: bound offloaded egress_).
 
 - [ ] **A308 — an IPsec SA release that finds a queue non-empty or SEC busy leaks the SA for the boot.** Source-verified
   by the 1.1.0 audit, not reproduced. `cdx_dpa_ipsecsa_release()` (cdx/dpa_ipsec.c) gives up when a retired SA FQ still

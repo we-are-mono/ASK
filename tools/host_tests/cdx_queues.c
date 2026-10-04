@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -25,23 +26,40 @@
 #define QM_DQRR_STAT_UNSCHEDULED 0x02
 #define QM_DQRR_STAT_FQ_EMPTY 0x80
 #define QM_DQRR_STAT_DQCR_EXPIRED 0x01
+#define QM_INITFQ_WE_CGID 0x10
+#define QM_INITFQ_WE_OAC 0x20
+#define QM_FQCTRL_CGE 2
+#define QM_OAC_CG 1
+#define QM_CGR_WE_MODE 1
+#define QM_CGR_WE_CS_THRES 2
+#define QM_CGR_WE_CSTD_EN 4
+#define QM_CGR_WE_CSCN_EN 0x10
+#define QM_CGR_EN 1
+#define QMAN_CGR_FLAG_USE_INIT 1
+#define SPEED_UNKNOWN (-1)
 #define TX_DIR 1
 #define FAILURE 1
 #define DPA_ERROR(...) do { } while (0)
 #define pr_warn_ratelimited(...) do { } while (0)
+#define READ_ONCE(x) (x)
+#define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))
+typedef uint8_t u8;
 typedef uint32_t u32;
+typedef uint64_t u64;
 enum qman_fq_state { qman_fq_state_oos, qman_fq_state_sched, qman_fq_state_retired };
 enum qman_cb_dqrr_result { qman_cb_dqrr_consume, qman_cb_dqrr_stop };
 enum qm_fd_format { qm_fd_contig, qm_fd_sg };
 struct qm_fd { enum qm_fd_format format; unsigned bpid; uint64_t addr; };
 struct qm_dqrr_entry { unsigned stat; struct qm_fd fd; };
+struct qm_mr_entry { struct { struct qm_fd fd; } ern; };
 struct qman_portal { unsigned unused; };
-struct net_device;
+struct net_device { bool carrier; u32 speed; };
 struct qman_fq {
     unsigned fqid; bool acquired, proc; enum qman_fq_state state; u32 flags;
     struct {
         enum qman_cb_dqrr_result (*dqrr)(struct qman_portal *, struct qman_fq *,
                                        const struct qm_dqrr_entry *);
+        void (*ern)(struct qman_portal *, struct qman_fq *, const struct qm_mr_entry *);
     } cb;
 };
 struct list_head { struct list_head *next; };
@@ -49,12 +67,64 @@ struct dpa_fq { struct qman_fq fq_base; struct list_head list; };
 struct qm_mcc_initfq {
     unsigned fqid, count, we_mask;
     struct { unsigned fq_ctrl; struct { unsigned channel, wq; } dest;
-             struct { unsigned hi, lo; } context_a; } fqd;
+             struct { unsigned hi, lo; } context_a; u8 cgid;
+             struct { unsigned oac; signed char oal; } oac_init; } fqd;
 };
-struct eth_iface_info { struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES]; unsigned tx_channel_id, tx_wq; };
-struct dpa_iface_info { struct eth_iface_info eth_info; void *tx_proc_entry; };
+struct qm_cgr_cs_thres { u64 bytes; };
+struct qm_mcc_initcgr {
+    unsigned we_mask;
+    struct { unsigned mode, cstd_en, cscn_en; struct qm_cgr_cs_thres cs_thres; } cgr;
+};
+struct qman_cgr { u32 cgrid; };
+struct ethtool_link_ksettings { struct { u32 speed; } base; };
+struct eth_iface_info {
+    struct net_device *net_dev; u32 speed;
+    struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES]; unsigned tx_channel_id, tx_wq;
+    struct qman_cgr fwd_cgr; u32 fwd_cgr_speed;
+};
+struct dpa_iface_info { struct eth_iface_info eth_info; void *tx_proc_entry; const char *name; };
 static struct dpa_iface_info iface;
+static struct net_device netdev;
 static unsigned calls, fail, live, pending, syncs, drains, pauses;
+static bool fault(void);
+/* The congestion group: allocated, set up (with what), held by a lock. */
+static bool cgr_allocated, cgr_tail_drop, devlist_locked;
+static unsigned cgr_releases;
+static u64 cgr_bytes;
+static int dpa_devlist_lock;
+static void spin_lock(int *lock) { assert(lock == &dpa_devlist_lock && !devlist_locked); devlist_locked = true; }
+static void spin_unlock(int *lock) { assert(lock == &dpa_devlist_lock && devlist_locked); devlist_locked = false; }
+static bool netif_carrier_ok(const struct net_device *dev) { return dev->carrier; }
+static int __ethtool_get_link_ksettings(struct net_device *dev, struct ethtool_link_ksettings *ks)
+{ assert(!devlist_locked); ks->base.speed = dev->speed; return 0; }
+static void qm_cgr_cs_thres_set64(struct qm_cgr_cs_thres *th, u64 value, int roundup)
+{ assert(roundup); th->bytes = value; }
+static int qman_alloc_cgrid(u32 *id)
+{
+    if (fault()) return -1;
+    assert(!cgr_allocated && !live); cgr_allocated = true; *id = 77; return 0;
+}
+static void qman_release_cgrid(u32 id)
+{
+    /* QMan refuses (leaks) a group a live FQ still names. */
+    assert(id == 77 && cgr_allocated && !live);
+    cgr_allocated = false; cgr_tail_drop = false; cgr_releases++;
+}
+static int qman_modify_cgr(struct qman_cgr *cgr, u32 flags, struct qm_mcc_initcgr *opts)
+{
+    assert(cgr->cgrid == 77 && cgr_allocated && opts);
+    if (fault()) return -1;
+    if (flags & QMAN_CGR_FLAG_USE_INIT) {
+        /* Set up from scratch, or reset to nothing before the release. */
+        cgr_tail_drop = (opts->we_mask & QM_CGR_WE_CSTD_EN) && opts->cgr.cstd_en == QM_CGR_EN;
+        if (cgr_tail_drop)
+            assert((opts->we_mask & QM_CGR_WE_CSCN_EN) && !opts->cgr.cscn_en && !opts->cgr.mode);
+        else
+            assert(!live);
+    }
+    if (opts->we_mask & QM_CGR_WE_CS_THRES) cgr_bytes = opts->cgr.cs_thres.bytes;
+    return 0;
+}
 static unsigned returned_frames, released_frames, empty_completions;
 static const struct qm_fd *expected_fd;
 static struct qman_fq *proc_fqs[DPAA_FWD_TX_QUEUES];
@@ -87,10 +157,18 @@ static int qman_create_fq(unsigned id, unsigned flags, struct qman_fq *fq)
     assert(!fq->acquired); fq->acquired = true; fq->fqid = fq - iface.eth_info.fwd_tx_fqinfo;
     live++; return 0;
 }
-static int qman_init_fq(struct qman_fq *fq, unsigned flags, void *opts)
+static int qman_init_fq(struct qman_fq *fq, unsigned flags, void *arg)
 {
-    (void)flags; (void)opts;
+    const struct qm_mcc_initfq *opts = arg;
+
+    (void)flags;
     if (fault()) return -1;
+    /* Every forwarding FQ joins the port's group, counting wire bytes. */
+    assert(cgr_allocated && cgr_tail_drop && fq->cb.ern);
+    assert((opts->we_mask & (QM_INITFQ_WE_CGID | QM_INITFQ_WE_OAC)) ==
+           (QM_INITFQ_WE_CGID | QM_INITFQ_WE_OAC));
+    assert((opts->fqd.fq_ctrl & QM_FQCTRL_CGE) && opts->fqd.cgid == 77);
+    assert(opts->fqd.oac_init.oac == QM_OAC_CG && opts->fqd.oac_init.oal == 24);
     fq->state = qman_fq_state_sched; return 0;
 }
 static void qman_destroy_fq(struct qman_fq *fq, unsigned flags)
@@ -163,16 +241,42 @@ static void usleep_range(unsigned min, unsigned max) { (void)min; (void)max; ass
 #include "cdx_queues.inc"
 int main(void)
 {
-    for (unsigned n = 1; n <= DPAA_FWD_TX_QUEUES * 3; n++) {
+    /* Two calls set up the group, then three per FQ. */
+    for (unsigned n = 1; n <= DPAA_FWD_TX_QUEUES * 3 + 2; n++) {
         memset(&iface, 0, sizeof(iface)); calls = pauses = 0; fail = n;
-        assert(create_fwd_tx_fqs(&iface)); assert(!live);
+        netdev = (struct net_device){ .carrier = n % 2, .speed = 1000 };
+        iface.eth_info.net_dev = &netdev; iface.eth_info.speed = 10000; iface.name = "eth4";
+        unsigned released = cgr_releases;
+        assert(create_fwd_tx_fqs(&iface)); assert(!live && !cgr_allocated);
+        /* A group that was allocated went back exactly once. */
+        assert(cgr_releases == released + (n > 1));
         calls = pauses = fail = 0;
         assert(!create_fwd_tx_fqs(&iface)); assert(live == DPAA_FWD_TX_QUEUES);
+        /* Sized for the link as it runs, and for the MAC's fastest while
+         * there is none: microseconds times Mbit/s is bits. */
+        assert(cgr_tail_drop && !devlist_locked);
+        assert(iface.eth_info.fwd_cgr_speed == (netdev.carrier ? 1000u : 10000u));
+        assert(cgr_bytes == (u64)iface.eth_info.fwd_cgr_speed * 2000 / 8);
         unsigned before = syncs;
         destroy_fwd_tx_fqs(&iface);
-        assert(!live && syncs == before + 1);
+        assert(!live && syncs == before + 1 && !cgr_allocated && !iface.eth_info.fwd_cgr_speed);
+        assert(cgr_releases == released + (n > 1) + 1);
         for (unsigned i = 0; i < DPAA_FWD_TX_QUEUES; i++) assert(!proc_fqs[i]);
     }
+    /* A slow link still holds a few jumbo frames. */
+    memset(&iface, 0, sizeof(iface)); calls = pauses = fail = 0;
+    netdev = (struct net_device){ .carrier = true, .speed = 100 };
+    iface.eth_info.net_dev = &netdev; iface.eth_info.speed = 1000; iface.name = "eth0";
+    assert(!create_fwd_tx_fqs(&iface) && cgr_bytes == 64 * 1024);
+    /* A rejected software enqueue goes back to its pool. */
+    struct qm_mr_entry ern = { .ern.fd = { .bpid = 3, .addr = 0x1000 } };
+    unsigned released_before = released_frames;
+    expected_fd = &ern.ern.fd;
+    iface.eth_info.fwd_tx_fqinfo[0].cb.ern(NULL, &iface.eth_info.fwd_tx_fqinfo[0], &ern);
+    expected_fd = NULL;
+    assert(released_frames == released_before + 1);
+    destroy_fwd_tx_fqs(&iface);
+    assert(!live && !cgr_allocated);
     struct dpa_fq *head = NULL;
     unsigned before = syncs;
     for (unsigned i = 0; i < 3; i++) {
@@ -188,8 +292,8 @@ int main(void)
     cdx_destroy_fq_list(&head);
     assert(syncs == before + 1);
     assert(drains && syncs && empty_completions && released_frames);
-    assert(returned_frames == released_frames);
-    printf("CDX queues: %u partial-creation faults, %u frames released, %u empty completions; asynchronous retirement, drain and retry passed\n",
-           DPAA_FWD_TX_QUEUES * 3, released_frames, empty_completions);
+    assert(returned_frames + 1 == released_frames);
+    printf("CDX queues: %u partial-creation faults, %u frames released, %u empty completions; congestion group, asynchronous retirement, drain and retry passed\n",
+           DPAA_FWD_TX_QUEUES * 3 + 2, released_frames, empty_completions);
     return 0;
 }
