@@ -39,7 +39,10 @@ struct ft_backend {
 	uint32_t qos_mark_mask;
 };
 
-/* Read-only probe with a five-second deadline, including blocked kernel reads. */
+/* Read-only probe with a five-second deadline, including blocked kernel reads.
+ * Returns 0, -1 for a failed or late probe, or FT_HEALTH_TERMINAL when CDX
+ * has latched a failure only a reboot clears. */
+#define FT_HEALTH_TERMINAL (-2)
 int ft_health(struct ft_ctx *ctx);
 bool ft_terminal_reason(char *reason, size_t n);
 /* Optional U-Boot budget hooks for the platform watchdog manager. */

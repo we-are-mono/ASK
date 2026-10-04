@@ -5,8 +5,26 @@ platform=$1
 read -r uptime rest < /proc/uptime
 started=${uptime%%.*}
 cleared=0
+# A terminal latch resets at once. Any other failure resets only once it
+# persists: one slow probe of a live datapath must not cost a reboot and a
+# recovery attempt. Three misses span about 30 s at the 5 s cadence.
+misses=0
+max_misses=3
 
-while ask-flowtable health; do
+while :; do
+	status=0
+	ask-flowtable health || status=$?
+	if [ "$status" = 0 ]; then
+		misses=0
+	elif [ "$status" = 2 ]; then
+		break
+	else
+		misses=$((misses + 1))
+		[ "$misses" -lt "$max_misses" ] || break
+		logger -t ask-recovery "health check failed ($misses of $max_misses)" || :
+	fi
+	# Fed while this process runs, misses included: the watchdog covers a hung
+	# monitor, and the miss count covers the datapath.
 	case "$platform" in
 		systemd) systemd-notify --ready WATCHDOG=1 ;;
 		openwrt) ubus -t 5 call service watchdog \
@@ -14,7 +32,7 @@ while ask-flowtable health; do
 		*) exit 2 ;;
 	esac
 	read -r uptime rest < /proc/uptime
-	if [ "$cleared" = 0 ] && [ "$((${uptime%%.*} - started))" -ge 3600 ]; then
+	if [ "$cleared" = 0 ] && [ "$misses" = 0 ] && [ "$((${uptime%%.*} - started))" -ge 3600 ]; then
 		# One attempt to clear after an hour of successful probes. A write
 		# failure leaves the conservative boot budget in place for repair.
 		ask-flowtable recovery-clear || logger -t ask-recovery 'could not clear boot budget'

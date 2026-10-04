@@ -18,11 +18,18 @@ enable automatic recovery because fault tests deliberately stop the datapath.
   exhausted or the watchdog unavailable, leave ASK disabled and Linux networking
   available; keep the OS watchdog running.
 
-`ask-flowtable health` returns 0 while networking is responsive, and 1 on a
-terminal CDX latch, invalid diagnostics, or a five-second probe timeout. It
-checks RTNL even when no flow exists. Recoverable in-place datapath restarts
-are allowed. A blocked kernel reader cannot prevent the command's parent from
-reporting failure.
+`ask-flowtable health` returns 0 while networking is responsive, 2 on a
+terminal CDX latch, and 1 on invalid diagnostics or a five-second probe
+timeout. It checks RTNL even when no flow exists. Recoverable in-place datapath
+restarts are allowed. A blocked kernel reader cannot prevent the command's
+parent from reporting failure.
+
+The monitor resets the platform at once on a terminal latch, and after three
+consecutive failed probes otherwise. A slow but live datapath (a probe over its
+deadline, a transient diagnostics error) therefore costs no reboot and no
+recovery attempt unless it persists for about half a minute. The monitor keeps
+feeding the service watchdog meanwhile, since it is itself running; a hung
+monitor still lets the watchdog expire.
 
 `recovery-arm` reserves one recovery attempt per kernel boot in the separate
 U-Boot variable `ask_recovery` (`count boot-UUID reason`). Return 2 means three unconfirmed boots have already been

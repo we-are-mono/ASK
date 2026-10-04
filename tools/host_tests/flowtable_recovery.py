@@ -31,10 +31,11 @@ def test_platform_health_and_reboot_budget(controller):
     reason = c.root / "cdx/parameters/flowtable_terminal_reason"
     reason.parent.mkdir()
     reason.write_text("restart budget exhausted\n")
+    # A terminal latch answers 2, which the monitor resets on at once.
     failed = c.run("health", check=False)
-    assert failed.returncode == 1 and "restart budget exhausted" in failed.stderr
+    assert failed.returncode == 2 and "restart budget exhausted" in failed.stderr
     (c.root / "backend").unlink()
-    assert c.run("health", check=False).returncode == 1  # CDX still owns the latch
+    assert c.run("health", check=False).returncode == 2  # CDX still owns the latch
     reason.write_text("")
     c.run("health")  # deliberately unloaded ASK, ordinary Linux networking
     (c.root / "backend").write_text("fatal_terminal 0\n")

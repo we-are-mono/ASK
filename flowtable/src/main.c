@@ -660,8 +660,12 @@ int main(int argc, char **argv)
 	 * parse error): take a clean error from run(), not SIGPIPE death. */
 	signal(SIGPIPE, SIG_IGN);
 
-	if (!strcmp(cmd, "health"))
-		return ft_health(&ctx) ? (fprintf(stderr, "ask-flowtable: %s\n", ctx.err), 1) : 0;
+	if (!strcmp(cmd, "health")) {
+		int rc = ft_health(&ctx);
+		if (!rc) return 0;
+		fprintf(stderr, "ask-flowtable: %s\n", ctx.err);
+		return rc == FT_HEALTH_TERMINAL ? 2 : 1;
+	}
 	if (!strncmp(cmd, "recovery-", 9)) {
 		int rc = ft_recovery(&ctx, cmd + 9);
 		if (rc) fprintf(stderr, "ask-flowtable: %s\n", ctx.err);

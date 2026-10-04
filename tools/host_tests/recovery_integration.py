@@ -16,9 +16,14 @@ def test_platform_recovery_hooks(tmp_path):
 echo "ask $*" >> "$TEST_ROOT/calls"
 case "$1" in
  health)
-  [ ! -e "$TEST_ROOT/probed" ] || exit 1
-  touch "$TEST_ROOT/probed"
-  echo '3601.0 0.0' > "$TEST_ROOT/uptime" ;;
+  # One status per probe from HEALTH_SEQ, the last repeated; the first
+  # probe moves the clock past the hour the budget clear waits for.
+  n=$(($(cat "$TEST_ROOT/probed" 2>/dev/null || echo 0) + 1))
+  echo "$n" > "$TEST_ROOT/probed"
+  echo '3601.0 0.0' > "$TEST_ROOT/uptime"
+  set -- ${HEALTH_SEQ:-0 1}
+  [ "$n" -le "$#" ] && i=$n || i=$#
+  eval "exit \\${$i}" ;;
  recovery-arm) exit "${ARM_STATUS:-0}" ;;
 esac
 ''',
@@ -29,7 +34,7 @@ case "$*" in *'"stop":false'*) echo "${WDT_START_STATUS:-offline}"; exit 0 ;; es
 echo "${WDT_STATUS:-running}"
 ''',
         "jsonfilter": '#!/bin/sh\ncat\n',
-        "logger": '#!/bin/sh\nexit 0\n',
+        "logger": '#!/bin/sh\necho "log $*" >> "$TEST_ROOT/calls"\n',
         "sleep": '#!/bin/sh\n[ "$1" = 5 ]\n',
         "reboot": '#!/bin/sh\necho unexpected-reboot >> "$TEST_ROOT/calls"\nexit 1\n',
     }
@@ -40,15 +45,34 @@ echo "${WDT_STATUS:-running}"
     monitor = tmp_path / "monitor"
     monitor.write_text((ROOT / "integration/ask-recovery-monitor").read_text().replace(
         "/proc/uptime", str(uptime)))
-    for platform in ("systemd", "openwrt"):
+    def monitor_run(platform, sequence):
         uptime.write_text("0.0 0.0\n")
         (tmp_path / "probed").unlink(missing_ok=True)
         log.write_text("")
-        result = run_process(["sh", str(monitor), platform], env=env, capture_output=True, timeout=5)
+        result = run_process(["sh", str(monitor), platform], env={**env, "HEALTH_SEQ": sequence},
+                             capture_output=True, timeout=5)
+        return result, log.read_text()
+
+    for platform in ("systemd", "openwrt"):
+        # A failing datapath resets on its third consecutive miss, having
+        # fed the watchdog through the first two.
+        result, calls = monitor_run(platform, "0 1")
         assert result.returncode == 1, result.stderr
-        calls = log.read_text()
-        assert calls.count("ask health") == 2 and calls.count("ask recovery-clear") == 1, calls
-        assert "unexpected-reboot" not in calls
+        assert calls.count("ask health") == 4 and calls.count("ask recovery-clear") == 1, calls
+        assert calls.count("health check failed") == 2 and "unexpected-reboot" not in calls
+        # A terminal latch resets on the probe that reports it.
+        result, terminal = monitor_run(platform, "0 2")
+        assert result.returncode == 1 and terminal.count("ask health") == 2, terminal
+        assert "health check failed" not in terminal
+        # Misses that a successful probe interrupts are forgiven, and the
+        # budget is cleared only on a successful probe.
+        result, recovered = monitor_run(platform, "1 1 0 1 1 2")
+        assert result.returncode == 1 and recovered.count("ask health") == 6, recovered
+        assert recovered.count("health check failed") == 4
+        assert recovered.count("ask recovery-clear") == 1
+        lines = recovered.splitlines()
+        cleared = lines.index("ask recovery-clear")
+        assert sum(line == "ask health" for line in lines[:cleared]) == 3, recovered
         if platform == "systemd":
             assert "notify --ready WATCHDOG=1" in calls
             assert "ask recovery-failed" not in calls  # native OnFailure unit owns it

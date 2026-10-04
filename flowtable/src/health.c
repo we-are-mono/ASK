@@ -34,7 +34,7 @@ static int probe(struct ft_ctx *ctx)
 	if (!terminal && ft_backend_read(ctx, &b)) return -1;
 	if (terminal || b.fatal_terminal) {
 		snprintf(ctx->err, sizeof(ctx->err), "datapath requires reboot: %s", reason);
-		return -1;
+		return FT_HEALTH_TERMINAL;
 	}
 	/* A single RTM_GETLINK takes RTNL in the pinned kernel, including when
 	 * no hardware flow is installed. Acquiring RTNL can block inside
@@ -69,23 +69,30 @@ error:
 
 int ft_health(struct ft_ctx *ctx)
 {
+	/* What the probe concluded and why, in one write: a reply either
+	 * arrives whole or the deadline answers instead. */
+	struct { int rc; char err[sizeof(ctx->err)]; } reply;
 	int p[2], rc = -1;
 	if (pipe2(p, O_CLOEXEC)) goto error;
 	pid_t child = fork();
 	if (child < 0) { close(p[0]); close(p[1]); goto error; }
 	if (!child) {
 		close(p[0]);
-		if (!probe(ctx)) ctx->err[0] = 0;
-		(void)write(p[1], ctx->err, sizeof(ctx->err));
+		reply.rc = probe(ctx);
+		if (!reply.rc) ctx->err[0] = 0;
+		memcpy(reply.err, ctx->err, sizeof(reply.err));
+		(void)write(p[1], &reply, sizeof(reply));
 		_exit(0);
 	}
 	close(p[1]);
 	struct pollfd event = {.fd = p[0], .events = POLLIN};
 	int ready = poll(&event, 1, FT_HEALTH_TIMEOUT_MS);
-	if (ready > 0 && read(p[0], ctx->err, sizeof(ctx->err)) == sizeof(ctx->err))
-		rc = ctx->err[0] ? -1 : 0;
-	else
+	if (ready > 0 && read(p[0], &reply, sizeof(reply)) == sizeof(reply)) {
+		memcpy(ctx->err, reply.err, sizeof(ctx->err));
+		rc = reply.rc;
+	} else {
 		snprintf(ctx->err, sizeof(ctx->err), "datapath health probe failed or exceeded its deadline");
+	}
 	/* The unreaped child pins its PID. Never wait for an unkillable RTNL
 	 * reader: return failure so the platform can reset the hardware. */
 	kill(child, SIGKILL);
