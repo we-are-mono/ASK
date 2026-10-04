@@ -45,6 +45,7 @@
 #define __GFP_COMP 1
 #define PAGE_SIZE 4096
 #define DMA_BIDIRECTIONAL 0
+#define DMA_TO_DEVICE 1
 #define SMP_CACHE_BYTES 64
 #define ALIGN(n, a) (((n) + (a) - 1) & ~((a) - 1))
 #define DPAA_EXTRA_BUF_SIZE_4_SKB 128
@@ -58,7 +59,11 @@
 #define pr_err_ratelimited(...) do { } while (0)
 #define dev_err(...) do { } while (0)
 #define pr_debug(...) do { } while (0)
-#define pr_warn_ratelimited(...) do { } while (0)
+/* Counted: an SA release says out loud what it waits on. */
+static unsigned warnings, warn_ons;
+#define pr_warn_ratelimited(fmt, ...) ((void)sizeof(printf(fmt, ##__VA_ARGS__)), warnings++)
+#define pr_info(...) do { } while (0)
+#define WARN_ON_ONCE(c) ({ bool c_ = (c); if (c_) warn_ons++; c_; })
 #define DPAIPSEC_INFO(...) do { } while (0)
 #define DPAIPSEC_ERROR(...) do { } while (0)
 #define EXPORT_SYMBOL(x)
@@ -83,9 +88,13 @@ static int ipsec_bpid = -1;
 #define QMAN_FQ_STATE_CHANGING 1
 #define QMAN_FQ_STATE_ORL 2
 #define QMAN_FQ_STATE_NE 4
+#define QMAN_FQ_STATE_VDQCR 8
 #define QMAN_VOLATILE_FLAG_WAIT 1
 #define QMAN_VOLATILE_FLAG_FINISH 2
 #define QM_VDQCR_NUMFRAMES_TILLEMPTY 1
+#define QM_DQRR_STAT_FQ_EMPTY 0x80
+#define QM_DQRR_STAT_DQCR_EXPIRED 0x01
+#define QM_DQRR_STAT_FD_VALID 0x10
 #define QM_CGR_WE_CSCN_EN 1
 #define QM_CGR_WE_CS_THRES 2
 #define QM_CGR_WE_MODE 4
@@ -93,13 +102,40 @@ static int ipsec_bpid = -1;
 #define QM_CGR_EN 1
 #define QMAN_CGR_FLAG_USE_INIT 1
 
+typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
+typedef uint64_t U64;
+typedef uint32_t U32;
+typedef uint16_t U16;
+typedef uint8_t U8;
 typedef uintptr_t dma_addr_t;
 typedef int cpumask_t;
 #define for_each_cpu(i, mask) for ((i) = 0; (i) < *(mask); (i)++)
-struct device { int unused; };
+#define READ_ONCE(x) (x)
+#define BIT(n) (1u << (n))
+/* Jiffies, which the harness moves a timer period per tick. */
+#define HZ 100
+static unsigned long jiffies = 1000;
+#define time_before(a, b) ((long)((a) - (b)) < 0)
+#define time_after_eq(a, b) ((long)((a) - (b)) >= 0)
+#define jiffies_to_msecs(j) ((unsigned)(j) * 1000 / HZ)
+#define rmb() do { } while (0)
+struct device { struct device *parent; void *drvdata; };
+static void *dev_get_drvdata(struct device *dev) { return dev->drvdata; }
+/* The frame descriptors an SA queue holds or QMan hands back. */
+enum qm_fd_format { qm_fd_contig, qm_fd_sg };
+struct qm_fd { enum qm_fd_format format; unsigned bpid; dma_addr_t addr; };
+#define qm_fd_addr(fd) ((fd)->addr)
+#define qm_fd_addr_get64(fd) ((fd)->addr)
+struct qm_dqrr_entry { unsigned stat, fqid; struct qm_fd fd; };
+struct qm_mr_entry { struct { unsigned rc; struct qm_fd fd; } ern; };
+enum qman_cb_dqrr_result { qman_cb_dqrr_consume, qman_cb_dqrr_stop };
+struct qman_portal { int unused; };
+typedef struct { int counter; } atomic_t;
+#define ATOMIC_INIT(n) { (n) }
+static int atomic_inc_return(atomic_t *v) { return ++v->counter; }
 struct sec_descriptor { char data[128]; };
 typedef struct { void *proc_dir; } cdx_proc_dir_entry_t;
 struct sk_buff { void *head; bool head_frag; };
@@ -129,10 +165,17 @@ static struct { struct { bool mutex; } ctrl; } cdx_instance = { { true } }, *cdx
 static unsigned datapath_epoch = 1;
 static unsigned cdx_ft_epoch(void) { assert(cdx_info->ctrl.mutex); return datapath_epoch; }
 enum qman_fq_state { qman_fq_state_oos, qman_fq_state_sched, qman_fq_state_retired };
+/* A queue with the frames it holds, which retirement leaves on it and a
+ * volatile dequeue delivers through its callback. */
 struct qman_fq {
-    unsigned fqid, flags, pending; bool acquired, proc;
+    unsigned fqid, flags, pending, held; bool acquired, proc;
+    struct qm_fd frames[4];
     enum qman_fq_state state;
-    struct { void (*dqrr)(void); void (*ern)(void); } cb;
+    struct {
+        enum qman_cb_dqrr_result (*dqrr)(struct qman_portal *, struct qman_fq *,
+                                         const struct qm_dqrr_entry *);
+        void (*ern)(struct qman_portal *, struct qman_fq *, const struct qm_mr_entry *);
+    } cb;
 };
 struct dpa_fq {
     struct qman_fq fq_base; struct list_head list;
@@ -314,8 +357,30 @@ static struct dpa_iface_info *dpa_get_ohifinfo_by_portid(unsigned id)
 { return fault() ? NULL : &iface; }
 static int get_oh_port_pcd_fqinfo(unsigned fm, int handle, unsigned dist, unsigned *base, unsigned *count)
 { if (fault()) return -EIO; *base = dist * 4; *count = 4; return 0; }
-static void ipsec_exception_pkt_handler(void) { }
-static void dpa_ipsec_ern_cb(void) { }
+/* What a frame an SA queue gave back was dropped as: a software SEC input
+ * through the SEC SG release, anything else through the common release. */
+static unsigned sg_releases, fd_releases, cp_drops;
+static void dpaa_sec_sg_release(const struct qm_fd *fd, bool free_skb)
+{
+    assert(free_skb && fd->format == qm_fd_sg && fd->bpid == skb_2bfreed_bpool_g->bpid);
+    assert(fd->addr && sg_bpool_g);
+    sg_releases++;
+}
+struct net_device;
+static void dpa_fd_release(const struct net_device *dev, const struct qm_fd *fd)
+{ assert(!dev && fd->addr); fd_releases++; }
+/* The SA whose release is under way, which the CPU receive callback cannot
+ * resolve any more: it marked itself SA_DELETE first. */
+static U16 *releasing_flags;
+static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *qm,
+        struct qman_fq *fq, const struct qm_dqrr_entry *dq)
+{
+    if (dq->stat & QM_DQRR_STAT_FD_VALID) {
+        assert(releasing_flags && (*releasing_flags & SA_DELETE));
+        cp_drops++;
+    }
+    return qman_cb_dqrr_consume;
+}
 static bool try_module_get(void *module)
 { if (module_going) return false; module_refs++; return true; }
 static void __module_get(void *module) { assert(module_refs); module_refs++; }
@@ -357,33 +422,75 @@ static void qman_destroy_fq(struct qman_fq *fq, unsigned flags)
     assert(!callbacks && queues && fq_registry[fq->fqid] == fq);
     fq_registry[fq->fqid] = NULL; fq->acquired = false; queues--;
 }
+/* Retirement completes immediately, or after this many looks at the queue;
+ * a PCD queue always retires holding a frame. */
+static bool retire_at_once;
+static unsigned retire_looks = 2, vdq_busy;
+static void retired(struct qman_fq *fq)
+{
+    fq->flags &= ~QMAN_FQ_STATE_CHANGING; fq->state = qman_fq_state_retired;
+    if (fq->fqid < 512 || fq->held) fq->flags |= QMAN_FQ_STATE_NE;
+}
 static void qman_fq_state(struct qman_fq *fq, enum qman_fq_state *state, u32 *flags)
 {
     assert(fq->acquired && ipsecinfo.ipsec_bp);
     assert(fq->fqid >= 512 ? module_refs > 0 : !dpa_ipsec_ready);
     if (fq->flags & QMAN_FQ_STATE_CHANGING) {
-        if (!fq->pending--) { fq->flags &= ~QMAN_FQ_STATE_CHANGING; fq->state = qman_fq_state_retired; }
+        if (!fq->pending--) retired(fq);
     }
-    *state = fq->state; *flags = fq->flags;
+    if (state) *state = fq->state;
+    if (flags) *flags = fq->flags;
 }
 static int qman_retire_fq(struct qman_fq *fq, void *flags)
 {
+    /* Only a scheduled queue, and never one already retiring. */
+    assert(fq->state == qman_fq_state_sched && !(fq->flags & QMAN_FQ_STATE_CHANGING));
     if (retires_failed) { retires_failed--; return -EIO; }
+    if (retire_at_once) { retired(fq); return 0; }
     fq->flags = QMAN_FQ_STATE_CHANGING;
-    if (fq->fqid < 512) fq->flags |= QMAN_FQ_STATE_NE;
-    fq->pending = 2; return 1;
+    fq->pending = retire_looks; return 1;
+}
+/* The portal delivering a volatile dequeue: every frame left, then the entry
+ * that finds the queue empty and ends the command. */
+static void vdq_deliver(struct qman_fq *fq)
+{
+    struct qm_dqrr_entry dq = { .fqid = fq->fqid };
+    assert(fq->flags & QMAN_FQ_STATE_VDQCR);
+    for (unsigned i = 0; i < fq->held; i++) {
+        dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd = fq->frames[i];
+        assert(fq->cb.dqrr(NULL, fq, &dq) == qman_cb_dqrr_consume);
+    }
+    fq->held = 0;
+    dq.stat = QM_DQRR_STAT_FQ_EMPTY | QM_DQRR_STAT_DQCR_EXPIRED;
+    memset(&dq.fd, 0, sizeof(dq.fd));
+    assert(fq->cb.dqrr(NULL, fq, &dq) == qman_cb_dqrr_consume);
+    fq->flags &= ~(QMAN_FQ_STATE_NE | QMAN_FQ_STATE_VDQCR);
+    callbacks++;
 }
 static int qman_volatile_dequeue(struct qman_fq *fq, unsigned flags, unsigned count)
 {
     assert(ipsecinfo.ipsec_bp && dpa_bp_array[2] == ipsecinfo.ipsec_bp);
     assert(fq->cb.dqrr && fq->state == qman_fq_state_retired);
-    fq->flags &= ~QMAN_FQ_STATE_NE;
-    callbacks++; return 0;
+    assert(count == QM_VDQCR_NUMFRAMES_TILLEMPTY && !(fq->flags & QMAN_FQ_STATE_VDQCR));
+    if (vdq_busy && !(flags & QMAN_VOLATILE_FLAG_WAIT)) { vdq_busy--; return -EBUSY; }
+    fq->flags |= QMAN_FQ_STATE_VDQCR;
+    /* Waiting for the finish: the frames are delivered before it returns.
+     * Otherwise later, when the portal is next polled. */
+    if (flags & QMAN_VOLATILE_FLAG_FINISH) vdq_deliver(fq);
+    return 0;
+}
+static void portal_poll(void)
+{
+    for (unsigned i = 0; i < 1024; i++)
+        if (fq_registry[i] && (fq_registry[i]->flags & QMAN_FQ_STATE_VDQCR))
+            vdq_deliver(fq_registry[i]);
 }
 static int qman_oos_fq(struct qman_fq *fq)
 {
     if (oos_failed) { oos_failed--; return -EBUSY; }
     assert(fq->state == qman_fq_state_retired && !fq->flags);
+    /* A frame QMan holds that the queue's state did not show: refused. */
+    if (fq->held) return -EBUSY;
     if (fq->fqid >= 512) callbacks++;
     fq->state = qman_fq_state_oos; return 0;
 }
@@ -422,13 +529,6 @@ static bool cdx_dpa_init_fault(void) { return fault(); }
 static int dpa_cfg_shared_icid(void) { return fault() ? -EINVAL : 63; }
 static void register_cdx_deinit_func(void (*cb)(void))
 { registrations++; exit_callback = cb; }
-static bool sec_busy;
-static bool cdx_ipsec_wait_sec_idle(void)
-{
-    for (unsigned i = 512; i < 515; i++)
-        assert(fq_registry[i] && fq_registry[i]->state == qman_fq_state_oos);
-    return !sec_busy;
-}
 static bool barrier_fail, fatal;
 static unsigned barriers;
 static void *dpa_get_ehash_td(void) { return &iface; }
@@ -442,6 +542,66 @@ static int ExternalHashTableFmPcdHcSync(void *td)
 static void cdx_ft_fatal(void) { fatal = true; }
 static bool cdx_ft_failed(void) { return fatal; }
 void cdx_dpa_ipsec_exit(void);
+
+/* SEC as its controller registers show it: CSTA[IDLE], the performance
+ * counters and MCFGR, reached from the job ring's parent device. The
+ * dequeued-request counter also moves for job-ring work, which proves nothing
+ * of the queue interface. Every look reads CSTA once. */
+struct caam_ctrl {
+    u32 mcr;
+    struct { u64 req_dequeued, ob_enc_req, ib_dec_req; u32 status; } perfmon;
+};
+struct caam_drv_private { struct caam_ctrl *ctrl; };
+static struct caam_ctrl caam;
+static struct caam_drv_private caam_priv = { &caam };
+static struct device caam_dev = { .drvdata = &caam_priv }, job_ring = { .parent = &caam_dev };
+static struct device *jrdev_g = &job_ring;
+static unsigned sec_looks;
+static u32 rd_reg32(const u32 *reg)
+{
+    if (reg == &caam.perfmon.status) sec_looks++;
+    return *reg;
+}
+#define rd_reg64(p) (*(p))
+/* SEC finishing IPsec protocol requests, outbound and inbound. */
+static void sec_protocol(void) { caam.perfmon.ob_enc_req += 2; caam.perfmon.ib_dec_req++; }
+/* SEC RM: CSTA[IDLE] is bit 1; the others here are status SEC also reports. */
+static void sec_set(bool idle, bool watchdog)
+{
+    caam.perfmon.status = BIT(10) | BIT(8) | (idle ? BIT(1) : 0);
+    caam.mcr = 0x3000 | (watchdog ? MCFGR_WDENABLE : 0);
+}
+
+/* The deletion timer: one armed entry, run a period at a time. */
+typedef struct timer_entry_t { int (*handler)(struct timer_entry_t *); } TIMER_ENTRY;
+static TIMER_ENTRY *armed;
+static void cdx_timer_init(TIMER_ENTRY *t, int (*handler)(TIMER_ENTRY *))
+{ assert(!armed); t->handler = handler; }
+static void cdx_timer_add(TIMER_ENTRY *t, unsigned long period)
+{ assert(!armed && t->handler && period == SA_CTX_RELEASE_TIMER_VAL); armed = t; }
+
+/* The SA entry, with what its release reads and writes. */
+typedef struct {
+    TIMER_ENTRY deletion_timer;
+    U8 release_state, release_flags;
+    unsigned long release_step, release_t0;
+    U64 release_protocol;
+    U16 flags, handle;
+    PDpaSecSAContext pSec_sa_context;
+    bool linked;
+} SAEntry, *PSAEntry;
+#define container_of(p, t, m) ((t *)((char *)(p) - __builtin_offsetof(t, m)))
+static unsigned fp_deletes, entries;
+static int cdx_ipsec_delete_fp_entry(PSAEntry sa) { assert(sa->flags & SA_DELETE); fp_deletes++; return 0; }
+static void sa_remove_from_list_fqid(PSAEntry sa) { assert(sa->linked && sa->pSec_sa_context); sa->linked = false; }
+static void sa_free(PSAEntry sa)
+{ assert(!sa->linked && !sa->pSec_sa_context && entries); entries--; releasing_flags = NULL; free(sa); }
+#define MAX_CIPHER_KEY_LEN 100
+#define MAX_AUTH_KEY_LEN 256
+#define Heap_Alloc(size) kzalloc(size, 0)
+#define log_err(...) do { } while (0)
+#define kfree_sensitive kfree
+static void cdx_ipsec_capture_post_free(void *p, size_t n) { }
 #include "ipsec_lifecycle.inc"
 
 static void clean(void)
@@ -459,6 +619,7 @@ static void reset(void)
 {
     clean(); steps = fail_step = seed_step = seed_fail = pauses = registrations = 0;
     retires_failed = oos_failed = cgr_deletes_failed = 0;
+    warnings = warn_ons = 0;
     seed_failure = NULL; exit_callback = NULL;
     module_going = false;
 }
@@ -489,11 +650,14 @@ static unsigned normal(void)
     return count;
 }
 
-static void sa_retired(struct dpa_ipsec_sainfo *sa)
+/* Every queue of an SA out of service the way its release takes them: a
+ * step at a time, never waiting, with the portal polled between steps. */
+static void sa_stopped(struct dpa_ipsec_sainfo *sa)
 {
     for (unsigned i = 0; i < NUM_FQS_PER_SA; i++) {
-        sa->sec_fq[i].fq_base.state = qman_fq_state_retired;
-        sa->sec_fq[i].fq_base.flags = 0;
+        unsigned tries = 0;
+        while (cdx_dpa_ipsec_fq_stop(sa, i)) { portal_poll(); assert(++tries < 8); }
+        assert(sa->sec_fq[i].fq_base.state == qman_fq_state_oos);
     }
 }
 
@@ -506,25 +670,20 @@ static unsigned sa_lifecycle(void)
     struct dpa_ipsec_sainfo *sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
     assert(sa && module_refs == 1 && queues == 15);
     unsigned count = steps;
-    sa_retired(sa);
-    oos_failed = 1;
-    assert(cdx_dpa_ipsecsa_release(sa) == FAILURE);
-    assert(module_refs == 1 && sa_range && ipsecinfo.ipsec_exception_fq);
+    /* Reached with a queue still in service, the release frees nothing:
+     * QMan's callbacks and SEC may still use all of it. */
+    assert(cdx_dpa_ipsecsa_release(sa) == FAILURE && warn_ons == 1);
+    assert(module_refs == 1 && sa_range && tags == 1 && queues == 15);
+    assert(ipsecinfo.ipsec_exception_fq);
+    warn_ons = 0;
+    /* A refused retirement or out-of-service step is asked for again. */
+    retires_failed = 1; oos_failed = 1;
+    sa_stopped(sa);
+    assert(!retires_failed && !oos_failed && warnings == 2);
+    warnings = 0;
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
     assert(!module_refs && !sa_range && !tags && !ipsecinfo.ipsec_exception_fq);
     assert(allocs == baseline && queues == 12);
-
-    /* Queue retirement does not prove that SEC finished its accepted job.
-     * No descriptor, queue, tag or module ownership can go on a failed proof. */
-    sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
-    assert(sa); sa_retired(sa); sec_busy = true;
-    unsigned retained_allocs = allocs;
-    assert(cdx_dpa_ipsecsa_release(sa) == FAILURE);
-    assert(module_refs == 1 && tags == 1 && sa_range && queues == 15);
-    assert(allocs == retained_allocs && ipsecinfo.ipsec_exception_fq);
-    /* Model a hardware reset solely to release the harness's allocations. */
-    sec_busy = false; callbacks = 0; sa_retired(sa);
-    assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && !tags);
 
     /* An SA whose classifier entry could not be proven gone holds its FQIDs
      * past its release, until the datapath restart that settles the entry:
@@ -533,7 +692,7 @@ static unsigned sa_lifecycle(void)
     sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
     assert(sa);
     cdx_dpa_ipsecsa_keep_fqids(sa);
-    sa_retired(sa);
+    sa_stopped(sa);
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
     assert(module_refs == 1 && tags == 1 && sa_range && allocs == baseline + 1);
     assert(cdx_dpa_ipsec_release_held_fqids() == 1 && !sa_range && allocs == baseline);
@@ -542,14 +701,14 @@ static unsigned sa_lifecycle(void)
     assert(sa);
     cdx_dpa_ipsecsa_keep_fqids(sa);
     datapath_epoch++;
-    sa_retired(sa);
+    sa_stopped(sa);
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && !sa_range && allocs == baseline);
     /* Held with nothing to record them in, they are lost with the SA rather
      * than handed to the next one. Only a reset gets them back. */
     sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
     assert(sa);
     cdx_dpa_ipsecsa_keep_fqids(sa);
-    sa_retired(sa);
+    sa_stopped(sa);
     seed_failure = "head"; seed_step = 0; seed_fail = 1;
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && sa_range && allocs == baseline);
     seed_failure = NULL; seed_step = seed_fail = 0;
@@ -565,7 +724,7 @@ static unsigned sa_lifecycle(void)
     sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
     assert(sa);
     u16 held_tag = sa->key_tag;
-    sa_retired(sa); barrier_fail = true;
+    sa_stopped(sa); barrier_fail = true;
     unsigned previous_barriers = barriers;
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
     assert(fatal && barriers == previous_barriers + 1 && module_refs == 1);
@@ -583,7 +742,7 @@ static unsigned sa_lifecycle(void)
     /* An uncertain dependent-flow delete also pins the identity, even
      * when the SA root and its final barrier both succeed. */
     sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
-    assert(sa); sa_retired(sa); fatal = true;
+    assert(sa); sa_stopped(sa); fatal = true;
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS);
     assert(module_refs == 1 && tags == 1 && sa_range);
     fatal = false;
@@ -602,7 +761,7 @@ static unsigned sa_lifecycle(void)
     sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
     assert(sa);
     cdx_dpa_ipsecsa_keep_fqids(sa);
-    sa_retired(sa);
+    sa_stopped(sa);
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && sa_range && allocs == baseline + 1);
     cdx_dpa_ipsec_held_fqids_exit(true);
     assert(!sa_range && allocs == baseline);
@@ -610,7 +769,7 @@ static unsigned sa_lifecycle(void)
     sa = cdx_dpa_ipsecsa_alloc(&ipsecinfo, 42);
     assert(sa);
     cdx_dpa_ipsecsa_keep_fqids(sa);
-    sa_retired(sa);
+    sa_stopped(sa);
     assert(cdx_dpa_ipsecsa_release(sa) == SUCCESS && module_refs == 1);
     assert(cdx_dpa_ipsec_release_held_fqids() == 1 && !module_refs);
     module_going = true;
@@ -619,6 +778,280 @@ static unsigned sa_lifecycle(void)
     cdx_dpa_ipsec_held_fqids_exit(true);
     clean();
     return count + 3;
+}
+
+/* An SA's release as its deletion timer drives it (A308): a step per timer
+ * period, waiting as long as a queue or SEC needs, never giving up and never
+ * freeing anything before the last step. */
+static PSAEntry machine_sa(void)
+{
+    PSAEntry sa = calloc(1, sizeof(*sa));
+    assert(sa); entries++;
+    sa->handle = 7;
+    sa->pSec_sa_context = cdx_ipsec_sec_sa_context_alloc(7);
+    PDpaSecSAContext ctx = sa->pSec_sa_context;
+    assert(ctx && module_refs == 1 && tags == 1 && queues == 15);
+    assert(ctx->to_sec_fqid == 513 && ctx->to_cp_fqid == 514 && ctx->sec_desc);
+    /* The key mappings the descriptor names for the SA's life. */
+    ctx->cipher_data.cipher_key_len = 16;
+    ctx->crypto_key_dma = dma_map_single(&device, ctx->cipher_data.cipher_key, 16, 0);
+    ctx->auth_data.split_key_len = 40;
+    ctx->auth_data.split_key_pad_len = 48;
+    ctx->auth_key_dma = dma_map_single(&device, ctx->auth_data.split_key, 48, 0);
+    sa->linked = true;
+    releasing_flags = &sa->flags;
+    return sa;
+}
+static struct dpa_ipsec_sainfo *sainfo_of(PSAEntry sa)
+{ return sa->pSec_sa_context->dpa_ipsecsa_handle; }
+static enum qman_fq_state qstate(struct dpa_ipsec_sainfo *s, int q)
+{ return s->sec_fq[q].fq_base.state; }
+/* A frame left on one of the SA's queues. */
+static void hold(struct dpa_ipsec_sainfo *s, int q, enum qm_fd_format format, unsigned bpid)
+{
+    struct qman_fq *fq = &s->sec_fq[q].fq_base;
+    unsigned i = fq->held;
+    assert(i < 4 && fq->state == qman_fq_state_sched);
+    fq->frames[i] = (struct qm_fd){ format, bpid, 0x1000 + 0x100 * q + i };
+    fq->held = i + 1;
+}
+/* One timer period: the portal delivers what was asked of it, time moves on,
+ * and the release takes its step, looking at SEC at most once. Nonzero while
+ * it asks to run again. */
+static int tick(void)
+{
+    portal_poll();
+    jiffies += SA_CTX_RELEASE_TIMER_VAL;
+    TIMER_ENTRY *t = armed;
+    assert(t);
+    armed = NULL;
+    unsigned looks = sec_looks;
+    int again = t->handler(t);
+    assert(sec_looks - looks <= 1);
+    if (again) armed = t;
+    return again;
+}
+/* Nothing an SA owns goes while its release waits. */
+static void held_whole(unsigned allocs_held, unsigned mappings_held, u16 tag)
+{
+    assert(armed && entries == 1 && module_refs == 1 && tags == 1 && sa_range);
+    assert(ipsec_key_tags.used[tag] && queues == 15);
+    assert(allocs == allocs_held && mappings == mappings_held);
+}
+/* And everything goes once it is done: the tag exactly once (ida_free
+ * refuses a second), the module reference, every allocation and mapping. */
+static void released_whole(unsigned baseline, unsigned base_mappings, u16 tag)
+{
+    assert(!armed && !entries && !module_refs && !tags && !sa_range);
+    assert(!ipsec_key_tags.used[tag] && queues == 12 && !ipsecinfo.ipsec_exception_fq);
+    assert(allocs == baseline && mappings == base_mappings);
+    assert(!sa_release_held && !warn_ons);
+}
+
+static unsigned release_machine(void)
+{
+    unsigned cases = 0;
+
+    reset();
+    fp_deletes = sg_releases = fd_releases = cp_drops = sec_looks = 0;
+    assert(cdx_dpa_ipsec_init() == SUCCESS);
+    unsigned baseline = allocs, base_mappings = mappings;
+    unsigned sg_bpid = skb_2bfreed_bpool_g->bpid, out_bpid = ipsecinfo.ipsec_bp->bpid;
+
+    /* A rejected enqueue and a drained frame are dropped alike: a software
+     * SEC input through the SEC SG release, anything else back to its pool. */
+    PSAEntry sa = machine_sa();
+    struct dpa_ipsec_sainfo *s = sainfo_of(sa);
+    struct qman_fq *to_sec = &s->sec_fq[FQ_TO_SEC].fq_base;
+    struct qm_mr_entry ern = { .ern = { .rc = 0x24, .fd = { qm_fd_sg, sg_bpid, 0x5000 } } };
+    assert(to_sec->cb.ern && to_sec->cb.dqrr && s->sec_fq[FQ_FROM_SEC].fq_base.cb.dqrr);
+    to_sec->cb.ern(NULL, to_sec, &ern);
+    assert(sg_releases == 1 && !fd_releases);
+    ern.ern.fd = (struct qm_fd){ qm_fd_sg, 1, 0x5100 };
+    to_sec->cb.ern(NULL, to_sec, &ern);
+    ern.ern.fd = (struct qm_fd){ qm_fd_contig, sg_bpid, 0x5200 };
+    to_sec->cb.ern(NULL, to_sec, &ern);
+    assert(sg_releases == 1 && fd_releases == 2 && warnings == 3);
+    sg_releases = fd_releases = warnings = 0;
+
+    /* Retirement completing a period late, a portal whose volatile dequeue
+     * is taken the first time, frames left on every queue, and SEC busy
+     * with no progress until it is seen idle. */
+    u16 tag = s->key_tag;
+    hold(s, FQ_TO_SEC, qm_fd_contig, 1);
+    hold(s, FQ_TO_SEC, qm_fd_sg, sg_bpid);
+    hold(s, FQ_TO_SEC, qm_fd_sg, 1);
+    hold(s, FQ_FROM_SEC, qm_fd_contig, out_bpid);
+    hold(s, FQ_TO_CP, qm_fd_contig, out_bpid);
+    retire_looks = 1; vdq_busy = 1; sec_set(false, true);
+    unsigned allocs_held = allocs, mappings_held = mappings;
+    cdx_ipsec_release_sa_resources(sa);
+    /* Only the queue into SEC stops at once. */
+    assert((sa->flags & SA_DELETE) && fp_deletes == 1 && armed == &sa->deletion_timer);
+    assert((to_sec->flags & QMAN_FQ_STATE_CHANGING) && sa->release_state == SA_RELEASE_TO_SEC);
+    assert(qstate(s, FQ_FROM_SEC) == qman_fq_state_sched && qstate(s, FQ_TO_CP) == qman_fq_state_sched);
+    assert(tick() && sa->release_state == SA_RELEASE_TO_SEC && !sec_looks);
+    /* Retired: T0, SEC's first look; its volatile dequeue refused. */
+    assert(tick() && sa->release_state == SA_RELEASE_TO_SEC && sec_looks == 1);
+    assert((sa->release_flags & SA_REL_T0) && sa->release_t0 == jiffies);
+    assert(to_sec->held == 3 && !(to_sec->flags & QMAN_FQ_STATE_VDQCR));
+    assert(tick() && (to_sec->flags & QMAN_FQ_STATE_VDQCR));
+    /* The portal drops the three frames; then the queue goes out of
+     * service, and SEC, busy, is looked at again. */
+    assert(tick() && qstate(s, FQ_TO_SEC) == qman_fq_state_oos);
+    assert(sg_releases == 1 && fd_releases == 2 && sa->release_state == SA_RELEASE_SEC_DONE);
+    /* SEC's output queue stays in service until SEC is done: an output for
+     * a job SEC took before T0 still reaches the offline port. */
+    for (unsigned i = 0; i < 5; i++) {
+        assert(tick() && sa->release_state == SA_RELEASE_SEC_DONE);
+        assert(qstate(s, FQ_FROM_SEC) == qman_fq_state_sched);
+        held_whole(allocs_held, mappings_held, tag);
+    }
+    hold(s, FQ_FROM_SEC, qm_fd_sg, out_bpid);
+    sec_set(true, true);
+    assert(tick() && sa->release_state == SA_RELEASE_FROM_SEC);
+    sec_set(false, true);
+    /* The exception queue outlasts the output queue by at least a period,
+     * for frames the offline port took from it: its retirement is asked for
+     * in a later period than the one the output queue went out of service. */
+    unsigned periods = 0, from_sec_oos = 0, to_cp_retiring = 0;
+    while (tick()) {
+        assert(sa->release_state >= SA_RELEASE_FROM_SEC && ++periods < 16);
+        if (!from_sec_oos && qstate(s, FQ_FROM_SEC) == qman_fq_state_oos)
+            from_sec_oos = periods;
+        if (!to_cp_retiring && (qstate(s, FQ_TO_CP) != qman_fq_state_sched ||
+                                (s->sec_fq[FQ_TO_CP].fq_base.flags & QMAN_FQ_STATE_CHANGING)))
+            to_cp_retiring = periods;
+        if (qstate(s, FQ_FROM_SEC) != qman_fq_state_oos)
+            assert(qstate(s, FQ_TO_CP) == qman_fq_state_sched);
+        held_whole(allocs_held, mappings_held, tag);
+    }
+    assert(from_sec_oos && to_cp_retiring > from_sec_oos);
+    assert(fd_releases == 4 && sg_releases == 1 && cp_drops == 1 && !warnings);
+    released_whole(baseline, base_mappings, tag);
+    cases++;
+
+    /* SEC idle at T0, while the queue into SEC still empties, is proof enough
+     * however busy SEC is afterwards; immediate retirement throughout. */
+    retire_at_once = true;
+    sa = machine_sa(); s = sainfo_of(sa); tag = s->key_tag;
+    hold(s, FQ_TO_SEC, qm_fd_contig, 1);
+    cdx_ipsec_release_sa_resources(sa);
+    assert(qstate(s, FQ_TO_SEC) == qman_fq_state_retired);
+    sec_set(true, true);
+    assert(tick() && (sa->release_flags & SA_REL_SEC_DONE));
+    sec_set(false, false);
+    unsigned looks = sec_looks;
+    /* Both later queues retire at once; the exception queue a period after
+     * the output queue is out of service. */
+    assert(tick() && sec_looks == looks && sa->release_state == SA_RELEASE_TO_CP);
+    assert(qstate(s, FQ_FROM_SEC) == qman_fq_state_oos);
+    assert(qstate(s, FQ_TO_CP) == qman_fq_state_sched);
+    assert(!tick() && sec_looks == looks);
+    released_whole(baseline, base_mappings, tag);
+    cases++;
+
+    /* An out-of-service step that QMan refuses because the queue holds a
+     * frame its state did not show dequeues it again, and the next period's
+     * attempt completes. */
+    sa = machine_sa(); s = sainfo_of(sa); tag = s->key_tag;
+    to_sec = &s->sec_fq[FQ_TO_SEC].fq_base;
+    cdx_ipsec_release_sa_resources(sa);
+    assert(qstate(s, FQ_TO_SEC) == qman_fq_state_retired && !to_sec->flags);
+    to_sec->frames[0] = (struct qm_fd){ qm_fd_contig, 1, 0x7000 };
+    to_sec->held = 1;
+    unsigned dropped = fd_releases;
+    assert(tick() && sa->release_state == SA_RELEASE_TO_SEC && warnings == 1);
+    assert((to_sec->flags & QMAN_FQ_STATE_VDQCR) && !(to_sec->flags & QMAN_FQ_STATE_NE));
+    sec_set(true, true);
+    assert(tick() && fd_releases == dropped + 1 && qstate(s, FQ_TO_SEC) == qman_fq_state_oos);
+    while (tick()) assert(armed);
+    released_whole(baseline, base_mappings, tag);
+    warnings = 0; cases++;
+
+    /* Busy SEC that keeps finishing IPsec protocol requests with its DECO
+     * watchdog on: proof SA_SEC_DONE_BOUND after T0, and not a period sooner,
+     * in a period it finished more of them since the last look. */
+    sa = machine_sa(); s = sainfo_of(sa); tag = s->key_tag;
+    allocs_held = allocs; mappings_held = mappings;
+    sec_set(false, true);
+    cdx_ipsec_release_sa_resources(sa);
+    assert(tick() && sa->release_state == SA_RELEASE_SEC_DONE);
+    unsigned long t0 = sa->release_t0;
+    while (jiffies + SA_CTX_RELEASE_TIMER_VAL < t0 + SA_SEC_DONE_BOUND) {
+        sec_protocol();
+        assert(tick() && sa->release_state == SA_RELEASE_SEC_DONE);
+        assert(qstate(s, FQ_FROM_SEC) == qman_fq_state_sched);
+        held_whole(allocs_held, mappings_held, tag);
+    }
+    sec_protocol();
+    assert(tick() && jiffies == t0 + SA_SEC_DONE_BOUND && !warnings);
+    assert(sa->release_state == SA_RELEASE_TO_CP);
+    assert(!tick());
+    released_whole(baseline, base_mappings, tag);
+    cases++;
+
+    /* SEC making no progress; progressing with its watchdog off; no SEC to
+     * look at; progressing only early after T0, and not since; moving only
+     * its dequeued-request count, which job-ring work moves too: each held
+     * as long as it lasts, counted once, said once, nothing freed; done as
+     * soon as SEC shows it. */
+    for (unsigned kind = 0; kind < 5; kind++) {
+        sa = machine_sa(); s = sainfo_of(sa); tag = s->key_tag;
+        allocs_held = allocs; mappings_held = mappings;
+        sec_set(false, kind != 1);
+        if (kind == 2) jrdev_g = NULL;
+        cdx_ipsec_release_sa_resources(sa);
+        for (unsigned i = 0; i < 4 * SA_SEC_DONE_BOUND / SA_CTX_RELEASE_TIMER_VAL; i++) {
+            if (kind == 1 || (kind == 3 && i < 5)) sec_protocol();
+            if (kind == 4) caam.perfmon.req_dequeued += 7;
+            assert(tick() && sa->release_state <= SA_RELEASE_SEC_DONE);
+            assert(qstate(s, FQ_FROM_SEC) == qman_fq_state_sched);
+            assert(qstate(s, FQ_TO_CP) == qman_fq_state_sched);
+            held_whole(allocs_held, mappings_held, tag);
+            assert(sa_release_held == (i >= SA_SEC_DONE_BOUND / SA_CTX_RELEASE_TIMER_VAL));
+        }
+        assert(warnings == 1);
+        jrdev_g = &job_ring;
+        if (kind == 1 || kind == 2) {
+            sec_set(true, false);
+        } else {
+            sec_protocol();
+        }
+        assert(tick() && sa->release_state == SA_RELEASE_TO_CP);
+        assert(!tick());
+        released_whole(baseline, base_mappings, tag);
+        warnings = 0; cases++;
+    }
+
+    /* A queue that will not retire is asked again every period, said out
+     * loud every period, and counted as held once; nothing goes until it
+     * does. The same for one that will not go out of service. */
+    for (unsigned kind = 0; kind < 2; kind++) {
+        sa = machine_sa(); s = sainfo_of(sa); tag = s->key_tag;
+        allocs_held = allocs; mappings_held = mappings;
+        sec_set(true, true);
+        cdx_ipsec_release_sa_resources(sa);
+        if (kind) oos_failed = 1000; else retires_failed = 1000;
+        unsigned rounds = 2 * SA_SEC_DONE_BOUND / SA_CTX_RELEASE_TIMER_VAL;
+        for (unsigned i = 0; i < rounds; i++) {
+            assert(tick());
+            held_whole(allocs_held, mappings_held, tag);
+        }
+        assert(sa_release_held == 1 && warnings > rounds);
+        assert(sa->release_state == (kind ? SA_RELEASE_TO_SEC : SA_RELEASE_FROM_SEC));
+        oos_failed = retires_failed = 0;
+        while (tick()) assert(armed);
+        released_whole(baseline, base_mappings, tag);
+        warnings = 0; cases++;
+    }
+    retire_at_once = false; retire_looks = 2;
+    sg_releases = fd_releases = cp_drops = 0;
+
+    exit_callback();
+    cdx_dpa_ipsec_held_fqids_exit(true);
+    clean();
+    return cases;
 }
 
 static void tag_lifecycle(void)
@@ -703,6 +1136,7 @@ int main(void)
             clean(); cases++;
         }
         cases += sa_lifecycle();
+        cases += release_machine();
     }
     printf("IPsec lifecycle: %u acquisition/seed cases, repeat cleanup and retry passed\n", cases);
     return 0;

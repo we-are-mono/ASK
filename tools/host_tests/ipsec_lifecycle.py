@@ -1,14 +1,28 @@
-"""A177: compile the IPsec acquisition/unwind and SDK buffer ownership code."""
+"""A177: compile the IPsec acquisition/unwind and SDK buffer ownership code,
+and (A308) an SA's release, step by step from its deletion timer."""
 
 from ask_orch.process import run_process
 
 import os
+import re
 from pathlib import Path
 
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 SDK_REL = Path("drivers/net/ethernet/freescale/sdk_dpaa")
+
+
+def definition(source, name):
+    """A function definition by name, whatever it returns."""
+    match = re.search(r"^[A-Za-z_][^\n;{}()]*?\b" + name + r"\s*\([^;{]*?\)\s*\{",
+                      source, re.M)
+    assert match, name
+    end, depth = match.end(), 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[match.start():end] + "\n"
 
 
 def test_ipsec_lifecycle(tmp_path):
@@ -29,12 +43,21 @@ def test_ipsec_lifecycle(tmp_path):
     sdk = sdk.replace("__cold __attribute__((nonnull))\n", "")
     source = (ROOT / "cdx/dpa_ipsec.c").read_text()
     devman = (ROOT / "cdx/devman.c").read_text()
+    sec = (ROOT / "cdx/cdx_dpa_ipsec.c").read_text()
+    control = (ROOT / "cdx/control_ipsec.h").read_text()
+    regs = (kernel / "drivers/crypto/caam/regs.h").read_text()
     (tmp_path / "ipsec_types.inc").write_text(
         source[source.index("struct cgr_priv {"):
                source.index("/* The following macro")]
         + source[source.index("struct dpa_ipsec_sainfo {"):
                source.index("#if defined(CONFIG_INET_IPSEC_OFFLOAD)",
-                            source.index("struct ipsec_info {"))])
+                            source.index("struct ipsec_info {"))]
+        # The SA's release: its steps, flags and timing, the SEC context it
+        # frees, and the DECO watchdog bit as the kernel defines it.
+        + re.search(r"^#define\s+SA_DELETE\s.*$", control, re.M).group() + "\n"
+        + control[control.index("struct cipher_params {"):
+                  control.index("typedef struct _tSAEntry {")]
+        + re.search(r"^#define MCFGR_WDENABLE\s.*$", regs, re.M).group() + "\n")
     names = ["cdx_find_ipsec_pcd_fqinfo", "ipsec_addfq_to_exceptionfq_list",
              "ipsec_delfq_from_exceptionfq_list",
              "create_ipsec_pcd_fqs", "ipsec_init_ohport",
@@ -45,7 +68,12 @@ def test_ipsec_lifecycle(tmp_path):
              "cdx_dpaa_ingress_cgr_exit", "cdx_dpa_ipsec_ready",
              "cdx_dpa_ipsec_init", "cdx_dpa_ipsec_exit"]
     (tmp_path / "ipsec_lifecycle.inc").write_text(
-        source[source.index("#define CDX_MAX_SG_BUFF_SIZE"):
+        # What an SA queue gives back undelivered, rejected or drained.
+        re.search(r"^static atomic_t dpa_ipsec_ern_count\b.*$", source, re.M).group() + "\n"
+        + function(source, "dpa_ipsec_fd_drop")
+        + function(source, "dpa_ipsec_ern_cb")
+        + function(source, "dpa_ipsec_drain_dqrr")
+        + source[source.index("#define CDX_MAX_SG_BUFF_SIZE"):
                source.index("static void ipsec_free_sg_buffer")]
         + function(staged.read_text(), "dpaa_bp_alloc_n_add_buffs")
         + function(staged.read_text(), "dpa_bp_recycle_frag")
@@ -63,7 +91,25 @@ def test_ipsec_lifecycle(tmp_path):
         + function(source, "cdx_dpa_ipsecsa_keep_fqids")
         + function(source, "cdx_dpa_ipsec_release_held_fqids")
         # And at unload, once CDX knows whether anything may still name them.
-        + function(source, "cdx_dpa_ipsec_held_fqids_exit"))
+        + function(source, "cdx_dpa_ipsec_held_fqids_exit")
+        # The SA's accessors and its queues' steps out of service.
+        + definition(source, "get_shared_desc")
+        + "".join(function(source, n) for n in
+                  ["get_fqid_to_sec", "ipsec_get_to_cp_fqid",
+                   "cdx_dpa_ipsec_retire_fq", "cdx_dpa_ipsec_fq_stop",
+                   "cdx_ipsec_sa_fq_check_if_retired_state"])
+        # The release itself, from the SEC side: what SEC is seen to do, the
+        # context built and freed, and the timer steps between.
+        + re.search(r"^#define CDX_SEC_CSTA_IDLE\s.*$", sec, re.M).group() + "\n"
+        + re.search(r"^static unsigned int sa_release_held;$", sec, re.M).group() + "\n"
+        + re.search(r"^struct cdx_sec_sample \{.*?^\};", sec, re.S | re.M).group() + "\n"
+        + function(sec, "cdx_ipsec_sec_sample")
+        + function(sec, "cdx_ipsec_sec_sa_context_free")
+        + sec[sec.index("PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc("):
+              sec.index("/* How much of the shared descriptor the PDB takes")]
+        + "".join(function(sec, n) for n in
+                  ["cdx_ipsec_sa_sec_done", "cdx_ipsec_sa_release_stalled",
+                   "cdx_ipsec_release_sa_ctx_cbk", "cdx_ipsec_release_sa_resources"]))
     binary = tmp_path / "ipsec_lifecycle"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

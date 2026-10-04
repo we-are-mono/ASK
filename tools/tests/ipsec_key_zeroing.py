@@ -67,10 +67,11 @@ REQID = 0x8701
 PROBE_PATH = "/proc/cdx/last_freed_key"
 
 # Deleting a state queues the hardware retirement on a workqueue, and the SEC
-# context is then released on a 1-second cdx_timer that reschedules while any
-# frame queue is still retiring. For a tunnel that never carried traffic this
-# completes on the first fire; the budget is for a loaded bus, not for the
-# expected case.
+# context is then released on a 1-second cdx_timer: the queue into SEC out of
+# service, SEC seen idle and SEC's output queue out of service in one fire,
+# then a fire later the exception queue and the release. For a tunnel that
+# never carried traffic this completes on the second fire; the budget is for a
+# loaded bus, not for the expected case.
 CAPTURE_POLL_BUDGET_S = 8.0
 CAPTURE_POLL_INTERVAL_S = 0.25
 

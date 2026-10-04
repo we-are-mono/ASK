@@ -871,14 +871,30 @@ Deleting one outbound owner leaves the root and identity valid for the survivor.
 SA deletion first withdraws dependent flow entries and the SA root. An uncertain
 root deletion retains the identity and FQIDs in either direction. The same hold
 applies whenever the datapath failure latch is set: a dependent forwarding entry
-may still validate this tag even if the SA root itself deleted cleanly. The deferred SA
-release requires all three queues out of service, then an explicit SEC
-`CSTA[IDLE]` observation (SEC RM chapter 13) before freeing the descriptor and keys.
-The check is bounded to 100 polls, sleeping 100–200 microseconds between polls.
-If SEC never becomes idle, the resources and module reference remain pinned until
-reboot; a timeout cannot authorize reuse. After the queues stop and SEC finishes,
-a successful FMan PCD barrier proves that an old packet no longer carries the
-identity through the offline port.
+may still validate this tag even if the SA root itself deleted cleanly. The delete
+then retires only TO_SEC, and the SA's release runs on the CDX timer, a step per
+second, retrying each step for as long as it takes and freeing nothing before the
+last (`cdx_ipsec_release_sa_ctx_cbk()`):
+
+1. TO_SEC retired, emptied by a volatile dequeue whose frames are dropped back to
+   their pools, and out of service. T0 is the first period it is seen retired.
+2. SEC proven done with every job it took from TO_SEC: `CSTA[IDLE]` (SEC RM
+   chapter 13) seen once at any period from T0 on; or, from 30 s after T0
+   (`SA_SEC_DONE_BOUND`), SEC's dequeued-request counter advanced since T0 with the
+   DECO watchdog enabled, so no job held at T0 can still run. Short of either, the
+   release waits.
+3. FROM_SEC, then TO_CP, each retired, emptied and out of service the same way.
+   FROM_SEC stays in service until step 2: an output for a job SEC took before T0
+   still reaches the offline port, where a retired queue would refuse it on SEC's
+   portal, which cannot return a refused frame's buffer.
+4. The queues, descriptor, key mappings and keys, FQIDs and tag, and the module
+   reference go together.
+
+A step still waiting 30 s after it began is logged and counted in the read-only
+`cdx.sa_release_held` parameter until the release completes; the SA keeps its
+module reference throughout, so CDX cannot unload under it. After the queues stop
+and SEC finishes, a successful FMan PCD barrier proves that an old packet no longer
+carries the identity through the offline port.
 
 A failed PCD barrier retains the tag/FQID allocation, latches the datapath failure
 and uses the existing stopped-port restart to settle hardware references. Retained

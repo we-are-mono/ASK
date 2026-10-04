@@ -290,20 +290,38 @@ uint32_t ipsec_get_to_cp_fqid(void *handle)
 extern struct dpa_bp *sg_bpool_g; // buffer reqd to frame SG list for skb fraglist
 extern struct dpa_bp *skb_2bfreed_bpool_g; //if no recyclable skbs exist in skb fraglist, those should be freed back, SEC engine will add to this bman pool
 
+/* Drop a frame an SA queue gave back without delivering it: one QMan
+ * rejected, or one left on a queue being emptied for the SA's release. The
+ * buffers behind it still belong to their BMan pools, and one not given back
+ * is lost for good: under load that empties the pool SEC writes into, and
+ * every later SEC job fails.
+ *
+ * A software input to SEC is a scatter/gather frame whose table comes from
+ * the SEC input pool and still owns its skb and payload mappings; it is
+ * completed the way normal reuse and the idle reaper complete one. Anything else
+ * -- a frame FMan classified onto TO_SEC, or SEC's output on FROM_SEC -- is
+ * plain pool buffers, contiguous or scatter/gather.
+ *
+ * QMan portal context (softirq or hardirq, no sleeping): the releases spin
+ * on BMan, nothing is allocated, and the skb free is the any-context one. */
+static void dpa_ipsec_fd_drop(const struct qm_fd *fd)
+{
+	struct dpa_bp *done = READ_ONCE(skb_2bfreed_bpool_g);
+
+	if (fd->format == qm_fd_sg && done && READ_ONCE(sg_bpool_g) &&
+	    fd->bpid == done->bpid) {
+		dpaa_sec_sg_release(fd, true);
+		return;
+	}
+	dpa_fd_release(NULL, fd);
+}
+
 /*
  * QMan Enqueue-Reject Notification on FQ_TO_SEC.
  *
- * SEC's QI rejects an enqueue (FQ retired/OOS, congestion, etc.) and the
- * rejected FD is delivered here. The buffer behind the FD is still owned by
- * its BMan pool — if we drop the message, the buffer is leaked permanently.
- * Under sustained load that drains BPID 37, after which every subsequent
- * SEC op silently fails with BPDERR-class errors and the SA wedges with no
- * recovery short of a reboot (see ISSUES.md A24).
- *
- * Recycle the buffer back to its pool, count the rejection, and emit a
- * rate-gated dmesg line so the wedge is observable. Runs in QMan
- * portal-poll (softirq, no-sleep) — bman_release spinloops, no allocation,
- * and the skb free below uses the any-context variant.
+ * QMan rejects a software enqueue (FQ retired/OOS, congestion, etc.) and the
+ * rejected FD is delivered here, to be given back (ISSUES.md A24). Counted,
+ * with a rate-gated dmesg line, so a wedge is observable.
  */
 static atomic_t dpa_ipsec_ern_count = ATOMIC_INIT(0);
 
@@ -311,8 +329,6 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 		const struct qm_mr_entry *msg)
 {
 	const struct qm_fd *fd = &msg->ern.fd;
-	struct dpa_bp *bp;
-	struct bm_buffer bmb;
 	int n = atomic_inc_return(&dpa_ipsec_ern_count);
 
 	if (n <= 16 || (n & 0xff) == 0)
@@ -320,22 +336,19 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 			"cdx: IPsec ERN on FQ 0x%x rc=0x%02x bpid=%u addr=0x%llx (count=%d)\n",
 			fq->fqid, msg->ern.rc, fd->bpid,
 			(unsigned long long)qm_fd_addr_get64(fd), n);
+	dpa_ipsec_fd_drop(fd);
+}
 
-	/* A rejected software input still owns its skb and payload mappings.
-	 * Share completion with normal reuse and the idle reaper. */
-	if (fd->format == qm_fd_sg && skb_2bfreed_bpool_g && sg_bpool_g &&
-	    fd->bpid == skb_2bfreed_bpool_g->bpid) {
-		dpaa_sec_sg_release(fd, true);
-		return;
-	}
-
-	bp = dpa_bpid2pool(fd->bpid);
-	if (bp) {
-		bmb.opaque = 0;
-		bm_buffer_set64(&bmb, qm_fd_addr(fd));
-		while (unlikely(bman_release(bp->pool, &bmb, 1, 0)))
-			cpu_relax();
-	}
+/* FROM_SEC and TO_SEC are consumed by hardware, SEC and the offline port, and
+ * software dequeues them only to empty them for the SA's release
+ * (cdx_dpa_ipsec_fq_stop()): what is left on them then is dropped. A volatile
+ * dequeue can end on an entry with no frame. */
+static enum qman_cb_dqrr_result dpa_ipsec_drain_dqrr(struct qman_portal *qm,
+		struct qman_fq *fq, const struct qm_dqrr_entry *dq)
+{
+	if (dq->stat & QM_DQRR_STAT_FD_VALID)
+		dpa_ipsec_fd_drop(&dq->fd);
+	return qman_cb_dqrr_consume;
 }
 
 
@@ -857,6 +870,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 #endif
 					flags = QMAN_FQ_FLAG_TO_DCPORTAL;
 					dpa_fq->channel = ipsecinfo.ofport_channel;
+					dpa_fq->fq_base.cb.dqrr = dpa_ipsec_drain_dqrr;
 					/* setting A1 value to 2 and setting a  bit to copy A1 value in  context A field  */
 					/* setting override frame queue option */
 					opts.fqd.context_a.hi = 
@@ -875,6 +889,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 					addr = virt_to_phys(ipsecsa_info->shared_desc);
 					dpa_fq->channel = ipsecinfo.crypto_channel_id;
 					dpa_fq->fq_base.cb.ern = dpa_ipsec_ern_cb;
+					dpa_fq->fq_base.cb.dqrr = dpa_ipsec_drain_dqrr;
 					opts.fqd.context_b = ipsecsa_info->sec_fq[FQ_FROM_SEC].fqid;
 					opts.fqd.context_a.hi = (uint32_t) (addr >> 32);
 					opts.fqd.context_a.lo = (uint32_t) (addr);
@@ -889,7 +904,11 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 					/* No net_dev is attached to FQ as its being fetched from sagd */
 					dpa_fq->fq_type = FQ_TYPE_RX_PCD;
 					/* creating CP fqid as the fqid value of FROM_SEC FQID +1 */
-					/* set call back function pointer */
+					/* The CPU's receive callback also empties the
+					 * queue for the SA's release: that starts by
+					 * marking the SA SA_DELETE, which the handler's
+					 * lookup skips, so whatever is left is dropped
+					 * back to its pools there. */
 					dpa_fq->fq_base.cb.dqrr = ipsec_exception_pkt_handler;
 					/* round robin channel like ethernet driver does */
 					dpa_fq->channel = portal_channel[next_portal_ch_idx];
@@ -1294,7 +1313,7 @@ void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle)
 
 	/* An SA can still own SEC work while its deferred deletion runs.
 	 * Keep the pool and callback text loaded until all its queues are
-	 * gone, including SAs retained after a failed retirement. */
+	 * gone, however long the release waits on QMan or SEC. */
 	if (!try_module_get(THIS_MODULE))
 		return NULL;
 	sainfo = (struct dpa_ipsec_sainfo *)
@@ -1339,10 +1358,63 @@ int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num)
 	fq = &dpa_fq->fq_base; 
 	ret = qman_retire_fq(fq, &flags);
 	if (ret < 0) {
-		DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
+		DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
 				__func__, fq->fqid, fq->fqid);
 	}
 	return ret;
+}
+
+/* One step towards taking one of an SA's queues out of service, never
+ * waiting on QMan: 0 once it is out of service; 1 while it is retired -- its
+ * consumer takes nothing more from it -- but not yet empty or out of service;
+ * -EBUSY while its retirement has not completed. The caller comes back a
+ * timer period later, for as long as it takes.
+ *
+ * A retirement that failed, or was never asked for, is asked for again. What
+ * a retired queue still holds is dequeued by a volatile dequeue and dropped
+ * by the queue's own callback, whose portal delivers it after this returns;
+ * the queue goes out of service only once that dequeue has finished and
+ * QMan has seen it empty. Control mutex held. */
+int cdx_dpa_ipsec_fq_stop(void *handle, int fq_num)
+{
+	struct qman_fq *fq = &((struct dpa_ipsec_sainfo *)handle)->sec_fq[fq_num].fq_base;
+	enum qman_fq_state state;
+	u32 flags;
+	int ret;
+
+	qman_fq_state(fq, &state, &flags);
+	if (state == qman_fq_state_oos)
+		return 0;
+	if (flags & QMAN_FQ_STATE_CHANGING)
+		return -EBUSY;
+	if (state != qman_fq_state_retired) {
+		ret = qman_retire_fq(fq, NULL);
+		if (ret < 0)
+			pr_warn_ratelimited("cdx: cannot retire IPsec SA queue 0x%x: %d\n",
+					    fq->fqid, ret);
+		/* Asynchronous, it completes with QMan's notification. */
+		if (ret)
+			return -EBUSY;
+		qman_fq_state(fq, &state, &flags);
+	}
+	if (flags & (QMAN_FQ_STATE_VDQCR | QMAN_FQ_STATE_ORL))
+		return 1;
+	if (flags & QMAN_FQ_STATE_NE) {
+		/* Refused while another queue holds this portal's volatile
+		 * dequeue; tried again next time. */
+		qman_volatile_dequeue(fq, 0, QM_VDQCR_NUMFRAMES_TILLEMPTY);
+		return 1;
+	}
+	ret = qman_oos_fq(fq);
+	if (ret) {
+		pr_warn_ratelimited("cdx: cannot take IPsec SA queue 0x%x out of service: %d\n",
+				    fq->fqid, ret);
+		/* QMan found it not empty after all: dequeue again, which
+		 * costs nothing on a queue that is. */
+		qman_volatile_dequeue(fq, 0, QM_VDQCR_NUMFRAMES_TILLEMPTY);
+		return 1;
+	}
+	return 0;
 }
 
 /* An SA's FQIDs going back with its queues: at once, unless a classifier entry
@@ -1389,53 +1461,38 @@ static void dpa_ipsec_release_fqids(struct dpa_ipsec_sainfo *sainfo)
 	list_add_tail(&held->list, &dpa_ipsec_held);
 }
 
+/* The SA's queues, descriptor, FQIDs and tag, and its module reference, once
+ * nothing can use them any more: every queue out of service and SEC proven
+ * done with every job it took (cdx_ipsec_release_sa_ctx_cbk()). The caller
+ * frees the keys the descriptor names after this. A queue still in service
+ * means that was not established, and then nothing is freed. */
 int cdx_dpa_ipsecsa_release(void *handle)
 {
 	struct dpa_ipsec_sainfo *sainfo;
 	struct dpa_fq *dpa_fq;
 	struct qman_fq *fq;
+	enum qman_fq_state state;
 	uint32_t ii;
-	//	uint32_t flags;
 
 	if (!handle)
 		return FAILURE;
 	sainfo = (struct dpa_ipsec_sainfo *)handle;
 
 	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
-		dpa_fq = &sainfo->sec_fq[ii];
-		fq = &dpa_fq->fq_base;
-		if (qman_oos_fq(fq)) {
-			/*
-			 * FQ is left in qman_fq_state_retired (not OOS).
-			 * Calling qman_destroy_fq(fq, 0) would itself fail
-			 * (precondition: OOS unless QMAN_FQ_DESTROY_PARKED),
-			 * and freeing sainfo would leave QMan holding a
-			 * dangling pointer for any future ERN/DQRR callback
-			 * — UAF. Leak sainfo + remaining FQ slots
-			 * intentionally; A24b's deferred-release timer cap
-			 * + ERN counter (dpa_ipsec_ern_count) make this
-			 * visible to the operator.
-			 */
-			pr_warn_ratelimited(
-				"cdx: qman_oos_fq failed on FQ 0x%x — leaking SA resources to avoid UAF (A24b)\n",
-				fq->fqid);
+		qman_fq_state(&sainfo->sec_fq[ii].fq_base, &state, NULL);
+		if (WARN_ON_ONCE(state != qman_fq_state_oos))
 			return FAILURE;
-		}
 	}
-	/* SEC can still be processing a job dequeued before TO_SEC retired.
-	 * Keep its descriptor, keys, callbacks, FQIDs and tag together unless
-	 * the hardware proves that job finished. The caller retains the key
-	 * mappings on failure, and this SA's module reference prevents unload. */
-	if (!cdx_ipsec_wait_sec_idle()) {
-		pr_warn_ratelimited("cdx: SEC did not become idle after SA queues stopped; retaining SA resources until reboot\n");
-		return FAILURE;
-	}
+	/* QMan can publish the last state change before the callback that
+	 * delivered it returns, and a software submit that found TO_SEC
+	 * before the SA was marked for deletion enqueues inside an RCU read
+	 * section. Retain both the embedded queues and the module until
+	 * those are done; the rejection such an enqueue earns came back
+	 * timer periods ago. */
+	synchronize_net();
 	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
 		dpa_fq = &sainfo->sec_fq[ii];
 		fq = &dpa_fq->fq_base;
-		/* QMan can publish the retired state before its last callback
-		 * returns. Retain both the embedded queue and the module. */
-		synchronize_net();
 		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
@@ -1510,9 +1567,10 @@ int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num)
 	struct qman_fq *fq;
 	sainfo = (struct dpa_ipsec_sainfo *)dpa_ipsecsa_handle;
 	dpa_fq = &sainfo->sec_fq[fq_num];
-	fq = &dpa_fq->fq_base; 
-	/* if fq is not in retired state, restart timer */
-	return (fq->state != qman_fq_state_retired);
+	fq = &dpa_fq->fq_base;
+	/* Nonzero while the queue may still feed its consumer. */
+	return fq->state != qman_fq_state_retired &&
+	       fq->state != qman_fq_state_oos;
 }
 
 #ifdef CS_TAIL_DROP

@@ -86,7 +86,6 @@ typedef struct _tSAID {
 /* flag to indicate in SA whether the shared descriptor already built or not */
 #define SA_SH_DESC_BUILT	0x80
 #define SA_DELETE		0x100
-#define SA_FQ_WAIT_B4_FREE	0x400 /* reserve 3 bits starting from 0x400 */
 
 /* Words of anti-replay scorecard in the ESP decapsulation PDB, enough for
  * SEC's widest, 128-entry window (struct ipsec_decap_pdb's anti_replay). */
@@ -120,14 +119,43 @@ struct auth_params {
         U32 split_key_pad_len;/* Length in bytes of the padded split key */
 };
 
-/* timer value for defered release of SA resources */
+/* How often a deleted SA's release takes its next step
+ * (cdx_ipsec_release_sa_ctx_cbk()). */
 #define SA_CTX_RELEASE_TIMER_VAL (1 * HZ)
-/* A24b: cap the FQ-retire poll loop so a wedged FQ doesn't pin the SAEntry
- * forever. SA_CTX_RELEASE_TIMER_VAL is 1s, so this is a 30s wall-clock cap.
- * On cap-hit, the deferred-release callback logs and skips the final free —
- * SA resources leak, but the system stays observable and recoverable for
- * the rest of cdx. */
-#define SA_RELEASE_MAX_ITER 30
+
+/* How long after its queue into SEC stopped a released SA waits before it
+ * accepts, in place of SEC reporting itself idle, that SEC kept taking new
+ * work with its DECO watchdog on. The watchdog fails a descriptor that runs
+ * past its limit, so once that limit has passed every job SEC held when the
+ * queue stopped has ended, one way or the other. That limit is counted in SEC
+ * clock cycles; 30 s would hold even 2^32 of them at any SEC clock above
+ * 143 MHz. The bound is kept far above the limit because a release that waits
+ * longer costs only a queue range and a tag for a while, and one that goes
+ * early lets SEC read a freed descriptor. */
+#define SA_SEC_DONE_BOUND (30 * HZ)
+
+/* The steps of an SA's release, in order. Each waits, a timer period at a
+ * time and for as long as it takes, for what it needs: nothing an SA owns is
+ * freed until every step is done. */
+enum sa_release_state {
+	/* The queue into SEC: retired, emptied, out of service. */
+	SA_RELEASE_TO_SEC,
+	/* SEC done with every job it took from that queue. */
+	SA_RELEASE_SEC_DONE,
+	/* SEC's output queue to the offline port, then the offline port's
+	 * exception queue to the CPU, each the same way as the first. */
+	SA_RELEASE_FROM_SEC,
+	SA_RELEASE_TO_CP,
+	/* Nothing can use the SA any more: all of it goes at once. */
+	SA_RELEASE_FREE,
+};
+
+/* _tSAEntry.release_flags */
+#define SA_REL_T0	0x1	/* release_t0 and release_protocol are set */
+#define SA_REL_SEC_DONE	0x2	/* SEC proven done with the SA's jobs */
+#define SA_REL_HELD	0x4	/* counted in sa_release_held */
+#define SA_REL_WARNED	0x8	/* the current step's stall has been reported */
+
 typedef struct dpa_sec_sa_context_s{
 	U32   to_sec_fqid;
 	U32   to_cp_fqid;
@@ -152,7 +180,15 @@ typedef struct _tSAEntry {
 	struct slist_entry      list_h;
 	struct slist_entry      list_fqid;
 	TIMER_ENTRY 		deletion_timer;
-	U32			deletion_iter;	/* A24b: poll count for FQ-retire wait; capped via SA_RELEASE_MAX_ITER */
+	/* The SA's release, which deletion_timer advances: its step (enum
+	 * sa_release_state), SA_REL_* flags, and the jiffies the step began.
+	 * T0 is when the queue into SEC was first seen retired, and
+	 * release_protocol SEC's IPsec request count at the last look. */
+	U8			release_state;
+	U8			release_flags;
+	unsigned long		release_step;
+	unsigned long		release_t0;
+	U64			release_protocol;
 	U16			hash_by_h;
 	struct _tSAID           id;             // SA 3-tuple
 	U8                      family;         // v4/v6

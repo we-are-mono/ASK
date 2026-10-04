@@ -492,7 +492,7 @@ EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_add, ASK_CDX_FLOWTABLE);
  *
  * Retiring the queue SEC takes the SA's frames from stops it being handed
  * more, but QMan may complete the retirement a little later, once a dequeue
- * already under way finishes (SA_FQ_WAIT_B4_FREE), and SEC finishes the jobs
+ * already under way finishes (cdx_dpa_ipsec_fq_stop()), and SEC finishes the jobs
  * it had taken either way, each in a few microseconds. So this waits,
  * briefly and boundedly, for the retirement and then for several times what
  * a job takes. The memory is still the SA's throughout: its release is

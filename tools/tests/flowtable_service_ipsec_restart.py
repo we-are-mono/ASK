@@ -68,6 +68,7 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service, directi
             assert reply.ok, reply
             installed = await r.state()
             assert installed["ipsec_sas"] == baseline["ipsec_sas"] + 1, installed
+            sa_dirs = (await console_command(con, "ls", "/proc/fqid_stats/sa"))["stdout"].split()
             # The stop, the SA's release and the restart are all reported
             # from work items, after the delete returns, and a printk would
             # land inside whichever console read runs then.
@@ -85,11 +86,18 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service, directi
             stopped, _ = await wait_stopped(con, installed)
             assert stopped["ipsec_sas"] == baseline["ipsec_sas"], stopped
             assert await knob(con, ROOT_FAULT) == "0"
-            # The SA's queues retire on a one-second timer before the release
-            # that would give its FQIDs back; held, the restart waits until
-            # that release has run and held them, so it is the restart that
-            # gives them back.
-            await asyncio.sleep(2)
+            # The SA's release, a step per second on the CDX timer until its
+            # queues are out of service and SEC is done with it, would give
+            # its FQIDs back, and takes the SA's procfs entry with it. Held,
+            # the restart waits until that release has run and held them, so
+            # it is the restart that gives them back.
+            for _ in range(90):
+                left = (await console_command(con, "ls", "/proc/fqid_stats/sa"))["stdout"].split()
+                if len(left) < len(sa_dirs):
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                raise AssertionError(f"the deleted SA was not released: {sa_dirs} -> {left}")
             restarted = await wait_restarted(con, installed)
             assert await wait_running(con) == RUNNING
             line = await assert_restarted_cleanly(con, marks)

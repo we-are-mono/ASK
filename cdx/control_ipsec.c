@@ -424,9 +424,9 @@ void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, U8 fami
 #ifdef CONTROL_IPSEC_DEBUG
 			printk(KERN_INFO "%s sa_add failed\n", __func__);
 #endif
-			cdx_ipsec_sec_sa_context_free(sa->pSec_sa_context);
-			sa->pSec_sa_context = NULL;
-			sa_free(sa);
+			/* Its queues exist, so it goes the way every SA
+			 * with queues goes, which frees the entry too. */
+			cdx_ipsec_release_sa_resources(sa);
 			return NULL;
 
 		}

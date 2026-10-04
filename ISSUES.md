@@ -273,12 +273,8 @@ result independently of those temporary files.
   port's room for wanted streams. Fix direction: keep an evicted-but-named discard out of the caps (or retire it) until
   it is wanted again. Check: listeners on a source's own port, fill the ids, join elsewhere, read `mcast_refused`.
 
-- [ ] **A308 — an IPsec SA release that finds a queue non-empty or SEC busy leaks the SA for the boot.** Source-verified
-  by the 1.1.0 audit, not reproduced. `cdx_dpa_ipsecsa_release()` (cdx/dpa_ipsec.c) gives up when a retired SA FQ still
-  holds frames, or when the device-global CAAM CSTA IDLE bit is not seen within 10-20 ms. Each give-up keeps one of 4094
-  key tags; once they are gone every offloaded SA install fails until reboot. Open questions: CSTA IDLE semantics under
-  queued QI work; whether QMan accepts SEC output into the already-retired FROM_SEC FQ. Fix direction: retry the release
-  from a worker until drained, rather than abandoning it. Check: rekey a loaded tunnel repeatedly, watch the free tag count.
+- [x] **A308 — an IPsec SA release that found a queue non-empty or SEC busy leaked the SA (and its key tag) for the boot.**
+  Fixed: per-tick release steps drain each queue and retire FROM_SEC only once SEC is proven done, so late SEC output is no longer lost (_:/^cdx: never abandon an IPsec SA release_).
 
 - [ ] **A309 — the routed multicast learner has no group cap and a pass can outrun its 5 s period.** Source-verified by the
   audit; needs a multicast routing daemon, which no shipped profile starts. `ft_mr_work_fn()` (cdx/ask_flowtable.c) keeps

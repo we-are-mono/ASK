@@ -110,7 +110,6 @@ uint32_t get_fqid_to_sec(void *handle);
 uint32_t ipsec_get_to_cp_fqid(void *handle);
 uint32_t ipsec_get_key_tag(void *handle);
 void ipsec_share_key_tag(void *handle, void *other);
-bool cdx_ipsec_wait_sec_idle(void);
 
 struct sec_descriptor *get_shared_desc(void *handle);
 
@@ -130,5 +129,8 @@ void cdx_deinit_fqid_procfs(void);
 /* SA frame queue management */
 int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num);
 int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num);
+/* One step towards an SA queue out of service: 0 out of service, 1 retired,
+ * -EBUSY retiring. Never waits. Control mutex held. */
+int cdx_dpa_ipsec_fq_stop(void *handle, int fq_num);
 
 #endif

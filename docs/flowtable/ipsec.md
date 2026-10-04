@@ -589,7 +589,7 @@ the state releases the SEC context.
 The entry enqueues to the SA's TO_SEC FQID, and while it may still be linked a
 later SA given the same FQIDs would be fed frames it was never admitted for.
 The queues still go -- an out-of-service FQ rejects the enqueue -- but the
-release that follows on its one-second timer keeps the range, recorded against
+release that follows on the CDX timer keeps the range, recorded against
 the datapath epoch the failure happened in. The failure stops the datapath,
 and CDX's restart settles the entry with the ports idle, gives every held
 range back and moves the epoch on, so a release that comes after the restart

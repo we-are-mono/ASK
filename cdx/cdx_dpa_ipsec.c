@@ -40,6 +40,9 @@
  * Contexts:
  *   cdx_ipsec_add/remove/update_*     - process, flowtable transaction.
  *   cdx_ipsec_sec_sa_context_*        - process, under command path.
+ *   cdx_ipsec_release_sa_ctx_cbk      - process, the CDX timer thread, which
+ *                                       holds ctrl->mutex; an SA's release
+ *                                       a step per timer period.
  *   split_key_done (CAAM callback)    - softirq; the kernel's own, it
  *                                       touches only the per-call
  *                                       split_key_result, which
@@ -384,8 +387,6 @@ static uint32_t cdx_ipsec_sh_desc_hdr_flags(PSAEntry sa)
 	return HDR_SAVECTX | HDR_SHARE_SERIAL;
 }
 
-extern int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num);
-
 extern int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num);
 
 /* #define PRINT_DESC  */
@@ -564,52 +565,56 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 	return 0;
 }
 
-/* Call after the SA's request queue is OOS. SEC RM CSTA[IDLE] proves that
- * jobs already dequeued by QI have also finished; QMan retirement alone does
- * not. A busy or wedged SEC is not permission to reuse a descriptor or tag.
- * Other SAs may continue running: one idle observation is sufficient once
- * this SA can no longer submit work. */
-bool cdx_ipsec_wait_sec_idle(void)
+/* SEC RM CSTA[IDLE]: no job anywhere in SEC. */
+#define CDX_SEC_CSTA_IDLE	BIT(1)
+
+/* SA releases that have waited past SA_SEC_DONE_BOUND on one step, on a
+ * queue or on SEC, and are waiting still: each holds its descriptor, keys,
+ * queues, FQIDs and tag, and a module reference, until the release completes.
+ * Control mutex. */
+static unsigned int sa_release_held;
+module_param(sa_release_held, uint, 0444);
+MODULE_PARM_DESC(sa_release_held,
+		 "IPsec SA releases still waiting on a queue or on SEC past their bound");
+
+/* One look at SEC as a whole, for the release of an SA whose queue into SEC
+ * has stopped. False without a job ring, when there is no SEC to look at. */
+struct cdx_sec_sample {
+	/* PC_OB_ENC_REQ + PC_IB_DEC_REQ: IPsec protocol requests, which only
+	 * the queue interface's SA descriptors make here -- unlike
+	 * PC_REQ_DEQ, which job-ring users move with the queue interface
+	 * stalled. */
+	u64 protocol;
+	bool idle;	/* CSTA[IDLE] */
+	bool watchdog;	/* MCFGR[WDE]: DECO watchdog on */
+};
+
+static bool cdx_ipsec_sec_sample(struct cdx_sec_sample *sample)
 {
 	struct caam_drv_private *ctrlpriv;
-	unsigned int tries;
 
 	if (!jrdev_g)
 		return false;
 	ctrlpriv = dev_get_drvdata(jrdev_g->parent);
-	for (tries = 0; tries < 100; tries++) {
-		if (rd_reg32(&ctrlpriv->ctrl->perfmon.status) & BIT(1))
-			return true;
-		usleep_range(100, 200);
-	}
-	return false;
+	sample->idle = rd_reg32(&ctrlpriv->ctrl->perfmon.status) &
+		       CDX_SEC_CSTA_IDLE;
+	sample->protocol = rd_reg64(&ctrlpriv->ctrl->perfmon.ob_enc_req) +
+			   rd_reg64(&ctrlpriv->ctrl->perfmon.ib_dec_req);
+	sample->watchdog = rd_reg32(&ctrlpriv->ctrl->mcr) & MCFGR_WDENABLE;
+	return true;
 }
 
+/* Frees an SA's SEC context: its queues, descriptor, FQIDs and tag
+ * (cdx_dpa_ipsecsa_release()), then the key mappings and keys the descriptor
+ * names. Only once nothing can use any of them: before the SA has queues
+ * (handle NULL), or from the last step of its release, with every queue out
+ * of service and SEC proven done with its jobs. Reached any other way,
+ * QMan's callbacks and SEC's jobs may still read all of it, so it is kept. */
 void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 {
-	/*
-	 * A24b: if cdx_dpa_ipsecsa_release fails (qman_oos_fq did not move
-	 * the FQ to OOS), QMan still owns the sainfo memory and may invoke
-	 * dqrr/ern callbacks on it. Freeing the per-SA crypto material below
-	 * — cipher_key, auth_key, split_key — would
-	 * UAF those buffers from the SEC pipeline (they are DMA-mapped while
-	 * any in-flight op is still resident). Leak the sec_context entirely
-	 * and let the operator restart to recover the resources. The leak is
-	 * surfaced via the pr_warn here and dpa_ipsec_ern_count.
-	 *
-	 * Pre-init error paths (handle == NULL) skip the release call and
-	 * proceed to free the crypto material — the buffers were never
-	 * DMA-mapped to SEC, so it's safe.
-	 */
-	if (pdpa_sec_context->dpa_ipsecsa_handle) {
-		if (cdx_dpa_ipsecsa_release(pdpa_sec_context->dpa_ipsecsa_handle)
-				!= SUCCESS) {
-			pr_warn_ratelimited(
-				"cdx: SA release failed for handle %p — leaking sec_context (A24b)\n",
-				pdpa_sec_context->dpa_ipsecsa_handle);
-			return;
-		}
-	}
+	if (pdpa_sec_context->dpa_ipsecsa_handle &&
+	    cdx_dpa_ipsecsa_release(pdpa_sec_context->dpa_ipsecsa_handle) != SUCCESS)
+		return;
 	/* Release the SA-lifetime key mappings before freeing the buffers.
 	 * Guards mirror the map sites in cdx_ipsec_create_shareddescriptor;
 	 * 0 means the SA never got a descriptor built. */
@@ -750,74 +755,139 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 	return 0;
 }
 
+/* Whether SEC has finished every job it took from the SA's queue into SEC,
+ * which the caller has just seen retired: SEC takes nothing more from it. One
+ * look at SEC per call, a call per timer period; the first fixes T0.
+ *
+ * SEC idle at any look from T0 on proves it, since nothing of this SA's can
+ * have reached SEC after T0. Under load from other SAs SEC may never be idle,
+ * so from SA_SEC_DONE_BOUND after T0 this settles for SEC taking new IPsec
+ * requests in the period just past, so that the queue interface is not
+ * wedged now, with its DECO watchdog on, so that no job it held at T0 can
+ * still be running. Short of either the answer stays no, however long that
+ * lasts: the SA keeps everything SEC might still read. */
+static bool cdx_ipsec_sa_sec_done(PSAEntry pSA)
+{
+	struct cdx_sec_sample now;
+	bool done;
+
+	if (pSA->release_flags & SA_REL_SEC_DONE)
+		return true;
+	/* The queue state the caller read comes before this look at SEC. */
+	rmb();
+	if (!cdx_ipsec_sec_sample(&now))
+		return false;
+	done = now.idle;
+	if (!(pSA->release_flags & SA_REL_T0)) {
+		pSA->release_t0 = jiffies;
+		pSA->release_flags |= SA_REL_T0;
+	} else if (now.watchdog && now.protocol != pSA->release_protocol &&
+		   time_after_eq(jiffies, pSA->release_t0 + SA_SEC_DONE_BOUND)) {
+		done = true;
+	}
+	pSA->release_protocol = now.protocol;
+	if (done)
+		pSA->release_flags |= SA_REL_SEC_DONE;
+	return done;
+}
+
+/* A release step still waiting SA_SEC_DONE_BOUND after it began is counted
+ * in sa_release_held, once per SA, until the release completes, and said out
+ * loud: once for SEC, every period (rate-limited) for a queue that will not
+ * stop. Nothing is given up on. */
+static void cdx_ipsec_sa_release_stalled(PSAEntry pSA)
+{
+	static const char * const steps[] = {
+		[SA_RELEASE_TO_SEC] = "queue into SEC",
+		[SA_RELEASE_SEC_DONE] = "SEC, never seen idle nor progressing with its DECO watchdog on,",
+		[SA_RELEASE_FROM_SEC] = "SEC output queue",
+		[SA_RELEASE_TO_CP] = "exception queue",
+	};
+
+	if (time_before(jiffies, pSA->release_step + SA_SEC_DONE_BOUND))
+		return;
+	if (!(pSA->release_flags & SA_REL_HELD)) {
+		pSA->release_flags |= SA_REL_HELD;
+		WRITE_ONCE(sa_release_held, sa_release_held + 1);
+	}
+	if (pSA->release_flags & SA_REL_WARNED)
+		return;
+	if (pSA->release_state == SA_RELEASE_SEC_DONE)
+		pSA->release_flags |= SA_REL_WARNED;
+	pr_warn_ratelimited("cdx: IPsec SA 0x%x release waiting %u s on the %s; its descriptor, keys, queues and tag stay held until it is done\n",
+			    pSA->handle,
+			    jiffies_to_msecs(jiffies - pSA->release_step) / 1000,
+			    steps[pSA->release_state]);
+}
+
+/* The SA's release, which cdx_ipsec_release_sa_resources() began, a step per
+ * timer period under the control mutex. Each step that cannot finish yet asks
+ * to be run again a period later, for as long as it takes; only the last
+ * frees anything, all of it at once.
+ *
+ * SEC's output queue stays in service until SEC is done with the SA: an
+ * output for a job SEC took before its queue stopped still reaches the
+ * offline port then, where a retired queue would refuse it on SEC's portal,
+ * which cannot return a refused frame's buffer. The exception queue in turn
+ * outlasts the output queue, for what the offline port sends it. */
 static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 {
-	PSAEntry         pSA;
-	PDpaSecSAContext sa_context;
-	int32_t ii, ret;
-	bool fq_stuck = false;
+	PSAEntry pSA = container_of(entry, SAEntry, deletion_timer);
+	void *handle = pSA->pSec_sa_context ?
+		       pSA->pSec_sa_context->dpa_ipsecsa_handle : NULL;
+	int rc;
 
-	pSA  = container_of(entry, SAEntry, deletion_timer);
-	cdx_timer_del(entry);
-	/* check frame queues states */
-	for (ii=0; ii<NUM_FQS_PER_SA; ii++)
-	{
-		if (pSA->flags & (SA_FQ_WAIT_B4_FREE << ii))
-		{
-			ret = cdx_ipsec_sa_fq_check_if_retired_state(pSA->pSec_sa_context->dpa_ipsecsa_handle, ii);
-			/* if fq is not in retired state, restart timer */
-			if (ret)
-			{
-				/*
-				 * A24b: cap the poll loop. A permanently-stuck FQ
-				 * (SEC pipeline wedge, hardware fault) without this
-				 * cap pins the SAEntry forever and prevents fresh
-				 * SA installs from reusing the slot. On cap-hit we
-				 * log loudly and skip the final free — sainfo +
-				 * crypto material leak, but the rest of cdx stays
-				 * recoverable in-band.
-				 */
-				pSA->deletion_iter++;
-				if (pSA->deletion_iter >= SA_RELEASE_MAX_ITER) {
-					pr_warn_ratelimited(
-						"cdx: SA release timeout on handle=0x%x fq[%d] after %u polls — leaking SA resources (A24b)\n",
-						pSA->handle, (int)ii, pSA->deletion_iter);
-					fq_stuck = true;
-					break;
-				}
-				cdx_timer_init((TIMER_ENTRY *)&pSA->deletion_timer,
-					cdx_ipsec_release_sa_ctx_cbk);
-				cdx_timer_add((TIMER_ENTRY *)&pSA->deletion_timer,
-					SA_CTX_RELEASE_TIMER_VAL);
-				return 0;
-			}
-			pSA->flags &= ~((SA_FQ_WAIT_B4_FREE << ii));
+	while (handle && pSA->release_state != SA_RELEASE_FREE) {
+		switch (pSA->release_state) {
+		case SA_RELEASE_TO_SEC:
+			rc = cdx_dpa_ipsec_fq_stop(handle, FQ_TO_SEC);
+			/* Retired but not yet emptied: SEC can already be
+			 * looked at. */
+			if (rc == 1)
+				cdx_ipsec_sa_sec_done(pSA);
+			if (rc)
+				goto wait;
+			break;
+		case SA_RELEASE_SEC_DONE:
+			if (!cdx_ipsec_sa_sec_done(pSA))
+				goto wait;
+			break;
+		case SA_RELEASE_FROM_SEC:
+			if (cdx_dpa_ipsec_fq_stop(handle, FQ_FROM_SEC))
+				goto wait;
+			/* The offline port may still hold frames it took
+			 * from the output queue, bound for the exception
+			 * queue: give it a period before that one stops,
+			 * since a frame it refuses on that portal is lost. */
+			pSA->release_state++;
+			pSA->release_step = jiffies;
+			pSA->release_flags &= ~SA_REL_WARNED;
+			goto wait;
+		case SA_RELEASE_TO_CP:
+			if (cdx_dpa_ipsec_fq_stop(handle, FQ_TO_CP))
+				goto wait;
+			break;
 		}
+		pSA->release_state++;
+		pSA->release_step = jiffies;
+		pSA->release_flags &= ~SA_REL_WARNED;
 	}
-	if (fq_stuck) {
-		/*
-		 * Don't touch sainfo / sec_context / SAEntry — qman may still
-		 * deliver dqrr/ern callbacks through the unretired FQ. Drop the
-		 * SAEntry from cache lists so traffic can't hit it again, but
-		 * leave the per-SA memory alone until the OS reboots.
-		 */
-		sa_remove_from_list_fqid(pSA);
-		return 0;
+	if (pSA->release_flags & SA_REL_HELD) {
+		WRITE_ONCE(sa_release_held, sa_release_held - 1);
+		pr_info("cdx: IPsec SA 0x%x release completed\n", pSA->handle);
 	}
-	/* delete from list_fq */
 	sa_remove_from_list_fqid(pSA);
-
-	sa_context = pSA->pSec_sa_context;
-	cdx_ipsec_sec_sa_context_free(sa_context);
+	cdx_ipsec_sec_sa_context_free(pSA->pSec_sa_context);
 	pSA->pSec_sa_context = NULL;
-	/* free sa memory */
 	sa_free(pSA);
 	return 0;
+wait:
+	cdx_ipsec_sa_release_stalled(pSA);
+	return 1;
 }
 
 void cdx_ipsec_release_sa_resources(PSAEntry pSA)
 {
-	int ii,ret;
 	pSA->flags |= SA_DELETE;
 	/* Delete the hash table entry. On failure the callee has already
 	 * disposed of ct/handle under the ehash tri-state (quarantine or
@@ -826,20 +896,18 @@ void cdx_ipsec_release_sa_resources(PSAEntry pSA)
 	 * the FQIDs and SEC identity the release below would otherwise free. */
 	cdx_ipsec_delete_fp_entry(pSA);
 
-	/* change frame queues states */
+	/* Only the queue into SEC stops now. The rest of the SA goes a step
+	 * at a time from the timer, once SEC is done with what it took
+	 * (cdx_ipsec_release_sa_ctx_cbk()), which also asks again for a
+	 * retirement refused here. */
 	if ((pSA->pSec_sa_context) &&
 	    (pSA->pSec_sa_context->dpa_ipsecsa_handle))
-	{
-		for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
-			ret = cdx_dpa_ipsec_retire_fq(pSA->pSec_sa_context->dpa_ipsecsa_handle, ii);
+		cdx_dpa_ipsec_retire_fq(pSA->pSec_sa_context->dpa_ipsecsa_handle,
+					FQ_TO_SEC);
+	pSA->release_state = SA_RELEASE_TO_SEC;
+	pSA->release_flags = 0;
+	pSA->release_step = jiffies;
 
-			if (ret == 1)
-				pSA->flags |= (SA_FQ_WAIT_B4_FREE << ii);
-
-		}
-	}
-
-	/* defer resource release */
 	cdx_timer_init((TIMER_ENTRY *)&pSA->deletion_timer,
 			cdx_ipsec_release_sa_ctx_cbk);
 	cdx_timer_add((TIMER_ENTRY *)&pSA->deletion_timer,
