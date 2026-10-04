@@ -621,6 +621,20 @@ t_Error FM_MAC_RestartAutoneg(t_Handle h_FmMac)
 
 /* ......................................................................... */
 
+t_Error FM_MAC_SetMaxFrameLength(t_Handle h_FmMac, uint16_t newVal)
+{
+    t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;
+
+    SANITY_CHECK_RETURN_ERROR(p_FmMacControllerDriver, E_INVALID_HANDLE);
+
+    if (p_FmMacControllerDriver->f_FM_MAC_SetMaxFrameLength)
+        return p_FmMacControllerDriver->f_FM_MAC_SetMaxFrameLength(h_FmMac, newVal);
+
+    RETURN_ERROR(MINOR, E_NOT_SUPPORTED, NO_MSG);
+}
+
+/* ......................................................................... */
+
 t_Error FM_MAC_MII_WritePhyReg (t_Handle h_FmMac, uint8_t phyAddr, uint8_t reg, uint16_t data)
 {
     t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;

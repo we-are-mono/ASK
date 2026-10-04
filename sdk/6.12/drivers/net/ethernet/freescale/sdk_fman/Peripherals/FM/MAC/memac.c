@@ -881,6 +881,34 @@ static uint16_t MemacGetMaxFrameLength(t_Handle h_Memac)
     return fman_memac_get_max_frame_len(p_Memac->p_MemMap);
 }
 
+/* ......................................................................... */
+
+static t_Error MemacSetMaxFrameLength(t_Handle h_Memac, uint16_t newVal)
+{
+    t_Memac     *p_Memac = (t_Memac *)h_Memac;
+    e_FmMacType portType;
+    t_Error     err;
+
+    SANITY_CHECK_RETURN_ERROR(p_Memac, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(!p_Memac->p_MemacDriverParam, E_INVALID_STATE);
+
+    portType =
+        ((ENET_SPEED_FROM_MODE(p_Memac->enetMode) < e_ENET_SPEED_10000) ? e_FM_MAC_1G : e_FM_MAC_10G);
+
+    /* The FM checks the length against the port's max frame length and
+     * records it; only once accepted does the MAC see it. */
+    err = FmSetMacMaxFrame(p_Memac->fmMacControllerDriver.h_Fm,
+                           portType,
+                           p_Memac->fmMacControllerDriver.macId,
+                           newVal);
+    if (err)
+        RETURN_ERROR(MINOR, err, NO_MSG);
+
+    fman_memac_set_max_frame_len(p_Memac->p_MemMap, newVal);
+
+    return E_OK;
+}
+
 static t_Error MemacInitInternalPhy(t_Handle h_Memac)
 {
     t_Memac *p_Memac = (t_Memac *)h_Memac;
@@ -1162,6 +1190,7 @@ static void InitFmMacControllerDriver(t_FmMacControllerDriver *p_FmMacController
     p_FmMacControllerDriver->f_FM_MAC_GetId                     = MemacGetId;
     p_FmMacControllerDriver->f_FM_MAC_GetVersion                = NULL;
     p_FmMacControllerDriver->f_FM_MAC_GetMaxFrameLength         = MemacGetMaxFrameLength;
+    p_FmMacControllerDriver->f_FM_MAC_SetMaxFrameLength         = MemacSetMaxFrameLength;
 
     p_FmMacControllerDriver->f_FM_MAC_MII_WritePhyReg           = MEMAC_MII_WritePhyReg;
     p_FmMacControllerDriver->f_FM_MAC_MII_ReadPhyReg            = MEMAC_MII_ReadPhyReg;

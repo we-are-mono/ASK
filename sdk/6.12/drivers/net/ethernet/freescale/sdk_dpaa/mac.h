@@ -88,6 +88,7 @@ struct mac_device {
 	int (*ptp_disable)(struct fm_mac_dev *fm_mac_dev);
 	int (*set_rx_pause)(struct fm_mac_dev *fm_mac_dev, bool en);
 	int (*set_tx_pause)(struct fm_mac_dev *fm_mac_dev, bool en);
+	int (*set_max_frame)(struct fm_mac_dev *fm_mac_dev, int len);
 	int (*fm_rtc_enable)(struct fm *fm_dev);
 	int (*fm_rtc_disable)(struct fm *fm_dev);
 	int (*fm_rtc_get_cnt)(struct fm *fm_dev, uint64_t *ts);

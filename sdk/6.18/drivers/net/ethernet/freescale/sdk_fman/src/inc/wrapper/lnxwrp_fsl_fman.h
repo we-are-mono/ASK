@@ -564,6 +564,20 @@ struct fm_mac_dev *fm_mac_config(t_FmMacParams *params);
 int fm_mac_config_max_frame_length(struct fm_mac_dev *fm_mac_dev,
 		int len);
 
+/**************************************************************************//**
+ @Function	fm_mac_set_max_frame_length
+
+ @Description   Change the maximum Rx frame length of an initialized MAC.
+
+ @Param[in]     fm_mac_dev   - A handle of the FM MAC device.
+ @Param[in]     len          - Whole frame, FCS included; at most
+                               fm_get_max_frm().
+
+ @Return        0 on success; -EOPNOTSUPP if the MAC type cannot change it
+                after init; another negative errno otherwise.
+*//***************************************************************************/
+int fm_mac_set_max_frame_length(struct fm_mac_dev *fm_mac_dev, int len);
+
 int fm_mac_config_pad_and_crc(struct fm_mac_dev *fm_mac_dev, bool enable);
 
 int fm_mac_config_half_duplex(struct fm_mac_dev *fm_mac_dev, bool enable);

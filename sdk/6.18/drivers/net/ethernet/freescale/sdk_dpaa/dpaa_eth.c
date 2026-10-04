@@ -664,6 +664,73 @@ static int __cold dpa_eth_priv_stop(struct net_device *net_dev)
 	return _errno;
 }
 
+/* The tags a full-size frame on the port may carry: none while nothing is
+ * stacked on it, one once anything is -- a VLAN, a bridge forwarding tagged
+ * frames through, a bond, a macvlan -- and two once a VLAN on the port is an
+ * 802.1ad service VLAN or carries a VLAN of its own: a VLAN device above it,
+ * or a bridge it is a port of, which tags the frames it forwards there or
+ * carries tagged ones through.
+ */
+static int dpa_upper_tags(struct net_device *net_dev)
+{
+	struct net_device *upper, *inner;
+	struct list_head *iter, *inner_iter;
+	int tags = 0;
+
+	rcu_read_lock();
+	netdev_for_each_upper_dev_rcu(net_dev, upper, iter) {
+		tags = max(tags, 1);
+		if (!is_vlan_dev(upper))
+			continue;
+		if (vlan_dev_vlan_proto(upper) == htons(ETH_P_8021AD))
+			tags = 2;
+		netdev_for_each_upper_dev_rcu(upper, inner, inner_iter)
+			if (is_vlan_dev(inner) || netif_is_bridge_master(inner))
+				tags = 2;
+	}
+	rcu_read_unlock();
+	return tags;
+}
+
+/* The mEMAC holds every received frame, FCS included, to its max frame length
+ * and makes no allowance of its own for a VLAN tag. Size the limit to what the
+ * port may carry at @mtu, with the tags dpa_upper_tags() allows for. Never
+ * below a standard frame, never above the FMan-wide maximum the ports are
+ * sized for.
+ *
+ * RTNL serializes every caller, so the limit follows the latest MTU and upper
+ * set.
+ */
+static int dpa_set_mac_max_frame(struct net_device *net_dev, int mtu)
+{
+	struct dpa_priv_s *priv = netdev_priv(net_dev);
+	struct mac_device *mac_dev = priv->mac_dev;
+	int len;
+
+	ASSERT_RTNL();
+
+	if (!mac_dev->set_max_frame)
+		return 0;
+
+	len = max(mtu, ETH_DATA_LEN) + ETH_HLEN + ETH_FCS_LEN +
+	      dpa_upper_tags(net_dev) * VLAN_HLEN;
+	len = min(len, dpa_get_max_frm());
+
+	return mac_dev->set_max_frame(mac_dev->get_mac_handle(mac_dev), len);
+}
+
+static int dpa_change_mtu(struct net_device *net_dev, int new_mtu)
+{
+	int err;
+
+	err = dpa_set_mac_max_frame(net_dev, new_mtu);
+	if (err)
+		return err;
+
+	WRITE_ONCE(net_dev->mtu, new_mtu);
+	return 0;
+}
+
 #ifdef CONFIG_NET_POLL_CONTROLLER
 static void dpaa_eth_poll_controller(struct net_device *net_dev)
 {
@@ -696,6 +763,7 @@ static const struct net_device_ops dpa_private_ops = {
 	.ndo_set_rx_mode = dpa_set_rx_mode,
 	.ndo_init = dpa_ndo_init,
 	.ndo_eth_ioctl = dpa_ioctl,
+	.ndo_change_mtu = dpa_change_mtu,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller = dpaa_eth_poll_controller,
 #endif
@@ -732,6 +800,25 @@ void dpa_private_napi_del(struct net_device *net_dev)
 }
 EXPORT_SYMBOL(dpa_private_napi_del);
 
+/* Without the jumbo buffer layout an Rx buffer is sized for one standard
+ * frame, yet fsl_fm_max_frm may raise the FMan-wide maximum far past it. Cap
+ * the MTU at what one buffer holds behind its headroom, a VLAN tag and the
+ * forwarded FCS included, so a frame the MAC accepts lands in one piece. The
+ * standard MTU stays available whatever the layout.
+ */
+static int dpa_priv_max_mtu(const struct dpa_priv_s *priv)
+{
+	int max_mtu = dpa_get_max_mtu();
+#ifndef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+	int buf_mtu = (int)priv->dpa_bp->size - priv->rx_headroom -
+		      (VLAN_ETH_HLEN + ETH_FCS_LEN);
+
+	max_mtu = min(max_mtu, max(buf_mtu, ETH_DATA_LEN));
+#endif
+
+	return max_mtu;
+}
+
 static int dpa_private_netdev_init(struct net_device *net_dev)
 {
 	int i;
@@ -755,7 +842,7 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
 
 	/* Configure the maximum MTU according to the FMan's MAXFRM */
 	net_dev->min_mtu = ETH_MIN_MTU;
-	net_dev->max_mtu = dpa_get_max_mtu();
+	net_dev->max_mtu = dpa_priv_max_mtu(priv);
 
 	net_dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 				NETIF_F_RXCSUM;
@@ -1168,11 +1255,55 @@ static struct platform_driver dpa_driver = {
 	.remove		= dpa_remove
 };
 
+/* A port's max frame length depends on its uppers as well as its MTU, so
+ * follow uppers being linked and unlinked, on the port and on a VLAN over it
+ * (a VLAN stacked on that VLAN adds a tag). Registration applies the first
+ * per-port limit: the MAC was initialized with the FMan-wide maximum, and a
+ * port left there would take frames its MTU says it cannot, so a failure
+ * fails the registration.
+ */
+static int dpa_netdev_event(struct notifier_block *nb, unsigned long event,
+			    void *ptr)
+{
+	struct net_device *net_dev = netdev_notifier_info_to_dev(ptr);
+	int err;
+
+	if (event == NETDEV_CHANGEUPPER && is_vlan_dev(net_dev))
+		net_dev = vlan_dev_real_dev(net_dev);
+	if (net_dev->netdev_ops != &dpa_private_ops)
+		return NOTIFY_DONE;
+
+	switch (event) {
+	case NETDEV_REGISTER:
+		return notifier_from_errno(dpa_set_mac_max_frame(net_dev,
+								 net_dev->mtu));
+	case NETDEV_CHANGEUPPER:
+		err = dpa_set_mac_max_frame(net_dev, net_dev->mtu);
+		if (unlikely(err < 0))
+			netdev_err(net_dev, "mac_dev->set_max_frame() = %d\n",
+				   err);
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block dpa_netdev_nb = {
+	.notifier_call = dpa_netdev_event,
+};
+
 static int __init __cold dpa_load(void)
 {
 	int	 _errno;
 
 	pr_info(DPA_DESCRIPTION "\n");
+
+	_errno = register_netdevice_notifier(&dpa_netdev_nb);
+	if (unlikely(_errno < 0)) {
+		pr_err(KBUILD_MODNAME ": register_netdevice_notifier() = %d\n",
+		       _errno);
+		return _errno;
+	}
 
 #ifdef CONFIG_FSL_DPAA_DBG_LOOP
 	dpa_debugfs_module_init();
@@ -1192,6 +1323,7 @@ static int __init __cold dpa_load(void)
 		pr_err(KBUILD_MODNAME
 			": %s:%hu:%s(): platform_driver_register() = %d\n",
 			KBUILD_BASENAME".c", __LINE__, __func__, _errno);
+		unregister_netdevice_notifier(&dpa_netdev_nb);
 	}
 
 	pr_debug(KBUILD_MODNAME ": %s:%s() ->\n",
@@ -1219,6 +1351,7 @@ static void __exit __cold dpa_unload(void)
 #endif
 
 	platform_driver_unregister(&dpa_driver);
+	unregister_netdevice_notifier(&dpa_netdev_nb);
 
 #ifdef CONFIG_FSL_DPAA_DBG_LOOP
 	dpa_debugfs_module_exit();

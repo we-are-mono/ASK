@@ -1538,6 +1538,29 @@ int fm_mac_config_max_frame_length(struct fm_mac_dev *fm_mac_dev,
 }
 EXPORT_SYMBOL(fm_mac_config_max_frame_length);
 
+int fm_mac_set_max_frame_length(struct fm_mac_dev *fm_mac_dev, int len)
+{
+	t_Error err;
+	int _errno;
+
+	/* Ports are sized for fsl_fm_max_frm; a MAC may accept less, never
+	 * more.
+	 */
+	if (len <= 0 || len > fsl_fm_max_frm)
+		return -EINVAL;
+
+	err = FM_MAC_SetMaxFrameLength(fm_mac_dev, (uint16_t)len);
+	if (GET_ERROR_TYPE(err) == E_NOT_SUPPORTED)
+		return -EOPNOTSUPP;
+
+	_errno = -GET_ERROR_TYPE(err);
+	if (unlikely(_errno < 0))
+		pr_err("FM_MAC_SetMaxFrameLength() = 0x%08x\n", err);
+
+	return _errno;
+}
+EXPORT_SYMBOL(fm_mac_set_max_frame_length);
+
 int fm_mac_config_pad_and_crc(struct fm_mac_dev *fm_mac_dev, bool enable)
 {
 	int err;

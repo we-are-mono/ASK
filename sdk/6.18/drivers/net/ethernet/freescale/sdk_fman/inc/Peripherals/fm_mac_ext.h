@@ -804,6 +804,23 @@ t_Error FM_MAC_AdjustLink(t_Handle h_FmMac, e_EnetSpeed speed, bool fullDuplex);
 t_Error FM_MAC_RestartAutoneg(t_Handle h_FmMac);
 
 /**************************************************************************//**
+ @Function      FM_MAC_SetMaxFrameLength
+
+ @Description   Change the maximum Rx frame length of an initialized MAC.
+                The length covers the whole frame, FCS included. It may
+                not exceed the max frame length of the MAC's port.
+                This routine is relevant only for mEMAC.
+
+ @Param[in]     h_FmMac     - A handle to a FM MAC Module.
+ @Param[in]     newVal      - MAX Frame length
+
+ @Return        E_OK on success; Error code otherwise.
+
+ @Cautions      Allowed only after FM_MAC_Init().
+*//***************************************************************************/
+t_Error FM_MAC_SetMaxFrameLength(t_Handle h_FmMac, uint16_t newVal);
+
+/**************************************************************************//**
  @Function      FM_MAC_GetId
 
  @Description   Return the MAC ID

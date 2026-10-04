@@ -19,7 +19,6 @@ SRC_URI += "\
            file://093-netlink-name-every-cb-mutex-class.patch \
            file://094-qbman-kasan-sanitize-off.patch \
            file://108-xfrm-validate-xmit-einprogress.patch \
-           file://109-sdk_dpaa-rx-max-frame-follows-mtu.patch \
            file://110-sdk-mainline-build-compat.patch \
            file://111-sdk_dpaa-cpu-queues-bounded-by-pool-share.patch \
            file://120-emc2305-dt-fan-control.patch \

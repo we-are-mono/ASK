@@ -151,6 +151,10 @@ static int __cold memac_init(struct mac_device *mac_dev)
 		(macdev2enetinterface(mac_dev) != e_ENET_MODE_XGMII_10000) ?
 			param.macId : param.macId + FM_MAX_NUM_OF_1G_MACS);
 
+	/* The FMan-wide maximum is only the starting point: the net device
+	 * narrows it to its MTU once registered (see dpa_set_mac_max_frame()).
+	 * A MAC no net device drives keeps it.
+	 */
 	_errno = fm_mac_config_max_frame_length(priv->fm_mac, fm_get_max_frm());
 	if (unlikely(_errno < 0))
 		goto _return_fm_mac_free;
@@ -642,6 +646,7 @@ static void setup_memac(struct mac_device *mac_dev)
 	mac_dev->get_mac_handle		= get_mac_handle;
 	mac_dev->set_tx_pause		= fm_mac_set_tx_pause_frames;
 	mac_dev->set_rx_pause		= fm_mac_set_rx_pause_frames;
+	mac_dev->set_max_frame		= fm_mac_set_max_frame_length;
 	mac_dev->fm_rtc_enable		= fm_rtc_enable;
 	mac_dev->fm_rtc_disable		= fm_rtc_disable;
 	mac_dev->fm_rtc_get_cnt		= fm_rtc_get_cnt;

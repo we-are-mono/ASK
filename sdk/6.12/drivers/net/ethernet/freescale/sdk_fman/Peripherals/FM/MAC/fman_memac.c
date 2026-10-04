@@ -275,6 +275,16 @@ uint16_t fman_memac_get_max_frame_len(struct memac_regs *regs)
     return(uint16_t)tmp;
 }
 
+/* Written as is, with Rx possibly running: nothing quiesces the MAC around
+ * the write. Every runtime change of the limit funnels through here, so
+ * should the hardware need Rx disabled for it, this is the one place to do
+ * so. */
+void fman_memac_set_max_frame_len(struct memac_regs *regs,
+	uint16_t max_frame_len)
+{
+    iowrite32be((uint32_t)max_frame_len, &regs->maxfrm);
+}
+
 
 void fman_memac_set_tx_pause_frames(struct memac_regs *regs,
                 uint8_t priority,
