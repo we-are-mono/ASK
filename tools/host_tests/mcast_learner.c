@@ -113,6 +113,7 @@ struct net_device {
 };
 
 #define READ_ONCE(x) (x)
+#define __force
 #define WRITE_ONCE(x, v) ((x) = (v))
 
 struct cdx_ft_vlan { uint16_t proto; uint16_t id; };
@@ -160,8 +161,38 @@ static void list_move(struct list_head *e, struct list_head *h)
          &pos->member != (head); \
          pos = n, n = list_entry(n->member.next, __typeof__(*n), member))
 
+/* --- hashtable.h, enough of it --------------------------------------- */
+struct hlist_node { struct hlist_node *next, **pprev; };
+struct hlist_head { struct hlist_node *first; };
+#define DEFINE_HASHTABLE(name, bits) struct hlist_head name[1 << (bits)]
+#define HASH_SIZE(name) (sizeof(name) / sizeof((name)[0]))
+#define hash_init(name) memset(name, 0, sizeof(name))
+static void hlist_add_head(struct hlist_node *n, struct hlist_head *h)
+{
+    n->next = h->first;
+    if (h->first)
+        h->first->pprev = &n->next;
+    h->first = n;
+    n->pprev = &h->first;
+}
+static void hash_del(struct hlist_node *n)
+{
+    *n->pprev = n->next;
+    if (n->next)
+        n->next->pprev = n->pprev;
+    n->next = NULL;
+    n->pprev = NULL;
+}
+#define hash_add(name, node, key) hlist_add_head(node, &(name)[(key) % HASH_SIZE(name)])
+#define hlist_entry_safe(ptr, type, member) \
+    ((ptr) ? list_entry(ptr, type, member) : NULL)
+#define hash_for_each_possible(name, obj, member, key) \
+    for (obj = hlist_entry_safe((name)[(key) % HASH_SIZE(name)].first, __typeof__(*(obj)), member); \
+         obj; obj = hlist_entry_safe((obj)->member.next, __typeof__(*(obj)), member))
+
 /* --- stubs ----------------------------------------------------------- */
 static LIST_HEAD(ft_mc_groups);
+static DEFINE_HASHTABLE(ft_mc_group_index, 8);
 static LIST_HEAD(ft_mc_flows);
 static unsigned int ft_mc_count, ft_mc_flow_count;
 static unsigned long long ft_mc_refused;
@@ -987,6 +1018,7 @@ static void reset(void)
 
     while (!list_empty(&ft_mc_groups))
         list_move(ft_mc_groups.next, &dead);
+    hash_init(ft_mc_group_index);
     while (!list_empty(&ft_mc_flows))
         list_move(ft_mc_flows.next, &gone);
     free_lists(&dead, &gone);
@@ -2945,7 +2977,9 @@ static void a_stream_nobody_wants_is_dropped_in_hardware(void)
     ft_mc_work_fn(NULL);
     assert(!f->gone && f->hw && f->hw_discard);
     ft_mc_refresh_fn(NULL);
-    assert(f->gone);
+    /* Aged, and still in hardware until the worker takes it out: the row
+     * says that, not a refusal the flow never had. */
+    assert(f->gone && f->hw && !strcmp(ft_mc_state(f), "retiring"));
     ft_mc_work_fn(NULL);
     assert(!flow(&P1, S, 0) && dels == 3 && !ft_mc_discarding && !ft_mc_flow_count);
     stats_now = (struct cdx_ft_counters){ 0 };
@@ -4006,7 +4040,10 @@ static void idle_flows_age_out(void)
     c = (struct cdx_ft_counters){ .packets = 101, .bytes = 6464 };
     ft_mc_flow_counted(f, &c, t0 + 4 * FT_MC_REFRESH_INTERVAL);
     assert(!f->gone && f->active == t0 + 4 * FT_MC_REFRESH_INTERVAL);
-    f->gone = true;
+    /* Nothing counted past its interval: the entry ages, and until the worker
+     * takes it out the row says it is going rather than "installed". */
+    ft_mc_flow_counted(f, &c, t0 + 7 * FT_MC_REFRESH_INTERVAL);
+    assert(f->gone && f->hw && f->ports && !strcmp(ft_mc_state(f), "retiring"));
     pass();
     assert(!ft_mc_flow_count);
     memset(&c, 0, sizeof(c));
@@ -4074,6 +4111,130 @@ static void idle_flows_age_out(void)
     assert(!ft_mc_lock && !in_transaction && refresh_rearms);
 }
 
+/* A frame as the worker drains it, past the dedup slots: the cases below
+ * make more streams than one interval's slots record. */
+static void observe(struct ft_mc_seen o)
+{
+    mutex_lock(&ft_mc_lock);
+    ft_mc_observe(&o);
+    mutex_unlock(&ft_mc_lock);
+}
+
+static unsigned port_flows(const struct net_device *in)
+{
+    struct ft_mc_flow *f;
+    unsigned n = 0;
+
+    list_for_each_entry(f, &ft_mc_flows, list)
+        if (!f->gone && f->in == in)
+            n++;
+    return n;
+}
+
+/* No more than FT_MC_MAX_PORT_FLOWS flows arriving on one port, and no more
+ * than FT_MC_MAX_TOTAL_FLOWS in all. Every source of every group a membership
+ * names would otherwise be a flow, and a sender choosing both made thousands,
+ * each asked of the bridge under RTNL at every refresh. A source past either
+ * bound is turned away as one past FT_MC_MAX_FLOWS is: no flow, and counted. */
+static void the_learner_keeps_a_bounded_number_of_flows(void)
+{
+    struct net_device *ports[] = { &P1, &P2, &P3 };
+    const unsigned groups = FT_MC_MAX_PORT_FLOWS / FT_MC_MAX_FLOWS + 1;
+    struct ft_mc_flow *f;
+    unsigned p, g, s;
+
+    /* Two ports reach the total, so the third finds it reached. */
+    assert(FT_MC_MAX_PORT_FLOWS < FT_MC_MAX_TOTAL_FLOWS &&
+           2 * FT_MC_MAX_PORT_FLOWS >= FT_MC_MAX_TOTAL_FLOWS);
+    reset();
+    /* Each port its own groups: FT_MC_MAX_FLOWS is a group's, whatever
+     * port its sources arrive on. */
+    for (g = 0; g < 3 * groups; g++) {
+        struct br_ip any = group_v4(htonl(0xef010000 + g), 0, 0);
+
+        assert(ft_mc_membership(&BR, &P3, &any, true, false));
+    }
+    for (p = 0; p < 3; p++)
+        for (g = 0; g < groups; g++)
+            for (s = 0; s < FT_MC_MAX_FLOWS; s++)
+                observe(seen_v4(&BR, ports[p], htonl(0xef010000 + p * groups + g),
+                                htonl(0x0a000000 | p << 16 | g << 4 | s), 0, false, SENDER));
+    assert(port_flows(&P1) == FT_MC_MAX_PORT_FLOWS);
+    assert(port_flows(&P2) == FT_MC_MAX_TOTAL_FLOWS - FT_MC_MAX_PORT_FLOWS);
+    assert(!port_flows(&P3) && ft_mc_flow_count == FT_MC_MAX_TOTAL_FLOWS);
+    assert(ft_mc_refused);
+
+    /* A flow going makes room for the next source. */
+    list_for_each_entry(f, &ft_mc_flows, list)
+        if (f->in == &P2) {
+            f->gone = true;
+            break;
+        }
+    pass();
+    assert(ft_mc_flow_count == FT_MC_MAX_TOTAL_FLOWS - 1);
+    observe(seen_v4(&BR, &P3, htonl(0xef010000 + 2 * groups), htonl(0x0a0f0000), 0, false, SENDER));
+    assert(port_flows(&P3) == 1 && ft_mc_flow_count == FT_MC_MAX_TOTAL_FLOWS);
+}
+
+/* A flow nothing carries is kept only while its stream arrives. Its frames
+ * are not recorded again once seen, so a flow that has heard nothing for
+ * FT_MC_UNCARRIED_AGE asks: its slot lapses, its next frame is recorded and
+ * answers, and a flow with no answer by the next age goes. */
+static void an_uncarried_flow_lives_while_its_stream_does(void)
+{
+    const uint32_t G = htonl(0xef020001), S = htonl(0x0a000009);
+    struct br_ip any = group_v4(G, 0, 0);
+    struct ft_mc_flow *f;
+
+    reset();
+    ft_mc_filtered = true;
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && !f->hw && !f->probing);
+    jiffies += FT_MC_UNCARRIED_AGE + 1;
+    ft_mc_refresh_fn(NULL);
+    assert(f->probing && !f->gone);
+    /* Installed before a frame answered: the entry's counts age it from
+     * here, and the question is dropped. Withdrawn again, it starts a fresh
+     * age rather than going at the next look. */
+    {
+        static char entry;
+        unsigned long asked = f->seen_at;
+
+        f->hw = (void *)&entry;
+        mutex_lock(&ft_mc_lock);
+        ft_mc_flow_probe(f, jiffies + FT_MC_UNCARRIED_AGE + 1);
+        mutex_unlock(&ft_mc_lock);
+        assert(!f->probing && !f->gone && f->seen_at != asked);
+        f->hw = NULL;
+        mutex_lock(&ft_mc_lock);
+        ft_mc_flow_probe(f, jiffies + FT_MC_UNCARRIED_AGE + 2);
+        mutex_unlock(&ft_mc_lock);
+        assert(!f->probing && !f->gone);
+        f->probing = true;
+        f->seen_at = asked;
+    }
+    /* The stream is still there: its next frame is news again. */
+    jiffies += FT_MC_REFRESH_INTERVAL;
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    assert(!f->probing && !f->gone);
+    /* It stops: the next age asks, and the one after takes the flow. */
+    jiffies += FT_MC_UNCARRIED_AGE + 1;
+    ft_mc_refresh_fn(NULL);
+    assert(f->probing && !f->gone);
+    jiffies += FT_MC_UNCARRIED_AGE + 1;
+    ft_mc_refresh_fn(NULL);
+    assert(f->gone);
+    pass();
+    assert(!flow(&P1, S, 0));
+    /* A frame after that is a stream again, and learned. */
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    assert(flow(&P1, S, 0));
+    ft_mc_filtered = false;
+}
+
 int main(void)
 {
     /* Until the routed learner first says where its VIFs are, they may be
@@ -4103,6 +4264,8 @@ int main(void)
     a_netdev_chain_keeps_a_flow_in_software();
     a_port_moves_between_bridges();
     idle_flows_age_out();
+    the_learner_keeps_a_bounded_number_of_flows();
+    an_uncarried_flow_lives_while_its_stream_does();
 
     reset();
     assert(holds == 0);

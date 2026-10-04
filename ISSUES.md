@@ -231,6 +231,50 @@ result independently of those temporary files.
   Captures, image identity and diagnostic scripts:
   `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
 
+- [ ] **A314 — 1.1.0's bridged multicast flow caps keep a wanted stream out behind unwanted ones.** Regression found by
+  `flowtable_service_multicast_discard_capacity.py` (run 2026-10-04) and confirmed by review. `ft_mc_observe()`
+  (cdx/ask_flowtable.c) counts installed discards toward `FT_MC_MAX_PORT_FLOWS` (256) and `FT_MC_MAX_TOTAL_FLOWS` (512);
+  discards keep counting while their upstream sends, so 256 of them on one port refuse every newly joined stream there
+  before A292's eviction can run. Fix: count only flows that are not installed discards (they are bounded by group ids
+  and give way under A292). The test must fill in two waves of 256 from one port, then join on that port.
+
+- [ ] **A306 — a flow admitted plain under an optional ("level use") template may stay plain in hardware after an SA appears.**
+  Unconfirmed, from review. With no SA yet, `xfrm_lookup()` resolves an optional template to the plain route, and
+  `ft_ipsec_resolve()` (cdx/ask_flowtable.c) admits the direction as plain. A later SA add changes what software would do
+  (it encrypts) but bumps no policy generation. If nothing else retires the entry, hardware keeps forwarding plaintext.
+  Confirm whether `ft_ipsec_genid` or the SA watch already retires such entries on an SA add. If not, retire entries a
+  `use` template covers when a matching SA is added, or refuse admission under any optional template. Mostly an IPComp
+  or hand-configured case: strongSwan installs `required` templates.
+
+- [ ] **A308 — an IPsec SA release that finds a queue non-empty or SEC busy leaks the SA for the boot.** Source-verified
+  by the 1.1.0 audit, not reproduced. `cdx_dpa_ipsecsa_release()` (cdx/dpa_ipsec.c) gives up when a retired SA FQ still
+  holds frames, or when the device-global CAAM CSTA IDLE bit is not seen within 10-20 ms. Each give-up keeps one of 4094
+  key tags; once they are gone every offloaded SA install fails until reboot. Open questions: CSTA IDLE semantics under
+  queued QI work; whether QMan accepts SEC output into the already-retired FROM_SEC FQ. Fix direction: retry the release
+  from a worker until drained, rather than abandoning it. Check: rekey a loaded tunnel repeatedly, watch the free tag count.
+
+- [ ] **A309 — the routed multicast learner has no group cap and a pass can outrun its 5 s period.** Source-verified by the
+  audit; needs a multicast routing daemon, which no shipped profile starts. `ft_mr_work_fn()` (cdx/ask_flowtable.c) keeps
+  an uncapped group list, re-derives every group each `FT_MR_STATS_INTERVAL` with a head-first quadratic pick and an RTNL
+  hold per group; once a pass exceeds the interval the work never ends. Fix direction: cap groups like the bridged learner
+  (1.1.0) and resume a pass from a cursor.
+
+- [ ] **A310 — unloading cdx leaves its clsact police/DSCP `flow_block` callbacks on DPAA tc blocks.** Source-verified by the
+  audit. A later tc operation on that port calls freed module text. Production never unloads cdx (load-once); it needs
+  root with `CAP_SYS_MODULE`. Fix: unbind every callback cdx bound before its module exit returns.
+
+- [ ] **A311 — a Wi-Fi VWD slot can be rebound to a new VAP before an entry built for the old VAP leaves hardware.**
+  Source-verified residual race, not reproduced: when the native `NETDEV_DOWN` delete is skipped (`NF_FLOW_HW_PENDING`,
+  or an allocation failure in `nf_flow_table_cleanup`), `ft_wifi_work` can win `ctrl.mutex` over the queued
+  `ft_retire_work` and reuse the slot's forwarding FQs. Unicast for the old VAP then reaches the new one. Fix: retire the
+  slot's entries before a rebind, not after.
+
+- [ ] **A312 — the health probe's `/proc/cdx_flowtable` render can miss its 5 s deadline under heavy bridged multicast.**
+  Source-verified by the audit; wall clock unmeasured. The probe renders the header, including O(bridged flows ×
+  groups) rows that an on-link sender sizes, and seq_file re-renders it on every buffer doubling. Mitigated in 1.1.0:
+  bridged flow caps, and ask-recovery-monitor resets only after three consecutive misses. Remaining fix: have
+  `ask-flowtable health` read a bounded status record, not the full header. Only matters where `integration/` is installed.
+
 - [x] **A276 — the data plane wedged twice under a flooded ESP SA.** An HC command
   timed out ("board reset required") because 11aa150's per-SA offline-port classification
   stranded an OH microcode task on a miss, starving the shared TNUM pool HC depends on

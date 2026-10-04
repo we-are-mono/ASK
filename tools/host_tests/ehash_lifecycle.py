@@ -30,14 +30,11 @@ def test_ehash_teardown(tmp_path):
 
     ehash = (sdk / "Peripherals/FM/Pcd/fm_ehash.c").read_text()
     cc = (sdk / "Peripherals/FM/Pcd/fm_cc.c").read_text()
-    wrapper = (sdk / "src/wrapper/lnxwrp_ioctls_fm.c").read_text()
     (tmp_path / "ehash_production.inc").write_text(
         function(ehash, "FreeEnEhashInfo") + function(ehash, "FM_PCD_HashTableDelete")
         + function(cc, "copy_td_to_ccbase") + function(cc, "FM_PCD_CcRootDelete")
         + function(cc, "FM_PCD_CcRootModifyNextEngine")
         + function(cc, "FmPcdCcModifyNextEngineParamTree")
-        + wrapper[wrapper.index("#define FM_PCD_COOKIE_SLOTS"):
-                  wrapper.index("static t_Error fm_pcd_cookie_to_handle")]
     )
     # CDX's quarantine over the same table API: its node type through
     # cdx_ehash_delete_entry(), the one delete every CDX path goes through.
@@ -45,12 +42,6 @@ def test_ehash_teardown(tmp_path):
     (tmp_path / "quarantine_production.inc").write_text(
         quarantine[quarantine.index("struct cdx_ehash_pending_free {"):
                    quarantine.index("/* delete classif entry from table.")])
-    start = wrapper.index("#if defined(CONFIG_COMPAT)\n        case FM_PCD_IOC_HASH_TABLE_SET_COMPAT:")
-    end = wrapper.index("#if defined(CONFIG_COMPAT)\n        case FM_PCD_IOC_HASH_TABLE_ADD_KEY_COMPAT:", start)
-    (tmp_path / "hash_ioctl.inc").write_text(
-        function(wrapper, "fm_pcd_compat_hash_put")
-        + "static t_Error hash_ioctl(t_LnxWrpFmDev *p_LnxWrpFmDev, unsigned cmd, unsigned long arg, bool compat) { t_Error err = E_OK; switch (cmd) {\n"
-        + wrapper[start:end] + "default: return E_INVALID_SELECTION; } return err; }\n")
     binary = tmp_path / "ehash_lifecycle"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

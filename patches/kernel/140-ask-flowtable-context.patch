@@ -1,30 +1,30 @@
-From 1c01ce06a28513f8cc39a32f18dee6d1ceba1d49 Mon Sep 17 00:00:00 2001
+From 552ba9ab2072461e55e44eebdd1fa368883e70b2 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
  context
 
 ---
- drivers/net/bonding/bond_main.c       |  80 ++++++++++++------
+ drivers/net/bonding/bond_main.c       |  80 +++++++++++------
  include/linux/netdevice.h             |   2 +
  include/net/flow.h                    |   2 +
- include/net/flow_offload.h            |  34 ++++++++
- include/net/netevent.h                |  31 +++++++
- include/net/netfilter/nf_flow_table.h |  49 +++++++++++
+ include/net/flow_offload.h            |  37 ++++++++
+ include/net/netevent.h                |  32 +++++++
+ include/net/netfilter/nf_flow_table.h |  60 +++++++++++++
  include/net/netns/xfrm.h              |   2 +
- include/net/xfrm.h                    |  90 +++++++++++++++++---
+ include/net/xfrm.h                    | 106 +++++++++++++++++++---
  net/ipv4/fib_trie.c                   |  20 +++++
  net/ipv4/route.c                      |   3 +-
- net/ipv6/ip6_fib.c                    |  23 ++++++
- net/netfilter/nf_flow_table_core.c    |  75 ++++++++++++++++-
+ net/ipv6/ip6_fib.c                    |  23 +++++
+ net/netfilter/nf_flow_table_core.c    |  89 +++++++++++++++++-
  net/netfilter/nf_flow_table_ip.c      |  25 +++++-
- net/netfilter/nf_flow_table_offload.c | 113 +++++++++++++++++++++++++-
- net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++++++----
- net/xfrm/xfrm_device.c                |  29 +++++--
- net/xfrm/xfrm_policy.c                | 104 +++++++++++++++++++++++-
+ net/netfilter/nf_flow_table_offload.c | 113 ++++++++++++++++++++++-
+ net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++++----
+ net/xfrm/xfrm_device.c                |  29 ++++--
+ net/xfrm/xfrm_policy.c                | 124 +++++++++++++++++++++++++-
  net/xfrm/xfrm_state.c                 |  25 ++++--
  net/xfrm/xfrm_user.c                  |   6 ++
- 19 files changed, 738 insertions(+), 77 deletions(-)
+ 19 files changed, 803 insertions(+), 77 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index 2919329a8c20..a6780e8dca2d 100644
@@ -292,10 +292,10 @@ index 335bbc52171c..5e373dbaa397 100644
  	kuid_t  flowic_uid;
  	__u32		flowic_multipath_hash;
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f4b762..7bfe51fe316d 100644
+index 292cd8f4b762..49f33defcb9a 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -688,7 +688,41 @@ struct flow_cls_common_offload {
+@@ -688,7 +688,44 @@ struct flow_cls_common_offload {
  	struct netlink_ext_ack *extack;
  };
  
@@ -310,6 +310,9 @@ index 292cd8f4b762..7bfe51fe316d 100644
 + * nf_flow_offload_handle_get/put; it carries no flow/table/conntrack pointer.
 + * nf_xfrm_genid is the policy generation captured before route selection.
 + * Drivers must validate it before admission and after publishing their watch.
++ * It is the flow's creation generation on every later offer too, so once a
++ * driver watches the handle (nf_flow_offload_handle_watch()) the watch, not
++ * this value, decides whether a policy change retires the flow.
 + * Each destination carries the cookie it was selected with: an IPv6 route is
 + * only valid for one FIB generation, so dst_check() needs that value and a
 + * zero cookie rejects every IPv6 destination. IPv4 ignores it.
@@ -338,7 +341,7 @@ index 292cd8f4b762..7bfe51fe316d 100644
  	enum flow_cls_command command;
  	bool use_act_stats;
 diff --git a/include/net/netevent.h b/include/net/netevent.h
-index 1be3757a8b7f..11b7d121af84 100644
+index 1be3757a8b7f..a98d45128798 100644
 --- a/include/net/netevent.h
 +++ b/include/net/netevent.h
 @@ -2,6 +2,9 @@
@@ -389,19 +392,20 @@ index 1be3757a8b7f..11b7d121af84 100644
  enum netevent_notif_type {
  	NETEVENT_NEIGH_UPDATE = 1, /* arg is struct neighbour ptr */
  	NETEVENT_REDIRECT,	   /* arg is struct netevent_redirect ptr */
-@@ -30,6 +57,10 @@ enum netevent_notif_type {
+@@ -30,6 +57,11 @@ enum netevent_notif_type {
  	NETEVENT_IPV4_MPATH_HASH_UPDATE, /* arg is struct net ptr */
  	NETEVENT_IPV6_MPATH_HASH_UPDATE, /* arg is struct net ptr */
  	NETEVENT_IPV4_FWD_UPDATE_PRIORITY_UPDATE, /* arg is struct net ptr */
 +	NETEVENT_IPV4_ROUTE_UPDATE, /* arg is struct netevent_ipv4_route ptr */
 +	NETEVENT_IPV6_ROUTE_UPDATE, /* arg is struct netevent_ipv6_route ptr */
-+	/* Borrowed net pointer; atomic context, notification cannot be vetoed. */
++	/* Borrowed struct xfrm_flowtable_change ptr; atomic context,
++	 * notification cannot be vetoed. */
 +	NETEVENT_XFRM_POLICY_UPDATE,
  };
  
  int register_netevent_notifier(struct notifier_block *nb);
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 1a6fca013165..7888c0b68089 100644
+index 1a6fca013165..bc7f2e12c936 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -84,6 +84,12 @@ struct nf_flowtable {
@@ -478,7 +482,7 @@ index 1a6fca013165..7888c0b68089 100644
  		enum flow_offload_xmit_type	xmit_type;
  	} tuple[FLOW_OFFLOAD_DIR_MAX];
  };
-@@ -221,6 +257,19 @@ struct nf_flow_route {
+@@ -221,6 +257,30 @@ struct nf_flow_route {
  struct flow_offload *flow_offload_alloc(struct nf_conn *ct);
  void flow_offload_free(struct flow_offload *flow);
  
@@ -489,11 +493,22 @@ index 1a6fca013165..7888c0b68089 100644
 + * The driver remains responsible for removing its hardware directions.
 + * Detaching the Linux flow also invalidates the handle; it cannot name a
 + * replacement flow even if its tuple or cookie is reused.
++ *
++ * Watch takes over XFRM policy invalidation for one handle. Without it any
++ * policy change retires the flow, as its generation goes stale. A driver calls
++ * it once it has published the flow to its NETEVENT_XFRM_POLICY_UPDATE watch
++ * and found the offer's generation still current, and from then on invalidates
++ * the handle for every change whose policy can select the flow, for as long as
++ * it keeps the flow published. A flow it stops publishing may keep a valid,
++ * watched handle: its software path stays on the policy hooks while any policy
++ * exists (xfrm_flowtable_enabled()), and a new offer of it carries the creation
++ * generation, which any later change has left stale.
 + */
 +void nf_flow_offload_handle_get(struct nf_flow_offload_handle *handle);
 +void nf_flow_offload_handle_put(struct nf_flow_offload_handle *handle);
 +bool nf_flow_offload_handle_valid(const struct nf_flow_offload_handle *handle);
 +bool nf_flow_offload_handle_invalidate(struct nf_flow_offload_handle *handle);
++void nf_flow_offload_handle_watch(struct nf_flow_offload_handle *handle);
 +
  static inline int
  nf_flow_table_offload_add_cb(struct nf_flowtable *flow_table,
@@ -519,7 +534,7 @@ index 9c7c9758e5e1..fb0cfde4c05d 100644
  	struct hlist_head	*policy_byidx;
  	unsigned int		policy_idx_hmask;
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index 2412c22ce0a6..4f61e50f2b70 100644
+index 2412c22ce0a6..bd5a813c82ad 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
 @@ -12,6 +12,7 @@
@@ -548,7 +563,7 @@ index 2412c22ce0a6..4f61e50f2b70 100644
  };
  
  struct xfrm_mode {
-@@ -1199,6 +1204,32 @@ static inline struct xfrm_offload *xfrm_offload(struct sk_buff *skb)
+@@ -1199,6 +1204,41 @@ static inline struct xfrm_offload *xfrm_offload(struct sk_buff *skb)
  #ifdef CONFIG_XFRM
  int __xfrm_policy_check(struct sock *, int dir, struct sk_buff *skb,
  			unsigned short family);
@@ -558,7 +573,16 @@ index 2412c22ce0a6..4f61e50f2b70 100644
 +			      u16 family);
 +bool xfrm_flowtable_in_plain(struct net *net, const struct flowi *fl,
 +			     u16 family);
-+void xfrm_flowtable_policy_changed(struct net *net);
++
++/* What NETEVENT_XFRM_POLICY_UPDATE reports: the namespace, and the policy
++ * linked, unlinked or migrated, or NULL for a change no one policy's selector
++ * bounds (a default), which can affect every flow. Borrowed for the call. */
++struct xfrm_flowtable_change {
++	struct net *net;
++	const struct xfrm_policy *pol;
++};
++
++void xfrm_flowtable_policy_changed(struct net *net, const struct xfrm_policy *pol);
 +
 +static inline u64 xfrm_flowtable_genid(struct net *net)
 +{
@@ -581,7 +605,7 @@ index 2412c22ce0a6..4f61e50f2b70 100644
  
  static inline bool __xfrm_check_nopolicy(struct net *net, struct sk_buff *skb,
  					 int dir)
-@@ -1356,6 +1387,24 @@ static inline void xfrm_sk_free_policy(struct sock *sk)
+@@ -1356,6 +1396,24 @@ static inline void xfrm_sk_free_policy(struct sock *sk)
  #else
  
  static inline void xfrm_sk_free_policy(struct sock *sk) {}
@@ -606,7 +630,7 @@ index 2412c22ce0a6..4f61e50f2b70 100644
  static inline int xfrm_sk_clone_policy(struct sock *sk, const struct sock *osk) { return 0; }
  static inline int xfrm6_route_forward(struct sk_buff *skb) { return 1; }
  static inline int xfrm4_route_forward(struct sk_buff *skb) { return 1; }
-@@ -1654,14 +1703,40 @@ struct xfrm_state *xfrm_state_lookup_byspi(struct net *net, __be32 spi,
+@@ -1654,14 +1712,40 @@ struct xfrm_state *xfrm_state_lookup_byspi(struct net *net, __be32 spi,
  int xfrm_state_check_expire(struct xfrm_state *x);
  void xfrm_state_update_stats(struct net *net);
  #ifdef CONFIG_XFRM_OFFLOAD
@@ -650,7 +674,7 @@ index 2412c22ce0a6..4f61e50f2b70 100644
  
  }
  #else
-@@ -2024,8 +2099,8 @@ static inline void xfrm_dev_state_advance_esn(struct xfrm_state *x)
+@@ -2024,8 +2108,8 @@ static inline void xfrm_dev_state_advance_esn(struct xfrm_state *x)
  	struct xfrm_dev_offload *xso = &x->xso;
  	struct net_device *dev = READ_ONCE(xso->dev);
  
@@ -661,7 +685,7 @@ index 2412c22ce0a6..4f61e50f2b70 100644
  }
  
  static inline bool xfrm_dst_offload_ok(struct dst_entry *dst)
-@@ -2051,8 +2126,8 @@ static inline void xfrm_dev_policy_delete(struct xfrm_policy *x)
+@@ -2051,8 +2135,8 @@ static inline void xfrm_dev_policy_delete(struct xfrm_policy *x)
  	struct xfrm_dev_offload *xdo = &x->xdo;
  	struct net_device *dev = xdo->dev;
  
@@ -672,7 +696,7 @@ index 2412c22ce0a6..4f61e50f2b70 100644
  }
  
  static inline void xfrm_dev_policy_free(struct xfrm_policy *x)
-@@ -2060,11 +2135,13 @@ static inline void xfrm_dev_policy_free(struct xfrm_policy *x)
+@@ -2060,11 +2144,13 @@ static inline void xfrm_dev_policy_free(struct xfrm_policy *x)
  	struct xfrm_dev_offload *xdo = &x->xdo;
  	struct net_device *dev = xdo->dev;
  
@@ -814,7 +838,7 @@ index 5b94cb8df8d8..2c1b9df1937a 100644
  }
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index df72b0376970..19dcf5a339f9 100644
+index df72b0376970..7fabd09a2c61 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
 @@ -9,6 +9,7 @@
@@ -825,13 +849,15 @@ index df72b0376970..19dcf5a339f9 100644
  #include <net/netfilter/nf_conntrack.h>
  #include <net/netfilter/nf_conntrack_core.h>
  #include <net/netfilter/nf_conntrack_l4proto.h>
-@@ -17,6 +18,59 @@
+@@ -17,6 +18,73 @@
  static DEFINE_MUTEX(flowtable_lock);
  static LIST_HEAD(flowtables);
  
 +struct nf_flow_offload_handle {
 +	refcount_t refs;
 +	atomic_t invalid;
++	/* Set by nf_flow_offload_handle_watch(). */
++	bool watched;
 +	struct rcu_head rcu_head;
 +};
 +
@@ -873,11 +899,23 @@ index df72b0376970..19dcf5a339f9 100644
 +}
 +EXPORT_SYMBOL_GPL(nf_flow_offload_handle_invalidate);
 +
++void nf_flow_offload_handle_watch(struct nf_flow_offload_handle *handle)
++{
++	if (handle)
++		smp_store_release(&handle->watched, true);
++}
++EXPORT_SYMBOL_GPL(nf_flow_offload_handle_watch);
++
++/* A policy change retires every flow captured under an older generation,
++ * unless its driver watches policy itself: then the driver retires only the
++ * flows the changed policy can select, and a change to any other policy
++ * leaves this one forwarding in hardware. */
 +static bool flow_offload_hw_invalid(const struct flow_offload *flow)
 +{
 +	if (!flow->hw_handle)
 +		return false;
-+	if (flow->xfrm_genid != xfrm_flowtable_genid(nf_ct_net(flow->ct)))
++	if (!smp_load_acquire(&flow->hw_handle->watched) &&
++	    flow->xfrm_genid != xfrm_flowtable_genid(nf_ct_net(flow->ct)))
 +		nf_flow_offload_handle_invalidate(flow->hw_handle);
 +	return !nf_flow_offload_handle_valid(flow->hw_handle);
 +}
@@ -885,7 +923,7 @@ index df72b0376970..19dcf5a339f9 100644
  static void
  flow_offload_fill_dir(struct flow_offload *flow,
  		      enum flow_offload_tuple_dir dir)
-@@ -119,6 +173,10 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+@@ -119,6 +187,10 @@ static int flow_offload_fill_route(struct flow_offload *flow,
  		j++;
  	}
  	flow_tuple->encap_num = route->tuple[dir].in.num_encaps;
@@ -896,7 +934,7 @@ index df72b0376970..19dcf5a339f9 100644
  
  	switch (route->tuple[dir].xmit_type) {
  	case FLOW_OFFLOAD_XMIT_DIRECT:
-@@ -207,6 +265,8 @@ static void flow_offload_route_release(struct flow_offload *flow)
+@@ -207,6 +279,8 @@ static void flow_offload_route_release(struct flow_offload *flow)
  
  void flow_offload_free(struct flow_offload *flow)
  {
@@ -905,7 +943,7 @@ index df72b0376970..19dcf5a339f9 100644
  	switch (flow->type) {
  	case NF_FLOW_OFFLOAD_ROUTE:
  		flow_offload_route_release(flow);
-@@ -276,6 +336,15 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+@@ -276,6 +350,15 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
  {
  	int err;
  
@@ -921,7 +959,7 @@ index df72b0376970..19dcf5a339f9 100644
  	flow->timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
  
  	err = rhashtable_insert_fast(&flow_table->rhashtable,
-@@ -363,7 +432,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
+@@ -363,7 +446,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
  
  	dir = tuplehash->tuple.dir;
  	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
@@ -930,7 +968,7 @@ index df72b0376970..19dcf5a339f9 100644
  		return NULL;
  
  	if (unlikely(nf_ct_is_dying(flow->ct)))
-@@ -417,7 +486,7 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+@@ -417,7 +500,7 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
@@ -939,7 +977,7 @@ index df72b0376970..19dcf5a339f9 100644
  	    nf_ct_is_dying(flow->ct) ||
  	    nf_flow_custom_gc(flow_table, flow))
  		flow_offload_teardown(flow);
-@@ -542,6 +611,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
+@@ -542,6 +625,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
  {
  	int err;
  
@@ -1552,7 +1590,7 @@ index d55c0cfeb929..7c7150474044 100644
  	return true;
  }
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index e033390e7785..df9194e6566a 100644
+index e033390e7785..5c1f38162dae 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
 @@ -34,6 +34,7 @@
@@ -1563,7 +1601,17 @@ index e033390e7785..df9194e6566a 100644
  #include <net/ip.h>
  #include <net/gre.h>
  #if IS_ENABLED(CONFIG_IPV6_MIP6)
-@@ -2228,8 +2229,18 @@ static struct xfrm_policy *xfrm_policy_lookup(struct net *net,
+@@ -253,6 +254,9 @@ bool xfrm_selector_match(const struct xfrm_selector *sel, const struct flowi *fl
+ 	}
+ 	return false;
+ }
++/* For a flowtable driver judging which of its flows a changed policy selects
++ * (NETEVENT_XFRM_POLICY_UPDATE), with the same semantics the lookup uses. */
++EXPORT_SYMBOL_GPL(xfrm_selector_match);
+ 
+ static const struct xfrm_policy_afinfo *xfrm_policy_get_afinfo(unsigned short family)
+ {
+@@ -2228,8 +2232,22 @@ static struct xfrm_policy *xfrm_policy_lookup(struct net *net,
  		return pol;
  #endif
  	return xfrm_policy_lookup_bytype(net, XFRM_POLICY_TYPE_MAIN, fl, family,
@@ -1573,35 +1621,39 @@ index e033390e7785..df9194e6566a 100644
 +
 +/* Invalidate cached policy decisions, including admissions queued before a
 + * policy mutation. Consumers only latch invalidation here: expiry can call
-+ * this under a spinlock, and hardware deletion must run in process context. */
-+void xfrm_flowtable_policy_changed(struct net *net)
++ * this under a spinlock, and hardware deletion must run in process context.
++ * Naming the policy lets a consumer that watches its flows retire only those
++ * the policy can select; NULL means any flow. */
++void xfrm_flowtable_policy_changed(struct net *net, const struct xfrm_policy *pol)
 +{
++	struct xfrm_flowtable_change change = { .net = net, .pol = pol };
++
 +	atomic64_inc_return_release(&net->xfrm.flowtable_genid);
-+	call_netevent_notifiers(NETEVENT_XFRM_POLICY_UPDATE, net);
++	call_netevent_notifiers(NETEVENT_XFRM_POLICY_UPDATE, &change);
  }
 +EXPORT_SYMBOL_GPL(xfrm_flowtable_policy_changed);
  
  static struct xfrm_policy *xfrm_sk_policy_lookup(const struct sock *sk, int dir,
  						 const struct flowi *fl,
-@@ -2323,6 +2334,8 @@ static void __xfrm_policy_link(struct xfrm_policy *pol, int dir)
+@@ -2323,6 +2341,8 @@ static void __xfrm_policy_link(struct xfrm_policy *pol, int dir)
  	list_add(&pol->walk.all, &net->xfrm.policy_all);
  	WRITE_ONCE(net->xfrm.policy_count[dir], net->xfrm.policy_count[dir] + 1);
  	xfrm_pol_hold(pol);
 +	if (dir < XFRM_POLICY_MAX)
-+		xfrm_flowtable_policy_changed(net);
++		xfrm_flowtable_policy_changed(net, pol);
  }
  
  static struct xfrm_policy *__xfrm_policy_unlink(struct xfrm_policy *pol,
-@@ -2341,6 +2354,8 @@ static struct xfrm_policy *__xfrm_policy_unlink(struct xfrm_policy *pol,
+@@ -2341,6 +2361,8 @@ static struct xfrm_policy *__xfrm_policy_unlink(struct xfrm_policy *pol,
  
  	list_del_init(&pol->walk.all);
  	WRITE_ONCE(net->xfrm.policy_count[dir], net->xfrm.policy_count[dir] - 1);
 +	if (dir < XFRM_POLICY_MAX)
-+		xfrm_flowtable_policy_changed(net);
++		xfrm_flowtable_policy_changed(net, pol);
  
  	return pol;
  }
-@@ -3537,6 +3552,100 @@ static inline int secpath_has_nontransport(const struct sec_path *sp, int k, int
+@@ -3537,6 +3559,100 @@ static inline int secpath_has_nontransport(const struct sec_path *sp, int k, int
  	return 0;
  }
  
@@ -1702,7 +1754,7 @@ index e033390e7785..df9194e6566a 100644
  static bool icmp_err_packet(const struct flowi *fl, unsigned short family)
  {
  	const struct flowi4 *fl4 = &fl->u.ip4;
-@@ -3816,7 +3925,8 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+@@ -3816,7 +3932,8 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
  			tpp = stp;
  		}
  
@@ -1712,7 +1764,7 @@ index e033390e7785..df9194e6566a 100644
  			/* This policy template was already checked by HW
  			 * and secpath was removed in __xfrm_policy_check2.
  			 */
-@@ -4301,6 +4411,7 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4301,6 +4418,7 @@ static int __net_init xfrm_net_init(struct net *net)
  
  	/* Initialize the per-net locks here */
  	spin_lock_init(&net->xfrm.xfrm_state_lock);
@@ -1720,12 +1772,12 @@ index e033390e7785..df9194e6566a 100644
  	spin_lock_init(&net->xfrm.xfrm_policy_lock);
  	seqcount_spinlock_init(&net->xfrm.xfrm_policy_hash_generation, &net->xfrm.xfrm_policy_lock);
  	mutex_init(&net->xfrm.xfrm_cfg_mutex);
-@@ -4580,6 +4691,8 @@ static int xfrm_policy_migrate(struct xfrm_policy *pol,
+@@ -4580,6 +4698,8 @@ static int xfrm_policy_migrate(struct xfrm_policy *pol,
  		}
  	}
  
 +	if (n)
-+		xfrm_flowtable_policy_changed(xp_net(pol));
++		xfrm_flowtable_policy_changed(xp_net(pol), pol);
  	write_unlock_bh(&pol->lock);
  
  	if (!n)
@@ -1802,7 +1854,7 @@ index 02188558bd1c..4d3d473682f8 100644
  				to_put = x;
  				x = NULL;
 diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
-index 41a8cadb7ce9..063817151129 100644
+index 41a8cadb7ce9..7cc02f89ba6a 100644
 --- a/net/xfrm/xfrm_user.c
 +++ b/net/xfrm/xfrm_user.c
 @@ -2434,6 +2434,7 @@ static int xfrm_set_default(struct sk_buff *skb, struct nlmsghdr *nlh,
@@ -1817,7 +1869,7 @@ index 41a8cadb7ce9..063817151129 100644
  	if (xfrm_userpolicy_is_valid(up->out))
  		WRITE_ONCE(net->xfrm.policy_default[XFRM_POLICY_OUT], up->out);
  
-+	xfrm_flowtable_policy_changed(net);
++	xfrm_flowtable_policy_changed(net, NULL);
 +	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
  	rt_genid_bump_all(net);
  

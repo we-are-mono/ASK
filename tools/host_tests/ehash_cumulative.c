@@ -317,6 +317,31 @@ static void check_find(void)
     if (wide.spare) ExternalHashTableCumulativeEntryFree(wide.spare);
 }
 
+/* A bucket holds at most EHASH_BUCKET_KEYS_MAX keys. The hash is an unkeyed
+ * CRC the hardware computes, so colliding keys can be chosen; past the bound
+ * an add is refused with the table untouched and the entry still the
+ * caller's, and a delete makes room again. */
+static void check_bucket_cap(void)
+{
+    struct en_exthash_tbl_entry *e[EHASH_BUCKET_KEYS_MAX + 1];
+    unsigned i, before;
+
+    assert(!bucket.h);
+    for (i = 0; i < EHASH_BUCKET_KEYS_MAX; i++)
+        add(e[i] = entry(0x1000 + i));
+    before = syncs;
+    e[i] = entry(0x1000 + i);
+    assert(ExternalHashTableAddKey(&info, KEY, e[i]) == EHASH_ADD_BUCKET_FULL);
+    assert(!found(e[i]) && syncs == before);
+    for (i = 0; i < EHASH_BUCKET_KEYS_MAX; i++)
+        assert(found(e[i]));
+    removed(e[0]);
+    add(e[EHASH_BUCKET_KEYS_MAX]);
+    for (i = 1; i <= EHASH_BUCKET_KEYS_MAX; i++)
+        removed(e[i]);
+    assert(!bucket.h);
+}
+
 int main(void)
 {
     struct en_exthash_tbl_entry *e[24];
@@ -631,6 +656,7 @@ int main(void)
     assert(ExternalHashTableFmPcdHcSync(&info) == 0 && sync_recovered_lines == recovered + 2);
 
     check_find();
+    check_bucket_cap();
 
     /* The table's destruction frees its spare, and with it the last node. */
     ExternalHashTableCumulativeEntryFree(xchg(&info.spare, NULL));

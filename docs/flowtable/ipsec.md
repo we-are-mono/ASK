@@ -1134,8 +1134,12 @@ callback already borrows. It is wrong, and wrong in the direction that matters.
 
 A transformed destination only reaches the flowtable for **locally generated**
 traffic. A *forwarded* flow is routed by `nf_route()` with a plain FIB lookup
-and is transformed afterwards, in `xfrm_route_forward()` at POSTROUTING, so its
-cached destination never carries the transform that will be applied to it.
+and is transformed afterwards, so its cached destination never carries the
+transform that will be applied to it. `ip_forward()` attaches one in
+`xfrm4_route_forward()` before `NF_INET_FORWARD`, judged on the tuple between
+the translations (DNAT done, SNAT not). A POSTROUTING that translates the source
+then asks again with the translated tuple (`nf_xfrm_me_harder()`), and that
+second answer is the one used.
 `dst_xfrm()` therefore answers "no transform" for exactly the flows a gateway
 encrypts — and the flow is then installed as an ordinary plain one, so the
 classifier forwards in hardware what the policy says to encrypt. **Measured on
@@ -1154,6 +1158,13 @@ the flow's own translated tuple, ports included, since a selector can name them
 policy resolving to an offloadable SA, and its handle goes on the rule; a
 policy that matches but resolves to nothing usable, and the flow is **refused**
 so the software path can do whatever the policy asks, including an acquire.
+
+A direction its own SNAT translates is also asked about the tuple between the
+translations, because the first lookup drops what it refuses before the second
+runs. A block whose selector names the LAN source but not the NAT address would
+otherwise drop every packet in software, while the hardware forwarded the same
+flow. The lookup can only refuse, because the second lookup still chooses the
+transform. Without SNAT the two tuples are the same.
 
 One subtlety, found by KASAN rather than by reading: on success
 `xfrm_bundle_create()` links the destination into the bundle and takes over the
@@ -1707,10 +1718,15 @@ missing right after a flow was admitted: its last CPU-path frames overlapped
 hardware traffic on the same SA.
 
 Patch 106 keeps the firmware's port ICIDs for every port type (Rx, OH, Tx and
-the host-command port). Storage profiles take their port's value too: the VSP
-ioctl, and `cdx/vsp_cfg.c` for the Wi-Fi profile. The fix trusts the boot
-firmware, as mainline's FMan driver does. A bootloader that gives FMan ports
-and QMan portals different ICIDs brings the reuse back.
+the host-command port). The Wi-Fi storage profile takes its Rx port's value
+too (`cdx/vsp_cfg.c`). Keeping the firmware's values does not prove the
+firmware gave every producer the same one, and for GCM, CCM or CTR a second
+identity repeats nonces under one key, not just sequence numbers. So the IPsec
+init checks before it arms: `dpa_cfg_shared_icid()` compares each classifier
+port's live `FMBM_SPLIODN` (`fm_port_get_icid()`) and each CPU portal's FICID
+(`qman_portal_ficid()`, both exported by patch 106). Any disagreement is logged
+with the port or CPU that differs. IPsec offload then stays off for the boot,
+and the gateway runs IPsec in software.
 
 #### Proved on hardware, 2026-09-23
 

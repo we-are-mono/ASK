@@ -1639,6 +1639,10 @@ int cdx_dpa_ipsec_init(void)
 	 * "without" the port and prove the rest still comes up. */
 	if (cdx_dpa_init_fault() || ipsec_init_ohport(&ipsecinfo))
 		goto failure;
+	/* One SA's jobs must reach SEC as one shared descriptor whichever
+	 * producer enqueues them; see dpa_cfg_shared_icid(). */
+	if (dpa_cfg_shared_icid() < 0)
+		goto failure;
 	if (add_ipsec_bpool(&ipsecinfo))
 		goto failure;
 	if (cdx_init_scatter_gather_bpool() || cdx_init_skb_2bfreed_bpool())

@@ -209,6 +209,7 @@ int dpa_cfg_stop(void);
 int dpa_cfg_resume(void);
 int dpa_cfg_quiesce(void);
 bool dpa_cfg_covered(void);
+int dpa_cfg_shared_icid(void);
 void dpa_cfg_deinit(void);
 /* An external hash table of the configuration, to issue a PCD barrier through
  * when the caller has none of its own; NULL before one is configured. Caller

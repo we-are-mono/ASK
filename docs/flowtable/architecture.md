@@ -76,8 +76,12 @@ Binding/cookie and ingress/tuple lookups use separate fixed hash indexes, each
 with 16,384 buckets, under the existing backend transaction. Full key comparison
 resolves collisions; the tuple hash has a seed chosen at adapter load. Index
 publication follows successful hardware installation and index removal shares
-the entry's list lifetime. Dependency notifications still walk the bounded
-watch list: a single prefix, neighbour or device change can affect every flow.
+the entry's list lifetime. The two dependencies a station can drive from the
+LAN at packet rate are indexed the same way: bridge FDB events look up flows by
+destination MAC and VID, neighbour updates by neighbour object, so a MAC flood
+costs one bucket per learn rather than a walk under the bridge's hash lock.
+Administrative notifications (prefix, device, policy, nexthop) still walk the
+bounded watch list, because one such change can affect every flow.
 
 Patch 140 supplies borrowed conntrack, both selected destinations, effective
 directional MTU and the table's accounting requirement. Context version 5 also
@@ -232,8 +236,11 @@ forwarding state, tunnel parameters, egress queues, SAs -- retires it by event.
 A fully offloaded flow, which is never offered again, relies on exactly that.
 The conntrack mark and a police filter are sampled once at admission, as for
 any offloaded flow ([QoS](qos.md)). What no event reports is rechecked on the
-offer: the policy generation and the two borrowed routes, as before any parse,
-and the IPv6 ingress MTU and bridge output hooks, as on every statistics pass.
+offer: the two borrowed routes, as before any parse, and the IPv6 ingress MTU
+and bridge output hooks, as on every statistics pass. The policy generation is
+not: the offer carries the flow's creation generation. The entry has been
+watched since it was published, and from then on a policy change retires it
+only if the changed policy's selector can match one of its tuples.
 A newly registered bridge `LOCAL_OUT` or `POST_ROUTING` hook retires a
 generation with an egress bridge. A pending global latch sends the offer
 through admission as before.

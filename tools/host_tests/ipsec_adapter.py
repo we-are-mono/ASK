@@ -89,7 +89,8 @@ def test_ipsec_adapter(tmp_path):
     names = [
         "ft_ipsec_esp_mtu", "ft_ipsec_bound",
         "ft_ipsec_offloaded", "ft_ipsec_inbound_candidates", "ft_ipsec_paired_inbound",
-        "ft_ipsec_record", "ft_ipsec_resolve", "ft_ipsec_flowi", "ft_ipsec_receiver",
+        "ft_ipsec_record", "ft_ipsec_resolve", "ft_ipsec_flowi", "ft_ipsec_permits",
+        "ft_ipsec_forward_flowi", "ft_ipsec_receiver",
         "ft_ipsec_receiving", "ft_ipsec_handle",
         "ft_ipsec_mark", "ft_ipsec_watch_find", "ft_ipsec_watch_unsampled",
         "ft_ipsec_path_moved",

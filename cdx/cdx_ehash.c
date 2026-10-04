@@ -1353,7 +1353,7 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 	uint16_t flags;
 	uint32_t key_size;
 	uint8_t *ptr;
-	int retval;
+	int retval = FAILURE;
 
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s::\n", __func__);
@@ -1538,11 +1538,15 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 	display_ehash_tbl_entry(&tbl_entry->hashentry, key_size);
 #endif // CDX_DPA_DEBUG
 	//insert entry into hash table
-	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry); 
-	if (retval == -1) {
-		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
+	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
+	if (retval < 0) {
+		/* A bucket at its bound is capacity, not a fault: the flow
+		 * stays in software, and the key that filled it was chosen
+		 * by whoever sent the traffic, so it is not logged. */
+		if (retval != EHASH_ADD_BUCKET_FULL)
+			DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;
-	}	
+	}
 	entry->ct->index = (uint16_t)retval;
 	kfree(info);
 	return SUCCESS;
@@ -1556,7 +1560,7 @@ err_ret:
 		ExternalHashTableEntryFree(tbl_entry);
 err_ret1:
 	kfree(info);
-	return FAILURE;
+	return retval == EHASH_ADD_BUCKET_FULL ? -ENOSPC : FAILURE;
 }
 
 /* A multicast group's root entry: the classifier key, the ingress validation,
@@ -1762,10 +1766,15 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	wmb();
 	//insert entry into hash table
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
-	if (retval == -1) {
-		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
+	if (retval < 0) {
+		/* A full bucket is capacity, and chosen by the sender: the
+		 * group stays in software unlogged, as a unicast flow does.
+		 * -EXFULL rather than -ENOSPC, which callers read as group ids
+		 * exhausted and evict a discard for. */
+		if (retval != EHASH_ADD_BUCKET_FULL)
+			DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;
-	}	
+	}
 	entry->ct->index = (uint16_t)retval;
 	kfree(info);
 	return SUCCESS;
@@ -1781,7 +1790,7 @@ err_ret:
 		ExternalHashTableEntryFree(tbl_entry);
 err_ret1:
 	kfree(info);
-	return FAILURE;
+	return retval == EHASH_ADD_BUCKET_FULL ? -EXFULL : FAILURE;
 }
 
 #ifdef INCLUDE_PPPoE_IFSTATS

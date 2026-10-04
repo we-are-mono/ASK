@@ -164,7 +164,8 @@ struct cdx_l2_encap {
 
 /* Insert a direction's classifier entry. A NULL encap derives the L2 framing
  * from the registered interfaces alone; a flow that carries tags, a PPPoE
- * session or a tunnel names them in encap. */
+ * session or a tunnel names them in encap. SUCCESS, -ENOSPC when the key's
+ * bucket already chains its most keys, or FAILURE. */
 int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap);
 int delete_entry_from_classif_table(PCtEntry entry);
 

@@ -34,12 +34,10 @@ def test_mroute_learner(tmp_path):
     # these has to fail here rather than compile into a harness that no longer
     # matches what the adapter keeps.
     enum_start = source.index("enum ft_mr_state {")
-    # The harness restates this one constant, so it must not drift.
-    assert "#define FT_MR_OIF_TEXT\t\t(CDX_MC_MAX_LISTENERS * (IFNAMSIZ + 1))" \
-        in source, "FT_MR_OIF_TEXT changed; mroute_learner.c repeats it"
     header = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
     (tmp_path / "mroute_learner.inc").write_text(
-        declaration(header, "cdx_mc_listener")
+        re.search(r"^#define FT_MR_OIF_TEXT\b.*\n", source, re.M).group(0)
+        + declaration(header, "cdx_mc_listener")
         + declaration(header, "cdx_mc_group_spec")
         + source[enum_start:source.index("};", enum_start) + 3]
         + _between(source, "struct ft_mr_vif {", "static LIST_HEAD(ft_mr_groups)")
@@ -273,32 +271,6 @@ def test_the_mtu_bound_is_rechecked_without_an_mfc_event():
     assert "idev->cnf.mtu6" in link, "IPv6 is bounded in its own units"
 
 
-def test_the_contract_is_tested_in_the_order_it_is_written():
-    """The backend refuses a link-local group and a wildcard source too, so
-    without these tests up front /proc would report "refused-failed" four
-    retries later and say nothing about why.
-    """
-    body = function(SOURCE.read_text(), "ft_mr_derive")
-    order = [
-        "FT_MR_REFUSED_TABLE",
-        "FT_MR_REFUSED_PAUSED",
-        "FT_MR_REFUSED_POLICY",
-        "FT_MR_REFUSED_WILDCARD",
-        "FT_MR_REFUSED_SCOPE",
-        "FT_MR_REFUSED_INGRESS",
-        "FT_MR_REFUSED_HOST",
-    ]
-    at = [body.index(name) for name in order]
-    assert at == sorted(at), f"the contract's order changed: {order}"
-    # The thresholds and the listeners come last, because both walk the oif
-    # list and the cheap tests have to be able to refuse before that.
-    assert max(at) < body.index("FT_MR_REFUSED_THRESHOLD")
-    # Except the XFRM policy, which routes every oif and is asked only of
-    # oifs the rest has let through, so a tunnel, a wildcard or a narrow
-    # oif keeps its own word under any policy.
-    assert body.index("FT_MR_REFUSED_XFRM") > body.rindex("FT_MR_REFUSED_MTU")
-
-
 # ------------------------------------------------------------- references
 
 def test_every_reference_the_learner_takes_is_released():
@@ -530,17 +502,11 @@ def test_the_counter_fold_restates_the_units():
     """The classifier counts the L2 frame it matched; ip_mr_forward() counts
     skb->len, which is the L3 packet. Folding one into the other without the
     correction would make `ip -s mroute` read high by the framing on every
-    frame -- the same restatement ft_l2_overhead() makes for a flow.
+    frame -- the same restatement ft_l2_overhead() makes for a flow. The fold
+    itself -- framing, adding rather than setting, lastuse -- is compiled and
+    run by mroute_fold.py; this is what feeds it.
     """
     source = SOURCE.read_text()
-    body = function(source, "ft_mr_fold")
-    assert "ETH_HLEN + tags * VLAN_HLEN" in body
-    # Added to what ipmr counted itself, never written over it: see
-    # mroute_fold.py for what setting did to the count.
-    assert "atomic_long_add(packets, &g->mfc->mfc_un.res.pkt" in body
-    assert "atomic_long_add(bytes, &g->mfc->mfc_un.res.bytes" in body
-    assert "atomic_long_set" not in body
-    assert "lastuse" in body, "ageing reads it and the CPU sees no packets"
     # The framing is the entry's own ingress tags, or, for a group routed
     # through a bridge, what the bridged group carrying it reports: a daemon
     # ageing its routes by SIOCGETSGCNT must see a merged stream flow.

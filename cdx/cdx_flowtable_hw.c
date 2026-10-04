@@ -191,6 +191,7 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 	struct cdx_ft_hw *hw;
 	unsigned int nstats, i;
 	PCtEntry ct;
+	int rc;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	*result = NULL;
@@ -502,13 +503,15 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 	 * the path it took before tags existed. The override refuses a
 	 * description the interfaces already filled in, and that refusal must
 	 * not reach a flow that is not asking to replace anything. */
-	if (insert_entry_in_classif_table_encap(
-		    ct, encap.num_ingress || encap.num_egress ||
-			encap.ingress_pppoe || encap.egress_pppoe ||
-			encap.ingress_tunnel.present || encap.egress_tunnel.present ?
-			&encap : NULL)) {
+	rc = insert_entry_in_classif_table_encap(
+		ct, encap.num_ingress || encap.num_egress ||
+		encap.ingress_pppoe || encap.egress_pppoe ||
+		encap.ingress_tunnel.present || encap.egress_tunnel.present ?
+		&encap : NULL);
+	if (rc) {
 		kfree(hw);
-		return -EIO;
+		/* A full bucket refuses the flow as a full table would. */
+		return rc == -ENOSPC ? -ENOSPC : -EIO;
 	}
 	/* Linked, so the microcode can reach every record the opcodes name
 	 * from the next hit on, and it may still reach them after the adapter

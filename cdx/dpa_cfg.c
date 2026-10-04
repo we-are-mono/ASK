@@ -560,6 +560,9 @@ struct dpa_init_port {
 	/* An Rx port belongs to a netdev, whose own state also decides whether
 	 * a resume enables it again; an offline port has none. */
 	bool rx;
+	/* The ICID the port stamps into the frames it enqueues, as the FMan
+	 * held it when the port was resolved, or a negative errno. */
+	int icid;
 };
 
 /* Where the classifier ports CDX configured stand. A stopped port is only
@@ -693,6 +696,8 @@ static int dpa_prepare_ports(t_LnxWrpFmDev **wrappers,
 			ports->entries[ports->count].handle = port->h_Dev;
 			ports->entries[ports->count].name = port->name;
 			ports->entries[ports->count].rx = info->type != 0;
+			ports->entries[ports->count].icid =
+				fm_port_get_icid((struct fm_port *)port);
 			if (FM_PORT_GetEnabled(port->h_Dev, &ports->entries[ports->count].enabled))
 				return -EIO;
 			ports->count++;
@@ -938,6 +943,56 @@ bool dpa_cfg_covered(void)
 	covered = dpa_ports_cover(&dpa_active_ports, &kind, &index);
 	mutex_unlock(&dpa_cfg_lock);
 	return covered;
+}
+
+/* The ICID every producer of an IPsec job shares, or a negative errno.
+ *
+ * SEC shares a shared descriptor -- and the ESP sequence number and the
+ * counter-mode IV stored in it -- only among jobs whose frames carry one ICID
+ * (SEC RM 7.3.2). An SA's jobs come from the classifier ports CDX configured
+ * and from every CPU's software portal, so all of them must agree: otherwise
+ * SERIAL sharing orders nothing between two producers, both encrypt from the
+ * same stored number, and the peer sees replays -- for GCM, a repeated nonce
+ * under one key. The boot firmware assigns these ICIDs and nothing here can
+ * repair them, so a disagreement is reported once and leaves IPsec offload
+ * off. The Wi-Fi storage profile copies its Rx port's value (vsp_cfg.c) and
+ * feeds no SEC job. */
+int dpa_cfg_shared_icid(void)
+{
+	const struct dpa_init_ports *ports = &dpa_active_ports;
+	int icid = -ENODEV, ficid;
+	unsigned int cpu;
+	uint32_t ii;
+
+	mutex_lock(&dpa_cfg_lock);
+	for (ii = 0; ii < ports->count; ii++) {
+		const struct dpa_init_port *port = &ports->entries[ii];
+
+		if (port->icid < 0) {
+			pr_err("cdx: cannot read %s's ICID: %d\n", port->name, port->icid);
+			icid = port->icid;
+			break;
+		}
+		if (icid >= 0 && port->icid != icid) {
+			pr_err("cdx: %s enqueues with ICID %d, other classifier ports with %d\n",
+			       port->name, port->icid, icid);
+			icid = -EINVAL;
+			break;
+		}
+		icid = port->icid;
+	}
+	mutex_unlock(&dpa_cfg_lock);
+	if (icid < 0)
+		return icid;
+	for_each_cpu(cpu, qman_affine_cpus()) {
+		ficid = qman_portal_ficid(qman_affine_channel(cpu));
+		if (ficid != icid) {
+			pr_err("cdx: CPU %u's QMan portal enqueues with ICID %d, the classifier ports with %d\n",
+			       cpu, ficid, icid);
+			return -EINVAL;
+		}
+	}
+	return icid;
 }
 
 /* Start the ports a stop left, as they were before it: an offline port if it

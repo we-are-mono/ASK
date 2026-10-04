@@ -55,6 +55,7 @@ typedef uint32_t __be32;
 #define EHOSTUNREACH 113
 #define ENETUNREACH 101
 #define EADDRNOTAVAIL 99
+#define EPERM 1
 #define XFRM_INF (~(u64)0)
 
 struct in6_addr { u8 s6_addr[16]; };
@@ -67,6 +68,10 @@ union nf_inet_addr {
 	struct in_addr in;
 	struct in6_addr in6;
 };
+static bool nf_inet_addr_cmp(const union nf_inet_addr *a, const union nf_inet_addr *b)
+{
+	return !memcmp(a->all, b->all, sizeof(a->all));
+}
 
 /* --- list.h, enough of it -------------------------------------------- */
 struct list_head { struct list_head *next, *prev; };
@@ -598,6 +603,11 @@ static struct xfrm_state *xfrm_state_lookup_byaddr(void *net, u32 mark,
 static struct { int oif; struct dst_entry *bundle; } policy_answers[2];
 static int policy_error;
 static unsigned policy_lookups;
+/* An OUT block whose selector names one IPv4 source, refused on any device;
+ * zero is none. And the IPv4 questions asked, in order. */
+static __be32 policy_block_saddr;
+#define POLICY_QUERIES 8u
+static struct flowi policy_queries[POLICY_QUERIES];
 
 static void policy_answer(int oif, struct dst_entry *bundle)
 {
@@ -614,10 +624,14 @@ static struct dst_entry *xfrm_lookup(void *net, struct dst_entry *dst,
 				     const struct flowi *fl, void *sk, int flags)
 {
 	(void)net; (void)sk;
+	if (policy_lookups < POLICY_QUERIES)
+		policy_queries[policy_lookups] = *fl;
 	policy_lookups++;
 	assert(flags & XFRM_LOOKUP_KEEP_DST_REF);
 	if (policy_error)
 		return ERR_PTR(policy_error);
+	if (policy_block_saddr && fl->u.ip4.saddr == policy_block_saddr)
+		return ERR_PTR(-EPERM);
 	for (unsigned i = 0; i < 2; i++) {
 		struct dst_entry *bundle = policy_answers[i].bundle;
 
@@ -2411,14 +2425,16 @@ static void test_handle_and_flowi(void)
 	/* Sending asks about the translated tuple, because that is what
 	 * leaves the port and what a selector naming addresses compares
 	 * against. */
-	ft_ipsec_flowi(&rule, false, &WAN, &fl);
+	ft_ipsec_flowi(&rule, false, &WAN, 0x20, &fl);
 	assert(fl.u.ip4.saddr == rule.new_src.ip && fl.u.ip4.daddr == rule.new_dst.ip);
 	assert(fl.u.ip4.fl4_sport == 3000 && fl.u.ip4.fl4_dport == 4000);
 	assert(fl.flowi_oif == WAN.ifindex && fl.flowi_proto == IPPROTO_TCP);
+	/* And the mark the packets carry, which a selector can name too. */
+	assert(fl.flowi_mark == 0x20);
 
 	/* Receiving asks about the untranslated pair, inverted, because that
 	 * is what the peer addressed. */
-	ft_ipsec_flowi(&rule, true, &LAN, &fl);
+	ft_ipsec_flowi(&rule, true, &LAN, 0, &fl);
 	assert(fl.u.ip4.saddr == rule.dst.ip && fl.u.ip4.daddr == rule.src.ip);
 	assert(fl.u.ip4.fl4_sport == 2000 && fl.u.ip4.fl4_dport == 1000);
 	assert(fl.flowi_oif == LAN.ifindex);
@@ -2526,6 +2542,104 @@ static void test_handle_and_flowi(void)
 	disown_all();
 	paired_state = NULL;
 	sa_pool[0].handle = sa_pool[1].handle = sa_pool[2].handle = 0;
+}
+
+/* Whether one of the questions asked so far was about this IPv4 tuple leaving
+ * by this device. */
+static bool policy_asked(__be32 saddr, __be32 daddr, __be16 sport, __be16 dport,
+			 int oif)
+{
+	for (unsigned i = 0; i < policy_lookups && i < POLICY_QUERIES; i++) {
+		const struct flowi *fl = &policy_queries[i];
+
+		if (fl->u.ip4.saddr == saddr && fl->u.ip4.daddr == daddr &&
+		    fl->u.ip4.fl4_sport == sport && fl->u.ip4.fl4_dport == dport &&
+		    fl->flowi_oif == oif)
+			return true;
+	}
+	return false;
+}
+
+/* ip_forward() asks OUT policy once before NF_INET_FORWARD, about the tuple
+ * between the translations -- DNAT done, this direction's SNAT not yet -- and
+ * drops what policy refuses there. A direction its own SNAT translates asks
+ * nothing else about that tuple, so a block naming the LAN source must refuse
+ * it here too, or the hardware forwards what the slow path drops. */
+static void test_handle_between_translations(void)
+{
+	struct dst_entry forward = { .ops = &v4_ops, .dev = &WAN, .refs = 1 };
+	struct dst_entry reverse = { .ops = &v4_ops, .refs = 1 };
+	struct nf_flow_offload_handle handle = { .valid = true };
+	struct flow_cls_offload cls;
+	struct cdx_ft_rule rule;
+	struct nf_conn ct = {};
+
+	bench_reset();
+	memset(policy_answers, 0, sizeof(policy_answers));
+	memset(&rule, 0, sizeof(rule));
+	memset(&cls, 0, sizeof(cls));
+	rule.family = AF_INET;
+	rule.proto = IPPROTO_UDP;
+	rule.in = rule.in_logical = &LAN;
+	rule.out = rule.out_logical = &WAN;
+	rule.src.ip = 0x0201a8c0;
+	rule.dst.ip = 0x0301a8c0;
+	rule.new_src.ip = 0x0401a8c0;
+	rule.new_dst.ip = 0x0501a8c0;
+	rule.sport = 1000;
+	rule.dport = 2000;
+	rule.new_sport = 3000;
+	rule.new_dport = 4000;
+	cls.nf_dst = &forward;
+	cls.nf_dst_reverse = &reverse;
+	cls.nf_ct = &ct;
+	cls.nf_handle = &handle;
+
+	/* No policy: admitted, having asked about the LAN source going to the
+	 * translated destination by the egress port. Every question carries
+	 * the connection's mark, as the packets do. */
+	ct.mark = 0x20;
+	policy_lookups = 0;
+	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
+	assert(policy_asked(rule.src.ip, rule.new_dst.ip, rule.sport, rule.new_dport,
+			    WAN.ifindex));
+	for (unsigned i = 0; i < policy_lookups && i < POLICY_QUERIES; i++)
+		assert(policy_queries[i].flowi_mark == 0x20);
+	ct.mark = 0;
+	assert(forward.refs == 1 && reverse.refs == 1);
+
+	/* A block on that source refuses the direction and its generation. */
+	policy_block_saddr = rule.src.ip;
+	ft_admission_invalidations = 0;
+	assert(!ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
+	assert(!handle.valid && ft_admission_invalidations == 1);
+	assert(forward.refs == 1 && reverse.refs == 1);
+	handle.valid = true;
+	policy_block_saddr = 0;
+
+	/* Whatever transform that tuple finds is the slow path's to discard: its
+	 * POSTROUTING asks again about the translated tuple, which is the sending
+	 * question. A bundle there is no refusal. */
+	{
+		struct xfrm_state *x = outbound_state();
+		struct dst_entry bundle = { .ops = &v4_ops, .xfrm = x };
+
+		x->xso.offload_handle = (unsigned long)&sa_pool[0];
+		sa_pool[0].handle = 5;
+		policy_answer(WAN.ifindex, &bundle);
+		assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN) && rule.sa_handle == 5);
+		assert(!bundle.refs && forward.refs == 1 && reverse.refs == 1);
+		memset(policy_answers, 0, sizeof(policy_answers));
+		sa_pool[0].handle = 0;
+	}
+
+	/* Without SNAT the tuple between the translations is the one that
+	 * leaves, already asked: no further question. */
+	rule.new_src = rule.src;
+	rule.new_sport = rule.sport;
+	policy_lookups = 0;
+	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
+	assert(policy_lookups == 3);
 }
 
 /* Install one outbound SA and return the state that owns it.
@@ -4583,6 +4697,7 @@ int main(void)
 	test_receiving_policy();
 	test_received_state_policy();
 	test_handle_and_flowi();
+	test_handle_between_translations();
 	test_watch_follows_peer();
 	test_watch_routes_like_install();
 	test_watch_egress_change_during_install();

@@ -27,7 +27,8 @@ def test_ehash_cumulative(tmp_path):
         "\n".join(re.findall(r"^#define\s+(?:MAX_EN_EHASH_(?:EXT_)?ENTRY_SIZE|EN_EHASH_ENTRY_ALIGN|"
                              r"EN_CUMULATIVE_NODE(?:_MAX_SIZE)?|EN_INVALID_CUMULATIVE_NODE|"
                              r"EN_NEXT_CUMULATIVE_NODE|EN_CU_HASH_TABLE_ENTRY_ADDR_SIZE|"
-                             r"EN_CU_FIXED_ELEMENTS_SIZE|EN_EHASH_DELETE_UNSYNCED)\s.*$",
+                             r"EN_CU_FIXED_ELEMENTS_SIZE|EN_EHASH_DELETE_UNSYNCED|"
+                             r"EHASH_ADD_BUCKET_FULL)\s.*$",
                              header, re.M)) + "\n"
         + "".join(declaration(header, name) for name in (
             "en_ehash_entry", "en_cumulative_entry", "en_cumulative_tbl_entry", "en_exthash_node",
@@ -38,8 +39,10 @@ def test_ehash_cumulative(tmp_path):
         pcd[pcd.index("static DEFINE_SPINLOCK(ehash_parked_lock);"):pcd.index("static void ehash_park_node(")]
         + re.search(r"^#define\s+EHASH_DELETE_NEEDS_NODE\s.*$", pcd, re.M).group() + "\n"
         + re.search(r"^#define\s+EHASH_CHAIN_MAX\s.*$", pcd, re.M).group() + "\n"
+        + re.search(r"^#define\s+EHASH_BUCKET_KEYS_MAX\s.*$", pcd, re.M).group() + "\n"
         + "".join(function(pcd, name) for name in (
-            "find_entry_in_bucket", "ehash_node_entry", "ExternalHashTableAllocCumulativeEntry",
+            "find_entry_in_bucket", "ehash_bucket_keys", "ehash_node_entry",
+            "ExternalHashTableAllocCumulativeEntry",
             "ExternalHashTableCumulativeEntryFree", "ehash_node_take_spare", "ehash_node_alloc",
             "ehash_node_release",
             "ehash_park_node", "ehash_barrier", "ExternalHashTableAddKey",

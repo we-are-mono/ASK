@@ -556,7 +556,10 @@ static int cdx_add_mcast_table_entry(struct mcast_group_info *pMcastGrpInfo)
 	}
 	if(retval)
 	{
-		DPA_ERROR("%s::Insert Mcast entry failed \r\n",__func__);
+		/* A full bucket is the sender's choice of addresses, not a
+		 * fault: the group stays in software, as the insert says. */
+		if (retval != -EXFULL)
+			DPA_ERROR("%s::Insert Mcast entry failed \r\n",__func__);
 		goto err_ret;
 	}
 

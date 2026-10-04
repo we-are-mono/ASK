@@ -39,7 +39,17 @@ typedef int t_Error;
  * port is up. */
 struct port { bool enabled, detached, fenced, pcd, netdev_down, fail_enable; unsigned busy; };
 struct device { unsigned id; };
-typedef struct { bool active; t_Handle h_Dev; char name[20]; } t_LnxWrpFmPortDev;
+typedef struct { bool active; t_Handle h_Dev; char name[20]; int icid; } t_LnxWrpFmPortDev;
+/* The ICID each port's FMBM_SPLIODN holds, and each CPU's portal FICID. */
+struct fm_port;
+static int fm_port_get_icid(struct fm_port *port) { return ((t_LnxWrpFmPortDev *)port)->icid; }
+#define FIXTURE_ICID 63
+#define FIXTURE_CPUS 4
+static int portal_ficid[FIXTURE_CPUS];
+static const void *qman_affine_cpus(void) { return portal_ficid; }
+#define for_each_cpu(cpu, mask) for ((void)(mask), (cpu) = 0; (cpu) < FIXTURE_CPUS; (cpu)++)
+static uint16_t qman_affine_channel(unsigned cpu) { return 0x400 + cpu; }
+static int qman_portal_ficid(uint16_t channel) { return portal_ficid[channel - 0x400]; }
 #define IFNAMSIZ 16
 typedef struct {
     unsigned id;
@@ -319,9 +329,12 @@ static void setup(void)
         wrappers[0].rxPorts[2 + i] = (t_LnxWrpFmPortDev){ true, &ports[2 * i + 1] };
         snprintf(wrappers[0].opPorts[i].name, sizeof(wrappers[0].opPorts[i].name), "fm0-port-oh%u", i + 1);
         snprintf(wrappers[0].rxPorts[2 + i].name, sizeof(wrappers[0].rxPorts[2 + i].name), "fm0-port-rx%u", 2 + i);
+        wrappers[0].opPorts[i].icid = wrappers[0].rxPorts[2 + i].icid = FIXTURE_ICID;
         ports[2 * i] = (struct port){.enabled = !!(port_up_mask & (1U << (2 * i)))};
         ports[2 * i + 1] = (struct port){.enabled = !!(port_up_mask & (1U << (2 * i + 1)))};
     }
+    for (unsigned i = 0; i < FIXTURE_CPUS; i++)
+        portal_ficid[i] = FIXTURE_ICID;
 }
 static void clean_success(void)
 {
@@ -471,6 +484,33 @@ static void check_stop_resume(void)
     clean_success();
 }
 
+/* IPsec offload needs every classifier port and every CPU's portal to enqueue
+ * with one ICID. Ports CDX did not configure do not count; one CDX configured
+ * that differs, or whose ICID cannot be read, or one portal that differs, is a
+ * refusal. */
+static void check_shared_icid(void)
+{
+    static struct port spare;
+
+    port_up_mask = 15;
+    setup(); assert(!dpa_cfg_install());
+    assert(dpa_cfg_shared_icid() == FIXTURE_ICID);
+    portal_ficid[FIXTURE_CPUS - 1] = 0;
+    assert(dpa_cfg_shared_icid() == -EINVAL);
+    clean_success();
+    setup(); wrappers[0].rxPorts[0] = (t_LnxWrpFmPortDev){ true, &spare, "fm0-port-rx0", 0 };
+    assert(!dpa_cfg_install() && dpa_cfg_shared_icid() == FIXTURE_ICID);
+    wrappers[0].rxPorts[0] = (t_LnxWrpFmPortDev){ 0 };
+    clean_success();
+    setup(); wrappers[0].rxPorts[3].icid = 0;
+    assert(!dpa_cfg_install() && dpa_cfg_shared_icid() == -EINVAL);
+    clean_success();
+    setup(); wrappers[0].opPorts[0].icid = -EIO;
+    assert(!dpa_cfg_install() && dpa_cfg_shared_icid() == -EIO);
+    clean_success();
+    assert(!dpa_cfg_lock);
+}
+
 int main(void)
 {
     setup(); lock_contention = 2;
@@ -511,6 +551,7 @@ int main(void)
         retry();
     }
     check_stop_resume();
+    check_shared_icid();
     printf("CDX startup fault points passed: %u allocations, %u stages and retry; "
            "restartable stop and resume\n", allocations, steps);
     return 0;

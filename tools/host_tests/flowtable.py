@@ -37,7 +37,7 @@ def test_decoder_and_lifecycle(tmp_path):
     names = ["ft_fault", "ft_devices_hold", "ft_devices_put", "ft_rule_names", "ft_crossed_hold", "ft_crossed_hold_all", "ft_crossed_put_all",
              "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
              "ft_neigh_table", "ft_neigh_check", "ft_neigh_moved", "ft_nexthop_usable",
-             "ft_next_hop", "ft_routes_valid", "ft_offer_current", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
+             "ft_next_hop", "ft_routes_valid", "ft_offer_routes_current", "ft_offer_current", "ft_policy_covers", "ft_fdb_key", "ft_watch_publish", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
              "ft_ppp_rx_overhead", "ft_tunnel_under",
              "ft_dev_stats_release",
@@ -183,9 +183,9 @@ def test_idle_counts_what_the_other_backends_own():
     through backends of their own, and an adapter on its way out retires them
     only after it has unregistered the hook that would otherwise answer; so
     each backend counts what it holds, on the one path that hands an object
-    back and the one that consumes it, and the answer includes both."""
-    idle = function((ROOT / "cdx/cdx_flowtable_backend.c").read_text(), "cdx_ft_idle")
-    assert "cdx_ipsec_sa_count()" in idle and "cdx_mc_group_count()" in idle
+    back and the one that consumes it, and the answer includes both: that
+    cdx_ft_idle() reads both counts is test_hardware_ownership's, against the
+    compiled backend."""
     for path, add, delete, counter in (
             ("cdx/cdx_ipsec_backend.c", "cdx_ipsec_sa_add", "cdx_ipsec_sa_del",
              "cdx_ipsec_sa_owned"),

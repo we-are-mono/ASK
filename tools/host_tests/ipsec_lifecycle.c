@@ -418,6 +418,8 @@ static int qman_delete_cgr(void *p)
 }
 static void qman_release_cgrid(unsigned id) { assert(cgrid && !cgr); cgrid = false; }
 static bool cdx_dpa_init_fault(void) { return fault(); }
+/* Producers that disagree on the ICID are one more refusal to unwind. */
+static int dpa_cfg_shared_icid(void) { return fault() ? -EINVAL : 63; }
 static void register_cdx_deinit_func(void (*cb)(void))
 { registrations++; exit_callback = cb; }
 static bool sec_busy;

@@ -17,7 +17,6 @@ typedef int64_t s64;
 #define FT_MR_OIF_TEXT 136
 #define CDX_MC_MAX_LISTENERS 8
 #define FT_MR_MAX_RETRIES 4
-#define FT_MR_MAX_RESTARTS 4
 #define FT_MR_STATS_INTERVAL 5
 /* Upstream's values, for the events a case queues. */
 #define FIB_EVENT_ENTRY_REPLACE 0

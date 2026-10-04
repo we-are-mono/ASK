@@ -299,6 +299,10 @@ struct cdx_ft_entry {
 	struct hlist_node cookie_node;
 	struct hlist_node key_node;
 	struct list_head neigh_list;
+	/* In ft_fdb_watch when it leaves by a bridge, and in ft_neigh_watch
+	 * when it holds a neighbour; published and unpublished with neigh_list. */
+	struct hlist_node fdb_node;
+	struct hlist_node neigh_node;
 	struct neighbour *neigh;
 	struct nf_flow_offload_handle *handle;
 	union nf_inet_addr next_hop;
@@ -356,6 +360,14 @@ static u32 ft_hash_seed;
  * handle, protected against entry removal here. Never take a neighbour lock
  * or start a backend transaction while holding this lock. */
 static LIST_HEAD(ft_neigh_entries);
+/* The same entries by what the FDB and neighbour notifiers carry: the
+ * destination MAC and VID a bridged egress was pinned under, and the
+ * neighbour an entry holds. Both events come at the rate stations learn and
+ * resolve -- a new source MAC is one -- under the bridge's or the neighbour's
+ * own lock, so each costs a bucket rather than a walk of every flow. Same lock
+ * and lifetime as ft_neigh_entries. */
+static DEFINE_HASHTABLE(ft_fdb_watch, CDX_FT_HASH_BITS);
+static DEFINE_HASHTABLE(ft_neigh_watch, CDX_FT_HASH_BITS);
 static DEFINE_SPINLOCK(ft_watch_lock);
 static LIST_HEAD(ft_block_list);
 /* Device counter records, VLAN and ppp alike. Mutated under the backend
@@ -1318,9 +1330,12 @@ static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
  * this direction received is what the far end sent, and the untranslated pair
  * is what the peer addressed. Ports are carried because a policy selector can
  * name them, and a flowi missing them would fail to match a policy that does.
+ * So is the mark, which the kernel decodes from the packet: the connection's,
+ * as the receiving end takes it, since admission allows only marks the QoS
+ * mask covers and the packets of an admitted flow carry its connection's.
  */
 static void ft_ipsec_flowi(const struct cdx_ft_rule *rule, bool reverse,
-			   struct net_device *out, struct flowi *fl)
+			   struct net_device *out, u32 mark, struct flowi *fl)
 {
 	const union nf_inet_addr *src = reverse ? &rule->dst : &rule->new_src;
 	const union nf_inet_addr *dst = reverse ? &rule->src : &rule->new_dst;
@@ -1341,6 +1356,101 @@ static void ft_ipsec_flowi(const struct cdx_ft_rule *rule, bool reverse,
 	}
 	fl->flowi_proto = rule->proto;
 	fl->flowi_oif = out->ifindex;
+	fl->flowi_mark = mark;
+}
+
+/* Whether output policy lets the tuple `fl` through at all. A lookup that fails
+ * is a block, or a transform with no state to apply; which transform one that
+ * succeeds resolves to is not asked here. The reference handling is
+ * ft_ipsec_resolve()'s. */
+static bool ft_ipsec_permits(struct dst_entry *dst, struct flowi *fl)
+{
+	struct dst_entry *bundle;
+
+	if (!dst)
+		return true;
+	dst = xfrm_dst_path(dst);
+	dst_hold(dst);
+	bundle = xfrm_lookup(&init_net, dst, fl, NULL, XFRM_LOOKUP_KEEP_DST_REF);
+	if (IS_ERR(bundle)) {
+		dst_release(dst);
+		return false;
+	}
+	/* The plain route, or a bundle that took over the reference above. */
+	dst_release(bundle);
+	return true;
+}
+
+/* The tuple ip_forward() and ip6_forward() present to output policy before
+ * NF_INET_FORWARD (xfrm4_route_forward(), xfrm6_route_forward()): between the
+ * translations, with DNAT done and this direction's SNAT not yet. Whether it
+ * differs from the one ft_ipsec_flowi() builds is the return value. */
+static bool ft_ipsec_forward_flowi(const struct cdx_ft_rule *rule,
+				   struct net_device *out, u32 mark, struct flowi *fl)
+{
+	ft_ipsec_flowi(rule, false, out, mark, fl);
+	if (nf_inet_addr_cmp(&rule->src, &rule->new_src) &&
+	    rule->sport == rule->new_sport)
+		return false;
+	if (rule->family != AF_INET) {
+		fl->u.ip6.saddr = rule->src.in6;
+		fl->u.ip6.fl6_sport = rule->sport;
+	} else {
+		fl->u.ip4.saddr = rule->src.ip;
+		fl->u.ip4.fl4_sport = rule->sport;
+	}
+	return true;
+}
+
+/* Whether a change to `pol` can alter what admission concluded about a
+ * direction. A policy changes an xfrm lookup only for a tuple its selector
+ * matches, so the selector is asked about every tuple ft_ipsec_handle()
+ * presents to policy: what leaves, the tuple between the translations, the
+ * reverse direction's outbound tuple, and the two receiving ones. What the
+ * selector alone cannot bound covers every direction: no policy named (a
+ * default changed), a mark or interface in the policy's key, and a tunnelled
+ * direction, whose outer header policy judges with a tuple of its own. */
+static bool ft_policy_covers(const struct xfrm_policy *pol,
+			     const struct cdx_ft_rule *rule)
+{
+	const struct {
+		const union nf_inet_addr *src, *dst;
+		__be16 sport, dport;
+	} tuples[] = {
+		{ &rule->new_src, &rule->new_dst, rule->new_sport, rule->new_dport },
+		{ &rule->src, &rule->new_dst, rule->sport, rule->new_dport },
+		{ &rule->dst, &rule->src, rule->dport, rule->sport },
+		{ &rule->new_dst, &rule->new_src, rule->new_dport, rule->new_sport },
+		{ &rule->src, &rule->dst, rule->sport, rule->dport },
+	};
+	struct flowi fl;
+	unsigned int i;
+
+	if (!pol || pol->mark.v || pol->mark.m || pol->if_id ||
+	    pol->selector.ifindex || rule->in_tunnel.present ||
+	    rule->out_tunnel.present)
+		return true;
+	if (pol->family != rule->family)
+		return false;
+	/* Every field a tuple sets is set for each one; the rest stay zero. */
+	memset(&fl, 0, sizeof(fl));
+	fl.flowi_proto = rule->proto;
+	for (i = 0; i < ARRAY_SIZE(tuples); i++) {
+		if (rule->family == AF_INET) {
+			fl.u.ip4.saddr = tuples[i].src->ip;
+			fl.u.ip4.daddr = tuples[i].dst->ip;
+			fl.u.ip4.fl4_sport = tuples[i].sport;
+			fl.u.ip4.fl4_dport = tuples[i].dport;
+		} else {
+			fl.u.ip6.saddr = tuples[i].src->in6;
+			fl.u.ip6.daddr = tuples[i].dst->in6;
+			fl.u.ip6.fl6_sport = tuples[i].sport;
+			fl.u.ip6.fl6_dport = tuples[i].dport;
+		}
+		if (xfrm_selector_match(&pol->selector, &fl, rule->family))
+			return true;
+	}
+	return false;
 }
 
 /* The receiving end of a direction, or with `reverse` of the other one: the
@@ -1394,13 +1504,24 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 			    struct cdx_ft_rule *rule, struct net_device *out,
 			    struct net_device *in)
 {
+	u32 mark = READ_ONCE(cls->nf_ct->mark);
 	struct ft_ipsec_receiver recv;
 	struct xfrm_state *received = NULL;
 	struct flowi fl;
 	u16 reverse_in;
 	bool allowed;
 
-	ft_ipsec_flowi(rule, false, out, &fl);
+	/* The forwarding path asks output policy twice. Before NF_INET_FORWARD
+	 * it asks about the tuple between the translations, and drops what
+	 * policy refuses there -- a block, or a transform with no state. A
+	 * POSTROUTING that translates the source then asks again about the
+	 * tuple that leaves, and only that answer chooses the transform (the
+	 * question below). So the first can only refuse; without SNAT the two
+	 * tuples are one, and the second question covers both. */
+	if (ft_ipsec_forward_flowi(rule, out, mark, &fl) &&
+	    !ft_ipsec_permits(cls->nf_dst, &fl))
+		goto denied;
+	ft_ipsec_flowi(rule, false, out, mark, &fl);
 	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, NULL, &rule->sa_handle, NULL,
 			      &rule->sa_mtu, &rule->sa_expansion))
 		goto denied;
@@ -1416,7 +1537,7 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 		xfrm_state_put(received);
 	if (!allowed)
 		goto denied;
-	ft_ipsec_flowi(rule, true, in, &fl);
+	ft_ipsec_flowi(rule, true, in, mark, &fl);
 	ft_ipsec_receiver(cls, rule, false, &recv);
 	if (!ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, &recv,
 			     &rule->in_sa_handle, &received, NULL, NULL))
@@ -1531,18 +1652,50 @@ static bool ft_routes_valid(const struct flow_cls_offload *cls)
 		dst_check(cls->nf_dst_reverse, cls->nf_dst_reverse_cookie);
 }
 
-/* The two things about an offer that no lock orders against it: the policy
- * generation it was queued under, and the two routes it borrows. Either one
- * having moved on retires the offer's whole generation. Needs no RTNL, so an
- * offer answered without admission is held to it as well. Returns whether the
- * generation is still valid. */
+/* The two routes an offer borrows, which no lock orders against it: either
+ * one having moved on retires the offer's whole generation. Needs no RTNL, so
+ * an offer answered without admission is held to it as well. Returns whether
+ * the generation is still valid. */
+static bool ft_offer_routes_current(const struct flow_cls_offload *cls)
+{
+	if (nf_flow_offload_handle_valid(cls->nf_handle) && !ft_routes_valid(cls))
+		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
+	return nf_flow_offload_handle_valid(cls->nf_handle);
+}
+
+/* The routes, and the policy generation the offer was queued under. That is
+ * the flow's creation generation on every offer, so it is asked only of an
+ * offer not yet published: once published the handle is watched, and a policy
+ * change retires the entry only if it can select it (ft_policy_covers()). An
+ * installed direction's offer is held to its routes alone. */
 static bool ft_offer_current(const struct flow_cls_offload *cls)
 {
 	if (cls->nf_xfrm_genid != xfrm_flowtable_genid(&init_net))
 		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_policy_invalidations);
-	if (nf_flow_offload_handle_valid(cls->nf_handle) && !ft_routes_valid(cls))
-		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
-	return nf_flow_offload_handle_valid(cls->nf_handle);
+	return ft_offer_routes_current(cls);
+}
+
+/* The ft_fdb_watch key of a bridged egress: the address the bridge looked its
+ * port up under, and the VID, under the adapter's seed. */
+static u32 ft_fdb_key(const u8 *mac, u16 vid)
+{
+	u32 key[2] = {};
+
+	memcpy(key, mac, ETH_ALEN);
+	key[1] ^= (u32)vid << 16;
+	return jhash2(key, ARRAY_SIZE(key), ft_hash_seed);
+}
+
+/* Put an entry on the watch list and into the indexes its dependencies name.
+ * Called with ft_watch_lock held. */
+static void ft_watch_publish(struct cdx_ft_entry *entry)
+{
+	list_add_tail(&entry->neigh_list, &ft_neigh_entries);
+	if (entry->rule.out_bridge)
+		hash_add(ft_fdb_watch, &entry->fdb_node,
+			 ft_fdb_key(entry->rule.dst_mac, entry->rule.out_bridge_vid));
+	if (entry->neigh)
+		hash_add(ft_neigh_watch, &entry->neigh_node, (unsigned long)entry->neigh);
 }
 
 static int ft_neigh_attach(struct cdx_ft_entry *entry)
@@ -1560,7 +1713,7 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 	 * is retired by nothing at all. */
 	if (entry->rule.out_session.present) {
 		spin_lock_bh(&ft_watch_lock);
-		list_add_tail(&entry->neigh_list, &ft_neigh_entries);
+		ft_watch_publish(entry);
 		spin_unlock_bh(&ft_watch_lock);
 		return 0;
 	}
@@ -1599,7 +1752,7 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 	if (valid) {
 		spin_lock(&ft_watch_lock);
 		entry->neigh = neigh;
-		list_add_tail(&entry->neigh_list, &ft_neigh_entries);
+		ft_watch_publish(entry);
 		spin_unlock(&ft_watch_lock);
 		ft_neighbour_refs++;
 	}
@@ -1620,6 +1773,10 @@ static void ft_neigh_detach(struct cdx_ft_entry *entry)
 	spin_lock_bh(&ft_watch_lock);
 	if (!list_empty(&entry->neigh_list))
 		list_del_init(&entry->neigh_list);
+	if (!hlist_unhashed(&entry->fdb_node))
+		hash_del(&entry->fdb_node);
+	if (!hlist_unhashed(&entry->neigh_node))
+		hash_del(&entry->neigh_node);
 	spin_unlock_bh(&ft_watch_lock);
 	if (!neigh)
 		return;
@@ -2869,6 +3026,11 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		ft_remove(entry);
 		return -EIO;
 	}
+	/* Watched, and current after it: from here a policy change retires
+	 * this generation only if it can select one of its directions, and
+	 * Linux leaves the rest to the walk rather than retiring the flow on a
+	 * generation that any policy anywhere moves on. */
+	nf_flow_offload_handle_watch(cls->nf_handle);
 	return 0;
 }
 
@@ -3017,9 +3179,11 @@ static bool ft_software_reoffers(const struct flow_cls_offload *cls)
  * queues, SAs -- retires the generation through its own event, as it has to for
  * a fully offloaded flow, which is never offered again at all. The conntrack
  * mark and a police filter are sampled once, at admission, which is all a fully
- * offloaded flow ever gets of them either. What ft_replace() checks ahead of
- * any parse still applies, through ft_offer_current(), as do the
- * admission conditions no event reports, through ft_entry_bounded(). */
+ * offloaded flow ever gets of them either. The routes ft_replace() checks
+ * ahead of any parse still apply, through ft_offer_routes_current(), as do the
+ * admission conditions no event reports, through ft_entry_bounded(). The
+ * policy generation does not: the offer carries the flow's creation one, and
+ * the watch the entry joined at publication answers for policy instead. */
 static bool ft_offer_installed(const struct cdx_ft_entry *entry,
 			       const struct flow_cls_offload *cls)
 {
@@ -3079,7 +3243,7 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		 * generation alive from hardware alone; retire it, so that
 		 * fresh traffic retries both directions after native GC. */
 		if (ft_offer_installed(entry, cls)) {
-			rc = ft_offer_current(cls) && ft_entry_bounded(entry) ?
+			rc = ft_offer_routes_current(cls) && ft_entry_bounded(entry) ?
 			     0 : ask_refuse(-EOPNOTSUPP);
 		} else if (!entry && ft_mtu_refused(cls)) {
 			rc = ask_refuse(-EOPNOTSUPP);
@@ -4497,13 +4661,21 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 	struct cdx_ft_entry *entry;
 
 	if (event == NETEVENT_XFRM_POLICY_UPDATE) {
-		if (!net_eq(ptr, &init_net))
+		const struct xfrm_flowtable_change *change = ptr;
+
+		if (!net_eq(change->net, &init_net))
 			return NOTIFY_DONE;
 		/* Atomic notification, including policy expiry. Never enter the
-		 * hardware backend while the XFRM policy lock is held. */
+		 * hardware backend while the XFRM policy lock is held. Only the
+		 * directions the changed policy can select are retired: every
+		 * published handle is watched, so Linux no longer retires the
+		 * rest on the generation alone. */
 		spin_lock_bh(&ft_watch_lock);
 		list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-			ft_handle_invalidate(entry->handle, &ft_ipsec_policy_invalidations);
+			if (nf_flow_offload_handle_valid(entry->handle) &&
+			    ft_policy_covers(change->pol, &entry->rule))
+				ft_handle_invalidate(entry->handle,
+						     &ft_ipsec_policy_invalidations);
 		spin_unlock_bh(&ft_watch_lock);
 		/* An output policy can govern a routed multicast copy, which
 		 * nothing else about the group changes to report: every group
@@ -4522,7 +4694,7 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 		return NOTIFY_DONE;
 	read_lock_bh(&neigh->lock);
 	spin_lock(&ft_watch_lock);
-	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+	hash_for_each_possible(ft_neigh_watch, entry, neigh_node, (unsigned long)neigh) {
 		if (entry->neigh == neigh &&
 		    !ft_neigh_matches(neigh, entry->rule.dst_mac)) {
 			/* Ordinary NUD ageing with a usable MAC needs no retirement.
@@ -4635,7 +4807,7 @@ static int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *pt
 	    !port || !net_eq(dev_net(port), &init_net))
 		return NOTIFY_DONE;
 	spin_lock_bh(&ft_watch_lock);
-	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+	hash_for_each_possible(ft_fdb_watch, entry, fdb_node, ft_fdb_key(info->addr, info->vid)) {
 		/* Only the egress direction is chosen by an FDB entry, and the
 		 * address it was looked up under is this rule's destination
 		 * MAC. An add naming the port the flow already leaves by
@@ -5137,6 +5309,8 @@ struct ft_mc_stream {
  */
 struct ft_mc_group {
 	struct list_head list;
+	/* In ft_mc_group_index by (bridge, VLAN, group), whatever source. */
+	struct hlist_node index;
 	struct net_device *bridge;
 	struct br_ip addr;
 	/* The ports holding the membership, each pinned. */
@@ -5278,6 +5452,11 @@ struct ft_mc_flow {
 	 * sends to would otherwise count one on every frame the dedup slots
 	 * could not hold. */
 	bool turned;
+	/* When a frame of it was last drained, or it last asked for one; and
+	 * whether it is asking, which its next frame answers. Only a flow
+	 * nothing carries is asked; see ft_mc_flow_probe(). */
+	unsigned long seen_at;
+	bool probing;
 	/* Consecutive failed installs. A failure is not permanent -- a port
 	 * that lost carrier gets it back -- but retrying on every frame of a
 	 * live stream would spin the worker against a flow that cannot be
@@ -5298,7 +5477,26 @@ struct ft_mc_flow {
  * the table is short of. Past this a source is left to the bridge. */
 #define FT_MC_MAX_FLOWS	8
 
+/* Flows arriving on one port, and flows in all. Every source of every group a
+ * membership names would otherwise be a flow, and memberships are as many as
+ * the bridge keeps: a sender choosing both made thousands, each asked of the
+ * bridge under RTNL at every refresh. The hardware holds 512 groups per family
+ * between both learners; one port is held to half of the total, so its
+ * senders cannot take every place. A source past either is turned away as one
+ * past FT_MC_MAX_FLOWS is. */
+#define FT_MC_MAX_PORT_FLOWS	256
+#define FT_MC_MAX_TOTAL_FLOWS	512
+
+/* How long a flow nothing carries keeps its place without a frame. Its frames
+ * are not recorded again once seen (ft_mc_record()), so at this age it asks
+ * -- see ft_mc_flow_probe() -- and goes at the next if nothing answered. */
+#define FT_MC_UNCARRIED_AGE	(6 * FT_MC_REFRESH_INTERVAL)
+
 static LIST_HEAD(ft_mc_groups);
+/* The memberships by (bridge, VLAN, group), for what a flow asks of them on
+ * every retirement pass: as many memberships as the bridge keeps, and walking
+ * them all for each flow made every pass flows x memberships. */
+static DEFINE_HASHTABLE(ft_mc_group_index, 8);
 static LIST_HEAD(ft_mc_flows);
 static DEFINE_MUTEX(ft_mc_lock);
 static unsigned int ft_mc_count, ft_mc_flow_count, ft_mc_installed;
@@ -5397,6 +5595,18 @@ static bool ft_mc_same_vlan_group(const struct br_ip *a, const struct br_ip *b)
 {
 	return a->proto == b->proto && a->vid == b->vid &&
 	       !memcmp(&a->dst, &b->dst, sizeof(a->dst));
+}
+
+/* The ft_mc_group_index key of a bridge VLAN's group: what
+ * ft_mc_same_vlan_group() compares, and the bridge, under the adapter's seed. */
+static u32 ft_mc_group_key(const struct net_device *bridge, const struct br_ip *addr)
+{
+	u32 key[2 + sizeof(addr->dst) / sizeof(u32)];
+
+	key[0] = (u32)(unsigned long)bridge;
+	key[1] = (__force u32)addr->proto << 16 | addr->vid;
+	memcpy(key + 2, &addr->dst, sizeof(addr->dst));
+	return jhash2(key, ARRAY_SIZE(key), ft_hash_seed);
 }
 
 /* Ask the bridge again about every flow of this group on this bridge VLAN,
@@ -6150,7 +6360,8 @@ static bool ft_mc_flow_named(const struct ft_mc_flow *f)
 	const struct ft_mc_group *g;
 
 	lockdep_assert_held(&ft_mc_lock);
-	list_for_each_entry(g, &ft_mc_groups, list) {
+	hash_for_each_possible(ft_mc_group_index, g, index,
+			       ft_mc_group_key(f->bridge, &f->addr)) {
 		if (g->bridge != f->bridge || (!g->ports && !g->host) ||
 		    !ft_mc_same_vlan_group(&g->addr, &f->addr))
 			continue;
@@ -6182,6 +6393,7 @@ static void ft_mc_retire(struct list_head *dead, struct list_head *gone)
 	list_for_each_entry_safe(g, gtmp, &ft_mc_groups, list) {
 		if (g->ports || g->host)
 			continue;
+		hash_del(&g->index);
 		list_move(&g->list, dead);
 		ft_mc_count--;
 		retired = true;
@@ -6255,6 +6467,7 @@ static struct ft_mc_group *ft_mc_group_new(struct net_device *bridge,
 	g->bridge = bridge;
 	g->addr = *addr;
 	list_add(&g->list, &ft_mc_groups);
+	hash_add(ft_mc_group_index, &g->index, ft_mc_group_key(bridge, addr));
 	ft_mc_count++;
 	/* A frame of this group recorded before the membership existed was
 	 * named by nothing; it is worth recording again now that something
@@ -6997,16 +7210,19 @@ static bool ft_mc_same_key(const struct ft_mc_flow *a, const struct ft_mc_flow *
 static void ft_mc_observe(const struct ft_mc_seen *seen)
 {
 	bool counted = false, shared = false;
+	unsigned int flows = 0, port_flows = 0;
 	struct net_device *bridge, *in;
 	struct ft_mc_seen other;
 	struct ft_mc_flow *f, *o;
-	unsigned int flows = 0;
 	struct br_ip key;
 
 	lockdep_assert_held(&ft_mc_lock);
 	ft_mc_seen_key(seen, &key);
 	f = ft_mc_flow_find(&key, seen);
 	if (f) {
+		/* Its stream is arriving, which answers a flow that asked. */
+		f->seen_at = jiffies;
+		f->probing = false;
 		if (ether_addr_equal(f->dst_mac, seen->dst_mac) &&
 		    ether_addr_equal(f->src_mac, seen->src_mac) &&
 		    f->in_tagged == seen->tagged)
@@ -7092,6 +7308,7 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 	 * way. */
 	o = NULL;
 	list_for_each_entry(f, &ft_mc_flows, list) {
+		port_flows += !f->gone && f->in == in;
 		if (f->gone || f->bridge != bridge ||
 		    !ft_mc_same_vlan_group(&f->addr, &key))
 			continue;
@@ -7103,6 +7320,7 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 	}
 	if (flows >= FT_MC_MAX_FLOWS) {
 		if (!o || shared || ft_mc_filtered ||
+		    (o->in != in && port_flows >= FT_MC_MAX_PORT_FLOWS) ||
 		    ft_mc_host_joined(bridge, &key) ||
 		    !ft_mc_source_named(bridge, &key)) {
 			/* Counted once until the group's flows change, which
@@ -7119,6 +7337,14 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 		}
 		ft_mc_refused++;
 		o->gone = true;
+	} else if (ft_mc_flow_count >= FT_MC_MAX_TOTAL_FLOWS ||
+		   port_flows >= FT_MC_MAX_PORT_FLOWS) {
+		/* A place given up above makes none; a new one would.
+		 * Counted per frame the dedup slots let through, which is
+		 * once until something is forgotten or lapses. */
+		ft_mc_refused++;
+		dev_put(in);
+		return;
 	}
 	f = kzalloc(sizeof(*f), GFP_KERNEL);
 	if (!f) {
@@ -7136,6 +7362,7 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 	ether_addr_copy(f->dst_mac, seen->dst_mac);
 	ether_addr_copy(f->src_mac, seen->src_mac);
 	f->in_tagged = seen->tagged;
+	f->seen_at = jiffies;
 	f->dirty = true;
 	f->stale = true;
 	list_add_tail(&f->list, &ft_mc_flows);
@@ -8113,6 +8340,43 @@ static void ft_mc_flow_counted(struct ft_mc_flow *f,
 		f->gone = true;
 }
 
+/* Whether a flow nothing carries still has a stream. With no entry there is
+ * no count to age it by, and its frames are not recorded again once seen
+ * (ft_mc_record()): a flow that has heard nothing for FT_MC_UNCARRIED_AGE
+ * supersedes its slot, so its next frame is recorded and drained -- clearing
+ * the question in ft_mc_observe() -- and one still asking an age later goes.
+ * One record per live flow per age, against a flow every source of every
+ * named group would otherwise keep for as long as the group was named.
+ * Called with ft_mc_lock held. */
+static void ft_mc_flow_probe(struct ft_mc_flow *f, unsigned long now)
+{
+	struct ft_mc_stream shape;
+	struct ft_mc_seen seen;
+
+	lockdep_assert_held(&ft_mc_lock);
+	/* A carried flow is aged by its counts. Its clock starts over, and any
+	 * question asked before it was installed is dropped: an entry
+	 * withdrawn later begins a fresh age rather than going on the spot. */
+	if (f->hw) {
+		f->probing = false;
+		f->seen_at = now;
+		return;
+	}
+	if (f->gone || !time_after(now, f->seen_at + FT_MC_UNCARRIED_AGE))
+		return;
+	if (f->probing) {
+		f->gone = true;
+		return;
+	}
+	f->probing = true;
+	f->seen_at = now;
+	ether_addr_copy(shape.dst_mac, f->dst_mac);
+	ether_addr_copy(shape.src_mac, f->src_mac);
+	shape.tagged = f->in_tagged;
+	ft_mc_flow_seen(f, &shape, &seen);
+	ft_mc_supersede(&seen);
+}
+
 /* The periodic half of the bridged learner: what each installed entry has
  * counted since the last pass, and every flow asked of the bridge again.
  *
@@ -8142,6 +8406,7 @@ static void ft_mc_refresh_fn(struct work_struct *work)
 		 * zero and count the whole stream again into its route. */
 		if (f->hw && cdx_mc_group_stats(f->hw, &stats))
 			ft_mc_flow_counted(f, &stats, jiffies);
+		ft_mc_flow_probe(f, jiffies);
 	}
 	mutex_unlock(&ft_mc_lock);
 	cdx_ft_end();
@@ -8618,6 +8883,7 @@ static void ft_mc_exit(void)
 	 * and let go of their devices. */
 	mutex_lock(&ft_mc_lock);
 	list_splice_init(&ft_mc_groups, &dead);
+	hash_init(ft_mc_group_index);
 	list_splice_init(&ft_mc_flows, &gone);
 	list_for_each_entry_safe(r, rtmp, &ft_mc_routes, list) {
 		list_del(&r->list);
@@ -8656,6 +8922,11 @@ static void ft_mc_exit(void)
  * questions with one word. */
 static const char *ft_mc_state(const struct ft_mc_flow *f)
 {
+	/* Aged or taken back, and listed until the worker retires it: what it
+	 * is about to do, not a reason its flags would give a live flow. An
+	 * entry it still has stays in hardware and counted meanwhile. */
+	if (f->gone)
+		return "retiring";
 	if (!f->derived)
 		return "pending";
 	/* Before "installed", deliberately: a flow whose answer has just
@@ -8884,9 +9155,8 @@ static void ft_mc_rows(struct seq_file *seq)
  *     takes the transaction there -- RTNL then the transaction, the order the
  *     flowtable's bind path and the DSCP map's barrier already take.
  *     cdx_ctrl_lock_with_rtnl() forbids waiting for either lock while holding
- *     the other, and the one path that waits for RTNL while holding the
- *     transaction is the legacy FCI command plane, which is sealed once the
- *     flowtable owns the hardware. So that order closes no cycle, and the
+ *     the other, and no path waits for RTNL while holding the transaction:
+ *     admission only trylocks it. So that order closes no cycle, and the
  *     worker, which may wait for RTNL, never holds the transaction then. The
  *     bridged learner's drain, ft_mc_egress_drain(), is the same.
  *   - ft_mr_lock and ft_mc_lock are never nested. The bridged side only

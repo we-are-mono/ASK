@@ -2474,7 +2474,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 #endif
 	/*insert entry into hash table */
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
-	if (retval == -1) {
+	if (retval < 0) {
 		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;
 	}

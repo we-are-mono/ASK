@@ -12,6 +12,8 @@ typedef int atomic_t;
 struct rcu_head { int unused; };
 #define GFP_ATOMIC 0
 #define READ_ONCE(v) (v)
+#define smp_store_release(p, v) (*(p) = (v))
+#define smp_load_acquire(p) (*(p))
 #define EXPORT_SYMBOL_GPL(name)
 #define unlikely(v) (v)
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
@@ -222,6 +224,19 @@ int main(void)
     grace_period(); assert(!allocations && !ct.refs);
     flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
     assert(!flow_offload_hw_invalid(flow) && flow_offload_lookup(&table, &key[0]));
+    flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+    /* A handle its driver watches leaves policy to the driver: a later
+     * generation no longer retires the flow here, and only the driver's own
+     * invalidation does. */
+    flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+    nf_flow_offload_handle_watch(flow->hw_handle);
+    policy_generation++;
+    assert(!flow_offload_hw_invalid(flow) && flow_offload_lookup(&table, &key[0]));
+    nf_flow_offload_gc_step(&table, flow, NULL);
+    assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+    assert(nf_flow_offload_handle_invalidate(flow->hw_handle));
+    assert(flow_offload_hw_invalid(flow) && !flow_offload_lookup(&table, &key[0]));
+    nf_flow_offload_handle_watch(NULL);
     flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
     assert(!nf_flow_offload_handle_valid(NULL) && !nf_flow_offload_handle_invalidate(NULL));
     nf_flow_offload_handle_put(NULL);

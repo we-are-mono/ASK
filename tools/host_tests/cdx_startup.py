@@ -71,7 +71,7 @@ def test_cdx_startup(tmp_path):
     names = ["release_cfg_info", "dpa_prepare_ports", "dpa_set_ports_enabled",
              "dpa_release_pcd_fqs", "dpa_rollback_resources", "dpa_detach_ports",
              "dpa_ports_fence", "dpa_ports_wait_stopped", "dpa_ports_stop",
-             "dpa_ports_start", "dpa_cfg_stop", "dpa_cfg_covered", "dpa_cfg_resume",
+             "dpa_ports_start", "dpa_cfg_stop", "dpa_cfg_covered", "dpa_cfg_shared_icid", "dpa_cfg_resume",
              "dpa_cfg_quiesce", "dpa_cfg_deinit", "dpa_cfg_set_expt_defaults",
              "dpa_cfg_publish", "dpa_cfg_install"]
     (tmp_path / "cdx_startup.inc").write_text(

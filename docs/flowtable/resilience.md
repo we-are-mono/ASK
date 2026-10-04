@@ -533,8 +533,16 @@ WAN captures establish ESP use; directional hardware counters and software
 forwarding counters distinguish acceleration from successful software fallback.
 
 A per-network policy generation now invalidates both native flowtable lookup
-and ASK hardware admission. Policy notifications retire stale entries; admission
-checks the current policies and repeats generation checks across publication.
+and ASK hardware admission. Admission checks the current policies and repeats
+generation checks across publication. A published entry's handle is then
+watched (`nf_flow_offload_handle_watch()`, patch 140). From then on the
+generation no longer retires the flow in Linux, and a policy notification,
+which names the policy, retires only the entries whose tuples that policy's
+selector can match. The tuples are those leaving, those between the NAT
+translations, the reverse direction's, and the two receiving ones. A changed
+default, a mark or interface in the policy's key, or a tunnelled entry still
+retires conservatively. A CHILD_SA rekey therefore retires only the flows its
+own selectors name, not every offloaded flow on the gateway.
 Forwarding checks retain the received security path and enforce required
 transforms, including packet-offloaded policies. Marked policies conservatively
 exclude hardware admission when their selectors cannot be represented safely.

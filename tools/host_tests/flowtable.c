@@ -205,6 +205,7 @@ static void hlist_add(struct hlist_head *h, struct hlist_node *n)
 { n->next = h->first; if (n->next) n->next->pprev = &n->next; h->first = n; n->pprev = &h->first; }
 static void hash_del(struct hlist_node *n)
 { assert(n->pprev); *n->pprev = n->next; if (n->next) n->next->pprev = n->pprev; n->next = NULL; n->pprev = NULL; }
+static bool hlist_unhashed(const struct hlist_node *n) { return !n->pprev; }
 #define hash_add(t, n, k) hlist_add(&(t)[hash_slot(t, k)], n)
 #define hash_for_each_possible(t, p, m, k) \
     for (struct hlist_node *node_ = (t)[hash_slot(t, k)].first; \
@@ -654,6 +655,10 @@ static bool nf_flow_offload_handle_valid(const struct nf_flow_offload_handle *h)
 { return h && !h->invalid; }
 static bool nf_flow_offload_handle_invalidate(struct nf_flow_offload_handle *h)
 { bool old = h->invalid; h->invalid = true; return !old; }
+/* The handle the adapter last took policy invalidation over for. */
+static const struct nf_flow_offload_handle *watched_handle;
+static void nf_flow_offload_handle_watch(struct nf_flow_offload_handle *h)
+{ assert(h && !h->invalid); watched_handle = h; }
 static void nf_flow_offload_handle_get(struct nf_flow_offload_handle *h)
 { assert(h->refs); h->refs++; }
 static void nf_flow_offload_handle_put(struct nf_flow_offload_handle *h)
@@ -708,6 +713,8 @@ static DEFINE_HASHTABLE(ft_cookies, CDX_FT_HASH_BITS);
 static DEFINE_HASHTABLE(ft_keys, CDX_FT_HASH_BITS);
 static u32 ft_hash_seed;
 static LIST_HEAD(ft_neigh_entries);
+static DEFINE_HASHTABLE(ft_fdb_watch, CDX_FT_HASH_BITS);
+static DEFINE_HASHTABLE(ft_neigh_watch, CDX_FT_HASH_BITS);
 static bool ft_watch_lock;
 static LIST_HEAD(ft_block_list);
 static LIST_HEAD(ft_dev_stats);
@@ -1063,10 +1070,39 @@ static u16 ipsec_sa, ipsec_in_sa;
 static bool tunnel_policy_allowed = true;
 struct flowi {
     union {
-        struct { struct in6_addr saddr, daddr; u8 flowi6_proto; int flowi6_iif, flowi6_oif; } ip6;
-        struct { __be32 saddr, daddr; u8 flowi4_proto; int flowi4_iif, flowi4_oif; } ip4;
+        struct { struct in6_addr saddr, daddr; u8 flowi6_proto; int flowi6_iif, flowi6_oif;
+                 __be16 fl6_sport, fl6_dport; } ip6;
+        struct { __be32 saddr, daddr; u8 flowi4_proto; int flowi4_iif, flowi4_oif;
+                 __be16 fl4_sport, fl4_dport; } ip4;
     } u;
+    u8 flowi_proto;
 };
+/* A policy as the walk reads one, and a selector that names exact source and
+ * destination addresses (or none), ports under their masks, and a protocol,
+ * as the kernel's __xfrm4_selector_match() judges them. */
+struct xfrm_selector {
+    union nf_inet_addr saddr, daddr;
+    __be16 sport, sport_mask, dport, dport_mask;
+    u8 prefixlen_s, prefixlen_d, proto;
+    int ifindex;
+};
+struct xfrm_policy { u16 family; struct xfrm_selector selector; struct { u32 v, m; } mark; u32 if_id; };
+struct xfrm_flowtable_change { struct net *net; const struct xfrm_policy *pol; };
+static bool xfrm_selector_match(const struct xfrm_selector *sel, const struct flowi *fl,
+                                unsigned short family)
+{
+    __be16 sport = family == AF_INET ? fl->u.ip4.fl4_sport : fl->u.ip6.fl6_sport;
+    __be16 dport = family == AF_INET ? fl->u.ip4.fl4_dport : fl->u.ip6.fl6_dport;
+
+    if ((sel->proto && sel->proto != fl->flowi_proto) ||
+        ((sport ^ sel->sport) & sel->sport_mask) || ((dport ^ sel->dport) & sel->dport_mask))
+        return false;
+    if (family == AF_INET)
+        return (!sel->prefixlen_s || sel->saddr.ip == fl->u.ip4.saddr) &&
+               (!sel->prefixlen_d || sel->daddr.ip == fl->u.ip4.daddr);
+    return (!sel->prefixlen_s || !memcmp(&sel->saddr.in6, &fl->u.ip6.saddr, 16)) &&
+           (!sel->prefixlen_d || !memcmp(&sel->daddr.in6, &fl->u.ip6.daddr, 16));
+}
 static struct flowi last_tunnel_policy;
 static bool xfrm_flowtable_in_plain(struct net *net, const struct flowi *flow, u16 family)
 {
@@ -2753,6 +2789,18 @@ static void test_bridge_fdb(void)
 #define FDB_DRAIN() do { ft_handle_invalidate(&handle, &ft_mac_invalidations); \
     ft_retire_workfn(NULL); assert(!ft_count && !allocated); } while (0)
 
+    /* The event finds the entry by the address and VID it carries, and an
+     * entry holding a neighbour by that neighbour, rather than walking every
+     * flow: both fire at the rate stations learn and resolve. */
+    FDB_FIXTURE();
+    {
+        struct cdx_ft_entry *e = list_entry(ft_entries.next, struct cdx_ft_entry, list);
+
+        assert(!hlist_unhashed(&e->fdb_node));
+        assert(hlist_unhashed(&e->neigh_node) == !e->neigh);
+    }
+    FDB_DRAIN();
+
     /* A delete against the port the flow leaves by withdraws the pinning. */
     FDB_FIXTURE();
     assert(ft_fdb_event(NULL, SWITCHDEV_FDB_DEL_TO_DEVICE, &info) == NOTIFY_DONE);
@@ -2789,6 +2837,7 @@ static void test_bridge_fdb(void)
      * alone however well its address matches. */
     fixture();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(hlist_unhashed(&list_entry(ft_entries.next, struct cdx_ft_entry, list)->fdb_node));
     info = (struct switchdev_notifier_fdb_info){ .info.dev = &decoy, .addr = dst, .vid = 0 };
     before = ft_fdb_invalidations;
     assert(ft_fdb_event(NULL, SWITCHDEV_FDB_DEL_TO_DEVICE, &info) == NOTIFY_DONE);
@@ -5635,8 +5684,10 @@ static void test_installed_reoffer(void)
             u64 admission = ft_admission_invalidations, policy = ft_ipsec_policy_invalidations;
             u64 routes = ft_route_invalidations;
             unsigned trylocks = rtnl_trylocks, lookups = police_lookups;
-            /* What no lock orders against an offer still counts: a policy
-             * generation or a borrowed route that has moved on. */
+            /* What no lock orders against an offer still counts: a borrowed
+             * route that has moved on. A policy generation does not: the offer
+             * carries the flow's creation one, and the entry, watched since it
+             * was published, is retired by the changes that can select it. */
             if (stale == 1) xfrm_genid++;
             if (stale == 2) route.dst.valid = false;
             rtnl_busy = true;
@@ -5646,15 +5697,16 @@ static void test_installed_reoffer(void)
             assert(rtnl_trylocks == trylocks && ft_busy == busy && ft_validated == validated &&
                    police_lookups == lookups && ft_admission_invalidations == admission);
             assert(ft_find(&binding, cls.cookie) == installed && ft_count == 1 && live_hw == 1);
-            if (!stale) {
+            if (stale < 2) {
                 assert(rc == 0 && !handle.invalid && handle.refs == 2 && ft_rejects == rejects);
                 assert(installed->handle == &handle && ft_handle_refs == 1);
+                assert(ft_ipsec_policy_invalidations == policy);
                 remove_all();
                 continue;
             }
             assert(rc == -EOPNOTSUPP && handle.invalid && ft_rejects == rejects + 1);
-            assert(ft_ipsec_policy_invalidations == policy + (stale == 1));
-            assert(ft_route_invalidations == routes + (stale == 2));
+            assert(ft_ipsec_policy_invalidations == policy);
+            assert(ft_route_invalidations == routes + 1);
             ft_retire_workfn(NULL);
             assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated && !live_hw);
         }
@@ -6223,20 +6275,115 @@ static void test_ipsec_generation_retirement(void)
         /* A fresh generation can be admitted without rearming the backend. */
         handle = (struct nf_flow_offload_handle){ .refs = 1 };
         cls.nf_xfrm_genid = xfrm_genid;
+        watched_handle = NULL;
         assert(ft_replace(&binding, &cls) == 0);
+        /* Published and still current: Linux leaves this handle's policy
+         * invalidation to the walk from here. */
+        assert(watched_handle == &handle);
         struct net foreign = {0};
+        struct xfrm_flowtable_change change = { .net = &foreign };
         unsigned kicks = mroute_kicks;
         u64 changes = ft_mr_xfrm_changes;
-        ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &foreign);
+        ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &change);
         assert(!handle.invalid && mroute_kicks == kicks && ft_mr_xfrm_changes == changes);
-        ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &init_net);
-        assert(handle.invalid && ft_count == 1);
-        /* And every routed group is asked again: an output policy can
-         * govern a multicast copy, which nothing else would report. */
-        assert(mroute_kicks == kicks + 1 && ft_mr_xfrm_changes == changes + 1);
+        /* A policy of the other family, or one whose selector names none of
+         * the direction's tuples, cannot change what admission concluded:
+         * the direction stays installed, and so does its next offer, which
+         * still carries the flow's creation generation. */
+        struct xfrm_policy other_family = { .family = AF_INET6 };
+        struct xfrm_policy elsewhere = { .family = AF_INET,
+            .selector = { .daddr.ip = htonl(0xcb007109), .prefixlen_d = 32 } };
+        struct xfrm_policy other_proto = { .family = AF_INET,
+            .selector = { .proto = IPPROTO_TCP } };
+        const struct xfrm_policy *unrelated[] = { &other_family, &elsewhere, &other_proto };
+        change.net = &init_net;
+        for (unsigned i = 0; i < ARRAY_SIZE(unrelated); i++) {
+            change.pol = unrelated[i];
+            xfrm_genid++;
+            ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &change);
+            assert(!handle.invalid && ft_count == 1);
+        }
+        cls.command = FLOW_CLS_REPLACE;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        assert(!handle.invalid && ft_count == 1);
+        /* Every routed group is asked again all the same: an output policy
+         * can govern a multicast copy, which nothing else would report. */
+        assert(mroute_kicks == kicks + 3 && ft_mr_xfrm_changes == changes + 3);
+        /* What can select the direction retires it: a selector naming its
+         * destination, by itself or as the reverse direction's source, one
+         * bounded by a mark, which the walk cannot judge, and a change no
+         * single policy bounds. */
+        struct xfrm_policy covering[] = {
+            { .family = AF_INET, .selector = { .daddr.ip = htonl(0xc6336402), .prefixlen_d = 32 } },
+            { .family = AF_INET, .selector = { .saddr.ip = htonl(0xc6336402), .prefixlen_s = 32 } },
+            { .family = AF_INET, .selector = { .proto = IPPROTO_UDP } },
+            { .family = AF_INET6, .mark = { 0x44, 0xff } },
+        };
+        for (unsigned i = 0; i <= ARRAY_SIZE(covering); i++) {
+            change.pol = i < ARRAY_SIZE(covering) ? &covering[i] : NULL;
+            u64 retired = ft_ipsec_policy_invalidations;
+            handle.invalid = false;
+            ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &change);
+            assert(handle.invalid && ft_count == 1);
+            assert(ft_ipsec_policy_invalidations == retired + 1);
+        }
+        assert(mroute_kicks == kicks + 3 + ARRAY_SIZE(covering) + 1);
         ft_retire_workfn(NULL);
         assert(!ft_count && !live_hw && !allocated && !ft_handle_refs && !ft_neighbour_refs);
     }
+}
+
+/* Every tuple admission asks policy about, for a direction translated at both
+ * ends: a selector naming exactly one of them -- addresses and ports --
+ * covers the direction, and the same addresses under other ports do not. What
+ * the selector cannot bound covers it whatever the selector says. */
+static void test_policy_covers_tuples(void)
+{
+    struct cdx_ft_rule r;
+    const __be32 a = htonl(0x0a000001), b = htonl(0x0a000002);
+    const __be32 c = htonl(0x0a000003), d = htonl(0x0a000004);
+    const struct { __be32 s, d; __be16 sp, dp; } tuples[] = {
+        { c, d, htons(3000), htons(4000) },    /* what leaves */
+        { a, d, htons(1000), htons(4000) },    /* between the translations */
+        { b, a, htons(2000), htons(1000) },    /* the reverse direction's */
+        { d, c, htons(4000), htons(3000) },    /* received, reverse direction */
+        { a, b, htons(1000), htons(2000) },    /* received */
+    };
+
+    memset(&r, 0, sizeof(r));
+    r.family = AF_INET;
+    r.proto = IPPROTO_UDP;
+    r.src.ip = a; r.dst.ip = b; r.sport = htons(1000); r.dport = htons(2000);
+    r.new_src.ip = c; r.new_dst.ip = d; r.new_sport = htons(3000); r.new_dport = htons(4000);
+    for (unsigned i = 0; i < ARRAY_SIZE(tuples); i++) {
+        struct xfrm_policy pol = { .family = AF_INET, .selector = {
+            .saddr.ip = tuples[i].s, .daddr.ip = tuples[i].d, .prefixlen_s = 32, .prefixlen_d = 32,
+            .sport = tuples[i].sp, .dport = tuples[i].dp, .sport_mask = 0xffff, .dport_mask = 0xffff,
+            .proto = IPPROTO_UDP } };
+        assert(ft_policy_covers(&pol, &r));
+        pol.selector.sport = htons(9);
+        assert(!ft_policy_covers(&pol, &r));
+        pol.selector.sport = tuples[i].sp;
+        pol.selector.proto = IPPROTO_TCP;
+        assert(!ft_policy_covers(&pol, &r));
+    }
+    /* Addresses no tuple pairs that way are no selection either. */
+    struct xfrm_policy across = { .family = AF_INET, .selector = {
+        .saddr.ip = b, .daddr.ip = d, .prefixlen_s = 32, .prefixlen_d = 32 } };
+    assert(!ft_policy_covers(&across, &r));
+    /* A default (no policy), a mark, an if_id or an interface in the key, and
+     * a tunnelled direction cover it whatever the selector names -- even a
+     * policy of the other family. */
+    struct xfrm_policy other = { .family = AF_INET6 };
+    assert(!ft_policy_covers(&other, &r));
+    assert(ft_policy_covers(NULL, &r));
+    other.mark.v = 1; assert(ft_policy_covers(&other, &r)); other.mark.v = 0;
+    other.mark.m = 0xff; assert(ft_policy_covers(&other, &r)); other.mark.m = 0;
+    other.if_id = 7; assert(ft_policy_covers(&other, &r)); other.if_id = 0;
+    other.selector.ifindex = 3; assert(ft_policy_covers(&other, &r)); other.selector.ifindex = 0;
+    r.out_tunnel.present = true; assert(ft_policy_covers(&other, &r)); r.out_tunnel.present = false;
+    r.in_tunnel.present = true; assert(ft_policy_covers(&other, &r)); r.in_tunnel.present = false;
+    assert(!ft_policy_covers(&other, &r));
 }
 
 static void test_selective_routes(void)
@@ -7546,6 +7693,7 @@ int main(void)
     test_mtu_before_admission();
     test_mtu_refusal_sound();
     test_ipsec_generation_retirement();
+    test_policy_covers_tuples();
     test_nexthop_objects();
     test_qos_decode();
     test_egress_drain();

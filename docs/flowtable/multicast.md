@@ -775,7 +775,9 @@ analogue for, and it is why `/proc` has to show it: an operator looking at a
 group that is not being replicated must be able to tell "refused" from "not yet
 seen". `/proc` prints one `mcast` row per flow, with `member_src` the source of
 the most specific membership naming it, and one per membership that names no
-flow yet, as `pending-source`. `mcast_groups` counts memberships and
+flow yet, as `pending-source`. A flow that has aged out, or been taken back,
+reads `retiring` until the next worker pass removes it; its entry is still in
+hardware and still counted until then. `mcast_groups` counts memberships and
 `mcast_flows` flows; `mcast_installed` counts flows in hardware, and
 `mcast_enabled` is the global switch both learners answer to.
 
@@ -790,6 +792,17 @@ install is tried again at each of the next refreshes, five seconds apart, up to
 four times, and then reads `refused-failed` until the bridge's answer for the
 flow changes. `/proc` shows how many ids each family holds against how many it
 has (`mcast_group_ids4`, `mcast_group_ids6`, `mcast_group_id_slots`).
+
+The learner itself keeps at most 256 flows arriving on one port and 512 in
+all (`FT_MC_MAX_PORT_FLOWS`, `FT_MC_MAX_TOTAL_FLOWS`), beside the eight
+sources a group may have. Every source of every named group would otherwise
+be a flow, each asked of the bridge under RTNL at every refresh. A source past
+any bound is turned away and counted in `mcast_refused`. A flow nothing
+carries has no hardware count to age by, so after 30 s without a recorded
+frame it asks: its dedup slot lapses, the next frame of a live stream answers,
+and a flow with no answer 30 s later is retired and relearned from its next
+frame. Memberships are indexed by bridge, VLAN and group, so a retirement
+pass costs one lookup per flow rather than a walk of every membership.
 
 **Dependencies.** A multicast flow is the sixth dependency class. Its
 memberships come from the MDB and are retired by it, and a flow nothing names

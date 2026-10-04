@@ -448,10 +448,6 @@ static void strscpy(char *dst, const char *src, size_t size)
 }
 
 /* --- the learner's own state ------------------------------------------ */
-/* The one constant the harness restates rather than extracts; the Python side
- * asserts the source spells it the same way. */
-#define FT_MR_OIF_TEXT (CDX_MC_MAX_LISTENERS * (IFNAMSIZ + 1))
-
 static LIST_HEAD(ft_mr_groups);
 static int ft_mr_lock;
 static unsigned int ft_mr_count;
@@ -869,6 +865,52 @@ int main(void)
     /* And it is per family: an IPv6 rule does not refuse IPv4. */
     ft_mr_policy[ft_mr_idx(AF_INET6)] = 1;
     assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    free(g);
+
+    /* ---- the contract's order --------------------------------------- */
+
+    /* A group every clause refuses at once, and each one taken away in
+     * turn: the reason /proc gives is always the first clause that holds.
+     * The cheap tests come first, so the backend's own refusals of a
+     * wildcard source or a link-local group never surface as
+     * "refused-failed" four retries later; the threshold and the listeners
+     * walk the oifs after them; the XFRM policy, which routes every oif, is
+     * asked only of oifs everything else has let through. */
+    reset();
+    g = group4(&MFC, htonl(INADDR_ANY), ip4(224, 0, 0, 1), 0);
+    vif_set(AF_INET, 1, &LAN, 0);       /* the parent VIF has no device */
+    vif_set(AF_INET, 2, &LAN2, 0);
+    oif(g, 1, 1);
+    oif(g, 2, 16);                      /* a scoped threshold */
+    host_join4(&WAN, ip4(239, 8, 1, 5));
+    LAN.mtu = 1400;
+    init_net.xfrm.policy_count[XFRM_POLICY_OUT] = 1;
+    xfrm_governed = LAN.ifindex;
+    g->table = 100;
+    ft_mc_enabled = false;
+    ft_mr_policy[ft_mr_idx(AF_INET)] = 1;
+    assert(refuse(g) == FT_MR_REFUSED_TABLE);
+    g->table = RT_TABLE_DEFAULT;
+    assert(refuse(g) == FT_MR_REFUSED_PAUSED);
+    ft_mc_enabled = true;
+    assert(refuse(g) == FT_MR_REFUSED_POLICY);
+    ft_mr_policy[ft_mr_idx(AF_INET)] = 0;
+    assert(refuse(g) == FT_MR_REFUSED_WILDCARD);
+    g->src.ip = ip4(10, 0, 0, 52);
+    assert(refuse(g) == FT_MR_REFUSED_SCOPE);
+    g->dst.ip = ip4(239, 8, 1, 5);
+    assert(refuse(g) == FT_MR_REFUSED_INGRESS);
+    vif_set(AF_INET, 0, &WAN, 0);
+    assert(refuse(g) == FT_MR_REFUSED_HOST);
+    mc_list_count = mc4_used = 0;
+    assert(refuse(g) == FT_MR_REFUSED_THRESHOLD);
+    g->mfc->mfc_un.res.ttls[2] = 1;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    LAN.mtu = 1500;
+    assert(refuse(g) == FT_MR_REFUSED_XFRM && !route_held);
+    init_net.xfrm.policy_count[XFRM_POLICY_OUT] = 0;
+    assert(derive(g, &plan) == FT_MR_PENDING && plan.spec.listeners == 2);
     ft_mr_plan_put(&plan);
     free(g);
 

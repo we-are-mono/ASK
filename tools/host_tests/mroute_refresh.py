@@ -3,6 +3,7 @@
 from ask_orch.process import run_process
 import os
 from pathlib import Path
+import re
 
 from _host_pppoe_hm import (declaration)
 from _host_qos_lifecycle import (function)
@@ -13,11 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_mroute_refresh(tmp_path):
     source = (ROOT / "cdx/ask_flowtable.c").read_text()
     header = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
-    # The harness restates the restart bound its cases count against.
-    assert "#define FT_MR_MAX_RESTARTS\t4\n" in source, \
-        "FT_MR_MAX_RESTARTS changed; mroute_refresh.c repeats it"
+    # The restart bound the cases count against, as the worker defines it.
+    restarts = re.search(r"^#define FT_MR_MAX_RESTARTS\b.*\n", source, re.M).group(0)
     (tmp_path / "mroute_backend.inc").write_text(
-        declaration(header, "cdx_mc_listener")
+        restarts
+        + declaration(header, "cdx_mc_listener")
         + declaration(header, "cdx_mc_group_spec"))
     start = source.index("enum ft_mr_state {")
     structs = source[source.index("struct ft_mr_vif {"):
