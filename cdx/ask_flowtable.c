@@ -5483,7 +5483,8 @@ struct ft_mc_flow {
  * bridge under RTNL at every refresh. The hardware holds 512 groups per family
  * between both learners; one port is held to half of the total, so its
  * senders cannot take every place. A source past either is turned away as one
- * past FT_MC_MAX_FLOWS is. */
+ * past FT_MC_MAX_FLOWS is. Installed discards count toward neither: each holds
+ * a group id, which bounds them, and gives it up to a wanted stream. */
 #define FT_MC_MAX_PORT_FLOWS	256
 #define FT_MC_MAX_TOTAL_FLOWS	512
 
@@ -7210,7 +7211,7 @@ static bool ft_mc_same_key(const struct ft_mc_flow *a, const struct ft_mc_flow *
 static void ft_mc_observe(const struct ft_mc_seen *seen)
 {
 	bool counted = false, shared = false;
-	unsigned int flows = 0, port_flows = 0;
+	unsigned int flows = 0, port_flows = 0, total = 0;
 	struct net_device *bridge, *in;
 	struct ft_mc_seen other;
 	struct ft_mc_flow *f, *o;
@@ -7296,8 +7297,9 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 	 * Past FT_MC_MAX_FLOWS a new source takes a place only when something
 	 * asked for that source by name -- an (S,G) membership, which an SSM
 	 * listener's report produces, or a route -- and only from a flow that
-	 * nothing names that way and nothing carries, which gives way at no
-	 * cost to the hardware. So a source an SSM listener asked for is not
+	 * nothing names that way and nothing carries: one not in hardware,
+	 * which gives way at no cost, or failing that a discard, whose entry
+	 * only drops what nobody wants. So a source an SSM listener asked for is not
 	 * refused because the group's other senders got here first, and none
 	 * of those can take a place back: a group every host sends to keeps
 	 * the first eight it saw, and the rest cost a lookup here rather than
@@ -7308,19 +7310,32 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 	 * way. */
 	o = NULL;
 	list_for_each_entry(f, &ft_mc_flows, list) {
-		port_flows += !f->gone && f->in == in;
+		/* The caps count what may still be carried. An installed
+		 * discard is bounded by the group id it holds, and gives that
+		 * id up to a stream somebody wants (A292): counted here, a
+		 * port's discards would turn that stream away before it ever
+		 * reached the add that takes the id (A314). */
+		if (!f->gone && !f->hw_discard) {
+			total++;
+			port_flows += f->in == in;
+		}
 		if (f->gone || f->bridge != bridge ||
 		    !ft_mc_same_vlan_group(&f->addr, &key))
 			continue;
 		flows++;
 		counted |= f->turned;
 		shared |= f->derived && ft_mc_host_wants(f);
-		if (!f->hw && !ft_mc_source_named(bridge, &f->addr))
+		if ((!f->hw || (f->hw_discard && !o)) &&
+		    !ft_mc_source_named(bridge, &f->addr))
 			o = f;
 	}
 	if (flows >= FT_MC_MAX_FLOWS) {
+		/* The new flow counts toward both bounds; the one giving way
+		 * made room in them only if it counted there itself. */
 		if (!o || shared || ft_mc_filtered ||
-		    (o->in != in && port_flows >= FT_MC_MAX_PORT_FLOWS) ||
+		    ((o->in != in || o->hw_discard) &&
+		     port_flows >= FT_MC_MAX_PORT_FLOWS) ||
+		    (o->hw_discard && total >= FT_MC_MAX_TOTAL_FLOWS) ||
 		    ft_mc_host_joined(bridge, &key) ||
 		    !ft_mc_source_named(bridge, &key)) {
 			/* Counted once until the group's flows change, which
@@ -7337,7 +7352,7 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 		}
 		ft_mc_refused++;
 		o->gone = true;
-	} else if (ft_mc_flow_count >= FT_MC_MAX_TOTAL_FLOWS ||
+	} else if (total >= FT_MC_MAX_TOTAL_FLOWS ||
 		   port_flows >= FT_MC_MAX_PORT_FLOWS) {
 		/* A place given up above makes none; a new one would.
 		 * Counted per frame the dedup slots let through, which is

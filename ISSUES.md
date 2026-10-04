@@ -252,12 +252,8 @@ result independently of those temporary files.
 - [x] **A307 — failslab tests saw unrelated flows reinstalled.** Test bug: they idled past the 30 s flow timeout while the
   fault guard staged over the UART; now kept alive until armed (_:/^tests: harden lifecycle checks_).
 
-- [ ] **A314 — 1.1.0's bridged multicast flow caps keep a wanted stream out behind unwanted ones.** Regression found by
-  `flowtable_service_multicast_discard_capacity.py` (run 2026-10-04) and confirmed by review. `ft_mc_observe()`
-  (cdx/ask_flowtable.c) counts installed discards toward `FT_MC_MAX_PORT_FLOWS` (256) and `FT_MC_MAX_TOTAL_FLOWS` (512);
-  discards keep counting while their upstream sends, so 256 of them on one port refuse every newly joined stream there
-  before A292's eviction can run. Fix: count only flows that are not installed discards (they are bounded by group ids
-  and give way under A292). The test must fill in two waves of 256 from one port, then join on that port.
+- [x] **A314 — 1.1.0's bridged multicast flow caps counted installed discards, keeping wanted streams out.** Fixed:
+  the caps count only what may be carried, and a group's named source may displace an unnamed discard (_:/^cdx: let discards leave room_).
 
 - [ ] **A306 — a flow admitted plain under an optional ("level use") template may stay plain in hardware after an SA appears.**
   Unconfirmed, from review. With no SA yet, `xfrm_lookup()` resolves an optional template to the plain route, and
@@ -269,6 +265,13 @@ result independently of those temporary files.
 
 - [x] **A313 — offloaded egress queues were unbounded and shared by every flow (unpaced duplex 9.4/1.3-2.2 Gbit/s).**
   Fixed: per-port congestion group at `cdx.fwd_queue_us` of link speed, flows hashed over the FQs; now 9.2/7.0 (_:/^cdx: bound offloaded egress_).
+
+- [ ] **A315 — an evicted bridged discard that a membership still names counts toward the flow caps again.** From review,
+  not reproduced. A discard whose listener sits behind its own ingress stays named; `ft_mc_evict_discard()`
+  (cdx/ask_flowtable.c) clears its `hw_discard`, so it counts toward `FT_MC_MAX_PORT_FLOWS`, and its re-add as a discard
+  fails `-ENOSPC` up to `FT_MC_MAX_RETRIES` times while it holds a place with no entry. Enough of them could halve a
+  port's room for wanted streams. Fix direction: keep an evicted-but-named discard out of the caps (or retire it) until
+  it is wanted again. Check: listeners on a source's own port, fill the ids, join elsewhere, read `mcast_refused`.
 
 - [ ] **A308 — an IPsec SA release that finds a queue non-empty or SEC busy leaks the SA for the boot.** Source-verified
   by the 1.1.0 audit, not reproduced. `cdx_dpa_ipsecsa_release()` (cdx/dpa_ipsec.c) gives up when a retired SA FQ still

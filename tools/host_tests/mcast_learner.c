@@ -1395,6 +1395,47 @@ static void frames_become_flows(void)
         }
     }
 
+    /* The same with every place of the group held by an installed discard:
+     * an unnamed discard gives way too, its entry going from hardware with
+     * it, rather than the named source being refused for good. */
+    reset();
+    {
+        const uint32_t SSM = htonl(0x0a0000fe);
+        struct br_ip ssm = group_v4(G, SSM, 0);
+        struct ft_mc_flow *given = NULL;
+        unsigned deleted = dels;
+
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        for (uint32_t i = 0; i < FT_MC_MAX_FLOWS; i++)
+            see(seen_v4(&BR, &P1, G, htonl(0x0a000001 + i), 0, false, SENDER));
+        list_for_each_entry(f, &ft_mc_flows, list) {
+            f->hw = FAKE_HW;
+            f->hw_discard = true;
+            ft_mc_installed++;
+            ft_mc_discarding++;
+        }
+        assert(ft_mc_membership(&BR, &P3, &ssm, true, false));
+        see(seen_v4(&BR, &P1, G, SSM, 0, false, SENDER));
+        assert(flow(&P1, SSM, 0) && ft_mc_refused == 1);
+        list_for_each_entry(f, &ft_mc_flows, list) {
+            if (f->gone) {
+                assert(!given && f->hw_discard);
+                given = f;
+            } else if (f->hw_discard) {
+                /* The rest stay as they are; out of the worker's way. */
+                f->hw = NULL;
+                f->hw_discard = false;
+                f->gone = true;
+                ft_mc_installed--;
+                ft_mc_discarding--;
+            }
+        }
+        assert(given);
+        /* The worker itself, which deletes what retires. */
+        ft_mc_work_fn(NULL);
+        assert(dels == deleted + 1 && !ft_mc_discarding);
+    }
+
     /* A group every host sends to, which the host itself joined -- SSDP on
      * a router that runs a UPnP daemon. The bridge refuses every source of
      * it, so no place is given up for a new one even when it is asked for
@@ -4176,6 +4217,51 @@ static void the_learner_keeps_a_bounded_number_of_flows(void)
     assert(port_flows(&P3) == 1 && ft_mc_flow_count == FT_MC_MAX_TOTAL_FLOWS);
 }
 
+/* Installed discards count toward neither bound (A314). Each holds a group id,
+ * which bounds them, and gives it up to a stream somebody wants (A292); counted,
+ * a port's discards turned that stream away before its add could take one. */
+static void discards_leave_room_for_a_wanted_stream(void)
+{
+    const unsigned groups = FT_MC_MAX_PORT_FLOWS / FT_MC_MAX_FLOWS;
+    const uint32_t wanted = htonl(0xef030000 + groups);
+    struct br_ip any;
+    struct ft_mc_flow *f;
+    unsigned g, s;
+
+    reset();
+    for (g = 0; g <= groups; g++) {
+        any = group_v4(htonl(0xef030000 + g), 0, 0);
+        assert(ft_mc_membership(&BR, &P3, &any, true, false));
+    }
+    for (g = 0; g < groups; g++)
+        for (s = 0; s < FT_MC_MAX_FLOWS; s++)
+            observe(seen_v4(&BR, &P1, htonl(0xef030000 + g),
+                            htonl(0x0a000000 | g << 4 | s), 0, false, SENDER));
+    assert(port_flows(&P1) == FT_MC_MAX_PORT_FLOWS);
+    /* Every one of them a discard that holds its id: nobody wants them any
+     * more, and their upstream goes on sending. */
+    list_for_each_entry(f, &ft_mc_flows, list) {
+        f->hw = FAKE_HW;
+        f->hw_discard = true;
+    }
+    unsigned refused = ft_mc_refused;
+    observe(seen_v4(&BR, &P1, wanted, htonl(0x0a0f0001), 0, false, SENDER));
+    assert(port_flows(&P1) == FT_MC_MAX_PORT_FLOWS + 1 && ft_mc_refused == refused);
+    f = flow(&P1, htonl(0x0a0f0001), 0);
+    assert(f && !f->hw && !f->hw_discard);
+    /* Flows that may still be carried are held to the bound as before. */
+    list_for_each_entry(f, &ft_mc_flows, list)
+        if (f->hw_discard) {
+            f->hw = NULL;
+            f->hw_discard = false;
+        }
+    observe(seen_v4(&BR, &P1, wanted, htonl(0x0a0f0002), 0, false, SENDER));
+    assert(ft_mc_refused == refused + 1);
+    list_for_each_entry(f, &ft_mc_flows, list)
+        f->gone = true;
+    pass();
+}
+
 /* A flow nothing carries is kept only while its stream arrives. Its frames
  * are not recorded again once seen, so a flow that has heard nothing for
  * FT_MC_UNCARRIED_AGE asks: its slot lapses, its next frame is recorded and
@@ -4265,6 +4351,7 @@ int main(void)
     a_port_moves_between_bridges();
     idle_flows_age_out();
     the_learner_keeps_a_bounded_number_of_flows();
+    discards_leave_room_for_a_wanted_stream();
     an_uncarried_flow_lives_while_its_stream_does();
 
     reset();

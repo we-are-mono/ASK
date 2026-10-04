@@ -8,13 +8,15 @@ software, refused-failed. So an add that replicates and finds no id takes one
 from the discard that counted the fewest frames over the last refresh, and is
 made again at once.
 
-The case fills a family: one stream per fill group, each with a static
-membership on the LAN port, so the learner carries every one it has an id for
-and refuses the rest. The memberships go and the streams do not: every entry
-becomes a discard, and every id is still held. A host behind the LAN port then
-joins one more group, whose stream has to be carried in hardware straight
-away -- one discard gone for it, nothing counted as failing -- and stay carried
-while the discards go on counting, with nothing given up again.
+The case fills a family from one port, in two waves: one port's senders may
+hold half the family's places, so the second wave proves that discards hold
+none of them (A314). Each wave is one stream per fill group with a static
+membership on the LAN port, carried in hardware; its memberships then go and its
+streams do not, so every entry becomes a discard and keeps its id. A host behind
+the LAN port then joins one more group arriving on that same port, whose stream
+has to be carried in hardware straight away -- one discard gone for it, nothing
+counted as failing -- and stay carried while the discards go on counting, with
+nothing given up again.
 
 The fill streams come from a thread on this host, one prebuilt frame per group
 each period over a raw socket on the DUT-facing port: often while the learner
@@ -40,9 +42,8 @@ from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_rig import (command)
 from _flowtable_service_multicast_leave import (FILTER_TIMERS, FILTER_VERSION)
 
-# Past the ids a family has, so the fill is refused for room and not for
-# anything else.
-FILL = 520
+# At least the ids a family has.
+FILL = 512
 FILL_PREFIX = {4: "239.77.0.0/16", 6: "ff1e::77:0/112"}
 # Not counted by the windows' CPU counter, which counts PORT and the one after.
 FILL_PORT = PORT + 20
@@ -177,39 +178,45 @@ async def test_gives_its_id_to_a_listener(multicast_rig,
         # once its streams are kept off the ports: every id is the case's.
         empty = await settle(lambda s: s[ids] == 0, "no group id held before the fill", 30)
         slots = empty["mcast_group_id_slots"]
-        assert 0 < slots < FILL, brief(empty)
+        assert 0 < slots <= FILL and slots % 2 == 0, brief(empty)
+        # One port's senders may hold half the family's places
+        # (FT_MC_MAX_PORT_FLOWS), and every fill stream arrives on one port.
+        half = slots // 2
+        waves = [groups[:half], groups[half:slots]]
+
+        def wave_rows(state, wave):
+            names = {ipaddress.ip_address(g) for g in wave}
+            return [row for row in fill_rows(state) if ipaddress.ip_address(row["group"]) in names]
 
         async with AsyncExitStack() as stack:
-            # Every id held by a stream somebody wants, and the rest refused
-            # for room: there is no discard to give one up.
-            await stack.enter_async_context(filled(r, mcast_bridge, groups))
-            fill = stack.enter_context(Fill(family, groups, r.wire))
-            saturated = await settle(
-                lambda s: s["mcast_installed"] == slots and s[ids] == slots and
-                not any(row["state"] == "pending-source" for row in fill_rows(s)),
-                "every id held by a fill stream", 90)
-            assert saturated["mcast_discarding"] == 0, brief(saturated)
-            evicted = saturated["mcast_discards_evicted"]
+            evicted = None
+            fills = []
+            for n, wave in enumerate(waves):
+                # Every stream of the wave wanted and carried: the first wave
+                # fills its port's share, and the second has to find room
+                # beside the first's discards, which hold ids and no place.
+                await stack.enter_async_context(filled(r, mcast_bridge, wave))
+                fill = stack.enter_context(Fill(family, wave, r.wire))
+                fills.append(fill)
+                carried_wave = await settle(
+                    lambda s: s["mcast_installed"] == half * (n + 1) and s[ids] == half * (n + 1) and
+                    len(wave_rows(s, wave)) == half and
+                    all(row["state"] == "installed" for row in wave_rows(s, wave)),
+                    f"fill wave {n + 1} carried beside {n * half} discards", 90)
+                assert carried_wave["mcast_discarding"] == n * half, brief(carried_wave)
+                if evicted is None:
+                    evicted = carried_wave["mcast_discards_evicted"]
+                assert carried_wave["mcast_discards_evicted"] == evicted, brief(carried_wave)
 
-            # Nobody wants them any more, and upstream goes on sending: every
-            # entry drops its stream instead, and keeps its id. The fill
-            # streams never installed go first, with their memberships: while
-            # one is still wanted, its next try would rightly take the id of
-            # an entry already turned into a discard.
-            fill.period = HOLDING
-            held = {ipaddress.ip_address(row["group"]) for row in fill_rows(saturated)
-                    if row["state"] == "installed"}
-            refused = [g for g in groups if ipaddress.ip_address(g) not in held]
-            assert len(refused) == FILL - slots, brief(saturated)
-            await fill_memberships(r, mcast_bridge, refused, add=False)
-            await settle(lambda s: len(fill_rows(s)) == slots, "the refused fill streams retired", 30)
-            await fill_memberships(r, mcast_bridge, [g for g in groups if ipaddress.ip_address(g) in held],
-                                   add=False)
-            discarding = await settle(
-                lambda s: s["mcast_discarding"] == slots and s[ids] == slots and
-                len(fill_rows(s)) == slots and
-                all(row["state"] == "discarding" for row in fill_rows(s)),
-                "every id held by a discard", 60)
+                # Nobody wants them any more, and upstream goes on sending:
+                # every entry drops its stream instead, and keeps its id.
+                fill.period = HOLDING
+                await fill_memberships(r, mcast_bridge, wave, add=False)
+                discarding = await settle(
+                    lambda s: s["mcast_discarding"] == half * (n + 1) and s[ids] == half * (n + 1) and
+                    len(fill_rows(s)) == half * (n + 1) and
+                    all(row["state"] == "discarding" for row in fill_rows(s)),
+                    f"fill wave {n + 1} held by discards", 60)
             assert discarding["mcast_installed"] == slots, brief(discarding)
             assert discarding["mcast_discards_evicted"] == evicted, brief(discarding)
 
@@ -245,7 +252,7 @@ async def test_gives_its_id_to_a_listener(multicast_rig,
                         "mcast_install_errors", ids):
                 assert held[key] == joined[key], (key, brief(joined), brief(held))
             r.record(f"mcast-discard-capacity-v{family}", {
-                "slots": slots, "sent": fill.sent, "saturated": brief(saturated),
+                "slots": slots, "sent": sum(f.sent for f in fills), "carried": brief(carried_wave),
                 "discarding": brief(discarding), "joined": brief(joined), "held": brief(held)})
 
         # The fill stopped and the viewer left: every discard ages out at its
