@@ -93,8 +93,15 @@ LOGIN_RE    = re.compile(rb"(\w[\w.-]*)\s+login:\s*$", re.MULTILINE)
 PASSWORD_RE = re.compile(rb"[Pp]assword:\s*$")
 # Root prompt heuristic. Matches at end-of-buffer: "<hostuser>@... # " or "$ ".
 # No leading-newline anchor because the first prompt after login can land at
-# the very start of what we've buffered so far.
-PROMPT_RE   = re.compile(rb"[-@\w.:~]+[#$]\s*$")
+# the very start of what we've buffered so far. The working directory is part
+# of the prompt, and a shell init starts directly sits in "/".
+PROMPT_RE   = re.compile(rb"[-@\w.:~/]+[#$]\s*$")
+# What can follow a typed username: a shell, a password prompt, or the login
+# prompt again (the getty restarted, or the login was refused).
+_AFTER_USER_RE = re.compile(b"|".join(p.pattern for p in (PROMPT_RE, PASSWORD_RE, LOGIN_RE)),
+                            re.MULTILINE)
+_AFTER_PASSWORD_RE = re.compile(b"|".join(p.pattern for p in (PROMPT_RE, LOGIN_RE)),
+                                re.MULTILINE)
 
 # ANSI CSI / OSC escape sequences (bracketed-paste, colors, cursor moves, etc.)
 # Stripped on ingest so PROMPT_RE's `$` anchor isn't broken by invisibles.
@@ -285,11 +292,18 @@ class Console:
                 if LOGIN_RE.search(self.buf):
                     self.buf = b""
                     self.send(user + "\n")
-                    if password is not None:
-                        self.expect(PASSWORD_RE, timeout=5.0)
-                        self.send(password + "\n")
-                    self.expect(PROMPT_RE, timeout=10.0)
-                    return
+                    # A password prompt can appear for an account without a
+                    # password too: a USB serial port hangs up as its host
+                    # closes it, and a getty respawning under the typed name
+                    # splits it between two logins. Answer it, and start
+                    # again from a fresh login prompt.
+                    match, _ = self.expect(_AFTER_USER_RE, timeout=10.0)
+                    if PASSWORD_RE.search(match.group(0)):
+                        self.send((password or "") + "\n")
+                        match, _ = self.expect(_AFTER_PASSWORD_RE, timeout=10.0)
+                    if PROMPT_RE.search(match.group(0)):
+                        return
+                    self.buf = match.group(0) + self.buf
         raise TimeoutError(f"login timed out on {self.port}")
 
     # --- command execution ---------------------------------------------

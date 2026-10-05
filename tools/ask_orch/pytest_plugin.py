@@ -59,6 +59,7 @@ def pytest_configure(config):
         for key in (
             "ASK_TARGET_IP",
             "ASK_TARGET_DEV",
+            "ASK_TARGET_AGENT_DEV",
             "ASK_TARGET_LAN_IF",
             "ASK_TARGET_WAN_IF",
             "ASK_LAN_VM",
@@ -180,6 +181,8 @@ def hardware_bench(request):
             + "; configure .ask-test.mk from .ask-test.mk.example or export ASK_* variables"
         )
     resources = ["serial:" + os.path.realpath(os.environ["ASK_TARGET_DEV"])]
+    if os.environ.get("ASK_TARGET_AGENT_DEV"):
+        resources.append("serial:" + os.path.realpath(os.environ["ASK_TARGET_AGENT_DEV"]))
     resources.extend(
         prefix + os.environ[key]
         for key, prefix in (

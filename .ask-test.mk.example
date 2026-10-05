@@ -6,6 +6,10 @@ WAN_IP ?=
 # Optional: separate HTTP control address for the WAN agent.
 WAN_AGENT_IP ?=
 ASK_TARGET_DEV ?=
+# Optional: the DUT's USB serial port (USB-C data port to this host), e.g.
+# /dev/serial/by-id/usb-Mono_ASK_test_agent_<eth4 MAC>-if00. Carries the
+# agent instead of ASK_TARGET_DEV, which then keeps boot and recovery.
+ASK_TARGET_AGENT_DEV ?=
 # libvirt VM with qemu-guest-agent and guest-exec enabled.
 ASK_LAN_VM ?=
 ASK_LAN_NIC ?=

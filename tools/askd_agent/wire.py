@@ -10,7 +10,7 @@ import queue
 import threading
 import zlib
 
-VERSION = 1
+VERSION = 2
 CHUNK = 384
 MAX_MESSAGE = 64 << 20
 MAX_COMPRESSED = 16 << 20

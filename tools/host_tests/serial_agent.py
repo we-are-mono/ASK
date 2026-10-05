@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from askd_agent.wire import Channel, parse
+from askd_agent.wire import Channel, VERSION, parse
 from ask_orch.serial import SerialSession
 
 
@@ -219,12 +219,47 @@ def test_stdio_agent_restores_terminal_settings():
         os.close(slave)
 
 
+def test_prompts_in_any_directory_are_recognised():
+    from ask_orch.uart import PROMPT_RE
+
+    for prompt in (b"root@ask-ls1046a:~# ", b"root@ask-ls1046a:/# ",
+                   b"root@ask-ls1046a:/tmp/ask-x# ", b"user@host:~/src$ "):
+        assert PROMPT_RE.search(b"output\r\n" + prompt), prompt
+
+
+def test_login_answers_an_unexpected_password_prompt():
+    from ask_orch.uart import Console
+
+    master, slave = os.openpty()
+    replies = iter([b"\r\nask login: ", b"root\r\nPassword: ", b"\r\nroot@ask:~# "])
+    done = []
+
+    def dut():
+        # A getty that respawned under the typed name hands the next line to
+        # a password prompt; an account without a password accepts an empty
+        # one there.
+        while not done:
+            if select.select([master], [], [], 0.05)[0] and os.read(master, 4096):
+                os.write(master, next(replies, b""))
+
+    worker = concurrent.futures.ThreadPoolExecutor(1).submit(dut)
+    console = Console(port=os.ttyname(slave))
+    try:
+        console.login("root", None, timeout=5.0)
+    finally:
+        done.append(True)
+        worker.result(timeout=2)
+        console.close()
+        os.close(master)
+        os.close(slave)
+
+
 def test_long_operation_keeps_uart_available_and_scripts_are_checked(uart_agent):
     with concurrent.futures.ThreadPoolExecutor() as pool:
         slow = pool.submit(uart_agent.python, "import time; time.sleep(0.8); print('finished')")
         time.sleep(0.1)
         health = uart_agent.request("health")
-        assert health["ok"] and health["serial_protocol"] == 1
+        assert health["ok"] and health["serial_protocol"] == VERSION
         assert not slow.done()
         assert slow.result()["stdout"] == "finished\n"
     with pytest.raises(RuntimeError, match="digest"):
@@ -242,6 +277,28 @@ def test_uart_preserves_command_errors_and_binary_reads(uart_agent, tmp_path):
     assert (result.rc, result.stdout) == (7, "evidence")
     with pytest.raises(RuntimeError, match="not allowed"):
         uart_agent.request("exec", {"argv": ["not-an-allowed-command"]})
+
+
+async def test_binary_writes_arrive_byte_for_byte(uart_agent, tmp_path):
+    from ask_orch.client import Agent
+
+    payload = bytes(range(256))
+    sent = []
+
+    async def request(session, operation, body, timeout=None):
+        sent.append(body)
+        return uart_agent.request(operation, body)
+
+    agent = Agent("target")
+    agent.request = request
+    path = tmp_path / "module.ko"
+    result = await agent.fs_write(None, str(path), payload)
+    assert result["errno"] == 0 and result["rc"] == len(payload), result
+    assert path.read_bytes() == payload
+    assert "content" not in sent[0], "bytes must not travel as text"
+    text = tmp_path / "sysctl"
+    result = await agent.fs_write(None, str(text), "1\n")
+    assert result["errno"] == 0 and text.read_text() == "1\n", result
 
 
 def test_tcp_probe_is_explicit_and_closes(uart_agent):

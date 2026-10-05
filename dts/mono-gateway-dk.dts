@@ -93,6 +93,38 @@
 		};
 	};
 
+	/* The USB-C data port (not the PD power input). USB 2.0 runs straight
+	 * to the controller; the HD3SS3220 muxes the SuperSpeed pairs by
+	 * orientation and decides the data role from CC, which it hands to
+	 * the controller through the role switch.
+	 */
+	usb_c: connector {
+		compatible = "usb-c-connector";
+		label = "USB-C";
+		data-role = "dual";
+		power-role = "dual";
+		typec-power-opmode = "default";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				usb_c_hs_ep: endpoint {
+					remote-endpoint = <&usb0_hs_ep>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				usb_c_ss_ep: endpoint {
+					remote-endpoint = <&hd3ss3220_in_ep>;
+				};
+			};
+		};
+	};
+
 	/* SFP 1 */
 	sfp_xfi0: sfp-xfi0 {
 		compatible = "sff,sfp";
@@ -332,9 +364,34 @@
 	};
 };
 
+/* Dual-role behind the USB-C data port: host for storage and other
+ * devices, peripheral when a host is attached (the test image's USB serial
+ * gadget). A kernel built without gadget support keeps it a host.
+ */
 &usb0 {
 	status = "okay";
-	dr_mode = "host";
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "host";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb0_hs_ep: endpoint {
+				remote-endpoint = <&usb_c_hs_ep>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			usb0_ss_ep: endpoint {
+				remote-endpoint = <&hd3ss3220_out_ep>;
+			};
+		};
+	};
 };
 
 &usb1 {
@@ -558,9 +615,31 @@
 				status = "okay";
 			};
 
+			/* No interrupt line is wired; the driver polls CC once a
+			 * second instead.
+			 */
 			typec: hd3ss3220@47 {
 				compatible = "ti,hd3ss3220";
 				reg = <0x47>;
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						hd3ss3220_in_ep: endpoint {
+							remote-endpoint = <&usb_c_ss_ep>;
+						};
+					};
+
+					port@1 {
+						reg = <1>;
+						hd3ss3220_out_ep: endpoint {
+							remote-endpoint = <&usb0_ss_ep>;
+						};
+					};
+				};
 			};
 		};
 

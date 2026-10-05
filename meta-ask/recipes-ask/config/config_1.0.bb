@@ -5,6 +5,7 @@ LIC_FILES_CHKSUM = "file://${ASK_SRCROOT}/LICENSE;md5=b234ee4d69f5fce4486a80fdaf
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 SRC_URI = "file://S03debugfs \
+           file://S04usb-agent \
            file://S05ask-modules \
            file://S20status-leds \
            file://S35wifi-ap \
@@ -62,6 +63,11 @@ fakeroot do_install() {
     install -m 0755 ${UNPACKDIR}/S03debugfs ${D}${sysconfdir}/init.d/debugfs
     ln -sf ../init.d/debugfs ${D}${sysconfdir}/rcS.d/S03debugfs
 
+    # The test agent's USB serial port on the USB-C data port, beside the
+    # UART (see the script). Its shell comes from busybox-inittab's bbappend.
+    install -m 0755 ${UNPACKDIR}/S04usb-agent ${D}${sysconfdir}/init.d/usb-agent
+    ln -sf ../init.d/usb-agent ${D}${sysconfdir}/rcS.d/S04usb-agent
+
     # sysvinit hook that reads modules-load.d/ask.conf and modprobes each
     # line — busybox has no systemd-modules-load.service equivalent.
     install -m 0755 ${UNPACKDIR}/S05ask-modules ${D}${sysconfdir}/init.d/ask-modules
@@ -97,6 +103,8 @@ FILES:${PN} = " \
     ${sysconfdir}/ask/offload.conf \
     ${sysconfdir}/init.d/debugfs \
     ${sysconfdir}/rcS.d/S03debugfs \
+    ${sysconfdir}/init.d/usb-agent \
+    ${sysconfdir}/rcS.d/S04usb-agent \
     ${sysconfdir}/init.d/ask-modules \
     ${sysconfdir}/rcS.d/S05ask-modules \
     ${sysconfdir}/init.d/wifi-ap \

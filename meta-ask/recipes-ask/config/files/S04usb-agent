@@ -1,0 +1,65 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          usb-agent
+# Required-Start:    mountvirtfs
+# Default-Start:     S
+# Short-Description: USB serial port for the test agent
+### END INIT INFO
+
+# The test harness drives the DUT through a framed agent on a serial line.
+# The UART carries it at 115200 baud; this presents a USB CDC-ACM port on the
+# USB-C data port as well -- ttyGS0 here, a ttyACM on the attached host --
+# which carries the same protocol without that line rate. U-Boot, the boot
+# log and recovery stay on the UART.
+#
+# The function is created at boot so ttyGS0 exists for the shell init
+# respawns on it (busybox-inittab's bbappend). The
+# controller only offers a gadget (a UDC) while the port is in the device
+# role, which follows the cable, so a small loop binds the gadget whenever
+# a UDC is present and nothing is bound to it.
+
+G=/sys/kernel/config/usb_gadget/ask
+
+bind_loop() {
+    while :; do
+        for udc in /sys/class/udc/*; do
+            [ -e "$udc" ] || continue
+            if [ -z "$(cat "$udc/function" 2>/dev/null)" ]; then
+                echo "" > "$G/UDC" 2>/dev/null
+                basename "$udc" > "$G/UDC" 2>/dev/null
+            fi
+        done
+        sleep 2
+    done
+}
+
+case "$1" in
+    start|"")
+        mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config
+        [ -d /sys/kernel/config/usb_gadget ] || exit 0
+        if [ ! -d "$G" ]; then
+            mkdir "$G"
+            # Linux Foundation's multifunction composite gadget ids.
+            echo 0x1d6b > "$G/idVendor"
+            echo 0x0104 > "$G/idProduct"
+            mkdir "$G/strings/0x409"
+            echo "Mono" > "$G/strings/0x409/manufacturer"
+            echo "ASK test agent" > "$G/strings/0x409/product"
+            tr -d ':' < /sys/class/net/eth4/address > "$G/strings/0x409/serialnumber"
+            mkdir "$G/configs/c.1"
+            mkdir "$G/configs/c.1/strings/0x409"
+            echo "agent" > "$G/configs/c.1/strings/0x409/configuration"
+            mkdir "$G/functions/acm.agent"
+            ln -s "$G/functions/acm.agent" "$G/configs/c.1/"
+        fi
+        bind_loop </dev/null >/dev/null 2>&1 &
+        ;;
+    stop)
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

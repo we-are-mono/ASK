@@ -23,6 +23,7 @@ import pytest_asyncio
 from ask_orch import client
 from ask_orch.uart import Console, set_target_session
 from ask_orch.serial import SerialSession
+from askd_agent.wire import VERSION as SERIAL_PROTOCOL
 from ask_orch.guest import Guest
 from ask_orch.provenance import agent_sources, firmware_script
 
@@ -51,8 +52,17 @@ def target_agent(bench_health):
 
 @pytest.fixture(scope="session")
 def dut_uart(hardware_bench):
-    """One physical reader for both agent operations and console helpers."""
-    with Console.target(raw=True, log_path=str(artifact_dir("session") / "dut-uart.log")) as console:
+    """One physical reader for both agent operations and console helpers.
+
+    ASK_TARGET_AGENT_DEV names the DUT's USB serial port (its ttyGS0) to
+    carry them instead of the UART: the same protocol, without the UART's
+    line rate or its need to pace writes. The UART then stays free for raw
+    console use -- boot, reboot and recovery."""
+    agent_dev = os.environ.get("ASK_TARGET_AGENT_DEV")
+    log_path = str(artifact_dir("session") / "dut-uart.log")
+    opened = (Console(port=agent_dev, log_path=log_path) if agent_dev
+              else Console.target(raw=True, log_path=log_path))
+    with opened as console:
         session = SerialSession(console)
         set_target_session(session)
         try:
@@ -77,7 +87,7 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         health = await client.TARGET.health(session)
         record("dut", health, nodeid="session")
-        assert health.get("ok") and health.get("capture_protocol") == 2 and health.get("serial_protocol") == 1, (
+        assert health.get("ok") and health.get("capture_protocol") == 2 and health.get("serial_protocol") == SERIAL_PROTOCOL, (
             "DUT needs the current test agent with reliable kernel capture", health)
         required = {"ip", "nft", "conntrack", "python3"}
         for item in request.session.items:

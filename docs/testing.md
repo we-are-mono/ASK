@@ -25,7 +25,8 @@ The bench is three roles. The orchestrator hosts a libvirt LAN VM and connects t
         │  · TFTP server      │                      │   under test)│
         │  · WAN test agent   │                      └──────┬───────┘
         └─────────┬───────────┘                      DUT LAN port
-                  │ USB-serial to DUT                        │
+                  │ USB-serial to DUT console (UART)         │
+                  │ USB-C to DUT data port (agent, optional) │
                   │ virtio/QGA to client                     │ DHCP-served
                   │                                          │ LAN segment
         ┌─────────┴───────────┐                              │
@@ -53,8 +54,10 @@ Roles:
   the DUT's NAT. The traffic tests originate/sink here. In our lab this is a
   libvirt VM on the orchestrator host.
 
-DUT control uses UART; LAN control uses the VM's QEMU guest agent. Both stay
-available when a test interrupts forwarding, NAT, XFRM policy or a network link.
+DUT control uses a serial line: the UART, or the DUT's USB serial port when one
+is cabled (see [DUT agent over USB](#dut-agent-over-usb)). LAN control uses the
+VM's QEMU guest agent. All stay available when a test interrupts forwarding,
+NAT, XFRM policy or a network link.
 
 ---
 
@@ -150,6 +153,9 @@ Packages / services:
   agent's requirements).
 - **A USB-to-serial adapter** to the DUT's console header, plus permission
   to read it (the `dialout`/`plugdev` group, or run under `sudo`).
+- **Optionally, a USB-C cable** from the DUT's USB-C data port (not its power
+  input) to a USB port here, for the faster agent channel; the kernel's
+  `cdc_acm` driver presents it as a `/dev/ttyACM*` node.
 - Membership in the `libvirt`/`kvm` groups if the client is a local VM.
 
 Test agent: `make deploy-agents` installs the WAN-side agent as a systemd
@@ -175,8 +181,9 @@ The image supplies routing/firewall tools, `smcrouted`/`smcroutectl`, PPP/PPPoE,
 packet capture, traffic generators, ASK modules and the test agent.
 
 Use an agent built from the same checkout as the runner. Kernel capture requires
-`capture_protocol: 2` and `serial_protocol: 1` in the UART health response,
-readable `/dev/kmsg`, and retained boot logs.
+`capture_protocol: 2` and the checkout's `serial_protocol`
+(`askd_agent.wire.VERSION`) in the agent's health response, readable
+`/dev/kmsg`, and retained boot logs.
 After agent changes, rebuild, stage and boot the updated image. Preflight rejects
 an older agent; installing host packages cannot upgrade the agent inside the
 DUT's initramfs. Release runs also require the tools named by selected tests.
@@ -227,7 +234,8 @@ uses a guest-side `timeout` so commands remain bounded if the runner stops.
 ## Console / serial access
 
 The DUT uses its serial console for bootstrap, then a framed agent session on
-the same UART. The LAN VM uses its separate virtio guest-agent channel.
+the same UART, or on its USB serial port when `ASK_TARGET_AGENT_DEV` names one.
+The LAN VM uses its separate virtio guest-agent channel.
 
 ### DUT console
 
@@ -246,6 +254,26 @@ The VM's serial console remains available for manual recovery:
 **One reader per physical UART.** Detach manual terminals before running DUT
 tests. One session owns the UART; `Console.target()` handles used by individual
 tests borrow that session instead of opening another reader.
+
+### DUT agent over USB
+
+The test image presents a USB CDC-ACM serial port on the DUT's USB-C data port.
+The HD3SS3220 detects an attached host, the controller switches to the device
+role (thumb drives still mount when a device is attached instead), and
+`/etc/init.d/usb-agent` binds the gadget. init keeps a root login on its
+`ttyGS0` (`login -f root`, no getty: a USB serial port hangs up whenever its host
+closes it). On the orchestrator it appears as
+`/dev/serial/by-id/usb-Mono_ASK_test_agent_<eth4 MAC>-if00`.
+
+Set `ASK_TARGET_AGENT_DEV` to that path and the session's agent runs there: the
+same protocol, without the UART's 115200-baud line rate or its paced writes. The
+UART stays the console for U-Boot, the boot log, reboot and recovery, and stays
+required. Rig tests run roughly twice as fast; a plain rig fixture's setup and
+teardown drop from about 18 s to 3 s.
+
+If the node is missing, check the DUT side over the UART:
+`cat /sys/class/typec/port0/data_role` should read `[device]`, and
+`/sys/kernel/debug/usb/2f00000.usb/mode` `device`.
 
 ---
 
@@ -311,6 +339,7 @@ without shell interpolation, including values with spaces.
 |---|---|---|
 | `DUT_IP` / `ASK_TARGET_IP` | DUT address used by traffic tests | Optional; tests usually discover interface addresses |
 | `ASK_TARGET_DEV` | DUT serial device | Required |
+| `ASK_TARGET_AGENT_DEV` | DUT's USB serial port (`ttyGS0` on its USB-C data port), e.g. `/dev/serial/by-id/usb-Mono_ASK_test_agent_<eth4 MAC>-if00` | Optional; carries the agent instead of the UART, without its line rate |
 | `ASK_TARGET_LAN_IF` | DUT netdev facing the client | Board default: `eth3` |
 | `ASK_TARGET_WAN_IF` | DUT netdev facing the WAN | Board default: `eth4` |
 | `ASK_LAN_VM` | libvirt domain of the client | Required |
@@ -595,9 +624,9 @@ It checks that every returned frame is released once and empty completions
 release nothing, for both 8- and 16-queue configurations.
 
 `make ask-test` runs pytest under `sudo` (it needs the serial PTYs and the
-USB-serial node) against the source tree, so test edits are picked up
-without a redeploy. An autouse fixture fail-fasts the whole run if the DUT
-UART agent does not answer. DUT control does not require an IP address.
+USB-serial nodes) against the source tree, so test edits are picked up
+without a redeploy. An autouse fixture fails the run's hardware tests at setup
+if the DUT agent does not answer. DUT control does not require an IP address.
 
 ---
 
@@ -605,7 +634,7 @@ UART agent does not answer. DUT control does not require an IP address.
 
 | Node | Transport | Used for |
 |---|---|---|
-| DUT | Persistent UART agent | Commands, counters, kernel windows and local observations |
+| DUT | Persistent serial agent (UART, or USB CDC-ACM) | Commands, counters, kernel windows and local observations |
 | WAN host | HTTP test agent | Orchestrator-host operations |
 | LAN client | QEMU guest agent over virtio | Commands, scripts and local peer RPC |
 
@@ -616,7 +645,7 @@ the VM; its traffic sockets still exercise the DUT normally.
 QGA heartbeats keep that peer alive during quiet DUT measurements; its idle
 lease still ends traffic if the runner disappears.
 
-UART messages use compressed JSON, checked fragments and acknowledgements.
+Agent messages use compressed JSON, checked fragments and acknowledgements.
 Only damaged or unacknowledged fragments are retried. Completed request IDs are
 not executed again. Missing results fail with an unknown outcome; the harness
 does not replay a mutation. Scripts are cached by SHA-256 for the session.

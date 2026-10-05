@@ -82,6 +82,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://109-sdk_dpaa-rx-max-frame-follows-mtu.patch \
            file://110-sdk-mainline-build-compat.patch \
            file://120-emc2305-dt-fan-control.patch \
+           file://125-usb-typec-hd3ss3220-port-configuration.patch \
            file://130-thermal-linear-governor.patch \
            file://140-ask-flowtable-context.patch \
            file://141-ask-flowtable-teardown-attribution.patch \

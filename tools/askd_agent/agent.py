@@ -641,15 +641,20 @@ async def fs_read(body: dict, state: dict) -> dict:
 
 
 async def fs_write(body: dict, state: dict) -> dict:
-    """POST {path, content, [uid], [timeout_ms]} -> write attempt result.
+    """POST {path, content | content_hex, [uid], [timeout_ms]} -> write attempt result.
 
     Used for sysctl / /proc / /sys writes, including tests that care about
-    capability enforcement (`uid` drops privilege before the open).
+    capability enforcement (`uid` drops privilege before the open), and for
+    staging binaries such as test modules: `content_hex` carries bytes
+    exactly, where `content` is text.
     """
     try:
         path = body["path"]
-        content = body.get("content", "")
-    except (KeyError, TypeError) as e:
+        if "content_hex" in body:
+            content = bytes.fromhex(body["content_hex"])
+        else:
+            content = body.get("content", "")
+    except (KeyError, TypeError, ValueError) as e:
         return _error(400, {"error": f"bad request: {e}"})
     uid = body.get("uid")
     if uid is not None:

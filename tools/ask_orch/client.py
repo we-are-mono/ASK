@@ -235,11 +235,13 @@ class Agent:
         uid: int | None = None,
         timeout_ms: int = 1000,
     ) -> dict:
-        body: dict = {
-            "path":       path,
-            "content":    content if isinstance(content, str) else content.decode("latin-1"),
-            "timeout_ms": timeout_ms,
-        }
+        body: dict = {"path": path, "timeout_ms": timeout_ms}
+        # Bytes travel hex-encoded, as fs_read returns them: as text they would
+        # be re-encoded on the way and arrive altered.
+        if isinstance(content, str):
+            body["content"] = content
+        else:
+            body["content_hex"] = content.hex()
         if uid is not None:
             body["uid"] = int(uid)
         return await self.request(session, "fs/write", body, timeout=timeout_ms / 1000 + 5)
