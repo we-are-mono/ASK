@@ -50,8 +50,10 @@ def test_mroute_learner(tmp_path):
             # second caller -- so it is compiled here rather than stubbed.
             "ft_vlan_lower",
             "ft_bridge_vlan",
-            # Both learners' MTU bound, shared with the bridged one.
+            # Both learners' MTU bound, shared with the bridged one, and
+            # what a port's MAC delivers, shared with the unicast bound.
             "ft_mc_link_mtu",
+            "ft_port_arriving",
             "ft_mr_idx",
             "ft_mr_default_table",
             "ft_mr_state_text",

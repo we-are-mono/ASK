@@ -583,7 +583,8 @@ rather than through a registered VLAN interface. 802.1ad bridges are refused
 for the reason `ft_bridge_vlan()` already gives: the kernel describes no
 selector for that tag and the hardware would be asked to reproduce it blind.
 
-**The MTU.** No listener port may have a smaller MTU than the ingress port. A
+**The MTU.** No listener port may have a smaller MTU than what the ingress port
+accepts, `max(port MTU, 1500)`: its MAC takes full frames even below 1500. A
 listener's entry ends in `ENQUEUE_PKT`, and the microcode fragments any replica
 larger than the MTU that opcode carries. A bridge never fragments:
 `br_dev_queue_push_xmit()` drops a frame that does not fit the egress port,

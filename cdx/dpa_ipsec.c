@@ -1240,8 +1240,12 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 		return -1;
 	}
 
-	//find pools used by ethernet devices and borrow buffers from it
-	if (get_phys_port_poolinfo_bysize(1700, &info->parent_pool_info)) {
+	/* SEC writes a whole ESP frame, as large as the largest a port
+	 * accepts, into one buffer of this pool: the ports' own buffer size.
+	 * Only the device the buffers are mapped for is taken from a port's
+	 * pool, which is that size too. */
+	bp->size = IPSEC_BUFSIZE;
+	if (get_phys_port_poolinfo_bysize(bp->size, &info->parent_pool_info)) {
 		DPAIPSEC_ERROR("%s::failed to locate eth bman pool for ipsec\n", 
 				__func__);
 		kfree(bp);
@@ -1254,7 +1258,6 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 			(unsigned long)bp->paddr, bp->vaddr, bp->dev);
 #endif
 	bp->dev = bp_parent->dev;
-	bp->size = IPSEC_BUFSIZE;
 	bp->config_count = IPSEC_BUFCOUNT;
 	bp->free_buf_cb = ipsec_free_pool_buffer;
 	if (dpa_bp_alloc(bp, bp->dev)) {

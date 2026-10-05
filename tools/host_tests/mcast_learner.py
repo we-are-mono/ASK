@@ -61,6 +61,8 @@ def test_mcast_learner(tmp_path):
             "ft_mc_same_group",
             "ft_mc_find",
             "ft_mc_carriable",
+            # What a port's MAC delivers, shared with the unicast bound.
+            "ft_port_arriving",
             "ft_mc_mtu_bounded",
             "ft_mc_port_eligible",
             "ft_mc_port_tags",

@@ -153,7 +153,9 @@ static void fwd_tx_ern(struct qman_portal *portal, struct qman_fq *fq,
  * the other direction waited behind it (A313). */
 static unsigned int fwd_queue_us = 2000;
 
-/* A few jumbo frames, whatever the link reports. */
+/* Whatever the link reports, never less than six frames of 9600 bytes, the
+ * largest fsl_fm_max_frm accepts (sdk_fman refuses more, from Kconfig or the
+ * command line), so even a slow port's bound holds several jumbo frames. */
 #define FWD_CGR_MIN_BYTES	(64 * 1024)
 /* Preamble, inter-frame gap and FCS, which a frame descriptor's length leaves
  * out: counted per frame, so the threshold is time on the wire for small
@@ -430,8 +432,6 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 	//copy name
 	strncpy(iface_info->name, name, IF_NAME_SIZE);
 	iface_info->name[IF_NAME_SIZE - 1] = '\0';
-	//iface mtu
-	iface_info->mtu = device->mtu;
 	//os interface id
 	iface_info->osid = device->ifindex;
 	eth_info = &iface_info->eth_info;
@@ -885,15 +885,15 @@ int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
 	if (!iface_info)
 		goto out;
 
-	//search list for matching id
+	/* No MTU: a record keeps none, since a copy taken at registration
+	 * would not follow the port's, and the inbound SA path this serves
+	 * enqueues to SEC with an MTU of its own. */
 	if (iface_info->if_flags & IF_TYPE_ETHERNET ) {
-		l2_info->mtu = iface_info->mtu;
 #ifdef INCLUDE_ETHER_IFSTATS
 		l2_info->ether_stats_offset = iface_info->txstats_index;
 #endif
 		retval = SUCCESS;
 	} else if (iface_info->if_flags &  IF_TYPE_WLAN) {
-		l2_info->mtu = iface_info->mtu;
 		l2_info->is_wlan_iface = 1;
 		retval = SUCCESS;
 	} else {
@@ -1632,7 +1632,6 @@ static int get_wlan_iface_info(struct dpa_iface_info *iface_info)
 		DPA_INFO("%s::could not find device %s\n", __func__, iface_info->name);
 		return FAILURE;
 	}
-	iface_info->mtu = device->mtu;
 	/* Borrowed, exactly as the ethernet arm borrows its own: compared to
 	 * resolve a netdev back to this iface, never dereferenced, and gone
 	 * when the VAP is retired. */

@@ -472,6 +472,17 @@ counters, endpoint NIC counters, UDP loss and receiver buffer errors. Native
 iperf's reverse-only UDP stream does not meet the service's established
 original-direction admission rule, so simultaneous throughput uses TCP.
 
+`flowtable_jumbo.py` carries MTU 9000 on every hop: offloaded NAT TCP at
+8 Gbit/s each way and byte-exact 8972-byte UDP, a VLAN at 9000, a LAN at 9000
+behind a WAN at 1500 (TCP offloaded, oversized UDP fragmented by Linux, ICMP
+and Packet Too Big), a live MTU change, and A316's regression: a jumbo host on
+a 1500 port, whose frames the MAC drops and counts instead of the microcode
+fragmenting them. It raises the WAN host's bridge to 9000 only after pinning
+that host's own routes to 1500, refuses to start if a route carries metrics
+of its own, and restores every MTU, route and IPv6 MTU on the same boot. The
+WAN host's NIC itself stays at 9000 (its bridge at 1500), so no test bounces
+its link.
+
 The QoS host tests compile the production lifecycle functions with
 AddressSanitizer and UndefinedBehaviorSanitizer, inject each startup
 failure, and check resource balance, retries, interface reassignment,

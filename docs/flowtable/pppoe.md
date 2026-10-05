@@ -175,7 +175,7 @@ router has to answer with Packet Too Big
 advertise 1492 anyway; the IPv6 case and the ISP profile set it. IPv4 UDP from
 an Ethernet LAN into the session stays in software whatever the LAN's MTU,
 because the microcode's IPv4 fragments of a received frame carry no payload and
-a port receives full frames regardless
+a port receives at least full frames whatever its MTU
 ([architecture.md](architecture.md#native-context-and-admission)); TCP is
 carried, DF set, and so is the direction out of the session. A session
 negotiated at 1500 over a 1508-byte Ethernet (RFC 4638) is no smaller than the

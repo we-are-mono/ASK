@@ -268,6 +268,8 @@ int main(void)
     netdev = (struct net_device){ .carrier = true, .speed = 100 };
     iface.eth_info.net_dev = &netdev; iface.eth_info.speed = 1000; iface.name = "eth0";
     assert(!create_fwd_tx_fqs(&iface) && cgr_bytes == 64 * 1024);
+    /* Six of the largest frame sdk_fman lets a port take. */
+    assert(cgr_bytes / 9600 == 6);
     /* A rejected software enqueue goes back to its pool. */
     struct qm_mr_entry ern = { .ern.fd = { .bpid = 3, .addr = 0x1000 } };
     unsigned released_before = released_frames;

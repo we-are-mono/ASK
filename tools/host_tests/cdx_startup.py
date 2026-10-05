@@ -4,6 +4,7 @@ from ask_orch.process import run_process
 
 from pathlib import Path
 import os
+import re
 
 import pytest
 
@@ -121,6 +122,35 @@ def test_queues(tmp_path, queues):
     run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                         "UBSAN_OPTIONS": "halt_on_error=1"})
+
+
+def test_port_records_keep_no_mtu():
+    """A port's MTU changes under RTNL with nothing telling devman, and with
+    jumbo frames it changes what the port receives (A316): a copy taken when
+    the port registered goes stale the first time it moves. Nothing reads one,
+    so a record keeps none, and whatever needs the MTU asks the netdev."""
+    portdefs = (ROOT / "cdx/portdefs.h").read_text()
+    start = portdefs.index("struct dpa_iface_info {")
+    record = portdefs[start:portdefs.index("\n};", start)]
+    assert not re.search(r"\bmtu\b", record), "dpa_iface_info caches an MTU"
+    devman = (ROOT / "cdx/devman.c").read_text()
+    assert not re.search(r"iface_info->mtu\b", devman)
+
+
+def test_fragment_pool_holds_a_port_frame():
+    """The fragmenter writes a fragment as large as its path into one buffer
+    of this pool, so a jumbo path needs the ports' own buffer size; and at
+    that size the count is what SEC's output pool can have in flight, not the
+    2048 that cost 21 MB of jumbo buffers."""
+    source = (ROOT / "cdx/cdx_ehash.c").read_text()
+    assert re.search(r"^#define CDX_FRAG_BUFF_SIZE\s+dpa_bp_size\(NULL\)$", source, re.M)
+    count = re.search(r"^#define CDX_FRAG_BUFFERS_CNT\s+(\d+)$", source, re.M)
+    assert count and int(count.group(1)) == 512
+    body = function(source, "cdx_create_fragment_bufpool")
+    # The port pool it borrows a device from is asked for the size this one
+    # is, after that size is set.
+    assert body.index("bp->size = CDX_FRAG_BUFF_SIZE;") < \
+        body.index("get_phys_port_poolinfo_bysize(bp->size,")
 
 
 def test_eqcr(tmp_path):

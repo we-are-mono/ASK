@@ -407,9 +407,10 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
         # frame, and the host routes below carry none, so every direction's
         # path MTU is its egress port's. The adapter installs a non-TCP IPv4
         # direction only when its path carries the largest packet its ingress
-        # can deliver -- a full Ethernet frame, whatever MTU the port is given
-        # -- so this is what admits the rig's UDP directions at all. A test
-        # that needs a smaller path builds it for its own duration.
+        # can deliver -- a full Ethernet frame, or the port's MTU where that is
+        # larger -- so this is what admits the rig's UDP directions at all. A
+        # test that needs a smaller path, or a jumbo one, builds it for its
+        # own duration.
         mtus = {dev: int((await read(r.target, r.session, f"/sys/class/net/{dev}/mtu")).strip())
                 for dev in (TARGET_LAN_IF, TARGET_WAN_IF)}
         assert len(set(mtus.values())) == 1 and mtus[TARGET_LAN_IF] >= 1500, \

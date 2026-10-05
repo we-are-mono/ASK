@@ -146,13 +146,15 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  * requests it answers -- would starve every leaf on the channel. So a budget
  * stands in front of it: a sixteenth of the top channel's committed rate,
  * never less than 64 kbit/s unless the channel is slower than twice that, and
- * a burst of sixteen full-size frames. Enough for every link protocol and the
- * gateway's own sessions many times over; what a leaf can lose to it is
- * bounded by it. A control frame over budget is sent as unclassified traffic
- * rather than dropped. */
+ * a burst of sixteen full-size frames -- of the largest frame the ports are
+ * built for, so jumbo frames of the gateway's own sessions burst as far as
+ * standard ones do. Enough for every link protocol and the gateway's own
+ * sessions many times over; what a leaf can lose to it is bounded by it. A
+ * control frame over budget is sent as unclassified traffic rather than
+ * dropped. */
 #define CDX_HTB_CONTROL_SHARE	16
 #define CDX_HTB_CONTROL_FLOOR	8000		/* bytes per second */
-#define CDX_HTB_CONTROL_BURST	(16 * 1536)	/* bytes */
+#define CDX_HTB_CONTROL_BURST	(16U * dpa_get_max_frm())	/* bytes */
 
 /* The WRED curve a RED qdisc on a leaf asked for, kept so it can be put back
  * after the class queue is configured afresh: ceetm_set_class_queue() starts

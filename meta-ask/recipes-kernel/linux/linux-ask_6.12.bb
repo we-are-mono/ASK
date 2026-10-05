@@ -79,6 +79,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://106-sdk_fman-keep-firmware-port-icids.patch \
            file://107-sdk_dpaa-offload-hooks-under-rcu.patch \
            file://108-xfrm-validate-xmit-einprogress.patch \
+           file://109-sdk_dpaa-rx-max-frame-follows-mtu.patch \
            file://110-sdk-mainline-build-compat.patch \
            file://120-emc2305-dt-fan-control.patch \
            file://130-thermal-linear-governor.patch \

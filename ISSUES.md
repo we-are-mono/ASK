@@ -266,6 +266,16 @@ result independently of those temporary files.
 - [x] **A313 — offloaded egress queues were unbounded and shared by every flow (unpaced duplex 9.4/1.3-2.2 Gbit/s).**
   Fixed: per-port congestion group at `cdx.fwd_queue_us` of link speed, flows hashed over the FQs; now 9.2/7.0 (_:/^cdx: bound offloaded egress_).
 
+- [x] **A316 — with jumbo frames a port's MTU did not bound what it received; oversize non-DF traffic was fragmented
+  with zeroed payloads.** Fixed: per-port MAC max frame follows the MTU, arrivals bounded by the physical port (_:/^flowtable: support jumbo frames_).
+
+- [ ] **A317 — an untagged frame on a port with upper devices may exceed the port's MTU by its tag allowance.** Accepted
+  limitation of A316's fix. The mEMAC allows no extra room for VLAN tags, so a port with any upper keeps one tag (two
+  for 802.1ad/stacked VLANs) of headroom, which an untagged frame can use: 1501-1504 (1508) bytes on a 1500 port pass
+  the MAC, and non-DF UDP of that size into an admitted 1500 path is fragmented with zeroed payloads (A202). The
+  adapter deliberately does not count it (that would refuse every bridged 1500→1500 UDP direction); it needs a host
+  sending more than its link's MTU. Close only if the mEMAC turns out to have a tag-aware length check.
+
 - [ ] **A315 — an evicted bridged discard that a membership still names counts toward the flow caps again.** From review,
   not reproduced. A discard whose listener sits behind its own ingress stays named; `ft_mc_evict_discard()`
   (cdx/ask_flowtable.c) clears its `hw_discard`, so it counts toward `FT_MC_MAX_PORT_FLOWS`, and its re-add as a discard

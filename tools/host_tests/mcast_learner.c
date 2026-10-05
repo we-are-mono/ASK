@@ -115,6 +115,8 @@ struct net_device {
 #define READ_ONCE(x) (x)
 #define __force
 #define WRITE_ONCE(x, v) ((x) = (v))
+#define max_t(type, a, b) ((type)(a) > (type)(b) ? (type)(a) : (type)(b))
+#define ETH_DATA_LEN 1500
 
 struct cdx_ft_vlan { uint16_t proto; uint16_t id; };
 
@@ -1028,7 +1030,9 @@ static void reset(void)
     ft_mc_taps_publish(NULL, 0, false);
     BR.mrouter = BR2.mrouter = false;
     BR.flags = BR2.flags = 0;
-    P1.mtu = P2.mtu = P3.mtu = 0;
+    /* Standard Ethernet ports: what a MAC delivers is never less than a
+     * full frame, so a port MTU below that would refuse every flow. */
+    P1.mtu = P2.mtu = P3.mtu = 1500;
     P1.tc_ingress = P2.tc_ingress = P3.tc_ingress = false;
     P1.tc_egress = P2.tc_egress = P3.tc_egress = false;
     P1.chain_in = P2.chain_in = P3.chain_in = false;
@@ -1770,10 +1774,9 @@ static void the_bridge_decides(void)
     pass();
     assert(!flow(&P1, S1, 0) && !ft_mc_flow_count && holds == 2);
 
-    /* An MTU below the ingress's on any copy keeps the flow in software;
-     * a flow whose ingress has gone has nothing to bound. */
+    /* An MTU below what the ingress delivers on any copy keeps the flow in
+     * software; a flow whose ingress has gone has nothing to bound. */
     reset();
-    P1.mtu = P2.mtu = P3.mtu = 1500;
     assert(ft_mc_membership(&BR, &P2, &any, true, false));
     answer(&P1, S1, 0, 0, 2, &P2, &P3);
     see(seen_v4(&BR, &P1, G, S1, 0, false, SENDER));
@@ -1783,9 +1786,21 @@ static void the_bridge_decides(void)
     P3.mtu = 1400;
     assert(!ft_mc_mtu_bounded(f) && ft_mc_carriable(f));
     assert(!strcmp(ft_mc_state(f), "refused-mtu"));
+    /* A port lowered to the listener's still receives full Ethernet
+     * frames, which the bridge would drop at the listener and the
+     * microcode would fragment: the ingress counts for 1500 at least. */
     P1.mtu = 1400;
+    assert(!ft_mc_mtu_bounded(f));
+    P3.mtu = 1500;
     assert(ft_mc_mtu_bounded(f));
-    P1.mtu = P3.mtu = 1500;
+    /* And a jumbo ingress counts at its own size, against every copy. */
+    P1.mtu = 9000;
+    assert(!ft_mc_mtu_bounded(f));
+    P2.mtu = 9000;
+    assert(!ft_mc_mtu_bounded(f));
+    P3.mtu = 9000;
+    assert(ft_mc_mtu_bounded(f));
+    P1.mtu = P2.mtu = P3.mtu = 1500;
 }
 
 static void the_vlan_a_flow_arrives_in(void)
@@ -2032,7 +2047,6 @@ static void one_stream_both_learners(void)
     want.mtu = 1500;
     ft_mc_route_publish(&r1, &want);
     assert(ft_mc_mtu_bounded(f) && ft_mc_installable(f));
-    P1.mtu = P2.mtu = P3.mtu = 0;
     pass();
     assert(f->hw);
 

@@ -106,8 +106,21 @@ extern void *FmMurambaseAddr;
 #define create_ethernet_remove_hm(info) insert_opcodeonly_hm(info, STRIP_ETH_HDR)
 #define create_pppoe_remove_hm(info) insert_opcodeonly_hm(info, STRIP_PPPoE_HDR)
 
-#define CDX_FRAG_BUFFERS_CNT	2048
-#define CDX_FRAG_BUFF_SIZE	1500
+/* The pool the microcode's fragmenter takes every fragment after the first
+ * from. A fragment is as large as the path it leaves by, up to the largest
+ * frame a port accepts, so its buffers are the size the ports' own pools use:
+ * dpa_bp_size(), which is what _dpa_bp_add_8_bufs() allocates for and what
+ * the buffers are mapped for. With FSL_DPAA_ETH_JUMBO_FRAME that is about
+ * 10 KiB, where 2048 buffers would hold 21 MB. A buffer is held from the
+ * fragmenting enqueue until its port has sent it, and what reaches the
+ * fragmenter is, by admission, almost only SEC's output: an ESP packet a path
+ * cannot carry whole. A standard frame costs one buffer more, so 512 cover all
+ * IPSEC_BUFCOUNT (512) frames SEC's output pool holds in flight at once. A
+ * jumbo frame through an SA into a 1500-byte path costs up to six, so a burst
+ * of those can find the pool empty, which shows as an allocation failure in
+ * /proc/ucode_frag/stats; sizing for that worst case would cost ~30 MB. */
+#define CDX_FRAG_BUFFERS_CNT	512
+#define CDX_FRAG_BUFF_SIZE	dpa_bp_size(NULL)
 
 /* Flags that reside in MSB of t_IPF_TD.FragmentedFramesCounter field       */
 #define DF_ACTION_MASK          0x30  /* DFAction mask                */
@@ -3310,8 +3323,9 @@ static int cdx_create_fragment_bufpool(void)
 	bp->size = CDX_FRAG_BUFF_SIZE;
 	bp->config_count = CDX_FRAG_BUFFERS_CNT;
 
-	//find pools used by ethernet devices and borrow buffers from it
-	if (get_phys_port_poolinfo_bysize(CDX_FRAG_BUFF_SIZE, &frag_info_g.parent_pool_info)) {
+	/* A port pool's device is the one the buffers are mapped for; any
+	 * port's pool is this size. */
+	if (get_phys_port_poolinfo_bysize(bp->size, &frag_info_g.parent_pool_info)) {
 		DPA_ERROR("%s::failed to locate eth bman pool\n",
 				__func__);
 		/* bp->pool is still NULL here (pool is created by dpa_bp_alloc

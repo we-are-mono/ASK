@@ -119,11 +119,21 @@ without DF that exceeds the entry's MTU, and for a frame received on an
 Ethernet port those fragments leave with correct headers and an all-zero
 payload, so the receiver discards them. Fragments of the SEC output, which
 reaches the classifier through the offline port, are correct. What can arrive
-is the ingress device's MTU, but never less than a standard 1500-byte
-Ethernet payload less whatever the direction strips (a PPPoE session's 8
-bytes, a tunnel's outer header): a DPAA port keeps receiving full frames after
-its MTU is lowered, and the hosts behind it keep sending them unless each is
-configured, since DHCP's MTU option is widely ignored. A TCP direction is
+is bounded by the physical port's MAC: patch 109 programs each DPAA port's
+max frame from its MTU as `max(mtu, 1500)` plus header and FCS, plus one VLAN
+tag while the port has any upper device (a VLAN, a bridge, a bond, a macvlan)
+and two once a VLAN on it is 802.1ad or carries a VLAN, so a frame over that
+is dropped and counted by the MAC. A direction's bound is therefore the
+larger of its logical ingress device's MTU and `max(port MTU, 1500)`, less
+whatever the direction strips (a PPPoE session's 8 bytes, a tunnel's outer
+header): a port lowered below 1500 keeps receiving full frames, and a 1500
+bridge or VLAN over a 9000 port receives 9000-byte frames from hosts that
+were never told the smaller MTU, since DHCP's MTU option is widely ignored.
+On such a jumbo trunk every non-TCP IPv4 direction into a 1500 path stays in
+software. The tag allowance lets an untagged frame on a port with uppers
+exceed its MTU by four (or eight) bytes; that window is deliberately not
+counted, since counting it would refuse every bridged 1500→1500 UDP
+direction, and it needs a host sending more than its link's MTU. A TCP direction is
 carried into the smaller path: TCP sets DF, the preemptive
 `PREEMPT_DFBIT_HONOR` check hands an oversized DF packet to Linux for its
 Fragmentation Needed, and one that clamps the MSS rarely sees any. The one
@@ -153,8 +163,9 @@ either direction's packets: `flow_offload_refresh()` queues the whole flow, and
 the offload work offers both directions. A direction the MTU bound is certain to refuse is therefore refused
 before RTNL is taken, counted as a reject and never as busy, retiring nothing:
 IPv4 other than TCP whose path is below the larger of the ingress device's MTU
-and 1452 bytes (a full frame less a session and a 4in6 outer header, the most
-any ingress strips), or IPv6 whose path is below the ingress IPv6 MTU. It does
+and the port bound less 48 bytes (a session and a 4in6 outer header, the most
+any ingress strips), or IPv6 whose path is below the ingress IPv6 MTU plus
+whatever the port, less the same 48, accepts beyond the device's MTU. It does
 so only while no xfrm policy or blocking default is configured and neither
 destination carries a transform, because an SA exempts an IPv4 direction and a
 policy denial retires the generation, and only the walk under RTNL finds out

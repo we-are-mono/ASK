@@ -1,0 +1,473 @@
+From cc94945d5f513d2f25b4494fad5ba3572051c7bb Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 5 Oct 2026 00:45:28 +0200
+Subject: [PATCH] sdk_dpaa: size the MAC max frame length to the port's MTU
+
+The mEMAC max frame length was programmed once at init to the FMan-wide
+fsl_fm_max_frm, and the driver had no ndo_change_mtu. With
+FSL_FM_MAX_FRAME_SIZE=9600 a port at MTU 1500 therefore accepted ~9.6K
+frames. The MAC applies the limit to the whole frame, FCS included, and
+adds no room for a VLAN tag.
+
+Add FM_MAC_SetMaxFrameLength() (mEMAC only; the FM keeps its per-MAC
+bookkeeping and the port's limit check) and fm_mac_set_max_frame_length()
+in the wrapper. sdk_dpaa now sets the limit to
+max(mtu, 1500) + ETH_HLEN + ETH_FCS_LEN, plus VLAN_HLEN while the port
+has any upper device and twice that once a VLAN on it is 802.1ad or
+carries a VLAN of its own, capped at fsl_fm_max_frm. It is applied on
+registration, whose failure now fails it, on MTU change and on every
+upper link/unlink of the port or of a VLAN over it.
+
+Without the jumbo buffer layout, also cap max_mtu at what one Rx buffer
+holds behind its headroom, so fsl_fm_max_frm alone cannot advertise an
+MTU the buffers were not sized for.
+---
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 133 +++++++++++++++++-
+ .../net/ethernet/freescale/sdk_dpaa/mac-api.c |   5 +
+ drivers/net/ethernet/freescale/sdk_dpaa/mac.h |   1 +
+ .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |  14 ++
+ .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |   1 +
+ .../sdk_fman/Peripherals/FM/MAC/fman_memac.c  |  10 ++
+ .../sdk_fman/Peripherals/FM/MAC/memac.c       |  29 ++++
+ .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |  17 +++
+ .../sdk_fman/inc/flib/fsl_fman_memac.h        |   3 +
+ .../src/inc/wrapper/lnxwrp_fsl_fman.h         |  14 ++
+ .../sdk_fman/src/wrapper/lnxwrp_fm.c          |  23 +++
+ 11 files changed, 249 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+index 063302116911..8f959f60d3ec 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+@@ -664,6 +664,71 @@ static int __cold dpa_eth_priv_stop(struct net_device *net_dev)
+ 	return _errno;
+ }
+ 
++/* The tags a full-size frame on the port may carry: none while nothing is
++ * stacked on it, one once anything is -- a VLAN, a bridge forwarding tagged
++ * frames through, a bond, a macvlan -- and two once a VLAN on the port is an
++ * 802.1ad service VLAN or carries a VLAN of its own.
++ */
++static int dpa_upper_tags(struct net_device *net_dev)
++{
++	struct net_device *upper, *inner;
++	struct list_head *iter, *inner_iter;
++	int tags = 0;
++
++	rcu_read_lock();
++	netdev_for_each_upper_dev_rcu(net_dev, upper, iter) {
++		tags = max(tags, 1);
++		if (!is_vlan_dev(upper))
++			continue;
++		if (vlan_dev_vlan_proto(upper) == htons(ETH_P_8021AD))
++			tags = 2;
++		netdev_for_each_upper_dev_rcu(upper, inner, inner_iter)
++			if (is_vlan_dev(inner))
++				tags = 2;
++	}
++	rcu_read_unlock();
++	return tags;
++}
++
++/* The mEMAC holds every received frame, FCS included, to its max frame length
++ * and makes no allowance of its own for a VLAN tag. Size the limit to what the
++ * port may carry at @mtu, with the tags dpa_upper_tags() allows for. Never
++ * below a standard frame, never above the FMan-wide maximum the ports are
++ * sized for.
++ *
++ * RTNL serializes every caller, so the limit follows the latest MTU and upper
++ * set.
++ */
++static int dpa_set_mac_max_frame(struct net_device *net_dev, int mtu)
++{
++	struct dpa_priv_s *priv = netdev_priv(net_dev);
++	struct mac_device *mac_dev = priv->mac_dev;
++	int len;
++
++	ASSERT_RTNL();
++
++	if (!mac_dev->set_max_frame)
++		return 0;
++
++	len = max(mtu, ETH_DATA_LEN) + ETH_HLEN + ETH_FCS_LEN +
++	      dpa_upper_tags(net_dev) * VLAN_HLEN;
++	len = min(len, dpa_get_max_frm());
++
++	return mac_dev->set_max_frame(mac_dev->get_mac_handle(mac_dev), len);
++}
++
++static int dpa_change_mtu(struct net_device *net_dev, int new_mtu)
++{
++	int err;
++
++	err = dpa_set_mac_max_frame(net_dev, new_mtu);
++	if (err)
++		return err;
++
++	WRITE_ONCE(net_dev->mtu, new_mtu);
++	return 0;
++}
++
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ static void dpaa_eth_poll_controller(struct net_device *net_dev)
+ {
+@@ -698,6 +763,7 @@ static const struct net_device_ops dpa_private_ops = {
+ 	.ndo_set_rx_mode = dpa_set_rx_mode,
+ 	.ndo_init = dpa_ndo_init,
+ 	.ndo_eth_ioctl = dpa_ioctl,
++	.ndo_change_mtu = dpa_change_mtu,
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ 	.ndo_poll_controller = dpaa_eth_poll_controller,
+ #endif
+@@ -750,6 +816,25 @@ void dpa_private_napi_del(struct net_device *net_dev)
+ }
+ EXPORT_SYMBOL(dpa_private_napi_del);
+ 
++/* Without the jumbo buffer layout an Rx buffer is sized for one standard
++ * frame, yet fsl_fm_max_frm may raise the FMan-wide maximum far past it. Cap
++ * the MTU at what one buffer holds behind its headroom, a VLAN tag and the
++ * forwarded FCS included, so a frame the MAC accepts lands in one piece. The
++ * standard MTU stays available whatever the layout.
++ */
++static int dpa_priv_max_mtu(const struct dpa_priv_s *priv)
++{
++	int max_mtu = dpa_get_max_mtu();
++#ifndef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
++	int buf_mtu = (int)priv->dpa_bp->size - priv->rx_headroom -
++		      (VLAN_ETH_HLEN + ETH_FCS_LEN);
++
++	max_mtu = min(max_mtu, max(buf_mtu, ETH_DATA_LEN));
++#endif
++
++	return max_mtu;
++}
++
+ static int dpa_private_netdev_init(struct net_device *net_dev)
+ {
+ 	int i;
+@@ -773,7 +858,7 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
+ 
+ 	/* Configure the maximum MTU according to the FMan's MAXFRM */
+ 	net_dev->min_mtu = ETH_MIN_MTU;
+-	net_dev->max_mtu = dpa_get_max_mtu();
++	net_dev->max_mtu = dpa_priv_max_mtu(priv);
+ 
+ 	net_dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
+ 				NETIF_F_RXCSUM;
+@@ -1179,12 +1264,56 @@ static struct platform_driver dpa_driver = {
+ 	.remove		= dpa_remove
+ };
+ 
++/* A port's max frame length depends on its uppers as well as its MTU, so
++ * follow uppers being linked and unlinked, on the port and on a VLAN over it
++ * (a VLAN stacked on that VLAN adds a tag). Registration applies the first
++ * per-port limit: the MAC was initialized with the FMan-wide maximum, and a
++ * port left there would take frames its MTU says it cannot, so a failure
++ * fails the registration.
++ */
++static int dpa_netdev_event(struct notifier_block *nb, unsigned long event,
++			    void *ptr)
++{
++	struct net_device *net_dev = netdev_notifier_info_to_dev(ptr);
++	int err;
++
++	if (event == NETDEV_CHANGEUPPER && is_vlan_dev(net_dev))
++		net_dev = vlan_dev_real_dev(net_dev);
++	if (net_dev->netdev_ops != &dpa_private_ops)
++		return NOTIFY_DONE;
++
++	switch (event) {
++	case NETDEV_REGISTER:
++		return notifier_from_errno(dpa_set_mac_max_frame(net_dev,
++								 net_dev->mtu));
++	case NETDEV_CHANGEUPPER:
++		err = dpa_set_mac_max_frame(net_dev, net_dev->mtu);
++		if (unlikely(err < 0))
++			netdev_err(net_dev, "mac_dev->set_max_frame() = %d\n",
++				   err);
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block dpa_netdev_nb = {
++	.notifier_call = dpa_netdev_event,
++};
++
+ static int __init __cold dpa_load(void)
+ {
+ 	int	 _errno;
+ 
+ 	pr_info(DPA_DESCRIPTION "\n");
+ 
++	_errno = register_netdevice_notifier(&dpa_netdev_nb);
++	if (unlikely(_errno < 0)) {
++		pr_err(KBUILD_MODNAME ": register_netdevice_notifier() = %d\n",
++		       _errno);
++		return _errno;
++	}
++
+ #ifdef CONFIG_FSL_DPAA_DBG_LOOP
+ 	dpa_debugfs_module_init();
+ #endif /* CONFIG_FSL_DPAA_DBG_LOOP */
+@@ -1203,6 +1332,7 @@ static int __init __cold dpa_load(void)
+ 		pr_err(KBUILD_MODNAME
+ 			": %s:%hu:%s(): platform_driver_register() = %d\n",
+ 			KBUILD_BASENAME".c", __LINE__, __func__, _errno);
++		unregister_netdevice_notifier(&dpa_netdev_nb);
+ 	}
+ 
+ 	pr_debug(KBUILD_MODNAME ": %s:%s() ->\n",
+@@ -1230,6 +1360,7 @@ static void __exit __cold dpa_unload(void)
+ #endif
+ 
+ 	platform_driver_unregister(&dpa_driver);
++	unregister_netdevice_notifier(&dpa_netdev_nb);
+ 
+ #ifdef CONFIG_FSL_DPAA_DBG_LOOP
+ 	dpa_debugfs_module_exit();
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c b/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
+index 73ecec1f9d5a..6a9511873fb4 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
+@@ -151,6 +151,10 @@ static int __cold memac_init(struct mac_device *mac_dev)
+ 		(macdev2enetinterface(mac_dev) != e_ENET_MODE_XGMII_10000) ?
+ 			param.macId : param.macId + FM_MAX_NUM_OF_1G_MACS);
+ 
++	/* The FMan-wide maximum is only the starting point: the net device
++	 * narrows it to its MTU once registered (see dpa_set_mac_max_frame()).
++	 * A MAC no net device drives keeps it.
++	 */
+ 	_errno = fm_mac_config_max_frame_length(priv->fm_mac, fm_get_max_frm());
+ 	if (unlikely(_errno < 0))
+ 		goto _return_fm_mac_free;
+@@ -642,6 +646,7 @@ static void setup_memac(struct mac_device *mac_dev)
+ 	mac_dev->get_mac_handle		= get_mac_handle;
+ 	mac_dev->set_tx_pause		= fm_mac_set_tx_pause_frames;
+ 	mac_dev->set_rx_pause		= fm_mac_set_rx_pause_frames;
++	mac_dev->set_max_frame		= fm_mac_set_max_frame_length;
+ 	mac_dev->fm_rtc_enable		= fm_rtc_enable;
+ 	mac_dev->fm_rtc_disable		= fm_rtc_disable;
+ 	mac_dev->fm_rtc_get_cnt		= fm_rtc_get_cnt;
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/mac.h b/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
+index de5ffc0ab9c5..cffaec5949f7 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
+@@ -88,6 +88,7 @@ struct mac_device {
+ 	int (*ptp_disable)(struct fm_mac_dev *fm_mac_dev);
+ 	int (*set_rx_pause)(struct fm_mac_dev *fm_mac_dev, bool en);
+ 	int (*set_tx_pause)(struct fm_mac_dev *fm_mac_dev, bool en);
++	int (*set_max_frame)(struct fm_mac_dev *fm_mac_dev, int len);
+ 	int (*fm_rtc_enable)(struct fm *fm_dev);
+ 	int (*fm_rtc_disable)(struct fm *fm_dev);
+ 	int (*fm_rtc_get_cnt)(struct fm *fm_dev, uint64_t *ts);
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
+index ce7b97605c7c..d540f4d2aa37 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
+@@ -621,6 +621,20 @@ t_Error FM_MAC_RestartAutoneg(t_Handle h_FmMac)
+ 
+ /* ......................................................................... */
+ 
++t_Error FM_MAC_SetMaxFrameLength(t_Handle h_FmMac, uint16_t newVal)
++{
++    t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;
++
++    SANITY_CHECK_RETURN_ERROR(p_FmMacControllerDriver, E_INVALID_HANDLE);
++
++    if (p_FmMacControllerDriver->f_FM_MAC_SetMaxFrameLength)
++        return p_FmMacControllerDriver->f_FM_MAC_SetMaxFrameLength(h_FmMac, newVal);
++
++    RETURN_ERROR(MINOR, E_NOT_SUPPORTED, NO_MSG);
++}
++
++/* ......................................................................... */
++
+ t_Error FM_MAC_MII_WritePhyReg (t_Handle h_FmMac, uint8_t phyAddr, uint8_t reg, uint16_t data)
+ {
+     t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h
+index d859fbbcad62..24e8792108e7 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h
+@@ -115,6 +115,7 @@ typedef struct {
+     t_Error (*f_FM_MAC_SetAllMulti) (t_Handle h_FmMac, bool newVal);
+     t_Error (*f_FM_MAC_AdjustLink)     (t_Handle h_FmMac, e_EnetSpeed speed, bool fullDuplex);
+     t_Error (*f_FM_MAC_RestartAutoneg) (t_Handle h_FmMac);
++    t_Error (*f_FM_MAC_SetMaxFrameLength) (t_Handle h_FmMac, uint16_t newVal);
+ 
+     t_Error (*f_FM_MAC_SetWakeOnLan)   (t_Handle h_FmMac, bool en);
+ 
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fman_memac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fman_memac.c
+index 78d1f4d97445..5110fff3e2c1 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fman_memac.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fman_memac.c
+@@ -275,6 +275,16 @@ uint16_t fman_memac_get_max_frame_len(struct memac_regs *regs)
+     return(uint16_t)tmp;
+ }
+ 
++/* Written as is, with Rx possibly running: nothing quiesces the MAC around
++ * the write. Every runtime change of the limit funnels through here, so
++ * should the hardware need Rx disabled for it, this is the one place to do
++ * so. */
++void fman_memac_set_max_frame_len(struct memac_regs *regs,
++	uint16_t max_frame_len)
++{
++    iowrite32be((uint32_t)max_frame_len, &regs->maxfrm);
++}
++
+ 
+ void fman_memac_set_tx_pause_frames(struct memac_regs *regs,
+                 uint8_t priority,
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
+index 6b66035c6b6f..836e53e14594 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
+@@ -881,6 +881,34 @@ static uint16_t MemacGetMaxFrameLength(t_Handle h_Memac)
+     return fman_memac_get_max_frame_len(p_Memac->p_MemMap);
+ }
+ 
++/* ......................................................................... */
++
++static t_Error MemacSetMaxFrameLength(t_Handle h_Memac, uint16_t newVal)
++{
++    t_Memac     *p_Memac = (t_Memac *)h_Memac;
++    e_FmMacType portType;
++    t_Error     err;
++
++    SANITY_CHECK_RETURN_ERROR(p_Memac, E_INVALID_HANDLE);
++    SANITY_CHECK_RETURN_ERROR(!p_Memac->p_MemacDriverParam, E_INVALID_STATE);
++
++    portType =
++        ((ENET_SPEED_FROM_MODE(p_Memac->enetMode) < e_ENET_SPEED_10000) ? e_FM_MAC_1G : e_FM_MAC_10G);
++
++    /* The FM checks the length against the port's max frame length and
++     * records it; only once accepted does the MAC see it. */
++    err = FmSetMacMaxFrame(p_Memac->fmMacControllerDriver.h_Fm,
++                           portType,
++                           p_Memac->fmMacControllerDriver.macId,
++                           newVal);
++    if (err)
++        RETURN_ERROR(MINOR, err, NO_MSG);
++
++    fman_memac_set_max_frame_len(p_Memac->p_MemMap, newVal);
++
++    return E_OK;
++}
++
+ static t_Error MemacInitInternalPhy(t_Handle h_Memac)
+ {
+     t_Memac *p_Memac = (t_Memac *)h_Memac;
+@@ -1162,6 +1190,7 @@ static void InitFmMacControllerDriver(t_FmMacControllerDriver *p_FmMacController
+     p_FmMacControllerDriver->f_FM_MAC_GetId                     = MemacGetId;
+     p_FmMacControllerDriver->f_FM_MAC_GetVersion                = NULL;
+     p_FmMacControllerDriver->f_FM_MAC_GetMaxFrameLength         = MemacGetMaxFrameLength;
++    p_FmMacControllerDriver->f_FM_MAC_SetMaxFrameLength         = MemacSetMaxFrameLength;
+ 
+     p_FmMacControllerDriver->f_FM_MAC_MII_WritePhyReg           = MEMAC_MII_WritePhyReg;
+     p_FmMacControllerDriver->f_FM_MAC_MII_ReadPhyReg            = MEMAC_MII_ReadPhyReg;
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
+index abb0706798b2..e880f15ee481 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
+@@ -803,6 +803,23 @@ t_Error FM_MAC_AdjustLink(t_Handle h_FmMac, e_EnetSpeed speed, bool fullDuplex);
+ *//***************************************************************************/
+ t_Error FM_MAC_RestartAutoneg(t_Handle h_FmMac);
+ 
++/**************************************************************************//**
++ @Function      FM_MAC_SetMaxFrameLength
++
++ @Description   Change the maximum Rx frame length of an initialized MAC.
++                The length covers the whole frame, FCS included. It may
++                not exceed the max frame length of the MAC's port.
++                This routine is relevant only for mEMAC.
++
++ @Param[in]     h_FmMac     - A handle to a FM MAC Module.
++ @Param[in]     newVal      - MAX Frame length
++
++ @Return        E_OK on success; Error code otherwise.
++
++ @Cautions      Allowed only after FM_MAC_Init().
++*//***************************************************************************/
++t_Error FM_MAC_SetMaxFrameLength(t_Handle h_FmMac, uint16_t newVal);
++
+ /**************************************************************************//**
+  @Function      FM_MAC_GetId
+ 
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_memac.h b/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_memac.h
+index eca57b9792f2..28da08f15cdd 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_memac.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_memac.h
+@@ -400,6 +400,9 @@ void fman_memac_set_tx_pause_frames(struct memac_regs *regs,
+ 
+ uint16_t fman_memac_get_max_frame_len(struct memac_regs *regs);
+ 
++void fman_memac_set_max_frame_len(struct memac_regs *regs,
++	uint16_t max_frame_len);
++
+ void fman_memac_set_exception(struct memac_regs *regs, uint32_t val,
+ 	bool enable);
+ 
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h
+index 5e83f83af211..fbe745f2476a 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h
+@@ -566,6 +566,20 @@ struct fm_mac_dev *fm_mac_config(t_FmMacParams *params);
+ int fm_mac_config_max_frame_length(struct fm_mac_dev *fm_mac_dev,
+ 		int len);
+ 
++/**************************************************************************//**
++ @Function	fm_mac_set_max_frame_length
++
++ @Description   Change the maximum Rx frame length of an initialized MAC.
++
++ @Param[in]     fm_mac_dev   - A handle of the FM MAC device.
++ @Param[in]     len          - Whole frame, FCS included; at most
++                               fm_get_max_frm().
++
++ @Return        0 on success; -EOPNOTSUPP if the MAC type cannot change it
++                after init; another negative errno otherwise.
++*//***************************************************************************/
++int fm_mac_set_max_frame_length(struct fm_mac_dev *fm_mac_dev, int len);
++
+ int fm_mac_config_pad_and_crc(struct fm_mac_dev *fm_mac_dev, bool enable);
+ 
+ int fm_mac_config_half_duplex(struct fm_mac_dev *fm_mac_dev, bool enable);
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
+index a6bdd18c0f2e..c3f8cd6ba06a 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
+@@ -1534,6 +1534,29 @@ int fm_mac_config_max_frame_length(struct fm_mac_dev *fm_mac_dev,
+ }
+ EXPORT_SYMBOL(fm_mac_config_max_frame_length);
+ 
++int fm_mac_set_max_frame_length(struct fm_mac_dev *fm_mac_dev, int len)
++{
++	t_Error err;
++	int _errno;
++
++	/* Ports are sized for fsl_fm_max_frm; a MAC may accept less, never
++	 * more.
++	 */
++	if (len <= 0 || len > fsl_fm_max_frm)
++		return -EINVAL;
++
++	err = FM_MAC_SetMaxFrameLength(fm_mac_dev, (uint16_t)len);
++	if (GET_ERROR_TYPE(err) == E_NOT_SUPPORTED)
++		return -EOPNOTSUPP;
++
++	_errno = -GET_ERROR_TYPE(err);
++	if (unlikely(_errno < 0))
++		pr_err("FM_MAC_SetMaxFrameLength() = 0x%08x\n", err);
++
++	return _errno;
++}
++EXPORT_SYMBOL(fm_mac_set_max_frame_length);
++
+ int fm_mac_config_pad_and_crc(struct fm_mac_dev *fm_mac_dev, bool enable)
+ {
+ 	int err;
+-- 
+2.47.3
+

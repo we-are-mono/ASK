@@ -432,6 +432,9 @@ static struct inet6_dev *__in6_dev_get(const struct net_device *dev)
 #define U32_MAX 0xffffffffU
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define min_t(type, a, b) min((type)(a), (type)(b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define max_t(type, a, b) max((type)(a), (type)(b))
+#define ETH_DATA_LEN 1500
 #define kzalloc(n, f) calloc(1, (n))
 #define kfree(p) free(p)
 #define GFP_KERNEL 0
@@ -1817,16 +1820,28 @@ int main(void)
     assert(derive(g, &plan) == FT_MR_PENDING);
     ft_mr_plan_put(&plan);
     LAN.mtu = 1500;
-    /* The bound is the VIF the stream arrives on, not the port beneath it:
-     * a 1400-byte ingress VLAN on a 1500-byte port delivers 1400 at most. */
+    /* IPv4 counts what the parent's port delivers, not the VIF's MTU: its
+     * MAC takes the port's own MTU and never less than a full frame. A
+     * 1400-byte VLAN parent over a 1500-byte port delivers 1500. */
     VWAN.mtu = 1400;
     LAN.mtu = 1400;
     vif_set(AF_INET, 0, &VWAN, 0);
-    assert(derive(g, &plan) == FT_MR_PENDING);
-    ft_mr_plan_put(&plan);
-    VWAN.mtu = 1500;
     assert(refuse(g) == FT_MR_REFUSED_MTU);
     LAN.mtu = 1500;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    /* And a port lowered under it too: 1400 everywhere is still 1500 in. */
+    WAN.mtu = 1400;
+    LAN.mtu = 1400;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    /* A 1500-byte VLAN parent over a 9000-byte port delivers 9000. */
+    VWAN.mtu = LAN.mtu = 1500;
+    WAN.mtu = 9000;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    LAN.mtu = 9000;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    WAN.mtu = LAN.mtu = 1500;
     vif_set(AF_INET, 0, &WAN, 0);
     /* A listener's own VLAN device is what ipmr sends against, so a
      * smaller one refuses the group even over a 1500-byte port. */

@@ -6097,7 +6097,7 @@ static void test_mtu_before_admission(void)
     u64 busy = ft_busy, rejects = ft_rejects, validated = ft_validated;
     u64 admission = ft_admission_invalidations;
     unsigned trylocks = rtnl_trylocks, lookups = police_lookups;
-    assert(ft_mtu_refused(&cls));
+    assert(ft_mtu_refused(&cls, binding.dev));
     for (unsigned offer = 0; offer < 3; offer++) {
         rtnl_busy = offer & 1;
         cls.cookie = download;
@@ -6118,7 +6118,7 @@ static void test_mtu_before_admission(void)
      * is carried into the smaller path. */
     tcp_fixture(); cls.command = FLOW_CLS_REPLACE; cls.nf_mtu = 1492;
     trylocks = rtnl_trylocks;
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
     assert(rtnl_trylocks == trylocks + 1);
     remove_all();
@@ -6129,7 +6129,7 @@ static void test_mtu_before_admission(void)
         xfrm_policies = true;
         ipsec_sa = exempt ? 7 : 0;
         trylocks = rtnl_trylocks;
-        assert(!ft_mtu_refused(&cls));
+        assert(!ft_mtu_refused(&cls, binding.dev));
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == (exempt ? 0 : -EOPNOTSUPP));
         assert(rtnl_trylocks == trylocks + 1 && ft_count == exempt);
         remove_all();
@@ -6137,26 +6137,26 @@ static void test_mtu_before_admission(void)
     /* Nor is a transform on either destination left to this. */
     fixture(); cls.nf_mtu = 1492;
     route.dst.xfrm = &sa;
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     fixture(); cls.nf_mtu = 1492;
     reverse_route.dst.xfrm = &sa;
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     /* A request this cannot read is not one it refuses. */
     fixture(); cls.nf_mtu = 1492; bm.ip_proto = 0;
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     fixture(); cls.nf_mtu = 1492; bm.n_proto = 0;
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     fixture(); cls.nf_mtu = 1492; dissector.used_keys &= ~BIT_ULL(FLOW_DISSECTOR_KEY_BASIC);
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     fixture(); cls.nf_mtu = 1492; cls.nf_dst_reverse = NULL;
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     fixture(); cls.nf_mtu = 1492; cls.nf_dst = NULL;
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     fixture(); cls.nf_mtu = 1492; cls.rule = NULL;
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
     /* Nor a path the bound admits, the ordinary Ethernet WAN. */
     fixture();
-    assert(!ft_mtu_refused(&cls));
+    assert(!ft_mtu_refused(&cls, binding.dev));
 
     /* IPv6 is refused on its own bound, the ingress IPv6 MTU, for every
      * protocol -- and admitted through RTNL once the LAN advertises the path. */
@@ -6165,13 +6165,13 @@ static void test_mtu_before_admission(void)
         if (tcp) tcp_flow();
         in.ip6_mtu = 1500;
         trylocks = rtnl_trylocks; busy = ft_busy;
-        assert(ft_mtu_refused(&cls));
+        assert(ft_mtu_refused(&cls, binding.dev));
         rtnl_busy = true;
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
         rtnl_busy = false;
         assert(rtnl_trylocks == trylocks && ft_busy == busy && !handle.invalid && !ft_count);
         in.ip6_mtu = cls.nf_mtu;
-        assert(!ft_mtu_refused(&cls));
+        assert(!ft_mtu_refused(&cls, binding.dev));
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
         assert(rtnl_trylocks == trylocks + 1);
         remove_all();
@@ -6180,21 +6180,25 @@ static void test_mtu_before_admission(void)
 
 /* The early refusal never refuses what admission would admit: every ingress
  * shape the walk can find, both families, both protocols, with and without a
- * policy or an SA, across ingress MTUs and paths either side of each bound. And
- * where only the MTU can decide, it refuses exactly what admission refuses. */
+ * policy or an SA, across ingress MTUs, a standard and a jumbo port beneath
+ * them, and paths either side of each bound. And where only the MTU can
+ * decide, it refuses exactly what admission refuses. */
 static void test_mtu_refusal_sound(void)
 {
     enum { PLAIN, SESSION, TUNNEL, SESSION_TUNNEL, TAG, BRIDGE,
            PLAIN6, SESSION6, TUNNEL6, SHAPES };
     static const int ingress[] = { 1280, 1400, 1440, 1452, 1460, 1480, 1491, 1492,
                                    1493, 1500, 1508, 9000 };
+    static const int ports[] = { 1500, 9000 };
     static const u16 paths[] = { 68, 1279, 1280, 1400, 1440, 1451, 1452, 1453, 1459,
-                                 1460, 1480, 1491, 1492, 1493, 1499, 1500, 1508, 9000 };
+                                 1460, 1480, 1491, 1492, 1493, 1499, 1500, 1508, 8952,
+                                 8992, 9000 };
     unsigned refused = 0, exact = 0;
 
     for (unsigned shape = 0; shape < SHAPES; shape++)
     for (unsigned tcp = 0; tcp < 2; tcp++)
     for (unsigned sec = 0; sec < 4; sec++)
+    for (unsigned w = 0; w < ARRAY_SIZE(ports); w++)
     for (unsigned i = 0; i < ARRAY_SIZE(ingress); i++)
     for (unsigned p = 0; p < ARRAY_SIZE(paths); p++) {
         struct net_device *logical;
@@ -6231,29 +6235,117 @@ static void test_mtu_refusal_sound(void)
         xfrm_policies = sec > 0;
         ipsec_sa = sec == 2 ? 7 : 0;
         ipsec_in_sa = sec == 3 ? 8 : 0;
-        /* The IPv6 MTU follows the device's, so one number moves both. */
+        /* The port first: where it is the logical device too, the ingress
+         * MTU below is the one that stands. The IPv6 MTU follows the
+         * device's, so one number moves both. */
+        in.mtu = ports[w];
         logical->mtu = ingress[i];
         logical->ip6_mtu = 0;
         out.mtu = 9000;
         cls.nf_mtu = paths[p];
-        bool early = ft_mtu_refused(&cls);
+        bool early = ft_mtu_refused(&cls, binding.dev);
         int rc = ft_parse(&binding, &cls, &decoded, &next_hop);
         assert(!early || rc == -EOPNOTSUPP);
         refused += early;
         /* Behind a session under 4in6 the IPv4 bound is at its lowest, which
-         * is the one the early refusal assumes; IPv6 reads nothing else. */
-        if (!sec && ((shape == SESSION_TUNNEL && !tcp) || shape >= PLAIN6)) {
+         * is the one the early refusal assumes. IPv6 adds the port's excess
+         * over its device with the same assumption, so it is exact only while
+         * the port takes nothing more than the device's own MTU. */
+        if (!sec && ((shape == SESSION_TUNNEL && !tcp) ||
+                     (shape >= PLAIN6 && max_t(int, ports[w], 1500) <= ingress[i]))) {
             assert(early == (rc != 0));
             exact++;
         }
         logical->mtu = logical == &in ? 1500 : logical == &in_ppp ? 1492 :
                        logical == &in_ip6tnl ? 1452 : logical == &in_sit ? 1480 : 1500;
         logical->ip6_mtu = 0;
-        out.mtu = 1500;
+        in.mtu = out.mtu = 1500;
     }
     assert(refused && exact);
     xfrm_policies = false;
     ipsec_sa = ipsec_in_sa = 0;
+}
+
+/* What a direction is handed is what its port's MAC takes, not what the
+ * device it is routed from says (A316). Since patch 109 a DPAA port's MAXFRM
+ * follows its own MTU, never under a full Ethernet frame, so a 1500-byte VLAN
+ * or bridge over a 9000-byte port still receives 9000-byte frames: UDP from it
+ * into a 1500-byte path would be fragmented by the microcode with zero
+ * payloads, and is refused -- before RTNL and at admission alike -- while a
+ * 9000-byte path carries it. */
+static void test_mtu_port_bound(void)
+{
+    struct cdx_ft_rule decoded;
+
+    for (unsigned upper = 0; upper < 2; upper++) {
+        struct net_device *logical = upper ? &in_br : &in_tag;
+
+        if (upper) {
+            bridge_fixture();
+            reverse_route.dst.dev = &in_br;
+        } else {
+            ingress_tag_fixture();
+        }
+        /* The standard port first: the upper's own 1500 into 1500 is
+         * carried, the four bytes a tag allowance leaves an untagged frame
+         * on a port with uppers being deliberately not counted. */
+        assert(logical->mtu == 1500 && in.mtu == 1500 && cls.nf_mtu == 1500);
+        assert(!ft_mtu_refused(&cls, binding.dev));
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 &&
+               decoded.in == &in && decoded.in_logical == logical);
+        in.mtu = 9000;
+        assert(ft_mtu_refused(&cls, binding.dev));
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        /* Short of the port by anything is still too small to admit. Before
+         * RTNL it is only certain past what a session and 4in6 could strip,
+         * which this direction does not cross. */
+        out.mtu = cls.nf_mtu = 8999;
+        assert(!ft_mtu_refused(&cls, binding.dev));
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        out.mtu = cls.nf_mtu = 8951;
+        assert(ft_mtu_refused(&cls, binding.dev));
+        out.mtu = cls.nf_mtu = 9000;
+        assert(!ft_mtu_refused(&cls, binding.dev));
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 9000);
+        /* TCP sets DF, which the microcode hands to Linux: carried into the
+         * smaller path as before. */
+        out.mtu = cls.nf_mtu = 1500;
+        tcp_flow();
+        assert(!ft_mtu_refused(&cls, binding.dev));
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        in.mtu = 1500;
+    }
+    /* A port lowered under 1500 still takes full frames, whatever its upper
+     * says: the floor is the port's as much as the device's. */
+    ingress_tag_fixture();
+    in.mtu = in_tag.mtu = cls.nf_mtu = 1400;
+    out.mtu = 1500;
+    assert(ft_mtu_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    in.mtu = in_tag.mtu = cls.nf_mtu = 1500;
+    /* A session strips its header from what the port delivers: a 9000-byte
+     * port under a 1492-byte ppp device hands it up to 8992. */
+    pppoe_in_fixture();
+    in.mtu = 9000;
+    out.mtu = cls.nf_mtu = 8991;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    out.mtu = cls.nf_mtu = 8992;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.in_session.present);
+    /* IPv6 starts from what its link is told: a standard port under a device
+     * whose IPv6 MTU is the path's -- the 1492-byte LAN that carries IPv6
+     * into PPPoE -- is carried. The same device over a jumbo port is not: its
+     * hosts may never learn the smaller MTU, and the port takes what they
+     * send. */
+    fixture6();
+    reverse_route6.dst.dev = &in_tag;
+    in_tag.real_dev = &in;
+    out.mtu = cls.nf_mtu = 1492;
+    in_tag.ip6_mtu = 1492;
+    assert(!ft_mtu_refused(&cls, binding.dev));
+    in.mtu = 9000;
+    assert(ft_mtu_refused(&cls, binding.dev));
+    in.mtu = out.mtu = 1500;
+    in_tag.ip6_mtu = 0;
 }
 
 static void test_ipsec_generation_retirement(void)
@@ -7692,6 +7784,7 @@ int main(void)
     test_crossed_devices();
     test_mtu_before_admission();
     test_mtu_refusal_sound();
+    test_mtu_port_bound();
     test_ipsec_generation_retirement();
     test_policy_covers_tuples();
     test_nexthop_objects();

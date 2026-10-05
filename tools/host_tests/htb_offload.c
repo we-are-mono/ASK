@@ -651,6 +651,12 @@ static int dpa_register_setup_tc(cdx_ft_setup_tc_handler handler)
 static void dpa_unregister_setup_tc(void) { registered_ndo = NULL; }
 #define EXPORT_SYMBOL_NS_GPL(sym, ns)	extern int __unused_##sym
 
+/* The largest frame the ports are built for (fsl_fm_max_frm), which the
+ * control burst is sixteen of: a standard build's unless a case says
+ * otherwise. */
+static int dpa_max_frm = 1522;
+#define dpa_get_max_frm() dpa_max_frm
+
 #include "htb_types.inc"
 
 static struct cdx_htb_port cdx_htb_ports[MAX_PHY_PORTS];
@@ -1901,6 +1907,16 @@ static void test_control_budget(void)
 	assert(!add_leaf(dev, 1, 0, 0, 0, 16000000, 32000000, &qid1));
 	assert(port->control_rate == 1000000);
 	assert(port->control_tau == (s64)CDX_HTB_CONTROL_BURST * 1000);
+	assert(CDX_HTB_CONTROL_BURST == 16 * 1522);
+	/* Sixteen frames of the largest size the ports take: a jumbo build's
+	 * burst holds sixteen jumbo frames, not the two and a half sixteen
+	 * standard ones would. */
+	dpa_max_frm = 9600;
+	assert(!modify(dev, 1, 0, 0, 16000000, 32000000));
+	assert(port->control_tau == (s64)16 * 9600 * 1000);
+	dpa_max_frm = 1522;
+	assert(!modify(dev, 1, 0, 0, 16000000, 32000000));
+	assert(port->control_tau == (s64)16 * 1522 * 1000);
 	/* And it follows the rate. */
 	assert(!modify(dev, 1, 0, 0, 125000000, 125000000));
 	assert(port->control_rate == 125000000 / 16);

@@ -339,8 +339,16 @@ static int dpa_bp_alloc(struct dpa_bp *bp, struct device *dev)
     bp->pool = calloc(1, sizeof(*bp->pool)); assert(bp->pool);
     dpa_bp_array[id] = bp; return 0;
 }
+/* The largest buffer a pool asked a port's pool to match: SEC's output pool
+ * has to ask for what it is, the ports' own buffer size, or a jumbo build
+ * looks up a pool by a size nothing relates to. */
+static unsigned pool_size_asked;
 static int get_phys_port_poolinfo_bysize(unsigned size, struct port_bman_pool_info *p)
-{ if (fault()) return -ENOENT; p->pool_id = 1; return 0; }
+{
+    if (size > pool_size_asked) pool_size_asked = size;
+    if (fault()) return -ENOENT;
+    p->pool_id = 1; return 0;
+}
 static int alloc_offline_port(unsigned fm, unsigned type, void *rx, void *err)
 { if (fault()) return -ENOENT; assert(!port); port = true; return 0; }
 static int release_offline_port(unsigned fm, int handle)
@@ -625,7 +633,9 @@ static void reset(void)
 }
 static unsigned normal(void)
 {
+    pool_size_asked = 0;
     assert(cdx_dpa_ipsec_init() == SUCCESS);
+    assert(pool_size_asked == IPSEC_BUFSIZE && ipsecinfo.ipsec_bp->size == IPSEC_BUFSIZE);
     unsigned count = steps;
     assert(cdx_dpa_ipsec_ready() && registrations == 1 && queues == 12);
     assert(ipsecinfo.ipsec_bp->pool->count == IPSEC_BUFCOUNT);

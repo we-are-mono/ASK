@@ -21,6 +21,8 @@ import pytest
 from _topology import DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VIRT_IPV6, WAN_IPV6, lan_run_python
 from _flowtable_rig import command, read
 
+JUMBO = 9000
+
 
 @pytest.mark.parametrize("case", ["routed", "snat", "dnat"])
 async def test_udp(ipv6_rig, case):
@@ -190,11 +192,14 @@ async def test_mtu_recovery(ipv6_rig):
     """A device MTU change must retire both IPv6 directions and let them come
     back describing the new MTU, exactly as the IPv4 path does.
 
-    The LAN's IPv6 MTU is lowered with the WAN, as an operator would for any
-    smaller upstream: a LAN-to-WAN direction may only be in hardware while no
-    LAN host is told it can send more than the path carries (see
-    test_mtu_bound). It also lowers the LAN route, so both
-    directions come back at 1400."""
+    Both directions are only in hardware while neither port can deliver more
+    than the other's path carries: a LAN-to-WAN direction while no LAN host is
+    told it can send more (see test_mtu_bound), a WAN-to-LAN one while the WAN
+    port receives no more than the LAN path. A port never receives less than a
+    full Ethernet frame, so a WAN port lowered below one still delivers 1500
+    bytes and only the LAN-to-WAN direction can come back. Both ports move to
+    jumbo together for the full re-description, and the WAN alone goes below a
+    full frame for the one-sided one."""
     r = ipv6_rig
     sport, dport = PORTS["mtu"]
     loop = asyncio.get_running_loop()
@@ -212,20 +217,25 @@ async def test_mtu_recovery(ipv6_rig):
                                        "flowtable_v6_mtu")
 
         async def settled(expected):
-            """`expected` maps egress device to MTU: a direction describes the
-            path it leaves by, so only the one egressing the changed device
+            """`expected` maps egress device to MTU for every direction that
+            has to be in hardware, and no other: a direction describes the
+            path it leaves by, so only the one egressing a changed device
             moves."""
-            # The reduce step below retires the flow once, for the MTU change,
+            # The jumbo step below retires the flow once, for the MTU change,
             # and then has one readmission declined for the injected lost RTNL,
             # which the software path offers again about a second later.
-            return await _drive(r, send, lambda s: s["entries"] == 2 and all(
-                int(f["mtu"]) == expected[f["out"]] for f in s["flows"]),
+            return await _drive(r, send, lambda s: s["entries"] == len(expected) and all(
+                int(f["mtu"]) == expected.get(f["out"], -1) for f in s["flows"]),
                 f"IPv6 flow did not settle at MTU {expected}", timeout=20)
+
+        async def link_mtu(dev, mtu):
+            await command(r.target, r.session, "ip", "link", "set", "dev", dev, "mtu", str(mtu))
 
         initial = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: original})
         r.record("ipv6-mtu-initial", initial)
-        # 1400 is below the port MTU and above the IPv6 minimum, so the flow
-        # stays admissible and simply has to be re-described.
+        # Raising a device MTU raises its IPv6 MTU with it. The LAN goes
+        # first, which retires the flow; nothing is sent until the WAN has
+        # followed, so nothing is readmitted in between.
         #
         # The readmission is made to lose RTNL on its second direction. The
         # backend never waits for RTNL under its transaction: it declines with
@@ -234,44 +244,56 @@ async def test_mtu_recovery(ipv6_rig):
         # the second offers the flow again about a second later. Any RTNL
         # holder can cause that in production, so the re-description has to
         # survive it every run, not by chance.
-        #
-        # The LAN's IPv6 MTU goes first: lowering it leaves both installed
-        # directions bounded, so nothing retires until the device change.
-        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}=1400")
         knob = "/sys/module/ask_flowtable/parameters/flowtable_fail_stage"
         assert (await r.target.fs_write(r.session, knob, "4"))["errno"] == 0
         try:
-            await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
-                          "mtu", "1400")
+            await link_mtu(TARGET_LAN_IF, JUMBO)
+            await link_mtu(TARGET_WAN_IF, JUMBO)
             # Both directions of a connection share one invalidation handle and
             # the counter moves on the transition, so a single connection
             # retiring is one increment -- not one per direction.
             retired = await r.wait(lambda s: s["mtu_invalidations"] >= initial["mtu_invalidations"] + 1)
-            reduced = await settled({TARGET_LAN_IF: 1400, TARGET_WAN_IF: 1400})
+            raised = await settled({TARGET_LAN_IF: JUMBO, TARGET_WAN_IF: JUMBO})
             assert (await read(r.target, r.session, knob)).strip() == "0", "fault not consumed"
         finally:
             assert (await r.target.fs_write(r.session, knob, "0"))["errno"] == 0
-        assert reduced["errors"] == r.errors, reduced
-        assert reduced["busy"] >= initial["busy"] + 1, (initial, reduced)
+        assert raised["errors"] == r.errors, raised
+        assert raised["busy"] >= initial["busy"] + 1, (initial, raised)
         # The lost RTNL declined an offer and retired nothing.
-        assert reduced["admission_invalidations"] == initial["admission_invalidations"], \
-            (initial, reduced)
-        r.record("ipv6-mtu-reduced", {"retired": retired, "reduced": reduced})
+        assert raised["admission_invalidations"] == initial["admission_invalidations"], \
+            (initial, raised)
+        r.record("ipv6-mtu-raised", {"retired": retired, "raised": raised})
+        await link_mtu(TARGET_WAN_IF, original)
+        await link_mtu(TARGET_LAN_IF, original)
+        restored = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: original})
+        r.record("ipv6-mtu-restored", restored)
+
+        # Below a full frame. The LAN's IPv6 MTU is lowered with the WAN, as
+        # an operator would for any smaller upstream, which keeps the
+        # LAN-to-WAN direction bounded. The WAN port still receives a full
+        # frame, more than the 1400-byte LAN path carries, so the WAN-to-LAN
+        # direction stays with Linux, which can say Packet Too Big. The LAN
+        # goes first, so nothing installed is ever left unbounded.
+        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}=1400")
+        await link_mtu(TARGET_WAN_IF, 1400)
+        reduced = await settled({TARGET_WAN_IF: 1400})
+        assert reduced["rejects"] > restored["rejects"], (restored, reduced)
+        r.record("ipv6-mtu-reduced", reduced)
         # The LAN first again, so the WAN-to-LAN direction is never left
         # unbounded behind a 1400-byte WAN: raising it retires the bounded
         # LAN-to-WAN one, and the device change then retires whatever came
         # back in between.
         await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}")
-        await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
-                      "mtu", str(original))
+        await link_mtu(TARGET_WAN_IF, original)
         restored = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: original})
         assert restored["errors"] == r.errors, restored
-        r.record("ipv6-mtu-restored", restored)
+        r.record("ipv6-mtu-restored-again", restored)
     finally:
         transport.close()
+        for dev in (TARGET_WAN_IF, TARGET_LAN_IF):
+            await command(r.target, r.session, "ip", "link", "set", "dev", dev,
+                          "mtu", str(original), check=False)
         await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}", check=False)
-        await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
-                      "mtu", str(original), check=False)
         await _drop_tables(r)
 
 

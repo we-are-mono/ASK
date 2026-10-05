@@ -42,6 +42,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   flowtable_service_multicast_xfrm.py  326 (the oif an XFRM policy governs)
 #   flowtable_service_multicast_ports.py 327 (the oif a port rule drops toward)
 #   flowtable_slaac.py     331          (isolated LAN router advertisements)
+#   flowtable_jumbo.py     332          (VLAN_ID_JUMBO, tagged jumbo LAN)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
 # orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access
@@ -55,6 +56,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 VLAN_ID_MROUTE: int                   = 244
 VLAN_IDS_MROUTE_LIMIT: tuple[int, ...] = tuple(range(311, 320))
 VLAN_ID_MCAST_MTU: int                = 324
+VLAN_ID_JUMBO: int                    = 332
 VLAN_ID_PPPOE_WAN: int                = 3900
 
 # Bench wiring: the DUT's eth3 faces the LAN client VM, eth4 faces the
@@ -64,11 +66,12 @@ VLAN_ID_PPPOE_WAN: int                = 3900
 TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth3")
 LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "")
 
-# The largest IPv4 packet an Ethernet port delivers, whatever MTU the DUT gives
-# the port: the MAC's receive frame length is fixed at init, and the sending
-# host is never told the DUT's setting. The flowtable adapter installs a
-# non-TCP IPv4 direction only where its path carries this much from its
-# ingress, so a UDP direction into any smaller path stays in Linux.
+# The largest IPv4 packet an Ethernet port at or below a standard MTU delivers:
+# each port's MAC receive limit follows its MTU but never drops below a full
+# frame, and the sending host is never told the DUT's setting. A port given a
+# jumbo MTU delivers up to that MTU instead. The flowtable adapter installs a
+# non-TCP IPv4 direction only where its path carries the larger of the two from
+# its ingress, so a UDP direction into any smaller path stays in Linux.
 FULL_FRAME = 1500
 
 

@@ -108,7 +108,12 @@ parameter block, set live to don't-fragment.
 So an IPv6 direction is admitted only while nothing larger than its MTU is
 expected to arrive: while the IPv6 MTU of the interface it arrives on
 (`net.ipv6.conf.<if>.mtu`, the value its hosts learn from router
-advertisements) is no larger than the direction's own. A direction refused for
+advertisements) is no larger than the direction's own. Where the physical port
+accepts more than the interface's own MTU -- a 1500-byte bridge or VLAN over a
+9000-byte port -- the excess is added, because a host statically configured
+for jumbo frames or ignoring the advertised MTU sends what the port takes; on
+a plain port the MAC already drops anything over the port's MTU, so a lowered
+IPv6 MTU (1492 for PPPoE or 6in4) is trusted as is. A direction refused for
 this stays on the software flowtable path, where the oversized packet reaches
 `ip6_forward()` and gets its Packet Too Big; the reverse direction is admitted
 on its own. The IPv6 MTU is a sysctl that no device event reports, so every
@@ -226,8 +231,11 @@ Further cases assert behaviour rather than a packet count. A device MTU
 change retires the connection and lets it come back describing the new path:
 each direction carries the MTU of the interface *it* leaves by, and one
 connection is one retirement because both directions share an invalidation
-handle. The WAN port is reduced to 1400 together with the LAN's IPv6 MTU, as
-an operator would, so both directions come back at 1400 in hardware.
+handle. Both ports raised to 9000 bring both directions back at 9000 in
+hardware. The WAN port reduced to 1400 together with the LAN's IPv6 MTU, as
+an operator would, brings back only the LAN-to-WAN direction: a port never
+receives less than a full Ethernet frame, so the WAN still delivers 1500
+bytes into the 1400-byte LAN path and that direction stays with Linux.
 `flowtable_ipv6.py::test_mtu_bound` proves the bound itself: with the WAN route
 locked to 1280 and the LAN's IPv6 MTU at 1280, only the LAN-to-WAN direction
 is admitted; raising the LAN to 1500 retires it on the next stats pass or

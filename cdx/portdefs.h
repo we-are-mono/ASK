@@ -129,7 +129,6 @@ struct dpa_iface_info {
 	uint32_t if_flags; 	//from itf structure
 	uint32_t itf_id;	//from itf_structure
 	uint32_t osid;		//linux interface id
-	uint32_t mtu;		//iface mtu
 
 	uint8_t name[IF_NAME_SIZE]; //name as seen by OS
 	/* Only physical ports register: Ethernet ports, Wi-Fi VAPs and the

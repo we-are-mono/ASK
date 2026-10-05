@@ -2385,6 +2385,32 @@ static bool ft_vlan_actions(const struct flow_action *actions,
 	return true;
 }
 
+/* The largest untagged payload @port's MAC accepts: its MTU, but never less
+ * than a standard Ethernet frame. Patch 109 programs each DPAA port's MAXFRM
+ * from its MTU as max(mtu, 1500) plus the Ethernet header and FCS, and a tag
+ * more while the port has any upper device -- a VLAN, a bridge, a bond, a
+ * macvlan -- or two once a VLAN on it is 802.1ad or carries a VLAN, so that a
+ * tagged frame still carries a full payload. A port lowered below 1500 thus
+ * keeps receiving full frames, and a port raised above it receives what its
+ * MTU allows whatever the devices above it say.
+ *
+ * Those tag bytes also let an untagged frame of a port with uppers exceed this
+ * by four, or eight. That window is not counted: counting it would refuse
+ * every 1500-byte UDP direction between two bridged 1500-byte ports, and only
+ * a host sending more than the link's own MTU reaches it. */
+static u32 ft_port_arriving(const struct net_device *port)
+{
+	return max_t(u32, READ_ONCE(port->mtu), ETH_DATA_LEN);
+}
+
+/* The session and tunnel header a direction's ingress takes off before the
+ * packet reaches the bound its path is measured against. */
+static unsigned int ft_rule_stripped(const struct cdx_ft_rule *rule)
+{
+	return (rule->in_session.present ? PPPOE_SES_HLEN : 0) +
+	       (rule->in_tunnel.present ? rule->in_tunnel.header_size : 0);
+}
+
 /* Whether an IPv6 direction leaving by a path of @mtu can only ever be handed
  * packets that fit it. The microcode fragments anything over the entry's MTU
  * itself, IPv6 included, and nothing hands such a packet to Linux instead:
@@ -2399,29 +2425,47 @@ static bool ft_vlan_actions(const struct flow_action *actions,
  * device's, because ip6_dst_mtu_maybe_forward() ignores the bundle's unlocked
  * RTAX_MTU. Checked at admission, and for an installed direction on every
  * stats pass and every time Linux offers it again, because the IPv6 MTU is a
- * sysctl of its own that no device event reports. */
-static bool ft_ipv6_mtu_bounded(struct net_device *in, u32 mtu)
+ * sysctl of its own that no device event reports.
+ *
+ * Unlike the IPv4 bound below, this one starts from what the link is told
+ * rather than from what the port's MAC accepts: a lowered IPv6 MTU over a
+ * full-size port is the configuration that carries IPv6 into PPPoE or a
+ * tunnel at all (docs/flowtable/ipv6.md), and the port's floor would refuse
+ * exactly that. It adds only what the physical port (@port, less the @stripped
+ * session and tunnel header) accepts beyond the logical device's own MTU --
+ * nothing on a plain port, where the MAC already bounds arrivals at that MTU;
+ * the difference on a 1500-byte bridge or VLAN over a 9000-byte port, whose
+ * hosts may never learn the smaller MTU. */
+static bool ft_ipv6_mtu_bounded(struct net_device *in, const struct net_device *port,
+				unsigned int stripped, u32 mtu)
 {
+	u32 accepted = ft_port_arriving(port) - stripped;
+	u32 own = READ_ONCE(in->mtu);
+	u32 wider = accepted > own ? accepted - own : 0;
 	struct inet6_dev *idev;
 	bool bounded = false;
 
 	rcu_read_lock();
 	idev = __in6_dev_get(in);
 	if (idev)
-		bounded = (u32)READ_ONCE(idev->cnf.mtu6) <= mtu;
+		bounded = (u32)READ_ONCE(idev->cnf.mtu6) + wider <= mtu;
 	rcu_read_unlock();
 	return bounded;
 }
 
-/* The largest IPv4 packet a direction arriving on @in may be handed once its
- * ingress has taken @stripped bytes of session and tunnel header off: the
- * device's MTU, but never less than a standard Ethernet frame carries through
- * the same stripping. The IPv4 MTU bound and its refusal ahead of admission
- * both measure a path against this, so the two cannot disagree about what
- * arrives. */
-static u32 ft_ipv4_arriving(const struct net_device *in, unsigned int stripped)
+/* The largest IPv4 packet a direction arriving on @in through physical port
+ * @port may be handed once its ingress has taken @stripped bytes of session
+ * and tunnel header off: whichever is larger of the logical device's MTU and
+ * what the port's MAC accepts (ft_port_arriving()) less the same stripping.
+ * The logical device can be the smaller -- a 1500-byte bridge or VLAN over a
+ * 9000-byte port still receives 9000-byte frames -- and a tunnel device's MTU
+ * says nothing about the outer packets its port receives. The IPv4 MTU bound
+ * and its refusal ahead of admission both measure a path against this, so
+ * the two cannot disagree about what arrives. */
+static u32 ft_ipv4_arriving(const struct net_device *in, const struct net_device *port,
+			    unsigned int stripped)
 {
-	return max_t(u32, READ_ONCE(in->mtu), ETH_DATA_LEN - stripped);
+	return max_t(u32, READ_ONCE(in->mtu), ft_port_arriving(port) - stripped);
 }
 
 /* Whether an IPv4 direction leaving by a path of @mtu can be carried although
@@ -2437,21 +2481,18 @@ static u32 ft_ipv4_arriving(const struct net_device *in, unsigned int stripped)
  * and what SEC returns is fragmented on the offline port, where the
  * microcode's fragments are whole.
  *
- * What may arrive is the ingress device's MTU, but never less than a
- * standard Ethernet frame carries through whatever the direction strips: a
- * port keeps receiving full frames after its MTU is lowered, and a host that
- * was not told the smaller MTU -- DHCP's option for it is widely ignored --
- * keeps sending them. The ingress and the path are device and route MTUs,
- * whose changes retire the flow through their own events, so admission alone
- * decides. */
-static bool ft_ipv4_mtu_carried(const struct cdx_ft_rule *rule, const struct net_device *in,
-				u32 mtu)
+ * What may arrive is bounded by the ingress port's MAC rather than by the
+ * device the direction is routed from (ft_ipv4_arriving()): the port takes
+ * whatever its own MTU allows, never less than a full Ethernet frame, and a
+ * host that was not told a smaller MTU -- DHCP's option for it is widely
+ * ignored -- or that sits on the port's wider segment keeps sending such
+ * frames. The logical and physical ingress and the path are device and route
+ * MTUs, whose changes retire the flow through their own events, so admission
+ * alone decides. */
+static bool ft_ipv4_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
 {
-	unsigned int stripped = (rule->in_session.present ? PPPOE_SES_HLEN : 0) +
-				(rule->in_tunnel.present ? rule->in_tunnel.header_size : 0);
-
 	return rule->proto == IPPROTO_TCP || rule->sa_handle || rule->in_sa_handle ||
-	       ft_ipv4_arriving(in, stripped) <= mtu;
+	       ft_ipv4_arriving(rule->in_logical, rule->in, ft_rule_stripped(rule)) <= mtu;
 }
 
 /* Whether the decoder is certain to refuse this offer on its MTU bound, decided
@@ -2462,19 +2503,20 @@ static bool ft_ipv4_mtu_carried(const struct cdx_ft_rule *rule, const struct net
  * walk the whole path only to be refused again.
  *
  * Only a refusal that holds whatever the walk would find is made here. The
- * ingress device is the reverse destination's, exactly as the decoder takes
- * it, and the IPv6 bound reads nothing else. The IPv4 one is taken with the
- * most any ingress of an IPv4 flow can strip -- a session and the IPv6 outer
- * header of 4in6, the one tunnel mode that carries IPv4 -- which is where it is
- * lowest. And no transform may be in reach: neither destination carries one
- * and no policy or blocking default is configured, so every lookup
+ * ingress device is the reverse destination's and the physical port @port the
+ * one the offer is bound to, exactly as the decoder takes them, and the IPv6
+ * bound reads nothing else. The IPv4 one is taken with the most any ingress
+ * of an IPv4 flow can strip -- a session and the IPv6 outer header of 4in6,
+ * the one tunnel mode that carries IPv4 -- which is where it is lowest. And
+ * no transform may be in reach: neither destination carries one and no
+ * policy or blocking default is configured, so every lookup
  * ft_ipsec_handle() makes returns the plain route. No SA can then exempt the
  * direction, and no policy can deny it -- a denial retires the whole
  * generation, which a refusal here would otherwise skip. A socket's own
  * policy is not one of those: it never governs a forwarded packet, and
  * neither the lookups nor xfrm_flowtable_policy_check() consult it. Everything
  * that passes still meets the exact bound in the decoder. */
-static bool ft_mtu_refused(const struct flow_cls_offload *cls)
+static bool ft_mtu_refused(const struct flow_cls_offload *cls, const struct net_device *port)
 {
 	struct flow_rule *rule = cls->rule;
 	struct flow_match_basic basic;
@@ -2496,11 +2538,12 @@ static bool ft_mtu_refused(const struct flow_cls_offload *cls)
 	in = READ_ONCE(cls->nf_dst_reverse->dev);
 	if (basic.key->n_proto == htons(ETH_P_IP))
 		refused = basic.key->ip_proto != IPPROTO_TCP &&
-			  ft_ipv4_arriving(in, PPPOE_SES_HLEN + sizeof(struct ipv6hdr)) >
+			  ft_ipv4_arriving(in, port, PPPOE_SES_HLEN + sizeof(struct ipv6hdr)) >
 			  cls->nf_mtu;
 	else
 		refused = basic.key->n_proto == htons(ETH_P_IPV6) &&
-			  !ft_ipv6_mtu_bounded(in, cls->nf_mtu);
+			  !ft_ipv6_mtu_bounded(in, port, PPPOE_SES_HLEN + sizeof(struct ipv6hdr),
+					       cls->nf_mtu);
 	if (refused)
 		ask_dbg(ASK_DBG_DEVICE, "proto %u mtu %u below ingress %s before RTNL\n",
 			basic.key->ip_proto, cls->nf_mtu, netdev_name(in));
@@ -2801,12 +2844,13 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return ask_refuse(-EOPNOTSUPP);
-	if (family == AF_INET6 && !ft_ipv6_mtu_bounded(out->in_logical, cls->nf_mtu)) {
+	if (family == AF_INET6 &&
+	    !ft_ipv6_mtu_bounded(out->in_logical, out->in, ft_rule_stripped(out), cls->nf_mtu)) {
 		ask_dbg(ASK_DBG_DEVICE, "ipv6 mtu %u below ingress %s\n",
 			cls->nf_mtu, netdev_name(out->in_logical));
 		return ask_refuse(-EOPNOTSUPP);
 	}
-	if (family == AF_INET && !ft_ipv4_mtu_carried(out, out->in_logical, cls->nf_mtu)) {
+	if (family == AF_INET && !ft_ipv4_mtu_carried(out, cls->nf_mtu)) {
 		ask_dbg(ASK_DBG_DEVICE, "ipv4 proto %u mtu %u below ingress %s\n",
 			out->proto, cls->nf_mtu, netdev_name(out->in_logical));
 		return ask_refuse(-EOPNOTSUPP);
@@ -3081,7 +3125,8 @@ static bool ft_entry_bounded(struct cdx_ft_entry *entry)
 		return false;
 	}
 	if (entry->rule.family != AF_INET6 ||
-	    ft_ipv6_mtu_bounded(entry->rule.in_logical, entry->rule.mtu))
+	    ft_ipv6_mtu_bounded(entry->rule.in_logical, entry->rule.in,
+				ft_rule_stripped(&entry->rule), entry->rule.mtu))
 		return true;
 	ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
 	return false;
@@ -3245,7 +3290,7 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		if (ft_offer_installed(entry, cls)) {
 			rc = ft_offer_routes_current(cls) && ft_entry_bounded(entry) ?
 			     0 : ask_refuse(-EOPNOTSUPP);
-		} else if (!entry && ft_mtu_refused(cls)) {
+		} else if (!entry && ft_mtu_refused(cls, binding->dev)) {
 			rc = ask_refuse(-EOPNOTSUPP);
 		} else if (!entry && ft_count >= CDX_FT_MAX_ENTRIES &&
 			   ft_software_reoffers(cls)) {
@@ -5681,7 +5726,11 @@ static bool ft_mc_carriable(const struct ft_mc_flow *f)
  * the ingress's keeps the whole flow in software, where the bridge makes that
  * decision per frame. The comparison is in device MTUs because a bridge
  * decides in them; see ft_mc_link_mtu() for why the bound is an admission
- * test at all. A flow whose ingress has gone has nothing left to bound.
+ * test at all. What the ingress can deliver is what its MAC accepts, its MTU
+ * but never less than a full Ethernet frame (ft_port_arriving()): a port
+ * lowered to 1400 still receives 1500-byte frames, which the bridge would
+ * drop at a 1400-byte listener and the microcode would fragment. A flow whose
+ * ingress has gone has nothing left to bound.
  *
  * A route's copies are bounded by the same port: whatever the bridge hands the
  * host arrived there, and ipmr and ip6mr would drop or answer rather than
@@ -5694,7 +5743,7 @@ static bool ft_mc_mtu_bounded(const struct ft_mc_flow *f)
 
 	if (!f->in)
 		return true;
-	in_mtu = READ_ONCE(f->in->mtu);
+	in_mtu = ft_port_arriving(f->in);
 	for (i = 0; i < f->ports; i++)
 		if (READ_ONCE(f->port[i].dev->mtu) < in_mtu)
 			return false;
@@ -10129,12 +10178,24 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	 * raises an MFC event, so this is rechecked by the periodic refresh as
 	 * well as on NETDEV_CHANGEMTU.
 	 *
+	 * IPv4 is bounded by what arrives rather than by what the link is told:
+	 * the parent's port hands ipmr whatever its MAC accepts, its own MTU but
+	 * never less than a full Ethernet frame (ft_port_arriving()), so a
+	 * 1500-byte VLAN parent over a 9000-byte port, or a parent lowered to
+	 * 1400, delivers more than its own MTU.
+	 *
 	 * Through a bridge the bound is the bridge port the stream arrives on,
 	 * which the bridge hands up whatever the bridge device's own MTU, and
 	 * which only the bridged group knows: the plan carries the narrowest
 	 * copy for it to hold against that. */
-	if (spec.in && out_mtu < ft_mc_link_mtu(vif_dev, g->family))
-		return FT_MR_REFUSED_MTU;
+	if (spec.in) {
+		u32 arriving = ft_mc_link_mtu(vif_dev, g->family);
+
+		if (g->family == AF_INET)
+			arriving = max(arriving, ft_port_arriving(spec.in));
+		if (out_mtu < arriving)
+			return FT_MR_REFUSED_MTU;
+	}
 	/* An XFRM output policy Linux would apply to a copy, which hardware
 	 * cannot. Asked last, of oifs every test above has let through. The
 	 * generation is taken first, so a policy change after it is caught by
