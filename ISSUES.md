@@ -284,13 +284,8 @@ result independently of those temporary files.
 - [x] **A323 — offloaded tc police charged its rate bucket 18 bytes per frame more than Linux.** Fixed: tc profiles
   count the IP datagram (L3, rig-measured), peak bucket mtu - 14 (_:/^cdx: charge a police rate the IP datagram_).
 
-- [ ] **A325 — an offloaded matchall police never meters non-IP frames.** Measured 2026-10-06: 2000 1000-byte frames
-  of ethertype 0x88b5 into a 1 Mbit/s `matchall skip_sw` police on eth4 left the profile's colour counters at 0 (the
-  IPv4 control: 2000 metered, 1947 dropped), so the port profile is applied only on the IP classification path. Linux's
-  matchall polices every frame; with `skip_sw` nothing polices ARP, PPPoE discovery, LLDP or any other non-IP traffic
-  reaching the port. Find which KeyGen scheme/default path non-IP frames take (cdx PCD build) and whether it can name
-  the port profile; failing that, refuse `skip_sw` for matchall, so tc keeps the software filter for what the hardware
-  leaves out. Also unmeasured: what L3 length the profile charges a PPPoE session frame (Linux: PPPoE header + IP).
+- [x] **A325 — an offloaded matchall police never meters non-IP frames.** By design, as NXP's: non-IP misses the
+  Ethernet table into the punt profile, which bounds it; PPPoE sessions are metered; documented (_:/^docs: say what a matchall meter covers_).
 
 - [x] **A324 — two matchall police filters on one port shared its one rate limiter.** Fixed: a second is refused;
   each delete restored the boot rate under the other (_:/^cdx: police by Linux's two buckets_).

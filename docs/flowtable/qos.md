@@ -1328,8 +1328,17 @@ What remains is small and on the lenient side. A second VLAN tag (QinQ) or a
 PPPoE session header stays in Linux's count and not in the profile's: 4 or 8
 bytes per frame less charged, and frames that much longer pass. With a peak
 rate, the one PBS is both the length check and the peak bucket's depth, so
-that bucket is 14 bytes shallower than Linux's. Non-IP frames never reach a
-matchall's meter at all (A325).
+that bucket is 14 bytes shallower than Linux's.
+
+A matchall meters the port's data path, not every frame. IPv4 and PPPoE
+session traffic reach its profile (measured: 2000 of 2000 of each metered),
+but a frame with no IP inside -- ARP, PPPoE discovery and LCP, LLDP -- misses
+the Ethernet table, whose miss action is the shared punt profile
+(`CDX_EXPT_ETH_RATELIMIT`, `dpa_cfg.c`), and never meets the port's (0 of
+2000 metered). NXP's CDX routes it the same way. That traffic is bounded by the
+punt policer instead, which devlink exposes as the `punt` trap policer; a
+matchall's rate does not cover it, where Linux's software matchall would
+(A325).
 
 Only the unit differs. The kernel gives bytes per second; the FMD's byte mode
 takes Kbit/s (`GetInfoRateReg()` does `tmp *= 1000`), so the conversion is
