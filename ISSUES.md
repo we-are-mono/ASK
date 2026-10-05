@@ -305,11 +305,8 @@ result independently of those temporary files.
 - [x] **A308 — an IPsec SA release that found a queue non-empty or SEC busy leaked the SA (and its key tag) for the boot.**
   Fixed: per-tick release steps drain each queue and retire FROM_SEC only once SEC is proven done, so late SEC output is no longer lost (_:/^cdx: never abandon an IPsec SA release_).
 
-- [ ] **A309 — the routed multicast learner has no group cap and a pass can outrun its 5 s period.** Source-verified by the
-  audit; needs a multicast routing daemon, which no shipped profile starts. `ft_mr_work_fn()` (cdx/ask_flowtable.c) keeps
-  an uncapped group list, re-derives every group each `FT_MR_STATS_INTERVAL` with a head-first quadratic pick and an RTNL
-  hold per group; once a pass exceeds the interval the work never ends. Fix direction: cap groups like the bridged learner
-  (1.1.0) and resume a pass from a cursor.
+- [x] **A309 — the routed multicast learner followed groups without a cap, and a slow run never ended.** Fixed: 512
+  groups per family (`mroute_capped`), a per-run decision budget (_:/^cdx: cap the routed multicast learner_).
 
 - [ ] **A310 — unloading cdx leaves its clsact police/DSCP `flow_block` callbacks on DPAA tc blocks.** Source-verified by the
   audit. A later tc operation on that port calls freed module text. Production never unloads cdx (load-once); it needs

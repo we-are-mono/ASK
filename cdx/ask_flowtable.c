@@ -9529,6 +9529,16 @@ static LIST_HEAD(ft_mr_queue);
 static DEFINE_SPINLOCK(ft_mr_queue_lock);
 static struct ft_mr_vif ft_mr_vif[2][MAXVIFS];
 static unsigned int ft_mr_count, ft_mr_installed;
+/* The groups followed at once per family, the group ids cdx_mc has for each
+ * (shared with the bridged learner): every one is re-derived under RTNL each
+ * stats interval, and one past what the hardware could hold buys nothing. An
+ * MFC entry past it stays in software, counted in mroute_capped (each time
+ * the chain or a resync offers it), and the families it was turned away in
+ * (a bit each) are resynced once a group is freed, which picks it up if there
+ * is room. */
+#define FT_MR_MAX_GROUPS	512
+static unsigned long ft_mr_capped;
+static u64 ft_mr_capped_entries;
 static unsigned int ft_mr_policy[2];
 static u64 ft_mr_refused, ft_mr_install_errors, ft_mr_lost;
 static bool ft_mr_stopping;
@@ -11254,6 +11264,15 @@ static bool ft_mr_apply(struct ft_mr_event *ev)
 		return true;
 	}
 	if (!g) {
+		unsigned int family_groups = 0;
+
+		list_for_each_entry(g, &ft_mr_groups, list)
+			family_groups += g->family == ev->family;
+		if (family_groups >= FT_MR_MAX_GROUPS) {
+			ft_mr_capped_entries++;
+			set_bit(idx, &ft_mr_capped);
+			return true;
+		}
 		g = kzalloc(sizeof(*g), GFP_KERNEL);
 		if (!g)
 			return false;
@@ -12083,15 +12102,20 @@ static void ft_mr_work_fn(struct work_struct *work)
 {
 	struct ft_mr_group *g, *tmp;
 	struct ft_mr_event *ev;
-	unsigned int restarts = 0, xt_seq;
+	unsigned int restarts = 0, xt_seq, budget;
 	unsigned long unresolved;
-	bool retiring;
+	bool retiring, more = false;
 	LIST_HEAD(dead);
 
 	/* Registration may replay its dump after a sequence mismatch. Do not
 	 * apply those attempts before the initial authoritative resync. */
 	if (!smp_load_acquire(&ft_mr_ready))
 		return;
+	/* How many decisions this run makes before it hands the rest to the
+	 * next: every group twice, room for one rebuilt in the same run, and
+	 * no more, so a run ends even while the stats tick re-dirties groups
+	 * faster than they can be decided (each takes RTNL). */
+	budget = 2 * READ_ONCE(ft_mr_count) + 8;
 again:
 	retiring = false;
 	/* 1. What the chain saw. */
@@ -12193,6 +12217,16 @@ again:
 		list_del(&g->list);
 		ft_mr_group_free(g);
 	}
+	/* Room again for an entry the cap turned away: the resync, at the top
+	 * of the next run, finds it. */
+	if (retiring && READ_ONCE(ft_mr_capped) && !READ_ONCE(ft_mr_stopping)) {
+		unsigned long capped = xchg(&ft_mr_capped, 0);
+		unsigned int idx;
+
+		for_each_set_bit(idx, &capped, 2)
+			set_bit(idx, &ft_mr_resync_pending);
+		schedule_work(&ft_mr_work);
+	}
 
 	/* 5. One group per pass: the transaction is dropped between each,
 	 * because ft_mr_lock is never held across taking it.
@@ -12232,6 +12266,13 @@ again:
 		list_for_each_entry(g, &ft_mr_groups, list) {
 			if (!g->dirty || g->gone || ft_mr_stopping)
 				continue;
+			/* Spent: the next run, which the end of this one
+			 * queues, takes it. */
+			if (!budget) {
+				more = true;
+				break;
+			}
+			budget--;
 			target = g;
 			break;
 		}
@@ -12239,6 +12280,10 @@ again:
 			target->dirty = false;
 			target->busy = true;
 			retries = target->retries;
+			/* To the back of the list, so a run the stats tick
+			 * re-dirties every group behind reaches the tail
+			 * before it decides the head again. */
+			list_move_tail(&target->list, &ft_mr_groups);
 		}
 		mutex_unlock(&ft_mr_lock);
 		if (!target)
@@ -12267,6 +12312,7 @@ again:
 			mutex_lock(&ft_mr_lock);
 			target->busy = false;
 			target->dirty = true;
+			budget++;	/* handed back undecided */
 			mutex_unlock(&ft_mr_lock);
 			restarts++;
 			goto again;
@@ -12449,6 +12495,10 @@ again:
 		if (put_in)
 			dev_put(put_in);
 	}
+
+	/* What the budget left undecided is the next run's. */
+	if (more && !READ_ONCE(ft_mr_stopping))
+		schedule_work(&ft_mr_work);
 
 	/* The forwarding check exists while a group is watched; the ruleset is
 	 * followed while any group exists, and a settling one is looked at
@@ -15617,10 +15667,11 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * want of memory, which is the only way this learner's view can be
 	 * behind the kernel's. */
 	seq_printf(seq, "mroute_groups %u\nmroute_installed %u\nmroute_refused %llu\n"
-		   "mroute_install_errors %llu\nmroute_policy_rules %u\nmroute_lost %llu\n",
+		   "mroute_install_errors %llu\nmroute_policy_rules %u\nmroute_lost %llu\n"
+		   "mroute_capped %llu\n",
 		   ft_mr_count, ft_mr_installed, ft_mr_refused,
 		   ft_mr_install_errors, ft_mr_policy[0] + ft_mr_policy[1],
-		   ft_mr_lost);
+		   ft_mr_lost, ft_mr_capped_entries);
 	/* XFRM policy changes every routed group was asked again for; an IPv4
 	 * group a policy governs reads refused-xfrm. */
 	seq_printf(seq, "mroute_xfrm_changes %lld\n", atomic64_read(&ft_mr_xfrm_changes));

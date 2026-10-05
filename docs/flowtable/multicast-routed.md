@@ -936,6 +936,7 @@ mroute_refused 1
 mroute_install_errors 0
 mroute_policy_rules 0
 mroute_lost 0
+mroute_capped 0
 mroute_xfrm_changes 0
 mroute_ruleset_changes 3
 mroute_ruleset_settled 1

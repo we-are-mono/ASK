@@ -454,13 +454,17 @@ static void strscpy(char *dst, const char *src, size_t size)
 static LIST_HEAD(ft_mr_groups);
 static int ft_mr_lock;
 static unsigned int ft_mr_count;
+/* The families an MFC entry was turned away in at FT_MR_MAX_GROUPS. */
+static unsigned long ft_mr_capped;
+static u64 ft_mr_capped_entries;
+static void set_bit(unsigned int nr, unsigned long *addr) { *addr |= 1UL << nr; }
 static unsigned int ft_mr_policy[2];
 /* The `multicast` parameter both learners answer to, on at load. */
 static bool ft_mc_enabled = true;
 /* Set by a VIF change for the worker, which is not compiled here. */
 static bool ft_mr_taps_stale;
 __attribute__((unused)) static unsigned int ft_mr_installed;
-__attribute__((unused)) static u64 ft_mr_refused;
+static u64 ft_mr_refused;
 __attribute__((unused)) static u64 ft_mr_install_errors;
 
 /* --- the output route and policy an IPv4 copy meets ------------------- */
@@ -2041,6 +2045,58 @@ int main(void)
             free(dead);
         }
         ft_mr_count = 0;
+        assert(cache_holds == 0 && holds == 0);
+    }
+
+    /* ---- the cap on groups followed ----------------------------------- */
+
+    reset();
+    {
+        static struct mfc_cache entries[FT_MR_MAX_GROUPS + 1];
+        static struct mfc6_cache v6;
+        struct ft_mr_event ev;
+        u64 refused = ft_mr_refused, capped = ft_mr_capped_entries;
+
+        memset(&ev, 0, sizeof(ev));
+        ev.event = FIB_EVENT_ENTRY_ADD;
+        ev.family = AF_INET;
+        ev.table = RT_TABLE_DEFAULT;
+        for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+            entries[i].mfc_origin = ip4(10, 0, 0, 52);
+            entries[i].mfc_mcastgrp = ip4(239, 9, i >> 8, i & 0xff);
+            ev.mfc = &entries[i]._c;
+            assert(ft_mr_apply(&ev));
+        }
+        /* One past the cap is not followed, not lost: counted capped, with
+         * its family marked for a resync once a group is freed. */
+        assert(ft_mr_count == FT_MR_MAX_GROUPS && cache_holds == FT_MR_MAX_GROUPS);
+        assert(ft_mr_capped_entries == capped + 1 && ft_mr_refused == refused);
+        assert(!ft_mr_find(&entries[FT_MR_MAX_GROUPS]._c));
+        assert(ft_mr_capped == 1UL << ft_mr_idx(AF_INET));
+        /* A group already followed is still answered at the cap. */
+        ev.event = FIB_EVENT_ENTRY_REPLACE;
+        ev.mfc = &entries[0]._c;
+        ft_mr_find(&entries[0]._c)->dirty = false;
+        assert(ft_mr_apply(&ev) && ft_mr_find(&entries[0]._c)->dirty);
+        assert(ft_mr_count == FT_MR_MAX_GROUPS && ft_mr_capped_entries == capped + 1);
+        /* The cap is per family, as the hardware's group ids are: IPv4 at
+         * its limit leaves IPv6 room. */
+        ev.event = FIB_EVENT_ENTRY_ADD;
+        ev.family = AF_INET6;
+        ev.table = RT6_TABLE_DFLT;
+        ev.mfc = &v6._c;
+        assert(ft_mr_apply(&ev) && ft_mr_find(&v6._c));
+        assert(ft_mr_count == FT_MR_MAX_GROUPS + 1 && ft_mr_capped_entries == capped + 1);
+
+        while (ft_mr_groups.next != &ft_mr_groups) {
+            struct ft_mr_group *dead = list_entry(ft_mr_groups.next,
+                                                  struct ft_mr_group, list);
+            list_del(&dead->list);
+            mr_cache_put(dead->mfc);
+            free(dead);
+        }
+        ft_mr_count = 0;
+        ft_mr_capped = 0;
         assert(cache_holds == 0 && holds == 0);
     }
 

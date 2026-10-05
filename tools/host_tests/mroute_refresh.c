@@ -46,6 +46,8 @@ static void list_move(struct list_head *n, struct list_head *h)
 { list_del(n); list_add(n, h); }
 static void list_add_tail(struct list_head *n, struct list_head *h)
 { n->next = h; n->prev = h->prev; h->prev->next = n; h->prev = n; }
+static void list_move_tail(struct list_head *n, struct list_head *h)
+{ list_del(n); list_add_tail(n, h); }
 static bool list_empty(const struct list_head *h) { return h->next == h; }
 #define list_for_each_entry(p, h, m) \
     for (p = container_of((h)->next, __typeof__(*p), m); &p->m != h; \
@@ -210,6 +212,11 @@ static bool ft_mr_ready;
 /* The `multicast` parameter both learners answer to, on at load. */
 static bool ft_mc_enabled = true;
 static unsigned long ft_mr_resync_pending;
+/* The families an entry was turned away in at the group cap. */
+static unsigned long ft_mr_capped;
+static void set_bit(unsigned n, unsigned long *p) { *p |= 1UL << n; }
+#define for_each_set_bit(bit, addr, size) \
+    for ((bit) = 0; (bit) < (size); (bit)++) if ((*(addr) >> (bit)) & 1)
 /* The ruleset's answer for a confirmed group, as nft_port_dependent() gives
  * it: whether its packets could fare apart from the copies that confirmed
  * it -- 0 alike, 1 not, negative not judged. It asks under RTNL, of the
@@ -605,12 +612,17 @@ static unsigned long ft_mr_resync(void)
 /* The stream arrives tagged on its port: a spec the root validates the tag
  * of, which a rebuild has to carry as well. */
 static bool tagged_ingress;
+/* Something re-dirties the group while each decision is made, as the stats
+ * tick does to every group when a run takes longer than its interval. */
+static bool redirty_during_derive;
 static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p)
 {
     assert(rtnl);
     if (!list_empty(&ft_mr_queue))
         derived_behind++;
     derives++;
+    if (redirty_during_derive)
+        g->dirty = true;
     if (change_during_derive) {
         /* Under RTNL, as the tc caller is: the group is the worker's, and
          * still holds what it installed. */
@@ -1195,6 +1207,22 @@ int main(void)
         assert(adds == added + 1 && replaces == replaced + 1);
         assert(hardware.live && !g->egress_stale && !g->dirty);
         assert(hardware.built_at == ft_egress_changes);
+    }
+
+    /* A group re-dirtied as fast as it is decided -- the stats tick on a run
+     * slower than its interval -- does not keep one run going for ever
+     * (A309): the run spends its budget, queues the next and returns. */
+    {
+        unsigned d0 = derives;
+
+        g->dirty = true;
+        redirty_during_derive = true;
+        run();
+        redirty_during_derive = false;
+        assert(derives - d0 == 2 * ft_mr_count + 8);
+        assert(g->dirty && ft_mr_work.queued);
+        run();
+        assert(!g->dirty && derives - d0 == 2 * ft_mr_count + 9);
     }
 
     /* A DSCP filter's drain cannot wait for the worker: the worker takes

@@ -37,6 +37,7 @@ def test_mroute_learner(tmp_path):
     header = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
     (tmp_path / "mroute_learner.inc").write_text(
         re.search(r"^#define FT_MR_OIF_TEXT\b.*\n", source, re.M).group(0)
+        + re.search(r"^#define FT_MR_MAX_GROUPS\b.*\n", source, re.M).group(0)
         + declaration(header, "cdx_mc_listener")
         + declaration(header, "cdx_mc_group_spec")
         + source[enum_start:source.index("};", enum_start) + 3]
@@ -534,6 +535,8 @@ def test_proc_reports_a_row_and_a_summary():
     assert "ft_mr_rows(seq);" in show
     for key in ("mroute_groups", "mroute_installed", "mroute_refused",
                 "mroute_install_errors", "mroute_policy_rules",
+                # Entries the per-family group cap turned away (A309).
+                "mroute_capped",
                 "mroute_xfrm_changes", "mroute_ruleset_changes",
                 "mroute_ruleset_settled", "mroute_confirm_errors",
                 "mroute_port_probe_errors", "mroute_xtables_changes",
