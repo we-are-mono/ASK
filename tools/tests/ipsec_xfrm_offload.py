@@ -29,7 +29,7 @@ from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
 from _flowtable_rig import (artifact_dir, console_python)
 
-# Documentation-range addresses (RFC 2544 benchmarking block), distinct from
+# Addresses from the RFC 2544 benchmarking block (198.18.0.0/15), distinct from
 # every other IPsec file's so the tests can run in any order.
 LOCAL = "198.18.86.1"
 PEER = "198.18.86.2"

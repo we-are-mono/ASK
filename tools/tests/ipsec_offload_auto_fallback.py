@@ -41,7 +41,7 @@ from _flowtable_rig import (artifact_dir, console_command, read)
 from _flowtable_service_ipsec_replay import (xfrm_mib)
 from _ipsec_inbound_flow_offload import (crypto)
 
-# Documentation-range addresses (RFC 2544 benchmarking block), distinct from
+# Addresses from the RFC 2544 benchmarking block (198.18.0.0/15), distinct from
 # every other IPsec file's.
 LOCAL = "198.18.233.1"
 PEER = "198.18.233.2"

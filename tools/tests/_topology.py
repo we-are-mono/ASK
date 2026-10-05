@@ -13,6 +13,7 @@ existing primitives.
 from __future__ import annotations
 import asyncio
 import errno
+import json
 import os
 import aiohttp
 import pytest_asyncio
@@ -199,6 +200,16 @@ async def lan_run(lan, cmd: str, timeout: float = 10.0):
     return await asyncio.to_thread(lan.run, cmd, timeout)
 
 
+async def has_address(agent, session, interface: str, address: str) -> bool:
+    """Whether `interface` on the agent's host already holds IPv6 `address`.
+    A fixture that finds one there, such as the address the image gives the
+    DUT's WAN port, uses it and leaves it behind at teardown."""
+    result = checked(await agent.exec_cmd(session, ["ip", "-j", "-6", "addr", "show",
+                                                    "dev", interface]))
+    return any(a.get("local") == address
+               for link in json.loads(result["stdout"] or "[]") for a in link["addr_info"])
+
+
 async def lan_run_python(
     lan,
     script: str,
@@ -349,16 +360,16 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
                         f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF)
         cleanup.push(_del_dut_lan)
 
-        await _exec("ip", "-6", "addr", "del",
-                    f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, check=False)
-        r = await _exec("ip", "-6", "addr", "add",
-                        f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, "nodad")
-        assert r["rc"] == 0, f"DUT {TARGET_WAN_IF} v6 addr: {r}"
+        # The image addresses the WAN port itself; that address stays.
+        if not await has_address(target_agent, aiohttp_session, TARGET_WAN_IF, DUT_IPV6_WAN):
+            r = await _exec("ip", "-6", "addr", "add",
+                            f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, "nodad")
+            assert r["rc"] == 0, f"DUT {TARGET_WAN_IF} v6 addr: {r}"
 
-        async def _del_dut_wan():
-            await _exec("ip", "-6", "addr", "del",
-                        f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
-        cleanup.push(_del_dut_wan)
+            async def _del_dut_wan():
+                await _exec("ip", "-6", "addr", "del",
+                            f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
+            cleanup.push(_del_dut_wan)
 
         # ---- LAN address + default route ----
         await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null", check=False)

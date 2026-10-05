@@ -23,6 +23,7 @@ from _topology import (
     TARGET_WAN_IF,
     VIRT_IPV6,
     WAN_IPV6,
+    has_address,
     lan_ipv6_default,
     lan_run,
     lan_run_python,
@@ -212,9 +213,11 @@ async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
 
         # nodad on every static address: DAD would leave it tentative for
         # ~1.5s and the first flow of the session would silently not come up.
+        # One the image configures itself (the WAN port's) is left as it is,
+        # or teardown would take it from every test after this one.
         for address, interface in ((DUT_IPV6_LAN, TARGET_LAN_IF), (DUT_IPV6_WAN, TARGET_WAN_IF)):
-            await target("ip", "-6", "addr", "del", f"{address}/64", "dev", interface,
-                         check=False)
+            if await has_address(r.target, r.session, interface, address):
+                continue
             await target("ip", "-6", "addr", "add", f"{address}/64", "dev", interface, "nodad")
             cleanup.push(lambda a=address, i=interface: target(
                 "ip", "-6", "addr", "del", f"{a}/64", "dev", i, check=False))

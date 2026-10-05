@@ -56,7 +56,8 @@ from _ipsec_helpers import (
 )
 from _topology import TARGET_WAN_IF
 
-# Documentation-range endpoints, distinct from every other IPsec file's so the
+# Endpoints from the RFC 2544 benchmarking block (198.18.0.0/15), which no
+# real network routes, and distinct from every other IPsec file's so the
 # tests can run in any order.
 LOCAL = "198.18.87.1"
 PEER = "198.18.87.2"

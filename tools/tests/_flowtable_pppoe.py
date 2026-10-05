@@ -79,9 +79,11 @@ TAGGED_SUBNET, DUT_TAGGED_ADDR, LAN_TAGGED_ADDR = "172.29.76.0/24", "172.29.76.1
 SNAT_ADDR = "172.29.76.9"
 NAT_TABLE = "ask_pppoe_nat"
 
-# The session's own MTU, which pppd negotiates as the underlying device's less
-# the eight bytes a PPPoE header costs. Nothing here sets it; that it arrives
-# at 1492 on its own is part of what the MTU case proves.
+# The session's MTU: what both ends configure (mtu/mru below), the most a
+# 1500-byte device carries under the eight-byte PPPoE header. pppd takes the
+# smaller of it and the peer's MRU, and the concentrator clamps its MRU to its
+# own device's MTU less eight, so a short server device lowers the session
+# (_server_start() refuses one).
 SESSION_MTU = 1492
 
 # Seconds between the LCP echo requests each end of the session sends. Both
@@ -180,6 +182,14 @@ def _server_start(ipv6=False):
     server = "/usr/sbin/pppoe-server"
     if not os.access(server, os.X_OK):
         pytest.skip(f"{server} not installed on the orchestrator")
+    # The concentrator clamps its MRU to the device's MTU less the 8-byte
+    # session header, and the DUT's link then takes the smaller value. A
+    # short device would leave the session below SESSION_MTU, and every case
+    # asserting that MTU would fail as an admission or offload problem. A
+    # VLAN keeps a lowered MTU when its parent's MTU drops and comes back.
+    server_mtu = int(pathlib.Path(f"/sys/class/net/{SERVER_IF}/mtu").read_text())
+    assert server_mtu >= SESSION_MTU + 8, \
+        f"{SERVER_IF} MTU {server_mtu} cannot carry a {SESSION_MTU}-byte session"
     _server_clear(server)
     pathlib.Path(SERVER_SECRETS).write_text(
         f'"{PPPOE_USER}"   *   "{PPPOE_SECRET}"   *\n')

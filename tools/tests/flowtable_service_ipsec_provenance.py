@@ -58,6 +58,20 @@ async def test_ipsec_provenance_misses_and_mtu(ipsec_service):
         await p.batch([2], count=32, interval=0.03)
         await r.wait(lambda s: KEY in by_key(s))
         spi = r.ipsec.active["in"]
+        # The MTU cases first, while the flow under test is fresh in hardware;
+        # their injections are on its own tuple and keep it there. Once the
+        # injected sequence numbers lead, the peer's own replies fall behind
+        # the replay window, so nothing else can refresh the flow -- and the
+        # MAC-miss cycles below, on other ports, take about the flowtable's
+        # 30 s timeout between them. Each block's sequence numbers follow the
+        # last one's.
+        for cycle, size in enumerate([256, 1100, 1200]):
+            result = await inject(r, p, spi, b"ASK-MAC-MTU-" + secrets.token_bytes(8),
+                                  size=size, seq=100000 + cycle * COUNT)
+            assert result["wire"]["received"] == COUNT, result
+            assert result["software_forwarded"] == 0, result
+            assert all(s["length"] == size + 14 for s in result["wire"]["samples"]), result
+            healthy(result["after"])
         for cycle in range(4):
             mac = f"02:53:00:12:34:{cycle:02x}"
             counter = f"original_mac_{cycle}"
@@ -66,7 +80,7 @@ add counter inet {OBSERVE_TABLE} {counter}
 add rule inet {OBSERVE_TABLE} forward ether saddr {mac} ip saddr {INNER} udp sport {DPORT + cycle + 1} counter name {counter}
 """)
             result = await inject(r, p, spi, b"ASK-MAC-MISS-" + secrets.token_bytes(8),
-                                  sport=DPORT + cycle + 1, seq=100000 + cycle * COUNT,
+                                  sport=DPORT + cycle + 1, seq=100000 + (cycle + 3) * COUNT,
                                   source_mac=mac)
             assert result["wire"]["received"] == COUNT, result
             observed = await command(r.target, r.session, "nft", "-j", "list", "counter",
@@ -75,13 +89,6 @@ add rule inet {OBSERVE_TABLE} forward ether saddr {mac} ip saddr {INNER} udp spo
                       json.loads(observed["stdout"])["nftables"] if "counter" in item]
             r.record(counter, {"source_mac": mac, "counts": counts})
             assert counts == [COUNT], "Linux must observe each packet's original source MAC"
-            healthy(result["after"])
-        for cycle, size in enumerate([256, 1100, 1200]):
-            result = await inject(r, p, spi, b"ASK-MAC-MTU-" + secrets.token_bytes(8),
-                                  size=size, seq=100000 + (cycle + 4) * COUNT)
-            assert result["wire"]["received"] == COUNT, result
-            assert result["software_forwarded"] == 0, result
-            assert all(s["length"] == size + 14 for s in result["wire"]["samples"]), result
             healthy(result["after"])
 
 

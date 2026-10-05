@@ -5,8 +5,8 @@ storm of IPv6-fragmented UDP packets through the DUT's reassembly
 path; gates on splat_window for sanitizer hits and kmemleak filtered
 to reassembly-symbol needles for in-subsystem leaks.
 
-KASAN-eligible — same fragment-pool kmalloc code path as the IPv4
-storm, just exercised through the IPv6 path.
+KASAN-eligible — reassembly is Linux's, in its IPv6 fragment queues, as the
+IPv4 storm's is in the IPv4 ones.
 """
 
 from __future__ import annotations
@@ -20,14 +20,14 @@ import pytest
 from _topology import (lan_run_python)
 
 
-# Same filter set as the IPv4 storm — reassembly is IPv4/IPv6-shared.
+# The IPv6 counterpart of the IPv4 storm's filter: the shared fragment-queue
+# allocator, the stack's own reassembly and conntrack's defragmentation.
+# Limiting matches to them keeps hardware-owned DPAA buffers, which kmemleak's
+# pointer scanner cannot see, from reading as leaks.
 REASSM_LEAK_FILTER = [
-    "cdx_init_ip_reassembly",
-    "cdx_create_ipr_fq",
-    "replenish_ipr_frag_pool",
-    "cdx_get_ipr_v4_stats",
-    "cdx_get_ipr_v6_stats",
-    "ip_reassembly_frag_list",
+    "inet_frag_alloc", "inet_frag_create",
+    "ip6_frag_queue", "ip6_frag_reasm", "ipv6_frag_rcv",
+    "nf_ct_frag6_gather", "nf_ct_frag6_queue", "nf_ct_frag6_reasm",
 ]
 
 
