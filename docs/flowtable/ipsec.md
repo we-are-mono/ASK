@@ -848,35 +848,20 @@ traffic whatever its sequence number. `CONFIG_XFRM_MIGRATE` is off in the
 shipped configuration; if it is ever enabled, MIGRATE must be refused for
 packet-offloaded states.
 
-One case is open. With ESN, the PDB is seeded with the window top's high word.
+One case was open. With ESN, the PDB is seeded with the window top's high word.
 The SEC RM says SEC holds its own stored ESN back after a rollover until the
 whole window is past it ("Optional use of ESN in ESP decapsulation"). In the
 first window-width of numbers after a rollover, the stored ESN is therefore
 one below the top's. The RM does not say which value SEC expects of a window
 seeded inside that stretch, or how it tells that stretch from the start of a
-fresh SA, whose window also reaches below number zero. A wrong choice fails
-every frame's ICV. The rig settles it:
-
-1. Add an inbound ESN SA on the DUT with `replay-window 64 flag esn
-   replay-seq-hi 1 replay-seq 5 offload packet`. Give the peer's matching
-   outbound ESN SA `replay-oseq-hi 1 replay-oseq 5`, so that its next frames
-   are (1, 6), (1, 7), and so on. Send 20 frames through the tunnel.
-2. Do the same with `replay-seq 200` and `replay-oseq 200`, which is outside
-   the stretch. Both readings agree there, so this is the control.
-3. Add an inbound ESN SA seeded at (0, 0xffffffe0), which is outside the
-   stretch, with the peer starting at `replay-oseq-hi 0 replay-oseq
-   0xffffffe0`. Send frames across the rollover. After 10 post-rollover
-   frames, and again after 70, read the SA's replay state with
-   `ip xfrm state`. The pass publishes the PDB's numbers, so a top at
-   `seq_hi 1` after 10 frames means SEC stores the top's high word. A top still
-   at `seq_hi 0` until the window has passed means SEC stores the window
-   bottom's.
-
-In each step, count what the LAN side receives, and what SEC refused:
-`ipsec_sec_refused` in `/proc/cdx_flowtable` (next subsection; per SA there is
-no count). With the top's convention, every step delivers all its frames. With
-the bottom's, step 1 refuses all 20 as ICV failures while step 2 delivers, and
-`cdx_ipsec_build_in_replay()` then has to seed `hi - 1` inside the stretch.
+fresh SA, whose window also reaches below number zero. A wrong choice would
+fail every frame's ICV. The rig settled it: SEC takes the window top's high
+word, which is what `cdx_ipsec_build_in_replay()` seeds.
+`flowtable_service_ipsec_lifetime.py::test_inbound_esn` installs an inbound
+ESN SA with a 64-frame window at (1, 5), inside that stretch, at (1, 200), the
+control outside it, and at (0, 0xffffffe0), sending 80 echoes across the low
+word wrapping. Every case delivers every frame, and the replay state xfrm is
+given back ends at the last number the peer sent, high word included.
 
 #### Frames SEC refuses
 

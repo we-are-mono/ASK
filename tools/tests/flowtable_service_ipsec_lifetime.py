@@ -31,6 +31,7 @@ from _flowtable_selective_neighbour import (keys)
 from _flowtable_service import (FIRST)
 from _flowtable_service_ipsec import (INNER, LAN_INNER, Wire, flows_for, sec_counter)
 from _flowtable_service_ipsec_replay import (peer_errors, sa_state, xfrm_mib)
+from _ipsec_helpers import sa_replay_state
 
 # The accounting pass runs once a second, so a limit fires on the first pass
 # after it is crossed. This allows for that period and the jitter of a
@@ -352,3 +353,54 @@ async def test_starting_sequence(ipsec_service):
         # Neither SA above came near the end of its space.
         for spi in spis:
             assert not await monitor.expiries(spi), spi
+
+
+async def replace_inbound(r, *options, peer=()):
+    """Swap the fixture's inbound SA for one installed with `options` on the
+    DUT and `peer` on the WAN host, which sends on it."""
+    spi = await r.ipsec.prepare_peer("in", *peer)
+    await r.ipsec.remove("in")
+    await r.ipsec.install("in", spi, *options)
+    return spi
+
+
+# Where an inbound ESN SA starts, as (high word, low word), and how many echoes
+# cross it. The first sits in the window-width after a rollover, where SEC holds
+# its stored high word back (RFC 4303 App. A; ipsec.md); the second is the
+# control outside it; the third crosses the rollover itself, 32 frames before
+# it and 48 after.
+ESN_WINDOW = 64
+ESN_CASES = {
+    "after-rollover": ((1, 5), 20),
+    "control": ((1, 200), 20),
+    "across-rollover": ((0, 0xFFFFFFE0), 80),
+}
+
+
+@pytest.mark.parametrize("case", list(ESN_CASES))
+async def test_inbound_esn(ipsec_service, case):
+    """An inbound ESN SA authenticates with the right high word wherever its
+    window starts and across the low word wrapping (RFC 4303 2.2.1), and the
+    replay state published back into xfrm carries the high word over."""
+    r = ipsec_service
+    (hi, lo), count = ESN_CASES[case]
+    spi = await replace_inbound(
+        r, "flag", "esn", "replay-window", str(ESN_WINDOW),
+        "replay-seq-hi", str(hi), "replay-seq", hex(lo),
+        peer=("flag", "esn", "replay-oseq-hi", str(hi), "replay-oseq", hex(lo)))
+    before = xfrm_mib(Path("/proc/net/xfrm_stat").read_text())
+    echoed = await echoes(r, count)
+    last = (hi << 32 | lo) + count
+    deadline = time.monotonic() + 3
+    while True:
+        state = await sa_replay_state(r.target, r.session, dst=r.ipsec.outer, spi=spi)
+        if state["seq"] == last or time.monotonic() > deadline:
+            break
+        await asyncio.sleep(0.25)
+    figures = await sa_state(r, spi, "in")
+    record = {"case": case, "spi": spi, "echoed": echoed, "replay": state, "sa": figures,
+              "peer_refused": peer_errors(before), "start": [hi, lo], "last": last}
+    r.record(f"ipsec-inbound-esn-{case}", record)
+    assert echoed == count, record
+    assert figures["replay"][1:] == [0, 0], record
+    assert state["seq"] == last, record
