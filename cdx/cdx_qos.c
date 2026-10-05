@@ -428,9 +428,14 @@ int cdxdrv_release_shared_policers(struct cdx_fman_info *finfo)
  * `cbs`/`pbs` of zero mean "use the burst this port's speed implies", which is
  * what restoring the boot-time rate does. A tc police action carries its own
  * burst and passes it through.
+ *
+ * `drop_yellow` is tc's: Linux passes only what fits both of its buckets,
+ * which is green. The boot-time rate passes yellow, holding the port to its
+ * peak pair.
  */
 static int port_plcr_set(char *ifname, uint32_t rate_mode,
-			 uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs)
+			 uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs,
+			 bool drop_yellow)
 {
 	void *handle;
 	int hardwarePortId;
@@ -500,8 +505,13 @@ static int port_plcr_set(char *ifname, uint32_t rate_mode,
 	}
 	Params.nextEngineOnGreen = e_FM_PCD_PRS;
 	Params.paramsOnGreen.action = e_FM_PCD_ENQ_FRAME;
-	Params.nextEngineOnYellow = e_FM_PCD_PRS;
-	Params.paramsOnYellow.action = e_FM_PCD_ENQ_FRAME;
+	if (drop_yellow) {
+		Params.nextEngineOnYellow = e_FM_PCD_DONE;
+		Params.paramsOnYellow.action = e_FM_PCD_DROP_FRAME;
+	} else {
+		Params.nextEngineOnYellow = e_FM_PCD_PRS;
+		Params.paramsOnYellow.action = e_FM_PCD_ENQ_FRAME;
+	}
 	Params.nextEngineOnRed = e_FM_PCD_DONE;
 	Params.paramsOnRed.action = e_FM_PCD_DROP_FRAME;
 	handle = FM_PCD_PlcrProfileSet(port_rate_lim_mode[hardwarePortId].h_FmPcd, &Params);
@@ -527,7 +537,7 @@ int cdx_port_police_set(char *ifname, bool byte_mode,
 {
 	return port_plcr_set(ifname,
 			     byte_mode ? e_FM_PCD_PLCR_BYTE_MODE : e_FM_PCD_PLCR_PACKET_MODE,
-			     cir, pir, cbs, pbs);
+			     cir, pir, cbs, pbs, true);
 }
 
 /* Removing the filter returns the port to the rate it booted with, rather than
@@ -546,7 +556,7 @@ int cdx_port_police_clear(char *ifname)
 		cir = DEFAULT_PORT_FF_CIR_VALUE_10G;
 		pir = DEFAULT_PORT_FF_PIR_VALUE_10G;
 	}
-	return port_plcr_set(ifname, port_ff_lim_mode, cir, pir, 0, 0);
+	return port_plcr_set(ifname, port_ff_lim_mode, cir, pir, 0, 0, false);
 }
 
 /* The colours a profile counted. Read without clearing: the counters have
@@ -698,8 +708,9 @@ int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *finfo)
 	return 0;
 }
 
-/* api to modify ingress qos policer parameters */
-int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs)
+/* api to modify ingress qos policer parameters. `drop_yellow` as for
+ * port_plcr_set(): tc's meters pass green alone, the SEC profile yellow too. */
+int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs, bool drop_yellow)
 {
 	void *handle;
 	t_FmPcdPlcrProfileParams Params;
@@ -758,8 +769,13 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 
 	Params.nextEngineOnGreen = e_FM_PCD_CC;
 	Params.paramsOnGreen.action = e_FM_PCD_POST_POLICER_PROCES_FRAME;
-	Params.nextEngineOnYellow = e_FM_PCD_CC;
-	Params.paramsOnYellow.action = e_FM_PCD_POST_POLICER_PROCES_FRAME;
+	if (drop_yellow) {
+		Params.nextEngineOnYellow = e_FM_PCD_DONE;
+		Params.paramsOnYellow.action = e_FM_PCD_DROP_FRAME;
+	} else {
+		Params.nextEngineOnYellow = e_FM_PCD_CC;
+		Params.paramsOnYellow.action = e_FM_PCD_POST_POLICER_PROCES_FRAME;
+	}
 	Params.nextEngineOnRed = e_FM_PCD_DONE;
 	Params.paramsOnRed.action = e_FM_PCD_DROP_FRAME;
 	handle = FM_PCD_PlcrProfileSet(finfo->pcd_handle, &Params);
@@ -768,6 +784,7 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 				__func__, queue_no);
 		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
 	}
+	finfo->ingress_policer_info[queue_no].drop_yellow = drop_yellow;
 	finfo->ingress_policer_info[queue_no].cir_value = cir;
 	finfo->ingress_policer_info[queue_no].pir_value = pir;
 	finfo->ingress_policer_info[queue_no].cbs = cbs;
@@ -855,6 +872,7 @@ int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t
 		finfo->ingress_policer_info[queue_no].pbs = DEFAULT_SEC_PKT_MODE_PBS;
 	}
 #endif /* endif for SEC_PROFILE_SUPPORT */
+	finfo->ingress_policer_info[queue_no].drop_yellow = false;
 #ifdef QOS_DEBUG
 	printk("%s::plcr profile set to default for queue %d, handle %p\n",
 			__func__, queue_no, handle);
@@ -873,7 +891,8 @@ int cdxdrv_enable_or_disable_ingress_policer(struct cdx_fman_info *finfo, uint32
 					queue_no,finfo->ingress_policer_info[queue_no].cir_value,
 					finfo->ingress_policer_info[queue_no].pir_value,
 					finfo->ingress_policer_info[queue_no].cbs,
-					finfo->ingress_policer_info[queue_no].pbs);
+					finfo->ingress_policer_info[queue_no].pbs,
+					finfo->ingress_policer_info[queue_no].drop_yellow);
 		}
 	}
 	else {

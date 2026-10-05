@@ -1591,7 +1591,7 @@ int cdx_ingress_enable_or_disable_qos(uint32_t fm_index,uint32_t queue_no,uint32
 	return cdxdrv_enable_or_disable_ingress_policer(finfo,queue_no,oper);
 
 }
-int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs)
+int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs, bool drop_yellow)
 {
 	struct cdx_fman_info *finfo;
 
@@ -1603,7 +1603,7 @@ int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32
 	if (!finfo->ingress_policer_info[queue_no].handle)
 		return ERR_QM_INGRESS_POLICER_HANDLE_NULL;
 
-	return cdxdrv_modify_ingress_qos_policer_profile(finfo,queue_no,cir,pir,cbs,pbs);
+	return cdxdrv_modify_ingress_qos_policer_profile(finfo,queue_no,cir,pir,cbs,pbs,drop_yellow);
 }
 
 /* The peak rate and burst one ingress profile enforces, when it is metering at

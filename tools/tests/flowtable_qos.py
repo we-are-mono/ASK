@@ -30,6 +30,8 @@ iperf3 on the LAN VM and on the orchestrator.
 """
 from __future__ import annotations
 
+import pytest
+
 from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HIGH, PORT_LOW, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, TCP_FRAME, TCP_PAYLOAD
 
 from _flowtable_qos import (CAP_MBIT, COUNT, DATAGRAM, EF_TOS, OAL, OFFERED_MBIT, POLICE_BURST, PORT_DECLINED, PORT_DEFAULT, PORT_EF_REPLACED, PORT_EGRESS, PORT_POLICED, PORT_SATURATE, PORT_SHAPED, PROBE_SLACK, REMARK_CLASS, REMARK_MASK, SETTLE, TAIL_FRAMES, UDP_HEADERS, UNSHAPED_GBPS, WEIGHTED_CQ, WINDOW, WRED_BANDS, WRED_LIMIT, WRED_MBIT, WRED_PROBABILITY, admit, captured, conntrack_ids, directions, dut_ping, ef_filter, egress, handshakes, inbound, iperf, lan_start, leaf_delta, lockstep, logged, offered, offload, police_counters, probe, qdisc_shown, read_intervals, readmitted, received_bps, received_loss, reload_adapter, shaped_bps, timing_slack, tree)
@@ -1227,6 +1229,107 @@ async def test_flower_police_caps_the_flow(qos):
     # The profile meters the frame the port received, headers and all.
     expected = cap * DATAGRAM / (DATAGRAM + UDP_HEADERS)
     assert 0.9 * expected <= goodput <= 1.03 * expected, (goodput, expected)
+
+
+# Linux's police passes a frame only when it fits both buckets -- the rate's,
+# `burst` deep, and the peak rate's, `mtu` deep -- and never one longer than
+# `mtu` (tcf_police_act()). A peak rate therefore bounds bursts, not the rate:
+# what crosses is the committed rate. RFC 2698's yellow, above the committed
+# rate and within the peak, is excess to Linux, and has to be dropped.
+TWO_RATE = {
+    # Committed rate half the cap, peak at the cap: the cap must not be what
+    # comes through.
+    "peak": (CAP_MBIT // 2, CAP_MBIT, 9216, CAP_MBIT // 2),
+    # Every frame is longer than the mtu: none fits, whatever the rate.
+    "oversize": (CAP_MBIT, None, 1000, 0),
+}
+
+
+@pytest.mark.parametrize("case", list(TWO_RATE))
+async def test_flower_police_follows_linux_buckets(qos, case):
+    """A police action with a peak rate, or an mtu shorter than the frames,
+    delivers in hardware what Linux's police would."""
+    r = qos
+    dev = TARGET_WAN_IF
+    rate, peak, mtu, through = TWO_RATE[case]
+    target = f"{r.lan_ip}:{PORT_POLICED}"
+    second = ["peakrate", f"{peak}mbit"] if peak else []
+    await r.tc("qdisc", "add", "dev", dev, "clsact")
+    await r.tc("filter", "add", "dev", dev, "ingress", "protocol", "ip", "pref", "1",
+               "flower", "skip_sw", "ip_proto", "udp", "dst_ip", r.lan_ip,
+               "dst_port", str(PORT_POLICED),
+               "action", "police", "rate", f"{rate}mbit", *second, "burst", POLICE_BURST,
+               "mtu", str(mtu), "conform-exceed", "drop")
+    installed = (await r.tc("-s", "filter", "show", "dev", dev, "ingress"))["stdout"]
+    assert "in_hw" in installed, installed
+    await offload(r, inbound(r, "udp", PORT_POLICED))
+    await lan_start(r, iperf=[PORT_POLICED])
+    report = await iperf(r, PORT_POLICED, udp_mbit=OFFERED_MBIT)
+    state = await r.state()
+    shown = (await r.tc("-s", "filter", "show", "dev", dev, "ingress"))["stdout"]
+    metered, dropped = police_counters(shown)
+    forward = directions(state, ingress=dev, proto=17, dst=target)
+    goodput = received_bps(report)
+    offered = report["end"]["sum_sent"]["bits_per_second"]
+    r.record(f"qos-police-{case}", {"filter": shown, "state": state, "metered": metered,
+                                     "dropped": dropped, "goodput_bps": goodput,
+                                     "offered_bps": offered, "report": report})
+
+    assert offered >= 2 * rate * 1e6, ("the orchestrator did not offer enough to test a meter", offered)
+    # skip_sw: Linux carries the first datagrams unmetered, which admits the
+    # flow, and from then on the entry names the filter's profile.
+    assert len(forward) == 1 and 1 <= int(forward[0]["qos"], 16) >> 8 & 0xf <= 7, forward
+    expected = through * 1e6 * DATAGRAM / (DATAGRAM + UDP_HEADERS)
+    if through:
+        assert 0.9 * expected <= goodput <= 1.03 * expected, (goodput, expected)
+    else:
+        assert goodput <= 0.001 * offered, (goodput, offered)
+    # What did not cross was dropped by the meter, and tc is told so.
+    assert dropped and metered and dropped <= metered, (metered, dropped)
+
+
+# Linux's length check takes the frame as tc ingress sees it -- the IP datagram
+# and its Ethernet header, no FCS -- and passes it at exactly `mtu` bytes.
+BOUNDARY_MTU = 1000
+BOUNDARY_COUNT = 16
+
+
+async def test_flower_police_mtu_boundary(qos):
+    """A frame of exactly the police action's mtu crosses the offloaded meter,
+    and one a byte longer never does, as in Linux."""
+    r = qos
+    dev = TARGET_WAN_IF
+    target = f"{r.lan_ip}:{PORT_POLICED}"
+    await r.tc("qdisc", "add", "dev", dev, "clsact")
+    await r.tc("filter", "add", "dev", dev, "ingress", "protocol", "ip", "pref", "1",
+               "flower", "skip_sw", "ip_proto", "udp", "dst_ip", r.lan_ip,
+               "dst_port", str(PORT_POLICED),
+               "action", "police", "rate", f"{CAP_MBIT}mbit", "burst", POLICE_BURST,
+               "mtu", str(BOUNDARY_MTU), "conform-exceed", "drop")
+    await offload(r, inbound(r, "udp", PORT_POLICED))
+    await lan_start(r, echo=[PORT_POLICED])
+    # Small datagrams pass Linux unmetered (skip_sw) and admit the flow; the
+    # entry then names the filter's profile.
+    deadline = time.monotonic() + 20
+    while not directions(await r.state(), ingress=dev, proto=17, dst=target):
+        await asyncio.to_thread(lockstep, r.lan_ip, PORT_POLICED, 8)
+        assert time.monotonic() < deadline, "the policed flow was never admitted"
+    forward = directions(await r.state(), ingress=dev, proto=17, dst=target)
+    # Frames from a few bytes under the mtu to one over it, as Linux measures
+    # them: Ethernet 14 + IPv4 20 + UDP 8 around the payload.
+    crossed = {}
+    for length in range(BOUNDARY_MTU - 6, BOUNDARY_MTU + 2):
+        crossed[length] = await asyncio.to_thread(
+            lockstep, r.lan_ip, PORT_POLICED, BOUNDARY_COUNT,
+            payload_size=length - 42, timeout=0.3)
+    after = directions(await r.state(), ingress=dev, proto=17, dst=target)
+    shown = (await r.tc("-s", "filter", "show", "dev", dev, "ingress"))["stdout"]
+    r.record("qos-police-mtu-boundary", {"crossed": crossed, "forward": forward,
+                                          "after": after, "filter": shown})
+    assert len(forward) == 1 and 1 <= int(forward[0]["qos"], 16) >> 8 & 0xf <= 7, forward
+    assert [row["cookie"] for row in after] == [forward[0]["cookie"]], (forward, after)
+    assert crossed == {length: BOUNDARY_COUNT if length <= BOUNDARY_MTU else 0
+                       for length in crossed}, crossed
 
 
 async def test_egress_change_readmits_under_the_tree(qos):

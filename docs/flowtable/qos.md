@@ -1293,11 +1293,32 @@ tc filter add dev eth4 ingress flower ip_proto udp dst_port 5004 \
 rather than tolerating. `flow_action_entry.police` carries `rate_bytes_ps`,
 `peakrate_bytes_ps`, `burst`, `burst_pkt`, `rate_pkt_ps`, `mtu` and an
 `exceed`/`notexceed` pair of action ids. The hardware profile is
-`e_FM_PCD_PLCR_RFC_2698`: CIR, PIR, CBS, PBS, and an action per colour. So
-`rate_bytes_ps` is the CIR, `peakrate_bytes_ps` the PIR, `burst` the CBS, and
-`exceed.act_id == FLOW_ACTION_DROP` is what `cdx_qos.c` already programs as
-`e_FM_PCD_PLCR_DROP_FRAME` on red. Even the mode survives: `rate_pkt_ps` is
-packet mode, which these profiles also support.
+`e_FM_PCD_PLCR_RFC_2698`: CIR, PIR, CBS, PBS, and an action per colour. The
+colours do not mean what tc's buckets mean, though. Linux passes a frame only
+when it fits both of its buckets -- the rate's, `burst` deep, and the peak
+rate's, `mtu` deep -- and treats a frame longer than `mtu` as exceeding
+(`tcf_police_act()`), so a peak rate bounds bursts and the long-term rate stays
+`rate`. RFC 2698's yellow, above CIR and within PIR, is excess there. So a tc
+profile passes green alone and drops yellow and red: `rate_bytes_ps` is the
+CIR and `burst` the CBS, the peak bucket is `mtu` deep (PBS) at
+`peakrate_bytes_ps`, and with no peak rate it is refilled at 100 Gbit/s, which
+leaves it a pure length check. Every dropped colour is reported to tc as a
+drop. The port's boot-time rate and the SEC profile keep passing yellow, which
+is what they are for. The first offload passed yellow too, and so delivered
+the peak rate rather than the committed one (A322). Packet mode survives as
+well, since `rate_pkt_ps` maps to packet mode and these profiles support it.
+There is no peak bucket there and no length to check, so a packet rate with
+an `mtu` stays in software.
+
+The profile measures every frame whole, as the MAC forwarded it: Ethernet
+header, any VLAN tag and the FCS. Linux's length check takes the frame as tc
+ingress has it, header and tag included but no FCS, so the peak bucket is four
+bytes deeper than `mtu`, and a frame of exactly `mtu` crosses both
+(`test_flower_police_mtu_boundary` sweeps the boundary). The rate bucket keeps
+one difference: Linux charges it the IP datagram alone (`qdisc_pkt_len()`),
+the profile the whole frame, 18 bytes more. Offloaded policing is that much
+stricter -- about 1.2% for full-size frames, a quarter for minimum-size ones
+(A323).
 
 Only the unit differs. The kernel gives bytes per second; the FMD's byte mode
 takes Kbit/s (`GetInfoRateReg()` does `tmp *= 1000`), so the conversion is

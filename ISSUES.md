@@ -278,6 +278,20 @@ result independently of those temporary files.
 - [x] **A320 — an IPsec SA between IPv6 endpoints was refused packet offload; CMM offloaded it.** Fixed: routed and
   resolved in its family, outer header in wire order, NAT-T over IPv6 refused (_:/^cdx: offload IPsec SAs between IPv6 endpoints_).
 
+- [x] **A322 — an offloaded tc police with a peakrate passed the peak rate, and frames over its mtu, where Linux holds
+  both.** Fixed: tc profiles drop yellow, the peak bucket is mtu (+FCS) deep (_:/^cdx: police by Linux's two buckets_).
+
+- [ ] **A323 — offloaded tc police charges its rate bucket 18 bytes per frame more than Linux.** Linux charges the IP
+  datagram (`qdisc_pkt_len()` at tc ingress); the FMan profile measures `e_FM_PCD_PLCR_FULL_FRM_LEN`, Ethernet header and
+  FCS included. A flow policed in hardware gets ~1.2% less at 1500-byte frames and ~28% less at 64-byte ones than the
+  same rule in software. Candidate fix: `e_FM_PCD_PLCR_L3_FRM_LEN` for tc profiles, with PBS = mtu - 14 (+FCS if L3
+  counts it); the FMan RM is not in the tree and the rollback selection only offers L2 or FULL, so how a red frame's
+  rollback interacts with L3 charging must be measured on the rig (`test_flower_police_follows_linux_buckets` with
+  64-byte datagrams, `test_flower_police_mtu_boundary`) before switching. The length check is exact today.
+
+- [x] **A324 — two matchall police filters on one port shared its one rate limiter.** Fixed: a second is refused;
+  each delete restored the boot rate under the other (_:/^cdx: police by Linux's two buckets_).
+
 - [x] **A321 — an offloaded SA to a peer behind a router never followed the router's MAC moving.** Fixed: the watch
   matches neighbour events against the resolved next hop, not the peer (_:/^cdx: offload IPsec SAs between IPv6 endpoints_).
 

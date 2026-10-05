@@ -29,6 +29,8 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 typedef uint16_t __be16; typedef uint32_t __be32;
 #define SUCCESS 0
 #define FAILURE 1
+#define U32_MAX UINT32_MAX
+#define ETH_FCS_LEN 4
 #define EOPNOTSUPP 95
 #define EINVAL 22
 #define ENOSPC 28
@@ -226,7 +228,11 @@ static int cdx_ingress_policer_counters(u32 fm, u32 queue_no, struct cdx_police_
     return SUCCESS;
 }
 
-static struct { unsigned enabled, disabled, configured; u32 last_profile, cir, pir; } prof;
+static struct {
+    unsigned enabled, disabled, configured;
+    u32 last_profile, cir, pir, pbs;
+    bool drop_yellow;
+} prof;
 static bool prof_fail;
 static int cdx_ingress_enable_or_disable_qos(u32 fm, u32 queue_no, u32 oper)
 {
@@ -237,10 +243,11 @@ static int cdx_ingress_enable_or_disable_qos(u32 fm, u32 queue_no, u32 oper)
     return prof_fail ? FAILURE : SUCCESS;
 }
 static int cdx_ingress_policer_modify_config(u32 fm, u32 queue_no, u32 cir, u32 pir,
-                                             u32 cbs, u32 pbs)
+                                             u32 cbs, u32 pbs, bool drop_yellow)
 {
-    (void)fm; (void)cbs; (void)pbs;
+    (void)fm; (void)cbs;
     prof.configured++; prof.last_profile = queue_no; prof.cir = cir; prof.pir = pir;
+    prof.pbs = pbs; prof.drop_yellow = drop_yellow;
     return prof_fail ? FAILURE : SUCCESS;
 }
 
@@ -255,6 +262,9 @@ static struct flow_action_entry base(void)
     struct flow_action_entry a = { .id = FLOW_ACTION_POLICE };
     a.police.rate_bytes_ps = 62500000;      /* 500 Mbit/s */
     a.police.burst = 64000;
+    /* What tc_police gives a byte rate offered without an mtu: 255 cells of
+     * the rate table's eight bytes. */
+    a.police.mtu = 2040;
     a.police.exceed.act_id = FLOW_ACTION_DROP;
     a.police.notexceed.act_id = FLOW_ACTION_ACCEPT;
     return a;
@@ -263,16 +273,21 @@ static struct flow_action_entry base(void)
 /* One matchall filter, and the cookie tc would name it by. */
 #define MALL_COOKIE 0x5a5aUL
 
-static int offer(struct flow_action_entry act)
+static int offer_on(struct net_device *d, unsigned long cookie, struct flow_action_entry act)
 {
     struct flow_rule rule = { .action = { .num_entries = 1 } };
     rule.action.entries[0] = act;
     struct tc_cls_matchall_offload f = {
         .common = { .extack = &ack }, .command = TC_CLSMATCHALL_REPLACE,
-        .cookie = MALL_COOKIE, .rule = &rule };
+        .cookie = cookie, .rule = &rule };
     memset(&hw, 0, sizeof(hw));
     ack.msg = NULL;
-    return cdx_police_matchall(&dev, &f);
+    return cdx_police_matchall(d, &f);
+}
+
+static int offer(struct flow_action_entry act)
+{
+    return offer_on(&dev, MALL_COOKIE, act);
 }
 
 static int mall_cmd(struct net_device *d, unsigned long cookie, int command,
@@ -360,21 +375,37 @@ int main(void)
 
     /* Bytes per second in, Kbit/s out: 62_500_000 B/s is 500 Mbit/s is
      * 500_000 Kbit/s. A factor-of-eight slip shows up here and nowhere else. */
+    /* Linux passes a frame only when it fits the rate's bucket, `burst`
+     * deep, and is no longer than `mtu` (tcf_police_act()). The profile's
+     * green is that: the committed bucket is the rate's, and the peak bucket
+     * is `mtu` deep and refilled faster than any port, so it turns away only
+     * a longer frame. Yellow and red are both dropped. */
     assert(offer(base()) == 0);
     assert(hw.set && hw.byte_mode);
-    assert(hw.cir == 500000 && hw.pir == 500000);
-    assert(hw.cbs == 64000 && hw.pbs == 64000);
+    assert(hw.cir == 500000 && hw.pir == CDX_POLICE_UNBOUNDED_KBITS);
+    /* The profile measures the FCS the MAC forwards; Linux does not. */
+    assert(hw.cbs == 64000 && hw.pbs == 2040 + 4);
 
+    /* A peak rate is Linux's second bucket, `mtu` deep at that rate: its
+     * long-term rate stays the committed one. */
     struct flow_action_entry a = base();
     a.police.peakrate_bytes_ps = 125000000; /* 1 Gbit/s */
+    a.police.mtu = 9216;
     assert(offer(a) == 0 && hw.cir == 500000 && hw.pir == 1000000);
+    assert(hw.cbs == 64000 && hw.pbs == 9216 + 4);
+    a.police.mtu = U32_MAX;                 /* no length worth checking */
+    assert(offer(a) == 0 && hw.pbs == U32_MAX);
 
     a = base(); a.police.peakrate_bytes_ps = 1000;
     assert(offer(a) == -EOPNOTSUPP);
 
     a = base(); a.police.rate_bytes_ps = 0; a.police.burst = 0;
-    a.police.rate_pkt_ps = 20000; a.police.burst_pkt = 100;
+    a.police.rate_pkt_ps = 20000; a.police.burst_pkt = 100; a.police.mtu = U32_MAX;
     assert(offer(a) == 0 && !hw.byte_mode && hw.cir == 20000 && hw.cbs == 100);
+    /* A packet rate's buckets count frames and cannot check a length. */
+    hw.set = false;
+    a.police.mtu = 1514;
+    assert(offer(a) == -EOPNOTSUPP && !hw.set);
 
     a = base(); a.police.rate_pkt_ps = 20000;
     assert(offer(a) == -EOPNOTSUPP && !hw.set);
@@ -412,10 +443,10 @@ int main(void)
     struct flow_stats s;
     port_hw = (struct cdx_police_counters){ .green = 100, .yellow = 20, .red = 5 };
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
-    /* Green and yellow were enqueued, red was dropped, so the meter saw 125
-     * frames and discarded 5. No byte counter exists in the profile, so none
+    /* Green was enqueued, yellow and red dropped, so the meter saw 125
+     * frames and discarded 25. No byte counter exists in the profile, so none
      * is claimed rather than one being invented from an assumed frame size. */
-    assert(s.pkts == 125 && s.drops == 5 && s.bytes == 0);
+    assert(s.pkts == 125 && s.drops == 25 && s.bytes == 0);
     assert(s.lastused == jiffies && s.used_hw_stats_valid);
     assert(s.used_hw_stats == FLOW_ACTION_HW_STATS_IMMEDIATE);
 
@@ -443,6 +474,16 @@ int main(void)
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -EINVAL);
     counters_fail = false;
 
+    /* The port has one limiter. A second matchall is refused before the
+     * hardware is touched, so the first keeps its meter and its delete is
+     * still the only one that returns the port to its boot rate; another
+     * port takes one of its own. */
+    assert(offer_on(&dev, MALL_COOKIE + 1, base()) == -EOPNOTSUPP && !hw.set);
+    assert(ack.msg && strstr(ack.msg, "already has a police filter"));
+    assert(mall_cmd(&dev, MALL_COOKIE + 1, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
+    assert(offer_on(&other, MALL_COOKIE + 1, base()) == 0 && hw.set);
+    assert(mall_cmd(&other, MALL_COOKIE + 1, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+
     memset(&hw, 0, sizeof(hw));
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0 && hw.cleared);
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
@@ -457,7 +498,8 @@ int main(void)
     assert(flower_add(&dev, 1, &fr) == 0);
     assert(prof.enabled == 1 && prof.configured == 1);
     assert(prof.last_profile == 1);          /* profile 0 is the default */
-    assert(prof.cir == 500000 && prof.pir == 500000);
+    assert(prof.cir == 500000 && prof.pir == CDX_POLICE_UNBOUNDED_KBITS);
+    assert(prof.pbs == 2040 + 4 && prof.drop_yellow);
     assert(cdx_police_lookup(&flow) == 1);
 
     /* The filter is on one port's ingress. The same tuple arriving elsewhere
@@ -612,7 +654,7 @@ int main(void)
     assert(s.pkts == 49 && s.drops == 9 && s.bytes == 0);
     /* Each filter reads the profile it was given and not its neighbour's. */
     assert(flower_cmd(&dev, 8, FLOW_CLS_STATS, &s) == 0);
-    assert(s.pkts == 3 && s.drops == 1);
+    assert(s.pkts == 3 && s.drops == 2);
 
     /* Baselines are per filter, so one reading its counters does not empty
      * the other's. */

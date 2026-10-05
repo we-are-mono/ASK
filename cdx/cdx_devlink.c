@@ -184,7 +184,7 @@ static int cdx_devlink_policer_set(struct devlink *devlink,
 						      INGRESS_SEC_POLICER_QUEUE_NUM,
 						      (uint32_t)rate, (uint32_t)rate,
 						      (uint32_t)burst,
-						      (uint32_t)burst) != SUCCESS) {
+						      (uint32_t)burst, false) != SUCCESS) {
 			NL_SET_ERR_MSG_MOD(extack, "the SEC policer could not be programmed");
 			return -EINVAL;
 		}

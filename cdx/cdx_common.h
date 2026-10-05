@@ -501,5 +501,5 @@ int cdx_ingress_policer_peak(uint32_t fm_index, uint32_t queue_no,
 			     uint32_t *pir, uint32_t *pbs);
 int cdx_get_policer_profile_id(uint32_t fm_index, uint32_t queue_no);
 int cdx_ingress_enable_or_disable_qos(uint32_t fm_index,uint32_t queue_no,uint32_t oper);
-int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs);
+int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs, bool drop_yellow);
 #endif

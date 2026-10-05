@@ -52,6 +52,16 @@ static u32 cdx_police_bytes_to_kbits(u64 bytes_ps)
 	return (u32)div_u64(bytes_ps * 8, 1000);
 }
 
+/* A peak rate no port can approach, in Kbit/s: 100 Gbit/s, ten times the
+ * fastest port. A bucket refilled at it is full again before the next frame
+ * has finished arriving, so it holds back only a frame longer than itself.
+ * Each profile meters one port's arrivals (a matchall is the port's own, a
+ * flower profile is bound only to flows arriving on its filter's port), so no
+ * second port can crowd it. The profile shares one fixed-point scale between
+ * its two rates, sized to the larger; a committed rate of 1 Mbit/s still keeps
+ * fifteen significant bits, which a faster peak would start to spend. */
+#define CDX_POLICE_UNBOUNDED_KBITS	100000000U
+
 /* Refuse anything the profile cannot express, rather than programming a meter
  * that differs from the one described. Everything here is a property of the
  * action, so it can be judged before any hardware is touched. */
@@ -66,8 +76,8 @@ static int cdx_police_check(const struct flow_action_entry *act,
 		NL_SET_ERR_MSG_MOD(extack, "police: a rate is required");
 		return -EOPNOTSUPP;
 	}
-	/* The profile drops red and passes green and yellow on to the parser.
-	 * It has no way to express any other pairing. */
+	/* Under tc the profile passes green on to the parser and drops yellow
+	 * and red. It has no way to express any other pairing. */
 	if (act->police.exceed.act_id != FLOW_ACTION_DROP) {
 		NL_SET_ERR_MSG_MOD(extack, "police: exceed action must be drop");
 		return -EOPNOTSUPP;
@@ -83,6 +93,13 @@ static int cdx_police_check(const struct flow_action_entry *act,
 		NL_SET_ERR_MSG_MOD(extack, "police: avrate is not supported");
 		return -EOPNOTSUPP;
 	}
+	/* A packet-rate profile's buckets count frames, so neither can stand
+	 * in for Linux's frame-length check; only the unlimited default, which
+	 * tc gives a packet rate without an mtu, has nothing to check. */
+	if (act->police.rate_pkt_ps && act->police.mtu != U32_MAX) {
+		NL_SET_ERR_MSG_MOD(extack, "police: an mtu needs a byte rate");
+		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -96,13 +113,25 @@ static int cdx_police_rates(const struct flow_action_entry *act,
 	*byte_mode = act->police.rate_bytes_ps != 0;
 	if (*byte_mode) {
 		*cir = cdx_police_bytes_to_kbits(act->police.rate_bytes_ps);
-		/* RFC-2698 requires the peak rate to be at least the committed
-		 * one. tc lets an operator omit it, meaning "no second rate",
-		 * which this profile spells as the two being equal. */
-		*pir = act->police.peakrate_bytes_ps ?
-			cdx_police_bytes_to_kbits(act->police.peakrate_bytes_ps) : *cir;
 		*cbs = act->police.burst;
-		*pbs = act->police.burst;
+		/* Linux passes a frame only when it fits both of its buckets --
+		 * the rate's, `burst` deep, and the peak rate's, `mtu` deep --
+		 * and treats a frame longer than `mtu` as exceeding whatever
+		 * the buckets hold (tcf_police_act()). The profile drops yellow
+		 * for tc (cdx_port_police_set()), so its green is that same
+		 * rule: the committed bucket is the rate's, and the peak bucket
+		 * is `mtu` deep at the peak rate. With no peak rate the peak
+		 * bucket still does the length check, refilled far faster than
+		 * any port can drain it, so only a frame longer than it misses. */
+		*pir = act->police.peakrate_bytes_ps ?
+			cdx_police_bytes_to_kbits(act->police.peakrate_bytes_ps) :
+			CDX_POLICE_UNBOUNDED_KBITS;
+		/* The profile measures the whole frame as the MAC forwarded
+		 * it, FCS included; Linux measures it as tc ingress has it,
+		 * without one. A VLAN tag stays in the frame for both, as
+		 * nothing strips it on receive. */
+		*pbs = act->police.mtu > U32_MAX - ETH_FCS_LEN ? U32_MAX :
+		       act->police.mtu + ETH_FCS_LEN;
 	} else {
 		*cir = (u32)act->police.rate_pkt_ps;
 		*pir = *cir;
@@ -168,23 +197,23 @@ static u32 cdx_police_delta(u32 *last, u32 now)
 	return delta;
 }
 
-/* Green and yellow are enqueued, red is dropped, because the profile programs
- * e_FM_PCD_PLCR_DROP_FRAME on red. Every frame the meter saw is therefore the
- * sum of the three, and the dropped ones are the red ones. */
+/* Green is enqueued, yellow and red are dropped, because a tc profile programs
+ * e_FM_PCD_PLCR_DROP_FRAME on both. Every frame the meter saw is therefore the
+ * sum of the three, and the dropped ones are the yellow and the red ones. */
 static void cdx_police_report(struct flow_stats *stats,
 			      struct cdx_police_counters *base,
 			      const struct cdx_police_counters *now)
 {
 	u64 green = cdx_police_delta(&base->green, now->green);
-	u64 yellow = cdx_police_delta(&base->yellow, now->yellow);
-	u64 drops = cdx_police_delta(&base->red, now->red);
+	u64 drops = cdx_police_delta(&base->yellow, now->yellow) +
+		    cdx_police_delta(&base->red, now->red);
 
 	/* lastused is offered only when something moved. flow_stats_update()
 	 * keeps the later of what it holds and what it is given, so a quiet
 	 * filter has nothing to contribute and must not claim the present
 	 * moment as a time it was used. */
-	flow_stats_update(stats, 0, green + yellow + drops, drops,
-			  green + yellow + drops ? jiffies : 0,
+	flow_stats_update(stats, 0, green + drops, drops,
+			  green + drops ? jiffies : 0,
 			  FLOW_ACTION_HW_STATS_IMMEDIATE);
 }
 
@@ -228,6 +257,20 @@ static int cdx_police_replace(struct net_device *dev,
 	rc = cdx_police_rates(act, extack, &byte_mode, &cir, &pir, &cbs, &pbs);
 	if (rc)
 		return rc;
+
+	/* A port has one rate limiter. A second matchall would program over the
+	 * first's meter, and deleting either would return the port to its boot
+	 * rate under the other, which tc would still show as in hardware. tc
+	 * offers matchall filters under RTNL, so nothing lands in between. */
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	list_for_each_entry(port, &cdx_police_ports, list) {
+		if (port->dev == dev && port->cookie != f->cookie) {
+			spin_unlock_irqrestore(&cdx_police_lock, flags);
+			NL_SET_ERR_MSG_MOD(extack, "matchall: the port's rate limiter already has a police filter");
+			return -EOPNOTSUPP;
+		}
+	}
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
 
 	/* Allocated before the hardware is touched so a failure to program the
 	 * port leaves nothing behind to unwind. */
@@ -686,7 +729,7 @@ static int cdx_police_flower_replace(struct net_device *dev,
 	if (cdx_ingress_enable_or_disable_qos(FMAN_INDEX, profile,
 					      ENABLE_INGRESS_POLICER) != SUCCESS ||
 	    cdx_ingress_policer_modify_config(FMAN_INDEX, profile,
-					      cir, pir, cbs, pbs) != SUCCESS) {
+					      cir, pir, cbs, pbs, true) != SUCCESS) {
 		NL_SET_ERR_MSG_MOD(extack, "flower: the ingress policer profile could not be programmed");
 		rc = -EINVAL;
 		goto err_profile;

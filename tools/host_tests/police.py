@@ -46,10 +46,11 @@ def test_offload(tmp_path):
              "cdx_police_flower_replace", "cdx_police_flower_destroy",
              "cdx_police_flower_stats", "cdx_police_flower"]
     (tmp_path / "police_production.inc").write_text(
+        re.search(r"^#define CDX_POLICE_UNBOUNDED_KBITS\s.*$", source, re.M).group() + "\n"
         # The two records and the state they live in are file-scope, so they
         # are sliced rather than lifted by name -- what a lookup answers and
         # what a baseline holds depend on the state as much as the code.
-        source[source.index("static DEFINE_SPINLOCK(cdx_police_lock);"):
+        + source[source.index("static DEFINE_SPINLOCK(cdx_police_lock);"):
                source.index("/* One counter's delta.")]
         + source[source.index("struct cdx_police_filter {"):
                  source.index("static int cdx_police_profile_get")]

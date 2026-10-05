@@ -183,6 +183,8 @@ struct cdx_ingress_policer_info {
 	uint32_t pir_value;
 	uint32_t cbs;
 	uint32_t pbs;
+	/* Yellow is dropped (tc's meters) rather than passed. */
+	bool drop_yellow;
 };
 #endif
 
@@ -239,7 +241,7 @@ int cdxdrv_modify_missaction_policer_profile(struct cdx_fman_info *finfo, uint32
 
 #ifdef ENABLE_INGRESS_QOS	
 int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *finfo);
-int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs);
+int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs, bool drop_yellow);
 int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no);
 int cdxdrv_enable_or_disable_ingress_policer(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t oper);
 #endif
