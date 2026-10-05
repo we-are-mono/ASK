@@ -26,8 +26,6 @@ def command(suite, environ, executable=sys.executable):
     }
     argv = [executable, "-m", "pytest", "-c", str(root / "tools/pyproject.toml")]
     argv += [str(root / "tools" / path) for path in paths[suite]]
-    if suite != "host":
-        argv.append("-x")
     if env.get("K"):
         argv.extend(["-k", env["K"]])
     argv += shlex.split(env.get("ASK_TEST_ARGS", "")) + shlex.split(env.get("ARGS", ""))

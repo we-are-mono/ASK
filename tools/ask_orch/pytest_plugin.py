@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from ask_orch.artifacts import artifact_dir, record
+from ask_orch.artifacts import artifact_dir, prune_runs, record
 from ask_orch.lifecycle import bench_lock
 from ask_orch.provenance import checkout
 
@@ -40,6 +40,8 @@ def pytest_configure(config):
         )
     )
     root.mkdir(parents=True, exist_ok=True)
+    prune_runs(root, keep_days=float(os.environ.get("ASK_TEST_ARTIFACT_DAYS", "3")),
+               keep_runs=10, min_free=4 << 30)
     config._ask_run_dir = Path(
         tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S-"), dir=root)
     )
@@ -237,3 +239,45 @@ def pytest_runtest_makereport(item, call):
 
 def pytest_terminal_summary(terminalreporter):
     terminalreporter.write_line(f"Artifacts: {terminalreporter.config._ask_run_dir}")
+
+
+def _duration(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, seconds = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+_elapsed = {}
+_latest = None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_logreport(report):
+    """Time each test across its phases, ahead of the terminal reporter
+    printing its line, so that line can carry it."""
+    global _latest
+    _elapsed[report.nodeid] = _elapsed.get(report.nodeid, 0.0) + report.duration
+    _latest = report.nodeid
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionstart(session):
+    """With console_output_style = count, a verbose line ends in the test's
+    time as well as its place in the run: `PASSED  41.2s [ 27/514]`. pytest
+    offers the time or the count but not both, so its count is extended
+    here; the column keeps the reporter's colour, green while every test
+    passes. It reaches into the reporter's private progress API, which a
+    pytest upgrade has to keep in view."""
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None or reporter._show_progress_info != "count" or reporter.verbosity <= 0:
+        return
+    count = reporter._get_progress_information_message
+
+    def message():
+        return f" {_duration(_elapsed.get(_latest, 0.0))}{count()}"
+
+    reporter._get_progress_information_message = message

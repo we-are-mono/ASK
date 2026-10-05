@@ -394,13 +394,20 @@ the runner environment; it does not deploy or run tests.
 ### Results and artifacts
 
 Every selected test uses pytest's standard `PASSED`, `FAILED`, `ERROR`, or
-`SKIPPED` status, followed by final totals. Successful-test stdout stays
+`SKIPPED` status, followed by final totals. Each status line ends in the
+test's time across its phases and its place in the run, `PASSED 41.2s [ 27/514]`,
+coloured green while every test so far has passed (pass `--color=yes` when
+writing to a file). Successful-test stdout stays
 captured; failures include their diagnostics. `ARGS=-s` explicitly enables
 live output for debugging.
 
 Each invocation creates a unique directory under `/tmp/ask-tests-<uid>` (override
 with `ASK_TEST_ARTIFACTS`; `ASK_FLOWTABLE_ARTIFACTS` remains supported).
-The final output prints its path. It contains `junit.xml`, session metadata
+The final output prints its path. Before creating it, the harness deletes
+earlier run directories there older than `ASK_TEST_ARTIFACT_DAYS` (default 3),
+and the oldest ones while less than 4 GiB is free; the newest ten always stay.
+`/tmp` is a tmpfs on the bench, and a run that fills it fails every later
+write, the harness's own included. It contains `junit.xml`, session metadata
 (revision, checkout fingerprint, dependency versions, configured endpoints), DUT kernel/boot details,
 boot logs, and one directory per test with setup/call/teardown results and
 diagnostic artifacts. Test names include a hash so parameterized cases cannot
@@ -427,8 +434,9 @@ that differs from the checkout and checks each selected test's required tools.
   separate 45-second budget per callback and reports all failures. Commands
   must check return codes or verify an explicit cleanup postcondition.
 - A hardware setup or teardown failure blocks later hardware cases in that
-  invocation. Recover the bench before starting a new run. Hardware commands
-  stop at the first failure by default; host commands report all failures.
+  invocation. Recover the bench before starting a new run. Every command
+  reports all failures, so a full run is a complete ledger to fix from;
+  `ARGS=-x` stops at the first instead.
 - Local process locks cover the DUT, serial device, LAN VM and WAN endpoint.
   Overlapping invocations fail before setup; hardware xdist workers are
   rejected. Locks cover runners on one orchestrator. A shared lab coordinator

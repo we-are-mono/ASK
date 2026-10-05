@@ -5,6 +5,7 @@ import base64
 import errno
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from xml.etree import ElementTree
@@ -354,6 +355,50 @@ def test_overlapping_bench_reservations_are_refused_and_released(tmp_path):
         pass
 
 
+def test_old_run_artifacts_are_pruned(tmp_path, monkeypatch):
+    from ask_orch import artifacts
+
+    day = 86400
+    now = 1_800_000_000
+    runs = {}
+    for age in (9, 8, 7, 6, 5, 4, 1, 0):
+        run = tmp_path / f"2026100{9 - age}-120000-{age:02d}"
+        (run / "case").mkdir(parents=True)
+        os.utime(run, (now - age * day, now - age * day))
+        runs[age] = run
+    other = tmp_path / "notes"
+    other.mkdir()
+    os.utime(other, (now - 30 * day, now - 30 * day))
+    monkeypatch.setattr(artifacts.time, "time", lambda: now)
+    free = {"bytes": 1 << 40}
+    monkeypatch.setattr(artifacts.shutil, "disk_usage",
+                        lambda path: SimpleNamespace(free=free["bytes"]))
+
+    # By age: older than three days goes, but the newest runs always stay.
+    artifacts.prune_runs(tmp_path, keep_days=3, keep_runs=3, min_free=1 << 30)
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        [runs[4].name, runs[1].name, runs[0].name, "notes"])
+
+    # By space: oldest first until enough is free, never the newest runs and
+    # never a directory that is not a run.
+    removed = []
+    real_rmtree = artifacts.shutil.rmtree
+
+    def rmtree(path, **kwargs):
+        removed.append(Path(path).name)
+        free["bytes"] = 1 << 40
+        real_rmtree(path, **kwargs)
+
+    free["bytes"] = 0
+    monkeypatch.setattr(artifacts.shutil, "rmtree", rmtree)
+    artifacts.prune_runs(tmp_path, keep_days=30, keep_runs=1, min_free=1 << 30)
+    assert removed == [runs[4].name]
+    free["bytes"] = 0
+    artifacts.prune_runs(tmp_path, keep_days=30, keep_runs=2, min_free=1 << 30)
+    assert removed == [runs[4].name]
+    assert other.exists()
+
+
 def test_failed_capture_seek_closes_descriptor(monkeypatch):
     closed = []
     monkeypatch.setattr(dmesg.os, "open", lambda *args: 42)
@@ -432,8 +477,12 @@ def test_make_arguments_survive_sudo_as_literal_arguments(monkeypatch):
     assert env["ASK_TARGET_IP"] == "192.0.2.1"
     assert env["ASK_WAN_IPERF_IP"] == "192.0.2.2"
     assert env["ASK_WAN_IP"] == "127.0.0.1"
+    # A full run collects every failure; stopping at the first is opt-in.
+    assert "-x" not in argv
     host, _ = command("host", {}, "/venv/python")
     assert host[0] == "/venv/python" and "-x" not in host
+    scoped, _ = command("dut", {"ARGS": "-x"}, "/venv/python")
+    assert scoped[-1] == "-x"
 
 
 def test_teardown_failure_quarantines_bench_and_keeps_junit(pytester, monkeypatch):
@@ -529,6 +578,27 @@ def test_missing_capability():
     result = pytester.runpytest_subprocess("--release")
     result.assert_outcomes(failed=int(not skipif), errors=int(skipif))
     result.stdout.fnmatch_lines(["*release run cannot skip required coverage:*"])
+
+
+def test_progress_column_shows_duration_and_count(pytester, monkeypatch):
+    monkeypatch.setenv("ASK_TEST_ARTIFACTS", str(pytester.path / "artifacts"))
+    pytester.makeini("[pytest]\nconsole_output_style = count\n")
+    pytester.makeconftest("""
+import pytest
+pytest_plugins = ["ask_orch.pytest_plugin"]
+@pytest.fixture(scope="session", autouse=True)
+def hardware_bench():
+    yield
+""")
+    pytester.makepyfile("""
+import time
+def test_slow(): time.sleep(0.3)
+def test_fast(): pass
+""")
+    result = pytester.runpytest_subprocess("-v")
+    result.assert_outcomes(passed=2)
+    result.stdout.re_match_lines([r".*::test_slow PASSED +0\.[3-9]s \[1/2\]$",
+                                  r".*::test_fast PASSED +0\.0s \[2/2\]$"])
 
 
 def test_module_order_is_reproducible_and_keeps_cases_together(pytester, monkeypatch):

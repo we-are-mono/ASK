@@ -10,8 +10,11 @@ asyncio_default_fixture_loop_scope = "function"
 asyncio_default_test_loop_scope    = "function"
 
 # Native pytest status lines, captured successful-test output and final totals.
-# Hardware commands add -x; host runs collect all failures.
+# Every run collects all failures; pass ARGS=-x to stop at the first.
 addopts = "-v -ra --tb=short --strict-markers --strict-config"
+# Each verbose line ends in the test's time and its place in the run, e.g.
+# `PASSED  41.2s [ 27/514]` (the time is added by ask_orch.pytest_plugin).
+console_output_style = "count"
 testpaths = ["host_tests", "tests"]
 # Test directories contain plain test filenames and underscore-prefixed helpers.
 python_files = ["[!_]*.py"]
