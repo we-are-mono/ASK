@@ -14983,6 +14983,10 @@ struct ft_wifi_watch {
 	 * next hop cannot be: it is built into what was registered. So the VAP
 	 * is retired and registered again, which this asks the worker to do. */
 	bool stale;
+	/* The device `vap` was registered for, kept after `dev` is cleared so
+	 * the entries forwarding through it can be found when it is retired.
+	 * Only compared, never followed. */
+	const struct net_device *vap_dev;
 };
 
 static LIST_HEAD(ft_wifi_watches);
@@ -15117,6 +15121,26 @@ static void ft_wifi_device_gone(struct net_device *dev)
 		schedule_work(&ft_wifi_work);
 }
 
+/* Take every entry that forwards through @dev's VAP out of hardware before its
+ * VWD slot is released: a slot is handed to the next VAP registered, and an
+ * entry still in hardware would send the old VAP's unicast to the new one.
+ * The native NETDEV_DOWN delete is not enough on its own -- it is skipped for
+ * an entry still pending, or when nf_flow_table_cleanup() cannot allocate.
+ * Returns false while a deletion awaits the datapath's proof, when the slot
+ * must stay. Caller holds the transaction and RTNL. */
+static bool ft_wifi_vap_drained(const struct net_device *dev)
+{
+	struct cdx_ft_entry *entry, *next;
+
+	list_for_each_entry_safe(entry, next, &ft_entries, list) {
+		if (!ft_entry_uses(entry, dev))
+			continue;
+		ft_handle_invalidate(entry->handle, &ft_link_invalidations);
+		ft_remove(entry);
+	}
+	return !cdx_ft_pending();
+}
+
 static void ft_wifi_work_fn(struct work_struct *work)
 {
 	struct ft_wifi_watch *w, *tmp;
@@ -15128,6 +15152,8 @@ static void ft_wifi_work_fn(struct work_struct *work)
 	for (;;) {
 		struct cdx_wifi_vap *vap = NULL;
 		struct net_device *dev = NULL;
+		const struct net_device *vap_dev = NULL;
+		struct ft_wifi_watch *claimed = NULL;
 		int rc;
 
 		mutex_lock(&ft_wifi_lock);
@@ -15156,6 +15182,8 @@ static void ft_wifi_work_fn(struct work_struct *work)
 				 * again, this time reading the address the
 				 * device has now. */
 				vap = w->vap;
+				vap_dev = w->vap_dev;
+				claimed = w;
 				w->vap = NULL;
 				w->stale = false;
 				ft_wifi_registered--;
@@ -15201,6 +15229,7 @@ static void ft_wifi_work_fn(struct work_struct *work)
 					continue;
 				if (made) {
 					w->vap = made;
+					w->vap_dev = dev;
 					made = NULL;
 					ft_wifi_registered++;
 				} else {
@@ -15225,6 +15254,32 @@ static void ft_wifi_work_fn(struct work_struct *work)
 			if (rc && rc != -ENODEV)
 				pr_warn_ratelimited("cdx flowtable: %s could not be offloaded as a Wi-Fi VAP (%d)\n",
 						    netdev_name(dev), rc);
+		} else if (!ft_wifi_vap_drained(vap_dev)) {
+			bool stopping, pending;
+
+			/* Not yet: give the VAP back to its watch, marked so a
+			 * later pass claims it again, and last on the list so
+			 * no other device waits behind it. Only this worker
+			 * frees a watch, and never one that holds a VAP. The
+			 * deletion's proof is asked for with RTNL let go of --
+			 * the recovery takes it itself -- and once a second,
+			 * admission's own pace. */
+			mutex_lock(&ft_wifi_lock);
+			claimed->vap = vap;
+			claimed->stale = true;
+			ft_wifi_registered++;
+			list_move_tail(&claimed->list, &ft_wifi_watches);
+			stopping = ft_wifi_stopping;
+			mutex_unlock(&ft_wifi_lock);
+			cdx_ft_admission_end();
+			cdx_ft_recover();
+			pending = cdx_ft_pending();
+			cdx_ft_end();
+			if (stopping)
+				return;
+			if (pending)
+				msleep(MSEC_PER_SEC);
+			continue;
 		} else {
 			/* Already unlinked from its watch above, so this owns
 			 * it outright and nothing else can reach it. */

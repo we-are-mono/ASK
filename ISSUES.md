@@ -312,11 +312,8 @@ result independently of those temporary files.
   audit. A later tc operation on that port calls freed module text. Production never unloads cdx (load-once); it needs
   root with `CAP_SYS_MODULE`. Fix: unbind every callback cdx bound before its module exit returns.
 
-- [ ] **A311 — a Wi-Fi VWD slot can be rebound to a new VAP before an entry built for the old VAP leaves hardware.**
-  Source-verified residual race, not reproduced: when the native `NETDEV_DOWN` delete is skipped (`NF_FLOW_HW_PENDING`,
-  or an allocation failure in `nf_flow_table_cleanup`), `ft_wifi_work` can win `ctrl.mutex` over the queued
-  `ft_retire_work` and reuse the slot's forwarding FQs. Unicast for the old VAP then reaches the new one. Fix: retire the
-  slot's entries before a rebind, not after.
+- [x] **A311 — a Wi-Fi VWD slot could be rebound to a new VAP before an entry built for the old VAP left hardware.**
+  Fixed: a VAP's entries leave hardware, proven, before its slot is released (_:/^cdx: empty a Wi-Fi VAP's slot before reusing it_).
 
 - [ ] **A312 — the health probe's `/proc/cdx_flowtable` render can miss its 5 s deadline under heavy bridged multicast.**
   Source-verified by the audit; wall clock unmeasured. The probe renders the header, including O(bridged flows ×

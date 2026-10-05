@@ -58,6 +58,15 @@ static void list_del(struct list_head *e)
 	e->next = e->prev = NULL;
 }
 
+static void list_move_tail(struct list_head *e, struct list_head *head)
+{
+	list_del(e);
+	e->prev = head->prev;
+	e->next = head;
+	head->prev->next = e;
+	head->prev = e;
+}
+
 #define container_of(ptr, type, member) \
 	((type *)((char *)(ptr) - offsetof(type, member)))
 #define list_entry(ptr, type, member) container_of(ptr, type, member)
@@ -166,6 +175,10 @@ struct cdx_wifi_vap {
 
 static int vap_add_fail;
 static int vaps_live;
+/* ft_wifi_vap_drained()'s record, below. */
+static const struct net_device *drained_dev;
+static int drain_pending, drains, sleeps;
+static bool drain_required;
 static u16 next_vapid;
 static int supported_answer = 1;
 
@@ -209,10 +222,50 @@ static void cdx_wifi_vap_del(struct cdx_wifi_vap **vap)
 	 * struct at unregister, and ASan turns any read of it here into a
 	 * failure -- which is the whole point of this file. */
 	assert(v->live);
+	assert(!drain_required || drained_dev == v->dev);
+	drained_dev = NULL;
 	v->live = false;
 	vaps_live--;
 	free(v);
 	*vap = NULL;
+}
+
+/* --- the entries forwarding through a VAP ------------------------------ */
+/* What ft_wifi_vap_drained() answers: the device whose entries were last taken
+ * out of hardware, and how many more passes report a deletion still pending.
+ * A slot released for a device not drained, or still pending, is the A311
+ * race -- the next VAP would inherit an entry built for this one. The state
+ * is declared with the VAP backend, which checks it. */
+#define MSEC_PER_SEC 1000
+static int recovers;
+static void msleep(unsigned int ms) { assert(ms == MSEC_PER_SEC); sleeps++; }
+/* Asked with RTNL let go of: the recovery takes it itself, and could never
+ * have it while its caller held it. */
+static int cdx_ft_recover(void)
+{
+	assert(txn_depth && !rtnl_held);
+	recovers++;
+	return 0;
+}
+/* Whether a deletion still awaits its proof after the recovery: as many more
+ * drains as are still to report one. */
+static bool cdx_ft_pending(void)
+{
+	assert(txn_depth);
+	return drain_pending > 0;
+}
+static bool ft_wifi_vap_drained(const struct net_device *dev)
+{
+	assert(txn_depth);
+	ASSERT_RTNL();
+	drains++;
+	if (drain_pending) {
+		drain_pending--;
+		drained_dev = NULL;
+		return false;
+	}
+	drained_dev = dev;
+	return true;
 }
 
 /* --- the adapter's own code ------------------------------------------- */
@@ -437,6 +490,80 @@ static void test_unregister_retires(void)
 	reset();
 }
 
+/* A VAP's slot is handed to the next VAP registered, so it is released only
+ * once every entry forwarding through the old one has left hardware: a
+ * deletion still awaiting the datapath's proof keeps the slot, and the
+ * worker comes back for it. Retiring a stale VAP to register it again is the
+ * same release. */
+static void test_slot_released_after_its_entries(void)
+{
+	struct net_device *ap = mkdev("uap0", NL80211_IFTYPE_AP);
+
+	drain_required = true;
+	drains = sleeps = 0;
+	reconsider(ap);
+	drain();
+	assert(vaps_live == 1);
+
+	rtnl_held++;
+	ft_wifi_address_changed(ap);
+	rtnl_held--;
+	drain();
+	assert(vaps_live == 1 && drains == 1 && sleeps == 0);
+
+	unregister(ap);
+	drain_pending = 2;
+	drain();
+	/* Two passes found it pending; the recovery after the second cleared
+	 * it, so only the first waited. */
+	assert(vaps_live == 0 && drains == 4 && sleeps == 1 && recovers == 2);
+	assert(watches() == 0 && !txn_depth && !rtnl_held);
+
+	/* A VAP whose entries are still pending does not keep the device
+	 * behind it waiting: it goes to the back of the list. */
+	{
+		struct net_device *first = mkdev("uap0", NL80211_IFTYPE_AP);
+		struct net_device *second = mkdev("uap1", NL80211_IFTYPE_AP);
+
+		reconsider(first);
+		drain();
+		unregister(first);
+		reconsider(second);
+		drain_pending = 1;
+		drains = sleeps = 0;
+		drain();
+		/* Retired once, sent back; the second registered on the next
+		 * pass; then the first released. */
+		assert(drains == 2 && sleeps == 0 && vaps_live == 1);
+		unregister(second);
+		drain();
+		assert(vaps_live == 0 && watches() == 0);
+	}
+
+	/* And unload does not wait on a retry: one still pending when the
+	 * worker is told to stop ends the pass, and exit releases the VAP. */
+	{
+		struct net_device *ap2 = mkdev("uap0", NL80211_IFTYPE_AP);
+
+		reconsider(ap2);
+		drain();
+		unregister(ap2);
+		drain_pending = 1;
+		ft_wifi_stopping = true;
+		drains = sleeps = 0;
+		work_pending = 0;
+		ft_wifi_work_fn(NULL);
+		assert(drains == 1 && sleeps == 0 && vaps_live == 1 && !txn_depth);
+		drain_required = false;
+		ft_wifi_exit();
+		assert(vaps_live == 0 && watches() == 0);
+	}
+	drain_required = false;
+	drains = sleeps = recovers = 0;
+	drain_pending = 0;
+	reset();
+}
+
 /* A device that unregisters before its pending registration ever ran leaves
  * nothing behind. */
 static void test_unregister_before_add(void)
@@ -625,6 +752,7 @@ int main(void)
 	test_not_running();
 	test_mode_change();
 	test_unregister_retires();
+	test_slot_released_after_its_entries();
 	test_unregister_before_add();
 	test_add_failure_gives_up();
 	test_admission_backoff();
