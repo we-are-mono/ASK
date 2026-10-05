@@ -173,6 +173,10 @@ struct cdx_ipsec_sa_spec {
 	/* Copy the inner header's DF bit to the outer one. Meaningful for an
 	 * IPv4 outbound tunnel and ignored otherwise. */
 	bool copy_df;
+	/* Propagate an outer CE to the inner header at decapsulation (RFC
+	 * 6040), as Linux does unless the state has `noecn`. Meaningful for an
+	 * inbound tunnel and ignored otherwise. */
+	bool ecn;
 };
 
 /* What SEC counted for this SA, since it was installed. Packets and bytes are

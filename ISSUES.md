@@ -269,6 +269,12 @@ result independently of those temporary files.
 - [x] **A316 — with jumbo frames a port's MTU did not bound what it received; oversize non-DF traffic was fragmented
   with zeroed payloads.** Fixed: per-port MAC max frame follows the MTU, arrivals bounded by the physical port (_:/^flowtable: support jumbo frames_).
 
+- [x] **A318 — hardware IPsec decap overwrote the inner DSCP and ECN with the outer byte; Linux keeps both.** Fixed:
+  decap keeps the inner byte, decap-dscp in and dont-encap-dscp/noecn out refused offload (_:/^cdx: mark IPsec tunnel traffic as Linux does_).
+
+- [x] **A319 — an outer CE mark was not propagated to the inner header at hardware IPsec decap.** Fixed: RFC 6040
+  decap ECN (`PDBOPTS_ESP_TECN`) unless `noecn` (_:/^cdx: mark IPsec tunnel traffic as Linux does_).
+
 - [ ] **A317 — an untagged frame on a port with upper devices may exceed the port's MTU by its tag allowance.** Accepted
   limitation of A316's fix. The mEMAC allows no extra room for VLAN tags, so a port with any upper keeps one tag (two
   for 802.1ad/stacked VLANs) of headroom, which an untagged frame can use: 1501-1504 (1508) bytes on a 1500 port pass

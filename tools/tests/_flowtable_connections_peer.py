@@ -146,6 +146,12 @@ class Flow:
             with namespace(self.spec):
                 self.sock = socket.socket(family, socket.SOCK_DGRAM)
             self.sock.setblocking(False)
+            if "tos" in self.spec:
+                # The whole traffic-class byte: DSCP and ECN as given.
+                if family == socket.AF_INET6:
+                    self.sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS, self.spec["tos"])
+                else:
+                    self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, self.spec["tos"])
             self.sock.bind(local)
             self.sock.connect(remote)
             if "wire" in self.spec:

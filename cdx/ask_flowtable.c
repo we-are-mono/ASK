@@ -13183,6 +13183,7 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 	spec->copy_df = spec->family == AF_INET &&
 			spec->dir == CDX_IPSEC_DIR_OUT &&
 			!(x->props.flags & XFRM_STATE_NOPMTUDISC);
+	spec->ecn = !(x->props.flags & XFRM_STATE_NOECN);
 	if (x->encap) {
 		if (x->encap->encap_type != UDP_ENCAP_ESPINUDP) {
 			NL_SET_ERR_MSG(extack, "cdx: only UDP-encapsulated ESP is supported");
@@ -13254,6 +13255,30 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 		spec->crypt.alg = x->props.ealgo;
 		spec->crypt.bits = x->aead->alg_key_len;
 		memcpy(spec->crypt.key, x->aead->alg_key, x->aead->alg_key_len / 8);
+	}
+	/* SEC moves a tunnel's traffic class only as the whole byte, DSCP and
+	 * ECN together. Decapsulation leaves the inner byte alone, which is what
+	 * Linux does by default (RFC 4301 5.1.2.1), and propagates an outer CE
+	 * by RFC 6040 unless the state has `noecn`; a state asking for the outer
+	 * DSCP (decap-dscp) would need SEC to overwrite the inner ECN field too,
+	 * which RFC 6040 forbids. Encapsulation copies the inner byte out, so
+	 * neither a state asking for no DSCP copy (dont-encap-dscp) nor one
+	 * asking for a Not-ECT outer header (noecn) can be honoured. All three
+	 * stay in software. */
+	if (spec->tunnel && spec->dir == CDX_IPSEC_DIR_IN &&
+	    (x->props.flags & XFRM_STATE_DECAP_DSCP)) {
+		NL_SET_ERR_MSG(extack, "cdx: SEC cannot take the outer DSCP without the outer ECN");
+		return -EOPNOTSUPP;
+	}
+	if (spec->tunnel && spec->dir == CDX_IPSEC_DIR_OUT &&
+	    (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)) {
+		NL_SET_ERR_MSG(extack, "cdx: SEC copies the inner DSCP into the outer header");
+		return -EOPNOTSUPP;
+	}
+	if (spec->tunnel && spec->dir == CDX_IPSEC_DIR_OUT &&
+	    (x->props.flags & XFRM_STATE_NOECN)) {
+		NL_SET_ERR_MSG(extack, "cdx: SEC copies the inner ECN into the outer header");
+		return -EOPNOTSUPP;
 	}
 	spec->dev_mtu = dev->mtu;
 	spec->mtu = ft_ipsec_esp_mtu(x, dev->mtu);

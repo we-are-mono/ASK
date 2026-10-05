@@ -374,8 +374,11 @@ struct flowi {
 /* --- xfrm ------------------------------------------------------------ */
 #define XFRM_MODE_TRANSPORT 0
 #define XFRM_MODE_TUNNEL 1
-#define XFRM_STATE_NOPMTUDISC 1
+#define XFRM_STATE_NOECN 1
+#define XFRM_STATE_DECAP_DSCP 2
+#define XFRM_STATE_NOPMTUDISC 4
 #define XFRM_STATE_ESN 128
+#define XFRM_SA_XFLAG_DONT_ENCAP_DSCP 1
 #define XFRM_STATE_VOID 0
 #define XFRM_STATE_VALID 2
 #define XFRM_STATE_EXPIRED 4
@@ -449,6 +452,7 @@ struct xfrm_state {
 		u8 mode;
 		u8 aalgo, ealgo;
 		u8 flags;
+		u32 extra_flags;
 		u32 replay_window, reqid;
 		struct { u32 v, m; } smark;
 		int header_len;
@@ -1411,7 +1415,31 @@ static void test_spec(void)
 	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && peer_family == AF_INET6);
 	x->props.family = AF_INET;
 	assert(wan_route.dst.refs == 0);
+	/* SEC moves the traffic-class byte whole, so a tunnel asking for a
+	 * marking that splits it stays in software: the outer DSCP without
+	 * the outer ECN at decapsulation, and an outer header that does not
+	 * carry the inner DSCP or ECN at encapsulation. Asking for no ECN at
+	 * decapsulation is honoured instead, and the backend told. */
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && spec.ecn);
+	x->props.flags = XFRM_STATE_DECAP_DSCP;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+	x->props.flags = XFRM_STATE_NOECN;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && !spec.ecn);
+	x->props.flags = 0;
+	x->props.extra_flags = XFRM_SA_XFLAG_DONT_ENCAP_DSCP;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	x->props.extra_flags = 0;
 	x->xso.dir = XFRM_DEV_OFFLOAD_OUT;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && spec.ecn);
+	x->props.extra_flags = XFRM_SA_XFLAG_DONT_ENCAP_DSCP;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+	x->props.extra_flags = 0;
+	x->props.flags = XFRM_STATE_NOECN;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+	x->props.flags = XFRM_STATE_DECAP_DSCP;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0);
+	x->props.flags = 0;
+	assert(wan_route.dst.refs == 0 && neigh_refs == 0);
 
 	/* Transport mode keeps the SA's own reduced MTU and builds no outer
 	 * header: ((1500 - 24 - 12 - 20) & ~15) + 20 - 2. */

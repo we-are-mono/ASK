@@ -1427,12 +1427,16 @@ static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 			sec_desc->pdb_dec.options &= 0xf000ffff;
 			sec_desc->pdb_dec.options |= ((sa->header_len+UDP_HEADER_LEN) << PDBHDRLEN_ESP_DECAP_SHIFT);
 		}
-		/* by default copy dscp from outer to inner header */
-		sec_desc->pdb_dec.options |= PDBHMO_ESP_DIFFSERV;
-
+		/* The inner traffic class is left as it arrived: PDBHMO_ESP_DIFFSERV
+		 * would copy the whole outer byte over it, ECN included, where
+		 * Linux keeps the inner DSCP (RFC 4301 5.1.2.1) and never erases the
+		 * inner ECN field (RFC 6040). States that ask for the outer DSCP
+		 * are refused offload (ft_ipsec_spec()). An outer CE still reaches
+		 * the inner header by RFC 6040's decapsulation rules, as Linux's
+		 * does, unless the state has `noecn`. */
+		if (!(sa->flags & SA_NOECN))
+			sec_desc->pdb_dec.options |= PDBOPTS_TECN;
 		if (sa->hdr_flags) {
-			/*if (sa->hdr_flags & SA_HDR_COPY_TOS)
-				sec_desc->pdb_dec.options |= PDBHMO_ESP_DIFFSERV; */
 			if (sa->hdr_flags & SA_HDR_DEC_TTL)
 				sec_desc->pdb_dec.options |= PDBHMO_ESP_DECAP_DEC_TTL;
 			if (sa->hdr_flags & SA_HDR_COPY_DF)

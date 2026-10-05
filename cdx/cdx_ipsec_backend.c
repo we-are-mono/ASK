@@ -417,6 +417,9 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 	 * caller read. */
 	if (spec->copy_df)
 		sa->hdr_flags |= SA_HDR_COPY_DF;
+	/* And whether an outer CE reaches the inner header, the state's too. */
+	if (!spec->ecn)
+		sa->flags |= SA_NOECN;
 
 	if (spec->natt_sport)
 		cdx_ipsec_set_natt(&sa->natt.sport, &sa->natt.dport,

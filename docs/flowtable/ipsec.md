@@ -283,6 +283,19 @@ included — strongSwan's `sha256_96`, and xfrm's default for `auth` rather than
 `auth-trunc` — since every frame would carry an ICV of the wrong length (A223).
 So is `cmac(aes)`: SEC has AES-CMAC-96 but cdx carries no CMAC, and with no
 PF_KEY number it used to reach SEC as no authentication at all.
+The traffic class follows Linux. SEC moves a tunnel's TOS or traffic-class byte
+only whole, DSCP and ECN together. Decapsulation keeps the inner byte (RFC 4301
+5.1.2.1) and applies RFC 6040's ECN rules (`PDBOPTS_ESP_TECN`, left off for a
+`noecn` state, as Linux leaves them): an outer CE becomes an inner CE where the
+inner header is ECN-capable. Over a Not-ECT inner header an outer CE is a mark
+no compliant encapsulator lets arise; RFC 6040 drops that packet, and so does
+SEC, where Linux's xfrm forwards it unmarked. Encapsulation copies the inner
+byte to the outer header. That carries the DSCP as Linux does, and the ECN
+field in RFC 6040's normal mode, CE included, where Linux sends CE as ECT(0).
+States asking for what the whole byte cannot express are refused with
+`EOPNOTSUPP` and stay in software: `decap-dscp` inbound, which would take the
+outer ECN with the DSCP, and `dont-encap-dscp` and `noecn` outbound.
+`flowtable_service_ipsec_dscp.py` measures each case.
 NAT-T is carried through `x->encap->encap_sport/dport`, which the hardware SA
 keeps. An in-place `XFRM_MSG_UPDSA` reaches no driver, so 040 refuses one that
 would change a packet-offloaded state's ports or its output mark (`EINVAL`) —
