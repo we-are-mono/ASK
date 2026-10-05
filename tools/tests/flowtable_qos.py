@@ -1332,6 +1332,43 @@ async def test_flower_police_mtu_boundary(qos):
                        for length in crossed}, crossed
 
 
+# Linux charges a police action's rate the IP datagram (qdisc_pkt_len() at tc
+# ingress), not the Ethernet header or FCS around it. Small datagrams make the
+# difference large: 92 IP bytes against a 110-byte frame.
+SMALL_DATAGRAM = 64
+SMALL_RATE_MBIT = 50
+
+
+async def test_flower_police_charges_ip_bytes(qos):
+    """An offloaded police action admits as many small datagrams per second as
+    Linux's would: its rate counts IP bytes."""
+    r = qos
+    dev = TARGET_WAN_IF
+    target = f"{r.lan_ip}:{PORT_POLICED}"
+    await r.tc("qdisc", "add", "dev", dev, "clsact")
+    await r.tc("filter", "add", "dev", dev, "ingress", "protocol", "ip", "pref", "1",
+               "flower", "skip_sw", "ip_proto", "udp", "dst_ip", r.lan_ip,
+               "dst_port", str(PORT_POLICED),
+               "action", "police", "rate", f"{SMALL_RATE_MBIT}mbit", "burst", POLICE_BURST,
+               "conform-exceed", "drop")
+    await offload(r, inbound(r, "udp", PORT_POLICED))
+    await lan_start(r, iperf=[PORT_POLICED])
+    report = await iperf(r, PORT_POLICED, udp_mbit=3 * SMALL_RATE_MBIT, datagram=SMALL_DATAGRAM)
+    state = await r.state()
+    shown = (await r.tc("-s", "filter", "show", "dev", dev, "ingress"))["stdout"]
+    forward = directions(state, ingress=dev, proto=17, dst=target)
+    goodput = received_bps(report)
+    ip_bytes = SMALL_DATAGRAM + 8 + 20
+    expected = SMALL_RATE_MBIT * 1e6 * SMALL_DATAGRAM / ip_bytes
+    r.record("qos-police-ip-bytes", {"filter": shown, "state": state, "goodput_bps": goodput,
+                                      "expected_bps": expected, "report": report})
+    assert len(forward) == 1 and 1 <= int(forward[0]["qos"], 16) >> 8 & 0xf <= 7, forward
+    assert police_counters(shown)[1], shown
+    # Charging the whole frame would land 16% under; the token bucket itself
+    # runs a little under the rate.
+    assert 0.95 * expected <= goodput <= 1.03 * expected, (goodput, expected)
+
+
 async def test_egress_change_readmits_under_the_tree(qos):
     """A tree built or removed under live offloaded flows retires and readmits
     every one of them, with nothing but the next packet doing it.

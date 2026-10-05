@@ -422,6 +422,45 @@ int cdxdrv_release_shared_policers(struct cdx_fman_info *finfo)
 }
 
 /* api to modify port specific policer profile to reserver bandwidth for incoming control packets */
+/* What a byte-mode profile counts of a frame.
+ *
+ * A tc police action charges its rate the IP datagram (qdisc_pkt_len() at tc
+ * ingress, after any VLAN tag has been moved out of the frame), which is
+ * e_FM_PCD_PLCR_L3_FRM_LEN: measured on the rig with untagged frames, it counts
+ * from the IP header to the end of the frame without the FCS (the parser puts
+ * the IP header after any tags), where L2 counts the
+ * Ethernet header too and FULL the FCS as well. A red frame's rollback was
+ * measured to make no difference either way; L2, the nearer, is taken.
+ * NXP's profiles meter the whole frame as the wire carried it. */
+static void cdx_plcr_lengths(t_FmPcdPlcrProfileParams *params, bool tc_meter)
+{
+	params->nonPassthroughAlgParams.byteModeParams.frameLengthSelection =
+		tc_meter ? e_FM_PCD_PLCR_L3_FRM_LEN : e_FM_PCD_PLCR_FULL_FRM_LEN;
+	params->nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection =
+		tc_meter ? e_FM_PCD_PLCR_ROLLBACK_L2_FRM_LEN : e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
+}
+
+/* What a profile does with each colour. A tc police action passes only a
+ * frame that fits both of its buckets, which is green: yellow, above the
+ * committed rate and within the peak, is excess to Linux and dropped. NXP's
+ * profiles pass yellow, holding traffic to the peak pair alone. Red is
+ * dropped either way. */
+static void cdx_plcr_actions(t_FmPcdPlcrProfileParams *params, e_FmPcdEngine next,
+			     e_FmPcdDoneAction action, bool tc_meter)
+{
+	params->nextEngineOnGreen = next;
+	params->paramsOnGreen.action = action;
+	if (tc_meter) {
+		params->nextEngineOnYellow = e_FM_PCD_DONE;
+		params->paramsOnYellow.action = e_FM_PCD_DROP_FRAME;
+	} else {
+		params->nextEngineOnYellow = next;
+		params->paramsOnYellow.action = action;
+	}
+	params->nextEngineOnRed = e_FM_PCD_DONE;
+	params->paramsOnRed.action = e_FM_PCD_DROP_FRAME;
+}
+
 /* Program a port's ingress rate-limiter profile. The profile is created once at
  * port init; this only pushes parameters into it.
  *
@@ -429,13 +468,13 @@ int cdxdrv_release_shared_policers(struct cdx_fman_info *finfo)
  * what restoring the boot-time rate does. A tc police action carries its own
  * burst and passes it through.
  *
- * `drop_yellow` is tc's: Linux passes only what fits both of its buckets,
- * which is green. The boot-time rate passes yellow, holding the port to its
- * peak pair.
+ * `tc_meter` meters as a tc police action does (cdx_plcr_lengths(),
+ * cdx_plcr_actions()). The boot-time rate meters as NXP's profiles always
+ * have: whole frames, yellow passed, the port held to its peak pair.
  */
 static int port_plcr_set(char *ifname, uint32_t rate_mode,
 			 uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs,
-			 bool drop_yellow)
+			 bool tc_meter)
 {
 	void *handle;
 	int hardwarePortId;
@@ -476,14 +515,8 @@ static int port_plcr_set(char *ifname, uint32_t rate_mode,
 	//override color is RED
 	Params.color.override = e_FM_PCD_PLCR_RED;
 	Params.nonPassthroughAlgParams.rateMode = rate_mode;
-	if (rate_mode == e_FM_PCD_PLCR_BYTE_MODE) {
-		/* Meter the frame as it arrived, and roll a red frame back by the
-		 * same length, so the accounting matches what the wire carried. */
-		Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection =
-			e_FM_PCD_PLCR_FULL_FRM_LEN;
-		Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection =
-			e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
-	}
+	if (rate_mode == e_FM_PCD_PLCR_BYTE_MODE)
+		cdx_plcr_lengths(&Params, tc_meter);
 	if (iface_info->eth_info.speed == PORT_1G_SPEED ) {
 		Params.nonPassthroughAlgParams.committedBurstSize = cbs ? cbs : DEFAULT_1G_PORT_FF_CBS;
 		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs ? pbs : DEFAULT_1G_PORT_FF_PBS;
@@ -503,17 +536,7 @@ static int port_plcr_set(char *ifname, uint32_t rate_mode,
 		Params.nonPassthroughAlgParams.committedInfoRate = cir;
 		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = pir;
 	}
-	Params.nextEngineOnGreen = e_FM_PCD_PRS;
-	Params.paramsOnGreen.action = e_FM_PCD_ENQ_FRAME;
-	if (drop_yellow) {
-		Params.nextEngineOnYellow = e_FM_PCD_DONE;
-		Params.paramsOnYellow.action = e_FM_PCD_DROP_FRAME;
-	} else {
-		Params.nextEngineOnYellow = e_FM_PCD_PRS;
-		Params.paramsOnYellow.action = e_FM_PCD_ENQ_FRAME;
-	}
-	Params.nextEngineOnRed = e_FM_PCD_DONE;
-	Params.paramsOnRed.action = e_FM_PCD_DROP_FRAME;
+	cdx_plcr_actions(&Params, e_FM_PCD_PRS, e_FM_PCD_ENQ_FRAME, tc_meter);
 	handle = FM_PCD_PlcrProfileSet(port_rate_lim_mode[hardwarePortId].h_FmPcd, &Params);
 	if (!handle) {
 		printk("%s::unable to modify profile for port %d\n",
@@ -708,9 +731,10 @@ int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *finfo)
 	return 0;
 }
 
-/* api to modify ingress qos policer parameters. `drop_yellow` as for
- * port_plcr_set(): tc's meters pass green alone, the SEC profile yellow too. */
-int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs, bool drop_yellow)
+/* api to modify ingress qos policer parameters. `tc_meter` as for
+ * port_plcr_set(): a tc police action's meter, or NXP's, which the SEC
+ * profile keeps. */
+int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs, bool tc_meter)
 {
 	void *handle;
 	t_FmPcdPlcrProfileParams Params;
@@ -752,8 +776,7 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 		Params.nonPassthroughAlgParams.committedBurstSize = cbs;
 		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = pir;
 		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs;
-		Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection = e_FM_PCD_PLCR_FULL_FRM_LEN;
-		Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection = e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
+		cdx_plcr_lengths(&Params, tc_meter);
 	}
 #ifdef SEC_PROFILE_SUPPORT
 	else
@@ -767,24 +790,14 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 	}
 #endif /* endif for SEC_PROFILE_SUPPORT */
 
-	Params.nextEngineOnGreen = e_FM_PCD_CC;
-	Params.paramsOnGreen.action = e_FM_PCD_POST_POLICER_PROCES_FRAME;
-	if (drop_yellow) {
-		Params.nextEngineOnYellow = e_FM_PCD_DONE;
-		Params.paramsOnYellow.action = e_FM_PCD_DROP_FRAME;
-	} else {
-		Params.nextEngineOnYellow = e_FM_PCD_CC;
-		Params.paramsOnYellow.action = e_FM_PCD_POST_POLICER_PROCES_FRAME;
-	}
-	Params.nextEngineOnRed = e_FM_PCD_DONE;
-	Params.paramsOnRed.action = e_FM_PCD_DROP_FRAME;
+	cdx_plcr_actions(&Params, e_FM_PCD_CC, e_FM_PCD_POST_POLICER_PROCES_FRAME, tc_meter);
 	handle = FM_PCD_PlcrProfileSet(finfo->pcd_handle, &Params);
 	if (!handle) {
 		printk("%s::unable to modify profile for queue %d\n",
 				__func__, queue_no);
 		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
 	}
-	finfo->ingress_policer_info[queue_no].drop_yellow = drop_yellow;
+	finfo->ingress_policer_info[queue_no].tc_meter = tc_meter;
 	finfo->ingress_policer_info[queue_no].cir_value = cir;
 	finfo->ingress_policer_info[queue_no].pir_value = pir;
 	finfo->ingress_policer_info[queue_no].cbs = cbs;
@@ -872,7 +885,7 @@ int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t
 		finfo->ingress_policer_info[queue_no].pbs = DEFAULT_SEC_PKT_MODE_PBS;
 	}
 #endif /* endif for SEC_PROFILE_SUPPORT */
-	finfo->ingress_policer_info[queue_no].drop_yellow = false;
+	finfo->ingress_policer_info[queue_no].tc_meter = false;
 #ifdef QOS_DEBUG
 	printk("%s::plcr profile set to default for queue %d, handle %p\n",
 			__func__, queue_no, handle);
@@ -892,7 +905,7 @@ int cdxdrv_enable_or_disable_ingress_policer(struct cdx_fman_info *finfo, uint32
 					finfo->ingress_policer_info[queue_no].pir_value,
 					finfo->ingress_policer_info[queue_no].cbs,
 					finfo->ingress_policer_info[queue_no].pbs,
-					finfo->ingress_policer_info[queue_no].drop_yellow);
+					finfo->ingress_policer_info[queue_no].tc_meter);
 		}
 	}
 	else {

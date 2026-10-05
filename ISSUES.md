@@ -281,13 +281,16 @@ result independently of those temporary files.
 - [x] **A322 — an offloaded tc police with a peakrate passed the peak rate, and frames over its mtu, where Linux holds
   both.** Fixed: tc profiles drop yellow, the peak bucket is mtu (+FCS) deep (_:/^cdx: police by Linux's two buckets_).
 
-- [ ] **A323 — offloaded tc police charges its rate bucket 18 bytes per frame more than Linux.** Linux charges the IP
-  datagram (`qdisc_pkt_len()` at tc ingress); the FMan profile measures `e_FM_PCD_PLCR_FULL_FRM_LEN`, Ethernet header and
-  FCS included. A flow policed in hardware gets ~1.2% less at 1500-byte frames and ~28% less at 64-byte ones than the
-  same rule in software. Candidate fix: `e_FM_PCD_PLCR_L3_FRM_LEN` for tc profiles, with PBS = mtu - 14 (+FCS if L3
-  counts it); the FMan RM is not in the tree and the rollback selection only offers L2 or FULL, so how a red frame's
-  rollback interacts with L3 charging must be measured on the rig (`test_flower_police_follows_linux_buckets` with
-  64-byte datagrams, `test_flower_police_mtu_boundary`) before switching. The length check is exact today.
+- [x] **A323 — offloaded tc police charged its rate bucket 18 bytes per frame more than Linux.** Fixed: tc profiles
+  count the IP datagram (L3, rig-measured), peak bucket mtu - 14 (_:/^cdx: charge a police rate the IP datagram_).
+
+- [ ] **A325 — an offloaded matchall police never meters non-IP frames.** Measured 2026-10-06: 2000 1000-byte frames
+  of ethertype 0x88b5 into a 1 Mbit/s `matchall skip_sw` police on eth4 left the profile's colour counters at 0 (the
+  IPv4 control: 2000 metered, 1947 dropped), so the port profile is applied only on the IP classification path. Linux's
+  matchall polices every frame; with `skip_sw` nothing polices ARP, PPPoE discovery, LLDP or any other non-IP traffic
+  reaching the port. Find which KeyGen scheme/default path non-IP frames take (cdx PCD build) and whether it can name
+  the port profile; failing that, refuse `skip_sw` for matchall, so tc keeps the software filter for what the hardware
+  leaves out. Also unmeasured: what L3 length the profile charges a PPPoE session frame (Linux: PPPoE header + IP).
 
 - [x] **A324 — two matchall police filters on one port shared its one rate limiter.** Fixed: a second is refused;
   each delete restored the boot rate under the other (_:/^cdx: police by Linux's two buckets_).

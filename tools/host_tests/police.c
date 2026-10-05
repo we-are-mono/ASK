@@ -30,7 +30,7 @@ typedef uint16_t __be16; typedef uint32_t __be32;
 #define SUCCESS 0
 #define FAILURE 1
 #define U32_MAX UINT32_MAX
-#define ETH_FCS_LEN 4
+#define ETH_HLEN 14
 #define EOPNOTSUPP 95
 #define EINVAL 22
 #define ENOSPC 28
@@ -231,7 +231,7 @@ static int cdx_ingress_policer_counters(u32 fm, u32 queue_no, struct cdx_police_
 static struct {
     unsigned enabled, disabled, configured;
     u32 last_profile, cir, pir, pbs;
-    bool drop_yellow;
+    bool tc_meter;
 } prof;
 static bool prof_fail;
 static int cdx_ingress_enable_or_disable_qos(u32 fm, u32 queue_no, u32 oper)
@@ -243,11 +243,11 @@ static int cdx_ingress_enable_or_disable_qos(u32 fm, u32 queue_no, u32 oper)
     return prof_fail ? FAILURE : SUCCESS;
 }
 static int cdx_ingress_policer_modify_config(u32 fm, u32 queue_no, u32 cir, u32 pir,
-                                             u32 cbs, u32 pbs, bool drop_yellow)
+                                             u32 cbs, u32 pbs, bool tc_meter)
 {
     (void)fm; (void)cbs;
     prof.configured++; prof.last_profile = queue_no; prof.cir = cir; prof.pir = pir;
-    prof.pbs = pbs; prof.drop_yellow = drop_yellow;
+    prof.pbs = pbs; prof.tc_meter = tc_meter;
     return prof_fail ? FAILURE : SUCCESS;
 }
 
@@ -383,8 +383,9 @@ int main(void)
     assert(offer(base()) == 0);
     assert(hw.set && hw.byte_mode);
     assert(hw.cir == 500000 && hw.pir == CDX_POLICE_UNBOUNDED_KBITS);
-    /* The profile measures the FCS the MAC forwards; Linux does not. */
-    assert(hw.cbs == 64000 && hw.pbs == 2040 + 4);
+    /* The profile counts from the IP header, as Linux charges the rate;
+     * Linux's length check adds the Ethernet header back. */
+    assert(hw.cbs == 64000 && hw.pbs == 2040 - 14);
 
     /* A peak rate is Linux's second bucket, `mtu` deep at that rate: its
      * long-term rate stays the committed one. */
@@ -392,9 +393,13 @@ int main(void)
     a.police.peakrate_bytes_ps = 125000000; /* 1 Gbit/s */
     a.police.mtu = 9216;
     assert(offer(a) == 0 && hw.cir == 500000 && hw.pir == 1000000);
-    assert(hw.cbs == 64000 && hw.pbs == 9216 + 4);
+    assert(hw.cbs == 64000 && hw.pbs == 9216 - 14);
     a.police.mtu = U32_MAX;                 /* no length worth checking */
-    assert(offer(a) == 0 && hw.pbs == U32_MAX);
+    assert(offer(a) == 0 && hw.pbs == U32_MAX - 14);
+    /* An mtu no frame fits keeps a bucket nothing fits, never an empty
+     * one, which the profile would read as "use the default". */
+    a.police.mtu = 10;
+    assert(offer(a) == 0 && hw.pbs == 1);
 
     a = base(); a.police.peakrate_bytes_ps = 1000;
     assert(offer(a) == -EOPNOTSUPP);
@@ -499,7 +504,7 @@ int main(void)
     assert(prof.enabled == 1 && prof.configured == 1);
     assert(prof.last_profile == 1);          /* profile 0 is the default */
     assert(prof.cir == 500000 && prof.pir == CDX_POLICE_UNBOUNDED_KBITS);
-    assert(prof.pbs == 2040 + 4 && prof.drop_yellow);
+    assert(prof.pbs == 2040 - 14 && prof.tc_meter);
     assert(cdx_police_lookup(&flow) == 1);
 
     /* The filter is on one port's ingress. The same tuple arriving elsewhere

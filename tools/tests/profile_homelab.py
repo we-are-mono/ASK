@@ -1692,8 +1692,8 @@ async def test_ingress_policer_holds_the_rate(homelab, splat_window):
     measurement: the filter is offloaded or it does not exist, and `tc filter
     show` reporting `in_hw` is the kernel agreeing that a driver took it. The
     rate that follows is then the hardware's, and the profile's own colour
-    counters are what the drops are read from -- green and yellow are enqueued,
-    red is dropped, so every frame the meter saw is the sum of the three.
+    counters are what the drops are read from -- green is enqueued, yellow and
+    red are dropped, so every frame the meter saw is the sum of the three.
 
     The 2 Gbit/s cap is below line rate and above software forwarding capacity.
     Received throughput near that cap, in_hw and accounted drops prove both

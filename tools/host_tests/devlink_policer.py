@@ -53,6 +53,7 @@ def test_devlink_policer(tmp_path):
         + qos[qos.index("#define DEFAULT_INGRESS_CIR_VALUE"):
               qos.index("uint32_t port_ff_lim_mode")]
         + "".join(function(qos, name) for name in [
+            "cdx_plcr_lengths", "cdx_plcr_actions",
             "cdxdrv_modify_missaction_policer_profile",
             "cdxdrv_create_missaction_policer_profiles",
             "cdxdrv_create_ingress_qos_policer_profiles",

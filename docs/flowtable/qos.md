@@ -1310,15 +1310,26 @@ well, since `rate_pkt_ps` maps to packet mode and these profiles support it.
 There is no peak bucket there and no length to check, so a packet rate with
 an `mtu` stays in software.
 
-The profile measures every frame whole, as the MAC forwarded it: Ethernet
-header, any VLAN tag and the FCS. Linux's length check takes the frame as tc
-ingress has it, header and tag included but no FCS, so the peak bucket is four
-bytes deeper than `mtu`, and a frame of exactly `mtu` crosses both
-(`test_flower_police_mtu_boundary` sweeps the boundary). The rate bucket keeps
-one difference: Linux charges it the IP datagram alone (`qdisc_pkt_len()`),
-the profile the whole frame, 18 bytes more. Offloaded policing is that much
-stricter -- about 1.2% for full-size frames, a quarter for minimum-size ones
-(A323).
+What a frame costs follows Linux too. Linux charges a police rate the IP
+datagram (`qdisc_pkt_len()` at tc ingress, after `skb_vlan_untag()` has moved
+a tag out of the frame) and checks the length with the 14-byte Ethernet
+header added back. A tc profile counts `e_FM_PCD_PLCR_L3_FRM_LEN`, which the
+rig measured on untagged frames as exactly that datagram: from the IP header
+to the end of the frame without the FCS (`L2_FRM_LEN` adds the Ethernet header,
+`FULL_FRM_LEN` the FCS as well); the parser places the IP header after any
+tags. So the peak bucket is `mtu` less 14 deep, and a frame of exactly `mtu`
+crosses (`test_flower_police_mtu_boundary`), and small datagrams are admitted
+at Linux's rate (`test_flower_police_charges_ip_bytes`; charging the whole
+frame admitted 16% fewer 64-byte ones, A323). The reference documents the
+selections only by name; the rig's sweep is the source. NXP's profiles, the
+boot rate and SEC's, keep metering whole frames.
+
+What remains is small and on the lenient side. A second VLAN tag (QinQ) or a
+PPPoE session header stays in Linux's count and not in the profile's: 4 or 8
+bytes per frame less charged, and frames that much longer pass. With a peak
+rate, the one PBS is both the length check and the peak bucket's depth, so
+that bucket is 14 bytes shallower than Linux's. Non-IP frames never reach a
+matchall's meter at all (A325).
 
 Only the unit differs. The kernel gives bytes per second; the FMD's byte mode
 takes Kbit/s (`GetInfoRateReg()` does `tmp *= 1000`), so the conversion is

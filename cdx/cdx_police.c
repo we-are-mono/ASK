@@ -120,18 +120,22 @@ static int cdx_police_rates(const struct flow_action_entry *act,
 		 * the buckets hold (tcf_police_act()). The profile drops yellow
 		 * for tc (cdx_port_police_set()), so its green is that same
 		 * rule: the committed bucket is the rate's, and the peak bucket
-		 * is `mtu` deep at the peak rate. With no peak rate the peak
-		 * bucket still does the length check, refilled far faster than
-		 * any port can drain it, so only a frame longer than it misses. */
+		 * at the peak rate does the length check as well, so it is as
+		 * deep as the longest frame `mtu` lets through (below) -- 14
+		 * bytes shallower than Linux's. With no peak rate it does the
+		 * length check alone, refilled far faster than any port can
+		 * drain it, so only a frame longer than it misses. */
 		*pir = act->police.peakrate_bytes_ps ?
 			cdx_police_bytes_to_kbits(act->police.peakrate_bytes_ps) :
 			CDX_POLICE_UNBOUNDED_KBITS;
-		/* The profile measures the whole frame as the MAC forwarded
-		 * it, FCS included; Linux measures it as tc ingress has it,
-		 * without one. A VLAN tag stays in the frame for both, as
-		 * nothing strips it on receive. */
-		*pbs = act->police.mtu > U32_MAX - ETH_FCS_LEN ? U32_MAX :
-		       act->police.mtu + ETH_FCS_LEN;
+		/* A tc profile counts the frame from its IP header on
+		 * (cdx_plcr_lengths()), what Linux charges the rate, while
+		 * Linux's length check adds the 14-byte Ethernet header back:
+		 * tc ingress has already moved a VLAN tag out of the frame. A
+		 * second tag (QinQ) or a PPPoE session header stays in Linux's
+		 * count and not in the profile's, which is that much more
+		 * lenient. An mtu no frame fits keeps a bucket nothing fits. */
+		*pbs = act->police.mtu > ETH_HLEN ? act->police.mtu - ETH_HLEN : 1;
 	} else {
 		*cir = (u32)act->police.rate_pkt_ps;
 		*pir = *cir;

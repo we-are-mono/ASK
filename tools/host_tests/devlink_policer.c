@@ -304,6 +304,28 @@ int main(void)
     assert(registered(CDX_DEVLINK_POLICER_PUNT) && !registered(CDX_DEVLINK_POLICER_SEC));
     cdx_devlink_detach();
 
+    /* ---- a tc police action's meter, and the default it returns to ---- */
+    configure(NULL);
+    assert(cdx_ingress_enable_or_disable_qos(FMAN_INDEX, 1, ENABLE_INGRESS_POLICER) == SUCCESS);
+    assert(cdx_ingress_policer_modify_config(FMAN_INDEX, 1, 50000, 100000000, 64000, 2026,
+                                             true) == SUCCESS);
+    p = fman.ingress_policer_info[1].handle;
+    /* IP lengths, as Linux charges a police rate, and only green passes. */
+    assert(p->params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection ==
+           e_FM_PCD_PLCR_L3_FRM_LEN);
+    assert(p->params.nextEngineOnYellow == e_FM_PCD_DONE &&
+           p->params.paramsOnYellow.action == e_FM_PCD_DROP_FRAME);
+    assert(p->params.nextEngineOnGreen != e_FM_PCD_DONE);
+    assert(p->params.nonPassthroughAlgParams.peakOrExcessBurstSize == 2026);
+    /* Given back, the profile meters as NXP's do again, whatever enables it
+     * next. */
+    assert(cdx_ingress_enable_or_disable_qos(FMAN_INDEX, 1, DISABLE_INGRESS_POLICER) == SUCCESS);
+    assert(cdx_ingress_enable_or_disable_qos(FMAN_INDEX, 1, ENABLE_INGRESS_POLICER) == SUCCESS);
+    assert(p->params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection ==
+           e_FM_PCD_PLCR_FULL_FRM_LEN);
+    assert(p->params.nextEngineOnYellow == p->params.nextEngineOnGreen);
+    assert(cdx_ingress_enable_or_disable_qos(FMAN_INDEX, 1, DISABLE_INGRESS_POLICER) == SUCCESS);
+
     /* ---- nothing to report, no instance ---- */
     configure(no_punt);
     assert(cdx_ingress_enable_or_disable_qos(FMAN_INDEX, INGRESS_SEC_POLICER_QUEUE_NUM,

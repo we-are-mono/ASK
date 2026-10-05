@@ -186,7 +186,7 @@ print('LAN-DOWN')
 
 # ---- the orchestrator's side ----------------------------------------------
 
-async def iperf(r, port, *, seconds=IPERF_SECONDS, udp_mbit=None, streams=1):
+async def iperf(r, port, *, seconds=IPERF_SECONDS, udp_mbit=None, streams=1, datagram=DATAGRAM):
     """One iperf3 run from here to the LAN VM, and its report.
 
     The receiver's intervals come back in `server_output_json`, which is where a
@@ -196,7 +196,7 @@ async def iperf(r, port, *, seconds=IPERF_SECONDS, udp_mbit=None, streams=1):
     argv = ["iperf3", "-c", r.lan_ip, "-B", WAN_IP, "-p", str(port), "-t", str(seconds),
             "-J", "--get-server-output"]
     if udp_mbit:
-        argv += ["-u", "-b", f"{udp_mbit}M", "-l", str(DATAGRAM)]
+        argv += ["-u", "-b", f"{udp_mbit}M", "-l", str(datagram)]
     if streams > 1:
         argv += ["-P", str(streams)]
     proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE,
