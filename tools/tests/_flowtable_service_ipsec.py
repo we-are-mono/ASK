@@ -32,7 +32,8 @@ from _flowtable_service_vlan import balanced, denied
 from _flowtable_tcp import software_tx
 from _flowtable_tunnel import Capture
 from _ipsec_inbound_flow_offload import AUTH, CIPHER, sec_counter
-from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from _topology import (DUT_IPV6_WAN, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6, has_address,
+                       lan_run_python)
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 
@@ -47,12 +48,15 @@ UDP_ENCAP, UDP_ENCAP_ESPINUDP = 100, 2
 
 @dataclass(frozen=True)
 class Transform:
-    """The fixture's SA pair: the `ip xfrm state` algorithm arguments, and UDP
-    encapsulation as (DUT port, peer port), or None for bare ESP.
+    """The fixture's SA pair: the `ip xfrm state` algorithm arguments, UDP
+    encapsulation as (DUT port, peer port) or None for bare ESP, and whether
+    the tunnel's endpoints are IPv6 (the DUT's and the WAN host's WAN-segment
+    addresses) rather than IPv4. The inner traffic is IPv4 either way.
 
     A test asks for another one by parametrizing `ipsec_service` indirectly."""
     algorithms: tuple = ("enc", "cbc(aes)", CIPHER, "auth-trunc", "hmac(sha256)", AUTH, "128")
     encap: tuple | None = None
+    outer6: bool = False
 
 
 async def xfrm(r, agent, kind):
@@ -93,13 +97,13 @@ async def acq_expires(r, agent):
 
 
 class SecurityAssociations:
-    def __init__(self, r, wan, outer, transform=Transform()):
-        self.r, self.wan, self.outer = r, wan, outer
+    def __init__(self, r, wan, outer, transform=Transform(), peer=WAN_IP):
+        self.r, self.wan, self.outer, self.peer = r, wan, outer, peer
         self.transform = transform
         self.active, self.cleanup = {}, []
 
     def state(self, direction, spi):
-        src, dst = (self.outer, WAN_IP) if direction == "out" else (WAN_IP, self.outer)
+        src, dst = (self.outer, self.peer) if direction == "out" else (self.peer, self.outer)
         return ["src", src, "dst", dst, "proto", "esp", "spi", hex(spi)]
 
     def crypto(self, direction):
@@ -108,7 +112,11 @@ class SecurityAssociations:
             # The source port is the sending end's: the DUT's going out.
             sport, dport = self.transform.encap if direction == "out" else self.transform.encap[::-1]
             encap = ["encap", "espinudp", str(sport), str(dport), "0.0.0.0"]
-        return ["mode", "tunnel", "reqid", REQIDS[direction], *self.transform.algorithms, *encap]
+        # A state's selector otherwise takes the state's own family, the
+        # outer one, and no IPv4 flow would ever find an IPv6-outer state.
+        # strongSwan sets the same flag for a tunnel whose families differ.
+        mixed = ["flag", "af-unspec"] if self.transform.outer6 else []
+        return ["mode", "tunnel", "reqid", REQIDS[direction], *self.transform.algorithms, *encap, *mixed]
 
     async def add(self, agent, kind, identity, *options, check=True):
         result = await command(agent, self.r.session, "ip", "xfrm", kind, "add", *identity, *options, check=check)
@@ -170,7 +178,11 @@ async def ipsec_service(rig, request):
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     outer = next(a["local"] for i in json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show", "dev", TARGET_WAN_IF))["stdout"])
                  for a in i["addr_info"] if a["family"] == "inet")
-    r.ipsec = sa = SecurityAssociations(r, wan, outer, transform)
+    # The tunnel's endpoints. The inner routes below stay IPv4 either way:
+    # they only bring the inner packets to the policies that encapsulate them.
+    assert not (transform.outer6 and transform.encap), "NAT-T is IPv4's"
+    endpoint, peer_endpoint = (DUT_IPV6_WAN, WAN_IPV6) if transform.outer6 else (outer, WAN_IP)
+    r.ipsec = sa = SecurityAssociations(r, wan, endpoint, transform, peer_endpoint)
     r.ipsec_wire_if = wire_interface(r)
     transport, lan_created, encap = None, False, None
     cleanup = []
@@ -193,6 +205,17 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
         result = await lan_run_python(r.lan, setup, label='ipsec_recovery_inner', timeout=15)
         assert result.rc == 0, result.stdout
         lan_created = True
+        if transform.outer6:
+            # The DUT's WAN-segment address is normally the image's own, and
+            # stays; the WAN host's is the fixture's for the duration.
+            if not await has_address(r.target, r.session, TARGET_WAN_IF, DUT_IPV6_WAN):
+                await command(r.target, r.session, "ip", "-6", "addr", "add", f"{DUT_IPV6_WAN}/64",
+                              "dev", TARGET_WAN_IF, "nodad")
+                cleanup.append((r.target, ["ip", "-6", "addr", "del", f"{DUT_IPV6_WAN}/64",
+                                           "dev", TARGET_WAN_IF]))
+            await command(wan, r.session, "ip", "-6", "addr", "add", f"{WAN_IPV6}/64",
+                          "dev", r.wan_if, "nodad")
+            cleanup.append((wan, ["ip", "-6", "addr", "del", f"{WAN_IPV6}/64", "dev", r.wan_if]))
         for agent, args, undo in [
             (wan, ["ip", "addr", "add", INNER + "/32", "dev", "lo"], ["ip", "addr", "del", INNER + "/32", "dev", "lo"]),
             (r.target, ["ip", "route", "add", INNER + "/32", "via", WAN_IP, "dev", TARGET_WAN_IF, "mtu", "1400"],
@@ -214,7 +237,8 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
             spi = await sa.prepare_peer(direction)
             await sa.install(direction, spi)
             src, dst = (LAN_INNER, INNER) if direction == "out" else (INNER, LAN_INNER)
-            outer_src, outer_dst = (outer, WAN_IP) if direction == "out" else (WAN_IP, outer)
+            outer_src, outer_dst = ((endpoint, peer_endpoint) if direction == "out"
+                                    else (peer_endpoint, endpoint))
             selector = ["src", src + "/32", "dst", dst + "/32"]
             template = ["tmpl", "src", outer_src, "dst", outer_dst, "proto", "esp", "mode", "tunnel",
                         "reqid", REQIDS[direction], "level", "required"]
@@ -299,7 +323,7 @@ class Wire(Capture):
     def __init__(self, r, label):
         self.path = artifact_dir() / (label + ".pcap")
         self.interface = r.ipsec_wire_if
-        esp = "ip proto 50"
+        esp = "ip6 proto 50" if r.ipsec.transform.outer6 else "ip proto 50"
         if r.ipsec.transform.encap:
             esp = f"(ip proto 50 or udp port {r.ipsec.transform.encap[0]})"
         self.filter = f"ether src {r.dut_wan_mac} and ({esp} or (src host {LAN_INNER} and dst host {INNER}))"

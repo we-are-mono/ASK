@@ -4128,6 +4128,11 @@ struct ft_ipsec_watch {
 	struct net_device *dev;
 	union nf_inet_addr local;
 	union nf_inet_addr peer;
+	/* The neighbour the SA's frames are addressed to: the peer on-link,
+	 * the route's gateway otherwise, as the last resolution found it. A
+	 * neighbour event is matched against this, not the peer, or a peer
+	 * behind a router would never see its router move. */
+	union nf_inet_addr hop;
 	/* What the peer is routed with besides the two addresses. */
 	struct ft_ipsec_route route;
 	/* What the hardware is currently writing: the peer's address and the
@@ -4224,14 +4229,19 @@ static struct ft_ipsec_watch *ft_ipsec_watch_unsampled(u64 pass)
 static void ft_ipsec_neigh_moved(struct neighbour *neigh)
 {
 	struct ft_ipsec_watch *watch;
+	u8 family;
 
-	if (neigh->tbl != &arp_tbl || neigh->dead ||
+	if ((neigh->tbl != &arp_tbl && neigh->tbl != &nd_tbl) || neigh->dead ||
 	    !(neigh->nud_state & NUD_VALID))
 		return;
+	family = neigh->tbl == &nd_tbl ? AF_INET6 : AF_INET;
 	list_for_each_entry(watch, &ft_ipsec_watches, list) {
-		if (watch->family != AF_INET || watch->dev != neigh->dev)
+		if (watch->family != family || watch->dev != neigh->dev)
 			continue;
-		if (*(__be32 *)neigh->primary_key != watch->peer.ip)
+		if (family == AF_INET ?
+		    *(__be32 *)neigh->primary_key != watch->hop.ip :
+		    !ipv6_addr_equal((const struct in6_addr *)neigh->primary_key,
+				     &watch->hop.in6))
 			continue;
 		/* A different address is the case this watch exists for. An
 		 * unchanged one still matters when a previous attempt failed
@@ -4371,6 +4381,7 @@ static void ft_ipsec_watch_add(struct ft_ipsec_watch *watch,
 	watch->route = *route;
 	watch->local = spec->src;
 	watch->peer = spec->dst;
+	watch->hop = spec->next_hop;
 	ether_addr_copy(watch->dst_mac, spec->dst_mac);
 	ether_addr_copy(watch->src_mac, spec->dev->dev_addr);
 	watch->built_mtu = watch->path_mtu = spec->path_mtu;
@@ -12762,34 +12773,64 @@ static void ft_mc_egress_changed(const struct net_device *dev)
  * policy at install -- the answer, with the default xfrm_larval_drop, was a
  * blackhole on the loopback device, which refused the SA, and the lookup
  * could send an ACQUIRE for a flow nothing had sent.
+ *
+ * An IPv6 peer is asked the same way: ip6_route_output() is the FIB alone, as
+ * __xfrm6_dst_lookup() uses it, and fails into dst->error rather than a
+ * pointer. Either answer is released with dst_release().
  */
-static struct rtable *ft_ipsec_peer_route(struct net_device *dev,
-					  const union nf_inet_addr *local,
-					  const union nf_inet_addr *peer,
-					  const struct ft_ipsec_route *route,
-					  struct flowi4 *fl4)
+static struct dst_entry *ft_ipsec_peer_route(struct net_device *dev, u8 family,
+					     const union nf_inet_addr *local,
+					     const union nf_inet_addr *peer,
+					     const struct ft_ipsec_route *route)
 {
-	*fl4 = (struct flowi4){
-		.daddr = peer->ip,
-		.saddr = local->ip,
-		.flowi4_mark = route->mark,
-		.flowi4_l3mdev = l3mdev_master_ifindex(dev),
-		.flowi4_proto = route->proto,
-		.fl4_sport = route->sport,
-		.fl4_dport = route->dport,
+	struct dst_entry *dst;
+	struct flowi6 fl6;
+	struct flowi4 fl4;
+	struct rtable *rt;
+	int err;
+
+	if (family == AF_INET) {
+		fl4 = (struct flowi4){
+			.daddr = peer->ip,
+			.saddr = local->ip,
+			.flowi4_mark = route->mark,
+			.flowi4_l3mdev = l3mdev_master_ifindex(dev),
+			.flowi4_proto = route->proto,
+			.fl4_sport = route->sport,
+			.fl4_dport = route->dport,
+		};
+		rt = __ip_route_output_key(&init_net, &fl4);
+		return IS_ERR(rt) ? ERR_CAST(rt) : &rt->dst;
+	}
+	if (family != AF_INET6)
+		return ERR_PTR(-EAFNOSUPPORT);
+	fl6 = (struct flowi6){
+		.daddr = peer->in6,
+		.saddr = local->in6,
+		.flowi6_mark = route->mark,
+		.flowi6_l3mdev = l3mdev_master_ifindex(dev),
+		.flowi6_proto = route->proto,
+		.fl6_sport = route->sport,
+		.fl6_dport = route->dport,
 	};
-	return __ip_route_output_key(&init_net, fl4);
+	dst = ip6_route_output(&init_net, NULL, &fl6);
+	err = dst->error;
+	if (err) {
+		dst_release(dst);
+		return ERR_PTR(err);
+	}
+	return dst;
 }
 
-/* What the SA's frames can carry to the peer on `rt`: its learned PMTU while
+/* What the SA's frames can carry to the peer on `dst`: its learned PMTU while
  * one is current, else its own MTU, else the device's (dst_mtu()), and never
  * more than the port's. What the entry SEC's output is classified by
  * fragments them to, and the path every direction the SA encrypts is bounded
  * on (ft_ipsec_bound()). */
-static u32 ft_ipsec_route_mtu(const struct rtable *rt,
+static u32 ft_ipsec_route_mtu(const struct dst_entry *dst,
 			      const struct net_device *dev)
 {
-	return min_t(u32, dst_mtu(&rt->dst), READ_ONCE(dev->mtu));
+	return min_t(u32, dst_mtu(dst), READ_ONCE(dev->mtu));
 }
 
 /* The MTU of the path to an SA's peer now, asked of the FIB alone.
@@ -12810,20 +12851,17 @@ static int ft_ipsec_path_mtu(struct net_device *dev, u8 family,
 			     const union nf_inet_addr *peer,
 			     const struct ft_ipsec_route *route, u32 *path_mtu)
 {
-	struct flowi4 fl4;
-	struct rtable *rt;
+	struct dst_entry *dst;
 	int rc = 0;
 
-	if (family != AF_INET)
-		return -EOPNOTSUPP;
-	rt = ft_ipsec_peer_route(dev, local, peer, route, &fl4);
-	if (IS_ERR(rt))
-		return PTR_ERR(rt);
-	if (rt->dst.dev == dev)
-		*path_mtu = ft_ipsec_route_mtu(rt, dev);
+	dst = ft_ipsec_peer_route(dev, family, local, peer, route);
+	if (IS_ERR(dst))
+		return PTR_ERR(dst);
+	if (dst->dev == dev)
+		*path_mtu = ft_ipsec_route_mtu(dst, dev);
 	else
 		rc = -EOPNOTSUPP;
-	ip_rt_put(rt);
+	dst_release(dst);
 	return rc;
 }
 
@@ -12845,37 +12883,36 @@ static int ft_ipsec_path_mtu(struct net_device *dev, u8 family,
  *
  * `path_mtu` receives the path's MTU (ft_ipsec_route_mtu()) once the route
  * is found, and keeps it when the neighbour then fails to resolve: the path
- * is the route's, whatever the peer on it does.
+ * is the route's, whatever the peer on it does. `hop` likewise receives the
+ * neighbour's address -- the route's gateway, or the peer on-link -- once it
+ * is looked up, resolved or not, and is left as the caller had it when no
+ * entry could be had: the neighbour event the SA's watch has to answer is
+ * that one's, and a failed allocation says nothing new about which it is.
  */
 static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
 			     const union nf_inet_addr *local,
 			     const union nf_inet_addr *peer,
 			     const struct ft_ipsec_route *route, bool wait,
-			     u8 *mac, u32 *path_mtu,
+			     u8 *mac, u32 *path_mtu, union nf_inet_addr *hop,
 			     struct netlink_ext_ack *extack)
 {
 	struct neighbour *neighbour;
+	struct dst_entry *dst;
 	unsigned int attempt;
-	struct flowi4 fl4;
-	struct rtable *rt;
 	int rc = 0;
 
 	eth_zero_addr(mac);
-	if (family != AF_INET) {
-		NL_SET_ERR_MSG(extack, "cdx: only IPv4 tunnel endpoints are supported");
-		return -EOPNOTSUPP;
-	}
-	rt = ft_ipsec_peer_route(dev, local, peer, route, &fl4);
-	if (IS_ERR(rt)) {
+	dst = ft_ipsec_peer_route(dev, family, local, peer, route);
+	if (IS_ERR(dst)) {
 		NL_SET_ERR_MSG(extack, "cdx: no route to the remote tunnel endpoint");
-		return PTR_ERR(rt);
+		return PTR_ERR(dst);
 	}
-	if (rt->dst.dev != dev) {
+	if (dst->dev != dev) {
 		NL_SET_ERR_MSG(extack, "cdx: the route to the peer does not leave by the offload device");
 		rc = -EOPNOTSUPP;
 		goto out;
 	}
-	*path_mtu = ft_ipsec_route_mtu(rt, dev);
+	*path_mtu = ft_ipsec_route_mtu(dst, dev);
 	/* Resolve the peer, asking for it if nobody has yet.
 	 *
 	 * An offloaded SA is usually installed moments after an IKE exchange
@@ -12890,13 +12927,16 @@ static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
 	 * before any CDX lock or RTNL is taken, so waiting blocks only the
 	 * caller that asked for the SA. The bound is short enough to be
 	 * invisible next to the exchange that preceded it and long enough for
-	 * ARP on a LAN.
+	 * ARP or neighbour discovery on a LAN. The route's own lookup picks the
+	 * next hop, its gateway or the peer on-link, in either family.
 	 */
-	neighbour = dst_neigh_lookup(&rt->dst, &fl4.daddr);
+	neighbour = dst_neigh_lookup(dst, peer);
 	if (!neighbour) {
 		rc = -EHOSTUNREACH;
 		goto report;
 	}
+	memset(hop, 0, sizeof(*hop));
+	memcpy(hop, neighbour->primary_key, family == AF_INET ? sizeof(hop->ip) : sizeof(hop->in6));
 	for (attempt = 0; attempt < (wait ? FT_IPSEC_NEIGH_TRIES : 1); attempt++) {
 		/* Every usable state, which is the same set admission accepts:
 		 * a neighbour that is merely stale still has the address that
@@ -12918,7 +12958,7 @@ report:
 	if (rc)
 		NL_SET_ERR_MSG(extack, "cdx: the remote tunnel endpoint did not resolve");
 out:
-	ip_rt_put(rt);
+	dst_release(dst);
 	return rc;
 }
 
@@ -12939,17 +12979,14 @@ static bool ft_ipsec_peer_resolved(struct net_device *dev, u8 family,
 				   const struct ft_ipsec_route *route)
 {
 	struct neighbour *neighbour;
+	struct dst_entry *dst;
 	bool resolved = false;
 	u8 mac[ETH_ALEN];
-	struct flowi4 fl4;
-	struct rtable *rt;
 
-	if (family != AF_INET)
+	dst = ft_ipsec_peer_route(dev, family, local, peer, route);
+	if (IS_ERR(dst))
 		return false;
-	rt = ft_ipsec_peer_route(dev, local, peer, route, &fl4);
-	if (IS_ERR(rt))
-		return false;
-	neighbour = rt->dst.dev == dev ? dst_neigh_lookup(&rt->dst, &fl4.daddr) : NULL;
+	neighbour = dst->dev == dev ? dst_neigh_lookup(dst, peer) : NULL;
 	if (neighbour) {
 		if (READ_ONCE(neighbour->nud_state) & NUD_VALID) {
 			read_lock_bh(&neighbour->lock);
@@ -12959,7 +12996,7 @@ static bool ft_ipsec_peer_resolved(struct net_device *dev, u8 family,
 		}
 		neigh_release(neighbour);
 	}
-	ip_rt_put(rt);
+	dst_release(dst);
 	return resolved;
 }
 
@@ -12986,8 +13023,10 @@ static int ft_ipsec_next_hop(struct xfrm_state *x,
 	int rc;
 
 	ft_ipsec_route_of(x, &route);
+	spec->next_hop = spec->dst;
 	rc = ft_ipsec_peer_mac(spec->dev, spec->family, &spec->src, &spec->dst,
-			       &route, true, spec->dst_mac, &path_mtu, extack);
+			       &route, true, spec->dst_mac, &path_mtu,
+			       &spec->next_hop, extack);
 	if (!rc)
 		spec->path_mtu = path_mtu;
 	return rc;
@@ -13193,6 +13232,13 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 		 * on its tunnel arms: a transport SA would leave as bare ESP. */
 		if (!spec->tunnel) {
 			NL_SET_ERR_MSG(extack, "cdx: UDP encapsulation needs tunnel mode");
+			return -EOPNOTSUPP;
+		}
+		/* IPv6 forbids the zero UDP checksum IPv4 NAT-T sends, and
+		 * esp6 computes one; what SEC writes there has never been
+		 * proved, so ESP-in-UDP over IPv6 stays in software. */
+		if (spec->family != AF_INET) {
+			NL_SET_ERR_MSG(extack, "cdx: UDP encapsulation is supported over IPv4 only");
 			return -EOPNOTSUPP;
 		}
 		spec->natt_sport = x->encap->encap_sport;
@@ -14433,6 +14479,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 	struct cdx_ipsec_sa *sa;
 	union nf_inet_addr local;
 	union nf_inet_addr peer;
+	union nf_inet_addr hop;
 	struct net_device *dev;
 	u8 was_dst[ETH_ALEN];
 	u8 was_src[ETH_ALEN];
@@ -14464,6 +14511,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 		route = watch->route;
 		local = watch->local;
 		peer = watch->peer;
+		hop = watch->hop;
 		reported = watch->reported;
 		/* Left set: it is cleared below once the rebuild has happened,
 		 * and only if no egress change asked for another meanwhile. */
@@ -14478,8 +14526,20 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 
 		path_mtu = 0;
 		rc = ft_ipsec_peer_mac(dev, family, &local, &peer, &route, false,
-				       mac, &path_mtu, NULL);
+				       mac, &path_mtu, &hop, NULL);
 		resolved = !rc;
+		if (path_mtu) {
+			/* The route was found, and with it, unless no entry
+			 * could be allocated, the neighbour whose events now
+			 * concern this SA, resolved or not: the gateway may
+			 * have changed with the route, and a peer that did not
+			 * resolve is waited for by its answer. */
+			spin_lock_bh(&ft_watch_lock);
+			watch = ft_ipsec_watch_find(cookie);
+			if (watch)
+				watch->hop = hop;
+			spin_unlock_bh(&ft_watch_lock);
+		}
 		/* The path's MTU is framing as much as the addresses are: the
 		 * entry fragments SEC's output to it, and every direction the
 		 * SA encrypts was bounded by the SA on it. It is known once the

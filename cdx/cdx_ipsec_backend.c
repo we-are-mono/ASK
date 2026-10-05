@@ -184,7 +184,8 @@ static void cdx_ipsec_build_tunnel(PSAEntry sa,
 
 		sa->header_len = IPV6_HDR_SIZE;
 		memset(h, 0, sizeof(*h));
-		h->Ver_TC_FL = (6u << 28) | ((u32)spec->tos << 20);
+		/* Wire order: SEC copies the header into the frame as is. */
+		h->Ver_TC_FL = cpu_to_be32((6u << 28) | ((u32)spec->tos << 20));
 		h->HopLimit = spec->ttl;
 		h->NextHeader = IPPROTOCOL_ESP;
 		memcpy(h->SourceAddress, spec->src.ip6, sizeof(h->SourceAddress));

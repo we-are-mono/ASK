@@ -104,6 +104,12 @@ typedef struct {
 	struct _tRouteEntry *pRtEntry;
 	struct hw_ct *ct;
 	struct { u16 sport, dport; } natt;
+	/* A tunnel SA's outer header, which SEC copies into every frame. */
+	u8 header_len;
+	union {
+		ipv4_hdr_t ip4;
+		ipv6_hdr_t ip6;
+	} tunnel;
 } SAEntry, *PSAEntry;
 /* The two fields of CDX's route an SA's framing is rebuilt from. */
 typedef struct _tRouteEntry {
@@ -168,10 +174,12 @@ static void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen)
 #define be32_to_cpu(x) __builtin_bswap32(x)
 #define be64_to_cpu(x) __builtin_bswap64(x)
 #define cpu_to_be64(x) __builtin_bswap64(x)
+#define cpu_to_be32(x) __builtin_bswap32(x)
 #else
 #define be32_to_cpu(x) (x)
 #define be64_to_cpu(x) (x)
 #define cpu_to_be64(x) (x)
+#define cpu_to_be32(x) (x)
 #endif
 static void sec_get_stats_from_sa(PSAEntry sa, u32 *pkts, u64 *bytes);
 
@@ -1056,8 +1064,37 @@ static void test_restarted(void)
 	memset(fp_install_rc, 0, sizeof(fp_install_rc));
 }
 
+/* The outer header is the frame's own bytes: SEC prepends it as stored. */
+static void test_tunnel_header(void)
+{
+	struct cdx_ipsec_sa_spec spec = { .family = AF_INET6, .tos = 0x88, .ttl = 64 };
+	static const u8 v6_first[4] = { 0x68, 0x80, 0, 0 };	/* version 6, TC 0x88 */
+	static const u8 v4_first[2] = { 0x45, 0x88 };
+	SAEntry sa = { 0 };
+	const u8 *wire;
+
+	memset(spec.src.ip6, 0x11, sizeof(spec.src.ip6));
+	memset(spec.dst.ip6, 0x22, sizeof(spec.dst.ip6));
+	cdx_ipsec_build_tunnel(&sa, &spec);
+	wire = (const u8 *)&sa.tunnel.ip6;
+	assert(sa.header_len == 40 && sa.mode == SA_MODE_TUNNEL);
+	assert(!memcmp(wire, v6_first, sizeof(v6_first)));
+	assert(wire[6] == 50 && wire[7] == 64);
+	assert(wire[8] == 0x11 && wire[39] == 0x22);
+
+	memset(&sa, 0, sizeof(sa));
+	spec.family = AF_INET;
+	spec.src.ip = 0x0101a8c0;	/* 192.168.1.1 */
+	spec.dst.ip = 0x7a01a8c0;
+	cdx_ipsec_build_tunnel(&sa, &spec);
+	wire = (const u8 *)&sa.tunnel.ip4;
+	assert(sa.header_len == 20 && !memcmp(wire, v4_first, sizeof(v4_first)));
+	assert(wire[8] == 64 && wire[9] == 50 && wire[12] == 192 && wire[19] == 122);
+}
+
 int main(void)
 {
+	test_tunnel_header();
 	test_packet_total();
 	test_torn_reading();
 	test_implausible_bytes();

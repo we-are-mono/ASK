@@ -456,6 +456,15 @@ def test_ipsec_backend(tmp_path):
         # NAT-T SA can share.
         + "\n" + re.search(r"^struct hw_ct \{.*?^\};",
                            (ROOT / "cdx/cdx_common.h").read_text(), re.S | re.M).group()
+        # A tunnel SA's outer header, as CDX lays it out.
+        + "\n" + "\n".join(re.search(r"^typedef struct\s+IPv%d_HDR_STRUCT\s*\{.*?^\}\s*ipv%d_hdr_t;" % (v, v),
+                                     (ROOT / "cdx/cdx_common.h").read_text(), re.S | re.M).group()
+                           for v in (4, 6))
+        + "\n" + re.search(r"^#define IPV4_HDR_SIZE\s.*$", control, re.M).group()
+        + "\n" + re.search(r"^#define IPV6_HDR_SIZE\s.*$",
+                           (ROOT / "cdx/control_ipv6.h").read_text(), re.M).group()
+        + "\n" + re.search(r"^#define IPPROTOCOL_ESP\s.*$",
+                           (ROOT / "cdx/fe.h").read_text(), re.M).group()
         + "\n")
     (tmp_path / "ipsec_backend_production.inc").write_text(
         re.search(r"^struct cdx_ipsec_sa \{.*?^\};", backend, re.S | re.M).group() + "\n"
@@ -499,7 +508,8 @@ def test_ipsec_backend(tmp_path):
         + function(backend, "cdx_ipsec_sa_set_next_hop")
         # And the datapath restart's, over every SA installed here.
         + re.search(r"^static LIST_HEAD\(cdx_ipsec_sa_list\);$", backend, re.M).group() + "\n"
-        + function(backend, "cdx_ipsec_sa_restarted"))
+        + function(backend, "cdx_ipsec_sa_restarted")
+        + function(backend, "cdx_ipsec_build_tunnel"))
     binary = tmp_path / "ipsec_backend"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

@@ -110,6 +110,9 @@ struct cdx_ipsec_sa_spec {
 	struct net_device *dev;
 	union nf_inet_addr src;
 	union nf_inet_addr dst;
+	/* For an outbound SA, the neighbour dst_mac was resolved from: the
+	 * peer when it is on-link, the route's gateway otherwise. */
+	union nf_inet_addr next_hop;
 	__be32 spi;
 	struct cdx_ipsec_key auth;
 	struct cdx_ipsec_key crypt;

@@ -275,6 +275,12 @@ result independently of those temporary files.
 - [x] **A319 — an outer CE mark was not propagated to the inner header at hardware IPsec decap.** Fixed: RFC 6040
   decap ECN (`PDBOPTS_ESP_TECN`) unless `noecn` (_:/^cdx: mark IPsec tunnel traffic as Linux does_).
 
+- [x] **A320 — an IPsec SA between IPv6 endpoints was refused packet offload; CMM offloaded it.** Fixed: routed and
+  resolved in its family, outer header in wire order, NAT-T over IPv6 refused (_:/^cdx: offload IPsec SAs between IPv6 endpoints_).
+
+- [x] **A321 — an offloaded SA to a peer behind a router never followed the router's MAC moving.** Fixed: the watch
+  matches neighbour events against the resolved next hop, not the peer (_:/^cdx: offload IPsec SAs between IPv6 endpoints_).
+
 - [ ] **A317 — an untagged frame on a port with upper devices may exceed the port's MTU by its tag allowance.** Accepted
   limitation of A316's fix. The mEMAC allows no extra room for VLAN tags, so a port with any upper keeps one tag (two
   for 802.1ad/stacked VLANs) of headroom, which an untagged frame can use: 1501-1504 (1508) bytes on a 1500 port pass

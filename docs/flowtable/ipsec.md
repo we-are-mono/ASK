@@ -262,7 +262,13 @@ What the hardware may be asked to carry. Everything outside this goes to
 Linux, in software, exactly as it does today.
 
 **The SA.** ESP only — `x->id.proto == IPPROTO_ESP`; AH is refused, as 040's
-own check already does. Tunnel mode and transport mode, IPv4 and IPv6 outer.
+own check already does. Tunnel mode and transport mode, between IPv4 or IPv6
+endpoints, either family inside: the peer is routed and its neighbour resolved
+in the SA's own family (`ft_ipsec_peer_route()`, `ft_ipsec_peer_mac()`), and
+the watch follows its next hop -- the peer on-link, the gateway otherwise --
+through ARP or neighbour discovery alike. `flowtable_service_ipsec_outer6.py`
+carries an IPv4 tunnel between IPv6 endpoints. NAT-T is IPv4's: ESP-in-UDP
+over IPv6 needs a UDP checksum SEC was never shown to write, and is refused.
 Ciphers as the CDX shared-descriptor builder supports them: CBC and CTR with
 an HMAC, and AEAD — GCM at ICV 8/12/16. GMAC (`rfc4543`) is refused with
 `EOPNOTSUPP` and belongs in software: SEC's IPsec protocol leaves the IV out of
@@ -1940,9 +1946,9 @@ what would build either (A233):
   its device (`ft_ipsec_peer_on_port()`): the test its outbound half faces,
   asked first, since strongSwan installs the inbound half first. Such a tunnel
   is then refused in both halves, and `auto` installs both in software. A peer
-  routed by the port whose outbound half is refused for something else -- an
-  IPv6 outer header, a neighbour that did not resolve -- keeps its inbound
-  half in hardware, where its ESP does arrive.
+  routed by the port whose outbound half is refused for something else -- a
+  marking SEC cannot produce, a neighbour that did not resolve -- keeps its
+  inbound half in hardware, where its ESP does arrive.
 - An **outbound policy** is refused when its template names by SPI an SA the
   adapter does not hold on the policy's device (`ft_ipsec_policy_served()`), so
   `auto` installs it in software, beside the SA it names. strongSwan names the

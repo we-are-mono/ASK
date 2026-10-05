@@ -56,6 +56,7 @@ typedef uint32_t __be32;
 #define ENETUNREACH 101
 #define EADDRNOTAVAIL 99
 #define EPERM 1
+#define EAFNOSUPPORT 97
 #define XFRM_INF (~(u64)0)
 
 struct in6_addr { u8 s6_addr[16]; };
@@ -220,6 +221,7 @@ static bool is_zero_ether_addr(const u8 *a)
 #define IS_ERR(p) ((unsigned long)(void *)(p) >= (unsigned long)-4095)
 #define PTR_ERR(p) ((long)(p))
 #define ERR_PTR(e) ((void *)(long)(e))
+#define ERR_CAST(p) ((void *)(p))
 
 static unsigned slept;
 static void msleep(unsigned ms) { (void)ms; slept++; }
@@ -279,6 +281,11 @@ static void dev_put(struct net_device *d)
 
 struct neigh_table { int key_len; };
 static struct neigh_table arp_tbl = { .key_len = 4 };
+static struct neigh_table nd_tbl = { .key_len = 16 };
+static bool ipv6_addr_equal(const struct in6_addr *a, const struct in6_addr *b)
+{
+	return !memcmp(a, b, sizeof(*a));
+}
 
 struct neighbour {
 	struct neigh_table *tbl;
@@ -362,7 +369,13 @@ struct flowi4 {
 	int flowi4_l3mdev;
 	u8 flowi4_proto;
 };
-struct flowi6 { struct in6_addr daddr, saddr; __be16 fl6_dport, fl6_sport; };
+struct flowi6 {
+	struct in6_addr daddr, saddr;
+	__be16 fl6_dport, fl6_sport;
+	u32 flowi6_mark;
+	int flowi6_l3mdev;
+	u8 flowi6_proto;
+};
 struct flowi {
 	union { struct flowi4 ip4; struct flowi6 ip6; } u;
 	u8 flowi_proto;
@@ -1058,16 +1071,25 @@ static void ft_handle_invalidate(struct nf_flow_offload_handle *h, atomic64_t *c
 	if (h->valid) { h->valid = false; (*count)++; }
 }
 
-/* The route the FIB should answer with, and the neighbour on it. */
+/* The route the FIB should answer with, and the neighbour on it. Every answer
+ * is held, as the kernel's is, so a lookup the adapter does not release
+ * leaves the route's count above zero. */
 static struct rtable *route_answer;
 static int route_error;
 static struct neighbour *route_neigh;
-static unsigned route_lookups, route_puts;
+static unsigned route_lookups;
 static int route_oif, route_l3mdev;
 static u32 route_mark;
-/* The last lookup's whole key. */
+/* The last lookup's whole key, in its family. */
 static struct flowi4 route_key;
+static struct flowi6 route6_key;
 static struct dst_ops v4_ops = { .family = AF_INET };
+static struct dst_ops v6_ops = { .family = AF_INET6 };
+/* What ip6_route_output() answers a failed lookup with: a held route whose
+ * error says why, never a pointer error. */
+static struct dst_entry v6_null = { .ops = &v6_ops };
+/* The IPv6 route to the peer, over the WAN port unless told otherwise. */
+static struct dst_entry *route6_answer;
 /* The VRF the SA's port is enslaved to, or zero. */
 static int port_l3_master;
 static int l3mdev_master_ifindex(struct net_device *dev) { (void)dev; return port_l3_master; }
@@ -1089,7 +1111,25 @@ static struct rtable *__ip_route_output_key(void *net, struct flowi4 *fl4)
 	route_lookups++;
 	if (route_error)
 		return ERR_PTR(route_error);
+	dst_hold(&route_answer->dst);
 	return route_answer;
+}
+static struct dst_entry *ip6_route_output(void *net, void *sk, struct flowi6 *fl6)
+{
+	struct dst_entry *dst = route6_answer;
+
+	(void)net; (void)sk;
+	assert(!ft_watch_lock);
+	route_mark = fl6->flowi6_mark;
+	route_l3mdev = fl6->flowi6_l3mdev;
+	route6_key = *fl6;
+	route_lookups++;
+	if (route_error) {
+		v6_null.error = route_error;
+		dst = &v6_null;
+	}
+	dst_hold(dst);
+	return dst;
 }
 /* What ip_route_output_key() adds when the flow names a protocol:
  * xfrm_lookup_route(), which answers with a policy's bundle when its selector
@@ -1105,7 +1145,6 @@ static inline struct rtable *ip_route_output_key(void *net, struct flowi4 *fl4)
 		return route_bundle;
 	return rt;
 }
-static void ip_rt_put(struct rtable *rt) { (void)rt; route_puts++; }
 
 /* xfrm's own route lookup, which an inbound SA's peer is looked up with, in
  * either family: the route it answers with (the WAN route unless told
@@ -1176,6 +1215,10 @@ static const u8 MOVED_MAC[ETH_ALEN] = { 0x02, 0xbb, 0, 0, 0, 2 };
 #define LOCAL_IP  0x0101a8c0	/* 192.168.1.1, network order on a little end */
 #define PEER_IP   0x7a01a8c0	/* 192.168.1.122 */
 #define V4_SLASH24 0x00ffffff	/* inet_make_mask(24) */
+/* 2001:db8:1::1 and 2001:db8:1::7a, the same pair over IPv6. */
+static const struct in6_addr LOCAL6 = { { 0x20, 0x01, 0x0d, 0xb8, 0, 1, [15] = 0x01 } };
+static const struct in6_addr PEER6 = { { 0x20, 0x01, 0x0d, 0xb8, 0, 1, [15] = 0x7a } };
+#define CBC_TUNNEL6_HEADER (8 + 16 + 40)
 
 static struct neighbour peer_neigh = {
 	.tbl = &arp_tbl, .dev = &WAN, .nud_state = NUD_REACHABLE,
@@ -1183,6 +1226,7 @@ static struct neighbour peer_neigh = {
 	.ha = { 0x02, 0xaa, 0, 0, 0, 1 },
 };
 static struct rtable wan_route;
+static struct dst_entry wan_route6;
 
 static struct xfrm_algo_auth auth_key = { .alg_key_len = 160, .alg_trunc_len = 96 };
 static struct xfrm_algo cipher_key = { .alg_key_len = 128 };
@@ -1222,6 +1266,15 @@ static struct xfrm_state *outbound_state(void)
 	return &x;
 }
 
+/* The same SA between IPv6 endpoints: a 40-byte outer header. */
+static void outbound6(struct xfrm_state *x)
+{
+	x->props.family = AF_INET6;
+	x->props.header_len = CBC_TUNNEL6_HEADER;
+	memcpy(&x->id.daddr, &PEER6, sizeof(PEER6));
+	memcpy(&x->props.saddr, &LOCAL6, sizeof(LOCAL6));
+}
+
 static void bench_reset(void)
 {
 	init_net.xfrm.policy_all.next = init_net.xfrm.policy_all.prev = &init_net.xfrm.policy_all;
@@ -1242,11 +1295,16 @@ static void bench_reset(void)
 	peer_error = 0;
 	peer_lookups = 0;
 	route_neigh = &peer_neigh;
-	route_lookups = route_puts = 0;
+	route_lookups = 0;
+	route6_answer = &wan_route6;
+	wan_route6.ops = &v6_ops;
+	wan_route6.dev = &WAN;
+	wan_route6.mtu = 0;
+	peer_neigh.tbl = &arp_tbl;
 	peer_neigh.nud_state = NUD_REACHABLE;
 	peer_neigh.dead = false;
 	peer_neigh.dev = &WAN;
-	peer_neigh.primary_key[3] = 122;
+	memcpy(peer_neigh.primary_key, (u8[16]){ 0xc0, 0xa8, 1, 122 }, 16);
 	ether_addr_copy(peer_neigh.ha, PEER_MAC);
 	memset(policy_answers, 0, sizeof(policy_answers));
 	policy_error = 0;
@@ -1450,11 +1508,11 @@ static void test_spec(void)
 	x->props.mode = XFRM_MODE_TUNNEL;
 	x->props.header_len = CBC_TUNNEL_HEADER;
 
-	/* An outbound IPv6 SA has no resolver here yet, and one that cannot
-	 * be addressed must be refused rather than installed blind. */
-	x->props.family = AF_INET6;
-	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
-	x->props.family = AF_INET;
+	/* An outbound IPv6 SA is addressed through its own family's route
+	 * and neighbour (test_next_hop()), and taken. */
+	outbound6(x);
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && spec.family == AF_INET6);
+	assert(wan_route6.refs == 0 && neigh_refs == 0);
 }
 
 /* An AEAD transform is one key under an identity that names the mode and the
@@ -1652,7 +1710,7 @@ static void test_next_hop(void)
 	bench_reset();
 	route_error = -ENETUNREACH;
 	assert(ft_ipsec_spec(x, &spec, &ack) == -ENETUNREACH);
-	assert(route_lookups == 1 && route_puts == 0);
+	assert(route_lookups == 1 && wan_route.dst.refs == 0);
 
 	/* A route leaving by another port is refused too. Packet offload
 	 * binds a state to one device and the framing belongs to that device;
@@ -1660,7 +1718,7 @@ static void test_next_hop(void)
 	bench_reset();
 	x->xso.dev = &LAN;
 	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
-	assert(route_puts == 1);
+	assert(route_lookups == 1 && wan_route.dst.refs == 0);
 	/* And the FIB is left free to say so: a lookup bound to the SA's port
 	 * answers through that port whatever the table holds, and this refusal
 	 * could never happen. */
@@ -1713,7 +1771,33 @@ static void test_next_hop(void)
 	bench_reset();
 	route_neigh = NULL;
 	assert(ft_ipsec_spec(x, &spec, &ack) == -EHOSTUNREACH);
-	assert(neigh_refs == 0 && route_puts == 1);
+	assert(neigh_refs == 0 && wan_route.dst.refs == 0);
+
+	/* An IPv6 peer is asked in its own family with the same key, its
+	 * neighbour taken from the route, and the route released. */
+	bench_reset();
+	outbound6(x);
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && route_lookups == 1);
+	assert(ipv6_addr_equal(&route6_key.daddr, &PEER6));
+	assert(ipv6_addr_equal(&route6_key.saddr, &LOCAL6));
+	assert(route6_key.flowi6_proto == IPPROTO_ESP);
+	assert(spec.family == AF_INET6 && ether_addr_equal(spec.dst_mac, PEER_MAC));
+	assert(wan_route6.refs == 0 && neigh_refs == 0);
+	/* ESP-in-UDP over IPv6 needs a UDP checksum SEC was never shown to
+	 * write; it stays in software. */
+	x->encap = &natt;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP && route_lookups == 1);
+	x->encap = NULL;
+	/* ip6_route_output() fails into the route it returns, not a pointer,
+	 * and that route is still the caller's to release. */
+	bench_reset();
+	route_error = -ENETUNREACH;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -ENETUNREACH);
+	assert(route_lookups == 1 && v6_null.refs == 0);
+	bench_reset();
+	wan_route6.dev = &LAN;
+	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
+	assert(wan_route6.refs == 0 && wan_route.dst.refs == 0);
 }
 
 static void test_state_add(void)
@@ -2738,6 +2822,100 @@ static void test_watch_follows_peer(void)
 
 	ft_xdo_state_delete(x);
 	bench_clear_sas();
+
+	/* An IPv6 peer is followed through neighbour discovery's table, by
+	 * its whole address; an ARP entry whose first four bytes happen to
+	 * match it is not its neighbour. */
+	bench_reset();
+	peer_neigh.tbl = &nd_tbl;
+	memcpy(peer_neigh.primary_key, &PEER6, sizeof(PEER6));
+	*x = *outbound_state();
+	outbound6(x);
+	assert(ft_xdo_state_add(x, &(struct netlink_ext_ack){ NULL }) == 0);
+	ft_ipsec_follow_work(NULL);
+	works_scheduled = sa_next_hop_calls = 0;
+	other = peer_neigh;
+	other.tbl = &arp_tbl;
+	memcpy(other.primary_key, &PEER6, sizeof(PEER6));
+	ether_addr_copy(other.ha, MOVED_MAC);
+	ft_ipsec_neigh_moved(&other);
+	assert(works_scheduled == 0);
+	other.tbl = &nd_tbl;
+	other.primary_key[15] = 0x7b;
+	ft_ipsec_neigh_moved(&other);
+	assert(works_scheduled == 0);
+	other.primary_key[15] = 0x7a;
+	ft_ipsec_neigh_moved(&other);
+	assert(works_scheduled == 1);
+	ft_xdo_state_delete(x);
+	bench_clear_sas();
+}
+
+/* A peer beyond a router is addressed to the router, and it is the router's
+ * neighbour entry whose move has to be followed: an event for the peer's own
+ * address never comes, since nothing on this link resolves it. */
+static void test_watch_follows_gateway(void)
+{
+	struct neighbour gateway, peer;
+	struct xfrm_state state;
+	struct xfrm_state *x;
+
+	bench_reset();
+	bench_clear_sas();
+	gateway = peer = peer_neigh;
+	gateway.primary_key[3] = 254;		/* 192.168.1.254 */
+	gateway.refs = 0;
+	route_neigh = &gateway;
+	x = install_outbound(&state);
+	assert(ether_addr_equal(sa_pool[0].dst_mac, PEER_MAC));
+
+	/* The peer's own address moving says nothing about this link. */
+	ether_addr_copy(peer.ha, MOVED_MAC);
+	ft_ipsec_neigh_moved(&peer);
+	assert(works_scheduled == 0);
+
+	/* The router moving is followed, and the SA rebuilt onto it. */
+	ether_addr_copy(gateway.ha, MOVED_MAC);
+	ft_ipsec_neigh_moved(&gateway);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 1 && ether_addr_equal(sa_pool[0].dst_mac, MOVED_MAC));
+
+	/* A pass that finds the route but can have no neighbour entry -- the
+	 * table full -- says nothing about the router, which the watch keeps:
+	 * the router's own answer is still what retries it. */
+	route_neigh = NULL;
+	ft_ipsec_route_moved(AF_INET, &(__be32){ PEER_IP }, 0xffffffff, 32);
+	ft_ipsec_follow_work(NULL);
+	route_neigh = &gateway;
+	works_scheduled = 0;
+	ether_addr_copy(gateway.ha, PEER_MAC);
+	ft_ipsec_neigh_moved(&gateway);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(ether_addr_equal(sa_pool[0].dst_mac, PEER_MAC));
+	ether_addr_copy(gateway.ha, MOVED_MAC);
+	ft_ipsec_neigh_moved(&gateway);
+	ft_ipsec_follow_work(NULL);
+	assert(ether_addr_equal(sa_pool[0].dst_mac, MOVED_MAC));
+
+	/* The route then moves to another router: the watch follows the new
+	 * one's events from the pass that found it. */
+	route_neigh = &peer_neigh;
+	ft_ipsec_route_moved(AF_INET, &(__be32){ PEER_IP }, 0xffffffff, 32);
+	ft_ipsec_follow_work(NULL);
+	assert(ether_addr_equal(sa_pool[0].dst_mac, PEER_MAC));
+	works_scheduled = 0;
+	ether_addr_copy(gateway.ha, PEER_MAC);
+	ft_ipsec_neigh_moved(&gateway);
+	assert(works_scheduled == 0);
+	ether_addr_copy(peer_neigh.ha, MOVED_MAC);
+	ft_ipsec_neigh_moved(&peer_neigh);
+	assert(works_scheduled == 1);
+	ft_ipsec_follow_work(NULL);
+	assert(dev_holds == 0 && neigh_refs == 0 && gateway.refs == 0);
+	ft_xdo_state_delete(x);
+	bench_clear_sas();
 }
 
 /* The watch re-resolves with what the install resolved with: the SA's mark,
@@ -3098,10 +3276,10 @@ static void test_watch_sample_route_only(void)
 
 	/* A peer that has gone away, on a path that has not moved. */
 	peer_neigh.nud_state = NUD_FAILED;
-	neigh_lookups = neigh_probes = route_lookups = route_puts = 0;
+	neigh_lookups = neigh_probes = route_lookups = 0;
 	queued = accounting_passes(5);
 	assert(neigh_lookups == 0 && neigh_probes == 0 && neigh_refs == 0);
-	assert(queued == 0 && route_lookups == 5 && route_puts == route_lookups);
+	assert(queued == 0 && route_lookups == 5 && wan_route.dst.refs == 0);
 	assert(sa_next_hop_calls == 0 && dev_holds == 0 && !ft_watch_lock);
 
 	/* A rebuild the backend refuses is not retried on the clock either. */
@@ -3184,7 +3362,7 @@ static void test_peer_route_is_the_fibs(void)
 	ft_ipsec_route_moved(AF_INET, &(__be32){ PEER_IP }, 0xffffffff, 32);
 	ft_ipsec_follow_work(NULL);
 	assert(sa_next_hop_calls == 0 && sa_pool[0].path_mtu == 1500);
-	assert(dev_holds == 0 && route_puts == route_lookups);
+	assert(dev_holds == 0 && wan_route.dst.refs == 0);
 	ft_xdo_state_delete(x);
 	bench_clear_sas();
 
@@ -4727,6 +4905,7 @@ int main(void)
 	test_handle_and_flowi();
 	test_handle_between_translations();
 	test_watch_follows_peer();
+	test_watch_follows_gateway();
 	test_watch_routes_like_install();
 	test_watch_egress_change_during_install();
 	test_watch_route_and_device();
