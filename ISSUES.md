@@ -255,13 +255,8 @@ result independently of those temporary files.
 - [x] **A314 — 1.1.0's bridged multicast flow caps counted installed discards, keeping wanted streams out.** Fixed:
   the caps count only what may be carried, and a group's named source may displace an unnamed discard (_:/^cdx: let discards leave room_).
 
-- [ ] **A306 — a flow admitted plain under an optional ("level use") template may stay plain in hardware after an SA appears.**
-  Unconfirmed, from review. With no SA yet, `xfrm_lookup()` resolves an optional template to the plain route, and
-  `ft_ipsec_resolve()` (cdx/ask_flowtable.c) admits the direction as plain. A later SA add changes what software would do
-  (it encrypts) but bumps no policy generation. If nothing else retires the entry, hardware keeps forwarding plaintext.
-  Confirm whether `ft_ipsec_genid` or the SA watch already retires such entries on an SA add. If not, retire entries a
-  `use` template covers when a matching SA is added, or refuse admission under any optional template. Mostly an IPComp
-  or hand-configured case: strongSwan installs `required` templates.
+- [x] **A306 — a flow admitted plain under an optional ("level use") template stayed plain in hardware after its SA
+  appeared, where Linux encrypts.** Fixed: a sending end is offloaded plain only where policy asks for no transform (_:/^cdx: keep a direction under an unresolved template in software_).
 
 - [x] **A313 — offloaded egress queues were unbounded and shared by every flow (unpaced duplex 9.4/1.3-2.2 Gbit/s).**
   Fixed: per-port congestion group at `cdx.fwd_queue_us` of link speed, flows hashed over the FQs; now 9.2/7.0 (_:/^cdx: bound offloaded egress_).

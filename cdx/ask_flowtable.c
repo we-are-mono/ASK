@@ -1307,10 +1307,22 @@ static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 		return !!recv;
 	}
 	if (bundle == dst) {
-		/* No policy: an ordinary plain end. Nothing consumed the
-		 * reference taken above, so give it back. */
+		u16 family = dst->ops->family;
+		/* A device with disable_xfrm: Linux sends by it without
+		 * asking policy at all, so neither does this. */
+		bool noxfrm = dst->flags & DST_NOXFRM;
+
+		/* No transform applies. Nothing consumed the reference taken
+		 * above, so give it back. For the sending end that is not yet
+		 * the answer: an optional ("level use") template whose SA does
+		 * not exist yet resolves to nothing as well, and an entry
+		 * admitted plain would stay plain once the SA appears -- where
+		 * Linux, checking policy on every packet (patch 140 keeps them
+		 * off the software flowtable while a policy exists), encrypts.
+		 * So a direction is sent in hardware only where policy asks
+		 * for no transform at all. */
 		dst_release(dst);
-		return true;
+		return recv || noxfrm || xfrm_flowtable_out_plain(&init_net, fl, family);
 	}
 
 	x = ft_ipsec_offloaded(bundle, dev);

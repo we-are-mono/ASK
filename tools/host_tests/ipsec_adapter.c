@@ -321,6 +321,7 @@ static int neigh_event_send(struct neighbour *n, void *skb)
 
 /* --- destinations and routes ----------------------------------------- */
 struct dst_ops { u8 family; };
+#define DST_NOXFRM 0x0002
 struct dst_entry {
 	struct dst_ops *ops;
 	struct net_device *dev;
@@ -328,6 +329,7 @@ struct dst_entry {
 	struct xfrm_state *xfrm;
 	struct dst_entry *child;
 	int refs;
+	unsigned short flags;
 	/* The route's own MTU -- a learned PMTU or its metric -- or zero for
 	 * its device's, as dst_mtu() answers. */
 	unsigned mtu;
@@ -663,6 +665,18 @@ static struct dst_entry *xfrm_lookup(void *net, struct dst_entry *dst,
 		return bundle;
 	}
 	return dst;			/* no policy: the plain destination */
+}
+
+/* Whether output policy asks for no transform at all. A lookup that resolved
+ * nothing can still mean a template is there -- an optional one whose SA does
+ * not exist yet -- and that direction must not go to hardware plain. */
+static bool out_template_unresolved;
+static unsigned out_plain_asks;
+static bool xfrm_flowtable_out_plain(struct net *net, const struct flowi *fl, u16 family)
+{
+	(void)net; (void)fl; (void)family;
+	out_plain_asks++;
+	return !out_template_unresolved;
 }
 
 static struct net init_net;
@@ -2358,6 +2372,25 @@ static void test_resolve(void)
 	 * reference taken to ask handed back. */
 	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
 	assert(handle == 0 && plain.refs == 1 && policy_lookups == 2);
+
+	/* Nothing resolved, but under a template -- an optional one whose SA
+	 * does not exist yet (A306). Sent in hardware it would stay plain once
+	 * the SA appears, where Linux encrypts; so it is refused. The far end's
+	 * frames arrive plain either way, and policy accepts them. */
+	out_template_unresolved = true;
+	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(handle == 0 && plain.refs == 1);
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, NULL, NULL));
+	assert(plain.refs == 1);
+	/* Unless the route's device has disable_xfrm: Linux then sends by it
+	 * without asking policy, and so does hardware. */
+	out_plain_asks = 0;
+	plain.flags = DST_NOXFRM;
+	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(plain.refs == 1 && out_plain_asks == 0);
+	plain.flags = 0;
+	out_template_unresolved = false;
+	policy_lookups = 2;
 
 	/* A policy resolving to an offloaded SA. The bundle takes over the
 	 * caller's reference to the destination, and releasing the bundle has
