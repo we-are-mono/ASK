@@ -393,6 +393,62 @@ static void check_deferred(void)
     assert(live_nodes == allocated - 1);
 }
 
+/* A table deleted while a barrier issued through another table is in its
+ * sync: the node parked from the dying table is in the barrier's batch, and
+ * the release must free it rather than refill the freed table's spare. A
+ * second node parked from the dying table during the sync waits on the parked
+ * list, detached too. A nested barrier inside the sync links a second batch. */
+static struct en_exthash_info *dying;
+static struct en_cumulative_tbl_entry *dying_late;
+
+static void delete_dying(void)
+{
+    dying_late = ExternalHashTableAllocCumulativeEntry(dying);
+    ehash_park_node(dying, dying_late);
+    ehash_unpark_table(dying);
+    assert(!dying_late->parked_on);
+    free(dying);    /* FreeEnEhashInfo(): ASan reports any later touch */
+    dying = NULL;
+}
+
+static void nested_barrier(void)
+{
+    during_sync = delete_dying;
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0);
+}
+
+static void check_delete_during_sync(void)
+{
+    for (unsigned nested = 0; nested < 2; nested++) {
+        struct en_cumulative_tbl_entry *node;
+        unsigned allocated;
+
+        dying = calloc(1, sizeof(*dying));
+        dying->pcd = &pcd;
+        node = ExternalHashTableAllocCumulativeEntry(dying);
+        ehash_park_node(dying, node);
+        allocated = live_nodes;
+        during_sync = nested ? nested_barrier : delete_dying;
+        assert(ExternalHashTableDeleteSync(&info) == 0 && !during_sync && !dying);
+        /* The in-flight node freed, the late one still parked, unowned. */
+        assert(live_nodes == allocated && parked() == 1 && ehash_parked == dying_late);
+        assert(!ehash_inflight);
+        assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked());
+        assert(live_nodes == allocated - 1);
+    }
+}
+
+/* A second PCD's node parked while this PCD's nodes are in a barrier's sync. */
+static struct en_exthash_info *foreign_table;
+static struct en_cumulative_tbl_entry *foreign_node;
+
+static void park_foreign(void)
+{
+    assert(!ehash_parked);
+    ehash_park_node(foreign_table, foreign_node);
+    assert(!ehash_parked);
+}
+
 int main(void)
 {
     struct en_exthash_tbl_entry *e[24];
@@ -498,6 +554,23 @@ int main(void)
     assert(warnings == 1 && parked() == 1);
     /* Nor does a sync on the second PCD free this one's. */
     assert(ExternalHashTableFmPcdHcSync(&other) == 0 && parked() == 1 && !other.spare);
+    /* A failed sync on the second PCD neither retags this PCD's list nor
+     * makes this PCD's next park look foreign. */
+    fail_syncs = 1;
+    assert(ExternalHashTableFmPcdHcSync(&other) == -1 && parked() == 1);
+    assert(ehash_parked_pcd == &pcd);
+    struct en_cumulative_tbl_entry *mine = ExternalHashTableAllocCumulativeEntry(&info);
+    ehash_park_node(&info, mine);
+    assert(warnings == 1 && parked() == 2);
+    assert(ExternalHashTableFmPcdHcSync(&other) == 0);   /* ends the failure run */
+    /* While this PCD's nodes are in flight, the second PCD's node is refused. */
+    foreign_table = &other;
+    foreign_node = stray;
+    during_sync = park_foreign;
+    fail_syncs = 1;
+    assert(ExternalHashTableFmPcdHcSync(&info) == -1 && warnings == 2 && parked() == 2);
+    assert(ehash_parked_pcd == &pcd);
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked());
     XX_FreeSmart(stray);
     removed(e[1]);
     assert(!parked());
@@ -707,6 +780,7 @@ int main(void)
     assert(ExternalHashTableFmPcdHcSync(&info) == 0 && sync_recovered_lines == recovered + 2);
 
     check_deferred();
+    check_delete_during_sync();
     check_find();
     check_bucket_cap();
 

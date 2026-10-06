@@ -1,4 +1,4 @@
-From f5adb48be17186da5d451993ff692a09613b099a Mon Sep 17 00:00:00 2001
+From 1fbbf668d0faeb6c3cb0f4744be25ef6932caac3 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -119,7 +119,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 +---
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1549 ++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1582 ++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +----
@@ -182,7 +182,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 83 files changed, 8218 insertions(+), 12443 deletions(-)
+ 83 files changed, 8251 insertions(+), 12443 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -5324,10 +5324,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..fbe2b10afc9c
+index 000000000000..d60be8c3f1b4
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1549 @@
+@@ -0,0 +1,1582 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5654,15 +5654,32 @@ index 000000000000..fbe2b10afc9c
 + * many there were: a new run always reports again. */
 +static unsigned int ehash_barrier_failures;
 +
++/* The nodes a barrier took off the parked list, while its sync runs, and the
++ * PCD they were parked for. They are still parked as far as a table delete is
++ * concerned (ehash_unpark_table()) and as far as the one-PCD rule is: each
++ * in-flight batch stays reachable under ehash_parked_lock until it is
++ * released or parked again. */
++struct ehash_batch {
++	struct en_cumulative_tbl_entry *nodes;
++	void *pcd;
++	struct ehash_batch *next;
++};
++static struct ehash_batch *ehash_inflight;
++
 +static void ehash_park_node(struct en_exthash_info *info,
 +			    struct en_cumulative_tbl_entry *node)
 +{
++	struct ehash_batch *batch;
 +	unsigned long flags;
++	bool foreign;
 +
 +	if (!node)
 +		return;
 +	spin_lock_irqsave(&ehash_parked_lock, flags);
-+	if (ehash_parked && ehash_parked_pcd != info->pcd) {
++	foreign = ehash_parked && ehash_parked_pcd != info->pcd;
++	for (batch = ehash_inflight; batch; batch = batch->next)
++		foreign |= batch->nodes && batch->pcd != info->pcd;
++	if (foreign) {
 +		spin_unlock_irqrestore(&ehash_parked_lock, flags);
 +		WARN_ONCE(1, "fm_ehash: a second PCD's node cannot share the parked list, leaking %p\n",
 +			  node);
@@ -5678,64 +5695,80 @@ index 000000000000..fbe2b10afc9c
 +/* A sync on this table's PCD. What was parked before it is issued is freed
 + * if it completes and parked again if it does not; a node parked while it
 + * runs was unlinked too late to be proven by it, and waits for the next.
-+ * delete_barrier routes the sync through the DeleteKey fault knob. */
++ * delete_barrier routes the sync through the DeleteKey fault knob.
++ *
++ * The release reads each node's table and refills that table's spare, so it
++ * runs under ehash_parked_lock: a table deleted meanwhile has already had its
++ * nodes, in-flight ones included, turned over to the allocator, and one being
++ * deleted waits for the release to finish. Releasing allocates nothing and
++ * frees with kfree, so the lock covers it. */
 +static int ehash_barrier(struct en_exthash_info *info, bool delete_barrier)
 +{
-+	struct en_cumulative_tbl_entry *parked = NULL, *node;
++	struct ehash_batch batch = { NULL, info->pcd, NULL }, **link;
++	struct en_cumulative_tbl_entry *node;
 +	unsigned long flags;
 +	unsigned int failures;
++	bool reparked = false;
 +	int rc;
 +
 +	spin_lock_irqsave(&ehash_parked_lock, flags);
 +	if (ehash_parked_pcd == info->pcd) {
-+		parked = ehash_parked;
++		batch.nodes = ehash_parked;
 +		ehash_parked = NULL;
 +	}
++	batch.next = ehash_inflight;
++	ehash_inflight = &batch;
 +	spin_unlock_irqrestore(&ehash_parked_lock, flags);
 +	rc = delete_barrier ? ehash_delete_hcsync(info) : FmPcdHcSync(info->pcd);
 +	spin_lock_irqsave(&ehash_parked_lock, flags);
++	for (link = &ehash_inflight; *link != &batch; link = &(*link)->next)
++		;
++	*link = batch.next;
 +	failures = ehash_barrier_failures;
 +	ehash_barrier_failures = rc ? failures + 1 : 0;
++	while (batch.nodes) {
++		node = batch.nodes;
++		batch.nodes = node->next_entry;
++		if (rc) {
++			/* Back where they were, already accepted for this PCD:
++			 * parking refused another's while they were away. */
++			node->next_entry = ehash_parked;
++			ehash_parked = node;
++			reparked = true;
++		} else if (node->parked_on) {
++			ehash_node_release(node->parked_on, node);
++		} else {
++			ExternalHashTableCumulativeEntryFree(node);
++		}
++	}
++	if (reparked)
++		ehash_parked_pcd = info->pcd;
 +	spin_unlock_irqrestore(&ehash_parked_lock, flags);
 +	if (rc && !failures)
 +		pr_err("fm_ehash: FmPcdHcSync failed; unlinked storage stays parked until one completes\n");
 +	if (!rc && failures)
 +		pr_info("fm_ehash: FmPcdHcSync completed after %u failed\n", failures);
-+	if (!rc) {
-+		while (parked) {
-+			node = parked;
-+			parked = node->next_entry;
-+			if (node->parked_on)
-+				ehash_node_release(node->parked_on, node);
-+			else
-+				ExternalHashTableCumulativeEntryFree(node);
-+		}
-+		return 0;
-+	}
-+	/* Back where they were, already accepted for this PCD. */
-+	spin_lock_irqsave(&ehash_parked_lock, flags);
-+	while (parked) {
-+		node = parked;
-+		parked = node->next_entry;
-+		node->next_entry = ehash_parked;
-+		ehash_parked = node;
-+	}
-+	ehash_parked_pcd = info->pcd;
-+	spin_unlock_irqrestore(&ehash_parked_lock, flags);
 +	return rc;
 +}
 +
 +/* Before @info is freed: its parked nodes go back to the allocator, not to
-+ * its spare, when a barrier proves them. */
++ * its spare, when a barrier proves them -- those a barrier in flight holds
++ * too, which its release then frees rather than handing to a table that is
++ * gone. */
 +static void ehash_unpark_table(struct en_exthash_info *info)
 +{
 +	struct en_cumulative_tbl_entry *node;
++	struct ehash_batch *batch;
 +	unsigned long flags;
 +
 +	spin_lock_irqsave(&ehash_parked_lock, flags);
 +	for (node = ehash_parked; node; node = node->next_entry)
 +		if (node->parked_on == info)
 +			node->parked_on = NULL;
++	for (batch = ehash_inflight; batch; batch = batch->next)
++		for (node = batch->nodes; node; node = node->next_entry)
++			if (node->parked_on == info)
++				node->parked_on = NULL;
 +	spin_unlock_irqrestore(&ehash_parked_lock, flags);
 +}
 +
