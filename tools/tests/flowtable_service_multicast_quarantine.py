@@ -78,6 +78,15 @@ async def remaining(r, knob):
     return (await read(r.target, r.session, knob)).split()[0]
 
 
+def routed_groups(state):
+    """Routed groups with somewhere to go. smcrouted adds a listener-less entry
+    for whatever its WAN VIF hears -- the rig's segment carries an SSDP sender
+    -- and the learner tracks and refuses it, so mroute_groups moves with
+    traffic no case sends."""
+    return sorted((row["src"], row["group"]) for row in state["mroute"]
+                  if not (row["state"] == "refused-listener" and row["listeners"] == "-"))
+
+
 class Routed:
     """smcroute's MFC: the WAN port in, the LAN port out, a routing hop."""
     kind, hops = "mroute", 63
@@ -355,9 +364,10 @@ async def test_released_without_multicast(multicast_rig, rig):
                 break
             assert time.monotonic() < deadline, admitted
         assert admitted["quarantine"] == 0 and admitted["errors"] == parked["errors"], admitted
-        for counter in ("mroute_groups", "mroute_installed", "mcast_groups", "mcast_installed",
+        for counter in ("mroute_installed", "mcast_groups", "mcast_installed",
                         "mroute_install_errors", "mcast_install_errors"):
             assert admitted[counter] == parked[counter], (counter, summary(parked), summary(admitted))
+        assert routed_groups(admitted) == routed_groups(parked), (summary(parked), summary(admitted))
         admitted = await hardware_proof(r)
         drained = await r.delete_table()
         assert drained["quarantine"] == 0 and drained["errors"] == parked["errors"], drained
