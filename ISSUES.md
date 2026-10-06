@@ -321,6 +321,14 @@ result independently of those temporary files.
   bridged flow caps, and ask-recovery-monitor resets only after three consecutive misses. Remaining fix: have
   `ask-flowtable health` read a bounded status record, not the full header. Only matters where `integration/` is installed.
 
+- [ ] **A327 — a route change under a full table blocks flowtable readers ~13 s and piles up offload work.** Seen on the rig, KASAN
+  image, 2026-10-06. `flowtable_capacity.py`'s route-replace drain of 32,768 entries blocks `/proc/cdx_flowtable` readers
+  ~13 s while retirement holds the backend transaction. With the UDP conntracks kept alive through the drain
+  (`nf_conntrack_udp_timeout_stream` raised above `nf_flowtable_udp_timeout`), ~250 `nf_ft_offload` kworkers also pile
+  up in D state (load average 3 → 40), and the DUT's stdio agent missed host acks for over 8 s twice running, so the
+  agent exited. The stock suite expires those conntracks at the drain and does not hit it, but a production table of
+  live flows would. Next: time the retirement walk per entry, and bound or batch the re-offers the drain triggers.
+
 - [x] **A276 — the data plane wedged twice under a flooded ESP SA.** An HC command
   timed out ("board reset required") because 11aa150's per-SA offline-port classification
   stranded an OH microcode task on a miss, starving the shared TNUM pool HC depends on

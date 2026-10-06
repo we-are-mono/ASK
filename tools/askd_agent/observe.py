@@ -126,6 +126,33 @@ class Snapshots:
             keys.update(((w["lan_if"], proto, src, dst), (w["wan_if"], proto, dst, translated)))
         return keys
 
+    def public(self):
+        address = self.workload["public"]
+        return f"[{address}]:" if ":" in address else address + ":"
+
+    def remapped(self, ident):
+        """The workload's flows MASQUERADE gave another port.
+
+        It keeps the source port unless another conntrack already holds that
+        reply tuple, and then picks another. Maps such a flow's reply
+        direction, as (proto, src, dst), to the destination keys() names it
+        by; a reply naming any other port is not the flow's."""
+        if self.workload is None:
+            return {}
+        public, found = self.public(), {}
+        for proto, src, dst, new_src in self.db.execute(
+                "SELECT proto,src,dst,new_src FROM flow WHERE shot=? AND ingress=?",
+                (ident, self.workload["lan_if"])):
+            port = src.rsplit(":", 1)[1]
+            if new_src != public + port:
+                found[proto, dst, new_src] = public + port
+        return found
+
+    def canonical(self, key, remapped):
+        if remapped and key[0] == self.workload["wan_if"] and key[1:] in remapped:
+            return (*key[:3], remapped[key[1:]])
+        return key
+
     def rows(self, ident):
         if ident not in self.headers:
             raise ValueError("unknown flow snapshot")
@@ -139,11 +166,10 @@ class Snapshots:
         actual = set()
         translation = mtu = 0
         w = self.workload
+        remapped = self.remapped(ident)
         for row in self.rows(ident):
-            actual.add(row[:4])
-            translation += row[0] == w["lan_if"] and row[8] != (
-                (f"[{w['public']}]:" if ":" in w["public"] else w["public"] + ":")
-                + row[2].rsplit(":", 1)[1])
+            actual.add(self.canonical(row[:4], remapped))
+            translation += row[0] == w["lan_if"] and not row[8].startswith(self.public())
             mtu += "mtu" in body and row[7] != body["mtu"]
         missing, extra = expected - actual, actual - expected
         if not missing and not extra:
@@ -165,6 +191,7 @@ class Snapshots:
                 "SELECT cookie FROM flow WHERE shot=? EXCEPT SELECT cookie FROM flow WHERE shot=?",
                 (before, reference)))
         survivors = self.keys(range(self.workload.get("survivors", 0))) if self.workload else set()
+        remapped = self.remapped(before)
         counts = dict(missing_count=0, unexpected_count=0, regenerated_count=0,
                       unchanged_errors=0, progress_errors=0, survivor_progress_errors=0)
         evidence = {key: [] for key in ("missing", "unexpected", "regenerated", "survivors_regenerated", "errors")}
@@ -178,7 +205,8 @@ class Snapshots:
         while a is not None or b is not None:
             if b is None or (a is not None and a[:4] < b[:4]):
                 counts["missing_count"] += 1
-                if a[4] not in excluded and a[:4] not in excluded_keys and not body.get("allow_missing"):
+                if (a[4] not in excluded and self.canonical(a[:4], remapped) not in excluded_keys
+                        and not body.get("allow_missing")):
                     counts["unchanged_errors"] += 1
                 note("missing", a[:4])
                 a = next(old, None)
@@ -189,12 +217,13 @@ class Snapshots:
                 b = next(new, None)
                 continue
             key = a[:4]
-            ignored = a[4] in excluded or key in excluded_keys
+            identity = self.canonical(key, remapped)
+            ignored = a[4] in excluded or identity in excluded_keys
             regenerated = a[4] != b[4] or b[5] < a[5]
             if regenerated and not ignored:
                 counts["regenerated_count"] += 1
                 note("regenerated", key)
-                if key in survivors:
+                if identity in survivors:
                     note("survivors_regenerated", key)
             if not ignored and not (regenerated and body.get("allow_regenerated")):
                 if regenerated:
@@ -202,7 +231,7 @@ class Snapshots:
                     note("errors", key)
                 if b[5] <= a[5]:
                     counts["progress_errors"] += 1
-                    if key in survivors:
+                    if identity in survivors:
                         counts["survivor_progress_errors"] += 1
             a, b = next(old, None), next(new, None)
         return {**counts, **evidence, "checked": self.headers[after]["flow_count"]}

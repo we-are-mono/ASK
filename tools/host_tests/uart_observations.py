@@ -66,6 +66,49 @@ def test_full_table_comparison_detects_hidden_identity_changes(tmp_path):
         store.reset()
 
 
+@pytest.mark.parametrize("reply_port,clean", [(14247, True), (14248, False)])
+def test_check_follows_a_remapped_masquerade_port(tmp_path, reply_port, clean):
+    """MASQUERADE keeps a flow's source port unless another conntrack already
+    holds that reply tuple, and then picks another one. A flow whose two
+    directions agree on the port it was given is the workload's flow; one
+    whose reply direction names some other port is not."""
+    path = tmp_path / "flowtable"
+    config = dict(lan="192.0.2.2", wan="198.51.100.2", public="198.51.100.1",
+                  lan_if="lan", wan_if="wan", base=20000, dport=48271, count=4)
+    with path.open("w") as stream:
+        stream.write("entries 8\n")
+        for ident in range(4):
+            proto, port = (6 if ident & 1 else 17), 20000 + ident // 2
+            given, reply = (14247, reply_port) if ident == 2 else (port, port)
+            stream.write(f"flow cookie={ident}-lan in=lan proto={proto} src=192.0.2.2:{port} "
+                         f"dst=198.51.100.2:48271 packets=1 bytes=1 mtu=1500 "
+                         f"new_src=198.51.100.1:{given}\n")
+            stream.write(f"flow cookie={ident}-wan in=wan proto={proto} src=198.51.100.2:48271 "
+                         f"dst=198.51.100.1:{reply} packets=1 bytes=1 mtu=1500 "
+                         f"new_src=198.51.100.2:48271\n")
+    store = Snapshots(tmp_path, path)
+    try:
+        store.configure(config)
+        before = store.capture({})["snapshot"]
+        result = store.check({"snapshot": before})
+        assert result["translation_errors"] == 0, result
+        if clean:
+            assert result["missing_count"] == result["unexpected_count"] == 0, result
+            # Retiring the remapped flow by its identity is retiring both of
+            # its directions, whichever port it was given.
+            rows = [line for line in path.read_text().splitlines()
+                    if "proto=17 src=192.0.2.2:20001 " not in line and "dst=198.51.100.1:14247" not in line]
+            path.write_text("\n".join(rows) + "\n")
+            after = store.capture({})["snapshot"]
+            result = store.compare({"before": before, "after": after, "exclude_ids": [2]})
+            assert result["missing_count"] == 2 and result["unchanged_errors"] == 0, result
+        else:
+            assert result["missing"] == [("wan", "17", "198.51.100.2:48271", "198.51.100.1:20001")], result
+            assert result["unexpected"] == [("wan", "17", "198.51.100.2:48271", "198.51.100.1:14248")], result
+    finally:
+        store.reset()
+
+
 @pytest.mark.parametrize("source,destination", [("192.0.2.2", "198.51.100.2"),
                                                 ("fd00:1::2", "fd00:2::2")])
 async def test_local_deletion_batch_checks_every_ack(monkeypatch, source, destination):
