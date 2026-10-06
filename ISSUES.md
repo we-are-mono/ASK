@@ -324,6 +324,13 @@ result independently of those temporary files.
 - [x] **A327 — a route change under a full table blocked flowtable readers ~13 s and piled up offload kworkers.** Fixed:
   one barrier per 64-entry batch, and a deletion never waits for the transaction (_:/^cdx: retire flowtable entries in batches_).
 
+- [ ] **A328 — one UDP reply lost on the IPsec NAT-T return path (`flowtable_service_ipsec_rekey.py::test_ipsec_outbound_natt_rekey_root[cbc]`).**
+  Full run 179, 2026-10-06: flow 2 serial 618 got no reply. The WAN peer received the request, so the loss is on the
+  inbound leg (WAN encrypt → DUT decrypt → loki). The inbound SA did not change in that window, and loki's X550 showed
+  `rx_crc_errors` 0 over 841 M frames, so it is neither the SA switch nor the LAN-medium loss of
+  `docs/flowtable/udp-loss-investigation.md`. 10/10 scoped reruns passed. The peer harness now records DUT
+  `/proc/net/xfrm_stat` at start and the LAN NIC's error counters on failure. Next occurrence: diff those to place the drop.
+
 - [ ] **A329 — detaching a full table holds Netfilter's `flow_block_lock` while the binding's entries are retired.**
   `nf_flow_table_block_setup()` calls `ft_release()` with the lock held for write. Retiring 32,768 entries takes 5.9 s
   on the KASAN image, and Linux's `nf_ft_offload_stats` workers for that table sleep on the lock meanwhile (~257 in D,

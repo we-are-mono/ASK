@@ -19,7 +19,7 @@ from _flowtable_rig import SPORT as BASE_SPORT
 from ask_orch.commands import console_python
 from ask_orch.uart import Console
 from _flowtable_tcp import cpu, cpu_delta, software_tx
-from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_connections_peer import TCP_SIZE, UDP_SIZE, payload
 
 SPORT = BASE_SPORT + 32
@@ -168,6 +168,12 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_s
     heartbeat = None
     path = "/tmp/ask-peer-" + secrets.token_hex(8)
     started = False
+    # What the DUT's transforms had dropped when the peer started, so a lost
+    # datagram's record says what dropped meanwhile, not since boot.
+    try:
+        xfrm_before = await read(r.target, r.session, "/proc/net/xfrm_stat")
+    except Exception as error:
+        xfrm_before = repr(error)
 
     async def echo(reader, writer):
         writers.add(writer)
@@ -323,15 +329,27 @@ for suffix in ('.py', '.pid', '.log', '.sock'):
                         if len(data) >= 12:
                             ident, serial = struct.unpack("!IQ", data[:12])
                             seen.setdefault(ident, []).append(serial)
-                    dut = {}
+                    dut = {"/proc/net/xfrm_stat at start": xfrm_before}
                     for path in ("/proc/net/xfrm_stat", "/proc/cdx_flowtable"):
                         try:
                             dut[path] = await read(r.target, r.session, path)
                         except Exception as error:
                             dut[path] = repr(error)
+                    # A frame corrupted on the LAN medium is counted only by
+                    # the endpoint that received it
+                    # (docs/flowtable/udp-loss-investigation.md).
+                    try:
+                        lan_nic = (await lan_run_python(r.lan, f"""
+import subprocess
+stats = subprocess.run(['ethtool', '-S', {LAN_NIC!r}], capture_output=True, text=True).stdout
+print(''.join(line + '\\n' for line in stats.splitlines()
+              if any(word in line for word in ('err', 'drop', 'crc', 'miss'))), end='')
+""", timeout=10, label="peer_nic_errors")).stdout
+                    except Exception as error:
+                        lan_nic = repr(error)
                     r.record("connections-wan-received",
                              {"wan": {ident: sorted(serials)[-32:] for ident, serials in seen.items()},
-                              "dut": dut})
+                              "dut": dut, "lan_nic_errors": lan_nic})
                 assert result.rc == 0 and not errors, (result.stdout, errors)
         if shutdown_error:
             raise shutdown_error
