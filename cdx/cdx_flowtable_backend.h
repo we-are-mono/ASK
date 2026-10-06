@@ -180,6 +180,9 @@ struct cdx_ft_rule {
 	u8 src_mac[ETH_ALEN];
 	u8 dst_mac[ETH_ALEN];
 	u16 mtu;
+	/* Adapter state: an IPv6 direction whose path MTU is its egress
+	 * device's IPv6 MTU, the route's own not being locked. */
+	bool mtu_follows_dev;
 	/* Class, already decoded from the conntrack mark: low nibble is the
 	 * CEETM class queue, second nibble the channel (zero means the port's
 	 * own least-priority channel), third nibble the ingress policer

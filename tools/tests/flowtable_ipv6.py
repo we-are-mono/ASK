@@ -584,6 +584,56 @@ print(json.dumps(answer.summary()))
         await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}", check=False)
 
 
+@pytest.mark.rfc("4443", section="3.2")
+async def test_egress_mtu_drop(ipv6_rig):
+    """Lowering the WAN's IPv6 MTU retires the installed LAN-to-WAN direction.
+
+    The sysctl moves the path MTU IPv6 forwarding reads, and no event reports
+    it, so the stats pass has to notice an installed direction programmed with
+    more than its egress now carries. Left installed, it would forward what
+    Linux answers with Packet Too Big. The flow comes back with only the
+    WAN-to-LAN direction in hardware, the LAN still delivering a full frame
+    into the smaller path, and an oversized packet gets its Packet Too Big.
+    """
+    r = ipv6_rig
+    sport, dport = PORTS["egress"]
+    loop = asyncio.get_running_loop()
+    echo = PayloadEcho()
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: echo, local_addr=(WAN_IPV6, dport), family=socket.AF_INET6)
+    wan_mtu = f"net.ipv6.conf.{TARGET_WAN_IF}.mtu"
+    original = (await command(r.target, r.session, "sysctl", "-n", wan_mtu))["stdout"].strip()
+    assert original == "1500", original
+
+    async def send(count=8):
+        return await _udp_exchange(r, sport, WAN_IPV6, dport, count, (WAN_IPV6, dport),
+                                   "flowtable_v6_egress")
+
+    try:
+        await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
+        both = await _drive(r, send, lambda s: s["entries"] == 2, "both directions should be in hardware")
+        await command(r.target, r.session, "sysctl", "-w", f"{wan_mtu}=1400")
+        retired = await r.wait(lambda s: s["mtu_invalidations"] > both["mtu_invalidations"])
+        lowered = await _drive(r, send, lambda s: (s["entries"] == 1 and s["flows"][0]["in"] == TARGET_WAN_IF),
+                               "only the WAN-to-LAN direction should be in hardware")
+        r.record("ipv6-egress-mtu", {"both": both, "retired": retired, "lowered": lowered})
+        script = f'''
+from scapy.all import Ether, IPv6, UDP, Raw, ICMPv6PacketTooBig, srp1
+packet = IPv6(src={LAN_IPV6!r}, dst={WAN_IPV6!r})/UDP(sport={sport}, dport={dport})/Raw(b'E' * 1420)
+answer = srp1(Ether(dst={r.dut_lan_mac!r})/packet, iface={LAN_NIC!r}, timeout=3, verbose=False)
+assert answer is not None and ICMPv6PacketTooBig in answer, answer
+assert answer[ICMPv6PacketTooBig].mtu == 1400, answer.show(dump=True)
+'''
+        result = await lan_run_python(r.lan, script, timeout=20, label="flowtable_v6_egress")
+        assert result.rc == 0, result.stdout
+        await asyncio.sleep(0.5)
+        assert not echo.received[b"E" * 1420], echo.received
+    finally:
+        transport.close()
+        await _drop_tables(r)
+        await command(r.target, r.session, "sysctl", "-w", f"{wan_mtu}={original}", check=False)
+
+
 async def test_shares_the_admission_budget(ipv6_rig):
     """Both families draw on one budget and one pair of software indexes, so
     many concurrent IPv6 flows must each consume two directions and nothing

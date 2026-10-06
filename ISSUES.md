@@ -347,12 +347,8 @@ result independently of those temporary files.
   reload with a full table pays this. Fix direction: hand the binding's entries to the retirement worker and return,
   once nothing reads `entry->binding` after release.
 
-- [ ] **A331 — lowering an egress device's IPv6 MTU sysctl leaves installed entries at the old path MTU.**
-  `net.ipv6.conf.<egress>.mtu` lowers the route MTU (`rt6_mtu_change()`) with no netdev or FIB event the adapter
-  watches, and a learned unicast PMTU exception is the same. An installed IPv6 direction keeps its larger `rule->mtu`
-  and forwards frames Linux would answer with Packet Too Big. Nothing is fragmented or lost (the device MTU still
-  carries them); it diverges from Linux until the flow ends. Low. Fix direction: retire IPv6 entries egressing a
-  device whose `mtu6` changed, from the existing stats pass or an inet6 notifier.
+- [x] **A331 — lowering an egress device's IPv6 MTU sysctl left installed entries at the old path MTU.** Fixed:
+  the stats pass and re-offer retire a direction its egress no longer carries (_:/^flowtable: retire an IPv6 direction whose egress MTU drops_).
 
 - [x] **A276 — the data plane wedged twice under a flooded ESP SA.** An HC command
   timed out ("board reset required") because 11aa150's per-SA offline-port classification

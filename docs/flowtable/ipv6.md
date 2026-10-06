@@ -120,7 +120,14 @@ oversized packet from a host that ignored it. A direction refused for this
 stays on the software flowtable path, where the oversized packet reaches
 `ip6_forward()` and gets its Packet Too Big; the reverse direction is admitted
 on its own. Device and route MTU changes retire a flow through their own
-events, so admission alone decides.
+events. One change has none: the egress device's IPv6 MTU sysctl, which an
+unlocked route's forwarding MTU follows (`ip6_dst_mtu_maybe_forward()`).
+Admission, every stats pass and every time Linux offers an installed direction
+again retire a direction on such a route once its device's IPv6 MTU is below
+the direction's (counted as `mtu_invalidations`); left installed, it would
+forward what Linux answers with Packet Too Big. Linux's own software flowtable
+keeps the MTU a flow was created with, which is why admission checks too, and
+retiring the flow makes Linux create it again at the MTU its egress carries.
 
 TCP is exempt, because a PPPoE or tunnel uplink clamps its MSS, so no segment
 is larger than the path; an IPv6 segment over the clamp from a host that

@@ -1553,6 +1553,35 @@ static bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
 	       ft_arriving(rule->in_logical, rule->in, ft_rule_stripped(rule)) <= mtu;
 }
 
+static u32 ft_ipv6_dev_mtu(const struct net_device *dev)
+{
+	struct inet6_dev *idev;
+	u32 mtu = 0;
+
+	rcu_read_lock();
+	idev = __in6_dev_get(dev);
+	if (idev)
+		mtu = READ_ONCE(idev->cnf.mtu6);
+	rcu_read_unlock();
+	return mtu;
+}
+
+/* Whether an IPv6 direction's egress still carries the MTU it describes. IPv6
+ * forwarding reads an unlocked route's MTU from its device's IPv6 MTU
+ * (ip6_dst_mtu_maybe_forward()), a sysctl whose writes no notifier reports,
+ * so lowering it leaves an entry forwarding what Linux would answer with
+ * Packet Too Big. Raising it needs nothing: the entry stays bounded by what it
+ * was admitted with. A locked route MTU ignores the sysctl and changes through
+ * a route event, and IPv4 has no such sysctl, so only an unlocked IPv6 route
+ * follows its device. Its MTU is never above the device's when Linux creates
+ * the flow, so a retired flow comes back carried and nothing loops. Checked at
+ * admission, since Linux's flow keeps the MTU it was created with and the
+ * sysctl may have dropped since, and on every stats pass and re-offer. */
+static bool ft_egress_mtu_current(const struct cdx_ft_rule *rule)
+{
+	return !rule->mtu_follows_dev || ft_ipv6_dev_mtu(rule->out_logical) >= rule->mtu;
+}
+
 /* Whether the decoder is certain to refuse this offer on its MTU bound, decided
  * from the request alone and before RTNL. Linux offers a flow again about once
  * a second for as long as software forwards any of it, so a direction the bound
@@ -1970,6 +1999,13 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	if (!ether_addr_equal(ethernet + ETH_ALEN, out->out->dev_addr))
 		return ask_refuse(-ESTALE);
 	out->mtu = cls->nf_mtu;
+	out->mtu_follows_dev = family == AF_INET6 && !dst_metric_locked(cls->nf_dst, RTAX_MTU);
+	if (!ft_egress_mtu_current(out)) {
+		/* Retired rather than only refused, so Linux makes the flow again
+		 * with the MTU its egress carries now. */
+		ft_handle_invalidate(cls->nf_handle, &ft_mtu_invalidations);
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	ether_addr_copy(out->src_mac, ethernet + ETH_ALEN);
 	/* Last, because a tc police filter is matched against the finished
 	 * tuple. A filter is the more specific statement of the same intent as
@@ -2169,10 +2205,15 @@ static unsigned int ft_l2_overhead(const struct cdx_ft_rule *rule)
  * uses RCU. Retiring the generation also prevents its sibling keeping it alive. */
 static bool ft_entry_bounded(struct cdx_ft_entry *entry)
 {
-	if (!ft_bridge_egress_filtered(&entry->rule))
-		return true;
-	ft_handle_invalidate(entry->handle, &ft_admission_invalidations);
-	return false;
+	if (ft_bridge_egress_filtered(&entry->rule)) {
+		ft_handle_invalidate(entry->handle, &ft_admission_invalidations);
+		return false;
+	}
+	if (!ft_egress_mtu_current(&entry->rule)) {
+		ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
+		return false;
+	}
+	return true;
 }
 
 static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)

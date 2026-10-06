@@ -273,13 +273,20 @@ struct bridge_vlan_info { u16 vid, flags; };
  * they build, and that is what Netfilter then writes into the Ethernet
  * destination of a flow leaving by one. priv is what netdev_priv() hands back,
  * which is where the adapter reads the tunnel's configuration from. */
-struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
+struct net_device { int ifindex, refs, mtu, ip6_mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
                     unsigned short type; unsigned char addr_len; void *priv;
                     struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto;
                     bool bridge, vlan_filtering, stp_blocked, mst; struct net_device *master;
                     u16 br_proto, pvid; struct br_vlan_entry br_vlans[BR_MAX_VLANS];
                     unsigned br_nvlans; u16 vid_blocked; };
 #define netdev_priv(d) ((d)->priv)
+/* A device's IPv6 MTU starts as the device's own, as addrconf sets it; a case
+ * that writes the sysctl sets ip6_mtu. Only the egress side is read: what a
+ * direction may be handed is bounded by the ingress port, never by this. */
+struct inet6_dev { struct { int mtu6; } cnf; };
+static struct inet6_dev inet6_view;
+static struct inet6_dev *__in6_dev_get(const struct net_device *d)
+{ inet6_view.cnf.mtu6 = d->ip6_mtu ? d->ip6_mtu : d->mtu; return &inet6_view; }
 #define rcu_read_lock() do { } while (0)
 #define rcu_read_unlock() do { } while (0)
 /* Devices are told apart by pointer here, never by name; the production
@@ -502,7 +509,12 @@ struct dst_entry {
     int error;
     u32 cookie;
     bool valid;
+    /* RTAX_MTU's lock bit, the one metric lock the adapter reads. */
+    bool mtu_locked;
 };
+#define RTAX_MTU 2
+static bool dst_metric_locked(const struct dst_entry *d, int metric)
+{ return metric == RTAX_MTU && d->mtu_locked; }
 struct rtable { struct dst_entry dst; unsigned rt_type, rt_gw_family; __be32 rt_gw4; };
 /* Only the fields the decoder reads; rt6i_dst is what an RTF_CACHE route
  * names as its own next hop. */
@@ -1778,6 +1790,7 @@ static void fixture(void)
     ipsec_sa = ipsec_in_sa = 0;
     xfrm_policies = false;
     in.mtu = 1500;
+    in.ip6_mtu = out.ip6_mtu = 0;
     ft_ipsec_genid = xfrm_genid = 0;
     assert(!ft_handle_refs && handle.refs <= 1);
     handle = (struct nf_flow_offload_handle){ .refs = 1 };
@@ -1919,6 +1932,8 @@ static void test_ipv6(void)
     assert(nf_inet_addr_cmp(&decoded.src, &decoded.new_src));
     assert(decoded.new_sport == pk.src && decoded.new_dport == pk.dst);
     assert(decoded.mtu == 1500 && decoded.in == &in && decoded.out == &out);
+    /* The path is the egress device's IPv6 MTU, the route's unlocked. */
+    assert(decoded.mtu_follows_dev);
 
     /* An IPv6 destination is only valid for the FIB generation it was chosen
      * in. Admission is handed that cookie; a zero one rejects every route. */
@@ -1972,8 +1987,8 @@ static void test_ipv6(void)
      * anything over the entry's MTU, whose fragments it builds without their
      * payload, and nothing it hands Linux for the Packet Too Big IPv6 needs.
      * What may arrive is what the ingress port's MAC accepts, never what the
-     * link advertises -- the harness models no IPv6 MTU sysctl at all, so
-     * reading one would not compile -- and a 1500-byte LAN into PPPoE (1492)
+     * link advertises -- the ingress bound never reads the IPv6 MTU sysctl,
+     * only the egress recheck does -- and a 1500-byte LAN into PPPoE (1492)
      * or a 6in4 tunnel (1480) stays in software whatever its hosts are told.
      * A TCP direction is carried: the uplink clamps its MSS, and IPv4 TCP
      * sets DF besides. An IPv4 direction to or from SEC is never bounded:
@@ -2028,17 +2043,81 @@ static void test_ipv6(void)
     /* The neighbour must be discovered in the IPv6 table. */
     V6_REJECT(neighbour.tbl = &arp_tbl);
 #undef V6_REJECT
-    /* The bound reads only device and route MTUs, whose changes retire a
-     * flow through their own events, so the stats pass rechecks nothing of
-     * it: an IPv6 direction carried into a smaller path stays installed. */
-    fixture6(); tcp_flow(); cls.nf_mtu = 1492;
+    /* The ingress bound reads only device and route MTUs, whose changes
+     * retire a flow through their own events. The egress one does not: an
+     * unlocked IPv6 route's MTU is its device's IPv6 MTU, a sysctl no
+     * notifier reports, so every stats pass rechecks an IPv6 direction over
+     * an unlocked route. Raised or equal it stays; lowered under what the
+     * entry was programmed with, Linux would answer with Packet Too Big
+     * where the entry forwards, and it is retired. */
+    fixture6(); out.mtu = 9000; out.ip6_mtu = 1500;
     assert(ft_replace(&binding, &cls) == 0);
     struct cdx_ft_entry *bounded = ft_find(&binding, cls.cookie);
     u64 mtu_invalidations = ft_mtu_invalidations;
-    assert(bounded && ft_stats(bounded, &cls) == 0 && !handle.invalid);
+    assert(bounded && bounded->rule.mtu_follows_dev && bounded->rule.mtu == 1500);
+    assert(ft_stats(bounded, &cls) == 0 && !handle.invalid);
+    out.ip6_mtu = 9000;
+    assert(ft_stats(bounded, &cls) == 0 && !handle.invalid);
+    out.ip6_mtu = 1500;
     assert(ft_stats(bounded, &cls) == 0 && !handle.invalid &&
            ft_mtu_invalidations == mtu_invalidations);
-    assert(ft_remove(bounded) == 0);
+    out.ip6_mtu = 1400;
+    assert(ft_stats(bounded, &cls) == -EOPNOTSUPP && handle.invalid &&
+           ft_mtu_invalidations == mtu_invalidations + 1);
+    assert(ft_remove(bounded) == 0); ft_invalid = 0;
+    out.mtu = 1500;
+    /* A path narrower than the device still follows it: an unlocked route's
+     * MTU never exceeds its device's IPv6 MTU when the flow is made, so only
+     * a sysctl written since can put it under the entry's. Lowered to the
+     * path the direction stays; under it, it is retired. */
+    fixture6(); tcp_flow(); cls.nf_mtu = 1492;
+    assert(ft_replace(&binding, &cls) == 0);
+    bounded = ft_find(&binding, cls.cookie);
+    mtu_invalidations = ft_mtu_invalidations;
+    assert(bounded && bounded->rule.mtu_follows_dev && bounded->rule.mtu == 1492);
+    out.ip6_mtu = 1492;
+    assert(ft_stats(bounded, &cls) == 0 && !handle.invalid &&
+           ft_mtu_invalidations == mtu_invalidations);
+    out.ip6_mtu = 1280;
+    assert(ft_stats(bounded, &cls) == -EOPNOTSUPP && handle.invalid &&
+           ft_mtu_invalidations == mtu_invalidations + 1);
+    assert(ft_remove(bounded) == 0); ft_invalid = 0;
+    out.ip6_mtu = 0;
+    /* A locked route MTU ignores the sysctl and changes through a route
+     * event, and IPv4 has none: neither is rechecked. */
+    for (unsigned v6 = 0; v6 < 2; v6++) {
+        if (v6) { fixture6(); route6.dst.mtu_locked = true; } else fixture();
+        assert(ft_replace(&binding, &cls) == 0);
+        bounded = ft_find(&binding, cls.cookie);
+        mtu_invalidations = ft_mtu_invalidations;
+        assert(bounded && !bounded->rule.mtu_follows_dev);
+        out.ip6_mtu = 1280;
+        assert(ft_stats(bounded, &cls) == 0 && !handle.invalid &&
+               ft_mtu_invalidations == mtu_invalidations);
+        assert(ft_remove(bounded) == 0);
+        out.ip6_mtu = 0;
+    }
+    /* A flow Linux made before the egress IPv6 MTU dropped under its path is
+     * refused at admission and retired, so that it is made again with the
+     * MTU the egress carries now. Nothing is installed. Over a locked route
+     * the same sysctl is not the path, and the direction is admitted. */
+    for (unsigned locked = 0; locked < 2; locked++) {
+        fixture6(); route6.dst.mtu_locked = locked;
+        out.ip6_mtu = 1400;
+        mtu_invalidations = ft_mtu_invalidations;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == (locked ? 0 : -EOPNOTSUPP));
+        assert(handle.invalid == !locked && ft_mtu_invalidations == mtu_invalidations + !locked);
+        fixture6(); route6.dst.mtu_locked = locked;
+        out.ip6_mtu = 1400;
+        mtu_invalidations = ft_mtu_invalidations;
+        assert(ft_replace(&binding, &cls) == (locked ? 0 : -EOPNOTSUPP));
+        assert(handle.invalid == !locked && ft_mtu_invalidations == mtu_invalidations + !locked);
+        bounded = ft_find(&binding, cls.cookie);
+        assert(locked ? bounded && !bounded->rule.mtu_follows_dev : !bounded && !ft_count);
+        if (locked) assert(ft_remove(bounded) == 0);
+        ft_invalid = 0;
+        out.ip6_mtu = 0;
+    }
 
     /* Translation: five actions per edit and no checksum action. */
     nat6_fixture();
@@ -6208,23 +6287,35 @@ static void test_installed_reoffer(void)
             ft_retire_workfn(NULL);
             assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated && !live_hw);
         }
-    /* The MTU bound reads only device and route MTUs, whose changes retire a
-     * direction through their own events, so the offer Linux repeats every
-     * second for a partially offloaded flow rechecks none of it: an installed
-     * IPv6 direction into a smaller path is answered without RTNL and stays. */
-    {
-        fixture6(); tcp_flow(); cls.command = FLOW_CLS_REPLACE; cls.nf_mtu = 1492;
+    /* The egress IPv6 MTU is a sysctl no notifier reports. A partially
+     * offloaded flow is offered again every second, which is when a lowered
+     * one has to take out the installed direction that follows it -- also
+     * without RTNL. A path narrower than the device follows it too, retired
+     * only once the sysctl is under the path. One over a locked route is
+     * answered and stays whatever the sysctl says. */
+    for (unsigned kind = 0; kind < 5; kind++) {
+        /* Unchanged; lowered under the path; TCP into 1492 lowered to the
+         * path, then under it; a locked route lowered under it. */
+        static const int lowered_to[] = { 0, 1280, 1492, 1280, 1280 };
+        bool retired = kind == 1 || kind == 3;
+
+        fixture6(); cls.command = FLOW_CLS_REPLACE;
+        if (kind == 2 || kind == 3) { tcp_flow(); cls.nf_mtu = 1492; }
+        if (kind == 4) route6.dst.mtu_locked = true;
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
+        assert(ft_find(&binding, cls.cookie)->rule.mtu_follows_dev == (kind != 4));
         u64 mtu = ft_mtu_invalidations, rejects = ft_rejects;
         unsigned trylocks = rtnl_trylocks;
+        out.ip6_mtu = lowered_to[kind];
         rtnl_busy = true;
         int rc = ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding);
         rtnl_busy = false;
         assert(rtnl_trylocks == trylocks && ft_count == 1);
-        assert(rc == 0 && !handle.invalid);
-        assert(ft_mtu_invalidations == mtu && ft_rejects == rejects);
-        remove_all();
+        assert(rc == (retired ? -EOPNOTSUPP : 0) && handle.invalid == retired);
+        assert(ft_mtu_invalidations == mtu + retired && ft_rejects == rejects + retired);
+        if (retired) ft_retire_workfn(NULL); else remove_all();
         assert(!ft_count && !ft_handle_refs);
+        out.ip6_mtu = 0;
     }
     /* A generation already retired -- by an event, a latch or Linux itself --
      * is not an installed direction to answer for. The offer goes through
@@ -8230,6 +8321,9 @@ int main(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(is4(&decoded.src, ik.src) && is4(&decoded.dst, ik.dst) && decoded.sport == htons(10000));
     assert(decoded.mtu == 1500 && decoded.in == &in && decoded.out == &out);
+    /* IPv4 has no IPv6 MTU to follow, though the egress device's equals the
+     * path here. */
+    assert(!decoded.mtu_follows_dev);
     assert(!memcmp(decoded.dst_mac, (u8[]){2,0x11,0x22,0x33,0x44,0x55}, 6));
     assert(!memcmp(decoded.src_mac, out.dev_addr, 6));
     /* The MTU is the path's, not the egress device's. */
