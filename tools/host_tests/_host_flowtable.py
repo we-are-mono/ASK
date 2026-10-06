@@ -6,6 +6,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def flowtable_source():
+    """The flowtable adapter as one text: its private header, then each of its
+    objects, so a slice or an anchor finds what it names wherever it lives."""
+    cdx = ROOT / "cdx"
+    return "".join(path.read_text() for path in
+                   [cdx / "ask_flowtable_internal.h", *sorted(cdx.glob("ask_flowtable_*.c"))])
+
+
 def function(source, name):
     # The line has to begin with a word, the return type: a comment line that
     # names `foo()' would otherwise match and run on to the next definition.

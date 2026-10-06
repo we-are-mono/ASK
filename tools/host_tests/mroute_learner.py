@@ -11,13 +11,13 @@ from ask_orch.process import run_process
 
 from _host_mroute_learner import (
     ROOT,
-    SOURCE,
     _assert_not_inside,
     _between,
     _held_regions,
     _hunk_in,
     _hunks,
     _ordered,
+    mr_structs,
 )
 
 import os
@@ -25,11 +25,12 @@ from pathlib import Path
 import re
 
 from _host_pppoe_hm import (declaration)
+from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
 
 
 def test_mroute_learner(tmp_path):
-    source = SOURCE.read_text()
+    source = flowtable_source()
     # The real state, not a restatement: a field added or resized on any of
     # these has to fail here rather than compile into a harness that no longer
     # matches what the adapter keeps.
@@ -41,7 +42,7 @@ def test_mroute_learner(tmp_path):
         + declaration(header, "cdx_mc_listener")
         + declaration(header, "cdx_mc_group_spec")
         + source[enum_start:source.index("};", enum_start) + 3]
-        + _between(source, "struct ft_mr_vif {", "static LIST_HEAD(ft_mr_groups)")
+        + mr_structs(source)
         # The table the decision reads, declared between the struct it is an
         # array of and the functions that read it. The production definition
         # sits with the rest of the learner's state, which this harness owns.
@@ -97,7 +98,7 @@ def test_the_fib_handler_only_queues():
     or wait for the transaction. It holds what the worker will need, appends
     to a queue under a spinlock, and returns.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     body = function(source, "ft_mr_fib_event") + function(source, "ft_mr_event_alloc")
     for forbidden in ("cdx_ft_begin", "mutex_lock", "rtnl_lock",
                       "GFP_KERNEL", "cdx_mc_group_add", "cdx_mc_group_del",
@@ -120,7 +121,7 @@ def test_the_worker_never_holds_a_lock_across_the_transaction():
     RTNL, so it never holds the transaction then; the one caller that takes
     the transaction under RTNL is the drain, below.
     """
-    body = function(SOURCE.read_text(), "ft_mr_work_fn")
+    body = function(flowtable_source(), "ft_mr_work_fn")
     assert "cdx_ft_begin();" in body, "the worker is where the hardware happens"
     for lock, unlock, why in (
         ("mutex_lock(&ft_mr_lock)", "mutex_unlock(&ft_mr_lock)",
@@ -140,7 +141,7 @@ def test_the_worker_decides_against_the_chain_as_it_stands():
     taking RTNL and deriving, and handing the group back must follow the lock
     order: RTNL let go of before the learner lock, and no transaction at all.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     assert "ASSERT_RTNL();" in function(source, "ft_mr_queue_behind")
     worker = function(source, "ft_mr_work_fn")
     lock = worker.index("rtnl_lock();")
@@ -178,7 +179,7 @@ def test_the_drain_takes_the_transaction_under_its_callers_rtnl_only():
     going over to a bridge's copies included, whose entry of its own is
     recorded gone before the transaction is let go.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     drain = function(source, "ft_mr_egress_drain")
     for forbidden in ("rtnl_lock()", "flush_work", "cancel_work", "busy"):
         assert forbidden not in drain, forbidden
@@ -214,7 +215,7 @@ def test_the_two_learners_never_nest_their_locks():
     learner at all, it only kicks the worker.
     Nesting them in both directions is the deadlock this rules out.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     regions = _held_regions(source, "mutex_lock(&ft_mc_lock)",
                             "mutex_unlock(&ft_mc_lock)")
     _assert_not_inside(source, regions, "mutex_lock(&ft_mr_lock)",
@@ -247,7 +248,7 @@ def test_the_derivation_touches_no_hardware_and_takes_no_rtnl():
     transaction may not be taken under it at all. Everything it reads is
     netdev and bridge state.
     """
-    body = function(SOURCE.read_text(), "ft_mr_derive")
+    body = function(flowtable_source(), "ft_mr_derive")
     for forbidden in ("cdx_ft_begin", "rtnl_lock()", "ft_mr_offload_flag",
                       "mutex_lock(&ft_mr_lock)", "cdx_mc_group_add",
                       "cdx_mc_group_replace", "cdx_mc_group_del"):
@@ -262,7 +263,7 @@ def test_the_mtu_bound_is_rechecked_without_an_mfc_event():
     found by the periodic refresh re-deriving every group, installed ones
     included, exactly as the unicast IPv6 bound is found by the stats pass.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     derive = function(source, "ft_mr_derive")
     assert "return FT_MR_REFUSED_MTU;" in derive
     assert "ft_mc_link_mtu(vif_dev, g->family)" in derive
@@ -282,7 +283,7 @@ def test_every_reference_the_learner_takes_is_released():
     and it holds the kernel's own cache entry for as long as it is keyed on
     it. One path releases all of them.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     free = function(source, "ft_mr_group_free")
     assert "ft_mr_release_set(g)" in free
     assert "mr_cache_put(g->mfc)" in free
@@ -310,7 +311,7 @@ def test_a_plan_is_adopted_whole_or_returned_whole():
     some of them would name one it did not. Either the group takes the lot or
     ft_mr_plan_put() gives the lot back.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     put = function(source, "ft_mr_plan_put")
     assert "dev_put(plan->spec.listener[i].dev)" in put
     assert "dev_put(plan->spec.in)" in put
@@ -330,7 +331,7 @@ def test_the_learner_lets_go_of_a_device_that_went_away():
     merely goes down, and a reference still held when netdev_wait_allrefs()
     starts spinning is a device that never finishes unregistering.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     netdev = function(source, "ft_netdev_event")
     assert netdev.count("ft_mr_device_gone(dev)") == 2, (
         "both the link going down and unregistration must reach the learner")
@@ -352,7 +353,7 @@ def test_an_address_change_asks_every_routed_group_again():
     change itself has to ask again, or the chain writes the old address until
     the next refresh happens to replace it -- and the plan comparison has to
     see the difference, or even that would not."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     netdev = function(source, "ft_netdev_event")
     arm = netdev[netdev.index("case NETDEV_CHANGEADDR:"):]
     arm = arm[:arm.index("break;")]
@@ -370,7 +371,7 @@ def test_exit_drains_before_the_module_text_goes_away():
     VIF table, and it must do so after the FIB chain is unregistered so
     nothing can arrive while they drain.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     exit_body = function(source, "ask_flowtable_exit")
     assert "ft_mr_exit();" in exit_body
     assert exit_body.index("unregister_fib_notifier") < \
@@ -404,7 +405,7 @@ def test_the_learners_share_streams_not_keys():
     publishes its copies to the bridged group carrying it instead of
     installing a root of its own.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     assert "ft_mc_claim" not in source, "the address-pair register is gone"
     worker = function(source, "ft_mr_work_fn")
     # A parent on a bridge installs nothing: its copies are published, and
@@ -437,7 +438,7 @@ def test_the_routed_learner_reaches_the_bridged_one_only_through_its_door():
     and freeing a group's route happens only after it is off the bridged
     learner's list, which is what clears every pointer to it there.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     publish = function(source, "ft_mr_publish")
     unlock = publish.index("mutex_unlock(&ft_mr_lock);")
     assert unlock < publish.index("ft_mc_route_publish(")
@@ -465,7 +466,7 @@ def test_the_taps_say_so_whenever_they_cannot_be_trusted():
     its first word -- the taps say they may be anywhere. And a bridge that
     went down, whose taps the bridged learner dropped, is published again.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     taps = function(source, "ft_mr_publish_taps")
     assert "ft_mr_resync_pending" in taps
     assert "ft_mr_policy[0] || ft_mr_policy[1]" in taps
@@ -488,7 +489,7 @@ def test_a_listener_is_its_whole_framing_not_its_port():
     hairpin double-NAT case. Multicast agreeing is the two paths saying the
     same thing.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     body = function(source, "ft_mr_listener")
     assert "add.dev == ingress->dev && add.vlans == ingress->vlans" in body, (
         "the ingress test must compare the framing, not just the device")
@@ -509,7 +510,7 @@ def test_the_counter_fold_restates_the_units():
     itself -- framing, adding rather than setting, lastuse -- is compiled and
     run by mroute_fold.py; this is what feeds it.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     # The framing is the entry's own ingress tags, or, for a group routed
     # through a bridge, what the bridged group carrying it reports: a daemon
     # ageing its routes by SIOCGETSGCNT must see a merged stream flow.
@@ -530,7 +531,7 @@ def test_proc_reports_a_row_and_a_summary():
     diagnostic beside them rather than the only door. Both have to be there:
     `ip mroute show` says offloaded, and this says why not.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     show = function(source, "ft_show")
     assert "ft_mr_rows(seq);" in show
     for key in ("mroute_groups", "mroute_installed", "mroute_refused",
@@ -582,7 +583,7 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
     and NAT hook, before the group is carried. What every packet pays at that
     hook is the multicast test; a forwarded copy of a group, one lookup.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     hook = function(source, "ft_mr_confirm_hook")
     for family, test, mark in (
             ("AF_INET", "ipv4_is_multicast(iph->daddr)",
@@ -697,7 +698,7 @@ def test_legacy_tables_and_tc_are_judged_as_well():
     a replacement waits out; every table change moves a count the learner
     follows. tc is judged by the learner, before any walk and whatever the
     confirmations say, since neither confirms nor generation describes it."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     admit = function(source, "ft_mr_admit")
     at = [admit.index(s) for s in (
         "if (plan->via && ft_bridge_hooked(BIT(NF_BR_LOCAL_IN)))",
@@ -829,7 +830,7 @@ def test_nothing_that_can_drop_a_copy_runs_after_the_observer(tmp_path):
     netfilter BPF link refuses the last priority. But one anywhere a copy
     passes can judge it by its ports, and nothing reads it, so it keeps the
     family's groups in software wherever it is."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     (tmp_path / "mroute_confirm_order.inc").write_text(
         function(source, "ft_mr_observer_followed") + function(source, "ft_mr_bpf_hooked"))
     binary = tmp_path / "mroute_confirm_order"

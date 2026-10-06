@@ -9,16 +9,17 @@ from ask_orch.process import run_process
 import os
 from pathlib import Path
 
+from _host_flowtable import (flowtable_source)
+from _host_mroute_learner import (mr_structs)
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_mroute_fold(tmp_path):
-    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    source = flowtable_source()
     start = source.index("enum ft_mr_state {")
-    structs = source[source.index("struct ft_mr_vif {"):
-                     source.index("static LIST_HEAD(ft_mr_groups)")]
+    structs = mr_structs(source)
     (tmp_path / "mroute_types.inc").write_text(
         source[start:source.index("};", start) + 3] + structs)
     (tmp_path / "mroute_fold.inc").write_text(
@@ -43,7 +44,7 @@ def test_a_fresh_hardware_group_folds_from_zero():
     place that knows a group is new: it made it. A pointer comparison could
     not stand in -- the handle cdx_mc_group_del() frees is the next add's
     allocation often enough."""
-    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    source = flowtable_source()
     work = function(source, "ft_mr_work_fn")
     add = work.index("cdx_mc_group_add(&plan.spec, &hw)")
     # The outcome is adopted by ft_mr_record(), inside the transaction the
@@ -64,7 +65,7 @@ def test_both_learners_take_deltas_from_one_rule():
     baseline there. The routed fold and the bridged refresh that feeds a
     route's count must agree, or the MFC's count depends on which learner
     carried the stream."""
-    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    source = flowtable_source()
     assert "ft_mc_count_delta(&g->folded_packets, &g->folded_bytes," in function(source, "ft_mr_fold")
     assert "ft_mc_count_delta(&f->hw_packets, &f->hw_bytes," in function(source, "ft_mc_flow_counted")
     work = function(source, "ft_mc_work_fn")

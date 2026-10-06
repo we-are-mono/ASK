@@ -1036,7 +1036,7 @@ the product does.
 
 **Host** — `tools/host_tests/mroute_learner.py` and `mroute_learner.c`,
 in the shape of the bridged pair. It compiles the decision functions out of
-`cdx/ask_flowtable.c` against stubs and drives every clause of the contract:
+`cdx/ask_flowtable_mr.c` against stubs and drives every clause of the contract:
 each refusal, a VLAN-device iif resolving to its port, an oif expanded through
 a VLAN device, through a plain bridge on the flood set and through a
 vlan-aware bridge on an MDB port set, the listener ceiling, a listener equal to

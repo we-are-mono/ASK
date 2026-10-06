@@ -114,8 +114,8 @@ AUTH_KEY   = b"\x5A" * 32
 # functions an offloaded SA install actually walks; anything added by analogy
 # would mask a real leak and gets dropped on first false positive.
 IPSEC_LEAK_FILTER = [
-    "ft_xdo_state_add",                                 # ask_flowtable.c
-    "ft_ipsec_spec",                                    # ask_flowtable.c
+    "ft_xdo_state_add",                                 # ask_flowtable_ipsec.c
+    "ft_ipsec_spec",                                    # ask_flowtable_ipsec.c
     "ft_ipsec_watch_add",                               # the SA next-hop watch
     "cdx_ipsec_sa_add",                                 # cdx_ipsec_backend.c
     "cdx_ipsec_sa_del",                                 # cdx_ipsec_backend.c

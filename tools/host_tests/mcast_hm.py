@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 
 from _host_pppoe_hm import (declaration, typedef)
+from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,7 +30,7 @@ def test_mcast_root_hop_semantics(tmp_path):
 
 def test_bridge_mode_reaches_root_and_cannot_change_on_replace():
     from _host_mcast_backend import (code)
-    adapter = (ROOT / "cdx/ask_flowtable.c").read_text()
+    adapter = flowtable_source()
     encoder = (ROOT / "cdx/cdx_ehash.c").read_text()
     # Set on the key every group of a bridged flow is built on, whether it
     # replicates or discards, so a replace between the two keeps the mode.

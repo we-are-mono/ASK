@@ -845,7 +845,7 @@ def _assert_session(r, forward, reverse, session=None):
 # Ethernet and session headers on and no tag yet, the strip the frame as it
 # arrived less the session header, so the tag the session runs over is in.
 # The adapter restates by the same amounts (FT_PPP_TX_OVERHEAD and
-# ft_ppp_rx_overhead in ask_flowtable.c).
+# ft_ppp_rx_overhead in ask_flowtable_core.c).
 PPP_TX_OVERHEAD = 14 + 8
 PPP_RX_OVERHEAD = 14 + 4
 

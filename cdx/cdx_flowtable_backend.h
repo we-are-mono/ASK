@@ -11,7 +11,7 @@ struct net_device;
 struct cdx_ft_hw;
 
 /* Netfilter describes at most NF_FLOW_TABLE_ENCAP_MAX encapsulations per
- * direction. ask_flowtable.c asserts that the two bounds agree. */
+ * direction. ask_flowtable_internal.h asserts that the two bounds agree. */
 #define CDX_FT_VLAN_MAX 2
 
 /* How many devices one flowtable may be bound to at once.

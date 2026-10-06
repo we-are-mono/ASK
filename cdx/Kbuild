@@ -18,6 +18,11 @@ ccflags-y += $(CFG_FLAGS)
 
 obj-$(CONFIG_ASK_CDX) += cdx.o ask_flowtable.o
 
+ask_flowtable-y += ask_flowtable_core.o ask_flowtable_watch.o \
+	ask_flowtable_ipsec.o ask_flowtable_mc.o ask_flowtable_mc_hook.o \
+	ask_flowtable_mr.o ask_flowtable_mr_probe.o ask_flowtable_wifi.o \
+	ask_flowtable_main.o
+
 cdx-y += cdx_main.o cdx_hal.o cdx_timer.o layer2.o \
 	control_tx.o control_ipsec.o control_tunnel.o control_qm.o \
 	devman.o cdx_debug.o dpa_cfg.o cdx_dev.o \

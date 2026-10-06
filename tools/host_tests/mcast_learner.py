@@ -7,18 +7,18 @@ from pathlib import Path
 import re
 
 from _host_pppoe_hm import (declaration)
+from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "cdx/ask_flowtable.c"
 
 
 def test_mcast_learner(tmp_path):
-    source = SOURCE.read_text()
+    source = flowtable_source()
     backend = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
     counters = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     taps = source.index("#define FT_MC_TAPS")
-    state = source.index("static LIST_HEAD(ft_mc_routes);")
+    state = source.index("LIST_HEAD(ft_mc_routes);")
     # The real membership, flow and route descriptions, not restatements: a
     # field added or resized on any has to fail here rather than compile into
     # a harness that no longer matches what the adapter keeps.
@@ -31,12 +31,13 @@ def test_mcast_learner(tmp_path):
         + source[source.index("struct ft_mc_route {"):
                  source.index("\n", taps) + 1]
         # From the member bound rather than from the structs, so the harness
-        # gets FT_MC_MAX_MEMBERS, the retry ceiling and the flow cap without
-        # restating them.
+        # gets FT_MC_MAX_MEMBERS, the flow caps and the refresh interval, which
+        # the shortest age is two of, without restating them; the retry
+        # ceiling and the uncarried age stay with the learner.
         + source[source.index("#define FT_MC_MAX_MEMBERS"):
-                 source.index("static LIST_HEAD(ft_mc_groups)")]
-        # The refresh interval, which the shortest age is two of.
-        + re.search(r"#define FT_MC_REFRESH_INTERVAL.*\n", source).group(0)
+                 source.index("struct ft_mc_seen {")]
+        + re.search(r"#define FT_MC_MAX_RETRIES.*\n", source).group(0)
+        + re.search(r"#define FT_MC_UNCARRIED_AGE.*\n", source).group(0)
         # The published routes and taps, the state they are kept in.
         + source[state:source.index("\n", source.index(
             "static bool ft_mc_taps_overflow", state)) + 1]
@@ -46,7 +47,8 @@ def test_mcast_learner(tmp_path):
                  source.index("};", source.index("struct ft_mc_seen {")) + 3]
         # The ring the hook records into, its dedup slots, and what forgets
         # them.
-        + source[source.index("#define FT_MC_RING"):
+        + re.search(r"#define FT_MC_RING\b.*\n", source).group(0)
+        + source[source.index("\nstruct ft_mc_seen ft_mc_ring[FT_MC_RING];") + 1:
                  source.index("static bool ft_mc_seen_eq(")]
         # What runs in software on every bridge and bridge port, which the
         # derivation reads.
@@ -176,7 +178,7 @@ def test_the_handler_never_blocks_on_the_transaction():
     may take ft_mc_lock and nothing else, and the hardware belongs to a worker
     that runs outside RTNL.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     body = function(source, "ft_mc_swdev_obj")
     for forbidden in ("cdx_ft_begin", "cdx_mc_group_add", "cdx_mc_group_del",
                       "cdx_mc_group_replace", "cdx_mc_port_supported",
@@ -196,7 +198,7 @@ def test_the_worker_never_holds_the_group_lock_across_the_transaction():
     worker snapshots under the lock, releases it, then does the hardware.
     """
     from _host_mroute_learner import (_assert_not_inside, _held_regions)
-    body = function(SOURCE.read_text(), "ft_mc_work_fn")
+    body = function(flowtable_source(), "ft_mc_work_fn")
     assert "cdx_ft_begin();" in body, "the worker is where the hardware happens"
     _assert_not_inside(body, _held_regions(body, "mutex_lock(&ft_mc_lock)",
                                            "mutex_unlock(&ft_mc_lock)"),
@@ -210,7 +212,7 @@ def test_the_bridge_is_asked_under_rtnl_and_never_across_hardware():
     standing rule -- and the refresh takes the transaction in /proc's order.
     """
     from _host_mroute_learner import (_assert_not_inside, _held_regions)
-    source = SOURCE.read_text()
+    source = flowtable_source()
     worker = function(source, "ft_mc_work_fn")
     derive = worker[worker.index("rtnl_lock();"):]
     derive = derive[:derive.index("rtnl_unlock();")]
@@ -252,7 +254,7 @@ def test_every_bridge_decision_asks_the_flows_again():
     appearing or timing out is announced by nothing, so every flow is asked
     again at every refresh as well.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     swdev = function(source, "ft_swdev_event")
     attrs = swdev[swdev.index("case SWITCHDEV_ATTR_ID_BRIDGE_MROUTER:"):]
     attrs = attrs[:attrs.index("return NOTIFY_DONE;")]
@@ -282,7 +284,7 @@ def test_a_reload_asks_the_bridge_for_standing_memberships():
     its own notifier is registered so nothing falls between, under the RTNL
     the replay asserts, through a notifier that takes only added MDB objects
     and reads nothing else as one."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     init = function(source, "ask_flowtable_init")
     registered = init.index("register_switchdev_blocking_notifier(&ft_swdev_nb)")
     assert registered < init.index("ft_mc_replay();") < init.index("WRITE_ONCE(ft_ready, true);")
@@ -327,7 +329,7 @@ def test_every_reference_the_learner_takes_is_released():
     them and the entry names ports that must not be unregistered underneath
     it. One free path each releases all of them.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     free = function(source, "ft_mc_group_free")
     for field in ("g->port[i]", "g->bridge"):
         assert f"dev_put({field})" in free, f"{field} must be released"
@@ -349,7 +351,7 @@ def test_exit_drains_before_the_module_text_goes_away():
     and drain the memberships and flows, and it must do so after the switchdev
     chain is unregistered so nothing can add one while it drains.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     exit_body = function(source, "ask_flowtable_exit")
     assert "ft_mc_exit();" in exit_body
     assert exit_body.index("unregister_switchdev_blocking_notifier") < \
@@ -394,7 +396,7 @@ def test_a_flow_the_hardware_cannot_serve_whole_is_not_served_at_all():
     nothing anywhere to say why. A flow is refused whole over one such port,
     and every place that decides whether to install has to ask.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     derive = function(source, "ft_mc_flow_derive")
     assert "ft_mc_port_eligible(chosen[i])" in derive
     assert "error = -EOPNOTSUPP;" in derive
@@ -423,7 +425,7 @@ def test_a_flow_that_would_fragment_stays_in_software():
     frame larger than some copy's port MTU, and an MTU change, which changes
     no membership, has to reach installed flows as well.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     assert "ft_mc_mtu_bounded(f)" in function(source, "ft_mc_installable")
     assert "ft_mc_mtu_bounded(f)" in function(source, "ft_mc_state")
     assert '"refused-mtu"' in function(source, "ft_mc_state")
@@ -447,7 +449,7 @@ def test_the_vid_follows_the_bridge_rather_than_the_port():
     observation ever matches a membership, and the learner is inert on the
     commonest configuration there is.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     body = function(source, "ft_mc_frame_vid")
     assert "br_vlan_enabled(bridge)" in body, (
         "a bridge that does not filter has no VLAN to resolve")
@@ -470,7 +472,7 @@ def test_an_idle_entry_ages_on_the_bridges_clock():
     have its place, and a resumed one is learned again from traffic. The
     interval is the bridge's own for the flow's VLAN, read at every
     derivation, and the count is the one the refresh already reads."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     derive = function(source, "ft_mc_flow_derive")
     assert "f->age = br_multicast_membership_interval(f->bridge, f->addr.vid);" in derive
     # Before the early return for an unchanged answer, so a changed
@@ -494,7 +496,7 @@ def test_a_stream_the_parser_never_classifies_is_not_learned():
     learned from such a stream would count nothing, age out, and be learned
     again from the next frame for as long as the stream runs, so the hook
     records neither."""
-    hook = function(SOURCE.read_text(), "ft_mc_hook")
+    hook = function(flowtable_source(), "ft_mc_hook")
     record = hook.index("ft_mc_record(&seen);")
     assert hook.index("if (iph->ttl <= 1)\n\t\t\treturn NF_ACCEPT;") < record
     assert hook.index("if (ip6h->hop_limit <= 1)\n\t\t\treturn NF_ACCEPT;") < record
@@ -507,7 +509,7 @@ def test_a_bridge_filter_hook_keeps_bridged_multicast_in_software(tmp_path):
     carried. So while any hook but the learner's own is registered where a
     forwarded frame passes, every flow is refused, installed ones included,
     and the worker asks at every pass because nothing announces a hook."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     (tmp_path / "mcast_bridge_filter.inc").write_text(
         function(source, "ft_bridge_hooked") + function(source, "ft_mc_bridge_filtered")
         + function(source, "ft_dev_nf_ingress_hooked"))
@@ -546,7 +548,7 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     derivation holds, before the group lock, and every refresh asks again
     because nothing announces a filter or a chain."""
     from _host_mroute_learner import (_assert_not_inside, _held_regions)
-    source = SOURCE.read_text()
+    source = flowtable_source()
     derive = function(source, "ft_mc_flow_derive")
     for asked in ("ft_mc_soft_on(soft, f->in, true, &tc_soft, &nf_hooked);",
                   "ft_mc_soft_on(soft, port[i].dev, false, &tc_soft, &nf_hooked);",
@@ -608,10 +610,12 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     assert "ft_mc_soft_free(&soft);" in worker[worker.index("rtnl_unlock();"):]
     # A device the table does not name is one nothing can be said of.
     assert "*tc = *nf = true;" in function(source, "ft_mc_soft_on")
-    # Declared ahead of the bridged learner, defined with the routed one.
+    # Declared in the private header, defined with the routed learner's probes.
+    header = (ROOT / "cdx/ask_flowtable_internal.h").read_text()
+    probes = (ROOT / "cdx/ask_flowtable_mr_probe.c").read_text()
     for name in ("ft_dev_tc_soft", "ft_dev_stack_tc_soft"):
-        assert source.index(f"static bool {name}(struct net_device *dev, bool ingress);") < \
-            source.index("static void ft_mc_flow_derive(")
+        assert f"\nbool {name}(struct net_device *dev, bool ingress);" in header, name
+        assert f"\nbool {name}(struct net_device *dev, bool ingress)\n{{" in probes, name
     # A flowtable's hook is not a chain: chains and BPF programs are asked
     # for by type, which this kernel gives a flowtable none of.
     hooked = function(source, "ft_dev_nf_ingress_hooked")
@@ -661,7 +665,7 @@ def test_streams_the_worker_can_do_nothing_with_wake_it_once():
     holds wait rather than each being news on every frame. Every pass of the
     worker takes the transaction, and /proc counts the passes and the facts
     that waited."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     record = function(source, "ft_mc_record")
     assert "ft_mc_seen_set(seen)" in record
     assert "time_before(now, slot->at + FT_MC_REFRESH_INTERVAL)" in record
@@ -685,7 +689,7 @@ def test_a_failed_install_is_tried_again_an_interval_apart():
     another entry gives its room back -- but trying again straight away, in
     the same pass, only spends the ceiling before anything could change. The
     refresh is what tries again, one interval apart."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     worker = function(source, "ft_mc_work_fn")
     # A build is listeners or a discard, and either can fail.
     failed = worker[worker.index("if (build && rc) {"):]
@@ -703,7 +707,7 @@ def test_a_blocked_source_is_the_bridges_answer_not_a_listener():
     the group again -- the bridge's answer then leaves the port out, whatever
     the (*,G) membership that still names the flow says.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     body = function(source, "ft_mc_swdev_obj")
     assert "SWITCHDEV_OBJ_MDB_F_BLOCKED" in body
     blocked = body[body.index("SWITCHDEV_OBJ_MDB_F_BLOCKED"):]
@@ -720,7 +724,7 @@ def test_a_discard_gives_its_group_id_only_to_a_stream_somebody_wants():
     other kind. The discard leaves the hardware the way the worker takes an
     entry out: off the books under ft_mc_lock inside the transaction, deleted
     with the transaction alone, and never the flow the worker holds."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     evict = function(source, "ft_mc_evict_discard")
     assert "cdx_ft_assert_held();" in evict
     for guard in ("!f->hw_discard", "f->busy", "f->stale",
@@ -769,7 +773,7 @@ def test_a_failed_chain_swap_takes_the_flow_out_of_hardware():
     the flow out, as a routed group's failed update does, and it retries
     from software.
     """
-    worker = function(SOURCE.read_text(), "ft_mc_work_fn")
+    worker = function(flowtable_source(), "ft_mc_work_fn")
     swap = worker[worker.index("rc = cdx_mc_group_replace(hw, &spec);"):]
     swap = swap[:swap.index("} else {")]
     for step in ("cdx_mc_group_del(&hw);", "ft_mc_installed--;", "withdrew = true;"):
@@ -796,7 +800,7 @@ def test_no_worker_holds_its_learner_lock_across_the_hardware():
     keeps a half-built entry from being seen; the learner lock is only for
     the records."""
     from _host_mroute_learner import (_assert_not_inside, _held_regions)
-    source = SOURCE.read_text()
+    source = flowtable_source()
     for worker, lock in (("ft_mc_work_fn", "ft_mc_lock"), ("ft_mr_work_fn", "ft_mr_lock")):
         # The code, not what its comments mention.
         body = re.sub(r"/\*.*?\*/", "", function(source, worker), flags=re.S)
@@ -818,7 +822,7 @@ def test_the_dedup_slots_are_forgotten_whenever_an_answer_may_change():
     and the drain does not, because forgetting after every drain would record
     every frame of a stream that never installs.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     forget = "ft_mc_forget_seen();"
     assert forget in function(source, "ft_mc_group_new"), "a membership created"
     assert forget in function(source, "ft_mc_route_publish"), "a route published"
@@ -868,7 +872,7 @@ def test_the_learner_lets_go_of_a_device_that_went_away():
     unregistration lets go of the memberships; a link going down asks the
     bridge about the flows again.
     """
-    source = SOURCE.read_text()
+    source = flowtable_source()
     netdev = function(source, "ft_netdev_event")
     down = netdev[netdev.index("case NETDEV_GOING_DOWN:"):]
     assert "ft_mc_device_gone(dev, false);" in down[:down.index("break;")]
@@ -922,8 +926,8 @@ def test_a_changed_egress_rebuilds_every_group_copying_out_of_the_port():
     caller holds RTNL, which both workers take: so each learner's drain
     rebuilds in place, from the chain recorded with the entry.
     """
-    source = SOURCE.read_text()
-    assert "static void ft_mc_egress_changed(const struct net_device *dev);" in source
+    source = flowtable_source()
+    assert "void ft_mc_egress_changed(const struct net_device *dev);" in source
     hook = function(source, "ft_egress_changed")
     assert hook.index("atomic64_inc_return(&ft_egress_changes);") < \
         hook.index("ft_mc_egress_changed(dev);")

@@ -6,13 +6,15 @@ from pathlib import Path
 import re
 
 from _host_pppoe_hm import (declaration)
+from _host_flowtable import (flowtable_source)
+from _host_mroute_learner import (mr_structs)
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_mroute_refresh(tmp_path):
-    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    source = flowtable_source()
     header = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
     # The restart bound the cases count against, as the worker defines it.
     restarts = re.search(r"^#define FT_MR_MAX_RESTARTS\b.*\n", source, re.M).group(0)
@@ -21,18 +23,20 @@ def test_mroute_refresh(tmp_path):
         + declaration(header, "cdx_mc_listener")
         + declaration(header, "cdx_mc_group_spec"))
     start = source.index("enum ft_mr_state {")
-    structs = source[source.index("struct ft_mr_vif {"):
-                     source.index("static LIST_HEAD(ft_mr_groups)")]
+    structs = mr_structs(source)
     # What a group routed through a bridge publishes, as the adapter
     # declares it.
     route = source[source.index("struct ft_mc_route {"):
                    source.index("struct ft_mc_tap {")]
     (tmp_path / "mroute_types.inc").write_text(
         route + source[start:source.index("};", start) + 3] + structs)
-    # The confirmation table and the ruleset it is armed for, as declared.
+    # The confirmation table and the ruleset it is armed for, as declared:
+    # the watch and the poll's pace in the private header, the table and its
+    # state with the probes.
     (tmp_path / "mroute_confirm_types.inc").write_text(
-        source[source.index("struct ft_mr_watch {"):
-               source.index("/* The ruleset in force, as the packet path reads it.")])
+        source[source.index("struct ft_mr_watch {"):source.index("/* ask_flowtable_core.c */")]
+        + source[source.index("#define FT_MR_WATCH_BUCKETS"):
+                 source.index("/* The ruleset in force, as the packet path reads it.")])
     (tmp_path / "mroute_refresh.inc").write_text("\n".join(
         function(source, name) for name in [
             # What Linux itself forwarded: the table the hook fills, the

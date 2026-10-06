@@ -12,14 +12,14 @@ from ask_orch.process import run_process
 import os
 from pathlib import Path
 
+from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "cdx/ask_flowtable.c"
 
 
 def test_wifi_adapter(tmp_path):
-    source = SOURCE.read_text()
+    source = flowtable_source()
     # The real declarations, not a restatement of them. A field added to the
     # watch has to fail here rather than compile into a harness that no
     # longer describes what the adapter keeps.

@@ -28,7 +28,13 @@ CMM or per-flow FCI commands. CDX builds the classifier during
 | --- | --- |
 | Native callback context, shared handles and route integration | [Kernel patch 140](../../patches/kernel/140-ask-flowtable-context.patch) |
 | Whether an nftables commit is still being applied, for routed multicast confirmation; whether nf_tables (`nft_port_dependent()`) or iptables-legacy (`nf_xt_port_dependent()`, an ip_tables/ip6_tables walker reached through hooks typed `NF_HOOK_OP_XTABLES` and the NAT core's `NF_HOOK_OP_NAT`) could tell a routed group's streams apart by port; and `net->nf.xt_seq`, the count of x_tables table changes a caller re-asks on | [Kernel patch 148](../../patches/kernel/148-netfilter-nftables-commit-in-progress.patch) |
-| Rule decoding, binding, dependency watches and work | [ask_flowtable.c](../../cdx/ask_flowtable.c) |
+| Rule decoding, binding and admission | [ask_flowtable_core.c](../../cdx/ask_flowtable_core.c), sharing state through [ask_flowtable_internal.h](../../cdx/ask_flowtable_internal.h) |
+| Dependency watches, invalidation and the egress hook | [ask_flowtable_watch.c](../../cdx/ask_flowtable_watch.c) |
+| IPsec packet offload | [ask_flowtable_ipsec.c](../../cdx/ask_flowtable_ipsec.c) |
+| Bridged multicast learner | [ask_flowtable_mc.c](../../cdx/ask_flowtable_mc.c), [ask_flowtable_mc_hook.c](../../cdx/ask_flowtable_mc_hook.c) |
+| Routed multicast learner | [ask_flowtable_mr.c](../../cdx/ask_flowtable_mr.c), [ask_flowtable_mr_probe.c](../../cdx/ask_flowtable_mr_probe.c) |
+| Wi-Fi VAPs | [ask_flowtable_wifi.c](../../cdx/ask_flowtable_wifi.c) |
+| QoS classification, `/proc/cdx_flowtable`, module init and exit | [ask_flowtable_main.c](../../cdx/ask_flowtable_main.c) |
 | Private source interface | [cdx_flowtable_backend.h](../../cdx/cdx_flowtable_backend.h) |
 | Transactions, claim, port checks and fatal guard | [cdx_flowtable_backend.c](../../cdx/cdx_flowtable_backend.c) |
 | Independent directional encoding and retirement storage | [cdx_flowtable_hw.c](../../cdx/cdx_flowtable_hw.c) |

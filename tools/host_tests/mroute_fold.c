@@ -1,4 +1,4 @@
-/* The routed counter fold, compiled from cdx/ask_flowtable.c, against the one
+/* The routed counter fold, compiled from cdx/ask_flowtable_mr.c, against the one
  * thing it writes: an MFC entry's counters, which ipmr writes too. */
 #include <assert.h>
 #include <stdbool.h>

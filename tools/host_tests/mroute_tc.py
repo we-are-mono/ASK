@@ -13,6 +13,7 @@ from ask_orch.process import run_process
 import os
 from pathlib import Path
 
+from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,7 +27,7 @@ HELPERS = [
 
 
 def test_mroute_tc(tmp_path):
-    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    source = flowtable_source()
     # The whole section, configuration guards and all, from the first walker
     # type to the predicate the admission asks: the guards are part of what
     # is tested, and nothing between them is left out.

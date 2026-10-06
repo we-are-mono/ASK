@@ -40,7 +40,7 @@ count into them.
   session, and read it back through `/proc/cdx_flowtable` alone.
 
 The adapter holds one record per logical device a flow's encapsulation crosses
-(`struct cdx_ft_dev_stats` in `cdx/ask_flowtable.c`): a plain one for each VLAN
+(`struct cdx_ft_dev_stats` in `cdx/ask_flowtable_internal.h`): a plain one for each VLAN
 device in the tag stack, a timestamped one for the ppp device a session runs
 on. The path walk that derives the tag stack records which device each tag
 belongs to (`cdx_ft_vlan.ifindex`, zero for a tag a vlan-aware bridge adds with

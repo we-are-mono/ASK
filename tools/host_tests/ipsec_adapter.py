@@ -12,14 +12,14 @@ import os
 from pathlib import Path
 import re
 
+from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "cdx/ask_flowtable.c"
 
 
 def test_ipsec_adapter(tmp_path):
-    source = SOURCE.read_text()
+    source = flowtable_source()
     rule = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     backend = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
@@ -182,7 +182,7 @@ def test_sa_delete_counts_its_retirement_before_the_watch_goes():
     delete that removed the watch first would leave an instant in which the
     SA's hardware entry is in neither, and the drain would release a DSCP
     map the entry still reads."""
-    body = function(SOURCE.read_text(), "ft_xdo_state_delete")
+    body = function(flowtable_source(), "ft_xdo_state_delete")
     assert body.index("atomic_inc(&ft_ipsec_retiring)") < body.index("ft_ipsec_watch_del(sa)"), body
 
 
@@ -191,7 +191,7 @@ def test_sec_refusals_counted_from_load_to_unload():
     refused before the module existed is put down to it, and once more at
     unload, after the pass has stopped for good, so nothing counted since its
     last period is lost."""
-    source = SOURCE.read_text()
+    source = flowtable_source()
     init = function(source, "ask_flowtable_init")
     claim = init.index("rc = cdx_ft_claim();")
     fold = init.index("ft_sec_refusals_fold();", claim)

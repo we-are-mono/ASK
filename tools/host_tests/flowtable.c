@@ -705,7 +705,7 @@ static int ft_work, ft_retire_work, ft_dev_stats_work, ft_rearm_work;
 #define DECLARE_WORK(n, fn) int n
 #define DEFINE_SPINLOCK(n) bool n
 typedef struct { int unused; } netdevice_tracker;
-static DECLARE_WORK(ft_stopped_work, ft_stopped_workfn);
+DECLARE_WORK(ft_stopped_work, ft_stopped_workfn);
 static void ft_stopped_workfn(struct work_struct *work);
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);

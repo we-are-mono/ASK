@@ -74,7 +74,7 @@ Anchors are repository-relative (line numbers locate, not bound, the code).
 - **Admission selects shared tables.** `cdx/cdx_dpa_ipsec.c` `cdx_ipsec_fill_sec_info()`
   sets `ipsec_inbound_flow` and gets the offline-port table via `dpa_ipsec_ofport_td()`
   with no SA discriminator. `cdx/cdx_ehash.c` `fill_key_info()` builds a tuple key, not
-  SA provenance. `cdx/ask_flowtable.c` `ft_ipsec_paired_inbound()` selects the inbound
+  SA provenance. `cdx/ask_flowtable_ipsec.c` `ft_ipsec_paired_inbound()` selects the inbound
   SA and checks its policy at *admission* — necessary, but not a discriminator on later
   hardware hits.
 - **Outbound roots also live on the offline port.** `cdx/cdx_dpa_ipsec.c`

@@ -4,11 +4,18 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "cdx/ask_flowtable.c"
 
 
 def _between(source, start, end):
     return source[source.index(start):source.index(end)]
+
+
+def mr_structs(source):
+    """The learner's state structs. The group and its plan are shared with the
+    probes, so the private header holds them; the VIF and the event stay with
+    the learner."""
+    return (_between(source, "struct ft_mr_group {", "struct ft_mr_watch {")
+            + _between(source, "struct ft_mr_vif {", "static LIST_HEAD(ft_mr_groups)"))
 
 
 def _hunks(section):

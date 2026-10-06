@@ -6,7 +6,7 @@ replace/remove, counter deltas, and invalidation are compiled from CDX itself.
 
 from ask_orch.process import run_process
 
-from _host_flowtable import (ROOT, function)
+from _host_flowtable import (ROOT, flowtable_source, function)
 import os
 from pathlib import Path
 import re
@@ -15,7 +15,7 @@ import pytest
 
 
 def test_decoder_and_lifecycle(tmp_path):
-    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    source = flowtable_source()
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     hashes = (kernel / "include/linux/jhash.h").read_text()
@@ -29,7 +29,8 @@ def test_decoder_and_lifecycle(tmp_path):
         # From the encapsulation bound, not the rule: the rule embeds the tag
         # type and its depth, so slicing past them leaves an incomplete struct.
         hardware[hardware.index("#define CDX_FT_VLAN_MAX"):hardware.index("/* Process-context transactions")]
-        + source[source.index("struct cdx_ft_binding {"):source.index("static LIST_HEAD")]
+        + source[source.index("struct cdx_ft_binding {"):
+                 source.index("\n", source.index("#define CDX_FT_HASH_BITS")) + 1]
         # The framing a VLAN device's record is published with, as the
         # adapter defines it: the cases below assert the published values.
         + "\n".join(re.findall(r"^#define FT_(?:VLAN|PPP)_[RT]X_OVERHEAD\s.*$", source, re.M)) + "\n"
@@ -210,7 +211,7 @@ def test_qos_flow_class(tmp_path):
     start = "enum ip_conntrack_info {"
     (tmp_path / "qos_flow_class_types.inc").write_text(
         uapi[uapi.index(start):uapi.index("};", uapi.index(start)) + 3])
-    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    source = flowtable_source()
     (tmp_path / "qos_flow_class_production.inc").write_text(
         function(source, "ft_qos_class") + function(source, "ft_qos_flow_class"))
     binary = tmp_path / "qos_flow_class"
