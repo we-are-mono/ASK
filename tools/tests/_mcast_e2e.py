@@ -9,7 +9,7 @@ import re
 
 import pytest
 import pytest_asyncio
-from _flowtable_rig import artifact_dir, console_command
+from _flowtable_rig import artifact_dir, console_command, stop_boot_daemon
 from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _mcast_helpers import (
     arm_bridge_querier,
@@ -91,6 +91,7 @@ async def mcast_bridge(aiohttp_session, target_agent):
     The bridge inherits the WAN address and MAC for its querier and local
     traffic. UART control remains available throughout the topology change.
     """
+    await stop_boot_daemon()
     await multicast_on(target_agent, aiohttp_session)
     stack = TopologyStack()
     console = Console.target(log_path=str(artifact_dir() / "mcast-bridge-uart.log"))
@@ -521,6 +522,7 @@ async def smcrouted(aiohttp_session, target_agent):
     daemon starts, because smcroute matches a phyint by name at startup.
     """
     started: list[bool] = []
+    await stop_boot_daemon()
     await multicast_on(target_agent, aiohttp_session)
 
     async def start(ifaces: list[str]):

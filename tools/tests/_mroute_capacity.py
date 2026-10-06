@@ -12,7 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from _flowtable_rig import artifact_dir
+from _flowtable_rig import artifact_dir, stop_boot_daemon
 from _mcast_cpu import cpu_frames
 from _mcast_e2e import (
     _exec,
@@ -217,5 +217,10 @@ async def _window(target, session, *, family, group, observers,
 
 
 async def _preflight(target, session):
+    # The boot's service commits the ruleset when an interface goes, and a
+    # commit takes back every routed group's confirmation: a case that deletes
+    # an oif and checks the group without sending again would fail after a
+    # fresh boot and pass after a test that had stopped it.
+    await stop_boot_daemon()
     assert "mroute_groups 0\n" in await flowtable_proc(target, session), \
         "existing multicast routes belong to another workload"

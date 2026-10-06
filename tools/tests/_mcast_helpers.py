@@ -19,18 +19,16 @@ MULTICAST_SWITCH = "/sys/module/ask_flowtable/parameters/multicast"
 
 
 async def multicast_on(target_agent, session) -> None:
-    """The boot's offload service stopped, and multicast acceleration on.
+    """Multicast acceleration on, as a boot leaves it.
 
-    Stopped, as every controlled test does first rather than rely on an earlier
-    test having done it: the service commits the ruleset when an interface
-    goes, and a commit takes back every routed group's confirmation, so a case
-    that deletes an oif and checks the group without sending again would fail
-    after a fresh boot and pass after a rig test. The stop switches multicast
-    off and back on (stop_boot_daemon()); the switch is set here as well, so a
-    case expecting multicast in hardware never inherits it off."""
-    from _flowtable_rig import stop_boot_daemon
+    The offload service switches it off whenever it stops or its policy is
+    disabled, so a case that expects multicast in hardware switches it on
+    itself rather than inherit whatever the test before it left.
 
-    await stop_boot_daemon()
+    It does not stop the boot's service: a case running a service of its own
+    calls this too, from the smcroute daemon it starts. A case that owns the
+    policy without one stops the boot's service in its own setup
+    (stop_boot_daemon())."""
     result = await target_agent.fs_write(session, MULTICAST_SWITCH, "Y")
     assert result["errno"] == 0, (MULTICAST_SWITCH, result)
 
