@@ -95,17 +95,21 @@ async def test_bridged_ipv6(aiohttp_session, target_agent, lan, mcast_bridge,
     )
 
 
+@pytest.mark.rfc("1112")
+@pytest.mark.rfc("4291")
+@pytest.mark.rfc("3307")
+@pytest.mark.rfc("1812", section="5.3.1")
 @pytest.mark.parametrize("family", [4, 6])
 async def test_routed_to_a_port(aiohttp_session, target_agent, lan, smcrouted,
                                 stream_cpu, family):
     """The plain shape, both families: one (S,G), one oif, and that oif is the
-    LAN port itself.
+    LAN port itself. A TTL-1 stream for the same group is not routed.
     """
     group = GROUPS_V6["routed"] if family == 6 else GROUPS_V4["routed"]
     await run_routed_case(
         aiohttp_session, target_agent, lan, group=group, family=family,
         oif=TARGET_LAN_IF, lan_iface=LAN_NIC,
-        label=f"mroute_port_v{family}", smcrouted=smcrouted,
+        label=f"mroute_port_v{family}", smcrouted=smcrouted, expire=True,
     )
 
 

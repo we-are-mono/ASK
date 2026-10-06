@@ -74,6 +74,8 @@ def translated(sample):
 
 
 @pytest.mark.parametrize("kind", list(CASES))
+@pytest.mark.rfc("792")
+@pytest.mark.rfc("3022")
 async def test_icmp_error_is_translated(connections, kind):
     from scapy.all import ICMP, IP, UDP, Ether, Raw, sendp
 

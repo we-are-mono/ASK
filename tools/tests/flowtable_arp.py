@@ -11,6 +11,7 @@ from _flowtable_rig import (WAN_IP, command)
 from _flowtable_tcp import (BLOCK, connection, hardware_transfer, installed, software_tx)
 
 
+@pytest.mark.rfc("826")
 async def test_udp(rig):
     r = rig
     original_mac = r.lan_mac

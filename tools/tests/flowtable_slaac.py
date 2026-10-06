@@ -25,6 +25,7 @@ VID, PORT = 331, DPORT + 3130
 OLD, NEW = "fd73:6173:6b00:331::/64", "fd73:6173:6b00:332::/64"
 
 
+@pytest.mark.rfc("4862")
 async def test_renumbering_uses_native_source_selection(ipv6_rig):
     r, con = ipv6_rig, Console.target()
     stack = TopologyStack()

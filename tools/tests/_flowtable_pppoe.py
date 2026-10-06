@@ -167,7 +167,7 @@ def _direction(flows, source, destination):
 
 # ---- the session ---------------------------------------------------------
 
-def _server_start(ipv6=False):
+def _server_start(ipv6=False, auth="pap"):
     """The access concentrator, on the orchestrator's standing tagged device.
 
     Run as a plain subprocess rather than through the WAN agent: pppoe-server
@@ -195,9 +195,9 @@ def _server_start(ipv6=False):
         f'"{PPPOE_USER}"   *   "{PPPOE_SECRET}"   *\n')
     os.chmod(SERVER_SECRETS, 0o600)
     pathlib.Path(SERVER_OPTS).write_text(
-        # require-pap: the DUT authenticates to us, so a session that comes up
-        # has completed discovery and authentication rather than merely LCP.
-        "require-pap\n"
+        # require-pap/chap: the DUT authenticates to us, so a session that comes
+        # up has completed discovery and authentication rather than merely LCP.
+        f"require-{auth}\n"
         f"pap-secrets {SERVER_SECRETS}\n"
         f"chap-secrets {SERVER_SECRETS}\n"
         f"mtu {SESSION_MTU}\n"
@@ -578,6 +578,16 @@ async def _lan_segment(r, stack, tagged):
     return reachable
 
 
+async def _concentrator_if(r):
+    """The concentrator's own ppp device, named by the address pppoe-server
+    put on it rather than assumed to be the DUT's name: both ends are usually
+    ppp0, which is a coincidence between two machines rather than a fact about
+    either, and an earlier session still up on the concentrator breaks it."""
+    addresses = json.loads((await command(r.wan, r.session, "ip", "-j", "-4", "addr"))["stdout"])
+    return next(i["ifname"] for i in addresses
+                if any(a.get("local") == INNER_LOCAL for a in i["addr_info"]))
+
+
 async def _ipv6_session(r, stack, cleanup):
     """Global IPv6 on both ends of the session, and a LAN that can reach it.
 
@@ -598,13 +608,7 @@ async def _ipv6_session(r, stack, cleanup):
     async def target(*argv, check=True):
         return await command(r.target, r.session, *argv, check=check)
 
-    # The concentrator's own ppp device, named by the address pppoe-server put
-    # on it rather than assumed to be the DUT's name: both ends are usually
-    # ppp0, which is a coincidence between two machines rather than a fact
-    # about either.
-    addresses = json.loads((await command(r.wan, r.session, "ip", "-j", "-4", "addr"))["stdout"])
-    r.server_ppp_if = next(i["ifname"] for i in addresses
-                           if any(a.get("local") == INNER_LOCAL for a in i["addr_info"]))
+    r.server_ppp_if = await _concentrator_if(r)
 
     previous = (await target("sysctl", "-n", "net.ipv6.conf.all.forwarding"))["stdout"].strip()
     cleanup.append((r.target, ["sysctl", "-w",
@@ -672,8 +676,9 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     """LAN VM -> DUT -> PPPoE session -> orchestrator.
 
     The parameter selects the shape: "udp" (default), "tcp", "tagged" for a
-    tagged LAN behind the session, "tagged-tcp" for the same carrying TCP, or
-    "ipv6" for a session carrying v6 as well. Teardown reverses only what came
+    tagged LAN behind the session, "tagged-tcp" for the same carrying TCP,
+    "ipv6" for a session carrying v6 as well, or "chap" for the UDP session
+    authenticated with CHAP rather than PAP. Teardown reverses only what came
     up.
 
     The far endpoint is the session's own inner address, not the orchestrator's
@@ -684,7 +689,7 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     every Rig method; monkeypatch puts it back.
     """
     shape = getattr(request, "param", "udp")
-    assert shape in {"udp", "tcp", "tagged", "tagged-tcp", "ipv6"}
+    assert shape in {"udp", "tcp", "tagged", "tagged-tcp", "ipv6", "chap"}
     monkeypatch.setattr(ft, "WAN_IP", INNER_LOCAL)
     r = Rig()
     r.proto = "tcp" if shape.endswith("tcp") else "udp"
@@ -727,7 +732,7 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
         # that has nothing to do with the session.
         r.ppp_lower = await dut_vlan_subif(stack, r.target, r.session,
                                            parent=TARGET_WAN_IF, vid=WAN_VID)
-        server = _server_start(ipv6=r.session_ipv6)
+        server = _server_start(ipv6=r.session_ipv6, auth="chap" if shape == "chap" else "pap")
         # ~0.5s to bind. A bad interface or a port already in use exits fast;
         # catching that here beats a bring-up timeout half a minute later.
         await asyncio.sleep(0.5)
@@ -743,10 +748,11 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
         # pppd installs the peer host route itself; what it does not install is
         # the way back, and the concentrator has no route to the LAN at all.
         # Point-to-point, so no nexthop: the session is the only way there.
+        server_ppp_if = await _concentrator_if(r)
         for prefix in (r.reachable, f"{SNAT_ADDR}/32"):
             await command(r.wan, r.session, "ip", "route", "replace", prefix,
-                          "dev", r.ppp_if)
-            cleanup.append((r.wan, ["ip", "route", "del", prefix, "dev", r.ppp_if]))
+                          "dev", server_ppp_if)
+            cleanup.append((r.wan, ["ip", "route", "del", prefix]))
         # Only the LAN neighbour is pinned. There is deliberately none to pin
         # on the session: a ppp device is NOARP and carries no address, so the
         # concentrator is named by the session and by nothing else.

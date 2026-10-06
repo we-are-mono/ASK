@@ -40,21 +40,30 @@ from __future__ import annotations
 
 from _flowtable_pppoe import QOS_COUNT, QOS_RATE_MBIT, QOS_VOICE_CQ, QOS_VOICE_PRIO
 
-from _flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6, INNER_REMOTE, INNER_REMOTE6, LAN_VID, LCP_ECHO_INTERVAL, NAT_TABLE, PORT_QOS_BULK, PORT_QOS_VOICE, PPP_RX_OVERHEAD, QOS_TABLE, SESSION_MTU, SNAT_ADDR, SPORT6, SourceEcho, UNTAGGED_COUNT, UNTAGGED_DPORT, UNTAGGED_SPORT, WAN_ENDPOINT, WAN_VID, _assert_carried, _assert_session, _assert_undisturbed, _both_directions, _dial, _direction, _download_only, _established, _exchange6, _hangup, _offload_table6, _ppp_link, _qos_bulk, _qos_bulk_stop, _session_halves, _session_identity, _session_row, _session_text, _snat_table, _tcp_carried, _untagged_directions, _untagged_path, _untagged_window, _wait_reachable)
+from _flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6, INNER_REMOTE, INNER_REMOTE6, LAN_VID, LCP_ECHO_INTERVAL, NAT_TABLE, SERVER_IF, PORT_QOS_BULK, PORT_QOS_VOICE, PPP_RX_OVERHEAD, QOS_TABLE, SESSION_MTU, SNAT_ADDR, SPORT6, SourceEcho, UNTAGGED_COUNT, UNTAGGED_DPORT, UNTAGGED_SPORT, WAN_ENDPOINT, WAN_VID, _assert_carried, _assert_session, _assert_undisturbed, _both_directions, _dial, _direction, _download_only, _established, _exchange6, _hangup, _offload_table6, _ppp_link, _qos_bulk, _qos_bulk_stop, _session_halves, _session_identity, _session_row, _session_text, _snat_table, _tcp_carried, _untagged_directions, _untagged_path, _untagged_window, _wait_reachable)
 
 import asyncio
 import json
 import math
 import socket
+import subprocess
 import time
 
 import pytest
 
+from _flowtable_pppoe import DPORT6, _concentrator_if
+from _gated_tcp import GatedTcp
 from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF, lan_run
 import _flowtable_rig as ft
 from _flowtable_rig import Echo, SPORT, command, console_command, read
 
 
+@pytest.mark.rfc("2516")
+@pytest.mark.rfc("1661")
+@pytest.mark.rfc("1332")
+@pytest.mark.rfc("1334")
+@pytest.mark.rfc("1994")
+@pytest.mark.parametrize("pppoe_rig", ["udp", "chap"], indirect=True)
 async def test_routed(pppoe_rig):
     """A session on the WAN side and a bare LAN, routed, with no translation.
 
@@ -284,7 +293,7 @@ async def test_session_record_ignores_untagged_flows(pppoe_rig):
             measured = await _untagged_window(r, echo)
         finally:
             await command(r.wan, r.session, "ip", "route", "replace", r.reachable,
-                          "dev", r.ppp_if, check=False)
+                          "dev", await _concentrator_if(r), check=False)
         r.record("pppoe-untagged-beside-session",
                  {**measured, "session": _session_text(r.session_identity)})
 
@@ -786,6 +795,8 @@ async def test_mtu_retires(pppoe_rig):
                       "mtu", str(SESSION_MTU), check=False)
 
 
+@pytest.mark.rfc("2516", section="5")
+@pytest.mark.rfc("1661", section="5.8")
 async def test_session_retires_and_redials(pppoe_rig):
     """The session going away retires the flow, and a redial readmits it.
 
@@ -835,12 +846,31 @@ async def test_session_retires_and_redials(pppoe_rig):
     # The device is gone, so /proc/net/pppoe has nothing left to describe.
     assert not (await read(r.target, r.session, "/proc/net/pppoe")).splitlines()[1:]
 
+    # The redial's discovery and the session's keepalive, as the concentrator
+    # sees them on the wire.
+    pcap = ft.artifact_dir() / "pppoe-redial.pcap"
+    ft.artifact_dir().mkdir(parents=True, exist_ok=True)
+    dump = subprocess.Popen(["tcpdump", "-i", SERVER_IF, "-U", "-s", "96", "-w", str(pcap),
+                             "pppoed or pppoes"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    await asyncio.sleep(1.5)
     r.ppp_if, r.ppp_pid = await _dial(r.console, r.ppp_lower, ipv6=r.session_ipv6)
+    await asyncio.sleep(2 * LCP_ECHO_INTERVAL + 1)
+    dump.terminate()
+    dump.wait(5)
+    from scapy.all import PPPoED, PPP_LCP_Echo, rdpcap
+    frames = rdpcap(str(pcap))
+    # PADI, PADO, PADR, PADS in order (RFC 2516 §5), then an echo request
+    # answered by a reply on the session (RFC 1661 §5.8).
+    discovery = [p[PPPoED].code for p in frames if PPPoED in p]
+    assert discovery[:4] == [0x09, 0x07, 0x19, 0x65], discovery
+    echoes = {p[PPP_LCP_Echo].code for p in frames if PPP_LCP_Echo in p}
+    assert echoes >= {9, 10}, echoes
     # The device went and took its routes with it; the concentrator still has
     # no other way back to the LAN.
+    server_ppp_if = await _concentrator_if(r)
     for prefix in (r.reachable, f"{SNAT_ADDR}/32"):
         await command(r.wan, r.session, "ip", "route", "replace", prefix,
-                      "dev", r.ppp_if)
+                      "dev", server_ppp_if)
     second = await _session_identity(r)
     r.session_identity = second
     # The path went down and came back, so let the bring-up settle before any

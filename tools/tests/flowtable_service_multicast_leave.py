@@ -134,6 +134,11 @@ async def test_routed_bridge_leave(multicast_rig, listener_bridge, mechanism):
     assert final["mroute_install_errors"] == r.initial["mroute_install_errors"], summary(final)
 
 
+@pytest.mark.rfc("2236")
+@pytest.mark.rfc("3376")
+@pytest.mark.rfc("2710")
+@pytest.mark.rfc("3810")
+@pytest.mark.rfc("4541")
 @pytest.mark.parametrize("mechanism", MECHANISMS)
 async def test_bridged_leave(multicast_rig, mcast_bridge, mechanism):
     """Two hosts behind the LAN port of the WAN-LAN bridge; one goes, then the other."""

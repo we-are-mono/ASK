@@ -10,6 +10,7 @@ import pytest
 pytestmark = pytest.mark.parametrize("rig", ["tcp"], indirect=True)
 
 
+@pytest.mark.rfc("793")
 async def test_transfer_expiry_fin(rig):
     await tcp_transfer_expiry_fin(rig)
 

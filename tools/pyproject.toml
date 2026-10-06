@@ -27,6 +27,7 @@ markers = [
     "slow: profiles, throughput or sustained traffic",
     "destructive: changes boot state or requires a fresh boot afterwards",
     "requires(*binaries): DUT tools required before release-test setup",
+    "rfc(number, section=None): the RFC behaviour this test proves; see host_tests/rfc_coverage.py",
 ]
 # Last-resort watchdog around the test body. Cleanup has its own operation
 # budgets and is allowed to finish after this timer fires.

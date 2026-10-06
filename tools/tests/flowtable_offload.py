@@ -47,6 +47,7 @@ from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, kernel_rx_packets, 
 
 @pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_BASELINE") not in {"software", "flowtable", "hardware"},
                     reason="explicit forwarding-path loss diagnosis")
+@pytest.mark.rfc("768")
 async def test_long_exchange(rig):
     assert (await rig.state())["entries"] == 0
     hardware = os.environ["ASK_FLOWTABLE_BASELINE"] == "hardware"
@@ -175,6 +176,9 @@ async def test_reference_and_lifecycle(rig):
     r.record("idle-expiry", expired)
 
 
+@pytest.mark.rfc("791")
+@pytest.mark.rfc("792")
+@pytest.mark.rfc("1812", section="5.3.1")
 async def test_same_tuple_exceptions(rig):
     r = rig
     if (await r.state())["observe"]:

@@ -6,14 +6,17 @@ All policies remain required while an SA is absent, including on the peer.
 """
 from __future__ import annotations
 
-from _flowtable_service_ipsec import (INNER, LAN_INNER, Wire, flows_for, hardware, ipsec_shared_sequence, negative, plaintext_probe)
+from _flowtable_service_ipsec import (INNER, LAN_INNER, Transform, Wire, flows_for, hardware, ipsec_shared_sequence, negative, plaintext_probe)
 
 import asyncio
+import json
+import re
 import time
 
 import pytest
 
-from _topology import TARGET_WAN_IF
+from _ipsec_inbound_flow_offload import AUTH
+from _topology import TARGET_WAN_IF, lan_run_python
 from _flowtable_connections import (by_key, consistent, peer)
 from _flowtable_failslab import (same_service, slab_fault)
 from _flowtable_rig import (DPORT, command, read)
@@ -29,8 +32,71 @@ from _flowtable_service_vlan import attempts, balanced, received
 # than lingering into the next module's setup.
 
 
+async def _inner_echoes(r, count):
+    """Datagrams from the LAN's inner address that made the round trip."""
+    result = await lan_run_python(r.lan, f"""
+import json, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(({LAN_INNER!r}, {FIRST}))
+s.settimeout(1)
+echoed = 0
+for n in range({count}):
+    s.sendto(b"ASK-declined-%04d" % n, ({INNER!r}, {DPORT}))
+    try:
+        s.recv(2048); echoed += 1
+    except socket.timeout:
+        pass
+print(json.dumps({{"echoed": echoed}}))
+""", label="ipsec_declined_echo", timeout=count + 20)
+    assert result.rc == 0, result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])["echoed"]
+
+
+async def _sa_packets(r, direction):
+    shown = (await command(r.target, r.session, "ip", "-s", "xfrm", "state", "get",
+                           *r.ipsec.state(direction, r.ipsec.active[direction])))["stdout"]
+    return int(re.search(r"lifetime current:\s*\d+\(bytes\), (\d+)\(packets\)", shown).group(1))
+
+
+AH = Transform(algorithms=("auth-trunc", "hmac(sha256)", AUTH, "128"), proto="ah", offload=False)
+
+
+@pytest.mark.parametrize("ipsec_service", [AH], ids=["ah"], indirect=True)
+@pytest.mark.rfc("2402")
+async def test_ah_stays_in_software(ipsec_service):
+    """SEC is never handed an AH SA, and a flow an AH policy protects stays
+    with Linux: authenticated on the wire, never forwarded in hardware as
+    plaintext."""
+    r = ipsec_service
+    refused = await command(r.target, r.session, "ip", "xfrm", "state", "add", "src", r.ipsec.outer,
+                            "dst", r.ipsec.peer, "proto", "ah", "spi", "0xa7000001", "mode", "tunnel",
+                            *AH.algorithms, "offload", "packet", "dev", TARGET_WAN_IF, "dir", "out",
+                            check=False)
+    assert refused["rc"] != 0, refused
+    before = await _sa_packets(r, "out")
+    assert await _inner_echoes(r, 64) == 64
+    state = await r.state()
+    assert not any(INNER in (f["src"] + f["dst"]) for f in state["flows"]), state
+    assert await _sa_packets(r, "out") - before >= 64
+
+
+@pytest.mark.rfc("3173")
+async def test_ipcomp_refused(ipsec_service):
+    """SEC is never handed an IPComp SA: the add is refused, so the stack keeps
+    it, and the offloaded ESP tunnel beside it carries on."""
+    r = ipsec_service
+    refused = await command(r.target, r.session, "ip", "xfrm", "state", "add", "src", r.ipsec.outer,
+                            "dst", r.ipsec.peer, "proto", "comp", "spi", "0x1234", "mode", "tunnel",
+                            "comp", "deflate", "offload", "packet", "dev", TARGET_WAN_IF, "dir", "out",
+                            check=False)
+    assert refused["rc"] != 0, refused
+    assert await _inner_echoes(r, 16) == 16
+
+
 @pytest.mark.parametrize("direction", ["out", "in"])
 @pytest.mark.parametrize("allocation_failure", [False, True], ids=["withdrawal", "failslab"])
+@pytest.mark.rfc("4301")
+@pytest.mark.rfc("4303")
 async def test_sa_recovery(ipsec_service, direction, allocation_failure):
     r, flows = ipsec_service, flows_for(ipsec_service)
     service, policies = await supervision_status(r), await r.ipsec.policies()

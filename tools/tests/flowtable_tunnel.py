@@ -42,6 +42,8 @@ from _flowtable_tunnel import CHANGED_TTL
 from _flowtable_tunnel import (Capture, _admit, _assert_outer, _assert_tunnel, _both_directions, _directions, _established, _expected, _offload_table, _tunnel_counters, _tunnel_record, _udp_exchange)
 
 
+import subprocess
+
 import pytest
 
 from ask_orch.counters import kernel_tx_packets
@@ -52,6 +54,8 @@ from _flowtable_rig import assert_undisturbed, command
 
 # ---- cases ---------------------------------------------------------------
 
+@pytest.mark.rfc("4213")
+@pytest.mark.rfc("2473", section="4.1.1")
 @pytest.mark.parametrize("tunnel_rig", ["6o4", "4o6"], indirect=True)
 async def test_routed(tunnel_rig):
     """A routed UDP flow through the tunnel.
@@ -68,12 +72,20 @@ async def test_routed(tunnel_rig):
     flows, delta = await _established(r)
     forward, reverse = _directions(r, flows)
     _assert_tunnel(r, forward, reverse)
+    if r.shape.mode == "4o6":
+        # The far end's ip6tnl sends a Tunnel Encapsulation Limit option
+        # (RFC 2473 §4.1.1), so the strip counted below matched past it.
+        detail = subprocess.run(["ip", "-d", "link", "show", r.shape.device],
+                                capture_output=True, text=True, check=True).stdout
+        assert "encaplimit 4" in detail, detail
     assert reverse["out_vlan"] == reverse["out_ppp"] == "-", reverse
     if forward:
         assert forward["in_vlan"] == forward["in_ppp"] == "-", forward
     assert all(d == 64 for d in delta.values()), delta
 
 
+@pytest.mark.rfc("4213", section="3.2")
+@pytest.mark.rfc("2473", section="7.1")
 @pytest.mark.parametrize("tunnel_rig", ["6o4/mtu", "4o6/mtu"], indirect=True)
 async def test_full_mtu(tunnel_rig):
     """A datagram that fills the tunnel's MTU is still carried in hardware.
@@ -82,16 +94,35 @@ async def test_full_mtu(tunnel_rig):
     what it transmits is the outer packet; a direction programmed with the
     tunnel-reduced inner MTU excepts every full-size frame to the CPU while
     every counter says the flow is offloaded. The payload here is exactly the
-    inner MTU less its own headers. For 4o6 only the strip carries it in
-    hardware; the full-size insert is proved by test_tcp,
-    whose segments fill the tunnel.
+    inner MTU less its own headers. Only the strip carries it in hardware: a
+    UDP insert into a tunnel smaller than a full frame is Linux's, which is
+    what answers the oversized probe below. The full-size insert is proved by
+    test_tcp, whose segments fill the tunnel.
     """
     r = tunnel_rig
-    payload = r.shape.mtu - (40 if r.shape.family == 6 else 20) - 8
+    shape = r.shape
+    payload = shape.mtu - (40 if shape.family == 6 else 20) - 8
     flows, delta = await _established(r, count=32, payload_size=payload, name="mtu")
     forward, reverse = _directions(r, flows)
     _assert_tunnel(r, forward, reverse)
     assert all(d == 32 for d in delta.values()), delta
+    # One byte over, DF set: the entry point reports the tunnel's MTU back to
+    # the sender rather than fragmenting or dropping it (RFC 4213 §3.2,
+    # RFC 2473 §7.1), whatever MTU the LAN advertises.
+    if shape.family == 6:
+        probe = (f"IPv6(src={r.lan_address!r}, dst={shape.inner_orch!r})"
+                 f"/UDP(sport={shape.sport}, dport={shape.dport})/Raw(b'x' * {payload + 1})")
+        check = f"ICMPv6PacketTooBig in a and a[ICMPv6PacketTooBig].mtu == {shape.mtu}"
+    else:
+        probe = (f"IP(src={r.lan_address!r}, dst={shape.inner_orch!r}, flags='DF')"
+                 f"/UDP(sport={shape.sport}, dport={shape.dport})/Raw(b'x' * {payload + 1})")
+        check = f"ICMP in a and (a[ICMP].type, a[ICMP].code, a[ICMP].nexthopmtu) == (3, 4, {shape.mtu})"
+    result = await lan_run_python(r.lan, f'''
+from scapy.all import IP, IPv6, UDP, ICMP, ICMPv6PacketTooBig, Raw, sr1
+a = sr1({probe}, timeout=3, verbose=False)
+assert a is not None and {check}, a and a.show(dump=True)
+''', label="flowtable_tunnel_ptb", timeout=30)
+    assert result.rc == 0, result.stdout
 
 
 @pytest.mark.parametrize("tunnel_rig", ["6o4/tcp", "4o6/tcp"], indirect=True)
@@ -131,7 +162,12 @@ async def test_tcp(tunnel_rig):
         record = _tunnel_record(r, before)
         link = await _tunnel_counters(r)
         sent = await kernel_tx_packets(r.target, r.session, TARGET_WAN_IF)
-        await transfer.measure()
+        # The outer headers of the hardware's own inserts, for 4o6 the only
+        # ones there are (RFC 2473 §3).
+        capture = Capture(r, "tcp")
+        capture.snaplen = 128
+        async with capture:
+            await transfer.measure()
         sent = await kernel_tx_packets(r.target, r.session, TARGET_WAN_IF) - sent
         after = await r.state()
         record = {k: v - record[k] for k, v in _tunnel_record(r, after).items()}
@@ -140,6 +176,7 @@ async def test_tcp(tunnel_rig):
     r.record("tunnel-tcp", {"flows": flows, "after": after, "record": record, "link": link,
                             "software_wan_tx": sent, "report": transfer.report})
     _assert_tunnel(r, forward, reverse)
+    _assert_outer(r, capture.packets(), 100)
     assert forward["proto"] == reverse["proto"] == "6", flows
     new = {f["cookie"]: f for f in after["flows"]}
     assert_undisturbed(r, before, after, new.keys() == {forward["cookie"], reverse["cookie"]}

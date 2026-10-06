@@ -18,12 +18,13 @@ import socket
 
 import pytest
 
-from _topology import DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VIRT_IPV6, WAN_IPV6, lan_run_python
+from _topology import DUT_IPV6_LAN, DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VIRT_IPV6, WAN_IPV6, lan_run_python
 from _flowtable_rig import command, read
 
 JUMBO = 9000
 
 
+@pytest.mark.rfc("8200")
 @pytest.mark.parametrize("case", ["routed", "snat", "dnat"])
 async def test_udp(ipv6_rig, case):
     r = ipv6_rig
@@ -297,6 +298,114 @@ async def test_mtu_recovery(ipv6_rig):
         await _drop_tables(r)
 
 
+@pytest.mark.rfc("4861", section="7.2.5")
+async def test_neighbour_mac_change(ipv6_rig):
+    """The LAN host moves to a new MAC and says so with an unsolicited Neighbor
+    Advertisement (Override set): the DUT's learned neighbour takes the new
+    address, the offloaded flow is retired, and it comes back sending there."""
+    r = ipv6_rig
+    sport, dport = PORTS["neighbour"]
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        Echo, local_addr=(WAN_IPV6, dport), family=socket.AF_INET6)
+    moved = "02:9d:99:b2:33:02"
+
+    async def announce(mac):
+        result = await lan_run_python(r.lan, f'''
+import subprocess
+from scapy.all import Ether, IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr, sendp
+subprocess.run(['ip', 'link', 'set', 'dev', {LAN_NIC!r}, 'address', {mac!r}], check=True)
+# A new link address flushes this host's neighbours, the fixture's pinned
+# one for the DUT among them; pin it again as the fixture made it.
+subprocess.run(['ip', '-6', 'neigh', 'replace', {DUT_IPV6_LAN!r}, 'lladdr', {r.dut_lan_mac!r},
+                'nud', 'permanent', 'dev', {LAN_NIC!r}], check=True)
+sendp(Ether(src={mac!r}, dst='33:33:00:00:00:01') / IPv6(src={LAN_IPV6!r}, dst='ff02::1') /
+      ICMPv6ND_NA(R=0, S=0, O=1, tgt={LAN_IPV6!r}) / ICMPv6NDOptDstLLAddr(lladdr={mac!r}),
+      iface={LAN_NIC!r}, count=2, inter=0.05, verbose=False)
+''', label="flowtable_v6_neighbour", timeout=20)
+        assert result.rc == 0, result.stdout
+
+    async def neighbour():
+        rows = json.loads((await command(r.target, r.session, "ip", "-j", "-6", "neigh", "show",
+                                         LAN_IPV6, "dev", TARGET_LAN_IF))["stdout"])
+        return rows[0] if rows else {}
+
+    async def send(count=8):
+        return await _udp_exchange(r, sport, WAN_IPV6, dport, count, (WAN_IPV6, dport),
+                                   "flowtable_v6_neighbour")
+    try:
+        # Learned, not pinned: only a learned entry follows an advertisement.
+        await command(r.target, r.session, "ip", "-6", "neigh", "del", LAN_IPV6,
+                      "dev", TARGET_LAN_IF)
+        await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
+        before = await _drive(r, send, lambda s: s["entries"] == 2, "IPv6 flow did not install")
+        assert (await neighbour()).get("lladdr") == r.lan_mac
+        await announce(moved)
+        retired = await r.wait(lambda s: s["entries"] == 0 and
+                               s["neighbour_invalidations"] > before["neighbour_invalidations"])
+        assert (await neighbour()).get("lladdr") == moved
+        assert retired["invalidated"] == 0 and retired["errors"] == r.errors, retired
+        back = await _drive(r, send, lambda s: s["entries"] == 2, "IPv6 flow did not come back")
+        assert back["installs"] == before["installs"] + 2, (before, back)
+        assert await send(64) == {"echoed": 64, "lost": 0}
+        r.record("ipv6-neighbour-mac-change", {"before": before, "retired": retired, "back": back})
+    finally:
+        await announce(r.lan_mac)
+        transport.close()
+        await _drop_tables(r)
+
+
+@pytest.mark.rfc("8200", section="4.5")
+@pytest.mark.rfc("5722")
+async def test_fragments(ipv6_rig):
+    """Shuffled fragments of many datagrams arrive whole, and a datagram whose
+    fragments overlap is dropped entirely, as RFC 5722 requires."""
+    r = ipv6_rig
+    sizes = [2000 + 41 * i for i in range(60)]
+    overlapping = set(range(0, len(sizes), 5))
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    # Read only once all is sent: the buffer holds every datagram.
+    sock.setsockopt(socket.SOL_SOCKET, 33, 8 << 20)  # SO_RCVBUFFORCE
+    sock.bind((WAN_IPV6, 5204))
+    sock.setblocking(False)
+    payload = lambda i: i.to_bytes(4, "big") + bytes((i * 7 + k) % 251 for k in range(sizes[i] - 4))
+    script = f'''
+import random
+from scapy.all import IPv6, IPv6ExtHdrFragment, UDP, Raw, fragment6, raw, send
+frags = []
+for i, size in enumerate({sizes!r}):
+    data = i.to_bytes(4, "big") + bytes((i * 7 + k) % 251 for k in range(size - 4))
+    ip = IPv6(src={LAN_IPV6!r}, dst={WAN_IPV6!r})
+    parts = fragment6(ip / IPv6ExtHdrFragment(id=0x8200 + i) / UDP(sport=30600, dport=5204) / Raw(data), 1280)
+    if i in {sorted(overlapping)!r}:
+        # The first fragment again as two that overlap: no subset of what is
+        # sent reassembles without an overlap, whatever the arrival order.
+        first = raw(parts[0][IPv6ExtHdrFragment].payload)
+        parts[:1] = [ip / IPv6ExtHdrFragment(id=0x8200 + i, offset=0, m=1, nh=17) / Raw(first[:1024]),
+                     ip / IPv6ExtHdrFragment(id=0x8200 + i, offset=64, m=1, nh=17) / Raw(first[512:])]
+    frags += parts
+random.Random(8200).shuffle(frags)
+send(frags, verbose=0)
+'''
+    try:
+        result = await lan_run_python(r.lan, script, label="flowtable_v6_fragments", timeout=120)
+        assert result.rc == 0, result.stdout
+        received, loop = {}, asyncio.get_running_loop()
+        while len(received) < len(sizes) - len(overlapping):
+            try:
+                data = await asyncio.wait_for(loop.sock_recv(sock, 8192), 5)
+            except TimeoutError:
+                break
+            received[int.from_bytes(data[:4], "big")] = data
+        expected = set(range(len(sizes))) - overlapping
+        assert set(received) == expected, (expected - set(received), set(received) - expected)
+        assert all(data == payload(i) for i, data in received.items())
+    finally:
+        sock.close()
+
+
+@pytest.mark.rfc("8200")
+@pytest.mark.rfc("4443")
 async def test_same_tuple_exceptions(ipv6_rig):
     """Packets on an offloaded IPv6 tuple that Linux must handle still reach it.
 

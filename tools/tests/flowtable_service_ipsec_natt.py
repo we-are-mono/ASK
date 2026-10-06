@@ -31,13 +31,45 @@ import pytest
 from _ipsec_helpers import endpoints_down, endpoints_up
 from _topology import TARGET_WAN_IF
 from _flowtable_connections import (peer)
-from _flowtable_rig import (command)
+from _flowtable_rig import (command, read)
 from _flowtable_selective_neighbour import (warm)
 from _flowtable_service_ipsec import (INNER, Transform, flows_for, hardware, negative, plaintext_probe)
 from _flowtable_service_ipsec_replay import (sa_state)
 
 
 @pytest.mark.parametrize("ipsec_service", [NATT], ids=["dut4500-peer31000"], indirect=True)
+@pytest.mark.rfc("3948", section="2.2")
+async def test_non_esp_beside_offloaded_natt(ipsec_service):
+    """IKE (a zero non-ESP marker, RFC 3948 §2.2) and NAT keepalives (one 0xFF
+    byte, §2.3) share the offloaded SA's UDP ports. They must reach the DUT's
+    own stack, never SEC, while the SA's traffic runs in hardware."""
+    from scapy.all import IP, UDP, Raw, send
+
+    r, flows = ipsec_service, flows_for(ipsec_service)
+    dut, peer_port = PORTS
+
+    async def udp_in():
+        rows = [line.split() for line in (await read(r.target, r.session, "/proc/net/snmp")).splitlines()
+                if line.startswith("Udp:")]
+        stats = dict(zip(rows[0][1:], map(int, rows[1][1:])))
+        return stats["InDatagrams"] + stats["NoPorts"] + stats["InErrors"]
+
+    async with peer(r, flows, initial_ids=[0, 1, 2, 3], lease=400, listen_addresses=[INNER]) as p:
+        await warm(r, p, [0, 1, 2, 3], "natt-coexist-baseline", flows[:4])
+        before, received = await r.state(), await udp_in()
+        ike = b"\0\0\0\0" + secrets.token_bytes(8) + bytes(8) + b"\x21\x20\x22\x08" + bytes(8)
+        send([IP(src=r.ipsec.peer, dst=r.ipsec.outer) / UDP(sport=peer_port, dport=dut) / Raw(data)
+              for data in [b"\xff"] * 4 + [ike] * 4], verbose=False)
+        await asyncio.sleep(1)
+        arrived = await udp_in() - received
+        after = await hardware(r, p, "natt-coexist-hardware", flows[:4])
+    assert arrived >= 8, f"only {arrived} of 8 non-ESP datagrams reached the DUT's UDP stack"
+    refused = {k: after[k] - before[k] for k in before if k.startswith("ipsec_sec_refused")}
+    assert not any(refused.values()), refused
+
+
+@pytest.mark.parametrize("ipsec_service", [NATT], ids=["dut4500-peer31000"], indirect=True)
+@pytest.mark.rfc("3948")
 async def test_flowtable_service_ipsec_natt(ipsec_service):
     """An ESP-in-UDP SA pair with asymmetric ports is offloaded and carries the
     tunnel in hardware both ways, with each direction's outer ports exactly as

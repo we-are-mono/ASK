@@ -87,6 +87,7 @@ async def slow_packets(r):
 @pytest.mark.parametrize('case', ['source', 'destination', 'both'])
 @pytest.mark.parametrize('proto', ['udp', 'tcp'])
 @pytest.mark.parametrize('hardware', [False, True], ids=['software', 'hardware'])
+@pytest.mark.rfc("6296")
 async def test_flowtable_npt(ipv6_rig, case, proto, hardware):
     r = ipv6_rig
     sport = 49010 + 10 * ['source', 'destination', 'both'].index(case) + int(hardware) * 100

@@ -129,6 +129,7 @@ print(json.dumps({{'type': answer[ICMP].type, 'code': answer[ICMP].code, 'mtu': 
             assert not failures, failures
 
 
+@pytest.mark.rfc("791")
 async def test_fragments_non_df_ipv4(rig):
     """An IPv4 datagram with DF clear that is larger than its path is
     fragmented by Linux, because the direction that would need the microcode

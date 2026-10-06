@@ -25,6 +25,7 @@ PORT = DPORT + 3120
 GATEWAY_CONFIG = Path(__file__).resolve().parents[2] / "meta-ask/recipes-ask/config/files/dnsmasq-gateway.conf"
 
 
+@pytest.mark.rfc("2131", section="4.4.5")
 async def test_renewal_and_address_change(rig):
     r, con = rig, Console.target()
     stack = TopologyStack()
@@ -121,8 +122,8 @@ hook = root / 'hook.py'; hook.write_text({hook!r}); hook.chmod(0o700)
                 "-s", str(root / "hook.py"), "-p", str(root / "client.pid"), "-t", "3", "-T", "2"],
                 base=str(root / "client"))
 
-            async def events(address, after=0):
-                deadline = asyncio.get_running_loop().time() + 25
+            async def events(address, after=0, timeout=25):
+                deadline = asyncio.get_running_loop().time() + timeout
                 while True:
                     result = await console_python(con, f'''
 import json,pathlib
@@ -182,8 +183,17 @@ os.kill(pid, signal.SIGUSR1)
 
             async with peer(r, flows, lease=240) as p:
                 original = await mapping(p, FIRST)
-                await renew()
-                records = await events(FIRST, len(records))
+                # Unforced: the client renews by itself at T1, half the
+                # two-minute lease (RFC 2131 §4.4.5).
+                # Traffic runs throughout, or the idle flow would age out.
+                previous = len(records)
+                await p.rpc("start", [0], count=0, interval=0.02, allow_loss=True, udp_timeout=0.1)
+                try:
+                    records = await events(FIRST, previous, timeout=75)
+                finally:
+                    report = (await p.rpc("stop", [0]))["0"]
+                assert [row["event"] for row in records[previous:]] == ["renew"], records
+                assert report["received"] > 0 and report["lost"] == 0, report
                 assert await mapping(p, FIRST) == original
                 # A RAM-root reboot loses the server's lease database while
                 # its clients keep their addresses. Renewal must not NAK them.

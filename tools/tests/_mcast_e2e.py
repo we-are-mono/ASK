@@ -312,7 +312,7 @@ async def lan_join_and_count(lan, *, group: str, source: str | None,
 # ------------------------------------------------------------- WAN source
 
 def send_stream_from_vision(group: str, family: int, seconds: float,
-                            pps: int) -> None:
+                            pps: int, ttl: int = MCAST_TTL) -> None:
     """Send a multicast UDP stream from this host onto the DUT-facing wire.
 
     L2 sendp with an explicit iface, because a multicast destination has no
@@ -346,11 +346,11 @@ def send_stream_from_vision(group: str, family: int, seconds: float,
         import socket as _socket
         raw = _socket.inet_pton(_socket.AF_INET6, group)
         mac = "33:33:" + ":".join(f"{b:02x}" for b in raw[12:16])
-        layer = IPv6(src=src, dst=group, hlim=MCAST_TTL)
+        layer = IPv6(src=src, dst=group, hlim=ttl)
     else:
         o = [int(b) for b in group.split(".")]
         mac = "01:00:5e:%02x:%02x:%02x" % (o[1] & 0x7F, o[2], o[3])
-        layer = IP(src=src, dst=group, ttl=MCAST_TTL)
+        layer = IP(src=src, dst=group, ttl=ttl)
 
     frame = (Ether(dst=mac) / layer / UDP(sport=MCAST_PORT, dport=MCAST_PORT)
              / Raw(b"x" * 512))
@@ -611,7 +611,7 @@ async def installed_by_traffic(target_agent, aiohttp_session, group: str,
 
 async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
                           family: int, oif: str, lan_iface: str, label: str,
-                          smcrouted):
+                          smcrouted, expire: bool = False):
     """One routed case, end to end.
 
     Six oracles: `ip mroute show` reports offload, /proc says installed, the
@@ -730,6 +730,21 @@ async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
         f"their Ethernet source, which is what ipmr sends them with, so the "
         f"listener entry did not rebuild the L2 header as Linux would. "
         f"Headers: {headers[:400]!r}")
+
+    if expire:
+        # RFC 1812 §5.3.1: a datagram that would leave with TTL 0 is not
+        # forwarded. The soft parser hands TTL <= 1 to Linux unclassified, and
+        # ipmr's threshold of 1 drops it -- so nothing reaches the listener.
+        joiner = asyncio.create_task(lan_join_and_count(
+            lan, group=group, source=None, family=family,
+            seconds=STREAM_S + 4.0, igmp_version=None, label=label + "_ttl1",
+            iface=lan_iface,
+        ))
+        await asyncio.sleep(2.0)
+        await asyncio.to_thread(send_stream_from_vision, group, family,
+                                STREAM_S, STREAM_PPS, 1)
+        expired = await joiner
+        assert expired == 0, f"{group}: {expired} TTL-1 frames were routed to the listener"
 
     # Teardown is an assertion too: the entry going has to take the hardware
     # group and the kernel's flag with it.

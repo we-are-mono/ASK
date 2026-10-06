@@ -266,6 +266,44 @@ async def test_expiry(ipsec_service, unit):
     assert await echoes(r, 16) == 16, "the restored SA does not carry the tunnel"
 
 
+@pytest.mark.rfc("4301", section="4.4.2.1")
+async def test_time_expiry(ipsec_service):
+    """A time limit on an offloaded outbound SA fires through xfrm's own timer:
+    soft, then hard, which deletes the state and retires its flow."""
+    r, flows = ipsec_service, flows_for(ipsec_service)
+    outbound = next(key for key in keys([2], flows) if key[0] == TARGET_LAN_IF)
+    async with XfrmMonitor(r, "ipsec-lifetime-time") as monitor:
+        spi = await replace_outbound(r, "limit", "time-soft", "3", "limit", "time-hard", "6")
+        try:
+            await blast(r, 500, 2_000)
+            await r.wait(lambda state: outbound in by_key(state), timeout=5)
+            await r.wait(lambda state: outbound not in by_key(state), timeout=10)
+            expiries = await monitor.expiries(spi)
+            assert [event["hard"] for event in expiries] == [0, 1], expiries
+            assert await sa_state(r, spi) is None, "the hard expiry did not delete the state"
+        finally:
+            restored = await restore_outbound(r, spi)
+    assert restored and await echoes(r, 16) == 16
+
+
+@pytest.mark.rfc("4303", section="3.3.3")
+async def test_sequence_exhaustion(ipsec_service):
+    """A non-ESN SA eight numbers from the end of its space sends those eight
+    and no more: the counter never wraps, so no number is ever reused."""
+    r = ipsec_service
+    start = 0xFFFFFFFF - 8
+    spi = await replace_outbound(r, "replay-oseq", hex(start))
+    capture = Wire(r, "ipsec-sequence-exhaustion")
+    capture.snaplen = 64
+    async with capture:
+        echoed = await echoes(r, 32)
+    seqs = [seq for owner, seq in esp_sequences(capture.path) if owner == spi]
+    r.record("ipsec-sequence-exhaustion", {"spi": spi, "echoed": echoed, "wire": seqs})
+    assert echoed <= 8 and seqs == list(range(start + 1, start + 1 + len(seqs))), (echoed, seqs)
+    await replace_outbound(r)
+    assert await echoes(r, 16) == 16, "a fresh SA does not carry the tunnel"
+
+
 def esp_sequences(path):
     """(SPI, sequence) of every bare ESP frame in a capture, in capture order.
     A plain walk, like reused_sequences()."""

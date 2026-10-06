@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import textwrap
 
 import pytest
@@ -65,6 +66,50 @@ def _storm_script(duplicate: bool) -> str:
         send(all_frags, verbose=0, inter=0)
         print("STORM_DONE n_frags=%d" % len(all_frags))
     """).strip()
+
+
+@pytest.mark.rfc("791", section="3.2")
+async def test_reassembly_delivers(lan):
+    """Shuffled fragments of many datagrams arrive at the far end whole: what
+    the DUT reassembles and fragments again is byte for byte what was sent."""
+    sizes = [2000 + 37 * i for i in range(80)]
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Read only once all is sent: the buffer holds every datagram.
+    sock.setsockopt(socket.SOL_SOCKET, 33, 8 << 20)  # SO_RCVBUFFORCE
+    sock.bind((WAN_IPERF_IP, 5203))
+    sock.setblocking(False)
+    payload = lambda i: i.to_bytes(4, "big") + bytes((i * 7 + k) % 251 for k in range(sizes[i] - 4))
+    script = textwrap.dedent(f"""
+        import random
+        from scapy.all import IP, UDP, Raw, fragment, send
+        sizes = {sizes!r}
+        frags, shuffle = [], random.Random(791).shuffle
+        for start in range(0, len(sizes), 5):
+            # Shuffled five datagrams at a time: Linux drops a queue that
+            # more than net.ipv4.ipfrag_max_dist (64) of the same host's
+            # fragments overtook, and five never exceed 55.
+            group = []
+            for i in range(start, min(start + 5, len(sizes))):
+                data = i.to_bytes(4, "big") + bytes((i * 7 + k) % 251 for k in range(sizes[i] - 4))
+                group += fragment(IP(dst="{WAN_IPERF_IP}", id=0x791 + i) / UDP(sport=30500, dport=5203) / Raw(data), 500)
+            shuffle(group)
+            frags += group
+        send(frags, verbose=0)
+    """)
+    try:
+        result = await lan_run_python(lan, script, label="fragment_delivery", timeout=120)
+        assert result.rc == 0, result.stdout
+        received, loop = {}, asyncio.get_running_loop()
+        while len(received) < len(sizes):
+            try:
+                data = await asyncio.wait_for(loop.sock_recv(sock, 8192), 5)
+            except TimeoutError:
+                break
+            received[int.from_bytes(data[:4], "big")] = data
+        assert sorted(received) == list(range(len(sizes))), sorted(set(range(len(sizes))) - set(received))
+        assert all(data == payload(i) for i, data in received.items())
+    finally:
+        sock.close()
 
 
 async def _run_storm(lan_console, duplicate: bool) -> str:

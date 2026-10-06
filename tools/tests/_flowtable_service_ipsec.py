@@ -57,6 +57,9 @@ class Transform:
     algorithms: tuple = ("enc", "cbc(aes)", CIPHER, "auth-trunc", "hmac(sha256)", AUTH, "128")
     encap: tuple | None = None
     outer6: bool = False
+    # A protocol the adapter declines (AH) runs as a software pair.
+    proto: str = "esp"
+    offload: bool = True
 
 
 async def xfrm(r, agent, kind):
@@ -104,7 +107,7 @@ class SecurityAssociations:
 
     def state(self, direction, spi):
         src, dst = (self.outer, self.peer) if direction == "out" else (self.peer, self.outer)
-        return ["src", src, "dst", dst, "proto", "esp", "spi", hex(spi)]
+        return ["src", src, "dst", dst, "proto", self.transform.proto, "spi", hex(spi)]
 
     def crypto(self, direction):
         encap = []
@@ -137,9 +140,9 @@ class SecurityAssociations:
         # names its own window.
         if direction == "in" and "replay-window" not in options:
             options = (*options, "replay-window", "32")
+        offload = ["offload", "packet", "dev", TARGET_WAN_IF, "dir", direction] if self.transform.offload else []
         result = await self.add(self.r.target, "state", self.state(direction, spi),
-                               *self.crypto(direction), *options, "offload", "packet", "dev", TARGET_WAN_IF,
-                               "dir", direction, check=check)
+                               *self.crypto(direction), *options, *offload, check=check)
         if result["rc"] == 0:
             self.active[direction] = spi
         return result
@@ -240,11 +243,11 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
             outer_src, outer_dst = ((endpoint, peer_endpoint) if direction == "out"
                                     else (peer_endpoint, endpoint))
             selector = ["src", src + "/32", "dst", dst + "/32"]
-            template = ["tmpl", "src", outer_src, "dst", outer_dst, "proto", "esp", "mode", "tunnel",
+            template = ["tmpl", "src", outer_src, "dst", outer_dst, "proto", transform.proto, "mode", "tunnel",
                         "reqid", REQIDS[direction], "level", "required"]
             await sa.add(wan, "policy", [*selector, "dir", "in" if direction == "out" else "out"], *template)
             await sa.add(r.target, "policy", [*selector, "dir", direction], *template,
-                         "offload", "packet", "dev", TARGET_WAN_IF)
+                         *(["offload", "packet", "dev", TARGET_WAN_IF] if transform.offload else []))
             if direction == "in":
                 await sa.add(r.target, "policy", [*selector, "dev", TARGET_LAN_IF, "dir", "fwd"], *template)
         # The far inner end's echo, sharing the rig echo's record of what

@@ -1,16 +1,18 @@
 """Native MASQUERADE translation and Linux-owned WAN mapping retirement."""
 import asyncio
+import json
 import os
 import re
+import socket
 
 import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
 from ask_orch.uart import Console
-from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
+from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_connections import (FLOWS, healthy, peer)
-from _flowtable_rig import (artifact_dir, DPORT, WAN_IP, command, console_command, status_text)
+from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command, status_text)
 from _flowtable_policy import (CONFIG, apply, candidate, stop)
 from _flowtable_snat import (udp_snat as _udp)
 from _flowtable_tcp import (cpu, cpu_delta, software_tx, tcp_retransmit_withdraw_rst as _tcp)
@@ -201,3 +203,79 @@ async def test_wan_lifecycle(connections, masquerade_network):
             finally:
                 await command(r.target, r.session, "nft", "delete", "table", "ip", nat_table)
                 await console_command(con, "rm", "-f", CONFIG)
+
+
+@pytest.mark.rfc("4787", section="4.1")
+async def test_mapping_and_filtering(rig):
+    """One LAN socket talking to two WAN ports keeps one external mapping
+    (endpoint-independent, REQ-1), and a datagram from a WAN port it never
+    contacted does not reach it (REQ-8, address-and-port-dependent filtering):
+    what Linux's MASQUERADE decides, the offloaded flows must not change."""
+    r = rig
+    sport, ports, stranger = 48400, (48401, 48402), 48403
+    seen, loop = {}, asyncio.get_running_loop()
+
+    class Recorder(asyncio.DatagramProtocol):
+        def __init__(self, port):
+            self.port = port
+
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def datagram_received(self, data, addr):
+            seen.setdefault(self.port, set()).add(addr)
+            self.transport.sendto(data, addr)
+
+    servers = [(await loop.create_datagram_endpoint(lambda p=p: Recorder(p), local_addr=(WAN_IP, p)))[0]
+               for p in ports]
+    script = f'''
+import json, socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(({r.lan_ip!r}, {sport}))
+s.settimeout(0.05)
+replies = 0
+for n in range(120):
+    for port in {list(ports)!r}:
+        s.sendto(b"ASK-4787", ({WAN_IP!r}, port))
+        try:
+            s.recvfrom(64); replies += 1
+        except socket.timeout:
+            pass
+strangers, deadline = [], time.monotonic() + 6
+while time.monotonic() < deadline:
+    try:
+        data, addr = s.recvfrom(64)
+        if addr[1] not in {list(ports)!r}:
+            strangers.append(addr)
+    except socket.timeout:
+        pass
+print(json.dumps({{"replies": replies, "strangers": strangers}}))
+'''
+    try:
+        await r.nft(f'''table inet {TABLE} {{
+ flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; }}
+ chain forward {{ type filter hook forward priority 0; policy accept;
+ ip saddr {r.lan_ip} ip daddr {WAN_IP} udp sport {sport} udp dport {{ {ports[0]}, {ports[1]} }} flow add @fast
+ }}
+}}''')
+        task = asyncio.create_task(lan_run_python(r.lan, script, label="flowtable_nat_4787", timeout=60))
+        installed = await r.wait(lambda s: s["entries"] == 4, timeout=20)
+        mapped = {addr for addrs in seen.values() for addr in addrs}
+        assert len(mapped) == 1 and set(seen) == set(ports), seen
+        (public, port), = mapped
+        # Unsolicited, from the WAN host's port the LAN socket never sent to.
+        knock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        knock.bind((WAN_IP, stranger))
+        for _ in range(30):
+            knock.sendto(b"ASK-4787-stranger", (public, port))
+            await asyncio.sleep(0.2)
+        knock.close()
+        result = await task
+        assert result.rc == 0, result.stdout
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        r.record("nat-4787", {"mapping": [public, port], "installed": installed, "report": report})
+        assert report["replies"] >= 200 and not report["strangers"], report
+    finally:
+        for server in servers:
+            server.close()
+        await r.delete_table()

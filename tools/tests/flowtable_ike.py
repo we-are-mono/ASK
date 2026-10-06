@@ -1,4 +1,4 @@
-"""Negotiated IKEv2 SAs survive child rekey and an owned peer restart."""
+"""Negotiated IKEv2 and IKEv1 SAs survive child rekey and an owned peer restart."""
 
 import asyncio
 from functools import partial
@@ -25,11 +25,11 @@ OUTER, PEER, INNER = "198.18.110.1", "198.18.110.2", "198.18.111.2"
 REQID, PORT = 50110, DPORT + 3110
 
 
-def _connection(local, remote, local_ts, remote_ts, *, hardware):
+def _connection(local, remote, local_ts, remote_ts, *, hardware, version=2):
     return f'''
 connections {{
  ask-ike {{
-  version = 2
+  version = {version}
   local_addrs = {local}
   remote_addrs = {remote}
   proposals = aes128-sha256-modp2048
@@ -57,7 +57,10 @@ secrets {{ ike-test {{ id-1 = {local}
 '''
 
 
-async def test_rekey_and_peer_restart(rig):
+@pytest.mark.rfc("7296")
+@pytest.mark.rfc("2409")
+@pytest.mark.parametrize("version", [2, 1], ids=["ikev2", "ikev1"])
+async def test_rekey_and_peer_restart(rig, version):
     r = rig
     con = Console.target()
     stack = TopologyStack()
@@ -106,14 +109,16 @@ print(json.dumps(rows))
 ''')
         return json.loads(result["stdout"])
 
-    async def established(previous=()):
+    async def established(previous=frozenset()):
+        # IKEv1 keeps a rekeyed SA until it expires (strongSwan's
+        # delete_rekeyed defaults to no), so earlier SAs may linger.
         deadline = asyncio.get_running_loop().time() + 20
         while True:
-            rows = await states()
+            rows = [row for row in await states() if row["spi"] not in previous]
             spis = {row["spi"] for row in rows}
-            if len(rows) == 2 and spis.isdisjoint(previous):
+            if len(rows) == 2:
                 assert {row["direction"] for row in rows} == {"in", "out"}, rows
-                return spis
+                return previous | spis
             assert asyncio.get_running_loop().time() < deadline, rows
             await asyncio.sleep(0.3)
 
@@ -155,7 +160,7 @@ print(json.dumps(rows))
 }}
 '''
         (root / "strongswan.conf").write_text(daemon)
-        host_config.write_text(_connection(PEER, OUTER, INNER, r.lan_ip, hardware=False))
+        host_config.write_text(_connection(PEER, OUTER, INNER, r.lan_ip, hardware=False, version=version))
 
         async def swan(side, *args):
             argv = ("swanctl", *args, "--uri", uri)
@@ -195,7 +200,10 @@ print(json.dumps(rows))
 
         try:
             await local_add(["ip", "netns", "add", namespace], ["ip", "netns", "del", namespace])
+            # A fixed address: the DUT's neighbour for PEER outlives one case,
+            # and a fresh random one would leave it REACHABLE at a stale MAC.
             await local("ip", "link", "add", "link", r.wan_if, "name", "ike-peer",
+                        "address", "02:00:00:00:11:02",
                         "netns", namespace, "type", "macvlan", "mode", "bridge")
             for dev in ("lo", "ike-peer"):
                 await local("ip", "-n", namespace, "link", "set", dev, "up")
@@ -215,7 +223,7 @@ assert not pathlib.Path('/run/charon.pid').exists(), 'DUT already has an IKE dae
 root = pathlib.Path({str(root)!r})
 root.mkdir()
 (root / 'strongswan.conf').write_text({daemon!r})
-(root / 'swanctl.conf').write_text({_connection(OUTER, PEER, r.lan_ip, INNER, hardware=True)!r})
+(root / 'swanctl.conf').write_text({_connection(OUTER, PEER, r.lan_ip, INNER, hardware=True, version=version)!r})
 ''')
             stack.push(partial(console_command, con, "rm", "-rf", str(root)))
             await dut_process(stack, con, ["/usr/libexec/ipsec/charon"],
@@ -269,10 +277,12 @@ print('ready')
                     await hardware(p, "ike-after-" + transition)
         finally:
             try:
+                # The tails: a record is cut short, and the daemons open with
+                # pages of plugin loading.
                 for name in ("peer.log", "echo.log"):
                     if (root / name).exists():
-                        r.record("ike-" + name, {"text": (root / name).read_text()})
-                result = await console_command(con, "cat", str(root / "dut.log"), check=False)
+                        r.record("ike-" + name, {"text": (root / name).read_text()[-3500:]})
+                result = await console_command(con, "tail", "-c", "3500", str(root / "dut.log"), check=False)
                 r.record("ike-dut-log", result)
             finally:
                 await stack.teardown("IKE interoperability")
