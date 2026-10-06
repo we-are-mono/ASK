@@ -111,12 +111,12 @@ address is scoped to one link and cannot be forwarded between the two ports (a
 link MTU of 1280 rather than 68; and extension headers have no eligibility
 contract, so only packets whose transport header follows the fixed header are
 described by an admitted rule. Because the microcode fragments IPv6 as
-readily as IPv4, a direction whose path is smaller than its ingress
-interface's IPv6 MTU stays in software, where Linux sends Packet Too Big
-([ipv6.md](ipv6.md#packets-larger-than-the-path)). IPv4 has the matching bound
-for everything but TCP and IPsec, because the microcode's IPv4 fragments of a
-frame received on an Ethernet port carry no payload
-([architecture.md](architecture.md#native-context-and-admission)). What IPv6 still lacks
+readily as IPv4, and its fragments of a frame received on an Ethernet port
+carry no payload, a direction of either family other than TCP and IPv4 IPsec whose
+path is smaller than what its ingress port accepts stays in software, where
+Linux fragments IPv4 and sends IPv6 its Packet Too Big
+([ipv6.md](ipv6.md#packets-larger-than-the-path),
+[architecture.md](architecture.md#native-context-and-admission)). What IPv6 still lacks
 against IPv4 is a sustained-churn proof at full capacity; the Packet Too Big
 bound, device-MTU retirement, budget accounting, masquerade and hairpin double
 NAT each have one.

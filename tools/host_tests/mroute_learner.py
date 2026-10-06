@@ -259,9 +259,9 @@ def test_the_derivation_touches_no_hardware_and_takes_no_rtnl():
 def test_the_mtu_bound_is_rechecked_without_an_mfc_event():
     """Neither a device MTU change nor the IPv6 MTU sysctl touches the MFC, so
     the bound a group was admitted under would otherwise hold for its life.
-    The device change kicks the worker; the sysctl, which no event reports, is
-    found by the periodic refresh re-deriving every group, installed ones
-    included, exactly as the unicast IPv6 bound is found by the stats pass.
+    The device change kicks the worker; a listener's IPv6 MTU sysctl, which no
+    event reports, is found by the periodic refresh re-deriving every group,
+    installed ones included.
     """
     source = flowtable_source()
     derive = function(source, "ft_mr_derive")
@@ -272,7 +272,7 @@ def test_the_mtu_bound_is_rechecked_without_an_mfc_event():
     refresh = function(source, "ft_mr_stats_fn")
     assert "g->dirty = true;" in refresh
     link = function(source, "ft_mc_link_mtu")
-    assert "idev->cnf.mtu6" in link, "IPv6 is bounded in its own units"
+    assert "idev->cnf.mtu6" in link, "an IPv6 copy is bounded in its own units"
 
 
 # ------------------------------------------------------------- references

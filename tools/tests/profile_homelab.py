@@ -71,6 +71,7 @@ from _topology import (DUT_IPV6_WAN, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_
 from _flowtable_rig import (artifact_dir, Rig, command, console_command, read)
 from _flowtable_connections import peer
 from _flowtable_policy import (CONFIG, apply, stop)
+from _gated_tcp import GatedTcp
 from _flowtable_tunnel import (
     Shape,
     _dut_tunnel,
@@ -443,6 +444,46 @@ async def _accounted(ctx, client, *, peer, dport, sport, count=64, payload_size=
     assert software[TARGET_WAN_IF] < count // 2, (software, count)
     ctx.record(f"home-{label}", {"forward": forward, "reverse": reverse,
                                  "delta": delta, "software_rx": software})
+    return forward, reverse
+
+
+async def _tunnel_tcp(ctx, client, label):
+    """One TCP connection from `client` through the 6o4 tunnel, both directions
+    in hardware and each carrying the measured transfer. TCP rather than UDP: a
+    UDP upload into the tunnel is Linux's, the LAN port delivering a full frame
+    the tunnel cannot carry, and TCP's segments are clamped to fit. Returns
+    (forward, reverse) as installed."""
+    peer_address = ctx.shape.inner_orch
+    source, target = _bracketed(_source_address(client, peer_address)), _bracketed(peer_address)
+
+    def rows(state):
+        forward = [f for f in state["flows"] if f["proto"] == "6"
+                   and f["src"].startswith(source + ":") and f["dst"] == f"{target}:{PORT_V6}"]
+        reverse = [f for f in state["flows"] if f["proto"] == "6"
+                   and f["src"] == f"{target}:{PORT_V6}"]
+        return (forward[0], reverse[0]) if len(forward) == len(reverse) == 1 else None
+
+    async def run(script, **kwargs):
+        return await _client_python(ctx, client, script, **kwargs)
+
+    async with GatedTcp(run, source=_source_address(client, peer_address), peer=peer_address,
+                        dport=PORT_V6, label="home_" + label.replace("-", "_")) as transfer:
+        await transfer.warmed()
+        for _ in range(20):
+            before = await ctx.state()
+            if rows(before):
+                break
+            await asyncio.sleep(0.5)
+        assert rows(before), before["flows"]
+        forward, reverse = rows(before)
+        await transfer.measure()
+        after = await ctx.state()
+    moved = {f["cookie"]: int(f["packets"]) for f in after["flows"]}
+    assert forward["cookie"] in moved and reverse["cookie"] in moved, after["flows"]
+    assert moved[forward["cookie"]] - int(forward["packets"]) > 100, (forward, after["flows"])
+    assert moved[reverse["cookie"]] - int(reverse["packets"]) > 100, (reverse, after["flows"])
+    ctx.record("home-" + label, {"forward": forward, "reverse": reverse, "after": after,
+                                 "report": transfer.report})
     return forward, reverse
 
 
@@ -1233,10 +1274,9 @@ async def homelab(target_agent, lan, request, dmesg_allowlist):
             await _outer_segment(ctx, cleanup)
             await _dut_tunnel(ctx, cleanup)
             await _orchestrator_tunnel(ctx, cleanup)
-            # VLAN A tells its hosts the tunnel's MTU, as a 6in4 LAN has to for
-            # its IPv6 upload to be offloaded: the microcode would fragment a
-            # larger packet instead of letting Linux send Packet Too Big (see
-            # test_mtu_bound). The VLAN is this fixture's and
+            # VLAN A tells its hosts the tunnel's MTU, as a 6in4 LAN should,
+            # sparing them a Packet Too Big round trip; admission does not
+            # read it (see test_mtu_bound). The VLAN is this fixture's and
             # goes with it, so nothing is restored.
             vlan_a_mtu = f"/proc/sys/net/ipv6/conf/{ctx.bridge_text[VID_A]}/mtu"
             assert (await ctx.target.fs_write(ctx.session, vlan_a_mtu,
@@ -1490,11 +1530,11 @@ async def test_tunnel_gives_the_trusted_vlan_ipv6(homelab,
     half -- while both still name the physical ports, because a tunnel device
     never becomes one. The LAN side of the same connection is bridged and
     untagged, which is the combination this profile adds over the tunnel file's.
+    Over TCP: a UDP upload into the tunnel is Linux's, the LAN port delivering a
+    full frame, and TCP's segments are clamped to fit.
     """
     ctx = homelab
-    client = BY_NAME["a"]
-    forward, reverse = await _accounted(ctx, client, peer=ctx.shape.inner_orch,
-                                        dport=PORT_V6, sport=PORT_V6, label="tunnel6")
+    forward, reverse = await _tunnel_tcp(ctx, BY_NAME["a"], "tunnel6-tcp")
     expected = _tunnel_text(ctx.shape)
     assert forward["out_tnl"] == expected and forward["in_tnl"] == "-", forward
     assert reverse["in_tnl"] == expected and reverse["out_tnl"] == "-", reverse
@@ -1623,8 +1663,21 @@ async def test_mixed_traffic_survives_rekey(homelab, splat_window):
                             target=ctx.target, session=ctx.session)
 
     def pairs(state):
-        return [_directions(state["flows"], _bracketed(flow["lan"]), flow["sport"],
-                            _bracketed(flow["connect_ip"]), flow["connect_port"]) for flow in flows]
+        found = []
+        for index, flow in enumerate(flows):
+            lan = f"{_bracketed(flow['lan'])}:{flow['sport']}"
+            remote = f"{_bracketed(flow['connect_ip'])}:{flow['connect_port']}"
+            if index == 3:
+                # A UDP upload into the tunnel is Linux's: the LAN port takes
+                # a full frame and the tunnel carries 1480. The download alone.
+                assert not [f for f in state["flows"] if f["src"] == lan], state["flows"]
+                reverse = [f for f in state["flows"] if f["src"] == remote and f["new_dst"] == lan]
+                assert len(reverse) == 1, (flow, state["flows"])
+                found.append((None, reverse[0]))
+            else:
+                found.append(_directions(state["flows"], _bracketed(flow["lan"]), flow["sport"],
+                                         _bracketed(flow["connect_ip"]), flow["connect_port"]))
+        return found
 
     try:
         await _smcroute(ctx, ctx.bridge_text[VID_A], ctx.bridge_text[VID_B])
@@ -1643,7 +1696,7 @@ async def test_mixed_traffic_survives_rekey(homelab, splat_window):
                 pytest.fail(f"mixed profile did not admit every direction: {before}")
             for index, (forward, reverse) in enumerate(original[:3]):
                 _assert_wan(ctx, forward, reverse, client=paths[index][0])
-            assert original[3][0]["out_tnl"] == _tunnel_text(ctx.shape), original[3]
+            assert original[3][1]["in_tnl"] == _tunnel_text(ctx.shape), original[3]
             assert original[4][0]["sa"] != "0" and original[4][1]["in_sa"] != "0", original[4]
             await p.rpc("start", ids, count=0, interval=0.01, allow_loss=True, udp_timeout=0.1)
             multicast = asyncio.create_task(_watch_routed(ctx, [BY_NAME["a"], BY_NAME["b"]],
@@ -1665,6 +1718,8 @@ async def test_mixed_traffic_survives_rekey(homelab, splat_window):
                 assert report["lost"] <= (20 if int(ident) == 4 else 0), (ident, report)
             for old_pair, new_pair in zip(original[:4], current[:4]):
                 for old, new in zip(old_pair, new_pair):
+                    if old is None:
+                        continue
                     assert new["cookie"] == old["cookie"], (old, new)
                     assert int(new["packets"]) - int(old["packets"]) >= 3000, (old, new)
             assert current[4][0]["sa"] != original[4][0]["sa"], (original[4], current[4])
@@ -2025,9 +2080,7 @@ async def test_module_reload_reproves_the_profile(homelab,
     forward, reverse = await _accounted(ctx, guest, peer=INTERNET, dport=PORT_C,
                                         sport=PORT_C, label="reload-guest")
     _assert_wan(ctx, forward, reverse, client=guest)
-    forward, reverse = await _accounted(ctx, trusted, peer=ctx.shape.inner_orch,
-                                        dport=PORT_V6, sport=PORT_V6,
-                                        label="reload-tunnel")
+    forward, reverse = await _tunnel_tcp(ctx, trusted, "reload-tunnel")
     assert forward["out_tnl"] == _tunnel_text(ctx.shape), forward
     assert reverse["in_tnl"] == _tunnel_text(ctx.shape), reverse
     # The firewall is the kernel's, not the module's, so it has to still be

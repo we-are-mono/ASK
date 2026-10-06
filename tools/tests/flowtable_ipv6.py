@@ -193,14 +193,13 @@ async def test_mtu_recovery(ipv6_rig):
     """A device MTU change must retire both IPv6 directions and let them come
     back describing the new MTU, exactly as the IPv4 path does.
 
-    Both directions are only in hardware while neither port can deliver more
-    than the other's path carries: a LAN-to-WAN direction while no LAN host is
-    told it can send more (see test_mtu_bound), a WAN-to-LAN one while the WAN
-    port receives no more than the LAN path. A port never receives less than a
-    full Ethernet frame, so a WAN port lowered below one still delivers 1500
-    bytes and only the LAN-to-WAN direction can come back. Both ports move to
-    jumbo together for the full re-description, and the WAN alone goes below a
-    full frame for the one-sided one."""
+    Both UDP directions are only in hardware while neither port can deliver
+    more than the other's path carries (see test_mtu_bound). A port never
+    receives less than a full Ethernet frame, so with the WAN lowered below one
+    the LAN still delivers 1500 bytes into the smaller WAN path, and only the
+    WAN-to-LAN direction can come back. Both ports move to jumbo together for
+    the full re-description, and the WAN alone goes below a full frame for the
+    one-sided one."""
     r = ipv6_rig
     sport, dport = PORTS["mtu"]
     loop = asyncio.get_running_loop()
@@ -209,7 +208,6 @@ async def test_mtu_recovery(ipv6_rig):
         lambda: echo, local_addr=(WAN_IPV6, dport), family=socket.AF_INET6)
     original = int((await read(r.target, r.session, f"/sys/class/net/{TARGET_WAN_IF}/mtu")).strip())
     assert original == 1500, original
-    lan_mtu = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
     try:
         await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
 
@@ -269,22 +267,15 @@ async def test_mtu_recovery(ipv6_rig):
         restored = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: original})
         r.record("ipv6-mtu-restored", restored)
 
-        # Below a full frame. The LAN's IPv6 MTU is lowered with the WAN, as
-        # an operator would for any smaller upstream, which keeps the
-        # LAN-to-WAN direction bounded. The WAN port still receives a full
-        # frame, more than the 1400-byte LAN path carries, so the WAN-to-LAN
-        # direction stays with Linux, which can say Packet Too Big. The LAN
-        # goes first, so nothing installed is ever left unbounded.
-        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}=1400")
+        # Below a full frame. The LAN port still receives a full frame, more
+        # than the 1400-byte WAN path carries, so the LAN-to-WAN direction
+        # stays with Linux, which can say Packet Too Big -- whatever IPv6 MTU
+        # the LAN advertises, which is why this leaves it alone. The WAN-to-LAN
+        # direction leaves by the 1500-byte LAN and comes back alone.
         await link_mtu(TARGET_WAN_IF, 1400)
-        reduced = await settled({TARGET_WAN_IF: 1400})
+        reduced = await settled({TARGET_LAN_IF: original})
         assert reduced["rejects"] > restored["rejects"], (restored, reduced)
         r.record("ipv6-mtu-reduced", reduced)
-        # The LAN first again, so the WAN-to-LAN direction is never left
-        # unbounded behind a 1400-byte WAN: raising it retires the bounded
-        # LAN-to-WAN one, and the device change then retires whatever came
-        # back in between.
-        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}")
         await link_mtu(TARGET_WAN_IF, original)
         restored = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: original})
         assert restored["errors"] == r.errors, restored
@@ -294,7 +285,6 @@ async def test_mtu_recovery(ipv6_rig):
         for dev in (TARGET_WAN_IF, TARGET_LAN_IF):
             await command(r.target, r.session, "ip", "link", "set", "dev", dev,
                           "mtu", str(original), check=False)
-        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}", check=False)
         await _drop_tables(r)
 
 
@@ -502,18 +492,19 @@ print(json.dumps(results))
         await _drop_tables(r)
 
 
+@pytest.mark.rfc("4443", section="3.2")
 async def test_mtu_bound(ipv6_rig):
     """The microcode fragments an IPv6 packet over its entry's MTU instead of
-    handing it to Linux, so a direction whose path is smaller than its ingress
-    interface's IPv6 MTU must stay in software, where Linux answers with
+    handing it to Linux, so a UDP direction whose path is smaller than what
+    its ingress port accepts must stay in software, where Linux answers with
     Packet Too Big. The route to the WAN host is locked to 1280, the minimum.
 
-    While the LAN's IPv6 MTU is 1280 as well, the LAN-to-WAN direction is
-    bounded and goes to hardware; the WAN-to-LAN one is not, because the LAN
-    route now carries 1280 against a 1500-byte WAN. Raising the LAN back to
-    1500 is a sysctl no device event reports, so the next stats pass has to
-    retire the flow, and it comes back the other way round. Then an oversized
-    packet gets its Packet Too Big and the microcode fragments nothing.
+    Telling the LAN's hosts 1280 changes nothing for the LAN-to-WAN direction:
+    the port still takes a full frame from a host that ignores the advertised
+    MTU, so it stays in software, and the WAN-to-LAN one with it, the LAN path
+    now carrying 1280 against a 1500-byte WAN. With the LAN back at 1500 the
+    WAN-to-LAN direction goes to hardware alone. Then an oversized packet gets
+    its Packet Too Big and the microcode fragments nothing.
     """
     r = ipv6_rig
     sport, dport = PORTS["bound"]
@@ -548,16 +539,19 @@ async def test_mtu_bound(ipv6_rig):
         await command(r.target, r.session, *route)
         initial = await r.state()
         await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
-        bounded = await _drive(r, send, one_direction(TARGET_LAN_IF, 1280),
-                               "only the LAN-to-WAN direction should be in hardware")
-        assert bounded["rejects"] > initial["rejects"], (initial, bounded)
-        r.record("ipv6-bound-lan", bounded)
+        advertised = await _drive(r, send, lambda s: s["entries"] == 0 and s["rejects"] > initial["rejects"] + 1,
+                                  "neither direction may be in hardware")
+        r.record("ipv6-bound-advertised", advertised)
 
         await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}")
-        retired = await r.wait(lambda s: s["mtu_invalidations"] > bounded["mtu_invalidations"])
+        # Linux's flow keeps the path MTUs it was created with, so the
+        # WAN-to-LAN direction's offers would still carry 1280 until it ended:
+        # a new table makes a new flow.
+        await _drop_tables(r)
+        await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
         unbounded = await _drive(r, send, one_direction(TARGET_WAN_IF, 1500),
                                  "only the WAN-to-LAN direction should be in hardware")
-        r.record("ipv6-bound-wan", {"retired": retired, "unbounded": unbounded})
+        r.record("ipv6-bound-wan", unbounded)
 
         before = await fragments_sent()
         script = f'''

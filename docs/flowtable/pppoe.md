@@ -168,16 +168,13 @@ completed cleanly, so the peer parsed every frame the microcode emitted. A
 wrong protocol id is a header the peer discards, which would have shown as loss
 rather than as a rate.
 
-IPv6 into the session is admitted only while the LAN's IPv6 MTU is no larger
-than the session's 1492: the microcode would fragment a larger packet where a
-router has to answer with Packet Too Big
-([ipv6.md](ipv6.md#packets-larger-than-the-path)). A PPPoE LAN should
-advertise 1492 anyway; the IPv6 case and the ISP profile set it. IPv4 UDP from
-an Ethernet LAN into the session stays in software whatever the LAN's MTU,
-because the microcode's IPv4 fragments of a received frame carry no payload and
-a port receives at least full frames whatever its MTU
-([architecture.md](architecture.md#native-context-and-admission)); TCP is
-carried, DF set, and so is the direction out of the session. A session
+UDP of either family from an Ethernet LAN into the session stays in software,
+whatever MTU the LAN has or advertises: a port receives at least full frames,
+and the microcode would fragment the excess where Linux fragments IPv4 or
+answers IPv6 with Packet Too Big, its fragments of a received frame carrying no
+payload ([architecture.md](architecture.md#native-context-and-admission),
+[ipv6.md](ipv6.md#packets-larger-than-the-path)). TCP is carried, its MSS
+clamped by the uplink, and so is the direction out of the session. A session
 negotiated at 1500 over a 1508-byte Ethernet (RFC 4638) is no smaller than the
 LAN, so its UDP stays in hardware too. Linux offers such a flow again about once
 a second while its upload forwards in software. With no IPsec policy configured

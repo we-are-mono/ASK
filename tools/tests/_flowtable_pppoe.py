@@ -492,7 +492,7 @@ async def _wait_reachable6(r, attempts=25):
                 f"{attempts} attempts: {probe.stdout!r}")
 
 
-async def _offload_table6(r):
+async def _offload_table6(r, proto="udp"):
     """The offload table for a v6 flow across the session.
 
     `Rig.table()` writes an IPv4 match by construction and the family is part
@@ -504,7 +504,7 @@ async def _offload_table6(r):
  flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }};
  flags offload; }}
  chain forward {{ type filter hook forward priority 0; policy accept;
- ip6 saddr {LAN_IPV6} udp sport {SPORT6} udp dport {DPORT6} flow add @fast
+ ip6 saddr {LAN_IPV6} {proto} sport {SPORT6} {proto} dport {DPORT6} flow add @fast
  }}
 }}''')
     await r.wait(lambda s: s["bindings"] == 2)
@@ -614,14 +614,6 @@ async def _ipv6_session(r, stack, cleanup):
     cleanup.append((r.target, ["sysctl", "-w",
                                f"net.ipv6.conf.all.forwarding={previous}"]))
     await target("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
-    # The LAN tells its hosts the session's MTU, the configuration a PPPoE LAN
-    # needs for its IPv6 upload to be offloaded at all: the microcode would
-    # fragment a larger packet instead of letting Linux send Packet Too Big
-    # (see test_mtu_bound).
-    key = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
-    previous = (await target("sysctl", "-n", key))["stdout"].strip()
-    cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))
-    await target("sysctl", "-w", f"{key}={SESSION_MTU}")
 
     # nodad throughout: duplicate address detection leaves an address tentative
     # for about a second and a half, and the first flow would silently not come

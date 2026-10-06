@@ -97,44 +97,42 @@ async def test_ipv6_routed(pppoe_rig):
     wrong choice is a header the concentrator discards, which is silent loss
     rather than a refusal, so it stayed out until measured.
 
-    This is the measurement. A complete v6 exchange across the session is the
-    evidence: every datagram was answered, so the peer parsed every frame the
-    hardware inserted a header onto, which a wrong protocol id would not
-    survive. The counters then say the hardware carried it rather than software
-    quietly doing the work.
+    This is the download's half of the measurement: a complete v6 exchange
+    across the session, every reply stripped by the hardware. The UDP upload
+    is Linux's, as IPv4's is: the LAN port delivers a full frame and the
+    session carries 1492, and the microcode would fragment the excess where
+    Linux answers it with Packet Too Big. The insert, where the protocol id is
+    chosen, is proved by test_ipv6_tcp.
 
-    One routed case is the whole of it, deliberately. Nothing about the family
-    reaches the session decode -- the walk, the concentrator and the id are
-    identical either way -- so what the other shapes would re-prove is the
-    adapter's handling of a session, which the IPv4 cases already cover, and
-    what is new here belongs to the firmware.
+    One routed case per protocol is the whole of it, deliberately. Nothing
+    about the family reaches the session decode -- the walk, the concentrator
+    and the id are identical either way -- so what the other shapes would
+    re-prove is the adapter's handling of a session, which the IPv4 cases
+    already cover, and what is new here belongs to the firmware.
     """
     r = pppoe_rig
     # Errors accumulate for the life of the module, and the fault-injection
     # cases in flowtable_offload.py raise some on purpose, so what this
     # case can claim is that it added none of its own.
-    baseline = (await r.state())["errors"]
+    initial = await r.state()
+    baseline = initial["errors"]
     await _offload_table6(r)
     # Nothing re-offers a flow on its own, so each attempt sends before it
     # looks; admission needs traffic and the reverse direction needs a reply.
     for _ in range(10):
         await _exchange6(r, 4)
-        if (await r.state())["entries"] == 2:
+        if (await r.state())["entries"] == 1:
             break
-    flows = await _both_directions(r)
-    forward = _direction(flows, f"[{LAN_IPV6}]", f"[{INNER_LOCAL6}]")
+    state = await r.state()
+    flows = state["flows"]
+    assert len(flows) == 1 and state["rejects"] > initial["rejects"], (initial, state)
     reverse = _direction(flows, f"[{INNER_LOCAL6}]", f"[{LAN_IPV6}]")
-    assert forward["family"] == reverse["family"] == "6", flows
+    assert reverse["family"] == "6", flows
     # The session, asserted exactly as the v4 routed case asserts it: the id
-    # and the concentrator the kernel negotiated, on the direction that inserts
-    # the header and on the direction that strips it, and on neither LAN half.
-    _assert_session(r, forward, reverse)
-    assert forward["in_vlan"] == "-" and reverse["out_vlan"] == "-", (forward, reverse)
-    assert forward["in_br"] == reverse["out_br"] == "-", (forward, reverse)
-    # The forward direction leaves by the session, so it carries the session's
-    # MTU -- which is above the IPv6 minimum link MTU, the one extra thing v6
-    # requires of a path.
-    assert int(forward["mtu"]) == SESSION_MTU, forward
+    # and the concentrator the kernel negotiated on the direction that strips
+    # the header, and nothing on its LAN half.
+    _assert_session(r, None, reverse)
+    assert reverse["out_vlan"] == "-" and reverse["out_br"] == "-", reverse
 
     before = {f["cookie"]: int(f["packets"]) for f in flows}
     report = await _exchange6(r, 64)
@@ -152,6 +150,48 @@ async def test_ipv6_routed(pppoe_rig):
     r.record("pppoe-ipv6-routed", {"flows": flows, "delta": delta,
                                    "session": _session_text(r.session_identity),
                                    "observed": sorted(r.echo6.sources)})
+
+
+@pytest.mark.parametrize("pppoe_rig", ["ipv6"], indirect=True)
+async def test_ipv6_tcp(pppoe_rig):
+    """The v6 insert across the session, over TCP, which the uplink's MSS
+    clamp keeps within the session's MTU.
+
+    `en_ehash_insert_pppoe_hdr` carries no PPP protocol id, so the microcode
+    chooses between 0x0021 and 0x0057 itself, and a wrong choice is a header
+    the concentrator discards: silent loss rather than a refusal. A transfer
+    the concentrator's stack completed is the evidence that it parsed every
+    frame the hardware inserted a header onto, and the upload's own counter
+    says the hardware did the inserting.
+    """
+    r = pppoe_rig
+    baseline = (await r.state())["errors"]
+    await _offload_table6(r, "tcp")
+    async with GatedTcp(r.run_peer, source=LAN_IPV6, sport=SPORT6, peer=INNER_LOCAL6,
+                        dport=DPORT6, label="flowtable_pppoe_v6_tcp") as transfer:
+        await transfer.warmed()
+        before = await r.wait(lambda s: len(s["flows"]) == 2)
+        flows = await _both_directions(r, before)
+        await transfer.measure()
+        after = await r.state()
+    forward = _direction(flows, f"[{LAN_IPV6}]", f"[{INNER_LOCAL6}]")
+    reverse = _direction(flows, f"[{INNER_LOCAL6}]", f"[{LAN_IPV6}]")
+    assert forward["family"] == reverse["family"] == "6", flows
+    _assert_session(r, forward, reverse)
+    assert forward["in_vlan"] == "-" and reverse["out_vlan"] == "-", (forward, reverse)
+    assert forward["in_br"] == reverse["out_br"] == "-", (forward, reverse)
+    # The upload leaves by the session, so it carries the session's MTU --
+    # above the IPv6 minimum link MTU, the one extra thing v6 requires of a path.
+    assert int(forward["mtu"]) == SESSION_MTU, forward
+    new = {f["cookie"]: int(f["packets"]) for f in after["flows"]}
+    assert new.keys() == {forward["cookie"], reverse["cookie"]}, after
+    assert (after["installs"], after["deletes"]) == (before["installs"], before["deletes"]), (before, after)
+    upload = new[forward["cookie"]] - int(forward["packets"])
+    download = new[reverse["cookie"]] - int(reverse["packets"])
+    assert upload > 100 and download > 100, (upload, download)
+    assert after["errors"] == baseline, (baseline, after)
+    r.record("pppoe-ipv6-tcp", {"flows": flows, "after": after, "report": transfer.report,
+                                "session": _session_text(r.session_identity)})
 
 
 async def test_session_counters(pppoe_rig):
@@ -927,10 +967,11 @@ async def test_tunnel(pppoe_rig, mode):
     are ones its PPPoE stack took for this session, which is the proof that
     the frame was addressed to it.
 
-    A 4o6 UDP upload is Linux's -- an Ethernet LAN can deliver a full frame
-    and the tunnel's path is smaller -- so for 4o6 the direction proved here
-    is the one that arrives inside all three, and the records are held by it
-    alone.
+    A UDP upload is Linux's -- an Ethernet LAN can deliver a full frame and
+    the tunnel's path is smaller -- so over UDP the direction proved is the one
+    that arrives inside all three, and the records are held by it alone. The
+    upload that leaves inside all three is proved over TCP, which the uplink's
+    MSS clamp keeps within the tunnel.
     """
     import _flowtable_tunnel as tunnel
 
@@ -947,18 +988,12 @@ async def test_tunnel(pppoe_rig, mode):
     transport = None
     try:
         await tunnel._lan_side(r, cleanup, lan_cleanup)
-        if shape.family == 6:
-            # The LAN advertises the tunnel's MTU, the configuration under
-            # which an IPv6 direction into it is offloaded at all.
-            key = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
-            previous = (await command(r.target, r.session, "sysctl", "-n", key))["stdout"].strip()
-            cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))
-            await command(r.target, r.session, "sysctl", "-w", f"{key}={shape.mtu}")
-        else:
-            accept = ["POSTROUTING", "-s", r.lan_address, "-d", shape.inner_orch, "-p", "udp",
-                      "--sport", str(shape.sport), "--dport", str(shape.dport), "-j", "ACCEPT"]
-            await command(r.target, r.session, "iptables", "-t", "nat", "-I", *accept)
-            cleanup.append((r.target, ["iptables", "-t", "nat", "-D", *accept]))
+        if shape.family == 4:
+            for proto in ("udp", "tcp"):
+                accept = ["POSTROUTING", "-s", r.lan_address, "-d", shape.inner_orch, "-p", proto,
+                          "--sport", str(shape.sport), "--dport", str(shape.dport), "-j", "ACCEPT"]
+                await command(r.target, r.session, "iptables", "-t", "nat", "-I", *accept)
+                cleanup.append((r.target, ["iptables", "-t", "nat", "-D", *accept]))
         await tunnel._dut_tunnel(r, cleanup)
         await tunnel._orchestrator_tunnel(r, cleanup)
         await tunnel._wait_reachable(r)
@@ -982,6 +1017,31 @@ async def test_tunnel(pppoe_rig, mode):
         assert state["errors"] == before["errors"], (before, state)
         r.record(f"pppoe-tunnel-{mode}", {"flows": flows, "delta": delta, "session": row,
                                           "tunnel": tunnels[0]})
+
+        # The upload inside all three, over TCP.
+        await tunnel._offload_table(r, "tcp")
+
+        def tcp(s):
+            return [f for f in s["flows"] if f["proto"] == "6"]
+
+        async with GatedTcp(r.run_peer, source=r.lan_address, sport=shape.sport,
+                            peer=shape.inner_orch, dport=shape.dport,
+                            label=f"flowtable_pppoe_{mode}_tcp") as transfer:
+            await transfer.warmed()
+            started = await r.wait(lambda s: len(tcp(s)) == 2)
+            await transfer.measure()
+            ended = await r.state()
+        forward, reverse = tunnel._directions(r, tcp(started))
+        assert forward is not None, tcp(started)
+        tunnel._assert_tunnel(r, forward, reverse)
+        _assert_session(r, forward, reverse)
+        moved = {f["cookie"]: int(f["packets"]) for f in tcp(ended)}
+        assert moved.keys() == {forward["cookie"], reverse["cookie"]}, ended
+        upload = moved[forward["cookie"]] - int(forward["packets"])
+        assert upload > 100, (upload, transfer.report)
+        assert ended["errors"] == before["errors"], (before, ended)
+        r.record(f"pppoe-tunnel-{mode}-tcp", {"flows": tcp(started), "ended": ended,
+                                              "report": transfer.report})
     finally:
         if transport:
             transport.close()

@@ -119,11 +119,14 @@ state or an IPv6 gateway. The driver uses Linux's selected route rather than
 repeating policy routing with incomplete packet context. Effective MTU must be
 at least 68 and no greater than the egress device MTU.
 
-An IPv4 direction that is neither TCP nor to or from an SA is admitted only
-while nothing larger than its MTU can arrive. The microcode fragments a packet
-without DF that exceeds the entry's MTU, and for a frame received on an
-Ethernet port those fragments leave with correct headers and an all-zero
-payload, so the receiver discards them. Fragments of the SEC output, which
+A direction of either family that is neither TCP nor, for IPv4, to or from an
+SA is admitted only while nothing larger than its MTU can arrive
+(`ft_mtu_carried()`). The microcode fragments a packet that exceeds the
+entry's MTU -- IPv4 without DF, and any IPv6, which it never hands to Linux --
+and for a frame received on an Ethernet port those fragments leave with
+correct headers and an all-zero payload, so the receiver discards them; a
+6o4 insert's outer IPv4 header carries no DF, so an oversized 6o4 packet goes
+the same way. Fragments of the SEC output, which
 reaches the classifier through the offline port, are correct. What can arrive
 is bounded by the physical port's MAC: patch 109 programs each DPAA port's
 max frame from its MTU as `max(mtu, 1500)` plus header and FCS, plus one VLAN
@@ -134,9 +137,10 @@ larger of its logical ingress device's MTU and `max(port MTU, 1500)`, less
 whatever the direction strips (a PPPoE session's 8 bytes, a tunnel's outer
 header): a port lowered below 1500 keeps receiving full frames, and a 1500
 bridge or VLAN over a 9000 port receives 9000-byte frames from hosts that
-were never told the smaller MTU, since DHCP's MTU option is widely ignored.
-On such a jumbo trunk every non-TCP IPv4 direction into a 1500 path stays in
-software. The tag allowance lets an untagged frame on a port with uppers
+were never told the smaller MTU, since DHCP's MTU option is widely ignored and
+a router advertisement's can be. The IPv6 MTU a link advertises is therefore
+not the bound either. On such a jumbo trunk every non-TCP direction into a
+1500 path stays in software. The tag allowance lets an untagged frame on a port with uppers
 exceed its MTU by four (or eight) bytes; that window is deliberately not
 counted, since counting it would refuse every bridged 1500→1500 UDP
 direction, and it needs a host sending more than its link's MTU. A TCP direction is
@@ -145,16 +149,23 @@ carried into the smaller path: TCP sets DF, the preemptive
 Fragmentation Needed, and one that clamps the MSS rarely sees any. The one
 exception, a sender that clears DF on TCP into an unclamped smaller path,
 loses those segments and stalls rather than delivering corrupt data, since
-the zero payload fails the receiver's checksum. A refused direction stays
-on the software flowtable path, where `ip_forward()` fragments correctly; the
-reverse direction is admitted on its own. Equal MTUs, the ordinary Ethernet
-WAN, are unaffected. A smaller upstream is where it shows: UDP leaving a LAN
-by PPPoE (1492) or a 4in6 tunnel (1452) runs in software in that direction,
-and TCP and the download direction stay in hardware. Device and route MTU
+the zero payload fails the receiver's checksum. An IPv6 TCP direction has no
+DF to fall back on: it rests on the uplink's MSS clamp alone, and a segment
+over it from a host that ignores the clamp is lost. That clamp is the one
+thing an integration owes the bound (OpenWrt's `mtu_fix` on the WAN zone, on
+by default). A refused direction stays on the software flowtable path, where
+`ip_forward()` fragments correctly and `ip6_forward()` sends Packet Too Big;
+the reverse direction is admitted on its own. Equal MTUs, the ordinary
+Ethernet WAN, are unaffected. A smaller upstream is where it shows: UDP
+leaving a LAN by PPPoE (1492), a 6in4 tunnel (1480) or a 4in6 tunnel (1452)
+runs in software in that direction, and TCP and the download direction stay in
+hardware. Device and route MTU
 changes retire installed directions through their events, so the bound is
 checked at admission.
 
-A direction into an SA is exempt because its entry is bounded differently. The
+An IPv4 direction into an SA is exempt because its entry is bounded
+differently; an IPv6 one is not, because out of SEC the offline port would
+fragment the decrypted IPv6 packet itself. The
 bound is the bundle's MTU that Linux enforces, the smaller of the SA's MTU on
 the path to the peer and the inner route's, with SEC's expansion on top, which
 the microcode adds before comparing. `PREEMPT_DFBIT_HONOR` therefore hands
@@ -168,10 +179,9 @@ at most about once a second for as long as the software fast path forwards
 either direction's packets: `flow_offload_refresh()` queues the whole flow, and
 the offload work offers both directions. A direction the MTU bound is certain to refuse is therefore refused
 before RTNL is taken, counted as a reject and never as busy, retiring nothing:
-IPv4 other than TCP whose path is below the larger of the ingress device's MTU
-and the port bound less 48 bytes (a session and a 4in6 outer header, the most
-any ingress strips), or IPv6 whose path is below the ingress IPv6 MTU plus
-whatever the port, less the same 48, accepts beyond the device's MTU. It does
+anything other than TCP whose path is below the larger of the ingress device's
+MTU and the port bound less 48 bytes (a session and a 4in6 outer header, the
+most any ingress strips). It does
 so only while no xfrm policy or blocking default is configured and neither
 destination carries a transform, because an SA exempts an IPv4 direction and a
 policy denial retires the generation, and only the walk under RTNL finds out

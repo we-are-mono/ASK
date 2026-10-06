@@ -270,9 +270,10 @@ MTU and what its physical port accepts, `max(port MTU, 1500)`, since a
 is taken over the whole path: the oif, each VLAN
 device below it, the port, and for a bridge oif the bridge and each chosen
 port. A copy that collapses into another oif's keeps the narrower of the two
-paths. IPv6 is compared in IPv6 MTUs, the value a link is told and the one a
-Packet Too Big quotes, which is the bound the unicast IPv6 path uses
-([IPv6 guide](ipv6.md#packets-larger-than-the-path)). Otherwise the group is
+paths. IPv6 copies are compared in IPv6 MTUs, the value a link is told and the
+one a Packet Too Big quotes; what arrives is bounded by the parent's port, as
+for IPv4 and for unicast, never by the IPv6 MTU the parent advertises, which a
+source may ignore ([IPv6 guide](ipv6.md#packets-larger-than-the-path)). Otherwise the group is
 `refused-mtu`. Neither an MTU change nor the IPv6 MTU sysctl raises an MFC
 event, so the device change kicks the worker and the five-second refresh
 catches the sysctl. See [the bridged contract](multicast.md#the-eligibility-contract)

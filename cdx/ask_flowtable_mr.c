@@ -842,27 +842,24 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	/* The largest packet the parent VIF can hand ipmr has to fit every copy,
 	 * or the microcode would fragment one Linux never would: ip6mr answers
 	 * an oversized IPv6 replica with Packet Too Big and ipmr drops an IPv4
-	 * one with DF set. The IPv6 side is the parent's IPv6 MTU, the value
-	 * its link is told, which is the bound the unicast IPv6 path uses for
-	 * the same reason. Nothing an MTU change or the IPv6 MTU sysctl does
+	 * one with DF set. Nothing an MTU change or the IPv6 MTU sysctl does
 	 * raises an MFC event, so this is rechecked by the periodic refresh as
 	 * well as on NETDEV_CHANGEMTU.
 	 *
-	 * IPv4 is bounded by what arrives rather than by what the link is told:
-	 * the parent's port hands ipmr whatever its MAC accepts, its own MTU but
-	 * never less than a full Ethernet frame (ft_port_arriving()), so a
-	 * 1500-byte VLAN parent over a 9000-byte port, or a parent lowered to
-	 * 1400, delivers more than its own MTU.
+	 * Both families are bounded by what arrives rather than by what the link
+	 * is told, as unicast is: the parent's port hands ipmr whatever its MAC
+	 * accepts, its own MTU but never less than a full Ethernet frame
+	 * (ft_port_arriving()), so a 1500-byte VLAN parent over a 9000-byte port,
+	 * a parent lowered to 1400, or a source ignoring the IPv6 MTU its link
+	 * advertises, delivers more than the parent's own.
 	 *
 	 * Through a bridge the bound is the bridge port the stream arrives on,
 	 * which the bridge hands up whatever the bridge device's own MTU, and
 	 * which only the bridged group knows: the plan carries the narrowest
 	 * copy for it to hold against that. */
 	if (spec.in) {
-		u32 arriving = ft_mc_link_mtu(vif_dev, g->family);
+		u32 arriving = max(ft_mc_link_mtu(vif_dev, g->family), ft_port_arriving(spec.in));
 
-		if (g->family == AF_INET)
-			arriving = max(arriving, ft_port_arriving(spec.in));
 		if (out_mtu < arriving)
 			return FT_MR_REFUSED_MTU;
 	}

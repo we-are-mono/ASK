@@ -328,6 +328,9 @@ result independently of those temporary files.
 - [x] **A327 — a route change under a full table blocked flowtable readers ~13 s and piled up offload kworkers.** Fixed:
   one barrier per 64-entry batch, and a deletion never waits for the transaction (_:/^cdx: retire flowtable entries in batches_).
 
+- [x] **A330 — IPv6 into a smaller path trusted the advertised MTU, so a host ignoring it lost oversized packets with no Packet Too Big.** Fixed:
+  one MAC-bounded MTU rule for both families, routed multicast included (_:/^flowtable: bound IPv6 by what the port accepts_).
+
 - [ ] **A328 — one UDP reply lost on the IPsec NAT-T return path (`flowtable_service_ipsec_rekey.py::test_ipsec_outbound_natt_rekey_root[cbc]`).**
   Full run 179, 2026-10-06: flow 2 serial 618 got no reply. The WAN peer received the request, so the loss is on the
   inbound leg (WAN encrypt → DUT decrypt → loki). The inbound SA did not change in that window, and loki's X550 showed
@@ -343,6 +346,13 @@ result independently of those temporary files.
   load ~30). Readers and other tables are unaffected, since CDX's transaction is released between batches. An fw4
   reload with a full table pays this. Fix direction: hand the binding's entries to the retirement worker and return,
   once nothing reads `entry->binding` after release.
+
+- [ ] **A331 — lowering an egress device's IPv6 MTU sysctl leaves installed entries at the old path MTU.**
+  `net.ipv6.conf.<egress>.mtu` lowers the route MTU (`rt6_mtu_change()`) with no netdev or FIB event the adapter
+  watches, and a learned unicast PMTU exception is the same. An installed IPv6 direction keeps its larger `rule->mtu`
+  and forwards frames Linux would answer with Packet Too Big. Nothing is fragmented or lost (the device MTU still
+  carries them); it diverges from Linux until the flow ends. Low. Fix direction: retire IPv6 entries egressing a
+  device whose `mtu6` changed, from the existing stats pass or an inet6 notifier.
 
 - [x] **A276 — the data plane wedged twice under a flooded ESP SA.** An HC command
   timed out ("board reset required") because 11aa150's per-SA offline-port classification
@@ -671,7 +681,7 @@ file's git history.
   fixed (_:/^cdx: carry interface packet counts past the firmware's 32 bits_).
 
 - [x] **A200.** Consumers did not advertise a smaller upstream's IPv6 MTU, so LAN-to-WAN IPv6 behind PPPoE or 6in4 stayed in software —
-  documented as the integrating distribution's contract (_:/^docs: state what an integration owes an IPv6 LAN behind a narrower uplink_).
+  superseded by A330: admission no longer reads it; the contract is the uplink MSS clamp (_:/^flowtable: bound IPv6 by what the port accepts_).
 
 - [x] **A192.** VLAN and PPPoE admissions had no allocation-failure coverage —
   covered (_:/^tests: fail the allocations of tagged and session admissions_).

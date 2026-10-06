@@ -1874,20 +1874,40 @@ int main(void)
     ft_mr_plan_put(&plan);
     free(g);
 
-    /* IPv6 is bounded in its own units: the IPv6 MTU on both sides, which is
-     * what the link is told and what ip6_forward()'s Packet Too Big quotes.
-     * The device MTU of the listener is not the test while its IPv6 one is
-     * smaller, and a matching pair is carried whatever the device MTUs. */
+    /* IPv6 is bounded as IPv4 is, by what the parent's port delivers, never
+     * by the IPv6 MTU its link advertises, which a source may ignore. Each
+     * copy is held to its listener's IPv6 MTU, what ip6mr sends against and
+     * what its Packet Too Big quotes. Equal 1500-byte paths are carried; a
+     * listener advertising less is not, and a parent advertising the same
+     * smaller MTU over a 1500-byte port no longer makes up for it. */
     reset();
     g = group6(&MFC6, ip6(0xfc00, 0x99), ip6(0xff1e, 0x05), 0);
     vif_set(AF_INET6, 0, &WAN, 0);
     vif_set(AF_INET6, 1, &LAN, 0);
     oif(g, 1, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);   /* 1500 into 1500 */
+    ft_mr_plan_put(&plan);
     LAN.ip6_mtu = 1280;
     assert(refuse(g) == FT_MR_REFUSED_MTU);
     WAN.ip6_mtu = 1280;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    /* Nor does a parent lowered under the port: 1280 everywhere is still
+     * 1500 in, as for IPv4. */
+    WAN.mtu = LAN.mtu = 1280;
+    WAN.ip6_mtu = LAN.ip6_mtu = 0;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    WAN.mtu = LAN.mtu = 1500;
     assert(derive(g, &plan) == FT_MR_PENDING);
     ft_mr_plan_put(&plan);
+    /* A 1500-byte VLAN parent over a 9000-byte port delivers 9000. */
+    VWAN.mtu = 1500;
+    WAN.mtu = 9000;
+    vif_set(AF_INET6, 0, &VWAN, 0);
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    LAN.mtu = 9000;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    WAN.mtu = LAN.mtu = 1500;
     free(g);
 
     /* Into a bridge, both limits count: the bridge device's, which ip6mr and

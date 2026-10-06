@@ -85,12 +85,6 @@ async def tunnel_service(rig, request):
         previous = (await read(r.target, r.session, '/proc/sys/net/ipv6/conf/all/forwarding')).strip()
         await change(r.target, ['sysctl', '-w', 'net.ipv6.conf.all.forwarding=1'], ['sysctl', '-w', 'net.ipv6.conf.all.forwarding=' + previous])
         if shape.family == 6:
-            # The LAN tells its hosts the tunnel's MTU, without which the
-            # IPv6 direction into the tunnel stays in software (see
-            # test_mtu_bound).
-            key = f'net.ipv6.conf.{TARGET_LAN_IF}.mtu'
-            previous_mtu = (await command(r.target, r.session, 'sysctl', '-n', key))['stdout'].strip()
-            await change(r.target, ['sysctl', '-w', f'{key}={shape.mtu}'], ['sysctl', '-w', f'{key}={previous_mtu}'])
             await change(r.target, ['ip', '-6', 'addr', 'add', gateway + '/64', 'dev', TARGET_LAN_IF, 'nodad'],
                          ['ip', '-6', 'addr', 'del', gateway + '/64', 'dev', TARGET_LAN_IF])
             await lan_change(['ip', '-6', 'addr', 'add', r.tunnel_source + '/64', 'dev', LAN_NIC, 'nodad'],
@@ -170,8 +164,8 @@ def flows_for(r, protocol='tcp'):
         {'id': 5, 'proto': 'udp', 'sport': FIRST + 2, 'lan': r.lan_ip},
         {'id': 6, 'proto': 'udp', 'sport': FIRST + 2, **endpoint},
     ]
-    # A 4o6 UDP upload stays in Linux: the LAN port can deliver a full frame
-    # and the tunnel's path is smaller (see test_flowtable_tunnel).
+    # A UDP upload stays in Linux: the LAN port can deliver a full frame and
+    # the tunnel's path is smaller (see test_flowtable_tunnel).
     for flow in flows[2:]:
         if _upload_refused(r.shape, flow['proto']):
             flow['software'] = (TARGET_LAN_IF,)
@@ -292,7 +286,8 @@ async def test_recreated(tunnel_service):
                 unchanged(initial, after, [0, 1], flows)
             assert after['rearms'] == initial['rearms']
             if selective:
-                assert (after['installs'], after['deletes']) == (before['installs'] + 4, before['deletes'] + 4)
+                moved = len(keys([2, 3], flows))
+                assert (after['installs'], after['deletes']) == (before['installs'] + moved, before['deletes'] + moved)
             else:
                 # Recreating the nexthop can retire controls again. All
                 # displaced directions must balance and re-enter hardware.

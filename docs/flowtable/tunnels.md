@@ -212,15 +212,17 @@ which is the arithmetic the legacy owner's tunnel-interface path in `devman.c`
 already did. The full-MTU case below is the proof: a datagram that exactly fills
 the tunnel MTU is carried in hardware rather than excepted.
 
-A 6o4 egress direction is IPv6 into a path smaller than an ordinary LAN, and
-the microcode would fragment the outer packet of an oversized one where Linux
-sends the inner Packet Too Big. It is admitted only while the LAN's IPv6 MTU
-is no larger than the tunnel's ([ipv6.md](ipv6.md#packets-larger-than-the-path)),
-so the rig sets the LAN's IPv6 MTU to the tunnel's, the configuration a 6in4
-LAN wants anyway. A 4o6 egress direction other than TCP stays in software
-from an Ethernet LAN whatever its MTU, because the microcode's IPv4 fragments
-of a received frame carry no payload
-([architecture.md](architecture.md#native-context-and-admission)).
+An egress direction of either mode other than TCP stays in software from an
+Ethernet LAN, whatever MTU the LAN advertises: the port receives a full frame,
+more than the tunnel carries, and the microcode would fragment the outer packet
+of an oversized one -- for 6o4 with DF clear, since the insert fills that field
+itself -- and its fragments of a received frame carry no payload, so the
+packet would be lost where Linux sends the inner Packet Too Big or ICMP
+([architecture.md](architecture.md#native-context-and-admission),
+[ipv6.md](ipv6.md#packets-larger-than-the-path)). Measured before the bound
+covered IPv6: a 6o4 datagram one byte over the tunnel MTU left the WAN port as
+two outer fragments, the first all zeros past its header, and no Packet Too
+Big came back. TCP is carried both ways, its MSS clamped to the tunnel.
 
 ## Per-tunnel-device counters
 

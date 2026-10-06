@@ -66,8 +66,8 @@ Beyond the IPv4 rules, which all still apply:
 - The route must not be `RTF_REJECT`, `RTF_LOCAL` or `RTF_ANYCAST`, and its
   `dst->error` must be clear.
 - The MTU floor is `IPV6_MIN_MTU` (1280), not 68.
-- A direction's MTU may not be below its ingress interface's IPv6 MTU; see
-  the next section.
+- A direction's MTU may not be below what its ingress port accepts, unless it
+  is TCP; see the next section.
 
 ## Stateless prefix translation
 
@@ -105,34 +105,40 @@ IPv4 alone: the `PREEMPT_DFBIT_HONOR` preemptive check, which excepts an
 oversized IPv4 packet with DF set, and the fragmenter's DF action in the MURAM
 parameter block, set live to don't-fragment.
 
-So an IPv6 direction is admitted only while nothing larger than its MTU is
-expected to arrive: while the IPv6 MTU of the interface it arrives on
-(`net.ipv6.conf.<if>.mtu`, the value its hosts learn from router
-advertisements) is no larger than the direction's own. Where the physical port
-accepts more than the interface's own MTU -- a 1500-byte bridge or VLAN over a
-9000-byte port -- the excess is added, because a host statically configured
-for jumbo frames or ignoring the advertised MTU sends what the port takes; on
-a plain port the MAC already drops anything over the port's MTU, so a lowered
-IPv6 MTU (1492 for PPPoE or 6in4) is trusted as is. A direction refused for
-this stays on the software flowtable path, where the oversized packet reaches
+And for a frame an Ethernet port received, the fragments the microcode builds
+carry an all-zero payload, so an oversized packet is not even fragmented: it
+is lost, with no Packet Too Big to tell its sender.
+
+So the bound is the one IPv4 has, from one function for both families
+(`ft_mtu_carried()`, [architecture.md](architecture.md#native-context-and-admission)):
+a direction is admitted only while nothing larger than its MTU can arrive,
+measured by what its ingress port's MAC accepts -- never less than a full
+Ethernet frame, more on a jumbo port, less any session or tunnel header its
+ingress strips -- and not by the IPv6 MTU its link advertises. An earlier bound
+trusted that advertised value (`net.ipv6.conf.<if>.mtu`), and so lost every
+oversized packet from a host that ignored it. A direction refused for this
+stays on the software flowtable path, where the oversized packet reaches
 `ip6_forward()` and gets its Packet Too Big; the reverse direction is admitted
-on its own. The IPv6 MTU is a sysctl that no device event reports, so every
-stats pass, and every time Linux offers an installed direction again, rechecks
-the bound and retires an installed direction that no longer satisfies it
-(counted as `mtu_invalidations`). The re-offer is what reaches the installed
-half of a partially offloaded flow within a second, since Linux offers such a
-flow again every second its other half forwards in software; the stats pass
-reaches it too, on the statistics period.
+on its own. Device and route MTU changes retire a flow through their own
+events, so admission alone decides.
+
+TCP is exempt, because a PPPoE or tunnel uplink clamps its MSS, so no segment
+is larger than the path; an IPv6 segment over the clamp from a host that
+ignored it would be lost, the one place the exemption trusts the host, where
+IPv4 TCP's DF has the hardware hand it over instead. Unlike IPv4, a direction
+to or from an SA is not: out of SEC the offline port would fragment the
+decrypted IPv6 packet itself, which no router may do.
 
 Equal MTUs everywhere, the ordinary case, are unaffected. A smaller upstream
-is where it shows: IPv6 leaving a 1500-byte LAN by PPPoE (1492) or a 6in4
-tunnel (1480) runs in software in that direction unless the LAN is told the
-smaller MTU, by setting its IPv6 MTU and advertising it. That is the
-configuration such a network wants anyway, since it is also what spares its
-hosts a Packet Too Big round trip on every new path. An SA does not narrow
-the bound: through a transform a flow's MTU is its outer device's, because
-`ip6_dst_mtu_maybe_forward()` ignores the bundle's unlocked `RTAX_MTU`, so an
-IPv6 direction into an SA is admitted as before. Its entry's bound is the SA's
+is where it shows: a UDP upload from a 1500-byte LAN by PPPoE (1492) or a 6in4
+tunnel (1480) runs in software, whatever the LAN advertises, and its download
+and every TCP connection stay in hardware. Advertising the smaller MTU is
+still worth doing -- it spares hosts a Packet Too Big round trip on every new
+path -- but it no longer decides admission. An SA does not narrow the bound:
+through a transform a flow's MTU is its outer device's, because
+`ip6_dst_mtu_maybe_forward()` ignores the bundle's unlocked `RTAX_MTU`, so a
+direction into an SA meets the bound against its outer device, which a
+1500-byte LAN into a 1500-byte WAN does. Its entry's bound is the SA's
 MTU on the path to the peer with the ESP expansion on top, which is that path's
 MTU -- the port's, unless a hop to the peer is narrower -- and nothing excepts
 an IPv6 packet on size. So a packet that fits the port but not the bundle
@@ -145,32 +151,18 @@ fragments and no IPv6 ones, and no Packet Too Big is sent. The inner packet is
 never fragmented, which is what bounding exists to prevent -- a router must not
 fragment IPv6 -- and post-encryption fragmentation is what Linux itself does
 for an IPv4 inner packet without DF, so the direction stays in hardware; the
-microcode's fragments of the SEC output are correct. IPv4 has a bound of its
-own for a different reason: the microcode's fragments of a frame received on
-an Ethernet port carry an all-zero payload, so an IPv4 direction that is
-neither TCP nor to or from an SA is never admitted into a path smaller than
-what its ingress receives
-([architecture.md](architecture.md#native-context-and-admission)).
+microcode's fragments of the SEC output, made on the offline port, are
+correct.
 
 ## The consumer contract
 
-One obligation, and only on a network whose upstream path is narrower than
-its LAN. When the WAN is a PPPoE session (1492) or a 6in4/6rd tunnel (1480),
-the integration that owns the LAN interface sets its IPv6 MTU to the upstream
-path's and advertises that value in its router advertisements:
-
-- `net.ipv6.conf.<lan>.mtu` set to the uplink's IPv6 MTU, which is what the
-  admission bound above compares against;
-- the RA MTU option carrying the same value (odhcpd `ra_mtu`, radvd
-  `AdvLinkMTU`, systemd-networkd `[IPv6SendRA] ... LinkMTU` equivalents), so
-  hosts send packets that fit and never need the Packet Too Big round trip.
-
-Without it nothing breaks: the LAN-to-WAN IPv6 direction stays on the software
-flowtable path and every oversized packet still gets its Packet Too Big from
-`ip6_forward()`. Only that direction's acceleration is lost. Deriving the value
-from the uplink belongs to the integration that configures the uplink, since
-only it knows when a PPPoE session or tunnel comes up and at what MTU. ASK
-itself configures neither interface.
+One obligation, on a network whose upstream is narrower than its LAN: clamp
+TCP's MSS on the uplink (OpenWrt's `mtu_fix` on the WAN zone, on by default).
+An IPv6 TCP direction into the narrower path rests on that clamp alone, with
+no DF for the hardware to hand an oversized segment over by. The integration
+may also advertise the upstream's IPv6 MTU (odhcpd `ra_mtu`, radvd
+`AdvLinkMTU`), which spares its hosts a Packet Too Big round trip, but
+admission does not read it.
 
 ## Translation
 
@@ -232,15 +224,14 @@ change retires the connection and lets it come back describing the new path:
 each direction carries the MTU of the interface *it* leaves by, and one
 connection is one retirement because both directions share an invalidation
 handle. Both ports raised to 9000 bring both directions back at 9000 in
-hardware. The WAN port reduced to 1400 together with the LAN's IPv6 MTU, as
-an operator would, brings back only the LAN-to-WAN direction: a port never
-receives less than a full Ethernet frame, so the WAN still delivers 1500
-bytes into the 1400-byte LAN path and that direction stays with Linux.
-`flowtable_ipv6.py::test_mtu_bound` proves the bound itself: with the WAN route
-locked to 1280 and the LAN's IPv6 MTU at 1280, only the LAN-to-WAN direction
-is admitted; raising the LAN to 1500 retires it on the next stats pass or
-re-offer and the
-flow comes back with only the WAN-to-LAN direction in hardware; a 1448-byte
+hardware. The WAN port reduced to 1400 brings back only the WAN-to-LAN
+direction: a port never receives less than a full Ethernet frame, so the LAN
+still delivers 1500 bytes into the 1400-byte WAN path and that direction stays
+with Linux. `flowtable_ipv6.py::test_mtu_bound` proves the bound itself: with
+the WAN route locked to 1280 and the LAN's IPv6 MTU at 1280, neither direction
+is admitted -- the LAN-to-WAN one because the port still takes a full frame
+from a host that ignores the advertised MTU; with the LAN back at 1500 only
+the WAN-to-LAN direction is in hardware; a 1448-byte
 datagram then gets Packet Too Big with MTU 1280 and the microcode's IPv6
 fragment counter does not move. `flowtable_ipv6.py::test_same_tuple_exceptions`
 sends a hop limit of 1, hop-by-hop options, destination options, a chain of

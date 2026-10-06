@@ -18,13 +18,13 @@ one port is forwarded from the WAN side into a LAN client. Five features, one
 bridge, one physical port on each side.
 
 One behaviour of the shipping configuration shapes every traffic case: a
-subscriber's IPv4 UDP upload into the session stays in Linux. The LAN port can
-deliver a full 1500-byte frame whatever MTU it is given and the session carries
-1492, so the microcode would have to fragment it -- and its fragments of a frame
-an Ethernet port received carry no payload. The download still crosses in
-hardware, and so does all of TCP, which sets DF. So each case proves the UDP
-download and the refusal of its upload, and proves the upload itself on a TCP
-connection.
+subscriber's UDP upload into the session stays in Linux, IPv4 or IPv6. The LAN
+port can deliver a full 1500-byte frame whatever MTU it is given or advertises
+and the session carries 1492, so the microcode would have to fragment it -- and
+its fragments of a frame an Ethernet port received carry no payload. The
+download still crosses in hardware, and so does all of TCP, its MSS clamped to
+the session. So each case proves the UDP download and the refusal of its
+upload, and proves the upload itself on a TCP connection.
 
 Two disciplines every case here keeps, because a profile test is exactly where
 they are easiest to lose:
@@ -236,17 +236,16 @@ def _directions(flows, source, sport, peer, dport, upload=True):
 def _upload_in_linux(peer):
     """Whether a UDP connection's LAN-to-WAN direction stays in Linux.
 
-    An IPv4 one arrives on the LAN port, which can deliver a full 1500-byte
-    frame whatever MTU the port is given -- and many hosts ignore the MTU a
-    DHCP server offers -- and leaves into the session's 1492. The
-    microcode would have to fragment it, and its fragments of a frame an
-    Ethernet port received carry no payload, so the adapter leaves that
-    direction to Linux: this is what a subscriber's UDP upload does on this
-    profile, and the download still crosses in hardware. An IPv6 upload is
-    bounded by the MTU the subscriber VLAN advertises instead, and a TCP one
-    carries DF, so both of those stay in hardware; TCP is how every property
-    of the IPv4 upload is proved here."""
-    return ":" not in peer
+    It always does here. It arrives on the LAN port, which can deliver a full
+    1500-byte frame whatever MTU the port is given -- and a host may ignore
+    the MTU a DHCP server offers or a router advertisement carries -- and
+    leaves into the session's 1492. The microcode would have to fragment it,
+    and its fragments of a frame an Ethernet port received carry no payload,
+    so the adapter leaves that direction to Linux, which fragments IPv4 and
+    answers IPv6 with Packet Too Big. The download still crosses in hardware,
+    and so does a TCP upload, its MSS clamped to the session; TCP is how every
+    property of the upload is proved here."""
+    return True
 
 
 def _bracketed(address):
@@ -977,11 +976,11 @@ async def _session_ipv6(ctx, cleanup):
     async def dut(*argv, check=True):
         return await command(ctx.target, ctx.session, *argv, check=check)
 
-    # The subscriber VLAN tells its hosts the session's MTU, as a PPPoE LAN has
-    # to for its IPv6 upload to be offloaded: the microcode would fragment a
-    # larger packet instead of letting Linux send Packet Too Big (see
-    # test_mtu_bound). The VLAN is this fixture's and goes
-    # with it, so nothing is restored.
+    # The subscriber VLAN tells its hosts the session's MTU, as a PPPoE LAN
+    # should, sparing them a Packet Too Big round trip. Admission does not
+    # read it (see test_mtu_bound), so the IPv6 UDP upload stays in Linux all
+    # the same. The VLAN is this fixture's and goes with it, so nothing is
+    # restored.
     subscriber_mtu = f"/proc/sys/net/ipv6/conf/{BRIDGE}.{LAN_VID}/mtu"
     assert (await ctx.target.fs_write(ctx.session, subscriber_mtu,
                                       str(SESSION_MTU)))["errno"] == 0
@@ -1311,23 +1310,27 @@ async def test_ipv6_rides_the_session_natively(isp, splat_window):
     """IPv6 through the session, untranslated, from a bridged subscriber VLAN.
 
     The v4 half of this profile is translated and the v6 half is not, which is
-    what a dual-stack line is. Both cross the same session, so a complete
-    exchange here also says the microcode chose the right PPP protocol id for an
-    IPv6 frame: a wrong choice is a header the concentrator discards, which is
-    silent loss rather than a refusal.
+    what a dual-stack line is. Both cross the same session, so a complete TCP
+    transfer here also says the microcode chose the right PPP protocol id for
+    an IPv6 frame it inserted the header onto: a wrong choice is a header the
+    concentrator discards, which is silent loss rather than a refusal. The UDP
+    upload is Linux's (see _upload_in_linux), so UDP proves the download.
     """
     ctx = isp
-    forward, reverse = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL6,
-                                        dport=PORT_V6, sport=PORT_V6, label="ipv6")
+    _, download = await _accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL6,
+                                   dport=PORT_V6, sport=PORT_V6, label="ipv6")
+    _assert_session(ctx, None, download)
+    assert download["family"] == "6" and download["out_br"] == ctx.bridge_text[LAN_VID], download
+    # What the far end observed: the download's replies answered every
+    # datagram Linux sent up the session.
+    assert ctx.echoes[PORT_V6].sources == {(LAN_CLIENT6, PORT_V6)}, \
+        ctx.echoes[PORT_V6].sources
+    forward, reverse = await _tcp_accounted(ctx, BY_NAME["main"], peer=INNER_LOCAL6,
+                                            dport=PORT_V6, label="ipv6-tcp")
     _assert_session(ctx, forward, reverse)
     assert forward["family"] == reverse["family"] == "6", (forward, reverse)
     assert forward["in_br"] == ctx.bridge_text[LAN_VID], forward
     assert int(forward["mtu"]) == SESSION_MTU, forward
-    # What the far end observed, which is where the protocol id was decided: the
-    # concentrator's stack had to parse the PPP frame before a datagram could
-    # reach a socket at all.
-    assert ctx.echoes[PORT_V6].sources == {(LAN_CLIENT6, PORT_V6)}, \
-        ctx.echoes[PORT_V6].sources
 
 
 async def test_iptv_is_replicated_by_the_hardware(isp, splat_window):

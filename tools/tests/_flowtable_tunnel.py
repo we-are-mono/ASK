@@ -55,12 +55,12 @@ TTL, CHANGED_TTL = 64, 33
 def _upload_refused(shape, proto="udp"):
     """Whether the adapter leaves the LAN-to-tunnel direction to Linux.
 
-    A non-TCP IPv4 direction is installed only where its path carries the
-    largest packet its ingress port can deliver; into a tunnel smaller than a
-    full frame, the microcode would fragment it, and its fragments of a frame
-    an Ethernet port received are zero-filled. TCP sets DF and is exempt, and
-    an IPv6 direction is bounded by the LAN's advertised MTU instead."""
-    return shape.family == 4 and proto != "tcp" and shape.mtu < FULL_FRAME
+    A non-TCP direction is installed only where its path carries the largest
+    packet its ingress port can deliver; into a tunnel smaller than a full
+    frame, the microcode would fragment it, and its fragments of a frame an
+    Ethernet port received are zero-filled. TCP is exempt: the uplink clamps
+    its MSS."""
+    return proto != "tcp" and shape.mtu < FULL_FRAME
 
 
 class TunnelRig(Rig):
@@ -331,10 +331,11 @@ def _assert_outer(r, packets, count, ttl=TTL):
     a limitation the legacy owner also had, so requiring its absence is what
     catches a future microcode that starts honouring the template.
 
-    A 4o6 UDP upload is Linux's by design, so its outer packets are the
-    kernel's own: ip6tnl adds a tunnel encapsulation limit option the insert
-    opcode never builds, and for those the endpoints, the hop limit and the
-    routed inner packet are what the two have in common."""
+    A UDP upload is Linux's by design, so its outer packets are the kernel's
+    own: sit sets DF, the tunnel being pmtudisc, and ip6tnl adds a tunnel
+    encapsulation limit option the insert opcode never builds; for those the
+    endpoints, the hop limit and the routed inner packet are what the two have
+    in common."""
     from scapy.all import IP, TCP, UDP, IPv6
     shape = r.shape
     outer = [p for p in packets if (IP in p if shape.outer_family == 4 else IPv6 in p)]
@@ -342,9 +343,10 @@ def _assert_outer(r, packets, count, ttl=TTL):
     for p in outer:
         if shape.outer_family == 4:
             o = p[IP]
+            linux = _upload_refused(shape, "tcp" if TCP in o else "udp")
             assert (o.src, o.dst, o.proto) == (shape.outer[0], shape.outer[1], 41), p.summary()
             assert o.ttl == ttl, (o.ttl, ttl)
-            assert not o.flags.DF and o.frag == 0, p.summary()
+            assert bool(o.flags.DF) == linux and o.frag == 0, p.summary()
             assert o.ihl == 5 and o.version == 4, p.summary()
             raw = bytes(o)[:20]
             assert IP(raw).chksum == o.chksum and _ip_checksum(raw) == 0, "outer checksum"
@@ -652,15 +654,6 @@ async def tunnel_rig(target_agent, aiohttp_session, lan, splat_window, request):
             previous = (await command(r.target, r.session, "sysctl", "-n", key))["stdout"].strip()
             cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))
             await command(r.target, r.session, "sysctl", "-w", f"{key}=1")
-        if r.shape.family == 6:
-            # An IPv6 direction into a smaller path is only offloaded while
-            # the LAN tells its hosts that path's MTU: the microcode would
-            # fragment anything larger instead of letting Linux send its
-            # Packet Too Big. This is the configuration a 6in4 LAN needs.
-            key = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
-            previous = (await command(r.target, r.session, "sysctl", "-n", key))["stdout"].strip()
-            cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))
-            await command(r.target, r.session, "sysctl", "-w", f"{key}={r.shape.mtu}")
         await _lan_side(r, cleanup, lan_cleanup)
         await _outer_segment(r, cleanup)
         await _dut_tunnel(r, cleanup)

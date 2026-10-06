@@ -240,7 +240,7 @@ async def test_delete_retires(tunnel_rig):
     flow is judged against whatever tunnel exists then."""
     r = tunnel_rig
     flows, _ = await _established(r)
-    assert len(flows) == 2
+    assert len(flows) == _expected(r), flows
     before = await r.state()
     await command(r.target, r.session, "ip", "link", "del", r.shape.device)
     retired = await r.wait(lambda s: s["entries"] == 0)
