@@ -242,9 +242,13 @@ result independently of those temporary files.
   frozen; no kernel warning; `/proc/cdx_flowtable` not fatal or quarantined. So the stall is
   below the BMI (mEMAC/PCS/SerDes) or in the FMan core, on both ports at once; I2C still answered.
   Not reproduced since: capacity alone on a fresh boot, then the same 34-test sequence on that
-  boot, both passed (2 occurrences in 5 known runs). Next: loop the capacity test on one boot,
-  reading each 10G port's `fmbm_rfrc` and orchestrator ARP after every pass, and on a wedge read
-  the mEMAC registers (`/sys/class/net/ethN/mac_regs`) before anything else. **Never** run
+  boot, both passed (2 occurrences in 5 known runs). After A327 cut the drain's per-delete
+  host-command syncs (~33k) to one per 64 deletes, the capacity test passed 10/10 on one boot
+  (2026-10-06), with LAN→WAN pings and both 10G ports' `fmbm_rfrc` advancing after every pass.
+  HC-sync pressure stalling the FMan fits, but is unproven, and the mixed same-boot sequence of
+  both sightings was not repeated. **Not a 1.1.0 blocker:** the pre-release full suite decides,
+  and closes it if clean. On a wedge, read the mEMAC registers
+  (`/sys/class/net/ethN/mac_regs`) before anything else. **Never** run
   `ethtool` or QMan debugfs queries (`query_fq_np_fields`) on a wedged board: the first
   hard-locks a CPU under RTNL, the second pinned a CPU with no reply here. Recover with
   serial-break sysrq `s`, `b`.
