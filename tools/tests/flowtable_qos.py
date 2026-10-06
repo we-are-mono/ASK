@@ -210,9 +210,14 @@ async def test_weighted_leaf_outranks_unclassified_traffic(qos):
                   inbound(r, "tcp", PORT_WEIGHTED_BULK, r.mark(WEIGHTED_CQ)))
     await lan_start(r, iperf=[PORT_WEIGHTED, PORT_WEIGHTED_BULK])
     weighted_mbit = CAP_MBIT // 2
-    clients = [asyncio.create_task(iperf(r, PORT_WEIGHTED, udp_mbit=weighted_mbit)),
-               asyncio.create_task(iperf(r, PORT_WEIGHTED_BULK, udp_mbit=OFFERED_MBIT))]
+    # The bulk starts once the weighted flow is in hardware: until its own
+    # entry is installed, three times the cap lands in the CPU's receive queue,
+    # and a handshake arriving in that millisecond is dropped with it.
+    clients = [asyncio.create_task(iperf(r, PORT_WEIGHTED, udp_mbit=weighted_mbit))]
     try:
+        await r.wait(lambda s: directions(s, ingress=TARGET_WAN_IF, proto=17,
+                                          dst=f"{r.lan_ip}:{PORT_WEIGHTED}"), timeout=10)
+        clients.append(asyncio.create_task(iperf(r, PORT_WEIGHTED_BULK, udp_mbit=OFFERED_MBIT)))
         await asyncio.sleep(SETTLE)
         first = await egress(r, dev)
         state = await r.state()
