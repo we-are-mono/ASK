@@ -224,10 +224,13 @@ assert result.returncode == 0
                 assert received["bits_per_second"] >= minimum, received
                 if bidirectional:
                     # The forward data and the reverse ACKs share the WAN
-                    # port, and both directions' tail drops land somewhere;
-                    # 6.9-8.0 Gbit/s was measured over the floor.
+                    # port, and both directions' tail drops land somewhere.
+                    # Eleven runs measured 5.5-7.9 Gbit/s (mean 6.9), the
+                    # low end with the hosts' senders, not the DUT, short
+                    # of work; the unbounded queue this guards against
+                    # (A313) gave 1.3-2.2.
                     reverse_result = client_json["end"]["sum_received_bidir_reverse"]
-                    assert reverse_result["bits_per_second"] >= 6e9, reverse_result
+                    assert reverse_result["bits_per_second"] >= 5e9, reverse_result
         finally:
             try:
                 if lan_task:
