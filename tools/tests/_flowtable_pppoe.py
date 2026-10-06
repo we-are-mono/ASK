@@ -238,6 +238,58 @@ def _server_clear(server):
             deadline = time.monotonic() + 5
             while pathlib.Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
                 time.sleep(0.1)
+    _sessions_clear()
+
+
+def _running(pid):
+    """Alive and not a zombie: a session pppd whose server has not reaped it
+    yet has already exited."""
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def _session_pids():
+    """The concentrator's per-session pppd processes on SERVER_IF, by the
+    argv pppoe-server execs them with: argv[0] is a bare "pppd", then the
+    plugin and the interface it serves."""
+    pids = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = [a.decode(errors="replace")
+                    for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
+        except OSError:
+            continue
+        if (argv and os.path.basename(argv[0]) == "pppd" and argv[1:2] == ["plugin"]
+                and f"nic-{SERVER_IF}" in argv and _running(int(entry.name))):
+            pids.append(int(entry.name))
+    return pids
+
+
+def _sessions_clear():
+    """Wait out the session pppds a stopped concentrator leaves behind.
+
+    pppoe-server signals them on its way out but does not wait. One still
+    exiting holds its session's kernel socket, so a new server that hands the
+    DUT the same session id fails to connect its own (EALREADY), and the
+    PADT the old one sends on exit then hangs up the DUT's new session."""
+    pids = _session_pids()
+    for sig, wait in ((15, 5), (9, 5)):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + wait
+        while (pids := [p for p in pids if _running(p)]) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not pids:
+            return
+    raise AssertionError(f"session pppd {pids} outlived SIGKILL")
 
 
 def _server_stop(proc):
@@ -249,6 +301,7 @@ def _server_stop(proc):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+    _sessions_clear()
     for path in (SERVER_OPTS, SERVER_SECRETS):
         try:
             os.unlink(path)
