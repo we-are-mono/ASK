@@ -1073,6 +1073,9 @@ file's git history.
 
 ## Corrections to the original review (wontfix / not-a-bug)
 
+- [-] **A326 (wontfix, toolchain).** KASAN images trip `buildpaths` QA: GCC's ASan global metadata (`asan_add_global()`)
+  stores raw header paths, ignoring `-f*-prefix-map` (GCC 14.3 and 15.2); test-image only, and GCC stays unpatched.
+
 - [-] **A142 (wontfix, CMM retirement).** Interface-statistics offsets truncating
   past record 121 — reachable only through CMM's interface registration, now retired (this commit).
 

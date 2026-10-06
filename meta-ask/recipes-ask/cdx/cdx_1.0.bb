@@ -34,15 +34,10 @@ EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX
 EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL=1 -DCDX_DEBUG_DPA_INIT=1 -DCDX_DEBUG_FLOWTABLE=1 -DCDX_DEBUG_SPLIT_KEY_FAIL=1'"
 
 # Silence the [buildpaths] QA warning on the split kernel-module sub-package.
-# cdx.ko embeds a handful of TMPDIR-prefixed header paths in its .rodata
-# (rcupdate.h, dma-mapping.h, caam/regs.h) from __FILE__ macro expansions
-# inside static-inline kernel helpers that cdx calls. We tried both
-# `-fmacro-prefix-map` and `-ffile-prefix-map` via KCFLAGS with the canonical
-# source paths, and verified the flags reach every gcc invocation — but
-# those specific __FILE__ sites still leak through. Kernel's own in-tree
-# modules (cfg80211.ko etc.) have the identical leak but aren't packaged as
-# separate Yocto sub-packages so QA doesn't run on them. Paths are
-# cosmetic (dmesg output gets full paths; no runtime or ABI impact).
+# Under KASAN, cdx.ko embeds TMPDIR-prefixed header paths in its .rodata:
+# GCC's ASan global metadata records each instrumented global's source file
+# raw, and no -f*-prefix-map reaches it (ISSUES.md A326). The paths only
+# appear in KASAN reports; no runtime or ABI impact.
 #
 # Package name format comes from kernel-module-split.bbclass:
 #   ${KERNEL_MODULE_PACKAGE_PREFIX}${kernel_pkg}-module-<name>${SUFFIX}
