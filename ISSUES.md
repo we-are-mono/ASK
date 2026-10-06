@@ -328,8 +328,10 @@ result independently of those temporary files.
   Full run 179, 2026-10-06: flow 2 serial 618 got no reply. The WAN peer received the request, so the loss is on the
   inbound leg (WAN encrypt → DUT decrypt → loki). The inbound SA did not change in that window, and loki's X550 showed
   `rx_crc_errors` 0 over 841 M frames, so it is neither the SA switch nor the LAN-medium loss of
-  `docs/flowtable/udp-loss-investigation.md`. 10/10 scoped reruns passed. The peer harness now records DUT
-  `/proc/net/xfrm_stat` at start and the LAN NIC's error counters on failure. Next occurrence: diff those to place the drop.
+  `docs/flowtable/udp-loss-investigation.md`. 10/10 scoped reruns passed. A corrupted frame on the WAN cable is not
+  ruled out: the DUT rebooted before its `eth4` receive counters were read. The peer harness now records DUT
+  `/proc/net/xfrm_stat` at start, and on failure both DUT ports' and the LAN NIC's receive errors. Next occurrence:
+  diff those to place the drop.
 
 - [ ] **A329 — detaching a full table holds Netfilter's `flow_block_lock` while the binding's entries are retired.**
   `nf_flow_table_block_setup()` calls `ft_release()` with the lock held for write. Retiring 32,768 entries takes 5.9 s

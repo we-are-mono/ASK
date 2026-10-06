@@ -330,6 +330,15 @@ for suffix in ('.py', '.pid', '.log', '.sock'):
                             ident, serial = struct.unpack("!IQ", data[:12])
                             seen.setdefault(ident, []).append(serial)
                     dut = {"/proc/net/xfrm_stat at start": xfrm_before}
+                    # A frame corrupted on either cable is counted only by the
+                    # receiving end: the DUT's ports for what arrives there.
+                    for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+                        for counter in ("rx_crc_errors", "rx_errors", "rx_missed_errors"):
+                            path = f"/sys/class/net/{dev}/statistics/{counter}"
+                            try:
+                                dut[path] = (await read(r.target, r.session, path)).strip()
+                            except Exception as error:
+                                dut[path] = repr(error)
                     for path in ("/proc/net/xfrm_stat", "/proc/cdx_flowtable"):
                         try:
                             dut[path] = await read(r.target, r.session, path)
