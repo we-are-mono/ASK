@@ -69,6 +69,44 @@ def test_corruption_and_lost_final_ack_do_not_repeat_an_operation():
         right.close()
 
 
+def test_a_peer_stalled_for_several_retransmits_still_gets_the_message():
+    """A peer that stops acknowledging for a while is retransmitted to, not
+    given up on: a full-table route drain stalls the DUT's agent for ~14 s
+    (ISSUES.md A327), and a sender that gave up there took the agent, and
+    every test after it, down with it. Ten retransmit intervals here."""
+    left, right = socket.socketpair()
+    for sock in (left, right):
+        sock.settimeout(0.05)
+
+    def read(sock):
+        try:
+            data = sock.recv(4096)
+        except TimeoutError:
+            return b""
+        if not data:
+            raise EOFError
+        return data
+
+    stalled_until = time.monotonic() + 1.0
+
+    def acknowledge(data):
+        if b" a " in data and time.monotonic() < stalled_until:
+            return
+        right.sendall(data)
+
+    sender = Channel(lambda: read(left), left.sendall, ack_timeout=0.1)
+    receiver = Channel(lambda: read(right), acknowledge, ack_timeout=0.1)
+    try:
+        sender.send(1, {"operation": "wait"})
+        assert receiver.receive(timeout=1) == (1, {"operation": "wait"})
+        assert time.monotonic() >= stalled_until
+    finally:
+        sender.close()
+        receiver.close()
+        left.close()
+        right.close()
+
+
 @contextmanager
 def uart_process():
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}

@@ -36,7 +36,11 @@ class Channel:
     protocol, including corruption and lost acknowledgements, on the host.
     """
 
-    def __init__(self, read, write, *, ack_timeout=2, attempts=4):
+    # Thirty seconds of retransmits before a peer is given up on: a full-table
+    # route drain stalls the DUT's agent for ~14 s (ISSUES.md A327), and a
+    # sender that gives up there takes the session, and every test after it,
+    # down with it. Retransmitting is safe; the receiver drops duplicates.
+    def __init__(self, read, write, *, ack_timeout=2, attempts=15):
         self.read, self.write = read, write
         self.ack_timeout, self.attempts = ack_timeout, attempts
         self.incoming = queue.Queue()

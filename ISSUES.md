@@ -326,8 +326,9 @@ result independently of those temporary files.
   ~13 s while retirement holds the backend transaction. With the UDP conntracks kept alive through the drain
   (`nf_conntrack_udp_timeout_stream` raised above `nf_flowtable_udp_timeout`), ~250 `nf_ft_offload` kworkers also pile
   up in D state (load average 3 → 40), and the DUT's stdio agent missed host acks for over 8 s twice running, so the
-  agent exited. The stock suite expires those conntracks at the drain and does not hit it, but a production table of
-  live flows would. Next: time the retirement walk per entry, and bound or batch the re-offers the drain triggers.
+  agent exited. The stock suite hits it too, less often (full run 183, 2026-10-06), so the serial channel now retries
+  for 30 s instead of 8 s. A production table of live flows would hit it as well. Next: time the retirement walk per
+  entry, and bound or batch the re-offers the drain triggers.
 
 - [x] **A276 — the data plane wedged twice under a flooded ESP SA.** An HC command
   timed out ("board reset required") because 11aa150's per-SA offline-port classification
