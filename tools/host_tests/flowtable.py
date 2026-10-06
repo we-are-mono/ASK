@@ -34,6 +34,8 @@ def test_decoder_and_lifecycle(tmp_path):
         # The framing a VLAN device's record is published with, as the
         # adapter defines it: the cases below assert the published values.
         + "\n".join(re.findall(r"^#define FT_(?:VLAN|PPP)_[RT]X_OVERHEAD\s.*$", source, re.M)) + "\n"
+        # The retirement bound, as defined: the cases below count batches by it.
+        + re.search(r"^#define FT_RETIRE_BATCH\s.*$", source, re.M).group() + "\n"
     )
     names = ["ft_fault", "ft_devices_hold", "ft_devices_put", "ft_rule_names", "ft_crossed_hold", "ft_crossed_hold_all", "ft_crossed_put_all",
              "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
@@ -45,19 +47,27 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_dev_stats_get", "ft_dev_stats_put", "ft_dev_stats_gone",
              "ft_dev_stats_reap", "ft_dev_stats_drop_all", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",
-             "ft_l2_overhead", "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
+             "ft_l2_overhead", "ft_unlink", "ft_settle", "ft_remove",
+             "ft_destroy_defer", "ft_retire_deferred", "ft_deferred_destroys_drop", "ft_retire_batch",
+             "ft_handle_retired", "ft_retire_workfn", "ft_settle_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
              "ft_vlan_lower", "ft_bridge_vlan", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_port_arriving", "ft_rule_stripped", "ft_ipv6_mtu_bounded", "ft_ipv4_arriving", "ft_ipv4_mtu_carried", "ft_mtu_refused", "ft_bridge_egress_filtered", "ft_tunnel_inbound_allowed", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_targets", "ft_software_reoffers", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
              "ft_invalid_complete", "ft_drained", "ft_can_rearm", "ft_rearm", "ft_rearm_workfn",
-             "ft_release",
+             "ft_bound_to", "ft_release",
              "ft_bind_admissible", "ft_passive_callback", "ft_bind_passive",
              "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
-             "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire",
+             "ft_any_entry", "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire",
              "ft_port_stopped", "ft_stopped_clean", "ft_stopped_workfn", "ft_netdev_event",
              "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_egress_drain", "ft_egress_restarted", "ft_block_drain", "ft_hw_settle", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit", "ft_position", "ft_start", "ft_next", "ft_stop"]
     (tmp_path / "flowtable_production.inc").write_text(
         # The stopped-port sweep's queue, lock and work item, as declared.
         source[source.index("struct ft_stopped {"):source.index("static void ft_port_stopped(")]
+        # Whether the retirement worker has to walk the table, and the record
+        # a deletion that found the transaction held leaves it instead, with
+        # the list they wait on, as declared.
+        + re.search(r"^static atomic_t ft_retire_scan\b.*$", source, re.M).group() + "\n"
+        + source[source.index("struct ft_deferred_destroy {"):
+                 source.index("\n", source.index("static LLIST_HEAD(ft_deferred_destroys);")) + 1]
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"
     run_process([

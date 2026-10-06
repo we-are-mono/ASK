@@ -360,6 +360,8 @@ struct cdx_ft_stats_binding {
  * Atomic notifiers must use adapter-owned spinlocks and defer backend work.
  */
 void cdx_ft_begin(void);
+/* cdx_ft_begin() if the transaction is free now: true when it was taken. */
+bool cdx_ft_trybegin(void);
 void cdx_ft_end(void);
 void cdx_ft_assert_held(void);
 
@@ -511,6 +513,22 @@ void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
  * adapter to stop admission and start global recovery.
  */
 int cdx_ft_del(struct cdx_ft_hw **hw);
+/* cdx_ft_del() with its barrier left to cdx_ft_settle(), so retiring many keys
+ * costs one host-command round trip rather than one each. Always consumes
+ * *hw. 0: unlinked, its storage retained until a barrier proves it unreachable
+ * -- counted by cdx_ft_pending() and cdx_ft_owed() until then. -EIO as for
+ * cdx_ft_del(). The adapter settles what it unlinked before anything outside
+ * the transaction can need it proven, and escalates a failed settle as it
+ * would a failed delete.
+ */
+int cdx_ft_unlink(struct cdx_ft_hw **hw);
+/* Unlinks cdx_ft_unlink() has left owed and no settle has failed. */
+unsigned int cdx_ft_owed(void);
+/* One barrier for every owed unlink. 0: nothing owed any more. -EAGAIN: it
+ * failed, and *unproven owed unlinks are unproven retirements now, exactly as
+ * a delete returning -EAGAIN leaves one.
+ */
+int cdx_ft_settle(unsigned int *unproven);
 /* Retry retired storage; after a failure, first make sure the datapath is
  * stopped. -EAGAIN means retry later. Success never clears the failure: the
  * restart that does is CDX's own, and is reported through the egress ops'

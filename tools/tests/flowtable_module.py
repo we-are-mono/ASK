@@ -64,9 +64,11 @@ async def test_lifecycle(connections):
                 label = "module-barrier" if barrier else "module-healthy"
                 before = await r.state()
                 if barrier:
-                    # This hook fails DeleteKey's barrier only; recovery syncs
-                    # are real. Fail each of the four directional deletions.
-                    reply = await r.target.fs_write(r.session, "/proc/fm_ehash_hcsync_fail", "4")
+                    # This hook fails a deletion's barrier only; recovery
+                    # syncs are real. The unload retires the four directional
+                    # deletions in batches, each behind one barrier: fail the
+                    # first, which leaves its batch for unload's recovery.
+                    reply = await r.target.fs_write(r.session, "/proc/fm_ehash_hcsync_fail", "1")
                     assert reply["errno"] == 0, reply
                 await p.rpc("start", ids, count=0, interval=0.01)
                 await console_command(con, "rmmod", "ask_flowtable", timeout=25)

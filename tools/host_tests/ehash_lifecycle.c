@@ -66,6 +66,18 @@ static void FmPcdManipUpdateOwner(void *p, bool add) { assert(!p); }
 static void FrmReplicGroupUpdateOwner(void *p, bool add) { assert(!p); }
 static void FmPcdReleaseLock(void *p, void *lock) { assert(!lock); }
 static void DeleteTree(t_FmPcdCcTree *tree, t_FmPcd *pcd) { release((void *)tree->ccTreeBaseAddr); release(tree); }
+/* The parked nodes a table's deletion detaches from it, so a barrier proving
+ * them later does not refill a spare that is gone; what it does to them is
+ * ehash_cumulative.c's. Here: that teardown asks, once, while the table is
+ * still whole. */
+static struct en_exthash_info *unparked;
+static unsigned unparks;
+static void ehash_unpark_table(struct en_exthash_info *info)
+{
+    assert(info && info->table_base && info->spare);
+    unparked = info;
+    unparks++;
+}
 #include "ehash_production.inc"
 
 /* A table as its creation leaves it, down to the spare cumulative node a
@@ -355,7 +367,10 @@ int main(void)
         ((struct en_exthash_bucket *)t->table_base)[1].h = 123;
         assert(FM_PCD_HashTableDelete(t) == E_BUSY);
         ((struct en_exthash_bucket *)t->table_base)[1].h = 0;
+        /* Every refusal above left its parked nodes alone. */
+        assert(unparks == cycle);
         assert(FM_PCD_HashTableDelete(t) == E_OK);
+        assert(unparks == cycle + 1 && unparked == t);
         assert(!allocations);
     }
     /* Failed creation must release the same partially allocated resources. */

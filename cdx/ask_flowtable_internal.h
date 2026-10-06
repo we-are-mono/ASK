@@ -205,6 +205,10 @@ struct cdx_ft_entry {
  */
 #define CDX_FT_MAX_ENTRIES 32768U
 #define CDX_FT_HASH_BITS 14
+/* The most entries one transaction retires, and the most unlinks one barrier
+ * settles: a full table goes in batches that each hold the transaction for
+ * milliseconds, not one walk that held it for 13 seconds (A327). */
+#define FT_RETIRE_BATCH 64U
 
 /* What an MFC entry routed through a bridge contributes to the bridged group
  * carrying its stream.
@@ -734,6 +738,7 @@ extern atomic64_t ft_fdb_invalidations;
 extern atomic64_t ft_stp_invalidations;
 extern atomic64_t ft_qos_invalidations;
 extern atomic64_t ft_admission_invalidations;
+extern atomic64_t ft_destroy_deferrals;
 extern atomic64_t ft_ipsec_invalidations;
 extern atomic64_t ft_ipsec_genid;
 extern atomic64_t ft_ipsec_policy_invalidations;
@@ -747,6 +752,7 @@ extern int ft_done_seq;
 extern struct proc_dir_entry *ft_proc;
 extern struct delayed_work ft_work;
 extern struct work_struct ft_retire_work;
+extern struct work_struct ft_settle_work;
 extern struct delayed_work ft_rearm_work;
 extern struct work_struct ft_dev_stats_work;
 void ft_invalidate(void);
@@ -756,7 +762,12 @@ void ft_neigh_invalidate(struct cdx_ft_entry *entry);
 bool ft_rule_names(const struct cdx_ft_rule *rule, const struct net_device *dev);
 void ft_dev_stats_gone(const struct net_device *dev);
 void ft_dev_stats_drop_all(void);
+void ft_deferred_destroys_drop(void);
+int ft_unlink(struct cdx_ft_entry *entry);
+int ft_settle(void);
 int ft_remove(struct cdx_ft_entry *entry);
+bool ft_retire_batch(bool (*match)(const struct cdx_ft_entry *entry, const void *arg),
+		     const void *arg);
 struct net_device *ft_vlan_lower(struct net_device *dev);
 int ft_bridge_vlan(struct net_device *bridge, struct net_device *port,
 		   struct cdx_ft_vlan *stack, unsigned int *count);

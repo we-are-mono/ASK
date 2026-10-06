@@ -180,15 +180,24 @@ void ft_wifi_device_gone(struct net_device *dev)
  * an entry still pending, or when nf_flow_table_cleanup() cannot allocate.
  * Returns false while a deletion awaits the datapath's proof, when the slot
  * must stay. Caller holds the transaction and RTNL. */
+static bool ft_wifi_uses(const struct cdx_ft_entry *entry, const void *dev)
+{
+	return ft_entry_uses(entry, dev);
+}
+
 static bool ft_wifi_vap_drained(const struct net_device *dev)
 {
-	struct cdx_ft_entry *entry, *next;
+	struct cdx_ft_entry *entry;
 
-	list_for_each_entry_safe(entry, next, &ft_entries, list) {
-		if (!ft_entry_uses(entry, dev))
-			continue;
-		ft_handle_invalidate(entry->handle, &ft_link_invalidations);
-		ft_remove(entry);
+	list_for_each_entry(entry, &ft_entries, list)
+		if (ft_entry_uses(entry, dev))
+			ft_handle_invalidate(entry->handle, &ft_link_invalidations);
+	/* A batch at a time, letting the transaction go between batches: RTNL,
+	 * which the caller keeps, is the lock outside it. */
+	while (ft_retire_batch(ft_wifi_uses, dev)) {
+		cdx_ft_end();
+		cond_resched();
+		cdx_ft_begin();
 	}
 	return !cdx_ft_pending();
 }
@@ -365,6 +374,11 @@ void ft_wifi_exit(void)
 			 * reports at unload once a table has ever been bound. */
 			rtnl_lock();
 			cdx_ft_begin();
+			/* Its entries out of hardware first, as the worker's
+			 * retirement does: the bindings that would take them
+			 * are only drained later in unload. An unproven unlink
+			 * left behind is proven before CDX is released. */
+			ft_wifi_vap_drained(w->vap_dev);
 			cdx_wifi_vap_del(&w->vap);
 			cdx_ft_end();
 			rtnl_unlock();

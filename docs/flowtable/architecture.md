@@ -411,6 +411,24 @@ of retirement. The failure path uses the already allocated backend owner and
 requires no allocation. CDX accounts for pending retirement after adapter claim
 release and refuses a new claim while it remains unsafe.
 
+A delete's own barrier is a host-command round trip, about two thirds of what a
+delete costs. Retiring a full table one synchronized delete at a time held the
+control mutex for 13 s on the KASAN image, and readers, admission and Linux's
+callbacks queued behind it (A327). So the adapter unlinks without the barrier
+(`cdx_ft_unlink()`) and asks for one barrier per batch (`cdx_ft_settle()`). An
+owed unlink is the "barrier unproven" outcome before any barrier has been
+asked of it. Every walk that retires many entries goes in batches of at most 64
+and settles each batch before it lets the transaction go: the retirement worker,
+a binding's release, global invalidation, an SA's retirement and a Wi-Fi VAP's
+drain. Linux's own deletions arrive one flow per callback. Each leaves its
+barrier owed, the 64th owed one settles inline, and a queued settle takes the
+tail of a burst. Admission settles anything owed before it asks the backend. A
+failed settle counts as one failed deletion: its owed entries become ordinary
+unproven retirements, and global recovery takes over. Displaced cumulative nodes
+go back to their own table's spare, whichever table the barrier went through.
+`/proc/cdx_flowtable` reports owed unlinks as `owed`, separately from
+`quarantine`.
+
 Pending retirement includes entries CDX parked for its own paths: a multicast
 group delete or listener swap, or an IPsec SA delete, whose barrier failed. The
 backend refuses a claim and every new entry while any remain. One completed

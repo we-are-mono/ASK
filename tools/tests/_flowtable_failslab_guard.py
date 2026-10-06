@@ -45,8 +45,9 @@ TARGETS = {
     "mroute-event": ("ft_fib_event", "ask_flowtable", SOFTIRQ),
     "mroute-group": ("ft_mr_apply", "ask_flowtable", SOFTIRQ),
     # Built in: the classifier delete, whose only slab allocation is the node
-    # that rebuilds a crowded bucket without the key.
-    "ehash-delete": ("ExternalHashTableDeleteKey", None, SOFTIRQ),
+    # that rebuilds a crowded bucket without the key. Both the delete that
+    # syncs and the unlink that defers its barrier go through it.
+    "ehash-delete": ("ehash_delete", None, SOFTIRQ),
 }
 KNOBS = ("probability", "times", "interval", "space", "verbose", "task-filter",
          "ignore-gfp-wait", "cache-filter", "stacktrace-depth", "require-start",

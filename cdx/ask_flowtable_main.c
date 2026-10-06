@@ -419,13 +419,16 @@ static int ft_show(struct seq_file *seq, void *v)
 		   cdx_ft_terminal(), cdx_ft_restarts(), cdx_ft_resume_failures());
 	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nparked %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
-		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
+		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\nowed %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
 		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nstp_invalidations %lld\nqos_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
 		   cdx_ft_observing(), ft_bound, ft_passive, ft_parked, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_complete(), cdx_ft_failed(),
-		   cdx_ft_pending(),
+		   /* Retirements whose barrier failed, or that wait on CDX's own
+		    * proof; one merely owed its batch's barrier is counted apart,
+		    * and for no longer than until ft_settle_work runs. */
+		   cdx_ft_pending() - cdx_ft_owed(), cdx_ft_owed(),
 		   ft_can_rearm(), ft_rearms, ft_neighbour_refs, ft_handle_refs,
 		   atomic64_read(&ft_neigh_invalidations),
 		   atomic64_read(&ft_route_invalidations),
@@ -441,6 +444,9 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_ipsec_next_hop_updates));
 	/* The SAs this adapter installed, and every SA cdx's cache holds: an
 	 * install refused part-way has to leave both where they were. */
+	/* Linux's deletions that found the transaction held and left what
+	 * they named, if anything was in hardware, to the retirement worker. */
+	seq_printf(seq, "destroy_deferrals %lld\n", atomic64_read(&ft_destroy_deferrals));
 	seq_printf(seq, "ipsec_sas %u\nipsec_sa_cache %u\n",
 		   cdx_ipsec_sa_count(), cdx_ipsec_sa_cache_entries());
 	ft_sec_refusal_rows(seq);
@@ -776,6 +782,8 @@ netdev:
 	 * binding gone and the notifiers and the egress hook closed nothing is
 	 * left to queue any of them, so these cancels are final. */
 	cancel_work_sync(&ft_retire_work);
+	cancel_work_sync(&ft_settle_work);
+	ft_deferred_destroys_drop();
 	cancel_delayed_work_sync(&ft_work);
 	cancel_delayed_work_sync(&ft_rearm_work);
 	/* Both chains are unregistered above, so nothing can add a membership
@@ -899,6 +907,9 @@ static void __exit ask_flowtable_exit(void)
 	cancel_work_sync(&ft_ipsec_follow);
 	ft_ipsec_watch_flush();
 	cancel_work_sync(&ft_retire_work);
+	/* An unlink it would have settled stays counted as pending, which
+	 * ft_hw_settle() below proves before CDX is released. */
+	cancel_work_sync(&ft_settle_work);
 	cancel_delayed_work_sync(&ft_work);
 	/* ft_stopping, set above, already stops a parked rearm requeueing
 	 * itself; this waits out the pass in flight. */
@@ -912,6 +923,9 @@ static void __exit ask_flowtable_exit(void)
 	/* Indirect binds are gone with the line above; the direct ones are
 	 * still Netfilter's, and nothing else will ever hand them back. */
 	ft_block_drain();
+	/* The retirement work is cancelled above and the bindings are gone,
+	 * so nothing retires or records a deferred deletion any more. */
+	ft_deferred_destroys_drop();
 	WRITE_ONCE(ft_ready, false);
 	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,
 	 * before releasing CDX. The drain above removed every direction and

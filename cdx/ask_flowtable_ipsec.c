@@ -2626,11 +2626,17 @@ static bool ft_ipsec_none_left(void)
  * is read as it goes (cdx_ipsec_sa_del()) and kept for a re-add of it
  * (ft_ipsec_remember()).
  */
+static bool ft_names_sa(const struct cdx_ft_entry *entry, const void *handle)
+{
+	return entry->rule.sa_handle == *(const u16 *)handle ||
+	       entry->rule.in_sa_handle == *(const u16 *)handle;
+}
+
 static void ft_ipsec_retire_work(struct work_struct *work)
 {
 	struct ft_ipsec_retirement *retirement;
-	struct cdx_ft_entry *entry, *next;
-	bool kept;
+	struct cdx_ft_entry *entry;
+	bool kept, marked;
 	u16 handle;
 
 	for (;;) {
@@ -2641,24 +2647,34 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 		if (!retirement)
 			return;
 		handle = cdx_ipsec_sa_handle(retirement->sa);
+		marked = false;
 		for (;;) {
+			bool more;
+
 			cdx_ft_begin();
 			/* Serialize with admission, including an admission the atomic
 			 * deletion callback missed before its watch was published.
-			 * Never reuse an SA handle while a flow can still name it. */
-			list_for_each_entry_safe(entry, next, &ft_entries, list) {
-				if (entry->rule.sa_handle != handle &&
-				    entry->rule.in_sa_handle != handle)
-					continue;
-				ft_handle_invalidate(entry->handle, &ft_ipsec_invalidations);
-				ft_remove(entry);
+			 * Never reuse an SA handle while a flow can still name it.
+			 * Linux stops using every such flow at once; the batches
+			 * that follow need not look again, and still take out a
+			 * flow admitted meanwhile, as they match on the SA. */
+			if (!marked) {
+				list_for_each_entry(entry, &ft_entries, list)
+					if (ft_names_sa(entry, &handle))
+						ft_handle_invalidate(entry->handle,
+								     &ft_ipsec_invalidations);
+				marked = true;
 			}
+			more = ft_retire_batch(ft_names_sa, &handle);
 			/* A deletion barrier can defer reclaim or require datapath
 			 * quiescence. Retain the SA until that proof completes. */
-			if (!cdx_ft_pending() || !cdx_ft_recover())
+			if (!more && (!cdx_ft_pending() || !cdx_ft_recover()))
 				break;
 			cdx_ft_end();
-			msleep(20);
+			if (more)
+				cond_resched();
+			else
+				msleep(20);
 		}
 		cdx_ipsec_sa_del(&retirement->sa, &retirement->last);
 		/* Out of the hardware: an egress drain waiting on it may now

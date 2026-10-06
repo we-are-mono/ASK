@@ -23,6 +23,9 @@ struct cdx_ft_hw {
 	RouteEntry route;
 	struct list_head retired;
 	int delete_rc;
+	/* Unlinked with its barrier deferred to the caller's next settle, and
+	 * not yet failed by one (ft_owed). */
+	bool owed;
 	/* The ingress policer profile the rule named, kept so removal can unref
 	 * it against the pool; also in delete_rc's padding. */
 	u8 policer;
@@ -48,6 +51,11 @@ static_assert(sizeof(struct cdx_ft_stats_binding) ==
  * (cdx_ehash.c), the adapter can retain the already allocated owner until the
  * barrier passes. */
 static LIST_HEAD(ft_retired);
+/* The retired owners whose unlink deferred its barrier and that no barrier has
+ * failed yet: what one settle owes. A delete's own barrier costs a
+ * host-command round trip per key, which retiring a full table one key at a
+ * time made seconds of control-mutex hold (A327). */
+static unsigned int ft_owed;
 
 #ifdef CDX_DEBUG_FLOWTABLE
 static bool ft_fail_unlink;
@@ -575,6 +583,22 @@ void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
  * proves them all; cdx_ft_claim() refuses a configuration spanning more than
  * one, where it would not. A possibly linked key -- any other delete_rc -- is
  * never released: no barrier makes freeing it safe. */
+static unsigned int ft_retired_count;
+
+static void ft_hw_retire(struct cdx_ft_hw *hw)
+{
+	list_add_tail(&hw->retired, &ft_retired);
+	ft_retired_count++;
+	ft_owed += hw->owed;
+}
+
+static void ft_hw_unretire(struct cdx_ft_hw *hw)
+{
+	list_del(&hw->retired);
+	ft_retired_count--;
+	ft_owed -= hw->owed;
+}
+
 static void ft_hw_release_synced(void)
 {
 	struct cdx_ft_hw *hw, *next;
@@ -584,13 +608,13 @@ static void ft_hw_release_synced(void)
 			continue;
 		ExternalHashTableEntryFree(hw->entry.ct->handle);
 		kfree(hw->entry.ct);
-		list_del(&hw->retired);
+		ft_hw_unretire(hw);
 		ft_hw_free(hw);
 	}
 	cdx_ehash_quarantine_free_all();
 }
 
-int cdx_ft_hw_del(struct cdx_ft_hw **entry)
+static int ft_hw_del(struct cdx_ft_hw **entry, bool defer)
 {
 	struct cdx_ft_hw *hw = *entry;
 	struct hw_ct *ct;
@@ -600,13 +624,18 @@ int cdx_ft_hw_del(struct cdx_ft_hw **entry)
 	if (!hw)
 		return 0;
 	if (hw->options)
-		options_rc = cdx_ft_hw_del(&hw->options);
+		options_rc = ft_hw_del(&hw->options, defer);
 	ct = hw->entry.ct;
 	/* Preserve the real linked allocation to exercise fatal retirement.
 	 * Never inject a hard error after a successful destructive unlink; a
-	 * withheld proof is the one failure that can truthfully follow it. */
-	rc = ft_unlink_fault() ? -EIO :
-		ExternalHashTableDeleteKey(ct->td, ct->index, ct->handle);
+	 * withheld proof is the one failure that can truthfully follow it --
+	 * for a deferred unlink, at the settle that asks for it. */
+	if (ft_unlink_fault())
+		rc = -EIO;
+	else if (defer)
+		rc = ExternalHashTableUnlinkKey(ct->td, ct->index, ct->handle);
+	else
+		rc = ExternalHashTableDeleteKey(ct->td, ct->index, ct->handle);
 	if (!rc && ft_sync_fault())
 		rc = EN_EHASH_DELETE_UNSYNCED;
 	*entry = NULL;
@@ -620,21 +649,66 @@ int cdx_ft_hw_del(struct cdx_ft_hw **entry)
 		return options_rc == -EIO ? -EIO : 0;
 	}
 	hw->delete_rc = rc;
-	list_add_tail(&hw->retired, &ft_retired);
+	hw->owed = defer && rc == EN_EHASH_DELETE_UNSYNCED;
+	ft_hw_retire(hw);
 	if (rc == EN_EHASH_DELETE_UNSYNCED && options_rc != -EIO)
-		return -EAGAIN;
+		return defer ? 0 : -EAGAIN;
 	return -EIO;
+}
+
+int cdx_ft_hw_del(struct cdx_ft_hw **hw)
+{
+	return ft_hw_del(hw, false);
+}
+
+int cdx_ft_hw_unlink(struct cdx_ft_hw **hw)
+{
+	return ft_hw_del(hw, true);
 }
 
 unsigned int cdx_ft_hw_pending(void)
 {
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	return ft_retired_count;
+}
+
+unsigned int cdx_ft_hw_owed(void)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	return ft_owed;
+}
+
+/* The barrier every deferred unlink is owed, through the delete's fault knob
+ * like the barrier each would have issued itself. A completed one releases
+ * every unsynced owner, owed or not, as any barrier does. A failed one leaves
+ * the owed owners exactly where a delete whose own barrier failed leaves its
+ * owner, and says how many there were: they are owed nothing more than any
+ * other unproven retirement, which cdx_ft_hw_retry() goes on asking for. */
+int cdx_ft_hw_settle(unsigned int *unproven)
+{
 	struct cdx_ft_hw *hw;
-	unsigned int n = 0;
+	void *td = NULL;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	*unproven = 0;
 	list_for_each_entry(hw, &ft_retired, retired)
-		n++;
-	return n;
+		if (hw->owed) {
+			td = hw->entry.ct->td;
+			break;
+		}
+	if (!td)
+		return 0;
+	if (!ft_sync_fault() && !ExternalHashTableDeleteSync(td)) {
+		ft_hw_release_synced();
+		return 0;
+	}
+	list_for_each_entry(hw, &ft_retired, retired)
+		if (hw->owed) {
+			hw->owed = false;
+			(*unproven)++;
+		}
+	ft_owed = 0;
+	return -EAGAIN;
 }
 
 /* One barrier, since one proves every unlink before it: through the first
@@ -690,7 +764,7 @@ void cdx_ft_hw_quiesced(void)
 			cdx_ehash_abandon(hw->entry.ct->td, hw->entry.ct->index,
 					  hw->entry.ct->handle);
 		kfree(hw->entry.ct);
-		list_del(&hw->retired);
+		ft_hw_unretire(hw);
 		ft_hw_free(hw);
 	}
 }
@@ -712,7 +786,7 @@ void cdx_ft_hw_strand(void)
 		cdx_ehash_abandon(hw->entry.ct->td, hw->entry.ct->index,
 				  hw->entry.ct->handle);
 		kfree(hw->entry.ct);
-		list_del(&hw->retired);
+		ft_hw_unretire(hw);
 		/* Not ft_hw_free(): its holds stay taken. */
 		kfree(hw);
 		kept++;

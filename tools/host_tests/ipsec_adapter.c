@@ -1061,14 +1061,32 @@ struct cdx_ft_entry {
 };
 static LIST_HEAD(ft_entries);
 static LIST_HEAD(ft_neigh_entries);
-static int ft_remove(struct cdx_ft_entry *e)
+/* The flowtable's own retirement: an unlink owes a barrier, and a settle
+ * issues one for every unlink owed since the last. Compiled and tested in
+ * flowtable.c; here they count, so a case can say how many of each a
+ * retirement took. */
+static unsigned unlinks_owed, settles;
+static void cdx_ft_assert_held(void) { assert(ft_transaction); }
+static int ft_unlink(struct cdx_ft_entry *e)
 {
 	assert(ft_transaction && retirement_flows);
 	retirement_flows--;
+	unlinks_owed++;
 	list_del(&e->list);
 	free(e);
 	return 0;
 }
+static int ft_settle(void)
+{
+	assert(ft_transaction);
+	if (unlinks_owed)
+		settles++;
+	unlinks_owed = 0;
+	return 0;
+}
+/* Where a retirement walk lets the transaction go between batches. */
+static unsigned reschedules;
+static void cond_resched(void) { assert(!ft_transaction); reschedules++; }
 static unsigned cdx_ft_pending(void) { assert(ft_transaction); return retirement_barriers; }
 static int cdx_ft_recover(void)
 {
@@ -1076,12 +1094,17 @@ static int cdx_ft_recover(void)
 	if (retirement_barriers) retirement_barriers--;
 	return retirement_barriers ? -EIO : 0;
 }
+/* Every marking an SA's retirement asks for, already marked or not: one walk
+ * of the flows marks each once. */
+static unsigned ipsec_markings;
 static void ft_handle_invalidate(struct nf_flow_offload_handle *h, atomic64_t *count)
 {
 	/* A moved path's flows are walked on the watch's list, which the
 	 * watch lock guards. */
 	if (count == &ft_mtu_invalidations)
 		assert(ft_watch_lock);
+	if (count == &ft_ipsec_invalidations)
+		ipsec_markings++;
 	if (h->valid) { h->valid = false; (*count)++; }
 }
 
@@ -1888,6 +1911,57 @@ static void test_state_add(void)
 	assert(!late_handle.valid && !retirement_flows && !retirement_barriers);
 	assert(slept == slept_before + 2 && sa_deleted == 1);
 	assert(!ft_ipsec_retire_pending());
+
+	/* An SA more flows name than one transaction retires: they go a batch
+	 * at a time, either end naming it, each batch settled behind one
+	 * barrier and the transaction let go between batches -- not slept on,
+	 * which is for a barrier still unproven. A flow naming another SA
+	 * stays. */
+	{
+		enum { NAMING = 2 * FT_RETIRE_BATCH + 5, OTHERS = 3 };
+		struct nf_flow_offload_handle handles[NAMING + OTHERS];
+		unsigned batches = (NAMING + FT_RETIRE_BATCH - 1) / FT_RETIRE_BATCH;
+		unsigned before = settles, drops = reschedules, deleted = sa_deleted;
+		u16 sa;
+
+		assert(ft_xdo_state_add(x, &ack) == 0);
+		sa = x->handle;
+		ft_xdo_state_delete(x);
+		assert(ft_ipsec_retire_pending());
+		for (unsigned i = 0; i < NAMING + OTHERS; i++) {
+			struct cdx_ft_entry *e = calloc(1, sizeof(*e));
+
+			assert(e);
+			handles[i].valid = true;
+			e->handle = &handles[i];
+			if (i % 40 == 3 && i / 40 < OTHERS)
+				e->rule.sa_handle = sa + 1;
+			else if (i & 1)
+				e->rule.sa_handle = sa;
+			else
+				e->rule.in_sa_handle = sa;
+			list_add_tail(&e->list, &ft_entries);
+		}
+		retirement_flows = NAMING;
+		slept_before = slept;
+		unsigned markings = ipsec_markings;
+		bench_drain_retirements();
+		/* Marked in one walk before the first batch, not again for each. */
+		assert(ipsec_markings == markings + NAMING);
+		assert(!retirement_flows && !unlinks_owed && settles == before + batches);
+		assert(reschedules == drops + batches - 1 && slept == slept_before);
+		assert(sa_deleted == deleted + 1 && !ft_ipsec_retire_pending());
+		for (unsigned i = 0; i < NAMING + OTHERS; i++)
+			assert(handles[i].valid == (i % 40 == 3 && i / 40 < OTHERS));
+		for (unsigned i = 0; i < OTHERS; i++) {
+			struct cdx_ft_entry *e = list_entry(ft_entries.next, struct cdx_ft_entry, list);
+
+			assert(e->rule.sa_handle == sa + 1 && !e->rule.in_sa_handle);
+			list_del(&e->list);
+			free(e);
+		}
+		assert(ft_entries.next == &ft_entries);
+	}
 
 	/* A refused install leaves nothing behind: no SA, and no watch whose
 	 * SA never existed. */

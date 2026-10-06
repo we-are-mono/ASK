@@ -73,6 +73,7 @@ atomic64_t ft_fdb_invalidations = ATOMIC64_INIT(0);
 atomic64_t ft_stp_invalidations = ATOMIC64_INIT(0);
 atomic64_t ft_qos_invalidations = ATOMIC64_INIT(0);
 atomic64_t ft_admission_invalidations = ATOMIC64_INIT(0);
+atomic64_t ft_destroy_deferrals = ATOMIC64_INIT(0);
 atomic64_t ft_ipsec_invalidations = ATOMIC64_INIT(0);
 atomic64_t ft_ipsec_genid = ATOMIC64_INIT(0);
 atomic64_t ft_ipsec_policy_invalidations = ATOMIC64_INIT(0);
@@ -92,10 +93,12 @@ atomic_t ft_invalid_seq = ATOMIC_INIT(0);
 int ft_done_seq;
 struct proc_dir_entry *ft_proc;
 static void ft_retire_workfn(struct work_struct *work);
+static void ft_settle_workfn(struct work_struct *work);
 static void ft_rearm_workfn(struct work_struct *work);
 static void ft_dev_stats_reap(struct work_struct *work);
 DECLARE_DELAYED_WORK(ft_work, ft_invalidate_work);
 DECLARE_WORK(ft_retire_work, ft_retire_workfn);
+DECLARE_WORK(ft_settle_work, ft_settle_workfn);
 DECLARE_DELAYED_WORK(ft_rearm_work, ft_rearm_workfn);
 DECLARE_WORK(ft_dev_stats_work, ft_dev_stats_reap);
 
@@ -129,7 +132,7 @@ void ft_invalidate(void)
 		schedule_delayed_work(&ft_work, 0);
 }
 
-static struct cdx_ft_entry *ft_find(struct cdx_ft_binding *binding,
+static struct cdx_ft_entry *ft_find(const struct cdx_ft_binding *binding,
 				  unsigned long cookie)
 {
 	struct cdx_ft_entry *entry;
@@ -141,6 +144,10 @@ static struct cdx_ft_entry *ft_find(struct cdx_ft_binding *binding,
 	return NULL;
 }
 
+/* Handles have been marked that the retirement worker can find only by walking
+ * the table. */
+static atomic_t ft_retire_scan = ATOMIC_INIT(0);
+
 /* Called with either the backend transaction or the notifier's ft_watch_lock held. The
  * handle is immutable, owned before watch publication and shared by both
  * directions. Marking it also excludes Linux's cached flow immediately;
@@ -151,8 +158,88 @@ void ft_handle_invalidate(struct nf_flow_offload_handle *handle,
 {
 	if (nf_flow_offload_handle_invalidate(handle))
 		atomic64_inc(counter);
+	/* The worker has to walk the table for this one: nothing says which
+	 * entries name the handle. */
+	atomic_set(&ft_retire_scan, 1);
 	if (!READ_ONCE(ft_stopping))
 		schedule_work(&ft_retire_work);
+}
+
+/* A Linux deletion that found the transaction held (ft_rule_callback()):
+ * what the retirement worker needs to find its entry without walking the
+ * table. The binding is only compared, never dereferenced -- it may be
+ * released first -- and the handle is held, so no later generation can be
+ * mistaken for this one. */
+struct ft_deferred_destroy {
+	struct llist_node node;
+	const struct cdx_ft_binding *binding;
+	unsigned long cookie;
+	struct nf_flow_offload_handle *handle;
+};
+
+static LLIST_HEAD(ft_deferred_destroys);
+
+static void ft_destroy_defer(const struct cdx_ft_binding *binding,
+			     const struct flow_cls_offload *cls)
+{
+	struct ft_deferred_destroy *deferred;
+
+	if (nf_flow_offload_handle_invalidate(cls->nf_handle))
+		atomic64_inc(&ft_destroy_deferrals);
+	deferred = kmalloc(sizeof(*deferred), GFP_NOWAIT | __GFP_NOWARN);
+	if (deferred) {
+		deferred->binding = binding;
+		deferred->cookie = cls->cookie;
+		deferred->handle = cls->nf_handle;
+		nf_flow_offload_handle_get(deferred->handle);
+		llist_add(&deferred->node, &ft_deferred_destroys);
+	} else {
+		/* The handle is marked all the same; the walk finds it. */
+		atomic_set(&ft_retire_scan, 1);
+	}
+	if (!READ_ONCE(ft_stopping))
+		schedule_work(&ft_retire_work);
+}
+
+/* Unlink the entries deferred deletions name, at most FT_RETIRE_BATCH of them;
+ * true when records are left for the next run. A record whose entry is gone
+ * -- released with its binding, retired by a walk, or never in hardware --
+ * is simply dropped. */
+static bool ft_retire_deferred(void)
+{
+	struct llist_node *list = llist_del_all(&ft_deferred_destroys);
+	struct ft_deferred_destroy *deferred, *next;
+	struct cdx_ft_entry *entry;
+	unsigned int n = 0;
+	bool more = false;
+
+	llist_for_each_entry_safe(deferred, next, list, node) {
+		if (n == FT_RETIRE_BATCH) {
+			llist_add(&deferred->node, &ft_deferred_destroys);
+			more = true;
+			continue;
+		}
+		entry = ft_find(deferred->binding, deferred->cookie);
+		if (entry && entry->handle == deferred->handle) {
+			ft_unlink(entry);
+			n++;
+		}
+		nf_flow_offload_handle_put(deferred->handle);
+		kfree(deferred);
+	}
+	return more;
+}
+
+/* Every record left once nothing can add one: unload, after the bindings'
+ * release. Their entries went with the bindings. */
+void ft_deferred_destroys_drop(void)
+{
+	struct ft_deferred_destroy *deferred, *next;
+
+	llist_for_each_entry_safe(deferred, next, llist_del_all(&ft_deferred_destroys), node) {
+		nf_flow_offload_handle_put(deferred->handle);
+		kfree(deferred);
+	}
 }
 
 void ft_neigh_invalidate(struct cdx_ft_entry *entry)
@@ -570,9 +657,16 @@ static void ft_stats_binding(const struct cdx_ft_entry *entry,
 	}
 }
 
-int ft_remove(struct cdx_ft_entry *entry)
+/* Out of the adapter, and out of the classifier with the barrier that proves
+ * the firmware has left it still owed: ft_settle() asks for that, once for
+ * every entry unlinked since. A barrier is a host-command round trip, two
+ * thirds of what a delete costs, so a walk that retires many entries settles
+ * them behind one. Whatever owes a barrier settles it before the transaction
+ * ends or queues ft_settle_work to, so nothing outside the transaction finds
+ * an unlink unproven unless its barrier failed. */
+int ft_unlink(struct cdx_ft_entry *entry)
 {
-	int rc = cdx_ft_del(&entry->hw);
+	int rc = cdx_ft_unlink(&entry->hw);
 
 	if (rc) {
 		ft_errors++;
@@ -598,21 +692,95 @@ int ft_remove(struct cdx_ft_entry *entry)
 	return rc;
 }
 
-static void ft_retire_workfn(struct work_struct *work)
+/* The barrier every unlink since the last one is owed. A failed one is a
+ * failed deletion, counted once and escalated to global recovery as a delete
+ * whose own barrier failed always was: that recovery retries the barrier
+ * until it completes, or stops the datapath. */
+int ft_settle(void)
+{
+	unsigned int unproven;
+
+	cdx_ft_assert_held();
+	if (!cdx_ft_owed() || !cdx_ft_settle(&unproven))
+		return 0;
+	ft_errors++;
+	ft_invalidate();
+	return -EAGAIN;
+}
+
+int ft_remove(struct cdx_ft_entry *entry)
+{
+	int rc = ft_unlink(entry);
+	int settled = ft_settle();
+
+	return rc ?: settled;
+}
+
+/* Unlink at most FT_RETIRE_BATCH of the entries @match selects and settle them
+ * behind one barrier. True when it stopped at that bound with more selected:
+ * the caller lets the transaction go before asking again, so retiring a full
+ * table never holds it for more than one batch, and readers, admission and
+ * Linux's own callbacks interleave with the retirement instead of queueing
+ * behind all of it (A327). */
+bool ft_retire_batch(bool (*match)(const struct cdx_ft_entry *entry, const void *arg),
+		     const void *arg)
 {
 	struct cdx_ft_entry *entry, *next;
+	unsigned int n = 0;
+	bool more = false;
+
+	cdx_ft_assert_held();
+	list_for_each_entry_safe(entry, next, &ft_entries, list) {
+		if (!match(entry, arg))
+			continue;
+		if (n == FT_RETIRE_BATCH) {
+			more = true;
+			break;
+		}
+		ft_unlink(entry);
+		n++;
+	}
+	ft_settle();
+	return more;
+}
+
+static bool ft_handle_retired(const struct cdx_ft_entry *entry, const void *arg)
+{
+	return !nf_flow_offload_handle_valid(entry->handle);
+}
+
+static void ft_retire_workfn(struct work_struct *work)
+{
+	bool more;
 
 	cdx_ft_begin();
-	list_for_each_entry_safe(entry, next, &ft_entries, list) {
-		/* A failed retirement escalates to the existing global recovery.
-		 * That worker proves a barrier or stops the datapath before
-		 * reporting completion. Nothing rearms while CDX's latch holds:
-		 * it clears only once CDX has restarted the datapath. */
-		if (ft_stopping || atomic_read(&ft_invalid))
-			break;
-		if (!nf_flow_offload_handle_valid(entry->handle))
-			ft_remove(entry);
+	/* Deferred deletions first: each names its entry, so retiring them
+	 * costs nothing like a walk of the table, which only marked handles
+	 * nothing names need. */
+	more = ft_retire_deferred();
+	/* A failed retirement escalates to the existing global recovery.
+	 * That worker proves a barrier or stops the datapath before
+	 * reporting completion. Nothing rearms while CDX's latch holds:
+	 * it clears only once CDX has restarted the datapath. */
+	if (!ft_stopping && !atomic_read(&ft_invalid) && atomic_xchg(&ft_retire_scan, 0) &&
+	    ft_retire_batch(ft_handle_retired, NULL)) {
+		atomic_set(&ft_retire_scan, 1);
+		more = true;
 	}
+	ft_settle();
+	cdx_ft_end();
+	/* Behind whatever queued for the transaction meanwhile. */
+	if (more && !READ_ONCE(ft_stopping))
+		schedule_work(&ft_retire_work);
+}
+
+/* For unlinks whose callers could not settle them in the same transaction:
+ * Linux's own deletions, one flow at a time. A burst of them shares the one
+ * barrier this asks for. */
+static void ft_settle_workfn(struct work_struct *work)
+{
+	cdx_ft_begin();
+	ft_settle();
 	cdx_ft_end();
 }
 
@@ -1931,6 +2099,10 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		return ask_refuse(-ENOSPC);
 	if (ft_fault(1))
 		return ask_refuse(-ENOMEM);
+	/* The backend admits nothing while a retirement is unproven, and one
+	 * whose barrier is merely owed is that until it is asked for. */
+	if (ft_settle())
+		return ask_refuse(-EAGAIN);
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
 		return ask_refuse(-ENOMEM);
@@ -2181,7 +2353,21 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 
 	if (type != TC_SETUP_CLSFLOWER)
 		return -EOPNOTSUPP;
-	cdx_ft_begin();
+	/* Linux deletes one flow per work item, from an unbound workqueue
+	 * that runs up to 256 of them at once, and a route change or a
+	 * conntrack flush queues one for every flow. Each waiting for the
+	 * transaction put hundreds of workers to sleep behind whatever held
+	 * it (A327). A deletion that finds it held retires the generation
+	 * instead, as a dependency change does: the handle stops naming
+	 * anything in hardware, the retirement worker takes the entry out in
+	 * its next batch, and until then the entry's cookie refuses a new
+	 * generation (-ESTALE) rather than being taken for it. */
+	if (cls->command == FLOW_CLS_DESTROY && !cdx_ft_trybegin()) {
+		ft_destroy_defer(binding, cls);
+		return 0;
+	}
+	if (cls->command != FLOW_CLS_DESTROY)
+		cdx_ft_begin();
 	entry = ft_find(binding, cls->cookie);
 	if (entry && entry->handle != cls->nf_handle)
 		entry = NULL;
@@ -2278,7 +2464,17 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 			ft_rejects++;
 		break;
 	case FLOW_CLS_DESTROY:
-		rc = entry ? ft_remove(entry) : 0;
+		/* Linux deletes one flow per callback, and one route change can
+		 * delete the whole table: the deletions queued behind each other
+		 * share a barrier, at most FT_RETIRE_BATCH unlinks to one, and
+		 * the last of a burst leaves it to ft_settle_work -- unless an
+		 * unload, which set ft_stopping under this transaction, may
+		 * already have cancelled that work for good. */
+		rc = entry ? ft_unlink(entry) : 0;
+		if (cdx_ft_owed() >= FT_RETIRE_BATCH || ft_stopping)
+			ft_settle();
+		else if (cdx_ft_owed())
+			schedule_work(&ft_settle_work);
 		break;
 	case FLOW_CLS_STATS:
 		rc = entry ? ft_stats(entry, cls) : -ENOENT;
@@ -2376,10 +2572,14 @@ static void ft_rearm_workfn(struct work_struct *work)
 	cdx_ft_end();
 }
 
+static bool ft_bound_to(const struct cdx_ft_entry *entry, const void *binding)
+{
+	return entry->binding == binding;
+}
+
 void ft_release(void *priv)
 {
 	struct cdx_ft_binding *binding = priv;
-	struct cdx_ft_entry *entry, *next;
 
 	cdx_ft_begin();
 	/* Counted here rather than at unbind, because this is the one place
@@ -2391,9 +2591,15 @@ void ft_release(void *priv)
 		kfree(binding);
 		return;
 	}
-	list_for_each_entry_safe(entry, next, &ft_entries, list)
-		if (entry->binding == binding)
-			ft_remove(entry);
+	/* A batch at a time, letting the transaction go between batches. No
+	 * callback reaches this binding any more -- Netfilter has taken it off
+	 * the block -- so the entries left are only fewer when it comes back;
+	 * anything else retiring some of them meanwhile is no matter. */
+	while (ft_retire_batch(ft_bound_to, binding)) {
+		cdx_ft_end();
+		cond_resched();
+		cdx_ft_begin();
+	}
 	spin_lock_bh(&ft_watch_lock);
 	list_del(&binding->list);
 	ft_bound--;

@@ -294,6 +294,7 @@ static bool rtnl, rtnl_busy;
 static unsigned legacy_pending;
 static void mutex_lock(bool *m) { assert(!*m); *m = true; }
 static void mutex_unlock(bool *m) { assert(*m); *m = false; }
+static bool mutex_trylock(bool *m) { if (*m) return false; *m = true; return true; }
 static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
 static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
@@ -461,6 +462,30 @@ static int ExternalHashTableDeleteKey(void *td, unsigned index, struct key *hand
     if (delete_result == 0 || delete_result == EN_EHASH_DELETE_UNSYNCED) handle->linked = false;
     if (!delete_result) barrier();
     return delete_result;
+}
+/* The same delete without its sync, for a caller retiring many keys behind
+ * one: a key it unlinks is reported unsynced, never deleted, and waits for a
+ * barrier exactly as one whose own sync failed. A hard failure is the
+ * delete's. */
+static unsigned unlinks, delete_syncs;
+static int ExternalHashTableUnlinkKey(void *td, unsigned index, struct key *handle)
+{
+    assert(td == &in_itf && index == 1 && handle && (handle == key || handle == older) &&
+           handle->linked);
+    unlinks++;
+    if (delete_result != 0 && delete_result != EN_EHASH_DELETE_UNSYNCED)
+        return delete_result;
+    handle->linked = false;
+    return EN_EHASH_DELETE_UNSYNCED;
+}
+static int ExternalHashTableFmPcdHcSync(void *td);
+/* The sync a delete issues itself, asked for once for the unlinks above. Only
+ * ever asked for while an unlinked key waits on it. */
+static int ExternalHashTableDeleteSync(void *td)
+{
+    assert((key && !key->linked) || (older && !older->linked));
+    delete_syncs++;
+    return ExternalHashTableFmPcdHcSync(td);
 }
 static int ExternalHashTableFmPcdHcSync(void *td)
 {
@@ -1122,6 +1147,12 @@ static void test_backend(void)
     assert(cdx_flowtable_guard_init() == 0 && notifier_registered);
     struct netdev_notifier_info info = {&out};
     assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
+    /* The transaction without waiting for it: taken when free, refused
+     * while anything holds it, and then the caller's to end. */
+    assert(cdx_ft_trybegin() && cdx_info->ctrl.mutex);
+    assert(!cdx_ft_trybegin() && cdx_info->ctrl.mutex);
+    cdx_ft_end();
+    assert(!cdx_info->ctrl.mutex);
     cdx_ft_begin();
     /* A statistics slot is backend-owned like anything else it hands out, so
      * it is refused before the claim. Freeing nothing is always a no-op,
@@ -1313,6 +1344,32 @@ static void test_backend(void)
     assert(cdx_ft_admission_begin() == 0);
     assert(cdx_ft_add(&rule,&stats,&hw) == 0);
     cdx_ft_admission_end();
+    /* An unlink leaves the live count at once and its barrier to the settle,
+     * pending and owed until then; the settle issues the one barrier. A
+     * failed settle fails nothing: what it leaves is an ordinary unproven
+     * retirement, which the adapter's recovery retries. */
+    {
+        unsigned unproven = 99;
+
+        tries = syncs;
+        assert(cdx_ft_unlink(&hw) == 0 && !hw && !ft_live && !cdx_ft_failed());
+        assert(cdx_ft_unlink(&hw) == 0 && !ft_live);
+        assert(cdx_ft_owed() == 1 && cdx_ft_pending() == 1 && syncs == tries);
+        assert(cdx_ft_settle(&unproven) == 0 && !unproven && syncs == tries + 1);
+        assert(!cdx_ft_owed() && !cdx_ft_pending() && !key && !allocations);
+        assert(cdx_ft_admission_begin() == 0);
+        assert(cdx_ft_add(&rule,&stats,&hw) == 0);
+        cdx_ft_admission_end();
+        assert(cdx_ft_unlink(&hw) == 0 && cdx_ft_owed() == 1);
+        fail_sync = true;
+        assert(cdx_ft_settle(&unproven) == -EAGAIN && unproven == 1 && !cdx_ft_failed());
+        assert(!cdx_ft_owed() && cdx_ft_pending() == 1 && !ft_fatal_work.queued);
+        fail_sync = false;
+        assert(cdx_ft_recover() == 0 && !cdx_ft_pending() && !key);
+        assert(cdx_ft_admission_begin() == 0);
+        assert(cdx_ft_add(&rule,&stats,&hw) == 0);
+        cdx_ft_admission_end();
+    }
     /* A delete that cannot be proven latches the failure, and the latch
      * queues the work that stops the datapath and then restarts it. The
      * adapter's own recovery only ever stops it: once the ports are stopped
@@ -1808,6 +1865,23 @@ int main(void)
         assert(tunnel_slot.holds == 2);
         delete_result = 0;
         assert(cdx_ft_hw_retry() == 0 && !key && !older && !allocations && !tunnel_slot.holds);
+        /* Unlinked with the barrier deferred, the options entry goes the way
+         * the entry it belongs to goes: both unlinked without a sync, both
+         * owed, the shared record held, and one settle proves the two. */
+        {
+            unsigned syncs_before = syncs, deletes_before = deletes, unlinks_before = unlinks;
+            unsigned barriers = delete_syncs, unproven = 99;
+
+            assert(cdx_ft_hw_add(&rule, &stats, &hw) == 0 && hw->options);
+            assert(cdx_ft_hw_unlink(&hw) == 0 && !hw && !key->linked && !older->linked);
+            assert(unlinks == unlinks_before + 2 && deletes == deletes_before);
+            assert(syncs == syncs_before && cdx_ft_hw_pending() == 2 && cdx_ft_hw_owed() == 2);
+            assert(tunnel_slot.holds == 2);
+            assert(cdx_ft_hw_settle(&unproven) == 0 && !unproven);
+            assert(syncs == syncs_before + 1 && delete_syncs == barriers + 1);
+            assert(!cdx_ft_hw_pending() && !cdx_ft_hw_owed());
+            assert(!key && !older && !allocations && !tunnel_slot.holds);
+        }
         stats.in_tunnel = NULL;
         rule.out_tunnel = saved_tunnel;
         rule.in_tunnel = (struct cdx_ft_tunnel){};
@@ -1920,6 +1994,73 @@ int main(void)
         assert(nabandoned == 1 && abandoned[0] == older);
         settle_abandoned(); stopped=settled=false;
         assert(!older);
+    }
+    /* Retiring many keys behind one barrier: an unlink issues none and leaves
+     * its owner retired and owed, and the settle that follows proves every
+     * unsynced owner with a single one -- owed, or left by a delete whose own
+     * barrier failed -- and CDX's parked backlog with them. */
+    {
+        struct cdx_ft_hw *first = NULL;
+        unsigned barriers, freed, unproven;
+
+        delete_result = EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_hw_add(&rule,&stats,&first)==0 && cdx_ft_hw_del(&first)==-EAGAIN);
+        assert(cdx_ft_hw_pending()==1 && !cdx_ft_hw_owed());
+        /* Nothing owed: no barrier, whatever else is pending. */
+        old=syncs; unproven=99;
+        assert(cdx_ft_hw_settle(&unproven)==0 && !unproven && syncs==old);
+        assert(cdx_ft_hw_pending()==1 && key && !key->safe);
+        delete_result = 0;
+        old=deletes; unsigned unlinked=unlinks; barriers=syncs;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && older && key->linked);
+        assert(cdx_ft_hw_unlink(&hw)==0 && !hw && !key->linked && !key->safe);
+        assert(unlinks==unlinked+1 && deletes==old && syncs==barriers);
+        assert(cdx_ft_hw_pending()==2 && cdx_ft_hw_owed()==1 && allocations);
+        park_legacy(1); freed=legacy_freed;
+        old=delete_syncs;
+        assert(cdx_ft_hw_settle(&unproven)==0 && !unproven);
+        assert(syncs==barriers+1 && delete_syncs==old+1);
+        assert(!cdx_ft_hw_pending() && !cdx_ft_hw_owed() && !key && !older && !allocations);
+        assert(!legacy_pending && legacy_freed==freed+1);
+
+        /* A barrier that fails leaves every owed owner an ordinary unproven
+         * retirement, says how many, and owes nothing more: the next settle
+         * asks for no barrier, and the retry that does releases them. */
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw)==0);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw)==0);
+        assert(cdx_ft_hw_pending()==2 && cdx_ft_hw_owed()==2);
+        fail_sync=true; old=syncs; barriers=delete_syncs;
+        assert(cdx_ft_hw_settle(&unproven)==-EAGAIN && unproven==2);
+        assert(syncs==old+1 && delete_syncs==barriers+1);
+        assert(cdx_ft_hw_pending()==2 && !cdx_ft_hw_owed() && !key->safe && !older->safe);
+        fail_sync=false; old=syncs;
+        assert(cdx_ft_hw_settle(&unproven)==0 && !unproven && syncs==old);
+        assert(cdx_ft_hw_pending()==2);
+        assert(cdx_ft_hw_retry()==0 && syncs==old+1);
+        assert(!cdx_ft_hw_pending() && !key && !older && !allocations);
+
+        /* The debug knob's withheld proof reaches the settle that asks for it,
+         * never the unlink, which has no barrier of its own to withhold: the
+         * settle fails without issuing one, exactly as a failed one. */
+        ft_fail_sync = 1;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw)==0);
+        assert(ft_fail_sync==1 && cdx_ft_hw_owed()==1);
+        old=syncs;
+        assert(cdx_ft_hw_settle(&unproven)==-EAGAIN && unproven==1 && syncs==old);
+        assert(!ft_fail_sync && !cdx_ft_hw_owed() && cdx_ft_hw_pending()==1 && key);
+        assert(cdx_ft_hw_retry()==0 && syncs==old+1 && !key && !allocations);
+
+        /* A hard failure is the delete's: never owed, never proven by a
+         * settle, kept for the stopped ports. */
+        delete_result = -1;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw)==-EIO && !hw);
+        assert(key->linked && cdx_ft_hw_pending()==1 && !cdx_ft_hw_owed());
+        old=syncs;
+        assert(cdx_ft_hw_settle(&unproven)==0 && !unproven && syncs==old && key->linked);
+        stopped=settled=true; cdx_ft_hw_quiesced();
+        assert(!allocations && !cdx_ft_hw_pending() && nabandoned==1 && abandoned[0]==key);
+        settle_abandoned(); stopped=settled=false;
+        delete_result = 0;
     }
     /* Every record an entry's opcodes can name is held by the entry itself for
      * as long as the microcode may walk it, whatever the adapter does with its
@@ -2043,5 +2184,5 @@ int main(void)
         rule.qos = expected_qos = 0;
     }
     test_backend();
-    puts("Flowtable hardware: encoding, consuming delete, allocation-free retirement, barrier retry and quiescence passed");
+    puts("Flowtable hardware: encoding, consuming delete, allocation-free retirement, deferred settle, barrier retry and quiescence passed");
 }

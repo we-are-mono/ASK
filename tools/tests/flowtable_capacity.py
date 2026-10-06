@@ -1,7 +1,7 @@
 """Fill the production admission budget, overflow it, and reuse it under traffic."""
 from __future__ import annotations
 
-from _flowtable_capacity import BASE, CAPACITY, CONNECTIONS, DETACH_BOUND_SECONDS, DETACH_SECONDS, REPLACEMENTS, batch, check_rows, enable_snapshots, delete_udp, hardware_window, lan_counters, record_delivery, socket_drops, start, unchanged, wait_entries
+from _flowtable_capacity import BASE, CAPACITY, CONNECTIONS, DETACH_BOUND_SECONDS, DETACH_SECONDS, READER_BOUND_SECONDS, REPLACEMENTS, batch, check_rows, enable_snapshots, delete_udp, hardware_window, lan_counters, record_delivery, socket_drops, start, unchanged, wait_entries
 
 import json
 import resource
@@ -148,6 +148,10 @@ async def test_overflow_and_reuse(rig):
             assert drained["installs"] == drained["deletes"]
             r.record("capacity-route-drain", {"state": drained, "command_seconds": route_seconds,
                                              "retirement_seconds": time.monotonic() - started})
+            # Retirement goes in bounded batches, each behind one barrier, so
+            # a reader waits for a batch rather than the whole table: one
+            # walk under the transaction kept readers out for 13 s (A327).
+            assert drained["longest_read_seconds"] < READER_BOUND_SECONDS, drained
             # Reuse the initial admission pacing after bulk retirement too.
             # This verifies full occupancy/recovery without conflating it with
             # an unpaced simultaneous connection-admission stress test.
@@ -176,9 +180,11 @@ async def test_overflow_and_reuse(rig):
             assert all(final[k] == 0 for k in ("entries", "handle_refs", "neighbour_refs", "quarantine"))
             assert final["errors"] == initial["errors"], (initial, final)
             assert socket_drops(receiver) == 0, "generator UDP receive queue overflow"
-            # The retirement holds CDX's control mutex throughout, so its
-            # length is a property to bound, not only to wait out.
+            # The retirement holds Netfilter's block lock throughout, so its
+            # length is a property to bound, not only to wait out; CDX's
+            # transaction it lets go between batches.
             assert detach < DETACH_BOUND_SECONDS, detach
+            assert final["longest_read_seconds"] < READER_BOUND_SECONDS, final
     finally:
         try:
             records = {}

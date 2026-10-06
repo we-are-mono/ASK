@@ -43,12 +43,14 @@ ETH_HLEN, VLAN_HLEN = 14, 4
 # frame long.
 STRAY_LIMIT, FRAME_MAX = 12, 1518
 # CDX's debug knob withholding proofs that hardware entries are gone: each
-# completed unlink reports its barrier failed, each retry barrier fails, until
-# the count is spent. Absent from a production build.
+# barrier a retirement asks for reports failure, retries included, until the
+# count is spent. Absent from a production build.
 FAIL_SYNC = "/sys/module/cdx/parameters/flowtable_fail_sync"
-# Both directions' deletes, then three of the retries the invalidation worker
-# makes once a second: the entries stay unproven for about three seconds, long
-# past the device's unregistration and the reap that follows it.
+# The barrier the two directions' unlinks owe -- one, or one each when Linux's
+# own cleanup and the adapter's retirement each reach one first -- then the
+# retries the invalidation worker makes once a second: the entries stay
+# unproven for about three seconds, long past the device's unregistration and
+# the reap that follows it.
 WITHHELD_PROOFS = 5
 
 
@@ -302,7 +304,7 @@ async def test_record_waits_for_an_unproven_delete(offload_service_stopped,
                                and not s["stats_retained"], timeout=20)
         assert settled["invalidated"] == 1 and not settled["fatal"] and not settled["entries"], \
             settled
-        assert settled["errors"] - before["errors"] == 2, (before, settled)
+        assert 1 <= settled["errors"] - before["errors"] <= 2, (before, settled)
         assert settled["stats_deferred"] == deferred["stats_deferred"], settled
         assert settled["vlan_records"] == 0, settled
         assert (await read(r.target, r.session, FAIL_SYNC)).strip() == "0"

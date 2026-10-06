@@ -249,17 +249,35 @@ async def observe(operation, body, state):
     if operation == "delete_table":
         from .agent import exec_cmd
         started = time.monotonic()
-        deleted = await exec_cmd({"argv": ["nft", "delete", "table", "inet", body["table"]],
-                                  "timeout_ms": body.get("timeout", 30) * 1000}, state)
+        deleting = asyncio.create_task(exec_cmd(
+            {"argv": ["nft", "delete", "table", "inet", body["table"]],
+             "timeout_ms": body.get("timeout", 30) * 1000}, state))
+        # Readers while the delete retires the table, as wait_entries
+        # measures them afterwards.
+        longest = 0.0
+        while not deleting.done():
+            began = time.monotonic()
+            await asyncio.to_thread(read_state, summary=True)
+            longest = max(longest, time.monotonic() - began)
+            await asyncio.wait({deleting}, timeout=0.1)
+        deleted = await deleting
         result = await observe("wait_entries", {"count": 0, "unbound": True,
                                                 "timeout": body.get("timeout", 30)}, state)
-        return {**result, "delete_seconds": time.monotonic() - started, "delete_rc": deleted["rc"]}
+        return {**result, "delete_seconds": time.monotonic() - started, "delete_rc": deleted["rc"],
+                "longest_read_seconds": max(longest, result["longest_read_seconds"])}
     if operation == "wait_entries":
         start = time.monotonic()
+        # The longest a header read waited: the header takes the adapter's
+        # transaction, so this is how long a reader stood behind whatever
+        # retirement or admission held it meanwhile.
+        longest = 0.0
         while True:
+            began = time.monotonic()
             result = await asyncio.to_thread(read_state, summary=True)
+            longest = max(longest, time.monotonic() - began)
             if result["entries"] == body["count"] and (not body.get("unbound") or not result["bindings"]):
-                return {**result, "wait_seconds": time.monotonic() - start}
+                return {**result, "wait_seconds": time.monotonic() - start,
+                        "longest_read_seconds": longest}
             if time.monotonic() - start >= body.get("timeout", 90):
                 raise TimeoutError(f"expected {body['count']} entries: {result}")
             await asyncio.sleep(0.1)

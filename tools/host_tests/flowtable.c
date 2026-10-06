@@ -651,8 +651,11 @@ static void flow_rule_match_cvlan(struct flow_rule *r, struct flow_match_vlan *m
 struct flow_stats { u64 bytes, pkts; unsigned long lastused; };
 struct nf_flow_offload_handle { unsigned refs; bool invalid; };
 static struct nf_flow_offload_handle handle;
+/* Every validity question is counted: a walk of the table for retired
+ * generations asks one per entry, so a case can say no walk happened. */
+static unsigned handle_validity_checks;
 static bool nf_flow_offload_handle_valid(const struct nf_flow_offload_handle *h)
-{ return h && !h->invalid; }
+{ handle_validity_checks++; return h && !h->invalid; }
 static bool nf_flow_offload_handle_invalidate(struct nf_flow_offload_handle *h)
 { bool old = h->invalid; h->invalid = true; return !old; }
 /* The handle the adapter last took policy invalidation over for. */
@@ -699,7 +702,7 @@ static void flow_stats_update(struct flow_stats *s, u64 b, u64 p, u64 d, unsigne
 #include "flowtable_types.inc"
 struct cdx_ft_hw { struct cdx_ft_counters stats; };
 struct work_struct { int unused; };
-static int ft_work, ft_retire_work, ft_dev_stats_work, ft_rearm_work;
+static int ft_work, ft_retire_work, ft_settle_work, ft_dev_stats_work, ft_rearm_work;
 /* The stopped-port sweep's own declarations are compiled from the adapter;
  * these let the stubs below name its work item before they appear. */
 #define DECLARE_WORK(n, fn) int n
@@ -731,7 +734,7 @@ static unsigned ft_count, ft_bound, ft_parked, ft_fail_stage, ft_init_fail_stage
 static unsigned int ft_qos_mark_mask, ft_qos_default_class;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations;
+static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations, ft_destroy_deferrals;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static u64 atomic64_inc_return(u64 *v) { return ++*v; }
 static u64 atomic64_read_acquire(u64 *v) { return *v; }
@@ -770,8 +773,22 @@ static bool rtnl_trylock(void)
 static void rtnl_lock(void) { assert(!rtnl && !cdx_info->ctrl.mutex && !ft_watch_lock); rtnl = true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
 static int dpa_cfg_quiesce(void) { assert(rtnl && cdx_info->ctrl.mutex); return quiesce_fail ? -EIO : 0; }
-static void cdx_ft_begin(void) { assert(!ft_watch_lock); mutex_lock(&cdx_info->ctrl.mutex); }
+static bool transaction_busy;
+/* Waiting for a transaction another thread holds would sleep behind it,
+ * which is what a case setting transaction_busy says nothing may do. */
+static void cdx_ft_begin(void)
+{ assert(!ft_watch_lock && !transaction_busy); mutex_lock(&cdx_info->ctrl.mutex); }
 static void cdx_ft_end(void) { assert(!ft_watch_lock); mutex_unlock(&cdx_info->ctrl.mutex); }
+/* The transaction without waiting for it. A case holding it on another
+ * thread's behalf sets transaction_busy; every try is counted, won or lost. */
+static unsigned transaction_tries;
+static bool cdx_ft_trybegin(void)
+{
+    transaction_tries++;
+    if (transaction_busy || cdx_info->ctrl.mutex) return false;
+    cdx_ft_begin();
+    return true;
+}
 static void cdx_ft_assert_held(void) { assert(cdx_info->ctrl.mutex); }
 static bool *block_write_lock;
 static void down_write(bool *lock)
@@ -884,7 +901,10 @@ static bool cdx_ft_failed(void) { return ft_fatal; }
 static bool ft_restarting;
 static bool cdx_ft_terminal(void) { assert(cdx_info->ctrl.mutex); return ft_fatal && !ft_restarting; }
 static bool cdx_ft_observing(void) { return ft_observe; }
-static unsigned cdx_ft_pending(void) { return private_pending + legacy_pending; }
+/* Unlinks whose barrier is owed to the next settle: retired, so pending like
+ * any other retirement until a barrier proves them. */
+static unsigned owed;
+static unsigned cdx_ft_pending(void) { return private_pending + legacy_pending + owed; }
 /* The barrier a retry issues, and whether it completes. A completed one proves
  * every deletion before it, the backend's own and those CDX parked for itself,
  * so both pending counts go with it. A failed one leaves both, and reports
@@ -901,8 +921,8 @@ static int cdx_ft_recover(void)
         if (rc) return -EAGAIN;
     }
     if (!barrier_fails)
-        private_pending = legacy_pending = 0;
-    return barrier_fails && private_pending ? -EAGAIN : retry_error;
+        private_pending = legacy_pending = owed = 0;
+    return barrier_fails && (private_pending || owed) ? -EAGAIN : retry_error;
 }
 /* The parked rearm's retry is counted apart from the invalidation worker's,
  * so a case can say which of the two was asked to come back. */
@@ -911,7 +931,8 @@ static unsigned rearm_retries;
  * Cases mostly run a work function by hand instead of from the queue, so this
  * only means something across a stretch a case clears it for -- a load that
  * fails, which must leave nothing queued against text about to go. */
-static bool work_queued_invalidate, work_queued_retire, work_queued_rearm, work_queued_dev_stats;
+static bool work_queued_invalidate, work_queued_retire, work_queued_rearm, work_queued_dev_stats,
+            work_queued_settle;
 /* A rearm asked for at once, as CDX's restart does, rather than retried. */
 static unsigned rearm_kicks;
 static void schedule_delayed_work(int *work, unsigned delay)
@@ -922,13 +943,19 @@ static void schedule_delayed_work(int *work, unsigned delay)
     scheduled++;
     work_queued_invalidate = true;
 }
-static unsigned neigh_scheduled, dev_stats_scheduled, stopped_scheduled, follow_scheduled;
+static unsigned neigh_scheduled, dev_stats_scheduled, stopped_scheduled, follow_scheduled,
+                settle_scheduled;
 static int ft_ipsec_retire, ft_ipsec_follow, ft_ipsec_stats;
 static void schedule_work(int *work)
 {
     if (work == &ft_mr_work) { mroute_kicks++; return; }
     if (work == &ft_stopped_work) { stopped_scheduled++; return; }
     if (work == &ft_ipsec_follow) { follow_scheduled++; return; }
+    /* Asked for only with an unlink left owed under the transaction. */
+    if (work == &ft_settle_work) {
+        assert(cdx_info->ctrl.mutex && owed);
+        settle_scheduled++; work_queued_settle = true; return;
+    }
     assert(work == &ft_retire_work || work == &ft_dev_stats_work);
     if (work == &ft_dev_stats_work) { dev_stats_scheduled++; work_queued_dev_stats = true; }
     else { neigh_scheduled++; work_queued_retire = true; }
@@ -992,12 +1019,39 @@ static bool ft_ipsec_rebuild_pending(const struct net_device *dev)
 static bool ipsec_retiring;
 static bool ft_ipsec_retire_pending(void)
 { assert(cdx_info->ctrl.mutex); return ipsec_retiring; }
-/* Work items run where they are flushed, which is what flushing proves. */
+/* Work items run where they are flushed, which is what flushing proves. The
+ * adapter's own two run only if queued, as the workqueue's would; one that
+ * requeues itself while it runs is pending again afterwards, which is what a
+ * caller that has to see it finish asks. */
 static void ft_retire_workfn(struct work_struct *work);
+static void ft_settle_workfn(struct work_struct *work);
 static void ft_invalidate_work(struct work_struct *work);
-static unsigned stopped_flushes, follow_flushes, ipsec_retire_flushes;
+static unsigned stopped_flushes, follow_flushes, ipsec_retire_flushes, retire_flushes;
+static bool retire_requeued_meanwhile;
+static bool work_pending(int *work)
+{
+    assert(work == &ft_retire_work);
+    return work_queued_retire;
+}
 static void flush_work(int *work)
 {
+    if (work == &ft_retire_work) {
+        retire_flushes++;
+        if (work_queued_retire) {
+            work_queued_retire = false;
+            ft_retire_workfn(NULL);
+        }
+        /* Retirements queued again as fast as each run finishes. */
+        if (retire_requeued_meanwhile) work_queued_retire = true;
+        return;
+    }
+    if (work == &ft_settle_work) {
+        if (work_queued_settle) {
+            work_queued_settle = false;
+            ft_settle_workfn(NULL);
+        }
+        return;
+    }
     if (work == &ft_stopped_work) {
         /* Only once nothing can queue it again; and on unload, while the
          * rule callbacks the sweep's native cleanup flushes are still
@@ -1011,7 +1065,6 @@ static void flush_work(int *work)
         ft_stopped_workfn(NULL);
         return;
     }
-    if (work == &ft_retire_work) { ft_retire_workfn(NULL); return; }
     if (work == &ft_ipsec_follow) {
         assert(!cdx_info->ctrl.mutex);
         follow_flushes++;
@@ -1128,7 +1181,38 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls, struct cdx_ft_ru
  * declarations, which the production decoder is included ahead of. Takes no
  * reference, exactly as the kernel's does under RTNL. */
 static struct net_device *__dev_get_by_index(struct net *net, int ifindex);
+typedef int atomic_t;
+#define ATOMIC_INIT(n) (n)
 static int atomic_read(int *v) { return *v; }
+static int atomic_xchg(int *v, int n) { int old = *v; *v = n; return old; }
+/* The lock-free list deletions that found the transaction held leave their
+ * records on: a stack, newest first, as the kernel's. */
+struct llist_node { struct llist_node *next; };
+struct llist_head { struct llist_node *first; };
+#define LLIST_HEAD(name) struct llist_head name = { NULL }
+static bool llist_add(struct llist_node *node, struct llist_head *head)
+{ bool empty = !head->first; node->next = head->first; head->first = node; return empty; }
+static struct llist_node *llist_del_all(struct llist_head *head)
+{ struct llist_node *first = head->first; head->first = NULL; return first; }
+#define llist_entry(p, t, m) container_of(p, t, m)
+#define llist_for_each_entry_safe(pos, n, node, member)                         \
+    for (pos = llist_entry((node), typeof(*pos), member);                      \
+         (uintptr_t)(pos) + offsetof(typeof(*pos), member) &&                  \
+         (n = llist_entry(pos->member.next, typeof(*n), member), true);        \
+         pos = n)
+/* A record's allocation, which may not sleep: the deletion that makes it found
+ * the transaction held and is not to wait. A case can fail it. */
+#define GFP_NOWAIT 2
+#define __GFP_NOWARN 4
+static bool nowait_fail;
+static unsigned nowait_allocations;
+static void *kmalloc(size_t n, int flags)
+{
+    assert(flags == (GFP_NOWAIT | __GFP_NOWARN));
+    if (nowait_fail) return NULL;
+    nowait_allocations++; allocated++;
+    return malloc(n);
+}
 static void atomic_set(int *v, int n) { *v = n; }
 static void atomic_inc(int *v) { ++*v; }
 static int ft_invalid_seq, ft_done_seq;
@@ -1415,8 +1499,39 @@ static int cdx_ft_add(const struct cdx_ft_rule *r,
     }
     return 0;
 }
-static int cdx_ft_del(struct cdx_ft_hw **hw)
-{ assert(*hw && live_hw); live_hw--; free(*hw); *hw = NULL; if (deletion_error == -EIO) ft_fatal = true; return deletion_error; }
+/* The backend's deferred delete: an unlink retires an entry with its barrier
+ * owed, and a settle issues one barrier for every unlink owed since the last.
+ * deletion_error says how either goes: -EIO is the unlink's own hard failure,
+ * latched as the backend latches it; -EAGAIN is a barrier that fails, which
+ * the settle asking for it reports, as it does when the recovery's barrier
+ * would fail too. A failed settle leaves what it owed as ordinary unproven
+ * retirements, owed nothing more; a completed one proves every deletion
+ * before it, as the recovery's does. */
+static unsigned unlinks, settles;
+static int cdx_ft_unlink(struct cdx_ft_hw **hw)
+{
+    assert(cdx_info->ctrl.mutex && *hw && live_hw);
+    live_hw--; free(*hw); *hw = NULL; unlinks++;
+    if (deletion_error == -EIO) { ft_fatal = true; return -EIO; }
+    owed++;
+    return 0;
+}
+static unsigned cdx_ft_owed(void) { assert(cdx_info->ctrl.mutex); return owed; }
+static int cdx_ft_settle(unsigned *unproven)
+{
+    assert(cdx_info->ctrl.mutex);
+    *unproven = 0;
+    if (!owed) return 0;
+    settles++;
+    if (deletion_error == -EAGAIN || barrier_fails) {
+        *unproven = owed;
+        private_pending += owed;
+        owed = 0;
+        return -EAGAIN;
+    }
+    owed = private_pending = legacy_pending = 0;
+    return 0;
+}
 static void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats) { *stats = hw->stats; }
 
 /* Registration infrastructure; backend claim semantics are exercised against
@@ -1483,13 +1598,16 @@ static unsigned mc_switches;
 static void ft_mc_switched(void) { assert(ft_ready); mc_switches++; }
 static void cancel_work_sync(int *work)
 {
-    assert(work == &ft_retire_work || work == &ft_ipsec_follow || work == &ft_dev_stats_work);
-    /* CDX's egress hook queues both of these, and nothing the adapter
-     * unregisters before it excludes the hook, so cancelling either while it
-     * is still registered could be undone by the next call. */
+    assert(work == &ft_retire_work || work == &ft_settle_work || work == &ft_ipsec_follow ||
+           work == &ft_dev_stats_work);
+    /* CDX's egress hook queues the first and the follower, and Linux's own
+     * deletions the settle; nothing the adapter unregisters before the hook
+     * excludes any of them, so cancelling one while it is still registered
+     * could be undone by the next call. */
     if (work != &ft_dev_stats_work)
         assert(!registered_egress_changed);
     if (work == &ft_retire_work) work_queued_retire = false;
+    if (work == &ft_settle_work) work_queued_settle = false;
     if (work == &ft_dev_stats_work) work_queued_dev_stats = false;
     canceled++;
 }
@@ -1512,15 +1630,16 @@ static void unregister_indirect(void (*release)(void *))
 {
     assert(indirect_registered && !cdx_info->ctrl.mutex);
     /* Both unwinds stop new binds first. Unload gives this route back last,
-     * with all five works cancelled -- retirement, the delayed installer, the
-     * parked rearm's retry, the SA next-hop follower and the SA accounting
-     * pass -- and every notifier already gone. A load unwinding its own
+     * with all six works cancelled -- retirement, the settle Linux's own
+     * deletions left, the delayed installer, the parked rearm's retry, the SA
+     * next-hop follower and the SA accounting pass -- and every notifier
+     * already gone. A load unwinding its own
      * failure gives it back first and cancels the works after, once nothing
      * bound is left to queue them, with its notifiers still registered: that
      * is what tells the two apart. */
     assert(ft_stopping);
     if (!netdev_registered) {
-        assert(canceled == 5);
+        assert(canceled == 6);
         assert(!neigh_registered && !fib_registered && !nexthop_registered);
         assert(!fdb_registered && !swdev_obj_registered);
     } else {
@@ -1554,16 +1673,47 @@ static unsigned unload_sleeps, unload_failures;
 static void msleep(unsigned ms)
 {
     assert(ms == 1000 && backend_claimed && !cdx_info->ctrl.mutex && !rtnl);
-    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 5);
+    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 6);
     assert(unload_failures);
     unload_sleeps++;
     if (!--unload_failures) { retry_error=0; quiesce_fail=false; }
 }
+/* Where a walk retiring entries a batch at a time lets the transaction go:
+ * only ever outside it, and counted, so a case can say how many times. */
+static unsigned reschedules;
+static void cond_resched(void) { assert(!cdx_info->ctrl.mutex); reschedules++; }
 #define NF_BR_LOCAL_OUT 3
 #define NF_BR_POST_ROUTING 4
 static unsigned bridge_hooks;
 static bool ft_bridge_hooked(unsigned hooks) { return bridge_hooks & hooks; }
 #include "flowtable_production.inc"
+
+/* Most cases drive admission and removal directly, standing in for the rule
+ * callback that holds the transaction around both; both settle the barrier
+ * their unlinks owe, which only the transaction may ask for. These take it for
+ * a case that does not already hold it. */
+static int replace_held(struct cdx_ft_binding *binding, struct flow_cls_offload *cls)
+{
+    bool held = cdx_info->ctrl.mutex;
+    int rc;
+
+    if (!held) cdx_ft_begin();
+    rc = ft_replace(binding, cls);
+    if (!held) cdx_ft_end();
+    return rc;
+}
+static int remove_held(struct cdx_ft_entry *entry)
+{
+    bool held = cdx_info->ctrl.mutex;
+    int rc;
+
+    if (!held) cdx_ft_begin();
+    rc = ft_remove(entry);
+    if (!held) cdx_ft_end();
+    return rc;
+}
+#define ft_replace(binding, cls) replace_held(binding, cls)
+#define ft_remove(entry) remove_held(entry)
 
 static struct net_device in = { .ifindex = 5, .mtu = 1500, .type = ARPHRD_ETHER,
                                 .dev_addr = {2, 0, 0, 0, 0, 1} };
@@ -5417,10 +5567,329 @@ static void test_connections(void)
     neighbour.dead = true;
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
     assert(!ft_invalid && handle.invalid && ft_count == ARRAY_SIZE(entries));
-    ft_retire_workfn(NULL);
+    /* A batch a run: each unlinks at most FT_RETIRE_BATCH of them, settles
+     * those behind one barrier before it lets the transaction go, and queues
+     * the next run behind whatever waited for the transaction meanwhile -- so
+     * a full table takes as many runs as it has batches, not one walk. */
+    {
+        unsigned runs = 0, queued = neigh_scheduled;
+
+        work_queued_retire = true;
+        while (work_queued_retire) {
+            unsigned before = settles, left = ft_count;
+
+            work_queued_retire = false;
+            ft_retire_workfn(NULL);
+            runs++;
+            assert(!cdx_info->ctrl.mutex && !owed && settles == before + 1);
+            assert(ft_count == left - (left < FT_RETIRE_BATCH ? left : FT_RETIRE_BATCH));
+            assert(work_queued_retire == !!ft_count);
+        }
+        assert(runs == (ARRAY_SIZE(entries) + FT_RETIRE_BATCH - 1) / FT_RETIRE_BATCH);
+        assert(neigh_scheduled == queued + runs - 1);
+    }
     assert(!ft_count && !live_hw && !allocated && !ft_neighbour_refs && !neighbour.refs);
     assert(!out.refs && ft_installs == ft_deletes && ft_errors == errors);
     ft_invalid = 0; ft_invalid_done = false;
+}
+
+/* Retirement behind one barrier per batch rather than one per entry: Linux's
+ * own deletions share theirs, a failed one is one failure however many
+ * unlinks it owed, and a binding going with more than a batch lets the
+ * transaction go between batches. */
+static void test_batched_retirement(void)
+{
+    struct cdx_ft_entry *entry;
+    u64 errors = ft_errors, installs = ft_installs, deletes = ft_deletes;
+    unsigned before, scheduled;
+
+    /* A deletion owes its barrier to the work the last of Linux's burst
+     * leaves it to, every deletion queued behind it up to a batch shares the
+     * one barrier, and the deletion that fills the batch settles it there
+     * and then. A queued settle that then finds nothing owed asks for
+     * nothing. */
+    fixture();
+    for (unsigned i = 0; i <= FT_RETIRE_BATCH; i++) {
+        connection_rule(i);
+        assert(ft_replace(&binding, &cls) == 0);
+    }
+    before = settles; scheduled = settle_scheduled;
+    cls.command = FLOW_CLS_DESTROY;
+    for (unsigned i = 0; i < FT_RETIRE_BATCH; i++) {
+        connection_rule(i);
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        assert(!ft_find(&binding, cls.cookie) && ft_count == FT_RETIRE_BATCH - i);
+        if (i + 1 == FT_RETIRE_BATCH)
+            break;
+        assert(owed == i + 1 && cdx_ft_pending() == i + 1 && settles == before);
+        assert(work_queued_settle && settle_scheduled == scheduled + i + 1);
+    }
+    assert(!owed && !cdx_ft_pending() && settles == before + 1);
+    assert(settle_scheduled == scheduled + FT_RETIRE_BATCH - 1);
+    flush_work(&ft_settle_work);
+    assert(!work_queued_settle && settles == before + 1);
+    /* The last of a burst is the work's to settle, or the next admission's,
+     * which proves the retirement before it admits anything. */
+    connection_rule(FT_RETIRE_BATCH);
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    assert(!ft_count && !live_hw && owed == 1 && work_queued_settle);
+    flush_work(&ft_settle_work);
+    assert(!owed && settles == before + 2);
+    cls.command = FLOW_CLS_REPLACE;
+    connection_rule(0);
+    assert(ft_replace(&binding, &cls) == 0);
+    cls.command = FLOW_CLS_DESTROY;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && owed == 1);
+    cls.command = FLOW_CLS_REPLACE;
+    assert(ft_replace(&binding, &cls) == 0 && !owed && settles == before + 3 && ft_count == 1);
+    /* An unload may already have cancelled that work for good, so while one
+     * is in progress every deletion settles its own. */
+    ft_stopping = true; scheduled = settle_scheduled;
+    cls.command = FLOW_CLS_DESTROY;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    assert(!ft_count && !owed && settles == before + 4 && settle_scheduled == scheduled);
+    ft_stopping = false; work_queued_settle = false;
+    cls.command = FLOW_CLS_REPLACE;
+    assert(ft_errors == errors && !ft_invalid && !ft_fatal && !live_hw);
+
+    /* A barrier that fails is one failed deletion, however many unlinks it
+     * owed: counted once and escalated, its unlinks left as unproven
+     * retirements for the recovery to prove. */
+    fixture();
+    for (unsigned i = 0; i < 3; i++) {
+        connection_rule(i);
+        assert(ft_replace(&binding, &cls) == 0);
+    }
+    ft_handle_invalidate(&handle, &ft_neigh_invalidations);
+    assert(handle.invalid && work_queued_retire);
+    before = settles;
+    unsigned unlinked = unlinks;
+    deletion_error = -EAGAIN;
+    flush_work(&ft_retire_work);
+    deletion_error = 0;
+    assert(!ft_count && !live_hw && unlinks == unlinked + 3 && settles == before + 1);
+    assert(ft_errors == errors + 1 && ft_invalid && !ft_fatal);
+    assert(!owed && private_pending == 3 && cdx_ft_pending() == 3);
+    ft_invalidate_work(NULL);
+    assert(ft_invalid_done && !cdx_ft_pending() && ft_errors == errors + 1);
+    ft_invalid = 0; ft_invalid_done = false;
+
+    /* A binding going retires only its own entries, a batch at a time,
+     * letting the transaction go between batches and settling each batch
+     * before it does. */
+    fixture();
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+    struct cdx_ft_binding *bound = list_entry(ft_bindings.next, struct cdx_ft_binding, list);
+    unsigned mine = 0, others = 0;
+    for (unsigned i = 0; i < 2 * FT_RETIRE_BATCH + 12; i++) {
+        bool other = i % 50 == 7;
+
+        connection_rule(i);
+        assert(ft_replace(other ? &binding : bound, &cls) == 0);
+        if (other) others++; else mine++;
+    }
+    unsigned batches = (mine + FT_RETIRE_BATCH - 1) / FT_RETIRE_BATCH, drops = reschedules;
+    before = settles;
+    assert(batches > 2 && others);
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+    assert(reschedules == drops + batches - 1 && settles == before + batches);
+    assert(!ft_bound && ft_count == others && live_hw == others && !owed);
+    list_for_each_entry(entry, &ft_entries, list)
+        assert(entry->binding == &binding);
+    while (ft_entries.next != &ft_entries)
+        assert(ft_remove(list_entry(ft_entries.next, struct cdx_ft_entry, list)) == 0);
+    assert(!ft_count && !live_hw && !allocated && !in.refs && !ft_handle_refs);
+    assert(ft_errors == errors + 1 && ft_installs - installs == ft_deletes - deletes);
+
+    /* A deletion that finds the transaction held waits for none of it: it
+     * retires the generation instead, counted once however often Linux
+     * repeats it, and leaves a record naming its entry, holding the handle.
+     * The retirement work takes the entry out in its next run by that record,
+     * behind one barrier and without walking the table, and drops the record
+     * a repeat left once the entry is gone. Until then the stale entry's
+     * cookie refuses a new generation rather than being taken for it; once
+     * it is gone the new one is admitted. */
+    {
+        struct nf_flow_offload_handle gens[3] = { { .refs = 1 }, { .refs = 1 }, { .refs = 1 } };
+        struct nf_flow_offload_handle next = { .refs = 1 };
+        unsigned tries = transaction_tries, queued, rejected, records = nowait_allocations;
+        unsigned checks;
+        u64 deferrals = ft_destroy_deferrals;
+        struct cdx_ft_entry *stale;
+
+        fixture();
+        assert(!ft_retire_scan && !ft_deferred_destroys.first);
+        for (unsigned i = 0; i < 3; i++) {
+            connection_rule(i);
+            cls.nf_handle = &gens[i];
+            assert(ft_replace(&binding, &cls) == 0);
+        }
+        connection_rule(1);
+        cls.nf_handle = &gens[1];
+        stale = ft_find(&binding, cls.cookie);
+        assert(stale && stale->handle == &gens[1] && gens[1].refs == 2);
+        before = settles; unlinked = unlinks; queued = neigh_scheduled;
+        work_queued_retire = false;
+        transaction_busy = true;
+        cls.command = FLOW_CLS_DESTROY;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        assert(transaction_tries == tries + 1 && !cdx_info->ctrl.mutex);
+        assert(gens[1].invalid && !gens[0].invalid && !gens[2].invalid);
+        assert(ft_destroy_deferrals == deferrals + 1 && work_queued_retire);
+        assert(neigh_scheduled == queued + 1);
+        assert(ft_find(&binding, cls.cookie) == stale && ft_count == 3 && live_hw == 3);
+        assert(unlinks == unlinked && !owed && settles == before);
+        assert(nowait_allocations == records + 1 && gens[1].refs == 3 && !ft_retire_scan);
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        assert(transaction_tries == tries + 2 && ft_destroy_deferrals == deferrals + 1);
+        assert(ft_count == 3 && unlinks == unlinked);
+        assert(nowait_allocations == records + 2 && gens[1].refs == 4 && !ft_retire_scan);
+        transaction_busy = false;
+        /* The next generation of the same direction, under the same cookie. */
+        cls.command = FLOW_CLS_REPLACE;
+        cls.nf_handle = &next;
+        rejected = ft_rejects;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -ESTALE);
+        assert(ft_rejects == rejected + 1 && ft_find(&binding, cls.cookie) == stale);
+        assert(next.refs == 1 && !next.invalid && ft_count == 3 && !ft_retire_scan);
+        checks = handle_validity_checks;
+        flush_work(&ft_retire_work);
+        assert(!work_queued_retire && unlinks == unlinked + 1 && settles == before + 1 && !owed);
+        assert(!ft_find(&binding, cls.cookie) && ft_count == 2 && gens[1].refs == 1);
+        assert(handle_validity_checks == checks && !ft_deferred_destroys.first);
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        assert(ft_find(&binding, cls.cookie)->handle == &next && next.refs == 2 && ft_count == 3);
+        while (ft_entries.next != &ft_entries)
+            assert(ft_remove(list_entry(ft_entries.next, struct cdx_ft_entry, list)) == 0);
+        assert(gens[0].refs == 1 && gens[2].refs == 1 && next.refs == 1);
+        assert(!ft_count && !live_hw && !allocated && !ft_handle_refs && !ft_invalid);
+        assert(ft_errors == errors + 1);
+    }
+
+    /* A record whose entry left with its binding: the release takes the entry
+     * out, and the record, which only compared the binding, is dropped with
+     * its hold on the handle, unlinking nothing more. */
+    {
+        struct nf_flow_offload_handle gens[2] = { { .refs = 1 }, { .refs = 1 } };
+        unsigned checks;
+
+        fixture();
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+        struct cdx_ft_binding *gone = list_entry(ft_bindings.next, struct cdx_ft_binding, list);
+        for (unsigned i = 0; i < 2; i++) {
+            connection_rule(i);
+            cls.nf_handle = &gens[i];
+            assert(ft_replace(gone, &cls) == 0);
+        }
+        transaction_busy = true;
+        cls.command = FLOW_CLS_DESTROY;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, gone) == 0);
+        transaction_busy = false;
+        cls.command = FLOW_CLS_REPLACE;
+        assert(gens[1].refs == 3 && ft_deferred_destroys.first && work_queued_retire);
+        assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+        assert(!ft_count && !ft_bound && gens[0].refs == 1 && gens[1].refs == 2);
+        before = settles; unlinked = unlinks; checks = handle_validity_checks;
+        flush_work(&ft_retire_work);
+        assert(!ft_deferred_destroys.first && gens[1].refs == 1 && !allocated);
+        assert(unlinks == unlinked && settles == before && handle_validity_checks == checks);
+    }
+
+    /* More records than one run takes: a batch of them a run, each run
+     * settled behind one barrier and none of them a walk. */
+    {
+        enum { DEFERRED = 2 * FT_RETIRE_BATCH + 3 };
+        static struct nf_flow_offload_handle gens[DEFERRED];
+        unsigned runs = 0, checks = handle_validity_checks;
+
+        fixture();
+        for (unsigned i = 0; i < DEFERRED; i++) {
+            gens[i] = (struct nf_flow_offload_handle){ .refs = 1 };
+            connection_rule(i);
+            cls.nf_handle = &gens[i];
+            assert(ft_replace(&binding, &cls) == 0);
+        }
+        checks = handle_validity_checks;
+        transaction_busy = true;
+        cls.command = FLOW_CLS_DESTROY;
+        for (unsigned i = 0; i < DEFERRED; i++) {
+            connection_rule(i);
+            cls.nf_handle = &gens[i];
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        }
+        transaction_busy = false;
+        cls.command = FLOW_CLS_REPLACE;
+        assert(ft_count == DEFERRED && !ft_retire_scan && work_queued_retire);
+        while (work_queued_retire) {
+            unsigned left = ft_count;
+
+            before = settles;
+            work_queued_retire = false;
+            ft_retire_workfn(NULL);
+            runs++;
+            assert(settles == before + 1 && !owed);
+            assert(ft_count == left - (left < FT_RETIRE_BATCH ? left : FT_RETIRE_BATCH));
+            assert(work_queued_retire == !!ft_count);
+        }
+        assert(runs == (DEFERRED + FT_RETIRE_BATCH - 1) / FT_RETIRE_BATCH);
+        assert(handle_validity_checks == checks && !ft_deferred_destroys.first);
+        for (unsigned i = 0; i < DEFERRED; i++)
+            assert(gens[i].refs == 1 && gens[i].invalid);
+        assert(!live_hw && !allocated && !ft_handle_refs);
+    }
+
+    /* A record that cannot be had without sleeping: the handle is marked all
+     * the same, and the walk finds it, as for any other marked handle. */
+    {
+        struct nf_flow_offload_handle gen = { .refs = 1 };
+        unsigned records = nowait_allocations, checks;
+
+        fixture();
+        connection_rule(0);
+        cls.nf_handle = &gen;
+        assert(ft_replace(&binding, &cls) == 0);
+        transaction_busy = true; nowait_fail = true;
+        cls.command = FLOW_CLS_DESTROY;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        transaction_busy = false; nowait_fail = false;
+        cls.command = FLOW_CLS_REPLACE;
+        assert(nowait_allocations == records && gen.refs == 2 && gen.invalid);
+        assert(ft_retire_scan && !ft_deferred_destroys.first && work_queued_retire);
+        checks = handle_validity_checks;
+        flush_work(&ft_retire_work);
+        assert(handle_validity_checks > checks && !ft_retire_scan);
+        assert(!ft_count && gen.refs == 1 && !live_hw && !allocated);
+    }
+
+    /* Unload's drop of whatever records are left: each freed, its hold on
+     * the handle given back, its entry untouched. */
+    {
+        struct nf_flow_offload_handle gens[2] = { { .refs = 1 }, { .refs = 1 } };
+
+        fixture();
+        transaction_busy = true;
+        for (unsigned i = 0; i < 2; i++) {
+            connection_rule(i);
+            cls.nf_handle = &gens[i];
+            cls.command = FLOW_CLS_REPLACE;
+            transaction_busy = false;
+            assert(ft_replace(&binding, &cls) == 0);
+            transaction_busy = true;
+            cls.command = FLOW_CLS_DESTROY;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        }
+        transaction_busy = false;
+        cls.command = FLOW_CLS_REPLACE;
+        assert(gens[0].refs == 3 && gens[1].refs == 3 && allocated == 4);
+        unlinked = unlinks;
+        ft_deferred_destroys_drop();
+        assert(!ft_deferred_destroys.first && gens[0].refs == 2 && gens[1].refs == 2);
+        assert(allocated == 2 && ft_count == 2 && unlinks == unlinked);
+        while (ft_entries.next != &ft_entries)
+            assert(ft_remove(list_entry(ft_entries.next, struct cdx_ft_entry, list)) == 0);
+        assert(gens[0].refs == 1 && gens[1].refs == 1 && !allocated && !ft_handle_refs);
+        work_queued_retire = false;
+    }
 }
 
 static void test_selective_neighbours(void)
@@ -5736,7 +6205,7 @@ static void test_installed_reoffer(void)
     for (unsigned busy = 0; busy < 2; busy++) {
         fixture(); cls.command = FLOW_CLS_REPLACE;
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-        nf_flow_offload_handle_invalidate(&handle);
+        ft_handle_invalidate(&handle, &ft_route_invalidations);
         u64 busy_before = ft_busy, admission = ft_admission_invalidations;
         unsigned trylocks = rtnl_trylocks;
         rtnl_busy = busy;
@@ -7232,6 +7701,43 @@ static void test_egress_drain(void)
     assert(!ft_egress_drain(&out));
     assert(!ft_count && !live_hw && !allocated && !out.refs);
 
+    /* More of them than one retirement batch: the work requeues itself after
+     * each, so the drain flushes it until it stays idle. And a deletion of
+     * Linux's own whose barrier is still owed to the settle work is waited
+     * for too. */
+    fixture();
+    for (unsigned i = 0; i < 2 * FT_RETIRE_BATCH + 1; i++) {
+        connection_rule(i);
+        assert(ft_replace(&binding, &cls) == 0);
+    }
+    ft_egress_changed(&out);
+    assert(handle.invalid && work_queued_retire);
+    {
+        unsigned flushes = retire_flushes, before = settles;
+
+        assert(!ft_egress_drain(&out));
+        assert(retire_flushes == flushes + 3 && settles == before + 3 && !work_queued_retire);
+    }
+    assert(!ft_count && !live_hw && !allocated && !out.refs && !owed);
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    cls.command = FLOW_CLS_DESTROY;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    cls.command = FLOW_CLS_REPLACE;
+    assert(owed == 1 && work_queued_settle);
+    assert(!ft_egress_drain(&out) && !owed && !work_queued_settle && !cdx_ft_pending());
+    /* Retirements that keep the work queued as fast as it runs are not
+     * waited out: the drain waits for as many runs as a full table takes,
+     * and then goes on to what else it has to wait for. */
+    {
+        unsigned flushes = retire_flushes;
+
+        work_queued_retire = retire_requeued_meanwhile = true;
+        assert(!ft_egress_drain(&out));
+        assert(retire_flushes == flushes + 1 + CDX_FT_MAX_ENTRIES / FT_RETIRE_BATCH);
+        retire_requeued_meanwhile = work_queued_retire = false;
+    }
+
     /* An admission the change races. The entry is on the watch list before
      * its hardware entry is built, so the change marks it mid-install and
      * the admission takes back what it built rather than leaving an entry
@@ -7756,6 +8262,7 @@ int main(void)
     test_rearm();
     test_gateways();
     test_connections();
+    test_batched_retirement();
     test_neighbours();
     test_selective_neighbours();
     test_selective_routes();

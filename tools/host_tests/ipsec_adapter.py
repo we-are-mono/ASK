@@ -109,7 +109,8 @@ def test_ipsec_adapter(tmp_path):
         "ft_ipsec_retiring_in_the_way",
         "ft_ipsec_remember", "ft_ipsec_forget_all", "ft_ipsec_refuses",
         "ft_ipsec_fold_window", "ft_ipsec_fold_oseq", "ft_ipsec_fold",
-        "ft_xdo_state_add", "ft_ipsec_none_left", "ft_ipsec_retire_work",
+        "ft_xdo_state_add", "ft_ipsec_none_left", "ft_names_sa", "ft_retire_batch",
+        "ft_ipsec_retire_work",
         "ft_ipsec_watch_stale", "ft_ipsec_follow_work",
         "ft_xdo_state_delete", "ft_ipsec_names_owned", "ft_ipsec_policy_served",
         "ft_xdo_policy_add",
@@ -159,6 +160,9 @@ def test_ipsec_adapter(tmp_path):
         + source[source.index("/* ------------------------------------------------- what SEC refused"):
                  source.index("/* Publish one SA's counters into its state")]
         + function(source, "ft_sec_refusal_rows")
+        # The most flows one transaction retires, which an SA that many name
+        # takes batches of.
+        + re.search(r"^#define FT_RETIRE_BATCH\s.*$", source, re.M).group() + "\n"
         + "\n".join(function(source, name) for name in names)
         + source[source.index("static const struct xfrmdev_ops ft_xfrmdev_ops = {"):
                  source.index("/* Attach the ops to a CDX physical port")]

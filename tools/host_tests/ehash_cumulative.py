@@ -45,8 +45,9 @@ def test_ehash_cumulative(tmp_path):
             "ExternalHashTableAllocCumulativeEntry",
             "ExternalHashTableCumulativeEntryFree", "ehash_node_take_spare", "ehash_node_alloc",
             "ehash_node_release",
-            "ehash_park_node", "ehash_barrier", "ExternalHashTableAddKey",
-            "ExternalHashTableFmPcdHcSync", "ehash_delete_key", "ExternalHashTableDeleteKey",
+            "ehash_park_node", "ehash_barrier", "ehash_unpark_table", "ExternalHashTableAddKey",
+            "ExternalHashTableFmPcdHcSync", "ehash_delete_key", "ehash_delete",
+            "ExternalHashTableDeleteKey", "ExternalHashTableUnlinkKey", "ExternalHashTableDeleteSync",
             "ehash_bucket_links", "ExternalHashTableFindEntry",
             "ExternalHashTableHcFailed")))
     binary = tmp_path / "ehash_cumulative"

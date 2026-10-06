@@ -104,7 +104,17 @@ void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
  * it names until the same proof releases it. A repeated delete with
  * *hw == NULL does not erase prior errors. */
 int cdx_ft_hw_del(struct cdx_ft_hw **hw);
+/* The same without the barrier: 0 once the key is unlinked, its owner retained
+ * as an unsynced retirement owed to cdx_ft_hw_settle(); -EIO as above. */
+int cdx_ft_hw_unlink(struct cdx_ft_hw **hw);
 unsigned int cdx_ft_hw_pending(void);
+/* The retirements cdx_ft_hw_unlink() left owed and no settle has failed. */
+unsigned int cdx_ft_hw_owed(void);
+/* One barrier for every owed unlink. 0: none owed, or every one proven and
+ * released. -EAGAIN: the barrier failed; *unproven owed owners are now
+ * ordinary unproven retirements, as a delete whose own barrier failed
+ * leaves, owed nothing more. */
+int cdx_ft_hw_settle(unsigned int *unproven);
 /* One barrier for every unproven unlink, CDX's parked backlog included; see
  * the definition for what the return value does and does not cover. */
 int cdx_ft_hw_retry(void);

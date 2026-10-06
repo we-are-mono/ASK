@@ -215,6 +215,11 @@ bool ft_neigh_used(struct cdx_ft_entry *entry, bool active)
 	return true;
 }
 
+static bool ft_any_entry(const struct cdx_ft_entry *entry, const void *arg)
+{
+	return true;
+}
+
 void ft_invalidate_work(struct work_struct *work)
 {
 	/* Every bound device has to be flushed, and the flush has to happen
@@ -223,7 +228,6 @@ void ft_invalidate_work(struct work_struct *work)
 	 * makes the guard below unreachable rather than a silently short flush. */
 	struct net_device *devices[CDX_FT_MAX_BINDINGS];
 	struct cdx_ft_binding *binding;
-	struct cdx_ft_entry *entry, *next;
 	unsigned int n = 0, i;
 	int seq;
 
@@ -246,8 +250,14 @@ void ft_invalidate_work(struct work_struct *work)
 		cdx_ft_end();
 		return;
 	}
-	list_for_each_entry_safe(entry, next, &ft_entries, list)
-		ft_remove(entry);
+	/* A batch at a time, letting the transaction go between batches.
+	 * Nothing is admitted meanwhile, the latch being held, and nothing
+	 * rearms: this pass has not published completion. */
+	while (ft_retire_batch(ft_any_entry, NULL)) {
+		cdx_ft_end();
+		cond_resched();
+		cdx_ft_begin();
+	}
 	/* CDX retains failed deletions and owns the hardware latch. Retry until
 	 * a barrier or the stopped datapath makes retirement safe. */
 	if (cdx_ft_recover()) {
@@ -1074,10 +1084,19 @@ static void ft_egress_changed(struct net_device *dev)
 static int ft_egress_drain(struct net_device *dev)
 {
 	bool done, retiring;
+	unsigned int i;
 	int rc;
 
 	might_sleep();
+	/* Retirement requeues itself after each batch, behind whatever queued
+	 * for the transaction meanwhile, so one flush can return with batches
+	 * left: wait for as many as a full table takes, and no more, so that
+	 * later retirements that keep it queued are not waited out with them.
+	 * Linux's own deletions leave their barrier to ft_settle_work. */
 	flush_work(&ft_retire_work);
+	for (i = 0; i < CDX_FT_MAX_ENTRIES / FT_RETIRE_BATCH && work_pending(&ft_retire_work); i++)
+		flush_work(&ft_retire_work);
+	flush_work(&ft_settle_work);
 	if (atomic_read(&ft_invalid)) {
 		flush_delayed_work(&ft_work);
 		/* A rearm since the read above cleared the latch and reset the

@@ -63,8 +63,10 @@ async def test_barrier(selective):
     try:
         async with peer(r, FLOWS) as p:
             before = await warm(r, p, ALL, "selective-barrier-admission")
-            r.selective_errors += 2
-            result = await r.target.fs_write(r.session, knob, "2")
+            # One failed barrier, whichever retirement owes it: one failed
+            # deletion, and recovery's own barrier proves the rest.
+            r.selective_errors += 1
+            result = await r.target.fs_write(r.session, knob, "1")
             assert result["errno"] == 0, result
             await command(r.target, r.session, "ip", "neigh", "del", PEERS[0]["lan"], "dev", TARGET_LAN_IF)
             state = await r.wait(lambda s: s["invalidation_done"] == 1 and s["entries"] == 0)

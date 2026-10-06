@@ -1,4 +1,4 @@
-From e8a25d5db6ae37e247414ba3dc831f20a8e26341 Mon Sep 17 00:00:00 2001
+From f5adb48be17186da5d451993ff692a09613b099a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -110,7 +110,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
  .../freescale/sdk_dpaa/offline_port.c         |   51 +
- .../net/ethernet/freescale/sdk_fman/Kconfig   |   12 +-
+ .../net/ethernet/freescale/sdk_fman/Kconfig   |   13 +-
  .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  353 +-
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
@@ -119,7 +119,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 +---
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1499 ++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1549 ++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +----
@@ -140,7 +140,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +-
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1505 ++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1525 ++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
@@ -182,7 +182,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 83 files changed, 8147 insertions(+), 12443 deletions(-)
+ 83 files changed, 8218 insertions(+), 12443 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -1935,10 +1935,10 @@ index 000caf70e00e..9332eb1259b9 100644
  	/* print of all referenced & created queues */
  	dump_oh_config(dpa_oh_dev, oh_config);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Kconfig b/drivers/net/ethernet/freescale/sdk_fman/Kconfig
-index 3a6d1810b525..f0b890731fbf 100644
+index 3a6d1810b525..450cd15d0fd1 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Kconfig
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Kconfig
-@@ -9,12 +9,16 @@ menuconfig FSL_SDK_FMAN
+@@ -9,12 +9,17 @@ menuconfig FSL_SDK_FMAN
  
  if FSL_SDK_FMAN
  
@@ -1951,8 +1951,9 @@ index 3a6d1810b525..f0b890731fbf 100644
  	help
 -		This option compiles test code for FMan.
 +		Adds /proc/fm_ehash_hcsync_fail: writing a decimal N makes the
-+		next N host-command syncs issued inside ExternalHashTableDeleteKey
-+		report failure without touching hardware, so the
++		next N host-command syncs issued inside ExternalHashTableDeleteKey,
++		or for deferred unlinks by ExternalHashTableDeleteSync, report
++		failure without touching hardware, so the
 +		unlinked-but-unsynced delete paths and their caller-side
 +		quarantine handling can be exercised deterministically.
 +		Test images only; never enable in production.
@@ -5323,10 +5324,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..e9d1bf90f25f
+index 000000000000..fbe2b10afc9c
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1499 @@
+@@ -0,0 +1,1549 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5375,7 +5376,9 @@ index 000000000000..e9d1bf90f25f
 + * hardware, so the unlinked-but-unsynced (EN_EHASH_DELETE_UNSYNCED)
 + * paths and the caller-side quarantine handling can be driven
 + * deterministically from a rig test. Scoped to the syncs
-+ * ExternalHashTableDeleteKey issues itself - the standalone
++ * ExternalHashTableDeleteKey issues itself, and to
++ * ExternalHashTableDeleteSync(), which issues the same sync for unlinks that
++ * deferred it (ExternalHashTableUnlinkKey()) - the standalone
 + * ExternalHashTableFmPcdHcSync() barrier is deliberately NOT covered, so
 + * a quarantine reclaim drain keeps working while the knob is armed.
 + * Compiled out unless the ASK test image's config fragment enables it. */
@@ -5593,8 +5596,9 @@ index 000000000000..e9d1bf90f25f
 + * The spare is refilled by the first node released on the table after it was
 + * taken (ehash_node_release()): every node a completed barrier proves
 + * unreachable -- the one a rebuild replaced, the ones a shrinking chain
-+ * dropped, and the parked ones, which go to the table the barrier was issued
-+ * through -- and a node a delete took but did not link. A rebuild that took
++ * dropped, and the parked ones, which go back to the table they were parked
++ * from whichever table the barrier was issued through -- and a node a delete
++ * took but did not link. A rebuild that took
 + * the spare releases the node it replaced once its barrier completes, so the
 + * spare is back before the next delete however long the allocator keeps
 + * failing, as long as the barriers complete. The add path never takes it: a
@@ -5631,8 +5635,10 @@ index 000000000000..e9d1bf90f25f
 + *
 + * Linked through next_entry, which only software reads: the microcode follows
 + * cumulative_entry.next_entry_addr, and nothing in software reaches a node
-+ * once it is out of its chain. Parking therefore allocates nothing on a path
-+ * that has just failed.
++ * once it is out of its chain. Its prev_entry is dead for the same reason and
++ * names its table instead (parked_on), whose spare it refills: a delete that
++ * defers its barrier leaves nodes from many tables behind one barrier.
++ * Parking therefore allocates nothing on a path that has just failed.
 + *
 + * One sync proves every unlink before it only because every table lives on
 + * one PCD, as on LS1046A. A node from a second PCD would need a list of its
@@ -5663,6 +5669,7 @@ index 000000000000..e9d1bf90f25f
 +		return;
 +	}
 +	ehash_parked_pcd = info->pcd;
++	node->parked_on = info;
 +	node->next_entry = ehash_parked;
 +	ehash_parked = node;
 +	spin_unlock_irqrestore(&ehash_parked_lock, flags);
@@ -5698,16 +5705,38 @@ index 000000000000..e9d1bf90f25f
 +		while (parked) {
 +			node = parked;
 +			parked = node->next_entry;
-+			ehash_node_release(info, node);
++			if (node->parked_on)
++				ehash_node_release(node->parked_on, node);
++			else
++				ExternalHashTableCumulativeEntryFree(node);
 +		}
 +		return 0;
 +	}
++	/* Back where they were, already accepted for this PCD. */
++	spin_lock_irqsave(&ehash_parked_lock, flags);
 +	while (parked) {
 +		node = parked;
 +		parked = node->next_entry;
-+		ehash_park_node(info, node);
++		node->next_entry = ehash_parked;
++		ehash_parked = node;
 +	}
++	ehash_parked_pcd = info->pcd;
++	spin_unlock_irqrestore(&ehash_parked_lock, flags);
 +	return rc;
++}
++
++/* Before @info is freed: its parked nodes go back to the allocator, not to
++ * its spare, when a barrier proves them. */
++static void ehash_unpark_table(struct en_exthash_info *info)
++{
++	struct en_cumulative_tbl_entry *node;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ehash_parked_lock, flags);
++	for (node = ehash_parked; node; node = node->next_entry)
++		if (node->parked_on == info)
++			node->parked_on = NULL;
++	spin_unlock_irqrestore(&ehash_parked_lock, flags);
 +}
 +
 +
@@ -6028,6 +6057,9 @@ index 000000000000..e9d1bf90f25f
 +		if (READ_ONCE(buckets[i].h))
 +			RETURN_ERROR(MINOR, E_BUSY, ("external hash bucket is in use"));
 +
++	/* A node parked from this table outlives it, waiting for a barrier;
++	 * it must not refill a spare that is gone. */
++	ehash_unpark_table(info);
 +	FreeEnEhashInfo(info);
 +	return E_OK;
 +}
@@ -6306,17 +6338,20 @@ index 000000000000..e9d1bf90f25f
 +EXPORT_SYMBOL(ExternalHashTableFmPcdHcSync);
 +
 +/* ehash_delete_key() asking for a replacement node; never returned by
-+ * ExternalHashTableDeleteKey(). */
++ * ehash_delete(). */
 +#define EHASH_DELETE_NEEDS_NODE	1
 +
-+/* The delete proper, for ExternalHashTableDeleteKey(). *node is a zeroed
-+ * cumulative node taken outside the bucket lock, or NULL. The one arm that
-+ * rebuilds a node without the key links *node and clears it; with *node NULL
-+ * it returns EHASH_DELETE_NEEDS_NODE instead, before changing anything and
-+ * with the lock dropped, so the caller can take one and start over. A node
-+ * still in *node on return is the caller's to release. */
++/* The delete proper, for ehash_delete(). *node is a zeroed cumulative node
++ * taken outside the bucket lock, or NULL. The one arm that rebuilds a node
++ * without the key links *node and clears it; with *node NULL it returns
++ * EHASH_DELETE_NEEDS_NODE instead, before changing anything and with the lock
++ * dropped, so the caller can take one and start over. A node still in *node
++ * on return is the caller's to release. Without sync every unlink ends as one
++ * whose barrier failed does: what it displaced is parked, and the result is
++ * EN_EHASH_DELETE_UNSYNCED. */
 +static int ehash_delete_key(struct en_exthash_info *info, uint16_t index,
-+			    void *tbl_entry, struct en_cumulative_tbl_entry **node)
++			    void *tbl_entry, struct en_cumulative_tbl_entry **node,
++			    bool sync)
 +{
 +	t_Handle *h_Spinlock;
 +	uint32_t intFlags;
@@ -6341,7 +6376,7 @@ index 000000000000..e9d1bf90f25f
 +		FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		bucket->h = 0;
 +		XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+		if (ehash_barrier(info, true))
++		if (!sync || ehash_barrier(info, true))
 +			return EN_EHASH_DELETE_UNSYNCED;
 +		return 0;
 +	}
@@ -6459,7 +6494,7 @@ index 000000000000..e9d1bf90f25f
 +					bucket->h = phyaddr;
 +				}
 +				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+				if (ehash_barrier(info, true)) {
++				if (!sync || ehash_barrier(info, true)) {
 +					/* The replaced node is out of the chain
 +					 * just as the caller's entry is, and waits
 +					 * for the next barrier the same way. */
@@ -6517,7 +6552,7 @@ index 000000000000..e9d1bf90f25f
 +							XX_PhysToVirt(SwapUint64(phyaddr)));
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+					if (ehash_barrier(info, true)) {
++					if (!sync || ehash_barrier(info, true)) {
 +						/* Both nodes left the chain when the
 +						 * bucket took the last entry directly. */
 +						ehash_park_node(info, tmp_tbl_entry);
@@ -6537,7 +6572,7 @@ index 000000000000..e9d1bf90f25f
 +						phyaddr = SwapUint64(XX_VirtToPhys(cumulative_tbl_entry->next_entry));
 +						bucket->h = phyaddr;
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+						if (ehash_barrier(info, true)) {
++						if (!sync || ehash_barrier(info, true)) {
 +							ehash_park_node(info, cumulative_tbl_entry);
 +							return EN_EHASH_DELETE_UNSYNCED;
 +						}
@@ -6578,7 +6613,7 @@ index 000000000000..e9d1bf90f25f
 +						cumulative_tbl_entry->prev_entry->cumulative_entry.next_entry_addr = 0;
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+					if (ehash_barrier(info, true)) {
++					if (!sync || ehash_barrier(info, true)) {
 +						ehash_park_node(info, cumulative_tbl_entry);
 +						return EN_EHASH_DELETE_UNSYNCED;
 +					}
@@ -6599,38 +6634,37 @@ index 000000000000..e9d1bf90f25f
 +	return 0;
 +}
 +
-+int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
++static int ehash_delete(struct en_exthash_info *info, uint16_t index, void *tbl_entry,
++			bool sync)
 +{
-+	struct en_exthash_info *info = (struct en_exthash_info *)h_HashTbl;
 +	struct en_cumulative_tbl_entry *node = NULL;
 +	int rc;
 +
-+	rc = ehash_delete_key(info, index, tbl_entry, &node);
++	rc = ehash_delete_key(info, index, tbl_entry, &node, sync);
 +	if (rc == EHASH_DELETE_NEEDS_NODE) {
 +		node = ehash_node_alloc(info);
 +		/* The spare is empty after a rebuild on this table took it
 +		 * while the allocator was failing and then parked the node it
-+		 * replaced on a failed barrier (EN_EHASH_DELETE_UNSYNCED). A
-+		 * barrier that completes now releases that node into this
-+		 * table's spare, as ehash_barrier() does every parked node. */
++		 * replaced on a failed or deferred barrier
++		 * (EN_EHASH_DELETE_UNSYNCED). A barrier that completes now
++		 * releases that node into this table's spare, as
++		 * ehash_barrier() does every parked node into its own. */
 +		if (!node && READ_ONCE(ehash_parked) && !ehash_barrier(info, false))
 +			node = ehash_node_take_spare(info);
 +		if (!node) {
 +			/* So a delete fails for memory only when the allocator
 +			 * fails now, an earlier rebuild on this table left the
 +			 * spare empty as above, and this barrier fails too.
-+			 * Two rarer ways leave the spare empty with nothing
-+			 * parked to refill it: a barrier issued through
-+			 * another table has released the parked node there,
-+			 * or another delete on this table holds the spare at
-+			 * this moment, which CDX's serialized deletes never
-+			 * do. The bucket is untouched and the key still
-+			 * linked, as -1 tells the caller. */
++			 * One rarer way leaves the spare empty with nothing
++			 * parked to refill it: another delete on this table
++			 * holds the spare at this moment, which CDX's
++			 * serialized deletes never do. The bucket is untouched
++			 * and the key still linked, as -1 tells the caller. */
 +			REPORT_ERROR(MAJOR, E_NO_MEMORY, ("en_cumulative_entry"));
 +			return -1;
 +		}
 +		/* With a node in hand the delete cannot ask again. */
-+		rc = ehash_delete_key(info, index, tbl_entry, &node);
++		rc = ehash_delete_key(info, index, tbl_entry, &node, sync);
 +	}
 +	/* A node is left over only if the bucket changed while the lock was
 +	 * dropped and the delete no longer rebuilt one. */
@@ -6638,7 +6672,24 @@ index 000000000000..e9d1bf90f25f
 +	return rc;
 +}
 +
++int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
++{
++	return ehash_delete(h_HashTbl, index, tbl_entry, true);
++}
 +EXPORT_SYMBOL(ExternalHashTableDeleteKey);
++
++int ExternalHashTableUnlinkKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
++{
++	return ehash_delete(h_HashTbl, index, tbl_entry, false);
++}
++EXPORT_SYMBOL(ExternalHashTableUnlinkKey);
++
++int ExternalHashTableDeleteSync(void *h_HashTbl)
++{
++	/* ehash_barrier() reports the first failure of a run. */
++	return ehash_barrier(h_HashTbl, true) ? -1 : 0;
++}
++EXPORT_SYMBOL(ExternalHashTableDeleteSync);
 +
 +/* More cumulative nodes than any bucket can chain: each holds a key, and a
 + * bucket index is sixteen bits wide. A walk that has not ended by then is going
@@ -12215,10 +12266,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..d0f8e1e2aa72
+index 000000000000..c9d4e88e6b36
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1505 @@
+@@ -0,0 +1,1525 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -12333,10 +12384,18 @@ index 000000000000..d0f8e1e2aa72
 +#define EN_CU_HASH_TABLE_ENTRY_ADDR_SIZE 8
 +#define EN_CU_FIXED_ELEMENTS_SIZE 12
 +
++struct en_exthash_info;
++
 +struct en_cumulative_tbl_entry {
 +	struct en_cumulative_entry cumulative_entry;
 +	struct en_cumulative_tbl_entry *next_entry;
-+	struct en_cumulative_tbl_entry *prev_entry;
++	union {
++		struct en_cumulative_tbl_entry *prev_entry;
++		/* Once out of its chain and parked to wait for a barrier,
++		 * the table whose spare it refills when one completes; NULL
++		 * once that table is deleted. */
++		struct en_exthash_info *parked_on;
++	};
 +};
 +
 +/* DPA Classifier table entry statistics */
@@ -13706,10 +13765,22 @@ index 000000000000..d0f8e1e2aa72
 + * must defer the free until a later sync on the same PCD succeeds.
 + * Any cumulative node the unlink displaced is parked inside the same
 + * way, and freed by the first later sync through this API -- a delete,
-+ * an add or ExternalHashTableFmPcdHcSync() -- that completes. */
++ * an add, ExternalHashTableFmPcdHcSync() or ExternalHashTableDeleteSync()
++ * -- that completes. */
 +#define EN_EHASH_DELETE_UNSYNCED	(-2)
 +extern int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index,
 +				void *tbl_entry);
++/* ExternalHashTableDeleteKey() without its sync, for a caller retiring many
++ * keys behind one: EN_EHASH_DELETE_UNSYNCED once the key is unlinked, and -1
++ * as there; never 0. The caller then owes the entry exactly what a failed
++ * sync leaves it owing, and so does this delete for any cumulative node it
++ * displaced. */
++extern int ExternalHashTableUnlinkKey(void *h_HashTbl, uint16_t index,
++				void *tbl_entry);
++/* The sync a delete issues itself, for the unlinks above: 0 once it
++ * completes, which proves every unlink on the PCD before it, -1 if not. It
++ * goes through the DeleteKey fault knob, as a delete's own sync does. */
++extern int ExternalHashTableDeleteSync(void *h_HashTbl);
 +/* Which bucket links tbl_entry, for an owner whose delete returned -1 and
 + * that has stopped every port walking the table. Every -1 arm of the delete
 + * returns before it changes anything, so such an entry is either still where

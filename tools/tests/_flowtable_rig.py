@@ -541,13 +541,14 @@ async def ct_listing(r):
 
 
 async def latch_barrier_failure(r):
-    """Invalidate with the table still bound: fail the retirement barrier of
-    both directions' deletes, which the flowtable's own teardown issues once
-    the connection is removed. The worker's own barrier is not failed, so the
+    """Invalidate with the table still bound: fail the retirement barrier the
+    flowtable's own teardown owes once the connection is removed. Both
+    directions' deletes may share it or not; either way one failed barrier is
+    one failed deletion, and the worker's own barrier is not failed, so the
     invalidation drains completely."""
     knob = "/proc/fm_ehash_hcsync_fail"
     before = await r.state()
-    result = await r.target.fs_write(r.session, knob, "2")
+    result = await r.target.fs_write(r.session, knob, "1")
     assert result["errno"] == 0, result
     try:
         await r.clear_ct()
@@ -556,7 +557,7 @@ async def latch_barrier_failure(r):
     finally:
         result = await r.target.fs_write(r.session, knob, "0")
         assert result["errno"] == 0, result
-    assert latched["invalidated"] == 1 and latched["errors"] - before["errors"] == 2, (before, latched)
+    assert latched["invalidated"] == 1 and latched["errors"] - before["errors"] == 1, (before, latched)
     assert latched["fatal"] == latched["quarantine"] == 0, latched
     assert latched["bindings"] == before["bindings"] and latched["rearm_ready"] == 0, latched
     assert latched["handle_refs"] == latched["neighbour_refs"] == 0, latched

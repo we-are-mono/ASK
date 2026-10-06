@@ -248,8 +248,11 @@ async def test_retirement_failure(routes):
     try:
         async with peer(r, FLOWS) as p:
             before = await warm(r, p, ALL, "routes-barrier-admission")
-            r.route_errors += 2
-            result = await r.target.fs_write(r.session, knob, "2")
+            # The route change retires every direction behind one barrier,
+            # whichever retirement reaches each first; failing that barrier
+            # is one failed deletion, and recovery's own proves them all.
+            r.route_errors += 1
+            result = await r.target.fs_write(r.session, knob, "1")
             assert result["errno"] == 0, result
             await change_route(r, "replace", ROUTE, "dev", TARGET_LAN_IF, "mtu", "1100")
             state = await r.wait(lambda s: s["invalidation_done"] == 1 and s["entries"] == 0)

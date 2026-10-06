@@ -25,6 +25,11 @@ REPLACEMENTS = 256
 # about twice the measured time.
 DETACH_SECONDS = 60
 DETACH_BOUND_SECONDS = 30
+# The longest a /proc/cdx_flowtable header read may wait while a full table is
+# retired. One walk under the adapter's transaction held readers out for 13 s;
+# in batches the longest wait measured 0.9 s (KASAN), the reader queueing
+# behind Linux's own deletion and offer callbacks.
+READER_BOUND_SECONDS = 2
 # Keep explicit data sockets below the lab's ephemeral port range.
 BASE = 20000
 

@@ -321,14 +321,15 @@ result independently of those temporary files.
   bridged flow caps, and ask-recovery-monitor resets only after three consecutive misses. Remaining fix: have
   `ask-flowtable health` read a bounded status record, not the full header. Only matters where `integration/` is installed.
 
-- [ ] **A327 — a route change under a full table blocks flowtable readers ~13 s and piles up offload work.** Seen on the rig, KASAN
-  image, 2026-10-06. `flowtable_capacity.py`'s route-replace drain of 32,768 entries blocks `/proc/cdx_flowtable` readers
-  ~13 s while retirement holds the backend transaction. With the UDP conntracks kept alive through the drain
-  (`nf_conntrack_udp_timeout_stream` raised above `nf_flowtable_udp_timeout`), ~250 `nf_ft_offload` kworkers also pile
-  up in D state (load average 3 → 40), and the DUT's stdio agent missed host acks for over 8 s twice running, so the
-  agent exited. The stock suite hits it too, less often (full run 183, 2026-10-06), so the serial channel now retries
-  for 30 s instead of 8 s. A production table of live flows would hit it as well. Next: time the retirement walk per
-  entry, and bound or batch the re-offers the drain triggers.
+- [x] **A327 — a route change under a full table blocked flowtable readers ~13 s and piled up offload kworkers.** Fixed:
+  one barrier per 64-entry batch, and a deletion never waits for the transaction (_:/^cdx: retire flowtable entries in batches_).
+
+- [ ] **A329 — detaching a full table holds Netfilter's `flow_block_lock` while the binding's entries are retired.**
+  `nf_flow_table_block_setup()` calls `ft_release()` with the lock held for write. Retiring 32,768 entries takes 5.9 s
+  on the KASAN image, and Linux's `nf_ft_offload_stats` workers for that table sleep on the lock meanwhile (~257 in D,
+  load ~30). Readers and other tables are unaffected, since CDX's transaction is released between batches. An fw4
+  reload with a full table pays this. Fix direction: hand the binding's entries to the retirement worker and return,
+  once nothing reads `entry->binding` after release.
 
 - [x] **A276 — the data plane wedged twice under a flooded ESP SA.** An HC command
   timed out ("board reset required") because 11aa150's per-SA offline-port classification

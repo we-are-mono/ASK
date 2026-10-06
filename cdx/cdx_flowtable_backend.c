@@ -162,6 +162,12 @@ void cdx_ft_begin(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_begin, ASK_CDX_FLOWTABLE);
 
+bool cdx_ft_trybegin(void)
+{
+	return mutex_trylock(&cdx_info->ctrl.mutex);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_trybegin, ASK_CDX_FLOWTABLE);
+
 void cdx_ft_end(void)
 {
 	mutex_unlock(&cdx_info->ctrl.mutex);
@@ -791,6 +797,35 @@ int cdx_ft_del(struct cdx_ft_hw **hw)
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_del, ASK_CDX_FLOWTABLE);
+
+int cdx_ft_unlink(struct cdx_ft_hw **hw)
+{
+	int rc;
+
+	cdx_ft_assert_held();
+	if (!*hw)
+		return 0;
+	rc = cdx_ft_hw_unlink(hw);
+	ft_live--;
+	if (rc == -EIO)
+		cdx_ft_fatal();
+	return rc;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_unlink, ASK_CDX_FLOWTABLE);
+
+unsigned int cdx_ft_owed(void)
+{
+	cdx_ft_assert_held();
+	return cdx_ft_hw_owed();
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_owed, ASK_CDX_FLOWTABLE);
+
+int cdx_ft_settle(unsigned int *unproven)
+{
+	cdx_ft_assert_held();
+	return cdx_ft_hw_settle(unproven);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_settle, ASK_CDX_FLOWTABLE);
 
 /* When a stop that found a port still busy may be tried again. Every caller of
  * cdx_ft_recover() polls it -- the latch's work, the adapter's invalidation
