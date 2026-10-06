@@ -2349,10 +2349,14 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	 * conntrack flush queues one for every flow. Each waiting for the
 	 * transaction put hundreds of workers to sleep behind whatever held
 	 * it (A327). A deletion that finds it held retires the generation
-	 * instead, as a dependency change does: the handle stops naming
-	 * anything in hardware, the retirement worker takes the entry out in
-	 * its next batch, and until then the entry's cookie refuses a new
-	 * generation (-ESTALE) rather than being taken for it. */
+	 * instead, as a dependency change does: the handle is marked, the
+	 * retirement worker takes the entry out in its next batch, and until
+	 * then the entry's cookie refuses a new generation (-ESTALE) rather
+	 * than being taken for it. The entry forwards until that batch, as it
+	 * did while a deletion waited here for the transaction; what changes
+	 * is only that Linux, told the deletion is done, may release its flow
+	 * and conntrack first, and a new connection on the same tuple meets
+	 * the old entry until the batch -- for no longer than the wait was. */
 	if (cls->command == FLOW_CLS_DESTROY && !cdx_ft_trybegin()) {
 		ft_destroy_defer(binding, cls);
 		return 0;
