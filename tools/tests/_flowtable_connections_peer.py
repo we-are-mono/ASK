@@ -333,7 +333,16 @@ class Flow:
                 self.writer.transport.abort()
             else:
                 self.writer.write_eof()
-                assert await asyncio.wait_for(self.reader.read(), 5) == b""
+                # Thousands closing at once punt as many FINs to Linux, and
+                # the punt policer drops what exceeds its burst; each loss
+                # waits out TCP's retransmission backoff (0.2 s, doubling).
+                # 30 s spans six retries.
+                try:
+                    tail = await asyncio.wait_for(self.reader.read(), 30)
+                except TimeoutError as error:
+                    error.add_note(f"flow={self.spec} tcp_info={self.tcp_info()}")
+                    raise
+                assert tail == b"", (self.spec, tail[:64])
             self.writer.close()
             await self.writer.wait_closed()
             self.writer = None

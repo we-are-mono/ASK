@@ -114,10 +114,12 @@ class Peer:
 
     async def rpc(self, op, ids=None, **kwargs):
         body = json.dumps({"op": op, "ids": ids or [], **kwargs})
+        # Closing waits out TCP's FIN retransmissions (the peer's close()).
+        seconds = 60 if op in {"close", "shutdown"} else 25
         script = f"""
 import socket
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
-    control.settimeout(25)
+    control.settimeout({seconds})
     control.connect({self.path!r})
     control.sendall({(body + chr(10)).encode()!r})
     with control.makefile('rb') as stream:
@@ -126,7 +128,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
     print(line.decode(), end='')
 """
         async with self.lock:
-            result = await lan_run_python(self.lan, script, timeout=30, label="peer_rpc")
+            result = await lan_run_python(self.lan, script, timeout=seconds + 5, label="peer_rpc")
         assert result.rc == 0, result.stdout
         response = json.loads(result.stdout)
         assert response["op"] == op, response
