@@ -231,27 +231,8 @@ result independently of those temporary files.
   Captures, image identity and diagnostic scripts:
   `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
 
-- [ ] **A305 — both 10G ports stopped passing frames late in a same-boot run.** Seen twice, both
-  at the end of `flowtable_capacity.py::test_overflow_and_reuse` after a long same-boot sequence:
-  2026-09-23 (full suite, eth4 only) and 2026-10-04 (scoped run of 31 tests, eth3 and eth4;
-  KASAN image with the uncommitted 1.1.0 changes). The test body completed (32,768 entries
-  filled, 66k installs, drained to 0); the LAN peer's teardown then timed out waiting for a FIN.
-  State while wedged, read-only: carrier up on both ports; 10G Rx ports enabled
-  (`fmbm_rcfg` 0x80000000) but `fmbm_rfrc` frozen while the DUT pinged; Rx default/PCD and Tx
-  FQs empty; bpid 32 not depleted; nothing from the DUT's MAC on the wire; QMan portal IRQ counts
-  frozen; no kernel warning; `/proc/cdx_flowtable` not fatal or quarantined. So the stall is
-  below the BMI (mEMAC/PCS/SerDes) or in the FMan core, on both ports at once; I2C still answered.
-  Not reproduced since: capacity alone on a fresh boot, then the same 34-test sequence on that
-  boot, both passed (2 occurrences in 5 known runs). After A327 cut the drain's per-delete
-  host-command syncs (~33k) to one per 64 deletes, the capacity test passed 10/10 on one boot
-  (2026-10-06), with LAN→WAN pings and both 10G ports' `fmbm_rfrc` advancing after every pass.
-  HC-sync pressure stalling the FMan fits, but is unproven, and the mixed same-boot sequence of
-  both sightings was not repeated. **Not a 1.1.0 blocker:** the pre-release full suite decides,
-  and closes it if clean. On a wedge, read the mEMAC registers
-  (`/sys/class/net/ethN/mac_regs`) before anything else. **Never** run
-  `ethtool` or QMan debugfs queries (`query_fq_np_fields`) on a wedged board: the first
-  hard-locks a CPU under RTNL, the second pinned a CPU with no reply here. Recover with
-  serial-break sysrq `s`, `b`.
+- [x] **A305 — both 10G ports stopped passing frames late in a same-boot run.** Not reproduced: a clean
+  pre-release full suite and a drain-then-traffic soak on both sides of A327 (_:/^tests: soak a full table's retirement_).
 
 - [x] **A307 — failslab tests saw unrelated flows reinstalled.** Test bug: they idled past the 30 s flow timeout while the
   fault guard staged over the UART; now kept alive until armed (_:/^tests: harden lifecycle checks_).
