@@ -34,6 +34,8 @@ def test_wifi_adapter(tmp_path):
             "ft_wifi_reconsider",
             "ft_wifi_device_gone",
             "ft_wifi_address_changed",
+            "ft_wifi_unclaim",
+            "ft_wifi_slot_held",
             "ft_wifi_work_fn",
             "ft_wifi_exit",
         ]))

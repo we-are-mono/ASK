@@ -34,6 +34,7 @@ typedef uint64_t u64;
 #define ENOMEM 12
 #define EOPNOTSUPP 95
 #define EIO 5
+#define EEXIST 17
 
 /* --- list.h, enough of it -------------------------------------------- */
 struct list_head { struct list_head *next, *prev; };
@@ -175,6 +176,7 @@ struct cdx_wifi_vap {
 
 static int vap_add_fail;
 static int vaps_live;
+static struct cdx_wifi_vap *slots[8];
 /* ft_wifi_vap_drained()'s record, below. */
 static const struct net_device *drained_dev;
 static int drain_pending, drains, sleeps;
@@ -190,6 +192,7 @@ static bool cdx_wifi_vap_supported(struct net_device *dev)
 static int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **out)
 {
 	struct cdx_wifi_vap *v;
+	int i;
 
 	/* Every requirement the header states, asserted rather than assumed:
 	 * the caller owes the transaction and RTNL. Which of the two ways of
@@ -200,7 +203,16 @@ static int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **out)
 	ASSERT_RTNL();
 	*out = NULL;
 	if (vap_add_fail) { vap_add_fail--; return -EIO; }
+	/* The real backend refuses a device that already holds a slot, and a
+	 * slot nothing deletes is held for good, across a reload of the
+	 * adapter too: the backend lives in CDX. */
+	for (i = 0; i < 8; i++)
+		if (slots[i] && slots[i]->dev == dev)
+			return -EEXIST;
 	v = calloc(1, sizeof(*v));
+	for (i = 0; slots[i]; i++)
+		assert(i < 7);
+	slots[i] = v;
 	v->dev = dev;
 	v->vapid = next_vapid++;
 	v->live = true;
@@ -212,11 +224,15 @@ static int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **out)
 static void cdx_wifi_vap_del(struct cdx_wifi_vap **vap)
 {
 	struct cdx_wifi_vap *v = *vap;
+	int i;
 
 	assert(txn_depth);
 	ASSERT_RTNL();
 	if (!v)
 		return;
+	for (i = 0; i < 8; i++)
+		if (slots[i] == v)
+			slots[i] = NULL;
 	/* The device is borrowed, so a delete that runs after the device is
 	 * gone must not have touched it. The harness frees the net_device
 	 * struct at unregister, and ASan turns any read of it here into a
@@ -337,8 +353,8 @@ static unsigned int watches(void)
 static void reset(void)
 {
 	assert(watches() == 0);
+	assert(!vaps_live);
 	work_pending = 0;
-	vaps_live = 0;
 	next_vapid = 0;
 	alloc_fail = vap_add_fail = admission_fail = 0;
 	supported_answer = 1;
@@ -627,6 +643,80 @@ static void test_admission_backoff(void)
 	reset();
 }
 
+/* The same backoff with a retirement already claimed: the VAP goes back to its
+ * watch rather than nowhere. Lost there, it would hold its slot for good, and
+ * every later registration of the device would be refused as a duplicate. */
+static void test_admission_backoff_retiring(void)
+{
+	struct net_device *ap = mkdev("uap0", NL80211_IFTYPE_AP);
+	long long refusals = atomic64_read(&ft_wifi_refusals);
+
+	reconsider(ap);
+	drain();
+	assert(vaps_live == 1);
+
+	/* Down, then up again: the retirement and the re-registration. */
+	ap->running = false;
+	reconsider(ap);
+	admission_fail = 1;
+	drain();
+	assert(vaps_live == 0 && ft_wifi_registered == 0);
+	ap->running = true;
+	reconsider(ap);
+	drain();
+	assert(vaps_live == 1 && ft_wifi_registered == 1);
+	assert(atomic64_read(&ft_wifi_refusals) == refusals);
+
+	/* A stale VAP's retirement, which keeps the device wanted. */
+	rtnl_held++;
+	ft_wifi_address_changed(ap);
+	rtnl_held--;
+	admission_fail = 1;
+	drain();
+	assert(vaps_live == 1 && ft_wifi_registered == 1);
+	assert(atomic64_read(&ft_wifi_refusals) == refusals);
+
+	/* And unload, with one claimed when the worker stops. */
+	ap->running = false;
+	reconsider(ap);
+	admission_fail = 1;
+	work_pending = 0;
+	ft_wifi_work_fn(NULL);
+	ft_wifi_exit();
+	assert(vaps_live == 0 && watches() == 0);
+
+	unregister(ap);
+	reset();
+}
+
+/* A device allocated where an unregistered one was, before the old one's VAP
+ * is retired: the new device waits for that slot instead of being refused as
+ * the duplicate it only appears to be. */
+static void test_reused_device_waits(void)
+{
+	struct net_device *ap = mkdev("uap0", NL80211_IFTYPE_AP);
+	long long refusals = atomic64_read(&ft_wifi_refusals);
+
+	reconsider(ap);
+	drain();
+	assert(vaps_live == 1);
+
+	/* The old device goes and the "new" one, at the same address, comes
+	 * before the worker runs. */
+	rtnl_held++;
+	ft_wifi_device_gone(ap);
+	rtnl_held--;
+	reconsider(ap);
+	drain();
+	assert(vaps_live == 1 && ft_wifi_registered == 1 && watches() == 1);
+	assert(atomic64_read(&ft_wifi_refusals) == refusals);
+
+	unregister(ap);
+	drain();
+	assert(vaps_live == 0);
+	reset();
+}
+
 /* A VAP whose hardware address moves is registered again, because the address
  * was built into what was registered and cannot be rewritten in place. */
 static void test_address_change(void)
@@ -756,6 +846,8 @@ int main(void)
 	test_unregister_before_add();
 	test_add_failure_gives_up();
 	test_admission_backoff();
+	test_admission_backoff_retiring();
+	test_reused_device_waits();
 	test_address_change();
 	test_many();
 	test_exit_releases();

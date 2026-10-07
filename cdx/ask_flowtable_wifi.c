@@ -202,6 +202,34 @@ static bool ft_wifi_vap_drained(const struct net_device *dev)
 	return !cdx_ft_pending();
 }
 
+/* Give a claimed VAP back to its watch, marked so a later pass claims it again,
+ * and last on the list so no other device waits behind it. Marked stale rather
+ * than left as it was: an address change while it was claimed found no VAP to
+ * mark. Only this worker frees a watch, and never one that holds a VAP. Caller
+ * holds ft_wifi_lock. */
+static void ft_wifi_unclaim(struct ft_wifi_watch *w, struct cdx_wifi_vap *vap)
+{
+	w->vap = vap;
+	w->stale = true;
+	ft_wifi_registered++;
+	list_move_tail(&w->list, &ft_wifi_watches);
+}
+
+/* Whether a watch other than the device's own still holds a VAP for it: a
+ * device that unregistered while its VAP awaits retirement, and a new one
+ * allocated at the same address. The backend would refuse the new one as a
+ * duplicate of the slot not yet released, so it waits for the retirement
+ * instead. Caller holds ft_wifi_lock. */
+static bool ft_wifi_slot_held(const struct net_device *dev)
+{
+	struct ft_wifi_watch *w;
+
+	list_for_each_entry(w, &ft_wifi_watches, list)
+		if (w->vap && w->vap_dev == dev)
+			return true;
+	return false;
+}
+
 static void ft_wifi_work_fn(struct work_struct *work)
 {
 	struct ft_wifi_watch *w, *tmp;
@@ -219,7 +247,7 @@ static void ft_wifi_work_fn(struct work_struct *work)
 
 		mutex_lock(&ft_wifi_lock);
 		list_for_each_entry_safe(w, tmp, &ft_wifi_watches, list) {
-			if (w->wanted && !w->vap) {
+			if (w->wanted && !w->vap && !ft_wifi_slot_held(w->dev)) {
 				/* Referenced here, under the lock that
 				 * ft_wifi_device_gone() also takes, so the
 				 * device cannot be freed between choosing it
@@ -263,10 +291,21 @@ static void ft_wifi_work_fn(struct work_struct *work)
 		cdx_ft_begin();
 		if (cdx_ft_admission_begin()) {
 			/* RTNL is held by something that can wait for this
-			 * transaction. Come back rather than invert the two. */
+			 * transaction. Come back rather than invert the two --
+			 * which is the common case for a retirement, scheduled
+			 * from a notifier whose caller still holds RTNL, unload's
+			 * replay among them. A VAP claimed for it goes back to
+			 * its watch: dropped here, its slot would stay taken for
+			 * as long as CDX is loaded, and module exit would never
+			 * see it. */
 			cdx_ft_end();
 			if (dev)
 				dev_put(dev);
+			if (vap) {
+				mutex_lock(&ft_wifi_lock);
+				ft_wifi_unclaim(claimed, vap);
+				mutex_unlock(&ft_wifi_lock);
+			}
 			schedule_work(&ft_wifi_work);
 			return;
 		}
@@ -318,18 +357,12 @@ static void ft_wifi_work_fn(struct work_struct *work)
 		} else if (!ft_wifi_vap_drained(vap_dev)) {
 			bool stopping, pending;
 
-			/* Not yet: give the VAP back to its watch, marked so a
-			 * later pass claims it again, and last on the list so
-			 * no other device waits behind it. Only this worker
-			 * frees a watch, and never one that holds a VAP. The
+			/* Not yet: give the VAP back to its watch. The
 			 * deletion's proof is asked for with RTNL let go of --
 			 * the recovery takes it itself -- and once a second,
 			 * admission's own pace. */
 			mutex_lock(&ft_wifi_lock);
-			claimed->vap = vap;
-			claimed->stale = true;
-			ft_wifi_registered++;
-			list_move_tail(&claimed->list, &ft_wifi_watches);
+			ft_wifi_unclaim(claimed, vap);
 			stopping = ft_wifi_stopping;
 			mutex_unlock(&ft_wifi_lock);
 			cdx_ft_admission_end();

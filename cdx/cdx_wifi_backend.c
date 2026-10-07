@@ -42,8 +42,10 @@
  * which by then may be gone.
  */
 struct cdx_wifi_vap {
-	/* Compared against a netdev to find this VAP's watch again, never
-	 * dereferenced. Cleared once the device unregisters. */
+	/* Compared against a netdev to refuse registering it twice, never
+	 * dereferenced. Kept until the VAP is deleted, which can be after the
+	 * device unregistered; the adapter does not offer a device reusing
+	 * that address until then. */
 	const struct net_device *dev;
 	u32 itf_index;
 	u16 vapid;
