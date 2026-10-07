@@ -357,7 +357,9 @@ async def hardware(r, p, label, flows):
     for ident in range(len(flows)):
         for key in keys([ident], flows):
             packets = int(new[key]["packets"]) - int(old[key]["packets"])
-            assert packets >= (256 if flows[ident]["proto"] == "udp" else reports[ident]["bytes"] // 1500), (key, packets)
+            # A datagram within the peer's loss budget was lost before it hit.
+            udp = 256 - reports[ident].get("lost", 0)
+            assert packets >= (udp if flows[ident]["proto"] == "udp" else reports[ident]["bytes"] // 1500), (key, packets)
             if ident >= 2:
                 field = "sa" if key[0] == TARGET_LAN_IF else "in_sa"
                 assert new[key][field] != "0", new[key]

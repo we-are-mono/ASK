@@ -103,10 +103,13 @@ print('cleared')
 
 
 class Peer:
-    def __init__(self, lan, path, flows, tcp_size=TCP_SIZE):
+    def __init__(self, lan, path, flows, tcp_size=TCP_SIZE, udp_loss_budget=0):
         self.lan, self.path = lan, path
         self.tcp_size = tcp_size
         self.flows = {f["id"]: f for f in flows}
+        # UDP datagrams batches may lose over the peer's life, all flows
+        # together. Zero, the default, fails a batch on its first loss.
+        self.udp_loss_budget = udp_loss_budget
         self.lock = asyncio.Lock()
 
     async def rpc(self, op, ids=None, **kwargs):
@@ -133,13 +136,22 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
         # Default warmup spans the kernel's one-second admission retry. A
         # deferred offer needs another packet; polling an idle flow cannot
         # admit it. Measurement windows pass their own interval explicitly.
-        await self.rpc("start", ids, count=count, interval=interval)
+        lossy = [i for i in ids if self.udp_loss_budget and self.flows[i]["proto"] == "udp"]
+        exact = [i for i in ids if i not in lossy]
+        if exact:
+            await self.rpc("start", exact, count=count, interval=interval)
+        if lossy:
+            # The strict deadline, so a slow echo is not taken for a loss.
+            await self.rpc("start", lossy, count=count, interval=interval, allow_loss=True, udp_timeout=5)
         result = {int(k): v for k, v in (await self.rpc("wait", ids)).items()}
         assert set(result) == set(ids), result
         for ident, report in result.items():
             assert report["count"] == count, report
             size = self.tcp_size if self.flows[ident]["proto"] == "tcp" else UDP_SIZE
-            assert report["bytes"] == count * size, report
+            lost = report.get("lost", 0) if ident in lossy else 0
+            assert report["bytes"] == (count - lost) * size, report
+            self.udp_loss_budget -= lost
+            assert self.udp_loss_budget >= 0, ("UDP loss beyond the peer's budget", result)
         return result
 
     async def keep_alive(self):
@@ -159,7 +171,7 @@ def peer_script(config):
 
 @asynccontextmanager
 async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_size=TCP_SIZE,
-               reconnect=False, listen_addresses=()):
+               reconnect=False, listen_addresses=(), udp_loss_budget=0):
     specs = {f["id"]: f for f in flows}
     tasks, writers, errors, tcp_counts = set(), set(), [], {}
     active_ids = set()
@@ -249,7 +261,7 @@ else:
     raise TimeoutError('LAN peer did not start')
 """, timeout=15, label="peer_start")
         assert launched.rc == 0 and "READY" in launched.stdout.splitlines(), launched.stdout
-        controller = Peer(r.lan, path + ".sock", flows, tcp_size)
+        controller = Peer(r.lan, path + ".sock", flows, tcp_size, udp_loss_budget)
         def tcp_info():
             snapshots = []
             for stream in writers:

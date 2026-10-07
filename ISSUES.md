@@ -312,19 +312,25 @@ result independently of those temporary files.
 - [x] **A330 — IPv6 into a smaller path trusted the advertised MTU, so a host ignoring it lost oversized packets with no Packet Too Big.** Fixed:
   one MAC-bounded MTU rule for both families, routed multicast included (_:/^flowtable: bound IPv6 by what the port accepts_).
 
-- [ ] **A328 — one UDP reply lost on the IPsec NAT-T return path (`flowtable_service_ipsec_rekey.py::test_ipsec_outbound_natt_rekey_root[cbc]`).**
-  Full run 179, 2026-10-06: flow 2 serial 618 got no reply. The WAN peer received the request, so the loss is on the
-  inbound leg (WAN encrypt → DUT decrypt → loki). The inbound SA did not change in that window, and loki's X550 showed
-  `rx_crc_errors` 0 over 841 M frames, so it is neither the SA switch nor the LAN-medium loss of
-  `docs/flowtable/udp-loss-investigation.md`. 10/10 scoped reruns passed. A corrupted frame on the WAN cable is not
-  ruled out: the DUT rebooted before its `eth4` receive counters were read. The peer harness now records DUT
-  `/proc/net/xfrm_stat` at start, and on failure both DUT ports' and the LAN NIC's receive errors. Next occurrence:
-  diff those to place the drop. Seen again in full run 224 (2026-10-07,
-  `flowtable_service_multicast_quarantine.py::test_released_without_multicast`): the first datagram of a fresh flow left
-  loki and created no DUT conntrack, so it died before the DUT's IP stack (wire, switch or DPAA/FMan receive). That
-  test's plain `Rig.exchange` does not record the DUT port counters; 15/15 isolated reruns passed. The case now
-  retries a lost datagram in its admission loop instead of aborting, which left its parked entries behind and
-  skipped the rest of the suite.
+- [ ] **A328 — the IPsec offline port's classifier discards about one frame in 10^4–10^5 under bursty tunnel load.**
+  Seen as one lost UDP reply in `flowtable_service_ipsec_rekey.py::test_ipsec_outbound_natt_rekey_root` (full runs
+  179 and 226, ~1 in 15–30 scoped runs). Placed on 2026-10-07: oh1 (`1a83000`, the port SEC returns frames to) raises
+  `port_rx_filter_frame` (`fmbm_offc`, a `FM_FD_ERR_CLS_DISCARD`) by exactly one per lost reply and never in a passing
+  run; the inner flow's hit counter ends one short, so the frame dies before its hit. The WAN host's capture shows
+  every reply sent. Not the cause: table add/delete or the A327 batching (ftrace: nothing within 0.3–7 s), SEC
+  refusals, misses (KeyGen scheme 24), any FMan policer (`fmpl_rpcnt` unchanged), the inner MTU/DF check (1200 vs
+  1300 alike), egress congestion (both ports never congested), the rekey overlap (one SA suffices). Reproducer: two
+  tunnelled TCP flows with 128 KB records every 10 ms beside a UDP flow discard 2–19 frames per 2.5 s round. Impact: a
+  rare single-packet loss TCP and UDP applications absorb; no state is left wrong. The rekey test now allows one
+  lost datagram (`peer(udp_loss_budget=1)`). Next: name the microcode condition by moving `FM_FD_ERR_CLS_DISCARD`
+  from oh1's `fmbm_ofsdm` to `fmbm_ofsem`, so the frames reach cdx's `ofport_rx_err` with their status. The first try
+  reset the DUT about a minute in with no console output; capture the console before retrying.
+
+- [ ] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.**
+  Full run 224 (2026-10-07, `flowtable_service_multicast_quarantine.py::test_released_without_multicast`): it left
+  loki and created no DUT conntrack, so it died on the wire, the switch or DPAA/FMan receive. Plain Ethernet, not the
+  A328 path. `Rig.exchange` does not record the DUT port counters; 15/15 isolated reruns passed. The case retries a
+  lost datagram in its admission loop.
 
 - [ ] **A329 — detaching a full table holds Netfilter's `flow_block_lock` while the binding's entries are retired.**
   `nf_flow_table_block_setup()` calls `ft_release()` with the lock held for write. Retiring 32,768 entries takes 5.9 s

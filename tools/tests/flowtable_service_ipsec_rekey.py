@@ -57,8 +57,11 @@ async def test_ipsec_outbound_natt_rekey_root(ipsec_service):
     """Old and new SEC descriptors share one UDP output root. Retiring the
     first descriptor must keep that root's tag valid for the surviving SA."""
     r, flows = ipsec_service, flows_for(ipsec_service)
+    # The IPsec offline port's classifier discards about one decrypted frame
+    # in 10^4-10^5 while two TCP streams burst through the tunnel (A328);
+    # flow 2 shares the tunnel with those streams for most of this test.
     async with peer(r, flows, initial_ids=[0, 1, 2, 3], lease=300,
-                    listen_addresses=[INNER]) as p:
+                    listen_addresses=[INNER], udp_loss_budget=1) as p:
         await warm(r, p, [0, 1, 2, 3], "natt-overlap-baseline", flows[:4])
         await hardware(r, p, "natt-overlap-baseline-hardware", flows[:4])
         old_spi = r.ipsec.active["out"]
