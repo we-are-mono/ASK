@@ -358,7 +358,13 @@ async def test_released_without_multicast(multicast_rig, rig):
         # defers that offer to the flow's 30-second expiry.
         deadline = time.monotonic() + 45
         while True:
-            await r.exchange(32, promiscuous=False)
+            try:
+                await r.exchange(32, promiscuous=False)
+            except pytest.fail.Exception as error:
+                # A datagram lost on the way in (A328) only delays the offer
+                # this loop is waiting for, which the next round makes; it is
+                # not the release this case proves.
+                r.record("quarantine-exchange-loss", {"error": str(error)[:4000]})
             admitted = await r.state()
             if admitted["entries"] == 2:
                 break

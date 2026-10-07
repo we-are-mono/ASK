@@ -319,7 +319,12 @@ result independently of those temporary files.
   `docs/flowtable/udp-loss-investigation.md`. 10/10 scoped reruns passed. A corrupted frame on the WAN cable is not
   ruled out: the DUT rebooted before its `eth4` receive counters were read. The peer harness now records DUT
   `/proc/net/xfrm_stat` at start, and on failure both DUT ports' and the LAN NIC's receive errors. Next occurrence:
-  diff those to place the drop.
+  diff those to place the drop. Seen again in full run 224 (2026-10-07,
+  `flowtable_service_multicast_quarantine.py::test_released_without_multicast`): the first datagram of a fresh flow left
+  loki and created no DUT conntrack, so it died before the DUT's IP stack (wire, switch or DPAA/FMan receive). That
+  test's plain `Rig.exchange` does not record the DUT port counters; 15/15 isolated reruns passed. The case now
+  retries a lost datagram in its admission loop instead of aborting, which left its parked entries behind and
+  skipped the rest of the suite.
 
 - [ ] **A329 — detaching a full table holds Netfilter's `flow_block_lock` while the binding's entries are retired.**
   `nf_flow_table_block_setup()` calls `ft_release()` with the lock held for write. Retiring 32,768 entries takes 5.9 s
