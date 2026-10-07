@@ -633,6 +633,35 @@ def test_second(): pass
     assert collect(1) != collect(2)
 
 
+def test_bench_runs_draw_a_module_order_and_report_it(pytester, monkeypatch):
+    artifacts = pytester.path / "artifacts"
+    monkeypatch.setenv("ASK_TEST_ARTIFACTS", str(artifacts))
+    pytester.makeconftest('pytest_plugins = ["ask_orch.pytest_plugin"]')
+    names = [f"test_m{n:02d}" for n in range(12)]
+    for name in names:
+        pytester.makepyfile(**{name: "def test_case(): pass\n"})
+    host = pytester.mkdir("host_tests")
+    for name in names:
+        (host / f"{name}.py").write_text("def test_case(): pass\n")
+
+    def collect(*args):
+        before = set(artifacts.glob("*/session-*/selection.json"))
+        result = pytester.runpytest_subprocess("--collect-only", "-q", *args)
+        assert result.ret == 0
+        created, = set(artifacts.glob("*/session-*/selection.json")) - before
+        selection = json.loads(created.read_text())
+        return result, selection["module_order_seed"], [n.split("::")[0][:-3] for n in selection["nodeids"]]
+
+    # Outside host_tests a case is a bench case, and a bench run draws an order.
+    result, seed, order = collect(*(f"{name}.py" for name in names))
+    assert isinstance(seed, int) and sorted(order) == names
+    result.stdout.fnmatch_lines([f"module order: seed {seed} (repeat with --module-order-seed={seed})"])
+    assert collect(f"--module-order-seed={seed}", *(f"{name}.py" for name in names))[2] == order
+    assert collect("--fixed-order", *(f"{name}.py" for name in names))[1:] == (None, names)
+    # Host cases keep theirs: xdist workers must all collect the same one.
+    assert collect("host_tests")[1:] == (None, [f"host_tests/{name}" for name in names])
+
+
 @pytest.mark.parametrize("reported_failure", [False, True])
 async def test_capture_collects_evidence_for_a_reported_test_failure(monkeypatch, tmp_path, reported_failure):
     # pytest reports a failed test before resuming yield fixtures; it does not

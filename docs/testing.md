@@ -486,10 +486,14 @@ that differs from the checkout and checks each selected test's required tools.
   every selected skip, including disabled opt-in cases. Expected xfails keep
   their native status. Select the required release matrix explicitly and enable
   its opt-in cases. WAN address lifecycle needs its separate subnet invocation.
-- `ARGS='--module-order-seed=42'` shuffles whole modules with the standard
-  library. Test and parameter order within each module stays intact, including
-  the shared profile lifecycles. Session artifacts record the seed and complete
-  selection so a failing order can be repeated on the same boot.
+- Bench runs shuffle whole modules with a seed drawn per run, so state one module
+  leaves behind meets a different successor each time. Test and parameter order
+  within each module stays intact, including the shared profile lifecycles. The
+  seed is printed after collection and at the end of the run, and session
+  artifacts record it with the complete selection; `ARGS='--module-order-seed=N'`
+  repeats that order on the same boot. `ARGS=--fixed-order` keeps collection
+  order. Host-only runs keep collection order unless given a seed, since xdist
+  workers must all collect the same one.
 
 Native lifecycle tests use the actual protocol daemons: `flowtable_dhcp.py`
 checks unchanged renewal, renewal after the server loses its lease database,

@@ -22,7 +22,12 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         "--module-order-seed", type=int,
-        help="shuffle modules reproducibly while preserving each module's test order",
+        help="shuffle modules reproducibly while preserving each module's test order "
+             "(hardware runs pick a seed at random by default)",
+    )
+    parser.addoption(
+        "--fixed-order", action="store_true",
+        help="run modules in collection order instead of a random one",
     )
 
 
@@ -135,6 +140,13 @@ def pytest_collection_modifyitems(config, items):
     # remaining selection so `-m host -n auto` never reserves the bench.
     result = yield
     seed = config.getoption("--module-order-seed")
+    # A state one module leaves behind for the next is only found by
+    # changing who comes next, so every bench run draws a new order. Host
+    # runs keep theirs: xdist workers must all collect the same one.
+    if (seed is None and not config.getoption("--fixed-order")
+            and any(item.get_closest_marker("hardware") for item in items)):
+        seed = random.SystemRandom().randrange(1 << 32)
+    config._ask_order_seed = seed
     if seed is not None:
         modules = {}
         for item in items:
@@ -240,8 +252,19 @@ def pytest_runtest_makereport(item, call):
     return report
 
 
+def _order_line(config):
+    seed = getattr(config, "_ask_order_seed", None)
+    return None if seed is None else f"module order: seed {seed} (repeat with --module-order-seed={seed})"
+
+
+def pytest_report_collectionfinish(config):
+    return _order_line(config)
+
+
 def pytest_terminal_summary(terminalreporter):
     terminalreporter.write_line(f"Artifacts: {terminalreporter.config._ask_run_dir}")
+    if line := _order_line(terminalreporter.config):
+        terminalreporter.write_line(line)
 
 
 def _duration(seconds):
