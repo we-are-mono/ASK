@@ -11,8 +11,7 @@ async def test_switchdev_foreign_namespace(rig):
         return await command(r.target, r.session, *args)
 
     await r.table()
-    await r.exchange()
-    before = await r.wait(lambda s: s["entries"] == 2)
+    before = await r.admit()
     await run("modprobe", "dummy")
     await run("ip", "netns", "add", namespace)
     try:

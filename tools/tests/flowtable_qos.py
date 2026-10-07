@@ -703,8 +703,7 @@ async def test_dscp_remark_rewrites_the_wire(qos):
             == REMARK_MASK
         shift = (REMARK_MASK & -REMARK_MASK).bit_length() - 1
         await r.table(mark=REMARK_CLASS << shift)
-        await r.exchange(64)
-        installed = await r.wait(lambda s: s["entries"] == 2)
+        installed = await r.admit(64)
         before = await egress(r, TARGET_WAN_IF)
         packets = await captured(r, lambda: r.exchange(COUNT))
         after = await egress(r, TARGET_WAN_IF)

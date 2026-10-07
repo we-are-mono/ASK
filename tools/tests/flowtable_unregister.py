@@ -24,8 +24,7 @@ async def test_flowtable_physical_unregister(rig):
     addresses = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr",
                                          "show", "dev", TARGET_LAN_IF))["stdout"])[0]["addr_info"]
     await r.table()
-    await r.exchange(128, promiscuous=False)
-    initial = await r.wait(lambda s: s["entries"] == 2)
+    initial = await r.admit(128, promiscuous=False)
     baseline = len(r.echo.received)
     traffic = asyncio.create_task(terminal_stream(r, duration=24))
     device = None

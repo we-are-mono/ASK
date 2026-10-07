@@ -156,6 +156,22 @@ class Rig:
             await asyncio.sleep(0.1)
         pytest.fail(f"flowtable state did not converge: {state}")
 
+    async def admit(self, count=64, settled=lambda s: s["entries"] == 2, timeout=10, **exchange):
+        """Exchange `count`, then keep exchanging until `settled` holds. An
+        offer the backend declines in passing -- a lost rtnl_trylock, a
+        retirement still settling -- is offered again only by a later packet
+        of that direction, at most once a second, so a single burst followed
+        by an idle wait strands the direction it missed."""
+        deadline = time.monotonic() + timeout
+        await self.exchange(count, **exchange)
+        while True:
+            state = await self.state()
+            if settled(state):
+                return state
+            if time.monotonic() >= deadline:
+                pytest.fail(f"flowtable state did not converge: {state}")
+            await self.exchange(16, **exchange)
+
     async def nft(self, text):
         return await command(self.target, self.session, "nft", text)
 

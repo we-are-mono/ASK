@@ -86,8 +86,7 @@ async def test_reference_and_lifecycle(rig):
     # software and the rest in hardware, and the total is the same either way --
     # which is the point: the two now agree on what a frame is worth, so no part
     # of this has to know where the boundary fell.
-    await r.exchange(count, payload_size=payload)
-    counted = await r.wait(lambda s: s["entries"] == 2)
+    counted = await r.admit(count, payload_size=payload)
     total, deadline = None, time.monotonic() + 30
     while time.monotonic() < deadline:
         total = await ct_bytes(r)
@@ -163,8 +162,7 @@ async def test_reference_and_lifecycle(rig):
         assert (await r.state())["entries"] == 0
         await r.clear_ct()
         await r.table()
-        await r.exchange()
-        await r.wait(lambda s: s["entries"] == 2)
+        await r.admit()
     # Active traffic spans two default 30-second UDP flowtable timeouts.
     end = time.monotonic() + 65
     while time.monotonic() < end:
@@ -184,8 +182,7 @@ async def test_same_tuple_exceptions(rig):
     if (await r.state())["observe"]:
         pytest.skip("exception handling requires installed hardware")
     await r.table()
-    await r.exchange()
-    await r.wait(lambda s: s["entries"] == 2)
+    await r.admit()
     before = await r.state()
     await r.exchange(32, payload_size=8)
     r.record("exception-short-packets", {"before": before, "after": await r.state()})
@@ -264,8 +261,7 @@ async def test_conntrack_timeout_extension(rig):
         pytest.skip("timeout extension requires installed hardware")
     await r.table()
     opened = time.monotonic()
-    await r.exchange()
-    installed = await r.wait(lambda s: s["entries"] == 2)
+    installed = await r.admit()
     admitted = await ct_listing(r)
     assert "[HW_OFFLOAD]" in admitted, admitted
     identity = re.search(r"\bid=(\d+)", admitted)[1]
@@ -367,8 +363,7 @@ async def test_rearm(rig):
     rule_added = False
     boot_id = await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")
     await r.table()
-    await r.exchange(128, promiscuous=False)
-    await r.wait(lambda s: s["entries"] == 2)
+    await r.admit(128, promiscuous=False)
     try:
         for cycle, trigger in enumerate(("device", "rule", "barrier"), 1):
             before = await r.state()
@@ -445,8 +440,7 @@ async def test_rearm(rig):
             assert rearmed["rearms"] == initial["rearms"] + cycle
             assert rearmed["invalidated"] == rearmed["invalidation_done"] == rearmed["rearm_ready"] == 0
             assert rearmed["errors"] == invalid["errors"] and rearmed["fatal"] == 0
-            await r.exchange(128, promiscuous=False)
-            installed = await r.wait(lambda s: s["entries"] == 2)
+            installed = await r.admit(128, promiscuous=False)
             for flow in installed["flows"]:
                 assert int(flow["mtu"]) == r.port_mtu, installed
             tx_before = {d: await kernel_tx_packets(r.target, r.session, d)
@@ -483,8 +477,7 @@ async def test_invalidation(rig, trigger):
     if (await r.state())["observe"]:
         pytest.skip("invalidation requires installed hardware")
     await r.table()
-    await r.exchange()
-    before = await r.wait(lambda s: s["entries"] == 2)
+    before = await r.admit()
     assert trigger in {"neighbour", "barrier"}
     if trigger == "barrier":
         knob = "/proc/fm_ehash_hcsync_fail"
@@ -523,8 +516,7 @@ async def test_table_reload(rig):
     if (await r.state())["observe"]:
         pytest.skip("the reload proof requires installed hardware")
     await r.table()
-    await r.exchange(count=4)
-    before = await r.wait(lambda s: s["entries"] == 2)
+    before = await r.admit(4)
     ports = f"devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload;"
     probe = f"table inet {TABLE}_probe {{ flowtable probe {{ hook ingress priority 0; {ports} }}; }}"
     third = f"table inet {TABLE}_third {{ flowtable third {{ hook ingress priority 0; {ports} }}; }}"
@@ -541,8 +533,7 @@ async def test_table_reload(rig):
     # The old flowtable took its flows with it; conntrack still holds the
     # connection, so the next packets offer it to the new one.
     await r.wait(lambda s: s["bindings"] == 2 and not s["entries"])
-    await r.exchange(count=4)
-    admitted = await r.wait(lambda s: s["entries"] == 2)
+    admitted = await r.admit(4)
     baseline = {f["cookie"]: int(f["packets"]) for f in admitted["flows"]}
     await r.exchange(count=64)
     after = await r.state()
@@ -579,8 +570,7 @@ async def test_reload_invalidated(rig):
     replacement = f"{TABLE}_next"
     try:
         await r.table()
-        await r.exchange()
-        await r.wait(lambda s: s["entries"] == 2)
+        await r.admit()
         latched = await latch_barrier_failure(r)
         assert latched["bindings"] == 2 and latched["parked"] == 0, latched
 
@@ -594,8 +584,7 @@ async def test_reload_invalidated(rig):
         assert rearmed["bindings"] == 2 and rearmed["parked"] == 0, rearmed
         assert rearmed["invalidated"] == rearmed["invalidation_done"] == rearmed["rearm_ready"] == 0, rearmed
         assert rearmed["rearms"] == latched["rearms"] + 1 and rearmed["errors"] == latched["errors"], rearmed
-        await r.exchange()
-        await r.wait(lambda s: s["entries"] == 2)
+        await r.admit()
         reopened = await hardware_proof(r)
         r.record("reload-invalidated-fw4", {"latched": latched, "rearmed": rearmed,
                                             "hardware": reopened, "nft": reloaded})
@@ -690,8 +679,7 @@ async def test_counter_enabled_live(rig):
     if (await r.state())["observe"]:
         pytest.skip("live counter enablement requires installed hardware")
     await r.table()
-    await r.exchange()
-    installed = await r.wait(lambda s: s["entries"] == 2)
+    installed = await r.admit()
     await r.exchange(32)
     await asyncio.sleep(8)
     await r.nft(f"add flowtable inet {TABLE} fast {{ hook ingress priority 0; "
@@ -828,13 +816,11 @@ async def test_terminal(rig):
         r.restart_limit = await knob(con, LIMIT)
         await write(con, LIMIT, 1)
         await r.table()
-        await r.exchange(64)
-        await r.wait(lambda s: s["entries"] == 2)
+        await r.admit(64)
         r.record("budget-first", await timed_restart(con, ["nft", "delete", "table", "inet", TABLE]))
         await r.clear_ct()
     await r.table()
-    await r.exchange(128)
-    initial = await r.wait(lambda s: s["entries"] == 2)
+    initial = await r.admit(128)
     assert all(int(f["packets"]) > 0 for f in initial["flows"]), initial
     baseline = len(r.echo.received)
     # The sender has to outlast every console check before the stopped-port
@@ -1003,8 +989,7 @@ async def test_unproven_delete_restarts(rig):
     # first, then its links brought back, then the console's kernel messages.
     async with quiet_console(con), links_restored(r, con), restart_budget(con, r, (UNICAST_FAULT,)):
         await r.table()
-        await r.exchange(128)
-        initial = await r.wait(lambda s: s["entries"] == 2)
+        initial = await r.admit(128)
         assert all(int(f["packets"]) > 0 for f in initial["flows"]), initial
         marks = await log_marks(con)
         baseline = len(r.echo.received)
@@ -1098,8 +1083,7 @@ async def test_unproven_delete_restarts(rig):
         # parked and the restart counted once.
         await r.clear_ct()
         await r.table()
-        await r.exchange(64)
-        await r.wait(lambda s: s["entries"] == 2)
+        await r.admit(64)
         proven = await hardware_proof(r)
         assert proven["fatal"] == proven["quarantine"] == 0, proven
         assert proven["restarts"] == live["restarts"] + 1, proven
@@ -1109,8 +1093,7 @@ async def test_unproven_delete_restarts(rig):
         await assert_restarted_cleanly(con, marks, restarts=2)
         await r.clear_ct()
         await r.table()
-        await r.exchange(64)
-        await r.wait(lambda s: s["entries"] == 2)
+        await r.admit(64)
         final = await hardware_proof(r)
         assert final["restarts"] == live["restarts"] + 2 and final["fatal"] == 0, final
         assert final["resume_failures"] == live["resume_failures"], final
