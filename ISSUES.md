@@ -326,11 +326,8 @@ result independently of those temporary files.
   from oh1's `fmbm_ofsdm` to `fmbm_ofsem`, so the frames reach cdx's `ofport_rx_err` with their status. The first try
   reset the DUT about a minute in with no console output; capture the console before retrying.
 
-- [ ] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.**
-  Full run 224 (2026-10-07, `flowtable_service_multicast_quarantine.py::test_released_without_multicast`): it left
-  loki and created no DUT conntrack, so it died on the wire, the switch or DPAA/FMan receive. Plain Ethernet, not the
-  A328 path. `Rig.exchange` does not record the DUT port counters; 15/15 isolated reruns passed. The case retries a
-  lost datagram in its admission loop.
+- [x] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.** The rig's LAN copper SFP
+  module, since replaced: absent in every run with the new one (_:/^issues: close A332 as the LAN SFP module_).
 
 - [ ] **A329 — detaching a full table holds Netfilter's `flow_block_lock` while the binding's entries are retired.**
   `nf_flow_table_block_setup()` calls `ft_release()` with the lock held for write. Retiring 32,768 entries takes 5.9 s
