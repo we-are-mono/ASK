@@ -630,9 +630,14 @@ async def _tcp_accounted(ctx, client, *, peer, dport, label="profile_isp"):
         now = rows(after)
     ctx.record(f"isp-{label}", {"before": before, "after": after, "software_wan_tx": sent,
                                 "report": transfer.report})
+    # Nothing installed anywhere, and every delete accounted for by a row that
+    # was there before and is gone now: the previous case's connection closes
+    # as this one opens, and its two entries are retired in their own time.
+    gone = {f["cookie"] for f in before["flows"]} - {f["cookie"] for f in after["flows"]}
     assert_undisturbed(ctx, before, after,
                        (now[0]["cookie"], now[1]["cookie"]) == (forward["cookie"], reverse["cookie"])
-                       and (after["installs"], after["deletes"]) == (before["installs"], before["deletes"]),
+                       and after["installs"] == before["installs"]
+                       and after["deletes"] - before["deletes"] == len(gone),
                        label=f"isp-{label}-readmitted")
     upload = int(now[0]["packets"]) - int(forward["packets"])
     download = int(now[1]["packets"]) - int(reverse["packets"])
