@@ -7,7 +7,7 @@ import secrets
 import pytest
 
 from _flowtable_connections import (by_key, healthy, peer)
-from _flowtable_rig import (command)
+from _flowtable_rig import (command, read)
 from _flowtable_selective_neighbour import (warm)
 from _flowtable_service_ipsec import (INNER, Transform, flows_for, hardware)
 from _flowtable_service_ipsec_provenance import (COUNT, KEY, inject)
@@ -57,11 +57,8 @@ async def test_ipsec_outbound_natt_rekey_root(ipsec_service):
     """Old and new SEC descriptors share one UDP output root. Retiring the
     first descriptor must keep that root's tag valid for the surviving SA."""
     r, flows = ipsec_service, flows_for(ipsec_service)
-    # The IPsec offline port's classifier discards about one decrypted frame
-    # in 10^4-10^5 while two TCP streams burst through the tunnel (A328);
-    # flow 2 shares the tunnel with those streams for most of this test.
     async with peer(r, flows, initial_ids=[0, 1, 2, 3], lease=300,
-                    listen_addresses=[INNER], udp_loss_budget=1) as p:
+                    listen_addresses=[INNER]) as p:
         await warm(r, p, [0, 1, 2, 3], "natt-overlap-baseline", flows[:4])
         await hardware(r, p, "natt-overlap-baseline-hardware", flows[:4])
         old_spi = r.ipsec.active["out"]
@@ -84,3 +81,43 @@ async def test_ipsec_outbound_natt_rekey_root(ipsec_service):
         await warm(r, p, [0, 1, 2, 3, 4], "natt-overlap-survivor", flows[:5])
         await hardware(r, p, "natt-overlap-survivor-hardware", flows[:5])
         healthy(await r.state())
+
+
+# The IPsec offline port, which every frame SEC produces reaches next. Its
+# filter count is every frame FMan discarded for an error status, SEC's
+# refusals included.
+IPSEC_OFFLINE_PORT = "/sys/devices/platform/soc/1a00000.fman/1a83000.port/statistics/port_rx_filter_frame"
+
+
+@pytest.mark.parametrize("ipsec_service", [Transform(encap=(4500, 31000)),
+                         Transform(AEAD["rfc4106-icv16"].algorithms, (4500, 31000))],
+                         ids=["cbc", "gcm"], indirect=True)
+async def test_ipsec_decrypted_frames_intact_under_overlap(ipsec_service):
+    """SEC writes every decrypted frame whole while both rekey descriptors
+    encrypt. A frame SEC wrote short reaches the offline port with a bad L4
+    checksum, and FMan discards it there; SEC's own refusals are the only
+    discards allowed."""
+    r, flows = ipsec_service, flows_for(ipsec_service)
+
+    async def discards():
+        # The accounting pass reads the microcode's refusal count once a
+        # second; let it catch up with the live filter count first.
+        await asyncio.sleep(1.5)
+        filtered = int((await read(r.target, r.session, IPSEC_OFFLINE_PORT)).split()[-1])
+        return filtered, (await r.state())["ipsec_sec_refused"]
+
+    async with peer(r, flows, initial_ids=[0, 1, 2, 3], lease=400, listen_addresses=[INNER],
+                    tcp_size=131072) as p:
+        await warm(r, p, [0, 1, 2, 3], "overlap-intact-baseline", flows[:4])
+        await r.ipsec.install("out", await r.ipsec.prepare_peer("out"))
+        await p.rpc("open", [4])
+        await warm(r, p, [0, 1, 2, 3, 4], "overlap-intact-both", flows[:5])
+        before = await discards()
+        # Two streams of 128 KB records beside a UDP flow: the decrypted
+        # ACKs keep both outbound descriptors and the inbound one busy.
+        for _ in range(8):
+            await p.batch([2, 3, 4], count=256, interval=0.01)
+        after = await discards()
+    filtered, refused = after[0] - before[0], after[1] - before[1]
+    r.record("overlap-intact-discards", {"filtered": filtered, "refused": refused})
+    assert filtered == refused, f"offline port discarded {filtered} frames, {refused} of them SEC refusals"

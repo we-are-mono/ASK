@@ -312,47 +312,16 @@ result independently of those temporary files.
 - [x] **A330 — IPv6 into a smaller path trusted the advertised MTU, so a host ignoring it lost oversized packets with no Packet Too Big.** Fixed:
   one MAC-bounded MTU rule for both families, routed multicast included (_:/^flowtable: bound IPv6 by what the port accepts_).
 
-- [ ] **A328 — IPsec output-pool buffers are held by two frames at once, and one owner can free the page under the other.**
-  Symptom: oh1 (`1a83000`, the port SEC returns frames to) discards about one frame in 10^4–10^5 under bursty
-  tunnel load. Seen as one lost UDP reply in `flowtable_service_ipsec_rekey.py::test_ipsec_outbound_natt_rekey_root`
-  (full runs 179, 226; ~1 in 15–30 scoped runs) and in `flowtable_service_ipsec.py::test_sa_recovery` (run 236).
-  That test allows one lost datagram (`peer(udp_loss_budget=1)`). Reproducer: two tunnelled TCP flows with 128 KB
-  records every 10 ms beside a UDP flow lose 2–19 frames per 2.5 s round. Ruled out on 2026-10-07: table
-  churn/A327 batching, SEC refusals, KeyGen misses, the policer, MTU/DF, congestion, the rekey overlap.
-  Mechanism (2026-10-08):
-  - oh1 parses every frame twice (parse dispatches = 2 × `fmbm_ofrc` exactly). A dropped frame fails both parses with
-    an L4 error (`fmpr_l4rres` = 2 × drops) and leaves through the microcode's discard (CLS_DISCARD).
-  - Capture: one-word microcode patch, loaded through U-Boot `fman_ucode` with no flash write, plus PRS_HDR_ERR moved
-    from oh1's `fmbm_ofsdm` to `fmbm_ofsem`. The frames then reach error FQ 96, where cdx's `ofport_rx_err` dumps them.
-  - The dumps come from pool 34 (`ipsec_bp`). In both directions an FD and its buffer disagree: decrypted 70-byte
-    ACKs with the last 4 bytes zeroed or other frames' bytes in them, and NAT-T ESP frames with stale lengths. Two FDs
-    with different status words pointed at byte-identical buffers.
-  - KASAN with `page_owner=on` proves sharing. While FQ 96 still held an FD for a pool-34 buffer, another FD for the
-    same buffer reached the exception queue and failed the SA-tag check. `ipsec_exception_pkt_handler`'s `pkt_drop`
-    then freed the page (`consume_skb`). cdx's dump read it as a use-after-free, and `ipsec_pool_refill_work` seeded
-    the same page back into pool 34 144 µs later.
-  - Impact is larger than one lost packet. SEC/FMan DMA can land in a page the kernel has freed or reused (silent
-    memory corruption), and the LIFO refill can put one page into the pool twice.
-  - Not explained: pool 34 holds exactly 512 at idle, and an idle `rmmod cdx` drained it with no KASAN report. A code
-    audit found no software path that releases a pool-34 buffer twice: exception, software SEC submit,
-    `dpa_fd_release`, Tx (recycling is compiled out, `tx recycled` 0), refill. No SEC refusals, no corruption on the
-    wire, and random payloads give the same rate. The NXP reference handler (`pkt_drop` freed the skb *and* released
-    the FD) had this bug class; ours does not.
-  - Routing frames to FQ 96 wedges FMan within seconds ("HC confirmation timed out"), the same as moving CLS_DISCARD
-    on 2026-10-07. Each capture needs a reboot.
-  - Trigger, same boot: the reproducer needs two outbound SAs over one NAT-T tuple (the rekey overlap, sharing one
-    output root and SA tag). Two SAs: 30 drops in 8 rounds. One SA: 0 in 24 rounds. The 2026-10-07 note that one SA
-    suffices does not hold for this reproducer.
-  - A/B: a throwaway patch (`~/Mono/a328-handoff/patches/a328-no-sa-tag.patch`) drops the SA tag on this path.
-    - It restores NXP's 14-byte header copy, and oh1 neither validates nor strips the tag.
-    - Two SAs: 3 drops with the A328 signature in 52 rounds.
-    - It also brings bursts of 24–49 drops with no L4 error. These are the patch's own artifact: oh1's miss path
-      expects tagged frames.
-    - So the tag path (18-byte header assembly in the SEC descriptor, or validate-and-strip on oh1) is implicated.
-  Next: split the tag path. Keep the tag but build it another way in the SEC descriptor, or keep the descriptor and skip
-  oh1's validation. Also log the FD address (`qm_fd_addr`) in `ofport_rx_report` and in the exception handler, and
-  clamp the dump to `bp->size` (today it trusts `length20`), to pair the two FDs. Bulk IPsec (`ipsec_vlan_iperf_probe`) also discards ~10^4 frames per run
-  on oh1; those are SEC refusals cdx counts (buffer depletion, `other`), not this.
+- [x] **A328 — about one decrypted frame in 10^5 left SEC with its last four bytes zeroed, and the IPsec offline port dropped it.**
+  The inbound counters ran before the decap output drained; not shared buffers (_:/^cdx: let SEC's decap output drain before the inbound counters_).
+
+- [ ] **A333 — SEC refuses IPsec jobs in bursts under bulk or backed-up load.** Bulk IPsec (`ipsec_vlan_iperf_probe`)
+  discards ~10^4 frames per run on oh1 (`1a83000`). Under the A328 reproducer, bursts of 13–18 appeared whenever SEC's
+  output queued behind a slower consumer: oh1 cut to one task, or a CPU relay in front of it. cdx counts them as
+  `ipsec_sec_refused_other` (folded to `XfrmInError`), not as `..._buffer_depletion`. The leading suspect is pool 34
+  (`ipsec_bp`): 512 buffers, refilled only for frames the CPU consumes, with SEC unable to get an output buffer while
+  frames are in flight. Unconfirmed. Next: sample pool 34's free count (`0x1890600 + 4*34`) and the raw SEC status
+  during a burst, then size the pool to the in-flight bound or give it depletion backpressure.
 
 - [x] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.** The rig's LAN copper SFP
   module, since replaced: absent in every run with the new one (_:/^issues: close A332 as the LAN SFP module_).

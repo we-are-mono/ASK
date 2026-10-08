@@ -1299,6 +1299,16 @@ skip_byte_copy:
 #ifdef PRINT_DESC
 		cdx_ipsec_print_desc ( desc,__func__,__LINE__);
 #endif
+		/* The protocol is blocking only from DECO's standpoint (SEC RM
+		 * 7.7.2.1), so its last output store can still be pending when
+		 * the counters' MOVE and MATH commands below begin. Run in that
+		 * window, they cost about one decrypted frame in 10^5 its last
+		 * output word, zeroed, which FMan then drops as an L4 error.
+		 * Wait for the output to drain first (RM 7.20.3). The counters
+		 * stay after the protocol so that they count only frames it
+		 * accepted. */
+		append_jump(desc, JUMP_COND_CALM | JUMP_COND_NIP | JUMP_COND_NIFP |
+			    JUMP_COND_NOP | (1 << JUMP_OFFSET_SHIFT));
 		build_stats_descriptor_part(sa, pdb_len);
 #ifdef PRINT_DESC
 		cdx_ipsec_print_desc ( desc,__func__,__LINE__);
