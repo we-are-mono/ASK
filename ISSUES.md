@@ -340,9 +340,18 @@ result independently of those temporary files.
     the FD) had this bug class; ours does not.
   - Routing frames to FQ 96 wedges FMan within seconds ("HC confirmation timed out"), the same as moving CLS_DISCARD
     on 2026-10-07. Each capture needs a reboot.
-  Next: find what creates the second FD for one buffer, on the SEC/QMan/FMan side or in a release race. Log the FD
-  address (`qm_fd_addr`) in `ofport_rx_report` and in the exception handler, and clamp the dump to `bp->size` (today it
-  trusts `length20`). Then pair the two FDs. Bulk IPsec (`ipsec_vlan_iperf_probe`) also discards ~10^4 frames per run
+  - Trigger, same boot: the reproducer needs two outbound SAs over one NAT-T tuple (the rekey overlap, sharing one
+    output root and SA tag). Two SAs: 30 drops in 8 rounds. One SA: 0 in 24 rounds. The 2026-10-07 note that one SA
+    suffices does not hold for this reproducer.
+  - A/B: a throwaway patch (`~/Mono/a328-handoff/patches/a328-no-sa-tag.patch`) drops the SA tag on this path.
+    - It restores NXP's 14-byte header copy, and oh1 neither validates nor strips the tag.
+    - Two SAs: 3 drops with the A328 signature in 52 rounds.
+    - It also brings bursts of 24–49 drops with no L4 error. These are the patch's own artifact: oh1's miss path
+      expects tagged frames.
+    - So the tag path (18-byte header assembly in the SEC descriptor, or validate-and-strip on oh1) is implicated.
+  Next: split the tag path. Keep the tag but build it another way in the SEC descriptor, or keep the descriptor and skip
+  oh1's validation. Also log the FD address (`qm_fd_addr`) in `ofport_rx_report` and in the exception handler, and
+  clamp the dump to `bp->size` (today it trusts `length20`), to pair the two FDs. Bulk IPsec (`ipsec_vlan_iperf_probe`) also discards ~10^4 frames per run
   on oh1; those are SEC refusals cdx counts (buffer depletion, `other`), not this.
 
 - [x] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.** The rig's LAN copper SFP
