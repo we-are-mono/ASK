@@ -312,27 +312,38 @@ result independently of those temporary files.
 - [x] **A330 — IPv6 into a smaller path trusted the advertised MTU, so a host ignoring it lost oversized packets with no Packet Too Big.** Fixed:
   one MAC-bounded MTU rule for both families, routed multicast included (_:/^flowtable: bound IPv6 by what the port accepts_).
 
-- [ ] **A328 — the IPsec offline port's classifier discards about one frame in 10^4–10^5 under bursty tunnel load.**
-  Seen as one lost UDP reply in `flowtable_service_ipsec_rekey.py::test_ipsec_outbound_natt_rekey_root` (full runs
-  179 and 226, ~1 in 15–30 scoped runs). Placed on 2026-10-07: oh1 (`1a83000`, the port SEC returns frames to) raises
-  `port_rx_filter_frame` (`fmbm_offc`, a `FM_FD_ERR_CLS_DISCARD`) by exactly one per lost reply and never in a passing
-  run; the inner flow's hit counter ends one short, so the frame dies before its hit. The WAN host's capture shows
-  every reply sent. Not the cause: table add/delete or the A327 batching (ftrace: nothing within 0.3–7 s), SEC
-  refusals, misses (KeyGen scheme 24), any FMan policer (`fmpl_rpcnt` unchanged), the inner MTU/DF check (1200 vs
-  1300 alike), egress congestion (both ports never congested), the rekey overlap (one SA suffices). Reproducer: two
-  tunnelled TCP flows with 128 KB records every 10 ms beside a UDP flow discard 2–19 frames per 2.5 s round. Impact: a
-  rare single-packet loss TCP and UDP applications absorb; no state is left wrong. The rekey test now allows one
-  lost datagram (`peer(udp_loss_budget=1)`); full run 236 hit it in `flowtable_service_ipsec.py::test_sa_recovery`
-  too (flow 2's reply, request seen by the WAN host). 2026-10-08: the dropped frames carry a parser L4 error. With
-  parser statistics on oh1 alone (`fmpr_ppsc` 0x10000000, FMan port 3), `fmpr_l4rres` rose by exactly twice oh1's
-  filter count in all seven reproducer runs (76/38, 64/33, 54/27, 64/32...), `fmpr_l3rres` never moved, and the two
-  ports carrying wire traffic showed no L4 error at all -- so the L4 header is bad only in frames SEC produced, not on
-  the wire. A decompilation of this exact microcode (210.10.1, same SHA-256; mihakralj/vyos-ls1046a-build `decomp/`)
-  finds no load- or race-dependent discard, only parser-result and status checks ahead of the lookup. Next: which
-  direction (decrypt or encrypt output), and what in the L4 header is wrong -- punt the discard to Linux with a
-  one-word microcode patch (their `tools/qef-patch.py`) and capture the frame. Under bulk IPsec (`ipsec_vlan_iperf_probe`)
-  oh1 also discards ~10^4 frames per run, but those are SEC refusals already counted by cdx (buffer depletion,
-  `other`), not this.
+- [ ] **A328 — IPsec output-pool buffers are held by two frames at once, and one owner can free the page under the other.**
+  Symptom: oh1 (`1a83000`, the port SEC returns frames to) discards about one frame in 10^4–10^5 under bursty
+  tunnel load. Seen as one lost UDP reply in `flowtable_service_ipsec_rekey.py::test_ipsec_outbound_natt_rekey_root`
+  (full runs 179, 226; ~1 in 15–30 scoped runs) and in `flowtable_service_ipsec.py::test_sa_recovery` (run 236).
+  That test allows one lost datagram (`peer(udp_loss_budget=1)`). Reproducer: two tunnelled TCP flows with 128 KB
+  records every 10 ms beside a UDP flow lose 2–19 frames per 2.5 s round. Ruled out on 2026-10-07: table
+  churn/A327 batching, SEC refusals, KeyGen misses, the policer, MTU/DF, congestion, the rekey overlap.
+  Mechanism (2026-10-08):
+  - oh1 parses every frame twice (parse dispatches = 2 × `fmbm_ofrc` exactly). A dropped frame fails both parses with
+    an L4 error (`fmpr_l4rres` = 2 × drops) and leaves through the microcode's discard (CLS_DISCARD).
+  - Capture: one-word microcode patch, loaded through U-Boot `fman_ucode` with no flash write, plus PRS_HDR_ERR moved
+    from oh1's `fmbm_ofsdm` to `fmbm_ofsem`. The frames then reach error FQ 96, where cdx's `ofport_rx_err` dumps them.
+  - The dumps come from pool 34 (`ipsec_bp`). In both directions an FD and its buffer disagree: decrypted 70-byte
+    ACKs with the last 4 bytes zeroed or other frames' bytes in them, and NAT-T ESP frames with stale lengths. Two FDs
+    with different status words pointed at byte-identical buffers.
+  - KASAN with `page_owner=on` proves sharing. While FQ 96 still held an FD for a pool-34 buffer, another FD for the
+    same buffer reached the exception queue and failed the SA-tag check. `ipsec_exception_pkt_handler`'s `pkt_drop`
+    then freed the page (`consume_skb`). cdx's dump read it as a use-after-free, and `ipsec_pool_refill_work` seeded
+    the same page back into pool 34 144 µs later.
+  - Impact is larger than one lost packet. SEC/FMan DMA can land in a page the kernel has freed or reused (silent
+    memory corruption), and the LIFO refill can put one page into the pool twice.
+  - Not explained: pool 34 holds exactly 512 at idle, and an idle `rmmod cdx` drained it with no KASAN report. A code
+    audit found no software path that releases a pool-34 buffer twice: exception, software SEC submit,
+    `dpa_fd_release`, Tx (recycling is compiled out, `tx recycled` 0), refill. No SEC refusals, no corruption on the
+    wire, and random payloads give the same rate. The NXP reference handler (`pkt_drop` freed the skb *and* released
+    the FD) had this bug class; ours does not.
+  - Routing frames to FQ 96 wedges FMan within seconds ("HC confirmation timed out"), the same as moving CLS_DISCARD
+    on 2026-10-07. Each capture needs a reboot.
+  Next: find what creates the second FD for one buffer, on the SEC/QMan/FMan side or in a release race. Log the FD
+  address (`qm_fd_addr`) in `ofport_rx_report` and in the exception handler, and clamp the dump to `bp->size` (today it
+  trusts `length20`). Then pair the two FDs. Bulk IPsec (`ipsec_vlan_iperf_probe`) also discards ~10^4 frames per run
+  on oh1; those are SEC refusals cdx counts (buffer depletion, `other`), not this.
 
 - [x] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.** The rig's LAN copper SFP
   module, since replaced: absent in every run with the new one (_:/^issues: close A332 as the LAN SFP module_).
