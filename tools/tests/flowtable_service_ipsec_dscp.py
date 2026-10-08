@@ -23,7 +23,7 @@ import pytest
 from _ipsec_helpers import endpoints_down, endpoints_up
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_connections import (by_key, peer)
-from _flowtable_rig import DPORT, command
+from _flowtable_rig import DPORT, command, drive
 from _flowtable_service import FIRST
 from _flowtable_service_ipsec import (INNER, LAN_INNER, Wire, flows_for)
 from _flowtable_service_ipsec_replay import CBC
@@ -76,8 +76,7 @@ async def test_decap_keeps_the_inner_marking(ipsec_service, case):
     tos, outer_tos, expected = DECAP_CASES[case]
     async with peer(r, flows_for(r), initial_ids=[2], lease=300,
                     listen_addresses=[INNER]) as p:
-        await p.batch([2], count=32, interval=0.03)
-        await r.wait(lambda s: KEY in by_key(s))
+        await drive(r, lambda: p.batch([2], count=32, interval=0.03), lambda s: KEY in by_key(s))
         spi = r.ipsec.active["in"]
         # SEC decrypts every packet of an offloaded SA: the flow's own tuple
         # is then forwarded by hardware, another port by Linux. Either way the
@@ -108,8 +107,7 @@ async def test_encap_carries_the_inner_marking(ipsec_service, ecn):
     flows = flows_for(r)
     flows[2] = {**flows[2], "tos": AF41 | ecn}
     async with peer(r, flows, initial_ids=[2], lease=300, listen_addresses=[INNER]) as p:
-        await p.batch([2], count=32, interval=0.03)
-        await r.wait(lambda s: OUTBOUND in by_key(s))
+        await drive(r, lambda: p.batch([2], count=32, interval=0.03), lambda s: OUTBOUND in by_key(s))
         before = by_key(await r.state())
         async with Wire(r, f"dscp-encap-{ecn}") as wire:
             await p.batch([2], count=64, interval=0.02)

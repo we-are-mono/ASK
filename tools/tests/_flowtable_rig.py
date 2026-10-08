@@ -93,6 +93,26 @@ def status_text(text):
     return state
 
 
+async def drive(r, send, settled, timeout=10, again=None):
+    """Send traffic, then keep sending until `settled(r.state())` holds.
+
+    An offer the backend declines in passing -- a lost rtnl_trylock, a
+    retirement still settling -- is offered again only by a later packet of
+    that direction, at most once a second, or after two flowtable GC ticks
+    when the decline retired the generation. A single burst followed by an
+    idle wait strands the direction it missed. `again` is what each later
+    round sends, `send` by default."""
+    deadline = time.monotonic() + timeout
+    await send()
+    while True:
+        state = await r.state()
+        if settled(state):
+            return state
+        if time.monotonic() >= deadline:
+            pytest.fail(f"flowtable state did not converge: {state}")
+        await (again or send)()
+
+
 def assert_undisturbed(r, before, after, same=True, label="flow-disturbed"):
     """Nothing was readmitted between two adapter states, and no offer lost
     RTNL.
@@ -157,20 +177,10 @@ class Rig:
         pytest.fail(f"flowtable state did not converge: {state}")
 
     async def admit(self, count=64, settled=lambda s: s["entries"] == 2, timeout=10, **exchange):
-        """Exchange `count`, then keep exchanging until `settled` holds. An
-        offer the backend declines in passing -- a lost rtnl_trylock, a
-        retirement still settling -- is offered again only by a later packet
-        of that direction, at most once a second, so a single burst followed
-        by an idle wait strands the direction it missed."""
-        deadline = time.monotonic() + timeout
-        await self.exchange(count, **exchange)
-        while True:
-            state = await self.state()
-            if settled(state):
-                return state
-            if time.monotonic() >= deadline:
-                pytest.fail(f"flowtable state did not converge: {state}")
-            await self.exchange(16, **exchange)
+        """Exchange `count`, then keep exchanging until `settled` holds
+        (drive())."""
+        return await drive(self, lambda: self.exchange(count, **exchange), settled, timeout,
+                           again=lambda: self.exchange(16, **exchange))
 
     async def nft(self, text):
         return await command(self.target, self.session, "nft", text)

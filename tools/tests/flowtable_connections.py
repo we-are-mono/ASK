@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 
+from _flowtable_rig import drive
 from _flowtable_tcp import cpu, cpu_delta
 
 @pytest.mark.parametrize("connections", [5], indirect=True, ids=["expiry-5s"])
@@ -20,8 +21,7 @@ async def test_independent_lifetimes(connections):
     r.record("connections-idle", {"cpu": cpu_delta(cpu_before, cpu_after),
                                   "cpu_ticks_before": cpu_before, "cpu_ticks_after": cpu_after})
     async with peer(r) as p:
-        await p.batch(ALL)
-        installed = await r.wait(lambda s: s["entries"] == 64)
+        installed = await drive(r, lambda: p.batch(ALL), lambda s: s["entries"] == 64)
         healthy(installed)
         assert by_key(installed).keys() == keys(r, ALL), installed
         baseline = await hardware_batch(r, p, ALL, "connections-full")
@@ -60,8 +60,7 @@ async def test_independent_lifetimes(connections):
 
         # Reuse the deleted UDP tuple and refresh the still-open idle one while
         # all surviving connections keep their original hardware ownership.
-        await p.batch([0, 2])
-        restored = await r.wait(lambda s: s["entries"] == 62)
+        restored = await drive(r, lambda: p.batch([0, 2]), lambda s: s["entries"] == 62)
         unchanged(r, baseline, restored, live)
         assert by_key(restored).keys() == keys(r, [0, 2] + live), restored
         assert restored["installs"] == baseline["installs"] + 4 and restored["deletes"] == idle["deletes"], restored

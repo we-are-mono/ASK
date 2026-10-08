@@ -26,7 +26,7 @@ import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_connections import (by_key)
-from _flowtable_rig import (DPORT, command, console_command, console_python, read)
+from _flowtable_rig import (DPORT, command, console_command, console_python, drive, read)
 from _flowtable_selective_neighbour import (keys)
 from _flowtable_service import (FIRST)
 from _flowtable_service_ipsec import (INNER, LAN_INNER, Wire, flows_for, sec_counter)
@@ -214,8 +214,7 @@ async def test_expiry(ipsec_service, unit):
         try:
             # A first burst gets flow 2 admitted, so the counted one runs in
             # hardware from its first frame.
-            await blast(r, 500, 2_000)
-            admitted = await r.wait(lambda state: outbound in by_key(state), timeout=5)
+            admitted = await drive(r, lambda: blast(r, 500, 2_000), lambda state: outbound in by_key(state))
             flow = by_key(admitted)[outbound]
             assert flow["sa"] != "0", flow
             at_admission = await sa_state(r, spi)
@@ -275,8 +274,7 @@ async def test_time_expiry(ipsec_service):
     async with XfrmMonitor(r, "ipsec-lifetime-time") as monitor:
         spi = await replace_outbound(r, "limit", "time-soft", "3", "limit", "time-hard", "6")
         try:
-            await blast(r, 500, 2_000)
-            await r.wait(lambda state: outbound in by_key(state), timeout=5)
+            await drive(r, lambda: blast(r, 500, 2_000), lambda state: outbound in by_key(state))
             await r.wait(lambda state: outbound not in by_key(state), timeout=10)
             expiries = await monitor.expiries(spi)
             assert [event["hard"] for event in expiries] == [0, 1], expiries

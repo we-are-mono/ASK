@@ -15,7 +15,7 @@ import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_connections import (by_key, healthy, peer)
-from _flowtable_rig import (DPORT, WAN_IP, command, read)
+from _flowtable_rig import (DPORT, WAN_IP, command, drive, read)
 from _flowtable_service import (FIRST, OBSERVE_TABLE)
 from _flowtable_selective_neighbour import (warm)
 from _flowtable_service_ipsec import (INNER, LAN_INNER, Transform, Wire, flows_for, hardware)
@@ -55,8 +55,7 @@ async def test_ipsec_provenance_misses_and_mtu(ipsec_service):
     r = ipsec_service
     async with peer(r, flows_for(r), initial_ids=[2], lease=300,
                     listen_addresses=[INNER]) as p:
-        await p.batch([2], count=32, interval=0.03)
-        await r.wait(lambda s: KEY in by_key(s))
+        await drive(r, lambda: p.batch([2], count=32, interval=0.03), lambda s: KEY in by_key(s))
         spi = r.ipsec.active["in"]
         # The MTU cases first, while the flow under test is fresh in hardware;
         # their injections are on its own tuple and keep it there. Once the
@@ -109,8 +108,7 @@ async def test_ipsec_provenance_accounting(ipsec_service):
 
     async with peer(r, flows_for(r), initial_ids=[2], lease=180,
                     listen_addresses=[INNER]) as p:
-        await p.batch([2], count=32, interval=0.03)
-        await r.wait(lambda s: KEY in by_key(s))
+        await drive(r, lambda: p.batch([2], count=32, interval=0.03), lambda s: KEY in by_key(s))
         # Let the delayed statistics pass consume the initial software/HW mix.
         await asyncio.sleep(8)
         before = await reply_count()

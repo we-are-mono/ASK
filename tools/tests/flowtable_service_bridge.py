@@ -15,7 +15,7 @@ from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_connections_peer import payload
 from _flowtable_connections import (peer)
-from _flowtable_rig import (artifact_dir, DPORT, SPORT, TABLE, WAN_IP, command, console_command, read)
+from _flowtable_rig import (artifact_dir, DPORT, SPORT, TABLE, WAN_IP, command, console_command, drive, read)
 from _flowtable_selective_neighbour import (hardware, warm)
 from _flowtable_service import FIRST, service_status, supervision_status, wait_service
 from _flowtable_service_vlan import (attempts, balanced, denied, received)
@@ -220,8 +220,8 @@ async def test_vlan_state(bridge_service):
             await blocked_window(r, streams, FIRST, "service-bridge-vlan-state-blocked", check=guest_absent)
             # The trusted VLAN forwards through the same port and returns to hardware
             # while the guest VLAN is still blocked.
-            await p.batch([0, 1], count=64, interval=0.01)
-            trusted = await r.wait(lambda s: len(s["flows"]) == 4 and not guest_rows(s), timeout=10)
+            trusted = await drive(r, lambda: p.batch([0, 1], count=64, interval=0.01),
+                                  lambda s: len(s["flows"]) == 4 and not guest_rows(s))
             r.record("service-bridge-vlan-state-trusted", trusted)
             assert (await vlan_states(r))[GUEST_VID] == "blocking"
         finally:
