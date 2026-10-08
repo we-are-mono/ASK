@@ -283,6 +283,11 @@ async def test_mismatch_tcp(rig):
     r = rig
     stack = CleanupStack()
     try:
+        # What the LAN host learns is the assertion, so nothing it learned
+        # before may stand in for it: a smaller cached path MTU would never
+        # be raised by this test's Fragmentation Needed.
+        flushed = await lan_run(r.lan, "ip route flush cache")
+        assert flushed.rc == 0, flushed.stdout
         await lan_mtu(stack, r, JUMBO)
         await dut_mtu(stack, r, TARGET_LAN_IF, JUMBO)
         await links_up(r)

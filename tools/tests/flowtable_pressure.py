@@ -105,6 +105,10 @@ finally:
                 await warm(r, p, [0, 1], "pressure-policy-recovered", flows)
                 await hardware(r, p, "pressure-policy-final-hardware", flows)
         finally:
+            # The route's 1200-byte MTU sent the LAN host Fragmentation
+            # Needed; its cached path MTU outlives the route by ten minutes,
+            # and later tests expect the link's.
+            await asyncio.to_thread(r.lan.run, "ip route flush cache", 15)
             await stop(con)
             await console_command(con, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", "1500")
             await console_command(con, "rm", "-f", "/tmp/ask-flowtable-test.conf")
