@@ -69,6 +69,7 @@ from _topology import (DUT_IPV6_WAN, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_
                        TopologyStack, dut_vlan_subif, kernel_rx_packets, lan_run,
                        lan_run_python)
 from _flowtable_rig import (artifact_dir, Rig, command, console_command, read)
+from _mcast_cpu import cpu_frames, stream_cpu_counters
 from _flowtable_connections import peer
 from _flowtable_policy import (CONFIG, apply, stop)
 from _gated_tcp import GatedTcp
@@ -1052,11 +1053,14 @@ async def _watch_routed(ctx, clients, seconds, label):
     """Run the stream and answer with what every listener saw and what the CPU
     did not see.
 
-    The listeners are started first and left running, and the software receive
-    counter is sampled across the injection, because the discriminating oracle
-    is the one measured while the frames are in flight. Their window is longer
-    than the stream by the time it takes to start them all plus the settling
-    pause, so every one of them is counting before the first frame.
+    The listeners are started first and left running, and the stream's CPU
+    frames are counted across the injection, because the discriminating oracle
+    is the one measured while the frames are in flight -- by the fixture's
+    netdev ingress counters on the stream's port (_mcast_cpu), since the WAN
+    port's own receive counter also moves for everything else on the segment.
+    The listeners' window is longer than the stream by the time it takes to
+    start them all plus the settling pause, so every one of them is counting
+    before the first frame.
     """
     results = {client["name"]: f"/tmp/ask_{label}_{client['name']}.json"
                for client in clients}
@@ -1064,9 +1068,9 @@ async def _watch_routed(ctx, clients, seconds, label):
     for client in clients:
         await _spawn_listener(ctx, client, window, results[client["name"]])
     await asyncio.sleep(2.0)
-    before = await kernel_rx_packets(ctx.target, ctx.session, TARGET_WAN_IF)
+    before = await cpu_frames(ctx.target, ctx.session, TARGET_WAN_IF)
     await asyncio.to_thread(_inject_stream, seconds, STREAM_PPS, PORT_MCAST)
-    cpu = await kernel_rx_packets(ctx.target, ctx.session, TARGET_WAN_IF) - before
+    cpu = await cpu_frames(ctx.target, ctx.session, TARGET_WAN_IF) - before
     observed = {"sent": int(seconds * STREAM_PPS), "cpu": cpu, "clients": {},
                 "mroute": await _mroute_row(ctx)}
     for client in clients:
@@ -1098,7 +1102,8 @@ async def homelab(target_agent, lan, request, dmesg_allowlist):
     lifecycle case something to move.
     """
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session, capture_window(
-            target_agent, session, request.node.nodeid, dmesg_allowlist, name="profile-kernel"):
+            target_agent, session, request.node.nodeid, dmesg_allowlist, name="profile-kernel"), \
+            stream_cpu_counters(target_agent, session, (PORT_MCAST,)):
         ctx = Profile()
         ctx.target, ctx.session, ctx.lan = target_agent, session, lan
         ctx.wan = Agent("wan", f"http://{ORCH_IPV4}:9110")
