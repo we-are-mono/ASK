@@ -34,6 +34,7 @@ import time
 
 import pytest
 
+from ask_orch.artifacts import record
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 
 LAN_INNER = "198.18.88.2"
@@ -74,10 +75,17 @@ async def flows(session, agent):
 
 @pytest.mark.usefixtures("splat_window")
 async def test_tunnelled_flow_is_steered_to_sec(
-    aiohttp_session, target_agent, lan, record_property,
+    aiohttp_session, target_agent, lan,
 ):
     session = aiohttp_session
     spi = 0x0A880000 | (int.from_bytes(os.urandom(2), "big") or 1)
+    properties = {}
+
+    def note(key, value):
+        # The run's figures, kept in its artifacts: the suite's xunit2
+        # report has no per-test properties.
+        properties[key] = value
+        record("properties", properties)
 
     async def dut(*argv, check=True):
         result = await target_agent.exec_cmd(session, list(argv))
@@ -95,7 +103,7 @@ async def test_tunnelled_flow_is_steered_to_sec(
             (await dut("ip", "-j", "-4", "addr", "show", "dev", TARGET_LAN_IF))["stdout"])
         for address in interface["addr_info"] if address["family"] == "inet")
     here = os.environ["ASK_WAN_IPERF_IP"]
-    record_property("tunnel", f"{dut_lan} <-> {lan_outer}, inner {here} -> {LAN_INNER}")
+    note("tunnel", f"{dut_lan} <-> {lan_outer}, inner {here} -> {LAN_INNER}")
 
     state = ("src", dut_lan, "dst", lan_outer, "proto", "esp", "spi", hex(spi))
     crypto = ("mode", "tunnel", "reqid", str(REQID),
@@ -187,9 +195,9 @@ async def test_tunnelled_flow_is_steered_to_sec(
 
         forward = [row for row in rows if row.get("out") == TARGET_LAN_IF]
         reverse = [row for row in rows if row.get("out") == TARGET_WAN_IF]
-        record_property("echoed", echoed)
-        record_property("toenc_delta", after - before)
-        record_property("flows", "; ".join(
+        note("echoed", echoed)
+        note("toenc_delta", after - before)
+        note("flows", "; ".join(
             f"{r.get('in')}->{r.get('out')} sa={r.get('sa')} packets={r.get('packets')}"
             for r in rows))
 

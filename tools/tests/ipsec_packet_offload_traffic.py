@@ -47,16 +47,24 @@ from contextlib import AsyncExitStack
 
 import pytest
 
+from ask_orch.artifacts import record
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF
 
 
 @pytest.mark.usefixtures("splat_window")
 async def test_packet_offload_tunnel_carries_traffic(
-    aiohttp_session, target_agent, lan, record_property,
+    aiohttp_session, target_agent, lan,
 ):
     session = aiohttp_session
     spi = 0x0A870000 | (secrets.randbelow(65535) + 1)
+    properties = {}
+
+    def note(key, value):
+        # The run's figures, kept in its artifacts: the suite's xunit2
+        # report has no per-test properties.
+        properties[key] = value
+        record("properties", properties)
 
     async def dut(*argv, check=True):
         result = await target_agent.exec_cmd(session, list(argv))
@@ -84,7 +92,7 @@ async def test_packet_offload_tunnel_carries_traffic(
         field.split("/")[0]
         for field in lan_show.stdout.split()
         if field.count(".") == 3 and "/" in field)
-    record_property("endpoints", f"{dut_outer} <-> {lan_outer}")
+    note("endpoints", f"{dut_outer} <-> {lan_outer}")
 
     state = ("src", dut_outer, "dst", lan_outer, "proto", "esp", "spi", hex(spi))
     crypto = ("mode", "tunnel", "reqid", str(REQID),
@@ -201,9 +209,9 @@ async def test_packet_offload_tunnel_carries_traffic(
         after = await toenc(session, target_agent, TARGET_LAN_IF)
         peer = lan_sh("ip -s xfrm state", timeout=30)
         peer_decrypted = decrypted_packets(peer.stdout, spi)
-        record_property("sec_frames", after - before)
-        record_property("peer_decrypted", peer_decrypted)
-        record_property("delivered", len(received))
+        note("sec_frames", after - before)
+        note("peer_decrypted", peer_decrypted)
+        note("delivered", len(received))
 
         assert after - before == COUNT, (
             f"SEC handed {after - before} frames, expected {COUNT}: the tunnel "

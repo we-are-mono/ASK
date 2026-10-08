@@ -39,6 +39,7 @@ Two further things this asserts, each of which was a separate defect:
 
 from __future__ import annotations
 
+from ask_orch.artifacts import record
 from _ipsec_inbound_flow_offload import REQID_IN, REQID_OUT
 
 from _ipsec_inbound_flow_offload import COUNT, LAN_INNER, PAYLOAD, PORT, SETUP, TABLE, crypto, flows, quoted, sec_counter
@@ -58,10 +59,17 @@ from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 
 @pytest.mark.usefixtures("splat_window")
 async def test_tunnel_carries_both_directions_in_hardware(
-    aiohttp_session, target_agent, lan, record_property,
+    aiohttp_session, target_agent, lan,
 ):
     session = aiohttp_session
     spi_out = 0x0A960000 | (int.from_bytes(os.urandom(2), "big") or 1)
+    properties = {}
+
+    def note(key, value):
+        # The run's figures, kept in its artifacts: the suite's xunit2
+        # report has no per-test properties.
+        properties[key] = value
+        record("properties", properties)
     spi_in = spi_out ^ 0x8000
 
     async def dut(*argv, check=True):
@@ -80,7 +88,7 @@ async def test_tunnel_carries_both_directions_in_hardware(
             (await dut("ip", "-j", "-4", "addr", "show", "dev", TARGET_LAN_IF))["stdout"])
         for address in interface["addr_info"] if address["family"] == "inet")
     here = os.environ["ASK_WAN_IPERF_IP"]
-    record_property("tunnel", f"{dut_lan} <-> {lan_outer}, inner {here} <-> {LAN_INNER}")
+    note("tunnel", f"{dut_lan} <-> {lan_outer}, inner {here} <-> {LAN_INNER}")
 
     # The outbound SA carries here -> LAN_INNER; the inbound one carries the
     # replies. They are separate states with separate SPIs, exactly as an IKE
@@ -192,10 +200,10 @@ async def test_tunnel_carries_both_directions_in_hardware(
 
         forward = [row for row in rows if row.get("out") == TARGET_LAN_IF]
         reverse = [row for row in rows if row.get("out") == TARGET_WAN_IF]
-        record_property("echoed", echoed)
-        record_property("toenc_delta", toenc_after - toenc_before)
-        record_property("todec_delta", todec_after - todec_before)
-        record_property("flows", "; ".join(
+        note("echoed", echoed)
+        note("toenc_delta", toenc_after - toenc_before)
+        note("todec_delta", todec_after - todec_before)
+        note("flows", "; ".join(
             f"{r.get('in')}->{r.get('out')} sa={r.get('sa')} in_sa={r.get('in_sa')} "
             f"packets={r.get('packets')}" for r in rows))
 
