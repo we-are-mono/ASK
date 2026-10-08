@@ -77,7 +77,6 @@ def pytest_configure(config):
             "ASK_FLOWTABLE_CHURN_SECONDS",
             "ASK_FLOWTABLE_BASELINE",
             "ASK_FLOWTABLE_MIN_GBPS",
-            "ASK_IPSEC_IPERF",
             "ASK_IPSEC_IPERF_BPS",
         )
         if os.environ.get(key)

@@ -8,8 +8,8 @@ connections with no pause in between, then requires both 10G receive ports to
 have counted frames since. The peer's exit after the last pass closes every
 connection, as the capacity test's did.
 
-Off unless ASK_DRAIN_SOAK_PASSES names a number of passes: one takes about
-two minutes. On a wedge it reads the MAC registers and nothing else -- ethtool
+One pass, about two minutes, in every run; ASK_DRAIN_SOAK_PASSES names more
+for a soak. On a wedge it reads the MAC registers and nothing else -- ethtool
 and QMan debugfs hang a wedged board (A305).
 """
 from __future__ import annotations
@@ -20,15 +20,13 @@ import resource
 import socket
 import time
 
-import pytest
-
 from _flowtable_capacity import (BASE, CAPACITY, CONNECTIONS, DETACH_SECONDS, batch, enable_snapshots,
                                  socket_drops, start, wait_entries)
 from _flowtable_connections import peer
 from _flowtable_rig import DPORT, TABLE, WAN_IP, command, read
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 
-PASSES = int(os.environ.get("ASK_DRAIN_SOAK_PASSES", "0"))
+PASSES = int(os.environ.get("ASK_DRAIN_SOAK_PASSES", "1"))
 FMAN = "/sys/devices/platform/soc/1a00000.fman"
 # The two 10G ports' receive halves, by their BMI register blocks.
 RX_PORTS = ("1a90000", "1a91000")
@@ -43,7 +41,6 @@ async def rx_frames(r):
             for port in RX_PORTS}
 
 
-@pytest.mark.skipif(not PASSES, reason="set ASK_DRAIN_SOAK_PASSES to soak")
 async def test_drain_then_traffic(rig):
     r = rig
     receiver = r.echo.transport.get_extra_info("socket")

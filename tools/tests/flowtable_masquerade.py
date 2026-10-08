@@ -4,6 +4,8 @@ import json
 import os
 import re
 import socket
+import sys
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -21,18 +23,22 @@ ADDRESS, REPLACEMENT, ENDPOINT = "198.18.40.1", "198.18.40.3", "198.18.40.2"
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def masquerade_network(request, target_agent, aiohttp_session):
+async def masquerade_network(request, target_agent, aiohttp_session, monkeypatch):
     if request.node.originalname != "test_wan_lifecycle":
         yield
         return
     # Autouse ordering provisions the extra subnet before the common rig finds
     # its endpoint interface and installs its ordinary routes/neighbours.
-    if WAN_IP != ENDPOINT:
-        # This test needs the WAN host on a subnet of its own, and the fixture
-        # only provisions it for this test -- so a sweep cannot be pointed at
-        # that address without stranding every other test. It is run on its
-        # own, and saying so is more use than erroring in every ordinary run.
-        pytest.skip(f"needs ASK_WAN_IPERF_IP={ENDPOINT}, this run has {WAN_IP}")
+    # The WAN host sits on a subnet of its own here, so the endpoint every
+    # helper reads moves to it for this case alone: each loaded module's copy
+    # of the constant, read at call time, and the variable behind it.
+    # Taken first: the loop patches this module's own copy along the way.
+    original = WAN_IP
+    for module in list(sys.modules.values()):
+        if (getattr(module, "WAN_IP", None) == original
+                and Path(getattr(module, "__file__", None) or "/").parent == Path(__file__).parent):
+            monkeypatch.setattr(module, "WAN_IP", ENDPOINT)
+    monkeypatch.setenv("ASK_WAN_IPERF_IP", ENDPOINT)
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     cleanup = []
     try:

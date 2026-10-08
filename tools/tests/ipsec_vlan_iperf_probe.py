@@ -1,7 +1,9 @@
-"""Opt-in LAN-to-WAN throughput measurement for the SA provenance validation."""
+"""LAN-to-WAN iperf3 through an offloaded SA across a VLAN, both directions in
+hardware, for the SA provenance validation; ASK_IPSEC_IPERF_BPS caps the rate."""
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -14,8 +16,6 @@ from _flowtable_service_ipsec import (INNER, LAN_INNER, Transform)
 from _flowtable_service_ipsec_replay import (AEAD, peer_errors, sa_state, xfrm_mib)
 from _flowtable_tcp import (cpu, cpu_delta, software_tx)
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_IPSEC_IPERF") != "1",
-                                reason="explicit lab throughput measurement")
 PORT = 48993
 
 
@@ -103,7 +103,16 @@ assert result.returncode == 0, result.stderr
                 assert received["end"]["sum_received"]["bytes"] > 0, record
                 assert sum(d["in"] == TARGET_LAN_IF and d["sa"] != "0"
                            and d["packets"] > 1000 for d in deltas) == streams, deltas
-                assert not record["peer_errors"], record["peer_errors"]
+                # The peer's own SA says whether the DUT's ESP was good: no
+                # integrity failure, no replay. The host's MIB also counts
+                # its software crypto shedding load at this rate -- a
+                # StateProtoError or InError with the SA's `failed` still
+                # zero -- which is the peer's limit, not the DUT's frames.
+                stats = re.search(r"stats:\s*replay-window \d+ replay (\d+) failed (\d+)", record["peer_sa"])
+                assert stats and stats.groups() == ("0", "0"), record["peer_sa"]
+                shed = {"XfrmInStateProtoError", "XfrmInError"}
+                assert not {k: v for k, v in record["peer_errors"].items() if k not in shed}, \
+                    record["peer_errors"]
                 healthy(after)
             finally:
                 if task:
