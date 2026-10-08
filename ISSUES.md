@@ -322,9 +322,17 @@ result independently of those temporary files.
   1300 alike), egress congestion (both ports never congested), the rekey overlap (one SA suffices). Reproducer: two
   tunnelled TCP flows with 128 KB records every 10 ms beside a UDP flow discard 2–19 frames per 2.5 s round. Impact: a
   rare single-packet loss TCP and UDP applications absorb; no state is left wrong. The rekey test now allows one
-  lost datagram (`peer(udp_loss_budget=1)`). Next: name the microcode condition by moving `FM_FD_ERR_CLS_DISCARD`
-  from oh1's `fmbm_ofsdm` to `fmbm_ofsem`, so the frames reach cdx's `ofport_rx_err` with their status. The first try
-  reset the DUT about a minute in with no console output; capture the console before retrying.
+  lost datagram (`peer(udp_loss_budget=1)`); full run 236 hit it in `flowtable_service_ipsec.py::test_sa_recovery`
+  too (flow 2's reply, request seen by the WAN host). 2026-10-08: the dropped frames carry a parser L4 error. With
+  parser statistics on oh1 alone (`fmpr_ppsc` 0x10000000, FMan port 3), `fmpr_l4rres` rose by exactly twice oh1's
+  filter count in all seven reproducer runs (76/38, 64/33, 54/27, 64/32...), `fmpr_l3rres` never moved, and the two
+  ports carrying wire traffic showed no L4 error at all -- so the L4 header is bad only in frames SEC produced, not on
+  the wire. A decompilation of this exact microcode (210.10.1, same SHA-256; mihakralj/vyos-ls1046a-build `decomp/`)
+  finds no load- or race-dependent discard, only parser-result and status checks ahead of the lookup. Next: which
+  direction (decrypt or encrypt output), and what in the L4 header is wrong -- punt the discard to Linux with a
+  one-word microcode patch (their `tools/qef-patch.py`) and capture the frame. Under bulk IPsec (`ipsec_vlan_iperf_probe`)
+  oh1 also discards ~10^4 frames per run, but those are SEC refusals already counted by cdx (buffer depletion,
+  `other`), not this.
 
 - [x] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.** The rig's LAN copper SFP
   module, since replaced: absent in every run with the new one (_:/^issues: close A332 as the LAN SFP module_).
