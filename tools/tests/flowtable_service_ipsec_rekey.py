@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import secrets
 
 import pytest
 
 from _flowtable_connections import (by_key, healthy, peer)
-from _flowtable_rig import (command, read)
+from _flowtable_rig import (command)
 from _flowtable_selective_neighbour import (warm)
-from _flowtable_service_ipsec import (INNER, Transform, flows_for, hardware)
+from _flowtable_service_ipsec import (INNER, Transform, flows_for, hardware, offline_port_discards)
 from _flowtable_service_ipsec_provenance import (COUNT, KEY, inject)
 from _flowtable_service_ipsec_replay import (AEAD, sa_state)
+
+NATT = (4500, 31000)
 
 
 @pytest.mark.parametrize("ipsec_service", [Transform(), AEAD["rfc4106-icv16"]],
@@ -83,41 +86,46 @@ async def test_ipsec_outbound_natt_rekey_root(ipsec_service):
         healthy(await r.state())
 
 
-# The IPsec offline port, which every frame SEC produces reaches next. Its
-# filter count is every frame FMan discarded for an error status, SEC's
-# refusals included.
-IPSEC_OFFLINE_PORT = "/sys/devices/platform/soc/1a00000.fman/1a83000.port/statistics/port_rx_filter_frame"
+def key(name, size):
+    """A key of `size` bytes no other transform here shares, derived so a
+    failure reruns with the same keys (and a 3DES key whose thirds differ)."""
+    return "0x" + hashlib.shake_256(name.encode()).hexdigest(size)
 
 
-@pytest.mark.parametrize("ipsec_service", [Transform(encap=(4500, 31000)),
-                         Transform(AEAD["rfc4106-icv16"].algorithms, (4500, 31000))],
-                         ids=["cbc", "gcm"], indirect=True)
+# What a decrypted frame's last output word holds depends on the cipher's
+# block and the ICV that trail the payload, so each family SEC runs is
+# loaded here: AES-CBC with the HMAC lengths it pairs with, the counter
+# modes, and 3DES's 8-byte block.
+OVERLAP_TRANSFORMS = {
+    "cbc-sha256": Transform(encap=NATT),
+    "gcm": Transform(AEAD["rfc4106-icv16"].algorithms, NATT),
+    "cbc-sha1": Transform(("enc", "cbc(aes)", key("cbc-sha1/enc", 16),
+                           "auth-trunc", "hmac(sha1)", key("cbc-sha1/auth", 20), "96"), NATT),
+    "cbc-sha512": Transform(("enc", "cbc(aes)", key("cbc-sha512/enc", 32),
+                             "auth-trunc", "hmac(sha512)", key("cbc-sha512/auth", 64), "256"), NATT),
+    "ctr-sha256": Transform(("enc", "rfc3686(ctr(aes))", key("ctr/enc", 20),
+                             "auth-trunc", "hmac(sha256)", key("ctr/auth", 32), "128"), NATT),
+    "ccm-icv16": Transform(("aead", "rfc4309(ccm(aes))", key("ccm", 19), "128"), NATT),
+    "3des-sha1": Transform(("enc", "cbc(des3_ede)", key("3des/enc", 24),
+                            "auth-trunc", "hmac(sha1)", key("3des/auth", 20), "96"), NATT),
+}
+
+
+@pytest.mark.parametrize("ipsec_service", list(OVERLAP_TRANSFORMS.values()),
+                         ids=list(OVERLAP_TRANSFORMS), indirect=True)
 async def test_ipsec_decrypted_frames_intact_under_overlap(ipsec_service):
     """SEC writes every decrypted frame whole while both rekey descriptors
-    encrypt. A frame SEC wrote short reaches the offline port with a bad L4
-    checksum, and FMan discards it there; SEC's own refusals are the only
-    discards allowed."""
+    encrypt; SEC's own refusals are the only discards the offline port may
+    make (offline_port_discards())."""
     r, flows = ipsec_service, flows_for(ipsec_service)
-
-    async def discards():
-        # The accounting pass reads the microcode's refusal count once a
-        # second; let it catch up with the live filter count first.
-        await asyncio.sleep(1.5)
-        filtered = int((await read(r.target, r.session, IPSEC_OFFLINE_PORT)).split()[-1])
-        return filtered, (await r.state())["ipsec_sec_refused"]
-
     async with peer(r, flows, initial_ids=[0, 1, 2, 3], lease=400, listen_addresses=[INNER],
                     tcp_size=131072) as p:
         await warm(r, p, [0, 1, 2, 3], "overlap-intact-baseline", flows[:4])
         await r.ipsec.install("out", await r.ipsec.prepare_peer("out"))
         await p.rpc("open", [4])
         await warm(r, p, [0, 1, 2, 3, 4], "overlap-intact-both", flows[:5])
-        before = await discards()
-        # Two streams of 128 KB records beside a UDP flow: the decrypted
-        # ACKs keep both outbound descriptors and the inbound one busy.
-        for _ in range(8):
-            await p.batch([2, 3, 4], count=256, interval=0.01)
-        after = await discards()
-    filtered, refused = after[0] - before[0], after[1] - before[1]
-    r.record("overlap-intact-discards", {"filtered": filtered, "refused": refused})
-    assert filtered == refused, f"offline port discarded {filtered} frames, {refused} of them SEC refusals"
+        async with offline_port_discards(r, "overlap-intact-discards"):
+            # Two streams of 128 KB records beside a UDP flow: the decrypted
+            # ACKs keep both outbound descriptors and the inbound one busy.
+            for _ in range(8):
+                await p.batch([2, 3, 4], count=256, interval=0.01)

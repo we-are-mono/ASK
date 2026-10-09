@@ -285,10 +285,18 @@ async def test_receive_failslab(ipsec_service):
                           "priority", "1", "action", "allow")
             await r.wait(lambda s: not s["entries"], timeout=5)
             await p.batch([0, 1, 2, 3], count=32, interval=0.02)
+            dropped = f"/sys/class/net/{TARGET_WAN_IF}/statistics/rx_dropped"
+            before = int(await read(r.target, r.session, dropped))
             async with slab_fault(r, "ipsec-receive", "ipsec-receive-slab") as fault:
                 await p.rpc("start", [2], count=64, interval=0.02, allow_loss=True, udp_timeout=0.2)
                 reports = await p.rpc("wait", [2])
-                hit = await fault.hit()
+                # Since receive copies the frame, the one failure lands on the
+                # copy's sk_buff, which __build_skb() allocates __GFP_NOWARN
+                # (netdev_alloc_skb()'s page-fragment branch) and failslab
+                # does not report: the spent budget, the lost frame and the
+                # SA device's receive drop are its record.
+                hit = await fault.hit(silent=True)
+                assert int(await read(r.target, r.session, dropped)) > before
                 assert reports["2"]["lost"] >= 1 and reports["2"]["received"] > 32, reports
                 await p.batch([0, 1, 2, 3], count=64, interval=0.02)
                 assert len(await r.ipsec.states()) == 2
@@ -312,7 +320,14 @@ def configured(state):
                      if not line.strip().startswith("anti-replay context:"))
 
 
-async def test_pool_recovery(ipsec_service):
+async def test_receive_leaves_the_pool(ipsec_service):
+    """Linux takes each decrypted frame as a copy, and SEC's output buffer goes
+    straight back to SEC's pool (ipsec_copy_contig_fd()). A stream the CPU
+    receives therefore leaves the pool full and its refill with nothing to
+    replace, even with every refill allocation failing. Before, each frame
+    Linux took was a buffer missing until the refill replaced one: with the
+    refill failing, this stream emptied the pool, and SEC refused every SA's
+    jobs for want of an output buffer."""
     from _flowtable_failslab import (slab_fault)
 
     r, flows = ipsec_service, flows_for(ipsec_service)
@@ -349,47 +364,39 @@ print(json.dumps({'path': str(paths[0]), 'bpid': int(bpid)}))
             sas = await r.ipsec.states()
             depleted = (await r.state())["ipsec_sec_refused_buffer_depletion"]
             async with slab_fault(r, "ipsec-pool", "ipsec-pool-slab", continuous=True) as fault:
-                # Outbound SEC output returns to BMan in hardware; each
-                # software receive consumes one dedicated pool buffer.
+                # Every frame of this stream is received by the CPU: the
+                # policy above keeps it out of hardware.
                 await p.rpc("start", [2], count=768, interval=0.001,
                             allow_loss=True, udp_timeout=0.005)
-                reports = await p.rpc("wait", [2])
-                remaining = await available()
-                r.record("pool-exhaustion-window", {"reports": reports, "available": remaining})
-                # The short timeout keeps exhaustion within the fault lease.
-                # Validated late echoes still consumed a SEC receive buffer.
-                delivered = reports["2"]["received"] + reports["2"]["late"]
-                lost = reports["2"]["lost"] - reports["2"]["late"]
-                assert delivered >= 400 and lost >= 64, reports
-                assert remaining == 0
+                waiting = asyncio.create_task(p.rpc("wait", [2]))
+                lowest = initial_pool
+                while not waiting.done():
+                    lowest = min(lowest, await available())
+                    await asyncio.sleep(0.02)
+                reports = await waiting
+                r.record("pool-receive-window", {"reports": reports, "lowest": lowest})
                 assert (await read(r.target, r.session, "/sys/kernel/debug/failslab/probability")).strip() == "100"
+                # Validated late echoes were received too.
+                delivered = reports["2"]["received"] + reports["2"]["late"]
+                assert delivered >= 700, reports
+                assert lowest >= 480, (lowest, reports)
                 await p.batch([0, 1], count=32, interval=0.01)
                 await negative(r, p)
-                r.record("pool-exhausted", {"pool": pool, "before": initial_pool,
-                                           "available": 0, "reports": reports})
-            started = time.monotonic()
-            hit = await fault.hit()
-            # Leave protected traffic idle: refill must recover even when
-            # an empty SEC pool cannot generate another receive callback.
-            while await available() < 480:
-                assert time.monotonic() - started < 5
-                await asyncio.sleep(0.05)
-            recovered = await available()
-            refill_seconds = time.monotonic() - started
-            # SEC had no buffer to write what the empty pool could not
-            # supply. Those frames never reached Linux: the FMan microcode
-            # counted and dropped them, and the adapter reports them as a
-            # resource SEC ran out of, not as anything the traffic did.
-            state = await r.wait(lambda s: s["ipsec_sec_refused_buffer_depletion"] > depleted, timeout=5)
-            r.record("pool-depletion-refusals",
-                     {key: value for key, value in state.items() if key.startswith("ipsec_sec_refused")})
+            # Nothing was taken, so nothing was refilled: the failing
+            # allocator was never even asked.
+            assert fault.result["failures"] == 0, fault.result
+            # The accounting pass folds SEC's refusals once a second.
+            await asyncio.sleep(1.5)
+            state = await r.state()
+            refused = {key: value for key, value in state.items() if key.startswith("ipsec_sec_refused")}
+            r.record("pool-after-receive", {"pool": pool, "before": initial_pool, "lowest": lowest,
+                                           "available": await available(), "refused": refused})
+            assert state["ipsec_sec_refused_buffer_depletion"] == depleted, refused
             await p.batch([0, 1, 2, 3], count=64, interval=0.01)
             # The same SAs, not reinstalled ones. Their anti-replay context
             # follows SEC's numbering, which the traffic above advanced.
             assert [configured(s) for s in await r.ipsec.states()] == [configured(s) for s in sas]
             await plaintext_probe(r, p, "pool-plaintext")
-            r.record("pool-refilled", {"pool": pool, "available": recovered,
-                                      "seconds": refill_seconds, "fault": hit})
         finally:
             await console_command(r.service_console, "ip", "xfrm", "policy", "delete", *identity, check=False)
         await warm(r, p, [0, 1, 2, 3], "pool-readmitted", flows[:4])

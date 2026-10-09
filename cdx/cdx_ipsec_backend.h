@@ -411,8 +411,9 @@ bool cdx_ipsec_sa_replay_state(const struct cdx_ipsec_sa *sa,
  *
  * What it counts is every refusal on every SA, whichever feeder brought the
  * frame to SEC -- the classifier's or the CPU's -- and in either direction.
- * The total is exact; the class a refusal lands in is the microcode's choice
- * and not a reliable one (see cdx_sec_refusal). Nothing is reset: the
+ * The total loses an increment now and then when refusals arrive back to
+ * back; the class a refusal lands in is the microcode's choice and not a
+ * reliable one (see cdx_sec_refusal). Nothing is reset: the
  * microcode updates these read-modify-write, and a caller keeps its own
  * reading to take differences from.
  *

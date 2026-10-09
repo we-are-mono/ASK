@@ -1,7 +1,9 @@
 /* Compile the receive callback and secpath initializer with poisoned metadata
- * and independently accounted FD, skb and SA ownership. A device that is not a
- * DPAA port keeps its private area on a page nothing may read or write, so the
- * callback borrowing it as a port's fails the run by name. */
+ * and independently accounted FD, skb and SA ownership. A contiguous frame is
+ * copied and its buffer given back at once; a scatter/gather one is converted
+ * and leaves a debt. A device that is not a DPAA port keeps its private area
+ * on a page nothing may read or write, so the callback borrowing it as a
+ * port's fails the run by name. */
 #include <assert.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -14,6 +16,7 @@
 #include <errno.h>
 
 typedef int gro_result_t;
+typedef uintptr_t dma_addr_t;
 #define likely(x) (x)
 #define unlikely(x) (x)
 #define DPAIPSEC_ERROR(...) do {} while (0)
@@ -41,6 +44,8 @@ struct vlan_ethhdr { unsigned char dst[6], src[6]; uint16_t h_vlan_proto, h_vlan
 #define smp_store_release(p, v) (*(p) = (v))
 #define DMA_BIDIRECTIONAL 0
 #define qm_fd_addr(p) ((p)->addr)
+#define dpa_fd_offset(p) ((p)->offset)
+#define dpa_fd_length(p) ((p)->length20)
 typedef int atomic_t;
 #define ATOMIC_INIT(v) (v)
 static int atomic_read(atomic_t *p) { return *p; }
@@ -79,12 +84,15 @@ struct xfrm_state { struct { long long use_time; } curlft; struct { unsigned dir
 struct sec_path { int len, olen, verified_cnt; struct xfrm_state *xvec[6]; unsigned ovec[24]; };
 struct sk_buff { struct net_device *dev; unsigned protocol, mac_len; struct sec_path path; bool has_path; unsigned char *data; };
 static unsigned refs, fd_releases, skb_frees, delivered, converted, sg_buffers, added, concurrent, unmapped;
+static unsigned copied, synced_cpu, synced_device;
 static unsigned char *received_data;
+/* Where the skb's frame starts: the pool buffer converted, or the copy. */
+static unsigned char *skb_start;
 static unsigned int reaped;
 static unsigned int dpaa_sec_sg_reap(unsigned int budget)
 { assert(budget == 64); reaped++; return 0; }
 
-static bool no_device, no_state, napi_defer, refill_fail, secpath_fail, short_frame;
+static bool no_device, no_state, napi_defer, refill_fail, secpath_fail, short_frame, copy_fail;
 static struct xfrm_state state;
 static struct sk_buff packet;
 /* The one member of the DPAA driver's ops the driver exports. */
@@ -96,10 +104,23 @@ static const struct net_device_ops wifi_ops = { .ndo_init = NULL };
 static struct net_device device = { .name = "eth4", .netdev_ops = &dpa_ops };
 /* The device the SA names. */
 static struct net_device *sa_device = &device;
-static struct dpa_bp pool;
+static struct dpa_bp pool = { .size = 2048 };
 static struct dpa_bp *dpa_bpid2pool(unsigned id) { (void)id; return &pool; }
 static void dma_unmap_single(void *dev, uintptr_t addr, unsigned size, int direction)
 { (void)dev; (void)addr; (void)size; (void)direction; assert(!unmapped && !converted); unmapped++; }
+static uintptr_t fd_buffer;
+static void dma_sync_single_range_for_cpu(void *dev, uintptr_t addr, unsigned long off,
+                                          unsigned size, int direction)
+{
+    assert(dev == pool.dev && addr == fd_buffer && off + size <= pool.size);
+    assert(!unmapped && !synced_cpu && !copied); synced_cpu++;
+}
+static void dma_sync_single_range_for_device(void *dev, uintptr_t addr, unsigned long off,
+                                             unsigned size, int direction)
+{
+    assert(dev == pool.dev && addr == fd_buffer && off + size <= pool.size);
+    assert(synced_cpu && !synced_device); synced_device++;
+}
 static bool pskb_may_pull(struct sk_buff *skb, unsigned bytes)
 { assert(skb->data && bytes == ETH_HLEN + VLAN_HLEN + 1); return !short_frame; }
 static unsigned char *skb_pull(struct sk_buff *skb, unsigned bytes)
@@ -140,7 +161,29 @@ static bool dpaa_eth_napi_schedule(struct dpa_percpu_priv_s *p, struct qman_port
 { (void)p; (void)q; return napi_defer; }
 #endif
 static struct sk_buff *contig_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd, bool *gro, bool ts)
-{ (void)p; (void)fd; (void)gro; (void)ts; assert(unmapped && !converted && pool.count); pool.count--; converted++; packet.data = received_data; return &packet; }
+{
+    (void)p; (void)fd; (void)gro; (void)ts;
+    assert(unmapped && !converted && !copied && pool.count);
+    pool.count--; converted++; packet.data = skb_start = received_data; return &packet;
+}
+/* The copy: an skb of its own, from the frame's device, sized to the frame
+ * and its offset; the frame lands past that offset. */
+static unsigned char copy_buf[256];
+static struct sk_buff *netdev_alloc_skb(struct net_device *dev, unsigned len)
+{
+    assert(dev == sa_device && synced_cpu && !copied && !converted && !fd_releases);
+    assert(len <= sizeof(copy_buf));
+    if (copy_fail) return NULL;
+    memset(copy_buf, 0x5a, sizeof(copy_buf));
+    copied++; packet.data = copy_buf; return &packet;
+}
+static void skb_reserve(struct sk_buff *skb, unsigned len)
+{ assert(skb == &packet && skb->data == copy_buf); skb->data += len; }
+static void skb_put_data(struct sk_buff *skb, const void *data, unsigned len)
+{
+    assert(skb == &packet && skb->data + len <= copy_buf + sizeof(copy_buf));
+    memcpy(skb->data, data, len); skb_start = skb->data;
+}
 static struct sk_buff *sg_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd, bool *gro, int *count, bool ts)
 {
     struct sk_buff *skb = contig_fd_to_skb(p, fd, gro, ts);
@@ -157,7 +200,8 @@ static const struct qman_portal_config *qman_p_get_portal_config(struct qman_por
 { static struct qman_portal_config pc; (void)q; return &pc; }
 static void dev_kfree_skb(struct sk_buff *skb)
 {
-    assert(skb == &packet && converted == 1 && !skb_frees && !fd_releases);
+    /* A converted frame's buffer goes with the skb; a copy's went back first. */
+    assert(skb == &packet && converted + copied == 1 && !skb_frees && fd_releases == copied);
     skb_frees++;
     if (skb->has_path) {
         assert(skb->path.len >= 0 && skb->path.len <= 1);
@@ -171,14 +215,20 @@ static void netif_receive_skb(struct sk_buff *skb)
     for (unsigned i = 0; i < sizeof(skb->path.ovec) / sizeof(skb->path.ovec[0]); i++)
         assert(skb->path.ovec[i] == 0);
     for (unsigned i = 0; i < 12; i++) assert(skb->data[i] == i + 1);
-    assert(skb->data == received_data + VLAN_HLEN);
+    assert(skb->data == skb_start + VLAN_HLEN);
     delivered++;
     dev_kfree_skb(skb);
 }
 static int napi_gro_receive(int *napi, struct sk_buff *skb)
 { (void)napi; netif_receive_skb(skb); return 0; }
 static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
-{ (void)dev; (void)fd; assert(!unmapped && !converted && !skb_frees && !fd_releases); fd_releases++; }
+{
+    (void)dev;
+    assert(!unmapped && !converted && !skb_frees && !fd_releases && fd->addr == fd_buffer);
+    /* Given back with the device's view of it restored. */
+    assert(synced_cpu == synced_device);
+    fd_releases++;
+}
 static unsigned errors_logged;
 static void pr_err_ratelimited(const char *fmt, ...) { (void)fmt; errors_logged++; }
 #include "ipsec_receive_production.inc"
@@ -218,7 +268,10 @@ static void reset(void)
 {
     assert(!refs);
     refs = fd_releases = skb_frees = delivered = converted = unmapped = errors_logged = 0;
-    no_device = no_state = napi_defer = refill_fail = secpath_fail = short_frame = false;
+    copied = synced_cpu = synced_device = 0;
+    skb_start = NULL;
+    device.rx_dropped = 0;
+    no_device = no_state = napi_defer = refill_fail = secpath_fail = short_frame = copy_fail = false;
     memset(&packet, 0, sizeof(packet));
     state.xso.dir = XFRM_DEV_OFFLOAD_IN;
     for (unsigned i = 0; i < 12; i++) received_data[i] = i + 1;
@@ -251,31 +304,52 @@ int main(void)
     setup_devices();
     for (unsigned sg = 0; sg < 2; sg++) for (unsigned gro = 0; gro < 2; gro++) {
         dq.fd.format = sg;
-        dq.fd.addr = (uintptr_t)(sg ? table : frame);
+        dq.fd.addr = fd_buffer = (uintptr_t)(sg ? table : frame);
         device.features = gro ? NETIF_F_GRO : 0;
-        for (unsigned fault = 0; fault < 11; fault++) {
+        for (unsigned fault = 0; fault < 12; fault++) {
+            unsigned char pristine[sizeof(frame)];
+
             reset();
             no_device = fault == 1; no_state = fault == 2;
             refill_fail = fault == 3; secpath_fail = fault == 4;
             short_frame = fault == 7;
+            copy_fail = fault == 11;
             if (fault == 8) frame[15] ^= 1; /* another SA's tag */
             if (fault == 9) frame[12] = 8;  /* absent shim */
             if (fault == 10) state.xso.dir = 2; /* encrypted output miss */
             dq.fd.status = fault == 5 ? FM_FD_RX_STATUS_ERR_NON_FM : 0;
             dq.stat = fault == 6 ? 0 : QM_DQRR_STAT_FD_VALID;
+            memcpy(pristine, frame, sizeof(frame));
             assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_consume);
             assert(!refs);
-            if (!fault || fault == 3) assert(delivered == 1 && skb_frees == 1 && !fd_releases);
-            if (fault == 4 || (fault >= 7 && fault <= 9)) assert(!delivered && skb_frees == 1 && !fd_releases);
-            if (fault == 1 || fault == 2 || fault == 5 || fault == 10) assert(fd_releases == 1 && !skb_frees && !delivered);
+            /* A copied frame's buffer is back before the stack sees the
+             * copy; a converted one's goes with the skb. */
+            bool copy = !sg && copied;
+            bool lost = fault == 4 || (fault >= 7 && fault <= 9) || (!sg && fault == 11);
+            if (!fault || fault == 3 || (sg && fault == 11))
+                assert(delivered == 1 && skb_frees == 1 && fd_releases == copy);
+            if (fault == 4 || (fault >= 7 && fault <= 9))
+                assert(!delivered && skb_frees == 1 && fd_releases == copy);
+            if (fault == 1 || fault == 2 || fault == 5 || fault == 10 || (!sg && fault == 11))
+                assert(fd_releases == 1 && !skb_frees && !delivered);
             if (fault == 6) assert(!fd_releases && !skb_frees);
+            /* Every frame dropped after it was taken is the device's. */
+            assert(device.rx_dropped == lost);
             /* A frame SEC refused is not expected here at all -- FMan counts
              * and drops those -- so one that arrives is said out loud. */
             assert(errors_logged == (fault == 4 || fault == 5));
             assert(bp_count == 640);
+            if (!sg) {
+                /* Nothing taken from the pool, nothing to replace, and the
+                 * buffer given back as SEC wrote it. */
+                assert(!converted && pool.count == 512 && !ipsec_pool_debt);
+                assert(!memcmp(pristine, frame, sizeof(frame)));
+                if (fault == 0 || fault == 3 || fault == 4 || (fault >= 7 && fault <= 9) || fault == 11)
+                    assert(synced_cpu == 1 && synced_device == 1 && copied == (fault != 11));
+            }
             if (converted) {
-                unsigned consumed = sg ? sg_buffers : 1;
-                assert(pool.count == 512 - consumed && ipsec_pool_debt == (int)consumed);
+                unsigned consumed = sg_buffers;
+                assert(sg && pool.count == 512 - consumed && ipsec_pool_debt == (int)consumed);
                 run_refill();
                 if (refill_fail) {
                     assert(!added && ipsec_refill_work.queued && ipsec_refill_work.delay == 20);
@@ -310,7 +384,7 @@ int main(void)
     struct net_device *others[] = { &bridge, &vap, &no_ops };
     for (unsigned i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
         reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0;
-        dq.fd.format = qm_fd_contig; dq.fd.addr = (uintptr_t)frame;
+        dq.fd.format = qm_fd_contig; dq.fd.addr = fd_buffer = (uintptr_t)frame;
         sa_device = others[i];
         assert(ipsec_exception_pkt_handler(&portal, &fq, &dq) == qman_cb_dqrr_consume);
         assert(fd_releases == 1 && !unmapped && !converted && !skb_frees && !delivered);

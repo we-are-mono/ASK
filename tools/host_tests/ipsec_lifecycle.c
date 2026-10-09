@@ -101,6 +101,7 @@ static int ipsec_bpid = -1;
 #define QM_CGR_WE_CSTD_EN 8
 #define QM_CGR_EN 1
 #define QMAN_CGR_FLAG_USE_INIT 1
+#define QMAN_CGR_MODE_FRAME 1
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -168,7 +169,7 @@ enum qman_fq_state { qman_fq_state_oos, qman_fq_state_sched, qman_fq_state_retir
 /* A queue with the frames it holds, which retirement leaves on it and a
  * volatile dequeue delivers through its callback. */
 struct qman_fq {
-    unsigned fqid, flags, pending, held; bool acquired, proc;
+    unsigned fqid, flags, pending, held; bool acquired, proc, member;
     struct qm_fd frames[4];
     enum qman_fq_state state;
     struct {
@@ -228,7 +229,8 @@ static unsigned retires_failed, oos_failed, cgr_deletes_failed, pauses;
 static unsigned seed_step, seed_fail, port_releases, registrations;
 static int current_cpu;
 static const char *seed_failure;
-static bool port, cgr, cgrid;
+static bool port, cgr;
+static unsigned cgrids;
 static unsigned preempt_count;
 static unsigned module_refs;
 static bool module_going, sa_range;
@@ -418,8 +420,28 @@ static int qman_create_fq(unsigned id, unsigned flags, struct qman_fq *fq)
     assert(port && !fq_registry[id]); fq->fqid = id; fq->acquired = true;
     fq_registry[id] = fq; queues++; return 0;
 }
-static int qman_init_fq(struct qman_fq *fq, unsigned flags, void *opts)
-{ if (fault()) return -EIO; fq->state = qman_fq_state_sched; return 0; }
+/* The exception group, set up and released without a portal: every queue
+ * that joins it needs it configured first, and it goes only once they have. */
+static bool exception_group;
+static unsigned members;
+static int qman_init_fq(struct qman_fq *fq, unsigned flags, void *options)
+{
+    struct qm_mcc_initfq *opts = options;
+
+    if (fault()) return -EIO;
+    if (opts->we_mask & QM_INITFQ_WE_CGID) {
+        assert(opts->fqd.fq_ctrl & QM_FQCTRL_CGE);
+        if (sec_congestion && opts->fqd.cgid == ipsecinfo.cgr.ingress_cgr.cgrid &&
+            opts->fqd.cgid != ipsecinfo.exception_cgr.cgrid) {
+            assert(cgr);       /* a TO_SEC queue joining SEC's ingress group */
+        } else {
+            assert(exception_group && opts->fqd.cgid == ipsecinfo.exception_cgr.cgrid);
+            assert(!fq->member);
+            fq->member = true; members++;
+        }
+    }
+    fq->state = qman_fq_state_sched; return 0;
+}
 static void cdx_create_type_fqid_info_in_procfs(struct qman_fq *fq, int dir, void *entry, void *arg)
 { assert(fq->acquired); fq->proc = true; proc_entries++; }
 static void cdx_remove_fqid_info_in_procfs(unsigned id)
@@ -429,6 +451,7 @@ static void qman_destroy_fq(struct qman_fq *fq, unsigned flags)
     assert(fq->acquired && !fq->proc && fq->state == qman_fq_state_oos);
     assert(!callbacks && queues && fq_registry[fq->fqid] == fq);
     fq_registry[fq->fqid] = NULL; fq->acquired = false; queues--;
+    if (fq->member) { assert(members); members--; fq->member = false; }
 }
 /* Retirement completes immediately, or after this many looks at the queue;
  * a PCD queue always retires holding a frame. */
@@ -509,13 +532,22 @@ static void usleep_range(unsigned lo, unsigned hi)
 static void preempt_disable(void) { preempt_count++; }
 static void preempt_enable(void) { assert(preempt_count); preempt_count--; }
 static int smp_processor_id(void) { assert(preempt_count); return current_cpu; }
+/* Group IDs allocated, a bit each: SEC's ingress group, when configured, and
+ * the exception group. */
+static bool cgrid_held(unsigned id) { return id < 32 && (cgrids & 1u << id); }
 static int qman_alloc_cgrid(unsigned *id)
-{ if (fault()) return -ENOMEM; assert(!cgrid); cgrid = true; *id = 0; return 0; }
+{
+    if (fault()) return -ENOMEM;
+    for (unsigned i = 0; i < 2; i++)
+        if (!cgrid_held(i)) { cgrids |= 1u << i; *id = i; return 0; }
+    assert(!"more than two congestion groups");
+    return -ENOSPC;
+}
 static void cgr_cb(void) { }
 static void qm_cgr_cs_thres_set64(struct threshold *threshold, unsigned value, int mode) { }
 static int qman_create_cgr(struct qman_cgr *p, unsigned flags, struct qm_mcc_initcgr *opts)
 {
-    assert(preempt_count && ipsecinfo.cgr.cpu == current_cpu && cgrid);
+    assert(preempt_count && ipsecinfo.cgr.cpu == current_cpu && cgrid_held(p->cgrid));
     if (fault()) return -EIO;
     assert(!cgr); cgr = true; return 0;
 }
@@ -531,7 +563,29 @@ static int qman_delete_cgr(void *p)
     if (cgr_deletes_failed) { cgr_deletes_failed--; return -EBUSY; }
     cgr = false; return 0;
 }
-static void qman_release_cgrid(unsigned id) { assert(cgrid && !cgr); cgrid = false; }
+static int qman_modify_cgr(struct qman_cgr *p, unsigned flags, struct qm_mcc_initcgr *opts)
+{
+    assert(p == &ipsecinfo.exception_cgr && cgrid_held(p->cgrid) && flags == QMAN_CGR_FLAG_USE_INIT);
+    if (opts->cgr.cstd_en) {
+        /* Frames, each one buffer, dropped at the tail; nothing notified. */
+        assert(!exception_group && opts->cgr.mode == QMAN_CGR_MODE_FRAME && !opts->cgr.cscn_en);
+        assert(opts->we_mask & QM_CGR_WE_CSTD_EN);
+        if (fault()) return -EIO;
+        exception_group = true;
+        return 0;
+    }
+    assert(exception_group && !members);
+    exception_group = false;
+    return 0;
+}
+static void qman_release_cgrid(unsigned id)
+{
+    assert(cgrid_held(id));
+    /* A group is released only once nothing configures it. */
+    if (id == ipsecinfo.exception_cgr.cgrid) assert(!exception_group);
+    if (id == ipsecinfo.cgr.ingress_cgr.cgrid) assert(!cgr);
+    cgrids &= ~(1u << id);
+}
 static bool cdx_dpa_init_fault(void) { return fault(); }
 /* Producers that disagree on the ICID are one more refusal to unwind. */
 static int dpa_cfg_shared_icid(void) { return fault() ? -EINVAL : 63; }
@@ -617,7 +671,8 @@ static void clean(void)
     assert(!allocs && !mappings && !queues && !proc_entries && !callbacks);
     assert(!pages && !refill_running && !sg_bpool_g && !skb_2bfreed_bpool_g);
     for (unsigned id = 2; id < 64; id++) assert(!dpa_bp_array[id]);
-    assert(!port && !cgr && !cgrid && !preempt_count && !dpa_bp_array[2] && !cdx_dpa_ipsec_ready());
+    assert(!port && !cgr && !cgrids && !preempt_count && !dpa_bp_array[2] && !cdx_dpa_ipsec_ready());
+    assert(!exception_group && !members);
     assert(!ipsecinfo.ipsec_bp && !ipsecinfo.ipsec_pcd_fqs && ipsec_bpid == -1);
     assert(!module_refs && !sa_range && !tags && !ipsecinfo.ipsec_exception_fq);
     assert(!ipsecinfo.expt_fq_count && ipsecinfo.ofport_handle < 0);

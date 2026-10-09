@@ -175,9 +175,23 @@ struct ipsec_info {
 	struct cgr_priv	cgr;
 	bool cgr_initialized;
 #endif
+	/* Every exception queue the offline port feeds: IPSEC_EXCEPTION_FRAMES. */
+	struct qman_cgr exception_cgr;
+	bool exception_cgr_initialized;
 };
 
 static struct ipsec_info ipsecinfo = { .ofport_handle = -1 };
+
+/* Join a queue the offline port feeds frames to the CPU on to the exception
+ * group (IPSEC_EXCEPTION_FRAMES). Once the group holds that many, QMan refuses
+ * the port's enqueue and FMan drops the frame, giving its buffer back to the
+ * pool: the CPU loses frames it had no time for, not SEC its output buffers. */
+static void ipsec_exception_fq_bound(struct qm_mcc_initfq *opts)
+{
+	opts->we_mask |= QM_INITFQ_WE_CGID;
+	opts->fqd.fq_ctrl |= QM_FQCTRL_CGE;
+	opts->fqd.cgid = (u8)ipsecinfo.exception_cgr.cgrid;
+}
 
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 extern struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
@@ -351,6 +365,35 @@ static enum qman_cb_dqrr_result dpa_ipsec_drain_dqrr(struct qman_portal *qm,
 	return qman_cb_dqrr_consume;
 }
 
+/* A decrypted frame Linux takes is copied out of SEC's output pool, and its
+ * buffer goes straight back to it. Handed to the stack instead, the buffer is
+ * missing from the pool until the refill worker replaces it, and a stream of
+ * misses as fast as SEC can decrypt keeps the whole pool on that loan: SEC
+ * then refuses every SA's jobs for want of an output buffer, at whatever rate
+ * the worker allocates. The copy is one frame, into an skb its own size. NULL,
+ * with the buffer given back, when no skb can be had. */
+static struct sk_buff *ipsec_copy_contig_fd(struct net_device *net_dev,
+		const struct dpa_bp *dpa_bp, const struct qm_fd *fd)
+{
+	dma_addr_t addr = qm_fd_addr(fd);
+	unsigned int off = dpa_fd_offset(fd), len = dpa_fd_length(fd);
+	struct sk_buff *skb = NULL;
+
+	if (likely(off + len <= dpa_bp->size)) {
+		dma_sync_single_range_for_cpu(dpa_bp->dev, addr, off, len,
+					      DMA_BIDIRECTIONAL);
+		skb = netdev_alloc_skb(net_dev, off + len);
+		if (likely(skb)) {
+			skb_reserve(skb, off);
+			skb_put_data(skb, phys_to_virt(addr) + off, len);
+		}
+		dma_sync_single_range_for_device(dpa_bp->dev, addr, off, len,
+						 DMA_BIDIRECTIONAL);
+	}
+	dpa_fd_release(net_dev, fd);
+	return skb;
+}
+
 
 
 extern 	struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,
@@ -456,20 +499,28 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		xfrm_state_put(x);
 		goto rel_fd;
 	}
-	/* Conversion owns the buffer from here. SG conversion also returns
-	 * the table to BMan after remapping it, so unmap its old mapping first. */
-	dma_unmap_single(dpa_bp->dev, qm_fd_addr(&dq->fd), dpa_bp->size,
-			 DMA_BIDIRECTIONAL);
-
 	if (likely(dq->fd.format == qm_fd_contig)) {
-		skb = contig_fd_to_skb(priv, &dq->fd, &use_gro, false);
+		skb = ipsec_copy_contig_fd(net_dev, dpa_bp, &dq->fd);
+		if (unlikely(!skb)) {
+			dev_core_stats_rx_dropped_inc(net_dev);
+			xfrm_state_put(x);
+			return qman_cb_dqrr_consume;
+		}
+		/* As contig_fd_to_skb() leaves a frame whose L4 checksum FMan
+		 * did not vouch for: CHECKSUM_NONE, and no GRO. */
+		use_gro = false;
 	} else {
+		/* Conversion owns the buffers from here. SG conversion also
+		 * returns the table to BMan after remapping it, so unmap its
+		 * old mapping first. */
+		dma_unmap_single(dpa_bp->dev, qm_fd_addr(&dq->fd), dpa_bp->size,
+				 DMA_BIDIRECTIONAL);
 		skb = sg_fd_to_skb(priv, &dq->fd, &use_gro, &pool_balance, false);
 		percpu_priv->rx_sg++;
+		pool_balance--;
+		ipsec_pool_consumed(-pool_balance);
 	}
 
-	pool_balance--;
-	ipsec_pool_consumed(-pool_balance);
 	if (unlikely(!pskb_may_pull(skb, ETH_HLEN + VLAN_HLEN + 1)))
 		goto pkt_drop;
 	/* This tag was inserted by the executing SEC descriptor. Remove
@@ -549,9 +600,12 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 pkt_drop:
 #endif
-	/* Conversion transferred the FD buffers to the skb. Returning the FD
-	 * to BMan here would recycle memory the skb has just freed. The SA has
-	 * not yet been transferred to a secpath on either failure branch. */
+	/* The skb owns its data: a copy, whose buffer is back in the pool, or
+	 * a scatter/gather frame's buffers, which conversion transferred to it
+	 * and which returning the FD here would recycle as the skb frees them.
+	 * The SA has not yet been transferred to a secpath on either failure
+	 * branch. A receive drop of the SA's device, as a failed copy is. */
+	dev_core_stats_rx_dropped_inc(net_dev);
 	xfrm_state_put(x);
 	dev_kfree_skb(skb);
 	return qman_cb_dqrr_consume;
@@ -745,6 +799,7 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			opts.fqd.dest.wq = dpa_fq->wq;
 			opts.we_mask = (QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL |
 					QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA);
+			ipsec_exception_fq_bound(&opts);
 			if (schedule)
 				schedule = QMAN_INITFQ_FLAG_SCHED;
 
@@ -939,6 +994,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 				(QM_STASHING_EXCL_DATA | QM_STASHING_EXCL_ANNOTATION);
 			opts.fqd.context_a.stashing.data_cl = NUM_PKT_DATA_LINES_IN_CACHE;
 			opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
+			ipsec_exception_fq_bound(&opts);
 		}
 		if (to_sec_fq == 1)
 		{
@@ -1671,6 +1727,44 @@ static void cdx_dpaa_ingress_cgr_exit(struct cgr_priv *cgr)
 }
 #endif
 
+/* The exception group counts frames, each of which holds one pool buffer, and
+ * drops at the tail. It asks for no state-change notifications, so no portal
+ * owns it, and the egress groups' way of setting one up serves (devman.c). */
+static int ipsec_exception_cgr_init(void)
+{
+	struct qm_mcc_initcgr opts;
+
+	if (qman_alloc_cgrid(&ipsecinfo.exception_cgr.cgrid) < 0)
+		return -ENOSPC;
+	memset(&opts, 0, sizeof(opts));
+	opts.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSTD_EN |
+		       QM_CGR_WE_CSCN_EN;
+	opts.cgr.mode = QMAN_CGR_MODE_FRAME;
+	opts.cgr.cstd_en = QM_CGR_EN;
+	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres, IPSEC_EXCEPTION_FRAMES, 1);
+	if (qman_modify_cgr(&ipsecinfo.exception_cgr, QMAN_CGR_FLAG_USE_INIT, &opts)) {
+		qman_release_cgrid(ipsecinfo.exception_cgr.cgrid);
+		return -EIO;
+	}
+	ipsecinfo.exception_cgr_initialized = true;
+	return 0;
+}
+
+/* Its members are out of service by now, which the release requires: the PCD
+ * queues, and every SA's exception queue, gone with the SA, which holds the
+ * module until it is released. */
+static void ipsec_exception_cgr_exit(void)
+{
+	struct qm_mcc_initcgr opts;
+
+	if (!ipsecinfo.exception_cgr_initialized)
+		return;
+	memset(&opts, 0, sizeof(opts));
+	qman_modify_cgr(&ipsecinfo.exception_cgr, QMAN_CGR_FLAG_USE_INIT, &opts);
+	qman_release_cgrid(ipsecinfo.exception_cgr.cgrid);
+	ipsecinfo.exception_cgr_initialized = false;
+}
+
 
 /* Whether the DPA side of IPsec -- the offline port, its tables, the SEC
  * buffer pool and the PCD frame queues -- is there to be used. False until
@@ -1716,6 +1810,10 @@ int cdx_dpa_ipsec_init(void)
 		ipsecinfo.cgr_initialized = true;
 	}
 #endif
+	/* Before any queue that joins it: the PCD queues below, and every SA's
+	 * exception queue. */
+	if (ipsec_exception_cgr_init())
+		goto failure;
 	if (create_ipsec_pcd_fqs(&ipsecinfo, 1)) {
 		goto failure;
 	}
@@ -1753,6 +1851,7 @@ void cdx_dpa_ipsec_exit(void)
 		ipsecinfo.cgr_initialized = false;
 	}
 #endif
+	ipsec_exception_cgr_exit();
 	release_ipsec_bpool(&ipsecinfo);
 	release_ipsec_sg_pools();
 	/* Held FQIDs stay listed: what becomes of them is decided once CDX has

@@ -13,6 +13,8 @@ from _topology import LAN_IPV6, TARGET_WAN_IF, WAN_IPV6
 
 SPORT, DPORT = 48960, 48961
 V4_WAN_SPORT, V4_WAN_DPORT = 48962, 48963
+# The bulk TCP the decrypted-frame check drives through the tunnel.
+BULK_PORT = 48964
 REQIDS = {"out": "49411", "in": "49412"}
 # The far end's IPv6 address when the WAN carries no IPv6: on the WAN host's
 # loopback, in a prefix no segment of the rig uses.

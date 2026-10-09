@@ -12,6 +12,7 @@ import socket
 import struct
 import time
 from collections import Counter, defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from _flowtable_rig import (
     artifact_dir,
     command,
     console_command,
+    console_python,
     read,
 )
 from _flowtable_selective_neighbour import keys, unchanged
@@ -38,6 +40,100 @@ from ask_orch.client import Agent
 from ask_orch.uart import Console
 
 INNER = "198.18.102.2"
+
+# The IPsec offline port, which every frame SEC produces reaches next. Its
+# filter count is every frame FMan discarded for an error status, SEC's
+# refusals included.
+IPSEC_OFFLINE_PORT = "/sys/devices/platform/soc/1a00000.fman/1a83000.port/statistics/port_rx_filter_frame"
+# The FMan parser keeps its error counts only for the ports set in its
+# statistics mask, fmpr_ppsc, counted from the top bit by hardware port: the
+# IPsec offline port is port 3.
+PARSER = "/sys/devices/platform/soc/1a00000.fman/fm_prs_regs"
+PARSER_STATISTICS_MASK = 0x1ac78a0
+OFFLINE_PORT_PARSE_BIT = 0x80000000 >> 3
+PARSE_ERRORS = ("fmpr_l2rres", "fmpr_l3rres", "fmpr_l4rres", "fmpr_srres")
+
+
+async def _parser_statistics_mask(value):
+    """Set fmpr_ppsc to `value`; what it was."""
+    result = await console_python(Console.target(), f'''
+import ctypes, mmap, os
+fd = os.open('/dev/mem', os.O_RDWR | os.O_SYNC)
+regs = mmap.mmap(fd, mmap.PAGESIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE,
+                 offset={PARSER_STATISTICS_MASK} & -mmap.PAGESIZE)
+word = ctypes.c_uint32.from_buffer(regs, {PARSER_STATISTICS_MASK} % mmap.PAGESIZE)
+swap = lambda v: int.from_bytes(v.to_bytes(4, 'big'), 'little')
+old = swap(word.value)
+word.value = swap({value})
+print('statistics mask', old)
+del word
+regs.close()
+''', timeout=10)
+    return int(re.search(r"statistics mask (\d+)", result["stdout"]).group(1))
+
+
+async def offline_port_parse_errors(r):
+    """The parse errors counted for the ports in the parser's statistics mask."""
+    text = await read(r.target, r.session, PARSER)
+    counts = {line.split()[-1]: int(line.split()[1], 16)
+              for line in text.splitlines() if "fmpr_" in line}
+    return sum(counts[name] for name in PARSE_ERRORS)
+
+
+async def _offline_port_reading(r):
+    # The filter count is live, but the accounting pass reads the microcode's
+    # refusal count only once a second, and a tunnel's last frames can still
+    # be refused after its traffic ends: a reading counts once it has held
+    # still across one of those periods.
+    last = None
+    for _ in range(20):
+        await asyncio.sleep(1.5)
+        state = await r.state()
+        reading = {"filtered": int((await read(r.target, r.session, IPSEC_OFFLINE_PORT)).split()[-1]),
+                   "refused": state["ipsec_sec_refused"],
+                   "depletion": state["ipsec_sec_refused_buffer_depletion"],
+                   "parse_errors": await offline_port_parse_errors(r)}
+        if reading == last:
+            return reading
+        last = reading
+    raise AssertionError(f"offline port discards never settled: {last}")
+
+
+@asynccontextmanager
+async def offline_port_discards(r, label):
+    """Across the block, every frame the IPsec offline port discarded was one
+    SEC refused, and SEC wrote every frame it accepted whole.
+
+    The second is exact. A frame SEC wrote wrong fails the port's parse -- the
+    A328 frames, missing their last four bytes, failed the L4 checksum -- so
+    the parser's error count for the port, which the block turns on, must not
+    move. The first is as exact as the microcode's refusal count, which loses
+    an increment now and then when refusals arrive back to back (several of
+    its tasks update one counter read-modify-write): the filter count may
+    exceed the refusals by a couple, and by one more per hundred thousand,
+    never fall below them. Measured, with the parser counting nothing, the
+    filter count ran 0-2 over refusals of up to 584,000 in a run.
+
+    Yields a dict the block's counts land in once it ends."""
+    counts = {}
+    # The port alone, so no other port's errors count; and still the port
+    # alone at the end, since a PCD change rewrites the mask from the SDK's
+    # own copy, which names no port, and would leave nothing counted.
+    old = await _parser_statistics_mask(value=OFFLINE_PORT_PARSE_BIT)
+    try:
+        before = await _offline_port_reading(r)
+        yield counts
+        after = await _offline_port_reading(r)
+    finally:
+        held = await _parser_statistics_mask(value=old)
+    assert held == OFFLINE_PORT_PARSE_BIT, f"the parser stopped counting the offline port: {held:#x}"
+    counts.update({key: after[key] - before[key] for key in after})
+    r.record(label, counts)
+    assert counts["parse_errors"] == 0, \
+        f"the offline port failed to parse {counts['parse_errors']} of SEC's frames: {counts}"
+    lost = counts["filtered"] - counts["refused"]
+    assert 0 <= lost <= 2 + counts["refused"] // 100_000, \
+        f"offline port discarded {counts['filtered']} frames, {counts['refused']} of them SEC refusals"
 
 LAN_INNER = "198.18.102.3"
 

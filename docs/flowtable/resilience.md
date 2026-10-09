@@ -582,10 +582,17 @@ consumption until the dedicated 512-buffer pool emptied, after which software
 IPsec traffic could no longer produce receive callbacks. A separate debt
 counter and bounded worker now replenish consumed SEC buffers. Failed
 allocation or DMA mapping retains the debt and retries even with no arriving
-packets. The exhaustion test holds refill allocations failing, verifies an
-empty BMan pool, clears only the fault, then requires refill while protected
-traffic is idle and recovery of the original connections. The SEC enqueue
-attempt counter alone is not proof that an empty-pool enqueue succeeded.
+packets. The SEC enqueue attempt counter alone is not proof that an empty-pool
+enqueue succeeded.
+
+Since A333 software receive no longer consumes SEC buffers at all: it copies
+each contiguous frame and returns the buffer, so only a scatter/gather frame,
+which SEC does not produce into this pool's buffer size, still leaves a debt.
+The exhaustion test became its converse. With every refill allocation failing,
+a stream the CPU receives must leave the pool full, ask the failing allocator
+for nothing, and cause no buffer-depletion refusal
+(`test_receive_leaves_the_pool`). Before the change the same stream emptied the
+pool.
 
 An initial continuous-fault run also exposed an injector limitation: softirq
 receive processing can interrupt a refill worker and retain its function in

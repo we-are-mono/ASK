@@ -34,7 +34,11 @@ class Fault:
         self.result = None
         self.continuous = continuous
 
-    async def hit(self):
+    async def hit(self, silent=False):
+        """The guard's result once its fault is spent. `silent` admits a
+        one-shot failure at a __GFP_NOWARN site, which failslab does not log:
+        the spent budget is then the only record, and the caller proves the
+        effect some other way."""
         if self.result is None:
             self.result = await wait_json(self.r, self.root + "/result.json")
             self.r.record(self.label + "-injection", self.result)
@@ -47,6 +51,9 @@ class Fault:
             assert result["failures"] > 0, result
             return result
         log = "".join(result["kernel_records"])
+        if silent and "FAULT_INJECTION: forcing a failure" not in log:
+            assert result["remaining"] == 0, result
+            return result
         assert "FAULT_INJECTION: forcing a failure" in log and "name failslab" in log, log
         # times=1 is a limit, not an atomic reservation across CPUs. Prove
         # that this run consumed exactly one failure in the selected path.

@@ -315,13 +315,26 @@ result independently of those temporary files.
 - [x] **A328 — about one decrypted frame in 10^5 left SEC with its last four bytes zeroed, and the IPsec offline port dropped it.**
   The inbound counters ran before the decap output drained; not shared buffers (_:/^cdx: let SEC's decap output drain before the inbound counters_).
 
-- [ ] **A333 — SEC refuses IPsec jobs in bursts under bulk or backed-up load.** Bulk IPsec (`ipsec_vlan_iperf_probe`)
-  discards ~10^4 frames per run on oh1 (`1a83000`). Under the A328 reproducer, bursts of 13–18 appeared whenever SEC's
-  output queued behind a slower consumer: oh1 cut to one task, or a CPU relay in front of it. cdx counts them as
-  `ipsec_sec_refused_other` (folded to `XfrmInError`), not as `..._buffer_depletion`. The leading suspect is pool 34
-  (`ipsec_bp`): 512 buffers, refilled only for frames the CPU consumes, with SEC unable to get an output buffer while
-  frames are in flight. Unconfirmed. Next: sample pool 34's free count (`0x1890600 + 4*34`) and the raw SEC status
-  during a burst, then size the pool to the in-flight bound or give it depletion backpressure.
+- [x] **A333 — SEC refused IPsec jobs in bursts under bulk load.** `other` is anti-replay LATE against the WAN host's reordered
+  ESP; `buffer_depletion` was CPU-bound misses holding SEC's pool, now bounded and copied (_:/^cdx: leave SEC its output pool when frames go to the CPU_).
+
+- [ ] **A334 — Wi-Fi VAP forward queues can still take SEC's output pool.** `create_vap_fwd_from_fman_fqs()`
+  (`cdx/dpa_wifi.c`) gives them no congestion group. The IPsec offline port forwards decrypted frames for an offloaded
+  Wi-Fi flow there, each in a pool-34 buffer, and the CPU drains them by copying (`sec_frag_fd_to_vwd_skb()`). A
+  decrypted stream faster than that copy, which a 2.5 Gbit/s tunnel into a ~650 Mbit/s radio can be, backs up there
+  as A333's exception queues did, and SEC then refuses every SA's jobs. Fix: a frame-mode tail-drop group on those
+  queues; they also carry Ethernet-pool frames, so it bounds both. Source-verified by the A333 review; not reproduced.
+
+- [ ] **A335 — an egress port's congestion group bounds bytes, not SEC's buffers.** The forwarding TX queues' group
+  (A313, `devman.c` `fwd_queue_us`) holds 2 ms of link time: ~2,900 minimum frames at 1 Gbit/s, ~1,600 full ones at
+  10. Either is more than pool 34's 512, so decrypted traffic into a slower or shaped egress (a 2.3 Gbit/s tunnel into
+  a 1G LAN port, a CEETM class) can pin the pool and starve every SA. Fix direction: size pool 34 to the worst egress
+  bound plus `IPSEC_EXCEPTION_FRAMES`, or bound pool-34 frames on egress by count. Source-verified; not reproduced.
+
+- [ ] **A336 — frames the IPsec exception group drops are counted only in a register dump.** QMan refuses the offline
+  port's enqueue and FMan drops the frame (A333); the only count is oh1's `fmbm_ofwdc` in `fm_port_bmi_regs`, which A313's
+  egress rejections share. Fold it into `/proc/cdx_flowtable` beside `ipsec_sec_refused` (FM_PORT_GetCounter,
+  `e_FM_PORT_COUNTERS_WRED_DISCARD`), so a CPU path that cannot keep up is visible with the standard tools.
 
 - [x] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.** The rig's LAN copper SFP
   module, since replaced: absent in every run with the new one (_:/^issues: close A332 as the LAN SFP module_).

@@ -883,12 +883,21 @@ The microcode's table is the only record, and it has limits:
 
 - **It is global.** It has 23 counters for the whole FMan, and none of them
   names an SA or a direction.
-- **The total is exact, but the classes are not.** Measured on microcode
-  v210.10.1, N refused frames move the sum of the counters by exactly N. But
-  every replayed or late frame lands in `other_errs`, never in the
-  anti-replay counters. Three bursts of ten GCM frames under a wrong key split
-  1/9, 1/9 and 2/8 between `icv_failures` and `other_errs`. AES-GMAC ICV
-  failures land in `icv_failures`.
+- **The classes are not exact, and under a dense burst neither is the total.**
+  Measured on microcode v210.10.1: every replayed or late frame lands in
+  `other_errs`, never in the anti-replay counters; SEC's status for a late one
+  is `0x40xxxx83`. Three bursts of ten GCM frames under a wrong key split 1/9,
+  1/9 and 2/8 between `icv_failures` and `other_errs`. AES-GMAC ICV failures
+  land in `icv_failures`. The offline port's six tasks update the counters
+  with a read-modify-write, so refusals that arrive back to back lose
+  increments. In a buffer-depletion burst, where SEC refuses every job of
+  every SA for milliseconds, the table fell short of SEC's own count by up to
+  2.5% (1,925 against 1,974). SEC's count is `PC_REQ_DEQ` less
+  `PC_OB_ENC_REQ` and `PC_IB_DEC_REQ`, the jobs it started that never reached
+  a cipher. Refusals interleaved with good frames, such as a peer's late
+  frames, were counted exactly: none lost in 18 runs of up to 584,000. The
+  offline port's filter count (`port_rx_filter_frame`) includes every refused
+  frame, so the table can only fall short of it.
 - **The counters are 32-bit and big-endian.** The SDK's reader,
   `ExternalHashGetSECfailureStats()`, converts them to host order. It fails
   until the first external hash table has placed the block. The counters
@@ -921,11 +930,12 @@ finds no number left. An inbound overflow needs a peer sending past its own
 sequence space, which RFC 4303 forbids a sender to do and Linux's own output
 refuses.
 
-Only `ipsec_sec_refused` in `/proc/cdx_flowtable` is the exact count of every
-refusal. What the four xfrm counters gain is exactly what the microcode sorted
-into the classes folded there. That leaves out TTL and the 14 fault classes,
-and it is only as good as the microcode's sorting. A protocol refusal the
-microcode filed as a fault would be missed, and a replay is counted as
+Only `ipsec_sec_refused` in `/proc/cdx_flowtable` counts every kind of
+refusal, short only by what a dense burst loses. What the four xfrm counters
+gain is exactly what the microcode sorted into the classes folded there. That
+leaves out TTL and the 14 fault classes, and it is only as good as the
+microcode's sorting. A protocol refusal the microcode filed as a fault would be
+missed, and a replay is counted as
 `XfrmInError`, not as `XfrmInStateSeqError`.
 
 The xfrm counters need `CONFIG_XFRM_STATISTICS`. Only the meta-ask test image
@@ -952,9 +962,9 @@ ask_flowtable: 256 IPsec frames dropped, SEC could not process them: buffer_depl
 ```
 
 `/proc/cdx_flowtable` carries every class, counted since the adapter loaded
-and as of the pass's last reading. `ipsec_sec_refused` is the exact total, and
-`ipsec_sec_refused_<class>` gives each class under the names in
-`ft_sec_refusal[]`.
+and as of the pass's last reading. `ipsec_sec_refused` is the total, short only
+by the increments a dense burst loses (above), and `ipsec_sec_refused_<class>`
+gives each class under the names in `ft_sec_refusal[]`.
 
 **No count exists per SA.** For an offloaded SA, `ip -s xfrm state` shows
 `replay-window 0 replay 0 failed 0` however many of its frames SEC refused,
@@ -1342,6 +1352,57 @@ ingress hook takes the frame, which is what the flowtable's software path does
 to every decrypted frame it forwards. Fifty-nine of sixty "dropped" frames were
 delivered. A counter that cannot tell a loss from a steal is worse than none,
 and at line rate it is also a log flood.
+
+#### Frames the offline port gives the CPU must not take SEC's pool
+
+SEC writes every job's output into one buffer of its own BMan pool, 512
+buffers (`IPSEC_BUFCOUNT`) shared by every SA in both directions. A frame the
+offline port forwards in hardware returns its buffer when the egress port has
+sent it, within microseconds; under 2.5 Gbit/s of offloaded traffic the pool
+reads 495-512. A frame that misses the offline port's flow table goes to the
+CPU on the SA's exception queue (TO_CP) instead, still in that buffer. Misses
+come in bursts at line rate: the tail of a TCP flow after its teardown, the
+head of one before the flowtable offloads it, a flow nothing offloads. The CPU
+drains them at a few thousand frames a second on the KASAN image.
+
+Two things let such a burst take the whole pool (A333):
+
+- **The exception queues had no bound.** At the end of a 4-stream transfer the
+  inbound SA's TO_CP held 394-412 frames while every other queue was empty.
+- **Each frame Linux took was a buffer lost to the pool** until the refill
+  worker allocated a replacement, one order-2 page at a time. A stream of
+  misses kept the pool on that loan, and its throughput fell to the worker's.
+
+With the pool empty, SEC refuses every job of every SA with QI buffer pool
+depletion (`0x50000008`, FD address and length zero; SEC releases the input
+frame itself). An unoffloaded UDP stream of 500 Mbit/s from the WAN host made
+SEC refuse 1.42 million frames in ten seconds, and stalled an offloaded TCP
+flow beside it completely.
+
+Both are fixed. Every exception queue the offline port feeds, each SA's TO_CP
+and the port's PCD queues, joins one QMan congestion group in frame mode with
+tail drop at `IPSEC_EXCEPTION_FRAMES`, a quarter of the pool. QMan refuses the
+port's enqueue past it, and FMan drops the frame and returns its buffer: the
+SDK configures FMan's direct-connect portals to take their own enqueue
+rejections (`qm_set_dc(..., ed=1)`). The offline port counts those drops in its
+BMI WRED-discard counter, `fmbm_ofwdc` in
+`/sys/devices/platform/soc/1a00000.fman/1a83000.port/fm_port_bmi_regs`, not in
+its filter count; frames an egress port's congestion group refuses (A313) land
+there too. And `ipsec_exception_pkt_handler()` copies a contiguous frame into
+an skb of its own size and gives the buffer straight back
+(`ipsec_copy_contig_fd()`); only a scatter/gather frame, which SEC does not
+produce into a buffer of this size, still leaves a debt for the refill worker.
+A copy that cannot get an skb is the SA device's receive drop. With both, the
+same UDP stream gets its few thousand frames a second to the CPU, the rest are
+dropped at the offline port, SEC refuses nothing for want of a buffer, and the
+offloaded TCP keeps 2.27 Gbit/s.
+
+`flowtable_ipv6_sa.py::test_exception_backlog_leaves_sec_its_buffers` is that
+case; `flowtable_service_ipsec_policy.py::test_receive_leaves_the_pool` proves
+the receive path borrows nothing, with every refill allocation failing. Two
+other queues can still hold pool-34 frames past the pool's size: the Wi-Fi
+VAP forward queues, which have no group (A334), and the egress groups, which
+count bytes (A335).
 
 ### 7. Parity
 

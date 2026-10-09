@@ -359,6 +359,7 @@ def test_ipsec_receive_ownership(tmp_path):
                                 source.index("struct dpa_bp* get_ipsec_bp(void)")]
         # The test for a DPAA port, from where cdx keeps it.
         + function((ROOT / "cdx/devman.c").read_text(), "dpa_netdev_is_dpaa")
+        + function(source, "ipsec_copy_contig_fd")
         + function(source, "ipsec_exception_pkt_handler"))
     for portal_napi in (False, True):
         binary = tmp_path / f"ipsec_receive_{portal_napi}"

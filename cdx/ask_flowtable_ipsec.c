@@ -1900,21 +1900,23 @@ static void ft_ipsec_publish(struct xfrm_state *x,
  * xfrm nor cdx ever holds a refused frame to count, and the microcode's table
  * (cdx_ipsec_sec_refusals()) is the only record of one.
  *
- * Its total is exact: it moves by one for each refused frame. Its classes are
- * not. Measured on microcode v210.10.1, replayed and late frames all land in
- * other_errs and never in the anti-replay counters, and the ICV failures of
- * one GCM burst split between icv_failures and other_errs differently from
- * the next. And it is global: nothing in it names an SA, or a direction.
+ * Its classes are not exact. Measured on microcode v210.10.1, replayed and
+ * late frames all land in other_errs and never in the anti-replay counters,
+ * and the ICV failures of one GCM burst split between icv_failures and
+ * other_errs differently from the next. Nor, under a dense burst, is its
+ * total: the offline port's tasks update it read-modify-write, and refusals
+ * arriving back to back lose increments (up to 2.5% of a buffer-depletion
+ * burst). And it is global: nothing in it names an SA, or a direction.
  *
  * So the pass folds the table into /proc/net/xfrm_stat, each class that has
  * one into the counter xfrm raises for its own equivalent drop
  * (ft_sec_refusal[]), and into no state: `ip -s xfrm state` replay/failed
  * stay at zero for an offloaded SA, because no per-SA count of them exists.
  * What the folded counters gain is exactly what the microcode sorted into
- * those classes, no more reliable than its sorting; the exact count of every
- * refusal is the total in /proc/cdx_flowtable, which carries every class. The
- * classes that are no doing of the traffic's -- SEC's own faults, and
- * resources it ran out of -- are said out loud as well. Without
+ * those classes, no more reliable than its sorting; the nearest to a count of
+ * every refusal is the total in /proc/cdx_flowtable, which carries every
+ * class. The classes that are no doing of the traffic's -- SEC's own faults,
+ * and resources it ran out of -- are said out loud as well. Without
  * CONFIG_XFRM_STATISTICS the fold into xfrm compiles to nothing, and
  * /proc/cdx_flowtable is where the counts are.
  *

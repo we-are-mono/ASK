@@ -87,6 +87,15 @@ struct sec_descriptor {
 #define IPSEC_BUFSIZE	dpa_bp_size(NULL)
 #define IPSEC_BUFCOUNT  512
 #define	THRESHOLD_IPSEC_BPOOL_REFILL 16
+/* A frame the IPsec offline port sends the CPU, having missed its flow table,
+ * waits on an exception queue in a buffer of SEC's output pool. Together the
+ * exception queues hold at most this many; QMan refuses the port's enqueue
+ * past it and FMan drops the frame. Unbounded, a burst of misses faster than
+ * the CPU drains them -- the tail of a flow being torn down, the head of one
+ * not yet offloaded, a flow never offloaded -- held the whole pool, and SEC
+ * refused every job of every SA, offloaded flows' included, for want of an
+ * output buffer. The rest of the pool stays with SEC and the hardware path. */
+#define IPSEC_EXCEPTION_FRAMES	(IPSEC_BUFCOUNT / 4)
 
 struct ipsec_info; 
 void *  dpa_get_ipsec_instance(void);
