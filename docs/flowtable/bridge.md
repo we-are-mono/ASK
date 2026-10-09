@@ -266,8 +266,9 @@ while the other is readmitted at the port's. Raising the bridge's MTU above its
 port's -- 9000 over a 1500-byte port, which `br_change_mtu()` allows -- does
 not raise the direction leaving by it: Linux drops at the port what the port's
 MTU forbids (`is_skb_forwardable()`), so that direction is readmitted at the
-port's 1500 rather than the bridge's 9000 (A340), and the one arriving on the
-bridge stays in software.
+port's 1500 rather than the bridge's 9000 (A340). Nor does the bridge receive
+more than its port does, whose MAC takes frames by its own MTU, so the
+direction arriving on it is readmitted too, into the WAN's 1500 (A346).
 
 All of it on the KASAN image, with the adapter's error, fatal and quarantine
 counters at zero afterwards and no suppressed diagnostics.

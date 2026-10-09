@@ -264,9 +264,9 @@ its MTU, and nothing in front of it hands such a packet to Linux. Linux would
 not fragment it: `ip6mr` answers an oversized IPv6 replica with Packet Too Big,
 and `ipmr_queue_xmit()` drops an IPv4 one with DF set. So a group is carried
 only while nothing the parent VIF can deliver is larger than the smallest MTU a
-copy leaves by. For IPv4 what the parent can deliver is the larger of its own
-MTU and what its physical port accepts, `max(port MTU, 1500)`, since a
-1500-byte VLAN over a 9000-byte port still receives 9000-byte frames. That MTU
+copy leaves by. For IPv4 what the parent can deliver is what its physical port
+accepts, `max(port MTU, 1500)`, whatever its own MTU, since a 1500-byte VLAN
+over a 9000-byte port still receives 9000-byte frames. That MTU
 is taken over the whole path: the oif, each VLAN
 device below it, the port, and for a bridge oif the bridge and each chosen
 port. A copy that collapses into another oif's keeps the narrower of the two

@@ -6810,14 +6810,14 @@ static void test_mtu_before_admission(void)
 static void test_mtu_refusal_sound(void)
 {
     enum { PLAIN, SESSION, TUNNEL, SESSION_TUNNEL, TAG, BRIDGE,
-           PLAIN6, SESSION6, TUNNEL6, SHAPES };
-    static const int ingress[] = { 1280, 1400, 1440, 1452, 1460, 1480, 1491, 1492,
-                                   1493, 1500, 1508, 9000 };
+           PLAIN6, SESSION6, SESSION_TUNNEL6, TUNNEL6, SHAPES };
+    static const int ingress[] = { 1280, 1400, 1440, 1452, 1460, 1472, 1480, 1491,
+                                   1492, 1493, 1500, 1508, 9000 };
     static const int ports[] = { 1500, 9000 };
     static const u16 paths[] = { 68, 1279, 1280, 1400, 1440, 1451, 1452, 1453, 1459,
-                                 1460, 1480, 1491, 1492, 1493, 1499, 1500, 1508, 8952,
-                                 8992, 9000 };
-    unsigned refused = 0, exact = 0;
+                                 1460, 1471, 1472, 1473, 1479, 1480, 1491, 1492, 1493,
+                                 1499, 1500, 1508, 8952, 8972, 8992, 9000 };
+    unsigned refused = 0, exact = 0, exact_admitted = 0;
 
     for (unsigned shape = 0; shape < SHAPES; shape++)
     for (unsigned tcp = 0; tcp < 2; tcp++)
@@ -6852,6 +6852,17 @@ static void test_mtu_refusal_sound(void)
             memcpy(ingress_session.h_dest, AC_MAC, ETH_ALEN);
             logical = &in_ppp;
             break;
+        case SESSION_TUNNEL6:
+            /* 6in4 under a PPPoE session: a sit device's ingress strips
+             * its 20-byte outer header and the session's 8 at most. */
+            sit_in_fixture();
+            ingress_tunnel.lower_ifindex = in_ppp.ifindex;
+            memset(ingress_tunnel.h_dest, 0, ETH_ALEN);
+            ingress_session = (struct nf_flow_session){ .lower_ifindex = in.ifindex,
+                                                        .id = SESSION_ID + 1 };
+            memcpy(ingress_session.h_dest, AC_MAC, ETH_ALEN);
+            logical = &in_sit;
+            break;
         default: sit_in_fixture(); logical = &in_sit; break;
         }
         if (tcp) tcp_flow(); else udp_flow();
@@ -6869,21 +6880,25 @@ static void test_mtu_refusal_sound(void)
         int rc = ft_parse(&binding, &cls, &decoded, &next_hop);
         assert(!early || rc == -EOPNOTSUPP);
         refused += early;
-        /* Behind a session under 4in6 the bound is at its lowest, which is
-         * the one the early refusal assumes for either family. Elsewhere it
-         * is exact only while the device's own MTU is what arrives, the
-         * port taking nothing more -- shown for IPv6, whose shapes refuse
-         * nothing else on the way. */
-        if (!sec && !tcp && (shape == SESSION_TUNNEL ||
-                             (shape >= PLAIN6 && max_t(int, ports[w], 1500) <= ingress[i]))) {
+        /* What arrives is the port's to say, whatever the device above it
+         * claims (A346). The early refusal assumes the most the ingress
+         * device's kind can strip: nothing through an Ethernet device, a
+         * session through a ppp one, a session and 6in4's outer header
+         * through a sit one, a session and 4in6's through an ip6tnl one.
+         * Where that is what the walk finds, it is exact -- shown for IPv6,
+         * whose shapes refuse nothing else on the way, and for a session
+         * under either tunnel -- and both ways: some admitted, some not. */
+        if (!sec && !tcp && (shape == SESSION_TUNNEL || shape == PLAIN6 || shape == SESSION6 ||
+                             shape == SESSION_TUNNEL6)) {
             assert(early == (rc != 0));
             exact++;
+            exact_admitted += rc == 0;
         }
         logical->mtu = logical == &in ? 1500 : logical == &in_ppp ? 1492 :
                        logical == &in_ip6tnl ? 1452 : logical == &in_sit ? 1480 : 1500;
         in.mtu = out.mtu = 1500;
     }
-    assert(refused && exact);
+    assert(refused && exact && exact_admitted && exact_admitted < exact);
     xfrm_policies = false;
     ipsec_sa = ipsec_in_sa = 0;
 }
@@ -6918,11 +6933,11 @@ static void test_mtu_port_bound(void)
         in.mtu = 9000;
         assert(ft_mtu_refused(&cls, binding.dev));
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
-        /* Short of the port by anything is still too small to admit. Before
-         * RTNL it is only certain past what a session and 4in6 could strip,
-         * which this direction does not cross. */
+        /* Short of the port by anything is still too small to admit, and
+         * certain before RTNL too: an Ethernet device strips nothing on the
+         * way in. */
         out.mtu = cls.nf_mtu = 8999;
-        assert(!ft_mtu_refused(&cls, binding.dev));
+        assert(ft_mtu_refused(&cls, binding.dev));
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
         out.mtu = cls.nf_mtu = 8951;
         assert(ft_mtu_refused(&cls, binding.dev));
@@ -6937,6 +6952,16 @@ static void test_mtu_port_bound(void)
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
         in.mtu = 1500;
     }
+    /* An upper raised above its port receives no more than the port does
+     * for it: a 9000-byte bridge over a 1500-byte port carries UDP into a
+     * 1500-byte path, before RTNL and at admission (A346). */
+    bridge_fixture();
+    reverse_route.dst.dev = &in_br;
+    in_br.mtu = 9000;
+    assert(in.mtu == 1500 && cls.nf_mtu == 1500);
+    assert(!ft_mtu_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.in_logical == &in_br);
+    in_br.mtu = 1500;
     /* A port lowered under 1500 still takes full frames, whatever its upper
      * says: the floor is the port's as much as the device's. */
     ingress_tag_fixture();
@@ -6985,8 +7010,8 @@ static void test_mtu_port_bound(void)
     in.mtu = 1500;
     out.mtu = cls.nf_mtu = in_tag.mtu = 1492;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
-    /* Not certain before RTNL: within what a session and 4in6 could strip. */
-    assert(!ft_mtu_refused(&cls, binding.dev));
+    /* Certain before RTNL as well: a VLAN device strips nothing. */
+    assert(ft_mtu_refused(&cls, binding.dev));
     in.mtu = out.mtu = in_tag.mtu = 1500;
 }
 

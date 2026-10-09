@@ -851,18 +851,16 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	 * accepts, its own MTU but never less than a full Ethernet frame
 	 * (ft_port_arriving()), so a 1500-byte VLAN parent over a 9000-byte port,
 	 * a parent lowered to 1400, or a source ignoring the IPv6 MTU its link
-	 * advertises, delivers more than the parent's own.
+	 * advertises, delivers more than the parent's own. The port's bound is
+	 * the whole of it, as unicast's is (A346): a VLAN parent cannot be set
+	 * above its port's MTU, and nothing strips a header on the way up.
 	 *
 	 * Through a bridge the bound is the bridge port the stream arrives on,
 	 * which the bridge hands up whatever the bridge device's own MTU, and
 	 * which only the bridged group knows: the plan carries the narrowest
 	 * copy for it to hold against that. */
-	if (spec.in) {
-		u32 arriving = max(ft_mc_link_mtu(vif_dev, g->family), ft_port_arriving(spec.in));
-
-		if (out_mtu < arriving)
-			return FT_MR_REFUSED_MTU;
-	}
+	if (spec.in && out_mtu < ft_port_arriving(spec.in))
+		return FT_MR_REFUSED_MTU;
 	/* An XFRM output policy Linux would apply to a copy, which hardware
 	 * cannot. Asked last, of oifs every test above has let through. The
 	 * generation is taken first, so a policy change after it is caught by

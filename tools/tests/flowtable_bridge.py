@@ -604,9 +604,9 @@ async def test_bridge_above_its_port(bridge_rig):
     port's MTU, not the bridge's, so hardware never sends what the bridge
     would have dropped (A340).
 
-    The reverse, arriving on the WAN port, fits the port's 1500 bytes and stays
-    in hardware. The forward now arrives on a 9000-byte bridge, which a WAN
-    path of 1500 cannot carry, and stays in Linux as on any jumbo LAN."""
+    Nor does the bridge receive more than its port does: the port's MAC takes
+    frames by its own MTU, so the forward, arriving on the bridge, fits the
+    WAN's 1500 bytes and stays in hardware too (A346)."""
     r = bridge_rig
     await r.table()
     port_mtu = int((await read(r.target, r.session,
@@ -617,7 +617,8 @@ async def test_bridge_above_its_port(bridge_rig):
         assert int((await read(r.target, r.session,
                                f"/sys/class/net/{TARGET_LAN_IF}/mtu")).strip()) == port_mtu
         await r.wait(lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
-        raised = await _settled(r, {TARGET_LAN_IF: port_mtu}, since=before)
+        raised = await _settled(r, {TARGET_LAN_IF: port_mtu, TARGET_WAN_IF: port_mtu},
+                                since=before)
         assert raised["errors"] == before["errors"], raised
         r.record("bridge-above-port", {"before": before, "raised": raised})
     finally:

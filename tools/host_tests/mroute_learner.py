@@ -266,7 +266,9 @@ def test_the_mtu_bound_is_rechecked_without_an_mfc_event():
     source = flowtable_source()
     derive = function(source, "ft_mr_derive")
     assert "return FT_MR_REFUSED_MTU;" in derive
-    assert "ft_mc_link_mtu(vif_dev, g->family)" in derive
+    # What arrives is the parent's port's to say, not the parent's (A346).
+    assert "out_mtu < ft_port_arriving(spec.in)" in derive
+    assert "ft_mc_link_mtu(vif_dev" not in derive
     # After the listeners, because only they say how narrow the copies are.
     assert derive.index("FT_MR_REFUSED_MTU") > derive.rindex("FT_MR_REFUSED_LISTENER")
     refresh = function(source, "ft_mr_stats_fn")

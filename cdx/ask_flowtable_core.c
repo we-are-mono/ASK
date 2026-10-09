@@ -1543,19 +1543,20 @@ static unsigned int ft_rule_stripped(const struct cdx_ft_rule *rule)
 	       (rule->in_tunnel.present ? rule->in_tunnel.header_size : 0);
 }
 
-/* The largest packet a direction arriving on @in through physical port @port
- * may be handed once its ingress has taken @stripped bytes of session and
- * tunnel header off: whichever is larger of the logical device's MTU and what
- * the port's MAC accepts (ft_port_arriving()) less the same stripping. The
- * logical device can be the smaller -- a 1500-byte bridge or VLAN over a
- * 9000-byte port still receives 9000-byte frames -- and a tunnel device's MTU
- * says nothing about the outer packets its port receives. The MTU bound and
+/* The largest packet a direction arriving through physical port @port may be
+ * handed once its ingress has taken @stripped bytes of session and tunnel
+ * header off: what the port's MAC accepts (ft_port_arriving()) less that
+ * stripping, whatever the logical device it arrives on says. That device can
+ * be the smaller -- a 1500-byte bridge or VLAN over a 9000-byte port still
+ * receives 9000-byte frames -- and it can be the larger, a bridge whose MTU
+ * was set above its port's or a tunnel's set by hand above what its port
+ * carries, which receives no more than the port does for it (A346). Only a
+ * DPAA port is ever an ingress (cdx_ft_port_supported()). The MTU bound and
  * its refusal ahead of admission both measure a path against this, so the two
  * cannot disagree about what arrives. */
-static u32 ft_arriving(const struct net_device *in, const struct net_device *port,
-		       unsigned int stripped)
+static u32 ft_arriving(const struct net_device *port, unsigned int stripped)
 {
-	return max_t(u32, READ_ONCE(in->mtu), ft_port_arriving(port) - stripped);
+	return ft_port_arriving(port) - stripped;
 }
 
 /* Whether a direction leaving by a path of @mtu can be carried although a
@@ -1584,14 +1585,14 @@ static u32 ft_arriving(const struct net_device *in, const struct net_device *por
  * MTU allows, never less than a full Ethernet frame, and a host that ignores
  * a smaller advertised MTU -- DHCP's option for it widely is, and a router
  * advertisement's can be -- or that sits on the port's wider segment keeps
- * sending such frames. The logical and physical ingress and the path are
- * device and route MTUs, whose changes retire the flow through their own
- * events, so admission alone decides. */
+ * sending such frames. The physical ingress and the path are device and route
+ * MTUs, whose changes retire the flow through their own events, so admission
+ * alone decides. */
 static bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
 {
 	return rule->proto == IPPROTO_TCP ||
 	       (rule->family == AF_INET && (rule->sa_handle || rule->in_sa_handle)) ||
-	       ft_arriving(rule->in_logical, rule->in, ft_rule_stripped(rule)) <= mtu;
+	       ft_arriving(rule->in, ft_rule_stripped(rule)) <= mtu;
 }
 
 static u32 ft_ipv6_dev_mtu(const struct net_device *dev)
@@ -1631,10 +1632,11 @@ static bool ft_egress_mtu_current(const struct cdx_ft_rule *rule)
  * walk the whole path only to be refused again.
  *
  * Only a refusal that holds whatever the walk would find is made here. The
- * ingress device is the reverse destination's and the physical port @port the
- * one the offer is bound to, exactly as the decoder takes them. The bound is
- * taken with the most any ingress can strip -- a session and an IPv6 outer
- * header, the larger of the two tunnel modes' -- which is where it is lowest. And
+ * physical port @port is the one the offer is bound to, exactly as the decoder
+ * takes it, and what arrives is the port's to say (ft_arriving()). The bound
+ * is taken with the most the ingress device's kind can strip, which is where
+ * it is lowest: nothing through an Ethernet device, a session through a ppp
+ * one, a session and an outer header through a tunnel. And
  * no transform may be in reach: neither destination carries one and no
  * policy or blocking default is configured, so every lookup
  * ft_ipsec_handle() makes returns the plain route. No SA can then exempt the
@@ -1647,6 +1649,7 @@ static bool ft_mtu_refused(const struct flow_cls_offload *cls, const struct net_
 {
 	struct flow_rule *rule = cls->rule;
 	struct flow_match_basic basic;
+	unsigned int stripped;
 	struct net_device *in;
 	bool refused;
 
@@ -1660,13 +1663,32 @@ static bool ft_mtu_refused(const struct flow_cls_offload *cls, const struct net_
 		return false;
 	/* Without RTNL the destination's device can be swapped for the
 	 * blackhole one while its own unregisters; the device read here stays
-	 * valid until the grace period unregistration waits for. */
+	 * valid until the grace period unregistration waits for. What its
+	 * ingress can strip follows from what it is (ft_path_stack()): an
+	 * Ethernet device -- the port, a VLAN or a bridge on it -- nothing; a
+	 * ppp device its session; a tunnel device its outer header and a
+	 * session beneath; anything else, at most a session and an IPv6 outer
+	 * header. */
 	rcu_read_lock();
 	in = READ_ONCE(cls->nf_dst_reverse->dev);
+	switch (in->type) {
+	case ARPHRD_ETHER:
+		stripped = 0;
+		break;
+	case ARPHRD_PPP:
+		stripped = PPPOE_SES_HLEN;
+		break;
+	case ARPHRD_SIT:
+		stripped = PPPOE_SES_HLEN + sizeof(struct iphdr);
+		break;
+	default:
+		stripped = PPPOE_SES_HLEN + sizeof(struct ipv6hdr);
+		break;
+	}
 	refused = (basic.key->n_proto == htons(ETH_P_IP) ||
 		   basic.key->n_proto == htons(ETH_P_IPV6)) &&
 		  basic.key->ip_proto != IPPROTO_TCP &&
-		  ft_arriving(in, port, PPPOE_SES_HLEN + sizeof(struct ipv6hdr)) > cls->nf_mtu;
+		  ft_arriving(port, stripped) > cls->nf_mtu;
 	if (refused)
 		ask_dbg(ASK_DBG_DEVICE, "proto %u mtu %u below ingress %s before RTNL\n",
 			basic.key->ip_proto, cls->nf_mtu, netdev_name(in));

@@ -137,13 +137,14 @@ is bounded by the physical port's MAC: patch 109 programs each DPAA port's
 max frame from its MTU as `max(mtu, 1500)` plus header and FCS, plus one VLAN
 tag while the port has any upper device (a VLAN, a bridge, a bond, a macvlan)
 and two once a VLAN on it is 802.1ad or carries a VLAN, so a frame over that
-is dropped and counted by the MAC. A direction's bound is therefore the
-larger of its logical ingress device's MTU and `max(port MTU, 1500)`, less
-whatever the direction strips (a PPPoE session's 8 bytes, a tunnel's outer
-header): a port lowered below 1500 keeps receiving full frames, and a 1500
-bridge or VLAN over a 9000 port receives 9000-byte frames from hosts that
-were never told the smaller MTU, since DHCP's MTU option is widely ignored and
-a router advertisement's can be. The IPv6 MTU a link advertises is therefore
+is dropped and counted by the MAC. A direction's bound is therefore
+`max(port MTU, 1500)`, less whatever the direction strips (a PPPoE session's
+8 bytes, a tunnel's outer header), whatever its logical ingress device says: a
+port lowered below 1500 keeps receiving full frames, a 1500 bridge or VLAN
+over a 9000 port receives 9000-byte frames from hosts that were never told the
+smaller MTU, since DHCP's MTU option is widely ignored and a router
+advertisement's can be, and a bridge set to 9000 over a 1500 port receives no
+more than the port does (A346). The IPv6 MTU a link advertises is therefore
 not the bound either. On such a jumbo trunk every non-TCP direction into a
 1500 path stays in software. The tag allowance lets an untagged frame on a port with uppers
 exceed its MTU by four (or eight) bytes; that window is deliberately not
@@ -184,9 +185,10 @@ at most about once a second for as long as the software fast path forwards
 either direction's packets: `flow_offload_refresh()` queues the whole flow, and
 the offload work offers both directions. A direction the MTU bound is certain to refuse is therefore refused
 before RTNL is taken, counted as a reject and never as busy, retiring nothing:
-anything other than TCP whose path is below the larger of the ingress device's
-MTU and the port bound less 48 bytes (a session and a 4in6 outer header, the
-most any ingress strips). It does
+anything other than TCP whose path is below the port bound less the most the
+ingress device's kind can strip: nothing through an Ethernet device, a
+session's 8 bytes through a ppp one, 28 through a sit tunnel and 48 through
+any other (a session and a 4in6 outer header). It does
 so only while no xfrm policy or blocking default is configured and neither
 destination carries a transform, because an SA exempts an IPv4 direction and a
 policy denial retires the generation, and only the walk under RTNL finds out

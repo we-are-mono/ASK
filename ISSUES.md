@@ -348,14 +348,8 @@ result independently of those temporary files.
 - [x] **A339 — frames FMan drops after receiving them were counted nowhere standard.** Refused enqueues are now
   `rx_dropped`, no-buffer drops `rx_missed_errors` (_:/^cdx: count a port's frames where they leave and where they are lost_).
 
-- [ ] **A346 — a bridge raised above its port counts as receiving frames the port refuses.** What may arrive on a
-  direction's ingress is `ft_arriving()`: the larger of the logical device's MTU and what the port's MAC accepts
-  (`ft_port_arriving()`). A bridge's MTU set above its port's -- 9000 over 1500 -- makes that 9000, though patch 109
-  programs the port's MAXFRM from its own MTU and it receives nothing past about 1500 and its tags. A UDP direction
-  arriving on such a bridge is then kept in software for a path of 1500 that what actually arrives fits: offload lost,
-  nothing wrong on the wire. Fix direction: bound the logical device's term by the port's, after checking what a Wi-Fi
-  VAP's ingress, which has no DPAA MAC, needs from it. Found by the review of A340; seen in
-  `flowtable_bridge.py::test_bridge_above_its_port`, whose forward direction stays in software.
+- [x] **A346 — a bridge raised above its port counted as receiving frames the port refuses.** What arrives is now the
+  port's bound alone, before RTNL too (_:/^flowtable: bound what arrives by the port it arrives on_).
 
 - [ ] **A343 — FMan wedged once after a LAN port was held paused with thousands of offloaded frames queued.** Right
   after `flowtable_ipsec_stalled_port.py` held eth3 in 802.3x PAUSE for 4 s from the LAN VM, an FMan host command timed
