@@ -905,6 +905,17 @@ static u32 __raw_readl(const volatile void *addr)
 	return *(const volatile u32 *)addr;
 }
 #define __be32_to_cpu(x) ntohl(x)
+/* The IPsec offline port's count of frames QMan would not let it enqueue, as
+ * dpa_cfg reads it off the port: there only once a case gives it a port. */
+static bool offline_port_present;
+static u32 offline_port_rejections;
+static int cdx_dpa_ipsec_offline_port_rejected(u32 *count)
+{
+	if (!offline_port_present)
+		return -ENODEV;
+	*count = offline_port_rejections;
+	return 0;
+}
 #include "sec_refusals.inc"
 /* The /proc/net/xfrm_stat counters the adapter adds to, numbered as the
  * kernel numbers them. Only init_net's are ever touched. */
@@ -4988,10 +4999,42 @@ static void test_sec_refusals(void)
 		assert(xfrm_mib[m] - mib_before[m] == mib_expected[m]);
 	assert(sec_fault_lines == lines + 1);
 
+	/* What SEC produced and the offline port then could not enqueue is
+	 * counted beside the refusals, from the port's own counter: from its
+	 * first reading on, through a wrap, and not while there is no port to
+	 * read, which costs nothing it counted before or after. It reaches no
+	 * xfrm counter and no fault line. */
+	struct seq_file rows = { .len = 0 };
+	unsigned long long mibs = mib_total();
+
+	assert(strstr(seq.buf, "\nipsec_offline_port_rejected 0\n") && !ft_sec_rejected_known);
+	lines = sec_fault_lines;
+	offline_port_present = true;
+	offline_port_rejections = 0xfffffff0;
+	ft_ipsec_stats_work(NULL);
+	assert(ft_sec_rejected_known && !ft_sec_rejected);
+	offline_port_rejections = 0x10;
+	ft_ipsec_stats_work(NULL);
+	assert(ft_sec_rejected == 0x20);
+	offline_port_present = false;
+	offline_port_rejections = 0x99;
+	ft_ipsec_stats_work(NULL);
+	assert(ft_sec_rejected == 0x20);
+	offline_port_present = true;
+	offline_port_rejections = 0x30;
+	ft_ipsec_stats_work(NULL);
+	assert(ft_sec_rejected == 0x40);
+	assert(mib_total() == mibs && sec_fault_lines == lines);
+	ft_sec_refusal_rows(&rows);
+	assert(strstr(rows.buf, "\nipsec_offline_port_rejected 64\n"));
+
 	bench_clear_sas();
 	en_global_muram_mem = NULL;
 	ft_sec_known = false;
 	memset(ft_sec_counted, 0, sizeof(ft_sec_counted));
+	offline_port_present = false;
+	ft_sec_rejected_known = false;
+	ft_sec_rejected = 0;
 }
 
 int main(void)

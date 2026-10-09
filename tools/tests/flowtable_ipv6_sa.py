@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from _flowtable_ipv6_sa import BULK_PORT, DPORT, SPORT, V4_WAN_DPORT, V4_WAN_SPORT
 
-from _flowtable_ipv6_sa import FITS, REMOTE_PREFIX, REMOTE_V6, fragments_sent, sa_pair, xfrm_counters
+from _flowtable_ipv6_sa import FITS, REMOTE_PREFIX, REMOTE_V6, fragments_sent, sa_pair, tunnel, xfrm_counters
 
 import asyncio
 import json
@@ -39,7 +39,7 @@ import socket
 from _topology import LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6, lan_run_python
 from _flowtable_ipv6 import (PayloadEcho, _drive, _drop_tables, _hardware_delta, _offload_table, _udp_exchange)
 from _flowtable_rig import command
-from _flowtable_service_ipsec import (offline_port_discards)
+from _flowtable_service_ipsec import (offline_port_discards, offline_port_rejections)
 from _flowtable_service_ipsec_replay import (xfrm_mib)
 
 
@@ -220,16 +220,6 @@ assert result.returncode == 0, result.stderr
             await server.wait()
 
 
-async def _tunnel(r, cleanup):
-    """The SA pair, with bulk TCP to BULK_PORT offloaded and nothing else."""
-    await command(r.target, r.session, "ip", "-6", "route", "add", "default", "via", WAN_IPV6,
-                  "dev", TARGET_WAN_IF)
-    cleanup.append((r.target, ["ip", "-6", "route", "del", "default", "via", WAN_IPV6,
-                               "dev", TARGET_WAN_IF]))
-    await sa_pair(r, cleanup)
-    await _offload_table(r, f"ip6 saddr {LAN_IPV6} tcp dport {BULK_PORT}")
-
-
 async def test_decrypted_frames_intact_under_load(ipv6_rig):
     """Bulk IPv6 TCP each way through the IPv4 tunnel: SEC writes every
     decrypted IPv6 frame whole, its ACKs while the LAN sends and its full
@@ -245,7 +235,7 @@ async def test_decrypted_frames_intact_under_load(ipv6_rig):
     cleanup = []
     received = {}
     try:
-        await _tunnel(r, cleanup)
+        await tunnel(r, cleanup)
         async with offline_port_discards(r, "ipv6-sa-bulk-discards") as discards:
             for direction, options in (("lan-to-wan", []), ("wan-to-lan", ["-R"])):
                 end = await _iperf(r, BULK_PORT, ["-P", "4", *options], "flowtable_v6_sa_bulk")
@@ -269,12 +259,14 @@ async def test_exception_backlog_leaves_sec_its_buffers(ipv6_rig):
     Here an unoffloaded UDP stream from the WAN host runs at several times
     what the CPU can deliver, beside offloaded TCP the other way. SEC may
     refuse frames for its own reasons (the peer's reordering against the
-    replay window), but never for want of a buffer."""
+    replay window), but never for want of a buffer. What the CPU had no time
+    for is dropped at the offline port instead, and /proc/cdx_flowtable
+    counts it, as the port's own register does (A336)."""
     r = ipv6_rig
     cleanup = []
     try:
-        await _tunnel(r, cleanup)
-        start = await r.state()
+        await tunnel(r, cleanup)
+        start, rejections = await r.state(), await offline_port_rejections(r)
         # Either can fail when SEC starves, the offloaded TCP by stalling; the
         # refusals say why, so they are read and checked first.
         tcp, udp = await asyncio.gather(
@@ -285,9 +277,12 @@ async def test_exception_backlog_leaves_sec_its_buffers(ipv6_rig):
         await asyncio.sleep(1.5)
         end = await r.state()
         refused = {key: end[key] - start[key] for key in end if key.startswith("ipsec_sec_refused")}
+        rejected = {"counted": end["ipsec_offline_port_rejected"] - start["ipsec_offline_port_rejected"],
+                    "port": (await offline_port_rejections(r) - rejections) % 2**32}
         r.record("ipv6-sa-exception-backlog", {"tcp": repr(tcp), "udp": repr(udp),
-                                               "refused": refused, "state": end})
+                                               "refused": refused, "rejected": rejected, "state": end})
         assert refused["ipsec_sec_refused_buffer_depletion"] == 0, (refused, tcp, udp)
+        assert rejected["counted"] == rejected["port"] > 0, rejected
         for result in (tcp, udp):
             if isinstance(result, BaseException):
                 raise result

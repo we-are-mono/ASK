@@ -964,7 +964,11 @@ ask_flowtable: 256 IPsec frames dropped, SEC could not process them: buffer_depl
 `/proc/cdx_flowtable` carries every class, counted since the adapter loaded
 and as of the pass's last reading. `ipsec_sec_refused` is the total, short only
 by the increments a dense burst loses (above), and `ipsec_sec_refused_<class>`
-gives each class under the names in `ft_sec_refusal[]`.
+gives each class under the names in `ft_sec_refusal[]`. Beside them,
+`ipsec_offline_port_rejected` counts what SEC did produce and the IPsec offline
+port then dropped because QMan would not take it: its exception queues full,
+the CPU behind, or an egress port's queue full. No xfrm counter stands for
+those.
 
 **No count exists per SA.** For an offloaded SA, `ip -s xfrm state` shows
 `replay-window 0 replay 0 failed 0` however many of its frames SEC refused,
@@ -1385,10 +1389,12 @@ tail drop at `IPSEC_EXCEPTION_FRAMES`, a quarter of the pool. QMan refuses the
 port's enqueue past it, and FMan drops the frame and returns its buffer: the
 SDK configures FMan's direct-connect portals to take their own enqueue
 rejections (`qm_set_dc(..., ed=1)`). The offline port counts those drops in its
-BMI WRED-discard counter, `fmbm_ofwdc` in
-`/sys/devices/platform/soc/1a00000.fman/1a83000.port/fm_port_bmi_regs`, not in
-its filter count; frames an egress port's congestion group refuses (A313) land
-there too. And `ipsec_exception_pkt_handler()` copies a contiguous frame into
+BMI WRED-discard counter (`fmbm_ofwdc` in its `fm_port_bmi_regs`), not in its
+filter count, and frames an egress port's congestion group refuses (A313) land
+there too. The accounting pass reads it (`dpa_cfg_port_rejected()`, through
+`FM_PORT_GetCounter()`, which patch 010 exports) and folds it into
+`/proc/cdx_flowtable` as `ipsec_offline_port_rejected` (A336). And
+`ipsec_exception_pkt_handler()` copies a contiguous frame into
 an skb of its own size and gives the buffer straight back
 (`ipsec_copy_contig_fd()`); only a scatter/gather frame, which SEC does not
 produce into a buffer of this size, still leaves a debt for the refill worker.

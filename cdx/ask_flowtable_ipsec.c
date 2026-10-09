@@ -1989,6 +1989,12 @@ static const struct {
 static u32 ft_sec_seen[CDX_SEC_REFUSAL_CLASSES];
 static bool ft_sec_known;
 static u64 ft_sec_counted[CDX_SEC_REFUSAL_CLASSES];
+/* The same for what SEC produced and the IPsec offline port then could not
+ * enqueue (cdx_sec_refusals.rejected). Counted on its own: nothing refused
+ * these, and no xfrm counter stands for them. */
+static u32 ft_sec_rejected_seen;
+static bool ft_sec_rejected_known;
+static u64 ft_sec_rejected;
 
 /* Room for every fault class moving at once, at ten digits each: 343 bytes.
  * scnprintf() truncates rather than overruns if a name ever grows. */
@@ -2011,6 +2017,12 @@ void ft_sec_refusals_fold(void)
 
 	if (cdx_ipsec_sec_refusals(&now))
 		return;
+	if (now.rejected_ok) {
+		if (ft_sec_rejected_known)
+			ft_sec_rejected += (u32)(now.rejected - ft_sec_rejected_seen);
+		ft_sec_rejected_seen = now.rejected;
+		ft_sec_rejected_known = true;
+	}
 	if (!ft_sec_known) {
 		memcpy(ft_sec_seen, now.count, sizeof(ft_sec_seen));
 		ft_sec_known = true;
@@ -3157,10 +3169,11 @@ void ft_ipsec_detach_all(void)
 	synchronize_rcu();
 }
 
-/* The frames SEC refused since this module loaded: all of them, which is
- * exact, and then each class the microcode counted them in, which is only as
- * good as its sorting; see ft_sec_refusal[]. As of the accounting pass's last
- * reading. Transaction held. */
+/* The frames SEC refused since this module loaded: all of them, short only by
+ * the increments a burst of back-to-back refusals loses, and then each class
+ * the microcode counted them in, which is only as good as its sorting; see
+ * ft_sec_refusal[]. Then the frames SEC produced that the offline port could
+ * not enqueue. As of the accounting pass's last reading. Transaction held. */
 void ft_sec_refusal_rows(struct seq_file *seq)
 {
 	u64 total = 0;
@@ -3172,4 +3185,5 @@ void ft_sec_refusal_rows(struct seq_file *seq)
 	for (i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++)
 		seq_printf(seq, "ipsec_sec_refused_%s %llu\n", ft_sec_refusal[i].name,
 			   ft_sec_counted[i]);
+	seq_printf(seq, "ipsec_offline_port_rejected %llu\n", ft_sec_rejected);
 }

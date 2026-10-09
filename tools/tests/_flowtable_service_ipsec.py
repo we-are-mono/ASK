@@ -72,6 +72,17 @@ regs.close()
     return int(re.search(r"statistics mask (\d+)", result["stdout"]).group(1))
 
 
+OFFLINE_PORT_BMI = "/sys/devices/platform/soc/1a00000.fman/1a83000.port/fm_port_bmi_regs"
+
+
+async def offline_port_rejections(r):
+    """The frames the IPsec offline port dropped because QMan refused their
+    enqueue, from its BMI register dump: fmbm_ofwdc, 32 bits."""
+    text = await read(r.target, r.session, OFFLINE_PORT_BMI)
+    return next(int(line.split()[1], 16) for line in text.splitlines()
+                if line.split()[-1:] == ["fmbm_ofwdc"])
+
+
 async def offline_port_parse_errors(r):
     """The parse errors counted for the ports in the parser's statistics mask."""
     text = await read(r.target, r.session, PARSER)

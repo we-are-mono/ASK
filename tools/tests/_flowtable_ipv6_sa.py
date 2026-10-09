@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 
+from _flowtable_ipv6 import _offload_table
 from _flowtable_rig import command, read
 from _flowtable_service_ipsec_replay import xfrm_mib
 from _ipsec_inbound_flow_offload import crypto
@@ -66,6 +67,18 @@ async def sa_pair(r, cleanup, remote=WAN_IPV6):
                   "offload", "packet", "dev", TARGET_WAN_IF)
         if direction == "in":
             await add(r.target, "policy", [*selector, "dir", "fwd"], *template)
+
+
+async def tunnel(r, cleanup, match=f"tcp dport {BULK_PORT}"):
+    """The SA pair to the WAN host's IPv6 address, behind an IPv6 default
+    route, with what `match` names from the LAN VM offloaded and nothing
+    else: bulk TCP to BULK_PORT unless told otherwise."""
+    await command(r.target, r.session, "ip", "-6", "route", "add", "default", "via", WAN_IPV6,
+                  "dev", TARGET_WAN_IF)
+    cleanup.append((r.target, ["ip", "-6", "route", "del", "default", "via", WAN_IPV6,
+                               "dev", TARGET_WAN_IF]))
+    await sa_pair(r, cleanup)
+    await _offload_table(r, f"ip6 saddr {LAN_IPV6} {match}")
 
 
 async def xfrm_counters(r):

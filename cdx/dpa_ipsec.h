@@ -125,6 +125,7 @@ struct sec_descriptor *get_shared_desc(void *handle);
 struct qman_fq *get_to_sec_fq(void *handle);
 
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size);
+int cdx_dpa_ipsec_offline_port_rejected(u32 *count);
 int cdx_dpa_ipsec_init(void);
 void cdx_dpa_ipsec_exit(void);
 bool cdx_dpa_ipsec_ready(void);

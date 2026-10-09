@@ -331,10 +331,8 @@ result independently of those temporary files.
   a 1G LAN port, a CEETM class) can pin the pool and starve every SA. Fix direction: size pool 34 to the worst egress
   bound plus `IPSEC_EXCEPTION_FRAMES`, or bound pool-34 frames on egress by count. Source-verified; not reproduced.
 
-- [ ] **A336 — frames the IPsec exception group drops are counted only in a register dump.** QMan refuses the offline
-  port's enqueue and FMan drops the frame (A333); the only count is oh1's `fmbm_ofwdc` in `fm_port_bmi_regs`, which A313's
-  egress rejections share. Fold it into `/proc/cdx_flowtable` beside `ipsec_sec_refused` (FM_PORT_GetCounter,
-  `e_FM_PORT_COUNTERS_WRED_DISCARD`), so a CPU path that cannot keep up is visible with the standard tools.
+- [x] **A336 — frames the IPsec exception group drops were counted only in a register dump.** Now
+  `ipsec_offline_port_rejected` in `/proc/cdx_flowtable`, from oh1's own count (_:/^cdx: count what the IPsec offline port could not enqueue_).
 
 - [x] **A332 — the first datagram of a fresh flow lost before the DUT's IP stack.** The rig's LAN copper SFP
   module, since replaced: absent in every run with the new one (_:/^issues: close A332 as the LAN SFP module_).

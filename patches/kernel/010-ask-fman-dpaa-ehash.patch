@@ -1,4 +1,4 @@
-From 1fbbf668d0faeb6c3cb0f4744be25ef6932caac3 Mon Sep 17 00:00:00 2001
+From f24db42bc1d863a5a22ec34410ee2471fd88a617 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -152,7 +152,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../freescale/sdk_fman/ls1043_dflags.h        |    2 +
  .../freescale/sdk_fman/ncsw_config.mk         |    8 -
  .../sdk_fman/src/inc/wrapper/fsl_fman_test.h  |   84 -
- .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |   13 +-
+ .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |   14 +-
  .../sdk_fman/src/inc/wrapper/lnxwrp_fm_ext.h  |    5 -
  .../src/inc/wrapper/lnxwrp_fsl_fman.h         |    5 +
  .../freescale/sdk_fman/src/system/sys_io.c    |    1 +
@@ -182,7 +182,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 83 files changed, 8251 insertions(+), 12443 deletions(-)
+ 83 files changed, 8252 insertions(+), 12443 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -14522,15 +14522,16 @@ index 0466a4734aae..000000000000
 -
 -#endif /* __FSL_FMAN_TEST_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
-index 9667d45d7f75..0914141e9aa9 100644
+index 9667d45d7f75..cb849bbb00ed 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
-@@ -47,8 +47,14 @@
+@@ -47,8 +47,15 @@
  /* FMAN Port exported routines */
  EXPORT_SYMBOL(FM_PORT_Disable);
  EXPORT_SYMBOL(FM_PORT_Enable);
 +EXPORT_SYMBOL(FM_PORT_GetEnabled);
 +EXPORT_SYMBOL(FM_PORT_GetStopped);
++EXPORT_SYMBOL(FM_PORT_GetCounter);
 +EXPORT_SYMBOL(FM_PORT_IsPcdAttached);
 +EXPORT_SYMBOL(FM_PORT_SetFenced);
 +EXPORT_SYMBOL(FM_PORT_DetachPCD);
@@ -14540,7 +14541,7 @@ index 9667d45d7f75..0914141e9aa9 100644
  
  /* Runtime PCD exported routines */
  EXPORT_SYMBOL(FM_PCD_Enable);
-@@ -92,18 +98,13 @@ EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyCounter);
+@@ -92,18 +99,13 @@ EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyCounter);
  EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyStatistics);
  EXPORT_SYMBOL(FM_PCD_MatchTableFindNGetKeyStatistics);
  EXPORT_SYMBOL(FM_PCD_MatchTableGetMissStatistics);

@@ -1354,6 +1354,17 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	return cdx_dpa_init_fault() ? FAILURE : SUCCESS;
 }
 
+/* The frames the IPsec offline port dropped because QMan refused to enqueue
+ * them: the exception group full (IPSEC_EXCEPTION_FRAMES), the CPU behind,
+ * or an egress port's group full. 32 bits, wrapping; -ENODEV without the
+ * port. */
+int cdx_dpa_ipsec_offline_port_rejected(u32 *count)
+{
+	if (!cdx_dpa_ipsec_ready())
+		return -ENODEV;
+	return dpa_cfg_port_rejected(ipsecinfo.ofport_portid, count);
+}
+
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size)
 {
 	if (!ipsecinfo.ipsec_bp) 	

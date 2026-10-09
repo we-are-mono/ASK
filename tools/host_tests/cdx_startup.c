@@ -31,6 +31,7 @@ static unsigned coverage_warnings;
 #define display_dpa_cfg() do { } while (0)
 typedef void *t_Handle;
 typedef int t_Error;
+typedef uint32_t u32;
 
 #define FMAN_INDEX 0
 /* A port as the SDK keeps it: enabled, detached from its PCD, fenced against
@@ -174,6 +175,14 @@ static int FM_PORT_GetStopped(void *p, bool *stopped)
     return 0;
 }
 static int FM_PORT_IsPcdAttached(void *p, bool *attached) { *attached = ((struct port *)p)->pcd; return 0; }
+/* A port's BMI discard count: which port was read, under the lock that keeps
+ * the port list. */
+enum { e_FM_PORT_COUNTERS_WRED_DISCARD = 9 };
+static uint32_t FM_PORT_GetCounter(void *p, int counter)
+{
+    assert(counter == e_FM_PORT_COUNTERS_WRED_DISCARD && dpa_cfg_lock);
+    return 0x1000 + (uint32_t)((struct port *)p - ports);
+}
 static unsigned waits;
 static void usleep_range(unsigned min, unsigned max) { assert(min && max >= min); waits++; }
 #define ASSERT_RTNL() assert(rtnl)
@@ -511,6 +520,25 @@ static void check_shared_icid(void)
     assert(!dpa_cfg_lock);
 }
 
+/* A described port's discard count comes from the port the install resolved
+ * for it: the list and the description are walked in step. */
+static void check_port_rejected(void)
+{
+    uint32_t count = 0;
+
+    assert(dpa_cfg_port_rejected(0, &count) == -ENODEV && !count);
+    setup(); assert(!dpa_cfg_install());
+    for (unsigned id = 0; id < FIXTURE_PORTS; id++) {
+        assert(!dpa_cfg_port_rejected(id, &count));
+        assert(count == 0x1000 + id);
+    }
+    count = 0;
+    assert(dpa_cfg_port_rejected(FIXTURE_PORTS, &count) == -ENODEV && !count);
+    assert(!dpa_cfg_lock);
+    clean_success();
+    assert(dpa_cfg_port_rejected(0, &count) == -ENODEV);
+}
+
 int main(void)
 {
     setup(); lock_contention = 2;
@@ -552,6 +580,7 @@ int main(void)
     }
     check_stop_resume();
     check_shared_icid();
+    check_port_rejected();
     printf("CDX startup fault points passed: %u allocations, %u stages and retry; "
            "restartable stop and resume\n", allocations, steps);
     return 0;

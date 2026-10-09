@@ -995,6 +995,33 @@ int dpa_cfg_shared_icid(void)
 	return icid;
 }
 
+/* How many frames the described port with logical id `portid` dropped because
+ * QMan refused to enqueue them: its BMI's WRED discard count, which a
+ * congestion group's tail drop moves as well as WRED. 32 bits, and it wraps.
+ * The port is the one the install resolved for it, one entry per described
+ * port in fman_info's order. -ENODEV when no installed classifier has it.
+ * FM_PORT_GetCounter() reads zero for a counter that is not counting, which a
+ * caller summing differences would take for a wrap; sdk_fman enables a port's
+ * BMI counters when it initialises the port, and nothing disables them. */
+int dpa_cfg_port_rejected(uint32_t portid, u32 *count)
+{
+	const struct dpa_init_ports *ports = &dpa_active_ports;
+	uint32_t fm, ii, at = 0;
+	int rc = -ENODEV;
+
+	mutex_lock(&dpa_cfg_lock);
+	for (fm = 0; fm < num_fmans && rc; fm++)
+		for (ii = 0; ii < fman_info[fm].max_ports && at < ports->count; ii++, at++)
+			if (fman_info[fm].portinfo[ii].portid == portid) {
+				*count = FM_PORT_GetCounter(ports->entries[at].handle,
+							    e_FM_PORT_COUNTERS_WRED_DISCARD);
+				rc = 0;
+				break;
+			}
+	mutex_unlock(&dpa_cfg_lock);
+	return rc;
+}
+
 /* Start the ports a stop left, as they were before it: an offline port if it
  * was enabled then, an Rx port if it was and its netdev is still up. The fence
  * comes off first. RTNL and the control mutex held. -ENOTRECOVERABLE for ports

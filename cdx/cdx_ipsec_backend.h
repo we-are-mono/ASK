@@ -239,9 +239,14 @@ enum cdx_sec_refusal {
 };
 
 /* The microcode's counts as they stand, in host order. Each is a u32 that
- * only moves forward and wraps; the caller takes differences. */
+ * only moves forward and wraps; the caller takes differences. Beside them,
+ * the frames SEC did produce that the IPsec offline port then dropped because
+ * QMan refused to enqueue them: its exception group full, the CPU behind, or
+ * an egress port's group full. The same kind of u32, valid with `rejected_ok`. */
 struct cdx_sec_refusals {
 	u32 count[CDX_SEC_REFUSAL_CLASSES];
+	u32 rejected;
+	bool rejected_ok;
 };
 
 /* SA operations run inside the flowtable backend's transaction, taken with
