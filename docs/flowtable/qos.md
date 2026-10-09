@@ -2254,9 +2254,12 @@ bounds and shares out their egress queue (A313):
   drop cannot be added on top, since QMan keeps it in the field overhead
   accounting uses.
 - **Counted at ingress.** A frame the group drops is counted in the BMI discard
-  counter of the port that enqueued it — the receiving port's `fmbm_rfdc`, or
-  the IPsec offline port's `fmbm_ofdc` for what SEC returned; flow and offloaded
-  TX counters were incremented before the enqueue and count it as sent.
+  counter of the port that enqueued it — the receiving port's `fmbm_rfdc`,
+  which its `rx_dropped` now includes, or the IPsec offline port's
+  `fmbm_ofwdc` for what SEC returned, `ipsec_offline_port_rejected` in
+  `/proc/cdx_flowtable`. The flow's own counters were incremented before the
+  enqueue and count it as sent; the egress port's transmit counters come from
+  its MAC and do not (statistics.md, "What a port sent and what it dropped").
 
 Unbounded, a saturated 10G port held a standing 11.5 MB (9 ms) and the reverse
 direction of a duplex transfer ran at 1.3–2.2 Gbit/s. Bounded at 2 ms and shared

@@ -69,8 +69,10 @@
  *      - Reads every record handed out, once a period, so that no count
  *        comes round twice between two reads. It touches the carve and
  *        ifstats_wide alone, under the lock and only while stats_mem is
- *        set -- never a slot or an interface, whose lifetimes are their
- *        owners'. Queued by cdx_ifstats_start() when devman registers the
+ *        set -- never a slot, whose lifetime is its owner's. First it has
+ *        devman advance the registered ports' own wrapping counts
+ *        (dpa_port_counters_sample()), under dpa_devlist_lock and not
+ *        this one. Queued by cdx_ifstats_start() when devman registers the
  *        dev_get_stats hook and cancelled synchronously by
  *        cdx_ifstats_stop() when it deregisters it, so it cannot outlive
  *        the module.
@@ -659,6 +661,9 @@ static void ifstats_sampler_run(struct work_struct *work)
 	struct cdx_ft_stats rx, tx;
 	unsigned int ii;
 
+	/* The ports' own wrapping counts, under the device list's lock, which
+	 * is taken outside this file's lock and never inside it. */
+	dpa_port_counters_sample();
 	spin_lock(&dpa_statslist_lock);
 	if (stats_mem)
 		for (ii = 0; ii < MAX_LOGICAL_INTERFACES; ii++)

@@ -341,18 +341,33 @@ result independently of those temporary files.
   the bridge in software drops them (`is_skb_forwardable()`), the port sends them. Fix: refuse when the path MTU
   exceeds the physical egress port's too. Source-verified by the review of the A335 follow-up; not reproduced.
 
-- [ ] **A338 — an offloaded frame an egress group drops still counts as transmitted.** A unicast entry's enqueue
-  action carries the egress port's logical stats pointer (`create_enque_hm()` in `cdx_ehash.c`), and the microcode
-  counts the frame there at enqueue, before QMan decides. A frame the port's forwarding group (A313) or its group for
-  SEC's frames (A335) then refuses is in the port's TX packets and bytes all the same, so a paused or congested port
-  reads as sending what it dropped. Multicast already opts out (`no_tx_stats`); unicast needs the refusals taken back
-  out, or the count moved to where the frame leaves. Source-verified by the A335 review; not measured.
+- [ ] **A341 — a stalled port's forwarding queue can hold the Ethernet buffer pool every DPAA port shares.** The
+  forwarding group bounds bytes (A313): 2.5 MB at 10G, ~19,000 small frames, against a pool of 12,800 buffers that
+  every port seeds and every port receives into (`dpa_priv_common_bpid`). With the LAN port paused and 64-byte frames
+  offloaded towards it, its queue held 12,492 frames and the WAN port then dropped 1,931,989 frames for want of a
+  buffer -- every frame it received, the kernel's own included. Any port's receive starves while one port is paused or
+  slower than what is offloaded to it. Fix: bound the forwarding queues in frames, at most a share of the pool.
 
-- [ ] **A339 — what an Ethernet port's own enqueue loses to a congestion group is attributed nowhere.** A flow from an
-  Ethernet port is enqueued by that port, so a frame its egress port's forwarding group (A313) or the Wi-Fi VAPs' group
-  (`VWD_FWD_FRAMES`, A334) refuses is dropped by FMan with no ERN, counted at most among the ingress port's BMI
-  discards, which mix every cause. The IPsec offline port's such losses are `ipsec_offline_port_rejected` (A336); the
-  Ethernet ports need the same, through the standard tools. Found by the A334 review; not measured.
+- [x] **A338 — an offloaded frame an egress group drops counted as transmitted.** A paused port read 1,944,448 sent
+  for 12,489 on the wire; a port's TX now comes from its MAC (_:/^cdx: count a port's frames where they leave and where they are lost_).
+
+- [x] **A339 — frames FMan drops after receiving them were counted nowhere standard.** Refused enqueues are now
+  `rx_dropped`, no-buffer drops `rx_missed_errors` (_:/^cdx: count a port's frames where they leave and where they are lost_).
+
+- [ ] **A343 — FMan wedged once after a LAN port was held paused with thousands of offloaded frames queued.** Right
+  after `flowtable_ipsec_stalled_port.py` held eth3 in 802.3x PAUSE for 4 s from the LAN VM, an FMan host command timed
+  out (`hc.c:306 EnQFrm: Operation Timed Out`), two flowtable deletes stayed unproven (`quarantine 2`, `rearm_ready
+  0`), and eth3 never transmitted again -- not the kernel's own pings either -- while its mEMAC read as at boot
+  (`command_config 00020843`, `if_status 00002000`). Only a reboot recovered it. Seen once in about seven runs of the
+  PAUSE cases; recalls A305. What holds FMan is unknown; A341 shortens what a paused port can hold, so re-check after
+  it under repeated PAUSE runs.
+
+- [ ] **A342 — `ipsec_vlan_iperf_probe.py` can fail when the WAN host starves a stream of its ACKs.** One full-suite
+  run saw two of four streams stall from the start: the WAN host reordered their ESP ACKs past the 32-entry replay
+  window and SEC refused 331,329 as late (`ipsec_sec_refused_other`), with no DUT buffer depletion or egress drop. The
+  test asserts every stream moves 1,000 packets in hardware over 5 s. Two reruns passed, and passing runs see 3k-140k
+  such refusals. The peer's async crypto reorders (see A333); the test needs either an ordering peer or an assertion on
+  the streams' total rather than each.
 
 - [x] **A336 — frames the IPsec exception group drops were counted only in a register dump.** Now
   `ipsec_offline_port_rejected` in `/proc/cdx_flowtable`, from oh1's own count (_:/^cdx: count what the IPsec offline port could not enqueue_).

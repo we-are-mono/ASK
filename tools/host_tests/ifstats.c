@@ -128,6 +128,9 @@ static int schedule_delayed_work(struct delayed_work *dwork, unsigned long delay
     dwork->delay = delay;
     return 1;
 }
+/* The ports' wrapping counts, read first, outside this file's lock. */
+static unsigned port_samples;
+static void dpa_port_counters_sample(void) { assert(!locked); port_samples++; }
 static int cancel_delayed_work_sync(struct delayed_work *dwork)
 {
     int queued = dwork->queued;
@@ -337,10 +340,14 @@ static void reset_claims(void) { claim_count = 0; }
  * other reason, and it queues itself again for the same period. */
 static void sampler_period(void)
 {
+    unsigned ports = port_samples;
+
     assert(ifstats_sampler.queued);
     ifstats_sampler.queued = 0;
     ifstats_sampler.func(&ifstats_sampler.work);
     assert(!locked);
+    /* The ports' counts too, every period. */
+    assert(port_samples == ports + 1);
     assert(ifstats_sampler.queued && ifstats_sampler.delay == IFSTATS_SAMPLE_PERIOD);
 }
 

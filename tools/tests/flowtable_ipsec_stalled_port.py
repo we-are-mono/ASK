@@ -11,17 +11,16 @@ port sent again (A335). They now wait on queues of their own, bounded by count.
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import socket
-import subprocess
 import time
 
 from _flowtable_ipv6 import PayloadEcho, _drive, _drop_tables, _udp_exchange
 from _flowtable_ipv6_sa import STALL_DPORT, STALL_SPORT, tunnel
 from _flowtable_rig import command, console_python
 from _flowtable_service_ipsec import SEC_EGRESS_FRAMES, SEC_POOL
-from _topology import LAN_IPV6, LAN_NIC, WAN_IPV6, lan_run
+from _lan_pause import while_lan_port_paused
+from _topology import LAN_IPV6, WAN_IPV6
 from ask_orch.uart import Console
 
 # The lowest free count SEC's output pool reaches over a stretch, read from
@@ -65,17 +64,15 @@ def _blast(seconds):
 
 
 async def test_paused_lan_port_leaves_sec_its_buffers(ipv6_rig):
-    """The LAN VM's NIC pauses the DUT's LAN port, flow control on and its
-    ring no longer drained: the VM is suspended. The WAN host meanwhile sends
-    small datagrams through the tunnel to it, on a flow in hardware, and SEC
-    refuses none of them for want of a buffer."""
+    """The LAN VM pauses the DUT's LAN port with 802.3x PAUSE frames, as a
+    congested switch or host does. The WAN host meanwhile sends small
+    datagrams through the tunnel to it, on a flow in hardware, and SEC refuses
+    none of them for want of a buffer."""
     r = ipv6_rig
     cleanup = []
-    vm = os.environ.get("ASK_LAN_VM", "loki")
     echo = PayloadEcho()
     transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
         lambda: echo, local_addr=(WAN_IPV6, STALL_DPORT), family=socket.AF_INET6)
-    suspended = False
     try:
         await tunnel(r, cleanup, f"udp sport {STALL_SPORT} udp dport {STALL_DPORT}")
 
@@ -86,29 +83,20 @@ async def test_paused_lan_port_leaves_sec_its_buffers(ipv6_rig):
         await _drive(r, send, lambda s: s["entries"] == 2,
                      "both directions of the flow should be in hardware")
         transport.close()
-        # A 10G link negotiates no pause: set it outright.
-        result = await lan_run(r.lan, f"ethtool -A {LAN_NIC} autoneg off rx on tx on")
-        assert result.rc == 0, result.stdout
         start = await r.state()
-        subprocess.run(["virsh", "suspend", vm], check=True, capture_output=True)
-        suspended = True
-        lowest, sent = await asyncio.gather(
+        (lowest, sent), pauses = await while_lan_port_paused(r, lambda: asyncio.gather(
             console_python(Console.target(), POOL_LOWEST.format(seconds=4), timeout=30),
-            asyncio.to_thread(_blast, 3))
+            asyncio.to_thread(_blast, 3)), 4)
         await asyncio.sleep(1.5)
         end = await r.state()
     finally:
         transport.close()
-        if suspended:
-            subprocess.run(["virsh", "resume", vm], check=False, capture_output=True)
-            await asyncio.sleep(2)
-        await lan_run(r.lan, f"ethtool -A {LAN_NIC} autoneg on rx off tx off")
         await _drop_tables(r)
         for agent, argv in reversed(cleanup):
             await command(agent, r.session, *argv, check=False)
     refused = {key: end[key] - start[key] for key in end
                if key.startswith(("ipsec_sec_refused", "ipsec_offline_port_rejected"))}
-    record = {"sent": sent, "refused": refused, "flows": end["flows"],
+    record = {"sent": sent, "pauses": pauses, "refused": refused, "flows": end["flows"],
               "pool_lowest": int(re.search(r"lowest (\d+)", lowest["stdout"]).group(1))}
     r.record("ipsec-paused-port", record)
     assert sent > 10_000, record

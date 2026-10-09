@@ -58,6 +58,14 @@ typedef enum {
 	MAX_FQ_TYPES
 }fq_types;
 
+/* A port's 32-bit BMI count, carried past its wrap into the total since CDX
+ * first read it. */
+struct port_bmi_count {
+	bool ready;
+	u32 last;
+	u64 total;
+};
+
 //ethernet device information
 struct eth_iface_info {
 	struct net_device *net_dev;	//os device ref
@@ -84,6 +92,20 @@ struct eth_iface_info {
 	/* The port MTU sec_cgr's bound was sized for: frames rather than
 	 * bytes, so the largest frame decides how long they queue. */
 	uint32_t sec_cgr_mtu;
+	/* What the port's counters report while CDX holds it (devman.c), under
+	 * dpa_devlist_lock. Transmit is what its MAC sent: the netdev's own
+	 * counts at the first reading, then the MAC's advance since, which
+	 * offloaded frames an egress group refused never join. Receive adds
+	 * what the port took in and FMan then dropped: frames its enqueues lost
+	 * to a congestion group, as drops, and frames it found no buffer for,
+	 * as missed -- each a 32-bit BMI count carried past its wrap. */
+	struct {
+		bool ready;
+		u64 base_packets, base_bytes;
+		u64 mac_frames, mac_octets;
+		u64 frames, octets;
+	} tx_wire;
+	struct port_bmi_count rx_discarded, rx_no_buffer;
 	uint32_t rx_channel_id;		//channel id rx
 	uint32_t tx_channel_id;		//channel id tx
 	uint32_t tx_wq;			//tx work queue
@@ -207,6 +229,7 @@ struct dpa_iface_info *dpa_get_ifinfo_by_itfid(uint32_t itf_id);
 struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev);
 bool dpa_netdev_is_physical(const struct net_device *dev);
 void dpa_fwd_cgr_follow_link(struct net_device *dev);
+void dpa_port_counters_sample(void);
 bool dpa_netdev_is_dpaa(const struct net_device *dev);
 extern spinlock_t dpa_devlist_lock;
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid);

@@ -30,6 +30,7 @@
 #include <linux/ethtool.h>
 #include "fm_vsp_ext.h"
 #include "fm_port_ext.h"
+#include "fsl_fman_memac.h"
 #include "lnxwrp_fm.h"
 #include <linux/fsl_oh_port.h>
 #include "dpaa_eth.h"
@@ -85,7 +86,9 @@
  *        ioctl publishes fresh nodes under dpa_cfg_lock only — but
  *        fresh-node publication can't invalidate a reader. The
  *        spinlock covers readers outside the mutex
- *        (virt_iface_stats_callback via dev_get_stats) and any
+ *        (virt_iface_stats_callback via dev_get_stats, and
+ *        dpa_port_counters_sample from the statistics sampler, which
+ *        both advance a port's tx_wire and BMI drop counts) and any
  *        reader that wants local invariants. Lock-free lookups
  *        under the mutex lean on the remove-side invariant; see
  *        dpa_get_iface_stats_entries. The lock-free walkers that
@@ -109,12 +112,14 @@
  *   get_eth_iface_info         - process, ioctl.
  *   fwd_queue_us_set           - process, the module parameter's sysfs write.
  *   dpa_fwd_cgr_follow_link    - process, netdev notifier under RTNL.
+ *   dpa_port_counters_sample   - process, the statistics sampler's work item.
  */
 DEFINE_SPINLOCK(dpa_devlist_lock);
 struct dpa_iface_info *dpa_interface_info;
 
 static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 		uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t *portid, uint32_t hash);
+static void port_counters_prime(struct eth_iface_info *eth);
 
 extern struct net init_net;
 extern int fm_port_get_hwid(const struct fm_port *port);
@@ -1666,6 +1671,7 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	dpa_update_eth_if(priv);
 	iface_info->if_flags |= IF_STATS_ENABLED;
 #endif
+	port_counters_prime(&iface_info->eth_info);
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
@@ -2272,6 +2278,160 @@ struct dpa_priv_s *dpa_first_eth_priv(void)
 }
 
 
+/* A 64-bit mEMAC statistics counter, read upper half, lower, upper again, so
+ * that a carry into the upper half between the two reads -- the octet
+ * count's lower half wraps every few seconds at 10G -- cannot tear it. */
+static u64 memac_counter(u32 __iomem *low, u32 __iomem *high)
+{
+	u32 upper, lower;
+
+	do {
+		upper = ioread32be(high);
+		lower = ioread32be(low);
+	} while (upper != ioread32be(high));
+	return (u64)upper << 32 | lower;
+}
+
+/* The octets of a PAUSE frame on the wire, FCS included: a minimum frame. */
+#define MEMAC_PAUSE_OCTETS	(ETH_ZLEN + ETH_FCS_LEN)
+
+/* What the port's MAC has transmitted: every good frame that left by it,
+ * whoever queued it, and their octets with the FCS. The MAC counts the PAUSE
+ * frames it sends itself among them -- transmit pause is on by default -- and
+ * those are no frame anybody sent, so they come out. Every MAC of the FMan v3
+ * CDX drives is an mEMAC. False for a port that has no MAC to read. Registers
+ * only; any context. */
+static bool port_mac_tx(const struct eth_iface_info *eth, u64 *frames, u64 *octets)
+{
+	struct mac_device *mac;
+	struct memac_regs __iomem *regs;
+	u64 pause;
+
+	if (!dpa_netdev_is_dpaa(eth->net_dev))
+		return false;
+	mac = ((struct dpa_priv_s *)netdev_priv(eth->net_dev))->mac_dev;
+	regs = mac ? (struct memac_regs __iomem *)mac->vaddr : NULL;
+	if (!regs)
+		return false;
+	pause = memac_counter(&regs->txpf_l, &regs->txpf_u);
+	*frames = memac_counter(&regs->tfrm_l, &regs->tfrm_u) - pause;
+	*octets = memac_counter(&regs->toct_l, &regs->toct_u) - pause * MEMAC_PAUSE_OCTETS;
+	return true;
+}
+
+/* A count's advance since it was last read. Nothing clears these at run time;
+ * a count that went back anyway adds nothing, and is counted on from there. */
+static u64 port_advance(u64 now, u64 *last)
+{
+	u64 advance = now > *last ? now - *last : 0;
+
+	*last = now;
+	return advance;
+}
+
+/* A port's transmit counters as what its MAC sent (A338). An offloaded frame
+ * the classifier enqueues was counted where it was enqueued, before QMan
+ * decided; one an egress congestion group then refused never left, and a
+ * paused or congested port read as sending what it dropped. The MAC counts
+ * only what left -- the kernel's own frames, offloaded unicast and multicast
+ * alike -- so the netdev's counts at the first reading carry on by the MAC's
+ * advance. Octets come with the FCS, which a netdev's bytes leave out. */
+static bool port_tx_from_wire(struct eth_iface_info *eth,
+			      struct rtnl_link_stats64 *storage)
+{
+	u64 frames, octets;
+
+	if (!eth->tx_wire.ready || !port_mac_tx(eth, &frames, &octets))
+		return false;
+	eth->tx_wire.frames += port_advance(frames, &eth->tx_wire.mac_frames);
+	eth->tx_wire.octets += port_advance(octets, &eth->tx_wire.mac_octets);
+	storage->tx_packets = eth->tx_wire.base_packets + eth->tx_wire.frames;
+	storage->tx_bytes = eth->tx_wire.base_bytes + eth->tx_wire.octets -
+			    ETH_FCS_LEN * eth->tx_wire.frames;
+	return true;
+}
+
+/* One of the receive port's BMI counts. FMan drops a frame the port took in
+ * with nothing told when an enqueue of it is refused -- a congestion group
+ * full, the discard queue's tail drop -- which the port counts as a discard,
+ * and when the buffer pool has nothing to take it in, which it counts apart:
+ * the pool every DPAA port shares, which frames queued for a stalled port can
+ * hold. */
+static bool port_bmi_read(const struct eth_iface_info *eth, e_FmPortCounters counter,
+			  u32 *count)
+{
+	struct mac_device *mac;
+	t_LnxWrpFmPortDev *port;
+
+	if (!dpa_netdev_is_dpaa(eth->net_dev))
+		return false;
+	mac = ((struct dpa_priv_s *)netdev_priv(eth->net_dev))->mac_dev;
+	port = mac ? (t_LnxWrpFmPortDev *)mac->port_dev[RX] : NULL;
+	if (!port || !port->h_Dev)
+		return false;
+	*count = FM_PORT_GetCounter(port->h_Dev, counter);
+	return true;
+}
+
+/* Carry a 32-bit count past its wrap into the port's total since CDX took
+ * it; the first reading only sets where that total starts. */
+static void port_bmi_advance(const struct eth_iface_info *eth, e_FmPortCounters counter,
+			     struct port_bmi_count *count)
+{
+	u32 now;
+
+	if (!port_bmi_read(eth, counter, &now))
+		return;
+	if (count->ready)
+		count->total += (u32)(now - count->last);
+	count->last = now;
+	count->ready = true;
+}
+
+static void port_rx_drops_advance(struct eth_iface_info *eth)
+{
+	port_bmi_advance(eth, e_FM_PORT_COUNTERS_DISCARD_FRAME, &eth->rx_discarded);
+	port_bmi_advance(eth, e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD,
+			 &eth->rx_no_buffer);
+}
+
+/* Where the port's counts stand as CDX takes it, before anything can be
+ * offloaded through it: the driver's own transmit counts and the MAC's, which
+ * transmit carries on from, and the BMI's drops, which receive adds from.
+ * Read here rather than at the first dev_get_stats(), which nothing promises
+ * comes before the first offloaded frame. The port is not yet on the list. */
+static void port_counters_prime(struct eth_iface_info *eth)
+{
+	const struct net_device_ops *ops = eth->net_dev->netdev_ops;
+	struct rtnl_link_stats64 own = { 0 };
+	u64 frames, octets;
+
+	if (ops->ndo_get_stats64 && port_mac_tx(eth, &frames, &octets)) {
+		ops->ndo_get_stats64(eth->net_dev, &own);
+		eth->tx_wire.base_packets = own.tx_packets;
+		eth->tx_wire.base_bytes = own.tx_bytes;
+		eth->tx_wire.mac_frames = frames;
+		eth->tx_wire.mac_octets = octets;
+		eth->tx_wire.ready = true;
+	}
+	port_rx_drops_advance(eth);
+}
+
+/* Read every registered port's wrapping counts often enough that none comes
+ * round twice between two reads: at 10G, minimum-size frames take a 32-bit
+ * one round in under five minutes. Process context, from the statistics
+ * sampler; takes dpa_devlist_lock. */
+void dpa_port_counters_sample(void)
+{
+	struct dpa_iface_info *info;
+
+	spin_lock(&dpa_devlist_lock);
+	for (info = dpa_interface_info; info; info = info->next)
+		if (fwd_cgr_owner(info))
+			port_rx_drops_advance(&info->eth_info);
+	spin_unlock(&dpa_devlist_lock);
+}
+
 static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_stats64 *storage)
 {
 	struct dpa_iface_info *iface_info;
@@ -2303,11 +2463,20 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 			 * ingress and the enqueue counted on egress, both as
 			 * whole frames. The driver's own rx_bytes excludes the
 			 * Ethernet header, so the record is restated to match
-			 * before the two are added; transmit already agrees. */
+			 * before the two are added. Transmit comes from the MAC
+			 * instead, where it has one, and the enqueue's count is
+			 * then left out: it includes what never left. */
+			bool wire = port_tx_from_wire(&iface_info->eth_info, storage);
+
 			cdx_ifstats_read(iface_info->stats, &rx, &tx);
 			cdx_ifstats_fold(storage, rx.bytes, rx.packets,
-					 tx.bytes, tx.packets,
+					 wire ? 0 : tx.bytes, wire ? 0 : tx.packets,
 					 CDX_IFSTATS_PORT_RX_OVERHEAD, 0);
+			/* Received, then dropped by FMan: refused at the
+			 * enqueue, or with no buffer to take it in (A339). */
+			port_rx_drops_advance(&iface_info->eth_info);
+			storage->rx_dropped += iface_info->eth_info.rx_discarded.total;
+			storage->rx_missed_errors += iface_info->eth_info.rx_no_buffer.total;
 			break;
 		}
 		printk("%s::unknown iface type,no stats available\n",

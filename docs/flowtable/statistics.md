@@ -28,7 +28,9 @@ count into them.
 - `UPDATE_ETH_RX_STATS` counts every frame the flow receives into the ingress
   **port's** record, and the enqueue at the end of the list counts every frame
   the flow transmits into the egress port's. These records have always existed:
-  a physical port gets one when CDX registers it, in either ownership mode.
+  a physical port gets one when CDX registers it, in either ownership mode. A
+  port's own transmit counters no longer come from the enqueue's count but from
+  its MAC (below), since the enqueue counts frames QMan may then refuse.
 - `STRIP_ALL_VLAN_HDRS` and `INSERT_VLAN_HDR` take one pointer per tag. This is
   where a **VLAN device's** counters come from, and where the legacy owner
   needed a registered VLAN interface to allocate against. The flowtable owner
@@ -164,9 +166,10 @@ That decides four things.
 - **A port's receive counter subtracts the Ethernet header.** The SDK driver
   counts `skb->len` after `eth_type_trans()` has pulled it, so the driver's
   software frames and the firmware's hardware frames only add up once the
-  record is restated by 14 bytes per packet. Transmit needs nothing: the driver
-  counts the whole frame it was handed and so does the firmware. This applies
-  to the legacy owner too, whose port fold was raw before.
+  record is restated by 14 bytes per packet. This applies to the legacy owner
+  too, whose port fold was raw before. Transmit comes from the MAC, whose octets
+  carry the FCS, so it is restated by 4 bytes per frame to the whole frame the
+  driver counts.
 - **A VLAN device's receive counter subtracts the Ethernet header, and its
   transmit counter the tag, at every depth.** An 802.1Q device counts a
   received frame after the port pulled the header and its own tag came off,
@@ -222,6 +225,45 @@ one native surface that separates what the CPU saw from what the hardware
 forwarded, and the difference between it and `ip -s link` is the offloaded
 traffic. The rig test uses exactly that to prove a burst went through
 hardware.
+
+## What a port sent and what it dropped
+
+The enqueue counts a frame into the egress port's record before QMan decides
+whether to take it. A port that stops sending -- its link partner pauses it,
+as a congested switch or host does -- fills its queue, and QMan refuses the
+rest, which FMan then drops with nothing told. So a paused 10G LAN port read
+1,944,448 transmitted frames in `ip -s link` while its MAC put 12,489 on the
+wire, and the port the frames had come in by counted none of the rest anywhere
+the standard tools look (A338, A339).
+
+A registered port's transmit counters therefore come from its MAC
+(`port_tx_from_wire()` in `cdx/devman.c`): the driver's own counts as CDX
+takes the port, read at registration so nothing offloaded before the first
+reading is lost, carried on by the MAC's advance in good frames and their
+octets less the FCS. The MAC counts every frame that left, whoever queued it
+-- the kernel's, offloaded unicast and multicast, ESP after SEC, a hardware
+qdisc's -- and none that did not. It counts the PAUSE frames it sends itself
+among them too, transmit pause being on, and those come out again, 64 octets
+each. Its 64-bit counters are read upper half, lower, upper again, since the
+octets' lower half wraps every few seconds at 10G. The enqueue's count is
+still kept, and still read where there is no MAC.
+
+Receive adds what the port took in and FMan then dropped
+(`port_rx_drops_advance()`), from two of its BMI's counts. An enqueue a
+congestion group refused counts as a BMI discard and goes to `rx_dropped`; so
+does a frame an entry sends to the parked discard queue on purpose, and one
+the port's discard mask throws away. A frame the port found no buffer for --
+the buffer pool every DPAA port shares, which a stalled port's queue can hold
+(A341) -- is a BMI out-of-buffers discard and goes to `rx_missed_errors`, the
+counter Linux keeps for exactly that. Both are 32 bits, so the statistics
+sampler reads them every 30 s besides every `dev_get_stats()`; at 10G
+minimum-size frames take one round in under five minutes.
+
+Measured with the LAN VM pausing the LAN port by 802.3x PAUSE frames while the
+WAN host sends down an offloaded flow
+(`flowtable_stalled_port_counters.py`): full-size frames, 1,715 left of
+1,887,552, and `ip -s link` reads 1,715 transmitted and 1,885,837 dropped on
+WAN; 64-byte frames, 12,615 left of 1,940,864, with 1,928,256 missed.
 
 ## Proof
 
@@ -289,9 +331,9 @@ form the flow rows use.
   because the record is the VLAN device's.
 - **Frames handed to SEC are not counted by the enqueue.** The encoder emits no
   transmit pointer for a to-SEC enqueue (`stats_ptr = 0`), so an encrypted
-  direction's egress port bytes are not accounted by the flow's own action
-  list. Not measured here; the IPsec path's post-SEC enqueue is where that
-  count would have to come from.
+  direction's egress bytes are not in the flow's own records. The egress
+  port's transmit counters have them all the same, since they come from its
+  MAC; a VLAN device above it does not.
 - **Legacy attribution in QinQ.** The registered-interface path writes the
   insert's record list outermost-first, which, given the measured pairing,
   credits the outer interface with the frame before its own tag went on. It is
