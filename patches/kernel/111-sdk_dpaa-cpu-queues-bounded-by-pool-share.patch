@@ -1,0 +1,108 @@
+From 3e429a72a12c66b90f7dc47f8e93c865de29f1b3 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Fri, 9 Oct 2026 16:39:25 +0200
+Subject: [PATCH] sdk_dpaa: bound a port's queues to the CPU by its share of
+ the pool
+
+A frame waiting on a port's queues to the CPU holds a buffer of the pool
+every DPAA port receives into, and only the CPU taking it puts one back.
+The group those queues share counted bytes, up to 256 MB, so a flood the
+CPU could not keep up with held the whole pool, and every port missed
+whatever it received, forwarding in hardware included.
+
+Count frames instead, at a quarter of what the port seeds the pool with,
+and drop the per-frame byte overhead and the Kconfig threshold that only
+meant bytes. Congestion state changes stay off, now explicitly.
+---
+ .../net/ethernet/freescale/sdk_dpaa/Kconfig   |  8 ------
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 25 +++++++++++++------
+ .../freescale/sdk_dpaa/dpaa_eth_common.c      | 10 ++------
+ 3 files changed, 19 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig b/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
+index a14b325f2b4b..147b421c7d68 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
+@@ -146,14 +146,6 @@ config FSL_DPAA_CS_THRESHOLD_10G
+ 	help
+ 	  The size in bytes of the egress Congestion State notification threshold on 10G ports.
+ 
+-config FSL_DPAA_INGRESS_CS_THRESHOLD
+-	hex "Ingress congestion threshold on FMan ports"
+-	depends on FSL_SDK_DPAA_ETH
+-	default "0x10000000"
+-	help
+-	  The size in bytes of the ingress tail-drop threshold on FMan ports.
+-	  Traffic piling up above this value will be rejected by QMan and discarded by FMan.
+-
+ config FSL_DPAA_ETH_DEBUGFS
+ 	bool "DPAA Ethernet debugfs interface"
+ 	depends on DEBUG_FS && FSL_SDK_DPAA_ETH
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+index 0ddd1cbedeca..3f37ad686d1d 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+@@ -1049,10 +1049,19 @@ dpa_priv_bp_probe(struct device *dev)
+ 	return dpa_bp;
+ }
+ 
+-/* Place all ingress FQs (Rx Default, Rx Error, PCD FQs) in a dedicated CGR.
+- * We won't be sending congestion notifications to FMan; for now, we just use
+- * this CGR to generate enqueue rejections to FMan in order to drop the frames
+- * before they reach our ingress queues and eat up memory.
++/* Place all ingress FQs (Rx Default, Rx Error, PCD FQs) in a dedicated CGR,
++ * which refuses FMan's enqueue past its threshold, so FMan drops the frame.
++ *
++ * A frame waiting on these queues for the CPU holds a buffer of the pool
++ * every port receives into, and only the CPU taking it puts one back
++ * (dpaa_eth_refill_bpools()). The group counted bytes, up to 256 MB, so a
++ * flood the CPU could not keep up with -- traffic for the gateway itself, or
++ * for a flow not yet in hardware -- held the whole pool, and every port missed
++ * whatever it received, forwarding in hardware included. So it counts frames,
++ * at a quarter of what this port seeds the pool with: however many ports'
++ * queues to the CPU are full, those of every port together leave three
++ * quarters of the pool to receive into. Nothing consumes congestion state
++ * changes, so none are raised.
+  */
+ static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
+ {
+@@ -1066,11 +1075,11 @@ static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
+ 		goto out_error;
+ 	}
+ 
+-	/* Enable CS TD, but disable Congestion State Change Notifications. */
+ 	memset(&initcgr, 0, sizeof(initcgr));
+-	initcgr.we_mask = QM_CGR_WE_CS_THRES;
+-	initcgr.cgr.cscn_en = QM_CGR_EN;
+-	cs_th = CONFIG_FSL_DPAA_INGRESS_CS_THRESHOLD;
++	initcgr.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSCN_EN;
++	initcgr.cgr.mode = QMAN_CGR_MODE_FRAME;
++	initcgr.cgr.cscn_en = 0;
++	cs_th = max_t(u32, priv->dpa_bp->config_count * num_possible_cpus() / 4, 1);
+ 	qm_cgr_cs_thres_set64(&initcgr.cgr.cs_thres, cs_th, 1);
+ 
+ 	initcgr.we_mask |= QM_CGR_WE_CSTD_EN;
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
+index c14191b69d1a..6cffb70dd9f6 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
+@@ -1312,14 +1312,8 @@ int dpa_fq_init(struct dpa_fq *dpa_fq, bool td_enable)
+ 			initfq.we_mask |= QM_INITFQ_WE_CGID;
+ 			initfq.fqd.fq_ctrl |= QM_FQCTRL_CGE;
+ 			initfq.fqd.cgid = (uint8_t)priv->ingress_cgr.cgrid;
+-			/* Set a fixed overhead accounting, just like for the
+-			 * egress CGR.
+-			 */
+-			initfq.we_mask |= QM_INITFQ_WE_OAC;
+-			initfq.fqd.oac_init.oac = QM_OAC_CG;
+-			initfq.fqd.oac_init.oal =
+-				(signed char)(min(sizeof(struct sk_buff) +
+-				priv->tx_headroom, (size_t)FSL_QMAN_MAX_OAL));
++			/* The group counts frames, so no per-frame byte
++			 * overhead is accounted. */
+ 		}
+ 
+ 		/* Initialization common to all ingress queues */
+-- 
+2.47.3
+

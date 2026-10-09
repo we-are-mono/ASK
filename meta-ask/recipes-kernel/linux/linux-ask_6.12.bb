@@ -81,6 +81,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://108-xfrm-validate-xmit-einprogress.patch \
            file://109-sdk_dpaa-rx-max-frame-follows-mtu.patch \
            file://110-sdk-mainline-build-compat.patch \
+           file://111-sdk_dpaa-cpu-queues-bounded-by-pool-share.patch \
            file://120-emc2305-dt-fan-control.patch \
            file://125-usb-typec-hd3ss3220-port-configuration.patch \
            file://130-thermal-linear-governor.patch \

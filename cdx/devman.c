@@ -210,10 +210,12 @@ static u64 fwd_cgr_frames(uint32_t speed, unsigned int mtu, u64 cap)
  * each CPU (dpa_priv_bp_seed()), so that however many ports stall, their
  * forwarding queues leave half the pool to receive into; SEC's input queues
  * take one such share more (IPSEC_TO_SEC_FRAMES, the same count from the
- * Kconfig the driver seeds with). A frame takes one buffer: they are sized for
- * the largest frame FMan accepts, or the MTU for what one holds. With four
- * CPUs that is 1,280 frames: at 10 Gbit/s and a standard MTU, 1.6 ms of the
- * largest frames rather than fwd_queue_us's 2. */
+ * Kconfig the driver seeds with), and each port's queues to the CPU a quarter
+ * of its seed (the driver's ingress group): with all of them full at once,
+ * five ports leave 15% of the pool to receive into. A frame takes one buffer:
+ * they are sized for the largest frame FMan accepts, or the MTU for what one
+ * holds. With four CPUs that is 1,280 frames: at 10 Gbit/s and a standard
+ * MTU, 1.6 ms of the largest frames rather than fwd_queue_us's 2. */
 static u64 fwd_pool_frames(const struct eth_iface_info *eth_info)
 {
 	return max_t(u64, (u64)eth_info->pool_info[0].count *
@@ -627,6 +629,8 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 					if (!eth_info->rx_pcd_wq) {
 						eth_info->rx_pcd_wq = dpa_fq->wq;
 						eth_info->dqrr = dpa_fq->fq_base.cb.dqrr;
+						eth_info->rx_cgr = priv->use_ingress_cgr ?
+							&priv->ingress_cgr : NULL;
 					}
 					break;
 				default:
@@ -2073,8 +2077,10 @@ void cdx_destroy_fq_list(struct dpa_fq **head)
 }
 
 
-//create pcd
-int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry)
+/* Create a queue to the CPU, joining the congestion group cgr when there is
+ * one. */
+int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry,
+		  const struct qman_cgr *cgr)
 {
 	struct qman_fq *fq;
 	struct qm_mcc_initfq opts;
@@ -2100,6 +2106,11 @@ int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry)
 		(QM_STASHING_EXCL_DATA | QM_STASHING_EXCL_ANNOTATION);
 	opts.fqd.context_a.stashing.data_cl = NUM_PKT_DATA_LINES_IN_CACHE;
 	opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
+	if (cgr) {
+		opts.we_mask |= QM_INITFQ_WE_CGID;
+		opts.fqd.fq_ctrl |= QM_FQCTRL_CGE;
+		opts.fqd.cgid = (u8)cgr->cgrid;
+	}
 	if (qman_init_fq(fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
 		DPA_ERROR("%s::qman_init_fq failed for fqid %d\n",
 				__func__, dpa_fq->fqid);
@@ -2192,8 +2203,13 @@ static int cdxdrv_create_pcd_fqs(struct dpa_iface_info *iface_info)
 				dpa_fq->wq = eth_iface_info->rx_pcd_wq;
 				//use same callback used by ethernet driver 
 				dpa_fq->fq_base.cb.dqrr = eth_iface_info->dqrr;
-				//create PCD FQ
-				if (cdx_create_fq(dpa_fq, 0, iface_info->pcd_proc_entry)) {
+				/* Every classifier miss on the port ends on
+				 * one of these, for the CPU: in the driver's
+				 * group for its own such queues, so a flood
+				 * the CPU cannot keep up with holds no more
+				 * of the pool than that allows (A347). */
+				if (cdx_create_fq(dpa_fq, 0, iface_info->pcd_proc_entry,
+						  eth_iface_info->rx_cgr)) {
 					DPA_ERROR("%s::cdx_create_fq failed for fqid %d\n",
 							__func__, fqid);
 					kfree(dpa_fq);

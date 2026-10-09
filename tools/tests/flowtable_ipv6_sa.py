@@ -33,15 +33,13 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import re
 import socket
 
 
 from _topology import LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6, lan_run_python
 from _flowtable_ipv6 import (PayloadEcho, _drive, _drop_tables, _hardware_delta, _offload_table, _udp_exchange)
 from _flowtable_ipv6_sa import STALL_DPORT, STALL_SPORT
-from _flowtable_rig import command, console_python
-from ask_orch.uart import Console
+from _flowtable_rig import command, pool_lowest, port_drops
 from _flowtable_service_ipsec import (offline_port_discards, offline_port_rejections)
 from _flowtable_service_ipsec_replay import (xfrm_mib)
 
@@ -301,35 +299,6 @@ async def test_exception_backlog_leaves_sec_its_buffers(ipv6_rig):
             await command(agent, r.session, *argv, check=False)
 
 
-PORT_DROPS = f'''
-import json
-print(json.dumps({{dev: {{n: int(open(f"/sys/class/net/{{dev}}/statistics/{{n}}").read())
-                        for n in ("rx_dropped", "rx_missed_errors")}}
-                  for dev in ({TARGET_LAN_IF!r}, {TARGET_WAN_IF!r})}}))
-'''
-
-# The lowest free count of a BMan pool over a stretch, read from BMan's
-# big-endian content registers -- with no pool named, of the pool every DPAA
-# port receives into, which idle is the largest there is, many times SEC's own.
-POOL_LOWEST = '''
-import ctypes, mmap, os, time
-fd = os.open('/dev/mem', os.O_RDWR | os.O_SYNC)
-regs = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0x1890000)
-words = [ctypes.c_uint32.from_buffer(regs, 0x600 + 4 * bpid) for bpid in range(64)]
-def free(word):
-    return int.from_bytes(word.value.to_bytes(4, 'little'), 'big') & 0x7fffff
-counts = [free(word) for word in words]
-bpid = {bpid}
-if bpid < 0:
-    bpid = counts.index(max(counts))
-lowest, end = counts[bpid], time.monotonic() + {seconds}
-while time.monotonic() < end:
-    lowest = min(lowest, free(words[bpid]))
-print('pool', bpid, lowest)
-del words
-regs.close()
-'''
-
 # Datagrams as large as the tunnel carries whole, from the LAN VM on one
 # tuple, from several processes at once, as fast as each goes: line rate,
 # several times what SEC encrypts.
@@ -351,11 +320,6 @@ def blast(seconds):
 with multiprocessing.Pool(4) as pool:
     print('sent', sum(pool.map(blast, [{seconds}] * 4)))
 '''
-
-
-async def _port_drops():
-    result = await console_python(Console.target(), PORT_DROPS, timeout=30)
-    return json.loads(result["stdout"].strip().splitlines()[-1])
 
 
 async def test_sec_slower_than_its_input_leaves_the_pool(ipv6_rig):
@@ -382,24 +346,21 @@ async def test_sec_slower_than_its_input_leaves_the_pool(ipv6_rig):
         await _drive(r, send, lambda s: s["entries"] == 2,
                      "both directions of the flow should be in hardware")
         transport.close()
-        start, before = await r.state(), await _port_drops()
-        idle = await console_python(Console.target(), POOL_LOWEST.format(bpid=-1, seconds=0),
-                                    timeout=60)
-        bpid, idle = (int(v) for v in re.search(r"pool (\d+) (\d+)", idle["stdout"]).groups())
-        pool, flood = await asyncio.gather(
-            console_python(Console.target(), POOL_LOWEST.format(bpid=bpid, seconds=6), timeout=60),
+        start, before = await r.state(), await port_drops()
+        bpid, idle = await pool_lowest(0)
+        (_, lowest), flood = await asyncio.gather(
+            pool_lowest(6, bpid),
             lan_run_python(r.lan, FLOOD.format(lan=LAN_IPV6, sport=STALL_SPORT, wan=WAN_IPV6,
                                                dport=STALL_DPORT, size=FITS, seconds=4),
                            timeout=60, label="flowtable_v6_sa_flood"))
         await asyncio.sleep(1)
-        end, after = await r.state(), await _port_drops()
+        end, after = await r.state(), await port_drops()
     finally:
         transport.close()
         await _drop_tables(r)
         for agent, argv in reversed(cleanup):
             await command(agent, r.session, *argv, check=False)
     assert flood.rc == 0, flood.stdout
-    lowest = int(re.search(r"pool \d+ (\d+)", pool["stdout"]).group(1))
     hits = {f["cookie"]: int(f["packets"]) for f in end["flows"]}
     record = {"sent": int(flood.stdout.split()[-1]),
               "hits": sum(hits[f["cookie"]] - int(f["packets"]) for f in start["flows"]

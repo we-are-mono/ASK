@@ -335,6 +335,54 @@ async def pings_answered(address, count, delay=0):
     return int(received.group(1))
 
 
+# The lowest free count of a BMan pool over a stretch, read from BMan's
+# big-endian content registers -- with no pool named, of the pool every DPAA
+# port receives into, which idle is the largest there is, many times SEC's own.
+POOL_LOWEST = '''
+import ctypes, mmap, os, time
+fd = os.open('/dev/mem', os.O_RDWR | os.O_SYNC)
+regs = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0x1890000)
+words = [ctypes.c_uint32.from_buffer(regs, 0x600 + 4 * bpid) for bpid in range(64)]
+def free(word):
+    return int.from_bytes(word.value.to_bytes(4, 'little'), 'big') & 0x7fffff
+counts = [free(word) for word in words]
+bpid = {bpid}
+if bpid < 0:
+    bpid = counts.index(max(counts))
+lowest, end = counts[bpid], time.monotonic() + {seconds}
+while time.monotonic() < end:
+    lowest = min(lowest, free(words[bpid]))
+print('pool', bpid, lowest)
+del words
+regs.close()
+'''
+
+
+PORT_DROPS = f'''
+import json
+print(json.dumps({{dev: {{n: int(open(f"/sys/class/net/{{dev}}/statistics/{{n}}").read())
+                        for n in ("rx_dropped", "rx_missed_errors")}}
+                  for dev in ({TARGET_LAN_IF!r}, {TARGET_WAN_IF!r})}}))
+'''
+
+
+async def port_drops():
+    """Each rig port's receive drops and misses, as `ip -s link` reads them."""
+    result = await console_python(Console.target(), PORT_DROPS, timeout=30)
+    return json.loads(result["stdout"].strip().splitlines()[-1])
+
+
+async def pool_lowest(seconds, bpid=-1):
+    """The pool `bpid` names, or with none the Ethernet pool, and the lowest
+    its free count reads over the next `seconds`, as (bpid, lowest). Read over
+    the DUT's console, so the stretch starts a moment after the call."""
+    result = await console_python(Console.target(), POOL_LOWEST.format(bpid=bpid, seconds=seconds),
+                                  timeout=seconds + 60)
+    found = re.search(r"pool (\d+) (\d+)", result["stdout"])
+    assert found, result
+    return int(found.group(1)), int(found.group(2))
+
+
 async def stop_boot_daemon():
     """The offload service is default-on: a normal boot has already installed
     the catch-all policy, so the backend starts bound. Controlled tests own the

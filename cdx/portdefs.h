@@ -112,6 +112,11 @@ struct eth_iface_info {
 	uint32_t tx_wq;			//tx work queue
 	uint32_t rx_pcd_wq;		//wq used by ethernet driver pcd queues
 	qman_cb_dqrr dqrr;
+	/* The driver's congestion group for the port's queues to the CPU
+	 * (dpaa_eth_priv_ingress_cgr_init()), a share of the pool counted in
+	 * frames, which the distribution queues cdx makes for the port join
+	 * as well (A347). NULL where the driver keeps none. */
+	const struct qman_cgr *rx_cgr;
 	uint32_t num_pools;	//pools used by port
 	struct port_bman_pool_info pool_info[MAX_PORT_BMAN_POOLS]; //pool info
 	/* No mac_addr here: a physical port's own address is net_dev's, read
@@ -235,7 +240,8 @@ bool dpa_netdev_is_dpaa(const struct net_device *dev);
 extern spinlock_t dpa_devlist_lock;
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid);
 int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq);
-int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry);
+int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry,
+		  const struct qman_cgr *cgr);
 void dpa_release_iflist(void);
 /* The classifier ports CDX configured, stopped and started again around a
  * repair of the tables they walk; see dpa_cfg.c. RTNL and the control mutex

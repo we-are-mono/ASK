@@ -369,16 +369,8 @@ result independently of those temporary files.
 - [x] **A344 — the queues into SEC had no bound by default.** Every SA's input queue now joins one frame-counted group
   at a share of the Ethernet pool (_:/^cdx: bound SEC's input queues by the buffers they hold_).
 
-- [ ] **A347 — a flood the CPU cannot keep up with can take the Ethernet buffer pool.** Each DPAA port's queues to
-  the CPU -- its default, error and PCD receive FQs -- share a group whose tail drop is
-  `CONFIG_FSL_DPAA_INGRESS_CS_THRESHOLD`, 256 MB in bytes (`dpaa_eth_priv_ingress_cgr_init()`, sdk_dpaa), against the
-  pool of 12,800 buffers every port receives into, and the CPU replaces a buffer only once it has taken the frame
-  (`dpaa_eth_refill_bpools()`). Measured while proving A344: the first second of a 64-byte flood into an IPsec flow not
-  yet offloaded emptied the pool for 0.7 s and the LAN port missed 360,000 frames; the CPU then worked the backlog off
-  at ~3,200 frames/s on the KASAN image. Any burst the CPU cannot keep up with -- a flood to the DUT's own address,
-  traffic the classifier hands up -- starves every port's receive, offloaded forwarding included. NXP's SDK design.
-  Fix direction: bound each port's CPU-bound queues in frames at a share of the pool, as `fwd_pool_frames()` does for
-  the forwarding queues (a patch to sdk_dpaa); check what the CPU path needs for bursts at 10G first.
+- [x] **A347 — a flood the CPU could not keep up with could take the Ethernet buffer pool.** Each port's queues to the
+  CPU, cdx's distribution queues included, now share a frame-counted group at a quarter of its seed (_:/^cdx: bound a port's queues to the CPU_).
 
 - [ ] **A345 — a flow decrypted by one SA and encrypted by another can hold SEC's own pool while it waits for SEC.**
   Such a direction's decrypted frames leave the IPsec offline port for the second SA's input queue (FQ_TO_SEC), each

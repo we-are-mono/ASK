@@ -116,8 +116,10 @@ struct sec_descriptor {
  * own frames included (A344). So every SA's input queue joins one group that
  * drops at the tail past this many frames: the share of that pool one port's
  * forwarding queues may hold (fwd_pool_frames()), half of what a port seeds
- * it with. A frame SEC's own output sends back into SEC holds a buffer of
- * SEC's pool instead, and counts against the same bound. */
+ * it with. With every port's forwarding queues and queues to the CPU full as
+ * well, five ports keep 15% of that pool. A frame SEC's own output sends back
+ * into SEC holds a buffer of SEC's pool instead, and counts against the same
+ * bound. */
 #define IPSEC_TO_SEC_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
 
 struct ipsec_info; 

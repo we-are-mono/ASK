@@ -1502,7 +1502,8 @@ one SA and sent into another waits there as well, holding a buffer of SEC's
 own pool, which the bound is larger than (A345). The same flood now has
 2,547,019 frames refused at the LAN port, none missed on either port, and the
 pool never below 11,269 of 12,564. Before a flow is in hardware its frames go
-to the CPU, whose own queues are bounded only at 256 MB (A347).
+to the CPU, whose queues on each port hold at most a quarter of what the port
+seeds the pool with, in frames (A347).
 
 ### 7. Parity
 

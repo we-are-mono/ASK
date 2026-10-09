@@ -434,8 +434,9 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 			port_info->err_dpa_fq = dpa_fq;
 			fq->cb.dqrr = ofport_rx_err;
 		}
-		//create FQ
-		if (cdx_create_fq(dpa_fq, 0, dpa_oh_iface_info->pcd_proc_entry)) {
+		/* No group: what reaches these is reported and dropped
+		 * (ofport_rx_defa(), ofport_rx_err()), never a stream. */
+		if (cdx_create_fq(dpa_fq, 0, dpa_oh_iface_info->pcd_proc_entry, NULL)) {
 			DPA_ERROR("%s::cdx_create_fq failed for fqid %d\n",
 					__func__, dpa_fq->fqid);
 			port_info->rx_dpa_fq = NULL;
