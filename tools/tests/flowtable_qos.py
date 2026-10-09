@@ -423,8 +423,9 @@ async def test_red_leaf_leaves_the_pool(qos):
     assert leaf["frames"] + leaf["rejected"] > sent // 2 and leaf["rejected"] > sent // 2, record
     # The port it arrived on lost nothing for want of a buffer, kept
     # receiving the kernel's own traffic, and the tree held no more of the
-    # pool than its share: the leaf's 768 frames of it, SEC's half of its own
-    # pool less the two queues beside it, and what is in flight.
+    # pool than its share: the leaf's 768 frames of it, the 1,024 of SEC's own
+    # pool kept for the trees less the two queues beside it, and what is in
+    # flight.
     assert wan["rx_missed_errors"] == 0 and answered == 20, record
     assert idle - lowest <= POOL_SHARE, record
 

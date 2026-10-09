@@ -94,24 +94,27 @@ struct sec_descriptor {
  *     (IPSEC_EXCEPTION_FRAMES), the Wi-Fi VAPs' queues (VWD_FWD_FRAMES) and
  *     each Ethernet port's queues for these frames (IPSEC_EGRESS_FRAMES) --
  *     896 on a board of five ports;
- *   - half the pool for the class queues of hardware qdisc trees, all of them
+ *   - four shares for the SAs' input queues (IPSEC_TO_SEC_FRAMES), where a
+ *     frame one SA decrypted waits for the SA that encrypts it again, among
+ *     frames holding the Ethernet pool's buffers it cannot be told from;
+ *   - eight for the class queues of hardware qdisc trees, all of them
  *     together (IPSEC_QDISC_FRAMES, cdx_htb.c), which carry SEC's frames among
- *     the rest and cannot tell them apart;
- *   - and what is left, 128 on five ports, for SEC's own jobs in flight, of
- *     which it has a few dozen at line rate.
+ *     the rest and cannot tell them apart either;
+ *   - and what is left, 128 on five ports, for SEC's own jobs in flight and
+ *     their output on its way to the offline port, of which it has a few
+ *     dozen at line rate -- twice that where a relayed job's input is a
+ *     buffer of this pool too.
  *
- * So all of them full at once still leave SEC its own -- but for the SAs'
- * input queues (IPSEC_TO_SEC_FRAMES), which a frame decrypted by one SA and
- * sent into another waits on in a buffer of this pool, and whose bound is
- * drawn from the Ethernet pool's (A345). Each buffer is an order-2
- * allocation, 16 KiB with jumbo frames, so the pool takes 32 MiB, 16 MiB more
- * than before the qdisc trees had their half (A337). */
-#define IPSEC_BUFCOUNT  2048
+ * So all of them full at once still leave SEC its own. Each buffer is an
+ * order-2 allocation, 16 KiB with jumbo frames, so the pool takes 40 MiB:
+ * 16 MiB more than before the qdisc trees had their eight shares (A337), and
+ * 8 MiB more for the SAs' input (A345). */
+#define IPSEC_BUFCOUNT  2560
 #define	THRESHOLD_IPSEC_BPOOL_REFILL 16
-/* One fixed share of the pool, in frames. A literal rather than a fraction of
+/* One share of the pool, in frames. A literal rather than a fraction of
  * IPSEC_BUFCOUNT: what a share holds is also how long a frame may wait on its
- * queues, and the pool doubled for the qdisc trees' half without those queues
- * growing any longer. */
+ * queues, and the pool grew for the qdisc trees and the SAs' input without
+ * any queue growing longer. */
 #define IPSEC_SHARE_FRAMES	128
 /* A frame the IPsec offline port sends the CPU, having missed its flow table,
  * waits on an exception queue in a buffer of SEC's output pool. Together the
@@ -131,19 +134,19 @@ struct sec_descriptor {
 #define IPSEC_EGRESS_FRAMES	IPSEC_SHARE_FRAMES
 /* What every hardware qdisc tree's class queues together may hold of the
  * pool, which cdx_htb.c divides between the trees that are live. */
-#define IPSEC_QDISC_FRAMES	(IPSEC_BUFCOUNT / 2)
-/* A frame waiting on an SA's input queue holds a buffer of the pool every
- * DPAA port receives into until SEC has read it, and nothing replaces it
- * meanwhile. Offered faster than SEC encrypts or decrypts, the queues took
- * that whole pool, and every port missed whatever it received, the kernel's
- * own frames included (A344). So every SA's input queue joins one group that
- * drops at the tail past this many frames: the share of that pool one port's
- * forwarding queues may hold (fwd_pool_frames()), half of what a port seeds
- * it with. With every port's forwarding queues and queues to the CPU full as
- * well, five ports keep 15% of that pool. A frame SEC's own output sends back
- * into SEC holds a buffer of SEC's pool instead, and counts against the same
- * bound. */
-#define IPSEC_TO_SEC_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
+#define IPSEC_QDISC_FRAMES	(8 * IPSEC_SHARE_FRAMES)
+/* A frame waiting on an SA's input queue holds a buffer until SEC has read it,
+ * and nothing replaces it meanwhile: one of the pool every DPAA port receives
+ * into, or, decrypted by one SA and sent on into another, one of this pool.
+ * Offered faster than SEC encrypts or decrypts, the queues took the whole
+ * Ethernet pool, and every port missed whatever it received, the kernel's own
+ * frames included (A344); a hub relaying between tunnels could take this one
+ * and starve every SA as A333 did (A345). So every SA's input queue joins one
+ * group that drops at the tail past this many frames, which both pools budget
+ * for: four shares of this one, and less than the share of the Ethernet pool
+ * one port's forwarding queues may hold (fwd_pool_frames()). That is some
+ * 2.5 ms of SEC's work in full-size frames. */
+#define IPSEC_TO_SEC_FRAMES	(4 * IPSEC_SHARE_FRAMES)
 
 struct ipsec_info; 
 void *  dpa_get_ipsec_instance(void);

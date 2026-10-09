@@ -209,10 +209,10 @@ static u64 fwd_cgr_frames(uint32_t speed, unsigned int mtu, u64 cap)
  * receives into: half of what the port itself seeds it with, its count for
  * each CPU (dpa_priv_bp_seed()), so that however many ports stall, their
  * forwarding queues leave half the pool to receive into; SEC's input queues
- * take one such share more (IPSEC_TO_SEC_FRAMES, the same count from the
- * Kconfig the driver seeds with), and each port's queues to the CPU a quarter
- * of its seed (the driver's ingress group): with all of them full at once,
- * five ports leave 15% of the pool to receive into. A frame takes one buffer:
+ * take 512 frames more, all of them together (IPSEC_TO_SEC_FRAMES), and each
+ * port's queues to the CPU a quarter of its seed (the driver's ingress group):
+ * with all of them full at once, five ports leave a fifth of the pool to
+ * receive into. A frame takes one buffer:
  * they are sized for the largest frame FMan accepts, or the MTU for what one
  * holds. With four CPUs that is 1,280 frames: at 10 Gbit/s and a standard
  * MTU, 1.6 ms of the largest frames rather than fwd_queue_us's 2. */

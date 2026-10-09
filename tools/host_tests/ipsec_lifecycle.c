@@ -223,8 +223,6 @@ static bool refcount_dec_and_test(refcount_t *r) { assert(*r); return !--*r; }
 #include "ipsec_types.inc"
 static bool dpa_ipsec_ready;
 static unsigned qm_channel_caam;
-#define CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT 640
-static unsigned num_possible_cpus(void) { return 4; }
 static struct device device;
 static struct dpa_bp parent = { .dev = &device };
 static struct dpa_bp *dpa_bp_array[64];
@@ -690,10 +688,12 @@ static unsigned normal(void)
     assert(cdx_dpa_ipsec_ready() && registrations == 1 && queues == 12);
     assert(ipsecinfo.ipsec_bp->pool->count == IPSEC_BUFCOUNT);
     assert(ipsec_bpid == ipsecinfo.ipsec_bp->bpid);
-    /* Both groups count frames: the exception queues an eighth of SEC's pool,
-     * the SA input queues half of what a port seeds the Ethernet pool with. */
+    /* Both groups count frames: the exception queues one share of SEC's
+     * pool, the SA input queues four, which is also less than what a port's
+     * forwarding queues may hold of the Ethernet pool. */
     assert(exception_group.configured && exception_group.frames == IPSEC_EXCEPTION_FRAMES);
-    assert(to_sec_group.configured && to_sec_group.frames == 4 * 640 / 2);
+    assert(to_sec_group.configured && to_sec_group.frames == 4 * 128 &&
+           to_sec_group.frames < 4 * 640 / 2);
     assert(mappings == IPSEC_BUFCOUNT + CDX_MAX_SG_BUFF_COUNT);
     assert(sg_bpool_g->pool->count == CDX_MAX_SG_BUFF_COUNT);
     assert(!skb_2bfreed_bpool_g->pool->count);

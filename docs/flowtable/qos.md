@@ -1064,9 +1064,9 @@ port.
 
 **The tree is capped.** A tree's class queues together hold no more than the
 port's share of the Ethernet pool — half of what the port seeds it with, 1,280
-frames with four CPUs, the share its forwarding queues and SEC's input queues
-are held to — and all live trees together no more than half of SEC's output
-pool, 1,024 of its 2,048 buffers, divided evenly between them: a class queue
+frames with four CPUs, the share its forwarding queues are held to — and all
+live trees together no more than 1,024 of SEC's 2,560 output buffers, divided
+evenly between them: a class queue
 carries SEC's frames among the rest and cannot tell them apart. With one tree
 the SEC share binds, 1,024 frames; with two, 512 each. The queues counted are
 each leaf's and the top channel's queues 0 and 7 that unclassified and control
@@ -2607,7 +2607,7 @@ driver. Every number here is the hardware's or the driver's, not a policy:
 | Leaf classes | 16 per port | per port | `CDX_CEETM_MAX_QUEUES_PER_CHANNEL`, `:59` |
 | Weighted leaves | 8 per channel | until WBFS group B is claimed | `qman_ceetm_cq_claim_A` |
 | Strict priorities | 8 | per channel | CEETM |
-| Tail-drop depth | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, half of SEC's pool (1,024 of 2,048) shared evenly | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair; the hardware default is 8, far too shallow |
+| Tail-drop depth | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, 1,024 of SEC's 2,560 buffers shared evenly | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair; the hardware default is 8, far too shallow |
 | Ingress policer profiles | 8, of which **7** are addressable | per port | profile 0 is the default for everything unclassified; `CDX_FT_QOS_MAX_POLICER` |
 | DSCP→class egress map | **1 port at a time** | SoC-wide | "Now supporting only one interface", and the second port is refused |
 | Flowtable bindings | `MAX_PHY_PORTS` per table, 2 tables | one per cdx-backed port per table; the second table is a replacement or a probe | `CDX_FT_MAX_TABLE_DEVICES`, `CDX_FT_MAX_TABLES`; was 2 until A152 |

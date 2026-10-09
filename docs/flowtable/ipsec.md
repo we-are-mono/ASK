@@ -1363,10 +1363,11 @@ and at line rate it is also a log flood.
 
 #### Frames the offline port gives the CPU must not take SEC's pool
 
-SEC writes every job's output into one buffer of its own BMan pool, 2048
-buffers (`IPSEC_BUFCOUNT`; 512 until A335, 1024 until A337) shared by every SA
-in both directions. A frame the offline port forwards in hardware returns its buffer
-when the egress port has sent it, within microseconds; under 2.5 Gbit/s of
+SEC writes every job's output into one buffer of its own BMan pool, 2560
+buffers (`IPSEC_BUFCOUNT`; 512 until A335, 1024 until A337, 2048 until
+A345) shared by every SA in both directions. A frame the offline port
+forwards in hardware returns its buffer when the egress port has sent it,
+within microseconds; under 2.5 Gbit/s of
 offloaded traffic SEC has fewer than twenty of them out at once. A frame that
 misses the offline port's flow table goes to the
 CPU on the SA's exception queue (TO_CP) instead, still in that buffer. Misses
@@ -1435,7 +1436,7 @@ short the frame. Those queues' group then bounded bytes, two milliseconds at
 the link's speed (A313): 2.5 MB at 10 Gbit/s, some 17,000 frames of a small
 datagram stream, where the pool had 512. It counts frames now (A341), but its
 share of the Ethernet pool, 1,280 at 10 Gbit/s, is still more than SEC's
-whole pool. A port that stops sending -- its link
+pool can give any one port. A port that stops sending -- its link
 partner sends 802.3x pause, as a congested switch or host does -- or one slower
 than the tunnel held every buffer, and SEC refused every SA's jobs, both
 directions, until it sent again (A335; NXP's queues had no bound at all). With
@@ -1464,13 +1465,14 @@ refuses, and the offline port counts it in `ipsec_offline_port_rejected`. With
 the port paused, the same stream now loses 1,031,091 frames there, at the
 port's share; SEC refuses none, and the pool never reads below 880.
 
-The pool grew to 1024 for this, and to 2048 for the hardware qdisc trees
-below (A337). The exception queues, the Wi-Fi VAP queues and every Ethernet
-port each have a fixed share of 128 frames (`IPSEC_SHARE_FRAMES`), 896 on a
-five-port board; half the pool, 1,024 frames, is the qdisc trees'; and what is
-left, 128, is SEC's own with every queue full at once. Each buffer is an
-order-2 allocation, 16 KiB with jumbo frames, so the pool takes 32 MiB, 16 MiB
-more than at 1024. Each port's bound sits far below the 1.6 ms its forwarding
+The pool grew to 1024 for this, to 2048 for the hardware qdisc trees below
+(A337), and to 2560 for the SAs' input queues (A345, under "Nor its own
+input"). The exception queues, the Wi-Fi VAP queues and every Ethernet port
+each have a fixed share of 128 frames (`IPSEC_SHARE_FRAMES`), 896 on a
+five-port board; the SAs' input queues have four shares, 512; the qdisc trees
+eight, 1,024; and what is left, 128, is SEC's own with every queue full at
+once. Each buffer is an order-2 allocation, 16 KiB with jumbo frames, so the
+pool takes 40 MiB. Each port's bound sits far below the 1.6 ms its forwarding
 queues allow at 10 Gbit/s (128 full-size frames is 157 µs), the cost of a pool
 that has to cover every port; it matters only where a fast port is congested
 by other traffic. `flowtable_ipsec_stalled_port.py` is the paused-port case.
@@ -1479,9 +1481,10 @@ On a port a hardware qdisc owns, the offline port's frames take their class
 queue like any other frame. Those counted bytes once a RED qdisc was on them,
 and a tree of sixteen leaves held 2,048 frames even without one, more than the
 port's share. Every class queue counts frames now, and a tree's class queues
-together hold no more than the trees' half of this pool divided evenly between
-the live trees -- 1,024 frames with one tree, 512 each with two -- because a
-class queue cannot tell SEC's frames from the rest (qos.md, increment 6).
+together hold no more than the trees' eight shares of this pool divided evenly
+between the live trees -- 1,024 frames with one tree, 512 each with two --
+because a class queue cannot tell SEC's frames from the rest (qos.md,
+increment 6).
 
 #### Nor its own input
 
@@ -1497,20 +1500,26 @@ the WAN port missed what little it received, and nothing was refused (A344,
 `flowtable_ipv6_sa.py::test_sec_slower_than_its_input_leaves_the_pool`).
 
 Every SA's input queue now joins one group that counts frames and drops at the
-tail (`to_sec_cgr`, `ipsec_frame_cgr_init()`), at `IPSEC_TO_SEC_FRAMES`: the
-share of the Ethernet pool one port's forwarding queues may hold, half of what
-a port seeds it with, 1,280 with four CPUs. The parameter is gone. A port's
-enqueue the group refuses is dropped by FMan and counted as a receive drop of
+tail (`to_sec_cgr`, `ipsec_frame_cgr_init()`), at `IPSEC_TO_SEC_FRAMES`, 512:
+four shares of SEC's pool, and less than the 1,280 of the Ethernet pool one
+port's forwarding queues may hold -- some 2.5 ms of SEC's work in full-size
+frames. Both pools budget for it, because a flow decrypted by one SA and sent
+into another waits there too, holding a buffer of SEC's own pool; sized from
+the Ethernet pool alone, at 1,280, a hub relaying between tunnels could have
+taken SEC's pool and starved every SA as in A333 (A345). The parameter is
+gone. A port's enqueue the group refuses is dropped by FMan and counted as a
+receive drop of
 that port (statistics.md); a frame Linux hands a packet-offloaded SA's SEC
 itself, outbound or inbound, comes back as a refused enqueue, is given back,
 and counts in `ipsec_sec_input_refused` in `/proc/cdx_flowtable` without the
 warning a wedged queue still gets -- having already been counted by the driver
 as given to SEC. One group for all SAs, as for a port's flows: an SA
-holding it at the bound has the others' frames refused too. A flow decrypted by
-one SA and sent into another waits there as well, holding a buffer of SEC's
-own pool, which the bound is larger than (A345). The same flood now has
-2,547,019 frames refused at the LAN port, none missed on either port, and the
-pool never below 11,269 of 12,564. Before a flow is in hardware its frames go
+holding it at the bound has the others' frames refused too. The same flood now
+has 2,548,619 frames refused at the LAN port, none missed on either port, and
+the pool never more than 528 below idle (11,951 of 12,479; 11,269 of 12,564
+at 1,280). Four TCP streams through one SA move as much as at 1,280: 2.46
+Gbit/s with AES-GCM, 2.34-2.44 with AES-CBC and HMAC-SHA256. Before a flow is
+in hardware its frames go
 to the CPU, whose queues on each port hold at most a quarter of what the port
 seeds the pool with, in frames (A347).
 

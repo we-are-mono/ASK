@@ -225,8 +225,8 @@ static u64 div_u64(u64 a, u32 b) { return a / b; }
 #define CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT	640
 static unsigned int num_possible_cpus(void) { return 4; }
 #define DEFAULT_CQ_DEPTH	8
-/* SEC's pool and its half for qdisc trees, and how narrow a WRED band the
- * hardware layer draws, as cdx defines them (htb_pools.inc). */
+/* SEC's pool and the eight shares of it kept for qdisc trees, and how narrow
+ * a WRED band the hardware layer draws, as cdx defines them (htb_pools.inc). */
 #include "htb_pools.inc"
 static u32 ntohl(u32 v) { return __builtin_bswap32(v); }
 static bool ipv4_is_multicast(u32 addr) { return (ntohl(addr) & 0xf0000000) == 0xe0000000; }
@@ -720,11 +720,11 @@ static const struct cdx_ft_egress_ops __rcu *cdx_ft_egress_ops;
 static DEFINE_MUTEX(cdx_ft_egress_lock);
 
 _Static_assert(CDX_HTB_CQ_START == 1, "the stubs expect a queue to start at one frame");
-_Static_assert(IPSEC_BUFCOUNT == 2048 && IPSEC_QDISC_FRAMES == 1024,
-	       "half of SEC's pool for the qdisc trees");
+_Static_assert(IPSEC_BUFCOUNT == 2560 && IPSEC_QDISC_FRAMES == 1024,
+	       "1,024 of SEC's pool for the qdisc trees");
 
 /* What one tree may hold, restated from the pools rather than asked of the
- * cap: half of SEC's 2,048 buffers divided between the live trees, and never
+ * cap: 1,024 of SEC's 2,560 buffers divided between the live trees, and never
  * more than a port's share of the Ethernet pool, 1,280 with four CPUs -- which
  * the SEC share never reaches. */
 static u32 tree_budget(void)
@@ -2724,10 +2724,10 @@ static void test_red(void)
 /* ---- the tree's share of the buffer pools ---------------------------- */
 
 /* Every class queue of a tree counts frames, and together they hold no more
- * than the tree's budget: half of SEC's pool divided between the live trees,
- * within the port's share of the Ethernet pool. Shared out max-min fair,
- * shrunk before anything grows -- depth_written() checks that on every write
- * -- and drawn again whenever a share can move (A337). */
+ * than the tree's budget: the 1,024 of SEC's pool kept for the trees divided
+ * between the live trees, within the port's share of the Ethernet pool. Shared
+ * out max-min fair, shrunk before anything grows -- depth_written() checks
+ * that on every write -- and drawn again whenever a share can move (A337). */
 static void test_cap(void)
 {
 	struct net_device *dev = &devices[0], *other = &devices[1];
@@ -2877,13 +2877,13 @@ static void test_cap(void)
 	assert(!destroy(dev));
 	assert_balanced(dev);
 
-	/* ---- every live tree divides SEC's half ---- */
+	/* ---- every live tree divides SEC's 1,024 ---- */
 	reset_world();
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
 	assert(!red(dev, on1, TC_RED_REPLACE, 1000000, 3000000, 1u << 26, 4000000, false));
 	assert(cq_depth[0][NUM_PQS - 2] == 1024 - 2 * 128);
-	/* A second tree halves it, 2,048 / 2 / 2: the first shrinks, and
+	/* A second tree halves it, 1,024 / 2: the first shrinks, and
 	 * nothing grows. */
 	depth_writes = last_shrink = first_grow = 0;
 	assert(!create(other, 1, 0));

@@ -232,14 +232,16 @@ int main(void)
     unsigned faults = 0;
 
     /* A share of SEC's output pool, which the exception queues, the
-     * Ethernet ports' queues for its frames and the hardware qdisc trees'
-     * class queues have shares of too: all of them full at once, on a board
-     * of five ports, still leave SEC some. The fixed shares are 128 frames
-     * each, whatever the pool, and the trees have half of it. */
+     * Ethernet ports' queues for its frames, the SAs' input queues -- a
+     * frame one SA decrypted and another encrypts waits there in one of its
+     * buffers -- and the hardware qdisc trees' class queues have shares of
+     * too: all of them full at once, on a board of five ports, still leave
+     * SEC a share for its own jobs. The fixed shares are 128 frames each,
+     * whatever the pool, the SAs' input four of them and the trees eight. */
     assert(VWD_FWD_FRAMES == 128 && IPSEC_EXCEPTION_FRAMES == 128 && IPSEC_EGRESS_FRAMES == 128);
-    assert(IPSEC_QDISC_FRAMES == IPSEC_BUFCOUNT / 2);
+    assert(IPSEC_TO_SEC_FRAMES == 4 * 128 && IPSEC_QDISC_FRAMES == 8 * 128);
     assert(VWD_FWD_FRAMES + IPSEC_EXCEPTION_FRAMES + 5 * IPSEC_EGRESS_FRAMES +
-           IPSEC_QDISC_FRAMES < IPSEC_BUFCOUNT);
+           IPSEC_TO_SEC_FRAMES + IPSEC_QDISC_FRAMES + IPSEC_SHARE_FRAMES <= IPSEC_BUFCOUNT);
 
     /* The group alone: whichever of its two steps fails, nothing is left. */
     for (fail = 1; fail <= 2; fail++, faults++) {

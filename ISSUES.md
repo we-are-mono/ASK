@@ -357,15 +357,8 @@ result independently of those temporary files.
 - [x] **A347 — a flood the CPU could not keep up with could take the Ethernet buffer pool.** Each port's queues to the
   CPU, cdx's distribution queues included, now share a frame-counted group at a quarter of its seed (_:/^cdx: bound a port's queues to the CPU_).
 
-- [ ] **A345 — a flow decrypted by one SA and encrypted by another can hold SEC's own pool while it waits for SEC.**
-  Such a direction's decrypted frames leave the IPsec offline port for the second SA's input queue (FQ_TO_SEC), each
-  in a buffer of SEC's output pool (`IPSEC_BUFCOUNT`, 2048). Since A344 those queues share one frame-counted group, but
-  sized for the Ethernet pool (`IPSEC_TO_SEC_FRAMES`, 1,280), and SEC's budget has no share for it: the fixed shares
-  and the qdisc trees' half leave 128, SEC's own jobs'; before A344 they were unbounded.
-  A hub that relays between tunnels faster than SEC processes them could fill the group with SEC's own buffers and
-  SEC would then refuse every SA's jobs for want of an output buffer, as in A333. Fix direction: a second input queue
-  per SA for what the offline port sends back into SEC, in a group of its own sized from SEC's pool (which means a
-  share carved from the eighths `dpa_ipsec.h` budgets). Source-verified; not reproduced: the rig has one tunnel.
+- [x] **A345 — a flow relayed from one SA into another could hold SEC's own pool on the SAs' input queues.** Their group
+  is now 512 frames, four shares of SEC's pool grown to 2,560 (_:/^cdx: budget SEC's input queues in SEC's own pool_).
 
 - [x] **A342 — `ipsec_vlan_iperf_probe.py` failed when the WAN host's reordered ESP ACKs stalled a stream.** Each stream
   must stay in hardware through its SA, and only their total must move (_:/^tests: hold the IPsec iperf streams to their total_).

@@ -111,17 +111,17 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  * A frame on a class queue holds a buffer until the port sends it, however
  * short the frame: one of the pool every DPAA port receives into, or for an
  * IPsec flow one of SEC's output pool. Sixteen leaves at CDX_HTB_CQ_DEPTH
- * would hold 2,048 frames, as many as SEC's whole pool has, and a RED limit of
- * four megabytes counted in bytes held every buffer of the Ethernet pool with
- * 64-byte frames: the ports missed what they received, the gateway's own
+ * would hold 2,048 frames, more than SEC's pool kept for them, and a RED limit
+ * of four megabytes counted in bytes held every buffer of the Ethernet pool
+ * with 64-byte frames: the ports missed what they received, the gateway's own
  * frames included (A337). So every class queue counts frames, and a tree holds
  * no more than the port's share of the Ethernet pool -- half of what the port
- * seeds it with, the share its forwarding queues and SEC's input queues are
- * held to (fwd_pool_frames(), IPSEC_TO_SEC_FRAMES) -- nor, all live trees
- * together, more than the half of SEC's pool kept for them
- * (IPSEC_QDISC_FRAMES): a class queue carries SEC's frames among the rest and
- * cannot tell them apart. That half is divided evenly between the trees,
- * which with four CPUs leaves the SEC pool's share the tighter of the two.
+ * seeds it with, the share its forwarding queues are held to
+ * (fwd_pool_frames()) -- nor, all live trees together, more than the 1,024
+ * frames of SEC's pool kept for them (IPSEC_QDISC_FRAMES): a class queue
+ * carries SEC's frames among the rest and cannot tell them apart. Those are
+ * divided evenly between the trees, which with four CPUs leaves the SEC
+ * pool's share the tighter of the two.
  */
 #define CDX_HTB_ETH_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
 #define CDX_HTB_SEC_FRAMES	IPSEC_QDISC_FRAMES

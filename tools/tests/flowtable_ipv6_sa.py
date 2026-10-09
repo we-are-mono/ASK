@@ -40,13 +40,8 @@ from _topology import LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6,
 from _flowtable_ipv6 import (PayloadEcho, _drive, _drop_tables, _hardware_delta, _offload_table, _udp_exchange)
 from _flowtable_ipv6_sa import STALL_DPORT, STALL_SPORT
 from _flowtable_rig import command, pool_lowest, port_drops
-from _flowtable_service_ipsec import (offline_port_discards, offline_port_rejections)
+from _flowtable_service_ipsec import (SEC_INPUT_FRAMES, offline_port_discards, offline_port_rejections)
 from _flowtable_service_ipsec_replay import (xfrm_mib)
-
-# What SEC's input queues may hold of the pool every port receives into
-# (IPSEC_TO_SEC_FRAMES): half of what one port seeds it with, 640 for each of
-# the DUT's four CPUs.
-SEC_INPUT_FRAMES = 4 * 640 // 2
 
 
 async def test_oversized(ipv6_rig):

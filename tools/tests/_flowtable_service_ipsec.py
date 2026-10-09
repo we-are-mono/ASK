@@ -47,6 +47,10 @@ _POOL_HEADER = (Path(__file__).resolve().parents[2] / "cdx/dpa_ipsec.h").read_te
 SEC_POOL = int(re.search(r"^#define IPSEC_BUFCOUNT\s+(\d+)$", _POOL_HEADER, re.M).group(1))
 assert re.search(r"^#define IPSEC_EGRESS_FRAMES\s+IPSEC_SHARE_FRAMES$", _POOL_HEADER, re.M)
 SEC_EGRESS_FRAMES = int(re.search(r"^#define IPSEC_SHARE_FRAMES\s+(\d+)$", _POOL_HEADER, re.M).group(1))
+# What every SA's input queue together may hold, in buffers of either pool:
+# a number of those shares.
+SEC_INPUT_FRAMES = SEC_EGRESS_FRAMES * int(re.search(
+    r"^#define IPSEC_TO_SEC_FRAMES\s+\((\d+) \* IPSEC_SHARE_FRAMES\)$", _POOL_HEADER, re.M).group(1))
 
 # The IPsec offline port, which every frame SEC produces reaches next. Its
 # filter count is every frame FMan discarded for an error status, SEC's
