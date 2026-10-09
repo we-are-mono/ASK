@@ -69,6 +69,7 @@
 #include "cdx_htb.h"
 #include "cdx_police.h"
 #include "cdx_dscp.h"
+#include "dpa_ipsec.h"
 
 /* Leaf classes are handed netdev Tx queue indices out of the headroom patch 150
  * reserved above the direct queues, and sch_htb turns the index this file
@@ -92,18 +93,57 @@
 static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
 	      "class_txq[] must cover every egress class the adapter can decode");
 
-/* Frames a leaf's class queue may hold before tail drop.
+/* Frames a leaf's class queue asks to hold before tail drop.
  *
  * The hardware layer's default is eight, which is what CMM configured and is
  * far too shallow for a queue that is deliberately being shaped: a class whose
  * arrival rate exceeds its share has nowhere to wait, so it loses frames rather
  * than queueing them. A hundred and twenty-eight is about a millisecond at a
- * gigabit and stays a bounded claim on the buffer pool at sixteen leaves per
- * port. HTB carries no queue-depth field, so this is a default rather than a
- * setting: a RED qdisc on the leaf replaces this with a WRED curve, and its
- * own limit, in bytes.
+ * gigabit. HTB carries no queue-depth field, so this is a default rather than
+ * a setting: a RED qdisc on the leaf asks for its own limit instead, counted in
+ * frames (cdx_htb_red_want()). Either is only asked for: what a queue gets is
+ * its share of what the whole tree may hold (cdx_htb_cap()).
  */
 #define CDX_HTB_CQ_DEPTH	128
+
+/* What one tree's class queues may hold together, in frames.
+ *
+ * A frame on a class queue holds a buffer until the port sends it, however
+ * short the frame: one of the pool every DPAA port receives into, or for an
+ * IPsec flow one of SEC's output pool. Sixteen leaves at CDX_HTB_CQ_DEPTH
+ * would hold 2,048 frames, as many as SEC's whole pool has, and a RED limit of
+ * four megabytes counted in bytes held every buffer of the Ethernet pool with
+ * 64-byte frames: the ports missed what they received, the gateway's own
+ * frames included (A337). So every class queue counts frames, and a tree holds
+ * no more than the port's share of the Ethernet pool -- half of what the port
+ * seeds it with, the share its forwarding queues and SEC's input queues are
+ * held to (fwd_pool_frames(), IPSEC_TO_SEC_FRAMES) -- nor, all live trees
+ * together, more than the half of SEC's pool kept for them
+ * (IPSEC_QDISC_FRAMES): a class queue carries SEC's frames among the rest and
+ * cannot tell them apart. That half is divided evenly between the trees,
+ * which with four CPUs leaves the SEC pool's share the tighter of the two.
+ */
+#define CDX_HTB_ETH_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
+#define CDX_HTB_SEC_FRAMES	IPSEC_QDISC_FRAMES
+
+/* The class queues one tree can use: a leaf's each, and the top channel's two
+ * that unclassified and control traffic take while no leaf holds them. */
+#define CDX_HTB_CAP_QUEUES	(CDX_HTB_MAX_LEAVES + 2)
+
+/* What a class queue holds when it is configured, before the cap grows it to
+ * its share once every other queue of the tree has made room: configured at
+ * a full depth, a new queue would take the tree past its budget until the
+ * others had shrunk. Never zero, which a congestion group takes as no tail
+ * drop at all. */
+#define CDX_HTB_CQ_START	1
+
+/* A RED qdisc names its thresholds in bytes, and a class queue counts frames:
+ * the bytes are divided by a standard frame as it leaves -- the MTU's, where
+ * that is smaller -- with a VLAN tag, and the preamble, gap and FCS its time on
+ * the wire includes. Not by the largest frame a jumbo port admits, which would
+ * leave a RED band of a frame or two; what bounds the buffers a queue holds is
+ * the cap, whatever the frames are. */
+#define CDX_HTB_RED_OVERHEAD	(VLAN_ETH_HLEN + 24)
 
 /* Where a frame goes that names no leaf, on a port whose tree is live.
  *
@@ -156,9 +196,11 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
 #define CDX_HTB_CONTROL_FLOOR	8000		/* bytes per second */
 #define CDX_HTB_CONTROL_BURST	(16U * dpa_get_max_frm())	/* bytes */
 
-/* The WRED curve a RED qdisc on a leaf asked for, kept so it can be put back
- * after the class queue is configured afresh: ceetm_set_class_queue() starts
- * every queue on plain tail drop. */
+/* The WRED curve a RED qdisc on a leaf asked for, in its own bytes. Kept so
+ * the cap can draw it again in frames whenever what it is drawn for moves --
+ * the depth the queue is given, the port's MTU -- and after the class queue is
+ * configured afresh: ceetm_set_class_queue() starts every queue on plain tail
+ * drop. */
 struct cdx_htb_red_curve {
 	u32 min, max, probability, limit;
 };
@@ -176,10 +218,11 @@ struct cdx_htb_class {
 	u8 cq;			/* class-queue index, leaves only */
 	bool inner;		/* a channel with children, so not a queue */
 	/* The class queue is running `curve' for the RED qdisc `red_qdisc'
-	 * grafted on this leaf. Only a curve the hardware took sets it, so it
-	 * is also what that qdisc's statistics call reports as offloaded. The
-	 * handle matters because a qdisc replacing another on the same class
-	 * is created before the one it replaces is destroyed. */
+	 * grafted on this leaf. Only a curve the hardware took keeps it set --
+	 * the cap clears it when the curve will not go on -- so it is also what
+	 * that qdisc's statistics call reports as offloaded. The handle matters
+	 * because a qdisc replacing another on the same class is created before
+	 * the one it replaces is destroyed. */
 	bool red;
 	u32 red_qdisc;
 	struct cdx_htb_red_curve curve;
@@ -299,6 +342,268 @@ static bool cdx_htb_channel_owned(struct cdx_htb_port *port, u8 channel)
 	return false;
 }
 
+/* ---- the tree's share of the buffer pools ------------------------------- */
+
+/* Trees that are live, on every port: what SEC's share is divided between. */
+static unsigned int cdx_htb_live_trees(void)
+{
+	unsigned int ii, trees = 0;
+
+	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++)
+		trees += cdx_htb_ports[ii].live;
+	return trees;
+}
+
+/* What one tree's class queues may hold together, in frames
+ * (CDX_HTB_ETH_FRAMES). */
+static u32 cdx_htb_budget(void)
+{
+	unsigned int trees = max(cdx_htb_live_trees(), 1u);
+
+	return (u32)min_t(u64, CDX_HTB_ETH_FRAMES, CDX_HTB_SEC_FRAMES / trees);
+}
+
+/* The frame a RED qdisc's bytes are counted in on this port
+ * (CDX_HTB_RED_OVERHEAD). */
+static u32 cdx_htb_red_frame(struct cdx_htb_port *port)
+{
+	struct net_device *dev = port->qm_ctx ? port->qm_ctx->net_dev : NULL;
+	unsigned int mtu = dev ? READ_ONCE(dev->mtu) : ETH_DATA_LEN;
+
+	return min_t(unsigned int, mtu, ETH_DATA_LEN) + CDX_HTB_RED_OVERHEAD;
+}
+
+/* The depth a RED leaf asks for: its qdisc's limit, in frames. */
+static u32 cdx_htb_red_want(struct cdx_htb_port *port,
+			    const struct cdx_htb_red_curve *curve)
+{
+	return max_t(u32, curve->limit / cdx_htb_red_frame(port), 1);
+}
+
+/* A RED leaf's curve in frames, for a queue given `depth' of them.
+ *
+ * The qdisc's thresholds are divided into frames, and where the cap gave the
+ * queue less than the limit asked for, scaled by what it got against what it
+ * asked for, so the curve keeps its shape below a shallower tail drop. The
+ * minimum stays below the tail drop, so the curve starts before the queue is
+ * full; and the band is never narrower than the encoding draws with the
+ * implied minimum where it was put (ceetm_wred_min_band()), which also keeps
+ * a band that rounded to nothing from being refused as no band at all. */
+static void cdx_htb_red_frames(struct cdx_htb_port *port,
+			       const struct cdx_htb_red_curve *curve, u32 depth,
+			       u32 *min, u32 *max)
+{
+	u32 frame = cdx_htb_red_frame(port), want = cdx_htb_red_want(port, curve);
+	u64 lo = curve->min / frame, hi = curve->max / frame;
+
+	if (depth < want) {
+		lo = div_u64(lo * depth, want);
+		hi = div_u64(hi * depth, want);
+	}
+	if (lo >= depth)
+		lo = depth - 1;
+	hi = max_t(u64, hi, lo + ceetm_wred_min_band(curve->probability));
+	*min = (u32)lo;
+	*max = (u32)hi;
+}
+
+/* One class queue of a tree, as the cap sizes it. */
+struct cdx_htb_cap_queue {
+	struct cdx_htb_class *cl;	/* NULL for one no leaf holds */
+	u32 want;			/* frames it asks for */
+	u32 depth;			/* frames it is given */
+	u8 channel, cq;
+};
+
+/* The class queues a tree uses: each leaf's, and the top channel's queues
+ * unclassified and control traffic take while no leaf holds them
+ * (cdx_htb_implicit_sync()). A queue the tree gave back is not among them,
+ * though it may still hold what it had queued: reset, it is eligible only for
+ * the excess tokens the tree's own queues leave unused, and drains as they
+ * come -- behind a class that takes every token it may, not until that class
+ * goes quiet. */
+static unsigned int cdx_htb_cap_queues(struct cdx_htb_port *port,
+				       struct cdx_htb_cap_queue *q)
+{
+	static const u8 implicit[] = { CDX_HTB_UNCLASSIFIED_CQ, CDX_HTB_CONTROL_CQ };
+	struct cdx_htb_class *cl;
+	bool fallback = true;
+	unsigned int n = 0, ii;
+
+	list_for_each_entry(cl, &port->classes, list) {
+		if (cl->inner || WARN_ON_ONCE(n >= CDX_HTB_MAX_LEAVES))
+			continue;
+		if (port->defcls && cl->classid == port->defcls)
+			fallback = false;
+		q[n++] = (struct cdx_htb_cap_queue){
+			.cl = cl, .channel = cl->channel, .cq = cl->cq,
+			.want = cl->red ? cdx_htb_red_want(port, &cl->curve) :
+					  CDX_HTB_CQ_DEPTH,
+		};
+	}
+	if (port->top == CDX_HTB_NONE)
+		return n;
+	for (ii = 0; ii < ARRAY_SIZE(implicit); ii++) {
+		if (port->cq_used[port->top] & BIT(implicit[ii]))
+			continue;
+		/* With a default leaf, unclassified traffic takes that leaf and
+		 * nothing reaches queue 0: it takes no share, and keeps a frame
+		 * for whatever was resolved to it before the leaf came. */
+		q[n++] = (struct cdx_htb_cap_queue){
+			.channel = port->top, .cq = implicit[ii],
+			.want = implicit[ii] == CDX_HTB_UNCLASSIFIED_CQ && !fallback ?
+				CDX_HTB_CQ_START : CDX_HTB_CQ_DEPTH,
+		};
+	}
+	return n;
+}
+
+/* Share `budget' frames between the queues, max-min fair: a queue asking for
+ * no more than an even share of what is left gets what it asks for, and the
+ * queues asking for more split the rest evenly. Never under a frame. */
+static void cdx_htb_cap_share(struct cdx_htb_cap_queue *q, unsigned int n,
+			      u32 budget)
+{
+	unsigned int left = n, ii;
+	bool settled;
+	u32 share;
+
+	for (ii = 0; ii < n; ii++)
+		q[ii].depth = 0;
+	while (left) {
+		share = budget / left;
+		settled = false;
+		for (ii = 0; ii < n; ii++) {
+			if (q[ii].depth || q[ii].want > share)
+				continue;
+			q[ii].depth = q[ii].want;
+			budget -= q[ii].want;
+			left--;
+			settled = true;
+		}
+		if (settled)
+			continue;
+		for (ii = 0; ii < n; ii++)
+			if (!q[ii].depth)
+				q[ii].depth = max_t(u32, share, 1);
+		return;
+	}
+}
+
+/* Program one queue at `depth' frames, from what it holds now. A RED leaf's
+ * curve is drawn again every time, for that depth and the port's MTU, and
+ * written where it differs from what the group holds. Any
+ * other queue goes on plain tail drop, with a curve taken off if one is
+ * running there -- a leaf whose RED qdisc went, or a parent that inherited its
+ * last child's queue. */
+static int cdx_htb_cap_write(struct cdx_htb_port *port,
+			     const struct cdx_htb_cap_queue *q, u32 depth,
+			     u32 now, bool curve)
+{
+	u32 min, max;
+
+	if (q->cl && q->cl->red) {
+		cdx_htb_red_frames(port, &q->cl->curve, depth, &min, &max);
+		return ceetm_set_class_wred(q->channel, q->cq, min, max,
+					    q->cl->curve.probability, depth);
+	}
+	if (curve)
+		return ceetm_clear_class_wred(q->channel, q->cq, depth);
+	if (now != depth)
+		return ceetm_set_class_depth(q->channel, q->cq, depth);
+	return 0;
+}
+
+/* Program what cdx_htb_cap_share() gave each queue: every queue that shrinks,
+ * then the rest, so the depths the tree's queues are given never add up past
+ * its budget; and while a queue will not shrink, none grows, though a curve
+ * still goes on at the depth its queue has. What the queues hold can still run
+ * past it for a while: lowering a depth evicts nothing, and a queue holding
+ * more refuses frames until it has sent down to it, at its own rate, while the
+ * queues that grew fill -- at most the larger of each queue's old and new
+ * depth, added up. A RED leaf whose
+ * curve will not go on loses it, with a warning unless it is `asking', whose
+ * caller says so itself. Returns whether one did: that leaf now asks for a
+ * plain leaf's depth, and the shares are drawn again. */
+static bool cdx_htb_cap_apply(struct cdx_htb_port *port,
+			      struct cdx_htb_cap_queue *q, unsigned int n,
+			      struct cdx_htb_class *asking)
+{
+	bool stuck = false, lost = false, curve, shrinks;
+	u32 done = 0, now, depth;
+	unsigned int pass, ii;
+	int rc;
+
+	for (pass = 0; pass < 2; pass++) {
+		for (ii = 0; ii < n; ii++) {
+			if ((done & BIT(ii)) ||
+			    ceetm_class_queue_state(q[ii].channel, q[ii].cq, &now, &curve))
+				continue;
+			shrinks = q[ii].depth < now;
+			if (shrinks != (pass == 0))
+				continue;
+			done |= BIT(ii);
+			depth = stuck ? min(q[ii].depth, now) : q[ii].depth;
+			rc = cdx_htb_cap_write(port, &q[ii], depth, now, curve);
+			if (!rc)
+				continue;
+			if (shrinks)
+				stuck = true;
+			if (q[ii].cl && q[ii].cl->red) {
+				q[ii].cl->red = false;
+				lost = true;
+				if (q[ii].cl != asking)
+					pr_warn("cdx: %s class %x lost its RED curve on class queue %u; the RED qdisc is no longer offloaded\n",
+						cdx_htb_port_name(port), q[ii].cl->classid,
+						q[ii].cq);
+			} else if (curve) {
+				pr_warn("cdx: CEETM channel %u queue %u kept a RED curve its class no longer has\n",
+					q[ii].channel, q[ii].cq);
+			} else {
+				pr_warn("cdx: CEETM channel %u queue %u kept %u frames of tail drop rather than %u\n",
+					q[ii].channel, q[ii].cq, now, depth);
+			}
+		}
+	}
+	if (stuck)
+		pr_warn("cdx: %s left class queues short of their share: one would not give up frames to them\n",
+			cdx_htb_port_name(port));
+	return lost;
+}
+
+/* Size every class queue of a port's tree to its share of what the tree may
+ * hold (CDX_HTB_ETH_FRAMES), and program it. Redone whole whenever a share
+ * can move: a change to the tree's queues (cdx_htb_publish()), to a RED
+ * leaf's curve (cdx_htb_red()), to the port's MTU, which RED's frames are
+ * counted in (cdx_htb_mtu_changed()), and to the number of trees SEC's share
+ * is divided between (cdx_htb_cap_trees()). Every depth and every curve a
+ * class queue of a live tree is given comes from here, but for the frame a
+ * queue starts with (CDX_HTB_CQ_START). Ends, because each round but the last
+ * takes a RED leaf's curve away. */
+static void cdx_htb_cap(struct cdx_htb_port *port, struct cdx_htb_class *asking)
+{
+	struct cdx_htb_cap_queue q[CDX_HTB_CAP_QUEUES];
+	unsigned int n;
+
+	if (!port->live)
+		return;
+	do {
+		n = cdx_htb_cap_queues(port, q);
+		cdx_htb_cap_share(q, n, cdx_htb_budget());
+	} while (cdx_htb_cap_apply(port, q, n, asking));
+}
+
+/* A tree came or went, and the share of SEC's pool every other tree may hold
+ * moved with the number of them. */
+static void cdx_htb_cap_trees(struct cdx_htb_port *port)
+{
+	unsigned int ii;
+
+	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++)
+		if (&cdx_htb_ports[ii] != port)
+			cdx_htb_cap(&cdx_htb_ports[ii], NULL);
+}
+
 /* Republish what the Tx path reads. Called after every change to the tree,
  * under RTNL, and cheap enough to redo whole rather than patch in place.
  *
@@ -382,6 +687,9 @@ static void cdx_htb_publish(struct cdx_htb_port *port)
 	cdx_htb_control_budget(port, top);
 	WRITE_ONCE(port->top, top);
 	cdx_htb_implicit_sync(port, top);
+	/* Last, once the queues the tree uses are settled: whatever came,
+	 * went or moved, each one's share of the tree's budget follows. */
+	cdx_htb_cap(port, NULL);
 }
 
 /* Keep the class queues unclassified and control traffic take on the top
@@ -429,8 +737,9 @@ static void cdx_htb_implicit_sync(struct cdx_htb_port *port, u8 top)
 		if (!(want & BIT(cq)) || (port->implicit & BIT(cq)))
 			continue;
 		/* Tried again at the next change if this fails: nothing about
-		 * the command that got here depends on it. */
-		if (ceetm_set_class_queue(top, cq, 0, CDX_HTB_CQ_DEPTH)) {
+		 * the command that got here depends on it. Its depth is the
+		 * cap's, which follows. */
+		if (ceetm_set_class_queue(top, cq, 0, CDX_HTB_CQ_START)) {
 			pr_warn("cdx: %s cannot make CEETM channel %u queue %u eligible; frames that name no class can starve there\n",
 				cdx_htb_port_name(port), top, cq);
 			continue;
@@ -536,14 +845,16 @@ static void cdx_htb_implicit_forget(struct cdx_htb_port *port, u8 channel, u8 cq
 		port->implicit &= (u16)~BIT(cq);
 }
 
-/* Program a leaf's class queue, and remember that it is taken. */
+/* Program a leaf's class queue, and remember that it is taken. It starts on
+ * plain tail drop at CDX_HTB_CQ_START; its depth, and a RED leaf's curve, are
+ * the cap's, when the tree is published. */
 static int cdx_htb_cq_configure(struct cdx_htb_port *port, u8 channel, u8 cq,
 				u32 quantum, struct netlink_ext_ack *extack)
 {
 	int rc;
 
 	cdx_htb_implicit_forget(port, channel, cq);
-	rc = ceetm_set_class_queue(channel, cq, quantum, CDX_HTB_CQ_DEPTH);
+	rc = ceetm_set_class_queue(channel, cq, quantum, CDX_HTB_CQ_START);
 	if (rc) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "CEETM rejected the class queue; a quantum is a weight of 1 to 255, not a byte count");
@@ -564,35 +875,18 @@ static void cdx_htb_cq_release(struct cdx_htb_port *port, u8 channel, u8 cq)
 			channel, cq);
 }
 
-/* Give a leaf its RED curve back once its class queue has been configured
- * afresh, which always starts the queue on tail drop. A curve that will not go
- * back is dropped from the class too, so the qdisc stops reporting an offload
- * the hardware no longer has. */
-static void cdx_htb_red_restore(struct cdx_htb_port *port, struct cdx_htb_class *cl)
-{
-	if (!cl->red)
-		return;
-	if (!ceetm_set_class_wred(cl->channel, cl->cq, cl->curve.min, cl->curve.max,
-				  cl->curve.probability, cl->curve.limit))
-		return;
-	cl->red = false;
-	pr_warn("cdx: %s class %x lost its RED curve moving to class queue %u; the RED qdisc is no longer offloaded\n",
-		cdx_htb_port_name(port), cl->classid, cl->cq);
-}
-
 /* Put a class queue back the way it was, after a change that could not be
- * completed. Nothing else can be done about a failure here: the caller is
+ * completed; its depth, and a RED leaf's curve, come back with the publish
+ * that follows. Nothing else can be done about a failure here: the caller is
  * already unwinding. */
 static void cdx_htb_cq_restore(struct cdx_htb_port *port, struct cdx_htb_class *cl)
 {
-	if (cdx_htb_cq_configure(port, cl->channel, cl->cq, cl->quantum, NULL)) {
-		pr_warn("cdx: CEETM channel %u queue %u lost its configuration\n",
-			cl->channel, cl->cq);
-		/* Released on the way here, which took its curve with it. */
-		cl->red = false;
+	if (!cdx_htb_cq_configure(port, cl->channel, cl->cq, cl->quantum, NULL))
 		return;
-	}
-	cdx_htb_red_restore(port, cl);
+	pr_warn("cdx: CEETM channel %u queue %u lost its configuration\n",
+		cl->channel, cl->cq);
+	/* Released on the way here, which took its curve with it. */
+	cl->red = false;
 }
 
 /* tc rates are bytes per second; CEETM shapers are programmed in bits.
@@ -686,6 +980,9 @@ static int cdx_htb_create(struct cdx_htb_port *port, struct tc_htb_qopt_offload 
 	port->defcls = opt->classid;
 	port->live = true;
 	cdx_htb_publish(port);
+	/* One tree more divides SEC's share between more of them: the others
+	 * shrink, before this one has a queue to grow. */
+	cdx_htb_cap_trees(port);
 	return 0;
 }
 
@@ -721,6 +1018,9 @@ static void cdx_htb_destroy(struct cdx_htb_port *port)
 	if (cdx_htb_resize(port, 0))
 		pr_warn("cdx: %s kept Tx queues no class is using\n",
 			port->qm_ctx->net_dev ? port->qm_ctx->net_dev->name : "?");
+	/* And the trees left grow into the share of SEC's pool this one gave
+	 * back. Its queues are drained and reset by now. */
+	cdx_htb_cap_trees(port);
 }
 
 static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
@@ -916,11 +1216,8 @@ static int cdx_htb_leaf_del_last(struct cdx_htb_port *port,
 	}
 	/* The child's RED qdisc goes with the child, but only after this
 	 * command, and its destroy will then name a class that no longer
-	 * exists. So its curve comes off the class queue here, before the
-	 * parent inherits the queue as plain tail drop. */
-	if (cl->red && ceetm_clear_class_wred(cl->channel, cl->cq, CDX_HTB_CQ_DEPTH))
-		pr_warn("cdx: CEETM channel %u queue %u kept a RED curve its class no longer has\n",
-			cl->channel, cl->cq);
+	 * exists. So the parent inherits the queue as a plain leaf, and the
+	 * publish below takes the child's curve off it. */
 	parent->inner = false;
 	parent->qid = cl->qid;
 	parent->cq = cl->cq;
@@ -963,8 +1260,8 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
 	cl->cq = cq;
 	cl->quantum = opt->quantum;
 	/* A RED qdisc on the leaf moves with it: the queue it now occupies was
-	 * configured on tail drop, and the one it left was reset. */
-	cdx_htb_red_restore(port, cl);
+	 * configured on tail drop, the one it left was reset, and the publish
+	 * draws the curve on the new one. */
 	cdx_htb_publish(port);
 	return 0;
 }
@@ -979,6 +1276,12 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
  *
  * ECN is refused for the same reason: this hardware drops, it does not mark, so
  * accepting `ecn` would answer a request to mark by dropping instead.
+ *
+ * RED names its thresholds in bytes and a class queue counts frames, which is
+ * what bounds the buffers it holds. So the curve is kept as the qdisc gave it
+ * and the cap programs it (cdx_htb_cap()): the limit, in frames, is what the
+ * queue asks for of the tree's budget, and the curve is drawn in frames for
+ * the depth the queue is given (cdx_htb_red_frames()).
  *
  * "Refused" has to mean the hardware is left without a curve, and the qdisc has
  * to say so, because sch_red discards what this returns and creates or changes
@@ -1030,33 +1333,48 @@ static int cdx_htb_red(struct net_device *dev, struct cdx_htb_port *port,
 			refused = "the curve needs a band, min below max, and a limit";
 			rc = -EINVAL;
 		} else if (!refused) {
-			rc = ceetm_set_class_wred(cl->channel, cl->cq, opt->set.min,
-						  opt->set.max, opt->set.probability,
-						  opt->set.limit);
-			if (!rc) {
-				if (cl->red && !running) {
+			bool had = cl->red;
+			u32 had_qdisc = cl->red_qdisc;
+			struct cdx_htb_red_curve had_curve = cl->curve;
+
+			/* The cap programs it: the limit is what the queue asks
+			 * for of the tree's budget, and the curve is drawn in
+			 * frames for the depth the queue is given. */
+			cl->red = true;
+			cl->red_qdisc = opt->handle;
+			cl->curve = (struct cdx_htb_red_curve){
+				opt->set.min, opt->set.max,
+				opt->set.probability, opt->set.limit };
+			cdx_htb_cap(port, cl);
+			if (cl->red) {
+				if (had && !running) {
 					cl->red_displaced = true;
-					cl->displaced_qdisc = cl->red_qdisc;
-					cl->displaced = cl->curve;
+					cl->displaced_qdisc = had_qdisc;
+					cl->displaced = had_curve;
 				}
-				cl->red = true;
-				cl->red_qdisc = opt->handle;
-				cl->curve = (struct cdx_htb_red_curve){
-					opt->set.min, opt->set.max,
-					opt->set.probability, opt->set.limit };
 				return 0;
 			}
 			refused = "CEETM rejected the curve";
+			rc = -EIO;
+			/* The cap left the queue on tail drop. A curve another
+			 * qdisc had running there is that qdisc's until it goes,
+			 * and goes back on; this qdisc's own is gone either way. */
+			cl->red_qdisc = had_qdisc;
+			cl->curve = had_curve;
+			if (had && !running) {
+				cl->red = true;
+				cdx_htb_cap(port, NULL);
+			}
+			running = false;
 		}
 		/* A change to this qdisc: the old curve must not run under the
-		 * settings the software qdisc now shows. Another qdisc's curve
-		 * stays until that qdisc is destroyed, as it is next when this
-		 * one was meant to replace it. */
+		 * settings the software qdisc now shows, and the cap puts the
+		 * queue back on tail drop. Another qdisc's curve stays until that
+		 * qdisc is destroyed, as it is next when this one was meant to
+		 * replace it. */
 		if (running) {
 			cl->red = false;
-			if (ceetm_clear_class_wred(cl->channel, cl->cq, CDX_HTB_CQ_DEPTH))
-				netdev_warn(dev, "class %x kept a RED curve it was meant to lose\n",
-					    cl->classid);
+			cdx_htb_cap(port, NULL);
 		}
 		if (cl && cl->red)
 			netdev_warn(dev, "RED qdisc %x: not offloaded: %s; its class queue keeps RED qdisc %x's curve until that qdisc goes\n",
@@ -1080,22 +1398,21 @@ static int cdx_htb_red(struct net_device *dev, struct cdx_htb_port *port,
 		if (!running)
 			return 0;
 		/* The replacement itself, failing after its REPLACE: the qdisc
-		 * it displaced is still grafted, and gets its curve back. */
+		 * it displaced is still grafted, and gets its curve back. One
+		 * that will not go back leaves the queue on tail drop. */
 		if (cl->red_displaced) {
 			cl->red_displaced = false;
-			if (!ceetm_set_class_wred(cl->channel, cl->cq, cl->displaced.min,
-						  cl->displaced.max,
-						  cl->displaced.probability,
-						  cl->displaced.limit)) {
-				cl->red_qdisc = cl->displaced_qdisc;
-				cl->curve = cl->displaced;
-				return 0;
-			}
-			netdev_warn(dev, "RED qdisc %x: its curve could not be put back; its class queue is on tail drop\n",
-				    TC_H_MAJ(cl->displaced_qdisc) >> 16);
+			cl->red_qdisc = cl->displaced_qdisc;
+			cl->curve = cl->displaced;
+			cdx_htb_cap(port, cl);
+			if (!cl->red)
+				netdev_warn(dev, "RED qdisc %x: its curve could not be put back; its class queue is on tail drop\n",
+					    TC_H_MAJ(cl->displaced_qdisc) >> 16);
+			return 0;
 		}
 		cl->red = false;
-		return ceetm_clear_class_wred(cl->channel, cl->cq, CDX_HTB_CQ_DEPTH);
+		cdx_htb_cap(port, NULL);
+		return 0;
 	case TC_RED_STATS:
 		/* Answering is what marks the qdisc offloaded, so only a class
 		 * running the curve answers. The counters stay software's: what
@@ -1360,6 +1677,31 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 	port->implicit_channel = CDX_HTB_NONE;
 	cdx_htb_publish(port);
 out:
+	mutex_unlock(&cdx_htb_mutex);
+}
+
+/* A port's tree went (cdx_htb_port_gone()) and its CEETM context has been
+ * released, its queues with it: only now do the trees left grow into the share
+ * of SEC's pool it had, which until then its queues could still hold. */
+void cdx_htb_port_released(void)
+{
+	mutex_lock(&cdx_htb_mutex);
+	cdx_htb_cap_trees(NULL);
+	mutex_unlock(&cdx_htb_mutex);
+}
+
+/* The port's MTU changed. A RED leaf's thresholds are counted in frames of the
+ * size the MTU admits (cdx_htb_red_frames()), so what it asks for and the
+ * curve it runs move with it, and the tree's shares are drawn again. */
+void cdx_htb_mtu_changed(struct net_device *dev)
+{
+	struct cdx_htb_port *port = cdx_htb_port_of(dev);
+
+	ASSERT_RTNL();
+	if (!port)
+		return;
+	mutex_lock(&cdx_htb_mutex);
+	cdx_htb_cap(port, NULL);
 	mutex_unlock(&cdx_htb_mutex);
 }
 

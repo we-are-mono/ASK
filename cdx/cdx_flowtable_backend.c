@@ -121,10 +121,15 @@ static int cdx_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 
 	/* A speed change passes through the carrier, so it arrives here too.
 	 * An MTU change resizes the port's egress bounds, which count frames
-	 * of the largest size the MTU admits, carrier or not. */
+	 * of the largest size the MTU admits, carrier or not -- and a hardware
+	 * qdisc's class queues, whose RED curves count frames of the size it
+	 * admits. That one after the devlist lock is dropped: the tree's lock
+	 * is a mutex. */
 	if ((((event == NETDEV_UP || event == NETDEV_CHANGE) && netif_carrier_ok(dev)) ||
 	     event == NETDEV_CHANGEMTU) && dpa_netdev_is_physical(dev)) {
 		dpa_fwd_cgr_follow_link(dev);
+		if (event == NETDEV_CHANGEMTU)
+			cdx_htb_mtu_changed(dev);
 		return NOTIFY_DONE;
 	}
 	if (event != NETDEV_PRE_UP || !READ_ONCE(ft_failed) ||

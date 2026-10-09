@@ -326,8 +326,10 @@ int main(void)
         assert(iface.eth_info.fwd_cgr_mtu == 1500);
         assert(groups[0].thres == (netdev.carrier ? 1000u * 2000 / 8 / standard : share));
         assert(10000u * 2000 / 8 / standard > share);
-        /* SEC's frames from a gigabit up: the port's share of its pool. */
-        assert(groups[1].thres == IPSEC_EGRESS_FRAMES && IPSEC_EGRESS_FRAMES < IPSEC_BUFCOUNT);
+        /* SEC's frames from a gigabit up: the port's share of its pool, a
+         * fixed 128 frames whatever the pool holds. */
+        assert(groups[1].thres == IPSEC_EGRESS_FRAMES && IPSEC_EGRESS_FRAMES == 128 &&
+               IPSEC_EGRESS_FRAMES < IPSEC_BUFCOUNT);
         unsigned before = syncs;
         destroy_fwd_tx_fqs(&iface);
         assert(!live && syncs == before + 1 && !any_group() && !iface.eth_info.fwd_cgr_speed);

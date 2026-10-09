@@ -124,7 +124,11 @@ int ceetm_class_counters(uint32_t channel_num, uint32_t quenum,
 			 uint64_t *rej_frames);
 int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
 			 uint32_t max, uint32_t probability, uint32_t limit);
+uint32_t ceetm_wred_min_band(uint32_t probability);
 int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth);
+int ceetm_set_class_depth(uint32_t channel_num, uint32_t quenum, uint32_t depth);
+int ceetm_class_queue_state(uint32_t channel_num, uint32_t quenum,
+			    uint32_t *depth, bool *wred);
 int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num);
 int ceetm_set_channel_rates(uint32_t channel_num, uint64_t cir_bps, uint64_t eir_bps);
 int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight,

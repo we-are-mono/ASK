@@ -107,7 +107,8 @@ def test_queues(tmp_path, queues):
     bound = "".join(line + "\n" for line in source.splitlines()
                     if line.startswith(("#define FWD_CGR_", "static unsigned int fwd_queue_us")))
     bound += "".join(line + "\n" for line in pool.splitlines()
-                     if line.startswith(("#define IPSEC_BUFCOUNT", "#define IPSEC_EGRESS_FRAMES")))
+                     if line.startswith(("#define IPSEC_BUFCOUNT", "#define IPSEC_SHARE_FRAMES",
+                                         "#define IPSEC_EGRESS_FRAMES")))
     (tmp_path / "cdx_queues.inc").write_text(
         bound + function(source, "fwd_tx_drain_dqrr") + function(source, "fwd_tx_ern")
         + function(source, "fwd_cgr_bytes") + function(source, "fwd_cgr_frames")

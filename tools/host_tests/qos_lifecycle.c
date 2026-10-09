@@ -289,6 +289,14 @@ static void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
     assert(qm_ctx);
     dscp_ports_dropped++;
 }
+/* The other trees grow into the share the departed one had only after its
+ * context was released, whether or not that succeeded. */
+static unsigned htb_ports_released;
+static void cdx_htb_port_released(void)
+{
+    assert(htb_ports_dropped == htb_ports_released + 1 && !lni.claimed);
+    htb_ports_released++;
+}
 
 /* The devlink instance the device-wide meters live on. It is registered by the
  * DPA configuration once their profiles exist (devlink_policer.c and

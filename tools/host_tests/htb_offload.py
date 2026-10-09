@@ -44,6 +44,17 @@ def test_htb_offload(tmp_path):
          "ipv6_change_dsfield")))
     source = (ROOT / "cdx/cdx_htb.c").read_text()
     backend = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
+    # The pools a tree's class queues are budgeted against, as the headers
+    # define them, and the hardware layer's own reading of how narrow a WRED
+    # band it can draw, which the curve's conversion to frames widens to.
+    ipsec = (ROOT / "cdx/dpa_ipsec.h").read_text()
+    ceetm = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
+    (tmp_path / "htb_pools.inc").write_text(
+        "".join(re.search(rf"^#define\s+{name}\s.*$", ipsec, re.M).group() + "\n"
+                for name in ("IPSEC_BUFCOUNT", "IPSEC_QDISC_FRAMES"))
+        + "".join(line + "\n" for line in ceetm.splitlines()
+                  if line.startswith("#define CEETM_WRED_"))
+        + function(ceetm, "ceetm_wred_maxp") + function(ceetm, "ceetm_wred_min_band"))
     (tmp_path / "htb_types.inc").write_text(
         # The class encoding first: the queue budget asserts against it, and the
         # Tx path masks a decoded class with it before indexing.
@@ -77,11 +88,14 @@ def test_htb_offload(tmp_path):
     # are needed and the compiler catches a call to something not yet defined.
     names = [
         "cdx_htb_entry", "cdx_htb_port_of", "cdx_htb_port_name", "cdx_htb_find",
-        "cdx_htb_find_qid", "cdx_htb_channel_owned", "cdx_htb_implicit_sync",
+        "cdx_htb_find_qid", "cdx_htb_channel_owned",
+        "cdx_htb_live_trees", "cdx_htb_budget", "cdx_htb_red_frame",
+        "cdx_htb_red_want", "cdx_htb_red_frames", "cdx_htb_cap_queues",
+        "cdx_htb_cap_share", "cdx_htb_cap_write", "cdx_htb_cap_apply",
+        "cdx_htb_cap", "cdx_htb_cap_trees", "cdx_htb_implicit_sync",
         "cdx_htb_control_budget", "cdx_htb_publish", "cdx_htb_resize",
         "cdx_htb_channel_get", "cdx_htb_cq_get", "cdx_htb_implicit_forget",
-        "cdx_htb_cq_configure", "cdx_htb_cq_release",
-        "cdx_htb_red_restore", "cdx_htb_cq_restore",
+        "cdx_htb_cq_configure", "cdx_htb_cq_release", "cdx_htb_cq_restore",
         "cdx_htb_shape", "cdx_htb_unshape", "cdx_htb_class_free", "cdx_htb_qid_free",
         "cdx_htb_create", "cdx_htb_destroy", "cdx_htb_leaf_alloc",
         "cdx_htb_leaf_to_inner", "cdx_htb_leaf_del", "cdx_htb_leaf_del_last",
@@ -90,7 +104,8 @@ def test_htb_offload(tmp_path):
         "cdx_htb_setup_tc",
         "cdx_register_ft_egress", "cdx_unregister_ft_egress",
         "cdx_htb_class_queue",
-        "cdx_htb_port_gone", "cdx_register_ft_qos_class",
+        "cdx_htb_port_gone", "cdx_htb_port_released", "cdx_htb_mtu_changed",
+        "cdx_register_ft_qos_class",
         "cdx_unregister_ft_qos_class", "cdx_htb_l4", "cdx_htb_ip_family",
         "cdx_htb_parse", "cdx_htb_control", "cdx_htb_control_admit",
         "cdx_ft_qos_control_overruns", "cdx_htb_frame_class", "cdx_htb_same_datagram", "cdx_htb_fragment_class",
@@ -102,8 +117,11 @@ def test_htb_offload(tmp_path):
         "cdx_unregister_ft_setup_tc", "cdx_setup_tc", "cdx_htb_init",
         "cdx_htb_exit",
     ]
+    # The cap's view of one class queue is a structure among the functions.
+    cap_queue = source.index("struct cdx_htb_cap_queue {")
     (tmp_path / "htb_production.inc").write_text(
-        "\n".join(function(source, name) for name in names))
+        source[cap_queue:source.index("};", cap_queue) + 3]
+        + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "htb_offload"
     run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",

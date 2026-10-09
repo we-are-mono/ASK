@@ -46,7 +46,8 @@ PORT_REMARK_HW, PORT_REMARK_SW = PORT + 18, PORT + 19
 PORT_EF_REPLACED = PORT + 20
 PORT_DECLINED = PORT + 21
 PORT_WEIGHTED, PORT_WEIGHTED_BULK = PORT + 22, PORT + 23
-PORTS_LAST = PORT + 23
+PORT_POOL = PORT + 24
+PORTS_LAST = PORT_POOL
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
 # unshaped and far above what the CPU can: see the module docstring.

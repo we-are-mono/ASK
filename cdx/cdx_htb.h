@@ -17,6 +17,14 @@ void cdx_htb_exit(void);
 /* Drop a port's qdisc state without touching hardware, for a caller that is
  * already tearing the interface's CEETM context down. */
 void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx);
+/* That caller has released the context, and the other ports' trees take the
+ * share of SEC's pool the departed one had. */
+void cdx_htb_port_released(void);
+
+/* A DPAA port's MTU changed: a hardware qdisc's tree on it resizes its class
+ * queues, whose RED curves are counted in frames of the size it admits. RTNL
+ * held; takes this file's mutex, so never under a spinlock. */
+void cdx_htb_mtu_changed(struct net_device *dev);
 
 /* The CEETM channel and class queue a leaf class names, for a filter that
  * wants to send something to it. `classid' is a whole tc handle, as an

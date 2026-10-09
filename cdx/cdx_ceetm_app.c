@@ -494,8 +494,8 @@ static int ceetm_cfg_td_on_class_queue(struct ceetm_chnl_info *chnl_ctx, uint32_
  * depth: ceetm_cfg_td_on_class_queue() writes the tail-drop fields and nothing
  * else. So every path that hands a class queue to a new class, or back to its
  * defaults, turns it off here -- otherwise the next class on the queue inherits
- * a curve drawn in bytes over a tail drop now counted in frames, which no RED
- * qdisc describes and nothing will ever take away.
+ * a curve drawn for another class's depth, which no RED qdisc describes and
+ * nothing will ever take away.
  */
 static int ceetm_cq_wred_off(struct classque_info *cqinfo)
 {
@@ -507,6 +507,7 @@ static int ceetm_cq_wred_off(struct classque_info *cqinfo)
 	if (qman_ceetm_ccg_set(cqinfo->ccg, QM_CCGR_WE_WR_EN_G | QM_CCGR_WE_WR_EN_Y |
 			       QM_CCGR_WE_WR_EN_R, &params))
 		return -EIO;
+	cqinfo->wred = false;
 	return 0;
 }
 
@@ -890,7 +891,6 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 						return CEETM_FAILURE;
 					}
 				}
-				cqinfo->qdepth = DEFAULT_CQ_DEPTH;
 				/* Back to the defaults means no curve either: a
 				 * RED qdisc's own destroy arrives after the tree's,
 				 * finds no qdisc, and so cannot take one off. */
@@ -899,8 +899,11 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 						__func__, ii, jj);
 					return CEETM_FAILURE;
 				}
+				/* The depth is recorded once the group took it, so the
+				 * next tree on the channel reads what it holds
+				 * (ceetm_class_queue_state()). */
 				ceetm_dbg("%s::resetting que depth on class queue %d\n", __func__, ii);
-				if (ceetm_cfg_td_on_class_queue(qm_channel, jj, cqinfo->qdepth)) {
+				if (ceetm_cfg_td_on_class_queue(qm_channel, jj, DEFAULT_CQ_DEPTH)) {
 					ceetm_err("%s::ceetm_cfg_ccg_to_class_queue failed on chnl %d\n", 
 							__func__, ii);
 					return CEETM_FAILURE;
@@ -1165,17 +1168,47 @@ struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
  * docs/flowtable/qos.md.
  */
 #define CEETM_WRED_MAXP_UNITS	256u
+/* The steepest slope the encoding holds: SA at the top of its seven bits, at
+ * Sn 0. */
+#define CEETM_WRED_SA_MAX	127u
 
-/* MaxTH = MA * 2^Mn, with MA eight bits wide. */
-static void ceetm_wred_maxth(uint32_t bytes, struct qm_cgr_wr_parm *parm)
+/* The probability at MaxTH as the field holds it, in CEETM_WRED_MAXP_UNITS:
+ * the asked-for one, a fraction of 2^32, within the field's range and rounded
+ * down to the steps of four Pn counts in. */
+static uint32_t ceetm_wred_maxp(uint32_t probability)
+{
+	uint32_t maxp = (uint32_t)(((uint64_t)probability * CEETM_WRED_MAXP_UNITS) >> 32);
+
+	if (maxp < 4)
+		maxp = 4;
+	if (maxp > CEETM_WRED_MAXP_UNITS)
+		maxp = CEETM_WRED_MAXP_UNITS;
+	return maxp & ~3u;
+}
+
+/* The narrowest band, max minus min in frames, whose curve the encoding draws
+ * with its implied minimum where it was asked for. The slope climbs to MaxP
+ * across the band and is at most CEETM_WRED_SA_MAX per frame, so a band
+ * narrower than MaxP / CEETM_WRED_SA_MAX frames is drawn gentler than asked,
+ * its implied minimum below the asked one. Never under two frames, so a minimum
+ * and a maximum rounded down from bytes stay apart. For a caller converting a
+ * curve into frames, which has to widen a band this narrow before asking. */
+uint32_t ceetm_wred_min_band(uint32_t probability)
+{
+	return max_t(uint32_t, 2,
+		     DIV_ROUND_UP(ceetm_wred_maxp(probability), CEETM_WRED_SA_MAX));
+}
+
+/* MaxTH = MA * 2^Mn, with MA eight bits wide: exact up to 255. */
+static void ceetm_wred_maxth(uint32_t frames, struct qm_cgr_wr_parm *parm)
 {
 	uint32_t e = 0;
 
-	while (bytes > 0xff && e < 0x1f) {
-		bytes >>= 1;
+	while (frames > 0xff && e < 0x1f) {
+		frames >>= 1;
 		e++;
 	}
-	parm->MA = bytes > 0xff ? 0xff : bytes;
+	parm->MA = frames > 0xff ? 0xff : frames;
 	parm->Mn = e;
 }
 
@@ -1201,19 +1234,24 @@ static void ceetm_wred_slope(uint32_t maxp, uint32_t span,
 	sa = div64_u64(num, span);
 	if (sa < 64)
 		sa = 64;
-	if (sa > 127)
-		sa = 127;
+	if (sa > CEETM_WRED_SA_MAX)
+		sa = CEETM_WRED_SA_MAX;
 	parm->SA = sa;
 	parm->Sn = sn;
 }
 
 /* Put a class queue's congestion group on a WRED curve, and its tail drop at
- * the queue limit the same qdisc names.
+ * the queue limit the same qdisc names: min, max and limit are all frames.
  *
- * Both move to counting bytes rather than frames, because RED names its
- * thresholds in bytes and the offload carries no average frame size to convert
- * them with -- and because one mode covers tail drop and WRED together, so
- * they cannot disagree about the unit.
+ * Frames, as every class queue's group counts, with a curve or without one.
+ * A queued frame holds a buffer of the pool it arrived in until it is sent,
+ * however short the frame, so a bound in bytes is no bound on buffers: a RED
+ * limit of four megabytes held every buffer of the Ethernet pool with 64-byte
+ * frames, and the ports missed what they received (A337). The caller converts
+ * RED's byte thresholds into frames (cdx_htb.c). And one mode for every group,
+ * so none is ever switched between the two: a group does not convert the count
+ * it holds when its mode changes, and switched with frames queued it would go
+ * on counting in the new unit what it had counted in the old.
  */
 int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
 			 uint32_t max, uint32_t probability, uint32_t limit)
@@ -1234,23 +1272,17 @@ int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
 		return -ENODEV;
 
 	memset(&params, 0, sizeof(params));
-	params.mode = 0;	/* bytes */
+	params.mode = 1;	/* frames */
 	params.td_en = 1;
 	params.td_mode = 1;
 	qm_cgr_cs_thres_set64(&params.td_thres, limit, 0);
 
-	/* The probability arrives as a fraction of 2^32. */
-	maxp = (uint32_t)(((uint64_t)probability * CEETM_WRED_MAXP_UNITS) >> 32);
-	if (maxp < 4)
-		maxp = 4;
-	if (maxp > CEETM_WRED_MAXP_UNITS)
-		maxp = CEETM_WRED_MAXP_UNITS;
+	/* Derive the slope from the probability the field holds rather than
+	 * the one asked for. Pn steps in quarters of a 256th, so the curve's top
+	 * is not quite what was asked for -- and a slope drawn to the asked-for
+	 * top would put the curve's implied minimum somewhere else entirely. */
+	maxp = ceetm_wred_maxp(probability);
 	params.wr_parm_g.Pn = maxp / 4 - 1;
-	/* Take the probability back out of the field before deriving the slope
-	 * from it. Pn steps in quarters of a 256th, so the curve's top is not
-	 * quite what was asked for -- and a slope drawn to the asked-for top
-	 * would put the curve's implied minimum somewhere else entirely. */
-	maxp = 4 * (params.wr_parm_g.Pn + 1);
 	ceetm_wred_maxth(max, &params.wr_parm_g);
 	/* Draw the slope to the top the field actually holds rather than the one
 	 * that was asked for. MaxTH rounds down to an eight-bit mantissa, and on
@@ -1267,6 +1299,14 @@ int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
 	params.wr_en_y = 1;
 	params.wr_en_r = 1;
 
+	/* What the group already holds is not written again. A tree's cap draws
+	 * every RED leaf again whenever any of its shares moves (cdx_htb.c), and
+	 * a write that would change nothing could still fail, and the leaf lose
+	 * its curve for it. */
+	if (chnl_ctx->cq_info[quenum].wred && chnl_ctx->cq_info[quenum].qdepth == limit &&
+	    chnl_ctx->cq_info[quenum].wred_parm == params.wr_parm_g.word)
+		return 0;
+
 	mask = QM_CCGR_WE_MODE | QM_CCGR_WE_TD_EN | QM_CCGR_WE_TD_MODE |
 	       QM_CCGR_WE_TD_THRES |
 	       QM_CCGR_WE_WR_EN_G | QM_CCGR_WE_WR_EN_Y | QM_CCGR_WE_WR_EN_R |
@@ -1274,22 +1314,63 @@ int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
 	if (qman_ceetm_ccg_set(ccg, mask, &params))
 		return -EIO;
 	chnl_ctx->cq_info[quenum].qdepth = limit;
+	chnl_ctx->cq_info[quenum].wred = true;
+	chnl_ctx->cq_info[quenum].wred_parm = params.wr_parm_g.word;
 	return 0;
 }
 
 /* Take the curve away again, back to the frame-counted tail drop a leaf class
- * has without a RED qdisc on it. */
+ * has without a RED qdisc on it, at `depth' frames. */
 int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth)
 {
 	int rc;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES ||
+	    !depth)
 		return -EINVAL;
 	rc = ceetm_cq_wred_off(&qm_chnl_info[channel_num].cq_info[quenum]);
 	if (rc)
 		return rc;
 	if (ceetm_cfg_td_on_class_queue(&qm_chnl_info[channel_num], quenum, depth))
 		return -EIO;
+	return 0;
+}
+
+/* Move a class queue's tail drop to `depth' frames, and change nothing else:
+ * a curve running there, the queue's weight and its eligibility all stay. For
+ * a caller resizing queues against a budget of buffers (cdx_htb.c). Lowering
+ * a depth evicts nothing -- a queue holding more refuses frames until it has
+ * sent down to the new depth. Zero is refused: the group would take it as no
+ * tail drop at all. */
+int ceetm_set_class_depth(uint32_t channel_num, uint32_t quenum, uint32_t depth)
+{
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES ||
+	    !depth)
+		return -EINVAL;
+	if (!qm_chnl_info[channel_num].cq_info[quenum].ccg)
+		return -ENODEV;
+	if (ceetm_cfg_td_on_class_queue(&qm_chnl_info[channel_num], quenum, depth))
+		return -EIO;
+	return 0;
+}
+
+/* What a class queue's congestion group was last given: its tail-drop depth
+ * in frames, and whether a WRED curve runs on it. Each setter records it once
+ * the group took the change, so it is what the hardware holds. For a caller
+ * that shrinks some queues before it grows others, and so has to know which
+ * way each one moves. */
+int ceetm_class_queue_state(uint32_t channel_num, uint32_t quenum,
+			    uint32_t *depth, bool *wred)
+{
+	struct classque_info *cqinfo;
+
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
+	cqinfo = &qm_chnl_info[channel_num].cq_info[quenum];
+	if (!cqinfo->ccg)
+		return -ENODEV;
+	*depth = cqinfo->qdepth;
+	*wred = cqinfo->wred;
 	return 0;
 }
 

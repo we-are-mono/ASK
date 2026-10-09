@@ -25,7 +25,8 @@ def defines(path, *names):
 def test_wifi_forward_queues(tmp_path):
     source = (ROOT / "cdx/dpa_wifi.c").read_text()
     (tmp_path / "wifi_forward_queues_limits.inc").write_text(
-        defines("cdx/dpa_ipsec.h", "IPSEC_BUFCOUNT", "IPSEC_EXCEPTION_FRAMES", "IPSEC_EGRESS_FRAMES")
+        defines("cdx/dpa_ipsec.h", "IPSEC_BUFCOUNT", "IPSEC_SHARE_FRAMES",
+                "IPSEC_EXCEPTION_FRAMES", "IPSEC_EGRESS_FRAMES", "IPSEC_QDISC_FRAMES")
         + defines("cdx/dpa_wifi.h", "CDX_VWD_FWD_FQ_MAX")
         + defines("cdx/dpa_wifi.c", "VWD_FWD_FRAMES"))
     (tmp_path / "wifi_forward_queues_production.inc").write_text(

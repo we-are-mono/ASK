@@ -45,8 +45,8 @@ INNER = "198.18.102.2"
 # it for what the IPsec offline port sends out of that port.
 _POOL_HEADER = (Path(__file__).resolve().parents[2] / "cdx/dpa_ipsec.h").read_text()
 SEC_POOL = int(re.search(r"^#define IPSEC_BUFCOUNT\s+(\d+)$", _POOL_HEADER, re.M).group(1))
-SEC_EGRESS_FRAMES = SEC_POOL // int(re.search(
-    r"^#define IPSEC_EGRESS_FRAMES\s+\(IPSEC_BUFCOUNT / (\d+)\)$", _POOL_HEADER, re.M).group(1))
+assert re.search(r"^#define IPSEC_EGRESS_FRAMES\s+IPSEC_SHARE_FRAMES$", _POOL_HEADER, re.M)
+SEC_EGRESS_FRAMES = int(re.search(r"^#define IPSEC_SHARE_FRAMES\s+(\d+)$", _POOL_HEADER, re.M).group(1))
 
 # The IPsec offline port, which every frame SEC produces reaches next. Its
 # filter count is every frame FMan discarded for an error status, SEC's

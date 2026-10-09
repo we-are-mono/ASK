@@ -773,6 +773,10 @@ void cdx_ft_fatal(void);
 static unsigned follow_link_calls;
 static struct net_device *followed;
 static void dpa_fwd_cgr_follow_link(struct net_device *dev) { follow_link_calls++; followed = dev; }
+/* cdx_htb.c's resizer of a hardware qdisc's class queues, counted. */
+static unsigned mtu_changes;
+static struct net_device *mtu_changed;
+static void cdx_htb_mtu_changed(struct net_device *dev) { mtu_changes++; mtu_changed = dev; }
 #include "hardware_production.inc"
 #include "backend_production.inc"
 
@@ -870,9 +874,11 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     /* A physical port's link coming up or changing speed resizes its egress
      * bounds, latch or not, and so does its MTU changing, carrier or not --
      * the bound on SEC's frames counts frames of the largest size it admits;
-     * a link without carrier or a foreign device does not. */
+     * a link without carrier or a foreign device does not. Only the MTU
+     * resizes a hardware qdisc's class queues, whose RED curves count frames
+     * of the size it admits. */
     bool carrier = in->carrier;
-    unsigned follows = follow_link_calls;
+    unsigned follows = follow_link_calls, resizes = mtu_changes;
     in->carrier = true;
     assert(cdx_ft_netdev_event(NULL, NETDEV_UP, info) == NOTIFY_DONE);
     assert(follow_link_calls == follows + 1 && followed == in);
@@ -880,14 +886,15 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     assert(follow_link_calls == follows + 2);
     in->carrier = false;
     assert(cdx_ft_netdev_event(NULL, NETDEV_CHANGE, info) == NOTIFY_DONE);
-    assert(follow_link_calls == follows + 2);
+    assert(follow_link_calls == follows + 2 && mtu_changes == resizes);
     assert(cdx_ft_netdev_event(NULL, NETDEV_CHANGEMTU, info) == NOTIFY_DONE);
     assert(follow_link_calls == follows + 3 && followed == in);
+    assert(mtu_changes == resizes + 1 && mtu_changed == in);
     info->dev = &unrelated;
     unrelated.carrier = true;
     assert(cdx_ft_netdev_event(NULL, NETDEV_UP, info) == NOTIFY_DONE);
     assert(cdx_ft_netdev_event(NULL, NETDEV_CHANGEMTU, info) == NOTIFY_DONE);
-    assert(follow_link_calls == follows + 3);
+    assert(follow_link_calls == follows + 3 && mtu_changes == resizes + 1);
     info->dev = in;
     in->carrier = carrier;
     strcpy(out->name, "out");

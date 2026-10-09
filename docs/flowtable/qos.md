@@ -624,9 +624,11 @@ Some things the contract makes sharp:
   class under the root, rather than detached and rebound: detaching a live
   channel means draining it while frames are still being classified onto it.
   Channels return to the global pool at `TC_HTB_DESTROY`.
-- Leaf class queues get a tail-drop depth of 128 frames rather than the
+- Leaf class queues ask for a tail-drop depth of 128 frames rather than the
   hardware layer's default of eight, which is far too shallow for a queue that
-  is deliberately being shaped. Increment 6 replaces tail drop with WRED.
+  is deliberately being shaped, and get it while the tree's budget allows —
+  increment 6 caps the tree as a whole (A337). Increment 6 also offers WRED in
+  place of plain tail drop.
 
 Limits, all of them the hardware's: eight channels for the whole SoC shared by
 every port, eight weighted leaves per channel until WBFS group B is claimed
@@ -1010,8 +1012,8 @@ its queue back to its parent: sch_htb deletes the class before it destroys the
 RED qdisc on it, so the qdisc's own destroy arrives naming a class that is
 gone. The hardware layer backs that up for every path — configuring a class
 queue for a class, resetting one, and resetting a port all turn the curve off
-— because a curve drawn in bytes left under a tail drop counted in frames is
-something no qdisc describes and nothing would ever take away.
+— because a curve left behind is drawn for another class's depth, which no
+qdisc describes and nothing would ever take away.
 
 **Converting the curve is the whole of the work.** RED says "start dropping at
 min, reach probability P at max". The CCG says "reach P at MaxTH, getting there
@@ -1028,14 +1030,71 @@ are not:
 
 Both were caught by `tools/host_tests/ceetm_wred.py`, which asserts the
 invariant that matters — the curve's *implied minimum* lands back on the
-minimum that was asked for — across seven shapes rather than checking that each
+minimum that was asked for — across nine shapes rather than checking that each
 field round-trips.
 
-Tail drop moves to counting bytes along with the curve, because RED names its
-thresholds in bytes and the offload carries no average frame size to convert
-them with, and because one mode covers both so they cannot disagree about the
-unit. RED's `limit` becomes the tail-drop threshold. Without a RED qdisc a leaf
-keeps the frame-counted default from increment 3.
+**Every class queue counts frames, a curve's included (A337).** A frame on a
+class queue holds a buffer until the port sends it, however short the frame:
+one of the pool every DPAA port receives into, or for an IPsec flow one of
+SEC's output pool. The curve and its tail drop first moved to bytes, the unit
+RED names its thresholds in, and a bound in bytes is no bound on buffers. A
+10 Mbit class with `limit 4000000 min 1000000 max 3000000`, offered a flood of
+64-byte UDP, held the whole Ethernet pool: the WAN port missed 2.49 million
+frames, and twenty pings went unanswered. A group switched
+between the two units with frames queued would also go on counting in the new
+unit what it had counted in the old, because the hardware does not convert the
+count it holds. So no group ever leaves frame mode, and RED's thresholds are
+converted instead.
+
+**The conversion divides by a standard frame on the wire**: the port's MTU or
+1,500 bytes, whichever is smaller, plus a VLAN-tagged Ethernet header and the
+24 bytes of preamble, gap and FCS — 1,542 bytes on a standard port
+(`cdx_htb_red_frames()`). `limit` becomes the depth the queue asks for, never
+less than a frame, and `min` and `max` the curve's band. Not the largest frame
+a jumbo port admits: divided by 9,642 bytes, `min 20000 max 60000`, one of the
+curves measured below, would be a band of two frames to six. A queue of small
+frames therefore holds fewer bytes than the qdisc's limit names, and one of
+jumbo frames more; what bounds its buffers is the frame count, and the cap
+below. The band is never narrower than two frames: the slope is at most 127 per
+frame against a maximum probability of up to 252 256ths, so a band of one frame
+is drawn gentler than asked, starting a frame early
+(`ceetm_wred_min_band()`), and a band that rounded to nothing would be refused
+outright. An MTU change (`NETDEV_CHANGEMTU`) redraws every RED curve on the
+port.
+
+**The tree is capped.** A tree's class queues together hold no more than the
+port's share of the Ethernet pool — half of what the port seeds it with, 1,280
+frames with four CPUs, the share its forwarding queues and SEC's input queues
+are held to — and all live trees together no more than half of SEC's output
+pool, 1,024 of its 2,048 buffers, divided evenly between them: a class queue
+carries SEC's frames among the rest and cannot tell them apart. With one tree
+the SEC share binds, 1,024 frames; with two, 512 each. The queues counted are
+each leaf's and the top channel's queues 0 and 7 that unclassified and control
+traffic take while no leaf holds them, eighteen at most; queue 0 keeps a single
+frame and takes no share while a `default` leaf takes the unclassified traffic.
+Each asks for a depth — 128 frames for a plain leaf or one of those two queues,
+its limit for a RED leaf — and the budget is shared max-min fair
+(`cdx_htb_cap()`): a queue asking for no more than an even share gets what it
+asks for, and the rest split what is left evenly. A small tree's three queues
+get their 128 each; sixteen leaves and the two queues get 56 each, where 128
+each would be 2,304. The class above, alone in its tree beside those two
+queues, asks for 2,594 frames and gets the 768 they leave. A RED leaf given
+less than its limit has its band scaled by what it got against what it asked
+for, so the curve keeps its shape below the shallower tail drop: that class's
+648 to 1,945 frames become 191 to 575. The shares are drawn again after every
+change to the tree, to a RED curve and to the port's MTU, and whenever a tree
+comes or goes on any port — for a port that goes, once its CEETM context is
+released. Every queue that shrinks is programmed before any that grows, so the
+depths never add up past the budget, and while a queue will not shrink none
+grows. What the queues hold can run past it for a while: lowering a depth
+evicts nothing, so a queue holding more sends down to its new depth at its own
+rate while the queues that grew fill — at most the larger of each queue's old
+and new depth, added up. A deleted leaf's queue leaves the count with whatever
+it still holds; reset, it is eligible only for the excess tokens the tree's own
+queues leave unused, and drains as they come — behind a class that takes every
+token it may, not until that class goes quiet. A RED curve the group already
+holds is not written again. `tools/host_tests/htb_offload.py` checks the budget
+on every write.
 
 **Congestion-state notification stays off**, which settles the question this
 increment was asked to decide. Nothing consumes a notification: there is no CSCN
@@ -1044,31 +1103,38 @@ portal with no consumer. The visibility gap it was meant to close is closed
 instead by increment 5 — the rejected-frame counter is the observable, and a
 counter costs nothing where an interrupt would.
 
-*Proved on hardware, 2026-09-17.* A `rate 500mbit` class on `eth4`, an offloaded
-bulk flow saturating it, and a ping through the same class as the sparse flow —
-software-forwarded, because ICMP is not offloadable, so the two paths increments
-3 and 4 built share one class queue.
+*Proved on hardware, 2026-09-17; re-measured in frames, 2026-10-09.* A
+`rate 500mbit` class on the LAN port, four offloaded TCP streams saturating it,
+and a sparse probe flow marked into the same class queue and offloaded as well,
+which sends its next datagram only once the last is answered, so its round trip
+is how deep the queue sits; idle, 0.345 ms. RED's thresholds are bytes, which
+the class queue counts as frames of the port's MTU, 1,542 bytes on the wire:
+`min 60000 max 150000` is 38 to 97 frames. Goodput was 470 Mbit/s in every row.
 
-| leaf class queue | ping avg | ping max | sparse-flow loss | frames rejected |
+| leaf class queue | probe avg | probe max | probe loss | frames rejected |
 | --- | --- | --- | --- | --- |
-| tail drop only | 3.359 ms | 3.658 ms | 6.7% | 3,194 |
-| `min 60000 max 150000 probability 0.02` | 2.448 ms | 3.161 ms | 0% | 4,245 |
-| `min 20000 max 60000 probability 0.02` | 1.646 ms | 1.930 ms | 0% | 8,112 |
-| `min 20000 max 60000 probability 0.20` | 1.428 ms | 1.870 ms | 0% | 3,512 |
-| `min 5000 max 20000 probability 0.02` | 1.298 ms | 4.108 ms | 6.7% | 18,302 |
+| tail drop only (128 frames) | 2.818 ms | 3.271 ms | 0 of 498 | 2,138 |
+| `min 60000 max 150000 probability 0.02` | 2.223 ms | 2.535 ms | 4 of 401 | 5,357 |
+| `min 20000 max 60000 probability 0.02` | 0.952 ms | 1.120 ms | 8 of 306 | 6,179 |
+| `min 20000 max 60000 probability 0.20` | 0.818 ms | 1.059 ms | 5 of 378 | 4,159 |
+| `min 5000 max 20000 probability 0.02` | 0.364 ms | 0.540 ms | 14 of 186 | 15,116 |
 
-The baseline is bufferbloat, and measurably so: 128 frames of 1514 bytes drained
-at 500 Mbit is 3.1 ms, and the queue sat full at 3.36. WRED halves that and
-takes the sparse flow's loss to zero — tail drop was hitting the ping, and early
-random drops hit the bulk flow instead, which is the entire point.
+The baseline is bufferbloat, and measurably so: 128 frames of 1542 bytes drained
+at 500 Mbit is 3.2 ms, and the probe's round trip sat at 2.8 against 0.345
+idle. A band of 20,000 to 60,000 bytes takes it to a third of that, a tighter one
+further. The probe shares the curve: an early drop takes whichever
+frame arrives, so the sparse flow loses its share of them too, where the full
+tail lost none of 498 probes. The 2026-09-17 run, with the curve in bytes and a
+ping of fifteen through software as the sparse flow, had the reverse -- one of
+fifteen lost to the tail, none to the curves -- and fifteen was too few to tell.
 
 Latency falls monotonically as the band tightens and rejections rise with it,
-across a twelvefold range of thresholds, which is what says the byte thresholds
-land where they were asked to. Raising the probability shortens the queue
-*and* drops less, which is the equilibrium moving down a steeper curve rather
-than an anomaly. Too tight a band — five thousand bytes is about three frames —
-starts dropping the sparse flow again, and is the far edge of useful
-configuration rather than a better setting.
+across a twelvefold range of thresholds, which is what says the thresholds land
+where they were asked to after their conversion into frames. Raising the
+probability shortens the queue *and* drops less, which is the equilibrium moving
+down a steeper curve rather than an anomaly. Too tight a band — five thousand
+bytes is three frames — drops the sparse flow most of all, and is the far edge
+of useful configuration rather than a better setting.
 
 What that does **not** establish is the one number the SDK headers give no units
 for. `MaxP = 4 * (Pn + 1)` is a fraction of something they never state; 256ths
@@ -2281,7 +2347,9 @@ of 1,280, they ran at 9.15 and 7.07 Gbit/s with the reverse RTT at 0.3 ms, and
 each direction alone at 9.4. With the LAN port paused, 64-byte frames
 offloaded towards it now leave the pool alone: the WAN port misses none and
 the DUT answers pings on it throughout (`flowtable_stalled_port_counters.py`). A port with an HTB tree uses its CEETM
-class queues instead, which have their own tail drop and WRED (sections 3 and 6).
+class queues instead, which count frames too, with their own tail drop and
+WRED, and hold together no more than the same share of the pool, or less where
+SEC's pool is the tighter bound (sections 3 and 6, A337).
 
 ## The consumer contract
 
@@ -2539,7 +2607,7 @@ driver. Every number here is the hardware's or the driver's, not a policy:
 | Leaf classes | 16 per port | per port | `CDX_CEETM_MAX_QUEUES_PER_CHANNEL`, `:59` |
 | Weighted leaves | 8 per channel | until WBFS group B is claimed | `qman_ceetm_cq_claim_A` |
 | Strict priorities | 8 | per channel | CEETM |
-| Tail-drop depth | 128 frames | per leaf, ASK's default | hardware default is 8, far too shallow |
+| Tail-drop depth | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, half of SEC's pool (1,024 of 2,048) shared evenly | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair; the hardware default is 8, far too shallow |
 | Ingress policer profiles | 8, of which **7** are addressable | per port | profile 0 is the default for everything unclassified; `CDX_FT_QOS_MAX_POLICER` |
 | DSCP→class egress map | **1 port at a time** | SoC-wide | "Now supporting only one interface", and the second port is refused |
 | Flowtable bindings | `MAX_PHY_PORTS` per table, 2 tables | one per cdx-backed port per table; the second table is a replacement or a probe | `CDX_FT_MAX_TABLE_DEVICES`, `CDX_FT_MAX_TABLES`; was 2 until A152 |

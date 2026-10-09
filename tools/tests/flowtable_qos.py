@@ -32,20 +32,21 @@ from __future__ import annotations
 
 import pytest
 
-from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HIGH, PORT_LOW, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, TCP_FRAME, TCP_PAYLOAD
+from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HIGH, PORT_LOW, PORT_POOL, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, TCP_FRAME, TCP_PAYLOAD
 
 from _flowtable_qos import (CAP_MBIT, COUNT, DATAGRAM, EF_TOS, OAL, OFFERED_MBIT, POLICE_BURST, PORT_DECLINED, PORT_DEFAULT, PORT_EF_REPLACED, PORT_EGRESS, PORT_POLICED, PORT_SATURATE, PORT_SHAPED, PROBE_SLACK, REMARK_CLASS, REMARK_MASK, SETTLE, TAIL_FRAMES, UDP_HEADERS, UNSHAPED_GBPS, WEIGHTED_CQ, WINDOW, WRED_BANDS, WRED_LIMIT, WRED_MBIT, WRED_PROBABILITY, admit, captured, conntrack_ids, directions, dut_ping, ef_filter, egress, handshakes, inbound, iperf, lan_start, leaf_delta, lockstep, logged, offered, offload, police_counters, probe, qdisc_shown, read_intervals, readmitted, received_bps, received_loss, reload_adapter, shaped_bps, timing_slack, tree)
 
 import asyncio
 import json
 import re
+import socket
 import statistics
 import threading
 import time
 
 
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from _flowtable_rig import (WAN_IP, command, read)
+from _flowtable_rig import (WAN_IP, command, pings_answered, pool_lowest, port_drops, read)
 
 
 # ---- the scheduler ---------------------------------------------------------
@@ -349,6 +350,83 @@ async def test_wred_drops_before_the_tail(qos):
     assert wide["added"] <= 1.3 * delay(WRED_BANDS["wide"][1]) + PROBE_SLACK, wide
     assert wide["added"] >= 0.5 * delay(WRED_BANDS["wide"][0]), wide
     assert narrow["added"] < wide["added"] < tail["added"], phases
+
+
+# A slow class under a RED qdisc whose limit is deep in bytes: seconds of
+# full-size frames at the class's rate, and many times the Ethernet pool in
+# small ones.
+POOL_MBIT = 10
+POOL_RED = {"limit": 4_000_000, "min": 1_000_000, "max": 3_000_000}
+# What a port's class queues may hold of the pool every port receives into,
+# altogether: half of what the port seeds it with, 640 for each of four CPUs.
+POOL_SHARE = 4 * 640 // 2
+
+
+def _flood(destination, port, seconds, size=64):
+    """`size`-byte datagrams on the flow admit() put in hardware -- lockstep()'s
+    tuple, source port the destination's -- as fast as one socket goes."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((WAN_IP, port))
+    payload, sent, end = bytes(size), 0, time.monotonic() + seconds
+    try:
+        while time.monotonic() < end:
+            for _ in range(64):
+                try:
+                    sock.sendto(payload, (destination, port))
+                    sent += 1
+                except OSError:
+                    pass
+    finally:
+        sock.close()
+    return sent
+
+
+async def test_red_leaf_leaves_the_pool(qos):
+    """A class queue's frames hold buffers of the pool every DPAA port receives
+    into, however short they are, as the forwarding queues' do (A341). A RED
+    qdisc names its limit in bytes, and a slow class flooded with small
+    datagrams faster than it sends filled to that limit: thousands of frames
+    more than the pool has, and every port's receive starved. The class queue
+    now counts frames, and the port's whole tree holds no more than its share
+    of the pool, so the WAN port the flood arrives on misses nothing, the DUT
+    answers pings on it, and the class queue refuses the rest (A337)."""
+    r = qos
+    dev = TARGET_LAN_IF
+    mark = r.mark(HIGH_CQ)
+    await tree(r, dev, POOL_MBIT, [("1:10", HIGH_PRIO)])
+    burst = (2 * POOL_RED["min"] + POOL_RED["max"]) // (3 * 1500) + 1
+    await r.tc("qdisc", "add", "dev", dev, "parent", "1:10", "handle", "10:", "red",
+               *(str(v) for item in POOL_RED.items() for v in item), "avpkt", "1500",
+               "burst", str(burst), "probability", "0.02", "bandwidth", f"{POOL_MBIT}mbit")
+    red = await qdisc_shown(r, dev, "10:")
+    assert red.get("offloaded") is True, red
+    await offload(r, inbound(r, "udp", PORT_POOL, mark))
+    await lan_start(r, echo=[PORT_POOL])
+    forward, _ = await admit(r, PORT_POOL)
+    assert int(forward["qos"], 16) == HIGH_CQ, forward
+    bpid, idle = await pool_lowest(0)
+    before, leaf_before = await port_drops(), await egress(r, dev)
+    sent, (_, lowest), answered = await asyncio.gather(
+        asyncio.to_thread(_flood, r.lan_ip, PORT_POOL, 4),
+        pool_lowest(6, bpid),
+        pings_answered(r.dut_wan_ip, 20, 1.5))
+    after, leaf_after = await port_drops(), await egress(r, dev)
+    leaf = leaf_delta(leaf_before, leaf_after, 0)
+    wan = {k: after[TARGET_WAN_IF][k] - before[TARGET_WAN_IF][k] for k in before[TARGET_WAN_IF]}
+    record = {"sent": sent, "answered": answered, "leaf": leaf, "wan": wan,
+              "pool": {"bpid": bpid, "idle": idle, "lowest": lowest}}
+    r.record("qos-red-pool", record)
+    assert sent > 100_000, record
+    # The flood reached the class in hardware, and the class queue refused
+    # what it could not hold.
+    assert leaf["frames"] + leaf["rejected"] > sent // 2 and leaf["rejected"] > sent // 2, record
+    # The port it arrived on lost nothing for want of a buffer, kept
+    # receiving the kernel's own traffic, and the tree held no more of the
+    # pool than its share: the leaf's 768 frames of it, SEC's half of its own
+    # pool less the two queues beside it, and what is in flight.
+    assert wan["rx_missed_errors"] == 0 and answered == 20, record
+    assert idle - lowest <= POOL_SHARE, record
 
 
 async def test_red_reports_what_the_hardware_holds(qos):

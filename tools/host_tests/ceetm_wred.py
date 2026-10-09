@@ -31,11 +31,14 @@ def test_curve(tmp_path):
     compiler = os.environ.get("CC", "cc")
     assert shutil.which(compiler), f"C compiler required: {compiler}"
     source = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
-    names = ["ceetm_cq_wred_off", "ceetm_wred_maxth", "ceetm_wred_slope",
+    names = ["ceetm_cq_wred_off", "ceetm_wred_maxp", "ceetm_wred_min_band",
+             "ceetm_wred_maxth", "ceetm_wred_slope",
              "ceetm_set_class_wred", "ceetm_clear_class_wred",
+             "ceetm_set_class_depth", "ceetm_class_queue_state",
              "ceetm_set_class_queue", "ceetm_reset_class_queue"]
     (tmp_path / "wred_production.inc").write_text(
-        "#define CEETM_WRED_MAXP_UNITS\t256u\n"
+        "".join(line + "\n" for line in source.splitlines()
+                if line.startswith("#define CEETM_WRED_"))
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "ceetm_wred"
     run_process([

@@ -547,7 +547,7 @@ rel_fd:
  * flow's queue is drained by one CPU: a share per portal would multiply the
  * pool's commitment, and a CPU that falls behind holds the group at its
  * threshold for every VAP until it catches up. */
-#define VWD_FWD_FRAMES	(IPSEC_BUFCOUNT / 8)
+#define VWD_FWD_FRAMES	IPSEC_SHARE_FRAMES
 
 /* No state-change notifications, so no portal owns the group; the egress
  * groups set theirs up the same way (devman.c). */

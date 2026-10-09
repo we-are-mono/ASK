@@ -11,7 +11,7 @@
 #define IPSEC_FMAN_IDX 0
 #define PORT_TYPE_IPSEC 1
 #define IPSEC_BUFSIZE 2048
-#define IPSEC_BUFCOUNT 512
+#include "ipsec_pool.inc"
 #define PORTID_SHIFT_VAL 8
 #define NR_CPUS 4
 #define FQ_TYPE_RX_PCD 1
@@ -1190,7 +1190,9 @@ int main(void)
         reset(); normal(); /* Same tracked state can be acquired again. */
     }
     const char *kinds[] = { "head", "skb", "dma" };
-    const unsigned positions[] = {1, 2, 8, 9, 10, 511, 512};
+    /* The output pool's first buffers, each boundary of a batch of eight,
+     * and its last two, at the size the header gives it. */
+    const unsigned positions[] = {1, 2, 8, 9, 10, IPSEC_BUFCOUNT - 1, IPSEC_BUFCOUNT};
     for (unsigned k = 0; k < 3; k++) for (unsigned p = 0; p < 7; p++) {
         reset(); seed_failure = kinds[k]; seed_fail = positions[p];
         assert(cdx_dpa_ipsec_init() != SUCCESS);
@@ -1198,7 +1200,10 @@ int main(void)
         clean(); cases++;
     }
     /* Fail each boundary of raw SG seeding, after the output pool. */
-    const unsigned sg_positions[] = {513, 514, 520, 521, 1023, 1024};
+    const unsigned sg_positions[] = {
+        IPSEC_BUFCOUNT + 1, IPSEC_BUFCOUNT + 2, IPSEC_BUFCOUNT + 8, IPSEC_BUFCOUNT + 9,
+        IPSEC_BUFCOUNT + CDX_MAX_SG_BUFF_COUNT - 1, IPSEC_BUFCOUNT + CDX_MAX_SG_BUFF_COUNT,
+    };
     for (unsigned k = 0; k < 3; k += 2) for (unsigned p = 0; p < 6; p++) {
         reset(); seed_failure = kinds[k]; seed_fail = sg_positions[p];
         assert(cdx_dpa_ipsec_init() != SUCCESS);

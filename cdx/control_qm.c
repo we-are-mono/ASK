@@ -134,7 +134,7 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 {
 #ifdef ENABLE_EGRESS_QOS
-	int ii;
+	int ii, rc;
 
 	for (ii = 0; ii < ARRAY_SIZE(gQMCtx); ii++) {
 		if (gQMCtx[ii].iface_info == iface_info) {
@@ -143,7 +143,9 @@ int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 			 * classes in. */
 			cdx_dscp_port_gone(&gQMCtx[ii]);
 			cdx_htb_port_gone(&gQMCtx[ii]);
-			return ceetm_release_iface(&gQMCtx[ii]);
+			rc = ceetm_release_iface(&gQMCtx[ii]);
+			cdx_htb_port_released();
+			return rc;
 		}
 	}
 #endif

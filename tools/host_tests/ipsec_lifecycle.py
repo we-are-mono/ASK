@@ -47,6 +47,10 @@ def test_ipsec_lifecycle(tmp_path):
     control = (ROOT / "cdx/control_ipsec.h").read_text()
     regs = (kernel / "drivers/crypto/caam/regs.h").read_text()
     header = (ROOT / "cdx/dpa_ipsec.h").read_text()
+    # SEC's output pool and its fixed share, as the header defines them.
+    (tmp_path / "ipsec_pool.inc").write_text(
+        re.search(r"^#define\s+IPSEC_BUFCOUNT\s.*$", header, re.M).group() + "\n"
+        + re.search(r"^#define\s+IPSEC_SHARE_FRAMES\s.*$", header, re.M).group() + "\n")
     (tmp_path / "ipsec_types.inc").write_text(
         re.search(r"^#define\s+IPSEC_EXCEPTION_FRAMES\s.*$", header, re.M).group() + "\n"
         + re.search(r"^#define\s+IPSEC_TO_SEC_FRAMES\s.*$", header, re.M).group() + "\n"

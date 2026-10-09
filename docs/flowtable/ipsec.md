@@ -1363,9 +1363,9 @@ and at line rate it is also a log flood.
 
 #### Frames the offline port gives the CPU must not take SEC's pool
 
-SEC writes every job's output into one buffer of its own BMan pool, 1024
-buffers (`IPSEC_BUFCOUNT`, 512 until A335) shared by every SA in both
-directions. A frame the offline port forwards in hardware returns its buffer
+SEC writes every job's output into one buffer of its own BMan pool, 2048
+buffers (`IPSEC_BUFCOUNT`; 512 until A335, 1024 until A337) shared by every SA
+in both directions. A frame the offline port forwards in hardware returns its buffer
 when the egress port has sent it, within microseconds; under 2.5 Gbit/s of
 offloaded traffic SEC has fewer than twenty of them out at once. A frame that
 misses the offline port's flow table goes to the
@@ -1464,15 +1464,24 @@ refuses, and the offline port counts it in `ipsec_offline_port_rejected`. With
 the port paused, the same stream now loses 1,031,091 frames there, at the
 port's share; SEC refuses none, and the pool never reads below 880.
 
-The pool grew to 1024 for this: an eighth each to the exception queues, the
-Wi-Fi VAP queues and every Ethernet port, which on a five-port board leaves an
-eighth to SEC with every queue full at once. Each port's bound sits far below
-the 1.6 ms its forwarding queues allow at 10 Gbit/s (128 full-size frames is
-157 µs), the cost of a pool that has to cover every port; it matters only
-where a fast port is congested by other traffic. `flowtable_ipsec_stalled_port.py`
-is the paused-port case. On a port a hardware qdisc owns, the offline port's
-frames take their class queue like any other frame, which counts frames but
-holds more than a port's share (A337).
+The pool grew to 1024 for this, and to 2048 for the hardware qdisc trees
+below (A337). The exception queues, the Wi-Fi VAP queues and every Ethernet
+port each have a fixed share of 128 frames (`IPSEC_SHARE_FRAMES`), 896 on a
+five-port board; half the pool, 1,024 frames, is the qdisc trees'; and what is
+left, 128, is SEC's own with every queue full at once. Each buffer is an
+order-2 allocation, 16 KiB with jumbo frames, so the pool takes 32 MiB, 16 MiB
+more than at 1024. Each port's bound sits far below the 1.6 ms its forwarding
+queues allow at 10 Gbit/s (128 full-size frames is 157 µs), the cost of a pool
+that has to cover every port; it matters only where a fast port is congested
+by other traffic. `flowtable_ipsec_stalled_port.py` is the paused-port case.
+
+On a port a hardware qdisc owns, the offline port's frames take their class
+queue like any other frame. Those counted bytes once a RED qdisc was on them,
+and a tree of sixteen leaves held 2,048 frames even without one, more than the
+port's share. Every class queue counts frames now, and a tree's class queues
+together hold no more than the trees' half of this pool divided evenly between
+the live trees -- 1,024 frames with one tree, 512 each with two -- because a
+class queue cannot tell SEC's frames from the rest (qos.md, increment 6).
 
 #### Nor its own input
 

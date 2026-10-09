@@ -324,17 +324,8 @@ result independently of those temporary files.
 - [x] **A335 — an egress port's congestion group bounded bytes, not SEC's buffers.** A paused LAN port held all of pool 34
   and SEC refused 1.03M jobs; the offline port now has frame-counted queues per port (_:/^cdx: give the IPsec offline port its own frame-counted egress queues_).
 
-- [ ] **A337 — on a port a hardware qdisc owns, SEC's output still queues by the class's own bound.** The IPsec
-  offline port's frames take the class queue their mark resolves to (`cdx_get_sec_txfqid()` defers to
-  `cdx_get_txfqid()`), which tail-drops at `CDX_HTB_CQ_DEPTH` (128) frames per leaf, or at a RED leaf's limit in
-  bytes. That is a port's whole share of pool 34 (`IPSEC_EGRESS_FRAMES`) per class, and a tree of sixteen leaves is
-  twice the pool, so a shaped WAN class carrying an SA's output, or LAN classes taking decrypted traffic slower than the
-  tunnel, can still pin the pool and starve every SA. CEETM counts congestion per class queue, so the offline port's
-  frames cannot be bounded apart from the port's own there as they are on a plain port. A RED leaf's byte limit exposes
-  the Ethernet pool the same way A341 did on a plain port: 1 MB holds some 16,000 minimum-size frames, past the 12,800
-  buffers every port receives into. Fix direction: check whether a class queue's logical FQs can be given one for the
-  offline port in a QMan group of its own; else bound the tree's total depth, in frames, by both pools. Source-verified;
-  not reproduced.
+- [x] **A337 — a hardware qdisc's class queues could hold SEC's pool and, under RED's byte limit, the Ethernet pool.** Every
+  class queue counts frames, and a tree's depths share SEC's half of its doubled pool (_:/^cdx: bound a hardware qdisc's class queues by the buffers they hold_).
 
 - [x] **A340 — a bridge whose MTU exceeds a member port's offloaded frames that port's MTU forbids.** A direction's MTU
   is now also bounded by what its physical port carries (_:/^flowtable: bound a direction's MTU by the port it leaves by_).
@@ -368,8 +359,9 @@ result independently of those temporary files.
 
 - [ ] **A345 — a flow decrypted by one SA and encrypted by another can hold SEC's own pool while it waits for SEC.**
   Such a direction's decrypted frames leave the IPsec offline port for the second SA's input queue (FQ_TO_SEC), each
-  in a buffer of SEC's output pool (`IPSEC_BUFCOUNT`, 1024). Since A344 those queues share one frame-counted group, but
-  sized for the Ethernet pool (`IPSEC_TO_SEC_FRAMES`, 1,280), more than SEC's pool has; before it they were unbounded.
+  in a buffer of SEC's output pool (`IPSEC_BUFCOUNT`, 2048). Since A344 those queues share one frame-counted group, but
+  sized for the Ethernet pool (`IPSEC_TO_SEC_FRAMES`, 1,280), and SEC's budget has no share for it: the fixed shares
+  and the qdisc trees' half leave 128, SEC's own jobs'; before A344 they were unbounded.
   A hub that relays between tunnels faster than SEC processes them could fill the group with SEC's own buffers and
   SEC would then refuse every SA's jobs for want of an output buffer, as in A333. Fix direction: a second input queue
   per SA for what the offline port sends back into SEC, in a group of its own sized from SEC's pool (which means a

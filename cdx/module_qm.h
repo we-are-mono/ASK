@@ -60,6 +60,12 @@ struct classque_info {
 		uint32_t weight;	/* for WBFQs */
 	};
 	uint32_t qdepth;		/* CQ depths */
+	/* A WRED curve runs on the queue's congestion group: set by
+	 * ceetm_set_class_wred(), cleared by ceetm_cq_wred_off(), each once the
+	 * group took the change. */
+	bool wred;
+	/* That curve, as ceetm_set_class_wred() encoded it for every colour. */
+	uint32_t wred_parm;
 };
 
 #define MAX_DSCP	64
