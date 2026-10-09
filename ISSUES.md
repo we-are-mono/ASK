@@ -366,14 +366,28 @@ result independently of those temporary files.
   1,280, and the next 16 PAUSE cases on that image, run back to back, left no host-command timeout and every port
   sending; keep open until a cause is found or a longer soak stays clean.
 
-- [ ] **A344 — the queues into SEC have no bound by default.** Every SA's to-SEC FQ joins a congestion group only when
-  the `sec_congestion` module parameter names a byte threshold (`create_ipsec_fqs()`, `cdx_dpaa_ingress_cgr_init()`,
-  `cdx/dpa_ipsec.c`); it defaults to 0, as in NXP's tree, and the FQ's own tail drop is compiled out (`FQ_TAIL_DROP`).
-  What waits there holds buffers of the Ethernet pool every port receives into, so traffic offered to an SA faster than
-  SEC processes it -- small frames at 10G, or several SAs at once -- can hold that pool exactly as A341's paused port
-  did, and every port's receive starves. Fix direction: one frame-counted group for every to-SEC FQ, a share of the
-  Ethernet pool as `fwd_pool_frames()` takes, sized against SEC's throughput rather than a link's; reproduce first with
-  a small-frame stream faster than SEC. Found by the review confirming A341; source-verified, not reproduced.
+- [x] **A344 — the queues into SEC had no bound by default.** Every SA's input queue now joins one frame-counted group
+  at a share of the Ethernet pool (_:/^cdx: bound SEC's input queues by the buffers they hold_).
+
+- [ ] **A347 — a flood the CPU cannot keep up with can take the Ethernet buffer pool.** Each DPAA port's queues to
+  the CPU -- its default, error and PCD receive FQs -- share a group whose tail drop is
+  `CONFIG_FSL_DPAA_INGRESS_CS_THRESHOLD`, 256 MB in bytes (`dpaa_eth_priv_ingress_cgr_init()`, sdk_dpaa), against the
+  pool of 12,800 buffers every port receives into, and the CPU replaces a buffer only once it has taken the frame
+  (`dpaa_eth_refill_bpools()`). Measured while proving A344: the first second of a 64-byte flood into an IPsec flow not
+  yet offloaded emptied the pool for 0.7 s and the LAN port missed 360,000 frames; the CPU then worked the backlog off
+  at ~3,200 frames/s on the KASAN image. Any burst the CPU cannot keep up with -- a flood to the DUT's own address,
+  traffic the classifier hands up -- starves every port's receive, offloaded forwarding included. NXP's SDK design.
+  Fix direction: bound each port's CPU-bound queues in frames at a share of the pool, as `fwd_pool_frames()` does for
+  the forwarding queues (a patch to sdk_dpaa); check what the CPU path needs for bursts at 10G first.
+
+- [ ] **A345 — a flow decrypted by one SA and encrypted by another can hold SEC's own pool while it waits for SEC.**
+  Such a direction's decrypted frames leave the IPsec offline port for the second SA's input queue (FQ_TO_SEC), each
+  in a buffer of SEC's output pool (`IPSEC_BUFCOUNT`, 1024). Since A344 those queues share one frame-counted group, but
+  sized for the Ethernet pool (`IPSEC_TO_SEC_FRAMES`, 1,280), more than SEC's pool has; before it they were unbounded.
+  A hub that relays between tunnels faster than SEC processes them could fill the group with SEC's own buffers and
+  SEC would then refuse every SA's jobs for want of an output buffer, as in A333. Fix direction: a second input queue
+  per SA for what the offline port sends back into SEC, in a group of its own sized from SEC's pool (which means a
+  share carved from the eighths `dpa_ipsec.h` budgets). Source-verified; not reproduced: the rig has one tunnel.
 
 - [ ] **A342 — `ipsec_vlan_iperf_probe.py` can fail when the WAN host starves a stream of its ACKs.** One full-suite
   run saw two of four streams stall from the start: the WAN host reordered their ESP ACKs past the 32-entry replay

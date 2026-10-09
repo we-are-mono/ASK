@@ -7,7 +7,6 @@
 #include <errno.h>
 #undef errno
 
-#define CS_TAIL_DROP
 #define MAX_MATCH_TABLES 4
 #define IPSEC_FMAN_IDX 0
 #define PORT_TYPE_IPSEC 1
@@ -137,6 +136,9 @@ struct qman_portal { int unused; };
 typedef struct { int counter; } atomic_t;
 #define ATOMIC_INIT(n) { (n) }
 static int atomic_inc_return(atomic_t *v) { return ++v->counter; }
+static void atomic_inc(atomic_t *v) { ++v->counter; }
+#define QM_MR_RC_MASK 0xf0
+#define QM_MR_RC_CGR_TAILDROP 0x00
 struct sec_descriptor { char data[128]; };
 typedef struct { void *proc_dir; } cdx_proc_dir_entry_t;
 struct sk_buff { void *head; bool head_frag; };
@@ -168,8 +170,11 @@ static unsigned cdx_ft_epoch(void) { assert(cdx_info->ctrl.mutex); return datapa
 enum qman_fq_state { qman_fq_state_oos, qman_fq_state_sched, qman_fq_state_retired };
 /* A queue with the frames it holds, which retirement leaves on it and a
  * volatile dequeue delivers through its callback. */
+struct qman_cgr;
 struct qman_fq {
-    unsigned fqid, flags, pending, held; bool acquired, proc, member;
+    unsigned fqid, flags, pending, held; bool acquired, proc;
+    /* The congestion group the queue joined, if any. */
+    const struct qman_cgr *group;
     struct qm_fd frames[4];
     enum qman_fq_state state;
     struct {
@@ -217,7 +222,9 @@ static void refcount_inc(refcount_t *r) { assert(*r); ++*r; }
 static bool refcount_dec_and_test(refcount_t *r) { assert(*r); return !--*r; }
 #include "ipsec_types.inc"
 static bool dpa_ipsec_ready;
-static unsigned sec_congestion, qm_channel_caam;
+static unsigned qm_channel_caam;
+#define CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT 640
+static unsigned num_possible_cpus(void) { return 4; }
 static struct device device;
 static struct dpa_bp parent = { .dev = &device };
 static struct dpa_bp *dpa_bp_array[64];
@@ -225,13 +232,11 @@ static struct dpa_bp *sg_bpool_g, *skb_2bfreed_bpool_g;
 static struct dpa_iface_info iface = { .pcd_proc_entry = &iface };
 static cpumask_t cpus = 2;
 static unsigned steps, fail_step, allocs, mappings, queues, proc_entries, callbacks;
-static unsigned retires_failed, oos_failed, cgr_deletes_failed, pauses;
+static unsigned retires_failed, oos_failed, pauses;
 static unsigned seed_step, seed_fail, port_releases, registrations;
-static int current_cpu;
 static const char *seed_failure;
-static bool port, cgr;
+static bool port;
 static unsigned cgrids;
-static unsigned preempt_count;
 static unsigned module_refs;
 static bool module_going, sa_range;
 static void (*exit_callback)(void);
@@ -420,25 +425,30 @@ static int qman_create_fq(unsigned id, unsigned flags, struct qman_fq *fq)
     assert(port && !fq_registry[id]); fq->fqid = id; fq->acquired = true;
     fq_registry[id] = fq; queues++; return 0;
 }
-/* The exception group, set up and released without a portal: every queue
- * that joins it needs it configured first, and it goes only once they have. */
-static bool exception_group;
-static unsigned members;
+/* The two groups, the exception queues' and the SA input queues', set up and
+ * released without a portal: every queue that joins one needs it configured
+ * first, and it goes only once they have. */
+struct group_model { bool configured; unsigned members, frames; };
+static struct group_model exception_group, to_sec_group;
+static struct group_model *group_of(const struct qman_cgr *cgr)
+{
+    return cgr == &ipsecinfo.exception_cgr ? &exception_group :
+           cgr == &ipsecinfo.to_sec_cgr ? &to_sec_group : NULL;
+}
 static int qman_init_fq(struct qman_fq *fq, unsigned flags, void *options)
 {
     struct qm_mcc_initfq *opts = options;
 
     if (fault()) return -EIO;
     if (opts->we_mask & QM_INITFQ_WE_CGID) {
-        assert(opts->fqd.fq_ctrl & QM_FQCTRL_CGE);
-        if (sec_congestion && opts->fqd.cgid == ipsecinfo.cgr.ingress_cgr.cgrid &&
-            opts->fqd.cgid != ipsecinfo.exception_cgr.cgrid) {
-            assert(cgr);       /* a TO_SEC queue joining SEC's ingress group */
-        } else {
-            assert(exception_group && opts->fqd.cgid == ipsecinfo.exception_cgr.cgrid);
-            assert(!fq->member);
-            fq->member = true; members++;
-        }
+        const struct qman_cgr *cgr =
+            exception_group.configured && opts->fqd.cgid == ipsecinfo.exception_cgr.cgrid ?
+                &ipsecinfo.exception_cgr :
+            to_sec_group.configured && opts->fqd.cgid == ipsecinfo.to_sec_cgr.cgrid ?
+                &ipsecinfo.to_sec_cgr : NULL;
+
+        assert(opts->fqd.fq_ctrl & QM_FQCTRL_CGE && cgr && !fq->group);
+        fq->group = cgr; group_of(cgr)->members++;
     }
     fq->state = qman_fq_state_sched; return 0;
 }
@@ -451,7 +461,11 @@ static void qman_destroy_fq(struct qman_fq *fq, unsigned flags)
     assert(fq->acquired && !fq->proc && fq->state == qman_fq_state_oos);
     assert(!callbacks && queues && fq_registry[fq->fqid] == fq);
     fq_registry[fq->fqid] = NULL; fq->acquired = false; queues--;
-    if (fq->member) { assert(members); members--; fq->member = false; }
+    if (fq->group) {
+        struct group_model *g = group_of(fq->group);
+
+        assert(g->members); g->members--; fq->group = NULL;
+    }
 }
 /* Retirement completes immediately, or after this many looks at the queue;
  * a PCD queue always retires holding a frame. */
@@ -529,11 +543,7 @@ static void synchronize_net(void)
 { assert(!dpa_ipsec_ready || module_refs); callbacks = 0; }
 static void usleep_range(unsigned lo, unsigned hi)
 { assert(!dpa_ipsec_ready || module_refs); pauses++; assert(pauses < 1000); }
-static void preempt_disable(void) { preempt_count++; }
-static void preempt_enable(void) { assert(preempt_count); preempt_count--; }
-static int smp_processor_id(void) { assert(preempt_count); return current_cpu; }
-/* Group IDs allocated, a bit each: SEC's ingress group, when configured, and
- * the exception group. */
+/* Group IDs allocated, a bit each: the exception group and the to-SEC one. */
 static bool cgrid_held(unsigned id) { return id < 32 && (cgrids & 1u << id); }
 static int qman_alloc_cgrid(unsigned *id)
 {
@@ -543,47 +553,31 @@ static int qman_alloc_cgrid(unsigned *id)
     assert(!"more than two congestion groups");
     return -ENOSPC;
 }
-static void cgr_cb(void) { }
-static void qm_cgr_cs_thres_set64(struct threshold *threshold, unsigned value, int mode) { }
-static int qman_create_cgr(struct qman_cgr *p, unsigned flags, struct qm_mcc_initcgr *opts)
-{
-    assert(preempt_count && ipsecinfo.cgr.cpu == current_cpu && cgrid_held(p->cgrid));
-    if (fault()) return -EIO;
-    assert(!cgr); cgr = true; return 0;
-}
-static int smp_call_function_single(int cpu, void (*fn)(void *), void *arg, int wait)
-{
-    int previous = current_cpu;
-    assert(wait); current_cpu = cpu; fn(arg); current_cpu = previous;
-    return 0;
-}
-static int qman_delete_cgr(void *p)
-{
-    assert(cgr && !queues && ipsecinfo.ipsec_bp && current_cpu == ipsecinfo.cgr.cpu);
-    if (cgr_deletes_failed) { cgr_deletes_failed--; return -EBUSY; }
-    cgr = false; return 0;
-}
+static void qm_cgr_cs_thres_set64(struct threshold *threshold, unsigned value, int mode)
+{ assert(mode); threshold->TA = value; threshold->Tn = 0; }
 static int qman_modify_cgr(struct qman_cgr *p, unsigned flags, struct qm_mcc_initcgr *opts)
 {
-    assert(p == &ipsecinfo.exception_cgr && cgrid_held(p->cgrid) && flags == QMAN_CGR_FLAG_USE_INIT);
+    struct group_model *g = group_of(p);
+
+    assert(g && cgrid_held(p->cgrid) && flags == QMAN_CGR_FLAG_USE_INIT);
     if (opts->cgr.cstd_en) {
         /* Frames, each one buffer, dropped at the tail; nothing notified. */
-        assert(!exception_group && opts->cgr.mode == QMAN_CGR_MODE_FRAME && !opts->cgr.cscn_en);
-        assert(opts->we_mask & QM_CGR_WE_CSTD_EN);
+        assert(!g->configured && opts->cgr.mode == QMAN_CGR_MODE_FRAME && !opts->cgr.cscn_en);
+        assert(opts->we_mask & QM_CGR_WE_CSTD_EN && opts->we_mask & QM_CGR_WE_CS_THRES);
         if (fault()) return -EIO;
-        exception_group = true;
+        g->configured = true; g->frames = opts->cgr.cs_thres.TA;
         return 0;
     }
-    assert(exception_group && !members);
-    exception_group = false;
+    assert(g->configured && !g->members);
+    g->configured = false;
     return 0;
 }
 static void qman_release_cgrid(unsigned id)
 {
     assert(cgrid_held(id));
     /* A group is released only once nothing configures it. */
-    if (id == ipsecinfo.exception_cgr.cgrid) assert(!exception_group);
-    if (id == ipsecinfo.cgr.ingress_cgr.cgrid) assert(!cgr);
+    assert(!(exception_group.configured && id == ipsecinfo.exception_cgr.cgrid));
+    assert(!(to_sec_group.configured && id == ipsecinfo.to_sec_cgr.cgrid));
     cgrids &= ~(1u << id);
 }
 static bool cdx_dpa_init_fault(void) { return fault(); }
@@ -671,8 +665,9 @@ static void clean(void)
     assert(!allocs && !mappings && !queues && !proc_entries && !callbacks);
     assert(!pages && !refill_running && !sg_bpool_g && !skb_2bfreed_bpool_g);
     for (unsigned id = 2; id < 64; id++) assert(!dpa_bp_array[id]);
-    assert(!port && !cgr && !cgrids && !preempt_count && !dpa_bp_array[2] && !cdx_dpa_ipsec_ready());
-    assert(!exception_group && !members);
+    assert(!port && !cgrids && !dpa_bp_array[2] && !cdx_dpa_ipsec_ready());
+    assert(!exception_group.configured && !exception_group.members);
+    assert(!to_sec_group.configured && !to_sec_group.members);
     assert(!ipsecinfo.ipsec_bp && !ipsecinfo.ipsec_pcd_fqs && ipsec_bpid == -1);
     assert(!module_refs && !sa_range && !tags && !ipsecinfo.ipsec_exception_fq);
     assert(!ipsecinfo.expt_fq_count && ipsecinfo.ofport_handle < 0);
@@ -681,7 +676,7 @@ static void clean(void)
 static void reset(void)
 {
     clean(); steps = fail_step = seed_step = seed_fail = pauses = registrations = 0;
-    retires_failed = oos_failed = cgr_deletes_failed = 0;
+    retires_failed = oos_failed = 0;
     warnings = warn_ons = 0;
     seed_failure = NULL; exit_callback = NULL;
     module_going = false;
@@ -695,6 +690,10 @@ static unsigned normal(void)
     assert(cdx_dpa_ipsec_ready() && registrations == 1 && queues == 12);
     assert(ipsecinfo.ipsec_bp->pool->count == IPSEC_BUFCOUNT);
     assert(ipsec_bpid == ipsecinfo.ipsec_bp->bpid);
+    /* Both groups count frames: the exception queues an eighth of SEC's pool,
+     * the SA input queues half of what a port seeds the Ethernet pool with. */
+    assert(exception_group.configured && exception_group.frames == IPSEC_EXCEPTION_FRAMES);
+    assert(to_sec_group.configured && to_sec_group.frames == 4 * 640 / 2);
     assert(mappings == IPSEC_BUFCOUNT + CDX_MAX_SG_BUFF_COUNT);
     assert(sg_bpool_g->pool->count == CDX_MAX_SG_BUFF_COUNT);
     assert(!skb_2bfreed_bpool_g->pool->count);
@@ -708,8 +707,7 @@ static unsigned normal(void)
     for (unsigned i = 0; i < 3; i++)
         ipsec_delfq_from_exceptionfq_list(sa[i].fqid, &ipsecinfo);
     assert(!ipsecinfo.ipsec_exception_fq && ipsecinfo.expt_fq_count == 12);
-    retires_failed = oos_failed = cgr_deletes_failed = 2;
-    current_cpu = (current_cpu + 1) % 4;
+    retires_failed = oos_failed = 2;
     exit_callback(); clean();
     cdx_dpa_ipsec_exit(); clean();
     return count;
@@ -930,6 +928,8 @@ static unsigned release_machine(void)
     struct qman_fq *to_sec = &s->sec_fq[FQ_TO_SEC].fq_base;
     struct qm_mr_entry ern = { .ern = { .rc = 0x24, .fd = { qm_fd_sg, sg_bpid, 0x5000 } } };
     assert(to_sec->cb.ern && to_sec->cb.dqrr && s->sec_fq[FQ_FROM_SEC].fq_base.cb.dqrr);
+    /* The SA's input queue joins the to-SEC group; what SEC returns does not. */
+    assert(to_sec->group == &ipsecinfo.to_sec_cgr && !s->sec_fq[FQ_FROM_SEC].fq_base.group);
     to_sec->cb.ern(NULL, to_sec, &ern);
     assert(sg_releases == 1 && !fd_releases);
     ern.ern.fd = (struct qm_fd){ qm_fd_sg, 1, 0x5100 };
@@ -937,6 +937,12 @@ static unsigned release_machine(void)
     ern.ern.fd = (struct qm_fd){ qm_fd_contig, sg_bpid, 0x5200 };
     to_sec->cb.ern(NULL, to_sec, &ern);
     assert(sg_releases == 1 && fd_releases == 2 && warnings == 3);
+    /* The group full is SEC behind its input, not a wedge: given back and
+     * counted, never warned about. */
+    ern.ern.rc = QM_MR_RC_CGR_TAILDROP;
+    ern.ern.fd = (struct qm_fd){ qm_fd_sg, sg_bpid, 0x5300 };
+    to_sec->cb.ern(NULL, to_sec, &ern);
+    assert(sg_releases == 2 && warnings == 3 && dpa_ipsec_input_refused.counter == 1);
     sg_releases = fd_releases = warnings = 0;
 
     /* Retirement completing a period late, a portal whose volatile dequeue
@@ -1175,34 +1181,32 @@ int main(void)
     seed_failure = NULL;
     cdx_dpa_ipsec_exit(); clean();
     unsigned cases = 0;
-    for (sec_congestion = 0; sec_congestion <= 1; sec_congestion++) {
-        reset(); unsigned count = normal(); cases++;
-        for (unsigned fail = 1; fail <= count; fail++) {
-            reset(); fail_step = fail; retires_failed = oos_failed = 2;
-            assert(cdx_dpa_ipsec_init() != SUCCESS);
-            assert(!registrations); clean();
-            cdx_dpa_ipsec_exit(); clean(); cases++;
-            reset(); normal(); /* Same tracked state can be acquired again. */
-        }
-        const char *kinds[] = { "head", "skb", "dma" };
-        const unsigned positions[] = {1, 2, 8, 9, 10, 511, 512};
-        for (unsigned k = 0; k < 3; k++) for (unsigned p = 0; p < 7; p++) {
-            reset(); seed_failure = kinds[k]; seed_fail = positions[p];
-            assert(cdx_dpa_ipsec_init() != SUCCESS);
-            assert(seed_step == seed_fail && !registrations);
-            clean(); cases++;
-        }
-        /* Fail each boundary of raw SG seeding, after the output pool. */
-        const unsigned sg_positions[] = {513, 514, 520, 521, 1023, 1024};
-        for (unsigned k = 0; k < 3; k += 2) for (unsigned p = 0; p < 6; p++) {
-            reset(); seed_failure = kinds[k]; seed_fail = sg_positions[p];
-            assert(cdx_dpa_ipsec_init() != SUCCESS);
-            assert(seed_step == seed_fail && !registrations);
-            clean(); cases++;
-        }
-        cases += sa_lifecycle();
-        cases += release_machine();
+    reset(); unsigned count = normal(); cases++;
+    for (unsigned fail = 1; fail <= count; fail++) {
+        reset(); fail_step = fail; retires_failed = oos_failed = 2;
+        assert(cdx_dpa_ipsec_init() != SUCCESS);
+        assert(!registrations); clean();
+        cdx_dpa_ipsec_exit(); clean(); cases++;
+        reset(); normal(); /* Same tracked state can be acquired again. */
     }
+    const char *kinds[] = { "head", "skb", "dma" };
+    const unsigned positions[] = {1, 2, 8, 9, 10, 511, 512};
+    for (unsigned k = 0; k < 3; k++) for (unsigned p = 0; p < 7; p++) {
+        reset(); seed_failure = kinds[k]; seed_fail = positions[p];
+        assert(cdx_dpa_ipsec_init() != SUCCESS);
+        assert(seed_step == seed_fail && !registrations);
+        clean(); cases++;
+    }
+    /* Fail each boundary of raw SG seeding, after the output pool. */
+    const unsigned sg_positions[] = {513, 514, 520, 521, 1023, 1024};
+    for (unsigned k = 0; k < 3; k += 2) for (unsigned p = 0; p < 6; p++) {
+        reset(); seed_failure = kinds[k]; seed_fail = sg_positions[p];
+        assert(cdx_dpa_ipsec_init() != SUCCESS);
+        assert(seed_step == seed_fail && !registrations);
+        clean(); cases++;
+    }
+    cases += sa_lifecycle();
+    cases += release_machine();
     printf("IPsec lifecycle: %u acquisition/seed cases, repeat cleanup and retry passed\n", cases);
     return 0;
 }

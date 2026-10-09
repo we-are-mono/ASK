@@ -49,8 +49,7 @@ def test_ipsec_lifecycle(tmp_path):
     header = (ROOT / "cdx/dpa_ipsec.h").read_text()
     (tmp_path / "ipsec_types.inc").write_text(
         re.search(r"^#define\s+IPSEC_EXCEPTION_FRAMES\s.*$", header, re.M).group() + "\n"
-        + source[source.index("struct cgr_priv {"):
-               source.index("/* The following macro")]
+        + re.search(r"^#define\s+IPSEC_TO_SEC_FRAMES\s.*$", header, re.M).group() + "\n"
         + source[source.index("struct dpa_ipsec_sainfo {"):
                source.index("#if defined(CONFIG_INET_IPSEC_OFFLOAD)",
                             source.index("struct ipsec_info {"))]
@@ -66,13 +65,12 @@ def test_ipsec_lifecycle(tmp_path):
              "ipsec_free_pool_buffer", "release_ipsec_bpool", "add_ipsec_bpool",
              "ipsec_free_sg_buffer", "release_ipsec_sg_pools",
              "cdx_init_scatter_gather_bpool", "cdx_init_skb_2bfreed_bpool",
-             "cdx_dpaa_ingress_cgr_init", "ipsec_delete_cgr_on_cpu",
-             "cdx_dpaa_ingress_cgr_exit", "ipsec_exception_cgr_init",
-             "ipsec_exception_cgr_exit", "cdx_dpa_ipsec_ready",
+             "ipsec_frame_cgr_init", "ipsec_frame_cgr_exit", "cdx_dpa_ipsec_ready",
              "cdx_dpa_ipsec_init", "cdx_dpa_ipsec_exit"]
     (tmp_path / "ipsec_lifecycle.inc").write_text(
         # What an SA queue gives back undelivered, rejected or drained.
         re.search(r"^static atomic_t dpa_ipsec_ern_count\b.*$", source, re.M).group() + "\n"
+        + re.search(r"^static atomic_t dpa_ipsec_input_refused\b.*$", source, re.M).group() + "\n"
         + function(source, "dpa_ipsec_fd_drop")
         + function(source, "dpa_ipsec_ern_cb")
         + function(source, "dpa_ipsec_drain_dqrr")

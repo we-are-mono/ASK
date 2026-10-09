@@ -14,13 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import socket
 import time
 
 import pytest
 
-from _flowtable_rig import DPORT, SPORT, WAN_IP, console_python
+from _flowtable_rig import DPORT, SPORT, WAN_IP, console_python, pings_answered
 from _lan_pause import while_lan_port_paused
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from ask_orch.uart import Console
@@ -86,19 +85,6 @@ def _blast(sock, lan_ip, seconds, size):
     return sent
 
 
-async def _ping(address, count, delay):
-    """How many of `count` pings to `address`, from the WAN host, a tenth of a
-    second apart and starting `delay` seconds from now, were answered."""
-    await asyncio.sleep(delay)
-    proc = await asyncio.create_subprocess_exec(
-        "ping", "-n", "-q", "-c", str(count), "-i", "0.1", "-W", "1", address,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    out, _ = await proc.communicate()
-    received = re.search(r"(\d+) (?:packets )?received", out.decode())
-    assert received, out.decode()
-    return int(received.group(1))
-
-
 async def _paused_blast(r, size, label):
     """Three seconds of `size`-byte datagrams down the offloaded flow, from the
     WAN end of it, with the LAN port paused throughout, and the WAN host
@@ -123,7 +109,7 @@ async def _paused_blast(r, size, label):
         # of a second of the blast fills it.
         (sent, answered), pauses = await while_lan_port_paused(
             r, lambda: asyncio.gather(asyncio.to_thread(_blast, sock, r.lan_ip, 3, size),
-                                      _ping(r.dut_wan_ip, PINGS, 0.5)), 3)
+                                      pings_answered(r.dut_wan_ip, PINGS, 0.5)), 3)
         # What the port's queue held goes out once the pause lifts.
         await asyncio.sleep(2)
         after = await _counters(r)

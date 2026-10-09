@@ -1999,6 +1999,12 @@ static u64 ft_sec_counted[CDX_SEC_REFUSAL_CLASSES];
 static u32 ft_sec_rejected_seen;
 static bool ft_sec_rejected_known;
 static u64 ft_sec_rejected;
+/* And what of a packet-offloaded SA's frames Linux handed SEC itself, either
+ * way, SEC's input group refused (cdx_sec_refusals.input_refused): SEC behind
+ * what it was offered. */
+static u32 ft_sec_input_refused_seen;
+static bool ft_sec_input_refused_known;
+static u64 ft_sec_input_refused;
 
 /* Room for every fault class moving at once, at ten digits each: 343 bytes.
  * scnprintf() truncates rather than overruns if a name ever grows. */
@@ -2027,6 +2033,10 @@ void ft_sec_refusals_fold(void)
 		ft_sec_rejected_seen = now.rejected;
 		ft_sec_rejected_known = true;
 	}
+	if (ft_sec_input_refused_known)
+		ft_sec_input_refused += (u32)(now.input_refused - ft_sec_input_refused_seen);
+	ft_sec_input_refused_seen = now.input_refused;
+	ft_sec_input_refused_known = true;
 	if (!ft_sec_known) {
 		memcpy(ft_sec_seen, now.count, sizeof(ft_sec_seen));
 		ft_sec_known = true;
@@ -3190,4 +3200,5 @@ void ft_sec_refusal_rows(struct seq_file *seq)
 		seq_printf(seq, "ipsec_sec_refused_%s %llu\n", ft_sec_refusal[i].name,
 			   ft_sec_counted[i]);
 	seq_printf(seq, "ipsec_offline_port_rejected %llu\n", ft_sec_rejected);
+	seq_printf(seq, "ipsec_sec_input_refused %llu\n", ft_sec_input_refused);
 }

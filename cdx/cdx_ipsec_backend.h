@@ -242,11 +242,15 @@ enum cdx_sec_refusal {
  * only moves forward and wraps; the caller takes differences. Beside them,
  * the frames SEC did produce that the IPsec offline port then dropped because
  * QMan refused to enqueue them: its exception group full, the CPU behind, or
- * an egress port's group full. The same kind of u32, valid with `rejected_ok`. */
+ * an egress port's group full. The same kind of u32, valid with `rejected_ok`.
+ * And the frames of a packet-offloaded SA that Linux handed SEC itself,
+ * outbound or inbound, and SEC's input group refused, SEC behind what it was
+ * offered; another such u32. */
 struct cdx_sec_refusals {
 	u32 count[CDX_SEC_REFUSAL_CLASSES];
 	u32 rejected;
 	bool rejected_ok;
+	u32 input_refused;
 };
 
 /* SA operations run inside the flowtable backend's transaction, taken with

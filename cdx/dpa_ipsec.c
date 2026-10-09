@@ -48,13 +48,7 @@
 #include "dpa_wifi.h"
 #include "procfs.h"
 
-/*
-* DPA_FQ_TD_BYTES is frame queue tail drop bytes mode  threshold value. This 
-* threshold is per frame queue.
-*/
-#define DPA_FQ_TD_BYTES	316000000
-
-#ifdef DPA_IPSEC_OFFLOAD 
+#ifdef DPA_IPSEC_OFFLOAD
 //#define DPA_IPSEC_DEBUG  	1
 
 #define DPAIPSEC_ERROR(fmt, ...)\
@@ -71,41 +65,6 @@
 #endif
 
 #define IPSEC_WQ_ID		2
-
-/*
-* FQ_TAIL_DROP support for the tail drop support per frame queue base.
-* It means based on the on the threshold(default is in bytes mode, DPA_FQ_TD_BYTES)
-* value it drops the packet per frame queue. Basically this support framework is
-* added only for "to sec ipsec" frame queues only. Now it is disabled, as CS_TAIL_DROP
-* support is enabled and that is sufficient. To enable FQ_TAIL_DROP support uncomment
-* below macro.
-*/
-//#define FQ_TAIL_DROP
-
-/*
-* CS_TAIL_DROP support for the tail drop support is per congestion group record.
-* Each congestion group record can have multiple frame queues can group together.
-* In our case all "to sec ipsec" frame queues are grouped into one congestion group.
-* This threshold works on group all frame queues bytes at that moment. This also
-* by default in bytes mode. It checks thresold with CDX_DPAA_INGRESS_CS_TD.
-*/
-#define CS_TAIL_DROP
-#ifdef CS_TAIL_DROP
-struct cgr_priv {
-/*	bool use_ingress_cgr;*/
-	struct qman_cgr ingress_cgr;
-	int cpu;
-	int delete_result;
-};
-/* The following macro is used as default value before introducing module param */
-
-#define SEC_CONGESTION_DISABLE	0
-
-unsigned int sec_congestion = SEC_CONGESTION_DISABLE;
-module_param(sec_congestion, uint, S_IRUGO);
-MODULE_PARM_DESC(sec_congestion, "0: congestion disable n: congestion threshold");
-
-#endif
 
 struct dpa_ipsec_sainfo {
 	void *shdesc_mem;
@@ -171,13 +130,12 @@ struct ipsec_info {
 	struct dpa_fq *ipsec_pcd_fqs;
 	struct dpa_fq *ipsec_exception_fq;
 	struct port_bman_pool_info parent_pool_info;
-#ifdef CS_TAIL_DROP
-	struct cgr_priv	cgr;
-	bool cgr_initialized;
-#endif
 	/* Every exception queue the offline port feeds: IPSEC_EXCEPTION_FRAMES. */
 	struct qman_cgr exception_cgr;
 	bool exception_cgr_initialized;
+	/* Every SA's input queue: IPSEC_TO_SEC_FRAMES. */
+	struct qman_cgr to_sec_cgr;
+	bool to_sec_cgr_initialized;
 };
 
 static struct ipsec_info ipsecinfo = { .ofport_handle = -1 };
@@ -191,6 +149,17 @@ static void ipsec_exception_fq_bound(struct qm_mcc_initfq *opts)
 	opts->we_mask |= QM_INITFQ_WE_CGID;
 	opts->fqd.fq_ctrl |= QM_FQCTRL_CGE;
 	opts->fqd.cgid = (u8)ipsecinfo.exception_cgr.cgrid;
+}
+
+/* The same for an SA's input queue and the to-SEC group (IPSEC_TO_SEC_FRAMES):
+ * past it QMan refuses the port's enqueue and FMan drops the frame, counted as
+ * a discard of the port it arrived on, and a software enqueue comes back to
+ * dpa_ipsec_ern_cb(). */
+static void ipsec_to_sec_fq_bound(struct qm_mcc_initfq *opts)
+{
+	opts->we_mask |= QM_INITFQ_WE_CGID;
+	opts->fqd.fq_ctrl |= QM_FQCTRL_CGE;
+	opts->fqd.cgid = (u8)ipsecinfo.to_sec_cgr.cgrid;
 }
 
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
@@ -333,18 +302,28 @@ static void dpa_ipsec_fd_drop(const struct qm_fd *fd)
 /*
  * QMan Enqueue-Reject Notification on FQ_TO_SEC.
  *
- * QMan rejects a software enqueue (FQ retired/OOS, congestion, etc.) and the
- * rejected FD is delivered here, to be given back (ISSUES.md A24). Counted,
- * with a rate-gated dmesg line, so a wedge is observable.
+ * QMan rejects a software enqueue -- the to-SEC group full, or the FQ retired
+ * or out of service -- and the rejected FD is delivered here, to be given back
+ * (ISSUES.md A24). A full group is SEC behind what it is offered, which the
+ * ports' own enqueues meet as well, and is only counted
+ * (cdx_dpa_ipsec_input_refused()); anything else is counted with a rate-gated
+ * dmesg line, so a wedge is observable.
  */
 static atomic_t dpa_ipsec_ern_count = ATOMIC_INIT(0);
+static atomic_t dpa_ipsec_input_refused = ATOMIC_INIT(0);
 
 static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 		const struct qm_mr_entry *msg)
 {
 	const struct qm_fd *fd = &msg->ern.fd;
-	int n = atomic_inc_return(&dpa_ipsec_ern_count);
+	int n;
 
+	if ((msg->ern.rc & QM_MR_RC_MASK) == QM_MR_RC_CGR_TAILDROP) {
+		atomic_inc(&dpa_ipsec_input_refused);
+		dpa_ipsec_fd_drop(fd);
+		return;
+	}
+	n = atomic_inc_return(&dpa_ipsec_ern_count);
 	if (n <= 16 || (n & 0xff) == 0)
 		pr_warn_ratelimited(
 			"cdx: IPsec ERN on FQ 0x%x rc=0x%02x bpid=%u addr=0x%llx (count=%d)\n",
@@ -996,29 +975,8 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 			opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
 			ipsec_exception_fq_bound(&opts);
 		}
-		if (to_sec_fq == 1)
-		{
-#ifdef FQ_TAIL_DROP
-			/* Enabling the FQ tail drop threshold */
-			opts.we_mask = QM_INITFQ_WE_TDTHRESH;
-			/* Setting the frame queue tail drop threshold value. */
-			qm_fqd_taildrop_set(&opts.fqd.td, DPA_FQ_TD_BYTES, 1);
-			/* Enabling the FQ tail drop support. */
-			opts.fqd.fq_ctrl |= QM_FQCTRL_TDE;
-#endif
-#ifdef CS_TAIL_DROP
-			if (sec_congestion)
-			{
-				/* CS tail drop start*/
-				opts.we_mask |= QM_INITFQ_WE_CGID;
-				/* Enabling the congestion group */
-				opts.fqd.fq_ctrl |= QM_FQCTRL_CGE;
-				/* setting congestion group record id, which is created at the time of initialization. */
-				opts.fqd.cgid = (u8)ipsecinfo.cgr.ingress_cgr.cgrid;
-				/* CS tail drop end*/
-			}
-#endif
-		}
+		if (to_sec_fq)
+			ipsec_to_sec_fq_bound(&opts);
 		opts.we_mask |= (QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL |
 				QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA);
 		if(schedule)
@@ -1356,14 +1314,25 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 
 /* The frames the IPsec offline port dropped because QMan refused to enqueue
  * them: the exception group full (IPSEC_EXCEPTION_FRAMES), the CPU behind;
- * an egress port's group for SEC's frames full (IPSEC_EGRESS_FRAMES); or the
- * Wi-Fi VAPs' (VWD_FWD_FRAMES). 32 bits, wrapping; -ENODEV without the
+ * an egress port's group for SEC's frames full (IPSEC_EGRESS_FRAMES); the
+ * Wi-Fi VAPs' (VWD_FWD_FRAMES); or, for a flow going back into SEC, the
+ * to-SEC group (IPSEC_TO_SEC_FRAMES). 32 bits, wrapping; -ENODEV without the
  * port. */
 int cdx_dpa_ipsec_offline_port_rejected(u32 *count)
 {
 	if (!cdx_dpa_ipsec_ready())
 		return -ENODEV;
 	return dpa_cfg_port_rejected(ipsecinfo.ofport_portid, count);
+}
+
+/* The software enqueues to SEC -- a packet-offloaded SA's frames Linux hands
+ * SEC itself, outbound or inbound -- that the to-SEC group refused
+ * (dpa_ipsec_ern_cb()). The driver counted each as given to SEC before the
+ * refusal came back. The ports' own refused enqueues are their receive drops.
+ * 32 bits, wrapping. */
+u32 cdx_dpa_ipsec_input_refused(void)
+{
+	return (u32)atomic_read(&dpa_ipsec_input_refused);
 }
 
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size)
@@ -1644,137 +1613,43 @@ int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num)
 	       fq->state != qman_fq_state_oos;
 }
 
-#ifdef CS_TAIL_DROP
-static void cgr_cb(struct qman_portal *qm, struct qman_cgr *cgr, int congested)
-{
-	static u32 no_of_cong_entry = 0;
-#define PRINT_DURATION 500000
-
-#ifdef DPA_IPSEC_DEBUG
-	if (congested) {
-		if (((no_of_cong_entry/2) % PRINT_DURATION) == 0)
-			printk("%s()::%d entered congestion %d\n", __func__, __LINE__, no_of_cong_entry);
-
-	} else {
-		if (((no_of_cong_entry/2) % PRINT_DURATION) == 0)
-			printk("%s()::%d EXITED congestion %d.\n", __func__, __LINE__, no_of_cong_entry);
-	}
-#endif
-	++no_of_cong_entry;
-	return;
-}
-
-static int cdx_dpaa_ingress_cgr_init(struct cgr_priv *cgr)
-{
-	struct qm_mcc_initcgr initcgr;
-	u32 cs_th;
-	int err;
-
-	memset(&initcgr, 0, sizeof(struct qm_mcc_initcgr));
-	memset(cgr, 0, sizeof(struct cgr_priv));
-	err = qman_alloc_cgrid(&cgr->ingress_cgr.cgrid);
-	if (err < 0) {
-		pr_err("Error %d allocating CGR ID\n", err);
-		goto out_error;
-	}
-
-	cgr->ingress_cgr.cb = cgr_cb;
-	/* Enable CS TD, Congestion State Change Notifications. */
-	initcgr.we_mask = QM_CGR_WE_CSCN_EN | QM_CGR_WE_CS_THRES | QM_CGR_WE_MODE;
-	initcgr.cgr.cscn_en = QM_CGR_EN;
-	initcgr.cgr.mode= 0; /*Byte mode*/
-	cs_th = sec_congestion;
-
-	qm_cgr_cs_thres_set64(&initcgr.cgr.cs_thres, cs_th, 1);
-	printk("%s()::%d cs_th: %u mant %d exp %d\n", __func__, __LINE__,cs_th,
-			initcgr.cgr.cs_thres.TA, initcgr.cgr.cs_thres.Tn);
-
-	initcgr.we_mask |= QM_CGR_WE_CSTD_EN;
-	initcgr.cgr.cstd_en = QM_CGR_EN;
-
-	/* Deletion must use this same affine portal, even after migration. */
-	preempt_disable();
-	cgr->cpu = smp_processor_id();
-	err = qman_create_cgr(&cgr->ingress_cgr, QMAN_CGR_FLAG_USE_INIT,
-			&initcgr);
-	preempt_enable();
-	if (err < 0) {
-		pr_err("Error %d creating ingress CGR with ID %d\n", err,
-				cgr->ingress_cgr.cgrid);
-		qman_release_cgrid(cgr->ingress_cgr.cgrid);
-		goto out_error;
-	}
-	pr_debug("Created ingress CGR %d\n", cgr->ingress_cgr.cgrid);
-
-	/* cgr->use_ingress_cgr = true;*/
-
-out_error:
-	return err;
-}
-
-static void ipsec_delete_cgr_on_cpu(void *arg)
-{
-	struct cgr_priv *cgr = arg;
-
-	cgr->delete_result = qman_delete_cgr(&cgr->ingress_cgr);
-}
-
-static void cdx_dpaa_ingress_cgr_exit(struct cgr_priv *cgr)
-{
-	int ret;
-
-	/* qman_delete_cgr_safe() discards errors. Keep callback storage and
-	 * module text alive until deletion on the owning portal succeeds. */
-	for (;;) {
-		ret = smp_call_function_single(cgr->cpu, ipsec_delete_cgr_on_cpu,
-					       cgr, 1);
-		if (!ret)
-			ret = cgr->delete_result;
-		if (!ret)
-			break;
-		pr_warn_ratelimited("cdx: cannot delete IPsec CGR: %d\n", ret);
-		usleep_range(1000, 2000);
-	}
-	qman_release_cgrid(cgr->ingress_cgr.cgrid);
-}
-#endif
-
-/* The exception group counts frames, each of which holds one pool buffer, and
- * drops at the tail. It asks for no state-change notifications, so no portal
- * owns it, and the egress groups' way of setting one up serves (devman.c). */
-static int ipsec_exception_cgr_init(void)
+/* The exception and to-SEC groups count frames, each of which holds one pool
+ * buffer, and drop at the tail past `frames`. They ask for no state-change
+ * notifications, so no portal owns them, and the egress groups' way of setting
+ * one up serves (devman.c). */
+static int ipsec_frame_cgr_init(struct qman_cgr *cgr, bool *initialized, u64 frames)
 {
 	struct qm_mcc_initcgr opts;
 
-	if (qman_alloc_cgrid(&ipsecinfo.exception_cgr.cgrid) < 0)
+	if (qman_alloc_cgrid(&cgr->cgrid) < 0)
 		return -ENOSPC;
 	memset(&opts, 0, sizeof(opts));
 	opts.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSTD_EN |
 		       QM_CGR_WE_CSCN_EN;
 	opts.cgr.mode = QMAN_CGR_MODE_FRAME;
 	opts.cgr.cstd_en = QM_CGR_EN;
-	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres, IPSEC_EXCEPTION_FRAMES, 1);
-	if (qman_modify_cgr(&ipsecinfo.exception_cgr, QMAN_CGR_FLAG_USE_INIT, &opts)) {
-		qman_release_cgrid(ipsecinfo.exception_cgr.cgrid);
+	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres, frames, 1);
+	if (qman_modify_cgr(cgr, QMAN_CGR_FLAG_USE_INIT, &opts)) {
+		qman_release_cgrid(cgr->cgrid);
 		return -EIO;
 	}
-	ipsecinfo.exception_cgr_initialized = true;
+	*initialized = true;
 	return 0;
 }
 
 /* Its members are out of service by now, which the release requires: the PCD
- * queues, and every SA's exception queue, gone with the SA, which holds the
- * module until it is released. */
-static void ipsec_exception_cgr_exit(void)
+ * queues, and every SA's queues, gone with the SA, which holds the module
+ * until it is released. */
+static void ipsec_frame_cgr_exit(struct qman_cgr *cgr, bool *initialized)
 {
 	struct qm_mcc_initcgr opts;
 
-	if (!ipsecinfo.exception_cgr_initialized)
+	if (!*initialized)
 		return;
 	memset(&opts, 0, sizeof(opts));
-	qman_modify_cgr(&ipsecinfo.exception_cgr, QMAN_CGR_FLAG_USE_INIT, &opts);
-	qman_release_cgrid(ipsecinfo.exception_cgr.cgrid);
-	ipsecinfo.exception_cgr_initialized = false;
+	qman_modify_cgr(cgr, QMAN_CGR_FLAG_USE_INIT, &opts);
+	qman_release_cgrid(cgr->cgrid);
+	*initialized = false;
 }
 
 
@@ -1814,17 +1689,14 @@ int cdx_dpa_ipsec_init(void)
 		goto failure;
 	if (cdx_init_scatter_gather_bpool() || cdx_init_skb_2bfreed_bpool())
 		goto failure;
-#ifdef CS_TAIL_DROP
-	if (sec_congestion){
-		if (cdx_dpaa_ingress_cgr_init(&ipsecinfo.cgr)) {
-			goto failure;
-		}
-		ipsecinfo.cgr_initialized = true;
-	}
-#endif
-	/* Before any queue that joins it: the PCD queues below, and every SA's
-	 * exception queue. */
-	if (ipsec_exception_cgr_init())
+	/* Before any queue that joins them: the PCD queues below, and every
+	 * SA's exception and input queues. */
+	if (ipsec_frame_cgr_init(&ipsecinfo.exception_cgr,
+				 &ipsecinfo.exception_cgr_initialized,
+				 IPSEC_EXCEPTION_FRAMES) ||
+	    ipsec_frame_cgr_init(&ipsecinfo.to_sec_cgr,
+				 &ipsecinfo.to_sec_cgr_initialized,
+				 IPSEC_TO_SEC_FRAMES))
 		goto failure;
 	if (create_ipsec_pcd_fqs(&ipsecinfo, 1)) {
 		goto failure;
@@ -1857,13 +1729,8 @@ void cdx_dpa_ipsec_exit(void)
 		ipsecinfo.ofport_handle = -1;
 	}
 	memset(ipsecinfo.ofport_td, 0, sizeof(ipsecinfo.ofport_td));
-#ifdef CS_TAIL_DROP
-	if (ipsecinfo.cgr_initialized) {
-		cdx_dpaa_ingress_cgr_exit(&ipsecinfo.cgr);
-		ipsecinfo.cgr_initialized = false;
-	}
-#endif
-	ipsec_exception_cgr_exit();
+	ipsec_frame_cgr_exit(&ipsecinfo.to_sec_cgr, &ipsecinfo.to_sec_cgr_initialized);
+	ipsec_frame_cgr_exit(&ipsecinfo.exception_cgr, &ipsecinfo.exception_cgr_initialized);
 	release_ipsec_bpool(&ipsecinfo);
 	release_ipsec_sg_pools();
 	/* Held FQIDs stay listed: what becomes of them is decided once CDX has

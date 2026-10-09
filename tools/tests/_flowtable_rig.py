@@ -321,6 +321,20 @@ print(json.dumps({{'first': received[0], 'last': received[-1], 'count': len(rece
         (artifact_dir() / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
 
 
+async def pings_answered(address, count, delay=0):
+    """How many of `count` pings to `address`, from the WAN host, a tenth of a
+    second apart and starting `delay` seconds from now, were answered: whether
+    the DUT's kernel still receives while something else loads it."""
+    await asyncio.sleep(delay)
+    proc = await asyncio.create_subprocess_exec(
+        "ping", "-n", "-q", "-c", str(count), "-i", "0.1", "-W", "1", address,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    received = re.search(r"(\d+) (?:packets )?received", out.decode())
+    assert received, out.decode()
+    return int(received.group(1))
+
+
 async def stop_boot_daemon():
     """The offload service is default-on: a normal boot has already installed
     the catch-all policy, so the backend starts bound. Controlled tests own the

@@ -916,6 +916,10 @@ static int cdx_dpa_ipsec_offline_port_rejected(u32 *count)
 	*count = offline_port_rejections;
 	return 0;
 }
+/* And what SEC's input group refused of Linux's own enqueues to SEC, as
+ * dpa_ipsec counts them. */
+static u32 sec_input_refusals;
+static u32 cdx_dpa_ipsec_input_refused(void) { return sec_input_refusals; }
 #include "sec_refusals.inc"
 /* The /proc/net/xfrm_stat counters the adapter adds to, numbered as the
  * kernel numbers them. Only init_net's are ever touched. */
@@ -5045,6 +5049,19 @@ static void test_sec_refusals(void)
 	assert(mib_total() == mibs && sec_fault_lines == lines);
 	ft_sec_refusal_rows(&rows);
 	assert(strstr(rows.buf, "\nipsec_offline_port_rejected 64\n"));
+	/* Linux's own enqueues SEC's input group refused are counted the same
+	 * way, beside it, through a wrap, and reach no xfrm counter either. */
+	assert(strstr(rows.buf, "\nipsec_sec_input_refused 0\n") && ft_sec_input_refused_known);
+	sec_input_refusals = 0xfffffffc;
+	ft_ipsec_stats_work(NULL);
+	sec_input_refusals = 3;
+	ft_ipsec_stats_work(NULL);
+	assert(ft_sec_input_refused == 0xfffffffcull + 7);
+	assert(mib_total() == mibs && sec_fault_lines == lines);
+	struct seq_file refused = { .len = 0 };
+	ft_sec_refusal_rows(&refused);
+	snprintf(row, sizeof(row), "\nipsec_sec_input_refused %llu\n", 0xfffffffcull + 7);
+	assert(strstr(refused.buf, row));
 
 	bench_clear_sas();
 	en_global_muram_mem = NULL;
@@ -5053,6 +5070,9 @@ static void test_sec_refusals(void)
 	offline_port_present = false;
 	ft_sec_rejected_known = false;
 	ft_sec_rejected = 0;
+	sec_input_refusals = 0;
+	ft_sec_input_refused_known = false;
+	ft_sec_input_refused = 0;
 }
 
 int main(void)

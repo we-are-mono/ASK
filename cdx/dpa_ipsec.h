@@ -105,10 +105,20 @@ struct sec_descriptor {
 /* The same for what the offline port sends out of one Ethernet port: at most
  * this many frames wait in that port's queues for SEC's buffers (devman.c),
  * whatever the link does -- paused by its partner, slower than the tunnel; a
- * slow link's share, or a jumbo MTU's, is smaller, for its latency. A port's
- * own forwarding queues bound bytes, and held thousands of these, the whole
- * pool. */
+ * slow link's share is smaller, for its latency. A port's own forwarding
+ * queues hold a share of the Ethernet pool, more than this whole pool, and
+ * when they bounded bytes held thousands of these. */
 #define IPSEC_EGRESS_FRAMES	(IPSEC_BUFCOUNT / 8)
+/* A frame waiting on an SA's input queue holds a buffer of the pool every
+ * DPAA port receives into until SEC has read it, and nothing replaces it
+ * meanwhile. Offered faster than SEC encrypts or decrypts, the queues took
+ * that whole pool, and every port missed whatever it received, the kernel's
+ * own frames included (A344). So every SA's input queue joins one group that
+ * drops at the tail past this many frames: the share of that pool one port's
+ * forwarding queues may hold (fwd_pool_frames()), half of what a port seeds
+ * it with. A frame SEC's own output sends back into SEC holds a buffer of
+ * SEC's pool instead, and counts against the same bound. */
+#define IPSEC_TO_SEC_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
 
 struct ipsec_info; 
 void *  dpa_get_ipsec_instance(void);
@@ -139,6 +149,7 @@ struct qman_fq *get_to_sec_fq(void *handle);
 
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size);
 int cdx_dpa_ipsec_offline_port_rejected(u32 *count);
+u32 cdx_dpa_ipsec_input_refused(void);
 int cdx_dpa_ipsec_init(void);
 void cdx_dpa_ipsec_exit(void);
 bool cdx_dpa_ipsec_ready(void);

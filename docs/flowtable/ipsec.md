@@ -967,8 +967,12 @@ by the increments a dense burst loses (above), and `ipsec_sec_refused_<class>`
 gives each class under the names in `ft_sec_refusal[]`. Beside them,
 `ipsec_offline_port_rejected` counts what SEC did produce and the IPsec offline
 port then dropped because QMan would not take it: its exception queues full,
-the CPU behind; an egress port's queues for SEC's frames full; or the Wi-Fi
-VAPs'. No xfrm counter stands for those.
+the CPU behind; an egress port's queues for SEC's frames full; the Wi-Fi
+VAPs'; or, for a flow going back into SEC, SEC's own input group. And
+`ipsec_sec_input_refused` counts the frames of a packet-offloaded SA that Linux
+handed SEC itself, either way, and SEC's input group refused ("Nor its own
+input", below); the driver had already counted each as given to SEC. No xfrm
+counter stands for any of those.
 
 **No count exists per SA.** For an offloaded SA, `ip -s xfrm state` shows
 `replay-window 0 replay 0 failed 0` however many of its frames SEC refused,
@@ -1469,6 +1473,36 @@ where a fast port is congested by other traffic. `flowtable_ipsec_stalled_port.p
 is the paused-port case. On a port a hardware qdisc owns, the offline port's
 frames take their class queue like any other frame, which counts frames but
 holds more than a port's share (A337).
+
+#### Nor its own input
+
+What waits for SEC waits on the SA's input queue (FQ_TO_SEC) in a buffer of
+the pool every DPAA port receives into, and nothing replaces that buffer until
+SEC has read the frame. Those queues joined a group only when the
+`sec_congestion` module parameter named a byte threshold, which it never did
+(NXP's default, 0), so they were unbounded. Offered more than SEC encrypts --
+the LAN VM at ~10 Gbit/s of 1,390-byte datagrams on one flow in hardware
+through one SA, of which SEC encrypted ~2.4 -- they took the whole pool, 12,661
+buffers to none: the LAN port missed 2,483,441 frames for want of a buffer,
+the WAN port missed what little it received, and nothing was refused (A344,
+`flowtable_ipv6_sa.py::test_sec_slower_than_its_input_leaves_the_pool`).
+
+Every SA's input queue now joins one group that counts frames and drops at the
+tail (`to_sec_cgr`, `ipsec_frame_cgr_init()`), at `IPSEC_TO_SEC_FRAMES`: the
+share of the Ethernet pool one port's forwarding queues may hold, half of what
+a port seeds it with, 1,280 with four CPUs. The parameter is gone. A port's
+enqueue the group refuses is dropped by FMan and counted as a receive drop of
+that port (statistics.md); a frame Linux hands a packet-offloaded SA's SEC
+itself, outbound or inbound, comes back as a refused enqueue, is given back,
+and counts in `ipsec_sec_input_refused` in `/proc/cdx_flowtable` without the
+warning a wedged queue still gets -- having already been counted by the driver
+as given to SEC. One group for all SAs, as for a port's flows: an SA
+holding it at the bound has the others' frames refused too. A flow decrypted by
+one SA and sent into another waits there as well, holding a buffer of SEC's
+own pool, which the bound is larger than (A345). The same flood now has
+2,547,019 frames refused at the LAN port, none missed on either port, and the
+pool never below 11,269 of 12,564. Before a flow is in hardware its frames go
+to the CPU, whose own queues are bounded only at 256 MB (A347).
 
 ### 7. Parity
 

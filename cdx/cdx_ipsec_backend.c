@@ -852,6 +852,7 @@ int cdx_ipsec_sec_refusals(struct cdx_sec_refusals *refusals)
 	count[CDX_SEC_REFUSED_PREHEADER_READ] = stats.prehdr_read_errs;
 	count[CDX_SEC_REFUSED_OTHER] = stats.other_errs;
 	refusals->rejected_ok = !cdx_dpa_ipsec_offline_port_rejected(&refusals->rejected);
+	refusals->input_refused = cdx_dpa_ipsec_input_refused();
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sec_refusals, ASK_CDX_FLOWTABLE);
