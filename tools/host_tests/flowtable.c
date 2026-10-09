@@ -6144,14 +6144,17 @@ static void test_transient_admission(void)
              * the successfully installed direction, even during real contention. */
             /* Nor is the visit a refusal: a rejects count that moved on
              * visits alone would pass an oracle for a refusal that never
-             * happened. */
-            rtnl_busy = true;
+             * happened. Nor does it wait for the transaction: every offer
+             * visits each bound port, and most of a mass readmission's
+             * visits queueing for it behind the installs (A139) put
+             * hundreds of workers to spinning and sleeping for nothing. */
+            rtnl_busy = transaction_busy = true;
             u64 rejects = ft_rejects;
             unsigned visits = rtnl_trylocks;
             assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &other_binding) == -EOPNOTSUPP);
             assert(ft_fail_stage == 4 && ft_busy == busy && !handle.invalid);
             assert(ft_rejects == rejects && rtnl_trylocks == visits);
-            rtnl_busy = false;
+            rtnl_busy = transaction_busy = false;
             /* Nor can the installed direction offered again, which is what
              * Linux does alongside its other one: it never asks for RTNL. */
             unsigned trylocks = rtnl_trylocks;

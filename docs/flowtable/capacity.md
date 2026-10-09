@@ -114,11 +114,18 @@ The generator uses a bounded receive buffer on its own UDP socket and checks
 that socket's drop counter. File descriptor budgets apply only to generator
 processes. No host-wide networking sysctl is changed. This focused test does
 not substitute for a long-duration soak or capacity proofs for future features.
-An unpaced simultaneous restart after full route retirement produced material
-UDP loss during readmission; see the [development evidence](history/capacity.md#development-failures-and-link-observations).
-Lossless recovery under that burst is outside the accepted paced workload.
-The software-flowtable control reproduced the loss with hardware admission
-disabled; investigation is deferred as **A139** in [ISSUES.md](../../ISSUES.md).
+An unpaced simultaneous restart after full route retirement loses UDP during
+readmission; see the [development evidence](history/capacity.md#development-failures-and-link-observations).
+Lossless recovery under that burst is outside the accepted paced workload, and
+the loss is the software path's capacity rather than admission's (**A139** in
+[ISSUES.md](../../ISSUES.md)). Measured on the KASAN image with the CPU's
+receive queues at half the port's pool share: restarting all 16,384
+connections at once lost about 7% of UDP exchanges with offload, mostly in the
+first two seconds, and 14% with it off; 32,768 directions were back in
+hardware within about 18 s. Running Linux's offer work one item at a time,
+which removes all waiting on the backend transaction, left the loss unchanged.
+A TCP exchange whose retransmissions all fall in the first seconds of drops
+can back off past 20 s.
 
 ## Sustained connection churn
 

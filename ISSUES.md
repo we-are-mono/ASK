@@ -152,6 +152,18 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A351 — counter reads and deletions for a port that does not own the flow still take the backend transaction.**
+  Linux calls every bound port's block callback for each direction. Offers to the other ports are declined before the
+  transaction (A139), but `FLOW_CLS_STATS` and `FLOW_CLS_DESTROY` carry no rule, so `ft_rule_callback()`
+  (`cdx/ask_flowtable_core.c`) can only learn that the port owns nothing by `ft_find()` under it. A STATS visit returns
+  `-ENOENT` after waiting its turn; a DESTROY visit that loses the trylock goes through `ft_destroy_defer()`, which
+  allocates a deferred record naming nothing and schedules retirement work. With two ports this is half of the
+  transaction's counter-read traffic: Linux asks each offloaded flow for counters every tenth of its timeout, about every
+  3 s at the 30 s default. A139 measured that waiting on the transaction costs a mass readmission no loss, so this is
+  wasted contention, not a defect. Declining early needs ownership without the transaction: the direction's ingress
+  ifindex in the patch 140 context for every command (compared as `ft_request_targets()` compares the rule's), or an
+  RCU-safe cookie lookup.
+
 - [x] **A350 — a destroyed hardware qdisc's multicast replicas could leave by the port that claimed its channel next.**
   A torn-down tree's channels stay held for its port until its entries are retired or rebuilt (_:/^cdx: hold a torn-down qdisc's channels for its port_).
 
@@ -214,31 +226,8 @@ result independently of those temporary files.
 - [x] **A304.** Ignore switchdev events outside init_net; host tests and DUT bridge churn preserve both hardware directions.
   (_:/^cdx: ignore switchdev events from foreign network namespaces_).
 
-- [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
-  16,384 connections. **Investigated (2026-09-15), deferred at user request:**
-  outside the CMM-retirement work; no fix or tuning retained. On the KASAN
-  image for `507c404`, restart 8,192 TCP and 8,192 UDP connections together
-  after a route-MTU change retires their flow entries. With CMM off throughout,
-  hardware flow offload lost 5,953 of 197,970 UDP exchanges (3.01%); the
-  software-only Linux flowtable control lost 8,739 of 206,479 (4.23%), with
-  zero hardware flow entries installed. TCP records arrived intact and the
-  WAN UDP receiver reported no socket drops. Hardware occupancy recovered to
-  all 32,768 directions in 16.6 seconds. This establishes that the loss does
-  not require hardware-flow admission; a legacy-CMM comparison was not run.
-  Follow-up measurements found FMan RX buffer-exhaustion and filter counters
-  increasing without MAC errors. The existing Ethernet miss policer is active
-  at 195,312 packets/s with a 64-packet burst (`dpa_app/dpa.c`,
-  `cdx/cdx_qos.c`); receive-buffer exhaustion has its own
-  `port_rx_out_of_buffers_discard` counter and can occur with
-  `port_discard_frame` and Linux drop traces nearly silent. These observations
-  identify slow-path constraints, but their individual contributions to the
-  UDP loss were not isolated. RPS across four CPUs and serializing the flow
-  admission workqueue did not resolve it; both settings were restored.
-  The accepted paced-capacity result remains recorded in
-  [capacity validation](docs/flowtable/capacity.md). If revisited, measure RX
-  buffer and miss-policer drops separately before changing either mechanism.
-  Captures, image identity and diagnostic scripts:
-  `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
+- [x] **A139 — UDP loss when 16,384 connections restart at once.** Software-path capacity, not admission: ~7% offloaded,
+  14% offload off, unchanged with no transaction wait; documented in capacity.md (_:/^cdx: decline other ports' offers outside_).
 
 - [x] **A305 — both 10G ports stopped passing frames late in a same-boot run.** Not reproduced: a clean
   pre-release full suite and a drain-then-traffic soak on both sides of A327 (_:/^tests: soak a full table's retirement_).

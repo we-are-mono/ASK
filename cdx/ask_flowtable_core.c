@@ -2429,6 +2429,14 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		ft_destroy_defer(binding, cls);
 		return 0;
 	}
+	/* Native work offers each direction to every bound port. The other
+	 * ports' visits are not refusals, so they are neither counted nor
+	 * allowed near RTNL -- nor near the transaction: they are most of a
+	 * mass readmission's offers, and each would otherwise queue behind
+	 * the installs only to decline (A139). The rule and the binding's
+	 * device are fixed for the call. */
+	if (cls->command == FLOW_CLS_REPLACE && !ft_request_targets(binding, cls))
+		return -EOPNOTSUPP;
 	if (cls->command != FLOW_CLS_DESTROY)
 		cdx_ft_begin();
 	entry = ft_find(binding, cls->cookie);
@@ -2436,13 +2444,6 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		entry = NULL;
 	switch (cls->command) {
 	case FLOW_CLS_REPLACE:
-		/* Native work offers each direction to every bound port. The
-		 * other ports' visits are not refusals, so they are neither
-		 * counted nor allowed near RTNL. */
-		if (!ft_request_targets(binding, cls)) {
-			rc = -EOPNOTSUPP;
-			break;
-		}
 		/* Linux re-offers a flow while software forwards any part of
 		 * it, installed half included, so the offers that cannot change
 		 * anything are answered first, without RTNL: a direction already
