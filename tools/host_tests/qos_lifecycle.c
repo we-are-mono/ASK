@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 
 typedef uint16_t U16;
 typedef uint32_t u32;
@@ -36,6 +37,9 @@ static int atomic_read(atomic_t *p) { return p->value; }
 #define QM_CCGR_WE_MODE 2
 #define QM_CCGR_WE_TD_MODE 4
 #define QM_CCGR_WE_TD_THRES 8
+#define QM_CCGR_WE_WR_EN_R 16
+#define QM_CCGR_WE_WR_EN_Y 32
+#define QM_CCGR_WE_WR_EN_G 64
 
 struct list_head { struct list_head *next, *prev; };
 #define INIT_LIST_HEAD(n) ((n)->next = (n)->prev = (n))
@@ -205,7 +209,8 @@ static int qman_ceetm_cq_pop(struct qm_ceetm_cq *p, struct qm_fd *fd)
     pop_by_queue[p->idx]++;
     if (persistent_pop_error) return persistent_pop_error;
     if (pop_errors) return --pop_errors ? -EIO : -EAGAIN;
-    if (!pending_frames) return 0;
+    /* Injected frames are on the channel last mapped to a port. */
+    if (!pending_frames || p->parent->idx != mapping_id) return 0;
     unsigned id = --pending_frames;
     assert(packet_live[id]);
     *fd = (struct qm_fd){.bpid = id & 1 ? 0xff : 7, .id = id};
@@ -270,8 +275,17 @@ static int qman_ceetm_lni_release(struct qm_ceetm_lni *p)
 { assert(p->claimed && list_empty(&p->channels)); p->claimed = false; return 0; }
 static int qman_ceetm_sp_release(struct qm_ceetm_sp *p)
 { assert(p->claimed && !lni.claimed); p->claimed = false; return 0; }
+/* A channel mapped to a port while it still holds frames sends them out of
+ * that port, whichever port they were for. */
+static unsigned maps_with_frames;
 static int qman_ceetm_configure_mapping_shaper_tcfc(struct qm_mcc_ceetm_mapping_shaper_tcfc_config *cfg)
-{ mapping_id = cfg->cid & ~CEETM_COMMAND_CHANNEL_MAPPING; return hw_step(); }
+{
+    unsigned id = cfg->cid & ~CEETM_COMMAND_CHANNEL_MAPPING;
+
+    maps_with_frames += pending_frames && id == mapping_id;
+    mapping_id = id;
+    return hw_step();
+}
 static void dpa_disable_ceetm(struct net_device *dev) { dev->priv.ceetm_en = false; }
 /* Bookkeeping only, and covered by htb_offload.c; here it just has to be
  * called before the context it names is released. */
@@ -315,6 +329,7 @@ static int qman_ceetm_query_cq(unsigned id, unsigned fm, struct qm_mcr_ceetm_cq_
     query_by_queue[id & 15]++;
     if (fail_query) { fail_query = false; return -EIO; }
     if (hw_step()) return -EIO;
+    if ((id >> 4) != mapping_id) { query->frm_cnt = 0; return 0; }
     query->frm_cnt = pending_frames;
     if (pending_frames && !hold_frames) pending_frames--;
     return 0;
@@ -421,6 +436,13 @@ int main(void)
      * so below it a backlogged unclassified flow would pre-empt every
      * weighted leaf on the channel. */
     assert(group_a_placed >= CDX_CEETM_MAX_CHANNELS && !group_a_misplaced);
+    /* Every class queue starts at the module-load default. Only one a
+     * class gave back is parked lower (CEETM_PARKED_CQ_DEPTH): nothing names
+     * a queue no class has used. */
+    for (unsigned ch = 0; ch < CDX_CEETM_MAX_CHANNELS; ch++)
+        for (unsigned cq = 0; cq < MAX_SCHEDULER_QUEUES; cq++)
+            assert(qm_chnl_info[ch].cq_info[cq].qdepth == DEFAULT_CQ_DEPTH);
+    assert(CEETM_PARKED_CQ_DEPTH == 1 && DEFAULT_CQ_DEPTH == 8);
     struct net_device dev = {0};
     struct dpa_iface_info iface = {.name = "eth0", .eth_info = {&dev, 1}};
     port.portid = MAX_PHY_PORTS - 1;
@@ -436,7 +458,12 @@ int main(void)
     QM_context_ctl *ctx = &gQMCtx[port.portid];
     assert(!ceetm_get_egressfq(ctx, 0, 0));
     assert(!ceetm_get_egressfq(NULL, 1, 0));
+    /* A channel is not mapped when what its queues hold cannot be counted
+     * -- they are counted first, one each -- nor when the mapping fails. */
     fail_at = step + 1;
+    assert(ceetm_assign_chnl(ctx, 0) < 0);
+    assert(!ctx->chnl_map && !qm_chnl_info[0].qm_ctx && list_empty(&lni.channels));
+    fail_at = step + MAX_SCHEDULER_QUEUES + 1;
     assert(ceetm_assign_chnl(ctx, 0) < 0);
     assert(!ctx->chnl_map && !qm_chnl_info[0].qm_ctx && list_empty(&lni.channels));
     fail_at = 0;
@@ -447,14 +474,33 @@ int main(void)
     assert(!ceetm_get_egressfq(ctx, CDX_CEETM_MAX_CHANNELS + 1, 0));
     assert(!ceetm_get_egressfq(ctx, 1, MAX_SCHEDULER_QUEUES));
     assert(!ceetm_get_egressfq(&gQMCtx[0], 1, 0));
+    /* What a class queue holds, as QMan counts it, for the hardware qdisc's
+     * cap: the count, QMan's refusal as an error rather than as nothing
+     * held, and no answer for a queue out of range. */
+    uint32_t held = 0;
+    hold_frames = true; pending_frames = 7;
+    assert(ceetm_class_queue_backlog(0, 3, &held) == 0 && held == 7);
+    fail_query = true;
+    assert(ceetm_class_queue_backlog(0, 3, &held) == -EIO);
+    assert(ceetm_class_queue_backlog(CDX_CEETM_MAX_CHANNELS, 0, &held) == -EINVAL);
+    assert(ceetm_class_queue_backlog(0, MAX_SCHEDULER_QUEUES, &held) == -EINVAL);
+    hold_frames = false; pending_frames = 0;
     /* A DSCP map claimed and published: the context release gives both
      * back, whichever stage it had reached. */
     ctx->dscp_fq_claimed = kzalloc(sizeof(*ctx->dscp_fq_claimed), 0);
     ctx->dscp_fq_map = ctx->dscp_fq_claimed;
     dev.priv.ceetm_en = true;
     ctx->qos_enabled = true;
+    /* The tree's own depths, one queue with a curve: given back with the
+     * interface, every queue of the channel is parked before its drain. */
+    qm_chnl_info[0].cq_info[5].qdepth = 300;
+    qm_chnl_info[0].cq_info[5].wred = true;
+    qm_chnl_info[0].cq_info[9].qdepth = 56;
     pending_enqueues = pending_frames = pending_erns = 4;
     assert(cdx_disable_ceetm_on_iface(&iface) == 0);
+    for (unsigned i = 0; i < MAX_SCHEDULER_QUEUES; i++)
+        assert(qm_chnl_info[0].cq_info[i].qdepth == CEETM_PARKED_CQ_DEPTH &&
+               !qm_chnl_info[0].cq_info[i].wred);
     assert(!dev.priv.ceetm_en && !dev.priv.qm_ctx && !ctx->chnl_map);
     assert(!qm_chnl_info[0].qm_ctx && list_empty(&qm_chnl_info[0].channel->node));
     assert(!ceetm_get_egressfq(ctx, 0, 0));
@@ -464,7 +510,19 @@ int main(void)
         assert(!qm_chnl_info[0].cq_info[i].ceetmfq.net_dev);
     assert(cdx_disable_ceetm_on_iface(&iface) == 0);
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    /* What a tree taken down left on its channel -- a frame the classifier
+     * sent it after the drain -- is popped and freed before the channel is
+     * mapped to a port again, which would send it, and without the netdev
+     * the queue was last held for, whose reference is gone. */
+    unsigned released = pool_releases;
+    hold_frames = true; pending_frames = 1;
+    packets[0].id = 0; packet_live[0] = true;
+    assert(!qm_chnl_info[0].cq_info[0].ceetmfq.net_dev);
     assert(ceetm_assign_chnl(ctx, 0) == 0);
+    assert(!pending_frames && !packet_live[0] && pool_releases == released + 1);
+    assert(!maps_with_frames);
+    hold_frames = false;
+    released = pool_releases;
     for (unsigned query_failure = 0; query_failure < 2; query_failure++) {
         ctx->qos_enabled = dev.priv.ceetm_en = true;
         hold_frames = true; fail_query = query_failure; pop_errors = 2;
@@ -477,15 +535,27 @@ int main(void)
         assert(cdx_disable_ceetm_on_iface(&iface) < 0);
         assert(!pending_frames && !pop_errors && pop_calls);
         for (unsigned i = 0; i < ARRAY_SIZE(packets); i++) assert(!packet_live[i]);
-        assert(pool_releases == 2 * (query_failure + 1));
+        assert(pool_releases == released + 2 * (query_failure + 1));
         assert(skb_releases == 2 * (query_failure + 1));
         assert(!dev.priv.qm_ctx);
         hold_frames = false;
         assert(cdx_enable_ceetm_on_iface(&iface) == 0);
         assert(ceetm_assign_chnl(ctx, 0) == 0);
     }
+    /* And what is left on a channel no port holds when the module goes is
+     * popped and freed before its queues are: the SDK's free would discard
+     * the descriptor and lose the buffer. */
+    assert(cdx_disable_ceetm_on_iface(&iface) == 0);
+    released = pool_releases;
+    hold_frames = true; pending_frames = 1;
+    packets[0].id = 0; packet_live[0] = true;
+    shutdown_qos(); empty();
+    assert(!pending_frames && !packet_live[0] && pool_releases == released + 1);
+    hold_frames = false;
     shutdown_qos(); empty();
     assert(!dev.priv.qm_ctx && !dev.priv.ceetm_en && !dev.refs);
+    /* With the class queues released, there is none to hold anything. */
+    assert(ceetm_class_queue_backlog(0, 3, &held) == -ENODEV);
     assert(start() == 0);
     release_error = true;
     assert(ceetm_exit() < 0);
@@ -509,7 +579,7 @@ int main(void)
         pending_frames = 1; packets[0].id = 0; packet_live[0] = true;
         unsigned long before = jiffies;
         struct classque_info *cq = &qm_chnl_info[0].cq_info[0];
-        assert(ceetm_drain_queue(cq) < 0);
+        assert(ceetm_drain_queue(cq, CEETM_DRAIN_ALL) < 0);
         assert(jiffies - before <= 1000 && cq->drain_failed);
         assert(ceetm_release_queue(cq) < 0);
         assert(cq->cq && cq->lfq && cq->fq_created && packet_live[0]);
@@ -547,6 +617,26 @@ int main(void)
     assert(shutdown_waits == 1 && !dev.refs && !packet_live[0]);
     recover_on_shutdown_wait = false; hold_frames = false;
     shutdown_qos(); empty();
+    /* Leftovers a pop will not take keep their channel out of service, as a
+     * failed drain does: unmapped, so the frame goes out of no port, and
+     * popped by the unload once the pop works again. */
+    assert(start() == 0);
+    assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    assert(ceetm_assign_chnl(ctx, 0) == 0);
+    assert(cdx_disable_ceetm_on_iface(&iface) == 0);
+    assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    hold_frames = true; pending_frames = 1;
+    packets[0].id = 0; packet_live[0] = true;
+    persistent_pop_error = -EIO;
+    assert(ceetm_assign_chnl(ctx, 0) < 0);
+    assert(!ctx->chnl_map && !qm_chnl_info[0].qm_ctx);
+    assert(qm_chnl_info[0].cq_info[0].drain_failed && packet_live[0] && !maps_with_frames);
+    assert(ceetm_assign_chnl(ctx, 0) < 0);
+    persistent_pop_error = 0;
+    assert(cdx_disable_ceetm_on_iface(&iface) == 0);
+    shutdown_qos(); empty();
+    assert(!pending_frames && !packet_live[0]);
+    hold_frames = false;
     /* Late pool-backed ERNs need no device; malformed late SKB ERNs must
      * not dereference a detached interface. */
     struct qm_fd late = {.bpid = 7, .id = 0};

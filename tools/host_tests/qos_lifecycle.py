@@ -10,6 +10,7 @@ from _host_qos_lifecycle import (ROOT, function)
 
 from pathlib import Path
 import os
+import re
 import shutil
 
 
@@ -27,13 +28,14 @@ def test_qos_lifecycle(tmp_path):
     names = [
         "ceetm_resolve_channel", "ceetm_get_egressfq", "ceetm_egressfq_hook",
         "ceetm_release_lni", "ceetm_program_channel_shaper",
-        "ceetm_create_lni", "ceetm_get_fqcount",
+        "ceetm_create_lni", "ceetm_get_fqcount", "ceetm_class_queue_backlog",
         "ceetm_create_ccg_for_class_queue", "ceetm_num_to_2powN_multiple",
-        "ceetm_cfg_td_on_class_queue", "ceetm_create_cq",
+        "ceetm_cfg_td_on_class_queue", "ceetm_cq_wred_off", "ceetm_park_class_queue",
+        "ceetm_create_cq",
         "ceetm_create_queues", "ceetm_create_channel", "ceetm_init_channels",
         "ceetm_assign_chnl",
         "ceetm_release_fd", "ceetm_sync_portal", "ceetm_sync_portals",
-        "ceetm_drain_queue", "ceetm_drain_channel",
+        "ceetm_drain_queue", "ceetm_drain_channel", "ceetm_pop_leftovers",
         "ceetm_quiesce_port", "ceetm_put_channel_devices",
         "ceetm_dscp_map_release", "ceetm_release_iface", "ceetm_release_queue", "ceetm_release_channels",
         "ceetm_exit",
@@ -42,6 +44,8 @@ def test_qos_lifecycle(tmp_path):
         "static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];\n"
         "static bool ceetm_callbacks_registered;\n"
         "static int ceetm_release_channels(void);\n"
+        "static int ceetm_pop_leftovers(struct classque_info *cqinfo);\n"
+        + re.search(r"^#define CEETM_DRAIN_ALL\s.*$", source, re.M).group() + "\n"
         + "\n".join(function(source, name) for name in names)
         + "\n".join(function(control, name) for name in [
             "qm_init", "qm_quiesce", "qm_exit", "cdx_enable_ceetm_on_iface", "cdx_disable_ceetm_on_iface",

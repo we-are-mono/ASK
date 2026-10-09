@@ -37,6 +37,7 @@ static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
 static bool ceetm_callbacks_registered;
 
 static int ceetm_release_channels(void);
+static int ceetm_pop_leftovers(struct classque_info *cqinfo);
 
 
 /* The class queue a (channel, class queue) pair names, or NULL.
@@ -241,12 +242,12 @@ static struct qman_fq *ceetm_get_dscp_fq(void *ctx, uint8_t dscp)
 }
 
 /* get count of frames on a CEETM class queue */
-static int ceetm_get_fqcount(struct ceetm_chnl_info *chnl_ctx, uint32_t classque, uint32_t *fqcount)
+static int ceetm_get_fqcount(struct classque_info *cqinfo, uint32_t *fqcount)
 {
 	struct qm_mcr_ceetm_cq_query query;
 	struct qm_ceetm_cq *cq;
 
-	cq = chnl_ctx->cq_info[classque].cq;
+	cq = cqinfo->cq;
 	if (!cq)
 		return CEETM_FAILURE;
 	if (qman_ceetm_query_cq((cq->parent->idx << 4) | cq->idx,
@@ -509,6 +510,22 @@ static int ceetm_cq_wred_off(struct classque_info *cqinfo)
 		return -EIO;
 	cqinfo->wred = false;
 	return 0;
+}
+
+/* Park a class queue no class uses any more: no curve, and a frame of tail
+ * drop (CEETM_PARKED_CQ_DEPTH). What it holds already stays -- a lower tail
+ * drop evicts nothing. */
+static int ceetm_park_class_queue(struct ceetm_chnl_info *chnl_ctx,
+				  uint32_t quenum)
+{
+	int ret = 0;
+
+	if (ceetm_cq_wred_off(&chnl_ctx->cq_info[quenum]))
+		ret = -EIO;
+	if (ceetm_cfg_td_on_class_queue(chnl_ctx, quenum,
+					CEETM_PARKED_CQ_DEPTH))
+		ret = -EIO;
+	return ret;
 }
 
 static void ceetm_release_fd(struct net_device *net_dev, const struct qm_fd *fd)
@@ -891,21 +908,21 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 						return CEETM_FAILURE;
 					}
 				}
-				/* Back to the defaults means no curve either: a
-				 * RED qdisc's own destroy arrives after the tree's,
-				 * finds no qdisc, and so cannot take one off. */
-				if (ceetm_cq_wred_off(cqinfo)) {
-					ceetm_err("%s::cannot turn WRED off on chnl %d cq %d\n",
-						__func__, ii, jj);
-					return CEETM_FAILURE;
-				}
-				/* The depth is recorded once the group took it, so the
-				 * next tree on the channel reads what it holds
-				 * (ceetm_class_queue_state()). */
-				ceetm_dbg("%s::resetting que depth on class queue %d\n", __func__, ii);
-				if (ceetm_cfg_td_on_class_queue(qm_channel, jj, DEFAULT_CQ_DEPTH)) {
-					ceetm_err("%s::ceetm_cfg_ccg_to_class_queue failed on chnl %d\n", 
-							__func__, ii);
+				/* Parked: no curve -- a RED qdisc's own
+				 * destroy arrives after the tree's, finds
+				 * no qdisc, and so cannot take one off --
+				 * and a frame of tail drop rather than the
+				 * module-load default, since the port's
+				 * classifier entries name these queues
+				 * until they are installed again, after
+				 * the drain and after the port has stopped
+				 * serving them (CEETM_PARKED_CQ_DEPTH).
+				 * Recorded once the group took it, so the
+				 * next tree on the channel reads what it
+				 * holds (ceetm_class_queue_state()). */
+				if (ceetm_park_class_queue(qm_channel, jj)) {
+					ceetm_err("%s::cannot park chnl %d cq %d\n",
+						  __func__, ii, jj);
 					return CEETM_FAILURE;
 				}
 				if (jj >= NUM_PQS) {
@@ -1070,10 +1087,23 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 		if (chnl_ctx->cq_info[ii].drain_failed)
 			return CEETM_FAILURE;
 	if (chnl_ctx->qm_ctx) {
-		ceetm_err("%s::channel number %d already assigned to iface %s\n", 
+		ceetm_err("%s::channel number %d already assigned to iface %s\n",
 			__func__, channel_num, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
+	/* What a tree taken down left on the channel goes before the channel
+	 * is mapped to this port, or this port would send it
+	 * (ceetm_pop_leftovers()). Frames the entries of that tree send after
+	 * this, before they are installed again, still can be -- a parked
+	 * frame a queue at most. A queue that cannot be emptied keeps the
+	 * channel out of service, as a failed drain does. */
+	for (ii = 0; ii < NUM_CLASS_QUEUES; ii++)
+		if (chnl_ctx->cq_info[ii].cq &&
+		    ceetm_pop_leftovers(&chnl_ctx->cq_info[ii])) {
+			ceetm_err("%s::channel %d queue %d holds frames it cannot give up\n",
+				  __func__, channel_num, ii);
+			return CEETM_FAILURE;
+		}
 	channel = chnl_ctx->channel;
 	lni = qm_ctx->lni;
 	ceetm_dbg("%s::assigning channel %d(%d) to iface %s\n", __func__, 
@@ -1374,6 +1404,30 @@ int ceetm_class_queue_state(uint32_t channel_num, uint32_t quenum,
 	return 0;
 }
 
+/* The frames a class queue holds right now, as QMan counts them. Each class
+ * queue has a congestion group of its own counting frames, so this is also
+ * what that group compares with its tail drop.
+ *
+ * For a caller that bounds what the queues may hold rather than only what
+ * they are configured to: lowering a tail drop evicts nothing, so a queue
+ * that held more than its new depth keeps it until it sends it -- never, while
+ * its port is paused or a strict-priority sibling takes every token -- and a
+ * queue a class gives back keeps whatever was on it. Above the tail drop
+ * the count can only fall, which is what makes one reading of it a bound from
+ * then on. -ENODEV for a queue that was never built. */
+int ceetm_class_queue_backlog(uint32_t channel_num, uint32_t quenum,
+			      uint32_t *frames)
+{
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
+	if (!qm_chnl_info[channel_num].cq_info[quenum].cq)
+		return -ENODEV;
+	if (ceetm_get_fqcount(&qm_chnl_info[channel_num].cq_info[quenum],
+			      frames))
+		return -EIO;
+	return 0;
+}
+
 /* What a class queue actually dequeued, and what its congestion group
  * rejected. Read without QMAN_CEETM_FLAG_CLEAR_STATISTICS_COUNTER, so
  * repeated reads report totals rather than deltas -- these counters have one
@@ -1500,13 +1554,18 @@ int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight
 }
 
 /* Return a class queue to the state ceetm_reset_qos() would leave it in: no
- * WRED curve, its default depth, and out of contention for the channel's
- * committed rate. Group eligibility is deliberately left alone -- it belongs to
- * all eight weighted queues, and the surviving ones still want it.
+ * WRED curve, parked at a frame (CEETM_PARKED_CQ_DEPTH), and out of contention
+ * for the channel's committed rate. Group eligibility is deliberately left
+ * alone -- it belongs to all eight weighted queues, and the surviving ones
+ * still want it.
  *
  * The curve matters because nothing else will take it off. A leaf deleted with
  * a RED qdisc on it is deleted before that qdisc is destroyed, and the destroy
- * then names a class that no longer exists. */
+ * then names a class that no longer exists. The depth matters because the
+ * classifier entries installed for the class still send to the queue until
+ * they are installed again, and a caller that bounds what its queues may hold
+ * counts this one only by what it holds. What it already holds stays: a lower
+ * tail drop evicts nothing. */
 int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
 {
 	struct qm_ceetm_weight_code weight_code;
@@ -1518,10 +1577,7 @@ int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
 		return -EINVAL;
 	chnl_ctx = &qm_chnl_info[channel_num];
 	cqinfo = &chnl_ctx->cq_info[quenum];
-	if (ceetm_cq_wred_off(cqinfo))
-		ret = -EIO;
-	if (ceetm_cfg_td_on_class_queue(chnl_ctx, quenum, DEFAULT_CQ_DEPTH))
-		ret = -EIO;
+	ret = ceetm_park_class_queue(chnl_ctx, quenum);
 	if (quenum >= NUM_PQS) {
 		cqinfo->weight = DEFAULT_WBFQ_WEIGHT;
 		if (qman_ceetm_ratio2wbfs(DEFAULT_WBFQ_WEIGHT, 1, &weight_code, 0) ||
@@ -1798,7 +1854,12 @@ static int ceetm_sync_portals(void)
 	return atomic_read(&ret);
 }
 
-static int ceetm_drain_queue(struct classque_info *cqinfo)
+/* As many frames as a drain pops: all of them, until the queue reads empty. */
+#define CEETM_DRAIN_ALL	UINT_MAX
+
+/* Pop a class queue's frames and free them, until it reads empty or `limit'
+ * of them have gone. */
+static int ceetm_drain_queue(struct classque_info *cqinfo, unsigned int limit)
 {
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 	struct qm_fd fd;
@@ -1815,6 +1876,10 @@ static int ceetm_drain_queue(struct classque_info *cqinfo)
 		}
 		if (ret == 1) {
 			ceetm_release_fd(cqinfo->ceetmfq.net_dev, &fd);
+			if (!--limit) {
+				cqinfo->drain_failed = false;
+				return CEETM_SUCCESS;
+			}
 		}
 		if (time_after_eq(jiffies, timeout)) {
 			cqinfo->drain_failed = true;
@@ -1843,7 +1908,7 @@ static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
 			continue;
 		/* Prefer normal transmission, then reclaim any stranded frames. */
 		for (;;) {
-			if (ceetm_get_fqcount(chinfo, jj, &count)) {
+			if (ceetm_get_fqcount(&chinfo->cq_info[jj], &count)) {
 				ret = CEETM_FAILURE;
 				force_drain = true;
 				break;
@@ -1858,10 +1923,44 @@ static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
 			}
 			usleep_range(1000, 2000);
 		}
-		if (force_drain && ceetm_drain_queue(&chinfo->cq_info[jj]))
+		if (force_drain &&
+		    ceetm_drain_queue(&chinfo->cq_info[jj], CEETM_DRAIN_ALL))
 			ret = CEETM_FAILURE;
 	}
 	return ret;
+}
+
+/* Pop and free the frames a class queue no port serves still holds.
+ *
+ * A tree taken down drains its queues and stops its port serving them, but the
+ * classifier entries installed while it was live go on sending to them until
+ * they are installed again, which happens after the teardown, up to a couple
+ * of seconds later while RTNL is contended. Parked (CEETM_PARKED_CQ_DEPTH),
+ * each such queue keeps a frame of that: its channel stays mapped to the port
+ * it left, which dequeues nothing from it until a tree there starts the
+ * scheduler again. Mapped to another port meanwhile, the frame would go out of
+ * that one, to a neighbour it was not addressed to; at module unload, the
+ * queue would be freed with it, and its buffer lost. So both pop it first
+ * (ceetm_assign_chnl(), ceetm_release_queue()).
+ *
+ * A frame the CPU sent cannot be among them: the port's transmit path stops
+ * resolving its CEETM queues, and is waited out, before the drain
+ * (ceetm_quiesce_port()). The frames are the hardware's, in buffers of a pool
+ * dpa_fd_release() returns them to by pool id alone, with or without the
+ * netdev the queue was last held for. At most as many as were counted before:
+ * what the entries send meanwhile is not chased -- a stream refilling the
+ * queue as fast as it is popped would otherwise hold this for the drain's whole
+ * second and mark the queue failed. A count that cannot be read is a failure,
+ * as is a pop that keeps failing (ceetm_drain_queue()). */
+static int ceetm_pop_leftovers(struct classque_info *cqinfo)
+{
+	uint32_t count;
+
+	if (ceetm_get_fqcount(cqinfo, &count))
+		return CEETM_FAILURE;
+	if (!count)
+		return CEETM_SUCCESS;
+	return ceetm_drain_queue(cqinfo, count);
 }
 
 /* Take a port's scheduling down and hand its channels back: stop software
@@ -1875,7 +1974,7 @@ static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
 static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx, uint32_t *detached)
 {
 	int ret = CEETM_SUCCESS;
-	int ii;
+	int ii, jj;
 
 	*detached = 0;
 	if (qm_ctx->net_dev) {
@@ -1892,6 +1991,17 @@ static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx, uint32_t *detached
 
 		if (chinfo->qm_ctx != qm_ctx)
 			continue;
+		/* Every queue the channel had is given back with it, and is
+		 * parked before the drain, as a queue a class gives back is
+		 * (CEETM_PARKED_CQ_DEPTH): whatever still names it puts no
+		 * more than a frame on it once the drain has finished, and
+		 * the next tree on the channel finds it holding no more than
+		 * that. Already so after ceetm_reset_qos(); not when the
+		 * interface itself goes, which leaves the tree's own depths. */
+		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++)
+			if (chinfo->cq_info[jj].ccg &&
+			    ceetm_park_class_queue(chinfo, jj))
+				ret = CEETM_FAILURE;
 		if (ceetm_drain_channel(chinfo))
 			ret = CEETM_FAILURE;
 		list_del_init(&chinfo->channel->node);
@@ -2006,9 +2116,19 @@ static int ceetm_release_queue(struct classque_info *cqinfo)
 {
 	int ret = CEETM_SUCCESS;
 
-	/* Never hand an undrained CQ to the SDK's descriptor-discarding free. */
-	if (cqinfo->drain_failed && ceetm_drain_queue(cqinfo))
+	/* Never hand an undrained CQ to the SDK's descriptor-discarding free:
+	 * not one whose drain failed, nor one holding what a tree taken down
+	 * left on it after its drain (ceetm_pop_leftovers()). Nothing sends to
+	 * it any more -- this runs at module unload, once classification has
+	 * stopped, or when loading failed -- so popping what it held empties
+	 * it. A pop that keeps failing marks it failed, and the unload tries
+	 * again (qm_quiesce()). */
+	if (cqinfo->drain_failed) {
+		if (ceetm_drain_queue(cqinfo, CEETM_DRAIN_ALL))
+			return CEETM_FAILURE;
+	} else if (cqinfo->cq && ceetm_pop_leftovers(cqinfo)) {
 		return CEETM_FAILURE;
+	}
 	if (cqinfo->fq_created) {
 		qman_destroy_fq(&cqinfo->ceetmfq.egress_fq, 0);
 		cqinfo->fq_created = false;

@@ -47,7 +47,10 @@ PORT_EF_REPLACED = PORT + 20
 PORT_DECLINED = PORT + 21
 PORT_WEIGHTED, PORT_WEIGHTED_BULK = PORT + 22, PORT + 23
 PORT_POOL = PORT + 24
-PORTS_LAST = PORT_POOL
+# One flow per RED leaf, each filled while the LAN port is paused and then
+# shrunk under what it holds.
+PORT_HELD_A, PORT_HELD_B, PORT_HELD_C = PORT + 25, PORT + 26, PORT + 27
+PORTS_LAST = PORT_HELD_C
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
 # unshaped and far above what the CPU can: see the module docstring.
@@ -66,6 +69,7 @@ OAL = 24
 # index. prio 0 is the queue that wins.
 HIGH_PRIO, HIGH_CQ = 0, 7
 LOW_PRIO, LOW_CQ = 1, 6
+LOWER_PRIO, LOWER_CQ = 2, 5
 # A leaf that gives a quantum takes the first free queue of the weighted group,
 # which starts at class queue 8.
 WEIGHTED_CQ = 8

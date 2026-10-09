@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import pytest
 
-from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HIGH, PORT_LOW, PORT_POOL, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, TCP_FRAME, TCP_PAYLOAD
+from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, LOWER_CQ, LOWER_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HELD_A, PORT_HELD_B, PORT_HELD_C, PORT_HIGH, PORT_LOW, PORT_POOL, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, TCP_FRAME, TCP_PAYLOAD
 
 from _flowtable_qos import (CAP_MBIT, COUNT, DATAGRAM, EF_TOS, OAL, OFFERED_MBIT, POLICE_BURST, PORT_DECLINED, PORT_DEFAULT, PORT_EF_REPLACED, PORT_EGRESS, PORT_POLICED, PORT_SATURATE, PORT_SHAPED, PROBE_SLACK, REMARK_CLASS, REMARK_MASK, SETTLE, TAIL_FRAMES, UDP_HEADERS, UNSHAPED_GBPS, WEIGHTED_CQ, WINDOW, WRED_BANDS, WRED_LIMIT, WRED_MBIT, WRED_PROBABILITY, admit, captured, conntrack_ids, directions, dut_ping, ef_filter, egress, handshakes, inbound, iperf, lan_start, leaf_delta, lockstep, logged, offered, offload, police_counters, probe, qdisc_shown, read_intervals, readmitted, received_bps, received_loss, reload_adapter, shaped_bps, timing_slack, tree)
 
@@ -47,6 +47,7 @@ import time
 
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_rig import (WAN_IP, command, pings_answered, pool_lowest, port_drops, read)
+from _lan_pause import while_lan_port_paused
 
 
 # ---- the scheduler ---------------------------------------------------------
@@ -428,6 +429,120 @@ async def test_red_leaf_leaves_the_pool(qos):
     # flight.
     assert wan["rx_missed_errors"] == 0 and answered == 20, record
     assert idle - lowest <= POOL_SHARE, record
+
+
+# A RED leaf's limit of one standard frame on the wire, so a leaf shrunk to it
+# keeps only what it already holds. tc wants a RED's thresholds above the
+# average packet it is told of, so they sit above the limit; the hardware draws
+# the curve within the one frame regardless.
+ONE_FRAME_RED = {"limit": 1542, "min": 3000, "max": 9000}
+# How long each leaf's flow is flooded while the pool is read: a fraction of a
+# second fills a queue of small frames.
+HELD_FILL_SECONDS = 3
+# How long the LAN port stays paused: the three fills, the five qdisc changes
+# between them over the console, and a read of the leaves' counters.
+HELD_SECONDS = 40
+
+
+async def _red_on(r, dev, classid, curve):
+    """`curve` on the RED qdisc under `classid`, added or changed in place, and
+    run by the hardware."""
+    handle = classid.split(":")[1] + ":"
+    burst = (2 * curve["min"] + curve["max"]) // (3 * 1500) + 1
+    await r.tc("qdisc", "replace", "dev", dev, "parent", classid, "handle", handle, "red",
+               *(str(v) for item in curve.items() for v in item), "avpkt", "1500",
+               "burst", str(burst), "probability", "0.02", "bandwidth", f"{POOL_MBIT}mbit")
+    shown = await qdisc_shown(r, dev, handle)
+    assert shown.get("offloaded") is True, (classid, curve, shown)
+
+
+async def test_shrunk_leaf_backlog_stays_charged(qos):
+    """A class queue shrunk under what it holds keeps it: lowering a tail drop
+    evicts nothing, and a port its link partner pauses sends nothing. Its
+    frames stay in buffers of the pool every DPAA port receives into -- for an
+    IPsec flow, of SEC's -- so the queues that grow meanwhile may grow only
+    into what those frames leave of the tree's 1,024 (A348).
+
+    One tree on the LAN port, paused throughout, with three RED leaves fed by
+    three offloaded flows of 64-byte datagrams. The first leaf takes nearly
+    all of the tree's frames and fills; it is shrunk to a frame, and the
+    second asks for everything, fills, and is shrunk in turn; then the third
+    asks for everything and fills. Charged only its depth, each leaf that grew
+    took nearly the whole tree again on top of what the ones before it still
+    held, and the three held two to three thousand frames: more than the
+    port's share of the pool, and two or three times the 1,024 of SEC's pool
+    the trees may hold between them. That reads here as the pool falling that
+    far below idle. Charged what they hold, the second and third leaves get
+    only the room the frames before them left, the pool falls no further than
+    the port's share below idle, and the WAN port the floods arrive on misses
+    nothing."""
+    r = qos
+    dev = TARGET_LAN_IF
+    leaves = (("1:10", HIGH_CQ, PORT_HELD_A), ("1:11", LOW_CQ, PORT_HELD_B),
+              ("1:12", LOWER_CQ, PORT_HELD_C))
+    await tree(r, dev, POOL_MBIT, [("1:10", HIGH_PRIO), ("1:11", LOW_PRIO),
+                                   ("1:12", LOWER_PRIO)])
+    # The second and third leaves ask for a frame each, so the first gets all
+    # the tree has beside them and the queue frames that name no class take.
+    await _red_on(r, dev, "1:11", ONE_FRAME_RED)
+    await _red_on(r, dev, "1:12", ONE_FRAME_RED)
+    await _red_on(r, dev, "1:10", POOL_RED)
+    await offload(r, *(inbound(r, "udp", port, r.mark(cq)) for _, cq, port in leaves))
+    # Admitted while the port still sends: an admission waits for the echo.
+    await lan_start(r, echo=[port for _, _, port in leaves])
+    for _, cq, port in leaves:
+        forward, _ = await admit(r, port)
+        assert int(forward["qos"], 16) == cq, forward
+    bpid, idle = await pool_lowest(0)
+    before, leaves_before = await port_drops(), await egress(r, dev)
+
+    async def fill(port):
+        """One leaf's flow flooded while the pool is read: what was sent, and
+        the lowest the pool's free count fell to meanwhile."""
+        sent, (_, lowest) = await asyncio.gather(
+            asyncio.to_thread(_flood, r.lan_ip, port, HELD_FILL_SECONDS),
+            pool_lowest(HELD_FILL_SECONDS, bpid))
+        return {"sent": sent, "lowest": lowest}
+
+    async def held():
+        started = time.monotonic()
+        phases = {"first": await fill(PORT_HELD_A)}
+        await _red_on(r, dev, "1:10", ONE_FRAME_RED)
+        await _red_on(r, dev, "1:11", POOL_RED)
+        phases["second"] = await fill(PORT_HELD_B)
+        await _red_on(r, dev, "1:11", ONE_FRAME_RED)
+        await _red_on(r, dev, "1:12", POOL_RED)
+        phases["third"] = await fill(PORT_HELD_C)
+        # Read while the port is still paused, so nothing has left yet.
+        phases["leaves"] = await egress(r, dev)
+        phases["seconds"] = time.monotonic() - started
+        return phases
+
+    phases, pauses = await while_lan_port_paused(r, held, HELD_SECONDS)
+    after = await port_drops()
+    wan = {k: after[TARGET_WAN_IF][k] - before[TARGET_WAN_IF][k] for k in before[TARGET_WAN_IF]}
+    names = ("first", "second", "third")
+    filled = {name: leaf_delta(leaves_before, phases["leaves"], slot)
+              for slot, name in enumerate(names)}
+    lowest = min(phases[name]["lowest"] for name in names)
+    record = {"phases": phases, "filled": filled, "pauses": pauses, "wan": wan,
+              "pool": {"bpid": bpid, "idle": idle, "lowest": lowest}}
+    r.record("qos-held-backlog", record)
+    # The port stayed paused until the last read: past the pause, the leaves
+    # would have sent what they held and the reading would prove nothing.
+    assert phases["seconds"] < HELD_SECONDS, record
+    # Every flood reached its leaf in hardware, and the leaf refused what it
+    # could not hold.
+    for name in names:
+        assert phases[name]["sent"] > 100_000, record
+        assert filled[name]["rejected"] > phases[name]["sent"] // 2, record
+    # The first leaf held its frames in the pool, most of a tree of them:
+    # what the leaves after it had to be kept out of.
+    assert idle - phases["first"]["lowest"] >= 400, record
+    # And all three together held no more than the port's share, with the
+    # port they arrived on losing nothing for want of a buffer.
+    assert idle - lowest <= POOL_SHARE, record
+    assert wan["rx_missed_errors"] == 0, record
 
 
 async def test_red_reports_what_the_hardware_holds(qos):

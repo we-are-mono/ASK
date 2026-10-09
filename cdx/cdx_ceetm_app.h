@@ -97,6 +97,16 @@ Structure and Macro definitions
 #define CEETM_TOKEN_FRAC_MAXVAL         0x1fff
 /* default TD value */
 #define DEFAULT_CQ_DEPTH        8
+/* The tail drop of a class queue no class uses any more: one a leaf gave
+ * back, or every one of a tree taken down. One frame, the least a congestion
+ * group can hold -- zero is no tail drop at all. Classifier entries installed
+ * while the queue was a class's still name it until they are installed again
+ * after the change, and what they send it meanwhile is held to this: a frame,
+ * where the eight of the default above would let a tree's worth of queues
+ * hold more than what is left of SEC's pool, and on a tree taken down, where
+ * nothing serves the queue any more, keep it. The module-load default stays
+ * for queues no class has used, which nothing names. */
+#define CEETM_PARKED_CQ_DEPTH   1
 
 /**********************************************************************************************************************
    Function Prototypes
@@ -129,6 +139,8 @@ int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth
 int ceetm_set_class_depth(uint32_t channel_num, uint32_t quenum, uint32_t depth);
 int ceetm_class_queue_state(uint32_t channel_num, uint32_t quenum,
 			    uint32_t *depth, bool *wred);
+int ceetm_class_queue_backlog(uint32_t channel_num, uint32_t quenum,
+			      uint32_t *frames);
 int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num);
 int ceetm_set_channel_rates(uint32_t channel_num, uint64_t cir_bps, uint64_t eir_bps);
 int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight,

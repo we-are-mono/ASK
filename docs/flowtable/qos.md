@@ -627,8 +627,9 @@ Some things the contract makes sharp:
 - Leaf class queues ask for a tail-drop depth of 128 frames rather than the
   hardware layer's default of eight, which is far too shallow for a queue that
   is deliberately being shaped, and get it while the tree's budget allows —
-  increment 6 caps the tree as a whole (A337). Increment 6 also offers WRED in
-  place of plain tail drop.
+  increment 6 caps the tree as a whole, counting what each class queue holds
+  as well as its depth (A337, A348). Increment 6 also offers WRED in place of
+  plain tail drop.
 
 Limits, all of them the hardware's: eight channels for the whole SoC shared by
 every port, eight weighted leaves per channel until WBFS group B is claimed
@@ -1054,13 +1055,17 @@ less than a frame, and `min` and `max` the curve's band. Not the largest frame
 a jumbo port admits: divided by 9,642 bytes, `min 20000 max 60000`, one of the
 curves measured below, would be a band of two frames to six. A queue of small
 frames therefore holds fewer bytes than the qdisc's limit names, and one of
-jumbo frames more; what bounds its buffers is the frame count, and the cap
-below. The band is never narrower than two frames: the slope is at most 127 per
-frame against a maximum probability of up to 252 256ths, so a band of one frame
-is drawn gentler than asked, starting a frame early
-(`ceetm_wred_min_band()`), and a band that rounded to nothing would be refused
-outright. An MTU change (`NETDEV_CHANGEMTU`) redraws every RED curve on the
-port.
+jumbo frames more — on a 9,000-byte MTU about six times more, 9,042 bytes on
+the wire against the 1,542 each frame is counted as, and six times as long to
+drain at the limit. That is the trade-off, made deliberately: the curve keeps
+the shape the qdisc asked for in frames, and what matters to the buffer pools
+stays bounded, because every frame holds one buffer whatever its size and the
+cap below bounds the frames. The band is never narrower than two frames: the
+slope is at most 127 per frame against a maximum probability of up to 252
+256ths, so a band of one frame is drawn gentler than asked, starting a frame
+early (`ceetm_wred_min_band()`), and a band that rounded to nothing would be
+refused outright. An MTU change (`NETDEV_CHANGEMTU`) redraws every RED curve on
+the port.
 
 **The tree is capped.** A tree's class queues together hold no more than the
 port's share of the Ethernet pool — half of what the port seeds it with, 1,280
@@ -1086,15 +1091,85 @@ change to the tree, to a RED curve and to the port's MTU, and whenever a tree
 comes or goes on any port — for a port that goes, once its CEETM context is
 released. Every queue that shrinks is programmed before any that grows, so the
 depths never add up past the budget, and while a queue will not shrink none
-grows. What the queues hold can run past it for a while: lowering a depth
-evicts nothing, so a queue holding more sends down to its new depth at its own
-rate while the queues that grew fill — at most the larger of each queue's old
-and new depth, added up. A deleted leaf's queue leaves the count with whatever
-it still holds; reset, it is eligible only for the excess tokens the tree's own
-queues leave unused, and drains as they come — behind a class that takes every
-token it may, not until that class goes quiet. A RED curve the group already
-holds is not written again. `tools/host_tests/htb_offload.py` checks the budget
-on every write.
+grows.
+
+**What is capped is what the queues may hold, not their depths alone (A348).**
+Lowering a depth evicts nothing. A queue holding more than its new depth keeps
+those frames until the port sends them, which a paused port never does, and
+neither does a queue starved behind a strict-priority sibling; a queue a leaf
+gives back — deleted, moved to another priority, turned into a channel, or one
+of queues 0 and 7 when the top channel moves — keeps its frames too, and so
+does every queue of a tree taken down until its drain. Counting depths alone,
+a RED leaf filled to about 740 frames and shrunk to one while another grew and
+filled, a few times over, would hold more than all of SEC's 2,560 buffers, and
+every SA's jobs would be refused; three such leaves on the rig, the LAN port
+paused, held 2,048 of the Ethernet pool's. So once the shrinks are written,
+the cap reads what every class queue holds — QMan's own count
+(`ceetm_class_queue_backlog()`) — and charges each queue a tree uses the larger
+of its depth and that count, since above its depth the count can only fall,
+and every other queue what it holds. The queues that grow share, in the order
+the tree lists them, what those charges leave of the tree's budget and of the
+1,024 across every tree, whichever is less; growing up to what a queue already
+holds itself costs nothing. A queue kept short stays at what it got, a RED
+leaf's curve drawn for that depth, and the rest follows as the frames leave: a
+work item looks again 100 ms after the change, then half as often each time a
+queue is still short, down to once a second, holding only the qdisc's mutex and
+never RTNL (`cdx_htb_regrow_work()`). A shrink the hardware refuses is tried
+again the same way. A port paused for good keeps it polling once a second. The
+queues of a port's tree stay charged at their depth after the port goes until
+its CEETM context has been released and drained, and a channel whose drain
+failed stays charged what it holds. The same three leaves on the rig held 920
+buffers.
+
+A queue given back is charged only what it holds, but it is not quite left
+alone: the classifier entries installed while it was a class's still send to
+it until they are installed again after the change — up to a couple of
+seconds while RTNL is contended. So the hardware layer parks it at one frame
+rather than at its module-load default of eight (`CEETM_PARKED_CQ_DEPTH`),
+and a tree taken down, or one whose port goes, has every queue of its
+channels parked the same way before they are drained (`ceetm_quiesce_port()`).
+The bound therefore holds but for one frame per class queue a change has just
+touched, never more: a queue given back takes at most that frame from the
+entries, until they are installed again, and a queue configured while other
+queues' frames fill the budget starts at a frame no tail drop can go below,
+until those frames leave. A change touches at most the eighteen queues of its
+tree, against the 128 frames of SEC's pool left over for its own jobs; with
+eight, eighteen of them could have held 144 frames.
+
+**A tree taken down can leave frames behind.** Its queues are drained and its
+port stops serving them, but its entries go on sending to them until they are
+installed again, so under traffic each queue they named can be left holding
+its parked frame. Nothing sends it: the channel stays mapped to the port it
+left. Left alone, the frame would hold its buffer until that port started a
+tree again; a tree on another port that claimed the channel would send it out
+of the wrong port, to a neighbour it was not addressed to; and at unload the
+SDK's free would discard it with its buffer. While it waits it is charged, and
+a tree whose shares fill its budget stays that many frames short, with the
+regrow work polling once a second. So a channel's leftovers are popped and
+their buffers freed before the channel is mapped to a port again
+(`ceetm_assign_chnl()`), and before its queues are freed at unload
+(`ceetm_release_queue()`) — at most as many as the queue counts when asked,
+so a stream refilling it cannot hold the claim; a queue that will not give
+them up keeps the channel out of service, as a failed drain does. What
+remains is narrow: a channel claimed while the departed tree's entries are
+still being installed again can still take up to one frame a queue to the
+claiming port. Taking the port off its queues before they are drained —
+installing its entries again first, and draining after — closes that, and is
+filed separately.
+
+A refusal the regrow work meets again every second — a shrink, a curve, a
+count the hardware will not give — is logged once, and again only after it has
+been put right and comes back.
+
+A RED curve the group already holds is not written again.
+`tools/host_tests/htb_offload.py` checks both budgets on every write, counting
+each queue at the larger of its depth and what the test has filled it with,
+and a queue given back by the frame its entries can still add; it walks the
+sequence above, a deleted leaf, a priority change, a leaf that becomes a
+channel, the top channel moving, a second tree arriving, a port going, and a
+shrink the hardware refuses. `tools/host_tests/qos_lifecycle.py` checks that a
+port going parks its queues, and that leftovers are popped before a channel is
+mapped again and before it is freed.
 
 **Congestion-state notification stays off**, which settles the question this
 increment was asked to decide. Nothing consumes a notification: there is no CSCN
@@ -2607,7 +2682,7 @@ driver. Every number here is the hardware's or the driver's, not a policy:
 | Leaf classes | 16 per port | per port | `CDX_CEETM_MAX_QUEUES_PER_CHANNEL`, `:59` |
 | Weighted leaves | 8 per channel | until WBFS group B is claimed | `qman_ceetm_cq_claim_A` |
 | Strict priorities | 8 | per channel | CEETM |
-| Tail-drop depth | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, 1,024 of SEC's 2,560 buffers shared evenly | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair; the hardware default is 8, far too shallow |
+| Tail-drop depth | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, 1,024 of SEC's 2,560 buffers shared evenly, each queue counted at the larger of its depth and what it holds | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair; the hardware default is 8, far too shallow |
 | Ingress policer profiles | 8, of which **7** are addressable | per port | profile 0 is the default for everything unclassified; `CDX_FT_QOS_MAX_POLICER` |
 | DSCP→class egress map | **1 port at a time** | SoC-wide | "Now supporting only one interface", and the second port is refused |
 | Flowtable bindings | `MAX_PHY_PORTS` per table, 2 tables | one per cdx-backed port per table; the second table is a replacement or a probe | `CDX_FT_MAX_TABLE_DEVICES`, `CDX_FT_MAX_TABLES`; was 2 until A152 |

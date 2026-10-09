@@ -30,7 +30,6 @@ typedef uint16_t U16;
 #define NUM_PQS				8
 #define NUM_WBFQS			8
 #define MAX_SCHEDULER_QUEUES		(NUM_PQS + NUM_WBFQS)
-#define DEFAULT_CQ_DEPTH		8
 #define ceetm_err(...)			((void)0)
 #define ceetm_dbg(...)			((void)0)
 
@@ -409,7 +408,10 @@ int main(void)
 	 * depth, so the paths that hand a queue to a new class, or back to its
 	 * defaults, have to take it off themselves. A leaf deleted with a RED
 	 * qdisc on it is reset before that qdisc's destroy arrives, and the
-	 * destroy then names a class that is gone. */
+	 * destroy then names a class that is gone. A queue given back is
+	 * parked at a frame, all the classifier entries still naming it can
+	 * put on it until they are installed again. */
+	assert(CEETM_PARKED_CQ_DEPTH == 1);
 	static struct qm_ceetm_channel channel = { .idx = 0 };
 	struct qm_ceetm_ccg weighted = { .idx = 9 };
 
@@ -422,7 +424,8 @@ int main(void)
 		assert(!ceetm_set_class_wred(0, queue, 10, 40, 1u << 26, 160));
 		assert(group->wred_on && qm_chnl_info[0].cq_info[queue].wred);
 		assert(!ceetm_reset_class_queue(0, queue));
-		assert(!group->wred_on && td_depth == DEFAULT_CQ_DEPTH);
+		assert(!group->wred_on && td_depth == CEETM_PARKED_CQ_DEPTH);
+		assert(qm_chnl_info[0].cq_info[queue].qdepth == CEETM_PARKED_CQ_DEPTH);
 		assert(!qm_chnl_info[0].cq_info[queue].wred);
 		/* And configuring a queue for a class starts it on plain tail
 		 * drop, whatever the previous owner left behind. The same curve

@@ -10,15 +10,19 @@ struct netlink_ext_ack;
 
 /* Claim the netdev's ndo_setup_tc and start serving TC_SETUP_QDISC_HTB.
  * cdx owns the registration because CEETM is cdx's, and because cdx stays
- * loaded while the flowtable adapter can come and go. */
+ * loaded while the flowtable adapter can come and go. The exit waits for the
+ * work that regrows the trees' queues to finish, and leaves none pending. */
 int cdx_htb_init(void);
 void cdx_htb_exit(void);
 
 /* Drop a port's qdisc state without touching hardware, for a caller that is
- * already tearing the interface's CEETM context down. */
+ * already tearing the interface's CEETM context down. Its class queues stay
+ * charged at their depth to the other ports' trees until the next call. May
+ * sleep: it cancels, and waits out, the work that regrows the trees' queues,
+ * which takes this file's mutex and nothing else. */
 void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx);
-/* That caller has released the context, and the other ports' trees take the
- * share of SEC's pool the departed one had. */
+/* That caller has released the context, its queues drained, and the other
+ * ports' trees take the share of SEC's pool the departed one had. */
 void cdx_htb_port_released(void);
 
 /* A DPAA port's MTU changed: a hardware qdisc's tree on it resizes its class

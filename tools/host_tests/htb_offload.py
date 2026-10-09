@@ -49,9 +49,13 @@ def test_htb_offload(tmp_path):
     # band it can draw, which the curve's conversion to frames widens to.
     ipsec = (ROOT / "cdx/dpa_ipsec.h").read_text()
     ceetm = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
+    # And the depth a queue a class gave back is parked at, which bounds what
+    # the classifier entries still naming it can put on it.
+    ceetm_h = (ROOT / "cdx/cdx_ceetm_app.h").read_text()
     (tmp_path / "htb_pools.inc").write_text(
         "".join(re.search(rf"^#define\s+{name}\s.*$", ipsec, re.M).group() + "\n"
                 for name in ("IPSEC_BUFCOUNT", "IPSEC_SHARE_FRAMES", "IPSEC_QDISC_FRAMES"))
+        + re.search(r"^#define\s+CEETM_PARKED_CQ_DEPTH\s.*$", ceetm_h, re.M).group() + "\n"
         + "".join(line + "\n" for line in ceetm.splitlines()
                   if line.startswith("#define CEETM_WRED_"))
         + function(ceetm, "ceetm_wred_maxp") + function(ceetm, "ceetm_wred_min_band"))
@@ -91,8 +95,11 @@ def test_htb_offload(tmp_path):
         "cdx_htb_find_qid", "cdx_htb_channel_owned",
         "cdx_htb_live_trees", "cdx_htb_budget", "cdx_htb_red_frame",
         "cdx_htb_red_want", "cdx_htb_red_frames", "cdx_htb_cap_queues",
-        "cdx_htb_cap_share", "cdx_htb_cap_write", "cdx_htb_cap_apply",
-        "cdx_htb_cap", "cdx_htb_cap_trees", "cdx_htb_implicit_sync",
+        "cdx_htb_tree_mask", "cdx_htb_channel_port",
+        "cdx_htb_cap_share", "cdx_htb_cap_write", "cdx_htb_cap_charge",
+        "cdx_htb_cap_room", "cdx_htb_cap_apply", "cdx_htb_cap",
+        "cdx_htb_cap_trees",
+        "cdx_htb_regrow_work", "cdx_htb_implicit_sync",
         "cdx_htb_control_budget", "cdx_htb_publish", "cdx_htb_resize",
         "cdx_htb_channel_get", "cdx_htb_cq_get", "cdx_htb_implicit_forget",
         "cdx_htb_cq_configure", "cdx_htb_cq_release", "cdx_htb_cq_restore",
