@@ -169,11 +169,11 @@ def test_the_worker_decides_against_the_chain_as_it_stands():
     assert resync.index("failed |= BIT(idx);") < resync.index("rtnl_unlock();")
 
 
-def test_the_drain_takes_the_transaction_under_its_callers_rtnl_only():
-    """The drain runs under the RTNL a tc command holds and takes the
-    transaction there, the order the bind path already takes; it takes no
-    RTNL of its own, never waits for the worker, and takes ft_mr_lock only
-    inside the transaction. The worker, for its part, keeps the group's
+def test_the_drain_takes_no_rtnl_of_its_own():
+    """The drain takes the transaction itself -- under the RTNL a tc command
+    holds, or with none, from CDX's release of a torn-down tree's channels --
+    the order the bind path already takes; it takes no RTNL of its own, never
+    waits for the worker, and takes ft_mr_lock only inside the transaction. The worker, for its part, keeps the group's
     hardware until it is inside its own transaction and records before it
     leaves, so the drain never meets a group it cannot rebuild -- a group
     going over to a bridge's copies included, whose entry of its own is

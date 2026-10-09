@@ -30,9 +30,13 @@
  *
  * Everything below runs under RTNL in process context, and sch_htb wraps every
  * leaf add, delete and graft in dev_deactivate()/dev_activate(), so the netdev
- * can be quiesced the moment a callback returns. The one exception is the work
- * that grows class queues once frames other queues held have left
- * (cdx_htb_regrow_work()), which holds this file's mutex and no RTNL. RTNL is
+ * can be quiesced the moment a callback returns. The exceptions are two works,
+ * which run without RTNL: the one that grows class queues once frames other
+ * queues held have left (cdx_htb_regrow_work()), under this file's mutex
+ * throughout, and the one that gives a torn-down tree's channels back once its
+ * port's flowtable entries no longer send to them (cdx_htb_release_work()),
+ * which drops the mutex while it waits for the flowtable and reads again what
+ * it was releasing once it has it back. RTNL is
  * also what serialises the commands against each other; the hardware layer
  * still refuses what would clash -- ceetm_assign_chnl() will not hand out a
  * channel another port holds, and TC_HTB_CREATE below will not take a port
@@ -143,15 +147,14 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  * queues' frames fill the budget still starts at a frame (CDX_HTB_CQ_START),
  * until those frames leave; and a queue a class gave back, charged only what
  * it holds, is parked at a frame (CEETM_PARKED_CQ_DEPTH), which the classifier
- * entries that named it can still fill until they are installed again after
- * the change. A change touches at most the eighteen class queues of its tree,
- * against the 128 frames of SEC's pool left over for its own jobs. On a tree
- * taken down, that frame lands after the drain, on a channel its port no
- * longer serves; it stays, charged, until that port starts a tree again and
- * sends it, or until the channel is claimed again or the module goes, both of
- * which pop it first (ceetm_pop_leftovers()). A claim made while the entries
- * are still being installed again can take one more such frame a queue to the
- * claiming port.
+ * entries that named it can still fill until they have been retired or
+ * rebuilt after the change. A change touches at most the eighteen class
+ * queues of its tree, against the 128 frames of SEC's pool left over for its
+ * own jobs. On a tree taken down, that frame lands after the drain, on a
+ * channel its port no longer serves, quarantined for the port until nothing in
+ * the flowtable sends to it; it stays, charged, until the quarantine's release
+ * pops it (cdx_htb_release_work()), or the port takes the channel back and
+ * sends it.
  */
 #define CDX_HTB_ETH_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
 #define CDX_HTB_SEC_FRAMES	IPSEC_QDISC_FRAMES
@@ -179,6 +182,14 @@ static_assert(CEETM_PARKED_CQ_DEPTH <= CDX_HTB_CQ_START,
  * leave at the rate their port sends them, which a paused port does not. */
 #define CDX_HTB_REGROW_FIRST_MS	100
 #define CDX_HTB_REGROW_LAST_MS	1000
+
+/* How soon a release of a torn-down tree's channels that the flowtable could
+ * not yet clear asks again (cdx_htb_release_work()): soon at first, since what
+ * holds it up -- an invalidation, or an SA or multicast group whose rebuild
+ * failed and went back to its worker -- is work already under way, then half
+ * as often each time, down to once a second. */
+#define CDX_HTB_RELEASE_FIRST_MS	100
+#define CDX_HTB_RELEASE_LAST_MS		1000
 
 /* A RED qdisc names its thresholds in bytes, and a class queue counts frames:
  * the bytes are divided by a standard frame as it leaves -- the MTU's, where
@@ -334,6 +345,24 @@ struct cdx_htb_port {
 	bool told_stuck, told_unread;
 };
 
+/* The release of the channels a tree taken down left quarantined for its port
+ * (ceetm_stop_qos()), one a port, under cdx_htb_mutex. Kept apart from the
+ * port, which cdx_htb_port_gone() clears whole and a new tree starts afresh,
+ * while this outlives both until the release is done or the port goes.
+ *
+ * `dev' is the port's netdev, held while a release is due. Every teardown on
+ * the port moves `gen' on, and the HTB command that made it, having marked the
+ * port's flowtable entries for re-installation, sets `marked' to it
+ * (cdx_htb_release_arm()): a release waits for the marking that follows the
+ * teardown, and one that saw `gen' move while it waited gives back nothing a
+ * later teardown quarantined. `told' says the log was told the entries could
+ * not yet be shown retired or rebuilt. */
+struct cdx_htb_release {
+	struct net_device *dev;
+	unsigned long gen, marked;
+	bool due, told;
+};
+
 /* Indexed the way gQMCtx is, so a netdev's stashed QoS context names its
  * entry. Ports without CEETM never reach here at all. */
 static struct cdx_htb_port cdx_htb_ports[MAX_PHY_PORTS];
@@ -365,6 +394,15 @@ static bool cdx_htb_regrowing;
  * still hold frames up to their depth, and are charged so. Under
  * cdx_htb_mutex. */
 static u16 cdx_htb_departing[CDX_CEETM_MAX_CHANNELS];
+
+/* The releases of torn-down trees' channels, indexed as the ports are, and the
+ * work that carries them out (cdx_htb_release_work()) at its pace. Under
+ * cdx_htb_mutex, which the work takes only around what it reads and writes
+ * here: it waits for the flowtable without it. */
+static struct cdx_htb_release cdx_htb_releases[MAX_PHY_PORTS];
+static void cdx_htb_release_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(cdx_htb_release, cdx_htb_release_work);
+static unsigned int cdx_htb_release_ms;
 
 static struct cdx_htb_port *cdx_htb_entry(struct tQM_context_ctl *qm_ctx)
 {
@@ -639,10 +677,11 @@ static int cdx_htb_cap_write(struct cdx_htb_port *port,
  * its frames still on it, and one of a channel no tree holds: given back with
  * its tree or its port, or whose drain at teardown failed. Every such queue is
  * parked at a frame (CEETM_PARKED_CQ_DEPTH), and nothing names it once the
- * classifier entries on its port are installed again after the change; until
- * then they can put that frame on it, beyond what it is charged. On a channel
- * no tree holds, that frame stays charged until the channel is claimed again
- * or the module goes, which pop it first (ceetm_pop_leftovers()). What each of
+ * classifier entries on its port have been retired or rebuilt after the
+ * change; until then they can put that frame on it, beyond what it is charged.
+ * On a channel no tree holds, that frame stays charged until the channel's
+ * quarantine ends, it is claimed again or the module goes, each of which pops
+ * it first (ceetm_pop_leftovers()). What each of
  * this tree's own queues holds goes into `q', where the growth that has to fit
  * into what is left starts from. The queues a departing port's tree used count
  * as a tree's until its context is released (cdx_htb_departing).
@@ -869,8 +908,8 @@ static void cdx_htb_cap_trees(struct cdx_htb_port *port)
  * paused for good keeps it polling at that slowest pace, each time reading the
  * count of every class queue once per live tree, and so do the frames a tree
  * taken down under traffic can leave on its channels, a frame a queue at most
- * (CEETM_PARKED_CQ_DEPTH), until the channel is claimed again, which pops
- * them, or its port starts a tree and sends them.
+ * (CEETM_PARKED_CQ_DEPTH), until their release pops them
+ * (cdx_htb_release_work()), which redraws every tree's shares then.
  *
  * It holds cdx_htb_mutex and no RTNL, so it waits for no tc command, and the
  * only waits on it are the cancels, made without the mutex. What the cap reads
@@ -1076,6 +1115,7 @@ static int cdx_htb_channel_get(struct cdx_htb_port *port, u8 *channel,
 			       struct netlink_ext_ack *extack)
 {
 	uint32_t claimed;
+	int rc;
 	u8 ii;
 
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
@@ -1083,7 +1123,19 @@ static int cdx_htb_channel_get(struct cdx_htb_port *port, u8 *channel,
 			*channel = ii;
 			return 0;
 		}
-	if (ceetm_claim_channel(port->qm_ctx, &claimed)) {
+	rc = ceetm_claim_channel(port->qm_ctx, &claimed);
+	/* Every channel left is held for another port until its flowtable
+	 * entries are retired or rebuilt (cdx_htb_release_work()), normally a
+	 * matter of moments: worth saying so, or the operator is told the SoC
+	 * has none and stops trying. */
+	if (rc == -EBUSY) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "a CEETM channel is held until another port's flowtable entries are retired or rebuilt; try again shortly");
+		pr_warn_ratelimited("cdx: %s found the only CEETM channels left held until another port's flowtable entries are retired or rebuilt\n",
+				    cdx_htb_port_name(port));
+		return -EBUSY;
+	}
+	if (rc) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "no CEETM channel left; the SoC has eight and every port shares them");
 		return -ENOSPC;
@@ -1294,17 +1346,45 @@ static int cdx_htb_create(struct cdx_htb_port *port, struct tc_htb_qopt_offload 
 	return 0;
 }
 
+/* A tree on `port' was taken down and its channels are quarantined for the
+ * port (ceetm_stop_qos()): a release of them is due, holding the port's netdev
+ * until it is done. Armed only once the command has marked the port's
+ * flowtable entries (cdx_htb_release_arm()). */
+static void cdx_htb_release_due(struct cdx_htb_port *port)
+{
+	struct cdx_htb_release *r = &cdx_htb_releases[port - cdx_htb_ports];
+	struct net_device *dev = port->qm_ctx->net_dev;
+
+	/* A tree has no channels on a port with no netdev; the context
+	 * release ends the quarantine should there be one. */
+	if (WARN_ON_ONCE(!dev))
+		return;
+	if (!r->due) {
+		dev_hold(dev);
+		r->dev = dev;
+		r->due = true;
+		r->told = false;
+	}
+	r->gen++;
+}
+
 /* Teardown, for a command whose return value sch_htb discards.
  *
  * Every claim has to come back whatever the hardware says, so this reports
- * trouble and keeps going rather than stopping at the first failure. The
- * channels return to the global pool here; a channel whose drain failed stays
- * marked as such inside the hardware layer, which is what stops it being handed
- * out again.
+ * trouble and keeps going rather than stopping at the first failure. A channel
+ * whose drain failed stays marked as such inside the hardware layer, which is
+ * what stops it being handed out again.
+ *
+ * The others do not go back to the global pool here but stay quarantined for
+ * this port, which may take them back at once, while its flowtable entries can
+ * still send to their class queues: they are released once nothing in the
+ * flowtable does (cdx_htb_release_work(), which the command arms after this
+ * returns). Egress resumes on the port's forwarding queues at once meanwhile.
  */
 static void cdx_htb_destroy(struct cdx_htb_port *port)
 {
 	struct cdx_htb_class *cl, *next;
+	bool claimed = port->channels;
 
 	if (ceetm_stop_qos(port->qm_ctx))
 		pr_warn("cdx: CEETM on %s did not stop cleanly\n",
@@ -1326,8 +1406,11 @@ static void cdx_htb_destroy(struct cdx_htb_port *port)
 	if (cdx_htb_resize(port, 0))
 		pr_warn("cdx: %s kept Tx queues no class is using\n",
 			port->qm_ctx->net_dev ? port->qm_ctx->net_dev->name : "?");
+	if (claimed)
+		cdx_htb_release_due(port);
 	/* And the trees left grow into the share of SEC's pool this one gave
-	 * back. Its queues are drained and reset by now. */
+	 * back. Its queues are drained and parked by now; what its entries
+	 * put on them until the release is charged as what they hold. */
 	cdx_htb_cap_trees(port);
 }
 
@@ -1858,6 +1941,138 @@ void cdx_ft_egress_restarted(void)
 	srcu_read_unlock(&cdx_ft_egress_srcu, idx);
 }
 
+/* ---- releasing a torn-down tree's channels ------------------------------
+ *
+ * A tree taken down stops its port's transmit path and drains its class queues
+ * at once, but whatever the hardware still sends to them goes on putting a
+ * parked frame on each until it is retired, or rebuilt against the port as it
+ * now is. Every HTB command marks the port's flowtable entries for that
+ * (cdx_ft_egress_changed()), and sch_htb takes each leaf away (LEAF_DEL)
+ * before the tree, so a flow's retirement starts at the first of those, while
+ * tc holds the RTNL its readmission needs, and has normally finished before
+ * the channels go. What a teardown does not retire is rebuilt instead, since
+ * nothing would offer it again: an SA, by its own work, and a multicast
+ * group's listener entries, by workers that wait for the RTNL the command and
+ * whatever follows it hold. Those, and a retirement a burst of churn has not
+ * finished, are what outlive the teardown. The tree's channels therefore stay
+ * quarantined for the port (ceetm_stop_qos()) rather than going straight back
+ * to the pool: claimed by another port's tree meanwhile, a channel would carry
+ * those frames out of the wrong port (A350). The port's own next tree may
+ * take them back at once; frames on them then leave by the port they were
+ * meant for.
+ *
+ * The release waits until the flowtable has nothing left that sends to them
+ * (cdx_ft_egress_drain(), which rebuilds itself the multicast groups their
+ * workers have not got to, and waits for the rest) and only then ends the
+ * quarantine, popping what the entries left
+ * (ceetm_end_quarantine()). Until then what they left is charged as what the
+ * queues hold, as the cap charges any queue no tree uses.
+ *
+ * Locks. The drain sleeps on the flowtable's own work, which takes the control
+ * mutex, whose holder takes cdx_htb_mutex in cdx_htb_port_gone(): so the work
+ * waits for it holding neither -- nor RTNL, which it never takes -- with its
+ * own reference on the netdev, and re-reads what it was releasing under
+ * cdx_htb_mutex afterwards. No holder of
+ * the control mutex or of cdx_htb_mutex ever waits for the work; only
+ * cdx_htb_exit() cancels it, holding nothing. A port that goes meanwhile
+ * (cdx_htb_port_gone()) just forgets its release, whose quarantine ends with
+ * the port's context, classification stopped by then. */
+
+/* One port's release, if it is due and its port's entries have been marked
+ * since its last teardown. Returns whether it has to be tried again. */
+static bool cdx_htb_release_one(unsigned int ii)
+{
+	struct cdx_htb_release *r = &cdx_htb_releases[ii];
+	struct net_device *dev, *put = NULL;
+	bool again = false;
+	unsigned long gen;
+	int rc;
+
+	mutex_lock(&cdx_htb_mutex);
+	if (!r->due || r->marked != r->gen) {
+		mutex_unlock(&cdx_htb_mutex);
+		return false;
+	}
+	gen = r->gen;
+	dev = r->dev;
+	dev_hold(dev);
+	mutex_unlock(&cdx_htb_mutex);
+
+	rc = cdx_ft_egress_drain(dev);
+
+	mutex_lock(&cdx_htb_mutex);
+	/* Gone with its port, or taken down again while the drain ran: what
+	 * was proven does not cover the later teardown, whose own marking
+	 * arms this again. */
+	if (!r->due || r->gen != gen) {
+		mutex_unlock(&cdx_htb_mutex);
+		dev_put(dev);
+		return false;
+	}
+	if (rc) {
+		if (!r->told)
+			pr_warn("cdx: %s keeps the CEETM channels of its last tree out of service until its flowtable entries have been retired or rebuilt (%d)\n",
+				netdev_name(dev), rc);
+		r->told = true;
+		again = true;
+	} else {
+		if (ceetm_end_quarantine(&gQMCtx[ii]))
+			pr_warn("cdx: %s left frames on a CEETM channel of its last tree that could not be freed; the channel stays out of service\n",
+				netdev_name(dev));
+		put = r->dev;
+		r->dev = NULL;
+		r->due = false;
+		/* What the entries left was charged, and is gone: a tree kept
+		 * short for it can grow now. */
+		cdx_htb_cap_trees(NULL);
+	}
+	mutex_unlock(&cdx_htb_mutex);
+	dev_put(dev);
+	if (put)
+		dev_put(put);
+	return again;
+}
+
+/* Release what is due, and look again later at what cannot be yet: soon, then
+ * less often (CDX_HTB_RELEASE_FIRST_MS, CDX_HTB_RELEASE_LAST_MS). A channel
+ * the flowtable can never show nothing sends to is never released. */
+static void cdx_htb_release_work(struct work_struct *work)
+{
+	bool again = false;
+	unsigned int ii;
+
+	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_releases); ii++)
+		again |= cdx_htb_release_one(ii);
+	if (!again)
+		return;
+	/* The first look is the one the command arms; the first retry follows
+	 * it by CDX_HTB_RELEASE_FIRST_MS. */
+	mutex_lock(&cdx_htb_mutex);
+	queue_delayed_work(system_wq, &cdx_htb_release,
+			   msecs_to_jiffies(cdx_htb_release_ms));
+	cdx_htb_release_ms = clamp_t(unsigned int, 2 * cdx_htb_release_ms,
+				     CDX_HTB_RELEASE_FIRST_MS,
+				     CDX_HTB_RELEASE_LAST_MS);
+	mutex_unlock(&cdx_htb_mutex);
+}
+
+/* `port''s entries have been marked for re-installation after a teardown that
+ * made a release due: the release may go ahead, once they have been retired
+ * or rebuilt. Called by the command, after cdx_ft_egress_changed(), with no
+ * lock held. */
+static void cdx_htb_release_arm(struct cdx_htb_port *port)
+{
+	struct cdx_htb_release *r = &cdx_htb_releases[port - cdx_htb_ports];
+
+	mutex_lock(&cdx_htb_mutex);
+	if (r->due) {
+		r->marked = r->gen;
+		cdx_htb_release_ms = CDX_HTB_RELEASE_FIRST_MS;
+		mod_delayed_work(system_wq, &cdx_htb_release, 0);
+	}
+	mutex_unlock(&cdx_htb_mutex);
+}
+
 static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *opt)
 {
 	struct cdx_htb_port *port = cdx_htb_port_of(dev);
@@ -1891,6 +2106,12 @@ static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *
 	 * re-installing what did not need it only costs a readmission. */
 	if (opt->command != TC_HTB_LEAF_QUERY_QUEUE)
 		cdx_ft_egress_changed(dev);
+	/* A tree taken down left its channels quarantined, and their release
+	 * waits for the entries this and the leaf deletions before it marked to
+	 * have been retired or rebuilt. Armed only now: a release that drained
+	 * before the last marking proves nothing. */
+	if (opt->command == TC_HTB_DESTROY)
+		cdx_htb_release_arm(port);
 	return rc;
 }
 
@@ -1971,11 +2192,28 @@ out:
 void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 {
 	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
+	struct cdx_htb_release *r;
 	struct cdx_htb_class *cl, *next;
+	struct net_device *put = NULL;
 	unsigned int ii;
 
 	if (!port)
 		return;
+	/* A release due for an earlier tree is forgotten, not waited for: the
+	 * caller holds the control mutex, which the release's wait on the
+	 * flowtable needs. Releasing the context ends the quarantine, with
+	 * classification stopped by then; a release running now finds the
+	 * port's record gone when it looks again, and gives nothing back. */
+	r = &cdx_htb_releases[port - cdx_htb_ports];
+	mutex_lock(&cdx_htb_mutex);
+	if (r->due) {
+		put = r->dev;
+		r->dev = NULL;
+		r->due = false;
+	}
+	mutex_unlock(&cdx_htb_mutex);
+	if (put)
+		dev_put(put);
 	/* The regrow work reads a live tree's netdev, which the caller releases
 	 * after the context. What keeps the work off this one is the tree
 	 * ceasing to be live below, under the mutex the work holds: a run that
@@ -2965,6 +3203,13 @@ void cdx_htb_exit(void)
 		cdx_htb_port_gone(&gQMCtx[ii]);
 	}
 	/* No tree is live now, and only a live tree arms the regrow work, so
-	 * once this returns nothing runs in this module's text from it. */
+	 * once this returns nothing runs in this module's text from it. No
+	 * release is due either -- each port's going forgot its own, and only
+	 * a tc command arms one -- and a release still running finds nothing
+	 * to give back once it has the mutex again. Waited for holding
+	 * nothing: its wait on the flowtable returns at once with no adapter
+	 * left, which unloads before this module. The quarantines end with the
+	 * ports' contexts (ceetm_exit()). */
 	cancel_delayed_work_sync(&cdx_htb_regrow);
+	cancel_delayed_work_sync(&cdx_htb_release);
 }

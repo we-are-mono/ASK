@@ -109,7 +109,12 @@ struct ceetm_chnl_info {
 	uint32_t wbfq_chshaper;
 	struct shaper_info shaper_info;
 	PQM_context_ctl qm_ctx;
-	struct classque_info cq_info[MAX_SCHEDULER_QUEUES]; 
+	/* The port a tree taken down gave this channel back from, while that
+	 * port's classifier entries may still send to its class queues: no
+	 * other port may have it until they are known not to
+	 * (ceetm_end_quarantine()). NULL once they are. */
+	PQM_context_ctl quarantine;
+	struct classque_info cq_info[MAX_SCHEDULER_QUEUES];
 };
 #define QM_GET_CONTEXT(output_port) (&gQMCtx[output_port])
 

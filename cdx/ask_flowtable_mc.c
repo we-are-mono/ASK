@@ -2564,8 +2564,9 @@ unsigned int ft_mc_egress_mark(const struct net_device *dev)
 
 /* Rebuild what ft_mc_egress_mark(dev) marked, here and now.
  *
- * Called under the RTNL a tc command holds, so the worker, which takes RTNL
- * to ask the bridge, is never waited for. Nor is anything decided: the port's
+ * Called under the RTNL a tc command holds, or without it by CDX's release of
+ * a torn-down tree's channels; either way the worker, which takes RTNL to ask
+ * the bridge, is never waited for. Nor is anything decided: the port's
  * forwarding did not change, only its queues, so each flow's recorded chain
  * -- the bridge's copies and the routed copies riding it, as they were built,
  * with the flow's own ingress tag and sender -- is replaced by itself, which

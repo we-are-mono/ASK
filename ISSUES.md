@@ -152,18 +152,8 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A350 — a destroyed hardware qdisc's class queues can still take frames, which a channel's next owner sends.**
-  `cdx_htb_destroy()` drains the tree's class queues (`ceetm_stop_qos()`, cdx/cdx_ceetm_app.c) and only after the
-  mutex is released calls `cdx_ft_egress_changed()`, whose re-install of the port's flowtable entries is
-  asynchronous; until then the entries enqueue to the old class queues, parked at one frame each. The channel stays
-  mapped to the port's LNI, so those frames wait until a tree claims it again -- on another port, they leave by that
-  port's link. Since A348 leftovers are popped before a channel is mapped anew and at release, so what remains is a
-  claim inside the re-install window (~2 s under RTNL contention): at most one frame per class queue out of the wrong
-  port; and until a claim or unload pops them, the stranded frames hold pool buffers, which the qdisc cap charges as
-  backlog, keeping its regrowth work polling while a tree is short of them. Fix direction (reviewed from source, not built): in destroy, `dpa_disable_ceetm()`, then
-  `cdx_ft_egress_changed()` and `cdx_ft_egress_drain()` with `cdx_htb_mutex` dropped -- the drain's works take the
-  control mutex, whose holder takes this one in `cdx_htb_port_gone()` -- then drain and leave CEETM mode; handle a
-  `port_gone` meanwhile and a drain's `-EAGAIN` by today's order; egress stalls on the forwarding FQs for the drain.
+- [x] **A350 — a destroyed hardware qdisc's multicast replicas could leave by the port that claimed its channel next.**
+  A torn-down tree's channels stay held for its port until its entries are retired or rebuilt (_:/^cdx: hold a torn-down qdisc's channels for its port_).
 
 - [x] **A348 — a hardware qdisc's class queues could hold more of SEC's pool than their budget.** Each queue is charged
   what it holds where that is more, and growth waits for it to drain (_:/^cdx: charge a qdisc's class queues what they hold_).

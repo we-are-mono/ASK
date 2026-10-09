@@ -51,11 +51,15 @@
  *     the same order. The worker takes it there only to record: it programs
  *     the hardware with the transaction alone, so nothing that takes the lock
  *     under RTNL waits behind a hardware call. The drain keeps it across its
- *     rebuilds, which delays nothing under RTNL: its caller holds RTNL.
- *   - The worker never holds RTNL across cdx_ft_begin(). One caller does:
- *     ft_mr_egress_drain(), which runs under the RTNL a tc command holds and
- *     takes the transaction there -- RTNL then the transaction, the order the
- *     flowtable's bind path and the DSCP map's barrier already take.
+ *     rebuilds. Called by a tc command, that delays nothing under RTNL, which
+ *     the command holds; called by CDX's release of a torn-down tree's
+ *     channels, which holds no RTNL, it can keep a holder of RTNL that wants
+ *     the lock waiting for those rebuilds, which wait for neither.
+ *   - The worker never holds RTNL across cdx_ft_begin(). One caller may:
+ *     ft_mr_egress_drain(), which runs under the RTNL a tc command holds, or
+ *     from CDX's channel release without it, and takes the transaction there
+ *     -- under RTNL, RTNL then the transaction, the order the flowtable's
+ *     bind path and the DSCP map's barrier already take.
  *     cdx_ctrl_lock_with_rtnl() forbids waiting for either lock while holding
  *     the other, and no path waits for RTNL while holding the transaction:
  *     admission only trylocks it. So that order closes no cycle, and the
@@ -1586,7 +1590,10 @@ static unsigned int ft_mr_egress_mark(const struct net_device *dev)
 /* Rebuild what ft_mr_egress_mark(dev) marked, here and now.
  *
  * Waiting for the worker is not an option: it takes RTNL to decide, and the
- * caller holds RTNL. Nor is a decision needed. The port's membership did not
+ * caller may hold RTNL -- a tc command does; CDX's release of a torn-down
+ * tree's channels, which has to know the old queues are no longer named, does
+ * not, but waiting on a worker behind whatever holds RTNL would only delay it.
+ * Nor is a decision needed. The port's membership did not
  * change, only its queues, so the installed chain is replaced by itself --
  * the spec it was built from, recorded whole, ingress tags included, its
  * devices still pinned by the installed set -- which rebuilds every listener

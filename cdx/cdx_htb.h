@@ -11,7 +11,8 @@ struct netlink_ext_ack;
 /* Claim the netdev's ndo_setup_tc and start serving TC_SETUP_QDISC_HTB.
  * cdx owns the registration because CEETM is cdx's, and because cdx stays
  * loaded while the flowtable adapter can come and go. The exit waits for the
- * work that regrows the trees' queues to finish, and leaves none pending. */
+ * works that regrow the trees' queues and release a torn-down tree's channels
+ * to finish, and leaves neither pending. */
 int cdx_htb_init(void);
 void cdx_htb_exit(void);
 
@@ -19,7 +20,10 @@ void cdx_htb_exit(void);
  * already tearing the interface's CEETM context down. Its class queues stay
  * charged at their depth to the other ports' trees until the next call. May
  * sleep: it cancels, and waits out, the work that regrows the trees' queues,
- * which takes this file's mutex and nothing else. */
+ * which takes this file's mutex and nothing else. A release of an earlier
+ * tree's channels still due is forgotten rather than waited for, since it
+ * waits on work that takes the control mutex this is called under; the
+ * context's release ends their quarantine. */
 void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx);
 /* That caller has released the context, its queues drained, and the other
  * ports' trees take the share of SEC's pool the departed one had. */
@@ -48,8 +52,9 @@ bool cdx_htb_resolve_class(struct tQM_context_ctl *qm_ctx, u32 *channel, u32 *cq
 /* The flowtable adapter's egress hook, for CDX's own callers; see struct
  * cdx_ft_egress_ops. Both may sleep. The first needs no lock of the caller's;
  * the second must not be called holding a lock the adapter's retirement work
- * takes -- the control mutex above all. Neither waits for RTNL, which both
- * callers hold. */
+ * takes -- the control mutex above all. Neither waits for RTNL, so either may
+ * be called holding it, and the tc commands that call both do; the release of
+ * a torn-down tree's channels calls the second from a work without it. */
 void cdx_ft_egress_changed(struct net_device *dev);
 int cdx_ft_egress_drain(struct net_device *dev);
 /* The datapath restarted after a latch: whatever was refused or left undone

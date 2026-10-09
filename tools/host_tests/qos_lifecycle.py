@@ -33,10 +33,10 @@ def test_qos_lifecycle(tmp_path):
         "ceetm_cfg_td_on_class_queue", "ceetm_cq_wred_off", "ceetm_park_class_queue",
         "ceetm_create_cq",
         "ceetm_create_queues", "ceetm_create_channel", "ceetm_init_channels",
-        "ceetm_assign_chnl",
+        "ceetm_chnl_failed", "ceetm_assign_chnl", "ceetm_claim_channel",
         "ceetm_release_fd", "ceetm_sync_portal", "ceetm_sync_portals",
         "ceetm_drain_queue", "ceetm_drain_channel", "ceetm_pop_leftovers",
-        "ceetm_quiesce_port", "ceetm_put_channel_devices",
+        "ceetm_quiesce_port", "ceetm_put_channel_devices", "ceetm_end_quarantine",
         "ceetm_dscp_map_release", "ceetm_release_iface", "ceetm_release_queue", "ceetm_release_channels",
         "ceetm_exit",
     ]

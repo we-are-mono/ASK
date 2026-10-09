@@ -1122,40 +1122,82 @@ failed stays charged what it holds. The same three leaves on the rig held 920
 buffers.
 
 A queue given back is charged only what it holds, but it is not quite left
-alone: the classifier entries installed while it was a class's still send to
-it until they are installed again after the change — up to a couple of
-seconds while RTNL is contended. So the hardware layer parks it at one frame
+alone: the classifier entries installed while it was a class's can still send
+to it until they have been retired or rebuilt after the change — a flow's
+retirement starts with the command, a multicast group's listener entries wait
+for a worker that needs RTNL. So the hardware layer parks it at one frame
 rather than at its module-load default of eight (`CEETM_PARKED_CQ_DEPTH`),
 and a tree taken down, or one whose port goes, has every queue of its
 channels parked the same way before they are drained (`ceetm_quiesce_port()`).
 The bound therefore holds but for one frame per class queue a change has just
 touched, never more: a queue given back takes at most that frame from the
-entries, until they are installed again, and a queue configured while other
+entries, until they are retired or rebuilt, and a queue configured while other
 queues' frames fill the budget starts at a frame no tail drop can go below,
 until those frames leave. A change touches at most the eighteen queues of its
 tree, against the 128 frames of SEC's pool left over for its own jobs; with
 eight, eighteen of them could have held 144 frames.
 
-**A tree taken down can leave frames behind.** Its queues are drained and its
-port stops serving them, but its entries go on sending to them until they are
-installed again, so under traffic each queue they named can be left holding
-its parked frame. Nothing sends it: the channel stays mapped to the port it
-left. Left alone, the frame would hold its buffer until that port started a
-tree again; a tree on another port that claimed the channel would send it out
-of the wrong port, to a neighbour it was not addressed to; and at unload the
-SDK's free would discard it with its buffer. While it waits it is charged, and
-a tree whose shares fill its budget stays that many frames short, with the
-regrow work polling once a second. So a channel's leftovers are popped and
-their buffers freed before the channel is mapped to a port again
-(`ceetm_assign_chnl()`), and before its queues are freed at unload
-(`ceetm_release_queue()`) — at most as many as the queue counts when asked,
-so a stream refilling it cannot hold the claim; a queue that will not give
-them up keeps the channel out of service, as a failed drain does. What
-remains is narrow: a channel claimed while the departed tree's entries are
-still being installed again can still take up to one frame a queue to the
-claiming port. Taking the port off its queues before they are drained —
-installing its entries again first, and draining after — closes that, and is
-filed separately.
+**A tree taken down keeps its channels until its entries are gone (A350).**
+Its port's transmit path stops and its queues are drained at once, so egress
+resumes on the port's forwarding queues without a stall. But whatever the
+hardware still sends to those queues goes on putting frames on them until it
+has been retired, or rebuilt against the port as it now is. Every HTB command
+marks the port's flowtable entries for that (`cdx_ft_egress_changed()`), and
+sch_htb takes each leaf away (`TC_HTB_LEAF_DEL`) before the tree, so a flow's
+retirement starts at the first of those, while tc holds the RTNL its
+readmission needs, and has normally finished before the channels go. What a
+teardown does not retire is rebuilt instead, since nothing would offer it
+again: an SA, by its own work, and a multicast group's listener entries, by
+workers that wait for the RTNL the command and whatever follows it hold. Those,
+and a retirement a burst of churn has not finished, are what outlive the
+teardown. The channel stays mapped to the port it left, which no longer serves
+it. Given straight back to the pool, it could be claimed meanwhile by a tree on
+another port, and those frames — a group's replicas, typically — then left by
+that port's link, to a neighbour they were not addressed to.
+
+So the channels stay quarantined for the port (`ceetm_stop_qos()`): no other
+port's claim gets one (`ceetm_assign_chnl()` refuses it, quietly, and the
+claim takes the next). A claim that finds only such channels left is refused
+with `-EBUSY`, and tc and the log say a channel is held until another port's
+flowtable entries are retired or rebuilt, rather than `-ENOSPC` and that the
+SoC has none left: the command succeeds once the release below has run, which
+a drain the flowtable never confirms holds off for as long. The port's
+own next tree may take one back at once — frames on it then leave by the port
+they were meant for.
+
+The release is a work item (`cdx_htb_release_work()`), armed by the command
+only after it has marked the port's entries for re-installation. It holds the
+netdev and waits, with no lock of CDX's held and no RTNL, for the flowtable to
+say every entry it marked has been retired or rebuilt (`cdx_ft_egress_drain()`,
+which rebuilds itself the multicast groups their workers have not got to, and
+waits for the rest); then it pops what the entries left on the queues, frees
+their buffers and gives the channels back (`ceetm_end_quarantine()`), and
+redraws every tree's shares, since those frames were charged. A drain that
+cannot say so yet, `-EAGAIN`, is asked again 100 ms later, then half as often
+each time, down to once a second, and logged once;
+a channel whose entries cannot be shown gone is never released. A teardown of
+the same port while the release waits makes the next one wait for its own
+marking. A port that goes forgets its release rather than waiting on the
+flowtable — the release's wait needs the control mutex its caller holds — and
+releasing the port's context ends the quarantine itself, classification having
+stopped by then. Unloading cancels the release, holding nothing, and the
+ports' contexts end the quarantines. Leftovers are also popped before any
+channel is mapped to a port again and before its queues are freed at unload:
+at most as many as the queue counts when asked, so a stream refilling it cannot
+hold the claim, and a queue that will not give them up keeps the channel out
+of service, as a failed drain does.
+
+The locks, in order: RTNL, then `cdx_htb_mutex` (every tc command); the control
+mutex, then `cdx_htb_mutex` (a port's going); the DSCP mutex, then
+`cdx_htb_mutex` (a filter naming a class). The release takes `cdx_htb_mutex`
+only around its own bookkeeping and never across its wait on the flowtable,
+whose work takes the control mutex; nothing holding either of those waits for
+the release. It takes no RTNL: the drain rebuilds multicast groups under the
+flowtable's transaction and the learners' own locks, as it does for a tc
+command holding RTNL, and waits for no worker that takes RTNL. The regrow work
+and the release share only `cdx_htb_mutex`, each
+for its own state; a release that frees charged frames arms regrowth through
+the cap as any change does.
 
 A refusal the regrow work meets again every second — a shrink, a curve, a
 count the hardware will not give — is logged once, and again only after it has
@@ -1167,9 +1209,25 @@ each queue at the larger of its depth and what the test has filled it with,
 and a queue given back by the frame its entries can still add; it walks the
 sequence above, a deleted leaf, a priority change, a leaf that becomes a
 channel, the top channel moving, a second tree arriving, a port going, and a
-shrink the hardware refuses. `tools/host_tests/qos_lifecycle.py` checks that a
-port going parks its queues, and that leftovers are popped before a channel is
-mapped again and before it is freed.
+shrink the hardware refuses, and a torn-down tree's release: another port's
+tree given other channels until it has run, the flowtable asked without the
+mutex, `-EAGAIN` retried, a claim refused as busy while only a held channel
+is left, a teardown or the port's going while it waits, the same port taking
+its channel back, and unloading with it due.
+`tools/host_tests/qos_lifecycle.py` checks that a port going parks its queues,
+that leftovers are popped before a channel is mapped again and before it is
+freed, that a quarantined channel is refused to another port and given to its
+own, and that the claim says `-EBUSY` only while a held channel is all that is
+left — `-ENOSPC` once none is held, or the held one's drain failed. On the rig,
+`test_destroyed_tree_frames_stay_on_their_port` takes a loaded LAN tree down
+while a WAN tree claims every channel it can, ten times, and finds no frame
+addressed to the LAN VM on the WAN link; it passed before the quarantine too,
+the flows retired by the time the channels went.
+`test_destroyed_tree_multicast_stays_on_its_port` does the same with eight
+routed groups replicated in hardware through the LAN tree's unclassified queue,
+while another process keeps RTNL busy, and finds no replica on the WAN link.
+Each first checks that the WAN capture sees a frame of the shape it looks for,
+sent out of the WAN port by the DUT itself.
 
 **Congestion-state notification stays off**, which settles the question this
 increment was asked to decide. Nothing consumes a notification: there is no CSCN

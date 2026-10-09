@@ -147,6 +147,7 @@ int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight
 			  uint32_t depth);
 int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum);
 int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx);
+int ceetm_end_quarantine(struct tQM_context_ctl *qm_ctx);
 #ifdef ENABLE_EGRESS_QOS
 int ceetm_exit(void);
 #endif

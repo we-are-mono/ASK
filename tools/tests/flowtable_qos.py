@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import pytest
 
-from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, LOWER_CQ, LOWER_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HELD_A, PORT_HELD_B, PORT_HELD_C, PORT_HIGH, PORT_LOW, PORT_POOL, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, TCP_FRAME, TCP_PAYLOAD
+from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, LOWER_CQ, LOWER_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HELD_A, PORT_HELD_B, PORT_HELD_C, PORT_HIGH, PORT_LOW, PORT_POOL, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, PORT_STRANDED_GROUP, PORTS_STRANDED, TCP_FRAME, TCP_PAYLOAD
 
 from _flowtable_qos import (CAP_MBIT, COUNT, DATAGRAM, EF_TOS, OAL, OFFERED_MBIT, POLICE_BURST, PORT_DECLINED, PORT_DEFAULT, PORT_EF_REPLACED, PORT_EGRESS, PORT_POLICED, PORT_SATURATE, PORT_SHAPED, PROBE_SLACK, REMARK_CLASS, REMARK_MASK, SETTLE, TAIL_FRAMES, UDP_HEADERS, UNSHAPED_GBPS, WEIGHTED_CQ, WINDOW, WRED_BANDS, WRED_LIMIT, WRED_MBIT, WRED_PROBABILITY, admit, captured, conntrack_ids, directions, dut_ping, ef_filter, egress, handshakes, inbound, iperf, lan_start, leaf_delta, lockstep, logged, offered, offload, police_counters, probe, qdisc_shown, read_intervals, readmitted, received_bps, received_loss, reload_adapter, shaped_bps, timing_slack, tree)
 
@@ -46,8 +46,14 @@ import time
 
 
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from _flowtable_rig import (WAN_IP, command, pings_answered, pool_lowest, port_drops, read)
+from _flowtable_rig import (WAN_IP, command, console_command, console_python, pings_answered,
+                            pool_lowest, port_drops, read)
 from _lan_pause import while_lan_port_paused
+from _mcast_e2e import wan_source_address
+from _mcast_windows import (MulticastRig, learn, members, mroute_row, stream, summary,
+                            wire_interface)
+from _mroute_capacity import _daemon
+from _mroute_capture import multicast_mac
 
 
 # ---- the scheduler ---------------------------------------------------------
@@ -543,6 +549,323 @@ async def test_shrunk_leaf_backlog_stays_charged(qos):
     # port they arrived on losing nothing for want of a buffer.
     assert idle - lowest <= POOL_SHARE, record
     assert wan["rx_missed_errors"] == 0, record
+
+
+# How many times the LAN tree is taken down under load with a WAN tree built in
+# the same breath. Each cycle is a race between the WAN tree's first claim, a
+# few tens of milliseconds after the teardown, and whatever still sends to the
+# LAN tree's queues being installed again.
+STRANDED_CYCLES = 10
+# How long each flow is flooded in a cycle; the swap comes a second in.
+STRANDED_FLOOD_SECONDS = 4
+# The WAN tree's classes under its root: a channel each, as many as the SoC has.
+STRANDED_WAN_CLASSES = 8
+# After the WAN tree is taken down, for the releases of both trees' channels.
+STRANDED_SETTLE = 3
+# The routed groups streamed through the LAN tree. Each is rebuilt on its own
+# when the tree goes, so several keep some group's replicas on the old queue
+# for longer than one would.
+STRANDED_GROUPS = tuple(f"239.9.12.{ii}" for ii in range(1, 9))
+# The groups' frames together, a second. The stream crosses this host's WAN
+# segment, where every host may receive it, so it runs at a live video
+# stream's rate rather than as fast as a socket goes.
+STRANDED_GROUP_PPS = 8000
+# RTNL requests another process makes beside the swap, so that the routed
+# learner's worker, which rebuilds the groups only once it holds RTNL, waits
+# its turn behind them.
+STRANDED_RTNL_REQUESTS = 4000
+# Where the swap is staged on the DUT, so that the console carries only its
+# name and no character of it can be lost on the way.
+STRANDED_SWAP = "/tmp/ask_qos_teardown_and_claim.sh"
+
+
+async def _leaked_to_wan(r, during, bpf, linger=2.0):
+    """Run the coroutine `during()` and return, with its result, the frames
+    this host's WAN link carried meanwhile, and for `linger` seconds after,
+    that the kernel filter `bpf` selects: frames the DUT built for its LAN
+    port, which have no business on the WAN link.
+
+    Captured promiscuously, as a frame to a MAC nobody on the link answers to
+    is delivered here whether the link is a cable or a bridge, and filtered in
+    the kernel, so a flood of this host's own frames cannot crowd one out.
+    _dut_sends_on_wan() shows the path carries such a frame."""
+    from scapy.all import AsyncSniffer
+
+    ready = threading.Event()
+    sniffer = AsyncSniffer(iface=r.wan_if, store=True, started_callback=ready.set, filter=bpf)
+    sniffer.start()
+    try:
+        assert await asyncio.to_thread(ready.wait, 5), "the WAN capture did not start"
+        result = await during()
+        await asyncio.sleep(linger)
+    finally:
+        packets = sniffer.stop()
+    return list(packets or []), result
+
+
+# A UDP frame sent out of the DUT's WAN port as it is, through an AF_PACKET
+# socket of the DUT's own: the path a LAN frame that left by the wrong port
+# takes to this host.
+_DUT_SEND = '''
+import socket, struct
+def checksum(header):
+    total = sum(struct.unpack('!%dH' % (len(header) // 2), header))
+    total = (total >> 16) + (total & 0xffff)
+    total += total >> 16
+    return ~total & 0xffff
+payload = b'ASK-wan-capture-check'.ljust(32, b'.')
+udp = struct.pack('!HHHH', {port}, {port}, 8 + len(payload), 0) + payload
+ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0,
+                 socket.inet_aton({source!r}), socket.inet_aton({destination!r}))
+ip = ip[:10] + struct.pack('!H', checksum(ip)) + ip[12:]
+frame = bytes.fromhex({dst_mac!r}) + bytes.fromhex({src_mac!r}) + b'\\x08\\x00' + ip + udp
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind(({dev!r}, 0))
+for _ in range({count}):
+    s.send(frame)
+s.close()
+print('SENT')
+'''
+
+
+async def _dut_sends_on_wan(r, *, dst_mac, src_mac, destination, port, count):
+    """The DUT sends `count` UDP frames to `destination`, addressed at Ethernet
+    from `src_mac` to `dst_mac`, out of its WAN port as they are."""
+    script = _DUT_SEND.format(port=port, source=r.dut_wan_ip, destination=destination,
+                              dst_mac=dst_mac.replace(":", ""), src_mac=src_mac.replace(":", ""),
+                              dev=TARGET_WAN_IF, count=count)
+    result = await console_python(r.console, script, timeout=30)
+    assert "SENT" in result["stdout"], result
+
+
+async def _capture_checked(r, bpf, *, dst_mac, destination, port):
+    """The WAN capture under `bpf` sees every one of five frames the DUT itself
+    sends out of its WAN port the way a LAN frame leaving by the wrong port
+    would be: from the DUT's LAN MAC to `dst_mac`."""
+    seen, _ = await _leaked_to_wan(r, lambda: _dut_sends_on_wan(
+        r, dst_mac=dst_mac, src_mac=r.dut_lan_mac, destination=destination, port=port,
+        count=5), bpf, linger=0.5)
+    assert len(seen) == 5, ("the WAN capture cannot see a frame the DUT sends this way",
+                            bpf, [p.summary() for p in seen])
+
+
+async def _staged_swap(r, *, rtnl_requests=0):
+    """Stage the swap on the DUT and return a coroutine function that runs it,
+    returning the console's result: the last line of its output is how many
+    classes the WAN tree ended up with.
+
+    The swap takes the LAN tree down and builds a WAN tree with a channel per
+    class, every command from one `tc -batch` process, so nothing but the
+    kernel's own work sits between the teardown and the WAN tree's first
+    claim. A class the pool has no channel for is refused and the rest go on.
+    With `rtnl_requests`, another process makes that many RTNL requests beside
+    it: the loopback device's queue length, set back and forth and left as it
+    was, which nothing in the flowtable adapter or CDX follows."""
+    lan, wan = TARGET_LAN_IF, TARGET_WAN_IF
+    queue = int((await read(r.target, r.session, "/sys/class/net/lo/tx_queue_len")).strip())
+    lines = [f"qdisc del dev {lan} root", f"qdisc add dev {wan} root handle 1: htb offload",
+             *(f"class add dev {wan} parent 1: classid 1:{ii} htb rate 1000mbit ceil 1000mbit"
+               for ii in range(1, STRANDED_WAN_CLASSES + 1))]
+    busy = restore = ""
+    if rtnl_requests:
+        busy = (f"for i in $(seq {rtnl_requests // 2}); do\n"
+                f"  echo 'link set dev lo txqueuelen {queue + 1}'\n"
+                f"  echo 'link set dev lo txqueuelen {queue}'\n"
+                f"done | ip -force -batch - >/dev/null 2>&1 &\n")
+        restore = f"ip link set dev lo txqueuelen {queue}\n"
+    text = (busy + "tc -force -batch - >/dev/null 2>&1 <<'EOF'\n" + "\n".join(lines) + "\nEOF\n"
+            "wait\n" + restore + f"tc class show dev {wan} | grep -c '^class htb'\n")
+    result = await r.target.fs_write(r.session, STRANDED_SWAP, text)
+    assert not result.get("errno"), result
+
+    async def swap():
+        return await console_command(r.console, "sh", STRANDED_SWAP, check=False, timeout=60)
+    return swap
+
+
+async def test_destroyed_tree_frames_stay_on_their_port(qos):
+    """A tree taken down stops its port's transmit path and drains its class
+    queues at once, but whatever the hardware still sends to those queues goes
+    on putting frames on them until it is retired, or rebuilt against the port
+    as it now is. A channel given straight back to the pool and claimed
+    meanwhile by a tree on another port carried those frames out of that
+    port's link (A350); a tree's channels now stay with its port until the
+    flowtable has nothing left naming them.
+
+    Each cycle builds a tree on the LAN port with one offloaded flow marked
+    into each of its four leaves, floods them from this host, and a second in
+    takes the tree down and builds one on the WAN port claiming every channel
+    it can (_staged_swap()). No frame addressed to the LAN VM may then reach
+    this host's WAN link (_leaked_to_wan()). The capture is checked first with
+    frames the DUT sends out of its WAN port so addressed.
+
+    sch_htb takes every leaf away (LEAF_DEL) before the tree, and the first of
+    those starts retiring the LAN flows' entries while tc holds the RTNL their
+    readmission needs, so they are normally out of the hardware before the
+    channel is given back: this case passed before the quarantine too, and
+    guards the unicast half. What a teardown does not retire is a multicast
+    group's replication, which is rebuilt instead
+    (test_destroyed_tree_multicast_stays_on_its_port())."""
+    from scapy.all import UDP
+
+    r = qos
+    lan, wan = TARGET_LAN_IF, TARGET_WAN_IF
+    prios = (HIGH_PRIO, LOW_PRIO, LOWER_PRIO, LOWER_PRIO + 1)
+    leaves = [(f"1:{10 + ii}", prio) for ii, prio in enumerate(prios)]
+    flows = [(port, 7 - prio) for port, prio in zip(PORTS_STRANDED, prios)]
+    bpf = f"ether dst {r.lan_mac} and udp and dst host {r.lan_ip}"
+    await offload(r, *(inbound(r, "udp", port, r.mark(cq)) for port, cq in flows))
+    await lan_start(r, echo=list(PORTS_STRANDED), lifetime=STRANDED_CYCLES * 60)
+    await _capture_checked(r, bpf, dst_mac=r.lan_mac, destination=r.lan_ip,
+                           port=PORTS_STRANDED[0])
+    swap = await _staged_swap(r)
+    cycles = []
+    try:
+        for _ in range(STRANDED_CYCLES):
+            await tree(r, lan, CAP_MBIT, leaves)
+            for port, cq in flows:
+                forward, _ = await admit(r, port)
+                assert int(forward["qos"], 16) == cq, forward
+            floods = asyncio.gather(*(asyncio.to_thread(_flood, r.lan_ip, port,
+                                                        STRANDED_FLOOD_SECONDS)
+                                      for port, _ in flows))
+            await asyncio.sleep(1)
+            leaked, result = await _leaked_to_wan(r, swap, bpf)
+            sent = await floods
+            await r.tc("qdisc", "del", "dev", wan, "root")
+            cycles.append({"sent": sent, "leaked": len(leaked),
+                           "wan_classes": result["stdout"].split()[-1:],
+                           "leaked_ports": sorted({p[UDP].dport for p in leaked if UDP in p})})
+            await asyncio.sleep(STRANDED_SETTLE)
+    finally:
+        await console_command(r.console, "rm", "-f", STRANDED_SWAP, check=False)
+    r.record("qos-destroyed-tree-frames", {"cycles": cycles})
+    for cycle in cycles:
+        assert min(cycle["sent"]) > 10_000, cycles
+    assert sum(cycle["leaked"] for cycle in cycles) == 0, cycles
+
+
+def _paced_frames(iface, frames, seconds, pps):
+    """`frames` sent out of `iface` in turn, as they are, `pps` a second in
+    bursts a hundredth of a second apart, for `seconds`. Returns how many the
+    socket took."""
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+    sock.bind((iface, 0))
+    burst = max(1, pps // 100)
+    offered = sent = 0
+    start = time.monotonic()
+    try:
+        while time.monotonic() < start + seconds:
+            for _ in range(burst):
+                try:
+                    sock.send(frames[offered % len(frames)])
+                    sent += 1
+                except OSError:
+                    pass
+                offered += 1
+            pause = start + offered / pps - time.monotonic()
+            if pause > 0:
+                time.sleep(pause)
+    finally:
+        sock.close()
+    return sent
+
+
+async def test_destroyed_tree_multicast_stays_on_its_port(qos):
+    """A routed group's replicas to a port with a tree take the tree's
+    unclassified class queue, and a teardown does not retire a group the way
+    it retires a flow, since nothing would offer the group again: its
+    listener entries are rebuilt in place against the port as it now is, by
+    the routed learner's worker, which decides only once it holds RTNL, or by
+    the egress drain CDX runs before it hands a channel back. Until then they
+    go on putting replicas on the old queue, and a channel claimed meanwhile
+    by a tree on another port carried them out of that port's link (A350).
+
+    Each cycle builds a tree on the LAN port and streams eight routed groups
+    from this host to it, then shows the hardware replicating them into the
+    tree's unclassified queue: the groups' classifier counts and that queue's
+    dequeues move, the port's software transmit count next to nothing. A
+    second in, the swap (_staged_swap()) takes the tree down and builds one on
+    the WAN port claiming every channel, while another process keeps RTNL
+    busy. No replica, which leaves with the DUT's LAN address, may then reach
+    this host's WAN link (_leaked_to_wan()). The capture is checked first with
+    frames of that shape the DUT sends out of its WAN port."""
+    from scapy.all import IP, UDP, Ether, Raw, get_if_hwaddr
+
+    r = qos
+    lan, wan = TARGET_LAN_IF, TARGET_WAN_IF
+    source, listener = wan_source_address(4), f"{lan}/0"
+    assert source, "ASK_WAN_IPERF_IP names the address the groups are streamed from"
+    mr = MulticastRig(r.target, r.session, r.lan)
+    mr.wire = wire_interface()
+    initial = await mr.proc()
+    assert initial["mroute_groups"] == 0, ("routed groups of another workload", summary(initial))
+    configs = [stream(4, group, hops=63, source=source, port=PORT_STRANDED_GROUP)
+               for group in STRANDED_GROUPS]
+    frames = [bytes(Ether(dst=multicast_mac(group).hex(":"), src=get_if_hwaddr(mr.wire)) /
+                    IP(src=source, dst=group, ttl=64) /
+                    UDP(sport=PORT_STRANDED_GROUP, dport=PORT_STRANDED_GROUP) /
+                    Raw(b"ASK-stranded-group".ljust(32, b".")))
+              for group in STRANDED_GROUPS]
+    hosts = " or ".join(f"dst host {group}" for group in STRANDED_GROUPS)
+    bpf = f"ether src {r.dut_lan_mac} and udp and ({hosts})"
+
+    def rows(state):
+        return {group: mroute_row(state, group, source) for group in STRANDED_GROUPS}
+
+    def replicated(state):
+        return sum(int(row["packets"]) for row in rows(state).values() if row)
+
+    def carried(state):
+        return all(row and row["state"] == "installed" and
+                   members(row, "listeners") == {listener} for row in rows(state).values())
+
+    await _capture_checked(r, bpf, dst_mac=multicast_mac(STRANDED_GROUPS[0]).hex(":"),
+                           destination=STRANDED_GROUPS[0], port=PORT_STRANDED_GROUP)
+    swap = await _staged_swap(r, rtnl_requests=STRANDED_RTNL_REQUESTS)
+    cycles = []
+    try:
+        async with _daemon(r.target, r.session, [wan, lan]) as ctl:
+            for group in STRANDED_GROUPS:
+                await ctl("add", wan, source, group, lan)
+            for _ in range(STRANDED_CYCLES):
+                await tree(r, lan, CAP_MBIT, [("1:10", HIGH_PRIO)])
+                await learn(mr, configs, carried, "the groups carried to the LAN port")
+                before, before_state = await egress(r, lan), await mr.proc()
+                streaming = asyncio.ensure_future(asyncio.to_thread(
+                    _paced_frames, mr.wire, frames, STRANDED_FLOOD_SECONDS, STRANDED_GROUP_PPS))
+                await asyncio.sleep(1)
+                mid, mid_state = await egress(r, lan), await mr.proc()
+                leaked, result = await _leaked_to_wan(r, swap, bpf)
+                sent = await streaming
+                after_state = await mr.proc()
+                await r.tc("qdisc", "del", "dev", wan, "root")
+                cycles.append({
+                    "sent": sent, "queued": leaf_delta(before, mid, "default"),
+                    "software": mid["software_tx"] - before["software_tx"],
+                    "replicated": replicated(mid_state) - replicated(before_state),
+                    "leaked": len(leaked), "wan_classes": result["stdout"].split()[-1:],
+                    "leaked_groups": sorted({p[IP].dst for p in leaked if IP in p}),
+                    "after": {group: row and row["state"]
+                              for group, row in rows(after_state).items()}})
+                await asyncio.sleep(STRANDED_SETTLE)
+            for group in STRANDED_GROUPS:
+                await ctl("remove", wan, source, group)
+            final = await mr.settle(
+                lambda s: not any(rows(s).values()) and
+                s["mroute_installed"] == initial["mroute_installed"], "the groups removed")
+    finally:
+        await console_command(r.console, "rm", "-f", STRANDED_SWAP, check=False)
+    r.record("qos-destroyed-tree-multicast", {"cycles": cycles, "final": summary(final)})
+    for cycle in cycles:
+        assert cycle["sent"] >= 0.8 * STRANDED_GROUP_PPS * STRANDED_FLOOD_SECONDS, cycles
+        # A second's worth of the groups went through the tree's unclassified
+        # queue, replicated by the classifier rather than sent by the CPU.
+        assert cycle["replicated"] >= STRANDED_GROUP_PPS // 2, cycles
+        assert cycle["queued"]["frames"] >= STRANDED_GROUP_PPS // 2, cycles
+        assert cycle["software"] <= cycle["queued"]["frames"] // 10, cycles
+    assert sum(cycle["leaked"] for cycle in cycles) == 0, cycles
+    assert final["mroute_install_errors"] == initial["mroute_install_errors"], summary(final)
 
 
 async def test_red_reports_what_the_hardware_holds(qos):

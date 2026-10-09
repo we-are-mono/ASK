@@ -637,6 +637,95 @@ int main(void)
     shutdown_qos(); empty();
     assert(!pending_frames && !packet_live[0]);
     hold_frames = false;
+    /* A tree taken down keeps its channels for its port while the port's
+     * classifier entries may still send to them (A350): another port's
+     * claim is refused -- quietly, nothing popped and nothing mapped -- the
+     * port's own may take a channel back, popping what its entries left,
+     * and the quarantine's end pops it before any port may have the
+     * channel. The port's going ends it too, classification stopped. */
+    assert(start() == 0);
+    assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    assert(ceetm_assign_chnl(ctx, 0) == 0);
+    uint32_t detached;
+    assert(ceetm_quiesce_port(ctx, &detached, true) == 0 && detached == 1);
+    ceetm_put_channel_devices(detached);
+    assert(qm_chnl_info[0].quarantine == ctx && !qm_chnl_info[0].qm_ctx);
+    static struct qm_ceetm_lni lni_b;
+    INIT_LIST_HEAD(&lni_b.channels);
+    struct net_device dev_b = {0};
+    struct dpa_iface_info iface_b = {.name = "eth1"};
+    QM_context_ctl other = {.iface_info = &iface_b, .net_dev = &dev_b, .lni = &lni_b};
+    unsigned maps = maps_with_frames, pops = pop_calls;
+    hold_frames = true; pending_frames = 1;
+    packets[0].id = 0; packet_live[0] = true;
+    assert(ceetm_assign_chnl(&other, 0) < 0);
+    assert(!other.chnl_map && !qm_chnl_info[0].qm_ctx && !dev_b.refs);
+    assert(packet_live[0] && pending_frames == 1 && pop_calls == pops);
+    released = pool_releases;
+    assert(ceetm_end_quarantine(ctx) == 0);
+    assert(!qm_chnl_info[0].quarantine && !packet_live[0] && !pending_frames);
+    assert(pool_releases == released + 1);
+    assert(ceetm_assign_chnl(&other, 0) == 0 && other.chnl_map == 1);
+    assert(maps_with_frames == maps && dev_b.refs == MAX_SCHEDULER_QUEUES);
+    assert(ceetm_quiesce_port(&other, &detached, false) == 0 && detached == 1);
+    ceetm_put_channel_devices(detached);
+    assert(!dev_b.refs && !qm_chnl_info[0].quarantine);
+    /* The port's own claim takes its channel back while quarantined. */
+    assert(ceetm_assign_chnl(ctx, 0) == 0);
+    assert(ceetm_quiesce_port(ctx, &detached, true) == 0);
+    ceetm_put_channel_devices(detached);
+    pending_frames = 1; packet_live[0] = true;
+    assert(ceetm_assign_chnl(ctx, 0) == 0);
+    assert(!qm_chnl_info[0].quarantine && !packet_live[0] && !pending_frames);
+    assert(maps_with_frames == maps);
+    /* And its going ends the quarantine, popping what is there. */
+    assert(ceetm_quiesce_port(ctx, &detached, true) == 0);
+    ceetm_put_channel_devices(detached);
+    pending_frames = 1; packet_live[0] = true;
+    assert(cdx_disable_ceetm_on_iface(&iface) == 0);
+    assert(!qm_chnl_info[0].quarantine && !packet_live[0] && !pending_frames);
+    hold_frames = false;
+    shutdown_qos(); empty();
+    /* A claim refused only because every channel left is held that way for
+     * another port says so (-EBUSY): the channel is free again once that
+     * port's entries are gone, so the operator is told to try again rather
+     * than that the SoC has none (-ENOSPC), which is what a claim finding
+     * none held says -- and what one finding only a held channel whose
+     * drain failed says too, as that one is out of service for good. */
+    assert(start() == 0);
+    assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    static struct qm_ceetm_lni lni_c;
+    INIT_LIST_HEAD(&lni_c.channels);
+    struct net_device dev_c = {0};
+    struct dpa_iface_info iface_c = {.name = "eth2"};
+    QM_context_ctl third = {.iface_info = &iface_c, .net_dev = &dev_c, .lni = &lni_c};
+    uint32_t claimed;
+    for (unsigned ch = 1; ch < CDX_CEETM_MAX_CHANNELS; ch++)
+        assert(ceetm_assign_chnl(&third, ch) == 0);
+    assert(ceetm_claim_channel(ctx, &claimed) == 0 && claimed == 0);
+    assert(ceetm_quiesce_port(ctx, &detached, true) == 0 && detached == 1);
+    ceetm_put_channel_devices(detached);
+    claimed = CDX_CEETM_MAX_CHANNELS;
+    assert(ceetm_claim_channel(&other, &claimed) == -EBUSY);
+    assert(claimed == CDX_CEETM_MAX_CHANNELS && !other.chnl_map);
+    assert(!qm_chnl_info[0].qm_ctx);
+    assert(qm_chnl_info[0].quarantine == ctx && !dev_b.refs);
+    assert(ceetm_claim_channel(ctx, &claimed) == 0 && claimed == 0);
+    assert(ceetm_claim_channel(&other, &claimed) == -ENOSPC && !other.chnl_map);
+    assert(ceetm_quiesce_port(ctx, &detached, true) == 0 && detached == 1);
+    ceetm_put_channel_devices(detached);
+    qm_chnl_info[0].cq_info[0].drain_failed = true;
+    assert(ceetm_claim_channel(&other, &claimed) == -ENOSPC && !other.chnl_map);
+    qm_chnl_info[0].cq_info[0].drain_failed = false;
+    assert(ceetm_end_quarantine(ctx) == 0);
+    assert(ceetm_claim_channel(&other, &claimed) == 0 && claimed == 0);
+    assert(ceetm_quiesce_port(&other, &detached, false) == 0);
+    ceetm_put_channel_devices(detached);
+    assert(ceetm_quiesce_port(&third, &detached, false) == 0);
+    ceetm_put_channel_devices(detached);
+    assert(!dev_b.refs && !dev_c.refs && !other.chnl_map && !third.chnl_map);
+    assert(cdx_disable_ceetm_on_iface(&iface) == 0);
+    shutdown_qos(); empty();
     /* Late pool-backed ERNs need no device; malformed late SKB ERNs must
      * not dereference a detached interface. */
     struct qm_fd late = {.bpid = 7, .id = 0};

@@ -45,6 +45,7 @@ typedef int64_t s64;
  * test can say how often the log was told something. */
 static unsigned pr_warns;
 #define pr_warn(...)		((void)snprintf(NULL, 0, __VA_ARGS__), (void)pr_warns++)
+#define pr_warn_ratelimited(...)	pr_warn(__VA_ARGS__)
 #define WARN_ON_ONCE(c)		({ int __c = !!(c); assert(!__c); __c; })
 
 static bool rtnl = true;
@@ -147,8 +148,12 @@ struct net_device {
 	char name[16];
 	unsigned real_num_tx_queues;
 	unsigned int mtu;
+	int refs;
 };
 static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return &dev->priv; }
+static void dev_hold(struct net_device *dev) { assert(dev); dev->refs++; }
+static void dev_put(struct net_device *dev) { assert(dev && dev->refs > 0); dev->refs--; }
+static const char *netdev_name(const struct net_device *dev) { return dev->name; }
 
 /* What the stack does with a queue index the driver hands back. */
 #define DPA_SELECT_QUEUE_NONE	((u16)~0U)
@@ -483,6 +488,21 @@ static bool cq_live[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
 static u32 cq_weight[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
 static u64 chan_cir[CDX_CEETM_MAX_CHANNELS], chan_eir[CDX_CEETM_MAX_CHANNELS];
 static unsigned stop_calls;
+/* The port a tree taken down left a channel quarantined for, as the hardware
+ * layer keeps it (ceetm_stop_qos()): no other port's claim gets the channel
+ * until the quarantine ends, and what the port's entries put on its queues
+ * meanwhile is popped then, or when the port takes it back. */
+static struct tQM_context_ctl *chan_quarantine[CDX_CEETM_MAX_CHANNELS];
+static unsigned leftovers_popped, quarantine_ends;
+static void pop_channel(u32 channel)
+{
+	unsigned jj;
+
+	for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
+		leftovers_popped += cq_backlog[channel][jj];
+		cq_backlog[channel][jj] = 0;
+	}
+}
 
 /* One failure at a time, so every error path is walked without any other being
  * in the way. -1 means no fault. */
@@ -493,8 +513,11 @@ static bool fault(void)
 	return fault_seen++ == fault_point;
 }
 
+/* As the hardware layer claims: -EBUSY when the only channels left are held
+ * for another port's entries, -ENOSPC when there are none. */
 static int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, u32 *channel_num)
 {
+	bool held = false;
 	u32 ii;
 
 	if (fault())
@@ -502,13 +525,20 @@ static int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, u32 *channel_num)
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
 		if (chan_owner_set[ii])
 			continue;
+		if (chan_quarantine[ii] && chan_quarantine[ii] != qm_ctx) {
+			held = true;
+			continue;
+		}
+		if (chan_quarantine[ii])
+			pop_channel(ii);
+		chan_quarantine[ii] = NULL;
 		chan_owner_set[ii] = true;
 		chan_owner[ii] = qm_ctx;
 		qm_ctx->chnl_map |= BIT(ii);
 		*channel_num = ii;
 		return 0;
 	}
-	return -ENOSPC;
+	return held ? -EBUSY : -ENOSPC;
 }
 
 static int ceetm_set_channel_rates(u32 channel_num, u64 cir_bps, u64 eir_bps)
@@ -588,11 +618,33 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 		chan_cir[ii] = chan_eir[ii] = 0;
 		chan_owner_set[ii] = false;
 		chan_owner[ii] = NULL;
+		/* Given back, but this port's until its quarantine ends. */
+		chan_quarantine[ii] = qm_ctx;
 	}
 	qm_ctx->chnl_map = 0;
 	qm_ctx->qos_enabled = 0;
 	/* Teardown reporting a problem must still leave nothing behind. */
 	return fault() ? -EIO : 0;
+}
+
+/* The quarantine's end: what the port's entries put on its channels' queues is
+ * popped, the entries are known to be installed again -- so they name none of
+ * the queues any more -- and the channels are any port's. */
+static int ceetm_end_quarantine(struct tQM_context_ctl *qm_ctx)
+{
+	unsigned ii, jj;
+
+	quarantine_ends++;
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+		if (!qm_ctx || chan_quarantine[ii] != qm_ctx)
+			continue;
+		pop_channel(ii);
+		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++)
+			if (!cq_live[ii][jj])
+				cq_named[ii][jj] = false;
+		chan_quarantine[ii] = NULL;
+	}
+	return 0;
 }
 
 typedef int (*cdx_ft_setup_tc_handler)(struct net_device *dev,
@@ -651,16 +703,27 @@ static bool cdx_ft_idle(void) { return backend_idle; }
 static struct net_device *egress_changed_dev;
 static unsigned egress_changes, egress_drains;
 static int egress_drain_rc;
+static void (*changed_meanwhile)(void);
 static void egress_hook(struct net_device *dev)
 {
 	assert(dev);
 	egress_changed_dev = dev;
 	egress_changes++;
+	if (changed_meanwhile)
+		changed_meanwhile();
 }
+/* The flowtable's drain sleeps on work that takes the control mutex, whose
+ * holder takes cdx_htb_mutex: never waited for holding that. And what a test
+ * has happen while it waits, as another thread would. */
+static bool htb_mutex_held(void);
+static void (*drain_meanwhile)(void);
 static int egress_drain(struct net_device *dev)
 {
 	assert(dev);
+	assert(!htb_mutex_held());
 	egress_drains++;
+	if (drain_meanwhile)
+		drain_meanwhile();
 	return egress_drain_rc;
 }
 static unsigned egress_restarts;
@@ -798,6 +861,11 @@ static DECLARE_DELAYED_WORK(cdx_htb_regrow, cdx_htb_regrow_work);
 static unsigned int cdx_htb_regrow_ms;
 static bool cdx_htb_regrowing;
 static u16 cdx_htb_departing[CDX_CEETM_MAX_CHANNELS];
+static struct cdx_htb_release cdx_htb_releases[MAX_PHY_PORTS];
+static void cdx_htb_release_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(cdx_htb_release, cdx_htb_release_work);
+static unsigned int cdx_htb_release_ms;
+static bool htb_mutex_held(void) { return cdx_htb_mutex; }
 
 DEFINE_STATIC_SRCU(cdx_ft_egress_srcu);
 static const struct cdx_ft_egress_ops __rcu *cdx_ft_egress_ops;
@@ -999,6 +1067,16 @@ static void reset_world(void)
 		cq_depth[ii / MAX_SCHEDULER_QUEUES][ii % MAX_SCHEDULER_QUEUES] = DEFAULT_CQ_DEPTH;
 	memset(cq_backlog, 0, sizeof(cq_backlog));
 	memset(cq_named, 0, sizeof(cq_named));
+	/* A test that took a tree down leaves its release due, holding the
+	 * port's netdev; the next starts with none. */
+	memset(chan_quarantine, 0, sizeof(chan_quarantine));
+	memset(cdx_htb_releases, 0, sizeof(cdx_htb_releases));
+	cdx_htb_release.pending = false;
+	cdx_htb_release_ms = 0;
+	leftovers_popped = quarantine_ends = 0;
+	drain_meanwhile = NULL;
+	changed_meanwhile = NULL;
+	devices[0].refs = devices[1].refs = 0;
 	backlog_fail = false;
 	cdx_htb_regrow.pending = false;
 	cdx_htb_regrow_ms = 0;
@@ -3469,6 +3547,219 @@ static void test_backlog(void)
 	assert(allocations == 0);
 }
 
+/* ---- a torn-down tree's channels, given back ------------------------- */
+
+/* The release work's timer firing, like run_regrow(). */
+static void run_release(void)
+{
+	assert(cdx_htb_release.pending);
+	cdx_htb_release.pending = false;
+	rtnl = false;
+	cdx_htb_release.func(&cdx_htb_release.work);
+	rtnl = true;
+	assert(!cdx_htb_mutex);
+}
+
+static bool release_armed(unsigned long ms)
+{
+	return cdx_htb_release.pending && cdx_htb_release.delay == ms;
+}
+
+/* What happens while the release waits for the flowtable, as on other
+ * threads: the release holds the netdev itself; the tree is taken down again,
+ * on a new tree the port built meanwhile; the port goes. */
+static void drain_holds_dev(void)
+{
+	assert(devices[0].refs == 2);
+}
+
+static void taken_down_again(void)
+{
+	rtnl = true;
+	assert(!create(&devices[0], 1, 0));
+	assert(!add_leaf(&devices[0], 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!destroy(&devices[0]));
+	rtnl = false;
+}
+
+static void port_goes(void)
+{
+	cdx_htb_port_gone(&gQMCtx[3]);
+	assert(devices[0].refs == 1);
+}
+
+/* The entries are marked before the release can be armed. */
+static void not_armed_yet(void)
+{
+	assert(!cdx_htb_release.pending);
+}
+
+/* A tree taken down stops its port's transmit path and drains its class
+ * queues at once, but what the hardware still sends to those queues -- a
+ * multicast group's listener entries, rebuilt only after the teardown, or a
+ * flow whose retirement has not finished -- puts a frame on each meanwhile.
+ * Its channels are quarantined for the port until the flowtable shows those
+ * entries retired or rebuilt (A350): another port's tree, built in that
+ * window, gets other channels and could not send those frames out of its own
+ * link, and is told a held channel is busy rather than that none is left. The
+ * release waits for the flowtable without the mutex, holding the netdev, then
+ * pops what the entries left and gives the channels back; it is tried again
+ * until the flowtable can say so, forgotten when the port goes, and cancelled
+ * at unload. The port's own next tree may take its channels back at once. */
+static void test_release(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	const u32 on1 = TC_H_MAKE(1 << 16, 1);
+	unsigned changes, drains, warns, ends, popped, ii;
+
+	reset_world();
+	assert(!cdx_register_ft_egress(&egress_ops));
+
+	/* ---- another port's tree does not get the channel meanwhile ---- */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(chan_owner[0] == &gQMCtx[3]);
+	changes = egress_changes;
+	changed_meanwhile = not_armed_yet;
+	assert(!destroy(dev));
+	changed_meanwhile = NULL;
+	/* Quarantined for its port, the netdev held for the release, which is
+	 * armed only after the command marked the port's entries. */
+	assert(chan_quarantine[0] == &gQMCtx[3] && dev->refs == 1);
+	assert(egress_changes == changes + 1 && release_armed(0));
+	/* An entry not yet installed again puts a frame on a parked queue. */
+	cq_backlog[0][6] = 1;
+	/* Another port's tree, at once, gets channel 1 rather than 0. Its RED
+	 * leaf, asking for the 768 frames the two queues beside it leave, is a
+	 * frame short of them: the one on channel 0 is charged. */
+	assert(!create(other, 1, 0));
+	assert(!add_leaf(other, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(chan_owner[1] == &gQMCtx[4] && !chan_owner_set[0]);
+	assert(!red_in_frames(other, on1, 648, 1945, 2594));
+	assert(cq_depth[1][6] == 767 && regrow_armed(100));
+	/* The release: the flowtable asked, without the mutex and holding the
+	 * netdev, then the frame popped and the channel given back -- and the
+	 * leaf grows into the frame it left. */
+	drains = egress_drains;
+	drain_meanwhile = drain_holds_dev;
+	run_release();
+	drain_meanwhile = NULL;
+	assert(egress_drains == drains + 1 && !chan_quarantine[0]);
+	assert(!cq_backlog[0][6] && leftovers_popped == 1);
+	assert(dev->refs == 0 && !cdx_htb_release.pending);
+	assert(cq_depth[1][6] == 768);
+	/* Now another port's tree can have it. */
+	assert(!add_leaf(other, 2, 0, 2, 0, 1000000, 1000000, NULL));
+	assert(chan_owner[0] == &gQMCtx[4]);
+	assert(!destroy(other));
+	assert(chan_quarantine[0] == &gQMCtx[4] && chan_quarantine[1] == &gQMCtx[4]);
+	run_release();
+	assert(!chan_quarantine[0] && !chan_quarantine[1] && other->refs == 0);
+
+	/* ---- not released before the flowtable can say so ---- */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(!destroy(dev));
+	egress_drain_rc = -EAGAIN;
+	warns = pr_warns;
+	run_release();
+	assert(chan_quarantine[0] == &gQMCtx[3] && dev->refs == 1 && release_armed(100));
+	/* Asked again less and less often, and the log told once. */
+	for (ii = 0; ii < 3; ii++)
+		run_release();
+	assert(chan_quarantine[0] == &gQMCtx[3] && release_armed(800));
+	for (ii = 0; ii < 2; ii++)
+		run_release();
+	assert(chan_quarantine[0] == &gQMCtx[3] && release_armed(1000));
+	assert(pr_warns == warns + 1);
+	/* Another port's tree is given another channel meanwhile. */
+	assert(!create(other, 1, 0));
+	assert(!add_leaf(other, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(chan_owner[1] == &gQMCtx[4] && !chan_owner_set[0]);
+	/* And with every other channel taken, its next is refused as busy
+	 * rather than as the SoC out of channels, in tc and in the log: the
+	 * channel left comes free once the first port's entries are gone. */
+	for (ii = 2; ii < CDX_CEETM_MAX_CHANNELS; ii++)
+		chan_owner_set[ii] = true;
+	last_extack = NULL;
+	warns = pr_warns;
+	assert(add_leaf(other, 2, 0, 2, 0, 1000000, 1000000, NULL) == -EBUSY);
+	assert(last_extack && strstr(last_extack, "held until another port"));
+	assert(pr_warns == warns + 1 && !chan_owner_set[0]);
+	for (ii = 2; ii < CDX_CEETM_MAX_CHANNELS; ii++)
+		chan_owner_set[ii] = false;
+	egress_drain_rc = 0;
+	run_release();
+	assert(!chan_quarantine[0] && dev->refs == 0 && !cdx_htb_release.pending);
+
+	/* ---- the port takes its own channel back at once ---- */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(!destroy(dev));
+	cq_backlog[0][6] = 1;
+	popped = leftovers_popped;
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(chan_owner[0] == &gQMCtx[3] && !chan_quarantine[0]);
+	assert(leftovers_popped == popped + 1);
+	/* The release still due finds nothing quarantined, and lets the netdev
+	 * go. */
+	ends = quarantine_ends;
+	run_release();
+	assert(quarantine_ends == ends + 1 && dev->refs == 0 && !cdx_htb_release.pending);
+
+	/* ---- taken down again while the release waits ---- */
+	/* What the flowtable showed covers the first teardown, not the second,
+	 * whose own marking arms the release again. */
+	assert(!destroy(dev));
+	drain_meanwhile = taken_down_again;
+	ends = quarantine_ends;
+	run_release();
+	drain_meanwhile = NULL;
+	assert(quarantine_ends == ends && chan_quarantine[0] == &gQMCtx[3]);
+	assert(dev->refs == 1 && release_armed(0));
+	run_release();
+	assert(!chan_quarantine[0] && dev->refs == 0 && !cdx_htb_release.pending);
+
+	/* ---- the port goes with its release due ---- */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!destroy(dev) && dev->refs == 1);
+	cdx_htb_port_gone(&gQMCtx[3]);
+	assert(dev->refs == 0);
+	/* The context's release ends the quarantine, classification stopped
+	 * (ceetm_release_iface()); the release finds nothing due. */
+	chan_quarantine[0] = NULL;
+	drains = egress_drains;
+	run_release();
+	assert(egress_drains == drains && !cdx_htb_release.pending);
+	/* Or while the release waits: it gives nothing back, and lets go of its
+	 * own hold on the netdev. */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!destroy(dev));
+	drain_meanwhile = port_goes;
+	ends = quarantine_ends;
+	run_release();
+	drain_meanwhile = NULL;
+	assert(quarantine_ends == ends && chan_quarantine[0] == &gQMCtx[3]);
+	assert(dev->refs == 0 && !cdx_htb_release.pending);
+	chan_quarantine[0] = NULL;
+
+	/* ---- unloading with a release due ---- */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!destroy(dev));
+	egress_drain_rc = -EAGAIN;
+	run_release();
+	assert(release_armed(100) && dev->refs == 1);
+	cdx_htb_exit();
+	assert(!cdx_htb_release.pending && !dev->refs && !other->refs);
+	egress_drain_rc = 0;
+	cdx_unregister_ft_egress();
+	assert(allocations == 0);
+}
+
 /* A queue that cannot be put into service is a class that cannot be created,
  * and it has to leave nothing behind. */
 static void test_queue_budget(void)
@@ -3597,6 +3888,7 @@ int main(void)
 	test_red();
 	test_cap();
 	test_backlog();
+	test_release();
 	test_queue_budget();
 	test_faults();
 	test_dispatch();

@@ -914,7 +914,7 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 				 * and a frame of tail drop rather than the
 				 * module-load default, since the port's
 				 * classifier entries name these queues
-				 * until they are installed again, after
+				 * until they are retired or rebuilt, after
 				 * the drain and after the port has stopped
 				 * serving them (CEETM_PARKED_CQ_DEPTH).
 				 * Recorded once the group took it, so the
@@ -1068,6 +1068,19 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 }
 
 
+/* Whether a drain of one of the channel's class queues failed, which keeps it
+ * out of service for good: the queue retains its buffers and device
+ * reference. */
+static bool ceetm_chnl_failed(const struct ceetm_chnl_info *chnl_ctx)
+{
+	uint32_t ii;
+
+	for (ii = 0; ii < NUM_CLASS_QUEUES; ii++)
+		if (chnl_ctx->cq_info[ii].drain_failed)
+			return true;
+	return false;
+}
+
 int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 {
 	uint32_t ii;
@@ -1082,21 +1095,25 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 		return CEETM_FAILURE;
 	}
 	chnl_ctx = &qm_chnl_info[channel_num];
-	/* An unsuccessful drain retains its buffers and device reference. */
-	for (ii = 0; ii < NUM_CLASS_QUEUES; ii++)
-		if (chnl_ctx->cq_info[ii].drain_failed)
-			return CEETM_FAILURE;
+	if (ceetm_chnl_failed(chnl_ctx))
+		return CEETM_FAILURE;
 	if (chnl_ctx->qm_ctx) {
 		ceetm_err("%s::channel number %d already assigned to iface %s\n",
 			__func__, channel_num, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
+	/* A channel a tree taken down gave back is another port's while that
+	 * port's classifier entries may still send to it: mapped here, what
+	 * they send would leave by this port (ceetm_stop_qos()). The port it
+	 * came from may have it back at once -- what is sent to it then leaves
+	 * by the port it was meant for. Refused quietly, as the claim tries
+	 * the next channel. */
+	if (chnl_ctx->quarantine && chnl_ctx->quarantine != qm_ctx)
+		return CEETM_FAILURE;
 	/* What a tree taken down left on the channel goes before the channel
-	 * is mapped to this port, or this port would send it
-	 * (ceetm_pop_leftovers()). Frames the entries of that tree send after
-	 * this, before they are installed again, still can be -- a parked
-	 * frame a queue at most. A queue that cannot be emptied keeps the
-	 * channel out of service, as a failed drain does. */
+	 * is mapped to a port again (ceetm_pop_leftovers()). A queue that
+	 * cannot be emptied keeps the channel out of service, as a failed
+	 * drain does. */
 	for (ii = 0; ii < NUM_CLASS_QUEUES; ii++)
 		if (chnl_ctx->cq_info[ii].cq &&
 		    ceetm_pop_leftovers(&chnl_ctx->cq_info[ii])) {
@@ -1123,6 +1140,7 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 	channel->lni_idx = lni->idx;
 	list_add_tail(&channel->node, &lni->channels);
 	chnl_ctx->qm_ctx = qm_ctx;
+	chnl_ctx->quarantine = NULL;
 	qm_ctx->chnl_map |= (1 << chnl_ctx->idx);
 	ceetm_dbg("%s::lni %d, dcp %d, chnl_map %x\n", __func__, lni->idx, lni->dcp_idx, qm_ctx->chnl_map);
 	/* if qos is enabled on port and channel shaper is on program values into shaper */
@@ -1143,22 +1161,35 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 
 /* Bind whichever channel is free to this port, and say which one it was.
  * Channel allocation is this file's policy: lowest free index, skipping any
- * whose earlier drain failed -- ceetm_assign_chnl() refuses
- * those, and refusing is how a channel that may still hold frames stays out of
- * service. */
+ * whose earlier drain failed, and any a tree on another port gave back while
+ * that port's entries may still send to it -- ceetm_assign_chnl() refuses
+ * those, and refusing is how a channel that may still hold or take frames
+ * stays out of service.
+ *
+ * -ENOSPC when no channel is left. -EBUSY when the only ones left are held
+ * that way for another port: those come free once its entries have been
+ * retired or rebuilt, normally within moments, so the caller can say to try
+ * again rather than that the SoC has run out. */
 int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num)
 {
+	bool held = false;
 	uint32_t ii;
 
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
-		if (qm_chnl_info[ii].qm_ctx)
+		struct ceetm_chnl_info *chnl_ctx = &qm_chnl_info[ii];
+
+		if (chnl_ctx->qm_ctx || ceetm_chnl_failed(chnl_ctx))
 			continue;
+		if (chnl_ctx->quarantine && chnl_ctx->quarantine != qm_ctx) {
+			held = true;
+			continue;
+		}
 		if (ceetm_assign_chnl(qm_ctx, ii))
 			continue;
 		*channel_num = ii;
 		return 0;
 	}
-	return -ENOSPC;
+	return held ? -EBUSY : -ENOSPC;
 }
 
 /* The frame queue a class queue on a channel sends through, by the indices
@@ -1563,9 +1594,9 @@ int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight
  * a RED qdisc on it is deleted before that qdisc is destroyed, and the destroy
  * then names a class that no longer exists. The depth matters because the
  * classifier entries installed for the class still send to the queue until
- * they are installed again, and a caller that bounds what its queues may hold
- * counts this one only by what it holds. What it already holds stays: a lower
- * tail drop evicts nothing. */
+ * they are retired or rebuilt, and a caller that bounds what its queues may
+ * hold counts this one only by what it holds. What it already holds stays: a
+ * lower tail drop evicts nothing. */
 int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
 {
 	struct qm_ceetm_weight_code weight_code;
@@ -1933,15 +1964,20 @@ static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
 /* Pop and free the frames a class queue no port serves still holds.
  *
  * A tree taken down drains its queues and stops its port serving them, but the
- * classifier entries installed while it was live go on sending to them until
- * they are installed again, which happens after the teardown, up to a couple
- * of seconds later while RTNL is contended. Parked (CEETM_PARKED_CQ_DEPTH),
+ * classifier entries installed while it was live can go on sending to them
+ * until they are retired or rebuilt. A flow's retirement starts with the first
+ * class the teardown takes away and has normally finished by its end; a
+ * multicast group's listener entries are rebuilt only after it, once a worker
+ * holds RTNL or a drain gets to them, and a burst of churn can leave a
+ * retirement unfinished. Parked (CEETM_PARKED_CQ_DEPTH),
  * each such queue keeps a frame of that: its channel stays mapped to the port
  * it left, which dequeues nothing from it until a tree there starts the
- * scheduler again. Mapped to another port meanwhile, the frame would go out of
- * that one, to a neighbour it was not addressed to; at module unload, the
- * queue would be freed with it, and its buffer lost. So both pop it first
- * (ceetm_assign_chnl(), ceetm_release_queue()).
+ * scheduler again. Mapped to another port, the frame would go out of that one,
+ * to a neighbour it was not addressed to -- which the channel's quarantine
+ * prevents while the entries can still send (ceetm_stop_qos()) -- and at
+ * module unload the queue would be freed with it, and its buffer lost. So the
+ * quarantine's end, a channel's next mapping and its release all pop it first
+ * (ceetm_end_quarantine(), ceetm_assign_chnl(), ceetm_release_queue()).
  *
  * A frame the CPU sent cannot be among them: the port's transmit path stops
  * resolving its CEETM queues, and is waited out, before the drain
@@ -1970,8 +2006,13 @@ static int ceetm_pop_leftovers(struct classque_info *cqinfo)
  * that might still hold one are known to be finished.
  *
  * A channel whose drain failed is still detached. It keeps its drain_failed
- * mark, and that is what stops ceetm_assign_chnl() handing it out again. */
-static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx, uint32_t *detached)
+ * mark, and that is what stops ceetm_assign_chnl() handing it out again.
+ *
+ * With `quarantine', every channel detached is kept for this port until its
+ * caller ends that (ceetm_stop_qos()): for a port whose classifier still runs,
+ * whose entries can send to the queues after their drain. */
+static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx,
+			      uint32_t *detached, bool quarantine)
 {
 	int ret = CEETM_SUCCESS;
 	int ii, jj;
@@ -2005,6 +2046,8 @@ static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx, uint32_t *detached
 		if (ceetm_drain_channel(chinfo))
 			ret = CEETM_FAILURE;
 		list_del_init(&chinfo->channel->node);
+		if (quarantine)
+			chinfo->quarantine = qm_ctx;
 		chinfo->qm_ctx = NULL;
 		*detached |= 1U << ii;
 	}
@@ -2065,7 +2108,17 @@ static void ceetm_put_channel_devices(uint32_t detached)
  *
  * The caller cannot act on a failure -- sch_htb discards the return value of
  * both its destroy commands -- so this reports what went wrong and keeps going
- * rather than stopping at the first error. */
+ * rather than stopping at the first error.
+ *
+ * The channels come back quarantined for this port. Its transmit path stops
+ * at once, but whatever classifier entries still send to the class queues --
+ * a multicast group's listener entries, rebuilt only after the teardown, or a
+ * flow whose retirement, started when the tree's first class went, has not
+ * finished -- would refill a parked frame a queue after the drain. Another
+ * port claiming such a channel meanwhile would send those frames out of its
+ * own link (A350); so no other port may have it until the caller has seen
+ * that nothing sends to the queues any more and ended the quarantine
+ * (ceetm_end_quarantine()). This port may take it back at once. */
 int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 {
 	uint32_t detached;
@@ -2075,7 +2128,7 @@ int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 		return CEETM_SUCCESS;
 	if (ceetm_reset_qos(qm_ctx))
 		ret = CEETM_FAILURE;
-	if (ceetm_quiesce_port(qm_ctx, &detached))
+	if (ceetm_quiesce_port(qm_ctx, &detached, true))
 		ret = CEETM_FAILURE;
 	if (qm_ctx->net_dev) {
 		if (ceetm_sync_portals())
@@ -2086,12 +2139,48 @@ int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 	return ret;
 }
 
+/* End the quarantine of every channel a tree on this port gave back
+ * (ceetm_stop_qos()), for a caller that knows nothing sends to its queues any
+ * more: the port's classifier entries have been retired or rebuilt since, or
+ * classification has stopped. What they put on the queues meanwhile is popped
+ * and freed first (ceetm_pop_leftovers()), and the channel is any port's to
+ * claim. A queue whose drain failed is left to that: its channel stays out of
+ * service by it, and a pop failing now marks the queue so too. Returns whether
+ * every queue gave its frames up. */
+int ceetm_end_quarantine(struct tQM_context_ctl *qm_ctx)
+{
+	int ret = CEETM_SUCCESS;
+	uint32_t ii, jj;
+
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+		struct ceetm_chnl_info *chinfo = &qm_chnl_info[ii];
+
+		if (!qm_ctx || chinfo->quarantine != qm_ctx)
+			continue;
+		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
+			struct classque_info *cqinfo = &chinfo->cq_info[jj];
+
+			if (cqinfo->cq && !cqinfo->drain_failed &&
+			    ceetm_pop_leftovers(cqinfo))
+				ret = CEETM_FAILURE;
+		}
+		chinfo->quarantine = NULL;
+	}
+	return ret;
+}
+
 int ceetm_release_iface(struct tQM_context_ctl *qm_ctx)
 {
 	int ret = CEETM_SUCCESS;
 	uint32_t detached;
 
-	if (ceetm_quiesce_port(qm_ctx, &detached))
+	if (ceetm_quiesce_port(qm_ctx, &detached, false))
+		ret = CEETM_FAILURE;
+	/* Classification has stopped by the time a port's context is released
+	 * (dpa_release_interface()'s callers): nothing sends to the queues of
+	 * the channels its trees gave back, and their quarantine ends with
+	 * whatever they hold popped. */
+	if (ceetm_end_quarantine(qm_ctx))
 		ret = CEETM_FAILURE;
 	if (qm_ctx->net_dev) {
 		struct dpa_priv_s *priv = netdev_priv(qm_ctx->net_dev);

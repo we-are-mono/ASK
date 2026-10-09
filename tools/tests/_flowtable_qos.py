@@ -50,7 +50,12 @@ PORT_POOL = PORT + 24
 # One flow per RED leaf, each filled while the LAN port is paused and then
 # shrunk under what it holds.
 PORT_HELD_A, PORT_HELD_B, PORT_HELD_C = PORT + 25, PORT + 26, PORT + 27
-PORTS_LAST = PORT_HELD_C
+# One flow per leaf of a LAN tree taken down under load while a WAN tree
+# claims every channel it can.
+PORTS_STRANDED = (PORT + 28, PORT + 29, PORT + 30, PORT + 31)
+# Both UDP ports of the routed groups streamed through such a tree.
+PORT_STRANDED_GROUP = PORT + 32
+PORTS_LAST = PORT_STRANDED_GROUP
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
 # unshaped and far above what the CPU can: see the module docstring.
