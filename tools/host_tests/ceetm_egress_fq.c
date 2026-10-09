@@ -73,6 +73,7 @@ static struct dpa_priv_s *netdev_priv(struct net_device *dev)
 struct eth_iface_info {
     struct net_device *net_dev;
     struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES];
+    struct qman_fq sec_tx_fqinfo[DPAA_FWD_TX_QUEUES];
 };
 /* A hardware qdisc owning the port, reduced to the answer it gives: whether
  * it owns it, and where a mark with no class goes there. Its own resolution
@@ -188,18 +189,29 @@ int main(void)
     assert(cdx_get_txfqid(&eth, &none, 0) == 0x000456);
     assert(cdx_get_txfqid(&eth, &named, 0x1234) == 0x000107);
     assert(tree_asked == 2);
+    /* What the IPsec offline port sends there takes the same class queue:
+     * the tree shapes it like any other frame. */
+    assert(cdx_get_sec_txfqid(&eth, &none, 0) == 0x000456);
+    assert(cdx_get_sec_txfqid(&eth, &named, 0x1234) == 0x000107);
+    assert(tree_asked == 4);
     /* And the mark itself is never rewritten on the way. */
     assert(!none.chnl_id && !none.queue && named.chnl_id == 1 && named.queue == 7);
     /* Without CEETM on the port neither the tree nor the channels apply,
      * nor the mark's queue: the port's forwarding queues share one work
      * queue, and a flow's hash spreads flows over them. */
     dev.priv.ceetm_en = false;
-    for (unsigned i = 0; i < DPAA_FWD_TX_QUEUES; i++)
+    for (unsigned i = 0; i < DPAA_FWD_TX_QUEUES; i++) {
         eth.fwd_tx_fqinfo[i].fqid = 0x70 + i;
+        eth.sec_tx_fqinfo[i].fqid = 0x90 + i;
+    }
     tree_asked = 0;
     assert(cdx_get_txfqid(&eth, &named, 0) == 0x70 && !tree_asked);
     assert(cdx_get_txfqid(&eth, &named, 3) == 0x73);
     assert(cdx_get_txfqid(&eth, &none, 0x7fff) == 0x70 + (0x7fff & (DPAA_FWD_TX_QUEUES - 1)));
+    /* The offline port's frames, in SEC's buffers, take the port's other
+     * set, which counts frames, spread by the same hash. */
+    assert(cdx_get_sec_txfqid(&eth, &named, 3) == 0x93);
+    assert(cdx_get_sec_txfqid(&eth, &none, 0x7fff) == 0x90 + (0x7fff & (DPAA_FWD_TX_QUEUES - 1)));
     assert(!tree_asked);
 
     /* A port whose netdev is not the DPAA driver's has no queue here, and
@@ -209,7 +221,9 @@ int main(void)
                                   .priv = { .ceetm_en = true, .qm_ctx = &port } };
     struct eth_iface_info other_eth = { .net_dev = &foreign };
     other_eth.fwd_tx_fqinfo[7].fqid = 0x99;
+    other_eth.sec_tx_fqinfo[7].fqid = 0x9a;
     assert(cdx_get_txfqid(&other_eth, &named, 7) == 0 && !tree_asked && !foreign_reads);
+    assert(cdx_get_sec_txfqid(&other_eth, &named, 7) == 0 && !tree_asked && !foreign_reads);
     foreign.netdev_ops = NULL;
     assert(cdx_get_txfqid(&other_eth, &named, 7) == 0 && !foreign_reads);
     other_eth.net_dev = NULL;

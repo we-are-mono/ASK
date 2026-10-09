@@ -325,11 +325,25 @@ result independently of those temporary files.
   as A333's exception queues did, and SEC then refuses every SA's jobs. Fix: a frame-mode tail-drop group on those
   queues; they also carry Ethernet-pool frames, so it bounds both. Source-verified by the A333 review; not reproduced.
 
-- [ ] **A335 — an egress port's congestion group bounds bytes, not SEC's buffers.** The forwarding TX queues' group
-  (A313, `devman.c` `fwd_queue_us`) holds 2 ms of link time: ~2,900 minimum frames at 1 Gbit/s, ~1,600 full ones at
-  10. Either is more than pool 34's 512, so decrypted traffic into a slower or shaped egress (a 2.3 Gbit/s tunnel into
-  a 1G LAN port, a CEETM class) can pin the pool and starve every SA. Fix direction: size pool 34 to the worst egress
-  bound plus `IPSEC_EXCEPTION_FRAMES`, or bound pool-34 frames on egress by count. Source-verified; not reproduced.
+- [x] **A335 — an egress port's congestion group bounded bytes, not SEC's buffers.** A paused LAN port held all of pool 34
+  and SEC refused 1.03M jobs; the offline port now has frame-counted queues per port (_:/^cdx: give the IPsec offline port its own frame-counted egress queues_).
+
+- [ ] **A337 — on a port a hardware qdisc owns, SEC's output still queues by the class's own bound.** The IPsec
+  offline port's frames take the class queue their mark resolves to (`cdx_get_sec_txfqid()` defers to
+  `cdx_get_txfqid()`), which tail-drops at `CDX_HTB_CQ_DEPTH` (128) frames per leaf, or at a RED leaf's limit in
+  bytes. That is a port's whole share of pool 34 (`IPSEC_EGRESS_FRAMES`) per class, and a tree of sixteen leaves is
+  twice the pool, so a shaped WAN class carrying an SA's output, or LAN classes taking decrypted traffic slower than the
+  tunnel, can still pin the pool and starve every SA. CEETM counts congestion per class queue, so the offline port's
+  frames cannot be bounded apart from the port's own there as they are on a plain port. Fix direction: check whether a
+  class queue's logical FQs can be given one for the offline port in a QMan group of its own; else bound the tree's
+  total depth by the pool. Source-verified; not reproduced.
+
+- [ ] **A340 — a bridge whose MTU exceeds a member port's offloads frames that port's MTU forbids.** Admission checks a
+  flow's path MTU against the logical egress device only (`cls->nf_mtu > out->out_logical->mtu`,
+  `ask_flowtable_core.c`), never the physical port under it. A bridge MTU set above a member's, which
+  `br_change_mtu()` allows, then puts frames up to the bridge's MTU into hardware out of a member with a smaller one:
+  the bridge in software drops them (`is_skb_forwardable()`), the port sends them. Fix: refuse when the path MTU
+  exceeds the physical egress port's too. Source-verified by the review of the A335 follow-up; not reproduced.
 
 - [x] **A336 — frames the IPsec exception group drops were counted only in a register dump.** Now
   `ipsec_offline_port_rejected` in `/proc/cdx_flowtable`, from oh1's own count (_:/^cdx: count what the IPsec offline port could not enqueue_).

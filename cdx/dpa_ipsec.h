@@ -85,7 +85,13 @@ struct sec_descriptor {
 /* For all Buffer pools using the ethernet driver seed routine,
  * we'll be using the same   BPOOL size */
 #define IPSEC_BUFSIZE	dpa_bp_size(NULL)
-#define IPSEC_BUFCOUNT  512
+/* SEC's output pool. A frame holds one of its buffers from SEC's job until the
+ * frame leaves: sent by a port, dropped, or copied out by the CPU. SEC itself
+ * has a few dozen in flight at line rate; the exception queues and each
+ * Ethernet port's queues for these frames have a share of it below, an eighth
+ * each, so that all of them full at once still leave SEC its own on a board of
+ * up to five ports. */
+#define IPSEC_BUFCOUNT  1024
 #define	THRESHOLD_IPSEC_BPOOL_REFILL 16
 /* A frame the IPsec offline port sends the CPU, having missed its flow table,
  * waits on an exception queue in a buffer of SEC's output pool. Together the
@@ -94,8 +100,15 @@ struct sec_descriptor {
  * the CPU drains them -- the tail of a flow being torn down, the head of one
  * not yet offloaded, a flow never offloaded -- held the whole pool, and SEC
  * refused every job of every SA, offloaded flows' included, for want of an
- * output buffer. The rest of the pool stays with SEC and the hardware path. */
-#define IPSEC_EXCEPTION_FRAMES	(IPSEC_BUFCOUNT / 4)
+ * output buffer. */
+#define IPSEC_EXCEPTION_FRAMES	(IPSEC_BUFCOUNT / 8)
+/* The same for what the offline port sends out of one Ethernet port: at most
+ * this many frames wait in that port's queues for SEC's buffers (devman.c),
+ * whatever the link does -- paused by its partner, slower than the tunnel; a
+ * slow link's share, or a jumbo MTU's, is smaller, for its latency. A port's
+ * own forwarding queues bound bytes, and held thousands of these, the whole
+ * pool. */
+#define IPSEC_EGRESS_FRAMES	(IPSEC_BUFCOUNT / 8)
 
 struct ipsec_info; 
 void *  dpa_get_ipsec_instance(void);

@@ -30,7 +30,7 @@ def test_ceetm_egress_fq(tmp_path):
     assert shutil.which(compiler), f"C compiler required: {compiler}"
     source = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
     names = ["ceetm_resolve_channel", "ceetm_get_egressfq", "ceetm_egress_fqid",
-             "cdx_get_txfqid"]
+             "txfqid", "cdx_get_txfqid", "cdx_get_sec_txfqid"]
     # The test for a DPAA port, from where cdx keeps it, ahead of its user.
     (tmp_path / "egress_fq_production.inc").write_text(
         function((ROOT / "cdx/devman.c").read_text(), "dpa_netdev_is_dpaa")

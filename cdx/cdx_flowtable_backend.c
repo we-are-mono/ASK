@@ -119,9 +119,11 @@ static int cdx_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
-	/* A speed change passes through the carrier, so it arrives here too. */
-	if ((event == NETDEV_UP || event == NETDEV_CHANGE) &&
-	    netif_carrier_ok(dev) && dpa_netdev_is_physical(dev)) {
+	/* A speed change passes through the carrier, so it arrives here too.
+	 * An MTU change resizes the bound on SEC's frames, counted in frames
+	 * of the largest size the MTU admits, carrier or not. */
+	if ((((event == NETDEV_UP || event == NETDEV_CHANGE) && netif_carrier_ok(dev)) ||
+	     event == NETDEV_CHANGEMTU) && dpa_netdev_is_physical(dev)) {
 		dpa_fwd_cgr_follow_link(dev);
 		return NOTIFY_DONE;
 	}

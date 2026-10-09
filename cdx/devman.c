@@ -26,6 +26,7 @@
 #include <uapi/linux/in6.h> 
 #include <linux/spinlock.h>
 #include <linux/if_arp.h>
+#include <linux/if_vlan.h>
 #include <linux/ethtool.h>
 #include "fm_vsp_ext.h"
 #include "fm_port_ext.h"
@@ -48,7 +49,8 @@
 #include "endian_ext.h" 
 #include "dpa_control_mc.h"
 #include "dpa_wifi.h"
-#include "cdx_ceetm_gdef.h" 
+#include "dpa_ipsec.h"
+#include "cdx_ceetm_gdef.h"
 #include "cdx_defs.h"
 #include "devman.h"
 #include "control_tx.h"
@@ -169,14 +171,40 @@ static u64 fwd_cgr_bytes(uint32_t speed)
 		     FWD_CGR_MIN_BYTES);
 }
 
-/* Size the port's group for speed Mbit/s; init sets it up from scratch. The
- * management command spins briefly and never sleeps, so callers may hold
- * dpa_devlist_lock. */
+/* The bound on the IPsec offline port's frames at speed Mbit/s through a port
+ * of this MTU: as many of the largest frames the MTU admits -- with a tagged
+ * Ethernet header, on the wire -- as the forwarding group's bytes, so that
+ * these frames wait no longer than the rest on a slow link or a jumbo MTU,
+ * and never more than the port's share of SEC's pool, which a standard MTU
+ * gets from a gigabit up. FWD_CGR_MIN_BYTES holds several of the largest
+ * frame there is, so never none. */
+static u64 sec_cgr_frames(uint32_t speed, unsigned int mtu)
+{
+	return clamp_t(u64, fwd_cgr_bytes(speed) /
+			    (mtu + VLAN_ETH_HLEN + FWD_CGR_WIRE_OVERHEAD),
+		       1, IPSEC_EGRESS_FRAMES);
+}
+
+/* Size the port's groups for speed Mbit/s and the port's MTU as it is now;
+ * init sets the forwarding group up from scratch, after sec_cgr_init() has
+ * the other. The management command spins briefly and never sleeps, so
+ * callers may hold dpa_devlist_lock. */
 static int fwd_cgr_set(struct eth_iface_info *eth_info, uint32_t speed,
 		       bool init)
 {
 	struct qm_mcc_initcgr opts;
 
+	if (!init) {
+		unsigned int mtu = READ_ONCE(eth_info->net_dev->mtu);
+
+		memset(&opts, 0, sizeof(opts));
+		opts.we_mask = QM_CGR_WE_CS_THRES;
+		qm_cgr_cs_thres_set64(&opts.cgr.cs_thres,
+				      sec_cgr_frames(speed, mtu), 1);
+		if (qman_modify_cgr(&eth_info->sec_cgr, 0, &opts))
+			return -EIO;
+		eth_info->sec_cgr_mtu = mtu;
+	}
 	memset(&opts, 0, sizeof(opts));
 	opts.we_mask = QM_CGR_WE_CS_THRES;
 	if (init) {
@@ -249,8 +277,9 @@ static uint32_t fwd_cgr_link_speed(struct net_device *dev, uint32_t fallback)
 	return fallback;
 }
 
-/* The link came up or changed speed: size the port's bound for the speed it
- * now runs at. RTNL held. */
+/* The link came up or changed speed, or the port's MTU changed: size the
+ * port's bounds for what it now is. A link that reports no speed keeps the
+ * one the bounds were sized for. RTNL held. */
 void dpa_fwd_cgr_follow_link(struct net_device *dev)
 {
 	struct dpa_iface_info *info;
@@ -261,9 +290,10 @@ void dpa_fwd_cgr_follow_link(struct net_device *dev)
 		if (!fwd_cgr_owner(info) || info->eth_info.net_dev != dev)
 			continue;
 		if (!speed)
-			speed = info->eth_info.speed;
+			speed = info->eth_info.fwd_cgr_speed ?: info->eth_info.speed;
 		if (info->eth_info.fwd_cgr_speed &&
-		    info->eth_info.fwd_cgr_speed != speed &&
+		    (info->eth_info.fwd_cgr_speed != speed ||
+		     info->eth_info.sec_cgr_mtu != READ_ONCE(dev->mtu)) &&
 		    fwd_cgr_set(&info->eth_info, speed, false))
 			netdev_warn(dev, "could not resize the offloaded egress queue bound\n");
 		break;
@@ -284,56 +314,85 @@ static void fwd_cgr_release(struct eth_iface_info *eth_info)
 	qman_release_cgrid(eth_info->fwd_cgr.cgrid);
 }
 
-//create frame queues for the port used to transmit packets from ENQ action
-static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
+/* What the IPsec offline port sends out of a port waits there in buffers of
+ * SEC's output pool, one frame to a buffer however short the frame. A group in
+ * bytes sized for the link's latency holds thousands of them at 10 Gbit/s,
+ * more than the pool has: a port its link partner pauses, or one slower than
+ * the tunnel, would hold every buffer, and SEC would refuse every SA's jobs
+ * until it sent again. So those frames take queues of their own, whose group
+ * counts frames (sec_cgr_frames()) and follows the link with the forwarding
+ * group. Like that group it asks for no notifications, so no portal owns it.
+ * Set up before the forwarding group, whose speed, once published, lets the
+ * resizers at both. */
+static int sec_cgr_init(struct eth_iface_info *eth_info, uint32_t speed)
+{
+	struct qm_mcc_initcgr opts;
+	unsigned int mtu = READ_ONCE(eth_info->net_dev->mtu);
+
+	if (qman_alloc_cgrid(&eth_info->sec_cgr.cgrid) < 0)
+		return -ENOSPC;
+	memset(&opts, 0, sizeof(opts));
+	opts.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSTD_EN |
+		       QM_CGR_WE_CSCN_EN;
+	opts.cgr.mode = QMAN_CGR_MODE_FRAME;
+	opts.cgr.cstd_en = QM_CGR_EN;
+	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres, sec_cgr_frames(speed, mtu), 1);
+	if (qman_modify_cgr(&eth_info->sec_cgr, QMAN_CGR_FLAG_USE_INIT, &opts)) {
+		qman_release_cgrid(eth_info->sec_cgr.cgrid);
+		return -EIO;
+	}
+	eth_info->sec_cgr_mtu = mtu;
+	return 0;
+}
+
+/* As fwd_cgr_release(), and after it: its FQs are out of service by now, and
+ * nothing resizes it. */
+static void sec_cgr_release(struct eth_iface_info *eth_info)
+{
+	struct qm_mcc_initcgr opts;
+
+	memset(&opts, 0, sizeof(opts));
+	qman_modify_cgr(&eth_info->sec_cgr, QMAN_CGR_FLAG_USE_INIT, &opts);
+	qman_release_cgrid(eth_info->sec_cgr.cgrid);
+}
+
+/* One set of a port's transmit queues, in the group cgr; oal is the wire
+ * overhead a byte-counting group adds per frame. *created counts the queues
+ * made, for the caller to destroy if the set is incomplete. */
+static int create_tx_fq_set(struct dpa_iface_info *iface_info,
+			    struct qman_fq *fq, const struct qman_cgr *cgr,
+			    uint8_t oal, uint32_t *created)
 {
 	struct eth_iface_info *eth_info = &(iface_info->eth_info);
-	struct qman_fq *fq;
 	struct qm_mcc_initfq opts;
-	uint32_t ii, created = 0, speed;
-	int rc;
+	uint32_t ii;
 
-	if (qman_alloc_cgrid(&eth_info->fwd_cgr.cgrid) < 0) {
-		DPA_ERROR("%s::no congestion group for %s\n", __func__,
-			  iface_info->name);
-		return FAILURE;
-	}
-	/* Sized for the link as it is now: a port already up below its
-	 * fastest raises no event to correct it later. The port is already
-	 * published, so set up under the lock the resizers take. RTNL held. */
-	speed = fwd_cgr_link_speed(eth_info->net_dev, eth_info->speed);
-	spin_lock(&dpa_devlist_lock);
-	rc = fwd_cgr_set(eth_info, speed, true);
-	spin_unlock(&dpa_devlist_lock);
-	if (rc) {
-		DPA_ERROR("%s::could not set up the congestion group for %s\n",
-			  __func__, iface_info->name);
-		qman_release_cgrid(eth_info->fwd_cgr.cgrid);
-		return FAILURE;
-	}
-	fq = &eth_info->fwd_tx_fqinfo[0];
+	*created = 0;
 	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
 		memset(fq, 0, sizeof(struct qman_fq));
 		fq->cb.dqrr = fwd_tx_drain_dqrr;
 		fq->cb.ern = fwd_tx_ern;
 		//FQ for egress
-		if (qman_create_fq(0, 
+		if (qman_create_fq(0,
 					(QMAN_FQ_FLAG_DYNAMIC_FQID | QMAN_FQ_FLAG_TO_DCPORTAL),
 					fq)) {
 			DPA_ERROR("%s::unable to create fq at index %d\n",
 					__func__, ii);
-			goto err_ret;
+			return FAILURE;
 		}
 		memset(&opts, 0, sizeof(struct qm_mcc_initfq));
 		opts.fqid = fq->fqid;
 		opts.count = 1;
 		opts.we_mask = (QM_INITFQ_WE_FQCTRL | QM_INITFQ_WE_DESTWQ |
 				QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA |
-				QM_INITFQ_WE_CGID | QM_INITFQ_WE_OAC);
+				QM_INITFQ_WE_CGID);
 		opts.fqd.fq_ctrl = QM_FQCTRL_PREFERINCACHE | QM_FQCTRL_CGE;
-		opts.fqd.cgid = (u8)eth_info->fwd_cgr.cgrid;
-		opts.fqd.oac_init.oac = QM_OAC_CG;
-		opts.fqd.oac_init.oal = FWD_CGR_WIRE_OVERHEAD;
+		opts.fqd.cgid = (u8)cgr->cgrid;
+		if (oal) {
+			opts.we_mask |= QM_INITFQ_WE_OAC;
+			opts.fqd.oac_init.oac = QM_OAC_CG;
+			opts.fqd.oac_init.oal = oal;
+		}
 		opts.fqd.dest.channel = eth_info->tx_channel_id;
 		opts.fqd.dest.wq = eth_info->tx_wq;
 		//OVFQ=1 - override FQ in tree
@@ -349,53 +408,106 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 			DPA_ERROR("%s::qman_init_fq failed for fqid %d\n",
 					__func__, fq->fqid);
 			qman_destroy_fq(fq, 0);
-			goto err_ret;
+			return FAILURE;
 		}
 		/* creating /proc/fqid_stats dir for listing fqids */
 		cdx_create_type_fqid_info_in_procfs(fq, TX_DIR, iface_info->tx_proc_entry, NULL);
-		created++;
+		(*created)++;
 		if (cdx_dpa_init_fault())
-			goto err_ret;
-#ifdef DEVMAN_DEBUG
-		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n", 
-				__func__, fq->fqid, eth_info->tx_channel_id);
-#endif
-		fq++;
-	}
-	return 0;
-
-err_ret:
-	while (created)
-		cdx_destroy_fq(&eth_info->fwd_tx_fqinfo[--created]);
-	fwd_cgr_release(eth_info);
-	return FAILURE;
-}
-
-static void cdx_drain_fq(struct qman_fq *fq);
-
-static void destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
-{
-	struct eth_iface_info *eth_info = &(iface_info->eth_info);
-	struct qman_fq *fq;
-	uint32_t ii;
-
-	/* Keep the embedded FQs alive through asynchronous retirement and
-	 * the final callbacks before the caller frees the interface. */
-	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++)
-		cdx_drain_fq(&eth_info->fwd_tx_fqinfo[ii]);
-	synchronize_net();
-
-	fq = &eth_info->fwd_tx_fqinfo[0];
-	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
-		cdx_remove_fqid_info_in_procfs(fq->fqid);
-		qman_destroy_fq(fq, 0);
+			return FAILURE;
 #ifdef DEVMAN_DEBUG
 		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n",
 				__func__, fq->fqid, eth_info->tx_channel_id);
 #endif
 		fq++;
 	}
+	return 0;
+}
+
+//create frame queues for the port used to transmit packets from ENQ action
+static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
+{
+	struct eth_iface_info *eth_info = &(iface_info->eth_info);
+	uint32_t created = 0, sec_created = 0, speed;
+	int rc;
+
+	/* Sized for the link as it is now: a port already up below its
+	 * fastest raises no event to correct it later. RTNL held. */
+	speed = fwd_cgr_link_speed(eth_info->net_dev, eth_info->speed);
+	if (sec_cgr_init(eth_info, speed)) {
+		DPA_ERROR("%s::could not set up the IPsec egress group for %s\n",
+			  __func__, iface_info->name);
+		return FAILURE;
+	}
+	if (qman_alloc_cgrid(&eth_info->fwd_cgr.cgrid) < 0) {
+		DPA_ERROR("%s::no congestion group for %s\n", __func__,
+			  iface_info->name);
+		goto err_sec_cgr;
+	}
+	/* The port is already published, so set up under the lock the
+	 * resizers take. */
+	spin_lock(&dpa_devlist_lock);
+	rc = fwd_cgr_set(eth_info, speed, true);
+	spin_unlock(&dpa_devlist_lock);
+	if (rc) {
+		DPA_ERROR("%s::could not set up the congestion group for %s\n",
+			  __func__, iface_info->name);
+		qman_release_cgrid(eth_info->fwd_cgr.cgrid);
+		goto err_sec_cgr;
+	}
+	if (create_tx_fq_set(iface_info, eth_info->fwd_tx_fqinfo,
+			     &eth_info->fwd_cgr, FWD_CGR_WIRE_OVERHEAD, &created) ||
+	    create_tx_fq_set(iface_info, eth_info->sec_tx_fqinfo,
+			     &eth_info->sec_cgr, 0, &sec_created))
+		goto err_ret;
+	return 0;
+
+err_ret:
+	while (sec_created)
+		cdx_destroy_fq(&eth_info->sec_tx_fqinfo[--sec_created]);
+	while (created)
+		cdx_destroy_fq(&eth_info->fwd_tx_fqinfo[--created]);
 	fwd_cgr_release(eth_info);
+err_sec_cgr:
+	sec_cgr_release(eth_info);
+	return FAILURE;
+}
+
+static void cdx_drain_fq(struct qman_fq *fq);
+
+static void destroy_tx_fq_set(struct dpa_iface_info *iface_info,
+			      struct qman_fq *fq)
+{
+	uint32_t ii;
+
+	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
+		cdx_remove_fqid_info_in_procfs(fq->fqid);
+		qman_destroy_fq(fq, 0);
+#ifdef DEVMAN_DEBUG
+		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n",
+				__func__, fq->fqid, iface_info->eth_info.tx_channel_id);
+#endif
+		fq++;
+	}
+}
+
+static void destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
+{
+	struct eth_iface_info *eth_info = &(iface_info->eth_info);
+	uint32_t ii;
+
+	/* Keep the embedded FQs alive through asynchronous retirement and
+	 * the final callbacks before the caller frees the interface. */
+	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
+		cdx_drain_fq(&eth_info->fwd_tx_fqinfo[ii]);
+		cdx_drain_fq(&eth_info->sec_tx_fqinfo[ii]);
+	}
+	synchronize_net();
+
+	destroy_tx_fq_set(iface_info, eth_info->fwd_tx_fqinfo);
+	destroy_tx_fq_set(iface_info, eth_info->sec_tx_fqinfo);
+	fwd_cgr_release(eth_info);
+	sec_cgr_release(eth_info);
 }
 
 
@@ -657,14 +769,15 @@ struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid)
  */
 static inline int dpa_get_fqid_from_eth(struct eth_iface_info *eth_info,
 		uint32_t *tx_fqid,
-		void  *info, uint32_t hash)
+		void  *info, uint32_t hash, bool from_sec)
 {
 	uint32_t fqid;
 	U32 mark = 0; /* Default queue */
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)&mark;
 	if(info)
 		qosmark = info;
-	fqid = cdx_get_txfqid(eth_info, qosmark, hash);
+	fqid = from_sec ? cdx_get_sec_txfqid(eth_info, qosmark, hash) :
+			  cdx_get_txfqid(eth_info, qosmark, hash);
 
 	if (!fqid) {
 		DPA_ERROR("%s::unable to get ceetm fqid for chnl %d queue %d\n",
@@ -728,7 +841,7 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 			*portid = eth_info->portid;
 
 		if(fqid)
-			if(dpa_get_fqid_from_eth(eth_info, fqid, NULL, hash))
+			if(dpa_get_fqid_from_eth(eth_info, fqid, NULL, hash, false))
 				return FAILURE;
 
 		if (is_dscp_fq_map)
@@ -985,7 +1098,9 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				 * change. */
 				src_mac = (unsigned char *)eth_info->net_dev->dev_addr;
 			}
-			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, NULL, hash))
+			/* Only the offline port enqueues what an SA's
+			 * output matches: frames in SEC's buffers. */
+			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, NULL, hash, true))
 				break;
 			if (cdx_get_tx_dscp_fq_map(eth_info, &l2_info->is_dscp_fq_map, NULL) != 0)
 			{
@@ -1122,7 +1237,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 				src_mac = (unsigned char *)eth_info->net_dev->dev_addr;
 			}
 
-			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, qosinfo, hash))
+			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, qosinfo, hash, false))
 				goto err_ret;
 			if (cdx_get_tx_dscp_fq_map(eth_info, &l2_info->is_dscp_fq_map, qosinfo) != 0)
 			{
@@ -1140,6 +1255,25 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 	if (src_mac)
 		memcpy(&l2_info->l2hdr[ETHER_ADDR_LEN], src_mac, ETHER_ADDR_LEN);
 err_ret:
+	spin_unlock(&dpa_devlist_lock);
+	return retval;
+}
+
+/* The queue dpa_get_tx_info_by_itf() names for a flow, for an entry the IPsec
+ * offline port executes instead: on an Ethernet port, one of its queues for
+ * SEC's buffers. */
+int dpa_get_sec_tx_fqid(PRouteEntry rt_entry, void *qosinfo, uint32_t hash,
+			uint32_t *fqid)
+{
+	struct dpa_iface_info *iface_info;
+	int retval = FAILURE;
+
+	spin_lock(&dpa_devlist_lock);
+	iface_info = rt_entry->itf ?
+		dpa_get_ifinfo_by_itfid(rt_entry->itf->index) : NULL;
+	if (iface_info && (iface_info->if_flags & IF_TYPE_ETHERNET))
+		retval = dpa_get_fqid_from_eth(&iface_info->eth_info, fqid,
+					       qosinfo, hash, true);
 	spin_unlock(&dpa_devlist_lock);
 	return retval;
 }

@@ -562,6 +562,14 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 			}
 		}
 	}
+	/* A decrypted flow the offline port forwards out of an Ethernet port
+	 * leaves in a buffer of SEC's output pool, so by the port's queues for
+	 * those, which bound them by count. */
+	if (info->l3_info.ipsec_inbound_flow && !info->to_sec_fqid &&
+	    !info->l2_info.is_wlan_iface &&
+	    dpa_get_sec_tx_fqid(entry->pRtEntry, &entry->qosmark,
+				(uint32_t)entry->hash, &info->l2_info.fqid))
+		return -1;
 	return 0;
 }
 

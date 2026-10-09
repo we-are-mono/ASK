@@ -76,6 +76,14 @@ struct eth_iface_info {
 	 * up and again once it is torn down. */
 	struct qman_cgr fwd_cgr;
 	uint32_t fwd_cgr_speed;
+	/* The same queues again for what the IPsec offline port sends out of
+	 * this port, all of it in buffers of SEC's output pool, with a group
+	 * that drops at the tail by frames rather than bytes (devman.c). */
+	struct qman_fq sec_tx_fqinfo[DPAA_FWD_TX_QUEUES];
+	struct qman_cgr sec_cgr;
+	/* The port MTU sec_cgr's bound was sized for: frames rather than
+	 * bytes, so the largest frame decides how long they queue. */
+	uint32_t sec_cgr_mtu;
 	uint32_t rx_channel_id;		//channel id rx
 	uint32_t tx_channel_id;		//channel id tx
 	uint32_t tx_wq;			//tx work queue
@@ -233,6 +241,8 @@ int dpaa_vwd_init(void);
 void dpaa_vwd_exit(void);
 uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *markval,
 			uint32_t hash);
+uint32_t cdx_get_sec_txfqid(struct eth_iface_info *eth_info, void *markval,
+			    uint32_t hash);
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void *markval);
 int dpaa_is_oh_port(uint32_t portid);
 #endif

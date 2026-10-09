@@ -103,15 +103,22 @@ def test_cdx_startup(tmp_path):
 @pytest.mark.parametrize("queues", [8, 16])
 def test_queues(tmp_path, queues):
     source = (ROOT / "cdx/devman.c").read_text()
+    pool = (ROOT / "cdx/dpa_ipsec.h").read_text()
     bound = "".join(line + "\n" for line in source.splitlines()
                     if line.startswith(("#define FWD_CGR_", "static unsigned int fwd_queue_us")))
+    bound += "".join(line + "\n" for line in pool.splitlines()
+                     if line.startswith(("#define IPSEC_BUFCOUNT", "#define IPSEC_EGRESS_FRAMES")))
     (tmp_path / "cdx_queues.inc").write_text(
         bound + function(source, "fwd_tx_drain_dqrr") + function(source, "fwd_tx_ern")
-        + function(source, "fwd_cgr_bytes") + function(source, "fwd_cgr_set")
-        + function(source, "fwd_cgr_link_speed") + function(source, "fwd_cgr_release")
+        + function(source, "fwd_cgr_bytes") + function(source, "sec_cgr_frames")
+        + function(source, "fwd_cgr_set")
+        + function(source, "fwd_cgr_owner") + function(source, "fwd_cgr_link_speed")
+        + function(source, "dpa_fwd_cgr_follow_link") + function(source, "fwd_cgr_release")
+        + function(source, "sec_cgr_init") + function(source, "sec_cgr_release")
+        + function(source, "create_tx_fq_set")
         + function(source, "cdx_drain_fq") + function(source, "cdx_destroy_fq")
         + function(source, "cdx_drain_fq_list") + function(source, "cdx_destroy_fq_list") + function(source, "create_fwd_tx_fqs")
-        + function(source, "destroy_fwd_tx_fqs"))
+        + function(source, "destroy_tx_fq_set") + function(source, "destroy_fwd_tx_fqs"))
     binary = tmp_path / "cdx_queues"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

@@ -196,6 +196,7 @@ static int dev_get_port_parent_id(struct net_device *d, struct netdev_phys_item_
 #define NETDEV_PRE_UP 1
 #define NETDEV_UP 2
 #define NETDEV_CHANGE 3
+#define NETDEV_CHANGEMTU 4
 #define NOTIFY_DONE 0
 #define netdev_err(...) ((void)0)
 struct notifier_block { int (*notifier_call)(struct notifier_block *, unsigned long, void *); };
@@ -867,8 +868,9 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, info) == NOTIFY_DONE);
     dpa_interface_info = &in_iface;
     /* A physical port's link coming up or changing speed resizes its egress
-     * bound, latch or not; a link without carrier or a foreign device does
-     * not. */
+     * bounds, latch or not, and so does its MTU changing, carrier or not --
+     * the bound on SEC's frames counts frames of the largest size it admits;
+     * a link without carrier or a foreign device does not. */
     bool carrier = in->carrier;
     unsigned follows = follow_link_calls;
     in->carrier = true;
@@ -878,10 +880,14 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     assert(follow_link_calls == follows + 2);
     in->carrier = false;
     assert(cdx_ft_netdev_event(NULL, NETDEV_CHANGE, info) == NOTIFY_DONE);
+    assert(follow_link_calls == follows + 2);
+    assert(cdx_ft_netdev_event(NULL, NETDEV_CHANGEMTU, info) == NOTIFY_DONE);
+    assert(follow_link_calls == follows + 3 && followed == in);
     info->dev = &unrelated;
     unrelated.carrier = true;
     assert(cdx_ft_netdev_event(NULL, NETDEV_UP, info) == NOTIFY_DONE);
-    assert(follow_link_calls == follows + 2);
+    assert(cdx_ft_netdev_event(NULL, NETDEV_CHANGEMTU, info) == NOTIFY_DONE);
+    assert(follow_link_calls == follows + 3);
     info->dev = in;
     in->carrier = carrier;
     strcpy(out->name, "out");

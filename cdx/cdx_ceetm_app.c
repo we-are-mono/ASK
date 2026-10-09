@@ -116,10 +116,10 @@ static struct qman_fq *ceetm_egressfq_hook(void *ctx, uint32_t channel,
  * the backstop for a record that did not come through it.
  *
  * hash is the flow's (zero where there is no single flow), which picks the
- * forwarding queue on a port no hardware qdisc owns.
+ * forwarding queue on a port no hardware qdisc owns, from fwd.
  */
-uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info,
-			uint32_t hash)
+static uint32_t txfqid(struct eth_iface_info *eth_info, void *info,
+		       uint32_t hash, const struct qman_fq *fwd)
 {
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)info;
 	uint32_t quenum;
@@ -156,7 +156,24 @@ uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info,
 	 * other flow's packets -- the ACKs of the opposite direction among
 	 * them (A313) -- and each flow keeps one queue, so its order holds. */
 	quenum = hash & (DPAA_FWD_TX_QUEUES - 1);
-	return eth_info->fwd_tx_fqinfo[quenum].fqid;
+	return fwd[quenum].fqid;
+}
+
+uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info,
+			uint32_t hash)
+{
+	return txfqid(eth_info, info, hash, eth_info->fwd_tx_fqinfo);
+}
+
+/* The same, for an entry of the IPsec offline port: what it sends is in
+ * buffers of SEC's output pool, which the port's own forwarding queues bound
+ * only by bytes. On a port a hardware qdisc owns, the frame takes its class
+ * queue like any other; those count frames, but each holds more than a port's
+ * share of the pool (A337). */
+uint32_t cdx_get_sec_txfqid(struct eth_iface_info *eth_info, void *info,
+			    uint32_t hash)
+{
+	return txfqid(eth_info, info, hash, eth_info->sec_tx_fqinfo);
 }
 
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void* info)

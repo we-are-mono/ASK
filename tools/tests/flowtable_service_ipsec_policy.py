@@ -17,7 +17,7 @@ from _flowtable_rig import (DPORT, command, console_command)
 from _flowtable_rig import (console_python, read)
 from _flowtable_selective_neighbour import (keys, warm)
 from _flowtable_service import (FIRST, supervision_status)
-from _flowtable_service_ipsec import (INNER, LAN_INNER, REQIDS, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IP, Wire, balanced, flows_for, hardware, negative, plaintext_probe)
+from _flowtable_service_ipsec import (INNER, LAN_INNER, REQIDS, SEC_POOL, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IP, Wire, balanced, flows_for, hardware, negative, plaintext_probe)
 from _flowtable_service_vlan import (attempts)
 
 MARK_TABLE = "ask_recovery_xfrm_mark"
@@ -360,7 +360,7 @@ print(json.dumps({'path': str(paths[0]), 'bpid': int(bpid)}))
             await r.wait(lambda s: not s["entries"], timeout=5)
             await p.batch([0, 1, 2, 3], count=32, interval=0.01)
             initial_pool = await available()
-            assert 480 <= initial_pool <= 512, initial_pool
+            assert SEC_POOL - 32 <= initial_pool <= SEC_POOL, initial_pool
             sas = await r.ipsec.states()
             depleted = (await r.state())["ipsec_sec_refused_buffer_depletion"]
             async with slab_fault(r, "ipsec-pool", "ipsec-pool-slab", continuous=True) as fault:
@@ -379,7 +379,7 @@ print(json.dumps({'path': str(paths[0]), 'bpid': int(bpid)}))
                 # Validated late echoes were received too.
                 delivered = reports["2"]["received"] + reports["2"]["late"]
                 assert delivered >= 700, reports
-                assert lowest >= 480, (lowest, reports)
+                assert lowest >= SEC_POOL - 32, (lowest, reports)
                 await p.batch([0, 1], count=32, interval=0.01)
                 await negative(r, p)
             # Nothing was taken, so nothing was refilled: the failing

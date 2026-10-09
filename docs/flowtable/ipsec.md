@@ -1359,11 +1359,12 @@ and at line rate it is also a log flood.
 
 #### Frames the offline port gives the CPU must not take SEC's pool
 
-SEC writes every job's output into one buffer of its own BMan pool, 512
-buffers (`IPSEC_BUFCOUNT`) shared by every SA in both directions. A frame the
-offline port forwards in hardware returns its buffer when the egress port has
-sent it, within microseconds; under 2.5 Gbit/s of offloaded traffic the pool
-reads 495-512. A frame that misses the offline port's flow table goes to the
+SEC writes every job's output into one buffer of its own BMan pool, 1024
+buffers (`IPSEC_BUFCOUNT`, 512 until A335) shared by every SA in both
+directions. A frame the offline port forwards in hardware returns its buffer
+when the egress port has sent it, within microseconds; under 2.5 Gbit/s of
+offloaded traffic SEC has fewer than twenty of them out at once. A frame that
+misses the offline port's flow table goes to the
 CPU on the SA's exception queue (TO_CP) instead, still in that buffer. Misses
 come in bursts at line rate: the tail of a TCP flow after its teardown, the
 head of one before the flowtable offloads it, a flow nothing offloads. The CPU
@@ -1385,13 +1386,13 @@ flow beside it completely.
 
 Both are fixed. Every exception queue the offline port feeds, each SA's TO_CP
 and the port's PCD queues, joins one QMan congestion group in frame mode with
-tail drop at `IPSEC_EXCEPTION_FRAMES`, a quarter of the pool. QMan refuses the
+tail drop at `IPSEC_EXCEPTION_FRAMES`, 128 frames. QMan refuses the
 port's enqueue past it, and FMan drops the frame and returns its buffer: the
 SDK configures FMan's direct-connect portals to take their own enqueue
 rejections (`qm_set_dc(..., ed=1)`). The offline port counts those drops in its
 BMI WRED-discard counter (`fmbm_ofwdc` in its `fm_port_bmi_regs`), not in its
-filter count, and frames an egress port's congestion group refuses (A313) land
-there too. The accounting pass reads it (`dpa_cfg_port_rejected()`, through
+filter count, and so does every other group it enqueues to (below). The
+accounting pass reads it (`dpa_cfg_port_rejected()`, through
 `FM_PORT_GetCounter()`, which patch 010 exports) and folds it into
 `/proc/cdx_flowtable` as `ipsec_offline_port_rejected` (A336). And
 `ipsec_exception_pkt_handler()` copies a contiguous frame into
@@ -1405,10 +1406,51 @@ offloaded TCP keeps 2.27 Gbit/s.
 
 `flowtable_ipv6_sa.py::test_exception_backlog_leaves_sec_its_buffers` is that
 case; `flowtable_service_ipsec_policy.py::test_receive_leaves_the_pool` proves
-the receive path borrows nothing, with every refill allocation failing. Two
-other queues can still hold pool-34 frames past the pool's size: the Wi-Fi
-VAP forward queues, which have no group (A334), and the egress groups, which
-count bytes (A335).
+the receive path borrows nothing, with every refill allocation failing. The
+Wi-Fi VAP forward queues can still hold pool-34 frames past the pool's size;
+they have no group (A334).
+
+#### Nor the ports it forwards to
+
+What the offline port forwards out of an Ethernet port waits on that port's
+transmit queues until the port sends it, one frame to a pool buffer however
+short the frame. Those queues' group bounds bytes, two milliseconds at the
+link's speed (A313): 2.5 MB at 10 Gbit/s, some 17,000 frames of a small
+datagram stream, where the pool had 512. A port that stops sending -- its link
+partner sends 802.3x pause, as a congested switch or host does -- or one slower
+than the tunnel held every buffer, and SEC refused every SA's jobs, both
+directions, until it sent again (A335; NXP's queues had no bound at all). With
+the LAN VM's NIC pausing the LAN port, 1,035,648 datagrams down the tunnel to
+it in three seconds emptied the pool, and SEC refused all but 1,300.
+
+So the offline port's entries no longer enqueue to the port's forwarding
+queues. Each Ethernet port has a second set as large (`sec_tx_fqinfo[]`, same
+channel and work queue, chosen by the flow's hash the same way) in a group of
+its own that counts frames and drops at the tail (`sec_cgr`). An SA's ESP
+output takes them (`dpa_get_out_tx_info_by_itf_id()`, which builds only the
+offline port's entries), and so does a decrypted flow once
+`cdx_ipsec_fill_sec_info()` has moved it to the offline port's tables
+(`dpa_get_sec_tx_fqid()`); one that goes back into SEC, or out by a Wi-Fi VAP,
+keeps its queue. The group holds as many of the largest frames the port's MTU
+admits as the forwarding group's bytes, so these frames wait no longer than
+the rest, and at most `IPSEC_EGRESS_FRAMES`, 128: 128 on a standard MTU from a
+gigabit up, 42 at 100 Mbit/s; with a 9000-byte MTU still 128 at 10 Gbit/s,
+which is 0.9 ms, but 27 at a gigabit. It follows the link's speed with the
+forwarding group, and the port's MTU (`NETDEV_CHANGEMTU`). Microcode fragments
+of an ESP frame take the same queue and count one each. FMan drops what the group
+refuses, and the offline port counts it in `ipsec_offline_port_rejected`. With
+the port paused, the same stream now loses 1,031,091 frames there, at the
+port's share; SEC refuses none, and the pool never reads below 880.
+
+The pool grew to 1024 for this: an eighth each to the exception queues and
+every Ethernet port, which on a five-port board leaves a quarter to SEC with
+every queue full at once. Each port's bound sits far below
+the 2 ms its forwarding queues allow at 10 Gbit/s (128 full-size frames is
+157 µs), the cost of a pool that has to cover every port; it matters only
+where a fast port is congested by other traffic. `flowtable_ipsec_stalled_port.py`
+is the paused-port case. On a port a hardware qdisc owns, the offline port's
+frames take their class queue like any other frame, which counts frames but
+holds more than a port's share (A337).
 
 ### 7. Parity
 

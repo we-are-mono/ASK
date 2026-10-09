@@ -114,11 +114,13 @@ extern void *FmMurambaseAddr;
  * 10 KiB, where 2048 buffers would hold 21 MB. A buffer is held from the
  * fragmenting enqueue until its port has sent it, and what reaches the
  * fragmenter is, by admission, almost only SEC's output: an ESP packet a path
- * cannot carry whole. A standard frame costs one buffer more, so 512 cover all
- * IPSEC_BUFCOUNT (512) frames SEC's output pool holds in flight at once. A
- * jumbo frame through an SA into a 1500-byte path costs up to six, so a burst
- * of those can find the pool empty, which shows as an allocation failure in
- * /proc/ucode_frag/stats; sizing for that worst case would cost ~30 MB. */
+ * cannot carry whole, queued on its port's queues for SEC's frames, which hold
+ * IPSEC_EGRESS_FRAMES of them. A standard frame costs one buffer more, so 512
+ * cover four such ports at once, where an SA's outer path leaves by one. A
+ * jumbo frame through an SA into a
+ * 1500-byte path costs up to six, so a burst of those can find the pool empty,
+ * which shows as an allocation failure in /proc/ucode_frag/stats; sizing for
+ * that worst case would cost ~30 MB. */
 #define CDX_FRAG_BUFFERS_CNT	512
 #define CDX_FRAG_BUFF_SIZE	dpa_bp_size(NULL)
 
