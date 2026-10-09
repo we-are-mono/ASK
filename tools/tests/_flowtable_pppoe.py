@@ -25,6 +25,7 @@ from _flowtable_rig import (
     console_command,
     console_python,
     read,
+    release_latch,
 )
 from _gated_tcp import GatedTcp
 from _topology import (
@@ -691,7 +692,7 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     r.session_ipv6 = shape == "ipv6"
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
-    initial = await r.state()
+    initial = await release_latch(r)
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     r.wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     stack = TopologyStack()

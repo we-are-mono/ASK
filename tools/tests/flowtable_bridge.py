@@ -27,7 +27,8 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        dut_vlan_subif, lan_run, lan_vlan_subif)
-from _flowtable_rig import (DPORT, Echo, SPORT, WAN_IP, Rig, assert_undisturbed, command, read)
+from _flowtable_rig import (DPORT, Echo, SPORT, WAN_IP, Rig, assert_undisturbed, command, read,
+                            release_latch)
 from _gated_tcp import GatedTcp
 
 BRIDGE = "br-ft"
@@ -182,7 +183,7 @@ async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
     r.proto = "tcp" if shape == "tcp" else "udp"
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
-    initial = await r.state()
+    initial = await release_latch(r)
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     r.wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     stack = TopologyStack()

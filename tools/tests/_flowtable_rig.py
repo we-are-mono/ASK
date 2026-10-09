@@ -9,6 +9,7 @@ import re
 import shlex
 import struct
 import time
+import warnings
 from collections import Counter
 from contextlib import asynccontextmanager
 
@@ -38,6 +39,8 @@ SPORT = int(os.environ.get("ASK_FLOWTABLE_SPORT", "48270"))
 DPORT = int(os.environ.get("ASK_FLOWTABLE_DPORT", "48271"))
 
 TABLE = "ask_poc"
+# The flowtable release_latch() binds for a moment, and nothing else.
+LATCH_TABLE = "ask_latch_release"
 
 HEALTH_BASELINE = {"errors": 0}
 
@@ -383,7 +386,7 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
     # (_flowtable_restart.restart_budget()) or lowered.
     r.restart_limit = None
     await stop_boot_daemon()
-    initial = await r.state()
+    initial = await release_latch(r)
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     # The adapter's error count is cumulative for the boot and deliberately
     # never reset, so whatever earlier tests already accounted for is this
@@ -602,6 +605,43 @@ async def rearm_ready(r, timeout=10):
         if state["fatal"] or time.monotonic() >= deadline:
             return False
         await asyncio.sleep(0.1)
+
+
+async def release_latch(r):
+    """The adapter's state for a case to start from, with an invalidation an
+    earlier one left behind cleared first. A latch outlives the last binding
+    and only a bind clears it (ft_rearm()), so a case whose bindings went
+    before the adapter rearmed -- a daemon stopped ahead of its own rebind --
+    hands it on, harmless, to whatever runs next. A bare flowtable is bound
+    and given back, and only where a bind would rearm: a fatal adapter binds
+    passively, and a quarantine holds the rearm until its barrier completes,
+    and either is the next case's to report. The table goes again however the
+    wait for the rearm ends, and one an interrupted attempt left goes first:
+    left bound, it is two bindings no case can start under."""
+    if not (await _drop_latch_table(r))["rc"]:
+        warnings.warn(f"an interrupted latch release left {LATCH_TABLE} bound; removed")
+    state = await r.state()
+    if not state["invalidated"] or state["bindings"] or state["fatal"]:
+        return state
+    if not await rearm_ready(r):
+        # Whatever the wait saw last is the case's to report, not what was
+        # read before it.
+        return await r.state()
+    try:
+        await r.nft(f'''table inet {LATCH_TABLE} {{
+ flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; }}
+}}''')
+        await r.wait(lambda s: s["bindings"] == 2 and not s["invalidated"])
+    finally:
+        dropped = await _drop_latch_table(r)
+    assert not dropped["rc"], dropped
+    return await r.wait(lambda s: not s["bindings"])
+
+
+async def _drop_latch_table(r):
+    # Absent is the usual answer, and not an error; the caller decides.
+    return await command(r.target, r.session, "nft", "delete", "table", "inet", LATCH_TABLE,
+                         check=False)
 
 
 async def hardware_proof(r, count=256):

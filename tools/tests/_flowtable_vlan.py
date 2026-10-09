@@ -8,7 +8,7 @@ import os
 
 import pytest
 import pytest_asyncio
-from _flowtable_rig import DPORT, SPORT, WAN_IP, Echo, Rig, command, read
+from _flowtable_rig import DPORT, SPORT, WAN_IP, Echo, Rig, command, read, release_latch
 from _topology import (
     LAN_NIC,
     TARGET_LAN_IF,
@@ -107,7 +107,7 @@ async def vlan_rig(target_agent, aiohttp_session, lan, splat_window, request):
     r.proto = "tcp" if shape == "tcp" else "udp"
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
-    initial = await r.state()
+    initial = await release_latch(r)
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     r.wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     stack = TopologyStack()

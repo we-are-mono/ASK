@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from _flowtable_rig import Rig, command, read, stop_boot_daemon
+from _flowtable_rig import Rig, command, read, release_latch, stop_boot_daemon
 from _topology import (
     DUT_IPV6_LAN,
     DUT_IPV6_WAN,
@@ -177,7 +177,7 @@ async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     await stop_boot_daemon()
-    initial = await r.state()
+    initial = await release_latch(r)
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     # The adapter's error count is cumulative for the boot and never reset;
     # tests that inject failures may already have run. Only errors raised
