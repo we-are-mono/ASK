@@ -211,12 +211,13 @@ static u64 fwd_cgr_frames(uint32_t speed, unsigned int mtu, u64 cap)
  * each CPU (dpa_priv_bp_seed()), so that however many ports stall, their
  * forwarding queues leave half the pool to receive into; SEC's input queues
  * take 512 frames more, all of them together (IPSEC_TO_SEC_FRAMES), and each
- * port's queues to the CPU a quarter of its seed (the driver's ingress group):
- * with all of them full at once, five ports leave a fifth of the pool to
- * receive into. A frame takes one buffer:
- * they are sized for the largest frame FMan accepts, or the MTU for what one
- * holds. With four CPUs that is 1,280 frames: at 10 Gbit/s and a standard
- * MTU, 1.6 ms of the largest frames rather than fwd_queue_us's 2. */
+ * port's queues to the CPU half its seed too (the driver's ingress group). A
+ * port's two halves are its own share, so one port stalled and flooded at
+ * once still leaves the others theirs; every port both at once, with SEC's
+ * input full as well, would ask 4% more than the pool has. A frame takes one
+ * buffer: they are sized for the largest frame FMan accepts, or the MTU for
+ * what one holds. With four CPUs that is 1,280 frames: at 10 Gbit/s and a
+ * standard MTU, 1.6 ms of the largest frames rather than fwd_queue_us's 2. */
 static u64 fwd_pool_frames(const struct eth_iface_info *eth_info)
 {
 	return max_t(u64, (u64)eth_info->pool_info[0].count *

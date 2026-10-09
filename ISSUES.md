@@ -358,7 +358,7 @@ result independently of those temporary files.
   at a share of the Ethernet pool (_:/^cdx: bound SEC's input queues by the buffers they hold_).
 
 - [x] **A347 — a flood the CPU could not keep up with could take the Ethernet buffer pool.** Each port's queues to the
-  CPU, cdx's distribution queues included, now share a frame-counted group at a quarter of its seed (_:/^cdx: bound a port's queues to the CPU_).
+  CPU, cdx's distribution queues included, now share a frame-counted group at half its seed (_:/^cdx: bound a port's queues to the CPU_, _:/^sdk_dpaa: give a port's queues to the CPU half its seed_).
 
 - [x] **A345 — a flow relayed from one SA into another could hold SEC's own pool on the SAs' input queues.** Their group
   is now 512 frames, four shares of SEC's pool grown to 2,560 (_:/^cdx: budget SEC's input queues in SEC's own pool_).

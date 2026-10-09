@@ -1520,7 +1520,7 @@ the pool never more than 528 below idle (11,951 of 12,479; 11,269 of 12,564
 at 1,280). Four TCP streams through one SA move as much as at 1,280: 2.46
 Gbit/s with AES-GCM, 2.34-2.44 with AES-CBC and HMAC-SHA256. Before a flow is
 in hardware its frames go
-to the CPU, whose queues on each port hold at most a quarter of what the port
+to the CPU, whose queues on each port hold at most half of what the port
 seeds the pool with, in frames (A347).
 
 ### 7. Parity
