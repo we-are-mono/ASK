@@ -389,12 +389,8 @@ result independently of those temporary files.
   per SA for what the offline port sends back into SEC, in a group of its own sized from SEC's pool (which means a
   share carved from the eighths `dpa_ipsec.h` budgets). Source-verified; not reproduced: the rig has one tunnel.
 
-- [ ] **A342 — `ipsec_vlan_iperf_probe.py` can fail when the WAN host starves a stream of its ACKs.** One full-suite
-  run saw two of four streams stall from the start: the WAN host reordered their ESP ACKs past the 32-entry replay
-  window and SEC refused 331,329 as late (`ipsec_sec_refused_other`), with no DUT buffer depletion or egress drop. The
-  test asserts every stream moves 1,000 packets in hardware over 5 s. Two reruns passed, and passing runs see 3k-140k
-  such refusals. The peer's async crypto reorders (see A333); the test needs either an ordering peer or an assertion on
-  the streams' total rather than each.
+- [x] **A342 — `ipsec_vlan_iperf_probe.py` failed when the WAN host's reordered ESP ACKs stalled a stream.** Each stream
+  must stay in hardware through its SA, and only their total must move (_:/^tests: hold the IPsec iperf streams to their total_).
 
 - [x] **A336 — frames the IPsec exception group drops were counted only in a register dump.** Now
   `ipsec_offline_port_rejected` in `/proc/cdx_flowtable`, from oh1's own count (_:/^cdx: count what the IPsec offline port could not enqueue_).

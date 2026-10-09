@@ -68,21 +68,28 @@ print(result.stdout, flush=True)
 assert result.returncode == 0, result.stderr
 """
                 peer_before = xfrm_mib(Path("/proc/net/xfrm_stat").read_text())
+                # The previous run's flows can still be in hardware a while
+                # after its conntrack entries went; none of them is this run's.
+                stale = {f["cookie"] for f in (await r.state())["flows"]}
                 task = asyncio.create_task(lan_run_python(r.lan, script, timeout=50,
                                                          label=f"ipsec_iperf_{streams}"))
                 before = await r.wait(lambda s: sum(
-                    f["in"] == TARGET_LAN_IF and f["dst"] == f"{INNER}:{PORT}"
-                    and int(f["bytes"]) > 1_000_000 for f in s["flows"]) == streams,
-                    timeout=12)
+                    int(f["bytes"]) for f in s["flows"] if f["cookie"] not in stale
+                    and f["in"] == TARGET_LAN_IF and f["dst"] == f"{INNER}:{PORT}")
+                    > 1_000_000 * streams, timeout=12)
                 tx_before, cpu_before = await software_tx(r), await cpu(r)
                 await asyncio.sleep(5)
                 cpu_after, tx_after = await cpu(r), await software_tx(r)
                 after = await r.state()
+                # A flow admitted after the window opened moved all it has
+                # within it.
                 old = {f["cookie"]: f for f in before["flows"]}
-                deltas = [{"in": f["in"], "sa": f["sa"], "in_sa": f["in_sa"],
-                           "packets": int(f["packets"]) - int(old[f["cookie"]]["packets"]),
-                           "bytes": int(f["bytes"]) - int(old[f["cookie"]]["bytes"])}
-                          for f in after["flows"] if f["cookie"] in old]
+                zero = {"packets": 0, "bytes": 0}
+                deltas = [{"cookie": f["cookie"], "src": f["src"], "in": f["in"], "sa": f["sa"],
+                           "in_sa": f["in_sa"],
+                           "packets": int(f["packets"]) - int(old.get(f["cookie"], zero)["packets"]),
+                           "bytes": int(f["bytes"]) - int(old.get(f["cookie"], zero)["bytes"])}
+                          for f in after["flows"] if f["cookie"] not in stale]
                 result = await task
                 r.record(f"iperf-{streams}-console", {"rc": result.rc, "stdout": result.stdout})
                 assert result.rc == 0, result.stdout
@@ -101,8 +108,18 @@ assert result.returncode == 0, result.stderr
                 r.record(f"iperf-{streams}", record)
                 assert server.returncode == 0 and "error" not in received, record
                 assert received["end"]["sum_received"]["bytes"] > 0, record
-                assert sum(d["in"] == TARGET_LAN_IF and d["sa"] != "0"
-                           and d["packets"] > 1000 for d in deltas) == streams, deltas
+                # Every stream -- each connection iperf reports, its control
+                # connection aside -- is in hardware through the SA. What each
+                # one moves is up to the WAN host as well: its asynchronous
+                # crypto can reorder a stream's ESP ACKs past the SA's replay
+                # window, SEC refuses those as late, as it must, and that
+                # stream stalls for a while. So the streams together must move
+                # in hardware, not each of them (A342).
+                ports = {f"{LAN_INNER}:{c['local_port']}" for c in client["start"]["connected"]}
+                data = [d for d in deltas if d["in"] == TARGET_LAN_IF and d["src"] in ports]
+                assert len(ports) == streams and len(data) == streams, (ports, deltas)
+                assert all(d["sa"] != "0" for d in data), deltas
+                assert sum(d["packets"] for d in data) > 1000 * streams, deltas
                 # The peer's own SA says whether the DUT's ESP was good: no
                 # integrity failure, no replay. The host's MIB also counts
                 # its software crypto shedding load at this rate -- a
