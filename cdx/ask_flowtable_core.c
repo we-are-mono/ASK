@@ -1494,6 +1494,47 @@ u32 ft_port_arriving(const struct net_device *port)
 	return max_t(u32, READ_ONCE(port->mtu), ETH_DATA_LEN);
 }
 
+/* An MTU less the header inserted below it, never wrapping. */
+static u32 ft_mtu_less(u32 mtu, u32 header)
+{
+	return mtu > header ? mtu - header : 0;
+}
+
+/* The largest packet the devices below a direction's route carry for it: the
+ * physical port's MTU, the session's and the tunnel's lower device's, each
+ * less the session and tunnel headers inserted beneath it. A route's MTU is
+ * its logical device's, and a bridge's MTU may be set above its ports' --
+ * br_change_mtu() bounds it by nothing, and OpenWrt gives a bridge a jumbo MTU
+ * a member may not follow -- where Linux then drops at the port whatever the
+ * port's own MTU forbids (is_skb_forwardable()). A tunnel's MTU may be set
+ * above its lower device's less the outer header, which Linux then enforces
+ * on the outer packet. A VLAN device is bounded by its lower one. So a
+ * direction is bounded by this as well as by its route, and hardware never
+ * sends what Linux would not (A340). Under RTNL, which the lower devices are
+ * found under; a change of any of their MTUs retires the direction
+ * (ft_rule_names(), and the devices the walk crossed). */
+u32 ft_port_mtu(const struct cdx_ft_rule *rule)
+{
+	u32 session = rule->out_session.present ? PPPOE_SES_HLEN : 0;
+	/* The largest outer packet: what carries it, less the session. */
+	u32 outer = ft_mtu_less(READ_ONCE(rule->out->mtu), session);
+	struct net_device *lower;
+
+	if (rule->out_session.present) {
+		lower = __dev_get_by_index(&init_net, rule->out_session.lower_ifindex);
+		if (lower)
+			outer = min_t(u32, outer, ft_mtu_less(READ_ONCE(lower->mtu), session));
+	}
+	if (!rule->out_tunnel.present)
+		return outer;
+	/* The device the outer packet leaves by: a ppp device's MTU is already
+	 * net of the session, any other device's is the packet's own. */
+	lower = __dev_get_by_index(&init_net, rule->out_tunnel.lower_ifindex);
+	if (lower)
+		outer = min_t(u32, outer, READ_ONCE(lower->mtu));
+	return ft_mtu_less(outer, rule->out_tunnel.header_size);
+}
+
 /* The session and tunnel header a direction's ingress takes off before the
  * packet reaches the bound its path is measured against. */
 static unsigned int ft_rule_stripped(const struct cdx_ft_rule *rule)
@@ -1688,7 +1729,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	struct flow_match_ports ports;
 	struct flow_match_tcp tcp;
 	const struct flow_action_entry *action;
-	u32 mark;
+	u32 mark, mtu;
 	u8 policer;
 	static const u32 offsets[4] = { 4, 8, 0, 4 };
 	static const u32 masks[4] = { 0x0000ffff, 0, 0, 0xffff0000 };
@@ -1921,12 +1962,17 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    !ft_next_hop(cls, out->out_logical, family, &out->new_dst, next_hop,
 			 &out->next_hop_family) ||
 	    !ft_ipsec_handle(cls, out, out->out_logical, out->in_logical) ||
-	    cls->nf_mtu > out->out_logical->mtu ||
-	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
+	    cls->nf_mtu > out->out_logical->mtu)
 		return ask_refuse(-EOPNOTSUPP);
-	if (!ft_mtu_carried(out, cls->nf_mtu)) {
+	/* The route's MTU, and no more than the port carries (ft_port_mtu()):
+	 * what the bridge would drop above it, the hardware punts or is never
+	 * given, as for any path smaller than what may arrive. */
+	mtu = min_t(u32, cls->nf_mtu, ft_port_mtu(out));
+	if (mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
+		return ask_refuse(-EOPNOTSUPP);
+	if (!ft_mtu_carried(out, mtu)) {
 		ask_dbg(ASK_DBG_DEVICE, "family %u proto %u mtu %u below ingress %s\n",
-			family, out->proto, cls->nf_mtu, netdev_name(out->in_logical));
+			family, out->proto, mtu, netdev_name(out->in_logical));
 		return ask_refuse(-EOPNOTSUPP);
 	}
 	/* A tunnel inside a transform, or a transform inside a tunnel, is a
@@ -1998,7 +2044,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	}
 	if (!ether_addr_equal(ethernet + ETH_ALEN, out->out->dev_addr))
 		return ask_refuse(-ESTALE);
-	out->mtu = cls->nf_mtu;
+	out->mtu = mtu;
 	out->mtu_follows_dev = family == AF_INET6 && !dst_metric_locked(cls->nf_dst, RTAX_MTU);
 	if (!ft_egress_mtu_current(out)) {
 		/* Retired rather than only refused, so Linux makes the flow again

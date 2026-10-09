@@ -262,7 +262,12 @@ not watched. And lowering the bridge's MTU retires the connection as a single
 invalidation, because both directions share a handle; the UDP direction
 leaving by the bridge then stays in software, the path now smaller than what a
 port receives ([architecture.md](architecture.md#native-context-and-admission)),
-while the other is readmitted at the port's.
+while the other is readmitted at the port's. Raising the bridge's MTU above its
+port's -- 9000 over a 1500-byte port, which `br_change_mtu()` allows -- does
+not raise the direction leaving by it: Linux drops at the port what the port's
+MTU forbids (`is_skb_forwardable()`), so that direction is readmitted at the
+port's 1500 rather than the bridge's 9000 (A340), and the one arriving on the
+bridge stays in software.
 
 All of it on the KASAN image, with the adapter's error, fatal and quarantine
 counters at zero afterwards and no suppressed diagnostics.

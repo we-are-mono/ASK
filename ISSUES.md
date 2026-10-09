@@ -336,12 +336,8 @@ result independently of those temporary files.
   offline port in a QMan group of its own; else bound the tree's total depth, in frames, by both pools. Source-verified;
   not reproduced.
 
-- [ ] **A340 — a bridge whose MTU exceeds a member port's offloads frames that port's MTU forbids.** Admission checks a
-  flow's path MTU against the logical egress device only (`cls->nf_mtu > out->out_logical->mtu`,
-  `ask_flowtable_core.c`), never the physical port under it. A bridge MTU set above a member's, which
-  `br_change_mtu()` allows, then puts frames up to the bridge's MTU into hardware out of a member with a smaller one:
-  the bridge in software drops them (`is_skb_forwardable()`), the port sends them. Fix: refuse when the path MTU
-  exceeds the physical egress port's too. Source-verified by the review of the A335 follow-up; not reproduced.
+- [x] **A340 — a bridge whose MTU exceeds a member port's offloaded frames that port's MTU forbids.** A direction's MTU
+  is now also bounded by what its physical port carries (_:/^flowtable: bound a direction's MTU by the port it leaves by_).
 
 - [x] **A341 — a stalled port's forwarding queue could hold the Ethernet buffer pool every DPAA port shares.** Its group
   now counts frames, at most half the port's own seed (_:/^cdx: bound a port's forwarding queues by the buffers they hold_).
@@ -351,6 +347,15 @@ result independently of those temporary files.
 
 - [x] **A339 — frames FMan drops after receiving them were counted nowhere standard.** Refused enqueues are now
   `rx_dropped`, no-buffer drops `rx_missed_errors` (_:/^cdx: count a port's frames where they leave and where they are lost_).
+
+- [ ] **A346 — a bridge raised above its port counts as receiving frames the port refuses.** What may arrive on a
+  direction's ingress is `ft_arriving()`: the larger of the logical device's MTU and what the port's MAC accepts
+  (`ft_port_arriving()`). A bridge's MTU set above its port's -- 9000 over 1500 -- makes that 9000, though patch 109
+  programs the port's MAXFRM from its own MTU and it receives nothing past about 1500 and its tags. A UDP direction
+  arriving on such a bridge is then kept in software for a path of 1500 that what actually arrives fits: offload lost,
+  nothing wrong on the wire. Fix direction: bound the logical device's term by the port's, after checking what a Wi-Fi
+  VAP's ingress, which has no DPAA MAC, needs from it. Found by the review of A340; seen in
+  `flowtable_bridge.py::test_bridge_above_its_port`, whose forward direction stays in software.
 
 - [ ] **A343 — FMan wedged once after a LAN port was held paused with thousands of offloaded frames queued.** Right
   after `flowtable_ipsec_stalled_port.py` held eth3 in 802.3x PAUSE for 4 s from the LAN VM, an FMan host command timed

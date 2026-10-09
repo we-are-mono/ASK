@@ -277,7 +277,10 @@ the flow against whatever session exists then.
 What the adapter depends on otherwise is the ppp device itself: its MTU — which
 arrives at 1492 without anyone setting it, the eight bytes of overhead already
 in it — its link state and its removal, all through `ft_entry_uses()` on
-`out_logical`/`in_logical`.
+`out_logical`/`in_logical`. The ppp MTU counts for no more than the device
+below the session carries less those eight bytes (`ft_port_mtu()`): a ppp MTU
+set to 1500 over a 1500-byte port, outside RFC 4638's baby jumbo frames, is
+held to 1492, the frame the hardware would otherwise send being 1508 (A340).
 
 ## Verification
 

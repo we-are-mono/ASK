@@ -2766,6 +2766,23 @@ static void test_bridge(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     br.mst = false;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    /* A bridge's MTU may be raised above its port's, and Linux then drops
+     * at the port whatever the port's own MTU forbids, so the direction
+     * describes the port's MTU rather than the route's (A340): what arrives
+     * fits it, so it stays in hardware at 1500. A port as large carries the
+     * bridge's whole; one smaller than what may arrive keeps a UDP direction
+     * in software and a TCP one in hardware at the port's. */
+    br.mtu = cls.nf_mtu = 9000;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 1500);
+    out.mtu = 9000;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 9000);
+    out.mtu = 1400;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    bridge_out_fixture(); tcp_flow();
+    br.mtu = cls.nf_mtu = 9000; out.mtu = 1400;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 1400);
+    br.mtu = out.mtu = 1500;
+    bridge_out_fixture();
 
     for (unsigned hook = NF_BR_LOCAL_OUT; hook <= NF_BR_POST_ROUTING; hook++) {
         bridge_hooks = BIT(hook);
@@ -3502,8 +3519,13 @@ static void test_pppoe(void)
     /* The Ethernet source is still the port's, exactly as for a tagged flow. */
     assert(!memcmp(decoded.src_mac, out.dev_addr, ETH_ALEN));
     /* The MTU is the ppp device's, which already accounts for the eight bytes
-     * the session header costs; nothing here has to subtract them. */
+     * the session header costs. */
     assert(decoded.mtu == 1492 && ppp.mtu == 1492);
+    /* A ppp device set larger than that is held to what the port carries
+     * with the session header on, which is what the hardware inserts (A340). */
+    pppoe_out_fixture(); ppp.mtu = cls.nf_mtu = 1500;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 1492);
+    ppp.mtu = 1492;
     /* UDP from a 1500-byte LAN into the session would be fragmented by the
      * microcode, so it stays in software; the other way it fits the LAN.
      * An ingress session counts eight bytes less of the frame. */
@@ -4289,6 +4311,13 @@ static void test_tunnel(void)
     assert(decoded.out_tunnel.lower_ifindex == out_tag.ifindex);
     assert(decoded.out == &out && decoded.out_logical == &ip6tnl);
     assert(!memcmp(decoded.dst_mac, OUTER_MAC, ETH_ALEN));
+    assert(decoded.mtu == ip6tnl.mtu);
+    /* A device below the tunnel smaller than the tunnel's MTU allows for
+     * holds the direction to what it carries less the outer header, as
+     * Linux holds the outer packet to it (A340). */
+    out_tag.mtu = 1400;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 1400 - 40);
+    out_tag.mtu = 1500;
 
     /* And over a bridge, where the device below the tunnel has no tag of its
      * own but does have a bridge hop the walk must still cross. */

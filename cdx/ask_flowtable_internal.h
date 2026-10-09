@@ -773,6 +773,7 @@ int ft_bridge_vlan(struct net_device *bridge, struct net_device *port,
 		   struct cdx_ft_vlan *stack, unsigned int *count);
 bool ft_tunnel_dev(const struct net_device *dev);
 u32 ft_port_arriving(const struct net_device *port);
+u32 ft_port_mtu(const struct cdx_ft_rule *rule);
 bool ft_invalid_complete(void);
 bool ft_can_rearm(void);
 void ft_rearm(void);

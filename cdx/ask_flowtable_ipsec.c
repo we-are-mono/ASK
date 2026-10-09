@@ -55,15 +55,19 @@ static u32 ft_ipsec_esp_mtu(struct xfrm_state *x, u32 mtu)
  * peer while one is current, else the route's own, else its device's
  * (dst_mtu()), so a hop narrower than the port -- a DSL modem at 1492 -- is
  * in it, and so is a port whose MTU changed after the SA was installed; the
- * SA's own figures date from its install and see neither.
+ * SA's own figures date from its install and see neither. `port` is what the
+ * devices below the route carry (ft_port_mtu()); an SA's device is the
+ * physical port itself, so it bounds only a route whose MTU metric exceeds
+ * the port's (A340).
  *
  * False when the expansion does not fit the byte the classifier carries it in
  * (hdr_xpnd_sz), which no admitted transform comes near.
  */
 static bool ft_ipsec_bound(struct xfrm_state *x, const struct dst_entry *outer,
-			   u16 *mtu, u8 *expansion)
+			   u32 port, u16 *mtu, u8 *expansion)
 {
-	u32 path = dst_mtu(outer), inner = ft_ipsec_esp_mtu(x, path);
+	u32 path = min_t(u32, dst_mtu(outer), port);
+	u32 inner = ft_ipsec_esp_mtu(x, path);
 
 	if (path <= inner || path - inner > U8_MAX)
 		return false;
@@ -256,14 +260,14 @@ static bool ft_ipsec_record(const struct xfrm_state *x,
  * not own: without it a matching policy releases the reference the caller
  * borrowed.
  *
- * The sending end also takes its bound from the same bundle, into `sa_mtu`
- * and `sa_expansion` when given (ft_ipsec_bound()).
+ * The sending end also takes its bound from the same bundle and `port`, into
+ * `sa_mtu` and `sa_expansion` when given (ft_ipsec_bound()).
  */
 static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 			     struct net_device *dev,
 			     const struct ft_ipsec_receiver *recv,
 			     u16 *handle, struct xfrm_state **received,
-			     u16 *sa_mtu, u8 *sa_expansion)
+			     u32 port, u16 *sa_mtu, u8 *sa_expansion)
 {
 	struct dst_entry *bundle;
 	struct xfrm_state *x;
@@ -322,7 +326,7 @@ static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 	x = ft_ipsec_offloaded(bundle, dev);
 	ok = x ? ft_ipsec_record(x, recv, handle, received) : !!recv;
 	if (ok && x && !recv && sa_mtu &&
-	    !ft_ipsec_bound(x, xfrm_dst_child(bundle), sa_mtu, sa_expansion))
+	    !ft_ipsec_bound(x, xfrm_dst_child(bundle), port, sa_mtu, sa_expansion))
 		ok = false;
 	/* Releases the whole chain, including the reference the bundle took
 	 * over from us above. */
@@ -529,14 +533,14 @@ bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 		goto denied;
 	ft_ipsec_flowi(rule, false, out, mark, &fl);
 	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, NULL, &rule->sa_handle, NULL,
-			      &rule->sa_mtu, &rule->sa_expansion))
+			      ft_port_mtu(rule), &rule->sa_mtu, &rule->sa_expansion))
 		goto denied;
 	/* Both directions share one Linux generation. Validate both receiving
 	 * ends even when their SAs exist: policy may now require a different
 	 * transform, or forbid the tuple altogether. */
 	ft_ipsec_receiver(cls, rule, true, &recv);
 	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, &recv, &reverse_in,
-			     &received, NULL, NULL))
+			     &received, 0, NULL, NULL))
 		goto denied;
 	allowed = ft_ipsec_receiving(&recv, received);
 	if (received)
@@ -546,7 +550,7 @@ bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 	ft_ipsec_flowi(rule, true, in, mark, &fl);
 	ft_ipsec_receiver(cls, rule, false, &recv);
 	if (!ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, &recv,
-			     &rule->in_sa_handle, &received, NULL, NULL))
+			     &rule->in_sa_handle, &received, 0, NULL, NULL))
 		goto denied;
 	allowed = ft_ipsec_receiving(&recv, received);
 	if (received)

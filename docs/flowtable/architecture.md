@@ -116,8 +116,13 @@ RTNL. An OS rename preserves identity and forwarding semantics.
 Both borrowed routes are checked under RTNL before insertion. The egress route
 must be valid unicast IPv4 on the selected port, without XFRM, lightweight tunnel
 state or an IPv6 gateway. The driver uses Linux's selected route rather than
-repeating policy routing with incomplete packet context. Effective MTU must be
-at least 68 and no greater than the egress device MTU.
+repeating policy routing with incomplete packet context. The route's MTU must be
+no greater than the egress device MTU; the effective MTU is the smaller of it
+and what the devices below carry -- the physical port, and a session's or
+tunnel's lower device, less the headers inserted beneath (`ft_port_mtu()`) --
+and must be at least 68. A bridge's MTU may be set above its ports', and Linux
+then drops at the port what the port's MTU forbids, so the hardware never sends
+it either (A340).
 
 A direction of either family that is neither TCP nor, for IPv4, to or from an
 SA is admitted only while nothing larger than its MTU can arrive

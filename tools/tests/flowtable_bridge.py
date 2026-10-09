@@ -28,7 +28,7 @@ from ask_orch.client import Agent
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        dut_vlan_subif, lan_run, lan_vlan_subif)
 from _flowtable_rig import (DPORT, Echo, SPORT, WAN_IP, Rig, assert_undisturbed, command, read,
-                            release_latch)
+                            release_latch, stop_boot_daemon)
 from _gated_tcp import GatedTcp
 
 BRIDGE = "br-ft"
@@ -183,6 +183,7 @@ async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
     r.proto = "tcp" if shape == "tcp" else "udp"
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
+    await stop_boot_daemon()
     initial = await release_latch(r)
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     r.wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
@@ -308,6 +309,21 @@ async def _established(r, count=64):
                              k in ("invalidated", "invalidation_done", "rearms",
                                    "errors", "rejects", "busy", "installs", "deletes")))
     return flows, {c: after[c] - before[c] for c in before}
+
+
+async def _settled(r, expected, since=None):
+    """`expected` maps the egress port of each direction hardware should hold
+    to the MTU it should describe; `since`, a state the directions must have
+    been installed after. Readmission needs traffic, so each attempt sends
+    before it looks; nothing re-offers a retired flow on its own."""
+    for _ in range(10):
+        await r.exchange(count=4)
+        state = await r.state()
+        if (sorted(f["out"] for f in state["flows"]) == sorted(expected)
+                and all(int(f["mtu"]) == expected[f["out"]] for f in state["flows"])
+                and (since is None or state["installs"] > since["installs"])):
+            return state
+    pytest.fail(f"flow did not settle at {expected}: {state}")
 
 
 def _assert_ports(r, forward, reverse):
@@ -563,36 +579,49 @@ async def test_device_retires(bridge_rig):
     """
     r = bridge_rig
     await r.table()
-
-    async def settled(expected, since=None):
-        """`expected` maps the egress port of each direction hardware should
-        hold to the MTU it should describe; `since`, a state the directions
-        must have been installed after. Readmission needs traffic, so each
-        attempt sends before it looks; nothing re-offers a retired flow on its
-        own."""
-        for _ in range(10):
-            await r.exchange(count=4)
-            state = await r.state()
-            if (sorted(f["out"] for f in state["flows"]) == sorted(expected)
-                    and all(int(f["mtu"]) == expected[f["out"]] for f in state["flows"])
-                    and (since is None or state["installs"] > since["installs"])):
-                return state
-        pytest.fail(f"flow did not settle at {expected}: {state}")
-
-    before = await settled({TARGET_LAN_IF: 1500, TARGET_WAN_IF: 1500})
+    before = await _settled(r, {TARGET_LAN_IF: 1500, TARGET_WAN_IF: 1500})
     await command(r.target, r.session, "ip", "link", "set", BRIDGE, "mtu", "1400")
     try:
         invalidated = await r.wait(
             lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
         # Installed since, so a state caught mid-retirement cannot pass for
         # the readmitted one.
-        reduced = await settled({TARGET_WAN_IF: 1500}, since=before)
+        reduced = await _settled(r, {TARGET_WAN_IF: 1500}, since=before)
         assert reduced["errors"] == before["errors"], reduced
         assert reduced["rejects"] > invalidated["rejects"], (invalidated, reduced)
         r.record("bridge-mtu", {"before": before, "invalidated": invalidated,
                                 "reduced": reduced})
     finally:
         await command(r.target, r.session, "ip", "link", "set", BRIDGE, "mtu", "1500",
+                      check=False)
+
+
+async def test_bridge_above_its_port(bridge_rig):
+    """A bridge's MTU may be set above its ports' -- br_change_mtu() allows it,
+    as OpenWrt does when a bridge is given a jumbo MTU its members are not --
+    and Linux then drops at the port whatever the port's own MTU forbids
+    (is_skb_forwardable()). The direction leaving by the bridge describes the
+    port's MTU, not the bridge's, so hardware never sends what the bridge
+    would have dropped (A340).
+
+    The reverse, arriving on the WAN port, fits the port's 1500 bytes and stays
+    in hardware. The forward now arrives on a 9000-byte bridge, which a WAN
+    path of 1500 cannot carry, and stays in Linux as on any jumbo LAN."""
+    r = bridge_rig
+    await r.table()
+    port_mtu = int((await read(r.target, r.session,
+                               f"/sys/class/net/{TARGET_LAN_IF}/mtu")).strip())
+    before = await _settled(r, {TARGET_LAN_IF: port_mtu, TARGET_WAN_IF: port_mtu})
+    await command(r.target, r.session, "ip", "link", "set", BRIDGE, "mtu", "9000")
+    try:
+        assert int((await read(r.target, r.session,
+                               f"/sys/class/net/{TARGET_LAN_IF}/mtu")).strip()) == port_mtu
+        await r.wait(lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
+        raised = await _settled(r, {TARGET_LAN_IF: port_mtu}, since=before)
+        assert raised["errors"] == before["errors"], raised
+        r.record("bridge-above-port", {"before": before, "raised": raised})
+    finally:
+        await command(r.target, r.session, "ip", "link", "set", BRIDGE, "mtu", str(port_mtu),
                       check=False)
 
 

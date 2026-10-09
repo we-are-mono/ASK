@@ -209,7 +209,10 @@ it to the CPU and forwarding it in software while every counter said the flow
 was offloaded — the defect the IPsec increment measured at 0.07 Gb/s. So the
 egress direction is programmed with the tunnel MTU plus the outer header size,
 which is the arithmetic the legacy owner's tunnel-interface path in `devman.c`
-already did. The full-MTU case below is the proof: a datagram that exactly fills
+already did. The tunnel MTU counts for no more than the device below the
+tunnel carries less the outer header (`ft_port_mtu()`): a tunnel's MTU can be
+set above that by hand, and Linux then holds the outer packet to the lower
+device's MTU, so the hardware does too (A340). The full-MTU case below is the proof: a datagram that exactly fills
 the tunnel MTU is carried in hardware rather than excepted.
 
 An egress direction of either mode other than TCP stays in software from an

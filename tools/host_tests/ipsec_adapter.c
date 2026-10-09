@@ -1244,6 +1244,15 @@ static struct neighbour *dst_neigh_lookup(struct dst_entry *dst, const void *key
 	neigh_refs++;
 	return route_neigh;
 }
+/* What the physical port carries for a direction, the core's to answer
+ * (ft_port_mtu()): set below the outer route's MTU, it stands for a bridge
+ * raised above its port. */
+static u32 port_mtu = 65535;
+u32 ft_port_mtu(const struct cdx_ft_rule *rule)
+{
+	(void)rule;
+	return port_mtu;
+}
 
 #include "ipsec_production.inc"
 
@@ -2438,7 +2447,7 @@ static void test_resolve(void)
 
 	/* No destination at all is not a refusal: a direction with nothing to
 	 * ask about is a plain one. */
-	assert(ft_ipsec_resolve(NULL, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(NULL, &fl, &WAN, NULL, &handle, NULL, 0, NULL, NULL));
 	assert(handle == 0);
 
 	/* A carried transform must not preserve a policy that has since been
@@ -2448,14 +2457,14 @@ static void test_resolve(void)
 		struct dst_entry carried = { .ops = &v4_ops, .xfrm = x,
 					     .child = &under, .refs = 1 };
 
-		assert(ft_ipsec_resolve(&carried, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+		assert(ft_ipsec_resolve(&carried, &fl, &WAN, NULL, &handle, NULL, 0, NULL, NULL));
 		assert(handle == 0 && policy_lookups == 1 && under.refs == 1);
 		assert(carried.refs == 1);	/* borrowed, and given back */
 	}
 
 	/* No policy covers the tuple: an ordinary plain end, with the
 	 * reference taken to ask handed back. */
-	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, 0, NULL, NULL));
 	assert(handle == 0 && plain.refs == 1 && policy_lookups == 2);
 
 	/* Nothing resolved, but under a template -- an optional one whose SA
@@ -2463,15 +2472,15 @@ static void test_resolve(void)
 	 * the SA appears, where Linux encrypts; so it is refused. The far end's
 	 * frames arrive plain either way, and policy accepts them. */
 	out_template_unresolved = true;
-	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, 0, NULL, NULL));
 	assert(handle == 0 && plain.refs == 1);
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, 0, NULL, NULL));
 	assert(plain.refs == 1);
 	/* Unless the route's device has disable_xfrm: Linux then sends by it
 	 * without asking policy, and so does hardware. */
 	out_plain_asks = 0;
 	plain.flags = DST_NOXFRM;
-	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, 0, NULL, NULL));
 	assert(plain.refs == 1 && out_plain_asks == 0);
 	plain.flags = 0;
 	out_template_unresolved = false;
@@ -2482,7 +2491,7 @@ static void test_resolve(void)
 	 * to leave the borrowed destination exactly as it was found. */
 	policy_answer(WAN.ifindex, &bundle);
 	bundle.refs = 0;
-	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, 0, NULL, NULL));
 	assert(handle == 5);
 	assert(plain.refs == 1 && bundle.refs == 0);
 
@@ -2492,12 +2501,12 @@ static void test_resolve(void)
 	 * say -- which is how fifty-nine packets went out in the clear. */
 	memset(policy_answers, 0, sizeof(policy_answers));
 	policy_error = -EINVAL;
-	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, 0, NULL, NULL));
 	assert(plain.refs == 1);
 
 	/* The same answer at the receiving end is not a refusal: nothing has
 	 * been decrypted, so nothing is arriving that this tuple could miss. */
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, 0, NULL, NULL));
 	policy_error = 0;
 
 	/* A policy resolving to a transform the hardware cannot carry refuses
@@ -2506,10 +2515,10 @@ static void test_resolve(void)
 	policy_answer(WAN.ifindex, &bundle);
 	bundle.refs = 0;
 	x->xso.type = XFRM_DEV_OFFLOAD_CRYPTO;
-	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, NULL, NULL));
+	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL, 0, NULL, NULL));
 	assert(plain.refs == 1 && bundle.refs == 0);
 	bundle.refs = 0;
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, NULL, NULL));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &recv, &handle, NULL, 0, NULL, NULL));
 	assert(handle == 0 && plain.refs == 1 && bundle.refs == 0);
 	x->xso.type = XFRM_DEV_OFFLOAD_PACKET;
 	sa_pool[0].handle = 0;
@@ -2693,6 +2702,15 @@ static void test_handle_and_flowi(void)
 	bundle.refs = 0;
 	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
 	assert(rule.sa_mtu == 1422 && rule.sa_expansion == 70);
+	/* So does a port narrower than its route, which a bridge whose MTU was
+	 * raised above its port's leaves the route unaware of (A340). */
+	forward.mtu = 9000;
+	port_mtu = 1492;
+	bundle.refs = 0;
+	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
+	assert(rule.sa_mtu == 1422 && rule.sa_expansion == 70);
+	port_mtu = 65535;
+	forward.mtu = 1492;
 	/* An expansion past the byte the classifier carries it in is refused
 	 * rather than wrapped, the generation with it. */
 	x->props.header_len = 300;
