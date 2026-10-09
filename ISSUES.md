@@ -342,14 +342,8 @@ result independently of those temporary files.
 - [x] **A346 — a bridge raised above its port counted as receiving frames the port refuses.** What arrives is now the
   port's bound alone, before RTNL too (_:/^flowtable: bound what arrives by the port it arrives on_).
 
-- [ ] **A343 — FMan wedged once after a LAN port was held paused with thousands of offloaded frames queued.** Right
-  after `flowtable_ipsec_stalled_port.py` held eth3 in 802.3x PAUSE for 4 s from the LAN VM, an FMan host command timed
-  out (`hc.c:306 EnQFrm: Operation Timed Out`), two flowtable deletes stayed unproven (`quarantine 2`, `rearm_ready
-  0`), and eth3 never transmitted again -- not the kernel's own pings either -- while its mEMAC read as at boot
-  (`command_config 00020843`, `if_status 00002000`). Only a reboot recovered it. Seen once in about seven runs of the
-  PAUSE cases; recalls A305. What holds FMan is unknown. A341 cut what a paused port holds from ~12,500 small frames to
-  1,280, and the next 16 PAUSE cases on that image, run back to back, left no host-command timeout and every port
-  sending; keep open until a cause is found or a longer soak stays clean.
+- [x] **A343 — FMan wedged once after a LAN port was held paused with ~12,500 offloaded frames queued.** Not reproduced
+  in 56 PAUSE cases since A341 bounded what a paused port holds; reopen on any `EnQFrm` timeout (_:/^issues: close A343 as not reproduced_).
 
 - [x] **A344 — the queues into SEC had no bound by default.** Every SA's input queue now joins one frame-counted group
   at a share of the Ethernet pool (_:/^cdx: bound SEC's input queues by the buffers they hold_).
