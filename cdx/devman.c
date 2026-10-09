@@ -86,9 +86,10 @@
  *        ioctl publishes fresh nodes under dpa_cfg_lock only — but
  *        fresh-node publication can't invalidate a reader. The
  *        spinlock covers readers outside the mutex
- *        (virt_iface_stats_callback via dev_get_stats, and
+ *        (virt_iface_stats_callback via dev_get_stats, which reads a
+ *        port's tx_wire and BMI drop counts, and
  *        dpa_port_counters_sample from the statistics sampler, which
- *        both advance a port's tx_wire and BMI drop counts) and any
+ *        carries the BMI counts past their wrap) and any
  *        reader that wants local invariants. Lock-free lookups
  *        under the mutex lean on the remove-side invariant; see
  *        dpa_get_iface_stats_entries. The lock-free walkers that
@@ -2335,18 +2336,50 @@ static u64 memac_counter(u32 __iomem *low, u32 __iomem *high)
 
 /* The octets of a PAUSE frame on the wire, FCS included: a minimum frame. */
 #define MEMAC_PAUSE_OCTETS	(ETH_ZLEN + ETH_FCS_LEN)
+/* How many times a reading of the MAC's counts is taken again when something
+ * left the port while it was under way. */
+#define MEMAC_TX_TRIES		4
+/* And how many times, MEMAC_TX_PRIME_GAP_US apart, for the reading every
+ * later one is measured from (port_counters_prime()): a millisecond or two of
+ * them, for a port only the kernel sends by yet, which leaves a quiet moment
+ * far sooner. */
+#define MEMAC_TX_PRIME_TRIES	200
+#define MEMAC_TX_PRIME_GAP_US	5
 
-/* What the port's MAC has transmitted: every good frame that left by it,
- * whoever queued it, and their octets with the FCS. The MAC counts the PAUSE
- * frames it sends itself among them -- transmit pause is on by default -- and
- * those are no frame anybody sent, so they come out. Every MAC of the FMan v3
- * CDX drives is an mEMAC. False for a port that has no MAC to read. Registers
- * only; any context. */
-static bool port_mac_tx(const struct eth_iface_info *eth, u64 *frames, u64 *octets)
+/* The good frames the port's MAC sent for somebody: its unicast, multicast and
+ * broadcast counts, which -- measured on the rig -- leave out the PAUSE frames
+ * it sends itself, where its count of all good frames (TFRM) has them. A sum
+ * of counts that only grow, so a later reading is never below an earlier one,
+ * whenever each of its three counts was read. */
+static u64 memac_tx_frames(struct memac_regs __iomem *regs)
+{
+	return memac_counter(&regs->tuca_l, &regs->tuca_u) +
+	       memac_counter(&regs->tmca_l, &regs->tmca_u) +
+	       memac_counter(&regs->tbca_l, &regs->tbca_u);
+}
+
+/* What the port's MAC has transmitted for somebody: every good frame that left
+ * by it, whoever queued it, and their octets with the FCS. Its octet count has
+ * the PAUSE frames it sends itself among them -- transmit pause is on by
+ * default -- which no one sent, so they come out, and nothing counts those
+ * octets alone: a PAUSE frame sent between the reads of the two counts would
+ * read as 64 octets of data, and a data frame between the frames' read and the
+ * octets' as octets without a frame. So the reading is taken whole, between
+ * two reads of the frames and PAUSE counts that agree, or again, `tries' times
+ * in all; *whole says whether one was. One that was not is a moment off, with
+ * the frames and PAUSE counts read after the octets: whatever left meanwhile
+ * then reads as fewer octets, never more, which a reading measured from a whole
+ * one keeps no count of (port_tx_from_wire()) -- but which, taken as where
+ * every later reading is measured from, would read each of them high for good,
+ * so no base is ever taken from one (port_counters_prime()). Every MAC of the
+ * FMan v3 CDX drives is an mEMAC. False for a port that has no MAC to read.
+ * Registers only; any context. */
+static bool port_mac_tx(const struct eth_iface_info *eth, int tries, bool *whole,
+			u64 *frames, u64 *octets)
 {
 	struct mac_device *mac;
 	struct memac_regs __iomem *regs;
-	u64 pause;
+	u64 frames_before, pause_before, pause, all;
 
 	if (!dpa_netdev_is_dpaa(eth->net_dev))
 		return false;
@@ -2354,20 +2387,16 @@ static bool port_mac_tx(const struct eth_iface_info *eth, u64 *frames, u64 *octe
 	regs = mac ? (struct memac_regs __iomem *)mac->vaddr : NULL;
 	if (!regs)
 		return false;
-	pause = memac_counter(&regs->txpf_l, &regs->txpf_u);
-	*frames = memac_counter(&regs->tfrm_l, &regs->tfrm_u) - pause;
-	*octets = memac_counter(&regs->toct_l, &regs->toct_u) - pause * MEMAC_PAUSE_OCTETS;
+	do {
+		frames_before = memac_tx_frames(regs);
+		pause_before = memac_counter(&regs->txpf_l, &regs->txpf_u);
+		all = memac_counter(&regs->toct_l, &regs->toct_u);
+		pause = memac_counter(&regs->txpf_l, &regs->txpf_u);
+		*frames = memac_tx_frames(regs);
+		*whole = pause == pause_before && *frames == frames_before;
+	} while (!*whole && --tries);
+	*octets = all - pause * MEMAC_PAUSE_OCTETS;
 	return true;
-}
-
-/* A count's advance since it was last read. Nothing clears these at run time;
- * a count that went back anyway adds nothing, and is counted on from there. */
-static u64 port_advance(u64 now, u64 *last)
-{
-	u64 advance = now > *last ? now - *last : 0;
-
-	*last = now;
-	return advance;
 }
 
 /* A port's transmit counters as what its MAC sent (A338). An offloaded frame
@@ -2375,20 +2404,64 @@ static u64 port_advance(u64 now, u64 *last)
  * decided; one an egress congestion group then refused never left, and a
  * paused or congested port read as sending what it dropped. The MAC counts
  * only what left -- the kernel's own frames, offloaded unicast and multicast
- * alike -- so the netdev's counts at the first reading carry on by the MAC's
- * advance. Octets come with the FCS, which a netdev's bytes leave out. */
+ * alike -- so the netdev's counts as CDX took the port carry on by the MAC's
+ * advance since: its counts now less those it had then, not a sum of steps,
+ * so a reading a moment off -- one whose retries ran out, which can only read
+ * low -- is passed over rather than kept, and nothing is reported below what
+ * was reported before (A349). Octets come with the FCS, which a netdev's
+ * bytes leave out.
+ *
+ * Where they carry on from is only ever taken from a whole reading. A port
+ * whose MAC never stood still while CDX took it (port_counters_prime()) goes
+ * on as one without a MAC -- the driver's counts and the enqueue's, `enqueued'
+ * -- until a reading here is whole, and carries on from exactly what it
+ * reported then. Nothing clears the MAC's counts at run time; were they reset,
+ * the frames would read fewer, and the counts carry on from where they stood,
+ * at the first whole reading after. */
 static bool port_tx_from_wire(struct eth_iface_info *eth,
-			      struct rtnl_link_stats64 *storage)
+			      struct rtnl_link_stats64 *storage,
+			      const struct cdx_ft_stats *enqueued)
 {
-	u64 frames, octets;
+	u64 frames, octets, sent;
+	bool whole;
+	s64 bytes;
 
-	if (!eth->tx_wire.ready || !port_mac_tx(eth, &frames, &octets))
+	if (!port_mac_tx(eth, MEMAC_TX_TRIES, &whole, &frames, &octets))
 		return false;
-	eth->tx_wire.frames += port_advance(frames, &eth->tx_wire.mac_frames);
-	eth->tx_wire.octets += port_advance(octets, &eth->tx_wire.mac_octets);
-	storage->tx_packets = eth->tx_wire.base_packets + eth->tx_wire.frames;
-	storage->tx_bytes = eth->tx_wire.base_bytes + eth->tx_wire.octets -
-			    ETH_FCS_LEN * eth->tx_wire.frames;
+	if (!eth->tx_wire.ready) {
+		if (!whole)
+			return false;
+		eth->tx_wire.base_packets = storage->tx_packets + enqueued->packets;
+		eth->tx_wire.base_bytes = storage->tx_bytes + enqueued->bytes;
+		eth->tx_wire.packets = eth->tx_wire.base_packets;
+		eth->tx_wire.bytes = eth->tx_wire.base_bytes;
+		eth->tx_wire.mac_frames = eth->tx_wire.last_frames = frames;
+		eth->tx_wire.mac_octets = octets;
+		eth->tx_wire.ready = true;
+	}
+	/* The frames only grow, whole reading or not, so fewer than the last
+	 * reading had is a reset. One not whole leaves the last reading as it
+	 * was, so that the next whole one sees the reset too, and counts on. */
+	if (frames < eth->tx_wire.last_frames) {
+		if (!whole) {
+			storage->tx_packets = eth->tx_wire.packets;
+			storage->tx_bytes = eth->tx_wire.bytes;
+			return true;
+		}
+		eth->tx_wire.base_packets = eth->tx_wire.packets;
+		eth->tx_wire.base_bytes = eth->tx_wire.bytes;
+		eth->tx_wire.mac_frames = frames;
+		eth->tx_wire.mac_octets = octets;
+	}
+	eth->tx_wire.last_frames = frames;
+	sent = frames - eth->tx_wire.mac_frames;
+	bytes = (s64)eth->tx_wire.base_bytes + (s64)(octets - eth->tx_wire.mac_octets) -
+		ETH_FCS_LEN * (s64)sent;
+	eth->tx_wire.packets = max(eth->tx_wire.packets, eth->tx_wire.base_packets + sent);
+	if (bytes > (s64)eth->tx_wire.bytes)
+		eth->tx_wire.bytes = bytes;
+	storage->tx_packets = eth->tx_wire.packets;
+	storage->tx_bytes = eth->tx_wire.bytes;
 	return true;
 }
 
@@ -2440,18 +2513,29 @@ static void port_rx_drops_advance(struct eth_iface_info *eth)
  * offloaded through it: the driver's own transmit counts and the MAC's, which
  * transmit carries on from, and the BMI's drops, which receive adds from.
  * Read here rather than at the first dev_get_stats(), which nothing promises
- * comes before the first offloaded frame. The port is not yet on the list. */
+ * comes before the first offloaded frame. The port is not yet on the list.
+ * Only a whole reading of the MAC is taken (port_mac_tx()); a port that never
+ * gives one here is left to the first reading that does (port_tx_from_wire()).
+ * Process context; waits a millisecond or two at the most. */
 static void port_counters_prime(struct eth_iface_info *eth)
 {
 	const struct net_device_ops *ops = eth->net_dev->netdev_ops;
 	struct rtnl_link_stats64 own = { 0 };
 	u64 frames, octets;
+	bool whole = false;
+	int tries;
 
-	if (ops->ndo_get_stats64 && port_mac_tx(eth, &frames, &octets)) {
+	for (tries = 0; ops->ndo_get_stats64 && tries < MEMAC_TX_PRIME_TRIES; tries++) {
+		if (tries)
+			udelay(MEMAC_TX_PRIME_GAP_US);
+		if (!port_mac_tx(eth, 1, &whole, &frames, &octets) || whole)
+			break;
+	}
+	if (whole) {
 		ops->ndo_get_stats64(eth->net_dev, &own);
-		eth->tx_wire.base_packets = own.tx_packets;
-		eth->tx_wire.base_bytes = own.tx_bytes;
-		eth->tx_wire.mac_frames = frames;
+		eth->tx_wire.base_packets = eth->tx_wire.packets = own.tx_packets;
+		eth->tx_wire.base_bytes = eth->tx_wire.bytes = own.tx_bytes;
+		eth->tx_wire.mac_frames = eth->tx_wire.last_frames = frames;
 		eth->tx_wire.mac_octets = octets;
 		eth->tx_wire.ready = true;
 	}
@@ -2505,11 +2589,13 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 			 * whole frames. The driver's own rx_bytes excludes the
 			 * Ethernet header, so the record is restated to match
 			 * before the two are added. Transmit comes from the MAC
-			 * instead, where it has one, and the enqueue's count is
-			 * then left out: it includes what never left. */
-			bool wire = port_tx_from_wire(&iface_info->eth_info, storage);
+			 * instead, once a whole reading of it has been taken,
+			 * and the enqueue's count is then left out: it includes
+			 * what never left. */
+			bool wire;
 
 			cdx_ifstats_read(iface_info->stats, &rx, &tx);
+			wire = port_tx_from_wire(&iface_info->eth_info, storage, &tx);
 			cdx_ifstats_fold(storage, rx.bytes, rx.packets,
 					 wire ? 0 : tx.bytes, wire ? 0 : tx.packets,
 					 CDX_IFSTATS_PORT_RX_OVERHEAD, 0);

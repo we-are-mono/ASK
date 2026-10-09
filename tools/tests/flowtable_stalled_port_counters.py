@@ -63,11 +63,11 @@ print(json.dumps({{"links": links, "ports": ports}}))
 
 
 def _mac_frames(mac):
-    """Frames the MAC sent, from its 64-bit registers: its good frames, less
-    the PAUSE frames it sent itself."""
+    """Frames the MAC sent, from its 64-bit registers: its unicast, multicast
+    and broadcast frames, which leave out the PAUSE frames it sends itself."""
     def counter(name):
         return mac.get(f"{name}_l", 0) | mac.get(f"{name}_u", 0) << 32
-    return counter("tfrm") - counter("txpf")
+    return counter("tuca") + counter("tmca") + counter("tbca")
 
 
 def _blast(sock, lan_ip, seconds, size):
@@ -144,6 +144,120 @@ async def test_paused_port_leaves_the_pool(rig):
     assert record["answered"] == PINGS, record
     assert wan["rx_missed_errors"] == 0, record
     assert wan["rx_dropped"] >= record["hits"] - record["wire"] - KERNEL_SLACK, record
+
+
+# The DUT made to send PAUSE frames of its own on its WAN port: for two seconds
+# its receive port draws buffers from a pool that has none and asks for PAUSE
+# as soon as its FIFO holds anything, while the WAN host floods the port with
+# datagrams nothing answers. Both registers are put back. Reads the MAC's
+# transmit registers and the port's standard counters around it, each pair of
+# reads taken again until the MAC sent nothing between them.
+SEND_PAUSE = f'''
+import ctypes, glob, json, mmap, os, subprocess, time
+DEV = {TARGET_WAN_IF!r}
+nodes = {{}}
+for p in glob.glob("/proc/device-tree/soc/**/phandle", recursive=True):
+    nodes[int.from_bytes(open(p, "rb").read(), "big")] = os.path.dirname(p)
+def ref(node, prop):
+    return nodes[int.from_bytes(open(os.path.join(node, prop), "rb").read()[:4], "big")]
+mac_node = ref(os.path.realpath(f"/sys/class/net/{{DEV}}/device/of_node"), "fsl,fman-mac")
+rx_port = ref(mac_node, "fsl,fman-ports")
+bmi = 0x1a00000 + int.from_bytes(open(os.path.join(rx_port, "reg"), "rb").read()[:4], "big")
+fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+regs = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=bmi)
+bman = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0x1890000)
+def reg(m, off):
+    return ctypes.c_uint32.from_buffer(m, off)
+def word(m, off):
+    return int.from_bytes(reg(m, off).value.to_bytes(4, "little"), "big")
+def put(off, value):
+    reg(regs, off).value = int.from_bytes(value.to_bytes(4, "big"), "little")
+def free(bpid):
+    return word(bman, 0x600 + 4 * bpid) & 0x7fffff
+# A pool no receive port draws from and that holds nothing: the starved port's
+# frames then find no buffer at all, rather than one some other port owns.
+used = set()
+for node in glob.glob("/proc/device-tree/soc/fman@1a00000/port@*"):
+    compat = open(os.path.join(node, "compatible"), "rb").read()
+    if b"port-rx" not in compat:
+        continue
+    page = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE,
+                     offset=0x1a00000 + int.from_bytes(open(os.path.join(node, "reg"), "rb").read()[:4], "big"))
+    for i in range(8):
+        info = word(page, 0x100 + 4 * i)
+        if info & 0x80000000:
+            used.add(info >> 16 & 0x3f)
+empty = next(b for b in range(63, 0, -1) if b not in used and free(b) == 0)
+def mac():
+    out = {{}}
+    for line in open(f"/sys/class/net/{{DEV}}/mac_tx_stats"):
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].endswith(":"):
+            out[parts[-1]] = int(parts[1], 16)
+    return {{n: out[n + "_l"] | out[n + "_u"] << 32 for n in ("txpf", "tfrm", "tuca", "tmca", "tbca", "toct")}}
+def snapshot():
+    for _ in range(100):
+        first = mac()
+        stats = {{n: int(open(f"/sys/class/net/{{DEV}}/statistics/{{n}}").read())
+                 for n in ("tx_packets", "tx_bytes")}}
+        if mac() == first:
+            return {{**first, **stats}}
+    raise RuntimeError("the MAC never stood still for a reading")
+rule = ["INPUT", "-i", DEV, "-p", "udp", "--dport", "9", "-j", "DROP"]
+subprocess.run(["iptables", "-I", *rule], check=True)
+rfp, ebmpi = word(regs, 0x00c), word(regs, 0x100)
+try:
+    before = snapshot()
+    time.sleep(1)
+    put(0x00c, rfp & ~0x3ff)
+    put(0x100, (ebmpi & ~0x003f0000) | empty << 16)
+    time.sleep(2)
+finally:
+    put(0x100, ebmpi)
+    put(0x00c, rfp)
+    subprocess.run(["iptables", "-D", *rule])
+time.sleep(1)
+after = snapshot()
+print(json.dumps({{"bpid": empty, "delta": {{k: after[k] - before[k] for k in before}}}}))
+'''
+
+
+def _discard_flood(address, seconds):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    payload, end = bytes(1400), time.monotonic() + seconds
+    try:
+        while time.monotonic() < end:
+            try:
+                sock.sendto(payload, (address, 9))
+            except OSError:
+                pass
+    finally:
+        sock.close()
+
+
+async def test_sent_pause_is_no_frame(rig):
+    """The PAUSE frames a port sends itself are among its MAC's good frames
+    and octets (TFRM, TOCT), and not among its unicast, multicast or broadcast
+    frames, so a port's transmit counts take their frames from the latter and
+    their octets less the PAUSE frames' -- which no one sent (A338, A349). The
+    DUT made to send some, its counts are the MAC's data frames exactly."""
+    r = rig
+    flood = asyncio.create_task(asyncio.to_thread(_discard_flood, r.dut_wan_ip, 8))
+    try:
+        result = await console_python(Console.target(), SEND_PAUSE, timeout=60)
+    finally:
+        await flood
+    record = json.loads(result["stdout"].strip().splitlines()[-1])
+    # The port receives again once its registers are back.
+    record["answered"] = await pings_answered(r.dut_wan_ip, 5, 0.2)
+    r.record("sent-pause", record)
+    assert record["answered"] == 5, record
+    d = record["delta"]
+    frames = d["tuca"] + d["tmca"] + d["tbca"]
+    assert d["txpf"] > 0, record
+    assert d["tfrm"] == frames + d["txpf"], record
+    assert d["tx_packets"] == frames, record
+    assert d["tx_bytes"] == d["toct"] - 64 * d["txpf"] - 4 * frames, record
 
 
 @pytest.mark.parametrize("size", [64, 1400], ids=["small", "full"])

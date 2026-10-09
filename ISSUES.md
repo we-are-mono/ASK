@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A349 — a PAUSE frame sent between the MAC counter reads was counted as transmitted data for good.** Frames come
+  from the MAC's per-cast counts, which hold no PAUSE, from a coherent reading less a base (_:/^cdx: read a port's transmit counts whole_).
+
 - [x] **A289 — one accepted multicast packet authorized other, forbidden UDP ports.** Fixed: a
   confirmed routed group is carried only if `nft_port_dependent()` (patch 148) finds every packet treated alike, else `refused-ports` (_:/^cdx: keep a routed multicast group the ruleset tells apart by port_).
 

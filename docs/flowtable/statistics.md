@@ -240,13 +240,25 @@ A registered port's transmit counters therefore come from its MAC
 (`port_tx_from_wire()` in `cdx/devman.c`): the driver's own counts as CDX
 takes the port, read at registration so nothing offloaded before the first
 reading is lost, carried on by the MAC's advance in good frames and their
-octets less the FCS. The MAC counts every frame that left, whoever queued it
+octets less the FCS. That base is only ever taken from a whole reading of the
+MAC (below); a port that never gives one at registration -- sending without a
+pause the whole time, which a port nothing is offloaded through yet hardly
+does -- reports as a port without a MAC until a reading is whole, and carries
+on from exactly what it reported then, keeping whatever the enqueue counted
+meanwhile. The MAC counts every frame that left, whoever queued it
 -- the kernel's, offloaded unicast and multicast, ESP after SEC, a hardware
-qdisc's -- and none that did not. It counts the PAUSE frames it sends itself
-among them too, transmit pause being on, and those come out again, 64 octets
-each. Its 64-bit counters are read upper half, lower, upper again, since the
-octets' lower half wraps every few seconds at 10G. The enqueue's count is
-still kept, and still read where there is no MAC.
+qdisc's -- and none that did not. The frames are its unicast, multicast and
+broadcast counts (TUCA, TMCA, TBCA). Its count of all good frames (TFRM) and
+its octets (TOCT) also hold the PAUSE frames it sends itself, transmit pause
+being on, as measured on the rig with the DUT made to send some; so the octets
+lose 64 per PAUSE frame (TXPF), and nothing is taken from the frames. A PAUSE
+frame, or a data frame, sent between those reads would leave a reading a frame
+or 64 octets out, so the reading is taken between two reads of the frames and
+PAUSE counts that agree, or again, and each reading is the MAC's counts less
+the base rather than a sum of steps, never reported below the one before
+(A349). Its 64-bit counters are read upper half, lower, upper
+again, since the octets' lower half wraps every few seconds at 10G. The
+enqueue's count is still kept, and still read where there is no MAC.
 
 Receive adds what the port took in and FMan then dropped
 (`port_rx_drops_advance()`), from two of its BMI's counts. An enqueue a

@@ -26,10 +26,11 @@ def test_port_counters(tmp_path):
     assert count and state, "port_bmi_count / tx_wire / rx_discarded"
     (tmp_path / "port_counters_types.inc").write_text(
         count.group() + "struct eth_iface_info {\n\tstruct net_device *net_dev;\n" + state.group() + "};\n")
-    pause = re.search(r"^#define MEMAC_PAUSE_OCTETS\s.*$", source, re.M)
-    assert pause
-    (tmp_path / "port_counters_production.inc").write_text(pause.group() + "\n" + "\n".join(function(source, name) for name in [
-        "fwd_cgr_owner", "memac_counter", "port_mac_tx", "port_advance", "port_tx_from_wire",
+    defines = re.findall(r"^#define (?:MEMAC_PAUSE_OCTETS|MEMAC_TX_TRIES|MEMAC_TX_PRIME_TRIES|"
+                         r"MEMAC_TX_PRIME_GAP_US)\s.*$", source, re.M)
+    assert len(defines) == 4, defines
+    (tmp_path / "port_counters_production.inc").write_text("\n".join(defines) + "\n" + "\n".join(function(source, name) for name in [
+        "fwd_cgr_owner", "memac_counter", "memac_tx_frames", "port_mac_tx", "port_tx_from_wire",
         "port_bmi_read", "port_bmi_advance", "port_rx_drops_advance", "port_counters_prime",
         "dpa_port_counters_sample", "virt_iface_stats_callback",
     ]))

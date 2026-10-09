@@ -95,16 +95,22 @@ struct eth_iface_info {
 	uint32_t fwd_cgr_mtu;
 	/* What the port's counters report while CDX holds it (devman.c), under
 	 * dpa_devlist_lock. Transmit is what its MAC sent: the netdev's own
-	 * counts at the first reading, then the MAC's advance since, which
-	 * offloaded frames an egress group refused never join. Receive adds
-	 * what the port took in and FMan then dropped: frames its enqueues lost
-	 * to a congestion group, as drops, and frames it found no buffer for,
-	 * as missed -- each a 32-bit BMI count carried past its wrap. */
+	 * counts as CDX took the port -- or, if no reading of its MAC was whole
+	 * then, what the port reported at the first that was -- then the
+	 * MAC's advance since, which offloaded frames an egress group refused
+	 * never join: the MAC's counts then less the base taken with them,
+	 * never a sum of clamped steps, and never reported below what was
+	 * reported before. last_frames is the last reading's frames, which
+	 * fewer than says the MAC's counts were reset. Receive
+	 * adds what the port took in and FMan then dropped: frames its enqueues
+	 * lost to a congestion group, as drops, and frames it found no buffer
+	 * for, as missed -- each a 32-bit BMI count carried past its wrap. */
 	struct {
 		bool ready;
 		u64 base_packets, base_bytes;
 		u64 mac_frames, mac_octets;
-		u64 frames, octets;
+		u64 last_frames;
+		u64 packets, bytes;
 	} tx_wire;
 	struct port_bmi_count rx_discarded, rx_no_buffer;
 	uint32_t rx_channel_id;		//channel id rx
