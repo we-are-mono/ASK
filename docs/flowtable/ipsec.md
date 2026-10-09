@@ -1427,9 +1427,11 @@ queues with the group.
 
 What the offline port forwards out of an Ethernet port waits on that port's
 transmit queues until the port sends it, one frame to a pool buffer however
-short the frame. Those queues' group bounds bytes, two milliseconds at the
-link's speed (A313): 2.5 MB at 10 Gbit/s, some 17,000 frames of a small
-datagram stream, where the pool had 512. A port that stops sending -- its link
+short the frame. Those queues' group then bounded bytes, two milliseconds at
+the link's speed (A313): 2.5 MB at 10 Gbit/s, some 17,000 frames of a small
+datagram stream, where the pool had 512. It counts frames now (A341), but its
+share of the Ethernet pool, 1,280 at 10 Gbit/s, is still more than SEC's
+whole pool. A port that stops sending -- its link
 partner sends 802.3x pause, as a congested switch or host does -- or one slower
 than the tunnel held every buffer, and SEC refused every SA's jobs, both
 directions, until it sent again (A335; NXP's queues had no bound at all). With
@@ -1444,11 +1446,14 @@ output takes them (`dpa_get_out_tx_info_by_itf_id()`, which builds only the
 offline port's entries), and so does a decrypted flow once
 `cdx_ipsec_fill_sec_info()` has moved it to the offline port's tables
 (`dpa_get_sec_tx_fqid()`); one that goes back into SEC, or out by a Wi-Fi VAP,
-keeps its queue. The group holds as many of the largest frames the port's MTU
-admits as the forwarding group's bytes, so these frames wait no longer than
-the rest, and at most `IPSEC_EGRESS_FRAMES`, 128: 128 on a standard MTU from a
-gigabit up, 42 at 100 Mbit/s; with a 9000-byte MTU still 128 at 10 Gbit/s,
-which is 0.9 ms, but 27 at a gigabit. It follows the link's speed with the
+keeps its queue. The group is sized as the forwarding group is, as many of the
+largest frames the port's MTU admits as take two milliseconds at the link's
+speed, never fewer than a burst of standard frames needs, so these frames wait
+no longer than the rest, but at most `IPSEC_EGRESS_FRAMES`, 128: 128 on a
+standard MTU from a gigabit up, 42 at 100 Mbit/s; with a 9000-byte MTU 128
+from a gigabit up too, which is 0.9 ms of the largest at 10 Gbit/s and 9 ms at
+a gigabit, and 42 at 100 Mbit/s (qos.md, "A port without a hardware qdisc").
+It follows the link's speed with the
 forwarding group, and the port's MTU (`NETDEV_CHANGEMTU`). Microcode fragments
 of an ESP frame take the same queue and count one each. FMan drops what the group
 refuses, and the offline port counts it in `ipsec_offline_port_rejected`. With
@@ -1458,7 +1463,7 @@ port's share; SEC refuses none, and the pool never reads below 880.
 The pool grew to 1024 for this: an eighth each to the exception queues, the
 Wi-Fi VAP queues and every Ethernet port, which on a five-port board leaves an
 eighth to SEC with every queue full at once. Each port's bound sits far below
-the 2 ms its forwarding queues allow at 10 Gbit/s (128 full-size frames is
+the 1.6 ms its forwarding queues allow at 10 Gbit/s (128 full-size frames is
 157 µs), the cost of a pool that has to cover every port; it matters only
 where a fast port is congested by other traffic. `flowtable_ipsec_stalled_port.py`
 is the paused-port case. On a port a hardware qdisc owns, the offline port's

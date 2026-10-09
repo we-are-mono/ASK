@@ -29,7 +29,6 @@
 #define QM_INITFQ_WE_CGID 0x10
 #define QM_INITFQ_WE_OAC 0x20
 #define QM_FQCTRL_CGE 2
-#define QM_OAC_CG 1
 #define QM_CGR_WE_MODE 1
 #define QM_CGR_WE_CS_THRES 2
 #define QM_CGR_WE_CSTD_EN 4
@@ -47,6 +46,7 @@
 #define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
 #define clamp_t(t, v, lo, hi) min_t(t, max_t(t, v, lo), hi)
 #define VLAN_ETH_HLEN 18
+#define ETH_DATA_LEN 1500
 #define IF_TYPE_ETHERNET 0x1
 #define IF_TYPE_PHYSICAL 0x100
 #define netdev_warn(...) do { } while (0)
@@ -74,8 +74,7 @@ struct dpa_fq { struct qman_fq fq_base; struct list_head list; };
 struct qm_mcc_initfq {
     unsigned fqid, count, we_mask;
     struct { unsigned fq_ctrl; struct { unsigned channel, wq; } dest;
-             struct { unsigned hi, lo; } context_a; u8 cgid;
-             struct { unsigned oac; signed char oal; } oac_init; } fqd;
+             struct { unsigned hi, lo; } context_a; u8 cgid; } fqd;
 };
 struct qm_cgr_cs_thres { u64 bytes; };
 struct qm_mcc_initcgr {
@@ -84,13 +83,18 @@ struct qm_mcc_initcgr {
 };
 struct qman_cgr { u32 cgrid; };
 struct ethtool_link_ksettings { struct { u32 speed; } base; };
+/* What the port seeds the shared Ethernet pool with, for each CPU. */
+struct port_bman_pool_info { u32 count; };
 struct eth_iface_info {
     struct net_device *net_dev; u32 speed;
     struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES]; unsigned tx_channel_id, tx_wq;
     struct qman_cgr fwd_cgr; u32 fwd_cgr_speed;
     struct qman_fq sec_tx_fqinfo[DPAA_FWD_TX_QUEUES];
-    struct qman_cgr sec_cgr; u32 sec_cgr_mtu;
+    struct qman_cgr sec_cgr; u32 fwd_cgr_mtu;
+    struct port_bman_pool_info pool_info[1];
 };
+static unsigned cpus = 4;
+static unsigned num_possible_cpus(void) { return cpus; }
 struct dpa_iface_info {
     struct dpa_iface_info *next; u32 if_flags;
     struct eth_iface_info eth_info; void *tx_proc_entry; const char *name;
@@ -101,9 +105,8 @@ static struct dpa_iface_info *dpa_interface_info = &iface;
 static struct net_device netdev;
 static unsigned calls, fail, live, pending, syncs, drains, pauses;
 static bool fault(void);
-/* The congestion groups: 77 the forwarding queues', in bytes, and 78 the one
- * for SEC's frames, counting them. Allocated, set up (with what), held by a
- * lock. */
+/* The congestion groups, both counting frames: 77 the forwarding queues', 78
+ * the one for SEC's. Allocated, set up (with what), held by a lock. */
 #define GROUPS 2
 static struct { bool allocated, tail_drop, frames; u64 thres; } groups[GROUPS];
 static bool devlist_locked;
@@ -157,8 +160,8 @@ static int qman_modify_cgr(struct qman_cgr *cgr, u32 flags, struct qm_mcc_initcg
         if (tail_drop) {
             assert((opts->we_mask & (QM_CGR_WE_CSCN_EN | QM_CGR_WE_MODE)) ==
                    (QM_CGR_WE_CSCN_EN | QM_CGR_WE_MODE) && !opts->cgr.cscn_en);
-            /* Bytes for the forwarding group, frames for SEC's. */
-            assert(opts->cgr.mode == (cgr->cgrid == 78 ? QMAN_CGR_MODE_FRAME : 0));
+            /* Frames, for what a queued frame holds is a buffer. */
+            assert(opts->cgr.mode == QMAN_CGR_MODE_FRAME);
             groups[cgr->cgrid - 77].frames = opts->cgr.mode == QMAN_CGR_MODE_FRAME;
         } else {
             const struct qman_fq *set = cgr->cgrid == 77 ? iface.eth_info.fwd_tx_fqinfo
@@ -217,17 +220,11 @@ static int qman_init_fq(struct qman_fq *fq, unsigned flags, void *arg)
     (void)flags;
     if (fault()) return -1;
     assert(fq->cb.ern && (opts->we_mask & QM_INITFQ_WE_CGID) && (opts->fqd.fq_ctrl & QM_FQCTRL_CGE));
-    if (sec_fq(fq)) {
-        /* What the offline port sends joins the group that counts frames,
-         * which a per-frame byte overhead would mean nothing to. */
-        assert(groups[1].allocated && groups[1].tail_drop && groups[1].frames);
-        assert(opts->fqd.cgid == 78 && !(opts->we_mask & QM_INITFQ_WE_OAC));
-    } else {
-        /* Every forwarding FQ joins the port's group, counting wire bytes. */
-        assert(groups[0].allocated && groups[0].tail_drop && !groups[0].frames);
-        assert((opts->we_mask & QM_INITFQ_WE_OAC) && opts->fqd.cgid == 77);
-        assert(opts->fqd.oac_init.oac == QM_OAC_CG && opts->fqd.oac_init.oal == 24);
-    }
+    /* Each set joins its own group, which counts frames, and a per-frame
+     * byte overhead would mean nothing to. */
+    unsigned group = sec_fq(fq);
+    assert(groups[group].allocated && groups[group].tail_drop && groups[group].frames);
+    assert(opts->fqd.cgid == 77 + group && !(opts->we_mask & QM_INITFQ_WE_OAC));
     fq->state = qman_fq_state_sched; return 0;
 }
 static void qman_destroy_fq(struct qman_fq *fq, unsigned flags)
@@ -303,10 +300,16 @@ int main(void)
     /* Two calls set up each group, then three per FQ of its set. */
     const unsigned set = DPAA_FWD_TX_QUEUES * 3 + 2;
 
+    /* The largest frames a standard and a jumbo MTU admit, tagged, on the
+     * wire; and what a port with four CPUs, each seeded 640 buffers, may hold
+     * of the pool: half its own. */
+    const unsigned standard = 1500 + 18 + 24, jumbo = 9000 + 18 + 24, share = 4 * 640 / 2;
+
     for (unsigned n = 1; n <= 2 * set; n++) {
         memset(&iface, 0, sizeof(iface)); calls = pauses = 0; fail = n;
         netdev = (struct net_device){ .carrier = n % 2, .speed = 1000, .mtu = 1500 };
         iface.eth_info.net_dev = &netdev; iface.eth_info.speed = 10000; iface.name = "eth4";
+        iface.eth_info.pool_info[0].count = 640;
         unsigned released = cgr_releases;
         assert(create_fwd_tx_fqs(&iface)); assert(!live && !any_group());
         /* A group that was allocated went back exactly once: SEC's from
@@ -315,10 +318,14 @@ int main(void)
         calls = pauses = fail = 0;
         assert(!create_fwd_tx_fqs(&iface)); assert(live == 2 * DPAA_FWD_TX_QUEUES);
         /* Sized for the link as it runs, and for the MAC's fastest while
-         * there is none: microseconds times Mbit/s is bits. */
+         * there is none: as many of the largest frames as take 2 ms --
+         * microseconds times Mbit/s is bits -- up to the port's share of the
+         * pool, which 10 Gbit/s reaches. */
         assert(groups[0].tail_drop && groups[1].tail_drop && !devlist_locked);
         assert(iface.eth_info.fwd_cgr_speed == (netdev.carrier ? 1000u : 10000u));
-        assert(groups[0].thres == (u64)iface.eth_info.fwd_cgr_speed * 2000 / 8);
+        assert(iface.eth_info.fwd_cgr_mtu == 1500);
+        assert(groups[0].thres == (netdev.carrier ? 1000u * 2000 / 8 / standard : share));
+        assert(10000u * 2000 / 8 / standard > share);
         /* SEC's frames from a gigabit up: the port's share of its pool. */
         assert(groups[1].thres == IPSEC_EGRESS_FRAMES && IPSEC_EGRESS_FRAMES < IPSEC_BUFCOUNT);
         unsigned before = syncs;
@@ -327,55 +334,72 @@ int main(void)
         assert(cgr_releases == released + (n > 1) + (n > 3) + 2);
         for (unsigned i = 0; i < 2 * DPAA_FWD_TX_QUEUES; i++) assert(!proc_fqs[i]);
     }
-    /* A slow link still holds a few jumbo frames. */
+    /* A slow link still holds a few jumbo frames: no fewer than 64 KiB
+     * makes, six of the largest frame sdk_fman lets a port take. */
     memset(&iface, 0, sizeof(iface)); calls = pauses = fail = 0;
     netdev = (struct net_device){ .carrier = true, .speed = 100, .mtu = 1500 };
     iface.eth_info.net_dev = &netdev; iface.eth_info.speed = 1000; iface.name = "eth0";
     iface.if_flags = IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL;
-    assert(!create_fwd_tx_fqs(&iface) && groups[0].thres == 64 * 1024);
-    /* Six of the largest frame sdk_fman lets a port take. */
-    assert(groups[0].thres / 9600 == 6);
-    /* And no more of SEC's largest frames -- the MTU, a tagged header, the
-     * wire's overhead -- than those bytes: it waits no longer for them than
-     * for the rest. */
-    const unsigned standard = 1500 + 18 + 24, jumbo = 9000 + 18 + 24;
-    assert(groups[1].thres == 64 * 1024 / standard && groups[1].thres < IPSEC_EGRESS_FRAMES);
-    assert(iface.eth_info.sec_cgr_mtu == 1500);
+    iface.eth_info.pool_info[0].count = 640;
+    assert(64 * 1024 / 9600 == 6);
+    assert(!create_fwd_tx_fqs(&iface) && groups[0].thres == 64 * 1024 / standard);
+    /* SEC's group is sized the same way, below its own share. */
+    assert(groups[1].thres == groups[0].thres && groups[1].thres < IPSEC_EGRESS_FRAMES);
+    assert(iface.eth_info.fwd_cgr_mtu == 1500);
     /* Both follow the link: up to a gigabit, then back. */
     spin_lock(&dpa_devlist_lock);
     assert(!fwd_cgr_set(&iface.eth_info, 1000, false));
     spin_unlock(&dpa_devlist_lock);
-    assert(groups[0].thres == 1000u * 2000 / 8 && groups[1].thres == IPSEC_EGRESS_FRAMES);
-    assert(groups[0].tail_drop && groups[1].tail_drop && groups[1].frames);
+    assert(groups[0].thres == 1000u * 2000 / 8 / standard && groups[1].thres == IPSEC_EGRESS_FRAMES);
+    assert(groups[0].tail_drop && groups[1].tail_drop && groups[0].frames && groups[1].frames);
     spin_lock(&dpa_devlist_lock);
     assert(!fwd_cgr_set(&iface.eth_info, 100, false));
     spin_unlock(&dpa_devlist_lock);
-    assert(groups[0].thres == 64 * 1024 && groups[1].thres == 64 * 1024 / standard);
-    /* A jumbo MTU: SEC's group follows the frame size, so a gigabit holds
-     * no more than the 2 ms its bytes do; the forwarding group, in bytes,
-     * stays. The link reports no change, the MTU alone moved. */
+    assert(groups[0].thres == 64 * 1024 / standard && groups[1].thres == 64 * 1024 / standard);
+    /* A jumbo MTU: both groups follow the frame size. A gigabit's 2 ms of
+     * the largest frames is 27, which a burst of standard ones would
+     * overflow, so it holds two such bursts with room to spare instead. The
+     * link reports no change, the MTU alone moved. */
     netdev = (struct net_device){ .carrier = true, .speed = 1000, .mtu = 1500 };
     dpa_fwd_cgr_follow_link(&netdev);
     assert(groups[1].thres == IPSEC_EGRESS_FRAMES && iface.eth_info.fwd_cgr_speed == 1000);
     netdev.mtu = 9000;
     dpa_fwd_cgr_follow_link(&netdev);
-    assert(iface.eth_info.sec_cgr_mtu == 9000 && !devlist_locked);
-    assert(groups[0].thres == 1000u * 2000 / 8 && groups[1].thres == 1000u * 2000 / 8 / jumbo);
-    assert(groups[1].thres * jumbo <= groups[0].thres);
+    assert(iface.eth_info.fwd_cgr_mtu == 9000 && !devlist_locked);
+    assert(1000u * 2000 / 8 / jumbo == 27 && groups[0].thres == 128);
+    assert(groups[1].thres == (128 < IPSEC_EGRESS_FRAMES ? 128 : IPSEC_EGRESS_FRAMES));
     /* A slower link at that MTU, and its carrier lost: the bound keeps the
      * speed it was sized for and still follows the MTU. */
     netdev.carrier = false;
     netdev.mtu = 1500;
     dpa_fwd_cgr_follow_link(&netdev);
-    assert(iface.eth_info.fwd_cgr_speed == 1000 && groups[1].thres == IPSEC_EGRESS_FRAMES);
+    assert(iface.eth_info.fwd_cgr_speed == 1000 && iface.eth_info.fwd_cgr_mtu == 1500);
+    assert(groups[0].thres == 1000u * 2000 / 8 / standard && groups[1].thres == IPSEC_EGRESS_FRAMES);
+    /* Slower still, the bursts' floor is the 2 ms of standard frames there
+     * are, as on a standard MTU. */
     netdev = (struct net_device){ .carrier = true, .speed = 100, .mtu = 9000 };
     dpa_fwd_cgr_follow_link(&netdev);
-    assert(groups[0].thres == 64 * 1024 && groups[1].thres == 64 * 1024 / jumbo);
-    assert(groups[1].thres >= 1 && groups[1].thres * jumbo <= groups[0].thres);
-    /* At 10G even jumbo frames fill the port's share of the pool first. */
+    assert(64 * 1024 / jumbo >= 6 && groups[0].thres == 64 * 1024 / standard);
+    assert(groups[1].thres == groups[0].thres);
+    /* At 10G, 2 ms of jumbo frames is more than the bursts need, and stays
+     * below the port's share of the Ethernet pool; SEC's share of its own
+     * pool is less. */
     netdev.speed = 10000;
     dpa_fwd_cgr_follow_link(&netdev);
     assert(groups[1].thres == IPSEC_EGRESS_FRAMES);
+    assert(groups[0].thres == 10000u * 2000 / 8 / jumbo && groups[0].thres > 128 && groups[0].thres < share);
+    /* A standard MTU at 10G reaches the Ethernet share: a paused port holds
+     * no more than half of what it seeds, whatever it is sent (A341). */
+    netdev.mtu = 1500;
+    dpa_fwd_cgr_follow_link(&netdev);
+    assert(groups[0].thres == share && groups[1].thres == IPSEC_EGRESS_FRAMES);
+    /* With fewer CPUs, fewer buffers seeded, and a smaller share. */
+    cpus = 2;
+    spin_lock(&dpa_devlist_lock);
+    assert(!fwd_cgr_set(&iface.eth_info, 10000, false));
+    spin_unlock(&dpa_devlist_lock);
+    assert(groups[0].thres == 2 * 640 / 2);
+    cpus = 4;
     /* A rejected software enqueue goes back to its pool. */
     struct qm_mr_entry ern = { .ern.fd = { .bpid = 3, .addr = 0x1000 } };
     unsigned released_before = released_frames;

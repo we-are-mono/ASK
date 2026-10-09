@@ -120,7 +120,7 @@ static int cdx_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 	/* A speed change passes through the carrier, so it arrives here too.
-	 * An MTU change resizes the bound on SEC's frames, counted in frames
+	 * An MTU change resizes the port's egress bounds, which count frames
 	 * of the largest size the MTU admits, carrier or not. */
 	if ((((event == NETDEV_UP || event == NETDEV_CHANGE) && netif_carrier_ok(dev)) ||
 	     event == NETDEV_CHANGEMTU) && dpa_netdev_is_physical(dev)) {

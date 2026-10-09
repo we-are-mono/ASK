@@ -78,20 +78,21 @@ struct eth_iface_info {
 	struct port_fq_info fqinfo[MAX_FQ_TYPES];	//fq info for defa types
 	struct port_fq_info eth_tx_fqinfo[DPAA_ETH_TX_QUEUES];	//ethdrv TX FQs 
 	struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES]; /* cctable TX FQs */
-	/* Tail drop over fwd_tx_fqinfo[] once their backlog outlasts
-	 * fwd_queue_us at the link's speed (devman.c). fwd_cgr_speed is the
-	 * Mbit/s the threshold was sized for; zero until the group is set
-	 * up and again once it is torn down. */
+	/* Tail drop over fwd_tx_fqinfo[] by frames: as many of the largest the
+	 * MTU admits as take fwd_queue_us at the link's speed, at most a share
+	 * of the Ethernet pool (devman.c). fwd_cgr_speed is the Mbit/s the
+	 * threshold was sized for; zero until the group is set up and again
+	 * once it is torn down. */
 	struct qman_cgr fwd_cgr;
 	uint32_t fwd_cgr_speed;
 	/* The same queues again for what the IPsec offline port sends out of
 	 * this port, all of it in buffers of SEC's output pool, with a group
-	 * that drops at the tail by frames rather than bytes (devman.c). */
+	 * of its own bounded by a share of that pool (devman.c). */
 	struct qman_fq sec_tx_fqinfo[DPAA_FWD_TX_QUEUES];
 	struct qman_cgr sec_cgr;
-	/* The port MTU sec_cgr's bound was sized for: frames rather than
-	 * bytes, so the largest frame decides how long they queue. */
-	uint32_t sec_cgr_mtu;
+	/* The port MTU both groups' bounds were sized for: they count frames,
+	 * so the largest frame decides how long they queue. */
+	uint32_t fwd_cgr_mtu;
 	/* What the port's counters report while CDX holds it (devman.c), under
 	 * dpa_devlist_lock. Transmit is what its MAC sent: the netdev's own
 	 * counts at the first reading, then the MAC's advance since, which

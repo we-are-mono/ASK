@@ -165,9 +165,16 @@ static unsigned int fwd_queue_us = 2000;
  * command line), so even a slow port's bound holds several jumbo frames. */
 #define FWD_CGR_MIN_BYTES	(64 * 1024)
 /* Preamble, inter-frame gap and FCS, which a frame descriptor's length leaves
- * out: counted per frame, so the threshold is time on the wire for small
- * frames too. */
+ * out: a frame's time on the wire counts them too. */
 #define FWD_CGR_WIRE_OVERHEAD	24
+/* On a port whose MTU admits jumbo frames, fwd_queue_us of the largest is few
+ * frames on a slow link -- 27 at a gigabit -- and standard ones arrive in
+ * bursts that would overflow it: a TCP sender's segmentation offload sends
+ * 64 KiB, 45 of them, at once. So never fewer frames than two such bursts
+ * with room to spare, or than fwd_queue_us of standard frames where those are
+ * fewer; jumbo frames then wait longer on a slow port, 9 ms at a gigabit, still
+ * within the pool's share. */
+#define FWD_CGR_BURST_FRAMES	128
 
 static u64 fwd_cgr_bytes(uint32_t speed)
 {
@@ -176,18 +183,39 @@ static u64 fwd_cgr_bytes(uint32_t speed)
 		     FWD_CGR_MIN_BYTES);
 }
 
-/* The bound on the IPsec offline port's frames at speed Mbit/s through a port
- * of this MTU: as many of the largest frames the MTU admits -- with a tagged
- * Ethernet header, on the wire -- as the forwarding group's bytes, so that
- * these frames wait no longer than the rest on a slow link or a jumbo MTU,
- * and never more than the port's share of SEC's pool, which a standard MTU
- * gets from a gigabit up. FWD_CGR_MIN_BYTES holds several of the largest
- * frame there is, so never none. */
-static u64 sec_cgr_frames(uint32_t speed, unsigned int mtu)
+/* A port's egress groups count frames, because what a queued frame holds is a
+ * buffer, however short the frame: a bound in bytes held some 30,000
+ * minimum-size frames at 10 Gbit/s, more than twice the pool every DPAA port
+ * receives into, and a port its link partner paused then starved every port's
+ * receive, the kernel's own frames included (A341). The bound at speed Mbit/s
+ * through a port of this MTU is as many of the largest frames the MTU admits
+ * -- with a tagged Ethernet header, on the wire -- as fit in fwd_cgr_bytes(),
+ * so no frame waits longer than fwd_queue_us, but no fewer than a burst of
+ * standard ones needs (FWD_CGR_BURST_FRAMES), and never more than cap, the
+ * pool share the group may hold. FWD_CGR_MIN_BYTES holds several of the
+ * largest frame there is, so never none. */
+static u64 fwd_cgr_frames(uint32_t speed, unsigned int mtu, u64 cap)
 {
-	return clamp_t(u64, fwd_cgr_bytes(speed) /
-			    (mtu + VLAN_ETH_HLEN + FWD_CGR_WIRE_OVERHEAD),
-		       1, IPSEC_EGRESS_FRAMES);
+	u64 bytes = fwd_cgr_bytes(speed);
+	u64 largest = bytes / (mtu + VLAN_ETH_HLEN + FWD_CGR_WIRE_OVERHEAD);
+	u64 burst = min_t(u64, bytes / (ETH_DATA_LEN + VLAN_ETH_HLEN +
+					FWD_CGR_WIRE_OVERHEAD),
+			  FWD_CGR_BURST_FRAMES);
+
+	return clamp_t(u64, max_t(u64, largest, burst), 1, cap);
+}
+
+/* What a port's forwarding queues may hold of the pool every DPAA port
+ * receives into: half of what the port itself seeds it with, its count for
+ * each CPU (dpa_priv_bp_seed()), so that however many ports stall, half the
+ * pool is left to receive into. A frame takes one buffer: they are sized for
+ * the largest frame FMan accepts, or the MTU for what one holds. With four
+ * CPUs that is 1,280 frames: at 10 Gbit/s and a standard MTU, 1.6 ms of the
+ * largest frames rather than fwd_queue_us's 2. */
+static u64 fwd_pool_frames(const struct eth_iface_info *eth_info)
+{
+	return max_t(u64, (u64)eth_info->pool_info[0].count *
+			  num_possible_cpus() / 2, 1);
 }
 
 /* Size the port's groups for speed Mbit/s and the port's MTU as it is now;
@@ -197,35 +225,35 @@ static u64 sec_cgr_frames(uint32_t speed, unsigned int mtu)
 static int fwd_cgr_set(struct eth_iface_info *eth_info, uint32_t speed,
 		       bool init)
 {
+	unsigned int mtu = READ_ONCE(eth_info->net_dev->mtu);
 	struct qm_mcc_initcgr opts;
 
 	if (!init) {
-		unsigned int mtu = READ_ONCE(eth_info->net_dev->mtu);
-
 		memset(&opts, 0, sizeof(opts));
 		opts.we_mask = QM_CGR_WE_CS_THRES;
 		qm_cgr_cs_thres_set64(&opts.cgr.cs_thres,
-				      sec_cgr_frames(speed, mtu), 1);
+				      fwd_cgr_frames(speed, mtu, IPSEC_EGRESS_FRAMES), 1);
 		if (qman_modify_cgr(&eth_info->sec_cgr, 0, &opts))
 			return -EIO;
-		eth_info->sec_cgr_mtu = mtu;
 	}
 	memset(&opts, 0, sizeof(opts));
 	opts.we_mask = QM_CGR_WE_CS_THRES;
 	if (init) {
-		/* Bytes, tail drop, and no state-change notifications: the
+		/* Frames, tail drop, and no state-change notifications: the
 		 * drop needs none, and a threshold this short would raise
 		 * one at every TCP sawtooth. */
 		opts.we_mask |= QM_CGR_WE_MODE | QM_CGR_WE_CSTD_EN |
 				QM_CGR_WE_CSCN_EN;
-		opts.cgr.mode = 0;
+		opts.cgr.mode = QMAN_CGR_MODE_FRAME;
 		opts.cgr.cstd_en = QM_CGR_EN;
 	}
-	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres, fwd_cgr_bytes(speed), 1);
+	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres,
+			      fwd_cgr_frames(speed, mtu, fwd_pool_frames(eth_info)), 1);
 	if (qman_modify_cgr(&eth_info->fwd_cgr,
 			    init ? QMAN_CGR_FLAG_USE_INIT : 0, &opts))
 		return -EIO;
 	eth_info->fwd_cgr_speed = speed;
+	eth_info->fwd_cgr_mtu = mtu;
 	return 0;
 }
 
@@ -266,7 +294,7 @@ static const struct kernel_param_ops fwd_queue_us_ops = {
 };
 module_param_cb(fwd_queue_us, &fwd_queue_us_ops, &fwd_queue_us, 0644);
 MODULE_PARM_DESC(fwd_queue_us,
-		 "Offloaded egress queued per port before tail drop, in microseconds at link speed");
+		 "Offloaded egress queued per port before tail drop, in microseconds of the largest frames at link speed");
 
 /* The speed the link runs at, or fallback while it has none or reports none.
  * A port without a PHY reports none (dpa_get_ksettings()), so its bound is
@@ -298,7 +326,7 @@ void dpa_fwd_cgr_follow_link(struct net_device *dev)
 			speed = info->eth_info.fwd_cgr_speed ?: info->eth_info.speed;
 		if (info->eth_info.fwd_cgr_speed &&
 		    (info->eth_info.fwd_cgr_speed != speed ||
-		     info->eth_info.sec_cgr_mtu != READ_ONCE(dev->mtu)) &&
+		     info->eth_info.fwd_cgr_mtu != READ_ONCE(dev->mtu)) &&
 		    fwd_cgr_set(&info->eth_info, speed, false))
 			netdev_warn(dev, "could not resize the offloaded egress queue bound\n");
 		break;
@@ -320,15 +348,16 @@ static void fwd_cgr_release(struct eth_iface_info *eth_info)
 }
 
 /* What the IPsec offline port sends out of a port waits there in buffers of
- * SEC's output pool, one frame to a buffer however short the frame. A group in
- * bytes sized for the link's latency holds thousands of them at 10 Gbit/s,
- * more than the pool has: a port its link partner pauses, or one slower than
- * the tunnel, would hold every buffer, and SEC would refuse every SA's jobs
- * until it sent again. So those frames take queues of their own, whose group
- * counts frames (sec_cgr_frames()) and follows the link with the forwarding
- * group. Like that group it asks for no notifications, so no portal owns it.
- * Set up before the forwarding group, whose speed, once published, lets the
- * resizers at both. */
+ * SEC's output pool, a pool of its own and far smaller than the Ethernet one:
+ * the forwarding group's share of that holds more than SEC's pool has, so a
+ * port its link partner pauses, or one slower than the tunnel, would hold
+ * every buffer, and SEC would refuse every SA's jobs until it sent again. So
+ * those frames take queues of their own, whose group is bounded by the port's
+ * share of SEC's pool and follows the link with the forwarding group. Like
+ * that group it asks for no notifications, so no portal owns it. Set up
+ * before the forwarding group, whose speed, once published, lets the resizers
+ * at both; RTNL held, so the MTU it is sized for stays the one that group
+ * records. */
 static int sec_cgr_init(struct eth_iface_info *eth_info, uint32_t speed)
 {
 	struct qm_mcc_initcgr opts;
@@ -341,12 +370,12 @@ static int sec_cgr_init(struct eth_iface_info *eth_info, uint32_t speed)
 		       QM_CGR_WE_CSCN_EN;
 	opts.cgr.mode = QMAN_CGR_MODE_FRAME;
 	opts.cgr.cstd_en = QM_CGR_EN;
-	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres, sec_cgr_frames(speed, mtu), 1);
+	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres,
+			      fwd_cgr_frames(speed, mtu, IPSEC_EGRESS_FRAMES), 1);
 	if (qman_modify_cgr(&eth_info->sec_cgr, QMAN_CGR_FLAG_USE_INIT, &opts)) {
 		qman_release_cgrid(eth_info->sec_cgr.cgrid);
 		return -EIO;
 	}
-	eth_info->sec_cgr_mtu = mtu;
 	return 0;
 }
 
@@ -361,12 +390,11 @@ static void sec_cgr_release(struct eth_iface_info *eth_info)
 	qman_release_cgrid(eth_info->sec_cgr.cgrid);
 }
 
-/* One set of a port's transmit queues, in the group cgr; oal is the wire
- * overhead a byte-counting group adds per frame. *created counts the queues
- * made, for the caller to destroy if the set is incomplete. */
+/* One set of a port's transmit queues, in the group cgr. *created counts the
+ * queues made, for the caller to destroy if the set is incomplete. */
 static int create_tx_fq_set(struct dpa_iface_info *iface_info,
 			    struct qman_fq *fq, const struct qman_cgr *cgr,
-			    uint8_t oal, uint32_t *created)
+			    uint32_t *created)
 {
 	struct eth_iface_info *eth_info = &(iface_info->eth_info);
 	struct qm_mcc_initfq opts;
@@ -393,11 +421,6 @@ static int create_tx_fq_set(struct dpa_iface_info *iface_info,
 				QM_INITFQ_WE_CGID);
 		opts.fqd.fq_ctrl = QM_FQCTRL_PREFERINCACHE | QM_FQCTRL_CGE;
 		opts.fqd.cgid = (u8)cgr->cgrid;
-		if (oal) {
-			opts.we_mask |= QM_INITFQ_WE_OAC;
-			opts.fqd.oac_init.oac = QM_OAC_CG;
-			opts.fqd.oac_init.oal = oal;
-		}
 		opts.fqd.dest.channel = eth_info->tx_channel_id;
 		opts.fqd.dest.wq = eth_info->tx_wq;
 		//OVFQ=1 - override FQ in tree
@@ -461,9 +484,9 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 		goto err_sec_cgr;
 	}
 	if (create_tx_fq_set(iface_info, eth_info->fwd_tx_fqinfo,
-			     &eth_info->fwd_cgr, FWD_CGR_WIRE_OVERHEAD, &created) ||
+			     &eth_info->fwd_cgr, &created) ||
 	    create_tx_fq_set(iface_info, eth_info->sec_tx_fqinfo,
-			     &eth_info->sec_cgr, 0, &sec_created))
+			     &eth_info->sec_cgr, &sec_created))
 		goto err_ret;
 	return 0;
 

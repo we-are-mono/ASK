@@ -3,16 +3,18 @@
 An offloaded frame is enqueued by the port it arrived on, straight to the queue
 of the port it leaves by. When that port stops sending -- its link partner
 pauses it, as a congested switch or host does -- its queue fills, and FMan
-drops the rest with nothing told: refused at the enqueue once the queue's group
-is full, or, for small frames, of which the queue holds more than the buffer
-pool every port shares, for want of a buffer to take them in. The port must not
-then read as having sent them (A338), and the port they arrived on must count
-them, as drops and as misses (A339).
+drops the rest with nothing told, refused at the enqueue once the queue's group
+is full. The port must not then read as having sent them (A338), and the port
+they arrived on must count them as drops (A339). Each frame the queue holds
+takes a buffer from the pool every DPAA port receives into, so the group's
+bound must leave that pool enough to receive into whatever the frames' size
+(A341).
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import time
 
@@ -27,6 +29,9 @@ FMAN = "/sys/devices/platform/soc/1a00000.fman"
 # Frames the kernel itself sends on the paused port while the test runs --
 # neighbour and router traffic -- are counted by both sides alike; allow some.
 KERNEL_SLACK = 1000
+# Pings to the DUT's WAN address while the LAN port is paused, which the
+# blast outlasts.
+PINGS = 20
 
 
 async def _counters(r):
@@ -81,17 +86,24 @@ def _blast(sock, lan_ip, seconds, size):
     return sent
 
 
-@pytest.mark.parametrize("size", [64, 1400], ids=["small", "full"])
-async def test_paused_port_counts(rig, size):
-    """The LAN VM pauses the DUT's LAN port with 802.3x PAUSE frames, as a
-    congested switch or host does. The WAN host meanwhile sends down an
-    offloaded flow to it far more than the port's queue holds. The LAN port's
-    transmit count is what its MAC sent, not what was queued for it, and the
-    WAN port counts the rest as received and dropped -- whether the queue's
-    group refused them (full-size frames, which reach its bound in bytes
-    first) or the receive port found no buffer to take them in (small ones,
-    of which the queue holds more than the pool has)."""
-    r = rig
+async def _ping(address, count, delay):
+    """How many of `count` pings to `address`, from the WAN host, a tenth of a
+    second apart and starting `delay` seconds from now, were answered."""
+    await asyncio.sleep(delay)
+    proc = await asyncio.create_subprocess_exec(
+        "ping", "-n", "-q", "-c", str(count), "-i", "0.1", "-W", "1", address,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    received = re.search(r"(\d+) (?:packets )?received", out.decode())
+    assert received, out.decode()
+    return int(received.group(1))
+
+
+async def _paused_blast(r, size, label):
+    """Three seconds of `size`-byte datagrams down the offloaded flow, from the
+    WAN end of it, with the LAN port paused throughout, and the WAN host
+    pinging the DUT's WAN address meanwhile. Returns what was sent and what
+    the counters made of it."""
     await r.table()
     await r.admit()
     flows = (await r.state())["flows"]
@@ -107,8 +119,11 @@ async def test_paused_port_counts(rig, size):
     try:
         before = await _counters(r)
         flow_before = int(down["packets"])
-        sent, pauses = await while_lan_port_paused(
-            r, lambda: asyncio.to_thread(_blast, sock, r.lan_ip, 3, size), 3)
+        # The pings start once the paused port's queue is full: a fraction
+        # of a second of the blast fills it.
+        (sent, answered), pauses = await while_lan_port_paused(
+            r, lambda: asyncio.gather(asyncio.to_thread(_blast, sock, r.lan_ip, 3, size),
+                                      _ping(r.dut_wan_ip, PINGS, 0.5)), 3)
         # What the port's queue held goes out once the pause lifts.
         await asyncio.sleep(2)
         after = await _counters(r)
@@ -123,20 +138,44 @@ async def test_paused_port_counts(rig, size):
     wire = _mac_frames(after["links"][TARGET_LAN_IF]["mac"]) - _mac_frames(before["links"][TARGET_LAN_IF]["mac"])
     ports = {k: after["ports"][k] - before["ports"].get(k, 0)
              for k in after["ports"] if after["ports"][k] != before["ports"].get(k, 0)}
-    record = {"sent": sent, "pauses": pauses, "hits": hits, "wire": wire, "delta": delta, "ports": ports,
+    record = {"sent": sent, "pauses": pauses, "hits": hits, "wire": wire, "answered": answered,
+              "delta": delta, "ports": ports,
               "mac_before": before["links"][TARGET_LAN_IF]["mac"],
               "mac_after": after["links"][TARGET_LAN_IF]["mac"]}
-    r.record("stalled-port-counters", record)
+    r.record(label, record)
     assert sent > 100_000 and hits > 100_000, record
+    return record
+
+
+async def test_paused_port_leaves_the_pool(rig):
+    """A341: the frames a paused port's queue holds take buffers from the pool
+    every DPAA port receives into, and small frames offloaded towards it must
+    not take them all. The WAN port keeps receiving -- the DUT answers pings
+    to its address throughout -- and what the paused port's queue cannot take
+    is refused at the enqueue, a drop, never lost for want of a buffer."""
+    record = await _paused_blast(rig, 64, "stalled-port-pool")
+    wan = record["delta"][TARGET_WAN_IF]
+    assert record["answered"] == PINGS, record
+    assert wan["rx_missed_errors"] == 0, record
+    assert wan["rx_dropped"] >= record["hits"] - record["wire"] - KERNEL_SLACK, record
+
+
+@pytest.mark.parametrize("size", [64, 1400], ids=["small", "full"])
+async def test_paused_port_counts(rig, size):
+    """The LAN VM pauses the DUT's LAN port with 802.3x PAUSE frames, as a
+    congested switch or host does. The WAN host meanwhile sends down an
+    offloaded flow to it far more than the port's queue holds. The LAN port's
+    transmit count is what its MAC sent, not what was queued for it, and the
+    WAN port counts the rest as received and dropped."""
+    r = rig
+    record = await _paused_blast(r, size, "stalled-port-counters")
+    hits, wire, delta = record["hits"], record["wire"], record["delta"]
     # The pause held: far fewer frames left than arrived for the port.
     dropped = hits - wire
     assert dropped > hits // 2, record
     # A338: what the port says it sent is what its MAC sent.
     assert abs(delta[TARGET_LAN_IF]["tx_packets"] - wire) <= KERNEL_SLACK, record
-    # A339: the port the frames came in by counts the rest: full-size frames
-    # reach the queue's bound in bytes and are refused at the enqueue, which
-    # is a drop; small ones fill the shared buffer pool first and find no
-    # buffer, which is a miss.
+    # A339: the port the frames came in by counts the rest, refused at the
+    # enqueue, as drops.
     wan = delta[TARGET_WAN_IF]
-    assert abs(wan["rx_dropped"] + wan["rx_missed_errors"] - dropped) <= KERNEL_SLACK, record
-    assert (wan["rx_dropped"] if size == 1400 else wan["rx_missed_errors"]) > dropped // 2, record
+    assert abs(wan["rx_dropped"] - dropped) <= KERNEL_SLACK, record

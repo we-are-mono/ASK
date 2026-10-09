@@ -426,6 +426,7 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
         r.wan_mac = wan_mac
         dut = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show", "dev", TARGET_WAN_IF))["stdout"])[0]
         dut_ip = next(a["local"] for a in dut["addr_info"] if a["family"] == "inet")
+        r.dut_wan_ip = dut_ip
         existing = json.loads((await command(wan, r.session, "ip", "-j", "route", "show", "exact", f"{r.lan_ip}/32"))["stdout"])
         if existing:
             assert existing[0].get("gateway") == dut_ip and existing[0]["dev"] == r.wan_if, existing

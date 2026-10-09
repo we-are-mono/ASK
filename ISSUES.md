@@ -330,9 +330,11 @@ result independently of those temporary files.
   bytes. That is a port's whole share of pool 34 (`IPSEC_EGRESS_FRAMES`) per class, and a tree of sixteen leaves is
   twice the pool, so a shaped WAN class carrying an SA's output, or LAN classes taking decrypted traffic slower than the
   tunnel, can still pin the pool and starve every SA. CEETM counts congestion per class queue, so the offline port's
-  frames cannot be bounded apart from the port's own there as they are on a plain port. Fix direction: check whether a
-  class queue's logical FQs can be given one for the offline port in a QMan group of its own; else bound the tree's
-  total depth by the pool. Source-verified; not reproduced.
+  frames cannot be bounded apart from the port's own there as they are on a plain port. A RED leaf's byte limit exposes
+  the Ethernet pool the same way A341 did on a plain port: 1 MB holds some 16,000 minimum-size frames, past the 12,800
+  buffers every port receives into. Fix direction: check whether a class queue's logical FQs can be given one for the
+  offline port in a QMan group of its own; else bound the tree's total depth, in frames, by both pools. Source-verified;
+  not reproduced.
 
 - [ ] **A340 — a bridge whose MTU exceeds a member port's offloads frames that port's MTU forbids.** Admission checks a
   flow's path MTU against the logical egress device only (`cls->nf_mtu > out->out_logical->mtu`,
@@ -341,12 +343,8 @@ result independently of those temporary files.
   the bridge in software drops them (`is_skb_forwardable()`), the port sends them. Fix: refuse when the path MTU
   exceeds the physical egress port's too. Source-verified by the review of the A335 follow-up; not reproduced.
 
-- [ ] **A341 — a stalled port's forwarding queue can hold the Ethernet buffer pool every DPAA port shares.** The
-  forwarding group bounds bytes (A313): 2.5 MB at 10G, ~19,000 small frames, against a pool of 12,800 buffers that
-  every port seeds and every port receives into (`dpa_priv_common_bpid`). With the LAN port paused and 64-byte frames
-  offloaded towards it, its queue held 12,492 frames and the WAN port then dropped 1,931,989 frames for want of a
-  buffer -- every frame it received, the kernel's own included. Any port's receive starves while one port is paused or
-  slower than what is offloaded to it. Fix: bound the forwarding queues in frames, at most a share of the pool.
+- [x] **A341 — a stalled port's forwarding queue could hold the Ethernet buffer pool every DPAA port shares.** Its group
+  now counts frames, at most half the port's own seed (_:/^cdx: bound a port's forwarding queues by the buffers they hold_).
 
 - [x] **A338 — an offloaded frame an egress group drops counted as transmitted.** A paused port read 1,944,448 sent
   for 12,489 on the wire; a port's TX now comes from its MAC (_:/^cdx: count a port's frames where they leave and where they are lost_).
@@ -359,8 +357,18 @@ result independently of those temporary files.
   out (`hc.c:306 EnQFrm: Operation Timed Out`), two flowtable deletes stayed unproven (`quarantine 2`, `rearm_ready
   0`), and eth3 never transmitted again -- not the kernel's own pings either -- while its mEMAC read as at boot
   (`command_config 00020843`, `if_status 00002000`). Only a reboot recovered it. Seen once in about seven runs of the
-  PAUSE cases; recalls A305. What holds FMan is unknown; A341 shortens what a paused port can hold, so re-check after
-  it under repeated PAUSE runs.
+  PAUSE cases; recalls A305. What holds FMan is unknown. A341 cut what a paused port holds from ~12,500 small frames to
+  1,280, and the next 16 PAUSE cases on that image, run back to back, left no host-command timeout and every port
+  sending; keep open until a cause is found or a longer soak stays clean.
+
+- [ ] **A344 — the queues into SEC have no bound by default.** Every SA's to-SEC FQ joins a congestion group only when
+  the `sec_congestion` module parameter names a byte threshold (`create_ipsec_fqs()`, `cdx_dpaa_ingress_cgr_init()`,
+  `cdx/dpa_ipsec.c`); it defaults to 0, as in NXP's tree, and the FQ's own tail drop is compiled out (`FQ_TAIL_DROP`).
+  What waits there holds buffers of the Ethernet pool every port receives into, so traffic offered to an SA faster than
+  SEC processes it -- small frames at 10G, or several SAs at once -- can hold that pool exactly as A341's paused port
+  did, and every port's receive starves. Fix direction: one frame-counted group for every to-SEC FQ, a share of the
+  Ethernet pool as `fwd_pool_frames()` takes, sized against SEC's throughput rather than a link's; reproduce first with
+  a small-frame stream faster than SEC. Found by the review confirming A341; source-verified, not reproduced.
 
 - [ ] **A342 — `ipsec_vlan_iperf_probe.py` can fail when the WAN host starves a stream of its ACKs.** One full-suite
   run saw two of four streams stall from the start: the WAN host reordered their ESP ACKs past the 32-entry replay

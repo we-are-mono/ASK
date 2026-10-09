@@ -110,8 +110,8 @@ def test_queues(tmp_path, queues):
                      if line.startswith(("#define IPSEC_BUFCOUNT", "#define IPSEC_EGRESS_FRAMES")))
     (tmp_path / "cdx_queues.inc").write_text(
         bound + function(source, "fwd_tx_drain_dqrr") + function(source, "fwd_tx_ern")
-        + function(source, "fwd_cgr_bytes") + function(source, "sec_cgr_frames")
-        + function(source, "fwd_cgr_set")
+        + function(source, "fwd_cgr_bytes") + function(source, "fwd_cgr_frames")
+        + function(source, "fwd_pool_frames") + function(source, "fwd_cgr_set")
         + function(source, "fwd_cgr_owner") + function(source, "fwd_cgr_link_speed")
         + function(source, "dpa_fwd_cgr_follow_link") + function(source, "fwd_cgr_release")
         + function(source, "sec_cgr_init") + function(source, "sec_cgr_release")
