@@ -146,14 +146,6 @@ config FSL_DPAA_CS_THRESHOLD_10G
 	help
 	  The size in bytes of the egress Congestion State notification threshold on 10G ports.
 
-config FSL_DPAA_INGRESS_CS_THRESHOLD
-	hex "Ingress congestion threshold on FMan ports"
-	depends on FSL_SDK_DPAA_ETH
-	default "0x10000000"
-	help
-	  The size in bytes of the ingress tail-drop threshold on FMan ports.
-	  Traffic piling up above this value will be rejected by QMan and discarded by FMan.
-
 config FSL_DPAA_ETH_DEBUGFS
 	bool "DPAA Ethernet debugfs interface"
 	depends on DEBUG_FS && FSL_SDK_DPAA_ETH

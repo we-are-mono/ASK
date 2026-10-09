@@ -1317,14 +1317,8 @@ int dpa_fq_init(struct dpa_fq *dpa_fq, bool td_enable)
 			initfq.we_mask |= QM_INITFQ_WE_CGID;
 			initfq.fqd.fq_ctrl |= QM_FQCTRL_CGE;
 			initfq.fqd.cgid = (uint8_t)priv->ingress_cgr.cgrid;
-			/* Set a fixed overhead accounting, just like for the
-			 * egress CGR.
-			 */
-			initfq.we_mask |= QM_INITFQ_WE_OAC;
-			initfq.fqd.oac_init.oac = QM_OAC_CG;
-			initfq.fqd.oac_init.oal =
-				(signed char)(min(sizeof(struct sk_buff) +
-				priv->tx_headroom, (size_t)FSL_QMAN_MAX_OAL));
+			/* The group counts frames, so no per-frame byte
+			 * overhead is accounted. */
 		}
 
 		/* Initialization common to all ingress queues */

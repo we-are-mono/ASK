@@ -100,6 +100,13 @@ static uint8_t debug = -1;
 module_param(debug, byte, S_IRUGO);
 MODULE_PARM_DESC(debug, "Module/Driver verbosity level");
 
+/* How many quarters of what a port seeds the pool with its queues to the CPU
+ * may hold (dpaa_eth_priv_ingress_cgr_init()): half by default. */
+static uint ingress_quarters = 2;
+module_param(ingress_quarters, uint, 0444);
+MODULE_PARM_DESC(ingress_quarters,
+		 "Quarters of a port's pool seed its queues to the CPU may hold (1-4)");
+
 /* This has to work in tandem with the DPA_CS_THRESHOLD_xxx values. */
 static uint16_t tx_timeout = 1000;
 module_param(tx_timeout, ushort, S_IRUGO);
@@ -110,6 +117,10 @@ MODULE_PARM_DESC(tx_timeout, "The Tx timeout in ms");
 #define DPAA_ETH_MAX_PAD (L1_CACHE_BYTES * 8)
 
 static uint8_t dpa_priv_common_bpid;
+/* The per-CPU fill of that common pool, counted once for every private port
+ * (dpaa_eth_priv_probe()). Allocated with the first port and kept: private
+ * ports are not removed. */
+static int __percpu *dpa_priv_common_count;
 
 #ifdef CONFIG_FSL_DPAA_DBG_LOOP
 struct net_device *dpa_loop_netdevs[20];
@@ -898,10 +909,23 @@ dpa_priv_bp_probe(struct device *dev)
 	return dpa_bp;
 }
 
-/* Place all ingress FQs (Rx Default, Rx Error, PCD FQs) in a dedicated CGR.
- * We won't be sending congestion notifications to FMan; for now, we just use
- * this CGR to generate enqueue rejections to FMan in order to drop the frames
- * before they reach our ingress queues and eat up memory.
+/* Place all ingress FQs (Rx Default, Rx Error, PCD FQs) in a dedicated CGR,
+ * which refuses FMan's enqueue past its threshold, so FMan drops the frame.
+ *
+ * A frame waiting on these queues for the CPU holds a buffer of the pool
+ * every port receives into, and only the CPU taking it puts one back
+ * (dpaa_eth_refill_bpools()). The group counted bytes, up to 256 MB, so a
+ * flood the CPU could not keep up with -- traffic for the gateway itself, or
+ * for a flow not yet in hardware -- held the whole pool, and every port missed
+ * whatever it received, forwarding in hardware included. So it counts frames,
+ * at half of what this port seeds the pool with (ingress_quarters): a port's
+ * queues to the CPU then never hold more than half its own share, and a flood
+ * of one port leaves the others theirs. A quarter was measured too tight for
+ * the CPU's own forwarding -- some one frame in a hundred refused while 16,384
+ * connections were admitted at a measured pace, where half refused none -- and
+ * a whole share lost no less of a mass re-admission in hardware while leaving
+ * the pool less to receive into. Nothing consumes congestion state changes, so
+ * none are raised.
  */
 static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
 {
@@ -915,11 +939,15 @@ static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
 		goto out_error;
 	}
 
-	/* Enable CS TD, but disable Congestion State Change Notifications. */
 	memset(&initcgr, 0, sizeof(initcgr));
-	initcgr.we_mask = QM_CGR_WE_CS_THRES;
-	initcgr.cgr.cscn_en = QM_CGR_EN;
-	cs_th = CONFIG_FSL_DPAA_INGRESS_CS_THRESHOLD;
+	initcgr.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSCN_EN;
+	initcgr.cgr.mode = QMAN_CGR_MODE_FRAME;
+	initcgr.cgr.cscn_en = 0;
+	/* What this port seeds the pool with, not the pool's running total
+	 * (config_count), which every port probed after the first raises by
+	 * its own seed: bounded by that, the bound grew with probe order. */
+	cs_th = max_t(u32, CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() *
+			   clamp_t(uint, ingress_quarters, 1, 4) / 4, 1);
 	qm_cgr_cs_thres_set64(&initcgr.cgr.cs_thres, cs_th, 1);
 
 	initcgr.we_mask |= QM_CGR_WE_CSTD_EN;
@@ -1180,17 +1208,24 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
 		memset(percpu_priv, 0, sizeof(*percpu_priv));
 	}
 
-	priv->percpu_count = devm_alloc_percpu(dev, *priv->percpu_count);
-	if (!priv->percpu_count) {
-		dev_err(dev, "devm_alloc_percpu() failed\n");
-		err = -ENOMEM;
-		goto alloc_percpu_failed;
+	/* Every private port receives into the one common pool, so its fill is
+	 * counted once. Counted per port, a frame received on one port and
+	 * sent out of another found the sender's count already full and was
+	 * confirmed and freed, while the receiver refilled with new buffers --
+	 * an allocation and a free per forwarded frame. Each port still adds
+	 * its own share to what the pool is kept at, so the pool holds what
+	 * it did. */
+	if (!dpa_priv_common_count) {
+		dpa_priv_common_count = alloc_percpu(int);
+		if (!dpa_priv_common_count) {
+			dev_err(dev, "alloc_percpu() failed\n");
+			err = -ENOMEM;
+			goto alloc_percpu_failed;
+		}
+	} else {
+		dpa_bp->config_count += CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT;
 	}
-
-	for_each_possible_cpu(i) {
-		int *percpu_count = per_cpu_ptr(priv->percpu_count, i);
-		*percpu_count = 0;
-	}
+	priv->percpu_count = dpa_priv_common_count;
 
 	/* Initialize NAPI */
 	err = dpa_private_napi_add(net_dev);

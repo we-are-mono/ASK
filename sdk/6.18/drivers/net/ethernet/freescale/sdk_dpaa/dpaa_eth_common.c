@@ -1215,12 +1215,17 @@ void dpa_fq_setup(struct dpa_priv_s *priv, const struct dpa_fq_cbs_t *fq_cbs,
 }
 EXPORT_SYMBOL(dpa_fq_setup);
 
-static void dpa_fq_init_cgr(struct qm_mcc_initfq *initfq, uint8_t cgid,
-			    signed char oal)
+static void dpa_fq_init_cgr(struct qm_mcc_initfq *initfq, uint8_t cgid)
 {
 	initfq->we_mask |= QM_INITFQ_WE_CGID;
 	initfq->fqd.fq_ctrl |= QM_FQCTRL_CGE;
 	initfq->fqd.cgid = cgid;
+}
+
+static void dpa_fq_init_cgr_oac(struct qm_mcc_initfq *initfq, uint8_t cgid,
+				signed char oal)
+{
+	dpa_fq_init_cgr(initfq, cgid);
 	initfq->we_mask |= QM_INITFQ_WE_OAC;
 	initfq->fqd.oac_init.oac = QM_OAC_CG;
 	initfq->fqd.oac_init.oal = oal;
@@ -1289,7 +1294,8 @@ int dpa_fq_init(struct dpa_fq *dpa_fq, bool td_enable)
 			 * insufficient value, but even that is better than
 			 * no overhead accounting at all.
 			 */
-			dpa_fq_init_cgr(&initfq, priv->cgr_data.cgr.cgrid, oal);
+			dpa_fq_init_cgr_oac(&initfq, priv->cgr_data.cgr.cgrid,
+					    oal);
 
 		if (td_enable) {
 			initfq.we_mask |= QM_INITFQ_WE_TDTHRESH;
@@ -1320,20 +1326,19 @@ int dpa_fq_init(struct dpa_fq *dpa_fq, bool td_enable)
 			}
 		}
 
-		/* Put all *private* ingress queues in our "ingress CGR". */
+		/* Put all *private* ingress queues in our "ingress CGRs".
+		 * The groups count frames, so no per-frame byte overhead is
+		 * accounted.
+		 */
 		if (priv->use_ingress_cgr &&
 		    (dpa_fq->fq_type == FQ_TYPE_RX_DEFAULT ||
 		     dpa_fq->fq_type == FQ_TYPE_RX_ERROR ||
 		     dpa_fq->fq_type == FQ_TYPE_RX_PCD))
-			/* Set a fixed overhead accounting, just like for the
-			 * egress CGR.
-			 */
-			dpa_fq_init_cgr(&initfq, priv->ingress_cgr.cgrid, oal);
+			dpa_fq_init_cgr(&initfq, priv->ingress_cgr.cgrid);
 
 		if (priv->use_ingress_cgr &&
 		    dpa_fq->fq_type == FQ_TYPE_RX_PCD_HI_PRIO)
-			dpa_fq_init_cgr(&initfq, priv->ingress_cgr_hi_prio.cgrid,
-					oal);
+			dpa_fq_init_cgr(&initfq, priv->ingress_cgr_hi_prio.cgrid);
 
 		/* Initialization common to all ingress queues */
 		if (dpa_fq->flags & QMAN_FQ_FLAG_NO_ENQUEUE) {
