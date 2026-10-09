@@ -87,10 +87,10 @@ struct sec_descriptor {
 #define IPSEC_BUFSIZE	dpa_bp_size(NULL)
 /* SEC's output pool. A frame holds one of its buffers from SEC's job until the
  * frame leaves: sent by a port, dropped, or copied out by the CPU. SEC itself
- * has a few dozen in flight at line rate; the exception queues and each
- * Ethernet port's queues for these frames have a share of it below, an eighth
- * each, so that all of them full at once still leave SEC its own on a board of
- * up to five ports. */
+ * has a few dozen in flight at line rate; the exception queues, each Ethernet
+ * port's queues for these frames and the Wi-Fi VAPs' queues have a share of it
+ * (below, and VWD_FWD_FRAMES), an eighth each, so that all of them full at
+ * once still leave SEC its own on a board of up to five ports. */
 #define IPSEC_BUFCOUNT  1024
 #define	THRESHOLD_IPSEC_BPOOL_REFILL 16
 /* A frame the IPsec offline port sends the CPU, having missed its flow table,

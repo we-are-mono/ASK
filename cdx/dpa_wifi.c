@@ -37,6 +37,7 @@
 #include "dpaa_eth.h"
 #include "dpaa_eth_common.h"
 #include "dpa_wifi.h"
+#include "dpa_ipsec.h"
 #include "layer2.h"
 #include "cdx.h"
 #include "cdx_wifi_backend.h"
@@ -526,16 +527,57 @@ done:
 	return 0;
 
 rel_fd:
-	{
-		struct bm_buffer bmb;
-
-		memset(&bmb, 0, sizeof(struct bm_buffer));
-		bmb.bpid = dq->fd.bpid;
-		bmb.addr = dq->fd.addr;
-		while (bman_release(dpa_bp->pool, &bmb, 1, 0))
-			cpu_relax();	
-	}
+	/* Every buffer of the frame: a scatter/gather frame's data buffers
+	 * as well as its table, which is all a release of the FD's own
+	 * address gave back. */
+	dpa_fd_release(NULL, &dq->fd);
 	goto done;
+}
+
+/* Frames every VAP's forwarding queues may hold together before QMan refuses
+ * the classifier's enqueue and FMan drops the frame. The CPU drains them,
+ * copying out a frame in SEC's output pool and taking one in an Ethernet pool
+ * as it is, and hands each to the radio's own queue behind dev_queue_xmit(),
+ * which is where Wi-Fi traffic is meant to wait. A stream faster than that
+ * drain -- a tunnel at its line rate into one radio -- backed up here without
+ * bound: SEC's buffers until SEC refused every SA's jobs, an Ethernet pool's
+ * until the ports dropped what they received. This covers the CPU's lag, and
+ * is the Wi-Fi share of SEC's pool beside the exception queues' and each
+ * Ethernet port's (IPSEC_EGRESS_FRAMES). One group for every VAP, though a
+ * flow's queue is drained by one CPU: a share per portal would multiply the
+ * pool's commitment, and a CPU that falls behind holds the group at its
+ * threshold for every VAP until it catches up. */
+#define VWD_FWD_FRAMES	(IPSEC_BUFCOUNT / 8)
+
+/* No state-change notifications, so no portal owns the group; the egress
+ * groups set theirs up the same way (devman.c). */
+static int vwd_fwd_cgr_init(struct dpaa_vwd_priv_s *priv)
+{
+	struct qm_mcc_initcgr opts;
+
+	if (qman_alloc_cgrid(&priv->fwd_cgr.cgrid) < 0)
+		return -ENOSPC;
+	memset(&opts, 0, sizeof(opts));
+	opts.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSTD_EN |
+		       QM_CGR_WE_CSCN_EN;
+	opts.cgr.mode = QMAN_CGR_MODE_FRAME;
+	opts.cgr.cstd_en = QM_CGR_EN;
+	qm_cgr_cs_thres_set64(&opts.cgr.cs_thres, VWD_FWD_FRAMES, 1);
+	if (qman_modify_cgr(&priv->fwd_cgr, QMAN_CGR_FLAG_USE_INIT, &opts)) {
+		qman_release_cgrid(priv->fwd_cgr.cgrid);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* Every VAP's queues are out of service by now, which the release requires. */
+static void vwd_fwd_cgr_exit(struct dpaa_vwd_priv_s *priv)
+{
+	struct qm_mcc_initcgr opts;
+
+	memset(&opts, 0, sizeof(opts));
+	qman_modify_cgr(&priv->fwd_cgr, QMAN_CGR_FLAG_USE_INIT, &opts);
+	qman_release_cgrid(priv->fwd_cgr.cgrid);
 }
 
 static int create_vap_fwd_from_fman_fqs(struct vap_desc_s *vap, void *proc_entry)
@@ -613,7 +655,10 @@ static int create_vap_fwd_from_fman_fqs(struct vap_desc_s *vap, void *proc_entry
 		opts.fqd.dest.channel = dpa_fq->channel;
 		opts.fqd.dest.wq = dpa_fq->wq;
 		opts.we_mask = (QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL |
-				QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA);
+				QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA |
+				QM_INITFQ_WE_CGID);
+		opts.fqd.fq_ctrl = QM_FQCTRL_CGE;
+		opts.fqd.cgid = (u8)vap->vwd->fwd_cgr.cgrid;
 		if (qman_init_fq(fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
 			DPAWIFI_ERROR("%s::qman_init_fq failed for fqid %d\n",
 					__func__, dpa_fq->fqid);
@@ -1400,13 +1445,16 @@ int dpaa_vwd_init(void)
 	rc = vwd_init_ohport(priv);
 	if (rc < 0)
 		goto err_eth;
+	rc = vwd_fwd_cgr_init(priv);
+	if (rc)
+		goto err_oh;
 
 	/* The class and its device carry no character device: they are where
 	 * the statistics and per-VAP files live, under /sys/class/vwd/vwd0. */
 	priv->vwd_class = class_create("vwd");
 	if (IS_ERR(priv->vwd_class)) {
 		rc = PTR_ERR(priv->vwd_class);
-		goto err_oh;
+		goto err_cgr;
 	}
 	priv->vwd_device = device_create(priv->vwd_class, NULL, 0, NULL,
 					 "vwd0");
@@ -1426,6 +1474,8 @@ err_device:
 	device_unregister(priv->vwd_device);
 err_class:
 	class_destroy(priv->vwd_class);
+err_cgr:
+	vwd_fwd_cgr_exit(priv);
 err_oh:
 	vwd_free_ohport(priv);
 	synchronize_net();
@@ -1449,6 +1499,7 @@ void dpaa_vwd_exit(void)
 	dpaa_vwd_down(priv);
 	for (i = 0; i < MAX_WIFI_VAPS; i++)
 		release_vap_fqs(&priv->vaps[i]);
+	vwd_fwd_cgr_exit(priv);
 	vwd_free_ohport(priv);
 	synchronize_net();
 	/* Every queue is retired, so no poll can be scheduled any more. */

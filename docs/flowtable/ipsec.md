@@ -967,8 +967,8 @@ by the increments a dense burst loses (above), and `ipsec_sec_refused_<class>`
 gives each class under the names in `ft_sec_refusal[]`. Beside them,
 `ipsec_offline_port_rejected` counts what SEC did produce and the IPsec offline
 port then dropped because QMan would not take it: its exception queues full,
-the CPU behind, or an egress port's queue full. No xfrm counter stands for
-those.
+the CPU behind; an egress port's queues for SEC's frames full; or the Wi-Fi
+VAPs'. No xfrm counter stands for those.
 
 **No count exists per SA.** For an offloaded SA, `ip -s xfrm state` shows
 `replay-window 0 replay 0 failed 0` however many of its frames SEC refused,
@@ -1406,9 +1406,22 @@ offloaded TCP keeps 2.27 Gbit/s.
 
 `flowtable_ipv6_sa.py::test_exception_backlog_leaves_sec_its_buffers` is that
 case; `flowtable_service_ipsec_policy.py::test_receive_leaves_the_pool` proves
-the receive path borrows nothing, with every refill allocation failing. The
-Wi-Fi VAP forward queues can still hold pool-34 frames past the pool's size;
-they have no group (A334).
+the receive path borrows nothing, with every refill allocation failing.
+
+The Wi-Fi VAP forward queues are the same case. A decrypted flow leaving by a
+VAP is enqueued there by the offline port, and the CPU drains them -- copying a
+pool-34 frame out, taking an Ethernet-pool frame as it is -- into the radio's
+own queue behind `dev_queue_xmit()`, which drops rather than pushes back. They
+had no group (A334), so a decrypted stream faster than that drain, or a stall
+in it, took the pool the same way, and Ethernet traffic into a VAP the
+Ethernet pool. Every VAP's queues now join one group in frame mode with tail
+drop at `VWD_FWD_FRAMES`, 128 frames (`dpa_wifi.c`), set up before a VAP can
+open and released after the last queue: a share of SEC's pool, and of the
+Ethernet pool, for the CPU's lag only. One group for all VAPs rather than one
+per portal, which would multiply the pool's commitment; a CPU that falls behind
+holds it at its threshold for every VAP until it catches up. No rig test sends
+a flow out of a VAP; `tools/host_tests/wifi_forward_queues.py` compiles the
+queues with the group.
 
 #### Nor the ports it forwards to
 
@@ -1442,9 +1455,9 @@ refuses, and the offline port counts it in `ipsec_offline_port_rejected`. With
 the port paused, the same stream now loses 1,031,091 frames there, at the
 port's share; SEC refuses none, and the pool never reads below 880.
 
-The pool grew to 1024 for this: an eighth each to the exception queues and
-every Ethernet port, which on a five-port board leaves a quarter to SEC with
-every queue full at once. Each port's bound sits far below
+The pool grew to 1024 for this: an eighth each to the exception queues, the
+Wi-Fi VAP queues and every Ethernet port, which on a five-port board leaves an
+eighth to SEC with every queue full at once. Each port's bound sits far below
 the 2 ms its forwarding queues allow at 10 Gbit/s (128 full-size frames is
 157 µs), the cost of a pool that has to cover every port; it matters only
 where a fast port is congested by other traffic. `flowtable_ipsec_stalled_port.py`

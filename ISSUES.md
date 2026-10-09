@@ -318,12 +318,8 @@ result independently of those temporary files.
 - [x] **A333 — SEC refused IPsec jobs in bursts under bulk load.** `other` is anti-replay LATE against the WAN host's reordered
   ESP; `buffer_depletion` was CPU-bound misses holding SEC's pool, now bounded and copied (_:/^cdx: leave SEC its output pool when frames go to the CPU_).
 
-- [ ] **A334 — Wi-Fi VAP forward queues can still take SEC's output pool.** `create_vap_fwd_from_fman_fqs()`
-  (`cdx/dpa_wifi.c`) gives them no congestion group. The IPsec offline port forwards decrypted frames for an offloaded
-  Wi-Fi flow there, each in a pool-34 buffer, and the CPU drains them by copying (`sec_frag_fd_to_vwd_skb()`). A
-  decrypted stream faster than that copy, which a 2.5 Gbit/s tunnel into a ~650 Mbit/s radio can be, backs up there
-  as A333's exception queues did, and SEC then refuses every SA's jobs. Fix: a frame-mode tail-drop group on those
-  queues; they also carry Ethernet-pool frames, so it bounds both. Source-verified by the A333 review; not reproduced.
+- [x] **A334 — Wi-Fi VAP forward queues could take SEC's output pool.** Every VAP's queues now share one
+  frame-counted tail-drop group, a share of the pool; host-tested, no rig VAP flow (_:/^cdx: bound the Wi-Fi VAP forwarding queues_).
 
 - [x] **A335 — an egress port's congestion group bounded bytes, not SEC's buffers.** A paused LAN port held all of pool 34
   and SEC refused 1.03M jobs; the offline port now has frame-counted queues per port (_:/^cdx: give the IPsec offline port its own frame-counted egress queues_).
@@ -344,6 +340,19 @@ result independently of those temporary files.
   `br_change_mtu()` allows, then puts frames up to the bridge's MTU into hardware out of a member with a smaller one:
   the bridge in software drops them (`is_skb_forwardable()`), the port sends them. Fix: refuse when the path MTU
   exceeds the physical egress port's too. Source-verified by the review of the A335 follow-up; not reproduced.
+
+- [ ] **A338 — an offloaded frame an egress group drops still counts as transmitted.** A unicast entry's enqueue
+  action carries the egress port's logical stats pointer (`create_enque_hm()` in `cdx_ehash.c`), and the microcode
+  counts the frame there at enqueue, before QMan decides. A frame the port's forwarding group (A313) or its group for
+  SEC's frames (A335) then refuses is in the port's TX packets and bytes all the same, so a paused or congested port
+  reads as sending what it dropped. Multicast already opts out (`no_tx_stats`); unicast needs the refusals taken back
+  out, or the count moved to where the frame leaves. Source-verified by the A335 review; not measured.
+
+- [ ] **A339 — what an Ethernet port's own enqueue loses to a congestion group is attributed nowhere.** A flow from an
+  Ethernet port is enqueued by that port, so a frame its egress port's forwarding group (A313) or the Wi-Fi VAPs' group
+  (`VWD_FWD_FRAMES`, A334) refuses is dropped by FMan with no ERN, counted at most among the ingress port's BMI
+  discards, which mix every cause. The IPsec offline port's such losses are `ipsec_offline_port_rejected` (A336); the
+  Ethernet ports need the same, through the standard tools. Found by the A334 review; not measured.
 
 - [x] **A336 — frames the IPsec exception group drops were counted only in a register dump.** Now
   `ipsec_offline_port_rejected` in `/proc/cdx_flowtable`, from oh1's own count (_:/^cdx: count what the IPsec offline port could not enqueue_).

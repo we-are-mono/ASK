@@ -88,6 +88,8 @@ struct dpaa_vwd_priv_s {
 	struct device 				*vwd_device;
 	struct dpa_priv_s			*eth_priv;
 	uint32_t						oh_port_handle;
+	/* Tail drop over every VAP's forwarding queues together (dpa_wifi.c). */
+	struct qman_cgr				fwd_cgr;
 	struct vap_desc_s 	vaps[MAX_WIFI_VAPS];
 	spinlock_t 				vaplock;
 	struct vwd_global_stats_s  __percpu         	*vwd_global_stats;
