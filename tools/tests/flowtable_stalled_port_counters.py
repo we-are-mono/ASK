@@ -130,6 +130,10 @@ async def _paused_blast(r, size, label):
               "mac_after": after["links"][TARGET_LAN_IF]["mac"]}
     r.record(label, record)
     assert sent > 100_000 and hits > 100_000, record
+    # The pause held: far fewer frames left than arrived for the port. A
+    # pause that never took effect, or took effect too late, leaves nothing
+    # for what each case asserts to rest on.
+    assert hits - wire > hits // 2, record
     return record
 
 
@@ -270,9 +274,7 @@ async def test_paused_port_counts(rig, size):
     r = rig
     record = await _paused_blast(r, size, "stalled-port-counters")
     hits, wire, delta = record["hits"], record["wire"], record["delta"]
-    # The pause held: far fewer frames left than arrived for the port.
     dropped = hits - wire
-    assert dropped > hits // 2, record
     # A338: what the port says it sent is what its MAC sent.
     assert abs(delta[TARGET_LAN_IF]["tx_packets"] - wire) <= KERNEL_SLACK, record
     # A339: the port the frames came in by counts the rest, refused at the

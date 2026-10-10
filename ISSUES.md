@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A356 — the stalled-port pool test passed whether or not the pause took hold.** Test bug: every case of the file
+  now requires most of the flow refused at the paused port before its own checks (_:/^tests: require the pause to hold in every stalled-port case_).
+
 - [x] **A355 — a close of many connections could outlast the caller's 60 s.** The peer's closes held 32 slots each
   for their whole wait; they now start 32 every 5 ms and are waited for together (_:/^tests: start a peer's closes in batches_).
 
