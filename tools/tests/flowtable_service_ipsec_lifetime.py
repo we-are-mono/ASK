@@ -286,18 +286,20 @@ async def test_time_expiry(ipsec_service):
 
 @pytest.mark.rfc("4303", section="3.3.3")
 async def test_sequence_exhaustion(ipsec_service):
-    """A non-ESN SA eight numbers from the end of its space sends those eight
-    and no more: the counter never wraps, so no number is ever reused."""
+    """A non-ESN SA sends all seven supported tail sequences, ending at
+    0xFFFFFFFE. SEC refuses 0xFFFFFFFF itself; no number wraps or is reused."""
     r = ipsec_service
     start = 0xFFFFFFFF - 8
+    expected = list(range(start + 1, 0xFFFFFFFF))
     spi = await replace_outbound(r, "replay-oseq", hex(start))
     capture = Wire(r, "ipsec-sequence-exhaustion")
     capture.snaplen = 64
     async with capture:
         echoed = await echoes(r, 32)
     seqs = [seq for owner, seq in esp_sequences(capture.path) if owner == spi]
-    r.record("ipsec-sequence-exhaustion", {"spi": spi, "echoed": echoed, "wire": seqs})
-    assert echoed <= 8 and seqs == list(range(start + 1, start + 1 + len(seqs))), (echoed, seqs)
+    r.record("ipsec-sequence-exhaustion", {"spi": spi, "echoed": echoed, "wire": seqs,
+                                          "expected": expected})
+    assert echoed == len(expected) and seqs == expected, (echoed, seqs, expected)
     await replace_outbound(r)
     assert await echoes(r, 16) == 16, "a fresh SA does not carry the tunnel"
 
