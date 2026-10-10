@@ -44,10 +44,9 @@ def echo(count):
         time.sleep(0.002)
 def released():
     assert s.recv(1) == b'G', 'the far end closed without releasing the next phase'
-echo({warm})
-released()
-echo({measured})
-released()
+for count in {counts!r}:
+    echo(count)
+    released()
 s.close()
 print(json.dumps({{'port': port, 'sent': {sent}}}))
 '''
@@ -60,25 +59,29 @@ class GatedTcp:
     where this process listens.
 
     Use as an async context manager: `await warmed()` once admission has had
-    its phase, `await measure()` for the measured one. On the way out every
-    phase is released, so the peer always finishes and frees its console.
-    `peername` is the address the connection arrived from, after any
+    its phase, `await measure()` for the measured one. `more` adds phases of
+    those block counts after it, each released by another `measure()`, so one
+    connection can be measured on either side of a change. On the way out
+    every phase is released, so the peer always finishes and frees its
+    console. `peername` is the address the connection arrived from, after any
     translation; `report` is the peer's own account, once it has closed."""
 
     def __init__(self, run, *, source, peer, dport, label, sport=0, warm=32, measured=128,
-                 timeout=60):
+                 more=(), timeout=60):
         self.run, self.source, self.sport = run, source, sport
         self.peer, self.dport, self.label = peer, dport, label
-        self.warm, self.measured, self.timeout = warm, measured, timeout
-        self._echoed = [asyncio.Event(), asyncio.Event()]
-        self._released = [asyncio.Event(), asyncio.Event()]
+        self.counts, self.timeout = [warm, measured, *more], timeout
+        self._echoed = [asyncio.Event() for _ in self.counts]
+        self._released = [asyncio.Event() for _ in self.counts]
+        self._next = 1
+        self.connections = 0
         self.peername = self.report = self.result = None
 
     async def _serve(self, reader, writer):
+        self.connections += 1
         self.peername = tuple(writer.get_extra_info("peername")[:2])
         try:
-            for count, echoed, released in zip((self.warm, self.measured),
-                                               self._echoed, self._released):
+            for count, echoed, released in zip(self.counts, self._echoed, self._released):
                 for _ in range(count):
                     writer.write(await reader.readexactly(len(BLOCK)))
                     await writer.drain()
@@ -99,8 +102,8 @@ class GatedTcp:
         script = PEER.format(family="socket.AF_INET6" if family == socket.AF_INET6
                              else "socket.AF_INET",
                              source=self.source, sport=self.sport, peer=self.peer,
-                             dport=self.dport, warm=self.warm, measured=self.measured,
-                             sent=(self.warm + self.measured) * len(BLOCK))
+                             dport=self.dport, counts=self.counts,
+                             sent=sum(self.counts) * len(BLOCK))
         self.task = asyncio.create_task(self.run(script, timeout=self.timeout + 60,
                                                  label=self.label))
         return self
@@ -119,8 +122,10 @@ class GatedTcp:
         await self._phase(0)
 
     async def measure(self):
-        self._released[0].set()
-        await self._phase(1)
+        assert self._next < len(self.counts), f"{self.label}: no phase left to release"
+        self._released[self._next - 1].set()
+        await self._phase(self._next)
+        self._next += 1
 
     async def __aexit__(self, kind, error, trace):
         for released in self._released:
@@ -129,6 +134,9 @@ class GatedTcp:
             self.result = await self.task
         finally:
             self.server.close()
+            # wait_closed() waits for every connection, and a peer that
+            # stalled mid-phase never closes its end.
+            self.server.close_clients()
             await self.server.wait_closed()
         if kind is None:
             assert self.result.rc == 0, self.result.stdout

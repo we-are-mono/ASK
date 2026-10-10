@@ -39,9 +39,10 @@ from __future__ import annotations
 
 from _flowtable_tunnel import CHANGED_TTL
 
-from _flowtable_tunnel import (Capture, _admit, _assert_outer, _assert_tunnel, _both_directions, _directions, _established, _expected, _offload_table, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange)
+from _flowtable_tunnel import (MOVED_DEV, MOVED_GATEWAY, MOVED_MAC, Capture, _admit, _announce, _assert_outer, _assert_tunnel, _both_directions, _directions, _established, _expected, _moved_host, _offload_table, _outer_neighbour, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange, _undo)
 
 
+import asyncio
 import os
 import subprocess
 
@@ -246,6 +247,164 @@ async def test_rate(tunnel_rig, upload):
                       "--dport", str(shape.dport), check=False)
         if shape.family == 4:
             await command(r.target, r.session, "iptables", "-t", "nat", "-D", *accept)
+
+
+async def _follows(r, label, move, back, counter):
+    """One TCP connection through the tunnel, measured in hardware three
+    times: on the WAN host's own MAC, after `move()` points the outer path at
+    MOVED_MAC, and after `back()` returns it. Each move must retire the
+    generation it found -- its cookies gone, `counter` up -- and the next must
+    come back by itself on the same connection, its inserted outer frames
+    leaving for the new MAC.
+
+    The outer path is a dependency of the inserting direction alone, in the
+    outer header's family rather than the flow's: nothing the flow borrows
+    watches it. The stripping direction goes with it, sharing the flow's
+    handle."""
+    from scapy.all import Ether
+    shape = r.shape
+    await _offload_table(r, "tcp")
+
+    async def run(script, **kwargs):
+        return await lan_run_python(r.lan, script, **kwargs)
+
+    def cookies(state):
+        return {f["cookie"] for f in state["flows"]}
+
+    # A retired flow is re-added by its next packet only once Netfilter's
+    # garbage collection, a second or so later, has finished tearing the old
+    # one down, and an admission that loses RTNL is offered again a second
+    # after that. The phase that readmits runs for several seconds of both.
+    readmit = 1024
+    records = {}
+    async with GatedTcp(run, source=r.lan_address, sport=shape.sport, peer=shape.inner_orch,
+                        dport=shape.dport, label=f"flowtable_tunnel_{label}",
+                        more=(readmit, 128, readmit, 128)) as transfer:
+        await transfer.warmed()
+        state = await r.wait(lambda s: len(s["flows"]) == _expected(r, "tcp"))
+        for name, change, mac in (("own", None, r.wan_mac), ("moved", move, MOVED_MAC),
+                                  ("back", back, r.wan_mac)):
+            if change:
+                old, counted = cookies(state), state[counter]
+                await change()
+                retired = await r.wait(lambda s: not old & cookies(s) and s[counter] > counted)
+                assert retired["invalidated"] == 0 and retired["bindings"] == 2, retired
+                # The next phase is what offers the connection again.
+                await transfer.measure()
+                state = await r.wait(lambda s: len(s["flows"]) == _expected(r, "tcp")
+                                     and not old & cookies(s))
+            before = await r.state()
+            flows = await _both_directions(r, "tcp", before)
+            forward, reverse = _directions(r, flows)
+            _assert_tunnel(r, forward, reverse)
+            sent = await kernel_tx_packets(r.target, r.session, TARGET_WAN_IF)
+            capture = Capture(r, f"{label}-{name}")
+            capture.snaplen = 128
+            async with capture:
+                await transfer.measure()
+            sent = await kernel_tx_packets(r.target, r.session, TARGET_WAN_IF) - sent
+            state = after = await r.state()
+            new = {f["cookie"]: f for f in after["flows"]}
+            kept = {forward["cookie"], reverse["cookie"]} <= new.keys()
+            upload = int(new[forward["cookie"]]["packets"]) - int(forward["packets"]) if kept else 0
+            download = int(new[reverse["cookie"]]["packets"]) - int(reverse["packets"]) if kept else 0
+            packets = capture.packets()
+            destinations = {p[Ether].dst for p in packets}
+            records[name] = {"before": before, "after": after, "upload": upload, "download": download,
+                             "software_wan_tx": sent, "outer_destinations": sorted(destinations),
+                             "outer_neighbour": await _outer_neighbour(r)}
+            r.record(f"tunnel-{label}", records)
+            assert kept, ("readmitted mid-phase", name)
+            assert upload > 100 and download > 100, records[name]
+            assert 0 <= sent < upload // 4, records[name]
+            _assert_outer(r, packets, 100)
+            assert destinations == {mac}, (name, mac, destinations)
+    # One connection throughout: the far end accepted no other, and the peer's
+    # one socket would have failed on a reset.
+    assert transfer.connections == 1, transfer.connections
+    return records
+
+
+@pytest.mark.parametrize("tunnel_rig", ["6o4/neighbour", "4o6/neighbour"], indirect=True)
+async def test_outer_neighbour_moves(tunnel_rig):
+    """The WAN host's outer endpoint moves to another MAC and says so -- a
+    gratuitous ARP for 6o4's IPv4 outer header, an overriding Neighbor
+    Advertisement for 4o6's IPv6 one -- and later moves back. The DUT's
+    learned outer neighbour follows each time, the tunnel's established TCP
+    connection is retired from hardware and readmitted on the same
+    connection, and its inserted outer frames go to the MAC announced."""
+    r = tunnel_rig
+    shape = r.shape
+    family = ["-6"] if shape.outer_family == 6 else []
+    pinned = ["ip", *family, "neigh", "replace", shape.outer[1], "lladdr", r.wan_mac,
+              "nud", "permanent", "dev", TARGET_WAN_IF]
+    cleanup = []
+    try:
+        await _moved_host(r, cleanup)
+        if shape.outer_family == 4:
+            # This host would otherwise refresh its own entry for the DUT
+            # with an ARP request from its usual MAC, and an ARP request
+            # teaches its receiver the sender's MAC: the DUT would learn the
+            # old one back. 4o6's entry is pinned by the fixture.
+            await command(r.wan, r.session, "ip", "neigh", "replace", shape.outer[0], "lladdr",
+                          r.dut_wan_mac, "nud", "permanent", "dev", r.wan_if)
+            cleanup.append((r.wan, ["ip", "neigh", "replace", shape.outer[0], "lladdr", r.dut_wan_mac,
+                                    "nud", "stale", "dev", r.wan_if]))
+        # Learned rather than pinned: only a learned entry follows an
+        # announcement.
+        await command(r.target, r.session, "ip", *family, "neigh", "replace", shape.outer[1],
+                      "lladdr", r.wan_mac, "nud", "reachable", "dev", TARGET_WAN_IF)
+        cleanup.append((r.target, pinned))
+
+        def announcing(mac, device):
+            async def change():
+                _announce(r, mac, device)
+                for _ in range(20):
+                    if (await _outer_neighbour(r)).get("lladdr") == mac:
+                        return
+                    await asyncio.sleep(0.25)
+                pytest.fail(f"the DUT's outer neighbour never took {mac}: {await _outer_neighbour(r)}")
+            return change
+
+        await _follows(r, "outer-neighbour", announcing(MOVED_MAC, MOVED_DEV),
+                       announcing(r.wan_mac, r.wan_if), "neighbour_invalidations")
+    finally:
+        await _undo(r, cleanup)
+
+
+@pytest.mark.parametrize("tunnel_rig", ["6o4/route", "4o6/route"], indirect=True)
+async def test_outer_route_moves(tunnel_rig):
+    """The DUT's route to the WAN host's outer endpoint is replaced by one
+    through a gateway at another MAC, and later removed, which returns the
+    endpoint to its on-link route. The route watch matches the outer
+    destination in the outer header's family, the tunnel's established TCP
+    connection is retired and readmitted on the same connection, and its
+    inserted outer frames go to whichever next hop the route names."""
+    r = tunnel_rig
+    shape = r.shape
+    family = ["-6"] if shape.outer_family == 6 else []
+    gateway = MOVED_GATEWAY[shape.mode]
+    host = f"{shape.outer[1]}/{128 if shape.outer_family == 6 else 32}"
+    cleanup = []
+    unroute = (r.target, ["ip", *family, "route", "del", host, "dev", TARGET_WAN_IF])
+    try:
+        await _moved_host(r, cleanup)
+        await command(r.target, r.session, "ip", *family, "neigh", "replace", gateway, "lladdr",
+                      MOVED_MAC, "nud", "permanent", "dev", TARGET_WAN_IF)
+        cleanup.append((r.target, ["ip", *family, "neigh", "del", gateway, "dev", TARGET_WAN_IF]))
+
+        async def through_gateway():
+            cleanup.append(unroute)
+            await command(r.target, r.session, "ip", *family, "route", "replace", host, "via", gateway,
+                          "dev", TARGET_WAN_IF, *([] if family else ["onlink"]))
+
+        async def on_link():
+            await command(r.target, r.session, *unroute[1])
+            cleanup.remove(unroute)
+
+        await _follows(r, "outer-route", through_gateway, on_link, "route_invalidations")
+    finally:
+        await _undo(r, cleanup)
 
 
 @pytest.mark.parametrize("tunnel_rig", ["6o4/change"], indirect=True)

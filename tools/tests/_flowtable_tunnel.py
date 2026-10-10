@@ -45,7 +45,22 @@ MTU_4O6 = 1440          # 1500 less the 40-byte IPv6 outer header and a 20-byte 
 
 # One port pair per case so a conntrack left by one never feeds another.
 PORTS = {"routed": (48910, 48911), "mtu": (48920, 48921), "tcp": (48930, 48931),
-         "change": (48940, 48941), "delete": (48950, 48951), "rate": (48970, 48971)}
+         "change": (48940, 48941), "delete": (48950, 48951), "rate": (48970, 48971),
+         "neighbour": (48980, 48981), "route": (48982, 48983)}
+
+# Where the WAN host's outer endpoint moves to: a second MAC on its WAN
+# bridge (_moved_host).
+MOVED_DEV, MOVED_MAC = "ftmove0", "02:9d:99:b2:9a:01"
+# The WAN host's 6o4 outer endpoint when a case moves its MAC: an address of
+# its own rather than its segment address. Linux updates a neighbour from any
+# ARP packet's sender, and the WAN host ARPs for every other host on the
+# segment from its segment address and usual MAC, which would move the DUT's
+# entry straight back.
+OWN_OUTER_V4 = "198.18.108.2"
+# The gateway an outer route move sends through, its neighbour pinned to
+# MOVED_MAC: for 6o4 an address from the benchmarking range rather than the
+# WAN segment's own, for 4o6 one of the segment's test ULAs nothing else uses.
+MOVED_GATEWAY = {"6o4": "198.18.107.1", "4o6": "fc00:beef::7"}
 
 # What the outer header's TTL is asked to be, and what it is changed to by the
 # case that reconfigures the tunnel under a live flow.
@@ -87,12 +102,12 @@ class Shape:
     """One tunnel mode: the devices, the addresses at each end and the family
     of the flow inside it."""
 
-    def __init__(self, mode, sport, dport):
+    def __init__(self, mode, sport, dport, orch_outer=None):
         self.mode = mode
         self.sport, self.dport = sport, dport
         if mode == "6o4":
             self.device = TUN_6O4
-            self.outer = (DUT_WAN_IPV4, ORCH_IPV4)
+            self.outer = (DUT_WAN_IPV4, orch_outer or ORCH_IPV4)
             self.inner_dut, self.inner_orch = DUT_INNER_V6, ORCH_INNER_V6
             self.family, self.mtu, self.header = 6, MTU_6O4, 20
         else:
@@ -561,6 +576,14 @@ async def _outer_segment(r, cleanup):
         family = ["-6"]
     else:
         family = []
+        if orch_outer != ORCH_IPV4:
+            # An address of the WAN host's own for the case (OWN_OUTER_V4),
+            # on-link from the DUT though outside the segment's prefix.
+            await command(wan, r.session, "ip", "addr", "add", f"{orch_outer}/32", "dev", r.wan_if)
+            cleanup.append((wan, ["ip", "addr", "del", f"{orch_outer}/32", "dev", r.wan_if]))
+            await command(target, r.session, "ip", "route", "replace", f"{orch_outer}/32",
+                          "dev", TARGET_WAN_IF)
+            cleanup.append((target, ["ip", "route", "del", f"{orch_outer}/32", "dev", TARGET_WAN_IF]))
     old = json.loads((await command(target, r.session, "ip", "-j", *family, "neigh", "show",
                                     "to", orch_outer, "dev", TARGET_WAN_IF))["stdout"])
     restore = ["ip", *family, "neigh", "del", orch_outer, "dev", TARGET_WAN_IF]
@@ -571,6 +594,85 @@ async def _outer_segment(r, cleanup):
     await command(target, r.session, "ip", *family, "neigh", "replace", orch_outer, "lladdr",
                   r.wan_mac, "nud", "permanent", "dev", TARGET_WAN_IF)
     cleanup.append((target, restore))
+
+
+async def _moved_host(r, cleanup):
+    """A second MAC for the WAN host's outer endpoint: a macvlan on its WAN
+    bridge. It takes unicast only, so it answers the DUT's unicast neighbour
+    probes and never a LAN host's broadcast or multicast one, which would
+    teach the LAN a MAC that is gone once the case ends."""
+    wan, shape = r.wan, r.shape
+    await command(wan, r.session, "ip", "link", "del", MOVED_DEV, check=False)
+    await command(wan, r.session, "ip", "link", "add", MOVED_DEV, "link", r.wan_if, "address",
+                  MOVED_MAC, "type", "macvlan", "mode", "bridge")
+    cleanup.append((wan, ["ip", "link", "del", MOVED_DEV]))
+    # No link-local address, so the device sends nothing of its own from
+    # MOVED_MAC: no DAD, no router solicitation.
+    await command(wan, r.session, "ip", "link", "set", MOVED_DEV, "addrgenmode", "none")
+    # Outer packets arrive here for an address it does not carry, and a
+    # device with no IPv4 address fails any reverse-path filter. udev applies
+    # the sysctl defaults to a new device once it appears, after any value
+    # set before, so wait for it first. The orchestrator is this machine.
+    subprocess.run(["udevadm", "settle", "--timeout=10"], check=True, timeout=15)
+    await command(wan, r.session, "sysctl", "-w", f"net.ipv4.conf.{MOVED_DEV}.rp_filter=0")
+    value = await command(wan, r.session, "sysctl", "-n", f"net.ipv4.conf.{MOVED_DEV}.rp_filter")
+    assert value["stdout"].strip() == "0", value
+    await command(wan, r.session, "nft", f'''table netdev {MOVED_DEV} {{
+ chain ingress {{ type filter hook ingress device "{MOVED_DEV}" priority 0; policy accept;
+ ether daddr ff:ff:ff:ff:ff:ff drop
+ ether daddr & ff:ff:00:00:00:00 == 33:33:00:00:00:00 drop
+ }}
+}}''')
+    cleanup.append((wan, ["nft", "delete", "table", "netdev", MOVED_DEV]))
+    if shape.outer_family == 6:
+        # IPv6 answers a neighbour solicitation only for an address on the
+        # device it arrived on.
+        await command(wan, r.session, "ip", "-6", "addr", "add", f"{shape.outer[1]}/128",
+                      "dev", MOVED_DEV, "nodad")
+    await command(wan, r.session, "ip", "link", "set", MOVED_DEV, "up")
+
+
+async def _undo(r, cleanup):
+    """Every step of `cleanup`, newest first, each attempted whatever the one
+    before it did; what failed is reported together at the end."""
+    failures = []
+    for agent, argv in reversed(cleanup):
+        try:
+            result = await command(agent, r.session, *argv, check=False)
+            if result["rc"]:
+                failures.append(result)
+        except Exception as error:
+            failures.append({"argv": argv, "error": repr(error)})
+    assert not failures, failures
+
+
+def _announce(r, mac, device):
+    """The WAN host's outer endpoint announcing itself at `mac`, from
+    `device`: a gratuitous ARP request or an unsolicited, overriding Neighbor
+    Advertisement, unicast to the DUT so no other host on the segment learns
+    anything from it. Sent by device name: scapy's interface cache keeps the
+    index of a device an earlier case deleted."""
+    from scapy.all import ARP, Ether, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr, IPv6
+    dut, orch = r.shape.outer
+    if r.shape.outer_family == 4:
+        frame = Ether(src=mac, dst=r.dut_wan_mac) / ARP(op=1, hwsrc=mac, psrc=orch,
+                                                        hwdst="00:00:00:00:00:00", pdst=orch)
+    else:
+        frame = (Ether(src=mac, dst=r.dut_wan_mac) / IPv6(src=orch, dst=dut, hlim=255)
+                 / ICMPv6ND_NA(R=0, S=0, O=1, tgt=orch) / ICMPv6NDOptDstLLAddr(lladdr=mac))
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as raw:
+        raw.bind((device, 0))
+        for _ in range(2):
+            raw.send(bytes(frame))
+            time.sleep(0.05)
+
+
+async def _outer_neighbour(r):
+    """The DUT's neighbour entry for the WAN host's outer endpoint."""
+    family = ["-6"] if r.shape.outer_family == 6 else []
+    rows = json.loads((await command(r.target, r.session, "ip", "-j", *family, "neigh", "show",
+                                     r.shape.outer[1], "dev", TARGET_WAN_IF))["stdout"])
+    return rows[0] if rows else {}
 
 
 async def _wait_reachable(r, attempts=25):
@@ -627,7 +729,8 @@ async def tunnel_rig(target_agent, aiohttp_session, lan, splat_window, request):
     assert mode in {"6o4", "4o6"}, param
     sport, dport = PORTS[case or "routed"]
     r = TunnelRig()
-    r.shape = Shape(mode, sport, dport)
+    r.shape = Shape(mode, sport, dport,
+                    OWN_OUTER_V4 if (mode, case) == ("6o4", "neighbour") else None)
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     await ft.stop_boot_daemon()
