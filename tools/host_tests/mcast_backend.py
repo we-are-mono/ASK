@@ -137,37 +137,51 @@ def test_replace_keeps_the_key_in_the_classifier():
            "cdx_mcast_group_destroy" not in body, (
         "replace must not take the group's key out of the classifier")
     # The old chain is unreachable from the root but a walk can still be inside
-    # it, which is what the quarantine is for.
+    # it until a barrier completes (test_replace_frees_what_its_barrier_proves_
+    # and_parks_the_rest()).
     assert "cdx_ehash_quarantine_entry(" in body, (
-        "the displaced chain must be quarantined, not freed")
+        "a displaced chain whose barrier failed must be quarantined")
     assert "cdx_free_exthash_mcast_members(grp)" not in body, (
-        "the displaced chain must never be released outright")
+        "the group's own members are the new chain, never to be released here")
 
     publish = code("cdx_mc_publish_chain")
     assert publish.index("wmb();") < publish.index("first_member_flow_addr ="), (
         "the new chain must be visible to FMAN before the pointer that reaches it")
 
 
-def test_replace_drains_what_it_parks():
-    """The displaced chain is parked, and nothing else is bound to release it
-    soon: the flowtable backend issues a barrier only when it deletes or is
-    waiting on the backlog. Membership changes whenever anyone changes channel, so an
-    undrained backlog grows by a chain per change until the entry pool is
-    exhausted -- which fails every classifier insert, not just multicast.
+def test_replace_frees_what_its_barrier_proves_and_parks_the_rest():
+    """The displaced chain is out of the root entry's reach once the new one is
+    published, but a walk begun before may still be inside it until a barrier
+    completes. The splice's own barrier is tried first: what it proves gone goes
+    straight back to the allocator, and anything parked before it with it, so
+    the backlog settles at zero rather than growing by a chain per channel
+    change. Only what a failed barrier leaves is parked, for the next one. Parked
+    before the barrier, a record that could not be made leaked the entry for
+    good even when the barrier then completed (A360). Nothing else is bound to
+    release the backlog soon, so replace also drains it before building.
     """
     body = code("cdx_mc_group_replace")
-    park = body.index("cdx_ehash_quarantine_entry(")
+    swap = body.index("grp->members[ii] = fresh->members[ii];")
     assert body.count("cdx_ehash_quarantine_drain(") == 1 and \
-        body.index("cdx_ehash_quarantine_drain(") < park, "replace must reclaim before parking"
+        body.index("cdx_ehash_quarantine_drain(") < swap, "replace must reclaim before it builds"
     # The splice's own barrier, through the file's funnel so the test image
-    # can fail it, and only its success may release what it parked.
-    barrier = body.index("mc_hcsync(", park)
-    assert body.index("cdx_ehash_quarantine_free_all()", barrier) > barrier, (
-        "the barrier that settles the backlog must follow the parking")
-    # DPA_ERROR is a braced block, so the arms carry braces of their own.
-    assert re.search(r"if \(mc_hcsync\([^)]*\)\)\s*\{\s*DPA_ERROR\([^;]*;\s*\}\s*else\s*\{\s*"
-                     r"cdx_ehash_quarantine_free_all\(\);\s*\}", body[park:]), (
-        "a failed barrier must leave the displaced chain parked")
+    # can fail it, before anything displaced is parked or freed.
+    barrier = body.index("if (mc_hcsync(", swap)
+    assert body.index("cdx_ehash_quarantine_entry(") > barrier, (
+        "nothing displaced may be parked before its barrier has been tried")
+    assert "ExternalHashTableEntryFree(" not in body[:barrier], (
+        "nothing displaced may be freed before its barrier has completed")
+    otherwise = body.index("} else {", barrier)
+    failed, completed = body[barrier:otherwise], body[otherwise:]
+    completed = completed[:completed.index("\n\t}")]
+    assert re.search(r"if \(old\[ii\]\.bIsValidEntry[^)]*\)\s*cdx_ehash_quarantine_entry\([^;]*"
+                     r"old\[ii\]\.tbl_entry\);", failed) and "EntryFree" not in failed, (
+        "a failed barrier must park every displaced entry and free none")
+    assert re.search(r"if \(old\[ii\]\.bIsValidEntry[^)]*\)\s*ExternalHashTableEntryFree\("
+                     r"old\[ii\]\.tbl_entry\);", completed) and \
+        "cdx_ehash_quarantine_free_all();" in completed and \
+        "cdx_ehash_quarantine_entry(" not in completed, (
+        "a completed barrier must free the displaced entries and the backlog, and park nothing")
 
 
 def test_a_withdrawn_group_parks_against_its_own_table():

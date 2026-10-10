@@ -1548,11 +1548,12 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 		goto err_unlock;
 	}
 	/* The displaced chain is out of the root entry's reach but a walk
-	 * already under way can still be inside it, so it is parked rather
-	 * than freed. Swapping members[] is what the bucket lock protects --
-	 * the parameter store above is not ordered by it and does not need to
-	 * be -- so take the old entries out under the lock and park them
-	 * after: cdx_ehash_quarantine_entry() allocates. */
+	 * already under way can still be inside it until a barrier completes.
+	 * Swapping members[] is what the bucket lock protects -- the parameter
+	 * store above is not ordered by it and does not need to be -- so take
+	 * the old entries out under the lock, and decide their fate after the
+	 * barrier. Until then they are held only here, which nothing can ask to
+	 * see proven: that takes the transaction this holds (cdx_ft_proven()). */
 	{
 		struct mcast_group_member old[MC_MAX_LISTENERS_PER_GROUP];
 		unsigned int uiHash;
@@ -1573,23 +1574,28 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 		grp->uiListenerCnt = fresh->uiListenerCnt;
 		spin_unlock(lock);
 
-		for (ii = 0; ii < MC_MAX_LISTENERS_PER_GROUP; ii++)
-			if (old[ii].bIsValidEntry)
-				cdx_ehash_quarantine_entry(grp->pCtEntry->ct->td,
-							   old[ii].tbl_entry);
-	}
-	/* And the barrier proving the microcode has left the chain just
-	 * unlinked, which releases it and anything parked before it, so the
-	 * backlog settles at zero rather than growing by a chain per channel
-	 * change. This is the listener splice this interface performs, so its
-	 * barrier goes through mc_hcsync(): a failure leaves the displaced chain
-	 * parked for the next barrier on this PCD, and the test image can make
-	 * one fail on demand. */
-	if (mc_hcsync(grp->pCtEntry->ct->td)) {
-		DPA_ERROR("%s::FmPcdHcSync failed, %u entries still quarantined\n",
-			  __func__, cdx_ehash_quarantine_pending());
-	} else {
-		cdx_ehash_quarantine_free_all();
+		/* The barrier proving the microcode has left the chain just
+		 * unlinked. This is the listener splice this interface performs,
+		 * so it goes through mc_hcsync(), which the test image can fail
+		 * on demand. What it proves gone goes straight back, and what
+		 * was parked before it with it, so the backlog settles at zero
+		 * rather than growing by a chain per channel change. What a
+		 * failed one leaves is parked for the next barrier on this PCD
+		 * -- only then: a record that cannot be made leaks its entry,
+		 * which a completed barrier would have freed (A360). */
+		if (mc_hcsync(grp->pCtEntry->ct->td)) {
+			for (ii = 0; ii < MC_MAX_LISTENERS_PER_GROUP; ii++)
+				if (old[ii].bIsValidEntry && old[ii].tbl_entry)
+					cdx_ehash_quarantine_entry(grp->pCtEntry->ct->td,
+								   old[ii].tbl_entry);
+			DPA_ERROR("%s::FmPcdHcSync failed, %u entries still quarantined\n",
+				  __func__, cdx_ehash_quarantine_pending());
+		} else {
+			for (ii = 0; ii < MC_MAX_LISTENERS_PER_GROUP; ii++)
+				if (old[ii].bIsValidEntry && old[ii].tbl_entry)
+					ExternalHashTableEntryFree(old[ii].tbl_entry);
+			cdx_ehash_quarantine_free_all();
+		}
 	}
 	mutex_unlock(&mc_mutators_mutex);
 	kfree(fresh);

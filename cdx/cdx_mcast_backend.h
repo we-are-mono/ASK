@@ -204,8 +204,9 @@ int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
  * What actually happens is a pointer swap. The root entry's REPLICATE opcode
  * names the head of the chain the microcode walks, so the new set is built
  * unpublished and then becomes the chain in one store; the key never leaves the
- * table. The old chain goes to the quarantine rather than being freed, because
- * a walk already under way can still be inside it.
+ * table. A walk already under way can still be inside the old chain, so it is
+ * freed only once the barrier that follows has completed, and goes to the
+ * quarantine if that fails.
  *
  * The spec's key must equal the installed one -- a caller with a new key wants
  * a new group. The same all-or-nothing rule as add: on failure the previously

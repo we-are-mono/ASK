@@ -616,9 +616,9 @@ void cdx_ehash_quarantine_abandon(void)
  * failures are frequently transient (frame-pool exhaustion rather than a
  * wedged channel), so the reclaim attempt belongs on the next mutator
  * that touches the same PCD. Paths that delete a key get the retry for
- * free through cdx_ehash_delete_entry(); this entry point exists for the
- * ones that only splice (multicast listener REMOVE/UPDATE), which
- * otherwise issue no barrier at all. No-op when nothing is pending,
+ * free through cdx_ehash_delete_entry(); this entry point is for one that
+ * only splices -- a multicast group's replace -- before it builds, so the
+ * backlog is reclaimed before it can grow. No-op when nothing is pending,
  * which is the common case. */
 void cdx_ehash_quarantine_drain(void *td)
 {
