@@ -358,6 +358,45 @@ regs.close()
 '''
 
 
+# The IPsec offline port, which every frame SEC produces reaches next. Its
+# filter count is every frame FMan discarded for an error status, SEC's
+# refusals included.
+IPSEC_OFFLINE_PORT = "/sys/devices/platform/soc/1a00000.fman/1a83000.port/statistics/port_rx_filter_frame"
+
+# Where the DUT can lose a forwarded frame without an error of its own: each
+# port's drops, ingress enqueue refusals and the CPU's queue bound among them,
+# and the IPsec offline port's discards.
+DUT_DROPS = tuple(f"/sys/class/net/{dev}/statistics/{counter}"
+                  for dev in (TARGET_LAN_IF, TARGET_WAN_IF)
+                  for counter in ("rx_dropped", "tx_dropped")) + (IPSEC_OFFLINE_PORT,)
+
+
+async def dut_drops(r):
+    """DUT_DROPS as read now, each a count or the error reading it raised."""
+    drops = {}
+    for path in DUT_DROPS:
+        try:
+            drops[path] = (await read(r.target, r.session, path)).strip()
+        except Exception as error:
+            drops[path] = repr(error)
+    return drops
+
+
+MISSED = tuple(f"/sys/class/net/{dev}/statistics/rx_missed_errors" for dev in (TARGET_LAN_IF, TARGET_WAN_IF))
+
+
+@asynccontextmanager
+async def none_missed(r, label):
+    """Across the block, neither port missed a frame it received: the BMI had
+    a buffer for every one, and neither MAC's FIFO filled with them (A352)."""
+    before = {path: int((await read(r.target, r.session, path)).strip()) for path in MISSED}
+    yield
+    after = {path: int((await read(r.target, r.session, path)).strip()) for path in MISSED}
+    missed = {path: after[path] - before[path] for path in MISSED}
+    r.record(label, missed)
+    assert not any(missed.values()), f"the ports missed frames they received: {missed}"
+
+
 PORT_DROPS = f'''
 import json
 print(json.dumps({{dev: {{n: int(open(f"/sys/class/net/{{dev}}/statistics/{{n}}").read())

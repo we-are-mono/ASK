@@ -66,6 +66,14 @@ struct port_bmi_count {
 	u64 total;
 };
 
+/* A port's 64-bit MAC count, carried past the MAC's own resets into the total
+ * since CDX first read it. */
+struct port_mac_count {
+	bool ready;
+	u64 last;
+	u64 total;
+};
+
 //ethernet device information
 struct eth_iface_info {
 	struct net_device *net_dev;	//os device ref
@@ -113,6 +121,7 @@ struct eth_iface_info {
 		u64 packets, bytes;
 	} tx_wire;
 	struct port_bmi_count rx_discarded, rx_no_buffer;
+	struct port_mac_count rx_mac_dropped;
 	uint32_t rx_channel_id;		//channel id rx
 	uint32_t tx_channel_id;		//channel id tx
 	uint32_t tx_wq;			//tx work queue

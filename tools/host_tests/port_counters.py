@@ -1,5 +1,5 @@
 """A registered Ethernet port's standard counters, compiled from devman.c: its
-transmit counts from the MAC, its receive drops from the BMI."""
+transmit counts from the MAC, its receive drops from the BMI and the MAC."""
 
 from ask_orch.process import run_process
 
@@ -22,16 +22,18 @@ def test_port_counters(tmp_path):
     # The port's own state as portdefs.h declares it, not a restatement.
     ports = (ROOT / "cdx/portdefs.h").read_text()
     count = re.search(r"^struct port_bmi_count \{.*?\n\};\n", ports, re.S | re.M)
-    state = re.search(r"\tstruct \{\n\t\tbool ready;\n\t\tu64 base_packets.*?rx_no_buffer;\n", ports, re.S)
-    assert count and state, "port_bmi_count / tx_wire / rx_discarded"
+    mac_count = re.search(r"^struct port_mac_count \{.*?\n\};\n", ports, re.S | re.M)
+    state = re.search(r"\tstruct \{\n\t\tbool ready;\n\t\tu64 base_packets.*?rx_mac_dropped;\n", ports, re.S)
+    assert count and mac_count and state, "port_bmi_count / port_mac_count / tx_wire / rx_mac_dropped"
     (tmp_path / "port_counters_types.inc").write_text(
-        count.group() + "struct eth_iface_info {\n\tstruct net_device *net_dev;\n" + state.group() + "};\n")
+        count.group() + mac_count.group() +
+        "struct eth_iface_info {\n\tstruct net_device *net_dev;\n" + state.group() + "};\n")
     defines = re.findall(r"^#define (?:MEMAC_PAUSE_OCTETS|MEMAC_TX_TRIES|MEMAC_TX_PRIME_TRIES|"
                          r"MEMAC_TX_PRIME_GAP_US)\s.*$", source, re.M)
     assert len(defines) == 4, defines
     (tmp_path / "port_counters_production.inc").write_text("\n".join(defines) + "\n" + "\n".join(function(source, name) for name in [
         "fwd_cgr_owner", "memac_counter", "memac_tx_frames", "port_mac_tx", "port_tx_from_wire",
-        "port_bmi_read", "port_bmi_advance", "port_rx_drops_advance", "port_counters_prime",
+        "port_bmi_read", "port_bmi_advance", "port_mac_rx_advance", "port_rx_drops_advance", "port_counters_prime",
         "dpa_port_counters_sample", "virt_iface_stats_callback",
     ]))
     binary = tmp_path / "port_counters"

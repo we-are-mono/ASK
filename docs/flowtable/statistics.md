@@ -263,15 +263,25 @@ enqueue's count is still kept, and still read where there is no MAC.
 Receive adds what the port took in and FMan then dropped
 (`port_rx_drops_advance()`), from two of its BMI's counts. An enqueue a
 congestion group refused counts as a BMI discard and goes to `rx_dropped`; so
-does a frame an entry sends to the parked discard queue on purpose, and one
-the port's discard mask throws away. A frame the port found no buffer for in
-the pool every DPAA port shares is a BMI out-of-buffers discard and goes to
-`rx_missed_errors`, the counter Linux keeps for exactly that. A stalled port's
-queue could once hold that whole pool, and every port then missed everything
-it received; the queue's group now leaves it half (A341, qos.md, "A port
-without a hardware qdisc"). Both are 32 bits, so the statistics
-sampler reads them every 30 s besides every `dev_get_stats()`; at 10G
-minimum-size frames take one round in under five minutes.
+does a frame an entry sends to the parked discard queue on purpose. A frame
+the port found no buffer for in the pool every DPAA port shares is a BMI
+out-of-buffers discard and goes to `rx_missed_errors`, the counter Linux keeps
+for exactly that. A stalled port's queue could once hold that whole pool, and
+every port then missed everything it received; the queue's group now leaves it
+half (A341, qos.md, "A port without a hardware qdisc"). Both are 32 bits, so
+the statistics sampler reads them every 30 s besides every `dev_get_stats()`;
+at 10G minimum-size frames take one round in under five minutes.
+
+A frame the receive MAC had no room for in its own FIFO, because FMan had not
+yet drained it, never reaches FMan whole. The MAC drops it, or passes it on
+cut short and marked bad (`FM_FD_ERR_PHYSICAL`), which the port's discard mask
+then throws away as a bad frame, not as a BMI discard: neither is in the two
+counts above. The MAC's own count of both (RDRP) goes to `rx_missed_errors`
+as well (`port_mac_rx_advance()`), from where it stood when CDX took the port
+and past any reset of the MAC's counters (A352). It moved during line-rate
+bursts of 128 KB TCP records with IPsec offloaded while the 10G receive ports
+had NXP's 24 KB FIFOs; the board's device tree gives them 48 KB, under which
+the same bursts lost none.
 
 Measured with the LAN VM pausing the LAN port by 802.3x PAUSE frames while the
 WAN host sends down an offloaded flow

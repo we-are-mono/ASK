@@ -87,7 +87,7 @@
  *        fresh-node publication can't invalidate a reader. The
  *        spinlock covers readers outside the mutex
  *        (virt_iface_stats_callback via dev_get_stats, which reads a
- *        port's tx_wire and BMI drop counts, and
+ *        port's tx_wire and its BMI and MAC drop counts, and
  *        dpa_port_counters_sample from the statistics sampler, which
  *        carries the BMI counts past their wrap) and any
  *        reader that wants local invariants. Lock-free lookups
@@ -2503,16 +2503,44 @@ static void port_bmi_advance(const struct eth_iface_info *eth, e_FmPortCounters 
 	count->ready = true;
 }
 
+/* The frames the receive MAC dropped itself, its FIFO full because FMan had
+ * not yet drained it (A352): those it cut short and passed on marked bad,
+ * which the BMI then discards, and those it dropped whole. FMan never counts
+ * either among the drops above. Registers only; any context. */
+static void port_mac_rx_advance(struct eth_iface_info *eth)
+{
+	struct port_mac_count *count = &eth->rx_mac_dropped;
+	struct mac_device *mac;
+	struct memac_regs __iomem *regs;
+	u64 now;
+
+	if (!dpa_netdev_is_dpaa(eth->net_dev))
+		return;
+	mac = ((struct dpa_priv_s *)netdev_priv(eth->net_dev))->mac_dev;
+	regs = mac ? (struct memac_regs __iomem *)mac->vaddr : NULL;
+	if (!regs)
+		return;
+	now = memac_counter(&regs->rdrp_l, &regs->rdrp_u);
+	/* The count is 64 bits and never wraps: fewer than last time is the
+	 * MAC's counters reset, and everything counted since is new. */
+	if (count->ready)
+		count->total += now >= count->last ? now - count->last : now;
+	count->last = now;
+	count->ready = true;
+}
+
 static void port_rx_drops_advance(struct eth_iface_info *eth)
 {
 	port_bmi_advance(eth, e_FM_PORT_COUNTERS_DISCARD_FRAME, &eth->rx_discarded);
 	port_bmi_advance(eth, e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD,
 			 &eth->rx_no_buffer);
+	port_mac_rx_advance(eth);
 }
 
 /* Where the port's counts stand as CDX takes it, before anything can be
  * offloaded through it: the driver's own transmit counts and the MAC's, which
- * transmit carries on from, and the BMI's drops, which receive adds from.
+ * transmit carries on from, and the BMI's and the MAC's receive drops, which
+ * receive adds from.
  * Read here rather than at the first dev_get_stats(), which nothing promises
  * comes before the first offloaded frame. The port is not yet on the list.
  * Only a whole reading of the MAC is taken (port_mac_tx()); a port that never
@@ -2543,10 +2571,11 @@ static void port_counters_prime(struct eth_iface_info *eth)
 	port_rx_drops_advance(eth);
 }
 
-/* Read every registered port's wrapping counts often enough that none comes
- * round twice between two reads: at 10G, minimum-size frames take a 32-bit
- * one round in under five minutes. Process context, from the statistics
- * sampler; takes dpa_devlist_lock. */
+/* Read every registered port's receive drops, the BMI's 32-bit counts often
+ * enough that none comes round twice between two reads: at 10G, minimum-size
+ * frames take one round in under five minutes. The MAC's count does not wrap
+ * and is read along with them. Process context, from the statistics sampler;
+ * takes dpa_devlist_lock. */
 void dpa_port_counters_sample(void)
 {
 	struct dpa_iface_info *info;
@@ -2601,10 +2630,13 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 					 wire ? 0 : tx.bytes, wire ? 0 : tx.packets,
 					 CDX_IFSTATS_PORT_RX_OVERHEAD, 0);
 			/* Received, then dropped by FMan: refused at the
-			 * enqueue, or with no buffer to take it in (A339). */
+			 * enqueue, or with no buffer to take it in (A339). Or
+			 * never handed to it whole, the MAC's FIFO full (A352):
+			 * missed, as a frame there was no room for. */
 			port_rx_drops_advance(&iface_info->eth_info);
 			storage->rx_dropped += iface_info->eth_info.rx_discarded.total;
-			storage->rx_missed_errors += iface_info->eth_info.rx_no_buffer.total;
+			storage->rx_missed_errors += iface_info->eth_info.rx_no_buffer.total +
+						     iface_info->eth_info.rx_mac_dropped.total;
 			break;
 		}
 		printk("%s::unknown iface type,no stats available\n",

@@ -8,7 +8,7 @@ import secrets
 import pytest
 
 from _flowtable_connections import (by_key, healthy, peer)
-from _flowtable_rig import (command)
+from _flowtable_rig import (command, none_missed)
 from _flowtable_selective_neighbour import (warm)
 from _flowtable_service_ipsec import (INNER, Transform, flows_for, hardware, offline_port_discards)
 from _flowtable_service_ipsec_provenance import (COUNT, KEY, inject)
@@ -116,10 +116,12 @@ OVERLAP_TRANSFORMS = {
 async def test_ipsec_decrypted_frames_intact_under_overlap(ipsec_service):
     """SEC writes every decrypted frame whole while both rekey descriptors
     encrypt; SEC's own refusals are the only discards the offline port may
-    make (offline_port_discards())."""
+    make (offline_port_discards()). The records arrive back to back at line
+    rate on both ports, which neither MAC may drop for want of room in its
+    FIFO (none_missed())."""
     r, flows = ipsec_service, flows_for(ipsec_service)
     async with peer(r, flows, initial_ids=[0, 1, 2, 3], lease=400, listen_addresses=[INNER],
-                    tcp_size=131072) as p:
+                    tcp_size=131072) as p, none_missed(r, "overlap-intact-missed"):
         await warm(r, p, [0, 1, 2, 3], "overlap-intact-baseline", flows[:4])
         await r.ipsec.install("out", await r.ipsec.prepare_peer("out"))
         await p.rpc("open", [4])

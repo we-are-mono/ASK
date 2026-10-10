@@ -20,6 +20,7 @@ import pytest_asyncio
 from _flowtable_connections import by_key
 from _flowtable_rig import (
     DPORT,
+    IPSEC_OFFLINE_PORT,
     WAN_IP,
     Echo,
     artifact_dir,
@@ -52,10 +53,6 @@ SEC_EGRESS_FRAMES = int(re.search(r"^#define IPSEC_SHARE_FRAMES\s+(\d+)$", _POOL
 SEC_INPUT_FRAMES = SEC_EGRESS_FRAMES * int(re.search(
     r"^#define IPSEC_TO_SEC_FRAMES\s+\((\d+) \* IPSEC_SHARE_FRAMES\)$", _POOL_HEADER, re.M).group(1))
 
-# The IPsec offline port, which every frame SEC produces reaches next. Its
-# filter count is every frame FMan discarded for an error status, SEC's
-# refusals included.
-IPSEC_OFFLINE_PORT = "/sys/devices/platform/soc/1a00000.fman/1a83000.port/statistics/port_rx_filter_frame"
 # The FMan parser keeps its error counts only for the ports set in its
 # statistics mask, fmpr_ppsc, counted from the top bit by hardware port: the
 # IPsec offline port is port 3.

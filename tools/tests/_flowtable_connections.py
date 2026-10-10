@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from _flowtable_rig import DPORT, HEALTH_BASELINE, TABLE, WAN_IP, command, read
+from _flowtable_rig import DPORT, HEALTH_BASELINE, TABLE, WAN_IP, command, dut_drops, read
 from _flowtable_rig import SPORT as BASE_SPORT
 from ask_orch.commands import console_python
 from ask_orch.uart import Console
@@ -182,12 +182,14 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_s
     heartbeat = None
     path = "/tmp/ask-peer-" + secrets.token_hex(8)
     started = False
-    # What the DUT's transforms had dropped when the peer started, so a lost
-    # datagram's record says what dropped meanwhile, not since boot.
+    # What the DUT's transforms, ports and IPsec offline port had dropped when
+    # the peer started, so a lost datagram's record says what dropped
+    # meanwhile, not since boot.
     try:
         xfrm_before = await read(r.target, r.session, "/proc/net/xfrm_stat")
     except Exception as error:
         xfrm_before = repr(error)
+    drops_before = await dut_drops(r)
 
     async def echo(reader, writer):
         writers.add(writer)
@@ -343,7 +345,8 @@ for suffix in ('.py', '.pid', '.log', '.sock'):
                         if len(data) >= 12:
                             ident, serial = struct.unpack("!IQ", data[:12])
                             seen.setdefault(ident, []).append(serial)
-                    dut = {"/proc/net/xfrm_stat at start": xfrm_before}
+                    dut = {"/proc/net/xfrm_stat at start": xfrm_before,
+                           "drops at start": drops_before, "drops": await dut_drops(r)}
                     # A frame corrupted on either cable is counted only by the
                     # receiving end: the DUT's ports for what arrives there.
                     for dev in (TARGET_LAN_IF, TARGET_WAN_IF):

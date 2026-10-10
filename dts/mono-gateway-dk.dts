@@ -167,6 +167,15 @@
 		fman0-extended-args {
 			cell-index = <0x00>;
 			compatible = "fsl,fman-extended-args";
+			/* Charged only for the ports the SDK initialises: the host
+			 * command port (0xa00), the two offline ports, the three 1G
+			 * MACs' receive and transmit ports, and the two 10G MACs'.
+			 * With the 10G receive ports at 0xc000 that is 0x39a00 of
+			 * 0x3e500, leaving 0x4b00: room for one more offline port at
+			 * 0x3200, not for another 1G MAC's pair at 0x6400. A disabled
+			 * MAC's port is never initialised, so its node below is never
+			 * charged.
+			 */
 			total-fifo-size = <0x3e500>;
 
 			/* Offline ports for CDX - cell-index overridden for SDK compatibility:
@@ -190,9 +199,12 @@
 				buffer-layout = <0x60 0x40>;
 			};
 
-			/* All 1G ports need extended-args (SDK driver requirement) */
+			/* A port with no node takes the SDK's defaults. The disabled
+			 * MACs' nodes are kept for a board that enables one, which
+			 * must first find it room in the budget above.
+			 */
 
-			/* MAC1 (ethernet@e0000) - cell-index 0 - disabled but needed */
+			/* MAC1 (ethernet@e0000) - cell-index 0 - disabled */
 			fman0_rx0-extended-args {
 				cell-index = <0x00>;
 				compatible = "fsl,fman-port-1g-rx-extended-args";
@@ -224,7 +236,7 @@
 				buffer-layout = <0x60 0x40>;
 			};
 
-			/* MAC3 (ethernet@e4000) - cell-index 2 - disabled but needed */
+			/* MAC3 (ethernet@e4000) - cell-index 2 - disabled */
 			fman0_rx2-extended-args {
 				cell-index = <0x02>;
 				compatible = "fsl,fman-port-1g-rx-extended-args";
@@ -240,7 +252,7 @@
 				buffer-layout = <0x60 0x40>;
 			};
 
-			/* MAC4 (ethernet@e6000) - cell-index 3 - disabled but needed */
+			/* MAC4 (ethernet@e6000) - cell-index 3 - disabled */
 			fman0_rx3-extended-args {
 				cell-index = <0x03>;
 				compatible = "fsl,fman-port-1g-rx-extended-args";
@@ -288,11 +300,18 @@
 				buffer-layout = <0x60 0x40>;
 			};
 
-			/* MAC9 (ethernet@f0000) - 10G cell-index 0 */
+			/* MAC9 (ethernet@f0000) - 10G cell-index 0.
+			 * A 10G receive port's FIFO is what holds a burst at line
+			 * rate while FMan classifies it; NXP's 24 KB (0x6000) let
+			 * the MAC's own FIFO overflow under back-to-back 128 KB
+			 * TCP records with IPsec offloaded, dropping frames no
+			 * FMan counter saw (A352). 48 KB lost none, and holds five
+			 * 9600-byte frames rather than two.
+			 */
 			fman0_rx6-extended-args {
 				cell-index = <0x00>;
 				compatible = "fsl,fman-port-10g-rx-extended-args";
-				fifo-size = <0x6000 0x00>;
+				fifo-size = <0xc000 0x00>;
 				buffer-layout = <0x60 0x40>;
 				vsp-window = <0x02 0x00>;
 			};
@@ -304,11 +323,11 @@
 				buffer-layout = <0x60 0x40>;
 			};
 
-			/* MAC10 (ethernet@f2000) - 10G cell-index 1 */
+			/* MAC10 (ethernet@f2000) - 10G cell-index 1, sized as MAC9 */
 			fman0_rx7-extended-args {
 				cell-index = <0x01>;
 				compatible = "fsl,fman-port-10g-rx-extended-args";
-				fifo-size = <0x6000 0x00>;
+				fifo-size = <0xc000 0x00>;
 				buffer-layout = <0x60 0x40>;
 				vsp-window = <0x02 0x00>;
 			};

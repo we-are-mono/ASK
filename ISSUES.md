@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A352 — line-rate bursts overflowed the 10G receive MACs' FIFOs, dropping frames no counter saw.** The 10G receive
+  ports get 48 KB FIFOs, and the MAC's own drops count in `rx_missed_errors` (_:/^dts: give the 10G receive ports room_).
+
 - [x] **A351 — counter reads and deletions for a port that does not own the flow took the backend transaction.** Patch 140
   names each direction's ingress for every command, and the other ports' visits are answered before it (_:/^cdx: answer other ports' visits without the transaction_).
 

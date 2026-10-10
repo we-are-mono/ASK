@@ -37,10 +37,11 @@ struct rtnl_link_stats64 {
     u64 rx_packets, tx_packets, rx_bytes, tx_bytes, rx_dropped, tx_dropped, rx_missed_errors;
 };
 struct cdx_ft_stats { u64 bytes, packets; };
-/* The mEMAC's transmit counters, each two 32-bit halves. */
+/* The mEMAC's transmit counters and its receive drops, each two 32-bit halves. */
 struct memac_regs {
     u32 toct_l, toct_u, tfrm_l, tfrm_u, txpf_l, txpf_u;
     u32 tuca_l, tuca_u, tmca_l, tmca_u, tbca_l, tbca_u;
+    u32 rdrp_l, rdrp_u;
 };
 struct fm_port_model { u32 discards, no_buffer; };
 typedef struct { t_Handle h_Dev; } t_LnxWrpFmPortDev;
@@ -73,8 +74,9 @@ static void udelay(unsigned long us) { (void)us; }
 /* The MAC: what it has sent, kept whole, and served in halves. A carry may be
  * due between an upper half's read and the lower's. As measured on the rig,
  * its own PAUSE frames are among its good frames (TFRM) and octets (TOCT), and
- * not among its unicast, multicast or broadcast ones. */
-static struct { u64 unicast, multicast, broadcast, octets, pause; } mac;
+ * not among its unicast, multicast or broadcast ones. It also drops frames it
+ * received, when its FIFO is full. */
+static struct { u64 unicast, multicast, broadcast, octets, pause, rx_dropped; } mac;
 static struct memac_regs regs;
 static int carry_on_read;
 /* Something the MAC sends while a reading is under way: on the given register
@@ -100,6 +102,7 @@ static u32 ioread32be(const u32 *reg)
     halves(&regs.tuca_l, &regs.tuca_u, mac.unicast);
     halves(&regs.tmca_l, &regs.tmca_u, mac.multicast);
     halves(&regs.tbca_l, &regs.tbca_u, mac.broadcast);
+    halves(&regs.rdrp_l, &regs.rdrp_u, mac.rx_dropped);
     return *reg;
 }
 static struct fm_port_model rx_port;
@@ -216,6 +219,7 @@ int main(void)
     transmit(100, 100 - ETH_FCS_LEN);
     rx_port.discards = 7;
     rx_port.no_buffer = 9;
+    mac.rx_dropped = 11;
 
     /* CDX takes the port: where it stands then is where everything counts
      * from, whether or not anything reads the counters before the first
@@ -329,6 +333,23 @@ int main(void)
     rx_port.no_buffer = 2;
     s = read_stats(3);
     assert(s.rx_dropped == 3 + dropped + 0x20 && s.rx_missed_errors == missed + 3);
+
+    /* Frames the receive MAC dropped itself, its FIFO full because FMan had
+     * not drained it, are missed as well (A352): FMan never saw them, or saw
+     * them cut short and discarded them, and counted neither. From where the
+     * MAC stood when CDX took the port, as everything else. */
+    u64 discarded = s.rx_dropped;
+    missed = s.rx_missed_errors;
+    mac.rx_dropped += 20;
+    s = read_stats(3);
+    assert(s.rx_missed_errors == missed + 20 && s.rx_dropped == discarded);
+    /* The MAC's counters reset: what it has dropped since is all new. */
+    mac.rx_dropped = 4;
+    s = read_stats(3);
+    assert(s.rx_missed_errors == missed + 20 + 4 && s.rx_dropped == discarded);
+    mac.rx_dropped += 6;
+    s = read_stats(3);
+    assert(s.rx_missed_errors == missed + 30);
 
     /* Where the counters start from is taken whole as well: a PAUSE frame
      * sent while CDX takes the port, on whichever read it lands, leaves the
