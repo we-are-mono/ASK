@@ -396,12 +396,19 @@ unsigned int cdx_ft_resume_failures(void);
  * Also what a failed unicast delete latches, through cdx_ft_del(). */
 void cdx_ft_fatal(void);
 unsigned int cdx_ft_pending(void);
+/* Everything unlinked through this backend or parked by CDX -- a flow's key,
+ * a multicast group's old listener chain, an SA's entry -- is proven out of
+ * the hardware's reach: no failure latched while the ports still run, and
+ * nothing pending once the one barrier this issues for it has completed. What
+ * must hold before hardware a port let go of -- a CEETM channel, the DSCP map
+ * -- may serve another port. 0, or -EAGAIN to ask again later. */
+int cdx_ft_proven(void);
 
 /* Nothing the adapter installed through this backend -- a flow direction, an
- * SA or a multicast group -- is in the hardware, live or waiting on a delete.
- * Takes the transaction itself, so it is for CDX's own callers -- one that has
- * to know the classifier is not reading something while no adapter is
- * registered to ask. */
+ * SA or a multicast group -- is in the hardware, live or unlinked and not yet
+ * proven gone (cdx_ft_proven()). Takes the transaction itself, so it is for
+ * CDX's own callers -- one that has to know the classifier is not reading
+ * something while no adapter is registered to ask. */
 bool cdx_ft_idle(void);
 
 /* Admission also excludes network configuration. Call outside RTNL; begin

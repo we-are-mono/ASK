@@ -920,6 +920,9 @@ static unsigned cdx_ft_pending(void) { return private_pending + legacy_pending +
  * failure only for the backend's own, as the backend does. */
 static unsigned recoveries;
 static bool barrier_fails;
+/* The latch's ports found stopped and idle behind a barrier: they stay so
+ * until the restart, which clears the latch. */
+static bool latch_stopped;
 static int cdx_ft_recover(void)
 {
     assert(cdx_info->ctrl.mutex);
@@ -928,10 +931,24 @@ static int cdx_ft_recover(void)
         if (!rtnl_trylock()) return -EAGAIN;
         int rc = dpa_cfg_quiesce(); rtnl_unlock();
         if (rc) return -EAGAIN;
+        latch_stopped = true;
     }
     if (!barrier_fails)
         private_pending = legacy_pending = owed = 0;
     return barrier_fails && (private_pending || owed) ? -EAGAIN : retry_error;
+}
+/* Whether every unlink is proven out of the hardware's reach: no latch whose
+ * key may still be linked with the ports running, and nothing retired or
+ * parked once the barrier it issues for them has run. */
+static unsigned proofs;
+static int cdx_ft_proven(void)
+{
+    assert(cdx_info->ctrl.mutex);
+    proofs++;
+    if (ft_fatal && !latch_stopped) return -EAGAIN;
+    if (cdx_ft_pending() && !barrier_fails)
+        private_pending = legacy_pending = owed = 0;
+    return cdx_ft_pending() ? -EAGAIN : 0;
 }
 /* The parked rearm's retry is counted apart from the invalidation worker's,
  * so a case can say which of the two was asked to come back. */
@@ -7979,7 +7996,7 @@ static void test_egress_drain(void)
     rtnl_busy = false;
     assert(!ft_egress_drain(&out) && ft_invalid_done);
     list_del(&binding.list);
-    ft_invalid = 0; ft_invalid_done = false; ft_fatal = false;
+    ft_invalid = 0; ft_invalid_done = false; ft_fatal = false; latch_stopped = false;
 
     /* A rearm landing while the drain waits clears the latch and resets the
      * done flag with it; it only rearms a finished invalidation, so the
@@ -8019,6 +8036,32 @@ static void test_egress_drain(void)
     assert(ft_egress_drain(&out) == -EAGAIN && mc_drains == 2 && mr_drains == 2);
     mr_drain_rc = 0;
     assert(!ft_egress_drain(&out) && mc_drains == 3 && mr_drains == 3);
+
+    /* A group rebuilt or deleted, or an SA's entry, whose barrier failed:
+     * its old chain is out of the root's reach and parked, but a walk begun
+     * before the splice may still be inside it, sending to the port's
+     * queues. The drain issues a barrier for it, under the transaction, and
+     * holds while that fails. So does a deletion that could not be proven
+     * unlinked at all -- a group's root, latched with no invalidation of the
+     * adapter's own -- until the ports that walk the tables are stopped
+     * behind a barrier, as they stay until the restart settles it. A learner
+     * that cannot vouch for a group is answered first: nothing is proven for
+     * a chain not yet rebuilt. */
+    proofs = 0;
+    legacy_pending = 1; barrier_fails = true;
+    assert(ft_egress_drain(&out) == -EAGAIN && proofs == 1 && legacy_pending == 1);
+    assert(!cdx_info->ctrl.mutex);
+    barrier_fails = false;
+    assert(!ft_egress_drain(&out) && proofs == 2 && !legacy_pending);
+    ft_fatal = true;
+    assert(ft_egress_drain(&out) == -EAGAIN && proofs == 3);
+    latch_stopped = true;
+    assert(!ft_egress_drain(&out) && proofs == 4);
+    ft_fatal = latch_stopped = false;
+    mc_drain_rc = -EAGAIN; legacy_pending = 1;
+    assert(ft_egress_drain(&out) == -EAGAIN && proofs == 4 && legacy_pending == 1);
+    mc_drain_rc = 0;
+    assert(!ft_egress_drain(&out) && proofs == 5 && !legacy_pending);
 
     /* An SA being deleted has left the watch list, and its entries -- an
      * outbound one reads the port's DSCP map -- leave the hardware only when

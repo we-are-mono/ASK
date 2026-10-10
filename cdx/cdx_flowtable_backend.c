@@ -357,6 +357,9 @@ static int cdx_ft_restart(unsigned long *delay)
 	rc = dpa_cfg_stop();
 	if (rc == -EXDEV) {
 		rc = 0;
+		/* Nor does an earlier stop prove anything any more: that port
+		 * walks the tables whatever CDX's own do (cdx_ft_proven()). */
+		ft_stopped_at = 0;
 		cdx_ft_set_terminal("a port CDX did not configure reaches the classifier");
 		goto out;
 	}
@@ -517,6 +520,27 @@ unsigned int cdx_ft_pending(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_pending, ASK_CDX_FLOWTABLE);
 
+/* An unlink is out of the hardware's reach only once a barrier has completed
+ * behind it: until then a walk begun before it may still be inside what it
+ * unlinked -- a flow's key, a multicast group's old listener chain, an SA's
+ * entry -- and send by it. So nothing is proven while anything is retired or
+ * parked without one; one barrier is issued here for all of it, as one proves
+ * every unlink before it. A deletion that could not be proven unlinked at all
+ * latched the failure, and its key may still be linked: no barrier proves that
+ * gone. Once the ports that walk the tables are found stopped and idle with a
+ * barrier behind them, though, nothing reaches it, and they stay stopped until
+ * the restart has settled it. 0, or -EAGAIN. */
+int cdx_ft_proven(void)
+{
+	cdx_ft_assert_held();
+	if (ft_failed && !ft_stopped_at)
+		return -EAGAIN;
+	if (cdx_ft_pending())
+		cdx_ft_hw_retry();
+	return cdx_ft_pending() ? -EAGAIN : 0;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_proven, ASK_CDX_FLOWTABLE);
+
 bool cdx_ft_idle(void)
 {
 	bool idle;
@@ -524,7 +548,7 @@ bool cdx_ft_idle(void)
 	cdx_ft_begin();
 	/* SAs and multicast groups too: an adapter that has unregistered its
 	 * egress hook retires them after it, on its way out. */
-	idle = !ft_live && !cdx_ft_pending() && !cdx_ipsec_sa_count() &&
+	idle = !ft_live && !cdx_ft_proven() && !cdx_ipsec_sa_count() &&
 	       !cdx_mc_group_count();
 	cdx_ft_end();
 	return idle;
@@ -861,9 +885,10 @@ int cdx_ft_recover(void)
 		rtnl_unlock();
 		ft_recover_next = 0;
 		/* Another port still walks the tables: no stop of CDX's own
-		 * proves anything, now or later, so nothing it retired is
-		 * freed. */
+		 * proves anything, now or later -- nor an earlier one -- so
+		 * nothing it retired is freed. */
 		if (rc == -EXDEV) {
+			ft_stopped_at = 0;
 			cdx_ft_set_terminal("a port CDX did not configure reaches the classifier");
 			cdx_ft_hw_strand();
 			return cdx_ft_hw_retry();

@@ -625,29 +625,36 @@ void cdx_ehash_quarantine_drain(void *td)
 
 /* The same retry for a caller with no table of its own to issue the
  * barrier through: one sync through the first parked entry's recorded
- * table. A direct sync, deliberately not routed through the multicast
- * fault knob's funnel, so an armed knob never keeps a backlog alive.
- * Returns 0 when nothing is parked any more, -EAGAIN when the sync
+ * table, or, when none recorded one, the PCD's own -- any table on it is
+ * barrier enough. A direct sync, deliberately not routed through the
+ * multicast fault knob's funnel, so an armed knob never keeps a backlog
+ * alive. Returns 0 when nothing is parked any more, -EAGAIN when the sync
  * failed and everything stays parked. Quiet on failure: the sync itself
  * already logs, and a caller that retries on a timer should not add a
  * line per attempt. */
 int cdx_ehash_quarantine_retry(void)
 {
 	struct cdx_ehash_pending_free *node;
+	void *td = NULL;
 
 	cdx_ehash_quarantine_assert_held();
+	if (list_empty(&cdx_ehash_pending_frees))
+		return 0;
 	list_for_each_entry(node, &cdx_ehash_pending_frees, list)
 	{
-		if (!node->td)
-			continue;
-		if (ExternalHashTableFmPcdHcSync(node->td))
-			return -EAGAIN;
-		cdx_ehash_quarantine_free_all();
-		return 0;
+		if (node->td) {
+			td = node->td;
+			break;
+		}
 	}
-	/* Nothing parked, or nothing that named a table to sync through:
-	 * the latter waits for a barrier from a caller that has one. */
-	return list_empty(&cdx_ehash_pending_frees) ? 0 : -EAGAIN;
+	if (!td)
+		td = dpa_get_ehash_td();
+	/* With no table configured at all, the backlog waits for a barrier
+	 * from a caller that has one. */
+	if (!td || ExternalHashTableFmPcdHcSync(td))
+		return -EAGAIN;
+	cdx_ehash_quarantine_free_all();
+	return 0;
 }
 
 /* Table entries a delete could not prove it unlinked.

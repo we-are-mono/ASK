@@ -1963,10 +1963,11 @@ void cdx_ft_egress_restarted(void)
  *
  * The release waits until the flowtable has nothing left that sends to them
  * (cdx_ft_egress_drain(), which rebuilds itself the multicast groups their
- * workers have not got to, and waits for the rest) and only then ends the
- * quarantine, popping what the entries left
- * (ceetm_end_quarantine()). Until then what they left is charged as what the
- * queues hold, as the cap charges any queue no tree uses.
+ * workers have not got to, and waits for the rest) -- nor anything a walk begun
+ * before an unlink may still be inside, which only a completed barrier proves
+ * (cdx_ft_proven()) -- and only then ends the quarantine, popping what the
+ * entries left (ceetm_end_quarantine()). Until then what they left is charged
+ * as what the queues hold, as the cap charges any queue no tree uses.
  *
  * Locks. The drain sleeps on the flowtable's own work, which takes the control
  * mutex, whose holder takes cdx_htb_mutex in cdx_htb_port_gone(): so the work

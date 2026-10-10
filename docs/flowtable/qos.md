@@ -1170,9 +1170,16 @@ only after it has marked the port's entries for re-installation. It holds the
 netdev and waits, with no lock of CDX's held and no RTNL, for the flowtable to
 say every entry it marked has been retired or rebuilt (`cdx_ft_egress_drain()`,
 which rebuilds itself the multicast groups their workers have not got to, and
-waits for the rest); then it pops what the entries left on the queues, frees
-their buffers and gives the channels back (`ceetm_end_quarantine()`), and
-redraws every tree's shares, since those frames were charged. A drain that
+waits for the rest). Retired or rebuilt is not yet gone: a walk begun before an
+unlink may still be inside what it unlinked — a group's old listener chain, an
+SA's entry, a flow's key — until a host-command barrier completes, and a
+rebuild whose barrier failed leaves that chain parked. So the drain also asks
+the backend whether every unlink is proven (`cdx_ft_proven()`): nothing parked
+or retired once a barrier it issues itself has completed, and no deletion
+latched for want of proof while the ports still run (A357). Then it pops what
+the entries left on the queues, frees their buffers and gives the channels back
+(`ceetm_end_quarantine()`), and redraws every tree's shares, since those frames
+were charged. A drain that
 cannot say so yet, `-EAGAIN`, is asked again 100 ms later, then half as often
 each time, down to once a second, and logged once;
 a channel whose entries cannot be shown gone is never released. A teardown of

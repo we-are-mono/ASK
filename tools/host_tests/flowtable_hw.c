@@ -979,12 +979,15 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     stop_result = 0;
     expect_terminal("cannot be started again", restarts);
     /* A port outside CDX's configuration reaching a classifier: no stop of
-     * CDX's own vouches for the tables, now or later. */
+     * CDX's own vouches for the tables, now or later -- nor one earlier in
+     * the episode, so nothing a port let go of is proven free. */
     resolves = resolver_calls;
     latch_root();
     stop_result = -EXDEV;
+    ft_stopped_at = 1;
     run_until_idle();
-    assert(!settled && resolver_calls == resolves && key->linked);
+    assert(!settled && resolver_calls == resolves && key->linked && !ft_stopped_at);
+    cdx_ft_begin(); assert(cdx_ft_proven() == -EAGAIN); cdx_ft_end();
     stop_result = 0;
     expect_terminal("a port CDX did not configure reaches the classifier", restarts);
     /* Without a table to barrier through, the restart has nothing parked to
@@ -1260,6 +1263,32 @@ static void test_backend(void)
     /* With nothing pending, admission issues no barrier at all. */
     assert(cdx_ft_add(&rule,&stats,&hw) == 0 && syncs == tries + 2);
     assert(cdx_ft_del(&hw) == 0 && !hw && !ft_live && !key);
+    /* What a port's released hardware -- a CEETM channel, the DSCP map --
+     * waits on before another port may have it: every unlink proven out of
+     * the hardware's reach. Nothing to prove issues no barrier. A backlog or
+     * a retirement with none completed behind it is proven by one issued
+     * here, and stands while that fails. A latched deletion, whose key may
+     * still be linked, stands whatever a barrier would say until the ports
+     * that walk the tables are found stopped behind one, as they stay until
+     * the restart settles it. */
+    tries = syncs;
+    assert(!cdx_ft_proven() && syncs == tries);
+    park_legacy(2); fail_sync = true;
+    assert(cdx_ft_proven() == -EAGAIN && syncs == tries + 1 && legacy_pending == 2);
+    fail_sync = false;
+    assert(!cdx_ft_proven() && syncs == tries + 2 && !legacy_pending);
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0);
+    delete_result = EN_EHASH_DELETE_UNSYNCED;
+    assert(cdx_ft_del(&hw) == -EAGAIN && cdx_ft_pending() == 1);
+    delete_result = 0; fail_sync = true; tries = syncs;
+    assert(cdx_ft_proven() == -EAGAIN && key && cdx_ft_pending() == 1 && syncs == tries + 1);
+    fail_sync = false;
+    assert(!cdx_ft_proven() && !key && !cdx_ft_pending() && syncs == tries + 2);
+    ft_failed = true;
+    assert(cdx_ft_proven() == -EAGAIN && syncs == tries + 2);
+    ft_stopped_at = 1;
+    assert(!cdx_ft_proven() && syncs == tries + 2);
+    ft_failed = false; ft_stopped_at = 0;
     /* A direction that names an SA. Each end lands in its own slot and marks
      * the entry secure, and the *sending* end's MTU has SEC's expansion put
      * back on: the microcode adds it before comparing, so the flow's inner
@@ -1496,7 +1525,16 @@ static void test_backend(void)
     assert(cdx_ft_idle() && !cdx_info->ctrl.mutex);
     sa_owned = 1; assert(!cdx_ft_idle()); sa_owned = 0;
     mc_owned = 1; assert(!cdx_ft_idle()); mc_owned = 0;
-    legacy_pending = 1; assert(!cdx_ft_idle()); legacy_pending = 0;
+    /* A backlog CDX parked is proven gone by a barrier issued here, and is
+     * still in reach while that fails; a latched deletion is, whatever a
+     * barrier would say. */
+    park_legacy(1); fail_sync = true; before = syncs;
+    assert(!cdx_ft_idle() && syncs == before + 1 && legacy_pending == 1);
+    fail_sync = false;
+    assert(cdx_ft_idle() && syncs == before + 2 && !legacy_pending);
+    cdx_ft_begin(); ft_failed = true; cdx_ft_end();
+    assert(!cdx_ft_idle() && syncs == before + 2);
+    cdx_ft_begin(); ft_failed = false; cdx_ft_end();
     assert(cdx_ft_idle() && !cdx_info->ctrl.mutex);
     /* A port outside CDX's configuration reaching the classifier: the latch
      * cannot restart, and the adapter's recovery keeps what was retired,
@@ -1509,8 +1547,10 @@ static void test_backend(void)
     delete_result = -1;
     assert(cdx_ft_del(&hw) == -EIO && cdx_ft_failed() && cdx_ft_pending() == 1);
     stop_result = -EXDEV;
+    ft_stopped_at = 1;
     assert(cdx_ft_recover() == 0 && ft_terminal && !settled && kept_lines == 1);
     assert(key->linked && nabandoned == 1 && abandoned[0] == key && !cdx_ft_pending());
+    assert(!ft_stopped_at && cdx_ft_proven() == -EAGAIN);
     assert(!allocations && cdx_ft_release() == 0);
     cdx_ft_end();
     run_until_idle();

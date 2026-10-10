@@ -1062,11 +1062,12 @@ static void ft_egress_changed(struct net_device *dev)
 }
 
 /* Wait until everything ft_egress_changed(dev) started has finished: every
- * flow it retired is out of the hardware, and every SA and multicast group on
- * the port it asked to rebuild has been rebuilt. CDX calls this before handing
- * the microcode's DSCP map to another port: the map is one table with no port
- * in it, so an entry still reading it after the hand-over would transmit on the
- * other port's queues.
+ * flow it retired is out of the hardware, every SA and multicast group on the
+ * port it asked to rebuild has been rebuilt, and a barrier has proven what
+ * they left out of the hardware's reach (cdx_ft_proven()). CDX calls this
+ * before handing the microcode's DSCP map to another port: the map is one
+ * table with no port in it, so an entry still reading it after the hand-over
+ * would transmit on the other port's queues.
  *
  * Retirement stands aside for a global invalidation, which removes every
  * entry itself, so that is waited for too -- and a recovery that cannot finish
@@ -1137,7 +1138,19 @@ static int ft_egress_drain(struct net_device *dev)
 	/* And every multicast group with a copy on the port, both learners'
 	 * whatever the first says: each rebuilds what it can. */
 	rc = ft_mc_egress_drain(dev);
-	return ft_mr_egress_drain(dev) ?: rc;
+	rc = ft_mr_egress_drain(dev) ?: rc;
+	if (rc)
+		return rc;
+	/* Rebuilt or retired is not yet out of the hardware's reach: a walk
+	 * begun before an unlink -- a group's old chain, an SA's entry, a
+	 * flow's key -- may still be inside it until a barrier completes, and
+	 * one that failed left it parked. Those hold the drain until a barrier
+	 * issued here proves them gone; a deletion latched for want of proof
+	 * holds it until the ports are found stopped behind one. */
+	cdx_ft_begin();
+	rc = cdx_ft_proven();
+	cdx_ft_end();
+	return rc;
 }
 
 /* CDX restarted the datapath after a deletion it could not prove (struct

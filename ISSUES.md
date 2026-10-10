@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A357 — a port's released channels and DSCP map could serve another port before its unlinks were proven.** The
+  egress drain now holds until a barrier proves every unlink gone and no latch is live (_:/^cdx: release a port's hardware only once a barrier proves_).
+
 - [x] **A356 — the stalled-port pool test passed whether or not the pause took hold.** Test bug: every case of the file
   now requires most of the flow refused at the paused port before its own checks (_:/^tests: require the pause to hold in every stalled-port case_).
 

@@ -159,6 +159,9 @@ static int ExternalHashTableFindEntry(void *td, void *entry, uint16_t *index)
     if (!find_rc) *index = found_in;
     return find_rc;
 }
+/* The table the DPA configuration gives the PCD, if any. */
+static void *pcd_table;
+static void *dpa_get_ehash_td(void) { assert(cdx_info->ctrl.mutex); return pcd_table; }
 /* Declared by cdx_common.h in the module; one calls another defined below it. */
 int cdx_ehash_quarantine_retry(void);
 #include "quarantine_production.inc"
@@ -196,18 +199,24 @@ static void check_quarantine(void)
     hc_fail = false;
     assert(cdx_ehash_quarantine_retry() == 0 && hc_syncs == 2 && synced_table == first);
     assert(!cdx_ehash_quarantine_pending() && allocations == held);
-    /* An entry parked naming no table waits for a caller that has one; one
-     * behind it that names a table is barrier enough for both. */
+    /* An entry parked naming no table is synced through the PCD's own: any
+     * table on it is barrier enough, and nothing else need come along to
+     * issue one. With none configured it waits for a caller that has one;
+     * one behind it that names a table is barrier enough for both. */
     cdx_ehash_quarantine_entry(NULL, allocate(8));
     assert(cdx_ehash_quarantine_retry() == -EAGAIN && hc_syncs == 2);
+    pcd_table = first;
+    assert(cdx_ehash_quarantine_retry() == 0 && hc_syncs == 3 && synced_table == first);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held);
+    cdx_ehash_quarantine_entry(NULL, allocate(8));
     cdx_ehash_quarantine_entry(second, allocate(8));
-    assert(cdx_ehash_quarantine_retry() == 0 && hc_syncs == 3 && synced_table == second);
+    assert(cdx_ehash_quarantine_retry() == 0 && hc_syncs == 4 && synced_table == second);
     assert(!cdx_ehash_quarantine_pending() && allocations == held);
     /* A delete that syncs is the same barrier: its entry and the backlog go. */
     assert(cdx_ehash_delete_entry(first, 1, allocate(8)) == EN_EHASH_DELETE_UNSYNCED);
     delete_rc = SUCCESS;
     assert(cdx_ehash_delete_entry(first, 2, allocate(8)) == SUCCESS);
-    assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 3);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 4);
     /* A key that may still be linked is never parked: no barrier makes it
      * free. It is recorded for the restart that settles it (exercised in
      * check_abandoned()); here unload, with the ports never stopped, leaks
@@ -224,14 +233,14 @@ static void check_quarantine(void)
      * backlog when it completes... */
     cdx_ehash_quarantine_entry(first, allocate(8));
     cdx_ehash_quarantine_abandon();
-    assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 4);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 5);
     /* ...and with nothing proven even then gives back only the bookkeeping. */
     entry = allocate(8);
     cdx_ehash_quarantine_entry(first, entry);
     hc_fail = true;
     cdx_ehash_quarantine_abandon();
     hc_fail = false;
-    assert(!cdx_ehash_quarantine_pending() && allocations == held + 1 && hc_syncs == 5);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held + 1 && hc_syncs == 6);
     release(entry);
     assert(!unlocked);
     cdx_info->ctrl.mutex = false;
