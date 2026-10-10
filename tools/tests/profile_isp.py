@@ -79,6 +79,7 @@ from ask_orch.client import Agent
 from ask_orch.uart import Console
 from ask_orch.counters import kernel_tx_packets
 from _gated_tcp import GatedTcp
+from _throughput import tcp_floor
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        dut_vlan_subif, kernel_rx_packets, lan_run_python)
 from _flowtable_rig import (artifact_dir, Rig, assert_undisturbed, command, console_command, read)
@@ -141,8 +142,8 @@ GUEST_MAC = "02:9d:99:b2:92:02"
 IPTV_MAC = "02:9d:99:b2:93:02"
 
 # One port per case, so a conntrack left behind by one never feeds another.
-# Above every other flowtable file's range; the highest in use is the tunnel
-# file's 48951.
+# Above every other flowtable file's range; the highest in use is the IPv6
+# file's rate port, 49051.
 PORT_MAIN = int(os.environ.get("ASK_PROFILE_ISP_PORT", "49100"))
 PORT_GUEST = PORT_MAIN + 2
 PORT_V6 = PORT_MAIN + 4
@@ -151,8 +152,7 @@ PORT_BULK = PORT_MAIN + 8
 PORT_PUBLIC = PORT_MAIN + 10
 PORT_IPTV = PORT_MAIN + 12      # and +13, one per channel
 PORT_RATE = PORT_MAIN + 16
-# The throughput floor's ramp: past it, the receiver's count is steady state.
-RAMP_SECONDS = 3
+PORT_RATE6 = PORT_MAIN + 18
 
 # Two channels, so the channel-change case has a survivor to keep watching.
 # Each carries its own destination port: two sockets bound to one port both
@@ -1686,25 +1686,23 @@ while True:
                              label="profile_isp_forward_stop", timeout=20)
 
 
-async def test_throughput(isp, splat_window):
-    """What the profile forwards when nothing is in its way.
+@pytest.mark.parametrize("family, upload", [(4, True), (4, False), (6, True), (6, False)],
+                         ids=["ipv4-upload", "ipv4-download", "ipv6-upload", "ipv6-download"])
+async def test_throughput(isp, splat_window, family, upload):
+    """What the profile forwards when nothing is in its way, each way, for
+    the translated IPv4 half and the native IPv6 half.
 
     A number below the ceiling means the CPU carried it, because the CPU cannot
     carry this much: the point of the case is the floor, not the measurement. It
     runs against the same profile as everything above, so what it measures is
-    the shipping configuration rather than a bare NAT path. A floor needs a
-    steady-state sample, not a long one: the receiver's own count over the
-    five seconds after a three-second ramp, in which a slow start that
-    overshoots has recovered. Taken from the receiver's per-second intervals
-    rather than iperf3's omit period, whose first interval after the omit
-    claims two seconds for one second's bytes when the two timers fire in the
-    same microsecond.
+    the shipping configuration rather than a bare NAT path. Every stream and
+    its acknowledgements name the session and the carrier tag on their
+    hardware entries while the rate is measured (_throughput).
 
-    The floor is this path's capability, so it is the best of up to three
-    samples: the session ends in the WAN host's own PPPoE stack, whose share
-    of one core makes single samples range 8.4-9.2 Gb/s with the DUT
-    unchanged (the untagged homelab path holds 9.414 run after run). A path
-    that lost its ceiling misses in every sample.
+    The floor is the best of up to three samples: the session ends in the WAN
+    host's own PPPoE stack, whose share of one core makes single samples range
+    8.4-9.2 Gb/s with the DUT unchanged (the untagged homelab path holds 9.414
+    run after run). A path that lost its ceiling misses in every sample.
     """
     ctx = isp
     client = BY_NAME["main"]
@@ -1714,48 +1712,24 @@ async def test_throughput(isp, splat_window):
     # 8.948 and 8.936 Gb/s under the flowtable against 8.984 and 8.931
     # under CMM. A 9 Gb/s floor borrowed from the untagged benchmark
     # therefore fails a path that is at its ceiling, which is the opposite
-    # of what a throughput gate is for.
-    floor = float(os.environ.get("ASK_PROFILE_ISP_MIN_GBPS", "8.8")) * 1e9
+    # of what a throughput gate is for. IPv6's floor is IPv4's less its
+    # twenty extra header bytes a segment; the samples behind both were
+    # 8.97-9.12 Gb/s uploading and 9.16-9.33 downloading.
+    floor = float(os.environ.get(*(("ASK_PROFILE_ISP_MIN_GBPS6", "8.6") if family == 6
+                                   else ("ASK_PROFILE_ISP_MIN_GBPS", "8.8")))) * 1e9
 
-    async def sample(attempt):
-        server = await asyncio.create_subprocess_exec(
-            "iperf3", "-s", "-1", "-B", INNER_LOCAL, "-p", str(PORT_RATE), "-J",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        try:
-            await asyncio.sleep(0.3)
-            assert server.returncode is None, "the endpoint iperf3 did not start"
-            script = f'''
-import json, subprocess
-argv = ['iperf3', '-c', {INNER_LOCAL!r}, '-B', {client['ip']!r}, '-p', {str(PORT_RATE)!r},
-        '-P', '4', '-t', '8', '-Z', '-J']
-result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
-print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
-'''
-            result = await _client_python(ctx, client, script, label="profile_isp_rate",
-                                          timeout=70)
-            assert result.rc == 0, result.stdout
-            report = json.loads(result.stdout.strip().splitlines()[-1])
-            stdout, _ = await asyncio.wait_for(server.communicate(), 15)
-            received = json.loads(stdout)
-            settled = [i["sum"] for i in received["intervals"] if i["sum"]["start"] >= RAMP_SECONDS - 0.01]
-            assert settled, received["intervals"]
-            measured = {"bits_per_second": sum(i["bytes"] for i in settled) * 8 / sum(i["seconds"] for i in settled),
-                        "seconds": sum(i["seconds"] for i in settled)}
-            ctx.record("isp-throughput" if attempt == 0 else f"isp-throughput-{attempt}",
-                       {"client": report, "server": received["end"]["sum_received"], "settled": measured})
-            assert report["rc"] == 0, report
-            return measured
-        finally:
-            if server.returncode is None:
-                server.terminate()
-                await asyncio.wait_for(server.communicate(), 10)
+    async def run(script, *, label, timeout):
+        return await _client_python(ctx, client, script, label=label, timeout=timeout)
 
-    samples = []
-    for attempt in range(3):
-        samples.append(await sample(attempt))
-        if samples[-1]["bits_per_second"] >= floor:
-            break
-    assert max(s["bits_per_second"] for s in samples) >= floor, (samples, floor)
+    def through_session(data, acks):
+        for row, ack in zip(data, acks):
+            _assert_session(ctx, *((row, ack) if upload else (ack, row)))
+
+    await tcp_floor(ctx, server=INNER_LOCAL6 if family == 6 else INNER_LOCAL,
+                    client=client["ip6" if family == 6 else "ip"],
+                    port=PORT_RATE6 if family == 6 else PORT_RATE, upload=upload, floor=floor,
+                    family=family, run=run, check=through_session,
+                    label=f"isp-throughput-ipv{family}-{'upload' if upload else 'download'}")
 
 
 # ---- lifecycle: the events a real line produces ----------------------------

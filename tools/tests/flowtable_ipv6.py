@@ -14,14 +14,20 @@ from _flowtable_ipv6 import (Echo, HAIRPIN, HAIRPIN_GATEWAY, NAT_TABLE, PORTS, P
 
 import asyncio
 import json
+import os
 import socket
 
 import pytest
 
 from _topology import DUT_IPV6_LAN, DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VIRT_IPV6, WAN_IPV6, lan_run_python
 from _flowtable_rig import command, read
+from _throughput import tcp_floor
 
 JUMBO = 9000
+# The routed path's ceiling: 9.173 Gb/s upload and 9.260 download
+# (docs/flowtable/ipv6.md), the IPv6 header's extra twenty bytes per segment
+# below IPv4's 9.414.
+MIN_RATE = float(os.environ.get("ASK_FLOWTABLE_IPV6_MIN_GBPS", "9")) * 1e9
 
 
 @pytest.mark.rfc("8200")
@@ -134,6 +140,25 @@ async def test_tcp(ipv6_rig):
             await conn.close()
     finally:
         await _drop_tables(r)
+
+
+@pytest.mark.parametrize("upload", [True, False], ids=["upload", "download"])
+async def test_rate(ipv6_rig, upload):
+    """Routed IPv6 TCP at the path's ceiling, each way, every stream and its
+    acknowledgements on a hardware entry while the rate is measured
+    (_throughput)."""
+    r = ipv6_rig
+    _, port = PORTS["rate"]
+    try:
+        await _offload_table(r, f"ip6 saddr {LAN_IPV6} tcp dport {port}")
+        await tcp_floor(r, server=WAN_IPV6, client=LAN_IPV6, port=port, upload=upload,
+                        floor=MIN_RATE, family=6,
+                        label=f"ipv6-rate-{'upload' if upload else 'download'}")
+    finally:
+        await _drop_tables(r)
+        await command(r.target, r.session, "conntrack", "-D", "-f", "ipv6", "-p", "tcp",
+                      "--orig-src", LAN_IPV6, "--orig-dst", WAN_IPV6, "--dport", str(port),
+                      check=False)
 
 
 async def test_masquerade(ipv6_rig):

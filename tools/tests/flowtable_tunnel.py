@@ -39,17 +39,23 @@ from __future__ import annotations
 
 from _flowtable_tunnel import CHANGED_TTL
 
-from _flowtable_tunnel import (Capture, _admit, _assert_outer, _assert_tunnel, _both_directions, _directions, _established, _expected, _offload_table, _tunnel_counters, _tunnel_record, _udp_exchange)
+from _flowtable_tunnel import (Capture, _admit, _assert_outer, _assert_tunnel, _both_directions, _directions, _established, _expected, _offload_table, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange)
 
 
+import os
 import subprocess
 
 import pytest
 
 from ask_orch.counters import kernel_tx_packets
 from _gated_tcp import GatedTcp
-from _topology import TARGET_WAN_IF, lan_run_python
+from _throughput import tcp_floor
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_rig import assert_undisturbed, command
+
+# Both modes ran at the path's ceiling on four streams: 6o4 9.15 Gb/s
+# inserting and 9.14 stripping, 4o6 9.14 and 9.08 (docs/flowtable/tunnels.md).
+MIN_RATE = float(os.environ.get("ASK_FLOWTABLE_TUNNEL_MIN_GBPS", "8.8")) * 1e9
 
 
 # ---- cases ---------------------------------------------------------------
@@ -201,6 +207,45 @@ async def test_tcp(tunnel_rig):
     # Only the handful of frames the reads above cost left the WAN port in
     # software while the measured phase crossed it.
     assert 0 <= sent < upload // 4, (sent, upload)
+
+
+@pytest.mark.parametrize("upload", [True, False], ids=["insert", "strip"])
+@pytest.mark.parametrize("tunnel_rig", ["6o4/rate", "4o6/rate"], indirect=True)
+async def test_rate(tunnel_rig, upload):
+    """TCP through the tunnel at the path's ceiling, inserting the outer
+    header on the upload and stripping it on the download, every stream and
+    its acknowledgements on a hardware entry while the rate is measured
+    (_throughput)."""
+    r = tunnel_rig
+    shape = r.shape
+    ip = "ip6" if shape.family == 6 else "ip"
+    # The fixture exempts only its fixed port pair from the image's
+    # masquerade; iperf3's streams take their own source ports.
+    accept = ["POSTROUTING", "-s", r.lan_address, "-d", shape.inner_orch, "-p", "tcp",
+              "--dport", str(shape.dport), "-j", "ACCEPT"]
+    if shape.family == 4:
+        await command(r.target, r.session, "iptables", "-t", "nat", "-I", *accept)
+    hop = _tunnel_text(shape)
+
+    def through_tunnel(data, acks):
+        # Inserted on the way out of the LAN port, stripped on the way in
+        # from the WAN port, for the data and its acknowledgements alike.
+        for row in data + acks:
+            side = row["out_tnl"] if row["in"] == TARGET_LAN_IF else row["in_tnl"]
+            assert side == hop, (hop, row)
+
+    try:
+        await _offload_table(r, match=f"{ip} saddr {r.lan_address} tcp dport {shape.dport}")
+        await tcp_floor(r, server=shape.inner_orch, client=r.lan_address, port=shape.dport,
+                        upload=upload, floor=MIN_RATE, family=shape.family, check=through_tunnel,
+                        label=f"tunnel-rate-{shape.mode}-{'insert' if upload else 'strip'}")
+    finally:
+        await r.delete_table()
+        await command(r.target, r.session, "conntrack", "-D", "-p", "tcp",
+                      "--orig-src", r.lan_address, "--orig-dst", shape.inner_orch,
+                      "--dport", str(shape.dport), check=False)
+        if shape.family == 4:
+            await command(r.target, r.session, "iptables", "-t", "nat", "-D", *accept)
 
 
 @pytest.mark.parametrize("tunnel_rig", ["6o4/change"], indirect=True)

@@ -152,6 +152,16 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A361 — the LAN port's FMan receive path filters a few minimum-size frames that arrive whole.** Seen by
+  `flowtable_nat_throughput.py::test_packet_rate`: one paced NAT'd UDP flow of 64-byte frames at 1.9 Mpps lost 3-16 of
+  6,000,000 frames, and 9 Mpps of overload ~8,700 of ~9.9 million the MAC passed, each counted in the receive port's
+  `port_rx_filter_frame` (`/sys/devices/platform/soc/1a00000.fman/1a90000.port/statistics/`) while the mEMAC reports
+  no RERR and the port no `port_rx_bad_frame`. 128-byte frames lose none below the ceiling, and under overload exactly
+  the MAC's cut-short RERR frames. Counted, not silent, and inside the gate's 1e-4 loss share, so not a release
+  blocker. Next: move the filter's bits from the RX port's discard mask (`fmbm_rfsdm`, BMI +0x68) to its error-enqueue
+  mask (`fmbm_rfsem`, +0x6C) so those frames reach `priv_rx_error_dqrr` with their FD status, then tell a parse or
+  KeyGen error at minimum length from an FMan resource limit.
+
 - [x] **A360 — a multicast group's replace leaked a displaced listener entry for good when its record could not be
   made.** The barrier now comes first; only what it fails to prove is parked (_:/^cdx: free a replaced chain its barrier proves gone_).
 

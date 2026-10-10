@@ -45,7 +45,7 @@ MTU_4O6 = 1440          # 1500 less the 40-byte IPv6 outer header and a 20-byte 
 
 # One port pair per case so a conntrack left by one never feeds another.
 PORTS = {"routed": (48910, 48911), "mtu": (48920, 48921), "tcp": (48930, 48931),
-         "change": (48940, 48941), "delete": (48950, 48951)}
+         "change": (48940, 48941), "delete": (48950, 48951), "rate": (48970, 48971)}
 
 # What the outer header's TTL is asked to be, and what it is changed to by the
 # case that reconfigures the tunnel under a live flow.
@@ -187,12 +187,12 @@ async def _both_directions(r, proto="udp", state=None):
     return state["flows"]
 
 
-async def _offload_table(r, proto="udp"):
+async def _offload_table(r, proto="udp", match=None):
     await r.nft(f'''table inet {TABLE} {{
  flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }};
  flags offload; }}
  chain forward {{ type filter hook forward priority 0; policy accept;
- {r.shape.match(r.lan_address, proto)} flow add @fast
+ {match or r.shape.match(r.lan_address, proto)} flow add @fast
  }}
 }}''')
     await r.wait(lambda s: s["bindings"] == 2)

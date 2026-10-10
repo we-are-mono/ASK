@@ -506,14 +506,52 @@ The IKE case requires UDP 500/4500 and the DUT's charon PID file to be unused.
 `profile_homelab.py::test_mixed_traffic_survives_rekey` keeps the VLAN WAN paths,
 IPv6 tunnel, IPsec and multicast active together for a minute through a rekey.
 `flowtable_nat_throughput.py` checks a 9 Gbit/s TCP floor in separate forward and
-reverse runs, simultaneous unpaced TCP directions with floors of 8 Gbit/s forward
+reverse runs, and simultaneous unpaced TCP directions with floors of 8 Gbit/s forward
 and 5 Gbit/s reverse (the offloaded egress bound, A313; eleven calibration runs
 measured 5.5-7.9 Gbit/s reverse, against 1.3-2.2 with the unbounded queue it
-guards against), and 64-byte UDP payloads at 25 Mbit/s. These are acceptance
-floors, not measured rates. Artifacts include native DUT MAC
-counters, endpoint NIC counters, UDP loss and receiver buffer errors. Native
-iperf's reverse-only UDP stream does not meet the service's established
-original-direction admission rule, so simultaneous throughput uses TCP.
+guards against). These are acceptance floors, not measured rates. Artifacts
+include native DUT MAC counters, endpoint NIC counters and receiver buffer
+errors. Native iperf's reverse-only UDP stream does not meet the service's
+established original-direction admission rule, so simultaneous throughput uses
+TCP.
+
+`test_packet_rate` in the same file measures NAT'd UDP at 64- and 128-byte
+frames, sent by `pktgen` on the LAN VM and counted at each hop: the LAN VM's
+NIC, the DUT's LAN MAC (`mac_rx_stats`), its FMan receive port, the flows'
+hardware entries, its WAN MAC (`mac_tx_stats`), and the WAN host NIC's MAC
+counter, which counts what arrives whatever that host's CPU does. Lossless,
+one paced generator thread offers at least 1.8 Mpps; the MAC drops nothing,
+less than 1e-4 of the frames goes missing, and the DUT's kernel transmits
+next to nothing. One thread only, because the LAN VM is a guest: a descheduled
+paced thread catches up at full speed, and four doing so together briefly
+offer more than the ceiling. Overloaded, four unpaced threads offer about
+9 Mpps; the hardware path still forwards at least 3 Mpps (3.17-3.30 measured,
+the FMan receive path's ceiling at both sizes), and every refused frame is
+counted at the MAC or by the port's frame filter (A361).
+
+The other paths' rate floors share `_throughput.tcp_floor()`. Every stream and
+its acknowledgements stay on unchanged hardware entries through a three-second
+window inside the measured interval, and the DUT's kernel transmits next to
+nothing. The rate is the receiver's own count from its fourth second on, and
+the best of up to three samples meets the floor:
+
+| Case | Floor (Gbit/s) | Measured 2026-10-10 |
+| --- | --- | --- |
+| `flowtable_ipv6.py::test_rate`, routed IPv6 each way | 9 | 9.27-9.28 |
+| `flowtable_tunnel.py::test_rate`, 6o4 and 4o6 insert and strip | 8.8 | 9.05-9.15 |
+| `flowtable_service_ipsec_rate.py`, CBC and GCM each way | 2 | 2.29-2.54 |
+| `profile_isp.py::test_throughput`, PPPoE IPv4 each way | 8.8 | 8.98-9.33 |
+| `profile_isp.py::test_throughput`, PPPoE IPv6 each way | 8.6 | 8.97-9.20 |
+
+The tunnel case also requires every entry to name the tunnel, and the PPPoE
+one the session and its carrier tag. The IPsec case requires every entry to
+name its SA, the frames the kernel handed SEC to stay at most 64 to encrypt
+(`tx toenc`) and none to decrypt (`tx todec`) in the window, and the WAN
+host's own SA to report no replay or integrity failure. Its ceiling is that
+host's software ESP rather than the DUT, so its streams' entries need only
+move together: the host reorders its ESP enough for SEC to refuse some as
+late, which can stall one stream (A342).
+Each floor can be overridden with an environment variable named beside it.
 
 `flowtable_jumbo.py` carries MTU 9000 on every hop: offloaded NAT TCP at
 8 Gbit/s each way and byte-exact 8972-byte UDP, a VLAN at 9000, a LAN at 9000
