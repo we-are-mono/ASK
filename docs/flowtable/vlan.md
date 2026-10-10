@@ -20,15 +20,23 @@ through. Everything this increment does follows from those two being different
 objects for the first time.
 
 The tags themselves are derived from the devices, not decoded from the action
-list. `ft_vlan_stack()` walks `cls->nf_dst->dev` down to the redirect port and
-`cls->nf_dst_reverse->dev` down to the binding's port, one VLAN layer at a
-time, and the `FLOW_ACTION_VLAN_POP` and `FLOW_ACTION_VLAN_PUSH` actions are
+list. `ft_path_stack()` (`cdx/ask_flowtable_core.c`) walks `cls->nf_dst->dev`
+down to the redirect port and `cls->nf_dst_reverse->dev` down to the binding's
+port, and the `FLOW_ACTION_VLAN_POP` and `FLOW_ACTION_VLAN_PUSH` actions are
 then required to agree with what the walk found. That is the same shape the
 adapter already uses for translation, where the mapping comes from the
-conntrack and the mangle actions have to match it. It also means every path
-that is not a chain of 802.1Q devices — a bridge, a PPPoE session, a bond, a
-MACVLAN — is declined by the walk itself rather than by an action count that
-happens not to add up.
+conntrack and the mangle actions have to match it.
+
+The walk is one walker for every supported composition, taken outermost
+first: an optional tunnel hop, then an optional PPPoE session (at most one,
+and outermost of the Ethernet framing), then 802.1Q VLAN devices one layer at
+a time, ending either at the port or at a bridge that must be the port's own
+master, whose tag is derived from its VLAN groups. A session spends one of the
+`CDX_FT_VLAN_MAX` encapsulation slots, so a session admits one tag alongside
+it. Any other upper device — a bond, a MACVLAN, a second session, a session
+beneath a tag — is declined by the walk itself rather than by an action count
+that happens not to add up. The [supported scope](README.md#supported-scope)
+lists the bridge and PPPoE contracts in full.
 
 CDX takes the stack from the rule. It has no VLAN interface to walk: the
 adapter registers none, and `control_vlan.c`, which registered them for CMM,
@@ -94,8 +102,10 @@ that reversal wrong swaps a QinQ pair on the wire and nothing else notices.
 
 Beyond the rules a routed flow already satisfies:
 
-- Each logical device must reach its physical port through 802.1Q VLAN devices
-  alone, at most `NF_FLOW_TABLE_ENCAP_MAX` of them. 802.1ad is declined: the
+- Each logical device must reach its physical port through the composition
+  above: 802.1Q VLAN devices, optionally under one outermost PPPoE session
+  and optionally ending at the port's own bridge, with at most
+  `NF_FLOW_TABLE_ENCAP_MAX` tags and session together. 802.1ad is declined: the
   kernel describes no selector for it and emits no push action, so a tag that
   is not 802.1Q is one the hardware would be asked to reproduce blind.
 - An egress VLAN device may not override its parent's MAC address. The

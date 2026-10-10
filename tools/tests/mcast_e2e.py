@@ -147,12 +147,11 @@ async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
                                                    smcrouted, stream_cpu):
     """Two oifs on the one LAN port: untagged, and tagged on a sub-interface.
 
-    This is the only multi-listener replication this rig can do, and it is the
-    measurement ISSUES.md A158 has been waiting for. The board has five ports
-    and two with carrier, one of which is every group's ingress, so a second
-    listener has to be a second tag stack on the one port that is left. A
-    listener is identified by its whole framing rather than by its device, so
-    the backend takes both and builds one entry per copy in the chain.
+    This is the same-port framing case: two copies out of one port that differ
+    only by their tag stack. A listener is identified by its whole framing
+    rather than by its device, so the backend takes both and builds one entry
+    per copy in the chain. Replication across two physical ports and the
+    eight-listener ceiling are mroute_capacity.py's (A158).
 
     The two copies are counted separately rather than together, which is what
     discriminates replication from a single copy seen twice: the socket joined

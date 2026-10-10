@@ -2184,8 +2184,16 @@ What is left is smaller and none of it blocks retirement:
 - **A rekey names the newest inbound SA.** `xfrm_state_lookup_byaddr()` answers
   with the most recently installed state for a pair, which is the one a fresh
   flow should name; the older one keeps its own classifier entry until it is
-  deleted, and that deletion retires whatever depends on it. Nothing here has
-  been exercised against a live rekey under load.
+  deleted, and that deletion retires whatever depends on it. This is now
+  exercised on the rig:
+  `flowtable_service_ipsec_rekey.py::test_ipsec_inbound_rekey_collision`
+  delivers one tuple through both overlapping inbound SAs and requires only
+  the bound one to use hardware;
+  `test_ipsec_decrypted_frames_intact_under_overlap` runs line-rate traffic
+  across transform combinations while both rekey descriptors are live; and
+  `flowtable_ike.py::test_rekey_and_peer_restart` runs real IKEv1 and IKEv2
+  rekeys and a peer restart through strongSwan. An endpoint address change
+  (MOBIKE or a NAT-T float) under traffic is not yet exercised on the rig.
 - **A direction can hold both an inbound and an outbound SA**, and the rule has
   a slot for each, but nothing proves the opcode order for a flow decrypted
   from one tunnel and re-encrypted into another. Admission allows at most one

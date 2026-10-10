@@ -15,11 +15,13 @@ struct cdx_mc_group;
  * MC_MAX_LISTENERS_PER_GROUP, which sizes the group's member array. It is not
  * a hardware bound and nothing names
  * one: the programming path is a loop, one external-hash entry per listener,
- * threaded into the next. It is repeated here rather than widened because a
- * bridged group's listeners are physical ports and a
- * gateway has five, so no reachable configuration approaches it -- and because
- * a number that has never been measured should not be quietly raised by the
- * caller that would first depend on it.
+ * threaded into the next. It is the backend's admission limit: a group with
+ * more listeners stays in software. A bridged group gets one framing per
+ * port, so on a five-port gateway it stays below the limit, but a routed group
+ * reaches it through VLAN-distinct listeners on one port, and the rig does
+ * (mroute_capacity.py). Eight is what has been measured, not the silicon's
+ * maximum, so it should not be quietly raised by the caller that would first
+ * depend on it.
  */
 #define CDX_MC_MAX_LISTENERS	8
 

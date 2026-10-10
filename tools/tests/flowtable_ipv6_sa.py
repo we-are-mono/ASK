@@ -1,9 +1,10 @@
 """IPv6 inside an IPsec tunnel with an IPv4 outer header, in hardware.
 
-The adapter accepts IPv4 tunnel endpoints only, so an IPv6 flow reaches an SA
-as IPv6-in-IPv4: a dual-stack LAN's IPv6 carried over an IPv4 site-to-site
-tunnel. What such a direction does with a packet too big for the SA's bundle
-is the question here. Software checks a packet against the bundle's MTU, the
+This file pins one family combination, IPv6-in-IPv4: a dual-stack LAN's IPv6
+carried over an IPv4 site-to-site tunnel. IPv6 tunnel endpoints are offloaded
+too; flowtable_service_ipsec_outer6.py covers them. What an IPv6-in-IPv4
+direction does with a packet too big for the SA's bundle is the question
+here. Software checks a packet against the bundle's MTU, the
 outer device's less the ESP expansion, and answers an oversized one with
 Packet Too Big (xfrm6_tunnel_check_size). The entry is programmed with the
 port's MTU and the expansion on top, so the hardware takes the packet, and

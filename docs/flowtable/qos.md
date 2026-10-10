@@ -414,7 +414,8 @@ collide as duplicate keys; and `ft_replace()` compares whole rules with
   need a second field and are not in this increment.
 - `cdx/cdx_flowtable_hw.c` — write `ct->qosmark.chnl_id` and `.queue` in
   `cdx_ft_hw_add()`.
-- `tools/ask_flowtable.py` — render the guard from the mask the running
+- The flowtable controller (then `tools/ask_flowtable.py`, now the C
+  `ask-flowtable` in `flowtable/src`) — render the guard from the mask the running
   adapter reports rather than restating a constant, which moves the render
   inside the lock because only a live backend knows the mask. Policy `mark`
   selectors keep their existing "representable for migration" status; making a
@@ -2500,16 +2501,17 @@ system is wrong by construction, and a bespoke control binary is worse: it has
 no ecosystem tooling and has to be packaged three times.
 
 The flowtable controller already sets the precedent and should be matched
-rather than improved on. `tools/ask_flowtable.py` is stdlib-only Python over
-`/etc/ask/flowtable.json`, `/proc/cdx_flowtable`, `/sys/class/net` and the
-`nft` binary. No UCI, no procd, no systemd, no distribution assumption
-anywhere. QoS should look the same.
+rather than improved on. `ask-flowtable` (`flowtable/src`) is a C service that
+depends only on libc, over `/etc/ask/offload.conf`, `/proc/cdx_flowtable`,
+`/sys/class/net`, a raw `NETLINK_ROUTE` socket and the `nft` binary. No UCI, no
+procd, no systemd, no distribution assumption anywhere; a consumer packages it
+with its own init script. QoS should look the same.
 
 | Concern | Generic interface | What a consumer does with it |
 | --- | --- | --- |
 | Scheduler tree | `tc` HTB offload via `ndo_setup_tc` | Armbian: `tc` directly. OpenWrt: render UCI to `tc`. Bench: script it. |
 | Classification | `ct mark`, set by nftables or iptables | Whatever firewall the distribution already runs |
-| Policy and state | `/etc/ask/*.json` plus a stdlib-only tool | Package the file; no code |
+| Policy and state | `/etc/ask/` configuration plus a libc-only tool | Package the file; no code |
 
 This is the decisive argument against a userspace FCI writer. `tc` is in
 iproute2 on every distribution, is already the vocabulary for hardware queue
@@ -2636,7 +2638,7 @@ and reports `admission_ready: true`.
 
 ### The clash, which is automatic rather than accidental
 
-ASK's admit chain runs at `filter` priority 10 (`tools/ask_flowtable.py:162`).
+ASK's admit chain runs at `filter` priority 10 (`flowtable/src/render.c`).
 fw4's forward chain runs at `priority filter`, which is 0, and
 `meta l4proto { tcp, udp } flow offload @ft` is its **first statement**
 (`templates/ruleset.uc:135-138`). If fw4 offloads at all, it reaches every flow

@@ -4,10 +4,16 @@ Roadmap item 11. What the hardware already does, what the radio on this board
 actually is, and why the port is asymmetric enough that one direction is worth
 building and the other has to be measured before it is.
 
-This document is written before any code, because the roadmap asks items 5 to
+This document was written before any code, because the roadmap asks items 5 to
 8 — and this one — to settle a feature-specific hardware eligibility contract
 first, and because the shape of the answer here turns on facts about the
-driver that were not in the roadmap's estimate.
+driver that were not in the roadmap's estimate. The design sections keep that
+original reasoning, so their descriptions of the pre-increment tree are in the
+past tense. The egress half has since been built: CDX tries to claim the Wi-Fi
+offline port at load in every boot (a failure only disables Wi-Fi offload),
+`cdx/ask_flowtable_wifi.c` registers VAPs from
+netdev events, and an open VAP is admitted as a hardware egress. Where the
+current tree is described, the text says so.
 
 ## Three corrections to the estimate this work started from
 
@@ -51,8 +57,8 @@ sets it to 0. So the exported call was always the vendor-specific fast path,
 and the general case was the netfilter hook.
 
 **It is a capability to add, not behaviour to preserve.** `cdx_wifi_rx_fastpath`
-has no caller, `dpaa_vwd_init()` is skipped outright in a flowtable boot, and
-a production gateway's CMM has no `wifi` verb in its `set`/`show`/`query` CLI.
+had no caller, `dpaa_vwd_init()` was skipped outright in a flowtable boot, and
+a production gateway's CMM had no `wifi` verb in its `set`/`show`/`query` CLI.
 Three independent observations, all consistent: this offload has not been
 running. The Wi-Fi *feature* is in daily use; the Wi-Fi *offload* is not what
 has been carrying it. That sets the bar — there is no parity to restore, so
@@ -102,28 +108,35 @@ dpa-fman0-oh@3   fman0_oh_0x4 (port@84000)   FQs 0x62/0x63   — Wi-Fi
 The device tree says so itself, on the second one's extended-args: *"Wi-Fi
 frames need room for the offline-port pipeline and internal context as well as
 the frame itself."* So the OH port this increment needs is not something to
-find or free — it is already declared, sized for this traffic, and sitting
-unused in a flowtable boot because `dpaa_vwd_init()` never runs to claim it.
+find or free — it was already declared and sized for this traffic, and sat
+unused in a flowtable boot because `dpaa_vwd_init()` never ran to claim it.
 FMAN declares six offline ports (0x2 to 0x7); the board exposes two, which is
 a DTS decision rather than a silicon limit, and both are spoken for.
 
-## What is gated today
+## What was gated before this increment
 
-`cdx/cdx_main.c:381`:
+`cdx_main.c` then read:
 
 ```c
 rc = cdx_flowtable_enabled() ? 0 : dpaa_vwd_init();
 ```
 
 In a flowtable boot the VAP frame queues, the buffer pools, the offline port
-and the netdev notifier are never built. This is the same ownership gate IPsec
-had at `cdx_main.c:395`, and it has the same consequence: the absence surfaces
-several layers from the cause, as a frame queue that cannot be resolved rather
-than as anything naming Wi-Fi.
+and the netdev notifier were never built. This was the same ownership gate
+IPsec had in `cdx_main.c`, and it had the same consequence: the absence
+surfaced several layers from the cause, as a frame queue that could not be
+resolved rather than as anything naming Wi-Fi.
 
-Separately, admission refuses a VAP as an egress: `cdx_ft_port_supported()`
-requires `dpa_netdev_is_physical()`, which a VAP netdev is not. So a flow to a
-Wi-Fi client is declined before any of the above is reached.
+Separately, admission refused a VAP as an egress: `cdx_ft_port_supported()`
+required `dpa_netdev_is_physical()`, which a VAP netdev is not. So a flow to a
+Wi-Fi client was declined before any of the above was reached.
+
+Both gates are gone in the current tree. `cdx_main.c` calls `dpaa_vwd_init()`
+unconditionally under `CFG_WIFI_OFFLOAD`, and a failure there is not fatal: it
+leaves `dpaa_vwd_ready()` false, so every VAP is refused and the gateway keeps
+its Ethernet offload. Admission asks `cdx_ft_egress_supported()`
+(`cdx/cdx_flowtable_backend.c`), which accepts a VAP once its frame queues are
+open. A VAP's own ingress is still never programmed.
 
 ## The decision: egress first, ingress measured
 
@@ -153,10 +166,12 @@ that the answer is nothing.
 
 ## The control plane
 
-A VAP reaches CDX today as `FPP_CMD_WIFI_VAP_ENTRY` (add, update, remove) sent
-by CMM, which learns its interface list from a static UCI file naming
-interfaces by name. That is three FCI commands, a userspace daemon and a
-configuration file to describe something the kernel already knows.
+Under CMM a VAP reached CDX as `FPP_CMD_WIFI_VAP_ENTRY` (add, update, remove)
+sent by CMM, which learned its interface list from a static UCI file naming
+interfaces by name. That was three FCI commands, a userspace daemon and a
+configuration file to describe something the kernel already knows. CMM and FCI
+have since been removed, and the netdev notifier below is what the current
+tree uses (`cdx/ask_flowtable_wifi.c`).
 
 The replacement is the move multicast and IPsec both made: **a netdev
 notifier**. A VAP registering *is* the event. Its name, index and hardware
@@ -503,8 +518,26 @@ change.
 
 ## Tests
 
-The suite has no Wi-Fi coverage at all today, which is consistent with the
-offload never having run.
+Current coverage is host-side plus one DUT probe of the driver, and no rig
+test yet sends a flow out of a VAP:
+
+- `tools/host_tests/wifi_adapter.c` compiles the adapter's VAP registration
+  against stubs and covers the branches a hardware AP never takes:
+  unregistration, mode changes, address changes and a watch lost
+  mid-transaction.
+- `tools/host_tests/wifi_admission.c` compiles the backend's egress-only
+  admission contract.
+- `tools/host_tests/wifi_forward_queues.py` compiles and runs the VAP
+  forwarding queues and the group that bounds them.
+- `tools/host_tests/mwifiex_rx.py` exercises the patched `moal` receive
+  epilogue on the host, and `tools/tests/mwifiex_rx_dut.py` runs the real
+  receive-drop path on the DUT's KASAN kernel.
+
+The measurements in step 6 were taken by hand with the offload active. The
+missing regression is an associated client receiving routed TCP and UDP
+through a VAP with hardware entries proved, one-way UDP with no other traffic
+on the board to hide the dequeue dependency described below, and AP down/up
+recovery on the same boot.
 
 **What can be tested without a radio**, and should be, because it is most of
 the mechanism: a VAP binds to a netdev by `wifi_offload_dev` and nothing on
@@ -546,10 +579,10 @@ lifecycle, compiled from the adapter against stubs.
   `moal`, and zero by construction rather than by choice: admission only
   accepts `ARPHRD_ETHER` devices with a six-byte address, so the case the flag
   describes is refused before it can reach the flag.
-- **Whether the ingress half is worth building at all.** Step 4 decides it.
-  The honest possibility is that Linux's own fast path is already close
-  enough that the offline-port round trip buys nothing, in which case this
-  increment ends at step 5 and says so.
+- ~~**Whether the ingress half is worth building at all.**~~ Settled by the
+  measurement in step 6: it is not, because the downlink wall is the driver's
+  single transmit worker and the uplink is not CPU-bound. This increment ends
+  at step 5.
 - **Per-station scheduling stays the driver's.** Nothing here changes how the
   firmware schedules airtime, so the ceiling for any of this is what the radio
   and its driver can already do.

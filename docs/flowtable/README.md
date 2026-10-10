@@ -48,8 +48,8 @@ configuration instructions.
 | Area | Current boundary |
 | --- | --- |
 | Kernel and hardware | Repository Linux 6.12.103 with its pinned SDK, LS1046A DPAA/FMAN and existing proprietary NXP firmware |
-| Topology and capacity | One hardware flowtable, two initial-netns physical Ethernet ports, at most 32,768 directional entries |
-| Routed traffic | Unicast IPv4 and IPv6 UDP and established/assured TCP; default conntrack zones and zero conntrack mark |
+| Topology and capacity | Initial-netns physical Ethernet ports, up to 40 per flowtable (a representable bound; the board's own ports are the practical limit), at most two flowtables bound at once (a replacement during a Netfilter transaction, or a consumer's offload probe), at most 32,768 directional entries. Any other device a table names, such as a VAP in the LAN bridge, is bound passively and its flows stay in software |
+| Routed traffic | Unicast IPv4 and IPv6 UDP and established/assured TCP; default conntrack zones, and a conntrack mark only within the configured QoS mask ([QoS](qos.md)) |
 | Encapsulation | 802.1Q VLAN subinterfaces on either port, up to two stacked tags per direction, ingress and egress independently. The tag stack is derived from the devices Linux routed through and the pop/push actions must agree with it. 802.1ad, a VLAN device overriding its parent's MAC, and any upper device that is neither an 802.1Q VLAN, a bridge nor a PPPoE session (bond, MACVLAN) are declined |
 | PPPoE | One session per direction in either address family, outermost, over a physical port or over the VLAN device or bridge below it. The session is not derived but carried from the kernel's own forwarding-path walk through patch 140, because a ppp device registers no lower neighbour and the session lives in a pppox socket; the push action's sid must agree with it. A session spends one of the two encapsulation slots, so it admits one tag alongside and PPPoE over QinQ is declined. A session egress has no neighbour and no Ethernet destination — Netfilter writes zeros, and the concentrator the session names is required instead. The insert opcode names no PPP protocol id, so the microcode chooses one; measured on this bench, it chooses correctly for IPv6 |
 | Interface counters | A physical port's and a VLAN device's `ip -s link` and `/proc/net/dev` include the traffic the hardware forwarded on their behalf, folded from the firmware's own per-interface records by `dev_get_stats()` and restated into each device's units; `ethtool -S` stays the driver's software view, so the difference between the two is the offloaded traffic. One plain record per VLAN device and one timestamped record per `ppp` device, each held for the device's life and shared by every flow over it; the pools are 122 and 4 deep and shared with the legacy owner, so a device the pool has nothing for forwards uncounted and `/proc/cdx_flowtable` says so. A tag with no device behind it — a vlan-aware bridge's own — has no counter |
@@ -106,7 +106,7 @@ Both families share one admission budget and one set of adapter indexes, so
 the 32,768 bound counts IPv4 and IPv6 directions together. Within IPv6 the
 boundary is narrower than IPv4's in three respects, each a stated exclusion
 rather than an omission: a flow endpoint may not be link-local, because such an
-address is scoped to one link and cannot be forwarded between the two ports (a
+address is scoped to one link and cannot be forwarded between ports (a
 *gateway* may be, and normally is); the accepted MTU floor is the IPv6 minimum
 link MTU of 1280 rather than 68; and extension headers have no eligibility
 contract, so only packets whose transport header follows the fixed header are
@@ -116,10 +116,13 @@ carry no payload, a direction of either family other than TCP and IPv4 IPsec who
 path is smaller than what its ingress port accepts stays in software, where
 Linux fragments IPv4 and sends IPv6 its Packet Too Big
 ([ipv6.md](ipv6.md#packets-larger-than-the-path),
-[architecture.md](architecture.md#native-context-and-admission)). What IPv6 still lacks
-against IPv4 is a sustained-churn proof at full capacity; the Packet Too Big
-bound, device-MTU retirement, budget accounting, masquerade and hairpin double
-NAT each have one.
+[architecture.md](architecture.md#native-context-and-admission)). The Packet
+Too Big bound, device-MTU retirement, budget accounting, masquerade and hairpin
+double NAT each have an IPv6 proof. The full-capacity sustained-churn proof has
+an IPv6 version (`test_flowtable_ipv6_sustained_churn` in
+`tools/tests/flowtable_churn.py`, opt-in through `ASK_FLOWTABLE_CHURN=1` like
+the [IPv4 one](capacity.md#sustained-connection-churn)), but no accepted
+full-length run of it is recorded yet.
 
 ## How the components fit
 

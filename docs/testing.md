@@ -507,8 +507,10 @@ The IKE case requires UDP 500/4500 and the DUT's charon PID file to be unused.
 IPv6 tunnel, IPsec and multicast active together for a minute through a rekey.
 `flowtable_nat_throughput.py` checks a 9 Gbit/s TCP floor in separate forward and
 reverse runs, simultaneous unpaced TCP directions with floors of 8 Gbit/s forward
-and 6 Gbit/s reverse (the offloaded egress bound, A313), and 64-byte UDP payloads
-at 25 Mbit/s. Artifacts include native DUT MAC
+and 5 Gbit/s reverse (the offloaded egress bound, A313; eleven calibration runs
+measured 5.5-7.9 Gbit/s reverse, against 1.3-2.2 with the unbounded queue it
+guards against), and 64-byte UDP payloads at 25 Mbit/s. These are acceptance
+floors, not measured rates. Artifacts include native DUT MAC
 counters, endpoint NIC counters, UDP loss and receiver buffer errors. Native
 iperf's reverse-only UDP stream does not meet the service's established
 original-direction admission rule, so simultaneous throughput uses TCP.
@@ -610,11 +612,14 @@ run traffic tests. A plain reboot may select the board's installed firmware.
 
 The fault controls `dpa_init_fail_site` and `dpa_init_fail_step` are built
 only into the test image. Production builds omit them. Host coverage in
-`tools/host_tests/cdx_startup.py` exercises the SET_PARAMS transaction,
-partial userspace copies, allocation failures and asynchronous queue
-retirement under ASan/UBSan. It also checks all initial port enable-state
-combinations, state restoration after rollback and unload, and the production
-unload cleanup of PCD queues, private/shared policers and FMAN metadata.
+`tools/host_tests/cdx_startup.py` exercises the in-kernel classifier
+installation and publication (`dpa_cfg_install()`, `dpa_cfg_publish()`), its
+rollback, allocation failures and asynchronous queue retirement under
+ASan/UBSan. It also checks all initial port enable-state combinations, state
+restoration after rollback and unload, and the production unload cleanup of
+PCD queues, private/shared policers and FMAN metadata. The userspace
+SET_PARAMS ioctl that used to drive startup is retired; `flowtable_module.py`
+checks that it returns `ENOTTY`.
 The SDK port API cases cover detach on policy-less and fully cleaned ports,
 while incomplete setup and real hardware detach errors must still fail.
 `sdk_port_state.py` compiles the production `FM_PORT_GetEnabled`/`GetStopped`/

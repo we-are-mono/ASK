@@ -219,8 +219,10 @@ exclusion policy. Multicast stays on, since the policy asks for acceleration.
 Disabling the policy drains multicast too: the switch goes off first and the
 drain also waits for `mcast_installed` and `mroute_installed`.
 A retirement failure reports that recovery is required and never publishes a
-replacement. A fatal hardware failure still requires full provider teardown
-and a fresh boot. There is no automatic switch to CMM.
+replacement. A fatal hardware latch is not by itself a reboot: CDX restarts the
+datapath after a recoverable one and the daemon reconciles the policy once the
+restart completes. Only a terminal latch requires full provider teardown and a
+fresh boot (see `status` below).
 
 Concurrent controller calls serialize on `/run/ask-flowtable/policy.lock`. Each
 `nft` invocation has a five-second monotonic deadline covering input, output
@@ -274,11 +276,12 @@ its netdev; an offline port only when CDX is reloaded or the board reboots.
 | Backend hardware capacity | 32,768-direction admission budget; see [capacity](capacity.md); no live resize guarantee |
 | Observe mode | `ask.flowtable_observe=1` boot parameter / immutable provider parameter |
 | CMM logging and CLI listener | Retired with the daemon; CLI errors, Linux diagnostics and backend counters replace them |
-| VLAN, tunnel, Wi-Fi and asymmetric feature settings | Feature-specific future increments; unsupported traffic continues through Linux |
+| VLAN, tunnel and Wi-Fi settings | Derived from the Linux devices on each flow's path, under each feature's own contract: [VLAN](vlan.md), [bridge](bridge.md), [PPPoE](pppoe.md), [tunnels](tunnels.md), [Wi-Fi](wifi.md) egress |
+| Asymmetric paths and Wi-Fi ingress | Not offloaded; they continue through Linux |
 
 Use normal persistent Linux sysctl configuration for native scalar settings.
-There is no need to duplicate those controls in the policy file or send them
-through FCI. A Linux conntrack capacity setting does not resize CDX hardware.
+There is no need to duplicate those controls in the policy file. A Linux
+conntrack capacity setting does not resize CDX hardware.
 Existing hardware lifetime changes should be applied across a policy stop/apply
 boundary when immediate retirement is required. IPv6, NAT, PPPoE,
 bridge/VLAN, multicast, IPsec and tunnel acceleration each have their own

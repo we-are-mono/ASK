@@ -64,16 +64,27 @@ initramfs; production packaging and persistent deployment remain separate work.
 The adapter acquires an exclusive provider claim before publishing callbacks.
 Claim is refused while CDX's latch holds (until CDX restarts the datapath, or
 for good once the latch is terminal), while another claim or live directions
-exist, or while retirement is pending. The first successful
-claim permanently seals provider configuration for that CDX instance, even if
-adapter initialization subsequently fails. SET_PARAMS rechecks the seal under
-the control lock. Release requires zero live directions; it cannot clear the
-seal, quarantine or latch.
+exist, or while retirement is pending. Provider configuration is fixed when
+CDX loads: CDX builds the classifier itself, and the userspace SET_PARAMS ioctl
+that could once change it is retired and returns `ENOTTY`
+(`cdx/cdx_ioctl.h`). Release requires zero live directions; it cannot clear
+quarantine or the latch.
 
 ## Native context and admission
 
-One hardware flowtable may bind at most two physical Ethernet ports in the
-initial network namespace. The adapter admits at most 32,768 directions, sufficient
+Every binding that carries hardware flows is a physical CDX Ethernet port in
+the initial network namespace. Any other device a table names, such as a VAP
+in the LAN bridge, or a port the hardware cannot take for the rest of the
+boot, is bound passively: every request is declined and its flows stay on the
+software fast path. One flowtable may bind up to 40 hardware ports
+(`CDX_FT_MAX_TABLE_DEVICES`, `cdx/cdx_flowtable_backend.h`; passive bindings
+are not counted); that matches CDX's physical-port slots and is a
+representable bound, not a port count, so on a board the limit is the ports
+it actually has. At most two flowtables may be bound at once
+(`CDX_FT_MAX_TABLES`): Netfilter binds a replacement table while preparing its
+transaction and unbinds the old one only at commit, and a consumer probing for
+offload binds a second table beside its own. Two tables may therefore bind
+the same device; one table never binds a device twice. The adapter admits at most 32,768 directions, sufficient
 for 16,384 fully accelerated connections. This is an admission budget, not a
 firmware capacity claim. The [capacity guide](capacity.md) describes
 resource reasoning and the focused proof. Directions consume slots independently without eviction.
@@ -95,18 +106,27 @@ supplies a shared invalidation handle. Cookies are opaque and binding-local;
 the adapter never recovers a parent flow through a cookie cast. No borrowed
 conntrack or destination pointer survives the callback.
 
-Admission requires exact supported masks and actions, default conntrack zones,
-zero conntrack mark and a table without native `counter` accounting. Supported
-packets are routed unicast IPv4 TCP/UDP and TCP/UDP source NAT (static or MASQUERADE) and destination or combined NAT. TCP additionally
+Admission requires exact supported masks and actions and default conntrack
+zones. A conntrack mark is admitted only inside the configured QoS
+classification mask (`ask_flowtable.qos_mark_mask`, see [QoS](qos.md)); a bit
+outside it still refuses, and with no mask configured that is every nonzero
+mark. A table with native `counter` accounting is admitted, and the hardware
+traffic is restated into Netfilter's units (see
+[statistics](#statistics-diagnostics-and-verification)). Supported packets are
+routed unicast IPv4 and IPv6 TCP/UDP, IPv4 TCP/UDP source NAT (static or
+MASQUERADE) and destination or combined NAT, and IPv6 source and destination
+NAT ([IPv6](ipv6.md), [NAT](nat.md)). TCP additionally
 requires an assured, established conntrack and precisely Netfilter's FIN/RST
 exclusion. Helpers and sequence-adjusted connections are excluded by native
-flowtable eligibility. Other protocols, encapsulations and NAT types require
-separate contracts and proofs.
+flowtable eligibility. VLAN, bridge and PPPoE framing, multicast, IPsec,
+tunnels and Wi-Fi egress each have their own eligibility contract, linked from
+the [overview](README.md); anything without one stays in software.
 
 Rules contain four native Ethernet mangle words and a redirect, with the exact
-translation/checksum sequence for admitted [TCP/UDP NAT](nat.md). Ports
-must be registered physical CDX devices, running with carrier, and
-outside bridge/L3-slave configurations. Ingress and egress must be distinct
+translation/checksum sequence for admitted [TCP/UDP NAT](nat.md). Bound ports
+must be registered physical CDX devices, running with carrier. A logical
+ingress or egress above one is admitted only through the composition the
+[VLAN](vlan.md) and bridge/PPPoE contracts describe. Ingress and egress must be distinct
 except for a completed combined SNAT/DNAT mapping (the hairpin contract). Physical lookup uses the device object,
 not its name or a recyclable interface index. The requested source MAC must
 match the egress device's **current** address. The encoder's source cache is
@@ -114,8 +134,11 @@ synchronized under its reader lock while admission holds its transaction and
 RTNL. An OS rename preserves identity and forwarding semantics.
 
 Both borrowed routes are checked under RTNL before insertion. The egress route
-must be valid unicast IPv4 on the selected port, without XFRM, lightweight tunnel
-state or an IPv6 gateway. The driver uses Linux's selected route rather than
+must be valid unicast on the selected port, of the flow's own family and
+without lightweight tunnel state; an IPv4 route may not use an IPv6 gateway,
+and an IPv6 route may not be a reject, local or anycast route. For an
+encrypted flow the route judged is the one beneath the transform, which
+carries the outer packet ([IPsec](ipsec.md)). The driver uses Linux's selected route rather than
 repeating policy routing with incomplete packet context. The route's MTU must be
 no greater than the egress device MTU; the effective MTU is the smaller of it
 and what the devices below carry -- the physical port, and a session's or

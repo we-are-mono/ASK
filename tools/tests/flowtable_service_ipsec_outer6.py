@@ -1,7 +1,8 @@
 """An IPsec tunnel between IPv6 endpoints is offloaded like an IPv4 one.
 
 The SAs run between the DUT's and the WAN host's WAN-segment IPv6 addresses;
-the inner traffic is IPv4, as in every other IPsec file. Both halves are
+the inner traffic is IPv4 (flowtable_ipv6_sa.py carries IPv6 inside an IPv4
+tunnel). Both halves are
 taken by the hardware -- the outbound one addressed through IPv6's route and
 neighbour discovery -- and the tunnel's flows are carried without Linux and
 leave nothing in the clear.
