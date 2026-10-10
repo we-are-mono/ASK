@@ -162,15 +162,6 @@ result independently of those temporary files.
   mask (`fmbm_rfsem`, +0x6C) so those frames reach `priv_rx_error_dqrr` with their FD status, then tell a parse or
   KeyGen error at minimum length from an FMan resource limit.
 
-- [ ] **A363 — an in-place IPv6 traffic-class rewrite leaves a `CHECKSUM_COMPLETE` value stale.** A362's twin, from its
-  review, not reproduced. `ipv6_change_dsfield()` (`include/net/dsfield.h`) rewrites the header's first word with no
-  fixup, and none of its eleven callers adds one (`xt_DSCP`, `act_ctinfo`, `sch_cake`, ipvs, xfrm, OVS, reassembly). A
-  copy that is received again keeps the stale value, for example an ip6tables `DSCP` target on a group ip6mr forwards
-  to an oif the host joined. Our ports never deliver a hardware COMPLETE, and conntrack's software one exists only from
-  PREROUTING on, so only a rewrite after that and a local re-receive hit it; above 76 bytes the datagram is dropped as
-  a UDP checksum error. Fix direction: an skb-aware variant that does what `IP6_ECN_set_ce()` does with the first word,
-  used by the callers that may keep COMPLETE.
-
 - [x] **A362 — IPv6 multicast looped back to a DUT socket on the oif was dropped above 76 bytes.** ip6mr's hop-limit
   rewrite left a stale `CHECKSUM_COMPLETE`; patch 170 keeps it valid (_:/^ipv6: keep a looped multicast copy_).
 
@@ -1162,6 +1153,9 @@ file's git history.
   boot on eth4 rx>0 with static neighbors). Reopen if it recurs.
 
 ## Corrections to the original review (wontfix / not-a-bug)
+
+- [-] **A363 (wontfix, upstream).** `ipv6_change_dsfield()` leaves a `CHECKSUM_COMPLETE` value stale; on this box it
+  takes a legacy ip6tables DSCP rule on routed multicast that the router itself listens to, which fw4 never builds.
 
 - [-] **A326 (wontfix, toolchain).** KASAN images trip `buildpaths` QA: GCC's ASan global metadata (`asan_add_global()`)
   stores raw header paths, ignoring `-f*-prefix-map` (GCC 14.3 and 15.2); test-image only, and GCC stays unpatched.
