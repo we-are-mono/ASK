@@ -655,11 +655,11 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 		/* ExternalHashTableDeleteKey() syncs the PCD before
 		 * reporting success, so the classifier entry - and the
 		 * listener chain hanging off it - is provably out of reach
-		 * of the ucode walkers. Release the members outright, and
-		 * clear the quarantine backlog on the strength of that same
-		 * barrier. */
+		 * of the ucode walkers. Release the members outright. The
+		 * quarantine backlog went with that barrier already
+		 * (cdx_ehash_delete_entry()); a success that issued none -- a
+		 * group with no classifier entry -- must not forgive it. */
 		cdx_free_exthash_mcast_members(pMcastGrpInfo);
-		cdx_ehash_quarantine_free_all();
 	}
 	else if (rc == EN_EHASH_DELETE_UNSYNCED)
 	{

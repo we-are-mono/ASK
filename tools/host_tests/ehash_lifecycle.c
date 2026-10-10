@@ -217,6 +217,38 @@ static void check_quarantine(void)
     delete_rc = SUCCESS;
     assert(cdx_ehash_delete_entry(first, 2, allocate(8)) == SUCCESS);
     assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 4);
+    /* An unlink whose record cannot be made leaks its entry, which nothing
+     * can free any more, but is owed a barrier all the same: until one
+     * completes the backlog is not empty, whatever its list holds, and the
+     * retry and the drain each issue one for it -- the retry through the
+     * PCD's own table, with no entry to name one. */
+    void *lost = allocate(8), *also_lost = allocate(8);
+    kmalloc_fails = true;
+    cdx_ehash_quarantine_entry(first, lost);
+    kmalloc_fails = false;
+    assert(cdx_ehash_quarantine_pending() == 1 && allocations == held + 2);
+    hc_fail = true;
+    assert(cdx_ehash_quarantine_retry() == -EAGAIN && hc_syncs == 5);
+    cdx_ehash_quarantine_drain(second);
+    assert(hc_syncs == 6 && cdx_ehash_quarantine_pending() == 1);
+    hc_fail = false;
+    assert(cdx_ehash_quarantine_retry() == 0 && hc_syncs == 7 && synced_table == first);
+    assert(!cdx_ehash_quarantine_pending());
+    kmalloc_fails = true;
+    cdx_ehash_quarantine_entry(first, also_lost);
+    kmalloc_fails = false;
+    cdx_ehash_quarantine_drain(second);
+    assert(hc_syncs == 8 && synced_table == second && !cdx_ehash_quarantine_pending());
+    assert(allocations == held + 2);
+    release(lost); release(also_lost);
+    /* Module exit's last barrier is owed to an unrecorded unlink alone too. */
+    lost = allocate(8);
+    kmalloc_fails = true;
+    cdx_ehash_quarantine_entry(first, lost);
+    kmalloc_fails = false;
+    cdx_ehash_quarantine_abandon();
+    assert(hc_syncs == 9 && !cdx_ehash_quarantine_pending());
+    release(lost);
     /* A key that may still be linked is never parked: no barrier makes it
      * free. It is recorded for the restart that settles it (exercised in
      * check_abandoned()); here unload, with the ports never stopped, leaks
@@ -233,15 +265,20 @@ static void check_quarantine(void)
      * backlog when it completes... */
     cdx_ehash_quarantine_entry(first, allocate(8));
     cdx_ehash_quarantine_abandon();
-    assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 5);
-    /* ...and with nothing proven even then gives back only the bookkeeping. */
+    assert(!cdx_ehash_quarantine_pending() && allocations == held && hc_syncs == 10);
+    /* ...and with nothing proven even then gives back only the bookkeeping,
+     * an unlink it could not record among what is left behind. */
     entry = allocate(8);
     cdx_ehash_quarantine_entry(first, entry);
+    lost = allocate(8);
+    kmalloc_fails = true;
+    cdx_ehash_quarantine_entry(first, lost);
+    kmalloc_fails = false;
     hc_fail = true;
     cdx_ehash_quarantine_abandon();
     hc_fail = false;
-    assert(!cdx_ehash_quarantine_pending() && allocations == held + 1 && hc_syncs == 6);
-    release(entry);
+    assert(!cdx_ehash_quarantine_pending() && allocations == held + 2 && hc_syncs == 11);
+    release(entry); release(lost);
     assert(!unlocked);
     cdx_info->ctrl.mutex = false;
     FreeEnEhashInfo(first);

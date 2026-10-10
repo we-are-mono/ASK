@@ -486,7 +486,8 @@ int hw_ct_get_active(struct hw_ct *ct)
  * Each parked entry records the table it was unlinked from, so the backlog
  * can issue its own barrier (cdx_ehash_quarantine_retry()) for a caller
  * that has no table to hand: the flowtable backend refuses admission while
- * anything is parked, and would otherwise wait on some unrelated delete.
+ * anything is owed a barrier, and would otherwise wait on some unrelated
+ * delete.
  *
  * Concurrency: the quarantine carries no lock of its own. Every touch
  * runs under ctrl.mutex: the flowtable backend and its multicast and
@@ -506,17 +507,23 @@ struct cdx_ehash_pending_free {
 
 static LIST_HEAD(cdx_ehash_pending_frees);
 static unsigned int cdx_ehash_pending_free_cnt;
+/* Unlinks whose entry could not be parked for want of memory: the entry is
+ * leaked, but the barrier it is owed is not forgiven. Until one completes,
+ * the backlog counts each, and what waits on the backlog -- admission, a
+ * port's released hardware (cdx_ft_proven()) -- waits on them too. */
+static unsigned int cdx_ehash_unrecorded;
 
 static void cdx_ehash_quarantine_assert_held(void)
 {
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 }
 
-/* Advisory snapshot for the debug proc readers, which run outside the
- * mutator serialization. */
+/* Unlinks owed a barrier, parked or not: the count cdx_ft_pending() reads
+ * under ctrl.mutex, and an advisory snapshot for the debug proc readers,
+ * which run outside the mutator serialization. */
 unsigned int cdx_ehash_quarantine_pending(void)
 {
-	return READ_ONCE(cdx_ehash_pending_free_cnt);
+	return READ_ONCE(cdx_ehash_pending_free_cnt) + READ_ONCE(cdx_ehash_unrecorded);
 }
 
 /* td is the table tbl_entry was unlinked from. Any table on this PCD
@@ -537,9 +544,12 @@ void cdx_ehash_quarantine_entry(void *td, void *tbl_entry)
 		 * so it can neither be freed without a barrier nor reached
 		 * again through the owning software state. Leak it - the same
 		 * outcome the code had before the quarantine existed - and
-		 * make the leak visible in the log. */
+		 * make the leak visible in the log. A walk begun before the
+		 * unlink may still be inside it all the same, so the barrier
+		 * it is owed is still counted. */
 		DPA_ERROR("%s::quarantine alloc failed, leaking tbl_entry %p\n",
 				__func__, tbl_entry);
+		WRITE_ONCE(cdx_ehash_unrecorded, cdx_ehash_unrecorded + 1);
 		return;
 	}
 	node->td = td;
@@ -550,11 +560,11 @@ void cdx_ehash_quarantine_entry(void *td, void *tbl_entry)
 	WRITE_ONCE(cdx_ehash_pending_free_cnt, cdx_ehash_pending_free_cnt + 1);
 }
 
-/* Release the whole backlog. Callers must have just observed a
- * successful HC sync on this PCD, or be running at module exit where
- * the PCD teardown has already quiesced the FMAN. Calling it without
- * such a barrier reintroduces the use-after-free the quarantine exists
- * to prevent. */
+/* Release the whole backlog, and discharge the barrier the unrecorded
+ * unlinks were owed. Callers must have just observed a successful HC sync
+ * on this PCD, or be running at module exit where the PCD teardown has
+ * already quiesced the FMAN. Calling it without such a barrier
+ * reintroduces the use-after-free the quarantine exists to prevent. */
 void cdx_ehash_quarantine_free_all(void)
 {
 	struct cdx_ehash_pending_free *node, *tmp;
@@ -567,6 +577,7 @@ void cdx_ehash_quarantine_free_all(void)
 		kfree(node);
 	}
 	WRITE_ONCE(cdx_ehash_pending_free_cnt, 0);
+	WRITE_ONCE(cdx_ehash_unrecorded, 0);
 }
 
 /* Module-exit disposition of a backlog no drain could clear. cdx does
@@ -583,11 +594,11 @@ void cdx_ehash_quarantine_abandon(void)
 	struct cdx_ehash_pending_free *node, *tmp;
 
 	cdx_ehash_quarantine_assert_held();
-	if (!READ_ONCE(cdx_ehash_pending_free_cnt) || !cdx_ehash_quarantine_retry())
+	if (!cdx_ehash_quarantine_pending() || !cdx_ehash_quarantine_retry())
 		return;
 
 	DPA_ERROR("%s::HC channel never recovered, leaking %u quarantined entries\n",
-			__func__, READ_ONCE(cdx_ehash_pending_free_cnt));
+			__func__, cdx_ehash_quarantine_pending());
 	/* Only the table entries have to be abandoned. The list nodes are
 	 * ordinary kmalloc'd bookkeeping with no hardware reference, so
 	 * release them rather than hand kmemleak a pile of reports that
@@ -598,6 +609,7 @@ void cdx_ehash_quarantine_abandon(void)
 		kfree(node);
 	}
 	WRITE_ONCE(cdx_ehash_pending_free_cnt, 0);
+	WRITE_ONCE(cdx_ehash_unrecorded, 0);
 }
 
 /* Retry the barrier for entries parked by an earlier failed sync. HC
@@ -611,13 +623,13 @@ void cdx_ehash_quarantine_abandon(void)
 void cdx_ehash_quarantine_drain(void *td)
 {
 	cdx_ehash_quarantine_assert_held();
-	if (list_empty(&cdx_ehash_pending_frees))
+	if (!cdx_ehash_quarantine_pending())
 		return;
 
 	if (ExternalHashTableFmPcdHcSync(td))
 	{
 		DPA_ERROR("%s::FmPcdHcSync failed, %u entries still quarantined\n",
-				__func__, cdx_ehash_pending_free_cnt);
+				__func__, cdx_ehash_quarantine_pending());
 		return;
 	}
 	cdx_ehash_quarantine_free_all();
@@ -628,8 +640,8 @@ void cdx_ehash_quarantine_drain(void *td)
  * table, or, when none recorded one, the PCD's own -- any table on it is
  * barrier enough. A direct sync, deliberately not routed through the
  * multicast fault knob's funnel, so an armed knob never keeps a backlog
- * alive. Returns 0 when nothing is parked any more, -EAGAIN when the sync
- * failed and everything stays parked. Quiet on failure: the sync itself
+ * alive. Returns 0 when nothing is owed a barrier any more, -EAGAIN when the
+ * sync failed and everything stays owed. Quiet on failure: the sync itself
  * already logs, and a caller that retries on a timer should not add a
  * line per attempt. */
 int cdx_ehash_quarantine_retry(void)
@@ -638,7 +650,7 @@ int cdx_ehash_quarantine_retry(void)
 	void *td = NULL;
 
 	cdx_ehash_quarantine_assert_held();
-	if (list_empty(&cdx_ehash_pending_frees))
+	if (!cdx_ehash_quarantine_pending())
 		return 0;
 	list_for_each_entry(node, &cdx_ehash_pending_frees, list)
 	{

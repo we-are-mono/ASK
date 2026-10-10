@@ -152,6 +152,18 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A360 — a multicast group's replace leaks a displaced listener entry for good when its record cannot be made.**
+  `cdx_mc_group_replace()` (`cdx/dpa_control_mc.c`) parks every displaced member through
+  `cdx_ehash_quarantine_entry()` before its barrier, on every call. A record allocation that fails there leaks the
+  entry (A359 keeps the barrier it is owed, not the memory), even when the barrier that follows completes and the
+  entry could simply have been freed. Under memory pressure, or failslab, each such replace loses one table entry
+  from the pool. Fix: issue the barrier first, free the displaced members directly on success, and park them only
+  when it fails; `tools/host_tests/mcast_backend.py`'s ordering asserts (`test_replace_drains_what_it_parks`) change
+  with it.
+
+- [x] **A359 — an unlink the quarantine could not record for want of memory was owed no barrier.** It now counts as
+  pending until one completes (_:/^cdx: keep the barrier an unrecorded unlink is owed_).
+
 - [ ] **A358 — the destroyed-tree test's WAN capture check once saw none of the DUT's five frames.** In the release
   run of b62ef8a8's predecessor image (2026-10-10, test 126/570, after `test_shrunk_leaf_backlog_stays_charged`),
   `_capture_checked()` in `tools/tests/flowtable_qos.py` saw 0 of 5 frames the DUT sends out of eth4 from its LAN MAC
