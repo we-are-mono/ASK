@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A353 — the capacity test's last close outlived its 30 s.** Test bug: the peer closed ~8,300 TCP connections at
+  once, and their FINs and lockstep retries burst through the punt path; it now closes 32 at a time (_:/^tests: close a peer's connections a few at a time_).
+
 - [x] **A352 — line-rate bursts overflowed the 10G receive MACs' FIFOs, dropping frames no counter saw.** The 10G receive
   ports get 48 KB FIFOs, and the MAC's own drops count in `rx_missed_errors` (_:/^dts: give the 10G receive ports room_).
 

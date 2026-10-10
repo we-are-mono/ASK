@@ -17,6 +17,12 @@ import time
 TCP_SIZE = 16384
 UDP_SIZE = 256
 CONTROL_IDLE_TIMEOUT = 35
+# Connections closed at once. Linux takes every FIN itself, through each
+# port's punt policer (a 64-frame burst) and its queue to the CPU, and TCP
+# retransmits a lost one on the same schedule for every connection, so
+# thousands closed together arrive as one burst and retry as bursts; a few at
+# a time never form one.
+CLOSE_CONCURRENCY = 32
 # linux/in.h: a socket's DF policy, for probes on a flow's own tuple.
 IP_MTU_DISCOVER = 10
 IP_PMTUDISC_PROBE = 3
@@ -333,10 +339,10 @@ class Flow:
                 self.writer.transport.abort()
             else:
                 self.writer.write_eof()
-                # Thousands closing at once punt as many FINs to Linux, and
-                # the punt policer drops what exceeds its burst; each loss
-                # waits out TCP's retransmission backoff (0.2 s, doubling).
-                # 30 s spans six retries.
+                # Linux takes the FIN through the punt path, which drops
+                # what exceeds its burst (close_all() keeps a close's FINs
+                # within it); each loss waits out TCP's retransmission
+                # backoff (0.2 s, doubling). 30 s spans six retries.
                 try:
                     tail = await asyncio.wait_for(self.reader.read(), 30)
                 except TimeoutError as error:
@@ -352,6 +358,17 @@ class Flow:
         if self.wire:
             self.wire.close()
             self.wire = None
+
+
+async def close_all(flows):
+    """Close every flow, CLOSE_CONCURRENCY of them at a time."""
+    gate = asyncio.Semaphore(CLOSE_CONCURRENCY)
+
+    async def close(flow):
+        async with gate:
+            await flow.close()
+
+    await asyncio.gather(*(close(flow) for flow in flows))
 
 
 async def main(config):
@@ -443,10 +460,10 @@ async def main(config):
                     result = await finish(ids, stop=op == "stop")
                 elif op == "close":
                     assert all(i not in running for i in ids)
-                    await asyncio.gather(*(flows[i].close() for i in ids))
+                    await close_all([flows[i] for i in ids])
                 elif op == "shutdown":
                     result = await finish(list(running), stop=True)
-                    await asyncio.gather(*(flow.close() for flow in flows.values()))
+                    await close_all(list(flows.values()))
                 else:
                     raise AssertionError(command)
                 control.write(json.dumps({"op": op, "result": result}).encode() + b"\n")
