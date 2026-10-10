@@ -579,6 +579,22 @@ STRANDED_RTNL_REQUESTS = 4000
 STRANDED_SWAP = "/tmp/ask_qos_teardown_and_claim.sh"
 
 
+def _lan_mac_toward_this_host(r):
+    """Have the WAN link's switch place the LAN VM's MAC behind this host.
+
+    A case that bridges the DUT's LAN and WAN ports sends the LAN VM's frames
+    out of the WAN port, and the switch learns its MAC on the DUT's port. A
+    frame the DUT later sends there to that MAC -- a leak -- then enters the
+    switch by the port its destination is learned on, and is dropped there:
+    the capture sees nothing for as long as the switch remembers (A358). One
+    frame from that MAC, from this host to the DUT, moves the entry here. Its
+    EtherType is a local experimental one, which the DUT ignores."""
+    from scapy.all import Ether, Raw, sendp
+
+    sendp(Ether(src=r.lan_mac, dst=r.dut_wan_mac, type=0x88b5) / Raw(b"ASK-capture-path".ljust(46, b".")),
+          iface=r.wan_if, verbose=False)
+
+
 async def _leaked_to_wan(r, during, bpf, linger=2.0):
     """Run the coroutine `during()` and return, with its result, the frames
     this host's WAN link carried meanwhile, and for `linger` seconds after,
@@ -586,11 +602,14 @@ async def _leaked_to_wan(r, during, bpf, linger=2.0):
     port, which have no business on the WAN link.
 
     Captured promiscuously, as a frame to a MAC nobody on the link answers to
-    is delivered here whether the link is a cable or a bridge, and filtered in
-    the kernel, so a flood of this host's own frames cannot crowd one out.
-    _dut_sends_on_wan() shows the path carries such a frame."""
+    is delivered here whether the link is a cable or a bridge -- the switch's
+    entry for the LAN VM's MAC is first made to point here
+    (_lan_mac_toward_this_host()) -- and filtered in the kernel, so a flood of
+    this host's own frames cannot crowd one out. _dut_sends_on_wan() shows the
+    path carries such a frame."""
     from scapy.all import AsyncSniffer
 
+    await asyncio.to_thread(_lan_mac_toward_this_host, r)
     ready = threading.Event()
     sniffer = AsyncSniffer(iface=r.wan_if, store=True, started_callback=ready.set, filter=bpf)
     sniffer.start()
