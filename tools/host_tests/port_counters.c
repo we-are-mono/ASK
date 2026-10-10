@@ -4,7 +4,7 @@
  * Transmit is what the port's MAC sent: an offloaded frame was counted when the
  * classifier enqueued it, before QMan decided, and one an egress congestion
  * group refused never left. So the netdev's own counts as CDX took the port --
- * or what the port reported at the first whole reading of its MAC -- carry on
+ * or what the port reported at the first reading of it that stood still -- carry on
  * by the MAC's advance since, whatever the enqueue counted. Receive
  * adds what the port's own enqueues lost to a congestion group, as drops, and
  * what it found no buffer for, as misses, from 32-bit BMI counts carried past
@@ -20,6 +20,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int64_t s64;
 #define max(a, b) ((a) > (b) ? (a) : (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
 typedef void *t_Handle;
 #define __iomem
 #define RX 0
@@ -45,13 +46,20 @@ struct memac_regs {
 };
 struct fm_port_model { u32 discards, no_buffer; };
 typedef struct { t_Handle h_Dev; } t_LnxWrpFmPortDev;
-struct mac_device { void *port_dev[2]; void *vaddr; };
+/* The SDK driver sets link and speed at probe -- down, and the MAC's fastest --
+ * and never again: they say nothing of the link. */
+struct mac_device { void *port_dev[2]; void *vaddr; bool link; uint16_t speed, max_speed; };
 struct dpa_priv_s { struct mac_device *mac_dev; };
 struct net_device;
 struct net_device_ops { void (*ndo_get_stats64)(struct net_device *, struct rtnl_link_stats64 *); };
 struct net_device {
     char name[16]; struct dpa_priv_s priv; bool dpaa; const struct net_device_ops *netdev_ops;
+    unsigned int mtu;
 };
+#define VLAN_ETH_HLEN 18
+#define VLAN_HLEN 4
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+#define READ_ONCE(x) (x)
 
 #include "port_counters_types.inc"
 
@@ -69,7 +77,15 @@ static void spin_lock(int *lock) { assert(lock == &dpa_devlist_lock && !locked);
 static void spin_unlock(int *lock) { assert(lock == &dpa_devlist_lock && locked); locked = 0; }
 static bool dpa_netdev_is_dpaa(const struct net_device *dev) { return dev && dev->dpaa; }
 static void *netdev_priv(const struct net_device *dev) { return (void *)&dev->priv; }
-static void udelay(unsigned long us) { (void)us; }
+/* Time passes only where the code waits; a frame on its way to the MAC's count
+ * gets there once enough of it has (transit_advance(), below). */
+typedef u64 ktime_t;
+static u64 now_us;
+static ktime_t ktime_get(void) { return now_us; }
+static long long ktime_us_delta(ktime_t later, ktime_t earlier) { return (long long)(later - earlier); }
+static void transit_advance(unsigned long us);
+static void queue_take(unsigned long us);
+static void udelay(unsigned long us) { now_us += us; transit_advance(us); queue_take(us); }
 
 /* The MAC: what it has sent, kept whole, and served in halves. A carry may be
  * due between an upper half's read and the lower's. As measured on the rig,
@@ -104,6 +120,22 @@ static u32 ioread32be(const u32 *reg)
     halves(&regs.tbca_l, &regs.tbca_u, mac.broadcast);
     halves(&regs.rdrp_l, &regs.rdrp_u, mac.rx_dropped);
     return *reg;
+}
+/* Frames FMan has taken from a queue, of `bytes' each, which the MAC counts
+ * one at a time once each is on the wire: the first `left_us' from now, each
+ * after it `frame_us' later. */
+static struct { u64 frames, bytes, left_us, frame_us; } transit;
+static void transit_advance(unsigned long us)
+{
+    while (transit.frames && us >= transit.left_us) {
+        us -= transit.left_us;
+        mac.unicast++;
+        mac.octets += transit.bytes + ETH_FCS_LEN;
+        transit.frames--;
+        transit.left_us = transit.frame_us;
+    }
+    if (transit.frames)
+        transit.left_us -= us;
 }
 static struct fm_port_model rx_port;
 static t_LnxWrpFmPortDev rx_wrapper = { .h_Dev = &rx_port };
@@ -149,12 +181,94 @@ static void cdx_ft_ifstats_fold(const struct net_device *dev, struct rtnl_link_s
     assert(!locked);
 }
 
+/* What the kernel has enqueued for the port and FMan not yet taken, in frames
+ * and bytes, as QMan's queue counts read; none readable on a port a hardware
+ * qdisc owns. `enqueue_on_read' has the kernel enqueue a frame just after the
+ * given reading of them -- the driver counts it, the reading does not -- which
+ * a freeze of the kernel's transmit does not stop: the driver sends without
+ * the lock it waits on. `offload_on_read' has the classifier enqueue one
+ * instead, which the port's record counts. `take_in_gap' has FMan take a frame
+ * of `take_bytes' from the queue during the next wait, which the MAC counts
+ * only after it. */
+static struct {
+    u64 frames, bytes, take_bytes;
+    bool qdisc;
+    int enqueue_on_read, offload_on_read, take_in_gap;
+} queue;
+static void queue_take(unsigned long us)
+{
+    if (!queue.take_in_gap || !queue.frames)
+        return;
+    queue.take_in_gap = 0;
+    queue.frames--, queue.bytes -= queue.take_bytes;
+    transit.frames++, transit.bytes = queue.take_bytes, transit.left_us = 1;
+    (void)us;
+}
+/* The speed the PHY reports for the link, or none. Read under RTNL and never
+ * under dpa_devlist_lock: reading a PHY may sleep. */
+static uint32_t phy_speed;
+static uint32_t fwd_cgr_link_speed(struct net_device *dev, uint32_t fallback)
+{
+    (void)dev;
+    assert(!locked);
+    return phy_speed ?: fallback;
+}
+/* Resizing a port's egress bound: a QMan management command, which can fail. */
+static int cgr_fails;
+static int fwd_cgr_set(struct eth_iface_info *eth, uint32_t speed, bool init)
+{
+    assert(locked && !init);
+    if (cgr_fails)
+        return -5;
+    eth->fwd_cgr_speed = speed;
+    eth->fwd_cgr_mtu = eth->net_dev->mtu;
+    return 0;
+}
+#define netdev_warn(dev, ...) do { (void)(dev); } while (0)
+static int tx_frozen, frozen_reads, tx_freezes, queue_reads;
+static void netif_tx_lock_bh(struct net_device *dev) { (void)dev; assert(!tx_frozen); tx_frozen = 1; tx_freezes++; }
+static void netif_tx_unlock_bh(struct net_device *dev) { (void)dev; assert(tx_frozen); tx_frozen = 0; }
+static bool port_tx_queued(const struct eth_iface_info *eth, u64 *frames, u64 *bytes)
+{
+    (void)eth;
+    queue_reads++;
+    if (queue.qdisc)
+        return false;
+    frozen_reads += tx_frozen;
+    *frames = queue.frames;
+    *bytes = queue.bytes;
+    if (queue.enqueue_on_read && !--queue.enqueue_on_read) {
+        queue.frames++, queue.bytes += 300;
+        driver_tx++, driver_tx_bytes += 300;
+    }
+    if (queue.offload_on_read && !--queue.offload_on_read) {
+        queue.frames++, queue.bytes += 800;
+        record_tx.packets++, record_tx.bytes += 800;
+    }
+    return true;
+}
+
 #include "port_counters_production.inc"
 
-static struct mac_device mac_dev = { .vaddr = &regs };
-static struct net_device eth3 = { .name = "eth3", .dpaa = true, .netdev_ops = &dpa_ops };
+static struct mac_device mac_dev = { .vaddr = &regs, .link = false, .speed = 10000, .max_speed = 10000 };
+static struct net_device eth3 = { .name = "eth3", .dpaa = true, .netdev_ops = &dpa_ops, .mtu = 1500 };
 static struct dpa_iface_info port, wifi;
 static int record;
+
+/* A port as CDX takes it: the MAC's fastest speed, and the link's at 10G as
+ * the statistics hook will have it once the port's queues are made. */
+static struct eth_iface_info fresh_port(void)
+{
+    return (struct eth_iface_info){ .net_dev = &eth3, .speed = 10000, .tx_wire.link_speed = 10000 };
+}
+
+/* The longest a frame FMan has taken from a queue takes to reach the MAC's
+ * count: its time on the wire -- MTU, two tags, header, FCS, preamble and gap
+ * -- at the link's speed, and the readings' margin after. */
+static u64 on_wire_us(unsigned int mtu, unsigned int speed)
+{
+    return DIV_ROUND_UP(8 * (mtu + 4 + 4 + 14 + 4 + 8 + 12), speed) + MEMAC_TX_PRIME_GAP_US;
+}
 
 /* dev_get_stats(): the driver's counts, then the hook. */
 static struct rtnl_link_stats64 read_stats(u64 rx_dropped)
@@ -208,7 +322,7 @@ int main(void)
     mac_dev.port_dev[RX] = &rx_wrapper;
     eth3.priv.mac_dev = &mac_dev;
     port = (struct dpa_iface_info){ .if_flags = IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL | IF_STATS_ENABLED,
-                                    .eth_info = { .net_dev = &eth3 }, .stats = &record };
+                                    .eth_info = fresh_port(), .stats = &record };
     strcpy(port.name, "eth3");
     wifi = (struct dpa_iface_info){ .if_flags = IF_TYPE_WLAN, .next = &port };
     strcpy(wifi.name, "wlan0");
@@ -360,7 +474,7 @@ int main(void)
         for (unsigned at = 1; at <= 48; at++) {
             struct dpa_iface_info taken = port;
 
-            taken.eth_info = (struct eth_iface_info){ .net_dev = &eth3 };
+            taken.eth_info = fresh_port();
             inject_what = what, inject_at = at, reads = 0;
             port_counters_prime(&taken.eth_info);
             inject_what = NOTHING;
@@ -385,11 +499,13 @@ int main(void)
     for (int what = PAUSE; what <= DATA; what++) {
         struct dpa_iface_info busy = port;
         struct rtnl_link_stats64 quiet, after;
+        u64 began = now_us;
 
-        busy.eth_info = (struct eth_iface_info){ .net_dev = &eth3 };
+        busy.eth_info = fresh_port();
         inject_what = what, inject_at = 0, inject_every = 3, reads = 0;
         port_counters_prime(&busy.eth_info);
-        assert(!busy.eth_info.tx_wire.ready);
+        assert(!busy.eth_info.tx_wire.ready && now_us - began <= MEMAC_TX_PRIME_BUDGET_US);
+        assert(now_us - began > MEMAC_TX_PRIME_BUDGET_US / 2);
         dpa_interface_info = &busy;
         s = read_stats(3);
         assert(s.tx_packets == driver_tx + record_tx.packets);
@@ -404,6 +520,254 @@ int main(void)
         dpa_interface_info = &wifi;
     }
 
+    /* Frames the kernel had enqueued and the MAC not yet sent when CDX took
+     * the port: the driver counted them as they were enqueued and the MAC
+     * counts them as they leave, and they are counted once. The kernel's
+     * transmit is held while the queues are read, so that none joins them
+     * meanwhile. */
+    {
+        struct dpa_iface_info queued = port;
+
+        queued.eth_info = fresh_port();
+        driver_tx += 10, driver_tx_bytes += 10 * 500;
+        queue.frames = 10, queue.bytes = 10 * 500;
+        frozen_reads = 0;
+        port_counters_prime(&queued.eth_info);
+        assert(queued.eth_info.tx_wire.ready && frozen_reads && !tx_frozen);
+        dpa_interface_info = &queued;
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        queue.frames = queue.bytes = 0;
+        transmit(10, 500);
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        driver_tx += 3, driver_tx_bytes += 3 * 200;
+        transmit(3, 200);
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        dpa_interface_info = &wifi;
+    }
+
+    /* Frames FMan had taken from their queue and the MAC not yet counted when
+     * CDX took the port are in the driver's count alone. Readings a frame's
+     * time on the wire apart at the link's speed -- jumbo frames at 1G here,
+     * two of them back to back -- see one arrive while the other is still on
+     * its way, and the counts start from a pair taken once both have. */
+    {
+        struct dpa_iface_info moving = port;
+        u64 began = now_us;
+
+        moving.eth_info = fresh_port();
+        phy_speed = 1000, eth3.mtu = 9000;
+        driver_tx += 2, driver_tx_bytes += 2 * 9000;
+        transit.frames = 2, transit.bytes = 9000;
+        transit.left_us = transit.frame_us = 9000 * 8 / 1000;
+        port_counters_prime(&moving.eth_info);
+        assert(moving.eth_info.tx_wire.ready && now_us - began <= MEMAC_TX_PRIME_BUDGET_US);
+        udelay(1000);
+        dpa_interface_info = &moving;
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        driver_tx += 2, driver_tx_bytes += 2 * 700;
+        transmit(2, 700);
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        dpa_interface_info = &wifi;
+        phy_speed = 0, eth3.mtu = 1500;
+    }
+
+    /* A gigabit port linked at 10M as CDX takes it: a frame is on its way to
+     * the MAC's count for as long as on_wire_us() at that speed, and the
+     * readings are that far apart, at the speed the PHY reports; the MAC's
+     * fastest is a hundred times too soon. */
+    {
+        struct dpa_iface_info linked = port;
+
+        linked.eth_info = fresh_port();
+        linked.eth_info.speed = 1000;
+        phy_speed = 10;
+        driver_tx += 1, driver_tx_bytes += 1500;
+        transit.frames = 1, transit.bytes = 1500;
+        transit.left_us = on_wire_us(1500, 10);
+        port_counters_prime(&linked.eth_info);
+        assert(linked.eth_info.tx_wire.ready && !transit.frames);
+        phy_speed = 0;
+        dpa_interface_info = &linked;
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        transmit(2, 600);
+        driver_tx += 2, driver_tx_bytes += 2 * 600;
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        dpa_interface_info = &wifi;
+    }
+
+    /* From the statistics hook, a port CDX could not read standing still as
+     * it took it: nothing is read while CDX is still making its queues; then
+     * its readings are timed by the speed the link last reported -- 1G as
+     * CDX took it, 100M once it changed -- even when its egress bound could
+     * not follow. */
+    {
+        struct dpa_iface_info linked = port;
+
+        linked.eth_info = fresh_port();
+        linked.eth_info.speed = 1000;
+        linked.eth_info.tx_wire.link_speed = 0;
+        queue.qdisc = true;
+        port_counters_prime(&linked.eth_info);
+        assert(!linked.eth_info.tx_wire.ready);
+        queue.qdisc = false;
+        dpa_interface_info = &linked;
+        int reads = queue_reads;
+        s = read_stats(3);
+        assert(!linked.eth_info.tx_wire.ready && queue_reads == reads);
+        assert(s.tx_packets == driver_tx + record_tx.packets);
+        phy_speed = 100;
+        dpa_fwd_cgr_follow_link(&eth3);
+        assert(!linked.eth_info.tx_wire.link_speed);
+        /* The queues made, as at 1G; then the link changes speed. */
+        linked.eth_info.tx_wire.link_speed = linked.eth_info.fwd_cgr_speed = 1000;
+        linked.eth_info.fwd_cgr_mtu = eth3.mtu;
+        cgr_fails = 1;
+        dpa_fwd_cgr_follow_link(&eth3);
+        assert(linked.eth_info.tx_wire.link_speed == 100 && linked.eth_info.fwd_cgr_speed == 1000);
+        cgr_fails = 0;
+        dpa_fwd_cgr_follow_link(&eth3);
+        assert(linked.eth_info.fwd_cgr_speed == 100);
+        /* The link goes down, and reports no speed: the last one stands. */
+        phy_speed = 0;
+        dpa_fwd_cgr_follow_link(&eth3);
+        assert(linked.eth_info.tx_wire.link_speed == 100 && linked.eth_info.fwd_cgr_speed == 100);
+        driver_tx += 1, driver_tx_bytes += 1500;
+        transit.frames = 1, transit.bytes = 1500;
+        transit.left_us = on_wire_us(1500, 100);
+        s = read_stats(3);
+        assert(!linked.eth_info.tx_wire.ready && !transit.frames);
+        s = read_stats(3);
+        assert(linked.eth_info.tx_wire.ready);
+        u64 reported = driver_tx + record_tx.packets, reported_bytes = driver_tx_bytes + record_tx.bytes;
+        assert(s.tx_packets == reported && s.tx_bytes == reported_bytes);
+        transmit(2, 600);
+        s = read_stats(3);
+        assert(s.tx_packets == reported + 2 && s.tx_bytes == reported_bytes + 2 * 600);
+        dpa_interface_info = &wifi;
+    }
+
+    /* A frame the kernel enqueued while the queues were read, which the
+     * freeze does not stop: the driver counted it and the reading of the
+     * queues did not, so that pair is passed over, and the next counts it
+     * as queued. */
+    {
+        struct dpa_iface_info slipped = port;
+
+        slipped.eth_info = fresh_port();
+        /* The first reading of the queues only says they can be read; the
+         * enqueue comes after the second pair's. */
+        queue.enqueue_on_read = 3;
+        port_counters_prime(&slipped.eth_info);
+        assert(slipped.eth_info.tx_wire.ready && !queue.enqueue_on_read && queue.frames == 1);
+        dpa_interface_info = &slipped;
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        queue.frames = queue.bytes = 0;
+        transmit(1, 300);
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        dpa_interface_info = &wifi;
+    }
+
+    /* A frame FMan took from its queue between the two readings, and the MAC
+     * had not counted by the second: it left the queue's count and joined no
+     * other, so that pair is passed over too. */
+    {
+        struct dpa_iface_info taking = port;
+
+        taking.eth_info = fresh_port();
+        driver_tx += 1, driver_tx_bytes += 400;
+        queue.frames = 1, queue.bytes = queue.take_bytes = 400;
+        queue.take_in_gap = 1;
+        port_counters_prime(&taking.eth_info);
+        assert(taking.eth_info.tx_wire.ready && !queue.frames && !transit.frames);
+        dpa_interface_info = &taking;
+        udelay(1000);
+        s = read_stats(3);
+        assert(s.tx_packets == driver_tx && s.tx_bytes == driver_tx_bytes);
+        dpa_interface_info = &wifi;
+    }
+
+    /* A link too slow for two readings a frame's time apart within the time
+     * CDX may hold the kernel's transmit: no reading is tried, then or from
+     * the statistics hook, and the port goes on by the driver's counts and
+     * the record's. */
+    {
+        struct dpa_iface_info slow = port;
+        int freezes = tx_freezes;
+
+        slow.eth_info = fresh_port();
+        phy_speed = 10, eth3.mtu = 9000;
+        frozen_reads = 0;
+        port_counters_prime(&slow.eth_info);
+        assert(!slow.eth_info.tx_wire.ready && !frozen_reads && tx_freezes == freezes);
+        slow.eth_info.tx_wire.link_speed = 10;
+        dpa_interface_info = &slow;
+        s = read_stats(3);
+        assert(!slow.eth_info.tx_wire.ready && !frozen_reads);
+        assert(s.tx_packets == driver_tx + record_tx.packets);
+        dpa_interface_info = &wifi;
+        phy_speed = 0, eth3.mtu = 1500;
+    }
+
+    /* Taken later, from the statistics hook: what was queued then -- of the
+     * kernel's and of the offloaded frames the enqueue's record counts -- is
+     * counted once too. A reading the kernel enqueued during is passed over,
+     * and so is every reading of a port a hardware qdisc owns, whose class
+     * queues count no bytes; the port goes on by the driver's counts and the
+     * record's meanwhile. */
+    {
+        struct dpa_iface_info late = port;
+        struct cdx_ft_stats record_was = record_tx;
+
+        late.eth_info = fresh_port();
+        queue.qdisc = true;
+        port_counters_prime(&late.eth_info);
+        assert(!late.eth_info.tx_wire.ready);
+        dpa_interface_info = &late;
+        driver_tx += 4, driver_tx_bytes += 4 * 100;
+        queue.frames = 4, queue.bytes = 4 * 100;
+        record_tx.packets += 6, record_tx.bytes += 6 * 1000;
+        queue.frames += 6, queue.bytes += 6 * 1000;
+        /* Nor is a reading that cannot be taken waited out, under the lock,
+         * at every read of its counters. */
+        u64 at = now_us;
+        s = read_stats(3);
+        assert(!late.eth_info.tx_wire.ready && now_us == at);
+        assert(s.tx_packets == driver_tx + record_tx.packets && s.tx_bytes == driver_tx_bytes + record_tx.bytes);
+        queue.qdisc = false;
+        queue.enqueue_on_read = 2;
+        s = read_stats(3);
+        assert(!late.eth_info.tx_wire.ready && !queue.enqueue_on_read);
+        assert(s.tx_packets + 1 == driver_tx + record_tx.packets);
+        /* So is one an offloaded frame joined the queues after their second
+         * reading: the record counted it, and the reading did not. */
+        queue.offload_on_read = 2;
+        s = read_stats(3);
+        assert(!late.eth_info.tx_wire.ready && !queue.offload_on_read);
+        assert(s.tx_packets == driver_tx + record_tx.packets);
+        s = read_stats(3);
+        assert(late.eth_info.tx_wire.ready);
+        u64 reported = driver_tx + record_tx.packets, reported_bytes = driver_tx_bytes + record_tx.bytes;
+        assert(s.tx_packets == reported && s.tx_bytes == reported_bytes);
+        transmit(4, 100), transmit(1, 300), transmit(6, 1000), transmit(1, 800);
+        queue.frames = queue.bytes = 0;
+        s = read_stats(3);
+        assert(s.tx_packets == reported && s.tx_bytes == reported_bytes);
+        transmit(2, 50);
+        s = read_stats(3);
+        assert(s.tx_packets == reported + 2 && s.tx_bytes == reported_bytes + 100);
+        dpa_interface_info = &wifi;
+        record_tx = record_was;
+    }
+
     /* A port with no statistics enabled gets nothing added. */
     port.if_flags &= ~IF_STATS_ENABLED;
     s = read_stats(3);
@@ -411,7 +775,7 @@ int main(void)
     port.if_flags |= IF_STATS_ENABLED;
     /* One CDX took without a MAC to read keeps the enqueue's count. */
     struct dpa_iface_info bare = port;
-    bare.eth_info = (struct eth_iface_info){ .net_dev = &eth3 };
+    bare.eth_info = fresh_port();
     mac_dev.vaddr = NULL;
     port_counters_prime(&bare.eth_info);
     assert(!bare.eth_info.tx_wire.ready);

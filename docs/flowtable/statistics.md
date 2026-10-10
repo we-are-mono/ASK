@@ -240,12 +240,23 @@ A registered port's transmit counters therefore come from its MAC
 (`port_tx_from_wire()` in `cdx/devman.c`): the driver's own counts as CDX
 takes the port, read at registration so nothing offloaded before the first
 reading is lost, carried on by the MAC's advance in good frames and their
-octets less the FCS. That base is only ever taken from a whole reading of the
-MAC (below); a port that never gives one at registration -- sending without a
-pause the whole time, which a port nothing is offloaded through yet hardly
-does -- reports as a port without a MAC until a reading is whole, and carries
-on from exactly what it reported then, keeping whatever the enqueue counted
-meanwhile. The MAC counts every frame that left, whoever queued it
+octets less the FCS. A frame still queued then was counted by the driver as it
+was enqueued and is counted again by the MAC as it leaves, so the base leaves
+out what QMan holds for the port: the driver's transmit queues, each once, and
+CDX's forwarding and SEC-output queues to it (A354). The base is only ever
+taken from a reading that stood still: the driver's counts, the MAC's (whole,
+below) and the queues', read twice one largest frame's time on the wire apart,
+with nothing moved, so that no frame was between a queue and the MAC's count.
+The time is at the speed the link's PHY reports; the driver's own record of
+the MAC's speed is set at probe and never again. CDX holds the kernel's
+transmit meanwhile, for 5 ms at most. A port that does not stand still in that
+time, or whose link is too slow for it, reports as a port without a MAC -- the
+driver's counts and the enqueue's -- until the statistics hook finds a reading
+that does, with the enqueue's record unchanged across it too, and carries on
+from exactly what it reported then. A paused port stands still with what it
+was sending in its MAC's FIFO, and those few frames count twice; one a
+hardware qdisc owns by then never gives such a reading, its class queues
+counting no bytes. The MAC counts every frame that left, whoever queued it
 -- the kernel's, offloaded unicast and multicast, ESP after SEC, a hardware
 qdisc's -- and none that did not. The frames are its unicast, multicast and
 broadcast counts (TUCA, TMCA, TBCA). Its count of all good frames (TFRM) and

@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A354 — a port's transmit counts counted twice what was still queued when CDX took it.** Where they start
+  leaves out what QMan holds for the port, read standing still (_:/^cdx: leave what is still queued out of where transmit_).
+
 - [x] **A353 — the capacity test's last close outlived its 30 s.** Test bug: the peer closed ~8,300 TCP connections at
   once, and their FINs and lockstep retries burst through the punt path; it now closes 32 at a time (_:/^tests: close a peer's connections a few at a time_).
 

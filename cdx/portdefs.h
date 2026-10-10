@@ -102,23 +102,31 @@ struct eth_iface_info {
 	 * so the largest frame decides how long they queue. */
 	uint32_t fwd_cgr_mtu;
 	/* What the port's counters report while CDX holds it (devman.c), under
-	 * dpa_devlist_lock. Transmit is what its MAC sent: the netdev's own
-	 * counts as CDX took the port -- or, if no reading of its MAC was whole
-	 * then, what the port reported at the first that was -- then the
-	 * MAC's advance since, which offloaded frames an egress group refused
-	 * never join: the MAC's counts then less the base taken with them,
-	 * never a sum of clamped steps, and never reported below what was
-	 * reported before. last_frames is the last reading's frames, which
-	 * fewer than says the MAC's counts were reset. Receive
-	 * adds what the port took in and FMan then dropped: frames its enqueues
-	 * lost to a congestion group, as drops, and frames it found no buffer
-	 * for, as missed -- each a 32-bit BMI count carried past its wrap. */
+	 * dpa_devlist_lock. Transmit is what its MAC sent: what the port
+	 * reported as CDX took it -- or, if its transmit never stood still
+	 * then, at the first reading that did, which a port a hardware qdisc
+	 * owns by then never has -- less what was still queued
+	 * for it then (base_*), then the MAC's advance since, which offloaded
+	 * frames an egress group refused never join: the MAC's counts then less
+	 * the base taken with them, never a sum of clamped steps, and never
+	 * reported below what was reported before (packets, bytes).
+	 * last_frames is the last reading's frames, which fewer than says the
+	 * MAC's counts were reset. Receive adds what the port took in and FMan
+	 * then dropped: frames its enqueues lost to a congestion group, as
+	 * drops, and frames it found no buffer for, as missed -- each a 32-bit
+	 * BMI count carried past its wrap -- and frames the MAC dropped itself,
+	 * its FIFO full, as missed too. link_speed is the Mbit/s the link ran
+	 * at as CDX took the port, or last reported since -- the MAC's fastest
+	 * while it has reported none -- which a reading from the statistics
+	 * hook is timed by; zero until the port's queues are all made, and no
+	 * such reading is taken until then. */
 	struct {
 		bool ready;
 		u64 base_packets, base_bytes;
 		u64 mac_frames, mac_octets;
 		u64 last_frames;
 		u64 packets, bytes;
+		uint32_t link_speed;
 	} tx_wire;
 	struct port_bmi_count rx_discarded, rx_no_buffer;
 	struct port_mac_count rx_mac_dropped;

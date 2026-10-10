@@ -104,8 +104,10 @@
  *   dpa_devlist_lock is the innermost lock its takers hold. The locks
  *   taken inside it are cdx_ifstats.c's dpa_statslist_lock, by
  *   virt_iface_stats_callback reading a record, and the affine QMan
- *   portal's, by fwd_cgr_set() resizing a port's egress bound; nothing
- *   holding either takes this one.
+ *   portal's, by fwd_cgr_set() resizing a port's egress bound and by
+ *   port_tx_prime_late() reading a port's queues; nothing holding either
+ *   takes this one. port_tx_prime_late() also waits under it, for
+ *   MEMAC_TX_LATE_GAP_MAX_US at most.
  *
  * Contexts:
  *   dpa_add_*, dpa_remove_*    - process, ioctl configuration.
@@ -317,8 +319,10 @@ static uint32_t fwd_cgr_link_speed(struct net_device *dev, uint32_t fallback)
 }
 
 /* The link came up or changed speed, or the port's MTU changed: size the
- * port's bounds for what it now is. A link that reports no speed keeps the
- * one the bounds were sized for. RTNL held. */
+ * port's bounds for what it now is, and time the transmit counters' readings
+ * by its speed (port_tx_prime_late()) whether or not the bounds can follow. A
+ * link that reports no speed keeps the one the bounds were sized for, and the
+ * readings the one they were timed by. RTNL held. */
 void dpa_fwd_cgr_follow_link(struct net_device *dev)
 {
 	struct dpa_iface_info *info;
@@ -328,6 +332,8 @@ void dpa_fwd_cgr_follow_link(struct net_device *dev)
 	for (info = dpa_interface_info; info; info = info->next) {
 		if (!fwd_cgr_owner(info) || info->eth_info.net_dev != dev)
 			continue;
+		if (speed && info->eth_info.tx_wire.link_speed)
+			info->eth_info.tx_wire.link_speed = speed;
 		if (!speed)
 			speed = info->eth_info.fwd_cgr_speed ?: info->eth_info.speed;
 		if (info->eth_info.fwd_cgr_speed &&
@@ -494,6 +500,11 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 	    create_tx_fq_set(iface_info, eth_info->sec_tx_fqinfo,
 			     &eth_info->sec_cgr, &sec_created))
 		goto err_ret;
+	/* Its queues all made, the statistics hook may read them, timed by
+	 * the link's speed (port_tx_prime_late()). */
+	spin_lock(&dpa_devlist_lock);
+	eth_info->tx_wire.link_speed = speed;
+	spin_unlock(&dpa_devlist_lock);
 	return 0;
 
 err_ret:
@@ -2340,12 +2351,16 @@ static u64 memac_counter(u32 __iomem *low, u32 __iomem *high)
 /* How many times a reading of the MAC's counts is taken again when something
  * left the port while it was under way. */
 #define MEMAC_TX_TRIES		4
-/* And how many times, MEMAC_TX_PRIME_GAP_US apart, for the reading every
- * later one is measured from (port_counters_prime()): a millisecond or two of
- * them, for a port only the kernel sends by yet, which leaves a quiet moment
- * far sooner. */
-#define MEMAC_TX_PRIME_TRIES	200
+/* Where transmit counts carry on from is read twice, a frame's time apart on
+ * the port's wire and this margin besides (port_tx_gap_us()). */
 #define MEMAC_TX_PRIME_GAP_US	5
+/* How long CDX holds the kernel's transmit at most while it reads that, as it
+ * takes a port (port_counters_prime()): a few readings apart even for a
+ * full-size frame at 10 Mbit/s. */
+#define MEMAC_TX_PRIME_BUDGET_US 5000
+/* And the longest gap the statistics hook waits for it (port_tx_prime_late()):
+ * a 9600-byte frame at 1G, or a full-size one at 100M. */
+#define MEMAC_TX_LATE_GAP_MAX_US 150
 
 /* The good frames the port's MAC sent for somebody: its unicast, multicast and
  * broadcast counts, which -- measured on the rig -- leave out the PAUSE frames
@@ -2400,6 +2415,127 @@ static bool port_mac_tx(const struct eth_iface_info *eth, int tries, bool *whole
 	return true;
 }
 
+/* Add what `count' of CDX's queues to the port hold to *frames and *bytes;
+ * queues never made have no FQID. */
+static bool port_cdx_queued(struct qman_fq *fqs, int count, u64 *frames, u64 *bytes)
+{
+	struct qm_mcr_queryfq_np np;
+	int ii;
+
+	for (ii = 0; ii < count; ii++) {
+		if (!fqs[ii].fqid)
+			continue;
+		if (qman_query_fq_np(&fqs[ii], &np))
+			return false;
+		*frames += np.frm_cnt;
+		*bytes += np.byte_cnt;
+	}
+	return true;
+}
+
+/* What is queued for the port to send and not yet taken by FMan: the frames
+ * and bytes in the driver's transmit queues, and in CDX's to it -- the
+ * classifier's forwarding queues and those the IPsec offline port sends SEC's
+ * output to the wire by, both of which the port's record counts -- as QMan
+ * counts them: frame descriptors' lengths, the units the driver's tx_bytes and
+ * the record count in. Each of the driver's queues once: its egress_fqs[]
+ * names one again when there are fewer queues than CPUs. False when a queue
+ * cannot be read, and on a port a hardware qdisc owns: its class queues count
+ * no bytes. Any context. */
+static bool port_tx_queued(const struct eth_iface_info *eth, u64 *frames, u64 *bytes)
+{
+	struct dpa_priv_s *priv = netdev_priv(eth->net_dev);
+	struct qm_mcr_queryfq_np np;
+	struct dpa_fq *fq;
+
+	*frames = *bytes = 0;
+#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
+	if (priv->ceetm_en)
+		return false;
+#endif
+	list_for_each_entry(fq, &priv->dpa_fq_list, list) {
+		if (fq->fq_type != FQ_TYPE_TX)
+			continue;
+		if (qman_query_fq_np(&fq->fq_base, &np))
+			return false;
+		*frames += np.frm_cnt;
+		*bytes += np.byte_cnt;
+	}
+	return port_cdx_queued((struct qman_fq *)eth->fwd_tx_fqinfo, DPAA_FWD_TX_QUEUES,
+			       frames, bytes) &&
+	       port_cdx_queued((struct qman_fq *)eth->sec_tx_fqinfo, DPAA_FWD_TX_QUEUES,
+			       frames, bytes);
+}
+
+/* How long the largest frame the port sends -- its MTU, two tags, preamble,
+ * gap and FCS -- takes on its wire at `speed' Mbit/s, the longest a frame FMan
+ * has taken from a queue can be on its way to the MAC's count; and a margin.
+ * The speed is the link's as its PHY reported it: the driver's mac_dev record
+ * of it is set at probe, to the MAC's fastest, and never again. */
+static unsigned int port_tx_gap_us(const struct net_device *dev, uint32_t speed)
+{
+	unsigned int bits = 8 * (READ_ONCE(dev->mtu) + VLAN_ETH_HLEN + VLAN_HLEN +
+				 FWD_CGR_WIRE_OVERHEAD);
+
+	return DIV_ROUND_UP(bits, max(speed, 1U)) + MEMAC_TX_PRIME_GAP_US;
+}
+
+/* Where the port's transmit stands, for the counts to carry on from: the
+ * driver's own counts, the MAC's, whole, and what is still queued for it, read
+ * twice `gap' microseconds apart (port_tx_gap_us()) and taken only when none
+ * moved. A frame the driver counted is then among what the MAC sent or still
+ * queued, not taken from a queue and on its way between, and no count is
+ * taken a moment off another. The driver's counts are compared as well as the
+ * queues because nothing the kernel offers holds its transmit entirely still:
+ * the driver sends without the queues' lock, which a freeze waits on, and a
+ * noqueue device's transmit and netpoll do not look at the freeze at all. A
+ * paused port, and likely one whose link is down, stands still with what it
+ * was sending in its FIFO, and those few frames are counted twice. False,
+ * without the wait, for a port with no MAC or with a hardware qdisc; false
+ * for one whose transmit moved. Any context. */
+static bool port_tx_still(const struct eth_iface_info *eth, unsigned int gap,
+			  u64 *packets, u64 *bytes, u64 *frames, u64 *octets,
+			  u64 *queued, u64 *queued_bytes)
+{
+	const struct net_device_ops *ops = eth->net_dev->netdev_ops;
+	struct rtnl_link_stats64 before = { 0 }, after = { 0 };
+	u64 frames_before, octets_before, queued_before, bytes_before;
+	bool whole_before, whole, read;
+
+	ops->ndo_get_stats64(eth->net_dev, &before);
+	if (!port_mac_tx(eth, 1, &whole_before, &frames_before, &octets_before) ||
+	    !port_tx_queued(eth, &queued_before, &bytes_before))
+		return false;
+	udelay(gap);
+	read = port_mac_tx(eth, 1, &whole, frames, octets) &&
+	       port_tx_queued(eth, queued, queued_bytes);
+	ops->ndo_get_stats64(eth->net_dev, &after);
+	*packets = after.tx_packets;
+	*bytes = after.tx_bytes;
+	return read && whole_before && whole &&
+	       *frames == frames_before && *octets == octets_before &&
+	       *queued == queued_before && *queued_bytes == bytes_before &&
+	       after.tx_packets == before.tx_packets && after.tx_bytes == before.tx_bytes;
+}
+
+/* Carry the port's transmit counts on from `packets' and `bytes', what the
+ * netdev reported as CDX took it, by what the MAC sends from `frames' and
+ * `octets' on. What was still queued then was counted where it was enqueued
+ * and is counted again by the MAC when it leaves, so where the MAC's advance
+ * is added to leaves it out; the counts reported stay where they were until
+ * the MAC has sent it, and never step back. */
+static void port_tx_base(struct eth_iface_info *eth, u64 packets, u64 bytes,
+			 u64 frames, u64 octets, u64 queued, u64 queued_bytes)
+{
+	eth->tx_wire.packets = packets;
+	eth->tx_wire.bytes = bytes;
+	eth->tx_wire.base_packets = packets - min(queued, packets);
+	eth->tx_wire.base_bytes = bytes - min(queued_bytes, bytes);
+	eth->tx_wire.mac_frames = eth->tx_wire.last_frames = frames;
+	eth->tx_wire.mac_octets = octets;
+	eth->tx_wire.ready = true;
+}
+
 /* A port's transmit counters as what its MAC sent (A338). An offloaded frame
  * the classifier enqueues was counted where it was enqueued, before QMan
  * decided; one an egress congestion group then refused never left, and a
@@ -2412,34 +2548,22 @@ static bool port_mac_tx(const struct eth_iface_info *eth, int tries, bool *whole
  * was reported before (A349). Octets come with the FCS, which a netdev's
  * bytes leave out.
  *
- * Where they carry on from is only ever taken from a whole reading. A port
- * whose MAC never stood still while CDX took it (port_counters_prime()) goes
- * on as one without a MAC -- the driver's counts and the enqueue's, `enqueued'
- * -- until a reading here is whole, and carries on from exactly what it
- * reported then. Nothing clears the MAC's counts at run time; were they reset,
- * the frames would read fewer, and the counts carry on from where they stood,
- * at the first whole reading after. */
+ * Where they carry on from is only ever taken from a reading that stood still
+ * (port_tx_still()). A port whose transmit never did while CDX took it
+ * (port_counters_prime()) goes on as one without a MAC -- the driver's counts
+ * and the enqueue's -- until one does (port_tx_prime_late()), and carries on
+ * from what it reported then. Nothing clears the MAC's counts at run time;
+ * were they reset, the frames would read fewer, and the counts carry on from
+ * where they stood, at the first whole reading after. */
 static bool port_tx_from_wire(struct eth_iface_info *eth,
-			      struct rtnl_link_stats64 *storage,
-			      const struct cdx_ft_stats *enqueued)
+			      struct rtnl_link_stats64 *storage)
 {
 	u64 frames, octets, sent;
 	bool whole;
 	s64 bytes;
 
-	if (!port_mac_tx(eth, MEMAC_TX_TRIES, &whole, &frames, &octets))
+	if (!eth->tx_wire.ready || !port_mac_tx(eth, MEMAC_TX_TRIES, &whole, &frames, &octets))
 		return false;
-	if (!eth->tx_wire.ready) {
-		if (!whole)
-			return false;
-		eth->tx_wire.base_packets = storage->tx_packets + enqueued->packets;
-		eth->tx_wire.base_bytes = storage->tx_bytes + enqueued->bytes;
-		eth->tx_wire.packets = eth->tx_wire.base_packets;
-		eth->tx_wire.bytes = eth->tx_wire.base_bytes;
-		eth->tx_wire.mac_frames = eth->tx_wire.last_frames = frames;
-		eth->tx_wire.mac_octets = octets;
-		eth->tx_wire.ready = true;
-	}
 	/* The frames only grow, whole reading or not, so fewer than the last
 	 * reading had is a reset. One not whole leaves the last reading as it
 	 * was, so that the next whole one sees the reset too, and counts on. */
@@ -2538,37 +2662,85 @@ static void port_rx_drops_advance(struct eth_iface_info *eth)
 }
 
 /* Where the port's counts stand as CDX takes it, before anything can be
- * offloaded through it: the driver's own transmit counts and the MAC's, which
- * transmit carries on from, and the BMI's and the MAC's receive drops, which
- * receive adds from.
- * Read here rather than at the first dev_get_stats(), which nothing promises
- * comes before the first offloaded frame. The port is not yet on the list.
- * Only a whole reading of the MAC is taken (port_mac_tx()); a port that never
- * gives one here is left to the first reading that does (port_tx_from_wire()).
- * Process context; waits a millisecond or two at the most. */
+ * offloaded through it: the driver's own transmit counts, what of them is
+ * still queued, and the MAC's, which transmit carries on from
+ * (port_tx_base()); and the BMI's and the MAC's receive drops, which receive
+ * adds from. Read here rather than at the first dev_get_stats(), which nothing
+ * promises comes before the first offloaded frame. The port is not yet on the
+ * list. The kernel's transmit is held meanwhile (netif_tx_lock_bh()), so that
+ * what it sends by the qdisc does not join the queues while they are read: a
+ * port that is sending drains and stands still, and a paused one stands still
+ * with its queue counted. One that does not within MEMAC_TX_PRIME_BUDGET_US,
+ * or whose link is too slow for a reading in it, is left to
+ * port_tx_prime_late(). Process context, RTNL held: the link's speed is read
+ * from its PHY. Holds the kernel's transmit that long, and one reading's
+ * queries besides, at the most. */
 static void port_counters_prime(struct eth_iface_info *eth)
 {
-	const struct net_device_ops *ops = eth->net_dev->netdev_ops;
-	struct rtnl_link_stats64 own = { 0 };
-	u64 frames, octets;
-	bool whole = false;
-	int tries;
+	struct net_device *dev = eth->net_dev;
+	u64 packets, bytes, frames, octets, queued, queued_bytes;
+	bool still = false, whole;
+	unsigned int gap;
+	ktime_t start;
 
-	for (tries = 0; ops->ndo_get_stats64 && tries < MEMAC_TX_PRIME_TRIES; tries++) {
-		if (tries)
-			udelay(MEMAC_TX_PRIME_GAP_US);
-		if (!port_mac_tx(eth, 1, &whole, &frames, &octets) || whole)
-			break;
+	/* Nor is it held for a port that can never be read standing still in
+	 * the time: one whose link is too slow, with no MAC, or whose queues a
+	 * hardware qdisc owns. A link that is down reports no speed, and the
+	 * MAC's fastest serves: one never up has sent nothing, though what one
+	 * that just went down had queued may still be leaving at its speed. */
+	gap = dpa_netdev_is_dpaa(dev) ?
+	      port_tx_gap_us(dev, fwd_cgr_link_speed(dev, eth->speed)) : 0;
+	if (dev->netdev_ops->ndo_get_stats64 && gap && gap <= MEMAC_TX_PRIME_BUDGET_US &&
+	    port_mac_tx(eth, 1, &whole, &frames, &octets) &&
+	    port_tx_queued(eth, &queued, &queued_bytes)) {
+		start = ktime_get();
+		netif_tx_lock_bh(dev);
+		while (!still && ktime_us_delta(ktime_get(), start) + gap <= MEMAC_TX_PRIME_BUDGET_US)
+			still = port_tx_still(eth, gap, &packets, &bytes, &frames, &octets,
+					      &queued, &queued_bytes);
+		netif_tx_unlock_bh(dev);
 	}
-	if (whole) {
-		ops->ndo_get_stats64(eth->net_dev, &own);
-		eth->tx_wire.base_packets = eth->tx_wire.packets = own.tx_packets;
-		eth->tx_wire.base_bytes = eth->tx_wire.bytes = own.tx_bytes;
-		eth->tx_wire.mac_frames = eth->tx_wire.last_frames = frames;
-		eth->tx_wire.mac_octets = octets;
-		eth->tx_wire.ready = true;
-	}
+	if (still)
+		port_tx_base(eth, packets, bytes, frames, octets, queued, queued_bytes);
 	port_rx_drops_advance(eth);
+}
+
+/* A port port_counters_prime() could not read standing still carries on from
+ * the first reading here that does, with the enqueue's record unchanged across
+ * it too: from what the port reported until then, the driver's counts and the
+ * record's summed. The kernel's transmit is not held here, so a reading it
+ * moved is passed over, as is one an offloaded frame moved, and none is tried
+ * on a link too slow for a gap of MEMAC_TX_LATE_GAP_MAX_US. The link's speed
+ * is tx_wire.link_speed, the one it ran at as CDX took the port or last
+ * reported since (dpa_fwd_cgr_follow_link()): its PHY cannot be read under the
+ * lock, and a change reaches that only as the kernel signals it, within a
+ * second. None is tried before the port's queues are all made, as CDX is
+ * still taking it. A port a hardware qdisc owns by then is never read
+ * standing still, and goes on reporting the driver's counts and the record's,
+ * which count frames its classes refused as sent. Called with dpa_devlist_lock
+ * held, from the statistics hook: registers, the driver's counts and QMan
+ * queries, and a wait of MEMAC_TX_LATE_GAP_MAX_US at most. */
+static void port_tx_prime_late(struct dpa_iface_info *iface_info)
+{
+	struct eth_iface_info *eth = &iface_info->eth_info;
+	struct cdx_ft_stats rx, tx_before, tx_after;
+	u64 packets, bytes, frames, octets, queued, queued_bytes;
+	unsigned int gap;
+
+	if (eth->tx_wire.ready || !eth->tx_wire.link_speed ||
+	    !eth->net_dev->netdev_ops->ndo_get_stats64 || !dpa_netdev_is_dpaa(eth->net_dev))
+		return;
+	gap = port_tx_gap_us(eth->net_dev, eth->tx_wire.link_speed);
+	if (gap > MEMAC_TX_LATE_GAP_MAX_US)
+		return;
+	cdx_ifstats_read(iface_info->stats, &rx, &tx_before);
+	if (!port_tx_still(eth, gap, &packets, &bytes, &frames, &octets, &queued, &queued_bytes))
+		return;
+	cdx_ifstats_read(iface_info->stats, &rx, &tx_after);
+	if (tx_after.packets != tx_before.packets || tx_after.bytes != tx_before.bytes)
+		return;
+	port_tx_base(eth, packets + tx_after.packets, bytes + tx_after.bytes,
+		     frames, octets, queued, queued_bytes);
 }
 
 /* Read every registered port's receive drops, the BMI's 32-bit counts often
@@ -2619,13 +2791,14 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 			 * whole frames. The driver's own rx_bytes excludes the
 			 * Ethernet header, so the record is restated to match
 			 * before the two are added. Transmit comes from the MAC
-			 * instead, once a whole reading of it has been taken,
-			 * and the enqueue's count is then left out: it includes
-			 * what never left. */
+			 * instead, once a reading of it that stood still has
+			 * been taken, and the enqueue's count is then left out:
+			 * it includes what never left. */
 			bool wire;
 
+			port_tx_prime_late(iface_info);
 			cdx_ifstats_read(iface_info->stats, &rx, &tx);
-			wire = port_tx_from_wire(&iface_info->eth_info, storage, &tx);
+			wire = port_tx_from_wire(&iface_info->eth_info, storage);
 			cdx_ifstats_fold(storage, rx.bytes, rx.packets,
 					 wire ? 0 : tx.bytes, wire ? 0 : tx.packets,
 					 CDX_IFSTATS_PORT_RX_OVERHEAD, 0);

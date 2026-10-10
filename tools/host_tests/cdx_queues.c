@@ -91,6 +91,7 @@ struct eth_iface_info {
     struct qman_cgr fwd_cgr; u32 fwd_cgr_speed;
     struct qman_fq sec_tx_fqinfo[DPAA_FWD_TX_QUEUES];
     struct qman_cgr sec_cgr; u32 fwd_cgr_mtu;
+    struct { u32 link_speed; } tx_wire;
     struct port_bman_pool_info pool_info[1];
 };
 static unsigned cpus = 4;
@@ -313,10 +314,15 @@ int main(void)
         unsigned released = cgr_releases;
         assert(create_fwd_tx_fqs(&iface)); assert(!live && !any_group());
         /* A group that was allocated went back exactly once: SEC's from
-         * its own setup on, the forwarding group from its setup on. */
+         * its own setup on, the forwarding group from its setup on. The
+         * statistics hook is never told to read queues that are not all
+         * there. */
         assert(cgr_releases == released + (n > 1) + (n > 3));
+        assert(!iface.eth_info.tx_wire.link_speed);
         calls = pauses = fail = 0;
         assert(!create_fwd_tx_fqs(&iface)); assert(live == 2 * DPAA_FWD_TX_QUEUES);
+        /* Once they are, it reads them timed by the link's speed. */
+        assert(iface.eth_info.tx_wire.link_speed == iface.eth_info.fwd_cgr_speed);
         /* Sized for the link as it runs, and for the MAC's fastest while
          * there is none: as many of the largest frames as take 2 ms --
          * microseconds times Mbit/s is bits -- up to the port's share of the
@@ -365,6 +371,7 @@ int main(void)
     netdev = (struct net_device){ .carrier = true, .speed = 1000, .mtu = 1500 };
     dpa_fwd_cgr_follow_link(&netdev);
     assert(groups[1].thres == IPSEC_EGRESS_FRAMES && iface.eth_info.fwd_cgr_speed == 1000);
+    assert(iface.eth_info.tx_wire.link_speed == 1000);
     netdev.mtu = 9000;
     dpa_fwd_cgr_follow_link(&netdev);
     assert(iface.eth_info.fwd_cgr_mtu == 9000 && !devlist_locked);
@@ -376,13 +383,14 @@ int main(void)
     netdev.mtu = 1500;
     dpa_fwd_cgr_follow_link(&netdev);
     assert(iface.eth_info.fwd_cgr_speed == 1000 && iface.eth_info.fwd_cgr_mtu == 1500);
+    assert(iface.eth_info.tx_wire.link_speed == 1000);
     assert(groups[0].thres == 1000u * 2000 / 8 / standard && groups[1].thres == IPSEC_EGRESS_FRAMES);
     /* Slower still, the bursts' floor is the 2 ms of standard frames there
      * are, as on a standard MTU. */
     netdev = (struct net_device){ .carrier = true, .speed = 100, .mtu = 9000 };
     dpa_fwd_cgr_follow_link(&netdev);
     assert(64 * 1024 / jumbo >= 6 && groups[0].thres == 64 * 1024 / standard);
-    assert(groups[1].thres == groups[0].thres);
+    assert(groups[1].thres == groups[0].thres && iface.eth_info.tx_wire.link_speed == 100);
     /* At 10G, 2 ms of jumbo frames is more than the bursts need, and stays
      * below the port's share of the Ethernet pool; SEC's share of its own
      * pool is less. */
