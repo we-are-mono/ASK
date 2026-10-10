@@ -1,0 +1,187 @@
+From fb8d112e6043e1a4243caeb156f592e2ab0e09be Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sat, 10 Oct 2026 21:38:37 +0200
+Subject: [PATCH] ipv6: keep CHECKSUM_COMPLETE valid across hop-limit rewrites
+
+ip6mr_forward2() decrements the hop limit in place but leaves a
+CHECKSUM_COMPLETE value as it was. ip6_forward() avoids this by calling
+skb_forward_csum() first. IPv4 avoids it because ip_decrease_ttl()
+updates the header checksum, so the change cancels out of the full sum.
+An IPv6 hop limit has no checksum to balance it.
+
+The stale value reaches local delivery when the host has joined the group
+on an outgoing interface: ip6_finish_output2() clones the forwarded copy,
+and dev_loopback_xmit() keeps the clone's checksum state. On ingress the
+CHECKSUM_NONE frame was given a software COMPLETE by conntrack's
+nf_ip6_checksum(). On re-receive udp6_csum_init() treats a failed software
+COMPLETE as a bad checksum, so every datagram above CHECKSUM_BREAK was
+dropped as Udp6InCsumErrors. Shorter ones were recomputed and accepted.
+
+ipv6_set_hop_limit() rewrites the hop limit and replaces its contribution
+to a COMPLETE value. ip6mr_forward2() uses it. So do the other in-place
+decrements that keep COMPLETE without a fixup: the software flowtable,
+nft fwd, nf_dup, the ip6tables HL target, the SRv6 and RPL looped-back
+paths and OVS's dec_ttl. OVS's set_ipv6_ttl() already did this.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ include/net/ipv6.h               | 17 +++++++++++++++++
+ net/ipv6/exthdrs.c               |  6 ++++--
+ net/ipv6/ip6mr.c                 |  2 +-
+ net/ipv6/netfilter/nf_dup_ipv6.c |  2 +-
+ net/netfilter/nf_flow_table_ip.c |  2 +-
+ net/netfilter/nft_fwd_netdev.c   |  3 ++-
+ net/netfilter/xt_HL.c            |  3 ++-
+ net/openvswitch/actions.c        |  3 ++-
+ 8 files changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index e843eb7efbcc..f37978c5c669 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -910,6 +910,23 @@ static inline int ip6_sk_dst_hoplimit(struct ipv6_pinfo *np, struct flowi6 *fl6,
+ 	return hlimit;
+ }
+ 
++/* Rewrite the hop limit of a packet in place. Unlike the IPv4 TTL, it is
++ * covered by no header checksum to absorb the change, so a CHECKSUM_COMPLETE
++ * value must follow it: a forwarded multicast copy looped back to a listener
++ * on the outgoing interface is received again with that value. Callers keep
++ * the IPv6 header an even distance from where the value starts (skb->data,
++ * or a pulled or pushed link-layer header before it), so the hop limit is the
++ * low byte of its 16-bit word.
++ */
++static inline void ipv6_set_hop_limit(struct sk_buff *skb, struct ipv6hdr *hdr,
++				      u8 hop_limit)
++{
++	if (skb->ip_summed == CHECKSUM_COMPLETE)
++		csum_replace(&skb->csum, (__force __wsum)htons(hdr->hop_limit),
++			     (__force __wsum)htons(hop_limit));
++	hdr->hop_limit = hop_limit;
++}
++
+ /* copy IPv6 saddr & daddr to flow_keys, possibly using 64bit load/store
+  * Equivalent to :	flow->v6addrs.src = iph->saddr;
+  *			flow->v6addrs.dst = iph->daddr;
+diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
+index e91afe5ec0b5..abfed1f93ef0 100644
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -477,7 +477,8 @@ static int ipv6_srh_rcv(struct sk_buff *skb)
+ 			kfree_skb(skb);
+ 			return -1;
+ 		}
+-		ipv6_hdr(skb)->hop_limit--;
++		ipv6_set_hop_limit(skb, ipv6_hdr(skb),
++				   ipv6_hdr(skb)->hop_limit - 1);
+ 
+ 		skb_pull(skb, sizeof(struct ipv6hdr));
+ 		goto looped_back;
+@@ -641,7 +642,8 @@ static int ipv6_rpl_srh_rcv(struct sk_buff *skb)
+ 			kfree_skb(skb);
+ 			return -1;
+ 		}
+-		ipv6_hdr(skb)->hop_limit--;
++		ipv6_set_hop_limit(skb, ipv6_hdr(skb),
++				   ipv6_hdr(skb)->hop_limit - 1);
+ 
+ 		skb_pull(skb, sizeof(struct ipv6hdr));
+ 		goto looped_back;
+diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
+index 68bc518500f9..41c2bed9b00b 100644
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -2090,7 +2090,7 @@ static int ip6mr_forward2(struct net *net, struct mr_table *mrt,
+ 		goto out_free;
+ 
+ 	ipv6h = ipv6_hdr(skb);
+-	ipv6h->hop_limit--;
++	ipv6_set_hop_limit(skb, ipv6h, ipv6h->hop_limit - 1);
+ 
+ 	IP6CB(skb)->flags |= IP6SKB_FORWARDED;
+ 
+diff --git a/net/ipv6/netfilter/nf_dup_ipv6.c b/net/ipv6/netfilter/nf_dup_ipv6.c
+index a8bb04bd94cf..0a84d3cc99c7 100644
+--- a/net/ipv6/netfilter/nf_dup_ipv6.c
++++ b/net/ipv6/netfilter/nf_dup_ipv6.c
+@@ -61,7 +61,7 @@ void nf_dup_ipv6(struct net *net, struct sk_buff *skb, unsigned int hooknum,
+ 	if (hooknum == NF_INET_PRE_ROUTING ||
+ 	    hooknum == NF_INET_LOCAL_IN) {
+ 		struct ipv6hdr *iph = ipv6_hdr(skb);
+-		--iph->hop_limit;
++		ipv6_set_hop_limit(skb, iph, iph->hop_limit - 1);
+ 	}
+ 	if (nf_dup_ipv6_route(net, skb, gw, oif)) {
+ 		__this_cpu_write(nf_skb_duplicated, true);
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index 89d941523bac..cde4a3f73d7e 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -753,7 +753,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+ 	ip6h = ipv6_hdr(skb);
+ 	nf_flow_nat_ipv6(flow, skb, dir, ip6h);
+ 
+-	ip6h->hop_limit--;
++	ipv6_set_hop_limit(skb, ip6h, ip6h->hop_limit - 1);
+ 	skb_clear_tstamp(skb);
+ 
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+diff --git a/net/netfilter/nft_fwd_netdev.c b/net/netfilter/nft_fwd_netdev.c
+index 4bce36c3a6a0..9f7b0a35df99 100644
+--- a/net/netfilter/nft_fwd_netdev.c
++++ b/net/netfilter/nft_fwd_netdev.c
+@@ -16,6 +16,7 @@
+ #include <net/netfilter/nf_dup_netdev.h>
+ #include <net/neighbour.h>
+ #include <net/ip.h>
++#include <net/ipv6.h>
+ 
+ struct nft_fwd_netdev {
+ 	u8	sreg_dev;
+@@ -142,7 +143,7 @@ static void nft_fwd_neigh_eval(const struct nft_expr *expr,
+ 			goto out;
+ 		}
+ 
+-		ip6h->hop_limit--;
++		ipv6_set_hop_limit(skb, ip6h, ip6h->hop_limit - 1);
+ 		neigh_table = NEIGH_ND_TABLE;
+ 		break;
+ 		}
+diff --git a/net/netfilter/xt_HL.c b/net/netfilter/xt_HL.c
+index 7873b834c300..9a31adccbd4d 100644
+--- a/net/netfilter/xt_HL.c
++++ b/net/netfilter/xt_HL.c
+@@ -12,6 +12,7 @@
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+ #include <net/checksum.h>
++#include <net/ipv6.h>
+ 
+ #include <linux/netfilter/x_tables.h>
+ #include <linux/netfilter_ipv4/ipt_TTL.h>
+@@ -93,7 +94,7 @@ hl_tg6(struct sk_buff *skb, const struct xt_action_param *par)
+ 		break;
+ 	}
+ 
+-	ip6h->hop_limit = new_hl;
++	ipv6_set_hop_limit(skb, ip6h, new_hl);
+ 
+ 	return XT_CONTINUE;
+ }
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index de126616d1cb..2360a89487fb 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -1229,7 +1229,8 @@ static int execute_dec_ttl(struct sk_buff *skb, struct sw_flow_key *key)
+ 		if (nh->hop_limit <= 1)
+ 			return -EHOSTUNREACH;
+ 
+-		key->ip.ttl = --nh->hop_limit;
++		ipv6_set_hop_limit(skb, nh, nh->hop_limit - 1);
++		key->ip.ttl = nh->hop_limit;
+ 	} else if (skb->protocol == htons(ETH_P_IP)) {
+ 		struct iphdr *nh;
+ 		u8 old_ttl;
+-- 
+2.47.3
+

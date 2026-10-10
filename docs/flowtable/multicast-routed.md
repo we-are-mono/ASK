@@ -1200,6 +1200,21 @@ legacy one -- both ports are carried to both oifs, and the classifier counts
 both streams whole. tc runs on the DUT's console: the agent does not list it,
 because `tc exec bpf import` starts any program.
 
+`tools/tests/flowtable_service_multicast_host.py` proves the host clause for
+both learners and both families. Each case starts with the group in hardware.
+A socket on the DUT then joins it, on the route's parent VIF or on its oif for
+the routed learner and on the bridge device for the bridged one. The group
+reads `refused-host`, and a routed one loses `offload` in `ip mroute`. One
+numbered stream then reaches both the socket and the LAN VM through the CPU,
+every sequence exactly once. When the socket closes, the group returns to
+hardware with no other change, and the classifier counts the whole next
+window. The IPv6 oif case found a kernel bug. `ip6mr` left a stale
+`CHECKSUM_COMPLETE` on the copy it loops back. So every datagram longer than
+76 bytes was dropped as a UDP checksum error. Patch 170 keeps the value valid
+across the hop-limit rewrite. The value is conntrack's, computed when it
+checksums the frame, so that case also requires conntrack to hold the stream
+with checksumming on.
+
 ## Proved on hardware
 
 Flowtable boot, KASAN image, 2026-09-21. The DUT routes between its WAN and
@@ -1227,11 +1242,10 @@ same path with every counter read by hand.
 
 Two clauses of the contract are not reachable from this rig and are covered by
 the host harness alone. A **threshold above 1** needs a daemon that writes one,
-and every daemon in the contract writes 1. **`refused-host`** needs the box to
-have joined the group on its own ingress interface or on an oif, which nothing
-here does.
-`refused-contested` is likewise host-only: it needs two parents on two VLANs of
-one port for one `(S,G)`, which no daemon in the contract writes on its own.
+and every daemon in the contract writes 1. **`refused-contested`** needs two
+parents on two VLANs of one port for one `(S,G)`, which no daemon in the
+contract writes on its own. `refused-host` is proved on the rig by
+`tools/tests/flowtable_service_multicast_host.py`, under Tests.
 
 One number is worth carrying forward because it is the design working rather
 than a shortfall. `ip -s mroute` lags the hardware by up to the fold's

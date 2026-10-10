@@ -1152,6 +1152,11 @@ double replication — transfers directly and is the right assertion here too.
 
 Both halves run in a **flowtable boot**, which the existing five cannot.
 
+The host-MDB refusal is proved on the rig by
+`tools/tests/flowtable_service_multicast_host.py`. While the group is in
+hardware, a socket on the DUT joins it on the bridge device. The test is
+described with the routed learner's, in `multicast-routed.md` under Tests.
+
 ## The consumer contract
 
 There is none, and that is the result.
