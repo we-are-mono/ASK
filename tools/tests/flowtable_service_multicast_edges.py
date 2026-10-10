@@ -26,7 +26,7 @@ from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, host
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN, TopologyStack,
                        dut_vlan_subif, lan_vlan_subif)
 from _mroute_capture import payload
-from _flowtable_rig import (HEALTH_BASELINE, command, console_command)
+from _flowtable_rig import (HEALTH_BASELINE, command, console_command, console_json, console_python)
 from _mcast_e2e import (wan_source_address)
 from _mroute_capacity import (_daemon, _python)
 
@@ -362,23 +362,70 @@ async def test_learner_handoff(multicast_rig, mcast_bridge, family):
         assert final[counter] == r.initial[counter], (counter, summary(final))
 
 
-async def reload_adapter(r, label, standing, during):
+async def reload_adapter(r, label, standing, during, *, failure_stage=None):
     """rmmod and modprobe the adapter with groups standing; CDX stays.
 
     `during` runs while the adapter is out, and the whole path must keep
-    forwarding in software: what the adapter owned was only the acceleration."""
+    forwarding in software: what the adapter owned was only the acceleration.
+    Stage 6 fails after queuing MFC replay; stage 5 after replaying the MDB.
+    AP registration is also replayed by the netdevice notifier. Workers may
+    run before the fault, but the test does not depend on that scheduling."""
     console = await dut_console(label)
     unloaded = False
+    record = {"failure_stage": failure_stage}
+
+    async def resources():
+        result = await console_python(console, """
+import json
+from pathlib import Path
+vwd = Path('/sys/class/vwd/vwd0')
+netdevs = {p.name for p in Path('/sys/class/net').iterdir()}
+print(json.dumps({
+    'adapter': Path('/sys/module/ask_flowtable').exists(),
+    'proc': Path('/proc/cdx_flowtable').exists(),
+    'holder': Path('/sys/module/cdx/holders/ask_flowtable').exists(),
+    'provider_refcount': int(Path('/sys/module/cdx/refcnt').read_text()),
+    'vaps': sorted(p.name for p in vwd.iterdir() if p.name in netdevs) if vwd.exists() else [],
+}))
+""")
+        return console_json(result["stdout"])
+
+    async def absent(name):
+        current = record[name] = await resources()
+        assert not any(current[key] for key in ("adapter", "proc", "holder", "vaps")), current
+        if "unloaded" in record:
+            assert current["provider_refcount"] == record["unloaded"]["provider_refcount"], record
+        return current
+
     try:
+        before = record["before"] = await resources()
+        state = await r.proc()
+        assert state["wifi_vaps"] == len(before["vaps"]), (state, before)
+        if failure_stage is not None:
+            assert before["vaps"], "failed replay requires a standing, registered AP"
         await console_command(console, "rmmod", "ask_flowtable", timeout=30)
         unloaded = True
-        for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable"):
-            assert (await console_command(console, "test", "-e", path, check=False))["rc"] == 1, path
+        await absent("unloaded")
+        if failure_stage is not None:
+            failed = record["failed_load"] = await console_command(
+                console, "modprobe", "ask_flowtable", f"init_fail_stage={failure_stage}",
+                timeout=30, check=False)
+            assert failed["rc"] != 0 and "Cannot allocate memory" in failed["stdout"], failed
+            await absent("after_failure")
         await during()
+        # Exercise the forwarding hooks after unwind, then check that no
+        # delayed worker recreated a registration or retained CDX ownership.
+        await absent("after_software")
         await console_command(console, "modprobe", "ask_flowtable", timeout=30)
         unloaded = False
-        loaded = await r.proc()
-        assert loaded["fatal"] == loaded["quarantine"] == 0, summary(loaded)
+        loaded = await r.settle(lambda s: s["wifi_vaps"] == len(before["vaps"]),
+                                "standing AP registrations replayed after the reload")
+        recovered = record["recovered"] = await resources()
+        assert recovered == before, record
+        record["loaded"] = loaded
+        for counter in ("fatal", "quarantine", "errors", "wifi_refused",
+                        "mcast_install_errors", "mroute_install_errors"):
+            assert loaded[counter] == 0, (counter, loaded)
         # The reload restarted the error count; health is measured from it.
         HEALTH_BASELINE["errors"] = loaded["errors"]
     finally:
@@ -387,13 +434,19 @@ async def reload_adapter(r, label, standing, during):
                 await console_command(console, "modprobe", "ask_flowtable", timeout=30, check=False)
         finally:
             console.close()
-    return await standing()
+            r.record(label + "-lifecycle", record)
+    relearned = await standing()
+    for counter in ("errors", "mcast_install_errors", "mroute_install_errors", "wifi_refused"):
+        assert relearned[counter] == 0, (counter, relearned)
+    return relearned
 
 
+@pytest.mark.parametrize("failure_stage", [None, 6, 5], ids=["reload", "fail6", "fail5"])
 @pytest.mark.parametrize("family", [4, 6])
-async def test_reload_routed(multicast_rig, family):
-    """The MFC outlives the adapter; registering again replays it."""
+async def test_reload_routed(multicast_rig, family, failure_stage):
+    """A standing MFC and AP survive normal unload and failed replay initialization."""
     r = multicast_rig
+    label = f"reload-routed-v{family}" + (f"-fail{failure_stage}" if failure_stage is not None else "")
     group, source = RELOAD_GROUP[family], wan_source_address(family)
     observers = [(r.lan, {LAN_NIC: r.dut_lan_mac})]
 
@@ -405,13 +458,13 @@ async def test_reload_routed(multicast_rig, family):
         await learn(r, [stream(family, group, hops=63)], lambda s: routed(s, group, source),
                     "installed before the reload")
         before = await r.window([stream(family, group, hops=63)], observers, ingress=TARGET_WAN_IF,
-                                label=f"reload-routed-v{family}-before")
+                                label=label + "-before")
         assert delivered(before, streamed(before, group), LAN_NIC)
         in_hardware(before)
 
         async def unloaded():
             out = await r.window([stream(family, group, hops=63)], observers, ingress=TARGET_WAN_IF,
-                                 label=f"reload-routed-v{family}-unloaded", adapter=False)
+                                 label=label + "-unloaded", adapter=False)
             assert delivered(out, streamed(out, group), LAN_NIC)
             in_software(out)
             line, _, _ = await kernel_mroute(r, family, source, group, offloaded=False, fold=False)
@@ -422,11 +475,12 @@ async def test_reload_routed(multicast_rig, family):
             return await learn(r, [stream(family, group, hops=63)],
                                lambda s: routed(s, group, source), "relearned after the reload")
 
-        relearned = await reload_adapter(r, f"mcast-reload-routed-v{family}", standing, unloaded)
+        relearned = await reload_adapter(r, "mcast-" + label, standing, unloaded,
+                                        failure_stage=failure_stage)
         assert len([g for g in relearned["mroute"] if same(g["group"], group)]) == 1, summary(relearned)
         assert relearned["mroute_installed"] == r.initial["mroute_installed"] + 1, summary(relearned)
         after = await r.window([stream(family, group, hops=63)], observers, ingress=TARGET_WAN_IF,
-                               label=f"reload-routed-v{family}-after")
+                               label=label + "-after")
         assert delivered(after, streamed(after, group), LAN_NIC)
         assert moved(after, row) == COUNT, summary(after["after"])
         in_hardware(after)
@@ -528,15 +582,17 @@ async def test_counter_fold(multicast_rig, family):
             await policy("del", check=False)
 
 
+@pytest.mark.parametrize("failure_stage", [None, 6, 5], ids=["reload", "fail6", "fail5"])
 @pytest.mark.parametrize("family", [4, 6])
-async def test_reload_bridged(multicast_rig, mcast_bridge, family):
+async def test_reload_bridged(multicast_rig, mcast_bridge, family, failure_stage):
     """The MDB outlives the adapter; its standing memberships must come back.
 
     Registering on the switchdev chain replays nothing, and a membership that
     stands is never announced again -- a refreshing report finds its port
     group and only restarts a timer. So whatever brings the groups back has
-    to be the adapter's own doing at load."""
+    to be the adapter's own doing at load, even after a failed replay."""
     r = multicast_rig
+    label = f"reload-bridged-v{family}" + (f"-fail{failure_stage}" if failure_stage is not None else "")
     bridge = mcast_bridge
     group, source = RELOAD_GROUP[family], wan_source_address(family)
     observers = [(r.lan, {LAN_NIC: None})]
@@ -554,13 +610,13 @@ async def test_reload_bridged(multicast_rig, mcast_bridge, family):
     await mdb(r, bridge, group, add=True)
     await learn(r, [stream(family, group, hops=64)], carried, "installed before the reload")
     before = await r.window([stream(family, group, hops=64)], observers, ingress=TARGET_WAN_IF,
-                            label=f"reload-bridged-v{family}-before")
+                            label=label + "-before")
     assert delivered(before, streamed(before, group), LAN_NIC)
     in_hardware(before)
 
     async def unloaded():
         out = await r.window([stream(family, group, hops=64)], observers, ingress=TARGET_WAN_IF,
-                             label=f"reload-bridged-v{family}-unloaded", adapter=False)
+                             label=label + "-unloaded", adapter=False)
         assert delivered(out, streamed(out, group), LAN_NIC)
         in_software(out)
 
@@ -570,10 +626,11 @@ async def test_reload_bridged(multicast_rig, mcast_bridge, family):
         return await learn(r, [stream(family, group, hops=64)], carried,
                            "the membership standing across the reload")
 
-    relearned = await reload_adapter(r, f"mcast-reload-bridged-v{family}", standing, unloaded)
+    relearned = await reload_adapter(r, "mcast-" + label, standing, unloaded,
+                                    failure_stage=failure_stage)
     assert len([g for g in relearned["mcast"] if same(g["group"], group)]) == 1, summary(relearned)
     after = await r.window([stream(family, group, hops=64)], observers, ingress=TARGET_WAN_IF,
-                           label=f"reload-bridged-v{family}-after")
+                           label=label + "-after")
     assert delivered(after, streamed(after, group), LAN_NIC)
     assert moved(after, row) == COUNT, summary(after["after"])
     in_hardware(after)
