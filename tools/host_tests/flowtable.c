@@ -695,6 +695,9 @@ struct flow_cls_offload {
     struct nf_flow_offload_handle *nf_handle;
     u32 nf_dst_cookie, nf_dst_reverse_cookie;
     u64 nf_xfrm_genid;
+    /* The kernel fills it and the rule's meta key from one helper, so a case
+     * that moves one moves the other. */
+    int nf_ingress_ifindex;
     unsigned command;
     u16 nf_mtu;
     bool nf_counter;
@@ -1840,6 +1843,7 @@ static void fixture(void)
     /* The path as large as the port the flow arrives on, the ordinary
      * Ethernet case: a case about a smaller one narrows it. */
     cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1500,
+        .nf_ingress_ifindex = mk.ingress_ifindex,
         .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL,
         .nf_session = &egress_session, .nf_session_reverse = &ingress_session,
         .nf_tunnel = &egress_tunnel, .nf_tunnel_reverse = &ingress_tunnel };
@@ -2668,7 +2672,7 @@ static void test_vlan(void)
     out_qinq.real_dev = &out_tag;
     out_tag.real_dev = &out;
     binding.dev = &out;
-    mk.ingress_ifindex = out.ifindex;
+    cls.nf_ingress_ifindex = mk.ingress_ifindex = out.ifindex;
     /* The frame leaves by `in` here, so that is whose address the Ethernet
      * source names. */
     source_mac(&in);
@@ -2685,7 +2689,7 @@ static void test_vlan(void)
     vk[1].vlan_id = 301;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     binding.dev = &in;
-    mk.ingress_ifindex = in.ifindex;
+    cls.nf_ingress_ifindex = mk.ingress_ifindex = in.ifindex;
 
     /* Tagged on both sides: three distinct devices are pinned, which no
      * single-sided case reaches. */
@@ -6145,8 +6149,8 @@ static void test_transient_admission(void)
             /* Nor is the visit a refusal: a rejects count that moved on
              * visits alone would pass an oracle for a refusal that never
              * happened. Nor does it wait for the transaction: every offer
-             * visits each bound port, and most of a mass readmission's
-             * visits queueing for it behind the installs (A139) put
+             * visits each bound port, and at least half of a mass
+             * readmission's visits queueing for it behind the installs (A139) put
              * hundreds of workers to spinning and sleeping for nothing. */
             rtnl_busy = transaction_busy = true;
             u64 rejects = ft_rejects;
@@ -6154,6 +6158,20 @@ static void test_transient_admission(void)
             assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &other_binding) == -EOPNOTSUPP);
             assert(ft_fail_stage == 4 && ft_busy == busy && !handle.invalid);
             assert(ft_rejects == rejects && rtnl_trylocks == visits);
+            /* Counter reads and deletions visit every bound port as offers
+             * do, carrying no rule, and the other port owns nothing of this
+             * direction. It answers as it always has, without trying for
+             * the transaction, and without marking the shared handle or
+             * recording a deletion that names nothing (A351). */
+            u64 deferrals = ft_destroy_deferrals;
+            unsigned tries = transaction_tries;
+            cls.command = FLOW_CLS_STATS;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &other_binding) == -ENOENT);
+            cls.command = FLOW_CLS_DESTROY;
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &other_binding) == 0);
+            assert(transaction_tries == tries && ft_destroy_deferrals == deferrals);
+            assert(!handle.invalid && !ft_deferred_destroys.first && ft_count == 1);
+            cls.command = FLOW_CLS_REPLACE;
             rtnl_busy = transaction_busy = false;
             /* Nor can the installed direction offered again, which is what
              * Linux does alongside its other one: it never asks for RTNL. */
@@ -6571,7 +6589,7 @@ static void test_crossed_devices(void)
     struct cdx_ft_binding qinq_binding = { .dev = &out };
     vlan_fixture(); cls.command = FLOW_CLS_REPLACE;
     reverse_route.dst.dev = &out_qinq;
-    mk.ingress_ifindex = out.ifindex;
+    cls.nf_ingress_ifindex = mk.ingress_ifindex = out.ifindex;
     source_mac(&in);
     rule.action.entries[4].dev = &in;
     route.dst.dev = &in;

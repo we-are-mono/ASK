@@ -51,7 +51,7 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_destroy_defer", "ft_retire_deferred", "ft_deferred_destroys_drop", "ft_retire_batch",
              "ft_handle_retired", "ft_retire_workfn", "ft_settle_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
              "ft_vlan_lower", "ft_bridge_vlan", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_port_arriving", "ft_mtu_less", "ft_port_mtu", "ft_rule_stripped", "ft_arriving", "ft_mtu_carried", "ft_ipv6_dev_mtu", "ft_egress_mtu_current", "ft_mtu_refused", "ft_bridge_egress_filtered", "ft_tunnel_inbound_allowed", "ft_parse", "ft_same_key", "ft_key_hash",
-             "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_targets", "ft_software_reoffers", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
+             "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_owned", "ft_software_reoffers", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
              "ft_invalid_complete", "ft_drained", "ft_can_rearm", "ft_rearm", "ft_rearm_workfn",
              "ft_bound_to", "ft_release",
              "ft_bind_admissible", "ft_passive_callback", "ft_bind_passive",

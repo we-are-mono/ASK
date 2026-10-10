@@ -250,6 +250,12 @@ distinguish ordinary traffic from a tunnel's outer endpoints and protocol
 translated tuple. The [NAT guide](nat.md#mapping-and-dependencies)
 defines mapping validation and dependency addresses.
 
+Netfilter visits every bound device with each offer, counter read and deletion,
+and only the direction's ingress can own anything of it. Patch 140 names that
+ingress for every command (`nf_ingress_ifindex`, context version 9), so the
+other devices answer as finding nothing -- offers declined, no counters, nothing
+deleted -- before RTNL or the backend transaction.
+
 A direction reports success only after insertion. An offer for a direction
 already installed in the same generation is answered from its entry (below);
 one that arrives while a global latch is pending goes through admission, which

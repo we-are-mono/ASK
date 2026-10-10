@@ -67,8 +67,8 @@
 #include "cdx_wifi_backend.h"
 #include "cdx_police.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 12
-#error "CDX flowtable requires kernel flowtable context version 12 or later"
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 13
+#error "CDX flowtable requires kernel flowtable context version 13 or later"
 #endif
 
 /* The bridge FDB pins a bridged flow's egress port, and this is the only

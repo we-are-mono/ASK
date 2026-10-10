@@ -1,30 +1,30 @@
-From 552ba9ab2072461e55e44eebdd1fa368883e70b2 Mon Sep 17 00:00:00 2001
+From da8049fe85726741b02d93527b04e7377efc9a1c Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
  context
 
 ---
- drivers/net/bonding/bond_main.c       |  80 +++++++++++------
+ drivers/net/bonding/bond_main.c       |  80 ++++++++++------
  include/linux/netdevice.h             |   2 +
  include/net/flow.h                    |   2 +
- include/net/flow_offload.h            |  37 ++++++++
+ include/net/flow_offload.h            |  44 +++++++++
  include/net/netevent.h                |  32 +++++++
- include/net/netfilter/nf_flow_table.h |  60 +++++++++++++
+ include/net/netfilter/nf_flow_table.h |  60 ++++++++++++
  include/net/netns/xfrm.h              |   2 +
- include/net/xfrm.h                    | 106 +++++++++++++++++++---
- net/ipv4/fib_trie.c                   |  20 +++++
+ include/net/xfrm.h                    | 106 +++++++++++++++++++--
+ net/ipv4/fib_trie.c                   |  20 ++++
  net/ipv4/route.c                      |   3 +-
  net/ipv6/ip6_fib.c                    |  23 +++++
  net/netfilter/nf_flow_table_core.c    |  89 +++++++++++++++++-
- net/netfilter/nf_flow_table_ip.c      |  25 +++++-
- net/netfilter/nf_flow_table_offload.c | 113 ++++++++++++++++++++++-
- net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++++----
+ net/netfilter/nf_flow_table_ip.c      |  25 ++++-
+ net/netfilter/nf_flow_table_offload.c | 129 ++++++++++++++++++++++++--
+ net/netfilter/nft_flow_offload.c      | 102 ++++++++++++++++----
  net/xfrm/xfrm_device.c                |  29 ++++--
- net/xfrm/xfrm_policy.c                | 124 +++++++++++++++++++++++++-
- net/xfrm/xfrm_state.c                 |  25 ++++--
+ net/xfrm/xfrm_policy.c                | 124 ++++++++++++++++++++++++-
+ net/xfrm/xfrm_state.c                 |  25 ++++-
  net/xfrm/xfrm_user.c                  |   6 ++
- 19 files changed, 803 insertions(+), 77 deletions(-)
+ 19 files changed, 821 insertions(+), 82 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index 2919329a8c20..a6780e8dca2d 100644
@@ -292,10 +292,10 @@ index 335bbc52171c..5e373dbaa397 100644
  	kuid_t  flowic_uid;
  	__u32		flowic_multipath_hash;
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f4b762..49f33defcb9a 100644
+index 292cd8f4b762..3851c360e54d 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -688,7 +688,44 @@ struct flow_cls_common_offload {
+@@ -688,7 +688,51 @@ struct flow_cls_common_offload {
  	struct netlink_ext_ack *extack;
  };
  
@@ -323,8 +323,14 @@ index 292cd8f4b762..49f33defcb9a 100644
 + * if any: nf_session belongs to nf_dst and nf_session_reverse to
 + * nf_dst_reverse, so a direction's egress and ingress sessions are named the
 + * same way its two destinations are. Both are always non-NULL; a path with no
-+ * session reports a zero lower_ifindex. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 8
++ * session reports a zero lower_ifindex.
++ * Version 9 names the direction's ingress for every command, as
++ * nf_ingress_ifindex: the device a REPLACE rule's meta key matches, and zero
++ * from other producers. Each direction is offered to every device bound to
++ * the table, and a STATS or DESTROY carries no rule, so this is how a driver
++ * tells the device that owns the direction from the others without looking
++ * anything up. */
++#define FLOW_CLS_HAS_NF_CONTEXT 9
  struct flow_cls_offload {
 +	const struct nf_conn *nf_ct;
 +	struct dst_entry *nf_dst;
@@ -335,6 +341,7 @@ index 292cd8f4b762..49f33defcb9a 100644
 +	u64 nf_xfrm_genid;
 +	u32 nf_dst_cookie;
 +	u32 nf_dst_reverse_cookie;
++	int nf_ingress_ifindex;
 +	u16 nf_mtu;
 +	bool nf_counter;
  	struct flow_cls_common_offload common;
@@ -1066,7 +1073,7 @@ index 98edcaa37b38..ff35d601699a 100644
  	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
  	if (ret < 0)
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f51d7d7..7ffa064bbdb1 100644
+index 4f346f51d7d7..6bc5aa1d88f8 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -12,6 +12,7 @@
@@ -1077,7 +1084,36 @@ index 4f346f51d7d7..7ffa064bbdb1 100644
  
  #define NF_FLOW_RULE_ACTION_MAX	24
  
-@@ -250,6 +251,10 @@ static int flow_offload_eth_src(struct net *net,
+@@ -89,6 +90,15 @@ static void nf_flow_rule_vlan_match(struct flow_dissector_key_vlan *key,
+ 	mask->vlan_tpid = 0xffff;
+ }
+ 
++/* The device a direction arrives on: what its rule's meta key matches, and
++ * what every command's context names as its ingress. */
++static int nf_flow_offload_ingress(const struct flow_offload_tuple *tuple)
++{
++	if (tuple->xmit_type == FLOW_OFFLOAD_XMIT_TC)
++		return tuple->tc.iifidx;
++	return tuple->iifidx;
++}
++
+ static int nf_flow_rule_match(struct nf_flow_match *match,
+ 			      const struct flow_offload_tuple *tuple,
+ 			      struct dst_entry *other_dst)
+@@ -111,11 +121,7 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
+ 		nf_flow_rule_lwt_match(match, tun_info);
+ 	}
+ 
+-	if (tuple->xmit_type == FLOW_OFFLOAD_XMIT_TC)
+-		key->meta.ingress_ifindex = tuple->tc.iifidx;
+-	else
+-		key->meta.ingress_ifindex = tuple->iifidx;
+-
++	key->meta.ingress_ifindex = nf_flow_offload_ingress(tuple);
+ 	mask->meta.ingress_ifindex = 0xffffffff;
+ 
+ 	if (tuple->encap_num > 0 && !(tuple->in_vlan_ingress & BIT(0)) &&
+@@ -250,6 +256,10 @@ static int flow_offload_eth_src(struct net *net,
  		addr = this_tuple->out.h_source;
  		break;
  	case FLOW_OFFLOAD_XMIT_NEIGH:
@@ -1088,7 +1124,7 @@ index 4f346f51d7d7..7ffa064bbdb1 100644
  		other_tuple = &flow->tuplehash[!dir].tuple;
  		dev = dev_get_by_index(net, other_tuple->iifidx);
  		if (!dev)
-@@ -303,9 +308,38 @@ static int flow_offload_eth_dst(struct net *net,
+@@ -303,9 +313,38 @@ static int flow_offload_eth_dst(struct net *net,
  		ether_addr_copy(ha, this_tuple->out.h_dest);
  		break;
  	case FLOW_OFFLOAD_XMIT_NEIGH:
@@ -1127,7 +1163,7 @@ index 4f346f51d7d7..7ffa064bbdb1 100644
  		n = dst_neigh_lookup(dst_cache, daddr);
  		if (!n)
  			return -ENOENT;
-@@ -597,6 +631,10 @@ static int flow_offload_redirect(struct net *net,
+@@ -597,6 +636,10 @@ static int flow_offload_redirect(struct net *net,
  		ifindex = this_tuple->out.hw_ifidx;
  		break;
  	case FLOW_OFFLOAD_XMIT_NEIGH:
@@ -1138,7 +1174,7 @@ index 4f346f51d7d7..7ffa064bbdb1 100644
  		other_tuple = &flow->tuplehash[!dir].tuple;
  		ifindex = other_tuple->iifidx;
  		break;
-@@ -805,12 +843,16 @@ nf_flow_offload_rule_alloc(struct net *net,
+@@ -805,12 +848,16 @@ nf_flow_offload_rule_alloc(struct net *net,
  	int err = -ENOMEM;
  
  	flow_rule = kzalloc(sizeof(*flow_rule), GFP_KERNEL);
@@ -1157,7 +1193,7 @@ index 4f346f51d7d7..7ffa064bbdb1 100644
  
  	flow_rule->rule->match.dissector = &flow_rule->match.dissector;
  	flow_rule->rule->match.mask = &flow_rule->match.mask;
-@@ -896,6 +938,34 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
+@@ -896,6 +943,34 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
  	cls_flow->cookie = (unsigned long)tuple;
  }
  
@@ -1192,7 +1228,7 @@ index 4f346f51d7d7..7ffa064bbdb1 100644
  static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_offload *flow,
  				 struct nf_flow_rule *flow_rule,
-@@ -904,7 +974,22 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -904,7 +979,23 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {
@@ -1210,13 +1246,14 @@ index 4f346f51d7d7..7ffa064bbdb1 100644
 +		.nf_xfrm_genid = flow->xfrm_genid,
 +		.nf_dst_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[dir].tuple),
 +		.nf_dst_reverse_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[!dir].tuple),
++		.nf_ingress_ifindex = nf_flow_offload_ingress(&flow->tuplehash[dir].tuple),
 +		.nf_mtu = flow->tuplehash[dir].tuple.mtu,
 +		.nf_counter = !!(READ_ONCE(flowtable->flags) & NF_FLOWTABLE_COUNTER),
 +	};
  	struct netlink_ext_ack extack = {};
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
-@@ -1087,6 +1172,10 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
+@@ -1087,6 +1178,10 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
  
  	offload = kmalloc(sizeof(struct flow_offload_work), GFP_ATOMIC);
  	if (!offload) {
@@ -1227,7 +1264,7 @@ index 4f346f51d7d7..7ffa064bbdb1 100644
  		clear_bit(NF_FLOW_HW_PENDING, &flow->flags);
  		return NULL;
  	}
-@@ -1125,20 +1214,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
+@@ -1125,20 +1220,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
  	flow_offload_queue_work(offload);
  }
  

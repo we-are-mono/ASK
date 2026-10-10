@@ -152,17 +152,8 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A351 — counter reads and deletions for a port that does not own the flow still take the backend transaction.**
-  Linux calls every bound port's block callback for each direction. Offers to the other ports are declined before the
-  transaction (A139), but `FLOW_CLS_STATS` and `FLOW_CLS_DESTROY` carry no rule, so `ft_rule_callback()`
-  (`cdx/ask_flowtable_core.c`) can only learn that the port owns nothing by `ft_find()` under it. A STATS visit returns
-  `-ENOENT` after waiting its turn; a DESTROY visit that loses the trylock goes through `ft_destroy_defer()`, which
-  allocates a deferred record naming nothing and schedules retirement work. With two ports this is half of the
-  transaction's counter-read traffic: Linux asks each offloaded flow for counters every tenth of its timeout, about every
-  3 s at the 30 s default. A139 measured that waiting on the transaction costs a mass readmission no loss, so this is
-  wasted contention, not a defect. Declining early needs ownership without the transaction: the direction's ingress
-  ifindex in the patch 140 context for every command (compared as `ft_request_targets()` compares the rule's), or an
-  RCU-safe cookie lookup.
+- [x] **A351 — counter reads and deletions for a port that does not own the flow took the backend transaction.** Patch 140
+  names each direction's ingress for every command, and the other ports' visits are answered before it (_:/^cdx: answer other ports' visits without the transaction_).
 
 - [x] **A350 — a destroyed hardware qdisc's multicast replicas could leave by the port that claimed its channel next.**
   A torn-down tree's channels stay held for its port until its entries are retired or rebuilt (_:/^cdx: hold a torn-down qdisc's channels for its port_).

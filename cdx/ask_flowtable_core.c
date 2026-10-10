@@ -2326,20 +2326,17 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 	return 0;
 }
 
-/* Native flowtable work visits all bound devices for each direction. Decline
- * the other ingress before taking RTNL or attributing a transient failure to
- * its shared generation. These immutable match fields need no RTNL. */
-static bool ft_request_targets(const struct cdx_ft_binding *binding,
-			       const struct flow_cls_offload *cls)
+/* Native flowtable work visits all bound devices for each direction, and only
+ * the direction's ingress can own anything of it. Netfilter names that ingress
+ * for every command -- the device a REPLACE rule's meta key matches, which
+ * ft_parse() still checks -- so the others are told apart without a lookup:
+ * before RTNL, before the transaction, and before a transient failure could be
+ * attributed to the shared generation. The binding's device and its ifindex
+ * are fixed while it is bound: a namespace move unbinds the device first. */
+static bool ft_request_owned(const struct cdx_ft_binding *binding,
+			     const struct flow_cls_offload *cls)
 {
-	struct flow_match_meta meta;
-
-	if (!cls->rule ||
-	    !(cls->rule->match.dissector->used_keys & BIT(FLOW_DISSECTOR_KEY_META)))
-		return false;
-	flow_rule_match_meta(cls->rule, &meta);
-	return meta.mask->ingress_ifindex == -1 &&
-	       meta.key->ingress_ifindex == binding->dev->ifindex;
+	return cls->nf_ingress_ifindex == binding->dev->ifindex;
 }
 
 /* Whether Linux will offer this direction again on its own. flow_offload_refresh()
@@ -2412,6 +2409,16 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 
 	if (type != TC_SETUP_CLSFLOWER)
 		return -EOPNOTSUPP;
+	/* Offers, counter reads and deletions each visit every bound port. The
+	 * other ports' visits are not refusals, so they are neither counted nor
+	 * allowed near RTNL -- nor near the transaction: they are at least half
+	 * of a mass readmission's offers (A139) and of the counter reads Linux
+	 * makes of every offloaded flow, and each would otherwise wait its turn
+	 * only to find nothing (A351). A deletion of nothing marks and records
+	 * nothing. Each is answered as finding nothing always was. */
+	if (!ft_request_owned(binding, cls))
+		return cls->command == FLOW_CLS_DESTROY ? 0 :
+		       cls->command == FLOW_CLS_STATS ? -ENOENT : -EOPNOTSUPP;
 	/* Linux deletes one flow per work item, from an unbound workqueue
 	 * that runs up to 256 of them at once, and a route change or a
 	 * conntrack flush queues one for every flow. Each waiting for the
@@ -2429,14 +2436,6 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		ft_destroy_defer(binding, cls);
 		return 0;
 	}
-	/* Native work offers each direction to every bound port. The other
-	 * ports' visits are not refusals, so they are neither counted nor
-	 * allowed near RTNL -- nor near the transaction: they are most of a
-	 * mass readmission's offers, and each would otherwise queue behind
-	 * the installs only to decline (A139). The rule and the binding's
-	 * device are fixed for the call. */
-	if (cls->command == FLOW_CLS_REPLACE && !ft_request_targets(binding, cls))
-		return -EOPNOTSUPP;
 	if (cls->command != FLOW_CLS_DESTROY)
 		cdx_ft_begin();
 	entry = ft_find(binding, cls->cookie);
