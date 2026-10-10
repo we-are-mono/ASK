@@ -30,7 +30,7 @@ from _flowtable_rig import (DPORT, command, console_command, console_python, dri
 from _flowtable_selective_neighbour import (keys)
 from _flowtable_service import (FIRST)
 from _flowtable_service_ipsec import (INNER, LAN_INNER, Wire, flows_for, sec_counter)
-from _flowtable_service_ipsec_replay import (peer_errors, sa_state, xfrm_mib)
+from _flowtable_service_ipsec_replay import (offloaded, peer_errors, sa_state, xfrm_mib)
 from _ipsec_helpers import sa_replay_state
 
 # The accounting pass runs once a second, so a limit fires on the first pass
@@ -111,17 +111,17 @@ async def replace_outbound(r, *options, peer=()):
     return spi
 
 
-async def restore_outbound(r, expired):
-    """Put an outbound SA back once a hard expiry has deleted the fixture's.
+async def restore_sa(r, expired, direction="out"):
+    """Put an SA back once a hard expiry has deleted the fixture's.
 
-    The new state also removes the larval one an acquire left behind, if it
+    An outbound state also removes the larval one an acquire left behind, if it
     has not expired first (the fixture keeps net.core.xfrm_acq_expires
     short): the policy is still required, and traffic after the expiry asked
     the key manager, which the monitor is, for a state that never came."""
-    if await sa_state(r, expired) is not None:
+    if await sa_state(r, expired, direction) is not None:
         return None
-    spi = await r.ipsec.prepare_peer("out")
-    await r.ipsec.install("out", spi)
+    spi = await r.ipsec.prepare_peer(direction)
+    await r.ipsec.install(direction, spi)
     return spi
 
 
@@ -196,36 +196,48 @@ BLAST_RATE = 20_000
 LIMITS = {"packet": (50_000, 100_000), "byte": (50_000_000, 100_000_000)}
 
 
+@pytest.mark.parametrize("direction", ["out", "in"])
 @pytest.mark.parametrize("unit", ["packet", "byte"])
-async def test_expiry(ipsec_service, unit):
-    """A packet or byte limit on an offloaded outbound SA fires through xfrm:
+async def test_expiry(ipsec_service, unit, direction):
+    """A packet or byte limit on an offloaded SA fires through xfrm:
     one soft expiry within a pass of the soft limit, then the hard expiry and
     the state's deletion. Until then the counts rise in `ip -s xfrm state`
     and the flow stays in hardware; the hard expiry retires it."""
     r, flows = ipsec_service, flows_for(ipsec_service)
     soft, hard = LIMITS[unit]
     field = unit + "s"
-    outbound = next(key for key in keys([2], flows) if key[0] == TARGET_LAN_IF)
-    label = f"ipsec-lifetime-{unit}"
+    ingress = TARGET_LAN_IF if direction == "out" else TARGET_WAN_IF
+    flow_key = next(key for key in keys([2], flows) if key[0] == ingress)
+    sa_field = "sa" if direction == "out" else "in_sa"
+    feeder = "tx toenc" if direction == "out" else "tx todec"
+    label = f"ipsec-lifetime-{unit}-{direction}"
     restored = None
     async with XfrmMonitor(r, label) as monitor:
-        spi = await replace_outbound(r, "limit", f"{unit}-soft", str(soft), "limit", f"{unit}-hard", str(hard))
+        replace = replace_outbound if direction == "out" else replace_inbound
+        spi = await replace(r, "limit", f"{unit}-soft", str(soft), "limit", f"{unit}-hard", str(hard))
         task, samples = None, []
         try:
+            if direction == "in":
+                # The fixture's replaced SA may still be releasing its FQs.
+                # Drain it before admission, so this wait cannot age the flow.
+                await r.wait(lambda s: s["ipsec_sa_cache"] == s["ipsec_sas"], timeout=45)
             # A first burst gets flow 2 admitted, so the counted one runs in
             # hardware from its first frame.
-            admitted = await drive(r, lambda: blast(r, 500, 2_000), lambda state: outbound in by_key(state))
-            flow = by_key(admitted)[outbound]
-            assert flow["sa"] != "0", flow
-            at_admission = await sa_state(r, spi)
-            toenc = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc")
+            admitted = await drive(r, lambda: blast(r, 500, 2_000), lambda state: flow_key in by_key(state))
+            flow = by_key(admitted)[flow_key]
+            assert flow[sa_field] != "0", flow
+            if direction == "in":
+                sa_dir = f"/proc/fqid_stats/sa/{int(flow['in_sa']):#x}"
+                await console_command(r.service_console, "test", "-d", sa_dir)
+            at_admission = await sa_state(r, spi, direction)
+            cpu = await sec_counter(r.session, r.target, TARGET_WAN_IF, feeder)
             task = asyncio.create_task(blast(r, BLAST_COUNT, BLAST_RATE))
             while not task.done():
                 # The flow first: an SA still short of its hard limit when read
                 # after it proves the flow was read before any hard expiry.
                 state = await r.state()
-                samples.append({"flow": by_key(state).get(outbound), "sa": await sa_state(r, spi),
-                                "toenc": await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc"),
+                samples.append({"flow": by_key(state).get(flow_key), "sa": await sa_state(r, spi, direction),
+                                "cpu_fed": await sec_counter(r.session, r.target, TARGET_WAN_IF, feeder),
                                 "ipsec_invalidations": state["ipsec_invalidations"]})
                 await asyncio.sleep(0.3)
             report = await task
@@ -241,28 +253,70 @@ async def test_expiry(ipsec_service, unit):
             assert soft <= softs[0][field] <= soft + PASS_SLACK_SECONDS * rate, (softs, rate)
             assert hard <= hards[0][field] <= hard + PASS_SLACK_SECONDS * rate, (hards, rate)
             # A hard expiry deletes the state; a soft one leaves it alone.
-            assert await sa_state(r, spi) is None, "the hard expiry did not delete the state"
+            assert await sa_state(r, spi, direction) is None, "the hard expiry did not delete the state"
             live = [sample for sample in samples if sample["sa"] and sample["sa"][field] < hard]
             counts = [sample["sa"][field] for sample in live]
             assert len(set(counts)) >= 3 and counts == sorted(counts), counts
             assert all(sample["sa"]["use"] != "-" for sample in live if sample["sa"]["packets"]), live
             assert any(sample["sa"][field] >= soft for sample in live), "no sample between the two expiries"
             for sample in live:
-                assert sample["flow"] and (sample["flow"]["cookie"], sample["flow"]["sa"]) == (flow["cookie"], flow["sa"]), (
+                assert sample["flow"] and (sample["flow"]["cookie"], sample["flow"][sa_field]) == (flow["cookie"], flow[sa_field]), (
                     "the flow left hardware before the hard expiry", sample)
             # The SA's figures trail SEC by up to a pass, the flow's do not.
             carried = live[-1]["sa"]["packets"] - at_admission["packets"]
             matched = int(live[-1]["flow"]["packets"]) - int(flow["packets"])
             assert matched >= carried - PASS_SLACK_SECONDS * BLAST_RATE, (matched, carried)
-            assert live[-1]["toenc"] - toenc <= 64, ("the CPU carried the traffic", live[-1]["toenc"] - toenc)
-            assert outbound not in by_key(final), final
+            assert 0 <= live[-1]["cpu_fed"] - cpu <= 64, ("the CPU carried the traffic", live[-1]["cpu_fed"] - cpu)
+            assert flow_key not in by_key(final), final
             assert final["ipsec_invalidations"] == admitted["ipsec_invalidations"] + 1, (admitted, final)
+            if direction == "in":
+                retired = await r.wait(lambda s:
+                    s["ipsec_sas"] == admitted["ipsec_sas"] - 1 and
+                    s["ipsec_sa_cache"] == admitted["ipsec_sa_cache"] - 1 and
+                    all(f["in_sa"] != flow["in_sa"] and f["cookie"] != flow["cookie"] for f in s["flows"]),
+                    timeout=45)
+                deadline = time.monotonic() + 45
+                while (exists := await console_command(r.service_console, "test", "-d", sa_dir, check=False))["rc"] == 0:
+                    assert time.monotonic() < deadline, ("expired SA queues remain", sa_dir)
+                    await asyncio.sleep(0.5)
+                assert exists["rc"] == 1, exists
+                # Requests must still reach and authenticate at the peer, and
+                # its replies must actually carry the expired SPI on the wire.
+                # No echo alone could also mean the outbound path was broken.
+                capture = Wire(r, label + "-expired")
+                capture.filter = f"ip proto 50 and src host {r.ipsec.peer} and dst host {r.ipsec.outer}"
+                capture.snaplen = 64
+                received = r.inner_echo.packets
+                async with capture:
+                    echoed = await echoes(r, 16)
+                seqs = [seq for owner, seq in esp_sequences(capture.path) if owner == spi]
+                withdrawn = {"retired": retired, "sa_dir": sa_dir, "echoed": echoed,
+                             "peer_received": r.inner_echo.packets - received, "wire": seqs}
+                r.record(label + "-withdrawal", withdrawn)
+                assert withdrawn["peer_received"] == 16 and len(seqs) == len(set(seqs)) == 16, withdrawn
+                assert echoed == 0, withdrawn
         finally:
             if task:
                 await asyncio.gather(task, return_exceptions=True)
-            restored = await restore_outbound(r, spi)
-    assert restored, "the hard expiry left the fixture's outbound SA in place"
+            restored = await restore_sa(r, spi, direction)
+    assert restored, "the hard expiry left the fixture's SA in place"
+    if direction == "in":
+        assert restored != spi and await sa_state(r, restored, "in") is not None, restored
+        await offloaded(r)
+        recovered = await drive(r, lambda: echoes(r, 4), lambda s:
+            flow_key in by_key(s) and s["ipsec_sas"] == admitted["ipsec_sas"] and
+            s["ipsec_sa_cache"] == admitted["ipsec_sa_cache"])
+        new = by_key(recovered)[flow_key]
+        assert new["in_sa"] != "0", new
+        cpu = await sec_counter(r.session, r.target, TARGET_WAN_IF, feeder)
     assert await echoes(r, 16) == 16, "the restored SA does not carry the tunnel"
+    if direction == "in":
+        after = await r.state()
+        carried = by_key(after)[flow_key]
+        submitted = await sec_counter(r.session, r.target, TARGET_WAN_IF, feeder) - cpu
+        r.record(label + "-recovered", {"spi": restored, "before": recovered, "after": after, "cpu_fed": submitted})
+        assert (carried["cookie"], carried["in_sa"]) == (new["cookie"], new["in_sa"]), (new, carried)
+        assert int(carried["packets"]) - int(new["packets"]) == 16 and submitted == 0, (new, carried, submitted)
 
 
 @pytest.mark.rfc("4301", section="4.4.2.1")
@@ -280,7 +334,7 @@ async def test_time_expiry(ipsec_service):
             assert [event["hard"] for event in expiries] == [0, 1], expiries
             assert await sa_state(r, spi) is None, "the hard expiry did not delete the state"
         finally:
-            restored = await restore_outbound(r, spi)
+            restored = await restore_sa(r, spi)
     assert restored and await echoes(r, 16) == 16
 
 
@@ -324,6 +378,94 @@ SEQUENCE_COUNT = 16
 EXHAUSTING = 0xF0000000
 # Named by no policy, so this SA never carries the fixture's traffic.
 EXHAUSTING_REQID = "49303"
+
+
+@pytest.mark.parametrize("feeder", ["cpu", "classifier"])
+async def test_outbound_esn_rollover(ipsec_service, feeder):
+    """Both SEC feeders cross the low-word boundary with one 64-bit counter.
+
+    The software peer authenticates the implicit high word. The classifier
+    case is admitted before the wrap, so cold-flow CPU traffic cannot stand
+    in for the hardware feeder at the boundary."""
+    r, flows = ipsec_service, flows_for(ipsec_service)
+    label = f"ipsec-outbound-esn-{feeder}"
+    target = (1 << 32) | 0xFFFFFFF7
+    start = target if feeder == "cpu" else (1 << 32) | 0xFFFFFE00
+    spi = await replace_outbound(
+        r, "flag", "esn", "replay-oseq-hi", "1", "replay-oseq", hex(start & 0xFFFFFFFF),
+        peer=("flag", "esn", "replay-seq-hi", "1", "replay-seq", hex(start & 0xFFFFFFFF)))
+    await offloaded(r)
+    outbound = next(key for key in keys([2], flows) if key[0] == TARGET_LAN_IF)
+    record = {"spi": spi, "start": start, "publication": []}
+    exempt = ["POSTROUTING", "-s", LAN_INNER, "-d", INNER, "-p", "icmp", "-j", "ACCEPT"]
+    exempted = False
+
+    async def position(expected):
+        # GETAE and GETSA both publish the live PDB. Each completed round trip
+        # has already left SEC, so these quiet boundaries have exact values.
+        replay = await sa_replay_state(r.target, r.session, dst=r.ipsec.peer, spi=spi)
+        state = await sa_state(r, spi)
+        samples = record["publication"]
+        samples.append({"expected": expected, "getae": replay["oseq"], "state": state})
+        assert state and replay["oseq"] == state["oseq"] == expected, record
+        assert len(samples) == 1 or samples[-2]["getae"] <= replay["oseq"], record
+
+    async def send(count):
+        if feeder == "classifier":
+            assert await echoes(r, count) == count, (label, count)
+        else:
+            result = await asyncio.to_thread(
+                r.lan.run, f"ping -n -q -c {count} -i 0.02 -W 1 -I {LAN_INNER} {INNER}", timeout=count + 5)
+            received = re.search(r"(\d+) packets transmitted, (\d+) received", result.stdout)
+            assert result.rc == 0 and received and tuple(map(int, received.groups())) == (count, count), result.stdout
+
+    try:
+        if feeder == "cpu":
+            await command(r.target, r.session, "iptables", "-t", "nat", "-I", *exempt)
+            exempted = True
+        else:
+            warmed = 0
+
+            async def warm():
+                nonlocal warmed
+                warmed += 4
+                assert warmed <= 256, "the classifier did not admit the flow before the rollover headroom ran out"
+                await send(4)
+
+            await drive(r, warm, lambda s: outbound in by_key(s) and by_key(s)[outbound]["sa"] != "0")
+            await position(start + warmed)
+            # Align only after admission. Replacing a warmed SA here would
+            # retire its flow, leaving the rollover to the CPU again.
+            await send(target - start - warmed)
+        await position(target)
+        before = await r.state()
+        cpu = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc")
+        peer = xfrm_mib(Path("/proc/net/xfrm_stat").read_text())
+        capture = Wire(r, label)
+        capture.snaplen = 64
+        sent = 0
+        async with capture:
+            for count in (4, 8, 4):
+                await send(count)
+                sent += count
+                await position(target + sent)
+        after = await r.state()
+        submitted = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc") - cpu
+        seqs = [seq for owner, seq in esp_sequences(capture.path) if owner == spi]
+        expected = [(target + n) & 0xFFFFFFFF for n in range(1, 17)]
+        record.update(before=before, after=after, cpu_fed=submitted, wire=seqs,
+                      expected=expected, peer_refused=peer_errors(peer))
+        assert seqs == expected and not record["peer_refused"], record
+        assert submitted == (16 if feeder == "cpu" else 0), record
+        if feeder == "classifier":
+            old, new = by_key(before)[outbound], by_key(after)[outbound]
+            assert old["sa"] != "0" and (old["cookie"], old["sa"]) == (new["cookie"], new["sa"]), record
+            assert int(new["packets"]) - int(old["packets"]) == 16, record
+            assert (before["installs"], before["deletes"]) == (after["installs"], after["deletes"]), record
+    finally:
+        r.record(label, record)
+        if exempted:
+            await command(r.target, r.session, "iptables", "-t", "nat", "-D", *exempt)
 
 
 async def test_starting_sequence(ipsec_service):
