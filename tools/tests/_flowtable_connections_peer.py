@@ -17,12 +17,16 @@ import time
 TCP_SIZE = 16384
 UDP_SIZE = 256
 CONTROL_IDLE_TIMEOUT = 35
-# Connections closed at once. Linux takes every FIN itself, through each
-# port's punt policer (a 64-frame burst) and its queue to the CPU, and TCP
-# retransmits a lost one on the same schedule for every connection, so
-# thousands closed together arrive as one burst and retry as bursts; a few at
-# a time never form one.
-CLOSE_CONCURRENCY = 32
+# Connections whose close starts together, and the gap before the next ones
+# start. Linux takes every FIN itself, through each port's punt policer (a
+# 64-frame burst) and its queue to the CPU, and TCP retransmits a lost one on
+# the same schedule for every connection, so thousands closed in one instant
+# arrive as one burst and retry as bursts. Started a batch at a time they
+# arrive, and retry, spread out, while every close still waits for its own
+# FIN alongside the rest: 16,384 connections start within 2.6 s, so a close
+# of them all ends within its 30 s wait of that, inside the caller's 60 s.
+CLOSE_BATCH = 32
+CLOSE_GAP = 0.005
 # linux/in.h: a socket's DF policy, for probes on a flow's own tuple.
 IP_MTU_DISCOVER = 10
 IP_PMTUDISC_PROBE = 3
@@ -361,14 +365,13 @@ class Flow:
 
 
 async def close_all(flows):
-    """Close every flow, CLOSE_CONCURRENCY of them at a time."""
-    gate = asyncio.Semaphore(CLOSE_CONCURRENCY)
-
-    async def close(flow):
-        async with gate:
-            await flow.close()
-
-    await asyncio.gather(*(close(flow) for flow in flows))
+    """Close every flow, starting CLOSE_BATCH of them every CLOSE_GAP."""
+    closing = []
+    for start in range(0, len(flows), CLOSE_BATCH):
+        if start:
+            await asyncio.sleep(CLOSE_GAP)
+        closing += [asyncio.create_task(flow.close()) for flow in flows[start:start + CLOSE_BATCH]]
+    await asyncio.gather(*closing)
 
 
 async def main(config):

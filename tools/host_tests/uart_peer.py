@@ -7,12 +7,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from _flowtable_rig import Echo
-from _flowtable_connections_peer import CONTROL_IDLE_TIMEOUT
+from _flowtable_connections_peer import CLOSE_BATCH, CLOSE_GAP, CONTROL_IDLE_TIMEOUT, close_all
 import _flowtable_connections as connections
 
 
@@ -141,3 +142,27 @@ async def test_peer_failure_closes_the_control_connection(tmp_path):
         if process.returncode is None:
             process.kill()
             await process.communicate()
+
+
+async def test_closing_many_spreads_the_fins_but_waits_for_them_together():
+    """A close of thousands starts CLOSE_BATCH connections every CLOSE_GAP, so
+    their FINs reach the DUT's punt path spread out, and waits for all of them
+    at once: one connection's wait plus the pacing, not the sum of the waits,
+    which the caller's 60 s would not cover."""
+    starts = []
+
+    class Flow:
+        async def close(self):
+            starts.append(time.monotonic())
+            await asyncio.sleep(0.5)
+
+    flows = [Flow() for _ in range(1024)]
+    began = time.monotonic()
+    await close_all(flows)
+    took = time.monotonic() - began
+    pacing = (len(flows) // CLOSE_BATCH - 1) * CLOSE_GAP
+    started = sorted(start - began for start in starts)
+    # The second batch waits a gap after the first, however busy the host.
+    assert started[CLOSE_BATCH] - started[CLOSE_BATCH - 1] >= CLOSE_GAP / 2, started[:2 * CLOSE_BATCH]
+    assert started[-1] >= 0.9 * pacing, (started[-1], pacing)
+    assert took < 0.5 + pacing + 0.5, (took, pacing)

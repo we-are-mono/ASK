@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A355 — a close of many connections could outlast the caller's 60 s.** The peer's closes held 32 slots each
+  for their whole wait; they now start 32 every 5 ms and are waited for together (_:/^tests: start a peer's closes in batches_).
+
 - [x] **A354 — a port's transmit counts counted twice what was still queued when CDX took it.** Where they start
   leaves out what QMan holds for the port, read standing still (_:/^cdx: leave what is still queued out of where transmit_).
 
