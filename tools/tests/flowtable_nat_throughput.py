@@ -37,10 +37,9 @@ PACKET_SPORT, PACKET_PORT = SPORT + 3002, DPORT + 3002
 PACKET_FRAMES = (64, 128)
 # The LAN VM's four pktgen threads, one per transmit queue of its 10 Gbit/s
 # NIC, put 9.04 Mpps of minimum frames on the wire, into a MAC nobody owns,
-# and 8 Mpps of 128-byte ones. That overloads the DUT. A paced rate needs a
-# single thread: the LAN VM is a guest, and a paced pktgen thread the host
-# descheduled catches up at full speed, so four of them catching up together
-# offer well past the DUT's ceiling for a moment, where one alone cannot.
+# and 8 Mpps of 128-byte ones. That overloads the DUT. Paced runs use one
+# thread and a NIC queue rate cap: even one descheduled pktgen thread can
+# catch up at full speed and briefly exceed the DUT's receive capacity.
 PACKET_THREADS = 4
 PACKET_SECONDS = 3
 PACKET_SENDER = {64: 9e6, 128: 8e6}
@@ -364,6 +363,8 @@ def _pktgen(r, frame, threads, count, ratep):
 import json, subprocess, time
 from pathlib import Path
 root = Path("/proc/net/pktgen")
+if {bool(ratep)}:
+    Path("/sys/class/net/{LAN_NIC}/queues/tx-0/tx_maxrate").write_text({str(((ratep or 0) * (frame + 20) * 8 + 999999) // 1000000)!r})
 subprocess.run(["modprobe", "pktgen"], check=True)
 def pg(path, cmd):
     (root / path).write_text(cmd + "\\n")
@@ -439,6 +440,7 @@ print(echoed)
     record = {"frame": frame, "overload": overload, "offered_target": offered,
               "count_per_thread": count, "wire": wire}
     transport = None
+    pacing = None
     sinking = routed = False
     with Console.target(log_path=str(artifact_dir() / "packet-rate-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
@@ -488,6 +490,21 @@ print(echoed)
             sinking = True
 
             hops_before, host_before, cpu_before = await _dut_hops(r), _host_nic(wire), await cpu(r)
+            if ratep:
+                assert threads == 1
+                result = await lan_run_python(r.lan, f'''
+import json
+from pathlib import Path
+nic = Path("/sys/class/net/{LAN_NIC}")
+print(json.dumps({{"prior_mbps": int((nic / "queues/tx-0/tx_maxrate").read_text()),
+                  "link_mbps": int((nic / "speed").read_text())}}))
+''', label="packet_rate_pacing", timeout=10)
+                assert result.rc == 0, result.stdout
+                pacing = json.loads(result.stdout.strip().splitlines()[-1])
+                assert pacing["link_mbps"] > 0, pacing
+                # Frame includes FCS; preamble and inter-frame gap add 20 bytes.
+                pacing["cap_mbps"] = (ratep * (frame + 20) * 8 + 999999) // 1000000
+                record["pacing"] = pacing
             result = await lan_run_python(r.lan, _pktgen(r, frame, threads, count, ratep),
                                           label="packet_rate_pktgen", timeout=PACKET_SECONDS * 4 + 30)
             assert result.rc == 0, result.stdout
@@ -563,23 +580,37 @@ print(echoed)
             assert after["invalidated"] == after["fatal"] == after["quarantine"] == 0, after
             assert after["errors"] == before["errors"], (before, after)
         finally:
-            r.record(f"packet-rate-{frame}-{'overload' if overload else 'lossless'}", record)
             try:
-                if transport:
-                    transport.close()
-                if sinking:
-                    subprocess.run(["nft", "delete", "table", "netdev", sink], check=False, timeout=10)
-                if routed:
-                    await lan_run_python(r.lan, f"import subprocess\nsubprocess.run({unroute!r}, check=True)\n",
-                                         label="packet_rate_unroute", timeout=15)
+                if pacing:
+                    # Guest timeout can skip its finally. Own restoration here;
+                    # ixgbe's zero write updates sysfs but leaves hardware capped.
+                    rates = [pacing["prior_mbps"]] if pacing["prior_mbps"] else [pacing["link_mbps"], 0]
+                    result = await lan_run_python(r.lan, f'''
+from pathlib import Path
+queue = Path("/sys/class/net/{LAN_NIC}/queues/tx-0/tx_maxrate")
+for rate in {rates!r}:
+    queue.write_text(str(rate))
+assert int(queue.read_text()) == {pacing["prior_mbps"]}
+''', label="packet_rate_restore", timeout=10)
+                    assert result.rc == 0, result.stdout
             finally:
                 try:
-                    await stop(con)
+                    r.record(f"packet-rate-{frame}-{'overload' if overload else 'lossless'}", record)
+                    if transport:
+                        transport.close()
+                    if sinking:
+                        subprocess.run(["nft", "delete", "table", "netdev", sink], check=False, timeout=10)
+                    if routed:
+                        await lan_run_python(r.lan, f"import subprocess\nsubprocess.run({unroute!r}, check=True)\n",
+                                             label="packet_rate_unroute", timeout=15)
                 finally:
-                    await command(r.target, r.session, "nft", "delete", "table", "ip", nat_table)
-                    await console_command(con, "rm", "-f", CONFIG)
-                    await command(r.target, r.session, "conntrack", "-D", "-p", "udp", "--orig-src", r.lan_ip,
-                                  "--orig-dst", WAN_IP, "--dport", str(PACKET_PORT), check=False)
+                    try:
+                        await stop(con)
+                    finally:
+                        await command(r.target, r.session, "nft", "delete", "table", "ip", nat_table)
+                        await console_command(con, "rm", "-f", CONFIG)
+                        await command(r.target, r.session, "conntrack", "-D", "-p", "udp", "--orig-src", r.lan_ip,
+                                      "--orig-dst", WAN_IP, "--dport", str(PACKET_PORT), check=False)
         final = await r.wait(lambda s: not s["entries"])
         assert final["installs"] == final["deletes"] and final["fatal"] == final["quarantine"] == 0, final
         assert final["errors"] == HEALTH_BASELINE["errors"], (final, HEALTH_BASELINE)

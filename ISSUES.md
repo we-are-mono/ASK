@@ -158,7 +158,8 @@ result independently of those temporary files.
   `port_rx_filter_frame` (`/sys/devices/platform/soc/1a00000.fman/1a90000.port/statistics/`) while the mEMAC reports
   no RERR and the port no `port_rx_bad_frame`. 128-byte frames lose none below the ceiling, and under overload exactly
   the MAC's cut-short RERR frames. Counted, not silent, and inside the gate's 1e-4 loss share, so not a release
-  blocker. Next: move the filter's bits from the RX port's discard mask (`fmbm_rfsdm`, BMI +0x68) to its error-enqueue
+  blocker. Those paced samples predate the NIC queue rate cap: pktgen's average rate did not bound its catch-up bursts.
+  Next: move the filter's bits from the RX port's discard mask (`fmbm_rfsdm`, BMI +0x68) to its error-enqueue
   mask (`fmbm_rfsem`, +0x6C) so those frames reach `priv_rx_error_dqrr` with their FD status, then tell a parse or
   KeyGen error at minimum length from an FMan resource limit.
 

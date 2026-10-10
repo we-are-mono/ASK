@@ -522,9 +522,13 @@ hardware entries, its WAN MAC (`mac_tx_stats`), and the WAN host NIC's MAC
 counter, which counts what arrives whatever that host's CPU does. Lossless,
 one paced generator thread offers at least 1.8 Mpps; the MAC drops nothing,
 less than 1e-4 of the frames goes missing, and the DUT's kernel transmits
-next to nothing. One thread only, because the LAN VM is a guest: a descheduled
-paced thread catches up at full speed, and four doing so together briefly
-offer more than the ceiling. Overloaded, four unpaced threads offer about
+next to nothing. Even one descheduled pktgen thread catches up at full speed,
+so paced runs also cap its NIC transmit queue at the requested wire rate
+(frame size including FCS, plus 20 bytes for preamble and inter-frame gap).
+The artifact records the cap and previous setting. The orchestrator restores
+that setting even if the guest script fails or times out; restoring an unlimited
+ixgbe queue writes link speed before zero because zero alone leaves its hardware
+limiter unchanged. Overloaded, four unpaced threads offer about
 9 Mpps; the hardware path still forwards at least 3 Mpps (3.17-3.30 measured,
 the FMan receive path's ceiling at both sizes), and every refused frame is
 counted at the MAC or by the port's frame filter (A361).
