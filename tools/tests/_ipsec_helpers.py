@@ -29,6 +29,7 @@ this image is built from:
                              mode 214, replay_window 215, flags 216)
   xfrm_algo         68 B + key      (name 64, key_len 4)
   xfrm_algo_auth    72 B + key      (name 64, key_len 4, trunc_len 4)
+  xfrm_algo_aead    72 B + key      (name 64, key_len 4, icv_len 4)
   xfrm_user_offload  8 B            (ifindex 4, flags 1, pad)
   xfrm_encap_tmpl   24 B            (type 2, sport 2, dport 2, pad, oa 16)
 
@@ -191,6 +192,7 @@ def newsa(
     offload: bool = True,
     cipher_key: bytes = CIPHER_KEY,
     auth_key: bytes = AUTH_KEY,
+    aead: tuple[str, bytes, int] | None = None,
     natt: tuple[int, int] | None = None,
     replay_window: int = 0,
     replay: tuple[int, int, int] | None = None,
@@ -204,6 +206,9 @@ def newsa(
     `replay` is the (oseq, seq, bitmap) a keying daemon carries over when it
     re-adds an SA, as XFRMA_REPLAY_VAL: the legacy shape, for a window of 32
     or less, which is what `ip` cannot send.
+
+    `aead` is (algorithm name, key including salt, ICV length in bits),
+    replacing the default separate CBC cipher and HMAC attributes.
     """
     info = (
         _selector()                                   # sel
@@ -229,11 +234,16 @@ def newsa(
         + b"\x00" * 7                                 # tail padding to 224
     )
     assert len(info) == 224, len(info)
-    attrs = (
-        _nla(XFRMA_ALG_CRYPT, _algo(ENC_ALG, cipher_key))
-        + _nla(XFRMA_ALG_AUTH_TRUNC,
-               _algo_auth(AUTH_ALG, auth_key, AUTH_TRUNC_BITS))
-    )
+    if aead is not None:
+        name, key, icv_bits = aead
+        attrs = _nla(XFRMA_ALG_AEAD, name.encode().ljust(64, b"\x00")
+                     + struct.pack("<II", len(key) * 8, icv_bits) + key)
+    else:
+        attrs = (
+            _nla(XFRMA_ALG_CRYPT, _algo(ENC_ALG, cipher_key))
+            + _nla(XFRMA_ALG_AUTH_TRUNC,
+                   _algo_auth(AUTH_ALG, auth_key, AUTH_TRUNC_BITS))
+        )
     if replay is not None:
         attrs += _nla(XFRMA_REPLAY_VAL, struct.pack("<III", *replay))
     if natt is not None:
@@ -360,7 +370,8 @@ async def sa_add(
     target_agent, session, *, src: str, dst: str, spi: int, reqid: int,
     ifindex: int, inbound: bool = False, mode: int = XFRM_MODE_TUNNEL,
     offload: bool = True, cipher_key: bytes = CIPHER_KEY,
-    auth_key: bytes = AUTH_KEY, natt: tuple[int, int] | None = None,
+    auth_key: bytes = AUTH_KEY, aead: tuple[str, bytes, int] | None = None,
+    natt: tuple[int, int] | None = None,
     failslab_times: int | None = None, timeout_ms: int = 3000,
     replay_window: int = 0, replay: tuple[int, int, int] | None = None,
 ) -> SaReply:
@@ -370,7 +381,7 @@ async def sa_add(
         session, NETLINK_XFRM,
         newsa(src=src, dst=dst, spi=spi, reqid=reqid, ifindex=ifindex,
               inbound=inbound, mode=mode, offload=offload,
-              cipher_key=cipher_key, auth_key=auth_key, natt=natt,
+              cipher_key=cipher_key, auth_key=auth_key, aead=aead, natt=natt,
               replay_window=replay_window, replay=replay),
         nlmsg_type=XFRM_MSG_NEWSA,
         nlmsg_flags=NLM_F_REQUEST | NLM_F_ACK,
