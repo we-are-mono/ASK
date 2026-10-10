@@ -152,6 +152,16 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A358 — the destroyed-tree test's WAN capture check once saw none of the DUT's five frames.** In the release
+  run of b62ef8a8's predecessor image (2026-10-10, test 126/570, after `test_shrunk_leaf_backlog_stays_charged`),
+  `_capture_checked()` in `tools/tests/flowtable_qos.py` saw 0 of 5 frames the DUT sends out of eth4 from its LAN MAC
+  to the LAN VM's MAC; the DUT printed `SENT`. It failed before any tree was built, so the CEETM channel release is
+  not involved. The test alone, the pair with its predecessor, and both destroyed-tree tests all passed on reruns
+  (same boot and the next). Candidates: the DUT's WAN MAC never sent them (paused or stalled), the QSW switch dropped
+  them (unknown unicast; a stale FDB entry for the LAN VM's MAC on the DUT's port), or the host's br0 capture missed
+  them. The check now reports how many frames the WAN MAC sent across the send: on a recurrence, ≥5 with none
+  captured points past the DUT (read the switch's FDB and port counters over its REST API), fewer at the DUT.
+
 - [x] **A357 — a port's released channels and DSCP map could serve another port before its unlinks were proven.** The
   egress drain now holds until a barrier proves every unlink gone and no latch is live (_:/^cdx: release a port's hardware only once a barrier proves_).
 

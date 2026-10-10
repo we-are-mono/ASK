@@ -605,9 +605,17 @@ async def _leaked_to_wan(r, during, bpf, linger=2.0):
 
 # A UDP frame sent out of the DUT's WAN port as it is, through an AF_PACKET
 # socket of the DUT's own: the path a LAN frame that left by the wrong port
-# takes to this host.
+# takes to this host. Says how many frames the port's MAC sent meanwhile, so
+# that frames that never arrive are known to have left the DUT or not.
 _DUT_SEND = '''
-import socket, struct
+import socket, struct, time
+def mac_frames():
+    regs = {{}}
+    for line in open('/sys/class/net/{dev}/mac_tx_stats'):
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].endswith(':'):
+            regs[parts[-1]] = int(parts[1], 16)
+    return sum(regs[n + '_l'] | regs[n + '_u'] << 32 for n in ('tuca', 'tmca', 'tbca'))
 def checksum(header):
     total = sum(struct.unpack('!%dH' % (len(header) // 2), header))
     total = (total >> 16) + (total & 0xffff)
@@ -621,32 +629,39 @@ ip = ip[:10] + struct.pack('!H', checksum(ip)) + ip[12:]
 frame = bytes.fromhex({dst_mac!r}) + bytes.fromhex({src_mac!r}) + b'\\x08\\x00' + ip + udp
 s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
 s.bind(({dev!r}, 0))
+before = mac_frames()
 for _ in range({count}):
     s.send(frame)
 s.close()
-print('SENT')
+time.sleep(0.2)
+print('SENT', mac_frames() - before)
 '''
 
 
 async def _dut_sends_on_wan(r, *, dst_mac, src_mac, destination, port, count):
     """The DUT sends `count` UDP frames to `destination`, addressed at Ethernet
-    from `src_mac` to `dst_mac`, out of its WAN port as they are."""
+    from `src_mac` to `dst_mac`, out of its WAN port as they are. Returns how
+    many frames the port's MAC sent meanwhile: these, and whatever else the
+    DUT sent there."""
     script = _DUT_SEND.format(port=port, source=r.dut_wan_ip, destination=destination,
                               dst_mac=dst_mac.replace(":", ""), src_mac=src_mac.replace(":", ""),
                               dev=TARGET_WAN_IF, count=count)
     result = await console_python(r.console, script, timeout=30)
-    assert "SENT" in result["stdout"], result
+    sent = re.search(r"^SENT (\d+)$", result["stdout"], re.M)
+    assert sent, result
+    return int(sent.group(1))
 
 
 async def _capture_checked(r, bpf, *, dst_mac, destination, port):
     """The WAN capture under `bpf` sees every one of five frames the DUT itself
     sends out of its WAN port the way a LAN frame leaving by the wrong port
     would be: from the DUT's LAN MAC to `dst_mac`."""
-    seen, _ = await _leaked_to_wan(r, lambda: _dut_sends_on_wan(
+    seen, left = await _leaked_to_wan(r, lambda: _dut_sends_on_wan(
         r, dst_mac=dst_mac, src_mac=r.dut_lan_mac, destination=destination, port=port,
         count=5), bpf, linger=0.5)
     assert len(seen) == 5, ("the WAN capture cannot see a frame the DUT sends this way",
-                            bpf, [p.summary() for p in seen])
+                            bpf, [p.summary() for p in seen],
+                            f"the DUT's WAN MAC sent {left} frames meanwhile")
 
 
 async def _staged_swap(r, *, rtnl_requests=0):
