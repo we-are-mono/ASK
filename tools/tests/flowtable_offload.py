@@ -16,8 +16,10 @@ import errno
 import json
 import os
 import re
+import secrets
 import threading
 import time
+from collections import Counter
 
 import pytest
 
@@ -25,6 +27,7 @@ from ask_orch.commands import command, console_command, console_python, read
 from ask_orch.counters import kernel_tx_packets
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, kernel_rx_packets, lan_run_python
+from _flowtable_udp_wire import udp_wire_payload
 
 # Per-boot floor for the cumulative counters health checks compare against;
 # the rig fixture refreshes it for every test.
@@ -178,6 +181,8 @@ async def test_reference_and_lifecycle(rig):
 @pytest.mark.rfc("792")
 @pytest.mark.rfc("1812", section="5.3.1")
 async def test_same_tuple_exceptions(rig):
+    from scapy.all import AsyncSniffer, wrpcap
+
     r = rig
     if (await r.state())["observe"]:
         pytest.skip("exception handling requires installed hardware")
@@ -190,6 +195,9 @@ async def test_same_tuple_exceptions(rig):
     # only where its path carries the largest frame its ingress port can
     # deliver, so nothing arriving on this tuple can exceed its entry; the DF
     # exception is proved on a TCP entry in flowtable_mtu.py.
+    prefix = f"ASK-invalid-{secrets.token_hex(8)}-"
+    forbidden = {name: (prefix + name).encode() for name in
+                 ("bad_checksum", "version", "version15")}
     script = f'''
 import json, socket, struct, time
 from scapy.all import Ether, IP, UDP, ICMP, Raw, IPOption, fragment, sendp, srp1, getmacbyip
@@ -222,25 +230,78 @@ for name, packets, payload in [
     assert ttl == [63], (name, ttl)
     results[name] = len(data)
 # Headers Linux would discard must not be forwarded by the entry for their tuple.
+forbidden = {forbidden!r}
 for name, pkt in [
-    ('bad_checksum', IP(src=src,dst=dst,ttl=64,chksum=0x1234)/UDP(sport=sport,dport=dport)/Raw(b'ASK-badsum')),
-    ('version', IP(src=src,dst=dst,ttl=64,version=5)/UDP(sport=sport,dport=dport)/Raw(b'ASK-version')),
-    ('version15', IP(src=src,dst=dst,ttl=64,version=15)/UDP(sport=sport,dport=dport)/Raw(b'ASK-version15')),
+    ('bad_checksum', IP(src=src,dst=dst,ttl=64)/UDP(sport=sport,dport=dport)),
+    ('version', IP(src=src,dst=dst,ttl=64,version=5)/UDP(sport=sport,dport=dport)),
+    ('version15', IP(src=src,dst=dst,ttl=64,version=15)/UDP(sport=sport,dport=dport)),
 ]:
-    sendp(eth/pkt, iface=iface, verbose=False)
-    results[name] = 'sent'
+    pkt /= Raw(forbidden[name])
+    if name == 'bad_checksum':
+        pkt = IP(bytes(pkt))
+        pkt.chksum ^= 1
+    frame = eth/pkt
+    sendp(frame, iface=iface, verbose=False)
+    results[name] = {{'sent': 1, 'frame': bytes(frame).hex()}}
 time.sleep(0.5)
 s.close()
 print(json.dumps(results))
 '''
-    result = await lan_run_python(r.lan, script, timeout=25, label="flowtable_exceptions")
-    assert result.rc == 0, result.stdout
+    ready = threading.Event()
+    # An IP/UDP filter can discard the malformed frames whose absence is being
+    # tested. Match only Ethernet, then search their unique markers as raw bytes.
+    sniffer = AsyncSniffer(iface=r.wan_if, store=True, started_callback=ready.set,
+                          filter=f"ether src {r.dut_wan_mac} or ether src {r.lan_mac}",
+                          timeout=60)
+    controls, report = set(), {"installed": before}
+
+    async def control(name):
+        seen = set(r.echo.received)
+        report[name] = await hardware_proof(r)
+        payloads = set(r.echo.received) - seen
+        assert len(payloads) == 256, (name, len(payloads))
+        controls.update(payloads)
+
+    sniffer.start()
+    try:
+        assert await asyncio.to_thread(ready.wait, 5), "exception WAN capture did not start"
+        await control("valid-before")
+        result = await lan_run_python(r.lan, script, timeout=25, label="flowtable_exceptions")
+        assert result.rc == 0, result.stdout
+        report["results"] = json.loads(result.stdout.strip())
+        await control("valid-after")
+        after = report["valid-after"]
+        assert {f["cookie"] for f in before["flows"]} == {f["cookie"] for f in after["flows"]}, report
+        assert (before["installs"], before["deletes"]) == (after["installs"], after["deletes"]), report
+        await asyncio.sleep(0.5)
+    finally:
+        if sniffer.running:
+            sniffer.stop(join=False)
+        await asyncio.to_thread(sniffer.join, 5)
+        assert not sniffer.thread.is_alive(), "exception WAN capture did not stop"
+        packets = list(sniffer.results or [])
+        wrpcap(str(artifact_dir() / "exceptions-wan.pcap"), packets)
+        r.record("exceptions", report)
+
+    leaked = {name: [bytes(packet).hex() for packet in packets if payload in bytes(packet)]
+              for name, payload in forbidden.items()}
+    report["leaked"] = leaked
+    r.record("exceptions", report)
+    assert not any(leaked.values()), ("malformed IPv4 frames escaped on the WAN", leaked)
+    received = []
+    for packet in packets:
+        if b"ASK-flowtable" not in bytes(packet):
+            continue
+        payload = udp_wire_payload(bytes(packet), source_ip=r.lan_ip, destination_ip=WAN_IP,
+                                   source_port=SPORT, destination_port=DPORT,
+                                   source_mac=r.dut_wan_mac, destination_mac=r.wan_mac)
+        assert payload in controls, packet.summary()
+        received.append(payload)
+    assert Counter(received) == Counter(controls), (len(received), len(controls))
     assert r.echo.received[b"ASK-options"] == 1
     assert r.echo.received[b"ASK-fragments".ljust(1024, b".")] == 1
     assert not r.echo.received[b"ASK-expired"]
-    assert not any(r.echo.received[p] for p in (b"ASK-badsum", b"ASK-version", b"ASK-version15"))
-    await r.exchange()
-    r.record("exceptions", {"results": json.loads(result.stdout.strip()), "state": await r.state()})
+    assert not any(r.echo.received[payload] for payload in forbidden.values())
 
 
 async def test_conntrack_timeout_extension(rig):
