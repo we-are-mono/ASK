@@ -1,6 +1,8 @@
 """The rig's classifier bucket model agrees with the SDK's own hash."""
 
 from ask_orch.process import run_process
+import json
+import ipaddress
 import os
 from pathlib import Path
 import random
@@ -74,3 +76,33 @@ def test_crowded_ipv4_ports_share_a_bucket_whatever_surrounds_them(tmp_path):
         portid, source, destination = rng.randrange(256), rng.randbytes(4), rng.randbytes(4)
         keys = [model.ipv4_key(portid, source, destination, 17, s, d) for s, d in pairs]
         assert len(set(run([(key, model.IPV4_MASK, 0) for key in keys]))) == 1
+
+
+def test_crowded_ipv4_can_overflow_a_bucket(tmp_path):
+    run = kernel_hash(tmp_path)
+    # One beyond the SDK's 32-key bucket cap. Run separately so an
+    # exponential search fails boundedly instead of hanging the host suite.
+    result = run_process([sys.executable, "-c", "import json; from _ehash_bucket import crowded_ipv4, CROWDED_DPORT_XORS; "
+                          "print(json.dumps(crowded_ipv4([48271 ^ n for n in CROWDED_DPORT_XORS])))"],
+                         cwd=ROOT / "tools/tests", capture_output=True, text=True, check=True, timeout=5)
+    pairs = json.loads(result.stdout)
+    assert len(pairs) == len({s for s, _ in pairs}) == 33
+    assert all(1024 <= s < 32768 for s, _ in pairs)
+    source, destination = bytes([192, 168, 1, 2]), bytes([10, 0, 0, 141])
+    forward = [model.ipv4_key(3, source, destination, 17, s, d) for s, d in pairs]
+    reverse = [model.ipv4_key(4, destination, source, 17, d, s) for s, d in pairs]
+    assert len(set(run([(key, model.IPV4_MASK, 0) for key in forward]))) == 1
+    assert len(set(run([(key, model.IPV4_MASK, 0) for key in reverse]))) == 33
+
+
+def test_crowded_multicast_groups_share_a_bucket(tmp_path):
+    run = kernel_hash(tmp_path)
+    groups = model.crowded_mcast_ipv4()
+    assert len(groups) == len(set(groups)) == 33
+    rng = random.Random(13)
+    for _ in range(16):
+        portid, source_mac, source = rng.randrange(256), rng.randbytes(6), rng.randbytes(4)
+        keys = [model.mcast_ipv4_key(portid, source_mac, source,
+                                    ipaddress.IPv4Address(group).packed) for group in groups]
+        assert all(len(key) == 22 for key in keys)
+        assert len(set(run([(key, model.MCAST_MASK, 0) for key in keys]))) == 1
