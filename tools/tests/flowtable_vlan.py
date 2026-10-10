@@ -9,13 +9,22 @@ only evidence the encapsulation reached the wire rather than just the rule.
 """
 from __future__ import annotations
 
-from _flowtable_vlan import (NAT_TABLE, SNAT_ADDR, VLAN_ID, VLAN_INNER, _direction, _established, _flows)
+import asyncio
+import secrets
+import threading
+from collections import Counter
+
+from _flowtable_vlan import (NAT_TABLE, SNAT_ADDR, VLAN_ID, VLAN_INNER, _direction, _established,
+                             _flows, _send_vlan_frames, _vlan_ingress_visible)
 
 import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from _flowtable_rig import DPORT, SPORT, WAN_IP, assert_undisturbed, command
+from _flowtable_rig import (DPORT, SPORT, TABLE, WAN_IP, artifact_dir, assert_undisturbed,
+                            command, ct_listing)
+from _flowtable_udp_wire import udp_wire_payload
 from _gated_tcp import GatedTcp
+from ask_orch.counters import kernel_tx_packets
 
 
 async def test_routed(vlan_rig):
@@ -88,6 +97,124 @@ async def test_qinq(vlan_rig):
     assert reverse["out_vlan"] == expected and reverse["in_vlan"] == "-", reverse
     assert all(d == 64 for d in delta.values()), delta
     r.record("vlan-qinq", {"flows": flows, "delta": delta})
+
+
+@pytest.mark.parametrize("vlan_rig", ["udp", "qinq"], indirect=True)
+@pytest.mark.parametrize("hardware", [False, True], ids=["software", "hardware"])
+async def test_installed_tuple_isolation(vlan_rig, hardware):
+    """An installed physical-port/5-tuple must not bypass VLAN isolation."""
+    from scapy.all import AsyncSniffer, Dot1Q, Ether, IP, Raw, UDP, wrpcap
+
+    r = vlan_rig
+    tags = r.vlan_tags
+    wrong = VLAN_ID % 4094 + 1
+    while wrong in tags:
+        wrong = wrong % 4094 + 1
+    negatives = {"wrong-vid": [wrong, *tags[1:]], "missing-tags": []}
+    if len(tags) == 2:
+        negatives.update({"missing-outer": tags[1:], "missing-inner": tags[:1],
+                          "wrong-inner": [VLAN_ID, wrong],
+                          "reversed-tags": list(reversed(tags))})
+    prefix = f"ASK-vlan-{secrets.token_hex(4)}-".encode()
+
+    def probes(name, stack, count):
+        payloads, frames = [], []
+        for n in range(count):
+            payload = prefix + f"{name}-{n}".encode()
+            payload = payload.ljust(128, b".")
+            packet = Ether(src=r.lan_mac, dst=r.dut_lan_mac)
+            for vid in stack:
+                packet /= Dot1Q(vlan=vid)
+            packet /= IP(src=r.lan_ip, dst=WAN_IP, ttl=64) / UDP(sport=SPORT, dport=DPORT) / Raw(payload)
+            payloads.append(payload)
+            frames.append(bytes(packet))
+        return payloads, frames
+
+    bad = {name: probes(name, stack, 4) for name, stack in negatives.items()}
+    # The physical LAN remains routable. Make the intended isolation explicit:
+    # an untagged packet with the same source is otherwise valid slow-path traffic.
+    await r.nft(f'''table inet {TABLE} {{
+ chain isolation {{ type filter hook forward priority -10; policy accept;
+ ip saddr {r.lan_ip} ip daddr {WAN_IP} udp sport {SPORT} udp dport {DPORT} \
+iifname != "{r.dut_vlan_if}" counter drop
+ }}
+}}''')
+    ready = threading.Event()
+    sniffer = AsyncSniffer(iface=r.wan_if, store=True, started_callback=ready.set,
+                          filter=f"ether src {r.dut_wan_mac} or ether src {r.lan_mac}")
+    reports, expected = {}, []
+    sniffer.start()
+    try:
+        assert await asyncio.to_thread(ready.wait, 5), "WAN VLAN capture did not start"
+        await _vlan_ingress_visible(r, [frame for _, frames in bad.values() for frame in frames])
+        await r.clear_ct()
+        await r.table(hardware=hardware)
+        if hardware:
+            installed = await r.admit()
+            assert _direction(installed["flows"], r.lan_ip, WAN_IP)["in_vlan"] == ".".join(map(str, tags))
+        else:
+            for _ in range(10):
+                await r.exchange(4)
+                if "[OFFLOAD]" in await ct_listing(r):
+                    break
+            assert "[OFFLOAD]" in await ct_listing(r)
+            installed = await r.state()
+            assert installed["entries"] == installed["bindings"] == 0, installed
+        # Raw injection owns no UDP socket on the LAN. Suppress replies so a
+        # port-unreachable cannot retire the connection under measurement.
+        r.echo.reply = False
+        cases = [("valid-before", probes("valid-before", tags, 32)), *bad.items(),
+                 ("valid-after", probes("valid-after", tags, 32))]
+        for name, (payloads, frames) in cases:
+            positive = name.startswith("valid-")
+            before = await r.state()
+            tx_before = await kernel_tx_packets(r.target, r.session, TARGET_WAN_IF)
+            sent = await _send_vlan_frames(r, frames, "vlan_tuple_isolation")
+            await asyncio.sleep(0.2)
+            after = await r.state()
+            software_tx = await kernel_tx_packets(r.target, r.session, TARGET_WAN_IF) - tx_before
+            reports[name] = {**sent, "before": before, "after": after, "software_tx": software_tx}
+            r.record("vlan-isolation", reports)
+            if not hardware:
+                assert "[OFFLOAD]" in await ct_listing(r), (name, reports[name])
+            assert_undisturbed(r, installed, after,
+                               {f["cookie"] for f in installed["flows"]} ==
+                               {f["cookie"] for f in after["flows"]} and
+                               (installed["installs"], installed["deletes"]) ==
+                               (after["installs"], after["deletes"]))
+            if positive:
+                expected.extend(payloads)
+                assert all(r.echo.received[payload] == 1 for payload in payloads), (name, r.echo.received)
+                if hardware:
+                    old = _direction(before["flows"], r.lan_ip, WAN_IP)
+                    new = _direction(after["flows"], r.lan_ip, WAN_IP)
+                    assert int(new["packets"]) - int(old["packets"]) == len(frames), reports[name]
+                    assert 0 <= software_tx <= 8, reports[name]
+                else:
+                    assert software_tx >= len(frames), reports[name]
+            # A rejected frame can hit the classifier before the tag check,
+            # so negative hardware-counter deltas are deliberately unconstrained.
+        await asyncio.sleep(0.5)
+    finally:
+        r.echo.reply = True
+        packets = list(sniffer.stop() or [])
+        wrpcap(str(artifact_dir() / "vlan-isolation-wan.pcap"), packets)
+
+    forbidden = [payload for payloads, _ in bad.values() for payload in payloads]
+    leaked = [bytes(packet).hex() for packet in packets
+              if any(payload in bytes(packet) for payload in forbidden)]
+    assert not leaked, ("wrong-tag frames escaped on the WAN", leaked)
+    assert not any(r.echo.received[payload] for payload in forbidden), r.echo.received
+    received = []
+    for packet in packets:
+        if prefix not in bytes(packet):
+            continue
+        payload = udp_wire_payload(bytes(packet), source_ip=r.lan_ip, destination_ip=WAN_IP,
+                                   source_port=SPORT, destination_port=DPORT,
+                                   source_mac=r.dut_wan_mac, destination_mac=r.wan_mac)
+        assert payload is not None, packet.summary()
+        received.append(payload)
+    assert Counter(received) == Counter(expected), (received, expected)
 
 
 async def test_device_mtu_retires(vlan_rig):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 
 import pytest
 import pytest_asyncio
@@ -20,6 +21,9 @@ from _topology import (
     lan_vlan_subif,
 )
 from ask_orch.client import Agent
+from ask_orch.commands import console_json, console_python
+from ask_orch.uart import Console
+from ask_orch.artifacts import artifact_dir
 
 # Claimed in _topology.py's VLAN ID conventions block. 271 carries the tagged
 # LAN; 272 is the inner tag of the QinQ case, stacked on top of 271 so the wire
@@ -57,6 +61,101 @@ def _direction(flows, source, destination):
                 and f["dst"].startswith(destination + ":")]
     assert len(matching) == 1, (source, destination, flows)
     return matching[0]
+
+
+async def _send_vlan_frames(r, frames, label):
+    """Send serialized frames on the physical peer, without its VLAN devices."""
+    result = await r.run_peer(f'''
+import json, socket, time
+frames = [bytes.fromhex(frame) for frame in {[frame.hex() for frame in frames]!r}]
+with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as wire:
+    wire.bind(({r.peer_link!r}, 0))
+    for frame in frames:
+        assert wire.send(frame) == len(frame)
+        time.sleep(0.003)
+print(json.dumps({{"sent": len(frames), "bytes": sum(map(len, frames))}}))
+''', timeout=10, label=label)
+    assert result.rc == 0, result.stdout
+    report = json.loads(result.stdout.strip())
+    assert report == {"sent": len(frames), "bytes": sum(map(len, frames))}, report
+    return report
+
+
+async def _vlan_ingress_visible(r, frames):
+    """Prove every negative tag stack reaches the DUT before installing a flow.
+
+    A hardware rejection need not punt to Linux. Calibrate the same frames
+    with no flowtable, so a switch dropping an unfamiliar VID cannot pass the
+    later isolation test. The offset alternatives cover zero, one and two tags
+    without libpcap's stateful `vlan` filter changing subsequent offsets.
+    """
+    from scapy.all import rdpcap
+
+    assert (await r.state())["entries"] == 0
+    ready = f"/tmp/ask-vlan-capture-{time.monotonic_ns()}"
+    bpf = (f"ether src {r.lan_mac} and ether dst {r.dut_lan_mac} and (" +
+           " or ".join(f"ether[{offset}:4] = 0x41534b2d" for offset in (42, 46, 50)) + ")")
+    script = f'''
+import json, pathlib, subprocess, tempfile, time
+ready = pathlib.Path({ready!r})
+with tempfile.TemporaryDirectory(prefix='ask-vlan-capture-') as directory:
+    pcap = pathlib.Path(directory) / 'ingress.pcap'
+    log = pathlib.Path(directory) / 'tcpdump.log'
+    with log.open('wb') as stderr:
+        proc = subprocess.Popen(['tcpdump', '-p', '-n', '-U', '-Z', 'root', '--immediate-mode',
+                                 '-i', {TARGET_LAN_IF!r}, '-c', {str(len(frames))!r},
+                                 '-w', str(pcap), {bpf!r}],
+                                stdout=subprocess.DEVNULL, stderr=stderr)
+        complete = False
+        try:
+            deadline = time.monotonic() + 5
+            while 'listening on' not in log.read_text():
+                assert proc.poll() is None and time.monotonic() < deadline, log.read_text()
+                time.sleep(0.02)
+            ready.write_text('ready')
+            try:
+                complete = proc.wait(timeout=10) == 0
+            except subprocess.TimeoutExpired:
+                pass
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            ready.unlink(missing_ok=True)
+    print(json.dumps({{'complete': complete, 'pcap': pcap.read_bytes().hex(),
+                      'stderr': log.read_text()}}))
+'''
+    with Console.target() as con:
+        task = asyncio.create_task(console_python(con, script, timeout=20))
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                if task.done():
+                    await task
+                    pytest.fail("DUT VLAN capture ended before becoming ready")
+                status = await r.target.fs_read(r.session, ready)
+                if status["errno"] == 0:
+                    assert bytes.fromhex(status["content_hex"]) == b"ready", status
+                    break
+                assert status["errno"] == 2, status
+                assert time.monotonic() < deadline, "DUT VLAN capture did not start"
+                await asyncio.sleep(0.05)
+            sent = await _send_vlan_frames(r, frames, "vlan_ingress_calibration")
+        finally:
+            # Let the bounded process finish its own cleanup even if sending fails.
+            await asyncio.gather(task, return_exceptions=True)
+        report = console_json(task.result()["stdout"])
+    path = artifact_dir() / "vlan-isolation-ingress.pcap"
+    path.write_bytes(bytes.fromhex(report.pop("pcap")))
+    captured = [bytes(packet) for packet in rdpcap(str(path))]
+    r.record("vlan-isolation-ingress", {**report, **sent,
+                                       "frames": [frame.hex() for frame in captured]})
+    assert report["complete"], report
+    assert captured == frames, ("negative probes did not arrive intact at the DUT", captured, frames)
 
 
 async def _tagged_segment(r, stack, inner):
@@ -106,6 +205,7 @@ async def vlan_rig(target_agent, aiohttp_session, lan, splat_window, request):
     assert shape in {"udp", "tcp", "qinq"}
     r = Rig()
     r.proto = "tcp" if shape == "tcp" else "udp"
+    r.vlan_tags = [VLAN_ID, VLAN_INNER] if shape == "qinq" else [VLAN_ID]
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     await stop_boot_daemon()
