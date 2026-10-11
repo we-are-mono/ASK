@@ -1103,24 +1103,22 @@ IPv6 the hop-by-hop, routing and leading destination-options headers that
 precede ESP; and the offset of the next-header byte SEC swaps for ESP: 1 for
 IPv4's protocol byte or the IPv6 fixed header's, otherwise the extension
 header, in eight-byte units, whose first byte it is. A header the word cannot
-describe — not in the linear area, or longer than 132 bytes — fails the frame
+describe — not in the linear area, or longer than 134 bytes — fails the frame
 rather than send it encrypted wrong.
 
-The 132 bytes are FMan's, not SEC's. SEC's output goes to the IPsec offline
-port behind 18 bytes of Ethernet and the SA's tag, and FMan's parser
-classifies a frame whose transport header ends within its first 158 bytes
-but discards most frames whose header ends later, counting them only in the
-port's `port_rx_filter_frame`. Measured with IPv6 extension headers, ESP's
-SPI and sequence number ending at byte 154 of SEC's output were classified
-32 times in 32, ending at 162 twice; the physical ports show the same edge
-for plain UDP, and reach it sooner for TCP, whose header is longer
-(ISSUES.md A367). So the longest IPv6 header SEC is given is 128 bytes, 88
-of them extension headers, leaving room for ESP's or a UDP header's eight
-bytes; the old bound, the eight-bit field, let SEC number frames the offline
-port then discarded unseen (A366). A decrypted TCP header is longer: an
-inbound transport TCP packet whose IPv6 header is over about 100-120 bytes
-passes the port as ESP, is decrypted, and is discarded by the offline port,
-which the driver cannot tell before decryption.
+The 134 bytes are FMan's, not SEC's. SEC's output goes to the IPsec offline
+port behind 18 bytes of Ethernet and the SA's tag, and FMan's parser reads
+no further than byte 160 of a frame ([the parser's reach](../in-kernel-pcd.md#the-parsers-reach)):
+a header it cannot finish there gets the frame discarded. Measured with IPv6
+extension headers, ESP's SPI and sequence number ending at byte 154 of SEC's
+output were classified 32 times in 32, ending at 162 twice. So the longest
+IPv6 header SEC is given is 128 bytes, 88 of them extension headers, leaving
+room for ESP's or a UDP header's eight bytes; the old bound, the eight-bit
+field, let SEC number frames the offline port then discarded unseen (A366).
+A decrypted TCP header is longer: an inbound transport TCP packet whose IPv6
+header is over about 100-120 bytes passes the port as ESP, is decrypted, and
+is discarded by the offline port, which the driver cannot tell before
+decryption.
 
 **An inbound transport frame names its own header too.** The decap PDB
 states a plain header naming ESP in its fixed part (40 bytes, offset 1, or
@@ -1136,7 +1134,7 @@ trailer as `xfrm6_transport_finish()` would. Told nothing, SEC read the
 first extension header or option as ESP and refused every such frame (A364).
 ESP the stack found anywhere else, behind a UDP header say, or a header past
 the bound above, is given back unsubmitted and dropped as
-`XfrmInStateMismatch`. A tunnel's word stays zero. One more thing the stack
+`XfrmInStateMismatch`. One more thing the stack
 leaves for the submit: it writes its address into a Record Route or
 Timestamp option of a packet it delivers, after checking the header
 checksum and without updating it, and SEC only updates the checksum of the
@@ -1144,6 +1142,30 @@ header it passes on. The decrypted packet then carried a stale checksum and
 the offline port discarded it, so the submit recomputes a header with
 options whose checksum no longer holds, unsharing it first: a raw socket's
 clone may share it.
+
+**An inbound tunnel frame names its outer header.** A tunnel SA's decap PDB
+states a plain outer header too: 20 or 40 bytes, and a UDP header behind
+them for ESP-in-UDP. IPv6 tunnel ESP behind extension headers misses the
+port's ESP table, and the soft parser sends IPv4 ESP or UDP behind options to
+the CPU, ESP-in-UDP among it, since the port's UDP table hands that to SEC by
+ports the soft parser cannot see (`ipv4schema`, every port but the offline
+one; Linux's own flowtable leaves IPv4 options to the stack as well). The
+submit used to give SEC a tunnel's frame with DPOVRD zero, the PDB as it
+stands, and SEC read the options or extension headers as ESP and refused
+every such frame (A368). `dpa_ipsec_inb_dpovrd()` now gives a tunnel frame
+the tunnel protocol's own word (SEC RM table 9-27): the override bit and the
+length of everything ahead of ESP, which SEC strips, in its twelve-bit
+field. The frame has to arrive the way the state receives — in UDP for a
+state with an encapsulation, behind exactly a UDP header, bare otherwise —
+which `xfrm_input()` would check only after the submit; anything else is
+given back and dropped as `XfrmInStateMismatch`. The outer header goes with
+the rest, so its checksum is left as it is. The submit moves such a frame
+back to its MAC header by as many bytes again, which a `u8` had counted.
+`flowtable_service_ipsec_outer_headers.py` sends tunnel ESP with IPv4
+options, IPv6 hop-by-hop and destination options, and ESP-in-UDP with IPv4
+options, and checks each is delivered to the LAN through the CPU's submit;
+frames whose ESP ends past the parser's reach are counted as the port's
+receive drops instead.
 
 **The offline port's TTL check spares ESP.** The soft parser sends a frame
 with a TTL or hop limit of 1 or 0 to the CPU before any forwarding entry can

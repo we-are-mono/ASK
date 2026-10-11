@@ -2653,9 +2653,29 @@ static void port_mac_rx_advance(struct eth_iface_info *eth)
 	count->ready = true;
 }
 
+/* The BMI's filter count is every frame it discarded for a status bit its
+ * discard mask holds. That is any discard an FMan engine chose -- a policer's
+ * red or yellow (the punt and SEC meters, an offloaded tc police), the
+ * microcode's for a frame whose headers ran past the 160 bytes the parser
+ * reaches (the first 256-byte internal buffer, less the DTS buffer-layout's
+ * 96 bytes of manipulation headroom; A367) or a header it found in error --
+ * a frame longer than the port's maximum, and the frames the MAC passed on cut
+ * short. Those last are the bad-frame count, which the MAC's own drop count
+ * below already has; the rest are refused. Each was taken in whole and
+ * delivered nowhere. Subtracting holds while the bad frames stay in the
+ * discard mask, as they are by default (FM_RFSDM_DEFAULT): moved to the error
+ * queue they would leave the filter count and the difference would stop
+ * moving. The filter count is read first, so a bad frame between the two
+ * reads goes missing from the difference for a reading rather than counting
+ * twice, and the difference is never reported lower than it was. */
 static void port_rx_drops_advance(struct eth_iface_info *eth)
 {
 	port_bmi_advance(eth, e_FM_PORT_COUNTERS_DISCARD_FRAME, &eth->rx_discarded);
+	port_bmi_advance(eth, e_FM_PORT_COUNTERS_RX_FILTER_FRAME, &eth->rx_filtered);
+	port_bmi_advance(eth, e_FM_PORT_COUNTERS_RX_BAD_FRAME, &eth->rx_bad);
+	if (eth->rx_filtered.total > eth->rx_bad.total &&
+	    eth->rx_filtered.total - eth->rx_bad.total > eth->rx_refused)
+		eth->rx_refused = eth->rx_filtered.total - eth->rx_bad.total;
 	port_bmi_advance(eth, e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD,
 			 &eth->rx_no_buffer);
 	port_mac_rx_advance(eth);
@@ -2803,11 +2823,13 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 					 wire ? 0 : tx.bytes, wire ? 0 : tx.packets,
 					 CDX_IFSTATS_PORT_RX_OVERHEAD, 0);
 			/* Received, then dropped by FMan: refused at the
-			 * enqueue, or with no buffer to take it in (A339). Or
-			 * never handed to it whole, the MAC's FIFO full (A352):
-			 * missed, as a frame there was no room for. */
+			 * enqueue, by a policer or by the classifier, or with
+			 * no buffer to take it in (A339, A367). Or never handed
+			 * to it whole, the MAC's FIFO full (A352): missed, as a
+			 * frame there was no room for. */
 			port_rx_drops_advance(&iface_info->eth_info);
-			storage->rx_dropped += iface_info->eth_info.rx_discarded.total;
+			storage->rx_dropped += iface_info->eth_info.rx_discarded.total +
+					       iface_info->eth_info.rx_refused;
 			storage->rx_missed_errors += iface_info->eth_info.rx_no_buffer.total +
 						     iface_info->eth_info.rx_mac_dropped.total;
 			break;

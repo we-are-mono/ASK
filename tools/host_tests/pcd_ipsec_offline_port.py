@@ -75,9 +75,11 @@ def test_soft_parser_scope():
         assert checks[0].get('expr') == (f'({limit} == 1 or {limit} == 0) and '
                                          f'($logicalportid != 9 or {protocol} != 0x32)'), schema
     # An inbound SA's PDB states a plain IPv4 header: ESP behind options goes
-    # to the CPU from every port but the offline one, whose ESP is SEC's.
+    # to the CPU from every port but the offline one, whose ESP is SEC's, and
+    # so does UDP behind options, ESP-in-UDP among it.
     options = tree.findall("protocol[@name='ipv4schema']/execute-code/before/if")[1]
-    assert options.get('expr') == '$logicalportid != 9 and ipv4.nextp == 0x32 and ipv4.hlen != 5'
+    assert options.get('expr') == ('$logicalportid != 9 and (ipv4.nextp == 0x32 or ipv4.nextp == 0x11) '
+                                   'and ipv4.hlen != 5')
     assert options.find("if-true/assign-variable[@name='$nia']").get('value') == '0x500002'
 
 

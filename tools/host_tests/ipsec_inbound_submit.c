@@ -42,6 +42,7 @@ typedef uint32_t u32;
 
 struct iphdr { u8 ihl:4, version:4; u8 tos, tot_len[2], id[2], frag_off[2], ttl, protocol; u16 check; u8 addrs[8]; };
 struct ipv6hdr { u8 version_class[4]; u8 payload_len[2]; u8 nexthdr; u8 hop_limit; u8 addrs[32]; };
+struct udphdr { u16 source, dest, len, check; };
 /* Where the stack found the header it hands on: the byte naming it. */
 struct inet6_skb_parm { u16 nhoff; };
 
@@ -80,11 +81,13 @@ struct sk_buff {
 	struct inet6_skb_parm cb6;
 };
 #define IP6CB(skb) (&(skb)->cb6)
-/* What the submit reads of the state: its handle, its mode and the device it
- * is bound to. */
+/* What the submit reads of the state: its handle, its mode, whether it is
+ * received in UDP and the device it is bound to. */
+struct xfrm_encap_tmpl { u16 encap_type; };
 struct xfrm_state {
 	u16 handle;
 	struct { u8 mode; } props;
+	struct xfrm_encap_tmpl *encap;
 	struct { struct net_device *dev; } xso;
 };
 
@@ -288,7 +291,8 @@ static void setup(void)
 	memcpy(devices, all, sizeof(all));
 }
 
-static _Alignas(8) u8 buffer[256], original[256];
+/* Room for a tunnel's longest outer header, and a little past it. */
+static _Alignas(8) u8 buffer[4352], original[4352];
 static struct sk_buff skb;
 /* Where the frame's ESP starts, and the DPOVRD value SEC is to be given. */
 static unsigned char *start;
@@ -336,7 +340,7 @@ static void frame(struct net_device *dev, unsigned l3, unsigned l2)
 /* As frame() on a port, but IPv6, with `n` extension headers of the given
  * types and eight-byte lengths ahead of ESP, and the stack's note of the byte
  * naming ESP. */
-static void frame6(struct net_device *dev, const u8 *types, const u8 *units, int n)
+static void frame6(struct net_device *dev, const u8 *types, const u16 *units, int n)
 {
 	unsigned l3 = 14, at = l3 + 6, off = l3 + 40;
 
@@ -547,35 +551,157 @@ static void test_headers(void)
 	assert(want == word(40, 1));
 	taken(submit(), &eth3_priv, &eth3_dma);
 	/* ...or the last extension header's, in eight-byte units. */
-	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){1}, 1);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){1}, 1);
 	assert(want == word(48, 5));
 	taken(submit(), &eth3_priv, &eth3_dma);
-	frame6(&eth3, (u8[]){NEXTHDR_HOP, NEXTHDR_DEST}, (u8[]){1, 2}, 2);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP, NEXTHDR_DEST}, (u16[]){1, 2}, 2);
 	assert(want == word(64, 6));
 	taken(submit(), &eth3_priv, &eth3_dma);
 
 	/* The byte the stack found ESP by has to name it. */
-	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){1}, 1);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){1}, 1);
 	skb.cb6.nhoff = 6;
 	handed_back(submit());
 
 	/* Up to the longest header the offline port reliably parses past in
 	 * SEC's output, and no further. */
-	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){11}, 1);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){11}, 1);
 	assert(want == word(128, 5));
 	taken(submit(), &eth3_priv, &eth3_dma);
-	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){12}, 1);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){12}, 1);
+	handed_back(submit());
+}
+
+/* A tunnel SA's value: the length of the outer header material SEC strips. */
+static u32 strip(unsigned len)
+{
+	return DPOVRD_ENABLE | len;
+}
+
+/* As frame() on a port, with an IPv4 header `ihl` words long and, for
+ * ESP-in-UDP, a UDP header between it and ESP. */
+static void frame4(unsigned ihl, bool udp)
+{
+	unsigned len = ihl * 4 + (udp ? 8 : 0);
+
+	frame(&eth3, 14, 14);
+	buffer[14] = (u8)(0x40 | ihl);
+	buffer[14 + 9] = udp ? IPPROTO_UDP : IPPROTO_ESP;
+	skb.data = start = buffer + 14 + len;
+	want = strip(len);
+	memcpy(original, buffer, sizeof(buffer));
+}
+
+/* frame6()'s frame in UDP: the byte the stack found the next header by names
+ * UDP, and ESP follows a UDP header. */
+static void udp6(void)
+{
+	buffer[14 + skb.cb6.nhoff] = IPPROTO_UDP;
+	skb.data = start = skb.data + 8;
+	memcpy(original, buffer, sizeof(buffer));
+}
+
+/* What SEC is told of a tunnel frame's outer header. Its SA's PDB states a
+ * plain one, so each frame gives everything ahead of ESP, which SEC strips,
+ * IPv4 options and IPv6 extension headers included -- provided it came the
+ * way the state receives: in UDP for a state with an encapsulation, bare
+ * otherwise. */
+static void test_tunnel_headers(void)
+{
+	static struct xfrm_encap_tmpl espinudp = { 2 };
+
+	sa.xso.dev = &eth3;
+	sa.props.mode = XFRM_MODE_TUNNEL;
+
+	/* IPv4, plain and with options. The outer header goes, checksum and
+	 * all, so a stale one is left as it is. */
+	frame4(5, false);
+	taken(submit(), &eth3_priv, &eth3_dma);
+	frame4(6, false);
+	assert(ip_fast_csum(buffer + 14, 6));
+	taken(submit(), &eth3_priv, &eth3_dma);
+	assert(!checksum_writes && !bench.cows);
+	frame4(15, false);
+	assert(want == strip(60));
+	taken(submit(), &eth3_priv, &eth3_dma);
+	/* A header length that is not where the stack found ESP. */
+	frame4(6, false);
+	buffer[14] = 0x45;
+	memcpy(original, buffer, sizeof(buffer));
 	handed_back(submit());
 
-	/* A tunnel's frame keeps its SA's PDB, whatever its header. */
-	sa.props.mode = XFRM_MODE_TUNNEL;
-	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){1}, 1);
-	want = 0;
+	/* IPv6, plain and with extension headers, past a transport word's
+	 * eight bits... */
+	frame6(&eth3, NULL, NULL, 0);
+	want = strip(40);
 	taken(submit(), &eth3_priv, &eth3_dma);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP, NEXTHDR_DEST}, (u16[]){1, 2}, 2);
+	want = strip(64);
+	taken(submit(), &eth3_priv, &eth3_dma);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){32}, 1);
+	want = strip(296);
+	taken(submit(), &eth3_priv, &eth3_dma);
+	/* ...up to its twelve, the whole way back to the MAC header counted:
+	 * that is how much SEC is given. */
+	frame6(&eth3, (u8[]){NEXTHDR_HOP, NEXTHDR_DEST}, (u16[]){256, 250}, 2);
+	want = strip(4088);
+	taken(submit(), &eth3_priv, &eth3_dma);
+	assert(skb.data == buffer && skb.len == 100 + 14 + 4088);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP, NEXTHDR_DEST}, (u16[]){256, 251}, 2);
+	handed_back(submit());
+	/* What SEC refuses to queue goes back moved by as much. */
+	frame6(&eth3, (u8[]){NEXTHDR_HOP, NEXTHDR_DEST}, (u16[]){256, 250}, 2);
+	bench.enqueue_result = -5;
+	assert(submit() == -1 && bench.releases == 1);
+	assert(skb.data == start && skb.len == 100);
+	/* The byte the stack found ESP by has to name it. */
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){1}, 1);
+	skb.cb6.nhoff = 6;
+	handed_back(submit());
+
+	/* ESP-in-UDP: the UDP header goes too... */
+	sa.encap = &espinudp;
+	frame4(5, true);
+	assert(want == strip(28));
+	taken(submit(), &eth3_priv, &eth3_dma);
+	frame4(6, true);
+	taken(submit(), &eth3_priv, &eth3_dma);
+	assert(!checksum_writes && !bench.cows);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){1}, 1);
+	udp6();
+	want = strip(56);
+	taken(submit(), &eth3_priv, &eth3_dma);
+	/* ...but bare ESP is not how such a state receives... */
+	frame4(5, false);
+	handed_back(submit());
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){1}, 1);
+	handed_back(submit());
+	/* ...nor is ESP without a whole IP and UDP header ahead of it. */
 	frame(&eth3, 14, 14);
-	want = 0;
-	taken(submit(), &eth3_priv, &eth3_dma);
+	buffer[14 + 9] = IPPROTO_UDP;
+	skb.data = start = buffer + 14 + 8;
+	memcpy(original, buffer, sizeof(buffer));
+	handed_back(submit());
+	frame4(6, true);
+	buffer[14] = 0x45;
+	memcpy(original, buffer, sizeof(buffer));
+	handed_back(submit());
+
+	/* A state without one takes nothing the stack found in UDP. */
+	sa.encap = NULL;
+	frame4(5, true);
+	handed_back(submit());
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u16[]){1}, 1);
+	udp6();
+	handed_back(submit());
+
+	/* Nor is a transport state received in UDP, which is never
+	 * offloaded. */
 	sa.props.mode = XFRM_MODE_TRANSPORT;
+	sa.encap = &espinudp;
+	frame4(5, true);
+	handed_back(submit());
+	sa.encap = NULL;
 }
 
 int main(void)
@@ -584,5 +710,6 @@ int main(void)
 	test_ports();
 	test_other_devices();
 	test_headers();
+	test_tunnel_headers();
 	return 0;
 }

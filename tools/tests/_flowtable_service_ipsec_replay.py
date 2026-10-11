@@ -238,20 +238,31 @@ class Inbound:
         # The fixture's receiving policy names this reqid, so what SEC
         # decrypts for this SA is forwarded as the fixture's own SA would be.
         # Windows above 32 reach the kernel as an ESN-format replay state.
+        # The fixture's encapsulation and outer family come with it.
+        transform = self.r.ipsec.transform
+        encap = (["encap", "espinudp", str(transform.encap[1]), str(transform.encap[0]), "0.0.0.0"]
+                 if transform.encap else [])
+        mixed = ["flag", "af-unspec"] if transform.outer6 else []
         await self.r.ipsec.add(self.r.target, "state", self.r.ipsec.state("in", self.spi),
-                               "mode", "tunnel", "reqid", REQIDS["in"], *self.algorithms,
+                               "mode", "tunnel", "reqid", REQIDS["in"], *self.algorithms, *encap, *mixed,
                                "replay-window", str(self.window),
                                "offload", "packet", "dev", TARGET_WAN_IF, "dir", "in")
 
+    def sealed(self, seq):
+        """ESP for `seq`, header to ICV, around the marked datagram to the LAN
+        end."""
+        from scapy.all import IP, UDP, Raw
+        payload = self.marker + struct.pack("!II", self.spi, seq)
+        inner = IP(src=INNER, dst=LAN_INNER, ttl=64) / UDP(sport=DPORT, dport=RPORT) / Raw(payload.ljust(64, b"."))
+        return esp(self.algorithms, self.spi, seq, bytes(inner))
+
     def packet(self, seq):
         """The frame for `seq`, built once: every replay is byte-identical."""
-        from scapy.all import IP, UDP, Raw
+        from scapy.all import IP, Raw
         if seq not in self.frames:
-            payload = self.marker + struct.pack("!II", self.spi, seq)
-            inner = IP(src=INNER, dst=LAN_INNER, ttl=64) / UDP(sport=DPORT, dport=RPORT) / Raw(payload.ljust(64, b"."))
             self.ident = (self.ident + 1) & 0xFFFF
             self.frames[seq] = IP(src=WAN_IP, dst=self.r.ipsec.outer, ttl=64, id=self.ident, proto=50) / Raw(
-                esp(self.algorithms, self.spi, seq, bytes(inner)))
+                self.sealed(seq))
         return self.frames[seq]
 
     async def send(self, frames):

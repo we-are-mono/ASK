@@ -1,4 +1,4 @@
-From 3374af185a5898e6fc3dc983ae7cb63f4f2f747c Mon Sep 17 00:00:00 2001
+From 11f9e33f542f72185c2dbbc4c429921c5488a46e Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 23:30:35 +0200
 Subject: [PATCH] sdk_dpaa: hold RCU across the offload module's transmit hooks
@@ -25,7 +25,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 62 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 5299eb6aea85..10efec382a80 100644
+index f38e20bd018a..c8af7b8ad379 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -82,7 +82,10 @@ int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_
@@ -53,7 +53,7 @@ index 5299eb6aea85..10efec382a80 100644
  void dpa_unregister_ipsec_fq_handler(void)
  {
  	WRITE_ONCE(cdx_get_ipsec_fq_hookfn, NULL);
-@@ -1615,11 +1620,7 @@ static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
+@@ -1619,11 +1624,7 @@ static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
  	return dpa_ipsec_transport_dpovrd(nh, hdr_len, at, IPPROTO_ESP, dpovrd);
  }
  
@@ -66,7 +66,7 @@ index 5299eb6aea85..10efec382a80 100644
  {
  	struct xfrm_state *x;
  	struct qman_fq *egress_fq = NULL;
-@@ -1726,6 +1727,25 @@ static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_dev
+@@ -1730,6 +1731,25 @@ static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_dev
  	return err;
  }
  
@@ -92,7 +92,7 @@ index 5299eb6aea85..10efec382a80 100644
  /* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
   * its private area. The ops table is the driver's own, and dpa_ndo_init is
   * the one member of it exported, so no other driver's ops carry it: the test
-@@ -1801,7 +1821,8 @@ static bool dpa_ipsec_inb_dpovrd(const struct xfrm_state *x,
+@@ -1827,7 +1847,8 @@ static bool dpa_ipsec_inb_dpovrd(const struct xfrm_state *x,
   * skb is as it came, a stale IPv4 header checksum at most put right, for
   * xfrm_input() to decide what becomes of it.
   */
@@ -102,7 +102,7 @@ index 5299eb6aea85..10efec382a80 100644
  {
  	struct qman_fq *sec_fq = NULL;
  	struct dpa_priv_s	*priv = NULL;
-@@ -1967,13 +1988,26 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+@@ -1998,13 +2019,26 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  	skb->data += tmp_len;
  	return -1; /* give packet to linux */
  }
@@ -130,7 +130,7 @@ index 5299eb6aea85..10efec382a80 100644
  {
  	struct dpa_priv_s	*priv;
  	struct dpa_percpu_priv_s *percpu_priv;
-@@ -2062,6 +2096,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -2093,6 +2127,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  	conf_fq = priv->conf_fqs[queuenum  & (DPAA_ETH_TX_QUEUES-1)];
  	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
  }

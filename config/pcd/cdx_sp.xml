@@ -91,10 +91,13 @@
           </if-true>
         </if>
 	<!-- SEC decrypts an inbound SA's frames against the 20-byte header its
-	     PDB states, and would read IPv4 options as ESP: such a frame goes to
-	     the CPU, which tells SEC the header's length per frame. On the IPsec
-	     offline port ESP is SEC's own output. -->
-        <if expr="$logicalportid != 9 and ipv4.nextp == 0x32 and ipv4.hlen != 5">
+	     PDB states, a UDP header behind it for ESP-in-UDP, and would read
+	     IPv4 options as ESP: such a frame goes to the CPU, which tells SEC
+	     the header's length per frame. The port's UDP table hands ESP-in-UDP
+	     to SEC by ports this cannot see, so all UDP with options goes, as
+	     Linux's own flowtable leaves it to the stack too (ip_has_options()).
+	     On the IPsec offline port ESP is SEC's own output. -->
+        <if expr="$logicalportid != 9 and (ipv4.nextp == 0x32 or ipv4.nextp == 0x11) and ipv4.hlen != 5">
           <if-true>
             <assign-variable name="$nia" value="0x500002"/>
             <assign-variable name="$hpnia" value="0x500002"/>

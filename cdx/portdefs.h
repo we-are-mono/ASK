@@ -112,10 +112,15 @@ struct eth_iface_info {
 	 * reported below what was reported before (packets, bytes).
 	 * last_frames is the last reading's frames, which fewer than says the
 	 * MAC's counts were reset. Receive adds what the port took in and FMan
-	 * then dropped: frames its enqueues lost to a congestion group, as
-	 * drops, and frames it found no buffer for, as missed -- each a 32-bit
-	 * BMI count carried past its wrap -- and frames the MAC dropped itself,
-	 * its FIFO full, as missed too. link_speed is the Mbit/s the link ran
+	 * then dropped: frames its enqueues lost to a congestion group and
+	 * frames an FMan engine refused -- a policer's, or the classifier's for
+	 * a header in error or one past the parser's reach (A367) -- as drops,
+	 * and frames it found no buffer for, as missed -- each a 32-bit BMI
+	 * count carried past its wrap. The refused are the BMI's filter count
+	 * less its bad frames, which it also holds and the MAC's count below
+	 * already has, never reported below what was reported before
+	 * (rx_refused). And frames the MAC dropped itself, its FIFO full, as
+	 * missed too. link_speed is the Mbit/s the link ran
 	 * at as CDX took the port, or last reported since -- the MAC's fastest
 	 * while it has reported none -- which a reading from the statistics
 	 * hook is timed by; zero until the port's queues are all made, and no
@@ -128,7 +133,8 @@ struct eth_iface_info {
 		u64 packets, bytes;
 		uint32_t link_speed;
 	} tx_wire;
-	struct port_bmi_count rx_discarded, rx_no_buffer;
+	struct port_bmi_count rx_discarded, rx_filtered, rx_bad, rx_no_buffer;
+	u64 rx_refused;
 	struct port_mac_count rx_mac_dropped;
 	uint32_t rx_channel_id;		//channel id rx
 	uint32_t tx_channel_id;		//channel id tx

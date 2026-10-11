@@ -178,6 +178,15 @@
 			 */
 			total-fifo-size = <0x3e500>;
 
+			/* Each port's buffer-layout is <headroom alignment>. The
+			 * headroom is where the microcode inserts the headers an
+			 * entry adds, and it is taken from the parser's 256-byte
+			 * window: at 0x60 the parser reaches byte 160 of a frame,
+			 * and a frame whose headers run further may be dropped
+			 * (docs/in-kernel-pcd.md, "The parser's reach"). The IPsec
+			 * driver's DPA_IPSEC_PARSE_REACH follows it.
+			 */
+
 			/* Offline ports for CDX - cell-index overridden for SDK compatibility:
 			 * fman0_oh_0x3 (port@83000) = cell-index 1 (SDK style)
 			 * fman0_oh_0x4 (port@84000) = cell-index 2 (SDK style)

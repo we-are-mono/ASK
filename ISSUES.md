@@ -152,28 +152,19 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A368 — inbound tunnel-mode ESP behind outer IPv6 extension headers or IPv4 options is never decrypted.**
-  Source-verified, inherited from NXP (its submit always passed DPOVRD 0). The tunnel decap PDB states the plain
-  outer header (`cdx_ipsec_build_in_sa_pdb()`: `sa->header_len`, +8 for NAT-T). Such a frame misses the port's ESP6
-  table, and IPv4 ESP behind options now goes to the CPU too (`cdx_sp.xml` `ipv4schema`), so it reaches
-  `dpaa_submit_inb_pkt_to_SEC()`, whose `dpa_ipsec_inb_dpovrd()` gives a tunnel 0: SEC reads the extension
-  header or option as ESP and refuses it. NAT-T frames with options still reach SEC from the port. Fix direction:
-  a tunnel decap word, OVRD plus the outer header material length (SEC RM table 9-27, bits 11-0, AOIPHO 0), and the
-  NAT-T options case punted like plain ESP. Check: hand-built tunnel ESP with an outer hop-by-hop header or IPv4
-  options (`_flowtable_service_ipsec_replay.esp()`), delivered to the LAN.
+- [ ] **A370 — frames the soft parser sends to the CPU bypass the devlink punt meter.** `cdx_sp.xml` punts TTL or hop
+  limit 0/1, IPv4 ESP or UDP behind options (A364/A368) and PPPoE control frames with `$nia`/`$hpnia` 0x500002, straight
+  to the BMI enqueue, while ordinary exceptions go through the punt policer (`$nia` 0x4C0000, devlink trap policer 1).
+  A flood of such frames reaches the CPU unmetered whatever `devlink trap policer set` says; only the CPU queues'
+  congestion group bounds it. Found reviewing A368; pre-existing for TTL and PPPoE. Fix direction: punt through the
+  policer (its profile then enqueues) and check the KeyGen/CC path a half-parsed frame then takes, under the XML gate.
 
-- [ ] **A367 — FMan discards most frames whose transport header ends past ~byte 158, counted only as filtered.**
-  Measured 2026-10-11, pre-existing (seen on the image before the A364-A366 fix), not IPsec-specific. Plain IPv6
-  UDP to the DUT with 96 bytes of hop-by-hop or destination options (UDP header ending at frame byte 158) arrives
-  32/32; with 104 (166) ~5/32, the rest in the WAN RX port's `port_rx_filter_frame` (`1a91000.port`). A TCP SYN
-  (40-byte header) loses most frames already at 88 bytes of options (header ending at 182). The IPsec offline port
-  drops SEC's output the same way: ESP's SPI and sequence ending at byte 154, 32/32; at 162, 2/32. So IPv6 with
-  long extension headers, TCP soonest, is lost on receive. Not explained by the RM or errata; NXP's parser and
-  microcode or our PCD and soft parser are both open. `DPA_IPSEC_TRANSPORT_HDR_MAX` keeps ESP and UDP inside it;
-  an inbound transport TCP packet whose IPv6 header is over ~100-120 bytes still passes the port as ESP, is
-  decrypted by SEC and then discarded by the offline port, counted only as filtered.
-  Next: as A361 proposes, move the filter bits to the error-enqueue mask to read the FD status (parse error?
-  timeout?), then retry with NXP's `cdx_sp.xml` to rule ours in or out. Possibly A361's mechanism.
+- [ ] **A369 — IPv4 TCP (and other non-UDP, non-ESP) frames with IP options are forwarded in hardware.** Linux's own
+  flowtable never fast-paths them (`nf_flow_tuple_ip()`: `ip_has_options()`), so Linux's forwarding path would record
+  a Record Route or Timestamp option and drop source-routed packets under `accept_source_route=0`; an offloaded
+  entry forwards them untouched. A368 sends UDP behind options to the CPU (ESP-in-UDP needed it); TCP still matches its
+  entry. Fix direction: `$logicalportid != 9 and ipv4.hlen != 5` to the CPU in `ipv4schema` for every protocol, under
+  the XML gate; check: a TCP flow's SYN-ACK with an LSRR option is dropped, one with Record Route leaves recorded.
 
 - [ ] **A361 — the LAN port's FMan receive path filters a few minimum-size frames that arrive whole.** Seen by
   `flowtable_nat_throughput.py::test_packet_rate`: one paced NAT'd UDP flow of 64-byte frames at 1.9 Mpps lost 3-16 of
@@ -185,6 +176,12 @@ result independently of those temporary files.
   Next: move the filter's bits from the RX port's discard mask (`fmbm_rfsdm`, BMI +0x68) to its error-enqueue
   mask (`fmbm_rfsem`, +0x6C) so those frames reach `priv_rx_error_dqrr` with their FD status, then tell a parse or
   KeyGen error at minimum length from an FMan resource limit.
+
+- [x] **A368 — inbound tunnel ESP behind outer IPv6 extension headers or IPv4 options was never decrypted.** The submit
+  gives SEC the outer header's length; IPv4 UDP behind options goes to the CPU (_:/^ipsec: describe a tunnel frame's outer header_).
+
+- [x] **A367 — FMan dropped frames whose headers ran past byte ~158, counted only as filtered.** Its parser reaches
+  256 − 96 (DTS FOF) bytes; documented as a limit, now counted in `rx_dropped` (_:/^ipsec: describe a tunnel frame's outer header_).
 
 - [x] **A366 — transport headers past FMan's parse reach were dropped after SEC numbered them.** The bound is 132
   bytes, measured (A367), not the 256-byte window (_:/^ipsec: describe a transport frame's header to SEC both ways_).

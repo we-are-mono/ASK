@@ -57,7 +57,10 @@ def test_ipsec_inbound_submit_device(tmp_path):
     A transport SA's frame is described to SEC as the stack found it: its IP
     header up to ESP, options and extension headers included, and the byte
     naming ESP. ESP anywhere the SA's would not be, and a header longer than
-    the IPsec offline port reliably parses past, go back untouched.
+    the IPsec offline port reliably parses past, go back untouched. A tunnel
+    SA's frame gives SEC everything ahead of ESP to strip, the UDP header of
+    ESP-in-UDP included, up to the twelve bits SEC takes, if it came in UDP
+    exactly when its state has an encapsulation.
     """
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))

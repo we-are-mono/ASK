@@ -30,6 +30,8 @@ typedef void *t_Handle;
 #define CDX_IFSTATS_PORT_RX_OVERHEAD ETH_HLEN
 #define printk(...) do { } while (0)
 typedef enum { e_FM_PORT_COUNTERS_DISCARD_FRAME = 7,
+               e_FM_PORT_COUNTERS_RX_BAD_FRAME = 9,
+               e_FM_PORT_COUNTERS_RX_FILTER_FRAME = 11,
                e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD = 13 } e_FmPortCounters;
 
 #include "port_counters_flags.inc"
@@ -44,7 +46,9 @@ struct memac_regs {
     u32 tuca_l, tuca_u, tmca_l, tmca_u, tbca_l, tbca_u;
     u32 rdrp_l, rdrp_u;
 };
-struct fm_port_model { u32 discards, no_buffer; };
+/* The BMI's receive counts. A frame the MAC passed on cut short is in both
+ * the bad and the filter count, as on the rig (A361). */
+struct fm_port_model { u32 discards, filtered, bad, no_buffer; };
 typedef struct { t_Handle h_Dev; } t_LnxWrpFmPortDev;
 /* The SDK driver sets link and speed at probe -- down, and the MAC's fastest --
  * and never again: they say nothing of the link. */
@@ -138,12 +142,25 @@ static void transit_advance(unsigned long us)
         transit.left_us -= us;
 }
 static struct fm_port_model rx_port;
+static int bad_after_filter_read;
 static t_LnxWrpFmPortDev rx_wrapper = { .h_Dev = &rx_port };
 static u32 FM_PORT_GetCounter(t_Handle h, e_FmPortCounters counter)
 {
     assert(h == &rx_port);
     if (counter == e_FM_PORT_COUNTERS_DISCARD_FRAME)
         return rx_port.discards;
+    if (counter == e_FM_PORT_COUNTERS_RX_FILTER_FRAME) {
+        u32 filtered = rx_port.filtered;
+
+        /* A cut-short frame arriving just after this read. */
+        if (bad_after_filter_read) {
+            bad_after_filter_read = 0;
+            rx_port.filtered++, rx_port.bad++, mac.rx_dropped++;
+        }
+        return filtered;
+    }
+    if (counter == e_FM_PORT_COUNTERS_RX_BAD_FRAME)
+        return rx_port.bad;
     assert(counter == e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD);
     return rx_port.no_buffer;
 }
@@ -332,6 +349,7 @@ int main(void)
     driver_tx = 100, driver_tx_bytes = 10000;
     transmit(100, 100 - ETH_FCS_LEN);
     rx_port.discards = 7;
+    rx_port.filtered = 5;
     rx_port.no_buffer = 9;
     mac.rx_dropped = 11;
 
@@ -357,6 +375,26 @@ int main(void)
     rx_port.no_buffer += 50;
     s = read_stats(3);
     assert(s.rx_dropped == 3 + 600 && s.rx_missed_errors == 50);
+    /* Frames its classifier refused are dropped: those whose headers ran
+     * past the parser's reach, which the microcode discards (A367). */
+    rx_port.filtered += 27;
+    s = read_stats(3);
+    assert(s.rx_dropped == 3 + 600 + 27 && s.rx_missed_errors == 50);
+    /* A frame the MAC passed on cut short is in the BMI's filter and bad
+     * counts and the MAC's own drops: missed, once (A352). */
+    rx_port.filtered += 4, rx_port.bad += 4, mac.rx_dropped += 4;
+    s = read_stats(3);
+    assert(s.rx_dropped == 3 + 600 + 27 && s.rx_missed_errors == 50 + 4);
+    /* One arriving between the reads of the two counts is never refused,
+     * and what was refused does not step back meanwhile. */
+    bad_after_filter_read = 1;
+    s = read_stats(3);
+    assert(!bad_after_filter_read && s.rx_dropped == 3 + 600 + 27 && s.rx_missed_errors == 50 + 5);
+    s = read_stats(3);
+    assert(s.rx_dropped == 3 + 600 + 27 && s.rx_missed_errors == 50 + 5);
+    rx_port.filtered += 2;
+    s = read_stats(3);
+    assert(s.rx_dropped == 3 + 600 + 27 + 2);
 
     /* The kernel's own frames leave by the same MAC: counted there once,
      * whatever the driver's own count says meanwhile. */
@@ -439,14 +477,17 @@ int main(void)
     /* The BMI counts wrap at 32 bits; the sampler keeps up with them, and a
      * reading after the wrap still adds only what is new. */
     rx_port.discards = 0xfffffff0u;
+    rx_port.filtered = 0xfffffffeu;
     rx_port.no_buffer = 0xffffffffu;
     dpa_port_counters_sample();
     assert(!locked);
-    u64 dropped = port.eth_info.rx_discarded.total, missed = port.eth_info.rx_no_buffer.total;
+    u64 dropped = port.eth_info.rx_discarded.total + port.eth_info.rx_refused;
+    u64 missed = port.eth_info.rx_no_buffer.total + port.eth_info.rx_mac_dropped.total;
     rx_port.discards = 0x10;
+    rx_port.filtered = 1;
     rx_port.no_buffer = 2;
     s = read_stats(3);
-    assert(s.rx_dropped == 3 + dropped + 0x20 && s.rx_missed_errors == missed + 3);
+    assert(s.rx_dropped == 3 + dropped + 0x20 + 3 && s.rx_missed_errors == missed + 3);
 
     /* Frames the receive MAC dropped itself, its FIFO full because FMan had
      * not drained it, are missed as well (A352): FMan never saw them, or saw

@@ -62,8 +62,8 @@ COUNT = 16
 # The longest IPv6 header SEC may keep ahead of a transport SA's ESP, 88
 # bytes of extension headers: SEC's output then carries ESP at byte 146,
 # behind 14 bytes of Ethernet and the SA's 4-byte tag, its SPI and sequence
-# number ending at 154. FMan's parser discards most frames whose transport
-# header ends past byte 158; eight bytes more end ESP's at 162.
+# number ending at 154. FMan's parser reads no further than byte 160 of a
+# frame (A367); eight bytes more end ESP's at 162.
 LONGEST = 128
 IPPROTO_IPV6, IPV6_UNICAST_HOPS = 41, 16
 # IPV6_HOPOPTS and IPV6_DSTOPTS (linux/in6.h), each set to a header of one

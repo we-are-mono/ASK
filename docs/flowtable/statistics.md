@@ -272,9 +272,21 @@ again, since the octets' lower half wraps every few seconds at 10G. The
 enqueue's count is still kept, and still read where there is no MAC.
 
 Receive adds what the port took in and FMan then dropped
-(`port_rx_drops_advance()`), from two of its BMI's counts. An enqueue a
+(`port_rx_drops_advance()`), from its BMI's counts. An enqueue a
 congestion group refused counts as a BMI discard and goes to `rx_dropped`; so
-does a frame an entry sends to the parked discard queue on purpose. A frame
+does a frame an entry sends to the parked discard queue on purpose. So does a
+frame an FMan engine refused, which the BMI counts as filtered: a policer's
+red or yellow (the devlink punt and SEC meters, an offloaded `tc police`,
+whose own counts report them too), the microcode's for a frame whose headers
+run past the parser's reach or are in error (A367, [in-kernel-pcd.md](../in-kernel-pcd.md#the-parsers-reach)),
+and a frame longer than the port's maximum. The filter count also holds the
+MAC's cut-short frames below, which the BMI counts as bad as well, so
+`rx_dropped` takes the filter count less the bad one, read in that order and
+never reported lower than before (`rx_refused`): a bad frame between the two
+reads is left out for a reading rather than counted twice. Measured: 32
+over-length frames into the LAN port moved its large, filter and
+`rx_dropped` counts by 32 and its bad count and `rx_missed_errors` by none;
+the punt meter's devlink drops matched the WAN port's filter count. A frame
 the port found no buffer for in the pool every DPAA port shares is a BMI
 out-of-buffers discard and goes to `rx_missed_errors`, the counter Linux keeps
 for exactly that. A stalled port's queue could once hold that whole pool, and
@@ -286,8 +298,8 @@ at 10G minimum-size frames take one round in under five minutes.
 A frame the receive MAC had no room for in its own FIFO, because FMan had not
 yet drained it, never reaches FMan whole. The MAC drops it, or passes it on
 cut short and marked bad (`FM_FD_ERR_PHYSICAL`), which the port's discard mask
-then throws away as a bad frame, not as a BMI discard: neither is in the two
-counts above. The MAC's own count of both (RDRP) goes to `rx_missed_errors`
+then throws away as a bad frame, not as a BMI discard: neither reaches
+`rx_dropped`. The MAC's own count of both (RDRP) goes to `rx_missed_errors`
 as well (`port_mac_rx_advance()`), from where it stood when CDX took the port
 and past any reset of the MAC's counters (A352). It moved during line-rate
 bursts of 128 KB TCP records with IPsec offloaded while the 10G receive ports

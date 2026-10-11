@@ -238,3 +238,35 @@ that offset. The SEC policy has no PPPoE table; the soft parser bypasses this
 lookup on logical port 9. The host comparison checks the group layout, but
 hardware traffic tests are still required after changes to parser behavior or
 CC-root offsets. The flowtable PPPoE tests replace the retired CMM tests.
+
+## The parser's reach
+
+FMan's parser reads only the first 256-byte internal buffer of a frame
+(DPAA RM §5.9.4.8), and the BMI places the frame `FMBM_RIM[FOF]` bytes into
+that buffer, the parse start offset with it. FOF is the port's
+`buffer-layout` manipulation headroom in the board DTS, 96 bytes on every
+RX and offline port, which the microcode uses to insert the headers an
+entry adds (outer tunnel header, VLAN tags, PPPoE). The parser therefore
+reaches byte 160 of a frame. A header it cannot finish there, hard or soft,
+is backed out and the frame marked block-limit-exceeded (`FD[STATUS]` BLE).
+The ASK microcode's hash entry sends such a frame to a recovery path that
+lets some through and discards the rest (`CLS_DISCARD`), whatever its
+classification would have been. How many it saves varies: most of them on a
+freshly booted DUT, about one in six after hours of traffic. Linux would
+have received them all.
+
+It takes a header that ends past byte 160: on an untagged IPv6 frame, about
+90-100 bytes of extension headers ahead of UDP or ESP, less ahead of TCP.
+Everyday options are 8 bytes (router alert, a tunnel's encapsulation limit),
+so the frames that reach it are the unusual ones: a long SRv6 segment list,
+large hop-by-hop or destination options, a deep stack of encapsulations.
+Shrinking FOF would only move the edge and squeeze the microcode's
+insertions; walking the extension-header chain in `cdx_sp.xml` to send such
+frames to the CPU first is an XML change for a case this rare. So they stay
+dropped, and are counted: the BMI counts each in the port's filter counter
+(`port_rx_filter_frame` under the port's sysfs statistics), which CDX folds,
+less the MAC's bad frames it also holds, into the port's `rx_dropped`
+alongside the enqueue's discards (`ip -s link`; flowtable/statistics.md).
+The IPsec submit bounds what SEC may keep ahead of a transport SA's ESP by
+the same reach (`DPA_IPSEC_PARSE_REACH`, ISSUES A366/A367); a change to the
+DTS `buffer-layout` has to change it too.
