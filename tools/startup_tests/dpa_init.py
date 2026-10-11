@@ -22,8 +22,11 @@ FAULTS = [
     ("dpa_cfg_install", 1),        # MURAM statistics
     ("dpa_cfg_install", 2),        # first offline interface
     ("dpa_add_port_ff_policier_profile", 1),  # private slot, before profile SET
-    ("create_fwd_tx_fqs", 1),
-    ("create_fwd_tx_fqs", 16),
+    # A port's two sets of 16 transmit queues: the forwarding set's first and
+    # last, then the IPsec set's first, with a complete set to unwind.
+    ("create_tx_fq_set", 1),
+    ("create_tx_fq_set", 16),
+    ("create_tx_fq_set", 17),
     ("dpa_cfg_install", 4),        # first complete Ethernet interface
     ("dpa_add_port_ff_policier_profile", 5),
     ("cdxdrv_create_pcd_fqs", 1),
