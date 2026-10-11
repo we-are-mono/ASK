@@ -11,6 +11,12 @@ from pathlib import Path
 RUN_NAME = re.compile(r"^\d{8}-\d{6}-")
 
 
+def runs_root():
+    return Path(os.environ.get(
+        "ASK_TEST_ARTIFACTS",
+        os.environ.get("ASK_FLOWTABLE_ARTIFACTS", f"/tmp/ask-tests-{os.getuid()}")))
+
+
 def prune_runs(root, keep_days, keep_runs, min_free):
     """Delete earlier run directories under `root`, oldest first.
 

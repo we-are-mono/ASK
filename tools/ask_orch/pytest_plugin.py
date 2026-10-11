@@ -1,6 +1,7 @@
 """Common pytest reporting and hardware ownership for every ASK suite."""
 
 import importlib.metadata
+import json
 import os
 import random
 import tempfile
@@ -9,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from ask_orch.artifacts import artifact_dir, prune_runs, record
+from ask_orch import release
+from ask_orch.artifacts import artifact_dir, prune_runs, record, runs_root
 from ask_orch.lifecycle import bench_lock
 from ask_orch.provenance import checkout
 
@@ -19,6 +21,11 @@ def pytest_addoption(parser):
         "--release",
         action="store_true",
         help="require hardware capabilities and reject unexpected skips",
+    )
+    parser.addoption(
+        "--release-run", choices=sorted(release.MATRIX),
+        help="run one release matrix entry exactly as declared and record it in the ledger "
+             "(implies --release)",
     )
     parser.addoption(
         "--module-order-seed", type=int,
@@ -34,16 +41,28 @@ def pytest_addoption(parser):
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     config._ask_broken = None
+    config._ask_failed = set()
     if hasattr(config, "workerinput"):
         config._ask_run_dir = Path(config.workerinput["ask_run_dir"])
         os.environ["ASK_TEST_RUN_DIR"] = str(config._ask_run_dir)
         return
-    root = Path(
-        os.environ.get(
-            "ASK_TEST_ARTIFACTS",
-            os.environ.get("ASK_FLOWTABLE_ARTIFACTS", f"/tmp/ask-tests-{os.getuid()}"),
-        )
-    )
+    run = config.getoption("--release-run")
+    if run:
+        config.option.release = True
+        # The matrix variables select what an entry covers, and the gates
+        # what it proves: a run with any of them other than declared would
+        # count as an entry it is not.
+        wrong = [name for name in release.variables()
+                 if os.environ.get(name) != release.MATRIX[run].env.get(name)]
+        if wrong or release.overrides(os.environ):
+            raise pytest.UsageError(
+                f"release run {run} needs "
+                + ", ".join(f"{name}={release.MATRIX[run].env.get(name) or '(unset)'}" for name in wrong)
+                + (", " if wrong and release.overrides(os.environ) else "")
+                + ", ".join(f"{name} unset" for name in release.overrides(os.environ))
+                + "; use make test-release RUN=" + run)
+    config._ask_started = time.time()
+    root = runs_root()
     root.mkdir(parents=True, exist_ok=True)
     prune_runs(root, keep_days=float(os.environ.get("ASK_TEST_ARTIFACT_DAYS", "3")),
                keep_runs=10, min_free=4 << 30)
@@ -56,7 +75,7 @@ def pytest_configure(config):
     versions = {
         d.metadata["Name"]: d.version for d in importlib.metadata.distributions()
     }
-    source = checkout(Path(__file__).resolve().parents[2])
+    source = config._ask_source = checkout(Path(__file__).resolve().parents[2])
     # Only bench settings: credentials and unrelated environment variables
     # never belong in a distributable test report.
     settings = {
@@ -73,13 +92,9 @@ def pytest_configure(config):
             "ASK_WAN_IPERF_IP",
             "ASK_WAN_INJECT_IF",
             "ASK_KERNEL_SOURCE",
-            "ASK_FLOWTABLE_CHURN",
-            "ASK_FLOWTABLE_CHURN_SECONDS",
             "ASK_FLOWTABLE_BASELINE",
-            "ASK_FLOWTABLE_TERMINAL",
-            "ASK_FLOWTABLE_UNREGISTER",
-            "ASK_FLOWTABLE_MIN_GBPS",
-            "ASK_IPSEC_IPERF_BPS",
+            *release.variables(),
+            *release.overrides(os.environ),
         )
         if os.environ.get(key)
     }
@@ -91,6 +106,7 @@ def pytest_configure(config):
             "packages": versions,
             "bench": settings,
             "release": config.getoption("--release"),
+            "release_run": run,
         },
         nodeid="session",
     )
@@ -160,6 +176,8 @@ def pytest_collection_modifyitems(config, items):
         for item in explicit
         for marker in [item.get_closest_marker("explicit")]
     ]
+    if run := config.getoption("--release-run"):
+        _release_selection(config, items, run)
     seed = config.getoption("--module-order-seed")
     # A state one module leaves behind for the next is only found by
     # changing who comes next, so every bench run draws a new order. Host
@@ -186,6 +204,35 @@ def pytest_collection_modifyitems(config, items):
                 "hardware tests require one runner; use test-host for parallel host tests"
             )
     return result
+
+
+def _release_selection(config, items, run):
+    """A release run selects its entry exactly: the declared paths, nothing
+    narrowed, every explicit case it leaves out run by another entry or
+    waived, and either only cases that end their boot or none of them."""
+    problems = []
+    given = []
+    for arg in config.args:
+        path, sep, rest = arg.partition("::")
+        resolved = (Path(config.invocation_params.dir) / path).resolve()
+        given.append(os.path.relpath(resolved, release.TOOLS) + sep + rest)
+    if sorted(given) != sorted(release.paths(run)):
+        problems.append(f"selects {given}, not {release.paths(run)}")
+    narrowed = [option for option in ("keyword", "markexpr", "deselect", "lf", "failedfirst",
+                                      "newfirst", "stepwise")
+                if getattr(config.option, option, None)]
+    if narrowed:
+        problems.append("narrows the selection with " + ", ".join(narrowed))
+    for nodeid in release.uncovered(run, config._ask_explicit):
+        problems.append(f"leaves out {nodeid}, which no other entry runs")
+    ending = [item for item in items if item.get_closest_marker("destructive")]
+    if ending and len(ending) != len(items):
+        problems.append("mixes cases that end their boot with cases that need it: "
+                        + ", ".join(item.nodeid for item in ending))
+    if not items:
+        problems.append("selects no case")
+    if problems:
+        raise pytest.UsageError(f"release run {run} " + "; ".join(problems))
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -251,11 +298,18 @@ def pytest_runtest_makereport(item, call):
             f"release run cannot skip required coverage: {report.longrepr}"
         )
     item._ask_failed = getattr(item, "_ask_failed", False) or report.failed
+    if report.failed:
+        item.config._ask_failed.add(item.nodeid)
     if (
         report.failed
         and report.when in {"setup", "teardown"}
         and item.get_closest_marker("hardware")
     ):
+        item.config._ask_broken = item.nodeid
+    # A destructive case ends its boot however it went, and nothing after it
+    # in this session may use that boot.
+    if (report.when == "teardown" and item.get_closest_marker("destructive")
+            and item.get_closest_marker("hardware") and not item.config._ask_broken):
         item.config._ask_broken = item.nodeid
     path = artifact_dir(item.nodeid)
     report.user_properties.append(("artifacts", str(path)))
@@ -272,6 +326,37 @@ def pytest_runtest_makereport(item, call):
         nodeid=item.nodeid,
     )
     return report
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """A release run's outcome goes to the ledger with the boot and image it
+    ran on, as the session's DUT records left them."""
+    config = session.config
+    run = config.getoption("--release-run")
+    # A refused invocation ran nothing, and a collection proves nothing.
+    if (not run or hasattr(config, "workerinput") or config.option.collectonly
+            or exitstatus == pytest.ExitCode.USAGE_ERROR):
+        return
+
+    def load(name):
+        try:
+            return json.loads((artifact_dir("session") / f"{name}.json").read_text())
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    release.append(release.ledger_path(config._ask_run_dir.parent), {
+        "run": run,
+        "revision": config._ask_source["revision"],
+        "checkout": config._ask_source["sha256"],
+        "started": config._ask_started,
+        "finished": time.time(),
+        "exitstatus": int(exitstatus),
+        "selected": len(session.items),
+        "failed": sorted(config._ask_failed),
+        "boot_id": load("dut").get("boot_id"),
+        "image": load("firmware").get("image"),
+        "run_dir": str(config._ask_run_dir),
+    })
 
 
 def _order_line(config):

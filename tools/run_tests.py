@@ -6,6 +6,8 @@ import shlex
 import sys
 from pathlib import Path
 
+from ask_orch import release
+
 
 def command(suite, environ, executable=sys.executable):
     root = Path(__file__).resolve().parents[1]
@@ -24,11 +26,24 @@ def command(suite, environ, executable=sys.executable):
         "startup": ["startup_tests"],
         "all": ["host_tests", "tests"],
     }
-    argv = [executable, "-m", "pytest", "-c", str(root / "tools/pyproject.toml")]
-    argv += [str(root / "tools" / path) for path in paths[suite]]
-    if env.get("K"):
-        argv.extend(["-k", env["K"]])
-    argv += shlex.split(env.get("ASK_TEST_ARGS", "")) + shlex.split(env.get("ARGS", ""))
+    if suite == "status":
+        argv = [executable, "-m", "ask_orch.release", "status"]
+    else:
+        if suite == "release":
+            run = env.get("RUN")
+            if run not in release.MATRIX:
+                raise SystemExit("RUN names one release run: " + ", ".join(release.MATRIX))
+            if env.get("K"):
+                raise SystemExit("a release run selects its own cases; drop K")
+            env = release.environment(run, env)
+            paths[suite] = release.paths(run)
+        argv = [executable, "-m", "pytest", "-c", str(root / "tools/pyproject.toml")]
+        argv += [str(root / "tools" / path) for path in paths[suite]]
+        if suite == "release":
+            argv += ["--release-run", run]
+        if env.get("K"):
+            argv.extend(["-k", env["K"]])
+        argv += shlex.split(env.get("ASK_TEST_ARGS", "")) + shlex.split(env.get("ARGS", ""))
     if suite != "host" and os.geteuid() != 0:
         # argv stays an argument list: spaces, quotes and shell metacharacters
         # in settings never become shell syntax at the sudo boundary.
@@ -43,7 +58,7 @@ def command(suite, environ, executable=sys.executable):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", choices=("all", "host", "dut", "startup"))
+    parser.add_argument("suite", choices=("all", "host", "dut", "startup", "release", "status"))
     args = parser.parse_args()
     argv, env = command(args.suite, os.environ)
     os.execvpe(argv[0], argv, env)

@@ -490,9 +490,12 @@ that differs from the checkout and checks each selected test's required tools.
   `explicit_not_selected`.
 - `ARGS=--release` checks required DUT tools before setup and fails on
   every selected skip. Expected xfails keep their native status. Disabled
-  explicit cases are deselected rather than skipped, so a release run covers
-  the rest of the suite; enable the soaks in it and run each terminal case on
-  its own fresh boot. WAN address lifecycle needs its separate subnet invocation.
+  explicit cases are deselected rather than skipped. A release itself is the
+  matrix below, not one invocation.
+- A destructive case ends its boot whatever its outcome. It writes
+  `/run/ask-test-boot-spent` on the DUT before it starts; every later session's
+  preflight refuses that boot, and later hardware cases in the same session
+  are skipped as needing recovery.
 - Bench runs shuffle whole modules with a seed drawn per run, so state one module
   leaves behind meets a different successor each time. Test and parameter order
   within each module stays intact, including the shared profile lifecycles. The
@@ -687,6 +690,49 @@ without a redeploy. An autouse fixture fails the run's hardware tests at setup
 if the DUT agent does not answer. DUT control does not require an IP address.
 
 ---
+
+### Release qualification
+
+A release is every run in `tools/ask_orch/release.py`'s matrix passing
+against one checkout and one DUT image:
+
+| Run | Selects | Boot |
+|---|---|---|
+| `suite` | host and DUT suites | staged test image |
+| `churn` | `flowtable_churn.py`, `ASK_FLOWTABLE_CHURN=1` | staged test image |
+| `invalidation-barrier` | `test_invalidation`, `ASK_FLOWTABLE_INVALIDATION=barrier` | staged test image |
+| `terminal-unload` | `test_terminal`, `ASK_FLOWTABLE_TERMINAL=unload` | ends its boot |
+| `terminal-budget` | `test_terminal`, `ASK_FLOWTABLE_TERMINAL=budget` | ends its boot |
+| `unregister` | `flowtable_unregister.py`, `ASK_FLOWTABLE_UNREGISTER=1` | ends its boot |
+| `startup` | `startup_tests` | `rdinit=/bin/sh`; ends its boot |
+
+```sh
+make test-release RUN=suite      # one entry, exactly as declared
+make release-status              # what passed for this checkout, what is left
+```
+
+`make test-release` sets the entry's variables and clears the other entries'.
+A run is refused if anything changes what it covers or proves: `K`, `-k`, `-m`,
+`--deselect`, `--lf` and similar, a different path, a matrix variable other
+than declared, or any rate floor (`ASK_*_MIN_GBPS*`), sweep width, soak length,
+offered load or `ASK_REGEN_ABI_SNAPSHOT`. A release proves the defaults.
+`ARGS` still passes options that do not narrow the run, such as `-x`. The
+`suite` run also refuses an explicit case that no other entry runs and no
+waiver in the matrix accounts for; `test_long_exchange` is waived as a
+diagnostic.
+
+Each finished run appends its outcome, boot ID and DUT image identity (the
+kernel's build notes and a digest of `/lib/modules/<release>`) to
+`release-ledger.jsonl` beside the run directories, or to
+`ASK_RELEASE_LEDGER`. Set `ASK_TEST_ARTIFACTS` to durable storage for a release:
+the default root is a tmpfs. `make release-status` takes each entry's latest
+run against the current checkout fingerprint and exits 0 only when all of them
+passed on the same image as `suite`. Any edit to the checkout starts the matrix
+again.
+
+Run the entries that end their boot last on each boot, then boot the staged
+image again. The startup run needs the `rdinit=/bin/sh` boot that the CDX
+startup rollback section above describes.
 
 ## How the harness reaches each node
 

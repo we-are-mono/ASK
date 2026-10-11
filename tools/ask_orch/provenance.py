@@ -32,14 +32,32 @@ def agent_sources(root):
             for path in sorted(Path(root).rglob("*.py"))}
 
 
-def firmware_script(required):
-    # Run once on the DUT; only hashes and component identities cross UART.
-    return f'''
-import hashlib, json, pathlib, platform, shutil
-import askd_agent
+# The DUT image's identity, the same in every boot of it -- the startup
+# suite's rdinit=/bin/sh boot included, where no module has loaded yet: the
+# kernel's build notes and every file in its module tree.
+IMAGE = '''
+import hashlib, json, pathlib, platform
 def digest(path):
     path = pathlib.Path(path)
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+def image():
+    tree = hashlib.sha256()
+    base = pathlib.Path('/lib/modules') / platform.release()
+    for path in sorted(p for p in base.rglob('*') if p.is_file() and not p.is_symlink()):
+        tree.update(str(path.relative_to(base)).encode() + b'\\0' + bytes.fromhex(digest(path)))
+    return {'kernel_notes_sha256': digest('/sys/kernel/notes'), 'modules_sha256': tree.hexdigest()}
+'''
+
+
+def image_script():
+    return IMAGE + "print(json.dumps(image()))\n"
+
+
+def firmware_script(required):
+    # Run once on the DUT; only hashes and component identities cross UART.
+    return IMAGE + f'''
+import shutil
+import askd_agent
 root = pathlib.Path(askd_agent.__file__).parent
 modules = {{}}
 for path in sorted(pathlib.Path('/sys/module').iterdir()):
@@ -50,6 +68,7 @@ for path in sorted(pathlib.Path('/sys/module').iterdir()):
                               'srcversion': version.read_text().strip() if version.exists() else None}}
 tools = {{name: shutil.which(name) for name in {sorted(required)!r}}}
 print(json.dumps({{'kernel': platform.release(), 'kernel_notes_sha256': digest('/sys/kernel/notes'),
+                  'image': image(),
                   'agent_sources': {{str(path.relative_to(root)): digest(path) for path in sorted(root.rglob('*.py'))}},
                   'modules': modules, 'binaries': {{name: {{'path': path, 'sha256': digest(path)}}
                                                 for name, path in tools.items() if path}},

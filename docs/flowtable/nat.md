@@ -143,12 +143,9 @@ translation/lifetime proofs with native masquerade rules. The separate
 an active address, replace it, and take the WAN interface down/up. Both live TCP
 and UDP conntracks and hardware directions must disappear at each destructive
 transition. Fresh connections must use the replacement address and offload
-without recreating the policy table. Its setup requires this endpoint address:
-
-```sh
-ASK_WAN_IPERF_IP=198.18.40.2 ASK_FLOWTABLE_SPORT=55400 \
-  make ask-test ASK_TEST_ARGS='-q -k "flowtable_masquerade and test_wan_lifecycle"'
-```
+without recreating the policy table. Its fixture adds the subnet to both ends
+and points the WAN endpoint at `198.18.40.2` for this case alone, so it runs
+in the ordinary suite.
 
 See the [MASQUERADE validation record](history/masquerade.md).
 

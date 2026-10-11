@@ -30,6 +30,10 @@ from ask_orch.provenance import agent_sources, firmware_script
 
 from _dmesg_allowlist import load_allowlist
 
+# Written on the DUT by a case that ends its boot, before it starts. The
+# rootfs is an initramfs, so only a new boot clears it.
+BOOT_SPENT = "/run/ask-test-boot-spent"
+
 
 # ---- per-test aiohttp ---------------------------------------------------
 
@@ -89,6 +93,10 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
         record("dut", health, nodeid="session")
         assert health.get("ok") and health.get("capture_protocol") == 2 and health.get("serial_protocol") == SERIAL_PROTOCOL, (
             "DUT needs the current test agent with reliable kernel capture", health)
+        spent = await client.TARGET.fs_read(session, BOOT_SPENT)
+        assert spent["errno"], (
+            f"{bytes.fromhex(spent['content_hex']).decode()} ended this boot; "
+            "boot the staged image again before testing")
         required = {"ip", "nft", "conntrack", "python3"}
         for item in request.session.items:
             for marker in item.iter_markers("requires"):
@@ -122,6 +130,16 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
             assert firmware["agent_matches_checkout"], (
                 "DUT agent differs from this checkout; rebuild, stage and boot the current image")
         return {"health": health, "boot": boot}
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _boot_ending(request, _target_reachable, aiohttp_session, target_agent):
+    """A destructive case ends its boot whatever its outcome, so it says so on
+    the DUT before anything else of it runs, and the next session refuses
+    that boot."""
+    if request.node.get_closest_marker("destructive"):
+        result = await target_agent.fs_write(aiohttp_session, BOOT_SPENT, request.node.nodeid)
+        assert result["errno"] == 0, result
 
 
 @pytest_asyncio.fixture(autouse=True)

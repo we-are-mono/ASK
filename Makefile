@@ -31,7 +31,7 @@ include build/deploy.mk
 #                            exits non-zero on failure.
 # ============================================================================
 
-.PHONY: setup ask-image stage-image deploy-agent-wan deploy-agents ask-test test test-host test-dut test-startup test-env help
+.PHONY: setup ask-image stage-image deploy-agent-wan deploy-agents ask-test test test-host test-dut test-startup test-release release-status test-env help
 
 # Install the host tools the kas build needs: kas itself, BitBake's host
 # dependencies, and the en_US.UTF-8 locale BitBake requires. Debian 13
@@ -95,7 +95,7 @@ deploy-agents: deploy-agent-wan
 # Keep environment and make-command-line settings identical. The Python
 # adapter forwards arguments through sudo without shell interpolation.
 export $(filter ASK_%,$(.VARIABLES))
-export DUT_IP WAN_IP WAN_AGENT_IP K ARGS
+export DUT_IP WAN_IP WAN_AGENT_IP K ARGS RUN
 
 test:
 	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" all
@@ -110,6 +110,12 @@ test-dut:
 
 test-startup:
 	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" startup
+
+test-release:
+	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" release
+
+release-status:
+	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" status
 
 test-env:
 	sudo python3 -m venv "$(WAN_PREFIX)/venv"
@@ -128,5 +134,7 @@ help:
 	@echo "make test-host     - host suite without sudo or hardware; ARGS='-vv'"
 	@echo "make test-dut      - DUT suite; WAN_AGENT_IP overrides the WAN control address"
 	@echo "make test-startup  - dedicated rdinit=/bin/sh startup suite"
+	@echo "make test-release  - one release matrix run, RUN=suite|churn|...; recorded in the ledger"
+	@echo "make release-status - which release runs passed for this checkout and image"
 	@echo "make test-env      - install pinned runner dependencies without deploying agents"
 	@echo "make ask-test      - alias for make test; ASK_* settings remain supported"

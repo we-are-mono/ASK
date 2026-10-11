@@ -5,6 +5,7 @@ boot an image with cdx commented out of config/ask-modules.conf. The final
 checks load and unload CDX successfully in the same boot.
 """
 
+import asyncio
 import base64
 import gzip
 import json
@@ -12,7 +13,9 @@ import re
 import shlex
 
 from ask_orch.uart import Console
-from ask_orch.artifacts import artifact_dir
+from ask_orch.artifacts import artifact_dir, record
+from ask_orch.commands import console_json, console_python
+from ask_orch.provenance import image_script
 
 # Check each resource class, partial queue batches and the final handoff.
 FAULTS = [
@@ -55,6 +58,11 @@ def test_rollback(tmp_path):
         assert not re.search(r"^cdx ", run("cat /proc/modules"), re.M), \
             "boot an image with cdx left out of the autoload list"
         boot = run("cat /proc/sys/kernel/random/boot_id")
+        # What a release ledger ties this run to: the boot, and the image the
+        # other runs must share.
+        record("dut", {"boot_id": boot}, nodeid="session")
+        identity = asyncio.run(console_python(con, image_script(), timeout=120))
+        record("firmware", {"image": console_json(identity["stdout"])}, nodeid="session")
         muram_paths = run("find /sys/devices -name fm_muram_free_size").splitlines()
         assert muram_paths, "FMAN MURAM accounting is required"
         muram_command = "cat " + " ".join(shlex.quote(p) for p in muram_paths)
