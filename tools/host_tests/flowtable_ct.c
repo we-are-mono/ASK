@@ -103,6 +103,8 @@ static void nf_flow_nat_ipv6(const struct flow_offload *flow, struct sk_buff *sk
                              enum flow_offload_tuple_dir dir, struct ipv6hdr *ip6h)
 { assert(!skb->_nfct || skb_nfct(skb) != &flow->ct->ct_general); rewritten++; }
 static void ip_decrease_ttl(struct iphdr *iph) { iph->ttl--; }
+static void ipv6_set_hop_limit(struct sk_buff *skb, struct ipv6hdr *hdr, u8 hop_limit)
+{ hdr->hop_limit = hop_limit; }
 static void skb_clear_tstamp(struct sk_buff *skb) { }
 static void nf_ct_acct_update(struct nf_conn *ct, u32 dir, unsigned int bytes)
 { accounted++; ct->acct_packets[dir]++; ct->acct_bytes[dir] += bytes; }
