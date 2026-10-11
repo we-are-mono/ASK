@@ -1106,6 +1106,18 @@ header, in eight-byte units, whose first byte it is. A header the word cannot
 describe — not in the linear area, or longer than the field's 255 bytes —
 fails the frame rather than send it encrypted wrong.
 
+SEC swaps only that byte, so an IPv6 frame with hop-by-hop or destination
+options leaves SEC with ESP named in the last extension header and the fixed
+header still naming the first. The offline port's IPv6 ESP scheme
+(`cdx_sec_esp6_dist`) therefore keys on the last header's next header (IPPID,
+`header_index="last"`), and the outbound SA's entry carries the key generator's
+order for it: address, SPI, protocol. Keyed on the fixed header's, every such
+frame missed the SA's entry, reached the CPU on its exception queue and was
+freed there uncounted. A frame that still misses an outbound SA's entry is now
+the port's transmit drop (`ip -s link`) and logged. The inbound physical-port
+table keeps the fixed header's: SEC's decap PDB states a 40-byte header, so a
+frame with extension headers could not be decapsulated there either way.
+
 A frame the driver cannot give SEC — no SEC queue for its SA, a header the
 word cannot describe, no S/G table, a queue that refuses it — is freed and
 counted as the port's transmit drop (`ip -s link`), and `tx toenc` counts
@@ -1113,7 +1125,10 @@ only the frames SEC was given. Before, every such frame vanished and was
 still counted as sent. `tools/host_tests/ipsec_sec_submit.py` compiles
 the word's choice and the submit out of the patched tree;
 `ipsec_offload_transport.py` has a software peer decrypt the DUT's
-transport traffic, half of it carrying IPv4 options.
+transport traffic, half of it carrying IPv4 options;
+`ipsec_offload_transport6.py` does the same for IPv6, three quarters of it
+carrying hop-by-hop options, destination options or both, and checks on the
+wire that they stay ahead of ESP.
 
 Proof: a tunnel carries traffic with no flowtable entry at all, with the SEC
 counter advancing and an independent peer decrypting what it produced.

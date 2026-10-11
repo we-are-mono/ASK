@@ -152,6 +152,28 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A364 — inbound IPv6 transport ESP behind extension headers is never decrypted.** Source-verified by review,
+  not run. The physical port's ESP6 scheme keys on the fixed header's next header, so such a frame misses (correctly:
+  the transport decap PDB, `cdx_dpa_ipsec.c` ~1477, states a 40-byte header and next-header offset 1). Linux then
+  hands it to SEC through `dpaa_submit_inb_pkt_to_SEC()` with DPOVRD 0 (`dpaa_eth_sg.c` ~1825), SEC reads the
+  extension header as ESP, fails the ICV and refuses the frame, counted only globally. Software cannot decrypt it
+  instead: the SA's replay state lives in SEC. Fix direction: give inbound transport frames a DPOVRD describing
+  their headers, as `dpa_ipsec_dpovrd()` does outbound, or refuse such SAs' offload. Check: the reverse of
+  `ipsec_offload_transport6.py`, the WAN host sending with hop-by-hop and destination options.
+
+- [ ] **A365 — a transport-mode packet with hop limit or TTL 0 or 1 is punted on the IPsec offline port and dropped.**
+  Source-verified by review. The soft parser's TTL/hop-limit checks (`config/pcd/cdx_sp.xml` ~83, ~108) have no
+  logical-port gate, so SEC's transport output keeps the packet's own hop limit and a value of 1 (a first
+  `traceroute6`/`traceroute` probe to an on-link peer) goes to the outbound SA's exception queue, where it is
+  freed; since the ESP6 output fix it is counted as the port's `tx_dropped` and logged as an output miss. Fix
+  direction: exempt the offline port (logical port 9) from those checks, under the soft-parser change gate.
+
+- [ ] **A366 — IPv6 transport extension headers over 194 bytes push the SPI past FMan's 256-byte parse window.**
+  Theoretical. `dpa_ipsec_dpovrd()` accepts up to 215 bytes of headers ahead of ESP; with Ethernet, the SEC
+  identity tag and the fixed header, more than ~194 bytes of extension headers leave the SPI unparsed on the
+  offline port and the frame misses its SA's entry (counted as `tx_dropped`). Fix direction: bound the header
+  length `dpa_ipsec_dpovrd()` accepts by the parse window, so such a frame fails before SEC.
+
 - [ ] **A361 — the LAN port's FMan receive path filters a few minimum-size frames that arrive whole.** Seen by
   `flowtable_nat_throughput.py::test_packet_rate`: one paced NAT'd UDP flow of 64-byte frames at 1.9 Mpps lost 3-16 of
   6,000,000 frames, and 9 Mpps of overload ~8,700 of ~9.9 million the MAC passed, each counted in the receive port's
@@ -429,13 +451,13 @@ each so the open bug list stays honest.
   confirming that CDX can accelerate it while preserving required kernel
   processing. Adding a command handler alone would not establish that.
 
-- [ ] **A39 — transport-mode ESP offload.** cdx can run transport-mode SAs
-  (SA_MODE_TUNNEL is set only by FPP_CMD_IPSEC_SA_SET_TUNNEL), but the product
-  config and the whole rig suite exercise tunnel mode exclusively, so the
-  transport path never runs. The SEC-era fix (_7cfd157_) means era 8 now enables
-  PDBOPTS_ESP_AOFL in the transport-mode decap PDB (tunnel mode is unaffected by
-  era). To enable: add a transport-mode rig case and validate the path plus the
-  AOFL-adjusted lengths before it ships.
+- [ ] **A39 — transport-mode ESP offload: the inbound half.** Outbound transport
+  SAs are rig-tested for both families: `ipsec_offload_transport.py` (IPv4, with
+  and without options, full size) and `ipsec_offload_transport6.py` (IPv6, with
+  hop-by-hop and destination options, full size). Inbound transport decap has no
+  rig case: the SEC-era fix (_7cfd157_) makes era 8 enable PDBOPTS_ESP_AOFL in the
+  transport-mode decap PDB (tunnel mode is unaffected by era). To enable: a
+  WAN-host-to-DUT transport case validating the AOFL-adjusted lengths (see A364).
 
 - [x] **A103.** fmlib's PCD-modify/FrmReplic/VSPAlloc verbs skipped the handle→cookie conversion; moot, the ioctl
   plane and fmlib are gone (_:/^fman: retire the userspace FMD ioctl plane_).

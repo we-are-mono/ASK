@@ -2186,6 +2186,13 @@ static int fill_ipsec_key_info(PSAEntry sa, struct en_exthash_tbl_entry *tbl_ent
 		key->ipv4_esp_key.ipv4_protocol = IPPROTOCOL_ESP;
 		key->ipv4_esp_key.spi = sa->id.spi;
 	}
+	else if (sa->direction == CDX_DPA_IPSEC_OUTBOUND)
+	{
+		key_size += sizeof(struct ipv6_esp_out_key);
+		memcpy(key->ipv6_esp_out_key.ipv6_daddr, &sa->id.daddr, 16);
+		key->ipv6_esp_out_key.spi = sa->id.spi;
+		key->ipv6_esp_out_key.ipv6_protocol = IPPROTOCOL_ESP;
+	}
 	else
 	{
 		key_size += sizeof(struct ipv6_esp_key);

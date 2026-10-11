@@ -451,8 +451,14 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	}
 
 	/* Output-root misses carry ciphertext. They must never be labelled
-	 * as an authenticated inbound packet when returned to Linux. */
+	 * as an authenticated inbound packet when returned to Linux. Such a
+	 * frame left Linux by this port and never reaches the wire: it is the
+	 * port's transmit drop, and a layout the offline port cannot classify. */
 	if (unlikely(x->xso.dir != XFRM_DEV_OFFLOAD_IN)) {
+		dev_core_stats_tx_dropped_inc(net_dev);
+		pr_err_ratelimited(
+			"cdx: IPsec SPI 0x%x output missed the offline port on %s - dropping\n",
+			ntohl(x->id.spi), net_dev->name);
 		xfrm_state_put(x);
 		goto rel_fd;
 	}

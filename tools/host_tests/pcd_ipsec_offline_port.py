@@ -67,6 +67,85 @@ def test_soft_parser_scope():
     assert vlan.get('expr').startswith('($logicalportid == 9) and ')
 
 
+# KeyGen's known-field bits (fm_kg.h). A scheme's key carries its known fields
+# in descending bit order, whatever order the distribution lists them in. The
+# protocol byte of the fixed IP header is PTYPE1; for IPv6, header_index="last"
+# reads the last header's next header instead, IPPID, which names ESP behind
+# extension headers.
+KEYGEN_BITS = {("ipv4.dst", None): 0x80000, ("ipv6.dst", None): 0x80000,
+               ("ipv4.nextp", None): 0x40000, ("ipv6.nexthdr", None): 0x40000,
+               ("ipsec_esp.spi", None): 0x200, ("ipv6.nexthdr", "last"): 0x80}
+
+
+def key_order(tree, distribution):
+    refs = tree.findall(f"distribution[@name='{distribution}']/key/fieldref")
+    return [name for name, _ in sorted(((ref.get("name"), ref.get("header_index")) for ref in refs),
+                                       key=lambda field: -KEYGEN_BITS[field])]
+
+
+def test_esp_keys_follow_each_table_s_key_order(tmp_path):
+    """An SA's ESP key carries its fields in the order KeyGen extracts them for
+    the table the SA's entry lives in: an inbound SA's on the physical ports,
+    an outbound SA's on the IPsec offline port. The offline port classifies
+    SEC's output by the last next header, which is ESP however many extension
+    headers a transport-mode packet keeps ahead of it; the fixed header's
+    would name the first extension header, and the frame would miss."""
+    tree = ET.parse(ROOT / "config/pcd/cdx_pcd.xml").getroot()
+    sec6 = {ref.get("name"): ref.get("header_index")
+            for ref in tree.findall("distribution[@name='cdx_sec_esp6_dist']/key/fieldref")}
+    assert sec6["ipv6.nexthdr"] == "last", sec6
+    common = (ROOT / "cdx/cdx_common.h").read_text()
+    control = (ROOT / "cdx/control_ipsec.h").read_text()
+    source = tmp_path / "esp_key.c"
+    source.write_text(r"""
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define DPA_PACKED __attribute__((packed))
+#define PROTO_IPV4 4
+#define IPPROTOCOL_ESP 50
+""" + common[common.index("struct ipv4_tcpudp_key{"):
+             common.index("#define MAX_KEY_SIZE")]
+        + "\n".join(re.findall(r"^#define CDX_DPA_IPSEC_(?:IN|OUT)BOUND\s.*$", control, re.M))
+        + r"""
+typedef struct {
+    int family, direction;
+    struct { uint32_t spi; struct { uint32_t a6[4]; } daddr; } id;
+} SAEntry, *PSAEntry;
+struct en_exthash_tbl_entry { struct { uint8_t key[64]; } hashentry; };
+""" + function((ROOT / "cdx/cdx_dpa_ipsec.c").read_text(), "fill_ipsec_key_info")
+        + r"""
+int main(void) {
+    for (int family = 4; family <= 6; family += 2) {
+        for (int inbound = 1; inbound >= 0; inbound--) {
+            SAEntry sa = {.family = family, .direction = inbound ?
+                CDX_DPA_IPSEC_INBOUND : CDX_DPA_IPSEC_OUTBOUND};
+            struct en_exthash_tbl_entry entry;
+            for (int i = 0; i < 16; i++)
+                ((uint8_t *)sa.id.daddr.a6)[i] = i + 17;
+            memcpy(&sa.id.spi, "\xa9\x00\x00\x01", 4);
+            memset(&entry, 0xa5, sizeof(entry));
+            int size = fill_ipsec_key_info(&sa, &entry, 7);
+            assert(size > 0 && size < 64 && entry.hashentry.key[size] == 0xa5);
+            for (int i = 0; i < size; i++) printf("%02x", entry.hashentry.key[i]);
+            puts("");
+        }
+    }
+}
+""")
+    binary = tmp_path / "esp_key"
+    run_process([os.environ.get("HOSTCC", "cc"), "-Wall", "-Wextra", "-Werror",
+                    "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+                    str(source), "-o", str(binary)], check=True)
+    actual = subprocess.check_output([str(binary)], text=True).splitlines()
+    values = {"ipv4.dst": bytes(range(17, 21)), "ipv6.dst": bytes(range(17, 33)),
+              "ipv4.nextp": b"\x32", "ipv6.nexthdr": b"\x32", "ipsec_esp.spi": b"\xa9\x00\x00\x01"}
+    expected = [(b"\x07" + b"".join(values[field] for field in key_order(tree, table))).hex()
+                for table in ("cdx_esp4_dist", "cdx_sec_esp4_dist", "cdx_esp6_dist", "cdx_sec_esp6_dist")]
+    assert actual == expected
+
+
 def test_natt_keys_match_the_physical_and_sec_tables(tmp_path):
     common = (ROOT / "cdx/cdx_common.h").read_text()
     control = (ROOT / "cdx/control_ipsec.h").read_text()

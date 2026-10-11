@@ -377,7 +377,7 @@
   </protocols>
   <key>
     <fieldref name="ipv6.dst"/>
-    <fieldref name="ipv6.nexthdr"/>
+    <fieldref name="ipv6.nexthdr" header_index="last"/>
     <fieldref name="ipsec_esp.spi"/>
   </key>
   <queue count="1" base="0x2010"/>

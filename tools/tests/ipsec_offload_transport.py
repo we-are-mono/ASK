@@ -45,19 +45,17 @@ from _flowtable_ipv6_sa import (fragments_sent)
 from _flowtable_rig import (artifact_dir, WAN_IP, Echo, command, console_python)
 from _flowtable_service_ipsec import (wire_interface)
 from _flowtable_service_ipsec_replay import (PEER_ERRORS, xfrm_mib)
-from _ipsec_inbound_flow_offload import (AUTH, CIPHER, sec_counter)
+from _ipsec_inbound_flow_offload import (sec_counter)
 from _ipsec_offload_egress_device import (PEER, wan_outer)
 from _ipsec_packet_offload_traffic import (decrypted_packets)
+from _ipsec_transport import (transport_sa)
 
 PORT = 48992
 FULL_PORT = 48993
-REQID = "49521"
 COUNT = 32
 # Four option bytes: three no-ops and the end of the list, so the header is
 # 24 bytes rather than 20.
 OPTIONS = b"\x01\x01\x01\x00"
-ALGORITHMS = ["mode", "transport", "reqid", REQID, "enc", "cbc(aes)", CIPHER,
-              "auth-trunc", "hmac(sha256)", AUTH, "128"]
 
 
 def payload(n):
@@ -102,33 +100,6 @@ print('sent')
 '''
 
 
-async def transport_sa(r, wan, step, outer, spi, selector, policy_first=False):
-    """The SA from the DUT's WAN address to PEER on the WAN host, with the
-    policy selecting `selector` on both ends: the DUT's half packet-offloaded,
-    the WAN host's ordinary software. `policy_first` installs the policies
-    before the states, the order a trap policy has them in."""
-    state = ["src", outer, "dst", PEER, "proto", "esp", "spi", hex(spi)]
-    template = ["tmpl", "src", outer, "dst", PEER, "proto", "esp", "mode", "transport",
-                "reqid", REQID, "level", "required"]
-    states = [
-        (wan, ["ip", "xfrm", "state", "add", *state, *ALGORITHMS, "replay-window", "32"],
-         ["ip", "xfrm", "state", "delete", *state]),
-        (r.target, ["ip", "xfrm", "state", "add", *state, *ALGORITHMS,
-                    "offload", "packet", "dev", TARGET_WAN_IF, "dir", "out"],
-         ["ip", "xfrm", "state", "delete", *state]),
-    ]
-    policies = [
-        (wan, ["ip", "xfrm", "policy", "add", *selector, "dir", "in", *template],
-         ["ip", "xfrm", "policy", "delete", *selector, "dir", "in"]),
-        (r.target, ["ip", "xfrm", "policy", "add", *selector, "dir", "out", *template,
-                    "offload", "packet", "dev", TARGET_WAN_IF],
-         ["ip", "xfrm", "policy", "delete", *selector, "dir", "out"]),
-    ]
-    for group in ((policies, states) if policy_first else (states, policies)):
-        for agent, argv, undo in group:
-            await step(agent, argv, undo)
-
-
 async def peer_on_loopback(r, wan, step):
     await step(wan, ["ip", "addr", "add", PEER + "/32", "dev", "lo"],
                ["ip", "addr", "del", PEER + "/32", "dev", "lo"])
@@ -156,7 +127,7 @@ async def test_offloaded_transport_sa_is_decrypted(rig):
         # Only this test's datagrams: the selector names the port. UDP by
         # number: the image carries no /etc/protocols for ip to resolve names.
         selector = ["src", outer + "/32", "dst", PEER + "/32", "proto", "17", "dport", str(PORT)]
-        await transport_sa(r, wan, step, outer, spi, selector)
+        await transport_sa(r, wan, step, outer, PEER, spi, selector)
         transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
             lambda: echo, local_addr=(PEER, PORT))
 
@@ -224,7 +195,7 @@ async def test_offloaded_transport_sa_carries_full_size_frames(rig, policy_first
         # Every protocol between the two hosts: it covers the SA's own ESP
         # from the DUT to the peer, which is what exposes the lookup.
         selector = ["src", outer + "/32", "dst", PEER + "/32"]
-        await transport_sa(r, wan, step, outer, spi, selector, policy_first)
+        await transport_sa(r, wan, step, outer, PEER, spi, selector, policy_first)
         transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
             lambda: echo, local_addr=(PEER, FULL_PORT))
         # Two accounting passes, each of which asks every SA's path again:

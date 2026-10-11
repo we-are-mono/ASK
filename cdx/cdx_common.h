@@ -187,6 +187,15 @@ struct ipv6_esp_key{
 	uint32_t spi;   //spi
 }DPA_PACKED;
 
+/* The IPsec offline port's IPv6 ESP key, for an outbound SA's output. Its
+ * scheme reads the last header's next header (IPPID), whose key generator
+ * bit falls below the SPI's, so the protocol comes last. */
+struct ipv6_esp_out_key{
+	uint8_t ipv6_daddr[16];
+	uint32_t spi;
+	uint8_t ipv6_protocol;
+}DPA_PACKED;
+
 /* A bridged multicast group's key, in the bridged multicast tables: the
  * frame's own Ethernet pair ahead of the routed key's fields. The order is the
  * key generator's, which extracts by hardware field id rather than in the
@@ -223,6 +232,7 @@ union dpa_key {
 			struct ethernet_key ether_key;
 			struct ipv4_esp_key ipv4_esp_key;
 			struct ipv6_esp_key ipv6_esp_key;
+			struct ipv6_esp_out_key ipv6_esp_out_key;
 			struct ipv4_3tuple_tcpudp_key ipv4_3tuple_tcpudp_key;
 			struct ipv6_3tuple_tcpudp_key ipv6_3tuple_tcpudp_key;
 			struct ipv4_mcast_mac_key ipv4_mcast_mac_key;

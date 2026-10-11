@@ -382,9 +382,12 @@ const struct cdx_pcd_group cdx_pcd_groups[CDX_PCD_NUM_GROUPS] = {
 		.num_units = 2,
 		.units = { CDX_PCD_UNIT_IPSEC_ESP, CDX_PCD_UNIT_IPV6 },
 		.num_extracts = 3,
+		/* SEC's transport-mode output keeps the packet's hop-by-hop and
+		 * destination options ahead of ESP, and names ESP only in the
+		 * last of them: the fixed header's next header would miss. */
 		.extracts = {
 			EXTRACT(IPv6, NONE, IPv6_DST_IP),
-			EXTRACT(IPv6, NONE, IPv6_NEXT_HDR),
+			EXTRACT(IPv6, LAST, IPv6_NEXT_HDR),
 			EXTRACT(IPSEC_ESP, NONE, IPSEC_ESP_SPI),
 		},
 	},

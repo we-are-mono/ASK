@@ -1210,7 +1210,7 @@
         {
           "field": "NET_HEADER_FIELD_IPv6_NEXT_HDR",
           "hdr": "HEADER_TYPE_IPv6",
-          "index": "e_FM_PCD_HDR_INDEX_NONE"
+          "index": "e_FM_PCD_HDR_INDEX_LAST"
         },
         {
           "field": "NET_HEADER_FIELD_IPSEC_ESP_SPI",

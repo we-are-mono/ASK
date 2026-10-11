@@ -77,10 +77,11 @@ struct net_device_ops { int (*ndo_init)(struct net_device *dev); };
 /* priv is what netdev_priv() answers: a struct dpa_priv_s behind a port. */
 struct net_device {
     unsigned features; const char *name; const struct net_device_ops *netdev_ops;
-    void *priv; unsigned long rx_dropped;
+    void *priv; unsigned long rx_dropped, tx_dropped;
 };
 struct dpa_bp { unsigned count; void *dev; unsigned size; };
-struct xfrm_state { struct { long long use_time; } curlft; struct { unsigned dir; } xso; };
+struct xfrm_state { struct { long long use_time; } curlft; struct { unsigned dir; } xso;
+                    struct { unsigned spi; } id; };
 struct sec_path { int len, olen, verified_cnt; struct xfrm_state *xvec[6]; unsigned ovec[24]; };
 struct sk_buff { struct net_device *dev; unsigned protocol, mac_len; struct sec_path path; bool has_path; unsigned char *data; };
 static unsigned refs, fd_releases, skb_frees, delivered, converted, sg_buffers, added, concurrent, unmapped;
@@ -145,6 +146,7 @@ static struct dpa_percpu_priv_s cpu;
 static int bp_count;
 static struct dpa_priv_s priv = { .percpu_priv = &cpu, .percpu_count = &bp_count };
 static inline void dev_core_stats_rx_dropped_inc(struct net_device *dev) { dev->rx_dropped++; }
+static inline void dev_core_stats_tx_dropped_inc(struct net_device *dev) { dev->tx_dropped++; }
 static void *skb_ext_find(struct sk_buff *skb, int kind)
 { (void)kind; return skb->has_path ? &skb->path : NULL; }
 static void *skb_ext_add(struct sk_buff *skb, int kind)
@@ -270,7 +272,7 @@ static void reset(void)
     refs = fd_releases = skb_frees = delivered = converted = unmapped = errors_logged = 0;
     copied = synced_cpu = synced_device = 0;
     skb_start = NULL;
-    device.rx_dropped = 0;
+    device.rx_dropped = device.tx_dropped = 0;
     no_device = no_state = napi_defer = refill_fail = secpath_fail = short_frame = copy_fail = false;
     memset(&packet, 0, sizeof(packet));
     state.xso.dir = XFRM_DEV_OFFLOAD_IN;
@@ -335,9 +337,13 @@ int main(void)
             if (fault == 6) assert(!fd_releases && !skb_frees);
             /* Every frame dropped after it was taken is the device's. */
             assert(device.rx_dropped == lost);
+            /* An outbound SA's output that missed the offline port left
+             * Linux by this port and never reaches the wire. */
+            assert(device.tx_dropped == (fault == 10));
             /* A frame SEC refused is not expected here at all -- FMan counts
-             * and drops those -- so one that arrives is said out loud. */
-            assert(errors_logged == (fault == 4 || fault == 5));
+             * and drops those -- so one that arrives is said out loud, and
+             * so is an output layout the offline port cannot classify. */
+            assert(errors_logged == (fault == 4 || fault == 5 || fault == 10));
             assert(bp_count == 640);
             if (!sg) {
                 /* Nothing taken from the pool, nothing to replace, and the
