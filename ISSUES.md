@@ -159,13 +159,6 @@ result independently of those temporary files.
   congestion group bounds it. Found reviewing A368; pre-existing for TTL and PPPoE. Fix direction: punt through the
   policer (its profile then enqueues) and check the KeyGen/CC path a half-parsed frame then takes, under the XML gate.
 
-- [ ] **A369 — IPv4 TCP (and other non-UDP, non-ESP) frames with IP options are forwarded in hardware.** Linux's own
-  flowtable never fast-paths them (`nf_flow_tuple_ip()`: `ip_has_options()`), so Linux's forwarding path would record
-  a Record Route or Timestamp option and drop source-routed packets under `accept_source_route=0`; an offloaded
-  entry forwards them untouched. A368 sends UDP behind options to the CPU (ESP-in-UDP needed it); TCP still matches its
-  entry. Fix direction: `$logicalportid != 9 and ipv4.hlen != 5` to the CPU in `ipv4schema` for every protocol, under
-  the XML gate; check: a TCP flow's SYN-ACK with an LSRR option is dropped, one with Record Route leaves recorded.
-
 - [ ] **A361 — the LAN port's FMan receive path filters a few minimum-size frames that arrive whole.** Seen by
   `flowtable_nat_throughput.py::test_packet_rate`: one paced NAT'd UDP flow of 64-byte frames at 1.9 Mpps lost 3-16 of
   6,000,000 frames, and 9 Mpps of overload ~8,700 of ~9.9 million the MAC passed, each counted in the receive port's
@@ -176,6 +169,9 @@ result independently of those temporary files.
   Next: move the filter's bits from the RX port's discard mask (`fmbm_rfsdm`, BMI +0x68) to its error-enqueue
   mask (`fmbm_rfsem`, +0x6C) so those frames reach `priv_rx_error_dqrr` with their FD status, then tell a parse or
   KeyGen error at minimum length from an FMan resource limit.
+
+- [-] **A369 — IPv4 TCP with IP options is forwarded by its offloaded entry, unlike Linux's flowtable.** Wontfix: only
+  Record Route/Timestamp go unrecorded (routers default to accepting source routes); punting adds an unmetered class (A370).
 
 - [x] **A368 — inbound tunnel ESP behind outer IPv6 extension headers or IPv4 options was never decrypted.** The submit
   gives SEC the outer header's length; IPv4 UDP behind options goes to the CPU (_:/^ipsec: describe a tunnel frame's outer header_).
