@@ -6,6 +6,7 @@
 #define __ERR_MODULE__ MODULE_FM_PCD
 #include "fm_pcd.h"
 #include "fm_manip.h"
+typedef struct { unsigned magic; } spinlock_t;
 #include "ehash_layout.h"
 static unsigned allocations, control_calls, reported;
 #undef REPORT_ERROR
@@ -13,6 +14,13 @@ static unsigned allocations, control_calls, reported;
 /* Stop supported requests at their first allocation. Unsupported requests
  * must return before reaching either allocation/control boundary. */
 #define kzalloc(size, flags) (allocations++, (void *)NULL)
+/* Behind that first allocation, which fails: never reached. */
+#define kvcalloc(...) (assert(!"bucket locks allocated"), (void *)NULL)
+#define spin_lock_init(lock) assert(!"bucket lock initialised")
+#define alloc_pages_exact(...) (assert(!"buckets allocated"), (void *)NULL)
+#define BUILD_BUG_ON(cond) _Static_assert(!(cond), #cond)
+#define PAGE_SIZE 4096u
+#define might_sleep() ((void)0)
 #define ExternalHashTableAllocCumulativeEntry(...) (allocations++, (void *)NULL)
 #define ehash_hcsync_fault_proc_init() (control_calls++)
 #define ManipOrStatsSetNode(...) (allocations++, (t_FmPcdManip *)NULL)

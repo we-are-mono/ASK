@@ -31,7 +31,7 @@ def test_sdk_port_pcd(tmp_path, unit):
         assert count == 1
         production = "".join(function(ehash, name) for name in (
             "ExternalHashTableAllocCumulativeEntry", "ExternalHashTableCumulativeEntryFree",
-            "FreeEnEhashInfo")) + creation
+            "FreeEnEhashInfo", "FM_PCD_HashTableDelete")) + creation
     elif unit == "reassembly":
         layout = (sdk / "inc/Peripherals/fm_ehash.h").read_text().split("static inline void display_mcast_member_tbl_entry", 1)[0]
         (tmp_path / "ehash_layout.h").write_text(layout + "\n#endif\n")

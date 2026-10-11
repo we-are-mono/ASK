@@ -1,4 +1,4 @@
-From f24db42bc1d863a5a22ec34410ee2471fd88a617 Mon Sep 17 00:00:00 2001
+From 34dce6f9c8bcf1c1ef2a11f8d0b7cf40996492f3 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -119,7 +119,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 +---
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1582 ++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1567 ++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +----
@@ -182,7 +182,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 83 files changed, 8252 insertions(+), 12443 deletions(-)
+ 83 files changed, 8237 insertions(+), 12443 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -5324,10 +5324,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..d60be8c3f1b4
+index 000000000000..ab9d0eef9aaa
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1582 @@
+@@ -0,0 +1,1567 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5822,7 +5822,7 @@ index 000000000000..d60be8c3f1b4
 +	struct en_exthash_tbl_entry *new_entry;
 +	uint16_t index;
 +	struct en_exthash_bucket *bucket;
-+	t_Handle *h_Spinlock;
++	t_Handle h_Spinlock;
 +	uint32_t intFlags;
 +	int retval;
 +	uint64_t phyaddr;
@@ -5842,7 +5842,7 @@ index 000000000000..d60be8c3f1b4
 +                                (uint16_t)info->hashmask, &index);
 +	bucket = ((struct en_exthash_bucket *)(info->table_base) + index);
 +
-+	h_Spinlock = *(info->pSpinlock + index);
++	h_Spinlock = &info->bucket_lock[index];
 +   	intFlags = XX_LockIntrSpinlock(h_Spinlock);
 +
 +	retval = index;
@@ -6050,24 +6050,12 @@ index 000000000000..d60be8c3f1b4
 +static void FreeEnEhashInfo(t_Handle handle)
 +{
 +	struct en_exthash_info *info;
-+	uint32_t ii;
-+	
++
 +	info = (struct en_exthash_info *)handle;
 +	if (info) {
-+		if (info->pSpinlock) {
-+			//free all bucket locks
-+			for (ii = 0; ii <= info->hashmask; ii++) {
-+				if (*(info->pSpinlock + ii)) {
-+					XX_FreeSpinlock(*(info->pSpinlock + ii));
-+				} else 
-+					break;
-+			}	
-+			//free lock handle array
-+			XX_FreeSmart(info->pSpinlock);
-+			info->pSpinlock = NULL;
-+		}
++		kvfree(info->bucket_lock);
 +		if (info->table_base)
-+			XX_FreeSmart(info->table_base);
++			free_pages_exact(info->table_base, info->tablesize);
 +		if (info->spare)
 +			ExternalHashTableCumulativeEntryFree(info->spare);
 +		kfree(info);
@@ -6080,6 +6068,7 @@ index 000000000000..d60be8c3f1b4
 +	struct en_exthash_bucket *buckets;
 +	uint32_t i;
 +
++	might_sleep();
 +	SANITY_CHECK_RETURN_ERROR(info, E_INVALID_HANDLE);
 +	/* Root deletion follows port detachment. Keep tables alive while a
 +	 * root or a flow can still reach them. */
@@ -6108,6 +6097,7 @@ index 000000000000..d60be8c3f1b4
 +	t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
 +	uint32_t table_type;
 +
++	might_sleep();
 +	/* Reject reserved reassembly types before touching PCD state or parameters. */
 +	if ((p_Param->table_type & TABLE_TYPE_MASK) == IPV4_REASSM_TABLE ||
 +	    (p_Param->table_type & TABLE_TYPE_MASK) == IPV6_REASSM_TABLE) {
@@ -6168,36 +6158,31 @@ index 000000000000..d60be8c3f1b4
 +	info->hashmask = p_Param->hashResMask;
 +	info->pcd = h_FmPcd;
 +	info->type = p_Param->table_type;
-+	//spin locks are required for tables filled by GPP
-+	//allocate memory for bucket lock handles
-+	info->pSpinlock = XX_MallocSmart((sizeof(t_Handle *) * (info->hashmask + 1)),
-+						0, sizeof(t_Handle));
-+	if (!info->pSpinlock) {
++	/* Spin locks are required for tables filled by GPP: one per bucket,
++	 * in a single array, so that neither creating nor deleting a table
++	 * costs an allocation per bucket. */
++	info->bucket_lock = kvcalloc(info->hashmask + 1, sizeof(*info->bucket_lock),
++				     GFP_KERNEL);
++	if (!info->bucket_lock) {
 +		REPORT_ERROR(MAJOR, E_NO_MEMORY,
 +			("spin lock array"));
 +		goto err_ret;
 +	}
-+	//allocate and initialize spin locks on all buckets
-+	for (ii = 0; ii <= info->hashmask; ii++) {
-+		*(info->pSpinlock + ii) = XX_InitSpinlock();
-+		if (!*(info->pSpinlock + ii)) {
-+			REPORT_ERROR(MAJOR, E_NO_MEMORY,
-+					("spinlock for en_ext_hash"));
-+			goto err_ret;
-+		}
-+	}
++	for (ii = 0; ii <= info->hashmask; ii++)
++		spin_lock_init(&info->bucket_lock[ii]);
 +
-+		info->tablesize = (sizeof(struct en_exthash_bucket) << (64 - num_of_zeroes) );
-+    	info->table_base = XX_MallocSmart(info->tablesize, 0 /*p_Param->externalHashParams.dataMemId not used */, 
-+			EN_EXTHASH_TBL_ALIGNMENT);
++	/* The FMan reads the buckets by DMA at their physical address, so
++	 * they are physically contiguous; page alignment covers
++	 * EN_EXTHASH_TBL_ALIGNMENT. */
++	BUILD_BUG_ON(EN_EXTHASH_TBL_ALIGNMENT > PAGE_SIZE);
++	info->tablesize = (sizeof(struct en_exthash_bucket) << (64 - num_of_zeroes) );
++	info->table_base = alloc_pages_exact(info->tablesize, GFP_KERNEL | __GFP_ZERO);
 +    	if (!info->table_base)
 +    	{
 +        	REPORT_ERROR(MAJOR, E_NO_MEMORY,
 +                	     ("en_ext_hash_table"));
 +		goto err_ret;
 +    	}
-+	//clear table
-+	memset(info->table_base, 0, info->tablesize);
 +	/* The node a delete falls back on when the allocator fails it
 +	 * (ehash_node_alloc()). */
 +	info->spare = ExternalHashTableAllocCumulativeEntry(info);
@@ -6386,7 +6371,7 @@ index 000000000000..d60be8c3f1b4
 +			    void *tbl_entry, struct en_cumulative_tbl_entry **node,
 +			    bool sync)
 +{
-+	t_Handle *h_Spinlock;
++	t_Handle h_Spinlock;
 +	uint32_t intFlags;
 +	uint64_t phyaddr;
 +	struct en_exthash_bucket *bucket;
@@ -6398,7 +6383,7 @@ index 000000000000..d60be8c3f1b4
 +
 +	bucket = ((struct en_exthash_bucket *)info->table_base + index);
 +	entry = (struct en_exthash_tbl_entry *)tbl_entry;
-+	h_Spinlock = *(info->pSpinlock + index);
++	h_Spinlock = &info->bucket_lock[index];
 +	intFlags = XX_LockIntrSpinlock(h_Spinlock);
 +	FM_EHASH_PRINT("%s(%d) tbl_entry %p\n", __func__,__LINE__,tbl_entry);
 +	// check if it normal node or cumulative node 
@@ -6748,7 +6733,7 @@ index 000000000000..d60be8c3f1b4
 +	int rc = 0;
 +
 +	bucket = (struct en_exthash_bucket *)info->table_base + index;
-+	h_Spinlock = *(info->pSpinlock + index);
++	h_Spinlock = &info->bucket_lock[index];
 +	intFlags = XX_LockIntrSpinlock(h_Spinlock);
 +	if (!bucket->h)
 +		goto out;
@@ -12299,7 +12284,7 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..c9d4e88e6b36
+index 000000000000..288ea0ded74c
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 @@ -0,0 +1,1525 @@
@@ -12944,7 +12929,7 @@ index 000000000000..c9d4e88e6b36
 +struct en_exthash_info {
 +	uint32_t flags;
 +	void *table_base;	//base of table in DDR
-+	void **pSpinlock;	//array of spin locks for each bucket
++	spinlock_t *bucket_lock;	//one spin lock per bucket, in one array
 +	void *h_Ad;		//handle to muRam holding AD
 +	unsigned int tree_owners;
 +	struct en_exthash_node node; //ccnode

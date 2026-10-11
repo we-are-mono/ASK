@@ -796,6 +796,10 @@ int cdx_ehash_resolve_abandoned(unsigned int *resolved)
 	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_roots, list)
 	{
 		rc = cdx_ehash_resolve_root(node);
+		/* A root not linked where it was added has had every bucket of
+		 * its table searched, each under its own lock. The callers hold
+		 * only mutexes, so a long backlog yields between roots. */
+		cond_resched();
 		if (rc == -ENOTRECOVERABLE)
 			return rc;
 		if (rc) {

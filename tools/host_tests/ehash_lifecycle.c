@@ -31,9 +31,11 @@ struct en_exthash_node {
 };
 struct en_exthash_bucket { uint64_t h, pad; };
 struct en_cumulative_tbl_entry;
+typedef struct { unsigned magic; } spinlock_t;
 struct en_exthash_info {
-    void *table_base, **pSpinlock, *h_Ad, *pcd;
-    unsigned tree_owners, hashmask, num_keys;
+    void *table_base, *h_Ad, *pcd;
+    spinlock_t *bucket_lock;
+    unsigned tree_owners, hashmask, num_keys, tablesize;
     struct en_exthash_node node;
     struct en_cumulative_tbl_entry *spare;
 };
@@ -55,9 +57,13 @@ typedef struct next_engine t_FmPcdCcNextEngineParams;
 static unsigned allocations;
 static void *allocate(size_t size) { void *p = calloc(1, size); assert(p); allocations++; return p; }
 static void release(void *p) { assert(p && allocations); allocations--; free(p); }
-#define XX_FreeSpinlock release
-#define XX_FreeSmart release
 #define kfree release
+static void kvfree(void *p) { if (p) release(p); }
+/* The buckets, given back by the size a table records for them. */
+static void free_pages_exact(void *p, size_t size)
+{ assert(size == 2 * sizeof(struct en_exthash_bucket)); release(p); }
+/* sdk_ehash_create.c checks that table deletion says it may sleep. */
+#define might_sleep() ((void)0)
 static void ExternalHashTableCumulativeEntryFree(void *node) { release(node); }
 static void *FmPcdGetMuramHandle(void *pcd) { assert(pcd); return pcd; }
 static void FM_MURAM_FreeMem(void *muram, void *p) { assert(muram); release(p); }
@@ -86,9 +92,9 @@ static struct en_exthash_info *table(t_FmPcd *pcd)
 {
     struct en_exthash_info *t = allocate(sizeof(*t));
     t->pcd = pcd; t->hashmask = 1;
-    t->table_base = allocate(2 * sizeof(struct en_exthash_bucket));
-    t->pSpinlock = allocate(2 * sizeof(void *));
-    for (unsigned i = 0; i < 2; i++) t->pSpinlock[i] = allocate(1);
+    t->tablesize = 2 * sizeof(struct en_exthash_bucket);
+    t->table_base = allocate(t->tablesize);
+    t->bucket_lock = allocate(2 * sizeof(spinlock_t));
     t->spare = allocate(1);
     return t;
 }
@@ -133,6 +139,9 @@ static void *kmalloc_stub(size_t size) { return kmalloc_fails ? NULL : allocate(
 static struct { struct { bool mutex; } ctrl; } cdx_instance, *cdx_info = &cdx_instance;
 static unsigned unlocked;
 #define lockdep_assert_held(lock) do { if (!*(lock)) unlocked++; } while (0)
+/* A table search can visit every bucket; the resolver yields after each. */
+static unsigned yields;
+#define cond_resched() ((void)yields++)
 #define SUCCESS 0
 #define FAILURE (-1)
 #define EN_EHASH_DELETE_UNSYNCED (-2)
@@ -312,9 +321,10 @@ static void check_abandoned(void)
     /* Still linked where it was added, and still refused, most likely for a
      * cumulative node: the restart waits, keeping everything. */
     find_rc = 0; found_in = 5;
-    unsigned asked = deletes;
+    unsigned asked = deletes, yielded = yields;
     assert(cdx_ehash_resolve_abandoned(&resolved) == -EAGAIN && !resolved);
     assert(deletes == asked + 1 && deleted_from == 5 && allocations == held + 6);
+    assert(yields == yielded + 1);
     /* Linked from another bucket than it was added to: deleted there. Its
      * dependents go only now, with every root settled. */
     delete_rc = SUCCESS; found_in = 9;
@@ -419,12 +429,17 @@ int main(void)
         assert(unparks == cycle + 1 && unparked == t);
         assert(!allocations);
     }
-    /* Failed creation must release the same partially allocated resources. */
+    /* Failed creation must release the same partially allocated resources:
+     * the table alone, with its bucket locks, and with its buckets too. */
     for (unsigned n = 0; n < 3; n++) {
         struct en_exthash_info *t = allocate(sizeof(*t));
         t->pcd = &pcd; t->hashmask = 1;
-        t->pSpinlock = allocate(2 * sizeof(void *));
-        for (unsigned i = 0; i < n; i++) t->pSpinlock[i] = allocate(1);
+        if (n > 0)
+            t->bucket_lock = allocate(2 * sizeof(spinlock_t));
+        if (n > 1) {
+            t->tablesize = 2 * sizeof(struct en_exthash_bucket);
+            t->table_base = allocate(t->tablesize);
+        }
         FreeEnEhashInfo(t);
         assert(!allocations);
     }

@@ -47,15 +47,19 @@ static unsigned link_barriers;
 #define dma_wmb() ((void)link_barriers++)
 static unsigned warnings;
 #define WARN_ONCE(cond, ...) ({ bool warned_ = (cond); if (warned_) warnings++; warned_; })
+/* A bucket lock: one element of the table's array of them. */
+typedef struct { bool unused; } spinlock_t;
 
 #include "ehash_types.inc"
 
 /* The bucket and parked-list locks: held around exactly the code they cover,
- * never across a sync. */
+ * never across a sync, and a bucket lock released is the one taken. */
 static bool bucket_locked;
-static uint32_t XX_LockIntrSpinlock(t_Handle lock) { assert(lock && !bucket_locked); bucket_locked = true; return 7; }
+static t_Handle bucket_held;
+static uint32_t XX_LockIntrSpinlock(t_Handle lock)
+{ assert(lock && !bucket_locked); bucket_locked = true; bucket_held = lock; return 7; }
 static void XX_UnlockIntrSpinlock(t_Handle lock, uint32_t flags)
-{ assert(lock && bucket_locked && flags == 7); bucket_locked = false; }
+{ assert(lock == bucket_held && bucket_locked && flags == 7); bucket_locked = false; bucket_held = NULL; }
 #define spin_lock_irqsave(lock, flags) do { assert(!*(lock)); *(lock) = true; (flags) = 0; } while (0)
 #define spin_unlock_irqrestore(lock, flags) do { assert(*(lock)); *(lock) = false; (void)(flags); } while (0)
 
@@ -122,8 +126,8 @@ static int ehash_delete_hcsync(struct en_exthash_info *info)
 
 #define KEY 16
 static struct en_exthash_bucket bucket;
-static void *bucket_lock = (void *)1;
-static struct en_exthash_info info = { .table_base = &bucket, .pSpinlock = &bucket_lock, .pcd = &pcd };
+static spinlock_t bucket_lock;
+static struct en_exthash_info info = { .table_base = &bucket, .bucket_lock = &bucket_lock, .pcd = &pcd };
 
 static struct en_exthash_tbl_entry *entry(unsigned n)
 {
@@ -222,8 +226,8 @@ static void check_find(void)
 {
     struct en_exthash_tbl_entry *e[12], *stranger = entry(999);
     struct en_exthash_bucket buckets[4] = { 0 };
-    void *locks[4] = { (void *)1, (void *)2, (void *)3, (void *)4 };
-    struct en_exthash_info wide = { .table_base = buckets, .pSpinlock = locks, .pcd = &pcd,
+    spinlock_t locks[4] = { 0 };
+    struct en_exthash_info wide = { .table_base = buckets, .bucket_lock = locks, .pcd = &pcd,
                                     .hashmask = 3 };
     unsigned before;
 
@@ -351,8 +355,8 @@ static void check_deferred(void)
 {
     struct en_exthash_tbl_entry *e[3];
     struct en_exthash_bucket second_bucket = { 0 };
-    void *second_lock = (void *)2;
-    struct en_exthash_info second = { .table_base = &second_bucket, .pSpinlock = &second_lock,
+    spinlock_t second_lock = { 0 };
+    struct en_exthash_info second = { .table_base = &second_bucket, .bucket_lock = &second_lock,
                                       .pcd = &pcd };
     struct en_cumulative_tbl_entry *own, *spare;
     unsigned before;
