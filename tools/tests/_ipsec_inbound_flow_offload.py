@@ -42,13 +42,19 @@ def crypto(reqid):
             "auth-trunc", "hmac(sha256)", AUTH, "128"]
 
 
-async def sec_counter(session, agent, iface, name):
-    """`tx toenc`/`tx todec` across CPUs: frames the software path gave SEC."""
+async def sec_counters(session, agent, iface, names):
+    """`tx toenc`/`tx todec` across CPUs, from one `ethtool -S` read: frames
+    the software path gave SEC."""
     result = await agent.exec_cmd(session, ["ethtool", "-S", iface])
     assert result["rc"] == 0, result
-    return sum(int(line.split(":")[1])
-               for line in result["stdout"].splitlines()
-               if line.strip().startswith(f"{name} [CPU"))
+    lines = [line.strip() for line in result["stdout"].splitlines()]
+    return {name: sum(int(line.split(":")[1]) for line in lines
+                      if line.startswith(f"{name} [CPU"))
+            for name in names}
+
+
+async def sec_counter(session, agent, iface, name):
+    return (await sec_counters(session, agent, iface, [name]))[name]
 
 
 async def flows(session, agent):

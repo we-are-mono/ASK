@@ -25,7 +25,7 @@ from _flowtable_rig import WAN_IP, command, console_command, read
 from _flowtable_service import CONF, INIT, service_status, wait_service
 from _flowtable_service_ipsec import INNER, LAN_INNER, Transform
 from _flowtable_service_ipsec_replay import AEAD, peer_errors, xfrm_mib
-from _ipsec_inbound_flow_offload import sec_counter
+from _ipsec_inbound_flow_offload import sec_counters
 from _throughput import tcp_floor
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 
@@ -74,8 +74,7 @@ async def test_rate(ipsec_service, upload):
                 assert row[field] != "0", row
 
         async def software_sec():
-            return {name: await sec_counter(r.session, r.target, TARGET_WAN_IF, name)
-                    for name in ("tx toenc", "tx todec")}
+            return await sec_counters(r.session, r.target, TARGET_WAN_IF, ("tx toenc", "tx todec"))
 
         def offloaded(delta):
             assert 0 <= delta["tx toenc"] <= SOFTWARE_SEC and delta["tx todec"] == 0, delta

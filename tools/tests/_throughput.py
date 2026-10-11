@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
@@ -109,21 +110,35 @@ async def _sample(r, record, *, server, client, port, upload, family, streams, r
     try:
         await asyncio.sleep(0.3)
         assert server_side.returncode is None, "the endpoint iperf3 did not start"
+        loop = asyncio.get_running_loop()
+        # Each edge of the window reads the DUT's state, CPU, software transmit
+        # and the caller's counters, a few seconds' worth over the UART and a
+        # fraction of that over the USB port. One edge read here, timed, sizes
+        # the run so both edges and the window between them fall inside it
+        # whichever carries the agent. The window opens STAGING after launch,
+        # where iperf3 may already have started, so the run is counted from
+        # the launch. A previous sample's entries outlive its streams by a
+        # second or so; none of them is this sample's.
+        edge = loop.time()
+        stale = {f["cookie"] for f in (await r.state())["flows"]}
+        if counters:
+            await counters()
+        await software_tx(r)
+        await cpu(r)
+        record["edge"] = edge = loop.time() - edge
+        record["seconds"] = seconds = max(SECONDS,
+                                          math.ceil(STAGING + RAMP + WINDOW + 2 * edge + 1))
         record["argv"] = argv = [
             "iperf3", "-c", server, "-B", client, "-p", str(port), "-P", str(streams),
-            "-t", str(SECONDS), "-Z", "-J", *(["-6"] if family == 6 else []),
+            "-t", str(seconds), "-Z", "-J", *(["-6"] if family == 6 else []),
             *([] if upload else ["-R"])]
         script = f'''
 import json, subprocess
-result = subprocess.run({argv!r}, capture_output=True, text=True, timeout={SECONDS + 20})
+result = subprocess.run({argv!r}, capture_output=True, text=True, timeout={seconds + 20})
 print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}}))
 '''
-        # A previous sample's entries outlive its streams by a second or so;
-        # none of them is this sample's.
-        stale = {f["cookie"] for f in (await r.state())["flows"]}
-        loop = asyncio.get_running_loop()
         launched = loop.time()
-        task = asyncio.create_task(run(script, label=label, timeout=SECONDS + 40))
+        task = asyncio.create_task(run(script, label=label, timeout=seconds + 40))
         data_in = TARGET_LAN_IF if upload else TARGET_WAN_IF
         target = endpoint(server, port)
         while True:
@@ -139,7 +154,7 @@ print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout, 'stderr': r
         # Inside the settled part of the run, which the rate is taken from,
         # and over before the run is.
         start = max(loop.time(), launched + STAGING + RAMP)
-        assert start + WINDOW < launched + STAGING + SECONDS - 0.5, \
+        assert start + WINDOW + 2 * edge < launched + seconds - 0.5, \
             "the streams entered hardware too late in the run to measure them there"
         await asyncio.sleep(start - loop.time())
         record["before"] = before = await r.state()
