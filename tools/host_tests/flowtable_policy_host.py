@@ -359,7 +359,11 @@ def test_builtin_default_is_the_shipped_configuration(engine):
     resolution and every scope and exclusion in order, so an edit to either
     that is not made to the other changes it."""
     recipe = (ROOT / "meta-ask/recipes-ask/config/config_1.0.bb").read_text()
-    assert "${ASK_SRCROOT}/config/offload.conf ${D}${sysconfdir}/ask/offload.conf" in recipe
+    # Fetched from the checkout's config/, which no copy beside the recipe
+    # shadows, and installed where the daemon reads it.
+    assert "${ASK_SRCROOT}/config:" in recipe and "file://offload.conf" in recipe
+    assert not (ROOT / "meta-ask/recipes-ask/config/files/offload.conf").exists()
+    assert "${UNPACKDIR}/offload.conf ${D}${sysconfdir}/ask/offload.conf" in recipe
     source = (ENGINE / "main.c").read_text()
     literal = re.search(r"static const char DEFAULT_CONF\[\] =(.*?);", source, re.S)
     assert literal, "main.c no longer defines DEFAULT_CONF"
