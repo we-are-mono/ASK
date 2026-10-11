@@ -3,7 +3,7 @@ DESCRIPTION = "Linux kernel driver for TI LP5812 LED controller that supports 4x
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0-only;md5=801f80980d171dd6425610833a22dbe6"
 
-inherit module
+inherit module ask-provenance
 
 SRC_URI = " \
     file://leds-lp5812.c \

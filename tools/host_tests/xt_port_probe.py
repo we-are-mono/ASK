@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import re
 
-import pytest
+from _kernel_source import kernel_source
 
 ROOT = Path(__file__).resolve().parents[2]
 PATCH = ROOT / "patches/kernel/148-netfilter-nftables-commit-in-progress.patch"
@@ -54,12 +54,9 @@ def braced(text, head):
 
 
 def test_xt_port_probe(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     ip_tables = kernel / "net/ipv4/netfilter/ip_tables.c"
     x_tables_h = kernel / "include/linux/netfilter/x_tables.h"
-    if not ip_tables.exists() or not x_tables_h.exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     (tmp_path / "ip_packet_match.inc").write_text(braced(
         ip_tables.read_text(), r"^static inline bool\nip_packet_match\("))
     (tmp_path / "ifname.inc").write_text(braced(

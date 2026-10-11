@@ -15,13 +15,11 @@ import os
 from pathlib import Path
 
 from _host_qos_lifecycle import (function)
-
-ROOT = Path(__file__).resolve().parents[2]
+from _kernel_source import (kernel_source)
 
 
 def test_ipsec_sec_submit(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     source = (kernel / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c").read_text()
     # The header sizes, the L3 finder, the DPOVRD choice and the submit.
     (tmp_path / "ipsec_sec_submit.inc").write_text(
@@ -62,8 +60,7 @@ def test_ipsec_inbound_submit_device(tmp_path):
     ESP-in-UDP included, up to the twelve bits SEC takes, if it came in UDP
     exactly when its state has an encapsulation.
     """
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     source = (kernel / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c").read_text()
     (tmp_path / "ipsec_inbound_submit.inc").write_text(
         # The header sizes and the parser's reach the DPOVRD value is bound by.

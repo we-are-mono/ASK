@@ -1,17 +1,19 @@
 """CDX startup rollback, driven from a boot where CDX has not loaded yet.
 
 Run separately from tools/tests: these cases require an unconfigured FMAN, so
-boot an image with cdx commented out of config/ask-modules.conf. The final
-checks load and unload CDX successfully in the same boot.
+boot the staged test image with rdinit=/bin/sh, where no init script loads
+cdx. The final checks load and unload CDX successfully in the same boot.
 """
 
 import asyncio
 import base64
 import gzip
 import json
+from pathlib import Path
 import re
 import shlex
 
+from ask_orch import manifest
 from ask_orch.uart import Console
 from ask_orch.artifacts import artifact_dir, record
 from ask_orch.commands import console_json, console_python
@@ -44,7 +46,7 @@ SPLATS = re.compile(r"BUG:|WARNING: CPU:|Oops:|Kernel panic|possible circular lo
                     r"unable to release|Error in releasing")
 
 
-def test_rollback(tmp_path):
+def test_rollback(tmp_path, request):
     tmp_path = artifact_dir()
     with Console.target(log_path=str(tmp_path / "uart.log")) as con:
         con.login("root", None)
@@ -56,16 +58,21 @@ def test_rollback(tmp_path):
 
         run("stty cols 240 -echo")
         # The only precondition that matters is an FMAN nothing has configured
-        # yet. Boot an image with cdx left out of
+        # yet. Boot the staged image with rdinit=/bin/sh, so nothing runs
         # /etc/modules-load.d/ask.conf; the sweep loads and unloads cdx itself.
         assert not re.search(r"^cdx ", run("cat /proc/modules"), re.M), \
-            "boot an image with cdx left out of the autoload list"
+            "boot the staged image with rdinit=/bin/sh, before anything loads cdx"
         boot = run("cat /proc/sys/kernel/random/boot_id")
         # What a release ledger ties this run to: the boot, and the image the
         # other runs must share.
         record("dut", {"boot_id": boot}, nodeid="session")
         identity = asyncio.run(console_python(con, image_script(), timeout=120))
-        record("firmware", {"image": console_json(identity["stdout"])}, nodeid="session")
+        image = console_json(identity["stdout"])
+        problems = manifest.verify(Path(__file__).resolve().parents[2], image)
+        record("firmware", {"image": image, "build_problems": problems}, nodeid="session")
+        if request.config.getoption("--release"):
+            assert not problems, ("DUT image was not built from this checkout ("
+                                  + "; ".join(problems) + "); " + manifest.REMEDY)
         muram_paths = run("find /sys/devices -name fm_muram_free_size").splitlines()
         assert muram_paths, "FMAN MURAM accounting is required"
         muram_command = "cat " + " ".join(shlex.quote(p) for p in muram_paths)

@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from _host_qos_lifecycle import (function)
+from _kernel_source import (kernel_source)
 
 ROOT = Path(__file__).resolve().parents[2]
 SDK_REL = Path("drivers/net/ethernet/freescale/sdk_dpaa")
@@ -26,19 +27,8 @@ def definition(source, name):
 
 
 def test_ipsec_lifecycle(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
-    # Accept either an already rebuilt SDK or the previous build. In the
-    # latter case apply the committed patch in isolation, never in the build.
-    relative = SDK_REL / "dpaa_eth_sg.c"
-    staged = tmp_path / relative
-    staged.parent.mkdir(parents=True)
-    staged.write_bytes((kernel / relative).read_bytes())
-    patch = ROOT / "patches/kernel/105-sdk_dpaa-buffer-seed-failure.patch"
-    reverse = run_process(["git", "apply", "--reverse", "--check", str(patch)],
-                             cwd=tmp_path, capture_output=True)
-    if reverse.returncode:
-        run_process(["git", "apply", str(patch)], cwd=tmp_path, check=True)
+    kernel = kernel_source()
+    sg = (kernel / SDK_REL / "dpaa_eth_sg.c").read_text()
     sdk = (kernel / SDK_REL / "dpaa_eth_common.c").read_text()
     sdk = sdk.replace("__cold __attribute__((nonnull))\n", "")
     source = (ROOT / "cdx/dpa_ipsec.c").read_text()
@@ -80,8 +70,8 @@ def test_ipsec_lifecycle(tmp_path):
         + function(source, "dpa_ipsec_drain_dqrr")
         + source[source.index("#define CDX_MAX_SG_BUFF_SIZE"):
                source.index("static void ipsec_free_sg_buffer")]
-        + function(staged.read_text(), "dpaa_bp_alloc_n_add_buffs")
-        + function(staged.read_text(), "dpa_bp_recycle_frag")
+        + function(sg, "dpaa_bp_alloc_n_add_buffs")
+        + function(sg, "dpa_bp_recycle_frag")
         + function(sdk, "dpa_bp_drain") + function(sdk, "_dpa_bp_free")
         + "\n".join(function(devman, n) for n in
                     ["cdx_drain_fq", "cdx_destroy_fq", "cdx_drain_fq_list", "cdx_destroy_fq_list"])

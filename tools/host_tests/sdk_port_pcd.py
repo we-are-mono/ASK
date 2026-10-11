@@ -2,7 +2,8 @@
 
 from ask_orch.process import run_process
 
-from _host_sdk_port_pcd import (ROOT, function)
+from _host_sdk_port_pcd import (function)
+from _kernel_source import (kernel_source)
 from pathlib import Path
 import os
 import re
@@ -14,11 +15,8 @@ import pytest
 @pytest.mark.parametrize("unit", ["port_pcd", "port_api", "port_free", "port_free_legacy",
                                   "kg_plan", "reassembly", "ehash_create"])
 def test_sdk_port_pcd(tmp_path, unit):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
-    if not (sdk / "inc").exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     if unit == "ehash_create":
         layout = (sdk / "inc/Peripherals/fm_ehash.h").read_text().split("static inline void display_mcast_member_tbl_entry", 1)[0]
         (tmp_path / "ehash_layout.h").write_text(layout + "\n#endif\n")

@@ -5,17 +5,13 @@ from pathlib import Path
 import os
 import shutil
 
-import pytest
-
-from _host_sdk_scheme_delete import (ROOT, function)
+from _host_sdk_scheme_delete import (function)
+from _kernel_source import (kernel_source)
 
 
 def test_sdk_scheme_set(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
-    if not (sdk / "inc").exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE")
     pcd = (sdk / "Peripherals/FM/Pcd/fm_pcd.c").read_text()
     kg = (sdk / "Peripherals/FM/Pcd/fm_kg.c").read_text()
     hc = (sdk / "Peripherals/FM/HC/hc.c").read_text()

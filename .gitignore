@@ -29,6 +29,7 @@ sources/
 # Editor files
 *.swp
 *.swo
+.vscode/
 
 # Python bytecode
 __pycache__/
@@ -42,9 +43,11 @@ IPSEC.md
 /pdf/
 
 # OpenEmbedded / kas build output (oe-logs/oe-workdir are symlinks into the
-# bitbake work tree — no trailing slash so the symlinks match too)
+# bitbake work tree — no trailing slash so the symlinks match too; externalsrc
+# holds singletask.lock in the source tree while a task runs)
 oe-logs
 oe-workdir
+singletask.lock
 build/*.log
 build/conf/
 meta-ask/build/

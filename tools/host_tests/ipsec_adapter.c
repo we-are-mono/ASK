@@ -2568,14 +2568,12 @@ static void test_receiving_policy(void)
 		pol.mark.m = 0xff;
 		list_add_tail(&pol.walk.all, &init_net.xfrm.policy_all);
 		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
-#ifdef FT_SOCKET_POLICY_EXEMPT
 		/* A socket's own policy governs that socket's packets and never a
 		 * forwarded one, however it is marked. */
 		pol.index = 8 + XFRM_POLICY_MAX + XFRM_POLICY_OUT;
 		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
 		pol.index = 8 + XFRM_POLICY_FWD;
 		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
-#endif
 		pol.walk.dead = true;
 		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
 		list_del(&pol.walk.all);

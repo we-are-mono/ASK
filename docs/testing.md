@@ -106,7 +106,7 @@ Additional system dependencies depend on the selected suite:
 |---|---|
 | Python harness checks in `tools/host_tests/harness.py` | Runner environment only; no board or compiler |
 | Compiled host regressions | C/C++ compiler, headers, standard C++ library, AddressSanitizer and UndefinedBehaviorSanitizer; Debian's `build-essential` toolchain supplies these. `HOSTCC` selects a compiler instead of `cc`. |
-| SDK/FMC/FMLIB host regressions | Patched kernel and pinned vendor source trees from the image build. `ASK_KERNEL_SOURCE` overrides the kernel tree; it must contain the ASK patches and SDK headers. |
+| SDK/FMC/FMLIB host regressions | Patched kernel and pinned vendor source trees from an image build of this checkout. `ASK_KERNEL_SOURCE` overrides the kernel tree; it must be one such a build prepared. |
 | DUT traffic tests | WAN agent, `ip`/`bridge`/`tc`, `iptables`, `conntrack`, `ethtool`, `iperf3`, `tcpdump`, and access to the DUT UART and LAN guest agent |
 | PPPoE tests and ISP profile | WAN-side `pppd` and `/usr/sbin/pppoe-server`, kernel PPPoE support, and the corresponding tools/modules in the DUT image |
 | Image building and booting | `make setup` build dependencies, kas, a TFTP server and the staged image/DTB |
@@ -589,9 +589,14 @@ pytest -c tools/pyproject.toml tools/host_tests -k qos
 ```
 
 The SDK regression uses the patched kernel source from the build tree.
-Set `ASK_KERNEL_SOURCE` to test another patched tree. Missing SDK or vendor
-sources fail the host suite with an actionable error; no SDK tests silently
-skip. Build the image first to fetch and patch the required sources.
+Set `ASK_KERNEL_SOURCE` to test another tree an image build prepared. Missing
+SDK or vendor sources fail the host suite with an actionable error; no SDK
+tests silently skip. Build the image first to fetch and patch the required
+sources. The tree follows `patches/kernel/` only once a build has run since
+the series changed, so it carries the build record of the kernel inputs it
+was prepared from (`.ask-provenance.json`). A tree whose record differs from
+the checkout fails every test that compiles from it until the image is
+rebuilt, rather than testing the previous patches.
 Forced-drain cases hold frames in a queue until timeout or fail its query,
 then verify that pool buffers and skb-backed frames are reclaimed before
 the interface context is released. Persistent hardware errors and prefetch
@@ -721,8 +726,31 @@ offered load or `ASK_REGEN_ABI_SNAPSHOT`. A release proves the defaults.
 waiver in the matrix accounts for; `test_long_exchange` is waived as a
 diagnostic.
 
+A release also refuses an image this checkout did not build, before any case
+runs. Every recipe in `meta-ask` inherits `ask-provenance`, which records the
+checkout files it builds from, each by content: the recipe, its local sources,
+its external source tree and the directories it declares. The kernel declares
+`patches/kernel/` and `dts/`, and the image declares the whole layer. A file
+counts if git would commit it, under the checkout's own ignore rules. The
+record is taken before configure, and any change to that set of files takes
+it again and rebuilds what depends on it. A local source that changes while
+the build reads it fails the build. Each record is installed in
+`/usr/share/ask/provenance/`. The device tree, which U-Boot loads apart from
+the kernel, carries the digest of the kernel's record as its
+`mono,ask-provenance` root property. The preflight compares each record with
+the checkout (`tools/ask_orch/manifest.py`). It refuses a component built from
+other sources, a recipe without a record, a record without a recipe, and a
+device tree from another kernel build. Where the build tree still holds the
+image's record, the refusal names the files that changed; otherwise it says
+the build tree did not last build that part of the image. Rebuilding, staging
+and booting the image clears all of them. Outside a release the same differences are a warning, because
+testing an older image on purpose is legitimate. The test agent's installed
+sources are compared separately, which also catches an agent patched in place
+on the DUT.
+
 Each finished run appends its outcome, boot ID and DUT image identity (the
-kernel's build notes and a digest of `/lib/modules/<release>`) to
+kernel's build notes, a digest of `/lib/modules/<release>`, the build records
+and the device tree's property) to
 `release-ledger.jsonl` beside the run directories, or to
 `ASK_RELEASE_LEDGER`. Set `ASK_TEST_ARTIFACTS` to durable storage for a release:
 the default root is a tmpfs. `make release-status` takes each entry's latest
@@ -792,8 +820,9 @@ rollback after an HC timeout; the board-reset requirement still applies.
 enqueue, completion and cleanup helpers together with the Linux QMan wrapper
 under ASan/UBSan. It injects rejection, missing and late confirmations,
 completion at the deadline, overlapping commands, pool exhaustion and partial
-allocation failure. Set `ASK_KERNEL_SOURCE` to a patched kernel tree, or use
-the default build tree, and run it with the other host tests. Hardware smoke,
+allocation failure. It compiles from the default build tree, or from another
+tree an image build of this checkout prepared named by `ASK_KERNEL_SOURCE`,
+and runs with the other host tests. Hardware smoke,
 scheme lifecycle and offload tests cover normal confirmed commands; the
 transport timeout injections run on the host.
 

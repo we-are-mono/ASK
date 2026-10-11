@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import re
 
-ROOT = Path(__file__).resolve().parents[2]
+from _kernel_source import kernel_source
 
 
 def target(source, name):
@@ -24,8 +24,7 @@ def target(source, name):
 
 
 def test_npt_conntrack(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     uapi = (kernel / "include/uapi/linux/netfilter/nf_conntrack_common.h").read_text()
     npt = (kernel / "include/uapi/linux/netfilter_ipv6/ip6t_NPT.h").read_text()
     start = "enum ip_conntrack_info {"

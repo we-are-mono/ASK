@@ -6,17 +6,14 @@ from pathlib import Path
 import os
 import re
 
-import pytest
+from _kernel_source import kernel_source
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_ehash_teardown(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
-    if not sdk.exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
 
     def function(source, name):
         match = re.search(r"^(?:static )?(?:void|t_Error|uint32_t) " + name

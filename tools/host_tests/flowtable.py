@@ -7,17 +7,15 @@ replace/remove, counter deltas, and invalidation are compiled from CDX itself.
 from ask_orch.process import run_process
 
 from _host_flowtable import (ROOT, flowtable_source, function)
+from _kernel_source import (kernel_source)
 import os
 from pathlib import Path
 import re
 
-import pytest
-
 
 def test_decoder_and_lifecycle(tmp_path):
     source = flowtable_source()
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     hashes = (kernel / "include/linux/jhash.h").read_text()
     (tmp_path / "flowtable_hash.inc").write_text(
         # From __jhash_mix, not __jhash_final: jhash2 needs both macros.
@@ -138,8 +136,7 @@ def test_hardware_ownership(tmp_path):
 
 
 def test_neighbour_fallback(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     source = (kernel / "net/netfilter/nf_flow_table_ip.c").read_text()
     offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     (tmp_path / "neigh_fallback_production.inc").write_text(
@@ -162,15 +159,10 @@ def test_neighbour_fallback(tmp_path):
 
 
 def test_stats_poll(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
     stats = function(offload, "nf_flow_offload_stats")
-    # The tree the image build unpacked; it follows patches/kernel/ only once a
-    # build has run since the patch changed.
-    if "stats_time" not in stats:
-        pytest.skip(f"{kernel} predates patch 140's partial-flow statistics poll")
     (tmp_path / "stats_poll_production.inc").write_text(
         function(header, "nf_flow_timeout_delta") + stats)
     binary = tmp_path / "flowtable_stats_poll"
@@ -215,8 +207,7 @@ def test_qos_flow_class(tmp_path):
     """The adapter's classifier for the software Tx path finds a frame's
     connection again when a scrub took its conntrack, by the inverse of the
     packet's own tuple, and gives back the reference the lookup took."""
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     uapi = (kernel / "include/uapi/linux/netfilter/nf_conntrack_common.h").read_text()
     start = "enum ip_conntrack_info {"
     (tmp_path / "qos_flow_class_types.inc").write_text(
@@ -241,8 +232,7 @@ def test_software_path_carries_the_conntrack(tmp_path):
     """The software flowtable's forward step, compiled from the kernel, hands
     every frame it forwards its flow's conntrack with a reference of its own,
     and none to a frame it gives back to the stack."""
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     source = (kernel / "net/netfilter/nf_flow_table_ip.c").read_text()
     uapi = (kernel / "include/uapi/linux/netfilter/nf_conntrack_common.h").read_text()
     (tmp_path / "flowtable_ct_types.inc").write_text("".join(

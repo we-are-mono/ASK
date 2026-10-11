@@ -9,7 +9,7 @@ import random
 import re
 import sys
 
-import pytest
+from _kernel_source import kernel_source
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools/tests"))
@@ -17,11 +17,8 @@ import _ehash_bucket as model  # noqa: E402
 
 
 def kernel_hash(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     pcd = kernel / "drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd"
-    if not pcd.exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     source = (pcd / "fm_cc.c").read_text()
     match = re.search(r"^void get_indexed_hash_bucket\([^;]*?\)\s*\{", source, re.M)
     assert match, "get_indexed_hash_bucket"

@@ -8,7 +8,7 @@ import shutil
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
+from _kernel_source import kernel_source
 
 
 def function(source, name):
@@ -24,14 +24,11 @@ def function(source, name):
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["ls104x", "legacy"])
 def test_sdk_port_resources(tmp_path, legacy):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
-    if not (sdk / "inc").exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE")
     source = (sdk / "Peripherals/FM/fm.c").read_text()
     marker = "/* All shared resource accounting is protected by the FM lock."
-    production = source[source.index(marker):source.index("t_Error FmGetSetPortParams(")] if marker in source else ""
+    production = source[source.index(marker):source.index("t_Error FmGetSetPortParams(")]
     production += "\n".join(function(source, name) for name in [
         "FmGetSetPortParams", "FmFreePortParams", "FmSetNumOfTasks",
         "FmSetSizeOfFifo", "FmSetNumOfOpenDmas",

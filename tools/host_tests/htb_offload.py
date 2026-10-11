@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 
-import pytest
+from _kernel_source import kernel_source
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -31,11 +31,8 @@ def function(source, name):
 def test_htb_offload(tmp_path):
     compiler = os.environ.get("CC", "cc")
     assert shutil.which(compiler), f"C compiler required: {compiler}"
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     dsfield = kernel / "include/net/dsfield.h"
-    if not dsfield.exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE for include/net/dsfield.h")
     # The kernel's own rewrite, so a remark is checked against the header and
     # checksum it really leaves rather than against a restatement of it.
     (tmp_path / "dsfield.inc").write_text("".join(

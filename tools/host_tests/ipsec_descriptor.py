@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import re
 
-import pytest
+from _kernel_source import kernel_source
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -51,11 +51,8 @@ def test_ipsec_descriptor_drains_before_counters(tmp_path):
     sec_h = (ROOT / "cdx/cdx_dpa_ipsec.h").read_text()
     control = (ROOT / "cdx/control_ipsec.h").read_text()
     layout = (ROOT / "cdx/dpa_ipsec.h").read_text()
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     caam = kernel / "drivers/crypto/caam"
-    if not (caam / "desc_constr.h").exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     pdb = (caam / "pdb.h").read_text()
     decap = re.search(r"struct ipsec_decap_pdb \{.*?\n\}[^;\n]*;", pdb, re.S).end()
     for name in ("desc.h", "desc_constr.h"):

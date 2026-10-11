@@ -14,6 +14,7 @@ import re
 
 from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
+from _kernel_source import (kernel_source)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -22,8 +23,7 @@ def test_ipsec_adapter(tmp_path):
     source = flowtable_source()
     rule = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     backend = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     policy = (kernel / "net/xfrm/xfrm_policy.c").read_text()
     state = (kernel / "net/xfrm/xfrm_state.c").read_text()
     replay = (kernel / "net/xfrm/xfrm_replay.c").read_text()
@@ -121,16 +121,12 @@ def test_ipsec_adapter(tmp_path):
     # callback above.
     attachment = ["ft_ipsec_attach", "ft_ipsec_detach"]
     # Patch 140 tells a socket's own policy apart by the direction its index
-    # encodes. A tree unpacked before that has neither the call nor the case
-    # that exercises it.
-    check = function(policy, "xfrm_flowtable_policy_check")
-    socket_policies = "xfrm_policy_is_dead_or_sk" in check
+    # encodes, through xfrm_policy_is_dead_or_sk().
     (tmp_path / "ipsec_production.inc").write_text(
-        ("#define FT_SOCKET_POLICY_EXEMPT\n" if socket_policies else "")
-        + "\n".join(function(policy, name) for name in (
+        "\n".join(function(policy, name) for name in (
             "xfrm_state_ok", "xfrm_policy_ok", "secpath_has_nontransport",
-            *(("xfrm_policy_is_dead_or_sk",) if socket_policies else ())))
-        + check
+            "xfrm_policy_is_dead_or_sk"))
+        + function(policy, "xfrm_flowtable_policy_check")
         # xfrm's own judge of a lifetime, which the accounting pass hands its
         # counters to. Renamed so the harness can count the calls around it.
         + function(state, "xfrm_state_check_expire").replace(
@@ -296,8 +292,7 @@ def test_ipsec_keys(tmp_path):
     backend = (ROOT / "cdx/cdx_ipsec_backend.c").read_text()
     spec = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
     sec = (ROOT / "cdx/cdx_dpa_ipsec.c").read_text()
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     caam = kernel / "drivers/crypto/caam"
     key_gen = (caam / "key_gen.h").read_text()
     (tmp_path / "ipsec_keys_types.inc").write_text(
@@ -349,8 +344,7 @@ def test_ipsec_receive_ownership(tmp_path):
     nothing is built from the private area of a device that is not a DPAA
     port, whatever device the SA names."""
     source = (ROOT / "cdx/dpa_ipsec.c").read_text()
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     text = (kernel / "net/xfrm/xfrm_input.c").read_text()
     start = text.index("struct sec_path *secpath_set(")
     end = text.index("\nEXPORT_SYMBOL(secpath_set)", start)
@@ -438,8 +432,7 @@ def test_ipsec_backend(tmp_path):
     header = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
     control = (ROOT / "cdx/control_ipsec.h").read_text()
     sec = (ROOT / "cdx/cdx_dpa_ipsec.c").read_text()
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     pdb = (kernel / "drivers/crypto/caam/pdb.h").read_text()
     layout = (ROOT / "cdx/dpa_ipsec.h").read_text()
     decap = re.search(r"struct ipsec_decap_pdb \{.*?\n\}[^;\n]*;", pdb, re.S).end()

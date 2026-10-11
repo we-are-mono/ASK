@@ -17,13 +17,11 @@ from pathlib import Path
 import re
 
 from _host_qos_lifecycle import (function)
-
-ROOT = Path(__file__).resolve().parents[2]
+from _kernel_source import (kernel_source)
 
 
 def test_xfrm_input_sec_only(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     text = (kernel / "net/xfrm/xfrm_input.c").read_text()
     snmp = (kernel / "include/uapi/linux/snmp.h").read_text()
     (tmp_path / "xfrm_input_mib.inc").write_text(

@@ -13,7 +13,8 @@ import os
 from pathlib import Path
 import re
 
-ROOT = Path(__file__).resolve().parents[2]
+from _kernel_source import kernel_source
+
 SDK = Path("drivers/net/ethernet/freescale/sdk_dpaa")
 
 
@@ -30,8 +31,7 @@ def function(source, name):
 
 
 def test_dpaa_hooks(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     eth = (kernel / SDK / "dpaa_eth.c").read_text()
     sg = (kernel / SDK / "dpaa_eth_sg.c").read_text()
     header = (kernel / SDK / "dpaa_eth_common.h").read_text()

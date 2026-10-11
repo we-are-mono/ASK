@@ -5,13 +5,11 @@ import os
 from pathlib import Path
 
 from _host_flowtable import (function)
-
-ROOT = Path(__file__).resolve().parents[2]
+from _kernel_source import (kernel_source)
 
 
 def test_native_admission_allocation_recovery(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     source = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     core = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
     # Normalize only the declaration line break for the shared extractor.

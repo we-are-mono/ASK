@@ -2,7 +2,11 @@ SUMMARY = "ASK runtime configuration files"
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://${ASK_SRCROOT}/LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 
-FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+inherit ask-provenance
+
+# The module list and the offload policy are the ones every consumer ships,
+# from the checkout's config/.
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:${ASK_SRCROOT}/config:"
 
 SRC_URI = "file://S03debugfs \
            file://S04usb-agent \
@@ -14,6 +18,8 @@ SRC_URI = "file://S03debugfs \
            file://dnsmasq-gateway.conf \
            file://hostapd-ask.conf \
            file://ask-flowtable-qos.conf \
+           file://ask-modules.conf \
+           file://offload.conf \
           "
 
 # No source tree — just config files, referenced via UNPACKDIR below.
@@ -24,23 +30,12 @@ S = "${UNPACKDIR}"
 # package); the Python helper and its python3-* runtime are gone.
 RDEPENDS:${PN} += "dnsmasq iptables iproute2 nftables hostapd ask-flowtable"
 
-# These files are installed from ${ASK_SRCROOT} (outside SRC_URI's reach).
-# Without listing them as task input checksums, bitbake's sstate signature for
-# do_install doesn't change when their *content* does — meaning a fresh kas
-# build silently restores the previous (stale) version from sstate. Each
-# entry is "<path>:True" so bitbake hashes the file and the task re-runs on
-# any content change.
-do_install[file-checksums] += " \
-    ${ASK_SRCROOT}/config/ask-modules.conf:True \
-    ${ASK_SRCROOT}/config/offload.conf:True \
-"
-
 fakeroot do_install() {
     install -d ${D}${sysconfdir}
 
 
     install -d ${D}${sysconfdir}/modules-load.d
-    install -m 0644 ${ASK_SRCROOT}/config/ask-modules.conf \
+    install -m 0644 ${UNPACKDIR}/ask-modules.conf \
         ${D}${sysconfdir}/modules-load.d/ask.conf
 
     # Test image only: turn on mark classification so the suite exercises
@@ -52,7 +47,7 @@ fakeroot do_install() {
     # The default offload policy. The ask-flowtable daemon (its own package)
     # falls back to identical built-in defaults when this file is absent.
     install -d ${D}${sysconfdir}/ask
-    install -m 0644 ${ASK_SRCROOT}/config/offload.conf ${D}${sysconfdir}/ask/offload.conf
+    install -m 0644 ${UNPACKDIR}/offload.conf ${D}${sysconfdir}/ask/offload.conf
 
     install -d ${D}${sysconfdir}/init.d
     install -d ${D}${sysconfdir}/rcS.d

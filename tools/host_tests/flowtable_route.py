@@ -4,12 +4,11 @@ from ask_orch.process import run_process
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+from _kernel_source import kernel_source
 
 
 def test_flowtable_strict_reverse_route(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     source = (kernel / "net/ipv4/route.c").read_text()
     start = source.index("struct rtable *ip_route_output_key_hash_rcu(")
     end = source.index("\n}\n", start) + 3

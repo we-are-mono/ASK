@@ -5,18 +5,14 @@ from pathlib import Path
 import os
 import shutil
 
-import pytest
-
 from _host_ehash_cumulative import (function as definition)
-from _host_sdk_port_pcd import (ROOT, function)
+from _host_sdk_port_pcd import (function)
+from _kernel_source import (kernel_source)
 
 
 def test_sdk_port_state(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
-    if not (sdk / "inc").exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     port = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
     flib = (sdk / "Peripherals/FM/Port/fman_port.c").read_text()
     production = function(port, "FM_PORT_GetEnabled")

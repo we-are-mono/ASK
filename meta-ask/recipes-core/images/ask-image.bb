@@ -151,4 +151,9 @@ disable_hostapd_default_init() {
     rm -f ${IMAGE_ROOTFS}/etc/rc*.d/*hostapd*
 }
 
-inherit image
+# The whole layer: its configuration, classes and kas file, the appends to
+# OE-core recipes no other record covers, and any file that would shadow
+# another recipe's source.
+ASK_PROVENANCE_PATHS = "meta-ask"
+
+inherit image ask-provenance

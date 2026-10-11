@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import warnings
 
 from ask_orch.artifacts import artifact_dir, record
 from ask_orch.capture import capture_window, verify_capture
@@ -20,7 +21,7 @@ import aiohttp
 import pytest
 import pytest_asyncio
 
-from ask_orch import client
+from ask_orch import client, manifest
 from ask_orch.uart import Console, set_target_session
 from ask_orch.serial import SerialSession
 from askd_agent.wire import VERSION as SERIAL_PROTOCOL
@@ -87,7 +88,9 @@ def dmesg_allowlist():
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
-    """Check firmware, logging and selected release capabilities before mutations."""
+    """Check firmware, logging and selected release capabilities before
+    mutations. A release also needs the image this checkout builds: every
+    component and the device tree (ask_orch.manifest)."""
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         health = await client.TARGET.health(session)
         record("dut", health, nodeid="session")
@@ -106,6 +109,7 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
         firmware = json.loads(result["stdout"])
         expected = agent_sources(Path(__file__).resolve().parents[1] / "askd_agent")
         firmware["agent_matches_checkout"] = firmware["agent_sources"] == expected
+        firmware["build_problems"] = manifest.verify(Path(__file__).resolve().parents[2], firmware["image"])
         record("firmware", firmware, nodeid="session")
         config = await client.TARGET.fs_read(session, "/proc/config.gz")
         assert config["errno"] == 0, config
@@ -129,6 +133,13 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
                 "release firmware lacks required tools", firmware["missing_binaries"])
             assert firmware["agent_matches_checkout"], (
                 "DUT agent differs from this checkout; rebuild, stage and boot the current image")
+            assert not firmware["build_problems"], (
+                "DUT image was not built from this checkout ("
+                + "; ".join(firmware["build_problems"]) + "); " + manifest.REMEDY)
+        elif firmware["build_problems"]:
+            # Testing an older image on purpose is legitimate outside a release.
+            warnings.warn("DUT image was not built from this checkout: "
+                          + "; ".join(firmware["build_problems"]))
         return {"health": health, "boot": boot}
 
 

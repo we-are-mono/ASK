@@ -7,7 +7,7 @@ so the test image exercises the shipping datapath rather than an approximation."
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=ab04ac0f249af12befccb94447c08b77"
 
-inherit module
+inherit module ask-provenance
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 

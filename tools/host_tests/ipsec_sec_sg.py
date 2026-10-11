@@ -5,12 +5,11 @@ from ask_orch.process import run_process
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+from _kernel_source import kernel_source
 
 
 def test_ipsec_sec_sg(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     source = (kernel / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c").read_text()
     (tmp_path / "ipsec_sec_sg.inc").write_text(
         source[source.index("static void dma_unmap_skb_sg_addrs"):

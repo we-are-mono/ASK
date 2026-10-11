@@ -8,20 +8,16 @@ xfrm_state_migrate() makes now do -- and the one path that writes them,
 XFRM_MSG_NEWAE, refuses to for such a state: no driver hears of it.
 """
 
-import os
-from pathlib import Path
 import re
 
 from _host_qos_lifecycle import (function)
+from _kernel_source import (kernel_source)
 
-ROOT = Path(__file__).resolve().parents[2]
-KERNEL = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-    "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
 REFRESH = "xfrm_dev_state_update_stats(x);"
 
 
 def user():
-    return (KERNEL / "net/xfrm/xfrm_user.c").read_text()
+    return (kernel_source() / "net/xfrm/xfrm_user.c").read_text()
 
 
 def test_getae_publishes_before_it_reads():
@@ -46,7 +42,7 @@ def test_getsa_publishes_before_it_reads():
 def test_migrate_publishes_before_it_clones():
     """The clone takes the replay state as xfrm has it, so the driver
     publishes first, under x->lock."""
-    source = (KERNEL / "net/xfrm/xfrm_state.c").read_text()
+    source = (kernel_source() / "net/xfrm/xfrm_state.c").read_text()
     body = function(source, "xfrm_state_migrate")
     clone = body.index("xc = xfrm_state_clone(x, encap);")
     refresh = body.index(REFRESH)

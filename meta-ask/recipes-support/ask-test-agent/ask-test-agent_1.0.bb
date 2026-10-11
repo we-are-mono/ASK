@@ -49,4 +49,4 @@ FILES:${PN} = " \
     ${sysconfdir}/rcS.d/S70askd-agent \
 "
 
-inherit python3-dir
+inherit python3-dir ask-provenance

@@ -5,15 +5,14 @@ import os
 from pathlib import Path
 import subprocess
 
+from ask_orch import build_record, manifest
+
 
 def checkout(root):
-    def git(*args):
-        return subprocess.check_output(["git", *args], cwd=root, timeout=10)
-
-    names = sorted(set(git("ls-files", "-z", "--cached", "--others", "--exclude-standard").split(b"\0")) - {b""})
+    names = build_record.names(root)
     digest = hashlib.sha256()
     for name in names:
-        path = Path(root) / os.fsdecode(name)
+        path = Path(root) / name
         if path.is_symlink():
             kind, content = b"link", hashlib.sha256(os.fsencode(os.readlink(path))).digest()
         elif path.is_file():
@@ -22,9 +21,9 @@ def checkout(root):
                 content = hashlib.file_digest(stream, "sha256").digest()
         else:
             kind, content = b"missing", b""
-        digest.update(name + b"\0" + kind + b"\0" + content)
-    return {"revision": git("rev-parse", "HEAD").decode().strip(),
-            "sha256": digest.hexdigest(), "files": len(names)}
+        digest.update(os.fsencode(name) + b"\0" + kind + b"\0" + content)
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, timeout=10)
+    return {"revision": revision.decode().strip(), "sha256": digest.hexdigest(), "files": len(names)}
 
 
 def agent_sources(root):
@@ -34,18 +33,34 @@ def agent_sources(root):
 
 # The DUT image's identity, the same in every boot of it -- the startup
 # suite's rdinit=/bin/sh boot included, where no module has loaded yet: the
-# kernel's build notes and every file in its module tree.
-IMAGE = '''
+# kernel's build notes, every file in its module tree, the build records of
+# what each component was built from (manifest.verify() reads them), and the
+# device tree's own record of the kernel build that compiled it.
+IMAGE = f'''
+RECORDS = {manifest.IMAGE_DIR!r}
+DEVICETREE = '/sys/firmware/devicetree/base/' + {manifest.DEVICETREE_PROPERTY!r}
+''' + '''
 import hashlib, json, pathlib, platform
 def digest(path):
     path = pathlib.Path(path)
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+def paths(record):
+    try:
+        return json.loads(record.read_bytes())['paths']
+    except (ValueError, KeyError, TypeError):
+        return None
+def build():
+    return {'build': {path.stem: {'sha256': digest(path), 'paths': paths(path)}
+                      for path in sorted(pathlib.Path(RECORDS).glob('*.json'))},
+            'devicetree': (pathlib.Path(DEVICETREE).read_bytes().rstrip(b'\\0').decode()
+                           if pathlib.Path(DEVICETREE).exists() else None)}
 def image():
     tree = hashlib.sha256()
     base = pathlib.Path('/lib/modules') / platform.release()
     for path in sorted(p for p in base.rglob('*') if p.is_file() and not p.is_symlink()):
         tree.update(str(path.relative_to(base)).encode() + b'\\0' + bytes.fromhex(digest(path)))
-    return {'kernel_notes_sha256': digest('/sys/kernel/notes'), 'modules_sha256': tree.hexdigest()}
+    return {'kernel_notes_sha256': digest('/sys/kernel/notes'), 'modules_sha256': tree.hexdigest(),
+            **build()}
 '''
 
 

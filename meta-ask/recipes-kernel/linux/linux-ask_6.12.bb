@@ -7,9 +7,16 @@ Image+initramfs for ASK testing."
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://COPYING;md5=6bc538ed5bd9a7fc9398086aedcd7e46"
 
-inherit kernel
+inherit kernel ask-provenance
 
 DEPENDS += "bison-native flex-native bc-native"
+
+# The SDK pin arrives by `require`, outside SRC_URI. The series and board
+# directories are recorded whole, so a file that would shadow one in SRC_URI
+# counts too. The record reaches the image through the package every module
+# depends on.
+ASK_PROVENANCE_PATHS = "pins/nxp-sdk-srcrev.inc patches/kernel dts"
+ASK_PROVENANCE_OWNER = "${KERNEL_PACKAGE_NAME}-base"
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/patches/kernel:"
@@ -219,6 +226,12 @@ WARN_QA:remove  = "patch-status"
 do_configure:prepend() {
     cp ${UNPACKDIR}/defconfig ${B}/.config
     cp ${UNPACKDIR}/*.dts ${S}/arch/arm64/boot/dts/freescale/
+    # U-Boot loads the device tree apart from this kernel, so the tree names
+    # the kernel record of the build that compiled it; the test harness
+    # refuses a tree from any other build (tools/ask_orch/manifest.py).
+    digest=$(sha256sum ${ASK_PROVENANCE_DIR}/${PN}.json)
+    printf '\n/ {\n\tmono,ask-provenance = "%s";\n};\n' "${digest%% *}" \
+        >> ${S}/arch/arm64/boot/dts/freescale/mono-gateway-dk.dts
 }
 
 # Merge the ASK config fragment after the base defconfig is in place, then

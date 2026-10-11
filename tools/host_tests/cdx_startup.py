@@ -9,6 +9,7 @@ import re
 import pytest
 
 from _host_qos_lifecycle import function
+from _kernel_source import kernel_source
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -163,12 +164,9 @@ def test_fragment_pool_holds_a_port_frame():
 
 
 def test_eqcr(tmp_path):
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    kernel = kernel_source()
     high = kernel / "drivers/staging/fsl_qbman/qman_high.c"
     low = high.with_name("qman_low.h")
-    if not high.exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     text = low.read_text()
     start = text.index("static inline u8 qm_eqcr_get_hw_fill(")
     end = text.index("\n}", start) + 3

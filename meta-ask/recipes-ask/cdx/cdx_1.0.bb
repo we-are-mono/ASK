@@ -2,7 +2,7 @@ SUMMARY = "ASK CDX hardware backend and Linux flowtable adapter modules"
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://${ASK_SRCROOT}/LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 
-inherit module externalsrc
+inherit module externalsrc ask-provenance
 
 EXTERNALSRC       = "${ASK_SRCROOT}/cdx"
 EXTERNALSRC_BUILD = "${ASK_SRCROOT}/cdx"

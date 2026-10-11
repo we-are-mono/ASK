@@ -2,12 +2,13 @@
 import importlib.util
 import gzip
 import json
-import os
 from pathlib import Path
 import re
 from types import SimpleNamespace
 
 import pytest
+
+from _kernel_source import kernel_source
 
 SOURCE = Path(__file__).resolve().parents[1] / "tests/_flowtable_failslab_guard.py"
 spec = importlib.util.spec_from_file_location("slab_guard", SOURCE)
@@ -133,10 +134,7 @@ def test_every_target_names_a_function_its_module_defines(target):
     if module in ("cdx", "ask_flowtable"):
         files = sorted((SOURCE.parents[2] / "cdx").glob("*.c"))
     else:
-        kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", SOURCE.parents[2] /
-            "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
-        if not (kernel / "net").exists():
-            pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE")
+        kernel = kernel_source()
         files = sorted(path for directory in KERNEL_DIRS[module]
                        for path in (kernel / directory).glob("*.c"))
     definition = re.compile(rf"(?m)^(?:[A-Za-z_][\w \t*]*[\s*])?{re.escape(name)}\([^;{{]*\)\s*\{{")

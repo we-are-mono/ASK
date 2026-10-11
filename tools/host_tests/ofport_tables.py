@@ -18,20 +18,15 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
-import pytest
-
 from _host_qos_lifecycle import (function)
+from _kernel_source import (kernel_source)
 
 ROOT = Path(__file__).resolve().parents[2]
 FM_EH_TYPES = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h"
 
 
 def kernel_tree():
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
-                  "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
-    if not (kernel / FM_EH_TYPES).exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
-    return kernel
+    return kernel_source()
 
 
 def table_types(kernel):

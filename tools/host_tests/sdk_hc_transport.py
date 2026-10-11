@@ -5,23 +5,16 @@ from pathlib import Path
 import os
 import shutil
 
-import pytest
-
-from _host_sdk_scheme_delete import (ROOT, function)
+from _host_sdk_scheme_delete import (function)
+from _kernel_source import (kernel_source)
 
 
 def test_sdk_hc_transport(tmp_path):
-    default = ROOT / "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"
-    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", default))
+    kernel = kernel_source()
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
-    if not (sdk / "inc").exists():
-        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE")
     hc = (sdk / "Peripherals/FM/HC/hc.c").read_text()
     wrapper = (sdk / "src/wrapper/lnxwrp_fm_port.c").read_text()
-    qman_path = kernel / "include/linux/fsl_qman.h"
-    if not qman_path.exists():
-        qman_path = default / "include/linux/fsl_qman.h"
-    qman = qman_path.read_text()
+    qman = (kernel / "include/linux/fsl_qman.h").read_text()
     (tmp_path / "hc_layout.inc").write_text(
         hc[hc.index("#define DEFAULT_dataMemId"):hc.index("static t_Error FillBufPool")])
     (tmp_path / "qman_layout.inc").write_text(
