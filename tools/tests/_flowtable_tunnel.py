@@ -46,7 +46,7 @@ MTU_4O6 = 1440          # 1500 less the 40-byte IPv6 outer header and a 20-byte 
 # One port pair per case so a conntrack left by one never feeds another.
 PORTS = {"routed": (48910, 48911), "mtu": (48920, 48921), "tcp": (48930, 48931),
          "change": (48940, 48941), "delete": (48950, 48951), "rate": (48970, 48971),
-         "neighbour": (48980, 48981), "route": (48982, 48983)}
+         "neighbour": (48980, 48981), "route": (48982, 48983), "remark": (48984, 48985)}
 
 # Where the WAN host's outer endpoint moves to: a second MAC on its WAN
 # bridge (_moved_host).
@@ -710,12 +710,18 @@ async def _clear_ct(r, proto="udp"):
 class EchoServer(asyncio.DatagramProtocol):
     def __init__(self):
         self.packets = 0
+        # Set by a case that marks each reply itself: called with the
+        # datagram and its source, it readies the socket and returns where
+        # the reply goes.
+        self.prepare = None
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, addr):
         self.packets += 1
+        if self.prepare:
+            addr = self.prepare(data, addr)
         self.transport.sendto(data, addr)
 
 

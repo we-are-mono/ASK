@@ -2357,6 +2357,20 @@ connection shows the same thing from the inside — its handshake leaves at
 
 No BUG, WARNING, call trace or KASAN output beyond the init banner.
 
+*Only the codepoint, proved on hardware 2026-10-11.* The rewrite changes six
+bits of a byte the ECN field shares, and in IPv6 a word the flow label shares,
+so a sender that set neither would pass a rewrite that cleared both. The rig's
+remark cases send each flow's datagrams through all four ECN encodings, and
+from IPv6 under a flow label the sender leased; every datagram arrives at EF
+with its own encoding and label, one hop fewer and with both checksums
+verifying, from the hardware and the software path alike
+(`flowtable_qos.py::test_dscp_remark_agrees_in_software` and its `_ipv6`
+twin). Inside a 6o4 or 4o6 tunnel the remark is of the carried header, and
+`flowtable_tunnel.py::test_remark_rewrites_the_carried_header` holds it to the
+same: after the hardware's strip, and before its insert, where an
+ECN-capable TCP connection's data segments keep ECT(0) and its bare
+acknowledgements none.
+
 #### The software path remarks too
 
 That last observation was a defect, not a property. A flow changing codepoint

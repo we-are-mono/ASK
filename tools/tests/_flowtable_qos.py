@@ -11,6 +11,7 @@ import socket
 import struct
 import threading
 import time
+from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
@@ -24,6 +25,7 @@ from _flowtable_rig import (
     console_json,
     read,
 )
+from _flowtable_udp_wire import wire_checksum
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from ask_orch.client import Agent
 from ask_orch.uart import Console
@@ -114,6 +116,15 @@ COUNT = 256
 # names class queue 7 under it.
 REMARK_MASK = 0x7ffff0
 REMARK_CLASS = 1 << 12 | EF_DSCP << 13
+# What the remark cases' senders put in the byte the remark rewrites: AF11,
+# and beside it an ECN field that walks all four encodings, datagram n
+# carrying n % 4. A rewrite that clears or sets either ECN bit shows on the
+# datagrams it changed.
+AF11_TOS = 10 << 2
+# An IPv6 sender's own flow label, which sits in the same word as the traffic
+# class and has to survive its rewrite. Below the stateless-range bit, so
+# no flowlabel_state_ranges setting refuses it.
+FLOW_LABEL = 0x5a5a5
 
 # A UDP flow does not back off, so the policer's burst only shapes the first
 # instant of the transfer; a megabyte keeps that instant short.
@@ -499,6 +510,174 @@ async def reload_adapter(r, *parameters, idle=True):
         assert state["bindings"] == state["entries"] == 0, state
     await console_command(r.console, "rmmod", "ask_flowtable", check=idle, timeout=30)
     await console_command(r.console, "modprobe", "ask_flowtable", *parameters, timeout=30)
+
+
+@asynccontextmanager
+async def remarking(r):
+    """The adapter reloaded with REMARK_MASK for the case, yielding the mark
+    that names REMARK_CLASS under it, and reloaded with the image's own
+    options afterwards. The remark lives in bits the image's mask does not
+    cover; the two boot-immutable parameters have to read back as they did
+    before."""
+    parameters = "/sys/module/ask_flowtable/parameters/"
+    original = {name: (await read(r.target, r.session, parameters + name)).strip()
+                for name in ("qos_mark_mask", "qos_default_class")}
+    await reload_adapter(r, f"qos_mark_mask={REMARK_MASK:#x}")
+    try:
+        mask = int((await read(r.target, r.session, parameters + "qos_mark_mask")).strip())
+        assert mask == REMARK_MASK, mask
+        shift = (REMARK_MASK & -REMARK_MASK).bit_length() - 1
+        yield REMARK_CLASS << shift
+    finally:
+        await reload_adapter(r, idle=False)
+    restored = {name: (await read(r.target, r.session, parameters + name)).strip()
+                for name in original}
+    assert restored == original, (original, restored)
+
+
+IPV6_FLOWLABEL_MGR, IPV6_FLOWINFO_SEND, IPV6_FLOWINFO = 32, 33, 11
+
+
+def flowlabel_lease(destination):
+    """The IPV6_FLOWLABEL_MGR request that leases FLOW_LABEL towards
+    `destination`. Linux sends a nonzero flow label only from one its socket
+    holds, and only with IPV6_FLOWINFO_SEND set. The lease is shareable, so
+    one still lingering from an earlier socket is taken over, not refused."""
+    return (socket.inet_pton(socket.AF_INET6, destination) + struct.pack("!I", FLOW_LABEL)
+            # IPV6_FL_A_GET, IPV6_FL_S_ANY, IPV6_FL_F_CREATE, no expiry or linger.
+            + struct.pack("=BBHHHI", 0, 255, 1, 0, 0, 0))
+
+
+# How a remark case's LAN-side socket is readied: from IPv6 under FLOW_LABEL,
+# with `level, option` naming where each datagram's TOS or traffic class goes.
+REMARK_SOCKET = f'''
+import json, socket, struct, time
+v6 = ':' in destination
+s = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((source, sport))
+peer = (destination, dport)
+if v6:
+    s.setsockopt(socket.IPPROTO_IPV6, {IPV6_FLOWLABEL_MGR}, lease)
+    s.setsockopt(socket.IPPROTO_IPV6, {IPV6_FLOWINFO_SEND}, 1)
+    peer += ({FLOW_LABEL}, 0)
+level, option = (socket.IPPROTO_IPV6, socket.IPV6_TCLASS) if v6 else (socket.IPPROTO_IP, socket.IP_TOS)
+'''
+
+
+def remark_script(source, sport, destination, dport, body):
+    lease = flowlabel_lease(destination) if ":" in destination else b""
+    return (f"source, sport, destination, dport, lease = "
+            f"{source!r}, {sport}, {destination!r}, {dport}, {lease!r}\n" + REMARK_SOCKET + body)
+
+
+async def remark_send(r, source, destination, port, count):
+    """`count` numbered datagrams from the LAN VM, one way, at AF11 with the
+    ECN field walking its four encodings; from IPv6 under FLOW_LABEL."""
+    script = remark_script(source, port, destination, port, f'''
+for n in range({count}):
+    s.setsockopt(level, option, {AF11_TOS} | n % 4)
+    s.sendto(struct.pack('!Q', n) + b'ASK-remark'.ljust(120, b'.'), peer)
+    time.sleep(0.002)
+print(json.dumps({{'sent': {count}}}))
+''')
+    result = await lan_run_python(r.lan, script, label="flowtable_qos_remark", timeout=60)
+    assert result.rc == 0, result.stdout
+
+
+async def remark_echo(lan, source, sport, destination, dport, count):
+    """remark_send()'s datagrams, each answered before the next: the reply's
+    TOS or traffic class, hop count and flow label as the LAN VM's stack
+    received them, in the form remark_fields() gives, and how many were lost.
+
+    A datagram whose IP header or UDP checksum did not verify is not
+    delivered, so every reply that arrived verified; the stack's own error
+    counters, which have to stay put, say which check a lost one failed."""
+    script = remark_script(source, sport, destination, dport, f'''
+if v6:
+    for flag in (socket.IPV6_RECVTCLASS, socket.IPV6_RECVHOPLIMIT, {IPV6_FLOWINFO}):
+        s.setsockopt(socket.IPPROTO_IPV6, flag, 1)
+else:
+    for flag in (socket.IP_RECVTOS, 12):  # IP_RECVTTL
+        s.setsockopt(socket.IPPROTO_IP, flag, 1)
+s.settimeout(2)
+def errors():
+    counters = {{}}
+    lines = open('/proc/net/snmp').read().splitlines()
+    for names, values in zip(lines[::2], lines[1::2]):
+        group = names.split(':')[0]
+        counters.update({{group + k: int(v) for k, v in zip(names.split()[1:], values.split()[1:])}})
+    counters.update({{k: int(v) for k, v in (line.split() for line in open('/proc/net/snmp6'))}})
+    return {{k: counters[k] for k in ('IpInHdrErrors', 'UdpInCsumErrors', 'Ip6InHdrErrors',
+                                     'Udp6InCsumErrors')}}
+before = errors()
+received, lost = [], 0
+for n in range({count}):
+    s.setsockopt(level, option, {AF11_TOS} | n % 4)
+    payload = struct.pack('!Q', n) + b'ASK-remark'.ljust(56, b'.')
+    s.sendto(payload, peer)
+    try:
+        data, ancillary, _, _ = s.recvmsg(2048, 256)
+    except TimeoutError:
+        lost += 1
+        continue
+    assert data == payload, (n, data)
+    fields = {{'n': n, 'label': None, 'header': True, 'udp': True}}
+    for cmsg_level, cmsg_type, value in ancillary:
+        if (cmsg_level, cmsg_type) in ((socket.IPPROTO_IP, socket.IP_TOS),
+                                       (socket.IPPROTO_IPV6, socket.IPV6_TCLASS)):
+            fields['tos'] = value[0] if len(value) == 1 else struct.unpack('=i', value)[0]
+        elif (cmsg_level, cmsg_type) in ((socket.IPPROTO_IP, socket.IP_TTL),
+                                         (socket.IPPROTO_IPV6, socket.IPV6_HOPLIMIT)):
+            fields['hop'] = struct.unpack('=i', value)[0]
+        elif (cmsg_level, cmsg_type) == (socket.IPPROTO_IPV6, {IPV6_FLOWINFO}):
+            fields['label'] = struct.unpack('!I', value)[0] & 0xfffff
+    received.append(fields)
+    time.sleep(0.005)
+after = errors()
+print(json.dumps({{'fields': received, 'lost': lost,
+                  'errors': {{k: after[k] - before[k] for k in before}}}}))
+''')
+    result = await lan_run_python(lan, script, label="flowtable_qos_remark_echo",
+                                  timeout=count * 0.3 + 40)
+    assert result.rc == 0, result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def remark_fields(packet):
+    """What a remark case reads off one captured datagram: its number, the
+    TOS or traffic-class byte, the hop count, the flow label (None for IPv4),
+    and whether its IP header and UDP checksums verify."""
+    from scapy.all import IP, UDP, IPv6
+    if IPv6 in packet:
+        ip = packet[IPv6]
+        family = socket.AF_INET6
+        fields = {"tos": ip.tc, "hop": ip.hlim, "label": ip.fl, "header": True}
+    else:
+        ip = packet[IP]
+        family = socket.AF_INET
+        fields = {"tos": ip.tos, "hop": ip.ttl, "label": None,
+                  "header": wire_checksum(bytes(ip)[:ip.ihl * 4]) == 0}
+    udp = bytes(ip[UDP])
+    # A short frame's Ethernet padding follows the datagram in scapy's layers.
+    udp = udp[:struct.unpack("!H", udp[4:6])[0]]
+    addresses = socket.inet_pton(family, ip.src) + socket.inet_pton(family, ip.dst)
+    pseudo = addresses + (struct.pack("!I3xB", len(udp), 17) if family == socket.AF_INET6
+                          else struct.pack("!xBH", 17, len(udp)))
+    fields["udp"] = wire_checksum(pseudo + udp) == 0
+    fields["n"] = struct.unpack("!Q", udp[8:16])[0]
+    return fields
+
+
+def assert_remarked(name, fields, count, *, label=None, hop=63):
+    """Each of `count` numbered datagrams arrived once, rewritten to EF and in
+    nothing else: the ECN codepoint its sender gave it kept, the flow label
+    kept, one hop fewer, and both checksums verifying."""
+    numbers = sorted(f["n"] for f in fields)
+    assert numbers == list(range(count)), (name, len(numbers), numbers[:8])
+    for f in fields:
+        assert f["tos"] == EF_TOS | f["n"] % 4, (name, f)
+        assert f["label"] == label and f["hop"] == hop, (name, f)
+        assert f["header"] and f["udp"], (name, f)
 
 
 @pytest_asyncio.fixture

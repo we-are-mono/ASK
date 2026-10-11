@@ -28,6 +28,10 @@ CATALOGUE = {
     "1812": ("supported", "router requirements: TTL, multicast scope"),
     "793": ("supported", "TCP flows"),
     "768": ("supported", "UDP flows"),
+    # Marking
+    "2474": ("supported", "DSCP remarked by a flow's class"),
+    "3168": ("supported", "ECN field kept through a DSCP remark"),
+    "6437": ("supported", "IPv6 flow label kept through forwarding"),
     # Translation
     "3022": ("supported", "NAPT"),
     "4787": ("supported", "UDP NAT behaviour unchanged by offload"),

@@ -39,19 +39,23 @@ from __future__ import annotations
 
 from _flowtable_tunnel import CHANGED_TTL
 
-from _flowtable_tunnel import (MOVED_DEV, MOVED_GATEWAY, MOVED_MAC, Capture, _admit, _announce, _assert_outer, _assert_tunnel, _both_directions, _directions, _established, _expected, _moved_host, _offload_table, _outer_neighbour, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange, _undo)
+from _flowtable_tunnel import (MOVED_DEV, MOVED_GATEWAY, MOVED_MAC, OUTER_TABLE, Capture, _admit, _announce, _assert_outer, _assert_tunnel, _both_directions, _directions, _established, _expected, _ip_checksum, _moved_host, _offload_table, _outer_counter, _outer_counter_add, _outer_neighbour, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange, _undo)
 
 
 import asyncio
 import os
+import socket
+import struct
 import subprocess
 
 import pytest
 
 from ask_orch.counters import kernel_tx_packets
+from ask_orch.lifecycle import checked
+from _flowtable_qos import (AF11_TOS, COUNT, EF_TOS, FLOW_LABEL, IPV6_FLOWINFO_SEND, IPV6_FLOWLABEL_MGR, REMARK_CLASS, assert_remarked, flowlabel_lease, remark_echo, remark_fields, remarking)
 from _gated_tcp import GatedTcp
 from _throughput import tcp_floor
-from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run, lan_run_python
 from _flowtable_rig import assert_undisturbed, command
 
 # Both modes ran at the path's ceiling on four streams: 6o4 9.15 Gb/s
@@ -208,6 +212,145 @@ async def test_tcp(tunnel_rig):
     # Only the handful of frames the reads above cost left the WAN port in
     # software while the measured phase crossed it.
     assert 0 <= sent < upload // 4, (sent, upload)
+
+
+@pytest.mark.rfc("3168", section="5")
+@pytest.mark.rfc("6437", section="2")
+@pytest.mark.parametrize("tunnel_rig", ["6o4/remark", "4o6/remark"], indirect=True)
+async def test_remark_rewrites_the_carried_header(qos, tunnel_rig):
+    """A class that remarks to EF, on a connection through the tunnel,
+    rewrites the header the tunnel carries -- the connection's own -- and
+    nothing else in it, on either half of the path the hardware runs.
+
+    The strip: this host answers each of the LAN VM's datagrams at AF11, the
+    ECN field walking its four encodings and, inside IPv6, under a flow label
+    of its own. The replies reach the LAN VM at EF and otherwise as they were
+    sent, one hop fewer, while the classifier counted every one and Linux saw
+    next to none of their outer packets: the hardware rewrote the header the
+    strip had just exposed.
+
+    The insert: a UDP upload into a tunnel smaller than a full frame is
+    Linux's (_upload_refused()), so the requests of that exchange show the
+    software path rewriting the carried header behind the outer one. The
+    hardware's insert is TCP's. ECN is negotiated for the connection, so the
+    LAN VM's data segments carry ECT(0) and its bare acknowledgements none;
+    each has to leave inside the outer header the hardware built, at EF and
+    with its own ECN codepoint.
+
+    The remark bits lie outside the image's mask, so the adapter is reloaded
+    with a wider one for the case (remarking()).
+    """
+    from scapy.all import IP, TCP, UDP, IPv6
+
+    r, t = qos, tunnel_rig
+    shape = t.shape
+    v6 = shape.family == 6
+    ip = "ip6" if v6 else "ip"
+    label = FLOW_LABEL if v6 else None
+    echo = t.echo.transport.get_extra_info("socket")
+    if v6:
+        level, option = socket.IPPROTO_IPV6, socket.IPV6_TCLASS
+        echo.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 64)
+        echo.setsockopt(socket.IPPROTO_IPV6, IPV6_FLOWLABEL_MGR, flowlabel_lease(t.lan_address))
+        echo.setsockopt(socket.IPPROTO_IPV6, IPV6_FLOWINFO_SEND, 1)
+    else:
+        level, option = socket.IPPROTO_IP, socket.IP_TOS
+        echo.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 64)
+
+    def marked(data, addr):
+        # The reply at AF11 and the ECN encoding the request carried.
+        echo.setsockopt(level, option, AF11_TOS | struct.unpack("!Q", data[:8])[0] % 4)
+        return (*addr[:2], FLOW_LABEL, 0) if v6 else addr
+
+    def carried(packet):
+        # The IPv6 header of a 6o4 frame, the IPv4 one of a 4o6 frame.
+        return packet[IPv6] if v6 else packet[IP]
+
+    def tcp_rows(state):
+        return [f for f in state["flows"] if f["proto"] == "6"]
+
+    async def run(script, **kwargs):
+        return await lan_run_python(t.lan, script, **kwargs)
+
+    ecn = (await lan_run(t.lan, "sysctl -n net.ipv4.tcp_ecn")).stdout.strip()
+    async with remarking(r) as mark:
+        try:
+            await _offload_table(t, match=f"{ip} saddr {t.lan_address} {ip} daddr {shape.inner_orch} "
+                                          f"meta l4proto {{ tcp, udp }} ct mark set {mark:#x}")
+            _, strip = _directions(t, await _admit(t))
+            installed = await t.state()
+            record = _tunnel_record(t, installed)
+            await _outer_counter_add(t)
+            t.echo.prepare = marked
+            try:
+                outer = await _outer_counter(t)
+                async with Capture(t, f"remark-{shape.mode}") as capture:
+                    answered = await remark_echo(t.lan, t.lan_address, shape.sport,
+                                                 shape.inner_orch, shape.dport, COUNT)
+                outer = await _outer_counter(t) - outer
+            finally:
+                t.echo.prepare = None
+                await command(t.target, t.session, "nft", "delete", "table", "netdev",
+                              OUTER_TABLE, check=False)
+            echoed = await t.state()
+            record = {k: v - record[k] for k, v in _tunnel_record(t, echoed).items()}
+
+            checked(await lan_run(t.lan, "sysctl -w net.ipv4.tcp_ecn=1"))
+            async with GatedTcp(run, source=t.lan_address, sport=shape.sport,
+                                peer=shape.inner_orch, dport=shape.dport,
+                                label="flowtable_tunnel_remark") as transfer:
+                await transfer.warmed()
+                before = await t.wait(lambda s: len(tcp_rows(s)) == 2)
+                segments = Capture(t, f"remark-{shape.mode}-tcp")
+                segments.snaplen = 128
+                async with segments:
+                    await transfer.measure()
+                after = await t.state()
+        finally:
+            try:
+                checked(await lan_run(t.lan, f"sysctl -w net.ipv4.tcp_ecn={ecn}"))
+            finally:
+                await t.delete_table()
+    requests = [carried(p) for p in capture.packets()]
+    forward, reverse = _directions(t, tcp_rows(before))
+    counted = {f["cookie"]: int(f["packets"]) for f in tcp_rows(after)}
+    t.record("tunnel-remark", {"strip": strip, "installed": installed, "echoed": echoed,
+                               "record": record, "outer_seen": outer,
+                               "lost": answered["lost"], "errors": answered["errors"],
+                               "before": before, "after": after})
+
+    # The strip: every reply carried by the hardware, rewritten and nothing else.
+    assert int(strip["qos"], 16) == REMARK_CLASS, strip
+    rows = {f["cookie"]: int(f["packets"]) for f in echoed["flows"]}
+    assert rows.get(strip["cookie"], 0) - int(strip["packets"]) == COUNT, (installed, echoed)
+    assert record["rx_packets"] == COUNT and outer < COUNT // 4, (record, outer)
+    assert answered["lost"] == 0 and not any(answered["errors"].values()), answered
+    assert_remarked("strip", answered["fields"], COUNT, label=label)
+    # The software insert: each request's carried header rewritten likewise.
+    assert_remarked("insert", [remark_fields(c) for c in requests if UDP in c], COUNT, label=label)
+    # The hardware insert: the connection's class on both directions, and the
+    # LAN VM's segments carried by its insert -- at EF, with their own ECN.
+    assert {int(f["qos"], 16) for f in (forward, reverse)} == {REMARK_CLASS}, (forward, reverse)
+    assert counted.get(forward["cookie"], 0) - int(forward["packets"]) > 100, (forward, after)
+    packets = segments.packets()
+    _assert_outer(t, packets, 100)
+    sent = [c for c in map(carried, packets) if TCP in c and c[TCP].sport == shape.sport]
+    sequences, data = set(), 0
+    for c in sent:
+        tos = c.tc if v6 else c.tos
+        assert tos >> 2 == EF_TOS >> 2 and c[TCP].dport == shape.dport, c.summary()
+        assert v6 or _ip_checksum(bytes(c)[:c.ihl * 4]) == 0, c.summary()
+        if not len(c[TCP].payload):
+            assert tos & 3 == 0, ("a bare acknowledgement carries no ECN", c.summary())
+            continue
+        # A retransmission is sent without ECT; the original carried it.
+        if c[TCP].seq not in sequences:
+            assert tos & 3 == 2, ("a data segment lost its ECT(0)", c.summary())
+            data += 1
+        sequences.add(c[TCP].seq)
+    # Short of the rows' count: this host may coalesce the segments it
+    # receives before the capture sees them.
+    assert data, [c.summary() for c in sent[:8]]
 
 
 @pytest.mark.parametrize("upload", [True, False], ids=["insert", "strip"])
