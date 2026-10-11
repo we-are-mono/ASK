@@ -44,7 +44,7 @@ typedef uint32_t u32;
 #define PPP_IPV6 0x57
 
 struct xfrm_state { struct { u8 mode; } props; u32 handle; };
-struct iphdr { u8 bytes[20]; };
+struct iphdr { u8 version_ihl, tos, tot_len[2], id[2], frag_off[2], ttl, protocol, check[2], addrs[8]; };
 struct ipv6hdr { u8 version_class[4]; u8 payload_len[2]; u8 nexthdr; u8 hop_limit; u8 addrs[32]; };
 struct sec_path { int len; struct xfrm_state *xvec[6]; };
 struct sk_buff {
@@ -136,6 +136,7 @@ static unsigned build6(u8 *frame, const u8 *types, const u8 *units, int n)
 	memset(frame, 0, 512);
 	frame[0] = 0x60;
 	frame[6] = n ? types[0] : IPPROTO_UDP;
+	frame[7] = 64;
 	for (int i = 0; i < n; i++) {
 		frame[off] = i + 1 < n ? types[i + 1] : IPPROTO_UDP;
 		frame[off + 1] = units[i] - 1;
@@ -198,6 +199,29 @@ static void test_dpovrd(void)
 	assert(!dpa_ipsec_dpovrd(&transport, frame, 60, &dpovrd));
 	len = build6(frame, (u8[]){NEXTHDR_HOP, NEXTHDR_ROUTING}, (u8[]){16, 16}, 2);
 	assert(len > 0xff && !dpa_ipsec_dpovrd(&transport, frame, len + 8, &dpovrd));
+
+	/* The offline port parses SEC's output behind 14 bytes of Ethernet and
+	 * the SA's 4-byte tag, and FMan finds a header that starts within the
+	 * first 150 bytes: a 128-byte header leaves ESP at 146, one of 136 at
+	 * 154, where most frames are discarded. */
+	len = build6(frame, (u8[]){NEXTHDR_HOP}, (u8[]){11}, 1);
+	assert(len == 128);
+	assert(dpa_ipsec_dpovrd(&transport, frame, len + 8, &dpovrd) && dpovrd == expect(128, 5));
+	len = build6(frame, (u8[]){NEXTHDR_HOP}, (u8[]){12}, 1);
+	assert(len == 136);
+	assert(!dpa_ipsec_dpovrd(&transport, frame, len + 8, &dpovrd));
+
+	/* A hop limit of 1 or 0 sends SEC's output to the CPU unless the fixed
+	 * header names ESP, so a frame with extension headers and such a
+	 * limit is refused; without them it is encrypted. */
+	for (u8 hop = 0; hop <= 2; hop++) {
+		len = build6(frame, (u8[]){NEXTHDR_HOP}, (u8[]){1}, 1);
+		frame[7] = hop;
+		assert(dpa_ipsec_dpovrd(&transport, frame, len + 8, &dpovrd) == (hop > 1));
+		len = build6(frame, NULL, NULL, 0);
+		frame[7] = hop;
+		assert(dpa_ipsec_dpovrd(&transport, frame, len + 8, &dpovrd) && dpovrd == expect(40, 1));
+	}
 }
 
 static struct qman_fq sec_fq;

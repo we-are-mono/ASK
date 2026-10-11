@@ -32,6 +32,18 @@ typedef uint32_t u32;
 #define ETH_HLEN 14
 #define PPPOE_SES_HLEN 8
 #define DPAA_IP_VERSION_4 4
+#define IPVERSION 4
+#define IPPROTO_UDP 17
+#define IPPROTO_ESP 50
+#define NEXTHDR_HOP 0
+#define NEXTHDR_DEST 60
+#define XFRM_MODE_TRANSPORT 0
+#define XFRM_MODE_TUNNEL 1
+
+struct iphdr { u8 ihl:4, version:4; u8 tos, tot_len[2], id[2], frag_off[2], ttl, protocol; u16 check; u8 addrs[8]; };
+struct ipv6hdr { u8 version_class[4]; u8 payload_len[2]; u8 nexthdr; u8 hop_limit; u8 addrs[32]; };
+/* Where the stack found the header it hands on: the byte naming it. */
+struct inet6_skb_parm { u16 nhoff; };
 
 struct net { int unused; };
 struct net_device;
@@ -65,11 +77,14 @@ struct sk_buff {
 	unsigned int len;
 	u16 mac_header, network_header, mac_len;
 	int iif_index;
+	struct inet6_skb_parm cb6;
 };
-/* What the submit reads of the state: its handle and the device it is bound
- * to. */
+#define IP6CB(skb) (&(skb)->cb6)
+/* What the submit reads of the state: its handle, its mode and the device it
+ * is bound to. */
 struct xfrm_state {
 	u16 handle;
+	struct { u8 mode; } props;
 	struct { struct net_device *dev; } xso;
 };
 
@@ -93,10 +108,11 @@ static const struct net_device_ops wwan_ops = { .ndo_init = NULL };
 
 /* What happened to the frame. */
 static struct {
-	int sg_result, enqueue_result;
+	int sg_result, enqueue_result, cow_result;
 	unsigned cows, sg_calls, enqueues, releases;
 	struct device *sg_dev;
 	struct net_device *sg_netdev;
+	u32 sg_cmd;
 } bench;
 
 static struct qman_fq sec_fq;
@@ -117,13 +133,49 @@ static unsigned char *skb_mac_header(const struct sk_buff *skb)
 {
 	return skb->head + skb->mac_header;
 }
+static unsigned char *skb_network_header(const struct sk_buff *skb)
+{
+	return skb->head + skb->network_header;
+}
+static struct iphdr *ip_hdr(const struct sk_buff *skb)
+{
+	return (struct iphdr *)skb_network_header(skb);
+}
+
+/* The one's-complement sum of a header `ihl` words long, folded and
+ * inverted: zero for a header whose checksum is right. */
+static u16 ip_fast_csum(const void *header, unsigned ihl)
+{
+	const u8 *p = header;
+	uint32_t sum = 0;
+
+	for (unsigned i = 0; i < ihl * 4; i += 2)
+		sum += p[i] << 8 | p[i + 1];
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return (u16)~sum;
+}
+
+static unsigned checksum_writes;
+
+static void ip_send_check(struct iphdr *iph)
+{
+	u16 sum;
+
+	checksum_writes++;
+	iph->check = 0;
+	sum = ip_fast_csum(iph, iph->ihl);
+	/* Stored in network order, as the sum was taken. */
+	((u8 *)&iph->check)[0] = sum >> 8;
+	((u8 *)&iph->check)[1] = sum & 0xff;
+}
 static struct net *dev_net(const struct net_device *dev) { (void)dev; return &init_net; }
 
 static int skb_cow_head(struct sk_buff *skb, unsigned int headroom)
 {
 	(void)skb; (void)headroom;
 	bench.cows++;
-	return 0;
+	return bench.cow_result;
 }
 
 static int skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
@@ -133,6 +185,7 @@ static int skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
 	bench.sg_calls++;
 	bench.sg_dev = dev;
 	bench.sg_netdev = net_dev;
+	bench.sg_cmd = fd_cmd;
 	fd->cmd = fd_cmd;
 	return bench.sg_result;
 }
@@ -237,10 +290,21 @@ static void setup(void)
 
 static _Alignas(8) u8 buffer[256], original[256];
 static struct sk_buff skb;
+/* Where the frame's ESP starts, and the DPOVRD value SEC is to be given. */
+static unsigned char *start;
+static u32 want;
+
+/* A transport SA's value: the header's length, and its byte that names ESP
+ * as SEC counts it. */
+static u32 word(unsigned len, unsigned nh_offset)
+{
+	return DPOVRD_ENABLE | len << 16 | nh_offset << 8;
+}
 
 static void reset(void)
 {
 	memset(&bench, 0, sizeof(bench));
+	checksum_writes = 0;
 	eth3_cpu.tx_caam_dec = eth4_cpu.tx_caam_dec = 0;
 	cdx_get_ipsec_fq_hookfn = get_fq;
 	fq_answer = &sec_fq;
@@ -263,8 +327,36 @@ static void frame(struct net_device *dev, unsigned l3, unsigned l2)
 		.len = 100, .mac_header = (u16)(l3 - l2), .network_header = (u16)l3,
 		.mac_len = (u16)l2,
 	};
+	start = skb.data;
+	want = word(20, 1);
 	memcpy(original, buffer, sizeof(buffer));
 	reset();
+}
+
+/* As frame() on a port, but IPv6, with `n` extension headers of the given
+ * types and eight-byte lengths ahead of ESP, and the stack's note of the byte
+ * naming ESP. */
+static void frame6(struct net_device *dev, const u8 *types, const u8 *units, int n)
+{
+	unsigned l3 = 14, at = l3 + 6, off = l3 + 40;
+
+	frame(dev, l3, 14);
+	buffer[13] = 0xdd;
+	buffer[12] = 0x86;
+	memset(buffer + l3, 0, 40);
+	buffer[l3] = 0x60;
+	buffer[l3 + 7] = 64;
+	for (int i = 0; i < n; i++) {
+		buffer[at] = types[i];
+		buffer[off + 1] = units[i] - 1;
+		at = off;
+		off += units[i] * 8;
+	}
+	buffer[at] = IPPROTO_ESP;
+	skb.data = start = buffer + off;
+	skb.cb6.nhoff = (u16)(at - l3);
+	want = word(off - l3, n ? (at - l3) / 8 : 1);
+	memcpy(original, buffer, sizeof(buffer));
 }
 
 /* A frame from a PPPoE session: Ethernet, the session header and the PPP
@@ -291,19 +383,20 @@ static int submit(void) { return dpaa_submit_inb_pkt_to_SEC(&skb, &sa); }
 static void handed_back(int rc)
 {
 	assert(rc == -1);
-	assert(skb.data == buffer + skb.network_header + 20 && skb.len == 100);
+	assert(skb.data == start && skb.len == 100);
 	assert(!memcmp(buffer, original, sizeof(buffer)));
 	assert(!bench.cows && !bench.sg_calls && !bench.enqueues && !bench.releases);
 	assert(!eth3_cpu.tx_caam_dec && !eth4_cpu.tx_caam_dec);
 	assert(rcu_depth == 0);
 }
 
-/* Given to SEC from the MAC header on, mapped for `dma` and counted as the
- * port's. */
+/* Given to SEC from the MAC header on, with the DPOVRD value its header asks
+ * for, mapped for `dma` and counted as the port's. */
 static void taken(int rc, struct dpa_priv_s *priv, struct device *dma)
 {
 	assert(rc == 0 && fq_asked == 7);
 	assert(bench.sg_calls == 1 && bench.enqueues == 1 && !bench.releases);
+	assert(bench.sg_cmd == want);
 	assert(bench.sg_dev == dma && bench.sg_netdev == priv->net_dev);
 	assert(priv->percpu_priv->tx_caam_dec == 1);
 	assert(rcu_depth == 0);
@@ -396,10 +489,100 @@ static void test_other_devices(void)
 	handed_back(submit());
 }
 
+/* What SEC is told of a transport frame's IP header. Its SA's PDB states a
+ * plain one naming ESP in the fixed part, so anything else is described per
+ * frame: the length up to ESP and the byte naming it, which SEC overwrites
+ * with the protocol from the trailer. */
+static void test_headers(void)
+{
+	sa.xso.dev = &eth3;
+
+	/* IPv4 options: the header's own length. The stack checked the
+	 * header's checksum and then wrote into a Record Route option, so the
+	 * checksum SEC is handed is put right; SEC only updates it. */
+	frame(&eth3, 14, 14);
+	buffer[14] = 0x46;
+	skb.data = start = buffer + 14 + 24;
+	want = word(24, 1);
+	memcpy(original, buffer, sizeof(buffer));
+	assert(ip_fast_csum(buffer + 14, 6));
+	taken(submit(), &eth3_priv, &eth3_dma);
+	/* Unshared first: a raw socket's clone may share the header. */
+	assert(bench.cows == 1);
+	assert(checksum_writes == 1 && !ip_fast_csum(buffer + 14, 6));
+	/* A header that cannot be unshared goes back unwritten, the frame
+	 * moved back to where it was. */
+	frame(&eth3, 14, 14);
+	buffer[14] = 0x46;
+	skb.data = start = buffer + 14 + 24;
+	memcpy(original, buffer, sizeof(buffer));
+	bench.cow_result = -12;
+	assert(submit() == -1 && skb.data == start && skb.len == 100);
+	assert(!checksum_writes && !bench.sg_calls && !memcmp(buffer, original, sizeof(buffer)));
+	/* One that is right is left alone... */
+	frame(&eth3, 14, 14);
+	buffer[14] = 0x46;
+	skb.data = start = buffer + 14 + 24;
+	ip_send_check((struct iphdr *)(buffer + 14));
+	want = word(24, 1);
+	reset();
+	taken(submit(), &eth3_priv, &eth3_dma);
+	assert(!checksum_writes && !bench.cows);
+	/* ...as is a header without options, which the stack never writes:
+	 * its checksum here is nonsense, and stays so. */
+	frame(&eth3, 14, 14);
+	assert(ip_fast_csum(buffer + 14, 5));
+	taken(submit(), &eth3_priv, &eth3_dma);
+	assert(!checksum_writes);
+
+	/* ESP the stack found behind a UDP header is not where this SA's is. */
+	frame(&eth3, 14, 14);
+	buffer[14 + 9] = IPPROTO_UDP;
+	skb.data = start = buffer + 14 + 28;
+	memcpy(original, buffer, sizeof(buffer));
+	handed_back(submit());
+
+	/* IPv6: the fixed header's byte, offset one... */
+	frame6(&eth3, NULL, NULL, 0);
+	assert(want == word(40, 1));
+	taken(submit(), &eth3_priv, &eth3_dma);
+	/* ...or the last extension header's, in eight-byte units. */
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){1}, 1);
+	assert(want == word(48, 5));
+	taken(submit(), &eth3_priv, &eth3_dma);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP, NEXTHDR_DEST}, (u8[]){1, 2}, 2);
+	assert(want == word(64, 6));
+	taken(submit(), &eth3_priv, &eth3_dma);
+
+	/* The byte the stack found ESP by has to name it. */
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){1}, 1);
+	skb.cb6.nhoff = 6;
+	handed_back(submit());
+
+	/* Up to the longest header the offline port reliably parses past in
+	 * SEC's output, and no further. */
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){11}, 1);
+	assert(want == word(128, 5));
+	taken(submit(), &eth3_priv, &eth3_dma);
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){12}, 1);
+	handed_back(submit());
+
+	/* A tunnel's frame keeps its SA's PDB, whatever its header. */
+	sa.props.mode = XFRM_MODE_TUNNEL;
+	frame6(&eth3, (u8[]){NEXTHDR_HOP}, (u8[]){1}, 1);
+	want = 0;
+	taken(submit(), &eth3_priv, &eth3_dma);
+	frame(&eth3, 14, 14);
+	want = 0;
+	taken(submit(), &eth3_priv, &eth3_dma);
+	sa.props.mode = XFRM_MODE_TRANSPORT;
+}
+
 int main(void)
 {
 	setup();
 	test_ports();
 	test_other_devices();
+	test_headers();
 	return 0;
 }

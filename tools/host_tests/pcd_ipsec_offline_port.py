@@ -65,6 +65,20 @@ def test_soft_parser_scope():
     assert pppoe.get('expr') == '$logicalportid != 9'
     vlan = tree.find("protocol[@name='vlanschema']/execute-code/before/if")
     assert vlan.get('expr').startswith('($logicalportid == 9) and ')
+    # A TTL or hop limit of 1 or 0 sends a frame to the CPU, before any
+    # forwarding entry could pass it on expired -- except, on the IPsec
+    # offline port, ESP its fixed header names: SEC's output for an outbound
+    # SA, which leaves as the packet's own and is freed if it is excepted.
+    for schema, limit, protocol in (('ipv4schema', 'ipv4.ttl', 'ipv4.nextp'),
+                                    ('ipv6schema', 'ipv6.hop', 'ipv6.nexthdr')):
+        checks = tree.findall(f"protocol[@name='{schema}']/execute-code/before/if")
+        assert checks[0].get('expr') == (f'({limit} == 1 or {limit} == 0) and '
+                                         f'($logicalportid != 9 or {protocol} != 0x32)'), schema
+    # An inbound SA's PDB states a plain IPv4 header: ESP behind options goes
+    # to the CPU from every port but the offline one, whose ESP is SEC's.
+    options = tree.findall("protocol[@name='ipv4schema']/execute-code/before/if")[1]
+    assert options.get('expr') == '$logicalportid != 9 and ipv4.nextp == 0x32 and ipv4.hlen != 5'
+    assert options.find("if-true/assign-variable[@name='$nia']").get('value') == '0x500002'
 
 
 # KeyGen's known-field bits (fm_kg.h). A scheme's key carries its known fields

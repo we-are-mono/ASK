@@ -53,13 +53,23 @@ def test_ipsec_inbound_submit_device(tmp_path):
     untouched, for xfrm_input() to drop. Every device that is not a port
     keeps its private area on an unreadable page, so borrowing it fails the
     run.
+
+    A transport SA's frame is described to SEC as the stack found it: its IP
+    header up to ESP, options and extension headers included, and the byte
+    naming ESP. ESP anywhere the SA's would not be, and a header longer than
+    the IPsec offline port reliably parses past, go back untouched.
     """
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     source = (kernel / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c").read_text()
     (tmp_path / "ipsec_inbound_submit.inc").write_text(
-        function(source, "dpa_netdev_is_dpaa_port")
+        # The header sizes and the parser's reach the DPOVRD value is bound by.
+        source[source.index("#define ETH_HDR_SIZE"):
+               source.index("static unsigned char* dpa_get_skb_nh")]
+        + function(source, "dpa_ipsec_transport_dpovrd")
+        + function(source, "dpa_netdev_is_dpaa_port")
         + function(source, "dpa_inb_port_ok")
+        + function(source, "dpa_ipsec_inb_dpovrd")
         + function(source, "__dpaa_submit_inb_pkt_to_SEC")
         + function(source, "dpaa_submit_inb_pkt_to_SEC"))
     binary = tmp_path / "ipsec_inbound_submit"
