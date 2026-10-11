@@ -41,9 +41,8 @@ from _flowtable_tcp import cpu_delta, transfer_counters
 from ask_orch.commands import console_python
 from ask_orch.uart import Console
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("ASK_FLOWTABLE_CHURN") != "1",
-    reason="explicit sustained full-capacity churn proof")
+pytestmark = pytest.mark.explicit("ASK_FLOWTABLE_CHURN", "1",
+                                  reason="sustained full-capacity churn proof")
 GROUP = 256
 SURVIVORS = GROUP
 # Connections never opened before the last round, which retires one group for

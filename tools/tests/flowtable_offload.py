@@ -48,8 +48,8 @@ from _flowtable_udp_wire import udp_wire_payload
 # whether an absent key means none or means an older adapter.
 
 
-@pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_BASELINE") not in {"software", "flowtable", "hardware"},
-                    reason="explicit forwarding-path loss diagnosis")
+@pytest.mark.explicit("ASK_FLOWTABLE_BASELINE", "software", "flowtable", "hardware",
+                      reason="forwarding-path loss diagnosis")
 @pytest.mark.rfc("768")
 async def test_long_exchange(rig):
     assert (await rig.state())["entries"] == 0
@@ -848,8 +848,8 @@ async def test_partial_accounting(rig):
 # fixed link keeps its carrier, and takes the agent's path with it.
 
 
-@pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TERMINAL") not in {"unload", "budget"},
-                    reason="explicit terminal lifecycle test; fresh boot required")
+@pytest.mark.explicit("ASK_FLOWTABLE_TERMINAL", "unload", "budget",
+                      reason="terminal lifecycle; fresh boot required")
 async def test_terminal(rig):
     """What still ends in a reboot: unloading CDX, and an unproven deletion
     once the restart budget is spent. The second leaves the datapath stopped

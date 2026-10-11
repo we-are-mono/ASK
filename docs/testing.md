@@ -482,10 +482,17 @@ that differs from the checkout and checks each selected test's required tools.
 - Select `host`, `hardware`, `smoke`, `slow`, and `destructive` with `ARGS='-m
   expression'`. Markers and configuration are checked strictly. Startup tests
   remain a separate `make test-startup` command and require their special boot.
+- Explicit cases carry `@pytest.mark.explicit(variable, *values, reason=...)`:
+  soaks, diagnostics run in one chosen mode, and terminal lifecycles that need
+  a fresh boot afterwards. One runs only when its variable holds one of its
+  values; otherwise it is deselected, and the summary names it with the
+  variable that selects it. The session's `selection.json` lists them under
+  `explicit_not_selected`.
 - `ARGS=--release` checks required DUT tools before setup and fails on
-  every selected skip, including disabled opt-in cases. Expected xfails keep
-  their native status. Select the required release matrix explicitly and enable
-  its opt-in cases. WAN address lifecycle needs its separate subnet invocation.
+  every selected skip. Expected xfails keep their native status. Disabled
+  explicit cases are deselected rather than skipped, so a release run covers
+  the rest of the suite; enable the soaks in it and run each terminal case on
+  its own fresh boot. WAN address lifecycle needs its separate subnet invocation.
 - Bench runs shuffle whole modules with a seed drawn per run, so state one module
   leaves behind meets a different successor each time. Test and parameter order
   within each module stays intact, including the shared profile lifecycles. The

@@ -76,6 +76,8 @@ def pytest_configure(config):
             "ASK_FLOWTABLE_CHURN",
             "ASK_FLOWTABLE_CHURN_SECONDS",
             "ASK_FLOWTABLE_BASELINE",
+            "ASK_FLOWTABLE_TERMINAL",
+            "ASK_FLOWTABLE_UNREGISTER",
             "ASK_FLOWTABLE_MIN_GBPS",
             "ASK_IPSEC_IPERF_BPS",
         )
@@ -138,6 +140,26 @@ def pytest_collection_modifyitems(config, items):
     # pytest applies -k/-m inside this hook. Mark first; validate only the
     # remaining selection so `-m host -n auto` never reserves the bench.
     result = yield
+    # An explicit case -- a soak, a diagnostic run in one chosen mode, or a
+    # lifecycle that needs a fresh boot afterwards -- belongs to a run only
+    # when its variable selects it. Leaving it out is a selection, not a
+    # skip, so a release run, which fails every skip, can still cover the
+    # rest of the suite; the summary names each case left out.
+    explicit = []
+    for item in items:
+        marker = item.get_closest_marker("explicit")
+        if marker and os.environ.get(marker.args[0]) not in marker.args[1:]:
+            explicit.append(item)
+    if explicit:
+        config.hook.pytest_deselected(items=explicit)
+        left_out = set(explicit)
+        items[:] = [item for item in items if item not in left_out]
+    config._ask_explicit = [
+        {"nodeid": item.nodeid, "variable": marker.args[0],
+         "values": list(marker.args[1:]), "reason": marker.kwargs.get("reason", "")}
+        for item in explicit
+        for marker in [item.get_closest_marker("explicit")]
+    ]
     seed = config.getoption("--module-order-seed")
     # A state one module leaves behind for the next is only found by
     # changing who comes next, so every bench run draws a new order. Host
@@ -154,7 +176,8 @@ def pytest_collection_modifyitems(config, items):
         random.Random(seed).shuffle(groups)
         items[:] = [item for group in groups for item in group]
     record("selection", {"module_order_seed": seed,
-                         "nodeids": [item.nodeid for item in items]}, nodeid="session")
+                         "nodeids": [item.nodeid for item in items],
+                         "explicit_not_selected": config._ask_explicit}, nodeid="session")
     if any(item.get_closest_marker("hardware") for item in items):
         if getattr(config.option, "numprocesses", None) or hasattr(
             config, "workerinput"
@@ -261,6 +284,10 @@ def pytest_report_collectionfinish(config):
 
 
 def pytest_terminal_summary(terminalreporter):
+    for case in getattr(terminalreporter.config, "_ask_explicit", []):
+        terminalreporter.write_line(
+            f"explicit case not selected: {case['nodeid']} "
+            f"({case['variable']}={'|'.join(case['values'])}: {case['reason']})")
     terminalreporter.write_line(f"Artifacts: {terminalreporter.config._ask_run_dir}")
     if line := _order_line(terminalreporter.config):
         terminalreporter.write_line(line)

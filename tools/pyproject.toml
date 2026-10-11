@@ -26,6 +26,7 @@ markers = [
     "smoke: agent health and boot checks",
     "slow: profiles, throughput or sustained traffic",
     "destructive: changes boot state or requires a fresh boot afterwards",
+    "explicit(variable, *values, reason): runs only when the variable holds one of the values; otherwise deselected",
     "requires(*binaries): DUT tools required before release-test setup",
     "rfc(number, section=None): the RFC behaviour this test proves; see host_tests/rfc_coverage.py",
 ]

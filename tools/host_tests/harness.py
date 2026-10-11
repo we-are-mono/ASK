@@ -580,6 +580,45 @@ def test_missing_capability():
     result.stdout.fnmatch_lines(["*release run cannot skip required coverage:*"])
 
 
+@pytest.mark.parametrize("value", [None, "other", "software"])
+def test_explicit_cases_run_only_when_their_variable_selects_them(pytester, monkeypatch, value):
+    artifacts = pytester.path / "artifacts"
+    monkeypatch.setenv("ASK_TEST_ARTIFACTS", str(artifacts))
+    if value is None:
+        monkeypatch.delenv("ASK_EXPLICIT_MODE", raising=False)
+    else:
+        monkeypatch.setenv("ASK_EXPLICIT_MODE", value)
+    pytester.makeconftest("""
+import pytest
+pytest_plugins = ["ask_orch.pytest_plugin"]
+@pytest.fixture(scope="session", autouse=True)
+def hardware_bench():
+    yield
+""")
+    pytester.makepyfile("""
+import os
+import pytest
+@pytest.mark.explicit("ASK_EXPLICIT_MODE", "software", "hardware", reason="loss diagnosis")
+def test_diagnosis():
+    assert os.environ["ASK_EXPLICIT_MODE"] in {"software", "hardware"}
+def test_required():
+    pass
+""")
+    result = pytester.runpytest_subprocess("--release", "-p", "no:cacheprovider")
+    selected = value == "software"
+    result.assert_outcomes(passed=1 + selected, deselected=int(not selected))
+    if selected:
+        result.stdout.no_fnmatch_line("*not selected*")
+    else:
+        result.stdout.fnmatch_lines([
+            "*explicit case not selected: *::test_diagnosis "
+            "(ASK_EXPLICIT_MODE=software|hardware: loss diagnosis)"])
+    (created,) = artifacts.glob("*/session-*/selection.json")
+    selection = json.loads(created.read_text())
+    assert [entry["nodeid"] for entry in selection["explicit_not_selected"]] == (
+        [] if selected else ["test_explicit_cases_run_only_when_their_variable_selects_them.py::test_diagnosis"])
+
+
 def test_progress_column_shows_duration_and_count(pytester, monkeypatch):
     monkeypatch.setenv("ASK_TEST_ARTIFACTS", str(pytester.path / "artifacts"))
     pytester.makeini("[pytest]\nconsole_output_style = count\n")

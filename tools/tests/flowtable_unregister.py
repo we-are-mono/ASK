@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 
 import pytest
@@ -12,8 +11,8 @@ from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF
 from _flowtable_rig import (artifact_dir, HEALTH_BASELINE, TABLE, command, console_command, console_python, read, terminal_stream)
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_UNREGISTER") != "1",
-                               reason="explicit physical driver removal; fresh boot required")
+pytestmark = pytest.mark.explicit("ASK_FLOWTABLE_UNREGISTER", "1",
+                                  reason="physical driver removal; fresh boot required")
 
 
 async def test_flowtable_physical_unregister(rig):
