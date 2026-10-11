@@ -4292,10 +4292,8 @@ static void test_tunnel(void)
      * while a TCP one is carried -- DF set, its segments clamped. */
     TUNNEL6_REJECT(udp_flow());
 
-    /* 4o6 ingress, and the one per-tunnel property only this mode may carry:
-     * the ip6tnl strip can copy the outer DSCP over the inner one. */
+    /* 4o6 ingress. */
     ip6tnl_in_fixture();
-    ingress_tunnel.flags = CDX_FT_TUNNEL_DSCP_COPY;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.in_tunnel.present && decoded.in_tunnel.mode == CDX_FT_TUNNEL_4O6);
     assert(!memcmp(&last_tunnel_policy.u.ip6.saddr, &ingress_tunnel.daddr.in6, 16));
@@ -4307,9 +4305,18 @@ static void test_tunnel(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     tunnel_policy_allowed = true;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-    assert(decoded.in_tunnel.flags == CDX_FT_TUNNEL_DSCP_COPY);
     assert(decoded.in_tunnel.header_size == 40 && !decoded.out_tunnel.present);
     assert(decoded.in_logical == &in_ip6tnl);
+    /* The one receive property only this mode has, the outer DSCP copied
+     * over the inner, keeps the strip in software: the microcode's copy adds
+     * the outer ECN bits into the codepoint. The tunnel's insert, which the
+     * property does not touch, is still carried. */
+    ingress_tunnel.flags = CDX_FT_TUNNEL_DSCP_COPY;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    ip6tnl_out_fixture();
+    egress_tunnel.flags = CDX_FT_TUNNEL_DSCP_COPY;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_tunnel.present && decoded.out_tunnel.flags == CDX_FT_TUNNEL_DSCP_COPY);
     /* What arrives through it is what a full outer packet carries past its
      * 40-byte header -- a peer need not add the encapsulation limit the
      * device's own MTU allows for -- so UDP needs that much path. */

@@ -584,7 +584,7 @@ print(json.dumps({{'sent': {count}}}))
     assert result.rc == 0, result.stdout
 
 
-async def remark_echo(lan, source, sport, destination, dport, count):
+async def marked_echo(lan, source, sport, destination, dport, count):
     """remark_send()'s datagrams, each answered before the next: the reply's
     TOS or traffic class, hop count and flow label as the LAN VM's stack
     received them, in the form remark_fields() gives, and how many were lost.
@@ -637,7 +637,7 @@ after = errors()
 print(json.dumps({{'fields': received, 'lost': lost,
                   'errors': {{k: after[k] - before[k] for k in before}}}}))
 ''')
-    result = await lan_run_python(lan, script, label="flowtable_qos_remark_echo",
+    result = await lan_run_python(lan, script, label="flowtable_qos_marked_echo",
                                   timeout=count * 0.3 + 40)
     assert result.rc == 0, result.stdout
     return json.loads(result.stdout.strip().splitlines()[-1])
@@ -668,14 +668,15 @@ def remark_fields(packet):
     return fields
 
 
-def assert_remarked(name, fields, count, *, label=None, hop=63):
-    """Each of `count` numbered datagrams arrived once, rewritten to EF and in
-    nothing else: the ECN codepoint its sender gave it kept, the flow label
-    kept, one hop fewer, and both checksums verifying."""
+def assert_remarked(name, fields, count, *, tos=EF_TOS, label=None, hop=63):
+    """Each of `count` numbered datagrams arrived once at the codepoint `tos`
+    carries -- EF unless told otherwise -- and changed in nothing else: the
+    ECN codepoint its sender gave it kept, the flow label kept, one hop fewer,
+    and both checksums verifying."""
     numbers = sorted(f["n"] for f in fields)
     assert numbers == list(range(count)), (name, len(numbers), numbers[:8])
     for f in fields:
-        assert f["tos"] == EF_TOS | f["n"] % 4, (name, f)
+        assert f["tos"] == tos | f["n"] % 4, (name, f)
         assert f["label"] == label and f["hop"] == hop, (name, f)
         assert f["header"] and f["udp"], (name, f)
 

@@ -181,6 +181,33 @@ tunnel set to inherit the inner TOS is refused for the same reason; an
 allowed. A tunnel inside an IPsec transform, or a transform inside a tunnel, is
 refused: nothing here proves the opcode order a stacked encapsulation needs.
 
+Measured on the wire, 2026-10-11 (`flowtable_tunnel.py`):
+
+- **A configured marking** reaches every outer header the insert builds: a
+  `sit` tunnel's `tos`, an `ip6_tnl` tunnel's `tclass` and `flowlabel`, and a
+  new one moved in by `ip tunnel change` under a live connection, which the
+  link watch retires and readmits.
+- **The outer ECN field** is the carried packet's, which the insert copies as
+  Linux's own encapsulation does (RFC 6040 §4.1): ECT(0) data segments leave
+  at ECT(0), bare acknowledgements at Not-ECT, even under a configured marking
+  that sets ECN bits of its own.
+- **`tclass inherit`** gives the outer header the carried codepoint, and after
+  a remark class's rewrite: the hardware remarks before it inserts, so both
+  headers leave at EF. Linux's software path copies outward first and remarks
+  later, which leaves the two paths disagreeing about such a flow's outer
+  codepoint (A374).
+- **On receive** the strip drops the outer codepoint with the outer header.
+  `dscp inherit`, which copies it inward, is the one receive property the
+  hardware gets wrong: its copy adds the whole outer traffic class to the
+  carried TOS byte, ECN bits included, so AF21 over ECT(0) arrived as DSCP 19
+  and Not-ECT. A tunnel set that way keeps its strip in software (A371); its
+  insert is still carried.
+
+Two things are not reproduced. The strip ignores an outer CE mark, which Linux
+carries into an ECT inner packet and drops over a Not-ECT one (A372). And a
+4o6 tunnel with no configured flow label gets label zero from the insert where
+Linux computes one (A373).
+
 ## The outer header, and the mode
 
 The header the hardware inserts is built by the same `tnl_build_header()` the
@@ -264,6 +291,8 @@ Beyond the rules a routed flow already satisfies:
   unicast address with a resolved neighbour on the device below.
 - The TTL must not be zero (inherit), and a `sit` tunnel must not inherit the
   inner TOS; the hardware writes the header it is given.
+- A direction that strips an `ip6_tnl` tunnel set to `dscp inherit` stays in
+  software: the strip's copy adds the outer ECN bits into the codepoint (A371).
 - The four Ethernet mangle words must be the tunnel's own local address,
   zero-padded, and the destination is taken from the outer next hop.
 - The device below the tunnel must share the egress port's MAC address, the
@@ -290,7 +319,8 @@ Host-side, `tools/host_tests/flowtable.c::test_tunnel` compiles the production
 decoder against a simulated kernel and covers a 6o4 and a 4o6 tunnel on each
 side, both directions, a tunnel over a VLAN device, over a bridge and over a
 PPPoE session, and the declined paths — a mode that does not match the family,
-a TTL of zero, an inherited TOS on `sit`, endpoints that do not match the
+a TTL of zero, an inherited TOS on `sit`, the strip of an `ip6_tnl` tunnel
+that copies the outer DSCP inward, endpoints that do not match the
 device, a tunnel plus an SA, a hop the walk crossed but the adapter did not
 reach, and the outer neighbour not resolving. `test_tunnel_stats` covers the
 record ownership and the measured framing; `tools/host_tests/tunnel_hm.c`
@@ -311,6 +341,9 @@ which the counters alone cannot show:
 | Routed UDP | yes | 64 hardware packets per admitted direction (4o6 upload stays in software); tunnel identity and captured outer header match the device's configuration, DF absent |
 | Full-MTU datagram | yes | a datagram filling the tunnel MTU is carried in each admitted hardware direction, so the microcode's size check counts the outer header |
 | TCP | yes | half a megabyte on one connection with both directions in hardware and the cookies unchanged |
+| Fixed marking | yes | `test_fixed_marking`: a configured `tos`, or `tclass` and `flowlabel`, on every outer header the insert builds, each beside the carried packet's ECN field and matching Linux's own outer headers for the same tunnel; `ip tunnel change` under the live connection retires it, and the readmitted insert carries the new marking |
+| Inherited traffic class | yes | `test_inherited_traffic_class`: `tclass inherit` puts the carried AF21 on every inserted outer header; a `sit` tunnel's `tos inherit` is declined, and Linux carries the connection. `test_inherited_traffic_class_after_remark`: under a remark class both headers leave at EF |
+| Outer codepoint on receive | yes | `test_outer_codepoint_on_receive`: replies under AF21 outer headers reach the LAN VM at their own codepoint and ECN field; `dscp inherit` turned on under the live flow retires the strip, every later offer is declined, and Linux delivers the copied codepoint with each reply's ECN field, CE included |
 | DSCP remark | yes | `test_remark_rewrites_the_carried_header`: a class remarking to EF rewrites the carried header and nothing else in it. Replies through the hardware's strip, sent at AF11 across all four ECN encodings (and, in IPv6, under a leased flow label), reach the LAN VM at EF with the encoding and label as sent; an ECN-capable TCP connection's segments through its insert leave at EF with ECT(0) on data and none on bare acknowledgements |
 | Reconfigure under load | 6o4 | `ip tunnel change` of the TTL retires the flow through the link watch, and the flow readmitted afterwards carries the new TTL on the wire |
 | Delete under load | yes | deleting the tunnel device retires both directions and leaves the bindings up, so the next flow is judged against whatever tunnel exists then |

@@ -1702,6 +1702,15 @@ static bool ft_tunnel_inbound_allowed(const struct cdx_ft_tunnel *tunnel)
 
 	if (!tunnel->present)
 		return true;
+	/* An ip6_tnl tunnel set to `dscp inherit' copies the outer codepoint
+	 * over the carried one on receive, keeping the carried ECN field. The
+	 * strip's copy does not do that: measured on the DK, the microcode adds
+	 * the whole outer traffic class to the carried TOS byte, so the outer
+	 * ECN bits carry into the codepoint -- AF21 over ECT(0) arrives as
+	 * DSCP 19 and Not-ECT, a CE mark as ECT(1). Linux strips such a tunnel
+	 * instead; its insert, which the setting does not touch, stays offered. */
+	if (tunnel->flags & CDX_FT_TUNNEL_DSCP_COPY)
+		return false;
 	/* Decapsulation receives a plaintext outer packet. A policy requiring
 	 * transport ESP, a block or a blocking default cannot be bypassed by
 	 * a hardware inner-tuple hit. The normal policy generation check also

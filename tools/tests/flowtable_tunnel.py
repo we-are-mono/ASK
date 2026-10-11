@@ -39,23 +39,20 @@ from __future__ import annotations
 
 from _flowtable_tunnel import CHANGED_TTL
 
-from _flowtable_tunnel import (MOVED_DEV, MOVED_GATEWAY, MOVED_MAC, OUTER_TABLE, Capture, _admit, _announce, _assert_outer, _assert_tunnel, _both_directions, _directions, _established, _expected, _ip_checksum, _moved_host, _offload_table, _outer_counter, _outer_counter_add, _outer_neighbour, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange, _undo)
+from _flowtable_tunnel import (MOVED_DEV, MOVED_GATEWAY, MOVED_MAC, Capture, _admit, _announce, _assert_marked, _assert_outer, _assert_tunnel, _both_directions, _carried, _change, _directions, _ecn_capable, _established, _expected, _insert_phases, _ip_checksum, _marking, _moved_host, _offload_table, _outer_neighbour, _retired, _stripped, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange, _undo)
 
 
 import asyncio
 import os
-import socket
-import struct
 import subprocess
 
 import pytest
 
 from ask_orch.counters import kernel_tx_packets
-from ask_orch.lifecycle import checked
-from _flowtable_qos import (AF11_TOS, COUNT, EF_TOS, FLOW_LABEL, IPV6_FLOWINFO_SEND, IPV6_FLOWLABEL_MGR, REMARK_CLASS, assert_remarked, flowlabel_lease, remark_echo, remark_fields, remarking)
+from _flowtable_qos import (AF11_TOS, COUNT, EF_TOS, FLOW_LABEL, REMARK_CLASS, assert_remarked, remark_fields, remarking)
 from _gated_tcp import GatedTcp
 from _throughput import tcp_floor
-from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run, lan_run_python
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_rig import assert_undisturbed, command
 
 # Both modes ran at the path's ceiling on four streams: 6o4 9.15 Gb/s
@@ -240,101 +237,34 @@ async def test_remark_rewrites_the_carried_header(qos, tunnel_rig):
     The remark bits lie outside the image's mask, so the adapter is reloaded
     with a wider one for the case (remarking()).
     """
-    from scapy.all import IP, TCP, UDP, IPv6
+    from scapy.all import TCP, UDP
 
     r, t = qos, tunnel_rig
     shape = t.shape
     v6 = shape.family == 6
     ip = "ip6" if v6 else "ip"
     label = FLOW_LABEL if v6 else None
-    echo = t.echo.transport.get_extra_info("socket")
-    if v6:
-        level, option = socket.IPPROTO_IPV6, socket.IPV6_TCLASS
-        echo.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 64)
-        echo.setsockopt(socket.IPPROTO_IPV6, IPV6_FLOWLABEL_MGR, flowlabel_lease(t.lan_address))
-        echo.setsockopt(socket.IPPROTO_IPV6, IPV6_FLOWINFO_SEND, 1)
-    else:
-        level, option = socket.IPPROTO_IP, socket.IP_TOS
-        echo.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 64)
-
-    def marked(data, addr):
-        # The reply at AF11 and the ECN encoding the request carried.
-        echo.setsockopt(level, option, AF11_TOS | struct.unpack("!Q", data[:8])[0] % 4)
-        return (*addr[:2], FLOW_LABEL, 0) if v6 else addr
-
-    def carried(packet):
-        # The IPv6 header of a 6o4 frame, the IPv4 one of a 4o6 frame.
-        return packet[IPv6] if v6 else packet[IP]
-
-    def tcp_rows(state):
-        return [f for f in state["flows"] if f["proto"] == "6"]
-
-    async def run(script, **kwargs):
-        return await lan_run_python(t.lan, script, **kwargs)
-
-    ecn = (await lan_run(t.lan, "sysctl -n net.ipv4.tcp_ecn")).stdout.strip()
     async with remarking(r) as mark:
         try:
             await _offload_table(t, match=f"{ip} saddr {t.lan_address} {ip} daddr {shape.inner_orch} "
                                           f"meta l4proto {{ tcp, udp }} ct mark set {mark:#x}")
-            _, strip = _directions(t, await _admit(t))
-            installed = await t.state()
-            record = _tunnel_record(t, installed)
-            await _outer_counter_add(t)
-            t.echo.prepare = marked
-            try:
-                outer = await _outer_counter(t)
-                async with Capture(t, f"remark-{shape.mode}") as capture:
-                    answered = await remark_echo(t.lan, t.lan_address, shape.sport,
-                                                 shape.inner_orch, shape.dport, COUNT)
-                outer = await _outer_counter(t) - outer
-            finally:
-                t.echo.prepare = None
-                await command(t.target, t.session, "nft", "delete", "table", "netdev",
-                              OUTER_TABLE, check=False)
-            echoed = await t.state()
-            record = {k: v - record[k] for k, v in _tunnel_record(t, echoed).items()}
-
-            checked(await lan_run(t.lan, "sysctl -w net.ipv4.tcp_ecn=1"))
-            async with GatedTcp(run, source=t.lan_address, sport=shape.sport,
-                                peer=shape.inner_orch, dport=shape.dport,
-                                label="flowtable_tunnel_remark") as transfer:
-                await transfer.warmed()
-                before = await t.wait(lambda s: len(tcp_rows(s)) == 2)
-                segments = Capture(t, f"remark-{shape.mode}-tcp")
-                segments.snaplen = 128
-                async with segments:
-                    await transfer.measure()
-                after = await t.state()
+            await _admit(t)
+            strip, replies, requests, _ = await _stripped(t, AF11_TOS, f"remark-{shape.mode}")
+            (phase,) = await _insert_phases(t, f"remark-{shape.mode}-tcp")
         finally:
-            try:
-                checked(await lan_run(t.lan, f"sysctl -w net.ipv4.tcp_ecn={ecn}"))
-            finally:
-                await t.delete_table()
-    requests = [carried(p) for p in capture.packets()]
-    forward, reverse = _directions(t, tcp_rows(before))
-    counted = {f["cookie"]: int(f["packets"]) for f in tcp_rows(after)}
-    t.record("tunnel-remark", {"strip": strip, "installed": installed, "echoed": echoed,
-                               "record": record, "outer_seen": outer,
-                               "lost": answered["lost"], "errors": answered["errors"],
-                               "before": before, "after": after})
+            await t.delete_table()
 
     # The strip: every reply carried by the hardware, rewritten and nothing else.
     assert int(strip["qos"], 16) == REMARK_CLASS, strip
-    rows = {f["cookie"]: int(f["packets"]) for f in echoed["flows"]}
-    assert rows.get(strip["cookie"], 0) - int(strip["packets"]) == COUNT, (installed, echoed)
-    assert record["rx_packets"] == COUNT and outer < COUNT // 4, (record, outer)
-    assert answered["lost"] == 0 and not any(answered["errors"].values()), answered
-    assert_remarked("strip", answered["fields"], COUNT, label=label)
+    assert_remarked("strip", replies, COUNT, label=label)
     # The software insert: each request's carried header rewritten likewise.
-    assert_remarked("insert", [remark_fields(c) for c in requests if UDP in c], COUNT, label=label)
+    carried = [_carried(t, p) for p in requests]
+    assert_remarked("insert", [remark_fields(c) for c in carried if UDP in c], COUNT, label=label)
     # The hardware insert: the connection's class on both directions, and the
     # LAN VM's segments carried by its insert -- at EF, with their own ECN.
-    assert {int(f["qos"], 16) for f in (forward, reverse)} == {REMARK_CLASS}, (forward, reverse)
-    assert counted.get(forward["cookie"], 0) - int(forward["packets"]) > 100, (forward, after)
-    packets = segments.packets()
-    _assert_outer(t, packets, 100)
-    sent = [c for c in map(carried, packets) if TCP in c and c[TCP].sport == shape.sport]
+    assert {int(f["qos"], 16) for f in phase["rows"]} == {REMARK_CLASS}, phase["rows"]
+    sent = [c for c in (_carried(t, p) for p in phase["packets"])
+            if TCP in c and c[TCP].sport == shape.sport]
     sequences, data = set(), 0
     for c in sent:
         tos = c.tc if v6 else c.tos
@@ -351,6 +281,168 @@ async def test_remark_rewrites_the_carried_header(qos, tunnel_rig):
     # Short of the rows' count: this host may coalesce the segments it
     # receives before the capture sees them.
     assert data, [c.summary() for c in sent[:8]]
+
+
+# The fixed markings a case configures and then moves to under a live
+# connection: AF11 then AF41 in the TOS byte, and for 4o6 a flow label each.
+# The second is configured with an ECN bit set, which Linux's encapsulation
+# replaces with the carried packet's ECN field, so the insert has to as well.
+MARKINGS = {"6o4": ((0x28, None), (0x8a, None)), "4o6": ((0x28, 0x12345), (0x8a, 0x54321))}
+AF21_TOS = 18 << 2
+
+
+def _marking_options(mode, tos, label):
+    if mode == "6o4":
+        return ["tos", f"{tos:#x}"]
+    return ["tclass", f"{tos:#x}", "flowlabel", f"{label:#x}"]
+
+
+@pytest.mark.rfc("2983", section="3")
+@pytest.mark.rfc("6040", section="4.1")
+@pytest.mark.rfc("6437", section="2")
+@pytest.mark.parametrize("tunnel_rig", ["6o4/marking", "4o6/marking"], indirect=True)
+async def test_fixed_marking(tunnel_rig):
+    """The outer header the hardware inserts carries the marking the tunnel
+    is configured with -- a sit tunnel's `tos`, an ip6_tnl tunnel's `tclass`
+    and `flowlabel` -- and a change to it under a live connection reaches the
+    wire.
+
+    Beside the configured codepoint the outer ECN field is the carried
+    packet's, as Linux's encapsulation copies it (RFC 6040 §4.1, CE leaving
+    as ECT(0)), whatever ECN bits the configured marking itself sets. Linux's own outer headers are the reference: a UDP upload
+    into the tunnel is Linux's (_upload_refused()), and the requests of an
+    exchange walking all four ECN encodings show the configured marking and
+    the copy. The hardware's insert is TCP's: the LAN VM's connection
+    negotiates ECN, so its data segments carry ECT(0) and its bare
+    acknowledgements none, and every outer header the insert builds has to
+    carry the marking with the matching ECN field.
+
+    `ip tunnel change` then moves the marking under the connection. The
+    adapter retires every flow through the device, the connection is
+    readmitted, and its next phase leaves with the new marking.
+    """
+    r = tunnel_rig
+    shape = r.shape
+    ip = "ip6" if shape.family == 6 else "ip"
+    first, second = MARKINGS[shape.mode]
+    await _change(r.target, r, *_marking_options(shape.mode, *first))
+    await _offload_table(r, match=f"{ip} saddr {r.lan_address} {ip} daddr {shape.inner_orch} "
+                                  f"meta l4proto {{ tcp, udp }}")
+    await _admit(r)
+    _, _, requests, _ = await _stripped(r, AF11_TOS, f"marking-{shape.mode}")
+    phases = await _insert_phases(
+        r, f"marking-{shape.mode}-tcp",
+        (None, lambda: _change(r.target, r, *_marking_options(shape.mode, *second))))
+    # Linux's insert: the configured marking and every ECN encoding copied,
+    # CE as ECT(0).
+    assert _assert_marked(r, requests, first[0] >> 2, first[1], "udp").keys() == {0, 1, 2}
+    # The hardware's, before and after the change.
+    for phase, (tos, label) in zip(phases, (first, second)):
+        assert _assert_marked(r, phase["packets"], tos >> 2, label, "tcp").keys() == {0, 2}
+
+
+@pytest.mark.rfc("2983", section="3")
+@pytest.mark.parametrize("tunnel_rig", ["6o4/inherit", "4o6/inherit"], indirect=True)
+async def test_inherited_traffic_class(tunnel_rig):
+    """A tunnel told to inherit the carried packet's codepoint.
+
+    An ip6_tnl tunnel's `tclass inherit` has a microcode flag of its own, and
+    the hardware's insert follows it: the LAN VM's connection leaves at AF21,
+    and every outer header the insert builds carries AF21 beside the carried
+    ECN field. A sit tunnel's `tos inherit` has none, so its flows are
+    declined, and Linux carries the connection and inherits the codepoint
+    itself.
+    """
+    r = tunnel_rig
+    shape = r.shape
+    await _change(r.target, r, "tclass" if shape.mode == "4o6" else "tos", "inherit")
+    await _offload_table(r, "tcp")
+    if shape.mode == "4o6":
+        (phase,) = await _insert_phases(r, "inherit-4o6", tos=AF21_TOS)
+        assert {_marking(r, p)["inner_dscp"] for p in phase["packets"]} == {AF21_TOS >> 2}
+        assert _assert_marked(r, phase["packets"], None, None, "tcp").keys() == {0, 2}
+        return
+
+    async def run(script, **kwargs):
+        return await lan_run_python(r.lan, script, **kwargs)
+
+    async with _ecn_capable(r.lan), GatedTcp(
+            run, source=r.lan_address, sport=shape.sport, peer=shape.inner_orch,
+            dport=shape.dport, label="flowtable_tunnel_inherit", tos=AF21_TOS) as transfer:
+        await transfer.warmed()
+        capture = Capture(r, "inherit-6o4")
+        capture.snaplen = 128
+        async with capture:
+            await transfer.measure()
+        state = await r.state()
+    r.record("tunnel-inherit-6o4", state)
+    assert not [f for f in state["flows"] if f["proto"] == "6"], state
+    packets = capture.packets()
+    assert {_marking(r, p)["inner_dscp"] for p in packets} == {AF21_TOS >> 2}
+    assert _assert_marked(r, packets, None, None, "tcp").keys() == {0, 2}
+
+
+@pytest.mark.rfc("2983", section="3")
+@pytest.mark.parametrize("tunnel_rig", ["6o4/copy", "4o6/copy"], indirect=True)
+async def test_outer_codepoint_on_receive(tunnel_rig):
+    """The far end marks every outer header AF21 while the replies inside it
+    leave at zero, each with an ECN encoding of its own. The hardware's strip
+    removes the outer codepoint with the outer header: the replies reach the
+    LAN VM at zero with their own ECN field.
+
+    An ip6_tnl tunnel can be told otherwise: `dscp inherit` copies the outer
+    codepoint into the carried header and nothing more, so a CE reply, whose
+    outer header the far end sent at ECT(0), still arrives CE (RFC 6040
+    §4.2). The strip's own copy adds the whole outer traffic class instead,
+    ECN bits and all, so the adapter leaves that strip to Linux: turned on
+    under the live flow, the setting retires it, every offer afterwards is
+    declined, and the replies arrive copied as Linux copies them.
+    """
+    r = tunnel_rig
+    shape = r.shape
+    label = FLOW_LABEL if shape.family == 6 else None
+
+    def sent_as_described(frames):
+        # The far end's outer headers: AF21, beside each reply's own ECN
+        # field as Linux encapsulates it, a CE reply's at ECT(0).
+        markings = [_marking(r, p) for p in frames]
+        assert len(markings) == COUNT, len(markings)
+        for m in markings:
+            assert (m["dscp"], m["ecn"]) == (AF21_TOS >> 2, 2 if m["inner_ecn"] == 3
+                                             else m["inner_ecn"]), m
+        assert {m["inner_ecn"] for m in markings} == {0, 1, 2, 3}, markings[:4]
+
+    await _change(r.wan, r, "tclass" if shape.mode == "4o6" else "tos", f"{AF21_TOS:#x}")
+    await _offload_table(r)
+    await _admit(r)
+    _, replies, _, sent = await _stripped(r, 0, f"copy-{shape.mode}")
+    sent_as_described(sent)
+    assert_remarked("strip", replies, COUNT, tos=0, label=label)
+    if shape.mode == "6o4":
+        return
+    await _retired(r, await r.state(), lambda: _change(r.target, r, "dscp", "inherit"))
+    _, replies, _, sent = await _stripped(r, 0, "copy-4o6-inherit", hardware=False)
+    sent_as_described(sent)
+    assert_remarked("strip, copied", replies, COUNT, tos=AF21_TOS, label=label)
+
+
+@pytest.mark.parametrize("tunnel_rig", ["4o6/inherit"], indirect=True)
+async def test_inherited_traffic_class_after_remark(qos, tunnel_rig):
+    """A remark class on a connection through a `tclass inherit` tunnel: the
+    hardware rewrites the carried header first and builds the outer header
+    from it, so both leave at EF."""
+    r, t = qos, tunnel_rig
+    shape = t.shape
+    await _change(t.target, t, "tclass", "inherit")
+    async with remarking(r) as mark:
+        try:
+            await _offload_table(t, match=f"{shape.match(t.lan_address, 'tcp')} "
+                                          f"ct mark set {mark:#x}")
+            (phase,) = await _insert_phases(t, "inherit-remark-4o6", tos=AF21_TOS)
+        finally:
+            await t.delete_table()
+    assert {_marking(t, p)["inner_dscp"] for p in phase["packets"]} == {EF_TOS >> 2}
+    assert _assert_marked(t, phase["packets"], None, None, "tcp").keys() == {0, 2}
 
 
 @pytest.mark.parametrize("upload", [True, False], ids=["insert", "strip"])

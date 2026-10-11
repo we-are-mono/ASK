@@ -28,6 +28,9 @@ PEER = '''
 import json, socket, time
 s = socket.socket({family}, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if {tos}:
+    s.setsockopt(*((socket.IPPROTO_IPV6, socket.IPV6_TCLASS) if s.family == socket.AF_INET6
+                   else (socket.IPPROTO_IP, socket.IP_TOS)), {tos})
 s.bind(({source!r}, {sport}))
 s.settimeout(60)
 s.connect(({peer!r}, {dport}))
@@ -64,11 +67,13 @@ class GatedTcp:
     connection can be measured on either side of a change. On the way out
     every phase is released, so the peer always finishes and frees its
     console. `peername` is the address the connection arrived from, after any
-    translation; `report` is the peer's own account, once it has closed."""
+    translation; `report` is the peer's own account, once it has closed.
+    `tos` is the DSCP the peer's segments leave with, in the TOS byte; the
+    stack keeps the ECN bits beside it."""
 
     def __init__(self, run, *, source, peer, dport, label, sport=0, warm=32, measured=128,
-                 more=(), timeout=60):
-        self.run, self.source, self.sport = run, source, sport
+                 more=(), timeout=60, tos=0):
+        self.run, self.source, self.sport, self.tos = run, source, sport, tos
         self.peer, self.dport, self.label = peer, dport, label
         self.counts, self.timeout = [warm, measured, *more], timeout
         self._echoed = [asyncio.Event() for _ in self.counts]
@@ -102,7 +107,7 @@ class GatedTcp:
         script = PEER.format(family="socket.AF_INET6" if family == socket.AF_INET6
                              else "socket.AF_INET",
                              source=self.source, sport=self.sport, peer=self.peer,
-                             dport=self.dport, counts=self.counts,
+                             dport=self.dport, counts=self.counts, tos=self.tos,
                              sent=sum(self.counts) * len(BLOCK))
         self.task = asyncio.create_task(self.run(script, timeout=self.timeout + 60,
                                                  label=self.label))

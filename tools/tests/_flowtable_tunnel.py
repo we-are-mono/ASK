@@ -6,13 +6,18 @@ import asyncio
 import json
 import os
 import socket
+import struct
 import subprocess
 import time
+from contextlib import asynccontextmanager
 
 import _flowtable_rig as ft
 import pytest
 import pytest_asyncio
+from _flowtable_qos import (COUNT, FLOW_LABEL, IPV6_FLOWINFO_SEND, IPV6_FLOWLABEL_MGR,
+                            flowlabel_lease, marked_echo)
 from _flowtable_rig import Rig, artifact_dir, assert_undisturbed, command, read
+from _gated_tcp import GatedTcp
 from _topology import (
     DUT_IPV6_LAN,
     DUT_IPV6_WAN,
@@ -25,6 +30,7 @@ from _topology import (
     lan_run_python,
 )
 from ask_orch.client import Agent
+from ask_orch.lifecycle import checked
 
 TABLE = "ask_tunnel"
 DUT_WAN_IPV4 = os.environ.get("ASK_TARGET_IP", "")
@@ -46,7 +52,8 @@ MTU_4O6 = 1440          # 1500 less the 40-byte IPv6 outer header and a 20-byte 
 # One port pair per case so a conntrack left by one never feeds another.
 PORTS = {"routed": (48910, 48911), "mtu": (48920, 48921), "tcp": (48930, 48931),
          "change": (48940, 48941), "delete": (48950, 48951), "rate": (48970, 48971),
-         "neighbour": (48980, 48981), "route": (48982, 48983), "remark": (48984, 48985)}
+         "neighbour": (48980, 48981), "route": (48982, 48983), "remark": (48984, 48985),
+         "marking": (48972, 48973), "inherit": (48974, 48975), "copy": (48976, 48977)}
 
 # Where the WAN host's outer endpoint moves to: a second MAC on its WAN
 # bridge (_moved_host).
@@ -125,12 +132,13 @@ class Shape:
         return (f"{ip} saddr {lan_address} {proto} sport {self.sport} "
                 f"{proto} dport {self.dport}")
 
-    def capture_filter(self):
-        """The outer packets the DUT sends, and only those. A 4o6 packet Linux
-        built carries ip6tnl's tunnel encapsulation limit in a destination
-        options header before the inner one, which `ip6 proto` would not look
-        past, so the next header is read at both places it can be."""
-        local, remote = self.outer
+    def capture_filter(self, received=False):
+        """The outer packets the DUT sends, and only those -- or with
+        `received`, the ones this host sends it. A 4o6 packet Linux built
+        carries ip6tnl's tunnel encapsulation limit in a destination options
+        header before the inner one, which `ip6 proto` would not look past,
+        so the next header is read at both places it can be."""
+        local, remote = self.outer[::-1] if received else self.outer
         if self.mode == "6o4":
             return f"ip proto 41 and src host {local} and dst host {remote}"
         return (f"ip6 and src host {local} and dst host {remote} "
@@ -296,9 +304,9 @@ class Capture:
     # so a line-rate burst does not fill /tmp.
     snaplen = 0
 
-    def __init__(self, r, name):
+    def __init__(self, r, name, received=False):
         self.path = artifact_dir() / f"tunnel-{name}.pcap"
-        self.filter = r.shape.capture_filter()
+        self.filter = r.shape.capture_filter(received)
         self.interface = r.wan_if
 
     async def __aenter__(self):
@@ -461,6 +469,200 @@ async def _established(r, count=64, payload_size=64, name="routed"):
     assert (record["rx_packets"], record["tx_packets"]) == (count, inserted), record
     _assert_outer(r, capture.packets(), count)
     return flows, delta
+
+
+# ---- marking -------------------------------------------------------------
+
+async def _change(agent, r, *options):
+    """`ip tunnel change` on one end's tunnel device: the options in the
+    command's own words, every other parameter left as it was."""
+    family = ["-6"] if r.shape.mode == "4o6" else []
+    await command(agent, r.session, "ip", *family, "tunnel", "change", r.shape.device, *options)
+
+
+def _cookies(state):
+    return {f["cookie"] for f in state["flows"]}
+
+
+async def _retired(r, before, change):
+    """Run `change` and wait for it to retire every flow through the tunnel,
+    which the link watch counts."""
+    old, counted = _cookies(before), before["link_invalidations"]
+    await change()
+    return await r.wait(lambda s: not old & _cookies(s) and s["link_invalidations"] > counted)
+
+
+@asynccontextmanager
+async def _ecn_capable(lan):
+    """The LAN VM's TCP asking for ECN, which this host grants when asked: a
+    connection's data segments then leave the LAN VM at ECT(0) and its bare
+    acknowledgements at Not-ECT, two encodings the outer header has to
+    follow."""
+    previous = (await lan_run(lan, "sysctl -n net.ipv4.tcp_ecn")).stdout.strip()
+    checked(await lan_run(lan, "sysctl -w net.ipv4.tcp_ecn=1"))
+    try:
+        yield
+    finally:
+        checked(await lan_run(lan, f"sysctl -w net.ipv4.tcp_ecn={previous}"))
+
+
+def _mark_replies(r, tos):
+    """This host's replies through the tunnel at `tos`, each beside the ECN
+    encoding its request carried (remark_send() walks them), at a hop count
+    of 64 and, inside IPv6, under FLOW_LABEL. The caller clears
+    `r.echo.prepare` afterwards."""
+    echo = r.echo.transport.get_extra_info("socket")
+    v6 = r.shape.family == 6
+    if v6:
+        level, option = socket.IPPROTO_IPV6, socket.IPV6_TCLASS
+        echo.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 64)
+        echo.setsockopt(socket.IPPROTO_IPV6, IPV6_FLOWLABEL_MGR, flowlabel_lease(r.lan_address))
+        echo.setsockopt(socket.IPPROTO_IPV6, IPV6_FLOWINFO_SEND, 1)
+    else:
+        level, option = socket.IPPROTO_IP, socket.IP_TOS
+        echo.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 64)
+
+    def marked(data, addr):
+        echo.setsockopt(level, option, tos | struct.unpack("!Q", data[:8])[0] % 4)
+        return (*addr[:2], FLOW_LABEL, 0) if v6 else addr
+    r.echo.prepare = marked
+
+
+async def _stripped(r, tos, name, hardware=True):
+    """COUNT replies from this host at `tos` through the hardware's strip, as
+    the LAN VM's stack received them (marked_echo()), and the outer frames
+    each way: the requests they answered, which Linux inserted, and the
+    replies as this host sent them. The strip row and the tunnel's receive
+    record have to move by every reply while Linux sees next to none of their
+    outer packets, and none may be lost or fail a checksum.
+
+    Without `hardware`, a tunnel whose strip the adapter declines: no
+    direction of the flow is installed though the replies offer it again,
+    and Linux sees every outer packet itself."""
+    shape = r.shape
+    installed = await r.state()
+    strip = _directions(r, installed["flows"])[1] if hardware else None
+    record = _tunnel_record(r, installed)
+    await _outer_counter_add(r)
+    _mark_replies(r, tos)
+    try:
+        outer = await _outer_counter(r)
+        async with Capture(r, name) as capture, Capture(r, f"{name}-replies", True) as replies:
+            answered = await marked_echo(r.lan, r.lan_address, shape.sport, shape.inner_orch,
+                                         shape.dport, COUNT)
+        outer = await _outer_counter(r) - outer
+    finally:
+        r.echo.prepare = None
+        await command(r.target, r.session, "nft", "delete", "table", "netdev", OUTER_TABLE,
+                      check=False)
+    state = await r.state()
+    record = {k: v - record[k] for k, v in _tunnel_record(r, state).items()}
+    moved = {f["cookie"]: int(f["packets"]) for f in state["flows"]}
+    r.record(f"tunnel-{name}", {"strip": strip, "installed": installed, "state": state,
+                                "record": record, "outer_seen": outer,
+                                "lost": answered["lost"], "errors": answered["errors"],
+                                "tos": [f.get("tos") for f in answered["fields"]]})
+    if hardware:
+        assert moved.get(strip["cookie"], 0) - int(strip["packets"]) == COUNT, (installed, state)
+        assert record["rx_packets"] == COUNT and outer < COUNT // 4, (record, outer)
+    else:
+        assert not moved and state["rejects"] > installed["rejects"], (installed, state)
+        assert record["rx_packets"] == 0 and outer >= COUNT, (record, outer)
+    assert answered["lost"] == 0 and not any(answered["errors"].values()), answered
+    return strip, answered["fields"], capture.packets(), replies.packets()
+
+
+def _carried(r, packet):
+    """The header the tunnel carries: the IPv6 one of a 6o4 frame, the IPv4
+    one of a 4o6 frame."""
+    from scapy.all import IP, IPv6
+    return packet[IPv6] if r.shape.family == 6 else packet[IP]
+
+
+def _marking(r, packet):
+    """An outer frame's codepoint and ECN field and, for 4o6, its flow label,
+    beside the carried header's codepoint and ECN field."""
+    from scapy.all import IP, IPv6
+    if r.shape.mode == "6o4":
+        tos, label, carried = packet[IP].tos, None, packet[IPv6].tc
+    else:
+        tos, label, carried = packet[IPv6].tc, packet[IPv6].fl, packet[IP].tos
+    return {"dscp": tos >> 2, "ecn": tos & 3, "label": label,
+            "inner_dscp": carried >> 2, "inner_ecn": carried & 3}
+
+
+def _assert_marked(r, packets, dscp, label, proto):
+    """Every outer frame carrying `proto` at the codepoint `dscp` -- the
+    carried header's own where None -- under the configured flow label
+    `label`, and with the carried header's ECN field: copied as RFC 6040
+    §4.1's normal mode and Linux's encapsulation copy it, CE leaving as
+    ECT(0) as Linux has it. Returns how many frames carried each ECN
+    codepoint.
+
+    A 4o6 tunnel configured with no label is not held to one: Linux then
+    labels from a hash that depends on whether the frame already carries one
+    (A373), and the hardware inserts zero."""
+    from scapy.all import TCP, UDP
+    layer = TCP if proto == "tcp" else UDP
+    seen = {}
+    for p in packets:
+        if layer not in _carried(r, p):
+            continue
+        m = _marking(r, p)
+        expected = m["inner_dscp"] if dscp is None else dscp
+        assert m["dscp"] == expected and label in (None, m["label"]), (m, p.summary())
+        assert m["ecn"] == (2 if m["inner_ecn"] == 3 else m["inner_ecn"]), (m, p.summary())
+        seen[m["ecn"]] = seen.get(m["ecn"], 0) + 1
+    assert seen, (proto, len(packets))
+    return seen
+
+
+async def _insert_phases(r, name, changes=(None,), *, tos=0):
+    """One ECN-capable TCP connection from the LAN VM through the tunnel,
+    measured once per entry of `changes` with the frames the hardware's
+    insert put on the wire captured. Each entry but the first is run before
+    its phase, and has to retire every flow through the tunnel; the
+    connection is readmitted before it is measured again. Per phase: the
+    connection's two rows, the upload's, how many packets it carried, and the
+    captured frames."""
+    shape = r.shape
+    readmit = 1024
+    more = tuple(n for _ in changes[1:] for n in (readmit, 128))
+
+    async def run(script, **kwargs):
+        return await lan_run_python(r.lan, script, **kwargs)
+
+    def tcp(state):
+        return {f["cookie"]: f for f in state["flows"] if f["proto"] == "6"}
+
+    phases = []
+    async with _ecn_capable(r.lan), GatedTcp(
+            run, source=r.lan_address, sport=shape.sport, peer=shape.inner_orch,
+            dport=shape.dport, label=f"flowtable_tunnel_{name}", more=more, tos=tos) as transfer:
+        await transfer.warmed()
+        state = await r.wait(lambda s: len(tcp(s)) == 2)
+        for index, change in enumerate(changes):
+            if change:
+                await _retired(r, state, change)
+                await transfer.measure()
+                old = set(tcp(state))
+                state = await r.wait(lambda s: len(tcp(s)) == 2 and not old & set(tcp(s)))
+            forward, _ = _directions(r, list(tcp(state).values()))
+            capture = Capture(r, f"{name}-{index}")
+            capture.snaplen = 128
+            async with capture:
+                await transfer.measure()
+            after = tcp(await r.state())
+            carried = int(after[forward["cookie"]]["packets"]) - int(forward["packets"]) \
+                if forward["cookie"] in after else 0
+            phases.append({"rows": list(tcp(state).values()), "forward": forward,
+                           "carried": carried, "packets": capture.packets()})
+            state = await r.state()
+    r.record(f"tunnel-{name}", [{k: v for k, v in p.items() if k != "packets"} for p in phases])
+    for phase in phases:
+        assert phase["carried"] > 100, phase["forward"]
+        _assert_outer(r, phase["packets"], 100)
+    return phases
 
 
 # ---- topology ------------------------------------------------------------

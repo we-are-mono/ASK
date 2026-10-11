@@ -2397,10 +2397,11 @@ selection that already decodes the same class from the same mark:
   class, remark included, comes from the connection found again by its tuple
   ([unclassified traffic](#unclassified-traffic)). The tunnel's own outer header
   is left as the tunnel wrote it, before the remark: a tunnel that copies the
-  inner codepoint outward shows the upstream the old one. Whether the
-  microcode copies the remarked codepoint into the outer header of an
-  offloaded 6in4 or 4in6 flow is not known from source, and needs a capture on
-  the rig to settle.
+  inner codepoint outward shows the upstream the old one. The hardware does
+  the opposite, measured on a 4in6 `tclass inherit` tunnel (a 6in4 one cannot
+  inherit in hardware): it remarks before it inserts, so an offloaded flow's
+  outer header carries the remarked codepoint, and the two paths disagree
+  there (A374).
 - **On a port with no tree**, a class does nothing but remark, so the port asks
   the adapter about a frame only when some class it can decode carries a remark
   — the image's 0xf0 mask cannot, and its default class does not.

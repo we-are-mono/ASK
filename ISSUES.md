@@ -152,6 +152,33 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A374 — a remark under a `tclass inherit` 4o6 tunnel changes the outer codepoint when the flow is offloaded.**
+  The hardware remarks the carried header before its insert copies it outward, so both leave at EF
+  (`flowtable_tunnel.py::test_inherited_traffic_class_after_remark`). Linux's insert copies the carried codepoint
+  first and the remark runs later, at the port's queue selection (`cdx_htb_select_queue()`): measured, AF11 requests
+  through the same tunnel left Linux with the outer header at AF11 and the carried one at EF. So the outer codepoint the
+  upstream sees moves at offload, the switch the remark design exists to prevent (docs/flowtable/qos.md, "The
+  software path remarks too"). Fix direction: remark in software before the encapsulation, for example from an egress
+  hook on tunnel devices, which both the forward path and the software flowtable reach.
+
+- [ ] **A373 — a 4o6 tunnel with no configured flow label sends label 0 from hardware; Linux labels it.** Linux's
+  ip6_tnl asks `ip6_make_flowlabel()` for a label: from the frame's hash where one is set (RPS sets it), otherwise from
+  the tunnel's outer keys -- measured 0x7f1f9 for two different flows on the test image, which has no RPS. The insert
+  template carries `p->flowinfo`'s label, zero (patch 143's `ip6_tnl_fill_forward_path()`), so the outer label changes
+  when the flow is offloaded and an AFTR's ECMP gets no entropy from it (RFC 6438). A configured label is reproduced
+  (`test_fixed_marking`). Fix needs a decision: one label per tunnel computed as Linux does without a hash, or one per
+  flow from the inner tuple (RFC 6438), which matches Linux only where RPS hashed the frame.
+
+- [ ] **A372 — the hardware strip ignores an outer CE mark.** RFC 6040 §4.2, and Linux's sit and ip6_tnl receive, mark
+  an ECT carried packet CE under an outer CE and drop a Not-ECT one. Measured on both 6o4 and 4o6 with the far end's
+  outer headers rewritten to CE (nft `ip ecn set ce` / `ip6 ecn set ce` at its postrouting): all 256 replies were
+  counted by the strip and reached the LAN VM with their own ECN field unchanged, Not-ECT ones included. A congestion
+  mark set inside the tunnel is lost once the flow is offloaded. Fix direction: have the soft parser send tunnel frames
+  whose outer ECN is CE to the CPU, rare outside congestion but unmetered until A370; or a microcode change. XML gate.
+
+- [x] **A371 — a `dscp inherit` 4o6 strip added the whole outer traffic class to the carried TOS.** Microcode copy, ECN
+  bits and all; that strip is now Linux's (_:/^tunnels: prove the outer marking on the wire_).
+
 - [ ] **A370 — frames the soft parser sends to the CPU bypass the devlink punt meter.** `cdx_sp.xml` punts TTL or hop
   limit 0/1, IPv4 ESP or UDP behind options (A364/A368) and PPPoE control frames with `$nia`/`$hpnia` 0x500002, straight
   to the BMI enqueue, while ordinary exceptions go through the punt policer (`$nia` 0x4C0000, devlink trap policer 1).

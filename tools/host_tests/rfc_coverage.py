@@ -57,6 +57,8 @@ CATALOGUE = {
     # Tunnels
     "2473": ("supported", "4o6 tunnel"),
     "4213": ("supported", "6o4 (sit) tunnel"),
+    "2983": ("supported", "tunnel outer codepoint: configured or inherited"),
+    "6040": ("supported", "ECN copied into the outer header; an outer CE is not applied on strip (A372)"),
     "5969": ("unsupported", "6rd, TODO after 1.1.0"),
     "7597": ("unsupported", "MAP-E, TODO after 1.1.0"),
     # IPsec
