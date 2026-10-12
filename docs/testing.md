@@ -529,7 +529,16 @@ TCP.
 frames, sent by `pktgen` on the LAN VM and counted at each hop: the LAN VM's
 NIC, the DUT's LAN MAC (`mac_rx_stats`), its FMan receive port, the flows'
 hardware entries, its WAN MAC (`mac_tx_stats`), and the WAN host NIC's MAC
-counter, which counts what arrives whatever that host's CPU does. Lossless,
+counter. That last count holds only while the host keeps up: an mlx4 NIC
+leaves frames it drops for want of receive buffers out of `rx_packets_phy`.
+One host CPU drains each flow's ring, at about 70% softirq load for the
+lossless 1.9 Mpps, so a few milliseconds of other host work overflow it. A
+sample in which the host's `rx_dropped` or `rx_fifo_errors` moved is measured
+again, up to three samples, and fails as the host's, not the DUT's, if every
+one overflowed; a sample in which anything else fell short is not retried.
+Keep the host's default 1024-entry receive rings: 8192 still overflowed and
+cost its TCP receive enough to fail `profile_isp`'s 8.8 Gbit/s upload
+floor. Lossless,
 one paced generator thread offers at least 1.8 Mpps; the MAC drops nothing,
 less than 1e-4 of the frames goes missing, and the DUT's kernel transmits
 next to nothing. Even one descheduled pktgen thread catches up at full speed,
@@ -539,7 +548,7 @@ The artifact records the cap and previous setting. The orchestrator restores
 that setting even if the guest script fails or times out; restoring an unlimited
 ixgbe queue writes link speed before zero because zero alone leaves its hardware
 limiter unchanged. Overloaded, four unpaced threads offer about
-9 Mpps; the hardware path still forwards at least 3 Mpps (3.17-3.30 measured,
+9 Mpps; the hardware path still forwards at least 3 Mpps (3.17-3.39 measured,
 the FMan receive path's ceiling at both sizes), and every refused frame is
 counted at the MAC or by the port's frame filter (A361).
 

@@ -67,6 +67,10 @@ PACKET_LOSS = 1e-4
 # The LAN VM's own frames (ARP, neighbour discovery) landing between two
 # counter reads of one snapshot.
 PACKET_NOISE = 64
+# Samples taken before the WAN host's own receive loss fails the case: one
+# host CPU drains a flow's ring at about 70% softirq load at 1.9 Mpps, so a
+# few milliseconds of other host work can overflow its ring.
+PACKET_SAMPLES = 3
 
 
 def _udp_counters():
@@ -342,12 +346,14 @@ async def _dut_hops(r):
 
 
 def _host_nic(name):
-    """The WAN host NIC's MAC-level receive counters: what arrived on the
-    wire, whatever this host's CPU then made of it."""
+    """The WAN host NIC's receive counters. Its MAC-level count holds what
+    arrived only while the host keeps up: mlx4 leaves frames it drops for
+    want of receive buffers out of `rx_packets_phy` and counts them in
+    `rx_dropped` and `rx_fifo_errors` instead."""
     out = subprocess.run(["ethtool", "-S", name], capture_output=True, text=True, timeout=5, check=True).stdout
     stats = {k.strip(): int(v) for k, v in (line.split(":", 1) for line in out.splitlines()[1:])
              if v.strip().isdigit()}
-    return {k: stats[k] for k in ("rx_packets_phy", "rx_packets", "rx_dropped") if k in stats}
+    return {k: stats[k] for k in ("rx_packets_phy", "rx_packets", "rx_dropped", "rx_fifo_errors") if k in stats}
 
 
 def _pktgen(r, frame, threads, count, ratep):
@@ -489,7 +495,6 @@ print(echoed)
             subprocess.run(["nft", sink_rules], check=True, timeout=10)
             sinking = True
 
-            hops_before, host_before, cpu_before = await _dut_hops(r), _host_nic(wire), await cpu(r)
             if ratep:
                 assert threads == 1
                 result = await lan_run_python(r.lan, f'''
@@ -505,32 +510,45 @@ print(json.dumps({{"prior_mbps": int((nic / "queues/tx-0/tx_maxrate").read_text(
                 # Frame includes FCS; preamble and inter-frame gap add 20 bytes.
                 pacing["cap_mbps"] = (ratep * (frame + 20) * 8 + 999999) // 1000000
                 record["pacing"] = pacing
-            result = await lan_run_python(r.lan, _pktgen(r, frame, threads, count, ratep),
-                                          label="packet_rate_pktgen", timeout=PACKET_SECONDS * 4 + 30)
-            assert result.rc == 0, result.stdout
-            sender = json.loads(result.stdout.strip().splitlines()[-1])
-            # The hardware's counters reach the adapter on its statistics
-            # pass, once a second.
-            await asyncio.sleep(2)
-            after = await r.state()
-            hops_after, host_after, cpu_after = await _dut_hops(r), _host_nic(wire), await cpu(r)
+            # The WAN host counts what the DUT sent only while it keeps up.
+            # A sample in which it ran out of receive buffers itself is
+            # measured again; one in which anything else fell short is not.
+            record["samples"] = []
+            for attempt in range(PACKET_SAMPLES):
+                start = before if attempt == 0 else await r.state()
+                hops_before, host_before, cpu_before = await _dut_hops(r), _host_nic(wire), await cpu(r)
+                result = await lan_run_python(r.lan, _pktgen(r, frame, threads, count, ratep),
+                                              label="packet_rate_pktgen", timeout=PACKET_SECONDS * 4 + 30)
+                assert result.rc == 0, result.stdout
+                sender = json.loads(result.stdout.strip().splitlines()[-1])
+                # The hardware's counters reach the adapter on its statistics
+                # pass, once a second.
+                await asyncio.sleep(2)
+                after = await r.state()
+                hops_after, host_after, cpu_after = await _dut_hops(r), _host_nic(wire), await cpu(r)
+                host = {k: host_after[k] - host_before[k] for k in host_before}
+                record["samples"].append({"sender": sender, "host": host})
+                if not any(host.get(k, 0) for k in ("rx_dropped", "rx_fifo_errors")):
+                    break
             sunk = subprocess.run(["nft", "-j", "list", "table", "netdev", sink],
                                   capture_output=True, text=True, timeout=10, check=True).stdout
             moved = directions(after)
             record.update({
-                "sender": sender, "before": before, "after": after,
+                "sender": sender, "before": start, "after": after,
                 "hops": {side: {k: v for k, v in hops.items()} for side, hops in
                          (("before", hops_before), ("after", hops_after))},
-                "host": {k: host_after[k] - host_before[k] for k in host_before},
+                "host": host,
                 "sink": [rule["rule"]["expr"] for rule in json.loads(sunk)["nftables"] if "rule" in rule],
                 "cpu": cpu_delta(cpu_before, cpu_after)})
 
             sent = sender["nic"]["tx_pkts_nic"]
             rate = sent / sender["elapsed"]
-            assert all((TARGET_LAN_IF, sport) in moved and moved[(TARGET_LAN_IF, sport)]["cookie"]
-                       == entries[sport]["cookie"] for sport in sports), ("an entry was replaced", entries, moved)
-            matched = sum(int(moved[(TARGET_LAN_IF, sport)]["packets"]) - int(entries[sport]["packets"])
-                          for sport in sports)
+            baseline = directions(start)
+            assert all(rows.get((TARGET_LAN_IF, sport), {}).get("cookie") == entries[sport]["cookie"]
+                       for rows in (baseline, moved) for sport in sports), \
+                ("an entry was replaced", entries, baseline, moved)
+            matched = sum(int(moved[(TARGET_LAN_IF, sport)]["packets"])
+                          - int(baseline[(TARGET_LAN_IF, sport)]["packets"]) for sport in sports)
             change = {side: {k: hops_after[side][k] - hops_before[side][k] for k in hops_before[side]}
                       for side in ("lan_rx", "lan_port", "wan_tx", "kernel_tx")}
             record["account"] = account = {
@@ -555,9 +573,14 @@ print(json.dumps({{"prior_mbps": int((nic / "queues/tx-0/tx_maxrate").read_text(
                 ("enqueued frames went unmatched", account)
             assert wan_tx["tpkt"] >= matched * (1 - PACKET_LOSS) and wan_tx["terr"] == 0, \
                 ("matched frames did not leave the WAN MAC", account)
+            # A host that ran out of receive buffers also left those frames
+            # out of its MAC count, so the count below would charge the DUT
+            # with the host's own loss.
+            assert not any(record["host"].get(k, 0) for k in ("rx_dropped", "rx_fifo_errors")), \
+                (f"the WAN host's receive rings overflowed in all {PACKET_SAMPLES} samples; "
+                 "they say nothing about the DUT", record["samples"], account)
             assert record["host"]["rx_packets_phy"] >= wan_tx["tpkt"] * (1 - PACKET_LOSS), \
                 ("the WAN host's MAC did not receive every frame", account)
-            assert record["host"].get("rx_dropped", 0) == 0, ("the WAN host's driver fell behind", account)
             assert all(0 <= v <= 512 for v in change["kernel_tx"].values()), \
                 ("the DUT's kernel forwarded the flood", account)
             if overload:
