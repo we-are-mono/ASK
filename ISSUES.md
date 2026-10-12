@@ -152,6 +152,26 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A376 — a new UDP flow's first requests are sometimes lost before the DUT counts them.** Once in a randomized
+  release suite (module seed 914008896, test 163), `flowtable_nat_icmp.py::test_icmp_error_is_translated[frag-needed]`
+  stopped in `snat_warm()`: the first four requests of flow 0 never reached the WAN host and the fifth did, so the
+  peer timed out. No DUT drop counter the peer records moved, loki's `enp4s0` had no CRC or link event, and the
+  module passed in all 22 runs since: 18 after `ipsec_offload_transport6.py`, its neighbour in that run, and one
+  replay of the run's exact 34-module prefix. `snat_warm()` now records
+  `path_counters()` before and after a failed warm-up -- both ends' neighbour tables, `arp_cache`
+  `unresolved_discards`, SNMP/netstat, NIC counters, conntrack and the ruleset -- so a recurrence says whether a
+  neighbour resolution, a route or the fresh SNAT/policy apply took them. Next: read `*-counters-failed` beside
+  `*-counters-before` on the next occurrence.
+
+- [ ] **A375 — after a bridge bounce, a routed IPv6 IPTV group was once never carried again.** Once in a randomized
+  release suite (module seed 3342300334, test 567), `flowtable_service_multicast_bridge.py::
+  test_route_count_across_a_bridge_bounce[6]` timed out in `_ride()`: after `ip link set br-ftmcast down/up` the
+  group's bridged row did not reach `installed` with a routed half within 20 s. The IPv4 twin passed in the same run,
+  and the case has passed since in 7 scoped runs, 4 in-order module runs and 2 later suites. Ruled out: the bridge's IPv6 querier,
+  counted within 0.1 s of `up` in every instrumented run. The truncated assertion lost the row's state; `_ride()`
+  now records the row, both learners' tables, the bridge's MDB and link (`multicast-ride-timeout`) and names the
+  state. Next: on recurrence, read that record; a `refused-*` state names the learner's reason.
+
 - [ ] **A374 — a remark under a `tclass inherit` 4o6 tunnel changes the outer codepoint when the flow is offloaded.**
   The hardware remarks the carried header before its insert copies it outward, so both leave at EF
   (`flowtable_tunnel.py::test_inherited_traffic_class_after_remark`). Linux's insert copies the carried codepoint

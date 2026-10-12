@@ -12,7 +12,7 @@ from _flowtable_connections import FLOWS, healthy, peer
 from _flowtable_policy import CONFIG, apply, candidate, stop
 from _flowtable_rig import DPORT, WAN_IP, artifact_dir, command, console_command, read
 from _flowtable_tcp import cpu, cpu_delta, software_tx
-from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
+from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from ask_orch.uart import Console
 from _flowtable_connections_peer import UDP_SIZE, payload
 from _flowtable_udp_wire import udp_wire_payload
@@ -31,9 +31,57 @@ def snat_flows(r, state, external, port):
     return rows
 
 
+LAN_COUNTERS = f'''
+import json, subprocess
+def sh(c): return subprocess.run(c, shell=True, capture_output=True, text=True).stdout
+print(json.dumps({{"neigh": sh("ip -s -j neigh show dev {LAN_NIC}"), "arp_cache": sh("cat /proc/net/stat/arp_cache"),
+                  "snmp": sh("cat /proc/net/snmp"), "netstat": sh("cat /proc/net/netstat"),
+                  "nic": sh("ethtool -S {LAN_NIC} | grep -Ei 'rx_packets|tx_packets|err|drop|miss|crc'"),
+                  "link": sh("ip -s -j link show {LAN_NIC}"), "route": sh("ip -j route get {WAN_IP}")}}))
+'''
+
+
+async def path_counters(r, label):
+    """Both ends' neighbour, ARP, IP and NIC counters and the DUT's
+    conntrack and ruleset. A new flow's first requests have been lost
+    with no DUT drop counter moving, so the counters that count a
+    neighbour or route failure instead are recorded around the warm-up
+    (A376)."""
+    dut = {}
+    for name, path in (("arp_cache", "/proc/net/stat/arp_cache"), ("snmp", "/proc/net/snmp"),
+                       ("netstat", "/proc/net/netstat"), ("softnet", "/proc/net/softnet_stat"),
+                       ("nf_conntrack", "/proc/net/stat/nf_conntrack"),
+                       ("lan_missed", f"/sys/class/net/{TARGET_LAN_IF}/statistics/rx_missed_errors"),
+                       ("wan_missed", f"/sys/class/net/{TARGET_WAN_IF}/statistics/rx_missed_errors"),
+                       ("lan_rx", f"/sys/class/net/{TARGET_LAN_IF}/statistics/rx_packets"),
+                       ("wan_tx", f"/sys/class/net/{TARGET_WAN_IF}/statistics/tx_packets")):
+        try:
+            dut[name] = await read(r.target, r.session, path)
+        except Exception as error:
+            dut[name] = repr(error)
+    for name, argv in (("neigh", ("ip", "-s", "-j", "neigh", "show")),
+                       ("conntrack", ("conntrack", "-L", "-p", "udp", "-o", "extended")),
+                       ("nft", ("nft", "-j", "list", "ruleset")),
+                       ("route", ("ip", "-j", "route", "get", WAN_IP))):
+        try:
+            dut[name] = (await command(r.target, r.session, *argv, check=False))["stdout"]
+        except Exception as error:
+            dut[name] = repr(error)
+    try:
+        lan = (await lan_run_python(r.lan, LAN_COUNTERS, label="path_counters", timeout=20)).stdout
+    except Exception as error:
+        lan = repr(error)
+    r.record(label, {"dut": dut, "lan": lan, "state": await r.state()})
+
+
 async def snat_warm(r, p, external, port, label):
+    await path_counters(r, f"{label}-counters-before")
     for _ in range(10):
-        await p.batch([0], 64, 0.01)
+        try:
+            await p.batch([0], 64, 0.01)
+        except BaseException:
+            await path_counters(r, f"{label}-counters-failed")
+            raise
         state = await r.state()
         if state["entries"] == 2:
             snat_flows(r, state, external, port)
