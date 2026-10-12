@@ -884,10 +884,20 @@ async def _ride(r, group, source):
     while True:
         await _from_wan(r, new_config(family, source, group, FRAMING_PORT, []), 16, r.wan_mac)
         sent += 16
-        row = _iptv_row(await r.state(), group)
+        state = await r.state()
+        row = _iptv_row(state, group)
         if row and row['state'] == 'installed' and row['routed'] != '-':
             break
-        assert time.monotonic() < deadline, ('never carried with its route', row)
+        if time.monotonic() >= deadline:
+            # What the bridge itself forwards decides what the learner may
+            # carry, so keep it beside the row.
+            mdb = await command(r.target, r.session, 'bridge', '-j', '-d', 'mdb', 'show', 'dev', BRIDGE)
+            link = await command(r.target, r.session, 'ip', '-d', '-j', 'link', 'show', BRIDGE)
+            r.record('multicast-ride-timeout', {'row': row, 'mcast': state['mcast'], 'mroute': state['mroute'],
+                                                'mdb': mdb['stdout'], 'bridge': link['stdout']})
+            raise AssertionError(f"never carried with its route: state "
+                                 f"{row and row['state']!r}, routed {row and row['routed']!r}; "
+                                 f"see multicast-ride-timeout")
         await asyncio.sleep(0.3)
     state = await r.wait(lambda s: (m := _mroute_row(s, group)) is not None
                          and m['state'] == 'installed', timeout=15)
