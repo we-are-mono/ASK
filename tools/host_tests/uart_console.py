@@ -85,6 +85,9 @@ def test_interrupted_drain_does_not_resend_bytes(pty_port, monkeypatch, failure)
 
 def test_target_paces_writes_for_a_small_receive_fifo(monkeypatch):
     monkeypatch.setattr(uart, "DEFAULT_TARGET_DEV", "/dev/fake-uart")
+    # A hardware module earlier in the same session leaves its DUT session
+    # installed, and Console.target() would hand that out instead.
+    monkeypatch.setattr(uart, "_TARGET_SESSION", None)
     class Receiver:
         def __init__(self, **kwargs):
             self.fifo = b""
