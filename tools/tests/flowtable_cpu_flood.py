@@ -11,9 +11,8 @@ and every port missed whatever it received, offloaded forwarding included
 from __future__ import annotations
 
 import asyncio
-import multiprocessing
-import socket
-import time
+import subprocess
+import sys
 
 from _flowtable_rig import pool_lowest, port_drops
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
@@ -23,27 +22,35 @@ from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 DISCARD = 9
 
 
-def _blast(address, seconds):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    payload, sent, end = bytes(64), 0, time.monotonic() + seconds
-    try:
-        while time.monotonic() < end:
-            for _ in range(64):
-                try:
-                    sock.sendto(payload, (address, DISCARD))
-                    sent += 1
-                except OSError:
-                    pass
-    finally:
-        sock.close()
-    return sent
+BLAST = f'''
+import socket, sys, time
+address, seconds = sys.argv[1], float(sys.argv[2])
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+payload, sent, end = bytes(64), 0, time.monotonic() + seconds
+while time.monotonic() < end:
+    for _ in range(64):
+        try:
+            sock.sendto(payload, (address, {DISCARD}))
+            sent += 1
+        except OSError:
+            pass
+print(sent)
+'''
 
 
 def _flood(address, seconds, senders=4):
     """Small datagrams to the gateway's own address from several processes at
-    once, as fast as each goes: several times what its CPU receives."""
-    with multiprocessing.get_context("fork").Pool(senders) as pool:
-        return sum(pool.starmap(_blast, [(address, seconds)] * senders))
+    once, as fast as each goes: several times what its CPU receives. Each is
+    its own interpreter: forking this multi-threaded one could hand a child a
+    lock another thread held."""
+    procs = [subprocess.Popen([sys.executable, "-c", BLAST, address, str(seconds)],
+                              stdout=subprocess.PIPE, text=True) for _ in range(senders)]
+    sent = 0
+    for proc in procs:
+        out, _ = proc.communicate(timeout=seconds + 30)
+        assert proc.returncode == 0, (proc.returncode, out)
+        sent += int(out)
+    return sent
 
 
 async def test_cpu_flood_leaves_the_pool(rig):
