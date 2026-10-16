@@ -694,3 +694,53 @@ print('sent')
         assert after["l2_retired"] >= state["l2_retired"] + count, (state["l2_retired"], after["l2_retired"])
     finally:
         await r.target.fs_write(r.session, param, saved)
+
+
+async def test_l2_refusal_held(l2_rig):
+    """A pair the bridge would not forward -- here, between two isolated
+    ports -- is refused once and then left to software for up to ten seconds,
+    as auto_bridge left a pair CMM denied, rather than asked again every
+    second it carries traffic (A383); and a change to a port it rests on asks
+    again at once. Isolation is lifted while the refusal is fresh, so an
+    admission well inside the hold is the port's event clearing it, not the
+    hold running out."""
+    r = l2_rig
+    await _exchange(r, count=4)
+    await _carried(r)
+    frame = _frame(PEER_MAC, r.station_mac, None, b"askl2-held").hex()
+    script = f"""
+import socket, time
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind(({LAN_NIC!r}, 0))
+frame = bytes.fromhex({frame!r})
+end = time.monotonic() + 14
+while time.monotonic() < end:
+    s.send(frame)
+    time.sleep(0.02)
+print('sent')
+"""
+    for port in (TARGET_LAN_IF, TARGET_WAN_IF):
+        await command(r.target, r.session, "bridge", "link", "set", "dev", port, "isolated", "on")
+    await r.wait(lambda s: not _pairs(r, s), timeout=5)
+    before = await r.state()
+    run = asyncio.create_task(lan_run_python(r.lan, script, label="l2_held", timeout=40))
+    try:
+        refused = await r.wait(lambda s: s["l2_refused"] > before["l2_refused"], timeout=5)
+        refused_at = time.monotonic()
+        await asyncio.sleep(2.5)
+        held = await r.state()
+        r.record("l2-held", {"refused": held["l2_refused"] - before["l2_refused"],
+                             "held": held["l2_held"] - refused["l2_held"]})
+        assert not _pairs(r, held), held["l2flows"]
+        # One refusal, and the observations since held rather than asked.
+        assert held["l2_refused"] - before["l2_refused"] <= 2, (before, held)
+        assert held["l2_held"] > refused["l2_held"], (refused, held)
+        # One port no longer isolated: the bridge forwards the pair again,
+        # and the port's event clears the refusal.
+        await command(r.target, r.session, "bridge", "link", "set", "dev", TARGET_LAN_IF,
+                      "isolated", "off")
+        await r.wait(lambda s: r.lan_port in _pairs(r, s), timeout=4)
+        assert time.monotonic() - refused_at < 8.5, time.monotonic() - refused_at
+    finally:
+        result = await run
+    assert result.rc == 0 and "sent" in result.stdout, result.stdout

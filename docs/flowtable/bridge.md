@@ -382,6 +382,20 @@ ingress port (`br_fdb_refresh()`, patch 163), as a received frame would; the
 destination's is its reverse pair's to keep, so a station that went silent
 ages out and is flooded for as it would be in software.
 
+A pair the learner refuses is left to software for at most ten seconds
+(`FT_L2_REFUSE_HOLD`) before its frames are offered again, unless something it
+may rest on changes first: an FDB event for either station (the destination not
+yet learned is the commonest refusal), any port's or the bridge's change, a
+binding coming, going or being rearmed, the datapath restarting, or the pair it
+collided with -- the same stations in another form, or through another VLAN
+device of the port -- being retired. A refusal decided while such an event came
+in is not held at all. auto_bridge parked a pair CMM denied until ten seconds
+without a frame or a change, so a denied pair carrying traffic stayed denied;
+this one is asked again within ten seconds whatever. What raises no event -- a
+tc filter or netdev chain going, the bridge leaving promiscuous mode, the VLAN
+tunnel flag, room freed in a full hardware table -- waits out the hold.
+`l2_held` counts the observations a refusal kept from the worker.
+
 `/proc/cdx_flowtable` lists each pair as an `l2flow` row with its ports,
 addresses, VLAN, tag rewrite and counters, after the flow rows and under
 `l2_*` totals in the header. Like the flow rows, each is a record of its own,

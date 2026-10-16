@@ -2704,6 +2704,8 @@ void ft_rearm(void)
 	}
 	list_for_each_entry(binding, &ft_bindings, list)
 		binding->parked = false;
+	/* And one refused while they were parked. */
+	ft_l2_refusals_reset();
 	pr_info("cdx flowtable: admission rearmed for %u parked binding%s\n",
 		ft_parked, ft_parked == 1 ? "" : "s");
 	WRITE_ONCE(ft_parked, 0);
@@ -2985,6 +2987,8 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		list_add_tail(&binding->list, &ft_bindings);
 		ft_bound++;
 		spin_unlock_bh(&ft_watch_lock);
+		/* A bridged pair refused for want of this binding. */
+		ft_l2_refusals_reset();
 		if (binding->parked) {
 			WRITE_ONCE(ft_parked, ft_parked + 1);
 			/* A table that already holds flows -- one gaining a

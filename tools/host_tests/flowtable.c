@@ -507,6 +507,8 @@ static void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
     l2_fdb_events++;
 }
 static void ft_l2_dev_changed(const struct net_device *dev) { (void)dev; l2_devices_changed++; }
+static unsigned l2_refusal_resets;
+static void ft_l2_refusals_reset(void) { l2_refusal_resets++; }
 static bool ft_l2_retire_batch(void) { l2_retire_alls++; return false; }
 /* Three buckets of bridged pairs' rows after the flows': two rows, none and
  * one, which the /proc walk has to hand off to, step through and resume
@@ -5465,8 +5467,11 @@ static void detach_during_cleanup(void)
     assert(!ft_bound && !ft_parked && !ft_count && !ft_invalid_done);
     assert(!can_rearm());
     /* The worker has not finished, so a bind now is parked behind it rather
-     * than refused. Leaving again gives everything back. */
+     * than refused. Leaving again gives everything back. A bind clears the
+     * bridged learner's refusals, which may have rested on its absence. */
+    unsigned bind_resets = l2_refusal_resets;
     assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+    assert(l2_refusal_resets == bind_resets + 1);
     assert(ft_bound == 1 && ft_parked == 1 && bound_to(&block, &in)->parked && ft_invalid);
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && !ft_bound && !ft_parked);
 }
@@ -5524,12 +5529,17 @@ static void test_rearm(void)
     unsigned rechecks = mc_rechecks, kicks = mroute_kicks, marked = ipsec_marked_all;
     unsigned follows = follow_scheduled, rearming = rearm_kicks;
     ft_fatal = false; /* The restart CDX did, which clears its latch. */
+    unsigned resets = l2_refusal_resets;
     ft_egress_restarted();
     assert(mc_rechecks == rechecks + 1 && mroute_kicks == kicks + 1);
     assert(ipsec_marked_all == marked + 1 && follow_scheduled == follows + 1);
     assert(rearm_kicks == rearming + 1);
+    /* Bridged pairs the stopped backend refused are asked again. */
+    assert(l2_refusal_resets == resets + 1);
     ft_rearm_workfn(NULL);
     assert(!ft_parked && !ft_invalid && ft_rearms == rearms + 1 && !bound_to(&block, &in)->parked);
+    /* And again by the rearm, which a parked binding's refusals rested on. */
+    assert(l2_refusal_resets == resets + 2);
     rearms = ft_rearms;
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && !ft_bound && !allocated && !in.refs);
     ft_restarting = false;

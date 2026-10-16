@@ -901,6 +901,7 @@ bool ft_l2_hook_is(const struct nf_hook_ops *ops);
 void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
 		     const struct net_device *port);
 void ft_l2_dev_changed(const struct net_device *dev);
+void ft_l2_refusals_reset(void);
 bool ft_l2_retire_batch(void);
 int ft_l2_egress_drain(const struct net_device *dev);
 void ft_l2_show(struct seq_file *seq);

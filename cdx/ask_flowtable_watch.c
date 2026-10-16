@@ -1214,6 +1214,8 @@ static int ft_egress_drain(struct net_device *dev)
  * no lock of CDX's here. */
 static void ft_egress_restarted(void)
 {
+	/* A bridged pair the stopped backend refused is asked again. */
+	ft_l2_refusals_reset();
 	ft_mc_kick_all();
 	ft_mr_kick();
 	ft_ipsec_all_moved();

@@ -184,11 +184,10 @@ result independently of those temporary files.
   bridged learner does the same, and patch 171 lets the port's MAC take the second tag such a port carries
   (_:/^flowtable: carry bridges whose port is a VLAN device_).
 
-- [ ] **A383 — a bridged pair the learner refuses is asked of the bridge again every second it carries traffic.** A
-  station pair through a Wi-Fi VAP, an unbound port or a key collision re-enters the ring once a second per CPU, and
-  each pass costs an `rtnl_trylock()` and a resolve that fails the same way (`ask_flowtable_l2.c`, `ft_l2_admit()`).
-  Harmless at the dozens of pairs a LAN has; a refusal cache keyed by pair and reason, or a cheap port test in the hook,
-  would remove it.
+- [x] **A383 — a bridged pair the learner refused was asked of the bridge again every second it carried traffic.** A
+  refusal now holds for at most ten seconds, as auto_bridge parked a pair CMM denied, unless an FDB event for either
+  station, a port's or the bridge's change, a binding, a datapath restart or the colliding pair's retirement clears it
+  first (_:/^flowtable: hold a refused bridged pair_).
 
 - [x] **A382 — the bridged unicast learner retired and listed its pairs in one pass under the control mutex.** Its
   walks now go a batch per hold of the transaction, as routed retirement does (A327), and its `/proc` rows are records

@@ -59,6 +59,13 @@ MODULE_PARM_DESC(l2_idle_ms, "Milliseconds a bridged pair no frame hits stays in
 #define FT_L2_VISIT_BATCH	256U
 #define FT_L2_RING	256
 #define FT_L2_SEEN	256
+/* How long a refused pair is left to software before it is asked again,
+ * unless something it depends on changes first -- an FDB entry of either
+ * station, a port, the bindings, the pair it collided with. auto_bridge
+ * parked a pair CMM denied in its LINUX state until ten seconds without a
+ * frame, or a change; this holds ten seconds at most (A383). */
+#define FT_L2_REFUSE_HOLD	(10 * HZ)
+#define FT_L2_REFUSALS	256
 
 struct ft_l2_seen {
 	int bridge_ifindex;
@@ -140,6 +147,21 @@ static DECLARE_DELAYED_WORK(ft_l2_work, ft_l2_workfn);
 
 /* Counters for /proc. */
 static u64 ft_l2_installs, ft_l2_refused, ft_l2_retired, ft_l2_dropped, ft_l2_deferred;
+/* Observations the refusal cache kept from the worker. */
+static u64 ft_l2_held;
+
+/* The pairs refused lately, one slot per hash, a later refusal taking the
+ * slot of an earlier one it collides with; and a count of the events that
+ * clear them, which a refusal decided across one is not cached against.
+ * Under ft_l2_lock. */
+static struct {
+	struct ft_l2_seen seen;
+	unsigned long until;
+} ft_l2_refusals[FT_L2_REFUSALS];
+static unsigned int ft_l2_events;
+/* Slots holding a refusal, expired or not: a clear with none to clear
+ * skips the walk, which every FDB event pays for. */
+static unsigned int ft_l2_refusals_used;
 
 /* By the stations and EtherType alone, so that one bucket holds the pair on
  * every port: two bridge ports that are VLAN devices of one physical port
@@ -169,6 +191,80 @@ static bool ft_l2_same_key(const struct ft_l2_seen *a, const struct ft_l2_seen *
 static bool ft_l2_same(const struct ft_l2_seen *a, const struct ft_l2_seen *b)
 {
 	return ft_l2_same_key(a, b) && a->vid == b->vid && a->tagged == b->tagged;
+}
+
+/* ------------------------------------------------------------ refusals */
+
+/* Empty a slot. Under ft_l2_lock. */
+static void ft_l2_refusal_drop(unsigned int slot)
+{
+	if (!ft_l2_refusals[slot].until)
+		return;
+	ft_l2_refusals[slot].until = 0;
+	ft_l2_refusals_used--;
+}
+
+/* Whether `s` was refused within FT_L2_REFUSE_HOLD and nothing it depends on
+ * has changed since; a slot found expired is emptied. Under ft_l2_lock. */
+static bool ft_l2_refused_lately(const struct ft_l2_seen *s)
+{
+	unsigned int slot = ft_l2_hash(s) % FT_L2_REFUSALS;
+
+	if (!ft_l2_refusals[slot].until)
+		return false;
+	if (!time_before(jiffies, ft_l2_refusals[slot].until)) {
+		ft_l2_refusal_drop(slot);
+		return false;
+	}
+	return ft_l2_same(&ft_l2_refusals[slot].seen, s);
+}
+
+/* Remember a refusal the worker decided, unless an event that clears
+ * refusals came in while it decided: the event cleared nothing yet, and the
+ * refusal may rest on what it changed. `events` is ft_l2_events as the worker
+ * read it before deciding. */
+static void ft_l2_refusal(const struct ft_l2_seen *s, unsigned int events)
+{
+	unsigned int slot = ft_l2_hash(s) % FT_L2_REFUSALS;
+
+	spin_lock_bh(&ft_l2_lock);
+	if (events == ft_l2_events) {
+		if (!ft_l2_refusals[slot].until)
+			ft_l2_refusals_used++;
+		ft_l2_refusals[slot].seen = *s;
+		ft_l2_refusals[slot].until = jiffies + FT_L2_REFUSE_HOLD ?: 1;
+	}
+	spin_unlock_bh(&ft_l2_lock);
+}
+
+/* Forget the refusals `addr` in `vid` is a station of, or every one when
+ * addr is NULL. Under ft_l2_lock. */
+static void ft_l2_refusals_clear(const u8 *addr, u16 vid)
+{
+	unsigned int i;
+
+	ft_l2_events++;
+	for (i = 0; i < FT_L2_REFUSALS && ft_l2_refusals_used; i++) {
+		if (!ft_l2_refusals[i].until)
+			continue;
+		/* Expired ones go whatever they name, so that a refusal no
+		 * frame asks about again does not keep the walk going. */
+		if (addr && time_before(jiffies, ft_l2_refusals[i].until) &&
+		    (ft_l2_refusals[i].seen.vid != vid ||
+		     (!ether_addr_equal(ft_l2_refusals[i].seen.dst, addr) &&
+		      !ether_addr_equal(ft_l2_refusals[i].seen.src, addr))))
+			continue;
+		ft_l2_refusal_drop(i);
+	}
+}
+
+/* Something every refusal may rest on changed: a binding came, went or was
+ * rearmed, or the datapath restarted after a backend gate refused pairs. */
+void ft_l2_refusals_reset(void)
+{
+	spin_lock_bh(&ft_l2_lock);
+	ft_l2_refusals_clear(NULL, 0);
+	spin_unlock_bh(&ft_l2_lock);
 }
 
 /* ------------------------------------------------------------------ hook */
@@ -262,6 +358,11 @@ static unsigned int ft_l2_hook(void *priv, struct sk_buff *skb,
 	recent->at = jiffies;
 	put_cpu_ptr(ft_l2_recent);
 	spin_lock_bh(&ft_l2_lock);
+	if (ft_l2_refused_lately(&seen)) {
+		ft_l2_held++;
+		spin_unlock_bh(&ft_l2_lock);
+		return NF_ACCEPT;
+	}
 	if (ft_l2_head - ft_l2_tail < FT_L2_RING) {
 		ft_l2_ring[ft_l2_head++ % FT_L2_RING] = seen;
 	} else {
@@ -501,8 +602,24 @@ static void ft_l2_release(struct ft_l2_pair *p)
 
 static void ft_l2_unlink(struct ft_l2_pair *p)
 {
+	unsigned int slot = ft_l2_hash(&p->key) % FT_L2_REFUSALS;
+	bool full = ft_l2_count == FT_L2_MAX;
+
 	ft_l2_release(p);
 	ft_l2_retired++;
+	/* A pair refused for colliding with this one -- the same stations
+	 * in another form, or through another VLAN device of the port --
+	 * shares its slot; one refused for want of room may go in now. No
+	 * event count: admission, the only other writer of a refusal, runs
+	 * under the same transaction. */
+	spin_lock_bh(&ft_l2_lock);
+	if (full) {
+		for (slot = 0; slot < FT_L2_REFUSALS; slot++)
+			ft_l2_refusal_drop(slot);
+	} else {
+		ft_l2_refusal_drop(slot);
+	}
+	spin_unlock_bh(&ft_l2_lock);
 }
 
 /* One observation, under the transaction and RTNL. -EAGAIN: try again later.
@@ -515,21 +632,35 @@ static void ft_l2_unlink(struct ft_l2_pair *p)
 static int ft_l2_admit(const struct ft_l2_seen *s)
 {
 	struct ft_l2_pair *p, *other;
+	unsigned int events;
 	s64 changes;
 	int rc;
 
+	spin_lock_bh(&ft_l2_lock);
+	/* Another CPU's observation of a pair this pass already refused. */
+	if (ft_l2_refused_lately(s)) {
+		ft_l2_held++;
+		spin_unlock_bh(&ft_l2_lock);
+		return 0;
+	}
+	events = ft_l2_events;
+	spin_unlock_bh(&ft_l2_lock);
 	hash_for_each_possible(ft_l2_pairs, p, node, ft_l2_hash(s)) {
 		if (!ft_l2_same_key(&p->key, s))
 			continue;
 		/* The pair itself, or the same pair in another wire form or
 		 * VLAN of the port, which would need the one key twice:
 		 * software. */
-		if (!ft_l2_same(&p->key, s))
+		if (!ft_l2_same(&p->key, s)) {
 			ft_l2_refused++;
+			ft_l2_refusal(s, events);
+		}
 		return 0;
 	}
-	if (ft_l2_count >= FT_L2_MAX)
+	if (ft_l2_count >= FT_L2_MAX) {
+		ft_l2_refusal(s, events);
 		return -ENOSPC;
+	}
 	p = kzalloc(sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -537,6 +668,7 @@ static int ft_l2_admit(const struct ft_l2_seen *s)
 	if (!ft_l2_resolve(s, p)) {
 		kfree(p);
 		ft_l2_refused++;
+		ft_l2_refusal(s, events);
 		return 0;
 	}
 	/* The same stations from another VLAN device of the physical port
@@ -547,6 +679,7 @@ static int ft_l2_admit(const struct ft_l2_seen *s)
 		    ether_addr_equal(other->key.src, s->src)) {
 			kfree(p);
 			ft_l2_refused++;
+			ft_l2_refusal(s, events);
 			return 0;
 		}
 	}
@@ -582,7 +715,14 @@ static int ft_l2_admit(const struct ft_l2_seen *s)
 	if (rc) {
 		ft_l2_release(p);
 		ft_l2_refused++;
-		return rc == -EAGAIN ? -EAGAIN : 0;
+		if (rc == -EAGAIN)
+			return -EAGAIN;
+		/* The backend's refusal holds as one of the bridge's does: a
+		 * full table, a port it will not program, or a gate it shuts
+		 * while the datapath restarts, whose end clears it
+		 * (ft_egress_restarted()). */
+		ft_l2_refusal(s, events);
+		return 0;
 	}
 	ft_l2_installs++;
 	return 0;
@@ -834,6 +974,8 @@ static void ft_l2_mark(bool (*match)(const struct ft_l2_pair *p, const void *arg
 	bool any = false;
 
 	spin_lock_bh(&ft_l2_lock);
+	/* Whatever changed a device may have been what a refusal rested on. */
+	ft_l2_refusals_clear(NULL, 0);
 	list_for_each_entry(p, &ft_l2_list, list) {
 		if (!p->dead && match(p, arg)) {
 			p->dead = true;
@@ -856,7 +998,14 @@ void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
 	struct ft_l2_pair *p;
 	bool any = false, dst;
 
+	/* Nothing installed and nothing refused while the hook is off, but
+	 * for an unload's last moments, which retire everything anyway. */
+	if (!READ_ONCE(ft_l2_hooked))
+		return;
 	spin_lock_bh(&ft_l2_lock);
+	/* A station learned, moved or gone may be what a refusal rested on:
+	 * the destination not yet learned is the commonest. */
+	ft_l2_refusals_clear(addr, vid);
 	hash_for_each_possible(ft_l2_stations, station, node, ft_l2_station_hash(addr, vid)) {
 		p = station->pair;
 		dst = station == &p->dst_station;
@@ -959,9 +1108,10 @@ static void ft_l2_tags(const struct cdx_ft_vlan *tags, u8 count, char *text, siz
 void ft_l2_show(struct seq_file *seq)
 {
 	seq_printf(seq, "l2_enabled %u\nl2_entries %u\nl2_installs %llu\nl2_refused %llu\n"
-		   "l2_retired %llu\nl2_dropped %llu\nl2_deferred %llu\n",
+		   "l2_held %llu\nl2_retired %llu\nl2_dropped %llu\nl2_deferred %llu\n",
 		   READ_ONCE(ft_l2_enabled) && READ_ONCE(ft_l2_hooked), ft_l2_count,
-		   ft_l2_installs, ft_l2_refused, ft_l2_retired, ft_l2_dropped, ft_l2_deferred);
+		   ft_l2_installs, ft_l2_refused, READ_ONCE(ft_l2_held), ft_l2_retired,
+		   ft_l2_dropped, ft_l2_deferred);
 }
 
 /* The rows, one seq_file record each, after the flows' (main.c's
