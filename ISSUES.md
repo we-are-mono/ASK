@@ -162,12 +162,12 @@ result independently of those temporary files.
 - [ ] **A388 — under br_netfilter, an fw4-style `flow add` takes bridged connections into the software flowtable.**
   With `bridge-nf-call-iptables` on, a bridged frame crosses the inet `forward` chain, and `nft_flow_offload_eval()`
   has no check for br_netfilter's fake route (`DST_FAKE_RTABLE`), so the connection is marked `[OFFLOAD]` and given a
-  flowtable entry built from that route. On the rig (vlan-filtering bridge, the DUT on-link in the stations' subnet) the
-  entry never matched: frames reached the peer with TTL 64 and the station's own MAC, and the adapter was never
-  offered it. The cost there is churn, and conntrack timeouts handed to a flowtable that carries nothing. A bridge
-  without VLAN filtering was not probed; a match there would forward a bridged frame as routed (TTL less one, the
-  router's MAC). Not ASK's own: any OpenWrt box running Docker with flow offloading has it, and upstream lacks the
-  check too. Next: probe a plain bridge; the fix is one test in `nft_flow_offload_skip()`.
+  flowtable entry built from that route. The entry never matches: on a vlan-filtering bridge and on a plain one (the
+  DUT on-link in the stations' subnet, hardware pairs refused so the CPU forwarded everything), every frame reached
+  both ends with TTL 64 and the stations' own MACs, and the adapter was never offered it. The cost is churn -- an entry
+  per bridged connection, rebuilt as it expires -- and conntrack timeouts handed to a flowtable that carries nothing.
+  Not ASK's own: any OpenWrt box running Docker with flow offloading has it, and upstream lacks the check too. Next:
+  low priority; the fix is one test in `nft_flow_offload_skip()`.
 
 - [x] **A387 — with br_netfilter loaded (Docker loads it), no flow leaving through a bridge was offloaded; 1.0.7
   offloaded them.** Patch 172 labels br_netfilter's hooks and counts its setting changes. A routed flow ignores them,
