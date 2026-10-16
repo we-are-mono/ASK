@@ -12,6 +12,8 @@
 #define RECOVERY_LOCK FT_RUNTIME "/recovery.lock"
 #define BOOT_ID "/proc/sys/kernel/random/boot_id"
 #define RECOVERY_LIMIT 3
+#define RECOVERY_ARMED "watchdog armed; failure detail unavailable if this boot hangs"
+#define RECOVERY_REFUNDED "orderly shutdown; the attempt this boot spent was refunded"
 
 struct recovery {
 	unsigned count;
@@ -88,7 +90,8 @@ static int write_record(const struct recovery *r)
 
 int ft_recovery(struct ft_ctx *ctx, const char *verb)
 {
-	if (strcmp(verb, "arm") && strcmp(verb, "failed") && strcmp(verb, "clear")) {
+	if (strcmp(verb, "arm") && strcmp(verb, "failed") && strcmp(verb, "clear") &&
+	    strcmp(verb, "clean") && strcmp(verb, "retry")) {
 		snprintf(ctx->err, sizeof(ctx->err), "unknown recovery command");
 		return 1;
 	}
@@ -106,8 +109,10 @@ int ft_recovery(struct ft_ctx *ctx, const char *verb)
 	struct recovery original = r;
 	if (!strcmp(verb, "arm")) {
 		/* Service restarts and concurrent callers spend at most one attempt
-		 * per kernel boot, including after a healthy boot clears the count. */
-		if (!strcmp(r.boot, boot)) { rc = 0; goto out; }
+		 * per kernel boot, including after a healthy boot clears the count --
+		 * unless this boot's attempt was refunded by a stop, after which a
+		 * start in the same boot spends it again. */
+		if (!strcmp(r.boot, boot) && strcmp(r.reason, RECOVERY_REFUNDED)) { rc = 0; goto out; }
 		if (r.count >= RECOVERY_LIMIT) {
 			snprintf(ctx->err, sizeof(ctx->err), "recovery budget exhausted after %u boots: %s",
 				 r.count, r.reason);
@@ -115,20 +120,59 @@ int ft_recovery(struct ft_ctx *ctx, const char *verb)
 		}
 		if (r.count) fprintf(stderr, "ask-flowtable: previous recovery: %s\n", r.reason);
 		r.count++;
-		snprintf(r.reason, sizeof(r.reason), "watchdog armed; failure detail unavailable if this boot hangs");
+		snprintf(r.reason, sizeof(r.reason), RECOVERY_ARMED);
+		/* Only an arm names the boot. A clear or a retry that did would
+		 * let a later start in that same boot pass as already armed and
+		 * enable hardware with nothing spent. */
+		strcpy(r.boot, boot);
 	} else if (!strcmp(verb, "failed")) {
 		if (strcmp(r.boot, boot)) {
 			snprintf(ctx->err, sizeof(ctx->err), "recovery was not armed in this boot");
 			goto out;
 		}
+		/* A stop refunded this boot's attempt and the datapath failed after
+		 * all: the attempt comes back with the failure. */
+		if (!strcmp(r.reason, RECOVERY_REFUNDED))
+			r.count++;
 		ft_terminal_reason(r.reason, sizeof(r.reason));
+	} else if (!strcmp(verb, "clean")) {
+		/* A shutdown of a boot that armed, recorded no failure and whose
+		 * datapath the platform has just found healthy. The attempt it
+		 * spent proved nothing about the datapath, so it is refunded: a box
+		 * rebooted a few times in its first hour does not lose its offload.
+		 * A hang or a watchdog reset never runs a shutdown, a recorded
+		 * failure keeps the attempt it cost, and one recorded after the
+		 * refund takes it back. */
+		if (strcmp(r.boot, boot) || !r.count || strcmp(r.reason, RECOVERY_ARMED)) {
+			rc = 0; goto out;
+		}
+		r.count--;
+		snprintf(r.reason, sizeof(r.reason), RECOVERY_REFUNDED);
+	} else if (!strcmp(verb, "retry")) {
+		/* The platform calls this after a day up in software with the
+		 * budget spent. One more attempt, so a passing cause -- power that
+		 * failed during the first hours, a cable -- does not keep the
+		 * hardware off for good, while a datapath that still hangs costs at
+		 * most one reset a day. */
+		if (r.count < RECOVERY_LIMIT || !strcmp(r.boot, boot)) {
+			/* Not spent -- or spent by this very boot, which armed
+			 * and is still using the attempt it took. */
+			rc = 0; goto out;
+		}
+		r.count = RECOVERY_LIMIT - 1;
+		/* The last failure, cut to what the record has room for. */
+		snprintf(r.reason, sizeof(r.reason), "one more attempt after a day; last: %.90s",
+			 original.reason);
 	} else {
 		/* The platform calls this after an hour of successful probes, or an
 		 * operator after repair. No wall clock or writable rootfs required. */
 		r.count = 0;
 		snprintf(r.reason, sizeof(r.reason), "recovery budget cleared");
 	}
-	strcpy(r.boot, boot);
+	/* A record no boot ever armed still needs a boot that parses; one no
+	 * kernel will ever report makes the next arm spend. */
+	if (!r.boot[0])
+		strcpy(r.boot, "00000000-0000-0000-0000-000000000000");
 	if (r.count == original.count && !strcmp(r.boot, original.boot) &&
 	    !strcmp(r.reason, original.reason)) {
 		rc = 0; goto out;

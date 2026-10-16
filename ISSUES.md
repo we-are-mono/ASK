@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A380 — three reboots inside a healthy hour, or three power cuts, turned hardware offload off for good.** A
+  healthy shutdown refunds its attempt and a spent budget retries after a day up (_:/^recovery: refund healthy shutdowns_).
+
 - [x] **A379 — a connection marked by mwan3 or pbr was never offloaded; 1.0.7 offloaded it.** The operator now names
   route-only bits, admitted and carried nowhere (_:/^flowtable: admit marks that only select a route_).
 

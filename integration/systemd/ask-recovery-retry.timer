@@ -1,0 +1,8 @@
+[Unit]
+Description=One more ASK recovery attempt after a day up with the budget spent
+
+[Timer]
+OnBootSec=1d
+
+[Install]
+WantedBy=timers.target

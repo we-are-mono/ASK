@@ -1,0 +1,8 @@
+[Unit]
+Description=Allow one more ASK recovery attempt after a day with the budget spent
+
+[Service]
+Type=oneshot
+# A no-op unless the budget is exhausted; then the next boot may arm once more.
+ExecStart=/usr/sbin/ask-flowtable recovery-retry
+TimeoutStartSec=infinity

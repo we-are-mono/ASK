@@ -42,8 +42,33 @@ before arming the next boot; arming also logs the previous record.
 The monitor calls `recovery-clear` after one continuous hour of successful
 probes. This is a consecutive-boot limit, independent of RTC time or persistent
 root storage. An operator can also clear the budget after repair and restart the
-services. Normal reboots before the healthy hour conservatively spend an attempt.
-Environment writes happen at arm, failure, and confirmation, not on each probe.
+services.
+
+`recovery-clean` refunds the attempt a boot spent when the system shuts down
+in order and the datapath still passes `health` -- a reboot or poweroff, not a
+plain stop or restart of the service, which refunds and writes nothing. A hang
+or a watchdog reset never runs a shutdown, a teardown that wedged on the way
+down fails the health check, and a failure recorded after a refund takes the
+attempt back. So a box rebooted a few times in its first hour keeps its
+offload, while a power loss, which cannot be told from a hang, still counts.
+
+`recovery-retry` turns an exhausted budget into one more attempt. The platform
+calls it after a day up in software with the budget spent, so a passing cause
+does not keep hardware offload off for good, and a datapath that still hangs
+costs at most one reset a day. It does nothing otherwise. The day is uptime: a
+box rebooted every night never gets there and needs `recovery-clear`.
+
+Only `recovery-arm` records the boot it ran in, so a start later in a boot
+that `retry` or `clear` ran in still spends its attempt -- as does a start
+after a refund in the same boot. A sysupgrade stops services without their
+stop scripts, so it never refunds: three flashes inside an hour turn offload
+off until the retry a day later. The budget carries
+over a firmware upgrade unchanged; clearing it on first boot would let an image
+that hangs reset the count every time, and the retry already recovers a box
+whose new image fixed the cause.
+
+Environment writes happen at arm, failure, refund, retry and confirmation, not
+on each probe.
 
 ## systemd: Armbian, NixOS, VyOS
 
@@ -52,8 +77,10 @@ the platform's existing watchdog configuration. The supplied paths match Armbian
 NixOS/VyOS packaging should translate paths
 and service names to its own service definitions.
 
-1. Install `systemd/ask-watchdog.conf` in `/etc/systemd/system.conf.d/` and
-   the three `ask-recovery*.service` files in `/etc/systemd/system/`.
+1. Install `systemd/ask-watchdog.conf` in `/etc/systemd/system.conf.d/`, the
+   four `ask-recovery*.service` files and `ask-recovery-retry.timer` in
+   `/etc/systemd/system/`, and enable the timer. The budget unit's `ExecStop`
+   is the shutdown refund, gated on `health`.
 2. Install `systemd/ask-flowtable.service.d/recovery.conf` in the matching
    `/etc/systemd/system/ask-flowtable.service.d/` directory. Apply the same
    dependencies to any earlier service that activates ASK hardware.
@@ -72,6 +99,10 @@ reboot. Budget failure itself has **no** reboot action.
 
 1. Install `openwrt/ask-recovery` as `/etc/init.d/ask-recovery`, mode 0755,
    then enable it. It uses the existing `ubus`, `jsonfilter`, and procd APIs.
+   Its stop at a system shutdown refunds a healthy boot's attempt; with the
+   budget exhausted it runs a `retry` instance that calls `recovery-retry`
+   after a day up, and it writes `armed`, `exhausted`, `unavailable` or
+   `stopped` to `/var/run/ask-recovery.state` for a UI to show.
 2. In the consumer's ASK activation path, require successful
    `/etc/init.d/ask-recovery start` **and** `ask-flowtable recovery-arm` before
    loading/enabling the hardware adapter. An rcS order alone is not a failure

@@ -25,6 +25,7 @@ case "$1" in
   [ "$n" -le "$#" ] && i=$n || i=$#
   eval "exit \\${$i}" ;;
  recovery-arm) exit "${ARM_STATUS:-0}" ;;
+ recovery-clean) exit "${CLEAN_STATUS:-0}" ;;
 esac
 ''',
         "systemd-notify": '#!/bin/sh\necho "notify $*" >> "$TEST_ROOT/calls"\n',
@@ -85,8 +86,8 @@ echo "${WDT_STATUS:-running}"
     init = ROOT / "integration/openwrt/ask-recovery"
     wrapper = f'''
 . '{init}'
-procd_open_instance() {{ echo 'instance opened' >> "$TEST_ROOT/calls"; }}
-procd_set_param() {{ :; }}
+procd_open_instance() {{ echo "instance opened $1" >> "$TEST_ROOT/calls"; }}
+procd_set_param() {{ echo "param $*" >> "$TEST_ROOT/calls"; }}
 procd_close_instance() {{ :; }}
 service_running() {{ return 0; }}
 start_service
@@ -96,10 +97,94 @@ service_started
     for status, arm, start, allowed in [("running", "0", "offline", True), ("running", "2", "offline", False),
                                        ("offline", "0", "offline", False), ("offline", "0", "running", True)]:
         log.write_text("")
+        state = tmp_path / "state"
         result = run_process(["sh", "-c", wrapper],
-                                env={**env, "WDT_STATUS": status, "ARM_STATUS": arm, "WDT_START_STATUS": start},
+                                env={**env, "WDT_STATUS": status, "ARM_STATUS": arm, "WDT_START_STATUS": start,
+                                     "ASK_RECOVERY_STATE": str(state)},
                                 capture_output=True, timeout=5)
         assert (result.returncode == 0) == allowed, result.stderr
-        assert ("instance opened" in log.read_text()) == allowed
+        assert ("instance opened monitor" in log.read_text()) == allowed
+        # A spent budget schedules its one retry, a day out, and says so;
+        # nothing else does.
+        exhausted = status == "running" and arm == "2"
+        assert ("instance opened retry" in log.read_text()) == exhausted
+        if exhausted:
+            assert "sleep 86400 && { ask-flowtable recovery-retry ||" in log.read_text()
+        expected = "armed" if allowed else "exhausted" if exhausted else "unavailable"
+        assert state.read_text().strip() == expected
         if status == "running":
             assert '"stop":false' not in log.read_text()
+    # "armed" waits for the monitor procd runs: none running, none claimed.
+    log.write_text("")
+    state = tmp_path / "state"
+    result = run_process(["sh", "-c", wrapper.replace("service_running() {{ return 0; }}".replace("{{", "{").replace("}}", "}"),
+                                                      "service_running() { return 1; }")],
+                         env={**env, "ASK_RECOVERY_STATE": str(state)}, capture_output=True, timeout=5)
+    assert result.returncode != 0 and state.read_text().strip() == "unavailable", state.read_text()
+
+    # Only a shutdown refunds, and only of a datapath that still passes its
+    # health check; a plain stop or restart writes nothing. A refund that
+    # fails is logged.
+    for action, health, refunded in [("shutdown", "0", True), ("shutdown", "1", False),
+                                     ("stop", "0", False), ("restart", "0", False)]:
+        log.write_text("")
+        state = tmp_path / "state"
+        result = run_process(["sh", "-c", f". '{init}'\naction={action}\nstop_service"],
+                             env={**env, "HEALTH_SEQ": health, "ASK_RECOVERY_STATE": str(state)},
+                             capture_output=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+        assert ("ask recovery-clean" in log.read_text()) == refunded, (action, health, log.read_text())
+        assert state.read_text().strip() == "stopped"
+    log.write_text("")
+    (tmp_path / "probed").unlink(missing_ok=True)
+    result = run_process(["sh", "-c", f". '{init}'\naction=shutdown\nstop_service"],
+                         env={**env, "HEALTH_SEQ": "0", "CLEAN_STATUS": "1",
+                              "ASK_RECOVERY_STATE": str(tmp_path / "state")},
+                         capture_output=True, timeout=5)
+    assert result.returncode == 0 and "could not refund" in log.read_text(), log.read_text()
+
+
+def test_systemd_units_parse(tmp_path):
+    """systemd accepts every shipped unit: syntax, specifiers and the `$$`
+    escapes in the shutdown refund. The binaries they name are not on this
+    host, which is the one complaint allowed."""
+    import shutil
+    import pytest
+    if not shutil.which("systemd-analyze"):
+        pytest.skip("systemd-analyze is not installed")
+    units = sorted((ROOT / "integration/systemd").glob("*.service")) + \
+        sorted((ROOT / "integration/systemd").glob("*.timer"))
+    for unit in units:
+        shutil.copy(unit, tmp_path / unit.name)
+    result = run_process(["systemd-analyze", "verify", "--man=no",
+                          *[str(tmp_path / unit.name) for unit in units]],
+                         capture_output=True, text=True, timeout=30)
+    complaints = [line for line in (result.stdout + result.stderr).splitlines()
+                  if line.strip() and "is not executable" not in line]
+    assert not complaints, complaints
+
+
+def test_systemd_refund_gate(tmp_path):
+    """The budget unit's ExecStop, run as systemd runs it once `$$` is
+    unescaped: a refund only while the system is stopping and the datapath
+    passes its health check."""
+    import re
+    unit = (ROOT / "integration/systemd/ask-recovery-budget.service").read_text()
+    command = re.search(r"^ExecStop=-/bin/sh -c '(.*)'$", unit, re.M).group(1).replace("$$", "$")
+    calls = tmp_path / "calls"
+    for name, body in {
+        "systemctl": '#!/bin/sh\n[ "$1" = is-system-running ] && echo "$SYSTEM_STATE"\n',
+        "ask-flowtable": '#!/bin/sh\necho "ask $*" >> "$TEST_ROOT/calls"\n'
+                         '[ "$1" = health ] && exit "$HEALTH"\nexit 0\n',
+    }.items():
+        (tmp_path / name).write_text(body)
+        (tmp_path / name).chmod(0o755)
+    command = command.replace("/usr/sbin/ask-flowtable", str(tmp_path / "ask-flowtable"))
+    for state, health, refunded in [("stopping", "0", True), ("stopping", "1", False),
+                                    ("running", "0", False), ("degraded", "0", False)]:
+        calls.write_text("")
+        run_process(["sh", "-c", command],
+                    env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}",
+                         "TEST_ROOT": str(tmp_path), "SYSTEM_STATE": state, "HEALTH": health},
+                    capture_output=True, timeout=5)
+        assert ("ask recovery-clean" in calls.read_text()) == refunded, (state, health, calls.read_text())

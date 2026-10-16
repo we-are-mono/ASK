@@ -99,13 +99,98 @@ else:
         assert record["ask_recovery"].split(" ", 2)[0] == str(min(boot, 3))
         assert record["ask_recovery"].split(" ", 2)[2] == "restart budget exhausted"
         assert {key: record[key] for key in platform} == platform
+    def count():
+        return json.loads(envfile.read_text())["ask_recovery"].split(" ", 2)
+
+    def writes():
+        return (c.root / "env-writes").read_text()
+
+    # A clear in a boot that never armed -- this one was exhausted -- keeps
+    # the record's earlier boot, so a start later in it still spends its
+    # attempt; a second clear writes nothing.
     c.run("recovery-clear")
-    writes = (c.root / "env-writes").read_text()
+    assert count()[0] == "0"
+    before = writes()
     c.run("recovery-clear")
+    assert writes() == before
     c.run("recovery-arm")
-    assert (c.root / "env-writes").read_text() == writes
+    assert count()[0] == "1" and "armed" in count()[2]
+    before = writes()
+    c.run("recovery-arm")  # a restart in an armed boot spends nothing more
+    assert writes() == before
+
+    # A healthy shutdown refunds the attempt its boot spent, once; a start in
+    # the same boot spends it again; a failure recorded after a refund takes
+    # the attempt back; a boot that recorded a failure keeps it.
+    (c.root / "boot_id").write_text("00000000-0000-0000-0000-000000000005\n")
+    c.run("recovery-arm")
+    assert count()[0] == "2"
+    c.run("recovery-clean")
+    assert count()[0] == "1" and "refunded" in count()[2]
+    before = writes()
+    c.run("recovery-clean")
+    assert writes() == before
+    # A start after the refund, in the same boot, spends it again; a second
+    # refund then puts it back once more.
+    c.run("recovery-arm")
+    assert count()[0] == "2" and "armed" in count()[2]
+    c.run("recovery-clean")
+    assert count()[0] == "1" and "refunded" in count()[2]
+    c.run("recovery-failed")
+    assert count()[0] == "2" and count()[2] == "restart budget exhausted"
+    c.run("recovery-clean")
+    assert count()[0] == "2"
+    # A refund never reaches another boot's attempt.
+    (c.root / "boot_id").write_text("00000000-0000-0000-0000-000000000006\n")
+    c.run("recovery-clean")
+    assert count()[0] == "2"
+
+    # A failure reported in a boot the record does not name is refused and
+    # writes nothing.
+    before = writes()
+    assert c.run("recovery-failed", check=False).returncode == 1
+    assert writes() == before
+
+    # Spent, then a day in software allows exactly one more attempt, keeping
+    # the failure it follows. A retry in a boot that armed is still that
+    # boot's attempt and moves nothing. A start in the retrying boot spends
+    # the attempt at once rather than passing as armed, and neither a second
+    # retry nor a refund attempt moves it again.
+    c.run("recovery-arm")
+    assert count()[0] == "3"
+    before = writes()
+    c.run("recovery-retry")
+    assert writes() == before and count()[0] == "3"
+    (c.root / "boot_id").write_text("00000000-0000-0000-0000-000000000007\n")
+    assert c.run("recovery-arm", check=False).returncode == 2
+    c.run("recovery-retry")
+    assert count()[0] == "2" and count()[2].startswith("one more attempt after a day; last: ")
+    before = writes()
+    c.run("recovery-retry")
+    c.run("recovery-clean")
+    assert writes() == before
+    c.run("recovery-arm")
+    assert count()[0] == "3" and "armed" in count()[2]
+    (c.root / "boot_id").write_text("00000000-0000-0000-0000-000000000008\n")
+    assert c.run("recovery-arm", check=False).returncode == 2
+    c.run("recovery-clear")
+    # A clean in that boot after the clear has nothing to refund.
+    before = writes()
+    c.run("recovery-clean")
+    assert writes() == before
+
+    # A box that never armed: a clear writes a record that still parses,
+    # under a boot no kernel reports, and the next arm spends.
     record = json.loads(envfile.read_text())
-    assert record["ask_recovery"].split(" ", 2)[0] == "0"
+    del record["ask_recovery"]
+    envfile.write_text(json.dumps(record))
+    c.run("recovery-clear")
+    assert json.loads(envfile.read_text())["ask_recovery"] == \
+        "0 00000000-0000-0000-0000-000000000000 recovery budget cleared"
+    c.run("recovery-arm")
+    assert count()[0] == "1"
+
+    record = json.loads(envfile.read_text())
     for bad in ("-1", "4", "junk", ""):
         record["ask_recovery"] = bad + " " + record["ask_recovery"].split(" ", 1)[1]
         envfile.write_text(json.dumps(record))

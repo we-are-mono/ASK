@@ -8,5 +8,9 @@ Type=oneshot
 ExecStartPre=/bin/sh -c 'readlink /proc/1/fd/* | grep -qx /dev/watchdog0'
 ExecStart=/usr/sbin/ask-flowtable recovery-arm
 RemainAfterExit=yes
+# A system shutdown of a datapath that is still healthy refunds the attempt
+# this boot spent; a hang or a watchdog reset never stops this unit, a plain
+# stop or restart refunds nothing, and a wedged teardown fails the check.
+ExecStop=-/bin/sh -c '[ "$$(systemctl is-system-running)" = stopping ] && /usr/sbin/ask-flowtable health && exec /usr/sbin/ask-flowtable recovery-clean'
 # Let fw_setenv complete its flash transaction.
 TimeoutStartSec=infinity
