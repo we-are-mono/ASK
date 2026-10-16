@@ -24,10 +24,19 @@
  * - the events, which mark pairs dead from wherever they arrive (the FDB, a
  *   port's state, a device going away) and wake the worker to retire them.
  *
- * A pair is admitted only while no bridge-family netfilter hook other than the
- * learners' own observers is registered: an ebtables or nftables bridge chain,
- * or br_netfilter, can drop or mark a forwarded frame, and an installed entry
- * forwards where none of them runs (ft_bridge_hooked()).
+ * A bridge-family netfilter hook can drop, mark or translate a forwarded
+ * frame, and an installed entry forwards where none of them runs. With none
+ * registered but the learners' own, a pair is admitted on sight. With hooks
+ * whose rules the adapter can follow -- an nftables bridge chain, br_netfilter
+ * handing bridged frames to iptables as Docker has it -- a pair is admitted
+ * only once a frame of it has been seen leaving the bridge after all of them
+ * (the confirmation hooks), untranslated, its connection's mark the class; and
+ * every ruleset change takes the pairs and confirmations back, so a rule added
+ * later applies within a pass. One entry carries every frame of a pair, as
+ * auto_bridge's did: what the rules decide about one conversation between two
+ * stations, the entry applies to all of them. Any other hook -- an ebtables
+ * table, whose changes nothing reports, a module of unknown purpose -- keeps
+ * every pair in software (ft_bridge_hook_kinds()).
  */
 #include "ask_flowtable_internal.h"
 
@@ -66,6 +75,12 @@ MODULE_PARM_DESC(l2_idle_ms, "Milliseconds a bridged pair no frame hits stays in
  * frame, or a change; this holds ten seconds at most (A383). */
 #define FT_L2_REFUSE_HOLD	(10 * HZ)
 #define FT_L2_REFUSALS	256
+/* How recent a confirmation admits its pair, how many are kept, and how long
+ * a ruleset stands still, its commit applied whole, before frames confirm
+ * under it. */
+#define FT_L2_CONFIRM_FRESH	(2 * HZ)
+#define FT_L2_CONFIRMS	1024
+#define FT_L2_RULESET_SETTLE	(HZ / 2)
 
 struct ft_l2_seen {
 	int bridge_ifindex;
@@ -79,6 +94,36 @@ struct ft_l2_seen {
 	u16 vid;
 	bool tagged;
 };
+
+/* The rules a confirmation was made under: nftables' commit counter and the
+ * cursor its packet path reads rules through, the count of x_tables table
+ * changes (patch 148), the count of changes to which bridged frames
+ * br_netfilter hands to the IP hooks (patch 172) -- all four read on the
+ * packet path -- and the other bridge hooks there were (FT_BRIDGE_HOOK_*),
+ * which only the worker reads. */
+struct ft_l2_ruleset {
+	unsigned int seq;
+	unsigned int xt;
+	unsigned int brnf;
+	unsigned int kinds;
+	u8 cursor;
+};
+
+/* A frame of a pair seen leaving the bridge after every bridge and IP hook it
+ * crosses, untranslated: the bridge ports it came in and went out by, the
+ * stations, the EtherType, the tag the bridge sends it with (FT_L2_TAGGED and
+ * the VID, or none), its connection's mark as the rules left it, and when. */
+struct ft_l2_confirm {
+	int in_ifindex;
+	int out_ifindex;
+	u8 dst[ETH_ALEN];
+	u8 src[ETH_ALEN];
+	u16 ethertype;
+	u16 tag;
+	u32 mark;
+	unsigned long at;
+};
+#define FT_L2_TAGGED	BIT(15)
 
 /* A pair's place in the index FDB events are matched through, one per
  * station: an event names one address, and walking every pair for each one
@@ -98,12 +143,18 @@ struct ft_l2_pair {
 	 * which are the same devices unless a port is a VLAN device. */
 	struct net_device *bridge, *in, *out;
 	struct cdx_ft_l2_rule rule;
+	/* The tag the bridge itself sends the pair's frames with, as a
+	 * confirmation records it: inside any of the port's VLAN device. */
+	u16 out_tag;
 	struct cdx_ft_hw *hw;
 	u64 packets, bytes;
 	unsigned long hit;	/* jiffies the counters last moved */
 	/* The generation of each walk that last visited the pair
 	 * (ft_l2_walk_batch()). */
 	unsigned int walked[2];
+	/* Admitted on a confirmation, under the ruleset it was made under. */
+	bool confirmed;
+	struct ft_l2_ruleset ruleset;
 	bool dead;
 };
 
@@ -137,6 +188,21 @@ struct ft_l2_recent {
 	unsigned long at;
 };
 static struct ft_l2_recent __percpu *ft_l2_recent;
+/* The confirmation hook's own once-a-second-per-pair cache, per CPU. */
+static struct ft_l2_confirm __percpu *ft_l2_confirm_recent;
+/* Under ft_l2_lock. */
+static struct ft_l2_confirm ft_l2_confirms[FT_L2_CONFIRMS];
+/* The ruleset confirmations are made under, written by the worker while the
+ * hooks may not confirm; whether they may; when the ruleset was first seen;
+ * and whether the IP confirmation hooks are registered, which they are while
+ * br_netfilter is. */
+static struct ft_l2_ruleset ft_l2_ruleset;
+static bool ft_l2_confirming, ft_l2_ruleset_armed, ft_l2_ip_hooked;
+static unsigned long ft_l2_ruleset_since;
+/* Bit 0: a confirmation hook found the rules moved and asked the worker to
+ * catch up, which it clears when it does: once, not once a frame. */
+static unsigned long ft_l2_kicked;
+static u64 ft_l2_unconfirmed, ft_l2_ruleset_changes;
 static bool ft_l2_hooked, ft_l2_stopping;
 static unsigned long ft_l2_checked;
 static unsigned int ft_l2_walk_gen[2];
@@ -144,6 +210,10 @@ static unsigned int ft_l2_walk_gen[2];
 static bool ft_l2_rechecking;
 static void ft_l2_workfn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_l2_work, ft_l2_workfn);
+/* The learner, the bridge confirmation hook, and the IPv4 and IPv6 ones
+ * (FT_L2_IP_CONFIRM on) for the frames br_netfilter takes from the bridge. */
+#define FT_L2_IP_CONFIRM	2
+static struct nf_hook_ops ft_l2_hook_ops[4];
 
 /* Counters for /proc. */
 static u64 ft_l2_installs, ft_l2_refused, ft_l2_retired, ft_l2_dropped, ft_l2_deferred;
@@ -374,18 +444,401 @@ static unsigned int ft_l2_hook(void *priv, struct sk_buff *skb,
 	return NF_ACCEPT;	/* always: this observes, it never diverts */
 }
 
-static struct nf_hook_ops ft_l2_hook_ops = {
-	.hook = ft_l2_hook,
-	.pf = NFPROTO_BRIDGE,
-	.hooknum = NF_BR_PRE_ROUTING,
-	/* Last, as the multicast learner's: what a later bridge rule would
-	 * drop is never learned. */
-	.priority = NF_BR_PRI_LAST,
+/* --------------------------------------------------------- confirmations */
+
+static void ft_l2_ruleset_read(struct ft_l2_ruleset *r)
+{
+#if IS_ENABLED(CONFIG_NF_TABLES)
+	/* The commit stores its counter before it moves the cursor, and pairs
+	 * that store with this acquire. */
+	r->seq = smp_load_acquire(&init_net.nft.base_seq);
+	r->cursor = READ_ONCE(init_net.nft.gencursor);
+#else
+	r->seq = 0;
+	r->cursor = 0;
+#endif
+	r->xt = nf_xt_seq(&init_net);
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+	r->brnf = br_nf_seq(&init_net);
+#else
+	r->brnf = 0;
+#endif
+}
+
+/* Whether the rules the packet path reads are the same: the hook kinds are
+ * the worker's to compare. */
+static bool ft_l2_ruleset_same(const struct ft_l2_ruleset *a, const struct ft_l2_ruleset *b)
+{
+	return a->seq == READ_ONCE(b->seq) && a->cursor == READ_ONCE(b->cursor) &&
+	       a->xt == READ_ONCE(b->xt) && a->brnf == READ_ONCE(b->brnf);
+}
+
+static u32 ft_l2_confirm_hash(int in_ifindex, const u8 *dst, const u8 *src, u16 ethertype)
+{
+	u8 key[2 * ETH_ALEN];
+
+	memcpy(key, dst, ETH_ALEN);
+	memcpy(key + ETH_ALEN, src, ETH_ALEN);
+	return jhash(key, sizeof(key), (u32)in_ifindex ^ ((u32)ethertype << 16));
+}
+
+static bool ft_l2_confirm_same(const struct ft_l2_confirm *a, const struct ft_l2_confirm *b)
+{
+	return a->in_ifindex == b->in_ifindex && a->out_ifindex == b->out_ifindex &&
+	       a->ethertype == b->ethertype && a->tag == b->tag && a->mark == b->mark &&
+	       ether_addr_equal(a->dst, b->dst) && ether_addr_equal(a->src, b->src);
+}
+
+/* Whether a frame is a group's: a bridge sends a copy of a multicast frame
+ * to a listener with its unicast address when multicast_to_unicast is on,
+ * and what the rules accept of a group says nothing of the stations' own
+ * traffic. */
+static bool ft_l2_group_frame(const struct sk_buff *skb, u16 ethertype)
+{
+	if (skb->pkt_type == PACKET_MULTICAST || skb->pkt_type == PACKET_BROADCAST)
+		return true;
+	if (ethertype == ETH_P_IP) {
+		const struct iphdr *iph;
+		struct iphdr _iph;
+
+		iph = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_iph), &_iph);
+		return !iph || ipv4_is_multicast(iph->daddr) || ipv4_is_lbcast(iph->daddr);
+	}
+	if (ethertype == ETH_P_IPV6) {
+		const struct ipv6hdr *ip6h;
+		struct ipv6hdr _ip6h;
+
+		ip6h = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ip6h), &_ip6h);
+		return !ip6h || ipv6_addr_is_multicast(&ip6h->daddr);
+	}
+	return true;
+}
+
+/* Records a frame of a pair as confirmed, at most once a second per pair
+ * and CPU: `in` and `out` are the bridge ports it came in and leaves by,
+ * `ethertype` its own inside any tag. */
+static void ft_l2_confirm_record(struct sk_buff *skb, int in_ifindex, int out_ifindex,
+				 u16 ethertype)
+{
+	struct ft_l2_confirm c = {}, *recent;
+	enum ip_conntrack_info ctinfo;
+	struct ft_l2_ruleset now;
+	const struct nf_conn *ct;
+	unsigned int slot;
+
+	if (!skb_mac_header_was_set(skb) || ft_l2_group_frame(skb, ethertype))
+		return;
+	ether_addr_copy(c.dst, eth_hdr(skb)->h_dest);
+	ether_addr_copy(c.src, eth_hdr(skb)->h_source);
+	if (!is_unicast_ether_addr(c.dst) || !is_valid_ether_addr(c.src))
+		return;
+	/* The tag the bridge gave it: an entry pushes the one the bridge
+	 * sends the pair with, so a confirmation in another VLAN, of the same
+	 * stations, is not this pair's. 802.1ad is no pair of the learner's. */
+	if (skb_vlan_tag_present(skb)) {
+		if (skb->vlan_proto != htons(ETH_P_8021Q))
+			return;
+		c.tag = FT_L2_TAGGED | skb_vlan_tag_get_id(skb);
+	}
+	/* Translated on its way through -- iptables NAT on a bridged frame --
+	 * which an entry forwarding it untouched would not be; or a connection
+	 * a helper reads or whose sequence numbers are adjusted, which needs
+	 * every frame in software, as a routed flow does. Whatever translates
+	 * a frame these hooks see has done so before them: the bridge's last
+	 * one sees only what crosses no IP POST_ROUTING hook, and the IP one
+	 * is last there, anything after it counted (ft_l2_confirm_followed()).
+	 * So a connection not yet confirmed in conntrack -- the first frame,
+	 * or one br_netfilter took only through PRE_ROUTING, which a frame the
+	 * bridge tags on egress is unless bridge-nf-filter-vlan-tagged is on --
+	 * has its translation decided as well. */
+	ct = nf_ct_get(skb, &ctinfo);
+	if (ct && ((READ_ONCE(ct->status) & (IPS_NAT_MASK | IPS_SEQ_ADJUST)) ||
+		   nf_ct_ext_exist(ct, NF_CT_EXT_HELPER)))
+		return;
+	/* Judged by rules the worker has not caught up with. */
+	ft_l2_ruleset_read(&now);
+	if (!ft_l2_ruleset_same(&now, &ft_l2_ruleset)) {
+		if (!READ_ONCE(ft_l2_stopping) && !test_bit(0, &ft_l2_kicked) &&
+		    !test_and_set_bit(0, &ft_l2_kicked))
+			mod_delayed_work(system_wq, &ft_l2_work, 0);
+		return;
+	}
+	c.in_ifindex = in_ifindex;
+	c.out_ifindex = out_ifindex;
+	c.ethertype = ethertype;
+	/* The mark a class is decoded from, for a routed flow and for this
+	 * frame on the software path alike (ft_qos_flow_class()): its
+	 * connection's, and none without one. */
+	c.mark = ct ? READ_ONCE(ct->mark) : 0;
+	slot = ft_l2_confirm_hash(c.in_ifindex, c.dst, c.src, c.ethertype);
+	recent = get_cpu_ptr(ft_l2_confirm_recent) + slot % FT_L2_SEEN;
+	if (ft_l2_confirm_same(recent, &c) && time_before(jiffies, recent->at + FT_L2_PASS)) {
+		put_cpu_ptr(ft_l2_confirm_recent);
+		return;
+	}
+	c.at = jiffies ?: 1;
+	*recent = c;
+	put_cpu_ptr(ft_l2_confirm_recent);
+	spin_lock_bh(&ft_l2_lock);
+	ft_l2_confirms[slot % FT_L2_CONFIRMS] = c;
+	spin_unlock_bh(&ft_l2_lock);
+}
+
+/* Whether br_netfilter has a frame the bridge forwards between its ports,
+ * and so hands it to the IP POST_ROUTING hooks from its own bridge
+ * POST_ROUTING hook -- which never returns it to the bridge hooks after. */
+static const struct nf_bridge_info *ft_l2_brnf(const struct sk_buff *skb)
+{
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+	const struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+
+	if (nf_bridge && nf_bridge->physoutdev)
+		return nf_bridge;
+#endif
+	return NULL;
+}
+
+/* The last word on a frame the bridge forwards before it is transmitted,
+ * unless br_netfilter takes it to the IP hooks: every bridge hook has had
+ * it. Never diverts. */
+static unsigned int ft_l2_confirm_hook(void *priv, struct sk_buff *skb,
+				       const struct nf_hook_state *state)
+{
+	struct net_device *out = state->out;
+
+	if (!smp_load_acquire(&ft_l2_confirming) || !out || !netif_is_bridge_port(out) ||
+	    (skb->protocol != htons(ETH_P_IP) && skb->protocol != htons(ETH_P_IPV6)) ||
+	    ft_l2_brnf(skb))
+		return NF_ACCEPT;
+	/* The bridge port the frame came in by: the receive path sets it on
+	 * every round, a VLAN device's included. */
+	ft_l2_confirm_record(skb, skb->skb_iif, out->ifindex, ntohs(skb->protocol));
+	return NF_ACCEPT;	/* always: this observes, it never diverts */
+}
+
+/* The last word on a frame br_netfilter took from the bridge: every bridge
+ * hook before its own POST_ROUTING one, and every IP hook, have had it. It
+ * names the bridge ports in its own record, and the frame's EtherType is
+ * the one it set. Never diverts. */
+static unsigned int ft_l2_confirm_ip_hook(void *priv, struct sk_buff *skb,
+					  const struct nf_hook_state *state)
+{
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+	const struct nf_bridge_info *nf_bridge;
+
+	if (!smp_load_acquire(&ft_l2_confirming))
+		return NF_ACCEPT;
+	nf_bridge = ft_l2_brnf(skb);
+	/* Only a frame br_netfilter took as it came: the receive path has
+	 * already moved an 802.1Q tag out of it, so one whose payload it pulled
+	 * a PPPoE session header (bridge-nf-filter-pppoe-tagged) or a second
+	 * tag from is no IP frame of the pair's on the wire. */
+	if (nf_bridge && nf_bridge->orig_proto == BRNF_PROTO_UNCHANGED)
+		ft_l2_confirm_record(skb, nf_bridge->physinif, nf_bridge->physoutdev->ifindex,
+				     ntohs(skb->protocol));
+#endif
+	return NF_ACCEPT;	/* always: this observes, it never diverts */
+}
+
+/* The confirmation of an observation, if a fresh one was made. */
+static bool ft_l2_confirmed(const struct ft_l2_seen *s, struct ft_l2_confirm *c)
+{
+	u32 slot = ft_l2_confirm_hash(s->in_ifindex, s->dst, s->src, s->ethertype) %
+		   FT_L2_CONFIRMS;
+	bool fresh;
+
+	spin_lock_bh(&ft_l2_lock);
+	*c = ft_l2_confirms[slot];
+	spin_unlock_bh(&ft_l2_lock);
+	fresh = c->at && time_before(jiffies, c->at + FT_L2_CONFIRM_FRESH);
+	return fresh && c->in_ifindex == s->in_ifindex && c->ethertype == s->ethertype &&
+	       ether_addr_equal(c->dst, s->dst) && ether_addr_equal(c->src, s->src);
+}
+
+/* Whether a hook of someone else's runs after a confirmation hook, where it
+ * could drop, mark or rewrite a frame the hook has already confirmed: after
+ * the bridge one, anything but br_netfilter's own, which takes on only the
+ * frames that hook leaves to the IP ones; after an IP one, a chain or a
+ * program -- conntrack's confirmation, x_tables and NAT have their places
+ * well before LAST, as the routed multicast learner has it
+ * (ft_mr_observer_followed()). */
+static bool ft_l2_followed(struct nf_hook_entries __rcu *const *head,
+			   const struct nf_hook_ops *mine, bool ip)
+{
+	const struct nf_hook_entries *e;
+	struct nf_hook_ops **ops;
+	bool followed = false, after = false;
+	unsigned int j;
+
+	rcu_read_lock();
+	e = rcu_dereference(*head);
+	if (e) {
+		ops = nf_hook_entries_get_hook_ops(e);
+		for (j = 0; j < e->num_hook_entries && !followed; j++) {
+			if (ops[j] == mine)
+				after = true;
+			else if (after && ip)
+				followed = ops[j]->hook_ops_type != NF_HOOK_OP_UNDEFINED;
+			else if (after)
+				followed = ops[j]->hook_ops_type != NF_HOOK_OP_BR_NETFILTER;
+		}
+	}
+	rcu_read_unlock();
+	return followed;
+}
+
+static bool ft_l2_confirm_followed(void)
+{
+	bool followed = false;
+
+#if IS_ENABLED(CONFIG_NETFILTER_FAMILY_BRIDGE)
+	followed = ft_l2_followed(&init_net.nf.hooks_bridge[NF_BR_POST_ROUTING],
+				  &ft_l2_hook_ops[1], false);
+#endif
+	if (READ_ONCE(ft_l2_ip_hooked))
+		followed = followed ||
+			   ft_l2_followed(&init_net.nf.hooks_ipv4[NF_INET_POST_ROUTING],
+					  &ft_l2_hook_ops[FT_L2_IP_CONFIRM], true) ||
+			   ft_l2_followed(&init_net.nf.hooks_ipv6[NF_INET_POST_ROUTING],
+					  &ft_l2_hook_ops[FT_L2_IP_CONFIRM + 1], true);
+	return followed;
+}
+
+/* The other bridge hooks a frame the learner would take from the bridge
+ * crosses (FT_BRIDGE_HOOK_*), anything that runs after the confirmation hook
+ * counting as one this does not follow. */
+static unsigned int ft_l2_hook_kinds_now(void)
+{
+	unsigned int kinds = ft_bridge_hook_kinds(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
+						  BIT(NF_BR_POST_ROUTING));
+
+	if (kinds && ft_l2_confirm_followed())
+		kinds |= FT_BRIDGE_HOOK_OTHER;
+	/* br_netfilter's frames with no IP hook to confirm them; or crossing
+	 * a netfilter BPF program at the IP hooks, whose changes, and its maps',
+	 * nothing counts. */
+	if ((kinds & FT_BRIDGE_HOOK_BRNF) &&
+	    (!READ_ONCE(ft_l2_ip_hooked) || ft_mr_bpf_hooked(AF_INET) ||
+	     ft_mr_bpf_hooked(AF_INET6)))
+		kinds |= FT_BRIDGE_HOOK_OTHER;
+	return kinds;
+}
+
+/* Follow the ruleset and the other bridge hooks, once a pass, with no lock
+ * held: when the rules change, confirmations stop, every one is forgotten
+ * once no frame judged by the old rules can still be recording one, and the
+ * pairs made under them go at the sweep; they start again once the rules have
+ * stood still for FT_L2_RULESET_SETTLE with the commit behind them applied
+ * whole, as the routed multicast learner's do (ft_mr_ruleset_sync()). */
+static void ft_l2_ruleset_sync(void)
+{
+	struct ft_l2_ruleset now;
+	unsigned int kinds;
+
+	clear_bit(0, &ft_l2_kicked);
+	kinds = ft_l2_hook_kinds_now();
+	/* The IP confirmation hooks, for as long as br_netfilter takes frames
+	 * from the bridge to the IP hooks: registration sleeps, and only this
+	 * pass and unload touch them -- unload once this pass is done, so none
+	 * is registered once it has begun. One that will not register confirms
+	 * nothing br_netfilter takes, so nothing is confirmed. */
+	if (!!(kinds & FT_BRIDGE_HOOK_BRNF) != READ_ONCE(ft_l2_ip_hooked) &&
+	    !READ_ONCE(ft_l2_stopping)) {
+		if (READ_ONCE(ft_l2_ip_hooked)) {
+			nf_unregister_net_hooks(&init_net, &ft_l2_hook_ops[FT_L2_IP_CONFIRM], 2);
+			WRITE_ONCE(ft_l2_ip_hooked, false);
+		} else if (!nf_register_net_hooks(&init_net, &ft_l2_hook_ops[FT_L2_IP_CONFIRM],
+						  2)) {
+			WRITE_ONCE(ft_l2_ip_hooked, true);
+		}
+		kinds = ft_l2_hook_kinds_now();
+	}
+	ft_l2_ruleset_read(&now);
+	if (!ft_l2_ruleset_same(&now, &ft_l2_ruleset) || kinds != ft_l2_ruleset.kinds) {
+		/* With no hook to follow before or after, nothing confirmed
+		 * under the old rules or will under these: no frame to wait
+		 * out, which every commit would otherwise cost a pass. */
+		if (kinds || ft_l2_ruleset.kinds || READ_ONCE(ft_l2_confirming)) {
+			smp_store_release(&ft_l2_confirming, false);
+			synchronize_rcu();
+			spin_lock_bh(&ft_l2_lock);
+			memset(ft_l2_confirms, 0, sizeof(ft_l2_confirms));
+			spin_unlock_bh(&ft_l2_lock);
+		}
+		WRITE_ONCE(ft_l2_ruleset.seq, now.seq);
+		WRITE_ONCE(ft_l2_ruleset.cursor, now.cursor);
+		WRITE_ONCE(ft_l2_ruleset.xt, now.xt);
+		WRITE_ONCE(ft_l2_ruleset.brnf, now.brnf);
+		WRITE_ONCE(ft_l2_ruleset.kinds, kinds);
+		ft_l2_ruleset_since = jiffies;
+		if (ft_l2_ruleset_armed && kinds)
+			ft_l2_ruleset_changes++;
+		ft_l2_ruleset_armed = true;
+		return;
+	}
+	/* Only hooks whose rules this follows need confirming at all, and
+	 * only a confirmation nothing follows means what it says. */
+	if (!kinds || (kinds & FT_BRIDGE_HOOK_OTHER)) {
+		smp_store_release(&ft_l2_confirming, false);
+		return;
+	}
+	if (READ_ONCE(ft_l2_confirming) ||
+	    time_before(jiffies, ft_l2_ruleset_since + FT_L2_RULESET_SETTLE))
+		return;
+#if IS_ENABLED(CONFIG_NF_TABLES)
+	if (nft_commit_in_progress(&init_net))
+		return;
+#endif
+	/* A frame already past the rules may have been judged by the commit
+	 * half applied: every such one finishes first. */
+	synchronize_rcu();
+	ft_l2_ruleset_read(&now);
+	if (ft_l2_ruleset_same(&now, &ft_l2_ruleset))
+		smp_store_release(&ft_l2_confirming, true);
+}
+
+static struct nf_hook_ops ft_l2_hook_ops[4] = {
+	{
+		.hook = ft_l2_hook,
+		.pf = NFPROTO_BRIDGE,
+		.hooknum = NF_BR_PRE_ROUTING,
+		/* Last, as the multicast learner's: what a later bridge rule
+		 * would drop is never learned. */
+		.priority = NF_BR_PRI_LAST,
+	},
+	{
+		.hook = ft_l2_confirm_hook,
+		.pf = NFPROTO_BRIDGE,
+		.hooknum = NF_BR_POST_ROUTING,
+		/* Last. At one priority netfilter runs a later registration
+		 * first, so br_netfilter's own POST_ROUTING hook, loaded when
+		 * Docker starts, may run on either side of this one. Either
+		 * way the frames it takes to the IP hooks, and never returns,
+		 * are the IP confirmation hooks' (ft_l2_brnf()), and the rest
+		 * it passes untouched. ft_l2_confirm_followed() keeps
+		 * confirmations off while anything else runs after. */
+		.priority = NF_BR_PRI_LAST,
+	},
+	[FT_L2_IP_CONFIRM] = {
+		.hook = ft_l2_confirm_ip_hook,
+		.pf = NFPROTO_IPV4,
+		.hooknum = NF_INET_POST_ROUTING,
+		/* Last. Conntrack confirms at this priority too, and runs
+		 * after this hook if it registered first, which changes
+		 * nothing a frame here is judged by: its NAT ran well before. */
+		.priority = NF_IP_PRI_LAST,
+	},
+	[FT_L2_IP_CONFIRM + 1] = {
+		.hook = ft_l2_confirm_ip_hook,
+		.pf = NFPROTO_IPV6,
+		.hooknum = NF_INET_POST_ROUTING,
+		.priority = NF_IP6_PRI_LAST,
+	},
 };
 
 bool ft_l2_hook_is(const struct nf_hook_ops *ops)
 {
-	return ops == &ft_l2_hook_ops;
+	return ops >= &ft_l2_hook_ops[0] && ops < &ft_l2_hook_ops[ARRAY_SIZE(ft_l2_hook_ops)];
 }
 
 /* --------------------------------------------------------------- admission */
@@ -567,11 +1020,13 @@ static bool ft_l2_resolve(const struct ft_l2_seen *s, struct ft_l2_pair *p)
 		p->rule.in_vlan[p->rule.in_vlans].proto = htons(ETH_P_8021Q);
 		p->rule.in_vlan[p->rule.in_vlans++].id = s->vid;
 	}
+	p->out_tag = 0;
 	if (br_vlan_enabled(bridge) && !out_untagged) {
 		if (p->rule.out_vlans == CDX_FT_VLAN_MAX)
 			return false;
 		p->rule.out_vlan[p->rule.out_vlans].proto = htons(ETH_P_8021Q);
 		p->rule.out_vlan[p->rule.out_vlans++].id = s->vid;
+		p->out_tag = FT_L2_TAGGED | s->vid;
 	}
 	p->bridge = bridge;
 	p->in = in;
@@ -629,9 +1084,10 @@ static void ft_l2_unlink(struct ft_l2_pair *p)
  * that nothing the bridge does between the answer and the entry goes unseen:
  * a change before publication shows in the second answer, one after it marks
  * the pair, which the next pass retires. */
-static int ft_l2_admit(const struct ft_l2_seen *s)
+static int ft_l2_admit(const struct ft_l2_seen *s, unsigned int kinds)
 {
 	struct ft_l2_pair *p, *other;
+	struct ft_l2_confirm conf;
 	unsigned int events;
 	s64 changes;
 	int rc;
@@ -645,6 +1101,14 @@ static int ft_l2_admit(const struct ft_l2_seen *s)
 	}
 	events = ft_l2_events;
 	spin_unlock_bh(&ft_l2_lock);
+	/* Under bridge hooks this follows, only a pair a frame of which was
+	 * seen leaving after them, under the rules in force: the next
+	 * observation asks again, whatever this one lacked. */
+	if (kinds && (kinds != READ_ONCE(ft_l2_ruleset.kinds) ||
+		      !smp_load_acquire(&ft_l2_confirming) || !ft_l2_confirmed(s, &conf))) {
+		ft_l2_unconfirmed++;
+		return 0;
+	}
 	hash_for_each_possible(ft_l2_pairs, p, node, ft_l2_hash(s)) {
 		if (!ft_l2_same_key(&p->key, s))
 			continue;
@@ -670,6 +1134,27 @@ static int ft_l2_admit(const struct ft_l2_seen *s)
 		ft_l2_refused++;
 		ft_l2_refusal(s, events);
 		return 0;
+	}
+	if (kinds) {
+		/* Confirmed leaving by the port the bridge forwards the pair
+		 * to now, and queued in the class its connection's mark gives:
+		 * one the hardware cannot express keeps it in software, as it
+		 * does a routed flow. */
+		if (conf.out_ifindex != p->out->ifindex || conf.tag != p->out_tag) {
+			kfree(p);
+			ft_l2_unconfirmed++;
+			return 0;
+		}
+		p->rule.qos = ft_qos_class(conf.mark);
+		if (!ft_qos_class_valid(p->rule.qos)) {
+			kfree(p);
+			ft_l2_refused++;
+			ft_l2_refusal(s, events);
+			return 0;
+		}
+		p->confirmed = true;
+		/* The worker's own copy: only this pass writes it. */
+		p->ruleset = ft_l2_ruleset;
 	}
 	/* The same stations from another VLAN device of the physical port
 	 * would need its key twice. */
@@ -706,6 +1191,18 @@ static int ft_l2_admit(const struct ft_l2_seen *s)
 		ft_l2_refused++;
 		return 0;
 	}
+	/* A rule committed during this pass: the next confirmation is made
+	 * under it. */
+	if (kinds) {
+		struct ft_l2_ruleset now;
+
+		ft_l2_ruleset_read(&now);
+		if (!ft_l2_ruleset_same(&now, &ft_l2_ruleset)) {
+			ft_l2_release(p);
+			ft_l2_unconfirmed++;
+			return 0;
+		}
+	}
 	/* Before anything is built: an egress change counted after this is
 	 * one the entry may predate (ft_egress_changes). */
 	changes = atomic64_read_acquire(&ft_egress_changes);
@@ -736,7 +1233,12 @@ static bool ft_l2_current(const struct ft_l2_pair *p)
 {
 	struct ft_l2_pair now;
 
-	return ft_l2_resolve(&p->key, &now) && now.in == p->in && now.out == p->out &&
+	if (!ft_l2_resolve(&p->key, &now))
+		return false;
+	/* A confirmed pair's class is its confirmation's mark's, which the
+	 * bridge has no say in. */
+	now.rule.qos = p->rule.qos;
+	return now.in == p->in && now.out == p->out &&
 	       !memcmp(&now.rule, &p->rule, sizeof(now.rule));
 }
 
@@ -822,10 +1324,11 @@ static void ft_l2_yield(void)
 }
 
 struct ft_l2_sweeping {
-	bool filtered;
+	unsigned int kinds;
 };
 
-/* Dead, idle, or under a bridge filter: out of hardware. Otherwise the
+/* Dead, idle, or under a bridge hook this does not follow: out of hardware;
+ * and under one it does, a pair not confirmed under the rules in force. Otherwise the
  * pair's counters are read, and a pair they moved for keeps its source
  * station's FDB entry fresh. */
 static bool ft_l2_sweep_one(struct ft_l2_pair *p, const void *arg)
@@ -837,7 +1340,13 @@ static bool ft_l2_sweep_one(struct ft_l2_pair *p, const void *arg)
 	spin_lock_bh(&ft_l2_lock);
 	dead = p->dead;
 	spin_unlock_bh(&ft_l2_lock);
-	if (dead || sweep->filtered || READ_ONCE(ft_l2_stopping) || atomic_read(&ft_invalid))
+	if (dead || (sweep->kinds & FT_BRIDGE_HOOK_OTHER) || READ_ONCE(ft_l2_stopping) ||
+	    atomic_read(&ft_invalid))
+		return true;
+	/* A pair made before the hooks came, or under rules since changed:
+	 * what it carries never passed them as they are. */
+	if (sweep->kinds && (!p->confirmed || p->ruleset.kinds != sweep->kinds ||
+			     !ft_l2_ruleset_same(&p->ruleset, &ft_l2_ruleset)))
 		return true;
 	cdx_ft_stats(p->hw, &c);
 	if (c.packets != p->packets) {
@@ -849,19 +1358,14 @@ static bool ft_l2_sweep_one(struct ft_l2_pair *p, const void *arg)
 	return !time_before(jiffies, p->hit + msecs_to_jiffies(READ_ONCE(ft_l2_idle_ms)));
 }
 
-static bool ft_l2_filtered(void)
+/* Whether a pair may be admitted now, with `kinds` the other bridge hooks
+ * as they are now. Asked in the hold of the transaction the admission runs
+ * in: a walk that let it go meanwhile may have seen it latched by an
+ * invalidation, a hook appear, or unload begin. */
+static bool ft_l2_live(unsigned int kinds)
 {
-	return ft_bridge_hooked(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
-				BIT(NF_BR_POST_ROUTING));
-}
-
-/* Whether a pair may be admitted now. Asked in the hold of the transaction
- * the admission runs in: a walk that let it go meanwhile may have seen it
- * latched by an invalidation, a filter appear, or unload begin. */
-static bool ft_l2_live(void)
-{
-	return !ft_l2_filtered() && !READ_ONCE(ft_l2_stopping) && !atomic_read(&ft_invalid) &&
-	       READ_ONCE(ft_l2_enabled);
+	return !(kinds & FT_BRIDGE_HOOK_OTHER) && !READ_ONCE(ft_l2_stopping) &&
+	       !atomic_read(&ft_invalid) && READ_ONCE(ft_l2_enabled);
 }
 
 /* Every pair visited once, a batch per hold of the transaction. Called and
@@ -872,7 +1376,7 @@ static void ft_l2_sweep(void)
 
 	ft_l2_walk_gen[FT_L2_SWEEP]++;
 	for (;;) {
-		sweep.filtered = ft_l2_filtered();
+		sweep.kinds = ft_l2_hook_kinds_now();
 		if (ft_l2_walk_batch(FT_L2_SWEEP, ft_l2_sweep_one, &sweep))
 			return;
 		ft_l2_yield();
@@ -917,7 +1421,7 @@ static void ft_l2_recheck(void)
 static void ft_l2_workfn(struct work_struct *work)
 {
 	struct ft_l2_seen batch[32];
-	unsigned int n = 0, i, retry = 0;
+	unsigned int n = 0, i, retry = 0, kinds;
 	bool rtnl = false, again, live;
 
 	spin_lock_bh(&ft_l2_lock);
@@ -926,9 +1430,10 @@ static void ft_l2_workfn(struct work_struct *work)
 	again = ft_l2_tail != ft_l2_head;
 	spin_unlock_bh(&ft_l2_lock);
 
+	ft_l2_ruleset_sync();
 	cdx_ft_begin();
 	ft_l2_sweep();
-	live = ft_l2_live();
+	live = ft_l2_live(ft_l2_hook_kinds_now());
 	/* A recheck cut short with nothing left to check, or nothing it may
 	 * keep, is abandoned: the next starts afresh when due. */
 	if (!live || list_empty(&ft_l2_list))
@@ -937,10 +1442,11 @@ static void ft_l2_workfn(struct work_struct *work)
 	    (ft_l2_rechecking || time_after_eq(jiffies, ft_l2_checked + FT_L2_RECHECK)))
 		ft_l2_recheck();
 	/* Asked again: the recheck may have let the transaction go. */
-	if (n && ft_l2_live()) {
+	kinds = ft_l2_hook_kinds_now();
+	if (n && ft_l2_live(kinds)) {
 		rtnl = !cdx_ft_admission_begin();
 		for (i = 0; i < n; i++) {
-			if (rtnl && ft_l2_admit(&batch[i]) != -EAGAIN)
+			if (rtnl && ft_l2_admit(&batch[i], kinds) != -EAGAIN)
 				continue;
 			/* Back in the ring for the next pass: admission takes
 			 * RTNL without waiting, and nothing else re-offers a
@@ -1112,6 +1618,12 @@ void ft_l2_show(struct seq_file *seq)
 		   READ_ONCE(ft_l2_enabled) && READ_ONCE(ft_l2_hooked), ft_l2_count,
 		   ft_l2_installs, ft_l2_refused, READ_ONCE(ft_l2_held), ft_l2_retired,
 		   ft_l2_dropped, ft_l2_deferred);
+	/* The other bridge hooks the last pass found (FT_BRIDGE_HOOK_*),
+	 * whether frames confirm pairs now, how many observations waited for
+	 * a confirmation, and how many ruleset changes took pairs back. */
+	seq_printf(seq, "l2_hook_kinds %u\nl2_confirming %u\nl2_unconfirmed %llu\nl2_ruleset_changes %llu\n",
+		   READ_ONCE(ft_l2_ruleset.kinds), READ_ONCE(ft_l2_confirming), ft_l2_unconfirmed,
+		   ft_l2_ruleset_changes);
 }
 
 /* The rows, one seq_file record each, after the flows' (main.c's
@@ -1173,31 +1685,49 @@ int ft_l2_init(void)
 		return 0;
 	ft_l2_recent = __alloc_percpu(FT_L2_SEEN * sizeof(*ft_l2_recent),
 				      __alignof__(*ft_l2_recent));
-	rc = ft_l2_recent ? nf_register_net_hook(&init_net, &ft_l2_hook_ops) : -ENOMEM;
+	ft_l2_confirm_recent = __alloc_percpu(FT_L2_SEEN * sizeof(*ft_l2_confirm_recent),
+					      __alignof__(*ft_l2_confirm_recent));
+	rc = ft_l2_recent && ft_l2_confirm_recent ?
+	     nf_register_net_hooks(&init_net, ft_l2_hook_ops, FT_L2_IP_CONFIRM) :
+	     -ENOMEM;
 	if (rc) {
-		pr_warn("cdx flowtable: bridged unicast learner could not register its hook (%d); bridged pairs stay in software\n",
+		pr_warn("cdx flowtable: bridged unicast learner could not register its hooks (%d); bridged pairs stay in software\n",
 			rc);
 		free_percpu(ft_l2_recent);
+		free_percpu(ft_l2_confirm_recent);
 		ft_l2_recent = NULL;
+		ft_l2_confirm_recent = NULL;
 		return 0;
 	}
 	WRITE_ONCE(ft_l2_hooked, true);
 	return 0;
 }
 
-/* Called with no transaction held: unregisters the hook, waits out the
- * frames inside it and the worker, then retires everything installed. */
+/* Called with no transaction held: unregisters the hooks, waits out the
+ * frames inside them and the worker, then retires everything installed. */
 void ft_l2_exit(void)
 {
 	WRITE_ONCE(ft_l2_stopping, true);
 	if (READ_ONCE(ft_l2_hooked)) {
 		WRITE_ONCE(ft_l2_hooked, false);
-		nf_unregister_net_hook(&init_net, &ft_l2_hook_ops);
+		nf_unregister_net_hooks(&init_net, ft_l2_hook_ops, FT_L2_IP_CONFIRM);
+	}
+	/* Unregistering waits for no frame inside a hook: every one that read
+	 * ft_l2_stopping clear, and so may queue the worker, is done after
+	 * this, and the cancel below is the last word. */
+	synchronize_net();
+	cancel_delayed_work_sync(&ft_l2_work);
+	/* The worker registers the IP ones, and registers none once
+	 * ft_l2_stopping is set; it is done. */
+	if (READ_ONCE(ft_l2_ip_hooked)) {
+		WRITE_ONCE(ft_l2_ip_hooked, false);
+		nf_unregister_net_hooks(&init_net, &ft_l2_hook_ops[FT_L2_IP_CONFIRM], 2);
 		synchronize_net();
 	}
 	free_percpu(ft_l2_recent);
+	free_percpu(ft_l2_confirm_recent);
 	ft_l2_recent = NULL;
-	cancel_delayed_work_sync(&ft_l2_work);
+	ft_l2_confirm_recent = NULL;
 	cdx_ft_begin();
 	while (ft_l2_retire_batch())
 		ft_l2_yield();

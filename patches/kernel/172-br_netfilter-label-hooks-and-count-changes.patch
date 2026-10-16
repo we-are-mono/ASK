@@ -1,0 +1,255 @@
+From dc2363128fedbb70d6490e42e6383ccfa05c6290 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Fri, 16 Oct 2026 22:48:30 +0200
+Subject: [PATCH] br_netfilter: label its bridge hooks and count its changes
+
+An offload that forwards in hardware has to know which bridge hooks a
+frame it would take from the bridge passes through, and br_netfilter's
+are of a kind it can account for. They hand frames the bridge forwards
+between its ports to the IP hooks, whose rules it can follow; and a
+routed frame leaving through the bridge has no physoutdev, so
+br_nf_post_routing() passes it untouched. Every other bridge hook
+without a type is an ebtables table or an unknown module, which it
+cannot account for.
+
+Give br_netfilter's four bridge-family ops their own hook_ops_type, so
+they can be told apart, and report it in nfnetlink_hook as the other
+types without chain information are.
+
+Which bridged frames meet those rules at all is the bridge-nf-* sysctls'
+and each bridge's nf_call_* options' to say, and nothing reports them
+changing: an offload that saw a frame pass with call-iptables at 0 would
+go on forwarding its pair past every rule once it is set to 1, as Docker
+does on a box that booted with it off. Count the changes in a per-net
+sequence, moved after the new value is in place, as nf_xt_seq() counts
+x_tables table changes; and once more when the module's per-net state
+is set up, since a reload puts the defaults back.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ include/linux/netfilter.h             |  6 ++++++
+ include/net/netfilter/nf_port_probe.h | 27 +++++++++++++++++++++++++++
+ include/net/netns/netfilter.h         |  6 ++++++
+ net/bridge/br_netfilter_hooks.c       | 13 +++++++++++++
+ net/bridge/br_netlink.c               |  5 +++++
+ net/bridge/br_sysfs_br.c              |  4 ++++
+ net/netfilter/nfnetlink_hook.c        |  1 +
+ 7 files changed, 62 insertions(+)
+
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+index 42ac5238fc3c..3ef8b4ab095c 100644
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -98,6 +98,12 @@ enum nf_hook_ops_type {
+ 	 * its struct nf_nat_lookup_hook_priv.
+ 	 */
+ 	NF_HOOK_OP_NAT,
++	/* br_netfilter's bridge hooks, which hand frames the bridge forwards
++	 * between its ports to the iptables, ip6tables and arptables hooks as
++	 * the bridge-nf-call-* sysctls say. A routed frame leaving through the
++	 * bridge has no physoutdev and passes br_nf_post_routing() untouched.
++	 */
++	NF_HOOK_OP_BR_NETFILTER,
+ };
+ 
+ struct nf_hook_ops {
+diff --git a/include/net/netfilter/nf_port_probe.h b/include/net/netfilter/nf_port_probe.h
+index c6ecb4b67d41..f92634115dab 100644
+--- a/include/net/netfilter/nf_port_probe.h
++++ b/include/net/netfilter/nf_port_probe.h
+@@ -108,4 +108,31 @@ static inline unsigned int nf_xt_seq(const struct net *net)
+ 	return atomic_read_acquire(&net->nf.xt_seq);
+ }
+ 
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++/**
++ * br_nf_changed - say that br_netfilter may hand other bridged frames on
++ * @net: the network namespace
++ *
++ * Called once a bridge-nf-* sysctl is written and once a bridge's
++ * nf_call_* option changes, after the new value is in place: which frames
++ * the bridge forwards between its ports meet the IP hooks, and so the rules
++ * there, is theirs to say. An offload that forwards bridged frames past those
++ * hooks, on what it saw them decide, decides again whenever br_nf_seq()
++ * moves; nothing else reports the change.
++ */
++static inline void br_nf_changed(struct net *net)
++{
++	atomic_inc_return_release(&net->nf.brnf_seq);
++}
++
++/**
++ * br_nf_seq - how many times br_netfilter's hand-off in @net has changed
++ * @net: the network namespace
++ */
++static inline unsigned int br_nf_seq(const struct net *net)
++{
++	return atomic_read_acquire(&net->nf.brnf_seq);
++}
++#endif
++
+ #endif /* _NF_PORT_PROBE_H */
+diff --git a/include/net/netns/netfilter.h b/include/net/netns/netfilter.h
+index aa8d6d05927e..568489969e1b 100644
+--- a/include/net/netns/netfilter.h
++++ b/include/net/netns/netfilter.h
+@@ -38,5 +38,11 @@ struct netns_nf {
+ 	 * removal; see nf_xt_changed().
+ 	 */
+ 	atomic_t xt_seq;
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++	/* Moved by every change to which bridged frames br_netfilter hands
++	 * to the IP hooks; see br_nf_changed().
++	 */
++	atomic_t brnf_seq;
++#endif
+ };
+ #endif
+diff --git a/net/bridge/br_netfilter_hooks.c b/net/bridge/br_netfilter_hooks.c
+index c550907b92dd..abbee5cafa84 100644
+--- a/net/bridge/br_netfilter_hooks.c
++++ b/net/bridge/br_netfilter_hooks.c
+@@ -36,6 +36,7 @@
+ #include <net/dst_metadata.h>
+ #include <net/route.h>
+ #include <net/netfilter/br_netfilter.h>
++#include <net/netfilter/nf_port_probe.h>
+ #include <net/netns/generic.h>
+ #include <net/inet_dscp.h>
+ 
+@@ -1081,6 +1082,7 @@ static const struct nf_hook_ops br_nf_ops[] = {
+ 	{
+ 		.hook = br_nf_pre_routing,
+ 		.pf = NFPROTO_BRIDGE,
++		.hook_ops_type = NF_HOOK_OP_BR_NETFILTER,
+ 		.hooknum = NF_BR_PRE_ROUTING,
+ 		.priority = NF_BR_PRI_BRNF,
+ 	},
+@@ -1088,6 +1090,7 @@ static const struct nf_hook_ops br_nf_ops[] = {
+ 	{
+ 		.hook = br_nf_local_in,
+ 		.pf = NFPROTO_BRIDGE,
++		.hook_ops_type = NF_HOOK_OP_BR_NETFILTER,
+ 		.hooknum = NF_BR_LOCAL_IN,
+ 		.priority = NF_BR_PRI_LAST,
+ 	},
+@@ -1095,12 +1098,14 @@ static const struct nf_hook_ops br_nf_ops[] = {
+ 	{
+ 		.hook = br_nf_forward,
+ 		.pf = NFPROTO_BRIDGE,
++		.hook_ops_type = NF_HOOK_OP_BR_NETFILTER,
+ 		.hooknum = NF_BR_FORWARD,
+ 		.priority = NF_BR_PRI_BRNF,
+ 	},
+ 	{
+ 		.hook = br_nf_post_routing,
+ 		.pf = NFPROTO_BRIDGE,
++		.hook_ops_type = NF_HOOK_OP_BR_NETFILTER,
+ 		.hooknum = NF_BR_POST_ROUTING,
+ 		.priority = NF_BR_PRI_LAST,
+ 	},
+@@ -1211,6 +1216,8 @@ int brnf_sysctl_call_tables(const struct ctl_table *ctl, int write,
+ 
+ 	if (write && *(int *)(ctl->data))
+ 		*(int *)(ctl->data) = 1;
++	if (write && !ret)
++		br_nf_changed(ctl->extra1);
+ 	return ret;
+ }
+ 
+@@ -1267,6 +1274,7 @@ static int br_netfilter_sysctl_init_net(struct net *net)
+ {
+ 	struct ctl_table *table = brnf_table;
+ 	struct brnf_net *brnet;
++	unsigned int i;
+ 
+ 	if (!net_eq(net, &init_net)) {
+ 		table = kmemdup(table, sizeof(brnf_table), GFP_KERNEL);
+@@ -1281,8 +1289,13 @@ static int br_netfilter_sysctl_init_net(struct net *net)
+ 	table[3].data = &brnet->filter_vlan_tagged;
+ 	table[4].data = &brnet->filter_pppoe_tagged;
+ 	table[5].data = &brnet->pass_vlan_indev;
++	/* The namespace a write reports its change in. */
++	for (i = 0; i < ARRAY_SIZE(brnf_table); i++)
++		table[i].extra1 = net;
+ 
+ 	br_netfilter_sysctl_default(brnet);
++	/* A reload puts back the defaults whatever they were set to. */
++	br_nf_changed(net);
+ 
+ 	brnet->ctl_hdr = register_net_sysctl_sz(net, "net/bridge", table,
+ 						ARRAY_SIZE(brnf_table));
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 6b97ae47f855..8889be92a528 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -11,6 +11,7 @@
+ #include <linux/etherdevice.h>
+ #include <net/rtnetlink.h>
+ #include <net/net_namespace.h>
++#include <net/netfilter/nf_port_probe.h>
+ #include <net/sock.h>
+ #include <uapi/linux/if_bridge.h>
+ 
+@@ -1533,6 +1534,10 @@ static int br_changelink(struct net_device *brdev, struct nlattr *tb[],
+ 
+ 		br_opt_toggle(br, BROPT_NF_CALL_ARPTABLES, !!val);
+ 	}
++
++	if (data[IFLA_BR_NF_CALL_IPTABLES] || data[IFLA_BR_NF_CALL_IP6TABLES] ||
++	    data[IFLA_BR_NF_CALL_ARPTABLES])
++		br_nf_changed(dev_net(br->dev));
+ #endif
+ 
+ 	if (data[IFLA_BR_MULTI_BOOLOPT]) {
+diff --git a/net/bridge/br_sysfs_br.c b/net/bridge/br_sysfs_br.c
+index ea733542244c..debdf2c534d3 100644
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@ -16,6 +16,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/times.h>
+ #include <linux/sched/signal.h>
++#include <net/netfilter/nf_port_probe.h>
+ 
+ #include "br_private.h"
+ 
+@@ -784,6 +785,7 @@ static int set_nf_call_iptables(struct net_bridge *br, unsigned long val,
+ 				struct netlink_ext_ack *extack)
+ {
+ 	br_opt_toggle(br, BROPT_NF_CALL_IPTABLES, !!val);
++	br_nf_changed(dev_net(br->dev));
+ 	return 0;
+ }
+ 
+@@ -806,6 +808,7 @@ static int set_nf_call_ip6tables(struct net_bridge *br, unsigned long val,
+ 				 struct netlink_ext_ack *extack)
+ {
+ 	br_opt_toggle(br, BROPT_NF_CALL_IP6TABLES, !!val);
++	br_nf_changed(dev_net(br->dev));
+ 	return 0;
+ }
+ 
+@@ -828,6 +831,7 @@ static int set_nf_call_arptables(struct net_bridge *br, unsigned long val,
+ 				 struct netlink_ext_ack *extack)
+ {
+ 	br_opt_toggle(br, BROPT_NF_CALL_ARPTABLES, !!val);
++	br_nf_changed(dev_net(br->dev));
+ 	return 0;
+ }
+ 
+diff --git a/net/netfilter/nfnetlink_hook.c b/net/netfilter/nfnetlink_hook.c
+index abd08ac814f6..2d35e129fad2 100644
+--- a/net/netfilter/nfnetlink_hook.c
++++ b/net/netfilter/nfnetlink_hook.c
+@@ -222,6 +222,7 @@ static int nfnl_hook_dump_one(struct sk_buff *nlskb,
+ 		break;
+ 	case NF_HOOK_OP_XTABLES:
+ 	case NF_HOOK_OP_NAT:
++	case NF_HOOK_OP_BR_NETFILTER:
+ 	case NF_HOOK_OP_UNDEFINED:
+ 		break;
+ 	default:
+-- 
+2.47.3
+

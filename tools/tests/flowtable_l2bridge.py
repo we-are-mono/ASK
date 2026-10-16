@@ -31,16 +31,21 @@ check hands to Linux.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import re
 import subprocess
 import time
 
 import pytest
 import pytest_asyncio
 
+from ask_orch.artifacts import artifact_dir
 from ask_orch.counters import kernel_rx_packets
-from _flowtable_rig import Rig, command, read, release_latch, stop_boot_daemon
+from ask_orch.uart import Console
+from _flowtable_rig import (HEALTH_BASELINE, Rig, command, console_command, read, release_latch,
+                            stop_boot_daemon)
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _throughput import MOVED, RAMP, SOFTWARE_TX, STAGING, STREAMS, WINDOW, settled
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN,
@@ -71,6 +76,12 @@ MIN_RATE = float(os.environ.get("ASK_FLOWTABLE_L2_MIN_GBPS", "9")) * 1e9
 # measured run outlives it: the run proves the learner keeps the FDB entries
 # of a pair it carries alive (br_fdb_refresh()).
 AGEING_CS = 1000
+BRNF_SYSCTLS = ("net.bridge.bridge-nf-call-iptables", "net.bridge.bridge-nf-call-ip6tables")
+BRNF_VLAN = "net.bridge.bridge-nf-filter-vlan-tagged"
+# FT_BRIDGE_HOOK_*, as /proc/cdx_flowtable reports l2_hook_kinds.
+HOOK_NFT, HOOK_BRNF, HOOK_OTHER = 1, 2, 4
+# The station's frames to the peer, as a bridge or an IP rule names them.
+DROP = f"ip saddr {STATION_ADDR} ip daddr {PEER_ADDR} drop"
 
 
 async def _local(*argv, check=True):
@@ -95,14 +106,22 @@ async def _exchange(r, count=10, interval=0.05):
     return result.stdout
 
 
-async def _carried(r, timeout=10):
-    """Both pairs installed. Exchanges while waiting: the learner hears of a
+def _received(ping):
+    match = re.search(r"(\d+) (?:packets )?received", ping)
+    assert match, ping
+    return int(match.group(1))
+
+
+async def _carried(r, timeout=10, since=None):
+    """Both pairs installed -- since `since`, a state they must have been
+    installed after, if given. Exchanges while waiting: the learner hears of a
     pair from its frames, and a pass that lost RTNL retries on its own, but a
     pair retired since is heard of again only from new frames."""
     deadline = time.monotonic() + timeout
     while True:
         state = await r.state()
-        if len(_pairs(r, state)) == 2:
+        if len(_pairs(r, state)) == 2 and \
+                (since is None or state["l2_installs"] >= since["l2_installs"] + 2):
             return state
         if time.monotonic() >= deadline:
             r.record("l2-not-carried", state)
@@ -239,11 +258,18 @@ async def _segment(r, stack, shape):
     link = json.loads((await lan_run(r.lan, f"ip -j link show dev {LAN_NIC}", 10)).stdout)
     r.station_mac = link[0]["address"]
 
-    # Both ports bound: the learner carries a pair only between two ports an
-    # offload flowtable holds.
+    stack.push(lambda: dut("nft", "delete", "table", "inet", TABLE, check=False))
+    await _bind(r)
+
+
+async def _bind(r):
+    """Both ports bound: the learner carries a pair only between two ports an
+    offload flowtable holds."""
+    async def dut(*argv, check=True):
+        return await command(r.target, r.session, *argv, check=check)
+
     await dut("nft", "delete", "table", "inet", TABLE, check=False)
     await dut("nft", f"add table inet {TABLE}")
-    stack.push(lambda: dut("nft", "delete", "table", "inet", TABLE, check=False))
     await dut("nft", f"add flowtable inet {TABLE} fast {{ hook ingress priority 0 ; "
                      f"devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }} ; flags offload ; }}")
     await r.wait(lambda s: s["bindings"] == 2)
@@ -477,23 +503,32 @@ async def test_l2_fdb_delete_retires(l2_rig):
     await _carried(r)
 
 
-async def test_l2_bridge_filter_keeps_software(l2_rig):
-    """A bridge-family chain can drop or mark what the bridge forwards, and
-    an entry would forward where it never runs: while one exists, no pair is
-    carried, and once it goes they are again."""
+async def test_l2_bridge_chain_rules(l2_rig):
+    """A bridge-family chain can drop or mark what the bridge forwards, and an
+    entry forwards where it never runs (A387). Once one exists the pairs made
+    without it go, and come back once a frame of theirs is seen leaving after
+    it; a rule dropping their frames, added under them, takes them out again
+    and keeps them out -- its frames never reach the peer -- and once the
+    chain goes they are carried as before."""
     r = l2_rig
     await _exchange(r, count=4)
-    await _carried(r)
+    before = await _carried(r)
     await command(r.target, r.session, "nft", f"add table bridge {FILTER_TABLE}")
     try:
         await command(r.target, r.session, "nft",
                       f"add chain bridge {FILTER_TABLE} forward {{ type filter hook forward "
                       f"priority 0 ; policy accept ; }}")
-        await r.wait(lambda s: not _pairs(r, s), timeout=5)
-        await _exchange(r, count=20)
+        confirmed = await _carried(r, timeout=15, since=before)
+        assert confirmed["l2_hook_kinds"] == HOOK_NFT, confirmed
+        await command(r.target, r.session, "nft",
+                      f"add rule bridge {FILTER_TABLE} forward {DROP}")
+        gone = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+        assert _received(await _exchange(r, count=20)) == 0
         await asyncio.sleep(2.5)
-        state = await r.state()
-        assert not _pairs(r, state), state["l2flows"]
+        held = await r.state()
+        r.record("l2-bridge-chain", {"confirmed": confirmed, "gone": gone, "held": held})
+        assert not _pairs(r, held), held["l2flows"]
+        assert held["l2_unconfirmed"] > gone["l2_unconfirmed"], (gone, held)
     finally:
         await command(r.target, r.session, "nft", "delete", "table", "bridge", FILTER_TABLE,
                       check=False)
@@ -744,3 +779,167 @@ print('sent')
     finally:
         result = await run
     assert result.rc == 0 and "sent" in result.stdout, result.stdout
+
+
+@contextlib.asynccontextmanager
+async def _br_netfilter(r, call, vlan_tagged=True):
+    """br_netfilter loaded, as Docker loads it, handing the IP frames the
+    bridge forwards to the IP hooks with `call` 1 -- Docker's setting -- or
+    not with 0, OpenWrt's own at boot; and an inet forward chain accepting
+    all, as Docker's FORWARD and fw4's forward are. Unloaded after.
+
+    Every pair on this rig leaves one port tagged, and br_netfilter hands a
+    frame the bridge tags on its way out to the IP forward and postrouting
+    hooks only with bridge-nf-filter-vlan-tagged on, which `vlan_tagged`
+    sets: a case whose rules must see every frame needs it. Without it such
+    a frame meets only prerouting, as on an OpenWrt LAN with a tagged trunk
+    to an access point."""
+    async def dut(*argv, check=True):
+        return await command(r.target, r.session, *argv, check=check)
+
+    await dut("modprobe", "br_netfilter")
+    try:
+        await dut("sysctl", "-w", f"{BRNF_VLAN}={int(vlan_tagged)}")
+        for name in BRNF_SYSCTLS:
+            await dut("sysctl", "-w", f"{name}={call}")
+        await dut("nft", f"add table inet {FILTER_TABLE}")
+        await dut("nft", f"add chain inet {FILTER_TABLE} forward {{ type filter hook forward "
+                         f"priority 0 ; policy accept ; }}")
+        yield dut
+    finally:
+        await dut("nft", "delete", "table", "inet", FILTER_TABLE, check=False)
+        for name in (*BRNF_SYSCTLS, BRNF_VLAN):
+            await dut("sysctl", "-w", f"{name}=0", check=False)
+        await dut("rmmod", "br_netfilter", check=False)
+
+
+
+@pytest.mark.parametrize("l2_rig", ["access", "vlanport"], indirect=True)
+@pytest.mark.parametrize("vlan_tagged", [True, False], ids=["filter-tagged", "prerouting-only"])
+async def test_l2_br_netfilter_carried(l2_rig, vlan_tagged):
+    """With br_netfilter handing bridged frames to the IP hooks, as on a box
+    running Docker, a pair is carried once a frame of it is seen leaving after
+    every one of them (A387) -- and at line rate, as auto_bridge carried it in
+    1.0.7. The pairs made before br_netfilter came were judged by no IP rule:
+    they go, and come back confirmed. "prerouting-only" leaves
+    bridge-nf-filter-vlan-tagged off: the station's frames, tagged on their
+    way out, meet only prerouting, and their connection is never confirmed in
+    conntrack, which must not keep them in software."""
+    r = l2_rig
+    await _exchange(r, count=4)
+    before = await _carried(r)
+    async with _br_netfilter(r, call=1, vlan_tagged=vlan_tagged):
+        state = await _carried(r, timeout=15, since=before)
+        r.record("l2-brnf-carried", state)
+        assert state["l2_hook_kinds"] == HOOK_BRNF and state["l2_confirming"] == 1, state
+        record = await _rate(r, upload=True, seconds=15)
+        assert record["settled"]["bits_per_second"] >= MIN_RATE, \
+            (record["settled"], MIN_RATE)
+
+
+async def test_l2_br_netfilter_rules(l2_rig):
+    """Under br_netfilter the IP rules decide a pair as they decide its frames
+    in software (A387): a rule added under a carried pair takes it back within
+    a pass, so the rule applies -- the frames it drops never reach the peer --
+    and the pair is not carried again while the rule stands; once the rule
+    goes, it is."""
+    r = l2_rig
+    async with _br_netfilter(r, call=1) as dut:
+        await _exchange(r, count=4)
+        carried = await _carried(r, timeout=15)
+        await dut("nft", f"add rule inet {FILTER_TABLE} forward {DROP}")
+        gone = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+        assert gone["l2_ruleset_changes"] > carried["l2_ruleset_changes"], (carried, gone)
+        assert _received(await _exchange(r, count=20)) == 0
+        await asyncio.sleep(2.5)
+        held = await r.state()
+        r.record("l2-brnf-rules", {"carried": carried, "gone": gone, "held": held})
+        assert not _pairs(r, held), held["l2flows"]
+        assert held["l2_unconfirmed"] > gone["l2_unconfirmed"], (gone, held)
+        await dut("nft", "flush", "chain", "inet", FILTER_TABLE, "forward")
+        await _carried(r, timeout=15)
+
+
+async def test_l2_br_netfilter_turned_on(l2_rig):
+    """OpenWrt boots with bridge-nf-call-iptables at 0, and Docker sets it to
+    1. A pair carried while its frames met no IP rule is taken back once they
+    do (patch 172 counts the change, which nothing else reports), so a rule
+    that applies to them from then on -- here, one dropping them -- applies
+    to the pair too."""
+    r = l2_rig
+    async with _br_netfilter(r, call=0) as dut:
+        await dut("nft", f"add rule inet {FILTER_TABLE} forward {DROP}")
+        await _exchange(r, count=4)
+        carried = await _carried(r, timeout=15)
+        assert carried["l2_hook_kinds"] == HOOK_BRNF, carried
+        await dut("sysctl", "-w", f"{BRNF_SYSCTLS[0]}=1")
+        gone = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+        r.record("l2-brnf-turned-on", {"carried": carried, "gone": gone})
+        assert gone["l2_ruleset_changes"] > carried["l2_ruleset_changes"], (carried, gone)
+        assert _received(await _exchange(r, count=20)) == 0
+        assert not _pairs(r, await r.state())
+
+
+async def _reload_adapter(r):
+    """The adapter unloaded and loaded again, which registers its hooks after
+    every one registered now, and the ports bound again: Linux replays no
+    flowtable binding to a module that registers later."""
+    con = Console.target(log_path=str(artifact_dir() / "l2-reload-uart.log"))
+    try:
+        await asyncio.to_thread(con.login, "root", None)
+        await console_command(con, "rmmod", "ask_flowtable", timeout=25)
+        await console_command(con, "modprobe", "ask_flowtable")
+    finally:
+        con.close()
+    # A fresh adapter counts errors from zero.
+    HEALTH_BASELINE["errors"] = (await r.state())["errors"]
+    await _bind(r)
+
+
+async def test_l2_br_netfilter_loaded_first(l2_rig):
+    """br_netfilter loaded before the adapter, as a box that loads every
+    module at boot may order them: its POST_ROUTING hook then runs after the
+    bridge confirmation hook, which leaves it the frames it takes to the IP
+    hooks, and the IP confirmation hooks confirm them there. A drop at IP
+    postrouting, which such a frame meets only after the bridge hook, proves
+    the bridge hook left them: the pairs go and stay out."""
+    r = l2_rig
+    async with _br_netfilter(r, call=1) as dut:
+        await _reload_adapter(r)
+        await _exchange(r, count=4)
+        state = await _carried(r, timeout=15)
+        assert state["l2_hook_kinds"] == HOOK_BRNF and state["l2_confirming"] == 1, state
+        await dut("nft", f"add chain inet {FILTER_TABLE} post {{ type filter hook postrouting "
+                         f"priority 0 ; policy accept ; }}")
+        await dut("nft", f"add rule inet {FILTER_TABLE} post {DROP}")
+        gone = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+        assert _received(await _exchange(r, count=20)) == 0
+        await asyncio.sleep(2.5)
+        held = await r.state()
+        r.record("l2-brnf-first", {"carried": state, "gone": gone, "held": held})
+        assert not _pairs(r, held), held["l2flows"]
+
+
+async def test_l2_hook_after_confirmation(l2_rig):
+    """A bridge chain that runs after the confirmation hook -- registered
+    before the adapter at the last priority, which netfilter then runs after
+    it -- could drop or mark a frame already confirmed: while it exists, no
+    pair is carried; once it goes, they are."""
+    r = l2_rig
+    await command(r.target, r.session, "nft", f"add table bridge {FILTER_TABLE}")
+    try:
+        await command(r.target, r.session, "nft",
+                      f"add chain bridge {FILTER_TABLE} post {{ type filter hook postrouting "
+                      f"priority 2147483647 ; policy accept ; }}")
+        await _reload_adapter(r)
+        await _exchange(r, count=20)
+        await asyncio.sleep(2.5)
+        await _exchange(r, count=20)
+        state = await r.state()
+        r.record("l2-hook-after", state)
+        assert state["l2_hook_kinds"] == HOOK_NFT | HOOK_OTHER, state
+        assert not _pairs(r, state), state["l2flows"]
+    finally:
+        await command(r.target, r.session, "nft", "delete", "table", "bridge", FILTER_TABLE,
+                      check=False)
+    await _carried(r)

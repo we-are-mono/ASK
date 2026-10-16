@@ -646,7 +646,8 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
         worker.index("ft_mr_watch_arm(target, &plan)") < \
         worker.index("state = ft_mr_admit(target, &plan)") < worker.index("same = installed &&")
     admit = function(source, "ft_mr_admit")
-    assert "ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING))" in admit
+    # br_netfilter passes a routed copy untouched: it has no physoutdev.
+    assert "ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING))" in admit
     assert "if (ft_mr_observer_followed(g->family) || ft_mr_bpf_hooked(g->family))" in admit
     assert "return FT_MR_UNCONFIRMED;" in admit and "ft_mr_watch_complete(g->watch)" in admit
     # A ruleset commit is looked for while any group exists, and a settling

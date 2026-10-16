@@ -429,6 +429,31 @@ async def test_routed(bridge_rig):
     r.record("bridge-routed", {"flows": flows, "delta": delta})
 
 
+@pytest.mark.parametrize("bridge_rig", ["openwrt"], indirect=True)
+async def test_routed_br_netfilter(bridge_rig):
+    """br_netfilter, as Docker loads it, hands the frames a bridge forwards
+    between its ports to the IP hooks, and passes a routed frame leaving by
+    the bridge untouched: it never had a physoutdev. So routed flows through
+    the bridge stay in hardware while it is loaded (A387), as they did in
+    1.0.7, where 1.1.0 kept them in software."""
+    r = bridge_rig
+    sysctls = ("net.bridge.bridge-nf-call-iptables", "net.bridge.bridge-nf-call-ip6tables")
+    await command(r.target, r.session, "modprobe", "br_netfilter")
+    try:
+        for name in sysctls:
+            await command(r.target, r.session, "sysctl", "-w", f"{name}=1")
+        flows, delta = await _established(r)
+        forward = _direction(flows, r.lan_ip, WAN_IP)
+        reverse = _direction(flows, WAN_IP, r.lan_ip)
+        _assert_ports(r, forward, reverse)
+        assert all(d == 64 for d in delta.values()), delta
+        r.record("bridge-routed-br-netfilter", {"flows": flows, "delta": delta})
+    finally:
+        for name in sysctls:
+            await command(r.target, r.session, "sysctl", "-w", f"{name}=0", check=False)
+        await command(r.target, r.session, "rmmod", "br_netfilter", check=False)
+
+
 @pytest.mark.parametrize("bridge_rig", ["openwrt-wan"], indirect=True)
 async def test_bridged_both_sides(bridge_rig):
     """A bridge on each side: OpenWrt's br-lan, and a bridged WAN whose address

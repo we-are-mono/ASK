@@ -1770,7 +1770,9 @@ static void cond_resched(void) { assert(!cdx_info->ctrl.mutex); reschedules++; }
 #define NF_BR_LOCAL_OUT 3
 #define NF_BR_POST_ROUTING 4
 static unsigned bridge_hooks;
-static bool ft_bridge_hooked(unsigned hooks) { return bridge_hooks & hooks; }
+/* A bridge hook a routed frame leaving by the bridge crosses: br_netfilter's
+ * pass it untouched, so these are anything else. */
+static bool ft_bridge_hooked_routed(unsigned hooks) { return bridge_hooks & hooks; }
 #include "flowtable_production.inc"
 
 /* Most cases drive admission and removal directly, standing in for the rule

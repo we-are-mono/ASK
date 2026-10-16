@@ -511,7 +511,8 @@ def test_a_bridge_filter_hook_keeps_bridged_multicast_in_software(tmp_path):
     and the worker asks at every pass because nothing announces a hook."""
     source = flowtable_source()
     (tmp_path / "mcast_bridge_filter.inc").write_text(
-        function(source, "ft_bridge_hooked") + function(source, "ft_mc_bridge_filtered")
+        function(source, "ft_bridge_hook_kinds") + function(source, "ft_bridge_hooked")
+        + function(source, "ft_bridge_hooked_routed") + function(source, "ft_mc_bridge_filtered")
         + function(source, "ft_dev_nf_ingress_hooked"))
     binary = tmp_path / "mcast_bridge_filter"
     run_process([

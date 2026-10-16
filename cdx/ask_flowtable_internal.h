@@ -892,7 +892,16 @@ void ft_mc_supersede(const struct ft_mc_seen *seen);
 void ft_mc_flow_seen(const struct ft_mc_flow *f,
 		     const struct ft_mc_stream *shape,
 		     struct ft_mc_seen *seen);
+#define FT_BRIDGE_HOOK_NFT	BIT(0)
+#define FT_BRIDGE_HOOK_BRNF	BIT(1)
+#define FT_BRIDGE_HOOK_OTHER	BIT(2)
+unsigned int ft_bridge_hook_kinds(unsigned int hooks);
 bool ft_bridge_hooked(unsigned int hooks);
+bool ft_bridge_hooked_routed(unsigned int hooks);
+/* Whether a netfilter BPF program runs at the family's prerouting, forward or
+ * postrouting hook (ask_flowtable_mr_probe.c); the bridged unicast learner
+ * asks it too, of the frames br_netfilter hands there. */
+bool ft_mr_bpf_hooked(u8 family);
 
 /* The bridged unicast learner (ask_flowtable_l2.c). */
 int ft_l2_init(void);

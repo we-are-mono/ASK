@@ -17,6 +17,14 @@ bridge-family `LOCAL_OUT` or `POST_ROUTING` hook is registered. Hardware sends
 directly to the port queue and cannot execute those hooks. The software
 flowtable's neighbour output traverses the bridge and applies them.
 
+br_netfilter's hooks, which Docker loads, do not count (A387). They hand the
+frames a bridge forwards between its ports to the IP hooks; a routed frame
+leaving by the bridge has no `physoutdev`, and `br_nf_post_routing()` passes it
+untouched. Patch 172 labels them (`NF_HOOK_OP_BR_NETFILTER`) so the adapter can
+tell them from an nftables chain or an ebtables table, which still count.
+`test_routed_br_netfilter` holds both directions of a routed flow in hardware
+with br_netfilter loaded and `bridge-nf-call-iptables` on.
+
 The adapter rechecks these hooks on each installed offer and statistics poll.
 If a hook appears after admission, it retires the flow generation, including
 its other hardware direction. This follows the flowtable polling cadence;
@@ -359,9 +367,64 @@ can arrive is what the physical port's MAC accepts, so the egress port's MTU
 is held to that, not to a VLAN device's on the way in. Two VLAN devices of one
 physical port share its key, so the same pair through a second one stays in
 software. The rig runs pairs through a VLAN-device port alone ("vlanport") and
-tagged for the bridge's VLAN as well ("vlanport-trunk", two tags each way). While any bridge-family hook other than the learners' own
-is registered -- an nftables or ebtables chain, br_netfilter -- no pair is
-carried, exactly as for a bridged routed flow.
+tagged for the bridge's VLAN as well ("vlanport-trunk", two tags each way).
+
+**Bridge hooks.** A bridge-family hook can drop, mark or translate a
+forwarded frame, and an entry forwards where none of them runs. With none
+registered but the learners' own, a pair is carried on sight. With hooks whose
+rules the adapter can follow -- an nftables bridge chain, and br_netfilter
+handing bridged frames to the IP hooks, as on a box running Docker -- a pair is
+carried only once one of its frames has been seen leaving after every one of
+them, as auto_bridge learned only from frames that had passed the filters
+(A387). The confirmation is taken at the bridge's last `POST_ROUTING` hook; a
+frame br_netfilter takes to the IP hooks never comes back to the bridge's, so
+for those it is taken at IP `POST_ROUTING`, last, by hooks registered only while
+br_netfilter is; anything registered to run after either one keeps every pair
+in software. The frame must belong to no connection, or to one nothing
+translates (its NAT is decided by then), no helper reads and no sequence
+adjustment rewrites, as for a routed flow. It must leave by the port the bridge
+forwards the pair to when it is admitted, tagged as the entry will tag it, so a
+frame of the same stations in another VLAN confirms nothing. A group's frame
+confirms nothing either, including the unicast copy `multicast_to_unicast`
+makes of it, and neither does a PPPoE session's payload that br_netfilter hands
+on as IP.
+
+It must also have been judged by the rules in force. Every confirmation reads
+the nftables generation, the x_tables change count (patch 148) and
+br_netfilter's own change count: its `bridge-nf-*` sysctls and each bridge's
+`nf_call_*` options decide which bridged frames meet the IP rules at all, and
+nothing else reports them changing (patch 172). Any change, or a hook coming or
+going, stops confirmations, forgets them, and takes back at the next pass every
+pair made under the old rules; confirmations resume once the rules have stood
+still for half a second. So a rule added under a carried pair applies within a
+pass, and OpenWrt's boot setting (`bridge-nf-call-iptables` 0), turned on by
+Docker, takes back the pairs no IP rule had judged. A netfilter BPF program at
+the IP hooks, whose changes nothing counts, keeps every pair in software while
+br_netfilter hands frames there. A pair is queued in the
+class its connection's mark gives, as a routed flow is and as the software path
+queues its frames (auto_bridge copied the packet's mark). As with auto_bridge,
+one entry carries every frame of a pair: what the rules decide about one
+conversation between two stations, the entry applies to all of them.
+
+A hook the adapter cannot follow -- an ebtables table, whose changes nothing
+reports, bridge conntrack, any other module, or anything registered to run
+after a confirmation hook -- keeps every pair in software. `/proc` reports
+`l2_hook_kinds` (1 nftables, 2 br_netfilter, 4 other), `l2_confirming`,
+`l2_unconfirmed` (observations that waited for a confirmation) and
+`l2_ruleset_changes`.
+
+What the confirmation cannot follow is any rule whose verdict changes while
+the ruleset stands still: an ipset, a `time`, `limit`, `quota` or `recent`
+match, an nftables meter. Their verdict on the confirmed frame holds for the
+pair until it idles or the ruleset changes. A rule that rewrites the frame --
+DSCP, TTL, TCP MSS -- rewrites the frames that reach Linux, never the pair's
+in hardware, and a frame queued to userspace (`NFQUEUE`, nftables `queue`)
+confirms the pair once accepted, so an inspector there sees only the first
+frames: auto_bridge behaved the same on all three counts. A frame br_netfilter
+hands only to prerouting -- one the bridge tags on its way out, unless
+`bridge-nf-filter-vlan-tagged` is on -- is judged by prerouting alone, in
+software as in hardware, and its connection is never confirmed in conntrack;
+it confirms its pair all the same, as the forward rules never see it either.
 
 The learner publishes a pair where events can mark it before it asks the
 bridge the last time and builds the entry, so nothing the bridge does in
@@ -413,13 +476,34 @@ with the WAN in VLAN 1 of the same bridge. Both pairs are listed with the tag
 rewrite each needs; a ping burst moves both pairs' counters by every frame
 while the DUT transmits none; four TCP streams run at 9.37-9.39 Gbit/s each
 way in both shapes with the DUT ~5% busy, for longer than a shortened FDB
-ageing time with nothing retired; an FDB delete, an idle pair and a bridge
-chain each take the pairs out, and they come back. Frames injected with a
+ageing time with nothing retired; an FDB delete and an idle pair each take
+the pairs out, and they come back. Frames injected with a
 pair's addresses in every form the bridge would not forward to the far end --
 untagged, tagged where the entry expects none, tagged in another VLAN -- are
 counted at the far end: none arrives, every one reaches Linux on the ingress.
 The entry's counters are no evidence there: they count a key's matches,
 including the frames its check then hands up.
+
+With br_netfilter loaded and an inet `forward` chain, as Docker has them, the
+pairs come back confirmed and run at 9.39 Gbit/s in both the access and the
+VLAN-device shapes, the DUT 4-5% busy (`test_l2_br_netfilter_carried`). A drop
+rule added under carried pairs takes them out within a pass and the frames it
+drops never reach the peer, and the pairs return once it goes
+(`test_l2_br_netfilter_rules`); pairs carried with `bridge-nf-call-iptables` at
+0 go the moment it is set to 1 under such a rule
+(`test_l2_br_netfilter_turned_on`). Every pair on the rig leaves one port
+tagged, which br_netfilter hands to the IP forward and postrouting hooks only
+with `bridge-nf-filter-vlan-tagged` on, so the cases whose rules must see every
+frame set it; `test_l2_br_netfilter_carried[prerouting-only]` leaves it off, as
+an OpenWrt LAN with a tagged trunk to an access point has it. br_netfilter
+loaded before the adapter, so that its `POST_ROUTING` hook runs after the
+bridge confirmation hook, is confirmed through the IP hooks all the same
+(`test_l2_br_netfilter_loaded_first`); a bridge chain at the last priority
+registered before the adapter, which runs after the confirmation, keeps every
+pair in software until it goes (`test_l2_hook_after_confirmation`). An
+nftables bridge chain alone is followed as br_netfilter is: the pairs come back
+confirmed, a drop rule added under them takes them out
+(`test_l2_bridge_chain_rules`).
 
 ## What this does not carry
 

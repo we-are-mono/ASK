@@ -1801,7 +1801,7 @@ static bool ft_tunnel_inbound_allowed(const struct cdx_ft_tunnel *tunnel)
 static bool ft_bridge_egress_filtered(const struct cdx_ft_rule *rule)
 {
 	return rule->out_bridge &&
-	       ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING));
+	       ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING));
 }
 
 /* Exact masks preserve every selector. Native flowtables supply routing

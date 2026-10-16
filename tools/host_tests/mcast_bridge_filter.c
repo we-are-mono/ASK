@@ -44,14 +44,22 @@ enum {
     NF_BR_NUMHOOKS,
 };
 
-/* As include/linux/netfilter.h has them in 6.12: an nftables base chain is
- * NF_TABLES, a netfilter BPF link BPF, and a flowtable's hook is left
- * UNDEFINED -- the label for it came later. */
+/* As include/linux/netfilter.h has them in 6.12 with patches 148 and 172:
+ * an nftables base chain is NF_TABLES, a netfilter BPF link BPF, an x_tables
+ * table XTABLES, br_netfilter's bridge hooks BR_NETFILTER, and a flowtable's
+ * hook is left UNDEFINED -- the label for it came later. */
 enum nf_hook_ops_type {
     NF_HOOK_OP_UNDEFINED,
     NF_HOOK_OP_NF_TABLES,
     NF_HOOK_OP_BPF,
+    NF_HOOK_OP_XTABLES,
+    NF_HOOK_OP_NAT,
+    NF_HOOK_OP_BR_NETFILTER,
 };
+/* As ask_flowtable_internal.h has them. */
+#define FT_BRIDGE_HOOK_NFT BIT(0)
+#define FT_BRIDGE_HOOK_BRNF BIT(1)
+#define FT_BRIDGE_HOOK_OTHER BIT(2)
 struct nf_hook_ops { int priority; enum nf_hook_ops_type hook_ops_type; };
 struct nf_hook_entry { void *hook; void *priv; };
 /* The entries, then the trailer of each one's registering ops, as
@@ -71,7 +79,9 @@ static struct {
     struct { struct nf_hook_entries *hooks_bridge[NF_BR_NUMHOOKS - 1]; } nf;
 } init_net;
 
-static struct nf_hook_ops ft_mc_hook_ops, ft_l2_hook_ops, nft_chain, ebtables, br_netfilter;
+static struct nf_hook_ops ft_mc_hook_ops, ft_l2_hook_ops, ebtables;
+static struct nf_hook_ops nft_chain = { .hook_ops_type = NF_HOOK_OP_NF_TABLES };
+static struct nf_hook_ops br_netfilter = { .hook_ops_type = NF_HOOK_OP_BR_NETFILTER };
 /* The bridged unicast learner's observer, as ask_flowtable_l2.c answers. */
 static bool ft_l2_hook_is(const struct nf_hook_ops *ops) { return ops == &ft_l2_hook_ops; }
 /* At a device's own netdev hooks: an nftables netdev chain, or an inet one at
@@ -191,6 +201,23 @@ int main(void)
     assert(!ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)));
     registered(NF_BR_POST_ROUTING, 1, &br_netfilter);
     assert(ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)));
+    /* Which br_netfilter's are not, for a routed copy: it has no physoutdev,
+     * and br_nf_post_routing() passes it untouched. Anything else is. */
+    assert(!ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)));
+    registered(NF_BR_LOCAL_OUT, 1, &ebtables);
+    assert(ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)));
+    registered(NF_BR_LOCAL_OUT, 1, &nft_chain);
+    assert(ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)));
+    registered(NF_BR_LOCAL_OUT, 0);
+
+    /* Each kind told apart, the learners' own hooks none. */
+    registered(NF_BR_FORWARD, 3, &ft_mc_hook_ops, &ft_l2_hook_ops, &br_netfilter);
+    assert(ft_bridge_hook_kinds(BIT(NF_BR_FORWARD)) == FT_BRIDGE_HOOK_BRNF);
+    registered(NF_BR_FORWARD, 2, &nft_chain, &br_netfilter);
+    assert(ft_bridge_hook_kinds(BIT(NF_BR_FORWARD)) ==
+           (FT_BRIDGE_HOOK_NFT | FT_BRIDGE_HOOK_BRNF));
+    registered(NF_BR_FORWARD, 1, &ebtables);
+    assert(ft_bridge_hook_kinds(BIT(NF_BR_FORWARD)) == FT_BRIDGE_HOOK_OTHER);
 
     for (unsigned int i = 0; i < ARRAY_SIZE(init_net.nf.hooks_bridge); i++)
         registered(i, 0);

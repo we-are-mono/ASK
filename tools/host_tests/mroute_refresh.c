@@ -186,6 +186,12 @@ static bool ft_bridge_hooked(unsigned int hooks)
             (hooks & (BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)))) ||
            (bridge_in_hooked && (hooks & BIT(NF_BR_LOCAL_IN)));
 }
+/* The output's hooks a routed copy crosses: br_netfilter's pass it
+ * untouched, so these stand for anything else. */
+static bool ft_bridge_hooked_routed(unsigned int hooks)
+{
+    return ft_bridge_hooked(hooks);
+}
 /* An nftables chain or BPF program running after the observer at
  * POST_ROUTING, which mroute_confirm_order.c finds in the real hook lists. */
 static bool observer_followed;

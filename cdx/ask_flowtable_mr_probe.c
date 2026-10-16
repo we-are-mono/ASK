@@ -475,9 +475,10 @@ static bool ft_mr_observer_followed(u8 family)
 /* Whether a netfilter BPF program runs where the family's copies pass:
  * prerouting, forward or postrouting. Like a chain it can judge a copy by its
  * ports, and neither port walk can read it, so while one is attached every
- * group of the family stays in software. Asked of the hook lists themselves,
- * under RCU: nothing reports a link attached or released. */
-static bool ft_mr_bpf_hooked(u8 family)
+ * group of the family stays in software, and the bridged unicast learner
+ * carries no pair br_netfilter hands there. Asked of the hook lists
+ * themselves, under RCU: nothing reports a link attached or released. */
+bool ft_mr_bpf_hooked(u8 family)
 {
 	static const u8 hooks[] = {
 		NF_INET_PRE_ROUTING, NF_INET_FORWARD, NF_INET_POST_ROUTING,
@@ -813,8 +814,10 @@ enum ft_mr_state ft_mr_admit(struct ft_mr_group *g,
 	enum ft_mr_state why;
 	int rc;
 
+	/* Routed into the bridge, so br_netfilter's hooks pass the copies
+	 * untouched, as they pass a routed unicast flow's. */
 	if (plan->out_bridged &&
-	    ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)))
+	    ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)))
 		return FT_MR_REFUSED_FILTER;
 	if (plan->via && ft_bridge_hooked(BIT(NF_BR_LOCAL_IN)))
 		return FT_MR_REFUSED_FILTER;

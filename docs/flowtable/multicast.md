@@ -663,11 +663,10 @@ Some hooks never go away once they appear, and keep bridged multicast in
 software for the rest of the boot: `br_netfilter` once loaded (Docker and
 libvirt load it), an ebtables table once anything has listed or used it, and
 an nftables bridge base chain even when it is empty with an accept policy.
-`br_netfilter` counts whether or not `bridge-nf-call-iptables` is set. Its
-per-namespace sysctls live in its own private state and the per-bridge option
-in the bridge's, neither of which a module can read, and its hooks cannot be
-told from an nftables chain at the same priority; the setting also defaults to
-on. A host that wants bridged multicast offloaded unloads it.
+`br_netfilter` counts whether or not `bridge-nf-call-iptables` is set: the
+bridged unicast learner confirms a pair against the IP rules it hands frames to
+([bridge hooks](bridge.md#switching-between-two-ports)), but this learner does
+not (A389). A host that wants bridged multicast offloaded unloads it.
 
 **What runs on the ports themselves.** A bridge port's frames cross more than
 the bridge's hooks. tc runs on every port's way in and way out, and so does

@@ -367,39 +367,62 @@ static struct nf_hook_ops ft_mc_hook_ops = {
 	.priority = NF_BR_PRI_LAST,
 };
 
-/* Whether a bridge hook that could decide a frame's fate is registered in
- * init_net at any of `hooks`, a mask of NF_BR_* bits. The bridged learners'
- * own are not: they only observe. Asked of the hook lists themselves, which
- * cost a few loads under RCU: no event says a hook was registered. */
-bool ft_bridge_hooked(unsigned int hooks)
+/* The kinds of bridge hook registered in init_net at any of `hooks`, a mask
+ * of NF_BR_* bits, as FT_BRIDGE_HOOK_* bits. The bridged learners' own are not
+ * counted: they only observe. An nftables chain and br_netfilter are kinds
+ * whose rules the adapter can follow -- an nftables commit moves its
+ * generation, and br_netfilter hands frames to the IP hooks, whose rules move
+ * that generation or the x_tables count (patch 172 labels its ops). Any other
+ * -- an ebtables table, a module of unknown purpose -- is not. Asked of the
+ * hook lists themselves, which cost a few loads under RCU: no event says a
+ * hook was registered. */
+unsigned int ft_bridge_hook_kinds(unsigned int hooks)
 {
+	unsigned int kinds = 0;
 #if IS_ENABLED(CONFIG_NETFILTER_FAMILY_BRIDGE)
 	const struct nf_hook_entries *e;
 	struct nf_hook_ops **ops;
-	bool hooked = false;
 	unsigned int i, j;
 
 	rcu_read_lock();
 	/* The array's own bound: it has NF_INET_NUMHOOKS slots, one fewer than
 	 * NF_BR_NUMHOOKS counts, since BROUTING is no netfilter hook. */
-	for (i = 0; i < ARRAY_SIZE(init_net.nf.hooks_bridge) && !hooked; i++) {
+	for (i = 0; i < ARRAY_SIZE(init_net.nf.hooks_bridge); i++) {
 		if (!(hooks & BIT(i)))
 			continue;
 		e = rcu_dereference(init_net.nf.hooks_bridge[i]);
 		if (!e)
 			continue;
 		ops = nf_hook_entries_get_hook_ops(e);
-		for (j = 0; j < e->num_hook_entries; j++)
-			if (ops[j] != &ft_mc_hook_ops && !ft_l2_hook_is(ops[j])) {
-				hooked = true;
-				break;
-			}
+		for (j = 0; j < e->num_hook_entries; j++) {
+			if (ops[j] == &ft_mc_hook_ops || ft_l2_hook_is(ops[j]))
+				continue;
+			if (ops[j]->hook_ops_type == NF_HOOK_OP_NF_TABLES)
+				kinds |= FT_BRIDGE_HOOK_NFT;
+			else if (ops[j]->hook_ops_type == NF_HOOK_OP_BR_NETFILTER)
+				kinds |= FT_BRIDGE_HOOK_BRNF;
+			else
+				kinds |= FT_BRIDGE_HOOK_OTHER;
+		}
 	}
 	rcu_read_unlock();
-	return hooked;
-#else
-	return false;
 #endif
+	return kinds;
+}
+
+/* Whether a bridge hook that could decide a frame's fate is registered at any
+ * of `hooks`. */
+bool ft_bridge_hooked(unsigned int hooks)
+{
+	return ft_bridge_hook_kinds(hooks);
+}
+
+/* The same question for a frame routed through a bridge rather than bridged
+ * by it: br_netfilter's hooks pass such a frame untouched -- it never had a
+ * physoutdev (br_nf_post_routing()) -- so they do not count. */
+bool ft_bridge_hooked_routed(unsigned int hooks)
+{
+	return ft_bridge_hook_kinds(hooks) & ~FT_BRIDGE_HOOK_BRNF;
 }
 
 /* Whether netfilter runs a chain on what `dev` receives, at its own netdev

@@ -63,6 +63,7 @@ IMAGE_INSTALL = " \
     kernel-module-ip6table-filter \
     kernel-module-ip6table-mangle \
     kernel-module-ip6t-npt \
+    kernel-module-br-netfilter \
     dnsmasq \
     lmsensors-sensors \
     \
