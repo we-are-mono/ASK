@@ -159,21 +159,13 @@ result independently of those temporary files.
   its pairs against the rules br_netfilter hands frames to (A387). Next: confirm a bridged group's copies the same
   way, and exempt br_netfilter at `LOCAL_IN` for a routed group's source.
 
-- [ ] **A388 — under br_netfilter, an fw4-style `flow add` takes bridged connections into the software flowtable.**
-  With `bridge-nf-call-iptables` on, a bridged frame crosses the inet `forward` chain, and `nft_flow_offload_eval()`
-  has no check for br_netfilter's fake route (`DST_FAKE_RTABLE`), so the connection is marked `[OFFLOAD]` and given a
-  flowtable entry built from that route. The entry never matches: on a vlan-filtering bridge and on a plain one (the
-  DUT on-link in the stations' subnet, hardware pairs refused so the CPU forwarded everything), every frame reached
-  both ends with TTL 64 and the stations' own MACs, and the adapter was never offered it. The cost is churn -- an entry
-  per bridged connection, rebuilt as it expires -- and conntrack timeouts handed to a flowtable that carries nothing.
-  Not ASK's own: any OpenWrt box running Docker with flow offloading has it, and upstream lacks the check too. Next:
-  low priority; the fix is one test in `nft_flow_offload_skip()`.
+- [x] **A388 — under br_netfilter, fw4's `flow add` took bridged connections into a flowtable that never carried
+  them.** Patch 173 skips a packet whose route is br_netfilter's placeholder
+  (_:/^flowtable: keep bridged connections out of the software flowtable_).
 
-- [x] **A387 — with br_netfilter loaded (Docker loads it), no flow leaving through a bridge was offloaded; 1.0.7
-  offloaded them.** Patch 172 labels br_netfilter's hooks and counts its setting changes. A routed flow ignores them,
-  since br_netfilter passes a routed frame untouched. A bridged pair is carried once one of its frames is seen leaving
-  after every hook, under the rules in force, and goes back at any rule change, as auto_bridge learned only after the
-  filters (_:/^flowtable: carry bridged traffic past br_netfilter_).
+- [x] **A387 — with br_netfilter loaded (Docker loads it), no flow leaving through a bridge was offloaded.** Routed
+  flows now ignore its hooks, and a bridged pair is carried once a frame of it has passed them all
+  (_:/^flowtable: carry bridged traffic past br_netfilter_).
 
 - [ ] **A386 — transit ESP, GRE, IPIP and IPv6-in-IPv4 are forwarded in software; 1.0.7 offloaded them.** CMM
   registered those conntrack entries too (`SUPPORTED_LOCAL_PROTO` in `cmm/src/conntrack.h@mono-1.0.7`); Netfilter's

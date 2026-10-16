@@ -112,6 +112,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://170-ipv6-hop-limit-checksum-complete.patch \
            file://171-sdk_dpaa-rx-max-frame-bridged-vlan.patch \
            file://172-br_netfilter-label-hooks-and-count-changes.patch \
+           file://173-netfilter-nft_flow_offload-skip-br_netfilter-frames.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

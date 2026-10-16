@@ -1,0 +1,49 @@
+From 45e42418f1fea26efb053e9248e3bea8d4ede92a Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sat, 17 Oct 2026 01:14:39 +0200
+Subject: [PATCH] netfilter: nft_flow_offload: skip frames br_netfilter bridges
+
+With bridge-nf-call-iptables set, as Docker sets it, br_netfilter hands
+the frames a bridge forwards between its ports to the IP forward hook,
+where a ruleset that offloads every TCP and UDP connection -- OpenWrt's
+fw4 does -- runs `flow add` on them. Their route is br_netfilter's
+placeholder for the bridge, not a route anything forwards by: the flow
+built on it is never matched, yet it marks the conntrack offloaded,
+hands its timeout to the flowtable, turns off its TCP window checks,
+and is rebuilt each time it expires.
+
+Skip a packet whose route is that placeholder, as one carrying a
+security path or IP options is skipped.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ net/netfilter/nft_flow_offload.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index 95d631ab80be..f4212a82c8f5 100644
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -407,9 +407,19 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+ 
+ static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
+ {
++	const struct dst_entry *dst = skb_dst(skb);
++
+ 	if (skb_sec_path(skb))
+ 		return true;
+ 
++	/* A frame br_netfilter hands to the IP hooks is bridged, not routed:
++	 * its route is the bridge's placeholder, which nothing forwards by.
++	 * A flow built on it is never matched, and only takes the conntrack
++	 * from conntrack and its TCP window checks with it.
++	 */
++	if (dst && (dst->flags & DST_FAKE_RTABLE))
++		return true;
++
+ 	if (family == NFPROTO_IPV4) {
+ 		const struct ip_options *opt;
+ 
+-- 
+2.47.3
+

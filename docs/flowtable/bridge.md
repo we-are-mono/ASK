@@ -406,6 +406,13 @@ queues its frames (auto_bridge copied the packet's mark). As with auto_bridge,
 one entry carries every frame of a pair: what the rules decide about one
 conversation between two stations, the entry applies to all of them.
 
+br_netfilter also hands those frames to whatever the IP forward hook runs,
+and fw4's forward chain offers every TCP and UDP connection it sees to its
+flowtable (`flow add`). A bridged frame's route there is br_netfilter's
+placeholder for the bridge, so the flow built on it is never matched, but it
+marked the conntrack offloaded, handed its timeout to the flowtable and turned
+its TCP window checks off. Patch 173 has `flow add` skip such a frame (A388).
+
 A hook the adapter cannot follow -- an ebtables table, whose changes nothing
 reports, bridge conntrack, any other module, or anything registered to run
 after a confirmation hook -- keeps every pair in software. `/proc` reports
@@ -503,7 +510,9 @@ registered before the adapter, which runs after the confirmation, keeps every
 pair in software until it goes (`test_l2_hook_after_confirmation`). An
 nftables bridge chain alone is followed as br_netfilter is: the pairs come back
 confirmed, a drop rule added under them takes them out
-(`test_l2_bridge_chain_rules`).
+(`test_l2_bridge_chain_rules`). With fw4's `flow add` in the forward chain and
+the CPU forwarding every frame, no bridged conntrack is marked offloaded
+(`test_l2_br_netfilter_flow_add`).
 
 ## What this does not carry
 

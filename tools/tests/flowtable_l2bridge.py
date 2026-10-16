@@ -943,3 +943,46 @@ async def test_l2_hook_after_confirmation(l2_rig):
         await command(r.target, r.session, "nft", "delete", "table", "bridge", FILTER_TABLE,
                       check=False)
     await _carried(r)
+
+async def _tcp(r, seconds=3):
+    """A TCP stream from the station to the peer, at a rate the CPU forwards."""
+    server = await asyncio.create_subprocess_exec(
+        "ip", "netns", "exec", NAMESPACE, "iperf3", "-s", "-1", "-B", PEER_ADDR,
+        "-p", str(IPERF_PORT), stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL)
+    try:
+        await asyncio.sleep(0.5)
+        result = await lan_run(r.lan, f"iperf3 -c {PEER_ADDR} -B {STATION_ADDR} -p {IPERF_PORT} "
+                                      f"-t {seconds} -b 20M >/dev/null && echo streamed",
+                               seconds + 20)
+        assert result.rc == 0 and "streamed" in result.stdout, result.stdout
+    finally:
+        if server.returncode is None:
+            server.terminate()
+        await server.wait()
+
+
+async def test_l2_br_netfilter_flow_add(l2_rig):
+    """fw4's forward chain offers every TCP and UDP connection it sees to its
+    flowtable (`flow add`), and under br_netfilter it sees the bridged ones
+    too. Their route is br_netfilter's placeholder, which nothing forwards
+    by: patch 173 keeps them from the flowtable, whose flow would never be
+    matched but would mark the conntrack offloaded and turn its TCP window
+    checks off (A388). A promiscuous bridge keeps the pairs in software, so
+    the CPU forwards every frame and the chain sees each one."""
+    r = l2_rig
+    async with _br_netfilter(r, call=1) as dut:
+        await dut("nft", f"add chain inet {TABLE} fw4 {{ type filter hook forward priority 0 ; "
+                         f"policy accept ; }}")
+        await dut("nft", f"add rule inet {TABLE} fw4 meta l4proto {{ tcp, udp }} flow add @fast")
+        await dut("ip", "link", "set", BRIDGE, "promisc", "on")
+        try:
+            await _tcp(r)
+            conntrack = await dut("conntrack", "-L", "-o", "extended", check=False)
+            bridged = [line for line in conntrack["stdout"].splitlines() if PEER_ADDR in line]
+            r.record("l2-brnf-flow-add", {"conntrack": bridged, "state": await r.state()})
+            assert bridged, conntrack["stdout"]
+            assert not any("OFFLOAD" in line for line in bridged), bridged
+        finally:
+            await dut("ip", "link", "set", BRIDGE, "promisc", "off", check=False)
+            await dut("nft", "delete", "chain", "inet", TABLE, "fw4", check=False)
