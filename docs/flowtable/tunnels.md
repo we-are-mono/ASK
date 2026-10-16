@@ -295,9 +295,8 @@ Beyond the rules a routed flow already satisfies:
   software: the strip's copy adds the outer ECN bits into the codepoint (A371).
 - The four Ethernet mangle words must be the tunnel's own local address,
   zero-padded, and the destination is taken from the outer next hop.
-- The device below the tunnel must share the egress port's MAC address, the
-  rule every logical device satisfies, imposed here on the device the outer
-  packet actually leaves by.
+- The outer packet's Ethernet source is the address of the device below the
+  tunnel, which it leaves by, whether or not that is the port's own.
 - A tunnel and an IPsec transform may not appear on the same flow.
 - The outer receive packet must be allowed by inbound XFRM policy without a
   transform.

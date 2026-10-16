@@ -32,6 +32,7 @@ MIN_RATE = float(os.environ.get("ASK_FLOWTABLE_IPV6_MIN_GBPS", "9")) * 1e9
 
 @pytest.mark.rfc("8200")
 @pytest.mark.parametrize("case", ["routed", "snat", "dnat"])
+@pytest.mark.parametrize("ipv6_rig", ["port", "openwrt"], indirect=True)
 async def test_udp(ipv6_rig, case):
     r = ipv6_rig
     sport, dport = PORTS[case]
@@ -102,6 +103,7 @@ async def test_udp(ipv6_rig, case):
         await _drop_tables(r)
 
 
+@pytest.mark.parametrize("ipv6_rig", ["port", "openwrt"], indirect=True)
 async def test_tcp(ipv6_rig):
     r = ipv6_rig
     sport, dport = PORTS["tcp"]

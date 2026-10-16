@@ -733,18 +733,17 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
 	 * hairpin routing. The provider rechecks physical device state. */
 	if (!ft_claimed || ft_failed || ft_observe || cdx_ft_pending() ||
 	    !cdx_ft_port_supported(rule->in) || !cdx_ft_egress_supported(rule->out) ||
-	    !ether_addr_equal(rule->src_mac, rule->out->dev_addr)) {
+	    !is_valid_ether_addr(rule->src_mac)) {
 		/* Eight clauses and one return: without the operands a refusal
 		 * here says only that CDX declined, which is the least useful
 		 * true thing it could say. */
 		ask_dbg(ASK_DBG_DEVICE,
-			"add claimed=%d failed=%d observe=%d pending=%u in=%s(%d) out=%s(%d) srcmac=%d\n",
+			"add claimed=%d failed=%d observe=%d pending=%u in=%s(%d) out=%s(%d) srcmac=%pM\n",
 			ft_claimed, ft_failed, ft_observe, cdx_ft_pending(),
 			rule->in ? netdev_name(rule->in) : "(null)",
 			cdx_ft_port_supported(rule->in),
 			rule->out ? netdev_name(rule->out) : "(null)",
-			cdx_ft_egress_supported(rule->out),
-			rule->out ? ether_addr_equal(rule->src_mac, rule->out->dev_addr) : -1);
+			cdx_ft_egress_supported(rule->out), rule->src_mac);
 		return ask_refuse(-EOPNOTSUPP);
 	}
 	rc = cdx_ft_hw_add(rule, stats, result);

@@ -20,13 +20,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 
 import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
-                       dut_vlan_subif, lan_run, lan_vlan_subif)
+                       OPENWRT_LAN_VID, dut_vlan_subif, lan_run, lan_vlan_subif,
+                       openwrt_lan, openwrt_wan)
 from _flowtable_rig import (DPORT, Echo, SPORT, WAN_IP, Rig, assert_undisturbed, command, read,
                             release_latch, stop_boot_daemon)
 from _gated_tcp import GatedTcp
@@ -81,7 +83,7 @@ def _direction(flows, source, destination):
 async def _fdb(r, mac):
     """Every bridge port this address is currently learned on."""
     entries = json.loads((await command(r.target, r.session, "bridge", "-j", "fdb",
-                                        "show", "br", BRIDGE))["stdout"])
+                                        "show", "br", r.bridge))["stdout"])
     return sorted(e["ifname"] for e in entries
                   if e["mac"] == mac and e.get("master") is not False
                   and "permanent" not in e.get("flags", []))
@@ -97,6 +99,28 @@ async def _bridged_segment(r, stack, shape):
     async def dut(*argv, check=True):
         return await command(r.target, r.session, *argv, check=check)
 
+    if shape in ("openwrt", "openwrt-vlan"):
+        # OpenWrt's own LAN: br-lan over every non-WAN port, its address
+        # the first port's, so the station's port is not the bridge's -- as a
+        # plain bridge, or VLAN-aware with the address on br-lan.1. The source
+        # of every frame towards the station is the bridge's, as it is in
+        # software, and the exchange checks it on the wire.
+        lan = await openwrt_lan(stack, r.target, r.session, lan=r.lan,
+                                vid=OPENWRT_LAN_VID if shape == "openwrt-vlan" else None)
+        r.bridge = lan["bridge"]
+        r.dut_lan_if = r.bridge_text = lan["l3"]
+        r.dut_lan_ip = lan["address"].split("/")[0]
+        r.bridge_port = TARGET_LAN_IF
+        r.peer_if, r.peer_link = LAN_NIC, LAN_NIC
+        r.dut_lan_mac = lan["lan_port_mac"]
+        r.peer_gateway_mac = lan["mac"]
+        link = json.loads(r.lan.run(f"ip -j link show dev {LAN_NIC}", timeout=10).stdout)
+        r.peer_mac = r.lan_mac = link[0]["address"]
+        addr = json.loads(r.lan.run(f"ip -j -4 addr show dev {LAN_NIC}", timeout=10).stdout)
+        r.lan_ip = next(a["local"] for a in addr[0]["addr_info"] if a["family"] == "inet")
+        return None
+
+    r.bridge = BRIDGE
     # The DUT's LAN address moves onto the bridge, so the flow's logical
     # egress device is the bridge (or a VLAN on it) rather than the port.
     lan_cidr = json.loads((await dut("ip", "-j", "-4", "addr", "show",
@@ -156,9 +180,9 @@ async def _bridged_segment(r, stack, shape):
     r.lan_ip = next(a["local"] for a in lan_json(f"ip -j -4 addr show dev {r.peer_if}")[0]["addr_info"]
                     if a["family"] == "inet")
     r.peer_mac = r.lan_mac = lan_json(f"ip -j link show dev {r.peer_if}")[0]["address"]
-    # The Ethernet source of a bridged neighbour-output flow is the physical
-    # port's, and a bridge takes its lowest port's address, so the two agree.
-    # That agreement is the eligibility rule, not an accident, so assert it.
+    # A one-port bridge takes its port's address, and a VLAN device above it
+    # the bridge's, so on these shapes the source the station sees is the
+    # port's as well. The "openwrt" shape is the one where the two differ.
     r.dut_lan_mac = (await read(r.target, r.session,
                                 f"/sys/class/net/{TARGET_LAN_IF}/address")).strip()
     for device in {BRIDGE, r.dut_lan_if}:
@@ -172,15 +196,20 @@ async def _bridged_segment(r, stack, shape):
 async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
     """LAN VM -> bridged segment -> DUT -> unbridged WAN host.
 
-    The parameter selects the shape: "plain" (default), "access", "tagged", or
-    "tcp" for an established connection over the access shape. Teardown
+    The parameter selects the shape: "plain" (default), "access", "tagged",
+    "tcp" for an established connection over the access shape, "openwrt" for
+    OpenWrt's own multi-port br-lan (_topology.openwrt_lan), "openwrt-vlan" for
+    its VLAN-aware form with the address on br-lan.1, "openwrt-tcp" for an
+    established connection over the plain one, or "openwrt-wan" for that LAN
+    routed to a bridged WAN whose address is its own (_topology.openwrt_wan). Teardown
     reverses only what came up, so a partial setup leaves nothing for the next
     case to inherit -- including the LAN address, which moves onto the bridge.
     """
     shape = getattr(request, "param", "plain")
-    assert shape in {"plain", "access", "tagged", "tcp"}
+    assert shape in {"plain", "access", "tagged", "tcp", "openwrt", "openwrt-tcp", "openwrt-vlan",
+                     "openwrt-wan"}
     r = Rig()
-    r.proto = "tcp" if shape == "tcp" else "udp"
+    r.proto = "tcp" if shape.endswith("tcp") else "udp"
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     await stop_boot_daemon()
@@ -192,7 +221,9 @@ async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
     transport = None
     try:
         await command(r.target, r.session, "modprobe", "xt_tcpudp")
-        subnet = await _bridged_segment(r, stack, "access" if shape == "tcp" else shape)
+        segment = {"tcp": "access", "openwrt-tcp": "openwrt",
+                   "openwrt-wan": "openwrt"}.get(shape, shape)
+        subnet = await _bridged_segment(r, stack, segment)
         r.dut_wan_mac = (await read(r.target, r.session,
                                     f"/sys/class/net/{TARGET_WAN_IF}/address")).strip()
         addresses = json.loads((await command(r.wan, r.session, "ip", "-j", "-4", "addr"))["stdout"])
@@ -200,9 +231,14 @@ async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
                         if any(a.get("local") == WAN_IP for a in i["addr_info"]))
         r.wan_mac = json.loads((await command(r.wan, r.session, "ip", "-j", "link", "show",
                                               "dev", r.wan_if))["stdout"])[0]["address"]
+        r.dut_wan_if = TARGET_WAN_IF
+        if shape == "openwrt-wan":
+            wan = await openwrt_wan(stack, r.target, r.session, r.wan, r.wan_if)
+            r.dut_wan_if = r.wan_bridge = wan["bridge"]
+            r.dut_wan_mac = wan["mac"]
         dut = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr",
-                                        "show", "dev", TARGET_WAN_IF))["stdout"])[0]
-        r.dut_wan_ip = next(a["local"] for a in dut["addr_info"] if a["family"] == "inet")
+                                        "show", "dev", r.dut_wan_if))["stdout"])[0]
+        r.dut_wan_ip = next(a["local"] for a in dut["addr_info"] if "local" in a)
         reachable = subnet or f"{r.lan_ip}/32"
         await command(r.wan, r.session, "ip", "route", "replace", reachable,
                       "via", r.dut_wan_ip, "dev", r.wan_if)
@@ -212,7 +248,7 @@ async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
         # to the bridge, or to the VLAN device above it; the same address on
         # the port underneath would be a different neighbour and not be found.
         for ip, mac, dev in ((r.lan_ip, r.lan_mac, r.dut_lan_if),
-                             (WAN_IP, r.wan_mac, TARGET_WAN_IF)):
+                             (WAN_IP, r.wan_mac, r.dut_wan_if)):
             await command(r.target, r.session, "ip", "neigh", "replace", ip, "lladdr", mac,
                           "nud", "permanent", "dev", dev)
             cleanup.append((r.target, ["ip", "neigh", "del", ip, "dev", dev]))
@@ -335,8 +371,14 @@ def _assert_ports(r, forward, reverse):
     assert reverse["out_br"] == r.bridge_text and reverse["in_br"] == "-", reverse
 
 
+@pytest.mark.parametrize("bridge_rig", ["plain", "openwrt", "openwrt-vlan"], indirect=True)
 async def test_routed(bridge_rig):
-    """A bridged LAN and an unbridged WAN, routed, with no translation."""
+    """A bridged LAN and an unbridged WAN, routed, with no translation.
+
+    The "openwrt" shape is the LAN OpenWrt ships: the station's port is not the
+    one whose address the bridge carries. Both directions are held in hardware,
+    and the exchange checks every frame towards the station carries the
+    bridge's address, as the software path's do."""
     r = bridge_rig
     flows, delta = await _established(r)
     forward = _direction(flows, r.lan_ip, WAN_IP)
@@ -353,6 +395,93 @@ async def test_routed(bridge_rig):
     r.record("bridge-routed", {"flows": flows, "delta": delta})
 
 
+@pytest.mark.parametrize("bridge_rig", ["openwrt-wan"], indirect=True)
+async def test_bridged_both_sides(bridge_rig):
+    """A bridge on each side: OpenWrt's br-lan, and a bridged WAN whose address
+    is its own rather than its port's.
+
+    Each direction names the bridge it crosses on its own side, and carries
+    the source Linux sends with on the side it leaves by: the exchange checks
+    br-lan's address on every frame the station receives, and every frame
+    reaching the WAN host is checked here for br-wan's.
+    """
+    r = bridge_rig
+    sniff = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+    sniff.bind((r.wan_if, 0))
+    sniff.setblocking(False)
+    try:
+        flows, delta = await _established(r)
+        sources = set()
+        while True:
+            try:
+                frame = sniff.recv(2048)
+            except BlockingIOError:
+                break
+            ihl = (frame[14] & 15) * 4
+            if (len(frame) >= 14 + ihl + 4 and frame[23] == socket.IPPROTO_UDP
+                    and frame[30:34] == socket.inet_aton(WAN_IP)
+                    and int.from_bytes(frame[14 + ihl + 2:14 + ihl + 4], "big") == DPORT):
+                sources.add(frame[6:12].hex(":"))
+    finally:
+        sniff.close()
+    forward = _direction(flows, r.lan_ip, WAN_IP)
+    reverse = _direction(flows, WAN_IP, r.lan_ip)
+    assert forward["in"] == TARGET_LAN_IF and forward["out"] == TARGET_WAN_IF, forward
+    assert reverse["in"] == TARGET_WAN_IF and reverse["out"] == TARGET_LAN_IF, reverse
+    assert forward["in_br"] == r.bridge_text and forward["out_br"] == r.wan_bridge, forward
+    assert reverse["in_br"] == r.wan_bridge and reverse["out_br"] == r.bridge_text, reverse
+    assert all(d == 64 for d in delta.values()), delta
+    assert sources == {r.dut_wan_mac}, sources
+    r.record("bridge-both-sides", {"flows": flows, "delta": delta, "wan_sources": sorted(sources)})
+
+
+@pytest.mark.parametrize("bridge_rig", ["openwrt", "openwrt-vlan"], indirect=True)
+async def test_bridge_address_change(bridge_rig):
+    """The bridge's address changing under installed flows.
+
+    netifd sets br-lan's address, and a bridge whose address is not set takes a
+    new one when ports come and go. Either way every installed direction
+    towards the station was admitted with the old source, so the change retires
+    them, and the next exchange is admitted again and carries the new address
+    on every frame the station receives.
+    """
+    r = bridge_rig
+    flows, delta = await _established(r)
+    assert all(d == 64 for d in delta.values()), delta
+    before = await r.state()
+    new_mac = "02:a5:4b:b2:00:01"
+    await command(r.target, r.session, "ip", "link", "set", r.bridge, "address", new_mac)
+    # Whichever watch sees it first retires them: the bridge rewrites its own
+    # FDB entry for the old address before it raises NETDEV_CHANGEADDR.
+    watched = ("mac_invalidations", "fdb_invalidations", "neighbour_invalidations")
+    retired = await r.wait(lambda s: not s["entries"] and
+                           any(s[k] > before[k] for k in watched), timeout=15)
+    assert retired["errors"] == before["errors"], retired
+    # A VLAN device that took the bridge's address follows it
+    # (vlan_sync_address()), so br-lan.1 sends with the new one too; read it
+    # off the device carrying the router's address rather than assume.
+    r.peer_gateway_mac = (await read(r.target, r.session,
+                                     f"/sys/class/net/{r.dut_lan_if}/address")).strip()
+    # The station still names the old address for its router, which the
+    # bridge keeps delivering -- it is still a port's -- until the station's
+    # cache ages. Make it ask now, so the measurement is of the new source.
+    await lan_run(r.lan, f"ip neigh del {r.dut_lan_ip} dev {r.peer_if} 2>/dev/null; true", 10.0)
+    # Readmission needs traffic, and frames that arrive while Linux is still
+    # tearing the old flow down offer nothing; send until both are back.
+    for _ in range(10):
+        await r.exchange(count=4)
+        if len((await r.state())["flows"]) == 2:
+            break
+    readmitted = await _both_directions(r)
+    counts = {f["cookie"]: int(f["packets"]) for f in readmitted}
+    await r.exchange(count=32)
+    final = {f["cookie"]: int(f["packets"]) for f in await _flows(r)}
+    assert all(final[c] - counts[c] == 32 for c in counts), (counts, final)
+    r.record("bridge-address-change", {"before": flows, "retired": retired,
+                                       "source": r.peer_gateway_mac, "after": readmitted})
+
+
+@pytest.mark.parametrize("bridge_rig", ["plain", "openwrt", "openwrt-vlan"], indirect=True)
 async def test_snat(bridge_rig):
     """Source NAT across the bridge, proved at the far endpoint.
 
@@ -626,7 +755,7 @@ async def test_bridge_above_its_port(bridge_rig):
                       check=False)
 
 
-@pytest.mark.parametrize("bridge_rig", ["tcp"], indirect=True)
+@pytest.mark.parametrize("bridge_rig", ["tcp", "openwrt-tcp"], indirect=True)
 async def test_tcp(bridge_rig):
     """An established TCP connection over the shipping bridged topology.
 

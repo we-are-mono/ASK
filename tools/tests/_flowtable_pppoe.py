@@ -42,6 +42,8 @@ from _topology import (
     dut_vlan_subif,
     lan_run,
     lan_vlan_subif,
+    openwrt_lan,
+    openwrt_wan,
 )
 from ask_orch.client import Agent
 from ask_orch.commands import console_json
@@ -60,6 +62,9 @@ LAN_VID = int(os.environ.get("ASK_FLOWTABLE_PPPOE_LAN_VID", "276"))
 # 10.99.0.x, where the IPsec bench puts an address on the orchestrator's lo.
 INNER_LOCAL = os.environ.get("ASK_PPPOE_INNER_LOCAL", "10.98.0.1")
 INNER_REMOTE = os.environ.get("ASK_PPPOE_INNER_REMOTE", "10.98.0.2")
+# A locally administered address no port on the board carries, standing in for
+# the one an ISP has bound the line to.
+CLONED_WAN_MAC = "02:a5:4b:39:00:01"
 PPPOE_USER, PPPOE_SECRET = "ask-test", "ask-test-secret"
 
 # The same two ends of the session in IPv6, claimed in _topology.py. IPV6CP
@@ -547,13 +552,28 @@ print(json.dumps({{'echoed': echoed, 'lost': lost}}))
 
 # ---- topology ------------------------------------------------------------
 
-async def _lan_segment(r, stack, tagged):
-    """The LAN side, tagged or not, and the LAN VM's route to the inner peer.
+async def _lan_segment(r, stack, mode):
+    """The LAN side -- "plain", "tagged", or "openwrt" for OpenWrt's own
+    multi-port br-lan (_topology.openwrt_lan) -- and the LAN VM's route to the
+    inner peer.
 
     The route is restated rather than created: the bench already carries it,
     which is why nothing here removes it.
     """
-    if tagged:
+    if mode == "openwrt":
+        lan = await openwrt_lan(stack, r.target, r.session, lan=r.lan)
+        dut_if, lan_if = lan["bridge"], LAN_NIC
+        addr = json.loads((await lan_run(r.lan, f"ip -j -4 addr show dev {LAN_NIC}")).stdout)
+        r.lan_ip = next(a["local"] for a in addr[0]["addr_info"] if a["family"] == "inet")
+        await lan_run(r.lan, f"ip route replace {INNER_LOCAL}/32 "
+                             f"via {lan['address'].split('/')[0]} dev {LAN_NIC}")
+        r.dut_lan_if, r.peer_if, r.peer_link = dut_if, lan_if, LAN_NIC
+        link = json.loads((await lan_run(r.lan, f"ip -j link show dev {lan_if}")).stdout)[0]
+        r.peer_mac = r.lan_mac = link["address"]
+        # The station's gateway is the bridge, whose address is not its port's.
+        r.peer_gateway_mac = r.dut_lan_mac = lan["mac"]
+        return f"{r.lan_ip}/32"
+    if mode == "tagged":
         dut_if = await dut_vlan_subif(stack, r.target, r.session, parent=TARGET_LAN_IF,
                                       vid=LAN_VID, ipv4=f"{DUT_TAGGED_ADDR}/24")
         lan_if = await lan_vlan_subif(
@@ -671,9 +691,12 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
 
     The parameter selects the shape: "udp" (default), "tcp", "tagged" for a
     tagged LAN behind the session, "tagged-tcp" for the same carrying TCP,
-    "ipv6" for a session carrying v6 as well, or "chap" for the UDP session
-    authenticated with CHAP rather than PAP. Teardown reverses only what came
-    up.
+    "ipv6" for a session carrying v6 as well, "chap" for the UDP session
+    authenticated with CHAP rather than PAP, "openwrt" / "openwrt-tcp" for
+    OpenWrt's own multi-port br-lan behind the session, "cloned-tcp" for a
+    session over a device carrying a cloned MAC, or "bridged-wan-tcp" for a
+    session over a VLAN device on a bridged WAN whose address is its own
+    (_topology.openwrt_wan). Teardown reverses only what came up.
 
     The far endpoint is the session's own inner address, not the orchestrator's
     ordinary WAN address. It has to be: a host route for the WAN address down
@@ -683,7 +706,8 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     every Rig method; monkeypatch puts it back.
     """
     shape = getattr(request, "param", "udp")
-    assert shape in {"udp", "tcp", "tagged", "tagged-tcp", "ipv6", "chap"}
+    assert shape in {"udp", "tcp", "tagged", "tagged-tcp", "ipv6", "chap",
+                     "openwrt", "openwrt-tcp", "cloned-tcp", "bridged-wan-tcp"}
     monkeypatch.setattr(ft, "WAN_IP", INNER_LOCAL)
     r = Rig()
     r.proto = "tcp" if shape.endswith("tcp") else "udp"
@@ -725,8 +749,27 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
         # Adding an upper to a bound port is a configuration change the adapter
         # answers with full invalidation, which would retire flows for a reason
         # that has nothing to do with the session.
+        lower_parent = TARGET_WAN_IF
+        if shape.startswith("bridged-wan"):
+            # The WAN port under a bridge whose address is its own, and the
+            # session over a VLAN device on that bridge: br-wan.3900, which
+            # takes the bridge's address, so the session's frames carry it.
+            wan_v4 = os.environ.get("ASK_WAN_IPERF_IP", "")
+            addresses = json.loads((await command(r.wan, r.session, "ip", "-j", "-4",
+                                                  "addr"))["stdout"])
+            wan_if = next(i["ifname"] for i in addresses
+                          if any(a.get("local") == wan_v4 for a in i["addr_info"]))
+            bridged = await openwrt_wan(stack, r.target, r.session, r.wan, wan_if)
+            lower_parent = bridged["bridge"]
+            r.wan_bridge_mac = bridged["mac"]
         r.ppp_lower = await dut_vlan_subif(stack, r.target, r.session,
-                                           parent=TARGET_WAN_IF, vid=WAN_VID)
+                                           parent=lower_parent, vid=WAN_VID)
+        if shape.startswith("cloned"):
+            # The ISP's MAC binding, cloned onto the device the session runs
+            # over, as OpenWrt's `macaddr` on a PPPoE WAN does: the frames the
+            # session sends carry it, and the concentrator answers only it.
+            await command(r.target, r.session, "ip", "link", "set", r.ppp_lower,
+                          "address", CLONED_WAN_MAC)
         server = _server_start(ipv6=r.session_ipv6, auth="chap" if shape == "chap" else "pap")
         # ~0.5s to bind. A bad interface or a port already in use exits fast;
         # catching that here beats a bring-up timeout half a minute later.
@@ -738,7 +781,8 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
         r.ppp_if, r.ppp_pid = await _dial(console, r.ppp_lower, ipv6=r.session_ipv6)
         stack.push(lambda: _hangup(console))
         r.console = console
-        r.reachable = await _lan_segment(r, stack, shape.startswith("tagged"))
+        r.reachable = await _lan_segment(r, stack, "tagged" if shape.startswith("tagged") else
+                                         "openwrt" if shape.startswith("openwrt") else "plain")
         r.session_identity = await _session_identity(r)
         # pppd installs the peer host route itself; what it does not install is
         # the way back, and the concentrator has no route to the LAN at all.

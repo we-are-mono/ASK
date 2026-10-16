@@ -244,13 +244,11 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 			!!(out->flags & ENTRY_VALID));
 		return ask_refuse(-EOPNOTSUPP);
 	}
-	/* Nothing to synchronize before encoding any more. This used to copy
-	 * the admission-validated source MAC into the interface record,
-	 * because the encoder read its Ethernet source from a cache that was
-	 * filled once from perm_addr and never followed a change. The encoder
-	 * reads the netdev directly now, and admission has already refused any
-	 * direction whose source is not that port's current address, so the
-	 * two agree by construction rather than by being copied. */
+	/* Nothing to synchronize before encoding: the entry carries its own
+	 * Ethernet source (hw->route.srcmac below), so the interface record is
+	 * never written and two directions leaving one port with different
+	 * sources -- a bridge's and the port's own -- cannot disturb each
+	 * other. */
 	nstats = ft_hw_stats_walk(stats, NULL);
 	hw = kzalloc(struct_size(hw, stats, nstats), GFP_KERNEL);
 	if (!hw)
@@ -301,6 +299,7 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 	if (rule->out_tunnel.present)
 		hw->route.mtu += rule->out_tunnel.header_size;
 	ether_addr_copy(hw->route.dstmac, rule->dst_mac);
+	ether_addr_copy(hw->route.srcmac, rule->src_mac);
 	ct = &hw->entry;
 	ct->twin = &hw->twin;
 	hw->twin.twin = ct;

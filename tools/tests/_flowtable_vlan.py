@@ -30,6 +30,9 @@ from ask_orch.artifacts import artifact_dir
 # carries 271 outside and 272 inside.
 VLAN_ID = int(os.environ.get("ASK_FLOWTABLE_VLAN_ID", "271"))
 VLAN_INNER = VLAN_ID + 1
+# A locally administered address no port on the board carries, for the VLAN
+# device that overrides its parent's (OpenWrt's `macaddr` on a VLAN device).
+CLONED_VLAN_MAC = "02:a5:4b:27:10:01"
 # Deliberately not derived from the VID: a VLAN id can exceed an octet, and a
 # subnet built out of one silently aliases as soon as it does.
 LAN_SUBNET, DUT_VLAN_ADDR, LAN_VLAN_ADDR = "172.29.71.0/24", "172.29.71.1", "172.29.71.2"
@@ -158,8 +161,9 @@ with tempfile.TemporaryDirectory(prefix='ask-vlan-capture-') as directory:
     assert captured == frames, ("negative probes did not arrive intact at the DUT", captured, frames)
 
 
-async def _tagged_segment(r, stack, inner):
-    """The tagged LAN, on both sides of the wire.
+async def _tagged_segment(r, stack, inner, cloned=False):
+    """The tagged LAN, on both sides of the wire. `cloned` gives the DUT's
+    VLAN device an address of its own rather than its parent's.
 
     Only the LAN is tagged. The WAN keeps the untagged address the rest of the
     suite uses, so the two directions of one connection differ in exactly the
@@ -167,6 +171,9 @@ async def _tagged_segment(r, stack, inner):
     """
     dut_if = await dut_vlan_subif(stack, r.target, r.session, parent=TARGET_LAN_IF,
                                   vid=VLAN_ID, ipv4=f"{DUT_VLAN_ADDR}/24")
+    if cloned:
+        await command(r.target, r.session, "ip", "link", "set", dut_if,
+                      "address", CLONED_VLAN_MAC)
     lan_if = await lan_vlan_subif(stack, r.lan, parent=LAN_NIC, vid=VLAN_ID,
                                   ipv4=f"{LAN_VLAN_ADDR}/24",
                                   routes=[] if inner else [f"{WAN_IP}/32 via {DUT_VLAN_ADDR} dev vlan{VLAN_ID}"])
@@ -197,12 +204,13 @@ async def _tagged_segment(r, stack, inner):
 async def vlan_rig(target_agent, aiohttp_session, lan, splat_window, request):
     """LAN VM -> tagged segment -> DUT -> untagged WAN host.
 
-    The parameter selects the shape: "udp" (default), "tcp", or "qinq" for a
-    second tag inside the first. Teardown reverses only what came up, so a
+    The parameter selects the shape: "udp" (default), "tcp", "qinq" for a
+    second tag inside the first, or "cloned" for a VLAN device whose address
+    is its own rather than its parent's. Teardown reverses only what came up, so a
     partial setup leaves nothing for the next case to inherit.
     """
     shape = getattr(request, "param", "udp")
-    assert shape in {"udp", "tcp", "qinq"}
+    assert shape in {"udp", "tcp", "qinq", "cloned"}
     r = Rig()
     r.proto = "tcp" if shape == "tcp" else "udp"
     r.vlan_tags = [VLAN_ID, VLAN_INNER] if shape == "qinq" else [VLAN_ID]
@@ -217,7 +225,7 @@ async def vlan_rig(target_agent, aiohttp_session, lan, splat_window, request):
     transport = None
     try:
         await command(r.target, r.session, "modprobe", "xt_tcpudp")
-        subnet = await _tagged_segment(r, stack, shape == "qinq")
+        subnet = await _tagged_segment(r, stack, shape == "qinq", cloned=shape == "cloned")
         r.dut_wan_mac = (await read(r.target, r.session,
                                     f"/sys/class/net/{TARGET_WAN_IF}/address")).strip()
         addresses = json.loads((await command(r.wan, r.session, "ip", "-j", "-4", "addr"))["stdout"])

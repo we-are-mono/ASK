@@ -140,6 +140,194 @@ async def dut_vlan_subif(
     return iface
 
 
+# The LAN OpenWrt builds on this board: one bridge, br-lan, over every DPAA port
+# the WAN does not take, its address set by netifd to the first port's. Only
+# TARGET_LAN_IF is cabled to a station here, so that port is the one behind
+# which the station sits, and its own address is not the bridge's -- the case
+# every OpenWrt LAN has on all but one port. A port that is up is left out:
+# bridging a cabled port would hand the test LAN's DHCP to whatever is on the
+# other end, and the property the shape exists for survives without it, because
+# the bridge's address is set rather than inherited.
+#
+# `vid` builds the DSA-style variant instead: VLAN filtering on, every port an
+# untagged member of `vid` (OpenWrt's VLAN 1), and the router's address on
+# br-lan.<vid>, which takes the bridge's address as a VLAN device does.
+OPENWRT_LAN_BRIDGE = "br-lan"
+OPENWRT_LAN_VID = 1
+OPENWRT_PORT_CANDIDATES = tuple(f"eth{i}" for i in range(5))
+
+
+async def openwrt_lan(
+    stack: TopologyStack,
+    target_agent,
+    session: aiohttp.ClientSession,
+    *,
+    name: str = OPENWRT_LAN_BRIDGE,
+    vid: int | None = None,
+    lan=None,
+) -> dict:
+    """Move the DUT's LAN address from TARGET_LAN_IF onto an OpenWrt-shaped
+    bridge, push the undo onto `stack`, and return the bridge's name, address
+    and ports, and the device carrying the router's address ("l3"). The LAN
+    port's IPv4 address comes back when the stack unwinds; given the LAN VM,
+    so does its neighbour entry for the router, which named the bridge's
+    address and would otherwise address a port that no longer answers to it.
+    """
+    async def _exec(*argv: str, check=True):
+        result = await target_agent.exec_cmd(session, list(argv))
+        return checked(result) if check else result
+
+    async def _read(path):
+        result = await target_agent.fs_read(session, path)
+        if result["errno"]:
+            return None
+        return bytes.fromhex(result["content_hex"]).decode().strip()
+
+    ports = []
+    for port in OPENWRT_PORT_CANDIDATES:
+        if port == TARGET_WAN_IF:
+            continue
+        address = await _read(f"/sys/class/net/{port}/address")
+        if address is not None:
+            ports.append((port, address, await _read(f"/sys/class/net/{port}/operstate")))
+    assert any(p == TARGET_LAN_IF for p, _, _ in ports), (TARGET_LAN_IF, ports)
+    lan_mac = next(a for p, a, _ in ports if p == TARGET_LAN_IF)
+    # netifd's choice, made explicit so it holds whichever ports join: the
+    # first port's address, which on this board is never the station's port.
+    bridge_mac = next(a for p, a, _ in ports if p != TARGET_LAN_IF)
+    assert bridge_mac != lan_mac, ports
+
+    addresses = json.loads((await _exec("ip", "-j", "-4", "addr", "show",
+                                        "dev", TARGET_LAN_IF))["stdout"])
+    dut_lan = next(f"{a['local']}/{a['prefixlen']}" for a in addresses[0]["addr_info"]
+                   if a["family"] == "inet")
+    # A bridge port carries no addresses on OpenWrt. One left on it keeps a
+    # connected route out of a device the bridge consumes every frame of, so
+    # neighbour discovery through it never completes and whatever that route
+    # wins is lost -- the port's IPv6 addresses go too, and come back after.
+    v6 = json.loads((await _exec("ip", "-j", "-6", "addr", "show", "dev", TARGET_LAN_IF,
+                                 "scope", "global"))["stdout"])
+    port_v6 = [f"{a['local']}/{a['prefixlen']}" for i in v6 for a in i["addr_info"]
+               if "local" in a]
+    if lan is not None:
+        async def _forget_router():
+            result = await lan_run(lan, f"ip neigh del {dut_lan.split('/')[0]} "
+                                        f"dev {LAN_NIC} 2>/dev/null; true", 10.0)
+            return result
+        stack.push(_forget_router)
+    await _exec("ip", "link", "del", name, check=False)
+    await _exec("ip", "link", "add", "name", name, "type", "bridge")
+
+    async def _cleanup():
+        await _exec("ip", "link", "del", name, check=False)
+        for address in port_v6:
+            await _exec("ip", "-6", "addr", "replace", address, "dev", TARGET_LAN_IF,
+                        "nodad", check=False)
+        return await _exec("ip", "addr", "replace", dut_lan, "dev", TARGET_LAN_IF)
+    stack.push(_cleanup)
+
+    await _exec("ip", "link", "set", name, "address", bridge_mac)
+    if vid is not None:
+        # vlan_default_pvid 0 first, so no port is given a PVID the shape
+        # did not ask for; then every member untagged in `vid`.
+        await _exec("ip", "link", "set", name, "type", "bridge",
+                    "vlan_filtering", "1", "vlan_default_pvid", "0")
+    await _exec("ip", "addr", "del", dut_lan, "dev", TARGET_LAN_IF)
+    for address in port_v6:
+        await _exec("ip", "-6", "addr", "del", address, "dev", TARGET_LAN_IF)
+    members = [p for p, _, state in ports if p == TARGET_LAN_IF or state != "up"]
+    for port in members:
+        await _exec("ip", "link", "set", port, "master", name)
+        if vid is not None:
+            await _exec("bridge", "vlan", "add", "dev", port, "vid", str(vid),
+                        "pvid", "untagged")
+    await _exec("ip", "link", "set", name, "up")
+    l3 = name
+    if vid is not None:
+        await _exec("bridge", "vlan", "add", "dev", name, "vid", str(vid), "self")
+        l3 = await dut_vlan_subif(stack, target_agent, session, parent=name, vid=vid,
+                                  name=f"{name}.{vid}")
+    await _exec("ip", "addr", "add", dut_lan, "dev", l3)
+    assert await _read(f"/sys/class/net/{l3}/address") == bridge_mac, l3
+    return {"bridge": name, "l3": l3, "mac": bridge_mac, "ports": members,
+            "lan_port_mac": lan_mac, "address": dut_lan, "port_ipv6": port_v6}
+
+
+# A bridged WAN, as some OpenWrt configurations build it: br-wan over the WAN
+# port, with an address of its own rather than the port's (a MAC an ISP binds
+# the line to, set on the bridge). Everything the WAN port carried moves onto
+# the bridge and comes back: its IPv4 address, its global IPv6 addresses and
+# the default route through it. The WAN host is told the bridge's address for
+# the DUT and forgets it again, so neither side waits on a cache to age.
+OPENWRT_WAN_BRIDGE = "br-wan"
+OPENWRT_WAN_MAC = "02:a5:4b:00:00:14"
+
+
+async def openwrt_wan(
+    stack: TopologyStack,
+    target_agent,
+    session: aiohttp.ClientSession,
+    wan_agent,
+    wan_if: str,
+    *,
+    name: str = OPENWRT_WAN_BRIDGE,
+    mac: str = OPENWRT_WAN_MAC,
+) -> dict:
+    """Move the DUT's WAN onto a bridge over TARGET_WAN_IF whose address is
+    `mac`, push the undo onto `stack`, and return the bridge, its address and
+    the WAN address. `wan_if` is the WAN host's device on that segment."""
+    async def _exec(*argv: str, check=True):
+        result = await target_agent.exec_cmd(session, list(argv))
+        return checked(result) if check else result
+
+    async def _wan(*argv: str, check=True):
+        result = await wan_agent.exec_cmd(session, list(argv))
+        return checked(result) if check else result
+
+    v4 = json.loads((await _exec("ip", "-j", "-4", "addr", "show", "dev",
+                                 TARGET_WAN_IF))["stdout"])
+    dut_wan = next(f"{a['local']}/{a['prefixlen']}" for a in v4[0]["addr_info"]
+                   if "local" in a)
+    v6 = json.loads((await _exec("ip", "-j", "-6", "addr", "show", "dev", TARGET_WAN_IF,
+                                 "scope", "global"))["stdout"])
+    port_v6 = [f"{a['local']}/{a['prefixlen']}" for i in v6 for a in i["addr_info"]
+               if "local" in a]
+    defaults = json.loads((await _exec("ip", "-j", "-4", "route", "show", "default",
+                                       "dev", TARGET_WAN_IF))["stdout"])
+    gateways = [d["gateway"] for d in defaults if "gateway" in d]
+    port_mac = json.loads((await _exec("ip", "-j", "link", "show", "dev",
+                                       TARGET_WAN_IF))["stdout"])[0]["address"]
+    assert port_mac != mac, port_mac
+
+    async def _restore():
+        await _exec("ip", "link", "del", name, check=False)
+        await _exec("ip", "addr", "replace", dut_wan, "dev", TARGET_WAN_IF, check=False)
+        for address in port_v6:
+            await _exec("ip", "-6", "addr", "replace", address, "dev", TARGET_WAN_IF,
+                        "nodad", check=False)
+        for gateway in gateways:
+            await _exec("ip", "route", "replace", "default", "via", gateway,
+                        "dev", TARGET_WAN_IF, check=False)
+        await _wan("ip", "neigh", "del", dut_wan.split("/")[0], "dev", wan_if, check=False)
+        return {"rc": 0}
+    stack.push(_restore)
+
+    await _exec("ip", "link", "del", name, check=False)
+    await _exec("ip", "link", "add", "name", name, "type", "bridge")
+    await _exec("ip", "link", "set", name, "address", mac)
+    await _exec("ip", "addr", "del", dut_wan, "dev", TARGET_WAN_IF)
+    for address in port_v6:
+        await _exec("ip", "-6", "addr", "del", address, "dev", TARGET_WAN_IF)
+    await _exec("ip", "link", "set", TARGET_WAN_IF, "master", name)
+    await _exec("ip", "link", "set", name, "up")
+    await _exec("ip", "addr", "add", dut_wan, "dev", name)
+    for gateway in gateways:
+        await _exec("ip", "route", "replace", "default", "via", gateway, "dev", name)
+    await _wan("ip", "neigh", "replace", dut_wan.split("/")[0], "lladdr", mac,
+               "nud", "reachable", "dev", wan_if)
+    return {"bridge": name, "mac": mac, "port_mac": port_mac, "address": dut_wan}
+
+
 async def lan_vlan_subif(
     stack: TopologyStack,
     lan,

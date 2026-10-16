@@ -1256,10 +1256,15 @@ static void ft_invalidate(void)
 static void (*barrier_hook)(void);
 static void smp_mb(void) { if (barrier_hook) { void (*hook)(void) = barrier_hook; barrier_hook = NULL; hook(); } }
 #define smp_mb__after_atomic() smp_mb()
-static bool cdx_ft_port_supported(struct net_device *d) { return d && physical_ok; }
 /* The egress set is wider in production (an open VAP); the asymmetry has its
- * own harness (wifi_admission.c). Here the two sets coincide. */
-static bool cdx_ft_egress_supported(struct net_device *d) { return cdx_ft_port_supported(d); }
+ * own harness (wifi_admission.c). Here the two sets coincide, except for the
+ * one device a case names a VAP. */
+static struct net_device *vap_dev;
+static bool cdx_ft_port_supported(struct net_device *d) { return d && physical_ok && d != vap_dev; }
+static bool cdx_ft_egress_supported(struct net_device *d)
+{
+    return cdx_ft_port_supported(d) || (d && d == vap_dev);
+}
 static unsigned int ft_passive;
 /* ASK-DEBUG tracing is a printk in production; nothing to observe here. */
 #define ask_refuse(err) (err)
@@ -2602,9 +2607,14 @@ static void test_vlan(void)
     VLAN_REJECT(out_tag.real_dev = &upper);
     /* The payload bound belongs to the logical device, not the port. */
     VLAN_REJECT(out_tag.mtu = 1491);
-    /* A VLAN device normally inherits its parent's address. One that does not
-     * would have software and hardware disagree about the Ethernet source. */
-    VLAN_REJECT(out_tag.dev_addr[5]++);
+    /* A VLAN device with an address of its own sends with it, so the
+     * direction carries that address as its Ethernet source, not the port's. */
+    egress_tag_fixture();
+    out_tag.dev_addr[5]++;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(ether_addr_equal(decoded.src_mac, out_tag.dev_addr) &&
+           !ether_addr_equal(decoded.src_mac, out.dev_addr));
+    ether_addr_copy(out_tag.dev_addr, out.dev_addr);
     /* A neighbour on the physical port is not this flow's neighbour. */
     VLAN_REJECT(neighbour.dev = &out);
 #undef VLAN_REJECT
@@ -2977,7 +2987,31 @@ static void test_bridge(void)
     /* The bridge carries its own MTU and its own address, exactly as a VLAN
      * device does, and both belong to the flow that routes through it. */
     BRIDGE_REJECT(br.mtu = 1491);
-    BRIDGE_REJECT(br.dev_addr[5]++);
+    /* A bridge whose address is not its egress port's -- every port of
+     * OpenWrt's br-lan but the one it took its address from -- is admitted,
+     * and the direction carries the bridge's address, as Linux sends with. */
+    {
+        u8 port_mac[ETH_ALEN];
+
+        bridge_out_fixture();
+        ether_addr_copy(port_mac, br.dev_addr);
+        br.dev_addr[5]++;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        assert(ether_addr_equal(decoded.src_mac, br.dev_addr) &&
+               !ether_addr_equal(decoded.src_mac, out.dev_addr));
+        /* A VAP behind the bridge keeps the older rule until its own source
+         * is proved on the air: the bridge's address must be the VAP's. */
+        ether_addr_copy(br.dev_addr, port_mac);
+        vap_dev = &out;
+        bridge_out_fixture();
+        br.dev_addr[5]++;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        ether_addr_copy(br.dev_addr, port_mac);
+        bridge_out_fixture();
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        assert(ether_addr_equal(decoded.src_mac, out.dev_addr));
+        vap_dev = NULL;
+    }
     /* A neighbour on the port underneath is not this flow's neighbour. */
     BRIDGE_REJECT(neighbour.dev = &out);
     /* An inserted tag the action list does not push, and a pushed tag the
@@ -3663,11 +3697,16 @@ static void test_pppoe(void)
      * kernel that started resolving something there would otherwise be
      * silently overridden by the session's address. */
     PPPOE_REJECT(rule.action.entries[2].mangle.val = 0x33221102);
-    /* The device below the session may not override the port's address: the
-     * hardware emits the port's and software would emit the override. */
-    PPPOE_REJECT(egress_session.lower_ifindex = out_tag.ifindex;
-                 out_tag.dev_addr[5]++;
-                 encap_actions(0, push_one, ARRAY_SIZE(push_one)));
+    /* The device below the session may carry an address of its own -- an
+     * ISP's MAC binding -- and pppoe_xmit() builds the header against it, so
+     * the direction carries it as its source. */
+    pppoe_out_fixture();
+    egress_session.lower_ifindex = out_tag.ifindex;
+    out_tag.dev_addr[5]++;
+    encap_actions(0, push_one, ARRAY_SIZE(push_one));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(ether_addr_equal(decoded.src_mac, out_tag.dev_addr) &&
+           !ether_addr_equal(decoded.src_mac, out.dev_addr));
     ether_addr_copy(out_tag.dev_addr, out.dev_addr);
     /* A session plus a full tag stack exceeds the encapsulation budget. */
     PPPOE_REJECT(egress_session.lower_ifindex = out_qinq.ifindex;
@@ -4454,12 +4493,16 @@ static void test_tunnel(void)
     /* Truncation counts: a sixteen-byte address padded to six is not the same
      * six bytes as a four-byte one. */
     TUNNEL_REJECT(tunnel_ethernet_dest(&ip6tnl));
-    /* The device below the tunnel may not override the port's address: the
-     * hardware emits the port's and software would emit the override. */
-    TUNNEL6_REJECT(egress_tunnel.lower_ifindex = out_tag.ifindex;
-                   outer_neighbour(&out_tag, AF_INET6);
-                   out_tag.dev_addr[5]++;
-                   encap_actions(0, push_one, ARRAY_SIZE(push_one)));
+    /* The device below the tunnel may carry an address of its own; the outer
+     * packet leaves through it with that address, and so does the direction. */
+    ip6tnl_out_fixture();
+    egress_tunnel.lower_ifindex = out_tag.ifindex;
+    outer_neighbour(&out_tag, AF_INET6);
+    out_tag.dev_addr[5]++;
+    encap_actions(0, push_one, ARRAY_SIZE(push_one));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(ether_addr_equal(decoded.src_mac, out_tag.dev_addr) &&
+           !ether_addr_equal(decoded.src_mac, out.dev_addr));
     ether_addr_copy(out_tag.dev_addr, out.dev_addr);
     /* A tunnel the kernel's walk crossed but this one did not reach: the
      * hardware would be asked to forward with no outer header at all. */
@@ -8445,6 +8488,8 @@ int main(void)
     fixture();
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(is4(&decoded.src, ik.src) && is4(&decoded.dst, ik.dst) && decoded.sport == htons(10000));
+    /* Untagged and unbridged, the device Linux sends from is the port. */
+    assert(ether_addr_equal(decoded.src_mac, out.dev_addr));
     assert(decoded.mtu == 1500 && decoded.in == &in && decoded.out == &out);
     /* IPv4 has no IPv6 MTU to follow, though the egress device's equals the
      * path here. */

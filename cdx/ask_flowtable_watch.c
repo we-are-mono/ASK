@@ -306,9 +306,10 @@ static bool ft_entry_crosses(const struct cdx_ft_entry *entry, const struct net_
  * on the way down -- a VLAN device under a session, a tunnel or another tag,
  * and the ppp device under a tunnel. A VLAN device carries its own MTU and
  * administrative state, a bridge carries both plus the FDB that chose the
- * egress port, and a device under a session or a tunnel had to carry the
- * port's address for the walk to admit the direction, so a flow depends on
- * each exactly as it depends on the physical port underneath. */
+ * egress port, and the device Linux sends from -- a bridge, a VLAN device,
+ * the one under a session or a tunnel -- lends the entry its address as the
+ * Ethernet source, so a flow depends on each exactly as it depends on the
+ * physical port underneath. */
 bool ft_entry_uses(const struct cdx_ft_entry *entry, const struct net_device *dev)
 {
 	return ft_rule_names(&entry->rule, dev) || ft_entry_crosses(entry, dev);

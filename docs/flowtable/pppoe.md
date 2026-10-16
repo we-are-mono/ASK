@@ -145,10 +145,10 @@ Beyond the rules a routed, tagged flow already satisfies:
 - The session must have completed discovery: a session id of zero is reserved
   for discovery itself, and a concentrator address that is not a valid unicast
   Ethernet address describes nothing the hardware could reach.
-- The device the session runs over must resolve, and must share its port's MAC
-  address. This is the rule the VLAN increment imposes on a logical device,
-  applied to the one device a session hides — a ppp device has no address of
-  its own, so that is where the rule has to be stated.
+- The device the session runs over must resolve. Its address is the session's
+  Ethernet source, as `pppoe_xmit()` builds the header against it, so a device
+  carrying an ISP's MAC binding is carried with it
+  (`flowtable_pppoe.py::test_cloned_wan_mac`).
 - A session the kernel's walk crossed but the adapter's did not reach is
   refused rather than dropped from the description, which would forward with no
   session header at all.

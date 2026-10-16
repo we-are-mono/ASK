@@ -27,6 +27,7 @@ from _topology import (
     lan_ipv6_default,
     lan_run,
     lan_run_python,
+    openwrt_lan,
 )
 from ask_orch.client import Agent
 from ask_orch.lifecycle import CleanupStack, checked
@@ -169,10 +170,16 @@ async def _tcp_connection(r, sport, dport, *, destination=WAN_IPV6, expect_sourc
 
 
 @pytest_asyncio.fixture
-async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
+async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window, request):
     """LAN VM <-> DUT <-> WAN host over two ULA /64s, with both endpoints
     pinned as permanent neighbours so admission never races ND. Teardown
-    reverses only what actually came up."""
+    reverses only what actually came up.
+
+    The parameter selects the LAN: "port" (default), the LAN port itself, or
+    "openwrt", OpenWrt's own multi-port br-lan (_topology.openwrt_lan), whose
+    address is not the station's port's."""
+    shape = getattr(request, "param", "port")
+    assert shape in {"port", "openwrt"}
     r = IPv6Rig()
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
@@ -194,8 +201,12 @@ async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
         lan_link = json.loads((await lan_run(lan, f"ip -j link show dev {LAN_NIC}"))
                               .stdout.strip())[0]
         r.lan_mac = lan_link["address"]
+        r.dut_lan_if = TARGET_LAN_IF
+        if shape == "openwrt":
+            bridge = await openwrt_lan(cleanup, r.target, r.session, lan=lan)
+            r.dut_lan_if = bridge["l3"]
         r.dut_lan_mac = (await read(r.target, r.session,
-                                    f"/sys/class/net/{TARGET_LAN_IF}/address")).strip()
+                                    f"/sys/class/net/{r.dut_lan_if}/address")).strip()
         r.dut_wan_mac = (await read(r.target, r.session,
                                     f"/sys/class/net/{TARGET_WAN_IF}/address")).strip()
         # The IPv6 endpoint shares the interface that already carries the IPv4
@@ -216,7 +227,7 @@ async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
         # ~1.5s and the first flow of the session would silently not come up.
         # One the image configures itself (the WAN port's) is left as it is,
         # or teardown would take it from every test after this one.
-        for address, interface in ((DUT_IPV6_LAN, TARGET_LAN_IF), (DUT_IPV6_WAN, TARGET_WAN_IF)):
+        for address, interface in ((DUT_IPV6_LAN, r.dut_lan_if), (DUT_IPV6_WAN, TARGET_WAN_IF)):
             if await has_address(r.target, r.session, interface, address):
                 continue
             await target("ip", "-6", "addr", "add", f"{address}/64", "dev", interface, "nodad")
@@ -251,7 +262,7 @@ async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
         cleanup.push(lambda: command(wan, r.session, "ip", "-6", "neigh", "del",
                                        DUT_IPV6_WAN, "dev", r.wan_if, check=False))
 
-        for address, mac, interface in ((LAN_IPV6, r.lan_mac, TARGET_LAN_IF),
+        for address, mac, interface in ((LAN_IPV6, r.lan_mac, r.dut_lan_if),
                                         (WAN_IPV6, r.wan_mac, TARGET_WAN_IF),
                                         (VIRT_IPV6, r.wan_mac, TARGET_WAN_IF)):
             await target("ip", "-6", "neigh", "replace", address, "lladdr", mac,

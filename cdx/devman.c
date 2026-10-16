@@ -1299,6 +1299,11 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 				__func__, iface_info->if_flags);
 		break;
 	}
+	/* An egress that names its own source writes it in place of the
+	 * interface's: a routed frame leaving a bridge carries the bridge's
+	 * address on every port, not the port's. */
+	if (src_mac && !is_zero_ether_addr(rt_entry->srcmac))
+		src_mac = rt_entry->srcmac;
 	if (src_mac)
 		memcpy(&l2_info->l2hdr[ETHER_ADDR_LEN], src_mac, ETHER_ADDR_LEN);
 err_ret:

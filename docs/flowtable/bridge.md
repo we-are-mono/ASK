@@ -214,11 +214,10 @@ Beyond the rules a routed, tagged flow already satisfies:
   never have described the flow.
 - A port reporting a switchdev parent is refused, which is what makes
   `DEV_PATH_BR_VLAN_UNTAG_HW` unreachable.
-- The bridge (or the VLAN device above it) must share the egress port's MAC
-  address, under the rule the VLAN increment already imposes: the Ethernet
-  source of a neighbour-output flow is the port's, and the encoder caches one
-  address per port. A bridge takes its lowest port's address, so this holds for
-  that port and decides which ports of a multi-port bridge are eligible.
+- The bridge (or the VLAN device above it) need not share the egress port's
+  MAC address: the direction carries the address Linux sends with (see
+  [the Ethernet source](#the-ethernet-source)). A Wi-Fi VAP behind the bridge is
+  the exception for now and still has to carry the bridge's address itself.
 - `CONFIG_NET_SWITCHDEV` is required to build the adapter at all. It is the
   only chain a plain bridge reports FDB and VLAN-membership changes on, and
   building without it would offload bridged flows and never retire a stale
@@ -273,13 +272,24 @@ direction arriving on it is readmitted too, into the WAN's 1500 (A346).
 All of it on the KASAN image, with the adapter's error, fatal and quarantine
 counters at zero afterwards and no suppressed diagnostics.
 
-## What this does not carry
+## The Ethernet source
 
-A bridge whose address differs from the egress port's, which is every port of
-a multi-port bridge except the one the address was taken from. Lifting it
-needs a per-flow Ethernet source in the encoder rather than one cached address
-per port, which is the same allocator question interface statistics raise, and
-belongs with item 9 rather than here.
+A routed frame Linux sends through a bridge carries the bridge's address, on
+whichever port the FDB chose. On a multi-port bridge that is every port's
+frames but those of the port the address was taken from -- OpenWrt's br-lan
+over eth0 to eth3, its address eth0's, is the common case. Each direction
+therefore carries its own source: the address of the device the walk found
+Linux transmitting from (`ft_path_stack()`), which the encoder writes in place
+of the port's (`RouteEntry.srcmac`). The same rule covers a VLAN device with an
+address of its own and the device under a PPPoE session. A change of that
+address retires the entries naming the device, as a port's does.
+
+`flowtable_bridge.py` runs its routed, SNAT and TCP cases over that shape too
+("openwrt", `_topology.openwrt_lan()`), and the exchange checks the bridge's
+address on every frame the station receives; `flowtable_pppoe.py` does the
+same behind a session (`test_openwrt_lan`, `test_openwrt_lan_tcp`).
+
+## What this does not carry
 
 MACVLAN is a separate upper device and is still declined by the walk: it is
 neither an 802.1Q VLAN nor a bridge master. That is the accepted answer rather

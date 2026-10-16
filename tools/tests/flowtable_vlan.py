@@ -14,14 +14,14 @@ import secrets
 import threading
 from collections import Counter
 
-from _flowtable_vlan import (NAT_TABLE, SNAT_ADDR, VLAN_ID, VLAN_INNER, _direction, _established,
-                             _flows, _send_vlan_frames, _vlan_ingress_visible)
+from _flowtable_vlan import (CLONED_VLAN_MAC, NAT_TABLE, SNAT_ADDR, VLAN_ID, VLAN_INNER, _direction,
+                             _established, _flows, _send_vlan_frames, _vlan_ingress_visible)
 
 import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_rig import (DPORT, SPORT, TABLE, WAN_IP, artifact_dir, assert_undisturbed,
-                            command, ct_listing)
+                            command, ct_listing, read)
 from _flowtable_udp_wire import udp_wire_payload
 from _gated_tcp import GatedTcp
 from ask_orch.counters import kernel_tx_packets
@@ -42,6 +42,27 @@ async def test_routed(vlan_rig):
     assert reverse["in"] == TARGET_WAN_IF and reverse["out"] == TARGET_LAN_IF, reverse
     assert all(d == 64 for d in delta.values()), delta
     r.record("vlan-routed", {"flows": flows, "delta": delta})
+
+
+@pytest.mark.parametrize("vlan_rig", ["cloned"], indirect=True)
+async def test_cloned_mac(vlan_rig):
+    """A VLAN device whose address is its own rather than its parent's, routed.
+
+    Linux sends every frame through that device with its address, so the
+    hardware has to write it too: the exchange checks the source of every
+    frame towards the station against the device's address, not the port's.
+    """
+    r = vlan_rig
+    port = (await read(r.target, r.session, f"/sys/class/net/{TARGET_LAN_IF}/address")).strip()
+    assert r.dut_lan_mac == CLONED_VLAN_MAC != port, (r.dut_lan_mac, port)
+    flows, delta = await _established(r)
+    forward = _direction(flows, r.lan_ip, WAN_IP)
+    reverse = _direction(flows, WAN_IP, r.lan_ip)
+    assert forward["in_vlan"] == str(VLAN_ID) and reverse["out_vlan"] == str(VLAN_ID), (forward,
+                                                                                        reverse)
+    assert forward["in"] == TARGET_LAN_IF and reverse["out"] == TARGET_LAN_IF, (forward, reverse)
+    assert all(d == 64 for d in delta.values()), delta
+    r.record("vlan-cloned", {"flows": flows, "delta": delta, "mac": r.dut_lan_mac})
 
 
 async def test_snat(vlan_rig):

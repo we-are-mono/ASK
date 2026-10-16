@@ -548,10 +548,10 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
  * ip6_finish_output2() build the header on the VIF device, and a bridge, or a
  * VLAN device on a port or a bridge, sends it on unchanged. It is the port's
  * only when the oif is the port -- a VLAN device can be given another, and a
- * bridge carries one of its ports' or its own -- and the unicast path's answer
- * to the same divergence, refusing it, would keep a whole IPTV stream in
- * software on the ordinary br-lan.N layout. An oif with no unicast address of
- * its own names no frame the hardware could write, and is refused. Read under
+ * bridge carries one of its ports' or its own -- which is the unicast path's
+ * answer to the same divergence too (ft_path_stack()'s source). An oif with no
+ * unicast address of its own names no frame the hardware could write, and is
+ * refused. Read under
  * RTNL, which every address change holds, so the plan and the device agree;
  * NETDEV_CHANGEADDR asks for the plan again.
  */

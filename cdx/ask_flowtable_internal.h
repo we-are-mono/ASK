@@ -183,10 +183,10 @@ struct cdx_ft_entry {
 	/* The devices each side's frames cross that the rule names only by
 	 * index: a VLAN device between the logical device and the port, and
 	 * the ppp device a tunnel runs over. The walk that admitted the
-	 * direction required each of them -- up, carrying the port's address,
-	 * stacked exactly so -- so each is held and watched like the devices
-	 * the rule does name. Kept on the entry for the reason the records
-	 * above are. */
+	 * direction required each of them -- up and stacked exactly so -- and
+	 * the one Linux sends from lends the entry its address, so each is
+	 * held and watched like the devices the rule does name. Kept on the
+	 * entry for the reason the records above are. */
 	struct net_device *crossed[CDX_FT_CROSSED_MAX];
 	unsigned int ncrossed;
 	unsigned long cookie;

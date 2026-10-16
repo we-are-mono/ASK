@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A377 — a station behind any br-lan port but the one whose address the bridge took got no hardware download.**
+  Each direction now carries the source Linux sends with (_:/^cdx: carry each direction's Ethernet source_).
+
 - [ ] **A376 — a new UDP flow's first requests are sometimes lost before the DUT counts them.** Once in a randomized
   release suite (module seed 914008896, test 163), `flowtable_nat_icmp.py::test_icmp_error_is_translated[frag-needed]`
   stopped in `snat_warm()`: the first four requests of flow 0 never reached the WAN host and the fifth did, so the

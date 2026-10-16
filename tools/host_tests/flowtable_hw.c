@@ -153,6 +153,7 @@ static void host_log(const char *format, ...)
 #define ASSERT_RTNL() assert(rtnl)
 #define ARPHRD_ETHER 1
 #define ether_addr_equal(a,b) (!memcmp(a,b,6))
+#define is_valid_ether_addr(a) (!((a)[0] & 1) && memcmp(a, (u8[6]){0}, 6))
 #define CDX_DEBUG_FLOWTABLE 1
 #define EXPORT_SYMBOL_NS_GPL(...)
 #define module_param(...)
@@ -245,7 +246,7 @@ struct key { bool linked, safe; };
 static struct key *key, *older;
 struct hw_ct { void *td; unsigned index; struct key *handle; u64 pkts, bytes; u32 timestamp; };
 struct itf { unsigned type, index; };
-typedef struct { struct itf *itf, *input_itf, *underlying_input_itf; unsigned mtu; u8 dstmac[6]; } RouteEntry;
+typedef struct { struct itf *itf, *input_itf, *underlying_input_itf; unsigned mtu; u8 dstmac[6], srcmac[6]; } RouteEntry;
 typedef struct CtEntry {
     struct CtEntry *twin;
     RouteEntry *pRtEntry;
@@ -338,6 +339,8 @@ static unsigned expected_proto = IPPROTO_UDP;
  * each nibble reached the field that reads it. */
 static u16 expected_qos;
 static bool expected_hairpin;
+/* The Ethernet source the entry must carry: the rule's. */
+static u8 expected_src_mac[6] = {2};
 /* What the entry must carry as its own MTU. Ordinarily the flow's, but a
  * direction handed to SEC has to be given the egress port's instead: the
  * microcode adds the tunnel expansion before comparing, so a tunnel-reduced
@@ -373,11 +376,9 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
                encap->ingress_tunnel.present || encap->egress_tunnel.present);
         observed_encap = *encap;
     }
-    /* The encoding port's source address is the netdev's, and the backend no
-     * longer copies it anywhere first. Admission has already refused any rule
-     * whose src_mac disagrees with it, so the two match by construction. */
-    assert(!memcmp((expected_hairpin ? in_iface : out_iface).eth_info.net_dev->dev_addr,
-                   (u8[]){2,0,0,0,0,0}, 6));
+    /* The entry carries its own Ethernet source, the rule's, for the encoder
+     * to write in place of the port's; the port's own record is untouched. */
+    assert(!memcmp(ct->pRtEntry->srcmac, expected_src_mac, 6));
     assert(ct->proto == expected_proto && ct->twin->proto == expected_proto);
     assert(ct->Sport == htons(1234) && ct->Dport == htons(5678));
     /* Ports always come from the twin object, in both families. */
@@ -1239,8 +1240,14 @@ static void test_backend(void)
     out.switch_port=true; assert(!cdx_ft_port_supported(&out)); out.switch_port=false;
     out.carrier=false; assert(!cdx_ft_port_supported(&out)); out.carrier=true;
     out.running=false; assert(!cdx_ft_port_supported(&out)); out.running=true;
+    /* A source other than the port's is a bridge's or a VLAN device's own,
+     * and is carried; one no frame may carry is refused. */
     out.dev_addr[5]=1; assert(cdx_ft_port_supported(&out));
-    assert(cdx_ft_add(&rule,&stats,&hw)==-EOPNOTSUPP && !hw); out.dev_addr[5]=0;
+    assert(cdx_ft_add(&rule,&stats,&hw)==0 && hw); assert(cdx_ft_del(&hw)==0 && !hw);
+    out.dev_addr[5]=0;
+    rule.src_mac[0]=1; assert(cdx_ft_add(&rule,&stats,&hw)==-EOPNOTSUPP && !hw);
+    memset(rule.src_mac,0,6); assert(cdx_ft_add(&rule,&stats,&hw)==-EOPNOTSUPP && !hw);
+    rule.src_mac[0]=2;
     out.reg_state=0; assert(!cdx_ft_port_supported(&out)); out.reg_state=NETREG_REGISTERED;
     out.type=0; assert(!cdx_ft_port_supported(&out)); out.type=ARPHRD_ETHER;
     out.addr_len=0; assert(!cdx_ft_port_supported(&out)); out.addr_len=ETH_ALEN;

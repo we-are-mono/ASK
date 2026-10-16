@@ -128,10 +128,12 @@ must be registered physical CDX devices, running with carrier. A logical
 ingress or egress above one is admitted only through the composition the
 [VLAN](vlan.md) and bridge/PPPoE contracts describe. Ingress and egress must be distinct
 except for a completed combined SNAT/DNAT mapping (the hairpin contract). Physical lookup uses the device object,
-not its name or a recyclable interface index. The requested source MAC must
-match the egress device's **current** address. The encoder's source cache is
-synchronized under its reader lock while admission holds its transaction and
-RTNL. An OS rename preserves identity and forwarding semantics.
+not its name or a recyclable interface index. The Ethernet source is the
+address of the device Linux transmits from -- a bridge, a VLAN device, the
+device under a session -- carried in the entry rather than read from the port;
+Netfilter's own source words must still name the egress port's **current**
+address, or the offer predates a change and is retired. An OS rename preserves
+identity and forwarding semantics.
 
 Both borrowed routes are checked under RTNL before insertion. The egress route
 must be valid unicast on the selected port, of the flow's own family and

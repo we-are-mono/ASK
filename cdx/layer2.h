@@ -50,6 +50,11 @@
 typedef struct _tRouteEntry {
 	struct _itf *itf;
 	U8 dstmac[ETHER_ADDR_LEN];
+	/* The Ethernet source the egress writes, where its owner names one --
+	 * a flowtable direction leaving through a bridge or a device with an
+	 * address of its own. Zero, as every other owner leaves it, means the
+	 * egress interface's own address. */
+	U8 srcmac[ETHER_ADDR_LEN];
 	U16 mtu;
 	U16 flags;
 	union

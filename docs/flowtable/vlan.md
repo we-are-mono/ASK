@@ -108,10 +108,11 @@ Beyond the rules a routed flow already satisfies:
   `NF_FLOW_TABLE_ENCAP_MAX` tags and session together. 802.1ad is declined: the
   kernel describes no selector for it and emits no push action, so a tag that
   is not 802.1Q is one the hardware would be asked to reproduce blind.
-- An egress VLAN device may not override its parent's MAC address. The
-  Ethernet source of a neighbour-output flow is the port's, and the encoder
-  caches one address per port, so an override would have software and hardware
-  disagree about the source MAC of the same flow.
+- An egress VLAN device may override its parent's MAC address. Linux sends
+  through it with its own address, so the direction carries that address as
+  its Ethernet source and the encoder writes it in place of the port's (see
+  [the bridge guide](bridge.md#the-ethernet-source));
+  `flowtable_vlan.py::test_cloned_mac` checks it on the wire.
 - The POP actions must be one per ingress tag and the PUSH actions must name
   the egress tags in order, imposing neither priority nor DEI, neither of
   which the hardware reproduces.

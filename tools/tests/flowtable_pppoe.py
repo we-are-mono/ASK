@@ -51,7 +51,7 @@ import time
 
 import pytest
 
-from _flowtable_pppoe import DPORT6, _concentrator_if
+from _flowtable_pppoe import CLONED_WAN_MAC, DPORT6, _concentrator_if
 from _gated_tcp import GatedTcp
 from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF, lan_run
 import _flowtable_rig as ft
@@ -782,6 +782,97 @@ async def test_tcp(pppoe_rig):
     # The forward direction leaves by the session, so it carries the session's
     # MTU; nothing in this test set it, and the eight bytes are already in it.
     assert int(forward["mtu"]) == SESSION_MTU, forward
+    _assert_carried(r, measured)
+
+
+@pytest.mark.parametrize("pppoe_rig", ["openwrt"], indirect=True)
+async def test_openwrt_lan(pppoe_rig):
+    """OpenWrt's own LAN behind the session: the station sits on a br-lan port
+    whose address is not the bridge's, as it does on every port but one.
+
+    The download is held in hardware and leaves by the station's port through
+    the bridge, and the exchange checks that every frame towards the station
+    carries the bridge's address as its source, as the software path's do. The
+    UDP upload is Linux's (see the module docstring); test_openwrt_lan_tcp
+    carries both directions.
+    """
+    r = pppoe_rig
+    flows, delta = await _established(r)
+    reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
+    _assert_session(r, None, reverse)
+    assert reverse["out_br"] == r.dut_lan_if and reverse["out_vlan"] == "-", reverse
+    assert int(reverse["mtu"]) == 1500, reverse
+    assert all(d == 64 for d in delta.values()), delta
+    r.record("pppoe-openwrt", {"flows": flows, "delta": delta,
+                               "session": _session_text(r.session_identity)})
+
+
+@pytest.mark.parametrize("pppoe_rig", ["openwrt-tcp"], indirect=True)
+async def test_openwrt_lan_tcp(pppoe_rig):
+    """Both directions between OpenWrt's br-lan and a session, in hardware: the
+    upload enters by the station's bridge port and inserts the session, the
+    download strips it and leaves by that port, and the session's record counts
+    both halves into the ppp device."""
+    r = pppoe_rig
+    await r.table()
+    measured = await _tcp_carried(r, "flowtable_pppoe_openwrt_tcp")
+    flows = measured["flows"]
+    r.record("pppoe-openwrt-tcp", {**measured, "session": _session_text(r.session_identity)})
+    forward = _direction(flows, r.lan_ip, INNER_LOCAL)
+    reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
+    _assert_session(r, forward, reverse)
+    assert forward["in_br"] == r.dut_lan_if and reverse["out_br"] == r.dut_lan_if, (forward,
+                                                                                   reverse)
+    assert int(forward["mtu"]) == SESSION_MTU, forward
+    _assert_carried(r, measured)
+
+
+@pytest.mark.parametrize("pppoe_rig", ["cloned-tcp"], indirect=True)
+async def test_cloned_wan_mac(pppoe_rig):
+    """A session over a device carrying a cloned MAC, as an ISP that binds the
+    line to one requires (OpenWrt's `macaddr` on the WAN).
+
+    The concentrator finds a session's frames by their source address as well
+    as by the session id (pppoe_rcv()), so the upload reaching it from hardware
+    at all is the wire's proof that the insert writes the clone rather than
+    the port's own address -- which would be dropped there, unanswered.
+    """
+    r = pppoe_rig
+    lower = (await read(r.target, r.session, f"/sys/class/net/{r.ppp_lower}/address")).strip()
+    port = (await read(r.target, r.session, f"/sys/class/net/{TARGET_WAN_IF}/address")).strip()
+    assert lower == CLONED_WAN_MAC != port, (lower, port)
+    await r.table()
+    measured = await _tcp_carried(r, "flowtable_pppoe_cloned_tcp")
+    flows = measured["flows"]
+    r.record("pppoe-cloned-tcp", {**measured, "session": _session_text(r.session_identity)})
+    forward = _direction(flows, r.lan_ip, INNER_LOCAL)
+    reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
+    _assert_session(r, forward, reverse)
+    _assert_carried(r, measured)
+
+
+@pytest.mark.parametrize("pppoe_rig", ["bridged-wan-tcp"], indirect=True)
+async def test_bridged_wan(pppoe_rig):
+    """A session over a VLAN device on a bridged WAN: br-wan, whose address is
+    its own rather than its port's, and br-wan.3900 over it.
+
+    The session's frames carry br-wan.3900's address, which is the bridge's,
+    and the concentrator answers a session only from the source it was
+    negotiated with (pppoe_rcv()), so the upload reaching it from hardware is
+    the wire's proof of the source the insert writes.
+    """
+    r = pppoe_rig
+    lower = (await read(r.target, r.session, f"/sys/class/net/{r.ppp_lower}/address")).strip()
+    port = (await read(r.target, r.session, f"/sys/class/net/{TARGET_WAN_IF}/address")).strip()
+    assert lower == r.wan_bridge_mac != port, (lower, port)
+    await r.table()
+    measured = await _tcp_carried(r, "flowtable_pppoe_bridged_wan_tcp")
+    flows = measured["flows"]
+    r.record("pppoe-bridged-wan-tcp", {**measured, "session": _session_text(r.session_identity)})
+    forward = _direction(flows, r.lan_ip, INNER_LOCAL)
+    reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
+    _assert_session(r, forward, reverse)
+    assert forward["out_br"] != "-" and reverse["in_br"] != "-", (forward, reverse)
     _assert_carried(r, measured)
 
 

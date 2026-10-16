@@ -1264,7 +1264,7 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 			 const struct nf_flow_tunnel *tunnel,
 			 struct cdx_ft_vlan *stack, struct net_device **bridge,
 			 u16 *bridge_vid, struct cdx_ft_session *out_session,
-			 struct cdx_ft_tunnel *out_tunnel)
+			 struct cdx_ft_tunnel *out_tunnel, struct net_device **source)
 {
 	/* Zeroed so a tag the bridge adds carries no device: ft_bridge_vlan()
 	 * writes the tag and leaves ifindex alone. */
@@ -1272,6 +1272,8 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 	unsigned int count = 0, i;
 	int vid;
 
+	if (source)
+		*source = NULL;
 	*bridge = NULL;
 	*bridge_vid = 0;
 	memset(out_session, 0, sizeof(*out_session));
@@ -1308,21 +1310,20 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 		lower = __dev_get_by_index(&init_net, session->lower_ifindex);
 		if (!lower)
 			return -EOPNOTSUPP;
-		/* The rule the VLAN increment imposes on a logical device,
-		 * applied to the one device a session hides: the Ethernet
-		 * source of a neighbour-output flow is the port's and the
-		 * encoder caches one address per port, so a device below the
-		 * session that overrides it would have software and hardware
-		 * disagree. A ppp device carries no address of its own, so this
-		 * is where that rule has to be stated. */
-		if (!ether_addr_equal(lower->dev_addr, physical->dev_addr))
-			return -EOPNOTSUPP;
 		out_session->present = true;
 		out_session->id = session->id;
 		out_session->lower_ifindex = session->lower_ifindex;
 		ether_addr_copy(out_session->mac, session->h_dest);
 		logical = lower;
 	}
+	/* The device Linux hands the outermost Ethernet frame to: below any
+	 * tunnel and session, above every tag and bridge. Its address is the
+	 * frame's source -- a bridge's own rather than its egress port's, a
+	 * VLAN device's even where it overrides its parent's, the one under a
+	 * session that pppoe_xmit() builds the header against -- so it is what
+	 * the hardware has to write too. Only an egress asks. */
+	if (source)
+		*source = logical;
 	/* Each step strictly descends and the tag count is bounded, so a path
 	 * that never reaches the port terminates at the bound. The bridge hop
 	 * is terminal, which is what bounds it there. */
@@ -1760,6 +1761,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	struct flow_match_ports ports;
 	struct flow_match_tcp tcp;
 	const struct flow_action_entry *action;
+	struct net_device *source;
 	u32 mark, mtu;
 	u8 policer;
 	static const u32 offsets[4] = { 4, 8, 0, 4 };
@@ -1879,13 +1881,14 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	vlans = ft_path_stack(out->out_logical, out->out, cls->nf_session,
 			      cls->nf_tunnel, out->out_vlan, &out->out_bridge,
 			      &out->out_bridge_vid, &out->out_session,
-			      &out->out_tunnel);
+			      &out->out_tunnel, &source);
 	if (vlans < 0)
 		return vlans;
 	out->out_vlans = vlans;
 	vlans = ft_path_stack(out->in_logical, out->in, cls->nf_session_reverse,
 			      cls->nf_tunnel_reverse, out->in_vlan, &out->in_bridge,
-			      &out->in_bridge_vid, &out->in_session, &out->in_tunnel);
+			      &out->in_bridge_vid, &out->in_session, &out->in_tunnel,
+			      NULL);
 	if (vlans < 0)
 		return vlans;
 	out->in_vlans = vlans;
@@ -1903,27 +1906,21 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	     out->in_tunnel.mode != (family == AF_INET6 ? CDX_FT_TUNNEL_6O4 :
 				     CDX_FT_TUNNEL_4O6)))
 		return ask_refuse(-EOPNOTSUPP);
-	/* The Ethernet source a neighbour-output flow carries is the physical
-	 * port's, and the encoder caches exactly one address per port. A logical
-	 * device that does not share that address would have software emit one
-	 * source MAC and hardware another for the same flow, so it is declined
-	 * rather than left silently divergent. A VLAN device normally inherits
-	 * its parent's address; a bridge normally takes its lowest port's, so
-	 * this also decides which ports of a multi-port bridge are eligible.
-	 * A ppp device has no address at all -- addr_len is zero -- so where a
-	 * session is present the same rule is imposed by the walk, on the
-	 * device below it, which is the one that does have one. A tunnel
-	 * device's address is its local IP address, so the same applies. */
-	if (!out->out_session.present && !out->out_tunnel.present &&
-	    !ether_addr_equal(out->out_logical->dev_addr, out->out->dev_addr))
+	/* The Ethernet source is the address of the device the walk found Linux
+	 * transmitting from (ft_path_stack()), which on an OpenWrt LAN is the
+	 * bridge: every port but the one whose address the bridge took differs
+	 * from it, and software sends with the bridge's. The encoder writes the
+	 * entry's own source, so nothing about the port has to agree; only an
+	 * address no frame may carry is declined. */
+	if (!source || !is_valid_ether_addr(source->dev_addr))
 		return ask_refuse(-EOPNOTSUPP);
-	if (out->out_tunnel.present && !out->out_session.present) {
-		struct net_device *lower = __dev_get_by_index(
-			&init_net, out->out_tunnel.lower_ifindex);
-
-		if (!lower || !ether_addr_equal(lower->dev_addr, out->out->dev_addr))
-			return ask_refuse(-EOPNOTSUPP);
-	}
+	/* A VAP is the exception for now: its frames leave through the Wi-Fi
+	 * driver, and a source other than its own has not been proved there on
+	 * the wire, so it keeps the rule it had -- the VAP's own address or
+	 * software. */
+	if (!cdx_ft_port_supported(out->out) &&
+	    !ether_addr_equal(source->dev_addr, out->out->dev_addr))
+		return ask_refuse(-EOPNOTSUPP);
 	/* Re-entering the port a frame arrived on is a hairpin, and needs full
 	 * NAT to be a distinct path -- unless the two stacks differ, which is
 	 * ordinary routing between VLANs carried on one trunk, or the two
@@ -1986,9 +1983,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		memcpy(ethernet + offsets[i], &word, sizeof(word));
 	}
 	/* Neighbours, the borrowed destination and the payload bound all belong
-	 * to the logical egress device. The Ethernet source is the physical
-	 * port's, because that is the address Netfilter writes for a
-	 * neighbour-output flow and the only one the encoder can cache. */
+	 * to the logical egress device, and so does the Ethernet source (the
+	 * walk's source device, checked above). */
 	if (!ft_vlan_actions(&rule->action, out) ||
 	    !ft_next_hop(cls, out->out_logical, family, &out->new_dst, next_hop,
 			 &out->next_hop_family) ||
@@ -2073,6 +2069,11 @@ static int ft_parse(struct cdx_ft_binding *binding,
 			return ask_refuse(-EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, ethernet);
 	}
+	/* Netfilter's own source words name the egress port's address as it
+	 * was when the rule was built (the reverse tuple's ingress port). They
+	 * are not what the hardware writes, but one that no longer matches the
+	 * port says the offer predates an address change, so it is retired as
+	 * stale and the next offer is built against the port as it is now. */
 	if (!ether_addr_equal(ethernet + ETH_ALEN, out->out->dev_addr))
 		return ask_refuse(-ESTALE);
 	out->mtu = mtu;
@@ -2083,7 +2084,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		ft_handle_invalidate(cls->nf_handle, &ft_mtu_invalidations);
 		return ask_refuse(-EOPNOTSUPP);
 	}
-	ether_addr_copy(out->src_mac, ethernet + ETH_ALEN);
+	ether_addr_copy(out->src_mac, source->dev_addr);
 	/* Last, because a tc police filter is matched against the finished
 	 * tuple. A filter is the more specific statement of the same intent as
 	 * the mark, so where one claims this flow its profile replaces the
