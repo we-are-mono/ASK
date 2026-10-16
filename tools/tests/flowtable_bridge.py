@@ -45,6 +45,10 @@ ROAM_VID = ACCESS_VID + 2
 # out of one silently aliases as soon as it does.
 TAGGED_SUBNET, DUT_TAGGED_ADDR, LAN_TAGGED_ADDR = "172.29.73.0/24", "172.29.73.1", "172.29.73.2"
 SNAT_ADDR = "172.29.73.9"
+# The "vlanport" shape's VLAN: a VLAN device on eth3 is the bridge's port.
+# Claimed in _topology.py, with its subnet.
+PORT_VID = int(os.environ.get("ASK_FLOWTABLE_BRIDGE_PORT_VID", "333"))
+PORT_SUBNET, DUT_PORT_ADDR, LAN_PORT_ADDR = "172.29.78.0/24", "172.29.78.1", "172.29.78.2"
 # The station's address on the second bridge port, and an address on that
 # subnet that answers nothing: the ARP for it is the roaming stimulus.
 ROAM_ADDR, ROAM_PROBE = "172.29.75.2", "172.29.75.1"
@@ -122,6 +126,27 @@ async def _bridged_segment(r, stack, shape):
         return None
 
     r.bridge = BRIDGE
+    if shape == "vlanport":
+        # A bridge whose port is a VLAN device on the physical one: br-ft
+        # over eth3.N, the way OpenWrt bridges a VLAN without bridge-vlan
+        # sections. eth3 keeps its own address and traffic; only VLAN N is
+        # bridged, so the tag comes from the port's device, not the bridge.
+        port = await dut_vlan_subif(stack, r.target, r.session, parent=TARGET_LAN_IF,
+                                    vid=PORT_VID)
+        await dut("ip", "link", "del", BRIDGE, check=False)
+        await dut("ip", "link", "add", "name", BRIDGE, "type", "bridge")
+        stack.push(lambda: dut("ip", "link", "del", BRIDGE, check=False))
+        await dut("ip", "link", "set", port, "master", BRIDGE)
+        await dut("ip", "link", "set", BRIDGE, "up")
+        await dut("ip", "addr", "add", f"{DUT_PORT_ADDR}/24", "dev", BRIDGE)
+        r.bridge_port = port
+        r.dut_lan_if, r.bridge_text = BRIDGE, BRIDGE
+        r.peer_if = await lan_vlan_subif(
+            stack, r.lan, parent=LAN_NIC, vid=PORT_VID, ipv4=f"{LAN_PORT_ADDR}/24",
+            routes=[f"{WAN_IP}/32 via {DUT_PORT_ADDR} dev vlan{PORT_VID}"])
+        r.peer_link = LAN_NIC
+        return await _segment_peer(r, PORT_SUBNET)
+
     # The DUT's LAN address moves onto the bridge, so the flow's logical
     # egress device is the bridge (or a VLAN on it) rather than the port.
     lan_cidr = json.loads((await dut("ip", "-j", "-4", "addr", "show",
@@ -173,6 +198,11 @@ async def _bridged_segment(r, stack, shape):
             r.peer_if, r.peer_link = lan_if, LAN_NIC
             subnet = TAGGED_SUBNET
 
+    return await _segment_peer(r, subnet)
+
+
+async def _segment_peer(r, subnet):
+    """The station's side of a bridged segment, once the DUT's is up."""
     def lan_json(cmd):
         result = r.lan.run(cmd, timeout=10)
         assert result.rc == 0, result.stdout
@@ -208,7 +238,7 @@ async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
     """
     shape = getattr(request, "param", "plain")
     assert shape in {"plain", "access", "tagged", "tcp", "openwrt", "openwrt-tcp", "openwrt-vlan",
-                     "openwrt-wan"}
+                     "openwrt-wan", "vlanport", "vlanport-tcp"}
     r = Rig()
     r.proto = "tcp" if shape.endswith("tcp") else "udp"
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
@@ -223,7 +253,7 @@ async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
     try:
         await command(r.target, r.session, "modprobe", "xt_tcpudp")
         segment = {"tcp": "access", "openwrt-tcp": "openwrt",
-                   "openwrt-wan": "openwrt"}.get(shape, shape)
+                   "openwrt-wan": "openwrt", "vlanport-tcp": "vlanport"}.get(shape, shape)
         subnet = await _bridged_segment(r, stack, segment)
         r.dut_wan_mac = (await read(r.target, r.session,
                                     f"/sys/class/net/{TARGET_WAN_IF}/address")).strip()
@@ -554,6 +584,31 @@ async def test_vlan_tagged(bridge_rig):
     r.record("bridge-vlan-tagged", {"flows": flows, "delta": delta})
 
 
+@pytest.mark.parametrize("bridge_rig", ["vlanport"], indirect=True)
+async def test_vlan_port(bridge_rig):
+    """A bridge whose port is a VLAN device: br-ft over eth3.N.
+
+    The flow's LAN side crosses the bridge and then the port's own VLAN
+    device, so the tag on the wire is that device's -- stripped on the way in
+    and pushed on the way out -- and the bridge, which filters nothing, adds
+    none. The FDB learns the station on the VLAN device, and that is the port
+    the entry is pinned to."""
+    r = bridge_rig
+    flows, delta = await _established(r)
+    forward = _direction(flows, r.lan_ip, WAN_IP)
+    reverse = _direction(flows, WAN_IP, r.lan_ip)
+    _assert_ports(r, forward, reverse)
+    assert forward["in_vlan"] == str(PORT_VID) and forward["out_vlan"] == "-", forward
+    assert reverse["out_vlan"] == str(PORT_VID) and reverse["in_vlan"] == "-", reverse
+    assert all(d == 64 for d in delta.values()), delta
+    assert await _fdb(r, r.lan_mac) == [r.bridge_port]
+    r.record("bridge-vlan-port", {"flows": flows, "delta": delta})
+    # The VLAN device is a dependency of both directions, as the port is:
+    # leaving the bridge takes them out of hardware.
+    await command(r.target, r.session, "ip", "link", "set", r.bridge_port, "nomaster")
+    await r.wait(lambda s: not s["flows"], timeout=5)
+
+
 async def test_fdb_roaming(bridge_rig):
     """A station that reappears on another bridge port retires its flow.
 
@@ -754,7 +809,39 @@ async def test_bridge_above_its_port(bridge_rig):
                       check=False)
 
 
-@pytest.mark.parametrize("bridge_rig", ["tcp", "openwrt-tcp"], indirect=True)
+@pytest.mark.parametrize("bridge_rig", ["vlanport"], indirect=True)
+async def test_vlan_port_mtu(bridge_rig):
+    """The bridge checks what it forwards against its port, and the port here
+    is the VLAN device: with eth3 and the bridge raised to 9000 bytes and
+    eth3.N left at 1500, Linux drops anything larger at eth3.N
+    (is_skb_forwardable()), so the direction leaving through it describes
+    1500 -- not the physical port's 9000 (A340)."""
+    r = bridge_rig
+    await r.table()
+    port_mtu = int((await read(r.target, r.session,
+                               f"/sys/class/net/{r.bridge_port}/mtu")).strip())
+    phys_mtu = int((await read(r.target, r.session,
+                               f"/sys/class/net/{TARGET_LAN_IF}/mtu")).strip())
+    before = await _settled(r, {TARGET_LAN_IF: port_mtu, TARGET_WAN_IF: port_mtu})
+    try:
+        await command(r.target, r.session, "ip", "link", "set", TARGET_LAN_IF, "mtu", "9000")
+        await command(r.target, r.session, "ip", "link", "set", BRIDGE, "mtu", "9000")
+        assert int((await read(r.target, r.session,
+                               f"/sys/class/net/{r.bridge_port}/mtu")).strip()) == port_mtu
+        await r.wait(lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
+        # Only the direction toward the station: the other one now arrives
+        # on a 9000-byte MAC and is UDP into a 1500-byte path, which stays in
+        # software by design (FULL_FRAME, _topology.py).
+        raised = await _settled(r, {TARGET_LAN_IF: port_mtu}, since=before)
+        r.record("bridge-vlan-port-mtu", {"before": before, "raised": raised})
+    finally:
+        await command(r.target, r.session, "ip", "link", "set", BRIDGE, "mtu", str(port_mtu),
+                      check=False)
+        await command(r.target, r.session, "ip", "link", "set", TARGET_LAN_IF, "mtu",
+                      str(phys_mtu), check=False)
+
+
+@pytest.mark.parametrize("bridge_rig", ["tcp", "openwrt-tcp", "vlanport-tcp"], indirect=True)
 async def test_tcp(bridge_rig):
     """An established TCP connection over the shipping bridged topology.
 
@@ -775,7 +862,10 @@ async def test_tcp(bridge_rig):
     forward = _direction(before["flows"], r.lan_ip, WAN_IP)
     reverse = _direction(before["flows"], WAN_IP, r.lan_ip)
     _assert_ports(r, forward, reverse)
-    assert forward["in_vlan"] == "-" and reverse["out_vlan"] == "-", (forward, reverse)
+    # The access and OpenWrt shapes put no tag on the station's wire; the
+    # VLAN-device port puts its own.
+    tag = str(PORT_VID) if r.bridge_port != TARGET_LAN_IF else "-"
+    assert forward["in_vlan"] == tag and reverse["out_vlan"] == tag, (forward, reverse)
     old = {f["cookie"]: int(f["packets"]) for f in before["flows"]}
     new = {f["cookie"]: int(f["packets"]) for f in after["flows"]}
     assert_undisturbed(r, before, after, old.keys() == new.keys()

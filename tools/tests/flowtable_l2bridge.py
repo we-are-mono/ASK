@@ -40,11 +40,11 @@ import pytest
 import pytest_asyncio
 
 from ask_orch.counters import kernel_rx_packets
-from _flowtable_rig import Rig, command, release_latch, stop_boot_daemon
+from _flowtable_rig import Rig, command, read, release_latch, stop_boot_daemon
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _throughput import MOVED, RAMP, SOFTWARE_TX, STAGING, STREAMS, WINDOW, settled
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN,
-                       TopologyStack, lan_run, lan_run_python, lan_vlan_subif)
+                       TopologyStack, dut_vlan_subif, lan_run, lan_run_python, lan_vlan_subif)
 
 BRIDGE = "br-l2"
 # The bench VLAN wan3900 already carries between the WAN host and eth4: only
@@ -57,6 +57,9 @@ PEER_IF = "ask-l2-peer"
 PEER_MAC = "02:00:00:00:12:02"
 # Claimed in _topology.py. Neither end is the DUT's.
 PEER_ADDR, STATION_ADDR = "172.29.77.1", "172.29.77.2"
+# The "vlanport" shape's VLAN on the LAN segment: eth3's VLAN device for it
+# is the bridge's port. Claimed in _topology.py.
+PORT_VID = int(os.environ.get("ASK_FLOWTABLE_L2_PORT_VID", "334"))
 PREFIX = 24
 IPERF_PORT = 5212
 TABLE = "ask_l2"
@@ -112,16 +115,24 @@ async def _carried(r, timeout=10):
 async def _segment(r, stack, shape):
     """br-l2 over eth3 and eth4, as the module docstring describes. The
     "trunk" shape has the LAN VM tagged 3900 on eth3 as well, which has no
-    PVID then: both pairs are tagged on the way in and on the way out."""
+    PVID then: both pairs are tagged on the way in and on the way out. The
+    "vlanport" shape bridges eth3's VLAN device for PORT_VID instead of eth3,
+    the way OpenWrt bridges a VLAN without bridge-vlan sections: the station's
+    tag is that device's, and eth3 keeps its own address."""
     async def dut(*argv, check=True):
         return await command(r.target, r.session, *argv, check=check)
+
+    r.lan_port = TARGET_LAN_IF
+    if shape.startswith("vlanport"):
+        r.lan_port = await dut_vlan_subif(stack, r.target, r.session, parent=TARGET_LAN_IF,
+                                          vid=PORT_VID)
 
     def addresses(output):
         return [f"{a['local']}/{a['prefixlen']}" for link in json.loads(output or "[]")
                 for a in link["addr_info"] if "local" in a]
 
     held = {}
-    for port in (TARGET_LAN_IF, TARGET_WAN_IF):
+    for port in (r.lan_port, TARGET_WAN_IF):
         v4 = (await dut("ip", "-j", "-4", "addr", "show", "dev", port))["stdout"]
         v6 = (await dut("ip", "-j", "-6", "addr", "show", "dev", port, "scope", "global"))["stdout"]
         held[port] = (addresses(v4), addresses(v6))
@@ -160,15 +171,15 @@ async def _segment(r, stack, shape):
         await dut("ip", "link", "set", port, "master", BRIDGE)
     await dut("bridge", "vlan", "add", "dev", TARGET_WAN_IF, "vid", "1", "pvid", "untagged")
     await dut("bridge", "vlan", "add", "dev", TARGET_WAN_IF, "vid", str(VID))
-    await dut("bridge", "vlan", "add", "dev", TARGET_LAN_IF, "vid", str(VID),
-              *(["pvid", "untagged"] if shape == "access" else []))
+    await dut("bridge", "vlan", "add", "dev", r.lan_port, "vid", str(VID),
+              *([] if shape.endswith("trunk") else ["pvid", "untagged"]))
     await dut("bridge", "vlan", "add", "dev", BRIDGE, "vid", "1", "pvid", "untagged", "self")
     await dut("bridge", "vlan", "add", "dev", BRIDGE, "vid", str(VID), "self")
     await dut("ip", "link", "set", BRIDGE, "up")
     lan_l3 = f"{BRIDGE}.{VID}"
     await dut("ip", "link", "add", "link", BRIDGE, "name", lan_l3, "type", "vlan", "id", str(VID))
     await dut("ip", "link", "set", lan_l3, "up")
-    for port, l3 in ((TARGET_WAN_IF, BRIDGE), (TARGET_LAN_IF, lan_l3)):
+    for port, l3 in ((TARGET_WAN_IF, BRIDGE), (r.lan_port, lan_l3)):
         v4, v6 = held[port]
         for address in v4:
             await dut("ip", "addr", "add", address, "dev", l3)
@@ -183,14 +194,39 @@ async def _segment(r, stack, shape):
     stack.push(lambda: _local("ip", "netns", "del", NAMESPACE))
     await _local("ip", "link", "add", "link", "wan3900", "name", PEER_IF, "address", PEER_MAC,
                  "netns", NAMESPACE, "type", "macvlan", "mode", "bridge")
-    for dev in ("lo", PEER_IF):
-        await _local("ip", "-n", NAMESPACE, "link", "set", dev, "up")
+    await _local("ip", "-n", NAMESPACE, "link", "set", "lo", "up")
+    # A namespace deleted a moment ago is torn down asynchronously, and its
+    # macvlan holds PEER_MAC on wan3900 until it is: wait that out.
+    for _ in range(50):
+        if not (await _local("ip", "-n", NAMESPACE, "link", "set", PEER_IF, "up",
+                             check=False))["rc"]:
+            break
+        await asyncio.sleep(0.2)
+    else:
+        await _local("ip", "-n", NAMESPACE, "link", "set", PEER_IF, "up")
     await _local("ip", "-n", NAMESPACE, "addr", "add", f"{PEER_ADDR}/{PREFIX}", "dev", PEER_IF)
 
     # The station: a second address on the LAN VM's port, or on a VLAN
     # device over it.
-    if shape == "trunk":
-        await lan_vlan_subif(stack, r.lan, parent=LAN_NIC, vid=VID, ipv4=f"{STATION_ADDR}/{PREFIX}")
+    if shape == "vlanport-trunk":
+        # Two tags: the port's VLAN device's outside, the bridge's inside.
+        outer = await lan_vlan_subif(stack, r.lan, parent=LAN_NIC, vid=PORT_VID)
+        await lan_vlan_subif(stack, r.lan, parent=outer, vid=VID, ipv4=f"{STATION_ADDR}/{PREFIX}")
+        # A full-size frame with both tags is a tag longer than the VLAN
+        # VM's port receives at its MTU; raised after the VLAN devices, which
+        # keep theirs, so only the frames grow, never the packets.
+        base = json.loads((await lan_run(r.lan, f"ip -j link show dev {LAN_NIC}", 10)).stdout)
+        base_mtu = base[0]["mtu"]
+        raised = await lan_run(r.lan, f"ip link set {LAN_NIC} mtu {base_mtu + 4}", 10)
+        assert raised.rc == 0, raised.stdout
+
+        async def lower_lan_mtu():
+            result = await lan_run(r.lan, f"ip link set {LAN_NIC} mtu {base_mtu}", 10)
+            return {"rc": result.rc, "stdout": result.stdout}
+        stack.push(lower_lan_mtu)
+    elif shape != "access":
+        await lan_vlan_subif(stack, r.lan, parent=LAN_NIC, vid=VID if shape == "trunk" else PORT_VID,
+                             ipv4=f"{STATION_ADDR}/{PREFIX}")
     else:
         await lan_run(r.lan, f"ip addr del {STATION_ADDR}/{PREFIX} dev {LAN_NIC} 2>/dev/null; true", 10)
         checked = await lan_run(r.lan, f"ip addr add {STATION_ADDR}/{PREFIX} dev {LAN_NIC}", 10)
@@ -215,9 +251,11 @@ async def _segment(r, stack, shape):
 
 @pytest_asyncio.fixture
 async def l2_rig(target_agent, aiohttp_session, lan, splat_window, request):
-    """The parameter selects the shape: "access" (default) or "trunk"."""
+    """The parameter selects the shape: "access" (default), "trunk",
+    "vlanport", or "vlanport-trunk" -- the VLAN-device port tagged for the
+    bridge's VLAN too, so the station's frames carry two tags."""
     shape = getattr(request, "param", "access")
-    assert shape in {"access", "trunk"}
+    assert shape in {"access", "trunk", "vlanport", "vlanport-trunk"}
     r = Rig()
     r.shape = shape
     r.target, r.session, r.lan = target_agent, aiohttp_session, lan
@@ -245,30 +283,41 @@ async def l2_rig(target_agent, aiohttp_session, lan, splat_window, request):
         assert final["l2_entries"] == 0, final
 
 
-@pytest.mark.parametrize("l2_rig", ["access", "trunk"], indirect=True)
+# What each shape's pairs strip on the way in and push on the way out, by
+# ingress: the station's (eth3 or its VLAN device) and the peer's (eth4).
+TAGS = {
+    "access": {"station": ("0", "-", str(VID)), "peer": ("1", str(VID), "-")},
+    "trunk": {"station": ("1", str(VID), str(VID)), "peer": ("1", str(VID), str(VID))},
+    "vlanport": {"station": ("0", str(PORT_VID), str(VID)),
+                 "peer": ("1", str(VID), str(PORT_VID))},
+    "vlanport-trunk": {"station": ("1", f"{PORT_VID}.{VID}", str(VID)),
+                       "peer": ("1", str(VID), f"{PORT_VID}.{VID}")},
+}
+
+
+@pytest.mark.parametrize("l2_rig", ["access", "trunk", "vlanport", "vlanport-trunk"], indirect=True)
 async def test_l2_pairs_in_hardware(l2_rig):
     """Both directions installed with the rewrite each needs, and the
     classifier carries every frame of a burst while the DUT's kernel sends
     none of them."""
     r = l2_rig
-    trunk = r.shape == "trunk"
     await _exchange(r, count=4)
     state = await _carried(r)
     pairs = _pairs(r, state)
     r.record("l2-pairs", pairs)
-    out = pairs[TARGET_LAN_IF]
-    assert (out["out"], out["br"], out["dst"], out["src"]) == \
-        (TARGET_WAN_IF, BRIDGE, PEER_MAC, r.station_mac), out
-    # Untagged in, the port's PVID, and tagged on the way out -- or, from a
-    # trunk, tagged in, validated and stripped, and tagged again.
+    out = pairs[r.lan_port]
+    assert (out["out"], out["port_in"], out["port_out"], out["br"], out["dst"], out["src"]) == \
+        (TARGET_WAN_IF, TARGET_LAN_IF, TARGET_WAN_IF, BRIDGE, PEER_MAC, r.station_mac), out
+    # Whatever arrives tagged is validated and stripped, all of it, and the
+    # egress tags are pushed afresh: the port's own VLAN device's outermost,
+    # the bridge's inside it.
     assert (out["type"], out["vid"], out["tagged"], out["in_vlan"], out["out_vlan"]) == \
-        ("0x0800", str(VID), "1" if trunk else "0", "strip" if trunk else "-", str(VID)), out
+        ("0x0800", str(VID), *TAGS[r.shape]["station"]), out
     back = pairs[TARGET_WAN_IF]
-    assert (back["out"], back["dst"], back["src"]) == (TARGET_LAN_IF, r.station_mac, PEER_MAC), back
-    # Tagged in, validated and stripped, untagged on the way out to an
-    # access port and tagged again to a trunk.
+    assert (back["out"], back["port_in"], back["port_out"], back["dst"], back["src"]) == \
+        (r.lan_port, TARGET_WAN_IF, TARGET_LAN_IF, r.station_mac, PEER_MAC), back
     assert (back["type"], back["vid"], back["tagged"], back["in_vlan"], back["out_vlan"]) == \
-        ("0x0800", str(VID), "1", "strip", str(VID) if trunk else "0"), back
+        ("0x0800", str(VID), *TAGS[r.shape]["peer"]), back
     # The router's own frames are routed, never a pair.
     assert not [row for row in state["l2flows"] if row["dst"] == r.bridge_mac], state["l2flows"]
 
@@ -347,7 +396,7 @@ print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout, 'stderr': r
             await asyncio.wait_for(server.communicate(), 10)
 
 
-@pytest.mark.parametrize("l2_rig", ["access", "trunk"], indirect=True)
+@pytest.mark.parametrize("l2_rig", ["access", "trunk", "vlanport", "vlanport-trunk"], indirect=True)
 @pytest.mark.parametrize("upload", [True, False], ids=["station-to-peer", "peer-to-station"])
 async def test_l2_line_rate(l2_rig, upload):
     """Line rate between the stations, carried by the two pairs throughout,
@@ -373,6 +422,45 @@ async def test_l2_line_rate(l2_rig, upload):
         "a carried pair was retired: its FDB entries aged out under it"
     assert len(_pairs(r, end)) == 2, end["l2flows"]
     assert max(samples) >= MIN_RATE, (samples, MIN_RATE)
+
+
+@pytest.mark.parametrize("l2_rig", ["access", "vlanport"], indirect=True)
+async def test_l2_port_leaves(l2_rig):
+    """A port leaving the bridge -- eth3, or the VLAN device on it that is
+    the bridge's port -- takes both pairs through it out of hardware."""
+    r = l2_rig
+    await _exchange(r, count=4)
+    before = await _carried(r)
+    await command(r.target, r.session, "ip", "link", "set", r.lan_port, "nomaster")
+    after = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+    assert after["l2_retired"] >= before["l2_retired"] + 2, (before, after)
+
+
+@pytest.mark.parametrize("l2_rig", ["vlanport"], indirect=True)
+async def test_l2_mtu(l2_rig):
+    """What arrives is what the physical port's MAC accepts, whatever the
+    VLAN device on it says: with eth3 raised to 9000 bytes under a 1500-byte
+    eth3.N, the station's frames can be larger than eth4 carries, which the
+    bridge drops and the hardware would fragment -- so that pair leaves the
+    hardware and stays out, while the other way still fits."""
+    r = l2_rig
+    phys_mtu = int((await read(r.target, r.session,
+                               f"/sys/class/net/{TARGET_LAN_IF}/mtu")).strip())
+    await _exchange(r, count=4)
+    before = await _carried(r)
+    try:
+        await command(r.target, r.session, "ip", "link", "set", TARGET_LAN_IF, "mtu", "9000")
+        await r.wait(lambda s: r.lan_port not in _pairs(r, s), timeout=5)
+        for _ in range(4):
+            await _exchange(r, count=4)
+            await asyncio.sleep(1)
+        state = await r.state()
+        pairs = _pairs(r, state)
+        assert r.lan_port not in pairs and TARGET_WAN_IF in pairs, state["l2flows"]
+        assert state["l2_refused"] > before["l2_refused"], (before, state)
+    finally:
+        await command(r.target, r.session, "ip", "link", "set", TARGET_LAN_IF, "mtu",
+                      str(phys_mtu), check=False)
 
 
 async def test_l2_fdb_delete_retires(l2_rig):

@@ -95,18 +95,30 @@ refuses any port reporting a switch parent — which a DPAA MAC never does. The
 exclusion is a property the gate proves, not one the hardware is assumed to
 have.
 
-## The bridge hop is terminal
+## The bridge hop
 
-`ft_path_stack()` accepts one bridge master and stops there. It does not
-descend through `netdev_for_each_lower_dev()`, as it does for a VLAN device: a
-bridge has many lower devices and the first is whichever was enslaved first,
-never the one the FDB chose. The port this flow leaves by is already known —
-it is what the redirect and the binding name — so the walk requires
-`netdev_master_upper_dev_get(physical)` to be that bridge and terminates.
-
-The same requirement declines a bridge port that is itself a stacked device: a
-VLAN device enslaved to the bridge hides whatever tag lies between it and the
-physical port, and the walk would derive a stack shorter than the wire carries.
+`ft_path_stack()` accepts one bridge master. It does not descend from it
+through `netdev_for_each_lower_dev()`, as it does from a VLAN device: a bridge
+has many lower devices and the first is whichever was enslaved first, never
+the one the FDB chose. The port this flow leaves by is already known — it is
+what the redirect and the binding name — so the walk finds the bridge's port
+from below instead (`ft_bridge_port()`): the physical port itself, or an
+802.1Q VLAN device on it that the bridge enslaves, which is how OpenWrt
+bridges a VLAN without `bridge-vlan` sections (`br-lan` over `eth0.10`). From
+that port the walk descends as anywhere else, so the port's own tag lands
+outside any the bridge adds, and the VLAN device is recorded with the tags --
+its counters, and the dependency that retires the flow when its state, its
+membership or its MTU changes, and whose MTU bounds the direction: the bridge
+checks a frame against its port (`is_skb_forwardable()`), which a VLAN device
+may set below the physical port's (`ft_port_mtu()`). A bridge that enslaves
+two VLAN devices of one physical port is ambiguous from below and declined, as
+is a second bridge on the way down. Where the physical port and a VLAN device
+on it are both the bridge's ports, the physical port is taken; a flow the FDB
+sent through the VLAN device then fails the exact action count and the
+pushes' VIDs, unless the bridge's own tag on the physical port is that same
+VID -- the same wire, with the port's STP and FDB dependencies attached in
+place of the device's. 1.0.7 carried the same shape (a bridged VLAN interface, sending
+with the bridge's address); 1.1.0 declined it until this walk.
 
 ## The fifth dependency
 
@@ -205,8 +217,8 @@ that would misforward if the delete were not watched.
 Beyond the rules a routed, tagged flow already satisfies:
 
 - Each logical device must reach its physical port through 802.1Q VLAN devices
-  and at most one bridge master, and that bridge must be the port's own
-  master. A bridge port that is itself a stacked device is declined.
+  and at most one bridge master, whose port is the physical port or one 802.1Q
+  VLAN device stack on it.
 - The effective tag stack, after the bridge's own transformation, is still
   bounded by `NF_FLOW_TABLE_ENCAP_MAX`.
 - The egress port must be a member of the VLAN the bridge resolved. It would
@@ -339,7 +351,15 @@ MAC), and an entry would take that copy away. Frames for the bridge's own
 address are the router's and are never recorded, and `br_fdb_forward_port()`
 (patch 163) answers only for learned entries, so a port's own address is not
 a destination either. Priority-tagged and 802.1ad-tagged frames stay in
-software. While any bridge-family hook other than the learners' own
+software. Either port may be an 802.1Q VLAN device on a physical port, as in
+the routed walk: the key is then the physical port's, the device's tag is
+checked and stripped on the way in and pushed outermost on the way out, the
+bridge's own inside it, and the physical ports are what must be bound. What
+can arrive is what the physical port's MAC accepts, so the egress port's MTU
+is held to that, not to a VLAN device's on the way in. Two VLAN devices of one
+physical port share its key, so the same pair through a second one stays in
+software. The rig runs pairs through a VLAN-device port alone ("vlanport") and
+tagged for the bridge's VLAN as well ("vlanport-trunk", two tags each way). While any bridge-family hook other than the learners' own
 is registered -- an nftables or ebtables chain, br_netfilter -- no pair is
 carried, exactly as for a bridged routed flow.
 

@@ -307,6 +307,16 @@ static bool is_vlan_dev(const struct net_device *d) { return d->real_dev && !d->
 static bool netif_is_bridge_master(const struct net_device *d) { return d->bridge; }
 static bool netif_is_bridge_port(const struct net_device *d) { return d->master && d->master->bridge; }
 static struct net_device *netdev_master_upper_dev_get(struct net_device *d) { return d->master; }
+static struct net_device *netdev_master_upper_dev_get_rcu(struct net_device *d) { return d->master; }
+/* The upper walk ft_bridge_port() searches from a physical port: over every
+ * device the fixtures build with (all_devices, defined with them), an upper
+ * being any device whose real_dev chain reaches the port. Each is visited
+ * twice, as the kernel's walk calls back again on backtracking through it. */
+struct netdev_nested_priv { unsigned char flags; void *data; };
+static int netdev_walk_all_upper_dev_rcu(struct net_device *dev,
+                                         int (*fn)(struct net_device *upper,
+                                                   struct netdev_nested_priv *priv),
+                                         struct netdev_nested_priv *priv);
 /* A port forwards unless a case blocks it, and MST is off unless a case turns
  * it on: the state every other case's bridge is in. */
 #define BR_STATE_DISABLED 0
@@ -2392,6 +2402,22 @@ static struct net_device *all_devices[] = { &in, &out, &out_tag, &in_tag, &out_q
                                             &upper, &decoy, &br, &br_tag, &in_br,
                                             &br_qinq, &ppp, &in_ppp,
                                             &sit, &in_sit, &ip6tnl, &in_ip6tnl };
+static int netdev_walk_all_upper_dev_rcu(struct net_device *dev,
+                                         int (*fn)(struct net_device *upper,
+                                                   struct netdev_nested_priv *priv),
+                                         struct netdev_nested_priv *priv)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(all_devices); i++)
+        for (struct net_device *d = all_devices[i]->real_dev; d; d = d->real_dev)
+            if (d == dev) {
+                int rc = fn(all_devices[i], priv) ?: fn(all_devices[i], priv);
+
+                if (rc)
+                    return rc;
+                break;
+            }
+    return 0;
+}
 static struct net_device *__dev_get_by_index(struct net *net, int ifindex)
 {
     assert(net == &init_net);
@@ -2451,6 +2477,9 @@ static void bridge_fixture(void)
     out.master = &br;
     in.master = &in_br;
     decoy.master = &br;
+    /* Only the port itself, unless a case enslaves a VLAN device on it. */
+    out_tag.master = out_qinq.master = in_tag.master = NULL;
+    out_tag.br_nvlans = 0;
     out.stp_blocked = in.stp_blocked = false;
     out.vid_blocked = in.vid_blocked = 0;
     ether_addr_copy(br.dev_addr, out.dev_addr);
@@ -2971,6 +3000,39 @@ static void test_bridge(void)
     assert(decoded.out_vlans == 1 && decoded.out_vlan[0].id == 300);
     assert(decoded.out_bridge == &br && decoded.out_bridge_vid == 100);
 
+    /* A bridge port that is a VLAN device on the physical one -- br-lan over
+     * eth3.100: the walk finds the port from below and descends from it, so
+     * the device's tag is pushed, recorded against it, and the bridge, which
+     * filters nothing, adds none. */
+    bridge_out_fixture();
+    out.master = NULL;
+    out_tag.master = &br;
+    encap_actions(0, (const u16[]){ 100 }, 1);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_vlans == 1 && decoded.out_vlan[0].id == 100 &&
+           decoded.out_vlan[0].ifindex == out_tag.ifindex);
+    assert(decoded.out_bridge == &br && decoded.out_bridge_vid == 0);
+    /* The same port as a tagged member of a vlan-aware bridge: two tags on
+     * the wire, the port's device's outermost and the bridge's inside it,
+     * as Netfilter pushes them. */
+    bridge_out_fixture();
+    out.master = NULL;
+    out_tag.master = &br;
+    br.vlan_filtering = true;
+    br.pvid = 200;
+    out_tag.br_nvlans = 1;
+    out_tag.br_vlans[0] = (struct br_vlan_entry){ .vid = 200, .flags = 0 };
+    encap_actions(0, (const u16[]){ 100, 200 }, 2);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_vlans == 2);
+    assert(decoded.out_vlan[0].id == 100 && decoded.out_vlan[0].ifindex == out_tag.ifindex);
+    assert(decoded.out_vlan[1].id == 200 && !decoded.out_vlan[1].ifindex);
+    assert(decoded.out_bridge == &br && decoded.out_bridge_vid == 200);
+    /* And the port's MTU, not the physical one's, bounds the direction. */
+    out_tag.mtu = 1400;
+    assert(ft_port_mtu(&decoded) == 1400);
+    out_tag.mtu = 1500;
+
 #define BRIDGE_REJECT(...) do { bridge_out_fixture(); __VA_ARGS__; \
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
     /* The port a bridged flow leaves by is the one the FDB chose, and the
@@ -2978,10 +3040,9 @@ static void test_bridge(void)
      * different path entirely. */
     BRIDGE_REJECT(out.master = NULL);
     BRIDGE_REJECT(out.master = &in_br);
-    /* A bridge port that is itself a stacked device hides whatever tag lies
-     * between it and the physical port, so the walk declines rather than
-     * deriving a stack it cannot see. */
-    BRIDGE_REJECT(out.master = NULL; out_tag.master = &br);
+    /* Two VLAN devices of the port both enslaved to the bridge: which one
+     * the FDB chose cannot be told from below, so the walk declines. */
+    BRIDGE_REJECT(out.master = NULL; out_tag.master = &br; out_qinq.master = &br);
     /* A vlan-aware bridge whose egress port is not a member of the resolved
      * VLAN would have failed the path walk outright, so Netfilter would never
      * have described this flow. The action list is made to agree with the tag

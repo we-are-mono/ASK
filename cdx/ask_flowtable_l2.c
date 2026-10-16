@@ -81,6 +81,9 @@ struct ft_l2_pair {
 	struct ft_l2_station dst_station, src_station;
 	struct list_head list;
 	struct ft_l2_seen key;
+	/* The bridge, its two ports -- what the FDB and the bridge's own
+	 * events name -- and, in the rule, the physical ports beneath them,
+	 * which are the same devices unless a port is a VLAN device. */
 	struct net_device *bridge, *in, *out;
 	struct cdx_ft_l2_rule rule;
 	struct cdx_ft_hw *hw;
@@ -119,9 +122,12 @@ static DECLARE_DELAYED_WORK(ft_l2_work, ft_l2_workfn);
 /* Counters for /proc. */
 static u64 ft_l2_installs, ft_l2_refused, ft_l2_retired, ft_l2_dropped, ft_l2_deferred;
 
+/* By the stations and EtherType alone, so that one bucket holds the pair on
+ * every port: two bridge ports that are VLAN devices of one physical port
+ * share its hardware key. */
 static u32 ft_l2_hash(const struct ft_l2_seen *s)
 {
-	return jhash(s->dst, 2 * ETH_ALEN, (u32)s->in_ifindex ^ ((u32)s->ethertype << 16));
+	return jhash(s->dst, 2 * ETH_ALEN, s->ethertype);
 }
 
 static u32 ft_l2_station_hash(const u8 *addr, u16 vid)
@@ -129,10 +135,12 @@ static u32 ft_l2_station_hash(const u8 *addr, u16 vid)
 	return jhash(addr, ETH_ALEN, vid);
 }
 
-/* Two observations share one hardware key when they arrive on one port with
- * one pair and one EtherType. Neither the VLAN nor the tag is in the key --
- * its EtherType is the frame's own, inside any tag -- so a pair tagged and
- * untagged, or tagged in two VLANs, on one port is one key. */
+/* Two observations share one hardware key when they arrive on one bridge
+ * port with one pair and one EtherType. Neither the VLAN nor the tag is in the
+ * key -- its EtherType is the frame's own, inside any tag -- so a pair tagged
+ * and untagged, or tagged in two VLANs, on one port is one key; and so is the
+ * pair on two VLAN devices of one physical port, which admission compares by
+ * the physical port it resolved. */
 static bool ft_l2_same_key(const struct ft_l2_seen *a, const struct ft_l2_seen *b)
 {
 	return a->in_ifindex == b->in_ifindex && a->ethertype == b->ethertype &&
@@ -290,6 +298,48 @@ static bool ft_l2_nf_egress_hooked(const struct net_device *dev)
 #endif
 }
 
+/* Down from a bridge port to the physical port it rides on: the port itself,
+ * or through 802.1Q VLAN devices only, whose tags are appended to `tags`
+ * outermost first. NULL for any other device, or more tags than a direction
+ * carries. Under RTNL. */
+static struct net_device *ft_l2_lower(struct net_device *port, struct cdx_ft_vlan *tags,
+				      u8 *count)
+{
+	struct cdx_ft_vlan found[CDX_FT_VLAN_MAX];
+	unsigned int n = 0, i;
+
+	while (is_vlan_dev(port)) {
+		if (n == CDX_FT_VLAN_MAX || vlan_dev_vlan_proto(port) != htons(ETH_P_8021Q))
+			return NULL;
+		found[n].proto = htons(ETH_P_8021Q);
+		found[n].id = vlan_dev_vlan_id(port);
+		found[n].ifindex = port->ifindex;
+		n++;
+		port = vlan_dev_priv(port)->real_dev;
+	}
+	if (*count + n > CDX_FT_VLAN_MAX)
+		return NULL;
+	/* Found innermost first; the wire has the lowest device's outermost. */
+	for (i = 0; i < n; i++)
+		tags[(*count)++] = found[n - 1 - i];
+	return port;
+}
+
+/* Whether a netdev chain runs on any VLAN device of a port's stack, on the
+ * way in or out: every one of them sees the frame in software. */
+static bool ft_l2_stack_hooked(const struct cdx_ft_vlan *tags, u8 count, bool ingress)
+{
+	struct net_device *dev;
+	u8 i;
+
+	for (i = 0; i < count; i++) {
+		dev = tags[i].ifindex ? __dev_get_by_index(&init_net, tags[i].ifindex) : NULL;
+		if (dev && (ingress ? ft_dev_nf_ingress_hooked(dev) : ft_l2_nf_egress_hooked(dev)))
+			return true;
+	}
+	return false;
+}
+
 /* How the bridge carries `vid` through `port`: whether the port is a member
  * and whether it sends the VLAN untagged. A bridge that does not filter
  * carries everything untagged. Under RTNL. */
@@ -315,7 +365,7 @@ static bool ft_l2_member(struct net_device *bridge, struct net_device *port, u16
  * the ingress can deliver. Fills the rule; false leaves the pair to software. */
 static bool ft_l2_resolve(const struct ft_l2_seen *s, struct ft_l2_pair *p)
 {
-	struct net_device *bridge, *in, *out;
+	struct net_device *bridge, *in, *out, *lower_in, *lower_out;
 	bool in_untagged, out_untagged;
 	u16 proto, pvid;
 
@@ -343,8 +393,14 @@ static bool ft_l2_resolve(const struct ft_l2_seen *s, struct ft_l2_pair *p)
 	out = br_fdb_forward_port(bridge, s->dst, s->vid);
 	if (!out || out == in || br_fdb_forward_port(bridge, s->src, s->vid) != in)
 		return false;
-	if (!ft_l2_bound(in) || !ft_l2_bound(out) ||
-	    !cdx_ft_port_supported(in) || !cdx_ft_port_supported(out))
+	memset(&p->rule, 0, sizeof(p->rule));
+	/* The tags of a port that is a VLAN device are outermost on the wire,
+	 * outside any the bridge adds. */
+	lower_in = ft_l2_lower(in, p->rule.in_vlan, &p->rule.in_vlans);
+	lower_out = ft_l2_lower(out, p->rule.out_vlan, &p->rule.out_vlans);
+	if (!lower_in || !lower_out || lower_in == lower_out ||
+	    !ft_l2_bound(lower_in) || !ft_l2_bound(lower_out) ||
+	    !cdx_ft_port_supported(lower_in) || !cdx_ft_port_supported(lower_out))
 		return false;
 	/* Port to port: the bridge's own VLAN entry plays no part. */
 	if (!br_port_bridging(in, s->vid) || !br_port_bridging(out, s->vid))
@@ -359,36 +415,43 @@ static bool ft_l2_resolve(const struct ft_l2_seen *s, struct ft_l2_pair *p)
 	/* What tc or a netdev chain runs on either port runs on every frame the
 	 * bridge forwards in software and on none an entry forwards. */
 	if (ft_dev_stack_tc_soft(in, true) || ft_dev_stack_tc_soft(out, false) ||
-	    ft_dev_nf_ingress_hooked(in) || ft_l2_nf_egress_hooked(out))
+	    ft_dev_nf_ingress_hooked(lower_in) || ft_l2_nf_egress_hooked(lower_out) ||
+	    ft_l2_stack_hooked(p->rule.in_vlan, p->rule.in_vlans, true) ||
+	    ft_l2_stack_hooked(p->rule.out_vlan, p->rule.out_vlans, false))
 		return false;
 	if (!ft_l2_member(bridge, in, s->vid, &in_untagged) ||
 	    !ft_l2_member(bridge, out, s->vid, &out_untagged))
 		return false;
 	/* A frame the bridge would send bigger than the egress carries is one
-	 * it drops; the hardware would fragment it instead. */
-	if (out->mtu < in->mtu || out->mtu < ETH_DATA_LEN)
+	 * it drops; the hardware would fragment it instead. What can arrive is
+	 * what the physical port's MAC accepts, whatever a VLAN device on it
+	 * says; what leaves is bounded by the bridge's port, which a VLAN
+	 * device on the physical one may set lower. */
+	if (out->mtu < ft_port_arriving(lower_in))
 		return false;
-	memset(&p->rule, 0, sizeof(p->rule));
-	p->rule.in = in;
-	p->rule.out = out;
+	p->rule.in = lower_in;
+	p->rule.out = lower_out;
 	ether_addr_copy(p->rule.dst_mac, s->dst);
 	ether_addr_copy(p->rule.src_mac, s->src);
 	p->rule.ethertype = s->ethertype;
 	p->rule.mtu = out->mtu;
 	p->rule.qos = ft_qos_class(0);
+	/* The bridge's own tag is innermost. A frame tagged on the wire and
+	 * leaving tagged in the same VLAN is still stripped and tagged again:
+	 * the strip is what checks the VID, which the key does not carry, and
+	 * without it the pair's frames in any other VLAN of the port would
+	 * leave in theirs. */
 	if (s->tagged) {
-		p->rule.in_vlans = 1;
-		p->rule.in_vlan[0].proto = htons(ETH_P_8021Q);
-		p->rule.in_vlan[0].id = s->vid;
+		if (p->rule.in_vlans == CDX_FT_VLAN_MAX)
+			return false;
+		p->rule.in_vlan[p->rule.in_vlans].proto = htons(ETH_P_8021Q);
+		p->rule.in_vlan[p->rule.in_vlans++].id = s->vid;
 	}
-	/* A frame tagged on the wire and leaving tagged in the same VLAN is
-	 * still stripped and tagged again: the strip is what checks the VID,
-	 * which the key does not carry, and without it the pair's frames in
-	 * any other VLAN of the port would leave in theirs. */
 	if (br_vlan_enabled(bridge) && !out_untagged) {
-		p->rule.out_vlans = 1;
-		p->rule.out_vlan[0].proto = htons(ETH_P_8021Q);
-		p->rule.out_vlan[0].id = s->vid;
+		if (p->rule.out_vlans == CDX_FT_VLAN_MAX)
+			return false;
+		p->rule.out_vlan[p->rule.out_vlans].proto = htons(ETH_P_8021Q);
+		p->rule.out_vlan[p->rule.out_vlans++].id = s->vid;
 	}
 	p->bridge = bridge;
 	p->in = in;
@@ -411,6 +474,8 @@ static void ft_l2_release(struct ft_l2_pair *p)
 	dev_put(p->bridge);
 	dev_put(p->in);
 	dev_put(p->out);
+	dev_put(p->rule.in);
+	dev_put(p->rule.out);
 	kfree(p);
 	ft_l2_count--;
 }
@@ -430,7 +495,7 @@ static void ft_l2_unlink(struct ft_l2_pair *p)
  * the pair, which the next pass retires. */
 static int ft_l2_admit(const struct ft_l2_seen *s)
 {
-	struct ft_l2_pair *p;
+	struct ft_l2_pair *p, *other;
 	s64 changes;
 	int rc;
 
@@ -455,9 +520,22 @@ static int ft_l2_admit(const struct ft_l2_seen *s)
 		ft_l2_refused++;
 		return 0;
 	}
+	/* The same stations from another VLAN device of the physical port
+	 * would need its key twice. */
+	hash_for_each_possible(ft_l2_pairs, other, node, ft_l2_hash(s)) {
+		if (other->rule.in == p->rule.in && other->key.ethertype == s->ethertype &&
+		    ether_addr_equal(other->key.dst, s->dst) &&
+		    ether_addr_equal(other->key.src, s->src)) {
+			kfree(p);
+			ft_l2_refused++;
+			return 0;
+		}
+	}
 	dev_hold(p->bridge);
 	dev_hold(p->in);
 	dev_hold(p->out);
+	dev_hold(p->rule.in);
+	dev_hold(p->rule.out);
 	p->hit = jiffies;
 	p->dst_station.pair = p->src_station.pair = p;
 	spin_lock_bh(&ft_l2_lock);
@@ -639,7 +717,20 @@ void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
 
 static bool ft_l2_names_dev(const struct ft_l2_pair *p, const void *arg)
 {
-	return p->bridge == arg || p->in == arg || p->out == arg;
+	const struct net_device *dev = arg;
+	u8 i;
+
+	if (p->bridge == dev || p->in == dev || p->out == dev ||
+	    p->rule.in == dev || p->rule.out == dev)
+		return true;
+	/* A VLAN device between a port and its physical port. */
+	for (i = 0; i < p->rule.in_vlans; i++)
+		if (p->rule.in_vlan[i].ifindex == dev->ifindex)
+			return true;
+	for (i = 0; i < p->rule.out_vlans; i++)
+		if (p->rule.out_vlan[i].ifindex == dev->ifindex)
+			return true;
+	return false;
 }
 
 /* A port's or the bridge's state, VLAN membership, filtering, MTU, link or
@@ -663,7 +754,7 @@ int ft_l2_egress_drain(const struct net_device *dev)
 
 	cdx_ft_begin();
 	list_for_each_entry_safe(p, next, &ft_l2_list, list)
-		if (p->in == dev || p->out == dev)
+		if (p->rule.in == dev || p->rule.out == dev)
 			ft_l2_unlink(p);
 	rc = ft_settle();
 	cdx_ft_end();
@@ -683,21 +774,41 @@ void ft_l2_retire_all(void)
 
 /* -------------------------------------------------------------------- proc */
 
+/* A tag stack outermost first, dot separated, "-" for none. */
+static void ft_l2_tags(const struct cdx_ft_vlan *tags, u8 count, char *text, size_t size)
+{
+	unsigned int at = 0;
+	u8 i;
+
+	if (!count) {
+		strscpy(text, "-", size);
+		return;
+	}
+	for (i = 0; i < count && at < size; i++)
+		at += scnprintf(text + at, size - at, "%s%u", i ? "." : "", tags[i].id);
+}
+
+/* in and out are the bridge's ports, port_in and port_out the physical ports
+ * beneath them; in_vlan is the stack each frame arrives with and the entry
+ * checks and strips, out_vlan the one it leaves with. */
 void ft_l2_show(struct seq_file *seq)
 {
+	char in_vlan[16], out_vlan[16];
 	struct ft_l2_pair *p;
 
 	seq_printf(seq, "l2_enabled %u\nl2_entries %u\nl2_installs %llu\nl2_refused %llu\n"
 		   "l2_retired %llu\nl2_dropped %llu\nl2_deferred %llu\n",
 		   READ_ONCE(ft_l2_enabled) && READ_ONCE(ft_l2_hooked), ft_l2_count,
 		   ft_l2_installs, ft_l2_refused, ft_l2_retired, ft_l2_dropped, ft_l2_deferred);
-	list_for_each_entry(p, &ft_l2_list, list)
-		seq_printf(seq, "l2flow in=%s out=%s br=%s dst=%pM src=%pM type=%#06x vid=%u tagged=%u in_vlan=%s out_vlan=%u packets=%llu bytes=%llu\n",
-			   netdev_name(p->in), netdev_name(p->out), netdev_name(p->bridge),
+	list_for_each_entry(p, &ft_l2_list, list) {
+		ft_l2_tags(p->rule.in_vlan, p->rule.in_vlans, in_vlan, sizeof(in_vlan));
+		ft_l2_tags(p->rule.out_vlan, p->rule.out_vlans, out_vlan, sizeof(out_vlan));
+		seq_printf(seq, "l2flow in=%s out=%s port_in=%s port_out=%s br=%s dst=%pM src=%pM type=%#06x vid=%u tagged=%u in_vlan=%s out_vlan=%s packets=%llu bytes=%llu\n",
+			   netdev_name(p->in), netdev_name(p->out), netdev_name(p->rule.in),
+			   netdev_name(p->rule.out), netdev_name(p->bridge),
 			   p->key.dst, p->key.src, p->key.ethertype, p->key.vid, p->key.tagged,
-			   p->rule.in_vlans ? "strip" : "-",
-			   p->rule.out_vlans ? p->rule.out_vlan[0].id : 0,
-			   p->packets, p->bytes);
+			   in_vlan, out_vlan, p->packets, p->bytes);
+	}
 }
 
 /* --------------------------------------------------------- start and stop */

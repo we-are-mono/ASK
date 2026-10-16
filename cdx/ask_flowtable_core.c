@@ -1259,6 +1259,52 @@ static struct net_device *ft_tunnel_hop(struct net_device *logical,
 	return lower;
 }
 
+struct ft_bridge_port_walk {
+	struct net_device *bridge;
+	struct net_device *port;
+	unsigned int found;
+};
+
+/* The walk calls back on a device again each time it backtracks through it,
+ * so only a device other than the last one found counts: one port found
+ * however often stays one, and a second ends the walk. */
+static int ft_bridge_port_one(struct net_device *upper, struct netdev_nested_priv *priv)
+{
+	struct ft_bridge_port_walk *walk = priv->data;
+
+	if (upper != walk->port && is_vlan_dev(upper) &&
+	    netdev_master_upper_dev_get_rcu(upper) == walk->bridge) {
+		walk->port = upper;
+		walk->found++;
+	}
+	return walk->found > 1;
+}
+
+/* The port of `bridge` a path down to `physical` crosses: the physical port
+ * itself, or an 802.1Q VLAN device stacked on it -- OpenWrt's br-lan over
+ * eth0.10 rather than over eth0 with a bridge VLAN. Netfilter resolved the
+ * FDB's port into the device below it, so the port is found from there; only
+ * a bridge enslaving two VLAN devices of one port is ambiguous, and declined.
+ * The caller descends from the port to `physical` and requires every step to
+ * be a VLAN device, as anywhere else on the path. Under RTNL. */
+static struct net_device *ft_bridge_port(struct net_device *bridge,
+					 struct net_device *physical)
+{
+	struct ft_bridge_port_walk walk = { .bridge = bridge };
+	struct netdev_nested_priv priv = { .data = &walk };
+
+	ASSERT_RTNL();
+	if (netdev_master_upper_dev_get(physical) == bridge)
+		return physical;
+	rcu_read_lock();
+	netdev_walk_all_upper_dev_rcu(physical, ft_bridge_port_one, &priv);
+	rcu_read_unlock();
+	if (walk.found != 1)
+		ask_dbg(ASK_DBG_DEVICE, "bridge %s has %u ports above %s\n",
+			netdev_name(bridge), walk.found, netdev_name(physical));
+	return walk.found == 1 ? walk.port : NULL;
+}
+
 static int ft_path_stack(struct net_device *logical, struct net_device *physical,
 			 const struct nf_flow_session *session,
 			 const struct nf_flow_tunnel *tunnel,
@@ -1270,6 +1316,7 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 	 * writes the tag and leaves ifindex alone. */
 	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX] = {};
 	unsigned int count = 0, i;
+	struct net_device *port;
 	int vid;
 
 	if (source)
@@ -1325,21 +1372,24 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 	if (source)
 		*source = logical;
 	/* Each step strictly descends and the tag count is bounded, so a path
-	 * that never reaches the port terminates at the bound. The bridge hop
-	 * is terminal, which is what bounds it there. */
+	 * that never reaches the port terminates at the bound. There is one
+	 * bridge hop at most, which is what bounds it there. */
 	while (logical != physical) {
 		if (netif_is_bridge_master(logical)) {
 			/* Which port a bridged flow leaves by was decided by
 			 * the FDB, and Netfilter already resolved that into the
 			 * redirect and the binding; a bridge has many lower
 			 * devices and descending by adjacency would pick an
-			 * arbitrary one. So require the port to be this
-			 * bridge's own, and stop. A bridge port that is itself
-			 * a stacked device hides a tag from this walk and is
-			 * declined by the same requirement. */
-			if (netdev_master_upper_dev_get(physical) != logical)
+			 * arbitrary one. So find the port from below
+			 * (ft_bridge_port()): the physical port, or a VLAN
+			 * device on it, whose tags the walk then adds on the way
+			 * down as it does above the bridge. */
+			if (*bridge)
 				return -EOPNOTSUPP;
-			vid = ft_bridge_vlan(logical, physical, inner, &count);
+			port = ft_bridge_port(logical, physical);
+			if (!port)
+				return -EOPNOTSUPP;
+			vid = ft_bridge_vlan(logical, port, inner, &count);
 			if (vid < 0)
 				return vid;
 			/* The bridge carries nothing through a port, or a VLAN
@@ -1351,11 +1401,12 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 			 * applies. MST stays software-only: a VID-to-MSTI remap
 			 * moves per-VLAN states under one bridge-wide event
 			 * that this adapter does not map onto flows. */
-			if (br_mst_enabled(logical) || !br_port_forwarding(physical, vid))
+			if (br_mst_enabled(logical) || !br_port_forwarding(port, vid))
 				return -EOPNOTSUPP;
 			*bridge = logical;
 			*bridge_vid = vid;
-			break;
+			logical = port;
+			continue;
 		}
 		if (!is_vlan_dev(logical) || count == CDX_FT_VLAN_MAX ||
 		    vlan_dev_vlan_proto(logical) != htons(ETH_P_8021Q))
@@ -1481,13 +1532,15 @@ static bool ft_vlan_actions(const struct flow_action *actions,
  * than a standard Ethernet frame. Patch 109 programs each DPAA port's MAXFRM
  * from its MTU as max(mtu, 1500) plus the Ethernet header and FCS, and a tag
  * more while the port has any upper device -- a VLAN, a bridge, a bond, a
- * macvlan -- or two once a VLAN on it is 802.1ad or carries a VLAN, so that a
- * tagged frame still carries a full payload. A port lowered below 1500 thus
- * keeps receiving full frames, and a port raised above it receives what its
- * MTU allows whatever the devices above it say.
+ * macvlan -- or two once a VLAN on it is 802.1ad, carries a VLAN, or is a
+ * bridge port (patch 171), so that a tagged frame still carries a full
+ * payload. A port lowered below 1500 thus keeps receiving full frames, and a
+ * port raised above it receives what its MTU allows whatever the devices above
+ * it say.
  *
  * Those tag bytes also let an untagged frame of a port with uppers exceed this
- * by four, or eight. That window is not counted: counting it would refuse
+ * by four, or eight -- and a frame with one tag by four where the port allows
+ * two. That window is not counted: counting it would refuse
  * every 1500-byte UDP direction between two bridged 1500-byte ports, and only
  * a host sending more than the link's own MTU reaches it. */
 u32 ft_port_arriving(const struct net_device *port)
@@ -1509,7 +1562,8 @@ static u32 ft_mtu_less(u32 mtu, u32 header)
  * a member may not follow -- where Linux then drops at the port whatever the
  * port's own MTU forbids (is_skb_forwardable()). A tunnel's MTU may be set
  * above its lower device's less the outer header, which Linux then enforces
- * on the outer packet. A VLAN device is bounded by its lower one. So a
+ * on the outer packet. A VLAN device is bounded by its lower one, and a
+ * frame bridged out through a VLAN-device port by that device. So a
  * direction is bounded by this as well as by its route, and hardware never
  * sends what Linux would not (A340). Under RTNL, which the lower devices are
  * found under; a change of any of their MTUs retires the direction
@@ -1520,7 +1574,19 @@ u32 ft_port_mtu(const struct cdx_ft_rule *rule)
 	/* The largest outer packet: what carries it, less the session. */
 	u32 outer = ft_mtu_less(READ_ONCE(rule->out->mtu), session);
 	struct net_device *lower;
+	unsigned int i;
 
+	/* And every VLAN device the path crosses, a bridge's port among them --
+	 * br-lan over eth0.10 checks the frame against eth0.10, not the
+	 * physical port beneath it. A VLAN device's MTU never exceeds its
+	 * lower's, so this binds only where one was set lower. */
+	for (i = 0; i < rule->out_vlans; i++) {
+		if (!rule->out_vlan[i].ifindex)
+			continue;
+		lower = __dev_get_by_index(&init_net, rule->out_vlan[i].ifindex);
+		if (lower)
+			outer = min_t(u32, outer, ft_mtu_less(READ_ONCE(lower->mtu), session));
+	}
 	if (rule->out_session.present) {
 		lower = __dev_get_by_index(&init_net, rule->out_session.lower_ifindex);
 		if (lower)
@@ -1883,15 +1949,21 @@ static int ft_parse(struct cdx_ft_binding *binding,
 			      cls->nf_tunnel, out->out_vlan, &out->out_bridge,
 			      &out->out_bridge_vid, &out->out_session,
 			      &out->out_tunnel, &source);
-	if (vlans < 0)
+	if (vlans < 0) {
+		ask_dbg(ASK_DBG_DEVICE, "egress path %s to %s: %d\n",
+			netdev_name(out->out_logical), netdev_name(out->out), vlans);
 		return vlans;
+	}
 	out->out_vlans = vlans;
 	vlans = ft_path_stack(out->in_logical, out->in, cls->nf_session_reverse,
 			      cls->nf_tunnel_reverse, out->in_vlan, &out->in_bridge,
 			      &out->in_bridge_vid, &out->in_session, &out->in_tunnel,
 			      NULL);
-	if (vlans < 0)
+	if (vlans < 0) {
+		ask_dbg(ASK_DBG_DEVICE, "ingress path %s to %s: %d\n",
+			netdev_name(out->in_logical), netdev_name(out->in), vlans);
 		return vlans;
+	}
 	out->in_vlans = vlans;
 	if (ft_bridge_egress_filtered(out) || !ft_tunnel_inbound_allowed(&out->in_tunnel))
 		return ask_refuse(-EOPNOTSUPP);

@@ -152,6 +152,11 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A384 — a bridge whose port is a VLAN device (`br-lan` over `eth0.10`) kept every flow and station pair through it
+  in software; 1.0.7 offloaded them.** The walk finds the bridge's port from below and descends from it, the
+  bridged learner does the same, and patch 171 lets the port's MAC take the second tag such a port carries
+  (_:/^flowtable: carry bridges whose port is a VLAN device_).
+
 - [ ] **A383 — a bridged pair the learner refuses is asked of the bridge again every second it carries traffic.** A
   station pair through a Wi-Fi VAP, an unbound port or a key collision re-enters the ring once a second per CPU, and
   each pass costs an `rtnl_trylock()` and a resolve that fails the same way (`ask_flowtable_l2.c`, `ft_l2_admit()`).

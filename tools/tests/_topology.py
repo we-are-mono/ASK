@@ -44,6 +44,10 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   flowtable_service_multicast_ports.py 327 (the oif a port rule drops toward)
 #   flowtable_slaac.py     331          (isolated LAN router advertisements)
 #   flowtable_jumbo.py     332          (VLAN_ID_JUMBO, tagged jumbo LAN)
+#   flowtable_bridge.py    333          (ASK_FLOWTABLE_BRIDGE_PORT_VID, a VLAN device
+#                                        as the bridge's port; 172.29.78.0/24)
+#   flowtable_l2bridge.py  334          (ASK_FLOWTABLE_L2_PORT_VID, the same for
+#                                        bridged pairs)
 #   flowtable_l2bridge.py  3900         (borrowed, see below; and 172.29.77.0/24
 #                                        between its two stations)
 #

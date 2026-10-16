@@ -879,6 +879,20 @@ int ft_nexthop_event(struct notifier_block *nb, unsigned long event, void *ptr)
  * on an unrelated bridge costs one retirement and readmission, where missing
  * a real move costs silent misforwarding.
  */
+/* Whether `port`, a bridge port, is the one a flow leaves its bridge by: the
+ * physical port, or one of the VLAN devices over it the walk crossed. */
+static bool ft_out_port(const struct cdx_ft_rule *rule, const struct net_device *port)
+{
+	unsigned int i;
+
+	if (port == rule->out)
+		return true;
+	for (i = 0; i < rule->out_vlans; i++)
+		if (rule->out_vlan[i].ifindex == port->ifindex)
+			return true;
+	return false;
+}
+
 int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	const struct switchdev_notifier_fdb_info *info = ptr;
@@ -894,11 +908,12 @@ int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		/* Only the egress direction is chosen by an FDB entry, and the
 		 * address it was looked up under is this rule's destination
 		 * MAC. An add naming the port the flow already leaves by
-		 * re-states the pinning rather than changing it. */
+		 * re-states the pinning rather than changing it; that port is
+		 * the physical one, or a VLAN device on it the walk crossed. */
 		if (!entry->rule.out_bridge ||
 		    entry->rule.out_bridge_vid != info->vid ||
 		    !ether_addr_equal(entry->rule.dst_mac, info->addr) ||
-		    (event == SWITCHDEV_FDB_ADD_TO_DEVICE && port == entry->rule.out))
+		    (event == SWITCHDEV_FDB_ADD_TO_DEVICE && ft_out_port(&entry->rule, port)))
 			continue;
 		ft_handle_invalidate(entry->handle, &ft_fdb_invalidations);
 	}
