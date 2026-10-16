@@ -1801,10 +1801,11 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    !net_eq(nf_ct_net(cls->nf_ct), &init_net) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_ORIGINAL) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_REPLY) ||
-	    /* Outside the classification mask the mark still means something
-	     * this adapter cannot honour, so it still refuses. With no mask
-	     * configured that is every mark, exactly as before. */
-	    (mark & ~ft_qos_mark_mask) ||
+	    /* Outside the classification mask and the bits that only select a
+	     * route, the mark still means something this adapter cannot
+	     * honour, so it still refuses. With neither configured that is
+	     * every mark, exactly as before. */
+	    (mark & ~(ft_qos_mark_mask | ft_route_mark_mask)) ||
 	    cls->common.chain_index || cls->common.protocol != ETH_P_ALL)
 		return ask_refuse(-EOPNOTSUPP);
 	flow_rule_match_meta(rule, &meta);

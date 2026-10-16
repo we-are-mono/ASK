@@ -282,7 +282,8 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			snprintf(ctx->err, sizeof(ctx->err), "fewer than two offload-capable ports are up");
 			goto out;
 		}
-		if (ft_render(ctx, p, st.qos_mark_mask, script, sizeof(script)) < 0)
+		if (ft_render(ctx, p, st.qos_mark_mask | st.route_mark_mask, script,
+			      sizeof(script)) < 0)
 			goto out;
 	} else {
 		/* Disabled is disabled for multicast as well: switched off
@@ -700,7 +701,7 @@ int main(int argc, char **argv)
 		char buf[FT_RENDER_MAX + 1];
 		uint32_t mask = 0;
 		if (ft_backend_read(&ctx, &st) == 0 && st.present)
-			mask = st.qos_mark_mask;
+			mask = st.qos_mark_mask | st.route_mark_mask;
 		if (p.enabled && p.devices_auto)
 			ft_enumerate(&p);
 		if (ft_render(&ctx, &p, mask, buf, sizeof(buf)) < 0) {

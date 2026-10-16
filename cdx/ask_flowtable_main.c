@@ -24,9 +24,30 @@
 unsigned int ft_qos_mark_mask;
 static unsigned int ft_qos_default_class;
 module_param_named(qos_mark_mask, ft_qos_mark_mask, uint, 0444);
-MODULE_PARM_DESC(qos_mark_mask, "Conntrack mark bits holding the class; 0 disables classification and refuses marked flows");
+MODULE_PARM_DESC(qos_mark_mask, "Conntrack mark bits holding the class; 0 disables classification");
 module_param_named(qos_default_class, ft_qos_default_class, uint, 0444);
 MODULE_PARM_DESC(qos_default_class, "Class for flows whose masked mark is zero: nibbles low to high are class queue, channel, ingress policer profile, then a remark flag and six bits of DSCP");
+
+/* Conntrack mark bits that select a route at a connection's creation and are
+ * read by nothing after it: mwan3's, pbr's, a VPN client's policy routing.
+ * Linux resolved the route those bits chose when it created the flow, and the
+ * flow keeps it on either fast path, so a mark inside them refuses nothing.
+ * By naming them the operator states that nothing else reads them once the
+ * connection exists -- no forward or postrouting rule, no tc filter, connmark
+ * or ctinfo action, no re-marking expected to re-route a live connection --
+ * which Linux's own software flowtable assumes of a flow too, since none of
+ * those see its packets either. IPsec policy is the exception the adapter
+ * enforces itself: under a policy such a direction stays in software
+ * (ft_ipsec_handle()). Bits inside qos_mark_mask stay the class's, and the
+ * two masks may not overlap. Zero, the default, keeps the contract above.
+ *
+ * Boot-immutable like the class mask, for the controller's sake: it renders
+ * its admission guard from both masks when it applies a policy, and a change
+ * it did not see would leave that guard offering what the adapter refuses,
+ * or refusing what it would take. */
+unsigned int ft_route_mark_mask;
+module_param_named(route_mark_mask, ft_route_mark_mask, uint, 0444);
+MODULE_PARM_DESC(route_mark_mask, "Conntrack mark bits that only select a route at connection creation (mwan3, pbr); a mark within them is admitted");
 
 /* Reject a class the hardware cannot express rather than truncating it into a
  * different queue, which would accelerate the flow onto a queue nobody asked
@@ -400,11 +421,12 @@ static int ft_show(struct seq_file *seq, void *v)
 			vlan_slots += !!record->slot;
 		}
 	}
-	/* The controller reads the mask back from here rather than from sysfs,
-	 * because it already parses this header and must refuse a policy whose
-	 * mark selectors contradict what the running adapter will decode. */
-	seq_printf(seq, "qos_mark_mask %u\nqos_default_class %u\n",
-		   ft_qos_mark_mask, ft_qos_default_class);
+	/* The controller reads both masks back from here rather than from
+	 * sysfs, because it already parses this header, and renders its
+	 * admission guard from their union. The guard runs before any of the
+	 * policy's own mark selectors, so none of them can widen admission. */
+	seq_printf(seq, "qos_mark_mask %u\nqos_default_class %u\nroute_mark_mask %u\n",
+		   ft_qos_mark_mask, ft_qos_default_class, ft_route_mark_mask);
 	/* Frames the software path forwarded unchanged because their header
 	 * could not be made writable for the remark their class asks for. */
 	seq_printf(seq, "qos_remark_failures %llu\n", cdx_ft_qos_remark_failures());
@@ -648,6 +670,11 @@ static int __init ask_flowtable_init(void)
 	    (ft_qos_mark_mask >> __ffs(ft_qos_mark_mask)) > CDX_FT_QOS_MASK) {
 		pr_err("cdx flowtable: qos_mark_mask %#x spans more than the %u bits of a class\n",
 		       ft_qos_mark_mask, (unsigned int)fls(CDX_FT_QOS_MASK));
+		return -EINVAL;
+	}
+	if (ft_qos_mark_mask & ft_route_mark_mask) {
+		pr_err("cdx flowtable: route_mark_mask %#x overlaps qos_mark_mask %#x\n",
+		       ft_route_mark_mask, ft_qos_mark_mask);
 		return -EINVAL;
 	}
 	if (!ft_qos_class_valid(ft_qos_default_class)) {

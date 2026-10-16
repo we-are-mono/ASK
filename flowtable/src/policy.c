@@ -59,7 +59,8 @@ void ft_policy_hash(const struct ft_policy *p, char out[65])
 {
 	/* Deterministic canonical serialization; list order is significant and
 	 * preserved, field order within a match is fixed by index. Independent
-	 * of qos_mark_mask so the marker is stable across adapter reloads.
+	 * of the adapter's mark masks so the marker is stable across adapter
+	 * reloads.
 	 *
 	 * An explicit device list is configuration and is covered. The ports
 	 * "devices auto" resolved to are not: they are whichever ports are up

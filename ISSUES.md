@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A379 — a connection marked by mwan3 or pbr was never offloaded; 1.0.7 offloaded it.** The operator now names
+  route-only bits, admitted and carried nowhere (_:/^flowtable: admit marks that only select a route_).
+
 - [x] **A378 — an offer that lost `rtnl_trylock()` was waited for with no traffic to re-offer it.** Flaky
   `test_qinq`/`test_tcp` (`busy=2`, no flows); the helpers now keep sending (_:/^tests: keep sending while admission is awaited_).
 

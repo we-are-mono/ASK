@@ -341,8 +341,9 @@ static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
  * is what the peer addressed. Ports are carried because a policy selector can
  * name them, and a flowi missing them would fail to match a policy that does.
  * So is the mark, which the kernel decodes from the packet: the connection's,
- * as the receiving end takes it, since admission allows only marks the QoS
- * mask covers and the packets of an admitted flow carry its connection's.
+ * as the receiving end takes it, sampled once at admission. Under a policy
+ * only class bits get this far (ft_ipsec_handle()), and the packets of such a
+ * flow carry its connection's.
  */
 static void ft_ipsec_flowi(const struct cdx_ft_rule *rule, bool reverse,
 			   struct net_device *out, u32 mark, struct flowi *fl)
@@ -467,7 +468,7 @@ bool ft_policy_covers(const struct xfrm_policy *pol,
  * physical port its frames arrive by, and the tuple they carry as the
  * forwarding policy judges it. */
 static void ft_ipsec_receiver(const struct flow_cls_offload *cls,
-			      const struct cdx_ft_rule *rule, bool reverse,
+			      const struct cdx_ft_rule *rule, bool reverse, u32 mark,
 			      struct ft_ipsec_receiver *recv)
 {
 	struct flowi *fl = &recv->fl;
@@ -495,7 +496,7 @@ static void ft_ipsec_receiver(const struct flow_cls_offload *cls,
 	fl->flowi_proto = rule->proto;
 	fl->flowi_iif = in->ifindex;
 	fl->flowi_oif = out->ifindex;
-	fl->flowi_mark = READ_ONCE(cls->nf_ct->mark);
+	fl->flowi_mark = mark;
 }
 
 static bool ft_ipsec_receiving(const struct ft_ipsec_receiver *recv,
@@ -521,6 +522,15 @@ bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 	u16 reverse_in;
 	bool allowed;
 
+	/* Route-only mark bits are admitted because nothing after creation
+	 * reads them -- but policy lookup does, from each packet's own mark,
+	 * and whether a connmark restore puts these bits there is not knowable
+	 * here. With any policy configured, a direction marked outside the
+	 * class stays in software rather than have hardware and Linux choose
+	 * different transforms. */
+	if ((mark & ~ft_qos_mark_mask) && !xfrm_flowtable_enabled(&init_net))
+		return false;
+
 	/* The forwarding path asks output policy twice. Before NF_INET_FORWARD
 	 * it asks about the tuple between the translations, and drops what
 	 * policy refuses there -- a block, or a transform with no state. A
@@ -538,7 +548,7 @@ bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 	/* Both directions share one Linux generation. Validate both receiving
 	 * ends even when their SAs exist: policy may now require a different
 	 * transform, or forbid the tuple altogether. */
-	ft_ipsec_receiver(cls, rule, true, &recv);
+	ft_ipsec_receiver(cls, rule, true, mark, &recv);
 	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, &recv, &reverse_in,
 			     &received, 0, NULL, NULL))
 		goto denied;
@@ -548,7 +558,7 @@ bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 	if (!allowed)
 		goto denied;
 	ft_ipsec_flowi(rule, true, in, mark, &fl);
-	ft_ipsec_receiver(cls, rule, false, &recv);
+	ft_ipsec_receiver(cls, rule, false, mark, &recv);
 	if (!ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, &recv,
 			     &rule->in_sa_handle, &received, 0, NULL, NULL))
 		goto denied;

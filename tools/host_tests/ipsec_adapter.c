@@ -1258,6 +1258,18 @@ u32 ft_port_mtu(const struct cdx_ft_rule *rule)
 	return port_mtu;
 }
 
+/* Admission's class mask, and whether any policy is configured at all --
+ * which turns the software fast path off, and is how the kernel spells "no
+ * policy": xfrm_flowtable_enabled(). A direction marked outside the class
+ * stays in software under a policy. */
+static unsigned int ft_qos_mark_mask = 0xf0;
+static bool policies_configured = true;
+static bool xfrm_flowtable_enabled(struct net *net)
+{
+	(void)net;
+	return !policies_configured;
+}
+
 #include "ipsec_production.inc"
 
 /* --- the bench ------------------------------------------------------- */
@@ -2690,6 +2702,17 @@ static void test_handle_and_flowi(void)
 	 * reversed tuple leaving the ingress port, which is a direction whose
 	 * frames arrive in the clear rather than a refusal. */
 	policy_answer(WAN.ifindex, &bundle);
+	/* Route-only mark bits are what policy lookup reads from each packet,
+	 * which nothing here can vouch for: under a policy such a direction is
+	 * Linux's, before a lookup is made. Class bits are not. */
+	ct.mark = 0x100;
+	assert(!ft_ipsec_handle(&cls, &rule, &WAN, &LAN) && !bundle.refs);
+	/* With no policy at all the guard has nothing to protect. */
+	policies_configured = false;
+	bundle.refs = 0;
+	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
+	policies_configured = true;
+	ct.mark = 0;
 	bundle.refs = 0;
 	assert(ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
 	assert(rule.sa_handle == 5 && rule.in_sa_handle == 0);

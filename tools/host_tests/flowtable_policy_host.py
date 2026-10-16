@@ -214,6 +214,8 @@ def test_render_admission_mask_follows_the_adapter(engine):
     assert "  ct mark & 0xffffffff != 0x0 return" in render(engine, BASE, 0).splitlines()
     # A class mask leaves the class bits for the adapter; other bits refuse.
     assert "  ct mark & 0xff00ffff != 0x0 return" in render(engine, BASE, 0x00ff0000).splitlines()
+    # Every bit admitted renders no guard at all.
+    assert not [l for l in render(engine, BASE, 0xffffffff).splitlines() if "ct mark &" in l]
     # The mask changes the guard but not the marker: a reboot under a different
     # mask is not a different policy.
     plain, masked = render(engine, BASE, 0), render(engine, BASE, 0x00ff0000)

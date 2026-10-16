@@ -108,9 +108,16 @@ conntrack or destination pointer survives the callback.
 
 Admission requires exact supported masks and actions and default conntrack
 zones. A conntrack mark is admitted only inside the configured QoS
-classification mask (`ask_flowtable.qos_mark_mask`, see [QoS](qos.md)); a bit
-outside it still refuses, and with no mask configured that is every nonzero
-mark. A table with native `counter` accounting is admitted, and the hardware
+classification mask (`ask_flowtable.qos_mark_mask`, see [QoS](qos.md)) and the
+bits an operator names at load as selecting a route only
+(`ask_flowtable.route_mark_mask`: mwan3's, pbr's, a VPN client's policy
+routing, which Linux resolved when it created the flow). Naming them states
+that nothing reads them once the connection exists -- no forward or postrouting
+rule, no tc filter, connmark or ctinfo action -- which Linux's own software
+flowtable assumes of a flow as well. The two masks may not overlap, and under
+an IPsec policy a direction marked outside the class stays in software, since
+policy lookup reads each packet's mark. A bit outside both still refuses, and
+with neither configured that is every nonzero mark. A table with native `counter` accounting is admitted, and the hardware
 traffic is restated into Netfilter's units (see
 [statistics](#statistics-diagnostics-and-verification)). Supported packets are
 routed unicast IPv4 and IPv6 TCP/UDP, IPv4 TCP/UDP source NAT (static or

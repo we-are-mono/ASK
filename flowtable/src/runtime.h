@@ -36,7 +36,10 @@ struct ft_backend {
 	/* Multicast acceleration: the adapter's global switch and what both of
 	 * its learners have in hardware, which only a disable drains. */
 	long     mcast_enabled, mcast_installed, mroute_installed;
-	uint32_t qos_mark_mask;
+	/* The mark bits the adapter admits: its class field, and the bits an
+	 * operator named as selecting a route only. Their union is what the
+	 * admission guard renders. */
+	uint32_t qos_mark_mask, route_mark_mask;
 };
 
 /* Read-only probe with a five-second deadline, including blocked kernel reads.

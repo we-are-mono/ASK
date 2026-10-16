@@ -12,6 +12,22 @@ import time
 import pytest
 
 
+def test_admission_guard_follows_both_mark_masks(controller):
+    """The controller reads the adapter's class mask and its route-only mask
+    from the backend and renders their union into the admission guard -- the
+    applied table and `render` alike -- and no guard when every bit is
+    admitted."""
+    c = controller
+    c.backend(qos_mark_mask=0xf0, route_mark_mask=0x3f00)
+    with c.daemon():
+        c.wait(c.ready)
+    applied = c.calls("-f")[-1]["script"].splitlines()
+    assert "  ct mark & 0xffffc00f != 0x0 return" in applied, applied
+    assert "  ct mark & 0xffffc00f != 0x0 return" in c.run("render").stdout.splitlines()
+    c.backend(qos_mark_mask=0, route_mark_mask=0xffffffff)
+    assert "ct mark &" not in c.run("render").stdout
+
+
 def test_quiet_network_retries_failed_apply(controller):
     c = controller
     (c.root / "fail-install").touch()

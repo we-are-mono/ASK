@@ -740,7 +740,7 @@ static void drop_dev_records(void);
 static unsigned ft_count, ft_bound, ft_parked, ft_fail_stage, ft_init_fail_stage;
 /* Module parameters in production; plain globals here so a case can set the
  * mask, drive ft_parse, and read the class back off the rule. */
-static unsigned int ft_qos_mark_mask, ft_qos_default_class;
+static unsigned int ft_qos_mark_mask, ft_qos_default_class, ft_route_mark_mask;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
 static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations, ft_destroy_deferrals;
@@ -8252,6 +8252,18 @@ static void test_qos_decode(void)
     ft_qos_mark_mask = CDX_FT_QOS_MASK << 16;
     assert(ask_flowtable_init() == 0);
     ask_flowtable_exit();
+    /* Route-only bits inside the class's would decode as a class: refused at
+     * load, and a disjoint pair loads. */
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    ft_qos_mark_mask = 0xf0; ft_route_mark_mask = 0x3ff0;
+    assert(ask_flowtable_init() == -EINVAL);
+    ft_route_mark_mask = 0x3f00;
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    assert(ask_flowtable_init() == 0);
+    ask_flowtable_exit();
+    ft_route_mark_mask = 0;
     ft_qos_mark_mask = saved_mask; ft_qos_default_class = saved_default;
     ft_ready=ft_stopping=false; registration_step=canceled=0;
 }
@@ -8503,6 +8515,24 @@ int main(void)
     REJECT(cls.nf_handle = NULL);
     REJECT(handle.invalid = true);
     REJECT(ct.mark = 1); REJECT(ct.status = IPS_NAT_MASK); REJECT(cls.nf_mtu = 0);
+    /* Bits the operator names as selecting a route only (mwan3's, pbr's) are
+     * admitted and decode no class; a bit outside them still refuses, and
+     * they compose with the class's own. */
+    ft_route_mark_mask = 0x3f00;
+    fixture(); ct.mark = 0x3f00;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.qos == 0);
+    REJECT(ct.mark = 0x4000);
+    REJECT(ct.mark = 0x3f01);
+    {
+        unsigned int saved = ft_qos_mark_mask;
+
+        ft_qos_mark_mask = 0xf0;
+        fixture(); ct.mark = 0x3f20;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.qos == 2);
+        REJECT(ct.mark = 0x4020);
+        ft_qos_mark_mask = saved;
+    }
+    ft_route_mark_mask = 0;
     /* The floor on a TCP flow, which no ingress bound refuses first. */
     REJECT(tcp_flow(); cls.nf_mtu = 67);
     tcp_fixture(); cls.nf_mtu = 68;

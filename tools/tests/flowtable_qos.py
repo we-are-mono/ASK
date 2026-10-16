@@ -1459,7 +1459,8 @@ async def test_declined_flow_keeps_its_class_in_software(qos):
     before = await r.state()
     # The lowest bit the running mask leaves out, as the ARP fallback case
     # takes it: the flow is refused whatever the boot configured.
-    outside = ~int(before["qos_mark_mask"]) & 0xffffffff
+    outside = ~(int(before["qos_mark_mask"]) |
+                int(before.get("route_mark_mask", 0))) & 0xffffffff
     mark = r.mark(LOW_CQ) | (outside & -outside)
     await offload(r, f"ip saddr {WAN_IP} ip daddr {r.lan_ip} udp dport {PORT_DECLINED} "
                      f"counter ct mark set {mark:#x} flow add @fast")

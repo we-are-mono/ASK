@@ -58,6 +58,7 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 		else if (!strcmp(key, "rearms"))         { b->rearms = v; }
 		else if (!strcmp(key, "errors"))         { b->errors = v; }
 		else if (!strcmp(key, "qos_mark_mask"))  { b->qos_mark_mask = (uint32_t)strtoul(sval, NULL, 0); }
+		else if (!strcmp(key, "route_mark_mask")) { b->route_mark_mask = (uint32_t)strtoul(sval, NULL, 0); }
 		else if (!strcmp(key, "mcast_enabled"))    { b->mcast_enabled = v; seen |= 128; }
 		else if (!strcmp(key, "mcast_installed"))  { b->mcast_installed = v; seen |= 256; }
 		else if (!strcmp(key, "mroute_installed")) { b->mroute_installed = v; seen |= 512; }

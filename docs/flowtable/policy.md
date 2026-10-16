@@ -65,7 +65,9 @@ exclusion lists each permit at most 256 lines. There is no arbitrary nftables
 text in this format.
 
 Admission requires established original-direction IPv4/IPv6 TCP/UDP traffic
-and a conntrack mark with no bits outside the backend's allowed QoS mask.
+and a conntrack mark with no bits outside the backend's QoS mask and its
+route-only mask together (`qos_mark_mask` and `route_mark_mask` in
+`/proc/cdx_flowtable`); the controller renders that union into its guard.
 Address selectors currently express IPv4 matches; `scope any` includes both
 families. Routed TCP/UDP, source NAT (static or MASQUERADE), destination NAT and
 combined/hairpin NAT are eligible within the adapter's physical-port contract. Linux additionally refuses helper and sequence-adjusted connections. See the

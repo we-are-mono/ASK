@@ -251,9 +251,10 @@ async def test_rendered_admission(service):
     chains = [item["chain"] for item in objects if "chain" in item]
     assert [(c["name"], c.get("type"), c.get("hook"), c.get("prio"), c.get("policy")) for c in chains] == [
         ("admit", "filter", "forward", 10, "accept")], chains
-    refused = ~(await r.state())["qos_mark_mask"] & 0xffffffff
+    state = await r.state()
+    refused = ~(state["qos_mark_mask"] | state.get("route_mark_mask", 0)) & 0xffffffff
     rules = chain_rules(listing, "admit")
-    guards = [*ADMISSION_GUARDS, f"ct mark & {refused:#x} != 0x0 return"]
+    guards = [*ADMISSION_GUARDS, *([f"ct mark & {refused:#x} != 0x0 return"] if refused else [])]
     assert rules[:len(guards)] == guards, rules
     # The fixture's policy is one scope line and no exclusion.
     policy = rules[len(guards):]

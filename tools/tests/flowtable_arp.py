@@ -58,7 +58,8 @@ async def test_software_fallback(rig):
         # under test: a mark carrying a bit the adapter cannot honour. Taken
         # from the running mask rather than assumed, and the lowest such bit,
         # so the flow is refused whatever the boot configured.
-        outside = ~int(before["qos_mark_mask"]) & 0xffffffff
+        outside = ~(int(before["qos_mark_mask"]) |
+                    int(before.get("route_mark_mask", 0))) & 0xffffffff
         await r.table(mark=outside & -outside)
         await r.exchange(128, promiscuous=False)
         declined = await r.wait(lambda s: s["rejects"] > before["rejects"])

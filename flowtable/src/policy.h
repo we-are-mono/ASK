@@ -89,11 +89,12 @@ int ft_conf_parse(struct ft_ctx *ctx, const char *text, size_t len,
 int ft_validate(struct ft_ctx *ctx, const struct ft_policy *p);
 
 /* Render the nftables table text for an enabled, validated policy into buf.
- * qos_mark_mask is read from the live adapter (0 when unknown). Returns the
+ * admitted_mark_mask is the mark bits the live adapter admits -- its class
+ * mask and its route-only mask together -- or 0 when unknown. Returns the
  * number of bytes written (excluding NUL), or -1 (ctx->err set) on overflow.
  * With buf NULL and buflen 0 it only measures, returning the length. */
 int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
-	      uint32_t qos_mark_mask, char *buf, size_t buflen);
+	      uint32_t admitted_mark_mask, char *buf, size_t buflen);
 
 /* The most an enabled policy can render at apply: its rules under the widest
  * mark guard, plus the longest device list "devices auto" may resolve to.

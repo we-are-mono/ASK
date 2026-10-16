@@ -952,6 +952,7 @@ void ft_wifi_exit(void);
 
 /* ask_flowtable_main.c */
 extern unsigned int ft_qos_mark_mask;
+extern unsigned int ft_route_mark_mask;
 bool ft_qos_class_valid(unsigned int class);
 u32 ft_qos_class(u32 mark);
 

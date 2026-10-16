@@ -88,11 +88,11 @@ static void emit_match(struct out *o, const struct ft_match *m, const char *acti
 #define FT_FLAGS "flags offload;"
 
 int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
-	      uint32_t qos_mark_mask, char *buf, size_t buflen)
+	      uint32_t admitted_mark_mask, char *buf, size_t buflen)
 {
 	struct out o = { buf, buflen, 0, false };
 	char hash[65];
-	uint32_t refused = ~qos_mark_mask & 0xffffffffu;
+	uint32_t refused = ~admitted_mark_mask & 0xffffffffu;
 	int i;
 
 	if (!p->enabled) {
@@ -121,7 +121,9 @@ int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 	emit(&o, "  meta l4proto != { tcp, udp } return\n");
 	emit(&o, "  ct direction != original return\n");
 	emit(&o, "  ct state != established return\n");
-	emit(&o, "  ct mark & %#x != 0x0 return\n", refused);
+	/* Every bit admitted refuses none: the guard would only test zero. */
+	if (refused)
+		emit(&o, "  ct mark & %#x != 0x0 return\n", refused);
 	for (i = 0; i < p->nexclude; i++)
 		emit_match(&o, &p->exclude[i], "return");
 	for (i = 0; i < p->nscope; i++)
