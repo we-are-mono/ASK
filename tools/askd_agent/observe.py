@@ -31,6 +31,9 @@ def read_state(*, summary=False, path=TABLE):
     result = empty()
     with path.open() as stream:
         for line in stream:
+            # A summary stops at the flow rows, and so leaves out the bridged
+            # pairs' rows (l2flow), which follow them; their totals are in
+            # the header.
             if summary and line.startswith("flow "):
                 break
             line_into(result, line)

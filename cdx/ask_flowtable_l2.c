@@ -52,6 +52,11 @@ MODULE_PARM_DESC(l2_idle_ms, "Milliseconds a bridged pair no frame hits stays in
 #define FT_L2_RECHECK	(5 * HZ)
 /* Pairs, bounded well below what the Ethernet tables of the ports hold. */
 #define FT_L2_MAX	4096
+/* The most pairs one hold of the transaction visits. With FT_RETIRE_BATCH, the
+ * most it unlinks before the barrier that settles them, a walk over thousands
+ * of pairs goes in holds of milliseconds rather than one hold over all of
+ * them, as routed retirement does (A327, A382). */
+#define FT_L2_VISIT_BATCH	256U
 #define FT_L2_RING	256
 #define FT_L2_SEEN	256
 
@@ -89,7 +94,18 @@ struct ft_l2_pair {
 	struct cdx_ft_hw *hw;
 	u64 packets, bytes;
 	unsigned long hit;	/* jiffies the counters last moved */
+	/* The generation of each walk that last visited the pair
+	 * (ft_l2_walk_batch()). */
+	unsigned int walked[2];
 	bool dead;
+};
+
+/* The walks over every pair that may let the transaction go between batches:
+ * the sweep that reads counters and retires what is dead or idle, and the
+ * recheck that asks the bridge again. */
+enum ft_l2_walk {
+	FT_L2_SWEEP,
+	FT_L2_RECHECK_WALK,
 };
 
 static DEFINE_HASHTABLE(ft_l2_pairs, 10);
@@ -116,6 +132,9 @@ struct ft_l2_recent {
 static struct ft_l2_recent __percpu *ft_l2_recent;
 static bool ft_l2_hooked, ft_l2_stopping;
 static unsigned long ft_l2_checked;
+static unsigned int ft_l2_walk_gen[2];
+/* A recheck that RTNL cut short resumes where it stopped. */
+static bool ft_l2_rechecking;
 static void ft_l2_workfn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_l2_work, ft_l2_workfn);
 
@@ -537,6 +556,9 @@ static int ft_l2_admit(const struct ft_l2_seen *s)
 	dev_hold(p->rule.in);
 	dev_hold(p->rule.out);
 	p->hit = jiffies;
+	/* Fresh: no walk in progress needs to visit it. */
+	p->walked[FT_L2_SWEEP] = ft_l2_walk_gen[FT_L2_SWEEP];
+	p->walked[FT_L2_RECHECK_WALK] = ft_l2_walk_gen[FT_L2_RECHECK_WALK];
 	p->dst_station.pair = p->src_station.pair = p;
 	spin_lock_bh(&ft_l2_lock);
 	hash_add(ft_l2_pairs, &p->node, ft_l2_hash(s));
@@ -590,12 +612,173 @@ static void ft_l2_refresh(struct ft_l2_pair *p)
 	br_fdb_refresh(p->bridge, p->key.src, p->key.vid, p->in);
 }
 
+/* One batch of a walk over every pair: the pairs this generation of the walk
+ * has not visited, up to FT_L2_VISIT_BATCH of them or FT_RETIRE_BATCH unlinks,
+ * each unlinked where `visit` says so, and what was unlinked settled. Each
+ * visited pair is stamped with the generation, so the walk holds no pointer
+ * across the transaction its caller lets go between batches, and a pair
+ * admitted meanwhile, stamped as it is published, waits for the next walk.
+ * True once every pair has been visited. Under the transaction. */
+static bool ft_l2_walk_batch(enum ft_l2_walk walk,
+			     bool (*visit)(struct ft_l2_pair *p, const void *arg), const void *arg)
+{
+	struct ft_l2_pair *p, *next;
+	unsigned int visited = 0, unlinked = 0;
+	bool done = true;
+
+	cdx_ft_assert_held();
+	list_for_each_entry_safe(p, next, &ft_l2_list, list) {
+		if (p->walked[walk] == ft_l2_walk_gen[walk])
+			continue;
+		if (visited == FT_L2_VISIT_BATCH || unlinked == FT_RETIRE_BATCH) {
+			done = false;
+			break;
+		}
+		p->walked[walk] = ft_l2_walk_gen[walk];
+		visited++;
+		if (visit(p, arg)) {
+			ft_l2_unlink(p);
+			unlinked++;
+		}
+	}
+	ft_settle();
+	return done;
+}
+
+/* Up to FT_RETIRE_BATCH of the pairs `match` names out of the hardware and
+ * settled. True when some remain: the caller lets the transaction go before
+ * asking again, as for ft_retire_batch(). Under the transaction. */
+static bool ft_l2_retire_batch_of(bool (*match)(const struct ft_l2_pair *p, const void *arg),
+				  const void *arg, int *settled)
+{
+	struct ft_l2_pair *p, *next;
+	unsigned int n = 0;
+	bool more = false;
+	int rc;
+
+	cdx_ft_assert_held();
+	list_for_each_entry_safe(p, next, &ft_l2_list, list) {
+		if (!match(p, arg))
+			continue;
+		if (n == FT_RETIRE_BATCH) {
+			more = true;
+			break;
+		}
+		ft_l2_unlink(p);
+		n++;
+	}
+	rc = ft_settle();
+	if (settled && rc)
+		*settled = rc;
+	return more;
+}
+
+/* Let the transaction go between two batches of a walk, and take it back. */
+static void ft_l2_yield(void)
+{
+	cdx_ft_end();
+	cond_resched();
+	cdx_ft_begin();
+}
+
+struct ft_l2_sweeping {
+	bool filtered;
+};
+
+/* Dead, idle, or under a bridge filter: out of hardware. Otherwise the
+ * pair's counters are read, and a pair they moved for keeps its source
+ * station's FDB entry fresh. */
+static bool ft_l2_sweep_one(struct ft_l2_pair *p, const void *arg)
+{
+	const struct ft_l2_sweeping *sweep = arg;
+	struct cdx_ft_counters c = {};
+	bool dead;
+
+	spin_lock_bh(&ft_l2_lock);
+	dead = p->dead;
+	spin_unlock_bh(&ft_l2_lock);
+	if (dead || sweep->filtered || READ_ONCE(ft_l2_stopping) || atomic_read(&ft_invalid))
+		return true;
+	cdx_ft_stats(p->hw, &c);
+	if (c.packets != p->packets) {
+		p->packets = c.packets;
+		p->bytes = c.bytes;
+		p->hit = jiffies;
+		ft_l2_refresh(p);
+	}
+	return !time_before(jiffies, p->hit + msecs_to_jiffies(READ_ONCE(ft_l2_idle_ms)));
+}
+
+static bool ft_l2_filtered(void)
+{
+	return ft_bridge_hooked(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
+				BIT(NF_BR_POST_ROUTING));
+}
+
+/* Whether a pair may be admitted now. Asked in the hold of the transaction
+ * the admission runs in: a walk that let it go meanwhile may have seen it
+ * latched by an invalidation, a filter appear, or unload begin. */
+static bool ft_l2_live(void)
+{
+	return !ft_l2_filtered() && !READ_ONCE(ft_l2_stopping) && !atomic_read(&ft_invalid) &&
+	       READ_ONCE(ft_l2_enabled);
+}
+
+/* Every pair visited once, a batch per hold of the transaction. Called and
+ * returning with it held. */
+static void ft_l2_sweep(void)
+{
+	struct ft_l2_sweeping sweep;
+
+	ft_l2_walk_gen[FT_L2_SWEEP]++;
+	for (;;) {
+		sweep.filtered = ft_l2_filtered();
+		if (ft_l2_walk_batch(FT_L2_SWEEP, ft_l2_sweep_one, &sweep))
+			return;
+		ft_l2_yield();
+	}
+}
+
+static bool ft_l2_recheck_one(struct ft_l2_pair *p, const void *arg)
+{
+	return !ft_l2_current(p);
+}
+
+/* Every installed pair asked of the bridge again, a batch per hold of the
+ * transaction and of RTNL, which is taken without waiting: a batch that
+ * cannot have it leaves the rest of the walk to the next pass, which
+ * resumes it rather than starting over. Called and returning with the
+ * transaction held and RTNL not. */
+static void ft_l2_recheck(void)
+{
+	bool done;
+
+	for (;;) {
+		if (cdx_ft_admission_begin())
+			return;
+		/* A walk starts with the first batch that has RTNL: one that
+		 * never could stays due at the ordinary pass, rather than
+		 * retrying at FT_L2_RETRY with a sweep each time. */
+		if (!ft_l2_rechecking) {
+			ft_l2_walk_gen[FT_L2_RECHECK_WALK]++;
+			ft_l2_rechecking = true;
+		}
+		done = ft_l2_walk_batch(FT_L2_RECHECK_WALK, ft_l2_recheck_one, NULL);
+		cdx_ft_admission_end();
+		if (done) {
+			ft_l2_rechecking = false;
+			ft_l2_checked = jiffies;
+			return;
+		}
+		ft_l2_yield();
+	}
+}
+
 static void ft_l2_workfn(struct work_struct *work)
 {
 	struct ft_l2_seen batch[32];
-	struct ft_l2_pair *p, *next;
 	unsigned int n = 0, i, retry = 0;
-	bool filtered, rtnl = false, again, recheck;
+	bool rtnl = false, again, live;
 
 	spin_lock_bh(&ft_l2_lock);
 	while (ft_l2_tail != ft_l2_head && n < ARRAY_SIZE(batch))
@@ -604,41 +787,18 @@ static void ft_l2_workfn(struct work_struct *work)
 	spin_unlock_bh(&ft_l2_lock);
 
 	cdx_ft_begin();
-	filtered = ft_bridge_hooked(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
-				    BIT(NF_BR_POST_ROUTING));
-	/* Dead, idle, or under a bridge filter: out of hardware. */
-	list_for_each_entry_safe(p, next, &ft_l2_list, list) {
-		struct cdx_ft_counters c = {};
-		bool dead;
-
-		spin_lock_bh(&ft_l2_lock);
-		dead = p->dead;
-		spin_unlock_bh(&ft_l2_lock);
-		if (!dead && !filtered && !READ_ONCE(ft_l2_stopping) &&
-		    !atomic_read(&ft_invalid)) {
-			cdx_ft_stats(p->hw, &c);
-			if (c.packets != p->packets) {
-				p->packets = c.packets;
-				p->bytes = c.bytes;
-				p->hit = jiffies;
-				ft_l2_refresh(p);
-			}
-			if (time_before(jiffies, p->hit + msecs_to_jiffies(READ_ONCE(ft_l2_idle_ms))))
-				continue;
-		}
-		ft_l2_unlink(p);
-	}
-	recheck = !list_empty(&ft_l2_list) &&
-		  time_after_eq(jiffies, ft_l2_checked + FT_L2_RECHECK);
-	if ((n || recheck) && !filtered && !READ_ONCE(ft_l2_stopping) &&
-	    !atomic_read(&ft_invalid) && READ_ONCE(ft_l2_enabled)) {
+	ft_l2_sweep();
+	live = ft_l2_live();
+	/* A recheck cut short with nothing left to check, or nothing it may
+	 * keep, is abandoned: the next starts afresh when due. */
+	if (!live || list_empty(&ft_l2_list))
+		ft_l2_rechecking = false;
+	if (live && !list_empty(&ft_l2_list) &&
+	    (ft_l2_rechecking || time_after_eq(jiffies, ft_l2_checked + FT_L2_RECHECK)))
+		ft_l2_recheck();
+	/* Asked again: the recheck may have let the transaction go. */
+	if (n && ft_l2_live()) {
 		rtnl = !cdx_ft_admission_begin();
-		if (rtnl && recheck) {
-			list_for_each_entry_safe(p, next, &ft_l2_list, list)
-				if (!ft_l2_current(p))
-					ft_l2_unlink(p);
-			ft_l2_checked = jiffies;
-		}
 		for (i = 0; i < n; i++) {
 			if (rtnl && ft_l2_admit(&batch[i]) != -EAGAIN)
 				continue;
@@ -659,7 +819,7 @@ static void ft_l2_workfn(struct work_struct *work)
 	cdx_ft_end();
 	if (READ_ONCE(ft_l2_stopping))
 		return;
-	if (again || retry)
+	if (again || retry || ft_l2_rechecking)
 		mod_delayed_work(system_wq, &ft_l2_work, rtnl && !retry ? 0 : FT_L2_RETRY);
 	else if (!list_empty(&ft_l2_list))
 		mod_delayed_work(system_wq, &ft_l2_work, FT_L2_PASS);
@@ -747,29 +907,36 @@ void ft_l2_dev_changed(const struct net_device *dev)
  * admitted from here on reads the new plan; one built across the change
  * found ft_egress_changes moved and was taken out again. Takes the
  * transaction. */
+static bool ft_l2_on_port(const struct ft_l2_pair *p, const void *dev)
+{
+	return p->rule.in == dev || p->rule.out == dev;
+}
+
 int ft_l2_egress_drain(const struct net_device *dev)
 {
-	struct ft_l2_pair *p, *next;
-	int rc;
+	int rc = 0;
 
 	cdx_ft_begin();
-	list_for_each_entry_safe(p, next, &ft_l2_list, list)
-		if (p->rule.in == dev || p->rule.out == dev)
-			ft_l2_unlink(p);
-	rc = ft_settle();
+	/* A barrier that failed in any batch fails the drain, as it would
+	 * have failed the one walk this was. */
+	while (ft_l2_retire_batch_of(ft_l2_on_port, dev, &rc))
+		ft_l2_yield();
 	cdx_ft_end();
 	return rc;
 }
 
-/* Global invalidation, from its worker, under the transaction: everything
- * goes, and the next frames learn it again once admission is rearmed. */
-void ft_l2_retire_all(void)
+static bool ft_l2_any(const struct ft_l2_pair *p, const void *arg)
 {
-	struct ft_l2_pair *p, *next;
+	return true;
+}
 
-	cdx_ft_assert_held();
-	list_for_each_entry_safe(p, next, &ft_l2_list, list)
-		ft_l2_unlink(p);
+/* Global invalidation, from its worker, and unload: everything goes, and the
+ * next frames learn it again once admission is rearmed. One batch, under the
+ * transaction; true while pairs remain, and the caller lets the transaction go
+ * before asking again (A382). */
+bool ft_l2_retire_batch(void)
+{
+	return ft_l2_retire_batch_of(ft_l2_any, NULL, NULL);
 }
 
 /* -------------------------------------------------------------------- proc */
@@ -788,27 +955,62 @@ static void ft_l2_tags(const struct cdx_ft_vlan *tags, u8 count, char *text, siz
 		at += scnprintf(text + at, size - at, "%s%u", i ? "." : "", tags[i].id);
 }
 
-/* in and out are the bridge's ports, port_in and port_out the physical ports
- * beneath them; in_vlan is the stack each frame arrives with and the entry
- * checks and strips, out_vlan the one it leaves with. */
+/* The totals, in the header of /proc/cdx_flowtable. */
 void ft_l2_show(struct seq_file *seq)
 {
-	char in_vlan[16], out_vlan[16];
-	struct ft_l2_pair *p;
-
 	seq_printf(seq, "l2_enabled %u\nl2_entries %u\nl2_installs %llu\nl2_refused %llu\n"
 		   "l2_retired %llu\nl2_dropped %llu\nl2_deferred %llu\n",
 		   READ_ONCE(ft_l2_enabled) && READ_ONCE(ft_l2_hooked), ft_l2_count,
 		   ft_l2_installs, ft_l2_refused, ft_l2_retired, ft_l2_dropped, ft_l2_deferred);
-	list_for_each_entry(p, &ft_l2_list, list) {
-		ft_l2_tags(p->rule.in_vlan, p->rule.in_vlans, in_vlan, sizeof(in_vlan));
-		ft_l2_tags(p->rule.out_vlan, p->rule.out_vlans, out_vlan, sizeof(out_vlan));
-		seq_printf(seq, "l2flow in=%s out=%s port_in=%s port_out=%s br=%s dst=%pM src=%pM type=%#06x vid=%u tagged=%u in_vlan=%s out_vlan=%s packets=%llu bytes=%llu\n",
-			   netdev_name(p->in), netdev_name(p->out), netdev_name(p->rule.in),
-			   netdev_name(p->rule.out), netdev_name(p->bridge),
-			   p->key.dst, p->key.src, p->key.ethertype, p->key.vid, p->key.tagged,
-			   in_vlan, out_vlan, p->packets, p->bytes);
+}
+
+/* The rows, one seq_file record each, after the flows' (main.c's
+ * ft_position()): a read holds the transaction for one buffer of them, never
+ * for all (A382). Addressed as the flows are, by hash bucket and offset in it,
+ * so no pair pointer survives the transaction between reads. */
+unsigned int ft_l2_row_buckets(void)
+{
+	return HASH_SIZE(ft_l2_pairs);
+}
+
+struct list_head *ft_l2_row(unsigned int bucket, unsigned int *skip)
+{
+	struct ft_l2_pair *p;
+
+	hlist_for_each_entry(p, &ft_l2_pairs[bucket], node) {
+		if (*skip) {
+			(*skip)--;
+			continue;
+		}
+		return &p->list;
 	}
+	return NULL;
+}
+
+struct list_head *ft_l2_row_next(struct list_head *row)
+{
+	struct ft_l2_pair *p = list_entry(row, struct ft_l2_pair, list);
+
+	if (!p->node.next)
+		return NULL;
+	return &hlist_entry(p->node.next, struct ft_l2_pair, node)->list;
+}
+
+/* in and out are the bridge's ports, port_in and port_out the physical ports
+ * beneath them; in_vlan is the stack each frame arrives with and the entry
+ * checks and strips, out_vlan the one it leaves with. */
+void ft_l2_show_row(struct seq_file *seq, struct list_head *row)
+{
+	struct ft_l2_pair *p = list_entry(row, struct ft_l2_pair, list);
+	char in_vlan[16], out_vlan[16];
+
+	ft_l2_tags(p->rule.in_vlan, p->rule.in_vlans, in_vlan, sizeof(in_vlan));
+	ft_l2_tags(p->rule.out_vlan, p->rule.out_vlans, out_vlan, sizeof(out_vlan));
+	seq_printf(seq, "l2flow in=%s out=%s port_in=%s port_out=%s br=%s dst=%pM src=%pM type=%#06x vid=%u tagged=%u in_vlan=%s out_vlan=%s packets=%llu bytes=%llu\n",
+		   netdev_name(p->in), netdev_name(p->out), netdev_name(p->rule.in),
+		   netdev_name(p->rule.out), netdev_name(p->bridge),
+		   p->key.dst, p->key.src, p->key.ethertype, p->key.vid, p->key.tagged,
+		   in_vlan, out_vlan, p->packets, p->bytes);
 }
 
 /* --------------------------------------------------------- start and stop */
@@ -847,7 +1049,7 @@ void ft_l2_exit(void)
 	ft_l2_recent = NULL;
 	cancel_delayed_work_sync(&ft_l2_work);
 	cdx_ft_begin();
-	ft_l2_retire_all();
-	ft_settle();
+	while (ft_l2_retire_batch())
+		ft_l2_yield();
 	cdx_ft_end();
 }

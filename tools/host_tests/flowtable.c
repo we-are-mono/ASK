@@ -507,7 +507,34 @@ static void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
     l2_fdb_events++;
 }
 static void ft_l2_dev_changed(const struct net_device *dev) { (void)dev; l2_devices_changed++; }
-static void ft_l2_retire_all(void) { l2_retire_alls++; }
+static bool ft_l2_retire_batch(void) { l2_retire_alls++; return false; }
+/* Three buckets of bridged pairs' rows after the flows': two rows, none and
+ * one, which the /proc walk has to hand off to, step through and resume
+ * inside (ft_l2_row()). */
+static struct list_head l2_rows[3];
+static const unsigned int l2_row_bucket[3] = { 0, 0, 2 };
+static unsigned int ft_l2_row_buckets(void) { return 3; }
+static struct list_head *ft_l2_row(unsigned int bucket, unsigned int *skip)
+{
+    for (unsigned int i = 0; i < ARRAY_SIZE(l2_rows); i++) {
+        if (l2_row_bucket[i] != bucket)
+            continue;
+        if (*skip) {
+            (*skip)--;
+            continue;
+        }
+        return &l2_rows[i];
+    }
+    return NULL;
+}
+static struct list_head *ft_l2_row_next(struct list_head *row)
+{
+    unsigned int i = row - l2_rows;
+
+    assert(i < ARRAY_SIZE(l2_rows));
+    return i + 1 < ARRAY_SIZE(l2_rows) && l2_row_bucket[i + 1] == l2_row_bucket[i] ?
+           &l2_rows[i + 1] : NULL;
+}
 static unsigned l2_egress_drains;
 static int ft_l2_egress_drain(const struct net_device *dev) { (void)dev; l2_egress_drains++; return 0; }
 /* The Wi-Fi VAP registration lives in its own file and has its own harness
@@ -5487,9 +5514,11 @@ static void test_rearm(void)
     assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
     assert(!ft_passive && ft_bound == 1 && ft_parked == 1 && bound_to(&block, &in)->parked);
     assert(ft_replace(bound_to(&block, &in), &cls) == -EOPNOTSUPP && !live_hw);
-    unsigned flushes = flushed, recovered = recoveries;
+    unsigned flushes = flushed, recovered = recoveries, l2_retired = l2_retire_alls;
     ft_invalidate_work(NULL);
     assert(flushed == flushes + 1 && recoveries == recovered + 1 && ft_invalid_done);
+    /* And the bridged pairs went with the flows. */
+    assert(l2_retire_alls > l2_retired);
     ft_rearm_workfn(NULL);
     assert(ft_parked == 1 && ft_rearms == rearms);
     unsigned rechecks = mc_rechecks, kicks = mroute_kicks, marked = ipsec_marked_all;
@@ -5755,16 +5784,31 @@ static void connection_rule(unsigned n)
 }
 
 /* Complete and fragmented proc iteration must enumerate every live owner once,
- * including collisions, empty buckets and a resumed read at the current row. */
+ * including collisions, empty buckets and a resumed read at the current row --
+ * and then every bridged pair's row once, after all of them, resuming inside
+ * their buckets too. */
 static void test_iterator(unsigned expected)
 {
-    bool seen[CDX_FT_MAX_ENTRIES] = {0};
+    bool seen[CDX_FT_MAX_ENTRIES] = {0}, l2_seen[ARRAY_SIZE(l2_rows)] = {0};
     loff_t pos = 0;
     void *row = ft_start(NULL, &pos);
-    unsigned count = 0;
+    unsigned count = 0, l2 = 0;
 
     assert(row == &ft_entries);
     while ((row = ft_next(NULL, row, &pos))) {
+        if ((uintptr_t)row >= (uintptr_t)l2_rows &&
+            (uintptr_t)row < (uintptr_t)(l2_rows + ARRAY_SIZE(l2_rows))) {
+            unsigned i = (struct list_head *)row - l2_rows;
+
+            assert(!l2_seen[i] && ft_position_l2(pos));
+            l2_seen[i] = true;
+            l2++;
+            ft_stop(NULL, row);
+            assert(ft_start(NULL, &pos) == row);
+            continue;
+        }
+        /* Every flow row precedes every bridged pair's. */
+        assert(!l2 && !ft_position_l2(pos));
         struct cdx_ft_entry *entry = list_entry(row, struct cdx_ft_entry, list);
         unsigned index = (entry->cookie - 1000) % 100000;
         assert(index < CDX_FT_MAX_ENTRIES && !seen[index]);
@@ -5776,7 +5820,7 @@ static void test_iterator(unsigned expected)
         }
     }
     ft_stop(NULL, row);
-    assert(count == expected);
+    assert(count == expected && l2 == ARRAY_SIZE(l2_rows));
 }
 
 static void test_connections(void)

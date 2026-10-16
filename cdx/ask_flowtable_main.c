@@ -157,11 +157,20 @@ static struct notifier_block ft_nexthop_nb = { .notifier_call = ft_nexthop_event
 /* Position zero is the header. Other positions encode bucket+1 in the upper
  * word and the entry offset within that bucket in the lower word. Resuming a
  * paged read therefore walks only its bucket, not all preceding flow entries.
- * No entry pointer survives release of the transaction between reads. */
+ * No entry pointer survives release of the transaction between reads. The
+ * bridged pairs' rows follow the flows', their buckets numbered on after the
+ * flows' (ft_l2_row()). */
+static bool ft_position_l2(loff_t pos)
+{
+	/* bucket + 1 past the flows' last */
+	return (u64)pos >> 32 > HASH_SIZE(ft_cookies);
+}
+
 static void *ft_position(loff_t *pos)
 {
 	unsigned int bucket = (*pos >> 32) - 1, skip = (u32)*pos;
 	struct cdx_ft_entry *entry;
+	struct list_head *row;
 
 	for (; bucket < HASH_SIZE(ft_cookies); bucket++) {
 		hlist_for_each_entry(entry, &ft_cookies[bucket], cookie_node) {
@@ -171,6 +180,13 @@ static void *ft_position(loff_t *pos)
 			}
 			return &entry->list;
 		}
+		*pos = (loff_t)(bucket + 2) << 32;
+		skip = 0;
+	}
+	for (; bucket < HASH_SIZE(ft_cookies) + ft_l2_row_buckets(); bucket++) {
+		row = ft_l2_row(bucket - HASH_SIZE(ft_cookies), &skip);
+		if (row)
+			return row;
 		*pos = (loff_t)(bucket + 2) << 32;
 		skip = 0;
 	}
@@ -186,8 +202,15 @@ static void *ft_start(struct seq_file *seq, loff_t *pos)
 static void *ft_next(struct seq_file *seq, void *v, loff_t *pos)
 {
 	struct cdx_ft_entry *entry;
+	struct list_head *row;
 
-	if (v != &ft_entries) {
+	if (v != &ft_entries && ft_position_l2(*pos)) {
+		row = ft_l2_row_next(v);
+		if (row) {
+			(*pos)++;
+			return row;
+		}
+	} else if (v != &ft_entries) {
 		entry = list_entry(v, struct cdx_ft_entry, list);
 		if (entry->cookie_node.next) {
 			(*pos)++;
@@ -361,6 +384,11 @@ static int ft_show(struct seq_file *seq, void *v)
 	char in_tnl[IFNAMSIZ + 100], out_tnl[IFNAMSIZ + 100];
 	char nexthop[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
 
+	/* seq_file holds the position of the record it shows in seq->index. */
+	if (v != &ft_entries && ft_position_l2(seq->index)) {
+		ft_l2_show_row(seq, v);
+		return 0;
+	}
 	if (v != &ft_entries) {
 		entry = list_entry(v, struct cdx_ft_entry, list);
 		cdx_ft_stats(entry->hw, &stats);

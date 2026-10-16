@@ -383,7 +383,13 @@ destination's is its reverse pair's to keep, so a station that went silent
 ages out and is flooded for as it would be in software.
 
 `/proc/cdx_flowtable` lists each pair as an `l2flow` row with its ports,
-addresses, VLAN, tag rewrite and counters, under `l2_*` totals.
+addresses, VLAN, tag rewrite and counters, after the flow rows and under
+`l2_*` totals in the header. Like the flow rows, each is a record of its own,
+so a read holds the transaction for one buffer of them; and every walk over
+the pairs -- the once-a-second sweep that reads counters and ages pairs out,
+the recheck, a global invalidation, an egress drain, unload -- goes a batch at
+a time, at most `FT_L2_VISIT_BATCH` (256) pairs visited and `FT_RETIRE_BATCH`
+(64) retired per hold, as routed retirement does (A327, A382).
 `ask_flowtable.l2_bridge=0` turns the learner off.
 
 `flowtable_l2bridge.py` proves it on the rig: the LAN VM on eth3 and a

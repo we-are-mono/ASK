@@ -645,3 +645,52 @@ async def test_l2_ingress_tag_validated(l2_rig):
             # Handed to the bridge, which drops it or keeps it in its own
             # VLAN: never at the far end.
             assert delivered[label] == 0, (label, delivered)
+
+
+async def test_l2_many_pairs(l2_rig):
+    """More pairs than one batch of any walk takes (A382): 400 stations behind
+    eth3, each talking to the peer, are all installed, all listed -- one
+    /proc record each, across many reads -- and all retired again by the idle
+    sweep, a batch per hold of the transaction, leaving nothing behind."""
+    r = l2_rig
+    count = 400
+    param = "/sys/module/ask_flowtable/parameters/l2_idle_ms"
+    await _exchange(r, count=4)
+    await _carried(r)
+    stations = [f"02:a5:{i >> 8:02x}:{i & 0xff:02x}:00:01" for i in range(count)]
+    frames = [_frame(PEER_MAC, mac, None, b"askl2-many").hex() for mac in stations]
+    script = f"""
+import socket, time
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind(({LAN_NIC!r}, 0))
+frames = [bytes.fromhex(f) for f in {frames!r}]
+for _ in range(6):
+    for frame in frames:
+        s.send(frame)
+        time.sleep(0.0005)
+    time.sleep(1)
+print('sent')
+"""
+    saved = bytes.fromhex((await r.target.fs_read(r.session, param))["content_hex"]).decode().strip()
+    try:
+        injected = asyncio.create_task(lan_run_python(r.lan, script, label="l2_many", timeout=90))
+        deadline = time.monotonic() + 60
+        while True:
+            state = await r.state()
+            rows = [row for row in state["l2flows"] if row["dst"] == PEER_MAC]
+            if len(rows) >= count or time.monotonic() > deadline:
+                break
+            await asyncio.sleep(1)
+        result = await injected
+        assert result.rc == 0 and "sent" in result.stdout, result.stdout
+        r.record("l2-many", {"entries": state["l2_entries"], "rows": len(rows),
+                             "refused": state["l2_refused"], "dropped": state["l2_dropped"]})
+        assert len(rows) >= count, (len(rows), state["l2_entries"], state["l2_refused"])
+        # The header's count and the rows span several reads, between which
+        # a pair can come or go; they agree once nothing does.
+        await r.wait(lambda s: s["l2_entries"] == len(s["l2flows"]), timeout=10)
+        assert (await r.target.fs_write(r.session, param, "2000"))["errno"] == 0
+        after = await r.wait(lambda s: not s["l2_entries"] and not s["l2flows"], timeout=30)
+        assert after["l2_retired"] >= state["l2_retired"] + count, (state["l2_retired"], after["l2_retired"])
+    finally:
+        await r.target.fs_write(r.session, param, saved)

@@ -258,8 +258,13 @@ void ft_invalidate_work(struct work_struct *work)
 		cond_resched();
 		cdx_ft_begin();
 	}
-	/* And every bridged pair, which no flow retirement reaches. */
-	ft_l2_retire_all();
+	/* And every bridged pair, which no flow retirement reaches, the same
+	 * way. */
+	while (ft_l2_retire_batch()) {
+		cdx_ft_end();
+		cond_resched();
+		cdx_ft_begin();
+	}
 	/* CDX retains failed deletions and owns the hardware latch. Retry until
 	 * a barrier or the stopped datapath makes retirement safe. */
 	if (cdx_ft_recover()) {

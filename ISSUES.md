@@ -190,10 +190,9 @@ result independently of those temporary files.
   Harmless at the dozens of pairs a LAN has; a refusal cache keyed by pair and reason, or a cheap port test in the hook,
   would remove it.
 
-- [ ] **A382 — the bridged unicast learner retires and lists its pairs in one pass under the control mutex.** The
-  dead/idle sweep, `ft_l2_retire_all()` and `ft_l2_show()` each walk every pair (up to `FT_L2_MAX`, 4096) in one hold,
-  where routed retirement batches by `FT_RETIRE_BATCH` and lets the transaction go between batches (A327). A LAN has
-  tens of pairs; batch them the same way if a deployment ever holds thousands.
+- [x] **A382 — the bridged unicast learner retired and listed its pairs in one pass under the control mutex.** Its
+  walks now go a batch per hold of the transaction, as routed retirement does (A327), and its `/proc` rows are records
+  of their own (_:/^flowtable: walk the bridged pairs a batch at a time_).
 
 - [x] **A381 — two stations on two LAN ports talked through the CPU; 1.0.7 switched them at line rate.** The bridged
   unicast learner installs each station pair in the ingress port's Ethernet table (_:/^flowtable: switch bridged station pairs_).
