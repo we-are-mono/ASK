@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A378 — an offer that lost `rtnl_trylock()` was waited for with no traffic to re-offer it.** Flaky
+  `test_qinq`/`test_tcp` (`busy=2`, no flows); the helpers now keep sending (_:/^tests: keep sending while admission is awaited_).
+
 - [x] **A377 — a station behind any br-lan port but the one whose address the bridge took got no hardware download.**
   Each direction now carries the source Linux sends with (_:/^cdx: carry each direction's Ethernet source_).
 

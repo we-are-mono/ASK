@@ -903,7 +903,17 @@ async def _established(r, count=64):
     """
     initial = await r.state()
     await r.table()
-    await r.exchange(count=4)
+    # Admission takes rtnl_trylock, so an offer can be declined in passing;
+    # Linux offers it again only on a later packet, at most once a second
+    # (drive()). Keep sending until the download is in and the upload has
+    # been refused, then judge what is installed.
+    deadline = time.monotonic() + 10
+    while True:
+        await r.exchange(count=4)
+        state = await r.state()
+        if ((any(f["in"] == TARGET_WAN_IF for f in state["flows"])
+             and state["rejects"] > initial["rejects"]) or time.monotonic() >= deadline):
+            break
     flows = await _download_only(r, initial)
     installed = await r.state()
     before = {f["cookie"]: int(f["packets"]) for f in flows}
@@ -969,10 +979,10 @@ async def _tcp_carried(r, label):
     async with GatedTcp(r.run_peer, source=r.lan_ip, sport=SPORT, peer=INNER_LOCAL,
                         dport=DPORT, label=label) as transfer:
         await transfer.warmed()
-        # Admission is asynchronous (rtnl_trylock, deferred a second or two
-        # under RTNL contention), so warmed()'s brief settle can miss a late
-        # direction; wait both in before reading the baseline the record and
-        # the direction check share.
+        # Admission is asynchronous, and an offer that lost rtnl_trylock comes
+        # back only on a later packet; the warm phase runs long enough for that
+        # (_gated_tcp.WARM_SECONDS). Wait both in before reading the baseline
+        # the record and the direction check share.
         before = await r.wait(lambda s: len(s["flows"]) == 2)
         flows = await _both_directions(r, before)
         record = _session_halves(before, r.session_identity)

@@ -292,15 +292,18 @@ async def _both_directions(r):
     """Admission is directional, so one direction refused leaves the other
     accelerated and the difference is invisible in a throughput number. When
     the count is wrong, say what Linux and the adapter each thought."""
-    # Admission is asynchronous and takes rtnl_trylock, so a direction can be
-    # deferred a second or two when the bench's own ip commands hold RTNL; give
-    # the deferred readmission that window before treating a missing direction
-    # as a refusal. A genuine refusal still fails, just after the wait.
+    # Admission takes rtnl_trylock, so an offer can be declined in passing
+    # while the bench's own commands hold RTNL. Linux offers the flow again
+    # only on a later packet of that direction, at most once a second
+    # (drive()), so keep sending while waiting; idle, the declined direction
+    # never comes back. A genuine refusal still fails, after the window.
     state = await r.state()
-    for _ in range(100):
-        if len(state["flows"]) == 2:
-            break
-        await asyncio.sleep(0.1)
+    deadline = time.monotonic() + 10
+    while len(state["flows"]) != 2 and time.monotonic() < deadline:
+        if r.proto == "udp":
+            await r.exchange(count=4)
+        else:
+            await asyncio.sleep(0.1)
         state = await r.state()
     if len(state["flows"]) != 2:
         conntrack = await command(r.target, r.session, "conntrack", "-L", "-o", "extended",

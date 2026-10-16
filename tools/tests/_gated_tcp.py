@@ -23,6 +23,12 @@ BLOCK = bytes(range(256)) * 16
 # Long enough after the last echo for the peer's delayed ACK to cross, so a
 # read sees an idle connection rather than its last frame in flight.
 SETTLE = 0.5
+# How long the first phase keeps the connection busy. Admission takes
+# rtnl_trylock and an offer that loses it is declined; Linux offers the flow
+# again only on a later packet of that direction, at most once a second
+# (flow_offload_refresh()). A first phase over in a tenth of a second left no
+# packet to re-offer it, and the idle wait after it timed out with no flow.
+WARM_SECONDS = 2.5
 
 PEER = '''
 import json, socket, time
@@ -36,7 +42,7 @@ s.settimeout(60)
 s.connect(({peer!r}, {dport}))
 port = s.getsockname()[1]
 block = bytes(range(256)) * 16
-def echo(count):
+def echo(count, pace):
     for _ in range(count):
         s.sendall(block)
         remaining = len(block)
@@ -44,11 +50,11 @@ def echo(count):
             chunk = s.recv(remaining)
             assert chunk, 'the far end closed mid-transfer'
             remaining -= len(chunk)
-        time.sleep(0.002)
+        time.sleep(pace)
 def released():
     assert s.recv(1) == b'G', 'the far end closed without releasing the next phase'
-for count in {counts!r}:
-    echo(count)
+for phase, count in enumerate({counts!r}):
+    echo(count, max(0.002, {warm_seconds} / max(count, 1)) if phase == 0 else 0.002)
     released()
 s.close()
 print(json.dumps({{'port': port, 'sent': {sent}}}))
@@ -108,6 +114,7 @@ class GatedTcp:
                              else "socket.AF_INET",
                              source=self.source, sport=self.sport, peer=self.peer,
                              dport=self.dport, counts=self.counts, tos=self.tos,
+                             warm_seconds=WARM_SECONDS,
                              sent=sum(self.counts) * len(BLOCK))
         self.task = asyncio.create_task(self.run(script, timeout=self.timeout + 60,
                                                  label=self.label))

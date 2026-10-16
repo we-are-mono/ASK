@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import socket
+import time
 
 import pytest
 import pytest_asyncio
@@ -304,15 +305,18 @@ async def _both_directions(r):
     """Admission is directional, so one direction refused leaves the other
     accelerated and the difference is invisible in a throughput number. When
     the count is wrong, say what Linux and the adapter each thought."""
-    # Admission is asynchronous and takes rtnl_trylock, so a direction can be
-    # deferred a second or two when the bench's own ip commands hold RTNL; give
-    # the deferred readmission that window before treating a missing direction
-    # as a refusal. A genuine refusal still fails, just after the wait.
+    # Admission takes rtnl_trylock, so an offer can be declined in passing
+    # while the bench's own commands hold RTNL. Linux offers the flow again
+    # only on a later packet of that direction, at most once a second
+    # (drive()), so keep sending while waiting; idle, the declined direction
+    # never comes back. A genuine refusal still fails, after the window.
     state = await r.state()
-    for _ in range(100):
-        if len(state["flows"]) == 2:
-            break
-        await asyncio.sleep(0.1)
+    deadline = time.monotonic() + 10
+    while len(state["flows"]) != 2 and time.monotonic() < deadline:
+        if r.proto == "udp":
+            await r.exchange(count=4)
+        else:
+            await asyncio.sleep(0.1)
         state = await r.state()
     if len(state["flows"]) != 2:
         conntrack = await command(r.target, r.session, "conntrack", "-L", "-o", "extended",
@@ -466,12 +470,7 @@ async def test_bridge_address_change(bridge_rig):
     # bridge keeps delivering -- it is still a port's -- until the station's
     # cache ages. Make it ask now, so the measurement is of the new source.
     await lan_run(r.lan, f"ip neigh del {r.dut_lan_ip} dev {r.peer_if} 2>/dev/null; true", 10.0)
-    # Readmission needs traffic, and frames that arrive while Linux is still
-    # tearing the old flow down offer nothing; send until both are back.
-    for _ in range(10):
-        await r.exchange(count=4)
-        if len((await r.state())["flows"]) == 2:
-            break
+    await r.exchange(count=4)
     readmitted = await _both_directions(r)
     counts = {f["cookie"]: int(f["packets"]) for f in readmitted}
     await r.exchange(count=32)
