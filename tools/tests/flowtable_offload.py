@@ -63,6 +63,44 @@ async def test_long_exchange(rig):
     assert (await rig.state())["entries"] == (2 if hardware else 0)
 
 
+async def test_one_way_udp(rig):
+    """A UDP flow nothing ever answers -- a stream, a log shipper, one leg of
+    a call -- is offloaded once conntrack has confirmed it, as 1.0.7 had CMM
+    program a confirmed one: the direction it flows in is carried in hardware
+    while conntrack still holds it unreplied, and the WAN host receives every
+    datagram."""
+    r = rig
+    await r.table()
+    r.echo.reply = False
+    count = 400
+    script = f'''
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(({r.lan_ip!r}, {SPORT}))
+for n in range({count}):
+    s.sendto(b'one-way'.ljust(200, b'.'), ({WAN_IP!r}, {DPORT}))
+    time.sleep(0.005)
+print('sent')
+'''
+    received = r.echo.packets
+    result = await lan_run_python(r.lan, script, label="one_way_udp", timeout=30)
+    assert result.rc == 0 and "sent" in result.stdout, result.stdout
+    await asyncio.sleep(1.5)
+    state = await r.state()
+    forward = [f for f in state["flows"] if f["src"].startswith(r.lan_ip + ":")
+               and f["dst"].startswith(WAN_IP + ":")]
+    assert len(forward) == 1, state["flows"]
+    # Admission takes the first packets or so; the stream after it is the
+    # hardware's.
+    assert int(forward[0]["packets"]) >= count // 2, forward
+    assert r.echo.packets - received == count, (r.echo.packets, received)
+    listing = await command(r.target, r.session, "conntrack", "-L", "-p", "udp",
+                            "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
+                            "--sport", str(SPORT), "--dport", str(DPORT))
+    assert "UNREPLIED" in listing["stdout"], listing
+    r.record("one-way-udp", {"forward": forward, "conntrack": listing["stdout"]})
+
+
 async def test_reference_and_lifecycle(rig):
     r = rig
     from _ioctl import CDX_CTRL_DPA_SET_PARAMS, SIZEOF_CDX_CTRL_SET_DPA_PARAMS

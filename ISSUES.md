@@ -152,6 +152,33 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A387 — with br_netfilter loaded (Docker loads it), no flow leaving through a bridge is offloaded.** Its hooks
+  sit at the bridge's `POST_ROUTING` (and `PRE_ROUTING`/`FORWARD`), and the adapter refuses any bridge hook it does not
+  own (`ft_bridge_egress_filtered()`, `ft_bridge_hooked()`), so every download to a `br-lan` station and every bridged
+  station pair stays in software; 1.0.7's CMM ignored bridge hooks. For bridged frames that is right while
+  `bridge-nf-call-ip*tables` hands them to iptables. For routed frames it looks conservative: `br_nf_post_routing()`
+  appears to act only on frames carrying `nf_bridge` state from entering the bridge, which a routed frame lacks (to be
+  confirmed against 6.12). Next: recognise
+  br_netfilter's own ops (they are static, so by `hook_ops_type` and priority, or a kernel patch exporting the ops) and
+  exempt them for routed egress only.
+
+- [ ] **A386 — transit ESP, GRE, IPIP and IPv6-in-IPv4 are forwarded in software; 1.0.7 offloaded them.** CMM
+  registered those conntrack entries too (`SUPPORTED_LOCAL_PROTO` in `cmm/src/conntrack.h@mono-1.0.7`); Netfilter's
+  flowtable carries only TCP and UDP, so nothing offers them to this adapter. It matters where the router does not
+  terminate them: native IPsec between routed (IPv6) hosts, PPTP or GRE tunnels, a 6in4 tunnel a LAN host runs. IPsec
+  behind NAT uses NAT-T and is offloaded as UDP. Two smaller A7 shapes stay as they are: a flow in a non-default
+  conntrack zone (OpenWrt sets none) and 6rd, which picks its outer destination per packet and which 1.0.7 did not
+  offload either. Next: measure these on a production image; offloading them needs flowtable support for port-less
+  protocols.
+
+- [ ] **A385 — the microcode's fragments of a frame received on an Ethernet port carry an all-zero payload.** A202
+  keeps every UDP direction into a smaller path in software because of it -- above all the upload into every PPPoE
+  session (1492 under a 1500 LAN), which 1.0.7 forwarded in hardware and, for a datagram over 1492 without DF,
+  corrupted. QUIC sets DF and is handed to Linux when oversized either way. The software rate of that upload could not
+  be measured on the rig's debug kernel (KASAN, lockdep, kmemleak: ~0.11 Gbit/s on one core); measure it on a
+  production image. Next: an NXP case on the fragmenter; a session at 1500 over a 1508-byte Ethernet (RFC 4638) avoids
+  it where the ISP supports one.
+
 - [x] **A384 — a bridge whose port is a VLAN device (`br-lan` over `eth0.10`) kept every flow and station pair through it
   in software; 1.0.7 offloaded them.** The walk finds the bridge's port from below and descends from it, the
   bridged learner does the same, and patch 171 lets the port's MAC take the second tag such a port carries
