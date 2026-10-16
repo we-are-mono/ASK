@@ -368,8 +368,8 @@ static struct nf_hook_ops ft_mc_hook_ops = {
 };
 
 /* Whether a bridge hook that could decide a frame's fate is registered in
- * init_net at any of `hooks`, a mask of NF_BR_* bits. The bridged learner's
- * own is not: it only observes. Asked of the hook lists themselves, which
+ * init_net at any of `hooks`, a mask of NF_BR_* bits. The bridged learners'
+ * own are not: they only observe. Asked of the hook lists themselves, which
  * cost a few loads under RCU: no event says a hook was registered. */
 bool ft_bridge_hooked(unsigned int hooks)
 {
@@ -390,7 +390,7 @@ bool ft_bridge_hooked(unsigned int hooks)
 			continue;
 		ops = nf_hook_entries_get_hook_ops(e);
 		for (j = 0; j < e->num_hook_entries; j++)
-			if (ops[j] != &ft_mc_hook_ops) {
+			if (ops[j] != &ft_mc_hook_ops && !ft_l2_hook_is(ops[j])) {
 				hooked = true;
 				break;
 			}

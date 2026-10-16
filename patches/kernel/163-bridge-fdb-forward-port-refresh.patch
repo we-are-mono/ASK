@@ -1,0 +1,278 @@
+From 7710fd6d859e1d734e9564e1112e47c5363b5dbf Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Fri, 16 Oct 2026 18:35:12 +0200
+Subject: [PATCH] bridge: export an FDB lookup, refresh and port state for L2
+ offload
+
+An offload that forwards a unicast pair between two bridge ports in
+hardware needs three things from the bridge that nothing exports.
+
+br_fdb_find_port() names a port for a local entry too -- the bridge's
+own address, or a port's -- so a frame for the router resolves to the
+port whose address it is, and an offload asking it would bridge the
+router's traffic. br_fdb_forward_port() answers only for a learned
+entry: the port the bridge forwards the address out of, or NULL.
+
+Frames the hardware forwards never reach the bridge, so br_fdb_update()
+never refreshes their entries and they age out under a live pair.
+br_fdb_refresh() does what that update would for a station's own entry,
+while it still names the port the station's frames arrive on. Both
+answer nothing once the bridge is being unregistered: ndo_uninit()
+destroys the FDB's hash table after the RCU grace period that state
+change starts.
+
+br_port_forwarding() includes the bridge's own VLAN entry, which a
+frame routed through the bridge crosses; a frame bridged between two
+ports does not. br_port_bridging() asks only the port's own state and
+its VLAN's.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ include/linux/if_bridge.h | 25 +++++++++++++
+ net/bridge/br_fdb.c       | 77 +++++++++++++++++++++++++++++++++++++++
+ net/bridge/br_private.h   |  7 ++++
+ net/bridge/br_stp.c       | 19 ++++++++++
+ net/bridge/br_vlan.c      | 16 +++++++-
+ 5 files changed, 142 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index ba17e9cae800..bf5ce897b36a 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -206,10 +206,16 @@ static inline int br_mst_get_state(const struct net_device *dev, u16 msti,
+ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ 				    const unsigned char *addr,
+ 				    __u16 vid);
++struct net_device *br_fdb_forward_port(const struct net_device *br_dev,
++				       const unsigned char *addr,
++				       __u16 vid);
++void br_fdb_refresh(const struct net_device *br_dev, const unsigned char *addr,
++		    __u16 vid, const struct net_device *port);
+ void br_fdb_clear_offload(const struct net_device *dev, u16 vid);
+ bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag);
+ u8 br_port_get_stp_state(const struct net_device *dev);
+ bool br_port_forwarding(const struct net_device *dev, u16 vid);
++bool br_port_bridging(const struct net_device *dev, u16 vid);
+ clock_t br_get_ageing_time(const struct net_device *br_dev);
+ #else
+ static inline struct net_device *
+@@ -220,6 +226,20 @@ br_fdb_find_port(const struct net_device *br_dev,
+ 	return NULL;
+ }
+ 
++static inline struct net_device *
++br_fdb_forward_port(const struct net_device *br_dev,
++		    const unsigned char *addr,
++		    __u16 vid)
++{
++	return NULL;
++}
++
++static inline void br_fdb_refresh(const struct net_device *br_dev,
++				  const unsigned char *addr, __u16 vid,
++				  const struct net_device *port)
++{
++}
++
+ static inline void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
+ {
+ }
+@@ -240,6 +260,11 @@ static inline bool br_port_forwarding(const struct net_device *dev, u16 vid)
+ 	return false;
+ }
+ 
++static inline bool br_port_bridging(const struct net_device *dev, u16 vid)
++{
++	return false;
++}
++
+ static inline clock_t br_get_ageing_time(const struct net_device *br_dev)
+ {
+ 	return 0;
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 39cc761012d4..cc2c10a27d80 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -267,6 +267,41 @@ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ }
+ EXPORT_SYMBOL_GPL(br_fdb_find_port);
+ 
++/* The port the bridge forwards a frame for @addr in @vid out of, or NULL when
++ * it delivers the frame locally or has not learned the address. Unlike
++ * br_fdb_find_port(), a local entry -- the bridge's own address, or a port's
++ * -- names no port, which is what an offload that forwards a pair between
++ * two ports has to know: a frame for the router is never bridged. Needs no
++ * RTNL, but the device returned is pinned by nothing: the caller holds RTNL
++ * or RCU for as long as it uses it. A bridge being unregistered answers NULL,
++ * its FDB about to go. */
++struct net_device *br_fdb_forward_port(const struct net_device *br_dev,
++				       const unsigned char *addr,
++				       __u16 vid)
++{
++	const struct net_bridge_port *dst;
++	struct net_bridge_fdb_entry *f;
++	struct net_device *dev = NULL;
++
++	if (!netif_is_bridge_master(br_dev))
++		return NULL;
++	rcu_read_lock();
++	/* unregister_netdevice_many() moves reg_state on and waits out RCU
++	 * readers before ndo_uninit() destroys the FDB's hash table. */
++	if (READ_ONCE(br_dev->reg_state) != NETREG_REGISTERED)
++		goto out;
++	f = br_fdb_find_rcu(netdev_priv(br_dev), addr, vid);
++	if (f && !test_bit(BR_FDB_LOCAL, &f->flags)) {
++		dst = READ_ONCE(f->dst);
++		if (dst)
++			dev = dst->dev;
++	}
++out:
++	rcu_read_unlock();
++	return dev;
++}
++EXPORT_SYMBOL_GPL(br_fdb_forward_port);
++
+ struct net_bridge_fdb_entry *br_fdb_find_rcu(struct net_bridge *br,
+ 					     const unsigned char *addr,
+ 					     __u16 vid)
+@@ -965,6 +1000,48 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+ 	}
+ }
+ 
++/* Keep a station's entry from ageing while an offload forwards what it sends.
++ * br_fdb_update() refreshes an entry from every frame the bridge receives from
++ * the station, and a frame the hardware forwards never reaches the bridge, so
++ * without this an entry carrying traffic ages out, and the offload built on
++ * it with it. As br_fdb_update() does, and only for what it would: a dynamic
++ * entry, and only while it still names @port, the port the station's frames
++ * arrive on -- an entry the bridge has since moved is the bridge's to age.
++ * An entry an activity notification marked inactive is marked active again
++ * and notified, as a received frame would. */
++void br_fdb_refresh(const struct net_device *br_dev, const unsigned char *addr,
++		    __u16 vid, const struct net_device *port)
++{
++	const struct net_bridge_port *dst;
++	struct net_bridge_fdb_entry *f;
++	unsigned long now = jiffies;
++	struct net_bridge *br;
++
++	if (!netif_is_bridge_master(br_dev))
++		return;
++	br = netdev_priv(br_dev);
++	rcu_read_lock();
++	if (READ_ONCE(br_dev->reg_state) != NETREG_REGISTERED || hold_time(br) == 0)
++		goto out;
++	f = br_fdb_find_rcu(br, addr, vid);
++	if (!f || test_bit(BR_FDB_LOCAL, &f->flags) || test_bit(BR_FDB_STATIC, &f->flags))
++		goto out;
++	dst = READ_ONCE(f->dst);
++	if (!dst || dst->dev != port || READ_ONCE(f->updated) == now)
++		goto out;
++	WRITE_ONCE(f->updated, now);
++	if (__fdb_mark_active(f)) {
++		/* With bottom halves off, as every other caller notifies the
++		 * atomic switchdev chain: its listeners may rely on it. */
++		local_bh_disable();
++		fdb_notify(br, f, RTM_NEWNEIGH, true);
++		local_bh_enable();
++	}
++out:
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL_GPL(br_fdb_refresh);
++
+ /* Dump information about entries, in response to GETNEIGH */
+ int br_fdb_dump(struct sk_buff *skb,
+ 		struct netlink_callback *cb,
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index cb7428f336f0..fbb7b2707c56 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -1597,6 +1597,7 @@ int br_vlan_fill_forward_path_mode(struct net_bridge *br,
+ 				   struct net_bridge_port *dst,
+ 				   struct net_device_path *path);
+ bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid);
++bool br_vlan_port_forwarding(const struct net_bridge_port *p, u16 vid);
+ 
+ static inline struct net_bridge_vlan_group *br_vlan_group(
+ 					const struct net_bridge *br)
+@@ -1778,6 +1779,12 @@ static inline bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid)
+ 	return true;
+ }
+ 
++static inline bool br_vlan_port_forwarding(const struct net_bridge_port *p,
++					   u16 vid)
++{
++	return true;
++}
++
+ static inline struct net_bridge_vlan_group *br_vlan_group(
+ 					const struct net_bridge *br)
+ {
+diff --git a/net/bridge/br_stp.c b/net/bridge/br_stp.c
+index 9a5183f24d1b..58a947d3e40b 100644
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -102,6 +102,25 @@ bool br_port_forwarding(const struct net_device *dev, u16 vid)
+ }
+ EXPORT_SYMBOL_GPL(br_port_forwarding);
+ 
++/* Whether @dev, a bridge port, forwards frames in @vid to another port: the
++ * port's own state, or MST's, and the VLAN's on the port. Unlike
++ * br_port_forwarding(), the bridge's own entry plays no part -- a frame
++ * bridged between two ports never crosses it. */
++bool br_port_bridging(const struct net_device *dev, u16 vid)
++{
++	const struct net_bridge_port *p;
++	bool forwarding;
++
++	rcu_read_lock();
++	p = br_port_get_check_rcu(dev);
++	forwarding = p && (br_mst_is_enabled(p) || p->state == BR_STATE_FORWARDING) &&
++		     br_vlan_port_forwarding(p, vid);
++	rcu_read_unlock();
++
++	return forwarding;
++}
++EXPORT_SYMBOL_GPL(br_port_bridging);
++
+ /* called under bridge lock */
+ struct net_bridge_port *br_get_port(struct net_bridge *br, u16 port_no)
+ {
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index c1cefc1a6799..ee24a81b1787 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -1497,6 +1497,19 @@ int br_vlan_fill_forward_path_mode(struct net_bridge *br,
+ 	return 0;
+ }
+ 
++/* The port's own half of br_vlan_forwarding(): what br_forward() asks of a
++ * frame bridged between two ports, which never crosses the bridge's entry. */
++bool br_vlan_port_forwarding(const struct net_bridge_port *p, u16 vid)
++{
++	struct net_bridge_vlan *v;
++
++	if (!br_opt_get(p->br, BROPT_VLAN_ENABLED))
++		return true;
++
++	v = br_vlan_find(nbp_vlan_group_rcu(p), vid);
++	return v && br_vlan_get_state(v) == BR_STATE_FORWARDING;
++}
++
+ /* The per-VLAN half of br_port_forwarding_vid(). br_forward() checks the
+  * port's VLAN through br_allowed_egress(); a flow's reply goes up the
+  * bridge's own entry, in br_pass_frame_up() -> br_allowed_egress(). MST
+@@ -1509,8 +1522,7 @@ bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid)
+ 	if (!br_opt_get(p->br, BROPT_VLAN_ENABLED))
+ 		return true;
+ 
+-	v = br_vlan_find(nbp_vlan_group_rcu(p), vid);
+-	if (!v || br_vlan_get_state(v) != BR_STATE_FORWARDING)
++	if (!br_vlan_port_forwarding(p, vid))
+ 		return false;
+ 
+ 	v = br_vlan_find(br_vlan_group_rcu(p->br), vid);
+-- 
+2.47.3
+

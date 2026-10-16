@@ -10,7 +10,8 @@ import time
 
 TABLE = Path("/proc/cdx_flowtable")
 ROW_NAMES = {"flow": "flows", "session": "sessions", "vlan": "vlans",
-             "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute"}
+             "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute",
+             "l2flow": "l2flows"}
 
 
 def empty():

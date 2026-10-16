@@ -19,7 +19,7 @@ ccflags-y += $(CFG_FLAGS)
 obj-$(CONFIG_ASK_CDX) += cdx.o ask_flowtable.o
 
 ask_flowtable-y += ask_flowtable_core.o ask_flowtable_watch.o \
-	ask_flowtable_ipsec.o ask_flowtable_mc.o ask_flowtable_mc_hook.o \
+	ask_flowtable_ipsec.o ask_flowtable_mc.o ask_flowtable_mc_hook.o ask_flowtable_l2.o \
 	ask_flowtable_mr.o ask_flowtable_mr_probe.o ask_flowtable_wifi.o \
 	ask_flowtable_main.o
 

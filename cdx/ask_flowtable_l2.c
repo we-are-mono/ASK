@@ -1,0 +1,742 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* The bridged unicast learner: LAN-to-LAN switching in hardware.
+ *
+ * A bridge over several DPAA ports forwards a station's frames to another
+ * station in software, one frame at a time, unless something installs an
+ * entry for them. Nothing in Linux does: a flowtable is routed, and a bridged
+ * pair crosses no route. So this learner does, the way 1.0.7's auto_bridge
+ * did with CMM behind it: it watches the frames the bridge forwards, and for a
+ * unicast pair between two bound ports it installs an entry in the ingress
+ * port's Ethernet table (insert_l2_entry_in_classif_table()) that forwards the
+ * pair's frames to the port the FDB names, untouched but for the tags the two
+ * ports' VLAN membership differs in. Every IP table's miss falls through to
+ * that table, so the pair's frames meet the entry and never reach the CPU.
+ *
+ * Three halves, as the bridged multicast learner has (ask_flowtable_mc*.c):
+ *
+ * - the hook, at the bridge's PRE_ROUTING, before the bridge has given an
+ *   untagged frame its port's PVID -- the only place the frame's wire form is
+ *   still known, and the wire form is the hardware key. It records, it never
+ *   diverts, and it records each pair at most once a second;
+ * - the worker, which asks the bridge itself -- under RTNL, taken without
+ *   waiting -- where the pair goes, whether both ports forward and how each
+ *   tags, installs, and retires what idles or what something invalidated;
+ * - the events, which mark pairs dead from wherever they arrive (the FDB, a
+ *   port's state, a device going away) and wake the worker to retire them.
+ *
+ * A pair is admitted only while no bridge-family netfilter hook other than the
+ * learners' own observers is registered: an ebtables or nftables bridge chain,
+ * or br_netfilter, can drop or mark a forwarded frame, and an installed entry
+ * forwards where none of them runs (ft_bridge_hooked()).
+ */
+#include "ask_flowtable_internal.h"
+
+static bool ft_l2_enabled = true;
+module_param_named(l2_bridge, ft_l2_enabled, bool, 0444);
+MODULE_PARM_DESC(l2_bridge, "Switch unicast traffic between two bound bridge ports in hardware");
+
+/* How long a pair no frame has hit stays installed. Its FDB entries are kept
+ * fresh meanwhile (ft_l2_refresh()), so this is what ages a pair out once its
+ * stations stop talking. */
+static unsigned int ft_l2_idle_ms = 30000;
+module_param_named(l2_idle_ms, ft_l2_idle_ms, uint, 0644);
+MODULE_PARM_DESC(l2_idle_ms, "Milliseconds a bridged pair no frame hits stays in hardware");
+/* A pass while anything is installed or pending: idle ageing, FDB refresh and
+ * the retries admission deferred for RTNL. */
+#define FT_L2_PASS	HZ
+/* A pass that could not have RTNL, or whose admission asked to be tried
+ * again: soon, but not at once, which would spin while RTNL is held. */
+#define FT_L2_RETRY	(HZ / 20)
+/* How often every installed pair is asked of the bridge again: nothing
+ * reports a tc filter, a netdev chain or a port flag changing under one. */
+#define FT_L2_RECHECK	(5 * HZ)
+/* Pairs, bounded well below what the Ethernet tables of the ports hold. */
+#define FT_L2_MAX	4096
+#define FT_L2_RING	256
+#define FT_L2_SEEN	256
+
+struct ft_l2_seen {
+	int bridge_ifindex;
+	int in_ifindex;
+	u8 dst[ETH_ALEN];
+	u8 src[ETH_ALEN];
+	/* The frame's own EtherType inside any tag: ETH_P_IP or ETH_P_IPV6. */
+	u16 ethertype;
+	/* The VLAN the bridge resolves the frame to, 0 when it does not
+	 * filter, and whether the frame arrived tagged with it. */
+	u16 vid;
+	bool tagged;
+};
+
+/* A pair's place in the index FDB events are matched through, one per
+ * station: an event names one address, and walking every pair for each one
+ * would cost a full walk per learned address under a MAC flood. */
+struct ft_l2_station {
+	struct hlist_node node;
+	struct ft_l2_pair *pair;
+};
+
+struct ft_l2_pair {
+	struct hlist_node node;
+	struct ft_l2_station dst_station, src_station;
+	struct list_head list;
+	struct ft_l2_seen key;
+	struct net_device *bridge, *in, *out;
+	struct cdx_ft_l2_rule rule;
+	struct cdx_ft_hw *hw;
+	u64 packets, bytes;
+	unsigned long hit;	/* jiffies the counters last moved */
+	bool dead;
+};
+
+static DEFINE_HASHTABLE(ft_l2_pairs, 10);
+static DEFINE_HASHTABLE(ft_l2_stations, 10);
+static LIST_HEAD(ft_l2_list);
+static unsigned int ft_l2_count;
+/* The ring, each pair's dead mark, and the membership of the pair list and
+ * the station index: events walk them from atomic context to mark pairs, so
+ * they are added to and removed from under this lock as well as the backend
+ * transaction, which is what everything else that walks them holds. */
+static DEFINE_SPINLOCK(ft_l2_lock);
+static struct ft_l2_seen ft_l2_ring[FT_L2_RING];
+static unsigned int ft_l2_head, ft_l2_tail;
+/* What each CPU recorded lately, so the hook takes the lock once a second per
+ * pair rather than once a frame: the software path crosses it on every frame
+ * a bridge forwards. Only a cache -- a slot overwritten mid-compare by a
+ * softirq on the same CPU costs a repeat record or a second's delay.
+ * FT_L2_SEEN slots per CPU, allocated at init: a module's static per-CPU data
+ * comes from a reserve of a few kilobytes that this alone would exceed. */
+struct ft_l2_recent {
+	struct ft_l2_seen seen;
+	unsigned long at;
+};
+static struct ft_l2_recent __percpu *ft_l2_recent;
+static bool ft_l2_hooked, ft_l2_stopping;
+static unsigned long ft_l2_checked;
+static void ft_l2_workfn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ft_l2_work, ft_l2_workfn);
+
+/* Counters for /proc. */
+static u64 ft_l2_installs, ft_l2_refused, ft_l2_retired, ft_l2_dropped, ft_l2_deferred;
+
+static u32 ft_l2_hash(const struct ft_l2_seen *s)
+{
+	return jhash(s->dst, 2 * ETH_ALEN, (u32)s->in_ifindex ^ ((u32)s->ethertype << 16));
+}
+
+static u32 ft_l2_station_hash(const u8 *addr, u16 vid)
+{
+	return jhash(addr, ETH_ALEN, vid);
+}
+
+/* Two observations share one hardware key when they arrive on one port with
+ * one pair and one EtherType. Neither the VLAN nor the tag is in the key --
+ * its EtherType is the frame's own, inside any tag -- so a pair tagged and
+ * untagged, or tagged in two VLANs, on one port is one key. */
+static bool ft_l2_same_key(const struct ft_l2_seen *a, const struct ft_l2_seen *b)
+{
+	return a->in_ifindex == b->in_ifindex && a->ethertype == b->ethertype &&
+	       ether_addr_equal(a->dst, b->dst) && ether_addr_equal(a->src, b->src);
+}
+
+static bool ft_l2_same(const struct ft_l2_seen *a, const struct ft_l2_seen *b)
+{
+	return ft_l2_same_key(a, b) && a->vid == b->vid && a->tagged == b->tagged;
+}
+
+/* ------------------------------------------------------------------ hook */
+
+static unsigned int ft_l2_hook(void *priv, struct sk_buff *skb,
+			       const struct nf_hook_state *state)
+{
+	struct net_device *port = state->in, *bridge;
+	struct ft_l2_recent *recent;
+	struct ft_l2_seen seen = {};
+	unsigned int l3_off = 0;
+	__be16 proto = skb->protocol;
+
+	if (!READ_ONCE(ft_l2_hooked) || !port || !netif_is_bridge_port(port))
+		return NF_ACCEPT;
+	/* Copied before anything below pulls: a pull may move the head. */
+	ether_addr_copy(seen.dst, eth_hdr(skb)->h_dest);
+	ether_addr_copy(seen.src, eth_hdr(skb)->h_source);
+	if (!is_unicast_ether_addr(seen.dst) || !is_valid_ether_addr(seen.src))
+		return NF_ACCEPT;
+	bridge = netdev_master_upper_dev_get_rcu(port);
+	/* The router's own traffic, routed rather than bridged: the bulk of
+	 * what crosses a LAN bridge, and never a pair. A promiscuous bridge
+	 * hands every frame it forwards up as well -- to a capture, or to an
+	 * upper device with an address of its own -- and an entry would take
+	 * that copy away. */
+	if (!bridge || ether_addr_equal(seen.dst, bridge->dev_addr) ||
+	    (READ_ONCE(bridge->flags) & IFF_PROMISC))
+		return NF_ACCEPT;
+	if (skb_vlan_tag_present(skb)) {
+		/* An 802.1ad tag is no tag to an 802.1Q bridge, which is the
+		 * only kind admission takes. */
+		if (skb->vlan_proto != htons(ETH_P_8021Q))
+			return NF_ACCEPT;
+		seen.tagged = true;
+		seen.vid = skb_vlan_tag_get_id(skb);
+	} else if (proto == htons(ETH_P_8021Q)) {
+		const struct vlan_hdr *vhdr;
+
+		if (!pskb_may_pull(skb, VLAN_HLEN))
+			return NF_ACCEPT;
+		vhdr = (const struct vlan_hdr *)skb->data;
+		seen.tagged = true;
+		seen.vid = ntohs(vhdr->h_vlan_TCI) & VLAN_VID_MASK;
+		proto = vhdr->h_vlan_encapsulated_proto;
+		l3_off = VLAN_HLEN;
+	}
+	/* A tagged frame on a bridge that does not filter is forwarded with
+	 * its tag as payload, and a priority tag (VID 0) is the port's PVID to
+	 * one that does, with the tag's priority kept; the learner leaves both
+	 * to software. */
+	if (seen.tagged && (!br_vlan_enabled(bridge) || !seen.vid))
+		return NF_ACCEPT;
+	if (!seen.tagged && br_vlan_enabled(bridge) && br_vlan_get_pvid_rcu(port, &seen.vid))
+		return NF_ACCEPT;
+	/* The parser ends the parse of a frame whose TTL or hop limit is 0 or
+	 * 1 before any table is consulted, so no entry would ever match one. */
+	if (proto == htons(ETH_P_IP)) {
+		const struct iphdr *iph;
+
+		if (!pskb_may_pull(skb, l3_off + sizeof(*iph)))
+			return NF_ACCEPT;
+		iph = (const struct iphdr *)(skb->data + l3_off);
+		if (iph->ttl <= 1)
+			return NF_ACCEPT;
+		seen.ethertype = ETH_P_IP;
+	} else if (proto == htons(ETH_P_IPV6)) {
+		const struct ipv6hdr *ip6h;
+
+		if (!pskb_may_pull(skb, l3_off + sizeof(*ip6h)))
+			return NF_ACCEPT;
+		ip6h = (const struct ipv6hdr *)(skb->data + l3_off);
+		if (ip6h->hop_limit <= 1)
+			return NF_ACCEPT;
+		seen.ethertype = ETH_P_IPV6;
+	} else {
+		return NF_ACCEPT;
+	}
+	seen.bridge_ifindex = bridge->ifindex;
+	seen.in_ifindex = port->ifindex;
+
+	/* At most once a second per pair and CPU: a stream at line rate
+	 * would otherwise fill the ring with restatements of one fact. */
+	recent = get_cpu_ptr(ft_l2_recent) + ft_l2_hash(&seen) % FT_L2_SEEN;
+	if (ft_l2_same(&recent->seen, &seen) &&
+	    time_before(jiffies, recent->at + FT_L2_PASS)) {
+		put_cpu_ptr(ft_l2_recent);
+		return NF_ACCEPT;
+	}
+	recent->seen = seen;
+	recent->at = jiffies;
+	put_cpu_ptr(ft_l2_recent);
+	spin_lock_bh(&ft_l2_lock);
+	if (ft_l2_head - ft_l2_tail < FT_L2_RING) {
+		ft_l2_ring[ft_l2_head++ % FT_L2_RING] = seen;
+	} else {
+		ft_l2_dropped++;
+	}
+	spin_unlock_bh(&ft_l2_lock);
+	if (!READ_ONCE(ft_l2_stopping))
+		mod_delayed_work(system_wq, &ft_l2_work, 0);
+	return NF_ACCEPT;	/* always: this observes, it never diverts */
+}
+
+static struct nf_hook_ops ft_l2_hook_ops = {
+	.hook = ft_l2_hook,
+	.pf = NFPROTO_BRIDGE,
+	.hooknum = NF_BR_PRE_ROUTING,
+	/* Last, as the multicast learner's: what a later bridge rule would
+	 * drop is never learned. */
+	.priority = NF_BR_PRI_LAST,
+};
+
+bool ft_l2_hook_is(const struct nf_hook_ops *ops)
+{
+	return ops == &ft_l2_hook_ops;
+}
+
+/* --------------------------------------------------------------- admission */
+
+static bool ft_l2_bound(const struct net_device *dev)
+{
+	struct cdx_ft_binding *binding;
+
+	list_for_each_entry(binding, &ft_bindings, list)
+		if (binding->dev == dev && !binding->parked)
+			return true;
+	return false;
+}
+
+/* Whether netfilter runs a chain on what `dev` sends, at its netdev egress
+ * hook. The ingress question is ft_dev_nf_ingress_hooked()'s. */
+static bool ft_l2_nf_egress_hooked(const struct net_device *dev)
+{
+#if IS_ENABLED(CONFIG_NETFILTER_EGRESS)
+	const struct nf_hook_entries *e;
+	bool hooked;
+
+	rcu_read_lock();
+	e = rcu_dereference(dev->nf_hooks_egress);
+	hooked = e && e->num_hook_entries;
+	rcu_read_unlock();
+	return hooked;
+#else
+	return false;
+#endif
+}
+
+/* How the bridge carries `vid` through `port`: whether the port is a member
+ * and whether it sends the VLAN untagged. A bridge that does not filter
+ * carries everything untagged. Under RTNL. */
+static bool ft_l2_member(struct net_device *bridge, struct net_device *port, u16 vid,
+			 bool *untagged)
+{
+	struct bridge_vlan_info info;
+
+	if (!br_vlan_enabled(bridge)) {
+		*untagged = true;
+		return true;
+	}
+	if (br_vlan_get_info(port, vid, &info))
+		return false;
+	*untagged = !!(info.flags & BRIDGE_VLAN_INFO_UNTAGGED);
+	return true;
+}
+
+/* Everything the bridge would decide about one frame of the pair, asked of
+ * the bridge, under RTNL: both ports this bridge's and bound, both
+ * forwarding in the VLAN, the destination learned on another port and the
+ * source on the ingress, how each port tags, and an egress that carries what
+ * the ingress can deliver. Fills the rule; false leaves the pair to software. */
+static bool ft_l2_resolve(const struct ft_l2_seen *s, struct ft_l2_pair *p)
+{
+	struct net_device *bridge, *in, *out;
+	bool in_untagged, out_untagged;
+	u16 proto, pvid;
+
+	bridge = __dev_get_by_index(&init_net, s->bridge_ifindex);
+	in = __dev_get_by_index(&init_net, s->in_ifindex);
+	if (!bridge || !in || !netif_is_bridge_master(bridge) ||
+	    netdev_master_upper_dev_get(in) != bridge || br_mst_enabled(bridge) ||
+	    (bridge->flags & IFF_PROMISC))
+		return false;
+	/* The VLAN the observation names has to be the one the bridge puts the
+	 * frame in now, not when the frame was seen: a PVID changed since, or
+	 * filtering switched off or on, would otherwise install the pair in a
+	 * VLAN the bridge no longer forwards it in -- and the FDB entries in
+	 * the old one can outlive the change. */
+	if (br_vlan_enabled(bridge)) {
+		if (br_vlan_get_proto(bridge, &proto) || proto != ETH_P_8021Q || !s->vid)
+			return false;
+		if (!s->tagged && (br_vlan_get_pvid(in, &pvid) || pvid != s->vid))
+			return false;
+	} else if (s->tagged || s->vid) {
+		return false;
+	}
+	/* Learned entries only: a frame for the bridge's or a port's own
+	 * address is the router's, and is never bridged. */
+	out = br_fdb_forward_port(bridge, s->dst, s->vid);
+	if (!out || out == in || br_fdb_forward_port(bridge, s->src, s->vid) != in)
+		return false;
+	if (!ft_l2_bound(in) || !ft_l2_bound(out) ||
+	    !cdx_ft_port_supported(in) || !cdx_ft_port_supported(out))
+		return false;
+	/* Port to port: the bridge's own VLAN entry plays no part. */
+	if (!br_port_bridging(in, s->vid) || !br_port_bridging(out, s->vid))
+		return false;
+	/* Two isolated ports never forward to each other; a locked or MAB
+	 * port admits a source only as 802.1X decides, frame by frame; a VLAN
+	 * tunnel port hands tunnel metadata to the egress. */
+	if ((br_port_flag_is_set(in, BR_ISOLATED) && br_port_flag_is_set(out, BR_ISOLATED)) ||
+	    br_port_flag_is_set(in, BR_PORT_LOCKED) || br_port_flag_is_set(in, BR_PORT_MAB) ||
+	    br_port_flag_is_set(in, BR_VLAN_TUNNEL) || br_port_flag_is_set(out, BR_VLAN_TUNNEL))
+		return false;
+	/* What tc or a netdev chain runs on either port runs on every frame the
+	 * bridge forwards in software and on none an entry forwards. */
+	if (ft_dev_stack_tc_soft(in, true) || ft_dev_stack_tc_soft(out, false) ||
+	    ft_dev_nf_ingress_hooked(in) || ft_l2_nf_egress_hooked(out))
+		return false;
+	if (!ft_l2_member(bridge, in, s->vid, &in_untagged) ||
+	    !ft_l2_member(bridge, out, s->vid, &out_untagged))
+		return false;
+	/* A frame the bridge would send bigger than the egress carries is one
+	 * it drops; the hardware would fragment it instead. */
+	if (out->mtu < in->mtu || out->mtu < ETH_DATA_LEN)
+		return false;
+	memset(&p->rule, 0, sizeof(p->rule));
+	p->rule.in = in;
+	p->rule.out = out;
+	ether_addr_copy(p->rule.dst_mac, s->dst);
+	ether_addr_copy(p->rule.src_mac, s->src);
+	p->rule.ethertype = s->ethertype;
+	p->rule.mtu = out->mtu;
+	p->rule.qos = ft_qos_class(0);
+	if (s->tagged) {
+		p->rule.in_vlans = 1;
+		p->rule.in_vlan[0].proto = htons(ETH_P_8021Q);
+		p->rule.in_vlan[0].id = s->vid;
+	}
+	/* A frame tagged on the wire and leaving tagged in the same VLAN is
+	 * still stripped and tagged again: the strip is what checks the VID,
+	 * which the key does not carry, and without it the pair's frames in
+	 * any other VLAN of the port would leave in theirs. */
+	if (br_vlan_enabled(bridge) && !out_untagged) {
+		p->rule.out_vlans = 1;
+		p->rule.out_vlan[0].proto = htons(ETH_P_8021Q);
+		p->rule.out_vlan[0].id = s->vid;
+	}
+	p->bridge = bridge;
+	p->in = in;
+	p->out = out;
+	return true;
+}
+
+/* Out of the hardware and every list, its devices let go. Under the
+ * transaction. */
+static void ft_l2_release(struct ft_l2_pair *p)
+{
+	if (cdx_ft_unlink(&p->hw))
+		ft_invalidate();
+	spin_lock_bh(&ft_l2_lock);
+	hash_del(&p->node);
+	hash_del(&p->dst_station.node);
+	hash_del(&p->src_station.node);
+	list_del(&p->list);
+	spin_unlock_bh(&ft_l2_lock);
+	dev_put(p->bridge);
+	dev_put(p->in);
+	dev_put(p->out);
+	kfree(p);
+	ft_l2_count--;
+}
+
+static void ft_l2_unlink(struct ft_l2_pair *p)
+{
+	ft_l2_release(p);
+	ft_l2_retired++;
+}
+
+/* One observation, under the transaction and RTNL. -EAGAIN: try again later.
+ *
+ * The pair is published -- where an FDB event or a device's can mark it --
+ * before the bridge is asked the last time and before anything is built, so
+ * that nothing the bridge does between the answer and the entry goes unseen:
+ * a change before publication shows in the second answer, one after it marks
+ * the pair, which the next pass retires. */
+static int ft_l2_admit(const struct ft_l2_seen *s)
+{
+	struct ft_l2_pair *p;
+	s64 changes;
+	int rc;
+
+	hash_for_each_possible(ft_l2_pairs, p, node, ft_l2_hash(s)) {
+		if (!ft_l2_same_key(&p->key, s))
+			continue;
+		/* The pair itself, or the same pair in another wire form or
+		 * VLAN of the port, which would need the one key twice:
+		 * software. */
+		if (!ft_l2_same(&p->key, s))
+			ft_l2_refused++;
+		return 0;
+	}
+	if (ft_l2_count >= FT_L2_MAX)
+		return -ENOSPC;
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+	p->key = *s;
+	if (!ft_l2_resolve(s, p)) {
+		kfree(p);
+		ft_l2_refused++;
+		return 0;
+	}
+	dev_hold(p->bridge);
+	dev_hold(p->in);
+	dev_hold(p->out);
+	p->hit = jiffies;
+	p->dst_station.pair = p->src_station.pair = p;
+	spin_lock_bh(&ft_l2_lock);
+	hash_add(ft_l2_pairs, &p->node, ft_l2_hash(s));
+	hash_add(ft_l2_stations, &p->dst_station.node, ft_l2_station_hash(s->dst, s->vid));
+	hash_add(ft_l2_stations, &p->src_station.node, ft_l2_station_hash(s->src, s->vid));
+	list_add_tail(&p->list, &ft_l2_list);
+	spin_unlock_bh(&ft_l2_lock);
+	ft_l2_count++;
+	if (br_fdb_forward_port(p->bridge, s->dst, s->vid) != p->out ||
+	    br_fdb_forward_port(p->bridge, s->src, s->vid) != p->in) {
+		ft_l2_release(p);
+		ft_l2_refused++;
+		return 0;
+	}
+	/* Before anything is built: an egress change counted after this is
+	 * one the entry may predate (ft_egress_changes). */
+	changes = atomic64_read_acquire(&ft_egress_changes);
+	rc = cdx_ft_l2_add(&p->rule, &p->hw);
+	if (!rc && atomic64_read(&ft_egress_changes) != changes)
+		rc = -EAGAIN;
+	if (rc) {
+		ft_l2_release(p);
+		ft_l2_refused++;
+		return rc == -EAGAIN ? -EAGAIN : 0;
+	}
+	ft_l2_installs++;
+	return 0;
+}
+
+/* ---------------------------------------------------------------- worker */
+
+/* Whether the bridge would still carry an installed pair as it is installed.
+ * Under the transaction and RTNL. */
+static bool ft_l2_current(const struct ft_l2_pair *p)
+{
+	struct ft_l2_pair now;
+
+	return ft_l2_resolve(&p->key, &now) && now.in == p->in && now.out == p->out &&
+	       !memcmp(&now.rule, &p->rule, sizeof(now.rule));
+}
+
+/* Keep the source station's FDB entry from ageing out while the hardware
+ * carries what it sends: those frames never reach the bridge to refresh it,
+ * and an entry that ages out retires the pair (ft_l2_fdb_event()) only for the
+ * next frame to learn it again. Only the source's, as the bridge itself
+ * refreshes only from what a station sends: the destination's is the reverse
+ * pair's to keep, and a station that went silent is the bridge's to age and
+ * flood for. */
+static void ft_l2_refresh(struct ft_l2_pair *p)
+{
+	br_fdb_refresh(p->bridge, p->key.src, p->key.vid, p->in);
+}
+
+static void ft_l2_workfn(struct work_struct *work)
+{
+	struct ft_l2_seen batch[32];
+	struct ft_l2_pair *p, *next;
+	unsigned int n = 0, i, retry = 0;
+	bool filtered, rtnl = false, again, recheck;
+
+	spin_lock_bh(&ft_l2_lock);
+	while (ft_l2_tail != ft_l2_head && n < ARRAY_SIZE(batch))
+		batch[n++] = ft_l2_ring[ft_l2_tail++ % FT_L2_RING];
+	again = ft_l2_tail != ft_l2_head;
+	spin_unlock_bh(&ft_l2_lock);
+
+	cdx_ft_begin();
+	filtered = ft_bridge_hooked(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
+				    BIT(NF_BR_POST_ROUTING));
+	/* Dead, idle, or under a bridge filter: out of hardware. */
+	list_for_each_entry_safe(p, next, &ft_l2_list, list) {
+		struct cdx_ft_counters c = {};
+		bool dead;
+
+		spin_lock_bh(&ft_l2_lock);
+		dead = p->dead;
+		spin_unlock_bh(&ft_l2_lock);
+		if (!dead && !filtered && !READ_ONCE(ft_l2_stopping) &&
+		    !atomic_read(&ft_invalid)) {
+			cdx_ft_stats(p->hw, &c);
+			if (c.packets != p->packets) {
+				p->packets = c.packets;
+				p->bytes = c.bytes;
+				p->hit = jiffies;
+				ft_l2_refresh(p);
+			}
+			if (time_before(jiffies, p->hit + msecs_to_jiffies(READ_ONCE(ft_l2_idle_ms))))
+				continue;
+		}
+		ft_l2_unlink(p);
+	}
+	recheck = !list_empty(&ft_l2_list) &&
+		  time_after_eq(jiffies, ft_l2_checked + FT_L2_RECHECK);
+	if ((n || recheck) && !filtered && !READ_ONCE(ft_l2_stopping) &&
+	    !atomic_read(&ft_invalid) && READ_ONCE(ft_l2_enabled)) {
+		rtnl = !cdx_ft_admission_begin();
+		if (rtnl && recheck) {
+			list_for_each_entry_safe(p, next, &ft_l2_list, list)
+				if (!ft_l2_current(p))
+					ft_l2_unlink(p);
+			ft_l2_checked = jiffies;
+		}
+		for (i = 0; i < n; i++) {
+			if (rtnl && ft_l2_admit(&batch[i]) != -EAGAIN)
+				continue;
+			/* Back in the ring for the next pass: admission takes
+			 * RTNL without waiting, and nothing else re-offers a
+			 * pair the way a packet re-offers a flow. */
+			spin_lock_bh(&ft_l2_lock);
+			if (ft_l2_head - ft_l2_tail < FT_L2_RING)
+				ft_l2_ring[ft_l2_head++ % FT_L2_RING] = batch[i];
+			spin_unlock_bh(&ft_l2_lock);
+			ft_l2_deferred++;
+			retry++;
+		}
+		if (rtnl)
+			cdx_ft_admission_end();
+	}
+	ft_settle();
+	cdx_ft_end();
+	if (READ_ONCE(ft_l2_stopping))
+		return;
+	if (again || retry)
+		mod_delayed_work(system_wq, &ft_l2_work, rtnl && !retry ? 0 : FT_L2_RETRY);
+	else if (!list_empty(&ft_l2_list))
+		mod_delayed_work(system_wq, &ft_l2_work, FT_L2_PASS);
+}
+
+/* ---------------------------------------------------------------- events */
+
+static void ft_l2_mark(bool (*match)(const struct ft_l2_pair *p, const void *arg),
+		       const void *arg)
+{
+	struct ft_l2_pair *p;
+	bool any = false;
+
+	spin_lock_bh(&ft_l2_lock);
+	list_for_each_entry(p, &ft_l2_list, list) {
+		if (!p->dead && match(p, arg)) {
+			p->dead = true;
+			any = true;
+		}
+	}
+	spin_unlock_bh(&ft_l2_lock);
+	if (any && !READ_ONCE(ft_l2_stopping))
+		mod_delayed_work(system_wq, &ft_l2_work, 0);
+}
+
+/* An FDB entry for either station of a pair moved, aged out or was deleted:
+ * the bridge would now forward the pair elsewhere, or flood it. A refresh
+ * raises no event, so the learner's own keep-alive costs nothing here. From
+ * the switchdev chain, atomic. */
+void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
+		     const struct net_device *port)
+{
+	struct ft_l2_station *station;
+	struct ft_l2_pair *p;
+	bool any = false, dst;
+
+	spin_lock_bh(&ft_l2_lock);
+	hash_for_each_possible(ft_l2_stations, station, node, ft_l2_station_hash(addr, vid)) {
+		p = station->pair;
+		dst = station == &p->dst_station;
+		if (p->dead || p->key.vid != vid ||
+		    !ether_addr_equal(dst ? p->key.dst : p->key.src, addr))
+			continue;
+		/* An add naming the port the pair already uses for the
+		 * station restates it rather than moving it. */
+		if (event == SWITCHDEV_FDB_ADD_TO_DEVICE && port == (dst ? p->out : p->in))
+			continue;
+		p->dead = true;
+		any = true;
+	}
+	spin_unlock_bh(&ft_l2_lock);
+	if (any && !READ_ONCE(ft_l2_stopping))
+		mod_delayed_work(system_wq, &ft_l2_work, 0);
+}
+
+static bool ft_l2_names_dev(const struct ft_l2_pair *p, const void *arg)
+{
+	return p->bridge == arg || p->in == arg || p->out == arg;
+}
+
+/* A port's or the bridge's state, VLAN membership, filtering, MTU, link or
+ * membership changed: every pair crossing it is asked of the bridge again. */
+void ft_l2_dev_changed(const struct net_device *dev)
+{
+	ft_l2_mark(ft_l2_names_dev, dev);
+}
+
+/* CDX is about to hand a port's queues, or the DSCP map, to something else
+ * (ft_egress_drain()): every pair through the port goes now, rather than
+ * when the worker gets to the mark ft_egress_changed() left -- an entry still
+ * enqueuing by the old plan would transmit on the new owner's queues. A pair
+ * admitted from here on reads the new plan; one built across the change
+ * found ft_egress_changes moved and was taken out again. Takes the
+ * transaction. */
+int ft_l2_egress_drain(const struct net_device *dev)
+{
+	struct ft_l2_pair *p, *next;
+	int rc;
+
+	cdx_ft_begin();
+	list_for_each_entry_safe(p, next, &ft_l2_list, list)
+		if (p->in == dev || p->out == dev)
+			ft_l2_unlink(p);
+	rc = ft_settle();
+	cdx_ft_end();
+	return rc;
+}
+
+/* Global invalidation, from its worker, under the transaction: everything
+ * goes, and the next frames learn it again once admission is rearmed. */
+void ft_l2_retire_all(void)
+{
+	struct ft_l2_pair *p, *next;
+
+	cdx_ft_assert_held();
+	list_for_each_entry_safe(p, next, &ft_l2_list, list)
+		ft_l2_unlink(p);
+}
+
+/* -------------------------------------------------------------------- proc */
+
+void ft_l2_show(struct seq_file *seq)
+{
+	struct ft_l2_pair *p;
+
+	seq_printf(seq, "l2_enabled %u\nl2_entries %u\nl2_installs %llu\nl2_refused %llu\n"
+		   "l2_retired %llu\nl2_dropped %llu\nl2_deferred %llu\n",
+		   READ_ONCE(ft_l2_enabled) && READ_ONCE(ft_l2_hooked), ft_l2_count,
+		   ft_l2_installs, ft_l2_refused, ft_l2_retired, ft_l2_dropped, ft_l2_deferred);
+	list_for_each_entry(p, &ft_l2_list, list)
+		seq_printf(seq, "l2flow in=%s out=%s br=%s dst=%pM src=%pM type=%#06x vid=%u tagged=%u in_vlan=%s out_vlan=%u packets=%llu bytes=%llu\n",
+			   netdev_name(p->in), netdev_name(p->out), netdev_name(p->bridge),
+			   p->key.dst, p->key.src, p->key.ethertype, p->key.vid, p->key.tagged,
+			   p->rule.in_vlans ? "strip" : "-",
+			   p->rule.out_vlans ? p->rule.out_vlan[0].id : 0,
+			   p->packets, p->bytes);
+}
+
+/* --------------------------------------------------------- start and stop */
+
+int ft_l2_init(void)
+{
+	int rc;
+
+	if (!ft_l2_enabled)
+		return 0;
+	ft_l2_recent = __alloc_percpu(FT_L2_SEEN * sizeof(*ft_l2_recent),
+				      __alignof__(*ft_l2_recent));
+	rc = ft_l2_recent ? nf_register_net_hook(&init_net, &ft_l2_hook_ops) : -ENOMEM;
+	if (rc) {
+		pr_warn("cdx flowtable: bridged unicast learner could not register its hook (%d); bridged pairs stay in software\n",
+			rc);
+		free_percpu(ft_l2_recent);
+		ft_l2_recent = NULL;
+		return 0;
+	}
+	WRITE_ONCE(ft_l2_hooked, true);
+	return 0;
+}
+
+/* Called with no transaction held: unregisters the hook, waits out the
+ * frames inside it and the worker, then retires everything installed. */
+void ft_l2_exit(void)
+{
+	WRITE_ONCE(ft_l2_stopping, true);
+	if (READ_ONCE(ft_l2_hooked)) {
+		WRITE_ONCE(ft_l2_hooked, false);
+		nf_unregister_net_hook(&init_net, &ft_l2_hook_ops);
+		synchronize_net();
+	}
+	free_percpu(ft_l2_recent);
+	ft_l2_recent = NULL;
+	cancel_delayed_work_sync(&ft_l2_work);
+	cdx_ft_begin();
+	ft_l2_retire_all();
+	ft_settle();
+	cdx_ft_end();
+}

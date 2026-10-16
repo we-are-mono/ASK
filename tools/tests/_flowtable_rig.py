@@ -78,7 +78,8 @@ async def upper_roundtrip(r, dev):
 
 
 STATUS_ROWS = {"flow": "flows", "session": "sessions", "vlan": "vlans",
-               "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute"}
+               "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute",
+               "l2flow": "l2flows"}
 
 
 def status_text(text):

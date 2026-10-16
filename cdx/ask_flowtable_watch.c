@@ -258,6 +258,8 @@ void ft_invalidate_work(struct work_struct *work)
 		cond_resched();
 		cdx_ft_begin();
 	}
+	/* And every bridged pair, which no flow retirement reaches. */
+	ft_l2_retire_all();
 	/* CDX retains failed deletions and owns the hardware latch. Retry until
 	 * a barrier or the stopped datapath makes retirement safe. */
 	if (cdx_ft_recover()) {
@@ -543,6 +545,9 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		 * itself is removed -- a link going down leaves the VIF in
 		 * place and the entry keyed on a port carrying nothing. */
 		ft_mr_device_gone(dev);
+		/* And a bridged pair through it, which the bridge stops
+		 * forwarding. */
+		ft_l2_dev_changed(dev);
 		break;
 	case NETDEV_CHANGEMTU:
 		/* IPv4 flushes route caches under this event's RTNL. Admission
@@ -558,6 +563,8 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		 * installed ones included. */
 		ft_mc_kick_all();
 		ft_mr_kick();
+		/* A bridged pair is admitted against both ports' MTU. */
+		ft_l2_dev_changed(dev);
 		break;
 	case NETDEV_CHANGEADDR:
 		/* NEIGH software output uses the current MAC. Reject a queued
@@ -581,6 +588,10 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		 * hardware nothing. A bridged copy keeps its sender's address
 		 * and has nothing to follow. */
 		ft_mr_kick();
+		/* Nor has a bridged pair, but the bridge's address is what
+		 * tells the router's frames from a pair's, so it is asked
+		 * again. */
+		ft_l2_dev_changed(dev);
 		break;
 	case NETDEV_CHANGENAME:
 		/* Names carry no forwarding semantics; backend lookup uses the
@@ -598,6 +609,9 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		 * listener exactly as a bridged one does. */
 		ft_mc_device_gone(dev, true);
 		ft_mr_device_gone(dev);
+		/* A bridged pair holds its devices until the worker lets it
+		 * go, which this asks for. */
+		ft_l2_dev_changed(dev);
 		/* Same shape for a VAP: the watch stops naming the device here
 		 * so nothing can follow the pointer, and the worker releases
 		 * what is left using only what it copied. */
@@ -630,6 +644,8 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 
 			ft_mc_port_moved(dev, upper->linking ? NULL :
 					      upper->upper_dev);
+			/* A port leaving its bridge takes its pairs along. */
+			ft_l2_dev_changed(dev);
 		}
 		/* A device paths only cross gaining or losing an upper changes
 		 * those paths and nothing any flow names; retire them the same
@@ -887,6 +903,8 @@ int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		ft_handle_invalidate(entry->handle, &ft_fdb_invalidations);
 	}
 	spin_unlock_bh(&ft_watch_lock);
+	/* A bridged pair is chosen by both its stations' entries. */
+	ft_l2_fdb_event(event, info->addr, info->vid, port);
 	return NOTIFY_DONE;
 }
 
@@ -989,6 +1007,8 @@ int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 			 * coarse boolean, is authority for both. */
 			ft_mr_kick();
 			ft_mc_bridge_changed(dev);
+			/* A bridged pair's ports, the same way. */
+			ft_l2_dev_changed(dev);
 			/* A port STP takes out of FORWARDING carries nothing in
 			 * the bridge from here on, while its hardware entries
 			 * would forward on in both directions under the shared
@@ -1025,6 +1045,7 @@ int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 	 * ingress, and is asked of the bridge again the same way. */
 	ft_mr_kick();
 	ft_mc_bridge_changed(dev);
+	ft_l2_dev_changed(dev);
 	spin_lock_bh(&ft_watch_lock);
 	/* Latch before releasing the watch lock, exactly as the netdev
 	 * upper-device event does: a concurrent last unbind and fresh bind must
@@ -1060,11 +1081,14 @@ static void ft_egress_changed(struct net_device *dev)
 	ft_device_retire(dev, &ft_qos_invalidations);
 	ft_ipsec_egress_changed(dev);
 	ft_mc_egress_changed(dev);
+	/* A bridged pair names its egress queue as a flow does. */
+	ft_l2_dev_changed(dev);
 }
 
 /* Wait until everything ft_egress_changed(dev) started has finished: every
  * flow it retired is out of the hardware, every SA and multicast group on the
- * port it asked to rebuild has been rebuilt, and a barrier has proven what
+ * port it asked to rebuild has been rebuilt, every bridged pair through it is
+ * out of the hardware, and a barrier has proven what
  * they left out of the hardware's reach (cdx_ft_proven()). CDX calls this
  * before handing the microcode's DSCP map to another port: the map is one
  * table with no port in it, so an entry still reading it after the hand-over
@@ -1140,6 +1164,11 @@ static int ft_egress_drain(struct net_device *dev)
 	 * whatever the first says: each rebuilds what it can. */
 	rc = ft_mc_egress_drain(dev);
 	rc = ft_mr_egress_drain(dev) ?: rc;
+	if (rc)
+		return rc;
+	/* And every bridged pair through it, which no flow retirement and no
+	 * multicast rebuild reaches. */
+	rc = ft_l2_egress_drain(dev);
 	if (rc)
 		return rc;
 	/* Rebuilt or retired is not yet out of the hardware's reach: a walk

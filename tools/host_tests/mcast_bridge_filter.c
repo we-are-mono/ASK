@@ -71,7 +71,9 @@ static struct {
     struct { struct nf_hook_entries *hooks_bridge[NF_BR_NUMHOOKS - 1]; } nf;
 } init_net;
 
-static struct nf_hook_ops ft_mc_hook_ops, nft_chain, ebtables, br_netfilter;
+static struct nf_hook_ops ft_mc_hook_ops, ft_l2_hook_ops, nft_chain, ebtables, br_netfilter;
+/* The bridged unicast learner's observer, as ask_flowtable_l2.c answers. */
+static bool ft_l2_hook_is(const struct nf_hook_ops *ops) { return ops == &ft_l2_hook_ops; }
 /* At a device's own netdev hooks: an nftables netdev chain, or an inet one at
  * ingress; a netfilter BPF program; a flowtable. */
 static struct nf_hook_ops netdev_chain = { .hook_ops_type = NF_HOOK_OP_NF_TABLES };
@@ -152,6 +154,12 @@ int main(void)
     assert(!ft_mc_bridge_filtered());
     registered(NF_BR_PRE_ROUTING, 1, &ft_mc_hook_ops);
     assert(!ft_mc_bridge_filtered());
+    /* Nor does the unicast learner's, which observes too. */
+    registered(NF_BR_PRE_ROUTING, 2, &ft_l2_hook_ops, &ft_mc_hook_ops);
+    assert(!ft_mc_bridge_filtered());
+    registered(NF_BR_PRE_ROUTING, 3, &ft_l2_hook_ops, &ebtables, &ft_mc_hook_ops);
+    assert(ft_mc_bridge_filtered());
+    registered(NF_BR_PRE_ROUTING, 1, &ft_mc_hook_ops);
 
     /* Another hook beside it at PRE_ROUTING, before or after it. */
     registered(NF_BR_PRE_ROUTING, 2, &ebtables, &ft_mc_hook_ops);

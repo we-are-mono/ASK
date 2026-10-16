@@ -108,7 +108,10 @@ Scoped and landed 2026-09-16, and with it the configuration the product
 actually runs: `br-lan.N` on a vlan-aware bridge over an untagged port. The
 mechanism, the transmit type it had to change, and the hardware proof are in
 the [bridge guide](bridge.md). `auto_bridge` and `ffbridge.c` are
-replaced rather than shared with: this mode loads neither.
+replaced rather than shared with: this mode loads neither. What `auto_bridge`
+did that no flowtable does -- switching a station pair between two bridge
+ports in hardware, with no route involved -- came back in 1.1.1 as the
+bridged unicast learner ([Switching between two ports](bridge.md#switching-between-two-ports)).
 
 Two findings are worth carrying. The first is that a bridge hop forced
 `FLOW_OFFLOAD_XMIT_DIRECT` in `nft_dev_path_info()` before any table's request

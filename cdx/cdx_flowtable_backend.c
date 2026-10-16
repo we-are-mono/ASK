@@ -731,6 +731,9 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
 		cdx_ft_retry_pending();
 	/* The adapter validates tuple/NAT eligibility, including same-port
 	 * hairpin routing. The provider rechecks physical device state. */
+	/* A tag count past the rule's own arrays would be read past them. */
+	if (rule->in_vlans > CDX_FT_VLAN_MAX || rule->out_vlans > CDX_FT_VLAN_MAX)
+		return ask_refuse(-EOPNOTSUPP);
 	if (!ft_claimed || ft_failed || ft_observe || cdx_ft_pending() ||
 	    !cdx_ft_port_supported(rule->in) || !cdx_ft_egress_supported(rule->out) ||
 	    !is_valid_ether_addr(rule->src_mac)) {
@@ -752,6 +755,38 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_add, ASK_CDX_FLOWTABLE);
+
+int cdx_ft_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **result)
+{
+	int rc;
+
+	cdx_ft_assert_held();
+	ASSERT_RTNL();
+	*result = NULL;
+	if (!ft_failed && cdx_ft_pending())
+		cdx_ft_retry_pending();
+	/* The gates a flow direction passes, both ends being ports: a bridged
+	 * pair is never a VAP's to send. */
+	if (rule->in_vlans > CDX_FT_VLAN_MAX || rule->out_vlans > CDX_FT_VLAN_MAX)
+		return ask_refuse(-EOPNOTSUPP);
+	if (!ft_claimed || ft_failed || ft_observe || cdx_ft_pending() ||
+	    !cdx_ft_port_supported(rule->in) || !cdx_ft_port_supported(rule->out) ||
+	    rule->in == rule->out || !is_valid_ether_addr(rule->src_mac) ||
+	    !is_valid_ether_addr(rule->dst_mac)) {
+		ask_dbg(ASK_DBG_DEVICE,
+			"l2 add claimed=%d failed=%d observe=%d pending=%u in=%s(%d) out=%s(%d) %pM->%pM\n",
+			ft_claimed, ft_failed, ft_observe, cdx_ft_pending(),
+			rule->in ? netdev_name(rule->in) : "(null)", cdx_ft_port_supported(rule->in),
+			rule->out ? netdev_name(rule->out) : "(null)", cdx_ft_port_supported(rule->out),
+			rule->src_mac, rule->dst_mac);
+		return ask_refuse(-EOPNOTSUPP);
+	}
+	rc = cdx_ft_hw_l2_add(rule, result);
+	if (!rc)
+		ft_live++;
+	return rc;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_l2_add, ASK_CDX_FLOWTABLE);
 
 /* Ownership, not encoding: a statistics slot is claimed and returned by the
  * adapter's own policy, so these are transaction-scoped like every other

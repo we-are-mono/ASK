@@ -3,6 +3,7 @@
  * owns each direction's objects; no hash, notification or ageing timer here
  * does. */
 #include <linux/etherdevice.h>
+#include <linux/jhash.h>
 #include <linux/module.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
@@ -556,6 +557,76 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 			cdx_ft_fatal();
 	}
 	return rc;
+}
+
+/* A bridged pair's entry (cdx_ft_l2_rule). It is an owner like a flow
+ * direction's, so deletion, counters and retirement are shared: only the key
+ * and the actions differ, which insert_l2_entry_in_classif_table() decides. */
+int cdx_ft_hw_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **result)
+{
+	struct dpa_iface_info *in_iface, *out_iface;
+	struct cdx_l2_encap encap = {};
+	POnifDesc in, out;
+	struct cdx_ft_hw *hw;
+	PCtEntry ct;
+	int rc;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	*result = NULL;
+	if (rule->ethertype != ETH_P_IP && rule->ethertype != ETH_P_IPV6)
+		return ask_refuse(-EOPNOTSUPP);
+	in_iface = dpa_get_ifinfo_by_netdev(rule->in);
+	out_iface = dpa_get_ifinfo_by_netdev(rule->out);
+	if (!in_iface || !out_iface || in_iface->itf_id >= L2_MAX_ONIF ||
+	    out_iface->itf_id >= L2_MAX_ONIF)
+		return ask_refuse(-EOPNOTSUPP);
+	in = get_onif_by_index(in_iface->itf_id);
+	out = get_onif_by_index(out_iface->itf_id);
+	/* Both ends are Ethernet ports: a VAP is never a bridged pair's egress
+	 * here, its own frames being Wi-Fi's to forward. */
+	if (!(in->flags & ENTRY_VALID) || !(out->flags & ENTRY_VALID) ||
+	    !in->itf || !out->itf ||
+	    in->itf->index != in_iface->itf_id || out->itf->index != out_iface->itf_id ||
+	    in->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) ||
+	    out->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
+		return ask_refuse(-EOPNOTSUPP);
+	hw = kzalloc(sizeof(*hw), GFP_KERNEL);
+	if (!hw)
+		return -ENOMEM;
+	hw->route.itf = out->itf;
+	hw->route.input_itf = in->itf;
+	hw->route.underlying_input_itf = in->itf;
+	hw->route.mtu = rule->mtu;
+	/* The frame's own pair, rewritten in place: the destination station and
+	 * the source station, not the router. */
+	ether_addr_copy(hw->route.dstmac, rule->dst_mac);
+	ether_addr_copy(hw->route.srcmac, rule->src_mac);
+	ct = &hw->entry;
+	ct->twin = &hw->twin;
+	hw->twin.twin = ct;
+	ct->pRtEntry = &hw->route;
+	ct->status = CONNTRACK_ORIG;
+	ct->fftype = rule->ethertype == ETH_P_IPV6 ? FFTYPE_IPV6 : FFTYPE_IPV4;
+	/* Spreads the pair over the egress port's queues as a flow's 5-tuple
+	 * hash does; the pair is all there is to hash. */
+	ct->hash = jhash(rule->dst_mac, 2 * ETH_ALEN, rule->ethertype);
+	ft_encap(rule->in_vlan, rule->in_vlans, encap.ingress, &encap.num_ingress);
+	ft_encap(rule->out_vlan, rule->out_vlans, encap.egress, &encap.num_egress);
+	ct->qosmark.queue = rule->qos & CDX_FT_QOS_QUEUE_MASK;
+	ct->qosmark.chnl_id = (rule->qos & CDX_FT_QOS_CHANNEL_MASK) >>
+			      CDX_FT_QOS_CHANNEL_SHIFT;
+	ct->qosmark.iqid = 0;
+	ct->qosmark.iqid_valid = 1;
+	rc = insert_l2_entry_in_classif_table(ct, rule->dst_mac, rule->src_mac,
+					      rule->ethertype,
+					      encap.num_ingress || encap.num_egress ? &encap : NULL);
+	if (rc) {
+		kfree(hw);
+		return rc == -ENOSPC ? -ENOSPC : -EIO;
+	}
+	cdx_police_profile_ref(hw->policer);
+	*result = hw;
+	return 0;
 }
 
 void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)

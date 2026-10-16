@@ -485,6 +485,21 @@ static void ft_mr_device_gone(struct net_device *dev)
     mroute_devices_gone++;
 }
 static void ft_mr_exit(void) { ft_mr_ready = false; ft_mr_resync_pending = 0; }
+/* The bridged unicast learner has its own file (ask_flowtable_l2.c); here the
+ * chains' calls into it only count. */
+static unsigned l2_devices_changed, l2_fdb_events, l2_retire_alls;
+static int ft_l2_init(void) { return 0; }
+static void ft_l2_exit(void) { }
+static void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
+                            const struct net_device *port)
+{
+    (void)event; (void)addr; (void)vid; (void)port;
+    l2_fdb_events++;
+}
+static void ft_l2_dev_changed(const struct net_device *dev) { (void)dev; l2_devices_changed++; }
+static void ft_l2_retire_all(void) { l2_retire_alls++; }
+static unsigned l2_egress_drains;
+static int ft_l2_egress_drain(const struct net_device *dev) { (void)dev; l2_egress_drains++; return 0; }
 /* The Wi-Fi VAP registration lives in its own file and has its own harness
  * (wifi_admission.c); here the notifier's calls into it only count. */
 static unsigned wifi_reconsiders, wifi_address_changes, wifi_devices_gone;

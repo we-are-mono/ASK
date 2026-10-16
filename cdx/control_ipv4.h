@@ -167,6 +167,8 @@ struct cdx_l2_encap {
  * session or a tunnel names them in encap. SUCCESS, -ENOSPC when the key's
  * bucket already chains its most keys, or FAILURE. */
 int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap);
+int insert_l2_entry_in_classif_table(PCtEntry entry, const uint8_t *da, const uint8_t *sa,
+				     uint16_t ethertype, const struct cdx_l2_encap *encap);
 int delete_entry_from_classif_table(PCtEntry entry);
 
 void display_ctentry(PCtEntry entry);

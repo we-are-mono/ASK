@@ -2678,6 +2678,8 @@ void ft_release(void *priv)
 	list_del(&binding->list);
 	ft_bound--;
 	spin_unlock_bh(&ft_watch_lock);
+	/* A bridged pair needs both its ports bound. */
+	ft_l2_dev_changed(binding->dev);
 	/* A live binding going may be the last one a parked binding waits
 	 * for: this is the commit of an atomic reload, releasing the table it
 	 * replaced. */

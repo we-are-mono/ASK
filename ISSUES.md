@@ -152,6 +152,20 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A383 — a bridged pair the learner refuses is asked of the bridge again every second it carries traffic.** A
+  station pair through a Wi-Fi VAP, an unbound port or a key collision re-enters the ring once a second per CPU, and
+  each pass costs an `rtnl_trylock()` and a resolve that fails the same way (`ask_flowtable_l2.c`, `ft_l2_admit()`).
+  Harmless at the dozens of pairs a LAN has; a refusal cache keyed by pair and reason, or a cheap port test in the hook,
+  would remove it.
+
+- [ ] **A382 — the bridged unicast learner retires and lists its pairs in one pass under the control mutex.** The
+  dead/idle sweep, `ft_l2_retire_all()` and `ft_l2_show()` each walk every pair (up to `FT_L2_MAX`, 4096) in one hold,
+  where routed retirement batches by `FT_RETIRE_BATCH` and lets the transaction go between batches (A327). A LAN has
+  tens of pairs; batch them the same way if a deployment ever holds thousands.
+
+- [x] **A381 — two stations on two LAN ports talked through the CPU; 1.0.7 switched them at line rate.** The bridged
+  unicast learner installs each station pair in the ingress port's Ethernet table (_:/^flowtable: switch bridged station pairs_).
+
 - [x] **A380 — three reboots inside a healthy hour, or three power cuts, turned hardware offload off for good.** A
   healthy shutdown refunds its attempt and a spent budget retries after a day up (_:/^recovery: refund healthy shutdowns_).
 

@@ -96,6 +96,7 @@ void cdx_ifstats_read(const void *record, struct cdx_ft_stats *rx,
 int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		  const struct cdx_ft_stats_binding *stats,
 		  struct cdx_ft_hw **result);
+int cdx_ft_hw_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **result);
 void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
 /* Always consumes *hw. 0: removed and synchronized. -EAGAIN: unlinked but
  * quarantined. -EIO: removal unproven; caller must stop further admission and

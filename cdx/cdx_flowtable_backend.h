@@ -356,6 +356,29 @@ struct cdx_ft_stats_binding {
 	struct cdx_ft_stats_slot *out_tunnel;
 };
 
+/* A unicast pair a bridge forwards between two of its ports, offloaded as
+ * the bridge forwards it: the frame is untouched but for the tags the two
+ * ports' VLAN membership differs in. `in` and `out` are physical ports of
+ * one bridge; the pair is the frame's own (destination, source), and the
+ * EtherType host-order ETH_P_IP or ETH_P_IPV6 -- the classifier's key with
+ * the ingress port. `in_vlan` is what the ingress strips and `out_vlan` what
+ * the egress inserts, outermost first; `mtu` the largest frame payload the
+ * egress port carries. */
+struct cdx_ft_l2_rule {
+	struct net_device *in;
+	struct net_device *out;
+	u8 dst_mac[ETH_ALEN];
+	u8 src_mac[ETH_ALEN];
+	u16 ethertype;
+	u16 mtu;
+	u8 in_vlans;
+	u8 out_vlans;
+	struct cdx_ft_vlan in_vlan[CDX_FT_VLAN_MAX];
+	struct cdx_ft_vlan out_vlan[CDX_FT_VLAN_MAX];
+	/* The class the pair's frames are queued in, decoded as a flow's is. */
+	u16 qos;
+};
+
 /* Process-context transactions serialize adapter state with CDX hardware
  * operations. They intentionally retain the existing control-lock ordering.
  * No backend operation calls the adapter. Never flush Netfilter work inside a
@@ -482,6 +505,11 @@ extern unsigned int cdx_ft_debug_mask;
 int cdx_ft_add(const struct cdx_ft_rule *rule,
 	       const struct cdx_ft_stats_binding *stats,
 	       struct cdx_ft_hw **result);
+
+/* Install a bridged pair. Deleted, read and retired with cdx_ft_del(),
+ * cdx_ft_stats() and the rest exactly as a flow direction is: the result is
+ * the same kind of owner. */
+int cdx_ft_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **result);
 /* Interface-level byte counters live in a small fixed firmware area, four
  * timestamped records and the rest plain, shared with the ports' own records.
  * Allocation is therefore expected to fail, and failing is not fatal:

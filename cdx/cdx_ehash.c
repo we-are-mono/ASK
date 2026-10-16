@@ -1601,6 +1601,117 @@ err_ret1:
 	return retval == EHASH_ADD_BUCKET_FULL ? -ENOSPC : FAILURE;
 }
 
+/* A bridged unicast pair's entry: the ingress port's Ethernet table, keyed on
+ * the frame's own address pair and EtherType, forwarding it to the egress port
+ * the bridge's FDB names.
+ *
+ * Every IP table's miss falls through to this table (cdxdrv_set_miss_action()),
+ * so the frames a bridge forwards between two ports -- addressed to another
+ * station, never to the router, so no routed entry claims them -- meet it last
+ * and leave by hardware. Nothing about the frame changes: no hop is crossed,
+ * so the actions are the non-routed ones (fill_actions()), and the Ethernet
+ * header is rewritten with the pair it already carries -- the route's
+ * destination and its own source (RouteEntry.srcmac). `encap` pops or pushes
+ * the tag where the bridge's VLAN membership differs between the two ports.
+ * `ethertype` is in host order, and the frame's own inside any tag: that is
+ * the one the key generator extracts (a tagged pair matches under its inner
+ * type on the rig), so the key tells neither the VLAN nor the tag apart and
+ * the strip's check is what does. */
+int insert_l2_entry_in_classif_table(PCtEntry entry, const uint8_t *da, const uint8_t *sa,
+				     uint16_t ethertype, const struct cdx_l2_encap *encap)
+{
+	struct ins_entry_info *info;
+	struct en_exthash_tbl_entry *tbl_entry = NULL;
+	union dpa_key *key;
+	uint16_t flags;
+	uint32_t key_size;
+	uint8_t *ptr;
+	int retval = FAILURE;
+
+	entry->ct = NULL;
+	info = kzalloc(sizeof(struct ins_entry_info), GFP_KERNEL);
+	if (!info)
+		return FAILURE;
+	info->entry = entry;
+	if (!entry->pRtEntry->underlying_input_itf || add_incoming_iface_info(entry))
+		goto err_ret1;
+	if (dpa_get_fm_port_index(entry->inPhyPortNum,
+				  entry->pRtEntry->underlying_input_itf->index,
+				  &info->fm_idx, &info->port_idx, &info->port_id))
+		goto err_ret;
+	info->fm_pcd = dpa_get_pcdhandle(info->fm_idx);
+	if (!info->fm_pcd)
+		goto err_ret;
+	info->tbl_type = ETHERNET_TABLE;
+	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, ETHERNET_TABLE);
+	if (!info->td)
+		goto err_ret;
+	if (dpa_get_tx_info_by_itf(entry->pRtEntry, &info->l2_info, &info->l3_info,
+				   &entry->qosmark, (uint32_t)entry->hash))
+		goto err_ret;
+	if (encap && apply_l2_encap(info, encap))
+		goto err_ret;
+	entry->ct = kzalloc(sizeof(struct hw_ct), GFP_KERNEL);
+	if (!entry->ct)
+		goto err_ret;
+	entry->ct->td = info->td;
+	entry->ct->fm_ctx = dpa_get_fm_ctx(info->fm_idx);
+	if (!entry->ct->fm_ctx)
+		goto err_ret;
+	tbl_entry = ExternalHashTableAllocEntry(info->td);
+	if (!tbl_entry)
+		goto err_ret;
+	flags = 0;
+#ifdef ENABLE_FLOW_TIME_STAMPS
+	SET_TIMESTAMP_ENABLE(flags);
+	tbl_entry->hashentry.timestamp_counter =
+		cpu_to_be32(dpa_get_timestamp_addr(EXTERNAL_TIMESTAMP_TIMERID));
+	tbl_entry->hashentry.timestamp = cpu_to_be32(JIFFIES32);
+	entry->ct->timestamp = JIFFIES32;
+#endif
+#ifdef ENABLE_FLOW_STATISTICS
+	SET_STATS_ENABLE(flags);
+#endif
+	/* The key generator extracts the port, then the pair and EtherType as
+	 * the header carries them. */
+	key = (union dpa_key *)&tbl_entry->hashentry.key[0];
+	key->portid = info->port_id;
+	memcpy(key->ether_key.ether_da, da, ETH_ALEN);
+	memcpy(key->ether_key.ether_sa, sa, ETH_ALEN);
+	key->ether_key.ether_type = cpu_to_be16(ethertype);
+	key_size = sizeof(struct ethernet_key) + 1;
+
+	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];
+	ptr += ALIGN(key_size, TBLENTRY_OPC_ALIGN);
+	info->opcptr = ptr;
+	ptr += MAX_OPCODES;
+	SET_OPC_OFFSET(flags, (uint32_t)(info->opcptr - (uint8_t *)tbl_entry));
+	SET_PARAM_OFFSET(flags, (uint32_t)(ptr - (uint8_t *)tbl_entry));
+	tbl_entry->hashentry.flags = cpu_to_be16(flags);
+	info->paramptr = ptr;
+	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - GET_PARAM_OFFSET(flags));
+	if (fill_actions(entry, info, false))
+		goto err_ret;
+	tbl_entry->enqueue_params = info->enqueue_params;
+	entry->ct->handle = tbl_entry;
+	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
+	if (retval < 0)
+		goto err_ret;
+	entry->ct->index = (uint16_t)retval;
+	kfree(info);
+	return SUCCESS;
+err_ret:
+	if (entry->ct) {
+		kfree(entry->ct);
+		entry->ct = NULL;
+	}
+	if (tbl_entry)
+		ExternalHashTableEntryFree(tbl_entry);
+err_ret1:
+	kfree(info);
+	return retval == EHASH_ADD_BUCKET_FULL ? -ENOSPC : FAILURE;
+}
+
 /* A multicast group's root entry: the classifier key, the ingress validation,
  * and REPLICATE_PKT naming the head of the listener chain.
  *

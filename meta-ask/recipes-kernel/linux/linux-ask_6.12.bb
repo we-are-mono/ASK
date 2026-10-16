@@ -108,6 +108,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://160-bridge-switchdev-mdb-group.patch \
            file://161-bridge-multicast-egress-snapshot.patch \
            file://162-bridge-forward-path-forwarding-state.patch \
+           file://163-bridge-fdb-forward-port-refresh.patch \
            file://170-ipv6-hop-limit-checksum-complete.patch \
           "
 

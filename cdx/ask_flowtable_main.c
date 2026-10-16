@@ -568,6 +568,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_wifi_registered, atomic64_read(&ft_wifi_refusals));
 	ft_mc_rows(seq);
 	ft_mr_rows(seq);
+	ft_l2_show(seq);
 	return 0;
 }
 
@@ -742,6 +743,9 @@ static int __init ask_flowtable_init(void)
 	/* The multicast switch wakes both learners only from here on; one
 	 * flipped while they were starting is answered by this wake. */
 	ft_mc_switched();
+	/* The bridged unicast learner's hook, once every event that retires a
+	 * pair it installs can arrive. */
+	ft_l2_init();
 	rc = ft_init_fault(5) ? -ENOMEM : flow_indr_dev_register(ft_bind, NULL);
 	if (rc)
 		goto not_ready;
@@ -822,6 +826,7 @@ netdev:
 	 * text about to go. */
 	ft_mc_exit();
 	ft_mr_exit();
+	ft_l2_exit();
 	/* The notifier's registration replayed NETDEV_REGISTER and attached
 	 * every port, so a failure after that point has ports to give back.
 	 * No SA can have been installed through them: xfrm_dev_ops_get()
@@ -904,6 +909,9 @@ static void __exit ask_flowtable_exit(void)
 	 * stopped -- ft_mr_kick() answers to ft_mr_stopping either way, but
 	 * the order makes that a property rather than a coincidence. */
 	ft_mr_exit();
+	/* And the bridged unicast pairs, whose events arrive on the chains
+	 * closed above: the hook goes, then the worker, then every entry. */
+	ft_l2_exit();
 	/* Likewise for the VAPs, and before the module's text goes: the
 	 * reconciling worker holds a pointer into it. */
 	ft_wifi_exit();

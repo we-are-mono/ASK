@@ -289,7 +289,104 @@ address retires the entries naming the device, as a port's does.
 address on every frame the station receives; `flowtable_pppoe.py` does the
 same behind a session (`test_openwrt_lan`, `test_openwrt_lan_tcp`).
 
+## Switching between two ports
+
+Everything above is routed: a flow crosses a bridge on its way to or from a
+route. Two stations on two ports of one bridge talk with no route at all, so
+no flowtable ever sees them, and 1.1.0 forwarded them in software. 1.0.7
+switched them at line rate: `auto_bridge`, fed by a kernel bridge hook (patch
+020, gone with CMM), handed CMM each pair to install. The bridged unicast
+learner (`ask_flowtable_l2.c`) does the same job inside the adapter.
+
+The hardware side needed nothing new. Every IP table's miss already falls
+through to the ingress port's Ethernet table (`cdxdrv_set_miss_action()`),
+keyed on the port and the frame's destination, source and EtherType, and that
+table sat empty. `insert_l2_entry_in_classif_table()` fills it: one entry per
+direction of a pair, the non-routed actions (no TTL, no NAT), the frame's own
+addresses written back unchanged (`RouteEntry.srcmac` again), and a pop or a
+push where the two ports tag the pair's VLAN differently. The key's EtherType
+is the frame's own inside the tag, not the TPID; the rig's tagged direction
+proves it. A tagged frame is always stripped and tagged again, even when both
+ports carry the VLAN tagged: the strip is what checks the VID, which the key
+does not hold, and without it the same pair in another VLAN of the port would
+leave in its own. Measured, the check is exact: a frame tagged with another
+VID than the entry strips, an untagged frame against an entry that strips a
+tag, and a tagged one against an entry that strips none all match the key and
+are handed to Linux, never forwarded. The tag inserted carries the VID alone, so a frame bridged
+from one trunk to another leaves with priority 0 where the bridge keeps its
+PCP -- as 1.0.7's entries did. Since neither the VLAN nor the tag is in the
+key, a pair in two VLANs, or tagged and untagged, on one port would need one
+key twice; the second stays in software.
+
+The learner is the bridged multicast learner's shape: a bridge
+`PRE_ROUTING` hook -- before the bridge gives an untagged frame its PVID, the
+only place the wire form, which is the key, is still known -- that records a
+unicast IPv4 or IPv6 pair at most once a second per CPU and never diverts a
+frame; a worker that asks the bridge, under a trylocked RTNL, everything it
+would decide about the pair; and events that mark pairs dead from wherever
+they arrive. Admission requires both ports bound to an offload flowtable and
+supported, both forwarding in the VLAN (`br_port_bridging()`, patch 163: the
+port's state and its VLAN's, not the bridge's own entry, which a bridged frame
+never crosses), the VLAN the one the bridge puts the frame in now -- an
+untagged observation's VID still the ingress PVID, none at all without
+filtering -- the destination learned on another port and the source on the
+ingress, 802.1Q filtering or none, no MST, no isolation between the two, no
+locked, MAB or VLAN-tunnel port, nothing tc or a netdev chain runs on either
+port, an egress MTU no smaller than the ingress's, and a bridge that is not
+promiscuous: one that is hands every frame it forwards up as well, to a
+capture or to an upper device with an address of its own (a VRRP virtual
+MAC), and an entry would take that copy away. Frames for the bridge's own
+address are the router's and are never recorded, and `br_fdb_forward_port()`
+(patch 163) answers only for learned entries, so a port's own address is not
+a destination either. Priority-tagged and 802.1ad-tagged frames stay in
+software. While any bridge-family hook other than the learners' own
+is registered -- an nftables or ebtables chain, br_netfilter -- no pair is
+carried, exactly as for a bridged routed flow.
+
+The learner publishes a pair where events can mark it before it asks the
+bridge the last time and builds the entry, so nothing the bridge does in
+between goes unseen. A pair retires when an FDB entry of either station
+moves, ages out or is deleted (matched through a per-station index, not a
+walk); when a port or the bridge changes state, VLAN membership, filtering,
+MTU, address or link, leaves the bridge or unregisters; when the port is
+unbound; on global invalidation; and after `l2_idle_ms` (30 s) with no frame.
+An egress change -- an HTB tree, a class, the DSCP map -- takes the port's
+pairs out synchronously before CDX hands its queues on (`ft_egress_drain()`),
+and a pair built across one is taken out again. Some changes raise no event
+-- a tc filter or a netdev chain, the bridge turning promiscuous, the VLAN
+tunnel flag, an FDB entry added by hand as dynamic or locked -- so every
+installed pair is asked of the bridge again every five seconds. Frames the
+hardware forwards never reach the bridge to refresh its FDB, so a pair whose
+counters moved refreshes its source station's entry, while it still names the
+ingress port (`br_fdb_refresh()`, patch 163), as a received frame would; the
+destination's is its reverse pair's to keep, so a station that went silent
+ages out and is flooded for as it would be in software.
+
+`/proc/cdx_flowtable` lists each pair as an `l2flow` row with its ports,
+addresses, VLAN, tag rewrite and counters, under `l2_*` totals.
+`ask_flowtable.l2_bridge=0` turns the learner off.
+
+`flowtable_l2bridge.py` proves it on the rig: the LAN VM on eth3 and a
+namespace on the WAN host, reaching eth4 tagged 3900, bridged in one VLAN --
+untagged on eth3 ("access") or tagged there too ("trunk"), tagged on eth4 --
+with the WAN in VLAN 1 of the same bridge. Both pairs are listed with the tag
+rewrite each needs; a ping burst moves both pairs' counters by every frame
+while the DUT transmits none; four TCP streams run at 9.37-9.39 Gbit/s each
+way in both shapes with the DUT ~5% busy, for longer than a shortened FDB
+ageing time with nothing retired; an FDB delete, an idle pair and a bridge
+chain each take the pairs out, and they come back. Frames injected with a
+pair's addresses in every form the bridge would not forward to the far end --
+untagged, tagged where the entry expects none, tagged in another VLAN -- are
+counted at the far end: none arrives, every one reaches Linux on the ingress.
+The entry's counters are no evidence there: they count a key's matches,
+including the frames its check then hands up.
+
 ## What this does not carry
+
+Between two ports, the learner carries IPv4 and IPv6 unicast only: ARP,
+other EtherTypes, a tagged frame on a bridge that does not filter VLANs
+(forwarded with its tag as payload), 802.1ad, a Wi-Fi VAP as either end and a
+pair whose TTL or hop limit is 1 stay in software.
 
 MACVLAN is a separate upper device and is still declined by the walk: it is
 neither an 802.1Q VLAN nor a bridge master. That is the accepted answer rather

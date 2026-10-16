@@ -44,6 +44,8 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   flowtable_service_multicast_ports.py 327 (the oif a port rule drops toward)
 #   flowtable_slaac.py     331          (isolated LAN router advertisements)
 #   flowtable_jumbo.py     332          (VLAN_ID_JUMBO, tagged jumbo LAN)
+#   flowtable_l2bridge.py  3900         (borrowed, see below; and 172.29.77.0/24
+#                                        between its two stations)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
 # orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access
@@ -53,7 +55,8 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # mroute_capacity.py also receives a tagged WAN replica on that existing
 # device using a temporary packet-socket membership, without reconfiguring it,
 # and flowtable_service_multicast_edges.py does the same. DHCP also borrows
-# it, creating only an owned macvlan child in a private server namespace.
+# it, creating only an owned macvlan child in a private server namespace, and
+# so does flowtable_l2bridge.py, for the station it bridges to the LAN VM.
 VLAN_ID_MROUTE: int                   = 244
 VLAN_IDS_MROUTE_LIMIT: tuple[int, ...] = tuple(range(311, 320))
 VLAN_ID_MCAST_MTU: int                = 324

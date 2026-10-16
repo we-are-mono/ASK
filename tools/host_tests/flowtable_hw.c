@@ -52,6 +52,9 @@ typedef u32 U32;
 #define HASH_CT6(s,d,sp,dp,proto) ((proto) * 17)
 #define DPA_CLS_HM_MAX_VLANs 6
 #define ETH_P_8021Q 0x8100
+#define ETH_P_IP 0x0800
+#define ETH_P_IPV6 0x86DD
+#define ETH_P_ARP 0x0806
 /* Host order in this description, as the header manipulation expects: it
  * applies cpu_to_be16/32 itself when it lays the tags out. */
 struct vlan_header { uint16_t tpid, tci; };
@@ -446,6 +449,43 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     key = calloc(1,sizeof(*key)); assert(key); key->linked = true;
     ct->ct->handle = key; ct->ct->td = &in_itf; ct->ct->index = 1;
     return 0;
+}
+/* A bridged pair's insert: the key's pair and EtherType as the rule gave
+ * them, and the entry's own route rewriting the frame with that same pair. */
+static struct { u8 da[6], sa[6]; u16 ethertype; bool encap_given; struct cdx_l2_encap encap; } l2_seen;
+static int insert_l2_entry_in_classif_table(PCtEntry ct, const uint8_t *da, const uint8_t *sa,
+                                            uint16_t ethertype, const struct cdx_l2_encap *encap)
+{
+    lockdep_assert_held(&cdx_info->ctrl.mutex);
+    memcpy(l2_seen.da, da, 6);
+    memcpy(l2_seen.sa, sa, 6);
+    l2_seen.ethertype = ethertype;
+    l2_seen.encap_given = encap != NULL;
+    memset(&l2_seen.encap, 0, sizeof(l2_seen.encap));
+    if (encap) {
+        assert(encap->num_ingress || encap->num_egress);
+        l2_seen.encap = *encap;
+    }
+    assert(!memcmp(ct->pRtEntry->dstmac, da, 6) && !memcmp(ct->pRtEntry->srcmac, sa, 6));
+    assert(ct->pRtEntry->itf == &out_itf && ct->pRtEntry->input_itf == &in_itf &&
+           ct->pRtEntry->underlying_input_itf == &in_itf);
+    assert(ct->status == CONNTRACK_ORIG && ct->twin && ct->twin->twin == ct);
+    assert(ct->fftype == (ethertype == ETH_P_IPV6 ? FFTYPE_IPV6 : FFTYPE_IPV4));
+    if (fail_insert) return -1;
+    ct->ct = kzalloc(sizeof(*ct->ct), GFP_KERNEL); assert(ct->ct);
+    if (key) { assert(!older); older = key; }
+    key = calloc(1,sizeof(*key)); assert(key); key->linked = true;
+    ct->ct->handle = key; ct->ct->td = &in_itf; ct->ct->index = 1;
+    return 0;
+}
+/* The pair's queue spread; any stable function of the pair does. */
+static u32 jhash(const void *k, u32 length, u32 initval)
+{
+    const u8 *b = k;
+    u32 h = initval;
+
+    while (length--) h = h * 31 + *b++;
+    return h;
 }
 /* A completed sync proves every key unlinked before it, whichever table it
  * went through: the PCD is one. A key still linked is never proven. */
@@ -1135,6 +1175,43 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     assert(!cdx_info->ctrl.mutex && !rtnl && !allocations);
 }
 
+/* A bridged pair: refused unless IPv4 or IPv6; untouched but for the tags
+ * the ports differ in; owned, read and deleted as a flow direction is. */
+static void test_l2_pair(struct net_device *in, struct net_device *out)
+{
+    struct cdx_ft_l2_rule rule = { .in = in, .out = out, .dst_mac = {2,3,4,5,6,7},
+                                   .src_mac = {2,9,9,9,9,1}, .ethertype = ETH_P_IP, .mtu = 1500 };
+    struct cdx_ft_counters counters;
+    struct cdx_ft_hw *hw;
+
+    rule.ethertype = ETH_P_ARP;
+    assert(cdx_ft_hw_l2_add(&rule, &hw) == -EOPNOTSUPP && !hw && !allocations);
+    rule.ethertype = ETH_P_IP;
+    out_itf.type = 2; assert(cdx_ft_hw_l2_add(&rule, &hw) == -EOPNOTSUPP && !hw); out_itf.type = 129;
+    fail_insert = true; assert(cdx_ft_hw_l2_add(&rule, &hw) == -EIO && !hw && !allocations); fail_insert = false;
+    for (unsigned i = 0; i < 4; i++) {
+        rule.ethertype = i & 1 ? ETH_P_IPV6 : ETH_P_IP;
+        rule.in_vlans = !!(i & 2);
+        rule.in_vlan[0] = (struct cdx_ft_vlan){ .proto = htons(ETH_P_8021Q), .id = 3900 };
+        rule.out_vlans = 0;
+        assert(cdx_ft_hw_l2_add(&rule, &hw) == 0 && hw);
+        assert(!memcmp(l2_seen.da, rule.dst_mac, 6) && !memcmp(l2_seen.sa, rule.src_mac, 6));
+        assert(l2_seen.ethertype == rule.ethertype);
+        /* An untagged pair asks for no override, as an untagged flow does. */
+        assert(l2_seen.encap_given == !!(i & 2));
+        assert(l2_seen.encap.num_ingress == rule.in_vlans && !l2_seen.encap.num_egress);
+        cdx_ft_hw_stats(hw, &counters); assert(counters.packets == 99 && counters.bytes == 12345);
+        assert(cdx_ft_hw_del(&hw) == 0 && !hw && !key && !allocations);
+    }
+    /* Tagged on the way in and out: stripped, which checks the VID, and
+     * tagged again. */
+    rule.in_vlans = rule.out_vlans = 1;
+    rule.out_vlan[0] = rule.in_vlan[0];
+    assert(cdx_ft_hw_l2_add(&rule, &hw) == 0);
+    assert(l2_seen.encap.num_ingress == 1 && l2_seen.encap.num_egress == 1);
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+}
+
 static void test_backend(void)
 {
     struct net_device in = { .name="in", .net=&init_net, .type=ARPHRD_ETHER,
@@ -1698,6 +1775,7 @@ int main(void)
     rule.family = AF_UNSPEC; assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
     expected_family = rule.family = AF_INET;
     rule.src = v4(htonl(0xc0000201)); rule.dst = v4(htonl(0xc6336401));
+    test_l2_pair(&in, &out);
     rule.proto = expected_proto = IPPROTO_UDP;
 
     /* Encapsulation. The rule orders its tags outermost first; the L2

@@ -893,6 +893,17 @@ void ft_mc_flow_seen(const struct ft_mc_flow *f,
 		     const struct ft_mc_stream *shape,
 		     struct ft_mc_seen *seen);
 bool ft_bridge_hooked(unsigned int hooks);
+
+/* The bridged unicast learner (ask_flowtable_l2.c). */
+int ft_l2_init(void);
+void ft_l2_exit(void);
+bool ft_l2_hook_is(const struct nf_hook_ops *ops);
+void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
+		     const struct net_device *port);
+void ft_l2_dev_changed(const struct net_device *dev);
+void ft_l2_retire_all(void);
+int ft_l2_egress_drain(const struct net_device *dev);
+void ft_l2_show(struct seq_file *seq);
 bool ft_dev_nf_ingress_hooked(const struct net_device *dev);
 bool ft_mc_bridge_filtered(void);
 void ft_mc_hook_sync(bool wanted);
