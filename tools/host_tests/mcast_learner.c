@@ -512,6 +512,7 @@ static int cdx_mc_group_replace(struct cdx_mc_group *hw,
 static int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
                             struct cdx_mc_group **result);
 static void cdx_mc_group_del(struct cdx_mc_group **group);
+static unsigned cdx_mc_group_ids(u8 family, unsigned *slots);
 
 /* What the worker needs beyond the learner's own functions. The egress count
  * is the adapter's, shared with its IPsec half; ft_egress_changed() moves it
@@ -742,6 +743,14 @@ static unsigned ids_held(u8 family)
     for (unsigned i = 0; i < ARRAY_SIZE(entries); i++)
         n += entries[i].live && entries[i].key.family == family;
     return n;
+}
+/* What the backend says of a family's ids, under the transaction. */
+static unsigned cdx_mc_group_ids(u8 family, unsigned *slots)
+{
+    assert(in_transaction);
+    if (slots)
+        *slots = id_slots;
+    return ids_held(family);
 }
 /* A port's egress changing after a build has read it and before the worker
  * records it: counted, and marking what it can at once, since the worker
@@ -3433,6 +3442,7 @@ static void a_named_discard_waits_for_an_id(void)
     evicted = ft_mc_discards_evicted;
     wanted = installed_flow(G, S2, false);
     assert(!named->hw && named->retries == 1 && ft_mc_discards_evicted == evicted + 1);
+    assert(named->parked && !wanted->parked);
     assert(!strcmp(ft_mc_state(named), "pending"));
     /* The pass the eviction asked for keeps it, and does not try it yet. */
     a0 = adds;
@@ -3455,7 +3465,7 @@ static void a_named_discard_waits_for_an_id(void)
     ft_mc_refresh_fn(NULL);
     ft_mc_work_fn(NULL);
     assert(named->hw && named->hw_discard && !named->retries && ft_mc_discarding == 1);
-    assert(!strcmp(ft_mc_state(named), "discarding"));
+    assert(!named->parked && !strcmp(ft_mc_state(named), "discarding"));
     stats_now = (struct cdx_ft_counters){ 0 };
     reset();
 }
@@ -4439,6 +4449,91 @@ static void discards_leave_room_for_a_wanted_stream(void)
     pass();
 }
 
+/* A discard a membership still names gives its id up to a wanted stream and
+ * stays a flow, parked: it takes none of the caps' places, as it took none
+ * holding the id (A315). Counted, each such eviction took a place on its
+ * ingress port with no entry behind it, and a port whose discards gave their
+ * ids up had room for half the wanted streams it should. */
+static void an_evicted_named_discard_takes_no_place(void)
+{
+    const unsigned groups = FT_MC_MAX_PORT_FLOWS / FT_MC_MAX_FLOWS;
+    const uint32_t N = 0x280007ef, G = 0x290007ef, S1 = 0x0100000a, S2 = 0x0200000a;
+    const uint32_t last = htonl(0xef040000 + groups);
+    struct ft_mc_flow *named, *wanted, *f;
+    unsigned refused, g, s, filled = 1;
+
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    id_slots = 1;
+    named = named_discard(N, S1);
+    wanted = installed_flow(G, S2, false);
+    ft_mc_work_fn(NULL);
+    assert(flow(&P1, S1, 0) == named && !named->hw && named->parked);
+    /* P1 one short of its cap with flows that may still be carried: the
+     * wanted one, and pending sources of groups a membership names. */
+    for (g = 0; g <= groups; g++) {
+        struct br_ip any = group_v4(htonl(0xef040000 + g), 0, 0);
+
+        assert(ft_mc_membership(&BR, &P3, &any, true, false));
+    }
+    for (g = 0; g < groups && filled < FT_MC_MAX_PORT_FLOWS - 1; g++)
+        for (s = 0; s < FT_MC_MAX_FLOWS && filled < FT_MC_MAX_PORT_FLOWS - 1; s++, filled++)
+            observe(seen_v4(&BR, &P1, htonl(0xef040000 + g),
+                            htonl(0x0a100000 | g << 4 | s), 0, false, SENDER));
+    assert(wanted->in == &P1 && port_flows(&P1) == FT_MC_MAX_PORT_FLOWS);
+    refused = ft_mc_refused;
+    observe(seen_v4(&BR, &P1, last, htonl(0x0a1f0001), 0, false, SENDER));
+    assert(flow(&P1, htonl(0x0a1f0001), 0) && ft_mc_refused == refused);
+    /* The cap still holds for what may be carried. */
+    observe(seen_v4(&BR, &P1, last, htonl(0x0a1f0002), 0, false, SENDER));
+    assert(!flow(&P1, htonl(0x0a1f0002), 0) && ft_mc_refused == refused + 1);
+    list_for_each_entry(f, &ft_mc_flows, list)
+        f->gone = true;
+    pass();
+    reset();
+}
+
+/* No more of a family's flows are parked than the family has ids: a discard
+ * evicted while as many wait for one counts again, so wanted streams turned
+ * into discards and evicted in turn cannot grow the flows past the caps. */
+static void parked_discards_are_bounded_by_ids(void)
+{
+    const uint32_t N = 0x2a0007ef, G = 0x2b0007ef, H = 0x2c0007ef;
+    const uint32_t S1 = 0x0100000a, S2 = 0x0200000a, S3 = 0x0300000a;
+    struct ft_mc_flow *named, *wanted, *next, *f;
+
+    reset();
+    ft_mc_filtered = bridge_hooked = false;
+    id_slots = 1;
+    named = named_discard(N, S1);
+    wanted = installed_flow(G, S2, false);
+    assert(named->parked && !named->hw && wanted->hw && !wanted->hw_discard);
+    /* The wanted stream's listener goes behind its ingress: it is a discard
+     * the membership still names, holding the family's one id. */
+    answer(&P1, S2, 0, BR_MCAST_SNOOPED, 0);
+    {
+        struct br_ip any = group_v4(G, 0, 0);
+
+        mutex_lock(&ft_mc_lock);
+        ft_mc_touch(&BR, &any);
+        mutex_unlock(&ft_mc_lock);
+    }
+    ft_mc_work_fn(NULL);
+    assert(wanted->hw && wanted->hw_discard && !wanted->parked);
+    /* Another stream somebody wants takes that id. */
+    next = installed_flow(H, S3, false);
+    assert(next->hw && !wanted->hw && !wanted->hw_discard);
+    assert(named->parked && !wanted->parked);
+    mutex_lock(&ft_mc_lock);
+    assert(ft_mc_flow_capped(wanted) && !ft_mc_flow_capped(named));
+    mutex_unlock(&ft_mc_lock);
+    assert(ft_mc_parked() == 1);
+    list_for_each_entry(f, &ft_mc_flows, list)
+        f->gone = true;
+    pass();
+    reset();
+}
+
 /* A flow nothing carries is kept only while its stream arrives. Its frames
  * are not recorded again once seen, so a flow that has heard nothing for
  * FT_MC_UNCARRIED_AGE asks: its slot lapses, its next frame is recorded and
@@ -4530,6 +4625,8 @@ int main(void)
     idle_flows_age_out();
     the_learner_keeps_a_bounded_number_of_flows();
     discards_leave_room_for_a_wanted_stream();
+    an_evicted_named_discard_takes_no_place();
+    parked_discards_are_bounded_by_ids();
     an_uncarried_flow_lives_while_its_stream_does();
 
     reset();

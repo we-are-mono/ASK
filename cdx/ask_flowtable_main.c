@@ -545,6 +545,9 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * wants. */
 	seq_printf(seq, "mcast_discarding %u\nmcast_discards_evicted %llu\n",
 		   ft_mc_discarding, ft_mc_discards_evicted);
+	/* And of those, the ones still named, waiting outside the caps for an
+	 * id (A315). */
+	seq_printf(seq, "mcast_parked %u\n", ft_mc_parked());
 	/* The group ids both learners' groups hold, per family, and how many
 	 * each family has -- the same number for both: what a group that finds
 	 * none left, and reads refused-failed, ran out of. */

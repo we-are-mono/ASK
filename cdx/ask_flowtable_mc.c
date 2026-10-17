@@ -907,6 +907,29 @@ static bool ft_mc_discardable(const struct ft_mc_flow *f)
 	       f->local == BR_MCAST_SNOOPED;
 }
 
+/* Whether a flow takes one of the caps' places (ft_mc_observe()). An installed
+ * discard does not, its group id bounding it, and nor does one parked after
+ * giving that id up while it is still a discard in waiting: it holds no entry
+ * and waits for an id as it held one. Called with ft_mc_lock held. */
+bool ft_mc_flow_capped(const struct ft_mc_flow *f)
+{
+	lockdep_assert_held(&ft_mc_lock);
+	return !f->gone && !f->hw_discard && !(f->parked && !f->hw && ft_mc_discardable(f));
+}
+
+/* Flows parked without an entry, for /proc. */
+unsigned int ft_mc_parked(void)
+{
+	struct ft_mc_flow *f;
+	unsigned int n = 0;
+
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(f, &ft_mc_flows, list)
+		n += f->parked && !f->hw;
+	mutex_unlock(&ft_mc_lock);
+	return n;
+}
+
 /* The key a flow's hardware group is installed under: its port, its stream
  * and the one ingress shape the root accepts. Called with ft_mc_lock held. */
 static void ft_mc_flow_key(const struct ft_mc_flow *f,
@@ -1665,6 +1688,7 @@ static void ft_mc_drain(void)
 bool ft_mc_evict_discard(u8 family)
 {
 	struct ft_mc_flow *f, *victim = NULL;
+	unsigned int parked = 0, slots = 0;
 	struct cdx_mc_group *hw;
 	struct net_device *in;
 
@@ -1672,8 +1696,10 @@ bool ft_mc_evict_discard(u8 family)
 	mutex_lock(&ft_mc_lock);
 	if (!ft_mc_stopping) {
 		list_for_each_entry(f, &ft_mc_flows, list) {
-			if (!f->hw || !f->hw_discard || f->busy || f->stale ||
-			    ft_mc_family(&f->addr) != family)
+			if (ft_mc_family(&f->addr) != family)
+				continue;
+			parked += f->parked && !f->hw;
+			if (!f->hw || !f->hw_discard || f->busy || f->stale)
 				continue;
 			if (!victim || f->interval_packets < victim->interval_packets)
 				victim = f;
@@ -1690,8 +1716,13 @@ bool ft_mc_evict_discard(u8 family)
 	ft_mc_discarding--;
 	ft_mc_discards_evicted++;
 	/* Spent as a failed install is: a flow still named waits for the
-	 * refresh to try it again, and one named by nothing is retired first. */
+	 * refresh to try it again, and one named by nothing is retired first.
+	 * The one still named takes no place meanwhile, as it took none while
+	 * it held the id, while the family's parked flows are fewer than its
+	 * ids; past that it counts again (A315). */
 	victim->retries++;
+	cdx_mc_group_ids(family, &slots);
+	victim->parked = ft_mc_flow_named(victim) && parked < slots;
 	in = victim->in;
 	dev_hold(in);
 	/* Its frames reach the CPU again, and one recorded while the entry
@@ -2004,6 +2035,8 @@ static void ft_mc_work_fn(struct work_struct *work)
 		ft_mc_discarding -= target->hw_discard;
 		target->hw_discard = hw && spec.discard;
 		ft_mc_discarding += target->hw_discard;
+		if (hw)
+			target->parked = false;
 		/* And the chain itself, whole, for the egress drain to replace
 		 * the entry with, holding what it names; nothing is recorded for
 		 * an entry this pass took out, or one it could not build. Nor

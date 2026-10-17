@@ -668,8 +668,8 @@ bool ft_mc_same_key(const struct ft_mc_flow *a, const struct ft_mc_flow *b)
  * of one that something names. Called with ft_mc_lock held. */
 void ft_mc_observe(const struct ft_mc_seen *seen)
 {
-	bool counted = false, shared = false;
-	unsigned int flows = 0, port_flows = 0, total = 0;
+	bool counted = false, shared = false, o_capped = false;
+	unsigned int flows = 0, port_flows = 0, total = 0, rank, o_rank = 0;
 	struct net_device *bridge, *in;
 	struct ft_mc_seen other;
 	struct ft_mc_flow *f, *o;
@@ -756,8 +756,9 @@ void ft_mc_observe(const struct ft_mc_seen *seen)
 	 * asked for that source by name -- an (S,G) membership, which an SSM
 	 * listener's report produces, or a route -- and only from a flow that
 	 * nothing names that way and nothing carries: one not in hardware,
-	 * which gives way at no cost, or failing that a discard, whose entry
-	 * only drops what nobody wants. So a source an SSM listener asked for is not
+	 * which gives way at no cost -- one holding a place first, so the place
+	 * comes back, before one parked (A315) -- or failing that a discard,
+	 * whose entry only drops what nobody wants. So a source an SSM listener asked for is not
 	 * refused because the group's other senders got here first, and none
 	 * of those can take a place back: a group every host sends to keeps
 	 * the first eight it saw, and the rest cost a lookup here rather than
@@ -773,7 +774,9 @@ void ft_mc_observe(const struct ft_mc_seen *seen)
 		 * id up to a stream somebody wants (A292): counted here, a
 		 * port's discards would turn that stream away before it ever
 		 * reached the add that takes the id (A314). */
-		if (!f->gone && !f->hw_discard) {
+		bool capped = ft_mc_flow_capped(f);
+
+		if (capped) {
 			total++;
 			port_flows += f->in == in;
 		}
@@ -783,17 +786,23 @@ void ft_mc_observe(const struct ft_mc_seen *seen)
 		flows++;
 		counted |= f->turned;
 		shared |= f->derived && ft_mc_host_wants(f);
-		if ((!f->hw || (f->hw_discard && !o)) &&
-		    !ft_mc_source_named(bridge, &f->addr))
+		/* The last of the best kind gives way; a discard only failing
+		 * every other. Whether it held a place is taken here, once. */
+		rank = !f->hw ? (capped ? 3 : 2) : f->hw_discard ? 1 : 0;
+		if (rank && rank >= o_rank && (rank > 1 || !o) &&
+		    !ft_mc_source_named(bridge, &f->addr)) {
 			o = f;
+			o_rank = rank;
+			o_capped = capped;
+		}
 	}
 	if (flows >= FT_MC_MAX_FLOWS) {
 		/* The new flow counts toward both bounds; the one giving way
 		 * made room in them only if it counted there itself. */
 		if (!o || shared || ft_mc_filtered ||
-		    ((o->in != in || o->hw_discard) &&
+		    ((o->in != in || !o_capped) &&
 		     port_flows >= FT_MC_MAX_PORT_FLOWS) ||
-		    (o->hw_discard && total >= FT_MC_MAX_TOTAL_FLOWS) ||
+		    (!o_capped && total >= FT_MC_MAX_TOTAL_FLOWS) ||
 		    ft_mc_host_joined(bridge, &key) ||
 		    !ft_mc_source_named(bridge, &key)) {
 			/* Counted once until the group's flows change, which

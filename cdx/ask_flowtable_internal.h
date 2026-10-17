@@ -343,6 +343,13 @@ struct ft_mc_flow {
 	 * and so no port's queues, which is what keeps it out of an egress
 	 * rebuild, and it ages at the first refresh that counts nothing. */
 	bool hw_discard;
+	/* A discard that gave its group id up to a stream somebody wants while
+	 * a membership still names it (ft_mc_evict_discard()). While it waits
+	 * as a discard for an entry it takes none of the caps' places, as it
+	 * took none while it held the id; once wanted, it counts again. No more
+	 * of a family's flows are parked than the family has ids
+	 * (ft_mc_flow_capped()). */
+	bool parked;
 	/* The flow in another shape reached the CPU while an entry was
 	 * installed -- the only way it can, because the entry's own frames
 	 * never do: a sender whose MAC changed, a tag the port now carries. It
@@ -472,7 +479,8 @@ struct ft_mc_flow {
  * between both learners; one port is held to half of the total, so its
  * senders cannot take every place. A source past either is turned away as one
  * past FT_MC_MAX_FLOWS is. Installed discards count toward neither: each holds
- * a group id, which bounds them, and gives it up to a wanted stream. */
+ * a group id, which bounds them, and gives it up to a wanted stream -- nor
+ * does one parked after giving it up, bounded by the ids as well (A315). */
 #define FT_MC_MAX_PORT_FLOWS	256
 #define FT_MC_MAX_TOTAL_FLOWS	512
 
@@ -893,6 +901,8 @@ extern u64 ft_mc_observed, ft_mc_dropped, ft_mc_deferred, ft_mc_hook_errors;
 extern u64 ft_mc_passes, ft_mc_forgets;
 extern bool ft_mc_hooked;
 void ft_mc_forget_seen(void);
+bool ft_mc_flow_capped(const struct ft_mc_flow *f);
+unsigned int ft_mc_parked(void);
 void ft_mc_supersede(const struct ft_mc_seen *seen);
 void ft_mc_flow_seen(const struct ft_mc_flow *f,
 		     const struct ft_mc_stream *shape,

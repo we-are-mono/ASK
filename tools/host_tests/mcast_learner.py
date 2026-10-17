@@ -95,6 +95,8 @@ def test_mcast_learner(tmp_path):
             "ft_mc_host_wants",
             "ft_mc_installable",
             "ft_mc_discardable",
+            "ft_mc_flow_capped",
+            "ft_mc_parked",
             "ft_mc_flow_key",
             "ft_mc_flow_spec",
             "ft_mc_discard_spec",

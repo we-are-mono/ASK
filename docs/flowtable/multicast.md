@@ -567,6 +567,11 @@ pick and its record, and one marked for its next pass, which may be about to
 make it replicate. The flow that gave way stays a flow: named by nothing, the
 next pass retires it; named still, it is tried again a refresh apart, as a
 failed install is, and goes back in if an id frees before its tries run out.
+Meanwhile it is parked: it takes none of the per-port or total places, as it
+took none while it held the id, so a port whose discards gave their ids up
+keeps its room for wanted streams; counted, every eviction had taken one with
+no entry behind it (A315). No more of a family's flows are parked than it has
+ids, and one that comes to replicate, or goes back in, counts as any other.
 `mcast_discards_evicted` counts them, and `mcast_group_ids4`,
 `mcast_group_ids6` and `mcast_group_id_slots` say how many ids each family
 holds and how many it has. The rig

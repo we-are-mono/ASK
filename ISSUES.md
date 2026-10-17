@@ -447,12 +447,8 @@ result independently of those temporary files.
   adapter deliberately does not count it (that would refuse every bridged 1500→1500 UDP direction); it needs a host
   sending more than its link's MTU. Close only if the mEMAC turns out to have a tag-aware length check.
 
-- [ ] **A315 — an evicted bridged discard that a membership still names counts toward the flow caps again.** From review,
-  not reproduced. A discard whose listener sits behind its own ingress stays named; `ft_mc_evict_discard()`
-  (cdx/ask_flowtable_mc.c) clears its `hw_discard`, so it counts toward `FT_MC_MAX_PORT_FLOWS`, and its re-add as a discard
-  fails `-ENOSPC` up to `FT_MC_MAX_RETRIES` times while it holds a place with no entry. Enough of them could halve a
-  port's room for wanted streams. Fix direction: keep an evicted-but-named discard out of the caps (or retire it) until
-  it is wanted again. Check: listeners on a source's own port, fill the ids, join elsewhere, read `mcast_refused`.
+- [x] **A315 — an evicted bridged discard a membership still names took a cap place with no entry.** It is parked now,
+  outside the caps, no more of a family than it has ids (_:/^flowtable: park an evicted discard outside the caps_).
 
 - [x] **A308 — an IPsec SA release that found a queue non-empty or SEC busy leaked the SA (and its key tag) for the boot.**
   Fixed: per-tick release steps drain each queue and retire FROM_SEC only once SEC is proven done, so late SEC output is no longer lost (_:/^cdx: never abandon an IPsec SA release_).
