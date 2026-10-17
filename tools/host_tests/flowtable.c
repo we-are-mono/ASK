@@ -8714,19 +8714,23 @@ int main(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.sa_handle);
     REJECT(PORTLESS(fixture, IPPROTO_ESP); xfrm_policies = true; ipsec_sa = 7);
     REJECT(PORTLESS(fixture, IPPROTO_GRE); xfrm_policies = true; ipsec_in_sa = 8);
-    /* Nor out of a PPPoE session: the three-tuple tables have no key for
-     * the session a receive entry must match. UDP is carried from one where
-     * it fits. Into one, the MTU keeps both in software already (A385). */
+    /* Nor in a PPPoE session either way: the three-tuple tables have no key
+     * for the session a receive entry must match, and a push into one is not
+     * proven there. UDP is carried from one where it fits, and into one at
+     * 1500 over a 1508-byte port (RFC 4638), where the MTU (A385) lets it. */
     pppoe_in_fixture(); cls.nf_mtu = 1492;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.in_session.present);
     pppoe_in_fixture(); cls.nf_mtu = 1492;
     bk.ip_proto = ct.protonum = IPPROTO_ESP;
     dissector.used_keys &= ~BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
-    pppoe_out_fixture(); udp_flow();
+    pppoe_out_fixture(); udp_flow(); out.mtu = 1508; ppp.mtu = cls.nf_mtu = 1500;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.out_session.present);
+    pppoe_out_fixture(); udp_flow(); out.mtu = 1508; ppp.mtu = cls.nf_mtu = 1500;
     bk.ip_proto = ct.protonum = IPPROTO_GRE;
     dissector.used_keys &= ~BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    out.mtu = 1500; ppp.mtu = 1492;
     fixture(); assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     struct cdx_ft_rule udp = decoded;
     tcp_fixture(); assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.proto == IPPROTO_TCP);
