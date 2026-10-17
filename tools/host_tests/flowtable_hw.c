@@ -180,6 +180,7 @@ struct net_device {
     unsigned type, addr_len, reg_state, mtu;
     bool l3_slave, running, carrier, switch_port;
     u8 dev_addr[6], perm_addr[6];
+    int ifindex;
 };
 /* A DPAA MAC reports no switch parent, which is what dev_get_port_parent_id()
  * signals by leaving -EOPNOTSUPP as the answer. A port that does report one
@@ -289,7 +290,26 @@ typedef struct CtEntry {
         unsigned iqid_valid : 1;
         unsigned chnl_id : 4;
     } qosmark;
+    uint8_t detour;
 } CtEntry, *PCtEntry;
+/* The detour's stages (cdx_detour.h); whether it is set up, as a case says;
+ * and its records, by tuple, as cdx_detour.c keeps them: a second live one
+ * with a tuple is refused, and one let go is gone at once here, there being
+ * no frame in flight to keep it for. */
+#define CDX_DETOUR_NONE 0
+#define CDX_DETOUR_OFFLINE 1
+#define CDX_DETOUR_REDIRECT 2
+static bool detour_ready, cdx_detour_strand;
+static bool cdx_ft_detour_ready(void) { return detour_ready; }
+struct cdx_detour_flow { __be32 saddr, daddr; __be16 sport, dport; int ifindex; };
+static struct cdx_detour_flow *detour_records[4];
+static unsigned detour_flows;
+/* The stage of each entry inserted, in order. */
+static u8 detour_stages[8];
+static unsigned detour_inserts;
+struct cdx_ft_rule;
+static int cdx_detour_flow_add(const struct cdx_ft_rule *rule, struct cdx_detour_flow **out);
+static void cdx_detour_flow_del(struct cdx_detour_flow *flow);
 static struct itf in_itf = {129, 1}, out_itf = {129, 2};
 typedef struct { struct itf *itf; unsigned flags; } OnifDesc, *POnifDesc;
 static OnifDesc in_onif = {&in_itf, ENTRY_VALID}, out_onif = {&out_itf, ENTRY_VALID};
@@ -444,6 +464,7 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     assert(!(ct->status & CONNTRACK_SEC) == !(expected_sa || expected_in_sa));
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));
     if (fail_insert || (fail_insert_after && !--fail_insert_after)) return -1;
+    if (detour_inserts < sizeof(detour_stages)) detour_stages[detour_inserts++] = ct->detour;
     ct->ct = kzalloc(sizeof(*ct->ct), GFP_KERNEL); assert(ct->ct);
     if (key) { assert(!older); older = key; }
     key = calloc(1,sizeof(*key)); assert(key); key->linked = true;
@@ -818,6 +839,42 @@ static void dpa_fwd_cgr_follow_link(struct net_device *dev) { follow_link_calls+
 static unsigned mtu_changes;
 static struct net_device *mtu_changed;
 static void cdx_htb_mtu_changed(struct net_device *dev) { mtu_changes++; mtu_changed = dev; }
+static int cdx_detour_flow_add(const struct cdx_ft_rule *rule, struct cdx_detour_flow **out)
+{
+    unsigned i, slot = 4;
+
+    lockdep_assert_held(&cdx_info->ctrl.mutex);
+    assert(rule->detour && rule->family == AF_INET);
+    for (i = 0; i < 4; i++) {
+        struct cdx_detour_flow *f = detour_records[i];
+
+        if (!f) { if (slot == 4) slot = i; continue; }
+        if (f->saddr == rule->src.ip && f->daddr == rule->dst.ip &&
+            f->sport == rule->sport && f->dport == rule->dport)
+            return -EBUSY;
+    }
+    assert(slot < 4);
+    detour_records[slot] = calloc(1, sizeof(**out));
+    assert(detour_records[slot]);
+    *detour_records[slot] = (struct cdx_detour_flow){ rule->src.ip, rule->dst.ip,
+                                                      rule->sport, rule->dport, rule->in->ifindex };
+    detour_flows++;
+    *out = detour_records[slot];
+    return 0;
+}
+static void cdx_detour_flow_del(struct cdx_detour_flow *flow)
+{
+    unsigned i;
+
+    if (!flow)
+        return;
+    for (i = 0; i < 4 && detour_records[i] != flow; i++)
+        ;
+    assert(i < 4 && detour_flows);
+    free(flow);
+    detour_records[i] = NULL;
+    detour_flows--;
+}
 #include "hardware_production.inc"
 #include "backend_production.inc"
 
@@ -1215,9 +1272,11 @@ static void test_l2_pair(struct net_device *in, struct net_device *out)
 static void test_backend(void)
 {
     struct net_device in = { .name="in", .net=&init_net, .type=ARPHRD_ETHER,
-        .addr_len=ETH_ALEN, .reg_state=NETREG_REGISTERED, .mtu=1500, .running=true, .carrier=true, .dev_addr={2}, .perm_addr={2} };
+        .addr_len=ETH_ALEN, .reg_state=NETREG_REGISTERED, .mtu=1500, .running=true, .carrier=true, .dev_addr={2}, .perm_addr={2},
+        .ifindex=3 };
     struct net_device out = in;
     strcpy(out.name, "out");
+    out.ifindex = 4;
     in_iface.eth_info.net_dev = &in; out_iface.eth_info.net_dev = &out;
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .family=AF_INET, .src.ip=htonl(0xc0000201), .dst.ip=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
@@ -1322,6 +1381,64 @@ static void test_backend(void)
     out.dev_addr[5]=1; assert(cdx_ft_port_supported(&out));
     assert(cdx_ft_add(&rule,&stats,&hw)==0 && hw); assert(cdx_ft_del(&hw)==0 && !hw);
     out.dev_addr[5]=0;
+    /* A detoured direction (cdx_detour.c): its record, then the offline
+     * port's entry, then the receive port's, which hands its frames to an
+     * entry that is there by then. Counted once, as it arrived; deleted
+     * receive entry first, its record with it; and whatever fails on the
+     * way leaves nothing behind. */
+    {
+        struct cdx_ft_hw *twin = NULL;
+        struct cdx_ft_counters counted;
+
+        rule.detour = true;
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == -EOPNOTSUPP && !hw);
+        assert(!key && !allocations && !detour_flows);
+        detour_ready = true;
+        detour_inserts = 0;
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == 0 && hw && hw->detour && !hw->flow);
+        assert(detour_inserts == 2 && detour_stages[0] == CDX_DETOUR_OFFLINE &&
+               detour_stages[1] == CDX_DETOUR_REDIRECT);
+        /* The record is the receive entry's, which sends frames to be
+         * handed back for as long as it may be linked. */
+        assert(key && older && detour_flows == 1 && hw->detour->flow &&
+               hw->detour->flow->ifindex == in.ifindex);
+        /* The offline port's entry is keyed by the tuple and that port
+         * alone, so a second direction with the tuple would be this one. */
+        assert(cdx_ft_hw_add(&rule, &stats, &twin) == -EBUSY && !twin);
+        assert(detour_inserts == 2 && detour_flows == 1);
+        cdx_ft_hw_stats(hw, &counted);
+        assert(counted.packets == 99 && counted.bytes == 12345 && counted.lastused == 321);
+        assert(cdx_ft_hw_del(&hw) == 0 && !hw && !key && !older && !allocations && !detour_flows);
+        /* The receive entry failing: the offline one and the record go. */
+        fail_insert_after = 2;
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == -EIO && !hw);
+        assert(!key && !older && !allocations && !detour_flows);
+        /* The offline one failing: the record goes. */
+        fail_insert_after = 1;
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == -EIO && !hw);
+        assert(!key && !older && !allocations && !detour_flows);
+        /* Unproven, both entries wait for their barrier, and the record with
+         * the receive entry: it may still be sending frames the offline port
+         * hands back. It goes once a barrier proves the entry gone. */
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == 0);
+        delete_result = EN_EHASH_DELETE_UNSYNCED;
+        assert(cdx_ft_hw_del(&hw) == -EAGAIN && !hw && cdx_ft_hw_pending() == 2 && detour_flows == 1);
+        delete_result = 0;
+        assert(cdx_ft_hw_retry() == 0 && !key && !older && !allocations && !detour_flows);
+        /* Stranded (the test knob): the receive entry alone, owning the
+         * record, so every frame comes back from the offline port. */
+        cdx_detour_strand = true;
+        detour_inserts = 0;
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == 0 && hw && !hw->detour && hw->flow);
+        assert(detour_inserts == 1 && detour_stages[0] == CDX_DETOUR_REDIRECT);
+        assert(key && !older && detour_flows == 1);
+        assert(cdx_ft_hw_del(&hw) == 0 && !hw && !key && !allocations && !detour_flows);
+        fail_insert_after = 1;
+        assert(cdx_ft_hw_add(&rule, &stats, &hw) == -EIO && !hw && !detour_flows && !allocations);
+        cdx_detour_strand = false;
+        rule.detour = false;
+        detour_ready = false;
+    }
     rule.src_mac[0]=1; assert(cdx_ft_add(&rule,&stats,&hw)==-EOPNOTSUPP && !hw);
     memset(rule.src_mac,0,6); assert(cdx_ft_add(&rule,&stats,&hw)==-EOPNOTSUPP && !hw);
     rule.src_mac[0]=2;

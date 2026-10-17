@@ -59,7 +59,7 @@ static int cdx_pcd_portid(const struct device_node *node, e_FmPortType type,
 	}
 
 	if (node && !of_property_read_u32(node, CDX_PCD_PORTID_PROP, &override)) {
-		/* The id is OR'd into FQID bits 16-19 through a 4-bit mask and
+		/* The id is OR'd into FQID bits 8-11 through a 4-bit mask and
 		 * compared against 9 by the soft parser; anything that does not
 		 * fit those is a board bug worth refusing. */
 		if (override > 15) {
@@ -238,7 +238,7 @@ int cdx_pcd_enumerate_ports(u8 fm_index, struct cdx_pcd_port *ports,
 	 * of the order interfaces happened to come up in. */
 	sort(ports, count, sizeof(*ports), cdx_pcd_port_cmp, NULL);
 
-	/* A duplicate id would make two ports share FQID bits 16-19 and give
+	/* A duplicate id would make two ports share FQID bits 8-11 and give
 	 * the soft parser an ambiguous $logicalportid. Cheap to check once. */
 	for (i = 0; i < (unsigned int)count; i++)
 		for (j = i + 1; j < (unsigned int)count; j++)

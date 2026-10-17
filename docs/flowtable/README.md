@@ -113,8 +113,10 @@ contract, so only packets whose transport header follows the fixed header are
 described by an admitted rule. Because the microcode fragments IPv6 as
 readily as IPv4, and its fragments of a frame received on an Ethernet port
 carry no payload, a direction of either family other than TCP and IPv4 IPsec whose
-path is smaller than what its ingress port accepts stays in software, where
-Linux fragments IPv4 and sends IPv6 its Packet Too Big
+path is smaller than what its ingress port accepts is not installed as it is:
+an IPv4 UDP one is carried through an offline port, whose fragments are whole
+([architecture.md](architecture.md#the-offline-port-detour)), and any other
+stays in software, where Linux fragments IPv4 and sends IPv6 its Packet Too Big
 ([ipv6.md](ipv6.md#packets-larger-than-the-path),
 [architecture.md](architecture.md#native-context-and-admission)). The Packet
 Too Big bound, device-MTU retirement, budget accounting, masquerade and hairpin

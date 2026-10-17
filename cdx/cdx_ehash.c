@@ -26,6 +26,7 @@
 #include "types.h"
 #include "cdx.h"
 #include "cdx_common.h"
+#include "cdx_detour.h"
 #include "list.h"
 #include "cdx_ioctl.h"
 #include "layer2.h"
@@ -1234,6 +1235,51 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed
 	return FAILURE;
 }
 
+/* The receive port's entry of a direction detoured through the offline port
+ * (cdx_detour.c). The frame is checked and counted as it arrived and handed on
+ * untouched -- its Ethernet header, tags and session too, which the offline
+ * port's parser and that port's entry for the flow read -- to the queue into
+ * the offline port. The path's MTU is carried so that the DF check sends a
+ * packet that may not be fragmented to Linux from here, with the port it
+ * arrived by, where an offline port could not say which that was; and nothing
+ * is fragmented here (FRAG_DISABLE, create_enque_hm()). */
+static int fill_detour_actions(PCtEntry entry, struct ins_entry_info *info)
+{
+	uint32_t iif_index, underlying_iif_index;
+#ifdef ENABLE_INGRESS_QOS
+	uint16_t quenum = 0;
+#endif
+
+	if (!entry->pRtEntry || !entry->pRtEntry->underlying_input_itf || !cdx_detour_fqid())
+		return FAILURE;
+	iif_index = (entry->pRtEntry->input_itf ?
+		     entry->pRtEntry->input_itf :
+		     entry->pRtEntry->underlying_input_itf)->index;
+	underlying_iif_index = entry->pRtEntry->underlying_input_itf->index;
+#ifdef ENABLE_INGRESS_QOS
+	if (entry->qosmark.iqid_valid)
+		quenum = (entry->qosmark.iqid & (INGRESS_FLOW_POLICER_QUEUES - 1));
+	if (create_preemptive_checks_hm(info, quenum))
+#else
+	if (create_preemptive_checks_hm(info))
+#endif
+		return FAILURE;
+#ifdef INCLUDE_ETHER_IFSTATS
+	if (create_eth_rx_stats_hm(info, iif_index, underlying_iif_index))
+		return FAILURE;
+#endif
+	/* The path's MTU stays as dpa_get_tx_info_by_itf() put it; what it
+	 * said of a Wi-Fi egress is the offline entry's to act on, this
+	 * enqueue being to the offline port. */
+	info->l2_info.fqid = cdx_detour_fqid();
+	info->l2_info.is_wlan_iface = 0;
+	info->l2_info.rspid = 0;
+	info->l2_info.no_tx_stats = 1;
+	info->l2_info.is_dscp_fq_map = 0;
+	info->tnl_hdr_size = 0;
+	return create_enque_hm(info);
+}
+
 /* Apply a caller-supplied VLAN stack and PPPoE session to the L2 description
  * derived from the interfaces. Only the Linux flowtable owner uses this: its
  * egress is a physical port with the encapsulation named by the flow, so
@@ -1484,6 +1530,18 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 				tbl_type);
 		goto err_ret;
 	}
+	/* The entry of a detour that does the direction's work lives in the
+	 * offline port's table, keyed with that port's id (cdx_detour.c). */
+	info->detour = entry->detour;
+	if (info->detour == CDX_DETOUR_OFFLINE) {
+		info->port_id = cdx_detour_portid();
+		info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, tbl_type);
+		if (!info->td) {
+			DPA_ERROR("%s::no offline-port table of type %d\n",
+				  __func__, tbl_type);
+			goto err_ret;
+		}
+	}
 
 	if (dpa_get_tx_info_by_itf(entry->pRtEntry, &info->l2_info,
 				&info->l3_info, &entry->qosmark, (uint32_t)entry->hash)) {
@@ -1597,7 +1655,8 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 	info->paramptr = ptr;
 	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
 			GET_PARAM_OFFSET(flags));
-	if (fill_actions(entry, info, true)) {
+	if (info->detour == CDX_DETOUR_REDIRECT ? fill_detour_actions(entry, info) :
+	    fill_actions(entry, info, true)) {
 		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
@@ -2624,6 +2683,8 @@ static int create_preemptive_checks_hm(struct ins_entry_info *info)
 	}
 	else
 #endif /* endif for SEC_PROFILE_SUPPORT */
+	/* A detoured direction is metered once, by its receive entry. */
+	if (info->detour != CDX_DETOUR_OFFLINE)
 	{
 		if((param->pp_no = cdx_get_policer_profile_id(info->fm_idx,queue_no))) {
 			param->OpMask |= PREEMPT_POLICE_PKT;
@@ -2763,6 +2824,9 @@ static int create_enque_hm(struct ins_entry_info *info)
 		else if (IS_IPV6_FLOW(entry))
 			word |= (IPSEC_DPOVRD_ENABLE|IPSEC_IPV6_ENCAPSULATION);
 	}
+	/* Nor into the offline port, which fragments it whole. */
+	if (info->detour == CDX_DETOUR_REDIRECT)
+		word |= FRAG_DISABLE;
 	word = word << 24;
 #endif
 	word |= MURAM_VIRT_TO_PHYS_ADDR(dscp_fq_map_ff_g.muram_addr);

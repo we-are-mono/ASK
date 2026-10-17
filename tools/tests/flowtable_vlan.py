@@ -248,10 +248,10 @@ async def test_device_mtu_retires(vlan_rig):
 
     Lowered below a full frame, the tagged device is a path the reverse's
     datagrams -- arriving on the WAN port, which can deliver 1500 bytes
-    whatever its MTU -- no longer fit, and the microcode would have to
-    fragment them. So the flow comes back with the forward direction alone
-    in hardware, still at the WAN port's MTU, and the reverse refused to
-    Linux, which fragments correctly.
+    whatever its MTU -- no longer fit, and the microcode has to fragment
+    them. So the flow comes back with the forward direction as it was, still
+    at the WAN port's MTU, and the reverse through the offline-port detour,
+    whose fragments are whole (A385).
     """
     r = vlan_rig
     await r.table()
@@ -278,11 +278,12 @@ async def test_device_mtu_retires(vlan_rig):
             lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
         # The flow comes back rather than staying retired: the direction
         # leaving by the WAN port as it was, the one into the tagged device
-        # refused. Installed since, so a state caught mid-retirement cannot
-        # pass for the readmitted one.
-        reduced = await settled({TARGET_WAN_IF: 1500}, since=before)
+        # through the offline-port detour (A385). Installed since, so a state
+        # caught mid-retirement cannot pass for the readmitted one.
+        reduced = await settled({TARGET_LAN_IF: 1400, TARGET_WAN_IF: 1500}, since=before)
         assert reduced["errors"] == before["errors"], reduced
-        assert reduced["rejects"] > invalidated["rejects"], (invalidated, reduced)
+        assert {f["out"]: f["detour"] for f in reduced["flows"]} == {
+            TARGET_LAN_IF: "1", TARGET_WAN_IF: "0"}, reduced
         r.record("vlan-mtu", {"before": before, "invalidated": invalidated,
                               "reduced": reduced})
     finally:

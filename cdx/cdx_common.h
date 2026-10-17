@@ -346,6 +346,9 @@ struct dpa_l3hdr_info {
 struct ins_entry_info {
 	uint32_t flags;
 	uint32_t type;
+	/* CDX_DETOUR_*: which entry of a direction's offline-port detour this
+	 * is, if any (cdx_detour.c). */
+	uint8_t detour;
 	struct dpa_l2hdr_info l2_info;
 	struct dpa_l3hdr_info l3_info;
 	uint32_t fm_idx;

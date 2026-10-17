@@ -781,9 +781,9 @@ async def test_device_retires(bridge_rig):
 
     Lowered below a full frame, the bridge is a path the reverse's datagrams
     -- arriving on the WAN port, which can deliver 1500 bytes whatever its
-    MTU -- no longer fit, and the microcode would have to fragment them. So
-    the flow comes back with the forward direction alone in hardware and the
-    reverse refused to Linux, which fragments correctly.
+    MTU -- no longer fit, and the microcode has to fragment them. So the flow
+    comes back with the reverse through the offline-port detour, whose
+    fragments are whole (A385), and the forward direction as it was.
     """
     r = bridge_rig
     await r.table()
@@ -794,9 +794,10 @@ async def test_device_retires(bridge_rig):
             lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
         # Installed since, so a state caught mid-retirement cannot pass for
         # the readmitted one.
-        reduced = await _settled(r, {TARGET_WAN_IF: 1500}, since=before)
+        reduced = await _settled(r, {TARGET_LAN_IF: 1400, TARGET_WAN_IF: 1500}, since=before)
         assert reduced["errors"] == before["errors"], reduced
-        assert reduced["rejects"] > invalidated["rejects"], (invalidated, reduced)
+        assert {f["out"]: f["detour"] for f in reduced["flows"]} == {
+            TARGET_LAN_IF: "1", TARGET_WAN_IF: "0"}, reduced
         r.record("bridge-mtu", {"before": before, "invalidated": invalidated,
                                 "reduced": reduced})
     finally:
@@ -856,7 +857,8 @@ async def test_vlan_port_mtu(bridge_rig):
         await r.wait(lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
         # Only the direction toward the station: the other one now arrives
         # on a 9000-byte MAC and is UDP into a 1500-byte path, which stays in
-        # software by design (FULL_FRAME, _topology.py).
+        # software by design (FULL_FRAME, _topology.py), the offline-port
+        # detour taking no jumbo port (A394).
         raised = await _settled(r, {TARGET_LAN_IF: port_mtu}, since=before)
         r.record("bridge-vlan-port-mtu", {"before": before, "raised": raised})
     finally:

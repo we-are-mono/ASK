@@ -24,7 +24,9 @@ Schemes are shared by ports using the same policy to fit the KeyGen limit of
 32. Each scheme selects a group in the receiving port's own CC root tree.
 Its `h_CcTree` names the first port using that policy.
 
-The shared policy serves the Ethernet ports and the Wi-Fi offline port:
+The shared policy serves the Ethernet ports, the Wi-Fi offline port and the
+detour's (`dpa-fman0-oh@4`, logical port 11; flowtable `architecture.md`, "The
+offline-port detour"):
 
 | Group | Table | Key size | Hash mask |
 | --- | --- | --- | --- |

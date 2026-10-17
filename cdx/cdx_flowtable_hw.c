@@ -16,9 +16,17 @@
 #include "cdx_flowtable_backend.h"
 #include "cdx_flowtable_hw.h"
 #include "cdx_police.h"
+#include "cdx_detour.h"
 
 struct cdx_ft_hw {
 	struct cdx_ft_hw *options;
+	/* The receive port's entry of a direction detoured through the offline
+	 * port, whose entry this owner is (cdx_detour.c). And on that receive
+	 * entry, the record by which the frames the offline port hands back
+	 * find their way to Linux: held for as long as the entry that sends
+	 * them there may be linked, and let go with it. */
+	struct cdx_ft_hw *detour;
+	struct cdx_detour_flow *flow;
 	CtEntry entry;
 	CtEntry twin;
 	RouteEntry route;
@@ -130,6 +138,7 @@ static void ft_hw_free(struct cdx_ft_hw *hw)
 {
 	unsigned int i;
 
+	cdx_detour_flow_del(hw->flow);
 	for (i = 0; i < hw->nstats; i++)
 		cdx_ft_ifstats_put(hw->stats[i]);
 	cdx_police_profile_unref(hw->policer);
@@ -192,7 +201,7 @@ static bool ft_hw_egress_onif(U8 type)
 
 static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 		  const struct cdx_ft_stats_binding *stats,
-		  struct cdx_ft_hw **result, bool options)
+		  struct cdx_ft_hw **result, bool options, u8 detour)
 {
 	POnifDesc in, out;
 	struct dpa_iface_info *in_iface, *out_iface;
@@ -303,6 +312,7 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 	ether_addr_copy(hw->route.dstmac, rule->dst_mac);
 	ether_addr_copy(hw->route.srcmac, rule->src_mac);
 	ct = &hw->entry;
+	ct->detour = detour;
 	ct->twin = &hw->twin;
 	hw->twin.twin = ct;
 	ct->pRtEntry = &hw->route;
@@ -543,14 +553,56 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		  const struct cdx_ft_stats_binding *stats,
 		  struct cdx_ft_hw **result)
 {
-	int rc = ft_hw_add_one(rule, stats, result, false);
+	int rc;
+
+	/* A detour's record first, which refuses a tuple another detoured
+	 * direction holds: the offline port's entry is keyed by the tuple and
+	 * that port alone. Then the offline port's entry, so that the receive
+	 * entry, once linked, hands its frames to an entry that is there. */
+	if (rule->detour) {
+		struct cdx_detour_flow *flow;
+
+		if (!cdx_ft_detour_ready())
+			return ask_refuse(-EOPNOTSUPP);
+		rc = cdx_detour_flow_add(rule, &flow);
+		if (rc)
+			return ask_refuse(rc);
+#ifdef CDX_DEBUG_FLOWTABLE
+		if (READ_ONCE(cdx_detour_strand)) {
+			rc = ft_hw_add_one(rule, stats, result, false, CDX_DETOUR_REDIRECT);
+			if (rc)
+				cdx_detour_flow_del(flow);
+			else
+				(*result)->flow = flow;
+			return rc;
+		}
+#endif
+		rc = ft_hw_add_one(rule, stats, result, false, CDX_DETOUR_OFFLINE);
+		if (rc) {
+			cdx_detour_flow_del(flow);
+			return rc;
+		}
+		rc = ft_hw_add_one(rule, stats, &(*result)->detour, false, CDX_DETOUR_REDIRECT);
+		if (rc) {
+			int retired;
+
+			cdx_detour_flow_del(flow);
+			retired = cdx_ft_hw_del(result);
+			if (retired && retired != -EAGAIN)
+				cdx_ft_fatal();
+			return rc;
+		}
+		(*result)->detour->flow = flow;
+		return 0;
+	}
+	rc = ft_hw_add_one(rule, stats, result, false, CDX_DETOUR_NONE);
 
 	if (rc || !rule->in_tunnel.present || rule->in_tunnel.family != AF_INET6)
 		return rc;
 	/* Linux may send an encapsulation-limit destination option. Match
 	 * its next-header byte too, so another encapsulation cannot borrow
 	 * this entry merely by starting with a destination-options header. */
-	rc = ft_hw_add_one(rule, stats, &(*result)->options, true);
+	rc = ft_hw_add_one(rule, stats, &(*result)->options, true, CDX_DETOUR_NONE);
 	if (rc) {
 		int retired = cdx_ft_hw_del(result);
 
@@ -633,6 +685,11 @@ int cdx_ft_hw_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **resul
 void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 {
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	/* A detoured direction is counted once, as it arrived. */
+	if (hw->detour) {
+		cdx_ft_hw_stats(hw->detour, stats);
+		return;
+	}
 	hw_ct_get_active(hw->entry.ct);
 	stats->packets = hw->entry.ct->pkts;
 	stats->bytes = hw->entry.ct->bytes;
@@ -694,8 +751,18 @@ static int ft_hw_del(struct cdx_ft_hw **entry, bool defer)
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	if (!hw)
 		return 0;
-	if (hw->options)
-		options_rc = ft_hw_del(&hw->options, defer);
+	/* The receive entry of a detour first: once it is gone no frame of
+	 * the direction reaches the offline port's entry for it any more. Its
+	 * record goes when it does (ft_hw_free()), kept a while after for the
+	 * frames still in the offline port's queue. */
+	if (hw->detour)
+		options_rc = ft_hw_del(&hw->detour, defer);
+	if (hw->options) {
+		int rc_options = ft_hw_del(&hw->options, defer);
+
+		if (rc_options == -EIO)
+			options_rc = -EIO;
+	}
 	ct = hw->entry.ct;
 	/* Preserve the real linked allocation to exercise fatal retirement.
 	 * Never inject a hard error after a successful destructive unlink; a

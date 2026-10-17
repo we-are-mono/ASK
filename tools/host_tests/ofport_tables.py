@@ -49,7 +49,10 @@ def offline_ports():
     devoh = (ROOT / "cdx/devoh.c").read_text()
     assigned = dict((ptype, int(number) - 1) for number, ptype in re.findall(
         r'\{"dpa-fman0-oh@(\d+)", PORT_TYPE_(\w+)\}', devoh))
-    assert set(assigned) == {"IPSEC", "WIFI"}, assigned
+    assert set(assigned) == {"IPSEC", "WIFI", "DETOUR"}, assigned
+    # The detour's port (cdx_detour.c) takes the shared policy, as Wi-Fi's
+    # does (cdx_pcd_ports.c); cdx_cfg.xml names the two the SDK's FMC set up.
+    del assigned["DETOUR"]
     cfg = ET.parse(ROOT / "config/pcd/cdx_cfg.xml").getroot()
     pcd = ET.parse(ROOT / "config/pcd/cdx_pcd.xml").getroot()
     desc = (ROOT / "cdx/cdx_pcd_desc.c").read_text()

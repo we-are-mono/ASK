@@ -38,13 +38,16 @@ async def test_pppoe_receive_identity(pppoe_rig, hardware):
         state = await r.state()
         listing = await command(r.target, r.session, "conntrack", "-L", "-f", family,
                                 "-p", "udp", "--orig-src", local, "--sport", str(sport))
-        if (state["entries"] == 1 if hardware
+        if (state["entries"] == (1 if ipv6 else 2) if hardware
                 else "[OFFLOAD]" in listing["stdout"]):
             break
     if hardware:
-        # The download alone: a UDP upload into the session's 1492 is
-        # Linux's in either family, the LAN port delivering a full frame.
-        assert state["entries"] == 1, state
+        # Both directions of IPv4, the upload into the session's 1492 through
+        # the offline-port detour, the LAN port delivering a full frame; the
+        # download alone of IPv6, whose upload is Linux's.
+        assert state["entries"] == (1 if ipv6 else 2), state
+        assert all(f["detour"] == ("1" if f["in"] == TARGET_LAN_IF else "0")
+                   for f in state["flows"]), state
         cookie = next(f["cookie"] for f in state["flows"] if f["in"] == TARGET_WAN_IF)
     else:
         assert state["entries"] == state["bindings"] == 0, state

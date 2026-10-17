@@ -1407,6 +1407,10 @@ static unsigned police_lookups;
 /* cdx's `transit` parameter, on as the test image loads it; the cases that
  * need it off turn it off themselves. */
 bool cdx_ft_transit = true;
+/* The offline-port detour (cdx_detour.c): down, as on a board without its
+ * port, except in the cases about it. */
+static bool detour_up;
+bool cdx_ft_detour_ready(void) { return detour_up; }
 static u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
 {
     /* A filter matches on the finished tuple, so this has to be asked last --
@@ -2126,6 +2130,34 @@ static void test_ipv6(void)
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == 9000);
         out.mtu = 1500;
     }
+    /* With the offline-port detour up (cdx_detour.c), an IPv4 UDP direction
+     * into the smaller path from a standard port takes it, its port
+     * fragmenting what must be, and it is the only one that does: IPv6 and a
+     * jumbo port's stay refused, TCP and a direction through an SA are
+     * carried as they were, and one whose path fits needs no detour. */
+    detour_up = true;
+    for (unsigned v6 = 0; v6 < 2; v6++) {
+        void (*family)(void) = v6 ? fixture6 : fixture;
+
+        family(); cls.nf_mtu = 1492;
+        assert(v6 ? ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP :
+               ft_parse(&binding, &cls, &decoded, &next_hop) == 0 &&
+               decoded.detour && decoded.mtu == 1492);
+        /* Not from a jumbo port, whose frames come in several buffers: a
+         * flood of them through the offline port starves the FMan (A394). */
+        family(); in.mtu = 9000;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        assert(ft_mtu_refused(&cls, binding.dev));
+        family(); tcp_flow(); cls.nf_mtu = 1492;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && !decoded.detour);
+        family(); cls.nf_mtu = 1492; xfrm_policies = true; ipsec_sa = 7;
+        assert(v6 ? ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP :
+               ft_parse(&binding, &cls, &decoded, &next_hop) == 0 &&
+               !decoded.detour && decoded.sa_handle);
+        family();
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && !decoded.detour);
+    }
+    detour_up = false;
     /* The neighbour must be discovered in the IPv6 table. */
     V6_REJECT(neighbour.tbl = &arp_tbl);
 #undef V6_REJECT
@@ -4417,6 +4449,22 @@ static void test_tunnel(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     sit_in_fixture(); tcp_flow(); cls.nf_mtu = 1479;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    /* Nor does the detour take an IPv4 UDP direction into a tunnel smaller
+     * than what arrives: what its offline port would fragment is the outer
+     * packet (ft_detours()), and the refusal is certain before RTNL too. */
+    detour_up = true;
+    vlan_fixture();
+    tunnel_devices();
+    route.dst.dev = &ip6tnl;
+    cls.nf_mtu = ip6tnl.mtu;
+    tnl6_hop(&egress_tunnel, out.ifindex);
+    tunnel_ethernet_dest(&ip6tnl);
+    outer_neighbour(&out, AF_INET6);
+    assert(ft_mtu_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    tcp_flow();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && !decoded.detour);
+    detour_up = false;
 
     /* 4o6 egress: the other mode, the other family, and a flow label and hop
      * limit the IPv4 header has nowhere to put. */
@@ -6954,7 +7002,27 @@ static void test_mtu_before_admission(void)
     assert(ft_count == 1 && ft_find(&binding, download) && !ft_find(&binding, download + 1));
     /* The refusal is the one ft_parse() makes. */
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* With the offline-port detour up the upload is not refused here: it
+     * goes through RTNL to admission, which carries it through the detour
+     * (cdx_detour.c), the download in its session as before. */
+    detour_up = true;
+    trylocks = rtnl_trylocks;
+    assert(!ft_mtu_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.detour &&
+           decoded.mtu == ppp.mtu && decoded.out_session.present);
+    cls.cookie = download + 1;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    assert(rtnl_trylocks == trylocks + 1 && ft_count == 2);
+    assert(ft_find(&binding, download + 1)->rule.detour && !ft_find(&binding, download)->rule.detour);
     remove_all();
+    /* Not a download from the session into a smaller LAN path, though: the
+     * offline port does not classify a session frame to its entry
+     * (ft_detours()), so it is refused as before, before RTNL and by the
+     * walk alike. */
+    pppoe_in_fixture(); cls.nf_mtu = 1400;
+    assert(ft_mtu_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    detour_up = false;
 
     /* What is not certain goes to admission, which decides as before. TCP
      * is carried into the smaller path. */
@@ -7004,7 +7072,9 @@ static void test_mtu_before_admission(void)
      * 1500-byte LAN port into the 1492-byte path is refused before RTNL and
      * never counted busy, while a TCP one goes through RTNL to admission,
      * which carries it. One through an SA goes to admission too, since an SA
-     * could exempt it -- and for IPv6 none does, so admission refuses it. */
+     * could exempt it -- and for IPv6 none does, so admission refuses it.
+     * The same with the detour up, which takes no IPv6. */
+    detour_up = true;
     for (unsigned kind = 0; kind < 3; kind++) {
         fixture6(); cls.command = FLOW_CLS_REPLACE; cls.nf_mtu = 1492;
         if (kind == 1) tcp_flow();
@@ -7024,6 +7094,7 @@ static void test_mtu_before_admission(void)
         assert(rtnl_trylocks == trylocks + 1 && ft_count == (kind == 1));
         remove_all();
     }
+    detour_up = false;
 }
 
 /* The early refusal never refuses what admission would admit: every ingress
@@ -7031,7 +7102,7 @@ static void test_mtu_before_admission(void)
  * policy or an SA, across ingress MTUs, a standard and a jumbo port beneath
  * them, and paths either side of each bound. And where only the MTU can
  * decide, it refuses exactly what admission refuses. */
-static void test_mtu_refusal_sound(void)
+static void mtu_refusal_sound(void)
 {
     enum { PLAIN, SESSION, TUNNEL, SESSION_TUNNEL, TAG, BRIDGE,
            PLAIN6, SESSION6, SESSION_TUNNEL6, TUNNEL6, SHAPES };
@@ -7125,6 +7196,16 @@ static void test_mtu_refusal_sound(void)
     assert(refused && exact && exact_admitted && exact_admitted < exact);
     xfrm_policies = false;
     ipsec_sa = ipsec_in_sa = 0;
+}
+
+/* With the offline-port detour down, and up: an IPv4 UDP direction it could
+ * take is then left to admission, whose walk decides. */
+static void test_mtu_refusal_sound(void)
+{
+    mtu_refusal_sound();
+    detour_up = true;
+    mtu_refusal_sound();
+    detour_up = false;
 }
 
 /* What a direction is handed is what its port's MAC takes, not what the

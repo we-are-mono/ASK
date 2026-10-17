@@ -152,6 +152,19 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A394 — UDP from a jumbo LAN port into a standard path stays in software.** The A385 detour takes it at a low
+  rate, whole (7 fragments per 9000-byte datagram, and its hand-back), but a line-rate flood of 9000-byte frames
+  through the offline port let 1.2% through (~1,660/s) and timed out the FMan host-command channel ("HC confirmation
+  timed out; board reset required"), leaving a failed barrier and three quarantined entries. 1500-byte floods do
+  not (530k/s). `ft_detours()` therefore takes no port above 1500. Suspects: the offline port's FIFO (0x3200) and
+  DMA/task share against frames fetched whole from several buffers; compare the IPsec port's jumbo path.
+
+- [ ] **A393 — a download from a PPPoE session into a LAN path below the session's MTU stays in software.** The A385
+  detour takes no session ingress: its offline port (logical port 11) handed every such frame back when one was tried
+  (`detour_delivered` 64 of 64). Why is not established; the suspect is the soft parser's session path on that port
+  (`cdx_sp.xml` pppoeschema, the PPPoE relay table at `$ccbase + 0x30`). Rare -- a LAN path below 1492 -- and correct
+  in software (`test_download_into_smaller_lan_path`). Fix the classification, then drop `ft_detours()`'s exclusion.
+
 - [x] **A392 — the transit miss chain costs a bridged pair's 64-byte frames 13-18% (2.06-2.17 vs 2.50 Mpps).** cdx's
   `transit` parameter, off by default, restores 1.0.7's chain; the test image turns it on
   (_:/^flowtable: carry transit tunnels from PPPoE sessions, behind a switch_).
@@ -180,13 +193,8 @@ result independently of those temporary files.
   (patch 174), the adapter keys them on address pair and protocol, and tunnel frames' TCP/UDP misses reach that key
   (_:/^flowtable: carry transit ESP and IP tunnels_).
 
-- [ ] **A385 — the microcode's fragments of a frame received on an Ethernet port carry an all-zero payload.** A202
-  keeps every UDP direction into a smaller path in software because of it -- above all the upload into every PPPoE
-  session (1492 under a 1500 LAN), which 1.0.7 forwarded in hardware and, for a datagram over 1492 without DF,
-  corrupted. QUIC sets DF and is handed to Linux when oversized either way. The software rate of that upload could not
-  be measured on the rig's debug kernel (KASAN, lockdep, kmemleak: ~0.11 Gbit/s on one core); measure it on a
-  production image. Next: an NXP case on the fragmenter; a session at 1500 over a 1508-byte Ethernet (RFC 4638) avoids
-  it where the ISP supports one.
+- [x] **A385 — UDP into a smaller path stayed in software: Rx-port microcode fragments carry zero payloads.** IPv4 UDP
+  detours through offline port oh@4, whose fragments are whole (_:/^flowtable: carry UDP into a smaller path through an offline port_).
 
 - [x] **A384 — a bridge whose port is a VLAN device (`br-lan` over `eth0.10`) kept every flow and station pair through it
   in software; 1.0.7 offloaded them.** The walk finds the bridge's port from below and descends from it, the

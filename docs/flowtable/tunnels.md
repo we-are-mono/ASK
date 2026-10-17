@@ -243,7 +243,8 @@ device's MTU, so the hardware does too (A340). The full-MTU case below is the pr
 the tunnel MTU is carried in hardware rather than excepted.
 
 An egress direction of either mode other than TCP stays in software from an
-Ethernet LAN, whatever MTU the LAN advertises: the port receives a full frame,
+Ethernet LAN, whatever MTU the LAN advertises, the offline-port detour that
+carries IPv4 UDP into a smaller path taking no tunnel: the port receives a full frame,
 more than the tunnel carries, and the microcode would fragment the outer packet
 of an oversized one -- for 6o4 with DF clear, since the insert fills that field
 itself -- and its fragments of a received frame carry no payload, so the

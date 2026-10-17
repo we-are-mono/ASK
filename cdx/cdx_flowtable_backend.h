@@ -180,6 +180,9 @@ struct cdx_ft_rule {
 	u8 src_mac[ETH_ALEN];
 	u8 dst_mac[ETH_ALEN];
 	u16 mtu;
+	/* A385: carried through the offline-port detour (cdx_detour.c), its
+	 * path being smaller than what its ingress delivers. */
+	bool detour;
 	/* Adapter state: an IPv6 direction whose path MTU is its egress
 	 * device's IPv6 MTU, the route's own not being locked. */
 	bool mtu_follows_dev;

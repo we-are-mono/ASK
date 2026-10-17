@@ -1,8 +1,11 @@
 """Re-admit current MTUs through an unchanged table and established TCP socket,
-and leave to Linux every IPv4 direction the microcode would have to fragment."""
+and carry every IPv4 UDP direction the microcode would have to fragment through
+the offline-port detour, whose fragments are whole (A385)."""
 from __future__ import annotations
 
-from _flowtable_mtu import SMALL_PATH, carried, current_mtus, fragmenter, linux_fragments, table_identity, udp_size, udp_warm
+from _flowtable_mtu import (SMALL_PATH, carried, current_mtus, detour_df, detour_fragments,
+                            detour_handback, detour_overload, detour_ttl, fragmenter,
+                            table_identity, udp_size, udp_warm)
 
 import asyncio
 import json
@@ -39,9 +42,9 @@ async def test_recovery(connections):
             current_mtus(initial, mtus)
             # Exercise decrease and increase on each side. No conntrack flush,
             # flowtable recreation, adapter reload or socket reopen is allowed.
-            # While a port is below a full frame, the UDP direction leaving by
-            # it stays in Linux -- the other port can still deliver 1500 bytes
-            # -- and the other three directions come back at the new MTUs.
+            # All four directions come back at the new MTUs; while a port is
+            # below a full frame, the UDP one leaving by it -- the other port
+            # can still deliver 1500 bytes -- through the detour.
             for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
                 for mtu in (1400, original[dev]):
                     before, tx_before = await r.state(), await software_tx(r)
@@ -84,15 +87,14 @@ async def test_recovery(connections):
                                       "echo_pmtu_discover": echo_pmtu})
         echo_socket.setsockopt(socket.SOL_IP, pmtu_option, 3)  # IP_PMTUDISC_PROBE
         # Below a full frame on the WAN port, the upload's path no longer
-        # carries what the LAN port can deliver, so Linux keeps that direction:
-        # a datagram exactly at the new MTU crosses it in software, one byte
-        # more with DF gets Linux's own Fragmentation Needed, and the download
-        # stays in hardware throughout.
-        lowered = await r.state()
+        # carries what the LAN port can deliver, so it takes the detour: a
+        # datagram exactly at the new MTU crosses it in hardware, one byte
+        # more with DF gets Linux's own Fragmentation Needed, handed over by
+        # the receive entry, and the download stays as it is throughout.
         await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF, "mtu", "1400")
         mtus[TARGET_WAN_IF] = 1400
-        refused = await udp_warm(r, sport, mtus)
-        assert refused["rejects"] > lowered["rejects"], (lowered, refused)
+        detoured = await udp_warm(r, sport, mtus)
+        assert [f["detour"] for f in sorted(detoured["flows"], key=lambda f: f["in"])] == ["1", "0"], detoured
         await udp_size(r, sport, 1372, "mtu-exact-boundary", mtus)
         probe = b"ASK-mtu-boundary".ljust(1373, b".")
         script = f'''
@@ -132,36 +134,79 @@ print(json.dumps({{'type': answer[ICMP].type, 'code': answer[ICMP].code, 'mtu': 
 @pytest.mark.rfc("791")
 async def test_fragments_non_df_ipv4(rig):
     """An IPv4 datagram with DF clear that is larger than its path is
-    fragmented by Linux, because the direction that would need the microcode
-    to fragment it is never installed.
+    fragmented in hardware, whole, through the offline-port detour (A385).
 
     The microcode fragments a non-DF IPv4 packet that exceeds its entry's MTU,
     and for a frame an Ethernet port received every payload byte of every
-    fragment it builds is zero. So a UDP direction whose path is smaller than
-    the largest frame its ingress port can deliver stays in Linux. Here the
-    host route to the WAN endpoint is lowered to 1200 for the test: the
-    LAN-to-WAN direction is refused, while the reverse -- arriving on the WAN
-    port and leaving by the LAN port at its full MTU -- is still installed.
+    fragment it builds is zero; of a frame an offline port took they are
+    whole. So a UDP direction whose path is smaller than the largest frame its
+    ingress port can deliver is installed in two entries: the LAN port's
+    hands each frame untouched to the offline port, whose entry does the
+    direction's work, fragmenting included. Here the host route to the WAN
+    endpoint is lowered to 1200 for the test: the LAN-to-WAN direction takes
+    the detour, while the reverse -- arriving on the WAN port and leaving by
+    the LAN port at its full MTU -- is installed as it always was.
 
     The LAN sends 1250-byte payloads at its interface MTU with DF clear --
     whatever path MTU it learned from earlier tests -- and the WAN endpoint
     receives without answering. Every packet must leave the WAN port as exactly
     two fragments within 1200 bytes that carry the datagram's own bytes, the
-    endpoint must reassemble each exactly once, and the microcode's fragmenter
-    must count nothing. TCP into the same path stays in hardware, which
-    test_tcp_into_smaller_path proves."""
+    endpoint must reassemble each exactly once, the offline port's fragmenter
+    must count every one, and Linux must send none of them. One with DF set is
+    Linux's to answer (test_df_into_detour); TCP into the same path stays in
+    hardware as it is, which test_tcp_into_smaller_path proves."""
     r = rig
     if (await r.state())["observe"]:
-        pytest.skip("the refusal is a hardware admission decision")
+        pytest.skip("the detour is a hardware admission decision")
     route = [WAN_IP + "/32", "dev", TARGET_WAN_IF]
     await command(r.target, r.session, "ip", "route", "replace", *route, "mtu", str(SMALL_PATH))
     try:
-        await linux_fragments(r)
+        await detour_fragments(r)
     finally:
         # Back to the fixture's route, which carries no MTU of its own. Never
         # checked here: a failure above is the one worth reporting, and the
         # fixture removes the route either way.
         await command(r.target, r.session, "ip", "route", "replace", *route, check=False)
+
+
+async def _detour_case(r, case):
+    if (await r.state())["observe"]:
+        pytest.skip("the detour is a hardware admission decision")
+    route = [WAN_IP + "/32", "dev", TARGET_WAN_IF]
+    await command(r.target, r.session, "ip", "route", "replace", *route, "mtu", str(SMALL_PATH))
+    try:
+        await case(r)
+    finally:
+        await command(r.target, r.session, "ip", "route", "replace", *route, check=False)
+
+
+@pytest.mark.rfc("1191")
+async def test_df_into_detour(rig):
+    """A DF datagram larger than a detoured direction's path gets Linux's
+    Fragmentation Needed, with the path's MTU, and goes no further; one that
+    fits is carried whole by the hardware (detour_df())."""
+    await _detour_case(rig, detour_df)
+
+
+@pytest.mark.rfc("792")
+async def test_ttl_expires_through_detour(rig):
+    """A datagram whose TTL runs out on the DUT gets Linux's Time Exceeded on
+    a detoured direction too, small or to be fragmented, and goes no further
+    (detour_ttl())."""
+    await _detour_case(rig, detour_ttl)
+
+
+async def test_detour_hands_back(rig):
+    """What the offline port does not forward reaches Linux on the port the
+    frame arrived by, and Linux forwards it (detour_handback())."""
+    await _detour_case(rig, detour_handback)
+
+
+async def test_detour_under_overload(rig):
+    """Offered more than its offline port forwards, a detoured direction loses
+    the excess at the port's queue and no buffer with it, and carries the rest
+    whole (detour_overload())."""
+    await _detour_case(rig, detour_overload)
 
 
 @pytest.mark.parametrize("rig", ["tcp"], indirect=True)

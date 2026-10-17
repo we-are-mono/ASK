@@ -46,6 +46,7 @@
 #include "control_ipsec.h"
 #include "dpa_control_mc.h"
 #include "dpa_ipsec.h"
+#include "cdx_detour.h"
 
 #ifdef CDX_DEBUG_KEY_ZEROING
 /* H2 regression tripwire — see cdx_dpa_ipsec.c for design rationale.
@@ -470,6 +471,9 @@ static int __init cdx_module_init(void)
 	}
 
 #endif
+	/* The offline-port detour for directions into a smaller path. Not
+	 * fatal either: without it they stay in software (cdx_detour.c). */
+	cdx_detour_init();
 	return 0;
 
 exit:

@@ -79,6 +79,9 @@ typedef struct _tCtEntry {
 	U8 sec_expansion;
 
 	U8 fftype;
+	/* CDX_DETOUR_*: the entry of an offline-port detour this one is, for
+	 * a direction whose path is smaller than its ingress delivers. */
+	U8 detour;
 
 	struct _tCtEntry *twin;
 	struct hw_ct *ct;       /** pointer to the hardware conntrack */

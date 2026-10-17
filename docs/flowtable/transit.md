@@ -28,7 +28,9 @@ session, or into or out of one of the router's own SAs, whose descriptors are
 filled for the TCP and UDP tables alone; those stay in the software flowtable.
 One received in a session is carried, bound to the session's ID (below). Every
 other rule a routed flow meets applies unchanged, the MTU one among them: a
-direction into a narrower path stays in software, as a UDP one does (A385).
+direction into a narrower path stays in software, as an IPv6 UDP one does; the
+offline-port detour that carries IPv4 UDP there (A385) takes no port-less
+protocol.
 
 **The hardware.** Each direction goes into the routed three-tuple tables,
 keyed on the address pair and protocol (`IPV4_MULTICAST_TABLE` and

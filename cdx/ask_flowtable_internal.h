@@ -61,6 +61,7 @@
 #include <net/cfg80211.h>
 #include <dpaa_eth_common.h>
 #include "cdx_flowtable_backend.h"
+#include "cdx_detour.h"
 #include "cdx_mcast_backend.h"
 #include "cdx_flowtable.h"
 #include "cdx_ipsec_backend.h"

@@ -168,19 +168,28 @@ completed cleanly, so the peer parsed every frame the microcode emitted. A
 wrong protocol id is a header the peer discards, which would have shown as loss
 rather than as a rate.
 
-UDP of either family from an Ethernet LAN into the session stays in software,
-whatever MTU the LAN has or advertises: a port receives at least full frames,
-and the microcode would fragment the excess where Linux fragments IPv4 or
-answers IPv6 with Packet Too Big, its fragments of a received frame carrying no
-payload ([architecture.md](architecture.md#native-context-and-admission),
-[ipv6.md](ipv6.md#packets-larger-than-the-path)). TCP is carried, its MSS
-clamped by the uplink, and so is the direction out of the session. A session
-negotiated at 1500 over a 1508-byte Ethernet (RFC 4638) is no smaller than the
-LAN, so its UDP stays in hardware too. Linux offers such a flow again about once
-a second while its upload forwards in software. With no IPsec policy configured
-both bounds refuse that offer before taking RTNL, and the installed download
-direction answers its own offer from its entry, so a partially offloaded flow
-costs no admission lock
+An IPv4 UDP upload from an Ethernet LAN into the session is carried in
+hardware through the offline-port detour (A385): a port receives at least full
+frames, more than the session's 1492, and the microcode's fragments of a frame
+the port received carry no payload, so the LAN port's entry hands each frame
+untouched to the detour's offline port, whose entry strips, translates, inserts
+the session header and fragments, whole, what exceeds the session. A DF one
+that does not fit goes to Linux from the LAN port for its Fragmentation Needed.
+The fragments each carry a session header of their own, its length theirs
+([architecture.md](architecture.md#the-offline-port-detour)). IPv6 UDP into the
+session stays in software, where Linux answers it with Packet Too Big
+([ipv6.md](ipv6.md#packets-larger-than-the-path)). TCP is carried as it is, its
+MSS clamped by the uplink, and so is the direction out of the session. A
+session negotiated at 1500 over a 1508-byte Ethernet (RFC 4638) is no smaller
+than the LAN, so its UDP needs no detour. The detour takes no direction out of
+the session, whose frames the offline port hands back rather than classify to
+its entry (A393): a download into a LAN path below the session's MTU stays in
+software. Linux
+offers an IPv6 flow again about
+once a second while its upload forwards in software. With no IPsec policy
+configured both bounds refuse that offer before taking RTNL, and the installed
+download direction answers its own offer from its entry, so a partially
+offloaded flow costs no admission lock
 ([architecture.md](architecture.md#native-context-and-admission)).
 
 ## Receive identity

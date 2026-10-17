@@ -60,6 +60,7 @@ static struct oh_port_type ohport_assign[] =
 {
 	{"dpa-fman0-oh@3", PORT_TYPE_WIFI},
 	{"dpa-fman0-oh@2", PORT_TYPE_IPSEC},
+	{"dpa-fman0-oh@4", PORT_TYPE_DETOUR},
 };
 #define MAX_OH_PORT_ASSIGN	(sizeof(ohport_assign) / sizeof(struct oh_port_type))
 

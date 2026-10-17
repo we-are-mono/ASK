@@ -26,26 +26,29 @@ The bench side that pre-exists is used, never built: the orchestrator's
 `wan3900` device and the LAN VM's route to the inner address are standing
 state, so this file creates neither and removes neither.
 
-An IPv4 UDP upload into the session stays in Linux, which is the shipping
-behaviour rather than a bench limitation. It arrives on the LAN port, which can
-deliver a full 1500-byte frame whatever MTU the port is given, and the session
-carries 1492: the microcode would have to fragment it, and the fragments it
-builds from a frame an Ethernet port received carry no payload. So the UDP
-cases assert that refusal and prove the download -- the strip -- in hardware,
-and every property of the upload -- the insert, the session MTU it describes,
-the translation in front of it, the LAN tag it pops -- is proved on TCP, which
-sets DF and is never the microcode's to fragment.
+An IPv4 UDP upload into the session takes the offline-port detour (A385). It
+arrives on the LAN port, which can deliver a full 1500-byte frame whatever MTU
+the port is given, and the session carries 1492: the microcode has to fragment
+it, and the fragments it builds from a frame an Ethernet port received carry no
+payload, where those of a frame an offline port took are whole. So the LAN
+port's entry hands each frame to the offline port, whose entry for the flow
+does the upload's work -- the insert, the translation in front of it, the LAN
+tag it pops, the fragmenting -- and the UDP cases prove both directions in
+hardware, the upload's counted as it arrived. An IPv6 UDP upload stays in
+Linux, as no router fragments IPv6. TCP, which sets DF and is never the
+microcode's to fragment, is carried as it is.
 """
 from __future__ import annotations
 
 from _flowtable_pppoe import QOS_COUNT, QOS_RATE_MBIT, QOS_VOICE_CQ, QOS_VOICE_PRIO
 
-from _flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6, INNER_REMOTE, INNER_REMOTE6, LAN_VID, LCP_ECHO_INTERVAL, NAT_TABLE, SERVER_IF, PORT_QOS_BULK, PORT_QOS_VOICE, PPP_RX_OVERHEAD, QOS_TABLE, SESSION_MTU, SNAT_ADDR, SPORT6, SourceEcho, UNTAGGED_COUNT, UNTAGGED_DPORT, UNTAGGED_SPORT, WAN_ENDPOINT, WAN_VID, _assert_carried, _assert_session, _assert_undisturbed, _both_directions, _dial, _direction, _download_only, _established, _exchange6, _hangup, _offload_table6, _ppp_link, _qos_bulk, _qos_bulk_stop, _session_halves, _session_identity, _session_row, _session_text, _snat_table, _tcp_carried, _untagged_directions, _untagged_path, _untagged_window, _wait_reachable)
+from _flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6, INNER_REMOTE, INNER_REMOTE6, LAN_VID, LCP_ECHO_INTERVAL, NAT_TABLE, SERVER_IF, PORT_QOS_BULK, PORT_QOS_VOICE, PPP_RX_OVERHEAD, PPP_TX_OVERHEAD, QOS_TABLE, SESSION_MTU, SNAT_ADDR, SPORT6, SourceEcho, UNTAGGED_COUNT, UNTAGGED_DPORT, UNTAGGED_SPORT, WAN_ENDPOINT, WAN_VID, _assert_carried, _assert_session, _assert_undisturbed, _both_directions, _dial, _direction, _established, _exchange6, _hangup, _offload_table6, _ppp_link, _qos_bulk, _qos_bulk_stop, _session_halves, _session_identity, _session_row, _session_text, _snat_table, _tcp_carried, _untagged_directions, _udp_directions, _untagged_path, _untagged_window, _wait_reachable)
 
 import asyncio
 import json
 import math
 import socket
+import struct
 import subprocess
 import time
 
@@ -68,19 +71,23 @@ async def test_routed(pppoe_rig):
     """A session on the WAN side and a bare LAN, routed, with no translation.
 
     The session id and the concentrator the adapter recorded have to be the
-    ones the kernel negotiated, on the direction that strips the header, and
-    on neither of the LAN-side halves. The UDP upload is Linux's; the
-    direction that inserts the header is proved by test_tcp.
+    ones the kernel negotiated, on the direction that strips the header and on
+    the one that inserts it, and on neither of the LAN-side halves. The upload
+    takes the offline-port detour, its path the session's.
     """
     r = pppoe_rig
     flows, delta = await _established(r)
+    forward = _direction(flows, r.lan_ip, INNER_LOCAL)
     reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
-    _assert_session(r, None, reverse)
+    _assert_session(r, forward, reverse)
     # Nothing on the LAN side is encapsulated, which is what makes the session
     # assertions above about the session rather than about the path.
     assert reverse["out_vlan"] == "-" and reverse["out_br"] == "-", reverse
-    # The download leaves by the LAN port, whose full MTU it carries.
-    assert int(reverse["mtu"]) == 1500, reverse
+    assert forward["in_vlan"] == "-" and forward["in_br"] == "-", forward
+    # The download leaves by the LAN port, whose full MTU it carries; the
+    # upload by the session, whose MTU it describes, through the detour.
+    assert int(reverse["mtu"]) == 1500 and reverse["detour"] == "0", reverse
+    assert int(forward["mtu"]) == SESSION_MTU and forward["detour"] == "1", forward
     assert all(d == 64 for d in delta.values()), delta
     r.record("pppoe-routed", {"flows": flows, "delta": delta,
                               "session": _session_text(r.session_identity)})
@@ -99,10 +106,11 @@ async def test_ipv6_routed(pppoe_rig):
 
     This is the download's half of the measurement: a complete v6 exchange
     across the session, every reply stripped by the hardware. The UDP upload
-    is Linux's, as IPv4's is: the LAN port delivers a full frame and the
-    session carries 1492, and the microcode would fragment the excess where
-    Linux answers it with Packet Too Big. The insert, where the protocol id is
-    chosen, is proved by test_ipv6_tcp.
+    is Linux's: the LAN port delivers a full frame and the session carries
+    1492, and the microcode would fragment the excess where Linux answers it
+    with Packet Too Big -- the offline-port detour that carries IPv4's takes
+    no IPv6. The insert, where the protocol id is chosen, is proved by
+    test_ipv6_tcp.
 
     One routed case per protocol is the whole of it, deliberately. Nothing
     about the family reaches the session decode -- the walk, the concentrator
@@ -208,22 +216,24 @@ async def test_session_counters(pppoe_rig):
     counts, is what makes the record an operator's number rather than a
     diagnostic.
 
-    The UDP upload is Linux's, so here the download alone holds the record
-    and moves its receive half, while the device's transmit counter moves by
-    the upload Linux sent through it. The insert's half of the record is
-    counted by test_tcp.
+    Both directions hold the record: the download moves its receive half,
+    and the upload, through the offline-port detour, its transmit half -- the
+    offline port's entry does the insert and counts it there, so a detoured
+    direction's session is counted as any other's.
     """
     r = pppoe_rig
-    initial = await r.state()
     await r.table()
-    await r.exchange(count=4)
-    await _download_only(r, initial)
+    for _ in range(10):
+        await r.exchange(count=4)
+        if len((await r.state())["flows"]) == 2:
+            break
+    await _udp_directions(r)
     state = await r.state()
     row = _session_row(state, r.session_identity)
-    # Held by the one direction in hardware, and holding a record: the pool
-    # is empty only after four sessions, and this bench has one. The record is
-    # the device's, and says which device.
-    assert row["refs"] == "1", row
+    # Held by both directions, and holding a record: the pool is empty only
+    # after four sessions, and this bench has one. The record is the device's,
+    # and says which device.
+    assert row["refs"] == "2", row
     assert row["slot"] == "yes", row
     assert row["dev"] == r.ppp_if, row
     assert state["session_records"] == 1 and state["session_slots"] == 1, state
@@ -242,19 +252,19 @@ async def test_session_counters(pppoe_rig):
     after = {k: int(row[k]) for k in before}
     delta = {k: after[k] - before[k] for k in before}
     link = {k: link_after[k] - link_before[k] for k in before}
-    # Received frames are the ones the download stripped the header from; the
-    # record's transmit half counts only headers hardware inserted, and the
-    # upload inserted none.
-    assert delta["rx_packets"] == 64 and delta["tx_packets"] == delta["tx_bytes"] == 0, (before, after)
+    # Received frames are the ones the download stripped the header from;
+    # transmitted ones those the upload's offline entry inserted it into.
+    assert delta["rx_packets"] == delta["tx_packets"] == 64, (before, after)
     # The firmware's session record, measured on this bench and pinned here:
     # the strip counts the frame as it arrived less the session header alone,
-    # so the WAN tag the session runs over is still in.
-    assert delta["rx_bytes"] == 64 * (ip_len + 14 + 4), delta
-    # The device counts the payload alone, both ways -- the download folded in
-    # from the record, the upload counted by Linux as it sent it -- and its
-    # counters now include the burst restated to exactly that, plus the few
-    # frames the session itself exchanges meanwhile (LCP echoes), each at most
-    # one frame.
+    # so the WAN tag the session runs over is still in; the insert counts the
+    # frame with the Ethernet and session headers on and no tag yet.
+    assert delta["rx_bytes"] == 64 * (ip_len + PPP_RX_OVERHEAD), delta
+    assert delta["tx_bytes"] == 64 * (ip_len + PPP_TX_OVERHEAD), delta
+    # The device counts the payload alone, both ways, folded in from the
+    # record, and its counters now include the burst restated to exactly that,
+    # plus the few frames the session itself exchanges meanwhile (LCP echoes),
+    # each at most one frame.
     for half in ("rx", "tx"):
         stray = link[f"{half}_packets"] - 64
         assert 0 <= stray <= 8, (half, link)
@@ -296,9 +306,10 @@ async def test_session_record_ignores_untagged_flows(pppoe_rig):
     can be read back is checked: no record held before the admission, exactly
     one after.
 
-    The control is the session's own download: 64 frames through it still
-    move the same record by exactly 64. A record that counted nothing at all
-    would pass everything else here too.
+    The control is the session's own flow: 64 frames each way through it
+    still move the same record by exactly 64 each way, the upload's through
+    the offline-port detour. A record that counted nothing at all would pass
+    everything else here too.
     """
     r = pppoe_rig
     initial = await r.state()
@@ -313,8 +324,11 @@ async def test_session_record_ignores_untagged_flows(pppoe_rig):
         await r.nft(f"add rule inet {ft.TABLE} forward ip saddr {r.lan_ip} "
                     f"ip daddr {WAN_ENDPOINT} udp sport {UNTAGGED_SPORT} "
                     f"udp dport {UNTAGGED_DPORT} flow add @fast")
-        await r.exchange(count=4)
-        await _download_only(r, initial)
+        for _ in range(10):
+            await r.exchange(count=4)
+            if len((await r.state())["flows"]) == 2:
+                break
+        await _udp_directions(r)
         held = await r.state()
         row = _session_row(held, r.session_identity)
         assert row["slot"] == "yes" and row["dev"] == r.ppp_if, row
@@ -354,11 +368,12 @@ async def test_session_record_ignores_untagged_flows(pppoe_rig):
         assert measured["answered"] == UNTAGGED_COUNT, measured["answered"]
         moved = [int(n["packets"]) - int(o["packets"]) for o, n in zip(old, new)]
         assert moved == [UNTAGGED_COUNT, UNTAGGED_COUNT], (moved, old, new)
-        # Nothing crossed the session's download in hardware meanwhile, where
-        # it is still installed -- it can go idle and expire in the window,
-        # which retires the entry and keeps the record. So any movement below
-        # is the pointer's and not traffic's.
-        download = {f["cookie"]: int(f["packets"]) for f in before["flows"] if f["in_ppp"] != "-"}
+        # Nothing crossed the session's directions in hardware meanwhile,
+        # where they are still installed -- they can go idle and expire in the
+        # window, which retires the entries and keeps the record. So any
+        # movement below is the pointer's and not traffic's.
+        download = {f["cookie"]: int(f["packets"]) for f in before["flows"]
+                    if f["in_ppp"] != "-" or f["out_ppp"] != "-"}
         crossed = {f["cookie"]: int(f["packets"]) - download[f["cookie"]]
                    for f in after["flows"] if f["cookie"] in download}
         assert not any(crossed.values()), (crossed, before["flows"], after["flows"])
@@ -384,16 +399,16 @@ async def test_session_record_ignores_untagged_flows(pppoe_rig):
         assert row["slot"] == "yes", row
         assert after["session_records"] == after["session_slots"] == 1, after
 
-        # The control. The download may have expired over the window, so it
-        # is offered until hardware holds it again, then measured as
-        # test_session_counters measures it.
+        # The control. The session's directions may have expired over the
+        # window, so they are offered until hardware holds both again, then
+        # measured as test_session_counters measures them.
         for _ in range(10):
             await r.exchange(count=4)
             state = await r.state()
-            if any(f["in_ppp"] != "-" for f in state["flows"]):
+            if sum(f["in_ppp"] != "-" or f["out_ppp"] != "-" for f in state["flows"]) == 2:
                 break
         else:
-            pytest.fail(f"the session's download was not readmitted: {state}")
+            pytest.fail(f"the session's directions were not readmitted: {state}")
         download = _direction(state["flows"], INNER_LOCAL, r.lan_ip)
         halves = _session_halves(state, r.session_identity)
         payload = 256
@@ -407,7 +422,8 @@ async def test_session_record_ignores_untagged_flows(pppoe_rig):
         assert int(counted["packets"]) - int(download["packets"]) == 64, (download, counted)
         assert control == {"rx_packets": 64,
                            "rx_bytes": 64 * (20 + 8 + payload + PPP_RX_OVERHEAD),
-                           "tx_packets": 0, "tx_bytes": 0}, (halves, control)
+                           "tx_packets": 64,
+                           "tx_bytes": 64 * (20 + 8 + payload + PPP_TX_OVERHEAD)}, (halves, control)
     finally:
         if transport:
             transport.close()
@@ -428,9 +444,12 @@ async def test_admission_failslab(pppoe_rig, target):
     failure: that direction forwards in hardware and counts nowhere, which the
     record's references and counters both show.
 
-    The UDP upload is Linux's and refused before it asks for any record, so
-    the download is the one direction the fault can meet. Without a record
-    from the download, the device has none at all."""
+    Both directions of the UDP flow cross the session, the upload through the
+    offline-port detour, and the fault meets whichever asks first. A failed
+    hardware add, of either -- for the detour, its record of the direction
+    first -- leaves nothing held, and both come back holding the record. A
+    failed record leaves the direction that asked for it uncounted, and the
+    other creates the record and counts alone."""
     from _flowtable_failslab import (slab_fault)
     from _flowtable_service import (FAULT_DIR)
 
@@ -450,25 +469,21 @@ async def test_admission_failslab(pppoe_rig, target):
         while True:
             await r.exchange(count=4)
             state = await r.state()
-            if len(state["flows"]) == 1:
+            if len(state["flows"]) == 2:
                 break
             assert time.monotonic() < deadline, state
     finally:
         await console_command(r.console, "rm", "-rf", FAULT_DIR, check=False)
-    flows = await _download_only(r, initial)
-    _assert_session(r, None, _direction(flows, INNER_LOCAL, r.lan_ip))
+    flows = await _udp_directions(r)
+    _assert_session(r, _direction(flows, r.lan_ip, INNER_LOCAL), _direction(flows, INNER_LOCAL, r.lan_ip))
     state = await r.state()
     assert state["errors"] == initial["errors"] and state["fatal"] == state["quarantine"] == 0, state
-    assert state["installs"] - state["deletes"] == state["entries"] == 1, state
-    session = _session_text(r.session_identity)
-    if target == "dev-stats":
-        assert state["session_records"] == initial["session_records"], (initial, state)
-        assert not [s for s in state["sessions"] if s["pppoe"] == session], state["sessions"]
-        counted = None
-    else:
-        assert state["session_records"] == initial["session_records"] + 1, (initial, state)
-        counted = _session_row(state, r.session_identity)
-        assert counted["slot"] == "yes", counted
+    assert state["installs"] - state["deletes"] == state["entries"] == 2, state
+    assert state["detour_flows"] == initial["detour_flows"] + 1, (initial, state)
+    assert state["session_records"] == initial["session_records"] + 1, (initial, state)
+    counted = _session_row(state, r.session_identity)
+    assert counted["slot"] == "yes", counted
+    assert counted["refs"] == ("1" if target == "dev-stats" else "2"), counted
     before = {f["cookie"]: int(f["packets"]) for f in flows}
     installed = state
     await r.exchange(count=64)
@@ -476,42 +491,43 @@ async def test_admission_failslab(pppoe_rig, target):
     _assert_undisturbed(r, installed, state, {f["cookie"] for f in state["flows"]} == set(before))
     assert {f["cookie"]: int(f["packets"]) - before[f["cookie"]]
             for f in state["flows"]} == {c: 64 for c in before}, (before, state["flows"])
-    # The download strips the session header and the burst moved it by 64,
-    # into the record's receive half where there is a record at all.
-    if counted is None:
-        row = None
-        assert not [s for s in state["sessions"] if s["pppoe"] == session], state["sessions"]
+    # The download strips the session header and the upload inserts it, and
+    # the burst moved each by 64: into the record's receive and transmit
+    # halves, but for the one direction whose record failed, which counts
+    # nowhere.
+    row = _session_row(state, r.session_identity)
+    moved = {half: int(row[half + "_packets"]) - int(counted[half + "_packets"])
+             for half in ("rx", "tx")}
+    if target == "dev-stats":
+        assert sorted(moved.values()) == [0, 64], (counted, row)
     else:
-        row = _session_row(state, r.session_identity)
-        moved = {half: int(row[half + "_packets"]) - int(counted[half + "_packets"])
-                 for half in ("rx", "tx")}
-        assert row["refs"] == "1" and moved == {"rx": 64, "tx": 0}, (counted, row)
+        assert moved == {"rx": 64, "tx": 64}, (counted, row)
     r.record("pppoe-" + target + "-recovery", {"initial": initial, "state": state,
                                                "hit": hit, "row": row})
     # Retiring the connection returns exactly the references it took.
     await r.delete_table()
-    if row is not None:
-        row = _session_row(await r.state(), r.session_identity)
-        assert row["refs"] == "0", row
+    row = _session_row(await r.state(), r.session_identity)
+    assert row["refs"] == "0", row
 
 
 async def test_snat(pppoe_rig):
     """Source NAT across the session, proved at the far endpoint.
 
     The concentrator observing the translated source is what separates a
-    rewrite that reached the wire from one that only reached the rule. The UDP
-    upload is Linux's, so here the translation on the way out is software's
-    and the hardware's half is the download's: the reverse translation, after
-    the strip. The upload's translation in front of the insert is
-    test_snat_tcp's.
+    rewrite that reached the wire from one that only reached the rule. Both
+    halves are the hardware's: the translation on the way out, in front of the
+    insert, on the offline port's entry of the detoured upload, and the
+    reverse translation, after the strip, on the download's.
     """
     r = pppoe_rig
     await command(r.target, r.session, "nft", _snat_table(r))
     try:
         flows, delta = await _established(r)
+        forward = _direction(flows, r.lan_ip, INNER_LOCAL)
+        assert forward["new_src"].startswith(SNAT_ADDR + ":") and forward["detour"] == "1", forward
         reverse = _direction(flows, INNER_LOCAL, SNAT_ADDR)
         assert reverse["new_dst"].startswith(r.lan_ip + ":"), reverse
-        _assert_session(r, None, reverse)
+        _assert_session(r, forward, reverse)
         assert all(d == 64 for d in delta.values()), delta
         # What the wire carried, not what the rule said it would.
         assert r.echo.sources == {(SNAT_ADDR, SPORT)}, r.echo.sources
@@ -564,8 +580,9 @@ async def test_tagged_lan(pppoe_rig):
     action list of the right length for the wrong reason -- so the tags are
     asserted per direction, not as a set.
 
-    Over UDP the upload is Linux's and the mirror is what is proved; over TCP
-    both directions are.
+    Both directions are proved over either protocol, the UDP upload through
+    the offline-port detour, whose receive entry hands the frame on with the
+    LAN tag still on for the offline port's entry to pop.
     """
     r = pppoe_rig
     if r.proto == "tcp":
@@ -573,17 +590,196 @@ async def test_tagged_lan(pppoe_rig):
         delta = await _tcp_carried(r, "flowtable_pppoe_tagged_tcp")
         flows = delta["flows"]
         forward = _direction(flows, r.lan_ip, INNER_LOCAL)
-        assert forward["in_vlan"] == str(LAN_VID), forward
         _assert_carried(r, delta)
     else:
         flows, delta = await _established(r)
-        forward = None
+        forward = _direction(flows, r.lan_ip, INNER_LOCAL)
+        assert forward["detour"] == "1", forward
         assert all(d == 64 for d in delta.values()), delta
+    assert forward["in_vlan"] == str(LAN_VID), forward
     reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
     _assert_session(r, forward, reverse)
     assert reverse["out_vlan"] == str(LAN_VID), reverse
     r.record("pppoe-tagged-lan-" + r.proto, {"flows": flows, "delta": delta,
                                              "lan_vid": LAN_VID, "wan_vid": WAN_VID})
+
+
+async def _send_datagrams(r, count, size, label, echo=False):
+    """`count` datagrams of `size` bytes from the LAN VM to the session's far
+    end with DF clear, one at a time; with `echo`, each echo awaited and
+    compared, and how many came back whole."""
+    from _topology import lan_run_python
+    script = f'''
+import json, socket, struct, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_IP, 10, 4)  # IP_MTU_DISCOVER: IP_PMTUDISC_INTERFACE, DF clear
+s.settimeout(2)
+s.bind(({r.lan_ip!r}, {SPORT}))
+whole = 0
+for n in range({count}):
+    payload = struct.pack('!Q', n) + bytes(range(1, 256)) * ({size} // 255 + 1)
+    payload = payload[:{size}]
+    s.sendto(payload, ({INNER_LOCAL!r}, {ft.DPORT}))
+    if {echo!r}:
+        try:
+            data, _ = s.recvfrom(4096)
+            whole += data == payload
+        except TimeoutError:
+            pass
+    else:
+        time.sleep(0.01)
+s.close()
+print(json.dumps({{"sent": {count}, "whole": whole}}))
+'''
+    result = await lan_run_python(r.lan, script, timeout=30, label=label)
+    assert result.rc == 0, result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+async def test_upload_fragments_whole(pppoe_rig):
+    """A UDP upload larger than the session leaves in fragments that are whole,
+    each with a session header of its own.
+
+    The upload takes the offline-port detour (see the module docstring), whose
+    entry inserts the session header and fragments what exceeds the session:
+    a 1500-byte datagram from the 1500-byte LAN becomes two, each a PPPoE frame
+    whose length is its own, on the session the kernel negotiated. Captured as
+    the wire carries them, on the concentrator's side of the tag, and checked
+    there byte for byte; the concentrator's ppp device reassembles every one.
+    Linux sends none of them: the fragmenter counts each."""
+    from scapy.all import IP, PPPoE, AsyncSniffer, wrpcap
+    from _flowtable_mtu import detour_counters, fragmenter
+    import threading
+    r = pppoe_rig
+    flows, _ = await _established(r)
+    session_id, _ = r.session_identity
+    count, size = 32, SESSION_MTU - 20
+    before, counters_before = await r.state(), await fragmenter(r)
+    ready = threading.Event()
+    sniffer = AsyncSniffer(iface=SERVER_IF, filter=f"pppoes and ip src {r.lan_ip}",
+                           store=True, started_callback=ready.set)
+    sniffer.start()
+    r.echo.reply = False
+    try:
+        assert await asyncio.to_thread(ready.wait, 5), "wire capture did not start"
+        await _send_datagrams(r, count, size, "flowtable_pppoe_upload_fragments")
+        payloads = [struct.pack("!Q", n) + (bytes(range(1, 256)) * (size // 255 + 1)) for n in range(count)]
+        payloads = [p[:size] for p in payloads]
+        deadline = time.monotonic() + 5
+        while sum(r.echo.received[p] for p in payloads) < count and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
+    finally:
+        r.echo.reply = True
+        frames = sniffer.stop()
+        ft.artifact_dir().mkdir(parents=True, exist_ok=True)
+        wrpcap(str(ft.artifact_dir() / "pppoe-upload-fragments.pcap"), frames)
+    await asyncio.sleep(1.5)
+    after, counters_after = await r.state(), await fragmenter(r)
+    moved = {k: counters_after[k] - counters_before[k] for k in counters_before}
+    r.record("pppoe-upload-fragments", {"before": before, "after": after, "fragmenter": moved,
+                                        "frames": len(frames)})
+    assert [r.echo.received[p] for p in payloads] == [1] * count, [r.echo.received[p] for p in payloads]
+    assert moved["IPv4 frames received"] == count, moved
+    assert moved["Number of IPv4 fragments sent"] == 2 * count, moved
+    assert moved["Failures in allocating buffers"] == 0, moved
+    assert detour_counters(after) == detour_counters(before), (before, after)
+    groups = {}
+    for frame in frames:
+        if IP in frame:
+            groups.setdefault(frame[IP].id, []).append(frame)
+    assert len(groups) == count, sorted(groups)
+    for ident, fragments in groups.items():
+        assert len(fragments) == 2, (ident, [f.summary() for f in fragments])
+        for fragment in fragments:
+            # The session's, and a length that is this fragment's: its PPP
+            # protocol field and its IP packet.
+            assert fragment[PPPoE].sessionid == session_id, fragment.summary()
+            assert fragment[PPPoE].len == fragment[IP].len + 2, fragment.summary()
+            assert fragment[IP].len <= SESSION_MTU, fragment.summary()
+        first, last = sorted(fragments, key=lambda f: f[IP].frag)
+        datagram = b"".join(bytes(f[IP])[4 * f[IP].ihl:f[IP].len] for f in (first, last))
+        serial = struct.unpack("!Q", datagram[8:16])[0]
+        assert datagram[8:] == payloads[serial], (ident, datagram[8:40].hex())
+
+
+async def test_download_into_smaller_lan_path(pppoe_rig):
+    """A download out of the session into a LAN path lowered below the
+    session's MTU stays in software; the upload still takes the detour.
+
+    The offline port does not classify a session frame to its entry -- every
+    frame of a download through the detour came back from the port when one
+    was tried (A393) -- so it is left to Linux, which fragments it, as
+    before. 1400-byte datagrams go up whole through
+    the detour and come back fragmented by Linux, which the LAN host
+    reassembles byte for byte."""
+    from _flowtable_mtu import detour_counters, fragmenter
+    r = pppoe_rig
+    route = [f"{r.lan_ip}/32", "dev", r.dut_lan_if]
+    echo_socket = r.echo.transport.get_extra_info("socket")
+    pmtu = echo_socket.getsockopt(socket.SOL_IP, 10)
+    await command(r.target, r.session, "ip", "route", "replace", *route, "mtu", "1200")
+    # The far end's replies leave with DF clear, as the LAN's requests do, so
+    # what is too big for the LAN path is fragmented rather than refused.
+    echo_socket.setsockopt(socket.SOL_IP, 10, 0)  # IP_MTU_DISCOVER: IP_PMTUDISC_DONT
+    try:
+        initial = await r.state()
+        await r.table()
+        for _ in range(10):
+            await r.exchange(count=4)
+            state = await r.state()
+            if state["flows"] and state["rejects"] > initial["rejects"]:
+                break
+        upload, = state["flows"]
+        assert (upload["in"], int(upload["mtu"]), upload["detour"]) == (
+            TARGET_LAN_IF, SESSION_MTU, "1"), state
+        before, counters_before = await r.state(), await fragmenter(r)
+        report = await _send_datagrams(r, 32, 1400, "flowtable_pppoe_download_smaller", echo=True)
+        await asyncio.sleep(1.5)
+        after, counters_after = await r.state(), await fragmenter(r)
+        moved = {k: counters_after[k] - counters_before[k] for k in counters_before}
+        r.record("pppoe-download-smaller", {"report": report, "fragmenter": moved,
+                                            "before": before, "after": after})
+        assert report == {"sent": 32, "whole": 32}, report
+        # Nothing fragmented in hardware -- the upload fits the session -- and
+        # nothing handed back.
+        assert moved["IPv4 frames received"] == 0, moved
+        assert detour_counters(after) == detour_counters(before), (before, after)
+        assert int(after["flows"][0]["packets"]) - int(before["flows"][0]["packets"]) == 32, (before, after)
+    finally:
+        echo_socket.setsockopt(socket.SOL_IP, 10, pmtu)
+        await r.delete_table()
+        await command(r.target, r.session, "ip", "route", "del", *route, check=False)
+
+
+@pytest.mark.parametrize("pppoe_rig", ["tagged"], indirect=True)
+async def test_handback_tagged(pppoe_rig):
+    """What the offline port hands back of a tagged upload reaches Linux on
+    the LAN port, tag and all, and Linux forwards it into the session.
+
+    The upload's receive entry is installed alone (the `detour_strand` test
+    knob), so every frame of it comes back from the offline port with nothing
+    to say where it arrived; the detour's record, found through the LAN tag,
+    says, and Linux takes the frame through the tagged device as it would have
+    from the port."""
+    from _flowtable_mtu import STRAND, detour_counters
+    r = pppoe_rig
+    assert (await r.target.fs_write(r.session, STRAND, "1"))["errno"] == 0
+    r.detour_strand = True
+    try:
+        await _established(r)
+    finally:
+        r.detour_strand = False
+        assert (await r.target.fs_write(r.session, STRAND, "0"))["errno"] == 0
+    before = await r.state()
+    report = await _send_datagrams(r, 16, 1400, "flowtable_pppoe_handback", echo=True)
+    await asyncio.sleep(1)
+    after = await r.state()
+    r.record("pppoe-handback", {"report": report, "before": before, "after": after})
+    assert report == {"sent": 16, "whole": 16}, report
+    delta = {k: after[k] - before[k] for k in detour_counters(before)}
+    assert delta == {"detour_flows": 0, "detour_delivered": 16, "detour_unknown": 0,
+                     "detour_failed": 0, "detour_errors": 0}, delta
 
 
 async def test_full_mtu_datagram(pppoe_rig):
@@ -597,15 +793,18 @@ async def test_full_mtu_datagram(pppoe_rig):
     burst. 1492 is the path MTU rather than a number chosen here, which is what
     makes the reply the same size as the request.
 
-    The UDP upload is Linux's, so the hardware's datagram here is the reply,
-    stripped of all twelve; the insert's large segments are
-    test_tcp's.
+    Both datagrams are the hardware's: the request, into the session through
+    the offline-port detour, whose receive entry carries the session MTU for
+    its DF check and whose offline entry adds all twelve and fragments nothing
+    of a datagram that fits; and the reply, stripped of all twelve.
     """
     r = pppoe_rig
-    initial = await r.state()
     await r.table()
-    await r.exchange(count=4)
-    before = {f["cookie"]: int(f["packets"]) for f in await _download_only(r, initial)}
+    for _ in range(10):
+        await r.exchange(count=4)
+        if len((await r.state())["flows"]) == 2:
+            break
+    before = {f["cookie"]: int(f["packets"]) for f in await _udp_directions(r)}
     installed = await r.state()
     # The session MTU less the IPv4 and UDP headers: the largest datagram the
     # path takes without fragmenting, and exactly the one the eight bytes of
@@ -793,15 +992,18 @@ async def test_openwrt_lan(pppoe_rig):
     The download is held in hardware and leaves by the station's port through
     the bridge, and the exchange checks that every frame towards the station
     carries the bridge's address as its source, as the software path's do. The
-    UDP upload is Linux's (see the module docstring); test_openwrt_lan_tcp
-    carries both directions.
+    upload enters by that port and takes the offline-port detour (see the
+    module docstring); test_openwrt_lan_tcp carries TCP both ways.
     """
     r = pppoe_rig
     flows, delta = await _established(r)
+    forward = _direction(flows, r.lan_ip, INNER_LOCAL)
     reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
-    _assert_session(r, None, reverse)
+    _assert_session(r, forward, reverse)
     assert reverse["out_br"] == r.dut_lan_if and reverse["out_vlan"] == "-", reverse
     assert int(reverse["mtu"]) == 1500, reverse
+    assert forward["in_br"] == r.dut_lan_if and forward["detour"] == "1", forward
+    assert int(forward["mtu"]) == SESSION_MTU, forward
     assert all(d == 64 for d in delta.values()), delta
     r.record("pppoe-openwrt", {"flows": flows, "delta": delta,
                                "session": _session_text(r.session_identity)})
@@ -879,14 +1081,12 @@ async def test_bridged_wan(pppoe_rig):
 async def test_mtu_retires(pppoe_rig):
     """The ppp device carries its own MTU, and a flow through it depends on it.
 
-    Each direction carries the MTU of the interface it leaves by. The UDP
-    upload is Linux's at any session MTU below a full frame, so the direction
-    in hardware is the download, which arrives by the session and leaves by
-    the LAN port at the port's MTU. It still depends on the ppp device it
-    arrives on: lowering the session retires the connection -- one increment,
-    for the one invalidation handle both directions share -- and the download
-    comes back as it was, the upload still refused. That the session direction
-    describes the session's MTU is test_tcp's to show.
+    Each direction carries the MTU of the interface it leaves by: the
+    download, which arrives by the session, the LAN port's; the upload, through
+    the offline-port detour at any session MTU below a full frame, the
+    session's. Lowering the session retires the connection -- one increment,
+    for the one invalidation handle both directions share -- and both come
+    back, the download as it was and the upload describing the new MTU.
     """
     r = pppoe_rig
     await r.table()
@@ -906,16 +1106,17 @@ async def test_mtu_retires(pppoe_rig):
                 return state
         pytest.fail(f"flow did not settle at {expected}: {state}")
 
-    before = await settled({TARGET_LAN_IF: 1500})
+    before = await settled({TARGET_LAN_IF: 1500, TARGET_WAN_IF: SESSION_MTU})
     await command(r.target, r.session, "ip", "link", "set", r.ppp_if, "mtu", "1400")
     try:
         invalidated = await r.wait(
             lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
-        # The same shape as before, so what tells the readmitted download from
-        # the retired one is that it was installed since.
-        reduced = await settled({TARGET_LAN_IF: 1500}, since=before)
+        # Installed since, which is what tells the readmitted directions from
+        # the retired ones.
+        reduced = await settled({TARGET_LAN_IF: 1500, TARGET_WAN_IF: 1400}, since=before)
         assert reduced["errors"] == before["errors"], reduced
-        assert reduced["rejects"] > invalidated["rejects"], (invalidated, reduced)
+        assert {f["out"]: f["detour"] for f in reduced["flows"]} == {
+            TARGET_LAN_IF: "0", TARGET_WAN_IF: "1"}, reduced
         # The session survived the MTU change, so the flow came back describing
         # the same session rather than a different one.
         assert await _session_identity(r) == r.session_identity
@@ -949,14 +1150,15 @@ async def test_session_retires_and_redials(pppoe_rig):
     admission is never disabled. A drop is therefore self-healing -- the table
     is not touched, nothing re-arms, and the next packet re-offers the flow
     against whatever session exists then, which is the assertion that matters
-    and the one a stale entry would fail. The UDP upload is Linux's, so the
-    direction in hardware on either side of the redial is the download, and
-    the session it names is the one it strips.
+    and the one a stale entry would fail. Both directions are in hardware on
+    either side of the redial, the upload through the offline-port detour, and
+    the session they name is the one the download strips and the upload
+    inserts.
     """
     r = pppoe_rig
     flows, delta = await _established(r)
-    reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
-    _assert_session(r, None, reverse)
+    _assert_session(r, _direction(flows, r.lan_ip, INNER_LOCAL),
+                    _direction(flows, INNER_LOCAL, r.lan_ip))
     assert all(d == 64 for d in delta.values()), delta
     before = await r.state()
     first = r.session_identity
@@ -972,6 +1174,7 @@ async def test_session_retires_and_redials(pppoe_rig):
     assert retired["invalidated"] == 0 and retired["invalidation_done"] == 0, retired
     assert retired["rearms"] == before["rearms"], retired
     assert retired["handle_refs"] == retired["neighbour_refs"] == 0, retired
+    assert retired["detour_flows"] == 0, retired
     assert retired["fatal"] == retired["quarantine"] == 0, retired
     assert retired["errors"] == before["errors"], retired
     # The device is gone, so /proc/net/pppoe has nothing left to describe.
@@ -1015,16 +1218,16 @@ async def test_session_retires_and_redials(pppoe_rig):
     for _ in range(10):
         await r.exchange(count=4)
         state = await r.state()
-        if state["entries"] == 1:
+        if state["entries"] == 2:
             break
     else:
         pytest.fail(f"the flow was not readmitted after the redial: {state}")
-    readmitted = await _download_only(r, retired)
-    reverse = _direction(readmitted, INNER_LOCAL, r.lan_ip)
+    readmitted = await _udp_directions(r)
     # Against the session that exists now. A flow that had survived the hangup,
     # or been readmitted from anything cached, would name the old one -- which
     # is exactly the failure that forwards happily and delivers nothing.
-    _assert_session(r, None, reverse, session=second)
+    _assert_session(r, _direction(readmitted, r.lan_ip, INNER_LOCAL),
+                    _direction(readmitted, INNER_LOCAL, r.lan_ip), session=second)
     after = await r.state()
     # Readmitted through the bindings that were never disturbed: no global
     # invalidation to clear, and nothing to re-arm.
@@ -1059,7 +1262,8 @@ async def test_tunnel(pppoe_rig, mode):
     the frame was addressed to it.
 
     A UDP upload is Linux's -- an Ethernet LAN can deliver a full frame and
-    the tunnel's path is smaller -- so over UDP the direction proved is the one
+    the tunnel's path is smaller, and the offline-port detour takes no
+    tunnel -- so over UDP the direction proved is the one
     that arrives inside all three, and the records are held by it alone. The
     upload that leaves inside all three is proved over TCP, which the uplink's
     MSS clamp keeps within the tunnel.

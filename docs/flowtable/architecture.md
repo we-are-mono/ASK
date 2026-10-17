@@ -157,8 +157,9 @@ then drops at the port what the port's MTU forbids, so the hardware never sends
 it either (A340).
 
 A direction of either family that is neither TCP nor, for IPv4, to or from an
-SA is admitted only while nothing larger than its MTU can arrive
-(`ft_mtu_carried()`). The microcode fragments a packet that exceeds the
+SA is admitted as it is only while nothing larger than its MTU can arrive
+(`ft_mtu_carried()`); an IPv4 UDP one is otherwise carried through the
+offline-port detour, below. The microcode fragments a packet that exceeds the
 entry's MTU -- IPv4 without DF, and any IPv6, which it never hands to Linux --
 and for a frame received on an Ethernet port those fragments leave with
 correct headers and an all-zero payload, so the receiver discards them; a
@@ -178,7 +179,7 @@ smaller MTU, since DHCP's MTU option is widely ignored and a router
 advertisement's can be, and a bridge set to 9000 over a 1500 port receives no
 more than the port does (A346). The IPv6 MTU a link advertises is therefore
 not the bound either. On such a jumbo trunk every non-TCP direction into a
-1500 path stays in software. The tag allowance lets an untagged frame on a port with uppers
+1500 path stays in software, the offline-port detour below included. The tag allowance lets an untagged frame on a port with uppers
 exceed its MTU by four (or eight) bytes; that window is deliberately not
 counted, since counting it would refuse every bridged 1500→1500 UDP
 direction, and it needs a host sending more than its link's MTU. A TCP direction is
@@ -194,12 +195,69 @@ thing an integration owes the bound (OpenWrt's `mtu_fix` on the WAN zone, on
 by default). A refused direction stays on the software flowtable path, where
 `ip_forward()` fragments correctly and `ip6_forward()` sends Packet Too Big;
 the reverse direction is admitted on its own. Equal MTUs, the ordinary
-Ethernet WAN, are unaffected. A smaller upstream is where it shows: UDP
-leaving a LAN by PPPoE (1492), a 6in4 tunnel (1480) or a 4in6 tunnel (1452)
-runs in software in that direction, and TCP and the download direction stay in
-hardware. Device and route MTU
+Ethernet WAN, are unaffected. A smaller upstream is where it shows: IPv6 UDP
+leaving a LAN by PPPoE (1492), and UDP of either family into a 6in4 tunnel
+(1480) or a 4in6 tunnel (1452), runs in software in that direction, and TCP
+and the download direction stay in hardware. Device and route MTU
 changes retire installed directions through their events, so the bound is
 checked at admission.
+
+### The offline-port detour
+
+IPv4 UDP into a smaller path from a standard port -- every UDP upload into a
+PPPoE session from a 1500-byte LAN, QUIC, WireGuard and games among it -- is
+carried in hardware
+through an offline port, whose microcode fragments whole (`cdx/cdx_detour.c`,
+A385). Only an offline port fetches the whole frame before its PCD runs, which
+is why the SEC output's fragments were always correct. The direction is
+installed as two entries, through `cdx_ft_hw_add()`. The receive port's checks
+and counts each frame and enqueues it untouched -- Ethernet header, tags and
+session included -- to the queue into `dpa-fman0-oh@4`, the board's third
+offline port, which nothing else uses. The offline port classifies it again,
+against its own entry for the tuple, keyed with that port's id, and that entry
+does what the receive port's otherwise would: the strip, the NAT, the TTL, the
+insert, the enqueue to the egress port, fragmenting included. The ingress
+policer and the Ethernet receive counters are the receive entry's; everything
+else, the session and tag counters with it, is the offline entry's, and the
+direction's packet and byte counts are the receive entry's, as it arrived.
+`/proc/cdx_flowtable` marks such a direction `detour=1`.
+
+DF is the receive entry's: it carries the path's MTU with `PREEMPT_DFBIT_HONOR`,
+so a DF packet the path cannot carry goes to Linux from the port it arrived by,
+which answers Fragmentation Needed, and its enqueue fragments nothing
+(`FRAG_DISABLE`). A packet without DF is fragmented by the offline port's
+fragmenter, two fragments for a 1500-byte packet into a 1200 or 1492 path,
+from the fragmenter's own pool.
+
+What the offline port hands back instead of forwarding reaches one of its PCD
+queues, the detour queue's context B or the port's default queue -- with
+nothing to say which port it came in by. Every detoured direction is recorded
+by its tuple for that (`cdx_detour_flow_add()`): the frame, still as it
+arrived, is parsed past its tags and session to the tuple, copied, and given to
+Linux on the recorded port with `netif_rx()`, as the receive port's own
+exception would have been. The record outlives the direction by a tenth of a
+second, for the frames still in the port's queue when its entries went, and it
+refuses a second direction with the tuple of one already carried, whose
+offline entry would collide with that one's: that direction stays in software.
+`detour_delivered`, `detour_unknown` (no record), `detour_failed` (not copied)
+and `detour_errors` (the port's error queue) count it.
+
+Every queue tail-drops at 128 KiB. A direction offered more than the offline
+port forwards -- some 530k 1500-byte packets a second on the DK, fragmented,
+6.4 Gbit/s -- loses the excess at the queue into the port; QMan discards an FMan enqueue it rejects and the buffers go back to their
+pool, so the ingress port's pool is never held. The detour's only cost is that
+throughput bound, well above any PPPoE uplink. A board without the port, an
+older device tree, comes up without the detour (`detour 0`) and keeps these
+directions in software as before, and so does cdx's `detour` parameter set to
+0 at runtime, for what is admitted from then on. The detour takes no tunnel, whose outer
+packet the fragmenter would cut, no SA, exempt already, no IPv6, which a
+router never fragments, no direction received in a PPPoE session, every
+frame of which the offline port handed back when one was tried (A393), and
+none from a port whose MTU is above 1500: a jumbo frame arrives in several
+buffers, and a line-rate flood of them through the offline port timed out the
+FMan's host-command channel, which only a reset recovers (A394). That leaves
+a download from a session into a LAN path below 1492, and UDP from a jumbo
+LAN into a standard path, in software.
 
 An IPv4 direction into an SA is exempt because its entry is bounded
 differently; an IPv6 one is not, because out of SEC the offline port would

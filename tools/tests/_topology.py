@@ -78,8 +78,9 @@ LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "")
 # each port's MAC receive limit follows its MTU but never drops below a full
 # frame, and the sending host is never told the DUT's setting. A port given a
 # jumbo MTU delivers up to that MTU instead. The flowtable adapter installs a
-# non-TCP IPv4 direction only where its path carries the larger of the two from
-# its ingress, so a UDP direction into any smaller path stays in Linux.
+# non-TCP IPv4 direction as it is only where its path carries the larger of the
+# two from its ingress; a UDP one into any smaller path takes the offline-port
+# detour (A385).
 FULL_FRAME = 1500
 
 

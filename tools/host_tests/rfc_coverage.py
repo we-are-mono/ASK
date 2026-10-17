@@ -20,6 +20,7 @@ CATALOGUE = {
     "791": ("supported", "IPv4 forwarding, TTL, fragmentation"),
     "8200": ("supported", "IPv6 forwarding, hop limit, fragmentation"),
     "792": ("supported", "ICMP errors through NAT, Time Exceeded"),
+    "1191": ("supported", "Fragmentation Needed for DF into a smaller path, the detour's too"),
     "4443": ("supported", "ICMPv6 Packet Too Big, Time Exceeded"),
     "826": ("supported", "ARP neighbour changes retire flows"),
     "4861": ("supported", "Neighbor Discovery changes retire flows"),

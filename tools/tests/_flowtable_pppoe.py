@@ -872,55 +872,63 @@ async def _both_directions(r, state=None):
     return state["flows"]
 
 
-async def _download_only(r, since):
-    """The one direction of an IPv4 UDP connection hardware holds: the
-    download, which arrives inside the session and leaves by the LAN port at
-    its full MTU. The upload's path is the session's 1492 bytes and its LAN
-    port can deliver 1500, so it is refused to Linux (see the module
-    docstring) -- counted as a reject since the state `since` was read, and
-    absent rather than merely late."""
+async def _udp_directions(r, detours=("1", "0")):
+    """Both directions of an IPv4 UDP connection, in hardware: the download,
+    which arrives inside the session and leaves by the LAN port at its full
+    MTU, as it is; and the upload, whose path is the session's 1492 bytes where
+    its LAN port can deliver 1500, through the offline-port detour, whose
+    microcode fragments what exceeds the session whole (A385, see the module
+    docstring). `detours` says which of the upload and the download take the
+    detour: a case that lowers the LAN path sends the download through it
+    too."""
     state = await r.state()
     flows = state["flows"]
-    if (len(flows) != 1 or flows[0]["in"] != TARGET_WAN_IF
-            or state["rejects"] <= since["rejects"]):
+    rows = {f["in"]: f for f in flows}
+    if (len(flows) != 2 or rows.keys() != {TARGET_LAN_IF, TARGET_WAN_IF}
+            or (rows[TARGET_LAN_IF]["detour"], rows[TARGET_WAN_IF]["detour"]) != tuple(detours)):
         conntrack = await command(r.target, r.session, "conntrack", "-L", "-o", "extended",
                                   check=False)
-        r.record("pppoe-unexpected-admission", {"since": since, "state": state,
-                                                "conntrack": conntrack})
-        pytest.fail(f"expected the download alone, the upload refused: "
+        r.record("pppoe-unexpected-admission", {"state": state, "conntrack": conntrack})
+        pytest.fail(f"expected both directions, the upload through the detour: "
                     f"validated={state['validated']} rejects={state['rejects']} "
-                    f"(from {since['rejects']}) busy={state['busy']} "
-                    f"errors={state['errors']}\nflows={flows}\nconntrack={conntrack['stdout']}")
+                    f"busy={state['busy']} errors={state['errors']}\nflows={flows}\n"
+                    f"conntrack={conntrack['stdout']}")
     return flows
 
 
-async def _established(r, count=64):
+async def _established(r, count=64, detours=("1", "0")):
     """Install the flow, then measure a second burst against the hardware.
 
-    What is installed is the download alone; see _download_only. The counters
-    are cumulative for the boot, so every measurement here is a delta against
-    a baseline taken once the flow is already installed.
+    Both directions are installed, the upload through the detour; see
+    _udp_directions. The counters are cumulative for the boot, so every
+    measurement here is a delta against a baseline taken once the flow is
+    already installed.
     """
-    initial = await r.state()
     await r.table()
     # Admission takes rtnl_trylock, so an offer can be declined in passing;
     # Linux offers it again only on a later packet, at most once a second
-    # (drive()). Keep sending until the download is in and the upload has
-    # been refused, then judge what is installed.
+    # (drive()). Keep sending until both directions are in, then judge what
+    # is installed.
     deadline = time.monotonic() + 10
     while True:
         await r.exchange(count=4)
         state = await r.state()
-        if ((any(f["in"] == TARGET_WAN_IF for f in state["flows"])
-             and state["rejects"] > initial["rejects"]) or time.monotonic() >= deadline):
+        if len(state["flows"]) == 2 or time.monotonic() >= deadline:
             break
-    flows = await _download_only(r, initial)
+    flows = await _udp_directions(r, detours)
     installed = await r.state()
     before = {f["cookie"]: int(f["packets"]) for f in flows}
     await r.exchange(count=count)
     state = await r.state()
     after = {f["cookie"]: int(f["packets"]) for f in state["flows"]}
     _assert_undisturbed(r, installed, state, set(before) == set(after))
+    # A detoured direction's packets are counted as they arrive, so they
+    # would read the same if the offline port handed every one back to Linux;
+    # that it handed none back is what says the hardware carried them.
+    handed_back = state["detour_delivered"] - installed["detour_delivered"]
+    if handed_back and getattr(r, "detour_strand", False) is False:
+        r.record("pppoe-handed-back", {"installed": installed, "state": state})
+        pytest.fail(f"the offline port handed back {handed_back} frames of the burst")
     return flows, {c: after[c] - before[c] for c in before}
 
 
@@ -933,7 +941,7 @@ def _assert_session(r, forward, reverse, session=None):
 
     Both directions still name the physical ports: a ppp device never becomes
     one, and neither does the tagged device the session stands on. `forward`
-    is None where the upload is Linux's.
+    is None where the upload is Linux's; an IPv4 UDP one takes the detour.
     """
     expected = _session_text(session or r.session_identity)
     assert reverse["in_ppp"] == expected and reverse["out_ppp"] == "-", reverse

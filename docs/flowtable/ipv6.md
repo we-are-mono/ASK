@@ -110,7 +110,9 @@ carry an all-zero payload, so an oversized packet is not even fragmented: it
 is lost, with no Packet Too Big to tell its sender.
 
 So the bound is the one IPv4 has, from one function for both families
-(`ft_mtu_carried()`, [architecture.md](architecture.md#native-context-and-admission)):
+(`ft_mtu_carried()`, [architecture.md](architecture.md#native-context-and-admission)),
+without the offline-port detour that carries IPv4 UDP past it, whose port
+would fragment the IPv6 packet as readily:
 a direction is admitted only while nothing larger than its MTU can arrive,
 measured by what its ingress port's MAC accepts -- never less than a full
 Ethernet frame, more on a jumbo port, less any session or tunnel header its

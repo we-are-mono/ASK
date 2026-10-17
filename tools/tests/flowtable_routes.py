@@ -9,7 +9,7 @@ import os
 import pytest_asyncio
 
 from ask_orch.client import Agent
-from _topology import FULL_FRAME, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_connections import (by_key, peer)
 from _flowtable_rig import (DPORT, SPORT, TABLE, WAN_IP, command, read)
 from _flowtable_selective_neighbour import (keys as peer_keys, unchanged as peer_unchanged)
@@ -34,13 +34,11 @@ def routed(mtu):
     The route's MTU is what names the route a readmitted flow took, so the
     cases below set a different one on each route they add. Below a full
     frame, A's UDP reply -- arriving on the WAN port, which can deliver 1500
-    bytes whatever its MTU -- no longer fits its path, and the adapter leaves
-    it to Linux rather than have the microcode fragment it. A's TCP reply
-    carries DF and takes the route's MTU into hardware, which is where the
-    marker is read."""
-    return [{**f, "software": (TARGET_WAN_IF,)}
-            if f["id"] in A and f["proto"] == "udp" and mtu < FULL_FRAME else f
-            for f in FLOWS]
+    bytes whatever its MTU -- no longer fits its path, and takes the
+    offline-port detour, whose fragments are whole (A385); A's TCP reply
+    carries DF. Either way every direction is in hardware, describing the
+    route's MTU, which is where the marker is read."""
+    return list(FLOWS)
 
 
 @pytest_asyncio.fixture
@@ -228,9 +226,9 @@ async def test_selective(routes):
                                   "dev", TARGET_LAN_IF, "mtu", "1100", check=False)
         assert duplicate["rc"] != 0, duplicate
         state = await r.state()
-        # A's UDP reply re-offers its flow whenever it crosses Linux, and that
-        # refusal is decided before RTNL; nothing here should take RTNL at
-        # all, and busy moving would name an offer that did.
+        # Every direction is in hardware, A's UDP reply through the detour, so
+        # nothing re-offers a flow here and nothing should take RTNL at all;
+        # busy moving would name an offer that did.
         assert state["busy"] == before["busy"], ("an offer took RTNL mid-window", before, state)
         peer_unchanged(before, state, ALL, flows=routed(1100))
         reports = await p.rpc("stop", B)

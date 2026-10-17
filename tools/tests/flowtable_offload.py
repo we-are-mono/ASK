@@ -819,8 +819,9 @@ async def test_partial_accounting(rig):
     """The hardware half of a partially offloaded flow reaches conntrack while
     its software half is still forwarding.
 
-    A host route smaller than a full frame keeps the UDP upload in Linux, and
-    the download goes to hardware. Linux refreshes the flow's timeout on every
+    A host route smaller than a full frame, with the offline-port detour
+    turned off (cdx's `detour`), keeps the UDP upload in Linux, and the
+    download goes to hardware. Linux refreshes the flow's timeout on every
     upload packet, and the flowtable collector used to ask the hardware only
     once a tenth of that timeout had run down -- which it never does while the
     upload flows -- so the download's bytes reached conntrack only after the
@@ -836,8 +837,10 @@ async def test_partial_accounting(rig):
         pytest.skip("requires installed hardware")
     timeout = int((await read(r.target, r.session,
                               "/proc/sys/net/netfilter/nf_flowtable_udp_timeout")).strip())
+    detour = "/sys/module/cdx/parameters/detour"
     await command(r.target, r.session, "ip", "route", "replace", f"{WAN_IP}/32",
                   "dev", TARGET_WAN_IF, "mtu", "1400")
+    assert (await r.target.fs_write(r.session, detour, "0"))["errno"] == 0
     try:
         await r.table(counter=True)
         await r.clear_ct()
@@ -877,6 +880,7 @@ async def test_partial_accounting(rig):
         assert after["busy"] == admitted["busy"] and after["entries"] == 1, (admitted, after)
         assert after["installs"] == admitted["installs"], (admitted, after)
     finally:
+        assert (await r.target.fs_write(r.session, detour, "1"))["errno"] == 0
         await command(r.target, r.session, "ip", "route", "replace", f"{WAN_IP}/32",
                       "dev", TARGET_WAN_IF)
 

@@ -374,6 +374,7 @@ static int ft_show(struct seq_file *seq, void *v)
 	struct cdx_ft_dev_stats *record;
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
+	struct cdx_detour_counters detour;
 	unsigned int session_records = 0, session_slots = 0, vlan_records = 0, vlan_slots = 0;
 	unsigned int tunnel_records = 0, tunnel_slots = 0, stats_retained;
 	unsigned int ids4, ids6, id_slots;
@@ -412,7 +413,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   in_tnl, out_tnl,
@@ -422,9 +423,10 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
 				   entry->rule.sa_handle, entry->rule.in_sa_handle,
+				   entry->rule.detour,
 				   nexthop, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   in_tnl, out_tnl,
@@ -434,6 +436,7 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
 				   entry->rule.sa_handle, entry->rule.in_sa_handle,
+				   entry->rule.detour,
 				   nexthop, stats.packets, stats.bytes, stats.lastused);
 		return 0;
 	}
@@ -521,6 +524,14 @@ static int ft_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "mcast_enabled %u\n", READ_ONCE(ft_mc_enabled));
 	/* Whether transit tunnels are carried; cdx's `transit` parameter. */
 	seq_printf(seq, "transit %u\n", cdx_ft_transit);
+	/* The offline-port detour (cdx_detour.c): whether it is up, the
+	 * directions it carries, and what the port handed back -- given to
+	 * Linux, with no direction to give it to, not copied, or in error. */
+	cdx_detour_counters(&detour);
+	seq_printf(seq, "detour %u\ndetour_flows %llu\ndetour_delivered %llu\n"
+		   "detour_unknown %llu\ndetour_failed %llu\ndetour_errors %llu\n",
+		   cdx_ft_detour_ready(), detour.flows, detour.delivered,
+		   detour.unknown, detour.failed, detour.errors);
 	/* Memberships the bridge reported, and the flows learned from traffic
 	 * that they and the routed learner's routes name; `installed` counts
 	 * flows, each one classifier entry. */

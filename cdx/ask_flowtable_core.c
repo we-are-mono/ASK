@@ -1638,14 +1638,15 @@ static u32 ft_arriving(const struct net_device *port, unsigned int stripped)
  * both tried on the board -- so an oversized IPv6 packet would never get the
  * Packet Too Big Linux sends. Any direction into a smaller path therefore
  * stays in software, where Linux fragments IPv4 and answers IPv6 with Packet
- * Too Big, with two exceptions. A TCP direction stays in hardware: a PPPoE or
+ * Too Big, with three exceptions. A TCP direction stays in hardware: a PPPoE or
  * tunnel uplink clamps its MSS, and IPv4 TCP sets DF besides; an IPv6 segment
- * over the clamp from a host that ignores it would be lost. And an IPv4
- * direction to or from SEC: its enqueue to SEC fragments nothing, and what SEC
- * returns is fragmented on the offline port, where the microcode's fragments
- * are whole and an IPv4 router may make them. An IPv6 one is not exempt: out of
- * SEC the offline port would fragment the decrypted IPv6 packet itself, which
- * no router may do.
+ * over the clamp from a host that ignores it would be lost. An IPv4 direction
+ * to or from SEC: its enqueue to SEC fragments nothing, and what SEC returns is
+ * fragmented on the offline port, where the microcode's fragments are whole and
+ * an IPv4 router may make them. An IPv6 one is not exempt: out of SEC the
+ * offline port would fragment the decrypted IPv6 packet itself, which no
+ * router may do. And an IPv4 UDP direction that takes the detour through an
+ * offline port, for the same reason (ft_detours()).
  *
  * What may arrive is bounded by the ingress port's MAC rather than by what
  * the link tells its hosts (ft_arriving()): the port takes whatever its own
@@ -1657,9 +1658,30 @@ static u32 ft_arriving(const struct net_device *port, unsigned int stripped)
  * alone decides. */
 static bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
 {
-	return rule->proto == IPPROTO_TCP ||
+	return rule->proto == IPPROTO_TCP || rule->detour ||
 	       (rule->family == AF_INET && (rule->sa_handle || rule->in_sa_handle)) ||
 	       ft_arriving(rule->in, ft_rule_stripped(rule)) <= mtu;
+}
+
+/* Whether a direction into a smaller path is carried through the offline-port
+ * detour (cdx_detour.c), whose port fragments it whole and whose receive entry
+ * sends a packet with DF to Linux for the ICMP: an IPv4 UDP one, received
+ * outside any session and through no tunnel and no SA. A tunnel is left out
+ * because the packet the fragmenter would cut is the outer one, a transform
+ * because it is exempt already, and TCP because it needs no fragmenting. A
+ * session frame is not one the offline port classifies to its entry: every
+ * frame of such a direction came back from the port, measured (A393). Nor is
+ * a port that delivers more than a standard frame: a jumbo one arrives in
+ * several buffers, and a flood of them through the offline port starved the
+ * FMan's host-command channel until a reset, measured (A394). The port's
+ * readiness is fixed for CDX's life, and cdx's `detour` parameter is read
+ * here, at admission. */
+static bool ft_detours(const struct cdx_ft_rule *rule)
+{
+	return rule->family == AF_INET && rule->proto == IPPROTO_UDP &&
+	       !rule->sa_handle && !rule->in_sa_handle && !rule->in_session.present &&
+	       !rule->in_tunnel.present && !rule->out_tunnel.present &&
+	       ft_port_arriving(rule->in) <= ETH_DATA_LEN && cdx_ft_detour_ready();
 }
 
 static u32 ft_ipv6_dev_mtu(const struct net_device *dev)
@@ -1695,8 +1717,9 @@ static bool ft_egress_mtu_current(const struct cdx_ft_rule *rule)
  * from the request alone and before RTNL. Linux offers a flow again about once
  * a second for as long as software forwards any of it, so a direction the bound
  * keeps out keeps coming back while it carries traffic -- on a PPPoE uplink
- * that is every UDP upload -- and each offer would otherwise take RTNL and
- * walk the whole path only to be refused again.
+ * that is every IPv6 UDP upload, and every IPv4 one on a board without the
+ * detour -- and each offer would otherwise take RTNL and walk the whole path
+ * only to be refused again.
  *
  * Only a refusal that holds whatever the walk would find is made here. The
  * physical port @port is the one the offer is bound to, exactly as the decoder
@@ -1717,8 +1740,8 @@ static bool ft_mtu_refused(const struct flow_cls_offload *cls, const struct net_
 	struct flow_rule *rule = cls->rule;
 	struct flow_match_basic basic;
 	unsigned int stripped;
-	struct net_device *in;
-	bool refused;
+	struct net_device *in, *out;
+	bool refused, detours;
 
 	if (!rule || !cls->nf_dst || !cls->nf_dst_reverse ||
 	    !(rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_BASIC)) ||
@@ -1752,9 +1775,17 @@ static bool ft_mtu_refused(const struct flow_cls_offload *cls, const struct net_
 		stripped = PPPOE_SES_HLEN + sizeof(struct ipv6hdr);
 		break;
 	}
+	/* An IPv4 UDP direction may take the detour unless it arrives by a
+	 * session, a tunnel or a jumbo port or leaves by a tunnel
+	 * (ft_detours()); what else would refuse it, the walk finds. */
+	out = READ_ONCE(cls->nf_dst->dev);
+	detours = cdx_ft_detour_ready() &&
+		  basic.key->n_proto == htons(ETH_P_IP) && basic.key->ip_proto == IPPROTO_UDP &&
+		  in->type == ARPHRD_ETHER && ft_port_arriving(port) <= ETH_DATA_LEN &&
+		  (out->type == ARPHRD_ETHER || out->type == ARPHRD_PPP);
 	refused = (basic.key->n_proto == htons(ETH_P_IP) ||
 		   basic.key->n_proto == htons(ETH_P_IPV6)) &&
-		  basic.key->ip_proto != IPPROTO_TCP &&
+		  basic.key->ip_proto != IPPROTO_TCP && !detours &&
 		  ft_arriving(port, stripped) > cls->nf_mtu;
 	if (refused)
 		ask_dbg(ASK_DBG_DEVICE, "proto %u mtu %u below ingress %s before RTNL\n",
@@ -2086,6 +2117,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	mtu = min_t(u32, cls->nf_mtu, ft_port_mtu(out));
 	if (mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return ask_refuse(-EOPNOTSUPP);
+	out->detour = ft_arriving(out->in, ft_rule_stripped(out)) > mtu && ft_detours(out);
 	if (!ft_mtu_carried(out, mtu)) {
 		ask_dbg(ASK_DBG_DEVICE, "family %u proto %u mtu %u below ingress %s\n",
 			family, out->proto, mtu, netdev_name(out->in_logical));

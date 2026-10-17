@@ -224,6 +224,8 @@ struct dpa_iface_info {
 #define PORT_VALID              (1 << 16)
 #define PORT_TYPE_WIFI          (1 << 12)
 #define PORT_TYPE_IPSEC         (2 << 12)
+/* The detour for directions into a smaller path (cdx_detour.c). */
+#define PORT_TYPE_DETOUR        (3 << 12)
 #define PORT_TYPE_MASK          (3 << 12)
 
 int find_pcd_fq_info(uint32_t fqid);
