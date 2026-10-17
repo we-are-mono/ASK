@@ -384,7 +384,11 @@ struct cdx_ft_l2_rule {
  * and GRE, IPv4 in IPv4 and IPv6 in IPv4 over IPv4 alone. The classifier
  * parses a tunnel down to the stream it carries, misses it there, and keys
  * the routed lookup on the first IPv4 header (cdxdrv_set_miss_action()),
- * which is the tunnel's own only when its outer header is IPv4. */
+ * which is the tunnel's own only when its outer header is IPv4. The first
+ * IPv4 header is not always the outermost: a frame of an IPv6 tunnel whose
+ * inner IPv4 header has a transit flow's pair and protocol matches that
+ * flow's entry too. It takes the same pair crossing the router both natively
+ * and inside such a tunnel, and is left. */
 static inline bool cdx_ft_portless(u8 family, u8 proto)
 {
 	switch (proto) {

@@ -1096,7 +1096,8 @@ out:
  * distributed by, and the frames it has taken -- which classification a kind
  * of frame reaches, read off the hardware rather than reasoned from the
  * parser. A scheme shared by several ports' policies is one counter, listed
- * under each, with the same handle. */
+ * under each, with the same handle. Each counter read is a host command, so
+ * the file is root's alone. */
 static struct proc_dir_entry *dpa_cfg_schemes_proc;
 
 static const char *dpa_cfg_scheme_name(uint32_t type)
@@ -1387,7 +1388,7 @@ int dpa_cfg_install(void)
 	cdx_ctrl_unlock_with_rtnl();
 	kfree(state);
 	/* A diagnostic: its absence costs nothing but the reading. */
-	dpa_cfg_schemes_proc = proc_create_single("cdx_pcd_schemes", 0444, NULL,
+	dpa_cfg_schemes_proc = proc_create_single("cdx_pcd_schemes", 0400, NULL,
 						  dpa_cfg_schemes_show);
 	return 0;
 

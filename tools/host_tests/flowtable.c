@@ -8708,6 +8708,25 @@ int main(void)
     REJECT(bk.ip_proto = ct.protonum = IPPROTO_ESP);
     /* Translated, which Netfilter does not offer them: none is admitted. */
     REJECT(PORTLESS(fixture, IPPROTO_GRE); ct.status |= IPS_SRC_NAT | IPS_SRC_NAT_DONE);
+    /* Nor through one of the router's SAs, whose descriptors fill the TCP
+     * and UDP tables alone, where UDP is carried. */
+    fixture(); xfrm_policies = true; ipsec_sa = 7;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.sa_handle);
+    REJECT(PORTLESS(fixture, IPPROTO_ESP); xfrm_policies = true; ipsec_sa = 7);
+    REJECT(PORTLESS(fixture, IPPROTO_GRE); xfrm_policies = true; ipsec_in_sa = 8);
+    /* Nor out of a PPPoE session: the three-tuple tables have no key for
+     * the session a receive entry must match. UDP is carried from one where
+     * it fits. Into one, the MTU keeps both in software already (A385). */
+    pppoe_in_fixture(); cls.nf_mtu = 1492;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.in_session.present);
+    pppoe_in_fixture(); cls.nf_mtu = 1492;
+    bk.ip_proto = ct.protonum = IPPROTO_ESP;
+    dissector.used_keys &= ~BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    pppoe_out_fixture(); udp_flow();
+    bk.ip_proto = ct.protonum = IPPROTO_GRE;
+    dissector.used_keys &= ~BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     fixture(); assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     struct cdx_ft_rule udp = decoded;
     tcp_fixture(); assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.proto == IPPROTO_TCP);

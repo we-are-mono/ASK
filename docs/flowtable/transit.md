@@ -13,21 +13,34 @@ flowtable carries only TCP, UDP and GREv0 and the adapter only TCP and UDP.
 IPv6-in-IP as it carries GRE: the tuple is the address pair and the protocol,
 the match a driver is handed says no more, and the offload timeout holds the
 connection for a day while the flow lives and hands it back with conntrack's
-own timeout for such protocols when it goes. They are offered only
-untranslated, as GRE is: the NAT paths rewrite ports wherever a transport
-header would be, which here is an SPI or an inner header.
+own timeout for such protocols when it goes -- GRE's own included, which the
+flowtable had left at the day. They are offered only untranslated, as GRE is.
+NPTv6 translates a connection's addresses without marking it NATed, and the
+flowtable then rewrote the tuple's zero ports wherever a transport header
+would be, here into an SPI or an inner header: the port rewrites now touch TCP
+and UDP alone, in software and in the rule a driver is handed.
 
 **The adapter.** `ft_parse()` admits a flow described without the ports key
 when `cdx_ft_portless()` names its protocol for its family, with ports zero:
 ESP over IPv4 or IPv6, and GRE, IPIP and 6in4 over IPv4 alone. A translated
-one, or one through a local tunnel device, is refused. Every other rule a
-routed flow meets applies unchanged, the MTU one among them: a direction into
-a narrower path stays in software, as a UDP one does (A385).
+one is refused, and so is one through a local tunnel device, through a PPPoE
+session either way, or into or out of one of the router's own SAs: the
+three-tuple key has no room for a session's concentrator and ID, which every
+receive entry in a session must match ([pppoe.md](pppoe.md)), and the SA
+descriptors are filled for the TCP and UDP tables alone. Those stay in the
+software flowtable. Every other rule a routed flow meets applies unchanged,
+the MTU one among them: a direction into a narrower path stays in software,
+as a UDP one does (A385).
 
 **The hardware.** Each direction goes into the routed three-tuple tables,
 keyed on the address pair and protocol (`IPV4_MULTICAST_TABLE` and
 `IPV6_MULTICAST_TABLE`, which routed multicast and ESP already used), with the
-routed actions of any flow.
+routed actions of any flow. The tables are shared: the IPv4 one holds 512
+entries in 256 buckets for routed groups, their listeners and transit flows
+together, and an install that finds no room leaves its flow or group in
+software. An outer fragment of a tunnel or ESP flow has no transport header
+to parse past, so it reaches the three-tuple key directly and is forwarded in
+hardware like the rest, where Linux's flowtable leaves fragments to the stack.
 
 ## How their frames reach that key
 
@@ -56,7 +69,8 @@ one whenever the outer header is IPv4. That is why IPIP, 6in4 and GRE are
 carried over IPv4 alone. A frame no transit flow claims misses there too and
 goes on as before; the bridged station pairs, whose TCP frames now cross two
 more lookups on their way to the Ethernet table, still run at 9.36-9.39 Gbit/s
-in every shape.
+in every shape. That is full-size frames: what the longer chain costs a stream
+of small ones, at a rate the rig cannot generate, is not measured.
 
 A 6in4 tunnel's inner ICMPv6, and anything else its parser leaves with no
 TCP or UDP behind the inner IPv6 header, reaches the IPv6 three-tuple scheme
@@ -72,7 +86,10 @@ devices at both ends, and for ESP a pair of manual transport-mode SAs over one
 TCP port, in IPv4 and in IPv6 -- offers the protocol to a hardware flowtable,
 and runs a TCP stream inside. Both directions are installed, their counters
 move by the millions of frames in a three-second window, and the DUT's kernel
-transmits next to nothing meanwhile:
+transmits next to nothing meanwhile. Once the stream ends, both directions
+are let go and the connection's timeout is conntrack's own -- GRE's three
+minutes, ten for the others -- and a GRE tunnel the image masquerades is never
+installed at all:
 
 | Case | Rate inside the tunnel |
 |---|---|

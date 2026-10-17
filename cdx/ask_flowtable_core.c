@@ -2097,6 +2097,14 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	if ((out->out_tunnel.present || out->in_tunnel.present) &&
 	    (out->sa_handle || out->in_sa_handle))
 		return ask_refuse(-EOPNOTSUPP);
+	/* A port-less flow is keyed in the three-tuple tables, which have no
+	 * PPPoE variant: a receive entry there could not hold the session's
+	 * concentrator and ID (pppoe.md). Nor is one proven through a PPPoE
+	 * push, or into or out of one of the router's own SAs, whose
+	 * descriptors are filled for the TCP and UDP tables alone. */
+	if (portless && (out->in_session.present || out->out_session.present ||
+			 out->sa_handle || out->in_sa_handle))
+		return ask_refuse(-EOPNOTSUPP);
 	/* What Netfilter writes into the four mangle words is the neighbour of
 	 * the device the route leaves by, and that is the outermost one the
 	 * walk took: the tunnel where there is one, else the ppp device. Each

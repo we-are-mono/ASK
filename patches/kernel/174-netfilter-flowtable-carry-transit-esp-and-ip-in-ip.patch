@@ -1,4 +1,4 @@
-From fc7a2ef408f2bec89b1eda63d67ed7bcf6f46111 Mon Sep 17 00:00:00 2001
+From a2cdc7910525082c2da62c23fc3914c87419f79d Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 17 Oct 2026 02:30:03 +0200
 Subject: [PATCH] netfilter: flowtable: carry transit ESP and IP-in-IP
@@ -12,25 +12,28 @@ offered them.
 
 Carry ESP, IPIP and IPv6-in-IP the way GRE is carried: the tuple is the
 address pair and the protocol, with no ports, and the match handed to a
-driver says as much. Like GRE they are not translated, since the NAT
-paths rewrite ports wherever a transport header would be, which here is
-an SPI or an inner header. The offload timeout holds them for a day as
-it holds GRE, and a flow torn down hands its connection back with
-conntrack's own timeout for such protocols.
+driver says as much. Like GRE they are not offered NATed. NPTv6 leaves
+IPS_NAT clear and still translates a flow's addresses, and the port
+rewrites would then write the tuple's zero ports into an SPI, a GRE
+header or an inner IP header: they now rewrite TCP and UDP alone, in
+software and in the rule handed to a driver. The offload timeout holds
+these flows for a day as it holds GRE, and a flow torn down hands its
+connection back with the timeout conntrack would have given it, GRE's
+included, which had kept the day.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- net/netfilter/nf_flow_table_core.c    | 10 ++++++++++
- net/netfilter/nf_flow_table_ip.c      | 16 ++++++++++++++++
- net/netfilter/nf_flow_table_offload.c |  3 +++
+ net/netfilter/nf_flow_table_core.c    | 28 +++++++++++++++++++++++++++
+ net/netfilter/nf_flow_table_ip.c      | 16 +++++++++++++++
+ net/netfilter/nf_flow_table_offload.c | 14 ++++++++++++--
  net/netfilter/nft_flow_offload.c      | 11 +++++++++++
- 4 files changed, 40 insertions(+)
+ 4 files changed, 67 insertions(+), 2 deletions(-)
 
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index ec5d7eae5406..781dd071a066 100644
+index ec5d7eae5406..69c01ead90e0 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -276,6 +276,13 @@ static void flow_offload_fixup_ct(struct nf_conn *ct)
+@@ -276,6 +276,19 @@ static void flow_offload_fixup_ct(struct nf_conn *ct)
  
  		timeout = tn->timeouts[state];
  		timeout -= tn->offload_timeout;
@@ -41,10 +44,16 @@ index ec5d7eae5406..781dd071a066 100644
 +		 * the flowtable held it at.
 +		 */
 +		timeout = nf_generic_pernet(net)->timeout;
++#ifdef CONFIG_NF_CT_PROTO_GRE
++	} else if (l4num == IPPROTO_GRE) {
++		/* And GRE with what its tracker refreshes it to. */
++		timeout = test_bit(IPS_SEEN_REPLY_BIT, &ct->status) ?
++			  ct->proto.gre.stream_timeout : ct->proto.gre.timeout;
++#endif
  	} else {
  		return;
  	}
-@@ -609,6 +616,9 @@ static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct)
+@@ -609,6 +622,9 @@ static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct)
  		switch (l4proto) {
  		case IPPROTO_UDP:
  		case IPPROTO_GRE:
@@ -54,6 +63,32 @@ index ec5d7eae5406..781dd071a066 100644
  			new_timeout = NF_CT_DAY;
  			break;
  		case IPPROTO_TCP:
+@@ -737,6 +753,14 @@ void nf_flow_snat_port(const struct flow_offload *flow,
+ 	struct flow_ports *hdr;
+ 	__be16 port, new_port;
+ 
++	/* Only TCP and UDP have ports there. A flow of another protocol is
++	 * translated by its addresses alone, as NPTv6 translates one without
++	 * setting IPS_NAT; what follows its IP header is an SPI, a GRE header
++	 * or an inner IP header.
++	 */
++	if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
++		return;
++
+ 	hdr = (void *)(skb_network_header(skb) + thoff);
+ 
+ 	switch (dir) {
+@@ -763,6 +787,10 @@ void nf_flow_dnat_port(const struct flow_offload *flow, struct sk_buff *skb,
+ 	struct flow_ports *hdr;
+ 	__be16 port, new_port;
+ 
++	/* See nf_flow_snat_port(). */
++	if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
++		return;
++
+ 	hdr = (void *)(skb_network_header(skb) + thoff);
+ 
+ 	switch (dir) {
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
 index cde4a3f73d7e..e2edd607afe7 100644
 --- a/net/netfilter/nf_flow_table_ip.c
@@ -89,7 +124,7 @@ index cde4a3f73d7e..e2edd607afe7 100644
  		return -1;
  	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 1665197c02d7..ab11d4a850d1 100644
+index 1665197c02d7..0c09e70f9eb5 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -182,6 +182,9 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
@@ -102,8 +137,39 @@ index 1665197c02d7..ab11d4a850d1 100644
  		break;
  	default:
  		return -EOPNOTSUPP;
+@@ -536,10 +539,14 @@ static int flow_offload_port_snat(struct net *net,
+ 				  enum flow_offload_tuple_dir dir,
+ 				  struct nf_flow_rule *flow_rule)
+ {
+-	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
++	struct flow_action_entry *entry;
+ 	u32 mask, port;
+ 	u32 offset;
+ 
++	/* No ports to rewrite: see nf_flow_snat_port(). */
++	if (!flow_offload_l4proto(flow))
++		return 0;
++	entry = flow_action_entry_next(flow_rule);
+ 	if (!entry)
+ 		return -E2BIG;
+ 
+@@ -570,10 +577,13 @@ static int flow_offload_port_dnat(struct net *net,
+ 				  enum flow_offload_tuple_dir dir,
+ 				  struct nf_flow_rule *flow_rule)
+ {
+-	struct flow_action_entry *entry = flow_action_entry_next(flow_rule);
++	struct flow_action_entry *entry;
+ 	u32 mask, port;
+ 	u32 offset;
+ 
++	if (!flow_offload_l4proto(flow))
++		return 0;
++	entry = flow_action_entry_next(flow_rule);
+ 	if (!entry)
+ 		return -E2BIG;
+ 
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index f4212a82c8f5..7fdd4812fbe0 100644
+index 8af60003fb3a..1fe72434c35a 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
 @@ -486,6 +486,17 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
@@ -111,9 +177,9 @@ index f4212a82c8f5..7fdd4812fbe0 100644
  	}
  #endif
 +	/* Transit ESP, IPv4 and IPv6 in IP: tracked by their address pair
-+	 * alone, so a flow of them is that pair. Not translated, as GRE is
-+	 * not: the port rewrites of the NAT paths would write into an SPI or
-+	 * an inner header.
++	 * alone, so a flow of them is that pair. Not NATed, as GRE is not;
++	 * NPTv6, which leaves IPS_NAT clear, translates their addresses
++	 * alone (nf_flow_snat_port()).
 +	 */
 +	case IPPROTO_ESP:
 +	case IPPROTO_IPIP:
