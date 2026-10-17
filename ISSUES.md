@@ -152,18 +152,11 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A394 — UDP from a jumbo LAN port into a standard path stays in software.** The A385 detour takes it at a low
-  rate, whole (7 fragments per 9000-byte datagram, and its hand-back), but a line-rate flood of 9000-byte frames
-  through the offline port let 1.2% through (~1,660/s) and timed out the FMan host-command channel ("HC confirmation
-  timed out; board reset required"), leaving a failed barrier and three quarantined entries. 1500-byte floods do
-  not (530k/s). `ft_detours()` therefore takes no port above 1500. Suspects: the offline port's FIFO (0x3200) and
-  DMA/task share against frames fetched whole from several buffers; compare the IPsec port's jumbo path.
+- [-] **A394 — UDP from a jumbo LAN port into a standard path stays in software, not detoured.** Wontfix: a rare setup,
+  correct in software; a jumbo flood through the offline port stalls the FMan HC (_:/^ISSUES: A393 and A394 stay_).
 
-- [ ] **A393 — a download from a PPPoE session into a LAN path below the session's MTU stays in software.** The A385
-  detour takes no session ingress: its offline port (logical port 11) handed every such frame back when one was tried
-  (`detour_delivered` 64 of 64). Why is not established; the suspect is the soft parser's session path on that port
-  (`cdx_sp.xml` pppoeschema, the PPPoE relay table at `$ccbase + 0x30`). Rare -- a LAN path below 1492 -- and correct
-  in software (`test_download_into_smaller_lan_path`). Fix the classification, then drop `ft_detours()`'s exclusion.
+- [-] **A393 — a PPPoE download into a LAN path below 1492 stays in software, not detoured.** Wontfix: a rare setup,
+  correct in software; the offline port's parser stops at the session (_:/^ISSUES: A393 and A394 stay_).
 
 - [x] **A392 — the transit miss chain costs a bridged pair's 64-byte frames 13-18% (2.06-2.17 vs 2.50 Mpps).** cdx's
   `transit` parameter, off by default, restores 1.0.7's chain; the test image turns it on
