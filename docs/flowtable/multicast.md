@@ -632,12 +632,32 @@ also removes an installed entry when local delivery starts, and can readmit
 the flow once it stops.
 
 **Bridge filtering.** A carried flow is replicated at the classifier, before
-any bridge netfilter hook runs. An nftables `bridge` chain, an ebtables table,
-or `br_netfilter` handing bridged traffic to iptables would stop seeing the
-stream the moment it went into hardware: a drop rule would stop dropping it,
-and a counter would stop counting it. So while any bridge hook is registered
-in the initial namespace at `prerouting`, `forward` or `postrouting`, no
-bridged flow is carried, and installed ones come out. The learner's own hook
+any bridge netfilter hook runs. An nftables `bridge` chain or an ebtables
+table would stop seeing the stream the moment it went into hardware: a drop
+rule would stop dropping it, and a counter would stop counting it. So while
+either is registered in the initial namespace at `prerouting`, `forward` or
+`postrouting`, no bridged flow is carried, and installed ones come out.
+
+`br_netfilter`, which Docker loads, refuses nothing by itself (A389). Its
+hooks hand what the bridge forwards to the IP hooks, so while they are
+registered every flow is asked what those do to its stream, as the routed
+learner asks of its groups: `nf_xt_port_dependent()` and
+`nft_port_dependent()` walk prerouting with its NAT chains, then forward and
+postrouting, with the bridge as the copies' input and output -- and its VLAN
+device for the flow's VLAN as the input too, since
+`bridge-nf-pass-vlan-input-dev` may name either -- conntrack and x_tables
+included. A ruleset that could tell the group's streams apart, drop them or
+translate them refuses the flow, `refused-filter`, as a netdev chain does, and
+so does a netfilter BPF program at those hooks. The walk is asked whatever
+`bridge-nf-call-iptables` says, which is br_netfilter's own to read. It runs
+at every derivation, so a rule added under a carried flow takes it out within
+a refresh. Its `input` hook only confirms a handed-up copy's conntrack, and
+counts nowhere. `flowtable_service_multicast_bridge.py::
+test_br_netfilter_follows_the_ip_rules` drops one of a group's two UDP ports
+in an inet forward chain under br_netfilter: the flow comes out, only the kept
+port arrives, and both are carried again once the rule goes;
+`test_br_netfilter_bridge_and_route` carries a group bridged and routed at
+once with it loaded. The learner's own hook
 does not count: it only observes. (VWD's Wi-Fi fast-path hook was exempted the
 same way until it was removed from CDX.) Hooks are per namespace, not per
 bridge, so this applies to every bridge.
@@ -660,13 +680,9 @@ rest of the nftables ruleset; see
 before carrying a copy routed into a bridge.
 
 Some hooks never go away once they appear, and keep bridged multicast in
-software for the rest of the boot: `br_netfilter` once loaded (Docker and
-libvirt load it), an ebtables table once anything has listed or used it, and
-an nftables bridge base chain even when it is empty with an accept policy.
-`br_netfilter` counts whether or not `bridge-nf-call-iptables` is set: the
-bridged unicast learner confirms a pair against the IP rules it hands frames to
-([bridge hooks](bridge.md#switching-between-two-ports)), but this learner does
-not (A389). A host that wants bridged multicast offloaded unloads it.
+software for the rest of the boot: an ebtables table once anything has listed
+or used it, and an nftables bridge base chain even when it is empty with an
+accept policy.
 
 **What runs on the ports themselves.** A bridge port's frames cross more than
 the bridge's hooks. tc runs on every port's way in and way out, and so does

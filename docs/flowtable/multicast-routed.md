@@ -420,8 +420,11 @@ way up too, for the copies that confirm the group, but not for the rest of
 its packets: an `ebtables -A INPUT` drop of one UDP port would let the other
 port's copies confirm the group and the dropped port ride its entry. So a
 group whose parent VIF is on a bridge is `refused-filter` while any hook is
-registered at the bridge's `input`: ebtables, br_netfilter, or an nftables
-bridge chain, which the port walk below would refuse as well.
+registered at the bridge's `input`: ebtables, or an nftables bridge chain,
+which the port walk below would refuse as well. br_netfilter's hook there only
+confirms the handed-up copy's conntrack, and counts nowhere: the IP rules it
+runs at the bridge's `prerouting` are the prerouting the port walk reads,
+which the receive path then skips (A389).
 
 **Every packet alike.** A copy seen leaving proves that the ruleset forwarded
 that copy. The classifier key stops at the address pair, so every other packet
@@ -838,7 +841,7 @@ family over:
 | A bridge hook registered at `output` or `postrouting` | nothing reports it: asked at every derivation | a group with an oif through a bridge is `refused-filter` |
 | An nftables chain after the observer at `POST_ROUTING` | nothing reports it: asked at every derivation, and creating a chain is a commit | the family's groups are `refused-filter` |
 | A netfilter BPF link at `PRE_ROUTING`, `FORWARD` or `POST_ROUTING` | nothing reports it: asked at every derivation | the family's groups are `refused-filter` |
-| A bridge hook registered at `input` -- ebtables, br_netfilter, an nftables bridge chain | nothing reports it: asked at every derivation | a group whose parent VIF is on a bridge is `refused-filter` |
+| A bridge hook registered at `input` -- ebtables, an nftables bridge chain, but not br_netfilter's | nothing reports it: asked at every derivation | a group whose parent VIF is on a bridge is `refused-filter` |
 | A rule that could treat two packets of a group apart -- by port, rate or anything the port walk does not model -- or a device it cannot follow joining a VIF's stack | a commit, which takes every confirmation back; a stack change is found by the walk itself, run at every derivation of a confirmed group | `refused-ports` once the group is confirmed again |
 | An iptables-legacy table registered, replaced or removed | the kernel's count `net->nf.xt_seq` (patch 148): read every second while any group exists, and at every worker pass | every group re-derived and `mroute_xtables_changes` counted, no confirmation taken back; a confirmed group whose packets the legacy rules could tell apart is `refused-xtables` |
 | A tc filter, qdisc tree filter, tcx program or XDP program on a device of the parent's or an oif's stack | nothing reports it: asked at every derivation, which the five-second refresh runs for every group | `refused-tc`, confirmed or not, unless the filter is an offloaded DSCP filter on a port whose map is published |

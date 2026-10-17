@@ -1225,3 +1225,96 @@ async def test_follows_egress_queues(multicast_bridge_service):
             await _mdb(r, TARGET_WAN_IF, group, add=False)
             await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']),
                          timeout=20)
+
+
+BRNF_SYSCTLS = ('net.bridge.bridge-nf-call-iptables', 'net.bridge.bridge-nf-call-ip6tables',
+                'net.bridge.bridge-nf-filter-vlan-tagged')
+INET_FILTER_TABLE = 'ask_ft_mc_inet'
+
+
+@asynccontextmanager
+async def _br_netfilter(r):
+    """br_netfilter loaded, as Docker loads it, handing the frames the bridge
+    forwards to the IP hooks -- tagged ones too, since the set-top box's
+    copies leave tagged and only bridge-nf-filter-vlan-tagged hands those on
+    -- and an inet forward chain accepting all, as Docker's FORWARD and fw4's
+    forward are. Unloaded after."""
+    async def dut(*argv, check=True):
+        return await command(r.target, r.session, *argv, check=check)
+
+    await dut('modprobe', 'br_netfilter')
+    try:
+        for name in BRNF_SYSCTLS:
+            await dut('sysctl', '-w', f'{name}=1')
+        await dut('nft', 'delete', 'table', 'inet', INET_FILTER_TABLE, check=False)
+        await dut('nft', 'add', 'table', 'inet', INET_FILTER_TABLE)
+        await dut('nft', 'add', 'chain', 'inet', INET_FILTER_TABLE, 'forward',
+                  '{ type filter hook forward priority 0; policy accept; }')
+        yield dut
+    finally:
+        await dut('nft', 'delete', 'table', 'inet', INET_FILTER_TABLE, check=False)
+        for name in BRNF_SYSCTLS:
+            await dut('sysctl', '-w', f'{name}=0', check=False)
+        await dut('rmmod', 'br_netfilter', check=False)
+
+
+async def test_br_netfilter_follows_the_ip_rules(multicast_bridge_service):
+    """br_netfilter hands what the bridge forwards to the IP hooks, and
+    refuses no bridged flow by itself (A389): the flow is asked what
+    prerouting, forward and postrouting do to its stream instead. With them
+    accepting it, it is carried, both of its UDP ports; a forward rule
+    dropping one of them takes it out of hardware -- refused-filter, the
+    set-top box receiving the kept port through the CPU and nothing of the
+    dropped one -- and once the rule goes it is carried again."""
+    r = multicast_bridge_service
+    family = r.multicast_family
+    group = '239.9.5.10' if family == 4 else 'ff1e::9:5:a'
+    source = r.multicast_source
+    await _mdb(r, TARGET_LAN_IF, group)
+    try:
+        async with _br_netfilter(r) as dut:
+            await _from_wan(r, new_config(family, source, group, FRAMING_PORT, []), 16,
+                            r.wan_mac)
+            await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+            await _split_window(r, group, source, 'multicast-brnf-accepted', None)
+
+            await dut('nft', 'add', 'rule', 'inet', INET_FILTER_TABLE, 'forward',
+                      'udp', 'dport', str(TC_DROPPED), 'drop')
+            # Nothing announces a rule: the refresh asks again.
+            await _bridged_row(r, group, lambda g: g['state'] == 'refused-filter')
+            await _split_window(r, group, source, 'multicast-brnf-dropped', 'refused-filter')
+
+            await dut('nft', 'flush', 'chain', 'inet', INET_FILTER_TABLE, 'forward')
+            await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+            await _split_window(r, group, source, 'multicast-brnf-lifted', None)
+    finally:
+        await _mdb(r, TARGET_LAN_IF, group, add=False)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=20)
+
+
+async def test_br_netfilter_bridge_and_route(multicast_bridge_service):
+    """test_bridge_and_route's group with br_netfilter loaded (A389): the
+    bridged copy and the routed one still come out of one classifier entry.
+    The routed half's stream reaches ipmr through the bridge, whose LOCAL_IN
+    hook br_netfilter registers only to confirm the handed-up copy's
+    conntrack, and the bridged half is asked about the IP hooks instead."""
+    r = multicast_bridge_service
+    family = r.multicast_family
+    group = '239.9.5.11' if family == 4 else 'ff1e::9:5:b'
+    async with _bridge_and_route(r, group) as route:
+        async with _br_netfilter(r):
+            source, egress_mac = route.source, route.egress_mac
+            row, routed, _ = await _ride(r, group, source)
+            assert row['ports'] == f'{TARGET_LAN_IF}/{IPTV_VID}', row
+            assert row['routed'] == f'{TARGET_LAN_IF}/{ROUTED_VID}', row
+            assert routed['in'] == BRIDGE, routed
+            result, before, after, cpu, idle = await _window(
+                r, group, source, r.lan, [LISTENER, ROUTED_LISTENER],
+                lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
+                'multicast-brnf-bridge-and-route')
+            _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
+            _assert_routed_copy(result[ROUTED_LISTENER], egress_mac, group)
+            counted = int(_iptv_row(after, group)['packets']) - \
+                int(_iptv_row(before, group)['packets'])
+            assert counted >= FRAMING_COUNT * 0.95, (before, after)
+            assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)

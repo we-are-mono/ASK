@@ -152,12 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A389 — with br_netfilter loaded (Docker loads it), bridged multicast stays in software.** The bridged
-  multicast learner counts br_netfilter's hooks as filters whatever `bridge-nf-call-*` says
-  (`ft_mc_bridge_filtered()`), and the routed one refuses a group whose source arrives through a bridge for its
-  `LOCAL_IN` hook (`ft_mr_admit()`), where `br_nf_local_in()` only confirms conntrack. The unicast learner now confirms
-  its pairs against the rules br_netfilter hands frames to (A387). Next: confirm a bridged group's copies the same
-  way, and exempt br_netfilter at `LOCAL_IN` for a routed group's source.
+- [x] **A389 — with br_netfilter loaded (Docker loads it), bridged multicast stayed in software.** A bridged flow is
+  asked what the IP hooks br_netfilter hands it to do to its stream, as routed groups are, and its `input` hook counts
+  nowhere (_:/^flowtable: carry bridged multicast past br_netfilter_).
 
 - [x] **A388 — under br_netfilter, fw4's `flow add` took bridged connections into a flowtable that never carried
   them.** Patch 173 skips a packet whose route is br_netfilter's placeholder

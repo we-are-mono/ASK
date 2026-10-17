@@ -130,6 +130,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_soft_free",
             "ft_mc_soft_on",
             "ft_mc_netdev_dependent",
+            "ft_mc_brnf_dependent",
             "ft_mc_flow_derive",
             "ft_mc_count_delta",
             "ft_mc_flow_counted",
@@ -513,6 +514,7 @@ def test_a_bridge_filter_hook_keeps_bridged_multicast_in_software(tmp_path):
     (tmp_path / "mcast_bridge_filter.inc").write_text(
         function(source, "ft_bridge_hook_kinds") + function(source, "ft_bridge_hooked")
         + function(source, "ft_bridge_hooked_routed") + function(source, "ft_mc_bridge_filtered")
+        + function(source, "ft_mc_brnf_hooked")
         + function(source, "ft_dev_nf_ingress_hooked"))
     binary = tmp_path / "mcast_bridge_filter"
     run_process([
@@ -597,7 +599,8 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     # the bridge is below it.
     bridge = function(source, "ft_mc_soft_bridge")
     assert "ft_dev_tc_soft(br, true)" in bridge and "ft_dev_nf_ingress_hooked(br)" in bridge
-    assert "ft_bridge_hooked(BIT(NF_BR_LOCAL_IN))" in bridge
+    # br_netfilter's LOCAL_IN hook only confirms the copy's conntrack.
+    assert "ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_IN))" in bridge
     assert "netdev_for_each_upper_dev_rcu(br, upper, iter)" in bridge
     assert "ft_dev_stack_tc_soft" not in bridge and "ASSERT_RTNL();" in bridge
     worker = function(source, "ft_mc_work_fn")

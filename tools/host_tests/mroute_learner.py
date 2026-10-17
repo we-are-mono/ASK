@@ -704,7 +704,7 @@ def test_legacy_tables_and_tc_are_judged_as_well():
     source = flowtable_source()
     admit = function(source, "ft_mr_admit")
     at = [admit.index(s) for s in (
-        "if (plan->via && ft_bridge_hooked(BIT(NF_BR_LOCAL_IN)))",
+        "if (plan->via && ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_IN)))",
         "ft_mr_observer_followed(g->family) || ft_mr_bpf_hooked(g->family)",
         "ft_mr_tc_filtered(plan)",
         "if (!ft_mr_ruleset_current())", "ft_mr_watch_complete(g->watch)",

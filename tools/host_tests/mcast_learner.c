@@ -201,6 +201,7 @@ static unsigned long long ft_mc_refused;
 /* What the worker last found of the bridge filter hooks; the cases set it
  * as the worker would. */
 static bool ft_mc_filtered;
+static bool ft_mc_brnf;
 /* The `multicast` parameter, on at load; the cases switch it as the offload
  * service would, and wake the learner as its setter does. */
 static bool ft_mc_enabled = true;
@@ -522,6 +523,10 @@ static s64 atomic64_read_acquire(const s64 *v) { return *v; }
 static bool ft_mc_recheck;
 static bool bridge_hooked;
 static bool ft_mc_bridge_filtered(void) { return bridge_hooked; }
+/* br_netfilter's hooks at the bridge, which ft_mc_bridge_filtered() leaves
+ * to each flow's walk of the IP hooks. */
+static bool brnf_hooked;
+static bool ft_mc_brnf_hooked(void) { return brnf_hooked; }
 /* The worker's last step, so every run of it is checked here for a flow it
  * picked and never recorded. */
 static void no_flow_busy(void);
@@ -552,6 +557,12 @@ static bool bridge_local_in;
 static bool ft_bridge_hooked(unsigned int hooks)
 {
     return (hooks & BIT(NF_BR_LOCAL_IN)) && bridge_local_in;
+}
+/* br_netfilter's LOCAL_IN hook judges nothing: bridge_local_in stands for
+ * any other. */
+static bool ft_bridge_hooked_routed(unsigned int hooks)
+{
+    return ft_bridge_hooked(hooks);
 }
 
 /* What tc runs in software on a device, and on it and every device below it;
@@ -596,11 +607,45 @@ static int probe_rc;
 static struct nft_port_probe probed;
 static const struct net_device *probed_out[CDX_MC_MAX_LISTENERS];
 static unsigned probes;
+/* The IP hooks br_netfilter hands a flow's frames to, asked as the routed
+ * learner asks of a group: the stream from a device and out of the bridge.
+ * The last two devices asked in are kept; ip_rc and xt_rc are the two
+ * walks' answers, and bpf_hooked a BPF program at the family's IP hooks. */
+static int ip_rc, xt_rc;
+static bool bpf_hooked;
+static const struct net_device *ip_in[2];
+static unsigned ip_probes;
+static int nft_port_dependent(int *net, const struct nft_port_probe *probe);
+static struct net_device BR;
+static int nft_ip_probe(const struct nft_port_probe *probe)
+{
+    assert(probe->in && probe->nout == 1 && probe->out[0] == &BR);
+    ip_in[0] = ip_in[1];
+    ip_in[1] = probe->in;
+    ip_probes++;
+    probed = *probe;
+    return ip_rc;
+}
+static int nf_xt_port_dependent(int *net, const struct nft_port_probe *probe)
+{
+    assert(net == &init_net && !probe->bridged);
+    return xt_rc;
+}
+static bool ft_mr_bpf_hooked(u8 family)
+{
+    (void)family;
+    return bpf_hooked;
+}
+/* The bridge's VLAN device for a VLAN, as the receive path finds it. */
+static struct net_device *__vlan_find_dev_deep_rcu(struct net_device *dev, uint16_t proto,
+                                                   uint16_t vid);
 static int nft_port_dependent(int *net, const struct nft_port_probe *probe)
 {
     int rc = 0;
 
-    assert(net == &init_net && probe->bridged && probe->in);
+    assert(net == &init_net && probe->in);
+    if (!probe->bridged)
+        return nft_ip_probe(probe);
     assert(probe->nout <= CDX_MC_MAX_LISTENERS && (!probe->nout || probe->out));
     probes++;
     probed = *probe;
@@ -855,6 +900,13 @@ static struct net_device BR2  = { .name = "br1",  .ifindex = 15, .bridge_master 
 /* The bridge's VLAN device, which what it hands up in that VLAN goes on to. */
 static struct net_device BRV  = { .name = "br0.289", .ifindex = 16, .vlan_of = &BR };
 
+static struct net_device *__vlan_find_dev_deep_rcu(struct net_device *dev, uint16_t proto,
+                                                   uint16_t vid)
+{
+    assert(proto == htons(ETH_P_8021Q));
+    return dev == &BR && vid == 289 ? &BRV : NULL;
+}
+
 static const u8 GROUP_MAC[ETH_ALEN] = { 0x01, 0, 0x5e, 0x07, 0, 0x01 };
 static const u8 SENDER[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x51 };
 static const u8 OTHER_SENDER[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x52 };
@@ -1038,6 +1090,9 @@ static void reset(void)
     P1.chain_in = P2.chain_in = P3.chain_in = false;
     P1.chain_out = P2.chain_out = P3.chain_out = false;
     probe_rc = 0;
+    brnf_hooked = ft_mc_brnf = bpf_hooked = false;
+    ip_rc = xt_rc = 0;
+    ip_probes = 0;
     /* A fresh learner: an empty ring and nothing recorded. */
     memset(ft_mc_last, 0, sizeof(ft_mc_last));
     ft_mc_ring_head = ft_mc_ring_tail = 0;
@@ -3738,6 +3793,93 @@ static void tc_keeps_a_flow_in_software(void)
     assert(f->hw && f->hw_discard && !strcmp(ft_mc_state(f), "discarding"));
 }
 
+static void br_netfilter_walks_the_ip_hooks(void)
+{
+    const uint32_t G = 0x1b0007ef, S = 0x0100000a;
+    struct br_ip any = group_v4(G, 0, 0);
+    unsigned long long refused;
+    struct ft_mc_flow *f;
+
+    /* br_netfilter, as Docker loads it, hands what the bridge forwards to
+     * the IP hooks: no bridge hook it registers refuses a flow, and each
+     * flow is asked instead what prerouting, forward and postrouting do to
+     * its stream, from the bridge and out of it. */
+    reset();
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, 0, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && !strcmp(ft_mc_state(f), "installed") && !ip_probes);
+    refused = ft_mc_refused;
+
+    /* Loaded: the worker finds it at its next pass and asks every flow
+     * again, the installed one included, and a ruleset that treats its
+     * stream alike keeps it in hardware. */
+    brnf_hooked = true;
+    ft_mc_work_fn(NULL);
+    assert(ft_mc_brnf && ip_probes == 1 && ip_in[1] == &BR && !probed.bridged);
+    assert(probed.family == NFPROTO_IPV4 && probed.saddr.ip == S && probed.daddr.ip == G);
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* One that may not -- in nftables, in x_tables, or a BPF program at the
+     * IP hooks -- takes it out, as a netdev chain would. */
+    ip_rc = 1;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && f->nf_hooked && !strcmp(ft_mc_state(f), "refused-filter"));
+    assert(ft_mc_refused == refused + 1);
+    ip_rc = 0;
+    xt_rc = 1;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-filter"));
+    xt_rc = 0;
+    bpf_hooked = true;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && !strcmp(ft_mc_state(f), "refused-filter"));
+    bpf_hooked = false;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* A walk a commit interrupted keeps the answer the flow had. */
+    ip_rc = -EAGAIN;
+    f->dirty = true;
+    pass();
+    assert(f->hw && !f->nf_hooked);
+    ip_rc = -E2BIG;
+    f->dirty = true;
+    pass();
+    assert(!f->hw && f->nf_hooked && ft_mc_port_probe_errors == 1);
+    ft_mc_port_probe_errors = 0;
+    ip_rc = 0;
+
+    /* Unloaded: asked again, and the IP hooks no more. */
+    brnf_hooked = false;
+    ip_probes = 0;
+    ft_mc_work_fn(NULL);
+    assert(!ft_mc_brnf && !ip_probes && f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* A flow in a VLAN the bridge has a device for is asked from both,
+     * as bridge-nf-pass-vlan-input-dev may name either. */
+    reset();
+    vlan_enabled = true;
+    member(&P1, 289, false);
+    member(&P2, 289, false);
+    any = group_v4(G, 0, 289);
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 289, 0, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
+    brnf_hooked = true;
+    ft_mc_work_fn(NULL);
+    f = flow(&P1, S, 289);
+    assert(f && f->hw && ip_probes >= 2);
+    assert(ip_in[0] == &BR && ip_in[1] == &BRV);
+    reset();
+}
+
 static void a_netdev_chain_keeps_a_flow_in_software(void)
 {
     const uint32_t G = 0x1a0007ef, S = 0x0100000a;
@@ -4362,6 +4504,7 @@ int main(void)
     a_bridge_filter_refuses_every_flow();
     tc_keeps_a_flow_in_software();
     a_netdev_chain_keeps_a_flow_in_software();
+    br_netfilter_walks_the_ip_hooks();
     a_port_moves_between_bridges();
     idle_flows_age_out();
     the_learner_keeps_a_bounded_number_of_flows();

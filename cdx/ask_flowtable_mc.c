@@ -189,6 +189,10 @@ bool ft_mc_recheck;
  * last pass, and no flow may be carried: see ft_mc_bridge_filtered(). Written
  * by the worker under ft_mc_lock. */
 bool ft_mc_filtered;
+/* br_netfilter's hooks were registered at the worker's last pass, and every
+ * flow is asked about the IP hooks they hand its frames to: see
+ * ft_mc_brnf_dependent(). Written by the worker under ft_mc_lock. */
+bool ft_mc_brnf;
 /* The routes and taps the routed learner publishes, under ft_mc_lock; what
  * each route is told back, under the leaf below. */
 LIST_HEAD(ft_mc_routes);
@@ -1258,8 +1262,9 @@ static bool ft_mc_soft_bridged(const struct net_device *dev)
 
 /* What a bridge's hand-up copy crosses: the bridge's own LOCAL_IN hook, the
  * bridge device's way in, and that of the devices above it -- a VLAN device, a
- * macvlan -- which the receive path hands it on to. Under RTNL, which keeps
- * the upper list as RCU would, and lets the tc walk sleep. */
+ * macvlan -- which the receive path hands it on to. br_netfilter's LOCAL_IN
+ * hook only confirms the copy's conntrack. Under RTNL, which keeps the upper
+ * list as RCU would, and lets the tc walk sleep. */
 static void ft_mc_soft_bridge(struct ft_mc_soft_dev *d, struct net_device *br)
 {
 	struct net_device *upper;
@@ -1268,7 +1273,7 @@ static void ft_mc_soft_bridge(struct ft_mc_soft_dev *d, struct net_device *br)
 	ASSERT_RTNL();
 	d->tc_in = ft_dev_tc_soft(br, true);
 	d->nf_in = ft_dev_nf_ingress_hooked(br) ||
-		   ft_bridge_hooked(BIT(NF_BR_LOCAL_IN));
+		   ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_IN));
 	netdev_for_each_upper_dev_rcu(br, upper, iter) {
 		d->tc_in |= ft_dev_tc_soft(upper, true);
 		d->nf_in |= ft_dev_nf_ingress_hooked(upper);
@@ -1377,6 +1382,63 @@ static bool ft_mc_netdev_dependent(const struct ft_mc_flow *f,
 	return rc != 0;
 }
 
+/* Whether the IP hooks br_netfilter hands a flow's frames to could tell its
+ * streams apart, drop them or translate them, as the routed learner asks of
+ * its groups (ft_mr_ports_matter()): prerouting with its NAT chains, then
+ * forward and postrouting for every copy, conntrack and x_tables included,
+ * each copy with the bridge as its output and the bridge as its input -- or,
+ * as bridge-nf-pass-vlan-input-dev may have it, the bridge's VLAN device for
+ * the flow's VLAN, so both are asked. The walk asks more than a bridged copy
+ * crosses: netdev chains on the bridge and below it, which ask nothing a
+ * bridged frame does not answer alike. A netfilter BPF program at any of those
+ * hooks, which nothing reads, refuses the flow too. A walk a commit
+ * interrupted, or that found no memory, keeps the answer as
+ * ft_mc_netdev_dependent() does. Called with RTNL and ft_mc_lock held; the
+ * walks take neither, and do not sleep. */
+static bool ft_mc_brnf_dependent(const struct ft_mc_flow *f, bool same)
+{
+	const struct net_device *out[1] = { f->bridge };
+	const struct net_device *in[2];
+	struct nft_port_probe probe = {
+		.out = out,
+		.nout = 1,
+	};
+	struct net_device *upper;
+	unsigned int n = 0, i;
+	int rc = 0;
+
+	if (ft_mc_family(&f->addr) == AF_INET6) {
+		probe.family = NFPROTO_IPV6;
+		probe.saddr.in6 = f->addr.src.ip6;
+		probe.daddr.in6 = f->addr.dst.ip6;
+	} else {
+		probe.family = NFPROTO_IPV4;
+		probe.saddr.ip = f->addr.src.ip4;
+		probe.daddr.ip = f->addr.dst.ip4;
+	}
+	if (ft_mr_bpf_hooked(ft_mc_family(&f->addr)))
+		return true;
+	rcu_read_lock();
+	in[n++] = f->bridge;
+	if (f->addr.vid) {
+		upper = __vlan_find_dev_deep_rcu(f->bridge, htons(ETH_P_8021Q), f->addr.vid);
+		if (upper)
+			in[n++] = upper;
+	}
+	for (i = 0; i < n && !rc; i++) {
+		probe.in = in[i];
+		rc = nf_xt_port_dependent(&init_net, &probe);
+		if (!rc)
+			rc = nft_port_dependent(&init_net, &probe);
+	}
+	rcu_read_unlock();
+	if (rc == -EAGAIN || rc == -ENOMEM)
+		return !same || f->nf_hooked;
+	if (rc < 0)
+		ft_mc_port_probe_errors++;
+	return rc != 0;
+}
+
 /* Ask the bridge what it does with this flow's frames, and keep the answer.
  *
  * br_multicast_list_ports() models the bridge's own receive path for a frame
@@ -1474,6 +1536,9 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *sof
 	same = f->derived && ports == f->ports &&
 	       ft_mc_listeners_same(port, f->port, ports);
 	if (ft_mc_netdev_dependent(f, port, ports, same))
+		nf_hooked = true;
+	/* And under br_netfilter, the IP hooks it hands the frames to. */
+	if (READ_ONCE(ft_mc_brnf) && ft_mc_brnf_dependent(f, same))
 		nf_hooked = true;
 	if (same && error == f->error && local == f->local &&
 	    tc_soft == f->tc_soft && nf_hooked == f->nf_hooked)
@@ -1625,7 +1690,7 @@ bool ft_mc_evict_discard(u8 family)
  */
 static void ft_mc_work_fn(struct work_struct *work)
 {
-	bool want_hook, told, derive = false, filtered;
+	bool want_hook, told, derive = false, filtered, brnf;
 	struct ft_mc_group *g, *gtmp;
 	struct ft_mc_flow *f, *ftmp;
 	struct ft_mc_route *r;
@@ -1642,23 +1707,30 @@ static void ft_mc_work_fn(struct work_struct *work)
 	 * against a port that has since changed is not a flow that cannot be
 	 * carried. */
 	filtered = ft_mc_bridge_filtered();
-	/* Said once per change: a hook that is never unregistered --
-	 * br_netfilter once loaded, an ebtables table once used -- keeps every
-	 * bridged stream in software for the boot, and without this only /proc
-	 * would say why. */
+	brnf = ft_mc_brnf_hooked();
+	/* Said once per change: a hook that is never unregistered -- an
+	 * ebtables table once used -- keeps every bridged stream in software
+	 * for the boot, and without this only /proc would say why. */
 	if (filtered != READ_ONCE(ft_mc_filtered)) {
 		if (filtered)
 			pr_info("cdx: a bridge netfilter hook is registered; bridged multicast stays in software while it is\n");
 		else
 			pr_info("cdx: no bridge netfilter hook remains; bridged multicast offload resumes\n");
 	}
-	if (READ_ONCE(ft_mc_recheck) || filtered != READ_ONCE(ft_mc_filtered)) {
+	if (READ_ONCE(ft_mc_recheck) || filtered != READ_ONCE(ft_mc_filtered) ||
+	    brnf != READ_ONCE(ft_mc_brnf)) {
+		/* br_netfilter coming or going changes what every flow's
+		 * frames cross, which only a derivation asks. */
+		bool rederive = brnf != READ_ONCE(ft_mc_brnf);
+
 		WRITE_ONCE(ft_mc_recheck, false);
 		mutex_lock(&ft_mc_lock);
 		WRITE_ONCE(ft_mc_filtered, filtered);
+		WRITE_ONCE(ft_mc_brnf, brnf);
 		list_for_each_entry(f, &ft_mc_flows, list) {
 			f->retries = 0;
 			f->stale = true;
+			f->dirty |= rederive;
 		}
 		/* And a source turned away under the old answer -- a filter
 		 * hook refusing its group -- may be learned under this one. */

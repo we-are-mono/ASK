@@ -801,7 +801,8 @@ static bool ft_mr_tc_filtered(const struct ft_mr_plan *plan)
  * confirmed the group passed it, but a hook there may judge the rest by their
  * ports, so any hook there keeps a group whose parent VIF is on a bridge in
  * software too -- an nftables bridge chain the port walk would refuse anyway,
- * ebtables and br_netfilter nothing else reads. So does a chain that runs
+ * and ebtables, which nothing else reads -- save br_netfilter's, which judges
+ * nothing. So does a chain that runs
  * after the observer at POST_ROUTING itself, and a netfilter BPF program at
  * any hook a copy crosses, which nothing reads. And a confirmed group is
  * carried only if the ruleset would treat every other packet of it as it did
@@ -819,7 +820,10 @@ enum ft_mr_state ft_mr_admit(struct ft_mr_group *g,
 	if (plan->out_bridged &&
 	    ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)))
 		return FT_MR_REFUSED_FILTER;
-	if (plan->via && ft_bridge_hooked(BIT(NF_BR_LOCAL_IN)))
+	/* br_netfilter's LOCAL_IN hook only confirms a handed-up copy's
+	 * conntrack; the IP rules it ran at the bridge's PRE_ROUTING are the
+	 * prerouting the port walk reads, which the receive path then skips. */
+	if (plan->via && ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_IN)))
 		return FT_MR_REFUSED_FILTER;
 	if (ft_mr_observer_followed(g->family) || ft_mr_bpf_hooked(g->family))
 		return FT_MR_REFUSED_FILTER;

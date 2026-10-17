@@ -178,15 +178,19 @@ int main(void)
     assert(ft_mc_bridge_filtered());
     registered(NF_BR_PRE_ROUTING, 1, &ft_mc_hook_ops);
 
-    /* An nftables bridge chain at FORWARD; br_netfilter at POST_ROUTING,
-     * whatever it would then do with the frame. */
+    /* An nftables bridge chain at FORWARD, or an ebtables table, refuses
+     * every flow; br_netfilter at POST_ROUTING refuses none, its flows being
+     * asked about the IP hooks it hands their frames to instead. */
     registered(NF_BR_FORWARD, 1, &nft_chain);
-    assert(ft_mc_bridge_filtered());
+    assert(ft_mc_bridge_filtered() && !ft_mc_brnf_hooked());
     registered(NF_BR_FORWARD, 0);
     assert(!ft_mc_bridge_filtered());
     registered(NF_BR_POST_ROUTING, 1, &br_netfilter);
-    assert(ft_mc_bridge_filtered());
+    assert(!ft_mc_bridge_filtered() && ft_mc_brnf_hooked());
+    registered(NF_BR_POST_ROUTING, 2, &br_netfilter, &ebtables);
+    assert(ft_mc_bridge_filtered() && ft_mc_brnf_hooked());
     registered(NF_BR_POST_ROUTING, 0);
+    assert(!ft_mc_brnf_hooked());
 
     /* The host's own traffic is none of a forwarded frame's business. */
     registered(NF_BR_LOCAL_IN, 1, &nft_chain);

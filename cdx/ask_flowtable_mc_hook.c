@@ -417,9 +417,10 @@ bool ft_bridge_hooked(unsigned int hooks)
 	return ft_bridge_hook_kinds(hooks);
 }
 
-/* The same question for a frame routed through a bridge rather than bridged
- * by it: br_netfilter's hooks pass such a frame untouched -- it never had a
- * physoutdev (br_nf_post_routing()) -- so they do not count. */
+/* The same question for a frame a bridge routes rather than bridges: one
+ * leaving through it, which br_nf_post_routing() passes untouched -- it never
+ * had a physoutdev -- or one handed up through it, whose conntrack
+ * br_nf_local_in() only confirms. br_netfilter's hooks do not count. */
 bool ft_bridge_hooked_routed(unsigned int hooks)
 {
 	return ft_bridge_hook_kinds(hooks) & ~FT_BRIDGE_HOOK_BRNF;
@@ -457,19 +458,28 @@ bool ft_dev_nf_ingress_hooked(const struct net_device *dev)
 
 /* Whether a bridge hook sees the frames a bridge forwards: at PRE_ROUTING,
  * FORWARD or POST_ROUTING. An nftables bridge-family chain, an ebtables
- * table, br_netfilter handing bridged traffic to iptables -- any of them can
- * drop, count or mark a forwarded frame, and an installed entry replicates at
- * the classifier where none of them runs. So while one is registered, no
- * bridged flow is carried.
+ * table -- either can drop, count or mark a forwarded frame, and an installed
+ * entry replicates at the classifier where neither runs. So while one is
+ * registered, no bridged flow is carried. br_netfilter's own hooks are not
+ * counted: what they hand a frame to is the IP hooks, which each flow is
+ * asked about instead (ft_mc_brnf_hooked(), ft_mc_brnf_dependent()).
  *
  * The worker asks at every pass, and the refresh runs one every interval
- * while any flow exists. br_netfilter is counted whatever its call-iptables
- * settings say, since those are its own and its hooks sit at FORWARD and
- * POST_ROUTING regardless. */
+ * while any flow exists. */
 bool ft_mc_bridge_filtered(void)
 {
-	return ft_bridge_hooked(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
-				BIT(NF_BR_POST_ROUTING));
+	return ft_bridge_hook_kinds(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
+				    BIT(NF_BR_POST_ROUTING)) & ~FT_BRIDGE_HOOK_BRNF;
+}
+
+/* Whether br_netfilter's hooks are where a forwarded frame passes, and so may
+ * hand a flow's frames to the IP hooks -- as Docker has them, which loads it.
+ * Counted whatever its bridge-nf-call-* settings say, which are its own: a
+ * frame they keep from the IP hooks loses nothing by the question. */
+bool ft_mc_brnf_hooked(void)
+{
+	return ft_bridge_hook_kinds(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
+				    BIT(NF_BR_POST_ROUTING)) & FT_BRIDGE_HOOK_BRNF;
 }
 
 /* The hook exists only while a membership or a route could name a flow. A box
