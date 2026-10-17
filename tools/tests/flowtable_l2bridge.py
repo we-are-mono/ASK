@@ -131,6 +131,45 @@ async def _carried(r, timeout=10, since=None):
         await _exchange(r, count=4)
 
 
+TWO_TAGS = "vlanport-trunk"
+
+
+def _lan_nic_mtu(lan, mtu):
+    """The LAN VM's NIC at `mtu`, its link up again for five seconds running.
+    An ixgbe MTU change resets the port and retrains the link, which on this
+    bench's 10GBASE-T link has taken from seconds to over three minutes."""
+    lan.run(f"ip link set dev {LAN_NIC} mtu {mtu}")
+    started, stable = time.monotonic(), 0
+    while time.monotonic() < started + 300:
+        up = lan.run(f"cat /sys/class/net/{LAN_NIC}/operstate").stdout.strip() == "up"
+        stable = stable + 1 if up else 0
+        if stable >= 5:
+            return
+        time.sleep(1)
+    raise AssertionError(f"{LAN_NIC} stayed down after its MTU went to {mtu}")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def lan_two_tags(lan, request):
+    """A full-size frame with two tags is a tag longer than the LAN VM's port
+    receives at its MTU, so the port is raised by four bytes for the file when
+    a "vlanport-trunk" case runs, and lowered once after it, as
+    flowtable_jumbo.py raises it: every change retrains the link, and
+    retraining it per case lost the link to the cases after it. Every shape
+    keeps the station's own packets at 1500 (_segment())."""
+    wanted = any(item.module is request.module and TWO_TAGS in item.nodeid
+                 for item in request.session.items)
+    old = int(lan.run(f"cat /sys/class/net/{LAN_NIC}/mtu").stdout.strip())
+    if not wanted:
+        yield
+        return
+    try:
+        _lan_nic_mtu(lan, old + 4)
+        yield
+    finally:
+        _lan_nic_mtu(lan, old)
+
+
 async def _segment(r, stack, shape):
     """br-l2 over eth3 and eth4, as the module docstring describes. The
     "trunk" shape has the LAN VM tagged 3900 on eth3 as well, which has no
@@ -227,25 +266,23 @@ async def _segment(r, stack, shape):
 
     # The station: a second address on the LAN VM's port, or on a VLAN
     # device over it.
+    # The station's packets are 1500 bytes at most in every shape, whatever
+    # the NIC under them is raised to (lan_two_tags()): a VLAN device takes
+    # its parent's MTU when it is made.
     if shape == "vlanport-trunk":
         # Two tags: the port's VLAN device's outside, the bridge's inside.
         outer = await lan_vlan_subif(stack, r.lan, parent=LAN_NIC, vid=PORT_VID)
-        await lan_vlan_subif(stack, r.lan, parent=outer, vid=VID, ipv4=f"{STATION_ADDR}/{PREFIX}")
-        # A full-size frame with both tags is a tag longer than the VLAN
-        # VM's port receives at its MTU; raised after the VLAN devices, which
-        # keep theirs, so only the frames grow, never the packets.
-        base = json.loads((await lan_run(r.lan, f"ip -j link show dev {LAN_NIC}", 10)).stdout)
-        base_mtu = base[0]["mtu"]
-        raised = await lan_run(r.lan, f"ip link set {LAN_NIC} mtu {base_mtu + 4}", 10)
-        assert raised.rc == 0, raised.stdout
-
-        async def lower_lan_mtu():
-            result = await lan_run(r.lan, f"ip link set {LAN_NIC} mtu {base_mtu}", 10)
-            return {"rc": result.rc, "stdout": result.stdout}
-        stack.push(lower_lan_mtu)
+        inner = await lan_vlan_subif(stack, r.lan, parent=outer, vid=VID,
+                                     ipv4=f"{STATION_ADDR}/{PREFIX}")
+        for dev in (inner, outer):
+            pinned = await lan_run(r.lan, f"ip link set {dev} mtu 1500", 10)
+            assert pinned.rc == 0, pinned.stdout
     elif shape != "access":
-        await lan_vlan_subif(stack, r.lan, parent=LAN_NIC, vid=VID if shape == "trunk" else PORT_VID,
-                             ipv4=f"{STATION_ADDR}/{PREFIX}")
+        dev = await lan_vlan_subif(stack, r.lan, parent=LAN_NIC,
+                                   vid=VID if shape == "trunk" else PORT_VID,
+                                   ipv4=f"{STATION_ADDR}/{PREFIX}")
+        pinned = await lan_run(r.lan, f"ip link set {dev} mtu 1500", 10)
+        assert pinned.rc == 0, pinned.stdout
     else:
         await lan_run(r.lan, f"ip addr del {STATION_ADDR}/{PREFIX} dev {LAN_NIC} 2>/dev/null; true", 10)
         checked = await lan_run(r.lan, f"ip addr add {STATION_ADDR}/{PREFIX} dev {LAN_NIC}", 10)
@@ -255,6 +292,10 @@ async def _segment(r, stack, shape):
             result = await lan_run(r.lan, f"ip addr del {STATION_ADDR}/{PREFIX} dev {LAN_NIC}", 10)
             return {"rc": result.rc, "stdout": result.stdout}
         stack.push(drop_station)
+        pinned = await lan_run(r.lan, f"ip route replace {PEER_ADDR.rsplit('.', 1)[0]}.0/{PREFIX} "
+                                      f"dev {LAN_NIC} proto kernel scope link src {STATION_ADDR} "
+                                      f"mtu 1500", 10)
+        assert pinned.rc == 0, pinned.stdout
     link = json.loads((await lan_run(r.lan, f"ip -j link show dev {LAN_NIC}", 10)).stdout)
     r.station_mac = link[0]["address"]
 
@@ -943,6 +984,7 @@ async def test_l2_hook_after_confirmation(l2_rig):
         await command(r.target, r.session, "nft", "delete", "table", "bridge", FILTER_TABLE,
                       check=False)
     await _carried(r)
+
 
 async def _tcp(r, seconds=3):
     """A TCP stream from the station to the peer, at a rate the CPU forwards."""
