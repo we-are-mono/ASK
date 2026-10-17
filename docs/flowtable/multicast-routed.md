@@ -422,9 +422,17 @@ port's copies confirm the group and the dropped port ride its entry. So a
 group whose parent VIF is on a bridge is `refused-filter` while any hook is
 registered at the bridge's `input`: ebtables, or an nftables bridge chain,
 which the port walk below would refuse as well. br_netfilter's hook there only
-confirms the handed-up copy's conntrack, and counts nowhere: the IP rules it
-runs at the bridge's `prerouting` are the prerouting the port walk reads,
-which the receive path then skips (A389).
+confirms the handed-up copy's conntrack, and counts nowhere (A389). What
+br_netfilter does change is prerouting: it runs it for the stream the bridge
+hands up with the bridge as the input -- or, with
+`bridge-nf-pass-vlan-input-dev`, the bridge's VLAN device for a tagged frame --
+and the receive path then skips prerouting on the VIF above the bridge. So
+while br_netfilter is hooked, a group whose parent VIF is a VLAN device on a
+bridge is walked twice, prerouting once with the bridge as its input and once
+with the VIF, forward with the VIF both times (patch 175 gives the probe a
+prerouting input of its own). A mark set at prerouting for the bridge that a
+forward rule then splits the group's ports on keeps the group out
+(`flowtable_service_multicast_bridge.py::test_br_netfilter_routed_prerouting`).
 
 **Every packet alike.** A copy seen leaving proves that the ruleset forwarded
 that copy. The classifier key stops at the address pair, so every other packet

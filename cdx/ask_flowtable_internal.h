@@ -395,6 +395,10 @@ struct ft_mc_flow {
 	 * runs in software on a bridged flow's ports. */
 	bool tc_soft;
 	bool nf_hooked;
+	/* nf_hooked holds an answer about the IP hooks br_netfilter hands the
+	 * frames to: a walk a commit interrupts keeps only an answer that
+	 * asked them (ft_mc_brnf_dependent()). */
+	bool brnf_walked;
 	/* The routed half of the flow's stream; see the section on the
 	 * learners' streams above. `route` is the published route whose
 	 * source and bridge VLAN are this flow's, matched by the worker and

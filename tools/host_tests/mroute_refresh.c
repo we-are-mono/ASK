@@ -242,10 +242,17 @@ struct nft_port_probe {
     union nf_inet_addr saddr;
     union nf_inet_addr daddr;
     const struct net_device *in;
+    const struct net_device *pre_in;
     const struct net_device * const *out;
     unsigned int nout;
     bool bridged;
 };
+/* br_netfilter's hooks at the bridge, as ft_bridge_hook_kinds() finds them,
+ * and the prerouting input the last walk was asked with. */
+#define FT_BRIDGE_HOOK_BRNF (1U << 1)
+static unsigned brnf_kinds;
+static unsigned ft_bridge_hook_kinds(unsigned hooks) { (void)hooks; return brnf_kinds; }
+static const struct net_device *probed_pre_in;
 static int rcu_depth;
 static void rcu_read_lock(void) { rcu_depth++; }
 static void rcu_read_unlock(void) { assert(rcu_depth > 0); rcu_depth--; }
@@ -311,6 +318,7 @@ static int nf_xt_port_dependent(const void *net, const struct nft_port_probe *p)
     assert(net == &init_net && xtables_answer != -EAGAIN);
     probe_is_the_plan(p);
     probed_family = p->family;
+    probed_pre_in = p->pre_in;
     xtables_asks++;
     return xtables_answer;
 }
@@ -319,6 +327,7 @@ static int nft_port_dependent(const void *net, const struct nft_port_probe *p)
     assert(net == &init_net);
     probe_is_the_plan(p);
     probed_family = p->family;
+    probed_pre_in = p->pre_in;
     ports_asks++;
     return ports_answer;
 }
@@ -1403,6 +1412,22 @@ int main(void)
         run();
         assert(g->state == FT_MR_INSTALLED && g->offloaded &&
                cache.mfc_flags == MFC_OFFLOAD && !hardware.live);
+        /* With br_netfilter at the bridge, the stream met prerouting with
+         * the bridge as its input and the VIF skipped it: walked once more,
+         * prerouting from the bridge (patch 175). */
+        {
+            unsigned asks = ports_asks, xasks = xtables_asks;
+
+            brnf_kinds = FT_BRIDGE_HOOK_BRNF;
+            ft_mr_recheck = true;
+            run();
+            assert(ports_asks == asks + 2 && xtables_asks == xasks + 2);
+            assert(probed_pre_in == &bridge && g->state == FT_MR_INSTALLED);
+            brnf_kinds = 0;
+            ft_mr_recheck = true;
+            run();
+            assert(!probed_pre_in && g->state == FT_MR_INSTALLED);
+        }
         unsigned folding = folds;
         refresh();
         assert(folds == folding + 1 && folded.packets == 7 && folded_tags == 1);

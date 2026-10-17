@@ -545,6 +545,20 @@ static int ft_mr_ports_matter(const struct ft_mr_group *g,
 		*why = FT_MR_REFUSED_XTABLES;
 	else
 		rc = nft_port_dependent(&init_net, &probe);
+	/* A VIF on a VLAN of a bridge br_netfilter hooks: the stream met
+	 * prerouting as br_netfilter ran it, with the bridge as its input --
+	 * or the VIF, as bridge-nf-pass-vlan-input-dev may have it -- and the
+	 * receive path skipped prerouting on the VIF itself. Both are asked
+	 * (patch 175). */
+	if (!rc && plan->via && plan->via != probe.in &&
+	    (ft_bridge_hook_kinds(BIT(NF_BR_PRE_ROUTING)) & FT_BRIDGE_HOOK_BRNF)) {
+		probe.pre_in = plan->via;
+		rc = nf_xt_port_dependent(&init_net, &probe);
+		if (rc)
+			*why = FT_MR_REFUSED_XTABLES;
+		else
+			rc = nft_port_dependent(&init_net, &probe);
+	}
 unlock:
 	rcu_read_unlock();
 	return rc;

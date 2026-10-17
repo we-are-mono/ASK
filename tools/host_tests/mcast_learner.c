@@ -599,6 +599,7 @@ struct nft_port_probe {
     union nf_inet_addr saddr;
     union nf_inet_addr daddr;
     const struct net_device *in;
+    const struct net_device *pre_in;
     const struct net_device *const *out;
     unsigned int nout;
     bool bridged;
@@ -613,7 +614,7 @@ static unsigned probes;
  * walks' answers, and bpf_hooked a BPF program at the family's IP hooks. */
 static int ip_rc, xt_rc;
 static bool bpf_hooked;
-static const struct net_device *ip_in[2];
+static const struct net_device *ip_in[2], *ip_pre[4];
 static unsigned ip_probes;
 static int nft_port_dependent(int *net, const struct nft_port_probe *probe);
 static struct net_device BR;
@@ -622,6 +623,8 @@ static int nft_ip_probe(const struct nft_port_probe *probe)
     assert(probe->in && probe->nout == 1 && probe->out[0] == &BR);
     ip_in[0] = ip_in[1];
     ip_in[1] = probe->in;
+    memmove(ip_pre, ip_pre + 1, sizeof(ip_pre) - sizeof(ip_pre[0]));
+    ip_pre[3] = probe->pre_in;
     ip_probes++;
     probed = *probe;
     return ip_rc;
@@ -3849,6 +3852,20 @@ static void br_netfilter_walks_the_ip_hooks(void)
     f->dirty = true;
     pass();
     assert(f->hw && !f->nf_hooked);
+    /* But not one from before br_netfilter came, which never asked the IP
+     * hooks: the first walk under it, interrupted, keeps the flow out. */
+    brnf_hooked = false;
+    ip_rc = 0;
+    ft_mc_work_fn(NULL);
+    assert(f->hw && !f->brnf_walked);
+    brnf_hooked = true;
+    ip_rc = -EAGAIN;
+    ft_mc_work_fn(NULL);
+    assert(!f->hw && f->nf_hooked && !strcmp(ft_mc_state(f), "refused-filter"));
+    ip_rc = 0;
+    f->dirty = true;
+    pass();
+    assert(f->hw && f->brnf_walked);
     ip_rc = -E2BIG;
     f->dirty = true;
     pass();
@@ -3862,8 +3879,9 @@ static void br_netfilter_walks_the_ip_hooks(void)
     ft_mc_work_fn(NULL);
     assert(!ft_mc_brnf && !ip_probes && f->hw && !strcmp(ft_mc_state(f), "installed"));
 
-    /* A flow in a VLAN the bridge has a device for is asked from both,
-     * as bridge-nf-pass-vlan-input-dev may name either. */
+    /* A flow in a VLAN the bridge has a device for is asked from both, as
+     * bridge-nf-pass-vlan-input-dev may name either, at prerouting and at
+     * forward apart: every pairing. */
     reset();
     vlan_enabled = true;
     member(&P1, 289, false);
@@ -3877,6 +3895,7 @@ static void br_netfilter_walks_the_ip_hooks(void)
     f = flow(&P1, S, 289);
     assert(f && f->hw && ip_probes >= 2);
     assert(ip_in[0] == &BR && ip_in[1] == &BRV);
+    assert(ip_pre[0] == &BR && ip_pre[1] == &BR && ip_pre[2] == &BRV && ip_pre[3] == &BRV);
     reset();
 }
 

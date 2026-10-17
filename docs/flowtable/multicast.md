@@ -643,10 +643,15 @@ hooks hand what the bridge forwards to the IP hooks, so while they are
 registered every flow is asked what those do to its stream, as the routed
 learner asks of its groups: `nf_xt_port_dependent()` and
 `nft_port_dependent()` walk prerouting with its NAT chains, then forward and
-postrouting, with the bridge as the copies' input and output -- and its VLAN
-device for the flow's VLAN as the input too, since
-`bridge-nf-pass-vlan-input-dev` may name either -- conntrack and x_tables
-included. A ruleset that could tell the group's streams apart, drop them or
+postrouting, with the bridge as the copies' output and as their input, or its
+VLAN device for the flow's VLAN, which `bridge-nf-pass-vlan-input-dev` may
+name instead -- at prerouting and at forward apart, so every pairing is asked
+(patch 175) -- conntrack and x_tables included. The walk asks more than a
+bridged copy crosses, the netdev chains on the bridge and every port below it
+among them, and refuses for a port it cannot follow through: a veth on the
+bridge, such as a container's, keeps every flow of that bridge in software
+under br_netfilter. A walk a commit interrupts keeps a flow's answer only if
+that answer already asked the IP hooks. A ruleset that could tell the group's streams apart, drop them or
 translate them refuses the flow, `refused-filter`, as a netdev chain does, and
 so does a netfilter BPF program at those hooks. The walk is asked whatever
 `bridge-nf-call-iptables` says, which is br_netfilter's own to read. It runs
@@ -657,7 +662,8 @@ test_br_netfilter_follows_the_ip_rules` drops one of a group's two UDP ports
 in an inet forward chain under br_netfilter: the flow comes out, only the kept
 port arrives, and both are carried again once the rule goes;
 `test_br_netfilter_bridge_and_route` carries a group bridged and routed at
-once with it loaded. The learner's own hook
+once with it loaded, and `test_br_netfilter_routed_prerouting` keeps one out
+whose routed copies a prerouting mark and a forward rule split. The learner's own hook
 does not count: it only observes. (VWD's Wi-Fi fast-path hook was exempted the
 same way until it was removed from CDX.) Hooks are per namespace, not per
 bridge, so this applies to every bridge.

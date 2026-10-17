@@ -1386,25 +1386,29 @@ static bool ft_mc_netdev_dependent(const struct ft_mc_flow *f,
  * streams apart, drop them or translate them, as the routed learner asks of
  * its groups (ft_mr_ports_matter()): prerouting with its NAT chains, then
  * forward and postrouting for every copy, conntrack and x_tables included,
- * each copy with the bridge as its output and the bridge as its input -- or,
- * as bridge-nf-pass-vlan-input-dev may have it, the bridge's VLAN device for
- * the flow's VLAN, so both are asked. The walk asks more than a bridged copy
+ * each copy with the bridge as its output. Its input is the bridge, or, as
+ * bridge-nf-pass-vlan-input-dev may have it, the bridge's VLAN device for
+ * the flow's VLAN -- at prerouting for a frame that arrived tagged, at
+ * forward for a copy that leaves tagged -- so every pairing is asked, with
+ * prerouting's apart (patch 175). The walk asks more than a bridged copy
  * crosses: netdev chains on the bridge and below it, which ask nothing a
- * bridged frame does not answer alike. A netfilter BPF program at any of those
- * hooks, which nothing reads, refuses the flow too. A walk a commit
- * interrupted, or that found no memory, keeps the answer as
- * ft_mc_netdev_dependent() does. Called with RTNL and ft_mc_lock held; the
- * walks take neither, and do not sleep. */
-static bool ft_mc_brnf_dependent(const struct ft_mc_flow *f, bool same)
+ * bridged frame does not answer alike, and refuse for a port the walk
+ * cannot follow, a veth among them. A netfilter BPF program at any of those
+ * hooks, which nothing reads, refuses the flow too. 0 when the ruleset
+ * treats the flow's packets alike, 1 when it may not, negative when it
+ * could not be judged. Called with RTNL and ft_mc_lock held; the walks take
+ * neither, and do not sleep. */
+static int ft_mc_brnf_dependent(const struct ft_mc_flow *f)
 {
 	const struct net_device *out[1] = { f->bridge };
-	const struct net_device *in[2];
+	const struct net_device *dev[2];
 	struct nft_port_probe probe = {
 		.out = out,
 		.nout = 1,
 	};
 	struct net_device *upper;
-	unsigned int n = 0, i;
+	unsigned int n = 0, i, j;
+	u16 proto = ETH_P_8021Q;
 	int rc = 0;
 
 	if (ft_mc_family(&f->addr) == AF_INET6) {
@@ -1417,26 +1421,26 @@ static bool ft_mc_brnf_dependent(const struct ft_mc_flow *f, bool same)
 		probe.daddr.ip = f->addr.dst.ip4;
 	}
 	if (ft_mr_bpf_hooked(ft_mc_family(&f->addr)))
-		return true;
+		return 1;
 	rcu_read_lock();
-	in[n++] = f->bridge;
+	dev[n++] = f->bridge;
 	if (f->addr.vid) {
-		upper = __vlan_find_dev_deep_rcu(f->bridge, htons(ETH_P_8021Q), f->addr.vid);
+		br_vlan_get_proto(f->bridge, &proto);
+		upper = __vlan_find_dev_deep_rcu(f->bridge, htons(proto), f->addr.vid);
 		if (upper)
-			in[n++] = upper;
+			dev[n++] = upper;
 	}
 	for (i = 0; i < n && !rc; i++) {
-		probe.in = in[i];
-		rc = nf_xt_port_dependent(&init_net, &probe);
-		if (!rc)
-			rc = nft_port_dependent(&init_net, &probe);
+		for (j = 0; j < n && !rc; j++) {
+			probe.pre_in = dev[i];
+			probe.in = dev[j];
+			rc = nf_xt_port_dependent(&init_net, &probe);
+			if (!rc)
+				rc = nft_port_dependent(&init_net, &probe);
+		}
 	}
 	rcu_read_unlock();
-	if (rc == -EAGAIN || rc == -ENOMEM)
-		return !same || f->nf_hooked;
-	if (rc < 0)
-		ft_mc_port_probe_errors++;
-	return rc != 0;
+	return rc;
 }
 
 /* Ask the bridge what it does with this flow's frames, and keep the answer.
@@ -1464,10 +1468,10 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *sof
 {
 	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
 	struct cdx_mc_listener port[CDX_MC_MAX_LISTENERS];
-	bool tc_soft = false, nf_hooked = false, same;
+	bool tc_soft = false, nf_hooked = false, same, brnf_walked;
 	struct ft_mc_seen seen;
 	unsigned int local = 0;
-	int n, error = 0;
+	int n, error = 0, rc;
 	u8 ports = 0, i;
 
 	ASSERT_RTNL();
@@ -1537,9 +1541,25 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *sof
 	       ft_mc_listeners_same(port, f->port, ports);
 	if (ft_mc_netdev_dependent(f, port, ports, same))
 		nf_hooked = true;
-	/* And under br_netfilter, the IP hooks it hands the frames to. */
-	if (READ_ONCE(ft_mc_brnf) && ft_mc_brnf_dependent(f, same))
-		nf_hooked = true;
+	/* And under br_netfilter, the IP hooks it hands the frames to. A walk
+	 * a commit interrupted, or that found no memory, keeps the answer the
+	 * flow had for the same ports only if that one asked them too. */
+	brnf_walked = false;
+	if (READ_ONCE(ft_mc_brnf)) {
+		rc = ft_mc_brnf_dependent(f);
+		if (rc == -EAGAIN || rc == -ENOMEM) {
+			if (!same || !f->brnf_walked || f->nf_hooked)
+				nf_hooked = true;
+			brnf_walked = same && f->brnf_walked;
+		} else {
+			if (rc < 0)
+				ft_mc_port_probe_errors++;
+			if (rc)
+				nf_hooked = true;
+			brnf_walked = true;
+		}
+	}
+	f->brnf_walked = brnf_walked;
 	if (same && error == f->error && local == f->local &&
 	    tc_soft == f->tc_soft && nf_hooked == f->nf_hooked)
 		return;

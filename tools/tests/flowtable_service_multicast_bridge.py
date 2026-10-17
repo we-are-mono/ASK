@@ -1278,8 +1278,10 @@ async def test_br_netfilter_follows_the_ip_rules(multicast_bridge_service):
             await _bridged_row(r, group, lambda g: g['state'] == 'installed')
             await _split_window(r, group, source, 'multicast-brnf-accepted', None)
 
+            # Named as br_netfilter names them: the bridge in and out.
             await dut('nft', 'add', 'rule', 'inet', INET_FILTER_TABLE, 'forward',
-                      'udp', 'dport', str(TC_DROPPED), 'drop')
+                      'iifname', BRIDGE, 'oifname', BRIDGE, 'udp', 'dport', str(TC_DROPPED),
+                      'drop')
             # Nothing announces a rule: the refresh asks again.
             await _bridged_row(r, group, lambda g: g['state'] == 'refused-filter')
             await _split_window(r, group, source, 'multicast-brnf-dropped', 'refused-filter')
@@ -1318,3 +1320,54 @@ async def test_br_netfilter_bridge_and_route(multicast_bridge_service):
                 int(_iptv_row(before, group)['packets'])
             assert counted >= FRAMING_COUNT * 0.95, (before, after)
             assert cpu < FRAMING_COUNT * 0.1, (cpu, idle)
+
+
+async def test_br_netfilter_routed_prerouting(multicast_bridge_service):
+    """br_netfilter runs prerouting for the stream its bridge hands up with
+    the bridge as the input, and the receive path then skips prerouting on
+    the VIF above it, br-ftmcast.289. A mark set there for the bridge, which a
+    forward rule then drops one UDP port of the routed copies on, splits the
+    group's streams, so the group stays out of hardware (patch 175): the
+    routed listener receives the kept port and nothing of the dropped one,
+    the set-top box both, and the CPU carries all of it."""
+    r = multicast_bridge_service
+    family = r.multicast_family
+    group = '239.9.5.12' if family == 4 else 'ff1e::9:5:c'
+    routed_dev = f'{BRIDGE}.{ROUTED_VID}'
+    async with _bridge_and_route(r, group) as route:
+        async with _br_netfilter(r) as dut:
+            await dut('nft', 'add', 'chain', 'inet', INET_FILTER_TABLE, 'pre',
+                      '{ type filter hook prerouting priority 0; policy accept; }')
+            await dut('nft', 'add', 'rule', 'inet', INET_FILTER_TABLE, 'pre',
+                      'iifname', BRIDGE, 'meta', 'mark', 'set', '1')
+            await dut('nft', 'add', 'rule', 'inet', INET_FILTER_TABLE, 'forward',
+                      'oifname', routed_dev, 'meta', 'mark', '1', 'udp', 'dport',
+                      str(TC_DROPPED), 'drop')
+            source = route.source
+            # The kept port alone, long enough for both learners to learn it
+            # and for its copies to confirm the route, as they would.
+            for _ in range(20):
+                await _from_wan(r, new_config(family, source, group, FRAMING_PORT, []), 16,
+                                r.wan_mac)
+                await asyncio.sleep(0.3)
+            state = await r.state()
+            row, routed = _iptv_row(state, group), _mroute_row(state, group)
+            r.record('multicast-brnf-routed-pre', {'row': row, 'routed': routed})
+            assert not row or row['state'] != 'installed', row
+            assert not routed or routed['state'] != 'installed', routed
+
+            kept = new_config(family, source, group, FRAMING_PORT, [LISTENER, ROUTED_LISTENER])
+            other = new_config(family, source, group, TC_DROPPED, [LISTENER, ROUTED_LISTENER])
+            async with capture(r.lan, kept) as kept_handle, capture(r.lan, other) as other_handle:
+                both = zip(frames(kept, {1: 512}, FRAMING_COUNT, source_mac=r.wan_mac),
+                           frames(other, {1: 512}, FRAMING_COUNT, source_mac=r.wan_mac))
+                await asyncio.to_thread(send, [frame for pair in both for frame in pair],
+                                        r.multicast_send_if)
+                await asyncio.sleep(0.5)
+            r.record('multicast-brnf-routed-pre-split', {'kept': kept_handle['result'],
+                                                         'dropped': other_handle['result']})
+            _assert_bridged_copy(kept_handle['result'][LISTENER], r.wan_mac, group)
+            _assert_routed_copy(kept_handle['result'][ROUTED_LISTENER], route.egress_mac, group)
+            _assert_bridged_copy(other_handle['result'][LISTENER], r.wan_mac, group)
+            dropped = other_handle['result'][ROUTED_LISTENER]
+            assert not dropped['errors'] and not dropped['seen'], dropped
