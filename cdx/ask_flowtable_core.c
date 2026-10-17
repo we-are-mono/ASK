@@ -1817,14 +1817,19 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
 	const unsigned long long keys4 = common | BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS);
 	const unsigned long long keys6 = common | BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS);
+	/* A protocol with no ports is described without the key
+	 * (nf_flow_rule_match()): ESP, GRE, IPv4 and IPv6 in IP. */
+	const unsigned long long portless4 = keys4 & ~BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
+	const unsigned long long portless6 = keys6 & ~BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
 	unsigned long long used, keys;
+	bool portless = false;
 	struct flow_rule *rule = cls->rule;
 	struct flow_match_meta meta;
 	struct flow_match_control control;
 	struct flow_match_basic basic;
 	struct flow_match_ipv4_addrs ipv4;
 	struct flow_match_ipv6_addrs ipv6;
-	struct flow_match_ports ports;
+	struct flow_match_ports ports = {};
 	struct flow_match_tcp tcp;
 	const struct flow_action_entry *action;
 	struct net_device *source;
@@ -1850,9 +1855,12 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		family = AF_INET;
 	else if (used == keys6 || used == (keys6 | BIT_ULL(FLOW_DISSECTOR_KEY_TCP)))
 		family = AF_INET6;
+	else if (used == portless4 || used == portless6)
+		family = used == portless6 ? AF_INET6 : AF_INET;
 	else
 		return ask_refuse(-EOPNOTSUPP);
-	keys = family == AF_INET6 ? keys6 : keys4;
+	portless = used == portless4 || used == portless6;
+	keys = portless ? used : family == AF_INET6 ? keys6 : keys4;
 	if (!cls->nf_ct)
 		return ask_refuse(-EOPNOTSUPP);
 	/* Sampled once: the admission test below and the class derived further
@@ -1877,7 +1885,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	flow_rule_match_meta(rule, &meta);
 	flow_rule_match_control(rule, &control);
 	flow_rule_match_basic(rule, &basic);
-	flow_rule_match_ports(rule, &ports);
+	if (!portless)
+		flow_rule_match_ports(rule, &ports);
 	if (meta.mask->ingress_ifindex != -1 || meta.mask->ingress_iftype ||
 	    meta.mask->l2_miss || meta.key->ingress_ifindex != binding->dev->ifindex ||
 	    control.mask->addr_type != 0xffff || control.mask->flags ||
@@ -1888,8 +1897,9 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    basic.key->n_proto != htons(family == AF_INET6 ? ETH_P_IPV6 : ETH_P_IP) ||
 	    basic.key->ip_proto != nf_ct_protonum(cls->nf_ct) ||
 	    nf_ct_l3num(cls->nf_ct) != family ||
-	    ports.mask->src != htons(0xffff) || ports.mask->dst != htons(0xffff) ||
-	    !ports.key->src || !ports.key->dst)
+	    (portless ? !cdx_ft_portless(family, basic.key->ip_proto) :
+	     ports.mask->src != htons(0xffff) || ports.mask->dst != htons(0xffff) ||
+	     !ports.key->src || !ports.key->dst))
 		return ask_refuse(-EOPNOTSUPP);
 	memset(out, 0, sizeof(*out));
 	out->family = family;
@@ -1908,8 +1918,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	}
 	if (!ft_endpoint(family, &out->src) || !ft_endpoint(family, &out->dst))
 		return ask_refuse(-EOPNOTSUPP);
-	out->sport = ports.key->src;
-	out->dport = ports.key->dst;
+	out->sport = portless ? 0 : ports.key->src;
+	out->dport = portless ? 0 : ports.key->dst;
 	out->proto = basic.key->ip_proto;
 	/* Four Ethernet mangles and a redirect are the shortest admissible
 	 * action list. Resolve the devices before the translation, because the
@@ -2029,11 +2039,17 @@ static int ft_parse(struct cdx_ft_binding *binding,
 			return ask_refuse(-EOPNOTSUPP);
 		break;
 	case IPPROTO_UDP:
-		if (used != keys)
+		if (portless || used != keys)
 			return ask_refuse(-EOPNOTSUPP);
 		break;
 	default:
-		return ask_refuse(-EOPNOTSUPP);
+		/* A transit flow of a protocol with no ports, which Netfilter
+		 * offers untranslated (patch 174), and no local tunnel either
+		 * side: the hardware builds none around such a stream. */
+		if (!portless || (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) ||
+		    out->out_tunnel.present || out->in_tunnel.present)
+			return ask_refuse(-EOPNOTSUPP);
+		break;
 	}
 	/* Bounded by the tag count the devices produced, which is the only
 	 * thing that makes these reads meaningful: the keys are never in

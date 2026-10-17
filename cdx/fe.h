@@ -49,6 +49,7 @@ enum return_code {
 #define IPPROTOCOL_UDP		17
 #define IPPROTOCOL_IPIP		4
 #define IPPROTOCOL_IPV6		41
+#define IPPROTOCOL_GRE		47
 #define IPPROTOCOL_ESP 		 50            /* Encapsulation Security Payload protocol */
 #define IPPROTOCOL_AH 		 51             /* Authentication Header protocol       */
 #define IPPROTOCOL_ICMPV6 	58

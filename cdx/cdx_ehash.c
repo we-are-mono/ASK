@@ -358,7 +358,13 @@ static int fill_key_info(PCtEntry entry, uint8_t *keymem, uint32_t port_id)
 					key_size -= 4;
 			}
 			break;
+		/* The routed tables' three-tuple key: the protocols with no
+		 * ports a transit flow is carried for, keyed as their outer
+		 * header is (cdxdrv_set_miss_action()). */
 		case IPPROTOCOL_ESP:
+		case IPPROTOCOL_GRE:
+		case IPPROTOCOL_IPIP:
+		case IPPROTOCOL_IPV6:
 			if (IS_IPV6_FLOW(entry))
 			{
 				saddr = (unsigned char*)entry->Saddr_v6;
@@ -369,7 +375,7 @@ static int fill_key_info(PCtEntry entry, uint8_t *keymem, uint32_t port_id)
 				for (i = 0; i < 16; i++)
 					key->ipv6_tcpudp_key.ipv6_daddr[i] = daddr[i];
 
-				key->ipv6_tcpudp_key.ipv6_protocol = IPPROTOCOL_ESP;
+				key->ipv6_tcpudp_key.ipv6_protocol = entry->proto;
 				key_size -= 4;
 			}
 			else
@@ -377,7 +383,7 @@ static int fill_key_info(PCtEntry entry, uint8_t *keymem, uint32_t port_id)
 				key_size = (sizeof(struct ipv4_tcpudp_key) + 1);
 				key->ipv4_tcpudp_key.ipv4_saddr = entry->Saddr_v4;
 				key->ipv4_tcpudp_key.ipv4_daddr = entry->Daddr_v4;
-				key->ipv4_tcpudp_key.ipv4_protocol = IPPROTOCOL_ESP;
+				key->ipv4_tcpudp_key.ipv4_protocol = entry->proto;
 				key_size -= 4;
 			}
 			break;
@@ -978,6 +984,9 @@ static int get_table_type(PCtEntry entry, uint32_t *type)
 			return SUCCESS;
 
 		case IPPROTOCOL_ESP:
+		case IPPROTOCOL_GRE:
+		case IPPROTOCOL_IPIP:
+		case IPPROTOCOL_IPV6:
 			if (IS_IPV6_FLOW(entry))
 				*type = IPV6_MULTICAST_TABLE;
 			else

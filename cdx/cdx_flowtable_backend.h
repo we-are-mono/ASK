@@ -379,6 +379,26 @@ struct cdx_ft_l2_rule {
 	u16 qos;
 };
 
+/* The protocols with no ports a transit flow is carried for, keyed on its
+ * address pair and protocol in the routed tables: ESP over either family,
+ * and GRE, IPv4 in IPv4 and IPv6 in IPv4 over IPv4 alone. The classifier
+ * parses a tunnel down to the stream it carries, misses it there, and keys
+ * the routed lookup on the first IPv4 header (cdxdrv_set_miss_action()),
+ * which is the tunnel's own only when its outer header is IPv4. */
+static inline bool cdx_ft_portless(u8 family, u8 proto)
+{
+	switch (proto) {
+	case IPPROTO_ESP:
+		return family == AF_INET || family == AF_INET6;
+	case IPPROTO_GRE:
+	case IPPROTO_IPIP:
+	case IPPROTO_IPV6:
+		return family == AF_INET;
+	default:
+		return false;
+	}
+}
+
 /* Process-context transactions serialize adapter state with CDX hardware
  * operations. They intentionally retain the existing control-lock ordering.
  * No backend operation calls the adapter. Never flush Netfilter work inside a

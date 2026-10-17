@@ -324,6 +324,11 @@ static int cdxdrv_set_miss_action(unsigned n) { (void)n; assert(stats && queues 
 static void *kzalloc(size_t size, int flags) { return kcalloc(1, size, flags); }
 static void strscpy(char *dst, const char *src, size_t size) { snprintf(dst, size, "%s", src); }
 #include "cdx_policers.inc"
+/* /proc/cdx_pcd_schemes, a diagnostic the harness has no reader for. */
+struct proc_dir_entry;
+static struct proc_dir_entry *dpa_cfg_schemes_proc;
+#define proc_create_single(name, mode, parent, show) ((struct proc_dir_entry *)NULL)
+static void proc_remove(struct proc_dir_entry *e) { (void)e; }
 #include "cdx_startup.inc"
 
 static void setup(void)

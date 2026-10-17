@@ -1411,7 +1411,8 @@ static u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
      * Asking earlier would match some filters against a half-built rule. */
     assert(rule && rule->in && rule->out);
     assert(rule->family == AF_INET || rule->family == AF_INET6);
-    assert(rule->proto == IPPROTO_TCP || rule->proto == IPPROTO_UDP);
+    assert(rule->proto == IPPROTO_TCP || rule->proto == IPPROTO_UDP ||
+           (cdx_ft_portless(rule->family, rule->proto) && !rule->sport && !rule->dport));
     assert(rule->mtu);
     police_lookups++;
     return police_lookup_profile;
@@ -8681,6 +8682,32 @@ int main(void)
     REJECT(rule.action.entries[4].dev = &in); REJECT(neigh_ok = false); REJECT(physical_ok = false);
     REJECT(dissector.used_keys |= BIT(FLOW_DISSECTOR_KEY_TCP));
     REJECT(bk.ip_proto = ct.protonum = IPPROTO_ICMP);
+    /* Transit protocols with no ports, described without the key and
+     * offered untranslated (patch 174): ESP over either family, GRE and IP
+     * in IP over IPv4 alone, the classifier keying the first IPv4 header. */
+#define PORTLESS(setup, proto) do { setup(); bk.ip_proto = ct.protonum = (proto); \
+        dissector.used_keys &= ~BIT_ULL(FLOW_DISSECTOR_KEY_PORTS); } while (0)
+    {
+        static const u8 portless[] = { IPPROTO_ESP, IPPROTO_GRE, IPPROTO_IPIP, IPPROTO_IPV6 };
+
+        for (unsigned i = 0; i < ARRAY_SIZE(portless); i++) {
+            PORTLESS(fixture, portless[i]);
+            assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+            assert(decoded.proto == portless[i] && !decoded.sport && !decoded.dport);
+        }
+        PORTLESS(fixture6, IPPROTO_ESP);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 &&
+               decoded.family == AF_INET6 && decoded.proto == IPPROTO_ESP);
+        PORTLESS(fixture6, IPPROTO_GRE);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        PORTLESS(fixture6, IPPROTO_IPIP);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    }
+    /* No other protocol without the key, and none of them with it. */
+    REJECT(PORTLESS(fixture, IPPROTO_UDP)); REJECT(PORTLESS(fixture, IPPROTO_ICMP));
+    REJECT(bk.ip_proto = ct.protonum = IPPROTO_ESP);
+    /* Translated, which Netfilter does not offer them: none is admitted. */
+    REJECT(PORTLESS(fixture, IPPROTO_GRE); ct.status |= IPS_SRC_NAT | IPS_SRC_NAT_DONE);
     fixture(); assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     struct cdx_ft_rule udp = decoded;
     tcp_fixture(); assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.proto == IPPROTO_TCP);

@@ -19,7 +19,9 @@
 #include <linux/compat.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
+#include <linux/proc_fs.h>
 #include <linux/rtnetlink.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 //#include <linux/fsl_dpa_classifier.h>
 #include "dpaa_eth.h"
@@ -497,12 +499,25 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 					miss_engine_params.params.kgParams.h_DirectScheme =
 						get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);
 				break;
+			case IPV4_TCP_TABLE:
+			case IPV6_TCP_TABLE:
+			case IPV4_3TUPLE_UDP_TABLE:
+			case IPV6_3TUPLE_UDP_TABLE:
+				/* A transit tunnel's frames -- IPv4 or IPv6 in IPv4,
+				 * GRE over IPv4 -- are parsed down to the stream they
+				 * carry and missed here on its ports; the routed
+				 * tables' scheme keys the first IPv4 header, which is
+				 * the tunnel's outer one, where a flow of the tunnel
+				 * itself is installed. Anything else misses there too,
+				 * and goes on as it did. */
+				miss_engine_params.params.kgParams.h_DirectScheme =
+					get_dist_info_by_fman_params(finfo, IPV4_MULTICAST_TABLE);
+				if (!miss_engine_params.params.kgParams.h_DirectScheme)
+					miss_engine_params.params.kgParams.h_DirectScheme =
+						get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);
+				break;
 			case IPV4_BRIDGED_MULTICAST_TABLE:
 			case IPV6_BRIDGED_MULTICAST_TABLE:
-			case IPV4_3TUPLE_UDP_TABLE:
-			case IPV6_TCP_TABLE:
-			case IPV4_TCP_TABLE:
-			case IPV6_3TUPLE_UDP_TABLE:
 				miss_engine_params.params.kgParams.h_DirectScheme =
 					get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);
 				break;
@@ -1077,8 +1092,52 @@ out:
 	return ret;
 }
 
+/* /proc/cdx_pcd_schemes: every KeyGen scheme a port's frames can be
+ * distributed by, and the frames it has taken -- which classification a kind
+ * of frame reaches, read off the hardware rather than reasoned from the
+ * parser. A scheme shared by several ports' policies is one counter, listed
+ * under each, with the same handle. */
+static struct proc_dir_entry *dpa_cfg_schemes_proc;
+
+static const char *dpa_cfg_scheme_name(uint32_t type)
+{
+	unsigned int i;
+
+	for (i = 0; i < CDX_PCD_NUM_GROUPS; i++)
+		if (cdx_pcd_groups[i].dist_type == type)
+			return cdx_pcd_groups[i].scheme_name;
+	return "?";
+}
+
+static int dpa_cfg_schemes_show(struct seq_file *m, void *v)
+{
+	struct cdx_port_info *pinfo;
+	struct cdx_dist_info *dist;
+	uint32_t f, p, d;
+
+	mutex_lock(&dpa_cfg_lock);
+	for (f = 0; fman_info && f < num_fmans; f++) {
+		for (p = 0; p < fman_info[f].max_ports; p++) {
+			pinfo = &fman_info[f].portinfo[p];
+			for (d = 0; pinfo->dist_info && d < pinfo->max_dist; d++) {
+				dist = &pinfo->dist_info[d];
+				if (!dist->handle)
+					continue;
+				seq_printf(m, "fm%u %s %s handle %p frames %u\n", f, pinfo->name,
+					   dpa_cfg_scheme_name(dist->type), dist->handle,
+					   FM_PCD_KgSchemeGetCounter(dist->handle));
+			}
+		}
+	}
+	mutex_unlock(&dpa_cfg_lock);
+	return 0;
+}
+
 void dpa_cfg_deinit(void)
 {
+	/* Before the lock its reader takes: removal waits for readers. */
+	proc_remove(dpa_cfg_schemes_proc);
+	dpa_cfg_schemes_proc = NULL;
 	cdx_ctrl_lock_with_rtnl();
 	if (dpa_cfg_quiesce()) {
 		pr_err("cdx: cannot quiesce DPA resources; reboot required\n");
@@ -1327,6 +1386,9 @@ int dpa_cfg_install(void)
 	mutex_unlock(&dpa_cfg_lock);
 	cdx_ctrl_unlock_with_rtnl();
 	kfree(state);
+	/* A diagnostic: its absence costs nothing but the reading. */
+	dpa_cfg_schemes_proc = proc_create_single("cdx_pcd_schemes", 0444, NULL,
+						  dpa_cfg_schemes_show);
 	return 0;
 
 err_ret:

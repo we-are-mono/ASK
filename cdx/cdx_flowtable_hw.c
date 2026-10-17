@@ -204,7 +204,8 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	*result = NULL;
-	if ((rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP) ||
+	if ((rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP &&
+	     !cdx_ft_portless(rule->family, rule->proto)) ||
 	    (rule->family != AF_INET && rule->family != AF_INET6))
 		return ask_refuse(-EOPNOTSUPP);
 	/* A direction handed to SEC carries the bound its SA puts on it and

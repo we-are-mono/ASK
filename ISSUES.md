@@ -164,14 +164,9 @@ result independently of those temporary files.
   flows now ignore its hooks, and a bridged pair is carried once a frame of it has passed them all
   (_:/^flowtable: carry bridged traffic past br_netfilter_).
 
-- [ ] **A386 — transit ESP, GRE, IPIP and IPv6-in-IPv4 are forwarded in software; 1.0.7 offloaded them.** CMM
-  registered those conntrack entries too (`SUPPORTED_LOCAL_PROTO` in `cmm/src/conntrack.h@mono-1.0.7`); Netfilter's
-  flowtable carries only TCP and UDP, so nothing offers them to this adapter. It matters where the router does not
-  terminate them: native IPsec between routed (IPv6) hosts, PPTP or GRE tunnels, a 6in4 tunnel a LAN host runs. IPsec
-  behind NAT uses NAT-T and is offloaded as UDP. Two smaller A7 shapes stay as they are: a flow in a non-default
-  conntrack zone (OpenWrt sets none) and 6rd, which picks its outer destination per packet and which 1.0.7 did not
-  offload either. Next: measure these on a production image; offloading them needs flowtable support for port-less
-  protocols.
+- [x] **A386 — transit ESP, GRE, IPIP and 6in4 were forwarded in software.** The flowtable carries them untranslated
+  (patch 174), the adapter keys them on address pair and protocol, and tunnel frames' TCP/UDP misses reach that key
+  (_:/^flowtable: carry transit ESP and IP tunnels_).
 
 - [ ] **A385 — the microcode's fragments of a frame received on an Ethernet port carry an all-zero payload.** A202
   keeps every UDP direction into a smaller path in software because of it -- above all the upload into every PPPoE

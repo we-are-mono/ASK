@@ -43,6 +43,9 @@ typedef uint32_t __be32;
 #define AF_INET 2
 #define AF_INET6 10
 #define IPPROTO_ESP 50
+#define IPPROTO_IPIP 4
+#define IPPROTO_IPV6 41
+#define IPPROTO_GRE 47
 #define IPPROTO_AH 51
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
