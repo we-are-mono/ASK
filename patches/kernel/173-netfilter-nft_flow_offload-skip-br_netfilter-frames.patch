@@ -1,4 +1,4 @@
-From 45e42418f1fea26efb053e9248e3bea8d4ede92a Mon Sep 17 00:00:00 2001
+From 91fc92daf9c2ed1e4dc7cba4d037c02db8711474 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 17 Oct 2026 01:14:39 +0200
 Subject: [PATCH] netfilter: nft_flow_offload: skip frames br_netfilter bridges
@@ -21,7 +21,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 10 insertions(+)
 
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 95d631ab80be..f4212a82c8f5 100644
+index 95d631ab80be..8af60003fb3a 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
 @@ -407,9 +407,19 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
@@ -35,8 +35,8 @@ index 95d631ab80be..f4212a82c8f5 100644
  
 +	/* A frame br_netfilter hands to the IP hooks is bridged, not routed:
 +	 * its route is the bridge's placeholder, which nothing forwards by.
-+	 * A flow built on it is never matched, and only takes the conntrack
-+	 * from conntrack and its TCP window checks with it.
++	 * A flow built on it is never matched; it would only take the
++	 * connection out of conntrack's hands, TCP window checks and all.
 +	 */
 +	if (dst && (dst->flags & DST_FAKE_RTABLE))
 +		return true;
