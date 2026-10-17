@@ -529,10 +529,11 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
 	/* Frames whose set of dedup slots had none to give them yet, which
-	 * their next frame asks for again; and the bridged worker's runs, each
-	 * of which takes the transaction. See ft_mc_record(). */
-	seq_printf(seq, "mcast_deferred %llu\nmcast_passes %llu\n",
-		   ft_mc_deferred, READ_ONCE(ft_mc_passes));
+	 * their next frame asks for again; the bridged worker's runs, each of
+	 * which takes the transaction; and the times every slot was forgotten,
+	 * each making every stream news once more. See ft_mc_record(). */
+	seq_printf(seq, "mcast_deferred %llu\nmcast_passes %llu\nmcast_forgets %llu\n",
+		   ft_mc_deferred, READ_ONCE(ft_mc_passes), READ_ONCE(ft_mc_forgets));
 	/* Flows whose ports' netdev chains could not be judged; see
 	 * ft_mc_netdev_dependent(). */
 	seq_printf(seq, "mcast_port_probe_errors %llu\n", ft_mc_port_probe_errors);

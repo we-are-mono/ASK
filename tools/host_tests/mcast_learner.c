@@ -2441,10 +2441,12 @@ static void the_dedup_slots(void)
         /* The waiting one first, into the slot recorded longest ago. */
         assert(!ft_mc_record(&crowd[FT_MC_SEEN_WAYS]));
         /* And a change that may answer them differently lets every one of
-         * them be recorded again at once. */
+         * them be recorded again at once, and is counted. */
+        u64 forgets = ft_mc_forgets;
         mutex_lock(&ft_mc_lock);
         ft_mc_forget_seen();
         mutex_unlock(&ft_mc_lock);
+        assert(ft_mc_forgets == forgets + 1);
         for (unsigned i = 0; i < FT_MC_SEEN_WAYS; i++) {
             assert(ft_mc_record(&crowd[i]));
             ft_mc_drain();

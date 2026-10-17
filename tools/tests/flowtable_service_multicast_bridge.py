@@ -649,6 +649,14 @@ async def test_yields_to_a_netdev_chain(
 UNWANTED, UNWANTED_ROUNDS = 32, 40
 # What else the segment sends the hook in a window: a handful of streams.
 BACKGROUND = 16
+# Every record is forgotten now and then by design (mcast_forgets): a new
+# membership on the segment or one that lapses, a port's state, a device's
+# MTU, each makes every stream news once more. A window that touches proves
+# nothing, and the streams are run again under groups of their own; one the
+# test's own learning caused would touch every attempt. Within a touched
+# window the counts still scale with the forgettings, and more than FORGETS
+# of them is a storm.
+ATTEMPTS, FORGETS = 3, 2
 
 
 async def test_unwanted_streams_wake_it_once(
@@ -659,11 +667,25 @@ async def test_unwanted_streams_wake_it_once(
     of them. Each is recorded once, and wakes the worker once: slots holding
     only the last few facts would record every one of them on every frame,
     each a pass of the worker taking the transaction. A stream somebody
-    joined, arriving among them, is still learned and carried."""
+    joined, arriving among them, is still learned and carried, and the
+    others are not news again for it."""
     r = multicast_bridge_service
+    touched = []
+    for attempt in range(ATTEMPTS):
+        forgets = await _wake_once(r, attempt)
+        if not forgets:
+            return
+        touched.append(forgets)
+    pytest.fail(f'every attempt was forgotten under: {touched}')
+
+
+async def _wake_once(r, attempt):
+    """One attempt, with groups of its own: the bounds hold exactly when
+    nothing forgot the records meanwhile. Returns how often something did."""
     family = r.multicast_family
-    wanted = '239.9.6.1' if family == 4 else 'ff1e::9:6:1'
-    unwanted = [f'239.9.7.{i + 1}' if family == 4 else f'ff1e::9:7:{i + 1:x}'
+    wanted = f'239.9.6.{attempt + 1}' if family == 4 else f'ff1e::9:6:{attempt + 1:x}'
+    first = UNWANTED * attempt + 1
+    unwanted = [f'239.9.7.{first + i}' if family == 4 else f'ff1e::9:7:{first + i:x}'
                 for i in range(UNWANTED)]
     source = r.multicast_source
     vlan = IPTV_VID if IPTV_TAGGED else None
@@ -675,7 +697,10 @@ async def test_unwanted_streams_wake_it_once(
 
     await _mdb(r, TARGET_LAN_IF, wanted)
     try:
-        await r.wait(lambda s: s['mcast_hooked'] == 1, timeout=10)
+        # The group is named, and the forgetting its creation makes done,
+        # before anything is counted.
+        await r.wait(lambda s: s['mcast_hooked'] == 1 and
+                     any(g['group'] == wanted for g in s['mcast']), timeout=10)
         configs = [new_config(family, source, g, FRAMING_PORT, []) for g in unwanted]
         before = await r.state()
         await asyncio.to_thread(send, interleaved(configs, UNWANTED_ROUNDS),
@@ -685,15 +710,18 @@ async def test_unwanted_streams_wake_it_once(
         delta = {key: after[key] - before[key] for key in after
                  if key.startswith('mcast_') and isinstance(after[key], int)
                  and isinstance(before.get(key), int)}
-        r.record('multicast-bridge-unwanted', {'delta': delta, 'before': before, 'after': after})
+        r.record(f'multicast-bridge-unwanted-{attempt}',
+                 {'delta': delta, 'before': before, 'after': after})
         # None of our unwanted streams may become a flow. Background traffic
         # can create unrelated entries, including hardware discard entries.
         # The segment's own multicast -- discovery from the office hosts on
         # the WAN side -- reaches the hook too, a few streams' worth; every
         # frame of the 1280 would be news without the slots.
         assert not [g for g in after['mcast'] if g['group'] in unwanted], after['mcast']
-        assert delta['mcast_observed'] <= UNWANTED + BACKGROUND, delta
-        assert delta['mcast_passes'] <= UNWANTED + BACKGROUND, delta
+        forgets = delta['mcast_forgets']
+        assert forgets <= FORGETS, delta
+        assert delta['mcast_observed'] <= (UNWANTED + BACKGROUND) * (1 + forgets), delta
+        assert delta['mcast_passes'] <= (UNWANTED + BACKGROUND) * (1 + forgets), delta
 
         # The wanted stream among them: learned and carried, and the others
         # are not news again -- across both runs each stream is recorded at
@@ -708,9 +736,12 @@ async def test_unwanted_streams_wake_it_once(
                 break
             assert asyncio.get_running_loop().time() < deadline, row
         last = await r.state()
-        assert last['mcast_observed'] - before['mcast_observed'] <= \
-            UNWANTED + 1 + BACKGROUND, \
-            (before['mcast_observed'], after['mcast_observed'], last['mcast_observed'])
+        forgets = last['mcast_forgets'] - before['mcast_forgets']
+        observed = last['mcast_observed'] - before['mcast_observed']
+        assert forgets <= FORGETS, (before['mcast_forgets'], last['mcast_forgets'])
+        assert observed <= (UNWANTED + 1 + BACKGROUND) * (1 + forgets), \
+            (before['mcast_observed'], after['mcast_observed'], last['mcast_observed'], forgets)
+        return forgets
     finally:
         await _mdb(r, TARGET_LAN_IF, wanted, add=False)
         await r.wait(lambda s: not any(g['group'] == wanted for g in s['mcast']), timeout=20)

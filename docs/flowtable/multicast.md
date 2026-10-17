@@ -1073,11 +1073,15 @@ interval. A stream waits only while every slot of its set is younger than
 that, and a slot that lapses goes to the first frame that asks for it. With
 more streams than slots in one set, which the hash makes rare, each gets a
 slot within a few intervals. `/proc` counts the worker's runs as
-`mcast_passes`. The rig case
-`flowtable_service_multicast_bridge.py::test_unwanted_streams_wake_it_once`
+`mcast_passes`, and the times every record was forgotten as `mcast_forgets`:
+a new membership or one that lapses, a port's state or a device's MTU
+changing, the hook going away, each makes every stream news once more. The
+rig case `flowtable_service_multicast_bridge.py::test_unwanted_streams_wake_it_once`
 interleaves 32 unjoined streams at about 1 kpps. Each is recorded once
-(`mcast_observed`), and the worker runs about once per stream rather than
-once per frame.
+(`mcast_observed`), and the worker runs about once per stream rather than once
+per frame; a stream joined among them is learned without making the others
+news again. A window something forgot in is run again under groups of its
+own.
 
 ### 7. Retirement
 

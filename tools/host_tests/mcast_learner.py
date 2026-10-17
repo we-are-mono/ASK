@@ -682,7 +682,7 @@ def test_streams_the_worker_can_do_nothing_with_wake_it_once():
     assert worker.index("WRITE_ONCE(ft_mc_passes, ft_mc_passes + 1);") < \
         worker.index("cdx_ft_begin();")
     show = function(source, "ft_show")
-    assert "mcast_passes" in show and "mcast_deferred" in show
+    assert "mcast_passes" in show and "mcast_deferred" in show and "mcast_forgets" in show
     # Seeded before the hook can be registered.
     init = function(source, "ask_flowtable_init")
     assert init.index("ft_hash_seed = get_random_u32();") < init.index("ft_mc_replay();")

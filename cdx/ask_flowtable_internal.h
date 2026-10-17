@@ -890,7 +890,7 @@ extern struct ft_mc_seen ft_mc_ring[FT_MC_RING];
 extern unsigned int ft_mc_ring_head, ft_mc_ring_tail;
 extern spinlock_t ft_mc_ring_lock;
 extern u64 ft_mc_observed, ft_mc_dropped, ft_mc_deferred, ft_mc_hook_errors;
-extern u64 ft_mc_passes;
+extern u64 ft_mc_passes, ft_mc_forgets;
 extern bool ft_mc_hooked;
 void ft_mc_forget_seen(void);
 void ft_mc_supersede(const struct ft_mc_seen *seen);

@@ -66,8 +66,9 @@ struct ft_mc_seen_slot {
 };
 static struct ft_mc_seen_slot ft_mc_last[FT_MC_SEEN_SETS][FT_MC_SEEN_WAYS];
 u64 ft_mc_observed, ft_mc_dropped, ft_mc_deferred, ft_mc_hook_errors;
-/* Runs of the worker. */
-u64 ft_mc_passes;
+/* Runs of the worker, and how often every slot was forgotten: each makes
+ * every stream news again on its next frame. */
+u64 ft_mc_passes, ft_mc_forgets;
 bool ft_mc_hooked;
 static DEFINE_MUTEX(ft_mc_hook_lock);
 
@@ -80,6 +81,7 @@ void ft_mc_forget_seen(void)
 	lockdep_assert_held(&ft_mc_lock);
 	spin_lock_bh(&ft_mc_ring_lock);
 	memset(ft_mc_last, 0, sizeof(ft_mc_last));
+	WRITE_ONCE(ft_mc_forgets, ft_mc_forgets + 1);
 	spin_unlock_bh(&ft_mc_ring_lock);
 }
 
@@ -526,6 +528,7 @@ void ft_mc_hook_sync(bool wanted)
 		synchronize_net();
 		spin_lock_bh(&ft_mc_ring_lock);
 		memset(ft_mc_last, 0, sizeof(ft_mc_last));
+		WRITE_ONCE(ft_mc_forgets, ft_mc_forgets + 1);
 		spin_unlock_bh(&ft_mc_ring_lock);
 	}
 	ft_mc_hooked = wanted;
