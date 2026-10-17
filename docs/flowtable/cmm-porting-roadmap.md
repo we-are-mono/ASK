@@ -521,7 +521,7 @@ foreign source. The table of runs is in the design doc.
 
 Two things temper it. The rig has one usable listener port, so multi-listener
 replication and the chain swap a join performs against an installed group are
-unexercised; and the soft parser refuses to classify TTL 0 or 1, which for a
+unexercised; and no IP table is searched for TTL 0 or 1, which for a
 *bridged* group is a real gap rather than correct behaviour — see the design
 doc. The end-to-end suite is `tools/tests/mcast_e2e.py`, written before
 the learner so it gates rather than describes.

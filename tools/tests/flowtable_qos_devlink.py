@@ -2,7 +2,11 @@
 
 Neither belongs to a netdev a `tc` filter could sit on, so cdx registers both
 on the FMAN's own devlink instance as trap policers. Policer 1 meters what the
-classifier punts to the CPU: every frame that misses every entry. Policer 2
+classifier punts to the CPU: every frame that misses every entry, the frames
+the soft parser ends the parse early for among them -- a TTL or hop limit of 0
+or 1, IPv4 ESP or UDP behind options, an IKE packet on the NAT-T port, a TCP
+SYN, FIN or RST, a PPPoE LCP frame -- unless a flow's entry or a bridged pair
+takes them. Policer 2
 meters what the classifier hands to the SEC engine, which a flow bound for an
 offloaded SA meets instead of the profile its own class names. Each is a rate
 and a burst in packets, and a drop count.
@@ -26,12 +30,15 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import os
+import re
 import secrets
 import shlex
 import socket
 import struct
+import subprocess
 import time
 
+import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
@@ -259,6 +266,204 @@ print(json.dumps({{'sent': sent, 'seconds': time.perf_counter() - start}}))
     await command(r.target, r.session, "conntrack", "-D", "-p", "udp", "--orig-src", r.lan_ip,
                   "--orig-dst", WAN_IP, "--dport", str(PORT_PUNT), check=False)
     assert_metered("punt", report["sent"], sink.count, drops, report["seconds"])
+
+
+# What the soft parser ends the parse early for and hands to the CPU, each
+# kind addressed to the DUT itself. The first five were enqueued from the
+# parser, past every lookup and the meter (A370); a SYN and an LCP frame
+# always met it.
+PARSER_PUNTS = ("ttl_one", "hop_limit_one", "ipv4_options", "nat_t_ike", "pppoe_ttl_one",
+                "tcp_syn", "pppoe_lcp")
+PORT_PARSER = PORT + 18
+PPPOE_SESSION = 0x1234
+# Every scheme a lookup keyed on an IP header is reached through.
+IP_SCHEMES = frozenset(f"cdx_{name}_dist" for name in (
+    "esp4", "esp6", "udp4", "tcp4", "udp6", "tcp6", "ipv4multicast", "ipv6multicast",
+    "bridged_mcast4", "bridged_mcast6", "tup3udp4", "tup3udp6"))
+# The scheme that must classify a kind's flood, if one is known, and those
+# that must classify none of it. The parser ends the first five without
+# confirming the header it stops at, so no table keyed on that header, an
+# entry of which would carry the frame on, is searched: a routed group's root
+# decrements a TTL of 1 to 0, and the UDP table holds ESP-in-UDP SAs.
+CLASSIFIED = {
+    "ttl_one": ("cdx_ethernet_dist", IP_SCHEMES),
+    "hop_limit_one": ("cdx_ethernet_dist", IP_SCHEMES),
+    "ipv4_options": ("cdx_ethernet_dist", IP_SCHEMES),
+    "nat_t_ike": (None, frozenset({"cdx_udp4_dist", "cdx_esp4_dist", "cdx_tup3udp4_dist"})),
+    "pppoe_ttl_one": ("cdx_pppoe_dist", IP_SCHEMES),
+    "tcp_syn": ("cdx_tcp4_dist", frozenset()),
+    "pppoe_lcp": ("cdx_pppoe_dist", IP_SCHEMES),
+}
+
+
+def checksum(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return ~total & 0xFFFF
+
+
+def pppoe_session(dut_mac, host_mac, protocol, payload):
+    """An Ethernet frame of PPPoE session PPPOE_SESSION carrying `payload` as
+    PPP `protocol`, padded to the Ethernet minimum."""
+    ppp = struct.pack("!H", protocol) + payload
+    frame = (dut_mac + host_mac
+             + struct.pack("!HBBHH", 0x8864, 0x11, 0, PPPOE_SESSION, len(ppp)) + ppp)
+    return frame.ljust(60, b"\0")
+
+
+def parser_punt(kind, dut):
+    """A socket and the function that sends one frame of `kind` through it,
+    from this host to the DUT's own WAN address: UDP to a closed port, a SYN
+    to one, or a PPPoE session frame for a session the DUT does not have."""
+    if kind == "hop_limit_one":
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 1)
+        target = (dut["ipv6"], PORT_PARSER, 0, socket.if_nametoindex(dut["host_if"]))
+        return sock, lambda n: sock.sendto(b"ASK-parser" + struct.pack("!Q", n), target)
+    if kind in ("ttl_one", "ipv4_options", "nat_t_ike"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((WAN_IP, PORT_PARSER))
+        port, prefix = PORT_PARSER, b"ASK-parser"
+        if kind == "ttl_one":
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 1)
+        elif kind == "ipv4_options":
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_OPTIONS, b"\x01\x01\x01\x00")
+        else:
+            # A zero where ESP-in-UDP has its SPI: IKE's non-ESP marker.
+            port, prefix = 4500, b"\0\0\0\0ASK-parser"
+        return sock, lambda n: sock.sendto(prefix + struct.pack("!Q", n), (dut["ipv4"], port))
+    if kind == "tcp_syn":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        sock.bind((WAN_IP, 0))
+        pseudo = socket.inet_aton(WAN_IP) + socket.inet_aton(dut["ipv4"]) + struct.pack(
+            "!BBH", 0, socket.IPPROTO_TCP, 20)
+
+        def syn(n):
+            header = struct.pack("!HHIIBBHHH", PORT_PARSER, PORT_PARSER, n, 0, 5 << 4, 0x02,
+                                 512, 0, 0)
+            header = header[:16] + struct.pack("!H", checksum(pseudo + header)) + header[18:]
+            sock.sendto(header, (dut["ipv4"], 0))
+        return sock, syn
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+    sock.bind((dut["host_if"], 0))
+    host_mac = sock.getsockname()[4]
+    if kind == "pppoe_lcp":
+        frame = pppoe_session(dut["mac"], host_mac, 0xC021, struct.pack("!BBHI", 9, 1, 8, 0))
+    else:
+        udp = struct.pack("!HHHH", PORT_PARSER, PORT_PARSER, 18, 0) + b"ASK-parser"
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 1, socket.IPPROTO_UDP,
+                         0, socket.inet_aton(WAN_IP), socket.inet_aton(dut["ipv4"]))
+        ip = ip[:10] + struct.pack("!H", checksum(ip)) + ip[12:]
+        frame = pppoe_session(dut["mac"], host_mac, 0x0021, ip + udp)
+    return sock, lambda n: sock.send(frame)
+
+
+def parser_flood(kind, dut):
+    """FLOOD_OFFERED frames of `kind` a second for FLOOD_SECONDS."""
+    sock, send = parser_punt(kind, dut)
+    sent = 0
+    try:
+        start = time.perf_counter()
+        while True:
+            now = time.perf_counter()
+            if now - start >= FLOOD_SECONDS:
+                break
+            due = start + sent / FLOOD_OFFERED
+            if now < due:
+                time.sleep(min(due - now, 0.0005))
+                continue
+            send(sent)
+            sent += 1
+        return {"sent": sent, "seconds": time.perf_counter() - start}
+    finally:
+        sock.close()
+
+
+async def dut_wan(con):
+    """The DUT's WAN port as this host reaches it: its MAC, IPv4 and IPv6
+    link-local addresses, and the host device on the same segment."""
+    shown = console_json((await console_command(con, "ip", "-j", "addr", "show", "dev",
+                                                TARGET_WAN_IF))["stdout"])[0]
+    addresses = [a for a in shown["addr_info"] if "local" in a]
+    host = json.loads(subprocess.run(["ip", "-j", "-4", "addr", "show"], check=True,
+                                     capture_output=True, text=True).stdout)
+    return {"mac": bytes.fromhex(shown["address"].replace(":", "")),
+            "ipv4": next(a["local"] for a in addresses if a["family"] == "inet"),
+            "ipv6": next(a["local"] for a in addresses
+                         if a["family"] == "inet6" and a["scope"] == "link"),
+            "host_if": next(i["ifname"] for i in host
+                            if any(a.get("local") == WAN_IP for a in i["addr_info"]))}
+
+
+async def scheme_frames(con):
+    """The frames each KeyGen scheme has classified, by name; a scheme shared
+    by several ports is listed under each with one handle, and counted once."""
+    shown = (await console_command(con, "cat", "/proc/cdx_pcd_schemes"))["stdout"]
+    handles = {m.group(2): (m.group(1), int(m.group(3))) for m in
+               re.finditer(r"^fm\d+ \S+ (\S+) handle (\S+) frames (\d+)\s*$", shown, re.M)}
+    assert handles, shown
+    totals = {}
+    for name, frames in handles.values():
+        totals[name] = totals.get(name, 0) + frames
+    return totals
+
+
+async def wan_rx_packets(con):
+    result = await console_command(con, "cat",
+                                   f"/sys/class/net/{TARGET_WAN_IF}/statistics/rx_packets")
+    return int(result["stdout"].split()[-1])
+
+
+@pytest.mark.parametrize("kind", PARSER_PUNTS)
+async def test_punt_policer_meters_parser_punts(devlink, kind):
+    """A frame the soft parser hands to the CPU meets policer 1 like any other
+    punt, is held to its rate, and is classified where no entry can carry it.
+
+    A TTL or hop limit of 1, UDP behind IPv4 options, IKE's non-ESP marker on
+    the NAT-T port and a TTL of 1 inside a PPPoE session each end the parse
+    early. The parser used to enqueue them itself, which no meter sees, so a
+    flood of them reached the CPU whatever devlink said (A370); they now take
+    the punt path every other exception takes. A TCP SYN and a PPPoE LCP frame
+    always did, and are the controls. Each flood is addressed to the DUT itself,
+    so every frame the meter passes is one the WAN port hands the CPU, and the
+    port's receive count is what got through. The KeyGen schemes' own counters
+    say which classified the flood (CLASSIFIED). The agent is not used between
+    the set and the restore: its own traffic shares the meter.
+    """
+    con, handle, original = devlink
+    dut = await dut_wan(con)
+    try:
+        await set_policer(con, handle, POLICER_PUNT, FLOOD_RATE, FLOOD_BURST)
+        _, rows = await policers(con)
+        base, rx = dropped(rows[POLICER_PUNT]), await wan_rx_packets(con)
+        schemes = await scheme_frames(con)
+        report = await asyncio.to_thread(parser_flood, kind, dut)
+        await asyncio.sleep(0.5)
+        _, rows = await policers(con)
+        passed = await wan_rx_packets(con) - rx
+        schemes = {name: (frames - schemes.get(name, 0)) & 0xFFFFFFFF
+                   for name, frames in (await scheme_frames(con)).items()}
+    finally:
+        row = original[POLICER_PUNT]
+        await set_policer(con, handle, POLICER_PUNT, row["rate"], row["burst"])
+    drops = dropped(rows[POLICER_PUNT]) - base
+    path = artifact_dir() / f"qos-devlink-parser-{kind}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"flood": report, "passed": passed, "dropped": drops,
+                                "schemes": {k: v for k, v in schemes.items() if v}}, indent=1))
+    assert_metered(kind, report["sent"], passed, drops, report["seconds"])
+    # A scheme shared by several ports counts what all of them classify, and
+    # what else crosses them in four seconds is a few frames, not a flood's
+    # worth.
+    expected, excluded = CLASSIFIED[kind]
+    if expected:
+        assert schemes[expected] >= report["sent"] - max(32, report["sent"] // 100), (
+            kind, expected, schemes)
+    taken = {name: schemes.get(name, 0) for name in excluded}
+    assert all(frames <= report["sent"] // 20 for frames in taken.values()), (kind, taken)
 
 
 def paced(destination, port, rate, seconds, *, tag=b"ASK-sec", payload_size=512):

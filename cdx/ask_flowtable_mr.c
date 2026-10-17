@@ -17,8 +17,9 @@
  *
  * Both learners use the same encoder, with explicit forwarding semantics.
  * This learner requests a routed root, which decrements TTL or hop limit;
- * the bridge learner preserves it. The parser refuses to classify a frame
- * arriving with 0 or 1, matching the router's `ttl > 1` rule. Listener entries
+ * the bridge learner preserves it. The parser leaves the IP header of a frame
+ * arriving with 0 or 1 unconfirmed, so no group's root is searched for it,
+ * matching the router's `ttl > 1` rule. Listener entries
  * rebuild Ethernet from the address of the VIF each copy is sent through to
  * the group's mapped multicast destination, as ipmr's own copies are built.
  *

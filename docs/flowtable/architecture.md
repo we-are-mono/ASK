@@ -303,8 +303,10 @@ on-link fallback after a failed forced-interface lookup. Ordinary kernel callers
 retain their existing behaviour.
 
 TCP admission depends on the deployed [soft parser](../../config/pcd/cdx_sp.xml):
-`tcpschema` sends packets with `tcp.flags & 7` to Linux before hash lookup, so
-SYN, FIN and RST cannot bypass Linux through an installed entry. CDX adds no
+`tcpschema` marks packets with `tcp.flags & 7` for the CPU (`$hpnia`), so a
+SYN, FIN or RST that matches an installed flow entry is handed to Linux rather
+than carried (a bridged pair carries it, as the bridge would), and one that
+misses meets the punt meter like any other exception. CDX adds no
 independent TCP sequence/window tracker. Parser or firmware changes require
 revalidation of this behaviour.
 

@@ -41,7 +41,7 @@ BRIDGE = "br_mcast_e2e"
 
 MCAST_PORT = int(os.environ.get("ASK_MCAST_E2E_PORT", "47300"))
 # Above 1, always. See send_stream_from_vision() and the TTL section of
-# docs/flowtable/multicast.md: the parser refuses to classify TTL 0 or 1.
+# docs/flowtable/multicast.md: no IP table is searched for TTL 0 or 1.
 MCAST_TTL = int(os.environ.get("ASK_MCAST_E2E_TTL", "64"))
 # Distinct group per case so a stale entry from one cannot satisfy another.
 GROUPS_V4 = {
@@ -336,9 +336,9 @@ def send_stream_from_vision(group: str, family: int, seconds: float,
 
     iface = os.environ.get("ASK_WAN_INJECT_IF", "")
     src = wan_source_address(family)
-    # Explicitly, and never inherited. The FMC soft parser ends the parse
-    # before classification for TTL 0 or 1, so a TTL-1 stream is never matched
-    # in hardware however correct the entry is -- and a plain UDP multicast
+    # Explicitly, and never inherited. The FMC soft parser leaves the IP header
+    # of TTL 0 or 1 unconfirmed, so a TTL-1 stream is never matched in
+    # hardware however correct the entry is -- and a plain UDP multicast
     # socket sends TTL 1 by default. Getting this wrong makes a working
     # offload look completely dead; it cost a rig session once.
     if family == 6:

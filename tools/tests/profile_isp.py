@@ -159,9 +159,9 @@ PORT_RATE6 = PORT_MAIN + 18
 # receive every group, and the counts could not then be told apart.
 GROUPS = ("239.9.1.1", "239.9.1.2")
 CHANNELS = [(group, PORT_IPTV + index) for index, group in enumerate(GROUPS)]
-# Above 1, always: the soft parser ends the parse before classification for TTL
-# 0 or 1, so a TTL-1 stream is never matched in hardware however correct the
-# entry is -- and a plain multicast socket sends TTL 1 by default.
+# Above 1, always: the soft parser leaves the IP header of TTL 0 or 1
+# unconfirmed, so a TTL-1 stream is never matched in hardware however correct
+# the entry is -- and a plain multicast socket sends TTL 1 by default.
 STREAM_TTL = 64
 STREAM_S, STREAM_PPS = 3.0, 500
 # How long the consumers listen before the stream starts: enough for the reports

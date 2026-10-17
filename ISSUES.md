@@ -152,6 +152,13 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A395 — on the Wi-Fi offline port (10), a TTL or hop limit of 0 or 1 likely still reaches the CPU unmetered.**
+  Inferred from the parser, not measured: `ethernetschema`'s offline-port correction exits unconfirmed
+  (`cdx_sp.xml`, `$logicalportid ge 9`), so a frame the TTL check then leaves unconfirmed (A370) confirms no header,
+  matches no KeyGen scheme and takes KeyGen's default action, a plain enqueue (`fm_kg.c`, `fman_kg_init()`). Its frames
+  have crossed the CPU once already, on their way in from the Wi-Fi driver, so a flood costs the CPU there first.
+  Fix direction: confirm Ethernet on port 10 as the receive ports do, then measure with the scheme counters.
+
 - [-] **A394 — UDP from a jumbo LAN port into a standard path stays in software, not detoured.** Wontfix: a rare setup,
   correct in software; a jumbo flood through the offline port stalls the FMan HC (_:/^ISSUES: A393 and A394 stay_).
 
@@ -259,22 +266,15 @@ result independently of those temporary files.
   an ECT carried packet CE under an outer CE and drop a Not-ECT one. Measured on both 6o4 and 4o6 with the far end's
   outer headers rewritten to CE (nft `ip ecn set ce` / `ip6 ecn set ce` at its postrouting): all 256 replies were
   counted by the strip and reached the LAN VM with their own ECN field unchanged, Not-ECT ones included. A congestion
-  mark set inside the tunnel is lost once the flow is offloaded. Fix direction: have the soft parser send tunnel frames
-  whose outer ECN is CE to the CPU with `$hpnia` alone, which the punt meter covers (A370); or a microcode change. XML
-  gate.
+  mark set inside the tunnel is lost once the flow is offloaded. Fix direction: have the soft parser end the parse of a
+  tunnel frame whose outer ECN is CE unconfirmed, with `$hpnia` alone, as the TTL check does (A370), so the strip entry
+  is not searched and the frame meets the punt meter; or a microcode change. XML gate.
 
 - [x] **A371 — a `dscp inherit` 4o6 strip added the whole outer traffic class to the carried TOS.** Microcode copy, ECN
   bits and all; that strip is now Linux's (_:/^tunnels: prove the outer marking on the wire_).
 
-- [ ] **A370 — frames the soft parser sends to the CPU with `$nia` 0x500002 bypass the devlink punt meter.**
-  `cdx_sp.xml` sends TTL or hop limit 0/1, IPv4 ESP or UDP behind options (A364/A368) and IKE NAT-T (UDP 4500, zero
-  marker) straight to the BMI enqueue; ordinary exceptions meet the punt policer (`$nia` 0x4C0000, devlink trap
-  policer 1). Measured from the WAN with the meter at 1000 pps, 8000 frames over 4 s: TTL-1 UDP, NAT-T and UDP behind
-  options all reached the CPU with none metered; plain UDP, TCP ACK, SYN, RST and PPPoE LCP each passed ~4060 and the
-  rest were on the drop count. A punt that sets only `$hpnia` (TCP control, PPPoE LCP) is metered, and a FIN still
-  leaves its offloaded entry for Linux (`test_transfer_expiry_fin`). Only the CPU queues' congestion group bounds
-  those classes; all but options are inherited from NXP's `cdx_sp.xml`. Fix direction: drop those `$nia` overrides
-  and keep `$hpnia`, as the TCP control punt does, then prove TTL 1 on an offloaded flow still reaches Linux. XML gate.
+- [x] **A370 — soft-parser punts that assigned `$nia` the enqueue bypassed the devlink punt meter.** They assign only
+  `$hpnia` now, as TCP control does, and meet it (_:/^cdx: meter what the soft parser hands the CPU_).
 
 - [ ] **A361 — the LAN port's FMan receive path filters a few minimum-size frames that arrive whole.** Seen by
   `flowtable_nat_throughput.py::test_packet_rate`: one paced NAT'd UDP flow of 64-byte frames at 1.9 Mpps lost 3-16 of
@@ -288,7 +288,7 @@ result independently of those temporary files.
   KeyGen error at minimum length from an FMan resource limit.
 
 - [-] **A369 — IPv4 TCP with IP options is forwarded by its offloaded entry, unlike Linux's flowtable.** Wontfix: only
-  Record Route/Timestamp go unrecorded (routers default to accepting source routes); punting adds an unmetered class (A370).
+  Record Route/Timestamp go unrecorded (routers default to accepting source routes).
 
 - [x] **A368 — inbound tunnel ESP behind outer IPv6 extension headers or IPv4 options was never decrypted.** The submit
   gives SEC the outer header's length; IPv4 UDP behind options goes to the CPU (_:/^ipsec: describe a tunnel frame's outer header_).

@@ -80,7 +80,18 @@ def test_soft_parser_scope():
     options = tree.findall("protocol[@name='ipv4schema']/execute-code/before/if")[1]
     assert options.get('expr') == ('$logicalportid != 9 and (ipv4.nextp == 0x32 or ipv4.nextp == 0x11) '
                                    'and ipv4.hlen != 5')
-    assert options.find("if-true/assign-variable[@name='$nia']").get('value') == '0x500002'
+    # Each of those, and IKE on the NAT-T port, leaves the parse unconfirmed
+    # with $hpnia the BMI's enqueue and $nia as it was, so the frame meets the
+    # punt meter on a lookup's miss. An enqueue in $nia goes from the parser
+    # straight to the CPU, past every lookup and the meter (A370).
+    natt = next(check for check in tree.findall("protocol[@name='udpschema']/execute-code/before/if")
+                if '0x1194' in check.get('expr')).find("if-true/if")
+    assert natt.get('expr') == '($FW[64:32] bitwand 0xFFFFFFFF) == 0x00000000'
+    for punt in [*(tree.findall(f"protocol[@name='{schema}']/execute-code/before/if")[0]
+                   for schema in ('ipv4schema', 'ipv6schema')), options, natt]:
+        assigned = {a.get('name'): a.get('value') for a in punt.findall("if-true/assign-variable")}
+        assert assigned == {'$hpnia': '0x500002'}, (punt.get('expr'), assigned)
+        assert punt.find("if-true/action").get('confirm') == 'no', punt.get('expr')
 
 
 # KeyGen's known-field bits (fm_kg.h). A scheme's key carries its known fields

@@ -132,7 +132,7 @@ def stream_key(config: dict) -> str:
 
 def frames(config: dict) -> list:
     from scapy.all import Ether, IP, IPv6, UDP, Raw
-    # Explicit and above 1: the parser refuses to classify TTL 0 or 1.
+    # Explicit and above 1: no IP table is searched for TTL 0 or 1.
     layer = (IP(src=config["source"], dst=config["group"], ttl=64) if config["family"] == 4 else
              IPv6(src=config["source"], dst=config["group"], hlim=64))
     return [Ether(dst=multicast_mac(config["group"]).hex(":")) / layer /

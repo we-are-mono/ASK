@@ -149,9 +149,9 @@ GROUP = os.environ.get("ASK_PROFILE_HOME_GROUP", "239.9.2.1")
 # The daemon's generated config. A path of this profile's own, because
 # mcast_e2e.py writes one too and the two must never be each other's.
 SMCROUTE_CONF = "/tmp/ask-profile-home-smcroute.conf"
-# Above 1, always: the soft parser ends the parse before classification for TTL
-# 0 or 1, and ip_mr_forward()'s own rule is the same one. The replicas carry one
-# less, which is the routing the hardware did on the way through.
+# Above 1, always: the soft parser leaves the IP header of TTL 0 or 1
+# unconfirmed, and ip_mr_forward()'s own rule is the same one. The replicas carry
+# one less, which is the routing the hardware did on the way through.
 STREAM_TTL = 64
 STREAM_S, STREAM_PPS = 3.0, 500
 

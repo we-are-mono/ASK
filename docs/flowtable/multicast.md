@@ -386,11 +386,12 @@ expensive.
 
 **A stream with TTL 1 is never offloaded, and for a bridged group that is a
 real limitation rather than a formality.** The FMC soft parser ends the parse
-before classification for any IPv4 frame whose TTL is 0 or 1
-(`cdx_sp.xml`, the `ipv4schema` protocol's `<before>` block, which assigns a
-new next-instruction address and exits), and the same for an IPv6 hop limit.
-Such a frame reaches the CPU and the bridge floods it in software, exactly as
-it does today.
+of any IPv4 frame whose TTL is 0 or 1 without confirming its IPv4 header
+(`cdx_sp.xml`, the `ipv4schema` protocol's `<before>` block), and the same for
+an IPv6 hop limit, so no table keyed on an IP header is searched for it. Such
+a frame reaches the CPU through the punt meter and the bridge floods it in
+software, exactly as it does today; a TTL-1 stream spends the punt rate every
+exception shares, 195312 packets a second by default (A370).
 
 For *routed* multicast that is correct and unremarkable: TTL 1 means do not
 forward beyond this link, so a router must not replicate it. For a **bridge**
@@ -400,7 +401,7 @@ itself to the local link by TTL â€” and a good deal of service discovery does â€
 is therefore carried in software on this hardware whatever the MDB says.
 
 Nothing in the adapter can change that: the decision is made in the parser
-before any table is consulted. What the adapter does is not learn from such a
+before any IP table is consulted. What the adapter does is not learn from such a
 frame. An entry for the stream would count nothing, age out after the
 membership interval, and be learned again from the next frame, for as long as
 the stream runs. So the membership stays `pending-source` in `/proc` and the

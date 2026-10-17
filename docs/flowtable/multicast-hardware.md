@@ -373,9 +373,10 @@ rather than a redesign — `ft_mc_carriable()` would refuse a group with both
 kinds of copy — and the entry falls back to what A188 replaced: the stream
 carried in software.
 
-Two smaller properties rest on existing behaviour rather than new measurement.
-A frame arriving with TTL 1 is bridged by Linux but not routed; the parser ends
-the parse for TTL 0 and 1 before any table is consulted, which is what makes a
-routed root's decrement safe, and a merged group depends on the same thing. And
-the counters folded into the MFC are the bridged root's, which counts each
-frame once however many copies it makes.
+Two smaller properties rest on behaviour measured elsewhere. A frame arriving
+with TTL 1 is bridged by Linux but not routed; the parser ends the parse for
+TTL 0 and 1 without confirming the IP header, so no IP table is consulted
+(`test_punt_policer_meters_parser_punts` reads the KeyGen schemes), which is
+what makes a routed root's decrement safe, and a merged group depends on the
+same thing. And the counters folded into the MFC are the bridged root's, which
+counts each frame once however many copies it makes.

@@ -752,6 +752,81 @@ async def test_download_into_smaller_lan_path(pppoe_rig):
         await command(r.target, r.session, "ip", "route", "del", *route, check=False)
 
 
+async def _in_hdr_errors(r):
+    """The DUT's IPv4 header-error count, which ip_forward() raises for every
+    packet it would forward with a TTL of 0 or 1, rate limit or not."""
+    rows = [line.split() for line in (await read(r.target, r.session, "/proc/net/snmp")).splitlines()
+            if line.startswith("Ip:")]
+    return int(dict(zip(rows[0][1:], rows[1][1:]))["InHdrErrors"])
+
+
+def _time_exceeded(icmp, source, destination, dport, seconds):
+    """Time Exceeded messages arriving on a raw ICMP socket within `seconds`
+    that quote a UDP datagram from `source` to `destination`:`dport`."""
+    found, deadline = 0, time.monotonic() + seconds
+    while (left := deadline - time.monotonic()) > 0:
+        icmp.settimeout(left)
+        try:
+            packet = icmp.recv(2048)
+        except TimeoutError:
+            break
+        header = 4 * (packet[0] & 0x0F)
+        message, quoted = packet[header:header + 8], packet[header + 8:]
+        if message[:2] != b"\x0b\x00" or len(quoted) < 28:
+            continue
+        inner = 4 * (quoted[0] & 0x0F)
+        if (quoted[9] == socket.IPPROTO_UDP
+                and socket.inet_ntoa(quoted[12:16]) == source
+                and socket.inet_ntoa(quoted[16:20]) == destination
+                and struct.unpack("!H", quoted[inner + 2:inner + 4])[0] == dport):
+            found += 1
+    return found
+
+
+async def test_download_ttl_one_reaches_linux(pppoe_rig):
+    """A download packet with a TTL of 1 on the offloaded tuple reaches Linux,
+    which answers Time Exceeded, and is not carried; the direction still is.
+
+    It arrives inside the session. The soft parser's TTL check ends the parse
+    without confirming its IPv4 header, and used to enqueue it to the CPU from
+    the parser itself, past the punt meter (A370). It is now classified by its
+    session header alone, as an LCP frame is, and must still find Linux rather
+    than the direction's entry. Every such packet raises
+    ip_forward()'s header-error count; Time Exceeded is rate limited, so one is
+    enough of those."""
+    r = pppoe_rig
+    count = 4
+    flows, _ = await _established(r)
+    reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
+    echo_socket = r.echo.transport.get_extra_info("socket")
+    icmp = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    ttl = echo_socket.getsockopt(socket.SOL_IP, socket.IP_TTL)
+    try:
+        before, errors = await r.state(), await _in_hdr_errors(r)
+        echo_socket.setsockopt(socket.SOL_IP, socket.IP_TTL, 1)
+        try:
+            for n in range(count):
+                r.echo.transport.sendto(b"ASK-pppoe-ttl-one" + struct.pack("!Q", n),
+                                        (r.lan_ip, SPORT))
+        finally:
+            echo_socket.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
+        exceeded = await asyncio.to_thread(_time_exceeded, icmp, INNER_LOCAL, r.lan_ip, SPORT, 2)
+        after, errors = await r.state(), await _in_hdr_errors(r) - errors
+    finally:
+        icmp.close()
+    carried = {f["cookie"]: int(f["packets"]) for f in after["flows"]}
+    r.record("pppoe-ttl-one", {"before": before, "after": after, "in_hdr_errors": errors,
+                               "time_exceeded": exceeded})
+    assert errors >= count and exceeded >= 1, (errors, exceeded)
+    assert carried[reverse["cookie"]] == int(_direction(before["flows"], INNER_LOCAL,
+                                                        r.lan_ip)["packets"]), (before, after)
+    _assert_undisturbed(r, before, after, {f["cookie"] for f in before["flows"]} == set(carried))
+    await r.exchange(count=16)
+    final = await r.state()
+    moved = int(_direction(final["flows"], INNER_LOCAL, r.lan_ip)["packets"]) - carried[reverse["cookie"]]
+    assert moved == 16, (after, final)
+
+
 @pytest.mark.parametrize("pppoe_rig", ["tagged"], indirect=True)
 async def test_handback_tagged(pppoe_rig):
     """What the offline port hands back of a tagged upload reaches Linux on

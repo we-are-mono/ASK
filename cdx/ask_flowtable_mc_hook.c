@@ -302,8 +302,9 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 			return NF_ACCEPT;
 		iph = (const struct iphdr *)(skb->data + l3_off);
 		/* The parser ends the parse of a frame whose TTL is 0 or 1
-		 * before any table is consulted, so no entry ever matches one:
-		 * the stream stays in software whatever is installed. A flow
+		 * without confirming its IPv4 header, so no IP table is
+		 * searched and no group's entry ever matches one: the stream
+		 * stays in software whatever is installed. A flow
 		 * learned from it would be an entry that counts nothing, aged
 		 * out and learned again from the next frame for as long as the
 		 * stream runs. The same holds for the IPv6 hop limit. */

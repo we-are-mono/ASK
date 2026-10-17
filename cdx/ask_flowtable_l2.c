@@ -390,8 +390,10 @@ static unsigned int ft_l2_hook(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 	if (!seen.tagged && br_vlan_enabled(bridge) && br_vlan_get_pvid_rcu(port, &seen.vid))
 		return NF_ACCEPT;
-	/* The parser ends the parse of a frame whose TTL or hop limit is 0 or
-	 * 1 before any table is consulted, so no entry would ever match one. */
+	/* The parser leaves the IP header of a frame whose TTL or hop limit is
+	 * 0 or 1 unconfirmed, so it is classified by its Ethernet header alone
+	 * and an installed pair carries it, as the bridge would (A370). The
+	 * learner takes its pairs from other frames. */
 	if (proto == htons(ETH_P_IP)) {
 		const struct iphdr *iph;
 

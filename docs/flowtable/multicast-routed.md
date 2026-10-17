@@ -40,9 +40,9 @@ hardware group that carries it; see below.
 because it looks like it should have.** A multicast root entry is built by
 `fill_actions()` in `cdx/cdx_ehash.c`, which sets `TTL_HM_VALID`
 unconditionally, so the microcode decrements the TTL or hop limit on every
-matched frame — and the FMC soft parser ends the parse before classification
-for any frame arriving with 0 or 1, which is the kernel's own `ttl > 1` rule
-expressed one layer down. Each listener entry
+matched frame — and the FMC soft parser ends the parse of any frame arriving
+with 0 or 1 without confirming its IP header, so no group's root is searched
+for it, which is the kernel's own `ttl > 1` rule expressed one layer down. Each listener entry
 (`create_exthash_entry4mcast_member`, `fill_mcast_member_actions`) rebuilds the
 Ethernet header, to the group's mapped multicast destination from the address
 of the VIF the copy is sent through (see **The source address** under

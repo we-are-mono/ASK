@@ -405,6 +405,34 @@ async def test_l2_pairs_in_hardware(l2_rig):
     assert all(count < burst // 4 for count in tx.values()), tx
 
 
+async def test_l2_ttl_one_is_bridged(l2_rig):
+    """A frame with a TTL of 1 between the stations is bridged, as Linux
+    bridges it: a TTL is a router's to spend.
+
+    The soft parser ends the parse of such a frame without confirming its IPv4
+    header, so it is classified by its Ethernet header alone, where the pairs
+    are (A370), and the pair carries it. Every request has to reach the peer,
+    in hardware rather than through the DUT's kernel, and every reply come
+    back."""
+    r = l2_rig
+    await _exchange(r, count=4)
+    pairs = _pairs(r, await _carried(r))
+    count = 256
+    tx_before = await software_tx(r)
+    ping = await lan_run(r.lan, f"ping -n -q -c {count} -i 0.02 -W 1 -t 1 {PEER_ADDR}",
+                         count * 0.02 + 10)
+    # The worker reads the counters once a pass.
+    await asyncio.sleep(2.5)
+    tx_after = await software_tx(r)
+    after = _pairs(r, await r.state())
+    moved = {port: int(after[port]["packets"]) - int(pairs[port]["packets"]) for port in pairs}
+    tx = {dev: tx_after[dev] - tx_before[dev] for dev in tx_before}
+    r.record("l2-ttl-one", {"ping": ping.stdout, "moved": moved, "software_tx": tx})
+    assert _received(ping.stdout) == count, ping.stdout
+    assert all(frames >= count for frames in moved.values()), moved
+    assert all(frames < count // 4 for frames in tx.values()), tx
+
+
 async def _rate(r, *, upload, seconds):
     """One iperf3 run between the stations, measured as _throughput.py
     measures a routed path: the pairs' counters moving and the DUT's kernel

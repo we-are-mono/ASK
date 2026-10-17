@@ -518,8 +518,10 @@ the CPU forwarding every frame, no bridged conntrack is marked offloaded
 
 Between two ports, the learner carries IPv4 and IPv6 unicast only: ARP,
 other EtherTypes, a tagged frame on a bridge that does not filter VLANs
-(forwarded with its tag as payload), 802.1ad, a Wi-Fi VAP as either end and a
-pair whose TTL or hop limit is 1 stay in software.
+(forwarded with its tag as payload), 802.1ad and a Wi-Fi VAP as either end
+stay in software, and a pair seen only with a TTL or hop limit of 1 is not
+learned; an installed pair carries such frames like any other
+(`test_l2_ttl_one_is_bridged`).
 
 MACVLAN is a separate upper device and is still declined by the walk: it is
 neither an 802.1Q VLAN nor a bridge master. That is the accepted answer rather
