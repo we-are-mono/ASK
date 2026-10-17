@@ -509,9 +509,12 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 				 * tables' scheme keys the first IPv4 header, which is
 				 * the tunnel's outer one, where a flow of the tunnel
 				 * itself is installed. Anything else misses there too,
-				 * and goes on as it did. */
-				miss_engine_params.params.kgParams.h_DirectScheme =
-					get_dist_info_by_fman_params(finfo, IPV4_MULTICAST_TABLE);
+				 * and goes on as it did. With the `transit`
+				 * parameter off they go straight to Ethernet, as in
+				 * 1.0.7. */
+				if (cdx_ft_transit)
+					miss_engine_params.params.kgParams.h_DirectScheme =
+						get_dist_info_by_fman_params(finfo, IPV4_MULTICAST_TABLE);
 				if (!miss_engine_params.params.kgParams.h_DirectScheme)
 					miss_engine_params.params.kgParams.h_DirectScheme =
 						get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);

@@ -519,6 +519,8 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * parameter); at 0 nothing of either is in hardware once they have
 	 * both passed. */
 	seq_printf(seq, "mcast_enabled %u\n", READ_ONCE(ft_mc_enabled));
+	/* Whether transit tunnels are carried; cdx's `transit` parameter. */
+	seq_printf(seq, "transit %u\n", cdx_ft_transit);
 	/* Memberships the bridge reported, and the flows learned from traffic
 	 * that they and the routed learner's routes name; `installed` counts
 	 * flows, each one classifier entry. */

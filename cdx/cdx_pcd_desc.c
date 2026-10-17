@@ -139,7 +139,8 @@ const struct cdx_pcd_group cdx_pcd_groups[CDX_PCD_NUM_GROUPS] = {
 	},
 	[6] = {
 		.table_name = "cdx_multicast6_cc",
-		.key_size = 34, .hash_res_mask = 0x00ff,
+		.key_size = 38, .hash_res_mask = 0x00ff,
+		.session_identity = true,
 		.table_type = IPV6_MULTICAST_TABLE,
 		.hw_table_type = IPV6_MULTICAST_TABLE,
 		.scheme_name = "cdx_ipv6multicast_dist",
@@ -155,7 +156,8 @@ const struct cdx_pcd_group cdx_pcd_groups[CDX_PCD_NUM_GROUPS] = {
 	},
 	[7] = {
 		.table_name = "cdx_multicast4_cc",
-		.key_size = 10, .hash_res_mask = 0x00ff,
+		.key_size = 14, .hash_res_mask = 0x00ff,
+		.session_identity = true,
 		.table_type = IPV4_MULTICAST_TABLE,
 		.hw_table_type = IPV4_MULTICAST_TABLE,
 		.scheme_name = "cdx_ipv4multicast_dist",

@@ -152,17 +152,13 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A392 — the TCP and UDP tables' misses now cross two more lookups before the Ethernet table (A386).** A
-  transit tunnel's frames reach the three-tuple key that way, and so does every frame no flow claims, the bridged
-  station pairs' among them. Full-size frames still run at 9.36-9.39 Gbit/s; what the longer chain costs a stream of
-  small frames is not measured, because the rig cannot generate one at that rate. Next: measure the bridged pairs'
-  64-byte rate with a hardware generator, against 1.1.0's chain.
+- [x] **A392 — the transit miss chain costs a bridged pair's 64-byte frames 13-18% (2.06-2.17 vs 2.50 Mpps).** cdx's
+  `transit` parameter, off by default, restores 1.0.7's chain; the test image turns it on
+  (_:/^flowtable: carry transit tunnels from PPPoE sessions, behind a switch_).
 
-- [ ] **A391 — a transit ESP or IP tunnel through a PPPoE session, or through one of the router's own SAs, stays in
-  software.** The three-tuple tables have no PPPoE variant, so a receive entry there could not match the session's
-  concentrator and ID (`pppoe.md`), and the SA descriptors are filled for the TCP and UDP tables alone. It is the
-  common shape for a LAN host's native IPsec over an IPv6-over-PPPoE WAN. 1.0.7 carried none of these in hardware
-  either. Next: PPPoE three-tuple schemes in `cdx_pcd.c`, and an SA case on the rig.
+- [x] **A391 — a transit tunnel received in a PPPoE session stayed in software.** The routed three-tuple keys end with
+  the PPPoE header's session ID; the way into a session and router SAs stay in software
+  (_:/^flowtable: carry transit tunnels from PPPoE sessions, behind a switch_).
 
 - [-] **A390 — the multicast learners' br_netfilter walks are coarser than needed.** Control-plane cost and a 5 s
   software blip at most; the routed learner may carry a bridged-source group for up to 5 s after br_netfilter loads,

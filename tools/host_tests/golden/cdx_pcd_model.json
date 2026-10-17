@@ -624,6 +624,13 @@
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
       ],
+      "generic": [
+        [
+          "HEADER_TYPE_PPPoE",
+          0,
+          4
+        ]
+      ],
       "group": 6,
       "name": "cdx_ipv6multicast_dist",
       "num_fqids": 1,
@@ -655,6 +662,13 @@
           "hdr": "HEADER_TYPE_IPv4",
           "index": "e_FM_PCD_HDR_INDEX_NONE"
         }
+      ],
+      "generic": [
+        [
+          "HEADER_TYPE_PPPoE",
+          0,
+          4
+        ]
       ],
       "group": 7,
       "name": "cdx_ipv4multicast_dist",
@@ -1603,7 +1617,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 34,
+      "key_size": 38,
       "max_keys": 512,
       "name": "cdx_multicast6_cc",
       "prefilled_entries": 0,
@@ -1612,7 +1626,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 10,
+      "key_size": 14,
       "max_keys": 512,
       "name": "cdx_multicast4_cc",
       "prefilled_entries": 0,
@@ -1729,7 +1743,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 34,
+      "key_size": 38,
       "max_keys": 512,
       "name": "cdx_multicast6_cc",
       "prefilled_entries": 0,
@@ -1738,7 +1752,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 10,
+      "key_size": 14,
       "max_keys": 512,
       "name": "cdx_multicast4_cc",
       "prefilled_entries": 0,
@@ -1855,7 +1869,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 34,
+      "key_size": 38,
       "max_keys": 512,
       "name": "cdx_multicast6_cc",
       "prefilled_entries": 0,
@@ -1864,7 +1878,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 10,
+      "key_size": 14,
       "max_keys": 512,
       "name": "cdx_multicast4_cc",
       "prefilled_entries": 0,
@@ -1981,7 +1995,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 34,
+      "key_size": 38,
       "max_keys": 512,
       "name": "cdx_multicast6_cc",
       "prefilled_entries": 0,
@@ -1990,7 +2004,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 10,
+      "key_size": 14,
       "max_keys": 512,
       "name": "cdx_multicast4_cc",
       "prefilled_entries": 0,
@@ -2107,7 +2121,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 34,
+      "key_size": 38,
       "max_keys": 512,
       "name": "cdx_multicast6_cc",
       "prefilled_entries": 0,
@@ -2116,7 +2130,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 10,
+      "key_size": 14,
       "max_keys": 512,
       "name": "cdx_multicast4_cc",
       "prefilled_entries": 0,
@@ -2296,7 +2310,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 34,
+      "key_size": 38,
       "max_keys": 512,
       "name": "cdx_multicast6_cc",
       "prefilled_entries": 0,
@@ -2305,7 +2319,7 @@
     {
       "hash_res_mask": 255,
       "hash_shift": 0,
-      "key_size": 10,
+      "key_size": 14,
       "max_keys": 512,
       "name": "cdx_multicast4_cc",
       "prefilled_entries": 0,

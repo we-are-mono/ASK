@@ -1692,9 +1692,30 @@ static void test_tunnel_keys(void)
     }
 }
 
+/* A routed three-tuple key's last four bytes, as cdx_pcd_session_key()
+ * extracts them from a frame: zeros with no session, the PPPoE header's
+ * version and type, code and session ID in one. */
+static void test_session_keys(void)
+{
+    struct cdx_l2_encap encap = {0};
+    uint8_t key[8];
+
+    memset(key, 0xff, sizeof(key));
+    assert(fill_session_key(NULL, key) == 4);
+    assert(!memcmp(key, (uint8_t[]){0, 0, 0, 0, 0xff}, 5));
+    assert(fill_session_key(&encap, key) == 4 && !memcmp(key, (uint8_t[]){0, 0, 0, 0}, 4));
+    encap.ingress_pppoe = 1;
+    encap.ingress_session_id = 0x1234;
+    /* The concentrator is not keyed. */
+    memcpy(encap.ingress_session_mac, (uint8_t[]){2, 3, 4, 5, 6, 7}, 6);
+    assert(fill_session_key(&encap, key) == 4);
+    assert(!memcmp(key, (uint8_t[]){0x11, 0, 0x12, 0x34, 0xff}, 5));
+}
+
 int main(void)
 {
     test_tunnel_keys();
+    test_session_keys();
     /* The ports carry the address the rule claims as its source. That is not
      * decoration: admission refuses any direction whose src_mac is not the
      * egress port's current address, so a fixture where they disagree

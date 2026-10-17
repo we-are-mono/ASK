@@ -31,6 +31,8 @@
 #define CDX_PCD_NUM_SCHEMES	(CDX_PCD_NUM_GROUPS + CDX_PCD_TUPLE_COUNT)
 /* At most five full-field extracts; tunnel/PPPoE bytes are appended separately. */
 #define CDX_PCD_MAX_EXTRACTS	5
+/* The PPPoE header bytes a routed three-tuple key ends with. */
+#define CDX_PCD_SESSION_KEY	4
 /* Widest protocol set is two (an L3 header plus its L4 or ESP header). */
 #define CDX_PCD_MAX_UNITS	2
 
@@ -70,6 +72,9 @@ struct cdx_pcd_group {
 	u8			table_type;	/* CDX lookup type */
 	u8			hw_table_type;	/* microcode class */
 	u8			tunnel_family;	/* 4/6 for native + PPPoE tuple schemes */
+	/* The routed three-tuple tables: one scheme keys a frame's PPPoE
+	 * session in band, after the known fields (cdx_pcd_session_key()). */
+	bool			session_identity;
 
 	/* KeyGen scheme, shared by ports using this policy. */
 	const char		*scheme_name;

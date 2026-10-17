@@ -1391,6 +1391,26 @@ static unsigned int fill_tunnel_key(PCtEntry entry, const struct cdx_l2_encap *e
 	return size + 8;
 }
 
+/* Mirrors cdx_pcd_session_key(): a routed three-tuple key ends with the first
+ * four bytes of the frame's PPPoE header -- version and type, the session-data
+ * code, the session ID -- or zeros for a frame with none. */
+static unsigned int fill_session_key(const struct cdx_l2_encap *encap, uint8_t *key)
+{
+	memset(key, 0, 4);
+	if (encap && encap->ingress_pppoe) {
+		__be16 session = cpu_to_be16(encap->ingress_session_id);
+
+		key[0] = 0x11;
+		memcpy(key + 2, &session, sizeof(session));
+	}
+	return 4;
+}
+
+static bool routed_tuple_table(uint32_t tbl_type)
+{
+	return tbl_type == IPV4_MULTICAST_TABLE || tbl_type == IPV6_MULTICAST_TABLE;
+}
+
 int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap)
 {
 	struct ins_entry_info *info;
@@ -1556,6 +1576,8 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 		key_size--;
 		key_size += fill_tunnel_key(entry, encap, tbl_entry->hashentry.key + key_size);
 	}
+	if (routed_tuple_table(tbl_type))
+		key_size += fill_session_key(encap, tbl_entry->hashentry.key + key_size);
 
 	//round off keysize to next 4 bytes boundary 
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];          
@@ -1883,6 +1905,10 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 								__func__);
 		goto err_ret;
 	}
+	/* A routed group is never received in a session: its ingress is no
+	 * ppp device (ft_mr_ingress()). */
+	if (!mac_pair && routed_tuple_table(tbl_type))
+		key_size += fill_session_key(NULL, &tbl_entry->hashentry.key[key_size]);
 	//round off keysize to next 4 bytes boundary
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];
 	ptr += ALIGN(key_size, TBLENTRY_OPC_ALIGN);

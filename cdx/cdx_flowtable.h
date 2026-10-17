@@ -4,6 +4,9 @@
 
 #include <linux/types.h>
 
+/* The `transit` parameter; see cdx_flowtable_backend.c. */
+extern bool cdx_ft_transit;
+
 struct net_device;
 enum tc_setup_type;
 

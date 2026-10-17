@@ -198,6 +198,23 @@ static void cdx_pcd_tunnel_key(t_FmPcdKgKeyExtractAndHashParams *key,
 	}
 }
 
+/* The first four bytes of a frame's PPPoE header -- version and type, code,
+ * session ID -- or zeros for a frame with none, after the routed three-tuple
+ * tables' known fields. Their one scheme takes both kinds of frame: it is
+ * reached by the TCP and UDP tables' misses as well as directly, and a miss
+ * names one scheme. So a session frame keys its session and never a native
+ * entry, and a transit flow received in a session is bound to it. The
+ * concentrator's MAC, which this one extract cannot leave out of a native
+ * frame's key, is not among them, as it is for the TCP and UDP tables. */
+static void cdx_pcd_session_key(t_FmPcdKgKeyExtractAndHashParams *key)
+{
+	key->numOfUsedDflts = 1;
+	key->privateDflt1 = 0;
+	key->dflts[0].type = e_FM_PCD_KG_GENERIC_FROM_DATA;
+	key->dflts[0].dfltSelect = e_FM_PCD_KG_DFLT_PRIVATE_1;
+	cdx_pcd_extract_bytes(key, HEADER_TYPE_PPPoE, 0, CDX_PCD_SESSION_KEY);
+}
+
 static int cdx_pcd_set_scheme(struct cdx_pcd_state *state, unsigned int idx,
 			      unsigned int grp, bool pppoe)
 {
@@ -236,6 +253,8 @@ static int cdx_pcd_set_scheme(struct cdx_pcd_state *state, unsigned int idx,
 	}
 	if (g->tunnel_family)
 		cdx_pcd_tunnel_key(&params.keyExtractAndHashParams, g->tunnel_family, pppoe);
+	if (g->session_identity)
+		cdx_pcd_session_key(&params.keyExtractAndHashParams);
 	params.keyExtractAndHashParams.hashDistributionNumOfFqids = g->num_fqids;
 	params.baseFqid = g->base_fqid;
 	params.numOfUsedExtractedOrs = 1;

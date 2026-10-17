@@ -18,6 +18,7 @@ SRC_URI = "file://S03debugfs \
            file://dnsmasq-gateway.conf \
            file://hostapd-ask.conf \
            file://ask-flowtable-qos.conf \
+           file://ask-transit.conf \
            file://ask-modules.conf \
            file://offload.conf \
           "
@@ -43,6 +44,9 @@ fakeroot do_install() {
     install -d ${D}${sysconfdir}/modprobe.d
     install -m 0644 ${UNPACKDIR}/ask-flowtable-qos.conf \
         ${D}${sysconfdir}/modprobe.d/ask-flowtable-qos.conf
+    # Test image only: transit tunnels in hardware, off by default.
+    install -m 0644 ${UNPACKDIR}/ask-transit.conf \
+        ${D}${sysconfdir}/modprobe.d/ask-transit.conf
 
     # The default offload policy. The ask-flowtable daemon (its own package)
     # falls back to identical built-in defaults when this file is absent.
@@ -95,6 +99,7 @@ fakeroot do_install() {
 FILES:${PN} = " \
     ${sysconfdir}/modules-load.d/ask.conf \
     ${sysconfdir}/modprobe.d/ask-flowtable-qos.conf \
+    ${sysconfdir}/modprobe.d/ask-transit.conf \
     ${sysconfdir}/ask/offload.conf \
     ${sysconfdir}/init.d/debugfs \
     ${sysconfdir}/rcS.d/S03debugfs \

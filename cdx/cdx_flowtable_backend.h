@@ -388,9 +388,13 @@ struct cdx_ft_l2_rule {
  * IPv4 header is not always the outermost: a frame of an IPv6 tunnel whose
  * inner IPv4 header has a transit flow's pair and protocol matches that
  * flow's entry too. It takes the same pair crossing the router both natively
- * and inside such a tunnel, and is left. */
+ * and inside such a tunnel, and is left. None is carried with the module's
+ * `transit` parameter off. */
+extern bool cdx_ft_transit;
 static inline bool cdx_ft_portless(u8 family, u8 proto)
 {
+	if (!cdx_ft_transit)
+		return false;
 	switch (proto) {
 	case IPPROTO_ESP:
 		return family == AF_INET || family == AF_INET6;

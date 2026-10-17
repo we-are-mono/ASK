@@ -1404,6 +1404,9 @@ static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_bloc
  * that what the hardware is told and what /proc reports are the same thing. */
 static u8 police_lookup_profile;
 static unsigned police_lookups;
+/* cdx's `transit` parameter, on as the test image loads it; the cases that
+ * need it off turn it off themselves. */
+bool cdx_ft_transit = true;
 static u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
 {
     /* A filter matches on the finished tuple, so this has to be asked last --
@@ -8703,6 +8706,11 @@ int main(void)
         PORTLESS(fixture6, IPPROTO_IPIP);
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     }
+    /* With cdx's `transit` parameter off, none of them is admitted. */
+    cdx_ft_transit = false;
+    REJECT(PORTLESS(fixture, IPPROTO_ESP)); REJECT(PORTLESS(fixture, IPPROTO_GRE));
+    REJECT(PORTLESS(fixture6, IPPROTO_ESP));
+    cdx_ft_transit = true;
     /* No other protocol without the key, and none of them with it. */
     REJECT(PORTLESS(fixture, IPPROTO_UDP)); REJECT(PORTLESS(fixture, IPPROTO_ICMP));
     REJECT(bk.ip_proto = ct.protonum = IPPROTO_ESP);
@@ -8714,16 +8722,17 @@ int main(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.sa_handle);
     REJECT(PORTLESS(fixture, IPPROTO_ESP); xfrm_policies = true; ipsec_sa = 7);
     REJECT(PORTLESS(fixture, IPPROTO_GRE); xfrm_policies = true; ipsec_in_sa = 8);
-    /* Nor in a PPPoE session either way: the three-tuple tables have no key
-     * for the session a receive entry must match, and a push into one is not
-     * proven there. UDP is carried from one where it fits, and into one at
-     * 1500 over a 1508-byte port (RFC 4638), where the MTU (A385) lets it. */
+    /* From a PPPoE session, keyed on its ID in the three-tuple tables, as
+     * UDP is carried from one where it fits; but not into one, a push not
+     * proven there, even at 1500 over a 1508-byte port (RFC 4638), where the
+     * MTU (A385) lets UDP. */
     pppoe_in_fixture(); cls.nf_mtu = 1492;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.in_session.present);
     pppoe_in_fixture(); cls.nf_mtu = 1492;
     bk.ip_proto = ct.protonum = IPPROTO_ESP;
     dissector.used_keys &= ~BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
-    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.in_session.present &&
+           decoded.proto == IPPROTO_ESP && !decoded.sport && !decoded.dport);
     pppoe_out_fixture(); udp_flow(); out.mtu = 1508; ppp.mtu = cls.nf_mtu = 1500;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.out_session.present);
     pppoe_out_fixture(); udp_flow(); out.mtu = 1508; ppp.mtu = cls.nf_mtu = 1500;

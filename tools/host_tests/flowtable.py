@@ -119,8 +119,15 @@ def test_hardware_ownership(tmp_path):
         function((ROOT / "cdx/cdx_hal.h").read_text(), "__WRITE_UNALIGNED_INT")
         + "#define WRITE_UNALIGNED_INT(var, val) __WRITE_UNALIGNED_INT(&(var), (val))\n"
         + function((ROOT / "cdx/control_tunnel.c").read_text(), "tnl_build_header"))
+    session = function((ROOT / "cdx/cdx_ehash.c").read_text(), "fill_session_key")
+    # The session bytes an entry's key ends with and those the scheme
+    # extracts (cdx_pcd_session_key()) are one size.
+    size = int(re.search(r"#define CDX_PCD_SESSION_KEY\s+(\d+)",
+                         (ROOT / "cdx/cdx_pcd.h").read_text())[1])
+    assert f"memset(key, 0, {size});" in session and f"return {size};" in session, session
     (tmp_path / "hardware_production.inc").write_text(
         function((ROOT / "cdx/cdx_ehash.c").read_text(), "fill_tunnel_key")
+        + session
         + source[source.index("struct cdx_ft_hw {"):])
     backend = (ROOT / "cdx/cdx_flowtable_backend.c").read_text()
     (tmp_path / "backend_production.inc").write_text(backend[backend.index("static bool ft_observe"):])

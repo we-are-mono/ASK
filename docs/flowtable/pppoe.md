@@ -185,13 +185,30 @@ costs no admission lock
 
 ## Receive identity
 
-Each receive entry matches the negotiated concentrator MAC and session ID,
-plus the physical port, inner addresses and ports, and tunnel fields. TCP and
+Each TCP and UDP receive entry matches the negotiated concentrator MAC and
+session ID, plus the physical port, inner addresses and ports, and tunnel
+fields. TCP and
 UDP select separate tables. The loader adds PPPoE schemes in C ahead of their
 native counterparts, sharing the existing tables; the XML stays unchanged.
 Native entries use eight zero bytes in place of the session identity, so a
 session frame cannot use a native entry. Physical IPv4 keys are 56 bytes and
 IPv6 keys are 55 bytes; SEC's private keys retain their original layout.
+
+The routed three-tuple tables, which hold routed multicast groups and the
+transit tunnels of [transit.md](transit.md), bind a session by its ID alone.
+Their one scheme is reached by the TCP and UDP tables' misses as well as
+directly, and a miss names one scheme, so the key cannot carry an Ethernet
+source for session frames without carrying one for native frames too. It ends
+instead with the first four bytes of the PPPoE header -- version and type,
+code, session ID -- which are zero for a native frame (A391). A session frame
+cannot use a native entry there either, and a frame in another session misses
+(`flowtable_transit.py`'s session cases inject both). What the key does not
+hold is the sender: a frame with the session's ID and a transit flow's
+addresses is forwarded in hardware from any source MAC, without the
+concentrator check patch 151 makes in software, and two concentrators on one
+port that gave the router the same session ID would share a transit entry.
+That is a host on the access segment that knows the session; only transit
+flows received in a session are exposed to it.
 
 Patch 151 also checks the concentrator MAC before IPv4 or IPv6 software
 flowtable forwarding. The software tuple already checks the session ID.

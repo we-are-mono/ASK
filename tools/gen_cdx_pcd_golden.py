@@ -167,6 +167,17 @@ def add_receive_identity(model):
         for table in model["tables"]:
             if table["name"] == table_name:
                 table["key_size"] = 56 if family == 4 else 55
+    # The routed three-tuple tables key a frame's PPPoE session in band, after
+    # their known fields, from their one scheme (cdx_pcd_session_key(), A391).
+    for scheme in model["schemes"]:
+        match = re.fullmatch(r"cdx_ipv([46])multicast_dist", scheme["name"])
+        if not match:
+            continue
+        scheme["generic"] = [["HEADER_TYPE_PPPoE", 0, 4]]
+        table_name = "cdx_multicast%s_cc" % match[1]
+        for table in model["tables"]:
+            if table["name"] == table_name:
+                table["key_size"] = 14 if match[1] == "4" else 38
     model["counts"]["scheme_count"] = len(model["schemes"])
 
 

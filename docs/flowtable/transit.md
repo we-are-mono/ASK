@@ -23,14 +23,12 @@ and UDP alone, in software and in the rule a driver is handed.
 **The adapter.** `ft_parse()` admits a flow described without the ports key
 when `cdx_ft_portless()` names its protocol for its family, with ports zero:
 ESP over IPv4 or IPv6, and GRE, IPIP and 6in4 over IPv4 alone. A translated
-one is refused, and so is one through a local tunnel device, through a PPPoE
-session either way, or into or out of one of the router's own SAs: the
-three-tuple key has no room for a session's concentrator and ID, which every
-receive entry in a session must match ([pppoe.md](pppoe.md)), and the SA
-descriptors are filled for the TCP and UDP tables alone. Those stay in the
-software flowtable. Every other rule a routed flow meets applies unchanged,
-the MTU one among them: a direction into a narrower path stays in software,
-as a UDP one does (A385).
+one is refused, and so is one through a local tunnel device, into a PPPoE
+session, or into or out of one of the router's own SAs, whose descriptors are
+filled for the TCP and UDP tables alone; those stay in the software flowtable.
+One received in a session is carried, bound to the session's ID (below). Every
+other rule a routed flow meets applies unchanged, the MTU one among them: a
+direction into a narrower path stays in software, as a UDP one does (A385).
 
 **The hardware.** Each direction goes into the routed three-tuple tables,
 keyed on the address pair and protocol (`IPV4_MULTICAST_TABLE` and
@@ -67,10 +65,42 @@ three-tuple UDP tables' misses to the IPv4 three-tuple scheme before the
 Ethernet table, and that scheme keys the first IPv4 header: the tunnel's outer
 one whenever the outer header is IPv4. That is why IPIP, 6in4 and GRE are
 carried over IPv4 alone. A frame no transit flow claims misses there too and
-goes on as before; the bridged station pairs, whose TCP frames now cross two
-more lookups on their way to the Ethernet table, still run at 9.36-9.39 Gbit/s
-in every shape. That is full-size frames: what the longer chain costs a stream
-of small ones, at a rate the rig cannot generate, is not measured.
+goes on as before. That costs every such frame two more lookups on its way to
+the Ethernet table, which full-size frames do not show -- the bridged station
+pairs still run at 9.36-9.39 Gbit/s in every shape -- and minimum ones do: the
+LAN VM flooding a pair with 64-byte frames at 9 Mpps, the pair forwards
+2.06-2.17 Mpps through this chain and 2.50 Mpps through 1.0.7's, 13-18% less
+(`flowtable_l2bridge.py::test_l2_packet_rate`, A392). Below that rate, and for
+frames past about 600 bytes at line rate, nothing is lost either way.
+
+## In a PPPoE session
+
+A transit flow that arrives in a session -- a LAN host's native IPsec over an
+IPv6-over-PPPoE WAN above all -- is keyed on the session as well (A391). The
+three-tuple keys end with the first four bytes of the frame's PPPoE header,
+zeros for a native frame, from the tables' one scheme: the TCP and UDP tables'
+misses reach it as well as frames that go to it directly, and a miss names one
+scheme. The entry strips the session as a TCP or UDP one does. Unlike theirs,
+it binds the session ID and not the concentrator's MAC
+([pppoe.md](pppoe.md#receive-identity)). A session frame no longer hits a
+native entry with the same addresses, which before it could, routed multicast
+groups' included. The way into the session stays in software: what a 1500-byte
+LAN may deliver exceeds the session's MTU, and a push from these tables is not
+proven.
+
+## Switched on
+
+All of it is behind cdx's `transit` parameter, off by default: off, the TCP
+and UDP tables' misses go straight to the Ethernet table, as in 1.0.7, and no
+port-less flow is admitted, so a router that never forwards such a tunnel
+keeps 1.0.7's rate for every frame no flow claims. On, it is everything this
+page describes. Read when the classifier is built, it takes a reboot to
+change -- cdx cannot be loaded twice in one boot. `/proc/cdx_flowtable` says
+which as `transit`. On OpenWrt it is a module option (`cdx transit=1` in
+`/etc/modules.d`), and fw4's rule has to offer the protocols as well (below).
+The ASK test image turns it on (`/etc/modprobe.d/ask-transit.conf`), and a
+boot with `cdx.transit=0` on the kernel's command line runs the case that
+proves it off (`flowtable_transit.py::test_transit_switched_off`).
 
 A 6in4 tunnel's inner ICMPv6, and anything else its parser leaves with no
 TCP or UDP behind the inner IPv6 header, reaches the IPv6 three-tuple scheme
@@ -102,5 +132,6 @@ installed at all:
 
 A ruleset offers these flows only if its `flow add` rule names them. OpenWrt's
 fw4 offers `meta l4proto { tcp, udp }`, so on OpenWrt they stay in software
-until fw4's rule lists `esp`, `gre`, `ipip` (4) and `ipv6` (41) as well -- a
-change for the OpenWrt port, not for this repository.
+until fw4's rule lists `esp`, `gre`, `ipip` (4) and `ipv6` (41) as well, and
+cdx's `transit` is on -- a change for the OpenWrt port, not for this
+repository.

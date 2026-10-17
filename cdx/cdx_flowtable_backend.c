@@ -31,6 +31,18 @@ EXPORT_SYMBOL_NS_GPL(cdx_ft_debug_mask, ASK_CDX_FLOWTABLE);
 module_param_named(ask_debug, cdx_ft_debug_mask, uint, 0644);
 MODULE_PARM_DESC(ask_debug, "ASK-DEBUG admission tracing: 1=refusals 2=accepts 4=devices");
 
+/* Transit ESP, GRE, IPIP and 6in4 in hardware (A386). It costs every frame
+ * the TCP and UDP tables miss two more lookups on its way to the Ethernet
+ * table (cdxdrv_set_miss_action()), and a bridged station pair's minimum
+ * frames 13-18% of their rate (A392); off, that chain is 1.0.7's, and such flows
+ * stay in the software flowtable (cdx_ft_portless()). Off by default: OpenWrt
+ * offers none of them to a flowtable unless told to. Read when the classifier
+ * is built, so fixed while the module is loaded. */
+bool cdx_ft_transit;
+EXPORT_SYMBOL_NS_GPL(cdx_ft_transit, ASK_CDX_FLOWTABLE);
+module_param_named(transit, cdx_ft_transit, bool, 0444);
+MODULE_PARM_DESC(transit, "Offload transit ESP, GRE, IPIP and 6in4; costs bridged minimum frames up to 18% (default off)");
+
 /* Detach/reclaim must not forget an unproven hardware deletion. */
 static bool ft_claimed, ft_failed;
 static unsigned int ft_live;

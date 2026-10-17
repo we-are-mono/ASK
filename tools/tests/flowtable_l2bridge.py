@@ -1045,3 +1045,132 @@ async def test_l2_br_netfilter_flow_add(l2_rig):
             await dut("ip", "link", "set", BRIDGE, "promisc", "off", check=False)
             await dut("ip", "route", "del", subnet, "dev", BRIDGE, check=False)
             await dut("nft", "delete", "chain", "inet", TABLE, "fw4", check=False)
+
+
+# ---- the pairs at packet rate (A392) ---------------------------------------
+#
+# A pair's frames reach its Ethernet-table entry only after missing every IP
+# table the classifier asks first, and A386 put two more in that chain: the
+# TCP and UDP tables' misses go through the routed three-tuple tables, where a
+# transit tunnel is keyed, before the bridged multicast and Ethernet ones
+# (cdx's `transit` parameter, cdxdrv_set_miss_action()). Full-size frames hide
+# what a lookup costs; minimum frames offered at several times what one port
+# forwards show it. The LAN VM floods the station's pair as flowtable_nat_
+# throughput.py floods a NAT'd flow. The case measures whichever chain cdx
+# was booted with: a boot with cdx.transit=0 on the kernel's command line
+# measures 1.0.7's, since cdx cannot be loaded twice in one boot.
+
+PACKET_FRAME = 64
+PACKET_THREADS = 4
+PACKET_SECONDS = 3
+# What the LAN VM's four threads put on the wire (flowtable_nat_throughput.py).
+PACKET_SENDER = 9e6
+PACKET_PORT = 5213
+# What the pair forwarded of minimum frames: 2.06-2.17 Mpps with the transit
+# chain and 2.50 Mpps without (docs/flowtable/transit.md).
+L2_PACKET_CAPACITY = float(os.environ.get("ASK_L2_PACKET_RATE_CAPACITY", "1.9")) * 1e6
+# The LAN VM's own frames landing between two counter reads of one snapshot.
+PACKET_NOISE = 64
+SINK = "ask_l2_packet_sink"
+
+
+def _wire():
+    """The WAN host's DUT-facing physical port."""
+    bridge = os.environ.get("ASK_WAN_INJECT_IF", "br0")
+    return os.environ.get("ASK_WAN_WIRE_IF") or next(
+        entry.name for entry in os.scandir(f"/sys/class/net/{bridge}/brif")
+        if os.path.exists(f"/sys/class/net/{entry.name}/device"))
+
+
+def _flood(count):
+    """The LAN VM's script: pktgen threads, one per transmit queue, flooding
+    the peer through the station's pair as fast as each can, and what its NIC
+    says left it."""
+    commands = [f"count {count}", "clone_skb 1000", f"pkt_size {PACKET_FRAME - 4}", "burst 32",
+                f"dst_mac {PEER_MAC}", f"src_min {STATION_ADDR}", f"src_max {STATION_ADDR}",
+                f"dst_min {PEER_ADDR}", f"dst_max {PEER_ADDR}",
+                f"udp_dst_min {PACKET_PORT}", f"udp_dst_max {PACKET_PORT}", "flag UDPCSUM"]
+    return f'''
+import json, subprocess, time
+from pathlib import Path
+root = Path("/proc/net/pktgen")
+subprocess.run(["modprobe", "pktgen"], check=True)
+def pg(path, cmd):
+    (root / path).write_text(cmd + "\\n")
+def nic():
+    out = subprocess.check_output(["ethtool", "-S", {LAN_NIC!r}], text=True)
+    stats = {{k.strip(): int(v) for k, v in (l.split(":", 1) for l in out.splitlines()[1:]) if v.strip().isdigit()}}
+    return {{k: stats[k] for k in ("tx_pkts_nic", "tx_packets", "tx_dropped")}}
+devices = [f"{LAN_NIC}@{{t}}" for t in range({PACKET_THREADS})]
+try:
+    for t, dev in enumerate(devices):
+        pg(f"kpktgend_{{t}}", "rem_device_all")
+        pg(f"kpktgend_{{t}}", f"add_device {{dev}}")
+        for cmd in {commands!r} + [f"queue_map_min {{t}}", f"queue_map_max {{t}}",
+                                   f"udp_src_min {{{PACKET_PORT} + 1 + t}}",
+                                   f"udp_src_max {{{PACKET_PORT} + 1 + t}}"]:
+            pg(dev, cmd)
+    before = nic()
+    start = time.monotonic()
+    pg("pgctrl", "start")
+    elapsed = time.monotonic() - start
+    after = nic()
+finally:
+    for t in range({PACKET_THREADS}):
+        pg(f"kpktgend_{{t}}", "rem_device_all")
+print(json.dumps({{"elapsed": elapsed, "nic": {{k: after[k] - before[k] for k in before}}}}))
+'''
+
+
+async def test_l2_packet_rate(l2_rig):
+    """Minimum frames through a pair at several times what one port forwards:
+    the pair forwards at least L2_PACKET_CAPACITY by its own counter, every
+    frame it matched leaves the WAN MAC, every one past what the port takes
+    is refused and counted at the LAN MAC, and the DUT's kernel sends none."""
+    from flowtable_nat_throughput import _dut_hops
+    r = l2_rig
+    await _exchange(r, count=4)
+    first = await _carried(r)
+    before = _pairs(r, first)[r.lan_port]
+    count = int(PACKET_SENDER / PACKET_THREADS * PACKET_SECONDS)
+    hops_before = await _dut_hops(r)
+    # The flood stops at this host's port, before its bridge and stack; only
+    # while it runs, since the pings that keep the pair learned go the same
+    # way.
+    await _local("nft", f'table netdev {SINK} {{ chain ingress {{ type filter hook ingress '
+                        f'device "{_wire()}" priority -500; policy accept; '
+                        f'ether daddr {PEER_MAC} counter drop; }}; }}')
+    try:
+        result = await lan_run_python(r.lan, _flood(count), label="l2_flood",
+                                      timeout=PACKET_SECONDS * 4 + 30)
+    finally:
+        await _local("nft", "delete", "table", "netdev", SINK, check=False)
+    assert result.rc == 0, result.stdout
+    sender = json.loads(result.stdout.strip().splitlines()[-1])
+    # The hardware's counters reach the adapter on its statistics pass.
+    await asyncio.sleep(2.5)
+    last = await r.state()
+    after = _pairs(r, last)[r.lan_port]
+    hops_after = await _dut_hops(r)
+    sent = sender["nic"]["tx_pkts_nic"]
+    matched = int(after["packets"]) - int(before["packets"])
+    change = {side: {k: hops_after[side][k] - hops_before[side][k] for k in hops_before[side]}
+              for side in ("lan_rx", "lan_port", "wan_tx", "kernel_tx")}
+    account = {"transit": last["transit"], "sent": sent, "offered_pps": sent / sender["elapsed"],
+               "forwarded_pps": matched / sender["elapsed"], "matched": matched, **change}
+    r.record(f"l2-packet-rate-transit-{last['transit']}", account)
+    lan_rx, port, wan_tx = change["lan_rx"], change["lan_port"], change["wan_tx"]
+    # The same entry throughout: none installed or retired meanwhile.
+    for name in ("l2_installs", "l2_retired"):
+        assert last[name] == first[name], (name, first[name], last[name])
+    # Several times what the port forwards, or the case measures the sender.
+    assert account["offered_pps"] >= 2 * L2_PACKET_CAPACITY, account
+    assert account["forwarded_pps"] >= L2_PACKET_CAPACITY, account
+    # Every frame past what the port took refused, and counted, at the MAC;
+    # every one it took matched; every one matched sent.
+    assert abs(lan_rx["rpkt"] - lan_rx["rfrm"] - lan_rx["rdrp"]) <= PACKET_NOISE, account
+    assert abs(port["port_frame"] - lan_rx["rfrm"] - lan_rx["rerr"]) <= PACKET_NOISE, account
+    assert port["port_discard_frame"] == port["port_rx_bad_frame"] == 0, account
+    assert matched >= port["port_enq_total"] - PACKET_NOISE, account
+    assert wan_tx["tpkt"] >= matched and wan_tx["terr"] == 0, account
+    assert all(0 <= v <= 512 for v in change["kernel_tx"].values()), account
