@@ -132,13 +132,17 @@ async def _carried(r, timeout=10, since=None):
 
 
 TWO_TAGS = "vlanport-trunk"
+# The LAN VM's NIC MTU outside this file, which a run that died with it
+# raised does not get to change.
+LAN_BASE_MTU = 1500
 
 
 def _lan_nic_mtu(lan, mtu):
     """The LAN VM's NIC at `mtu`, its link up again for five seconds running.
     An ixgbe MTU change resets the port and retrains the link, which on this
     bench's 10GBASE-T link has taken from seconds to over three minutes."""
-    lan.run(f"ip link set dev {LAN_NIC} mtu {mtu}")
+    result = lan.run(f"ip link set dev {LAN_NIC} mtu {mtu}")
+    assert result.rc == 0, result.stdout
     started, stable = time.monotonic(), 0
     while time.monotonic() < started + 300:
         up = lan.run(f"cat /sys/class/net/{LAN_NIC}/operstate").stdout.strip() == "up"
@@ -159,15 +163,14 @@ def lan_two_tags(lan, request):
     keeps the station's own packets at 1500 (_segment())."""
     wanted = any(item.module is request.module and TWO_TAGS in item.nodeid
                  for item in request.session.items)
-    old = int(lan.run(f"cat /sys/class/net/{LAN_NIC}/mtu").stdout.strip())
     if not wanted:
         yield
         return
     try:
-        _lan_nic_mtu(lan, old + 4)
+        _lan_nic_mtu(lan, LAN_BASE_MTU + 4)
         yield
     finally:
-        _lan_nic_mtu(lan, old)
+        _lan_nic_mtu(lan, LAN_BASE_MTU)
 
 
 async def _segment(r, stack, shape):
@@ -1013,18 +1016,32 @@ async def test_l2_br_netfilter_flow_add(l2_rig):
     checks off (A388). A promiscuous bridge keeps the pairs in software, so
     the CPU forwards every frame and the chain sees each one."""
     r = l2_rig
+    subnet = f"{PEER_ADDR.rsplit('.', 1)[0]}.0/{PREFIX}"
     async with _br_netfilter(r, call=1) as dut:
         await dut("nft", f"add chain inet {TABLE} fw4 {{ type filter hook forward priority 0 ; "
                          f"policy accept ; }}")
-        await dut("nft", f"add rule inet {TABLE} fw4 meta l4proto {{ tcp, udp }} flow add @fast")
+        await dut("nft", f"add rule inet {TABLE} fw4 meta l4proto {{ tcp, udp }} counter "
+                         f"flow add @fast")
+        # A route back to the stations through the bridge, as a router's LAN
+        # has: without one the flow could not be built at all, and the case
+        # would pass on a kernel without the patch.
+        await dut("ip", "route", "replace", subnet, "dev", BRIDGE)
         await dut("ip", "link", "set", BRIDGE, "promisc", "on")
         try:
             await _tcp(r)
             conntrack = await dut("conntrack", "-L", "-o", "extended", check=False)
             bridged = [line for line in conntrack["stdout"].splitlines() if PEER_ADDR in line]
-            r.record("l2-brnf-flow-add", {"conntrack": bridged, "state": await r.state()})
+            chain = json.loads((await dut("nft", "-j", "list", "chain", "inet", TABLE,
+                                          "fw4"))["stdout"])
+            offered = sum(e["counter"]["packets"] for item in chain["nftables"]
+                          for e in item.get("rule", {}).get("expr", []) if "counter" in e)
+            r.record("l2-brnf-flow-add", {"conntrack": bridged, "offered": offered,
+                                          "state": await r.state()})
+            # The rule saw the stream: `flow add` was asked of it.
+            assert offered > 0, chain
             assert bridged, conntrack["stdout"]
             assert not any("OFFLOAD" in line for line in bridged), bridged
         finally:
             await dut("ip", "link", "set", BRIDGE, "promisc", "off", check=False)
+            await dut("ip", "route", "del", subnet, "dev", BRIDGE, check=False)
             await dut("nft", "delete", "chain", "inet", TABLE, "fw4", check=False)
