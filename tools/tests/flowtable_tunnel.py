@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from _flowtable_tunnel import CHANGED_TTL
 
-from _flowtable_tunnel import (MOVED_DEV, MOVED_GATEWAY, MOVED_MAC, Capture, _admit, _announce, _assert_marked, _assert_outer, _assert_tunnel, _both_directions, _carried, _change, _directions, _ecn_capable, _established, _expected, _insert_phases, _ip_checksum, _marking, _moved_host, _offload_table, _outer_neighbour, _retired, _stripped, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange, _undo)
+from _flowtable_tunnel import (MOVED_DEV, MOVED_GATEWAY, MOVED_MAC, Capture, _admit, _announce, _assert_marked, _assert_outer, _assert_tunnel, _both_directions, _carried, _change, _congested, _directions, _ecn_capable, _established, _expected, _insert_phases, _ip_checksum, _marking, _moved_host, _offload_table, _outer_neighbour, _retired, _stripped, _tunnel_counters, _tunnel_record, _tunnel_text, _udp_exchange, _undo)
 
 
 import asyncio
@@ -424,6 +424,39 @@ async def test_outer_codepoint_on_receive(tunnel_rig):
     _, replies, _, sent = await _stripped(r, 0, "copy-4o6-inherit", hardware=False)
     sent_as_described(sent)
     assert_remarked("strip, copied", replies, COUNT, tos=AF21_TOS, label=label)
+
+
+@pytest.mark.rfc("6040", section="4.2")
+@pytest.mark.parametrize("tunnel_rig", ["6o4/ce", "4o6/ce"], indirect=True)
+async def test_outer_ce_on_receive(tunnel_rig):
+    """Replies whose outer header arrives CE, as a congested router inside the
+    tunnel marks it, are Linux's to receive: an ECT carried packet leaves CE
+    and a Not-ECT one is dropped (RFC 6040 §4.2), which the hardware's strip
+    cannot do -- it removed the outer header, mark and all (A372).
+
+    The soft parser hands such a frame to the CPU before the strip entry is
+    searched. So the replies sent ECT(0), ECT(1) or CE reach the LAN VM CE, each
+    Not-ECT one is a frame error on the DUT's tunnel and never arrives, Linux
+    sees every outer packet, and the strip counts none of them. With the mark
+    gone, the same strip carries the next replies again."""
+    r = tunnel_rig
+    shape = r.shape
+    count = 64
+    await _offload_table(r)
+    await _admit(r)
+    answered, sent, moved = await _congested(r, count, f"ce-{shape.mode}")
+    markings = [_marking(r, p) for p in sent]
+    assert len(markings) == count and {m["ecn"] for m in markings} == {3}, markings[:4]
+    assert {m["inner_ecn"] for m in markings} == {0, 1, 2, 3}, markings[:4]
+    received = {f["n"]: f["tos"] & 3 for f in answered["fields"]}
+    assert sorted(received) == [n for n in range(count) if n % 4], received
+    assert set(received.values()) == {3}, received
+    assert answered["lost"] == count // 4 and not any(answered["errors"].values()), answered
+    assert moved["frame_errors"] == count // 4, moved
+    assert moved["strip"] == 0 and moved["record"]["rx_packets"] == 0, moved
+    assert moved["outer_seen"] >= count, moved
+    _, replies, _, _ = await _stripped(r, 0, f"ce-after-{shape.mode}")
+    assert {f["tos"] & 3 for f in replies} == {0, 1, 2, 3}, replies[:4]
 
 
 @pytest.mark.parametrize("tunnel_rig", ["4o6/inherit"], indirect=True)

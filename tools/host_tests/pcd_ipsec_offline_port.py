@@ -92,6 +92,27 @@ def test_soft_parser_scope():
         assigned = {a.get('name'): a.get('value') for a in punt.findall("if-true/assign-variable")}
         assert assigned == {'$hpnia': '0x500002'}, (punt.get('expr'), assigned)
         assert punt.find("if-true/action").get('confirm') == 'no', punt.get('expr')
+    # A tunnel frame under an outer CE goes to Linux, which applies RFC 6040's
+    # decapsulation, from the receive ports, where the strips are (A372): 6o4,
+    # and 4o6 with or without the destination options of an encapsulation limit.
+    # The 6o4 check sits inside the branch that already names IPv6 next, and
+    # the 4o6 one asks for CE first, so other frames pay one compare at most.
+    branch = tree.find("protocol[@name='ipv4schema']/execute-code/before/"
+                       "if[@expr='ipv4.nextp == 0x29']/if-true")
+    # Ahead of the hand-over to the IPv6 header, where it runs at all.
+    assert [child.tag for child in branch] == ['if', 'action'], branch
+    assert branch[1].get('nextproto') == 'ipv6', branch[1].attrib
+    ce = {'ipv4schema': branch[0],
+          'ipv6schema': next(check for check in
+                             tree.findall("protocol[@name='ipv6schema']/execute-code/before/if")
+                             if check.get('expr').startswith('($FW[10:2])'))}
+    assert ce['ipv4schema'].get('expr') == '($FW[14:2]) == 3 and $logicalportid lt 9'
+    assert ce['ipv6schema'].get('expr') == ('($FW[10:2]) == 3 and $logicalportid lt 9 and '
+                                            '(ipv6.nexthdr == 0x04 or ipv6.nexthdr == 0x3c)')
+    for punt in ce.values():
+        assigned = {a.get('name'): a.get('value') for a in punt.findall("if-true/assign-variable")}
+        assert assigned == {'$hpnia': '0x500002'}, (punt.get('expr'), assigned)
+        assert punt.find("if-true/action").get('confirm') == 'no', punt.get('expr')
 
 
 # KeyGen's known-field bits (fm_kg.h). A scheme's key carries its known fields

@@ -53,7 +53,8 @@ MTU_4O6 = 1440          # 1500 less the 40-byte IPv6 outer header and a 20-byte 
 PORTS = {"routed": (48910, 48911), "mtu": (48920, 48921), "tcp": (48930, 48931),
          "change": (48940, 48941), "delete": (48950, 48951), "rate": (48970, 48971),
          "neighbour": (48980, 48981), "route": (48982, 48983), "remark": (48984, 48985),
-         "marking": (48972, 48973), "inherit": (48974, 48975), "copy": (48976, 48977)}
+         "marking": (48972, 48973), "inherit": (48974, 48975), "copy": (48976, 48977),
+         "ce": (48986, 48987)}
 
 # Where the WAN host's outer endpoint moves to: a second MAC on its WAN
 # bridge (_moved_host).
@@ -572,6 +573,73 @@ async def _stripped(r, tos, name, hardware=True):
     return strip, answered["fields"], capture.packets(), replies.packets()
 
 
+# This host's own table, which marks every outer header it sends the DUT CE.
+CE_TABLE = "ask_tunnel_ce"
+
+
+async def _congested(r, count, name):
+    """`count` replies from this host through the tunnel, each with the ECN
+    encoding its request's sequence number names (_mark_replies), under outer
+    headers this host marks CE on their way out, as a congested router inside
+    the tunnel would. Returns what the LAN VM's stack received (marked_echo()),
+    the replies as this host sent them, and what moved on the DUT meanwhile:
+    the strip row, the tunnel's receive record, the outer packets Linux saw
+    and the tunnel device's frame errors."""
+    shape = r.shape
+    dut, orch = shape.outer
+    if shape.mode == "6o4":
+        family, mark = "ip", f"ip saddr {orch} ip daddr {dut} ip protocol 41 ip ecn set ce"
+    else:
+        family, mark = "ip6", f"ip6 saddr {orch} ip6 daddr {dut} meta l4proto 4 ip6 ecn set ce"
+    installed = await r.state()
+    strip = _directions(r, installed["flows"])[1]
+    record = _tunnel_record(r, installed)
+    errors = await _frame_errors(r)
+    await _outer_counter_add(r)
+    _mark_replies(r, 0)
+    await command(r.wan, r.session, "nft", "delete", "table", family, CE_TABLE, check=False)
+    try:
+        await command(r.wan, r.session, "nft", f"""table {family} {CE_TABLE} {{
+ chain postrouting {{ type filter hook postrouting priority 300; policy accept; {mark}; }}
+}}""")
+        outer = await _outer_counter(r)
+        async with Capture(r, f"{name}-replies", True) as replies:
+            # A reply comes back in a millisecond; a Not-ECT one never does,
+            # and the whole burst has to end well inside the flow's idle
+            # timeout, which nothing refreshes while the strip sees none of it.
+            answered = await marked_echo(r.lan, r.lan_address, shape.sport, shape.inner_orch,
+                                         shape.dport, count, wait=0.3)
+        outer = await _outer_counter(r) - outer
+    finally:
+        r.echo.prepare = None
+        await command(r.wan, r.session, "nft", "delete", "table", family, CE_TABLE, check=False)
+        await command(r.target, r.session, "nft", "delete", "table", "netdev", OUTER_TABLE,
+                      check=False)
+    state = await r.state()
+    # Still the strip that was installed, not one retired and readmitted since,
+    # whose count would start again from nothing.
+    assert strip["cookie"] in {f["cookie"] for f in state["flows"]}, (strip, state["flows"])
+    moved = {
+        "strip": {f["cookie"]: int(f["packets"]) for f in state["flows"]}[strip["cookie"]]
+                 - int(strip["packets"]),
+        "record": {k: v - record[k] for k, v in _tunnel_record(r, state).items()},
+        "outer_seen": outer,
+        "frame_errors": await _frame_errors(r) - errors,
+    }
+    r.record(f"tunnel-{name}", {"strip": strip, "installed": installed, "state": state,
+                                "moved": moved, "lost": answered["lost"],
+                                "errors": answered["errors"],
+                                "fields": answered["fields"]})
+    return answered, replies.packets(), moved
+
+
+async def _frame_errors(r):
+    """The DUT tunnel device's receive frame errors, where sit and ip6_tnl count
+    a Not-ECT packet they drop under an outer CE."""
+    return int(await read(r.target, r.session,
+                          f"/sys/class/net/{r.shape.device}/statistics/rx_frame_errors"))
+
+
 def _carried(r, packet):
     """The header the tunnel carries: the IPv6 one of a 6o4 frame, the IPv4
     one of a 4o6 frame."""
@@ -961,6 +1029,10 @@ async def tunnel_rig(target_agent, aiohttp_session, lan, splat_window, request):
                         if any(a.get("local") == ORCH_IPV4 for a in i["addr_info"]))
         r.wan_mac = json.loads((await command(r.wan, r.session, "ip", "-j", "link", "show",
                                               "dev", r.wan_if))["stdout"])[0]["address"]
+        # A run killed mid-burst leaves this host marking every outer header
+        # CE, which would cost the next case every Not-ECT reply.
+        for family in ("ip", "ip6"):
+            await command(r.wan, r.session, "nft", "delete", "table", family, CE_TABLE, check=False)
         for key in ("net.ipv6.conf.all.forwarding", "net.ipv4.ip_forward"):
             previous = (await command(r.target, r.session, "sysctl", "-n", key))["stdout"].strip()
             cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))

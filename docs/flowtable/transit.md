@@ -108,7 +108,9 @@ A 6in4 tunnel's inner ICMPv6, and anything else its parser leaves with no
 TCP or UDP behind the inner IPv6 header, reaches the IPv6 three-tuple scheme
 on the inner header and misses: those frames go to the CPU, which forwards
 them through the software flowtable. A tunnel's inner TCP SYN, FIN and RST go
-to the CPU too, as `cdx_sp.xml` sends every such segment.
+to the CPU too, as `cdx_sp.xml` sends every such segment, and so does a 6in4
+frame whose outer ECN field is CE, which the parser leaves to Linux for a
+tunnel the DUT ends (A372); forwarded, it keeps its mark.
 
 ## Proof on the rig
 

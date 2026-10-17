@@ -584,10 +584,11 @@ print(json.dumps({{'sent': {count}}}))
     assert result.rc == 0, result.stdout
 
 
-async def marked_echo(lan, source, sport, destination, dport, count):
+async def marked_echo(lan, source, sport, destination, dport, count, wait=2):
     """remark_send()'s datagrams, each answered before the next: the reply's
     TOS or traffic class, hop count and flow label as the LAN VM's stack
-    received them, in the form remark_fields() gives, and how many were lost.
+    received them, in the form remark_fields() gives, and how many were lost:
+    a reply not in after `wait` seconds.
 
     A datagram whose IP header or UDP checksum did not verify is not
     delivered, so every reply that arrived verified; the stack's own error
@@ -599,7 +600,7 @@ if v6:
 else:
     for flag in (socket.IP_RECVTOS, 12):  # IP_RECVTTL
         s.setsockopt(socket.IPPROTO_IP, flag, 1)
-s.settimeout(2)
+s.settimeout({wait})
 def errors():
     counters = {{}}
     lines = open('/proc/net/snmp').read().splitlines()

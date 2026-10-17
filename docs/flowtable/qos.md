@@ -2058,22 +2058,24 @@ such port.
 
 **What the soft parser punts meets it too.** It ends the parse early for a TTL
 or hop limit of 0 or 1, IPv4 ESP or UDP behind options, IKE's non-ESP marker on
-the NAT-T port, a TCP SYN, FIN or RST, and a PPPoE LCP frame, and assigns each
-`$hpnia` the BMI's enqueue, which hands the frame to the CPU should a flow's
-entry match it. The first three end it without confirming the header they stop
-at, so no table keyed on that header is searched: a TTL or options frame meets
-only a receive port's Ethernet or PPPoE lookup, where a bridged pair's entry
-carries it as the bridge would (`test_l2_ttl_one_is_bridged`), and IKE no UDP
-table, where the ESP-in-UDP SAs are; what those lookups miss meets this
-profile. The same three also assigned `$nia` the enqueue, which takes the frame
-from the parser straight to the CPU, past every lookup and so past the meter:
-with the punt rate at 1000 packets a second, 8000 such frames offered over four
-seconds all arrived, where 8000 SYNs or LCP frames came through as about 4060
-with the rest dropped (A370). They now assign only `$hpnia`, and on the WAN
-port each kind is held to the rate and classified where no IP entry can carry
-it (`test_punt_policer_meters_parser_punts`). A SYN, FIN or RST is classified
-by its 5-tuple, and one that matches an offloaded tuple leaves through `$hpnia`
-rather than the miss.
+the NAT-T port, a TCP SYN, FIN or RST, a PPPoE LCP frame and a 6o4 or 4o6 frame
+under an outer CE, and assigns each `$hpnia` the BMI's enqueue, which hands the
+frame to the CPU should a flow's entry match it. The first three and the tunnel
+frames end it without confirming the header they stop at, so no table keyed on
+that header is searched: a TTL, options or tunnel frame meets only a receive
+port's Ethernet or PPPoE lookup, where a bridged pair's entry carries it as the
+bridge would (`test_l2_ttl_one_is_bridged`), and IKE no UDP table, where the
+ESP-in-UDP SAs are; what those lookups miss meets this profile. The first three
+also assigned `$nia` the enqueue, which takes the frame from the parser
+straight to the CPU, past every lookup and so past the meter: with the punt
+rate at 1000 packets a second, 8000 such frames offered over four seconds all
+arrived, where 8000 SYNs or LCP frames came through as about 4060 with the rest
+dropped (A370). They now assign only `$hpnia`, and on the WAN port each kind is
+held to the rate and classified where no IP entry can carry it
+(`test_punt_policer_meters_parser_punts`); the tunnel frames are Linux's for
+RFC 6040's decapsulation (A372). A SYN, FIN or RST is classified by its
+5-tuple, and one that matches an offloaded tuple leaves through `$hpnia` rather
+than the miss.
 
 **And the kernel already has a name for it.** "Rate-limit the packets this
 device sends to its CPU" is what `devlink-trap` policers are for:

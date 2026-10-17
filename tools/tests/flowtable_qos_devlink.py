@@ -5,8 +5,8 @@ on the FMAN's own devlink instance as trap policers. Policer 1 meters what the
 classifier punts to the CPU: every frame that misses every entry, the frames
 the soft parser ends the parse early for among them -- a TTL or hop limit of 0
 or 1, IPv4 ESP or UDP behind options, an IKE packet on the NAT-T port, a TCP
-SYN, FIN or RST, a PPPoE LCP frame -- unless a flow's entry or a bridged pair
-takes them. Policer 2
+SYN, FIN or RST, a PPPoE LCP frame, a 6o4 or 4o6 frame under an outer CE --
+unless a flow's entry or a bridged pair takes them. Policer 2
 meters what the classifier hands to the SEC engine, which a flow bound for an
 offloaded SA meets instead of the profile its own class names. Each is a rate
 and a burst in packets, and a drop count.
@@ -271,9 +271,10 @@ print(json.dumps({{'sent': sent, 'seconds': time.perf_counter() - start}}))
 # What the soft parser ends the parse early for and hands to the CPU, each
 # kind addressed to the DUT itself. The first five were enqueued from the
 # parser, past every lookup and the meter (A370); a SYN and an LCP frame
-# always met it.
+# always met it; a tunnel frame under an outer CE goes to Linux for RFC 6040's
+# decapsulation (A372).
 PARSER_PUNTS = ("ttl_one", "hop_limit_one", "ipv4_options", "nat_t_ike", "pppoe_ttl_one",
-                "tcp_syn", "pppoe_lcp")
+                "tcp_syn", "pppoe_lcp", "ce_6o4", "ce_4o6", "pppoe_ce_6o4")
 PORT_PARSER = PORT + 18
 PPPOE_SESSION = 0x1234
 # Every scheme a lookup keyed on an IP header is reached through.
@@ -281,10 +282,11 @@ IP_SCHEMES = frozenset(f"cdx_{name}_dist" for name in (
     "esp4", "esp6", "udp4", "tcp4", "udp6", "tcp6", "ipv4multicast", "ipv6multicast",
     "bridged_mcast4", "bridged_mcast6", "tup3udp4", "tup3udp6"))
 # The scheme that must classify a kind's flood, if one is known, and those
-# that must classify none of it. The parser ends the first five without
-# confirming the header it stops at, so no table keyed on that header, an
-# entry of which would carry the frame on, is searched: a routed group's root
-# decrements a TTL of 1 to 0, and the UDP table holds ESP-in-UDP SAs.
+# that must classify none of it. The parser ends the first five and the CE
+# tunnel frames without confirming the header it stops at, so no table keyed
+# on that header, an entry of which would carry the frame on, is searched: a
+# routed group's root decrements a TTL of 1 to 0, the UDP table holds
+# ESP-in-UDP SAs, and a tunnel's strip loses an outer CE.
 CLASSIFIED = {
     "ttl_one": ("cdx_ethernet_dist", IP_SCHEMES),
     "hop_limit_one": ("cdx_ethernet_dist", IP_SCHEMES),
@@ -293,6 +295,9 @@ CLASSIFIED = {
     "pppoe_ttl_one": ("cdx_pppoe_dist", IP_SCHEMES),
     "tcp_syn": ("cdx_tcp4_dist", frozenset()),
     "pppoe_lcp": ("cdx_pppoe_dist", IP_SCHEMES),
+    "ce_6o4": ("cdx_ethernet_dist", IP_SCHEMES),
+    "ce_4o6": ("cdx_ethernet_dist", IP_SCHEMES),
+    "pppoe_ce_6o4": ("cdx_pppoe_dist", IP_SCHEMES),
 }
 
 
@@ -317,7 +322,25 @@ def pppoe_session(dut_mac, host_mac, protocol, payload):
 def parser_punt(kind, dut):
     """A socket and the function that sends one frame of `kind` through it,
     from this host to the DUT's own WAN address: UDP to a closed port, a SYN
-    to one, or a PPPoE session frame for a session the DUT does not have."""
+    to one, a PPPoE session frame for a session the DUT does not have, or a
+    tunnel's frame for a tunnel it does not have."""
+    if kind == "ce_6o4":
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, 41)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 3)
+        udp = struct.pack("!HHHH", PORT_PARSER, PORT_PARSER, 18, 0) + b"ASK-parser"
+        inner = (struct.pack("!IHBB", 6 << 28, len(udp), socket.IPPROTO_UDP, 64)
+                 + socket.inet_pton(socket.AF_INET6, "fc00:cafe::1")
+                 + socket.inet_pton(socket.AF_INET6, "fc00:cafe::2") + udp)
+        return sock, lambda n: sock.sendto(inner, (dut["ipv4"], 0))
+    if kind == "ce_4o6":
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_IPIP)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS, 3)
+        udp = struct.pack("!HHHH", PORT_PARSER, PORT_PARSER, 18, 0) + b"ASK-parser"
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 64, socket.IPPROTO_UDP,
+                         0, socket.inet_aton("10.77.0.1"), socket.inet_aton("10.77.0.2"))
+        inner = ip[:10] + struct.pack("!H", checksum(ip)) + ip[12:] + udp
+        target = (dut["ipv6"], 0, 0, socket.if_nametoindex(dut["host_if"]))
+        return sock, lambda n: sock.sendto(inner, target)
     if kind == "hop_limit_one":
         sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 1)
@@ -352,6 +375,16 @@ def parser_punt(kind, dut):
     host_mac = sock.getsockname()[4]
     if kind == "pppoe_lcp":
         frame = pppoe_session(dut["mac"], host_mac, 0xC021, struct.pack("!BBHI", 9, 1, 8, 0))
+    elif kind == "pppoe_ce_6o4":
+        # 6in4 over a PPPoE WAN, the tunnel broker's shape, under an outer CE.
+        udp = struct.pack("!HHHH", PORT_PARSER, PORT_PARSER, 18, 0) + b"ASK-parser"
+        inner = (struct.pack("!IHBB", 6 << 28, len(udp), socket.IPPROTO_UDP, 64)
+                 + socket.inet_pton(socket.AF_INET6, "fc00:cafe::1")
+                 + socket.inet_pton(socket.AF_INET6, "fc00:cafe::2") + udp)
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 3, 20 + len(inner), 0, 0, 64, 41, 0,
+                         socket.inet_aton(WAN_IP), socket.inet_aton(dut["ipv4"]))
+        ip = ip[:10] + struct.pack("!H", checksum(ip)) + ip[12:]
+        frame = pppoe_session(dut["mac"], host_mac, 0x0021, ip + inner)
     else:
         udp = struct.pack("!HHHH", PORT_PARSER, PORT_PARSER, 18, 0) + b"ASK-parser"
         ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 1, socket.IPPROTO_UDP,
@@ -427,11 +460,13 @@ async def test_punt_policer_meters_parser_punts(devlink, kind):
     early. The parser used to enqueue them itself, which no meter sees, so a
     flood of them reached the CPU whatever devlink said (A370); they now take
     the punt path every other exception takes. A TCP SYN and a PPPoE LCP frame
-    always did, and are the controls. Each flood is addressed to the DUT itself,
-    so every frame the meter passes is one the WAN port hands the CPU, and the
-    port's receive count is what got through. The KeyGen schemes' own counters
-    say which classified the flood (CLASSIFIED). The agent is not used between
-    the set and the restore: its own traffic shares the meter.
+    always did, and are the controls. A 6o4 or 4o6 frame under an outer CE ends
+    the parse too, ahead of the tunnel's strip (A372). Each flood is addressed
+    to the DUT itself, so every frame the meter passes is one the WAN port hands
+    the CPU, and the port's receive count is what got through. The KeyGen
+    schemes' own counters say which classified the flood (CLASSIFIED). The agent
+    is not used between the set and the restore: its own traffic shares the
+    meter.
     """
     con, handle, original = devlink
     dut = await dut_wan(con)

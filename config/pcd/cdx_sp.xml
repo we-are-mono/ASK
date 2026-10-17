@@ -118,6 +118,18 @@
 	<!-- If next protocol is ipv6 change protocol -->
         <if expr="ipv4.nextp == 0x29">
           <if-true>
+	    <!-- A 6o4 tunnel's frame whose outer ECN field is CE is Linux's
+	         to receive: it marks an ECT carried packet CE and drops a
+	         Not-ECT one (RFC 6040 4.2), which the strip cannot. Left
+	         unconfirmed, as the TTL check is, so the strip entry is not
+	         searched, on the receive ports, where the strips are. Inside
+	         this branch, so no other frame pays for it. -->
+            <if expr="($FW[14:2]) == 3 and $logicalportid lt 9">
+              <if-true>
+                <assign-variable name="$hpnia" value="0x500002"/>
+                <action type="exit" confirm="no" nextproto="end_parse"/>
+              </if-true>
+            </if>
             <action type="exit" confirm="no" nextproto="ipv6"/>
           </if-true>
         </if>
@@ -130,6 +142,17 @@
 	<!-- As for IPv4. ESP behind extension headers is not seen here, so the
 	     driver gives SEC no such frame with a hop limit of 1 or 0. -->
 	<if expr="(ipv6.hop == 1 or ipv6.hop == 0) and ($logicalportid != 9 or ipv6.nexthdr != 0x32)">
+          <if-true>
+            <assign-variable name="$hpnia" value="0x500002"/>
+            <action type="exit" confirm="no" nextproto="end_parse"/>
+          </if-true>
+        </if>
+	<!-- As for a 6o4 frame, a 4o6 one under an outer CE, its IPv4 header
+	     next or behind the destination options Linux's encapsulation limit
+	     puts first: any frame with those options and an outer CE, which is
+	     rare enough to leave to Linux whole. CE first, the one compare
+	     every other frame pays. -->
+	<if expr="($FW[10:2]) == 3 and $logicalportid lt 9 and (ipv6.nexthdr == 0x04 or ipv6.nexthdr == 0x3c)">
           <if-true>
             <assign-variable name="$hpnia" value="0x500002"/>
             <action type="exit" confirm="no" nextproto="end_parse"/>

@@ -152,6 +152,13 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A396 — the hardware strip leaves an ECT(0) carried packet ECT(0) under an outer ECT(1).** RFC 6040 §4.2's
+  table, and Linux's `INET_ECN_decapsulate()` (`include/net/inet_ecn.h`, `INET_ECN_set_ect1()`), make it ECT(1).
+  From the code, not measured: Linux's own encapsulation copies the carried ECN outward, so only a path that
+  rewrites ECT(0) to ECT(1) produces the pair. Unlike an outer CE (A372) it cannot go to the CPU wholesale: an
+  outer ECT(1) is every frame of an L4S stream. Fix direction: compare the two fields in the soft parser (the outer
+  one kept in a GPR across the inner header's schema), if a GPR is free, or a microcode change.
+
 - [ ] **A395 — on the Wi-Fi offline port (10), a TTL or hop limit of 0 or 1 likely still reaches the CPU unmetered.**
   Inferred from the parser, not measured: `ethernetschema`'s offline-port correction exits unconfirmed
   (`cdx_sp.xml`, `$logicalportid ge 9`), so a frame the TTL check then leaves unconfirmed (A370) confirms no header,
@@ -262,13 +269,8 @@ result independently of those temporary files.
   (`test_fixed_marking`). Fix needs a decision: one label per tunnel computed as Linux does without a hash, or one per
   flow from the inner tuple (RFC 6438), which matches Linux only where RPS hashed the frame.
 
-- [ ] **A372 — the hardware strip ignores an outer CE mark.** RFC 6040 §4.2, and Linux's sit and ip6_tnl receive, mark
-  an ECT carried packet CE under an outer CE and drop a Not-ECT one. Measured on both 6o4 and 4o6 with the far end's
-  outer headers rewritten to CE (nft `ip ecn set ce` / `ip6 ecn set ce` at its postrouting): all 256 replies were
-  counted by the strip and reached the LAN VM with their own ECN field unchanged, Not-ECT ones included. A congestion
-  mark set inside the tunnel is lost once the flow is offloaded. Fix direction: have the soft parser end the parse of a
-  tunnel frame whose outer ECN is CE unconfirmed, with `$hpnia` alone, as the TTL check does (A370), so the strip entry
-  is not searched and the frame meets the punt meter; or a microcode change. XML gate.
+- [x] **A372 — the hardware strip ignored an outer CE mark.** The soft parser leaves a 6o4 or 4o6 frame under an outer
+  CE to Linux's RFC 6040 decapsulation, through the punt meter (_:/^cdx: leave an outer CE on a tunnel frame to Linux_).
 
 - [x] **A371 — a `dscp inherit` 4o6 strip added the whole outer traffic class to the carried TOS.** Microcode copy, ECN
   bits and all; that strip is now Linux's (_:/^tunnels: prove the outer marking on the wire_).

@@ -197,15 +197,32 @@ Measured on the wire, 2026-10-11 (`flowtable_tunnel.py`):
   later, which leaves the two paths disagreeing about such a flow's outer
   codepoint (A374).
 - **On receive** the strip drops the outer codepoint with the outer header.
-  `dscp inherit`, which copies it inward, is the one receive property the
+  `dscp inherit`, which copies it inward, is a receive property the
   hardware gets wrong: its copy adds the whole outer traffic class to the
   carried TOS byte, ECN bits included, so AF21 over ECT(0) arrived as DSCP 19
   and Not-ECT. A tunnel set that way keeps its strip in software (A371); its
   insert is still carried.
+- **An outer CE** is Linux's to receive (measured 2026-10-17,
+  `test_outer_ce_on_receive`). The strip removes the outer header, mark and
+  all, where RFC 6040 §4.2 carries CE into an ECT inner packet and drops a
+  Not-ECT one, as Linux's `sit` and `ip6_tnl` receive do. So the soft parser
+  hands a 6o4 frame, or a 4o6 one with or without the encapsulation limit's
+  destination options, whose outer ECN field is CE to the CPU before the strip
+  entry is searched, through the punt meter (A372). It cannot tell the
+  options of a tunnel from any other, so any IPv6 frame under CE whose first
+  extension header is destination options goes too, as does a transit 6in4
+  frame under CE ([transit](transit.md)). In steady state a congested path
+  marks a few frames a round trip, so the strip still carries the stream; each
+  marked frame takes the CPU's path and the punt meter, where unmarked
+  neighbours can overtake it. A far end in RFC 6040's normal mode copies an
+  inner CE outward too, so through such a tunnel every CE-marked download goes
+  that way.
 
-Two things are not reproduced. The strip ignores an outer CE mark, which Linux
-carries into an ECT inner packet and drops over a Not-ECT one (A372). And a
-4o6 tunnel with no configured flow label gets label zero from the insert where
+Two things are not reproduced. An outer ECT(1) over an ECT(0) carried packet,
+which RFC 6040 §4.2 and Linux's decapsulation make ECT(1), leaves the strip
+ECT(0): the parser cannot compare the two fields, and sending every outer
+ECT(1) to the CPU would send all of an L4S stream there (A396). And a 4o6
+tunnel with no configured flow label gets label zero from the insert where
 Linux computes one (A373).
 
 ## The outer header, and the mode
@@ -344,6 +361,7 @@ which the counters alone cannot show:
 | Fixed marking | yes | `test_fixed_marking`: a configured `tos`, or `tclass` and `flowlabel`, on every outer header the insert builds, each beside the carried packet's ECN field and matching Linux's own outer headers for the same tunnel; `ip tunnel change` under the live connection retires it, and the readmitted insert carries the new marking |
 | Inherited traffic class | yes | `test_inherited_traffic_class`: `tclass inherit` puts the carried AF21 on every inserted outer header; a `sit` tunnel's `tos inherit` is declined, and Linux carries the connection. `test_inherited_traffic_class_after_remark`: under a remark class both headers leave at EF |
 | Outer codepoint on receive | yes | `test_outer_codepoint_on_receive`: replies under AF21 outer headers reach the LAN VM at their own codepoint and ECN field; `dscp inherit` turned on under the live flow retires the strip, every later offer is declined, and Linux delivers the copied codepoint with each reply's ECN field, CE included |
+| Outer CE on receive | yes | `test_outer_ce_on_receive`: the WAN host marks every outer header it sends CE; the replies sent ECT(0), ECT(1) or CE reach the LAN VM CE, every Not-ECT one is a frame error on the DUT's tunnel and never arrives, Linux sees every outer packet and the strip counts none; with the mark gone the strip carries the next replies with their own ECN field |
 | DSCP remark | yes | `test_remark_rewrites_the_carried_header`: a class remarking to EF rewrites the carried header and nothing else in it. Replies through the hardware's strip, sent at AF11 across all four ECN encodings (and, in IPv6, under a leased flow label), reach the LAN VM at EF with the encoding and label as sent; an ECN-capable TCP connection's segments through its insert leave at EF with ECT(0) on data and none on bare acknowledgements |
 | Reconfigure under load | 6o4 | `ip tunnel change` of the TTL retires the flow through the link watch, and the flow readmitted afterwards carries the new TTL on the wire |
 | Delete under load | yes | deleting the tunnel device retires both directions and leaves the bindings up, so the next flow is judged against whatever tunnel exists then |
