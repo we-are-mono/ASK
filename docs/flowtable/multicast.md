@@ -651,22 +651,23 @@ bridged copy crosses, the netdev chains on the bridge and every port below it
 among them, and refuses for a port it cannot follow through: a veth on the
 bridge, such as a container's, keeps every flow of that bridge in software
 under br_netfilter. A walk a commit interrupts keeps a flow's answer only if
-that answer already asked the IP hooks. A ruleset that could tell the group's streams apart, drop them or
-translate them refuses the flow, `refused-filter`, as a netdev chain does, and
-so does a netfilter BPF program at those hooks. The walk is asked whatever
-`bridge-nf-call-iptables` says, which is br_netfilter's own to read. It runs
-at every derivation, so a rule added under a carried flow takes it out within
-a refresh. Its `input` hook only confirms a handed-up copy's conntrack, and
-counts nowhere. `flowtable_service_multicast_bridge.py::
+that answer already asked the IP hooks. A ruleset that could tell the group's
+streams apart, drop them or translate them refuses the flow, `refused-filter`,
+as a netdev chain does, and so does a netfilter BPF program at those hooks.
+The walk is asked whatever `bridge-nf-call-iptables` says, which is
+br_netfilter's own to read. It runs at every derivation, so a rule added under
+a carried flow takes it out within a refresh. Its `input` hook only confirms a
+handed-up copy's conntrack, and counts nowhere.
+`flowtable_service_multicast_bridge.py::
 test_br_netfilter_follows_the_ip_rules` drops one of a group's two UDP ports
 in an inet forward chain under br_netfilter: the flow comes out, only the kept
 port arrives, and both are carried again once the rule goes;
 `test_br_netfilter_bridge_and_route` carries a group bridged and routed at
 once with it loaded, and `test_br_netfilter_routed_prerouting` keeps one out
-whose routed copies a prerouting mark and a forward rule split. The learner's own hook
-does not count: it only observes. (VWD's Wi-Fi fast-path hook was exempted the
-same way until it was removed from CDX.) Hooks are per namespace, not per
-bridge, so this applies to every bridge.
+whose routed copies a prerouting mark and a forward rule split. The learner's
+own hook does not count: it only observes. (VWD's Wi-Fi fast-path hook was
+exempted the same way until it was removed from CDX.) Hooks are per namespace,
+not per bridge, so this applies to every bridge.
 Nothing announces a registered hook, so the worker checks the hook lists at
 every pass, and the refresh runs a pass every five seconds while any flow
 exists. `/proc` says `refused-filter`, and the kernel log says so once each

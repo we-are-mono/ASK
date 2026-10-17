@@ -265,6 +265,7 @@ struct nft_port_probe {
 	union nf_inet_addr saddr;
 	union nf_inet_addr daddr;
 	const struct net_device *in;
+	const struct net_device *pre_in;
 	const struct net_device * const *out;
 	unsigned int nout;
 	bool bridged;
@@ -803,7 +804,9 @@ static struct xt_table *nat_table(struct nf_nat_lookup_hook_priv *pre,
 /* ---- asking ----------------------------------------------------------------- */
 
 static struct net_device eth3 = { "eth3" }, eth4 = { "eth4" }, eth4_7 = { "eth4.7" },
-			 wlan0 = { "wlan0" };
+			 wlan0 = { "wlan0" }, br0 = { "br0" }, br0_289 = { "br0.289" };
+/* The device prerouting sees the stream arrive on, when not its input. */
+static const struct net_device *pre_in;
 static const char *source4 = "198.51.100.7", *group4 = "239.9.11.1";
 static const char *source6 = "2001:db8::7", *group6 = "ff1e::9:11:1";
 
@@ -815,6 +818,7 @@ static int ask(struct net *net, int family, const struct net_device *in,
 	struct nft_port_probe probe = {
 		.family = family == 4 ? NFPROTO_IPV4 : NFPROTO_IPV6,
 		.in = in,
+		.pre_in = pre_in,
 		.out = out,
 		.nout = nout,
 	};
@@ -1345,6 +1349,67 @@ static void hooks_and_tables(int family)
 	end();
 }
 
+/* br_netfilter runs prerouting for what its bridge hands up with the bridge
+ * as the input, and forward then sees the VLAN device above it: prerouting
+ * reads the probe's own input for it, and no other hook does (patch 175). */
+static void prerouting_input(int family)
+{
+	struct nf_nat_lookup_hook_priv *pre, *post;
+	struct spec nat = { .family = family };
+
+	begin(family);
+	add(base_chain(&spec, NF_INET_PRE_ROUTING, A_ACCEPT),
+	    (struct rule){ .in = "br0", .match = { "udp" }, .act = A_TARGET, .to = "MARK" });
+	table_on(&net, &spec, NF_HOOK_OP_XTABLES, mangle_hook);
+	pre_in = &br0;
+	assert(ask1(&net, family, &br0_289, &eth3) == 1);
+	pre_in = NULL;
+	assert(ask1(&net, family, &br0_289, &eth3) == 0);
+	assert(ask1(&net, family, &br0, &eth3) == 1);
+	end();
+	/* Forward reads the stream's input, not prerouting's. */
+	begin(family);
+	add(base_chain(&spec, NF_INET_FORWARD, A_ACCEPT),
+	    (struct rule){ .in = "br0", .act = A_DROP });
+	filter(&net, &spec);
+	pre_in = &br0;
+	assert(ask1(&net, family, &br0_289, &eth3) == 0);
+	pre_in = NULL;
+	end();
+	begin(family);
+	add(base_chain(&spec, NF_INET_FORWARD, A_ACCEPT),
+	    (struct rule){ .in = "br0.289", .act = A_DROP });
+	filter(&net, &spec);
+	pre_in = &br0;
+	assert(ask1(&net, family, &br0_289, &eth3) == 1);
+	pre_in = NULL;
+	end();
+	/* NAT's prerouting lookup sees it as the hook does ... */
+	begin(family);
+	pre = nat_core(&net, family, NF_INET_PRE_ROUTING);
+	post = nat_core(&net, family, NF_INET_POST_ROUTING);
+	add(base_chain(&nat, NF_INET_PRE_ROUTING, A_ACCEPT),
+	    (struct rule){ .in = "br0", .match = { "udp" }, .act = A_TARGET, .to = "DNAT" });
+	base_chain(&nat, NF_INET_POST_ROUTING, A_ACCEPT);
+	nat_table(pre, post, &nat);
+	pre_in = &br0;
+	assert(ask1(&net, family, &br0_289, &eth3) == 1);
+	pre_in = NULL;
+	assert(ask1(&net, family, &br0_289, &eth3) == 0);
+	spec_free(&nat);
+	end();
+	/* ... and postrouting's input stays what it was: none, or the oif. */
+	begin(family);
+	add(base_chain(&spec, NF_INET_POST_ROUTING, A_ACCEPT),
+	    (struct rule){ .act = A_JUMP, .to = "out" });
+	add(user_chain(&spec, "out"), (struct rule){ .in = "br0", .act = A_DROP });
+	filter(&net, &spec);
+	pre_in = &br0;
+	assert(ask1(&net, family, &br0_289, &eth3) == 0);
+	pre_in = NULL;
+	end();
+}
+
 static void bounds(int family)
 {
 	const char *far = family == 4 ? "10.0.0.1" : "fd00::1";
@@ -1407,6 +1472,7 @@ int main(void)
 		devices(family);
 		chains(family);
 		hooks_and_tables(family);
+		prerouting_input(family);
 		bounds(family);
 	}
 	meta_ask_ruleset();

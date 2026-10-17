@@ -164,6 +164,13 @@ result independently of those temporary files.
   common shape for a LAN host's native IPsec over an IPv6-over-PPPoE WAN. 1.0.7 carried none of these in hardware
   either. Next: PPPoE three-tuple schemes in `cdx_pcd.c`, and an SA case on the rig.
 
+- [ ] **A390 — the multicast learners' walks of br_netfilter's IP hooks are coarser than they need to be.** A bridged
+  VLAN flow walks four device pairings with both walkers at every derivation, under RTNL, though x_tables keeps no
+  state between hooks and needs the two diagonal ones. A walk a commit interrupts keeps a flow only when its listeners
+  are unchanged, so a listener change during a commit takes it out for a refresh. The routed learner notices
+  br_netfilter's arrival only at its next five-second pass, not from `br_nf_seq()` as the L2 learner does. All err
+  toward software.
+
 - [x] **A389 — with br_netfilter loaded (Docker loads it), bridged multicast stayed in software.** A bridged flow is
   asked what the IP hooks br_netfilter hands it to do to its stream, as routed groups are, and its `input` hook counts
   nowhere (_:/^flowtable: carry bridged multicast past br_netfilter_).

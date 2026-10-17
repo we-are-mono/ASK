@@ -235,6 +235,8 @@ static unsigned ports_asks;
  * order it asks them in and the word it gives each answer are its own. */
 static int xtables_answer;
 static unsigned xtables_asks;
+/* The answers to a walk whose prerouting reads its own input (pre_in). */
+static int pre_in_ports_answer, pre_in_xtables_answer;
 #define NFPROTO_IPV4 2
 #define NFPROTO_IPV6 10
 struct nft_port_probe {
@@ -320,7 +322,7 @@ static int nf_xt_port_dependent(const void *net, const struct nft_port_probe *p)
     probed_family = p->family;
     probed_pre_in = p->pre_in;
     xtables_asks++;
-    return xtables_answer;
+    return p->pre_in ? pre_in_xtables_answer : xtables_answer;
 }
 static int nft_port_dependent(const void *net, const struct nft_port_probe *p)
 {
@@ -329,7 +331,7 @@ static int nft_port_dependent(const void *net, const struct nft_port_probe *p)
     probed_family = p->family;
     probed_pre_in = p->pre_in;
     ports_asks++;
-    return ports_answer;
+    return p->pre_in ? pre_in_ports_answer : ports_answer;
 }
 static void mutex_lock(int *m) { assert(!*m); *m = 1; }
 #define lockdep_assert_held(m) assert(*(m))
@@ -516,6 +518,8 @@ static void cancel_work_sync(struct work_struct *w)
 static int ft_mc_lock;
 static struct net_device bridge;
 static bool through_bridge, carried;
+/* The VIF is the bridge itself, rather than a VLAN device on it. */
+static bool via_is_vif;
 static unsigned publishes, withdrawals, taps_published;
 static struct cdx_ft_counters bridged_count = { .packets = 7, .bytes = 7 * 578 };
 static void bridged_side(void)
@@ -526,7 +530,8 @@ static bool ft_mc_route_publish(struct ft_mc_route *r, const struct ft_mc_route 
 {
     bridged_side();
     publishes++;
-    assert(want->bridge == &bridge && want->listeners == wanted);
+    assert(want->bridge == (via_is_vif ? &vif_dev[planned_parent] : &bridge) &&
+           want->listeners == wanted);
     for (unsigned i = 0; i < want->listeners; i++)
         assert(want->listener[i].dev == &output[i]);
     /* Linking starts the count again, and a new series says so; restating
@@ -660,11 +665,11 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
         init_net.nft.base_seq++;
     }
     if (through_bridge) {
-        p->via = &bridge;
+        p->via = via_is_vif ? &vif_dev[planned_parent] : &bridge;
         p->via_vid = 289;
         p->via_tagged = true;
         p->mtu = 1500;
-        dev_hold(&bridge);
+        dev_hold(p->via);
     } else {
         p->spec.in = &input;
         dev_hold(&input);
@@ -1423,6 +1428,38 @@ int main(void)
             run();
             assert(ports_asks == asks + 2 && xtables_asks == xasks + 2);
             assert(probed_pre_in == &bridge && g->state == FT_MR_INSTALLED);
+            /* Either walk of the second refuses alone, each in its own
+             * word, nft not asked once x_tables has refused. */
+            pre_in_ports_answer = 1;
+            ft_mr_recheck = true;
+            run();
+            assert(g->state == FT_MR_REFUSED_PORTS && !g->offloaded && !cache.mfc_flags);
+            pre_in_ports_answer = 0;
+            pre_in_xtables_answer = 1;
+            asks = ports_asks;
+            ft_mr_recheck = true;
+            run();
+            assert(g->state == FT_MR_REFUSED_XTABLES && ports_asks == asks + 1);
+            pre_in_xtables_answer = 0;
+            ft_mr_recheck = true;
+            run();
+            assert(g->state == FT_MR_INSTALLED && g->offloaded);
+            /* Each refusal took the route back, and the install published
+             * it again. */
+            assert(withdrawals == withdrawn + 2);
+            /* A VIF that is the bridge itself meets prerouting as itself:
+             * walked once. */
+            via_is_vif = true;
+            asks = ports_asks;
+            xasks = xtables_asks;
+            ft_mr_recheck = true;
+            run();
+            assert(ports_asks == asks + 1 && xtables_asks == xasks + 1 && !probed_pre_in);
+            via_is_vif = false;
+            ft_mr_recheck = true;
+            run();
+            assert(g->state == FT_MR_INSTALLED && g->via == &bridge && bridge.refs == 1);
+            withdrawn = withdrawals;
             brnf_kinds = 0;
             ft_mr_recheck = true;
             run();

@@ -433,6 +433,10 @@ with the VIF, forward with the VIF both times (patch 175 gives the probe a
 prerouting input of its own). A mark set at prerouting for the bridge that a
 forward rule then splits the group's ports on keeps the group out
 (`flowtable_service_multicast_bridge.py::test_br_netfilter_routed_prerouting`).
+Two shapes are not walked: a VIF that is the bridge itself while
+`bridge-nf-pass-vlan-input-dev` names a VLAN device on it for a tag the bridge
+hands up untagged, and an 802.1ad bridge passing up a C-tagged frame. Both
+need a VLAN device on the bridge that no traffic is routed through.
 
 **Every packet alike.** A copy seen leaving proves that the ruleset forwarded
 that copy. The classifier key stops at the address pair, so every other packet

@@ -1,4 +1,4 @@
-From d440d1630e81c8eaf3eaee5a5e71a7f4e9bfe6e7 Mon Sep 17 00:00:00 2001
+From d0dd49fb951c69f4ec269e38140303fc6d53086b Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 17 Oct 2026 03:12:38 +0200
 Subject: [PATCH] netfilter: port probe: let prerouting see its own input
@@ -21,28 +21,30 @@ nftables walk and both x_tables walks at prerouting alone.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/net/netfilter/nf_port_probe.h | 5 +++++
- net/ipv4/netfilter/ip_tables.c        | 4 +++-
- net/ipv6/netfilter/ip6_tables.c       | 5 +++--
- net/netfilter/nf_tables_port_probe.c  | 2 +-
- 4 files changed, 12 insertions(+), 4 deletions(-)
+ include/net/netfilter/nf_port_probe.h |  6 ++++++
+ net/ipv4/netfilter/ip_tables.c        |  4 +++-
+ net/ipv6/netfilter/ip6_tables.c       |  5 +++--
+ net/netfilter/core.c                  |  4 ++--
+ net/netfilter/nf_tables_port_probe.c  | 24 ++++++++++++------------
+ 5 files changed, 26 insertions(+), 17 deletions(-)
 
 diff --git a/include/net/netfilter/nf_port_probe.h b/include/net/netfilter/nf_port_probe.h
-index f92634115dab..7ce4625efe12 100644
+index f92634115dab..9e59dc5b65f0 100644
 --- a/include/net/netfilter/nf_port_probe.h
 +++ b/include/net/netfilter/nf_port_probe.h
-@@ -14,6 +14,10 @@ struct net_device;
+@@ -14,6 +14,11 @@ struct net_device;
   * @saddr: the stream's source address
   * @daddr: the stream's destination address
   * @in: the device the stream arrives on
-+ * @pre_in: the device prerouting sees it arrive on, when not @in: br_netfilter
-+ *	runs prerouting for a frame its bridge hands up with the bridge as the
-+ *	input, and the receive path then skips it on the device above that @in
-+ *	is, a VLAN device on the bridge; NULL for @in
++ * @pre_in: the device prerouting sees it arrive on, when not @in; NULL for
++ *	@in. br_netfilter runs prerouting for what a bridge forwards or hands
++ *	up with the bridge, or the bridge's VLAN device for the frame's tag, as
++ *	the input, and the receive path then skips prerouting on the device
++ *	above the bridge that takes a copy up. Not read for a @bridged stream
   * @out: the devices copies of it leave through
   * @nout: how many entries @out has
   * @bridged: a bridge forwards it, not the IP stack
-@@ -52,6 +56,7 @@ struct nft_port_probe {
+@@ -52,6 +57,7 @@ struct nft_port_probe {
  	union nf_inet_addr		saddr;
  	union nf_inet_addr		daddr;
  	const struct net_device		*in;
@@ -81,8 +83,23 @@ index b2489b95b17b..652422307699 100644
  		p->visits = IP6T_PROBE_VISITS;
  		local_bh_disable();
  		addend = xt_write_recseq_begin();
+diff --git a/net/netfilter/core.c b/net/netfilter/core.c
+index 463e27c82fbd..e71b0c531472 100644
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -697,8 +697,8 @@ EXPORT_SYMBOL_GPL(nf_ip6t_probe_hook);
+  * @probe: the stream, known but for its ports
+  *
+  * Walks the ip_tables or ip6_tables tables, as @probe->family says, that a
+- * forwarded copy of the stream crosses at prerouting, forward and
+- * postrouting, with the NAT tables the NAT core runs for a connection's first
++ * forwarded copy of the stream crosses at prerouting (with @probe->pre_in as
++ * the input when set), forward and postrouting, with the NAT tables the NAT core runs for a connection's first
+  * packet among them; see struct nft_port_probe for what the caller vouches
+  * for. A family whose module is not loaded has no table.
+  *
 diff --git a/net/netfilter/nf_tables_port_probe.c b/net/netfilter/nf_tables_port_probe.c
-index a28859d6f108..fe25edc56491 100644
+index a28859d6f108..df7c6cbef8c0 100644
 --- a/net/netfilter/nf_tables_port_probe.c
 +++ b/net/netfilter/nf_tables_port_probe.c
 @@ -2179,7 +2179,7 @@ static u32 nft_probe_packet(struct nft_probe_ctx *ctx, u32 ctmark)
@@ -94,6 +111,35 @@ index a28859d6f108..fe25edc56491 100644
  		if (ctx->stop)
  			return ctmark;
  	}
+@@ -2271,17 +2271,17 @@ static void nft_probe_stream(struct nft_probe_ctx *ctx)
+  * @probe: the stream, all but its ports
+  *
+  * Evaluates the nf_tables ruleset in force for a forwarded UDP stream whose
+- * source and destination ports are unknown and everything else about it is
+- * as @probe says (see struct nft_port_probe for what the caller vouches for):
+- * it arrives on @probe->in, copies leave through each of @probe->out, it is
+- * conntracked as new with no reply, and it carries no mark. The chains walked
+- * are netdev ingress on the input device and the devices below it,
+- * prerouting (filter and NAT alike), then forward, postrouting and netdev
+- * egress on each output and the devices below it; ip or ip6 tables as the
+- * family says, and inet ones. For a bridged stream (@probe->bridged), netdev
+- * ingress and egress alone, with no conntrack attached, and no output needed.
+- * The first packet of the stream is followed, then later ones as far as NAT
+- * chains and conntrack marks make them differ.
++ * source and destination ports are unknown and everything else about it is as
++ * @probe says (see struct nft_port_probe for what the caller vouches for): it
++ * arrives on @probe->in (prerouting sees it on @probe->pre_in when that is
++ * set), copies leave through each of @probe->out, it is conntracked as new with
++ * no reply, and it carries no mark. The chains walked are netdev ingress on the
++ * input device and the devices below it, prerouting (filter and NAT alike),
++ * then forward, postrouting and netdev egress on each output and the devices
++ * below it; ip or ip6 tables as the family says, and inet ones. For a bridged
++ * stream (@probe->bridged), netdev ingress and egress alone, with no conntrack
++ * attached, and no output needed. The first packet of the stream is followed,
++ * then later ones as far as NAT chains and conntrack marks make them differ.
+  *
+  * Return: 0 when every path accepts the stream at every hook, for every
+  * output, with the same effects and no translation; 1 when two streams
 -- 
 2.47.3
 
