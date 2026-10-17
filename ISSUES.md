@@ -260,17 +260,21 @@ result independently of those temporary files.
   outer headers rewritten to CE (nft `ip ecn set ce` / `ip6 ecn set ce` at its postrouting): all 256 replies were
   counted by the strip and reached the LAN VM with their own ECN field unchanged, Not-ECT ones included. A congestion
   mark set inside the tunnel is lost once the flow is offloaded. Fix direction: have the soft parser send tunnel frames
-  whose outer ECN is CE to the CPU, rare outside congestion but unmetered until A370; or a microcode change. XML gate.
+  whose outer ECN is CE to the CPU with `$hpnia` alone, which the punt meter covers (A370); or a microcode change. XML
+  gate.
 
 - [x] **A371 — a `dscp inherit` 4o6 strip added the whole outer traffic class to the carried TOS.** Microcode copy, ECN
   bits and all; that strip is now Linux's (_:/^tunnels: prove the outer marking on the wire_).
 
-- [ ] **A370 — frames the soft parser sends to the CPU bypass the devlink punt meter.** `cdx_sp.xml` punts TTL or hop
-  limit 0/1, IPv4 ESP or UDP behind options (A364/A368) and PPPoE control frames with `$nia`/`$hpnia` 0x500002, straight
-  to the BMI enqueue, while ordinary exceptions go through the punt policer (`$nia` 0x4C0000, devlink trap policer 1).
-  A flood of such frames reaches the CPU unmetered whatever `devlink trap policer set` says; only the CPU queues'
-  congestion group bounds it. Found reviewing A368; pre-existing for TTL and PPPoE. Fix direction: punt through the
-  policer (its profile then enqueues) and check the KeyGen/CC path a half-parsed frame then takes, under the XML gate.
+- [ ] **A370 — frames the soft parser sends to the CPU with `$nia` 0x500002 bypass the devlink punt meter.**
+  `cdx_sp.xml` sends TTL or hop limit 0/1, IPv4 ESP or UDP behind options (A364/A368) and IKE NAT-T (UDP 4500, zero
+  marker) straight to the BMI enqueue; ordinary exceptions meet the punt policer (`$nia` 0x4C0000, devlink trap
+  policer 1). Measured from the WAN with the meter at 1000 pps, 8000 frames over 4 s: TTL-1 UDP, NAT-T and UDP behind
+  options all reached the CPU with none metered; plain UDP, TCP ACK, SYN, RST and PPPoE LCP each passed ~4060 and the
+  rest were on the drop count. A punt that sets only `$hpnia` (TCP control, PPPoE LCP) is metered, and a FIN still
+  leaves its offloaded entry for Linux (`test_transfer_expiry_fin`). Only the CPU queues' congestion group bounds
+  those classes; all but options are inherited from NXP's `cdx_sp.xml`. Fix direction: drop those `$nia` overrides
+  and keep `$hpnia`, as the TCP control punt does, then prove TTL 1 on an offloaded flow still reaches Linux. XML gate.
 
 - [ ] **A361 — the LAN port's FMan receive path filters a few minimum-size frames that arrive whole.** Seen by
   `flowtable_nat_throughput.py::test_packet_rate`: one paced NAT'd UDP flow of 64-byte frames at 1.9 Mpps lost 3-16 of
