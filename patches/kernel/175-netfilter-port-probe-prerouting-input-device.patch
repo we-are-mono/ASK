@@ -1,4 +1,4 @@
-From d0dd49fb951c69f4ec269e38140303fc6d53086b Mon Sep 17 00:00:00 2001
+From e4605550fabc20451a888c3b7be1b058ccfa4da0 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 17 Oct 2026 03:12:38 +0200
 Subject: [PATCH] netfilter: port probe: let prerouting see its own input
@@ -24,9 +24,9 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/net/netfilter/nf_port_probe.h |  6 ++++++
  net/ipv4/netfilter/ip_tables.c        |  4 +++-
  net/ipv6/netfilter/ip6_tables.c       |  5 +++--
- net/netfilter/core.c                  |  4 ++--
+ net/netfilter/core.c                  |  9 +++++----
  net/netfilter/nf_tables_port_probe.c  | 24 ++++++++++++------------
- 5 files changed, 26 insertions(+), 17 deletions(-)
+ 5 files changed, 29 insertions(+), 19 deletions(-)
 
 diff --git a/include/net/netfilter/nf_port_probe.h b/include/net/netfilter/nf_port_probe.h
 index f92634115dab..9e59dc5b65f0 100644
@@ -84,20 +84,25 @@ index b2489b95b17b..652422307699 100644
  		local_bh_disable();
  		addend = xt_write_recseq_begin();
 diff --git a/net/netfilter/core.c b/net/netfilter/core.c
-index 463e27c82fbd..e71b0c531472 100644
+index 463e27c82fbd..d3cbdf19ac3c 100644
 --- a/net/netfilter/core.c
 +++ b/net/netfilter/core.c
-@@ -697,8 +697,8 @@ EXPORT_SYMBOL_GPL(nf_ip6t_probe_hook);
+@@ -697,10 +697,11 @@ EXPORT_SYMBOL_GPL(nf_ip6t_probe_hook);
   * @probe: the stream, known but for its ports
   *
   * Walks the ip_tables or ip6_tables tables, as @probe->family says, that a
 - * forwarded copy of the stream crosses at prerouting, forward and
 - * postrouting, with the NAT tables the NAT core runs for a connection's first
+- * packet among them; see struct nft_port_probe for what the caller vouches
+- * for. A family whose module is not loaded has no table.
 + * forwarded copy of the stream crosses at prerouting (with @probe->pre_in as
-+ * the input when set), forward and postrouting, with the NAT tables the NAT core runs for a connection's first
-  * packet among them; see struct nft_port_probe for what the caller vouches
-  * for. A family whose module is not loaded has no table.
++ * the input when set), forward and postrouting, with the NAT tables the NAT
++ * core runs for a connection's first packet among them; see struct
++ * nft_port_probe for what the caller vouches for. A family whose module is not
++ * loaded has no table.
   *
+  * Return: 0 when every packet of the stream is accepted by every table
+  * unchanged, whatever its ports; 1 when two streams differing in ports may
 diff --git a/net/netfilter/nf_tables_port_probe.c b/net/netfilter/nf_tables_port_probe.c
 index a28859d6f108..df7c6cbef8c0 100644
 --- a/net/netfilter/nf_tables_port_probe.c
