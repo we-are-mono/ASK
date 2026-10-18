@@ -9,6 +9,7 @@ import json
 import secrets
 import socket
 import struct
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -361,6 +362,25 @@ for suffix in ('.py', '.pid', '.log', '.sock'):
                             dut[path] = await read(r.target, r.session, path)
                         except Exception as error:
                             dut[path] = repr(error)
+                    # A flow dark for a few seconds and then back is what a
+                    # neighbour entry holding a stale MAC does until its probes
+                    # fail: every node's entries, states and ages.
+                    # And whether the DUT saw the flow at all.
+                    for argv in (("ip", "-s", "neigh", "show"), ("conntrack", "-L", "-p", "udp")):
+                        try:
+                            dut[" ".join(argv)] = (await command(r.target, r.session, *argv,
+                                                                 check=False))["stdout"]
+                        except Exception as error:
+                            dut[" ".join(argv)] = repr(error)
+                    try:
+                        lan_neigh = (await lan_run_python(r.lan, """
+import subprocess
+print(subprocess.run(['ip', '-s', 'neigh', 'show'], capture_output=True, text=True).stdout, end='')
+""", timeout=10, label="peer_lan_neigh")).stdout
+                    except Exception as error:
+                        lan_neigh = repr(error)
+                    wan_neigh = subprocess.run(["ip", "-s", "neigh", "show"], capture_output=True,
+                                               text=True).stdout
                     # A frame corrupted on the LAN medium is counted only by
                     # the endpoint that received it
                     # (docs/flowtable/udp-loss-investigation.md).
@@ -375,7 +395,8 @@ print(''.join(line + '\\n' for line in stats.splitlines()
                         lan_nic = repr(error)
                     r.record("connections-wan-received",
                              {"wan": {ident: sorted(serials)[-32:] for ident, serials in seen.items()},
-                              "dut": dut, "lan_nic_errors": lan_nic})
+                              "dut": dut, "lan_nic_errors": lan_nic,
+                              "lan_neigh": lan_neigh, "wan_neigh": wan_neigh})
                 assert result.rc == 0 and not errors, (result.stdout, errors)
         if shutdown_error:
             raise shutdown_error
