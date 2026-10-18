@@ -549,7 +549,7 @@ static int ft_mr_ports_matter(const struct ft_mr_group *g,
 	 * prerouting as br_netfilter ran it, with the bridge as its input --
 	 * or the VIF, as bridge-nf-pass-vlan-input-dev may have it -- and the
 	 * receive path skipped prerouting on the VIF itself. Both are asked
-	 * (patch 175). */
+	 * (patch 148). */
 	if (!rc && plan->via && plan->via != probe.in &&
 	    (ft_bridge_hook_kinds(BIT(NF_BR_PRE_ROUTING)) & FT_BRIDGE_HOOK_BRNF)) {
 		probe.pre_in = plan->via;

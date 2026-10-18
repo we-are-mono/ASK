@@ -1,0 +1,112 @@
+From 3f0c317336265f03bda3134fb617429eb19687f1 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 9 Aug 2026 13:56:19 +0200
+Subject: [PATCH] netfilter: keep IPv6 prefix translation in conntrack and
+ flowtables
+
+Make ip6t_NPT point a connection's reply tuple at the translated prefix,
+so replies match it, and only while the conntrack is unconfirmed: NXP's
+reference code wrote every IP_CT_NEW and IP_CT_RELATED packet's address
+into a confirmed, hashed tuple in place, which an ICMP error from any
+other LAN address turned into a connection no reply could find.
+
+The translated tuple sets no IPS_NAT. Derive the flow's address rewrites
+from the tuples too, so both software flowtable forwarding and hardware
+actions keep translating. Conntrack status stays unchanged; ordinary
+forwarding still uses ip6t_NPT.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ net/ipv6/netfilter/ip6t_NPT.c      | 35 ++++++++++++++++++++++++++++++
+ net/netfilter/nf_flow_table_core.c | 15 +++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/net/ipv6/netfilter/ip6t_NPT.c b/net/ipv6/netfilter/ip6t_NPT.c
+index 787c74aa85e3..a63cd09c5440 100644
+--- a/net/ipv6/netfilter/ip6t_NPT.c
++++ b/net/ipv6/netfilter/ip6t_NPT.c
+@@ -11,6 +11,9 @@
+ #include <linux/netfilter_ipv6.h>
+ #include <linux/netfilter_ipv6/ip6t_NPT.h>
+ #include <linux/netfilter/x_tables.h>
++#ifdef CONFIG_CPE_FAST_PATH
++#include <net/netfilter/nf_conntrack.h>
++#endif
+ 
+ static int ip6t_npt_checkentry(const struct xt_tgchk_param *par)
+ {
+@@ -114,6 +117,25 @@ ip6t_snpt_tg(struct sk_buff *skb, const struct xt_action_param *par)
+ 			ip6t_npt_map_pfx(npt, &bounced_hdr->daddr);
+ 	}
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++	/* The peer answers the translated prefix, so the connection's reply
++	 * tuple has to name it or no reply matches the connection. Written
++	 * only while the conntrack is unconfirmed -- this packet's own, before
++	 * confirmation hashes it on that tuple. A confirmed one is in the
++	 * table under the tuple it has: rewritten in place it would be hashed
++	 * under one address while holding another, found by neither, and a
++	 * lookup comparing tuples meanwhile could read it torn. Later packets
++	 * of a connection, which keep IP_CT_NEW until a reply is seen, and
++	 * ICMP errors related to one, leave it as confirmation left it. */
++	{
++		enum ip_conntrack_info ctinfo;
++		struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
++
++		if (ct && !nf_ct_is_confirmed(ct))
++			ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u3.in6 =
++				ipv6_hdr(skb)->saddr;
++	}
++#endif
+ 	return XT_CONTINUE;
+ }
+ 
+@@ -139,6 +161,19 @@ ip6t_dnpt_tg(struct sk_buff *skb, const struct xt_action_param *par)
+ 			ip6t_npt_map_pfx(npt, &bounced_hdr->saddr);
+ 	}
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++	/* The mirror of the source rewrite above: a connection opened from
++	 * outside is answered from the address this rewrote its destination
++	 * to. Unconfirmed conntracks only, for the same reason. */
++	{
++		enum ip_conntrack_info ctinfo;
++		struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
++
++		if (ct && !nf_ct_is_confirmed(ct))
++			ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u3.in6 =
++				ipv6_hdr(skb)->daddr;
++	}
++#endif
+ 	return XT_CONTINUE;
+ }
+ 
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index 042b8de49c4d..ec5d7eae5406 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -139,6 +139,21 @@ struct flow_offload *flow_offload_alloc(struct nf_conn *ct)
+ 	if (ct->status & IPS_DST_NAT)
+ 		__set_bit(NF_FLOW_DNAT, &flow->flags);
+ 
++	/* ip6t_NPT publishes the translated address in the reply tuple but
++	 * does not use the stateful NAT status bits. Preserve that mapping in
++	 * both software forwarding and the hardware actions. Leave conntrack
++	 * status alone: the ordinary path still performs stateless NPT. */
++	if (nf_ct_l3num(ct) == NFPROTO_IPV6) {
++		const struct nf_conntrack_tuple *orig, *reply;
++
++		orig = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
++		reply = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
++		if (!nf_inet_addr_cmp(&orig->src.u3, &reply->dst.u3))
++			__set_bit(NF_FLOW_SNAT, &flow->flags);
++		if (!nf_inet_addr_cmp(&orig->dst.u3, &reply->src.u3))
++			__set_bit(NF_FLOW_DNAT, &flow->flags);
++	}
++
+ 	return flow;
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_alloc);
+-- 
+2.47.3
+

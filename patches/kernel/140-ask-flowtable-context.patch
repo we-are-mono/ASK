@@ -1,30 +1,57 @@
-From da8049fe85726741b02d93527b04e7377efc9a1c Mon Sep 17 00:00:00 2001
+From 615ee34261818832ae973954142c91fdbd458d56 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
  context
 
+Give a flowtable offload driver what Linux knows about each flow, and the
+events that change it. An offer (FLOW_CLS_HAS_NF_CONTEXT) carries the
+conntrack, both directions' routes and their cookies, PPPoE sessions,
+the ingress device, the MTU, the counter mode and a handle the flow
+shares with its driver: Linux or the driver can invalidate it, and the
+flowtable GC then retires that generation. IPv4 and IPv6 route changes
+are announced as netevents, and FLOWI_FLAG_NO_OIF_FALLBACK lets a
+table's reverse lookup respect a withdrawn or blackhole route.
+
+Each flow records the XFRM policy generation it was created under. While
+any policy or blocking default exists, a table whose driver uses handles
+keeps every software packet on the policy hooks, which cached forwarding
+cannot reproduce; xfrm_flowtable_policy_check() and the plain-route
+helpers let the driver judge a hardware flow itself, and
+NETEVENT_XFRM_POLICY_UPDATE reports each change. xfrmdev_ops gain a
+module owner, pinned while bonding forwards to a slave's.
+
+Nothing then refreshes such a flow in software, and a connection is
+offered by its first packet after confirmation -- for a request and its
+response the first reply, which can be the first packet sent to its
+destination. When flow_offload_eth_dst() finds that neighbour still
+resolving, it retires the generation, so that GC removes it and the
+next packet offers a fresh one. A failed neighbour, or any other failure
+to build the rules, waits for the flow to expire -- 30 seconds for
+UDP -- as a refusal that would only recur.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- drivers/net/bonding/bond_main.c       |  80 ++++++++++------
+ drivers/net/bonding/bond_main.c       |  80 +++++++++-----
  include/linux/netdevice.h             |   2 +
  include/net/flow.h                    |   2 +
- include/net/flow_offload.h            |  44 +++++++++
- include/net/netevent.h                |  32 +++++++
- include/net/netfilter/nf_flow_table.h |  60 ++++++++++++
+ include/net/flow_offload.h            |  44 ++++++++
+ include/net/netevent.h                |  32 ++++++
+ include/net/netfilter/nf_flow_table.h |  60 +++++++++++
  include/net/netns/xfrm.h              |   2 +
- include/net/xfrm.h                    | 106 +++++++++++++++++++--
+ include/net/xfrm.h                    | 106 +++++++++++++++++--
  net/ipv4/fib_trie.c                   |  20 ++++
  net/ipv4/route.c                      |   3 +-
- net/ipv6/ip6_fib.c                    |  23 +++++
- net/netfilter/nf_flow_table_core.c    |  89 +++++++++++++++++-
+ net/ipv6/ip6_fib.c                    |  23 ++++
+ net/netfilter/nf_flow_table_core.c    |  89 +++++++++++++++-
  net/netfilter/nf_flow_table_ip.c      |  25 ++++-
- net/netfilter/nf_flow_table_offload.c | 129 ++++++++++++++++++++++++--
- net/netfilter/nft_flow_offload.c      | 102 ++++++++++++++++----
+ net/netfilter/nf_flow_table_offload.c | 145 ++++++++++++++++++++++++--
+ net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++---
  net/xfrm/xfrm_device.c                |  29 ++++--
- net/xfrm/xfrm_policy.c                | 124 ++++++++++++++++++++++++-
+ net/xfrm/xfrm_policy.c                | 124 +++++++++++++++++++++-
  net/xfrm/xfrm_state.c                 |  25 ++++-
  net/xfrm/xfrm_user.c                  |   6 ++
- 19 files changed, 821 insertions(+), 82 deletions(-)
+ 19 files changed, 836 insertions(+), 83 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index 2919329a8c20..a6780e8dca2d 100644
@@ -78,7 +105,7 @@ index 2919329a8c20..a6780e8dca2d 100644
  	if (!err) {
  		xs->xso.real_dev = real_dev;
  		ipsec->xs = xs;
-@@ -522,6 +536,7 @@ static int bond_ipsec_add_sa(struct xfrm_state *xs,
+@@ -522,6 +536,7 @@ out:
  
  static void bond_ipsec_add_sa_all(struct bonding *bond)
  {
@@ -107,7 +134,7 @@ index 2919329a8c20..a6780e8dca2d 100644
  			slave_warn(bond_dev, real_dev, "%s: failed to add SA\n", __func__);
  			continue;
  		}
-@@ -564,6 +580,7 @@ static void bond_ipsec_add_sa_all(struct bonding *bond)
+@@ -564,6 +580,7 @@ out:
   **/
  static void bond_ipsec_del_sa(struct xfrm_state *xs)
  {
@@ -134,7 +161,7 @@ index 2919329a8c20..a6780e8dca2d 100644
  out:
  	netdev_put(real_dev, &tracker);
  	mutex_lock(&bond->ipsec_lock);
-@@ -612,6 +630,7 @@ static void bond_ipsec_del_sa(struct xfrm_state *xs)
+@@ -612,6 +630,7 @@ out:
  
  static void bond_ipsec_del_sa_all(struct bonding *bond)
  {
@@ -188,7 +215,7 @@ index 2919329a8c20..a6780e8dca2d 100644
  out:
  	netdev_put(real_dev, &tracker);
  }
-@@ -684,6 +706,7 @@ static void bond_ipsec_free_sa(struct xfrm_state *xs)
+@@ -684,6 +706,7 @@ out:
   **/
  static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
  {
@@ -213,7 +240,7 @@ index 2919329a8c20..a6780e8dca2d 100644
  out:
  	rcu_read_unlock();
  	return ok;
-@@ -709,6 +733,7 @@ static bool bond_ipsec_offload_ok(struct sk_buff *skb, struct xfrm_state *xs)
+@@ -709,6 +733,7 @@ out:
   **/
  static void bond_advance_esn_state(struct xfrm_state *xs)
  {
@@ -239,7 +266,7 @@ index 2919329a8c20..a6780e8dca2d 100644
  out:
  	rcu_read_unlock();
  }
-@@ -733,6 +759,7 @@ static void bond_advance_esn_state(struct xfrm_state *xs)
+@@ -733,6 +759,7 @@ out:
   **/
  static void bond_xfrm_update_stats(struct xfrm_state *xs)
  {
@@ -1073,7 +1100,7 @@ index 98edcaa37b38..ff35d601699a 100644
  	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
  	if (ret < 0)
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f51d7d7..6bc5aa1d88f8 100644
+index 4f346f51d7d7..8184a1ce9ffd 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -12,6 +12,7 @@
@@ -1163,7 +1190,31 @@ index 4f346f51d7d7..6bc5aa1d88f8 100644
  		n = dst_neigh_lookup(dst_cache, daddr);
  		if (!n)
  			return -ENOENT;
-@@ -597,6 +636,10 @@ static int flow_offload_redirect(struct net *net,
+@@ -316,8 +355,22 @@ static int flow_offload_eth_dst(struct net *net,
+ 		read_unlock_bh(&n->lock);
+ 		neigh_release(n);
+ 
+-		if (!(nud_state & NUD_VALID))
++		if (!(nud_state & NUD_VALID)) {
++			/* A neighbour still resolving fails both directions'
++			 * rules, and software offers the flow again on its next
++			 * refresh. While a policy keeps every packet of a table
++			 * with hardware handles off the software fast path
++			 * (xfrm_flowtable_enabled()) nothing refreshes it: retire
++			 * the generation, so that GC removes it and the
++			 * connection's next packet offers a fresh one. A failed
++			 * neighbour waits for the flow to expire, as a refusal
++			 * that would only recur.
++			 */
++			if (!(nud_state & NUD_FAILED) &&
++			    !xfrm_flowtable_enabled(net))
++				nf_flow_offload_handle_invalidate(flow->hw_handle);
+ 			return -ENOENT;
++		}
+ 		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+@@ -597,6 +650,10 @@ static int flow_offload_redirect(struct net *net,
  		ifindex = this_tuple->out.hw_ifidx;
  		break;
  	case FLOW_OFFLOAD_XMIT_NEIGH:
@@ -1174,7 +1225,7 @@ index 4f346f51d7d7..6bc5aa1d88f8 100644
  		other_tuple = &flow->tuplehash[!dir].tuple;
  		ifindex = other_tuple->iifidx;
  		break;
-@@ -805,12 +848,16 @@ nf_flow_offload_rule_alloc(struct net *net,
+@@ -805,12 +862,16 @@ nf_flow_offload_rule_alloc(struct net *net,
  	int err = -ENOMEM;
  
  	flow_rule = kzalloc(sizeof(*flow_rule), GFP_KERNEL);
@@ -1193,7 +1244,7 @@ index 4f346f51d7d7..6bc5aa1d88f8 100644
  
  	flow_rule->rule->match.dissector = &flow_rule->match.dissector;
  	flow_rule->rule->match.mask = &flow_rule->match.mask;
-@@ -896,6 +943,34 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
+@@ -896,6 +957,34 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
  	cls_flow->cookie = (unsigned long)tuple;
  }
  
@@ -1228,7 +1279,7 @@ index 4f346f51d7d7..6bc5aa1d88f8 100644
  static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_offload *flow,
  				 struct nf_flow_rule *flow_rule,
-@@ -904,7 +979,23 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -904,7 +993,23 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {
@@ -1253,7 +1304,7 @@ index 4f346f51d7d7..6bc5aa1d88f8 100644
  	struct netlink_ext_ack extack = {};
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
-@@ -1087,6 +1178,10 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
+@@ -1087,6 +1192,10 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
  
  	offload = kmalloc(sizeof(struct flow_offload_work), GFP_ATOMIC);
  	if (!offload) {
@@ -1264,7 +1315,7 @@ index 4f346f51d7d7..6bc5aa1d88f8 100644
  		clear_bit(NF_FLOW_HW_PENDING, &flow->flags);
  		return NULL;
  	}
-@@ -1125,20 +1220,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
+@@ -1125,20 +1234,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
  	flow_offload_queue_work(offload);
  }
  
@@ -1861,7 +1912,7 @@ index 02188558bd1c..4d3d473682f8 100644
  		WRITE_ONCE(xso->dev, NULL);
  		xso->type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
  		netdev_put(dev, &xso->dev_tracker);
-@@ -1563,17 +1568,27 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
+@@ -1563,17 +1568,27 @@ found:
  			struct xfrm_dev_offload *xdo = &pol->xdo;
  			struct xfrm_dev_offload *xso = &x->xso;
  

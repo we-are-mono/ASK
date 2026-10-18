@@ -176,7 +176,7 @@ result independently of those temporary files.
   Fix direction: confirm Ethernet on port 10 as the receive ports do, then measure with the scheme counters.
 
 - [x] **A398 — under any IPsec policy, a flow whose first offer could not be built stayed in software until it expired.**
-  The return neighbour still resolving fails the rules; patch 176 retires the generation, so the next packet offers it
+  The return neighbour still resolving fails the rules; patch 140 retires the generation, so the next packet offers it
   again (_:/^flowtable: offer again a flow whose neighbour was resolving_).
 
 - [-] **A394 — UDP from a jumbo LAN port into a standard path stays in software, not detoured.** Wontfix: a rare setup,
@@ -218,7 +218,7 @@ result independently of those temporary files.
 
 - [x] **A384 — a bridge whose port is a VLAN device (`br-lan` over `eth0.10`) kept every flow and station pair through it
   in software; 1.0.7 offloaded them.** The walk finds the bridge's port from below and descends from it, the
-  bridged learner does the same, and patch 171 lets the port's MAC take the second tag such a port carries
+  bridged learner does the same, and patch 109 lets the port's MAC take the second tag such a port carries
   (_:/^flowtable: carry bridges whose port is a VLAN device_).
 
 - [x] **A383 — a bridged pair the learner refused was asked of the bridge again every second it carried traffic.** A
@@ -1695,7 +1695,7 @@ file's git history.
   unmaps no-op on this coherent-DMA SoC); sibling paths → A90.
 
 - [x] **A91.** `ip_output()` ipsec-offload early-return leaked `rcu_read_lock` on
-  mainline 6.12.103 (rcu-wraps `ip_output`, unlike NXP 6.12.49) — fixed (patch 030):
+  mainline 6.12.103 (rcu-wraps `ip_output`, unlike NXP 6.12.49) — fixed (patch 040):
   unlock before the offload return. Surfaced by the mainline-regen audit.
 
 - [x] **A92.** `xfrm_output_one()` overflow guard leaked ≤6 `xfrm_state` refs + the skb

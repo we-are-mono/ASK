@@ -640,7 +640,7 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
         state.index('return "refused-tc";') < state.index("if (ft_mc_discardable(f))")
     # Patch 148's bridged probe: netdev hooks alone, no conntrack, no
     # x_tables, and a stream the bridge forwards nowhere still asked about.
-    patch = (ROOT / "patches/kernel/148-netfilter-nftables-commit-in-progress.patch").read_text()
+    patch = (ROOT / "patches/kernel/148-netfilter-port-probe.patch").read_text()
     sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
     assert "+\tbool\t\t\t\tbridged;" in sections["include/net/netfilter/nf_port_probe.h"]
     walk = sections["net/netfilter/nf_tables_port_probe.c"]

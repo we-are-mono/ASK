@@ -652,7 +652,7 @@ learner asks of its groups: `nf_xt_port_dependent()` and
 postrouting, with the bridge as the copies' output and as their input, or its
 VLAN device for the flow's VLAN, which `bridge-nf-pass-vlan-input-dev` may
 name instead -- at prerouting and at forward apart, so every pairing is asked
-(patch 175) -- conntrack and x_tables included. The walk asks more than a
+(patch 148) -- conntrack and x_tables included. The walk asks more than a
 bridged copy crosses, the netdev chains on the bridge and every port below it
 among them, and refuses for a port it cannot follow through: a veth on the
 bridge, such as a container's, keeps every flow of that bridge in software

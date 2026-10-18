@@ -429,7 +429,7 @@ hands up with the bridge as the input -- or, with
 and the receive path then skips prerouting on the VIF above the bridge. So
 while br_netfilter is hooked, a group whose parent VIF is a VLAN device on a
 bridge is walked twice, prerouting once with the bridge as its input and once
-with the VIF, forward with the VIF both times (patch 175 gives the probe a
+with the VIF, forward with the VIF both times (patch 148 gives the probe a
 prerouting input of its own). A mark set at prerouting for the bridge that a
 forward rule then splits the group's ports on keeps the group out
 (`flowtable_service_multicast_bridge.py::test_br_netfilter_routed_prerouting`).
@@ -582,7 +582,7 @@ pair: a new base chain's policy, element timeouts, and a concatenated (pipapo)
 set's new contents, which become visible only after the transaction loop.
 nf_tables' own commit mutex and busy mark are private to its pernet state, and
 nfnetlink releases its subsystem lock before the batch runs. So kernel patch
-148 adds a mark beside the pair in `struct net`. `net->nft.commit_applying` is
+139 adds a mark beside the pair in `struct net`. `net->nft.commit_applying` is
 set just before the new `base_seq` is published, which orders it by that
 release store. It is cleared with a release store once the set backends'
 updates are in. `nft_commit_in_progress()` reads it with an acquire. It fits in

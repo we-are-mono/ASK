@@ -1,4 +1,4 @@
-From cc94945d5f513d2f25b4494fad5ba3572051c7bb Mon Sep 17 00:00:00 2001
+From e685b98b11f46b68611d43cd47102b35ba58aa71 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 5 Oct 2026 00:45:28 +0200
 Subject: [PATCH] sdk_dpaa: size the MAC max frame length to the port's MTU
@@ -13,16 +13,23 @@ Add FM_MAC_SetMaxFrameLength() (mEMAC only; the FM keeps its per-MAC
 bookkeeping and the port's limit check) and fm_mac_set_max_frame_length()
 in the wrapper. sdk_dpaa now sets the limit to
 max(mtu, 1500) + ETH_HLEN + ETH_FCS_LEN, plus VLAN_HLEN while the port
-has any upper device and twice that once a VLAN on it is 802.1ad or
-carries a VLAN of its own, capped at fsl_fm_max_frm. It is applied on
-registration, whose failure now fails it, on MTU change and on every
-upper link/unlink of the port or of a VLAN over it.
+has any upper device and twice that once a VLAN on it is 802.1ad,
+carries a VLAN of its own or is a bridge port, capped at fsl_fm_max_frm.
+It is applied on registration, whose failure now fails it, on MTU change
+and on every upper link/unlink of the port or of a VLAN over it.
+
+A VLAN device that is a bridge port -- br-lan over eth0.10, the way
+OpenWrt bridges a VLAN without bridge-vlan sections -- carries a second
+tag whenever the bridge tags what it forwards there, or forwards tagged
+frames through it.
 
 Without the jumbo buffer layout, also cap max_mtu at what one Rx buffer
 holds behind its headroom, so fsl_fm_max_frm alone cannot advertise an
 MTU the buffers were not sized for.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 133 +++++++++++++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 135 +++++++++++++++++-
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |   5 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |   1 +
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |  14 ++
@@ -33,20 +40,22 @@ MTU the buffers were not sized for.
  .../sdk_fman/inc/flib/fsl_fman_memac.h        |   3 +
  .../src/inc/wrapper/lnxwrp_fsl_fman.h         |  14 ++
  .../sdk_fman/src/wrapper/lnxwrp_fm.c          |  23 +++
- 11 files changed, 249 insertions(+), 1 deletion(-)
+ 11 files changed, 251 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-index 063302116911..8f959f60d3ec 100644
+index 063302116911..c5a23f36b7d7 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-@@ -664,6 +664,71 @@ static int __cold dpa_eth_priv_stop(struct net_device *net_dev)
+@@ -664,6 +664,73 @@ static int __cold dpa_eth_priv_stop(struct net_device *net_dev)
  	return _errno;
  }
  
 +/* The tags a full-size frame on the port may carry: none while nothing is
 + * stacked on it, one once anything is -- a VLAN, a bridge forwarding tagged
 + * frames through, a bond, a macvlan -- and two once a VLAN on the port is an
-+ * 802.1ad service VLAN or carries a VLAN of its own.
++ * 802.1ad service VLAN or carries a VLAN of its own: a VLAN device above it,
++ * or a bridge it is a port of, which tags the frames it forwards there or
++ * carries tagged ones through.
 + */
 +static int dpa_upper_tags(struct net_device *net_dev)
 +{
@@ -62,7 +71,7 @@ index 063302116911..8f959f60d3ec 100644
 +		if (vlan_dev_vlan_proto(upper) == htons(ETH_P_8021AD))
 +			tags = 2;
 +		netdev_for_each_upper_dev_rcu(upper, inner, inner_iter)
-+			if (is_vlan_dev(inner))
++			if (is_vlan_dev(inner) || netif_is_bridge_master(inner))
 +				tags = 2;
 +	}
 +	rcu_read_unlock();
@@ -111,7 +120,7 @@ index 063302116911..8f959f60d3ec 100644
  #ifdef CONFIG_NET_POLL_CONTROLLER
  static void dpaa_eth_poll_controller(struct net_device *net_dev)
  {
-@@ -698,6 +763,7 @@ static const struct net_device_ops dpa_private_ops = {
+@@ -698,6 +765,7 @@ static const struct net_device_ops dpa_private_ops = {
  	.ndo_set_rx_mode = dpa_set_rx_mode,
  	.ndo_init = dpa_ndo_init,
  	.ndo_eth_ioctl = dpa_ioctl,
@@ -119,7 +128,7 @@ index 063302116911..8f959f60d3ec 100644
  #ifdef CONFIG_NET_POLL_CONTROLLER
  	.ndo_poll_controller = dpaa_eth_poll_controller,
  #endif
-@@ -750,6 +816,25 @@ void dpa_private_napi_del(struct net_device *net_dev)
+@@ -750,6 +818,25 @@ void dpa_private_napi_del(struct net_device *net_dev)
  }
  EXPORT_SYMBOL(dpa_private_napi_del);
  
@@ -145,7 +154,7 @@ index 063302116911..8f959f60d3ec 100644
  static int dpa_private_netdev_init(struct net_device *net_dev)
  {
  	int i;
-@@ -773,7 +858,7 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
+@@ -773,7 +860,7 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
  
  	/* Configure the maximum MTU according to the FMan's MAXFRM */
  	net_dev->min_mtu = ETH_MIN_MTU;
@@ -154,7 +163,7 @@ index 063302116911..8f959f60d3ec 100644
  
  	net_dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
  				NETIF_F_RXCSUM;
-@@ -1179,12 +1264,56 @@ static struct platform_driver dpa_driver = {
+@@ -1179,12 +1266,56 @@ static struct platform_driver dpa_driver = {
  	.remove		= dpa_remove
  };
  
@@ -211,7 +220,7 @@ index 063302116911..8f959f60d3ec 100644
  #ifdef CONFIG_FSL_DPAA_DBG_LOOP
  	dpa_debugfs_module_init();
  #endif /* CONFIG_FSL_DPAA_DBG_LOOP */
-@@ -1203,6 +1332,7 @@ static int __init __cold dpa_load(void)
+@@ -1203,6 +1334,7 @@ static int __init __cold dpa_load(void)
  		pr_err(KBUILD_MODNAME
  			": %s:%hu:%s(): platform_driver_register() = %d\n",
  			KBUILD_BASENAME".c", __LINE__, __func__, _errno);
@@ -219,7 +228,7 @@ index 063302116911..8f959f60d3ec 100644
  	}
  
  	pr_debug(KBUILD_MODNAME ": %s:%s() ->\n",
-@@ -1230,6 +1360,7 @@ static void __exit __cold dpa_unload(void)
+@@ -1230,6 +1362,7 @@ static void __exit __cold dpa_unload(void)
  #endif
  
  	platform_driver_unregister(&dpa_driver);

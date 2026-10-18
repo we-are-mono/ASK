@@ -1018,7 +1018,7 @@ ethertype to find the inner packet, SEC copies the fourteen bytes ahead of the
 tunnel header it builds, and the IPsec offline port rewrites the addresses and
 the ethertype from the SA's own next hop and outer family
 (`fill_ipsec_actions()` → `create_ethernet_hm(info, 1)`). It does not run the
-child route's `local_out`: with `ipsec_offload` set, 030's `__ip_local_out()`
+child route's `local_out`: with `ipsec_offload` set, 040's `__ip_local_out()`
 and `__ip6_local_out()` skip `LOCAL_OUT` and transmit through the child's
 neighbour themselves, which is the path this replaces, and the inner header
 was already finished by its protocol's output on the bundle or by forwarding.

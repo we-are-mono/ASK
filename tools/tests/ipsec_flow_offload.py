@@ -19,7 +19,7 @@ first packet the DUT sends the test host, so the DUT's neighbour entry for the
 host decides whether that offer can be built at all. `resolved` warms the entry
 first. `resolving` holds the DUT's ARP requests back until the first offer has
 failed: while a policy is configured no software refresh offers the flow again,
-so only the generation's retirement (kernel patch 176) brings the connection
+so only the generation's retirement (kernel patch 140) brings the connection
 into hardware before its flow expires.
 
 Also asserted here, because it is what this increment exists to prevent: a flow

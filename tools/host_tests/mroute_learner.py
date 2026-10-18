@@ -676,7 +676,7 @@ def test_the_kernel_marks_a_commit_until_it_is_applied():
     published -- ordered by the publishing release -- until the last set
     update is in, cleared with a release the learner's acquire pairs with;
     and the mark sits beside the pair in struct net, read inline."""
-    patch = (ROOT / "patches/kernel/148-netfilter-nftables-commit-in-progress.patch").read_text()
+    patch = (ROOT / "patches/kernel/139-netfilter-nftables-commit-in-progress.patch").read_text()
     sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
     commit = sections["net/netfilter/nf_tables_api.c"]
     assert commit.index("+\tWRITE_ONCE(net->nft.commit_applying, 1);") < \
@@ -690,7 +690,7 @@ def test_the_kernel_marks_a_commit_until_it_is_applied():
     # Every build applies it; meta-ask lists its patches one by one.
     recipe = (ROOT / "meta-ask/recipes-kernel/linux/linux-ask_6.12.bb").read_text()
     listed = re.findall(r"file://(\d+)-\S+\.patch", recipe)
-    assert "148" in listed and listed == sorted(listed)
+    assert "139" in listed and listed == sorted(listed)
 
 
 def test_legacy_tables_and_tc_are_judged_as_well():
@@ -743,7 +743,7 @@ def test_legacy_tables_and_tc_are_judged_as_well():
     assert "return !ingress && cdx_dscp_mirrored(dev, cookie);" in \
         function(htb, "cdx_tc_filter_mirrored")
 
-    patch = (ROOT / "patches/kernel/148-netfilter-nftables-commit-in-progress.patch").read_text()
+    patch = (ROOT / "patches/kernel/148-netfilter-port-probe.patch").read_text()
     sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
     for path, prefix in (("net/ipv4/netfilter/ip_tables.c", "ipt"),
                          ("net/ipv6/netfilter/ip6_tables.c", "ip6t")):

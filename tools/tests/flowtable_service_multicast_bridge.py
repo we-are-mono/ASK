@@ -1358,7 +1358,7 @@ async def test_br_netfilter_routed_prerouting(multicast_bridge_service):
     the bridge as the input, and the receive path then skips prerouting on
     the VIF above it, br-ftmcast.289. A mark set there for the bridge, which a
     forward rule then drops one UDP port of the routed copies on, splits the
-    group's streams, so the group stays out of hardware (patch 175): the
+    group's streams, so the group stays out of hardware (patch 148): the
     routed listener receives the kept port and nothing of the dropped one,
     the set-top box both, and the CPU carries all of it."""
     r = multicast_bridge_service

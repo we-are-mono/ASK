@@ -1,4 +1,4 @@
-From d84d53b84680d30227efc39603bfc76e5dc7b465 Mon Sep 17 00:00:00 2001
+From 8687fcd2a0ba60ad0047e1b462a77c58f2145257 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -7,6 +7,13 @@ Adds the IPsec packet offload to the FMAN SEC (CAAM) engine: hook points
 in xfrm_input.c, xfrm_output.c, xfrm_device.c and xfrm_state.c. New Kconfigs
 INET_IPSEC_OFFLOAD (net/ipv4/Kconfig) and INET6_IPSEC_OFFLOAD
 (net/ipv6/Kconfig), both depending on CPE_FAST_PATH from 010.
+
+The IP output path carries its bypasses (net/ipv4/ip_output.c,
+net/ipv6/{ip6_output,output_core}.c): a transport-mode frame for a
+packet-offloaded SA (skb->ipsec_offload, the skb field from 010) is
+still plaintext and leaves by the SA's own device. It skips LOCAL_OUT,
+POST_ROUTING and fragmentation on the way there, since SEC builds the
+ESP packet.
 
 Also the CAAM PDB struct packing (drivers/crypto/caam/pdb.h) required
 for SEC's view of the IPsec descriptor layout, and the xfrm_state handle
@@ -77,13 +84,16 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/net/netns/xfrm.h                      |   3 +
  include/net/xfrm.h                            |  11 +
  net/ipv4/Kconfig                              |   6 +
+ net/ipv4/ip_output.c                          |  24 +-
  net/ipv6/Kconfig                              |   6 +
+ net/ipv6/ip6_output.c                         |  18 +-
+ net/ipv6/output_core.c                        |   8 +
  net/xfrm/xfrm_device.c                        |  24 ++
  net/xfrm/xfrm_input.c                         |  48 +++
  net/xfrm/xfrm_output.c                        | 248 +++++++++++++++
  net/xfrm/xfrm_state.c                         | 202 +++++++++++++
  net/xfrm/xfrm_user.c                          |  27 ++
- 11 files changed, 837 insertions(+), 36 deletions(-)
+ 14 files changed, 884 insertions(+), 39 deletions(-)
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac..1669e0d267e3 100644
@@ -607,6 +617,55 @@ index 4cfd87b28c04..8871e4f90f2c 100644
  config INET_IPCOMP
  	tristate "IP: IPComp transformation"
  	select INET_XFRM_TUNNEL
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 41031c5c4303..cf455f665713 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -116,6 +116,14 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 
+ 	skb->protocol = htons(ETH_P_IP);
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD)
++	if(skb->ipsec_offload)
++	{
++		dst_output(net, sk, skb);
++		return 0;
++	}
++	else
++#endif /* endif for CONFIG_INET_IPSEC_OFFLOAD */
+ 	return nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
+ 		       net, sk, skb, NULL, skb_dst_dev(skb),
+ 		       dst_output);
+@@ -308,7 +316,11 @@ static int __ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *
+ 	if (skb_is_gso(skb))
+ 		return ip_finish_output_gso(net, sk, skb, mtu);
+ 
+-	if (skb->len > mtu || IPCB(skb)->frag_max_size)
++	if (
++#if defined(CONFIG_INET_IPSEC_OFFLOAD)
++		(skb->ipsec_offload == 0) &&
++#endif
++		(skb->len > mtu || IPCB(skb)->frag_max_size))
+ 		return ip_fragment(net, sk, skb, mtu, ip_finish_output2);
+ 
+ 	return ip_finish_output2(net, sk, skb);
+@@ -434,6 +446,16 @@ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 	skb->dev = dev;
+ 	skb->protocol = htons(ETH_P_IP);
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD)
++	/* Bypass invoking post routing hooks since the tunnel header and ESP
++	 * processing is not done in slow path for IPSec offloaded cases
++	 */
++	if (skb->ipsec_offload) {
++		ret_val = ip_finish_output(net, sk, skb);
++		rcu_read_unlock();
++		return ret_val;
++	}
++#endif
+ 	ret_val = NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
+ 				net, sk, skb, indev, dev,
+ 				ip_finish_output,
 diff --git a/net/ipv6/Kconfig b/net/ipv6/Kconfig
 index 1c9c686d9522..396a081a12b9 100644
 --- a/net/ipv6/Kconfig
@@ -624,6 +683,61 @@ index 1c9c686d9522..396a081a12b9 100644
  config INET6_IPCOMP
  	tristate "IPv6: IPComp transformation"
  	select INET6_XFRM_TUNNEL
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 5d17982cb994..4ec7a6da32ee 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -208,8 +208,15 @@ static int __ip6_finish_output(struct net *net, struct sock *sk, struct sk_buff
+ 	if (skb_is_gso(skb))
+ 		return ip6_finish_output_gso(net, sk, skb, mtu);
+ 
+-	if (skb->len > mtu ||
+-	    (IP6CB(skb)->frag_max_size && skb->len > IP6CB(skb)->frag_max_size))
++	if (
++#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/* If ipsec offload is there, do not do fragment. So, when IPSec
++		 * offload is enabled it directly calls ip6_finish_output2
++		 */
++		(skb->ipsec_offload == 0) &&
++#endif
++		((skb->len > mtu) ||
++		(IP6CB(skb)->frag_max_size && skb->len > IP6CB(skb)->frag_max_size)))
+ 		return ip6_fragment(net, sk, skb, ip6_finish_output2);
+ 
+ 	return ip6_finish_output2(net, sk, skb);
+@@ -244,6 +251,13 @@ int ip6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 		return 0;
+ 	}
+ 
++#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* Bypass invoking post routing hooks since the tunnel header and ESP
++	 * processing is not done in slow path for IPSec offloaded cases
++	 */
++	if (skb->ipsec_offload)
++		return ip6_finish_output(net, sk, skb);
++#endif
+ 	return NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
+ 			    net, sk, skb, indev, dev,
+ 			    ip6_finish_output,
+diff --git a/net/ipv6/output_core.c b/net/ipv6/output_core.c
+index 90a178dd24aa..c96261180a3d 100644
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@ -140,6 +140,14 @@ int __ip6_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 
+ 	skb->protocol = htons(ETH_P_IPV6);
+ 
++#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	if(skb->ipsec_offload)
++	{
++		dst_output(net, sk, skb);
++		return 0;
++	}
++	else
++#endif
+ 	return nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT,
+ 		       net, sk, skb, NULL, skb_dst(skb)->dev,
+ 		       dst_output);
 diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
 index 7744ed8e4c83..f2a7fa2704a4 100644
 --- a/net/xfrm/xfrm_device.c
@@ -711,7 +825,7 @@ index 5d3633ce6ba3..d0e39279123c 100644
  lock:
  		spin_lock(&x->lock);
  
-@@ -611,6 +645,20 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+@@ -611,6 +645,20 @@ lock:
  			goto drop_unlock;
  		}
  
@@ -1179,7 +1293,7 @@ index 792e5ef9361a..02188558bd1c 100644
  		net->xfrm.state_num--;
  		xfrm_nat_keepalive_state_updated(x);
  		spin_unlock(&net->xfrm.xfrm_state_lock);
-@@ -1524,6 +1607,15 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
+@@ -1524,6 +1607,15 @@ found:
  						  net->xfrm.state_byseq + h,
  						  x->xso.type);
  			}
@@ -1227,7 +1341,7 @@ index 792e5ef9361a..02188558bd1c 100644
  	xc = xfrm_state_clone(x, encap);
  	if (!xc)
  		return NULL;
-@@ -2098,6 +2208,40 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+@@ -2098,6 +2208,40 @@ error:
  EXPORT_SYMBOL(xfrm_state_migrate);
  #endif
  
@@ -1268,7 +1382,7 @@ index 792e5ef9361a..02188558bd1c 100644
  int xfrm_state_update(struct xfrm_state *x)
  {
  	struct xfrm_state *x1, *to_put;
-@@ -2154,6 +2298,10 @@ int xfrm_state_update(struct xfrm_state *x)
+@@ -2154,6 +2298,10 @@ out:
  	err = -EINVAL;
  	spin_lock_bh(&x1->lock);
  	if (likely(x1->km.state == XFRM_STATE_VALID)) {

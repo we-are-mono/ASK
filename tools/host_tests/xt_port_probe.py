@@ -1,6 +1,5 @@
-"""The x_tables port probe, as patch 148 adds it and patch 175 gives it a
-prerouting input of its own, over rule blobs laid out the way ip_tables lays a
-table out.
+"""The x_tables port probe, as patch 148 adds it, a prerouting input of its own
+included, over rule blobs laid out the way ip_tables lays a table out.
 
 The probe's code is taken from the patch -- both walkers, the pure-match and
 passing-target lists, the core's dispatcher -- and the kernel's own
@@ -16,31 +15,12 @@ import re
 from _kernel_source import kernel_source
 
 ROOT = Path(__file__).resolve().parents[2]
-PATCH = ROOT / "patches/kernel/148-netfilter-nftables-commit-in-progress.patch"
-PRE_IN = ROOT / "patches/kernel/175-netfilter-port-probe-prerouting-input-device.patch"
+PATCH = ROOT / "patches/kernel/148-netfilter-port-probe.patch"
 
 
 def sections(path=PATCH):
     patch = path.read_text()
     return dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
-
-
-def amended(text, section):
-    """A later patch's hunks applied to a file's patched text: each hunk's
-    old side, found once, replaced by its new side."""
-    for hunk in re.split(r"^@@[^\n]*\n", section, flags=re.M)[1:]:
-        old, new = [], []
-        for line in hunk.split("\n"):
-            if line == "-- ":
-                break
-            if line.startswith(("-", " ")) or line == "":
-                old.append(line[1:])
-            if line.startswith(("+", " ")) or line == "":
-                new.append(line[1:])
-        old, new = "\n".join(old).rstrip("\n"), "\n".join(new).rstrip("\n")
-        assert text.count(old) == 1, old
-        text = text.replace(old, new)
-    return text
 
 
 def patched(section):
@@ -83,11 +63,8 @@ def test_xt_port_probe(tmp_path):
         x_tables_h.read_text(), r"^static inline unsigned long ifname_compare_aligned\("))
 
     patch = sections()
-    pre_in = sections(PRE_IN)
-    v4 = amended(patched(patch["net/ipv4/netfilter/ip_tables.c"]),
-                 pre_in["net/ipv4/netfilter/ip_tables.c"])
-    v6 = amended(patched(patch["net/ipv6/netfilter/ip6_tables.c"]),
-                 pre_in["net/ipv6/netfilter/ip6_tables.c"])
+    v4 = patched(patch["net/ipv4/netfilter/ip_tables.c"])
+    v6 = patched(patch["net/ipv6/netfilter/ip6_tables.c"])
     xt = patched(patch["net/netfilter/x_tables.c"])
     core = patched(patch["net/netfilter/core.c"])
     walker = "/* ---- whether the tables could tell two UDP streams apart"

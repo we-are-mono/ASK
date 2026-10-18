@@ -64,7 +64,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://ask-kasan.cfg \
            file://mono-gateway-dk.dts \
            file://010-ask-fman-dpaa-ehash.patch \
-           file://030-ask-ipv4-ipv6-forwarding.patch \
+           file://030-ipv6-addrconf-modified-prefix-route-expiry.patch \
            file://040-ask-xfrm-ipsec-offload.patch \
            file://070-ask-ppp-hooks.patch \
            file://080-wext-core-restore-ndo_do_ioctl.patch \
@@ -92,6 +92,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://120-emc2305-dt-fan-control.patch \
            file://125-usb-typec-hd3ss3220-port-configuration.patch \
            file://130-thermal-linear-governor.patch \
+           file://139-netfilter-nftables-commit-in-progress.patch \
            file://140-ask-flowtable-context.patch \
            file://141-ask-flowtable-teardown-attribution.patch \
            file://142-ask-flowtable-teardown-handback-once.patch \
@@ -100,8 +101,8 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://145-netfilter-flowtable-upstream-lifetime-fixes.patch \
            file://146-xfrm-packet-offload-mixed-family-child-route.patch \
            file://147-netfilter-flowtable-attach-conntrack.patch \
-           file://148-netfilter-nftables-commit-in-progress.patch \
-           file://149-netfilter-flowtable-ipv6-prefix-translation.patch \
+           file://148-netfilter-port-probe.patch \
+           file://149-netfilter-ipv6-prefix-translation.patch \
            file://150-sdk_dpaa-hardware-qdisc.patch \
            file://151-netfilter-flowtable-pppoe-peer.patch \
            file://152-netfilter-nftables-device-hook-transactions.patch \
@@ -110,12 +111,9 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://162-bridge-forward-path-forwarding-state.patch \
            file://163-bridge-fdb-forward-port-refresh.patch \
            file://170-ipv6-hop-limit-checksum-complete.patch \
-           file://171-sdk_dpaa-rx-max-frame-bridged-vlan.patch \
            file://172-br_netfilter-label-hooks-and-count-changes.patch \
            file://173-netfilter-nft_flow_offload-skip-br_netfilter-frames.patch \
            file://174-netfilter-flowtable-carry-transit-esp-and-ip-in-ip.patch \
-           file://175-netfilter-port-probe-prerouting-input-device.patch \
-           file://176-netfilter-flowtable-offer-again-after-resolving-neighbour.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

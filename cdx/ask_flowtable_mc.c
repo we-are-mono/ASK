@@ -1423,7 +1423,7 @@ static bool ft_mc_netdev_dependent(const struct ft_mc_flow *f,
  * bridge-nf-pass-vlan-input-dev may have it, the bridge's VLAN device for
  * the flow's VLAN -- at prerouting for a frame that arrived tagged, at
  * forward for a copy that leaves tagged -- so every pairing is asked, with
- * prerouting's apart (patch 175). The walk asks more than a bridged copy
+ * prerouting's apart (patch 148). The walk asks more than a bridged copy
  * crosses: netdev chains on the bridge and below it, which ask nothing a
  * bridged frame does not answer alike, and refuse for a port the walk
  * cannot follow, a veth among them. A netfilter BPF program at any of those

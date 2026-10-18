@@ -82,7 +82,7 @@ The adapter validates those same tuple-derived rewrites against the native
 actions. CDX already encodes IPv6 source and destination address replacement,
 so no firmware change is needed. Conntrack's NAT status is unchanged and
 packets outside the flowtable still traverse the ordinary NPT targets.
-Patch 030's restriction to unconfirmed conntracks remains in place.
+The target still writes that tuple only while the conntrack is unconfirmed.
 
 `flowtable_npt.py` checks source, destination and combined translation
 for TCP and UDP, through software and hardware flowtables. The remote endpoint

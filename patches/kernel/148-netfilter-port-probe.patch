@@ -1,31 +1,15 @@
-From 94bcb357162cd9892846649cc1ba471824fdb75f Mon Sep 17 00:00:00 2001
+From 6b8359aa9ec619496f9ea720dc658cd75104eb35 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 24 Sep 2026 01:55:38 +0200
-Subject: [PATCH] netfilter: nf_tables: say when a commit is still being
- applied
-
-A commit bumps net->nft.base_seq and flips the generation cursor, then
-goes on applying the rest of the transaction: base chain policies,
-element timeouts, the set backends' commit updates. Something outside
-nf_tables that caches a verdict for a generation cannot tell when that
-is over. The commit mutex and the gc_seq busy mark are private to the
-pernet state, whose id is not exported, and nfnetlink releases its
-subsystem lock before the batch runs.
-
-Add net->nft.commit_applying, set just before base_seq is published and
-cleared with a release store once the set updates are in, and
-nft_commit_in_progress() to read it with an acquire. A reader that has
-seen a commit's base_seq with smp_load_acquire() and then finds it
-clear sees that commit fully applied. The field sits in the padding
-after gencursor, so struct net does not grow, and the reader is an
-inline load with no dependency on the nf_tables module.
+Subject: [PATCH] netfilter: let an offload ask whether the ruleset reads a
+ stream's ports
 
 An offload that keys streams on their addresses alone -- routed
 multicast, carried under source and group -- also needs to know whether
 the ruleset could tell two such streams apart by their ports: once one
 is seen forwarded, the others ride the same entry. Add
 nft_port_dependent(), which judges that from the ruleset without a
-packet, bracketed by base_seq and the applying mark. It walks netdev
+packet, bracketed by base_seq and nft_commit_in_progress(). It walks netdev
 ingress up the input device's stack, prerouting (NAT chains included),
 forward, postrouting and netdev egress down each output's stack, in hook
 order, reading each chain's rule blob for the current generation as
@@ -74,7 +58,8 @@ its own, and the NAT core's NF_HOOK_OP_NAT: the iptables-legacy NAT
 tables are registered with it and found only through its private data,
 which moves to nf_nat.h. A base chain's hook that a chain update adds
 for another device is typed NF_HOOK_OP_NF_TABLES, as the chain's first
-ones are, rather than left untyped like a flowtable's. The NAT core now frees its hook ops after a
+ones are, rather than left untyped like a flowtable's. The NAT core now frees
+its hook ops after a
 grace period, as it already freed that data, and the registration error
 paths that unregister hooks again -- ip_tables', ip6_tables', the NAT
 core's and the NAT tables' own -- wait one before freeing what they
@@ -88,25 +73,34 @@ every replacement once xt_replace_table() has waited out the packets
 reading the table it replaced, and by every removal, so that a caller
 that cached the answer asks again when it moves.
 
+br_netfilter runs prerouting for a frame its bridge hands up to the
+host with the bridge as the input device (or, with
+bridge-nf-pass-vlan-input-dev, the bridge's VLAN device for a tagged
+frame), and ip_sabotage_in() then skips prerouting on the device above
+the bridge that receives the frame. A routed multicast group whose
+parent VIF is a VLAN device on such a bridge meets prerouting with the
+bridge as its input and forward with the VIF, so a probe takes an
+optional prerouting input device, used by the nftables walk and both
+x_tables walks at prerouting alone.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  include/linux/netfilter.h              |    6 +
  include/linux/netfilter/x_tables.h     |    3 +
  include/net/netfilter/nf_nat.h         |   11 +
- include/net/netfilter/nf_port_probe.h  |  111 ++
- include/net/netfilter/nf_tables.h      |   40 +
+ include/net/netfilter/nf_port_probe.h  |  117 ++
+ include/net/netfilter/nf_tables.h      |   21 +
  include/net/netfilter/nf_tables_core.h |   56 +
  include/net/netfilter/nft_nat.h        |   34 +
  include/net/netns/netfilter.h          |    5 +
- include/net/netns/nftables.h           |    2 +
- net/ipv4/netfilter/ip_tables.c         |  307 ++-
+ net/ipv4/netfilter/ip_tables.c         |  309 +++-
  net/ipv4/netfilter/iptable_nat.c       |    8 +-
- net/ipv6/netfilter/ip6_tables.c        |  349 +++-
+ net/ipv6/netfilter/ip6_tables.c        |  350 +++-
  net/ipv6/netfilter/ip6table_nat.c      |    8 +-
  net/netfilter/Makefile                 |    2 +-
- net/netfilter/core.c                   |   53 +
+ net/netfilter/core.c                   |   54 +
  net/netfilter/nf_nat_core.c            |   19 +-
- net/netfilter/nf_tables_api.c          |   11 +
+ net/netfilter/nf_tables_api.c          |    1 +
  net/netfilter/nf_tables_port_probe.c   | 2365 ++++++++++++++++++++++++
  net/netfilter/nfnetlink_hook.c         |    2 +
  net/netfilter/nft_bitwise.c            |   10 -
@@ -121,7 +115,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/netfilter/nft_range.c              |    8 -
  net/netfilter/nft_redir.c              |    7 +-
  net/netfilter/x_tables.c               |   58 +
- 31 files changed, 3442 insertions(+), 88 deletions(-)
+ 30 files changed, 3421 insertions(+), 88 deletions(-)
  create mode 100644 include/net/netfilter/nf_port_probe.h
  create mode 100644 include/net/netfilter/nft_nat.h
  create mode 100644 net/netfilter/nf_tables_port_probe.c
@@ -181,10 +175,10 @@ index 9877f064548a..71112fad66ce 100644
  	       const struct nf_hook_state *state);
 diff --git a/include/net/netfilter/nf_port_probe.h b/include/net/netfilter/nf_port_probe.h
 new file mode 100644
-index 000000000000..c6ecb4b67d41
+index 000000000000..bd0516c48fe2
 --- /dev/null
 +++ b/include/net/netfilter/nf_port_probe.h
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,117 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _NF_PORT_PROBE_H
 +#define _NF_PORT_PROBE_H
@@ -201,6 +195,11 @@ index 000000000000..c6ecb4b67d41
 + * @saddr: the stream's source address
 + * @daddr: the stream's destination address
 + * @in: the device the stream arrives on
++ * @pre_in: the device prerouting sees it arrive on, when not @in; NULL for
++ *	@in. br_netfilter runs prerouting for what a bridge forwards or hands
++ *	up with the bridge, or the bridge's VLAN device for the frame's tag, as
++ *	the input, and the receive path then skips prerouting on the device
++ *	above the bridge that takes a copy up. Not read for a @bridged stream
 + * @out: the devices copies of it leave through
 + * @nout: how many entries @out has
 + * @bridged: a bridge forwards it, not the IP stack
@@ -239,6 +238,7 @@ index 000000000000..c6ecb4b67d41
 +	union nf_inet_addr		saddr;
 +	union nf_inet_addr		daddr;
 +	const struct net_device		*in;
++	const struct net_device		*pre_in;
 +	const struct net_device * const	*out;
 +	unsigned int			nout;
 +	bool				bridged;
@@ -297,7 +297,7 @@ index 000000000000..c6ecb4b67d41
 +
 +#endif /* _NF_PORT_PROBE_H */
 diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
-index f4b59915a49c..e2ad2c2cc78c 100644
+index f8301f226852..e2ad2c2cc78c 100644
 --- a/include/net/netfilter/nf_tables.h
 +++ b/include/net/netfilter/nf_tables.h
 @@ -11,6 +11,7 @@
@@ -325,29 +325,10 @@ index f4b59915a49c..e2ad2c2cc78c 100644
  	struct nft_expr			*exprs[NFT_SET_EXPR_MAX];
  	struct list_head		catchall_list;
  	unsigned char			data[]
-@@ -1937,4 +1941,40 @@ static inline u64 nft_net_tstamp(const struct net *net)
- 	return nft_pernet(net)->tstamp;
+@@ -1956,4 +1960,21 @@ static inline bool nft_commit_in_progress(const struct net *net)
+ 	return smp_load_acquire(&net->nft.commit_applying);
  }
  
-+/**
-+ * nft_commit_in_progress - whether a commit in @net is still applying itself
-+ * @net: the network namespace
-+ *
-+ * A commit bumps net->nft.base_seq and flips the generation cursor, then goes
-+ * on applying the rest of the transaction: base chain policies, element
-+ * timeouts, set backend updates. This is true from just before the bump until
-+ * all of that is in place. A reader that loaded base_seq with
-+ * smp_load_acquire(), as the packet path's set lookups do, and then finds this
-+ * false sees the commit that produced that base_seq fully applied.
-+ *
-+ * It lives beside base_seq in struct net, so a reader outside nf_tables needs
-+ * neither its pernet id nor a symbol from it.
-+ */
-+static inline bool nft_commit_in_progress(const struct net *net)
-+{
-+	return smp_load_acquire(&net->nft.commit_applying);
-+}
-+
 +/* The stream is described by struct nft_port_probe. A mark x_tables could
 + * leave on it, or a verdict it could give, is the caller's to rule out with
 + * nf_xt_port_dependent(), and tc the caller's own.
@@ -502,21 +483,8 @@ index a6a0bf4a247e..aa8d6d05927e 100644
 +	atomic_t xt_seq;
  };
  #endif
-diff --git a/include/net/netns/nftables.h b/include/net/netns/nftables.h
-index 99dd166c5d07..9fb5adf835f0 100644
---- a/include/net/netns/nftables.h
-+++ b/include/net/netns/nftables.h
-@@ -5,6 +5,8 @@
- struct netns_nftables {
- 	unsigned int		base_seq;
- 	u8			gencursor;
-+	/* Set while a commit applies itself; see nft_commit_in_progress(). */
-+	u8			commit_applying;
- };
- 
- #endif
 diff --git a/net/ipv4/netfilter/ip_tables.c b/net/ipv4/netfilter/ip_tables.c
-index 0ba456c4c634..32ee2bdf7c94 100644
+index 0ba456c4c634..3a1bac1db1b3 100644
 --- a/net/ipv4/netfilter/ip_tables.c
 +++ b/net/ipv4/netfilter/ip_tables.c
 @@ -25,6 +25,8 @@
@@ -546,7 +514,7 @@ index 0ba456c4c634..32ee2bdf7c94 100644
  	const struct iphdr *ip;
  	/* Initializing verdict to NF_DROP keeps gcc happy. */
  	unsigned int verdict = NF_DROP;
-@@ -361,6 +365,281 @@ ipt_do_table(void *priv,
+@@ -361,6 +365,283 @@ ipt_do_table(void *priv,
  	else return verdict;
  }
  
@@ -742,7 +710,9 @@ index 0ba456c4c634..32ee2bdf7c94 100644
 +	unsigned int addend;
 +	int ret = 0;
 +
-+	p->indev = p->hook == NF_INET_POST_ROUTING ? nulldevname : probe->in->name;
++	p->indev = p->hook == NF_INET_POST_ROUTING ? nulldevname :
++		   p->hook == NF_INET_PRE_ROUTING && probe->pre_in ? probe->pre_in->name :
++		   probe->in->name;
 +	for (i = 0; i < outputs && !ret; i++) {
 +		p->outdev = p->hook == NF_INET_PRE_ROUTING ?
 +			    nulldevname : probe->out[i]->name;
@@ -828,7 +798,7 @@ index 0ba456c4c634..32ee2bdf7c94 100644
  /* Figures out from what hook each rule can be called: returns 0 if
     there are loops.  Puts hook bitmask in comefrom. */
  static int
-@@ -1062,6 +1341,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
+@@ -1062,6 +1343,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
  	oldinfo = xt_replace_table(t, num_counters, newinfo, &ret);
  	if (!oldinfo)
  		goto put_module;
@@ -837,7 +807,7 @@ index 0ba456c4c634..32ee2bdf7c94 100644
  
  	/* Update module usage count based on number of rules */
  	if ((oldinfo->number > oldinfo->initial_entries) ||
-@@ -1715,6 +1996,7 @@ static void __ipt_unregister_table(struct net *net, struct xt_table *table)
+@@ -1715,6 +1998,7 @@ static void __ipt_unregister_table(struct net *net, struct xt_table *table)
  	if (private->number > private->initial_entries)
  		module_put(table_owner);
  	xt_free_table_info(private);
@@ -845,7 +815,7 @@ index 0ba456c4c634..32ee2bdf7c94 100644
  }
  
  int ipt_register_table(struct net *net, const struct xt_table *table,
-@@ -1755,8 +2037,10 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
+@@ -1755,8 +2039,10 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
  	/* No template? No need to do anything. This is used by 'nat' table, it registers
  	 * with the nat core instead of the netfilter core.
  	 */
@@ -857,7 +827,7 @@ index 0ba456c4c634..32ee2bdf7c94 100644
  
  	num_ops = hweight32(table->valid_hooks);
  	if (num_ops == 0) {
-@@ -1770,15 +2054,27 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
+@@ -1770,15 +2056,27 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
  		goto out_free;
  	}
  
@@ -887,7 +857,7 @@ index 0ba456c4c634..32ee2bdf7c94 100644
  	return ret;
  
  out_free:
-@@ -1865,6 +2161,7 @@ static int __init ip_tables_init(void)
+@@ -1865,6 +2163,7 @@ static int __init ip_tables_init(void)
  	if (ret < 0)
  		goto err4;
  
@@ -895,7 +865,7 @@ index 0ba456c4c634..32ee2bdf7c94 100644
  	return 0;
  
  err4:
-@@ -1877,6 +2174,8 @@ static int __init ip_tables_init(void)
+@@ -1877,6 +2176,8 @@ err1:
  
  static void __exit ip_tables_fini(void)
  {
@@ -925,7 +895,7 @@ index a5db7c67d61b..61e71912c96a 100644
  	kfree(repl);
  	return ret;
 diff --git a/net/ipv6/netfilter/ip6_tables.c b/net/ipv6/netfilter/ip6_tables.c
-index 6c5022242cf0..b2489b95b17b 100644
+index 6c5022242cf0..652422307699 100644
 --- a/net/ipv6/netfilter/ip6_tables.c
 +++ b/net/ipv6/netfilter/ip6_tables.c
 @@ -29,6 +29,8 @@
@@ -955,7 +925,7 @@ index 6c5022242cf0..b2489b95b17b 100644
  	/* Initializing verdict to NF_DROP keeps gcc happy. */
  	unsigned int verdict = NF_DROP;
  	const char *indev, *outdev;
-@@ -379,6 +383,323 @@ ip6t_do_table(void *priv, struct sk_buff *skb,
+@@ -379,6 +383,324 @@ ip6t_do_table(void *priv, struct sk_buff *skb,
  	else return verdict;
  }
  
@@ -1196,8 +1166,9 @@ index 6c5022242cf0..b2489b95b17b 100644
 +	for (i = 0; i < outputs && !ret; i++) {
 +		p->outdev = p->hook == NF_INET_PRE_ROUTING ?
 +			    nulldevname : probe->out[i]->name;
-+		p->indev = p->hook == NF_INET_POST_ROUTING ?
-+			   p->outdev : probe->in->name;
++		p->indev = p->hook == NF_INET_POST_ROUTING ? p->outdev :
++			   p->hook == NF_INET_PRE_ROUTING && probe->pre_in ?
++			   probe->pre_in->name : probe->in->name;
 +		p->visits = IP6T_PROBE_VISITS;
 +		local_bh_disable();
 +		addend = xt_write_recseq_begin();
@@ -1279,7 +1250,7 @@ index 6c5022242cf0..b2489b95b17b 100644
  /* Figures out from what hook each rule can be called: returns 0 if
     there are loops.  Puts hook bitmask in comefrom. */
  static int
-@@ -1079,6 +1400,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
+@@ -1079,6 +1401,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
  	oldinfo = xt_replace_table(t, num_counters, newinfo, &ret);
  	if (!oldinfo)
  		goto put_module;
@@ -1288,7 +1259,7 @@ index 6c5022242cf0..b2489b95b17b 100644
  
  	/* Update module usage count based on number of rules */
  	if ((oldinfo->number > oldinfo->initial_entries) ||
-@@ -1724,6 +2047,7 @@ static void __ip6t_unregister_table(struct net *net, struct xt_table *table)
+@@ -1724,6 +2048,7 @@ static void __ip6t_unregister_table(struct net *net, struct xt_table *table)
  	if (private->number > private->initial_entries)
  		module_put(table_owner);
  	xt_free_table_info(private);
@@ -1296,7 +1267,7 @@ index 6c5022242cf0..b2489b95b17b 100644
  }
  
  int ip6t_register_table(struct net *net, const struct xt_table *table,
-@@ -1761,8 +2085,10 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
+@@ -1761,8 +2086,10 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
  		return PTR_ERR(new_table);
  	}
  
@@ -1308,7 +1279,7 @@ index 6c5022242cf0..b2489b95b17b 100644
  
  	num_ops = hweight32(table->valid_hooks);
  	if (num_ops == 0) {
-@@ -1776,15 +2102,27 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
+@@ -1776,15 +2103,27 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
  		goto out_free;
  	}
  
@@ -1338,7 +1309,7 @@ index 6c5022242cf0..b2489b95b17b 100644
  	return ret;
  
  out_free:
-@@ -1872,6 +2210,7 @@ static int __init ip6_tables_init(void)
+@@ -1872,6 +2211,7 @@ static int __init ip6_tables_init(void)
  	if (ret < 0)
  		goto err4;
  
@@ -1346,7 +1317,7 @@ index 6c5022242cf0..b2489b95b17b 100644
  	return 0;
  
  err4:
-@@ -1884,6 +2223,8 @@ static int __init ip6_tables_init(void)
+@@ -1884,6 +2224,8 @@ err1:
  
  static void __exit ip6_tables_fini(void)
  {
@@ -1389,7 +1360,7 @@ index f0aa4d7ef499..0ebadc026948 100644
  ifdef CONFIG_X86_64
  ifndef CONFIG_UML
 diff --git a/net/netfilter/core.c b/net/netfilter/core.c
-index b9f551f02c81..463e27c82fbd 100644
+index b9f551f02c81..d3cbdf19ac3c 100644
 --- a/net/netfilter/core.c
 +++ b/net/netfilter/core.c
 @@ -23,6 +23,7 @@
@@ -1400,7 +1371,7 @@ index b9f551f02c81..463e27c82fbd 100644
  #include <net/netfilter/nf_queue.h>
  #include <net/sock.h>
  
-@@ -684,6 +685,58 @@ EXPORT_SYMBOL_GPL(nf_defrag_v4_hook);
+@@ -684,6 +685,59 @@ EXPORT_SYMBOL_GPL(nf_defrag_v4_hook);
  const struct nf_defrag_hook __rcu *nf_defrag_v6_hook __read_mostly;
  EXPORT_SYMBOL_GPL(nf_defrag_v6_hook);
  
@@ -1416,10 +1387,11 @@ index b9f551f02c81..463e27c82fbd 100644
 + * @probe: the stream, known but for its ports
 + *
 + * Walks the ip_tables or ip6_tables tables, as @probe->family says, that a
-+ * forwarded copy of the stream crosses at prerouting, forward and
-+ * postrouting, with the NAT tables the NAT core runs for a connection's first
-+ * packet among them; see struct nft_port_probe for what the caller vouches
-+ * for. A family whose module is not loaded has no table.
++ * forwarded copy of the stream crosses at prerouting (with @probe->pre_in as
++ * the input when set), forward and postrouting, with the NAT tables the NAT
++ * core runs for a connection's first packet among them; see struct
++ * nft_port_probe for what the caller vouches for. A family whose module is not
++ * loaded has no table.
 + *
 + * Return: 0 when every packet of the stream is accepted by every table
 + * unchanged, whatever its ports; 1 when two streams differing in ports may
@@ -1511,7 +1483,7 @@ index 041ab3733baa..f7737e648b06 100644
  unlock:
  	mutex_unlock(&nf_nat_proto_mutex);
 diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
-index 03dd9d1db12f..7a6d0496c161 100644
+index 5c30a237a3a5..7a6d0496c161 100644
 --- a/net/netfilter/nf_tables_api.c
 +++ b/net/netfilter/nf_tables_api.c
 @@ -2655,6 +2655,7 @@ static int nf_tables_updchain(struct nft_ctx *ctx, u8 genmask, u8 policy,
@@ -1522,33 +1494,9 @@ index 03dd9d1db12f..7a6d0496c161 100644
  
  				if (nft_hook_list_find(&basechain->hook_list, h)) {
  					list_del(&h->list);
-@@ -10303,6 +10304,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
- 	while (++base_seq == 0)
- 		;
- 
-+	/* Visible to anyone who sees the new base_seq, through the release
-+	 * below; see nft_commit_in_progress().
-+	 */
-+	WRITE_ONCE(net->nft.commit_applying, 1);
-+
- 	/* pairs with smp_load_acquire in nft_lookup_eval */
- 	smp_store_release(&net->nft.base_seq, base_seq);
- 
-@@ -10534,6 +10540,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
- 
- 	nft_set_commit_update(&set_update_list);
- 
-+	/* Everything a packet can see of this transaction is in place.
-+	 * Pairs with smp_load_acquire in nft_commit_in_progress().
-+	 */
-+	smp_store_release(&net->nft.commit_applying, 0);
-+
- 	nft_commit_notify(net, NETLINK_CB(skb).portid);
- 	nf_tables_gen_notify(net, skb, NFT_MSG_NEWGEN);
- 	nf_tables_commit_audit_log(&adl, nft_base_seq(net));
 diff --git a/net/netfilter/nf_tables_port_probe.c b/net/netfilter/nf_tables_port_probe.c
 new file mode 100644
-index 000000000000..a28859d6f108
+index 000000000000..df7c6cbef8c0
 --- /dev/null
 +++ b/net/netfilter/nf_tables_port_probe.c
 @@ -0,0 +1,2365 @@
@@ -3733,7 +3681,7 @@ index 000000000000..a28859d6f108
 +	if (ctx->stop)
 +		return ctmark;
 +	if (!p->bridged) {
-+		nft_probe_hook(ctx, NFT_PROBE_PRE, p->in, NULL, 0);
++		nft_probe_hook(ctx, NFT_PROBE_PRE, p->pre_in ?: p->in, NULL, 0);
 +		if (ctx->stop)
 +			return ctmark;
 +	}
@@ -3825,17 +3773,17 @@ index 000000000000..a28859d6f108
 + * @probe: the stream, all but its ports
 + *
 + * Evaluates the nf_tables ruleset in force for a forwarded UDP stream whose
-+ * source and destination ports are unknown and everything else about it is
-+ * as @probe says (see struct nft_port_probe for what the caller vouches for):
-+ * it arrives on @probe->in, copies leave through each of @probe->out, it is
-+ * conntracked as new with no reply, and it carries no mark. The chains walked
-+ * are netdev ingress on the input device and the devices below it,
-+ * prerouting (filter and NAT alike), then forward, postrouting and netdev
-+ * egress on each output and the devices below it; ip or ip6 tables as the
-+ * family says, and inet ones. For a bridged stream (@probe->bridged), netdev
-+ * ingress and egress alone, with no conntrack attached, and no output needed.
-+ * The first packet of the stream is followed, then later ones as far as NAT
-+ * chains and conntrack marks make them differ.
++ * source and destination ports are unknown and everything else about it is as
++ * @probe says (see struct nft_port_probe for what the caller vouches for): it
++ * arrives on @probe->in (prerouting sees it on @probe->pre_in when that is
++ * set), copies leave through each of @probe->out, it is conntracked as new with
++ * no reply, and it carries no mark. The chains walked are netdev ingress on the
++ * input device and the devices below it, prerouting (filter and NAT alike),
++ * then forward, postrouting and netdev egress on each output and the devices
++ * below it; ip or ip6 tables as the family says, and inet ones. For a bridged
++ * stream (@probe->bridged), netdev ingress and egress alone, with no conntrack
++ * attached, and no output needed. The first packet of the stream is followed,
++ * then later ones as far as NAT chains and conntrack marks make them differ.
 + *
 + * Return: 0 when every path accepts the stream at every hook, for every
 + * output, with the same effects and no translation; 1 when two streams

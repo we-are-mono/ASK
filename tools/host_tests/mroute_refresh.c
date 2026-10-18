@@ -1422,7 +1422,7 @@ int main(void)
                cache.mfc_flags == MFC_OFFLOAD && !hardware.live);
         /* With br_netfilter at the bridge, the stream met prerouting with
          * the bridge as its input and the VIF skipped it: walked once more,
-         * prerouting from the bridge (patch 175). */
+         * prerouting from the bridge (patch 148). */
         {
             unsigned asks = ports_asks, xasks = xtables_asks;
 

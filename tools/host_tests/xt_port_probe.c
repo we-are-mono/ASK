@@ -1351,7 +1351,7 @@ static void hooks_and_tables(int family)
 
 /* br_netfilter runs prerouting for what its bridge hands up with the bridge
  * as the input, and forward then sees the VLAN device above it: prerouting
- * reads the probe's own input for it, and no other hook does (patch 175). */
+ * reads the probe's own input for it, and no other hook does (patch 148). */
 static void prerouting_input(int family)
 {
 	struct nf_nat_lookup_hook_priv *pre, *post;
