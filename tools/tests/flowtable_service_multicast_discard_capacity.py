@@ -55,6 +55,11 @@ LEARNING, HOLDING = 0.2, 1.0
 # Past two refreshes, which is when an eviction that thrashed would show.
 HOLD = 11
 BATCH = "/tmp/ask_mcast_fill_memberships"
+# The longest a read of the datapath's state may wait while every discard
+# retires at once. The learner lets the transaction go between batches, so a
+# reader waits for one of them; it waited for all 512 deletes, 9.5 s on the
+# KASAN image, and a health probe behind it missed its 5 s deadline (A312).
+STATE_WAIT = 2.0
 
 
 def fill_groups(family: int) -> list[str]:
@@ -112,6 +117,32 @@ class Fill:
         assert not self.thread.is_alive(), "the fill sender did not stop"
         if self.error is not None and kind is None:
             raise self.error
+
+
+@asynccontextmanager
+async def state_waits(r):
+    """How long each read of /proc/cdx_flowtable's header took, read a tenth
+    of a second apart while the block runs, as the health probe reads it: one
+    read, which renders the whole header under the transaction everything
+    that changes the datapath takes."""
+    waits, done = [], asyncio.Event()
+
+    async def sample():
+        while not done.is_set():
+            began = time.monotonic()
+            got = await r.target.fs_read(r.session, "/proc/cdx_flowtable", max_bytes=4096)
+            # Short once the rows have gone: the file is then smaller than
+            # the read.
+            assert got.get("errno", 0) == 0 and got["size"] > 0, got
+            waits.append(round(time.monotonic() - began, 3))
+            await asyncio.sleep(0.1)
+
+    task = asyncio.create_task(sample())
+    try:
+        yield waits
+    finally:
+        done.set()
+        await task
 
 
 async def fill_memberships(r, bridge: str, groups: list[str], *, add: bool) -> None:
@@ -258,7 +289,14 @@ async def test_gives_its_id_to_a_listener(multicast_rig,
         # The fill stopped and the viewer left: every discard ages out at its
         # first refresh that counts nothing, and every id comes back -- read
         # while the segment's own multicast is still kept off the ports.
-        final = await settle(lambda s: s[ids] == 0 and s["mcast_installed"] == 0 and
-                             not fill_rows(s) and not mcast_rows(s, watched),
-                             "every id given back", 60)
+        async with state_waits(r) as waits:
+            begun = await r.proc()
+            final = await settle(lambda s: s[ids] == 0 and s["mcast_installed"] == 0 and
+                                 not fill_rows(s) and not mcast_rows(s, watched),
+                                 "every id given back", 60)
         assert final["quarantine"] == 0, brief(final)
+        r.record(f"mcast-discard-capacity-v{family}-waits", {"waits": waits})
+        # Sampled while the discards went, not after; and every one went at
+        # once, with no read waiting for more than a batch of them.
+        assert begun[ids] > 0, brief(begun)
+        assert waits and max(waits) < STATE_WAIT, sorted(waits)[-8:]

@@ -23,7 +23,7 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 {
 	FILE *f = fopen(FT_PROC, "r");
 	char line[256];
-	int seen = 0;
+	int seen = 0, optional = 0;
 	bool reports_terminal = false;
 
 	memset(b, 0, sizeof(*b));
@@ -43,25 +43,32 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 			continue;
 		v = strtol(sval, NULL, 0);
 		if      (!strcmp(key, "bindings"))       { b->bindings = v; seen |= 1; }
-		else if (!strcmp(key, "entries"))        { b->entries = v; }
+		else if (!strcmp(key, "entries"))        { b->entries = v; optional |= 1; }
 		else if (!strcmp(key, "handle_refs"))    { b->handle_refs = v; seen |= 2; }
 		else if (!strcmp(key, "neighbour_refs")) { b->neighbour_refs = v; seen |= 4; }
 		else if (!strcmp(key, "quarantine"))     { b->quarantine = v; seen |= 8; }
 		else if (!strcmp(key, "fatal"))          { b->fatal = v; seen |= 16; }
 		else if (!strcmp(key, "fatal_terminal")) { b->fatal_terminal = v; reports_terminal = true; }
-		else if (!strcmp(key, "restarts"))       { b->restarts = v; }
-		else if (!strcmp(key, "resume_failures")) { b->resume_failures = v; }
+		else if (!strcmp(key, "restarts"))       { b->restarts = v; optional |= 2; }
+		else if (!strcmp(key, "resume_failures")) { b->resume_failures = v; optional |= 4; }
 		else if (!strcmp(key, "observe"))        { b->observe = v; seen |= 32; }
 		else if (!strcmp(key, "invalidated"))    { b->invalidated = v; seen |= 64; }
-		else if (!strcmp(key, "installs"))       { b->installs = v; }
-		else if (!strcmp(key, "deletes"))        { b->deletes = v; }
-		else if (!strcmp(key, "rearms"))         { b->rearms = v; }
-		else if (!strcmp(key, "errors"))         { b->errors = v; }
-		else if (!strcmp(key, "qos_mark_mask"))  { b->qos_mark_mask = (uint32_t)strtoul(sval, NULL, 0); }
-		else if (!strcmp(key, "route_mark_mask")) { b->route_mark_mask = (uint32_t)strtoul(sval, NULL, 0); }
+		else if (!strcmp(key, "installs"))       { b->installs = v; optional |= 8; }
+		else if (!strcmp(key, "deletes"))        { b->deletes = v; optional |= 16; }
+		else if (!strcmp(key, "rearms"))         { b->rearms = v; optional |= 32; }
+		else if (!strcmp(key, "errors"))         { b->errors = v; optional |= 64; }
+		else if (!strcmp(key, "qos_mark_mask"))  { b->qos_mark_mask = (uint32_t)strtoul(sval, NULL, 0); optional |= 128; }
+		else if (!strcmp(key, "route_mark_mask")) { b->route_mark_mask = (uint32_t)strtoul(sval, NULL, 0); optional |= 256; }
 		else if (!strcmp(key, "mcast_enabled"))    { b->mcast_enabled = v; seen |= 128; }
 		else if (!strcmp(key, "mcast_installed"))  { b->mcast_installed = v; seen |= 256; }
 		else if (!strcmp(key, "mroute_installed")) { b->mroute_installed = v; seen |= 512; }
+		/* Once every key read here is in, stop: the rows after the
+		 * counters are each buffer a hold of the datapath's transaction
+		 * of its own, and thousands of bridged pairs made the health
+		 * probe take it hundreds of times (A312). An adapter that prints
+		 * a key fewer is read to the end, as before. */
+		if (seen == 1023 && optional == 511 && reports_terminal)
+			break;
 	}
 	int error = ferror(f);
 	fclose(f);

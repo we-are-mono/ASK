@@ -40,6 +40,7 @@
 #include <linux/delay.h>
 #include "cdx.h"
 #include "cdx_flowtable.h"
+#include "cdx_flowtable_backend.h"
 #include "cdx_htb.h"
 #include "control_tx.h"
 #include "module_qm.h"
@@ -99,8 +100,10 @@ void cdx_ctrl_lock_with_rtnl(void)
 		if (mutex_trylock(&cdx_info->ctrl.mutex))
 			return;
 		rtnl_unlock();
-		mutex_lock(&cdx_info->ctrl.mutex);
-		mutex_unlock(&cdx_info->ctrl.mutex);
+		/* Waited for as cdx_ft_begin() waits, so that a job letting
+		 * waiters through between its batches counts this one too. */
+		cdx_ft_begin();
+		cdx_ft_end();
 	}
 }
 

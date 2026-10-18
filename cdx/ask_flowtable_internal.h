@@ -485,6 +485,12 @@ struct ft_mc_flow {
 #define FT_MC_MAX_PORT_FLOWS	256
 #define FT_MC_MAX_TOTAL_FLOWS	512
 
+/* The most multicast groups either learner deletes in one hold of the
+ * transaction. A group's delete is its root and its listener chain, about
+ * 18 ms each on the KASAN image, so the 512 a family holds went in one hold of
+ * 9.5 s, which /proc, every install and the health probe waited out (A312). */
+#define FT_MC_RETIRE_BATCH	16U
+
 /* How often an installed flow's entry is asked what it has counted, and every
  * flow's answer is asked of the bridge again. The routed learner's fold and
  * re-derivation run at the same pace, for the same reason: some of what the

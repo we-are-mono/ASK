@@ -20,6 +20,9 @@ void cdx_ctrl_timer_stop(void);
 
 static void mutex_lock(bool *lock) { assert(!*lock && !rtnl); *lock = true; lock_waits++; }
 static void mutex_unlock(bool *lock) { assert(*lock); *lock = false; }
+/* The flowtable's transaction is the control mutex. */
+static void cdx_ft_begin(void) { mutex_lock(&cdx_info->ctrl.mutex); }
+static void cdx_ft_end(void) { mutex_unlock(&cdx_info->ctrl.mutex); }
 static int mutex_trylock(bool *lock)
 {
     assert(!*lock && rtnl);

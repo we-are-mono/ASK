@@ -152,6 +152,15 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A397 — the multicast egress drains rebuild every marked group in one hold, under the RTNL a tc command holds.**
+  `ft_mc_egress_drain()` and `ft_mr_egress_drain()` replace each group a port's queues or DSCP map changed under, all
+  in one hold of the transaction, and their caller holds RTNL throughout. With hundreds of replicating groups that is
+  seconds on the KASAN image, by A312's ~18 ms a group, and RTNL with it: the health probe's RTM_GETLINK and every
+  other netlink writer wait. From the code, not measured; it takes an operator's tc or DSCP-map change while many
+  groups replicate. Batching the transaction alone would not free RTNL, which the caller holds to know the rebuild
+  done. Fix direction: measure first; then rebuild in batches after the tc command returns, the stale groups withdrawn
+  to software until rebuilt, or bound how many a port may hold.
+
 - [ ] **A396 — the hardware strip leaves an ECT(0) carried packet ECT(0) under an outer ECT(1).** RFC 6040 §4.2's
   table, and Linux's `INET_ECN_decapsulate()` (`include/net/inet_ecn.h`, `INET_ECN_set_ect1()`), make it ECT(1).
   From the code, not measured: Linux's own encapsulation copies the carried ECN outward, so only a path that
@@ -470,17 +479,9 @@ result independently of those temporary files.
 - [x] **A311 — a Wi-Fi VWD slot could be rebound to a new VAP before an entry built for the old VAP left hardware.**
   Fixed: a VAP's entries leave hardware, proven, before its slot is released (_:/^cdx: empty a Wi-Fi VAP's slot before reusing it_).
 
-- [ ] **A312 — a bulk multicast retirement holds the CDX transaction for seconds, and the health probe can miss its
-  5 s deadline behind it.** Measured 2026-10-18 on the KASAN image, sampling `ask-flowtable health`, the
-  `/proc/cdx_flowtable` header read and an RTNL `ip link` call in parallel through
-  `flowtable_service_multicast_discard_capacity.py`'s fill to the 512-flow cap. The header the probe reads is cheap:
-  517 rows, 111 KB, about 40 ms, at most 350 ms while groups install; RTNL never stalled (at most 105 ms). When the fill
-  ended and about 512 bridged groups retired at once, the header read waited 9.5 s and one probe missed (the next took
-  4.0 s): `ft_mc_work_fn()` holds `cdx_ft_begin()` across every `cdx_mc_group_del()` of the pass, about 18 ms each
-  here, and /proc takes the transaction first. Not a reboot: the monitor resets after three consecutive misses, which
-  takes a stall of about 20-25 s (a failing probe waits 5 s, then sleeps 5 s), and production runs faster than KASAN;
-  routed groups retired in the same window would add their own. Fix direction: retire in batches, letting the
-  transaction go between them, as the L2 learner's walks do (A382).
+- [x] **A312 — a bulk multicast retirement held the CDX transaction for seconds; the health probe could miss its 5 s
+  deadline.** Both learners retire 16 groups to a hold and let waiters in between; /proc renders its header in one hold
+  and the probe stops at the counters (_:/^flowtable: retire multicast groups in batches_).
 - [x] **A327 — a route change under a full table blocked flowtable readers ~13 s and piled up offload kworkers.** Fixed:
   one barrier per 64-entry batch, and a deletion never waits for the transaction (_:/^cdx: retire flowtable entries in batches_).
 

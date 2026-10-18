@@ -544,6 +544,18 @@ go back to their own table's spare, whichever table the barrier went through.
 `/proc/cdx_flowtable` reports owed unlinks as `owed`, separately from
 `quarantine`.
 
+The multicast learners retire groups the same way, 16 to a hold
+(`FT_MC_RETIRE_BATCH`): a group's delete is its root and its listener chain,
+about 18 ms on the KASAN image, and a family's 512 retired in one hold kept
+/proc and the health probe waiting 9.5 s (A312). Between their batches they let
+the transaction go until nobody waiting for it is left, up to 100 ms
+(`cdx_ft_let_waiters()`): a released mutex wakes one waiter while the releasing
+job takes it back, so batches alone let one waiter through each. And
+/proc/cdx_flowtable sizes its buffer for the header when it is opened, so the
+header renders in one hold rather than once more at every doubling of seq_file's
+buffer. The health probe reads it only as far as the counters: each buffer of
+the rows after them would be a hold of its own.
+
 Pending retirement includes entries CDX parked for its own paths: a multicast
 group delete or listener swap, or an IPsec SA delete, whose barrier failed. The
 backend refuses a claim and every new entry while any remain. One completed

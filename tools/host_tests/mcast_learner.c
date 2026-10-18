@@ -488,9 +488,13 @@ static void rtnl_unlock(void) { assert(rtnl && !caller_rtnl); rtnl = 0; }
 static void (*before_begin)(void);
 static unsigned before_begin_skip;
 static void recorded_chains_hold_their_devices(void);
+/* Deletes in the current hold of the transaction, the most any hold made,
+ * and how often a retirement let waiters in between two of its holds. */
+static unsigned hold_dels, most_hold_dels, waiters_let_in;
 static void cdx_ft_begin(void)
 {
     assert(!in_transaction && !ft_mc_lock && (!rtnl || caller_rtnl));
+    hold_dels = 0;
     if (before_begin && before_begin_skip) {
         before_begin_skip--;
     } else if (before_begin) {
@@ -504,6 +508,11 @@ static void cdx_ft_begin(void)
 }
 static void cdx_ft_end(void) { assert(in_transaction); in_transaction = 0; }
 static void cdx_ft_assert_held(void) { assert(in_transaction); }
+static void cdx_ft_let_waiters(void)
+{
+    assert(!in_transaction && !ft_mc_lock);
+    waiters_let_in++;
+}
 #define U64_MAX UINT64_MAX
 static bool cdx_mc_group_stats(const struct cdx_mc_group *hw, struct cdx_ft_counters *c);
 struct cdx_mc_group_spec;
@@ -837,6 +846,8 @@ static void cdx_mc_group_del(struct cdx_mc_group **group)
         memset(*group, 0, sizeof(**group));
     }
     dels++;
+    if (++hold_dels > most_hold_dels)
+        most_hold_dels = hold_dels;
     *group = NULL;
 }
 
@@ -1021,7 +1032,8 @@ static void pass(void)
     rtnl_unlock();
     ft_mc_soft_free(&soft);
     ft_mc_match_routes();
-    ft_mc_retire(&dead, &gone);
+    while (ft_mc_retire(&dead, &gone))
+        free_lists(&dead, &gone);
     free_lists(&dead, &gone);
     list_for_each_entry(f, &ft_mc_flows, list) {
         if (!f->stale)
@@ -4449,6 +4461,40 @@ static void discards_leave_room_for_a_wanted_stream(void)
     pass();
 }
 
+/* A pass that retires every flow of a family at once lets the transaction go
+ * every FT_MC_RETIRE_BATCH deletes, and lets whoever waits for it in between,
+ * so nothing reading or changing the datapath meanwhile waits for all of them
+ * (A312). Each flow leaves the list and the hardware in the same hold, and the
+ * books come out even. */
+static void a_mass_retirement_goes_in_batches(void)
+{
+    const unsigned n = 2 * FT_MC_RETIRE_BATCH + 3;
+    struct ft_mc_flow *f;
+    unsigned g;
+
+    reset();
+    for (g = 0; g < n; g++) {
+        struct br_ip any = group_v4(htonl(0xef050000 + g), 0, 0);
+
+        assert(ft_mc_membership(&BR, &P3, &any, true, false));
+        observe(seen_v4(&BR, &P1, htonl(0xef050000 + g), htonl(0x0a050000 | g), 0,
+                        false, SENDER));
+    }
+    assert(ft_mc_flow_count == n);
+    list_for_each_entry(f, &ft_mc_flows, list) {
+        f->hw = FAKE_HW;
+        f->hw_discard = true;
+        f->gone = true;
+    }
+    ft_mc_installed = ft_mc_discarding = n;
+    dels = most_hold_dels = waiters_let_in = 0;
+    ft_mc_work_fn(NULL);
+    assert(!ft_mc_flow_count && list_empty(&ft_mc_flows));
+    assert(dels == n && !ft_mc_installed && !ft_mc_discarding);
+    assert(most_hold_dels == FT_MC_RETIRE_BATCH);
+    assert(waiters_let_in == (n - 1) / FT_MC_RETIRE_BATCH);
+}
+
 /* A discard a membership still names gives its id up to a wanted stream and
  * stays a flow, parked: it takes none of the caps' places, as it took none
  * holding the id (A315). Counted, each such eviction took a place on its
@@ -4625,6 +4671,7 @@ int main(void)
     idle_flows_age_out();
     the_learner_keeps_a_bounded_number_of_flows();
     discards_leave_room_for_a_wanted_stream();
+    a_mass_retirement_goes_in_batches();
     an_evicted_named_discard_takes_no_place();
     parked_discards_are_bounded_by_ids();
     an_uncarried_flow_lives_while_its_stream_does();

@@ -1050,13 +1050,16 @@ static bool ft_mc_flow_named(const struct ft_mc_flow *f)
  * ports by definition, and forgetting it would let the next port join install
  * a flow the host is still listening to -- and a flow a route names is kept
  * with no membership left, because its copies are the other half of its set:
- * the entry goes only when both learners are done with it. Called with
- * ft_mc_lock held. */
-static void ft_mc_retire(struct list_head *dead, struct list_head *gone)
+ * the entry goes only when both learners are done with it. No more than
+ * FT_MC_RETIRE_BATCH flows with an entry go at once: true when more are
+ * waiting, for the caller to take after letting the transaction go. Called
+ * with ft_mc_lock held. */
+static bool ft_mc_retire(struct list_head *dead, struct list_head *gone)
 {
 	struct ft_mc_group *g, *gtmp;
 	struct ft_mc_flow *f, *ftmp;
-	bool retired = false;
+	unsigned int deletes = 0;
+	bool retired = false, more = false;
 
 	lockdep_assert_held(&ft_mc_lock);
 	list_for_each_entry_safe(g, gtmp, &ft_mc_groups, list) {
@@ -1079,6 +1082,12 @@ static void ft_mc_retire(struct list_head *dead, struct list_head *gone)
 		if (!f->gone && (ft_mc_flow_named(f) ||
 				 (f->hw && (f->dirty || ft_mc_discardable(f)))))
 			continue;
+		/* The rest wait for the caller's next hold. */
+		if (f->hw && deletes == FT_MC_RETIRE_BATCH) {
+			more = true;
+			break;
+		}
+		deletes += !!f->hw;
 		list_move(&f->list, gone);
 		ft_mc_flow_count--;
 		retired = true;
@@ -1088,6 +1097,7 @@ static void ft_mc_retire(struct list_head *dead, struct list_head *gone)
 	 * learned from, so it may be recorded again. */
 	if (retired)
 		ft_mc_forget_seen();
+	return more;
 }
 
 /* Tell each route whether an installed flow is carrying it. Called by the
@@ -1741,7 +1751,7 @@ bool ft_mc_evict_discard(u8 family)
  */
 static void ft_mc_work_fn(struct work_struct *work)
 {
-	bool want_hook, told, derive = false, filtered, brnf;
+	bool want_hook, told, derive = false, filtered, brnf, first, more;
 	struct ft_mc_group *g, *gtmp;
 	struct ft_mc_flow *f, *ftmp;
 	struct ft_mc_route *r;
@@ -1827,35 +1837,49 @@ static void ft_mc_work_fn(struct work_struct *work)
 	 * already out of the hardware, never gone from the list with its entry
 	 * still installed. ft_mc_lock is held only for the lists, not for the
 	 * hardware: nothing but this worker reaches a flow once it is off
-	 * them. */
-	cdx_ft_begin();
-	mutex_lock(&ft_mc_lock);
-	if (!ft_mc_stopping)
-		ft_mc_match_routes();
-	ft_mc_retire(&dead, &gone);
-	mutex_unlock(&ft_mc_lock);
-	list_for_each_entry(f, &gone, list) {
-		if (f->hw) {
-			/* Even while stopping. Skipping the delete would strand
-			 * the classifier entry, its group id and its listener
-			 * chain in hardware with nothing left to own them --
-			 * this flow is already off the list ft_mc_exit()
-			 * drains, so nobody else would ever see it. */
-			cdx_mc_group_del(&f->hw);
-			ft_mc_installed--;
-			ft_mc_discarding -= f->hw_discard;
-			f->hw_discard = false;
+	 * them.
+	 *
+	 * A batch at a time, each off the list and out of the hardware in its
+	 * own hold: a pass that retires every stream of a family at once lets
+	 * the transaction go between batches, and lets whatever waits on it --
+	 * /proc, the health probe, every other install -- have it before the
+	 * next, so a waiter waits for about a batch rather than for all of them
+	 * (A312). What a later batch would have taken is asked again when its
+	 * turn comes, still listed and still installed in between, which is all
+	 * the egress drain needs. */
+	for (first = true, more = true; more; first = false) {
+		cdx_ft_begin();
+		mutex_lock(&ft_mc_lock);
+		if (first && !ft_mc_stopping)
+			ft_mc_match_routes();
+		more = ft_mc_retire(&dead, &gone);
+		mutex_unlock(&ft_mc_lock);
+		list_for_each_entry(f, &gone, list) {
+			if (f->hw) {
+				/* Even while stopping. Skipping the delete
+				 * would strand the classifier entry, its group
+				 * id and its listener chain in hardware with
+				 * nothing left to own them -- this flow is
+				 * already off the list ft_mc_exit() drains, so
+				 * nobody else would ever see it. */
+				cdx_mc_group_del(&f->hw);
+				ft_mc_installed--;
+				ft_mc_discarding -= f->hw_discard;
+				f->hw_discard = false;
+			}
 		}
-	}
-	cdx_ft_end();
+		cdx_ft_end();
 
-	list_for_each_entry_safe(g, gtmp, &dead, list) {
-		list_del(&g->list);
-		ft_mc_group_free(g);
-	}
-	list_for_each_entry_safe(f, ftmp, &gone, list) {
-		list_del(&f->list);
-		ft_mc_flow_free(f);
+		list_for_each_entry_safe(g, gtmp, &dead, list) {
+			list_del(&g->list);
+			ft_mc_group_free(g);
+		}
+		list_for_each_entry_safe(f, ftmp, &gone, list) {
+			list_del(&f->list);
+			ft_mc_flow_free(f);
+		}
+		if (more)
+			cdx_ft_let_waiters();
 	}
 
 	/* Install or update whatever is now installable. One flow per pass

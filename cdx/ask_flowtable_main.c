@@ -623,9 +623,41 @@ static const struct seq_operations ft_seq_ops = {
 	.stop = ft_stop,
 	.show = ft_show,
 };
+/* What the header record takes: the counters, and a row for each bridged
+ * flow, each bridged membership waiting for one and each routed group, of
+ * about this length -- 215 bytes on average at the caps; one with long port
+ * lists runs to some 750, and a header that outgrows the guess doubles as
+ * before. Never more than FT_HEADER_MAX up front. */
+#define FT_HEADER_BYTES		(16 * 1024)
+#define FT_HEADER_ROW_BYTES	320
+#define FT_HEADER_MAX		(4U << 20)
+
 static int ft_open(struct inode *inode, struct file *file)
 {
-	return seq_open(file, &ft_seq_ops);
+	struct seq_file *seq;
+	size_t size;
+	int rc;
+
+	rc = seq_open(file, &ft_seq_ops);
+	if (rc)
+		return rc;
+	/* Room for the header in one go. seq_file starts from a page and
+	 * doubles, rendering the record again from the start each time, and
+	 * each render is a hold of the transaction of its own: six for the 517
+	 * rows a family's multicast caps make, any of which could wait behind
+	 * a batch of a learner's retirement (A312). Counted without the
+	 * learners' locks: a header that has outgrown the guess by the time
+	 * it is read is doubled as before. */
+	size = min_t(size_t, FT_HEADER_MAX, FT_HEADER_BYTES + FT_HEADER_ROW_BYTES *
+		     ((size_t)READ_ONCE(ft_mc_flow_count) + READ_ONCE(ft_mc_count) +
+		      READ_ONCE(ft_mr_count)));
+	if (size > PAGE_SIZE) {
+		seq = file->private_data;
+		seq->buf = kvmalloc(size, GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
+		if (seq->buf)
+			seq->size = size;
+	}
+	return 0;
 }
 
 static const struct proc_ops ft_proc_ops = {

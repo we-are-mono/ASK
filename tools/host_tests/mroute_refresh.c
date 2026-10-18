@@ -18,6 +18,7 @@ typedef int64_t s64;
 #define CDX_MC_MAX_LISTENERS 8
 #define FT_MR_MAX_RETRIES 4
 #define FT_MR_STATS_INTERVAL 5
+#define FT_MC_RETIRE_BATCH 16U
 /* Upstream's values, for the events a case queues. */
 #define FIB_EVENT_ENTRY_REPLACE 0
 #define FIB_EVENT_ENTRY_DEL 3
@@ -478,6 +479,8 @@ static void cdx_ft_begin(void)
     ctrl = 1;
 }
 static void cdx_ft_end(void) { assert(ctrl); ctrl = 0; }
+/* Between two batches of a retirement, with the transaction let go. */
+static void cdx_ft_let_waiters(void) { assert(!ctrl && !ft_mr_lock); }
 static void dev_hold(struct net_device *d) { d->refs++; }
 static void dev_put(struct net_device *d) { assert(d->refs); d->refs--; }
 static void mr_cache_put(struct mr_mfc *c) { assert(c->refs); c->refs--; }

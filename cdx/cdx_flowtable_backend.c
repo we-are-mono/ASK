@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* CDX ownership and hardware services for the Linux flowtable adapter. */
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/if_arp.h>
 #include <linux/module.h>
@@ -175,11 +176,40 @@ void cdx_flowtable_guard_exit(void)
 	}
 }
 
+/* Callers of cdx_ft_begin() waiting to take the transaction, for
+ * cdx_ft_let_waiters(). */
+static atomic_t cdx_ft_waiting = ATOMIC_INIT(0);
+
 void cdx_ft_begin(void)
 {
+	atomic_inc(&cdx_ft_waiting);
 	mutex_lock(&cdx_info->ctrl.mutex);
+	atomic_dec(&cdx_ft_waiting);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_begin, ASK_CDX_FLOWTABLE);
+
+/* The longest a job between two of its batches waits for others' turns. */
+#define CDX_FT_LET_WAITERS_MS 100
+
+/* For a job that goes in batches and has let the transaction go after one:
+ * wait until nobody is waiting to take it, or CDX_FT_LET_WAITERS_MS, before
+ * taking it again. A mutex released with waiters wakes one of them,
+ * and the releasing job, still running, takes it back ahead of the rest; a
+ * waiter passed over once has the next release handed to it, so each batch let
+ * one waiter through and the last of several waited for as many batches
+ * (A312). Bounded, so that a steady stream of others cannot keep the job from
+ * finishing. Without the transaction held. */
+void cdx_ft_let_waiters(void)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(CDX_FT_LET_WAITERS_MS);
+
+	might_sleep();
+	lockdep_assert_not_held(&cdx_info->ctrl.mutex);
+	while (atomic_read(&cdx_ft_waiting) && time_before(jiffies, deadline))
+		usleep_range(500, 1000);
+	cond_resched();
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_let_waiters, ASK_CDX_FLOWTABLE);
 
 bool cdx_ft_trybegin(void)
 {

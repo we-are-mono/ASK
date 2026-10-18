@@ -876,6 +876,19 @@ static void cdx_detour_flow_del(struct cdx_detour_flow *flow)
     detour_flows--;
 }
 #include "hardware_production.inc"
+/* What the transaction counts its waiters with, and what a job between two
+ * batches sleeps with while they take their turn (cdx_ft_let_waiters()); a
+ * sleep moves the clock its deadline is read against. */
+typedef struct { int counter; } atomic_t;
+#define ATOMIC_INIT(i) { (i) }
+#define atomic_inc(v) ((void)++(v)->counter)
+#define atomic_dec(v) ((void)--(v)->counter)
+#define atomic_read(v) ((v)->counter)
+#define msecs_to_jiffies(m) ((unsigned long)(m) * HZ / 1000)
+#define usleep_range(min, max) ((void)(min), (void)(max), (void)jiffies++)
+#define cond_resched() ((void)0)
+#define might_sleep() ((void)0)
+#define lockdep_assert_not_held(m) assert(!*(m))
 #include "backend_production.inc"
 
 static bool ft_latched(void) { return ft_failed; }

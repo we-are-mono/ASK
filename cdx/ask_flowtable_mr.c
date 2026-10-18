@@ -1853,7 +1853,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 	struct ft_mr_event *ev;
 	unsigned int restarts = 0, xt_seq, budget;
 	unsigned long unresolved;
-	bool retiring, more = false;
+	bool retiring, left, more = false;
 	LIST_HEAD(dead);
 
 	/* Registration may replay its dump after a sequence mismatch. Do not
@@ -1924,10 +1924,10 @@ again:
 	if (!READ_ONCE(ft_mr_stopping))
 		ft_mr_publish_taps();
 
-	/* 4. Entries the kernel has deleted. Off the list and out of the
-	 * hardware in one transaction hold, for the reason the bridged learner
-	 * retires its flows that way: the egress drain reads the list under
-	 * the transaction, and a group gone from it with its entry still
+	/* 4. Entries the kernel has deleted. Each off the list and out of the
+	 * hardware in the same transaction hold, for the reason the bridged
+	 * learner retires its flows that way: the egress drain reads the list
+	 * under the transaction, and a group gone from it with its entry still
 	 * installed is one the drain would vouch for without having seen.
 	 * Only this worker marks a group gone, so the look beforehand, which
 	 * spares a pass with nothing to retire the transaction, cannot miss
@@ -1939,12 +1939,23 @@ again:
 			break;
 		}
 	mutex_unlock(&ft_mr_lock);
-	if (retiring) {
+	for (left = retiring; left; ) {
+		unsigned int deletes = 0;
+
+		/* FT_MC_RETIRE_BATCH entries to a hold, as the bridged learner
+		 * retires (A312); the rest stay listed and installed until the
+		 * next. */
+		left = false;
 		cdx_ft_begin();
 		mutex_lock(&ft_mr_lock);
 		list_for_each_entry_safe(g, tmp, &ft_mr_groups, list) {
 			if (!g->gone)
 				continue;
+			if (g->hw && deletes == FT_MC_RETIRE_BATCH) {
+				left = true;
+				break;
+			}
+			deletes += !!g->hw;
 			list_move(&g->list, &dead);
 			ft_mr_count--;
 		}
@@ -1961,10 +1972,12 @@ again:
 			ft_mr_key_freed = true;
 		}
 		cdx_ft_end();
-	}
-	list_for_each_entry_safe(g, tmp, &dead, list) {
-		list_del(&g->list);
-		ft_mr_group_free(g);
+		list_for_each_entry_safe(g, tmp, &dead, list) {
+			list_del(&g->list);
+			ft_mr_group_free(g);
+		}
+		if (left)
+			cdx_ft_let_waiters();
 	}
 	/* Room again for an entry the cap turned away: the resync, at the top
 	 * of the next run, finds it. */
