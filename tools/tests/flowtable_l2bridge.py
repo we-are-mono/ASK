@@ -1158,7 +1158,13 @@ async def test_l2_packet_rate(l2_rig):
     from flowtable_nat_throughput import _dut_hops
     r = l2_rig
     await _exchange(r, count=4)
-    first = await _carried(r)
+    await _carried(r)
+    # Both baselines after a statistics pass: the pair's count reaches the
+    # adapter only on one, the ports' are read as they stand, and the pings'
+    # last frames, in the ports' baseline and not yet in the pair's, read as
+    # frames the pair matched and the WAN port never sent.
+    await asyncio.sleep(2.5)
+    first = await r.state()
     before = _pairs(r, first)[r.lan_port]
     count = int(PACKET_SENDER / PACKET_THREADS * PACKET_SECONDS)
     hops_before = await _dut_hops(r)
