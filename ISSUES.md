@@ -175,6 +175,10 @@ result independently of those temporary files.
   have crossed the CPU once already, on their way in from the Wi-Fi driver, so a flood costs the CPU there first.
   Fix direction: confirm Ethernet on port 10 as the receive ports do, then measure with the scheme counters.
 
+- [x] **A398 — under any IPsec policy, a flow whose first offer could not be built stayed in software until it expired.**
+  The return neighbour still resolving fails the rules; patch 176 retires the generation, so the next packet offers it
+  again (_:/^flowtable: offer again a flow whose neighbour was resolving_).
+
 - [-] **A394 — UDP from a jumbo LAN port into a standard path stays in software, not detoured.** Wontfix: a rare setup,
   correct in software; a jumbo flood through the offline port stalls the FMan HC (_:/^ISSUES: A393 and A394 stay_).
 

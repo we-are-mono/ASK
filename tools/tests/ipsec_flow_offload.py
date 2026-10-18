@@ -14,6 +14,14 @@ The tunnel runs between the DUT and the LAN VM, and the traffic is *forwarded*
 by the DUT rather than generated on it, which is the shape a gateway actually
 has. The test host is the far end of the forwarded flow, not of the tunnel.
 
+The connection is offered to hardware by its first reply, which is also the
+first packet the DUT sends the test host, so the DUT's neighbour entry for the
+host decides whether that offer can be built at all. `resolved` warms the entry
+first. `resolving` holds the DUT's ARP requests back until the first offer has
+failed: while a policy is configured no software refresh offers the flow again,
+so only the generation's retirement (kernel patch 176) brings the connection
+into hardware before its flow expires.
+
 Also asserted here, because it is what this increment exists to prevent: a flow
 whose policy resolves to no usable SA must be refused, never installed in the
 clear. Admission used to ask the *destination* whether it was transformed
@@ -44,6 +52,10 @@ COUNT = 60
 CIPHER = b"\xa5" * 16
 AUTH = b"\x5a" * 32
 TABLE = "ask_ipsec_flow"
+ARP_TABLE = "ask_ipsec_arp"
+# Well inside the 30 s a UDP flow lives without a refresh: an offer that is
+# never made again leaves the connection in software that long.
+ADMISSION_S = 10
 
 
 def quoted(*argv):
@@ -73,9 +85,32 @@ async def flows(session, agent):
     return rows
 
 
+async def hw_invalid_retired(session, agent):
+    """Flows GC has retired for an invalid hardware handle, on every CPU."""
+    result = await agent.fs_read(session, "/proc/net/stat/nf_flowtable", max_bytes=8192)
+    lines = bytes.fromhex(result.get("content_hex", "")).decode().splitlines()
+    column = lines[0].split().index("gc_hw_invalid")
+    return sum(int(line.split()[column]) for line in lines[1:] if line.strip())
+
+
+def exchange(sock, count):
+    """Datagrams the echo answered, of `count` sent one at a time."""
+    echoed = 0
+    for _ in range(count):
+        sock.sendto(b"y" * 512, (LAN_INNER, PORT))
+        try:
+            sock.recv(2048)
+            echoed += 1
+        except OSError:
+            pass
+        time.sleep(0.02)
+    return echoed
+
+
 @pytest.mark.usefixtures("splat_window")
+@pytest.mark.parametrize("neighbour", ["resolved", "resolving"])
 async def test_tunnelled_flow_is_steered_to_sec(
-    aiohttp_session, target_agent, lan,
+    aiohttp_session, target_agent, lan, neighbour,
 ):
     session = aiohttp_session
     spi = 0x0A880000 | (int.from_bytes(os.urandom(2), "big") or 1)
@@ -177,26 +212,55 @@ async def test_tunnelled_flow_is_steered_to_sec(
             cleanup.append(lambda: subprocess.run(["ip", "route", "del", *host_route],
                                                    check=True, capture_output=True))
 
-        before = await toenc(session, target_agent, TARGET_LAN_IF)
+        await dut("nft", "delete", "table", "arp", ARP_TABLE, check=False)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(1)
-        echoed = 0
-        for _ in range(COUNT):
-            sock.sendto(b"y" * 512, (LAN_INNER, PORT))
-            try:
-                sock.recv(2048)
-                echoed += 1
-            except OSError:
-                pass
-            time.sleep(0.02)
+        before = await toenc(session, target_agent, TARGET_LAN_IF)
+        retired = await hw_invalid_retired(session, target_agent)
+        # Answering the host's ping resolves the DUT's entry for the host,
+        # and confirms the host's for the DUT: it sends the DUT no ARP request
+        # for a while, which would hand the DUT the entry the resolving case
+        # takes away.
+        subprocess.run(["ping", "-c1", "-W2", os.environ["ASK_TARGET_IP"]],
+                       check=True, capture_output=True)
+        if neighbour == "resolving":
+            # The first reply is forwarded, offered and queued behind an ARP
+            # request that never leaves, so its offer cannot be built. ARP
+            # retries every second; the next one after the drop goes resolves.
+            await dut("ip", "neigh", "flush", "dev", TARGET_WAN_IF)
+            await dut("nft", f'''table arp {ARP_TABLE} {{
+ chain out {{ type filter hook output priority 0; policy accept;
+ oifname "{TARGET_WAN_IF}" arp operation request drop
+ }}
+}}''')
+            cleanup.append(lambda: dut("nft", "delete", "table", "arp", ARP_TABLE, check=False))
+            assert exchange(sock, 1) == 0, (
+                "the first reply reached the host, so its neighbour was not "
+                "resolving when the connection was offered")
+            await dut("nft", "delete", "table", "arp", ARP_TABLE)
+
+        def admitted(rows):
+            return ({row.get("out") for row in rows} >= {TARGET_LAN_IF, TARGET_WAN_IF})
+
+        start = time.monotonic()
+        rows = []
+        while not admitted(rows) and time.monotonic() - start < ADMISSION_S:
+            exchange(sock, 5)
+            rows = await flows(session, target_agent)
+        note("admission_s", round(time.monotonic() - start, 2))
+        middle = await toenc(session, target_agent, TARGET_LAN_IF)
+        echoed = exchange(sock, COUNT)
         sock.close()
         after = await toenc(session, target_agent, TARGET_LAN_IF)
         rows = await flows(session, target_agent)
+        retired = await hw_invalid_retired(session, target_agent) - retired
 
         forward = [row for row in rows if row.get("out") == TARGET_LAN_IF]
         reverse = [row for row in rows if row.get("out") == TARGET_WAN_IF]
         note("echoed", echoed)
-        note("toenc_delta", after - before)
+        note("toenc_admission", middle - before)
+        note("toenc_delta", after - middle)
+        note("hw_invalid_retired", retired)
         note("flows", "; ".join(
             f"{r.get('in')}->{r.get('out')} sa={r.get('sa')} packets={r.get('packets')}"
             for r in rows))
@@ -208,11 +272,20 @@ async def test_tunnelled_flow_is_steered_to_sec(
         assert reverse and reverse[0]["sa"] == "0", (
             f"the return direction has no policy and must carry no SA: {reverse}")
         assert echoed >= COUNT - 2, f"only {echoed} of {COUNT} echoed"
-        # One, not COUNT: the packet that travelled before the entry existed.
-        # More than a handful means the classifier is not doing the steering.
-        assert after - before <= 2, (
-            f"{after - before} frames reached SEC through the software path; the "
-            f"classifier should have steered all but the first")
+        if neighbour == "resolved":
+            # One, not all: the packet that travelled before the entry
+            # existed. More means the first offer did not install.
+            assert middle - before <= 2, (
+                f"{middle - before} frames reached SEC through the software path "
+                f"before admission; the first offer should have installed")
+        else:
+            assert retired >= 1, (
+                "no generation was retired for an invalid handle: the first offer "
+                "did not fail, so this run did not exercise its re-offer")
+        # None once both directions are in: the classifier steers them all.
+        assert after == middle, (
+            f"{after - middle} frames reached SEC through the software path with "
+            f"the entry installed; the classifier should have steered them all")
     finally:
         for undo in reversed(cleanup):
             try:

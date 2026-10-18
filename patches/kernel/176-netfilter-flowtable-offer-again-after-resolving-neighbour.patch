@@ -1,0 +1,61 @@
+From f3f365f30dad4881771b19d3dbc4e3786ba1e699 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 18 Oct 2026 13:23:45 +0200
+Subject: [PATCH] netfilter: flowtable: offer again a flow whose neighbour was
+ resolving
+
+flow_offload_work_add() builds both directions' rules before it asks any
+driver, and gives up on the whole flow when either cannot be built. One
+that often cannot is a neighbour still resolving: a connection is
+offered by its first packet after confirmation, for a request and its
+response the first reply, which can be the first packet sent to its
+destination.
+
+Software offers the flow again on its next refresh, about a second
+later. A table with hardware handles keeps every packet off the software
+fast path while any XFRM policy or blocking default is configured, so
+nothing refreshes such a flow, and the connection stays in software
+until the flow expires -- 30 seconds for UDP -- and is added afresh.
+
+Invalidate the flow's handle when its rules fail on a neighbour still
+resolving and nothing will refresh it. GC retires the generation, and
+the connection's next packet offers a fresh one. A failed neighbour, or
+any other failure to build the rules, waits for the flow to expire: a
+retry would only meet the same refusal.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ net/netfilter/nf_flow_table_offload.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+index 0c09e70..bbdc658 100644
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -363,8 +363,22 @@ static int flow_offload_eth_dst(struct net *net,
+ 		read_unlock_bh(&n->lock);
+ 		neigh_release(n);
+ 
+-		if (!(nud_state & NUD_VALID))
++		if (!(nud_state & NUD_VALID)) {
++			/* A neighbour still resolving fails both directions'
++			 * rules, and software offers the flow again on its next
++			 * refresh. While a policy keeps every packet of a table
++			 * with hardware handles off the software fast path
++			 * (xfrm_flowtable_enabled()) nothing refreshes it: retire
++			 * the generation, so that GC removes it and the
++			 * connection's next packet offers a fresh one. A failed
++			 * neighbour waits for the flow to expire, as a refusal
++			 * that would only recur.
++			 */
++			if (!(nud_state & NUD_FAILED) &&
++			    !xfrm_flowtable_enabled(net))
++				nf_flow_offload_handle_invalidate(flow->hw_handle);
+ 			return -ENOENT;
++		}
+ 		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+-- 
+2.47.3
+

@@ -115,6 +115,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://173-netfilter-nft_flow_offload-skip-br_netfilter-frames.patch \
            file://174-netfilter-flowtable-carry-transit-esp-and-ip-in-ip.patch \
            file://175-netfilter-port-probe-prerouting-input-device.patch \
+           file://176-netfilter-flowtable-offer-again-after-resolving-neighbour.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"
