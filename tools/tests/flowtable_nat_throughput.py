@@ -215,7 +215,13 @@ assert result.returncode == 0
                         and f"{WAN_IP}:{PORT}" in (f["src"], f["dst"])
                         and (bidirectional or f["in"] == (TARGET_WAN_IF if reverse else TARGET_LAN_IF))
                         and int(f["bytes"]) > max(1_000_000, 512 * int(f["packets"]))]
-                if len(bulk) == streams * (2 if bidirectional else 1):
+                # Each stream's other direction too: one whose admission found
+                # RTNL held (`busy`) is offered again by software's next
+                # refresh, up to a second after its sibling went in.
+                present = by_key(before)
+                if len(bulk) == streams * (2 if bidirectional else 1) and all(
+                        (TARGET_WAN_IF if f["in"] == TARGET_LAN_IF else TARGET_LAN_IF,
+                         number, f["new_dst"], f["new_src"]) in present for f in bulk):
                     break
                 assert not lan_task.done(), "iperf ended before hardware admission"
                 assert asyncio.get_running_loop().time() < deadline, before
@@ -242,6 +248,7 @@ assert result.returncode == 0
                 assert (reply["new_src"], reply["new_dst"]) == (row["dst"], row["src"]), reply
             tx_before, cpu_before = await software_tx(r), await cpu(r)
             await asyncio.sleep(WINDOW_SECONDS)
+            assert not lan_task.done(), "iperf ended inside the measurement window"
             cpu_after, tx_after = await cpu(r), await software_tx(r)
             after = await r.state()
             healthy(after)

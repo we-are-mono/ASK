@@ -144,7 +144,12 @@ print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout, 'stderr': r
         while True:
             record["admission"] = state = await r.state()
             data = _bulk(state, target, data_in, stale)
-            if len(data) == streams:
+            # Their acknowledgements too: a direction whose admission found
+            # RTNL held (`busy`) is offered again by software's next refresh,
+            # up to a second after its data went in.
+            rows = {(f["in"], f["src"], f["dst"]) for f in state["flows"] if f["proto"] == "6"}
+            if len(data) == streams and all(
+                    (f["out"], f["new_dst"], f["new_src"]) in rows for f in data):
                 break
             assert not task.done(), "iperf3 ended before every stream was in hardware"
             assert loop.time() < launched + admission, \
