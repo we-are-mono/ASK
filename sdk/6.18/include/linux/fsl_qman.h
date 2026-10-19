@@ -2146,6 +2146,18 @@ int qman_affine_portal_eqcr_fill(int cpu);
 int qman_affine_portal_dqrr_pending(int cpu);
 
 /**
+ * qman_drain_ern - consume pending enqueue rejection notifications
+ *
+ * Call on the owning CPU of each affine portal after stopping producers
+ * and draining their enqueue rings, from task context with interrupts
+ * off, not from an IPI: the FQ state-change and ERN callbacks it runs
+ * take spinlock_t, which a never-threaded hard interrupt must not. The
+ * MR must normally be IRQ-driven; concurrent polling of the same portal
+ * is not permitted.
+ */
+void qman_drain_ern(void);
+
+/**
  * qman_stop_dequeues - Stop h/w dequeuing to the s/w portal
  *
  * Disables DQRR processing of the portal. This is reference-counted, so
@@ -3602,6 +3614,17 @@ int qman_ceetm_cq_get_dequeue_statistics(struct qm_ceetm_cq *cq, u32 flags,
  * Return 0 for success or -EINVAL for unsuccessful command to empty CQ.
  */
 int qman_ceetm_drain_cq(struct qm_ceetm_cq *cq);
+
+/**
+ * qman_ceetm_cq_pop - dequeue a frame for software reclamation
+ * @cq: the class queue, with producers stopped
+ * @fd: receives a CPU-endian descriptor when the return value is 1
+ *
+ * Returns 1 for a frame (the caller owns its buffers), 0 for an empty queue,
+ * -EAGAIN while QMan prefetches a descriptor, or another negative error.
+ * Keep queue and buffer ownership context alive until the queue is empty.
+ */
+int qman_ceetm_cq_pop(struct qm_ceetm_cq *cq, struct qm_fd *fd);
 
 	/* ---------------------- */
 	/* CEETM :: logical FQIDs */

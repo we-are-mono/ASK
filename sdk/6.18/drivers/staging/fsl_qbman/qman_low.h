@@ -522,6 +522,17 @@ static inline u8 qm_eqcr_get_avail(struct qm_portal *portal)
 	return eqcr->available;
 }
 
+/* CI stashing can leave the cached index behind the final one or two
+ * completions. Teardown must read the hardware consumer index without
+ * advancing the cached accounting used by later enqueue operations. */
+static inline u8 qm_eqcr_get_hw_fill(struct qm_portal *portal)
+{
+	struct qm_eqcr *eqcr = &portal->eqcr;
+	u8 ci = qm_in(EQCR_CI_CINH) & (QM_EQCR_SIZE - 1);
+
+	return qm_cyc_diff(QM_EQCR_SIZE, ci, EQCR_PTR2IDX(eqcr->cursor));
+}
+
 static inline u8 qm_eqcr_get_fill(struct qm_portal *portal)
 {
 	register struct qm_eqcr *eqcr = &portal->eqcr;

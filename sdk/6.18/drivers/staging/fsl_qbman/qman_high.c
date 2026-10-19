@@ -1604,6 +1604,31 @@ u32 qman_p_poll_slow(struct qman_portal *p)
 }
 EXPORT_SYMBOL(qman_p_poll_slow);
 
+void qman_drain_ern(void)
+{
+	struct qman_portal *p = get_raw_affine_portal();
+	unsigned long irqflags;
+
+	/* The message ring's FQ state-change and ERN callbacks take spinlock_t,
+	 * which lockdep's raw-nesting check allows in task context and in the
+	 * portal's own (threadable) IRQ handler, not in an IPI. */
+	lockdep_assert_RT_in_threaded_ctx();
+#ifdef CONFIG_FSL_DPA_PORTAL_SHARE
+	if (p->sharing_redirect)
+		goto out;
+#endif
+	/* The owner normally consumes MR entries from its IRQ handler. */
+	local_irq_save(irqflags);
+	__poll_portal_slow(p, QM_PIRQ_MRI);
+	qm_isr_status_clear(&p->p, QM_PIRQ_MRI);
+	local_irq_restore(irqflags);
+#ifdef CONFIG_FSL_DPA_PORTAL_SHARE
+out:
+#endif
+	put_affine_portal();
+}
+EXPORT_SYMBOL(qman_drain_ern);
+
 void qman_p_stop_dequeues(struct qman_portal *p)
 {
 	qman_stop_dequeues_ex(p);
@@ -2629,7 +2654,7 @@ int qman_eqcr_is_empty(void)
 
 	PORTAL_IRQ_LOCK(p, irqflags);
 	update_eqcr_ci(p, 0);
-	avail = qm_eqcr_get_fill(&p->p);
+	avail = qm_eqcr_get_hw_fill(&p->p);
 	PORTAL_IRQ_UNLOCK(p, irqflags);
 	put_affine_portal();
 	return avail == 0;
@@ -3699,10 +3724,10 @@ static int qman_ceetm_cq_peek_pop_xsfdrread(struct qm_ceetm_cq *cq,
 	switch (command_type) {
 	case 0:
 	case 1:
-		mcc->cq_ppxr.cqid = (cq->parent->idx << 4) | cq->idx;
+		mcc->cq_ppxr.cqid = cpu_to_be16((cq->parent->idx << 4) | cq->idx);
 		break;
 	case 2:
-		mcc->cq_ppxr.xsfdr = xsfdr;
+		mcc->cq_ppxr.xsfdr = cpu_to_be16(xsfdr);
 		break;
 	default:
 		break;
@@ -3715,15 +3740,17 @@ static int qman_ceetm_cq_peek_pop_xsfdrread(struct qm_ceetm_cq *cq,
 	DPA_ASSERT((mcr->verb & QM_MCR_VERB_MASK) ==
 				QM_CEETM_VERB_CQ_PEEK_POP_XFDRREAD);
 
+	/* The result belongs to this portal only while we hold its lock. */
+	res = mcr->result;
+	if (res == QM_MCR_RESULT_OK)
+		*cq_ppxr = mcr->cq_ppxr;
 	PORTAL_IRQ_UNLOCK(p, irqflags);
 	put_affine_portal();
 
-	res = mcr->result;
 	if (res != QM_MCR_RESULT_OK) {
 		pr_err("CEETM: CQ PEEK/POP/XSFDR READ failed\n");
 		return -EIO;
 	}
-	*cq_ppxr = mcr->cq_ppxr;
 	return 0;
 }
 
@@ -5362,6 +5389,26 @@ int qman_ceetm_cq_get_dequeue_statistics(struct qm_ceetm_cq *cq, u32 flags,
 }
 EXPORT_SYMBOL(qman_ceetm_cq_get_dequeue_statistics);
 
+int qman_ceetm_cq_pop(struct qm_ceetm_cq *cq, struct qm_fd *fd)
+{
+	struct qm_mcr_ceetm_cq_peek_pop_xsfdrread ppxr;
+	int ret;
+
+	ret = qman_ceetm_cq_peek_pop_xsfdrread(cq, 1, 0, &ppxr);
+	if (ret)
+		return ret;
+	/* The last frame can carry both the valid and empty bits. */
+	if (ppxr.stat & 0x1) {
+		*fd = ppxr.fd;
+		hw_fd_to_cpu(fd);
+		return 1;
+	}
+	if (ppxr.stat & 0x2)
+		return 0;
+	return -EAGAIN; /* QMan is still prefetching the next descriptor. */
+}
+EXPORT_SYMBOL(qman_ceetm_cq_pop);
+
 int qman_ceetm_drain_cq(struct qm_ceetm_cq *cq)
 {
 	struct qm_mcr_ceetm_cq_peek_pop_xsfdrread ppxr;
@@ -5404,8 +5451,10 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
 		return -ENODEV;
 	}
 	p = kmalloc(sizeof(*p), GFP_KERNEL);
-	if (!p)
-		return -ENOMEM;
+	if (!p) {
+		ret = -ENOMEM;
+		goto release_lfqid;
+	}
 	memset(&lfqmt_config, 0, sizeof(struct qm_mcc_ceetm_lfqmt_config));
 	p->idx = lfqid;
 	p->dctidx = (u16)(lfqid & CEETM_LFQMT_LFQID_LSB);
@@ -5422,10 +5471,18 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
 				lfqid, cq->idx);
 		list_del(&p->node);
 		kfree(p);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto release_lfqid;
 	}
 	*lfq = p;
 	return 0;
+
+release_lfqid:
+	if (cq->parent->dcp_idx == qm_dc_portal_fman0)
+		qman_release_ceetm0_lfqid(lfqid);
+	else
+		qman_release_ceetm1_lfqid(lfqid);
+	return ret;
 }
 EXPORT_SYMBOL(qman_ceetm_lfq_claim);
 
