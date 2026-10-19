@@ -390,11 +390,15 @@ static int lp5812_register_leds(struct lp5812_led *led, struct lp5812_chip *chip
 
 	for (i = 0; i < num_channels; i++) {
 		each = led + i;
+		/* Set before registration: the classdev is live once
+		 * lp5812_init_led() returns and the brightness ops
+		 * dereference chip.
+		 */
+		each->chip = chip;
+
 		ret = lp5812_init_led(each, chip, i);
 		if (ret)
 			goto err_init_led;
-
-		each->chip = chip;
 
 		for (j = 0; j < chip->led_config[i].num_colors; j++) {
 			ret = lp5812_auto_dc(chip, chip->led_config[i].led_id[j],
