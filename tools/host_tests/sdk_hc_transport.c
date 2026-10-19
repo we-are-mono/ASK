@@ -17,10 +17,18 @@
 /* Every line the transport would print, counted: a run of failures a caller
  * retries on a timer must report its first only, and the command that ends
  * the run one line more. */
-static unsigned reports, recoveries;
+static unsigned reports, recoveries, lates, stacks;
 #define REPORT_ERROR(level, err, msg) (reports++)
 #define RETURN_ERROR(level, err, msg) do { reports++; return ERROR_CODE(err); } while (0)
 #define pr_info(...) (recoveries++)
+/* The confirmation of the command that timed out says how late it came. */
+#define pr_warn(...) (lates++)
+/* A timeout shows who asked for its command. */
+#define dump_stack() (stacks++)
+/* Time advances only with the transport's own polling, at a modelled HZ of
+ * 250: a jiffy is 40 polls of 100 us. */
+static unsigned long jiffies;
+static uint32_t jiffies_to_msecs(unsigned long j) { return j * 4; }
 #define DBG(level, msg) ((void)0)
 #include "hc_layout.inc"
 
@@ -97,7 +105,8 @@ static void confirm(void)
 void XX_UDelay(uint32_t usecs)
 {
     assert(usecs == HC_CONFIRM_POLL_US && !((struct spin *)active->h_Spinlock)->held);
-    if (++delays == confirm_at) confirm();
+    if (!(++delays % 40)) jiffies++;
+    if (delays == confirm_at) confirm();
 }
 static int qman_enqueue(struct qman_fq *fq, const struct qm_fd *fd, u32 flags)
 {
@@ -190,6 +199,8 @@ static void rejection_and_completion(void)
     confirm_at = HC_CONFIRM_POLLS; /* Completion at the deadline wins. */
     assert(FmHcPcdSync(hc) == E_OK && !hc->failed);
     assert(delays == HC_CONFIRM_POLLS && !hc->nextSeqNumLocation);
+    /* Commands confirmed in time, even at the deadline, were never late. */
+    assert(!lates && !stacks);
     assert(FmAllowHcUsage(hc, false) == E_OK && !FmIsHcUsageAllowed(hc));
     assert(FmAllowHcUsage(hc, true) == E_OK);
     dispose(hc);
@@ -204,10 +215,18 @@ static void timeout_and_late_confirmation(bool before_return)
         assert(FmAllowHcUsage(hc, false) == E_OK);
         assert(!FmIsHcUsageAllowed(hc));
     }
-    unsigned reported = reports;
+    unsigned reported = reports, late = lates, stacked = stacks;
     assert(!FmHcIsFailed(hc));
     assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_TIMEOUT);
+    assert(stacks == stacked + 1);
     assert(hc->failed && delays == HC_CONFIRM_POLLS && submissions == 1);
+    /* The timeout names its command: the sync, taken in CPU order before the
+     * enqueue swapped the frame, sent a full deadline ago. */
+    assert(hc->sentOpcode[0] == (HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC));
+    assert(hc->timedOut[0] == !before_return);
+    assert(jiffies_to_msecs(jiffies - hc->sentAt[0]) == 1000);
+    /* Confirmed before the caller's PutBuf, the command was still late. */
+    assert(lates == late + before_return);
     /* One that timed out unconfirmed has failed the channel until reset,
      * which is what an owner asks before it stops waiting on barriers. */
     assert(FmHcIsFailed(hc));
@@ -235,17 +254,38 @@ static void timeout_and_late_confirmation(bool before_return)
             assert(borrowed[n] && borrowed[n] != hc->p_Frm[0]);
         }
         assert(!GetBuf(hc, &unused));
+        assert(lates == late);
         confirm();
+        /* The orphan's own confirmation says it was late, once. */
+        assert(lates == late + 1);
         assert(hc->nextSeqNumLocation == HC_CMD_POOL_SIZE - 1);
         t_HcFrame *reclaimed = GetBuf(hc, &unused);
         assert(reclaimed == hc->p_Frm[0] && unused == 0);
         for (unsigned n = 1; n < HC_CMD_POOL_SIZE; n++) PutBuf(hc, borrowed[n], seq[n]);
         PutBuf(hc, reclaimed, unused);
-        /* SDK rejects a duplicate CPU-order confirmation without double free. */
+        /* SDK rejects a duplicate CPU-order confirmation without double free,
+         * and without calling it late a second time. */
         FmHcTxConf(hc, (t_DpaaFD *)&pending.fd);
+        assert(lates == late + 1);
     }
     assert(!hc->nextSeqNumLocation && hc->failed && FmHcIsFailed(hc));
     refuses_teardown(hc); /* A late confirmation does not repair caller state. */
+    dispose(hc);
+}
+static void timeout_on_a_later_command(void)
+{
+    /* The command that times out is not the first frame: its own record is
+     * the one that says it was late. */
+    t_FmHc *hc = setup();
+    uint32_t seq;
+    t_HcFrame *frame = GetBuf(hc, &seq);
+    unsigned late = lates;
+    assert(seq == 0);
+    assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_TIMEOUT);
+    assert(hc->timedOut[1] && !hc->timedOut[0] && lates == late);
+    confirm();
+    assert(!hc->timedOut[1] && lates == late + 1);
+    PutBuf(hc, frame, seq);
     dispose(hc);
 }
 static void pool_and_cleanup(void)
@@ -288,6 +328,7 @@ static void exhausted_pool(void)
 static void independent_commands_and_invalid_confirmation(void)
 {
     t_FmHc *hc = setup();
+    unsigned late = lates;
     nested_command = true;
     assert(FmHcPcdSync(hc) == E_OK);
     assert(submissions == 2 && !delays && !hc->nextSeqNumLocation);
@@ -302,6 +343,8 @@ static void independent_commands_and_invalid_confirmation(void)
     DPAA_FD_SET_ADDR(&fd, (void *)16);
     FmHcTxConf(hc, &fd); /* Unknown address must not be dereferenced. */
     assert(hc->nextSeqNumLocation == 1);
+    /* Neither the nested completions nor rejected frames were late. */
+    assert(lates == late);
     PutBuf(hc, frame, seq);
     dispose(hc);
 }
@@ -313,9 +356,10 @@ int main(void)
     rejection_and_completion();
     timeout_and_late_confirmation(false);
     timeout_and_late_confirmation(true);
+    timeout_on_a_later_command();
     pool_and_cleanup();
     exhausted_pool();
     independent_commands_and_invalid_confirmation();
-    puts("SDK HC transport: rejection/retry, deadline, timeout, late confirmation, pool, teardown and failure reporting passed");
+    puts("SDK HC transport: rejection/retry, deadline, timeout, late confirmation of any command, pool, teardown and failure reporting passed");
     return 0;
 }

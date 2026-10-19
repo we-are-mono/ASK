@@ -152,6 +152,15 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A401 — a host command timed out in production; offload stayed off until reboot (reopens A343).** Zamanifi, OpenWrt
+  r1792438435 with ASK 1.1.4, 148 s after boot: `EnQFrm` timed out on the `fm_ehash` barrier's sync, the channel latched
+  failed, and `quarantine` stayed at 564 with admission off. Afterwards the FMan was healthy (RISCs ~3 %, no bus or ECC
+  error, command queue empty), no frame queue held a frame, task slots matched a healthy DUT, irqbalance was off;
+  802.3x PAUSE is on on every port. Not reproduced on the DUT with the same image, packages and config, WAN on 1G eth0:
+  175k installs with the WAN saturated, then 30 two-second PAUSE bursts on the LAN port under churn. Fix direction: the
+  timeout now names its command, wait and what else was outstanding with the call chain that asked for it, and a late
+  confirmation reports itself; read the next occurrence, then the microcode's sync handler.
+
 - [ ] **A400 — a 10G MAC at 2500base-x would take a 1G MAC's interrupt and frame-limit slots.** `macdev2enetinterface()`
   (sdk_dpaa/mac-api.c, patch 110) gives SPEED_2500 `e_ENET_MODE_SGMII_2500`, whose speed is below 10000, so memac files
   MAC9/MAC10 as 1G MAC 0/1: MAC1's or MAC2's slots (MAC2 is live on the DK). 1000base-x got the 10G speed in patch 110;

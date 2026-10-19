@@ -1,4 +1,4 @@
-From f1e7e5cb3b73545400c7226a94438d42fc2210e6 Mon Sep 17 00:00:00 2001
+From b147f55e779515451e5c639f0df596a2a215942d Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -71,6 +71,10 @@ Reject ordinary keygen schemes without a network environment.
 Track HC buffer ownership through enqueue rejection, completion and
 timeout. Quarantine accepted unconfirmed frames and latch timeout failure
 until board reset; keep QMan acceptance separate from SDK completion.
+A timeout names its command (sequence, opcode, the HC builder, time
+waited and what else was outstanding) with the call chain that asked for
+it, and each timed-out command still confirmed says how late it came:
+the one thing a timeout cannot.
 
 Build KG scheme changes in a private candidate, publish only after
 successful programming, and balance failed lock acquisitions. Preserve
@@ -111,7 +115,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
  .../freescale/sdk_dpaa/offline_port.c         |   51 +
  .../net/ethernet/freescale/sdk_fman/Kconfig   |   13 +-
- .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  353 +-
+ .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  419 +-
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
  .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
@@ -182,7 +186,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 83 files changed, 8237 insertions(+), 12443 deletions(-)
+ 83 files changed, 8303 insertions(+), 12443 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -1961,19 +1965,20 @@ index 3a6d1810b525..450cd15d0fd1 100644
  config FSL_SDK_FMAN_RTC_API
  	bool "FMan RTC (1588 timer) APIs"
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-index 80fb535231b9..7a3497d94c6e 100644
+index 80fb535231b9..9235b8b22ba1 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-@@ -32,6 +32,8 @@
+@@ -32,6 +32,9 @@
   */
  #define __ERR_MODULE__  MODULE_FM
  
++#include <linux/jiffies.h>
 +#include <linux/printk.h>
 +
  #include "std_ext.h"
  #include "error_ext.h"
  #include "sprint_ext.h"
-@@ -50,20 +52,7 @@
+@@ -50,20 +53,7 @@
  #define HC_HCOR_OPCODE_KG_SCM                                   0x1
  #define HC_HCOR_OPCODE_SYNC                                     0x2
  #define HC_HCOR_OPCODE_CC                                       0x3
@@ -1994,7 +1999,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_CMD_SHIFT       24
  #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_BPID            16
  
-@@ -79,7 +68,12 @@
+@@ -79,7 +69,12 @@
  #define SIZE_OF_HC_FRAME_PROFILE_CNT        (sizeof(t_HcFrame)-sizeof(t_FmPcdPlcrProfileRegs)+sizeof(uint32_t))
  #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
  
@@ -2007,7 +2012,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  
  #define BUILD_FD(len)                     \
  do {                                      \
-@@ -111,8 +105,6 @@ typedef struct t_HcFrame {
+@@ -111,8 +106,6 @@ typedef struct t_HcFrame {
          volatile uint32_t                       singleRegForWrite;    /* for writing SP, CPP, profile counter */
          t_FmPcdKgPortRegs                       portRegsForRead;
          volatile uint32_t                       clsPlanEntries[CLS_PLAN_NUM_PER_GRP];
@@ -2016,7 +2021,7 @@ index 80fb535231b9..7a3497d94c6e 100644
      } hcSpecificData;
  } t_HcFrame;
  
-@@ -121,6 +113,13 @@ typedef struct t_HcFrame {
+@@ -121,6 +114,13 @@ typedef struct t_HcFrame {
  #endif /* defined(__MWERKS__) && ... */
  
  
@@ -2030,7 +2035,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  typedef struct t_FmHc {
      t_Handle                    h_FmPcd;
      t_Handle                    h_HcPortDev;
-@@ -132,11 +131,55 @@ typedef struct t_FmHc {
+@@ -132,11 +132,88 @@ typedef struct t_FmHc {
      uint32_t                    seqNum[HC_CMD_POOL_SIZE];   /* FIFO of seqNum to use when
                                                                 taking buffer */
      uint32_t                    nextSeqNumLocation;         /* seqNum location in seqNum[] for next buffer */
@@ -2042,8 +2047,41 @@ index 80fb535231b9..7a3497d94c6e 100644
 +    bool                        quiescing;    /* No new borrowers during teardown. */
 +    uint32_t                    failures;     /* Failed since a command last completed. */
      t_HcFrame                   *p_Frm[HC_CMD_POOL_SIZE];
++    /* What each command in flight is and when it went out, taken before the
++     * enqueue swaps the frame to hardware order: a timeout names its command,
++     * and that command's confirmation, should it still come, says how late. */
++    uint32_t                    sentOpcode[HC_CMD_POOL_SIZE];
++    unsigned long               sentAt[HC_CMD_POOL_SIZE];
++    /* Each command that timed out, until its confirmation (if any) says how
++     * late it was: commands in flight together can each time out. */
++    bool                        timedOut[HC_CMD_POOL_SIZE];
  } t_FmHc;
  
++static const char *HcOpcodeName(uint32_t opcode)
++{
++    switch (opcode & ~HC_HCOR_GBL)
++    {
++        case HC_HCOR_OPCODE_PLCR_PRFL:                 return "policer profile";
++        case HC_HCOR_OPCODE_KG_SCM:                    return "KeyGen scheme";
++        case HC_HCOR_OPCODE_SYNC:                      return "sync";
++        case HC_HCOR_OPCODE_CC:                        return "coarse classification";
++        case HC_HCOR_OPCODE_CC_IP_FRAG_INITIALIZATION: return "IP fragmentation init";
++        default:                                       return "unknown";
++    }
++}
++
++/* Caller holds the HC lock. */
++static uint32_t HcOutstanding(t_FmHc *p_FmHc)
++{
++    uint32_t i, n = 0;
++
++    for (i = 0; i < HC_CMD_POOL_SIZE; i++)
++        if (p_FmHc->bufState[i] == e_HC_BUF_IN_FLIGHT ||
++            p_FmHc->bufState[i] == e_HC_BUF_ORPHANED)
++            n++;
++    return n;
++}
++
 +static uint32_t HcLock(t_FmHc *p_FmHc)
 +{
 +    return XX_LockIntrSpinlock(p_FmHc->h_Spinlock);
@@ -2088,7 +2126,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  
  static t_Error FillBufPool(t_FmHc *p_FmHc)
  {
-@@ -163,6 +206,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
+@@ -163,6 +240,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
      for (i = 0; i < HC_CMD_POOL_SIZE; i++)
      {
          p_FmHc->seqNum[i] = i;
@@ -2096,7 +2134,7 @@ index 80fb535231b9..7a3497d94c6e 100644
      }
      p_FmHc->nextSeqNumLocation = 0;
  
-@@ -175,19 +219,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
+@@ -175,19 +253,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
  
      ASSERT_COND(p_FmHc);
  
@@ -2122,7 +2160,7 @@ index 80fb535231b9..7a3497d94c6e 100644
      return p_FmHc->p_Frm[*p_SeqNum];
  }
  
-@@ -195,40 +241,73 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
+@@ -195,40 +275,88 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
  {
      uint32_t    intFlags;
  
@@ -2164,6 +2202,8 @@ index 80fb535231b9..7a3497d94c6e 100644
 +    }
 +    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY);
 +    p_FmHc->bufState[seqNum] = e_HC_BUF_IN_FLIGHT;
++    p_FmHc->sentOpcode[seqNum] = p_FmHc->p_Frm[seqNum]->opcode;
++    p_FmHc->sentAt[seqNum] = jiffies;
 +    HcUnlock(p_FmHc, intFlags);
      DBG(TRACE, ("Send Hc, SeqNum %d, buff@0x%p, fd offset 0x%x",
                  seqNum,
@@ -2204,10 +2244,23 @@ index 80fb535231b9..7a3497d94c6e 100644
 +            /* A late confirmation can reclaim the frame, but cannot repair
 +             * caller software state. Do not reopen HC or permit a switch to
 +             * direct-register programming; recovery requires a board reset. */
++            uint32_t opcode = p_FmHc->sentOpcode[seqNum];
++            uint32_t waited = jiffies_to_msecs(jiffies - p_FmHc->sentAt[seqNum]);
++            uint32_t others = HcOutstanding(p_FmHc) - 1;
++
 +            p_FmHc->failed = TRUE;
++            p_FmHc->timedOut[seqNum] = TRUE;
 +            p_FmHc->failures++;
 +            HcUnlock(p_FmHc, intFlags);
-+            RETURN_ERROR(MINOR, E_TIMEOUT, ("HC confirmation timed out; board reset required"));
++            /* The builder below is the HC entry point; who asked for the
++             * command -- an ehash insert or delete barrier, a quarantine
++             * drain -- is further up. At most HC_CMD_POOL_SIZE of these,
++             * ever: the channel stays failed. */
++            dump_stack();
++            RETURN_ERROR(MINOR, E_TIMEOUT,
++                         ("HC confirmation timed out; board reset required: seq %u, %s (opcode 0x%08x) built by %pS, unconfirmed after %u ms, %u other commands outstanding",
++                          seqNum, HcOpcodeName(opcode), opcode,
++                          __builtin_return_address(0), waited, others));
 +        }
 +        HcUnlock(p_FmHc, intFlags);
 +        XX_UDelay(HC_CONFIRM_POLL_US);
@@ -2215,7 +2268,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  }
  
  
-@@ -251,6 +330,12 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -251,6 +379,12 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      p_FmHc->h_QmArg             = p_FmHcParams->params.h_QmArg;
      p_FmHc->dataMemId           = DEFAULT_dataMemId;
      p_FmHc->usageAllowed		= TRUE;
@@ -2228,7 +2281,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  
      err = FillBufPool(p_FmHc);
      if (err != E_OK)
-@@ -278,7 +363,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -278,7 +412,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      if (!p_FmHc->h_HcPortDev)
      {
          REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM HC port!"));
@@ -2237,7 +2290,7 @@ index 80fb535231b9..7a3497d94c6e 100644
          return NULL;
      }
  
-@@ -312,13 +397,43 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -312,13 +446,43 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      return (t_Handle)p_FmHc;
  }
  
@@ -2283,7 +2336,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  
      for (i=0; i<HC_CMD_POOL_SIZE; i++)
          if (p_FmHc->p_Frm[i])
-@@ -326,10 +441,9 @@ void FmHcFree(t_Handle h_FmHc)
+@@ -326,10 +490,9 @@ void FmHcFree(t_Handle h_FmHc)
          else
              break;
  
@@ -2296,7 +2349,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  }
  
  /*****************************************************************************/
-@@ -338,16 +452,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
+@@ -338,16 +501,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
  {
      t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
      int     i;
@@ -2328,11 +2381,13 @@ index 80fb535231b9..7a3497d94c6e 100644
  }
  
  void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
-@@ -355,20 +483,27 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
+@@ -355,20 +532,44 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
      t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
      t_HcFrame   *p_HcFrame;
      uint32_t    intFlags;
 +    uint32_t    seqNum;
++    bool        late = FALSE;
++    uint32_t    opcode = 0, waited = 0;
  
      ASSERT_COND(p_FmHc);
  
@@ -2353,17 +2408,32 @@ index 80fb535231b9..7a3497d94c6e 100644
 +        (p_FmHc->bufState[seqNum] != e_HC_BUF_IN_FLIGHT &&
 +         p_FmHc->bufState[seqNum] != e_HC_BUF_ORPHANED))
          REPORT_ERROR(MINOR, E_INVALID_FRAME, ("Not an Host-Command frame received!"));
-+    else if (p_FmHc->bufState[seqNum] == e_HC_BUF_ORPHANED)
-+        ReturnBuf(p_FmHc, seqNum);
      else
 -        p_FmHc->enqueued[p_HcFrame->commandSequence] = FALSE;
 -    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
-+        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
++    {
++        /* A command that timed out answering after all says it was late
++         * rather than lost: the one thing a timeout cannot tell. */
++        if (p_FmHc->timedOut[seqNum])
++        {
++            p_FmHc->timedOut[seqNum] = FALSE;
++            late = TRUE;
++            opcode = p_FmHc->sentOpcode[seqNum];
++            waited = jiffies_to_msecs(jiffies - p_FmHc->sentAt[seqNum]);
++        }
++        if (p_FmHc->bufState[seqNum] == e_HC_BUF_ORPHANED)
++            ReturnBuf(p_FmHc, seqNum);
++        else
++            p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
++    }
 +    HcUnlock(p_FmHc, intFlags);
++    if (late)
++        pr_warn("FM HC: seq %u, %s (opcode 0x%08x), confirmed %u ms after it was sent, after its timeout\n",
++                seqNum, HcOpcodeName(opcode), opcode, waited);
  }
  
  t_Error FmHcPcdKgSetScheme(t_Handle                    h_FmHc,
-@@ -704,32 +839,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
+@@ -704,32 +905,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
      return E_OK;
  }
  
@@ -2396,7 +2466,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragScratchPoolCmdParams *p_FmPcdCcFragScratchPoolCmdParams)
  {
      t_FmHc                              *p_FmHc = (t_FmHc*)h_FmHc;
-@@ -768,40 +877,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
+@@ -768,40 +943,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
      return E_OK;
  }
  
@@ -2437,7 +2507,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  t_Error FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId, uint32_t requiredAction)
  {
      t_FmHc              *p_FmHc = (t_FmHc*)h_FmHc;
-@@ -1205,9 +1280,11 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
+@@ -1205,9 +1346,11 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
  
      ASSERT_COND(p_FmHc);
  
@@ -2450,7 +2520,7 @@ index 80fb535231b9..7a3497d94c6e 100644
      memset(p_HcFrame, 0, sizeof(t_HcFrame));
      /* first read SP register */
      p_HcFrame->opcode = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC);
-@@ -1221,8 +1298,9 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
+@@ -1221,8 +1364,9 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
  
      PutBuf(p_FmHc, p_HcFrame, seqNum);
  
@@ -2461,7 +2531,7 @@ index 80fb535231b9..7a3497d94c6e 100644
  
      return E_OK;
  }
-@@ -1233,20 +1311,53 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc)
+@@ -1233,20 +1377,53 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc)
      return p_FmHc->h_HcPortDev;
  }
  
