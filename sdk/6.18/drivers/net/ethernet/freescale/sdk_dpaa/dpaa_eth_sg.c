@@ -158,6 +158,7 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
 	char *new_buf, *ptr_buf;
 	dma_addr_t addr;
 	int ii,entries_in_bmb,buffs2fill;
+	int err = -ENOMEM;
 	struct device *dev = dpa_bp->dev;
 	struct sk_buff *skb = NULL, **skbh;
 	uint32_t bufsize;
@@ -231,10 +232,10 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
 				pr_err_ratelimited("%s(%d) ii %d buffs2fill %d dma_mapping_error failed \n",
 						__func__,__LINE__,ii,buffs2fill);
 				if (act_skb)
-				{
 					kfree_skb(skb);
-				}
-				kfree(new_buf);
+				else
+					kfree(new_buf);
+				err = -EIO;
 				goto handle_fail;
 			}
 			bm_buffer_set64(&bmb[ii], addr);
@@ -253,7 +254,9 @@ handle_fail:
 		while (unlikely(bman_release(dpa_bp->pool, bmb, ii, 0)))
 			cpu_relax();
 	}
-	return ii+buffs2fill;
+	/* Zero buffers seeded is still a failure. The caller owns every
+	 * buffer already released to BMan and must drain its pool. */
+	return err;
 
 }
 EXPORT_SYMBOL(dpaa_bp_alloc_n_add_buffs);
