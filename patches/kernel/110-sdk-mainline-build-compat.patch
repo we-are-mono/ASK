@@ -1,4 +1,4 @@
-From 179c70ca1e8a79a919e68897400d1b17003830a0 Mon Sep 17 00:00:00 2001
+From 1e338aa326d6432a20f4979ab4494dadfb85c9e5 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 23 Aug 2026 18:48:54 +0200
 Subject: [PATCH] sdk: build the vendored SDK on stock mainline
@@ -39,6 +39,23 @@ SDK source alignment (sdk_dpaa/mac.c):
    macro in this patch would collapse 702's switch cases onto the 2500BASEX
    cases (duplicate-case build error) once a 702-carrying tree consumes it.
 
+MAC interface modes (sdk_dpaa/mac-api.c, mac.c, sdk_fman memac.c):
+ - macdev2enetinterface() indexes its _100[]/_1000[] tables with mainline's
+   phy_interface_t, which has outgrown them: "1000base-x" (22) read past the
+   20-entry _1000[] into whatever the link placed after it (UBSAN). Firmware
+   that runs SFP1's SerDes lane at 1G (RCW 0x1333) writes exactly that mode
+   for MAC10. Map PHY_INTERFACE_MODE_1000BASEX to e_ENET_MODE_SGMII_BASEX_1000,
+   bound both lookups, and fail the MAC probe on a mode the tables lack.
+ - a 10G-capable MAC (cell-index 8 and up, now mac_dev->mac_10g) running at
+   1G keeps speed 10000 in its mode, as memac expects: the FMan files a MAC's
+   interrupts and frame limits by that speed, and a 1G one with MAC10's id
+   would take over MAC2's. Only the speed changes, so the BASEX flag stays.
+   fm_mac_set_handle() keys on the same flag.
+ - SetupSgmiiInternalPhyBaseX() honours a fixed link as the SGMII setup does:
+   AN off rather than forced on. That is how the PCS comes out of reset, and
+   the state the 1G link has always run in, since nothing programmed the PCS
+   while the mode was garbage.
+
 Board support (ex-712):
  - swphy: decode a 10000 Mbit/s fixed-link like 1000 (no distinct 10G MII
    code). The Mono Gateway's 10G (xfi) MACs use fixed-link 10000; mainline
@@ -62,20 +79,23 @@ overlap when both are applied.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- arch/arm64/include/asm/io.h                   |  4 +++
- arch/arm64/include/asm/pgtable.h              |  7 +++++
- drivers/net/ethernet/freescale/Kconfig        |  2 ++
- drivers/net/ethernet/freescale/Makefile       |  2 ++
- drivers/net/ethernet/freescale/sdk_dpaa/mac.c |  4 +--
- drivers/net/phy/phylink.c                     |  3 ++-
+ arch/arm64/include/asm/io.h                   |  4 ++
+ arch/arm64/include/asm/pgtable.h              |  7 ++++
+ drivers/net/ethernet/freescale/Kconfig        |  2 +
+ drivers/net/ethernet/freescale/Makefile       |  2 +
+ .../net/ethernet/freescale/sdk_dpaa/mac-api.c | 37 ++++++++++++++++---
+ drivers/net/ethernet/freescale/sdk_dpaa/mac.c |  8 ++--
+ drivers/net/ethernet/freescale/sdk_dpaa/mac.h |  3 ++
+ .../sdk_fman/Peripherals/FM/MAC/memac.c       |  9 ++++-
+ drivers/net/phy/phylink.c                     |  3 +-
  drivers/net/phy/swphy.c                       |  1 +
- drivers/staging/Kconfig                       |  2 ++
+ drivers/staging/Kconfig                       |  2 +
  drivers/staging/Makefile                      |  1 +
  include/linux/phylink.h                       |  1 +
  include/linux/skbuff.h                        |  1 +
  net/core/rtnetlink.c                          |  1 +
- net/core/skbuff.c                             | 26 +++++++++++++++++++
- 13 files changed, 52 insertions(+), 3 deletions(-)
+ net/core/skbuff.c                             | 26 +++++++++++++
+ 16 files changed, 97 insertions(+), 11 deletions(-)
 
 diff --git a/arch/arm64/include/asm/io.h b/arch/arm64/include/asm/io.h
 index 16a423101bdc..73daee06fd57 100644
@@ -135,11 +155,93 @@ index d0a259e47960..966141be7f9a 100644
  
  obj-y += dpaa2/
  obj-y += enetc/
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c b/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
+index 6a9511873fb4..98cb3e12662f 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
+@@ -83,17 +83,38 @@ static const enet_mode_t _1000[] = {
+ 	[PHY_INTERFACE_MODE_RGMII_ID]	= e_ENET_MODE_RGMII_1000,
+ 	[PHY_INTERFACE_MODE_RGMII_RXID]	= e_ENET_MODE_RGMII_1000,
+ 	[PHY_INTERFACE_MODE_RGMII_TXID]	= e_ENET_MODE_RGMII_1000,
+-	[PHY_INTERFACE_MODE_RTBI]	= e_ENET_MODE_RTBI_1000
++	[PHY_INTERFACE_MODE_RTBI]	= e_ENET_MODE_RTBI_1000,
++	[PHY_INTERFACE_MODE_1000BASEX]	= e_ENET_MODE_SGMII_BASEX_1000
+ };
+ 
++/* The tables are indexed by mainline's phy_interface_t, which has outgrown
++ * them; a mode they do not list is not one this driver can set up. */
++static enet_mode_t mode_lookup(const enet_mode_t *table, size_t size,
++			       phy_interface_t phy_if)
++{
++	return phy_if < size ? table[phy_if] : e_ENET_MODE_INVALID;
++}
++
+ static enet_mode_t __cold __attribute__((nonnull))
+ macdev2enetinterface(const struct mac_device *mac_dev)
+ {
++	enet_mode_t mode;
++
+ 	switch (mac_dev->max_speed) {
+ 	case SPEED_100:
+-		return _100[mac_dev->phy_if];
++		return mode_lookup(_100, ARRAY_SIZE(_100), mac_dev->phy_if);
+ 	case SPEED_1000:
+-		return _1000[mac_dev->phy_if];
++		mode = mode_lookup(_1000, ARRAY_SIZE(_1000), mac_dev->phy_if);
++		/* A 10G MAC at 1G keeps speed 10000 in its mode, as memac
++		 * expects ("speed=10000 is provided for SGMII ports"): the FMan
++		 * files its interrupts and frame limits by that speed, and as
++		 * a 1G MAC it would take over MAC1's or MAC2's. Only the speed
++		 * changes: ENET_INTERFACE_FROM_MODE() would drop the
++		 * ENET_IF_SGMII_BASEX flag that selects 1000BASE-X. */
++		if (mac_dev->mac_10g && mode != e_ENET_MODE_INVALID)
++			mode = (enet_mode_t)((mode & ~ENET_SPEED_FROM_MODE(mode)) |
++					     e_ENET_SPEED_10000);
++		return mode;
+ 	case SPEED_2500:
+ 		return e_ENET_MODE_SGMII_2500;
+ 	case SPEED_10000:
+@@ -132,6 +153,12 @@ static int __cold memac_init(struct mac_device *mac_dev)
+ 	param.baseAddr =  (typeof(param.baseAddr))(uintptr_t)devm_ioremap(
+ 		mac_dev->dev, mac_dev->res->start, 0x2000);
+ 	param.enetMode	= macdev2enetinterface(mac_dev);
++	if (unlikely(param.enetMode == e_ENET_MODE_INVALID)) {
++		dev_err(mac_dev->dev, "unsupported interface mode %s\n",
++			phy_modes(mac_dev->phy_if));
++		_errno = -EINVAL;
++		goto _return;
++	}
+ 	memcpy(&param.addr, mac_dev->addr, sizeof(mac_dev->addr));
+ 	param.macId		= mac_dev->cell_index;
+ 	param.h_Fm		= (handle_t)mac_dev->fm;
+@@ -148,8 +175,8 @@ static int __cold memac_init(struct mac_device *mac_dev)
+ 	}
+ 
+ 	fm_mac_set_handle(mac_dev->fm_dev, priv->fm_mac,
+-		(macdev2enetinterface(mac_dev) != e_ENET_MODE_XGMII_10000) ?
+-			param.macId : param.macId + FM_MAX_NUM_OF_1G_MACS);
++		mac_dev->mac_10g ?
++			param.macId + FM_MAX_NUM_OF_1G_MACS : param.macId);
+ 
+ 	/* The FMan-wide maximum is only the starting point: the net device
+ 	 * narrows it to its MTU once registered (see dpa_set_mac_max_frame()).
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/mac.c b/drivers/net/ethernet/freescale/sdk_dpaa/mac.c
-index 3163fd8e6b0e..a2b87f33e5dd 100644
+index 3163fd8e6b0e..87b47de8f4a5 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/mac.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac.c
-@@ -273,10 +273,10 @@ static int __cold mac_probe(struct platform_device *_of_dev)
+@@ -204,8 +204,10 @@ static int __cold mac_probe(struct platform_device *_of_dev)
+ 		goto _return_dev_set_drvdata;
+ 	}
+ 	mac_dev->cell_index = (uint8_t)cell_index;
+-	if (mac_dev->cell_index >= 8)
++	if (mac_dev->cell_index >= 8) {
+ 		mac_dev->cell_index -= 8;
++		mac_dev->mac_10g = true;
++	}
+ 
+ 	/* Get the MAC address */
+ 	_errno = of_get_mac_address(mac_node, mac_dev->addr);
+@@ -273,10 +275,10 @@ static int __cold mac_probe(struct platform_device *_of_dev)
  	mac_dev->speed		= phylink_interface_max_speed(mac_dev->phy_if);
  	mac_dev->max_speed	= mac_dev->speed;
  	mac_dev->if_support = MEMAC_SUPPORTED;
@@ -152,6 +254,40 @@ index 3163fd8e6b0e..a2b87f33e5dd 100644
  		mac_dev->if_support &= ~(SUPPORTED_10baseT_Half |
  					SUPPORTED_100baseT_Half);
  
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/mac.h b/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
+index cffaec5949f7..3fe0a818f035 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
+@@ -43,6 +43,9 @@ struct mac_device {
+ 	struct device		*dev;
+ 	void			*priv;
+ 	uint8_t			 cell_index;
++	/* One of the MACs that can run at 10G (MAC9, MAC10), whatever its link
++	 * mode: its cell_index then counts within the 10G MACs. */
++	bool			 mac_10g;
+ 	struct resource		*res;
+ 	void __iomem		*vaddr;
+ 	uint8_t			 addr[ETH_ALEN];
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
+index 836e53e14594..8b9917c0cbcd 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
+@@ -170,8 +170,13 @@ static void SetupSgmiiInternalPhyBaseX(t_Memac *p_Memac, uint8_t phyAddr)
+     MEMAC_MII_WritePhyReg(p_Memac, phyAddr, 0x13, 0x002f);
+     MEMAC_MII_WritePhyReg(p_Memac, phyAddr, 0x12, 0xaf08);
+ 
+-    /* Restart AN */
+-    tmpReg16 = PHY_SGMII_CR_DEF_VAL | PHY_SGMII_CR_RESET_AN;
++    if (!p_Memac->fixed)
++        /* Restart AN */
++        tmpReg16 = PHY_SGMII_CR_DEF_VAL | PHY_SGMII_CR_RESET_AN;
++    else
++        /* A fixed link negotiates nothing, as in the SGMII setup above:
++           AN off, which is also how the PCS comes out of reset */
++        tmpReg16 = PHY_SGMII_CR_DEF_VAL & ~PHY_SGMII_CR_AN_EN;
+     MEMAC_MII_WritePhyReg(p_Memac, phyAddr, 0x0, tmpReg16);
+ 
+     /* Restore original enet mode */
 diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
 index e6f3963739ad..332405f8a58f 100644
 --- a/drivers/net/phy/phylink.c

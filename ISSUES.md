@@ -152,6 +152,13 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A400 — a 10G MAC at 2500base-x would take a 1G MAC's interrupt and frame-limit slots.** `macdev2enetinterface()`
+  (sdk_dpaa/mac-api.c, patch 110) gives SPEED_2500 `e_ENET_MODE_SGMII_2500`, whose speed is below 10000, so memac files
+  MAC9/MAC10 as 1G MAC 0/1: MAC1's or MAC2's slots (MAC2 is live on the DK). 1000base-x got the 10G speed in patch 110;
+  2.5G cannot take the same rewrite, since `SetupSgmiiInternalPhy()` (memac.c) disables AN by matching
+  `e_ENET_MODE_SGMII_2500` exactly. Fix direction: pass 2.5G to memac separately from the mode's speed field. Neither
+  shipping RCW (0x1133, 0x1333) runs MAC9/MAC10 at 2.5G today.
+
 - [ ] **A399 — a 10G receive port can still overflow its MAC FIFO by a few frames under 128 KB TCP records with inbound
   IPsec.** `test_ipsec_decrypted_frames_intact_under_overlap[cbc-sha256]` counted 3, then 1, `rx_missed_errors` on eth4
   in 2 of 5 runs on a 9.5 h-old boot (full-suite run 7); it passed on the same boot hours earlier. A352 gave the 10G
