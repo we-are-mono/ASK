@@ -111,7 +111,7 @@ int cdx_pcd_set_extract(t_FmPcdExtractEntry *entry,
 struct cdx_pcd_port {
 	e_FmPortType	type;
 	u8		fm_index;
-	u8		number;		/* device-tree cell-index */
+	u8		number;		/* FMan port index within its type */
 	u8		portid;		/* logical port id -> prsResultPrivateInfo */
 	/* 0 for offline, 1 for 1G, 10 for 10G -- the encoding cdx_port_info
 	 * carries in its `type` field. */
@@ -123,7 +123,7 @@ struct cdx_pcd_port {
 
 /*
  * Enumerate the classification ports of FMan @fm_index into @ports (at most
- * CDX_PCD_MAX_PORTS), sorted by port class then cell-index. On success also
+ * CDX_PCD_MAX_PORTS), sorted by port class then port number. On success also
  * stores the FMan wrapper device the ports belong to in @fm_dev.
  *
  * Caller holds RTNL. Returns the number of ports, or negative on error.

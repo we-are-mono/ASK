@@ -4,8 +4,9 @@
  * one carries.
  *
  * None of this is board-specific input: the port set is whatever the device
- * tree enabled, the port number is its cell-index, and the logical port id is a
- * formula over the SoC's port counts. See docs/in-kernel-pcd.md.
+ * tree enabled, a port's class and number are those of the FMan port it receives
+ * through, and the logical port id is a formula over the SoC's port counts. See
+ * docs/in-kernel-pcd.md.
  *
  * The logical port id ends up in prsResultPrivateInfo, which cdx_sp.xml reads as
  * $logicalportid and tests against 9 to tell ethernet ports from offline ports.
@@ -39,7 +40,7 @@
 #define CDX_PCD_PORTID_PROP		"mono,cdx-logical-portid"
 
 static int cdx_pcd_portid(const struct device_node *node, e_FmPortType type,
-			  u8 cell_index)
+			  u8 number)
 {
 	u32 override;
 	unsigned int base;
@@ -69,7 +70,7 @@ static int cdx_pcd_portid(const struct device_node *node, e_FmPortType type,
 		}
 		return override;
 	}
-	return base + cell_index;
+	return base + number;
 }
 
 /*
@@ -96,6 +97,7 @@ static int cdx_pcd_add_eth_ports(u8 fm_index, struct cdx_pcd_port *ports,
 
 	for_each_netdev(&init_net, dev) {
 		t_LnxWrpFmDev *fm_dev;
+		t_LnxWrpFmPortDev *rx;
 		struct mac_device *mac_dev;
 		struct cdx_pcd_port *port;
 		struct dpa_priv_s *priv;
@@ -118,12 +120,26 @@ static int cdx_pcd_add_eth_ports(u8 fm_index, struct cdx_pcd_port *ports,
 			pr_err("cdx: more than %u classification ports\n", max_ports);
 			return -ENOSPC;
 		}
+		/* Classify by the FMan RX port the MAC is bound to, not by its
+		 * link. Firmware may run a 10G MAC at 1000base-x on a 1G SerDes
+		 * lane, but the MAC still receives through the FMan's 10G port,
+		 * and that port is what the PCD binds and dpa_cfg quiesces. */
+		rx = (t_LnxWrpFmPortDev *)mac_dev->port_dev[RX];
 		port = &ports[count];
-		port->type = mac_dev->max_speed == SPEED_10000 ?
-			e_FM_PORT_TYPE_RX_10G : e_FM_PORT_TYPE_RX;
-		port->speed = mac_dev->max_speed == SPEED_10000 ? 10 : 1;
+		port->type = rx->settings.param.portType;
+		switch (port->type) {
+		case e_FM_PORT_TYPE_RX_10G:
+			port->speed = 10;
+			break;
+		case e_FM_PORT_TYPE_RX:
+			port->speed = 1;
+			break;
+		default:
+			pr_err("cdx: %s: RX port of type %d\n", dev->name, port->type);
+			return -EINVAL;
+		}
 		port->fm_index = fm_index;
-		port->number = mac_dev->cell_index;
+		port->number = rx->id;
 
 		portid = cdx_pcd_portid(mac_dev->dev ? mac_dev->dev->of_node : NULL,
 					port->type, port->number);
@@ -192,7 +208,7 @@ static int cdx_pcd_add_oh_ports(u8 fm_index, struct cdx_pcd_port *ports,
 	return count;
 }
 
-/* Rank by port class, then by cell-index. */
+/* Rank by port class, then by port number. */
 static int cdx_pcd_port_cmp(const void *a, const void *b)
 {
 	static const int rank[] = {
@@ -232,7 +248,7 @@ int cdx_pcd_enumerate_ports(u8 fm_index, struct cdx_pcd_port *ports,
 		return -ENODEV;
 	}
 
-	/* Netdev registration order is not cell-index order, and the port this
+	/* Netdev registration order is not port order, and the port this
 	 * sort puts first is the one whose CC root tree every shared scheme
 	 * binds to. Sorting keeps that choice, and the whole build, independent
 	 * of the order interfaces happened to come up in. */

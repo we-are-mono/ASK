@@ -84,22 +84,27 @@ have:
 | Value | Source |
 | --- | --- |
 | which ports participate | DPAA netdevs (ethernet) and the `fsl,dpa-oh` registry `oh_port_probe()` fills (offline) |
-| port number | DT `cell-index` |
+| port class and number | the FMan port: its DT port node's binding and `cell-index` |
 | logical port id | formula over SoC port counts, below |
 
 Ethernet ports come from walking `init_net` for netdevs whose parent binding is
-`fsl,dpa-ethernet`, taking the port class from `mac_dev->max_speed`. Offline
+`fsl,dpa-ethernet`, taking the port class and number from the FMan RX port the
+MAC is bound to (`mac_dev->port_dev[RX]`), not from the link. Firmware may run a
+10G MAC at `1000base-x` on a 1G SerDes lane (SFP1 under SerDes protocol 0x1333),
+but the MAC still receives through the FMan's 10G port, so it stays 10G. Offline
 ports come from `offline_port_info[][]`, which the SDK fills from the
 `fsl,dpa-oh` node names; the host-command port and unbound OH ports are excluded
 by construction because they carry no binding. Results are sorted by port class
-then cell-index, so the port the shared schemes bind to does not depend on
+then port number, so the port the shared schemes bind to does not depend on
 interface registration order.
 
-The logical port id is a flat index over the FMan's whole port space:
+The logical port id is a flat index over the FMan's whole port space, where N is
+the port's number within its class (an RX port's `cell-index` less 0x08 for 1G
+or 0x10 for 10G; an offline port's slot):
 
-    1G  cell-index N -> N
-    10G cell-index N -> FM_MAX_NUM_OF_1G_RX_PORTS + N
-    OH  cell-index N -> FM_MAX_NUM_OF_1G_RX_PORTS + FM_MAX_NUM_OF_10G_RX_PORTS + N
+    1G  port N -> N
+    10G port N -> FM_MAX_NUM_OF_1G_RX_PORTS + N
+    OH  port N -> FM_MAX_NUM_OF_1G_RX_PORTS + FM_MAX_NUM_OF_10G_RX_PORTS + N
 
 On LS1043/LS1046 that gives 0–5 for 1G, 6–7 for 10G, 8 for OH0 (the
 host-command port) and 9–15 for OH1–7. It holds without exception across all
@@ -129,7 +134,7 @@ dpa-fman0-oh@2 {
 ```
 
 A conforming board writes no lines at all; `mono-gateway-dk.dts` needs none,
-since all seven of its ports match the formula.
+since all eight of its ports match the formula.
 
 The `mono` vendor prefix is not registered in the kernel's
 `vendor-prefixes.yaml`, although `mono,gateway-dk` and `mono,sfp-led` already
