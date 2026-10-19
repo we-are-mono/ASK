@@ -1,4 +1,4 @@
-From 8a0051b75e2170532887482ad02734a671525edc Mon Sep 17 00:00:00 2001
+From fa031c3ba071e6f95144973518bead507fbfca12 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:14:51 +0200
 Subject: [PATCH] netfilter: walk the forwarding path through sit and ip6_tnl
@@ -47,10 +47,10 @@ Context version 13 adds the two tunnel records.
  8 files changed, 262 insertions(+), 2 deletions(-)
 
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index 26990c9dd9b0..5a96a126cf21 100644
+index 1d0a3ff4e88c..1c92244baebf 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
-@@ -839,8 +839,21 @@ enum net_device_path_type {
+@@ -841,8 +841,21 @@ enum net_device_path_type {
  	DEV_PATH_PPPOE,
  	DEV_PATH_DSA,
  	DEV_PATH_MTK_WDMA,
@@ -72,7 +72,7 @@ index 26990c9dd9b0..5a96a126cf21 100644
  struct net_device_path {
  	enum net_device_path_type	type;
  	const struct net_device		*dev;
-@@ -871,6 +884,25 @@ struct net_device_path {
+@@ -873,6 +886,25 @@ struct net_device_path {
  			u8 bss;
  			u8 amsdu;
  		} mtk_wdma;
@@ -188,10 +188,10 @@ index bc7f2e12c936..92152691ea76 100644
  	} tuple[FLOW_OFFLOAD_DIR_MAX];
  };
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
-index b788a06bd3a5..6dc7d27ed089 100644
+index 7eb2e67842f4..f398b49be39e 100644
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
-@@ -1424,6 +1424,87 @@ ipxip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev,
+@@ -1416,6 +1416,87 @@ ipxip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev,
  	return 0;
  }
  
@@ -279,7 +279,7 @@ index b788a06bd3a5..6dc7d27ed089 100644
  static netdev_tx_t
  ip6_tnl_start_xmit(struct sk_buff *skb, struct net_device *dev)
  {
-@@ -1830,6 +1911,7 @@ static const struct net_device_ops ip6_tnl_netdev_ops = {
+@@ -1825,6 +1906,7 @@ static const struct net_device_ops ip6_tnl_netdev_ops = {
  	.ndo_change_mtu = ip6_tnl_change_mtu,
  	.ndo_get_stats64 = dev_get_tstats64,
  	.ndo_get_iflink = ip6_tnl_get_iflink,
@@ -288,7 +288,7 @@ index b788a06bd3a5..6dc7d27ed089 100644
  
  #define IPXIPX_FEATURES (NETIF_F_SG |		\
 diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
-index 78e685011382..9f06ff4e556d 100644
+index 1f980e827d04..7a95156dd697 100644
 --- a/net/ipv6/sit.c
 +++ b/net/ipv6/sit.c
 @@ -1066,6 +1066,74 @@ static netdev_tx_t sit_tunnel_xmit__(struct sk_buff *skb,
@@ -375,7 +375,7 @@ index 78e685011382..9f06ff4e556d 100644
  
  static void ipip6_dev_free(struct net_device *dev)
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 116941ca024d..732b8085c389 100644
+index 161b76af2ff6..70ef1e27c792 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
 @@ -191,6 +191,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
@@ -387,10 +387,10 @@ index 116941ca024d..732b8085c389 100644
  	switch (route->tuple[dir].xmit_type) {
  	case FLOW_OFFLOAD_XMIT_DIRECT:
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 6bc5aa1d88f8..dd3f14065add 100644
+index 8667bf9c5543..c6efada53d3f 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -988,6 +988,8 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -1002,6 +1002,8 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  		 * record naming no session is already self-describing. */
  		.nf_session = &flow->tuplehash[dir].tuple.session,
  		.nf_session_reverse = &flow->tuplehash[!dir].tuple.session,

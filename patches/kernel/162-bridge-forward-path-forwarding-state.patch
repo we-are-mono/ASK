@@ -1,4 +1,4 @@
-From 26157a3cb04ea8b20c72ac3b3922488a6d132ae1 Mon Sep 17 00:00:00 2001
+From b16fd93dfced3676fb17d3b74a44e2905ea3a3dc Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 18:25:22 +0200
 Subject: [PATCH] bridge: keep flow offload off ports that are not forwarding
@@ -34,10 +34,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  9 files changed, 144 insertions(+), 14 deletions(-)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
-index d5ec233201a8..418746f11fb3 100644
+index f8b2b2939627..ba17e9cae800 100644
 --- a/include/linux/if_bridge.h
 +++ b/include/linux/if_bridge.h
-@@ -205,6 +205,7 @@ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+@@ -209,6 +209,7 @@ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
  void br_fdb_clear_offload(const struct net_device *dev, u16 vid);
  bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag);
  u8 br_port_get_stp_state(const struct net_device *dev);
@@ -45,7 +45,7 @@ index d5ec233201a8..418746f11fb3 100644
  clock_t br_get_ageing_time(const struct net_device *br_dev);
  #else
  static inline struct net_device *
-@@ -230,6 +231,11 @@ static inline u8 br_port_get_stp_state(const struct net_device *dev)
+@@ -234,6 +235,11 @@ static inline u8 br_port_get_stp_state(const struct net_device *dev)
  	return BR_STATE_DISABLED;
  }
  
@@ -92,7 +92,7 @@ index da9e6370ed0f..f87bc384a3e6 100644
  };
  
 diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
-index 3768cc9c8ecb..3633749e714d 100644
+index 446761da4e54..f8443772f81a 100644
 --- a/net/bridge/br_device.c
 +++ b/net/bridge/br_device.c
 @@ -405,6 +405,15 @@ static int br_fill_forward_path(struct net_device_path_ctx *ctx,
@@ -112,10 +112,10 @@ index 3768cc9c8ecb..3633749e714d 100644
  	path->dev = dst->br->dev;
  	ctx->dev = dst->dev;
 diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
-index eaa949a77904..2ed20d43cbb8 100644
+index c2d4e127c799..cb510098fcfc 100644
 --- a/net/bridge/br_private.h
 +++ b/net/bridge/br_private.h
-@@ -1606,6 +1606,7 @@ void br_vlan_fill_forward_path_pvid(struct net_bridge *br,
+@@ -1587,6 +1587,7 @@ void br_vlan_fill_forward_path_pvid(struct net_bridge *br,
  int br_vlan_fill_forward_path_mode(struct net_bridge *br,
  				   struct net_bridge_port *dst,
  				   struct net_device_path *path);
@@ -123,7 +123,7 @@ index eaa949a77904..2ed20d43cbb8 100644
  
  static inline struct net_bridge_vlan_group *br_vlan_group(
  					const struct net_bridge *br)
-@@ -1782,6 +1783,11 @@ static inline int br_vlan_fill_forward_path_mode(struct net_bridge *br,
+@@ -1763,6 +1764,11 @@ static inline int br_vlan_fill_forward_path_mode(struct net_bridge *br,
  	return 0;
  }
  
@@ -135,7 +135,7 @@ index eaa949a77904..2ed20d43cbb8 100644
  static inline struct net_bridge_vlan_group *br_vlan_group(
  					const struct net_bridge *br)
  {
-@@ -1977,6 +1983,19 @@ static inline void br_mst_uninit(struct net_bridge *br)
+@@ -1958,6 +1964,19 @@ static inline void br_mst_uninit(struct net_bridge *br)
  }
  #endif
  
@@ -185,10 +185,10 @@ index 4cfebf5fcdf5..9a5183f24d1b 100644
  struct net_bridge_port *br_get_port(struct net_bridge *br, u16 port_no)
  {
 diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
-index 88cd613ccf70..204edcaf043e 100644
+index a61211a09e1e..3199e1b5bd72 100644
 --- a/net/bridge/br_vlan.c
 +++ b/net/bridge/br_vlan.c
-@@ -1519,6 +1519,27 @@ int br_vlan_fill_forward_path_mode(struct net_bridge *br,
+@@ -1497,6 +1497,27 @@ int br_vlan_fill_forward_path_mode(struct net_bridge *br,
  	return 0;
  }
  
@@ -267,7 +267,7 @@ index 4a736e005bad..2d9c2d96921b 100644
  	return 0;
  }
 diff --git a/net/core/dev.c b/net/core/dev.c
-index 1aab6f06d9eb..2a326163cfe3 100644
+index 0c15c90691b3..e9f5d3c8c629 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
 @@ -751,7 +751,7 @@ int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,

@@ -1,4 +1,4 @@
-From 3f0c317336265f03bda3134fb617429eb19687f1 Mon Sep 17 00:00:00 2001
+From 80a0372eef726240292ba8e84552408269a1a9c9 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] netfilter: keep IPv6 prefix translation in conntrack and

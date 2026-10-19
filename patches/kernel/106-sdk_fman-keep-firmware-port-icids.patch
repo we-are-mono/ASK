@@ -1,4 +1,4 @@
-From 3a4dae727e7b876f7fe9fd0bb35b2d107016f78b Mon Sep 17 00:00:00 2001
+From 502c963ae6eca35256acd25f8b2c2daed7bc9d56 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 12:56:31 +0200
 Subject: [PATCH] sdk_fman: keep the boot firmware's port ICIDs

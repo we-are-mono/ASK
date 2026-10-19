@@ -1,4 +1,4 @@
-From a20c2d9df90a2ed8a6a66f061d4aa4f630ad7290 Mon Sep 17 00:00:00 2001
+From 719f5100e81a07304f4c21278c8075ab816c3861 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] sdk_fman/sdk_dpaa/qbman: skip KASAN instrumentation
@@ -179,7 +179,7 @@ index 667cd859931f..8837373135e0 100644
  # Makefile for the Freescale Ethernet controllers
  #
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/Makefile b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/Makefile
-index 62713d626dfa..a6a728e984e3 100644
+index 6be35a21fd99..7f9f53b4db8a 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/Makefile
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/Makefile
 @@ -1,3 +1,5 @@

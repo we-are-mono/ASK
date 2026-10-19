@@ -1,4 +1,4 @@
-From 34dce6f9c8bcf1c1ef2a11f8d0b7cf40996492f3 Mon Sep 17 00:00:00 2001
+From f1e7e5cb3b73545400c7226a94438d42fc2210e6 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -195,7 +195,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  create mode 100644 include/linux/fsl_oh_port.h
 
 diff --git a/Makefile b/Makefile
-index f3bacdc021a4..6a9fd1893b8f 100644
+index 24d86c14edd8..317a93f0fcdb 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -130,6 +130,11 @@ export KBUILD_CLIPPY
@@ -24147,10 +24147,10 @@ index c42bde697436..68225db4d865 100644
  }
  #endif
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index ea9b40b196de..1591778c36f8 100644
+index 0aa536df9cb5..4aafbb9a7656 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
-@@ -2075,6 +2075,10 @@ struct net_device {
+@@ -2078,6 +2078,10 @@ struct net_device {
  	__cacheline_group_begin(net_device_read_rx);
  	struct bpf_prog __rcu	*xdp_prog;
  	struct list_head	ptype_specific;
@@ -24161,7 +24161,7 @@ index ea9b40b196de..1591778c36f8 100644
  	int			ifindex;
  	unsigned int		real_num_rx_queues;
  	struct netdev_rx_queue	*_rx;
-@@ -5311,6 +5315,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
+@@ -5347,6 +5351,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
  
  extern struct net_device *blackhole_netdev;
  
@@ -24177,7 +24177,7 @@ index ea9b40b196de..1591778c36f8 100644
  #define DEV_STATS_INC(DEV, FIELD) atomic_long_inc(&(DEV)->stats.__##FIELD)
  #define DEV_STATS_ADD(DEV, FIELD, VAL) 	\
 diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
-index 107a8c3ff07f..0e902f666a5f 100644
+index 84f2f6f11279..a1bcfe394390 100644
 --- a/include/linux/skbuff.h
 +++ b/include/linux/skbuff.h
 @@ -1028,6 +1028,9 @@ struct sk_buff {
@@ -24247,7 +24247,7 @@ index a629f92dc86b..020d6dd73bca 100644
  source "net/ipv6/Kconfig"
  source "net/netlabel/Kconfig"
 diff --git a/net/core/dev.c b/net/core/dev.c
-index ce5a1ab86ab5..40936205ea54 100644
+index 6c63867ff76d..3f68d968b237 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
 @@ -172,6 +172,10 @@ static int call_netdevice_notifiers_extack(unsigned long val,
@@ -24283,7 +24283,7 @@ index ce5a1ab86ab5..40936205ea54 100644
  		/* If packet is not checksummed and device does not
  		 * support checksumming for this protocol, complete
  		 * checksumming here.
-@@ -5595,6 +5606,12 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
+@@ -5599,6 +5610,12 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
  
  	trace_netif_receive_skb(skb);
  
@@ -24296,7 +24296,7 @@ index ce5a1ab86ab5..40936205ea54 100644
  	orig_dev = skb->dev;
  
  	skb_reset_network_header(skb);
-@@ -6936,8 +6953,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
+@@ -6940,8 +6957,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
  		napi_gro_flush(n, HZ >= 1000);
  	}
  
@@ -24305,7 +24305,7 @@ index ce5a1ab86ab5..40936205ea54 100644
  	/* Some drivers may have called napi_schedule
  	 * prior to exhausting their budget.
  	 */
-@@ -11093,10 +11108,44 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
+@@ -11111,10 +11126,44 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
  			storage->rx_otherhost_dropped += READ_ONCE(core_stats->rx_otherhost_dropped);
  		}
  	}
@@ -24351,10 +24351,10 @@ index ce5a1ab86ab5..40936205ea54 100644
   *	dev_fetch_sw_netstats - get per-cpu network device statistics
   *	@s: place to store stats
 diff --git a/net/core/gro.c b/net/core/gro.c
-index 1a239b44916e..2462c1146ff7 100644
+index 9ee75881b20c..705b94e0ee1d 100644
 --- a/net/core/gro.c
 +++ b/net/core/gro.c
-@@ -664,6 +664,9 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
+@@ -667,6 +667,9 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
  	__vlan_hwaccel_clear_tag(skb);
  	skb->dev = napi->dev;
  	skb->skb_iif = 0;
@@ -24365,7 +24365,7 @@ index 1a239b44916e..2462c1146ff7 100644
  	/* eth_type_trans() assumes pkt_type is PACKET_HOST */
  	skb->pkt_type = PACKET_HOST;
 diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
-index 625f273aeeed..a13e87558d0e 100644
+index 23b0e673fd83..6ad562621f7d 100644
 --- a/net/core/rtnetlink.c
 +++ b/net/core/rtnetlink.c
 @@ -884,9 +884,17 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
@@ -24405,10 +24405,10 @@ index 625f273aeeed..a13e87558d0e 100644
  
  	if (!valid) {
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index dcb5d025dc08..6c250222c704 100644
+index 623d9d10a208..6558a6def663 100644
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
-@@ -1535,12 +1535,18 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+@@ -1538,12 +1538,18 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
  	 */
  	new->queue_mapping = old->queue_mapping;
  
@@ -24427,7 +24427,7 @@ index dcb5d025dc08..6c250222c704 100644
  	CHECK_SKB_FIELD(vlan_proto);
  	CHECK_SKB_FIELD(vlan_tci);
  	CHECK_SKB_FIELD(transport_header);
-@@ -6157,7 +6163,29 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+@@ -6162,7 +6168,29 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
  	skb->skb_iif = 0;
  	skb->ignore_df = 0;
  	skb_dst_drop(skb);

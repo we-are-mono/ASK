@@ -1,4 +1,4 @@
-From a951b0b9d05a9b501445ad01cdae6d3cd7f02930 Mon Sep 17 00:00:00 2001
+From 179c70ca1e8a79a919e68897400d1b17003830a0 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 23 Aug 2026 18:48:54 +0200
 Subject: [PATCH] sdk: build the vendored SDK on stock mainline
@@ -78,10 +78,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  13 files changed, 52 insertions(+), 3 deletions(-)
 
 diff --git a/arch/arm64/include/asm/io.h b/arch/arm64/include/asm/io.h
-index 46bd37707e08..8ad3052680f6 100644
+index 16a423101bdc..73daee06fd57 100644
 --- a/arch/arm64/include/asm/io.h
 +++ b/arch/arm64/include/asm/io.h
-@@ -312,6 +312,10 @@ static inline void __iomem *ioremap_prot(phys_addr_t phys, size_t size,
+@@ -313,6 +313,10 @@ static inline void __iomem *ioremap_prot(phys_addr_t phys, size_t size,
  #include <asm-generic/io.h>
  
  #define ioremap_cache ioremap_cache
@@ -93,7 +93,7 @@ index 46bd37707e08..8ad3052680f6 100644
  {
  	if (pfn_is_map_memory(__phys_to_pfn(addr)))
 diff --git a/arch/arm64/include/asm/pgtable.h b/arch/arm64/include/asm/pgtable.h
-index 2de5a70a47ce..cfa07bf36308 100644
+index a66a474949c8..deaf12d3032b 100644
 --- a/arch/arm64/include/asm/pgtable.h
 +++ b/arch/arm64/include/asm/pgtable.h
 @@ -678,6 +678,13 @@ static inline void set_pud_at(struct mm_struct *mm, unsigned long addr,
@@ -218,10 +218,10 @@ index 5c01048860c4..50fec86d1b22 100644
  /**
   * struct phylink_mac_ops - MAC operations structure.
 diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
-index 956bc8ad25dd..5d520c71e93c 100644
+index a1bcfe394390..a25be74b5bd4 100644
 --- a/include/linux/skbuff.h
 +++ b/include/linux/skbuff.h
-@@ -1337,6 +1337,7 @@ static inline void consume_skb(struct sk_buff *skb)
+@@ -1333,6 +1333,7 @@ static inline void consume_skb(struct sk_buff *skb)
  #endif
  
  void __consume_stateless_skb(struct sk_buff *skb);
@@ -230,10 +230,10 @@ index 956bc8ad25dd..5d520c71e93c 100644
  
  void kfree_skb_partial(struct sk_buff *skb, bool head_stolen);
 diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
-index a13e87558d0e..fa1f9d704c75 100644
+index 6ad562621f7d..72e39dd3ccfb 100644
 --- a/net/core/rtnetlink.c
 +++ b/net/core/rtnetlink.c
-@@ -4265,6 +4265,7 @@ void rtmsg_ifinfo(int type, struct net_device *dev, unsigned int change,
+@@ -4270,6 +4270,7 @@ void rtmsg_ifinfo(int type, struct net_device *dev, unsigned int change,
  	rtmsg_ifinfo_event(type, dev, change, rtnl_get_event(0), flags,
  			   NULL, 0, portid, nlh);
  }
@@ -242,10 +242,10 @@ index a13e87558d0e..fa1f9d704c75 100644
  void rtmsg_ifinfo_newnet(int type, struct net_device *dev, unsigned int change,
  			 gfp_t flags, int *new_nsid, int new_ifindex)
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index cef20afbc891..8781900e75ae 100644
+index 6558a6def663..02727ce60778 100644
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
-@@ -1515,6 +1515,32 @@ void napi_consume_skb(struct sk_buff *skb, int budget)
+@@ -1518,6 +1518,32 @@ void napi_consume_skb(struct sk_buff *skb, int budget)
  }
  EXPORT_SYMBOL(napi_consume_skb);
  

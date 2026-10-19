@@ -1,4 +1,4 @@
-From 6a5222fb6c01f51bbf492c52d19f7a6ed54633a0 Mon Sep 17 00:00:00 2001
+From 76dd6f34a596cb39f9447248aecc854794003492 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] netlink: name every cb_mutex lock class up to MAX_LINKS

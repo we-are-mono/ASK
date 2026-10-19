@@ -1,4 +1,4 @@
-From fb8d112e6043e1a4243caeb156f592e2ab0e09be Mon Sep 17 00:00:00 2001
+From ea7fe2b711338d2d820fafba932db2c85f1343e3 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 10 Oct 2026 21:38:37 +0200
 Subject: [PATCH] ipv6: keep CHECKSUM_COMPLETE valid across hop-limit rewrites
@@ -36,7 +36,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  8 files changed, 30 insertions(+), 8 deletions(-)
 
 diff --git a/include/net/ipv6.h b/include/net/ipv6.h
-index e843eb7efbcc..f37978c5c669 100644
+index 3f3e312bced4..aab96f69538d 100644
 --- a/include/net/ipv6.h
 +++ b/include/net/ipv6.h
 @@ -910,6 +910,23 @@ static inline int ip6_sk_dst_hoplimit(struct ipv6_pinfo *np, struct flowi6 *fl6,
@@ -64,10 +64,10 @@ index e843eb7efbcc..f37978c5c669 100644
   * Equivalent to :	flow->v6addrs.src = iph->saddr;
   *			flow->v6addrs.dst = iph->daddr;
 diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
-index e91afe5ec0b5..abfed1f93ef0 100644
+index 5d1e98ae1818..19d24bf7a959 100644
 --- a/net/ipv6/exthdrs.c
 +++ b/net/ipv6/exthdrs.c
-@@ -477,7 +477,8 @@ static int ipv6_srh_rcv(struct sk_buff *skb)
+@@ -470,7 +470,8 @@ static int ipv6_srh_rcv(struct sk_buff *skb, struct inet6_dev *idev)
  			kfree_skb(skb);
  			return -1;
  		}
@@ -75,9 +75,9 @@ index e91afe5ec0b5..abfed1f93ef0 100644
 +		ipv6_set_hop_limit(skb, ipv6_hdr(skb),
 +				   ipv6_hdr(skb)->hop_limit - 1);
  
- 		skb_pull(skb, sizeof(struct ipv6hdr));
+ 		skb_pull(skb, skb_transport_offset(skb));
  		goto looped_back;
-@@ -641,7 +642,8 @@ static int ipv6_rpl_srh_rcv(struct sk_buff *skb)
+@@ -629,7 +630,8 @@ static int ipv6_rpl_srh_rcv(struct sk_buff *skb, struct inet6_dev *idev)
  			kfree_skb(skb);
  			return -1;
  		}
@@ -88,7 +88,7 @@ index e91afe5ec0b5..abfed1f93ef0 100644
  		skb_pull(skb, sizeof(struct ipv6hdr));
  		goto looped_back;
 diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
-index 68bc518500f9..41c2bed9b00b 100644
+index ac0120b75ff2..70f06faa6575 100644
 --- a/net/ipv6/ip6mr.c
 +++ b/net/ipv6/ip6mr.c
 @@ -2090,7 +2090,7 @@ static int ip6mr_forward2(struct net *net, struct mr_table *mrt,

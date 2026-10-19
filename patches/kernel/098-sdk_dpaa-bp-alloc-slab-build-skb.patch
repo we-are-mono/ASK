@@ -1,4 +1,4 @@
-From e81b28feeb250b41becd80d9caeac983f96701b3 Mon Sep 17 00:00:00 2001
+From 08cdea33c946077e98743aed1d69c891da162a60 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 04:09:54 +0200
 Subject: [PATCH] sdk_dpaa: preserve SEC buffer ownership through receive and
@@ -13,10 +13,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 164 insertions(+), 232 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-index 9515cbfe67e9..1f34bc8d3964 100644
+index 7d2c99af6319..2b852d0fc6f3 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-@@ -684,4 +684,7 @@ static inline void _dpa_bp_free_pf(void *addr)
+@@ -666,4 +666,7 @@ static inline void _dpa_bp_free_pf(void *addr)
  int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs,
  			      bool act_skb);
  
@@ -25,7 +25,7 @@ index 9515cbfe67e9..1f34bc8d3964 100644
 +
  #endif	/* __DPA_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index dc012b4dd1e2..20b5b83ef336 100644
+index f877d2ce6c25..28998254ccc9 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -135,7 +135,11 @@ static void dpa_bp_recycle_frag(struct dpa_bp *dpa_bp, unsigned long vaddr,
@@ -411,7 +411,7 @@ index dc012b4dd1e2..20b5b83ef336 100644
  }
  
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
-@@ -1644,47 +1652,8 @@ static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_dev
+@@ -1698,47 +1706,8 @@ static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_dev
  		}
  
  		if (unlikely(err < 0)) {
@@ -461,7 +461,7 @@ index dc012b4dd1e2..20b5b83ef336 100644
  			goto sec_submit_failed;
  		}
  
-@@ -1838,48 +1807,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+@@ -1988,48 +1957,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  		}
  
  		if (unlikely(err < 0)) {

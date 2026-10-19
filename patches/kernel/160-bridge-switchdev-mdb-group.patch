@@ -1,7 +1,8 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From bdc5da8d894f9d5cf4b15c32047671364740c1da Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 18 Sep 2026 13:20:00 +0200
-Subject: [PATCH] bridge: carry the multicast group into the MDB switchdev object
+Subject: [PATCH] bridge: carry the multicast group into the MDB switchdev
+ object
 
 br_switchdev_mdb_populate() converts a group to a multicast MAC with
 ip_eth_mc_map() and hands the driver nothing else, so the L3 group the

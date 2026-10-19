@@ -1,4 +1,4 @@
-From c80759ace0c367137cbf2a1a9ab74fc3b77174f6 Mon Sep 17 00:00:00 2001
+From a1bdddb802a64e1fc89e7d284983282e6a86a9e8 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 17 Aug 2026 20:17:28 +0200
 Subject: [PATCH] sdk_fman: fix IRQ handling in FMan sysfs show handlers

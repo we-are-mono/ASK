@@ -1,4 +1,4 @@
-From 186bdc6f09b7898a7de472ba97991a706478baef Mon Sep 17 00:00:00 2001
+From b775c92816da84e4dc7feb56f408acaffbed8e34 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 9 Oct 2026 16:39:25 +0200
 Subject: [PATCH] sdk_dpaa: bound a port's queues to the CPU by its share of
@@ -43,7 +43,7 @@ index a14b325f2b4b..147b421c7d68 100644
  	bool "DPAA Ethernet debugfs interface"
  	depends on DEBUG_FS && FSL_SDK_DPAA_ETH
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-index 8f959f60d3ec..c5a82480def0 100644
+index c5a23f36b7d7..3d56598a4bf2 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 @@ -100,6 +100,13 @@ static uint8_t debug = -1;
@@ -60,7 +60,7 @@ index 8f959f60d3ec..c5a82480def0 100644
  /* This has to work in tandem with the DPA_CS_THRESHOLD_xxx values. */
  static uint16_t tx_timeout = 1000;
  module_param(tx_timeout, ushort, S_IRUGO);
-@@ -896,10 +903,23 @@ dpa_priv_bp_probe(struct device *dev)
+@@ -898,10 +905,23 @@ dpa_priv_bp_probe(struct device *dev)
  	return dpa_bp;
  }
  
@@ -88,7 +88,7 @@ index 8f959f60d3ec..c5a82480def0 100644
   */
  static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
  {
-@@ -913,11 +933,12 @@ static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
+@@ -915,11 +935,12 @@ static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
  		goto out_error;
  	}
  

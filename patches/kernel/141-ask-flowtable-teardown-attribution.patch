@@ -1,5 +1,10 @@
+From 736a1b61f3d8dd2d45e5362e7a7c0534b922c537 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 19 Oct 2026 11:13:16 +0200
 Subject: [PATCH] netfilter: attribute flowtable teardowns to their cause
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 The garbage collector retires a flow when any of four independent
 conditions holds, and they are evaluated in a single expression:
@@ -21,9 +26,16 @@ most once per flow.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
+ include/net/netns/flow_table.h       |  4 ++++
+ net/netfilter/nf_flow_table_core.c   | 21 ++++++++++++++++++---
+ net/netfilter/nf_flow_table_procfs.c | 11 ++++++++---
+ 3 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/include/net/netns/flow_table.h b/include/net/netns/flow_table.h
+index 1c5fc657e267..16c12f3d67d0 100644
 --- a/include/net/netns/flow_table.h
 +++ b/include/net/netns/flow_table.h
-@@ -6,6 +6,10 @@
+@@ -6,6 +6,10 @@ struct nf_flow_table_stat {
  	unsigned int count_wq_add;
  	unsigned int count_wq_del;
  	unsigned int count_wq_stats;
@@ -34,9 +46,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  };
  
  struct netns_ft {
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index 3e051b1c9260..04c939a1c501 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -473,9 +473,24 @@
+@@ -508,9 +508,24 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
@@ -64,9 +78,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  		flow_offload_teardown(flow);
  
  	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
+diff --git a/net/netfilter/nf_flow_table_procfs.c b/net/netfilter/nf_flow_table_procfs.c
+index 159b033a43e6..fc2b0bbdad40 100644
 --- a/net/netfilter/nf_flow_table_procfs.c
 +++ b/net/netfilter/nf_flow_table_procfs.c
-@@ -45,14 +45,19 @@
+@@ -45,14 +45,19 @@ static int nf_flow_table_cpu_seq_show(struct seq_file *seq, void *v)
  	const struct nf_flow_table_stat *st = v;
  
  	if (v == SEQ_START_TOKEN) {
@@ -89,3 +105,6 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  		);
  	return 0;
  }
+-- 
+2.47.3
+

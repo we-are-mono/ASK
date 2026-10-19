@@ -1,4 +1,4 @@
-From 3474d9590ce8779022a9c9a92c8f7140f6361f5a Mon Sep 17 00:00:00 2001
+From 62b6698dc19ff96d4993bb7f0bc27c45dde06f79 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 18:49:36 +0200
 Subject: [PATCH] bridge: snapshot multicast data egress ports for L3 offload
@@ -112,10 +112,10 @@ index c5fe3b2a53e8..f8b2b2939627 100644
  {
  	return false;
 diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
-index d43b39ed61c7..837de8feda62 100644
+index d8b1d66de9a6..a5a5873a5030 100644
 --- a/net/bridge/br_multicast.c
 +++ b/net/bridge/br_multicast.c
-@@ -5071,6 +5071,278 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
+@@ -5070,6 +5070,278 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
  }
  EXPORT_SYMBOL_GPL(br_multicast_has_router_adjacent);
  

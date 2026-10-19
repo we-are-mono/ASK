@@ -1,4 +1,4 @@
-From 11f9e33f542f72185c2dbbc4c429921c5488a46e Mon Sep 17 00:00:00 2001
+From b0af158cebc89b79af6576f1319790dcb97df707 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 23:30:35 +0200
 Subject: [PATCH] sdk_dpaa: hold RCU across the offload module's transmit hooks

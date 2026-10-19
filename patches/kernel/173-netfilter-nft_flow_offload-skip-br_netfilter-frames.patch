@@ -1,4 +1,4 @@
-From 91fc92daf9c2ed1e4dc7cba4d037c02db8711474 Mon Sep 17 00:00:00 2001
+From 42727aea3803110ed518d1f4f28af19130c5c45a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 17 Oct 2026 01:14:39 +0200
 Subject: [PATCH] netfilter: nft_flow_offload: skip frames br_netfilter bridges

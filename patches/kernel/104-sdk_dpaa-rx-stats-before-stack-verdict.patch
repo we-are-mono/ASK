@@ -1,4 +1,4 @@
-From 5d3ddbeb13fc303c048af9bd0672ad06ad193ef1 Mon Sep 17 00:00:00 2001
+From 71aeb8890d583b7c84f0b776ff97e7253d2d6125 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 20 Sep 2026 16:10:21 +0200
 Subject: [PATCH] sdk_dpaa: count received frames before the stack's verdict
@@ -27,10 +27,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 18 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 65518093cfee..4d041e0fe4d4 100644
+index 28998254ccc9..957015324970 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -774,12 +774,23 @@ void __hot _dpa_rx(struct net_device *net_dev,
+@@ -790,12 +790,23 @@ void __hot _dpa_rx(struct net_device *net_dev,
  
  	skb_len = skb->len;
  
@@ -58,7 +58,7 @@ index 65518093cfee..4d041e0fe4d4 100644
  #endif
  
  	skb_record_rx_queue(skb, raw_smp_processor_id());
-@@ -790,15 +801,10 @@ void __hot _dpa_rx(struct net_device *net_dev,
+@@ -806,15 +817,10 @@ void __hot _dpa_rx(struct net_device *net_dev,
  		struct dpa_napi_portal *np = &percpu_priv->np[pc->index];
  
  		np->p = portal;

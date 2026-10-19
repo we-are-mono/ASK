@@ -47,7 +47,7 @@ typed rules, counters and opaque hardware handles, without CDX control/device
 structures or firmware objects. It is maintained with this repository, with no
 stable binary ABI promise. The adapter depends on `cdx` and `nf_flow_table`;
 CDX has no flowtable-module dependency. Kernel integration targets the pinned
-[6.12.103 recipe](../../meta-ask/recipes-kernel/linux/linux-ask_6.12.bb) and SDK source.
+[6.12.112 recipe](../../meta-ask/recipes-kernel/linux/linux-ask_6.12.bb) and SDK source.
 
 ## Startup and configuration seal
 

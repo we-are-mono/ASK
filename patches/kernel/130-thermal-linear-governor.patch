@@ -1,10 +1,10 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From bc197a1e948b2e33d69e83e0cf0dd1bab24cae22 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
-Date: Mon, 07 Sep 2026 20:49:05 +0200
+Date: Mon, 7 Sep 2026 20:49:05 +0200
 Subject: [PATCH] thermal: add linear active cooling governor with passive
  step-wise control
 
-Local implementation against Linux 6.12.103; not an upstream backport.
+Local implementation against Linux 6.12.112; not an upstream backport.
 Interpolate each active cooling map within its limits up to the next
 higher active trip bound to that device in the same zone. Keep core
 hysteresis, maximum-demand aggregation, and hot/critical handling. Reuse
@@ -16,23 +16,81 @@ sensors and cooling devices.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- drivers/thermal/Kconfig                     |   26 ++
- drivers/thermal/Makefile                    |    1 
- drivers/thermal/thermal_core.h              |    4 
- drivers/thermal/gov_step_wise.c             |   11 -
- drivers/thermal/gov_linear.c                |  108 ++++++++++
- drivers/thermal/gov_linear_test.c           |  292 +++++++++++++++++++++++++++
- Documentation/driver-api/thermal/index.rst  |    1 
- Documentation/driver-api/thermal/linear.rst |   39 ++++
+ Documentation/driver-api/thermal/index.rst  |   1 +
+ Documentation/driver-api/thermal/linear.rst |  39 +++
+ drivers/thermal/Kconfig                     |  26 ++
+ drivers/thermal/Makefile                    |   1 +
+ drivers/thermal/gov_linear.c                | 108 ++++++++
+ drivers/thermal/gov_linear_test.c           | 292 ++++++++++++++++++++
+ drivers/thermal/gov_step_wise.c             |  11 +-
+ drivers/thermal/thermal_core.h              |   4 +
  8 files changed, 476 insertions(+), 6 deletions(-)
+ create mode 100644 Documentation/driver-api/thermal/linear.rst
  create mode 100644 drivers/thermal/gov_linear.c
  create mode 100644 drivers/thermal/gov_linear_test.c
- create mode 100644 Documentation/driver-api/thermal/linear.rst
 
+diff --git a/Documentation/driver-api/thermal/index.rst b/Documentation/driver-api/thermal/index.rst
+index a886028014ab..301b9c7df3e6 100644
+--- a/Documentation/driver-api/thermal/index.rst
++++ b/Documentation/driver-api/thermal/index.rst
+@@ -11,6 +11,7 @@ Thermal
+    cpu-idle-cooling
+    sysfs-api
+    power_allocator
++   linear
+ 
+    exynos_thermal
+    exynos_thermal_emulation
+diff --git a/Documentation/driver-api/thermal/linear.rst b/Documentation/driver-api/thermal/linear.rst
+new file mode 100644
+index 000000000000..1e2c8299d40a
+--- /dev/null
++++ b/Documentation/driver-api/thermal/linear.rst
+@@ -0,0 +1,39 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++Linear thermal governor
++=======================
++
++The ``linear`` governor interpolates active cooling states using ordinary
++thermal trips and cooling maps. This is a local governor, not an upstream
++Linux feature. Passive trips retain the step_wise governor's behavior. Hot
++and critical trip handling remains in thermal core.
++
++For an active map, the lower state is requested at its trip temperature. The
++upper state is reached at the next higher active trip in the same zone that
++is also bound to this cooling device. Between those temperatures the state
++is interpolated, with integer division rounding down. Beyond the endpoint it
++is clamped to the upper state. A terminal map requests its upper state as
++soon as it becomes active. A fixed-state map has equal lower and upper limits.
++Trip order does not matter. Equal-temperature trips do not form a segment.
++
++For a continuous curve, set each map's upper state equal to the next map's
++lower state, and give the last map equal lower and upper states. For example,
++a fan exposing PWM bytes as cooling states can use a 40 C active trip with
++limits 34..255 and an 80 C active trip with limits 255..255. This requests 34,
++89, 144, 199 and 255 at 40, 50, 60, 70 and 80 C respectively. Cooling states
++are driver-defined; the governor does not interpret them as RPM or duty.
++
++The core's hysteresis threshold determines whether a map is active. A 2 C
++hysteresis on the 40 C trip starts cooling at 40 C and keeps at least state
++34 until the temperature falls below 38 C. Use zero hysteresis on subsequent
++points to retrace the same line when cooling. Inactive maps release their
++request; the core applies the maximum demand across all maps and zones.
++
++Select ``CONFIG_THERMAL_DEFAULT_GOV_LINEAR`` for automatic boot-time control,
++or select ``linear`` through a zone's policy attribute. The zone must poll or
++otherwise deliver temperature updates throughout the curve; trip interrupts
++alone cannot continuously adjust the state within a segment. Hardware startup
++boosts belong in the fan driver. The governor re-applies active-device requests
++on each update so transient write failures are retried. Temperature read
++failures retain the last demand and use the thermal core's existing retry
++behavior; this governor does not introduce a separate sensor watchdog.
 diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index 61e7ae524b1f..0c0ff468a28e 100644
 --- a/drivers/thermal/Kconfig
 +++ b/drivers/thermal/Kconfig
-@@ -106,6 +106,15 @@
+@@ -106,6 +106,15 @@ config THERMAL_DEFAULT_GOV_STEP_WISE
  	  Use the step_wise governor as default. This throttles the
  	  devices one step at a time.
  
@@ -48,11 +106,10 @@ diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
  config THERMAL_DEFAULT_GOV_FAIR_SHARE
  	bool "fair_share"
  	select THERMAL_GOV_FAIR_SHARE
-@@ -151,6 +160,23 @@
- 	help
+@@ -152,6 +161,23 @@ config THERMAL_GOV_STEP_WISE
  	  Enable this to manage platform thermals using a simple linear
  	  governor.
-+
+ 
 +config THERMAL_GOV_LINEAR
 +	bool "Linear thermal governor"
 +	select THERMAL_GOV_STEP_WISE
@@ -69,13 +126,15 @@ diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
 +	help
 +	  Exercise the governor through thermal core with simulated sensors
 +	  and cooling devices, including hysteresis and passive cooling.
- 
++
  config THERMAL_GOV_BANG_BANG
  	bool "Bang Bang thermal governor"
+ 	default n
 diff --git a/drivers/thermal/Makefile b/drivers/thermal/Makefile
+index 41c4d56beb40..2dbb192179c6 100644
 --- a/drivers/thermal/Makefile
 +++ b/drivers/thermal/Makefile
-@@ -21,6 +21,7 @@
+@@ -21,6 +21,7 @@ CFLAGS_gov_power_allocator.o			:= -I$(src)
  thermal_sys-$(CONFIG_THERMAL_GOV_FAIR_SHARE)	+= gov_fair_share.o
  thermal_sys-$(CONFIG_THERMAL_GOV_BANG_BANG)	+= gov_bang_bang.o
  thermal_sys-$(CONFIG_THERMAL_GOV_STEP_WISE)	+= gov_step_wise.o
@@ -83,69 +142,9 @@ diff --git a/drivers/thermal/Makefile b/drivers/thermal/Makefile
  thermal_sys-$(CONFIG_THERMAL_GOV_USER_SPACE)	+= gov_user_space.o
  thermal_sys-$(CONFIG_THERMAL_GOV_POWER_ALLOCATOR)	+= gov_power_allocator.o
  
-diff --git a/drivers/thermal/thermal_core.h b/drivers/thermal/thermal_core.h
---- a/drivers/thermal/thermal_core.h
-+++ b/drivers/thermal/thermal_core.h
-@@ -167,6 +167,8 @@
- #define DEFAULT_THERMAL_GOVERNOR       "power_allocator"
- #elif defined(CONFIG_THERMAL_DEFAULT_GOV_BANG_BANG)
- #define DEFAULT_THERMAL_GOVERNOR       "bang_bang"
-+#elif defined(CONFIG_THERMAL_DEFAULT_GOV_LINEAR)
-+#define DEFAULT_THERMAL_GOVERNOR       "linear"
- #endif
- 
- /* Initial state of a cooling device during binding */
-@@ -209,6 +211,8 @@
- 
- void thermal_cdev_update(struct thermal_cooling_device *);
- void __thermal_cdev_update(struct thermal_cooling_device *cdev);
-+void thermal_step_wise_update(struct thermal_zone_device *tz,
-+			      const struct thermal_trip_desc *td);
- 
- int get_tz_trend(struct thermal_zone_device *tz, const struct thermal_trip *trip);
- 
-diff --git a/drivers/thermal/gov_step_wise.c b/drivers/thermal/gov_step_wise.c
---- a/drivers/thermal/gov_step_wise.c
-+++ b/drivers/thermal/gov_step_wise.c
-@@ -78,9 +78,8 @@
- 	return instance->target;
- }
- 
--static void thermal_zone_trip_update(struct thermal_zone_device *tz,
--				     const struct thermal_trip_desc *td,
--				     int trip_threshold)
-+void thermal_step_wise_update(struct thermal_zone_device *tz,
-+			      const struct thermal_trip_desc *td)
- {
- 	const struct thermal_trip *trip = &td->trip;
- 	enum thermal_trend trend = get_tz_trend(tz, trip);
-@@ -88,13 +87,13 @@
- 	struct thermal_instance *instance;
- 	bool throttle = false;
- 
--	if (tz->temperature >= trip_threshold) {
-+	if (tz->temperature >= td->threshold) {
- 		throttle = true;
- 		trace_thermal_zone_trip(tz, trip_id, trip->type);
- 	}
- 
- 	dev_dbg(&tz->device, "Trip%d[type=%d,temp=%d]:trend=%d,throttle=%d\n",
--		trip_id, trip->type, trip_threshold, trend, throttle);
-+		trip_id, trip->type, td->threshold, trend, throttle);
- 
- 	list_for_each_entry(instance, &td->thermal_instances, trip_node) {
- 		int old_target;
-@@ -138,7 +137,7 @@
- 		    trip->type == THERMAL_TRIP_HOT)
- 			continue;
- 
--		thermal_zone_trip_update(tz, td, td->threshold);
-+		thermal_step_wise_update(tz, td);
- 	}
- 
- 	for_each_trip_desc(tz, td) {
 diff --git a/drivers/thermal/gov_linear.c b/drivers/thermal/gov_linear.c
 new file mode 100644
+index 000000000000..d936f757118c
 --- /dev/null
 +++ b/drivers/thermal/gov_linear.c
 @@ -0,0 +1,108 @@
@@ -259,6 +258,7 @@ new file mode 100644
 +#endif
 diff --git a/drivers/thermal/gov_linear_test.c b/drivers/thermal/gov_linear_test.c
 new file mode 100644
+index 000000000000..24a424407457
 --- /dev/null
 +++ b/drivers/thermal/gov_linear_test.c
 @@ -0,0 +1,292 @@
@@ -554,61 +554,69 @@ new file mode 100644
 +	.test_cases = linear_test_cases,
 +};
 +kunit_test_suite(linear_test_suite);
-diff --git a/Documentation/driver-api/thermal/index.rst b/Documentation/driver-api/thermal/index.rst
---- a/Documentation/driver-api/thermal/index.rst
-+++ b/Documentation/driver-api/thermal/index.rst
-@@ -11,6 +11,7 @@
-    cpu-idle-cooling
-    sysfs-api
-    power_allocator
-+   linear
+diff --git a/drivers/thermal/gov_step_wise.c b/drivers/thermal/gov_step_wise.c
+index b191e11e553b..a28ba495947f 100644
+--- a/drivers/thermal/gov_step_wise.c
++++ b/drivers/thermal/gov_step_wise.c
+@@ -76,9 +76,8 @@ static unsigned long get_target_state(struct thermal_instance *instance,
+ 	return instance->target;
+ }
  
-    exynos_thermal
-    exynos_thermal_emulation
-diff --git a/Documentation/driver-api/thermal/linear.rst b/Documentation/driver-api/thermal/linear.rst
-new file mode 100644
---- /dev/null
-+++ b/Documentation/driver-api/thermal/linear.rst
-@@ -0,0 +1,39 @@
-+.. SPDX-License-Identifier: GPL-2.0-only
-+
-+Linear thermal governor
-+=======================
-+
-+The ``linear`` governor interpolates active cooling states using ordinary
-+thermal trips and cooling maps. This is a local governor, not an upstream
-+Linux feature. Passive trips retain the step_wise governor's behavior. Hot
-+and critical trip handling remains in thermal core.
-+
-+For an active map, the lower state is requested at its trip temperature. The
-+upper state is reached at the next higher active trip in the same zone that
-+is also bound to this cooling device. Between those temperatures the state
-+is interpolated, with integer division rounding down. Beyond the endpoint it
-+is clamped to the upper state. A terminal map requests its upper state as
-+soon as it becomes active. A fixed-state map has equal lower and upper limits.
-+Trip order does not matter. Equal-temperature trips do not form a segment.
-+
-+For a continuous curve, set each map's upper state equal to the next map's
-+lower state, and give the last map equal lower and upper states. For example,
-+a fan exposing PWM bytes as cooling states can use a 40 C active trip with
-+limits 34..255 and an 80 C active trip with limits 255..255. This requests 34,
-+89, 144, 199 and 255 at 40, 50, 60, 70 and 80 C respectively. Cooling states
-+are driver-defined; the governor does not interpret them as RPM or duty.
-+
-+The core's hysteresis threshold determines whether a map is active. A 2 C
-+hysteresis on the 40 C trip starts cooling at 40 C and keeps at least state
-+34 until the temperature falls below 38 C. Use zero hysteresis on subsequent
-+points to retrace the same line when cooling. Inactive maps release their
-+request; the core applies the maximum demand across all maps and zones.
-+
-+Select ``CONFIG_THERMAL_DEFAULT_GOV_LINEAR`` for automatic boot-time control,
-+or select ``linear`` through a zone's policy attribute. The zone must poll or
-+otherwise deliver temperature updates throughout the curve; trip interrupts
-+alone cannot continuously adjust the state within a segment. Hardware startup
-+boosts belong in the fan driver. The governor re-applies active-device requests
-+on each update so transient write failures are retried. Temperature read
-+failures retain the last demand and use the thermal core's existing retry
-+behavior; this governor does not introduce a separate sensor watchdog.
+-static void thermal_zone_trip_update(struct thermal_zone_device *tz,
+-				     const struct thermal_trip_desc *td,
+-				     int trip_threshold)
++void thermal_step_wise_update(struct thermal_zone_device *tz,
++			      const struct thermal_trip_desc *td)
+ {
+ 	const struct thermal_trip *trip = &td->trip;
+ 	enum thermal_trend trend = get_tz_trend(tz, trip);
+@@ -86,13 +85,13 @@ static void thermal_zone_trip_update(struct thermal_zone_device *tz,
+ 	struct thermal_instance *instance;
+ 	bool throttle = false;
+ 
+-	if (tz->temperature >= trip_threshold) {
++	if (tz->temperature >= td->threshold) {
+ 		throttle = true;
+ 		trace_thermal_zone_trip(tz, trip_id, trip->type);
+ 	}
+ 
+ 	dev_dbg(&tz->device, "Trip%d[type=%d,temp=%d]:trend=%d,throttle=%d\n",
+-		trip_id, trip->type, trip_threshold, trend, throttle);
++		trip_id, trip->type, td->threshold, trend, throttle);
+ 
+ 	list_for_each_entry(instance, &td->thermal_instances, trip_node) {
+ 		int old_target;
+@@ -136,7 +135,7 @@ static void step_wise_manage(struct thermal_zone_device *tz)
+ 		    trip->type == THERMAL_TRIP_HOT)
+ 			continue;
+ 
+-		thermal_zone_trip_update(tz, td, td->threshold);
++		thermal_step_wise_update(tz, td);
+ 	}
+ 
+ 	for_each_trip_desc(tz, td) {
+diff --git a/drivers/thermal/thermal_core.h b/drivers/thermal/thermal_core.h
+index 007990ce139d..7db049e7c2ec 100644
+--- a/drivers/thermal/thermal_core.h
++++ b/drivers/thermal/thermal_core.h
+@@ -167,6 +167,8 @@ struct thermal_zone_device {
+ #define DEFAULT_THERMAL_GOVERNOR       "power_allocator"
+ #elif defined(CONFIG_THERMAL_DEFAULT_GOV_BANG_BANG)
+ #define DEFAULT_THERMAL_GOVERNOR       "bang_bang"
++#elif defined(CONFIG_THERMAL_DEFAULT_GOV_LINEAR)
++#define DEFAULT_THERMAL_GOVERNOR       "linear"
+ #endif
+ 
+ /* Initial state of a cooling device during binding */
+@@ -209,6 +211,8 @@ static inline bool cdev_is_power_actor(struct thermal_cooling_device *cdev)
+ 
+ void thermal_cdev_update(struct thermal_cooling_device *);
+ void __thermal_cdev_update(struct thermal_cooling_device *cdev);
++void thermal_step_wise_update(struct thermal_zone_device *tz,
++			      const struct thermal_trip_desc *td);
+ 
+ int get_tz_trend(struct thermal_zone_device *tz, const struct thermal_trip *trip);
+ 
 -- 
 2.47.3
 

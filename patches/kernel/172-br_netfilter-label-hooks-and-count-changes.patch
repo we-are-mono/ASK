@@ -1,4 +1,4 @@
-From dc2363128fedbb70d6490e42e6383ccfa05c6290 Mon Sep 17 00:00:00 2001
+From b3ba891f5f4d02cabff87635d011beaf846418f6 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 16 Oct 2026 22:48:30 +0200
 Subject: [PATCH] br_netfilter: label its bridge hooks and count its changes
@@ -54,10 +54,10 @@ index 42ac5238fc3c..3ef8b4ab095c 100644
  
  struct nf_hook_ops {
 diff --git a/include/net/netfilter/nf_port_probe.h b/include/net/netfilter/nf_port_probe.h
-index c6ecb4b67d41..f92634115dab 100644
+index bd0516c48fe2..9e59dc5b65f0 100644
 --- a/include/net/netfilter/nf_port_probe.h
 +++ b/include/net/netfilter/nf_port_probe.h
-@@ -108,4 +108,31 @@ static inline unsigned int nf_xt_seq(const struct net *net)
+@@ -114,4 +114,31 @@ static inline unsigned int nf_xt_seq(const struct net *net)
  	return atomic_read_acquire(&net->nf.xt_seq);
  }
  

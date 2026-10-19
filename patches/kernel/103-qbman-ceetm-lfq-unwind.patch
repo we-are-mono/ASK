@@ -1,4 +1,6 @@
+From d12891e7e3301d958d57d0851105c29b97133297 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 19 Oct 2026 11:13:14 +0200
 Subject: [PATCH] qbman: unwind CEETM LFQ claims and drain pending ERNs
 
 The LFQ claim reserves an ID before allocating its software object and
@@ -23,9 +25,14 @@ releasing the portal lock; convert popped descriptors to CPU byte order.
 CDX can then reclaim stranded frames instead of discarding their FDs.
 
 Upstream-Status: Pending
+---
+ drivers/staging/fsl_qbman/qman_high.c | 69 +++++++++++++++++++++++----
+ drivers/staging/fsl_qbman/qman_low.h  | 11 +++++
+ include/linux/fsl_qman.h              | 20 ++++++++
+ 3 files changed, 92 insertions(+), 8 deletions(-)
 
 diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
-index afb88db..2c78fe7 100644
+index afb88dbbe3e2..2c78fe7debf8 100644
 --- a/drivers/staging/fsl_qbman/qman_high.c
 +++ b/drivers/staging/fsl_qbman/qman_high.c
 @@ -1539,6 +1539,27 @@ u32 qman_poll_slow(void)
@@ -158,8 +165,30 @@ index afb88db..2c78fe7 100644
  }
  EXPORT_SYMBOL(qman_ceetm_lfq_claim);
  
+diff --git a/drivers/staging/fsl_qbman/qman_low.h b/drivers/staging/fsl_qbman/qman_low.h
+index 0e6fdf8d30c1..529f4fbf959a 100644
+--- a/drivers/staging/fsl_qbman/qman_low.h
++++ b/drivers/staging/fsl_qbman/qman_low.h
+@@ -517,6 +517,17 @@ static inline u8 qm_eqcr_get_avail(struct qm_portal *portal)
+ 	return eqcr->available;
+ }
+ 
++/* CI stashing can leave the cached index behind the final one or two
++ * completions. Teardown must read the hardware consumer index without
++ * advancing the cached accounting used by later enqueue operations. */
++static inline u8 qm_eqcr_get_hw_fill(struct qm_portal *portal)
++{
++	struct qm_eqcr *eqcr = &portal->eqcr;
++	u8 ci = qm_in(EQCR_CI_CINH) & (QM_EQCR_SIZE - 1);
++
++	return qm_cyc_diff(QM_EQCR_SIZE, ci, EQCR_PTR2IDX(eqcr->cursor));
++}
++
+ static inline u8 qm_eqcr_get_fill(struct qm_portal *portal)
+ {
+ 	register struct qm_eqcr *eqcr = &portal->eqcr;
 diff --git a/include/linux/fsl_qman.h b/include/linux/fsl_qman.h
-index 68225db..79785e3 100644
+index 68225db4d865..79785e3fbdc1 100644
 --- a/include/linux/fsl_qman.h
 +++ b/include/linux/fsl_qman.h
 @@ -2153,6 +2153,15 @@ int qman_poll_dqrr(unsigned int limit);
@@ -196,25 +225,6 @@ index 68225db..79785e3 100644
  	/* ---------------------- */
  	/* CEETM :: logical FQIDs */
  	/* ---------------------- */
-diff --git a/drivers/staging/fsl_qbman/qman_low.h b/drivers/staging/fsl_qbman/qman_low.h
-index 0e6fdf8..529f4fb 100644
---- a/drivers/staging/fsl_qbman/qman_low.h
-+++ b/drivers/staging/fsl_qbman/qman_low.h
-@@ -517,6 +517,17 @@ static inline u8 qm_eqcr_get_avail(struct qm_portal *portal)
- 	return eqcr->available;
- }
- 
-+/* CI stashing can leave the cached index behind the final one or two
-+ * completions. Teardown must read the hardware consumer index without
-+ * advancing the cached accounting used by later enqueue operations. */
-+static inline u8 qm_eqcr_get_hw_fill(struct qm_portal *portal)
-+{
-+	struct qm_eqcr *eqcr = &portal->eqcr;
-+	u8 ci = qm_in(EQCR_CI_CINH) & (QM_EQCR_SIZE - 1);
-+
-+	return qm_cyc_diff(QM_EQCR_SIZE, ci, EQCR_PTR2IDX(eqcr->cursor));
-+}
-+
- static inline u8 qm_eqcr_get_fill(struct qm_portal *portal)
- {
- 	register struct qm_eqcr *eqcr = &portal->eqcr;
+-- 
+2.47.3
+

@@ -1,4 +1,4 @@
-From 04c24d4b516a8a14998225eb5bae4270c886b772 Mon Sep 17 00:00:00 2001
+From bc07e4ac2b1c914705fd114c77a82e27389da3bd Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 12 Aug 2026 14:14:02 +0200
 Subject: [PATCH] sdk_dpaa: quiet benign "phy device not initialized" ethtool

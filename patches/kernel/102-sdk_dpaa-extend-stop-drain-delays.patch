@@ -1,4 +1,4 @@
-From e414696d49521b9ceb7734e037d5aa18ef92d8a3 Mon Sep 17 00:00:00 2001
+From 3789fd0630321db1bd694219615b702e850359b4 Mon Sep 17 00:00:00 2001
 From: Madalin Bucur <madalin.bucur@nxp.com>
 Date: Thu, 31 Oct 2019 16:37:57 +0200
 Subject: [PATCH] sdk_dpaa: extend delays in ndo_stop
@@ -29,9 +29,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
+index 11bdc426726e..c14191b69d1a 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
-@@ -193,7 +193,7 @@
+@@ -193,7 +193,7 @@ int __cold dpa_stop(struct net_device *net_dev)
  	/* Allow the Fman (Tx) port to process in-flight frames before we
  	 * try switching it off.
  	 */
@@ -40,14 +41,15 @@ diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers
  
  	_errno = mac_dev->stop(mac_dev);
  	if (unlikely(_errno < 0))
-@@ -209,6 +209,8 @@
- 	if (mac_dev->phy_dev)
+@@ -210,6 +210,8 @@ int __cold dpa_stop(struct net_device *net_dev)
  		phy_disconnect(mac_dev->phy_dev);
  	mac_dev->phy_dev = NULL;
-+
-+	msleep(200);
  
++	msleep(200);
++
  	return _errno;
  }
+ EXPORT_SYMBOL(dpa_stop);
 -- 
 2.47.3
+

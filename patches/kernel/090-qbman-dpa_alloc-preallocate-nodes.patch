@@ -1,4 +1,4 @@
-From 2f737562fffe3f57ac10accd02025a80a87d1de0 Mon Sep 17 00:00:00 2001
+From b94b100b14bfbb7074f15d03c8b14dd56c4e2b06 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] staging/fsl_qbman: dpa_alloc_new: preallocate nodes before

@@ -1,5 +1,5 @@
 SUMMARY = "Linux kernel for ASK LS1046A test target"
-DESCRIPTION = "Stock mainline 6.12.103 kernel with the NXP DPAA/FMan/QBMan \
+DESCRIPTION = "Stock mainline 6.12.112 kernel with the NXP DPAA/FMan/QBMan \
 SDK overlaid on top and the ASK patch bundle applied. This is the Yocto \
 twin of the OpenWrt-first build (scripts/mono-sync-ask-kernel.sh): the \
 same mainline base + NXP SDK overlay + ASK hooks, producing a bootable \
@@ -25,7 +25,7 @@ FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/patches/kernel:"
 # drifting copy under files/.
 FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/dts:"
 
-LINUX_VERSION = "6.12.103"
+LINUX_VERSION = "6.12.112"
 PV = "${LINUX_VERSION}+git${SRCPV}"
 
 # ============================================================================
@@ -36,15 +36,15 @@ PV = "${LINUX_VERSION}+git${SRCPV}"
 # ============================================================================
 
 # --- Pin 1: mainline kernel base (kernel.org stable) ---
-# NB: this is the COMMIT v6.12.103 points at, not the tag object. The
-# annotated tag v6.12.103 is object da1efec88de0..., which `git rev-parse
-# v6.12.103` prints; the commit it peels to (`v6.12.103^{commit}`) is the
+# NB: this is the COMMIT v6.12.112 points at, not the tag object. The
+# annotated tag v6.12.112 is object 1092ff6640e9..., which `git rev-parse
+# v6.12.112` prints; the commit it peels to (`v6.12.112^{commit}`) is the
 # value below. bitbake's SRCREV must be a commit (checkout -B / branch
 # --contains operate on commits), so pin the peeled commit.
 KERNEL_SRC = "git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git;protocol=https"
 KERNEL_BRANCH = "linux-6.12.y"
-# v6.12.103 (the annotated tag object is da1efec8...; this is its peeled commit).
-KERNEL_SRCREV = "25c09b42358e73e1476e517b296edb6344f2e4bd"
+# v6.12.112 (the annotated tag object is 1092ff66...; this is its peeled commit).
+KERNEL_SRCREV = "7aba70ab2e8d8ab3cd45abcaa15e1119a00dc42a"
 
 # --- Pin 2: NXP DPAA/FMan/QBMan SDK overlay ---
 # The SDK SRCREV lives in a canonical, format-neutral pin file
@@ -74,7 +74,6 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://093-netlink-name-every-cb-mutex-class.patch \
            file://094-sdk-fman-dpaa-qbman-kasan-sanitize-off.patch \
            file://096-sdk_fman-mac-hash-alloc-null-check.patch \
-           file://097-xfrm-trans-queue-force-dst-refcount.patch \
            file://098-sdk_dpaa-bp-alloc-slab-build-skb.patch \
            file://099-sdk_fman-ehash-flex-arrays.patch \
            file://100-sdk_dpaa-ethtool-quiet-phyless-ports.patch \
@@ -98,7 +97,6 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://142-ask-flowtable-teardown-handback-once.patch \
            file://143-ask-flowtable-tunnel-path.patch \
            file://144-ask-flowtable-extend-ct-timeout.patch \
-           file://145-netfilter-flowtable-upstream-lifetime-fixes.patch \
            file://146-xfrm-packet-offload-mixed-family-child-route.patch \
            file://147-netfilter-flowtable-attach-conntrack.patch \
            file://148-netfilter-port-probe.patch \

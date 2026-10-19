@@ -1,4 +1,4 @@
-From acb6d2a6fc5aa8a971b600a2177daf3f321a9d21 Mon Sep 17 00:00:00 2001
+From d09a5084e8a7b1f57a4dfb4fbdf3b6da828fd87f Mon Sep 17 00:00:00 2001
 From: Petr Wozniak <petr.wozniak@gmail.com>
 Date: Sun, 21 Jun 2026 12:03:26 +0200
 Subject: [PATCH] xfrm: propagate -EINPROGRESS from validate_xmit_xfrm()
@@ -36,7 +36,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 10 insertions(+), 4 deletions(-)
 
 diff --git a/net/core/dev.c b/net/core/dev.c
-index 40936205ea54..cc7f9a48cb0c 100644
+index 3f68d968b237..0c15c90691b3 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
 @@ -3765,6 +3765,9 @@ int skb_csum_hwoffload_help(struct sk_buff *skb,

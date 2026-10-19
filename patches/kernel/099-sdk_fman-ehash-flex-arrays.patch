@@ -1,4 +1,4 @@
-From 3607d5c2e2d6ecb6105f0ca27834241e5ad182be Mon Sep 17 00:00:00 2001
+From 056048d6a07ad8bc28117828aa4f860b03444081 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 3 Jul 2026 20:34:41 +0200
 Subject: [PATCH] sdk_fman: use C99 flexible arrays in ehash descriptor structs
@@ -32,7 +32,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 7 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-index bd16459d5d81..8cfb906052be 100644
+index 288ea0ded74c..4a1837d67bb6 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 @@ -60,7 +60,7 @@ struct en_ehash_entry {
@@ -44,7 +44,7 @@ index bd16459d5d81..8cfb906052be 100644
  		}__attribute__ ((packed));
  		struct {
  			uint8_t	hash_entry[MAX_EN_EHASH_ENTRY_SIZE];
-@@ -305,7 +305,7 @@ struct en_ehash_strip_all_vlan_hdrs {
+@@ -313,7 +313,7 @@ struct en_ehash_strip_all_vlan_hdrs {
  	uint8_t         op_flags;       /* To check vlan validation should be enabled or disabled*/
  	uint8_t         pad;
  	uint16_t         pad1;
@@ -53,7 +53,7 @@ index bd16459d5d81..8cfb906052be 100644
  }__attribute__ ((packed));
  
  //parameters for STRIP_PPPoE_HDR
-@@ -324,7 +324,7 @@ struct en_ehash_strip_l2_hdrs {
+@@ -332,7 +332,7 @@ struct en_ehash_strip_l2_hdrs {
  		};
  		uint32_t word;
  	};
@@ -62,7 +62,7 @@ index bd16459d5d81..8cfb906052be 100644
  }__attribute__ ((packed));
  
  //parameters for opcode VALIDATE_IPSEC_ID
-@@ -373,7 +373,7 @@ struct en_ehash_insert_l2_hdr {
+@@ -381,7 +381,7 @@ struct en_ehash_insert_l2_hdr {
  		};
  		uint32_t word;
  	};
@@ -71,7 +71,7 @@ index bd16459d5d81..8cfb906052be 100644
  }__attribute__ ((packed));
  
  struct en_ehash_insert_l2_hdr_stats {
-@@ -385,7 +385,7 @@ struct en_ehash_insert_l2_hdr_stats {
+@@ -393,7 +393,7 @@ struct en_ehash_insert_l2_hdr_stats {
                  };
                  uint32_t word;
          };
@@ -80,7 +80,7 @@ index bd16459d5d81..8cfb906052be 100644
  }__attribute__ ((packed));
  
  
-@@ -400,7 +400,7 @@ struct en_ehash_insert_vlan_hdr {
+@@ -408,7 +408,7 @@ struct en_ehash_insert_vlan_hdr {
  		}__attribute__ ((packed));
  		uint32_t word;
  	}__attribute__ ((packed));
@@ -89,7 +89,7 @@ index bd16459d5d81..8cfb906052be 100644
  }__attribute__ ((packed));
  
  struct en_ehash_insert_vlan_hdr_stats {
-@@ -461,7 +461,7 @@ struct en_ehash_insert_l3_hdr {
+@@ -469,7 +469,7 @@ struct en_ehash_insert_l3_hdr {
  		};
  		uint32_t word_1;
  	};

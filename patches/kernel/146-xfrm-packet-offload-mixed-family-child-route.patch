@@ -1,4 +1,4 @@
-From 036f0558160d92873c56cc93f60fb6983d054ebc Mon Sep 17 00:00:00 2001
+From 04c590f98ceb7f55cc98907a425b2dc1399fb5fa Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 18:26:25 +0200
 Subject: [PATCH] xfrm: route a cross-family packet-offload tunnel by the flow
@@ -41,10 +41,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  4 files changed, 139 insertions(+), 21 deletions(-)
 
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index 0c09f0162676..c6d691e94033 100644
+index bd5a813c82ad..a255f85fd353 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
-@@ -1854,12 +1854,19 @@ struct sk_buff *xfrm6_gro_udp_encap_rcv(struct sock *sk, struct list_head *head,
+@@ -1877,12 +1877,19 @@ struct sk_buff *xfrm6_gro_udp_encap_rcv(struct sock *sk, struct list_head *head,
  					struct sk_buff *skb);
  int xfrm_user_policy(struct sock *sk, int optname, sockptr_t optval,
  		     int optlen);
@@ -65,10 +65,10 @@ index 0c09f0162676..c6d691e94033 100644
  
  struct dst_entry *__xfrm_dst_lookup(int family, const struct xfrm_dst_lookup_params *params);
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 2532c1e332da..5fa1a432218f 100644
+index c6efada53d3f..73323775f4ce 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -291,6 +291,7 @@ static int flow_offload_eth_dst(struct net *net,
+@@ -296,6 +296,7 @@ static int flow_offload_eth_dst(struct net *net,
  	struct flow_action_entry *entry1 = flow_action_entry_next(flow_rule);
  	const struct flow_offload_tuple *other_tuple, *this_tuple;
  	const struct dst_entry *dst_cache;
@@ -76,7 +76,7 @@ index 2532c1e332da..5fa1a432218f 100644
  	unsigned char ha[ETH_ALEN];
  	struct neighbour *n;
  	const void *daddr;
-@@ -313,8 +314,6 @@ static int flow_offload_eth_dst(struct net *net,
+@@ -318,8 +319,6 @@ static int flow_offload_eth_dst(struct net *net,
  		daddr = &other_tuple->src_v4;
  		dst_cache = this_tuple->dst_cache;
  		if (this_tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM) {
@@ -85,7 +85,7 @@ index 2532c1e332da..5fa1a432218f 100644
  			/* What leaves this port is the transform's outer
  			 * packet, addressed to the remote tunnel endpoint
  			 * rather than to the tuple's own destination. So the
-@@ -340,7 +339,13 @@ static int flow_offload_eth_dst(struct net *net,
+@@ -345,7 +344,13 @@ static int flow_offload_eth_dst(struct net *net,
  				(const void *)&x->id.daddr.a6 :
  				(const void *)&x->id.daddr.a4;
  		}
@@ -101,10 +101,10 @@ index 2532c1e332da..5fa1a432218f 100644
  			return -ENOENT;
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index 8c4d265b7f47..2b32a9277e1f 100644
+index c23cc825fabd..e0eb9ded16a9 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
-@@ -661,8 +661,15 @@ static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
+@@ -659,8 +659,15 @@ static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
  {
  	struct neighbour *n = NULL;
  
@@ -122,10 +122,10 @@ index 8c4d265b7f47..2b32a9277e1f 100644
  		neigh_event_send(n, NULL);
  		neigh_release(n);
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index 01ffa8de8402..f2d0acaf70d3 100644
+index 5c1f38162dae..2b424b4ec32e 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
-@@ -292,13 +292,35 @@ struct dst_entry *__xfrm_dst_lookup(int family,
+@@ -295,13 +295,35 @@ struct dst_entry *__xfrm_dst_lookup(int family,
  }
  EXPORT_SYMBOL(__xfrm_dst_lookup);
  
@@ -162,7 +162,7 @@ index 01ffa8de8402..f2d0acaf70d3 100644
  	struct net *net = xs_net(x);
  	xfrm_address_t *saddr = &x->props.saddr;
  	xfrm_address_t *daddr = &x->id.daddr;
-@@ -319,21 +341,7 @@ static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
+@@ -322,21 +344,7 @@ static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
  	params.tos = tos;
  	params.oif = oif;
  	params.mark = mark;
@@ -185,7 +185,7 @@ index 01ffa8de8402..f2d0acaf70d3 100644
  
  	dst = __xfrm_dst_lookup(family, &params);
  
-@@ -2666,6 +2674,90 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+@@ -2673,6 +2681,90 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
  	return err;
  }
  
@@ -276,7 +276,7 @@ index 01ffa8de8402..f2d0acaf70d3 100644
  
  /* Allocate chain of dst_entry's, attach known xfrm's, calculate
   * all the metrics... Shortly, bundle a bundle.
-@@ -2733,7 +2825,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+@@ -2740,7 +2832,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
  		xdst->route = dst;
  		dst_copy_metrics(dst1, dst);
  
@@ -286,7 +286,7 @@ index 01ffa8de8402..f2d0acaf70d3 100644
  			__u32 mark = 0;
  			int oif;
  
-@@ -2749,6 +2842,12 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+@@ -2756,6 +2849,12 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
  			err = PTR_ERR(dst);
  			if (IS_ERR(dst))
  				goto put_states;

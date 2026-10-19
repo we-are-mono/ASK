@@ -1,4 +1,6 @@
+From 8c7462a3a17d9231c15552fce00652e0901b8da2 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 19 Oct 2026 11:13:16 +0200
 Subject: [PATCH] netfilter: hand the conntrack back only once per flow
 
 flow_offload_teardown() returns the conntrack to software every time it is
@@ -34,9 +36,14 @@ a kernel bump past d2d31ea8cd80 drops this patch rather than conflicting.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
+ net/netfilter/nf_flow_table_core.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index 04c939a1c501..161b76af2ff6 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -398,9 +398,18 @@
+@@ -433,9 +433,18 @@ static void flow_offload_del(struct nf_flowtable *flow_table,
  
  void flow_offload_teardown(struct flow_offload *flow)
  {
@@ -58,3 +65,6 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  }
  EXPORT_SYMBOL_GPL(flow_offload_teardown);
  
+-- 
+2.47.3
+

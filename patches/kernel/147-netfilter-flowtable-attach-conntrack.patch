@@ -1,4 +1,4 @@
-From c606c04f83a92d77e077a02493182ad296736c97 Mon Sep 17 00:00:00 2001
+From 25051f2e7c67729924caded7e9c48704c4b766f9 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 23:04:04 +0200
 Subject: [PATCH] netfilter: flowtable: attach the conntrack to

@@ -1,4 +1,4 @@
-From 6b8359aa9ec619496f9ea720dc658cd75104eb35 Mon Sep 17 00:00:00 2001
+From 4701fce758818a32cc0838bb62db1516a6e91cab Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 24 Sep 2026 01:55:38 +0200
 Subject: [PATCH] netfilter: let an offload ask whether the ruleset reads a
@@ -297,7 +297,7 @@ index 000000000000..bd0516c48fe2
 +
 +#endif /* _NF_PORT_PROBE_H */
 diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
-index f8301f226852..e2ad2c2cc78c 100644
+index 9cbad535ddc4..59e675307b1d 100644
 --- a/include/net/netfilter/nf_tables.h
 +++ b/include/net/netfilter/nf_tables.h
 @@ -11,6 +11,7 @@
@@ -325,7 +325,7 @@ index f8301f226852..e2ad2c2cc78c 100644
  	struct nft_expr			*exprs[NFT_SET_EXPR_MAX];
  	struct list_head		catchall_list;
  	unsigned char			data[]
-@@ -1956,4 +1960,21 @@ static inline bool nft_commit_in_progress(const struct net *net)
+@@ -1954,4 +1958,21 @@ static inline bool nft_commit_in_progress(const struct net *net)
  	return smp_load_acquire(&net->nft.commit_applying);
  }
  
@@ -865,7 +865,7 @@ index 0ba456c4c634..3a1bac1db1b3 100644
  	return 0;
  
  err4:
-@@ -1877,6 +2176,8 @@ err1:
+@@ -1877,6 +2176,8 @@ static int __init ip_tables_init(void)
  
  static void __exit ip_tables_fini(void)
  {
@@ -895,7 +895,7 @@ index a5db7c67d61b..61e71912c96a 100644
  	kfree(repl);
  	return ret;
 diff --git a/net/ipv6/netfilter/ip6_tables.c b/net/ipv6/netfilter/ip6_tables.c
-index 6c5022242cf0..652422307699 100644
+index f4e01f451d57..be15f987985c 100644
 --- a/net/ipv6/netfilter/ip6_tables.c
 +++ b/net/ipv6/netfilter/ip6_tables.c
 @@ -29,6 +29,8 @@
@@ -1250,7 +1250,7 @@ index 6c5022242cf0..652422307699 100644
  /* Figures out from what hook each rule can be called: returns 0 if
     there are loops.  Puts hook bitmask in comefrom. */
  static int
-@@ -1079,6 +1401,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
+@@ -1084,6 +1406,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
  	oldinfo = xt_replace_table(t, num_counters, newinfo, &ret);
  	if (!oldinfo)
  		goto put_module;
@@ -1259,7 +1259,7 @@ index 6c5022242cf0..652422307699 100644
  
  	/* Update module usage count based on number of rules */
  	if ((oldinfo->number > oldinfo->initial_entries) ||
-@@ -1724,6 +2048,7 @@ static void __ip6t_unregister_table(struct net *net, struct xt_table *table)
+@@ -1729,6 +2053,7 @@ static void __ip6t_unregister_table(struct net *net, struct xt_table *table)
  	if (private->number > private->initial_entries)
  		module_put(table_owner);
  	xt_free_table_info(private);
@@ -1267,7 +1267,7 @@ index 6c5022242cf0..652422307699 100644
  }
  
  int ip6t_register_table(struct net *net, const struct xt_table *table,
-@@ -1761,8 +2086,10 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
+@@ -1766,8 +2091,10 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
  		return PTR_ERR(new_table);
  	}
  
@@ -1279,7 +1279,7 @@ index 6c5022242cf0..652422307699 100644
  
  	num_ops = hweight32(table->valid_hooks);
  	if (num_ops == 0) {
-@@ -1776,15 +2103,27 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
+@@ -1781,15 +2108,27 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
  		goto out_free;
  	}
  
@@ -1309,7 +1309,7 @@ index 6c5022242cf0..652422307699 100644
  	return ret;
  
  out_free:
-@@ -1872,6 +2211,7 @@ static int __init ip6_tables_init(void)
+@@ -1877,6 +2216,7 @@ static int __init ip6_tables_init(void)
  	if (ret < 0)
  		goto err4;
  
@@ -1317,7 +1317,7 @@ index 6c5022242cf0..652422307699 100644
  	return 0;
  
  err4:
-@@ -1884,6 +2224,8 @@ err1:
+@@ -1889,6 +2229,8 @@ static int __init ip6_tables_init(void)
  
  static void __exit ip6_tables_fini(void)
  {
@@ -1483,7 +1483,7 @@ index 041ab3733baa..f7737e648b06 100644
  unlock:
  	mutex_unlock(&nf_nat_proto_mutex);
 diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
-index 5c30a237a3a5..7a6d0496c161 100644
+index 63c141040997..ce5a6ce6a7a3 100644
 --- a/net/netfilter/nf_tables_api.c
 +++ b/net/netfilter/nf_tables_api.c
 @@ -2655,6 +2655,7 @@ static int nf_tables_updchain(struct nft_ctx *ctx, u8 genmask, u8 policy,
@@ -3937,7 +3937,7 @@ index b61dc9c3383e..8f93d7254d61 100644
  		  struct nft_regs *regs,
  		  const struct nft_pktinfo *pkt)
 diff --git a/net/netfilter/nft_ct.c b/net/netfilter/nft_ct.c
-index 277fc60c3372..a26514238ead 100644
+index 8feea8b2422b..36c2dd4c2a74 100644
 --- a/net/netfilter/nft_ct.c
 +++ b/net/netfilter/nft_ct.c
 @@ -389,6 +389,7 @@ static int nft_ct_get_init(const struct nft_ctx *ctx,
@@ -4011,7 +4011,7 @@ index 2b01128737a3..e8d471eecfc9 100644
  static const struct nla_policy nft_masq_policy[NFTA_MASQ_MAX + 1] = {
  	[NFTA_MASQ_FLAGS]		=
 diff --git a/net/netfilter/nft_nat.c b/net/netfilter/nft_nat.c
-index e32cd9fbc7c2..586ed2014380 100644
+index cdbd800cac96..70b02d974420 100644
 --- a/net/netfilter/nft_nat.c
 +++ b/net/netfilter/nft_nat.c
 @@ -18,18 +18,9 @@

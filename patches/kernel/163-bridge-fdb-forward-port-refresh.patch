@@ -1,4 +1,4 @@
-From 7710fd6d859e1d734e9564e1112e47c5363b5dbf Mon Sep 17 00:00:00 2001
+From 63a58c4a5d48d2c45149bc808ad03e0f01e8a431 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 16 Oct 2026 18:35:12 +0200
 Subject: [PATCH] bridge: export an FDB lookup, refresh and port state for L2
@@ -90,7 +90,7 @@ index ba17e9cae800..bf5ce897b36a 100644
  {
  	return 0;
 diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
-index 39cc761012d4..cc2c10a27d80 100644
+index ab00b1e55eae..17f035d3b520 100644
 --- a/net/bridge/br_fdb.c
 +++ b/net/bridge/br_fdb.c
 @@ -267,6 +267,41 @@ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
@@ -135,7 +135,7 @@ index 39cc761012d4..cc2c10a27d80 100644
  struct net_bridge_fdb_entry *br_fdb_find_rcu(struct net_bridge *br,
  					     const unsigned char *addr,
  					     __u16 vid)
-@@ -965,6 +1000,48 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+@@ -966,6 +1001,48 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
  	}
  }
  
@@ -185,10 +185,10 @@ index 39cc761012d4..cc2c10a27d80 100644
  int br_fdb_dump(struct sk_buff *skb,
  		struct netlink_callback *cb,
 diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
-index cb7428f336f0..fbb7b2707c56 100644
+index cb510098fcfc..2b9f5f303d15 100644
 --- a/net/bridge/br_private.h
 +++ b/net/bridge/br_private.h
-@@ -1597,6 +1597,7 @@ int br_vlan_fill_forward_path_mode(struct net_bridge *br,
+@@ -1588,6 +1588,7 @@ int br_vlan_fill_forward_path_mode(struct net_bridge *br,
  				   struct net_bridge_port *dst,
  				   struct net_device_path *path);
  bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid);
@@ -196,7 +196,7 @@ index cb7428f336f0..fbb7b2707c56 100644
  
  static inline struct net_bridge_vlan_group *br_vlan_group(
  					const struct net_bridge *br)
-@@ -1778,6 +1779,12 @@ static inline bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid)
+@@ -1769,6 +1770,12 @@ static inline bool br_vlan_forwarding(const struct net_bridge_port *p, u16 vid)
  	return true;
  }
  
@@ -240,7 +240,7 @@ index 9a5183f24d1b..58a947d3e40b 100644
  struct net_bridge_port *br_get_port(struct net_bridge *br, u16 port_no)
  {
 diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
-index c1cefc1a6799..ee24a81b1787 100644
+index 3199e1b5bd72..3455f5ab6c59 100644
 --- a/net/bridge/br_vlan.c
 +++ b/net/bridge/br_vlan.c
 @@ -1497,6 +1497,19 @@ int br_vlan_fill_forward_path_mode(struct net_bridge *br,

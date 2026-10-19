@@ -1,4 +1,4 @@
-From e685b98b11f46b68611d43cd47102b35ba58aa71 Mon Sep 17 00:00:00 2001
+From ee77c46ebf613480d9f797bd0336acb01ed4b4d4 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 5 Oct 2026 00:45:28 +0200
 Subject: [PATCH] sdk_dpaa: size the MAC max frame length to the port's MTU

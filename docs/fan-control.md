@@ -122,7 +122,7 @@ config also enables thermal emulation for verification. KUnit and the
 
 ## Verification
 
-Run KUnit in a Linux 6.12.103 tree with patches 120 and 130 applied:
+Run KUnit in a Linux 6.12.112 tree with patches 120 and 130 applied:
 
 ```sh
 cat > /tmp/fan.kunitconfig <<'EOF'

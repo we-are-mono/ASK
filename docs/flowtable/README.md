@@ -47,7 +47,7 @@ configuration instructions.
 
 | Area | Current boundary |
 | --- | --- |
-| Kernel and hardware | Repository Linux 6.12.103 with its pinned SDK, LS1046A DPAA/FMAN and existing proprietary NXP firmware |
+| Kernel and hardware | Repository Linux 6.12.112 with its pinned SDK, LS1046A DPAA/FMAN and existing proprietary NXP firmware |
 | Topology and capacity | Initial-netns physical Ethernet ports, up to 40 per flowtable (a representable bound; the board's own ports are the practical limit), at most two flowtables bound at once (a replacement during a Netfilter transaction, or a consumer's offload probe), at most 32,768 directional entries. Any other device a table names, such as a VAP in the LAN bridge, is bound passively and its flows stay in software |
 | Routed traffic | Unicast IPv4 and IPv6 UDP and established/assured TCP; transit ESP over either family, and GRE, IPv4 in IPv4 and IPv6 in IPv4 (6in4) over IPv4, untranslated, keyed on the address pair and protocol, with cdx's `transit` on (patch 174, [transit tunnels](transit.md)); default conntrack zones, and a conntrack mark only within the configured QoS mask ([QoS](qos.md)) or the route-only mask (`route_mark_mask`: mwan3, pbr) |
 | Encapsulation | 802.1Q VLAN subinterfaces on either port, up to two stacked tags per direction, ingress and egress independently. The tag stack is derived from the devices Linux routed through and the pop/push actions must agree with it. A VLAN device, or the device under a session, with an address of its own sends with it, as Linux does. 802.1ad and any upper device that is neither an 802.1Q VLAN, a bridge nor a PPPoE session (bond, MACVLAN) are declined |

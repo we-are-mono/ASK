@@ -1,4 +1,4 @@
-From f331d5814aaf244cad69ef4f40caedf54cb0aecb Mon Sep 17 00:00:00 2001
+From 8329cf55068f1fd4baee0760064a14b493c89003 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 28 Apr 2026 15:11:07 +0200
 Subject: [PATCH] sdk_fman: MAC hash address allocation NULL check
