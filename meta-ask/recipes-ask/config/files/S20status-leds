@@ -8,10 +8,11 @@
 
 # U-Boot leaves the green LED lit. After leds-lp5812 binds, this script
 # turns green off and lights white at a low intensity so the board is
-# visibly running but the LED isn't distractingly bright.
+# visibly running but the LED isn't distractingly bright. The four colours
+# are one multicolour device; multi_intensity follows the DTS child order
+# (red green blue white).
 
-GREEN=/sys/class/leds/status:green
-WHITE=/sys/class/leds/status:white
+STATUS=/sys/class/leds/status:rgbw
 
 case "$1" in
     start|"")
@@ -19,13 +20,10 @@ case "$1" in
         # whole directory, so the lp5812 driver's autoload file isn't seen
         # by it. Probe explicitly here.
         modprobe leds-lp5812 2>/dev/null || true
-        if [ -d "$GREEN" ]; then
-            echo none > "$GREEN/trigger"
-            echo 0    > "$GREEN/brightness"
-        fi
-        if [ -d "$WHITE" ]; then
-            echo none > "$WHITE/trigger"
-            echo 16   > "$WHITE/brightness"
+        if [ -d "$STATUS" ]; then
+            echo none      > "$STATUS/trigger"
+            echo 0 0 0 255 > "$STATUS/multi_intensity"
+            echo 16        > "$STATUS/brightness"
         fi
         ;;
     stop)
