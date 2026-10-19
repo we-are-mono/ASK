@@ -248,23 +248,19 @@ static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 		return FAILURE;
 	}
 
-	if (iface_info->eth_info.speed == PORT_1G_SPEED ) {
+	/* The firmware sets the link mode (100M, 2.5G, ...), not just 1G or 10G.
+	 * A default above the link's rate never binds, so a slower link takes
+	 * the 1G defaults and a faster one the 10G defaults. */
+	if (iface_info->eth_info.speed <= PORT_1G_SPEED) {
 		port_rate_lim_mode[hardwarePortId].cir_value = DEFAULT_PORT_FF_CIR_VALUE_1G;
 		port_rate_lim_mode[hardwarePortId].pir_value = DEFAULT_PORT_FF_PIR_VALUE_1G;
 		uiPeakBurstSize = DEFAULT_1G_PORT_FF_PBS;
 		uiCommitedBurstSize = DEFAULT_1G_PORT_FF_CBS;
-	}
-	else if (iface_info->eth_info.speed == PORT_10G_SPEED ) {
+	} else {
 		port_rate_lim_mode[hardwarePortId].cir_value = DEFAULT_PORT_FF_CIR_VALUE_10G;
 		port_rate_lim_mode[hardwarePortId].pir_value = DEFAULT_PORT_FF_PIR_VALUE_10G;
 		uiPeakBurstSize = DEFAULT_10G_PORT_FF_PBS;
 		uiCommitedBurstSize = DEFAULT_10G_PORT_FF_CBS;
-	}
-	else
-	{
-		DPA_ERROR("%s::%d interface %s speed(%u) is not 1G or 10G. Configure proper value. \n",
-				__func__, __LINE__, iface_info->name, iface_info->eth_info.speed);
-		return FAILURE;
 	}
 
 	profhandle = fm_port_get_handle(port_handle);
@@ -517,19 +513,12 @@ static int port_plcr_set(char *ifname, uint32_t rate_mode,
 	Params.nonPassthroughAlgParams.rateMode = rate_mode;
 	if (rate_mode == e_FM_PCD_PLCR_BYTE_MODE)
 		cdx_plcr_lengths(&Params, tc_meter);
-	if (iface_info->eth_info.speed == PORT_1G_SPEED ) {
+	if (iface_info->eth_info.speed <= PORT_1G_SPEED) {
 		Params.nonPassthroughAlgParams.committedBurstSize = cbs ? cbs : DEFAULT_1G_PORT_FF_CBS;
 		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs ? pbs : DEFAULT_1G_PORT_FF_PBS;
-	}
-	else if (iface_info->eth_info.speed == PORT_10G_SPEED ) {
+	} else {
 		Params.nonPassthroughAlgParams.committedBurstSize = cbs ? cbs : DEFAULT_10G_PORT_FF_CBS;
 		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs ? pbs : DEFAULT_10G_PORT_FF_PBS;
-	}
-	else
-	{
-		DPA_ERROR("%s::%d interface %s speed(%u) is not 1G or 10G. Configure proper value. \n",
-				__func__, __LINE__, iface_info->name, iface_info->eth_info.speed);
-		return FAILURE;
 	}
 
 	{
@@ -572,7 +561,7 @@ int cdx_port_police_clear(char *ifname)
 
 	if (!iface_info || !(iface_info->if_flags & IF_TYPE_ETHERNET))
 		return FAILURE;
-	if (iface_info->eth_info.speed == PORT_1G_SPEED) {
+	if (iface_info->eth_info.speed <= PORT_1G_SPEED) {
 		cir = DEFAULT_PORT_FF_CIR_VALUE_1G;
 		pir = DEFAULT_PORT_FF_PIR_VALUE_1G;
 	} else {
