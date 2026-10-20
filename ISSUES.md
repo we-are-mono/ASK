@@ -152,19 +152,24 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A406 — `nf_ct_acct_add()` truncates a hardware stats delta to 32 bits.** It takes `unsigned int` packets
-  and bytes (`include/net/netfilter/nf_conntrack_acct.h`) while `flow_offload_work_stats()` passes the u64 deltas a
-  pull returns; a pull comes every ~3-4 s (a tenth of the 30 s timeout), so one flow above ~8.6 Gbit/s wraps between
-  pulls and conntrack loses 4 GiB at a time. Upstream has the same signature. Fix direction: widen both to u64.
+- [ ] **A407 — a burst of deletions drops most flows' last delta.** Deleting a table with 100 offloaded flows (200
+  hardware directions) on the rig deferred 88 deletions and dropped 164 final deltas (`/proc/cdx_flowtable`
+  `destroy_deferrals`, `finals_dropped`); conntrack missed 2,766 of 40,000 packets. A single flow's teardown is exact.
+  Each FLOW_CLS_DESTROY only tries the backend transaction (`ft_rule_callback()`, A327) and Netfilter runs many at
+  once on its unbound delete workqueue, so in a burst most find it held by another deletion; a deferred one is
+  answered at once and its delta has no taker. A route change, a conntrack flush or a link event tears down the same
+  way. The counter also takes deltas held for a binding released before their deletion -- a flow whose deletion could
+  not queue behind a read in flight during the unbind sweep -- and a final held for a deferred deletion that could
+  not be recorded (`ft_destroy_defer()` allocation failure) stays in `finals_held` until its binding goes. Fix
+  direction: let a deletion wait for the transaction a bounded time -- another deletion holds it for microseconds,
+  and only a long holder should defer it; in the unbind sweep, collect and flush again for the flows whose deletion
+  a pending read held back.
 
-- [ ] **A405 — a hardware flow's counts since its last stats pull are lost at teardown.** `flow_offload_work_del()`
-  (`net/netfilter/nf_flow_table_offload.c`) sends FLOW_CLS_DESTROY without stats, and `nf_flow_offload_tuple()`
-  copies a driver's stats back only for FLOW_CLS_STATS; cdx's DESTROY (`ft_unlink()`, ask_flowtable_core.c) frees the
-  entry, and its `reported` baseline, unread. Each flow loses up to a pull period (~3 s), and one that ends before its
-  first pull loses every hardware byte; retirements cdx starts itself (invalidation, unbind, SA, Wi-Fi) read nothing
-  either. Rig: a UDP stream torn down by deleting the table lost 1,940 of 18,571 packets, exactly. Fix direction:
-  DESTROY returns the final delta, which patch 140 folds under NF_FLOWTABLE_COUNTER; cdx reads the entry's counters
-  at unlink and holds the delta of its own retirements for Linux's DESTROY to collect.
+- [x] **A406 — `nf_ct_acct_add()` truncates a hardware stats delta to 32 bits.** Widened to u64 in patch 140, so both
+  the read's and the deletion's fold take a delta whole (_:/^netfilter, cdx: count a hardware flow's last delta_).
+
+- [x] **A405 — a hardware flow's counts since its last stats pull were lost at teardown.** DESTROY answers with the
+  last delta, which Linux folds, and cdx holds its own retirements' (_:/^netfilter, cdx: count a hardware flow's last delta_).
 
 - [x] **A404 — ask-flowtable rendered its flowtable without `counter`; conntrack accounting stopped at offload.**
   Rendered now, and added in place to an older table (_:/^flowtable: count the flowtable's flows_).
@@ -178,7 +183,8 @@ result independently of those temporary files.
   a row and `ask-recovery-monitor` rebooted the box ("datapath health check failed or timed out"). The probe waits in
   `cdx_ft_begin()` (`ctrl.mutex`); retirement itself is batched (FT_RETIRE_BATCH, A327), so the holder is something
   else. One candidate since A403: `cdx_ft_recover()` runs a whole datapath restart for an adapter caller under
-  `ctrl.mutex` (RTNL steps up to ~200 ms, and its barriers), paced only by `ft_restart_next`. Fix direction: find the holder
+  `ctrl.mutex` (RTNL steps up to ~200 ms, and its barriers), paced only by `ft_restart_next`. Since A405 an nft
+  commit that unbinds a device flushes the offload workqueues under its commit mutex, so a long holder delays it too. Fix direction: find the holder
   on the ASK image (lockdep, or a hold-time report in `cdx_ft_end()`), then bound it. Production exposure: a PPPoE, VPN
   or default-route change with many flows offloaded.
 

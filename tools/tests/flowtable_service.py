@@ -333,6 +333,41 @@ async def test_offloaded_flows_are_accounted(service):
         await accounted(p, "service-accounting-restored")
 
 
+async def test_retired_flows_keep_their_last_delta(service):
+    """A flow taken out of hardware while it carries traffic keeps what the
+    hardware counted since its last stats pull. A route change retires it --
+    the hardware entry first, Linux's flow after -- and the stream readmits
+    it; twice, mid-stream. Once the pulls catch up, conntrack accounts exactly
+    the datagrams that crossed, both ways, wherever each of them crossed."""
+    r = service
+    flows = [{**f, "lan": r.lan_ip} for f in FLOWS[:1]]
+    size = 256 + 8 + 20  # payload, UDP and IPv4 headers
+    # The host route the rig installs, unchanged for forwarding either way.
+    route = ["ip", "route", "replace", f"{WAN_IP}/32", "dev", TARGET_WAN_IF]
+    async with peer(r, flows, initial_ids=[0]) as p:
+        await warm(r, p, [0], "service-retire-warm", flows)
+        start = await settled_counts(r, flows[0])
+        before = await r.state()
+        await p.rpc("start", [0], count=0, interval=0.005)
+        try:
+            for extra in (["mtu", "1500"], []):
+                await asyncio.sleep(4)  # back in hardware, at most a pull behind
+                await command(r.target, r.session, *route, *extra)
+            await asyncio.sleep(4)
+        finally:
+            report = (await p.rpc("stop", [0]))["0"]
+            await command(r.target, r.session, *route)
+        end = await settled_counts(r, flows[0])
+        after = await r.state()
+        r.record("service-retire-accounting", {"start": start, "end": end, "report": report,
+                                               "before": before, "after": after})
+        # Retired twice, each time both directions.
+        assert after["deletes"] >= before["deletes"] + 4, (before, after)
+        assert report["lost"] == report["late"] == 0, report
+        assert (end[0] - start[0], end[1] - start[1]) == (
+            report["count"] * size, report["received"] * size), (start, end, report)
+
+
 async def test_foreign_table_beside(service):
     """Another offload flowtable binds beside the service's live one -- a
     consumer's own, or its check-mode probe -- which the adapter allows. The

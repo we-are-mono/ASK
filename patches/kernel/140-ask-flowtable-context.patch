@@ -1,4 +1,4 @@
-From f7735b4d8b92be2e8560b6e78407f66c4d011e9a Mon Sep 17 00:00:00 2001
+From 80d0f15c6e1eae194fbf7dc30c66d9c309f055e1 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
@@ -30,28 +30,38 @@ next packet offers a fresh one. A failed neighbour, or any other failure
 to build the rules, waits for the flow to expire -- 30 seconds for
 UDP -- as a refusal that would only recur.
 
+A flow's deletion answers with the counters its driver has not reported
+yet, folded into the conntrack as a counter read's reply is, and both
+folds take 64-bit deltas: a read every few seconds exceeds 32 bits on
+one flow above eight gigabits per second. Unbinding a device's block
+first tears its flows down through the still-bound driver, as the
+indirect cleanup does, so a deleted table reports its flows' last counts
+too.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- drivers/net/bonding/bond_main.c       |  80 +++++++++-----
- include/linux/netdevice.h             |   2 +
- include/net/flow.h                    |   2 +
- include/net/flow_offload.h            |  44 ++++++++
- include/net/netevent.h                |  32 ++++++
- include/net/netfilter/nf_flow_table.h |  60 +++++++++++
- include/net/netns/xfrm.h              |   2 +
- include/net/xfrm.h                    | 106 +++++++++++++++++--
- net/ipv4/fib_trie.c                   |  20 ++++
- net/ipv4/route.c                      |   3 +-
- net/ipv6/ip6_fib.c                    |  23 ++++
- net/netfilter/nf_flow_table_core.c    |  89 +++++++++++++++-
- net/netfilter/nf_flow_table_ip.c      |  25 ++++-
- net/netfilter/nf_flow_table_offload.c | 145 ++++++++++++++++++++++++--
- net/netfilter/nft_flow_offload.c      | 102 +++++++++++++++---
- net/xfrm/xfrm_device.c                |  29 ++++--
- net/xfrm/xfrm_policy.c                | 124 +++++++++++++++++++++-
- net/xfrm/xfrm_state.c                 |  25 ++++-
- net/xfrm/xfrm_user.c                  |   6 ++
- 19 files changed, 836 insertions(+), 83 deletions(-)
+ drivers/net/bonding/bond_main.c           |  80 ++++++---
+ include/linux/netdevice.h                 |   2 +
+ include/net/flow.h                        |   2 +
+ include/net/flow_offload.h                |  44 +++++
+ include/net/netevent.h                    |  32 ++++
+ include/net/netfilter/nf_conntrack_acct.h |   3 +-
+ include/net/netfilter/nf_flow_table.h     |  60 +++++++
+ include/net/netns/xfrm.h                  |   2 +
+ include/net/xfrm.h                        | 106 ++++++++++--
+ net/ipv4/fib_trie.c                       |  20 +++
+ net/ipv4/route.c                          |   3 +-
+ net/ipv6/ip6_fib.c                        |  23 +++
+ net/netfilter/nf_conntrack_core.c         |   3 +-
+ net/netfilter/nf_flow_table_core.c        |  89 +++++++++-
+ net/netfilter/nf_flow_table_ip.c          |  25 ++-
+ net/netfilter/nf_flow_table_offload.c     | 201 +++++++++++++++++++---
+ net/netfilter/nft_flow_offload.c          | 102 +++++++++--
+ net/xfrm/xfrm_device.c                    |  29 +++-
+ net/xfrm/xfrm_policy.c                    | 124 ++++++++++++-
+ net/xfrm/xfrm_state.c                     |  25 ++-
+ net/xfrm/xfrm_user.c                      |   6 +
+ 21 files changed, 879 insertions(+), 102 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index d10bbe4c3571..f910915934cb 100644
@@ -438,6 +448,20 @@ index 1be3757a8b7f..a98d45128798 100644
  };
  
  int register_netevent_notifier(struct notifier_block *nb);
+diff --git a/include/net/netfilter/nf_conntrack_acct.h b/include/net/netfilter/nf_conntrack_acct.h
+index a120685cac93..a6700a0cca06 100644
+--- a/include/net/netfilter/nf_conntrack_acct.h
++++ b/include/net/netfilter/nf_conntrack_acct.h
+@@ -65,8 +65,7 @@ static inline void nf_ct_set_acct(struct net *net, bool enable)
+ #endif
+ }
+ 
+-void nf_ct_acct_add(struct nf_conn *ct, u32 dir, unsigned int packets,
+-		    unsigned int bytes);
++void nf_ct_acct_add(struct nf_conn *ct, u32 dir, u64 packets, u64 bytes);
+ 
+ static inline void nf_ct_acct_update(struct nf_conn *ct, u32 dir,
+ 				     unsigned int bytes)
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
 index 1a6fca013165..bc7f2e12c936 100644
 --- a/include/net/netfilter/nf_flow_table.h
@@ -871,6 +895,20 @@ index 630b520f7241..c31cc86ea396 100644
  	fib6_info_release(rt);
  }
  
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index 77a445a59af3..8c28a6045e27 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -917,8 +917,7 @@ nf_conntrack_hash_check_insert(struct nf_conn *ct)
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_hash_check_insert);
+ 
+-void nf_ct_acct_add(struct nf_conn *ct, u32 dir, unsigned int packets,
+-		    unsigned int bytes)
++void nf_ct_acct_add(struct nf_conn *ct, u32 dir, u64 packets, u64 bytes)
+ {
+ 	struct nf_conn_acct *acct;
+ 
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
 index b00f1c68a8e7..3e051b1c9260 100644
 --- a/net/netfilter/nf_flow_table_core.c
@@ -1100,7 +1138,7 @@ index 98edcaa37b38..ff35d601699a 100644
  	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
  	if (ret < 0)
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 8e3edc7c37b3..8667bf9c5543 100644
+index 8e3edc7c37b3..4167a0724aa1 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -12,6 +12,7 @@
@@ -1304,7 +1342,90 @@ index 8e3edc7c37b3..8667bf9c5543 100644
  	struct netlink_ext_ack extack = {};
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
-@@ -1092,6 +1197,10 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
+@@ -926,7 +1031,9 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+ 	}
+ 	up_read(&flowtable->flow_block_lock);
+ 
+-	if (cmd == FLOW_CLS_STATS)
++	/* A deletion's reply carries what the drivers counted since their last
++	 * report, as a counter read's does; every driver adds to the one reply. */
++	if (cmd == FLOW_CLS_STATS || cmd == FLOW_CLS_DESTROY)
+ 		memcpy(stats, &cls_flow.stats, sizeof(*stats));
+ 
+ 	return i;
+@@ -944,11 +1051,12 @@ static int flow_offload_tuple_add(struct flow_offload_work *offload,
+ }
+ 
+ static void flow_offload_tuple_del(struct flow_offload_work *offload,
+-				   enum flow_offload_tuple_dir dir)
++				   enum flow_offload_tuple_dir dir,
++				   struct flow_stats *stats)
+ {
+ 	nf_flow_offload_tuple(offload->flowtable, offload->flow, NULL, dir,
+ 			      offload->flowtable->priority,
+-			      FLOW_CLS_DESTROY, NULL,
++			      FLOW_CLS_DESTROY, stats,
+ 			      &offload->flowtable->flow_block.cb_list);
+ }
+ 
+@@ -987,12 +1095,36 @@ static void flow_offload_work_add(struct flow_offload_work *offload)
+ 	nf_flow_offload_destroy(flow_rule);
+ }
+ 
++/* Fold what the drivers reported for each direction into the conntrack's
++ * counters, where the table counts. Drivers report the counters as deltas
++ * since their last report, so a deletion's reply folds like a read's, and in
++ * full: one flow above eight gigabits per second moves more than 32 bits of
++ * bytes between two reads. */
++static void flow_offload_work_acct(struct flow_offload_work *offload,
++				   const struct flow_stats stats[])
++{
++	if (!(offload->flowtable->flags & NF_FLOWTABLE_COUNTER))
++		return;
++	if (stats[0].pkts)
++		nf_ct_acct_add(offload->flow->ct, FLOW_OFFLOAD_DIR_ORIGINAL,
++			       stats[0].pkts, stats[0].bytes);
++	if (stats[1].pkts)
++		nf_ct_acct_add(offload->flow->ct, FLOW_OFFLOAD_DIR_REPLY,
++			       stats[1].pkts, stats[1].bytes);
++}
++
+ static void flow_offload_work_del(struct flow_offload_work *offload)
+ {
++	struct flow_stats stats[FLOW_OFFLOAD_DIR_MAX] = {};
++
+ 	clear_bit(IPS_HW_OFFLOAD_BIT, &offload->flow->ct->status);
+-	flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_ORIGINAL);
++	flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_ORIGINAL, &stats[0]);
+ 	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
+-		flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_REPLY);
++		flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_REPLY, &stats[1]);
++	/* What the hardware counted since the drivers' last report would
++	 * otherwise go with the flow -- a flow that ends before its first read,
++	 * every hardware byte. The timeout is not extended: the flow is going. */
++	flow_offload_work_acct(offload, stats);
+ }
+ 
+ static void flow_offload_tuple_stats(struct flow_offload_work *offload,
+@@ -1019,16 +1151,7 @@ static void flow_offload_work_stats(struct flow_offload_work *offload)
+ 	offload->flow->timeout = max_t(u64, offload->flow->timeout,
+ 				       lastused + flow_offload_get_timeout(offload->flow));
+ 
+-	if (offload->flowtable->flags & NF_FLOWTABLE_COUNTER) {
+-		if (stats[0].pkts)
+-			nf_ct_acct_add(offload->flow->ct,
+-				       FLOW_OFFLOAD_DIR_ORIGINAL,
+-				       stats[0].pkts, stats[0].bytes);
+-		if (stats[1].pkts)
+-			nf_ct_acct_add(offload->flow->ct,
+-				       FLOW_OFFLOAD_DIR_REPLY,
+-				       stats[1].pkts, stats[1].bytes);
+-	}
++	flow_offload_work_acct(offload, stats);
+ }
+ 
+ static void flow_offload_work_handler(struct work_struct *work)
+@@ -1092,6 +1215,10 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
  
  	offload = kmalloc(sizeof(struct flow_offload_work), GFP_ATOMIC);
  	if (!offload) {
@@ -1315,7 +1436,7 @@ index 8e3edc7c37b3..8667bf9c5543 100644
  		clear_bit(NF_FLOW_HW_PENDING, &flow->flags);
  		return NULL;
  	}
-@@ -1130,20 +1239,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
+@@ -1130,20 +1257,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
  	flow_offload_queue_work(offload);
  }
  
@@ -1353,6 +1474,21 @@ index 8e3edc7c37b3..8667bf9c5543 100644
  	flow_offload_queue_work(offload);
  }
  
+@@ -1263,6 +1406,14 @@ int nf_flow_table_offload_setup(struct nf_flowtable *flowtable,
+ 	if (!nf_flowtable_hw_offload(flowtable))
+ 		return nf_flow_offload_xdp_setup(flowtable, dev, cmd);
+ 
++	/* Tear the device's flows down through the driver before its block
++	 * goes, as the indirect cleanup does: once the block is unbound a
++	 * deletion reaches no driver, and the last of what the hardware
++	 * counted would go with the flows. A table being deleted, or a device
++	 * taken out of one, is the end of that device's flows either way. */
++	if (cmd == FLOW_BLOCK_UNBIND)
++		nf_flow_table_gc_cleanup(flowtable, dev);
++
+ 	if (dev->netdev_ops->ndo_setup_tc)
+ 		err = nf_flow_table_offload_cmd(&bo, flowtable, dev, cmd,
+ 						&extack);
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
 index 7dbbd892e197..d7e5ddf54ec0 100644
 --- a/net/netfilter/nft_flow_offload.c

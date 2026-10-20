@@ -47,7 +47,10 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_dev_stats_get", "ft_dev_stats_put", "ft_dev_stats_gone",
              "ft_dev_stats_reap", "ft_dev_stats_drop_all", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",
-             "ft_l2_overhead", "ft_unlink", "ft_settle", "ft_remove",
+             "ft_l2_overhead", "ft_delta_read", "ft_reported", "ft_delta_report",
+             "ft_delta_empty", "ft_delta_drop", "ft_final_find", "ft_final_free", "ft_final_hold",
+             "ft_final_take", "ft_finals_drop", "ft_finals_drop_all",
+             "ft_unlink", "ft_settle", "ft_remove",
              "ft_destroy_defer", "ft_retire_deferred", "ft_deferred_destroys_drop", "ft_retire_batch",
              "ft_handle_retired", "ft_retire_workfn", "ft_settle_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
              "ft_vlan_lower", "ft_bridge_vlan", "ft_bridge_port_one", "ft_bridge_port", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_port_arriving", "ft_mtu_less", "ft_port_mtu", "ft_rule_stripped", "ft_arriving", "ft_mtu_carried", "ft_detours", "ft_ipv6_dev_mtu", "ft_egress_mtu_current", "ft_mtu_refused", "ft_bridge_egress_filtered", "ft_tunnel_inbound_allowed", "ft_parse", "ft_same_key", "ft_key_hash",
@@ -68,6 +71,10 @@ def test_decoder_and_lifecycle(tmp_path):
         + re.search(r"^static atomic_t ft_retire_scan\b.*$", source, re.M).group() + "\n"
         + source[source.index("struct ft_deferred_destroy {"):
                  source.index("\n", source.index("static LLIST_HEAD(ft_deferred_destroys);")) + 1]
+        # And the record a retirement of the adapter's own leaves for Linux's
+        # deletion to collect, with the table it waits in.
+        + source[source.index("struct ft_final {"):
+                 source.index("\n", source.index("static DEFINE_HASHTABLE(ft_finals")) + 1]
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"
     run_process([
@@ -182,6 +189,55 @@ def test_stats_poll(tmp_path):
         "-Wno-sign-compare",
         "-Werror", "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable_stats_poll.c")), "-o", str(binary),
+    ], check=True)
+    run_process([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+
+
+def test_teardown_stats(tmp_path):
+    """The delete work, compiled from the kernel, folds what a driver reports
+    on FLOW_CLS_DESTROY into the conntrack as a counter read is folded, in
+    64 bits, and an unbind sweeps the device's flows through the driver before
+    its block goes."""
+    kernel = kernel_source()
+    offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
+    header = (kernel / "include/net/flow_offload.h").read_text()
+    table = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
+    acct = (kernel / "include/net/netfilter/nf_conntrack_acct.h").read_text()
+    core = (kernel / "net/netfilter/nf_conntrack_core.c").read_text()
+
+    def declaration(source, start):
+        return re.search(r"^" + re.escape(start) + r".*?^\};\n", source, re.M | re.S).group()
+
+    (tmp_path / "teardown_stats_types.inc").write_text(
+        declaration(table, "enum flow_offload_xmit_type {")
+        + declaration(header, "enum flow_cls_command {")
+        + declaration(header, "struct flow_stats {")
+        + declaration(header, "struct flow_cls_common_offload {")
+        + declaration(header, "struct flow_cls_offload {")
+        # The accounting entry point as declared: its parameter types decide
+        # how much of a delta survives the call.
+        + re.search(r"^void nf_ct_acct_add\(.*?\);\n", acct, re.M | re.S).group())
+    (tmp_path / "teardown_stats_production.inc").write_text(
+        function(core, "nf_ct_acct_add")
+        + function(offload, "nf_flow_offload_ingress")
+        + function(offload, "nf_flow_offload_init")
+        + function(offload, "nf_flow_offload_has_dst")
+        + function(offload, "nf_flow_offload_dst")
+        + function(offload, "nf_flow_offload_dst_cookie")
+        # From the per-direction command to the work handler: the replace,
+        # delete and statistics work, and whatever they share.
+        + offload[offload.index("static int nf_flow_offload_tuple("):
+                  offload.index("static void flow_offload_work_handler(")]
+        + function(offload, "nf_flow_table_offload_setup"))
+    binary = tmp_path / "flowtable_teardown_stats"
+    run_process([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
+        "-Wno-unused-parameter", "-Wno-unused-function",
+        "-Werror", "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("flowtable_teardown_stats.c")), "-o", str(binary),
     ], check=True)
     run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",

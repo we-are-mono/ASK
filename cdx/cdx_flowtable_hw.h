@@ -106,8 +106,10 @@ void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
  * *hw == NULL does not erase prior errors. */
 int cdx_ft_hw_del(struct cdx_ft_hw **hw);
 /* The same without the barrier: 0 once the key is unlinked, its owner retained
- * as an unsynced retirement owed to cdx_ft_hw_settle(); -EIO as above. */
-int cdx_ft_hw_unlink(struct cdx_ft_hw **hw);
+ * as an unsynced retirement owed to cdx_ft_hw_settle(); -EIO as above. final,
+ * if given, receives the direction's counters as cdx_ft_hw_stats() reads them,
+ * taken once its entries are unlinked; zero where there was nothing. */
+int cdx_ft_hw_unlink(struct cdx_ft_hw **hw, struct cdx_ft_counters *final);
 unsigned int cdx_ft_hw_pending(void);
 /* The retirements cdx_ft_hw_unlink() left owed and no settle has failed. */
 unsigned int cdx_ft_hw_owed(void);

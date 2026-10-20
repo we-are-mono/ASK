@@ -685,27 +685,36 @@ int cdx_ft_hw_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **resul
 	return 0;
 }
 
+/* An entry's counters, with its options entry's added in where it has one:
+ * the two forms of one direction count as one. */
+static void ft_hw_count(struct hw_ct *ct, const struct cdx_ft_counters *options,
+			struct cdx_ft_counters *stats)
+{
+	hw_ct_get_active(ct);
+	stats->packets = ct->pkts;
+	stats->bytes = ct->bytes;
+	stats->lastused = ct->timestamp;
+	if (options) {
+		stats->packets += options->packets;
+		stats->bytes += options->bytes;
+		if ((s32)(options->lastused - stats->lastused) > 0)
+			stats->lastused = options->lastused;
+	}
+}
+
 void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 {
+	struct cdx_ft_counters options = {};
+
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	/* A detoured direction is counted once, as it arrived. */
 	if (hw->detour) {
 		cdx_ft_hw_stats(hw->detour, stats);
 		return;
 	}
-	hw_ct_get_active(hw->entry.ct);
-	stats->packets = hw->entry.ct->pkts;
-	stats->bytes = hw->entry.ct->bytes;
-	stats->lastused = hw->entry.ct->timestamp;
-	if (hw->options) {
-		struct cdx_ft_counters extra;
-
-		cdx_ft_hw_stats(hw->options, &extra);
-		stats->packets += extra.packets;
-		stats->bytes += extra.bytes;
-		if ((s32)(extra.lastused - stats->lastused) > 0)
-			stats->lastused = extra.lastused;
-	}
+	if (hw->options)
+		cdx_ft_hw_stats(hw->options, &options);
+	ft_hw_count(hw->entry.ct, hw->options ? &options : NULL, stats);
 }
 
 /* Everything unlinked before a barrier that has just completed: the retired
@@ -745,24 +754,34 @@ static void ft_hw_release_synced(void)
 	cdx_ehash_quarantine_free_all();
 }
 
-static int ft_hw_del(struct cdx_ft_hw **entry, bool defer)
+static int ft_hw_del(struct cdx_ft_hw **entry, bool defer, struct cdx_ft_counters *final)
 {
 	struct cdx_ft_hw *hw = *entry;
+	struct cdx_ft_counters options = {};
 	struct hw_ct *ct;
 	int rc, options_rc = 0;
+	bool detoured = false, with_options = false;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	if (final)
+		memset(final, 0, sizeof(*final));
 	if (!hw)
 		return 0;
 	/* The receive entry of a detour first: once it is gone no frame of
 	 * the direction reaches the offline port's entry for it any more. Its
 	 * record goes when it does (ft_hw_free()), kept a while after for the
-	 * frames still in the offline port's queue. */
-	if (hw->detour)
-		options_rc = ft_hw_del(&hw->detour, defer);
+	 * frames still in the offline port's queue. A detoured direction's
+	 * count is its detour's, as cdx_ft_hw_stats() reads it, read as the
+	 * detour goes. */
+	if (hw->detour) {
+		options_rc = ft_hw_del(&hw->detour, defer, final);
+		detoured = true;
+	}
 	if (hw->options) {
-		int rc_options = ft_hw_del(&hw->options, defer);
+		int rc_options;
 
+		with_options = final && !detoured;
+		rc_options = ft_hw_del(&hw->options, defer, with_options ? &options : NULL);
 		if (rc_options == -EIO)
 			options_rc = -EIO;
 	}
@@ -779,6 +798,12 @@ static int ft_hw_del(struct cdx_ft_hw **entry, bool defer)
 		rc = ExternalHashTableDeleteKey(ct->td, ct->index, ct->handle);
 	if (!rc && ft_sync_fault())
 		rc = EN_EHASH_DELETE_UNSYNCED;
+	/* Read once nothing links the entry, so everything counted up to the
+	 * unlink is in it; what a walk that began before the unlink adds after
+	 * this read is the one count no read short of the barrier would see.
+	 * The storage is still the entry's: freed or retired only below. */
+	if (final && !detoured)
+		ft_hw_count(ct, with_options ? &options : NULL, final);
 	*entry = NULL;
 	if (!rc) {
 		ExternalHashTableEntryFree(ct->handle);
@@ -799,12 +824,12 @@ static int ft_hw_del(struct cdx_ft_hw **entry, bool defer)
 
 int cdx_ft_hw_del(struct cdx_ft_hw **hw)
 {
-	return ft_hw_del(hw, false);
+	return ft_hw_del(hw, false, NULL);
 }
 
-int cdx_ft_hw_unlink(struct cdx_ft_hw **hw)
+int cdx_ft_hw_unlink(struct cdx_ft_hw **hw, struct cdx_ft_counters *final)
 {
-	return ft_hw_del(hw, true);
+	return ft_hw_del(hw, true, final);
 }
 
 unsigned int cdx_ft_hw_pending(void)

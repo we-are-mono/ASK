@@ -1627,6 +1627,18 @@ static void test_backend(void)
         cdx_ft_hw_stats(hw, &counted);
         assert(counted.packets == 99 && counted.bytes == 12345 && counted.lastused == 321);
         assert(cdx_ft_hw_del(&hw) == 0 && !hw && !key && !older && !allocations && !detour_flows);
+        /* Unlinked, the direction's count goes out as a read gives it: the
+         * detour's alone, counted once as it arrived. */
+        {
+            unsigned unproven = 99;
+
+            assert(cdx_ft_hw_add(&rule, &stats, &hw) == 0 && hw->detour);
+            counted = (struct cdx_ft_counters){};
+            assert(cdx_ft_hw_unlink(&hw, &counted) == 0 && !hw);
+            assert(counted.packets == 99 && counted.bytes == 12345 && counted.lastused == 321);
+            assert(cdx_ft_hw_settle(&unproven) == 0 && !unproven);
+            assert(!key && !older && !allocations && !detour_flows);
+        }
         /* The receive entry failing: the offline one and the record go. */
         fail_insert_after = 2;
         assert(cdx_ft_hw_add(&rule, &stats, &hw) == -EIO && !hw);
@@ -1810,18 +1822,23 @@ static void test_backend(void)
      * failed settle fails nothing: what it leaves is an ordinary unproven
      * retirement, which the adapter's recovery retries. */
     {
+        struct cdx_ft_counters final = { .packets = 1 };
         unsigned unproven = 99;
 
         tries = syncs;
-        assert(cdx_ft_unlink(&hw) == 0 && !hw && !ft_live && !cdx_ft_failed());
-        assert(cdx_ft_unlink(&hw) == 0 && !ft_live);
+        /* The direction's counters go out with the unlink, as a read of it
+         * gives them; nothing to unlink reads as nothing. */
+        assert(cdx_ft_unlink(&hw, &final) == 0 && !hw && !ft_live && !cdx_ft_failed());
+        assert(final.packets == 99 && final.bytes == 12345 && final.lastused == 321);
+        assert(cdx_ft_unlink(&hw, &final) == 0 && !ft_live);
+        assert(!final.packets && !final.bytes && !final.lastused);
         assert(cdx_ft_owed() == 1 && cdx_ft_pending() == 1 && syncs == tries);
         assert(cdx_ft_settle(&unproven) == 0 && !unproven && syncs == tries + 1);
         assert(!cdx_ft_owed() && !cdx_ft_pending() && !key && !allocations);
         assert(cdx_ft_admission_begin() == 0);
         assert(cdx_ft_add(&rule,&stats,&hw) == 0);
         cdx_ft_admission_end();
-        assert(cdx_ft_unlink(&hw) == 0 && cdx_ft_owed() == 1);
+        assert(cdx_ft_unlink(&hw, NULL) == 0 && cdx_ft_owed() == 1);
         fail_sync = true;
         assert(cdx_ft_settle(&unproven) == -EAGAIN && unproven == 1 && !cdx_ft_failed());
         assert(!cdx_ft_owed() && cdx_ft_pending() == 1 && !ft_fatal_work.queued);
@@ -2363,8 +2380,13 @@ int main(void)
             unsigned syncs_before = syncs, deletes_before = deletes, unlinks_before = unlinks;
             unsigned barriers = delete_syncs, unproven = 99;
 
+            struct cdx_ft_counters final;
+
             assert(cdx_ft_hw_add(&rule, &stats, &hw) == 0 && hw->options);
-            assert(cdx_ft_hw_unlink(&hw) == 0 && !hw && !key->linked && !older->linked);
+            /* Both forms' counts go out with the unlink, as one read of the
+             * direction gives them. */
+            assert(cdx_ft_hw_unlink(&hw, &final) == 0 && !hw && !key->linked && !older->linked);
+            assert(final.packets == 198 && final.bytes == 24690 && final.lastused == 321);
             assert(unlinks == unlinks_before + 2 && deletes == deletes_before);
             assert(syncs == syncs_before && cdx_ft_hw_pending() == 2 && cdx_ft_hw_owed() == 2);
             assert(tunnel_slot.holds == 2);
@@ -2505,7 +2527,7 @@ int main(void)
         delete_result = 0;
         old=deletes; unsigned unlinked=unlinks; barriers=syncs;
         assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && older && key->linked);
-        assert(cdx_ft_hw_unlink(&hw)==0 && !hw && !key->linked && !key->safe);
+        assert(cdx_ft_hw_unlink(&hw, NULL)==0 && !hw && !key->linked && !key->safe);
         assert(unlinks==unlinked+1 && deletes==old && syncs==barriers);
         assert(cdx_ft_hw_pending()==2 && cdx_ft_hw_owed()==1 && allocations);
         park_legacy(1); freed=legacy_freed;
@@ -2518,8 +2540,8 @@ int main(void)
         /* A barrier that fails leaves every owed owner an ordinary unproven
          * retirement, says how many, and owes nothing more: the next settle
          * asks for no barrier, and the retry that does releases them. */
-        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw)==0);
-        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw)==0);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw, NULL)==0);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw, NULL)==0);
         assert(cdx_ft_hw_pending()==2 && cdx_ft_hw_owed()==2);
         fail_sync=true; old=syncs; barriers=delete_syncs;
         assert(cdx_ft_hw_settle(&unproven)==-EAGAIN && unproven==2);
@@ -2535,7 +2557,7 @@ int main(void)
          * never the unlink, which has no barrier of its own to withhold: the
          * settle fails without issuing one, exactly as a failed one. */
         ft_fail_sync = 1;
-        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw)==0);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw, NULL)==0);
         assert(ft_fail_sync==1 && cdx_ft_hw_owed()==1);
         old=syncs;
         assert(cdx_ft_hw_settle(&unproven)==-EAGAIN && unproven==1 && syncs==old);
@@ -2545,7 +2567,7 @@ int main(void)
         /* A hard failure is the delete's: never owed, never proven by a
          * settle, kept for the stopped ports. */
         delete_result = -1;
-        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw)==-EIO && !hw);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw)==0 && cdx_ft_hw_unlink(&hw, NULL)==-EIO && !hw);
         assert(key->linked && cdx_ft_hw_pending()==1 && !cdx_ft_hw_owed());
         old=syncs;
         assert(cdx_ft_hw_settle(&unproven)==0 && !unproven && syncs==old && key->linked);

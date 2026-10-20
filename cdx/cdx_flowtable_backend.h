@@ -595,8 +595,13 @@ int cdx_ft_del(struct cdx_ft_hw **hw);
  * cdx_ft_del(). The adapter settles what it unlinked before anything outside
  * the transaction can need it proven, and escalates a failed settle as it
  * would a failed delete.
+ * final, if given, receives the direction's counters as cdx_ft_stats() reads
+ * them, taken once its entries are unlinked and before their storage goes:
+ * everything counted up to the unlink is in it, and only a frame whose
+ * classifier walk began before the unlink can be counted after it, which no
+ * read short of the barrier would see. Zero where there was nothing to unlink.
  */
-int cdx_ft_unlink(struct cdx_ft_hw **hw);
+int cdx_ft_unlink(struct cdx_ft_hw **hw, struct cdx_ft_counters *final);
 /* Unlinks cdx_ft_unlink() has left owed and no settle has failed. */
 unsigned int cdx_ft_owed(void);
 /* One barrier for every owed unlink. 0: nothing owed any more. -EAGAIN: it

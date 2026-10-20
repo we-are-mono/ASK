@@ -1055,14 +1055,17 @@ int cdx_ft_del(struct cdx_ft_hw **hw)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_del, ASK_CDX_FLOWTABLE);
 
-int cdx_ft_unlink(struct cdx_ft_hw **hw)
+int cdx_ft_unlink(struct cdx_ft_hw **hw, struct cdx_ft_counters *final)
 {
 	int rc;
 
 	cdx_ft_assert_held();
-	if (!*hw)
+	if (!*hw) {
+		if (final)
+			memset(final, 0, sizeof(*final));
 		return 0;
-	rc = cdx_ft_hw_unlink(hw);
+	}
+	rc = cdx_ft_hw_unlink(hw, final);
 	ft_live--;
 	if (rc == -EIO)
 		cdx_ft_fatal();

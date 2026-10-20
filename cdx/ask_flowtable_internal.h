@@ -68,8 +68,8 @@
 #include "cdx_wifi_backend.h"
 #include "cdx_police.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 13
-#error "CDX flowtable requires kernel flowtable context version 13 or later"
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 14
+#error "CDX flowtable requires kernel flowtable context version 14 or later"
 #endif
 
 /* The bridge FDB pins a bridged flow's egress port, and this is the only
@@ -155,6 +155,16 @@ struct cdx_ft_dev_stats {
  * egress. How far a change to it reaches follows from which. */
 enum ft_device_role { FT_DEV_UNUSED, FT_DEV_CROSSED, FT_DEV_NAMED, FT_DEV_PORT };
 
+/* What a direction has counted since it was last reported, in the units
+ * Netfilter counts in -- the ingress framing ft_l2_overhead() names taken off
+ * the hardware's bytes -- and when the hardware last saw a frame of it, in
+ * kernel jiffies. */
+struct ft_delta {
+	u64 packets;
+	u64 bytes;
+	unsigned long lastused;
+};
+
 struct cdx_ft_entry {
 	struct list_head list;
 	struct hlist_node cookie_node;
@@ -194,6 +204,11 @@ struct cdx_ft_entry {
 	struct cdx_ft_rule rule;
 	struct cdx_ft_hw *hw;
 	struct cdx_ft_counters reported;
+	/* What an earlier entry of this generation had counted since its last
+	 * report when this adapter retired it, where Linux offered the
+	 * generation again before tearing it down: reported with this entry's
+	 * next delta, as if the two had been one. */
+	struct ft_delta carried;
 };
 
 /* Admission budget, not a firmware maximum. Directions consume slots
@@ -763,6 +778,8 @@ extern atomic64_t ft_ipsec_genid;
 extern atomic64_t ft_ipsec_policy_invalidations;
 extern u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 extern u64 ft_rearms;
+extern unsigned int ft_finals_held;
+extern u64 ft_finals_dropped;
 extern bool ft_ready, ft_stopping;
 extern atomic_t ft_invalid;
 extern bool ft_invalid_done;
@@ -782,7 +799,8 @@ bool ft_rule_names(const struct cdx_ft_rule *rule, const struct net_device *dev)
 void ft_dev_stats_gone(const struct net_device *dev);
 void ft_dev_stats_drop_all(void);
 void ft_deferred_destroys_drop(void);
-int ft_unlink(struct cdx_ft_entry *entry);
+void ft_finals_drop_all(void);
+int ft_unlink(struct cdx_ft_entry *entry, struct ft_delta *final);
 int ft_settle(void);
 int ft_remove(struct cdx_ft_entry *entry);
 bool ft_retire_batch(bool (*match)(const struct cdx_ft_entry *entry, const void *arg),

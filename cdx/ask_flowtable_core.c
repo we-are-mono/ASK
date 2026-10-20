@@ -79,6 +79,11 @@ atomic64_t ft_ipsec_genid = ATOMIC64_INIT(0);
 atomic64_t ft_ipsec_policy_invalidations = ATOMIC64_INIT(0);
 u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 u64 ft_rearms;
+/* Final deltas held for a deletion yet to come, and the deltas no deletion
+ * could take: dropped with their record, or never recorded. Both written and
+ * read under the backend transaction, like the records. */
+unsigned int ft_finals_held;
+u64 ft_finals_dropped;
 bool ft_ready, ft_stopping;
 atomic_t ft_invalid = ATOMIC_INIT(0);
 bool ft_invalid_done;
@@ -96,6 +101,8 @@ static void ft_retire_workfn(struct work_struct *work);
 static void ft_settle_workfn(struct work_struct *work);
 static void ft_rearm_workfn(struct work_struct *work);
 static void ft_dev_stats_reap(struct work_struct *work);
+static int ft_delta_read(const struct cdx_ft_entry *entry,
+			 const struct cdx_ft_counters *now, struct ft_delta *delta);
 DECLARE_DELAYED_WORK(ft_work, ft_invalidate_work);
 DECLARE_WORK(ft_retire_work, ft_retire_workfn);
 DECLARE_WORK(ft_settle_work, ft_settle_workfn);
@@ -165,6 +172,137 @@ void ft_handle_invalidate(struct nf_flow_offload_handle *handle,
 		schedule_work(&ft_retire_work);
 }
 
+/* The last delta of an entry this adapter retired on its own -- for a
+ * dependency change, a global invalidation, an SA or a VAP going, an offer
+ * that found the generation changed -- held for the deletion Linux sends once
+ * its collector has retired the generation, which finds no entry, or for the
+ * offer that admits the generation again before it does. Keyed as a deferred
+ * deletion is: the binding compared, never dereferenced, the handle held, so
+ * no later generation can be mistaken for this one. At most one per retired
+ * direction: a second retirement of the same generation folds into the first.
+ * Linux's own deletion needs none, its delta going back in the reply; one
+ * deferred for the transaction was answered already, so its delta has no
+ * taker and is dropped, counted. Nothing with no count to deliver is held. */
+struct ft_final {
+	struct hlist_node node;
+	const struct cdx_ft_binding *binding;
+	unsigned long cookie;
+	struct nf_flow_offload_handle *handle;
+	struct ft_delta delta;
+};
+
+static DEFINE_HASHTABLE(ft_finals, CDX_FT_HASH_BITS);
+
+static bool ft_delta_empty(const struct ft_delta *delta)
+{
+	return !delta->packets && !delta->bytes;
+}
+
+/* One that no deletion can take any more. */
+static void ft_delta_drop(const struct ft_delta *delta)
+{
+	if (!ft_delta_empty(delta))
+		ft_finals_dropped++;
+}
+
+static struct ft_final *ft_final_find(const struct cdx_ft_binding *binding,
+				      unsigned long cookie,
+				      const struct nf_flow_offload_handle *handle)
+{
+	struct ft_final *final;
+
+	hash_for_each_possible(ft_finals, final, node, cookie ^ (unsigned long)binding)
+		if (final->binding == binding && final->cookie == cookie &&
+		    final->handle == handle)
+			return final;
+	return NULL;
+}
+
+static void ft_final_free(struct ft_final *final)
+{
+	hash_del(&final->node);
+	nf_flow_offload_handle_put(final->handle);
+	kfree(final);
+	ft_finals_held--;
+}
+
+/* Under the transaction, like every reader. The allocation must not wait:
+ * the transaction is held, and a retirement walk takes one per entry. One
+ * that fails loses this delta alone. */
+static void ft_final_hold(const struct cdx_ft_binding *binding, unsigned long cookie,
+			  struct nf_flow_offload_handle *handle,
+			  const struct ft_delta *delta)
+{
+	struct ft_final *final;
+
+	if (ft_delta_empty(delta))
+		return;
+	final = ft_final_find(binding, cookie, handle);
+	if (final) {
+		final->delta.packets += delta->packets;
+		final->delta.bytes += delta->bytes;
+		if (time_after(delta->lastused, final->delta.lastused))
+			final->delta.lastused = delta->lastused;
+		return;
+	}
+	final = kmalloc(sizeof(*final), GFP_NOWAIT | __GFP_NOWARN);
+	if (!final) {
+		ft_delta_drop(delta);
+		return;
+	}
+	final->binding = binding;
+	final->cookie = cookie;
+	final->handle = handle;
+	final->delta = *delta;
+	nf_flow_offload_handle_get(handle);
+	hash_add(ft_finals, &final->node, cookie ^ (unsigned long)binding);
+	ft_finals_held++;
+}
+
+/* The delta held for this generation of the direction, if any, into *delta:
+ * the taker's to deliver, and the record is gone. */
+static bool ft_final_take(const struct cdx_ft_binding *binding, unsigned long cookie,
+			  const struct nf_flow_offload_handle *handle,
+			  struct ft_delta *delta)
+{
+	struct ft_final *final = ft_final_find(binding, cookie, handle);
+
+	if (!final)
+		return false;
+	*delta = final->delta;
+	ft_final_free(final);
+	return true;
+}
+
+/* Every record a binding holds, as the binding goes: no deletion reaches it
+ * any more. Under the transaction. */
+static void ft_finals_drop(const struct cdx_ft_binding *binding)
+{
+	struct ft_final *final;
+	struct hlist_node *next;
+	unsigned int bkt;
+
+	hash_for_each_safe(ft_finals, bkt, next, final, node)
+		if (final->binding == binding) {
+			ft_delta_drop(&final->delta);
+			ft_final_free(final);
+		}
+}
+
+/* Every record left once nothing can add one: unload, after the bindings'
+ * release, each of which dropped its own. */
+void ft_finals_drop_all(void)
+{
+	struct ft_final *final;
+	struct hlist_node *next;
+	unsigned int bkt;
+
+	hash_for_each_safe(ft_finals, bkt, next, final, node) {
+		ft_delta_drop(&final->delta);
+		ft_final_free(final);
+	}
+}
+
 /* A Linux deletion that found the transaction held (ft_rule_callback()):
  * what the retirement worker needs to find its entry without walking the
  * table. The binding is only compared, never dereferenced -- it may be
@@ -204,12 +342,16 @@ static void ft_destroy_defer(const struct cdx_ft_binding *binding,
 /* Unlink the entries deferred deletions name, at most FT_RETIRE_BATCH of them;
  * true when records are left for the next run. A record whose entry is gone
  * -- released with its binding, retired by a walk, or never in hardware --
- * is simply dropped. */
+ * is simply dropped. Either way the deletion was answered when it was
+ * deferred, so what the entry had counted since its last report has no
+ * taker: the walk that retired it first held that for this very deletion. */
 static bool ft_retire_deferred(void)
 {
 	struct llist_node *list = llist_del_all(&ft_deferred_destroys);
 	struct ft_deferred_destroy *deferred, *next;
 	struct cdx_ft_entry *entry;
+	struct ft_final *final;
+	struct ft_delta delta;
 	unsigned int n = 0;
 	bool more = false;
 
@@ -221,8 +363,16 @@ static bool ft_retire_deferred(void)
 		}
 		entry = ft_find(deferred->binding, deferred->cookie);
 		if (entry && entry->handle == deferred->handle) {
-			ft_unlink(entry);
+			ft_unlink(entry, &delta);
+			ft_delta_drop(&delta);
 			n++;
+		} else {
+			final = ft_final_find(deferred->binding, deferred->cookie,
+					      deferred->handle);
+			if (final) {
+				ft_delta_drop(&final->delta);
+				ft_final_free(final);
+			}
 		}
 		nf_flow_offload_handle_put(deferred->handle);
 		kfree(deferred);
@@ -663,15 +813,30 @@ static void ft_stats_binding(const struct cdx_ft_entry *entry,
  * thirds of what a delete costs, so a walk that retires many entries settles
  * them behind one. Whatever owes a barrier settles it before the transaction
  * ends or queues ft_settle_work to, so nothing outside the transaction finds
- * an unlink unproven unless its barrier failed. */
-int ft_unlink(struct cdx_ft_entry *entry)
+ * an unlink unproven unless its barrier failed.
+ *
+ * What the entry has counted since its last report is read as it goes: into
+ * *final for a caller with a deletion to answer, or one answered already and
+ * so with nothing to deliver it to; held otherwise (ft_final_hold()), for the
+ * deletion Linux is yet to send or the offer that readmits the generation. A
+ * sample that went backwards delivers nothing, as a read of it would have, and
+ * is escalated the same way. */
+int ft_unlink(struct cdx_ft_entry *entry, struct ft_delta *final)
 {
-	int rc = cdx_ft_unlink(&entry->hw);
+	struct cdx_ft_counters now;
+	struct ft_delta delta;
+	int rc = cdx_ft_unlink(&entry->hw, &now);
 
 	if (rc) {
 		ft_errors++;
 		ft_invalidate();
 	}
+	if (ft_delta_read(entry, &now, &delta))
+		memset(&delta, 0, sizeof(delta));
+	if (final)
+		*final = delta;
+	else
+		ft_final_hold(entry->binding, entry->cookie, entry->handle, &delta);
 	list_del(&entry->list);
 	hash_del(&entry->cookie_node);
 	hash_del(&entry->key_node);
@@ -710,7 +875,7 @@ int ft_settle(void)
 
 int ft_remove(struct cdx_ft_entry *entry)
 {
-	int rc = ft_unlink(entry);
+	int rc = ft_unlink(entry, NULL);
 	int settled = ft_settle();
 
 	return rc ?: settled;
@@ -737,7 +902,7 @@ bool ft_retire_batch(bool (*match)(const struct cdx_ft_entry *entry, const void 
 			more = true;
 			break;
 		}
-		ft_unlink(entry);
+		ft_unlink(entry, NULL);
 		n++;
 	}
 	ft_settle();
@@ -2349,6 +2514,10 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	hash_add(ft_keys, &entry->key_node, ft_key_hash(&entry->rule));
 	ft_count++;
 	ft_installs++;
+	/* An entry of this generation that this adapter retired, offered again
+	 * before Linux tore it down, left what it had counted since its last
+	 * report for this one to report. */
+	ft_final_take(binding, entry->cookie, entry->handle, &entry->carried);
 	/* An SA may expire before this entry joins the dependency watch. */
 	if (ipsec_genid != atomic64_read_acquire(&ft_ipsec_genid))
 		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_invalidations);
@@ -2424,11 +2593,64 @@ static bool ft_entry_bounded(struct cdx_ft_entry *entry)
 	return true;
 }
 
+/* What the direction has counted since it was last reported, from a sample of
+ * its counters, restated in the units Netfilter counts in, with whatever an
+ * earlier entry of the generation left this one to carry. The caller delivers
+ * it and then commits the sample with ft_reported(); a delivery that fails
+ * leaves it all to the next. 64-bit counters cannot wrap during this PoC's
+ * lifetime. A backwards sample means hardware state was reset or could not be
+ * read reliably; never turn it into an enormous unsigned delta or activity
+ * refresh. */
+static int ft_delta_read(const struct cdx_ft_entry *entry,
+			 const struct cdx_ft_counters *now, struct ft_delta *delta)
+{
+	u64 packets, bytes;
+
+	if (now->packets < entry->reported.packets || now->bytes < entry->reported.bytes) {
+		ft_errors++;
+		ft_invalidate();
+		return -EIO;
+	}
+	packets = now->packets - entry->reported.packets;
+	bytes = now->bytes - entry->reported.bytes;
+	/* Restate the delta in the units Netfilter counts in. Saturate rather
+	 * than wrap: a delta that cannot carry its own framing describes frames
+	 * this adapter cannot account for, and zero is the honest answer. */
+	bytes -= min_t(u64, bytes, packets * ft_l2_overhead(&entry->rule));
+	delta->packets = packets + entry->carried.packets;
+	delta->bytes = bytes + entry->carried.bytes;
+	/* Firmware uses the same 32-bit jiffies counter as CDX. Expand relative
+	 * to the current kernel clock; admitted idle durations are below 2^31. */
+	delta->lastused = jiffies - (u32)((u32)jiffies - now->lastused);
+	if (time_after(entry->carried.lastused, delta->lastused))
+		delta->lastused = entry->carried.lastused;
+	return 0;
+}
+
+/* The sample a delivered delta was read from is what the next is read against,
+ * and what was carried has been delivered with it. */
+static void ft_reported(struct cdx_ft_entry *entry, const struct cdx_ft_counters *now)
+{
+	entry->reported = *now;
+	memset(&entry->carried, 0, sizeof(entry->carried));
+}
+
+/* Into the reply to a counter read or a deletion. These are classifier hits,
+ * so a frame punted after its hit has been counted here and counted again by
+ * the path that handled it. Linux uses lastused for ageing; proc exposes the
+ * raw hardware counters for diagnostics, separately from what is reported
+ * into accounting. */
+static void ft_delta_report(struct flow_cls_offload *cls, const struct ft_delta *delta)
+{
+	flow_stats_update(&cls->stats, delta->bytes, delta->packets, 0, delta->lastused,
+			  FLOW_ACTION_HW_STATS_DELAYED);
+}
+
 static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 {
 	struct cdx_ft_counters now;
-	u64 packets, bytes;
-	unsigned long lastused;
+	struct ft_delta delta;
+	int rc;
 
 	if (!nf_flow_offload_handle_valid(entry->handle)) {
 		ft_neigh_invalidate(entry);
@@ -2437,32 +2659,13 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 	if (!ft_entry_bounded(entry))
 		return -EOPNOTSUPP;
 	cdx_ft_stats(entry->hw, &now);
-	/* 64-bit counters cannot wrap during this PoC's lifetime. A backwards
-	 * sample means hardware state was reset or could not be read reliably;
-	 * never turn it into an enormous unsigned delta or activity refresh. */
-	if (now.packets < entry->reported.packets || now.bytes < entry->reported.bytes) {
-		ft_errors++;
-		ft_invalidate();
-		return -EIO;
-	}
-	packets = now.packets - entry->reported.packets;
-	bytes = now.bytes - entry->reported.bytes;
-	/* Restate the delta in the units Netfilter counts in. Saturate rather
-	 * than wrap: a delta that cannot carry its own framing describes frames
-	 * this adapter cannot account for, and zero is the honest answer. */
-	bytes -= min_t(u64, bytes, packets * ft_l2_overhead(&entry->rule));
-	if (!ft_neigh_used(entry, packets != 0))
+	rc = ft_delta_read(entry, &now, &delta);
+	if (rc)
+		return rc;
+	if (!ft_neigh_used(entry, delta.packets != 0))
 		return -EOPNOTSUPP;
-	/* These are classifier hits, so a frame punted after its hit has been
-	 * counted here and counted again by the path that handled it. Linux uses
-	 * lastused for ageing; proc exposes the raw hardware counters for
-	 * diagnostics, separately from what is reported into accounting. */
-	/* Firmware uses the same 32-bit jiffies counter as CDX. Expand relative
-	 * to the current kernel clock; admitted idle durations are below 2^31. */
-	lastused = jiffies - (u32)((u32)jiffies - now.lastused);
-	flow_stats_update(&cls->stats, bytes, packets, 0, lastused,
-			  FLOW_ACTION_HW_STATS_DELAYED);
-	entry->reported = now;
+	ft_delta_report(cls, &delta);
+	ft_reported(entry, &now);
 	return 0;
 }
 
@@ -2666,19 +2869,31 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		if (rc)
 			ft_rejects++;
 		break;
-	case FLOW_CLS_DESTROY:
+	case FLOW_CLS_DESTROY: {
+		struct ft_delta delta = {};
+
 		/* Linux deletes one flow per callback, and one route change can
 		 * delete the whole table: the deletions queued behind each other
 		 * share a barrier, at most FT_RETIRE_BATCH unlinks to one, and
 		 * the last of a burst leaves it to ft_settle_work -- unless an
 		 * unload, which set ft_stopping under this transaction, may
-		 * already have cancelled that work for good. */
-		rc = entry ? ft_unlink(entry) : 0;
+		 * already have cancelled that work for good.
+		 *
+		 * What the direction counted since its last report goes back in
+		 * the reply, as a read's does: read off the entry as it goes,
+		 * or, for a generation this adapter retired first, held for
+		 * this deletion. */
+		rc = entry ? ft_unlink(entry, &delta) : 0;
+		if (!entry)
+			ft_final_take(binding, cls->cookie, cls->nf_handle, &delta);
+		if (!ft_delta_empty(&delta))
+			ft_delta_report(cls, &delta);
 		if (cdx_ft_owed() >= FT_RETIRE_BATCH || ft_stopping)
 			ft_settle();
 		else if (cdx_ft_owed())
 			schedule_work(&ft_settle_work);
 		break;
+	}
 	case FLOW_CLS_STATS:
 		rc = entry ? ft_stats(entry, cls) : -ENOENT;
 		break;
@@ -2805,6 +3020,11 @@ void ft_release(void *priv)
 		cond_resched();
 		cdx_ft_begin();
 	}
+	/* And what was held for deletions that reach this binding no more:
+	 * Netfilter sweeps a device's flows through the binding before it
+	 * takes it off the block, so these are the few whose deletion could
+	 * not be queued behind a read in flight, or was deferred. */
+	ft_finals_drop(binding);
 	spin_lock_bh(&ft_watch_lock);
 	list_del(&binding->list);
 	ft_bound--;

@@ -1040,7 +1040,8 @@ static bool ft_l2_resolve(const struct ft_l2_seen *s, struct ft_l2_pair *p)
  * transaction. */
 static void ft_l2_release(struct ft_l2_pair *p)
 {
-	if (cdx_ft_unlink(&p->hw))
+	/* A bridged pair reports to no one: nothing reads it on the way out. */
+	if (cdx_ft_unlink(&p->hw, NULL))
 		ft_invalidate();
 	spin_lock_bh(&ft_l2_lock);
 	hash_del(&p->node);

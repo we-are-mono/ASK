@@ -722,13 +722,31 @@ any PPPoE session header. `ft_l2_overhead()` subtracts exactly that stack, taken
 from the direction's own ingress framing, and saturates at zero rather than
 wrapping when a delta cannot carry it.
 
+A flow's last delta goes with its teardown. Linux's deletion (patch 140) reads
+stats back from `FLOW_CLS_DESTROY` as from `FLOW_CLS_STATS` and folds them into
+the conntrack the same way -- in 64 bits, since a read every few seconds
+exceeds 32 bits on one flow above eight gigabits per second -- and the adapter
+answers it with what the entry counted since its last report, which the
+backend reads once the entry's pieces are unlinked (`cdx_ft_unlink()`'s
+`final`). A retirement the adapter starts itself -- a dependency change, a
+global invalidation, an SA or a VAP going, an offer that found the generation
+changed -- reads the entry the same way and holds the delta, keyed by binding,
+cookie and the generation's handle (`struct ft_final`), for the deletion Linux
+sends once its collector has retired the generation, or for the offer that
+readmits the generation first, which carries it into the new entry's next
+report. Unbinding a device's block tears the device's flows down through the
+still-bound driver first, as the indirect cleanup always did, so a deleted
+table reports its flows' last counts too: nftables unbinds the hooks before it
+frees the table's flows. `/proc/cdx_flowtable` shows `finals_held`, the deltas
+waiting for their deletion, and `finals_dropped`, those no deletion could take.
+
 Per-interface counters are a separate set of firmware records, folded into a
 port's or a VLAN device's `rtnl_link_stats64` by the `dev_get_stats()` hook and
 restated the same way into that device's units; the
 [interface counters guide](statistics.md) has the records, the
 measured framing and the lifetime rules.
 
-Two residuals remain, both bounded and neither correctable from a total:
+The residuals, each bounded:
 
 - **Padding.** A frame below the sixty-byte minimum was padded before it was
   counted, and padding is invisible in an aggregate. A flow of minimum-size
@@ -737,6 +755,20 @@ Two residuals remain, both bounded and neither correctable from a total:
 - **Punts.** A frame punted after its hit was counted here is counted again by
   the path that handled it. That is bounded by exception traffic (TTL, MTU,
   TCP state), which is zero on a healthy flow.
+- **The read after the unlink.** The final counters are read once the entry's
+  pieces are unlinked, not after the barrier that proves the firmware has left
+  them: a frame whose classifier walk began before the unlink is counted after
+  the read, and that count is lost. Waiting for the barrier would cost every
+  deletion the host-command round trip batched retirement exists to avoid.
+- **Deletions with no taker.** A deletion that found the transaction held is
+  answered at once (`destroy_deferrals`), so what its entry counted since its
+  last report has no one to report to and is dropped; so is a delta held for a
+  binding Netfilter releases before the deletion that would take it -- a flow
+  whose deletion could not be queued behind a read in flight when the device's
+  flows were swept -- and one no record could be allocated for. All are counted
+  in `finals_dropped` (ISSUES A407). A conntrack killed first -- `conntrack -F`,
+  a ctnetlink delete -- has sent its destroy event before the flow's deletion
+  folds the last delta, so that delta reaches a counter nothing reads again.
 
 This was previously resolved the other way: counter-enabled tables were refused
 outright and enabling counters on a live table invalidated it. That refused

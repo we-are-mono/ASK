@@ -178,8 +178,11 @@ not the ports it resolved to, and `check` reports the hash the installed table
 carries. When the resolved set changes, the daemon changes the live
 flowtable's device list in one nft transaction, `add flowtable` for ports that
 came up and `delete flowtable` for ports that went down, without deleting the
-table or draining the hardware. Ports that stay keep their bindings and their
-hardware flows; the adapter binds or unbinds only the ports the update names.
+table or draining the hardware. Ports that stay keep their bindings, and every
+hardware flow that touches no port the update deletes; the adapter binds or
+unbinds only the ports the update names. Netfilter tears a deleted port's flows
+down, both directions, before it unbinds the port, so the last of what the
+hardware counted for them reaches conntrack.
 The result is verified as strictly as a replacement: marker, device list, one
 binding per device, no invalidation. If the update fails or does not verify,
 the same check falls back to the drain/install/verify transaction.

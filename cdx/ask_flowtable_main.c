@@ -502,6 +502,11 @@ static int ft_show(struct seq_file *seq, void *v)
 	/* Linux's deletions that found the transaction held and left what
 	 * they named, if anything was in hardware, to the retirement worker. */
 	seq_printf(seq, "destroy_deferrals %lld\n", atomic64_read(&ft_destroy_deferrals));
+	/* The last deltas of entries this module retired on its own, held for
+	 * the deletion Linux is yet to send for each; and the deltas no
+	 * deletion could take -- a deferred deletion's, a released binding's,
+	 * or one no record could be made for. */
+	seq_printf(seq, "finals_held %u\nfinals_dropped %llu\n", ft_finals_held, ft_finals_dropped);
 	seq_printf(seq, "ipsec_sas %u\nipsec_sa_cache %u\n",
 		   cdx_ipsec_sa_count(), cdx_ipsec_sa_cache_entries());
 	ft_sec_refusal_rows(seq);
@@ -894,6 +899,7 @@ netdev:
 	cancel_work_sync(&ft_retire_work);
 	cancel_work_sync(&ft_settle_work);
 	ft_deferred_destroys_drop();
+	ft_finals_drop_all();
 	cancel_delayed_work_sync(&ft_work);
 	cancel_delayed_work_sync(&ft_rearm_work);
 	/* Both chains are unregistered above, so nothing can add a membership
@@ -1038,8 +1044,10 @@ static void __exit ask_flowtable_exit(void)
 	 * still Netfilter's, and nothing else will ever hand them back. */
 	ft_block_drain();
 	/* The retirement work is cancelled above and the bindings are gone,
-	 * so nothing retires or records a deferred deletion any more. */
+	 * so nothing retires or records a deferred deletion any more, and
+	 * nothing holds a final delta or could add one. */
 	ft_deferred_destroys_drop();
+	ft_finals_drop_all();
 	WRITE_ONCE(ft_ready, false);
 	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,
 	 * before releasing CDX. The drain above removed every direction and
