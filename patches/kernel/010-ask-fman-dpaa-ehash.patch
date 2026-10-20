@@ -1,4 +1,4 @@
-From 0946c07b09216aa5f0d5b2d2164c8658f327a871 Mon Sep 17 00:00:00 2001
+From c46e5ee76fd6c835296326c30bd6309268d89a18 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -108,7 +108,11 @@ finished stopping, FM_PORT_IsPcdAttached() whether a port hands frames to
 a PCD, and FM_PORT_SetFenced() makes FM_PORT_Enable() refuse while set.
 FM_PORT_BypassPCD() sends a disabled port's frames to its default queue
 and gives the PCD back unchanged, with no host command, so the owner can
-forward in software while it settles the tables.
+forward in software while it settles the tables. A netdev opened on a
+fenced port fails cleanly and can be opened again: the port wrappers
+(enable, disable, suspend, resume, L4 checksum) answer in negative errnos,
+so the ndo_open turns NAPI off again, and dpa_start() lets the PHY go, as
+dpa_stop() does.
 ExternalHashTableFindEntry() says which bucket still links an entry (a
 delete no longer reads an empty bucket as a node).
 
@@ -118,7 +122,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../net/ethernet/freescale/sdk_dpaa/Kconfig   |    6 +-
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    |   43 +-
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   44 +-
- .../freescale/sdk_dpaa/dpaa_eth_common.c      |   79 +-
+ .../freescale/sdk_dpaa/dpaa_eth_common.c      |   84 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |   36 +-
  .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  948 +++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
@@ -173,7 +177,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../freescale/sdk_fman/src/system/sys_io.c    |    1 +
  .../freescale/sdk_fman/src/wrapper/Makefile   |    6 +-
  .../sdk_fman/src/wrapper/fman_test.c          | 1629 ------
- .../sdk_fman/src/wrapper/lnxwrp_fm.c          |  132 +-
+ .../sdk_fman/src/wrapper/lnxwrp_fm.c          |  146 +-
  .../sdk_fman/src/wrapper/lnxwrp_fm.h          |   11 +-
  .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |  156 +-
  .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   | 4796 -----------------
@@ -197,7 +201,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 83 files changed, 8545 insertions(+), 12467 deletions(-)
+ 83 files changed, 8559 insertions(+), 12472 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -497,10 +501,10 @@ index 7109d33419bd..7d2c99af6319 100644
 +
  #endif	/* __DPA_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
-index 515dfb68ed5f..cd63502f1cc4 100644
+index 515dfb68ed5f..5530bb6b8cc6 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
-@@ -166,6 +166,7 @@ int __cold dpa_start(struct net_device *net_dev)
+@@ -166,12 +166,18 @@ int __cold dpa_start(struct net_device *net_dev)
  	}
  
  	netif_tx_start_all_queues(net_dev);
@@ -508,7 +512,18 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  
  	return 0;
  
-@@ -186,6 +187,8 @@ int __cold dpa_stop(struct net_device *net_dev)
+ mac_start_failed:
+ 	for_each_port_device(i, mac_dev->port_dev)
+ 		fm_port_disable(mac_dev->port_dev[i]);
++	/* Let the PHY go as dpa_stop() does, or the next open finds it
++	 * attached and fails too. */
++	if (mac_dev->phy_dev)
++		phy_disconnect(mac_dev->phy_dev);
++	mac_dev->phy_dev = NULL;
+ 
+ 	return err;
+ }
+@@ -186,6 +192,8 @@ int __cold dpa_stop(struct net_device *net_dev)
  	priv = netdev_priv(net_dev);
  	mac_dev = priv->mac_dev;
  
@@ -517,7 +532,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  	netif_tx_stop_all_queues(net_dev);
  	/* Allow the Fman (Tx) port to process in-flight frames before we
  	 * try switching it off.
-@@ -297,6 +300,19 @@ int dpa_set_features(struct net_device *dev, netdev_features_t features)
+@@ -297,6 +305,19 @@ int dpa_set_features(struct net_device *dev, netdev_features_t features)
  }
  EXPORT_SYMBOL(dpa_set_features);
  
@@ -537,7 +552,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  #ifdef CONFIG_FSL_DPAA_TS
  u64 dpa_get_timestamp_ns(const struct dpa_priv_s *priv, enum port_type rx_tx,
  			const void *data)
-@@ -588,6 +604,16 @@ void dpa_set_rx_mode(struct net_device *net_dev)
+@@ -588,6 +609,16 @@ void dpa_set_rx_mode(struct net_device *net_dev)
  					   "mac_dev->set_promisc() = %d\n",
  					   _errno);
  	}
@@ -554,7 +569,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  
  	_errno = priv->mac_dev->set_multi(net_dev, priv->mac_dev);
  	if (unlikely(_errno < 0) && netif_msg_drv(priv))
-@@ -608,6 +634,7 @@ void dpa_set_buffers_layout(struct mac_device *mac_dev,
+@@ -608,6 +639,7 @@ void dpa_set_buffers_layout(struct mac_device *mac_dev,
  	layout[RX].time_stamp = true;
  #endif
  	fm_port_get_buff_layout_ext_params(mac_dev->port_dev[RX], &params);
@@ -562,7 +577,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  	layout[RX].manip_extra_space = params.manip_extra_space;
  	/* a value of zero for data alignment means "don't care", so align to
  	 * a non-zero value to prevent FMD from using its own default
-@@ -718,7 +745,7 @@ void dpa_bp_drain(struct dpa_bp *bp)
+@@ -718,7 +750,7 @@ void dpa_bp_drain(struct dpa_bp *bp)
  }
  EXPORT_SYMBOL(dpa_bp_drain);
  
@@ -571,7 +586,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  _dpa_bp_free(struct dpa_bp *dpa_bp)
  {
  	struct dpa_bp *bp = dpa_bpid2pool(dpa_bp->bpid);
-@@ -739,6 +766,7 @@ _dpa_bp_free(struct dpa_bp *dpa_bp)
+@@ -739,6 +771,7 @@ _dpa_bp_free(struct dpa_bp *dpa_bp)
  	dpa_bp_array[bp->bpid] = NULL;
  	bman_free_pool(bp->pool);
  }
@@ -579,7 +594,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  
  void __cold __attribute__((nonnull))
  dpa_bp_free(struct dpa_priv_s *priv)
-@@ -1435,19 +1463,10 @@ dpaa_eth_init_rx_port(struct fm_port *port, struct dpa_bp *bp, size_t count,
+@@ -1435,19 +1468,10 @@ dpaa_eth_init_rx_port(struct fm_port *port, struct dpa_bp *bp, size_t count,
  			   buf_layout, frag_enabled);
  }
  
@@ -599,7 +614,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  
  int dpa_alloc_pcd_fqids(struct device *dev, uint32_t num,
  				uint8_t alignment, uint32_t *base_fqid)
-@@ -1543,8 +1562,9 @@ void dpa_release_sgt(struct qm_sg_entry *sgt)
+@@ -1543,8 +1567,9 @@ void dpa_release_sgt(struct qm_sg_entry *sgt)
  }
  EXPORT_SYMBOL(dpa_release_sgt);
  
@@ -611,7 +626,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  {
  	struct qm_sg_entry	*sgt;
  	struct dpa_bp		*dpa_bp;
-@@ -1735,7 +1755,7 @@ int dpa_enable_tx_csum(struct dpa_priv_s *priv,
+@@ -1735,7 +1760,7 @@ int dpa_enable_tx_csum(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(dpa_enable_tx_csum);
  
@@ -620,7 +635,7 @@ index 515dfb68ed5f..cd63502f1cc4 100644
  void dpa_enable_ceetm(struct net_device *dev)
  {
  	struct dpa_priv_s *priv = netdev_priv(dev);
-@@ -1750,3 +1770,36 @@ void dpa_disable_ceetm(struct net_device *dev)
+@@ -1750,3 +1775,36 @@ void dpa_disable_ceetm(struct net_device *dev)
  }
  EXPORT_SYMBOL(dpa_disable_ceetm);
  #endif
@@ -16643,7 +16658,7 @@ index b2c0a19ac13a..000000000000
 -module_init(fmt_load);
 -module_exit(fmt_unload);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
-index e10512983b60..879ce3ce4c5d 100644
+index e10512983b60..2a88d24ebcaf 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 @@ -42,7 +42,6 @@
@@ -16842,7 +16857,61 @@ index e10512983b60..879ce3ce4c5d 100644
  u64 *fm_port_get_buffer_time_stamp(const struct fm_port *port,
  		const void *data)
  {
-@@ -1610,6 +1611,21 @@ int fm_mac_resume(struct fm_mac_dev *fm_mac_dev)
+@@ -1379,12 +1380,14 @@ uint16_t fm_get_tx_port_channel(struct fm_port *port)
+ }
+ EXPORT_SYMBOL(fm_get_tx_port_channel);
+ 
++/* Both answer in negative errnos, as their netdev callers test them: the
++ * SDK's error type is a positive errno value (E_BUSY from a fenced port). */
+ int fm_port_enable (struct fm_port *port)
+ {
+     t_LnxWrpFmPortDev   *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev*)port;
+     t_Error err = FM_PORT_Enable(p_LnxWrpFmPortDev->h_Dev);
+ 
+-    return GET_ERROR_TYPE(err);
++    return -GET_ERROR_TYPE(err);
+ }
+ EXPORT_SYMBOL(fm_port_enable);
+ 
+@@ -1393,15 +1396,17 @@ int fm_port_disable(struct fm_port *port)
+     t_LnxWrpFmPortDev   *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev*)port;
+     t_Error err = FM_PORT_Disable(p_LnxWrpFmPortDev->h_Dev);
+ 
+-    return GET_ERROR_TYPE(err);
++    return -GET_ERROR_TYPE(err);
+ }
+ EXPORT_SYMBOL(fm_port_disable);
+ 
++/* These three answer in negative errnos too: ndo_set_features and the PM
++ * core read nothing else as a failure. */
+ int fm_port_enable_rx_l4csum(struct fm_port *port, bool enable)
+ {
+ 	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev *)port;
+ 
+-	return FM_PORT_SetRxL4ChecksumVerify(p_LnxWrpFmPortDev->h_Dev, enable);
++	return -GET_ERROR_TYPE(FM_PORT_SetRxL4ChecksumVerify(p_LnxWrpFmPortDev->h_Dev, enable));
+ }
+ EXPORT_SYMBOL(fm_port_enable_rx_l4csum);
+ 
+@@ -1409,7 +1414,7 @@ int fm_port_suspend(struct fm_port *port)
+ {
+ 	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev *)port;
+ 
+-	return FM_PORT_Disable(p_LnxWrpFmPortDev->h_Dev);
++	return -GET_ERROR_TYPE(FM_PORT_Disable(p_LnxWrpFmPortDev->h_Dev));
+ }
+ EXPORT_SYMBOL(fm_port_suspend);
+ 
+@@ -1417,7 +1422,7 @@ int fm_port_resume(struct fm_port *port)
+ {
+ 	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev *)port;
+ 
+-	return FM_PORT_Enable(p_LnxWrpFmPortDev->h_Dev);
++	return -GET_ERROR_TYPE(FM_PORT_Enable(p_LnxWrpFmPortDev->h_Dev));
+ }
+ EXPORT_SYMBOL(fm_port_resume);
+ 
+@@ -1610,6 +1615,21 @@ int fm_mac_resume(struct fm_mac_dev *fm_mac_dev)
  }
  EXPORT_SYMBOL(fm_mac_resume);
  
@@ -16864,7 +16933,7 @@ index e10512983b60..879ce3ce4c5d 100644
  int fm_mac_set_promiscuous(struct fm_mac_dev *fm_mac_dev,
  		bool enable)
  {
-@@ -1987,11 +2003,7 @@ static int __init __cold fm_load (void)
+@@ -1987,11 +2007,7 @@ static int __init __cold fm_load (void)
          return -ENODEV;
      }
  
