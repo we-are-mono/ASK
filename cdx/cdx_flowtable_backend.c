@@ -88,13 +88,14 @@ MODULE_PARM_DESC(flowtable_restart_limit, "Datapath restarts allowed per 10 minu
 /* The hardware's own answers -- a stopped port gone idle, a barrier the
  * host-command channel completed -- come within moments when the FMan is well:
  * a port drains in microseconds, a barrier completes in well under a
- * millisecond, and one the channel took but never confirmed has failed it for
- * good already. So a restart waiting on either is retried soon, at a steady
+ * millisecond. So a restart waiting on either is retried soon, at a steady
  * interval, and an episode in which the hardware has failed to answer
  * FT_RESTART_HW_TRIES times -- a few seconds, a port's own wait for idle
- * included -- is one in which it will not: the latch is left for a reboot,
- * saying what it waited for. RTNL contention and the test hold are not the
- * hardware's and never count. */
+ * included -- leaves the latch for a reboot, saying what it waited for: the
+ * classifier ports are stopped meanwhile, and nothing they carry moves. A
+ * host command that timed out shuts the channel only until the FMan answers it
+ * (hc.c), so a barrier refused for that is retried here like any other. RTNL
+ * contention and the test hold are not the hardware's and never count. */
 #define FT_RESTART_HW_RETRY	(HZ / 4)
 #define FT_RESTART_HW_TRIES	12
 
@@ -346,15 +347,15 @@ static int cdx_ft_restart_hw_wait(const char *why, unsigned long *delay)
  * barrier a delete relies on to prove no lookup begun before it still walks
  * the tables proves the same of that frame. Nothing a stop lets go of is freed
  * before it. 0, also with no table to issue it through; -EAGAIN for one that
- * failed; -ENOTRECOVERABLE when the host-command channel has failed until
- * reset and no barrier will complete again. */
+ * failed, which a later one completes: a host command that timed out shuts the
+ * channel only until the FMan answers it. */
 static int cdx_ft_stopped_barrier(void)
 {
 	void *td = dpa_get_ehash_td();
 
 	if (!td || !ExternalHashTableFmPcdHcSync(td))
 		return 0;
-	return ExternalHashTableHcFailed(td) ? -ENOTRECOVERABLE : -EAGAIN;
+	return -EAGAIN;
 }
 
 /* Restart the datapath after a latch, which a stopped datapath makes provable.
@@ -374,9 +375,9 @@ static int cdx_ft_stopped_barrier(void)
  * contended, a port still finishing a frame, a key still linked, a barrier
  * that failed -- the hardware's own waits for a few seconds at most. Anything
  * that will not -- a port outside the configuration reaching a classifier, a
- * key nothing recorded, a malformed table, a host-command channel that has
- * failed, hardware that has stopped answering, the restart budget spent --
- * leaves the latch for a reboot, as it always was.
+ * key nothing recorded, a malformed table, hardware that has stopped
+ * answering, the restart budget spent -- leaves the latch for a reboot, as it
+ * always was.
  *
  * 0: restarted, or terminal; -EAGAIN with *delay set: try again then. Caller
  * holds the transaction. */
@@ -415,11 +416,6 @@ static int cdx_ft_restart(unsigned long *delay)
 		goto out;
 	}
 	rc = cdx_ft_stopped_barrier();
-	if (rc == -ENOTRECOVERABLE) {
-		rc = 0;
-		cdx_ft_set_terminal("the host-command channel has failed");
-		goto out;
-	}
 	if (rc) {
 		rc = cdx_ft_restart_hw_wait("the PCD barrier kept failing", delay);
 		goto out;
@@ -448,11 +444,6 @@ static int cdx_ft_restart(unsigned long *delay)
 		goto out;
 	}
 	rc = cdx_ft_stopped_barrier();
-	if (rc == -ENOTRECOVERABLE) {
-		rc = 0;
-		cdx_ft_set_terminal("the host-command channel has failed");
-		goto out;
-	}
 	if (rc) {
 		rc = cdx_ft_restart_hw_wait("the PCD barrier kept failing", delay);
 		goto out;
@@ -988,11 +979,6 @@ int cdx_ft_recover(void)
 		ft_recover_backoff = 0;
 		stopped = !rc;
 		rc = cdx_ft_stopped_barrier();
-		if (rc == -ENOTRECOVERABLE) {
-			cdx_ft_set_terminal("the host-command channel has failed");
-			cdx_ft_hw_strand();
-			return cdx_ft_hw_retry();
-		}
 		if (rc)
 			return -EAGAIN;
 		if (stopped)

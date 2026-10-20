@@ -121,6 +121,36 @@ static struct devlink *cdx_devlink;
 static struct devlink_trap_policer cdx_policers[2];
 static unsigned int cdx_policer_count;
 
+/* What each policer has dropped since it was registered: the running total
+ * devlink asks for. The profile's own red counter is not one -- every set
+ * zeroes it, and so does every rewrite of a set whose write did not land --
+ * so the total is kept here from deltas (cdx_police_advance()) and goes on
+ * across them. Indexed by policer id, under the policer lock. */
+static struct {
+	struct cdx_police_base	base;
+	u64			total;
+} cdx_policer_drops[CDX_DEVLINK_POLICER_SEC + 1];
+
+/* Bring one policer's total up to date with what its profile holds now. A
+ * read that fails leaves both the total and the baseline where they were:
+ * the total is reported as it stood, never a zero that would run it
+ * backwards, and the next good read adds only what was dropped since. */
+static void cdx_devlink_drops_update(u32 id)
+{
+	struct cdx_police_counters now, delta;
+	int rc;
+
+	if (id == CDX_DEVLINK_POLICER_SEC)
+		rc = cdx_ingress_policer_counters(FMAN_INDEX, INGRESS_SEC_POLICER_QUEUE_NUM,
+						  &now);
+	else
+		rc = cdx_expt_rate_counters(FMAN_INDEX, CDX_EXPT_ETH_RATELIMIT, &now);
+	if (rc != SUCCESS)
+		return;
+	cdx_police_advance(&cdx_policer_drops[id].base, &now, &delta);
+	cdx_policer_drops[id].total += delta.red;
+}
+
 /* Whether a programmed value fits the range the policer declares. Out of range
  * is left unregistered, never clamped: a clamped value is one the hardware is
  * not running, which is the fault this whole table exists to avoid. */
@@ -138,12 +168,19 @@ static bool cdx_devlink_in_range(const char *what, u32 rate, u32 burst,
 
 /* Fill cdx_policers[] from the programmed profiles and return how many there
  * are. Called under RTNL and the control mutex, before anything is registered,
- * so nothing else reads the table while it changes. */
+ * so nothing else reads the table while it changes; the profiles' records are
+ * read under the policer lock, as everywhere. */
 static unsigned int cdx_devlink_policers_build(void)
 {
 	unsigned int n = 0;
 	u32 rate, burst;
 
+	cdx_plcr_lock();
+	/* Both profiles have counted from zero since they were created, under
+	 * the write that created them. */
+	memset(cdx_policer_drops, 0, sizeof(cdx_policer_drops));
+	cdx_policer_drops[CDX_DEVLINK_POLICER_PUNT].base.known = true;
+	cdx_policer_drops[CDX_DEVLINK_POLICER_SEC].base.known = true;
 	/* The punt profile, if it exists and meters packets: a byte-mode
 	 * profile has a rate devlink would report in the wrong unit. */
 	if (cdx_expt_rate_config(FMAN_INDEX, CDX_EXPT_ETH_RATELIMIT,
@@ -168,70 +205,82 @@ static unsigned int cdx_devlink_policers_build(void)
 			DEVLINK_TRAP_POLICER(CDX_DEVLINK_POLICER_SEC, rate, burst,
 					     CDX_SEC_RATE_MAX, CDX_SEC_RATE_MIN,
 					     CDX_SEC_BURST_MAX, CDX_SEC_BURST_MIN);
+	cdx_plcr_unlock();
 	return n;
 }
 
 
+/* A set whose write does not land is taken all the same: the rate and burst
+ * are the profile's record, and the policer layer writes the profile from it
+ * until the hardware runs them (cdx_qos.c). devlink then shows what the meter
+ * is being brought to, and the operator is told it is behind, rather than
+ * devlink keeping the old values over a meter the timed-out write may or may
+ * not have changed. Only a set the profile cannot take is refused. */
 static int cdx_devlink_policer_set(struct devlink *devlink,
 				   const struct devlink_trap_policer *policer,
 				   u64 rate, u64 burst,
 				   struct netlink_ext_ack *extack)
 {
-	if (policer->id == CDX_DEVLINK_POLICER_SEC) {
-		/* Packet mode by construction, so no unit to check. Rate and
-		 * burst go together because the profile takes them together. */
-		if (cdx_ingress_policer_modify_config(FMAN_INDEX,
-						      INGRESS_SEC_POLICER_QUEUE_NUM,
-						      (uint32_t)rate, (uint32_t)rate,
-						      (uint32_t)burst,
-						      (uint32_t)burst, false) != SUCCESS) {
-			NL_SET_ERR_MSG_MOD(extack, "the SEC policer could not be programmed");
-			return -EINVAL;
-		}
-		return 0;
-	}
-	if (policer->id != CDX_DEVLINK_POLICER_PUNT)
+	int rc;
+
+	if (policer->id != CDX_DEVLINK_POLICER_SEC &&
+	    policer->id != CDX_DEVLINK_POLICER_PUNT)
 		return -EINVAL;
-	if (!cdx_expt_rate_is_packet_mode(FMAN_INDEX)) {
+	if (policer->id == CDX_DEVLINK_POLICER_PUNT &&
+	    !cdx_expt_rate_is_packet_mode(FMAN_INDEX)) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "the punt profile is configured to meter bytes, and a policer rate is packets per second");
 		return -EOPNOTSUPP;
 	}
-	/* Every table whose misses reach the CPU shares one profile, so the
-	 * exception type is the Ethernet one and the others -- WIFI, and two
-	 * the hardware layer declares but does not support -- are not separate
-	 * policers to expose. */
-	if (cdx_set_expt_rate(FMAN_INDEX, CDX_EXPT_ETH_RATELIMIT,
-			      (uint32_t)rate, (uint32_t)burst) != SUCCESS) {
-		NL_SET_ERR_MSG_MOD(extack, "the punt policer could not be programmed");
+	cdx_plcr_lock();
+	/* The write zeroes the profile's counters, so what it dropped under the
+	 * old rate is counted first. */
+	cdx_devlink_drops_update(policer->id);
+	if (policer->id == CDX_DEVLINK_POLICER_SEC) {
+		/* Packet mode by construction, so no unit to check. Rate and
+		 * burst go together because the profile takes them together. */
+		rc = cdx_ingress_policer_modify_config(FMAN_INDEX,
+						       INGRESS_SEC_POLICER_QUEUE_NUM,
+						       (uint32_t)rate, (uint32_t)rate,
+						       (uint32_t)burst,
+						       (uint32_t)burst, false);
+	} else {
+		/* Every table whose misses reach the CPU shares one profile, so
+		 * the exception type is the Ethernet one and the others -- WIFI,
+		 * and two the hardware layer declares but does not support --
+		 * are not separate policers to expose. */
+		rc = cdx_set_expt_rate(FMAN_INDEX, CDX_EXPT_ETH_RATELIMIT,
+				       (uint32_t)rate, (uint32_t)burst);
+	}
+	cdx_plcr_unlock();
+	if (rc == CDX_PLCR_DEFERRED) {
+		NL_SET_ERR_MSG_MOD(extack, "the policer write was not confirmed and is retried until it is");
+		return 0;
+	}
+	if (rc != SUCCESS) {
+		if (policer->id == CDX_DEVLINK_POLICER_SEC)
+			NL_SET_ERR_MSG_MOD(extack, "the SEC policer could not be programmed");
+		else
+			NL_SET_ERR_MSG_MOD(extack, "the punt policer could not be programmed");
 		return -EINVAL;
 	}
 	return 0;
 }
 
+/* Red is what each profile dropped: both program e_FM_PCD_DROP_FRAME on red
+ * and enqueue green and yellow. A running total, as devlink asks for
+ * (cdx_policer_drops). */
 static int cdx_devlink_policer_counter_get(struct devlink *devlink,
 					   const struct devlink_trap_policer *policer,
 					   u64 *p_drops)
 {
-	struct cdx_police_counters now;
-
-	if (policer->id == CDX_DEVLINK_POLICER_SEC) {
-		if (cdx_ingress_policer_counters(FMAN_INDEX,
-						 INGRESS_SEC_POLICER_QUEUE_NUM,
-						 &now) != SUCCESS)
-			return -EINVAL;
-		*p_drops = now.red;
-		return 0;
-	}
-	if (policer->id != CDX_DEVLINK_POLICER_PUNT)
+	if (policer->id != CDX_DEVLINK_POLICER_SEC &&
+	    policer->id != CDX_DEVLINK_POLICER_PUNT)
 		return -EINVAL;
-	if (cdx_expt_rate_counters(FMAN_INDEX, CDX_EXPT_ETH_RATELIMIT, &now) != SUCCESS)
-		return -EINVAL;
-	/* Red is what the profile dropped: it programs e_FM_PCD_DROP_FRAME on
-	 * red and enqueues green and yellow. A running total, as devlink asks
-	 * for -- unlike tc, it reports the counter rather than accumulating a
-	 * delta, so there is no baseline to keep here. */
-	*p_drops = now.red;
+	cdx_plcr_lock();
+	cdx_devlink_drops_update(policer->id);
+	*p_drops = cdx_policer_drops[policer->id].total;
+	cdx_plcr_unlock();
 	return 0;
 }
 

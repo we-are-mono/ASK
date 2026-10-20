@@ -435,6 +435,11 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 			port_info->err_dpa_fq = dpa_fq;
 			fq->cb.dqrr = ofport_rx_err;
 		}
+		/* And the work queue the driver gives a port's own queues of
+		 * that type: the channel's WQ0 and WQ1 are served strictly ahead
+		 * of the rest, and a queue left at 0 would outrank every CPU's
+		 * transmit confirmations and receive queues (A401). */
+		_dpa_assign_wq(dpa_fq);
 		/* No group: what reaches these is reported and dropped
 		 * (ofport_rx_defa(), ofport_rx_err()), never a stream. */
 		if (cdx_create_fq(dpa_fq, 0, dpa_oh_iface_info->pcd_proc_entry, NULL)) {

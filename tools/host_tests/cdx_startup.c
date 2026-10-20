@@ -119,6 +119,10 @@ static unsigned alloc_step, fail_alloc, live_allocs, step, fail_step;
 static void *stats, *oh[2], *eth[MAX_PHY_PORTS];
 static unsigned slots, queues;
 static bool restoring, unsafe_enable, fail_delete;
+/* Whether a policer profile exists for the reconcile work to rewrite, and how
+ * often that work was stopped. */
+static bool plcr_retry_live;
+static unsigned plcr_retry_stops;
 
 static void mutex_lock(int *lock)
 {
@@ -233,6 +237,7 @@ static int cdx_add_eth_onif(char *name)
 {
     unsigned n = atoi(name);
     port_rate_lim_mode[n].port_handle = &ports[2 * n + 1]; slots++;
+    plcr_retry_live = true;
     if (cdx_dpa_init_fault()) return -EIO;
     eth[n] = acquire(); if (!eth[n]) return -ENOMEM;
     phy_port[n].flags = 1; phy_port[n].itf.index = n;
@@ -279,6 +284,7 @@ static int cdx_create_port_fqs(void)
 int cdxdrv_create_missaction_policer_profiles(struct cdx_fman_info *f)
 {
     for (unsigned i = 0; i < CDX_EXPT_MAX_EXPT_LIMIT_TYPES; i++) {
+        plcr_retry_live = true;
         f->expt_rate_limit_info[i].handle = acquire();
         if (!f->expt_rate_limit_info[i].handle || cdx_dpa_init_fault()) return -ENOMEM;
     }
@@ -313,12 +319,21 @@ static int cdx_devlink_attach(struct device *dev)
     return devlink_attach_rc;
 }
 static void cdx_devlink_detach(void) { devlink_live = false; }
+/* The work that rewrites a profile whose write did not land runs while any
+ * profile exists, so it is stopped before one is released, whichever way the
+ * configuration goes; nothing restarts it. */
+static void cdx_plcr_reconcile_stop(void) { plcr_retry_live = false; plcr_retry_stops++; }
 static int FM_PCD_PlcrProfileDelete(void *p)
 {
-    assert(stopped() && !devlink_live);
+    assert(stopped() && !devlink_live && !plcr_retry_live);
     kfree(p); int ret = fail_delete ? -EIO : 0; fail_delete = false; return ret;
 }
-static int FM_PORT_PcdPlcrFreeProfiles(void *p) { assert(!((struct port *)p)->enabled && slots); slots--; return 0; }
+static int FM_PORT_PcdPlcrFreeProfiles(void *p)
+{
+    assert(!((struct port *)p)->enabled && slots && !plcr_retry_live);
+    slots--;
+    return 0;
+}
 static int cdxdrv_set_miss_action(unsigned n) { (void)n; assert(stats && queues == 4); return 0; }
 #define CDX_DPA_TBL_EXTERNAL_HASH 1
 #define CDX_EXPT_ETH_DEFA_LIMIT 195312
@@ -362,9 +377,10 @@ static void clean_success(void)
         assert(fq->fq_base.id == 1);
     assert(!dpa_cfg_quiesce());
     cdx_ctrl_unlock_with_rtnl();
+    unsigned stops = plcr_retry_stops;
     dpa_cfg_deinit();
     assert(!fman_info && !rtnl && !dpa_cfg_lock && !cdx_info->ctrl.mutex);
-    assert(!devlink_live);
+    assert(!devlink_live && !plcr_retry_live && plcr_retry_stops > stops);
     for (unsigned i = 0; i < 4; i++)
         assert(ports[i].enabled == !!(port_up_mask & (1U << i)));
     assert(!live_allocs && !slots && !queues);

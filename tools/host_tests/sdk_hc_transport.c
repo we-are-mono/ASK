@@ -55,6 +55,10 @@ struct spin { bool held; };
 static unsigned delays, confirm_at, submissions, frees, port_frees;
 static int allocation_budget = -1;
 static bool reject, inline_confirm, confirm_on_timeout, nested_command;
+/* The opcode the next submission must carry. */
+static uint32_t command;
+#define SYNC (HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC)
+#define CC_CHANGE (HC_HCOR_GBL | HC_HCOR_OPCODE_CC)
 static t_FmHc *active;
 static t_LnxWrpFmDev device;
 static t_FmTestFq confirmation_queue;
@@ -62,6 +66,14 @@ static struct qm_dqrr_entry pending;
 static unsigned char dma[HC_CMD_POOL_SIZE][512] __aligned(16);
 static bool allocated[HC_CMD_POOL_SIZE];
 static void confirm(void);
+/* A timeout asks the wrapper where its frame is, once. */
+static unsigned describes;
+static void describe(t_Handle arg, char *buf, uint32_t size)
+{
+    assert(arg == &device && buf && size >= 64);
+    describes++;
+    snprintf(buf, size, "frames queued: command 0, answer 1, error 0");
+}
 
 void XX_Print(char *format, ...) { assert(!"unexpected SDK assertion"); }
 void XX_Exit(int status) { assert(!"unexpected SDK exit"); }
@@ -91,7 +103,7 @@ void XX_UnlockIntrSpinlock(t_Handle p, uint32_t flags)
 {
     struct spin *s = p;
     assert(s && s->held && !flags); s->held = false;
-    if (active && active->failed && confirm_on_timeout) {
+    if (active && confirm_on_timeout && active->timedOut[0]) {
         confirm_on_timeout = false;
         confirm(); /* Between the timeout decision and the caller's PutBuf. */
     }
@@ -114,9 +126,11 @@ static int qman_enqueue(struct qman_fq *fq, const struct qm_fd *fd, u32 flags)
     submissions++;
     pending.fd = *fd;
     const unsigned char *bytes = XX_PhysToVirt(qm_fd_addr(fd));
-    assert(fd->length20 == sizeof(t_HcFrame));
-    /* The sync command must reach QMan in hardware byte order. */
-    assert(bytes[0] == 0x20 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 2);
+    assert(fd->length20 == (command == SYNC ? sizeof(t_HcFrame)
+                                            : SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC));
+    /* The command must reach QMan in hardware byte order. */
+    assert(bytes[0] == command >> 24 && bytes[1] == (uint8_t)(command >> 16) &&
+           bytes[2] == (uint8_t)(command >> 8) && bytes[3] == (uint8_t)command);
     if (reject) return -EBUSY;
     if (nested_command) {
         /* A second caller completes while the first still owns its command.
@@ -139,9 +153,11 @@ static t_FmHc *setup(void)
     active->usageAllowed = true;
     active->f_QmEnqueue = QmEnqueueCB;
     active->h_QmArg = &device;
+    active->f_QmDescribe = describe;
     device.h_PcdDev = active;
     confirmation_queue.h_Arg = &device;
     reject = inline_confirm = confirm_on_timeout = nested_command = false;
+    command = SYNC;
     delays = confirm_at = submissions = frees = port_frees = 0;
     allocation_budget = -1;
     assert(FillBufPool(active) == E_OK);
@@ -149,10 +165,9 @@ static t_FmHc *setup(void)
 }
 static void dispose(t_FmHc *hc)
 {
-    /* Fixture reset only: all hardware ownership must have ended first. The
-     * production API deliberately offers no way to clear the failure latch. */
-    assert(!hc->nextSeqNumLocation);
-    hc->failed = false;
+    /* All hardware ownership must have ended first: nothing borrowed, nothing
+     * unanswered. */
+    assert(!hc->nextSeqNumLocation && !HcUnanswered(hc));
     assert(FmHcFree(hc) == E_OK);
     active = NULL;
     for (unsigned i = 0; i < HC_CMD_POOL_SIZE; i++) assert(!allocated[i]);
@@ -174,10 +189,9 @@ static void rejection_and_completion(void)
     reject = true;
     for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
         assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
-        assert(!hc->nextSeqNumLocation && !hc->failed && !delays);
-        /* A refused sync can complete next time: the channel has not
-         * failed, and an owner waiting on a barrier waits for it. */
-        assert(!FmHcIsFailed(hc));
+        /* A refused sync was never sent: nothing is left unanswered, and
+         * the next can complete. */
+        assert(!hc->nextSeqNumLocation && !HcUnanswered(hc) && !delays);
         t_HcFrame expected = {.opcode = HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC};
         assert(!memcmp(hc->p_Frm[0], &expected, sizeof(expected)));
         /* A run of rejections reports its first only: neither a later
@@ -197,7 +211,7 @@ static void rejection_and_completion(void)
     assert(FmHcPcdSync(hc) == E_OK && recoveries == recovered + 2 && reports == reported + 2);
     inline_confirm = false;
     confirm_at = HC_CONFIRM_POLLS; /* Completion at the deadline wins. */
-    assert(FmHcPcdSync(hc) == E_OK && !hc->failed);
+    assert(FmHcPcdSync(hc) == E_OK && !HcUnanswered(hc));
     assert(delays == HC_CONFIRM_POLLS && !hc->nextSeqNumLocation);
     /* Commands confirmed in time, even at the deadline, were never late. */
     assert(!lates && !stacks);
@@ -205,46 +219,47 @@ static void rejection_and_completion(void)
     assert(FmAllowHcUsage(hc, true) == E_OK);
     dispose(hc);
 }
-static void timeout_and_late_confirmation(bool before_return)
+static void sync_timeout_and_late_confirmation(bool before_return)
 {
     t_FmHc *hc = setup();
     confirm_on_timeout = before_return;
-    if (before_return) {
-        /* Sync uses HC even when register programming was configured direct.
-         * Its timeout must close that pre-existing fallback too. */
-        assert(FmAllowHcUsage(hc, false) == E_OK);
-        assert(!FmIsHcUsageAllowed(hc));
-    }
-    unsigned reported = reports, late = lates, stacked = stacks;
-    assert(!FmHcIsFailed(hc));
+    /* Sync uses HC even when register programming was configured direct.
+     * Its timeout must close that pre-existing fallback while the sync may
+     * still be inside the FMan. */
+    assert(FmAllowHcUsage(hc, false) == E_OK);
+    assert(!FmIsHcUsageAllowed(hc));
+    unsigned reported = reports, late = lates, stacked = stacks, recovered = recoveries;
+    unsigned described = describes;
     assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_TIMEOUT);
-    assert(stacks == stacked + 1);
-    assert(hc->failed && delays == HC_CONFIRM_POLLS && submissions == 1);
+    assert(stacks == stacked + 1 && describes == described + 1);
+    assert(delays == HC_CONFIRM_POLLS && submissions == 1);
     /* The timeout names its command: the sync, taken in CPU order before the
      * enqueue swapped the frame, sent a full deadline ago. */
-    assert(hc->sentOpcode[0] == (HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC));
+    assert(hc->sentOpcode[0] == SYNC);
     assert(hc->timedOut[0] == !before_return);
     assert(jiffies_to_msecs(jiffies - hc->sentAt[0]) == 1000);
     /* Confirmed before the caller's PutBuf, the command was still late. */
     assert(lates == late + before_return);
-    /* One that timed out unconfirmed has failed the channel until reset,
-     * which is what an owner asks before it stops waiting on barriers. */
-    assert(FmHcIsFailed(hc));
+    /* Unanswered until its confirmation, and no longer than that. */
+    assert(HcUnanswered(hc) == !before_return);
     assert(hc->nextSeqNumLocation == (before_return ? 0 : 1));
-    /* The timeout that failed the channel is reported unconditionally, and
-     * starts the run every retry after it belongs to. */
+    /* The timeout is reported unconditionally, and starts the run every
+     * retry after it belongs to. */
     assert(reports == reported + 1 && hc->failures == 1);
-    refuses_teardown(hc);
-    t_HcFrame snapshot = *hc->p_Frm[0];
-    reported = reports;
-    for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
-        assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
-        assert(submissions == 1);
-        if (!before_return) assert(!memcmp(hc->p_Frm[0], &snapshot, sizeof(snapshot)));
-        /* A retry of a failed channel adds no line of its own. */
-        assert(reports == reported && hc->failures == n + 2);
-    }
     if (!before_return) {
+        /* Until it answers, nothing more goes to a port that has not: each
+         * retry fails at once, without a second's wait, adds no line, and
+         * leaves the orphan's frame as the hardware may still read it. */
+        refuses_teardown(hc);
+        t_HcFrame snapshot = *hc->p_Frm[0];
+        reported = reports;
+        for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
+            assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
+            assert(submissions == 1 && delays == HC_CONFIRM_POLLS);
+            assert(!memcmp(hc->p_Frm[0], &snapshot, sizeof(snapshot)));
+            assert(reports == reported && hc->failures == n + 2);
+            assert(describes == described + 1);
+        }
         /* Exhaust all remaining buffers and return them out of order. The
          * orphan may only rejoin the pool after its own confirmation. */
         t_HcFrame *borrowed[HC_CMD_POOL_SIZE];
@@ -257,7 +272,7 @@ static void timeout_and_late_confirmation(bool before_return)
         assert(lates == late);
         confirm();
         /* The orphan's own confirmation says it was late, once. */
-        assert(lates == late + 1);
+        assert(lates == late + 1 && !hc->timedOut[0]);
         assert(hc->nextSeqNumLocation == HC_CMD_POOL_SIZE - 1);
         t_HcFrame *reclaimed = GetBuf(hc, &unused);
         assert(reclaimed == hc->p_Frm[0] && unused == 0);
@@ -268,14 +283,54 @@ static void timeout_and_late_confirmation(bool before_return)
         FmHcTxConf(hc, (t_DpaaFD *)&pending.fd);
         assert(lates == late + 1);
     }
-    assert(!hc->nextSeqNumLocation && hc->failed && FmHcIsFailed(hc));
-    refuses_teardown(hc); /* A late confirmation does not repair caller state. */
+    /* Answered, the sync has left nothing in the FMan: the channel is open
+     * again, the direct fallback as it was configured, and the next command
+     * completes and says it ended the run. */
+    assert(!hc->nextSeqNumLocation && !HcUnanswered(hc));
+    assert(!FmIsHcUsageAllowed(hc));
+    assert(FmAllowHcUsage(hc, true) == E_OK);
+    inline_confirm = true;
+    unsigned sent = submissions;
+    assert(FmHcPcdSync(hc) == E_OK && submissions == sent + 1);
+    assert(recoveries == recovered + 1 && !hc->failures);
+    dispose(hc);
+}
+static void state_change_timeout_reopens_once_answered(bool before_return)
+{
+    /* A change that times out may yet be made: its caller hears E_TIMEOUT,
+     * an outcome unknown, and puts its own record right once the channel
+     * opens again -- as it does for a sync, on the answer. Until then
+     * nothing else is sent, nor may a register be written directly. */
+    t_FmHc *hc = setup();
+    confirm_on_timeout = before_return;
+    unsigned late = lates, stacked = stacks, recovered = recoveries;
+    command = CC_CHANGE;
+    assert(GET_ERROR_TYPE(FmHcPcdCcDoDynamicChange(hc, 0x100, 0x200)) == E_TIMEOUT);
+    assert(stacks == stacked + 1 && submissions == 1 && delays == HC_CONFIRM_POLLS);
+    assert(hc->sentOpcode[0] == CC_CHANGE);
+    assert(hc->timedOut[0] == !before_return && lates == late + before_return);
+    if (!before_return) {
+        refuses_teardown(hc);
+        command = SYNC;
+        assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE && submissions == 1);
+        command = CC_CHANGE;
+        assert(GET_ERROR_TYPE(FmHcPcdCcDoDynamicChange(hc, 0x100, 0x200)) == E_INVALID_STATE);
+        assert(submissions == 1 && delays == HC_CONFIRM_POLLS);
+        confirm();
+        assert(lates == late + 1 && !hc->timedOut[0]);
+    }
+    assert(!hc->nextSeqNumLocation && !HcUnanswered(hc));
+    /* The owner's re-assertion goes out, and is answered. */
+    inline_confirm = true;
+    assert(FmHcPcdCcDoDynamicChange(hc, 0x100, 0x200) == E_OK && submissions == 2);
+    assert(recoveries == recovered + 1 && !hc->failures);
     dispose(hc);
 }
 static void timeout_on_a_later_command(void)
 {
     /* The command that times out is not the first frame: its own record is
-     * the one that says it was late. */
+     * the one that says it was late, and its confirmation reopens the
+     * channel although another frame is still borrowed. */
     t_FmHc *hc = setup();
     uint32_t seq;
     t_HcFrame *frame = GetBuf(hc, &seq);
@@ -283,8 +338,11 @@ static void timeout_on_a_later_command(void)
     assert(seq == 0);
     assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_TIMEOUT);
     assert(hc->timedOut[1] && !hc->timedOut[0] && lates == late);
+    assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE && submissions == 1);
     confirm();
     assert(!hc->timedOut[1] && lates == late + 1);
+    inline_confirm = true;
+    assert(FmHcPcdSync(hc) == E_OK && submissions == 2);
     PutBuf(hc, frame, seq);
     dispose(hc);
 }
@@ -351,15 +409,15 @@ static void independent_commands_and_invalid_confirmation(void)
 int main(void)
 {
     _Static_assert(sizeof(struct qm_fd) == sizeof(t_DpaaFD), "QMan / SDK FD layout");
-    /* A PCD without a channel has none to fail. */
-    assert(!FmHcIsFailed(NULL));
     rejection_and_completion();
-    timeout_and_late_confirmation(false);
-    timeout_and_late_confirmation(true);
+    sync_timeout_and_late_confirmation(false);
+    sync_timeout_and_late_confirmation(true);
+    state_change_timeout_reopens_once_answered(false);
+    state_change_timeout_reopens_once_answered(true);
     timeout_on_a_later_command();
     pool_and_cleanup();
     exhausted_pool();
     independent_commands_and_invalid_confirmation();
-    puts("SDK HC transport: rejection/retry, deadline, timeout, late confirmation of any command, pool, teardown and failure reporting passed");
+    puts("SDK HC transport: rejection/retry, deadline, a late sync reopening the channel, a late change failing it, pool, teardown and failure reporting passed");
     return 0;
 }

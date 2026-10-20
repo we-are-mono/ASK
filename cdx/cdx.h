@@ -44,9 +44,12 @@
 /* ls104x hardware has a single fman */
 #define FMAN_INDEX 0 
 
-#define MAX_CDX_INIT_FUNCTIONS  16
+/* The test image registers sixteen; a seventeenth would have been dropped. */
+#define MAX_CDX_INIT_FUNCTIONS  32
 typedef void (*cdx_deinit_func)(void);
 void register_cdx_deinit_func(cdx_deinit_func func);
+/* Test-only portal loads (cdx_portal_faults.c); nothing in production. */
+void cdx_portal_faults_init(void);
 /* Enter/leave a configuration or terminal teardown transaction; entry must
  * hold neither RTNL nor ctrl.mutex. Runtime callbacks use the backend API. */
 void cdx_ctrl_lock_with_rtnl(void);

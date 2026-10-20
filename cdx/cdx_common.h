@@ -500,13 +500,38 @@ int cdx_port_police_clear(char *ifname);
 /* What an RFC-2698 profile counts: frames per output colour, and nothing
  * else. There is no byte counter in the hardware. Green and yellow are
  * enqueued, red is dropped, so the frames the meter saw are the sum of the
- * three and the ones it discarded are the red ones. */
+ * three and the ones it discarded are the red ones.
+ *
+ * `writes' is not a count of frames but which write of the profile the three
+ * were counted since: every write of a profile zeroes them, so a reading
+ * taken under an earlier one is no baseline for this one
+ * (cdx_police_advance()). */
 struct cdx_police_counters {
 	uint32_t	green;
 	uint32_t	yellow;
 	uint32_t	red;
+	uint32_t	writes;
 };
-void cdx_plcr_colours(void *handle, struct cdx_police_counters *out);
+/* Where one reader of a profile's free-running counters left off. `known' is
+ * false until a reading has succeeded: a reader that has none yet takes its
+ * first as where it starts, rather than claiming everything the profile had
+ * already counted. */
+struct cdx_police_base {
+	struct cdx_police_counters	at;
+	bool				known;
+};
+void cdx_police_advance(struct cdx_police_base *base,
+			const struct cdx_police_counters *now,
+			struct cdx_police_counters *delta);
+/* Every runtime write of a policer profile, every counter read, and the
+ * records they are built from (cdx_qos.c). */
+void cdx_plcr_lock(void);
+void cdx_plcr_unlock(void);
+/* Before any profile is released, at unload or when a configuration is rolled
+ * back: returns once the reconcile work has finished and will not run again.
+ * The work takes the policer lock, so the caller must not hold it. */
+void cdx_plcr_reconcile_stop(void);
+int cdx_plcr_colours(void *handle, struct cdx_police_counters *out);
 int cdx_port_police_counters(char *ifname, struct cdx_police_counters *out);
 int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
 				 struct cdx_police_counters *out);

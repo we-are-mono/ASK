@@ -43,7 +43,16 @@
 
 
 #define IPSEC_FMAN_IDX		0
+/* Into an offline port's channel, which no CPU queue shares. */
 #define DEFA_WQ_ID              0
+/* The work queue of every queue CDX gives a CPU portal's channel: the one the
+ * Ethernet driver gives its PCD receive queues (_dpa_assign_wq()), for frames
+ * that are received traffic as theirs are. A channel's WQ0 and WQ1 are served
+ * strictly ahead of the rest, so a queue there that the CPU cannot keep up
+ * with holds back every other queue of that CPU for as long as it stays busy:
+ * the driver's transmit confirmations at WQ1, and the FMan host-command
+ * answer, whose waiter gives up after a second (A401). */
+#define CDX_CPU_RX_WQ           5
 struct desc_hdr {
         uint32_t sd_hdr;
         union {

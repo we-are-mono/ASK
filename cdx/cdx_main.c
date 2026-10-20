@@ -115,10 +115,11 @@ void cdx_ctrl_unlock_with_rtnl(void)
 
 void register_cdx_deinit_func(cdx_deinit_func func)
 {
-	if (init_level == MAX_CDX_INIT_FUNCTIONS) {
-		printk("%s::cant register deinit function, increase MAX_CDX_INIT_FUNCTIONS\n", __func__);
+	/* A teardown not registered never runs, and unload frees what it
+	 * would have stopped first. */
+	if (WARN(init_level == MAX_CDX_INIT_FUNCTIONS,
+		 "cdx: cannot register %ps for unload; increase MAX_CDX_INIT_FUNCTIONS\n", func))
 		return;
-	}
 	deinit_fn[init_level] = func;
 	init_level++;
 	return;
@@ -477,6 +478,7 @@ static int __init cdx_module_init(void)
 	/* The offline-port detour for directions into a smaller path. Not
 	 * fatal either: without it they stay in software (cdx_detour.c). */
 	cdx_detour_init();
+	cdx_portal_faults_init();
 	return 0;
 
 exit:

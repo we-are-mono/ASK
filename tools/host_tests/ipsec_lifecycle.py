@@ -40,7 +40,8 @@ def test_ipsec_lifecycle(tmp_path):
     # SEC's output pool and its fixed share, as the header defines them.
     (tmp_path / "ipsec_pool.inc").write_text(
         re.search(r"^#define\s+IPSEC_BUFCOUNT\s.*$", header, re.M).group() + "\n"
-        + re.search(r"^#define\s+IPSEC_SHARE_FRAMES\s.*$", header, re.M).group() + "\n")
+        + re.search(r"^#define\s+IPSEC_SHARE_FRAMES\s.*$", header, re.M).group() + "\n"
+        + re.search(r"^#define\s+CDX_CPU_RX_WQ\s.*$", header, re.M).group() + "\n")
     (tmp_path / "ipsec_types.inc").write_text(
         re.search(r"^#define\s+IPSEC_EXCEPTION_FRAMES\s.*$", header, re.M).group() + "\n"
         + re.search(r"^#define\s+IPSEC_TO_SEC_FRAMES\s.*$", header, re.M).group() + "\n"

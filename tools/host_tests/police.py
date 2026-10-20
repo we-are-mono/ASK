@@ -1,68 +1,49 @@
-"""Compile the ingress-police offload against a stub kernel and exercise it."""
+"""Compile the ingress-police offload over the policer layer it programs, against
+a stub FMan, and exercise it."""
 
 from ask_orch.process import run_process
 
 import os
-import re
 import shutil
 from pathlib import Path
 
+import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def function(source: str, name: str) -> str:
-    """Lift one function definition out of a production source file."""
-    # The line has to begin with a return type, not with the ` * ' of a comment
-    # continuation: a comment naming `foo()' above the definition of foo would
-    # otherwise be lifted instead, and the brace matching below would run from
-    # there to whatever it found next.
-    match = re.search(rf"^(?:static\s+)?\w[\w \*]*\b{name}\(", source, re.M)
-    assert match, name
-    end = source.index("{", match.start()) + 1
-    depth = 1
-    while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
-        end += 1
-    return source[match.start():end] + "\n"
+from _host_policer import ROOT, after_includes, policer_layer
 
 
-def test_offload(tmp_path):
+# The walk through the verbs, then the cases that stand apart from it: each a
+# failure of the hardware, run in a process of its own so that one assertion
+# failing does not hide the next case.
+CASES = ["verbs", "matchall_deferred", "matchall_destroy_deferred",
+         "matchall_refused_destroy", "flower_destroy_deferred", "counters_unread",
+         "channel_shut", "locking"]
+
+
+@pytest.fixture(scope="module")
+def binary(tmp_path_factory):
     compiler = os.environ.get("CC", "cc")
     assert shutil.which(compiler), f"C compiler required: {compiler}"
-    source = (ROOT / "cdx/cdx_police.c").read_text()
-    # In file order, which is also dependency order. cdx_police_setup_block is
-    # left out: it is block plumbing over kernel helpers the stub does not
-    # model, and nothing it does is a decision worth pinning here.
-    names = ["cdx_police_bytes_to_kbits", "cdx_police_check", "cdx_police_rates",
-             "cdx_police_delta", "cdx_police_report", "cdx_police_port_find",
-             "cdx_police_replace", "cdx_police_port_destroy",
-             "cdx_police_port_stats", "cdx_police_matchall",
-             "cdx_police_profile_get", "cdx_police_profile_put",
-             "cdx_police_profile_ref", "cdx_police_profile_unref",
-             "cdx_police_addr_eq", "cdx_police_filter_matches",
-             "cdx_police_overlap",
-             "cdx_police_lookup", "cdx_police_filter_find", "cdx_police_parse",
-             "cdx_police_flower_replace", "cdx_police_flower_destroy",
-             "cdx_police_flower_stats", "cdx_police_flower"]
+    tmp_path = tmp_path_factory.mktemp("police")
+    policer_layer(tmp_path)
     (tmp_path / "police_production.inc").write_text(
-        re.search(r"^#define CDX_POLICE_UNBOUNDED_KBITS\s.*$", source, re.M).group() + "\n"
-        # The two records and the state they live in are file-scope, so they
-        # are sliced rather than lifted by name -- what a lookup answers and
-        # what a baseline holds depend on the state as much as the code.
-        + source[source.index("static DEFINE_SPINLOCK(cdx_police_lock);"):
-               source.index("/* One counter's delta.")]
-        + source[source.index("struct cdx_police_filter {"):
-                 source.index("static int cdx_police_profile_get")]
-        + "\n".join(function(source, name) for name in names))
+        after_includes((ROOT / "cdx/cdx_police.c").read_text()))
     binary = tmp_path / "police"
     run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-parameter", "-fsanitize=address,undefined",
-        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        "-fno-pie", "-no-pie", "-I", str(tmp_path), "-I", str(ROOT / "cdx"),
+        "-I", str(Path(__file__).parent),
         str(Path(__file__).with_name("police.c")), "-o", str(binary),
     ], check=True)
-    run_process([str(binary)], check=True, timeout=30, env={
+    return binary
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_offload(binary, case):
+    result = run_process([str(binary), case], text=True, capture_output=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"police {case}: passed" in result.stdout

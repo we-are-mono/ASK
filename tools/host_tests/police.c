@@ -1,5 +1,6 @@
 /* Ingress police offload: what an action has to say before hardware is
- * touched, the unit it is converted into, and which flows a filter claims.
+ * touched, the unit it is converted into, which flows a filter claims, and
+ * what the hardware ends up running when a write of it does not land.
  *
  * The conversion is the part worth pinning. tc counts bytes per second; the
  * FMD's byte mode counts Kbit/s and multiplies by 1000 on its way to bits. Get
@@ -7,35 +8,26 @@
  * until a link is saturated -- which is exactly the confusion that had CMM
  * validating a packets-per-second range against a byte-mode profile.
  *
- * The other half is the binding a flower filter needs. tc matches a 5-tuple;
+ * The second half is the binding a flower filter needs. tc matches a 5-tuple;
  * the hardware selects a profile per flowtable entry. Neither subsystem knows
  * about the other, so the lookup here is the whole of the correspondence and
  * a wrong answer silently meters the wrong traffic.
  *
  * The third is the accounting. The hardware keeps running totals with more
  * than one reader and tc accumulates deltas, so the arithmetic between them --
- * including what a counter going backwards means -- is the part that decides
+ * including what a counter going backwards means, and what a failed read or a
+ * rewrite of the profile does to a baseline -- is the part that decides
  * whether a reported drop count is the truth.
+ *
+ * The fourth is a write the host command channel does not deliver. The
+ * policer layer (cdx_qos.c) is compiled whole over a stub FMan
+ * (plcr_fixture.h), so what a profile runs is read off the stub rather than
+ * off the layer's own records: a case that leaves the two apart fails.
  */
-#include <assert.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "plcr_fixture.h"
 
-typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
-typedef uint16_t __be16; typedef uint32_t __be32;
-#define SUCCESS 0
-#define FAILURE 1
 #define U32_MAX UINT32_MAX
 #define ETH_HLEN 14
-#define EOPNOTSUPP 95
-#define EINVAL 22
-#define ENOSPC 28
-#define ENOENT 2
-#define ENOMEM 12
 #define AF_INET 2
 #define AF_INET6 10
 #define IPPROTO_TCP 6
@@ -43,10 +35,7 @@ typedef uint16_t __be16; typedef uint32_t __be32;
 #define BIT(n) (1UL << (n))
 #define BIT_ULL(n) (1ULL << (n))
 #define WARN_ON_ONCE(x) (x)
-#define FMAN_INDEX 0
-#define ENABLE_INGRESS_POLICER 1
-#define DISABLE_INGRESS_POLICER 0
-#define GFP_KERNEL 0
+#define EXPORT_SYMBOL_NS_GPL(sym, ns)
 
 static u64 div_u64(u64 n, u32 d) { return n / d; }
 
@@ -58,28 +47,10 @@ static void list_add_tail(struct list_head *e, struct list_head *h)
 { e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
 static void list_del(struct list_head *e)
 { e->prev->next = e->next; e->next->prev = e->prev; }
-#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define list_entry(p, t, m) container_of(p, t, m)
 #define list_for_each_entry(pos, head, m) \
     for (pos = list_entry((head)->next, typeof(*pos), m); &pos->m != (head); \
          pos = list_entry(pos->m.next, typeof(*pos), m))
-#define list_for_each_entry_safe(pos, n, head, m) \
-    for (pos = list_entry((head)->next, typeof(*pos), m), \
-         n = list_entry(pos->m.next, typeof(*pos), m); &pos->m != (head); \
-         pos = n, n = list_entry(n->m.next, typeof(*n), m))
-
-typedef int spinlock_t;
-#define DEFINE_SPINLOCK(x) spinlock_t x
-static void spin_lock_irqsave_(spinlock_t *l, unsigned long *f)
-{ assert(!*l); *l = 1; *f = 0; }
-static void spin_unlock_irqrestore_(spinlock_t *l, unsigned long f)
-{ (void)f; assert(*l); *l = 0; }
-#define spin_lock_irqsave(l, f) spin_lock_irqsave_(l, &(f))
-#define spin_unlock_irqrestore(l, f) spin_unlock_irqrestore_(l, f)
-
-static unsigned allocations;
-static void *kzalloc(size_t n, int flags) { (void)flags; allocations++; return calloc(1, n); }
-static void kfree(void *p) { if (p) { assert(allocations); allocations--; } free(p); }
 
 /* --- the offload vocabulary ---------------------------------------------- */
 enum flow_action_id {
@@ -96,13 +67,13 @@ struct flow_action_entry {
 };
 struct flow_action { unsigned num_entries; struct flow_action_entry entries[4]; };
 struct netlink_ext_ack { const char *msg; };
-#define NL_SET_ERR_MSG_MOD(e, m) do { if (e) (e)->msg = (m); } while (0)
+/* As the kernel's: the message must be a string literal. */
+#define NL_SET_ERR_MSG_MOD(e, m) do { static const char __msg[] = m; if (e) (e)->msg = __msg; } while (0)
 static bool flow_offload_has_one_action(const struct flow_action *a)
 { return a->num_entries == 1; }
 
 struct in6_addr { __be32 s6_addr32[4]; };
 union nf_inet_addr { __be32 all[4]; __be32 ip; struct in6_addr in6; };
-struct net_device { char name[16]; };
 
 enum {
     FLOW_DISSECTOR_KEY_CONTROL, FLOW_DISSECTOR_KEY_BASIC,
@@ -180,6 +151,15 @@ struct flow_cls_offload {
 static struct flow_rule *flow_cls_offload_flow_rule(struct flow_cls_offload *f)
 { return f->rule; }
 
+/* The block plumbing cdx_police_setup_block() hands its callback to. */
+enum tc_setup_type { TC_SETUP_CLSMATCHALL, TC_SETUP_CLSFLOWER };
+enum { FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS = 1 };
+struct flow_block_offload { int binder_type; struct list_head *driver_block_list; };
+typedef int flow_setup_cb_t(enum tc_setup_type type, void *type_data, void *cb_priv);
+static int flow_block_cb_setup_simple(struct flow_block_offload *f, struct list_head *list,
+                                      flow_setup_cb_t *cb, void *ident, void *priv, bool ingress)
+{ (void)f; (void)list; (void)cb; (void)ident; (void)priv; (void)ingress; return 0; }
+
 /* Only the fields the lookup reads. */
 struct cdx_ft_rule {
     struct net_device *in;
@@ -190,72 +170,99 @@ struct cdx_ft_rule {
 };
 #define CDX_FT_QOS_POLICER_MASK  0xf00u
 #define CDX_FT_QOS_POLICER_SHIFT 8
-#define CDX_FT_QOS_MAX_POLICER   7
 
-/* --- the hardware layer, recorded rather than performed ------------------ */
-static struct { bool set, cleared; bool byte_mode; u32 cir, pir, cbs, pbs; } hw;
-static bool hw_fail;
-static int cdx_port_police_set(const char *ifname, bool byte_mode,
-                               u32 cir, u32 pir, u32 cbs, u32 pbs)
-{
-    (void)ifname;
-    if (hw_fail) return FAILURE;
-    hw.set = true; hw.byte_mode = byte_mode;
-    hw.cir = cir; hw.pir = pir; hw.cbs = cbs; hw.pbs = pbs;
-    return SUCCESS;
-}
-static int cdx_port_police_clear(const char *ifname) { (void)ifname; hw.cleared = true; return SUCCESS; }
-
-/* The colours a profile counted. Free-running totals, as the hardware keeps
- * them, so a case can move them the way traffic would -- or reset them
- * underneath the filter. */
-struct cdx_police_counters { u32 green, yellow, red; };
-static struct cdx_police_counters port_hw, prof_hw[CDX_FT_QOS_MAX_POLICER + 1];
-static bool counters_fail;
-static int cdx_port_police_counters(const char *ifname, struct cdx_police_counters *out)
-{
-    (void)ifname;
-    if (counters_fail) return FAILURE;
-    *out = port_hw;
-    return SUCCESS;
-}
-static int cdx_ingress_policer_counters(u32 fm, u32 queue_no, struct cdx_police_counters *out)
-{
-    assert(fm == FMAN_INDEX);
-    assert(queue_no >= 1 && queue_no <= CDX_FT_QOS_MAX_POLICER);
-    if (counters_fail) return FAILURE;
-    *out = prof_hw[queue_no];
-    return SUCCESS;
-}
-
-static struct {
-    unsigned enabled, disabled, configured;
-    u32 last_profile, cir, pir, pbs;
-    bool tc_meter;
-} prof;
-static bool prof_fail;
-static int cdx_ingress_enable_or_disable_qos(u32 fm, u32 queue_no, u32 oper)
-{
-    assert(fm == FMAN_INDEX);
-    assert(queue_no >= 1 && queue_no <= CDX_FT_QOS_MAX_POLICER);
-    if (oper == ENABLE_INGRESS_POLICER) { prof.enabled++; prof.last_profile = queue_no; }
-    else prof.disabled++;
-    return prof_fail ? FAILURE : SUCCESS;
-}
-static int cdx_ingress_policer_modify_config(u32 fm, u32 queue_no, u32 cir, u32 pir,
-                                             u32 cbs, u32 pbs, bool tc_meter)
-{
-    (void)fm; (void)cbs;
-    prof.configured++; prof.last_profile = queue_no; prof.cir = cir; prof.pir = pir;
-    prof.pbs = pbs; prof.tc_meter = tc_meter;
-    return prof_fail ? FAILURE : SUCCESS;
-}
-
+#include "plcr_types.inc"
+#include "plcr_qos.inc"
+#include "plcr_cfg.inc"
 #include "police_production.inc"
 
+/* --- the board: one FMan, a 10G port and a 1G one ------------------------ */
+static struct cdx_fman_info fman;
+static struct fm_port rx4, rx3;
+static struct mac_device mac4 = { .port_dev = { &rx4 } }, mac3 = { .port_dev = { &rx3 } };
+static struct dpa_priv_s priv4 = { &mac4 }, priv3 = { &mac3 };
+static struct net_device dev = { .name = "eth4", .priv = &priv4 };
+static struct net_device other = { .name = "eth3", .priv = &priv3 };
+/* A netdev cdx has no port for, and so no rate limiter. */
+static struct net_device bare = { .name = "eth9" };
+static struct dpa_iface_info eth3 = { .name = "eth3", .if_flags = IF_TYPE_ETHERNET,
+    .eth_info = { .net_dev = &other, .speed = 1000, .hardwarePortId = 6 } };
+static struct dpa_iface_info eth4 = { .name = "eth4", .if_flags = IF_TYPE_ETHERNET,
+    .eth_info = { .net_dev = &dev, .speed = 10000, .hardwarePortId = 5 }, .next = &eth3 };
+
+/* What the DPA configuration creates before any owner can reach a profile. */
+static void boot(void)
+{
+    fman.pcd_handle = &plcr_pcd;
+    fman_info = &fman;
+    num_fmans = 1;
+    dpa_cfg_set_expt_defaults(&fman);
+    assert(!cdxdrv_create_missaction_policer_profiles(&fman));
+    assert(!cdxdrv_create_ingress_qos_policer_profiles(&fman));
+    dpa_interface_info = &eth4;
+    assert(dpa_add_ethport_ff_policier_profile(&eth4) == SUCCESS);
+    assert(dpa_add_ethport_ff_policier_profile(&eth3) == SUCCESS);
+}
+
+#define RATE(s) ((s)->params.nonPassthroughAlgParams)
+static struct profile *port_of(struct dpa_iface_info *i)
+{ return port_rate_lim_mode[i->eth_info.hardwarePortId].handle; }
+static struct profile *meter(unsigned q) { return fman.ingress_policer_info[q].handle; }
+/* The per-flow profile the last write that landed went to. */
+static unsigned last_profile(void)
+{
+    for (unsigned q = 1; q <= CDX_FT_QOS_MAX_POLICER; q++)
+        if (meter(q) == plcr_last)
+            return q;
+    assert(!"the last write was not to a per-flow profile");
+    return 0;
+}
+
+/* The boot meter, as NXP's profiles always ran it: packets, whole frames,
+ * yellow passed, the port held to its peak pair. */
+static void assert_port_boot(struct dpa_iface_info *i)
+{
+    struct profile *s = port_of(i);
+    bool slow = i->eth_info.speed <= PORT_1G_SPEED;
+
+    assert(RATE(s).rateMode == e_FM_PCD_PLCR_PACKET_MODE);
+    assert(RATE(s).committedInfoRate ==
+           (slow ? DEFAULT_PORT_FF_CIR_VALUE_1G : DEFAULT_PORT_FF_CIR_VALUE_10G));
+    assert(RATE(s).peakOrExcessInfoRate ==
+           (slow ? DEFAULT_PORT_FF_PIR_VALUE_1G : DEFAULT_PORT_FF_PIR_VALUE_10G));
+    assert(RATE(s).committedBurstSize == (slow ? DEFAULT_1G_PORT_FF_CBS : DEFAULT_10G_PORT_FF_CBS));
+    assert(RATE(s).peakOrExcessBurstSize == (slow ? DEFAULT_1G_PORT_FF_PBS : DEFAULT_10G_PORT_FF_PBS));
+    assert(s->params.nextEngineOnYellow == e_FM_PCD_PRS &&
+           s->params.paramsOnYellow.action == e_FM_PCD_ENQ_FRAME);
+}
+
+/* A tc police action's meter: bytes from the IP header on, yellow dropped. */
+static void assert_meter(struct profile *s, u32 cir, u32 pir, u32 cbs, u32 pbs)
+{
+    assert(RATE(s).rateMode == e_FM_PCD_PLCR_BYTE_MODE);
+    assert(RATE(s).committedInfoRate == cir && RATE(s).peakOrExcessInfoRate == pir);
+    assert(RATE(s).committedBurstSize == cbs && RATE(s).peakOrExcessBurstSize == pbs);
+    assert(RATE(s).byteModeParams.frameLengthSelection == e_FM_PCD_PLCR_L3_FRM_LEN);
+    assert(s->params.nextEngineOnYellow == e_FM_PCD_DONE &&
+           s->params.paramsOnYellow.action == e_FM_PCD_DROP_FRAME);
+    assert(s->params.nextEngineOnRed == e_FM_PCD_DONE &&
+           s->params.paramsOnRed.action == e_FM_PCD_DROP_FRAME);
+}
+
+/* A per-flow profile no filter holds: NXP's meter, wide open, so a flow still
+ * naming it passes. */
+static void assert_flow_profile_off(struct profile *s)
+{
+    assert(RATE(s).rateMode == e_FM_PCD_PLCR_BYTE_MODE);
+    assert(RATE(s).committedInfoRate == DEFAULT_INGRESS_CIR_VALUE);
+    assert(RATE(s).peakOrExcessInfoRate == DEFAULT_INGRESS_PIR_VALUE);
+    assert(RATE(s).committedBurstSize == DEFAULT_INGRESS_BYTE_MODE_CBS);
+    assert(RATE(s).peakOrExcessBurstSize == DEFAULT_INGRESS_BYTE_MODE_PBS);
+    assert(RATE(s).byteModeParams.frameLengthSelection == e_FM_PCD_PLCR_FULL_FRM_LEN);
+    assert(s->params.nextEngineOnYellow == s->params.nextEngineOnGreen);
+}
+
 static struct netlink_ext_ack ack;
-static struct net_device dev = { .name = "eth4" };
-static struct net_device other = { .name = "eth3" };
 
 static struct flow_action_entry base(void)
 {
@@ -280,7 +287,6 @@ static int offer_on(struct net_device *d, unsigned long cookie, struct flow_acti
     struct tc_cls_matchall_offload f = {
         .common = { .extack = &ack }, .command = TC_CLSMATCHALL_REPLACE,
         .cookie = cookie, .rule = &rule };
-    memset(&hw, 0, sizeof(hw));
     ack.msg = NULL;
     return cdx_police_matchall(d, &f);
 }
@@ -323,15 +329,6 @@ static struct flow_rule flower_rule(void)
     return r;
 }
 
-static int flower_add(struct net_device *d, unsigned long cookie, struct flow_rule *r)
-{
-    struct flow_cls_offload f = { .common = { .extack = &ack },
-        .command = FLOW_CLS_REPLACE, .cookie = cookie, .rule = r };
-    r->match.dissector = &r->dis;
-    ack.msg = NULL;
-    return cdx_police_flower(d, &f);
-}
-
 static int flower_add_prio(struct net_device *d, unsigned long cookie,
                            struct flow_rule *r, u32 prio, u32 chain)
 {
@@ -341,6 +338,11 @@ static int flower_add_prio(struct net_device *d, unsigned long cookie,
     r->match.dissector = &r->dis;
     ack.msg = NULL;
     return cdx_police_flower(d, &f);
+}
+
+static int flower_add(struct net_device *d, unsigned long cookie, struct flow_rule *r)
+{
+    return flower_add_prio(d, cookie, r, 0, 0);
 }
 
 static int flower_cmd(struct net_device *d, unsigned long cookie, int command,
@@ -369,10 +371,17 @@ static struct cdx_ft_rule flow_on(struct net_device *d)
     return r;
 }
 
-int main(void)
+/* ---- every verb, with a hardware that takes every write ---------------- */
+static void verbs(void)
 {
+    struct profile *p4 = port_of(&eth4), *p3 = port_of(&eth3);
+    struct flow_action_entry a;
+    struct flow_stats s;
+    unsigned tried;
+
     /* ---- matchall: the port-wide meter ---- */
 
+    assert_port_boot(&eth4);
     /* Bytes per second in, Kbit/s out: 62_500_000 B/s is 500 Mbit/s is
      * 500_000 Kbit/s. A factor-of-eight slip shows up here and nowhere else. */
     /* Linux passes a frame only when it fits the rate's bucket, `burst`
@@ -380,63 +389,65 @@ int main(void)
      * green is that: the committed bucket is the rate's, and the peak bucket
      * is `mtu` deep and refilled faster than any port, so it turns away only
      * a longer frame. Yellow and red are both dropped. */
-    assert(offer(base()) == 0);
-    assert(hw.set && hw.byte_mode);
-    assert(hw.cir == 500000 && hw.pir == CDX_POLICE_UNBOUNDED_KBITS);
     /* The profile counts from the IP header, as Linux charges the rate;
      * Linux's length check adds the Ethernet header back. */
-    assert(hw.cbs == 64000 && hw.pbs == 2040 - 14);
+    assert(offer(base()) == 0 && !ack.msg);
+    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
 
     /* A peak rate is Linux's second bucket, `mtu` deep at that rate: its
      * long-term rate stays the committed one. */
-    struct flow_action_entry a = base();
+    a = base();
     a.police.peakrate_bytes_ps = 125000000; /* 1 Gbit/s */
     a.police.mtu = 9216;
-    assert(offer(a) == 0 && hw.cir == 500000 && hw.pir == 1000000);
-    assert(hw.cbs == 64000 && hw.pbs == 9216 - 14);
+    assert(offer(a) == 0);
+    assert_meter(p4, 500000, 1000000, 64000, 9216 - 14);
     a.police.mtu = U32_MAX;                 /* no length worth checking */
-    assert(offer(a) == 0 && hw.pbs == U32_MAX - 14);
+    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == U32_MAX - 14);
     /* An mtu no frame fits keeps a bucket nothing fits, never an empty
      * one, which the profile would read as "use the default". */
     a.police.mtu = 10;
-    assert(offer(a) == 0 && hw.pbs == 1);
+    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == 1);
 
+    tried = plcr_attempts;
     a = base(); a.police.peakrate_bytes_ps = 1000;
-    assert(offer(a) == -EOPNOTSUPP);
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
 
     a = base(); a.police.rate_bytes_ps = 0; a.police.burst = 0;
     a.police.rate_pkt_ps = 20000; a.police.burst_pkt = 100; a.police.mtu = U32_MAX;
-    assert(offer(a) == 0 && !hw.byte_mode && hw.cir == 20000 && hw.cbs == 100);
+    assert(offer(a) == 0 && RATE(p4).rateMode == e_FM_PCD_PLCR_PACKET_MODE);
+    assert(RATE(p4).committedInfoRate == 20000 && RATE(p4).committedBurstSize == 100);
     /* A packet rate's buckets count frames and cannot check a length. */
-    hw.set = false;
+    tried = plcr_attempts;
     a.police.mtu = 1514;
-    assert(offer(a) == -EOPNOTSUPP && !hw.set);
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
 
     a = base(); a.police.rate_pkt_ps = 20000;
-    assert(offer(a) == -EOPNOTSUPP && !hw.set);
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
     a = base(); a.police.rate_bytes_ps = 0;
-    assert(offer(a) == -EOPNOTSUPP && !hw.set);
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
 
     /* A rate under 125 B/s rounds to zero Kbit/s; programming that would be a
      * meter that drops everything. */
     a = base(); a.police.rate_bytes_ps = 100;
-    assert(offer(a) == -EOPNOTSUPP && !hw.set);
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
 
     a = base(); a.police.exceed.act_id = FLOW_ACTION_PIPE;
-    assert(offer(a) == -EOPNOTSUPP && !hw.set);
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
     a = base(); a.police.notexceed.act_id = FLOW_ACTION_DROP;
-    assert(offer(a) == -EOPNOTSUPP && !hw.set);
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
+    a = base(); a.police.avrate = 1000;
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
+    a = base(); a.id = FLOW_ACTION_MANGLE;
+    assert(offer(a) == -EOPNOTSUPP && plcr_attempts == tried);
     a = base(); a.police.notexceed.act_id = FLOW_ACTION_PIPE;
     assert(offer(a) == 0);
-    a = base(); a.police.avrate = 1000;
-    assert(offer(a) == -EOPNOTSUPP && !hw.set);
-    a = base(); a.id = FLOW_ACTION_MANGLE;
-    assert(offer(a) == -EOPNOTSUPP && !hw.set);
 
-    /* A port that cannot be programmed leaves nothing behind -- the record is
-     * allocated before the hardware is touched precisely so this path can
-     * hand it back, and the leak checker is what says it did. */
-    hw_fail = true; assert(offer(base()) == -EINVAL); hw_fail = false;
+    /* A netdev cdx has no port for has no rate limiter to program. Nothing is
+     * written and nothing is left behind -- the record is allocated before
+     * the hardware is touched precisely so this path can hand it back, and
+     * the leak checker is what says it did. */
+    tried = plcr_attempts;
+    assert(offer_on(&bare, MALL_COOKIE, base()) == -EINVAL && plcr_attempts == tried);
 
     /* ---- matchall: what the filter reports ---- */
 
@@ -445,8 +456,7 @@ int main(void)
      * is reprogrammed and the record is not duplicated. */
     assert(offer(base()) == 0);
 
-    struct flow_stats s;
-    port_hw = (struct cdx_police_counters){ .green = 100, .yellow = 20, .red = 5 };
+    p4->green = 100; p4->yellow = 20; p4->red = 5;
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
     /* Green was enqueued, yellow and red dropped, so the meter saw 125
      * frames and discarded 25. No byte counter exists in the profile, so none
@@ -456,7 +466,7 @@ int main(void)
     assert(s.used_hw_stats == FLOW_ACTION_HW_STATS_IMMEDIATE);
 
     /* Totals in, deltas out: tc adds up what it is given. */
-    port_hw.green += 10; port_hw.red += 2;
+    p4->green += 10; p4->red += 2;
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
     assert(s.pkts == 12 && s.drops == 2);
 
@@ -468,29 +478,37 @@ int main(void)
     /* The profile was reset underneath. What the counter now holds is the
      * whole of the delta; reading a counter that went backwards as a 32-bit
      * wrap would credit the filter with four billion frames it never saw. */
-    port_hw = (struct cdx_police_counters){ .green = 3, .yellow = 0, .red = 1 };
+    p4->green = 3; p4->yellow = 0; p4->red = 1;
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
     assert(s.pkts == 4 && s.drops == 1);
+
+    /* Reprogramming the port zeroes its counters, which is no traffic. */
+    assert(offer(base()) == 0);
+    p4->green += 2;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(s.pkts == 2 && s.drops == 0);
 
     /* A cookie the driver never recorded gets no answer at all, rather than
      * the port's numbers under somebody else's name. */
     assert(mall_cmd(&dev, 999, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
-    counters_fail = true;
-    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -EINVAL);
-    counters_fail = false;
 
     /* The port has one limiter. A second matchall is refused before the
      * hardware is touched, so the first keeps its meter and its delete is
      * still the only one that returns the port to its boot rate; another
      * port takes one of its own. */
-    assert(offer_on(&dev, MALL_COOKIE + 1, base()) == -EOPNOTSUPP && !hw.set);
+    tried = plcr_attempts;
+    assert(offer_on(&dev, MALL_COOKIE + 1, base()) == -EOPNOTSUPP && plcr_attempts == tried);
     assert(ack.msg && strstr(ack.msg, "already has a police filter"));
     assert(mall_cmd(&dev, MALL_COOKIE + 1, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
-    assert(offer_on(&other, MALL_COOKIE + 1, base()) == 0 && hw.set);
+    assert(offer_on(&other, MALL_COOKIE + 1, base()) == 0);
+    assert_meter(p3, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
     assert(mall_cmd(&other, MALL_COOKIE + 1, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    assert_port_boot(&eth3);
 
-    memset(&hw, 0, sizeof(hw));
-    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0 && hw.cleared);
+    /* Removing the filter returns the port to the rate it booted with. */
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    assert_port_boot(&eth4);
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
 
     /* ---- flower: a meter for some of the port's flows ---- */
@@ -500,12 +518,13 @@ int main(void)
     assert(cdx_police_lookup(&flow) == 0);
 
     struct flow_rule fr = flower_rule();
-    assert(flower_add(&dev, 1, &fr) == 0);
-    assert(prof.enabled == 1 && prof.configured == 1);
-    assert(prof.last_profile == 1);          /* profile 0 is the default */
-    assert(prof.cir == 500000 && prof.pir == CDX_POLICE_UNBOUNDED_KBITS);
-    assert(prof.pbs == 2040 - 14 && prof.tc_meter);
+    assert(flower_add(&dev, 1, &fr) == 0 && !ack.msg);
+    assert(last_profile() == 1);             /* profile 0 is the default */
+    assert_meter(meter(1), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
     assert(cdx_police_lookup(&flow) == 1);
+    /* And a flow the flowtable admits naming it is told to meter by it. */
+    assert(fman.ingress_policer_info[1].profile_id &&
+           cdx_get_policer_profile_id(FMAN_INDEX, 1) == fman.ingress_policer_info[1].profile_id);
 
     /* The filter is on one port's ingress. The same tuple arriving elsewhere
      * is a different flow and must not pick up this meter. */
@@ -522,7 +541,11 @@ int main(void)
     wrong = flow_on(&dev); wrong.family = AF_INET6;
     assert(cdx_police_lookup(&wrong) == 0);
 
-    assert(flower_del(&dev, 1) == 0 && prof.disabled == 1);
+    /* Deleted, the profile meters as NXP's do again, and no flow admitted
+     * from now on is told to meter by it. */
+    assert(flower_del(&dev, 1) == 0);
+    assert_flow_profile_off(meter(1));
+    assert(cdx_get_policer_profile_id(FMAN_INDEX, 1) == 0);
     assert(cdx_police_lookup(&flow) == 0);
     assert(flower_del(&dev, 1) == -ENOENT);
 
@@ -532,10 +555,10 @@ int main(void)
      * so first-match would pick the wrong one. */
     fr = flower_rule();
     assert(flower_add_prio(&dev, 10, &fr, 100, 0) == 0);   /* low priority, first */
-    unsigned lowpri = prof.last_profile;
+    unsigned lowpri = last_profile();
     fr = flower_rule();
     assert(flower_add_prio(&dev, 11, &fr, 10, 0) == 0);    /* high priority, later */
-    unsigned hipri = prof.last_profile;
+    unsigned hipri = last_profile();
     assert(lowpri != hipri && cdx_police_lookup(&flow) == hipri);
     assert(flower_del(&dev, 10) == 0);                     /* drop the loser */
     assert(cdx_police_lookup(&flow) == hipri);             /* winner survives */
@@ -568,20 +591,20 @@ int main(void)
      * removal; here the refs stand in for that. */
     fr = flower_rule();
     assert(flower_add(&dev, 30, &fr) == 0);
-    unsigned held = prof.last_profile;                    /* a flow names it */
+    unsigned held = last_profile();                       /* a flow names it */
     cdx_police_profile_ref(held);
     assert(flower_del(&dev, 30) == 0);                    /* filter gone, flow not */
     /* Every other profile can be filled, but the held one stays out. */
     for (unsigned i = 0; i < CDX_FT_QOS_MAX_POLICER - 1; i++) {
         fr = flower_rule(); fr.ports.dst = 7000 + i;
-        assert(flower_add(&dev, 40 + i, &fr) == 0 && prof.last_profile != held);
+        assert(flower_add(&dev, 40 + i, &fr) == 0 && last_profile() != held);
     }
     /* Held out of the pool, so the next filter has nowhere to go -- rather than
      * reusing a profile a live flow still meters against. */
     fr = flower_rule(); fr.ports.dst = 8000;
     assert(flower_add(&dev, 50, &fr) == -EOPNOTSUPP);
     cdx_police_profile_unref(held);                       /* the flow retires */
-    assert(flower_add(&dev, 50, &fr) == 0 && prof.last_profile == held);  /* now reusable */
+    assert(flower_add(&dev, 50, &fr) == 0 && last_profile() == held);  /* now reusable */
     assert(flower_del(&dev, 50) == 0);
     for (unsigned i = 0; i < CDX_FT_QOS_MAX_POLICER - 1; i++)
         assert(flower_del(&dev, 40 + i) == 0);
@@ -633,28 +656,29 @@ int main(void)
     fr.dis.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
     assert(flower_add(&dev, 4, &fr) == -EOPNOTSUPP);
 
-    /* A profile that cannot be programmed is a failure to report, and must not
+    /* A profile with nothing to program is a refusal to report, and must not
      * leave the profile marked as taken. */
-    prof_fail = true;
+    void *h = fman.ingress_policer_info[1].handle;
+    fman.ingress_policer_info[1].handle = NULL;
     fr = flower_rule();
     assert(flower_add(&dev, 5, &fr) == -EINVAL);
-    prof_fail = false;
+    fman.ingress_policer_info[1].handle = h;
     fr = flower_rule();
-    assert(flower_add(&dev, 6, &fr) == 0);
+    assert(flower_add(&dev, 6, &fr) == 0 && last_profile() == 1);
     assert(flower_del(&dev, 6) == 0);
 
     /* ---- flower: the same accounting, on the profile the filter holds ---- */
 
     fr = flower_rule();
     assert(flower_add(&dev, 7, &fr) == 0);
-    unsigned mine = prof.last_profile;
+    unsigned mine = last_profile();
     fr = flower_rule(); fr.ports.dst = 7777;
     assert(flower_add(&dev, 8, &fr) == 0);
-    unsigned theirs = prof.last_profile;
+    unsigned theirs = last_profile();
     assert(mine != theirs);
 
-    prof_hw[mine] = (struct cdx_police_counters){ .green = 40, .yellow = 0, .red = 9 };
-    prof_hw[theirs] = (struct cdx_police_counters){ .green = 1, .yellow = 1, .red = 1 };
+    meter(mine)->green = 40; meter(mine)->yellow = 0; meter(mine)->red = 9;
+    meter(theirs)->green = meter(theirs)->yellow = meter(theirs)->red = 1;
     assert(flower_cmd(&dev, 7, FLOW_CLS_STATS, &s) == 0);
     assert(s.pkts == 49 && s.drops == 9 && s.bytes == 0);
     /* Each filter reads the profile it was given and not its neighbour's. */
@@ -663,7 +687,7 @@ int main(void)
 
     /* Baselines are per filter, so one reading its counters does not empty
      * the other's. */
-    prof_hw[mine].red += 4;
+    meter(mine)->red += 4;
     assert(flower_cmd(&dev, 7, FLOW_CLS_STATS, &s) == 0);
     assert(s.pkts == 4 && s.drops == 4);
     assert(flower_cmd(&dev, 8, FLOW_CLS_STATS, &s) == 0);
@@ -671,30 +695,333 @@ int main(void)
 
     assert(flower_cmd(&dev, 4242, FLOW_CLS_STATS, &s) == -ENOENT);
     assert(flower_cmd(&other, 7, FLOW_CLS_STATS, &s) == -ENOENT);
-    counters_fail = true;
-    assert(flower_cmd(&dev, 7, FLOW_CLS_STATS, &s) == -EINVAL);
-    counters_fail = false;
 
     assert(flower_del(&dev, 7) == 0);
     assert(flower_cmd(&dev, 7, FLOW_CLS_STATS, &s) == -ENOENT);
     assert(flower_del(&dev, 8) == 0);
 
-    /* The same profile is handed to the next filter, still holding everything
-     * the last one metered. A new filter reports what happened since it
+    /* The same profile handed to the next filter holds frames that are none
+     * of the new filter's. The new filter reports what happened since it
      * existed, not since the profile did. */
+    meter(mine)->green = 30;
     fr = flower_rule();
     assert(flower_add(&dev, 9, &fr) == 0);
-    assert(prof.last_profile == mine);
-    assert(prof_hw[mine].green + prof_hw[mine].red > 0);
+    assert(last_profile() == mine);
     assert(flower_cmd(&dev, 9, FLOW_CLS_STATS, &s) == 0);
     assert(s.pkts == 0 && s.drops == 0);
-    prof_hw[mine].green += 6;
+    meter(mine)->green += 6;
     assert(flower_cmd(&dev, 9, FLOW_CLS_STATS, &s) == 0);
     assert(s.pkts == 6 && s.drops == 0);
     assert(flower_del(&dev, 9) == 0);
+}
 
-    assert(!allocations);
-    puts("Police: unit conversion, action validation, flower binding, "
-         "profile budget and teardown passed");
-    return 0;
+/* ---- matchall: a write that does not land is retried until it does ----- */
+static void matchall_deferred(void)
+{
+    struct profile *p4 = port_of(&eth4);
+    struct flow_action_entry a;
+    struct flow_stats s;
+    unsigned landed;
+
+    /* The write times out and FMan never applied it. The filter is the
+     * operator's and is valid, so it is taken -- and the operator told the
+     * hardware is behind -- rather than refused for a fault that clears on
+     * its own. Until the retry lands the port keeps its boot meter. */
+    p4->green = 50;
+    plcr_lost = 1;
+    assert(offer(base()) == 0);
+    assert(ack.msg && strstr(ack.msg, "retried"));
+    assert_port_boot(&eth4);
+    assert(work_count == 1);
+
+    /* The retry lands, and the port runs what tc asked for. */
+    p4->green += 10;
+    assert(run_queued_work() == 1);
+    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert(!work_count);
+
+    /* The rewrite zeroed the counters, and the filter's baseline went with
+     * them: what is reported is what the meter counted since, rather than a
+     * jump by everything the port counted before. */
+    p4->green = 7; p4->red = 2;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(s.pkts == 9 && s.drops == 2);
+
+    /* Timed out after FMan applied it: the caller cannot tell, so it is
+     * written again. The same whole profile, so the port's meter does not
+     * change; only the counters restart, and the baseline with them. */
+    a = base(); a.police.rate_bytes_ps = 125000000;      /* 1 Gbit/s */
+    plcr_late = 1;
+    assert(offer(a) == 0 && ack.msg && work_count == 1);
+    assert_meter(p4, 1000000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    p4->green = 5;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(s.pkts == 5);
+    landed = p4->landed;
+    assert(run_queued_work() == 1 && p4->landed == landed + 1 && !work_count);
+    assert_meter(p4, 1000000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    p4->green = 3;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(s.pkts == 3);
+
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    assert_port_boot(&eth4);
+}
+
+/* ---- matchall: a delete that does not land ----------------------------- */
+static void matchall_destroy_deferred(void)
+{
+    struct profile *p4 = port_of(&eth4);
+    struct flow_action_entry a;
+    struct flow_stats s;
+
+    assert(offer(base()) == 0);
+    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+
+    /* tc forgets the filter whatever the driver says, so the port has to go
+     * back to its boot rate regardless: left at the filter's, it would run a
+     * rate nothing shows. */
+    plcr_lost = 1;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
+    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert(run_queued_work() == 1);
+    assert_port_boot(&eth4);
+    assert(!work_count);
+
+    /* A new filter offered while the reset is still outstanding writes the
+     * whole profile, which supersedes it: the retry that follows is the new
+     * filter's, not the reset's. */
+    assert(offer(base()) == 0);
+    plcr_lost = 1;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    a = base(); a.police.rate_bytes_ps = 12500000;       /* 100 Mbit/s */
+    assert(offer_on(&dev, MALL_COOKIE + 1, a) == 0 && !ack.msg);
+    assert_meter(p4, 100000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    run_queued_work();
+    assert_meter(p4, 100000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert(!work_count);
+    assert(mall_cmd(&dev, MALL_COOKIE + 1, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    assert_port_boot(&eth4);
+}
+
+/* ---- matchall: the delete of a filter the port never ran --------------- */
+static void matchall_refused_destroy(void)
+{
+    struct profile *p4 = port_of(&eth4);
+    struct flow_action_entry a = base();
+
+    assert(offer(base()) == 0);
+    a.police.rate_bytes_ps = 12500000;
+    assert(offer_on(&dev, MALL_COOKIE + 1, a) == -EOPNOTSUPP);
+    /* tc keeps a refused filter in software and still offers its delete to
+     * the driver. That delete is no reason to take the port's limiter from
+     * the filter that holds it. */
+    assert(mall_cmd(&dev, MALL_COOKIE + 1, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    assert_port_boot(&eth4);
+}
+
+/* ---- flower: a disable that does not land ------------------------------ */
+static void flower_destroy_deferred(void)
+{
+    struct cdx_ft_rule flow = flow_on(&dev);
+    struct flow_rule fr = flower_rule();
+    unsigned p;
+    int id;
+
+    assert(flower_add(&dev, 1, &fr) == 0);
+    p = last_profile();
+    id = fman.ingress_policer_info[p].profile_id;
+    assert(id && cdx_get_policer_profile_id(FMAN_INDEX, p) == id);
+
+    /* The filter is gone the moment tc says so: no flow admitted from now on
+     * is told to meter by its profile, and the retry turns the meter off for
+     * the flows that still name it. */
+    plcr_lost = 1;
+    assert(flower_del(&dev, 1) == 0);
+    assert(cdx_police_lookup(&flow) == 0);
+    assert(cdx_get_policer_profile_id(FMAN_INDEX, p) == 0);
+    assert_meter(meter(p), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert(run_queued_work() == 1);
+    assert_flow_profile_off(meter(p));
+    assert(!work_count);
+
+    /* A profile whose disable is still outstanding, handed to a new filter:
+     * the new filter's writes are whole profiles and supersede it, and the
+     * retry already due does not turn the new filter's meter off. */
+    fr = flower_rule();
+    assert(flower_add(&dev, 2, &fr) == 0 && last_profile() == p);
+    plcr_lost = 1;
+    assert(flower_del(&dev, 2) == 0);
+    fr = flower_rule(); fr.action.entries[0].police.rate_bytes_ps = 12500000;
+    assert(flower_add(&dev, 3, &fr) == 0 && !ack.msg && last_profile() == p);
+    assert_meter(meter(p), 100000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    run_queued_work();
+    assert_meter(meter(p), 100000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert(cdx_get_policer_profile_id(FMAN_INDEX, p) == id);
+    assert(!work_count);
+    assert(flower_del(&dev, 3) == 0);
+    assert_flow_profile_off(meter(p));
+
+    /* A filter whose writes do not land is taken, and flows admitted under it
+     * are told to meter by its profile: they meter once the retry lands,
+     * rather than never because they were admitted early. */
+    plcr_lost = 2;
+    fr = flower_rule();
+    assert(flower_add(&dev, 4, &fr) == 0);
+    assert(ack.msg && strstr(ack.msg, "retried"));
+    assert(cdx_police_lookup(&flow) == p);
+    assert(cdx_get_policer_profile_id(FMAN_INDEX, p) == id);
+    assert_flow_profile_off(meter(p));
+    assert(run_queued_work() == 1 && !work_count);
+    assert_meter(meter(p), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert(flower_del(&dev, 4) == 0);
+    assert_flow_profile_off(meter(p));
+}
+
+/* ---- a counter read that fails ----------------------------------------- */
+static void counters_unread(void)
+{
+    struct profile *p4 = port_of(&eth4), *p3 = port_of(&eth3);
+    struct flow_rule fr = flower_rule();
+    struct flow_stats s;
+    unsigned p;
+
+    assert(offer(base()) == 0);
+    p4->green = 100;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0 && s.pkts == 100);
+
+    /* A read that fails is no reading. tc is told nothing, and the baseline
+     * stays where the last good read left it: taking a zero it never counted
+     * for one would report the whole counter as new on the next read. */
+    p4->green += 30;
+    counters_fail = true;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -EINVAL);
+    assert(s.pkts == 0 && s.drops == 0);
+    counters_fail = false;
+    p4->green += 5;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(s.pkts == 35 && s.drops == 0);
+
+    /* A filter whose first reading fails has nothing to start from, so its
+     * first good read is the start: never the profile's whole count claimed
+     * as the filter's. */
+    p3->green = 1000;
+    counters_fail = true;
+    assert(offer_on(&other, 77, base()) == 0);
+    counters_fail = false;
+    p3->green = 40;
+    assert(mall_cmd(&other, 77, TC_CLSMATCHALL_STATS, &s) == 0 && s.pkts <= 40);
+    p3->green += 3;
+    assert(mall_cmd(&other, 77, TC_CLSMATCHALL_STATS, &s) == 0 && s.pkts == 3);
+
+    /* The same on a per-flow profile. */
+    assert(flower_add(&dev, 1, &fr) == 0);
+    p = last_profile();
+    meter(p)->green = 20; meter(p)->red = 2;
+    assert(flower_cmd(&dev, 1, FLOW_CLS_STATS, &s) == 0 && s.pkts == 22 && s.drops == 2);
+    meter(p)->red += 8;
+    counters_fail = true;
+    assert(flower_cmd(&dev, 1, FLOW_CLS_STATS, &s) == -EINVAL && s.pkts == 0);
+    counters_fail = false;
+    meter(p)->red += 1;
+    assert(flower_cmd(&dev, 1, FLOW_CLS_STATS, &s) == 0 && s.pkts == 9 && s.drops == 9);
+
+    assert(flower_del(&dev, 1) == 0);
+    assert(mall_cmd(&other, 77, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+}
+
+/* ---- the channel shut: every write refused until it reopens ------------ */
+static void channel_shut(void)
+{
+    struct cdx_ft_rule flow = flow_on(&dev);
+    struct flow_rule fr = flower_rule();
+    unsigned tried;
+
+    plcr_shut = true;
+    assert(offer(base()) == 0);
+    assert(flower_add(&dev, 1, &fr) == 0 && cdx_police_lookup(&flow) == 1);
+    assert(work_count == 1 && work_queued[0]->delay == msecs_to_jiffies(1000));
+
+    /* About once a second while anything is behind, each try one whole write
+     * of each profile behind, refused at once while the channel stays shut. */
+    tried = plcr_attempts;
+    for (unsigned i = 0; i < 3; i++) {
+        assert(run_queued_work() == 1);
+        assert(work_count == 1 && work_queued[0]->delay == msecs_to_jiffies(1000));
+    }
+    assert(plcr_attempts == tried + 3 * 2);
+    assert_port_boot(&eth4);
+    assert_flow_profile_off(meter(1));
+
+    /* The channel reopens: one run brings both to their records, and then
+     * nothing is due. */
+    plcr_shut = false;
+    assert(run_queued_work() == 1);
+    assert_meter(port_of(&eth4), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_meter(meter(1), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert(!work_count);
+    tried = plcr_attempts;
+    assert(run_queued_work() == 0 && plcr_attempts == tried);
+
+    assert(flower_del(&dev, 1) == 0);
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+}
+
+/* ---- every write and read under the policer mutex ---------------------- */
+static void locking(void)
+{
+    struct flow_rule fr = flower_rule();
+    struct flow_stats s;
+
+    /* The verbs, with every write landing. */
+    assert(offer(base()) == 0);
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(flower_add(&dev, 1, &fr) == 0);
+    assert(flower_cmd(&dev, 1, FLOW_CLS_STATS, &s) == 0);
+    assert(!plcr_unlocked && !lockdep_misses);
+    /* And with writes that do not, and the retries that follow. */
+    plcr_lost = 1;
+    assert(offer(base()) == 0);
+    plcr_lost = 1;
+    assert(flower_del(&dev, 1) == 0);
+    run_queued_work();
+    plcr_lost = 1;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
+    run_queued_work();
+    assert(!work_count);
+    /* The writes and reads the owners and the retry make, and the records
+     * they are built from, are all the mutex's. */
+    assert(!plcr_unlocked && !lockdep_misses);
+}
+
+int main(int argc, char **argv)
+{
+    static const struct { const char *name; void (*run)(void); } cases[] = {
+        { "verbs", verbs },
+        { "matchall_deferred", matchall_deferred },
+        { "matchall_destroy_deferred", matchall_destroy_deferred },
+        { "matchall_refused_destroy", matchall_refused_destroy },
+        { "flower_destroy_deferred", flower_destroy_deferred },
+        { "counters_unread", counters_unread },
+        { "channel_shut", channel_shut },
+        { "locking", locking },
+    };
+
+    assert(argc == 2);
+    boot();
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (strcmp(argv[1], cases[i].name))
+            continue;
+        cases[i].run();
+        /* Nothing is left behind: no record, no retry due, no lock held. */
+        assert(!allocations && !work_count && !spinlocks_held && !mutexes_held);
+        printf("police %s: passed\n", cases[i].name);
+        return 0;
+    }
+    fprintf(stderr, "no case %s\n", argv[1]);
+    return 2;
 }

@@ -1,4 +1,4 @@
-From b147f55e779515451e5c639f0df596a2a215942d Mon Sep 17 00:00:00 2001
+From c585ed46acd11fcb15db4771e6e5b3b8f5a828dd Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -69,12 +69,22 @@ or command failure, and return the lock once after a successful retry.
 Reject ordinary keygen schemes without a network environment.
 
 Track HC buffer ownership through enqueue rejection, completion and
-timeout. Quarantine accepted unconfirmed frames and latch timeout failure
-until board reset; keep QMan acceptance separate from SDK completion.
-A timeout names its command (sequence, opcode, the HC builder, time
-waited and what else was outstanding) with the call chain that asked for
-it, and each timed-out command still confirmed says how late it came:
-the one thing a timeout cannot.
+timeout; keep QMan acceptance separate from SDK completion. A command
+that times out keeps its frame, and the channel refuses every later
+command unsent, until its answer comes: then it opens again. Its caller
+hears E_TIMEOUT, an outcome unknown, and puts its own record right once
+the channel answers. A timeout names its command (sequence, opcode, the
+HC builder, time waited, what else was outstanding, and where the frame
+is: on the port's queue, answered behind what the CPU's portal channel
+holds, in that portal's ring unprocessed, or still in the FMan) with the
+call chain that asked for it, and its late answer says how late it came.
+qman_affine_portal_dqrr_pending() counts a portal's unconsumed entries.
+
+The HC answer and error queues sit at WQ0 of the first CPU's portal
+channel: QMan serves WQ0 and WQ1 strictly ahead of the rest, so an
+answer below a busy queue waits for as long as it stays busy.
+FM_PCD_PlcrProfileReadCounters() reads a profile's counters in one
+command and says whether it read them.
 
 Build KG scheme changes in a private candidate, publish only after
 successful programming, and balance failed lock acquisitions. Preserve
@@ -97,9 +107,7 @@ whose delete failed: FM_PORT_GetStopped() reads whether a port has really
 finished stopping, FM_PORT_IsPcdAttached() whether a port hands frames to
 a PCD, and FM_PORT_SetFenced() makes FM_PORT_Enable() refuse while set.
 ExternalHashTableFindEntry() says which bucket still links an entry (a
-delete no longer reads an empty bucket as a node), and
-ExternalHashTableHcFailed() whether the host-command channel has failed
-until reset.
+delete no longer reads an empty bucket as a node).
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
@@ -115,7 +123,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
  .../freescale/sdk_dpaa/offline_port.c         |   51 +
  .../net/ethernet/freescale/sdk_fman/Kconfig   |   13 +-
- .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  419 +-
+ .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  496 +-
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
  .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
@@ -123,14 +131,14 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 +---
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1567 ++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1556 ++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +----
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.h    |  111 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.c      |  127 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.h      |   18 +-
- .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c     |   13 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c     |   44 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h     |    1 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_replic.c   |   14 +-
  .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  949 ++--
@@ -144,11 +152,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +-
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1525 ++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1522 ++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
- .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  211 +-
+ .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  231 +-
  .../sdk_fman/inc/Peripherals/fm_port_ext.h    |   66 +-
  .../sdk_fman/inc/Peripherals/fm_vsp_ext.h     |   14 +
  .../sdk_fman/inc/flib/fsl_fman_port.h         |    5 +-
@@ -156,7 +164,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../freescale/sdk_fman/ls1043_dflags.h        |    2 +
  .../freescale/sdk_fman/ncsw_config.mk         |    8 -
  .../sdk_fman/src/inc/wrapper/fsl_fman_test.h  |   84 -
- .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |   14 +-
+ .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |   15 +-
  .../sdk_fman/src/inc/wrapper/lnxwrp_fm_ext.h  |    5 -
  .../src/inc/wrapper/lnxwrp_fsl_fman.h         |    5 +
  .../freescale/sdk_fman/src/system/sys_io.c    |    1 +
@@ -164,7 +172,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/src/wrapper/fman_test.c          | 1629 ------
  .../sdk_fman/src/wrapper/lnxwrp_fm.c          |  132 +-
  .../sdk_fman/src/wrapper/lnxwrp_fm.h          |   11 +-
- .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |  110 +-
+ .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |  156 +-
  .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   | 4796 -----------------
  .../src/wrapper/lnxwrp_ioctls_fm_compat.c     | 1167 ----
  .../src/wrapper/lnxwrp_ioctls_fm_compat.h     |  708 ---
@@ -174,9 +182,9 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/staging/fsl_qbman/Kconfig             |    7 +
  drivers/staging/fsl_qbman/fsl_usdpaa.c        |    1 -
  drivers/staging/fsl_qbman/qman_config.c       |    2 +
- drivers/staging/fsl_qbman/qman_high.c         |   84 +-
+ drivers/staging/fsl_qbman/qman_high.c         |  103 +-
  include/linux/fsl_oh_port.h                   |   26 +
- include/linux/fsl_qman.h                      |    6 +
+ include/linux/fsl_qman.h                      |   14 +
  include/linux/netdevice.h                     |   12 +
  include/linux/skbuff.h                        |    7 +
  include/uapi/linux/if.h                       |    1 +
@@ -186,7 +194,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 83 files changed, 8303 insertions(+), 12443 deletions(-)
+ 83 files changed, 8462 insertions(+), 12472 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -1965,7 +1973,7 @@ index 3a6d1810b525..450cd15d0fd1 100644
  config FSL_SDK_FMAN_RTC_API
  	bool "FMan RTC (1588 timer) APIs"
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-index 80fb535231b9..9235b8b22ba1 100644
+index 80fb535231b9..224ecc0b8d9a 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 @@ -32,6 +32,9 @@
@@ -2021,7 +2029,7 @@ index 80fb535231b9..9235b8b22ba1 100644
      } hcSpecificData;
  } t_HcFrame;
  
-@@ -121,6 +114,13 @@ typedef struct t_HcFrame {
+@@ -121,22 +114,122 @@ typedef struct t_HcFrame {
  #endif /* defined(__MWERKS__) && ... */
  
  
@@ -2035,7 +2043,12 @@ index 80fb535231b9..9235b8b22ba1 100644
  typedef struct t_FmHc {
      t_Handle                    h_FmPcd;
      t_Handle                    h_HcPortDev;
-@@ -132,11 +132,88 @@ typedef struct t_FmHc {
+     bool						usageAllowed;    /**< HC usage is allowed or denied by user via API */
+     t_FmPcdQmEnqueueCallback    *f_QmEnqueue;     /**< A callback for enqueuing frames to the QM */
+     t_Handle                    h_QmArg;          /**< A handle to the QM module */
++    void                        (*f_QmDescribe)(t_Handle h_QmArg, char *p_Buf, uint32_t size);
+     uint8_t                     dataMemId;        /**< Memory partition ID for data buffers */
+ 
      uint32_t                    seqNum[HC_CMD_POOL_SIZE];   /* FIFO of seqNum to use when
                                                                 taking buffer */
      uint32_t                    nextSeqNumLocation;         /* seqNum location in seqNum[] for next buffer */
@@ -2043,7 +2056,6 @@ index 80fb535231b9..9235b8b22ba1 100644
 -                                                               and not confirmed yet */
 +    t_Handle                    h_Spinlock;
 +    e_HcBufState                bufState[HC_CMD_POOL_SIZE];
-+    bool                        failed;       /* Ambiguous completion: reset required. */
 +    bool                        quiescing;    /* No new borrowers during teardown. */
 +    uint32_t                    failures;     /* Failed since a command last completed. */
      t_HcFrame                   *p_Frm[HC_CMD_POOL_SIZE];
@@ -2052,8 +2064,9 @@ index 80fb535231b9..9235b8b22ba1 100644
 +     * and that command's confirmation, should it still come, says how late. */
 +    uint32_t                    sentOpcode[HC_CMD_POOL_SIZE];
 +    unsigned long               sentAt[HC_CMD_POOL_SIZE];
-+    /* Each command that timed out, until its confirmation (if any) says how
-+     * late it was: commands in flight together can each time out. */
++    /* Each command that timed out, until its confirmation says how late it
++     * was: commands in flight together can each time out. While any is
++     * unanswered the port is sent nothing more (HcUnanswered()). */
 +    bool                        timedOut[HC_CMD_POOL_SIZE];
  } t_FmHc;
  
@@ -2100,11 +2113,26 @@ index 80fb535231b9..9235b8b22ba1 100644
 +    p_FmHc->seqNum[--p_FmHc->nextSeqNumLocation] = seqNum;
 +}
 +
-+/* Once the channel has failed, or while commands cannot be queued, every
-+ * later command fails the same way -- and CDX retries a sync once a second
-+ * while anything waits on a barrier. So a run of failures reports its first
-+ * only, and the command that ends it says how many there were: a new run
-+ * always reports again. The timeout that fails the channel is reported
++/* Caller holds the HC lock. Whether a command that timed out is still to be
++ * answered. Until each is, the port that has not answered is sent nothing
++ * more: what it was given may still be running, and a command sent after it
++ * would wait out its own deadline behind it. Its answer opens the channel
++ * again (FmHcTxConf()). */
++static bool HcUnanswered(t_FmHc *p_FmHc)
++{
++    uint32_t i;
++
++    for (i = 0; i < HC_CMD_POOL_SIZE; i++)
++        if (p_FmHc->timedOut[i])
++            return TRUE;
++    return FALSE;
++}
++
++/* While a timed-out command is unanswered, or while commands cannot be
++ * queued, every later command fails the same way -- and CDX retries a sync
++ * once a second while anything waits on a barrier. So a run of failures
++ * reports its first only, and the command that ends it says how many there
++ * were: a new run always reports again. A timeout is reported
 + * unconditionally and starts a run of its own. */
 +static bool HcFirstFailure(t_FmHc *p_FmHc)
 +{
@@ -2126,7 +2154,7 @@ index 80fb535231b9..9235b8b22ba1 100644
  
  static t_Error FillBufPool(t_FmHc *p_FmHc)
  {
-@@ -163,6 +240,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
+@@ -163,6 +256,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
      for (i = 0; i < HC_CMD_POOL_SIZE; i++)
      {
          p_FmHc->seqNum[i] = i;
@@ -2134,7 +2162,7 @@ index 80fb535231b9..9235b8b22ba1 100644
      }
      p_FmHc->nextSeqNumLocation = 0;
  
-@@ -175,19 +253,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
+@@ -175,19 +269,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
  
      ASSERT_COND(p_FmHc);
  
@@ -2160,7 +2188,7 @@ index 80fb535231b9..9235b8b22ba1 100644
      return p_FmHc->p_Frm[*p_SeqNum];
  }
  
-@@ -195,40 +275,88 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
+@@ -195,40 +291,99 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
  {
      uint32_t    intFlags;
  
@@ -2194,11 +2222,11 @@ index 80fb535231b9..9235b8b22ba1 100644
 -    p_FmHc->enqueued[seqNum] = TRUE;
 -    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
 +    intFlags = HcLock(p_FmHc);
-+    if (p_FmHc->failed || p_FmHc->quiescing)
++    if (p_FmHc->quiescing || HcUnanswered(p_FmHc))
 +    {
 +        HcUnlock(p_FmHc, intFlags);
 +        HC_RETURN_FIRST_ERROR(p_FmHc, MINOR, E_INVALID_STATE,
-+                              ("HC unavailable; reset required after timeout"));
++                              ("HC unavailable until a timed-out command is answered"));
 +    }
 +    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY);
 +    p_FmHc->bufState[seqNum] = e_HC_BUF_IN_FLIGHT;
@@ -2241,26 +2269,37 @@ index 80fb535231b9..9235b8b22ba1 100644
 +        }
 +        if (!timeout--)
 +        {
-+            /* A late confirmation can reclaim the frame, but cannot repair
-+             * caller software state. Do not reopen HC or permit a switch to
-+             * direct-register programming; recovery requires a board reset. */
++            /* Unanswered, the command may still run, or be running: its
++             * frame stays the hardware's (PutBuf()), and nothing more goes
++             * to the port until it is answered, nor may register programming
++             * switch to direct (FmIsHcUsageAllowed()). Its caller learns
++             * only that the outcome is unknown -- for a change to the FMan's
++             * state, that it may have been made -- and puts its own record
++             * right once the answer has opened the channel again. */
 +            uint32_t opcode = p_FmHc->sentOpcode[seqNum];
 +            uint32_t waited = jiffies_to_msecs(jiffies - p_FmHc->sentAt[seqNum]);
 +            uint32_t others = HcOutstanding(p_FmHc) - 1;
++            char queues[192] = "not known";
 +
-+            p_FmHc->failed = TRUE;
 +            p_FmHc->timedOut[seqNum] = TRUE;
 +            p_FmHc->failures++;
 +            HcUnlock(p_FmHc, intFlags);
++            /* Where the frame is: on the port's queue, the port never took
++             * it; on the answer queue, the CPU's portal has not dequeued it,
++             * and its channel's work queues say what it served first; in the
++             * portal's ring, that CPU has not processed it; on none of them,
++             * the FMan is still running it. */
++            if (p_FmHc->f_QmDescribe)
++                p_FmHc->f_QmDescribe(p_FmHc->h_QmArg, queues, sizeof(queues));
 +            /* The builder below is the HC entry point; who asked for the
 +             * command -- an ehash insert or delete barrier, a quarantine
-+             * drain -- is further up. At most HC_CMD_POOL_SIZE of these,
-+             * ever: the channel stays failed. */
++             * drain -- is further up. Once per episode: until the answer,
++             * every later command is refused before it is sent. */
 +            dump_stack();
 +            RETURN_ERROR(MINOR, E_TIMEOUT,
-+                         ("HC confirmation timed out; board reset required: seq %u, %s (opcode 0x%08x) built by %pS, unconfirmed after %u ms, %u other commands outstanding",
++                         ("HC confirmation timed out; commands wait for its answer: seq %u, %s (opcode 0x%08x) built by %pS, unconfirmed after %u ms, %u other commands outstanding; %s",
 +                          seqNum, HcOpcodeName(opcode), opcode,
-+                          __builtin_return_address(0), waited, others));
++                          __builtin_return_address(0), waited, others, queues));
 +        }
 +        HcUnlock(p_FmHc, intFlags);
 +        XX_UDelay(HC_CONFIRM_POLL_US);
@@ -2268,8 +2307,11 @@ index 80fb535231b9..9235b8b22ba1 100644
  }
  
  
-@@ -251,6 +379,12 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -249,8 +404,15 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+     p_FmHc->h_FmPcd             = p_FmHcParams->h_FmPcd;
+     p_FmHc->f_QmEnqueue         = p_FmHcParams->params.f_QmEnqueue;
      p_FmHc->h_QmArg             = p_FmHcParams->params.h_QmArg;
++    p_FmHc->f_QmDescribe        = p_FmHcParams->params.f_QmDescribe;
      p_FmHc->dataMemId           = DEFAULT_dataMemId;
      p_FmHc->usageAllowed		= TRUE;
 +    p_FmHc->h_Spinlock = XX_InitSpinlock();
@@ -2281,7 +2323,7 @@ index 80fb535231b9..9235b8b22ba1 100644
  
      err = FillBufPool(p_FmHc);
      if (err != E_OK)
-@@ -278,7 +412,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -278,7 +440,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      if (!p_FmHc->h_HcPortDev)
      {
          REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM HC port!"));
@@ -2290,7 +2332,7 @@ index 80fb535231b9..9235b8b22ba1 100644
          return NULL;
      }
  
-@@ -312,13 +446,43 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -312,13 +474,43 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      return (t_Handle)p_FmHc;
  }
  
@@ -2304,9 +2346,9 @@ index 80fb535231b9..9235b8b22ba1 100644
 +    if (!p_FmHc)
 +        return E_OK;
 +    flags = HcLock(p_FmHc);
-+    if (p_FmHc->failed)
-+        err = ERROR_CODE(E_INVALID_STATE);
-+    else if (p_FmHc->nextSeqNumLocation)
++    /* An unanswered command's frame is still the hardware's, and borrowed
++     * until its answer returns it. */
++    if (p_FmHc->nextSeqNumLocation || HcUnanswered(p_FmHc))
 +        err = ERROR_CODE(E_BUSY);
 +    else
 +        p_FmHc->quiescing = TRUE;
@@ -2336,7 +2378,7 @@ index 80fb535231b9..9235b8b22ba1 100644
  
      for (i=0; i<HC_CMD_POOL_SIZE; i++)
          if (p_FmHc->p_Frm[i])
-@@ -326,10 +490,9 @@ void FmHcFree(t_Handle h_FmHc)
+@@ -326,10 +518,9 @@ void FmHcFree(t_Handle h_FmHc)
          else
              break;
  
@@ -2349,7 +2391,7 @@ index 80fb535231b9..9235b8b22ba1 100644
  }
  
  /*****************************************************************************/
-@@ -338,16 +501,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
+@@ -338,16 +529,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
  {
      t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
      int     i;
@@ -2381,12 +2423,12 @@ index 80fb535231b9..9235b8b22ba1 100644
  }
  
  void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
-@@ -355,20 +532,44 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
+@@ -355,20 +560,48 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
      t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
      t_HcFrame   *p_HcFrame;
      uint32_t    intFlags;
 +    uint32_t    seqNum;
-+    bool        late = FALSE;
++    bool        late = FALSE, reopened = FALSE;
 +    uint32_t    opcode = 0, waited = 0;
  
      ASSERT_COND(p_FmHc);
@@ -2413,11 +2455,14 @@ index 80fb535231b9..9235b8b22ba1 100644
 -    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
 +    {
 +        /* A command that timed out answering after all says it was late
-+         * rather than lost: the one thing a timeout cannot tell. */
++         * rather than lost: the one thing a timeout cannot tell. The last
++         * such answer opens the channel again, with nothing left inside the
++         * port. */
 +        if (p_FmHc->timedOut[seqNum])
 +        {
 +            p_FmHc->timedOut[seqNum] = FALSE;
 +            late = TRUE;
++            reopened = !HcUnanswered(p_FmHc);
 +            opcode = p_FmHc->sentOpcode[seqNum];
 +            waited = jiffies_to_msecs(jiffies - p_FmHc->sentAt[seqNum]);
 +        }
@@ -2428,12 +2473,13 @@ index 80fb535231b9..9235b8b22ba1 100644
 +    }
 +    HcUnlock(p_FmHc, intFlags);
 +    if (late)
-+        pr_warn("FM HC: seq %u, %s (opcode 0x%08x), confirmed %u ms after it was sent, after its timeout\n",
-+                seqNum, HcOpcodeName(opcode), opcode, waited);
++        pr_warn("FM HC: seq %u, %s (opcode 0x%08x), confirmed %u ms after it was sent, after its timeout%s\n",
++                seqNum, HcOpcodeName(opcode), opcode, waited,
++                reopened ? "; commands resume" : "");
  }
  
  t_Error FmHcPcdKgSetScheme(t_Handle                    h_FmHc,
-@@ -704,32 +905,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
+@@ -704,32 +937,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
      return E_OK;
  }
  
@@ -2466,7 +2512,7 @@ index 80fb535231b9..9235b8b22ba1 100644
  t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragScratchPoolCmdParams *p_FmPcdCcFragScratchPoolCmdParams)
  {
      t_FmHc                              *p_FmHc = (t_FmHc*)h_FmHc;
-@@ -768,40 +943,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
+@@ -768,40 +975,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
      return E_OK;
  }
  
@@ -2507,7 +2553,120 @@ index 80fb535231b9..9235b8b22ba1 100644
  t_Error FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId, uint32_t requiredAction)
  {
      t_FmHc              *p_FmHc = (t_FmHc*)h_FmHc;
-@@ -1205,9 +1346,11 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
+@@ -932,7 +1105,7 @@ t_Error FmHcPcdPlcrSetProfile(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrPr
+ 
+     p_HcFrame = GetBuf(p_FmHc, &seqNum);
+     if (!p_HcFrame)
+-        RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
++        HC_RETURN_FIRST_ERROR(p_FmHc, MINOR, E_NO_MEMORY, ("HC Frame object"));
+ 
+     profileIndx = FmPcdPlcrProfileGetAbsoluteId(h_Profile);
+ 
+@@ -949,8 +1122,11 @@ t_Error FmHcPcdPlcrSetProfile(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrPr
+ 
+     PutBuf(p_FmHc, p_HcFrame, seqNum);
+ 
++    /* A policer's owner writes it again until it lands, once a second while
++     * the channel is shut: EnQFrm() reported it, if it was the first of its
++     * run. */
+     if (err != E_OK)
+-        RETURN_ERROR(MINOR, err, NO_MSG);
++        return ERROR_CODE(err);
+ 
+     return E_OK;
+ }
+@@ -1021,25 +1197,20 @@ t_Error  FmHcPcdPlcrSetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmP
+     return E_OK;
+ }
+ 
+-uint32_t FmHcPcdPlcrGetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter)
++t_Error FmHcPcdPlcrReadProfileCounters(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrProfileCounterValues *p_Values)
+ {
+     t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
+     uint16_t    absoluteProfileId = FmPcdPlcrProfileGetAbsoluteId(h_Profile);
+     t_Error     err;
+     t_HcFrame   *p_HcFrame;
+     t_DpaaFD    fmFd;
+-    uint32_t    retVal = 0;
+     uint32_t    seqNum;
+ 
+-    SANITY_CHECK_RETURN_VALUE(h_FmHc, E_INVALID_HANDLE,0);
++    SANITY_CHECK_RETURN_ERROR(h_FmHc, E_INVALID_HANDLE);
+ 
+-    /* first read scheme and check that it is valid */
+     p_HcFrame = GetBuf(p_FmHc, &seqNum);
+     if (!p_HcFrame)
+-    {
+-        REPORT_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
+-        return 0;
+-    }
++        HC_RETURN_FIRST_ERROR(p_FmHc, MINOR, E_NO_MEMORY, ("HC Frame object"));
+     memset(p_HcFrame, 0, sizeof(t_HcFrame));
+     p_HcFrame->opcode = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_PLCR_PRFL);
+     p_HcFrame->actionReg  = FmPcdPlcrBuildReadPlcrActionReg(absoluteProfileId);
+@@ -1049,36 +1220,44 @@ uint32_t FmHcPcdPlcrGetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmP
+     BUILD_FD(SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC);
+ 
+     err = EnQFrm(p_FmHc, &fmFd, seqNum);
+-    if (err != E_OK)
++    if (err == E_OK)
+     {
+-        PutBuf(p_FmHc, p_HcFrame, seqNum);
+-        REPORT_ERROR(MINOR, err, NO_MSG);
+-        return 0;
++        p_Values->green = p_HcFrame->hcSpecificData.profileRegs.fmpl_pegpc;
++        p_Values->yellow = p_HcFrame->hcSpecificData.profileRegs.fmpl_peypc;
++        p_Values->red = p_HcFrame->hcSpecificData.profileRegs.fmpl_perpc;
++        p_Values->recolouredYellow = p_HcFrame->hcSpecificData.profileRegs.fmpl_perypc;
++        p_Values->recolouredRed = p_HcFrame->hcSpecificData.profileRegs.fmpl_perrpc;
+     }
++    PutBuf(p_FmHc, p_HcFrame, seqNum);
++    /* Read again on every stats dump: EnQFrm() reported it, if it was the
++     * first of its run. */
++    if (err != E_OK)
++        return ERROR_CODE(err);
++    return E_OK;
++}
++
++uint32_t FmHcPcdPlcrGetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter)
++{
++    t_FmPcdPlcrProfileCounterValues values;
+ 
++    if (FmHcPcdPlcrReadProfileCounters(h_FmHc, h_Profile, &values) != E_OK)
++        return 0;
+     switch (counter)
+     {
+         case e_FM_PCD_PLCR_PROFILE_GREEN_PACKET_TOTAL_COUNTER:
+-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_pegpc;
+-            break;
++            return values.green;
+         case e_FM_PCD_PLCR_PROFILE_YELLOW_PACKET_TOTAL_COUNTER:
+-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_peypc;
+-            break;
++            return values.yellow;
+         case e_FM_PCD_PLCR_PROFILE_RED_PACKET_TOTAL_COUNTER:
+-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_perpc;
+-            break;
++            return values.red;
+         case e_FM_PCD_PLCR_PROFILE_RECOLOURED_YELLOW_PACKET_TOTAL_COUNTER:
+-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_perypc;
+-            break;
++            return values.recolouredYellow;
+         case e_FM_PCD_PLCR_PROFILE_RECOLOURED_RED_PACKET_TOTAL_COUNTER:
+-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_perrpc;
+-            break;
++            return values.recolouredRed;
+         default:
+             REPORT_ERROR(MAJOR, E_INVALID_SELECTION, NO_MSG);
++            return 0;
+     }
+-
+-    PutBuf(p_FmHc, p_HcFrame, seqNum);
+-    return retVal;
+ }
+ 
+ t_Error FmHcKgWriteSp(t_Handle h_FmHc, uint8_t hardwarePortId, uint32_t spReg, bool add)
+@@ -1205,9 +1384,11 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
  
      ASSERT_COND(p_FmHc);
  
@@ -2520,7 +2679,7 @@ index 80fb535231b9..9235b8b22ba1 100644
      memset(p_HcFrame, 0, sizeof(t_HcFrame));
      /* first read SP register */
      p_HcFrame->opcode = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC);
-@@ -1221,8 +1364,9 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
+@@ -1221,8 +1402,9 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
  
      PutBuf(p_FmHc, p_HcFrame, seqNum);
  
@@ -2531,7 +2690,7 @@ index 80fb535231b9..9235b8b22ba1 100644
  
      return E_OK;
  }
-@@ -1233,20 +1377,53 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc)
+@@ -1233,20 +1415,38 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc)
      return p_FmHc->h_HcPortDev;
  }
  
@@ -2548,31 +2707,14 @@ index 80fb535231b9..9235b8b22ba1 100644
 +    if (!p_FmHc)
 +        return E_OK;
 +    flags = HcLock(p_FmHc);
-+    if (p_FmHc->failed || p_FmHc->quiescing)
++    if (p_FmHc->quiescing)
 +        err = ERROR_CODE(E_INVALID_STATE);
-+    else if (p_FmHc->nextSeqNumLocation)
++    else if (p_FmHc->nextSeqNumLocation || HcUnanswered(p_FmHc))
 +        err = ERROR_CODE(E_BUSY);
 +    else
 +        p_FmHc->usageAllowed = allow;
 +    HcUnlock(p_FmHc, flags);
 +    return err;
-+}
-+
-+/* Whether a command timed out unconfirmed (EnQFrm()): every later command
-+ * fails, so a barrier that failed for that reason never completes before a
-+ * board reset, unlike one refused for want of a free frame. */
-+bool FmHcIsFailed(t_Handle h_FmHc)
-+{
-+    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
-+    uint32_t flags;
-+    bool failed;
-+
-+    if (!p_FmHc)
-+        return FALSE;
-+    flags = HcLock(p_FmHc);
-+    failed = p_FmHc->failed;
-+    HcUnlock(p_FmHc, flags);
-+    return failed;
  }
  
  bool FmIsHcUsageAllowed(t_Handle h_FmHc)
@@ -2585,8 +2727,10 @@ index 80fb535231b9..9235b8b22ba1 100644
  		return FALSE;
  
 -	return p_FmHc->usageAllowed;
++	/* Never direct while an unanswered command may still be inside the
++	 * port: a register write would race it. */
 +	flags = HcLock(p_FmHc);
-+	allowed = p_FmHc->usageAllowed || p_FmHc->failed;
++	allowed = p_FmHc->usageAllowed || HcUnanswered(p_FmHc);
 +	HcUnlock(p_FmHc, flags);
 +	return allowed;
  }
@@ -5394,10 +5538,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..ab9d0eef9aaa
+index 000000000000..f681d0b59c80
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1567 @@
+@@ -0,0 +1,1556 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5420,7 +5564,6 @@ index 000000000000..ab9d0eef9aaa
 +#include "fm_ehash.h"
 +#include "fm_pcd.h"
 +#include "fm_cc.h"
-+#include "fm_hc.h"
 +#include "endian_ext.h"
 +
 +/* FM_EHASH_DEBUG was a commented-out toggle gating printk dumps that had
@@ -6873,16 +7016,6 @@ index 000000000000..ab9d0eef9aaa
 +	return -ENOENT;
 +}
 +EXPORT_SYMBOL(ExternalHashTableFindEntry);
-+
-+/* Whether the table's PCD has lost its host-command channel for good, so that
-+ * no barrier through it will complete before a board reset. */
-+bool ExternalHashTableHcFailed(void *h_HashTbl)
-+{
-+	struct en_exthash_info *info = (struct en_exthash_info *)h_HashTbl;
-+
-+	return info && FmHcIsFailed(FmPcdGetHcHandle(info->pcd));
-+}
-+EXPORT_SYMBOL(ExternalHashTableHcFailed);
 +
 +int32_t ExternalHashGetSECfailureStats(en_SEC_failure_stats *stats)
 +{
@@ -9143,7 +9276,7 @@ index 241703a05e59..f0f48e5be914 100644
      uint16_t                ownerTmp;
      bool                    cnia;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
-index 5d96727f7251..816a444eae54 100644
+index 5d96727f7251..d201031cbaa0 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 @@ -55,6 +55,12 @@
@@ -9342,7 +9475,7 @@ index 5d96727f7251..816a444eae54 100644
 +    /* HC confirmations can still use this PCD and its resources. Refuse
 +     * before any teardown, and prevent new frame borrowers once idle. */
 +    if (p_FmPcd->h_Hc && (err = FmHcQuiesce(p_FmPcd->h_Hc)) != E_OK)
-+        RETURN_ERROR(MINOR, err, ("HC still owned or timed out; reset required"));
++        RETURN_ERROR(MINOR, err, ("HC still owned, or a timed-out command not yet answered"));
 +
      if (p_FmPcd->ipv6FrameIdAddr)
          FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, UINT_TO_PTR(p_FmPcd->ipv6FrameIdAddr));
@@ -9445,7 +9578,7 @@ index 9d78c8d76029..9420a85c87b6 100644
  {
      t_Handle    h_StatsAd;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_plcr.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_plcr.c
-index 473ad4bde0d9..259b0a279f30 100644
+index 473ad4bde0d9..9894a1851a22 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_plcr.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_plcr.c
 @@ -161,6 +161,14 @@ static t_Error SetProfileNia(t_FmPcd *p_FmPcd, e_FmPcdEngine nextEngine, u_FmPcd
@@ -9482,6 +9615,44 @@ index 473ad4bde0d9..259b0a279f30 100644
                                  break;
                              default:
                                  RETURN_ERROR(MAJOR, E_INVALID_SELECTION, NO_MSG);
+@@ -1796,6 +1805,37 @@ uint32_t FM_PCD_PlcrProfileGetCounter(t_Handle h_Profile, e_FmPcdPlcrProfileCoun
+     return counterVal;
+ }
+ 
++t_Error FM_PCD_PlcrProfileReadCounters(t_Handle h_Profile, t_FmPcdPlcrProfileCounterValues *p_Values)
++{
++    t_FmPcdPlcrProfile  *p_Profile = (t_FmPcdPlcrProfile*)h_Profile;
++    t_FmPcd             *p_FmPcd;
++    t_FmPcdPlcrRegs     *p_FmPcdPlcrRegs;
++    uint32_t            intFlags;
++
++    SANITY_CHECK_RETURN_ERROR(p_Profile, E_INVALID_HANDLE);
++    SANITY_CHECK_RETURN_ERROR(p_Values, E_NULL_POINTER);
++    p_FmPcd = p_Profile->h_FmPcd;
++    SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
++
++    if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
++        return FmHcPcdPlcrReadProfileCounters(p_FmPcd->h_Hc, h_Profile, p_Values);
++
++    p_FmPcdPlcrRegs = p_FmPcd->p_FmPcdPlcr->p_FmPcdPlcrRegs;
++    SANITY_CHECK_RETURN_ERROR(p_FmPcdPlcrRegs, E_INVALID_HANDLE);
++    if (p_Profile->absoluteProfileId >= FM_PCD_PLCR_NUM_ENTRIES)
++        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("profileId too Big "));
++
++    intFlags = PlcrHwLock(p_FmPcd->p_FmPcdPlcr);
++    WritePar(p_FmPcd, FmPcdPlcrBuildReadPlcrActionReg(p_Profile->absoluteProfileId));
++    p_Values->green = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_pegpc);
++    p_Values->yellow = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_peypc);
++    p_Values->red = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_perpc);
++    p_Values->recolouredYellow = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_perypc);
++    p_Values->recolouredRed = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_perrpc);
++    PlcrHwUnlock(p_FmPcd->p_FmPcdPlcr, intFlags);
++    return E_OK;
++}
++
+ t_Error FM_PCD_PlcrProfileSetCounter(t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter, uint32_t value)
+ {
+     t_FmPcdPlcrProfile  *p_Profile = (t_FmPcdPlcrProfile*)h_Profile;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_plcr.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_plcr.h
 index 2bb8b969956c..e00c6cf0d993 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_plcr.h
@@ -11918,7 +12089,7 @@ index fd9221b525b0..5a5c75a8b9b5 100644
  t_Error     FmPortGetSetCcParams(t_Handle h_FmPort, t_FmPortGetSetCcParams *p_FmPortGetSetCcParams);
  uint8_t     FmPortGetNetEnvId(t_Handle h_FmPort);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
-index 56f3ab8ee8e4..d962c5406dd4 100644
+index 56f3ab8ee8e4..bed5fbe45b03 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
 @@ -47,7 +47,10 @@ typedef struct t_FmHcParams {
@@ -11943,15 +12114,21 @@ index 56f3ab8ee8e4..d962c5406dd4 100644
  t_Error     FmHcPcdKgSetClsPlan(t_Handle h_FmHc, t_FmPcdKgInterModuleClsPlanSet *p_Set);
  t_Error     FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t clsPlanGrpId);
  
-@@ -85,8 +86,9 @@ t_Error     FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId
+@@ -75,6 +76,7 @@ t_Error     FmHcPcdPlcrDeleteProfile(t_Handle h_FmHc, t_Handle h_Profile);
+ 
+ t_Error     FmHcPcdPlcrSetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter, uint32_t value);
+ uint32_t    FmHcPcdPlcrGetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter);
++t_Error     FmHcPcdPlcrReadProfileCounters(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrProfileCounterValues *p_Values);
+ 
+ t_Error     FmHcKgWriteSp(t_Handle h_FmHc, uint8_t hardwarePortId, uint32_t spReg, bool add);
+ t_Error     FmHcKgWriteCpp(t_Handle h_FmHc, uint8_t hardwarePortId, uint32_t cppReg);
+@@ -85,7 +87,7 @@ t_Error     FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId
  t_Error     FmHcPcdSync(t_Handle h_FmHc);
  t_Handle    FmHcGetPort(t_Handle h_FmHc);
  
 -void     	FmAllowHcUsage(t_Handle h_FmHc, bool allow);
 +t_Error     FmAllowHcUsage(t_Handle h_FmHc, bool allow);
  bool     	FmIsHcUsageAllowed(t_Handle h_FmHc);
-+bool        FmHcIsFailed(t_Handle h_FmHc);
- 
  
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_sp_common.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_sp_common.h
@@ -12354,10 +12531,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..288ea0ded74c
+index 000000000000..dd605b8748a7
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1525 @@
+@@ -0,0 +1,1522 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -13878,9 +14055,6 @@ index 000000000000..288ea0ded74c
 + * table it may be freed. -EUCLEAN: a chain is malformed. */
 +extern int ExternalHashTableFindEntry(void *h_HashTbl, void *tbl_entry,
 +				uint16_t *index);
-+/* Whether the table's host-command channel has failed until a board reset:
-+ * a command timed out unconfirmed, and every barrier fails from then on. */
-+extern bool ExternalHashTableHcFailed(void *h_HashTbl);
 +
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ext.h
@@ -13933,7 +14107,7 @@ index ef62c8ef28d5..464b539e8c81 100644
  
  #endif /* __FM_MURAM_EXT */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
-index 6e5db2aaf500..8d00d66f18e6 100644
+index 6e5db2aaf500..39fd3f4fe48b 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 @@ -45,7 +45,7 @@
@@ -13959,7 +14133,18 @@ index 6e5db2aaf500..8d00d66f18e6 100644
   @Param[in]     h_QmArg         - Application's handle passed to QM module on enqueue.
   @Param[in]     p_Fd            - Frame descriptor for the frame.
  
-@@ -508,6 +515,22 @@ t_Error FM_PCD_Disable(t_Handle h_FmPcd);
+@@ -215,6 +222,10 @@ typedef struct t_FmPcdHcParams {
+                                                          will be used by the FM for dequeue. */
+     t_FmPcdQmEnqueueCallback    *f_QmEnqueue;       /**< Callback routine for enqueuing a frame to the QM */
+     t_Handle                    h_QmArg;            /**< Application's handle passed to QM module on enqueue */
++    /* Where a timed-out command's frame is, in one line for its report:
++     * still on the port's queue, in the FMan, or answered and waiting on the
++     * CPU's portal behind what its channel holds. Optional. */
++    void                        (*f_QmDescribe)(t_Handle h_QmArg, char *p_Buf, uint32_t size);
+ } t_FmPcdHcParams;
+ 
+ /**************************************************************************//**
+@@ -508,6 +519,22 @@ t_Error FM_PCD_Disable(t_Handle h_FmPcd);
  *//***************************************************************************/
  uint32_t FM_PCD_GetCounter(t_Handle h_FmPcd, e_FmPcdCounters counter);
  
@@ -13982,7 +14167,7 @@ index 6e5db2aaf500..8d00d66f18e6 100644
  /**************************************************************************//**
  @Function       FM_PCD_PrsLoadSw
  
-@@ -1244,7 +1267,7 @@ typedef enum e_FmPcdManipReassemWaysNumber {
+@@ -1244,7 +1271,7 @@ typedef enum e_FmPcdManipReassemWaysNumber {
  *//***************************************************************************/
  typedef enum e_FmPcdManipType {
      e_FM_PCD_MANIP_HDR = 0,             /**< Header manipulation */
@@ -13991,7 +14176,7 @@ index 6e5db2aaf500..8d00d66f18e6 100644
      e_FM_PCD_MANIP_FRAG,                /**< Fragmentation */
      e_FM_PCD_MANIP_SPECIAL_OFFLOAD      /**< Special Offloading */
  } e_FmPcdManipType;
-@@ -1699,6 +1722,7 @@ typedef struct t_FmPcdKgSchemeParams {
+@@ -1699,6 +1726,7 @@ typedef struct t_FmPcdKgSchemeParams {
          uint8_t                         relativeSchemeId;       /**< if modify=FALSE:Partition relative scheme id */
          t_Handle                        h_Scheme;               /**< if modify=TRUE: a handle of the existing scheme */
      } id;
@@ -13999,7 +14184,7 @@ index 6e5db2aaf500..8d00d66f18e6 100644
      bool                                alwaysDirect;           /**< This scheme is reached only directly, i.e. no need
                                                                       for match vector; KeyGen will ignore it when matching */
      struct {                                                    /**< HL Relevant only if alwaysDirect = FALSE */
-@@ -1944,8 +1968,7 @@ typedef struct t_FmPcdHashTableParams {
+@@ -1944,8 +1972,7 @@ typedef struct t_FmPcdHashTableParams {
      uint16_t                    maxNumOfKeys;               /**< Maximum Number Of Keys that will (ever) be used in this Hash-table */
      e_FmPcdCcStatsMode          statisticsMode;             /**< If not e_FM_PCD_CC_STATS_MODE_NONE, the required structures for the
                                                                   requested statistics mode will be allocated according to maxNumOfKeys. */
@@ -14009,7 +14194,7 @@ index 6e5db2aaf500..8d00d66f18e6 100644
      uint16_t                    hashResMask;                /**< Mask that will be used on the hash-result;
                                                                   The number-of-sets for this hash will be calculated
                                                                   as (2^(number of bits set in 'hashResMask'));
-@@ -1956,6 +1979,24 @@ typedef struct t_FmPcdHashTableParams {
+@@ -1956,6 +1983,24 @@ typedef struct t_FmPcdHashTableParams {
  
      t_FmPcdCcNextEngineParams   ccNextEngineParamsForMiss;  /**< Parameters for defining the next engine when a key is not matched */
  
@@ -14034,7 +14219,7 @@ index 6e5db2aaf500..8d00d66f18e6 100644
  } t_FmPcdHashTableParams;
  
  /**************************************************************************//**
-@@ -2802,6 +2843,11 @@ t_Error FM_PCD_NetEnvCharacteristicsDelete(t_Handle h_NetEnv);
+@@ -2802,6 +2847,11 @@ t_Error FM_PCD_NetEnvCharacteristicsDelete(t_Handle h_NetEnv);
                  p_SchemeParams->id.h_Scheme will return NULL if action fails due to scheme
                  BUSY state.
  
@@ -14046,7 +14231,30 @@ index 6e5db2aaf500..8d00d66f18e6 100644
   @Cautions      Allowed only following FM_PCD_Init().
  *//***************************************************************************/
  t_Handle FM_PCD_KgSchemeSet(t_Handle                h_FmPcd,
-@@ -3362,8 +3408,7 @@ t_Error FM_PCD_MatchTableGetNextEngine(t_Handle                     h_CcNode,
+@@ -2897,6 +2947,22 @@ t_Error FM_PCD_PlcrProfileDelete(t_Handle h_Profile);
+ uint32_t FM_PCD_PlcrProfileGetCounter(t_Handle                      h_Profile,
+                                       e_FmPcdPlcrProfileCounters    counter);
+ 
++/* A profile's five packet counters as one read of its registers. */
++typedef struct t_FmPcdPlcrProfileCounterValues {
++    uint32_t    green;
++    uint32_t    yellow;
++    uint32_t    red;
++    uint32_t    recolouredYellow;
++    uint32_t    recolouredRed;
++} t_FmPcdPlcrProfileCounterValues;
++
++/* FM_PCD_PlcrProfileGetCounter() returns 0 when the read fails, which a
++ * reader taking a baseline cannot tell from a counter at zero. This says
++ * whether it read: E_OK with every counter of the same instant, or an error
++ * and nothing written. */
++t_Error FM_PCD_PlcrProfileReadCounters(t_Handle                         h_Profile,
++                                       t_FmPcdPlcrProfileCounterValues  *p_Values);
++
+ /**************************************************************************//**
+  @Function      FM_PCD_PlcrProfileSetCounter
+ 
+@@ -3362,8 +3428,7 @@ t_Error FM_PCD_MatchTableGetNextEngine(t_Handle                     h_CcNode,
   @Param[in]     p_KgKey                 Pointer to the key; must be like the key
                                          that the KG is generated, i.e. the same
                                          extraction and with mask if exist.
@@ -14056,7 +14264,7 @@ index 6e5db2aaf500..8d00d66f18e6 100644
   @Param[out]    p_CcNodeBucketHandle    Pointer to the bucket of the provided key.
   @Param[out]    p_BucketIndex           Index to the bucket of the provided key
   @Param[out]    p_LastIndex             Pointer to last index in the bucket of the
-@@ -3422,71 +3467,6 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
+@@ -3422,71 +3487,6 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
  *//***************************************************************************/
  t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl);
  
@@ -14128,7 +14336,7 @@ index 6e5db2aaf500..8d00d66f18e6 100644
  /**************************************************************************//**
   @Function      FM_PCD_HashTableModifyMissNextEngine
  
-@@ -3506,75 +3486,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
+@@ -3506,75 +3506,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
  t_Error FM_PCD_HashTableModifyMissNextEngine(t_Handle                  h_HashTbl,
                                               t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
  
@@ -14204,7 +14412,7 @@ index 6e5db2aaf500..8d00d66f18e6 100644
  /**************************************************************************//**
   @Function      FM_PCD_ManipNodeSet
  
-@@ -3697,4 +3608,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
+@@ -3697,4 +3628,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
  /** @} */ /* end of FM_PCD_grp group */
  /** @} */ /* end of FM_grp group */
  
@@ -14577,7 +14785,7 @@ index 0466a4734aae..000000000000
 -
 -#endif /* __FSL_FMAN_TEST_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
-index 9667d45d7f75..cb849bbb00ed 100644
+index 9667d45d7f75..d697fcd7fae2 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
 @@ -47,8 +47,15 @@
@@ -14596,7 +14804,7 @@ index 9667d45d7f75..cb849bbb00ed 100644
  
  /* Runtime PCD exported routines */
  EXPORT_SYMBOL(FM_PCD_Enable);
-@@ -92,18 +99,13 @@ EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyCounter);
+@@ -92,18 +99,14 @@ EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyCounter);
  EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyStatistics);
  EXPORT_SYMBOL(FM_PCD_MatchTableFindNGetKeyStatistics);
  EXPORT_SYMBOL(FM_PCD_MatchTableGetMissStatistics);
@@ -14612,6 +14820,7 @@ index 9667d45d7f75..cb849bbb00ed 100644
  EXPORT_SYMBOL(FM_PCD_PlcrProfileSet);
  EXPORT_SYMBOL(FM_PCD_PlcrProfileDelete);
  EXPORT_SYMBOL(FM_PCD_PlcrProfileGetCounter);
++EXPORT_SYMBOL(FM_PCD_PlcrProfileReadCounters);
 +EXPORT_SYMBOL(FmPcdPlcrProfileGetAbsoluteId);
  EXPORT_SYMBOL(FM_PCD_PlcrProfileSetCounter);
  EXPORT_SYMBOL(FM_PCD_ManipNodeSet);
@@ -16600,7 +16809,7 @@ index 6e6f07eb499e..95812cace4d5 100644
  
  #endif /* __LNXWRP_FM_H__ */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
-index ea4235847686..4feb27953b34 100644
+index ea4235847686..64a732670ecb 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
 @@ -43,7 +43,6 @@
@@ -16666,7 +16875,7 @@ index ea4235847686..4feb27953b34 100644
  
  	return qman_cb_dqrr_consume;
  }
-@@ -187,46 +180,23 @@ static struct qman_fq *FqAlloc(t_LnxWrpFmDev * p_LnxWrpFmDev,
+@@ -187,49 +180,60 @@ static struct qman_fq *FqAlloc(t_LnxWrpFmDev * p_LnxWrpFmDev,
  static t_Error QmEnqueueCB(t_Handle h_Arg, void *p_Fd)
  {
  	t_LnxWrpFmDev *p_LnxWrpFmDev = (t_LnxWrpFmDev *) h_Arg;
@@ -16722,7 +16931,44 @@ index ea4235847686..4feb27953b34 100644
  	return E_OK;
  }
  
-@@ -792,11 +762,10 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
++/* What the host command's three queues hold, and the work queues of the
++ * channel its answers are delivered on, for a command that has timed out
++ * (EnQFrm()). -1 for a queue that could not be asked. */
++static void QmDescribeCB(t_Handle h_Arg, char *buf, uint32_t size)
++{
++	t_LnxWrpFmDev *p_LnxWrpFmDev = (t_LnxWrpFmDev *)h_Arg;
++	struct qman_fq *fqs[3] = { p_LnxWrpFmDev->hc_tx_fq,
++				   p_LnxWrpFmDev->hc_tx_conf_fq,
++				   p_LnxWrpFmDev->hc_tx_err_fq };
++	struct qm_mcr_queryfq_np np;
++	struct qm_mcr_querywq wq;
++	long frames[3];
++	unsigned int i;
++	int n;
++
++	for (i = 0; i < 3; i++)
++		frames[i] = fqs[i] && !qman_query_fq_np(fqs[i], &np) ? np.frm_cnt : -1;
++	n = scnprintf(buf, size, "frames queued: command %ld, answer %ld, error %ld",
++		      frames[0], frames[1], frames[2]);
++	memset(&wq, 0, sizeof(wq));
++	wq.channel.id = p_LnxWrpFmDev->hcCh;
++	if (qman_query_wq(0, &wq))
++		return;
++	n += scnprintf(buf + n, size - n, "; channel 0x%x wq0-7:", wq.channel.id);
++	/* The upper bits of each length are not part of it. */
++	for (i = 0; i < ARRAY_SIZE(wq.wq_len); i++)
++		n += scnprintf(buf + n, size - n, " %u", wq.wq_len[i] & 0x0fff);
++	/* Dequeued, but not yet processed by the CPU that portal belongs to
++	 * (lnxwrp_fm.c, hcCh): an answer on neither queue is either here or
++	 * still inside the FMan. */
++	n += scnprintf(buf + n, size - n, "; its portal holds %d unprocessed",
++		       qman_affine_portal_dqrr_pending(cpumask_first(qman_affine_cpus())));
++}
++
+ static t_LnxWrpFmPortDev *ReadFmPortDevTreeNode(struct platform_device
+ 						*of_dev)
+ {
+@@ -792,11 +796,10 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
  
  
      if ((p_LnxWrpFmPortDev->settings.param.portType != e_FM_PORT_TYPE_TX) &&
@@ -16738,7 +16984,7 @@ index ea4235847686..4feb27953b34 100644
      }
  
      if (CheckNConfigFmPortAdvArgs(p_LnxWrpFmPortDev) != E_OK)
-@@ -999,8 +968,6 @@ static void LnxwrpFmPcdDevIndexedExceptionsCb(t_Handle h_App,
+@@ -999,8 +1002,6 @@ static void LnxwrpFmPcdDevIndexedExceptionsCb(t_Handle h_App,
  
  static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
  {
@@ -16747,7 +16993,44 @@ index ea4235847686..4feb27953b34 100644
  	if (p_LnxWrpFmDev->pcdActive) {
  		t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = &p_LnxWrpFmDev->hcPort;
  		t_FmPcdParams fmPcdParams;
-@@ -1164,55 +1131,33 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
+@@ -1038,11 +1039,18 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+ 			RETURN_ERROR(MAJOR, E_NULL_POINTER,
+ 				     ("Frame queue allocation failed..."));
+ 
++		/* Both answers to a host command at WQ0, the top of the CPU's
++		 * channel. QMan serves a channel's WQ0 and WQ1 strictly ahead of
++		 * everything else on it, so an answer queued below a queue that
++		 * stays busy -- a receive or exception stream the CPU cannot keep
++		 * up with -- waits for as long as it stays busy, past the
++		 * command's deadline (EnQFrm()). At WQ0 it waits for no queue
++		 * below it, and for at most one turn of any beside it. */
+ 		p_LnxWrpFmDev->hc_tx_conf_fq =
+ 			FqAlloc(p_LnxWrpFmDev,
+ 				0,
+ 				QMAN_FQ_FLAG_NO_ENQUEUE,
+-				p_LnxWrpFmDev->hcCh, 1);
++				p_LnxWrpFmDev->hcCh, 0);
+ 		if (!p_LnxWrpFmDev->hc_tx_conf_fq)
+ 			RETURN_ERROR(MAJOR, E_NULL_POINTER,
+ 				     ("Frame queue allocation failed..."));
+@@ -1051,7 +1059,7 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+ 			FqAlloc(p_LnxWrpFmDev,
+ 				0,
+ 				QMAN_FQ_FLAG_NO_ENQUEUE,
+-				p_LnxWrpFmDev->hcCh, 2);
++				p_LnxWrpFmDev->hcCh, 0);
+ 		if (!p_LnxWrpFmDev->hc_tx_err_fq)
+ 			RETURN_ERROR(MAJOR, E_NULL_POINTER,
+ 				     ("Frame queue allocation failed..."));
+@@ -1067,6 +1075,7 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+ 			qman_fq_fqid(p_LnxWrpFmDev->hc_tx_conf_fq);
+ 		fmPcdParams.hc.qmChannel = p_LnxWrpFmPortDev->txCh;
+ 		fmPcdParams.hc.f_QmEnqueue = QmEnqueueCB;
++		fmPcdParams.hc.f_QmDescribe = QmDescribeCB;
+ 		fmPcdParams.hc.h_QmArg = (t_Handle) p_LnxWrpFmDev;
+ 
+ 		p_LnxWrpFmDev->h_PcdDev = FM_PCD_Config(&fmPcdParams);
+@@ -1164,55 +1173,33 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
  	if (p_LnxWrpFmPortDev->settings.param.portType == e_FM_PORT_TYPE_RX) {
  		Sprint(p_LnxWrpFmPortDev->name, "%s-port-rx%d",
  		       p_LnxWrpFmDev->name, p_LnxWrpFmPortDev->id);
@@ -16803,7 +17086,7 @@ index ea4235847686..4feb27953b34 100644
  		FreeFmPortDev(p_LnxWrpFmPortDev);
  		REPORT_ERROR(MAJOR, E_INVALID_STATE,
  			     ("Unable to create sys entry - fm port!!!"));
-@@ -1231,7 +1176,6 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
+@@ -1231,7 +1218,6 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
  static void fm_port_remove(struct platform_device *of_dev)
  {
  	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev;
@@ -16811,7 +17094,7 @@ index ea4235847686..4feb27953b34 100644
  	struct device *dev;
  
  	dev = &of_dev->dev;
-@@ -1239,10 +1183,6 @@ static void fm_port_remove(struct platform_device *of_dev)
+@@ -1239,10 +1225,6 @@ static void fm_port_remove(struct platform_device *of_dev)
  
  	fm_port_sysfs_destroy(dev);
  
@@ -23876,7 +24159,7 @@ index 114e2773845b..a44e26aff945 100644
  int qman_ceetm_get_xsfdr(enum qm_dc_portal portal, unsigned int *num)
  {
 diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
-index 4085aa9a2dcb..afb88dbbe3e2 100644
+index 4085aa9a2dcb..c264928a0358 100644
 --- a/drivers/staging/fsl_qbman/qman_high.c
 +++ b/drivers/staging/fsl_qbman/qman_high.c
 @@ -34,6 +34,9 @@
@@ -23968,7 +24251,33 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	/* Stop dequeues on the portal */
  	qm_dqrr_sdqcr_set(&qm->p, 0);
  
-@@ -3296,7 +3342,6 @@ static int qman_ceetm_configure_dct(struct qm_mcc_ceetm_dct_config *opts)
+@@ -1439,6 +1485,25 @@ void *qman_get_affine_portal(int cpu)
+ }
+ EXPORT_SYMBOL(qman_get_affine_portal);
+ 
++/* The entries a CPU's portal has dequeued into its ring that the CPU has not
++ * consumed yet: frames waiting on that CPU however its channel's work queues
++ * stand. Two register reads from any CPU, for a report; a full ring reads as
++ * empty. -ENODEV for a CPU without a portal. */
++int qman_affine_portal_dqrr_pending(int cpu)
++{
++	struct qman_portal *p = affine_portals[cpu];
++	struct qm_portal *portal;
++	u32 pi, ci;
++
++	if (!p)
++		return -ENODEV;
++	portal = &p->p;
++	pi = qm_in(DQRR_PI_CINH) & (QM_DQRR_SIZE - 1);
++	ci = qm_in(DQRR_CI_CINH) & (QM_DQRR_SIZE - 1);
++	return (pi - ci) & (QM_DQRR_SIZE - 1);
++}
++EXPORT_SYMBOL(qman_affine_portal_dqrr_pending);
++
+ int qman_p_poll_dqrr(struct qman_portal *p, unsigned int limit)
+ {
+ 	int ret;
+@@ -3296,7 +3361,6 @@ static int qman_ceetm_configure_dct(struct qm_mcc_ceetm_dct_config *opts)
  
  	p = get_affine_portal();
  	PORTAL_IRQ_LOCK(p, irqflags);
@@ -23976,7 +24285,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	mcc = qm_mc_start(&p->p);
  	mcc->dct_config = *opts;
  	qm_mc_commit(&p->p, QM_CEETM_VERB_DCT_CONFIG);
-@@ -3410,7 +3455,7 @@ static int qman_ceetm_query_class_scheduler(struct qm_ceetm_channel *channel,
+@@ -3410,7 +3474,7 @@ static int qman_ceetm_query_class_scheduler(struct qm_ceetm_channel *channel,
  	return 0;
  }
  
@@ -23985,7 +24294,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  		struct qm_mcc_ceetm_mapping_shaper_tcfc_config *opts)
  {
  	struct qm_mc_command *mcc;
-@@ -3440,6 +3485,7 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(
+@@ -3440,6 +3504,7 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(
  	}
  	return 0;
  }
@@ -23993,7 +24302,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  
  static int qman_ceetm_query_mapping_shaper_tcfc(
  		struct qm_mcc_ceetm_mapping_shaper_tcfc_query *opts,
-@@ -3485,7 +3531,6 @@ static int qman_ceetm_configure_ccgr(struct qm_mcc_ceetm_ccgr_config *opts)
+@@ -3485,7 +3550,6 @@ static int qman_ceetm_configure_ccgr(struct qm_mcc_ceetm_ccgr_config *opts)
  
  	p = get_affine_portal();
  	PORTAL_IRQ_LOCK(p, irqflags);
@@ -24001,7 +24310,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	mcc = qm_mc_start(&p->p);
  	mcc->ccgr_config = *opts;
  
-@@ -3903,6 +3948,7 @@ int qman_ceetm_lni_enable_shaper(struct qm_ceetm_lni *lni, int coupled,
+@@ -3903,6 +3967,7 @@ int qman_ceetm_lni_enable_shaper(struct qm_ceetm_lni *lni, int coupled,
  	lni->shaper_couple = coupled;
  	lni->oal = oal;
  
@@ -24009,7 +24318,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_LNI_SHAPER | lni->idx);
  	config_opts.dcpid = lni->dcp_idx;
  	config_opts.shaper_config.cpl = coupled;
-@@ -3936,7 +3982,8 @@ int qman_ceetm_lni_disable_shaper(struct qm_ceetm_lni *lni)
+@@ -3936,7 +4001,8 @@ int qman_ceetm_lni_disable_shaper(struct qm_ceetm_lni *lni)
  		pr_err("The shaper has been disabled\n");
  		return -EINVAL;
  	}
@@ -24019,7 +24328,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_LNI_SHAPER | lni->idx);
  	config_opts.dcpid = lni->dcp_idx;
  	config_opts.shaper_config.cpl = lni->shaper_couple;
-@@ -4173,6 +4220,7 @@ int qman_ceetm_lni_set_tcfcc(struct qm_ceetm_lni *lni,
+@@ -4173,6 +4239,7 @@ int qman_ceetm_lni_set_tcfcc(struct qm_ceetm_lni *lni,
  		return -EINVAL;
  	}
  
@@ -24027,7 +24336,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	query_opts.cid = cpu_to_be16(CEETM_COMMAND_TCFC | lni->idx);
  	query_opts.dcpid = lni->dcp_idx;
  	if (qman_ceetm_query_mapping_shaper_tcfc(&query_opts, &query_result)) {
-@@ -4254,6 +4302,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
+@@ -4254,6 +4321,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
  	p = kzalloc(sizeof(*p), GFP_KERNEL);
  	if (!p)
  		return -ENOMEM;
@@ -24035,7 +24344,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	p->idx = channel_idx;
  	p->dcp_idx = lni->dcp_idx;
  	p->lni_idx = lni->idx;
-@@ -4264,7 +4313,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
+@@ -4264,7 +4332,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
  						channel_idx);
  	config_opts.dcpid = lni->dcp_idx;
  	config_opts.channel_mapping.map_lni_id = lni->idx;
@@ -24044,7 +24353,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	if (qman_ceetm_configure_mapping_shaper_tcfc(&config_opts)) {
  		pr_err("Can't map channel#%d for LNI#%d\n",
  						channel_idx, lni->idx);
-@@ -4296,7 +4345,7 @@ int qman_ceetm_channel_release(struct qm_ceetm_channel *channel)
+@@ -4296,7 +4364,7 @@ int qman_ceetm_channel_release(struct qm_ceetm_channel *channel)
  			channel->dcp_idx);
  		return -EINVAL;
  	}
@@ -24053,7 +24362,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_SHAPER |
  				      channel->idx);
  	config_opts.dcpid = channel->dcp_idx;
-@@ -4334,7 +4383,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
+@@ -4334,7 +4402,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
  		pr_err("This channel shaper has been enabled!\n");
  		return -EINVAL;
  	}
@@ -24062,7 +24371,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	channel->shaper_enable = 1;
  	channel->shaper_couple = coupled;
  
-@@ -4347,6 +4396,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
+@@ -4347,6 +4415,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
  		return -EINVAL;
  	}
  
@@ -24070,7 +24379,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_MAPPING |
  						channel->idx);
  	config_opts.dcpid = channel->dcp_idx;
-@@ -4441,7 +4491,7 @@ int qman_ceetm_channel_set_commit_rate(struct qm_ceetm_channel *channel,
+@@ -4441,7 +4510,7 @@ int qman_ceetm_channel_set_commit_rate(struct qm_ceetm_channel *channel,
  		pr_err("Fail to get the current channel shaper setting\n");
  		return -EINVAL;
  	}
@@ -24079,7 +24388,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	channel->cr_token_rate.whole = token_rate->whole;
  	channel->cr_token_rate.fraction = token_rate->fraction;
  	channel->cr_token_bucket_limit = token_limit;
-@@ -4534,7 +4584,8 @@ int qman_ceetm_channel_set_excess_rate(struct qm_ceetm_channel *channel,
+@@ -4534,7 +4603,8 @@ int qman_ceetm_channel_set_excess_rate(struct qm_ceetm_channel *channel,
  		pr_err("Fail to get the current channel shaper setting\n");
  		return -EINVAL;
  	}
@@ -24089,7 +24398,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	channel->er_token_rate.whole = token_rate->whole;
  	channel->er_token_rate.fraction = token_rate->fraction;
  	channel->er_token_bucket_limit = token_limit;
-@@ -4618,7 +4669,7 @@ int qman_ceetm_channel_set_weight(struct qm_ceetm_channel *channel,
+@@ -4618,7 +4688,7 @@ int qman_ceetm_channel_set_weight(struct qm_ceetm_channel *channel,
  		pr_err("This channel is a shaped one\n");
  		return -EINVAL;
  	}
@@ -24098,7 +24407,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	channel->cr_token_bucket_limit = token_limit;
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_SHAPER |
  						channel->idx);
-@@ -4668,7 +4719,7 @@ int qman_ceetm_channel_set_group(struct qm_ceetm_channel *channel, int group_b,
+@@ -4668,7 +4738,7 @@ int qman_ceetm_channel_set_group(struct qm_ceetm_channel *channel, int group_b,
  		pr_err("Can't query channel#%d's scheduler!\n", channel->idx);
  		return -EINVAL;
  	}
@@ -24107,7 +24416,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	config_opts.cqcid = cpu_to_be16(channel->idx);
  	config_opts.dcpid = channel->dcp_idx;
  	config_opts.gpc_combine_flag = !group_b;
-@@ -4759,6 +4810,7 @@ int qman_ceetm_channel_set_group_er_eligibility(struct qm_ceetm_channel
+@@ -4759,6 +4829,7 @@ int qman_ceetm_channel_set_group_er_eligibility(struct qm_ceetm_channel
  						channel->idx);
  		return -EINVAL;
  	}
@@ -24115,7 +24424,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	csch_config.cqcid = cpu_to_be16(channel->idx);
  	csch_config.dcpid = channel->dcp_idx;
  	csch_config.gpc_combine_flag = csch_query.gpc_combine_flag;
-@@ -4806,6 +4858,7 @@ int qman_ceetm_channel_set_cq_cr_eligibility(struct qm_ceetm_channel *channel,
+@@ -4806,6 +4877,7 @@ int qman_ceetm_channel_set_cq_cr_eligibility(struct qm_ceetm_channel *channel,
  						channel->idx);
  		return -EINVAL;
  	}
@@ -24123,7 +24432,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	csch_config.cqcid = cpu_to_be16(channel->idx);
  	csch_config.dcpid = channel->dcp_idx;
  	csch_config.gpc_combine_flag = csch_query.gpc_combine_flag;
-@@ -4889,7 +4942,7 @@ int qman_ceetm_cq_claim(struct qm_ceetm_cq **cq,
+@@ -4889,7 +4961,7 @@ int qman_ceetm_cq_claim(struct qm_ceetm_cq **cq,
  		pr_err("Can't allocate memory for CQ#%d!\n", idx);
  		return -ENOMEM;
  	}
@@ -24132,7 +24441,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	list_add_tail(&p->node, &channel->class_queues);
  	p->idx = idx;
  	p->is_claimed = 1;
-@@ -4938,7 +4991,7 @@ int qman_ceetm_cq_claim_A(struct qm_ceetm_cq **cq,
+@@ -4938,7 +5010,7 @@ int qman_ceetm_cq_claim_A(struct qm_ceetm_cq **cq,
  		pr_err("Can't allocate memory for CQ#%d!\n", idx);
  		return -ENOMEM;
  	}
@@ -24141,7 +24450,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	list_add_tail(&p->node, &channel->class_queues);
  	p->idx = idx;
  	p->is_claimed = 1;
-@@ -4986,7 +5039,7 @@ int qman_ceetm_cq_claim_B(struct qm_ceetm_cq **cq,
+@@ -4986,7 +5058,7 @@ int qman_ceetm_cq_claim_B(struct qm_ceetm_cq **cq,
  		pr_err("Can't allocate memory for CQ#%d!\n", idx);
  		return -ENOMEM;
  	}
@@ -24150,7 +24459,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	list_add_tail(&p->node, &channel->class_queues);
  	p->idx = idx;
  	p->is_claimed = 1;
-@@ -5040,7 +5093,7 @@ int qman_ceetm_set_queue_weight(struct qm_ceetm_cq *cq,
+@@ -5040,7 +5112,7 @@ int qman_ceetm_set_queue_weight(struct qm_ceetm_cq *cq,
  						cq->parent->idx);
  		return -EINVAL;
  	}
@@ -24159,7 +24468,7 @@ index 4085aa9a2dcb..afb88dbbe3e2 100644
  	config_opts.cqcid = cpu_to_be16(cq->parent->idx);
  	config_opts.dcpid = cq->parent->dcp_idx;
  	config_opts.crem = query_result.crem;
-@@ -5257,6 +5310,7 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
+@@ -5257,6 +5329,7 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
  	p = kmalloc(sizeof(*p), GFP_KERNEL);
  	if (!p)
  		return -ENOMEM;
@@ -24200,10 +24509,25 @@ index 000000000000..03eb762aa0a4
 +
 +#endif
 diff --git a/include/linux/fsl_qman.h b/include/linux/fsl_qman.h
-index c42bde697436..68225db4d865 100644
+index c42bde697436..1967d4d63174 100644
 --- a/include/linux/fsl_qman.h
 +++ b/include/linux/fsl_qman.h
-@@ -3963,6 +3963,12 @@ static inline int qman_portals_probed(void) {
+@@ -2131,6 +2131,14 @@ u16 qman_affine_channel(unsigned int cpu);
+  */
+ void *qman_get_affine_portal(int cpu);
+ 
++/**
++ * qman_affine_portal_dqrr_pending - entries @cpu's portal holds unconsumed
++ *
++ * What the portal has dequeued into its ring and the CPU has not processed,
++ * for a report of where a frame waits. -ENODEV without a portal.
++ */
++int qman_affine_portal_dqrr_pending(int cpu);
++
+ /**
+  * qman_poll_dqrr - process DQRR (fast-path) entries
+  * @limit: the maximum number of DQRR entries to process
+@@ -3963,6 +3971,12 @@ static inline int qman_portals_probed(void) {
  	return 1;
  }
  

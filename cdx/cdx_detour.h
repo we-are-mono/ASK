@@ -34,6 +34,7 @@ void cdx_detour_flow_del(struct cdx_detour_flow *flow);
 void cdx_detour_counters(struct cdx_detour_counters *counters);
 #ifdef CDX_DEBUG_FLOWTABLE
 extern bool cdx_detour_strand;
+int cdx_detour_exception_placement(u16 *channel, u8 *wq);
 #endif
 
 #endif

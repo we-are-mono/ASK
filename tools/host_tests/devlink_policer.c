@@ -1,117 +1,26 @@
-/* What devlink says the two device-wide meters run, from the first `show'.
+/* What devlink says the two device-wide meters run, from the first `show', and
+ * what they run once a set has failed to land.
  *
  * A devlink policer reports the rate and burst it was registered with until a
  * set succeeds, and a set naming only a rate keeps the registered burst. So the
  * registration has to carry what the profiles were actually created with. The
- * chain is the whole point, so it is compiled end to end: CDX's startup defaults, the profiles cdx creates from them, the accessors that read them
+ * chain is the whole point, so it is compiled end to end: CDX's startup
+ * defaults, the profiles cdx creates from them, the accessors that read them
  * back, and the policer table built from those. A stub devlink core records
- * what was registered.
+ * what was registered, and a stub FMan (plcr_fixture.h) what each profile
+ * runs and counts.
  */
-#include <assert.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "plcr_fixture.h"
 
-typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
-typedef uint32_t U32;
-#define SUCCESS 0
-#define FAILURE 1
-#define EINVAL 22
-#define ENOMEM 12
-#define EOPNOTSUPP 95
-#define ERR_QM_INGRESS_SET_PROFILE_FAILED 0x100
-#define ERR_QM_INGRESS_POLICER_HANDLE_NULL 0x101
-#define FMAN_INDEX 0
-#define ENABLE_EGRESS_QOS
-#define SEC_PROFILE_SUPPORT
-#include "cdx_ioctl.h"
-
-/* --- the FMAN policer interface, as much of it as the profiles touch ------ */
-typedef void *t_Handle;
-typedef enum { e_FM_PCD_PLCR_PORT_PRIVATE, e_FM_PCD_PLCR_SHARED } e_FmPcdProfileTypeSelection;
-typedef enum { e_FM_PCD_PLCR_PASS_THROUGH, e_FM_PCD_PLCR_RFC_2698,
-               e_FM_PCD_PLCR_RFC_4115 } e_FmPcdPlcrAlgorithmSelection;
-typedef enum { e_FM_PCD_PLCR_COLOR_BLIND, e_FM_PCD_PLCR_COLOR_AWARE } e_FmPcdPlcrColorMode;
-typedef enum { e_FM_PCD_PLCR_GREEN, e_FM_PCD_PLCR_YELLOW, e_FM_PCD_PLCR_RED,
-               e_FM_PCD_PLCR_OVERRIDE } e_FmPcdPlcrColor;
-typedef enum { e_FM_PCD_PLCR_BYTE_MODE, e_FM_PCD_PLCR_PACKET_MODE } e_FmPcdPlcrRateMode;
-typedef enum { e_FM_PCD_PLCR_L2_FRM_LEN, e_FM_PCD_PLCR_L3_FRM_LEN,
-               e_FM_PCD_PLCR_L4_FRM_LEN, e_FM_PCD_PLCR_FULL_FRM_LEN } e_FmPcdPlcrFrameLengthSelect;
-typedef enum { e_FM_PCD_PLCR_ROLLBACK_L2_FRM_LEN,
-               e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN } e_FmPcdPlcrRollBackFrameSelect;
-typedef enum { e_FM_PCD_DONE, e_FM_PCD_KG, e_FM_PCD_CC, e_FM_PCD_PLCR,
-               e_FM_PCD_PRS } e_FmPcdEngine;
-typedef enum { e_FM_PCD_ENQ_FRAME = 0, e_FM_PCD_DROP_FRAME } e_FmPcdDoneAction;
-typedef struct {
-    bool modify;
-    union {
-        t_Handle h_Profile;
-        struct { e_FmPcdProfileTypeSelection profileType; t_Handle h_FmPort;
-                 uint16_t relativeProfileId; } newParams;
-    } id;
-    e_FmPcdPlcrAlgorithmSelection algSelection;
-    e_FmPcdPlcrColorMode colorMode;
-    struct { e_FmPcdPlcrColor dfltColor, override; } color;
-    struct {
-        e_FmPcdPlcrRateMode rateMode;
-        struct { e_FmPcdPlcrFrameLengthSelect frameLengthSelection;
-                 e_FmPcdPlcrRollBackFrameSelect rollBackFrameSelection; } byteModeParams;
-        uint32_t committedInfoRate, committedBurstSize;
-        uint32_t peakOrExcessInfoRate, peakOrExcessBurstSize;
-    } nonPassthroughAlgParams;
-    e_FmPcdEngine nextEngineOnGreen, nextEngineOnYellow, nextEngineOnRed;
-    struct { int action; } paramsOnGreen, paramsOnYellow, paramsOnRed;
-} t_FmPcdPlcrProfileParams;
-
-/* One slot per profile the harness hands out, holding what it was last
- * programmed with, so a test can say what the hardware runs. */
-static struct profile { bool live; t_FmPcdPlcrProfileParams params; } profiles[32];
-static unsigned profile_sets, fail_profile_set;
-static t_Handle FM_PCD_PlcrProfileSet(t_Handle pcd, t_FmPcdPlcrProfileParams *p)
-{
-    struct profile *slot;
-
-    assert(pcd);
-    profile_sets++;
-    if (fail_profile_set && profile_sets == fail_profile_set)
-        return NULL;
-    if (p->modify) {
-        slot = p->id.h_Profile;
-        assert(slot && slot->live);
-    } else {
-        for (slot = profiles; slot->live; slot++)
-            assert(slot < profiles + 31);
-        slot->live = true;
-    }
-    slot->params = *p;
-    return slot;
-}
-static uint8_t FmPcdPlcrProfileGetAbsoluteId(t_Handle h)
-{ return (uint8_t)((struct profile *)h - profiles); }
-#define cdx_dpa_init_fault() false
-#define printk(...) ((void)0)
-#define DPA_ERROR(...) ((void)0)
-
-static struct cdx_fman_info *fman_info;
-static uint32_t num_fmans;
-#include "devlink_policer_profiles.inc"
-
-/* --- the counters, which this file only routes ---------------------------- */
-struct cdx_police_counters { uint32_t green, yellow, red; };
-static int cdx_expt_rate_counters(uint32_t fm, uint32_t type, struct cdx_police_counters *out)
-{ assert(fm == FMAN_INDEX && type == CDX_EXPT_ETH_RATELIMIT); out->red = 11; return SUCCESS; }
-static int cdx_ingress_policer_counters(uint32_t fm, uint32_t q, struct cdx_police_counters *out)
-{ assert(fm == FMAN_INDEX && q == INGRESS_SEC_POLICER_QUEUE_NUM); out->red = 22; return SUCCESS; }
+#include "plcr_types.inc"
+#include "plcr_qos.inc"
+#include "plcr_cfg.inc"
 
 /* --- the devlink core, recorded ------------------------------------------ */
 struct device { int unused; };
 struct netlink_ext_ack { const char *msg; };
-#define NL_SET_ERR_MSG_MOD(e, m) do { if (e) (e)->msg = (m); } while (0)
-static unsigned warnings;
-#define pr_warn(...) (warnings++)
+/* As the kernel's: the message must be a string literal. */
+#define NL_SET_ERR_MSG_MOD(e, m) do { static const char __msg[] = m; if (e) (e)->msg = __msg; } while (0)
 struct devlink_trap_policer {
     u32 id; u64 init_rate, init_burst, max_rate, min_rate, max_burst, min_burst;
 };
@@ -175,7 +84,6 @@ static void devlink_unregister(struct devlink *d) { assert(d->registered); d->re
 
 static struct cdx_fman_info fman;
 static struct device fman_dev;
-static int pcd;
 
 /* What the loader configures and cdx creates at DPA configuration, with a hook
  * to change the loader's choices first. */
@@ -183,7 +91,7 @@ static void configure(void (*change)(struct cdx_fman_info *))
 {
     memset(profiles, 0, sizeof(profiles));
     memset(&fman, 0, sizeof(fman));
-    fman.pcd_handle = &pcd;
+    fman.pcd_handle = &plcr_pcd;
     dpa_cfg_set_expt_defaults(&fman);
     if (change)
         change(&fman);
@@ -204,6 +112,16 @@ static const struct devlink_trap_policer *registered(u32 id)
     return NULL;
 }
 
+static struct profile *punt_profile(void) { return fman.expt_rate_limit_info[CDX_EXPT_ETH_RATELIMIT].handle; }
+static struct profile *sec_profile(void) { return fman.ingress_policer_info[INGRESS_SEC_POLICER_QUEUE_NUM].handle; }
+#define RATE(s) ((s)->params.nonPassthroughAlgParams)
+/* Both pairs, as one devlink rate and burst program them. */
+static void assert_runs(struct profile *p, u32 rate, u32 burst)
+{
+    assert(RATE(p).committedInfoRate == rate && RATE(p).peakOrExcessInfoRate == rate);
+    assert(RATE(p).committedBurstSize == burst && RATE(p).peakOrExcessBurstSize == burst);
+}
+
 static void byte_mode(struct cdx_fman_info *f) { f->expt_ratelim_mode = EXPT_PKT_LIM_PLCR_MODE_BYTE; }
 static void no_punt(struct cdx_fman_info *f)
 { f->expt_rate_limit_info[CDX_EXPT_ETH_RATELIMIT].limit = DISABLE_EXPT_PROFILE; }
@@ -211,11 +129,27 @@ static void punt_too_fast(struct cdx_fman_info *f)
 { f->expt_rate_limit_info[CDX_EXPT_ETH_RATELIMIT].limit = CDX_PUNT_RATE_MAX + 1; }
 static void punt_burst_too_big(struct cdx_fman_info *f) { f->expt_ratelim_burst_size = 4096; }
 
-int main(void)
+static struct netlink_ext_ack ack;
+
+static int set(const struct devlink_trap_policer *policer, u64 rate, u64 burst)
+{
+    ack.msg = NULL;
+    return cdx_devlink->ops->trap_policer_set(cdx_devlink, policer, rate, burst, &ack);
+}
+
+static u64 drops_of(const struct devlink_trap_policer *policer)
+{
+    u64 drops = ~0ULL;
+
+    assert(!cdx_devlink->ops->trap_policer_counter_get(cdx_devlink, policer, &drops));
+    return drops;
+}
+
+/* ---- registration, the verbs, and detach -------------------------------- */
+static void verbs(void)
 {
     const struct devlink_trap_policer *punt, *sec;
-    struct netlink_ext_ack ack = { 0 };
-    u64 drops;
+    struct profile *p;
 
     /* ---- the defaults the image boots with ---- */
     configure(NULL);
@@ -234,14 +168,14 @@ int main(void)
     assert(sec->init_rate == 1060000 && sec->init_burst == 64);
     assert(sec->max_rate == CDX_SEC_RATE_MAX && sec->max_burst == CDX_SEC_BURST_MAX);
     /* And that is what the profiles themselves hold. */
-    struct profile *p = fman.expt_rate_limit_info[CDX_EXPT_ETH_RATELIMIT].handle;
-    assert(p->params.nonPassthroughAlgParams.rateMode == e_FM_PCD_PLCR_PACKET_MODE);
-    assert(p->params.nonPassthroughAlgParams.peakOrExcessInfoRate == punt->init_rate);
-    assert(p->params.nonPassthroughAlgParams.peakOrExcessBurstSize == punt->init_burst);
-    p = fman.ingress_policer_info[INGRESS_SEC_POLICER_QUEUE_NUM].handle;
-    assert(p->params.nonPassthroughAlgParams.rateMode == e_FM_PCD_PLCR_PACKET_MODE);
-    assert(p->params.nonPassthroughAlgParams.peakOrExcessInfoRate == sec->init_rate);
-    assert(p->params.nonPassthroughAlgParams.peakOrExcessBurstSize == sec->init_burst);
+    p = punt_profile();
+    assert(RATE(p).rateMode == e_FM_PCD_PLCR_PACKET_MODE);
+    assert(RATE(p).peakOrExcessInfoRate == punt->init_rate);
+    assert(RATE(p).peakOrExcessBurstSize == punt->init_burst);
+    p = sec_profile();
+    assert(RATE(p).rateMode == e_FM_PCD_PLCR_PACKET_MODE);
+    assert(RATE(p).peakOrExcessInfoRate == sec->init_rate);
+    assert(RATE(p).peakOrExcessBurstSize == sec->init_burst);
     assert(p->params.nextEngineOnYellow == p->params.nextEngineOnGreen);
     assert(p->params.paramsOnRed.action == e_FM_PCD_DROP_FRAME);
     assert(!warnings);
@@ -252,19 +186,17 @@ int main(void)
 
     /* ---- the verbs reach the profiles they describe ---- */
     unsigned sets = profile_sets;
-    assert(!cdx_devlink->ops->trap_policer_set(cdx_devlink, punt, 100000, 512, &ack));
-    p = fman.expt_rate_limit_info[CDX_EXPT_ETH_RATELIMIT].handle;
+    assert(!set(punt, 100000, 512) && !ack.msg);
+    p = punt_profile();
     assert(profile_sets == sets + 1 && p->params.modify);
-    assert(p->params.nonPassthroughAlgParams.committedInfoRate == 100000);
-    assert(p->params.nonPassthroughAlgParams.peakOrExcessBurstSize == 512);
-    assert(!cdx_devlink->ops->trap_policer_set(cdx_devlink, sec, 200000, 1024, &ack));
-    p = fman.ingress_policer_info[INGRESS_SEC_POLICER_QUEUE_NUM].handle;
-    assert(p->params.nonPassthroughAlgParams.committedInfoRate == 200000);
-    assert(p->params.nonPassthroughAlgParams.peakOrExcessInfoRate == 200000);
-    assert(p->params.nonPassthroughAlgParams.committedBurstSize == 1024);
-    assert(p->params.nonPassthroughAlgParams.peakOrExcessBurstSize == 1024);
-    assert(!cdx_devlink->ops->trap_policer_counter_get(cdx_devlink, punt, &drops) && drops == 11);
-    assert(!cdx_devlink->ops->trap_policer_counter_get(cdx_devlink, sec, &drops) && drops == 22);
+    assert_runs(p, 100000, 512);
+    assert(!set(sec, 200000, 1024) && !ack.msg);
+    assert_runs(sec_profile(), 200000, 1024);
+    /* Red is what each drops. */
+    punt_profile()->red = 11;
+    sec_profile()->red = 22;
+    assert(drops_of(punt) == 11 && drops_of(sec) == 22);
+    assert(!work_count);
 
     /* ---- detach, and again ---- */
     cdx_devlink_detach();
@@ -311,18 +243,16 @@ int main(void)
                                              true) == SUCCESS);
     p = fman.ingress_policer_info[1].handle;
     /* IP lengths, as Linux charges a police rate, and only green passes. */
-    assert(p->params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection ==
-           e_FM_PCD_PLCR_L3_FRM_LEN);
+    assert(RATE(p).byteModeParams.frameLengthSelection == e_FM_PCD_PLCR_L3_FRM_LEN);
     assert(p->params.nextEngineOnYellow == e_FM_PCD_DONE &&
            p->params.paramsOnYellow.action == e_FM_PCD_DROP_FRAME);
     assert(p->params.nextEngineOnGreen != e_FM_PCD_DONE);
-    assert(p->params.nonPassthroughAlgParams.peakOrExcessBurstSize == 2026);
+    assert(RATE(p).peakOrExcessBurstSize == 2026);
     /* Given back, the profile meters as NXP's do again, whatever enables it
      * next. */
     assert(cdx_ingress_enable_or_disable_qos(FMAN_INDEX, 1, DISABLE_INGRESS_POLICER) == SUCCESS);
     assert(cdx_ingress_enable_or_disable_qos(FMAN_INDEX, 1, ENABLE_INGRESS_POLICER) == SUCCESS);
-    assert(p->params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection ==
-           e_FM_PCD_PLCR_FULL_FRM_LEN);
+    assert(RATE(p).byteModeParams.frameLengthSelection == e_FM_PCD_PLCR_FULL_FRM_LEN);
     assert(p->params.nextEngineOnYellow == p->params.nextEngineOnGreen);
     assert(cdx_ingress_enable_or_disable_qos(FMAN_INDEX, 1, DISABLE_INGRESS_POLICER) == SUCCESS);
 
@@ -346,7 +276,152 @@ int main(void)
     assert(!cdx_devlink_attach(&fman_dev) && cdx_devlink->count == 2);
     cdx_devlink_detach();
     assert(!instances);
+}
 
-    puts("devlink policers: boot values, unit and range refusals, verbs, detach passed");
-    return 0;
+/* ---- the SEC policer, set while its write does not land ---------------- */
+static void sec_deferred(void)
+{
+    const struct devlink_trap_policer *sec;
+    u32 rate, burst;
+    int rc;
+
+    configure(NULL);
+    assert(!cdx_devlink_attach(&fman_dev));
+    sec = registered(CDX_DEVLINK_POLICER_SEC);
+
+    /* Timed out, never applied. The set is valid, so devlink is told it took
+     * -- and so shows the new rate -- and the profile is rewritten until it
+     * runs it, rather than devlink keeping a rate the meter may or may not
+     * have left behind. */
+    plcr_lost = 1;
+    rc = set(sec, 300000, 100);
+    assert(rc == 0 && ack.msg && strstr(ack.msg, "retried"));
+    assert(cdx_ingress_policer_peak(FMAN_INDEX, INGRESS_SEC_POLICER_QUEUE_NUM, &rate, &burst) ==
+           SUCCESS && rate == 300000 && burst == 100);
+    assert(RATE(sec_profile()).peakOrExcessInfoRate == 1060000 &&
+           RATE(sec_profile()).peakOrExcessBurstSize == 64);
+    assert(run_queued_work() == 1 && !work_count);
+    assert_runs(sec_profile(), 300000, 100);
+
+    /* Refused while the channel is shut: tried again each second, and left
+     * alone once it lands. */
+    plcr_shut = true;
+    assert(!set(sec, 400000, 200) && ack.msg);
+    assert(run_queued_work() == 1 && work_count == 1);
+    assert(run_queued_work() == 1 && work_count == 1);
+    assert_runs(sec_profile(), 300000, 100);
+    plcr_shut = false;
+    assert(run_queued_work() == 1 && !work_count);
+    assert_runs(sec_profile(), 400000, 200);
+    assert(!plcr_unlocked);
+    cdx_devlink_detach();
+}
+
+/* ---- the punt policer, set while its write does not land --------------- */
+static void punt_deferred(void)
+{
+    const struct devlink_trap_policer *punt;
+    u32 rate, burst;
+    int rc;
+
+    configure(NULL);
+    assert(!cdx_devlink_attach(&fman_dev));
+    punt = registered(CDX_DEVLINK_POLICER_PUNT);
+
+    plcr_lost = 1;
+    rc = set(punt, 100000, 512);
+    /* One request, held whole: never the old rate with the new burst. */
+    assert(cdx_expt_rate_config(FMAN_INDEX, CDX_EXPT_ETH_RATELIMIT, &rate, &burst) == SUCCESS);
+    assert((rate == 100000) == (burst == 512));
+    assert(rc == 0 && ack.msg && strstr(ack.msg, "retried"));
+    assert(rate == 100000 && burst == 512);
+    assert_runs(punt_profile(), 195312, 64);
+    assert(run_queued_work() == 1 && !work_count);
+    assert_runs(punt_profile(), 100000, 512);
+
+    /* Timed out after FMan applied it: the same whole profile is written
+     * again, which leaves the meter as it is. */
+    plcr_late = 1;
+    assert(!set(punt, 50000, 32) && ack.msg);
+    assert_runs(punt_profile(), 50000, 32);
+    assert(run_queued_work() == 1 && !work_count);
+    assert_runs(punt_profile(), 50000, 32);
+    assert(cdx_expt_rate_config(FMAN_INDEX, CDX_EXPT_ETH_RATELIMIT, &rate, &burst) == SUCCESS);
+    assert(rate == 50000 && burst == 32);
+    assert(!plcr_unlocked);
+    cdx_devlink_detach();
+}
+
+/* ---- the drop counts, across failed reads and rewrites ----------------- */
+static void counters(void)
+{
+    const struct devlink_trap_policer *punt, *sec;
+
+    configure(NULL);
+    assert(!cdx_devlink_attach(&fman_dev));
+    punt = registered(CDX_DEVLINK_POLICER_PUNT);
+    sec = registered(CDX_DEVLINK_POLICER_SEC);
+
+    punt_profile()->red = 40;
+    assert(drops_of(punt) == 40);
+    /* A read that fails is no reading: devlink is shown the drops it was
+     * shown last, not a zero that would run the count backwards, and the
+     * next good read adds only what the meter dropped since. */
+    punt_profile()->red += 10;
+    counters_fail = true;
+    assert(drops_of(punt) == 40);
+    counters_fail = false;
+    punt_profile()->red += 5;
+    assert(drops_of(punt) == 55);
+
+    /* A set rewrites the profile, which zeroes its counters. What the meter
+     * dropped is not undone by that: the count goes on from where it was. */
+    punt_profile()->red += 3;
+    assert(!set(punt, 100000, 512));
+    assert(!punt_profile()->red);
+    punt_profile()->red = 4;
+    assert(drops_of(punt) == 62);
+    /* And so does a retry, which rewrites it too. */
+    plcr_lost = 1;
+    assert(!set(punt, 90000, 512) && ack.msg);
+    punt_profile()->red += 1;
+    assert(drops_of(punt) == 63);
+    assert(run_queued_work() == 1 && !punt_profile()->red);
+    punt_profile()->red = 2;
+    assert(drops_of(punt) == 65);
+
+    /* The same for the SEC policer. */
+    sec_profile()->red = 7;
+    assert(drops_of(sec) == 7);
+    counters_fail = true;
+    assert(drops_of(sec) == 7);
+    counters_fail = false;
+    sec_profile()->red += 1;
+    assert(!set(sec, 300000, 100));
+    sec_profile()->red = 2;
+    assert(drops_of(sec) == 10);
+    assert(!plcr_unlocked && !lockdep_misses);
+    cdx_devlink_detach();
+}
+
+int main(int argc, char **argv)
+{
+    static const struct { const char *name; void (*run)(void); } cases[] = {
+        { "verbs", verbs },
+        { "sec_deferred", sec_deferred },
+        { "punt_deferred", punt_deferred },
+        { "counters", counters },
+    };
+
+    assert(argc == 2);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (strcmp(argv[1], cases[i].name))
+            continue;
+        cases[i].run();
+        assert(!work_count && !mutexes_held);
+        printf("devlink policers %s: passed\n", cases[i].name);
+        return 0;
+    }
+    fprintf(stderr, "no case %s\n", argv[1]);
+    return 2;
 }

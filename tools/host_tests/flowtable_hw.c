@@ -561,14 +561,6 @@ static int ExternalHashTableFmPcdHcSync(void *td)
     barrier();
     return 0;
 }
-/* Whether the host-command channel has failed for good: a sync that fails
- * then can never complete. */
-static bool hc_failed;
-static bool ExternalHashTableHcFailed(void *td)
-{
-    assert(td == &in_itf && cdx_info->ctrl.mutex);
-    return hc_failed;
-}
 static void ExternalHashTableEntryFree(struct key *handle)
 {
     assert(handle && (handle == key || handle == older));
@@ -1017,21 +1009,13 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     resolve_result = 0;
     assert(resumes == resumed && key->linked);
     expect_terminal("a possibly linked key could not be settled", restarts);
-    /* A host-command channel that has failed for good: no barrier will ever
-     * complete, so a failed one is not worth waiting for. One that merely
-     * failed is (above). */
-    latch_root();
-    fail_sync = true; hc_failed = true;
-    run_until_idle();
-    fail_sync = false; hc_failed = false;
-    expect_terminal("the host-command channel has failed", restarts);
     /* Hardware that stops answering without saying so: a port that never
-     * goes idle, or a barrier the channel keeps rejecting though it has not
-     * failed for good. Each is retried a quarter-second apart, and the
-     * dozenth unanswered try in an episode -- a few seconds in, long before
-     * a stall would be reported -- leaves the latch for a reboot, saying what
-     * it waited for. Recovery then keeps stopping the port until it does go
-     * idle, as it always did. */
+     * goes idle, or a barrier the channel keeps refusing -- a timed-out
+     * command it is still waiting on. Each is retried a quarter-second apart,
+     * and the dozenth unanswered try in an episode -- a few seconds in, long
+     * before a stall would be reported -- leaves the latch for a reboot,
+     * saying what it waited for. Recovery then keeps stopping the port until
+     * it does go idle, as it always did. */
     unsigned stalls = stall_lines;
 
     latch_root();

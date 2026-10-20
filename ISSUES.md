@@ -152,6 +152,16 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A403 — some datapath-restart failures still end in "reboot required".** A router runs for years unattended, so
+  no failure may need a reboot to clear. `cdx_ft_restart()` (cdx_flowtable_backend.c) makes the latch terminal for a
+  port CDX did not configure reaching a classifier, a possibly linked key that could not be recorded or that the table
+  refuses eight times, a malformed table, a port that never goes idle, a barrier still refused after ~3 s (a timed-out
+  host command whose answer is later than that, A401), and more than `flowtable_restart_limit` restarts in ten
+  minutes; `ask-recovery-monitor` then reboots. Merely retrying is no answer: an episode keeps every classifier port
+  disabled (`dpa_cfg_stop()`), so nothing is forwarded, not even in software, while health reports it well. Fix
+  direction: during an episode detach the PCD from every port (software forwarding), settle or rebuild the tables
+  with nothing walking them, attach again and re-offer; if it cannot attach, stay in software and retry.
+
 - [ ] **A402 — retiring thousands of flows after a route change holds cdx's control mutex past the recovery deadline.**
   OpenWrt image on the DUT, ~6,000 offloaded flows behind a /32 route flapped every 5 s (18,602 route invalidations in
   2 min): `ask-flowtable health` hit its 5 s deadline twice while RTNL answered in 10 ms; an earlier run missed three in
@@ -160,14 +170,8 @@ result independently of those temporary files.
   else. Fix direction: find the holder on the ASK image (lockdep, or a hold-time report in `cdx_ft_end()`), then bound
   it. Production exposure: a PPPoE, VPN or default-route change with many flows offloaded.
 
-- [ ] **A401 — a host command timed out in production; offload stayed off until reboot (reopens A343).** Zamanifi, OpenWrt
-  r1792438435 with ASK 1.1.4, 148 s after boot: `EnQFrm` timed out on the `fm_ehash` barrier's sync, the channel latched
-  failed, and `quarantine` stayed at 564 with admission off. Afterwards the FMan was healthy (RISCs ~3 %, no bus or ECC
-  error, command queue empty), no frame queue held a frame, task slots matched a healthy DUT, irqbalance was off;
-  802.3x PAUSE is on on every port. Not reproduced on the DUT with the same image, packages and config, WAN on 1G eth0:
-  175k installs with the WAN saturated, then 30 two-second PAUSE bursts on the LAN port under churn. Fix direction: the
-  timeout now names its command, wait and what else was outstanding with the call chain that asked for it, and a late
-  confirmation reports itself; read the next occurrence, then the microcode's sync handler.
+- [x] **A401 — a host command timed out in production; offload stayed off until reboot.** Its answer queued behind a WQ0
+  exception queue on CPU0; it now leads at WQ0, and a late one reopens the channel (_:/^sdk_fman, cdx: answer host commands first_).
 
 - [ ] **A400 — a 10G MAC at 2500base-x would take a 1G MAC's interrupt and frame-limit slots.** `macdev2enetinterface()`
   (sdk_dpaa/mac-api.c, patch 110) gives SPEED_2500 `e_ENET_MODE_SGMII_2500`, whose speed is below 10000, so memac files

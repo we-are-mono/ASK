@@ -96,11 +96,6 @@ static uint16_t add_bucket;
 static void get_indexed_hash_bucket(uint8_t size, uint8_t *key, uint8_t shift, uint16_t mask,
                                     uint16_t *index)
 { (void)size; (void)key; (void)shift; assert(add_bucket <= mask); *index = add_bucket; }
-/* The PCD's host-command channel, as far as whether it has failed for good. */
-static bool hc_failed;
-static t_Handle FmPcdGetHcHandle(t_Handle pcd) { return pcd; }
-static bool FmHcIsFailed(t_Handle hc) { assert(hc); return hc_failed; }
-
 /* The PCD's host-command sync. A delete's goes through the DeleteKey fault
  * knob first, as in the test image. */
 static int pcd, other_pcd;
@@ -312,11 +307,6 @@ static void check_find(void)
     assert(where(&wide, e[0], 3, 0) == 2);
     assert(ExternalHashTableDeleteKey(&wide, 2, e[0]) == 0 && !buckets[2].h);
     release_entry(e[0]);
-    /* Whether the channel the barriers go through has failed for good. */
-    assert(!ExternalHashTableHcFailed(&info) && !ExternalHashTableHcFailed(NULL));
-    hc_failed = true;
-    assert(ExternalHashTableHcFailed(&info));
-    hc_failed = false;
     release_entry(stranger);
     if (wide.spare) ExternalHashTableCumulativeEntryFree(wide.spare);
 }

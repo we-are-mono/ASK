@@ -757,7 +757,7 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 				next_portal_ch_idx = 0;
 			else
 				next_portal_ch_idx++;
-			dpa_fq->wq = DEFA_WQ_ID;
+			dpa_fq->wq = CDX_CPU_RX_WQ;
 			/* set options similar to ethernet driver */
 			memset(&opts, 0, sizeof(struct qm_mcc_initfq));
 			opts.fqd.fq_ctrl = (QM_FQCTRL_PREFERINCACHE | QM_FQCTRL_HOLDACTIVE);

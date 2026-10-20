@@ -813,17 +813,38 @@ An enqueue rejection leaves the HC frame with the caller, restores its CPU
 byte order, and permits another transport attempt. Acceptance and completion
 are separate: the SDK waits up to one second for that command's confirmation.
 
-`HC confirmation timed out; board reset required` means completion is
-unknown. Stop PCD management operations and reboot the board before reusing
-any affected hardware objects. The transport retains an unconfirmed frame,
-rejects further commands, and refuses buffer replacement, teardown, or a
-switch to direct register programming. A late confirmation releases the
-frame only; it does not reconcile caller software state or reopen transport.
-FMan sysfs bind/unbind is disabled because this built-in driver has no proven
-DMA drain/reset path and its remove callback cannot veto devres cleanup.
-Failed scheme modification preserves the previous software state; failed
-creation leaves the scheme invalid. This does not establish hardware
-rollback after an HC timeout; the board-reset requirement still applies.
+`HC confirmation timed out; commands wait for its answer` means completion
+is unknown: the command may still run. The line ends with where its frame
+was: `command 1` -- the HC port never took it; `answer 1` -- answered, but
+the first CPU's portal did not dequeue it, and the channel's `wq0-7` lengths
+say what it served instead; `its portal holds N unprocessed` with both
+queues empty -- dequeued, but that CPU did not process its portal; all zero
+-- the FMan is still running the command. Until it is answered the transport
+retains its frame, refuses every further command before sending it, and
+refuses buffer replacement, teardown, or a switch to direct register
+programming. The late confirmation (`... after its timeout; commands
+resume`) returns the frame and opens the channel again; nothing waits for a
+reboot. The caller of a timed-out command hears `E_TIMEOUT`, an outcome
+unknown, and puts its own record right once the channel answers: a barrier
+is retried until one completes, and a policer write is made again from the
+owner's record. A datapath restart, which waits with the ports stopped, waits
+a few seconds for that answer before it gives up (A403). The only
+state-changing command issued after boot is the
+policer profile write; KeyGen, classification-plan and CC commands run while
+the PCD is built. FMan sysfs bind/unbind is disabled because this built-in
+driver has no proven DMA drain/reset path and its remove callback cannot veto
+devres cleanup. Failed scheme modification preserves the previous software
+state; failed creation leaves the scheme invalid.
+
+The HC answer and error queues sit at WQ0 of the first CPU's portal channel,
+and nothing else of the image at WQ0 or WQ1 there: CDX's exception and detour
+queues take the Ethernet driver's PCD receive work queue (`CDX_CPU_RX_WQ`).
+QMan serves a channel's WQ0 and WQ1 strictly ahead of the rest, so an answer
+queued below a queue the CPU cannot keep up with would wait as long as that
+queue stays busy (A401). `tools/tests/flowtable_host_command.py` holds such a
+backlog on the portal with CDX's `portal_backlog` knob and stalls the CPU
+outright with `portal_stall`, each with a barrier of its own, while a flow is
+retired under it.
 
 `tools/host_tests/sdk_hc_transport.py` compiles the actual SDK pool,
 enqueue, completion and cleanup helpers together with the Linux QMan wrapper

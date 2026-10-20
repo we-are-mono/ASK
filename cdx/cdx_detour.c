@@ -319,7 +319,7 @@ static int cdx_detour_consumer(struct dpa_fq *dpa_fq, u32 fqid, u16 channel)
 	dpa_fq->fqid = fqid;
 	dpa_fq->fq_type = FQ_TYPE_RX_PCD;
 	dpa_fq->channel = channel;
-	dpa_fq->wq = DEFA_WQ_ID;
+	dpa_fq->wq = CDX_CPU_RX_WQ;
 	fq->cb.dqrr = cdx_detour_rx;
 	rc = qman_create_fq(fqid, 0, fq);
 	if (rc)
@@ -327,7 +327,7 @@ static int cdx_detour_consumer(struct dpa_fq *dpa_fq, u32 fqid, u16 channel)
 	opts.fqid = fqid;
 	opts.count = 1;
 	opts.fqd.dest.channel = channel;
-	opts.fqd.dest.wq = DEFA_WQ_ID;
+	opts.fqd.dest.wq = CDX_CPU_RX_WQ;
 	opts.fqd.fq_ctrl = QM_FQCTRL_PREFERINCACHE | QM_FQCTRL_HOLDACTIVE | QM_FQCTRL_TDE;
 	qm_fqd_taildrop_set(&opts.fqd.td, CDX_DETOUR_TAILDROP, 1);
 	opts.we_mask = QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL | QM_INITFQ_WE_TDTHRESH;
@@ -536,6 +536,20 @@ u32 cdx_detour_portid(void)
 {
 	return cdx_detour.portid;
 }
+
+#ifdef CDX_DEBUG_FLOWTABLE
+/* Where the exception queue lives, the one queue cdx pins to the first CPU:
+ * its channel and work queue, for a test to load that portal as its traffic
+ * would (cdx_portal_faults.c). */
+int cdx_detour_exception_placement(u16 *channel, u8 *wq)
+{
+	if (!smp_load_acquire(&cdx_detour.ready))
+		return -ENODEV;
+	*channel = cdx_detour.exception.channel;
+	*wq = cdx_detour.exception.wq;
+	return 0;
+}
+#endif
 
 void cdx_detour_counters(struct cdx_detour_counters *counters)
 {

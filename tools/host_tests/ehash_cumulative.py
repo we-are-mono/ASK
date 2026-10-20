@@ -48,8 +48,7 @@ def test_ehash_cumulative(tmp_path):
             "ehash_park_node", "ehash_barrier", "ehash_unpark_table", "ExternalHashTableAddKey",
             "ExternalHashTableFmPcdHcSync", "ehash_delete_key", "ehash_delete",
             "ExternalHashTableDeleteKey", "ExternalHashTableUnlinkKey", "ExternalHashTableDeleteSync",
-            "ehash_bucket_links", "ExternalHashTableFindEntry",
-            "ExternalHashTableHcFailed")))
+            "ehash_bucket_links", "ExternalHashTableFindEntry")))
     binary = tmp_path / "ehash_cumulative"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wno-unused-function",

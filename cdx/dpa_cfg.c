@@ -85,6 +85,14 @@ static struct dpa_fq *dpa_pcd_fq;
  *        synchronously inside cdx module init, before anything that
  *        reads them can be reached.
  *
+ *   cdx_plcr_mutex (cdx_qos.c, cdx_plcr_lock())
+ *      - Serializes the policer profiles' records (expt_rate_limit_info,
+ *        ingress_policer_info) with every runtime write and counter read
+ *        of them: the cdx_ingress_* and cdx_expt_rate_* accessors run
+ *        under it, taken by their tc and devlink callers and by the work
+ *        that rewrites a profile whose write did not land. The flowtable's
+ *        read of policer_on (cdx_get_policer_profile_id()) stays lock-free.
+ *
  * Contexts:
  *   dpa_cfg_install()                - process, cdx module init.
  *   display_dpa_cfg(), release_cfg_info()
@@ -364,11 +372,11 @@ bool cdx_expt_rate_is_packet_mode(uint32_t fm_index)
 	return (fman_info + fm_index)->expt_ratelim_mode != EXPT_PKT_LIM_PLCR_MODE_BYTE;
 }
 
-/* What the punt profile of one exception type was programmed with: a limit and
- * the burst every type shares, in whichever unit expt_ratelim_mode says. Only a
- * profile that exists answers -- a type configured DISABLE_EXPT_PROFILE was
- * never created -- so a caller reporting it never reports a meter that is not
- * there. */
+/* What the punt profile of one exception type is programmed with: its record's
+ * limit and burst, in whichever unit expt_ratelim_mode says. Only a profile
+ * that exists answers -- a type configured DISABLE_EXPT_PROFILE was never
+ * created -- so a caller reporting it never reports a meter that is not
+ * there. Under the policer lock, as every read of a record is. */
 int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,
 			 uint32_t *burst)
 {
@@ -380,46 +388,47 @@ int cdx_expt_rate_config(uint32_t fm_index, uint32_t type, uint32_t *limit,
 	if (!finfo->expt_rate_limit_info[type].handle)
 		return FAILURE;
 	*limit = finfo->expt_rate_limit_info[type].limit;
-	*burst = finfo->expt_ratelim_burst_size;
+	*burst = finfo->expt_rate_limit_info[type].burst;
 	return SUCCESS;
 }
 
-/* The colours the punt profile counted. Read without clearing, as everywhere
- * else. */
+/* The colours the punt profile counted, and under which write of it. Read
+ * without clearing, as everywhere else; a read that fails is FAILURE with *out
+ * untouched. */
 int cdx_expt_rate_counters(uint32_t fm_index, uint32_t type,
 			   struct cdx_police_counters *out)
 {
-	struct cdx_fman_info *finfo;
+	struct cdx_expt_ratelimit_info *info;
 
 	if (fm_index >= num_fmans || type >= CDX_EXPT_MAX_EXPT_LIMIT_TYPES)
 		return FAILURE;
-	finfo = (fman_info + fm_index);
-	if (!finfo->expt_rate_limit_info[type].handle)
+	info = &(fman_info + fm_index)->expt_rate_limit_info[type];
+	if (!info->handle || cdx_plcr_colours(info->handle, out) != SUCCESS)
 		return FAILURE;
-	cdx_plcr_colours(finfo->expt_rate_limit_info[type].handle, out);
+	out->writes = info->sync.writes;
 	return SUCCESS;
 }
 
+/* One exception type's rate and burst, from its owner. Both go into the record
+ * together and the profile is written whole from it, so a write that does not
+ * land leaves neither half of the request behind the other: the reconcile work
+ * writes the same pair again until it does (cdx_plcr_commit()). SUCCESS or
+ * CDX_PLCR_DEFERRED once recorded; FAILURE, with nothing recorded, for a type
+ * with no profile or a limit that is not a rate. */
 int cdx_set_expt_rate(uint32_t fm_index, uint32_t type, uint32_t limit, uint32_t burst_size)
 {
-	struct cdx_fman_info *finfo;
-	uint32_t old_limit;
+	struct cdx_expt_ratelimit_info *info;
 
-	if (fm_index >= num_fmans)
-		return -1;
-	if (type >= CDX_EXPT_MAX_EXPT_LIMIT_TYPES)
-		return -1;
-	finfo = (fman_info + fm_index);
-	if (!finfo->expt_rate_limit_info[type].handle)
-		return -1;
-	old_limit = finfo->expt_rate_limit_info[type].limit;
-	finfo->expt_rate_limit_info[type].limit = limit;
-	finfo->expt_ratelim_burst_size = burst_size;
-	if (cdxdrv_modify_missaction_policer_profile(finfo, type)) {
-		finfo->expt_rate_limit_info[type].limit = old_limit;
-		return -1;
-	}
-	return 0;
+	if (fm_index >= num_fmans || type >= CDX_EXPT_MAX_EXPT_LIMIT_TYPES)
+		return FAILURE;
+	info = &(fman_info + fm_index)->expt_rate_limit_info[type];
+	/* DISABLE_EXPT_PROFILE says a type has no profile, not how fast it
+	 * runs. */
+	if (!info->handle || limit == DISABLE_EXPT_PROFILE)
+		return FAILURE;
+	info->limit = limit;
+	info->burst = burst_size;
+	return cdxdrv_modify_missaction_policer_profile(fman_info + fm_index, type);
 }
 
 
@@ -764,6 +773,8 @@ static int dpa_rollback_resources(void)
 	/* First, while every profile it programs and counts still exists: its
 	 * callbacks reach them through handles released further down. */
 	cdx_devlink_detach();
+	/* And the work that rewrites them, for the same reason. */
+	cdx_plcr_reconcile_stop();
 	dpa_release_pcd_fqs();
 	for (ii = 0; ii < MAX_PHY_PORTS; ii++) {
 		if (phy_port[ii].flags) {
@@ -1142,6 +1153,10 @@ void dpa_cfg_deinit(void)
 	/* Before the lock its reader takes: removal waits for readers. */
 	proc_remove(dpa_cfg_schemes_proc);
 	dpa_cfg_schemes_proc = NULL;
+	/* Whether the profiles are released below or, the ports refusing to
+	 * quiesce, left for good, nothing may rewrite them once the module is
+	 * going; their owners, tc and devlink, have already let go of them. */
+	cdx_plcr_reconcile_stop();
 	cdx_ctrl_lock_with_rtnl();
 	if (dpa_cfg_quiesce()) {
 		pr_err("cdx: cannot quiesce DPA resources; reboot required\n");
@@ -1720,23 +1735,23 @@ int cdx_ingress_policer_peak(uint32_t fm_index, uint32_t queue_no,
 	return SUCCESS;
 }
 
-/* The colours one ingress profile counted. Read without clearing, so every
- * other reader's baseline stays where it was; a caller wanting deltas keeps
- * its own. */
+/* The colours one ingress profile counted, and under which write of it. Read
+ * without clearing, so every other reader's baseline stays where it was; a
+ * caller wanting deltas keeps its own (cdx_police_advance()). A read that
+ * fails is FAILURE with *out untouched. */
 int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
 				 struct cdx_police_counters *out)
 {
-	struct cdx_fman_info *finfo;
+	struct cdx_ingress_policer_info *info;
 
 	if (fm_index >= num_fmans || queue_no >= INGRESS_ALL_POLICER_QUEUES)
 		return FAILURE;
 
-	finfo = (fman_info + fm_index);
+	info = &(fman_info + fm_index)->ingress_policer_info[queue_no];
 
-	if (!finfo->ingress_policer_info[queue_no].handle)
+	if (!info->handle || cdx_plcr_colours(info->handle, out) != SUCCESS)
 		return FAILURE;
-
-	cdx_plcr_colours(finfo->ingress_policer_info[queue_no].handle, out);
+	out->writes = info->sync.writes;
 	return SUCCESS;
 }
 #endif

@@ -184,8 +184,9 @@ static void setup(bool use_hc)
 static void cleanup(void)
 {
     assert(!hc.nextSeqNumLocation && !irq_depth);
-    /* Fixture reset after confirmation only; production requires board reset. */
-    hc.failed = false; reject_command = omit_confirmation = check_live = reenter = false;
+    /* Every command answered: nothing left for the next case to wait on. */
+    assert(!HcUnanswered(&hc));
+    reject_command = omit_confirmation = check_live = reenter = false;
     if (SCHEME->valid) { SCHEME->owners = 0; assert(FM_PCD_KgSchemeDelete(SCHEME) == E_OK); }
     assert(!SCHEME->p_Lock && LIST_IsEmpty(&pcd.acquiredLocksLst));
     assert(pcd.netEnvs[0].owners == 1 && pcd.netEnvs[1].owners == 1);
@@ -218,7 +219,7 @@ static void failed_creation(bool use_hc)
         reject_command = fault == 3;
         assert(!FM_PCD_KgSchemeSet(&pcd, &p));
         assert(!SCHEME->valid && !SCHEME->p_Lock && LIST_IsEmpty(&pcd.acquiredLocksLst));
-        assert(pcd.netEnvs[0].owners == 1 && !hc.nextSeqNumLocation && !hc.failed);
+        assert(pcd.netEnvs[0].owners == 1 && !hc.nextSeqNumLocation && !HcUnanswered(&hc));
         /* Reassign the failed acquisition to someone else. A stale scheme
          * must not unlock or release that lock on a later delete or retry. */
         t_FmPcdLock *other = FmPcdAcquireLock(&pcd);
@@ -284,18 +285,24 @@ static void ambiguous_timeout(bool modify)
     p = parameters(1, modify);
     omit_confirmation = true;
     assert(!FM_PCD_KgSchemeSet(&pcd, &p));
-    assert(hc.failed && hc.nextSeqNumLocation == 1);
+    assert(HcUnanswered(&hc) && hc.nextSeqNumLocation == 1);
     if (modify) assert(!memcmp(SCHEME, &original, sizeof(original)));
     else assert(!SCHEME->valid && !SCHEME->p_Lock);
     /* Hardware may have applied the candidate even though software did not
-     * publish it. Retries must never program over that uncertain result. */
+     * publish it. Until the answer, no retry may program over that uncertain
+     * result, nor may programming switch to direct: nothing is sent. */
     assert(hardware.kgse_mv == pcd.netEnvs[1].unitsVectors[0]);
     unsigned sent = qman_calls;
     assert(FmAllowHcUsage(&hc, false) != E_OK);
     assert(!FM_PCD_KgSchemeSet(&pcd, &p) && qman_calls == sent);
     FmHcTxConf(&hc, &pending);
-    assert(!hc.nextSeqNumLocation && hc.failed);
-    assert(!FM_PCD_KgSchemeSet(&pcd, &p) && qman_calls == sent);
+    /* The answer opens the channel again, and the owner's retry puts the
+     * candidate in place for good: what software publishes is what the
+     * hardware has once more. */
+    assert(!hc.nextSeqNumLocation && !HcUnanswered(&hc));
+    omit_confirmation = false;
+    assert(FM_PCD_KgSchemeSet(&pcd, &p) == SCHEME && qman_calls > sent);
+    assert(SCHEME->valid && hardware.kgse_mv == pcd.netEnvs[1].unitsVectors[0]);
     cleanup();
 }
 int main(void)

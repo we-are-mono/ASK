@@ -15,7 +15,10 @@
 #define PORTID_SHIFT_VAL 8
 #define NR_CPUS 4
 #define FQ_TYPE_RX_PCD 1
-#define DEFA_WQ_ID 1
+/* The exception queues share a CPU's channel with the FMan host-command
+ * answer: below WQ0 and WQ1, which QMan serves strictly ahead of the rest,
+ * or a stream the CPU cannot keep up with holds that answer back (A401). */
+_Static_assert(CDX_CPU_RX_WQ > 1 && CDX_CPU_RX_WQ <= 7, "a CPU queue in the strict tier");
 #define NUM_PKT_DATA_LINES_IN_CACHE 2
 #define NUM_ANN_LINES_IN_CACHE 1
 #define PCD_DIR 1

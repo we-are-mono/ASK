@@ -33,4 +33,5 @@ cdx-y += cdx_main.o cdx_hal.o cdx_timer.o layer2.o \
 	cdx_flowtable_backend.o cdx_flowtable_hw.o \
 	cdx_ipsec_backend.o cdx_wifi_backend.o \
 	cdx_htb.o cdx_police.o cdx_dscp.o cdx_devlink.o \
-	cdx_pcd_desc.o cdx_pcd_ports.o cdx_pcd.o cdx_detour.o
+	cdx_pcd_desc.o cdx_pcd_ports.o cdx_pcd.o cdx_detour.o \
+	cdx_portal_faults.o

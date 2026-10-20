@@ -908,8 +908,7 @@ void cdx_ft_hw_quiesced(void)
 }
 
 /* Nothing can prove the classifier done with the retired entries: a port CDX
- * did not configure still reaches it, or the host-command channel every
- * barrier goes through has failed. Each entry stays allocated, and so do the
+ * did not configure still reaches it. Each entry stays allocated, and so do the
  * statistics records and policer its opcodes name, for the reset that alone
  * settles them. It is recorded as possibly linked (cdx_ehash_abandon()), so
  * an unload that can prove it gone still frees it; only the backend's own

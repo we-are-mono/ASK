@@ -23,6 +23,8 @@
 #include <net/if_inet6.h>
 #include <uapi/linux/in6.h> 
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/workqueue.h>
 #include <linux/if_arp.h>
 #include <linux/io.h>
 #include "lnxwrp_fm.h"
@@ -60,13 +62,22 @@ static_assert(CDX_FT_QOS_MAX_POLICER == INGRESS_FLOW_POLICER_QUEUES - 1,
 
 //#define QOS_DEBUG	1
 
-//per port fast forward policer information and defaults
+/* A port's fast-forward profile, and its record: what the profile's owner --
+ * the rate the port boots with, or a tc matchall police action -- last asked
+ * for, which every write of it is built from (port_plcr_params()). The bursts
+ * are the ones written, a port's default already resolved from its speed.
+ * Under cdx_plcr_mutex. */
 struct port_ff_rate_lim_info {
 	void *handle;
 	t_Handle h_FmPcd;
 	t_Handle port_handle;
+	uint32_t rate_mode;
 	uint32_t cir_value;
 	uint32_t pir_value;
+	uint32_t cbs;
+	uint32_t pbs;
+	bool tc_meter;
+	struct cdx_plcr_sync sync;
 };
 
 #define MAX_PHYS_PORTS			64              /*dpaa limit*/
@@ -111,19 +122,113 @@ struct port_ff_rate_lim_info {
 uint32_t port_ff_lim_mode = e_FM_PCD_PLCR_PACKET_MODE;
 struct port_ff_rate_lim_info port_rate_lim_mode[MAX_PHYS_PORTS];
 
-/* api to modify shared policer parameters for exception traffic to control plane */
+/* ---- keeping each profile to its record ---------------------------------
+ *
+ * After boot the only policer writes are the runtime ones: a port's
+ * fast-forward profile (tc matchall), the seven per-flow profiles (tc flower),
+ * and the SEC and punt profiles (devlink). Each is one host command carrying
+ * the whole profile, and it can fail: refused unsent while the host command
+ * channel is shut after a timeout, or timed out itself, FMan having applied
+ * it or not. So every runtime profile keeps a record of what its owner asked
+ * for, the owner's request goes into the record whether or not the write
+ * lands, and a write that does not land leaves the profile dirty for the
+ * reconcile work to write again, about once a second, until it does.
+ *
+ * Writing the whole profile again is what makes that safe. The host command
+ * port takes commands in order, and the channel reopens only once a timed-out
+ * command's late confirmation has arrived, so a rewrite always lands after
+ * whatever became of the write before it, and leaves the profile exactly as
+ * its record says.
+ *
+ * cdx_plcr_mutex serializes every runtime write, every counter read and the
+ * records. The tc callbacks (under RTNL) and the devlink ones (under the
+ * instance lock) take it around each verb, a port's profile takes it coming
+ * and going (under the control mutex), and the reconcile work takes it alone.
+ * Nothing holding it waits for any of those, so it is always the inner lock,
+ * with only cdx_police_lock inside it. The host command busy-waits, which is
+ * why this is a mutex and none of it is ever done under a spinlock. */
+static DEFINE_MUTEX(cdx_plcr_mutex);
+static void cdx_plcr_reconcile_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(cdx_plcr_reconcile, cdx_plcr_reconcile_work);
+/* Set once the profiles are about to be released, and never cleared: nothing
+ * queues the reconcile work after it. Under cdx_plcr_mutex. */
+static bool cdx_plcr_stopped;
+/* How soon a write that did not land is tried again. */
+#define CDX_PLCR_RETRY_MS	1000
+
+void cdx_plcr_lock(void)
+{
+	mutex_lock(&cdx_plcr_mutex);
+}
+
+void cdx_plcr_unlock(void)
+{
+	mutex_unlock(&cdx_plcr_mutex);
+}
+
+/* Write one profile whole and keep its record's account of whether the
+ * hardware runs it: SUCCESS when the write landed, CDX_PLCR_DEFERRED with the
+ * reconcile work queued when it did not. The log hears only of a profile
+ * falling behind its record and of it catching up, under the names `what'
+ * and `n'. */
+static int cdx_plcr_commit(t_Handle h_FmPcd, t_FmPcdPlcrProfileParams *params,
+			   struct cdx_plcr_sync *sync, const char *what,
+			   unsigned int n)
+{
+	lockdep_assert_held(&cdx_plcr_mutex);
+	if (FM_PCD_PlcrProfileSet(h_FmPcd, params)) {
+		if (sync->dirty)
+			pr_info("cdx: %s policer %u: rewrite confirmed, the profile runs its record\n",
+				what, n);
+		sync->dirty = false;
+		sync->writes++;
+		return SUCCESS;
+	}
+	if (!sync->dirty)
+		pr_warn("cdx: %s policer %u: write not confirmed, rewriting it until it is\n",
+			what, n);
+	sync->dirty = true;
+	if (!cdx_plcr_stopped)
+		queue_delayed_work(system_wq, &cdx_plcr_reconcile,
+				   msecs_to_jiffies(CDX_PLCR_RETRY_MS));
+	return CDX_PLCR_DEFERRED;
+}
+
+/* The rate a port boots with, and returns to when its tc filter goes. The
+ * firmware sets the link mode (100M, 2.5G, ...), not just 1G or 10G. A default
+ * above the link's rate never binds, so a slower link takes the 1G defaults
+ * and a faster one the 10G defaults. */
+static void port_plcr_boot(struct port_ff_rate_lim_info *info,
+			   const struct dpa_iface_info *iface_info)
+{
+	bool slow = iface_info->eth_info.speed <= PORT_1G_SPEED;
+
+	info->rate_mode = port_ff_lim_mode;
+	info->cir_value = slow ? DEFAULT_PORT_FF_CIR_VALUE_1G : DEFAULT_PORT_FF_CIR_VALUE_10G;
+	info->pir_value = slow ? DEFAULT_PORT_FF_PIR_VALUE_1G : DEFAULT_PORT_FF_PIR_VALUE_10G;
+	info->cbs = slow ? DEFAULT_1G_PORT_FF_CBS : DEFAULT_10G_PORT_FF_CBS;
+	info->pbs = slow ? DEFAULT_1G_PORT_FF_PBS : DEFAULT_10G_PORT_FF_PBS;
+	info->tc_meter = false;
+}
+
+static void port_plcr_params(const struct port_ff_rate_lim_info *info,
+			     t_FmPcdPlcrProfileParams *params);
+
+/* api to modify shared policer parameters for exception traffic to control plane.
+ * Writes one exception type's profile whole, from its record. */
 int cdxdrv_modify_missaction_policer_profile(struct cdx_fman_info *finfo, uint32_t type)
 {
-	void *handle;
+	struct cdx_expt_ratelimit_info *info;
 	t_FmPcdPlcrProfileParams Params;
 
 	if (type >= CDX_EXPT_MAX_EXPT_LIMIT_TYPES)
 		return FAILURE;
-	if (finfo->expt_rate_limit_info[type].limit == DISABLE_EXPT_PROFILE) 
+	info = &finfo->expt_rate_limit_info[type];
+	if (!info->handle || info->limit == DISABLE_EXPT_PROFILE)
 		return FAILURE;
 	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
 	Params.modify = 1;
-	Params.id.h_Profile = finfo->expt_rate_limit_info[type].handle;
+	Params.id.h_Profile = info->handle;
 	Params.algSelection = e_FM_PCD_PLCR_RFC_2698;
 	Params.colorMode = e_FM_PCD_PLCR_COLOR_BLIND;
 	//color as red by default
@@ -133,36 +238,26 @@ int cdxdrv_modify_missaction_policer_profile(struct cdx_fman_info *finfo, uint32
 	//set algorithm mode as bytes/sec
 	if (finfo->expt_ratelim_mode == EXPT_PKT_LIM_PLCR_MODE_BYTE) {
 		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_BYTE_MODE;
-		Params.nonPassthroughAlgParams.committedInfoRate = finfo->expt_rate_limit_info[type].limit;
-		Params.nonPassthroughAlgParams.committedBurstSize = finfo->expt_ratelim_burst_size;
-		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = finfo->expt_rate_limit_info[type].limit;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = finfo->expt_ratelim_burst_size;
+		Params.nonPassthroughAlgParams.committedInfoRate = info->limit;
+		Params.nonPassthroughAlgParams.committedBurstSize = info->burst;
+		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = info->limit;
+		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = info->burst;
 		Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection = e_FM_PCD_PLCR_FULL_FRM_LEN;
 		Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection = e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
 	} else {
 		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_PACKET_MODE;
-		Params.nonPassthroughAlgParams.committedInfoRate = finfo->expt_rate_limit_info[type].limit;
-		Params.nonPassthroughAlgParams.committedBurstSize = finfo->expt_ratelim_burst_size;
-		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = finfo->expt_rate_limit_info[type].limit;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = finfo->expt_ratelim_burst_size;
-	} 
+		Params.nonPassthroughAlgParams.committedInfoRate = info->limit;
+		Params.nonPassthroughAlgParams.committedBurstSize = info->burst;
+		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = info->limit;
+		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = info->burst;
+	}
 	Params.nextEngineOnGreen = e_FM_PCD_DONE;
 	Params.paramsOnGreen.action = e_FM_PCD_ENQ_FRAME;
 	Params.nextEngineOnYellow = e_FM_PCD_DONE;
 	Params.paramsOnYellow.action = e_FM_PCD_ENQ_FRAME;
 	Params.nextEngineOnRed = e_FM_PCD_DONE;
 	Params.paramsOnRed.action = e_FM_PCD_DROP_FRAME;
-	handle = FM_PCD_PlcrProfileSet(finfo->pcd_handle, &Params);
-	if (!handle) {
-		printk("%s::unable to modify profile for type %d\n",
-				__func__, type);
-		return FAILURE;
-	}	
-#ifdef QOS_DEBUG
-	printk("%s::plcr profile modified for type %d, mode %d, handle %p\n",
-			__func__, type, finfo->expt_ratelim_mode, handle);
-#endif
-	return SUCCESS;
+	return cdx_plcr_commit(finfo->pcd_handle, &Params, &info->sync, "exception", type);
 }
 
 /* api to add shared policer profile for exception traffic to control plane */
@@ -176,6 +271,9 @@ int cdxdrv_create_missaction_policer_profiles(struct cdx_fman_info *finfo)
 	h_FmPcd = finfo->pcd_handle;
 	for (ii = 0 ; ii < CDX_EXPT_MAX_EXPT_LIMIT_TYPES; ii++) {
 
+		/* Every type's record starts from the burst they are all
+		 * created with, and keeps its own from then on. */
+		finfo->expt_rate_limit_info[ii].burst = finfo->expt_ratelim_burst_size;
 		if (finfo->expt_rate_limit_info[ii].limit == DISABLE_EXPT_PROFILE)  {
 			finfo->expt_rate_limit_info[ii].handle = NULL;
 			continue;
@@ -193,18 +291,18 @@ int cdxdrv_create_missaction_policer_profiles(struct cdx_fman_info *finfo)
 		if (finfo->expt_ratelim_mode == EXPT_PKT_LIM_PLCR_MODE_BYTE) {
 			Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_BYTE_MODE;
 			Params.nonPassthroughAlgParams.committedInfoRate = finfo->expt_rate_limit_info[ii].limit;
-			Params.nonPassthroughAlgParams.committedBurstSize = finfo->expt_ratelim_burst_size;
+			Params.nonPassthroughAlgParams.committedBurstSize = finfo->expt_rate_limit_info[ii].burst;
 			Params.nonPassthroughAlgParams.peakOrExcessInfoRate = finfo->expt_rate_limit_info[ii].limit;
-			Params.nonPassthroughAlgParams.peakOrExcessBurstSize = finfo->expt_ratelim_burst_size;
+			Params.nonPassthroughAlgParams.peakOrExcessBurstSize = finfo->expt_rate_limit_info[ii].burst;
 			Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection = e_FM_PCD_PLCR_FULL_FRM_LEN;
 			Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection = e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
 		} else {
 			Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_PACKET_MODE;
 			Params.nonPassthroughAlgParams.committedInfoRate = finfo->expt_rate_limit_info[ii].limit;
-			Params.nonPassthroughAlgParams.committedBurstSize = finfo->expt_ratelim_burst_size;
+			Params.nonPassthroughAlgParams.committedBurstSize = finfo->expt_rate_limit_info[ii].burst;
 			Params.nonPassthroughAlgParams.peakOrExcessInfoRate = finfo->expt_rate_limit_info[ii].limit;
-			Params.nonPassthroughAlgParams.peakOrExcessBurstSize = finfo->expt_ratelim_burst_size;
-		} 
+			Params.nonPassthroughAlgParams.peakOrExcessBurstSize = finfo->expt_rate_limit_info[ii].burst;
+		}
 		Params.nextEngineOnGreen = e_FM_PCD_DONE;
 		Params.paramsOnGreen.action = e_FM_PCD_ENQ_FRAME;
 		Params.nextEngineOnYellow = e_FM_PCD_DONE;
@@ -236,10 +334,11 @@ int cdxdrv_create_missaction_policer_profiles(struct cdx_fman_info *finfo)
 static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 		uint8_t hardwarePortId, void *port_handle, t_Handle h_FmPcd)
 {
+	struct port_ff_rate_lim_info *info;
 	void *handle;
 	void *profhandle;
 	t_FmPcdPlcrProfileParams Params;
-	uint32_t uiPeakBurstSize, uiCommitedBurstSize;
+	int rc = FAILURE;
 
 	//init default cir and pir values for port
 	if (!(iface_info->if_flags & IF_TYPE_ETHERNET)) {
@@ -247,21 +346,9 @@ static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 				__func__, __LINE__, iface_info->name, iface_info->if_flags);
 		return FAILURE;
 	}
-
-	/* The firmware sets the link mode (100M, 2.5G, ...), not just 1G or 10G.
-	 * A default above the link's rate never binds, so a slower link takes
-	 * the 1G defaults and a faster one the 10G defaults. */
-	if (iface_info->eth_info.speed <= PORT_1G_SPEED) {
-		port_rate_lim_mode[hardwarePortId].cir_value = DEFAULT_PORT_FF_CIR_VALUE_1G;
-		port_rate_lim_mode[hardwarePortId].pir_value = DEFAULT_PORT_FF_PIR_VALUE_1G;
-		uiPeakBurstSize = DEFAULT_1G_PORT_FF_PBS;
-		uiCommitedBurstSize = DEFAULT_1G_PORT_FF_CBS;
-	} else {
-		port_rate_lim_mode[hardwarePortId].cir_value = DEFAULT_PORT_FF_CIR_VALUE_10G;
-		port_rate_lim_mode[hardwarePortId].pir_value = DEFAULT_PORT_FF_PIR_VALUE_10G;
-		uiPeakBurstSize = DEFAULT_10G_PORT_FF_PBS;
-		uiCommitedBurstSize = DEFAULT_10G_PORT_FF_CBS;
-	}
+	if (hardwarePortId >= MAX_PHYS_PORTS)
+		return FAILURE;
+	info = &port_rate_lim_mode[hardwarePortId];
 
 	profhandle = fm_port_get_handle(port_handle);
 #ifdef QOS_DEBUG
@@ -273,48 +360,39 @@ static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 				__func__, iface_info->name);
 		return FAILURE;
 	}
-	port_rate_lim_mode[hardwarePortId].port_handle = profhandle;
+	/* The record is the reconcile work's to read as soon as the profile
+	 * has a handle, so it is filled under the same lock. */
+	mutex_lock(&cdx_plcr_mutex);
+	info->port_handle = profhandle;
 	if (cdx_dpa_init_fault())
-		return FAILURE;
+		goto out;
+	port_plcr_boot(info, iface_info);
 	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
 	Params.id.newParams.profileType = e_FM_PCD_PLCR_PORT_PRIVATE;
 	Params.id.newParams.h_FmPort = profhandle;
 	Params.id.newParams.relativeProfileId = 0;
-	Params.algSelection = e_FM_PCD_PLCR_RFC_2698;
-	Params.colorMode = e_FM_PCD_PLCR_COLOR_BLIND;
-	//color as red by default
-	Params.color.dfltColor = e_FM_PCD_PLCR_RED;
-	//override color is RED
-	Params.color.override = e_FM_PCD_PLCR_RED;
-	//set algorithma mode 
-	Params.nonPassthroughAlgParams.rateMode = port_ff_lim_mode;
-
-
-	Params.nonPassthroughAlgParams.committedInfoRate = port_rate_lim_mode[hardwarePortId].cir_value;
-	Params.nonPassthroughAlgParams.peakOrExcessInfoRate = port_rate_lim_mode[hardwarePortId].pir_value;
-	Params.nonPassthroughAlgParams.committedBurstSize = uiCommitedBurstSize;
-	Params.nonPassthroughAlgParams.peakOrExcessBurstSize = uiPeakBurstSize;
-	Params.nextEngineOnGreen = e_FM_PCD_PRS;
-	Params.paramsOnGreen.action = e_FM_PCD_ENQ_FRAME;
-	Params.nextEngineOnYellow = e_FM_PCD_PRS;
-	Params.paramsOnYellow.action = e_FM_PCD_ENQ_FRAME;
-	Params.nextEngineOnRed = e_FM_PCD_DONE;
-	Params.paramsOnRed.action = e_FM_PCD_DROP_FRAME;
+	/* Built as every later write of it is, so a rewrite of the boot rate
+	 * is the profile as it was created. */
+	port_plcr_params(info, &Params);
 	handle = FM_PCD_PlcrProfileSet(h_FmPcd, &Params);
 	if (!handle) {
 		DPA_ERROR("%s::unable to profile set for port %s\n",
 				__func__, iface_info->name);
-		return FAILURE;
+		goto out;
 	}
-	port_rate_lim_mode[hardwarePortId].handle = handle;
-	port_rate_lim_mode[hardwarePortId].h_FmPcd = h_FmPcd;
+	info->handle = handle;
+	info->h_FmPcd = h_FmPcd;
+	memset(&info->sync, 0, sizeof(info->sync));
+	rc = SUCCESS;
 #ifdef QOS_DEBUG
 	printk("%s::plcr profile for dev %s handle %p\n",
 			__func__, iface_info->name, handle);
 #endif
 	//change fmbm_rfne value to policer
 	//FM_PORT_SetBmiNia(profhandle, 0x4c0000);
-	return SUCCESS;
+out:
+	mutex_unlock(&cdx_plcr_mutex);
+	return rc;
 }
 
 //api to add port specific policer profile on offline ports to reserve bandwidth for incoming control packets
@@ -344,22 +422,28 @@ int dpa_add_ethport_ff_policier_profile(struct dpa_iface_info *iface_info)
 
 }
 
-/* Delete the profile before releasing its port's allocation. */
+/* Delete the profile before releasing its port's allocation. Under the lock
+ * the reconcile work rewrites it under, so a retry never writes a profile
+ * that is being deleted -- which would make it valid again -- and finds no
+ * handle once it is gone. */
 void dpa_remove_ethport_ff_policier_profile(struct dpa_iface_info *iface_info)
 {
 	int hardwarePortId = iface_info->eth_info.hardwarePortId;
+	struct port_ff_rate_lim_info *info;
 
 	if (hardwarePortId < 0 || hardwarePortId >= MAX_PHYS_PORTS)
 		return;
-	if (!port_rate_lim_mode[hardwarePortId].handle)
-		return;
-
-	if (FM_PCD_PlcrProfileDelete(port_rate_lim_mode[hardwarePortId].handle) != 0)
-		DPA_ERROR("%s::PlcrProfileDelete failed for %s (port %d)\n",
-				__func__, iface_info->name, hardwarePortId);
-
-	port_rate_lim_mode[hardwarePortId].handle = NULL;
-	port_rate_lim_mode[hardwarePortId].h_FmPcd = NULL;
+	info = &port_rate_lim_mode[hardwarePortId];
+	mutex_lock(&cdx_plcr_mutex);
+	if (info->handle) {
+		if (FM_PCD_PlcrProfileDelete(info->handle) != 0)
+			DPA_ERROR("%s::PlcrProfileDelete failed for %s (port %d)\n",
+					__func__, iface_info->name, hardwarePortId);
+		info->handle = NULL;
+		info->h_FmPcd = NULL;
+		memset(&info->sync, 0, sizeof(info->sync));
+	}
+	mutex_unlock(&cdx_plcr_mutex);
 }
 
 /* Startup rollback calls this after stopping the ports and removing all
@@ -457,6 +541,43 @@ static void cdx_plcr_actions(t_FmPcdPlcrProfileParams *params, e_FmPcdEngine nex
 	params->paramsOnRed.action = e_FM_PCD_DROP_FRAME;
 }
 
+/* Everything of a port's profile but which profile it is, from its record.
+ *
+ * `tc_meter` meters as a tc police action does (cdx_plcr_lengths(),
+ * cdx_plcr_actions()). The boot-time rate meters as NXP's profiles always
+ * have: whole frames, yellow passed, the port held to its peak pair.
+ */
+static void port_plcr_params(const struct port_ff_rate_lim_info *info,
+			     t_FmPcdPlcrProfileParams *params)
+{
+	params->algSelection = e_FM_PCD_PLCR_RFC_2698;
+	params->colorMode = e_FM_PCD_PLCR_COLOR_BLIND;
+	//color as red by default
+	params->color.dfltColor = e_FM_PCD_PLCR_RED;
+	//override color is RED
+	params->color.override = e_FM_PCD_PLCR_RED;
+	params->nonPassthroughAlgParams.rateMode = info->rate_mode;
+	if (info->rate_mode == e_FM_PCD_PLCR_BYTE_MODE)
+		cdx_plcr_lengths(params, info->tc_meter);
+	params->nonPassthroughAlgParams.committedInfoRate = info->cir_value;
+	params->nonPassthroughAlgParams.committedBurstSize = info->cbs;
+	params->nonPassthroughAlgParams.peakOrExcessInfoRate = info->pir_value;
+	params->nonPassthroughAlgParams.peakOrExcessBurstSize = info->pbs;
+	cdx_plcr_actions(params, e_FM_PCD_PRS, e_FM_PCD_ENQ_FRAME, info->tc_meter);
+}
+
+/* A port's profile, written whole from its record. */
+static int port_plcr_write(struct port_ff_rate_lim_info *info, unsigned int port)
+{
+	t_FmPcdPlcrProfileParams Params;
+
+	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
+	Params.modify = 1;
+	Params.id.h_Profile = info->handle;
+	port_plcr_params(info, &Params);
+	return cdx_plcr_commit(info->h_FmPcd, &Params, &info->sync, "port", port);
+}
+
 /* Program a port's ingress rate-limiter profile. The profile is created once at
  * port init; this only pushes parameters into it.
  *
@@ -464,86 +585,64 @@ static void cdx_plcr_actions(t_FmPcdPlcrProfileParams *params, e_FmPcdEngine nex
  * what restoring the boot-time rate does. A tc police action carries its own
  * burst and passes it through.
  *
- * `tc_meter` meters as a tc police action does (cdx_plcr_lengths(),
- * cdx_plcr_actions()). The boot-time rate meters as NXP's profiles always
- * have: whole frames, yellow passed, the port held to its peak pair.
+ * A request this port can run becomes its record, whether or not the write
+ * lands (cdx_plcr_commit()); one it cannot -- no such port, or no profile --
+ * is refused with FAILURE and changes nothing.
  */
 static int port_plcr_set(char *ifname, uint32_t rate_mode,
 			 uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs,
 			 bool tc_meter)
 {
-	void *handle;
+	struct port_ff_rate_lim_info *info;
 	int hardwarePortId;
-	t_FmPcdPlcrProfileParams Params;
 	struct dpa_iface_info *iface_info;
 
-
+	lockdep_assert_held(&cdx_plcr_mutex);
 	iface_info = dpa_get_iface_by_name(ifname);
 	if (!iface_info)
 	{
-		printk("%s()::%d Invalid interface name <%s>\n", 
+		printk("%s()::%d Invalid interface name <%s>\n",
 				__func__, __LINE__, ifname);
-		return FAILURE;	
+		return FAILURE;
 	}
 	if (!(iface_info->if_flags & IF_TYPE_ETHERNET)) {
-		printk("%s()::%d Interface <%s> is not ethernet(0x%x).\n", 
+		printk("%s()::%d Interface <%s> is not ethernet(0x%x).\n",
 				__func__, __LINE__, ifname, iface_info->if_flags);
-		return FAILURE;	
+		return FAILURE;
 	}
 	hardwarePortId = iface_info->eth_info.hardwarePortId;
-	if (hardwarePortId == -1) {
-		return FAILURE;	
-	}
-	if (!port_rate_lim_mode[hardwarePortId].handle) 
-		return FAILURE;	
+	if (hardwarePortId < 0 || hardwarePortId >= MAX_PHYS_PORTS)
+		return FAILURE;
+	info = &port_rate_lim_mode[hardwarePortId];
+	if (!info->handle)
+		return FAILURE;
+	/* RFC 2698 has no committed rate above its peak, and the FMD refuses
+	 * one every time: recorded, it would be retried for ever. */
+	if (cir > pir)
+		return FAILURE;
 
 #ifdef QOS_DEBUG
 	printk("%s::modifying profile for %s::%d cir %d, pir %d\n", __func__,
 			ifname, hardwarePortId, cir, pir);
 #endif
-	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
-	Params.modify = 1;
-	Params.id.h_Profile = port_rate_lim_mode[hardwarePortId].handle;
-	Params.algSelection = e_FM_PCD_PLCR_RFC_2698;
-	Params.colorMode = e_FM_PCD_PLCR_COLOR_BLIND;
-	//color as red by default
-	Params.color.dfltColor = e_FM_PCD_PLCR_RED;
-	//override color is RED
-	Params.color.override = e_FM_PCD_PLCR_RED;
-	Params.nonPassthroughAlgParams.rateMode = rate_mode;
-	if (rate_mode == e_FM_PCD_PLCR_BYTE_MODE)
-		cdx_plcr_lengths(&Params, tc_meter);
+	info->rate_mode = rate_mode;
+	info->cir_value = cir;
+	info->pir_value = pir;
 	if (iface_info->eth_info.speed <= PORT_1G_SPEED) {
-		Params.nonPassthroughAlgParams.committedBurstSize = cbs ? cbs : DEFAULT_1G_PORT_FF_CBS;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs ? pbs : DEFAULT_1G_PORT_FF_PBS;
+		info->cbs = cbs ? cbs : DEFAULT_1G_PORT_FF_CBS;
+		info->pbs = pbs ? pbs : DEFAULT_1G_PORT_FF_PBS;
 	} else {
-		Params.nonPassthroughAlgParams.committedBurstSize = cbs ? cbs : DEFAULT_10G_PORT_FF_CBS;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs ? pbs : DEFAULT_10G_PORT_FF_PBS;
+		info->cbs = cbs ? cbs : DEFAULT_10G_PORT_FF_CBS;
+		info->pbs = pbs ? pbs : DEFAULT_10G_PORT_FF_PBS;
 	}
-
-	{
-		Params.nonPassthroughAlgParams.committedInfoRate = cir;
-		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = pir;
-	}
-	cdx_plcr_actions(&Params, e_FM_PCD_PRS, e_FM_PCD_ENQ_FRAME, tc_meter);
-	handle = FM_PCD_PlcrProfileSet(port_rate_lim_mode[hardwarePortId].h_FmPcd, &Params);
-	if (!handle) {
-		printk("%s::unable to modify profile for port %d\n",
-				__func__, hardwarePortId);
-		return FAILURE;
-	}
-	port_rate_lim_mode[hardwarePortId].cir_value = cir;
-	port_rate_lim_mode[hardwarePortId].pir_value = pir;
-#ifdef QOS_DEBUG
-	printk("%s::port %d cir value %d, pir value %d\n",
-			__func__, hardwarePortId, cir, pir);
-#endif
-	return SUCCESS;
+	info->tc_meter = tc_meter;
+	return port_plcr_write(info, hardwarePortId);
 }
 
 /* A tc `matchall action police` on a port's ingress. The caller has already
  * converted the action's rates into this profile's unit; byte mode is Kbit/s,
- * packet mode is packets per second. */
+ * packet mode is packets per second. SUCCESS, CDX_PLCR_DEFERRED or a refusal,
+ * as port_plcr_set() says. */
 int cdx_port_police_set(char *ifname, bool byte_mode,
 			uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs)
 {
@@ -557,46 +656,90 @@ int cdx_port_police_set(char *ifname, bool byte_mode,
 int cdx_port_police_clear(char *ifname)
 {
 	struct dpa_iface_info *iface_info = dpa_get_iface_by_name(ifname);
-	uint32_t cir, pir;
+	struct port_ff_rate_lim_info boot;
 
 	if (!iface_info || !(iface_info->if_flags & IF_TYPE_ETHERNET))
 		return FAILURE;
-	if (iface_info->eth_info.speed <= PORT_1G_SPEED) {
-		cir = DEFAULT_PORT_FF_CIR_VALUE_1G;
-		pir = DEFAULT_PORT_FF_PIR_VALUE_1G;
-	} else {
-		cir = DEFAULT_PORT_FF_CIR_VALUE_10G;
-		pir = DEFAULT_PORT_FF_PIR_VALUE_10G;
-	}
-	return port_plcr_set(ifname, port_ff_lim_mode, cir, pir, 0, 0, false);
+	port_plcr_boot(&boot, iface_info);
+	return port_plcr_set(ifname, boot.rate_mode, boot.cir_value, boot.pir_value,
+			     boot.cbs, boot.pbs, false);
 }
 
-/* The colours a profile counted. Read without clearing: the counters have
- * more than one reader, and clearing them here would move everyone else's
- * baseline.
+/* The colours a profile counted, all three from one read of it. Read without
+ * clearing: the counters have more than one reader, and clearing them here
+ * would move everyone else's baseline. A read that fails says so and leaves
+ * *out as it was. Taken for zeroes, as the per-counter interface used to hand
+ * them out, it would become a baseline the next good read reported the whole
+ * counter against, or a running total gone backwards.
  *
- * Both of these reach FM_PCD_PlcrProfileGetCounter(), which may take the
- * host-command path and busy-wait there, so neither is callable under a
- * spinlock.
+ * The read is a host command and busy-waits, so it is not callable under a
+ * spinlock; the record lookups that call it hold cdx_plcr_mutex, and say
+ * which write of the profile the reading belongs to.
  */
-void cdx_plcr_colours(void *handle, struct cdx_police_counters *out)
+int cdx_plcr_colours(void *handle, struct cdx_police_counters *out)
 {
-	out->green = FM_PCD_PlcrProfileGetCounter(handle,
-			e_FM_PCD_PLCR_PROFILE_GREEN_PACKET_TOTAL_COUNTER);
-	out->yellow = FM_PCD_PlcrProfileGetCounter(handle,
-			e_FM_PCD_PLCR_PROFILE_YELLOW_PACKET_TOTAL_COUNTER);
-	out->red = FM_PCD_PlcrProfileGetCounter(handle,
-			e_FM_PCD_PLCR_PROFILE_RED_PACKET_TOTAL_COUNTER);
+	t_FmPcdPlcrProfileCounterValues values;
+
+	if (FM_PCD_PlcrProfileReadCounters(handle, &values) != E_OK)
+		return FAILURE;
+	out->green = values.green;
+	out->yellow = values.yellow;
+	out->red = values.red;
+	return SUCCESS;
 }
 
 int cdx_port_police_counters(char *ifname, struct cdx_police_counters *out)
 {
 	int hardwarePortId = dpa_get_iface_hwid_by_name_and_type(ifname, IF_TYPE_ETHERNET);
+	struct port_ff_rate_lim_info *info;
 
-	if (hardwarePortId == -1 || !port_rate_lim_mode[hardwarePortId].handle)
+	lockdep_assert_held(&cdx_plcr_mutex);
+	if (hardwarePortId < 0 || hardwarePortId >= MAX_PHYS_PORTS)
 		return FAILURE;
-	cdx_plcr_colours(port_rate_lim_mode[hardwarePortId].handle, out);
+	info = &port_rate_lim_mode[hardwarePortId];
+	if (!info->handle || cdx_plcr_colours(info->handle, out) != SUCCESS)
+		return FAILURE;
+	out->writes = info->sync.writes;
 	return SUCCESS;
+}
+
+/* One counter's share of a reading under the same write as the baseline. A
+ * counter below the baseline was zeroed underneath -- by a write whose outcome
+ * was unknown, landing late -- rather than having wrapped, so the value it now
+ * holds is the whole of the delta. Reading it as a 32-bit wrap instead would
+ * credit a reader with most of four billion frames to cover a sample nobody
+ * missed, which is a far worse answer than losing one wrap's worth of
+ * counting. */
+static uint32_t cdx_police_delta(uint32_t last, uint32_t now)
+{
+	return now >= last ? now - last : now;
+}
+
+/* What a profile counted since a reader last looked, given a new reading,
+ * which becomes the reader's baseline. A reading under a later write than the
+ * baseline counts from that write, which zeroed the counters, so all of it is
+ * new: that is how a reader's baseline follows a rewrite of the profile --
+ * the owner's own, or the reconcile work's -- without anyone telling it. A
+ * reader with no baseline yet starts from this reading and is credited
+ * nothing. `delta->writes' is left zero. */
+void cdx_police_advance(struct cdx_police_base *base,
+			const struct cdx_police_counters *now,
+			struct cdx_police_counters *delta)
+{
+	const struct cdx_police_counters *at = &base->at;
+
+	memset(delta, 0, sizeof(*delta));
+	if (base->known && at->writes != now->writes) {
+		delta->green = now->green;
+		delta->yellow = now->yellow;
+		delta->red = now->red;
+	} else if (base->known) {
+		delta->green = cdx_police_delta(at->green, now->green);
+		delta->yellow = cdx_police_delta(at->yellow, now->yellow);
+		delta->red = cdx_police_delta(at->red, now->red);
+	}
+	base->at = *now;
+	base->known = true;
 }
 
 void *create_ddr_and_copy_from_muram(void *muramptr, void **ddrptr, U32 size)
@@ -720,26 +863,18 @@ int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *finfo)
 	return 0;
 }
 
-/* api to modify ingress qos policer parameters. `tc_meter` as for
- * port_plcr_set(): a tc police action's meter, or NXP's, which the SEC
- * profile keeps. */
-int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs, bool tc_meter)
+/* One ingress profile, written whole from its record: the SEC profile in
+ * packets, the per-flow ones in bytes, and `tc_meter` as for
+ * port_plcr_params(): a tc police action's meter, or NXP's, which the SEC
+ * profile keeps and a per-flow profile no filter holds returns to. */
+static int cdx_ingress_plcr_write(struct cdx_fman_info *finfo, uint32_t queue_no)
 {
-	void *handle;
+	struct cdx_ingress_policer_info *info = &finfo->ingress_policer_info[queue_no];
 	t_FmPcdPlcrProfileParams Params;
-
-	if (queue_no >= INGRESS_ALL_POLICER_QUEUES)
-		return FAILURE;
-
-
-	if (finfo->ingress_policer_info[queue_no].policer_on == DISABLE_INGRESS_POLICER) {
-		printk("%s::plcr profile is disabled on queue %d\n",__func__, queue_no);
-		return FAILURE;
-	}
 
 	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
 	Params.modify = 1;
-	Params.id.h_Profile = finfo->ingress_policer_info[queue_no].handle;
+	Params.id.h_Profile = info->handle;
 	Params.algSelection = e_FM_PCD_PLCR_RFC_2698;
 	Params.colorMode = e_FM_PCD_PLCR_COLOR_BLIND;
 	/*color as red by default */
@@ -747,12 +882,48 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 	/*override color is RED */
 	Params.color.override = e_FM_PCD_PLCR_RED;
 #ifdef SEC_PROFILE_SUPPORT
-	if (queue_no != INGRESS_SEC_POLICER_QUEUE_NUM)
+	if (queue_no == INGRESS_SEC_POLICER_QUEUE_NUM)
+		/*set algorithm mode as Packets/sec */
+		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_PACKET_MODE;
+	else
 #endif /* endif for SEC_PROFILE_SUPPORT */
 	{
 		/*set algorithm mode as bytes/sec */
 		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_BYTE_MODE;
-		Params.nonPassthroughAlgParams.committedInfoRate = cir;
+		cdx_plcr_lengths(&Params, info->tc_meter);
+	}
+	Params.nonPassthroughAlgParams.committedInfoRate = info->cir_value;
+	Params.nonPassthroughAlgParams.committedBurstSize = info->cbs;
+	Params.nonPassthroughAlgParams.peakOrExcessInfoRate = info->pir_value;
+	Params.nonPassthroughAlgParams.peakOrExcessBurstSize = info->pbs;
+	cdx_plcr_actions(&Params, e_FM_PCD_CC, e_FM_PCD_POST_POLICER_PROCES_FRAME,
+			 info->tc_meter);
+	return cdx_plcr_commit(finfo->pcd_handle, &Params, &info->sync, "ingress", queue_no);
+}
+
+/* api to modify ingress qos policer parameters. `tc_meter` as for
+ * port_plcr_params(): a tc police action's meter, or NXP's, which the SEC
+ * profile keeps. A request an enabled profile can run becomes its record,
+ * whether or not the write lands (cdx_plcr_commit()); anything else is
+ * refused and changes nothing. */
+int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs, bool tc_meter)
+{
+	struct cdx_ingress_policer_info *info;
+
+	lockdep_assert_held(&cdx_plcr_mutex);
+	if (queue_no >= INGRESS_ALL_POLICER_QUEUES)
+		return FAILURE;
+	info = &finfo->ingress_policer_info[queue_no];
+
+	if (info->policer_on == DISABLE_INGRESS_POLICER) {
+		printk("%s::plcr profile is disabled on queue %d\n",__func__, queue_no);
+		return FAILURE;
+	}
+
+#ifdef SEC_PROFILE_SUPPORT
+	if (queue_no != INGRESS_SEC_POLICER_QUEUE_NUM)
+#endif /* endif for SEC_PROFILE_SUPPORT */
+	{
 		/* Honour the caller's burst. This used to force the default of
 		 * 2000 bytes whatever was asked for -- barely one frame, so a
 		 * TCP flow lost enough of every window to collapse rather than
@@ -762,152 +933,136 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 			cbs = DEFAULT_INGRESS_BYTE_MODE_CBS;
 		if (!pbs)
 			pbs = DEFAULT_INGRESS_BYTE_MODE_PBS;
-		Params.nonPassthroughAlgParams.committedBurstSize = cbs;
-		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = pir;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs;
-		cdx_plcr_lengths(&Params, tc_meter);
 	}
-#ifdef SEC_PROFILE_SUPPORT
-	else
-	{
-		/*set algorithm mode as Packets/sec */
-		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_PACKET_MODE;
-		Params.nonPassthroughAlgParams.committedInfoRate = cir;
-		Params.nonPassthroughAlgParams.committedBurstSize = cbs;
-		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = pir;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs;
-	}
-#endif /* endif for SEC_PROFILE_SUPPORT */
-
-	cdx_plcr_actions(&Params, e_FM_PCD_CC, e_FM_PCD_POST_POLICER_PROCES_FRAME, tc_meter);
-	handle = FM_PCD_PlcrProfileSet(finfo->pcd_handle, &Params);
-	if (!handle) {
-		printk("%s::unable to modify profile for queue %d\n",
-				__func__, queue_no);
-		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
-	}
-	finfo->ingress_policer_info[queue_no].tc_meter = tc_meter;
-	finfo->ingress_policer_info[queue_no].cir_value = cir;
-	finfo->ingress_policer_info[queue_no].pir_value = pir;
-	finfo->ingress_policer_info[queue_no].cbs = cbs;
-	finfo->ingress_policer_info[queue_no].pbs = pbs;
-#ifdef QOS_DEBUG
-	printk("%s::plcr profile modified for queue %d, handle %p\n",
-			__func__, queue_no, handle);
-#endif
-	return SUCCESS;
-}
-int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no)
-{
-	void *handle;
-	t_FmPcdPlcrProfileParams Params;
-
-	if (queue_no >= INGRESS_ALL_POLICER_QUEUES)
+	/* RFC 2698 has no committed rate above its peak, and the FMD refuses
+	 * one every time: recorded, it would be retried for ever. */
+	if (cir > pir)
 		return FAILURE;
 
+	info->tc_meter = tc_meter;
+	info->cir_value = cir;
+	info->pir_value = pir;
+	info->cbs = cbs;
+	info->pbs = pbs;
+	return cdx_ingress_plcr_write(finfo, queue_no);
+}
 
-	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
-	Params.modify = 1;
-	Params.id.h_Profile = finfo->ingress_policer_info[queue_no].handle;
-	Params.algSelection = e_FM_PCD_PLCR_RFC_2698;
-	Params.colorMode = e_FM_PCD_PLCR_COLOR_BLIND;
-	/*color as red by default */
-	Params.color.dfltColor = e_FM_PCD_PLCR_RED;
-	/*override color is RED */
-	Params.color.override = e_FM_PCD_PLCR_RED;
-#ifdef SEC_PROFILE_SUPPORT
-	if (queue_no != INGRESS_SEC_POLICER_QUEUE_NUM)
-#endif /* endif for SEC_PROFILE_SUPPORT */
-	{
-		/*set algorithm mode as bytes/sec (kilobits/sec)*/
-		/*init default cir and pir values */
-		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_BYTE_MODE;
-		Params.nonPassthroughAlgParams.committedInfoRate = DEFAULT_INGRESS_CIR_VALUE;
-		Params.nonPassthroughAlgParams.committedBurstSize = DEFAULT_INGRESS_BYTE_MODE_CBS;
-		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = DEFAULT_INGRESS_PIR_VALUE;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = DEFAULT_INGRESS_BYTE_MODE_PBS;
-		Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection = e_FM_PCD_PLCR_FULL_FRM_LEN;
-		Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection = e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
-	}
-#ifdef SEC_PROFILE_SUPPORT
-	else /* PACKET_MODE */
-	{
-		/*set algorithm mode as Packets/sec */
-		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_PACKET_MODE;
-		Params.nonPassthroughAlgParams.committedInfoRate = DEFAULT_SEC_PROFILE_PKT_MODE_CIR;
-		Params.nonPassthroughAlgParams.committedBurstSize = DEFAULT_SEC_PKT_MODE_CBS;
-		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = DEFAULT_SEC_PROFILE_PKT_MODE_PIR;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = DEFAULT_SEC_PKT_MODE_PBS;
-	}
-#endif /* endif for SEC_PROFILE_SUPPORT */
+/* A profile back to the meter it was created with, in the record and then in
+ * the hardware. */
+int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t queue_no)
+{
+	struct cdx_ingress_policer_info *info;
 
-	Params.nextEngineOnGreen = e_FM_PCD_CC;
-	Params.paramsOnGreen.action = e_FM_PCD_POST_POLICER_PROCES_FRAME;
-	Params.nextEngineOnYellow = e_FM_PCD_CC;
-	Params.paramsOnYellow.action = e_FM_PCD_POST_POLICER_PROCES_FRAME;
-	Params.nextEngineOnRed = e_FM_PCD_DONE;
-	Params.paramsOnRed.action = e_FM_PCD_DROP_FRAME;
-	handle = FM_PCD_PlcrProfileSet(finfo->pcd_handle, &Params);
-	if (!handle) {
-		printk("%s::unable to set default values for queue %d\n",
-				__func__, queue_no);
-		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
-	}
+	lockdep_assert_held(&cdx_plcr_mutex);
+	if (queue_no >= INGRESS_ALL_POLICER_QUEUES)
+		return FAILURE;
+	info = &finfo->ingress_policer_info[queue_no];
 
 #ifdef SEC_PROFILE_SUPPORT
 	if (queue_no != INGRESS_SEC_POLICER_QUEUE_NUM)
 #endif /* endif for SEC_PROFILE_SUPPORT */
 	{
 		/* init default cir and pir values */
-		finfo->ingress_policer_info[queue_no].cir_value = DEFAULT_INGRESS_CIR_VALUE;
-		finfo->ingress_policer_info[queue_no].pir_value = DEFAULT_INGRESS_PIR_VALUE;
-		finfo->ingress_policer_info[queue_no].cbs = DEFAULT_INGRESS_BYTE_MODE_CBS ;
-		finfo->ingress_policer_info[queue_no].pbs = DEFAULT_INGRESS_BYTE_MODE_PBS;
+		info->cir_value = DEFAULT_INGRESS_CIR_VALUE;
+		info->pir_value = DEFAULT_INGRESS_PIR_VALUE;
+		info->cbs = DEFAULT_INGRESS_BYTE_MODE_CBS;
+		info->pbs = DEFAULT_INGRESS_BYTE_MODE_PBS;
 	}
 #ifdef SEC_PROFILE_SUPPORT
 	else
 	{
 		/* init default sec profile  cir and pir values */
-		finfo->ingress_policer_info[queue_no].cir_value = DEFAULT_SEC_PROFILE_PKT_MODE_CIR;
-		finfo->ingress_policer_info[queue_no].pir_value = DEFAULT_SEC_PROFILE_PKT_MODE_PIR;
-		finfo->ingress_policer_info[queue_no].cbs = DEFAULT_SEC_PKT_MODE_CBS ;
-		finfo->ingress_policer_info[queue_no].pbs = DEFAULT_SEC_PKT_MODE_PBS;
+		info->cir_value = DEFAULT_SEC_PROFILE_PKT_MODE_CIR;
+		info->pir_value = DEFAULT_SEC_PROFILE_PKT_MODE_PIR;
+		info->cbs = DEFAULT_SEC_PKT_MODE_CBS;
+		info->pbs = DEFAULT_SEC_PKT_MODE_PBS;
 	}
 #endif /* endif for SEC_PROFILE_SUPPORT */
-	finfo->ingress_policer_info[queue_no].tc_meter = false;
-#ifdef QOS_DEBUG
-	printk("%s::plcr profile set to default for queue %d, handle %p\n",
-			__func__, queue_no, handle);
-#endif
-	return SUCCESS;
+	info->tc_meter = false;
+	return cdx_ingress_plcr_write(finfo, queue_no);
 }
 
+/* `policer_on' is the record's, like the rates: set or cleared before the
+ * write, and left so whether or not it lands, because it is what the owner
+ * asked for and the reconcile work brings the profile to it. It is also what
+ * the flowtable reads when it admits a flow (cdx_get_policer_profile_id()),
+ * so a flow admitted under a filter whose write is still outstanding is told
+ * to meter by the profile -- and does, once the write lands -- and no flow
+ * admitted after the filter is gone is. */
 int cdxdrv_enable_or_disable_ingress_policer(struct cdx_fman_info *finfo, uint32_t queue_no,uint32_t oper)
 {
-	if(oper) {
-		if(finfo->ingress_policer_info[queue_no].policer_on == ENABLE_INGRESS_POLICER)
+	struct cdx_ingress_policer_info *info = &finfo->ingress_policer_info[queue_no];
+
+	lockdep_assert_held(&cdx_plcr_mutex);
+	if (oper) {
+		if (info->policer_on == ENABLE_INGRESS_POLICER) {
 			printk("%s:: Policer already enabled on queue no %d\n",__func__,queue_no);
-		else {
-			finfo->ingress_policer_info[queue_no].policer_on = ENABLE_INGRESS_POLICER;
-			return cdxdrv_modify_ingress_qos_policer_profile(finfo,
-					queue_no,finfo->ingress_policer_info[queue_no].cir_value,
-					finfo->ingress_policer_info[queue_no].pir_value,
-					finfo->ingress_policer_info[queue_no].cbs,
-					finfo->ingress_policer_info[queue_no].pbs,
-					finfo->ingress_policer_info[queue_no].tc_meter);
-		}
-	}
-	else {
-		if (cdxdrv_set_default_qos_policer_profile(finfo,queue_no) == SUCCESS) {
-			finfo->ingress_policer_info[queue_no].policer_on = DISABLE_INGRESS_POLICER;
 			return SUCCESS;
 		}
-		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
+		info->policer_on = ENABLE_INGRESS_POLICER;
+		return cdx_ingress_plcr_write(finfo, queue_no);
 	}
-	return SUCCESS;
+	info->policer_on = DISABLE_INGRESS_POLICER;
+	return cdxdrv_set_default_qos_policer_profile(finfo, queue_no);
 }
 
-#ifdef SEC_PROFILE_SUPPORT
-#endif /* endif for SEC_PROFILE_SUPPORT */
-
 #endif
+
+/* ---- the reconcile work --------------------------------------------------- */
+
+/* Every profile whose last write did not land, written again from its record.
+ * One that fails again queues the next try (cdx_plcr_commit()). */
+static void cdx_plcr_reconcile_ports(void)
+{
+	unsigned int ii;
+
+	for (ii = 0; ii < MAX_PHYS_PORTS; ii++) {
+		struct port_ff_rate_lim_info *info = &port_rate_lim_mode[ii];
+
+		if (info->handle && info->sync.dirty)
+			port_plcr_write(info, ii);
+	}
+}
+
+static void cdx_plcr_reconcile_shared(struct cdx_fman_info *finfo)
+{
+	uint32_t ii;
+
+	for (ii = 0; ii < CDX_EXPT_MAX_EXPT_LIMIT_TYPES; ii++)
+		if (finfo->expt_rate_limit_info[ii].handle &&
+		    finfo->expt_rate_limit_info[ii].sync.dirty)
+			cdxdrv_modify_missaction_policer_profile(finfo, ii);
+#ifdef ENABLE_INGRESS_QOS
+	for (ii = 0; ii < INGRESS_ALL_POLICER_QUEUES; ii++)
+		if (finfo->ingress_policer_info[ii].handle &&
+		    finfo->ingress_policer_info[ii].sync.dirty)
+			cdx_ingress_plcr_write(finfo, ii);
+#endif
+}
+
+/* About once a second while any profile is behind its record. A write refused
+ * while the host command channel is shut fails at once, so a try costs nothing
+ * until the channel reopens, and the first try after that brings every profile
+ * to its record; then nothing queues the work again. The owners' baselines
+ * follow on their own (cdx_police_advance()). */
+static void cdx_plcr_reconcile_work(struct work_struct *work)
+{
+	mutex_lock(&cdx_plcr_mutex);
+	if (!cdx_plcr_stopped) {
+		cdx_plcr_reconcile_ports();
+		/* The one FMan cdx configures (dpa_cfg_publish()). */
+		if (fman_info)
+			cdx_plcr_reconcile_shared(fman_info);
+	}
+	mutex_unlock(&cdx_plcr_mutex);
+}
+
+void cdx_plcr_reconcile_stop(void)
+{
+	mutex_lock(&cdx_plcr_mutex);
+	cdx_plcr_stopped = true;
+	mutex_unlock(&cdx_plcr_mutex);
+	/* A run already queued or under way finds the flag set and writes
+	 * nothing, and nothing queues another. */
+	cancel_delayed_work_sync(&cdx_plcr_reconcile);
+}

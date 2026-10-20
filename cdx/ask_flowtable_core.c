@@ -1672,8 +1672,8 @@ static bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
  * session frame is not one the offline port classifies to its entry: every
  * frame of such a direction came back from the port, measured (A393). Nor is
  * a port that delivers more than a standard frame: a jumbo one arrives in
- * several buffers, and a flood of them through the offline port starved the
- * FMan's host-command channel until a reset, measured (A394). The port's
+ * several buffers, and a flood of them through the offline port timed out the
+ * FMan's host-command channel, measured (A394). The port's
  * readiness is fixed for CDX's life, and cdx's `detour` parameter is read
  * here, at admission. */
 static bool ft_detours(const struct cdx_ft_rule *rule)

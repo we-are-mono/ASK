@@ -21,8 +21,8 @@ def test_sdk_hc_transport(tmp_path):
         qman[qman.index("struct qm_fd {"):qman.index("#define QM_FD_DD_NULL")])
     (tmp_path / "hc_production.inc").write_text("\n".join(function(hc, name) for name in [
         "FillBufPool", "GetBuf", "PutBuf", "EnQFrm", "FmHcQuiesce", "FmHcFree",
-        "FmHcSetFramesDataMemory", "FmHcTxConf", "FmHcPcdSync",
-        "FmAllowHcUsage", "FmIsHcUsageAllowed", "FmHcIsFailed",
+        "FmHcSetFramesDataMemory", "FmHcTxConf", "FmHcPcdSync", "FmHcPcdCcDoDynamicChange",
+        "FmAllowHcUsage", "FmIsHcUsageAllowed",
     ]))
     (tmp_path / "hc_wrapper.inc").write_text("\n".join(function(wrapper, name) for name in [
         "hc_swap_frame", "qm_tx_conf_dqrr_cb", "QmEnqueueCB",

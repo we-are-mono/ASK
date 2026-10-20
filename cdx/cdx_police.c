@@ -24,6 +24,15 @@
  *
  * Both report what they metered. The profile counts frames per colour and has
  * no byte counter, so tc is told frames and drops and nothing else.
+ *
+ * A write of a profile is a host command, and the FMD's host-command channel
+ * can fail one: it refuses commands for a while after one times out. A valid
+ * filter is taken all the same. Its meter becomes the profile's record and
+ * the policer layer writes the profile from it until the hardware runs it
+ * (cdx_qos.c), and tc is told so in a warning -- rather than with a refusal,
+ * which would leave the filter in software for good while flows the
+ * flowtable offloads never reach a software meter. A delete is never
+ * refused, so the profile it resets is retried the same way.
  */
 
 #include <linux/module.h>
@@ -165,13 +174,21 @@ static int cdx_police_rates(const struct flow_action_entry *act,
  *
  * tc adds up what a driver reports and the hardware counters are free-running
  * totals, so every filter keeps the values it last read and reports the
- * difference.
+ * difference (cdx_police_advance(), which also follows a rewrite of the
+ * profile). A read that fails reports nothing and leaves the baseline where
+ * it was, so tc goes on showing the totals it had.
  */
 
 /* Guards both lists below. Taken from the flowtable's admission path through
  * cdx_police_lookup(), so it stays a spinlock; the counter reads are done
  * outside it, because they reach the FMD's host-command path and busy-wait
- * there. */
+ * there.
+ *
+ * Every tc verb below also runs under the policer lock (cdx_plcr_lock()),
+ * which serializes it with devlink and with the work that rewrites a profile
+ * whose write did not land, and nests outside this one. The lists change
+ * only under both, so a holder of the policer lock may use a record it found
+ * after dropping this, and the baselines are the policer lock's alone. */
 static DEFINE_SPINLOCK(cdx_police_lock);
 
 /* A matchall filter is the port's own rate limiter rather than one of the
@@ -182,35 +199,24 @@ struct cdx_police_port {
 	struct list_head		list;
 	struct net_device		*dev;
 	unsigned long			cookie;
-	struct cdx_police_counters	base;
+	struct cdx_police_base		base;
 };
 
 static LIST_HEAD(cdx_police_ports);
-
-/* One counter's delta. A counter that has gone backwards was reset
- * underneath the filter rather than having wrapped, so the value it now holds
- * is the whole of the delta. Reading it as a 32-bit wrap
- * instead would credit a filter with most of four billion frames to cover a
- * sample nobody missed, which is a far worse answer than losing one wrap's
- * worth of counting. */
-static u32 cdx_police_delta(u32 *last, u32 now)
-{
-	u32 delta = now >= *last ? now - *last : now;
-
-	*last = now;
-	return delta;
-}
 
 /* Green is enqueued, yellow and red are dropped, because a tc profile programs
  * e_FM_PCD_PLCR_DROP_FRAME on both. Every frame the meter saw is therefore the
  * sum of the three, and the dropped ones are the yellow and the red ones. */
 static void cdx_police_report(struct flow_stats *stats,
-			      struct cdx_police_counters *base,
+			      struct cdx_police_base *base,
 			      const struct cdx_police_counters *now)
 {
-	u64 green = cdx_police_delta(&base->green, now->green);
-	u64 drops = cdx_police_delta(&base->yellow, now->yellow) +
-		    cdx_police_delta(&base->red, now->red);
+	struct cdx_police_counters delta;
+	u64 green, drops;
+
+	cdx_police_advance(base, now, &delta);
+	green = delta.green;
+	drops = (u64)delta.yellow + delta.red;
 
 	/* lastused is offered only when something moved. flow_stats_update()
 	 * keeps the later of what it holds and what it is given, so a quiet
@@ -238,8 +244,8 @@ static int cdx_police_replace(struct net_device *dev,
 {
 	struct netlink_ext_ack *extack = f->common.extack;
 	struct flow_action *action = &f->rule->action;
+	struct cdx_police_port *port, *existing = NULL;
 	const struct flow_action_entry *act;
-	struct cdx_police_port *port;
 	u32 cir, pir, cbs, pbs;
 	unsigned long flags;
 	bool byte_mode;
@@ -264,52 +270,70 @@ static int cdx_police_replace(struct net_device *dev,
 
 	/* A port has one rate limiter. A second matchall would program over the
 	 * first's meter, and deleting either would return the port to its boot
-	 * rate under the other, which tc would still show as in hardware. tc
-	 * offers matchall filters under RTNL, so nothing lands in between. */
+	 * rate under the other, which tc would still show as in hardware. The
+	 * policer lock is held from here to the end, so nothing lands in
+	 * between. */
+	cdx_plcr_lock();
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	list_for_each_entry(port, &cdx_police_ports, list) {
-		if (port->dev == dev && port->cookie != f->cookie) {
+		if (port->dev != dev)
+			continue;
+		if (port->cookie != f->cookie) {
 			spin_unlock_irqrestore(&cdx_police_lock, flags);
+			cdx_plcr_unlock();
 			NL_SET_ERR_MSG_MOD(extack, "matchall: the port's rate limiter already has a police filter");
 			return -EOPNOTSUPP;
 		}
+		existing = port;
 	}
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
-
-	/* Allocated before the hardware is touched so a failure to program the
-	 * port leaves nothing behind to unwind. */
-	port = kzalloc(sizeof(*port), GFP_KERNEL);
-	if (!port)
-		return -ENOMEM;
-	port->dev = dev;
-	port->cookie = f->cookie;
-
-	if (cdx_port_police_set(dev->name, byte_mode, cir, pir, cbs, pbs) != SUCCESS) {
-		kfree(port);
-		NL_SET_ERR_MSG_MOD(extack, "police: the port has no rate limiter");
-		return -EINVAL;
-	}
-
-	/* The port's limiter has been counting since the port came up, so a new
-	 * filter starts from where the hardware is now. Without this its first
-	 * report would credit it with every frame the port ever metered. A read
-	 * that fails leaves the baseline at zero, which is the same answer as
-	 * one taken before any traffic. */
-	cdx_port_police_counters(dev->name, &port->base);
 
 	/* tc replays a filter onto a block callback that binds after it, so the
 	 * same cookie can arrive twice. The second time reprograms the port and
-	 * keeps the record already there: the hardware counters did not
-	 * restart, so neither may the baseline. */
-	spin_lock_irqsave(&cdx_police_lock, flags);
-	if (cdx_police_port_find(dev, f->cookie)) {
-		spin_unlock_irqrestore(&cdx_police_lock, flags);
-		kfree(port);
-		return 0;
+	 * keeps the record already there, baseline and all: the write moves the
+	 * counters on to a new write, which the baseline follows by itself
+	 * (cdx_police_advance()). */
+	port = existing;
+	if (!port) {
+		/* Allocated before the hardware is touched so a failure to
+		 * program the port leaves nothing behind to unwind. */
+		port = kzalloc(sizeof(*port), GFP_KERNEL);
+		if (!port) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		port->dev = dev;
+		port->cookie = f->cookie;
+		/* The port's limiter has been counting since its last write,
+		 * so a new filter starts from where the hardware is now, read
+		 * before this filter's own write. A write that lands zeroes the
+		 * counters, which the baseline follows; one that does not
+		 * leaves the port counting on from here. A read that fails
+		 * leaves no baseline, and the filter's first good report starts
+		 * it -- never one crediting the filter with every frame the
+		 * port ever metered. */
+		port->base.known = cdx_port_police_counters(dev->name, &port->base.at) == SUCCESS;
 	}
-	list_add_tail(&port->list, &cdx_police_ports);
-	spin_unlock_irqrestore(&cdx_police_lock, flags);
-	return 0;
+
+	rc = cdx_port_police_set(dev->name, byte_mode, cir, pir, cbs, pbs);
+	if (rc != SUCCESS && rc != CDX_PLCR_DEFERRED) {
+		if (!existing)
+			kfree(port);
+		NL_SET_ERR_MSG_MOD(extack, "police: the port has no rate limiter");
+		rc = -EINVAL;
+		goto out;
+	}
+	if (rc == CDX_PLCR_DEFERRED)
+		NL_SET_ERR_MSG_MOD(extack, "police: the rate limiter write was not confirmed and is retried until it is");
+	if (!existing) {
+		spin_lock_irqsave(&cdx_police_lock, flags);
+		list_add_tail(&port->list, &cdx_police_ports);
+		spin_unlock_irqrestore(&cdx_police_lock, flags);
+	}
+	rc = 0;
+out:
+	cdx_plcr_unlock();
+	return rc;
 }
 
 static int cdx_police_port_destroy(struct net_device *dev,
@@ -318,13 +342,22 @@ static int cdx_police_port_destroy(struct net_device *dev,
 	struct cdx_police_port *port;
 	unsigned long flags;
 
+	cdx_plcr_lock();
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	port = cdx_police_port_find(dev, f->cookie);
 	if (port)
 		list_del(&port->list);
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	/* Back to the boot rate, for the filter that held the limiter only: tc
+	 * offers the delete of a filter the driver refused as well, having
+	 * kept that one in software, and it is no reason to take the limiter
+	 * from the filter that does hold it. tc forgets the filter whatever is
+	 * answered here, so a reset that does not land is retried like any
+	 * other write rather than leaving the port at a rate nothing shows. */
+	if (port)
+		cdx_port_police_clear(dev->name);
+	cdx_plcr_unlock();
 	kfree(port);
-	cdx_port_police_clear(dev->name);
 	return 0;
 }
 
@@ -334,21 +367,23 @@ static int cdx_police_port_stats(struct net_device *dev,
 	struct cdx_police_counters now;
 	struct cdx_police_port *port;
 	unsigned long flags;
-	bool reported;
+	int rc = -ENOENT;
 
-	if (cdx_port_police_counters(dev->name, &now) != SUCCESS)
-		return -EINVAL;
-
-	/* Looked up after the read rather than before it, because a filter can
-	 * be destroyed while its counters are being fetched and the baseline
-	 * belongs to whichever record is still there afterwards. */
+	/* Only a delete frees the record, and it takes the policer lock first,
+	 * so a record found here outlives the read. */
+	cdx_plcr_lock();
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	port = cdx_police_port_find(dev, f->cookie);
-	reported = port != NULL;
-	if (port)
-		cdx_police_report(&f->stats, &port->base, &now);
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
-	return reported ? 0 : -ENOENT;
+	if (port) {
+		rc = -EINVAL;
+		if (cdx_port_police_counters(dev->name, &now) == SUCCESS) {
+			cdx_police_report(&f->stats, &port->base, &now);
+			rc = 0;
+		}
+	}
+	cdx_plcr_unlock();
+	return rc;
 }
 
 static int cdx_police_matchall(struct net_device *dev,
@@ -389,7 +424,7 @@ struct cdx_police_filter {
 	bool			is_pipe;	/* conform continues (pipe) vs accept */
 	union nf_inet_addr	src, src_mask, dst, dst_mask;
 	__be16			sport, sport_mask, dport, dport_mask;
-	struct cdx_police_counters base;
+	struct cdx_police_base	base;
 };
 
 static LIST_HEAD(cdx_police_filters);
@@ -653,7 +688,7 @@ static int cdx_police_flower_replace(struct net_device *dev,
 	u32 cir, pir, cbs, pbs;
 	unsigned long flags;
 	bool byte_mode;
-	int profile, rc;
+	int profile, on, rc;
 
 	/* A filter in a non-zero chain is only reached by a `goto chain` from
 	 * chain 0. The offload binds by tuple lookup and cannot see that jump, so
@@ -697,6 +732,7 @@ static int cdx_police_flower_replace(struct net_device *dev,
 	if (rc)
 		goto err_free;
 
+	cdx_plcr_lock();
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	/* A pipe conform means "meter here and continue", which composes with any
 	 * filter that overlaps it. Lookup applies one profile, so that composition
@@ -715,7 +751,7 @@ static int cdx_police_flower_replace(struct net_device *dev,
 				NL_SET_ERR_MSG_MOD(extack,
 					"flower: a pipe policer overlaps another filter and cannot compose in hardware");
 				rc = -EOPNOTSUPP;
-				goto err_free;
+				goto err_unlock;
 			}
 		}
 	}
@@ -726,33 +762,48 @@ static int cdx_police_flower_replace(struct net_device *dev,
 		 * silently sharing one. tc then leaves the filter in software. */
 		NL_SET_ERR_MSG_MOD(extack, "flower: no ingress policer profile is free");
 		rc = -EOPNOTSUPP;
-		goto err_free;
+		goto err_unlock;
 	}
 	filter->profile = profile;
 
-	if (cdx_ingress_enable_or_disable_qos(FMAN_INDEX, profile,
-					      ENABLE_INGRESS_POLICER) != SUCCESS ||
-	    cdx_ingress_policer_modify_config(FMAN_INDEX, profile,
-					      cir, pir, cbs, pbs, true) != SUCCESS) {
-		NL_SET_ERR_MSG_MOD(extack, "flower: the ingress policer profile could not be programmed");
-		rc = -EINVAL;
-		goto err_profile;
-	}
-
 	/* A profile given back by one filter and handed to the next still holds
-	 * the frames the first one metered, so the baseline starts where the
-	 * hardware is rather than at zero. */
-	cdx_ingress_policer_counters(FMAN_INDEX, profile, &filter->base);
+	 * what it counted before, none of it this filter's, so the baseline
+	 * starts where the hardware is, read before this filter's writes: one
+	 * that lands zeroes the counters, which the baseline follows. */
+	filter->base.known = cdx_ingress_policer_counters(FMAN_INDEX, profile,
+							  &filter->base.at) == SUCCESS;
+
+	/* A write that does not land leaves the request in the profile's record
+	 * for the reconcile work to write until it does, so only a refusal fails
+	 * the filter. A profile whose disable is still outstanding from the
+	 * filter that had it before is no obstacle: these writes are whole
+	 * profiles and supersede it. */
+	on = cdx_ingress_enable_or_disable_qos(FMAN_INDEX, profile, ENABLE_INGRESS_POLICER);
+	if (on != SUCCESS && on != CDX_PLCR_DEFERRED)
+		goto err_refused;
+	rc = cdx_ingress_policer_modify_config(FMAN_INDEX, profile, cir, pir, cbs, pbs, true);
+	if (rc != SUCCESS && rc != CDX_PLCR_DEFERRED) {
+		/* Off again, so the profile goes back to the pool as it came. */
+		cdx_ingress_enable_or_disable_qos(FMAN_INDEX, profile, DISABLE_INGRESS_POLICER);
+		goto err_refused;
+	}
+	if (on == CDX_PLCR_DEFERRED || rc == CDX_PLCR_DEFERRED)
+		NL_SET_ERR_MSG_MOD(extack, "flower: the ingress policer write was not confirmed and is retried until it is");
 
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	list_add_tail(&filter->list, &cdx_police_filters);
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	cdx_plcr_unlock();
 	return 0;
 
-err_profile:
+err_refused:
+	NL_SET_ERR_MSG_MOD(extack, "flower: the ingress policer profile could not be programmed");
+	rc = -EINVAL;
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	cdx_police_profile_put(profile);
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
+err_unlock:
+	cdx_plcr_unlock();
 err_free:
 	kfree(filter);
 	return rc;
@@ -765,28 +816,36 @@ static int cdx_police_flower_destroy(struct net_device *dev,
 	unsigned long flags;
 	u8 profile;
 
+	cdx_plcr_lock();
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	filter = cdx_police_filter_find(dev, f->cookie);
-	if (filter) {
-		profile = filter->profile;
-		/* Return the profile to the pool only if no admitted flow still
-		 * names it; otherwise hold it out (pending) until the last such
-		 * flow is unref'd, so it is never reprogrammed under a live flow. */
-		if (cdx_police_profile_refs[profile])
-			cdx_police_profile_pending |= BIT(profile);
-		else
-			cdx_police_profile_put(profile);
+	if (filter)
 		list_del(&filter->list);
-	}
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
-	if (!filter)
+	if (!filter) {
+		cdx_plcr_unlock();
 		return -ENOENT;
+	}
+	profile = filter->profile;
 	/* Turn the meter off before the profile can be handed to another
 	 * filter, so a flow still naming it passes rather than meets somebody
 	 * else's rate. Flows admitted under it keep naming it until they are
-	 * reinstalled, which is the same contract the conntrack mark has. */
+	 * reinstalled, which is the same contract the conntrack mark has. The
+	 * record is off at once, so no flow admitted from here on is told to
+	 * meter by the profile; a disable that does not land is retried, and
+	 * superseded if a new filter is given the profile first. */
 	cdx_ingress_enable_or_disable_qos(FMAN_INDEX, profile,
 					  DISABLE_INGRESS_POLICER);
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	/* Return the profile to the pool only if no admitted flow still
+	 * names it; otherwise hold it out (pending) until the last such
+	 * flow is unref'd, so it is never reprogrammed under a live flow. */
+	if (cdx_police_profile_refs[profile])
+		cdx_police_profile_pending |= BIT(profile);
+	else
+		cdx_police_profile_put(profile);
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	cdx_plcr_unlock();
 	kfree(filter);
 	return 0;
 }
@@ -797,30 +856,25 @@ static int cdx_police_flower_stats(struct net_device *dev,
 	struct cdx_police_counters now;
 	struct cdx_police_filter *filter;
 	unsigned long flags;
-	bool reported;
-	u8 profile;
+	int rc = -ENOENT;
 
-	/* Which profile to read is decided under the lock; reading it is not,
-	 * because the counter fetch busy-waits on a host command. The filter
-	 * is then found again, since it can be destroyed in between and its
-	 * profile handed to somebody else. */
+	/* The read busy-waits on a host command, so it is made outside the
+	 * spinlock; the filter cannot be destroyed in between, nor its profile
+	 * handed to somebody else, because a delete takes the policer lock
+	 * first. */
+	cdx_plcr_lock();
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	filter = cdx_police_filter_find(dev, f->cookie);
-	profile = filter ? filter->profile : 0;
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
-	if (!profile)
-		return -ENOENT;
-
-	if (cdx_ingress_policer_counters(FMAN_INDEX, profile, &now) != SUCCESS)
-		return -EINVAL;
-
-	spin_lock_irqsave(&cdx_police_lock, flags);
-	filter = cdx_police_filter_find(dev, f->cookie);
-	reported = filter && filter->profile == profile;
-	if (reported)
-		cdx_police_report(&f->stats, &filter->base, &now);
-	spin_unlock_irqrestore(&cdx_police_lock, flags);
-	return reported ? 0 : -ENOENT;
+	if (filter) {
+		rc = -EINVAL;
+		if (cdx_ingress_policer_counters(FMAN_INDEX, filter->profile, &now) == SUCCESS) {
+			cdx_police_report(&f->stats, &filter->base, &now);
+			rc = 0;
+		}
+	}
+	cdx_plcr_unlock();
+	return rc;
 }
 
 static int cdx_police_flower(struct net_device *dev, struct flow_cls_offload *f)

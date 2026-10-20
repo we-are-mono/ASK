@@ -255,7 +255,7 @@ router never fragments, no direction received in a PPPoE session, every
 frame of which the offline port handed back when one was tried (A393), and
 none from a port whose MTU is above 1500: a jumbo frame arrives in several
 buffers, and a line-rate flood of them through the offline port timed out the
-FMan's host-command channel, which only a reset recovers (A394). That leaves
+FMan's host-command channel (A394). That leaves
 a download from a session into a LAN path below 1492, and UDP from a jumbo
 LAN into a standard path, in software.
 
@@ -613,24 +613,26 @@ hardware's own answers come within moments when the FMan is well -- a stopped
 port drains in microseconds, a barrier completes in well under a millisecond
 -- so a port not yet idle or a barrier the channel rejected is retried every
 quarter second, and twelve such unanswered tries in one restart, a few seconds,
-mean the hardware has stopped answering. RTNL and the hold are retried at a
-steady short interval and never count toward that; a key the table refuses
-backs off up to thirty seconds. Whatever it waits for, after thirty seconds it
-says once that it has stalled, and why. A key whose delete the table refuses
-on eight restart attempts (for want of memory, most likely) is taken as never
-going. One that cannot be proven safe makes the latch terminal
-(`fatal_terminal`), logs `reboot required` with the reason, and keeps the
-ports stopped: a port outside the configuration with a classifier of its own,
-a key that could not be recorded, a malformed table, a key refused eight
-times, a host-command channel that has failed for good, hardware that has
+mean the hardware has stopped answering. (A host command that times out shuts
+the channel only until the FMan answers it, so a barrier refused for that
+completes once the answer comes; the restart waits those few seconds for it,
+with the ports stopped, A403.) RTNL and the hold are retried at a steady short
+interval and never count toward that; a key the table refuses backs off up to
+thirty seconds. Whatever it waits for, after thirty seconds it says once that
+it has stalled, and why. A key whose delete the table refuses on eight restart
+attempts (for want of memory, most likely) is taken as never going. One that
+cannot be proven safe makes the latch terminal (`fatal_terminal`), logs
+`reboot required` with the reason, and keeps the ports stopped: a port outside
+the configuration with a classifier of its own, a key that could not be
+recorded, a malformed table, a key refused eight times, hardware that has
 stopped answering, or more than `flowtable_restart_limit` restarts (three by
 default) within ten minutes. A limit of zero leaves every latch for a reboot.
 A port that will not go idle is asked again no sooner than a quarter second
 later, and once the latch is terminal ever more rarely, up to every thirty
 seconds: each try holds RTNL through its whole wait for idle. Where nothing can
-prove the classifier done with what was retired -- that foreign port, or the
-failed channel -- the retired entries stay allocated with the statistics
-records and policer they name, for the reset. Full provider teardown still
+prove the classifier done with what was retired -- that foreign port -- the
+retired entries stay allocated with the statistics records and policer they
+name, for the reset. Full provider teardown still
 detaches the classifier and permits software port operation again, restoring
 each port as the stop found it (an Rx port only if its netdev is still up),
 and settles a recorded key only when no other port reaches a classifier. That

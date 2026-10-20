@@ -137,9 +137,31 @@ enum {
 #define EXPT_PKT_LIM_PLCR_MODE_PKT      0
 #define EXPT_PKT_LIM_PLCR_MODE_BYTE     1
 
+/* How a policer profile stands against the record it is written from. Every
+ * runtime write is the whole profile, rebuilt from the record, so writing it
+ * again is harmless and makes the hardware match the record whatever became
+ * of an earlier write. `dirty' says the last write did not land -- refused, or
+ * timed out with its outcome unknown -- so the hardware may run something
+ * else and the reconcile work (cdx_qos.c) writes it again; `writes' counts the
+ * writes that did land, each of which zeroes the profile's colour counters. */
+struct cdx_plcr_sync {
+	uint32_t writes;
+	bool dirty;
+};
+
+/* What a write of a runtime profile answers when the request was taken into
+ * the record but the write did not land: the reconcile work brings the
+ * hardware to it, so the caller has nothing to undo. SUCCESS means the
+ * hardware runs the request now; anything else refused it and recorded
+ * nothing. */
+#define CDX_PLCR_DEFERRED	1
+
 struct cdx_expt_ratelimit_info {
         void *handle;
+        /* The record: the rate, and the burst, of this type's profile. */
         uint32_t limit;
+        uint32_t burst;
+        struct cdx_plcr_sync sync;
 };
 
 
@@ -175,6 +197,11 @@ enum {
 #define DISABLE_INGRESS_POLICER 0
 #define ENABLE_INGRESS_POLICER 1
 
+/* The record of one ingress profile: what its owner -- a tc flower filter, the
+ * SEC policer's devlink set, or nobody -- last asked for, which the profile is
+ * written from. `policer_on' is part of it, so a flow admitted under a filter
+ * is told to meter by the profile even while the write that programs it is
+ * still outstanding, and none is once the filter is gone. */
 struct cdx_ingress_policer_info {
 	void *handle;
 	uint8_t  profile_id;
@@ -185,6 +212,7 @@ struct cdx_ingress_policer_info {
 	uint32_t pbs;
 	/* Meters as a tc police action does: IP lengths, yellow dropped. */
 	bool tc_meter;
+	struct cdx_plcr_sync sync;
 };
 #endif
 
@@ -205,7 +233,9 @@ struct cdx_fman_info {
 	/* EXPT_PKT_LIM_PLCR_MODE_PKT (0) or _BYTE (1). The comment here used to
 	 * say the opposite of what the defines above it spell. */
 	uint32_t expt_ratelim_mode;
-	uint32_t expt_ratelim_burst_size; //bytes or packets
+	/* The burst, in bytes or packets, every exception profile is created
+	 * with; each keeps its own from then on (cdx_expt_ratelimit_info). */
+	uint32_t expt_ratelim_burst_size;
 };
 
 /* Command numbers 1 (DPA_SET_PARAMS) and 5 (DPA_INIT_CHECK) are retired. cdx
