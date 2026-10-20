@@ -959,10 +959,6 @@ static unsigned stats_in_use(void)
 static int cdx_ft_admission_begin(void) { return rtnl_trylock() ? 0 : -EAGAIN; }
 static void cdx_ft_admission_end(void) { rtnl_unlock(); }
 static bool cdx_ft_failed(void) { return ft_fatal; }
-/* A latch CDX will restart the datapath after, rather than one left for a
- * reboot. Cases that say nothing get the reboot. */
-static bool ft_restarting;
-static bool cdx_ft_terminal(void) { assert(cdx_info->ctrl.mutex); return ft_fatal && !ft_restarting; }
 static bool cdx_ft_observing(void) { return ft_observe; }
 /* Unlinks whose barrier is owed to the next settle: retired, so pending like
  * any other retirement until a barrier proves them. */
@@ -5546,30 +5542,27 @@ static void test_rearm(void)
     list_init(&block.cb_list);
     assert(ft_invalid && ft_fatal && ft_invalid_done);
     u64 rearms = ft_rearms;
-    /* A failed deletion stops admission until a fresh boot. The bind still
-     * succeeds -- refusing it would fail the consumer's whole transaction --
-     * but passively: not counted as a binding, holding no device, never
-     * rearmed, and declining everything it is offered. */
-    assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == 0);
-    assert(ft_passive == 1 && !ft_bound && !ft_parked && !in.refs && !table.use_neigh);
-    assert(!bound_to(&block, &in) && flow_block_cb_lookup(&block, ft_passive_callback, &in));
-    /* The fatal latch independently prevents admission, even if another
-     * path were to clear the ordinary invalidation flag accidentally. */
+    /* A failed deletion latches admission off until CDX has restarted the
+     * datapath, which it always does in the end, the ports forwarding in
+     * software meanwhile; nothing about it waits for a fresh boot. A bind
+     * under the latch is therefore never passive: it is an ordinary one, and
+     * declines every flow while the latch holds, even were another path to
+     * clear the ordinary invalidation flag by accident. */
+    assert(!can_rearm());
     ft_invalid = 0;
-    assert(bind_device(&out, FLOW_BLOCK_BIND) == 0 && ft_passive == 2 && !ft_bound);
-    assert(ft_replace(&binding, &cls) == -EOPNOTSUPP);
-    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+    assert(bind_device(&out, FLOW_BLOCK_BIND) == 0 && !ft_passive && ft_bound == 1);
+    assert(!bound_to(&block, &out)->parked);
+    assert(ft_replace(bound_to(&block, &out), &cls) == -EOPNOTSUPP && !live_hw);
+    assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0 && !ft_bound && !out.refs);
     assert(!ft_passive && !allocated && !ft_invalid && ft_rearms == rearms);
     assert(block.cb_list.next == &block.cb_list && ft_block_list.next == &ft_block_list);
-    /* A latch CDX is restarting the datapath after is not that. A bind
-     * under it is an ordinary one -- parked behind the invalidation the
-     * failed delete raised -- and declines every flow while the latch
-     * holds; a repeat invalidation pass is not skipped either, since the
-     * parked table's flows go live after the restart and must have been
-     * flushed first. The restart asks for everything the stop refused:
+    /* With the invalidation the failed delete raised, a bind is parked
+     * behind it; a repeat invalidation pass is not skipped either, since
+     * the parked table's flows go live after the restart and must have been
+     * flushed first. The restart asks for everything the latch refused:
      * both learners reconsider their groups, every SA its peer, and the
      * parked binding is rearmed at once rather than at the next retry. */
-    ft_restarting = true; ft_invalid = 1;
+    ft_invalid = 1;
     assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
     assert(!ft_passive && ft_bound == 1 && ft_parked == 1 && bound_to(&block, &in)->parked);
     assert(ft_replace(bound_to(&block, &in), &cls) == -EOPNOTSUPP && !live_hw);
@@ -5596,7 +5589,6 @@ static void test_rearm(void)
     assert(l2_refusal_resets == resets + 2);
     rearms = ft_rearms;
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0 && !ft_bound && !allocated && !in.refs);
-    ft_restarting = false;
     /* A table of a fresh load, which has never been bound. */
     table.use_neigh = table.use_hw_handles = false;
     ft_fatal = false; /* Simulated fresh module/boot, never a recovery action. */

@@ -12,6 +12,8 @@
 #define SEC_PROFILE_SUPPORT
 #include "cdx_ioctl.h"
 #define __must_hold(x)
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, value) ((x) = (value))
 #define GFP_KERNEL 0
 #define CDX_MAX_FMANS 16
 #define MAX_PHY_PORTS 8
@@ -37,8 +39,11 @@ typedef uint32_t u32;
 /* A port as the SDK keeps it: enabled, detached from its PCD, fenced against
  * enables, still finishing frames for so many more looks, given a PCD of its
  * own (for a port CDX did not configure), and whether the netdev owning an Rx
- * port is up. */
-struct port { bool enabled, detached, fenced, pcd, netdev_down, fail_enable; unsigned busy; };
+ * port is up. And a datapath restart's software mode: frames sent past the PCD
+ * it keeps, and a bypass that fails, that takes only the entry register, or a
+ * PCD that will not come back. */
+struct port { bool enabled, detached, fenced, pcd, netdev_down, fail_enable;
+              bool bypassed, fail_bypass, half_bypass, fail_attach; unsigned busy; };
 struct device { unsigned id; };
 typedef struct { bool active; t_Handle h_Dev; char name[20]; int icid; } t_LnxWrpFmPortDev;
 /* The ICID each port's FMBM_SPLIODN holds, and each CPU's portal FICID. */
@@ -159,8 +164,14 @@ static bool stopped(void)
 }
 static int FM_PORT_GetEnabled(void *p, bool *enabled)
 { assert(rtnl); *enabled = ((struct port *)p)->enabled; return 0; }
+/* A detach ends a bypass too: there is no PCD left to go past. */
 static int FM_PORT_DetachPCD(void *p)
-{ assert(!((struct port *)p)->enabled); ((struct port *)p)->detached = true; return 0; }
+{
+    assert(!((struct port *)p)->enabled);
+    ((struct port *)p)->detached = true;
+    ((struct port *)p)->bypassed = false;
+    return 0;
+}
 static int FM_PORT_Disable(void *p) { ((struct port *)p)->enabled = false; return 0; }
 static unsigned refused_enables;
 static int FM_PORT_Enable(void *p)
@@ -181,7 +192,31 @@ static int FM_PORT_GetStopped(void *p, bool *stopped)
     if (port->busy) port->busy--;
     return 0;
 }
-static int FM_PORT_IsPcdAttached(void *p, bool *attached) { *attached = ((struct port *)p)->pcd; return 0; }
+/* A port of CDX's own has its PCD until it is detached, or while it is
+ * bypassed; one CDX did not configure has whatever a case gives it. */
+static bool own_port(const void *p) { return p >= (void *)ports && p < (void *)(ports + 4); }
+static int FM_PORT_IsPcdAttached(void *p, bool *attached)
+{
+    struct port *port = p;
+
+    *attached = own_port(p) ? !port->detached && !port->bypassed : port->pcd;
+    return 0;
+}
+/* The SDK switches a port past its PCD and back only while it takes no frame:
+ * disabled, and for taking the PCD back seen idle too. A bypass of a port still
+ * finishing one is the caller's risk, which it has to prove settled later. */
+static unsigned bypass_calls;
+static int FM_PORT_BypassPCD(void *p, bool bypass)
+{
+    struct port *port = p;
+
+    assert(own_port(p) && !port->enabled && !port->detached && (bypass || !port->busy));
+    bypass_calls++;
+    if (bypass ? port->fail_bypass : port->fail_attach)
+        return -EIO;
+    port->bypassed = bypass;
+    return bypass && port->half_bypass ? -EIO : 0;
+}
 /* A port's BMI discard count: which port was read, under the lock that keeps
  * the port list. */
 enum { e_FM_PORT_COUNTERS_WRED_DISCARD = 9 };
@@ -198,6 +233,13 @@ static bool dpa_rx_port_wanted(t_Handle handle, char name[IFNAMSIZ])
     assert(rtnl);
     snprintf(name, IFNAMSIZ, "eth%u", (unsigned)((struct port *)handle - ports));
     return !((struct port *)handle)->netdev_down;
+}
+/* A netdev, and the Rx port it receives on: none for a device not DPAA's. */
+struct net_device { struct port *rx; };
+static t_Handle dpa_netdev_rx_port(const struct net_device *dev)
+{
+    assert(rtnl);
+    return dev->rx;
 }
 static bool pcd_built;
 static int cdx_pcd_build(uint8_t fm_index, struct cdx_pcd_state *state)
@@ -517,6 +559,155 @@ static void check_stop_resume(void)
     clean_success();
 }
 
+static int locked_bypass(unsigned *held)
+{
+    cdx_ctrl_lock_with_rtnl();
+    int rc = dpa_cfg_bypass(held);
+    cdx_ctrl_unlock_with_rtnl();
+    return rc;
+}
+static int locked_unbypass(void)
+{
+    cdx_ctrl_lock_with_rtnl();
+    int rc = dpa_cfg_unbypass();
+    cdx_ctrl_unlock_with_rtnl();
+    return rc;
+}
+static bool all(bool (*test)(const struct port *))
+{
+    for (unsigned i = 0; i < 4; i++)
+        if (!test(&ports[i]))
+            return false;
+    return true;
+}
+/* Whether the netdev guard is told to refuse the open of a netdev on this
+ * port, or on no DPAA port at all (NULL). */
+static bool port_held(struct port *rx)
+{
+    struct net_device dev = { .rx = rx };
+
+    rtnl_lock();
+    bool held = dpa_cfg_port_held(&dev);
+    rtnl_unlock();
+    return held;
+}
+/* Forwarding in software: past the PCD, running, open to its netdev. */
+static bool soft(const struct port *p) { return p->bypassed && p->enabled && !p->fenced && !p->detached; }
+/* Stopped with its PCD, for a resume. */
+static bool held_back(const struct port *p) { return !p->bypassed && !p->enabled && p->fenced && !p->detached; }
+/* Running with its PCD, as before any of it. */
+static bool classifying(const struct port *p) { return !p->bypassed && p->enabled && !p->fenced && !p->detached; }
+
+/* A datapath restart's software mode, between its stop and its resume: every
+ * port past its PCD, which it keeps, and forwarding to Linux. ports[0]/[2] are
+ * offline ports, ports[1]/[3] Rx ports (setup()). */
+static void check_bypass(void)
+{
+    unsigned held = 99, errors, looks;
+
+    port_up_mask = 15;
+    setup(); assert(!dpa_cfg_install());
+    /* Only from a stop: a running port is never switched under its frames. */
+    assert(locked_bypass(&held) == -EINVAL && !dpa_cfg_bypassed() && all(classifying));
+    /* After one, every port goes past its PCD and starts again as a resume
+     * would start it -- an Rx port whose netdev went down stays down -- with
+     * the fence off, so its netdev's own open works as it would without CDX.
+     * Nothing is detached or drained. */
+    assert(!locked_stop());
+    ports[3].netdev_down = true;
+    assert(locked_bypass(&held) == 0 && !held && dpa_cfg_bypassed());
+    assert(dpa_active_ports.state == DPA_PORTS_BYPASSED);
+    assert(soft(&ports[0]) && soft(&ports[1]) && soft(&ports[2]));
+    assert(ports[3].bypassed && !ports[3].enabled && !ports[3].fenced);
+    for (struct dpa_fq *fq = dpa_pcd_fq; fq; fq = (struct dpa_fq *)fq->list.next)
+        assert(fq->fq_base.id != 1);
+    ports[3].netdev_down = false;
+    assert(!FM_PORT_Enable(&ports[3]) && all(soft));
+    /* Neither a stop nor a resume applies: only the unbypass gives the
+     * classifier back. A bypass again changes nothing. */
+    assert(locked_stop() == -EINVAL && locked_resume() == -EINVAL && all(soft));
+    unsigned calls = bypass_calls;
+    assert(locked_bypass(&held) == 0 && !held && all(soft) && bypass_calls == calls);
+    /* Giving it back stops every port as a stop does, waiting out a frame in
+     * hand, and then each takes its PCD back; a resume then starts what ran
+     * meanwhile, the port its netdev opened included. */
+    ports[1].busy = 2; waits = 0;
+    assert(!locked_unbypass() && dpa_active_ports.state == DPA_PORTS_STOPPED);
+    assert(!dpa_cfg_bypassed() && waits == 2 && all(held_back));
+    assert(!locked_resume() && dpa_active_ports.state == DPA_PORTS_RUNNING && all(classifying));
+    /* A netdev taken down while they were bypassed keeps its port down: the
+     * unbypass records what ran then. */
+    assert(!locked_stop() && locked_bypass(&held) == 0 && all(soft));
+    assert(!FM_PORT_Disable(&ports[1]));
+    assert(!locked_unbypass() && !locked_resume());
+    assert(!ports[1].enabled && classifying(&ports[0]) && classifying(&ports[2]) && classifying(&ports[3]));
+    assert(!FM_PORT_Enable(&ports[1]) && all(classifying));
+    /* A port still finishing a frame when the unbypass waits for it, or one
+     * that will not take its PCD back: every port goes back past its PCD and
+     * starts again, and the caller asks later. */
+    assert(!locked_stop() && locked_bypass(&held) == 0);
+    ports[2].busy = 1000;
+    assert(locked_unbypass() == -EBUSY && dpa_cfg_bypassed() && all(soft));
+    ports[2].busy = 0;
+    ports[1].fail_attach = true;
+    assert(locked_unbypass() == -EIO && dpa_cfg_bypassed() && all(soft));
+    ports[1].fail_attach = false;
+    assert(!locked_unbypass() && !locked_resume() && all(classifying));
+    /* A port still busy when the stop gave up on it is bypassed all the same,
+     * and so is every other, so the datapath forwards in software; the count
+     * of ports not yet seen idle says the tables may still be walked. A later
+     * bypass stops that port alone again, briefly, to look, and starts it
+     * again; once seen idle nothing stops it to look any more. */
+    ports[1].busy = 1000;
+    assert(locked_stop() == -EBUSY);
+    assert(locked_bypass(&held) == 1 && !held && dpa_cfg_bypassed() && all(soft));
+    waits = 0;
+    assert(locked_bypass(&held) == 1 && waits == DPA_STOP_WAIT_US / DPA_STOP_POLL_US && all(soft));
+    ports[1].busy = 0;
+    assert(locked_bypass(&held) == 0 && all(soft));
+    looks = stopped_looks;
+    assert(locked_bypass(&held) == 0 && stopped_looks == looks && all(soft));
+    assert(!locked_unbypass() && !locked_resume() && all(classifying));
+    /* A port whose bypass fails stays stopped, fenced against its netdev's
+     * open, named once however often it is tried again; the others proceed.
+     * The netdev guard is told which port that is, to refuse the open itself
+     * and say why. A bypass that took the port's entry though the rest failed
+     * counts as done: its frames go past the PCD. The unbypass leaves the held
+     * port as the stop did, for the resume to start with the others. */
+    errors = dpa_errors;
+    assert(!locked_stop());
+    assert(!port_held(&ports[3]));
+    ports[3].fail_bypass = ports[1].half_bypass = true;
+    assert(locked_bypass(&held) == 0 && held == 1);
+    assert(held_back(&ports[3]) && soft(&ports[0]) && soft(&ports[1]) && soft(&ports[2]));
+    assert(dpa_errors == errors + 1 && strstr(dpa_error_line, "fm0-port-rx3"));
+    assert(port_held(&ports[3]) && !port_held(&ports[1]) && !port_held(NULL));
+    assert(locked_bypass(&held) == 0 && held == 1 && dpa_errors == errors + 1);
+    assert(!locked_unbypass() && all(held_back) && !locked_resume() && all(classifying));
+    assert(!port_held(&ports[3]));
+    /* Tried again, and taken: it runs in software with the rest. */
+    assert(!locked_stop() && locked_bypass(&held) == 0 && held == 1 && held_back(&ports[3]));
+    ports[3].fail_bypass = ports[1].half_bypass = false;
+    assert(locked_bypass(&held) == 0 && !held && all(soft) && !port_held(&ports[3]));
+    /* Unload from a bypassed datapath detaches as from any other, and
+     * nothing bypasses or unbypasses after. One that finds a port still
+     * busy leaves them all forwarding in software for its next try, which
+     * records what runs then rather than what it stopped. */
+    cdx_ctrl_lock_with_rtnl();
+    ports[0].busy = 1000;
+    assert(dpa_cfg_quiesce() == -EBUSY && dpa_cfg_bypassed() && all(soft));
+    ports[0].busy = 0;
+    assert(!dpa_cfg_quiesce() && dpa_active_ports.state == DPA_PORTS_QUIESCED && !dpa_cfg_bypassed());
+    for (unsigned i = 0; i < 4; i++)
+        assert(ports[i].detached && !ports[i].enabled && !ports[i].bypassed);
+    assert(dpa_cfg_bypass(&held) == -ENOTRECOVERABLE && dpa_cfg_unbypass() == -ENOTRECOVERABLE);
+    cdx_ctrl_unlock_with_rtnl();
+    dpa_cfg_deinit();
+    for (unsigned i = 0; i < 4; i++)
+        assert(ports[i].enabled && !ports[i].fenced);
+    assert(!fman_info && !live_allocs && !slots && !queues);
+}
+
 /* IPsec offload needs every classifier port and every CPU's portal to enqueue
  * with one ICID. Ports CDX did not configure do not count; one CDX configured
  * that differs, or whose ICID cannot be read, or one portal that differs, is a
@@ -603,9 +794,10 @@ int main(void)
         retry();
     }
     check_stop_resume();
+    check_bypass();
     check_shared_icid();
     check_port_rejected();
     printf("CDX startup fault points passed: %u allocations, %u stages and retry; "
-           "restartable stop and resume\n", allocations, steps);
+           "restartable stop, bypass and resume\n", allocations, steps);
     return 0;
 }

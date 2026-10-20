@@ -24,7 +24,6 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 	FILE *f = fopen(FT_PROC, "r");
 	char line[256];
 	int seen = 0, optional = 0;
-	bool reports_terminal = false;
 
 	memset(b, 0, sizeof(*b));
 	if (!f) {
@@ -48,7 +47,7 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 		else if (!strcmp(key, "neighbour_refs")) { b->neighbour_refs = v; seen |= 4; }
 		else if (!strcmp(key, "quarantine"))     { b->quarantine = v; seen |= 8; }
 		else if (!strcmp(key, "fatal"))          { b->fatal = v; seen |= 16; }
-		else if (!strcmp(key, "fatal_terminal")) { b->fatal_terminal = v; reports_terminal = true; }
+		else if (!strcmp(key, "bypassed"))       { b->bypassed = v; optional |= 512; }
 		else if (!strcmp(key, "restarts"))       { b->restarts = v; optional |= 2; }
 		else if (!strcmp(key, "resume_failures")) { b->resume_failures = v; optional |= 4; }
 		else if (!strcmp(key, "observe"))        { b->observe = v; seen |= 32; }
@@ -67,7 +66,7 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 		 * of its own, and thousands of bridged pairs made the health
 		 * probe take it hundreds of times (A312). An adapter that prints
 		 * a key fewer is read to the end, as before. */
-		if (seen == 1023 && optional == 511 && reports_terminal)
+		if (seen == 1023 && optional == 1023)
 			break;
 	}
 	int error = ferror(f);
@@ -76,10 +75,6 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 		snprintf(ctx->err, sizeof(ctx->err), "incomplete backend diagnostics");
 		return -1;
 	}
-	/* An adapter from before CDX could restart the datapath: its latch
-	 * was always for a reboot. */
-	if (!reports_terminal)
-		b->fatal_terminal = b->fatal;
 	return 0;
 }
 
@@ -89,13 +84,13 @@ int ft_backend_json(const struct ft_backend *b, char *buf, size_t n)
 		"{\"present\": %s, \"bindings\": %ld, \"entries\": %ld, "
 		"\"handle_refs\": %ld, \"neighbour_refs\": %ld, \"quarantine\": %ld, "
 		"\"installs\": %ld, \"deletes\": %ld, \"rearms\": %ld, \"errors\": %ld, "
-		"\"fatal\": %ld, \"fatal_terminal\": %ld, \"restarts\": %ld, "
+		"\"fatal\": %ld, \"bypassed\": %ld, \"restarts\": %ld, "
 		"\"resume_failures\": %ld, \"invalidated\": %ld, \"observe\": %ld, "
 		"\"mcast_enabled\": %ld, \"mcast_installed\": %ld, \"mroute_installed\": %ld}",
 		b->present ? "true" : "false", b->bindings, b->entries,
 		b->handle_refs, b->neighbour_refs, b->quarantine,
 		b->installs, b->deletes, b->rearms, b->errors,
-		b->fatal, b->fatal_terminal, b->restarts, b->resume_failures,
+		b->fatal, b->bypassed, b->restarts, b->resume_failures,
 		b->invalidated, b->observe,
 		b->mcast_enabled, b->mcast_installed, b->mroute_installed);
 }
@@ -131,14 +126,9 @@ int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms, bool multicast)
 			return -1;
 		if (!b.present)
 			return 0;
-		if (b.fatal && b.fatal_terminal) {
-			snprintf(ctx->err, sizeof(ctx->err),
-				 "hardware retirement failed; full teardown and fresh boot required");
-			return -1;
-		}
 		/* A latch CDX is restarting the datapath after is waited out like
 		 * any other drain: nothing drained under it is final until the
-		 * ports run again. */
+		 * classifier runs again. */
 		if (!b.fatal && !b.bindings && !b.entries && !b.handle_refs &&
 		    !b.neighbour_refs && !b.quarantine &&
 		    (!multicast || (!b.mcast_installed && !b.mroute_installed)))

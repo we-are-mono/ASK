@@ -81,6 +81,9 @@ static void (*before_load)(void);
 #define __force
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 typedef uint16_t U16;
+/* The list the backend keeps its SAs on, and the one a classifier entry's
+ * record of a possibly linked key joins. */
+struct list_head { struct list_head *next, *prev; };
 
 /* The real PDB structures and shared descriptor layout, from the kernel's
  * pdb.h and cdx/dpa_ipsec.h. */
@@ -120,8 +123,6 @@ typedef struct _tRouteEntry {
 static bool transaction = true;
 static void cdx_ft_assert_held(void) { assert(transaction); }
 
-/* The list the backend keeps its SAs on. */
-struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
 #define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define list_for_each_entry(p, h, m) \

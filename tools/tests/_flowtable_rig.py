@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import os
 import re
@@ -442,9 +443,10 @@ async def stop_boot_daemon():
 async def restore_restart_limit(r) -> list:
     """Put back the restart limit a case left changed: over the recovery
     console when there is one, otherwise over the agent. Only once CDX has no
-    restart pending -- it checks the limit on every attempt, and the boot's
-    own could find its budget spent and stop the ports for good -- and not at
-    all once CDX has been unloaded with it. Returns what failed."""
+    restart pending -- it checks the limit before it gives the classifier
+    back, and the boot's own could find its budget spent and keep the datapath
+    in software for the rest of the window -- and not at all once CDX has
+    been unloaded with it. Returns what failed."""
     path = "/sys/module/cdx/parameters/flowtable_restart_limit"
     if r.recovery_console:
         from _flowtable_restart import latch_cleared, write
@@ -597,13 +599,13 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
                 failures.append(str(error))
         try:
             # A held restart is let go, and an armed delete fault cleared, so
-            # a case that failed inside its window does not leave the ports
-            # stopped. The knobs only the fault-injection image has are
-            # cleared where they exist.
+            # a case that failed inside its window does not leave the
+            # classifier bypassed. The knobs only the fault-injection image
+            # has are cleared where they exist.
             debug_knobs = [("cdx", "flowtable_fail_unlink"), ("cdx", "ehash_fail_unlink"),
                            ("cdx", "flowtable_restart_hold")]
             if r.recovery_console:
-                # Terminal cases remove CDX; restore only knobs still present.
+                # The unload case removes CDX; restore only knobs still present.
                 knobs = [("ask_flowtable", "flowtable_fail_stage"), *debug_knobs]
                 await console_python(r.recovery_console, f"""
 from pathlib import Path
@@ -624,8 +626,8 @@ for module, name in {knobs!r}:
                             failures.append(result)
             # A case that changed CDX's restart limit and could not put it
             # back itself has it put back here -- once no restart is pending,
-            # which the boot's own limit could turn terminal -- unless CDX
-            # has been unloaded with it.
+            # which the boot's own limit could keep waiting in software for
+            # the window -- unless CDX has been unloaded with it.
             if r.restart_limit is not None:
                 failures.extend(await restore_restart_limit(r))
         except Exception as error:
@@ -777,17 +779,26 @@ async def ct_counts(r):
     return counts
 
 
-async def terminal_stream(r, duration=12):
-    """Keep sending across an intentional datapath stop; validate every echo.
+# Each stream numbers its datagrams from a base of its own. Callers count new
+# payloads at the WAN echo, which keys them by content, so a second stream in
+# one test resending the first one's numbers would add nothing to it.
+_TERMINAL_STREAMS = itertools.count()
 
-    A terminal operation may interrupt delivery. Normal exchange() retains its
-    zero-loss requirement and separately checks forwarding after healthy unload.
+
+async def terminal_stream(r, duration=12):
+    """Keep sending across an intentional datapath disruption -- a restart's
+    stop and bypass, an unload --, validating every echo.
+
+    Such an operation may interrupt delivery for a moment. Normal exchange()
+    retains its zero-loss requirement and separately checks forwarding after
+    healthy unload.
     """
+    first = (1 << 63) + (next(_TERMINAL_STREAMS) << 32)
     script = f'''
 import json, socket, struct, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(({r.lan_ip!r}, {SPORT})); s.settimeout(0.02)
-first = 1 << 63
+first = {first}
 sent = first
 received = set()
 send_timeouts = 0

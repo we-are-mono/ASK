@@ -90,10 +90,10 @@ u64 cdx_ft_qos_control_overruns(void);
  * RTNL.
  *
  * restarted() says the datapath has restarted after a latch (cdx_ft_fatal()):
- * every port runs again and admission is open. While it was stopped, flows
- * were declined, multicast groups and SA rebuilds refused, and parked bindings
- * held back; this asks for all of it again. Called once per restart, with no
- * lock of CDX's held. It may sleep.
+ * every port runs on the classifier again and admission is open. While the
+ * classifier was out of the datapath, flows were declined, multicast groups and
+ * SA rebuilds refused, and parked bindings held back; this asks for all of it
+ * again. Called once per restart, with no lock of CDX's held. It may sleep.
  *
  * Registration is a one-shot claim, and unregistration waits out every call
  * already inside any op, so the module that registered can go once it
@@ -119,8 +119,8 @@ bool cdx_tc_filter_mirrored(struct net_device *dev, bool ingress,
 int cdx_flowtable_guard_init(void);
 void cdx_flowtable_guard_exit(void);
 void cdx_flowtable_quiesced(void);
-/* Cancel the work cdx_ft_fatal() schedules, which stops the ports and restarts
- * them; unload only, unlocked. */
+/* Cancel the work cdx_ft_fatal() schedules, which takes the classifier out of
+ * the datapath and gives it back; unload only, unlocked. */
 void cdx_ft_fatal_stop(void);
 /* Datapath restarts so far, counted from one: a hold taken in one epoch on
  * behalf of a possibly linked classifier key is released by the restart that

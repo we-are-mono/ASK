@@ -2,14 +2,14 @@
 
 Run with make ask-test ASK_TEST_ARGS='-k flowtable_offload'.
 Healthy invalidation recovers once the invalidated bindings are gone, including
-across an atomic reload, and an unproven deletion stops the datapath and
-restarts it in the same boot. The terminal tests -- CDX unload, and a deletion
-once the restart budget is spent -- still require a fresh boot before using ASK
-again.
+across an atomic reload, and an unproven deletion takes the classifier out of
+the datapath -- which forwards in software meanwhile, past the restart budget
+too -- and restarts it in the same boot. Only CDX's unload still requires a
+fresh boot before using ASK again.
 """
 from __future__ import annotations
 
-from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, RX_PORTS_SCRIPT, SPORT, TABLE, WAN_IP, ct_bytes, ct_counts, ct_listing, hardware_proof, latch_barrier_failure, links_restored, rearm_ready, status_text, terminal_stream, upper_roundtrip)
+from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, TABLE, WAN_IP, ct_bytes, ct_counts, ct_listing, hardware_proof, latch_barrier_failure, links_restored, rearm_ready, terminal_stream, upper_roundtrip)
 
 import asyncio
 import errno
@@ -23,7 +23,7 @@ from collections import Counter
 
 import pytest
 
-from ask_orch.commands import command, console_command, console_python, read
+from ask_orch.commands import command, console_command, read
 from ask_orch.counters import kernel_tx_packets
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, kernel_rx_packets, lan_run_python
@@ -885,168 +885,45 @@ async def test_partial_accounting(rig):
                       "dev", TARGET_WAN_IF)
 
 
-# The two 10G receive ports' enable bits, read through each port's own ioctl
-# over the console: a terminal failure stops classification there while a
-# fixed link keeps its carrier, and takes the agent's path with it.
-
-
-@pytest.mark.explicit("ASK_FLOWTABLE_TERMINAL", "unload", "budget",
-                      reason="terminal lifecycle; fresh boot required")
-async def test_terminal(rig):
-    """What still ends in a reboot: unloading CDX, and an unproven deletion
-    once the restart budget is spent. The second leaves the datapath stopped
-    for good -- every check of the window a restart would end, with no
-    restart -- and CDX's unload then gives the ports back to Linux."""
-    from _flowtable_restart import LIMIT, UNICAST_FAULT, knob, require_knobs, timed_restart, write
+@pytest.mark.explicit("ASK_FLOWTABLE_UNLOAD", "1", reason="CDX unload; fresh boot required")
+async def test_cdx_unload(rig):
+    """What still ends in a reboot: unloading CDX, a path the test image
+    exercises and production never takes. With flows in hardware and traffic
+    crossing, the adapter and CDX unload, and CDX's unload gives the ports
+    back to Linux, which forwards from then on."""
     r = rig
-    kind = os.environ["ASK_FLOWTABLE_TERMINAL"]
     assert not (await r.state())["observe"]
-    if kind == "budget":
-        await require_knobs(r.target, r.session, UNICAST_FAULT)
-    r.recovery_console = Console.target(log_path=str(artifact_dir() / "terminal-uart.log"))
+    r.recovery_console = Console.target(log_path=str(artifact_dir() / "unload-uart.log"))
     con = r.recovery_console
     await asyncio.to_thread(con.login, "root", None)
-    # Recovery reports from a worker after the delete has returned, and a
-    # printk landing inside a console read corrupts that read. dmesg keeps
-    # every line for the assertions; the level is put back at the end.
+    # Unload reports from a worker, and a printk landing inside a console
+    # read corrupts that read. dmesg keeps every line for the assertions; the
+    # level is put back at the end.
     printk = (await console_command(con, "cat", "/proc/sys/kernel/printk"))["stdout"].split()
     await console_command(con, "sysctl", "-w", "kernel.printk=1 4 1 7")
-    if kind == "budget":
-        # A fresh boot has restarted nothing, so with a budget of one the
-        # first unproven deletion restarts the datapath and the second is
-        # for the reboot. The fixture puts the limit back if CDX is still
-        # loaded by then.
-        r.restart_limit = await knob(con, LIMIT)
-        await write(con, LIMIT, 1)
-        await r.table()
-        await r.admit(64)
-        r.record("budget-first", await timed_restart(con, ["nft", "delete", "table", "inet", TABLE]))
-        await r.clear_ct()
     await r.table()
     initial = await r.admit(128)
     assert all(int(f["packets"]) > 0 for f in initial["flows"]), initial
     baseline = len(r.echo.received)
-    # The sender has to outlast every console check before the stopped-port
-    # observation at the end: about 45 s of UART round trips for budget.
-    traffic = asyncio.create_task(terminal_stream(r, duration=75 if kind == "budget" else 12))
-    unloaded = False
+    traffic = asyncio.create_task(terminal_stream(r, duration=12))
     try:
         deadline = time.monotonic() + 5
         while len(r.echo.received) < baseline + 32:
-            assert not traffic.done(), "traffic stopped before terminal operation"
-            assert time.monotonic() < deadline, "terminal stream did not reach WAN"
+            assert not traffic.done(), "traffic stopped before the unload"
+            assert time.monotonic() < deadline, "the stream did not reach WAN"
             await asyncio.sleep(0.05)
         live = await r.state()
         assert live["entries"] == 2 and all(
             int(after["packets"]) > int(before["packets"])
             for before, after in zip(initial["flows"], live["flows"])
         ), live
-        r.record(f"{kind}-live", live)
-        if kind == "budget":
-            # Read physical receive-port enable state, not netdev carrier:
-            # fixed links can retain carrier while classification is stopped.
-            before_ports = await console_python(con, RX_PORTS_SCRIPT)
-            assert json.loads(before_ports["stdout"]) == {"6": 1, "7": 1}
-            await console_python(con, "from pathlib import Path; Path('/sys/module/cdx/parameters/flowtable_fail_unlink').write_text('1')")
-            await console_command(con, "nft", "delete", "table", "inet", TABLE)
-            deadline = time.monotonic() + 10
-            while True:
-                result = await console_command(con, "cat", "/proc/cdx_flowtable")
-                stopped = status_text(result["stdout"].strip())
-                if stopped["invalidation_done"]:
-                    break
-                assert time.monotonic() < deadline, stopped
-                await asyncio.sleep(0.1)
-            assert stopped["fatal"] == stopped["invalidated"] == stopped["fatal_terminal"] == 1, stopped
-            assert stopped["restarts"] == live["restarts"], stopped
-            assert stopped["errors"] - live["errors"] == 1, stopped
-            assert stopped["entries"] == stopped["bindings"] == stopped["quarantine"] == 0, stopped
-            assert stopped["rearm_ready"] == 0, stopped
-            # A hardware table can still be created -- refusing it would fail
-            # a consumer's whole firewall transaction -- but its ports are
-            # bound passively: no binding, no admission, no rearm.
-            await console_command(con, "nft", "add", "table", "inet", TABLE)
-            attempted = await console_command(con, "nft", f"add flowtable inet {TABLE} fast {{ "
-                                  f"hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; "
-                                  "flags offload; }", check=False)
-            assert attempted["rc"] == 0, attempted
-            refused = status_text((await console_command(con, "cat", "/proc/cdx_flowtable"))["stdout"].strip())
-            assert refused["fatal"] == refused["invalidated"] == refused["invalidation_done"] == 1
-            assert refused["bindings"] == refused["parked"] == refused["entries"] == refused["rearm_ready"] == 0
-            assert refused["passive"] == stopped["passive"] + 2, (stopped, refused)
-            assert refused["rearms"] == live["rearms"] and refused["errors"] == stopped["errors"]
-            r.record("budget-rearm-passive", {"state": refused, "nft": attempted})
-            await console_command(con, "nft", "delete", "table", "inet", TABLE)
-            ports = await console_python(con, RX_PORTS_SCRIPT)
-            assert json.loads(ports["stdout"]) == {"6": 0, "7": 0}, ports
-            fault = await console_command(con, "cat", "/sys/module/cdx/parameters/flowtable_fail_unlink")
-            assert fault["stdout"].strip() == "N", fault
-            log = (await console_command(con, "dmesg"))["stdout"]
-            assert log.count("hardware stopped after unproven deletion; reboot required "
-                             "(restart budget exhausted)") == 1, log
-            r.record("budget-stopped", {"state": stopped, "ports": json.loads(ports["stdout"]), "dmesg": log})
-            mtu_checks = []
-            for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
-                original_mtu = (await console_command(con, "cat", f"/sys/class/net/{dev}/mtu"))["stdout"].strip()
-                try:
-                    await console_command(con, "ip", "link", "set", "dev", dev, "mtu", "1400")
-                finally:
-                    await console_command(con, "ip", "link", "set", "dev", dev, "mtu", original_mtu)
-                held = status_text((await console_command(con, "cat", "/proc/cdx_flowtable"))["stdout"].strip())
-                for field in ("fatal", "invalidated", "invalidation_done", "rearm_ready", "entries", "bindings",
-                              "installs", "deletes", "rearms", "errors", "quarantine"):
-                    assert held[field] == stopped[field], (field, held, stopped)
-                ports = json.loads((await console_python(con, RX_PORTS_SCRIPT))["stdout"])
-                assert ports == {"6": 0, "7": 0}, ports
-                mtu_checks.append({"dev": dev, "state": held, "ports": ports})
-            r.record("budget-mtu-refused", mtu_checks)
-            restart_checks = []
-            for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
-                await console_command(con, "ip", "link", "set", "dev", dev, "down")
-                restart = await console_command(con, "ip", "link", "set", "dev", dev, "up", check=False)
-                assert restart["rc"] != 0 and "Input/output error" in restart["stdout"], restart
-                link = json.loads((await console_command(con, "ip", "-j", "link", "show", "dev", dev))["stdout"])[0]
-                assert "UP" not in link["flags"], link
-                ports = json.loads((await console_python(con, RX_PORTS_SCRIPT))["stdout"])
-                assert ports == {"6": 0, "7": 0}, ports
-                restart_checks.append({"dev": dev, "restart": restart, "ports": ports})
-            r.record("budget-port-restart-refused", restart_checks)
-            # Allow already queued datagrams to arrive, then prove ingress
-            # remains stopped while the LAN sender is still running.
-            await asyncio.sleep(0.2)
-            received = len(r.echo.received)
-            assert not traffic.done(), "traffic ended before stopped-port observation"
-            await asyncio.sleep(1)
-            assert len(r.echo.received) == received, "traffic passed stopped classifier ports"
-        else:
-            await console_command(con, "rmmod", "ask_flowtable", timeout=25)
-            await console_command(con, "rmmod", "cdx", timeout=25)
-            unloaded = True
-        r.record(f"{kind}-traffic", await traffic)
+        r.record("unload-live", live)
+        await console_command(con, "rmmod", "ask_flowtable", timeout=25)
+        await console_command(con, "rmmod", "cdx", timeout=25)
+        r.record("unload-traffic", await traffic)
     finally:
         # Finish the LAN script before fixture cleanup changes its network.
-        try:
-            await traffic
-        finally:
-            if kind == "budget" and not unloaded:
-                await console_command(con, "rmmod", "ask_flowtable", timeout=25)
-                # The fatal latch belongs to the still-loaded provider. A
-                # fresh consumer must not turn an unproven deletion healthy.
-                refused = await console_command(con, "modprobe", "ask_flowtable", check=False)
-                assert refused["rc"] != 0 and "Operation not supported" in refused["stdout"], refused
-                await console_command(con, "test", "-e", "/sys/module/cdx")
-                for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable",
-                             "/sys/module/cdx/holders/ask_flowtable"):
-                    assert (await console_command(con, "test", "-e", path, check=False))["rc"] == 1, path
-                r.record("budget-module-reload-refused", refused)
-                for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
-                    restart = await console_command(con, "ip", "link", "set", "dev", dev, "up", check=False)
-                    assert restart["rc"] != 0 and "Input/output error" in restart["stdout"], restart
-                ports = json.loads((await console_python(con, RX_PORTS_SCRIPT))["stdout"])
-                assert ports == {"6": 0, "7": 0}, ports
-                r.record("budget-provider-guard-retained", {"ports": ports, "adapter_absent": True})
-                await console_command(con, "rmmod", "cdx", timeout=25)
-                unloaded = True
+        await traffic
     for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
         await console_command(con, "ip", "link", "set", "dev", dev, "up")
     # DOWN can discard the fixture's /32 routes and permanent neighbours.
@@ -1062,27 +939,175 @@ async def test_terminal(rig):
     await console_command(con, "nft", "delete", "table", "inet", TABLE, check=False)
     await r.clear_ct()
     await r.exchange(64)
-    r.record(f"{kind}-complete", {"module_absent": True, "post_unload_echoes": 64,
-                                "boot_id": await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")})
+    r.record("unload-complete", {"module_absent": True, "post_unload_echoes": 64,
+                                 "boot_id": await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")})
     await console_command(con, "sysctl", "-w", "kernel.printk=" + " ".join(printk[:4]))
 
 
-async def test_unproven_delete_restarts(rig):
-    """A unicast delete CDX cannot prove stops the datapath, and CDX restarts
-    it in the same boot.
+async def _latch_waiting(con, r, why: str) -> dict:
+    """Fail one unicast delete with a flow in hardware and the stream running,
+    and return the window that follows once it is waiting for `why`: or None
+    if the datapath restarted instead, which a budget not yet spent in this
+    boot's window allows."""
+    from _flowtable_restart import (REASON, RESTART_BOUND, UNICAST_FAULT, knob, proc, write)
+    await r.table()
+    await r.admit(64)
+    before = await proc(con)
+    await write(con, UNICAST_FAULT, 1)
+    await console_command(con, "nft", "delete", "table", "inet", TABLE)
+    deadline = time.monotonic() + RESTART_BOUND + 5
+    while True:
+        state = await proc(con)
+        if not state["fatal"] and state["restarts"] == before["restarts"] + 1:
+            await r.clear_ct()
+            return None
+        if state["fatal"] and state["bypassed"] and await knob(con, REASON) == why:
+            return state
+        assert time.monotonic() < deadline, (before, state)
+        await asyncio.sleep(0.2)
 
-    The key may still be linked, so the latch stops every classifier port;
-    with the ports idle CDX settles the key, and the ports start again. Held
-    by the test image's knob, the stopped window shows what the latch
-    promises: nothing forwarded, no port opened, no adapter loaded, Linux's own
-    configuration changes taken without effect. Released, the latch clears,
-    the restart is counted and logged with the key it settled, the adapter
-    loads, and the flow goes back into hardware with exact counts. A restart
-    nothing holds comes back within the bound."""
-    from _flowtable_restart import (HOLD, RUNNING, STOPPED, UNICAST_FAULT, assert_port_start_refused,
-                                    assert_restarted_cleanly, knob, log_marks, ports, proc,
-                                    quiet_console, require_knobs, restart_budget, restart_counts,
-                                    timed_restart, wait_restarted, wait_running, wait_stopped, write)
+
+async def _in_software(con, r, traffic, waiting: dict, classifying: dict, label: str):
+    """While a restart waits: the stream crosses the DUT -- through the CPU,
+    the classifier bypassed and every flow declined -- the receive ports run,
+    the platform's probe passes, a port opens again as usual, and nothing
+    asks for a reboot."""
+    from _flowtable_restart import (TERMINAL, assert_healthy, assert_ports_reopen, dmesg_count,
+                                    engines, ports, proc)
+    # Every flow out of the hardware, the deleted table's retirement done.
+    deadline = time.monotonic() + 10
+    while (retired := await proc(con))["entries"] or retired["quarantine"]:
+        assert time.monotonic() < deadline, retired
+        await asyncio.sleep(0.2)
+    assert retired["fatal"] == retired["bypassed"] == 1, retired
+    assert await ports(con) == {"6": 1, "7": 1}
+    now = await engines(con)
+    assert all(now[port] != classifying[port] for port in classifying), (classifying, now)
+    received, deadline = len(r.echo.received), time.monotonic() + 10
+    while len(r.echo.received) < received + 64:
+        assert not traffic.done(), "traffic ended before the software window"
+        assert time.monotonic() < deadline, "nothing crossed the bypassed classifier"
+        await asyncio.sleep(0.1)
+    health = await assert_healthy(con)
+    reopened = await assert_ports_reopen(con, (TARGET_LAN_IF, TARGET_WAN_IF))
+    for address, mac, dev in ((r.lan_ip, r.lan_mac, TARGET_LAN_IF),
+                              (WAN_IP, r.wan_mac, TARGET_WAN_IF)):
+        await console_command(con, "ip", "route", "replace", address + "/32", "dev", dev)
+        await console_command(con, "ip", "neigh", "replace", address, "lladdr", mac,
+                              "nud", "permanent", "dev", dev)
+    still = await proc(con)
+    assert still["fatal"] == still["bypassed"] == 1 and still["restarts"] == waiting["restarts"], still
+    assert await dmesg_count(con, TERMINAL) == 0
+    r.record(label, {"state": still, "health": health, "ports": reopened,
+                     "crossed": len(r.echo.received) - received})
+
+
+async def test_restart_budget_waits_in_software(rig):
+    """Past the restart budget, or with restarts disabled, an unproven
+    deletion waits in software -- never for a reboot -- and comes back to
+    hardware once the limit allows.
+
+    With a budget of one the boot's window is spent within at most two
+    unproven deletions, and the next finds it so: its key is settled at once,
+    but the classifier stays bypassed, the ports running past it, so the
+    stream still crosses the DUT through the CPU; the platform's probe passes,
+    a port taken down and up opens as usual, the wait is published, and no
+    line asks for a reboot. Raising the limit at runtime gives the classifier
+    back at once: the latch clears, the ports classify again, and a flow
+    admitted after it goes into hardware with its counters moving again. A
+    limit of zero waits the same way until it is raised."""
+    from _flowtable_restart import (BYPASSED, LIMIT, RESTARTED, TERMINAL, UNICAST_FAULT, engines,
+                                    log_marks, quiet_console, require_knobs, restart_budget,
+                                    wait_running, write)
+    r = rig
+    await require_knobs(r.target, r.session, UNICAST_FAULT)
+    assert not (await r.state())["observe"]
+    r.recovery_console = con = Console.target(log_path=str(artifact_dir() / "budget-uart.log"))
+    await asyncio.to_thread(con.login, "root", None)
+
+    async def window(limit: int, why: str, attempts: int, label: str) -> dict:
+        """A latch waiting for `why` under `limit`, the stream proving the
+        datapath forwards in software meanwhile, and then the limit raised:
+        the classifier back at once, and a flow in hardware again."""
+        await write(con, LIMIT, limit)
+        waiting = None
+        for _ in range(attempts):
+            waiting = await _latch_waiting(con, r, why)
+            if waiting:
+                break
+        assert waiting, f"no latch waited for {why}"
+        baseline = len(r.echo.received)
+        traffic = asyncio.create_task(terminal_stream(r, duration=60))
+        try:
+            deadline = time.monotonic() + 5
+            while len(r.echo.received) < baseline + 32:
+                assert not traffic.done(), "traffic stopped before the software window"
+                assert time.monotonic() < deadline, "the stream did not reach WAN in software"
+                await asyncio.sleep(0.05)
+            await _in_software(con, r, traffic, waiting, classifying, f"{label}-in-software")
+            # Raised at runtime: asked again at once, no window waited out.
+            raised = time.monotonic()
+            await write(con, LIMIT, 1000)
+            deadline = raised + 5
+            while (state := await r.state())["fatal"]:
+                assert time.monotonic() < deadline, state
+                await asyncio.sleep(0.2)
+            assert not state["bypassed"] and state["restarts"] == waiting["restarts"] + 1, state
+            assert await wait_running(con, classifying) == {"6": 1, "7": 1}
+        finally:
+            # Finish the LAN script before clearing its traffic state.
+            r.record(f"{label}-traffic", await traffic)
+        await r.clear_ct()
+        await r.table()
+        await r.admit(64)
+        proven = await hardware_proof(r)
+        assert proven["fatal"] == proven["bypassed"] == proven["quarantine"] == 0, proven
+        r.record(f"{label}-restored", {"waiting": waiting, "restored": state, "proven": proven,
+                                       "seconds": time.monotonic() - raised})
+        await r.clear_ct()
+        return proven
+
+    async with quiet_console(con), links_restored(r, con), restart_budget(con, r, (UNICAST_FAULT,)):
+        classifying = await engines(con)
+        marks = await log_marks(con)
+        start = await r.state()
+        # A budget of one is spent by the boot's window within two unproven
+        # deletions, and the next finds it so.
+        await window(1, "restart budget exhausted", 3, "budget")
+        # Restarts disabled: the same wait, until the limit is raised.
+        final = await window(0, "datapath restarts are disabled", 1, "disabled")
+        now = await log_marks(con)
+        restarted = now[RESTARTED] - marks[RESTARTED]
+        assert restarted == final["restarts"] - start["restarts"] and restarted >= 2, (marks, now)
+        assert now[BYPASSED] - marks[BYPASSED] == restarted and now[TERMINAL] == marks[TERMINAL]
+        r.record("budget-complete", {"final": final, "log": now,
+                                     "boot_id": await read(r.target, r.session,
+                                                           "/proc/sys/kernel/random/boot_id")})
+
+
+async def test_unproven_delete_restarts(rig):
+    """A unicast delete CDX cannot prove takes the classifier out of the
+    datapath, which forwards in software meanwhile, and CDX restarts it in
+    the same boot.
+
+    The key may still be linked, so the latch stops every classifier port
+    just long enough to see it idle and sends it past the classifier, which it
+    keeps; with nothing walking the tables CDX settles the key and gives the
+    classifier back. Held by the test image's knob, the bypassed window shows
+    what the latch promises: the stream still crosses the DUT, through the
+    CPU, the receive ports running with their frames past the PCD; every flow
+    declined; a port opens again as usual; no adapter loads; Linux's own
+    configuration changes are taken without effect; and the platform's probe
+    passes. Released, the latch clears, the restart is counted and logged with
+    the key it settled, the ports classify again, the adapter loads, and the
+    flow goes back into hardware with exact counts. A restart nothing holds
+    comes back within the bound, the ports stopped for no more than a moment
+    of it."""
+    from _flowtable_restart import (HOLD, REASON, RUNNING, STOP_BOUND, UNICAST_FAULT, assert_healthy,
+                                    assert_ports_reopen, assert_restarted_cleanly, engines, knob,
+                                    log_marks, ports, proc, quiet_console, require_knobs,
+                                    restart_budget, restart_counts, timed_restart, wait_bypassed,
+                                    wait_restarted, wait_running, write)
     r = rig
     await require_knobs(r.target, r.session, UNICAST_FAULT)
     assert not (await r.state())["observe"]
@@ -1094,10 +1119,11 @@ async def test_unproven_delete_restarts(rig):
         await r.table()
         initial = await r.admit(128)
         assert all(int(f["packets"]) > 0 for f in initial["flows"]), initial
+        classifying = await engines(con)
         marks = await log_marks(con)
         baseline = len(r.echo.received)
         # Outlasts the window's console checks, and then shows forwarding
-        # back after the restart.
+        # going on after the restart.
         traffic = asyncio.create_task(terminal_stream(r, duration=75))
         try:
             deadline = time.monotonic() + 5
@@ -1114,22 +1140,26 @@ async def test_unproven_delete_restarts(rig):
             await write(con, HOLD, 1)
             await write(con, UNICAST_FAULT, 1)
             await console_command(con, "nft", "delete", "table", "inet", TABLE)
-            stopped, _ = await wait_stopped(con, live)
+            bypassed, _ = await wait_bypassed(con, live, classifying)
             deadline = time.monotonic() + 10
-            while not stopped["invalidation_done"]:
-                assert time.monotonic() < deadline, stopped
+            while not bypassed["invalidation_done"]:
+                assert time.monotonic() < deadline, bypassed
                 await asyncio.sleep(0.1)
-                stopped = await proc(con)
-            assert stopped["invalidated"] == 1 and stopped["errors"] - live["errors"] == 1, stopped
-            assert stopped["entries"] == stopped["bindings"] == stopped["quarantine"] == 0, stopped
-            assert stopped["rearm_ready"] == 0, stopped
+                bypassed = await proc(con)
+            assert bypassed["invalidated"] == 1 and bypassed["errors"] - live["errors"] == 1, bypassed
+            assert bypassed["entries"] == bypassed["bindings"] == bypassed["quarantine"] == 0, bypassed
+            assert bypassed["rearm_ready"] == 0, bypassed
             assert await knob(con, UNICAST_FAULT) == "N"
-            # The stopped ports carry nothing while the sender keeps sending.
-            await asyncio.sleep(0.2)
-            received = len(r.echo.received)
-            assert not traffic.done(), "traffic ended before the stopped window"
-            await asyncio.sleep(1)
-            assert len(r.echo.received) == received, "traffic passed stopped classifier ports"
+            assert await knob(con, REASON) == "held by flowtable_restart_hold"
+            # The bypassed ports carry the stream in software while the sender
+            # keeps sending, and the platform finds the datapath healthy.
+            received, deadline = len(r.echo.received), time.monotonic() + 10
+            while len(r.echo.received) < received + 64:
+                assert not traffic.done(), "traffic ended before the bypassed window"
+                assert time.monotonic() < deadline, "nothing crossed the bypassed classifier"
+                await asyncio.sleep(0.1)
+            crossed = len(r.echo.received) - received
+            health = await assert_healthy(con)
             # Linux's own configuration is Linux's: an MTU change is taken
             # and leaves the latch, the adapter and the ports as they were.
             mtu_checks = []
@@ -1140,43 +1170,44 @@ async def test_unproven_delete_restarts(rig):
                 finally:
                     await console_command(con, "ip", "link", "set", "dev", dev, "mtu", original_mtu)
                 held = await proc(con)
-                for field in ("fatal", "fatal_terminal", "restarts", "invalidated", "invalidation_done",
+                for field in ("fatal", "bypassed", "restarts", "invalidated", "invalidation_done",
                               "rearm_ready", "entries", "bindings", "installs", "deletes", "rearms",
                               "errors", "quarantine"):
-                    assert held[field] == stopped[field], (field, held, stopped)
-                assert await ports(con) == STOPPED
+                    assert held[field] == bypassed[field], (field, held, bypassed)
+                assert await ports(con) == RUNNING
                 mtu_checks.append({"dev": dev, "state": held})
-            # No port opens under the latch, and no adapter claims it:
-            # unloading one works, loading one is refused until the restart.
-            refused_ports = await assert_port_start_refused(con, (TARGET_LAN_IF, TARGET_WAN_IF))
-            await console_command(con, "rmmod", "ask_flowtable", timeout=25)
-            reload = await console_command(con, "modprobe", "ask_flowtable", check=False, timeout=30)
-            assert reload["rc"] != 0 and "Operation not supported" in reload["stdout"], reload
-            assert await ports(con) == STOPPED
-            r.record("restart-stopped", {"live": live, "stopped": stopped, "mtu": mtu_checks,
-                                         "ports": refused_ports, "reload": reload})
-            # Released: CDX settles the key and restarts, and the adapter
-            # loads again once it has.
-            restarted = await wait_restarted(con, live, adapter=False)
-            assert restarted["entries"] == restarted["bindings"] == restarted["quarantine"] == 0, restarted
-            for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
-                await console_command(con, "ip", "link", "set", "dev", dev, "up")
+            # A port opens again as usual, past the classifier like the rest,
+            # and no adapter claims the latch: unloading one works, loading
+            # one is refused until the restart.
+            reopened = await assert_ports_reopen(con, (TARGET_LAN_IF, TARGET_WAN_IF))
             # DOWN can discard the fixture's /32 routes and permanent
-            # neighbours; they come back before the agent is used again.
+            # neighbours; they come back before anything else crosses.
             for address, mac, dev in ((r.lan_ip, r.lan_mac, TARGET_LAN_IF),
                                       (WAN_IP, r.wan_mac, TARGET_WAN_IF)):
                 await console_command(con, "ip", "route", "replace", address + "/32", "dev", dev)
                 await console_command(con, "ip", "neigh", "replace", address, "lladdr", mac,
                                       "nud", "permanent", "dev", dev)
-            assert await wait_running(con) == RUNNING
+            await console_command(con, "rmmod", "ask_flowtable", timeout=25)
+            reload = await console_command(con, "modprobe", "ask_flowtable", check=False, timeout=30)
+            assert reload["rc"] != 0 and "Operation not supported" in reload["stdout"], reload
+            assert await ports(con) == RUNNING
+            r.record("restart-bypassed", {"live": live, "bypassed": bypassed, "mtu": mtu_checks,
+                                          "ports": reopened, "reload": reload, "health": health,
+                                          "crossed": crossed})
+            # Released: CDX settles the key and restarts, and the adapter
+            # loads again once it has.
+            restarted = await wait_restarted(con, live, adapter=False)
+            assert restarted["entries"] == restarted["bindings"] == restarted["quarantine"] == 0, restarted
+            assert await wait_running(con, classifying) == RUNNING
+            assert not await knob(con, REASON)
             line = await assert_restarted_cleanly(con, marks)
-            resolved, released, _ = restart_counts(line)
-            assert resolved == 1 and released == 0, line
-            # Forwarding resumes, in software until the table is back.
+            resolved, released, stopped_ms, _ = restart_counts(line)
+            assert resolved == 1 and released == 0 and stopped_ms <= STOP_BOUND * 1000, line
+            # Forwarding goes on, in software until the table is back.
             resumed, deadline = len(r.echo.received), time.monotonic() + 10
             while len(r.echo.received) < resumed + 16:
-                assert not traffic.done(), "traffic ended before forwarding resumed"
-                assert time.monotonic() < deadline, "forwarding did not resume after the restart"
+                assert not traffic.done(), "traffic ended before forwarding went on"
+                assert time.monotonic() < deadline, "forwarding stopped after the restart"
                 await asyncio.sleep(0.1)
             r.record("restart-resumed", {"state": restarted, "log": line})
         finally:
@@ -1188,10 +1219,11 @@ async def test_unproven_delete_restarts(rig):
         await r.table()
         await r.admit(64)
         proven = await hardware_proof(r)
-        assert proven["fatal"] == proven["quarantine"] == 0, proven
+        assert proven["fatal"] == proven["bypassed"] == proven["quarantine"] == 0, proven
         assert proven["restarts"] == live["restarts"] + 1, proven
-        # A restart nothing holds comes back within the bound, and the flow
-        # with it once the table is back.
+        # A restart nothing holds comes back within the bound, the ports
+        # stopped for no more than a moment of it, and the flow with it once
+        # the table is back.
         timed = await timed_restart(con, ["nft", "delete", "table", "inet", TABLE])
         await assert_restarted_cleanly(con, marks, restarts=2)
         await r.clear_ct()

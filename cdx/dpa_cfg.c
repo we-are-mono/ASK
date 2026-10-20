@@ -72,8 +72,12 @@ static struct dpa_fq *dpa_pcd_fq;
  *        dpa_cfg_install(). release_cfg_info() assumes it
  *        is held by the caller.
  *      - Serializes every change to the classifier ports CDX
- *        configured (dpa_active_ports): the stop and resume of a
- *        datapath restart, the quiesce and restore of unload.
+ *        configured (dpa_active_ports): the stop, bypass, unbypass
+ *        and resume of a datapath restart, the quiesce and restore of
+ *        unload. Each of those also holds RTNL, so a netdev notifier
+ *        reads their state under RTNL alone (dpa_cfg_bypassed()), and
+ *        takes dpa_cfg_lock under RTNL, without ctrl.mutex, to read a
+ *        port's own (dpa_cfg_port_held()).
  *
  *   fman_info, num_fmans (file-scope globals)
  *      - Populated exactly once, in dpa_cfg_install() under
@@ -590,16 +594,26 @@ struct dpa_init_port {
 	/* The ICID the port stamps into the frames it enqueues, as the FMan
 	 * held it when the port was resolved, or a negative errno. */
 	int icid;
+	/* Through a datapath restart (dpa_cfg_bypass()): whether the port's
+	 * frames go past its PCD, and whether it has been seen with no frame in
+	 * hand while disabled since the restart first stopped it -- from then on
+	 * it walks no table until it takes the PCD back. A port that would not
+	 * go past its PCD, or take it back, is reported once a restart. */
+	bool bypassed, idle, reported;
 };
 
 /* Where the classifier ports CDX configured stand. A stopped port is only
- * disabled, so it can be enabled again exactly as it was. Detaching one is not
- * undone the same way -- FM_PORT_DetachPCD() drops the actions reattaching it
- * would need -- and draining retires its queues, so a port that has been
- * through either stays stopped until unload. */
+ * disabled, so it can be enabled again exactly as it was. A bypassed one runs,
+ * but sends its frames to its default queue past the PCD it keeps -- the
+ * datapath forwards in software -- and takes that PCD back unchanged
+ * (FM_PORT_BypassPCD()). Detaching one is not undone the same way --
+ * FM_PORT_DetachPCD() drops the actions reattaching it would need -- and
+ * draining retires its queues, so a port that has been through either stays
+ * stopped until unload. */
 enum dpa_ports_state {
 	DPA_PORTS_RUNNING,
 	DPA_PORTS_STOPPED,	/* disabled and fenced, resumable */
+	DPA_PORTS_BYPASSED,	/* running past the PCD, which they keep */
 	DPA_PORTS_DETACHING,	/* detach attempted; never resumed */
 	DPA_PORTS_QUIESCED,	/* detached and drained, for good */
 };
@@ -730,10 +744,11 @@ static int dpa_prepare_ports(t_LnxWrpFmDev **wrappers,
 			ports->count++;
 		}
 	}
-	/* Said once, here, rather than only when a stop needs it: such a port
-	 * leaves every unproven deletion to a reboot. */
+	/* Said once, here, rather than only when a stop needs it: while such a
+	 * port reaches a classifier, nothing proves an unproven deletion
+	 * settled, and the classifier stays bypassed after one. */
 	if (!dpa_ports_cover(ports, &kind, &jj))
-		pr_warn("cdx: %s port %u reaches a classifier CDX did not configure; a failed classifier deletion will need a reboot\n",
+		pr_warn("cdx: %s port %u reaches a classifier CDX did not configure; after a failed classifier deletion the datapath forwards in software until it no longer does\n",
 			kind, jj);
 	return 0;
 }
@@ -817,25 +832,35 @@ static void dpa_ports_fence(struct dpa_init_ports *ports, bool fenced)
 					fenced ? "" : "un", ii);
 }
 
-/* Wait until no port has a frame in hand. FM_PORT_Disable() waits a bounded
- * time for that and then reports success anyway, so a disabled port is not yet
- * a stopped one. */
-static int dpa_ports_wait_stopped(struct dpa_init_ports *ports)
+/* Wait up to `wait_us` until no port has a frame in hand -- every port with
+ * `all`, otherwise only those not yet seen so in this restart -- marking each
+ * one found so. Every port waited for must be disabled. FM_PORT_Disable()
+ * waits a bounded time for that and then reports success anyway, so a disabled
+ * port is not yet a stopped one. */
+static int dpa_ports_wait_idle(struct dpa_init_ports *ports, bool all,
+			       unsigned int wait_us)
 {
 	unsigned int waited = 0;
 	uint32_t ii;
-	bool stopped;
+	bool stopped, busy;
 
 	for (;;) {
+		busy = false;
 		for (ii = 0; ii < ports->count; ii++) {
-			if (FM_PORT_GetStopped(ports->entries[ii].handle, &stopped))
+			struct dpa_init_port *port = &ports->entries[ii];
+
+			if (!all && port->idle)
+				continue;
+			if (FM_PORT_GetStopped(port->handle, &stopped))
 				return -EIO;
-			if (!stopped)
-				break;
+			if (stopped)
+				port->idle = true;
+			else
+				busy = true;
 		}
-		if (ii == ports->count)
+		if (!busy)
 			return 0;
-		if (waited >= DPA_STOP_WAIT_US)
+		if (waited >= wait_us)
 			return -EBUSY;
 		usleep_range(DPA_STOP_POLL_US, 2 * DPA_STOP_POLL_US);
 		waited += DPA_STOP_POLL_US;
@@ -843,24 +868,53 @@ static int dpa_ports_wait_stopped(struct dpa_init_ports *ports)
 }
 
 /* Disable every port and wait until none has a frame in hand. The first stop
- * records which ports were enabled, for whoever starts them again. The ports
- * are fenced before they are disabled, and every call disables them all again,
- * which also stops one an enable racing the fence switched back on. */
+ * records which ports were enabled, for whoever starts them again, and begins a
+ * restart's record of each port; a stop of bypassed ports records again what
+ * ran past the PCD, which their netdevs may have opened or closed meanwhile,
+ * and leaves a port a bypass could not switch with what the first stop found.
+ * The ports are fenced before they are disabled, and every call disables them
+ * all again, which also stops one an enable racing the fence switched back on. */
 static int dpa_ports_stop(struct dpa_init_ports *ports)
 {
 	uint32_t ii;
 
-	if (ports->state == DPA_PORTS_RUNNING) {
-		for (ii = 0; ii < ports->count; ii++)
-			if (FM_PORT_GetEnabled(ports->entries[ii].handle,
-					       &ports->entries[ii].enabled))
+	if (ports->state == DPA_PORTS_RUNNING || ports->state == DPA_PORTS_BYPASSED) {
+		for (ii = 0; ii < ports->count; ii++) {
+			struct dpa_init_port *port = &ports->entries[ii];
+
+			if (ports->state == DPA_PORTS_BYPASSED && !port->bypassed)
+				continue;
+			if (FM_PORT_GetEnabled(port->handle, &port->enabled))
 				return -EIO;
-		ports->state = DPA_PORTS_STOPPED;
+		}
+		if (ports->state == DPA_PORTS_RUNNING) {
+			for (ii = 0; ii < ports->count; ii++) {
+				ports->entries[ii].bypassed = false;
+				ports->entries[ii].idle = false;
+				ports->entries[ii].reported = false;
+			}
+			WRITE_ONCE(ports->state, DPA_PORTS_STOPPED);
+		}
 	}
 	dpa_ports_fence(ports, true);
 	if (dpa_set_ports_enabled(ports, false))
 		return -EIO;
-	return dpa_ports_wait_stopped(ports);
+	return dpa_ports_wait_idle(ports, true, DPA_STOP_WAIT_US);
+}
+
+/* The Rx port a DPAA netdev receives on, or NULL for any other device. RTNL
+ * held. */
+static t_Handle dpa_netdev_rx_port(const struct net_device *dev)
+{
+	struct dpa_priv_s *priv;
+
+	ASSERT_RTNL();
+	if (dev->type != ARPHRD_ETHER || !dpa_netdev_is_dpaa(dev))
+		return NULL;
+	priv = netdev_priv(dev);
+	if (!priv->mac_dev || !priv->mac_dev->port_dev[RX])
+		return NULL;
+	return fm_port_get_handle(priv->mac_dev->port_dev[RX]);
 }
 
 /* Whether the netdev an Rx port belongs to is up, in whichever namespace it
@@ -880,13 +934,7 @@ static bool dpa_rx_port_wanted(t_Handle handle, char name[IFNAMSIZ])
 	rcu_read_lock();
 	for_each_net_rcu(net) {
 		for_each_netdev_rcu(net, dev) {
-			struct dpa_priv_s *priv;
-
-			if (dev->type != ARPHRD_ETHER || !dpa_netdev_is_dpaa(dev))
-				continue;
-			priv = netdev_priv(dev);
-			if (priv->mac_dev && priv->mac_dev->port_dev[RX] &&
-			    fm_port_get_handle(priv->mac_dev->port_dev[RX]) == handle) {
+			if (dpa_netdev_rx_port(dev) == handle) {
 				wanted = netif_running(dev);
 				strscpy(name, dev->name, IFNAMSIZ);
 				goto out;
@@ -898,29 +946,68 @@ out:
 	return wanted;
 }
 
-/* Take the fence down and start the ports as a stop found them: an offline
- * port if it was enabled then, an Rx port if it was and its netdev is still
- * up. Returns how many would not start, each named in the log; the others
- * start all the same. RTNL and dpa_cfg_lock held. */
+/* Start one fenced port as a stop found it: an offline port if it was enabled
+ * then, an Rx port if it was and its netdev is still up. The fence comes off
+ * either way. -EIO, the port named in the log, when it would not start. RTNL
+ * and dpa_cfg_lock held. */
+static int dpa_port_start(struct dpa_init_port *port)
+{
+	char name[IFNAMSIZ] = "";
+
+	if (FM_PORT_SetFenced(port->handle, false))
+		DPA_ERROR("cdx: cannot unfence port %s\n", port->name);
+	if (!port->enabled || (port->rx && !dpa_rx_port_wanted(port->handle, name)))
+		return 0;
+	if (FM_PORT_Enable(port->handle)) {
+		DPA_ERROR("cdx: cannot start port %s%s%s again\n", port->name,
+			  name[0] ? " of " : "", name);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* Take the fence down and start the ports as a stop found them. Returns how
+ * many would not start, each named in the log; the others start all the same.
+ * RTNL and dpa_cfg_lock held. */
 static unsigned int dpa_ports_start(struct dpa_init_ports *ports)
 {
 	unsigned int failed = 0;
 	uint32_t ii;
 
-	dpa_ports_fence(ports, false);
+	for (ii = 0; ii < ports->count; ii++)
+		if (dpa_port_start(&ports->entries[ii]))
+			failed++;
+	return failed;
+}
+
+/* Send one disabled port past its PCD: true once its frames go past it, which
+ * a bypass that took the entry register achieves whatever else of it failed.
+ * dpa_cfg_lock held. */
+static bool dpa_port_bypass(struct dpa_init_port *port)
+{
+	bool attached;
+
+	return !FM_PORT_BypassPCD(port->handle, true) ||
+	       (!FM_PORT_IsPcdAttached(port->handle, &attached) && !attached);
+}
+
+/* The same for the ports past their PCD alone, which is all a restart may
+ * start before the tables are settled: one a bypass could not switch stays
+ * stopped, and fenced. Those already running are left alone. RTNL and
+ * dpa_cfg_lock held. */
+static void dpa_ports_start_bypassed(struct dpa_init_ports *ports)
+{
+	uint32_t ii;
+	bool enabled;
+
 	for (ii = 0; ii < ports->count; ii++) {
 		struct dpa_init_port *port = &ports->entries[ii];
-		char name[IFNAMSIZ] = "";
 
-		if (!port->enabled || (port->rx && !dpa_rx_port_wanted(port->handle, name)))
+		if (!port->bypassed ||
+		    (!FM_PORT_GetEnabled(port->handle, &enabled) && enabled))
 			continue;
-		if (FM_PORT_Enable(port->handle)) {
-			DPA_ERROR("cdx: cannot start port %s%s%s again\n", port->name,
-				  name[0] ? " of " : "", name);
-			failed++;
-		}
+		dpa_port_start(port);
 	}
-	return failed;
 }
 
 /* Stop the classifier ports for a repair of the tables they walk, keeping what
@@ -929,11 +1016,12 @@ static unsigned int dpa_ports_start(struct dpa_init_ports *ports)
  *
  * 0: every port is disabled and fenced and has no frame in hand, and no port
  * CDX did not configure reaches a classifier, so nothing but host commands
- * walks the tables until dpa_cfg_resume(). -EBUSY: disabled, but a port is
- * still finishing a frame; ask again. -EXDEV: another port reaches a
- * classifier, and stopping CDX's own proves nothing about the tables.
- * -ENOTRECOVERABLE: stopped, and with no such port, but the ports have been
- * detached and can never be resumed. */
+ * walks the tables until dpa_cfg_bypass() or dpa_cfg_resume(). -EBUSY:
+ * disabled, but a port is still finishing a frame; ask again. -EXDEV: another
+ * port reaches a classifier, and stopping CDX's own proves nothing about the
+ * tables. -ENOTRECOVERABLE: stopped, and with no such port, but the ports
+ * have been detached and can never be resumed. -EINVAL for bypassed ports,
+ * which dpa_cfg_unbypass() stops. */
 int dpa_cfg_stop(void)
 {
 	struct dpa_init_ports *ports = &dpa_active_ports;
@@ -942,6 +1030,10 @@ int dpa_cfg_stop(void)
 	int ret = 0;
 
 	mutex_lock(&dpa_cfg_lock);
+	if (ports->state == DPA_PORTS_BYPASSED) {
+		ret = -EINVAL;
+		goto out;
+	}
 	if (ports->state != DPA_PORTS_QUIESCED) {
 		ret = dpa_ports_stop(ports);
 		if (ret)
@@ -1051,12 +1143,185 @@ int dpa_cfg_port_rejected(uint32_t portid, u32 *count)
 	return rc;
 }
 
+/* Send the stopped ports' frames past the classifier, so that the datapath
+ * forwards in software while a restart settles the tables they walk, and start
+ * them again as dpa_cfg_resume() would. RTNL and the control mutex held;
+ * idempotent, and every call does what an earlier one could not.
+ *
+ * Each port goes past its PCD while disabled, the SDK keeping the PCD to give
+ * back (FM_PORT_BypassPCD()), and from then on walks no table. One whose
+ * bypass failed stays stopped and fenced, named once, and is tried again by
+ * the next call; one whose bypass took the entry register counts as bypassed
+ * whatever else failed, its frames going past the PCD. A port seen with no
+ * frame in hand since the restart's first stop is proven out of the tables;
+ * one a stop gave up on is bypassed all the same -- its frame may still walk
+ * them -- and a later call stops it alone again, briefly, to look, and starts
+ * it again; the first call, which follows the stop, looks once and waits for
+ * nothing. A running port is never switched under its frames.
+ *
+ * Returns how many ports are not yet proven out of the tables -- the caller
+ * frees nothing a stop let go of while any is -- with *held set to how many
+ * stay stopped. -EINVAL for running ports, -ENOTRECOVERABLE for detached
+ * ones. */
+int dpa_cfg_bypass(unsigned int *held)
+{
+	struct dpa_init_ports *ports = &dpa_active_ports;
+	unsigned int unproven = 0;
+	uint32_t ii;
+	bool enabled;
+	int ret;
+
+	ASSERT_RTNL();
+	*held = 0;
+	mutex_lock(&dpa_cfg_lock);
+	if (ports->state != DPA_PORTS_STOPPED && ports->state != DPA_PORTS_BYPASSED) {
+		ret = ports->state == DPA_PORTS_RUNNING ? -EINVAL : -ENOTRECOVERABLE;
+		goto out;
+	}
+	if (ports->state == DPA_PORTS_BYPASSED) {
+		for (ii = 0; ii < ports->count; ii++) {
+			struct dpa_init_port *port = &ports->entries[ii];
+
+			if (port->idle || FM_PORT_GetEnabled(port->handle, &enabled) || !enabled)
+				continue;
+			/* Running past its PCD, which its netdev or an
+			 * earlier call started it on: started again below
+			 * whatever this finds. */
+			port->enabled = true;
+			if (FM_PORT_SetFenced(port->handle, true) || FM_PORT_Disable(port->handle)) {
+				/* Still running, and open to its netdev; the
+				 * look below finds it busy. */
+				DPA_ERROR("cdx: cannot stop port %s to look at it\n", port->name);
+				FM_PORT_SetFenced(port->handle, false);
+			}
+		}
+	}
+	/* Each port looked at is disabled -- by the restart's stop, or above --
+	 * and one still busy, or that cannot be asked, is counted below. */
+	dpa_ports_wait_idle(ports, false,
+			    ports->state == DPA_PORTS_BYPASSED ? DPA_STOP_WAIT_US : 0);
+	for (ii = 0; ii < ports->count; ii++) {
+		struct dpa_init_port *port = &ports->entries[ii];
+
+		if (!port->bypassed && dpa_port_bypass(port))
+			port->bypassed = true;
+		if (!port->bypassed) {
+			(*held)++;
+			if (!port->reported)
+				DPA_ERROR("cdx: cannot send port %s past its classifier; it stays stopped\n",
+					  port->name);
+			port->reported = true;
+		}
+		if (!port->idle)
+			unproven++;
+	}
+	dpa_ports_start_bypassed(ports);
+	WRITE_ONCE(ports->state, DPA_PORTS_BYPASSED);
+	ret = unproven;
+out:
+	mutex_unlock(&dpa_cfg_lock);
+	return ret;
+}
+
+/* Give the classifier back to the ports dpa_cfg_bypass() sent past it: each
+ * stopped as dpa_cfg_stop() stops them, so that no frame meets half of either
+ * set of registers, and then given its PCD back as it was, leaving the ports
+ * stopped and fenced for dpa_cfg_resume(), which starts what ran meanwhile --
+ * a port a bypass left stopped as the first stop found it. RTNL and the control
+ * mutex held. 0, also for ports already stopped; -EBUSY when a port would not
+ * go idle, -EIO when one would not take its PCD back: either way every port
+ * goes back past its PCD and starts again, and the caller asks later.
+ * -EINVAL for running ports, -ENOTRECOVERABLE for detached ones. */
+int dpa_cfg_unbypass(void)
+{
+	struct dpa_init_ports *ports = &dpa_active_ports;
+	uint32_t ii;
+	int ret;
+
+	ASSERT_RTNL();
+	mutex_lock(&dpa_cfg_lock);
+	if (ports->state != DPA_PORTS_BYPASSED) {
+		ret = ports->state == DPA_PORTS_STOPPED ? 0 :
+		      ports->state == DPA_PORTS_RUNNING ? -EINVAL : -ENOTRECOVERABLE;
+		goto out;
+	}
+	/* A port that would not stop or cannot say is one not seen idle. */
+	ret = dpa_ports_stop(ports) ? -EBUSY : 0;
+	for (ii = 0; !ret && ii < ports->count; ii++) {
+		struct dpa_init_port *port = &ports->entries[ii];
+
+		if (port->bypassed && FM_PORT_BypassPCD(port->handle, false)) {
+			if (!port->reported)
+				DPA_ERROR("cdx: port %s would not take its classifier back\n",
+					  port->name);
+			port->reported = true;
+			ret = -EIO;
+		}
+	}
+	if (ret) {
+		/* As before: every port that was past its PCD goes back past it
+		 * -- one given its PCD back above too -- and runs. One that will
+		 * not stays stopped with its PCD, as a failed bypass leaves it. */
+		for (ii = 0; ii < ports->count; ii++) {
+			struct dpa_init_port *port = &ports->entries[ii];
+
+			if (port->bypassed && !dpa_port_bypass(port))
+				port->bypassed = false;
+		}
+		dpa_ports_start_bypassed(ports);
+		goto out;
+	}
+	for (ii = 0; ii < ports->count; ii++)
+		ports->entries[ii].bypassed = false;
+	WRITE_ONCE(ports->state, DPA_PORTS_STOPPED);
+out:
+	mutex_unlock(&dpa_cfg_lock);
+	return ret;
+}
+
+/* Whether the classifier ports run past their PCD, for a restart's report and
+ * for the netdev guard, which lets a port open then. Lock-free: every change
+ * holds RTNL, under which the guard reads it; /proc's reading is a
+ * snapshot. */
+bool dpa_cfg_bypassed(void)
+{
+	return READ_ONCE(dpa_active_ports.state) == DPA_PORTS_BYPASSED;
+}
+
+/* Whether the Rx port this netdev receives on is one a bypass could not send
+ * past its classifier, which stays stopped and fenced while the others run:
+ * its netdev's open would fail at the fence, with the SDK's error rather than
+ * an errno and nothing said, so the netdev guard refuses it instead. RTNL
+ * held. */
+bool dpa_cfg_port_held(const struct net_device *dev)
+{
+	struct dpa_init_ports *ports = &dpa_active_ports;
+	t_Handle handle = dpa_netdev_rx_port(dev);
+	bool held = false;
+	uint32_t ii;
+
+	if (!handle)
+		return false;
+	mutex_lock(&dpa_cfg_lock);
+	if (ports->state == DPA_PORTS_BYPASSED) {
+		for (ii = 0; ii < ports->count; ii++) {
+			if (ports->entries[ii].handle == handle) {
+				held = !ports->entries[ii].bypassed;
+				break;
+			}
+		}
+	}
+	mutex_unlock(&dpa_cfg_lock);
+	return held;
+}
+
 /* Start the ports a stop left, as they were before it: an offline port if it
  * was enabled then, an Rx port if it was and its netdev is still up. The fence
  * comes off first. RTNL and the control mutex held. -ENOTRECOVERABLE for ports
  * that have been detached, which this would start on a path nothing
- * configured; otherwise how many ports would not start, each named in the log,
- * the others started all the same. */
+ * configured; -EINVAL for bypassed ones, which dpa_cfg_unbypass() gives the
+ * classifier back first; otherwise how many ports would not start, each named
+ * in the log, the others started all the same. */
 int dpa_cfg_resume(void)
 {
 	struct dpa_init_ports *ports = &dpa_active_ports;
@@ -1066,21 +1331,26 @@ int dpa_cfg_resume(void)
 	mutex_lock(&dpa_cfg_lock);
 	if (ports->state == DPA_PORTS_RUNNING)
 		goto out;
+	if (ports->state == DPA_PORTS_BYPASSED) {
+		ret = -EINVAL;
+		goto out;
+	}
 	if (ports->state != DPA_PORTS_STOPPED) {
 		ret = -ENOTRECOVERABLE;
 		goto out;
 	}
 	ret = dpa_ports_start(ports);
-	ports->state = DPA_PORTS_RUNNING;
+	WRITE_ONCE(ports->state, DPA_PORTS_RUNNING);
 out:
 	mutex_unlock(&dpa_cfg_lock);
 	return ret;
 }
 
 /* Stop the ports for good, for unload: stopped as dpa_cfg_stop() stops them,
- * keeping what an earlier stop recorded, then detached from the classifier and
- * their queues drained. Caller holds RTNL and the control mutex; preserve
- * current stack state. */
+ * keeping what an earlier stop recorded -- or, bypassed, recording what ran
+ * past the PCD, as dpa_cfg_unbypass() does -- then detached from the
+ * classifier, which also ends a bypass, and their queues drained. Caller holds
+ * RTNL and the control mutex; preserve current stack state. */
 int dpa_cfg_quiesce(void)
 {
 	struct dpa_init_ports *ports = &dpa_active_ports;
@@ -1090,9 +1360,14 @@ int dpa_cfg_quiesce(void)
 	if (ports->state == DPA_PORTS_QUIESCED)
 		goto out;
 	ret = dpa_ports_stop(ports);
-	if (ret)
+	if (ret) {
+		/* Bypassed ports forward in software until the next try, which
+		 * records again what runs then -- not ports this one disabled. */
+		if (ports->state == DPA_PORTS_BYPASSED)
+			dpa_ports_start_bypassed(ports);
 		goto out;
-	ports->state = DPA_PORTS_DETACHING;
+	}
+	WRITE_ONCE(ports->state, DPA_PORTS_DETACHING);
 	if (dpa_detach_ports(ports)) {
 		ret = -EIO;
 		goto out;
@@ -1100,7 +1375,7 @@ int dpa_cfg_quiesce(void)
 	/* Wi-Fi still holds these FQ pointers until its exit callback restores
 	 * their drain callbacks. Reclaim frames now, retain storage until then. */
 	cdx_drain_fq_list(dpa_pcd_fq);
-	ports->state = DPA_PORTS_QUIESCED;
+	WRITE_ONCE(ports->state, DPA_PORTS_QUIESCED);
 out:
 	mutex_unlock(&dpa_cfg_lock);
 	return ret;

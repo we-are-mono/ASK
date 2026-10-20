@@ -221,10 +221,10 @@ exclusion policy. Multicast stays on, since the policy asks for acceleration.
 Disabling the policy drains multicast too: the switch goes off first and the
 drain also waits for `mcast_installed` and `mroute_installed`.
 A retirement failure reports that recovery is required and never publishes a
-replacement. A fatal hardware latch is not by itself a reboot: CDX restarts the
-datapath after a recoverable one and the daemon reconciles the policy once the
-restart completes. Only a terminal latch requires full provider teardown and a
-fresh boot (see `status` below).
+replacement. A fatal hardware latch is never a reboot: CDX restarts the
+datapath after every one, forwarding in software however long that waits, and
+the daemon reconciles the policy once the restart completes (see `status`
+below).
 
 Concurrent controller calls serialize on `/run/ask-flowtable/policy.lock`. Each
 `nft` invocation has a five-second monotonic deadline covering input, output
@@ -258,12 +258,15 @@ measurements to prove execution. Global invalidation may leave the policy
 installed while admission is stopped. The daemon performs a full transaction
 to recover it automatically; under manual control, applying it again performs
 that boundary. While CDX restarts the datapath after a hardware retirement it
-could not prove (`fatal 1`, `fatal_terminal 0`), the daemon leaves the table
-alone and checks again every second until the restart is done; only a terminal
-one (`fatal_terminal 1`) still requires a fresh boot. `status` reports the
-restarts so far and `resume_failures`, the classifier ports a restart could
-not start again; the kernel log names each. A receive port starts again with
-its netdev; an offline port only when CDX is reloaded or the board reboots.
+could not prove (`fatal 1`; `bypassed 1` while the ports forward in software
+past the classifier), the daemon leaves the table alone and checks again after
+a second, then ever less often, up to its longest interval, until the restart
+is done; it never asks for a boot, and the health probe passes. What the
+restart waits for is `/sys/module/cdx/parameters/flowtable_degraded_reason`.
+`status` reports `bypassed`, the restarts so far and `resume_failures`, the
+classifier ports a restart could not start again; the kernel log names each.
+A receive port starts again with its netdev; an offline port only when CDX is
+reloaded or the board reboots.
 
 ## Carrying useful CMM settings forward
 

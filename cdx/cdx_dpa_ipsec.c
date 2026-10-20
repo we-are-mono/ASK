@@ -691,7 +691,6 @@ static inline void reset_natt_arr_mask(uint16_t *natt_arr_mask,int index)
 
 int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 {
-	struct hw_ct *hwct;
 	struct en_exthash_tbl_entry *natt_tbl_entry;
 	struct en_ehash_ipsec_preempt_op *ipsec_preempt_params;
 	int rc;
@@ -722,26 +721,27 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 			
 	}
 	if ((pSA->ct) && (pSA->ct->handle)) {
-		/* The table entry belongs to cdx_ehash_delete_entry() on every
-		 * arm of the DeleteKey contract, so the teardown below runs
-		 * unconditionally instead of bailing out with the entry still
-		 * owned by nobody (ISSUES.md A95). hw_ct is pure software with
-		 * no hardware reference, so releasing it after a failed delete
-		 * is safe and leaves no stale pointer to a handle this SA no
-		 * longer owns.
+		/* The table entry and its hw_ct belong to
+		 * cdx_ehash_delete_entry() on every arm of the DeleteKey
+		 * contract, so the teardown below runs unconditionally instead
+		 * of bailing out with the entry still owned by nobody (ISSUES.md
+		 * A95), and the SA lets go of both: after a failed delete the
+		 * hw_ct is CDX's record of the key, which this SA no longer
+		 * owns.
 		 *
 		 * What the entry names is another matter, and this is the only
 		 * place that knows: both callers -- the SA delete and an
 		 * outbound next-hop rebuild, after which the SA holds no entry
 		 * for its own delete to find -- come through here. A key that
-		 * may still be linked may still resolve, so the ports stop, as
-		 * any such key demands. An inbound SA's entry enqueues to its
+		 * may still be linked may still resolve, so the classifier is
+		 * taken out of the datapath, as any such key demands. An
+		 * inbound SA's entry enqueues to its
 		 * TO_SEC FQID, and an outbound one validates its SEC tag: both
 		 * identities must stay reserved past the SA's release. The
 		 * unsynced arm is out of the table and parked; it needs
 		 * neither. */
-		rc = cdx_ehash_delete_entry(pSA->ct->td, pSA->ct->index,
-				pSA->ct->handle);
+		rc = cdx_ehash_delete_entry(pSA->ct);
+		pSA->ct = NULL;
 		if (rc)
 			DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
 		if (rc && rc != EN_EHASH_DELETE_UNSYNCED) {
@@ -750,10 +750,6 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 				cdx_dpa_ipsecsa_keep_fqids(pSA->pSec_sa_context->dpa_ipsecsa_handle);
 			cdx_ft_fatal();
 		}
-		pSA->ct->handle =  NULL;
-		hwct = pSA->ct;
-		pSA->ct = NULL;
-		kfree(hwct);
 		/* Propagate the tri-state (negative on failure) rather than
 		 * flattening to -1; today's callers only test truthiness, so
 		 * this only preserves information. */

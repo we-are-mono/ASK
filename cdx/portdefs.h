@@ -278,9 +278,18 @@ void dpa_release_iflist(void);
  * repair of the tables they walk; see dpa_cfg.c. RTNL and the control mutex
  * held for each. Stop never detaches a port or drains a queue, so resume puts
  * every port back exactly as it was; quiesce does both, for unload, and leaves
- * the ports for good. Resume returns how many ports would not start, or a
- * negative errno. */
+ * the ports for good. Between a stop and a resume, bypass runs the ports past
+ * their PCD, which they keep, so the datapath forwards in software, and returns
+ * how many are not yet proven out of the tables (*held: how many it left
+ * stopped); unbypass gives the PCD back and leaves them stopped. Resume returns
+ * how many ports would not start, or a negative errno. Bypassed is lock-free
+ * and read under RTNL alone by the netdev guard, which also asks, under RTNL,
+ * whether a netdev's Rx port is one a bypass left stopped. */
 int dpa_cfg_stop(void);
+int dpa_cfg_bypass(unsigned int *held);
+int dpa_cfg_unbypass(void);
+bool dpa_cfg_bypassed(void);
+bool dpa_cfg_port_held(const struct net_device *dev);
 int dpa_cfg_resume(void);
 int dpa_cfg_quiesce(void);
 bool dpa_cfg_covered(void);

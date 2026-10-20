@@ -407,6 +407,12 @@ struct hw_ct {
 	uint64_t bytes;
 	uint64_t reset_pkts;
 	uint64_t reset_bytes;
+	/* CDX's record of the key while a delete cannot prove it unlinked
+	 * (cdx_ehash_abandon()), and the deletes the table has refused it since.
+	 * Made with the entry, so that recording a key that may still be linked
+	 * never needs memory on the failure path. */
+	struct list_head abandoned;
+	unsigned int resolve_attempts;
 };
 
 //uncomment to include flow timestamps
@@ -443,8 +449,9 @@ int hw_ct_get_active(struct hw_ct *ct);
  * through cdx_ehash_delete_entry(): ExternalHashTableDeleteKey()'s
  * tri-state (fm_ehash.h) decides whether the table entry may be freed,
  * must be parked until a later host-command barrier proves the ucode has
- * left it, or must be leaked forever. cdx_ehash_delete_entry() owns the
- * handle on every arm; callers free only their own software wrappers.
+ * left it, or must be kept, recorded, for the datapath restart that settles
+ * it. cdx_ehash_delete_entry() owns the hw_ct and its handle on every arm;
+ * callers free only their own software wrappers.
  *
  * The quarantine entry points below are for the paths that splice an
  * entry out by hand instead of calling DeleteKey (multicast listener
@@ -458,7 +465,7 @@ int hw_ct_get_active(struct hw_ct *ct);
  * mc_mutators_mutex - or at module exit with no handler in flight. Not
  * callable under a spinlock: the barriers busy-wait on host-command
  * completion. */
-int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle);
+int cdx_ehash_delete_entry(struct hw_ct *ct);
 void cdx_ehash_quarantine_entry(void *td, void *tbl_entry);
 void cdx_ehash_quarantine_free_all(void);
 void cdx_ehash_quarantine_drain(void *td);
@@ -468,19 +475,19 @@ unsigned int cdx_ehash_quarantine_pending(void);
 
 /* Table entries a delete could not prove it unlinked, kept for the datapath
  * restart that settles them (cdx_ehash.c). A root is an entry a bucket may
- * still link, named with the table and the bucket it was added to; a dependent
+ * still link, recorded through its hw_ct -- the table and the bucket it was
+ * added to -- which the record takes over and which cannot fail; a dependent
  * is reachable only through a root -- a multicast group's listener -- and goes
  * once every root is settled. Same serialization as the quarantine. */
-void cdx_ehash_abandon(void *td, uint16_t index, void *tbl_entry);
+void cdx_ehash_abandon(struct hw_ct *ct);
 void cdx_ehash_abandon_dependent(void *tbl_entry);
-/* A root could not be recorded: it may still be linked and nothing knows where,
- * so no restart can be proven safe. */
-bool cdx_ehash_abandoned_lost(void);
-/* Settle every root, with every port that walks the tables stopped and idle:
- * delete one still linked, free one no bucket links. 0 when none is left,
- * with *resolved counting the roots settled by this call; -EAGAIN when one is
- * still linked, most likely for want of memory, and worth trying again;
- * -ENOTRECOVERABLE when a table is malformed or a root will not go. */
+/* Settle every root, with nothing walking the tables -- every classifier port
+ * stopped or bypassed, each seen idle, and a barrier behind that: delete one
+ * still linked, free one no bucket links. 0 when none is left, with *resolved
+ * counting the roots settled by this call; -EAGAIN when one is still linked,
+ * most likely for want of memory, and worth trying again soon;
+ * -ENOTRECOVERABLE when a table is malformed or a root's delete has been
+ * refused too often, worth trying again only rarely. */
 int cdx_ehash_resolve_abandoned(unsigned int *resolved);
 /* Unload: settle what can be when the ports were stopped, and leak the rest.
  * True when nothing that may still be linked is left. */

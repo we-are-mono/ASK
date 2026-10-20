@@ -52,7 +52,8 @@ def test_sdk_port_pcd(tmp_path, unit):
                 "t_Error FmPortGetSetCcParams(", "static t_Error RealGetSetCcParams(")
             production += "\n".join(function(source, name) for name in [
                 "FmPortSetGprFunc", "FmPortSetFESupport", "FmPortDeleteFESupport",
-                "FM_PORT_Free", "AttachPCD", "DetachPCD", "FM_PORT_AttachPCD", "FM_PORT_DetachPCD",
+                "FM_PORT_Free", "AttachPCD", "DetachPCDEntry", "DetachPCDActions", "DetachPCD",
+                "FM_PORT_AttachPCD", "FM_PORT_DetachPCD", "FM_PORT_BypassPCD",
                 "FM_PORT_ConfigureMuramPage", "DeletePortPcd", "FM_PORT_SetPCD", "FM_PORT_DeletePCD",
                 "FM_PORT_PcdKgBindSchemes", "FM_PORT_PcdKgUnbindSchemes",
                 "FM_PORT_PcdCcModifyTree",

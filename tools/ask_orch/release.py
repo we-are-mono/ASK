@@ -42,10 +42,8 @@ MATRIX = {
     "churn": Run("dut", ("tests/flowtable_churn.py",), {"ASK_FLOWTABLE_CHURN": "1"}),
     "invalidation-barrier": Run("dut", ("tests/flowtable_offload.py::test_invalidation",),
                                 {"ASK_FLOWTABLE_INVALIDATION": "barrier"}),
-    "terminal-unload": Run("dut", ("tests/flowtable_offload.py::test_terminal",),
-                           {"ASK_FLOWTABLE_TERMINAL": "unload"}, ENDS),
-    "terminal-budget": Run("dut", ("tests/flowtable_offload.py::test_terminal",),
-                           {"ASK_FLOWTABLE_TERMINAL": "budget"}, ENDS),
+    "cdx-unload": Run("dut", ("tests/flowtable_offload.py::test_cdx_unload",),
+                      {"ASK_FLOWTABLE_UNLOAD": "1"}, ENDS),
     "unregister": Run("dut", ("tests/flowtable_unregister.py",), {"ASK_FLOWTABLE_UNREGISTER": "1"}, ENDS),
     "startup": Run("startup", boot="the staged test image with rdinit=/bin/sh, which it ends"),
 }

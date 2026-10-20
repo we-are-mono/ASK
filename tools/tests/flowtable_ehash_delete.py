@@ -36,10 +36,10 @@ async def test_rebuilds_under_allocation_failure(rig):
     bucket's node without it -- the one allocation a delete makes, atomic and
     free to fail under memory pressure. The rebuild takes the table's spare
     node instead, and the barrier after it hands back the node it replaced,
-    so every key comes out: nothing abandoned, no terminal latch. Without the
+    so every key comes out: nothing abandoned, no latch at all. Without the
     spare, the first such delete left its key linked and stopped the
-    datapath until a reboot. The bucket then takes the same four again and
-    the FMan forwards them."""
+    datapath until a reboot, as it was then. The bucket then takes the same
+    four again and the FMan forwards them."""
     r = rig
     pairs = crowded_ipv4(SERVERS)
     specs = [{"id": i, "proto": "udp", "sport": s, "connect_port": d} for i, (s, d) in enumerate(pairs)]

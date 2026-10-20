@@ -27,11 +27,11 @@ struct ft_backend {
 	bool     present;
 	long     bindings, entries, handle_refs, neighbour_refs, quarantine;
 	long     fatal, observe, invalidated;
-	/* fatal is CDX's latch, which a datapath restart clears; fatal_terminal
-	 * says none will in this boot. An adapter that does not report it is
-	 * one whose every latch was terminal. restarts counts the restarts, and
-	 * resume_failures the ports one could not start again. */
-	long     fatal_terminal, restarts, resume_failures;
+	/* fatal is CDX's latch, which a datapath restart clears; bypassed says
+	 * the classifier ports run past the classifier meanwhile, forwarding in
+	 * software. restarts counts the restarts, and resume_failures the ports
+	 * one could not start again. */
+	long     bypassed, restarts, resume_failures;
 	long     installs, deletes, rearms, errors;   /* observability, for the CLI result */
 	/* Multicast acceleration: the adapter's global switch and what both of
 	 * its learners have in hardware, which only a disable drains. */
@@ -43,11 +43,13 @@ struct ft_backend {
 };
 
 /* Read-only probe with a five-second deadline, including blocked kernel reads.
- * Returns 0, -1 for a failed or late probe, or FT_HEALTH_TERMINAL when CDX
- * has latched a failure only a reboot clears. */
-#define FT_HEALTH_TERMINAL (-2)
+ * Returns 0, or -1 for a failed or late probe. CDX latches nothing a reboot
+ * alone clears: a datapath restart, however long, forwards in software and is
+ * healthy. */
 int ft_health(struct ft_ctx *ctx);
-bool ft_terminal_reason(char *reason, size_t n);
+/* What a failed probe records for the platform: the failure, and what a
+ * datapath restart waits for if one is under way. */
+void ft_failure_reason(char *reason, size_t n);
 /* Optional U-Boot budget hooks for the platform watchdog manager. */
 int ft_recovery(struct ft_ctx *ctx, const char *verb);
 
@@ -65,13 +67,13 @@ int ft_backend_multicast(struct ft_ctx *ctx, bool on);
 
 /* What an apply or a drain returns instead of -1 while CDX is restarting the
  * datapath after a latch: nothing is wrong that waiting will not mend, so the
- * daemon retries soon rather than backing off. */
+ * daemon asks again soon, and ever less often while the restart lasts. */
 #define FT_RESTARTING (-2)
 
 /* Poll until the DRAIN_FIELDS are zero -- with `multicast`, both learners'
  * installed groups as well -- or the adapter is gone. 0 on drained, -1 on
- * timeout or a terminal latch, FT_RESTARTING while CDX restarts the datapath
- * past the deadline (ctx->err set). */
+ * timeout, FT_RESTARTING while CDX restarts the datapath past the deadline
+ * (ctx->err set). */
 int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms, bool multicast);
 
 /* Resolve "devices auto" against the live interface set: up fsl_dpa ports,

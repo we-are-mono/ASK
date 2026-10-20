@@ -139,7 +139,7 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker("slow")
         if (
             (item.path.name == "flowtable_offload.py"
-             and getattr(item, "originalname", None) == "test_terminal")
+             and getattr(item, "originalname", None) == "test_cdx_unload")
             or item.path.name == "flowtable_unregister.py"
         ):
             item.add_marker("destructive")

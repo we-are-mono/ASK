@@ -427,17 +427,17 @@ void cdx_ft_let_waiters(void);
 
 /* All operations below require a transaction unless explicitly stated.
  * Claim is exclusive. Release requires zero live directions, but CDX keeps any retired hardware
- * storage and its failure latch, which only a datapath restart or a reboot
- * clears. Neither operation resets hardware.
+ * storage and its failure latch, which only CDX's own datapath restart clears.
+ * Neither operation resets hardware.
  */
 int cdx_ft_claim(void);
 int cdx_ft_release(void);
-/* A deletion could not be proven and the datapath is stopped, or about to be,
- * until CDX has settled it and restarted. */
+/* A deletion could not be proven, and the classifier is out of the datapath,
+ * or about to be, until CDX has settled it and restarted. */
 bool cdx_ft_failed(void);
-/* The failure cannot be settled in this boot: the datapath stays stopped and
- * only a reboot clears it. Implies cdx_ft_failed(). */
-bool cdx_ft_terminal(void);
+/* The classifier ports run past the classifier meanwhile: the datapath
+ * forwards in software, for however long the restart waits. */
+bool cdx_ft_bypassed(void);
 /* How many times the datapath has restarted after a failure since CDX loaded. */
 unsigned int cdx_ft_restarts(void);
 /* How many classifier ports those restarts could not start again. The latch
@@ -447,10 +447,11 @@ unsigned int cdx_ft_restarts(void);
 unsigned int cdx_ft_resume_failures(void);
 /* Latch the failure for a root outside the unicast delete path -- a multicast
  * group's or an IPsec SA's -- that could not be provably unlinked and may
- * still forward in hardware. Refuses new entries and groups, blocks port
- * restart and stops the ports; once they are stopped CDX settles the root and
- * restarts the datapath, unless that cannot be proven safe (cdx_ft_terminal()).
- * Also what a failed unicast delete latches, through cdx_ft_del(). */
+ * still forward in hardware. Refuses new entries and groups; stops the ports
+ * and sends them past the classifier, so the datapath forwards in software;
+ * settles the root once none walks the tables; and gives the classifier back,
+ * retrying whatever it waits for for as long as it takes. Also what a failed
+ * unicast delete latches, through cdx_ft_del(). */
 void cdx_ft_fatal(void);
 unsigned int cdx_ft_pending(void);
 /* Everything unlinked through this backend or owed a barrier by CDX -- a
@@ -581,9 +582,10 @@ void cdx_ft_stats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
 void cdx_ft_stats_unpublish(struct cdx_ft_stats_slot *slot);
 void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
 /* Always consumes *hw. -EAGAIN: unlinked storage awaits a barrier. -EIO:
- * unlink is unproven; CDX latches the failure (cdx_ft_fatal()) and stops the
- * datapath until it has settled the key and restarted. Both errors require the
- * adapter to stop admission and start global recovery.
+ * unlink is unproven; CDX latches the failure (cdx_ft_fatal()) and takes the
+ * classifier out of the datapath, which forwards in software, until it has
+ * settled the key and restarted. Both errors require the adapter to stop
+ * admission and start global recovery.
  */
 int cdx_ft_del(struct cdx_ft_hw **hw);
 /* cdx_ft_del() with its barrier left to cdx_ft_settle(), so retiring many keys
@@ -602,11 +604,12 @@ unsigned int cdx_ft_owed(void);
  * a delete returning -EAGAIN leaves one.
  */
 int cdx_ft_settle(unsigned int *unproven);
-/* Retry retired storage; after a failure, first make sure the datapath is
- * stopped. -EAGAIN means retry later. Success never clears the failure: the
- * restart that does is CDX's own, and is reported through the egress ops'
- * restarted(). Never report software fallback ready before this operation
- * succeeds.
+/* Retry retired storage; after a failure, drive CDX's restart on and make
+ * sure no port walks the tables before anything retired goes. -EAGAIN means
+ * retry later. Success does not say the failure has cleared: the restart that
+ * clears it may complete here or later, and is reported through the egress
+ * ops' restarted() either way. Never report software fallback ready before
+ * this operation succeeds.
  */
 int cdx_ft_recover(void);
 

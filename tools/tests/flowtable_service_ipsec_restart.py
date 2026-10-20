@@ -1,12 +1,15 @@
-"""An SA delete that cannot prove its classifier entry unlinked stops the
-datapath, and CDX restarts it in the same boot.
+"""An SA delete that cannot prove its classifier entry unlinked takes the
+classifier out of the datapath, which forwards in software meanwhile, and CDX
+restarts it in the same boot.
 
 The entry enqueues to the SA's TO_SEC FQID. While it may still be linked the
 queues can go -- an out-of-service FQ rejects the enqueue -- but the FQIDs
 cannot: a later SA or any other queue given them would be fed frames it was
-never admitted for. So the delete latches the failure and stops the ports, and
-the SA's release that follows holds its FQIDs. With the ports idle CDX settles
-the entry, gives the FQIDs back and starts the ports again.
+never admitted for. So the delete latches the failure, the ports go past the
+classifier, and the SA's release that follows holds its FQIDs. With nothing
+walking the tables CDX settles the entry, gives the FQIDs back and gives the
+ports the classifier back. An offloaded SA's traffic has no path while it is
+bypassed; the restart installs it again.
 
 Nothing else is touched. The fixture's long-lived SA pair keeps its entries and
 its SEC contexts across the restart, and its flows forward in hardware after
@@ -20,9 +23,9 @@ import asyncio
 
 import pytest
 
-from _flowtable_restart import (HOLD, ROOT_FAULT, RUNNING, assert_restarted_cleanly, knob, log_marks,
-                                ports, require_knobs, restart_budget, restart_counts, wait_restarted,
-                                wait_running, wait_stopped, write)
+from _flowtable_restart import (HOLD, ROOT_FAULT, RUNNING, assert_healthy, assert_restarted_cleanly,
+                                engines, knob, log_marks, ports, require_knobs, restart_budget,
+                                restart_counts, wait_bypassed, wait_restarted, wait_running, write)
 from _ipsec_helpers import endpoints_down, endpoints_up, iface_index, sa_add, sa_del
 from _topology import TARGET_WAN_IF
 from _flowtable_connections import (peer)
@@ -69,23 +72,25 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service, directi
             installed = await r.state()
             assert installed["ipsec_sas"] == baseline["ipsec_sas"] + 1, installed
             sa_dirs = (await console_command(con, "ls", "/proc/fqid_stats/sa"))["stdout"].split()
-            # The stop, the SA's release and the restart are all reported
+            # The bypass, the SA's release and the restart are all reported
             # from work items, after the delete returns, and a printk would
             # land inside whichever console read runs then.
             await command(r.target, r.session, "sysctl", "-w", "kernel.printk=1 4 1 7")
             marks = await log_marks(con)
             assert await ports(con) == RUNNING
+            classifying = await engines(con)
             await write(con, HOLD, 1)
             # Armed over the agent while it still reaches the DUT; the delete
-            # that consumes it goes over the console, since the ports may stop
-            # before an agent reply could leave.
+            # that consumes it goes over the console, which the window is
+            # read over, as it was when the window stopped the ports.
             result = await r.target.fs_write(r.session, ROOT_FAULT, "1")
             assert result["errno"] == 0, result
             await console_command(con, "ip", "xfrm", "state", "delete", "src", src, "dst", dst,
                                   "proto", "esp", "spi", hex(SPI))
-            stopped, _ = await wait_stopped(con, installed)
-            assert stopped["ipsec_sas"] == baseline["ipsec_sas"], stopped
+            bypassed, _ = await wait_bypassed(con, installed, classifying)
+            assert bypassed["ipsec_sas"] == baseline["ipsec_sas"], bypassed
             assert await knob(con, ROOT_FAULT) == "0"
+            await assert_healthy(con)
             # The SA's release, a step per second on the CDX timer until its
             # queues are out of service and SEC is done with it, would give
             # its FQIDs back, and takes the SA's procfs entry with it. Held,
@@ -99,11 +104,11 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service, directi
             else:
                 raise AssertionError(f"the deleted SA was not released: {sa_dirs} -> {left}")
             restarted = await wait_restarted(con, installed)
-            assert await wait_running(con) == RUNNING
+            assert await wait_running(con, classifying) == RUNNING
             line = await assert_restarted_cleanly(con, marks)
-            resolved, released, _ = restart_counts(line)
+            resolved, released, *_ = restart_counts(line)
             assert resolved == 1 and released == 1, line
-            r.record("ipsec-restart", {"installed": installed, "stopped": stopped,
+            r.record("ipsec-restart", {"installed": installed, "bypassed": bypassed,
                                        "restarted": restarted, "log": line})
             # The pair's flows carry the tunnel in hardware again, SEC
             # counting both ways.

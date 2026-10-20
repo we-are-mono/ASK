@@ -152,23 +152,18 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A403 — some datapath-restart failures still end in "reboot required".** A router runs for years unattended, so
-  no failure may need a reboot to clear. `cdx_ft_restart()` (cdx_flowtable_backend.c) makes the latch terminal for a
-  port CDX did not configure reaching a classifier, a possibly linked key that could not be recorded or that the table
-  refuses eight times, a malformed table, a port that never goes idle, a barrier still refused after ~3 s (a timed-out
-  host command whose answer is later than that, A401), and more than `flowtable_restart_limit` restarts in ten
-  minutes; `ask-recovery-monitor` then reboots. Merely retrying is no answer: an episode keeps every classifier port
-  disabled (`dpa_cfg_stop()`), so nothing is forwarded, not even in software, while health reports it well. Fix
-  direction: during an episode detach the PCD from every port (software forwarding), settle or rebuild the tables
-  with nothing walking them, attach again and re-offer; if it cannot attach, stay in software and retry.
+- [x] **A403 — some datapath-restart failures still ended in "reboot required".** A restart now bypasses the classifier,
+  the ports forwarding in software until it settles, and retries; nothing is terminal (_:/^sdk_fman, cdx: forward in software while a restart settles_).
 
 - [ ] **A402 — retiring thousands of flows after a route change holds cdx's control mutex past the recovery deadline.**
   OpenWrt image on the DUT, ~6,000 offloaded flows behind a /32 route flapped every 5 s (18,602 route invalidations in
   2 min): `ask-flowtable health` hit its 5 s deadline twice while RTNL answered in 10 ms; an earlier run missed three in
   a row and `ask-recovery-monitor` rebooted the box ("datapath health check failed or timed out"). The probe waits in
   `cdx_ft_begin()` (`ctrl.mutex`); retirement itself is batched (FT_RETIRE_BATCH, A327), so the holder is something
-  else. Fix direction: find the holder on the ASK image (lockdep, or a hold-time report in `cdx_ft_end()`), then bound
-  it. Production exposure: a PPPoE, VPN or default-route change with many flows offloaded.
+  else. One candidate since A403: `cdx_ft_recover()` runs a whole datapath restart for an adapter caller under
+  `ctrl.mutex` (RTNL steps up to ~200 ms, and its barriers), paced only by `ft_restart_next`. Fix direction: find the holder
+  on the ASK image (lockdep, or a hold-time report in `cdx_ft_end()`), then bound it. Production exposure: a PPPoE, VPN
+  or default-route change with many flows offloaded.
 
 - [x] **A401 — a host command timed out in production; offload stayed off until reboot.** Its answer queued behind a WQ0
   exception queue on CPU0; it now leads at WQ0, and a late one reopens the channel (_:/^sdk_fman, cdx: answer host commands first_).

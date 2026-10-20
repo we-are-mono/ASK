@@ -239,17 +239,11 @@ void ft_invalidate_work(struct work_struct *work)
 		return;
 	}
 	/* Sampled before anything is retired or snapshotted: an event counted
-	 * after this has queued a pass of its own. */
+	 * after this has queued a pass of its own. A pass during a failure CDX is
+	 * restarting after runs whole like any other: the parked tables' flows
+	 * go live after the restart, and the pass has to have flushed them
+	 * first. */
 	seq = atomic_read(&ft_invalid_seq);
-	/* After a failure CDX cannot settle nothing is ever admitted again, so a
-	 * repeat pass has no flow to protect. One it is restarting after is
-	 * not that: the parked tables' flows go live after the restart, and the
-	 * pass has to have flushed them first. */
-	if (ft_invalid_done && cdx_ft_terminal()) {
-		ft_done_seq = seq;
-		cdx_ft_end();
-		return;
-	}
 	/* A batch at a time, letting the transaction go between batches.
 	 * Nothing is admitted meanwhile, the latch being held, and nothing
 	 * rearms: this pass has not published completion. */
@@ -1196,7 +1190,8 @@ static int ft_egress_drain(struct net_device *dev)
 	 * flow's key -- may still be inside it until a barrier completes, and
 	 * one that failed left it parked. Those hold the drain until a barrier
 	 * issued here proves them gone; a deletion latched for want of proof
-	 * holds it until the ports are found stopped behind one. */
+	 * holds it until no port walks the tables and one has completed behind
+	 * that. */
 	cdx_ft_begin();
 	rc = cdx_ft_proven();
 	cdx_ft_end();
@@ -1204,9 +1199,10 @@ static int ft_egress_drain(struct net_device *dev)
 }
 
 /* CDX restarted the datapath after a deletion it could not prove (struct
- * cdx_ft_egress_ops). While it was stopped every flow was declined, every
- * multicast group and SA rebuild refused, and a binding parked behind an
- * invalidation held back, since none of that drains while the latch is held.
+ * cdx_ft_egress_ops). While the classifier was out of it -- the ports
+ * forwarding in software -- every flow was declined, every multicast group and
+ * SA rebuild refused, and a binding parked behind an invalidation held back,
+ * since none of that drains while the latch is held.
  * Flows come back on their next offer by themselves; the rest is asked for
  * here: both learners reconsider every group, every SA has its peer looked up
  * again -- which rebuilds only the ones that need it -- and a parked binding is
@@ -1214,7 +1210,7 @@ static int ft_egress_drain(struct net_device *dev)
  * no lock of CDX's here. */
 static void ft_egress_restarted(void)
 {
-	/* A bridged pair the stopped backend refused is asked again. */
+	/* A bridged pair the latched backend refused is asked again. */
 	ft_l2_refusals_reset();
 	ft_mc_kick_all();
 	ft_mr_kick();

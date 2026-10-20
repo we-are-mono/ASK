@@ -273,9 +273,10 @@ static void cdx_module_deinit(void)
 	/* Stop the remaining internal writer before terminal retries release
 	 * both locks. Timer storage survives until its normal exit callback. */
 	cdx_ctrl_timer_stop();
-	/* And the work that stops the ports after an unproven deletion and
-	 * restarts them: unload quiesces the ports below itself, and the work
-	 * takes the control lock and cdx_info. */
+	/* And the work that takes the classifier out of the datapath after an
+	 * unproven deletion and gives it back: unload quiesces the ports below
+	 * itself, from wherever the work left them, and the work takes the
+	 * control lock and cdx_info. */
 	cdx_ft_fatal_stop();
 
 	/* Stop classification before any dependent subsystem releases queues.

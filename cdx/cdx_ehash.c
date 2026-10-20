@@ -681,128 +681,109 @@ int cdx_ehash_quarantine_retry(void)
  * Every arm of ExternalHashTableDeleteKey() that returns -1 does so before it
  * changes anything, and the test knob below fails a delete without calling it
  * at all, so such an entry is linked exactly where it was or in no bucket. No
- * barrier makes freeing it safe while a port walks the tables. Once every port
- * that does is stopped and idle (dpa_cfg_stop()), though, nothing races a
- * second look: the delete is tried again, and an entry no bucket links any
- * more can simply go. That is what lets the datapath restart rather than wait
- * for a reboot (cdx_ft_restart()).
+ * barrier makes freeing it safe while a port walks the tables. Once none does
+ * -- every classifier port stopped or sent past its PCD, each seen idle
+ * (dpa_cfg_bypass()), with a barrier behind that -- nothing races a second
+ * look: the delete is tried again, and an entry no bucket links any more can
+ * simply go. That is what lets the datapath restart, forwarding in software
+ * meanwhile, rather than wait for a reboot (cdx_ft_restart()).
  *
  * A root is an entry the tables may link -- a flow's, a multicast group's, an
- * SA's -- recorded with the table and the bucket it was added to. A dependent
- * is one only a root reaches -- a multicast group's listeners, chained behind
- * the group's entry -- and goes once every root has been settled.
- *
- * A record is allocated when the delete fails, and that can fail too. A root
- * without one may still be linked with nothing that knows where, so no restart
- * can be proven safe, and the latch is left for a reboot as before these
- * records existed. A dependent without one is leaked: whatever reached it is a
- * root, settled or not.
+ * SA's -- recorded through its hw_ct, which holds the table and the bucket it
+ * was added to and carries the record itself: recording one allocates nothing,
+ * so no key that may still be linked ever goes unrecorded. The record owns the
+ * hw_ct from then on. A dependent is one only a root reaches -- a multicast
+ * group's listeners, chained behind the group's entry -- and goes once every
+ * root has been settled; its record is allocated when the root's delete fails,
+ * and one that cannot be made leaks its entry, which costs memory and nothing
+ * else: only its root reached it, and nothing does once the root is settled.
  *
  * Same serialization as the quarantine above.
  */
-struct cdx_ehash_abandoned {
+struct cdx_ehash_dependent {
 	struct list_head list;
-	void *td;
 	void *tbl_entry;
-	uint16_t index;
-	/* Deletes the table refused this root during a restart. */
-	unsigned int attempts;
 };
 
 static LIST_HEAD(cdx_ehash_abandoned_roots);
 static LIST_HEAD(cdx_ehash_abandoned_dependents);
-static bool cdx_ehash_abandoned_unrecorded;
 
-/* How many restarts a root still linked may hold up, its delete refused each
- * time, most likely for want of a cumulative node, before the doubt is taken as
- * permanent. */
+/* How often a root still linked may have its delete refused, most likely for
+ * want of a cumulative node, before the resolver says it will not go: the
+ * restart then asks only rarely, the doubt no likelier to pass soon. */
 #define CDX_EHASH_RESOLVE_ATTEMPTS	8
 
-static struct cdx_ehash_abandoned *cdx_ehash_abandoned_record(void *td,
-		uint16_t index, void *tbl_entry, struct list_head *list)
-{
-	struct cdx_ehash_abandoned *node;
-
-	node = kmalloc(sizeof(*node), GFP_KERNEL);
-	if (!node)
-		return NULL;
-	node->td = td;
-	node->tbl_entry = tbl_entry;
-	node->index = index;
-	node->attempts = 0;
-	list_add_tail(&node->list, list);
-	return node;
-}
-
-void cdx_ehash_abandon(void *td, uint16_t index, void *tbl_entry)
+void cdx_ehash_abandon(struct hw_ct *ct)
 {
 	cdx_ehash_quarantine_assert_held();
-	if (!tbl_entry || cdx_ehash_abandoned_record(td, index, tbl_entry,
-						     &cdx_ehash_abandoned_roots))
+	if (!ct)
 		return;
-	DPA_ERROR("%s::cannot record possibly linked tbl_entry %p; only a reboot frees it\n",
-			__func__, tbl_entry);
-	cdx_ehash_abandoned_unrecorded = true;
+	ct->resolve_attempts = 0;
+	list_add_tail(&ct->abandoned, &cdx_ehash_abandoned_roots);
 }
 
 void cdx_ehash_abandon_dependent(void *tbl_entry)
 {
-	cdx_ehash_quarantine_assert_held();
-	if (!tbl_entry || cdx_ehash_abandoned_record(NULL, 0, tbl_entry,
-						     &cdx_ehash_abandoned_dependents))
-		return;
-	DPA_ERROR("%s::cannot record tbl_entry %p behind a possibly linked root, leaking it\n",
-			__func__, tbl_entry);
-}
+	struct cdx_ehash_dependent *node;
 
-bool cdx_ehash_abandoned_lost(void)
-{
 	cdx_ehash_quarantine_assert_held();
-	return cdx_ehash_abandoned_unrecorded;
+	if (!tbl_entry)
+		return;
+	node = kmalloc(sizeof(*node), GFP_KERNEL);
+	if (!node) {
+		DPA_ERROR("%s::cannot record tbl_entry %p behind a possibly linked root, leaking it\n",
+				__func__, tbl_entry);
+		return;
+	}
+	node->tbl_entry = tbl_entry;
+	list_add_tail(&node->list, &cdx_ehash_abandoned_dependents);
 }
 
 /* One root, with nothing walking the tables: 0 once it is unlinked, or found
  * in no bucket, and its entry the caller's to free. Asks the SDK directly,
  * never through the knob that fails deletes, so an armed knob cannot hold a
- * restart up. */
-static int cdx_ehash_resolve_root(struct cdx_ehash_abandoned *node)
+ * restart up. A malformed table is said once a root. */
+static int cdx_ehash_resolve_root(struct hw_ct *ct)
 {
-	uint16_t where = node->index;
+	uint16_t where = ct->index;
 	int rc;
 
-	rc = ExternalHashTableFindEntry(node->td, node->tbl_entry, &where);
+	rc = ExternalHashTableFindEntry(ct->td, ct->handle, &where);
 	if (rc == -ENOENT)
 		return 0;
 	if (rc) {
-		DPA_ERROR("%s::table %p is malformed (%d) around tbl_entry %p\n",
-				__func__, node->td, rc, node->tbl_entry);
+		if (!ct->resolve_attempts++)
+			DPA_ERROR("%s::table %p is malformed (%d) around tbl_entry %p\n",
+					__func__, ct->td, rc, ct->handle);
 		return -ENOTRECOVERABLE;
 	}
-	if (where != node->index)
+	if (where != ct->index)
 		DPA_ERROR("%s::tbl_entry %p is linked from bucket %u, added to %u\n",
-				__func__, node->tbl_entry, where, node->index);
-	rc = ExternalHashTableDeleteKey(node->td, where, node->tbl_entry);
+				__func__, ct->handle, where, ct->index);
+	rc = ExternalHashTableDeleteKey(ct->td, where, ct->handle);
 	/* With no walker in the tables an unlink needs no barrier to be
 	 * final; the restart issues one anyway before anything starts. */
 	if (rc == SUCCESS || rc == EN_EHASH_DELETE_UNSYNCED)
 		return 0;
-	if (++node->attempts < CDX_EHASH_RESOLVE_ATTEMPTS)
+	if (++ct->resolve_attempts < CDX_EHASH_RESOLVE_ATTEMPTS)
 		return -EAGAIN;
-	DPA_ERROR("%s::tbl_entry %p still linked after %u deletes\n",
-			__func__, node->tbl_entry, node->attempts);
+	if (ct->resolve_attempts == CDX_EHASH_RESOLVE_ATTEMPTS)
+		DPA_ERROR("%s::tbl_entry %p still linked after %u deletes\n",
+				__func__, ct->handle, ct->resolve_attempts);
 	return -ENOTRECOVERABLE;
 }
 
 int cdx_ehash_resolve_abandoned(unsigned int *resolved)
 {
-	struct cdx_ehash_abandoned *node, *tmp;
+	struct cdx_ehash_dependent *node, *next;
+	struct hw_ct *ct, *tmp;
 	int rc, ret = 0;
 
 	cdx_ehash_quarantine_assert_held();
 	*resolved = 0;
-	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_roots, list)
+	list_for_each_entry_safe(ct, tmp, &cdx_ehash_abandoned_roots, abandoned)
 	{
-		rc = cdx_ehash_resolve_root(node);
+		rc = cdx_ehash_resolve_root(ct);
 		/* A root not linked where it was added has had every bucket of
 		 * its table searched, each under its own lock. The callers hold
 		 * only mutexes, so a long backlog yields between roots. */
@@ -813,14 +794,14 @@ int cdx_ehash_resolve_abandoned(unsigned int *resolved)
 			ret = rc;
 			continue;
 		}
-		list_del(&node->list);
-		ExternalHashTableEntryFree(node->tbl_entry);
-		kfree(node);
+		list_del(&ct->abandoned);
+		ExternalHashTableEntryFree(ct->handle);
+		kfree(ct);
 		(*resolved)++;
 	}
 	if (ret)
 		return ret;
-	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_dependents, list)
+	list_for_each_entry_safe(node, next, &cdx_ehash_abandoned_dependents, list)
 	{
 		list_del(&node->list);
 		ExternalHashTableEntryFree(node->tbl_entry);
@@ -834,25 +815,26 @@ int cdx_ehash_resolve_abandoned(unsigned int *resolved)
  * be stopped, stays allocated for the reset that alone can free it, and only
  * the bookkeeping is released. Runs where cdx_ehash_quarantine_abandon() does,
  * with the tables still configured. True when nothing that may still be linked
- * is left, recorded or not. */
+ * is left. */
 bool cdx_ehash_abandoned_exit(bool stopped)
 {
-	struct cdx_ehash_abandoned *node, *tmp;
+	struct cdx_ehash_dependent *node, *next;
 	unsigned int resolved, leaked = 0;
+	struct hw_ct *ct, *tmp;
 
 	cdx_ehash_quarantine_assert_held();
-	if (stopped && !cdx_ehash_abandoned_unrecorded)
+	if (stopped)
 		/* Every refusal counts toward the root's attempts, so this
 		 * ends. */
 		while (cdx_ehash_resolve_abandoned(&resolved) == -EAGAIN)
 			;
-	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_roots, list)
+	list_for_each_entry_safe(ct, tmp, &cdx_ehash_abandoned_roots, abandoned)
 	{
-		list_del(&node->list);
-		kfree(node);
+		list_del(&ct->abandoned);
+		kfree(ct);
 		leaked++;
 	}
-	list_for_each_entry_safe(node, tmp, &cdx_ehash_abandoned_dependents, list)
+	list_for_each_entry_safe(node, next, &cdx_ehash_abandoned_dependents, list)
 	{
 		list_del(&node->list);
 		kfree(node);
@@ -861,7 +843,7 @@ bool cdx_ehash_abandoned_exit(bool stopped)
 	if (leaked)
 		DPA_ERROR("%s::leaking %u possibly linked table entries until reset\n",
 				__func__, leaked);
-	return !leaked && !cdx_ehash_abandoned_unrecorded;
+	return !leaked;
 }
 
 #ifdef CDX_DEBUG_FLOWTABLE
@@ -873,7 +855,7 @@ bool cdx_ehash_abandoned_exit(bool stopped)
  * never fails the restart's own deletes. */
 static unsigned int ehash_fail_unlink;
 module_param_named(ehash_fail_unlink, ehash_fail_unlink, uint, 0600);
-MODULE_PARM_DESC(ehash_fail_unlink, "Multicast/IPsec classifier deletes to fail before unlink, leaving the key linked; the datapath stops and restarts");
+MODULE_PARM_DESC(ehash_fail_unlink, "Multicast/IPsec classifier deletes to fail before unlink, leaving the key linked; the datapath restarts, forwarding in software meanwhile");
 #endif
 
 static bool cdx_ehash_unlink_fault(void)
@@ -890,30 +872,36 @@ static bool cdx_ehash_unlink_fault(void)
 /* Delete one key from an external hash table and dispose of its table
  * entry per the ExternalHashTableDeleteKey() tri-state (fm_ehash.h).
  *
- * This function owns `handle` from here on: no caller may free it on any
- * path, and a caller that keeps freeing it reintroduces the A95 defect
- * class (use-after-free on the not-unlinked arm, premature free on the
- * unsynced arm). Callers stay responsible for their own software
- * wrappers only. A NULL handle is tolerated so the "nothing was ever
- * installed" case needs no guard at every site.
+ * This function owns `ct` and the table entry it names (ct->handle) from
+ * here on: no caller may free either on any path, and a caller that keeps
+ * freeing the entry reintroduces the A95 defect class (use-after-free on the
+ * not-unlinked arm, premature free on the unsynced arm). The hw_ct goes with
+ * the entry, or, when the entry may still be linked, becomes CDX's record of
+ * it. Callers stay responsible for their own software wrappers only. A NULL
+ * ct or handle is tolerated so the "nothing was ever installed" case needs no
+ * guard at every site.
  *
  * Returns the raw rc, so callers can still distinguish gone (0) from
  * unlinked-but-unproven (EN_EHASH_DELETE_UNSYNCED) from
  * possibly-still-linked (FAILURE) - the last of which additionally means
  * the key may still resolve in hardware, so re-inserting it would build
  * a duplicate-key bucket. */
-int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle)
+int cdx_ehash_delete_entry(struct hw_ct *ct)
 {
+	void *handle = ct ? ct->handle : NULL;
 	int rc;
 
-	if (!handle)
+	if (!handle) {
+		kfree(ct);
 		return SUCCESS;
+	}
 
 	rc = cdx_ehash_unlink_fault() ? FAILURE :
-		ExternalHashTableDeleteKey(td, index, handle);
+		ExternalHashTableDeleteKey(ct->td, ct->index, handle);
 	if (rc == SUCCESS)
 	{
 		ExternalHashTableEntryFree(handle);
+		kfree(ct);
 		/* DeleteKey syncs the PCD before reporting success, and one
 		 * sync is a barrier for every entry unlinked before it, so
 		 * this same round-trip retires the whole backlog. */
@@ -924,30 +912,31 @@ int cdx_ehash_delete_entry(void *td, uint16_t index, void *handle)
 	{
 		/* Out of the chain, but no proof the ucode has left it. Park
 		 * it for the next successful sync on this PCD. */
-		cdx_ehash_quarantine_entry(td, handle);
+		cdx_ehash_quarantine_entry(ct->td, handle);
+		kfree(ct);
 		return rc;
 	}
 	/* Not provably unlinked, and nothing may retry the unlink while the
-	 * ports run: a live chain may still resolve to this entry. Freeing it
-	 * - now, or later through the quarantine - is a use-after-free the
-	 * hardware commits, so it is recorded for the restart that stops the
-	 * ports and settles it (cdx_ehash_resolve_abandoned()); the caller
-	 * latches the failure that brings that restart about. */
+	 * ports walk the tables: a live chain may still resolve to this entry.
+	 * Freeing it - now, or later through the quarantine - is a
+	 * use-after-free the hardware commits, so it is recorded for the
+	 * restart that takes the ports out of the tables and settles it
+	 * (cdx_ehash_resolve_abandoned()); the caller latches the failure that
+	 * brings that restart about. */
 	DPA_ERROR("%s::DeleteKey rc %d, keeping tbl_entry %p: not provably unlinked\n",
 			__func__, rc, handle);
-	cdx_ehash_abandon(td, index, handle);
+	cdx_ehash_abandon(ct);
 	return rc;
 }
 
 /* delete classif entry from table.
  *
  * Returns the ExternalHashTableDeleteKey() rc (fm_ehash.h): SUCCESS, or
- * one of the two failure arms. The table entry's disposition belongs to
- * cdx_ehash_delete_entry() on every arm; what this function owns is the
- * hw_ct wrapper, which is pure software with no hardware reference and
- * so is always released. Keeping ct alive past a failed delete bought
- * nothing and once let a later release free an already-disposed handle
- * (ISSUES.md A95). */
+ * one of the two failure arms. The table entry's disposition, and its hw_ct
+ * wrapper's, belong to cdx_ehash_delete_entry() on every arm; the entry lets
+ * go of the wrapper whatever happened. Keeping it reachable past a failed
+ * delete bought nothing and once let a later release free an already-disposed
+ * handle (ISSUES.md A95). */
 int delete_entry_from_classif_table(PCtEntry entry)
 {
 	int rc;
@@ -964,13 +953,10 @@ int delete_entry_from_classif_table(PCtEntry entry)
 		return SUCCESS;
 
 	CDX_DPA_DPRINT("\n");
-	rc = cdx_ehash_delete_entry(entry->ct->td, entry->ct->index,
-			entry->ct->handle);
+	rc = cdx_ehash_delete_entry(entry->ct);
+	entry->ct = NULL;
 	if (rc)
 		DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
-
-	kfree(entry->ct);
-	entry->ct = NULL;
 	return rc;
 }
 

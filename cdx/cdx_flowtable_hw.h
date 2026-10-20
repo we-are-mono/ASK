@@ -119,13 +119,14 @@ int cdx_ft_hw_settle(unsigned int *unproven);
 /* One barrier for every unproven unlink, CDX's parked backlog included; see
  * the definition for what the return value does and does not cover. */
 int cdx_ft_hw_retry(void);
-/* Only once dpa_cfg_stop() or dpa_cfg_quiesce() has found every classifier
- * port stopped and idle, and a PCD barrier has completed after that; requires
- * the control mutex. Frees what is unlinked and records what may not be
- * (cdx_ehash_abandon()). */
+/* Only once no classifier port walks the tables -- each stopped or bypassed
+ * and seen idle (dpa_cfg_bypass(), dpa_cfg_quiesce()) -- and a PCD barrier has
+ * completed after that; requires the control mutex. Frees what is unlinked and
+ * records what may not be (cdx_ehash_abandon()), stranded entries included. */
 void cdx_ft_hw_quiesced(void);
-/* When neither can be had for good: keeps every retired entry allocated with
- * its holds, recorded as possibly linked; requires the control mutex. */
+/* While a port CDX did not configure reaches the classifier: every retired
+ * entry whose key may still be linked kept, holds and all, but no longer
+ * pending, until cdx_ft_hw_quiesced(); requires the control mutex. */
 void cdx_ft_hw_strand(void);
 
 #endif

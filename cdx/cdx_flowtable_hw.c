@@ -60,6 +60,9 @@ static_assert(sizeof(struct cdx_ft_stats_binding) ==
  * (cdx_ehash.c), the adapter can retain the already allocated owner until the
  * barrier passes. */
 static LIST_HEAD(ft_retired);
+/* Retired owners whose key may still be linked while a port CDX did not
+ * configure reaches the classifier (cdx_ft_hw_strand()). */
+static LIST_HEAD(ft_stranded);
 /* The retired owners whose unlink deferred its barrier and that no barrier has
  * failed yet: what one settle owes. A delete's own barrier costs a
  * host-command round trip per key, which retiring a full table one key at a
@@ -69,7 +72,7 @@ static unsigned int ft_owed;
 #ifdef CDX_DEBUG_FLOWTABLE
 static bool ft_fail_unlink;
 module_param_named(flowtable_fail_unlink, ft_fail_unlink, bool, 0600);
-MODULE_PARM_DESC(flowtable_fail_unlink, "One-shot delete failure leaving a live key linked; the datapath stops and restarts");
+MODULE_PARM_DESC(flowtable_fail_unlink, "One-shot delete failure leaving a live key linked; the datapath restarts, forwarding in software meanwhile");
 /* A count rather than a flag: a connection is two entries, and the retry that
  * follows a failed barrier runs at once, so a single withheld proof is settled
  * by the other direction's delete before anything that waits on it can be
@@ -856,10 +859,11 @@ int cdx_ft_hw_settle(unsigned int *unproven)
  *
  * Returns -EAGAIN while one of the backend's own retirements is unproven:
  * that barrier failed, or a hard failure remains. That one is not deleted
- * again here, with the ports running and its chain possibly half rewritten;
- * only stopped ports settle it (cdx_ft_hw_quiesced(), then the datapath
- * restart, which finds where the key is still linked before deleting it
- * there). CDX's backlog is released on the same success but
+ * again here, with the ports walking the tables and its chain possibly half
+ * rewritten; only ports taken out of the tables settle it
+ * (cdx_ft_hw_quiesced(), then the datapath restart, which finds where the key
+ * is still linked before deleting it there). CDX's backlog is released on the
+ * same success but
  * does not hold this up: it is not the backend's, and the callers that wait
  * on it read cdx_ft_pending() themselves. */
 int cdx_ft_hw_retry(void)
@@ -882,53 +886,55 @@ int cdx_ft_hw_retry(void)
 	return list_empty(&ft_retired) ? 0 : -EAGAIN;
 }
 
-/* Caller has stopped every classifier port, seen it idle, and completed a PCD
- * barrier since, which nothing a port had in hand outlasts. Unlinked storage
- * can now be freed even though its own barrier never completed. A possibly
- * linked key must stay allocated: freeing it would leave a dangling hash-chain
- * link. It goes to CDX's record of such keys, which the datapath restart
- * settles with the ports still stopped (cdx_ehash_resolve_abandoned()); its
- * statistics records and policer are released all the same, since no port is
- * left to deliver a frame that could reach its opcodes. Idempotent. */
+/* Caller has proven that no classifier port walks the tables -- each stopped
+ * or sent past its PCD, and seen idle -- and completed a PCD barrier since,
+ * which nothing a port had in hand outlasts. Unlinked storage can now be freed
+ * even though its own barrier never completed. A possibly linked key must stay
+ * allocated: freeing it would leave a dangling hash-chain link. It goes, with
+ * its hw_ct, to CDX's record of such keys, which the datapath restart settles
+ * while the ports are still out of the tables (cdx_ehash_resolve_abandoned());
+ * its statistics records and policer are released all the same, since no
+ * frame is left to reach its opcodes until it is settled. Idempotent. */
 void cdx_ft_hw_quiesced(void)
+{
+	struct cdx_ft_hw *hw, *next;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	list_for_each_entry_safe(hw, next, &ft_stranded, retired) {
+		list_del(&hw->retired);
+		cdx_ehash_abandon(hw->entry.ct);
+		hw->entry.ct = NULL;
+		ft_hw_free(hw);
+	}
+	list_for_each_entry_safe(hw, next, &ft_retired, retired) {
+		if (hw->delete_rc == EN_EHASH_DELETE_UNSYNCED) {
+			ExternalHashTableEntryFree(hw->entry.ct->handle);
+			kfree(hw->entry.ct);
+		} else {
+			cdx_ehash_abandon(hw->entry.ct);
+		}
+		hw->entry.ct = NULL;
+		ft_hw_unretire(hw);
+		ft_hw_free(hw);
+	}
+}
+
+/* Nothing proves the classifier done with a retired entry whose key may still
+ * be linked while a port CDX did not configure walks the tables, and that port
+ * may stay. The entry is kept -- its key, and the statistics records and
+ * policer its opcodes name -- but out of what anything waits on, so that the
+ * adapter's retirements can finish meanwhile; cdx_ft_hw_quiesced() settles it
+ * once no port walks the tables. One merely owed a barrier stays retired: a
+ * barrier proves it gone whatever walks. Idempotent. */
+void cdx_ft_hw_strand(void)
 {
 	struct cdx_ft_hw *hw, *next;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	list_for_each_entry_safe(hw, next, &ft_retired, retired) {
 		if (hw->delete_rc == EN_EHASH_DELETE_UNSYNCED)
-			ExternalHashTableEntryFree(hw->entry.ct->handle);
-		else
-			cdx_ehash_abandon(hw->entry.ct->td, hw->entry.ct->index,
-					  hw->entry.ct->handle);
-		kfree(hw->entry.ct);
+			continue;
 		ft_hw_unretire(hw);
-		ft_hw_free(hw);
+		list_add_tail(&hw->retired, &ft_stranded);
 	}
-}
-
-/* Nothing can prove the classifier done with the retired entries: a port CDX
- * did not configure still reaches it. Each entry stays allocated, and so do the
- * statistics records and policer its opcodes name, for the reset that alone
- * settles them. It is recorded as possibly linked (cdx_ehash_abandon()), so
- * an unload that can prove it gone still frees it; only the backend's own
- * bookkeeping goes now. Idempotent. */
-void cdx_ft_hw_strand(void)
-{
-	struct cdx_ft_hw *hw, *next;
-	unsigned int kept = 0;
-
-	lockdep_assert_held(&cdx_info->ctrl.mutex);
-	list_for_each_entry_safe(hw, next, &ft_retired, retired) {
-		cdx_ehash_abandon(hw->entry.ct->td, hw->entry.ct->index,
-				  hw->entry.ct->handle);
-		kfree(hw->entry.ct);
-		ft_hw_unretire(hw);
-		/* Not ft_hw_free(): its holds stay taken. */
-		kfree(hw);
-		kept++;
-	}
-	if (kept)
-		pr_err("cdx flowtable: keeping %u retired entries and the records they name until reset\n",
-		       kept);
 }

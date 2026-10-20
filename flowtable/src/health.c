@@ -14,28 +14,27 @@
 #include <time.h>
 #include <unistd.h>
 
-bool ft_terminal_reason(char *reason, size_t n)
+void ft_failure_reason(char *reason, size_t n)
 {
-	FILE *f = fopen(FT_CDX_MODULE "/parameters/flowtable_terminal_reason", "r");
-	reason[0] = 0;
-	if (f) { (void)fgets(reason, n, f); fclose(f); }
-	reason[strcspn(reason, "\r\n")] = 0;
-	bool terminal = reason[0] != 0;
-	if (!terminal) snprintf(reason, n, "datapath health check failed or timed out");
-	return terminal;
+	/* What CDX's datapath restart waits for, if one does: context for a
+	 * failure, never one itself -- the datapath forwards in software
+	 * meanwhile. Read without RTNL, which a failed probe may not get. */
+	char degraded[96] = "";
+	FILE *f = fopen(FT_CDX_MODULE "/parameters/flowtable_degraded_reason", "r");
+	if (f) { (void)fgets(degraded, sizeof(degraded), f); fclose(f); }
+	degraded[strcspn(degraded, "\r\n")] = 0;
+	snprintf(reason, n, "datapath health check failed or timed out%s%s",
+		 degraded[0] ? "; classifier bypassed: " : "", degraded);
 }
 
 static int probe(struct ft_ctx *ctx)
 {
 	struct ft_backend b;
-	char reason[128];
-	/* CDX retains the latch even if its flowtable consumer is unloaded. */
-	bool terminal = ft_terminal_reason(reason, sizeof(reason));
-	if (!terminal && ft_backend_read(ctx, &b)) return -1;
-	if (terminal || b.fatal_terminal) {
-		snprintf(ctx->err, sizeof(ctx->err), "datapath requires reboot: %s", reason);
-		return FT_HEALTH_TERMINAL;
-	}
+	/* A latch CDX is restarting after is not unhealthy, however long the
+	 * restart waits: the classifier is bypassed and the ports forward in
+	 * software. What is is a backend that cannot say, or RTNL that does
+	 * not answer. */
+	if (ft_backend_read(ctx, &b)) return -1;
 	/* A single RTM_GETLINK takes RTNL in the pinned kernel, including when
 	 * no hardware flow is installed. Acquiring RTNL can block inside
 	 * sendto(), before recv(), so the parent bounds this whole process. */

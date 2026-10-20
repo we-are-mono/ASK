@@ -48,63 +48,138 @@ MODULE_PARM_DESC(transit, "Offload transit ESP, GRE, IPIP and 6in4; costs bridge
 static bool ft_claimed, ft_failed;
 static unsigned int ft_live;
 
-/* The restart that follows ft_failed (cdx_ft_restart()). ft_terminal: it
- * cannot be proven safe in this boot, and the ports stay stopped for a reboot.
+/* The restart that follows ft_failed (cdx_ft_restart()), in three phases that
+ * each pick up where the last left off. The classifier ports are stopped and
+ * sent past the classifier, so the datapath forwards in software
+ * (ft_bypassed_at), each seen idle (ft_ports_proven, and ft_ports_held counts
+ * those a bypass left stopped, tried again each time); the doubt is settled
+ * once nothing walks the tables and a barrier has completed behind that
+ * (ft_quiet_at); and the ports take the classifier back. Nothing about it is
+ * ever left for a reboot: what it waits for is retried for as long as it
+ * takes.
+ *
  * ft_epoch counts restarts from one, for a hold that has to tell whether a
  * restart has happened since it was taken. The rest describe the current
- * episode: when its ports were first stopped, the keys settled so far, the next
- * retry delay, how often the hardware has not answered, and whether its stall
- * has been reported. ft_resume_failures counts the ports a restart could not
- * start again. All under the control mutex; ft_terminal is also read without
- * it. */
-static bool ft_terminal, ft_restart_notify, ft_stall_reported;
-static char ft_terminal_reason[128];
-module_param_string(flowtable_terminal_reason, ft_terminal_reason, sizeof(ft_terminal_reason), 0444);
-MODULE_PARM_DESC(flowtable_terminal_reason, "Reason the datapath requires a reboot");
+ * episode: when it began and when its ports were first stopped, the keys
+ * settled so far, when it is next tried (ft_restart_next, for every caller)
+ * and the backoff after that, how often the hardware has not answered a stop,
+ * and which of its waits have been reported. ft_resume_failures counts the
+ * ports a restart could not start again. All under the control mutex. */
+static bool ft_restart_notify, ft_ports_proven;
+static unsigned int ft_ports_held;
 static unsigned int ft_restarts, ft_window_restarts, ft_episode_resolved, ft_hw_tries;
 static unsigned int ft_resume_failures;
 static u32 ft_epoch = 1;
-static unsigned long ft_episode_start, ft_stopped_at, ft_window_start;
+static unsigned long ft_episode_start, ft_stopped_at, ft_bypassed_at, ft_quiet_at;
+static unsigned long ft_window_start, ft_restart_next, ft_waits_reported;
 static unsigned long ft_restart_backoff = HZ;
+
+/* What a restart waits for, published while it waits -- empty while the
+ * classifier runs -- for an operator, and for the platform's report of a
+ * failure that does reset the board. Written under the parameter lock its
+ * reader takes, so a read never sees two reasons at once; that lock is taken
+ * under the control mutex, so no parameter of CDX's may take the control mutex
+ * in its set or get. */
+static char ft_degraded_reason[96];
+module_param_string(flowtable_degraded_reason, ft_degraded_reason, sizeof(ft_degraded_reason), 0444);
+MODULE_PARM_DESC(flowtable_degraded_reason, "What keeps the datapath forwarding in software after an unproven deletion; empty while the classifier runs");
+
+static void ft_fatal_work_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ft_fatal_work, ft_fatal_work_fn);
+
+/* A limit raised while a restart waits for one, read by the next attempt. */
+static bool ft_restart_asked;
 
 /* Restarts allowed in each FT_RESTART_WINDOW, counted from the first. A
  * datapath that keeps failing deletes has something wrong with it that a
- * restart will not mend, and stopping for good is the honest answer then. */
+ * restart will not mend, so once the budget is spent the classifier stays
+ * bypassed -- the datapath forwarding in software, its tables settled -- until
+ * the window allows another; at zero, until the limit is raised. A write is
+ * seen at once: a restart waiting on the limit is asked again. */
 #define FT_RESTART_WINDOW	(10 * 60 * HZ)
 static unsigned int ft_restart_limit = 3;
-module_param_named(flowtable_restart_limit, ft_restart_limit, uint, 0644);
-MODULE_PARM_DESC(flowtable_restart_limit, "Datapath restarts allowed per 10 minutes after unproven deletions; 0 leaves every one to a reboot");
+
+static int ft_restart_limit_set(const char *val, const struct kernel_param *kp)
+{
+	int rc = param_set_uint(val, kp);
+
+	if (!rc && READ_ONCE(ft_failed)) {
+		WRITE_ONCE(ft_restart_asked, true);
+		mod_delayed_work(system_wq, &ft_fatal_work, 0);
+	}
+	return rc;
+}
+
+static const struct kernel_param_ops ft_restart_limit_ops = {
+	.set = ft_restart_limit_set,
+	.get = param_get_uint,
+};
+module_param_cb(flowtable_restart_limit, &ft_restart_limit_ops, &ft_restart_limit, 0644);
+MODULE_PARM_DESC(flowtable_restart_limit, "Datapath restarts allowed per 10 minutes after unproven deletions; past it, and at 0, the datapath forwards in software until it may restart");
 
 /* Retry delays: RTNL contended, the test hold below, and the bounds of the
- * exponential backoff for what software keeps a restart waiting on -- a key
- * the table refuses, deletions still owed a barrier. The hardware's own waits
- * are retried below. A restart still waiting after FT_RESTART_STALL says so,
- * once. */
+ * exponential backoff for everything else a restart waits on -- a port not yet
+ * seen idle once the ports are bypassed, a barrier the channel refuses, a key
+ * the table refuses, a port CDX did not configure. The backoff's bound is also
+ * the longest the work ever sleeps while an episode lasts, so whatever ends
+ * one -- a window passing, a raised limit -- is seen within it. A wait that
+ * lasts past FT_RESTART_STALL into an episode is reported once for each
+ * reason. */
 #define FT_RESTART_RTNL_RETRY	(HZ / 10)
 #define FT_RESTART_HOLD_RETRY	(HZ / 4)
 #define FT_RESTART_BACKOFF_MAX	(30 * HZ)
 #define FT_RESTART_STALL	(30 * HZ)
 
-/* The hardware's own answers -- a stopped port gone idle, a barrier the
- * host-command channel completed -- come within moments when the FMan is well:
- * a port drains in microseconds, a barrier completes in well under a
- * millisecond. So a restart waiting on either is retried soon, at a steady
- * interval, and an episode in which the hardware has failed to answer
- * FT_RESTART_HW_TRIES times -- a few seconds, a port's own wait for idle
- * included -- leaves the latch for a reboot, saying what it waited for: the
- * classifier ports are stopped meanwhile, and nothing they carry moves. A
- * host command that timed out shuts the channel only until the FMan answers it
- * (hc.c), so a barrier refused for that is retried here like any other. RTNL
- * contention and the test hold are not the hardware's and never count. */
+/* The hardware's own answers -- a stopped port gone idle -- come within
+ * moments when the FMan is well: a port drains in microseconds. So before the
+ * classifier is bypassed, while the ports are stopped and nothing they carry
+ * moves, a port not yet idle is asked again soon, at a steady interval, until
+ * the hardware has failed to answer FT_RESTART_HW_TRIES times -- a few
+ * seconds, a port's own wait for idle included. Then the ports are bypassed
+ * anyway, the datapath forwards in software, and what such a port may still
+ * have in the tables keeps everything it could reach allocated until a later
+ * look finds it idle. RTNL contention and the test hold are not the
+ * hardware's and never count. */
 #define FT_RESTART_HW_RETRY	(HZ / 4)
 #define FT_RESTART_HW_TRIES	12
 
+/* What a restart waits for, each reported at most once an episode. */
+enum ft_restart_wait {
+	FT_WAIT_RTNL,
+	FT_WAIT_IDLE,
+	FT_WAIT_FOREIGN,
+	FT_WAIT_BARRIER,
+	FT_WAIT_HOLD,
+	FT_WAIT_LINKED,
+	FT_WAIT_UNSETTLED,
+	FT_WAIT_PENDING,
+	FT_WAIT_DISABLED,
+	FT_WAIT_BUDGET,
+	FT_WAIT_ATTACH,
+	FT_WAIT_DETACHED,
+};
+
+static const char *const ft_restart_why[] = {
+	[FT_WAIT_RTNL] = "RTNL is contended",
+	[FT_WAIT_IDLE] = "a port would not stop and go idle",
+	[FT_WAIT_FOREIGN] = "a port CDX did not configure reaches the classifier",
+	[FT_WAIT_BARRIER] = "the PCD barrier kept failing",
+	[FT_WAIT_HOLD] = "held by flowtable_restart_hold",
+	[FT_WAIT_LINKED] = "a possibly linked key is still linked",
+	[FT_WAIT_UNSETTLED] = "a possibly linked key could not be settled",
+	[FT_WAIT_PENDING] = "deletions still wait on a barrier",
+	[FT_WAIT_DISABLED] = "datapath restarts are disabled",
+	[FT_WAIT_BUDGET] = "restart budget exhausted",
+	[FT_WAIT_ATTACH] = "a port would not take the classifier back",
+	[FT_WAIT_DETACHED] = "the classifier ports cannot be started again",
+};
+
 #ifdef CDX_DEBUG_FLOWTABLE
-/* Test-only: keep the ports stopped after a latch, with every key recorded,
- * until cleared -- the window a test inspects the stopped datapath in. */
+/* Test-only: keep the classifier bypassed after a latch, with every key
+ * recorded, until cleared -- the window a test inspects the episode in. */
 static bool ft_restart_hold;
 module_param_named(flowtable_restart_hold, ft_restart_hold, bool, 0600);
-MODULE_PARM_DESC(flowtable_restart_hold, "Hold the datapath stopped after an unproven deletion until cleared (test image)");
+MODULE_PARM_DESC(flowtable_restart_hold, "Hold the classifier bypassed after an unproven deletion until cleared (test image)");
 #endif
 
 static bool ft_restart_held(void)
@@ -123,11 +198,14 @@ bool cdx_ft_observing(void)
 EXPORT_SYMBOL_NS_GPL(cdx_ft_observing, ASK_CDX_FLOWTABLE);
 
 /* The SDK's normal ndo_open enables FMAN ports. A failed hardware unlink
- * belongs to the provider even after adapter detach, so guard that restart
- * here until CDX has settled it and restarted the datapath -- which clears the
- * latch under the RTNL this runs under, so a port opened after it starts on a
- * running datapath -- or, when that cannot be done, until provider teardown
- * has detached PCD and released its ports. */
+ * belongs to the provider even after adapter detach, so guard that open here
+ * while the restart has the ports stopped -- before it has sent them past the
+ * classifier, or while it gives the classifier back, which clears the latch
+ * under the same RTNL hold this runs under, so a port opened after it starts
+ * on a running datapath. Once the ports are bypassed, one opened walks no
+ * table: it forwards in software like the rest, and opens as usual -- unless
+ * its own bypass failed, which leaves it stopped and fenced: refused here as
+ * well, rather than by the fence, which says nothing. */
 static int cdx_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 			     void *ptr)
 {
@@ -147,12 +225,10 @@ static int cdx_ft_netdev_event(struct notifier_block *nb, unsigned long event,
 		return NOTIFY_DONE;
 	}
 	if (event != NETDEV_PRE_UP || !READ_ONCE(ft_failed) ||
-	    !dpa_netdev_is_physical(dev))
+	    !dpa_netdev_is_physical(dev) ||
+	    (dpa_cfg_bypassed() && !dpa_cfg_port_held(dev)))
 		return NOTIFY_DONE;
-	if (READ_ONCE(ft_terminal))
-		netdev_err(dev, "CDX hardware retirement failed; unload CDX before restarting the port\n");
-	else
-		netdev_err(dev, "CDX is restarting the datapath after a failed hardware retirement; start the port once it has\n");
+	netdev_err(dev, "CDX is restarting the datapath after a failed hardware retirement; start the port once it has\n");
 	return notifier_from_errno(-EIO);
 }
 
@@ -237,12 +313,12 @@ bool cdx_ft_failed(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_failed, ASK_CDX_FLOWTABLE);
 
-bool cdx_ft_terminal(void)
+bool cdx_ft_bypassed(void)
 {
 	cdx_ft_assert_held();
-	return ft_terminal;
+	return dpa_cfg_bypassed();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_terminal, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_bypassed, ASK_CDX_FLOWTABLE);
 
 unsigned int cdx_ft_restarts(void)
 {
@@ -264,20 +340,9 @@ u32 cdx_ft_epoch(void)
 	return ft_epoch;
 }
 
-/* The latch can no longer be settled in this boot. Said once, with why; the
- * ports stay stopped, everything stays refused, and a reboot clears it. */
-static void cdx_ft_set_terminal(const char *why)
-{
-	if (ft_terminal)
-		return;
-	strscpy(ft_terminal_reason, why, sizeof(ft_terminal_reason));
-	WRITE_ONCE(ft_terminal, true);
-	pr_err("cdx flowtable: hardware stopped after unproven deletion; reboot required (%s)\n",
-	       why);
-}
-
-/* The ports were found stopped and idle after a latch. Recorded once per
- * episode, for the restart's report of how long they were. */
+/* The ports were found stopped after a latch, or given up on after their
+ * tries. Recorded once per episode, for the restart's report of how long the
+ * datapath forwarded nothing. */
 static void cdx_ft_ports_stopped(void)
 {
 	if (ft_stopped_at)
@@ -286,69 +351,48 @@ static void cdx_ft_ports_stopped(void)
 	pr_warn("cdx flowtable: ports stopped after unproven deletion\n");
 }
 
-/* Whether a restart may follow this latch: none at all with the limit at zero,
- * and no more than the limit within a window. */
-static bool cdx_ft_restart_allowed(void)
+/* The restart has to wait, for `why`: tried again `after` jiffies on. What it
+ * waits for is published while it does, and said in the log once an episode
+ * for each reason, once the episode has lasted long enough to matter. */
+static int cdx_ft_restart_wait(enum ft_restart_wait why, unsigned long after,
+			       unsigned long *delay)
 {
-	if (!ft_restart_limit) {
-		cdx_ft_set_terminal("datapath restarts are disabled");
-		return false;
-	}
-	if (!ft_window_start || time_after(jiffies, ft_window_start + FT_RESTART_WINDOW)) {
-		ft_window_start = jiffies ?: 1;
-		ft_window_restarts = 0;
-	}
-	if (ft_window_restarts >= ft_restart_limit) {
-		cdx_ft_set_terminal("restart budget exhausted");
-		return false;
-	}
-	return true;
-}
+	const char *text = ft_restart_why[why];
 
-/* A restart still waiting once the episode has lasted long enough to matter
- * says so, once, with what it is waiting for -- whatever that is. */
-static void cdx_ft_restart_stalled(const char *why)
-{
-	if (!ft_stall_reported && ft_episode_start &&
+	if (strcmp(ft_degraded_reason, text)) {
+		kernel_param_lock(THIS_MODULE);
+		strscpy(ft_degraded_reason, text, sizeof(ft_degraded_reason));
+		kernel_param_unlock(THIS_MODULE);
+	}
+	if (!(ft_waits_reported & BIT(why)) &&
 	    time_after(jiffies, ft_episode_start + FT_RESTART_STALL)) {
-		ft_stall_reported = true;
-		pr_warn("cdx flowtable: datapath restart stalled for %u s: %s; still retrying\n",
-			jiffies_to_msecs(jiffies - ft_episode_start) / 1000, why);
+		ft_waits_reported |= BIT(why);
+		pr_warn("cdx flowtable: datapath restart stalled for %u s: %s; %s, still retrying\n",
+			jiffies_to_msecs(jiffies - ft_episode_start) / 1000, text,
+			ft_bypassed_at ? "forwarding in software meanwhile" :
+					 "the ports stay stopped");
 	}
+	*delay = after;
+	return -EAGAIN;
 }
 
-/* A restart that has to wait: retried after the backoff, which doubles each
- * time up to its bound. The ports stay stopped meanwhile. */
-static int cdx_ft_restart_later(const char *why, unsigned long *delay)
+/* The same after the backoff, which doubles each time up to its bound. */
+static int cdx_ft_restart_later(enum ft_restart_wait why, unsigned long *delay)
 {
-	*delay = ft_restart_backoff;
+	unsigned long after = ft_restart_backoff;
+
 	ft_restart_backoff = min_t(unsigned long, 2 * ft_restart_backoff,
 				   FT_RESTART_BACKOFF_MAX);
-	cdx_ft_restart_stalled(why);
-	return -EAGAIN;
+	return cdx_ft_restart_wait(why, after, delay);
 }
 
-/* A restart the hardware has not answered: retried soon, until it has failed to
- * answer too often in this episode, and then the latch is for a reboot. 0 when
- * terminal; -EAGAIN with *delay set otherwise. */
-static int cdx_ft_restart_hw_wait(const char *why, unsigned long *delay)
-{
-	if (++ft_hw_tries >= FT_RESTART_HW_TRIES) {
-		cdx_ft_set_terminal(why);
-		return 0;
-	}
-	*delay = FT_RESTART_HW_RETRY;
-	cdx_ft_restart_stalled(why);
-	return -EAGAIN;
-}
-
-/* One barrier through the PCD once the ports have stopped. A frame a port had
- * in hand when it stopped may still be inside the FMan's controller; the
- * barrier a delete relies on to prove no lookup begun before it still walks
- * the tables proves the same of that frame. Nothing a stop lets go of is freed
- * before it. 0, also with no table to issue it through; -EAGAIN for one that
- * failed, which a later one completes: a host command that timed out shuts the
- * channel only until the FMan answers it. */
+/* One barrier through the PCD once nothing walks the tables any more. A frame
+ * a port had in hand when it stopped may still be inside the FMan's
+ * controller; the barrier a delete relies on to prove no lookup begun before
+ * it still walks the tables proves the same of that frame. Nothing a stop lets
+ * go of is freed before it. 0, also with no table to issue it through; -EAGAIN
+ * for one that failed, which a later one completes: a host command that timed
+ * out shuts the channel only until the FMan answers it. */
 static int cdx_ft_stopped_barrier(void)
 {
 	void *td = dpa_get_ehash_td();
@@ -358,100 +402,169 @@ static int cdx_ft_stopped_barrier(void)
 	return -EAGAIN;
 }
 
-/* Restart the datapath after a latch, which a stopped datapath makes provable.
+/* The first phase: every classifier port stopped and then sent past the
+ * classifier (dpa_cfg_bypass()), so that it forwards in software within
+ * moments of the stop, and each seen idle since it stopped. RTNL is taken by
+ * trying, for the transition alone, and never held across a wait between
+ * tries.
  *
- * The latch exists because a classifier key may still be linked: a delete
- * could not prove it unlinked, and the FMan might walk to it. Once every port
- * that walks the tables is stopped and idle (dpa_cfg_stop()) and a barrier
- * has completed behind the last frame they let go of, nothing does, and the
- * doubt can be settled: each recorded key is looked for and deleted again, or
- * found in no bucket at all (cdx_ehash_resolve_abandoned()). Then a second
- * barrier, and everything parked for one goes too. What the tables still link
- * is then exactly what the live owners believe they link, and the ports can
- * start again -- under the same RTNL hold that clears the latch, so no port
- * opens in between.
- *
- * Anything that may pass waits and is retried, with the ports stopped: RTNL
- * contended, a port still finishing a frame, a key still linked, a barrier
- * that failed -- the hardware's own waits for a few seconds at most. Anything
- * that will not -- a port outside the configuration reaching a classifier, a
- * key nothing recorded, a malformed table, hardware that has stopped
- * answering, the restart budget spent -- leaves the latch for a reboot, as it
- * always was.
- *
- * 0: restarted, or terminal; -EAGAIN with *delay set: try again then. Caller
- * holds the transaction. */
-static int cdx_ft_restart(unsigned long *delay)
+ * A port that will not go idle keeps them all stopped for its tries, a few
+ * seconds, and then is bypassed with the rest anyway; until a later look finds
+ * it idle it may still be walking the tables, so nothing is settled meanwhile.
+ * A port CDX did not configure reaching a classifier is the next phase's to
+ * wait for: CDX's own ports are stopped and idle, and go past the classifier
+ * all the same. Ports detached for an unload reach no classifier at all. */
+static int cdx_ft_restart_bypass(unsigned long *delay)
 {
-	unsigned int resolved, released;
-	int rc, unstarted;
+	unsigned int held;
+	int rc;
 
-	cdx_ft_assert_held();
-	if (!ft_episode_start)
-		ft_episode_start = jiffies ?: 1;
-	if (!cdx_ft_restart_allowed())
+	if (ft_ports_proven && !ft_ports_held)
 		return 0;
 	if (!rtnl_trylock()) {
+		/* Only a port a bypass left stopped is still to be tried:
+		 * settle meanwhile, and try it again next time. */
+		if (ft_ports_proven)
+			return 0;
 		/* Soon and at a steady interval: RTNL is held for moments. */
-		*delay = FT_RESTART_RTNL_RETRY;
-		cdx_ft_restart_stalled("RTNL is contended");
-		return -EAGAIN;
+		return cdx_ft_restart_wait(FT_WAIT_RTNL, FT_RESTART_RTNL_RETRY, delay);
 	}
-	rc = dpa_cfg_stop();
-	if (rc == -EXDEV) {
-		rc = 0;
-		/* Nor does an earlier stop prove anything any more: that port
-		 * walks the tables whatever CDX's own do (cdx_ft_proven()). */
-		ft_stopped_at = 0;
-		cdx_ft_set_terminal("a port CDX did not configure reaches the classifier");
-		goto out;
+	if (!ft_bypassed_at) {
+		rc = dpa_cfg_stop();
+		if (rc == -ENOTRECOVERABLE) {
+			rtnl_unlock();
+			cdx_ft_ports_stopped();
+			ft_ports_proven = true;
+			return 0;
+		}
+		if (rc && rc != -EXDEV && ++ft_hw_tries < FT_RESTART_HW_TRIES) {
+			rtnl_unlock();
+			return cdx_ft_restart_wait(FT_WAIT_IDLE, FT_RESTART_HW_RETRY, delay);
+		}
+		cdx_ft_ports_stopped();
 	}
-	if (rc == -ENOTRECOVERABLE) {
-		rc = 0;
-		cdx_ft_set_terminal("the classifier ports cannot be started again");
-		goto out;
+	rc = dpa_cfg_bypass(&held);
+	rtnl_unlock();
+	/* Detached meanwhile, or by a stop that gave up on a port: only the
+	 * stop above proves detached ports idle, so it is asked again. */
+	if (rc == -ENOTRECOVERABLE)
+		return cdx_ft_restart_later(FT_WAIT_DETACHED, delay);
+	if (rc < 0)
+		return cdx_ft_restart_later(FT_WAIT_IDLE, delay);
+	if (!ft_bypassed_at) {
+		ft_bypassed_at = jiffies ?: 1;
+		pr_warn("cdx flowtable: classifier bypassed after unproven deletion; the datapath forwards in software until it is settled\n");
 	}
-	if (rc) {
-		rc = cdx_ft_restart_hw_wait("a port would not stop and go idle", delay);
-		goto out;
+	ft_ports_held = held;
+	if (rc)
+		return cdx_ft_restart_later(FT_WAIT_IDLE, delay);
+	/* What the settle waits for backs off from the start again. */
+	if (!ft_ports_proven)
+		ft_restart_backoff = HZ;
+	ft_ports_proven = true;
+	return 0;
+}
+
+/* The second: with nothing walking the tables, the doubt settled. A barrier
+ * completes behind the last frame the ports let go of; then each recorded key
+ * is looked for and deleted again, or found in no bucket at all
+ * (cdx_ehash_resolve_abandoned()), a second barrier follows, and everything
+ * parked for one goes too. What the tables still link is then exactly what the
+ * live owners believe they link. No RTNL: nothing here changes a port.
+ *
+ * Run again on every attempt until the restart completes, since what it frees
+ * may have grown meanwhile -- a retirement finishing, a group deleted --, and
+ * each run is two barriers when there is nothing to settle. Whatever fails --
+ * a barrier the channel refuses, a key the table refuses, a malformed table
+ * (which only a rebuild of the table would mend; until one exists the key's
+ * memory stays as it is) -- is tried again, backing off, for as long as it
+ * takes. */
+static int cdx_ft_restart_settle(unsigned long *delay)
+{
+	unsigned int resolved;
+	int rc;
+
+	/* That port walks the tables whatever CDX's own do, so no earlier
+	 * barrier proves anything any more, and what may still be linked is
+	 * kept, out of what anything waits on; it may yet go. */
+	if (!dpa_cfg_covered()) {
+		ft_quiet_at = 0;
+		cdx_ft_hw_strand();
+		return cdx_ft_restart_later(FT_WAIT_FOREIGN, delay);
 	}
-	rc = cdx_ft_stopped_barrier();
-	if (rc) {
-		rc = cdx_ft_restart_hw_wait("the PCD barrier kept failing", delay);
-		goto out;
+	if (!ft_quiet_at) {
+		if (cdx_ft_stopped_barrier())
+			return cdx_ft_restart_later(FT_WAIT_BARRIER, delay);
+		ft_quiet_at = jiffies ?: 1;
 	}
-	cdx_ft_ports_stopped();
 	cdx_ft_hw_quiesced();
-	if (ft_restart_held()) {
-		*delay = FT_RESTART_HOLD_RETRY;
-		cdx_ft_restart_stalled("held by flowtable_restart_hold");
-		rc = -EAGAIN;
-		goto out;
-	}
-	if (cdx_ehash_abandoned_lost()) {
-		cdx_ft_set_terminal("a possibly linked key could not be recorded");
-		goto out;
-	}
+	if (ft_restart_held())
+		return cdx_ft_restart_wait(FT_WAIT_HOLD, FT_RESTART_HOLD_RETRY, delay);
 	rc = cdx_ehash_resolve_abandoned(&resolved);
 	ft_episode_resolved += resolved;
-	if (rc == -ENOTRECOVERABLE) {
-		rc = 0;
-		cdx_ft_set_terminal("a possibly linked key could not be settled");
-		goto out;
-	}
-	if (rc) {
-		rc = cdx_ft_restart_later("a possibly linked key is still linked", delay);
-		goto out;
-	}
-	rc = cdx_ft_stopped_barrier();
-	if (rc) {
-		rc = cdx_ft_restart_hw_wait("the PCD barrier kept failing", delay);
-		goto out;
-	}
+	if (rc == -ENOTRECOVERABLE)
+		return cdx_ft_restart_wait(FT_WAIT_UNSETTLED, FT_RESTART_BACKOFF_MAX, delay);
+	if (rc)
+		return cdx_ft_restart_later(FT_WAIT_LINKED, delay);
+	if (cdx_ft_stopped_barrier())
+		return cdx_ft_restart_later(FT_WAIT_BARRIER, delay);
 	cdx_ehash_quarantine_free_all();
-	if (cdx_ft_pending()) {
-		rc = cdx_ft_restart_later("deletions still wait on a barrier", delay);
-		goto out;
+	if (cdx_ft_pending())
+		return cdx_ft_restart_later(FT_WAIT_PENDING, delay);
+	return 0;
+}
+
+/* Whether the classifier may be given back now: never with the limit at zero,
+ * and no more than the limit within a window, counted from the first. Until it
+ * may, the ports stay in software and this is asked again within the backoff's
+ * bound, so a window that passes or a raised limit is seen. */
+static int cdx_ft_restart_budget(unsigned long *delay)
+{
+	unsigned int limit = READ_ONCE(ft_restart_limit);
+	unsigned long left;
+
+	if (!limit)
+		return cdx_ft_restart_wait(FT_WAIT_DISABLED, FT_RESTART_BACKOFF_MAX, delay);
+	if (!ft_window_start || time_after(jiffies, ft_window_start + FT_RESTART_WINDOW)) {
+		ft_window_start = jiffies ?: 1;
+		ft_window_restarts = 0;
+	}
+	if (ft_window_restarts < limit)
+		return 0;
+	left = ft_window_start + FT_RESTART_WINDOW + 1 - jiffies;
+	return cdx_ft_restart_wait(FT_WAIT_BUDGET,
+				   min_t(unsigned long, left, FT_RESTART_BACKOFF_MAX), delay);
+}
+
+/* The third: the classifier given back. Under one RTNL hold, so no port opens
+ * in between: the ports stop and take their PCD back (dpa_cfg_unbypass()),
+ * what an SA's possibly linked key held goes back, an SA a failed delete
+ * stranded gets its entry again, the latch clears, and the ports start as a
+ * stop found them. A port that would not go idle for that, or would not take
+ * its PCD back, leaves them all in software, asked again later. */
+static int cdx_ft_restart_restore(unsigned long *delay)
+{
+	unsigned int released;
+	int rc, unstarted;
+
+	rc = cdx_ft_restart_budget(delay);
+	if (rc)
+		return rc;
+	if (!rtnl_trylock())
+		return cdx_ft_restart_wait(FT_WAIT_RTNL, FT_RESTART_RTNL_RETRY, delay);
+	rc = dpa_cfg_unbypass();
+	if (rc) {
+		unsigned int held;
+
+		/* A port the unbypass's rollback could not send past the
+		 * classifier again is left stopped, and joins those the first
+		 * phase tries again on every attempt. */
+		if (dpa_cfg_bypass(&held) >= 0)
+			ft_ports_held = held;
+		rtnl_unlock();
+		return cdx_ft_restart_later(rc == -EBUSY ? FT_WAIT_IDLE :
+					    rc == -EIO ? FT_WAIT_ATTACH : FT_WAIT_DETACHED,
+					    delay);
 	}
 	/* Every key that could name them is settled: a release still to come
 	 * sees the new epoch and gives its FQIDs back at once. */
@@ -464,51 +577,93 @@ static int cdx_ft_restart(unsigned long *delay)
 	 * in resume_failures. A receive port starts again with its netdev; an
 	 * offline port, which has none, only with CDX's reload or a reboot. */
 	unstarted = dpa_cfg_resume();
+	rtnl_unlock();
 	if (unstarted > 0) {
 		ft_resume_failures += unstarted;
 		pr_err("cdx flowtable: %d classifier ports did not start again after the datapath restart\n",
 		       unstarted);
 	} else if (unstarted) {
-		/* Not after a stop that succeeded under this RTNL hold. */
+		/* Not after an unbypass that succeeded under this RTNL hold. */
 		ft_resume_failures++;
 		pr_err("cdx flowtable: the classifier ports did not start again after the datapath restart (%d)\n",
 		       unstarted);
 	}
 	ft_restarts++;
 	ft_window_restarts++;
-	pr_warn("cdx flowtable: datapath restarted after unproven deletion (%u keys resolved, %u FQID ranges released, stopped %u ms)\n",
+	pr_warn("cdx flowtable: datapath restarted after unproven deletion (%u keys resolved, %u FQID ranges released, stopped %u ms, bypassed %u ms)\n",
 		ft_episode_resolved, released,
-		ft_stopped_at ? jiffies_to_msecs(jiffies - ft_stopped_at) : 0);
+		ft_stopped_at ? jiffies_to_msecs((ft_bypassed_at ?: jiffies) - ft_stopped_at) : 0,
+		ft_bypassed_at ? jiffies_to_msecs(jiffies - ft_bypassed_at) : 0);
 	ft_restart_notify = true;
-	ft_episode_start = 0;
-	ft_stopped_at = 0;
-	ft_episode_resolved = 0;
-	ft_hw_tries = 0;
-	ft_stall_reported = false;
+	ft_episode_start = ft_stopped_at = ft_bypassed_at = ft_quiet_at = 0;
+	ft_episode_resolved = ft_hw_tries = ft_ports_held = 0;
+	ft_ports_proven = false;
+	ft_waits_reported = 0;
 	ft_restart_backoff = HZ;
-out:
-	rtnl_unlock();
+	kernel_param_lock(THIS_MODULE);
+	ft_degraded_reason[0] = '\0';
+	kernel_param_unlock(THIS_MODULE);
+	return 0;
+}
+
+/* Restart the datapath after a latch.
+ *
+ * The latch exists because a classifier key may still be linked: a delete
+ * could not prove it unlinked, and the FMan might walk to it. Once no port
+ * walks the tables, nothing does, and the doubt can be settled. Stopped ports
+ * would make that so but forward nothing, not even in software; so the ports
+ * are stopped only for as long as it takes to see them idle and switch them
+ * past the classifier, which they keep, and run again meanwhile, every frame
+ * going to Linux. Then the tables are settled, and the ports take the
+ * classifier back.
+ *
+ * Every phase that has to wait is tried again, at the interval what it waits
+ * for deserves, for as long as it takes; none of it is for a reboot, and from
+ * the bypass on the datapath forwards throughout. Each attempt runs every phase
+ * not yet done, at most once until the attempt due: the latch's work and the
+ * adapter's own recovery drive the same restart. Caller holds the
+ * transaction; RTNL is taken by trying, by each phase that changes a port,
+ * for that change alone.
+ *
+ * 0: restarted, the adapter to be told; -EAGAIN with *delay set: try again
+ * then. */
+static int cdx_ft_restart(unsigned long *delay)
+{
+	int rc;
+
+	cdx_ft_assert_held();
+	if (xchg(&ft_restart_asked, false))
+		ft_restart_next = 0;
+	if (ft_restart_next && time_before(jiffies, ft_restart_next)) {
+		*delay = ft_restart_next - jiffies;
+		return -EAGAIN;
+	}
+	if (!ft_episode_start)
+		ft_episode_start = jiffies ?: 1;
+	rc = cdx_ft_restart_bypass(delay);
+	if (!rc)
+		rc = cdx_ft_restart_settle(delay);
+	if (!rc)
+		rc = cdx_ft_restart_restore(delay);
+	ft_restart_next = rc ? ((jiffies + *delay) ?: 1) : 0;
 	return rc;
 }
 
-static void ft_fatal_work_fn(struct work_struct *work);
-static DECLARE_DELAYED_WORK(ft_fatal_work, ft_fatal_work_fn);
-
 /* cdx_ft_fatal() latches from paths the adapter's invalidation pass never
  * visits -- a multicast root belongs to its learner, and that pass only runs
- * while a flowtable is bound -- so nothing else is guaranteed to stop the
- * ports, let alone restart them. Both happen here, in a context that holds
- * neither lock: the restart stops the ports itself, and a latch that can no
- * longer restart is left to cdx_ft_recover(), which keeps them stopped. The
- * adapter hears of a restart only after the transaction has been released,
- * since what it asks for takes the transaction itself. */
+ * while a flowtable is bound -- so nothing else is guaranteed to restart the
+ * datapath. It happens here, in a context that holds neither lock, at
+ * whatever pace the restart asks for and for as long as the latch lasts: no
+ * longer than the backoff's bound between tries. The adapter hears of a
+ * restart only after the transaction has been released, since what it asks
+ * for takes the transaction itself. */
 static void ft_fatal_work_fn(struct work_struct *work)
 {
 	unsigned long delay = HZ;
 	int rc = 0;
 
 	cdx_ft_begin();
-	if (ft_failed && !ft_terminal)
+	if (ft_failed)
 		rc = cdx_ft_restart(&delay);
 	if (!rc)
 		rc = cdx_ft_recover();
@@ -523,16 +678,20 @@ static void ft_fatal_work_fn(struct work_struct *work)
  * (cdx_ft_del()). A classifier root that could not be provably unlinked may
  * still resolve in hardware -- forwarding a retired flow, replicating through a
  * revoked listener chain, or enqueueing to a deleted SA's queues. The latch
- * refuses new entries and groups and blocks port restart, and the work above
- * stops the ports and then restarts them once the root is settled, so a
- * possibly-still-linked root fail-stops the datapath rather than forwarding
- * on unnoticed. Every caller holds the transaction, which the restart that
- * clears the latch holds too; the store is WRITE_ONCE for the netdev notifier,
- * which reads it under RTNL alone. */
+ * refuses new entries and groups and blocks a port's open while the ports are
+ * stopped, and the work above takes the classifier out of the datapath and
+ * gives it back once the root is settled, so a possibly-still-linked root is
+ * never forwarded through unnoticed and the datapath forwards in software
+ * meanwhile. Every caller holds the transaction, which the restart that clears
+ * the latch holds too; the store is WRITE_ONCE for the netdev notifier, which
+ * reads it under RTNL alone. */
 void cdx_ft_fatal(void)
 {
 	WRITE_ONCE(ft_failed, true);
-	schedule_delayed_work(&ft_fatal_work, 0);
+	/* At once, even with the work queued later: a new latch stops and
+	 * bypasses the ports without waiting, and one during an episode costs
+	 * the attempt not yet due no more than a look at when it is. */
+	mod_delayed_work(system_wq, &ft_fatal_work, 0);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_fatal, ASK_CDX_FLOWTABLE);
 
@@ -560,13 +719,13 @@ EXPORT_SYMBOL_NS_GPL(cdx_ft_pending, ASK_CDX_FLOWTABLE);
  * parked without one; one barrier is issued here for all of it, as one proves
  * every unlink before it. A deletion that could not be proven unlinked at all
  * latched the failure, and its key may still be linked: no barrier proves that
- * gone. Once the ports that walk the tables are found stopped and idle with a
- * barrier behind them, though, nothing reaches it, and they stay stopped until
+ * gone. Once no port walks the tables -- each stopped or bypassed and seen
+ * idle, with a barrier behind that -- nothing reaches it, and none does until
  * the restart has settled it. 0, or -EAGAIN. */
 int cdx_ft_proven(void)
 {
 	cdx_ft_assert_held();
-	if (ft_failed && !ft_stopped_at)
+	if (ft_failed && !ft_quiet_at)
 		return -EAGAIN;
 	if (cdx_ft_pending())
 		cdx_ft_hw_retry();
@@ -925,65 +1084,31 @@ int cdx_ft_settle(unsigned int *unproven)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_settle, ASK_CDX_FLOWTABLE);
 
-/* When a stop that found a port still busy may be tried again. Every caller of
- * cdx_ft_recover() polls it -- the latch's work, the adapter's invalidation
- * pass, its SA retirement -- and each try holds RTNL through the whole wait
- * for idle, so a port that stays busy is not asked again before then: soon
- * while a restart may still come, then ever more rarely once the latch is
- * terminal. Under the control mutex. */
-static unsigned long ft_recover_next, ft_recover_backoff;
-
 int cdx_ft_recover(void)
 {
-	bool stopped;
-	int rc;
+	unsigned long delay;
 
 	cdx_ft_assert_held();
 	/* Never wait for RTNL while a callback transaction is held. CDX owns
-	 * this latch even after the adapter releases its claim. Stopping the
-	 * ports is all this does about it: the restart is the latch's work's,
-	 * which tells the adapter when it has happened. */
+	 * this latch even after the adapter releases its claim. After one this
+	 * drives the latch's own restart, at the pace its next attempt is due,
+	 * so every caller polling here -- the latch's work, the adapter's
+	 * invalidation pass, its Wi-Fi and SA retirements -- moves it on; what
+	 * was retired may go once no port walks the tables, before the
+	 * classifier comes back. While a port CDX did not configure walks
+	 * them, which may last, what may still be linked is kept, out of what
+	 * a caller waits on (cdx_ft_hw_strand()), and the rest goes behind a
+	 * barrier as it would without a latch. A restart completed here is
+	 * told to the adapter by the work, which runs outside this
+	 * transaction. */
 	if (ft_failed) {
-		if (ft_recover_next && time_before(jiffies, ft_recover_next))
-			return -EAGAIN;
-		if (!rtnl_trylock())
-			return -EAGAIN;
-		rc = dpa_cfg_stop();
-		rtnl_unlock();
-		ft_recover_next = 0;
-		/* Another port still walks the tables: no stop of CDX's own
-		 * proves anything, now or later -- nor an earlier one -- so
-		 * nothing it retired is freed. */
-		if (rc == -EXDEV) {
-			ft_stopped_at = 0;
-			cdx_ft_set_terminal("a port CDX did not configure reaches the classifier");
+		if (!cdx_ft_restart(&delay)) {
+			mod_delayed_work(system_wq, &ft_fatal_work, 0);
+		} else if (!ft_quiet_at) {
+			if (!ft_ports_proven || dpa_cfg_covered())
+				return -EAGAIN;
 			cdx_ft_hw_strand();
-			return cdx_ft_hw_retry();
 		}
-		/* Stopped, but never to be restarted: what the latch always
-		 * was. */
-		if (rc == -ENOTRECOVERABLE) {
-			cdx_ft_set_terminal("the classifier ports cannot be started again");
-		} else if (rc) {
-			if (!ft_terminal)
-				ft_recover_backoff = FT_RESTART_HW_RETRY;
-			else if (ft_recover_backoff < HZ)
-				ft_recover_backoff = HZ;
-			else
-				ft_recover_backoff = min_t(unsigned long, 2 * ft_recover_backoff,
-							   FT_RESTART_BACKOFF_MAX);
-			ft_recover_next = (jiffies + ft_recover_backoff) ?: 1;
-			pr_err_ratelimited("cdx flowtable: waiting for the ports to stop after unproven deletion\n");
-			return -EAGAIN;
-		}
-		ft_recover_backoff = 0;
-		stopped = !rc;
-		rc = cdx_ft_stopped_barrier();
-		if (rc)
-			return -EAGAIN;
-		if (stopped)
-			cdx_ft_ports_stopped();
-		cdx_ft_hw_quiesced();
 	}
 	return cdx_ft_hw_retry();
 }

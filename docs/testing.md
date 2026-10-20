@@ -483,8 +483,8 @@ that differs from the checkout and checks each selected test's required tools.
   expression'`. Markers and configuration are checked strictly. Startup tests
   remain a separate `make test-startup` command and require their special boot.
 - Explicit cases carry `@pytest.mark.explicit(variable, *values, reason=...)`:
-  soaks, diagnostics run in one chosen mode, and terminal lifecycles that need
-  a fresh boot afterwards. One runs only when its variable holds one of its
+  soaks, diagnostics run in one chosen mode, and lifecycles that need a fresh
+  boot afterwards, such as CDX's unload. One runs only when its variable holds one of its
   values; otherwise it is deselected, and the summary names it with the
   variable that selects it. The session's `selection.json` lists them under
   `explicit_not_selected`.
@@ -715,8 +715,7 @@ against one checkout and one DUT image:
 | `suite` | host and DUT suites | staged test image |
 | `churn` | `flowtable_churn.py`, `ASK_FLOWTABLE_CHURN=1` | staged test image |
 | `invalidation-barrier` | `test_invalidation`, `ASK_FLOWTABLE_INVALIDATION=barrier` | staged test image |
-| `terminal-unload` | `test_terminal`, `ASK_FLOWTABLE_TERMINAL=unload` | ends its boot |
-| `terminal-budget` | `test_terminal`, `ASK_FLOWTABLE_TERMINAL=budget` | ends its boot |
+| `cdx-unload` | `test_cdx_unload`, `ASK_FLOWTABLE_UNLOAD=1` | ends its boot |
 | `unregister` | `flowtable_unregister.py`, `ASK_FLOWTABLE_UNREGISTER=1` | ends its boot |
 | `startup` | `startup_tests` | `rdinit=/bin/sh`; ends its boot |
 
@@ -827,8 +826,10 @@ resume`) returns the frame and opens the channel again; nothing waits for a
 reboot. The caller of a timed-out command hears `E_TIMEOUT`, an outcome
 unknown, and puts its own record right once the channel answers: a barrier
 is retried until one completes, and a policer write is made again from the
-owner's record. A datapath restart, which waits with the ports stopped, waits
-a few seconds for that answer before it gives up (A403). The only
+owner's record. A datapath restart waits for that answer however long it
+takes, with the ports past the classifier and the datapath forwarding in
+software meanwhile, and gives the classifier back once a barrier completes
+(A403). The only
 state-changing command issued after boot is the
 policer profile write; KeyGen, classification-plan and CC commands run while
 the PCD is built. FMan sysfs bind/unbind is disabled because this built-in

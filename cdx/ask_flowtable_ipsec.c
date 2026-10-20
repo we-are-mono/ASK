@@ -2674,6 +2674,7 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 {
 	struct ft_ipsec_retirement *retirement;
 	struct cdx_ft_entry *entry;
+	unsigned int wait_ms;
 	bool kept, marked;
 	u16 handle;
 
@@ -2686,6 +2687,7 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 			return;
 		handle = cdx_ipsec_sa_handle(retirement->sa);
 		marked = false;
+		wait_ms = 20;
 		for (;;) {
 			bool more;
 
@@ -2705,14 +2707,18 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 			}
 			more = ft_retire_batch(ft_names_sa, &handle);
 			/* A deletion barrier can defer reclaim or require datapath
-			 * quiescence. Retain the SA until that proof completes. */
+			 * quiescence. Retain the SA until that proof completes:
+			 * asked again soon, then no more than once a second, since
+			 * a datapath restart can keep it minutes away. */
 			if (!more && (!cdx_ft_pending() || !cdx_ft_recover()))
 				break;
 			cdx_ft_end();
-			if (more)
+			if (more) {
 				cond_resched();
-			else
-				msleep(20);
+			} else {
+				msleep(wait_ms);
+				wait_ms = min_t(unsigned int, 2 * wait_ms, MSEC_PER_SEC);
+			}
 		}
 		cdx_ipsec_sa_del(&retirement->sa, &retirement->last);
 		/* Out of the hardware: an egress drain waiting on it may now

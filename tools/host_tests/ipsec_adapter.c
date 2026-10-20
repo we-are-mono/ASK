@@ -226,8 +226,16 @@ static bool is_zero_ether_addr(const u8 *a)
 #define ERR_PTR(e) ((void *)(long)(e))
 #define ERR_CAST(p) ((void *)(p))
 
-static unsigned slept;
-static void msleep(unsigned ms) { (void)ms; slept++; }
+/* Sleeps, counted, with the longest asked for: a retry that backs off may
+ * not stretch past a second. */
+static unsigned slept, longest_sleep;
+#define MSEC_PER_SEC 1000U
+static void msleep(unsigned ms)
+{
+	slept++;
+	if (ms > longest_sleep)
+		longest_sleep = ms;
+}
 
 static bool ipv6_prefix_equal(const void *a, const void *b, unsigned int len)
 {
@@ -1937,18 +1945,22 @@ static void test_state_add(void)
 
 	/* Model an admission that was not yet on the watch when deletion
 	 * ran. The SA worker must discover it, remove it under the transaction,
-	 * and complete deferred barriers before its handle can be reused. */
+	 * and complete deferred barriers before its handle can be reused --
+	 * however long they are withheld, which a datapath restart can make
+	 * minutes: asked again soon at first, then no more than once a second. */
 	struct nf_flow_offload_handle late_handle = { .valid = true };
 	struct cdx_ft_entry *late = calloc(1, sizeof(*late));
 	late->handle = &late_handle;
 	late->rule.in_sa_handle = sa_pool[0].handle;
 	list_add_tail(&late->list, &ft_entries);
 	retirement_flows = 1;
-	retirement_barriers = 3;
+	retirement_barriers = 12;
 	unsigned slept_before = slept;
+	longest_sleep = 0;
 	bench_drain_retirements();
 	assert(!late_handle.valid && !retirement_flows && !retirement_barriers);
-	assert(slept == slept_before + 2 && sa_deleted == 1);
+	assert(slept == slept_before + 11 && sa_deleted == 1);
+	assert(longest_sleep == MSEC_PER_SEC);
 	assert(!ft_ipsec_retire_pending());
 
 	/* An SA more flows name than one transaction retires: they go a batch

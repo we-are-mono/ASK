@@ -18,24 +18,27 @@ enable automatic recovery because fault tests deliberately stop the datapath.
   exhausted or the watchdog unavailable, leave ASK disabled and Linux networking
   available; keep the OS watchdog running.
 
-`ask-flowtable health` returns 0 while networking is responsive, 2 on a
-terminal CDX latch, and 1 on invalid diagnostics or a five-second probe
-timeout. It checks RTNL even when no flow exists. Recoverable in-place datapath
-restarts are allowed. A blocked kernel reader cannot prevent the command's
-parent from reporting failure.
+`ask-flowtable health` returns 0 while networking is responsive and 1 on
+invalid diagnostics or a five-second probe timeout. It checks RTNL even when no
+flow exists. A CDX datapath restart after an unproven deletion is healthy
+however long it waits: the classifier is bypassed and the ports forward in
+software meanwhile (`bypassed 1` in `/proc/cdx_flowtable`, the wait in
+`/sys/module/cdx/parameters/flowtable_degraded_reason`). A blocked kernel
+reader cannot prevent the command's parent from reporting failure.
 
-The monitor resets the platform at once on a terminal latch, and after three
-consecutive failed probes otherwise. A slow but live datapath (a probe over its
-deadline, a transient diagnostics error) therefore costs no reboot and no
-recovery attempt unless it persists for about half a minute. The monitor keeps
-feeding the service watchdog meanwhile, since it is itself running; a hung
-monitor still lets the watchdog expire.
+The monitor resets the platform after three consecutive failed probes; nothing
+resets it at once. A slow but live datapath (a probe over its deadline, a
+transient diagnostics error) therefore costs no reboot and no recovery attempt
+unless it persists for about half a minute. The monitor keeps feeding the
+service watchdog meanwhile, since it is itself running; a hung monitor still
+lets the watchdog expire.
 
 `recovery-arm` reserves one recovery attempt per kernel boot in the separate
 U-Boot variable `ask_recovery` (`count boot-UUID reason`). Return 2 means three unconfirmed boots have already been
 allowed; return 1 means the environment or hook failed. Both prevent activation.
 Repeated starts in the same boot do not spend another attempt. `recovery-failed`
-saves the terminal reason without acquiring RTNL. An abrupt hard hang retains
+saves the failure -- and what a datapath restart waited for, if one was under
+way -- without acquiring RTNL. An abrupt hard hang retains
 the previously stored “armed; detail unavailable” record. Read the reason
 before arming the next boot; arming also logs the previous record.
 
@@ -120,14 +123,15 @@ removes ASK health monitoring; the general OS watchdog continues running.
 
 ## Qualification
 
-ASK's KASAN test image passed actual hardware resets after a terminal datapath
-failure, a CPU hard-locked holding RTNL, and a stopped external watchdog feeder.
-The fourth attempt was refused; reasons/counts survived TFTP boots and all
-non-ASK U-Boot variables were preserved. Host checks exercise the health timeout,
-budget, and platform hooks; systemd unit validation uses version 257.
+ASK's KASAN test image passed actual hardware resets after a datapath failure
+that was then terminal (since A403 none is), a CPU hard-locked holding RTNL,
+and a stopped external watchdog feeder. The fourth attempt was refused;
+reasons/counts survived TFTP boots and all non-ASK U-Boot variables were
+preserved. Host checks exercise the health timeout, budget, and platform hooks;
+systemd unit validation uses version 257.
 
-Before enabling these files in a consumer image, test terminal failure, a CPU
-stuck holding RTNL, and three consecutive resets on that image. The OS service
+Before enabling these files in a consumer image, test a CPU stuck holding
+RTNL, a probe that times out, and three consecutive resets on that image. The OS service
 manager, its shutdown path, and firmware watchdog handoff are part of the test.
 Configuration validation and ASK initramfs tests do not establish that a
 different consumer image's complete recovery path works.

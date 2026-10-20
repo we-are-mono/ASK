@@ -2968,20 +2968,17 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		/* A bind the hardware cannot take must not fail the consumer's
 		 * transaction: that would fail its whole firewall reload, which is
 		 * far worse than a port forwarding in software. A port the
-		 * classifier cannot program is bound passively, and so are two
-		 * refusals that nothing in this boot will lift. A failed deletion
-		 * CDX cannot settle latches admission off until a fresh boot, so a
-		 * parked binding would wait for a rearm that never comes; one CDX
-		 * is restarting the datapath after is different, and its bindings
-		 * are made as any other's, every flow declined until the restart
-		 * and the rearm it asks for. A binding past the bound could not be
-		 * flushed by ft_invalidate_work(), whose device snapshot that bound
-		 * sizes; passive bindings are not counted in it. An invalidation
-		 * recovers in this boot once the bindings it caught are gone: a
-		 * binding made under one is parked below and takes over by
-		 * itself. */
-		passive = !cdx_ft_port_supported(dev) ? "not a classifier port" :
-			  cdx_ft_terminal() ? "admission stopped until reboot" : NULL;
+		 * classifier cannot program is bound passively, and so is a
+		 * binding past the bound, which ft_invalidate_work()'s device
+		 * snapshot, sized by that bound, could not flush; passive bindings
+		 * are not counted in it. A failed deletion CDX is restarting the
+		 * datapath after -- however long that takes, the ports forwarding
+		 * in software meanwhile -- refuses nothing here: its bindings are
+		 * made as any other's, every flow declined until the restart and
+		 * the rearm it asks for. An invalidation recovers in this boot once
+		 * the bindings it caught are gone: a binding made under one is
+		 * parked below and takes over by itself. */
+		passive = !cdx_ft_port_supported(dev) ? "not a classifier port" : NULL;
 		if (passive) {
 			rc = ft_bind_passive(dev, bo, flowtable, indirect, sch, cleanup,
 					     passive);

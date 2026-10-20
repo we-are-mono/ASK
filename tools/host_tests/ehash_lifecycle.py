@@ -34,11 +34,15 @@ def test_ehash_teardown(tmp_path):
         + function(cc, "FmPcdCcModifyNextEngineParamTree")
     )
     # CDX's quarantine over the same table API: its node type through
-    # cdx_ehash_delete_entry(), the one delete every CDX path goes through.
+    # cdx_ehash_delete_entry(), the one delete every CDX path goes through,
+    # and the owner's hw_ct, which carries the record of a key that may still
+    # be linked, as the module declares it.
     quarantine = (ROOT / "cdx/cdx_ehash.c").read_text()
     (tmp_path / "quarantine_production.inc").write_text(
-        quarantine[quarantine.index("struct cdx_ehash_pending_free {"):
-                   quarantine.index("/* delete classif entry from table.")])
+        re.search(r"^struct hw_ct \{.*?^\};", (ROOT / "cdx/cdx_common.h").read_text(),
+                  re.S | re.M).group() + "\n"
+        + quarantine[quarantine.index("struct cdx_ehash_pending_free {"):
+                     quarantine.index("/* delete classif entry from table.")])
     binary = tmp_path / "ehash_lifecycle"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

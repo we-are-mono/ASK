@@ -23,7 +23,7 @@ being retired; new coverage must use the native interfaces.
 | Acceleration is intentionally disabled or stopped for maintenance | Respect the stop. Recovery must not race firewall updates or recreate admission while an authorized stop is in effect. |
 | Desired configuration is malformed | Reject it and report the error. Follow the existing transaction contract for preserving the previous policy or leaving acceleration disabled; do not invent configuration or restore an obsolete security policy. Recover when valid desired configuration is supplied. |
 | Another owner controls a table or backend binding | Refuse the conflict and report it; do not take ownership by deleting foreign objects. Reconcile when the conflict is legitimately resolved. |
-| Hardware deletion cannot be proven | Stop and fence the classifier ports, settle the possibly linked key with them idle, and restart the datapath in the same boot (a second or two; see the [architecture](architecture.md#datapath-restart)). Only what a restart cannot prove safe -- a key that could not be recorded, a malformed table, ports outside the configuration, hardware that stops answering, or a spent restart budget -- stays stopped for provider teardown and a fresh boot (A403). |
+| Hardware deletion cannot be proven | Stop the classifier ports until they are idle and send them past the classifier, so the datapath forwards in software within moments; settle the possibly linked key with nothing walking the tables; and give the classifier back in the same boot (usually a second or two; see the [architecture](architecture.md#datapath-restart)). Whatever that waits for -- a port that will not go idle, a barrier the channel refuses, a key the table refuses, a malformed table, a port outside the configuration, a spent restart budget or a limit of zero -- it waits for in software, retrying for as long as it takes; nothing is ever left for a reboot, and the health probe passes throughout (A403). |
 
 Automatic recovery cannot make an invalid topology valid or repair a permanent
 hardware fault. Its responsibilities are to reach a safe state, report why
@@ -686,8 +686,7 @@ A bind the hardware cannot take now never fails the transaction:
 | --- | --- | --- |
 | Invalidation latched, old bindings still bound or hardware not drained | Parked: counted in `bindings` and `parked`, every flow declined | Software, until rearm |
 | Invalidation latched and drained | Rearmed at once, as the first bind after a detach always was | Hardware |
-| Deletion failure CDX is restarting after | Parked if an invalidation is latched, else live; every flow declined until the restart | Software, until the restart rearms it |
-| Terminal deletion failure (fresh boot required) | Passive (`passive`), never rearmed | Software |
+| Deletion failure CDX is restarting after, however long it waits | Parked if an invalidation is latched, else live; every flow declined until the restart | Software, until the restart rearms it |
 | Past the binding bound | Passive | Software |
 | First binding after a detach, candidate table not empty | Refused, as before | - |
 
@@ -702,11 +701,10 @@ Netfilter bypasses the software fast path, so the offer waits for the flow to
 expire, up to the 30-second flowtable timeout. If only an unproven hardware
 deletion remains, the parked binding retries that barrier every second until it
 completes. A deletion that could not be proven at all holds the rearm back until
-CDX has restarted the datapath, and the restart asks for the rearm itself.
-Terminal failure and the binding bound are passive rather than parked
-because nothing in the boot lifts them. A parked binding would wait for a rearm
-that never comes, and one past the bound could not be flushed by the
-invalidation worker.
+CDX has restarted the datapath, which it always does in the end, and the
+restart asks for the rearm itself. The binding bound is passive rather than
+parked because a binding past it could not be flushed by the invalidation
+worker.
 
 A parked table keeps making software flows, so the latch cannot simply absorb
 a global event raised meanwhile, as it does when nothing is parked. Such an
@@ -747,7 +745,7 @@ The following observations motivated the work:
   previously backgrounded the daemon once with `start-stop-daemon`. The
   supervisor now replaces crashed controllers.
 - [Flowtable fault tests](../../tools/tests/flowtable_offload.py) already
-  exercise add failures, invalidation/rearm and terminal deletion failures.
+  exercise add failures, invalidation/rearm and unproven deletion failures.
   Their explicit table recreation and cleanup prove those operations, rather
   than autonomous service recovery. Global invalidation deliberately requires
   a fresh binding/reconciliation boundary; recovery must preserve that barrier.
@@ -781,8 +779,9 @@ Start with deterministic cases that expose missing recovery mechanisms.
 | Next | Remove/recreate VLANs, flap links, change routes/neighbours, and exhaust/release admission resources | Stale forwarding stops; unaffected traffic follows its contract; eligible flows return to hardware after prerequisites recover. |
 | Next | Supply malformed policy, disable policy, request maintenance stop, or introduce foreign ownership | Recovery respects intent and ownership; it resumes only when the relevant blocking condition is resolved. |
 | Later | Repeat faults, combine events in recorded sequences, and restart with incomplete runtime state | No cumulative leak, retry storm, stale state or dependence on a pristine fixture. |
-| Same boot | Force unproven hardware deletion of each kind -- a flow, a multicast group, an IPsec SA | The ports stop and stay stopped while the test image's hold is set; released, the datapath restarts within two seconds and forwarding returns in hardware. |
-| Separate destructive suite | CDX unload, or an unproven deletion past the restart budget (`ASK_FLOWTABLE_TERMINAL=unload` or `budget`) | Hardware is fenced, evidence survives, and only provider teardown and a fresh boot recover. |
+| Same boot | Force unproven hardware deletion of each kind -- a flow, a multicast group, an IPsec SA | The classifier is bypassed while the test image's hold is set: the ports run, traffic crosses in software, the health probe passes, a port reopens; released, the datapath restarts within two seconds, the ports stopped for no more than a moment of it, and forwarding returns in hardware. |
+| Same boot | An unproven deletion past the restart budget, and with restarts disabled (`test_restart_budget_waits_in_software`) | The datapath waits in software, healthy, with no reboot line; raising `flowtable_restart_limit` at runtime restores hardware forwarding at once. |
+| Separate destructive suite | CDX unload (`ASK_FLOWTABLE_UNLOAD=1`) | Evidence survives, and the ports return to Linux; only a fresh boot loads CDX again. |
 
 Deleting the owned table is a deliberate fault test. It does not make arbitrary
 external edits to that table a supported interface. Its configuration-hash
@@ -811,8 +810,8 @@ reached. Avoid broad injection that primarily breaks the test agent.
 
 Keep explicit hardware failure hooks as well: failslab does not model every
 DMA/resource allocation, programming, synchronization or deletion failure.
-The existing one-shot `flowtable_fail_stage` and terminal unlink hooks are
-starting points. Inject errors through the real failure/unwind path, including
+The existing one-shot `flowtable_fail_stage` and unlink hooks are starting
+points. Inject errors through the real failure/unwind path, including
 partial programming, rather than merely setting a final status flag.
 
 For every covered point, require safe unwind, no invalid references or growing
@@ -881,8 +880,10 @@ do not require 2 Gbit/s from the CPU. See the [QoS guide](qos.md).
   attempts, last success, and whether progress is blocked by configuration,
   resource pressure or a fatal hardware condition.
 - Specify reset escalation separately: diagnostics first, bounded attempts,
-  restart/boot-loop protection, and an actionable terminal state if recovery
-  remains impossible.
+  restart/boot-loop protection, and degraded operation -- forwarding in
+  software, the reason published -- rather than a state only a reboot leaves,
+  while recovery waits. CDX's datapath restart is the model: it is never
+  terminal (A403).
 
 [Devlink health](https://docs.kernel.org/networking/devlink/devlink-health.html)
 is a useful design reference for reporting errors, collecting diagnostics and

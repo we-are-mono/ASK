@@ -465,11 +465,13 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * control budget was spent. */
 	seq_printf(seq, "qos_control_overruns %llu\n", cdx_ft_qos_control_overruns());
 	/* fatal is CDX's latch, held from a deletion it could not prove until
-	 * it has restarted the datapath; fatal_terminal says it never will in
-	 * this boot, restarts counts the ones it has done, and resume_failures
-	 * the classifier ports they could not start again. */
-	seq_printf(seq, "fatal_terminal %u\nrestarts %u\nresume_failures %u\n",
-		   cdx_ft_terminal(), cdx_ft_restarts(), cdx_ft_resume_failures());
+	 * it has restarted the datapath; bypassed says the classifier ports run
+	 * past the classifier meanwhile, the datapath forwarding in software,
+	 * restarts counts the restarts done, and resume_failures the classifier
+	 * ports they could not start again. What a restart waits for is CDX's
+	 * flowtable_degraded_reason. */
+	seq_printf(seq, "bypassed %u\nrestarts %u\nresume_failures %u\n",
+		   cdx_ft_bypassed(), cdx_ft_restarts(), cdx_ft_resume_failures());
 	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nparked %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\nowed %u\n"
@@ -704,14 +706,14 @@ static void ft_block_drain(void)
 }
 
 /* Every deletion left unproven, proven: a barrier completes, or -- after one
- * that may have left its key linked -- the datapath is stopped, as the backend
- * requires of an -EIO. Both unload and a load unwinding its own failure owe
- * this before the device records go and the claim is released, and neither
- * can count on the invalidation worker for it: ft_invalidate() does nothing
- * once ft_stopping is set. It cannot fail, so it waits, releasing the
- * transaction between attempts so configuration and other kernel work can
- * progress. A latch stays in CDX: a later load is refused until CDX has
- * restarted the datapath, and for good when it cannot. */
+ * that may have left its key linked -- no port walks the tables any more, as
+ * the backend requires of an -EIO. Both unload and a load unwinding its own
+ * failure owe this before the device records go and the claim is released,
+ * and neither can count on the invalidation worker for it: ft_invalidate()
+ * does nothing once ft_stopping is set. It cannot fail, so it waits,
+ * releasing the transaction between attempts so configuration and other
+ * kernel work can progress. A latch stays in CDX: a later load is refused
+ * until CDX has restarted the datapath. */
 static void ft_hw_settle(void)
 {
 	int rc;

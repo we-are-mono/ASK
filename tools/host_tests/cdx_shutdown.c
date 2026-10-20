@@ -61,7 +61,7 @@ static void cdx_flowtable_quiesced(void)
 {
     assert(rtnl && cdx_info->ctrl.mutex && ports_safe && !callbacks_released);
 }
-/* The terminal latch's port-stop work takes the control lock and reads
+/* The latch's datapath restart work takes the control lock and reads
  * cdx_info, so it is disabled without the lock and before anything it reaches
  * goes -- ahead of the deinit chain, whose multicast teardown may latch again
  * and must not queue it. */

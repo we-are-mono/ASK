@@ -673,8 +673,8 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 		 *
 		 * The classifier's own table entry is in the same
 		 * unlinked-but-unsynced state as the members; parking it, and
-		 * releasing its software-only hw_ct wrapper, is
-		 * delete_entry_from_classif_table()'s job (ISSUES.md A95). */
+		 * releasing its hw_ct wrapper, is cdx_ehash_delete_entry()'s
+		 * job (ISSUES.md A95). */
 		FreeMcastGrpID(pMcastGrpInfo->mctype, pMcastGrpInfo->grpid);
 		mc_quarantine_members(pMcastGrpInfo, td);
 	}
@@ -687,10 +687,10 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 		 * while it can - not now, and not via the quarantine, whose
 		 * backlog is freed on the next successful sync. They are
 		 * recorded behind the classifier's own entry, which
-		 * delete_entry_from_classif_table() recorded as a root and
-		 * whose software-only hw_ct wrapper it released, and the slots
-		 * cleared so nothing else can reach them. The group id is
-		 * software bookkeeping and is released regardless. */
+		 * cdx_ehash_delete_entry() recorded as a root through its
+		 * hw_ct, and the slots cleared so nothing else can reach them.
+		 * The group id is software bookkeeping and is released
+		 * regardless. */
 		unsigned int ii, kept = 0;
 
 		FreeMcastGrpID(pMcastGrpInfo->mctype, pMcastGrpInfo->grpid);
@@ -707,8 +707,9 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 			  __func__, rc, kept);
 		/* The root may still be linked and replicate through the
 		 * listener chain. Latch the failure, as the unicast delete
-		 * does on -EIO: the datapath stops rather than forwarding to a
-		 * revoked listener unnoticed, and restarts once the root is
+		 * does on -EIO: the classifier is taken out of the datapath,
+		 * which forwards in software, rather than forwarding to a
+		 * revoked listener unnoticed, and comes back once the root is
 		 * settled, freeing these with it. */
 		cdx_ft_fatal();
 	}

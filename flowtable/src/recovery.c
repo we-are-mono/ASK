@@ -134,7 +134,7 @@ int ft_recovery(struct ft_ctx *ctx, const char *verb)
 		 * all: the attempt comes back with the failure. */
 		if (!strcmp(r.reason, RECOVERY_REFUNDED))
 			r.count++;
-		ft_terminal_reason(r.reason, sizeof(r.reason));
+		ft_failure_reason(r.reason, sizeof(r.reason));
 	} else if (!strcmp(verb, "clean")) {
 		/* A shutdown of a boot that armed, recorded no failure and whose
 		 * datapath the platform has just found healthy. The attempt it

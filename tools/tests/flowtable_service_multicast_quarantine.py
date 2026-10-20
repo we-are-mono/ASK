@@ -32,8 +32,9 @@ after unlinking a listener chain. Both read back how many failures remain
 armed, and both are disarmed on the way out whatever happened.
 
 The last two cases fail a delete before its unlink instead (ehash_fail_unlink),
-which no barrier settles: the datapath stops, and CDX restarts it in the same
-boot once the ports are idle (_flowtable_restart.py).
+which no barrier settles: the classifier is bypassed, the datapath forwarding
+in software meanwhile, and CDX restarts it in the same boot once nothing walks
+the tables (_flowtable_restart.py).
 """
 from __future__ import annotations
 
@@ -42,9 +43,10 @@ import time
 
 import pytest
 
-from _flowtable_restart import (HOLD, ROOT_FAULT, RUNNING, assert_restarted_cleanly, dmesg_count, knob,
-                                log_marks, ports, require_knobs, restart_budget, restart_counts,
-                                wait_restarted, wait_running, wait_stopped, write)
+from _flowtable_restart import (HOLD, ROOT_FAULT, RUNNING, assert_healthy, assert_restarted_cleanly,
+                                dmesg_count, engines, knob, log_marks, ports, require_knobs,
+                                restart_budget, restart_counts, wait_bypassed, wait_restarted,
+                                wait_running, write)
 from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware, in_software, learn, mcast_rows, mdb, members, moved, mroute_row, packets, quiet, stream, streamed, summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
@@ -456,7 +458,7 @@ async def restart_after_withdrawal(r, learner, family):
     in_hardware(both, streams=2)
     live = await r.proc()
     assert live["fatal"] == 0, summary(live)
-    # The stop and the restart are reported from a work item, after the
+    # The bypass and the restart are reported from a work item, after the
     # withdrawal returns, and a printk would land inside whichever console read
     # runs then. dmesg keeps every line for the assertions below.
     printk = (await read(r.target, r.session, "/proc/sys/kernel/printk")).split()
@@ -467,33 +469,35 @@ async def restart_after_withdrawal(r, learner, family):
             # Its own restart budget, and on the way out, over this console
             # while it is still open, the hold released and the fault
             # disarmed: a case that fails inside the window must not leave
-            # the ports stopped for the agent's teardown to fail against.
+            # the classifier bypassed for the agent's teardown to find.
             async with restart_budget(console, r, (ROOT_FAULT,)):
                 marks = await log_marks(console)
                 failed = await dmesg_count(console, "classifier delete failed pre-unlink")
                 assert await ports(console) == RUNNING
+                classifying = await engines(console)
                 await write(console, HOLD, 1)
-                # Armed over the agent while it still reaches the DUT; the
-                # withdrawal that consumes it is the last command the
-                # management path carries. A bridged group nobody wants is
-                # first swapped to a discard and deleted a refresh or two
-                # later, which is the delete that fails.
+                # Armed over the agent while it still reaches the DUT. A
+                # bridged group nobody wants is first swapped to a discard and
+                # deleted a refresh or two later, which is the delete that
+                # fails.
                 result = await r.target.fs_write(r.session, ROOT_FAULT, "1")
                 assert result["errno"] == 0, result
                 await learner.remove(target)
-                stopped, _ = await wait_stopped(console, live, timeout=30)
+                bypassed, _ = await wait_bypassed(console, live, classifying, timeout=30)
                 # The adapter let the withdrawn group go; the hardware may
-                # not have, which is why the stopped ports and not /proc are
-                # the proof.
-                assert learner.withdrawn(stopped, target), summary(stopped)
+                # not have, which is why the ports past the classifier and not
+                # /proc are the proof: nothing walks to the group's key while
+                # it is settled.
+                assert learner.withdrawn(bypassed, target), summary(bypassed)
                 assert await knob(console, ROOT_FAULT) == "0"
                 assert await dmesg_count(console, "classifier delete failed pre-unlink") == failed + 1
-                r.record(f"mcast-restart-{learner.kind}-stopped", {"live": summary(live),
-                                                                   "stopped": summary(stopped)})
+                await assert_healthy(console)
+                r.record(f"mcast-restart-{learner.kind}-bypassed", {"live": summary(live),
+                                                                    "bypassed": summary(bypassed)})
                 restarted = await wait_restarted(console, live)
-                assert await wait_running(console) == RUNNING
+                assert await wait_running(console, classifying) == RUNNING
                 line = await assert_restarted_cleanly(console, marks)
-                resolved, released, _ = restart_counts(line)
+                resolved, released, *_ = restart_counts(line)
                 assert resolved == 1 and released == 0, line
         finally:
             console.close()

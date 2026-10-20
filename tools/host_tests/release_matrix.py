@@ -152,12 +152,12 @@ def test_uncovered_explicit_cases_and_gate_overrides(monkeypatch):
 
 def test_make_runs_one_entry_with_only_its_settings(monkeypatch):
     monkeypatch.setattr("os.geteuid", lambda: 0)
-    argv, env = command("release", {"RUN": "terminal-budget", "ASK_FLOWTABLE_CHURN": "1",
-                                    "ASK_FLOWTABLE_TERMINAL": "unload", "ARGS": "-x"}, "/venv/python")
-    assert argv[argv.index("--release-run") + 1] == "terminal-budget"
+    argv, env = command("release", {"RUN": "cdx-unload", "ASK_FLOWTABLE_CHURN": "1",
+                                    "ASK_FLOWTABLE_UNLOAD": "0", "ARGS": "-x"}, "/venv/python")
+    assert argv[argv.index("--release-run") + 1] == "cdx-unload"
     assert [arg for arg in argv if "::" in arg] == [
-        str(release.TOOLS / "tests/flowtable_offload.py::test_terminal")]
-    assert env["ASK_FLOWTABLE_TERMINAL"] == "budget" and "ASK_FLOWTABLE_CHURN" not in env
+        str(release.TOOLS / "tests/flowtable_offload.py::test_cdx_unload")]
+    assert env["ASK_FLOWTABLE_UNLOAD"] == "1" and "ASK_FLOWTABLE_CHURN" not in env
     assert argv[-1] == "-x"
     with pytest.raises(SystemExit, match="drop K"):
         command("release", {"RUN": "suite", "K": "ipsec"})

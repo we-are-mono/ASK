@@ -5,9 +5,10 @@ platform=$1
 read -r uptime rest < /proc/uptime
 started=${uptime%%.*}
 cleared=0
-# A terminal latch resets at once. Any other failure resets only once it
-# persists: one slow probe of a live datapath must not cost a reboot and a
-# recovery attempt. Three misses span about 30 s at the 5 s cadence.
+# A failure resets only once it persists: one slow probe of a live datapath
+# must not cost a reboot and a recovery attempt. Three misses span about 30 s
+# at the 5 s cadence. Nothing ASK reports resets at once: a datapath restart,
+# however long, forwards in software and probes healthy.
 misses=0
 max_misses=3
 
@@ -16,8 +17,6 @@ while :; do
 	ask-flowtable health || status=$?
 	if [ "$status" = 0 ]; then
 		misses=0
-	elif [ "$status" = 2 ]; then
-		break
 	else
 		misses=$((misses + 1))
 		[ "$misses" -lt "$max_misses" ] || break

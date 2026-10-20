@@ -87,7 +87,7 @@ int ft_enumerate(struct ft_policy *p) {
         "-DFT_NFT_TIMEOUT_MS=500", "-DFT_NFT_CLEANUP_MS=500",
         "-DFT_SUPERVISOR_MIN_MS=60", "-DFT_SUPERVISOR_MAX_MS=240",
         "-DFT_SUPERVISOR_STABLE_MS=600", "-DFT_SUPERVISOR_STOP_MS=100",
-        "-DFT_SERVICE_WAIT_MS=1500",
+        "-DFT_SERVICE_WAIT_MS=1500", "-DFT_DRAIN_MS=1500",
         "-DFT_HEALTH_TIMEOUT_MS=500",
         *map(str, sorted(src.glob("*.c"))), "-o", str(binary),
     ], check=True)

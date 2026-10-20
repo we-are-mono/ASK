@@ -61,10 +61,11 @@ echo "${WDT_STATUS:-running}"
         assert result.returncode == 1, result.stderr
         assert calls.count("ask health") == 4 and calls.count("ask recovery-clear") == 1, calls
         assert calls.count("health check failed") == 2 and "unexpected-reboot" not in calls
-        # A terminal latch resets on the probe that reports it.
-        result, terminal = monitor_run(platform, "0 2")
-        assert result.returncode == 1 and terminal.count("ask health") == 2, terminal
-        assert "health check failed" not in terminal
+        # No probe result resets at once: the datapath has no failure only a
+        # reboot clears, so any status but success is a miss like another.
+        result, other = monitor_run(platform, "0 2")
+        assert result.returncode == 1 and other.count("ask health") == 4, other
+        assert other.count("health check failed") == 2, other
         # Misses that a successful probe interrupts are forgiven, and the
         # budget is cleared only on a successful probe.
         result, recovered = monitor_run(platform, "1 1 0 1 1 2")

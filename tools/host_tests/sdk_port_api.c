@@ -166,6 +166,46 @@ int main(void)
             assert(FM_PORT_DeletePCD(&f.port) == E_OK); finish(&f);
         }
     }
+    /* A bypass sends a disabled port's frames to its default queue and
+     * gives the PCD back unchanged: no host command, refused while the port
+     * is enabled, and recoverable from a half done. */
+    for (unsigned oh = 0; oh < 2; oh++) {
+        init(&f, oh, true);
+        assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK); unlocked(&f);
+        volatile uint32_t *nia = oh ? &f.bmi.oh.fmbm_ofne : &f.bmi.rx.fmbm_rfne;
+        union fman_port_bmi_regs bmi = f.bmi;
+        struct fman_port_qmi_regs qmi = f.qmi;
+        uint32_t actions = f.port.requiredAction;
+        assert((*nia & ~BMI_RFNE_FDCS_MASK) != GET_NO_PCD_NIA_BMI_AC_ENQ_FRAME());
+        f.port.enabled = 1;
+        assert(GET_ERROR_TYPE(FM_PORT_BypassPCD(&f.port, true)) == E_INVALID_STATE); unlocked(&f);
+        assert(!memcmp(&bmi, &f.bmi, sizeof(bmi)) && !f.port.pcdBypassed);
+        f.port.enabled = 0;
+        failure = HC_SYNC;
+        for (unsigned twice = 0; twice < 2; twice++) {
+            assert(FM_PORT_BypassPCD(&f.port, true) == E_OK); unlocked(&f);
+            assert((*nia & ~BMI_RFNE_FDCS_MASK) == GET_NO_PCD_NIA_BMI_AC_ENQ_FRAME());
+            assert(f.port.pcdBypassed && f.port.requiredAction == actions && f.port.pcdConfigured);
+        }
+        for (unsigned twice = 0; twice < 2; twice++) {
+            assert(FM_PORT_BypassPCD(&f.port, false) == E_OK); unlocked(&f);
+            assert(!memcmp(&bmi, &f.bmi, sizeof(bmi)) && !memcmp(&qmi, &f.qmi, sizeof(qmi)));
+            assert(!f.port.pcdBypassed && f.port.requiredAction == actions);
+        }
+        /* The second half failing leaves new frames bypassing, and the
+         * call that gives the PCD back still does. */
+        failure = RISC_DETACH;
+        assert(FM_PORT_BypassPCD(&f.port, true) != E_OK); unlocked(&f);
+        assert((*nia & ~BMI_RFNE_FDCS_MASK) == GET_NO_PCD_NIA_BMI_AC_ENQ_FRAME() && f.port.pcdBypassed);
+        failure = NONE;
+        assert(FM_PORT_BypassPCD(&f.port, false) == E_OK); unlocked(&f);
+        assert(!memcmp(&bmi, &f.bmi, sizeof(bmi)) && !f.port.pcdBypassed);
+        failure = PORT_LOCK;
+        assert(GET_ERROR_TYPE(FM_PORT_BypassPCD(&f.port, true)) == E_BUSY);
+        failure = NONE;
+        assert(FM_PORT_DeletePCD(&f.port) == E_OK); finish(&f);
+        assert(GET_ERROR_TYPE(FM_PORT_BypassPCD(&f.port, true)) == E_INVALID_STATE);
+    }
     assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(NULL, NULL)) == E_NOT_SUPPORTED);
     assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree((void *)1, (void *)1)) == E_NOT_SUPPORTED);
     /* Reassembly requests cannot change an unconfigured or live port, even

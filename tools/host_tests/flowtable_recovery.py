@@ -38,23 +38,25 @@ def test_quiet_network_retries_failed_apply(controller):
 
 
 def test_platform_health_and_reboot_budget(controller):
-    """The OS owns resets; ASK spends a persistent attempt once per boot."""
+    """The OS owns resets; ASK spends a persistent attempt once per boot.
+
+    A datapath restart is never a reason for one: while CDX settles an
+    unproven deletion the classifier is bypassed and the ports forward in
+    software, however long that takes and whatever it waits for, so the probe
+    passes. What it says it waits for goes into the record of a failure that
+    does reset, as context."""
     c = controller
     c.run("health")
-    c.backend(fatal=1, fatal_terminal=0)
-    c.run("health")  # an in-place restart does not require a reboot
-    c.backend(fatal_terminal=1)
-    reason = c.root / "cdx/parameters/flowtable_terminal_reason"
+    c.backend(fatal=1, bypassed=1)
+    c.run("health")
+    reason = c.root / "cdx/parameters/flowtable_degraded_reason"
     reason.parent.mkdir()
     reason.write_text("restart budget exhausted\n")
-    # A terminal latch answers 2, which the monitor resets on at once.
-    failed = c.run("health", check=False)
-    assert failed.returncode == 2 and "restart budget exhausted" in failed.stderr
+    healthy = c.run("health", check=False)
+    assert healthy.returncode == 0 and not healthy.stderr, healthy
     (c.root / "backend").unlink()
-    assert c.run("health", check=False).returncode == 2  # CDX still owns the latch
-    reason.write_text("")
     c.run("health")  # deliberately unloaded ASK, ordinary Linux networking
-    (c.root / "backend").write_text("fatal_terminal 0\n")
+    (c.root / "backend").write_text("bypassed 0\n")
     assert c.run("health", check=False).returncode == 1
     (c.root / "backend").unlink()
     os.mkfifo(c.root / "backend")
@@ -62,7 +64,7 @@ def test_platform_health_and_reboot_budget(controller):
     failed = c.run("health", check=False)
     assert failed.returncode == 1 and "deadline" in failed.stderr
     assert time.monotonic() - started < 2
-    reason.write_text("restart budget exhausted\n")
+    recorded = "datapath health check failed or timed out; classifier bypassed: restart budget exhausted"
 
     # Both utilities share one stand-in environment. Script input must contain
     # only the ASK key; the firmware's rollback state must survive every update.
@@ -97,7 +99,7 @@ else:
             c.run("recovery-failed")
         record = json.loads(envfile.read_text())
         assert record["ask_recovery"].split(" ", 2)[0] == str(min(boot, 3))
-        assert record["ask_recovery"].split(" ", 2)[2] == "restart budget exhausted"
+        assert record["ask_recovery"].split(" ", 2)[2] == recorded
         assert {key: record[key] for key in platform} == platform
     def count():
         return json.loads(envfile.read_text())["ask_recovery"].split(" ", 2)
@@ -137,7 +139,7 @@ else:
     c.run("recovery-clean")
     assert count()[0] == "1" and "refunded" in count()[2]
     c.run("recovery-failed")
-    assert count()[0] == "2" and count()[2] == "restart budget exhausted"
+    assert count()[0] == "2" and count()[2] == recorded
     c.run("recovery-clean")
     assert count()[0] == "2"
     # A refund never reaches another boot's attempt.
@@ -452,52 +454,63 @@ def test_inactive_or_fatal_backend_is_not_rearmed(controller, field, value):
             c.wait(c.ready)
 
 
-def test_restarting_datapath_is_waited_for_not_backed_off(controller):
-    """CDX restarts the datapath after a deletion it could not prove, which
-    takes a second or two: the controller leaves its table alone meanwhile,
-    asks again at the shortest interval rather than backing off, says so once,
-    and is ready as soon as the latch clears. A latch that is terminal is a
-    reboot's, as before."""
+def test_restarting_datapath_is_waited_for_and_backed_off(controller):
+    """CDX restarts the datapath after a deletion it could not prove. That is
+    usually over in moments; while it is not, the classifier is bypassed and
+    the ports forward in software, for as long as what the restart waits for
+    takes -- minutes, hours. The controller leaves its table alone meanwhile,
+    says so once an episode, asks again soon and then ever less often, so a
+    long episode costs a check every FT_RETRY_MAX_MS rather than one at the
+    shortest interval, and is ready once the latch clears, however long it
+    held. Nothing about an episode is a reboot's."""
     c = controller
     with c.daemon():
         c.wait(c.ready)
         installs = len(c.calls("-f"))
-        c.backend(fatal=1, fatal_terminal=0)
+        c.backend(fatal=1, bypassed=1)
         c.wait(lambda: not c.ready())
-        time.sleep(0.2)
         checks = len(c.calls("list"))
-        time.sleep(1.2)
-        # Backing off from 50 ms would allow five checks in this window; the
-        # shortest interval allows two dozen, and a loaded host still well
-        # over the bound.
-        assert len(c.calls("list")) - checks >= 10
+        time.sleep(2)
+        # 50, 100, 200 and then 400 ms apart: about seven checks in this
+        # window, where the shortest interval would have made forty.
+        made = len(c.calls("list")) - checks
+        assert 3 <= made <= 20, made
         assert not c.calls("delete") and len(c.calls("-f")) == installs
         assert c.log().count("datapath restarting after an unproven deletion") == 1
         status = c.status()["backend"]
-        assert status["fatal"] == 1 and status["fatal_terminal"] == 0
-        c.backend(fatal=0, restarts=1, resume_failures=1)
+        assert status["fatal"] == 1 and status["bypassed"] == 1, status
+        assert "fatal_terminal" not in status, status
+        c.backend(fatal=0, bypassed=0, restarts=1, resume_failures=1)
         c.wait(c.ready)
         # A port that would not start again is reported, and holds nothing up:
         # the tables are settled, and the netdev is the operator's to restart.
         status = c.status()["backend"]
         assert status["restarts"] == 1 and status["resume_failures"] == 1
+        assert status["bypassed"] == 0
         assert not c.calls("delete") and len(c.calls("-f")) == installs
-        c.backend(fatal=1, fatal_terminal=1)
-        time.sleep(0.4)
-        assert "fresh boot required" in c.log()
+        # The next episode starts from the shortest interval again, and is
+        # said again -- once the daemon has seen this one end, which its
+        # longest interval bounds.
+        time.sleep(0.6)
+        c.backend(fatal=1, bypassed=1)
+        c.wait(lambda: c.log().count("datapath restarting after an unproven deletion") == 2)
+        c.backend(fatal=0, bypassed=0, restarts=2)
+        c.wait(c.ready)
+        assert "fresh boot" not in c.log()
         assert not c.calls("delete") and len(c.calls("-f")) == installs
 
 
 def test_drain_waits_out_a_restart(controller):
     """A stop while CDX restarts the datapath waits for the restart like any
-    other drain rather than failing, as it fails on a terminal latch."""
+    other drain rather than failing, and one that outlasts the drain's
+    deadline says the datapath is restarting -- never that it needs a boot."""
     c = controller
     c.run("apply")
-    c.backend(fatal=1, fatal_terminal=0)
+    c.backend(fatal=1, bypassed=1)
 
     def restarted():
         time.sleep(0.3)
-        c.backend(fatal=0, restarts=1)
+        c.backend(fatal=0, bypassed=0, restarts=1)
 
     worker = threading.Thread(target=restarted)
     started = time.monotonic()
@@ -506,9 +519,10 @@ def test_drain_waits_out_a_restart(controller):
     worker.join()
     assert time.monotonic() - started >= 0.3
     c.run("apply")
-    c.backend(fatal=1, fatal_terminal=1)
+    c.backend(fatal=1, bypassed=1)
     result = c.run("stop", check=False)
-    assert result.returncode != 0 and "fresh boot required" in result.stderr
+    assert result.returncode != 0 and "fresh boot" not in result.stderr, result
+    assert "datapath restarting after an unproven deletion" in result.stderr, result
 
 
 def test_absent_adapter_is_retried_until_it_returns(controller):

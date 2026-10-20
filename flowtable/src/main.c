@@ -32,6 +32,11 @@
 #ifndef FT_DEBOUNCE_MS
 #define FT_DEBOUNCE_MS 500
 #endif
+/* How long a transaction waits for the hardware to drain before it says why
+ * it has not. */
+#ifndef FT_DRAIN_MS
+#define FT_DRAIN_MS 15000
+#endif
 
 /* All accesses are serialized by FT_LOCK, including the daemon's decision
  * and its complete apply transaction. /run survives process restarts, not boot. */
@@ -186,12 +191,10 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			snprintf(ctx->err, sizeof(ctx->err), "an active flowtable provider is required");
 			goto out;
 		}
-		if (st.fatal && st.fatal_terminal) {
-			snprintf(ctx->err, sizeof(ctx->err), "hardware retirement failed; fresh boot required");
-			goto out;
-		}
 		/* Left as it is: whatever the table needs once CDX has restarted
-		 * the datapath, the next check sees it. */
+		 * the datapath, the next check sees it. However long that takes
+		 * the table's flows forward in software, as they do while the
+		 * latch holds whatever the table is. */
 		if (st.fatal) {
 			snprintf(ctx->err, sizeof(ctx->err), "datapath restarting after an unproven deletion");
 			rc = FT_RESTARTING;
@@ -303,7 +306,7 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 	 * a disabled policy drains multicast too. */
 	if (present && owned && ft_nft_delete(ctx, lock))
 		goto out;
-	drain = ft_backend_drain(ctx, 15000, !p->enabled);
+	drain = ft_backend_drain(ctx, FT_DRAIN_MS, !p->enabled);
 	if (drain) {
 		rc = drain;
 		goto out;
@@ -323,7 +326,7 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 	/* --check can invoke backend binding callbacks; only after the drain. */
 	if (ft_nft_run(ctx, script, true, lock))
 		goto out;
-	drain = ft_backend_drain(ctx, 15000, false);
+	drain = ft_backend_drain(ctx, FT_DRAIN_MS, false);
 	if (drain) {
 		rc = drain;
 		goto out;
@@ -359,7 +362,7 @@ rollback:
 		struct ft_ctx tmp;
 		char why[sizeof(ctx->err)];
 		snprintf(why, sizeof(why), "%s", ctx->err);
-		if (ft_nft_delete(&tmp, lock) == 0 && ft_backend_drain(&tmp, 15000, false) == 0) {
+		if (ft_nft_delete(&tmp, lock) == 0 && ft_backend_drain(&tmp, FT_DRAIN_MS, false) == 0) {
 			snprintf(ctx->err, sizeof(ctx->err), "apply failed, flowtable acceleration disabled: %.200s", why);
 		} else {
 			/* Left dirty: say so, mirroring the Python's compound error. */
@@ -434,7 +437,7 @@ int ft_stop(struct ft_ctx *ctx, bool emit)
 		goto out;
 	if (present && owned && ft_nft_delete(ctx, lock))
 		goto out;
-	if (ft_backend_drain(ctx, 15000, true))
+	if (ft_backend_drain(ctx, FT_DRAIN_MS, true))
 		goto out;
 	if (emit && ft_backend_read(ctx, &drained))
 		goto out;
@@ -479,7 +482,7 @@ static int cmd_status(struct ft_ctx *ctx)
 	       "\"reconciliation_paused\": %s, "
 	       "\"admission_ready\": %s, \"backend\": {\"present\": %s, "
 	       "\"bindings\": %ld, \"entries\": %ld, \"handle_refs\": %ld, \"neighbour_refs\": %ld, "
-	       "\"quarantine\": %ld, \"fatal\": %ld, \"fatal_terminal\": %ld, \"restarts\": %ld, "
+	       "\"quarantine\": %ld, \"fatal\": %ld, \"bypassed\": %ld, \"restarts\": %ld, "
 	       "\"resume_failures\": %ld, \"invalidated\": %ld, \"observe\": %ld, "
 	       "\"mcast_enabled\": %ld, \"mcast_installed\": %ld, \"mroute_installed\": %ld}}\n",
 	       owned ? "true" : "false",
@@ -489,7 +492,7 @@ static int cmd_status(struct ft_ctx *ctx)
 	       ready ? "true" : "false",
 	       st.present ? "true" : "false",
 	       st.bindings, st.entries, st.handle_refs, st.neighbour_refs, st.quarantine,
-	       st.fatal, st.fatal_terminal, st.restarts, st.resume_failures,
+	       st.fatal, st.bypassed, st.restarts, st.resume_failures,
 	       st.invalidated, st.observe,
 	       st.mcast_enabled, st.mcast_installed, st.mroute_installed);
 	return 0;
@@ -546,7 +549,7 @@ static int cmd_daemon(const char *conf)
 {
 	struct ft_ctx ctx = {0};
 	int nl;
-	int retry_ms = FT_RETRY_MIN_MS;
+	int retry_ms = FT_RETRY_MIN_MS, restart_ms = FT_RETRY_MIN_MS;
 	int64_t due = 0;
 	bool failed = false, restarting = false;
 
@@ -572,14 +575,19 @@ static int cmd_daemon(const char *conf)
 			int rc = reconcile(&ctx, conf);
 			failed = rc < 0;
 			if (rc == FT_RESTARTING) {
-				/* Over in a second or two, so retried at the
-				 * shortest interval rather than backed off, and
-				 * said once per restart. */
+				/* Usually over in moments, so asked again at the
+				 * shortest interval first; but one can wait --
+				 * forwarding in software -- for as long as its
+				 * cause lasts, so ever less often after, up to the
+				 * longest. Said once per restart. */
 				if (!restarting) {
 					fprintf(stderr, "ask-flowtable: reconciliation deferred: %s\n", ctx.err);
 					ft_log(LOG_NOTICE, "reconciliation deferred: %s", ctx.err);
+					restart_ms = FT_RETRY_MIN_MS;
 				}
-				due = now_ms() + FT_RETRY_MIN_MS;
+				due = now_ms() + restart_ms;
+				if (restart_ms < FT_RETRY_MAX_MS)
+					restart_ms = restart_ms > FT_RETRY_MAX_MS / 2 ? FT_RETRY_MAX_MS : restart_ms * 2;
 			} else if (failed) {
 				fprintf(stderr, "ask-flowtable: reconciliation deferred: %s; retry in %d ms\n",
 					ctx.err, retry_ms);
@@ -662,10 +670,9 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 
 	if (!strcmp(cmd, "health")) {
-		int rc = ft_health(&ctx);
-		if (!rc) return 0;
+		if (!ft_health(&ctx)) return 0;
 		fprintf(stderr, "ask-flowtable: %s\n", ctx.err);
-		return rc == FT_HEALTH_TERMINAL ? 2 : 1;
+		return 1;
 	}
 	if (!strncmp(cmd, "recovery-", 9)) {
 		int rc = ft_recovery(&ctx, cmd + 9);
