@@ -109,10 +109,12 @@ void ft_policy_hash(const struct ft_policy *p, char out[65]);
 
 /* A flowtable's device list as installed, read back from nft. n is -1 when
  * there is none to read: no owned table, or a listing this controller cannot
- * parse. */
+ * parse. counter is whether it declares `counter`: 1 or 0, or -1 when there is
+ * no declaration to read. */
 struct ft_devices {
 	int  n;
 	char name[FT_MAX_DEVICES][FT_IFNAME_MAX + 1];
+	int  counter;
 };
 
 /* The update that turns the installed flowtable's devices into the policy's:
@@ -122,6 +124,11 @@ struct ft_devices {
  * overflow. */
 int ft_render_membership(struct ft_ctx *ctx, const struct ft_policy *p,
 			 const struct ft_devices *installed, char *buf, size_t buflen);
+
+/* The update that makes an installed flowtable count its flows, as one an
+ * older controller rendered does not: it names no device, so every binding,
+ * and every flow offloaded through one, stays as it is. */
+const char *ft_render_counter(void);
 
 /* Interface names this controller writes into nft and reads back from it:
  * letters, digits, '_', '.' and '-', at most FT_IFNAME_MAX. */
@@ -134,7 +141,8 @@ int ft_marker_owned(const char *nft_output, char hash[65]);
 
 /* The owned table's flowtable devices from the same text (pure; host-tested).
  * Returns 0 with d filled, or -1 (d->n = -1) when the listing names no such
- * flowtable or a device this parser cannot read back. */
+ * flowtable or a device this parser cannot read back. d->counter is read
+ * either way, -1 only when there is no declaration. */
 int ft_marker_devices(const char *nft_output, struct ft_devices *d);
 
 #define FT_TABLE     "ask_flowtable"

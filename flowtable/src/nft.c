@@ -35,8 +35,10 @@ int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65]
 	char *argv[] = { "nft", "list", "table", "inet", FT_TABLE, NULL };
 	int rc = ft_nft_exec(argv, NULL, out, sizeof(out), keepfd);
 	*present = false; *owned = false; if (hash) hash[0] = '\0';
-	if (devices)
+	if (devices) {
 		devices->n = -1;
+		devices->counter = -1;
+	}
 	if (rc < 0) goto inspect_error;
 	if (rc != 0) {
 		/* An unsuccessful lookup is not proof of absence: ENOMEM, denied

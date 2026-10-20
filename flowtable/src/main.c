@@ -142,7 +142,7 @@ static int follow_devices(struct ft_ctx *ctx, const struct ft_policy *p,
 	    ft_nft_inspect(ctx, &present, &owned, inhash, &now, lock) ||
 	    ft_backend_read(ctx, &st))
 		return -1;
-	if (!(present && owned && !strcmp(inhash, hash) && same_devices(&now, p) &&
+	if (!(present && owned && !strcmp(inhash, hash) && same_devices(&now, p) && now.counter == 1 &&
 	      st.present && !st.observe &&
 	      st.bindings == p->ndevices && !st.fatal && !st.invalidated && !st.quarantine)) {
 		snprintf(ctx->err, sizeof(ctx->err), "updated devices did not acquire healthy backend bindings");
@@ -151,11 +151,36 @@ static int follow_devices(struct ft_ctx *ctx, const struct ft_policy *p,
 	return 0;
 }
 
+/* Make the installed flowtable count its flows, in an update that names no
+ * device, and verify it as a device update is verified: the same table, now
+ * counting, every binding it had still healthy. *installed is read again. */
+static int count_flows(struct ft_ctx *ctx, struct ft_devices *installed, long bindings,
+		       const char *hash, int lock)
+{
+	struct ft_devices now;
+	struct ft_backend st;
+	bool present, owned;
+	char inhash[65];
+
+	if (ft_nft_run(ctx, ft_render_counter(), false, lock) ||
+	    ft_nft_inspect(ctx, &present, &owned, inhash, &now, lock) ||
+	    ft_backend_read(ctx, &st))
+		return -1;
+	if (!(present && owned && !strcmp(inhash, hash) && now.counter == 1 &&
+	      st.present && !st.observe &&
+	      st.bindings == bindings && !st.fatal && !st.invalidated && !st.quarantine)) {
+		snprintf(ctx->err, sizeof(ctx->err), "the updated flowtable does not count its flows");
+		return -1;
+	}
+	*installed = now;
+	return 0;
+}
+
 /* Whether the daemon is holding a table whose ports fell below two, whether it
- * has an owned table whose devices it cannot read back, and whether another
- * flowtable is bound beside its own: each is logged once per episode rather
- * than on every check. */
-static bool holding, unreadable, beside;
+ * has an owned table whose devices it cannot read back, whether another
+ * flowtable is bound beside its own, and whether it could not make its table
+ * count: each is logged once per episode rather than on every check. */
+static bool holding, unreadable, beside, uncounted;
 
 /* The apply transaction, mirroring the Python Runtime.apply(): drain the old
  * hardware before rebinding, never leave a foreign or half-applied table.
@@ -214,6 +239,31 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			       "judging them by binding count");
 		}
 		unreadable = owned && installed.n < 0;
+		/* A table an older controller rendered declares no `counter`
+		 * (render.c), so conntrack keeps no account of its offloaded
+		 * flows; its policy is the same, so nothing below would ever
+		 * replace it. The flag goes on in place, whatever else the table
+		 * is kept for: the update names no device and binds nothing, so
+		 * neither a flowtable bound beside this one nor too few ports up
+		 * stands in its way. One that fails is replaced below when it
+		 * can be, and otherwise tried again at the next check. */
+		bool counted = true;
+
+		if (!owned || installed.counter)
+			uncounted = false;
+		if (reconcile && owned && !strcmp(inhash, hash) && !st.invalidated && !st.quarantine &&
+		    !installed.counter) {
+			counted = !count_flows(ctx, &installed, st.bindings, hash, lock);
+			if (counted) {
+				fprintf(stderr, "ask-flowtable: the installed flowtable counted nothing; "
+					"counting in place\n");
+				ft_log(LOG_NOTICE, "the installed flowtable counted nothing; counting in place");
+			} else if (!uncounted) {
+				fprintf(stderr, "ask-flowtable: counter update failed: %s\n", ctx->err);
+				ft_log(LOG_WARNING, "counter update failed: %s", ctx->err);
+			}
+			uncounted = !counted;
+		}
 		/* The adapter binds a second flowtable beside this one -- a
 		 * consumer's own, or its offload probe mid-transaction -- and
 		 * that shows only as more bindings than this table has devices.
@@ -243,7 +293,7 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 			 * cannot be read back is judged by its binding count
 			 * alone too: replacing the table on every check would be
 			 * far worse than not following a port. */
-			if (st.bindings == p->ndevices &&
+			if (counted && st.bindings == p->ndevices &&
 			    (!p->devices_auto || installed.n < 0 || same_devices(&installed, p)))
 				return 0;
 			/* The same policy on other ports: follow them in place
@@ -272,13 +322,16 @@ static int apply_table(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 					holding = true;
 					return 0;
 				}
-				if (!follow_devices(ctx, p, &installed, hash, lock)) {
-					rc = 0;
-					goto out;
+				if (counted) {
+					if (!follow_devices(ctx, p, &installed, hash, lock)) {
+						rc = 0;
+						goto out;
+					}
+					fprintf(stderr, "ask-flowtable: device update failed: %s; "
+						"replacing the table\n", ctx->err);
+					ft_log(LOG_WARNING, "device update failed: %s; replacing the table",
+					       ctx->err);
 				}
-				fprintf(stderr, "ask-flowtable: device update failed: %s; replacing the table\n",
-					ctx->err);
-				ft_log(LOG_WARNING, "device update failed: %s; replacing the table", ctx->err);
 			}
 		}
 		if (p->ndevices < 2) {

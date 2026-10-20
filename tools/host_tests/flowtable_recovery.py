@@ -803,3 +803,102 @@ def test_failed_device_update_falls_back_to_replacement(controller, fault):
         assert installs[2]["script"].startswith("table inet ask_flowtable")
         assert len(c.calls("delete")) == 1
         assert "device update failed" in c.log()
+
+
+COUNT = "add flowtable inet ask_flowtable fast { hook ingress priority 0; counter; flags offload; }\n"
+
+
+def uncount(c):
+    """Make the live table one an older controller rendered: no `counter`."""
+    table = c.root / "table"
+    text = table.read_text()
+    assert " counter; flags offload;" in text, text
+    table.write_text(text.replace(" counter; flags offload;", " flags offload;"))
+
+
+def counted(c):
+    """Whether the live table counts; a replacement has none for a moment."""
+    try:
+        return " counter; flags offload;" in (c.root / "table").read_text()
+    except FileNotFoundError:
+        return False
+
+
+@pytest.mark.parametrize("policy", [POLICY, AUTO])
+def test_uncounted_table_is_counted_in_place(controller, policy):
+    """A table rendered without `counter` keeps no conntrack accounting for an
+    offloaded flow, and its policy hash is the same, so nothing else would ever
+    replace it. The check that finds it adds the flag in place: one update that
+    names no device, so nothing is deleted or drained and every binding and
+    flow stays; once counted, nothing more is sent."""
+    c = controller
+    (c.root / "policy").write_text(policy)
+    with c.daemon():
+        c.wait(lambda: following(c, ["eth3", "eth4"]))
+        assert counted(c)
+        original = c.status()["policy_hash"]
+        c.backend(entries=6, handle_refs=6, neighbour_refs=6)
+        before = len(c.calls("-f"))
+        uncount(c)
+        c.wait(lambda: counted(c))
+        assert [call["script"] for call in c.calls("-f")[before:]] == [COUNT]
+        time.sleep(0.5)  # several more checks
+        assert len(c.calls("-f")) == before + 1 and not c.calls("delete")
+        status = c.status()
+        assert status["policy_hash"] == original and status["backend"]["entries"] == 6, status
+        assert following(c, ["eth3", "eth4"]) and c.log().count("counting in place") == 1, c.log()
+
+
+def test_failed_counter_update_falls_back_to_replacement(controller):
+    """A counter update that fails falls back to the full transaction in the
+    same check, which renders the flag with the rest of the table."""
+    c = controller
+    with c.daemon():
+        c.wait(c.ready)
+        before = len(c.calls("-f"))
+        (c.root / "fail-update").touch()
+        uncount(c)
+        c.wait(lambda: counted(c) and c.ready())
+        assert (c.root / "fault-consumed").exists()
+        installs = c.calls("-f")[before:]
+        assert installs[0]["script"] == COUNT, installs
+        assert installs[-1]["script"].startswith("table inet ask_flowtable")
+        assert len(c.calls("delete")) == 1 and "counter update failed" in c.log()
+
+
+def test_uncounted_table_is_counted_beside_another(controller):
+    """A flowtable bound beside this one keeps it from being replaced, not
+    from being counted: the update names no device and binds nothing."""
+    c = controller
+    with c.daemon():
+        c.wait(c.ready)
+        c.backend(bindings=4)
+        c.wait(lambda: "bound beside" in c.log())
+        before = len(c.calls("-f"))
+        uncount(c)
+        c.wait(lambda: counted(c))
+        assert [call["script"] for call in c.calls("-f")[before:]] == [COUNT]
+        assert not c.calls("delete") and c.status()["backend"]["bindings"] == 4
+
+
+def test_held_uncounted_table_is_counted_in_place(controller):
+    """With fewer than two ports up the table is kept as it stands, and still
+    counted in place. An update that fails there has no replacement to fall
+    back on: it is said once and tried again at the next check, the table
+    kept meanwhile."""
+    c = controller
+    (c.root / "policy").write_text(AUTO)
+    with c.daemon():
+        c.wait(lambda: following(c, ["eth3", "eth4"]))
+        c.ports("eth3")
+        c.wait(lambda: "keeping the installed devices" in c.log())
+        before = len(c.calls("-f"))
+        (c.root / "fail-update").touch()
+        uncount(c)
+        c.wait(lambda: counted(c))
+        assert (c.root / "fault-consumed").exists()
+        assert [call["script"] for call in c.calls("-f")[before:]] == [COUNT, COUNT]
+        assert not c.calls("delete")
+        log = c.log()
+        assert log.count("counter update failed") == 1, log
+        assert log.count("keeping the installed devices") == 1, log

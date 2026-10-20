@@ -12,6 +12,7 @@ from _flowtable_service import (ADMISSION_GUARDS, CONF, DAEMON, FAULT_DIR, FIRST
 
 import asyncio
 import json
+import re
 import time
 
 import pytest
@@ -248,6 +249,7 @@ async def test_rendered_admission(service):
     devices = flowtables[0]["dev"]
     assert sorted([devices] if isinstance(devices, str) else devices) == sorted([TARGET_LAN_IF, TARGET_WAN_IF])
     assert "flags offload" in listing, listing
+    assert counting(listing), listing
     chains = [item["chain"] for item in objects if "chain" in item]
     assert [(c["name"], c.get("type"), c.get("hook"), c.get("prio"), c.get("policy")) for c in chains] == [
         ("admit", "filter", "forward", 10, "accept")], chains
@@ -261,6 +263,74 @@ async def test_rendered_admission(service):
     assert len(policy) == 1 and policy[0].endswith(" flow add @fast"), rules
     assert f"ct original proto-src {FIRST}-{FIRST + 2}" in policy[0], policy
     assert f"ct original proto-dst {DPORT}" in policy[0], policy
+
+
+def counting(listing):
+    """Whether the listed flowtable declares `counter`, which nft lists on a
+    line of its own inside the declaration."""
+    declaration = listing.split("flowtable fast {", 1)[1].split("\n\t}", 1)[0]
+    return "\n\t\tcounter\n" in declaration + "\n"
+
+
+async def ct_counts(r, flow):
+    """conntrack's (original, reply) bytes for one peer flow."""
+    listing = await command(r.target, r.session, "conntrack", "-L", "-p", flow["proto"],
+                            "--orig-src", flow["lan"], "--orig-dst", WAN_IP,
+                            "--sport", str(flow["sport"]), "--dport", str(DPORT), "-o", "extended")
+    counts = tuple(int(n) for n in re.findall(r"bytes=(\d+)", listing["stdout"]))
+    assert len(counts) == 2, listing
+    return counts
+
+
+async def settled_counts(r, flow, quiet=4.5):
+    """The counts once nothing is left for a stats pass to add: unchanged for
+    longer than the pass's period, a tenth of the flow's 30 s timeout."""
+    last, since = await ct_counts(r, flow), time.monotonic()
+    deadline = since + 30
+    while time.monotonic() - since < quiet:
+        assert time.monotonic() < deadline, ("conntrack counts did not settle", last)
+        await asyncio.sleep(0.5)
+        now = await ct_counts(r, flow)
+        if now != last:
+            last, since = now, time.monotonic()
+    return last
+
+
+async def test_offloaded_flows_are_accounted(service):
+    """The service's flowtable counts its flows, so conntrack accounts what the
+    hardware forwards -- what per-device usage and nlbwmon read -- and not only
+    the packets before offload: a batch of echoes forwarded in hardware adds
+    exactly its IP bytes to each direction. A table an older controller
+    rendered without `counter` is counted in place by the next check: the
+    flows stay in hardware, nothing is reinstalled, and accounting resumes."""
+    r = service
+    flows = [{**f, "lan": r.lan_ip} for f in FLOWS[:1]]
+    batch = 256 * (256 + 8 + 20)  # payload, UDP and IPv4 headers, each way
+
+    async def accounted(p, label):
+        before = await settled_counts(r, flows[0])
+        state = await hardware(r, p, label, flows)
+        after = await settled_counts(r, flows[0])
+        r.record(f"{label}-accounting", {"before": before, "after": after})
+        assert (after[0] - before[0], after[1] - before[1]) == (batch, batch), (before, after)
+        return state
+
+    async with peer(r, flows, initial_ids=[0]) as p:
+        await warm(r, p, [0], "service-accounting-warm", flows)
+        first = await accounted(p, "service-accounting")
+        # The next check may restore it before this one reads it back.
+        await command(r.target, r.session, "nft", "add flowtable inet ask_flowtable fast "
+                      "{ hook ingress priority 0; flags offload; }")
+        listing = lambda: command(r.target, r.session, "nft", "list", "table", "inet", "ask_flowtable")
+        deadline = time.monotonic() + 15  # a check is due within five seconds
+        while not counting((await listing())["stdout"]):
+            assert time.monotonic() < deadline, "the service did not count its flowtable again"
+            await asyncio.sleep(0.5)
+        restored = await r.state()
+        assert (restored["installs"], restored["deletes"], restored["bindings"]) == (
+            first["installs"], first["deletes"], 2), (first, restored)
+        assert (await service_status(r))["admission_ready"]
+        await accounted(p, "service-accounting-restored")
 
 
 async def test_foreign_table_beside(service):

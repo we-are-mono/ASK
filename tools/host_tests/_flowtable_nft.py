@@ -49,29 +49,35 @@ def consume(fault):
     return True
 
 
-UPDATE = re.compile(r"(add|delete) flowtable inet ask_flowtable fast "
-                    r"\{ hook ingress priority 0; devices = \{ ([^}]*) \};( flags offload;)? \}")
+UPDATE = re.compile(r"(add|delete) flowtable inet ask_flowtable fast \{ hook ingress priority 0;"
+                    r"(?: devices = \{ ([^}]*) \};)?( counter;)?( flags offload;)? \}")
+FLAGS = re.compile(r"(flowtable fast \{.*?\}; )(?:counter; )?(flags offload; \})")
 
 
 def update(check):
-    """A device membership update of the live flowtable. Every statement
-    applies or none does, as in netfilter's batch: an added device must be
-    absent and carry the live flowtable's flags, a deleted one present."""
+    """An update of the live flowtable. Every statement applies or none does,
+    as in netfilter's batch: an added device must be absent, a deleted one
+    present. An add's flags replace the live flowtable's -- `counter` set or
+    cleared -- except that netfilter refuses one that drops offload; a delete
+    changes no flag."""
     if not table.exists():
         sys.exit("Error: No such file or directory")
     text = table.read_text()
     listed = re.search(r"devices = \{([^}]*)\}", text)
     devices = re.findall(r'"([^"]+)"', listed[1])
+    counted = "; counter; flags offload;" in text
     for line in script.splitlines():
         statement = UPDATE.fullmatch(line)
         if not statement:
             sys.exit(f"unexpected update statement: {line!r}")
-        verb, names, flags = statement[1], re.findall(r'"([^"]+)"', statement[2]), statement[3]
+        verb, names = statement[1], re.findall(r'"([^"]+)"', statement[2] or "")
+        counter, offload = bool(statement[3]), bool(statement[4])
         if verb == "add":
-            if not flags:
+            if not offload:
                 sys.exit("Error: Operation not supported")
             devices += [name for name in names if name not in devices]
-        elif flags or any(name not in devices for name in names):
+            counted = counter
+        elif counter or offload or not names or any(name not in devices for name in names):
             sys.exit("Error: No such file or directory")
         else:
             devices = [name for name in devices if name not in names]
@@ -79,10 +85,14 @@ def update(check):
         return
     if consume("fail-update"):
         sys.exit("injected device update failure")
-    table.write_text(text[:listed.start(1)] + " " + ", ".join(f'"{d}"' for d in devices) + " "
-                     + text[listed.end(1):])
-    # An update that commits while one device fails to bind as a rule binding.
-    backend(bindings=len(devices) - consume("short-bind"))
+    changed = devices != re.findall(r'"([^"]+)"', listed[1])
+    text = (text[:listed.start(1)] + " " + ", ".join(f'"{d}"' for d in devices) + " "
+            + text[listed.end(1):])
+    table.write_text(FLAGS.sub(r"\1counter; \2" if counted else r"\1\2", text, count=1))
+    # Only a change of devices binds or unbinds; one that commits while a
+    # device fails to bind does so as a rule binding.
+    if changed:
+        backend(bindings=len(devices) - consume("short-bind"))
 
 
 table = root / "table"

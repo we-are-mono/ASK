@@ -87,6 +87,21 @@ drain/install/verify transaction even if the desired policy hash is unchanged.
 A change in the ports `devices auto` finds up is made to the live table
 instead; see [device membership](#device-membership).
 
+The flowtable is declared with `counter`. Without it Netfilter discards the
+statistics the hardware reports for an offloaded flow, and its own fast path
+counts nothing either, so conntrack accounting -- what per-device usage and
+nlbwmon read -- stops when a flow is offloaded. A table an older controller
+rendered without the flag carries the same policy hash, so the check that
+finds it adds the flag in place: one `add flowtable` that names no device, so
+every binding and offloaded flow stays, verified like a device update. It
+binds nothing, so neither a flowtable bound beside this one nor fewer than two
+ports up keeps it from running. Every `add flowtable` restates `counter` with
+`flags offload`, because an update's flags replace the live flowtable's;
+Netfilter refuses only one that changes offload. If the update fails, the same
+check replaces the table where it would replace any other; where the table is
+kept as it stands instead, the update is tried again at the next check, and
+the failure is logged once.
+
 | Command | Authority and effect |
 | --- | --- |
 | `daemon` | Maintain its configured policy in the foreground unless reconciliation is paused. A lifetime lock permits only one controller. |

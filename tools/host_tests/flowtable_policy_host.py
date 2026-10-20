@@ -172,10 +172,16 @@ def test_render_addresses_ports_and_scope(engine):
     assert "ct original ip saddr 192.0.2.0/24 ct original ip daddr 198.51.100.2/32 flow add @fast" in rules
 
 
-def test_render_is_offload_only_and_clean(engine):
+def test_render_flowtable_counts_and_chains_are_clean(engine):
+    """The flowtable counts its flows: without `counter` netfilter drops the
+    hardware's statistics deltas and its own fast path's alike, and a flow's
+    conntrack accounting -- what per-device usage and nlbwmon read -- stops
+    when the flow is offloaded. The chains carry no counter of their own."""
     rules = render(engine, BASE)
-    assert "flags offload" in rules
-    assert "counter" not in rules and "flush" not in rules
+    declared = flowtable_line(rules)
+    assert declared.endswith("counter; flags offload; }"), declared
+    chains = rules.replace(declared, "")
+    assert "counter" not in chains and "flush" not in chains
     assert "ct status snat" not in rules and "ct status dnat" not in rules
 
 
@@ -293,11 +299,11 @@ def membership(engine, installed, resolved):
 
 @pytest.mark.parametrize("installed,resolved,update", [
     ("eth3,eth4", "eth3,eth4,eth5",
-     ['add flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth5" }; flags offload; }']),
+     ['add flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth5" }; counter; flags offload; }']),
     ("eth3,eth4,eth5", "eth3,eth4",
      ['delete flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth5" }; }']),
     ("eth3,eth4", "eth3,eth5,eth6",
-     ['add flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth5", "eth6" }; flags offload; }',
+     ['add flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth5", "eth6" }; counter; flags offload; }',
       'delete flowtable inet ask_flowtable fast { ' + HOOK + ' devices = { "eth4" }; }']),
     ("eth4,eth3", "eth3,eth4", []),
 ])
@@ -305,10 +311,21 @@ def test_membership_update_names_only_the_changed_devices(engine, installed, res
     """The add and delete are one script, so one nft transaction, and each
     names only the devices that change. Netfilter refuses an update on another
     hook or priority, or whose flags differ in offload from the live
-    flowtable's, so both restate what the table declares."""
+    flowtable's, and an add's flags replace the live flowtable's -- one without
+    `counter` would stop it counting -- so the add restates what the table
+    declares."""
     assert membership(engine, installed, resolved) == update
     declared = flowtable_line(render(engine, AUTO))
-    assert f"{{ {HOOK} devices" in declared and declared.endswith("flags offload; }")
+    assert f"{{ {HOOK} devices" in declared and declared.endswith("counter; flags offload; }")
+
+
+def test_counter_update_changes_only_the_flags(engine):
+    """A table rendered without `counter` gets it in place: an add that names
+    no device, so it leaves every binding and every offloaded flow alone, and
+    restates the hook and offload the live flowtable has."""
+    r = run(engine, BASE, "count")
+    assert r.returncode == 0 and r.stdout.splitlines() == [
+        'add flowtable inet ask_flowtable fast { ' + HOOK + ' counter; flags offload; }'], r.stdout
 
 
 LISTED = """table inet ask_flowtable {{
@@ -342,6 +359,47 @@ def test_listed_devices_are_read_back(engine, devices, read):
 def test_rendered_devices_are_read_back(engine):
     r = run(engine, render(engine, AUTO), "devices")
     assert r.stdout.strip() == "DEVICES eth3 eth4", r.stdout
+
+
+# nft 1.1.1 lists the flag after `flags offload`, on a line of its own.
+COUNTED = LISTED.format(hex="0" * 64, devices="\t\tdevices = { eth3, eth4 }\n").replace(
+    "\t\tflags offload\n", "\t\tflags offload\n\t\tcounter\n")
+
+
+@pytest.mark.parametrize("text,read", [
+    (COUNTED, "COUNTER 1"),
+    (COUNTED.replace("\t\tcounter\n", ""), "COUNTER 0"),
+    # nft 1.1.6 quotes each device; a flowtable left with none lists no
+    # devices line.
+    (COUNTED.replace("eth3, eth4", '"eth3", "eth4"'), "COUNTER 1"),
+    (COUNTED.replace("\t\tdevices = { eth3, eth4 }\n", ""), "COUNTER 1"),
+    # A device named like the flag, or a longer word, is not the flag.
+    (LISTED.format(hex="0" * 64, devices="\t\tdevices = { counter, eth4 }\n"), "COUNTER 0"),
+    (LISTED.format(hex="0" * 64, devices="\t\tdevices = { counters, eth4 }\n"), "COUNTER 0"),
+    # Nor is a chain's counter.
+    (COUNTED.replace("\t\tcounter\n", "").replace("policy accept;\n", "policy accept;\n\t\tcounter\n"),
+     "COUNTER 0"),
+    (COUNTED.replace("flowtable fast", "flowtable other"), "COUNTER -1"),
+])
+def test_listed_counter_is_read_back(engine, text, read):
+    """Whether the live flowtable counts, as nft lists it: the daemon updates
+    one that does not in place."""
+    r = run(engine, text, "counter")
+    assert r.returncode == 0 and r.stdout.strip() == read, r.stdout + r.stderr
+
+
+def test_counter_leaves_the_devices_readable(engine):
+    r = run(engine, COUNTED, "devices")
+    assert r.stdout.strip() == "DEVICES eth3 eth4", r.stdout
+
+
+def test_rendered_counter_is_read_back(engine):
+    """The daemon's own render reads back as counted, and an older render --
+    the same table without the flag -- as not."""
+    rendered = render(engine, AUTO)
+    assert run(engine, rendered, "counter").stdout.strip() == "COUNTER 1"
+    old = rendered.replace(" counter;", "")
+    assert old != rendered and run(engine, old, "counter").stdout.strip() == "COUNTER 0"
 
 
 def test_devices_outside_the_flowtable_are_not_read(engine):

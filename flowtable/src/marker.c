@@ -64,6 +64,31 @@ bool ft_devices_has(const struct ft_devices *d, const char *name)
 	return false;
 }
 
+/* Whether the declaration from p, just inside its opening brace, declares
+ * `counter`: a word of its own, outside the device list's braces, in the
+ * render (`...}; counter; flags offload; }`) and in nft's listing alike, where
+ * it is a line of its own. -1 when the declaration does not close. */
+static int declared_counter(const char *p)
+{
+	static const char word[] = "counter";
+	const size_t len = sizeof(word) - 1;
+	int depth = 1;
+
+	for (; *p; p++) {
+		if (*p == '{') {
+			depth++;
+		} else if (*p == '}') {
+			if (!--depth)
+				return 0;
+		} else if (depth == 1 && !strncmp(p, word, len) &&
+			   (isspace((unsigned char)p[-1]) || p[-1] == ';' || p[-1] == '{') &&
+			   (isspace((unsigned char)p[len]) || p[len] == ';' || p[len] == '}')) {
+			return 1;
+		}
+	}
+	return -1;
+}
+
 /* The flowtable is declared ahead of the chains, as the marker is, in both
  * this controller's render and nft's listing of it. nft 1.1.1 lists the
  * devices bare (`devices = { eth3, eth4 }`), 1.1.6 quotes each one, and a
@@ -78,10 +103,12 @@ int ft_marker_devices(const char *out, struct ft_devices *d)
 	const char *p, *end, *devices;
 
 	d->n = -1;
+	d->counter = -1;
 	if (!ft || (hdr_end && ft >= hdr_end))
 		return -1;
 	d->n = 0;
 	p = ft + sizeof(decl) - 1;
+	d->counter = declared_counter(p);
 	/* The first closing brace ends either the device list or, when there
 	 * is none, the declaration itself. */
 	end = strchr(p, '}');

@@ -152,6 +152,23 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A406 — `nf_ct_acct_add()` truncates a hardware stats delta to 32 bits.** It takes `unsigned int` packets
+  and bytes (`include/net/netfilter/nf_conntrack_acct.h`) while `flow_offload_work_stats()` passes the u64 deltas a
+  pull returns; a pull comes every ~3-4 s (a tenth of the 30 s timeout), so one flow above ~8.6 Gbit/s wraps between
+  pulls and conntrack loses 4 GiB at a time. Upstream has the same signature. Fix direction: widen both to u64.
+
+- [ ] **A405 — a hardware flow's counts since its last stats pull are lost at teardown.** `flow_offload_work_del()`
+  (`net/netfilter/nf_flow_table_offload.c`) sends FLOW_CLS_DESTROY without stats, and `nf_flow_offload_tuple()`
+  copies a driver's stats back only for FLOW_CLS_STATS; cdx's DESTROY (`ft_unlink()`, ask_flowtable_core.c) frees the
+  entry, and its `reported` baseline, unread. Each flow loses up to a pull period (~3 s), and one that ends before its
+  first pull loses every hardware byte; retirements cdx starts itself (invalidation, unbind, SA, Wi-Fi) read nothing
+  either. Rig: a UDP stream torn down by deleting the table lost 1,940 of 18,571 packets, exactly. Fix direction:
+  DESTROY returns the final delta, which patch 140 folds under NF_FLOWTABLE_COUNTER; cdx reads the entry's counters
+  at unlink and holds the delta of its own retirements for Linux's DESTROY to collect.
+
+- [x] **A404 — ask-flowtable rendered its flowtable without `counter`; conntrack accounting stopped at offload.**
+  Rendered now, and added in place to an older table (_:/^flowtable: count the flowtable's flows_).
+
 - [x] **A403 — some datapath-restart failures still ended in "reboot required".** A restart now bypasses the classifier,
   the ports forwarding in software until it settles, and retries; nothing is terminal (_:/^sdk_fman, cdx: forward in software while a restart settles_).
 

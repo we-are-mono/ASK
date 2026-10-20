@@ -8,7 +8,9 @@
  *                                          -> the nft text, or "REJECT: <msg>"
  *   flowtable_policy membership --installed A,B,... [--resolve A,B,...]
  *                                          -> the device update script
- *   flowtable_policy marker | devices      -> reads `nft list table` text
+ *   flowtable_policy count                 -> the update that adds `counter`
+ *   flowtable_policy marker | devices | counter
+ *                                          -> reads `nft list table` text
  *
  * "devices auto" is resolved to --resolve, or to a fixed pair, since the host
  * has no CDX ports; explicit device lists render as written.
@@ -73,6 +75,17 @@ int main(int argc, char **argv)
 		for (i = 0; i < d.n; i++)
 			printf(" %s", d.name[i]);
 		printf("\n");
+		return 0;
+	}
+	if (!strcmp(mode, "counter")) {
+		struct ft_devices d;
+
+		ft_marker_devices(text, &d);
+		printf("COUNTER %d\n", d.counter);
+		return 0;
+	}
+	if (!strcmp(mode, "count")) {
+		fputs(ft_render_counter(), stdout);
 		return 0;
 	}
 

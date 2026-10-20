@@ -80,12 +80,15 @@ static void emit_match(struct out *o, const struct ft_match *m, const char *acti
 		emit(o, "  %s\n", action);
 }
 
-/* The flowtable's hook and flags, shared by the table and by a membership
- * update of it. Netfilter refuses an update naming another hook or priority,
- * and one whose flags differ in offload from the live flowtable's; nft always
- * sends the update's flags, so they have to be restated. */
+/* The flowtable's hook and flags, shared by the table and by every update of
+ * it. Netfilter refuses an update naming another hook or priority, and one
+ * whose flags differ in offload from the live flowtable's; nft always sends
+ * the update's flags, which replace the live ones, so they have to be
+ * restated. Without `counter` netfilter discards the hardware's statistics
+ * deltas, and its own fast path counts nothing either: conntrack accounting,
+ * which per-device usage and nlbwmon read, stops when a flow is offloaded. */
 #define FT_HOOK  "hook ingress priority 0;"
-#define FT_FLAGS "flags offload;"
+#define FT_FLAGS "counter; flags offload;"
 
 int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 	      uint32_t admitted_mark_mask, char *buf, size_t buflen)
@@ -176,6 +179,11 @@ int ft_render_membership(struct ft_ctx *ctx, const struct ft_policy *p,
 		return -1;
 	}
 	return (int)o.off;
+}
+
+const char *ft_render_counter(void)
+{
+	return "add flowtable inet " FT_TABLE " " FT_FLOWTABLE " { " FT_HOOK " " FT_FLAGS " }\n";
 }
 
 long ft_render_bound(struct ft_ctx *ctx, const struct ft_policy *p)
