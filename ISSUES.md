@@ -167,7 +167,8 @@ result independently of those temporary files.
   -- is a candidate ahead of every software one, and an eviction tears its flow down and opens a new conntrack. Fix
   direction: assure the conntrack where the flowtable carries the flow, as `nf_conntrack_udp_packet()` would have: a
   carried packet of a replied connection past its `stream_ts` (patch 175's `nf_flow_ct_seen_reply()` sites, plus the
-  original direction); then test eviction with a full table on the rig.
+  original direction); then test eviction with a full table on the rig. Low priority: it needs the table exhausted
+  (262,144 entries on the DK; a busy home holds a few thousand), when new connections are already being dropped.
 
 - [x] **A408 — a UDP conntrack whose replies only crossed outside it expired at a live teardown.** Carried replies now
   mark it replied, and a live teardown keeps the full timeout (_:/^netfilter: hand back a carried UDP flow's conntrack_).
