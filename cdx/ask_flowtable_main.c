@@ -481,8 +481,9 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_complete(), cdx_ft_failed(),
 		   /* Retirements whose barrier failed, or that wait on CDX's own
-		    * proof; one merely owed its batch's barrier is counted apart,
-		    * and for no longer than until ft_settle_work runs. */
+		    * proof; one merely owed a barrier is counted apart, and for no
+		    * longer than until its retirement's last batch, the
+		    * FT_SETTLE_BOUND-th unlink owed or ft_settle_work. */
 		   cdx_ft_pending() - cdx_ft_owed(), cdx_ft_owed(),
 		   ft_can_rearm(), ft_rearms, ft_neighbour_refs, ft_handle_refs,
 		   atomic64_read(&ft_neigh_invalidations),

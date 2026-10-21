@@ -667,9 +667,11 @@ static void ft_stats_binding(const struct cdx_ft_entry *entry,
  * the firmware has left it still owed: ft_settle() asks for that, once for
  * every entry unlinked since. A barrier is a host-command round trip, two
  * thirds of what a delete costs, so a walk that retires many entries settles
- * them behind one. Whatever owes a barrier settles it before the transaction
- * ends or queues ft_settle_work to, so nothing outside the transaction finds
- * an unlink unproven unless its barrier failed.
+ * them behind one. Whatever owes a barrier settles it before it is done --
+ * before the transaction ends, or, for a retirement in batches, by its last
+ * batch -- or queues ft_settle_work to, so nothing finds an unlink unproven
+ * for long unless its barrier failed, and anything that needs the proof
+ * sooner asks for it.
  *
  * What the entry has counted since its last report is read as it goes and
  * reported through the flow's handle, which holds the conntrack: so it gets
@@ -694,6 +696,7 @@ int ft_unlink(struct cdx_ft_entry *entry)
 		ft_finals++;
 	}
 	list_del(&entry->list);
+	list_del(&entry->binding_node);
 	hash_del(&entry->cookie_node);
 	hash_del(&entry->key_node);
 	ft_neigh_detach(entry);
@@ -737,12 +740,14 @@ int ft_remove(struct cdx_ft_entry *entry)
 	return rc ?: settled;
 }
 
-/* Unlink at most FT_RETIRE_BATCH of the entries @match selects and settle them
- * behind one barrier. True when it stopped at that bound with more selected:
- * the caller lets the transaction go before asking again, so retiring a full
- * table never holds it for more than one batch, and readers, admission and
- * Linux's own callbacks interleave with the retirement instead of queueing
- * behind all of it (A327). */
+/* Unlink at most FT_RETIRE_BATCH of the entries @match selects. True when it
+ * stopped at that bound with more selected: the caller lets the transaction go
+ * before asking again, so retiring a full table never holds it for more than
+ * one batch, and readers, admission and Linux's own callbacks interleave with
+ * the retirement instead of queueing behind all of it (A327). The batch that
+ * finds nothing more to retire settles what is owed, and so does one that
+ * leaves FT_SETTLE_BOUND unlinks owed; in between, the next holder that needs
+ * the proof -- an admission, a recovery -- asks for it itself. */
 bool ft_retire_batch(bool (*match)(const struct cdx_ft_entry *entry, const void *arg),
 		     const void *arg)
 {
@@ -761,7 +766,8 @@ bool ft_retire_batch(bool (*match)(const struct cdx_ft_entry *entry, const void 
 		ft_unlink(entry);
 		n++;
 	}
-	ft_settle();
+	if (!more || cdx_ft_owed() >= FT_SETTLE_BOUND)
+		ft_settle();
 	return more;
 }
 
@@ -788,7 +794,10 @@ static void ft_retire_workfn(struct work_struct *work)
 		atomic_set(&ft_retire_scan, 1);
 		more = true;
 	}
-	ft_settle();
+	/* The run that leaves nothing for the next settles; the others leave
+	 * at most FT_SETTLE_BOUND owed to it. */
+	if (!more || cdx_ft_owed() >= FT_SETTLE_BOUND || READ_ONCE(ft_stopping))
+		ft_settle();
 	cdx_ft_end();
 	/* Behind whatever queued for the transaction meanwhile. */
 	if (more && !READ_ONCE(ft_stopping))
@@ -2366,6 +2375,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		return ask_refuse(rc);
 	}
 	list_add_tail(&entry->list, &ft_entries);
+	list_add_tail(&entry->binding_node, &binding->entries);
 	hash_add(ft_cookies, &entry->cookie_node,
 		 entry->cookie ^ (unsigned long)entry->binding);
 	hash_add(ft_keys, &entry->key_node, ft_key_hash(&entry->rule));
@@ -2731,14 +2741,16 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	case FLOW_CLS_DESTROY:
 		/* Linux deletes one flow per callback, and one route change can
 		 * delete the whole table: the deletions queued behind each other
-		 * share a barrier, at most FT_RETIRE_BATCH unlinks to one, and
+		 * share a barrier, at most FT_SETTLE_BOUND unlinks to one, and
 		 * the last of a burst leaves it to ft_settle_work -- unless an
 		 * unload, which set ft_stopping under this transaction, may
-		 * already have cancelled that work for good. The unlink reports
-		 * what the direction counted since its last report; a generation
-		 * this adapter retired first reported its own as it went. */
+		 * already have cancelled that work for good. A deletion that
+		 * settles holds the transaction for the round trip, and the
+		 * others of the burst find it held. The unlink reports what the
+		 * direction counted since its last report; a generation this
+		 * adapter retired first reported its own as it went. */
 		rc = entry ? ft_unlink(entry) : 0;
-		if (cdx_ft_owed() >= FT_RETIRE_BATCH || ft_stopping)
+		if (cdx_ft_owed() >= FT_SETTLE_BOUND || ft_stopping)
 			ft_settle();
 		else if (cdx_ft_owed())
 			schedule_work(&ft_settle_work);
@@ -2841,9 +2853,20 @@ static void ft_rearm_workfn(struct work_struct *work)
 	cdx_ft_end();
 }
 
-static bool ft_bound_to(const struct cdx_ft_entry *entry, const void *binding)
+/* At most FT_RETIRE_BATCH of the binding's entries, taken from its own list
+ * rather than found by walking everyone's, and settled as ft_retire_batch()
+ * settles. True while it has more. */
+static bool ft_retire_bound(struct cdx_ft_binding *binding)
 {
-	return entry->binding == binding;
+	unsigned int n;
+
+	cdx_ft_assert_held();
+	for (n = 0; n < FT_RETIRE_BATCH && !list_empty(&binding->entries); n++)
+		ft_unlink(list_first_entry(&binding->entries, struct cdx_ft_entry,
+					   binding_node));
+	if (list_empty(&binding->entries) || cdx_ft_owed() >= FT_SETTLE_BOUND)
+		ft_settle();
+	return !list_empty(&binding->entries);
 }
 
 void ft_release(void *priv)
@@ -2866,7 +2889,7 @@ void ft_release(void *priv)
 	 * anything else retiring some of them meanwhile is no matter. Each
 	 * reports what it counted as it goes: for a deleted table that is
 	 * every direction still in the hardware, as nothing deleted them first. */
-	while (ft_retire_batch(ft_bound_to, binding)) {
+	while (ft_retire_bound(binding)) {
 		cdx_ft_end();
 		cond_resched();
 		cdx_ft_begin();
@@ -3075,6 +3098,7 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		}
 		binding->dev = dev;
 		binding->table = flowtable;
+		INIT_LIST_HEAD(&binding->entries);
 		cb = indirect ?
 			flow_indr_block_cb_alloc(ft_rule_callback, dev, binding,
 				ft_release, bo, dev, sch, flowtable, NULL, cleanup) :

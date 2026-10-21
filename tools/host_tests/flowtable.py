@@ -32,8 +32,10 @@ def test_decoder_and_lifecycle(tmp_path):
         # The framing a VLAN device's record is published with, as the
         # adapter defines it: the cases below assert the published values.
         + "\n".join(re.findall(r"^#define FT_(?:VLAN|PPP)_[RT]X_OVERHEAD\s.*$", source, re.M)) + "\n"
-        # The retirement bound, as defined: the cases below count batches by it.
+        # The retirement bounds, as defined: the cases below count batches
+        # and barriers by them.
         + re.search(r"^#define FT_RETIRE_BATCH\s.*$", source, re.M).group() + "\n"
+        + re.search(r"^#define FT_SETTLE_BOUND\s.*$", source, re.M).group() + "\n"
         # What the bridge-port walk keeps between its callbacks.
         + re.search(r"^struct ft_bridge_port_walk \{.*?^\};\n", source, re.M | re.S).group()
     )
@@ -54,7 +56,7 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_vlan_lower", "ft_bridge_vlan", "ft_bridge_port_one", "ft_bridge_port", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_port_arriving", "ft_mtu_less", "ft_port_mtu", "ft_rule_stripped", "ft_arriving", "ft_mtu_carried", "ft_detours", "ft_ipv6_dev_mtu", "ft_egress_mtu_current", "ft_mtu_refused", "ft_bridge_egress_filtered", "ft_tunnel_inbound_allowed", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_owned", "ft_software_reoffers", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
              "ft_invalid_complete", "ft_drained", "ft_can_rearm", "ft_rearm", "ft_rearm_workfn",
-             "ft_bound_to", "ft_release",
+             "ft_retire_bound", "ft_release",
              "ft_bind_admissible", "ft_passive_callback", "ft_bind_passive",
              "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
              "ft_any_entry", "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire",

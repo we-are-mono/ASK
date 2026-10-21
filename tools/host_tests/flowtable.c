@@ -167,7 +167,9 @@ static __be32 inet_make_mask(unsigned plen) { assert(plen <= 32); return htonl(p
 #define cmpxchg(p, old, new) ({ typeof(*(p)) v = *(p); if (v == (old)) *(p) = (new); v; })
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
+#define LIST_HEAD_INIT(n) { &(n), &(n) }
 #define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define list_first_entry(h, t, m) list_entry((h)->next, t, m)
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define list_for_each_entry(p, h, m) \
     for (p = list_entry((h)->next, typeof(*p), m); &p->m != (h); p = list_entry(p->m.next, typeof(*p), m))
@@ -1857,7 +1859,7 @@ static struct net_device br_qinq = { .ifindex = 15, .mtu = 1500, .type = ARPHRD_
  * lower device, and the reduced MTU pppd negotiates for a session. */
 static struct net_device ppp = { .ifindex = 16, .mtu = 1492, .type = ARPHRD_PPP };
 static struct net_device in_ppp = { .ifindex = 17, .mtu = 1492, .type = ARPHRD_PPP };
-static struct cdx_ft_binding binding = { .dev = &in };
+static struct cdx_ft_binding binding = { .dev = &in, .entries = LIST_HEAD_INIT(binding.entries) };
 static struct dst_ops ipv4_ops = { .family = AF_INET };
 static struct dst_ops ipv6_ops6 = { .family = AF_INET6 };
 static struct rtable route, reverse_route;
@@ -5991,23 +5993,30 @@ static void test_connections(void)
     neighbour.dead = true;
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
     assert(!ft_invalid && handle.invalid && ft_count == ARRAY_SIZE(entries));
-    /* A batch a run: each unlinks at most FT_RETIRE_BATCH of them, settles
-     * those behind one barrier before it lets the transaction go, and queues
+    /* A batch a run: each unlinks at most FT_RETIRE_BATCH of them and queues
      * the next run behind whatever waited for the transaction meanwhile -- so
-     * a full table takes as many runs as it has batches, not one walk. */
+     * a full table takes as many runs as it has batches, not one walk. A
+     * barrier is asked for each time FT_SETTLE_BOUND unlinks are owed, and
+     * by the run that leaves nothing to the next: a full table takes one
+     * per thousand unlinks, not one per batch. */
     {
-        unsigned runs = 0, queued = neigh_scheduled;
+        unsigned runs = 0, queued = neigh_scheduled, total = ft_count, settled = settles;
 
+        assert(total > FT_SETTLE_BOUND);
         work_queued_retire = true;
         while (work_queued_retire) {
-            unsigned before = settles, left = ft_count;
+            unsigned left = ft_count, done;
 
             work_queued_retire = false;
             ft_retire_workfn(NULL);
             runs++;
-            assert(!cdx_info->ctrl.mutex && !owed && settles == before + 1);
+            done = total - ft_count;
+            assert(!cdx_info->ctrl.mutex);
             assert(ft_count == left - (left < FT_RETIRE_BATCH ? left : FT_RETIRE_BATCH));
             assert(work_queued_retire == !!ft_count);
+            assert(ft_count ? owed == done % FT_SETTLE_BOUND &&
+                              settles == settled + done / FT_SETTLE_BOUND
+                            : !owed && settles == settled + (total - 1) / FT_SETTLE_BOUND + 1);
         }
         assert(runs == (ARRAY_SIZE(entries) + FT_RETIRE_BATCH - 1) / FT_RETIRE_BATCH);
         assert(neigh_scheduled == queued + runs - 1);
@@ -6028,33 +6037,33 @@ static void test_batched_retirement(void)
     unsigned before, scheduled;
 
     /* A deletion owes its barrier to the work the last of Linux's burst
-     * leaves it to, every deletion queued behind it up to a batch shares the
-     * one barrier, and the deletion that fills the batch settles it there
-     * and then. A queued settle that then finds nothing owed asks for
-     * nothing. */
+     * leaves it to, every deletion queued behind it up to FT_SETTLE_BOUND
+     * shares the one barrier, and the deletion that reaches the bound
+     * settles it there and then. A queued settle that then finds nothing
+     * owed asks for nothing. */
     fixture();
-    for (unsigned i = 0; i <= FT_RETIRE_BATCH; i++) {
+    for (unsigned i = 0; i <= FT_SETTLE_BOUND; i++) {
         connection_rule(i);
         assert(ft_replace(&binding, &cls) == 0);
     }
     before = settles; scheduled = settle_scheduled;
     cls.command = FLOW_CLS_DESTROY;
-    for (unsigned i = 0; i < FT_RETIRE_BATCH; i++) {
+    for (unsigned i = 0; i < FT_SETTLE_BOUND; i++) {
         connection_rule(i);
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-        assert(!ft_find(&binding, cls.cookie) && ft_count == FT_RETIRE_BATCH - i);
-        if (i + 1 == FT_RETIRE_BATCH)
+        assert(!ft_find(&binding, cls.cookie) && ft_count == FT_SETTLE_BOUND - i);
+        if (i + 1 == FT_SETTLE_BOUND)
             break;
         assert(owed == i + 1 && cdx_ft_pending() == i + 1 && settles == before);
         assert(work_queued_settle && settle_scheduled == scheduled + i + 1);
     }
     assert(!owed && !cdx_ft_pending() && settles == before + 1);
-    assert(settle_scheduled == scheduled + FT_RETIRE_BATCH - 1);
+    assert(settle_scheduled == scheduled + FT_SETTLE_BOUND - 1);
     flush_work(&ft_settle_work);
     assert(!work_queued_settle && settles == before + 1);
     /* The last of a burst is the work's to settle, or the next admission's,
      * which proves the retirement before it admits anything. */
-    connection_rule(FT_RETIRE_BATCH);
+    connection_rule(FT_SETTLE_BOUND);
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
     assert(!ft_count && !live_hw && owed == 1 && work_queued_settle);
     flush_work(&ft_settle_work);
@@ -6099,13 +6108,15 @@ static void test_batched_retirement(void)
     ft_invalid = 0; ft_invalid_done = false;
 
     /* A binding going retires only its own entries, a batch at a time,
-     * letting the transaction go between batches and settling each batch
-     * before it does. */
+     * letting the transaction go between batches, and asks for a barrier
+     * once FT_SETTLE_BOUND unlinks are owed and once more with its last
+     * batch: a table of ten thousand flows is released behind twenty, not
+     * three hundred. */
     fixture();
     assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
     struct cdx_ft_binding *bound = list_entry(ft_bindings.next, struct cdx_ft_binding, list);
     unsigned mine = 0, others = 0;
-    for (unsigned i = 0; i < 2 * FT_RETIRE_BATCH + 12; i++) {
+    for (unsigned i = 0; i < FT_SETTLE_BOUND + 2 * FT_RETIRE_BATCH + 12; i++) {
         bool other = i % 50 == 7;
 
         connection_rule(i);
@@ -6113,10 +6124,11 @@ static void test_batched_retirement(void)
         if (other) others++; else mine++;
     }
     unsigned batches = (mine + FT_RETIRE_BATCH - 1) / FT_RETIRE_BATCH, drops = reschedules;
+    unsigned barriers = (mine - 1) / FT_SETTLE_BOUND + 1;
     before = settles;
-    assert(batches > 2 && others);
+    assert(batches > FT_SETTLE_BOUND / FT_RETIRE_BATCH && barriers == 2 && others);
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
-    assert(reschedules == drops + batches - 1 && settles == before + batches);
+    assert(reschedules == drops + batches - 1 && settles == before + barriers);
     assert(!ft_bound && ft_count == others && live_hw == others && !owed);
     list_for_each_entry(entry, &ft_entries, list)
         assert(entry->binding == &binding);
@@ -6250,12 +6262,13 @@ static void test_batched_retirement(void)
         assert(unlinks == unlinked && settles == before && handle_validity_checks == checks);
     }
 
-    /* More records than one run takes: a batch of them a run, each run
-     * settled behind one barrier and none of them a walk. */
+    /* More records than one run takes: a batch of them a run, none of them
+     * a walk, and one barrier for them all, asked for by the run that leaves
+     * nothing to the next. */
     {
         enum { DEFERRED = 2 * FT_RETIRE_BATCH + 3 };
         static struct nf_flow_offload_handle gens[DEFERRED];
-        unsigned runs = 0, checks = handle_validity_checks;
+        unsigned runs = 0, checks = handle_validity_checks, settled;
 
         fixture();
         for (unsigned i = 0; i < DEFERRED; i++) {
@@ -6275,14 +6288,15 @@ static void test_batched_retirement(void)
         transaction_busy = false;
         cls.command = FLOW_CLS_REPLACE;
         assert(ft_count == DEFERRED && !ft_retire_scan && work_queued_retire);
+        settled = settles;
         while (work_queued_retire) {
             unsigned left = ft_count;
 
-            before = settles;
             work_queued_retire = false;
             ft_retire_workfn(NULL);
             runs++;
-            assert(settles == before + 1 && !owed);
+            assert(ft_count ? settles == settled && owed == DEFERRED - ft_count
+                            : settles == settled + 1 && !owed);
             assert(ft_count == left - (left < FT_RETIRE_BATCH ? left : FT_RETIRE_BATCH));
             assert(work_queued_retire == !!ft_count);
         }
@@ -6468,7 +6482,8 @@ static void remove_all(void)
 
 static void test_transient_admission(void)
 {
-    struct cdx_ft_binding other_binding = { .dev = &out };
+    struct cdx_ft_binding other_binding = { .dev = &out,
+                                            .entries = LIST_HEAD_INIT(other_binding.entries) };
     for (unsigned tcp = 0; tcp < 2; tcp++)
         for (unsigned policies = 0; policies < 2; policies++) {
             if (tcp) tcp_fixture(); else fixture();
@@ -6924,7 +6939,8 @@ static void test_crossed_devices(void)
     /* And two tags on ingress with nothing above them, where the device of
      * the outer tag is crossed by the tag walk alone: the frame arrives on
      * `out` as eth3.100.300 and leaves by `in`. */
-    struct cdx_ft_binding qinq_binding = { .dev = &out };
+    struct cdx_ft_binding qinq_binding = { .dev = &out,
+                                           .entries = LIST_HEAD_INIT(qinq_binding.entries) };
     vlan_fixture(); cls.command = FLOW_CLS_REPLACE;
     reverse_route.dst.dev = &out_qinq;
     cls.nf_ingress_ifindex = mk.ingress_ifindex = out.ifindex;
@@ -8526,9 +8542,9 @@ static void test_egress_drain(void)
     assert(!ft_count && !live_hw && !allocated && !out.refs);
 
     /* More of them than one retirement batch: the work requeues itself after
-     * each, so the drain flushes it until it stays idle. And a deletion of
-     * Linux's own whose barrier is still owed to the settle work is waited
-     * for too. */
+     * each, so the drain flushes it until it stays idle, the last run
+     * settling what the others left owed. And a deletion of Linux's own whose
+     * barrier is still owed to the settle work is waited for too. */
     fixture();
     for (unsigned i = 0; i < 2 * FT_RETIRE_BATCH + 1; i++) {
         connection_rule(i);
@@ -8540,7 +8556,7 @@ static void test_egress_drain(void)
         unsigned flushes = retire_flushes, before = settles;
 
         assert(!ft_egress_drain(&out));
-        assert(retire_flushes == flushes + 3 && settles == before + 3 && !work_queued_retire);
+        assert(retire_flushes == flushes + 3 && settles == before + 1 && !work_queued_retire);
     }
     assert(!ft_count && !live_hw && !allocated && !out.refs && !owed);
     fixture();

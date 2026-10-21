@@ -1104,6 +1104,11 @@ static int ft_unlink(struct cdx_ft_entry *e)
 	free(e);
 	return 0;
 }
+static unsigned int cdx_ft_owed(void)
+{
+	assert(ft_transaction);
+	return unlinks_owed;
+}
 static int ft_settle(void)
 {
 	assert(ft_transaction);
@@ -1966,14 +1971,15 @@ static void test_state_add(void)
 	assert(!ft_ipsec_retire_pending());
 
 	/* An SA more flows name than one transaction retires: they go a batch
-	 * at a time, either end naming it, each batch settled behind one
-	 * barrier and the transaction let go between batches -- not slept on,
-	 * which is for a barrier still unproven. A flow naming another SA
-	 * stays. */
+	 * at a time, either end naming it, the transaction let go between
+	 * batches -- not slept on, which is for a barrier still unproven -- and
+	 * one barrier settles them all, fewer than FT_SETTLE_BOUND being owed
+	 * between batches. A flow naming another SA stays. */
 	{
 		enum { NAMING = 2 * FT_RETIRE_BATCH + 5, OTHERS = 3 };
 		struct nf_flow_offload_handle handles[NAMING + OTHERS];
 		unsigned batches = (NAMING + FT_RETIRE_BATCH - 1) / FT_RETIRE_BATCH;
+		unsigned barriers = (NAMING - 1) / FT_SETTLE_BOUND + 1;
 		unsigned before = settles, drops = reschedules, deleted = sa_deleted;
 		u16 sa;
 
@@ -2001,7 +2007,7 @@ static void test_state_add(void)
 		bench_drain_retirements();
 		/* Marked in one walk before the first batch, not again for each. */
 		assert(ipsec_markings == markings + NAMING);
-		assert(!retirement_flows && !unlinks_owed && settles == before + batches);
+		assert(!retirement_flows && !unlinks_owed && settles == before + barriers);
 		assert(reschedules == drops + batches - 1 && slept == slept_before);
 		assert(sa_deleted == deleted + 1 && !ft_ipsec_retire_pending());
 		for (unsigned i = 0; i < NAMING + OTHERS; i++)

@@ -1209,7 +1209,14 @@ static int ft_l2_admit(const struct ft_l2_seen *s, unsigned int kinds)
 	/* Before anything is built: an egress change counted after this is
 	 * one the entry may predate (ft_egress_changes). */
 	changes = atomic64_read_acquire(&ft_egress_changes);
-	rc = cdx_ft_l2_add(&p->rule, &p->hw);
+	/* The backend admits nothing while a retirement is unproven, and one
+	 * whose barrier a retirement in batches or a deletion left owed is that
+	 * until it is asked for -- here, as a flow's admission asks
+	 * (ft_replace()), rather than by the backend's retry, which is paced
+	 * for a barrier that failed. */
+	rc = ft_settle();
+	if (!rc)
+		rc = cdx_ft_l2_add(&p->rule, &p->hw);
 	if (!rc && atomic64_read(&ft_egress_changes) != changes)
 		rc = -EAGAIN;
 	if (rc) {

@@ -1,4 +1,4 @@
-From 33dd20dd67f5fda54e9064fa5ff380fce0a4654a Mon Sep 17 00:00:00 2001
+From 4d8000ee423110c77a5751ca55943c4a40d14a96 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
@@ -42,6 +42,10 @@ counter mode the table had at its last command about the flow, and takes
 64-bit deltas, as a counter read's now does: a read every few seconds
 exceeds 32 bits on one flow above eight gigabits per second.
 
+A table freed once its devices are all unbound frees its flows in place:
+each driver retired its directions as its binding was released, and a
+deletion per hardware flow would only run past an empty callback list.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  drivers/net/bonding/bond_main.c           |  80 +++++++----
@@ -57,7 +61,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/ipv4/route.c                          |   3 +-
  net/ipv6/ip6_fib.c                        |  23 +++
  net/netfilter/nf_conntrack_core.c         |   3 +-
- net/netfilter/nf_flow_table_core.c        | 123 +++++++++++++++-
+ net/netfilter/nf_flow_table_core.c        | 156 ++++++++++++++++++++-
  net/netfilter/nf_flow_table_ip.c          |  25 +++-
  net/netfilter/nf_flow_table_offload.c     | 163 ++++++++++++++++++++--
  net/netfilter/nft_flow_offload.c          | 102 +++++++++++---
@@ -65,7 +69,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/xfrm_policy.c                    | 124 +++++++++++++++-
  net/xfrm/xfrm_state.c                     |  25 +++-
  net/xfrm/xfrm_user.c                      |   6 +
- 21 files changed, 914 insertions(+), 87 deletions(-)
+ 21 files changed, 944 insertions(+), 90 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index d10bbe4c3571..f910915934cb 100644
@@ -938,7 +942,7 @@ index 77a445a59af3..8c28a6045e27 100644
  	struct nf_conn_acct *acct;
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index b00f1c68a8e7..9087a58ac380 100644
+index b00f1c68a8e7..9f5d6fdde83f 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
 @@ -9,14 +9,116 @@
@@ -1121,6 +1125,55 @@ index b00f1c68a8e7..9087a58ac380 100644
  	INIT_DELAYED_WORK(&flowtable->gc_work, nf_flow_offload_work_gc);
  	flow_block_init(&flowtable->flow_block);
  	init_rwsem(&flowtable->flow_block_lock);
+@@ -605,8 +724,22 @@ void nf_flow_table_cleanup(struct net_device *dev)
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_table_cleanup);
+ 
++/* What a deletion that reaches no driver leaves of a hardware flow, done in
++ * place: the flow is torn down, its conntrack no longer marked as in the
++ * hardware, and freed. */
++static void nf_flow_table_free_flow(struct nf_flowtable *flow_table,
++				    struct flow_offload *flow, void *data)
++{
++	flow_offload_teardown(flow);
++	if (test_bit(NF_FLOW_HW, &flow->flags))
++		clear_bit(IPS_HW_OFFLOAD_BIT, &flow->ct->status);
++	flow_offload_del(flow_table, flow);
++}
++
+ void nf_flow_table_free(struct nf_flowtable *flow_table)
+ {
++	bool unbound;
++
+ 	mutex_lock(&flowtable_lock);
+ 	list_del(&flow_table->list);
+ 	mutex_unlock(&flowtable_lock);
+@@ -614,9 +747,22 @@ void nf_flow_table_free(struct nf_flowtable *flow_table)
+ 	cancel_delayed_work_sync(&flow_table->gc_work);
+ 	nf_flow_table_offload_flush(flow_table);
+ 	/* ... no more pending work after this stage ... */
+-	nf_flow_table_iterate(flow_table, nf_flow_table_do_cleanup, NULL);
+-	nf_flow_table_gc_run(flow_table);
+-	nf_flow_table_offload_flush_cleanup(flow_table);
++	/* A table whose devices are all unbound has no driver left to tell:
++	 * each driver retired its directions, and reported what they counted,
++	 * as its binding was released. A deletion per hardware flow would only
++	 * be queued, run past an empty callback list and waited for -- seconds
++	 * for a table of ten thousand flows, under the commit mutex of the
++	 * transaction that flushes this. Free the flows in place instead. */
++	down_read(&flow_table->flow_block_lock);
++	unbound = list_empty(&flow_table->flow_block.cb_list);
++	up_read(&flow_table->flow_block_lock);
++	if (unbound) {
++		nf_flow_table_iterate(flow_table, nf_flow_table_free_flow, NULL);
++	} else {
++		nf_flow_table_iterate(flow_table, nf_flow_table_do_cleanup, NULL);
++		nf_flow_table_gc_run(flow_table);
++		nf_flow_table_offload_flush_cleanup(flow_table);
++	}
+ 	rhashtable_destroy(&flow_table->rhashtable);
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_table_free);
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
 index 98edcaa37b38..ff35d601699a 100644
 --- a/net/netfilter/nf_flow_table_ip.c

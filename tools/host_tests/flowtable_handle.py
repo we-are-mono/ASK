@@ -21,6 +21,11 @@ def test_lifecycle(tmp_path):
         + source[source.index("struct flow_offload_tuple_rhash *\nflow_offload_lookup"):
                  source.index("EXPORT_SYMBOL_GPL(flow_offload_lookup);")]
         + function(source, "nf_flow_offload_gc_step")
+        + function(source, "nf_flow_table_gc_run")
+        # A tree that predates the in-place free has no helper for it.
+        + (function(source, "nf_flow_table_free_flow")
+           if "nf_flow_table_free_flow(" in source else "")
+        + function(source, "nf_flow_table_free")
         + function(offload, "nf_flow_offload_add"))
     binary = tmp_path / "flowtable_handle"
     run_process([

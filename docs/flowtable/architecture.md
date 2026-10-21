@@ -530,16 +530,29 @@ A delete's own barrier is a host-command round trip, about two thirds of what a
 delete costs. Retiring a full table one synchronized delete at a time held the
 control mutex for 13 s on the KASAN image, and readers, admission and Linux's
 callbacks queued behind it (A327). So the adapter unlinks without the barrier
-(`cdx_ft_unlink()`) and asks for one barrier per batch (`cdx_ft_settle()`). An
-owed unlink is the "barrier unproven" outcome before any barrier has been
-asked of it. Every walk that retires many entries goes in batches of at most 64
-and settles each batch before it lets the transaction go: the retirement worker,
-a binding's release, global invalidation, an SA's retirement and a Wi-Fi VAP's
-drain. Linux's own deletions arrive one flow per callback. Each leaves its
-barrier owed, the 64th owed one settles inline, and a queued settle takes the
-tail of a burst. Admission settles anything owed before it asks the backend. A
-failed settle counts as one failed deletion: its owed entries become ordinary
-unproven retirements, and global recovery takes over. Displaced cumulative nodes
+(`cdx_ft_unlink()`) and asks for one barrier for many unlinks
+(`cdx_ft_settle()`). An owed unlink is the "barrier unproven" outcome before
+any barrier has been asked of it. Every walk that retires many entries goes in
+batches of at most 64, letting the transaction go between them: the retirement
+worker, a binding's release, global invalidation, an SA's retirement and a
+Wi-Fi VAP's drain. A binding's release takes its batches from the binding's
+own list of entries: found by walking every entry instead, past the other
+bindings' still in place, the first of a table's two releases cost the square
+of the table -- three times the second at 10,000 flows. A batch leaves its
+unlinks owed until 1,024 are (`FT_SETTLE_BOUND`), and the walk's last batch
+settles what remains: a barrier is a host-command round trip (2 ms on the
+KASAN image), and settling every batch asked for 314 of them in a 10,000-flow
+table's release, inside the nft commit. The unlinked keys are out of the
+classifier's reach once the walks under way end; the barrier proves that, and
+until it does only their storage waits. A completed barrier frees the storage
+of everything it proved, which costs the same however the barriers fall --
+most of what each per-batch settle took on the KASAN image, where every free
+is checked. Linux's own deletions arrive one flow per callback. Each leaves its
+barrier owed, the 1,024th owed one settles inline, and a queued settle takes
+the tail of a burst. A flow's and a bridged pair's admission settle anything
+owed before they ask the backend, as do recovery and a claim. A failed settle
+counts as one failed deletion: its owed entries become ordinary unproven
+retirements, and global recovery takes over. Displaced cumulative nodes
 go back to their own table's spare, whichever table the barrier went through.
 `/proc/cdx_flowtable` reports owed unlinks as `owed`, separately from
 `quarantine`.
@@ -752,6 +765,10 @@ torn down there would only fall to software and be recreated in the dying
 table, offloaded and released again inside the commit, the commit waiting on
 every admission. Instead the binding's release retires what it holds, each
 direction reporting its count, and no packet leaves the hardware before then.
+Once its devices are all unbound, Netfilter frees the table's flows in place
+(patch 140) rather than queueing a deletion per hardware flow that would reach
+no driver and waiting for them all -- under the commit mutex, since the `nft`
+process that deleted the table flushes the free as it closes its socket.
 
 Per-interface counters are a separate set of firmware records, folded into a
 port's or a VLAN device's `rtnl_link_stats64` by the `dev_get_stats()` hook and

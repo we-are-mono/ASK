@@ -592,9 +592,10 @@ int cdx_ft_del(struct cdx_ft_hw **hw);
  * costs one host-command round trip rather than one each. Always consumes
  * *hw. 0: unlinked, its storage retained until a barrier proves it unreachable
  * -- counted by cdx_ft_pending() and cdx_ft_owed() until then. -EIO as for
- * cdx_ft_del(). The adapter settles what it unlinked before anything outside
- * the transaction can need it proven, and escalates a failed settle as it
- * would a failed delete.
+ * cdx_ft_del(). The adapter settles what it unlinked by the end of the
+ * retirement, a bounded number of unlinks later at most; whatever needs them
+ * proven before that settles first. A failed settle is escalated as a failed
+ * delete would be.
  * final, if given, receives the direction's counters as cdx_ft_stats() reads
  * them, taken once its entries are unlinked and before their storage goes:
  * everything counted up to the unlink is in it, and only a frame whose

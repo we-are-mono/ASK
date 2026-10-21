@@ -157,8 +157,9 @@ def test_ipsec_adapter(tmp_path):
                  source.index("/* Publish one SA's counters into its state")]
         + function(source, "ft_sec_refusal_rows")
         # The most flows one transaction retires, which an SA that many name
-        # takes batches of.
+        # takes batches of, and the most unlinks left owed between them.
         + re.search(r"^#define FT_RETIRE_BATCH\s.*$", source, re.M).group() + "\n"
+        + re.search(r"^#define FT_SETTLE_BOUND\s.*$", source, re.M).group() + "\n"
         + "\n".join(function(source, name) for name in names)
         + source[source.index("static const struct xfrmdev_ops ft_xfrmdev_ops = {"):
                  source.index("/* Attach the ops to a CDX physical port")]

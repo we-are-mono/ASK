@@ -36,7 +36,9 @@ enum flow_offload_tuple_dir { FLOW_OFFLOAD_DIR_ORIGINAL, FLOW_OFFLOAD_DIR_REPLY,
 struct nf_flow_offload_handle;
 /* One count for every reference, the flow's and the handle's alike. */
 struct nf_conntrack { int unused; };
-struct nf_conn { struct nf_conntrack ct_general; unsigned refs; bool dying; };
+struct nf_conn { struct nf_conntrack ct_general; unsigned refs; bool dying; unsigned long status; };
+enum { IPS_OFFLOAD_BIT = 14, IPS_HW_OFFLOAD_BIT = 15 };
+static void clear_bit(unsigned bit, unsigned long *p) { *p &= ~(1UL << bit); }
 static void nf_conntrack_get(struct nf_conntrack *nfct)
 { struct nf_conn *ct = (struct nf_conn *)nfct; assert(ct->refs); ct->refs++; }
 /* What reached the conntrack's accounting, per direction. */
@@ -69,7 +71,18 @@ struct flow_offload {
     struct rcu_head rcu_head;
 };
 struct rhashtable { struct flow_offload_tuple_rhash *slots[2]; };
-struct nf_flowtable { struct rhashtable rhashtable; bool use_hw_handles, hardware; unsigned flags; };
+struct list_head { struct list_head *next, *prev; };
+static void list_del(struct list_head *entry)
+{ entry->next->prev = entry->prev; entry->prev->next = entry->next; }
+static bool list_empty(const struct list_head *head) { return head->next == head; }
+/* The block's callbacks are what a table's free asks about: whether any
+ * driver is still bound to be told of its flows' deletion. */
+struct nf_flowtable {
+    struct rhashtable rhashtable; bool use_hw_handles, hardware; unsigned flags;
+    struct list_head list;
+    struct { struct list_head cb_list; } flow_block;
+    int flow_block_lock, gc_work;
+};
 /* Declared by the header in the kernel; the handle's definitions use it
  * before they define it. */
 void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle, bool counter);
@@ -153,6 +166,39 @@ static void flow_offload_del(struct nf_flowtable *table, struct flow_offload *fl
 {
     table->rhashtable.slots[0] = table->rhashtable.slots[1] = NULL;
     flow_offload_free(flow);
+}
+/* What a table's free runs, around the per-flow steps it is built of. The
+ * table holds at most one flow, visited once, by its original direction. */
+static int flowtable_lock;
+static unsigned flushes, flush_cleanups;
+static void mutex_lock(int *lock) { assert(!*lock); *lock = 1; }
+static void mutex_unlock(int *lock) { assert(*lock); *lock = 0; }
+static void down_read(int *lock) { assert(!*lock); *lock = 1; }
+static void up_read(int *lock) { assert(*lock); *lock = 0; }
+static void cancel_delayed_work_sync(int *work) { *work = 0; }
+static void nf_flow_table_offload_flush(struct nf_flowtable *table) { flushes++; }
+static void rhashtable_destroy(struct rhashtable *table) { assert(!table->slots[0] && !table->slots[1]); }
+static void nf_flow_table_iterate(struct nf_flowtable *table,
+                                  void (*iter)(struct nf_flowtable *, struct flow_offload *, void *),
+                                  void *data)
+{
+    struct flow_offload_tuple_rhash *tuple = table->rhashtable.slots[0];
+    if (tuple) iter(table, container_of(tuple, struct flow_offload, tuplehash[0]), data);
+}
+static void nf_flow_table_do_cleanup(struct nf_flowtable *table, struct flow_offload *flow, void *data)
+{ assert(!data); flow_offload_teardown(flow); }
+void nf_flow_table_gc_run(struct nf_flowtable *table);
+/* The deletion queue's flush: each deletion queued ran and marked its flow
+ * dead, which the collector then frees. */
+static void nf_flow_table_offload_flush_cleanup(struct nf_flowtable *table)
+{
+    struct flow_offload_tuple_rhash *tuple = table->rhashtable.slots[0];
+    flush_cleanups++;
+    if (tuple) {
+        struct flow_offload *flow = container_of(tuple, struct flow_offload, tuplehash[0]);
+        if (test_bit(NF_FLOW_HW_DYING, &flow->flags)) set_bit(NF_FLOW_HW_DEAD, &flow->flags);
+    }
+    nf_flow_table_gc_run(table);
 }
 #include "handle_production.inc"
 
@@ -296,5 +342,28 @@ int main(void)
     flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0 && flow->hw_handle);
     assert(adds == offers + 2 && teardowns == retirements + 1);
     flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+    /* A table freed with no driver bound frees its flows in place: no
+     * deletion is queued for a hardware flow, which would reach no one, and
+     * its conntrack is no longer marked as in the hardware. With a driver
+     * still bound the deletion goes to it, as before. */
+    table.list.next = table.list.prev = &table.list;
+    table.flow_block.cb_list.next = table.flow_block.cb_list.prev = &table.flow_block.cb_list;
+    flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+    assert(test_bit(NF_FLOW_HW, &flow->flags));
+    ct.status = 1UL << IPS_HW_OFFLOAD_BIT;
+    unsigned deleted = deletes, freed_flushes = flushes;
+    retirements = teardowns;
+    nf_flow_table_free(&table);
+    assert(deletes == deleted && teardowns == retirements + 1 && flushes == freed_flushes + 1);
+    assert(!table.rhashtable.slots[0] && !test_bit(IPS_HW_OFFLOAD_BIT, &ct.status));
+    grace_period(); assert(!allocations && !ct.refs);
+    struct list_head bound;
+    bound.next = bound.prev = &table.flow_block.cb_list;
+    table.flow_block.cb_list.next = table.flow_block.cb_list.prev = &bound;
+    flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+    unsigned cleanups = flush_cleanups;
+    nf_flow_table_free(&table);
+    assert(deletes == deleted + 1 && flush_cleanups == cleanups + 1 && !table.rhashtable.slots[0]);
+    grace_period(); assert(!allocations && !ct.refs);
     puts("Flowtable handles: opt-in allocation, rollback, shared ownership, the conntrack held for accounting, lookup, GC, RCU and generation isolation passed");
 }

@@ -88,6 +88,12 @@ struct cdx_ft_binding {
 	struct list_head list;
 	struct net_device *dev;
 	struct nf_flowtable *table; /* retained as identity; borrowed in bind only */
+	/* The entries this binding admitted, each also on ft_entries, so that
+	 * its release visits its own: walking every entry for each batch of a
+	 * binding's, past those of the others still in place, made releasing a
+	 * full binding cost the square of the table. Under the backend
+	 * transaction, like ft_entries. */
+	struct list_head entries;
 	/* Bound while an invalidation was latched: counted and watched like any
 	 * other binding, but every flow it is offered stays in software until
 	 * ft_rearm() makes it live. Changed only under the backend transaction,
@@ -167,6 +173,8 @@ struct ft_delta {
 
 struct cdx_ft_entry {
 	struct list_head list;
+	/* On its binding's entries. */
+	struct list_head binding_node;
 	struct hlist_node cookie_node;
 	struct hlist_node key_node;
 	struct list_head neigh_list;
@@ -219,10 +227,20 @@ struct cdx_ft_entry {
  */
 #define CDX_FT_MAX_ENTRIES 32768U
 #define CDX_FT_HASH_BITS 14
-/* The most entries one transaction retires, and the most unlinks one barrier
- * settles: a full table goes in batches that each hold the transaction for
- * milliseconds, not one walk that held it for 13 seconds (A327). */
+/* The most entries one transaction retires: a full table goes in batches that
+ * each hold the transaction for milliseconds, not one walk that held it for 13
+ * seconds (A327). */
 #define FT_RETIRE_BATCH 64U
+/* The most unlinks a retirement leaves owed between its batches. A barrier is
+ * a host-command round trip, two milliseconds on the KASAN image, and one
+ * proves every unlink before it, so a retirement asks for one only every this
+ * many and with its last batch, instead of with every batch: a table of ten
+ * thousand flows is released behind twenty barriers, not three hundred. The
+ * unlinked keys are out of the classifier's reach once the walks under way
+ * finish; the barrier proves that, and until it does only their storage waits,
+ * freed by the barrier that proves it -- the same work however the barriers
+ * fall. */
+#define FT_SETTLE_BOUND (16 * FT_RETIRE_BATCH)
 
 /* What an MFC entry routed through a bridge contributes to the bridged group
  * carrying its stream.
