@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A410 — a peer flow went dark ~9 s at a case's start after a bridged case.** The LAN VM kept the bridge's MAC for
+  its gateway; every case now starts with what the VM learned forgotten (_:/^tests: start every case with the LAN VM_).
+
 - [ ] **A409 — an offloaded UDP conntrack is never ASSURED, so a full conntrack table evicts it first.** UDP becomes
   ASSURED only from a packet conntrack sees 2 s after the connection opened (`nf_conntrack_udp_packet()`), and the
   flowtable takes a UDP flow at its first established original datagram, normally well inside that: from then on

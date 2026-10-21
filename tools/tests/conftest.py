@@ -30,6 +30,7 @@ from ask_orch.provenance import agent_sources, firmware_script
 
 
 from _dmesg_allowlist import load_allowlist
+from _topology import LAN_NIC
 
 # Written on the DUT by a case that ends its boot, before it starts. The
 # rootfs is an initramfs, so only a new boot clears it.
@@ -163,6 +164,29 @@ async def _target_reachable(aiohttp_session, target_agent):
         pytest.exit(f"target agent unreachable: {e}", returncode=2)
     if not h.get("ok"):
         pytest.exit(f"target /health returned ok=False: {h!r}", returncode=2)
+
+
+@pytest.fixture(autouse=True)
+def _lan_learned_state_forgotten(lan):
+    """The LAN VM reaches everything beyond its subnet through the DUT's LAN
+    address, at the MAC it last learned for it. A case that bridges the LAN
+    port has the DUT answer for that address with the bridge's MAC, and the
+    VM keeps that MAC once the port is on its own again: the next case's
+    first datagrams go to a MAC the port no longer takes, and stay dark --
+    some nine seconds -- until the VM's unicast probes fail and a broadcast
+    finds the port's own. A peer that waits five seconds for an echo fails
+    on it. The bridge also carries the WAN segment's router advertisements
+    to the VM, which takes a default route, an address and an on-link
+    prefix from them. So every case starts with the VM's LAN NIC holding
+    none of what it learned: it resolves the DUT afresh, its first packet
+    queued a millisecond for it."""
+    result = lan.run(f"ip neigh flush dev {LAN_NIC} && "
+                     f"ip -6 route flush dev {LAN_NIC} proto ra && "
+                     f"ip -6 addr flush dev {LAN_NIC} scope global dynamic && "
+                     f"ip -6 route show dev {LAN_NIC} | awk '/ expires /{{print $1}}' | "
+                     f"while read -r prefix; do ip -6 route del \"$prefix\" dev {LAN_NIC} || exit 1; done",
+                     timeout=10)
+    assert result.rc == 0, ("forgetting what the LAN VM learned", result.stdout)
 
 
 @pytest.fixture(scope="session")
