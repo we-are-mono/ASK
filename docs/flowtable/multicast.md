@@ -437,10 +437,26 @@ membership protocol away from the bridge that is the source of truth for this
 whole design. The bridge floods them and must keep flooding them.
 
 **The ingress.** A single physical CDX port, learned from the frame that
-resolved the source, and a member of the bridge the MDB entry belongs to. The
+resolved the source, below a port of the bridge the MDB entry belongs to. The
 entry is keyed on it, so a stream arriving elsewhere misses and is forwarded in
 software — which is correct rather than a failure, and is how a second ingress
 gets its own entry.
+
+The bridge port is the physical port itself, or a stack of 802.1Q VLAN
+devices on one. OpenWrt bridges IPTV that way: `br-iptv` over the WAN port's
+`eth4.3999` and the LAN bridge's `br-lan.3999` (A412). The receive path strips
+a VLAN device's tag before any rx handler of the port below runs, so the
+bridge sees an untagged frame where the wire carried one more tag; the entry is
+keyed on the port below, and its root validates and strips that tag as well,
+which is how the routed learner keys a VIF that is a VLAN device. A stack ending
+anywhere else is not keyed: on another bridge (whose frames those are), on
+another bridge's port, on a device of another kind, or in a tag of another
+protocol. Neither are more tags than a root validates (two, the stack's and the
+bridge's own together). Such a source is counted in `mcast_refused`, and the
+membership naming it reads `refused-ingress` rather than `pending-source`. Two
+VLAN devices on one port are one classifier key, so the same sender and source
+arriving through both is `refused-contested`, as it is for two VLANs of one
+bridge.
 
 **The frame.** The key also carries the frame's own destination and source
 MACs. A bridge forwards a frame with the addresses it arrived with, and a
@@ -496,14 +512,33 @@ and refuse the flow. This is what keeps an IGMPv3 source filter in force: a
 every flow of the group again, and the hardware stops with it.
 
 Each port the bridge names must satisfy `cdx_mc_port_identity()` — a physical
-CDX Ethernet port — and have egress framing a rule can describe. A port that
-does not **refuses the whole flow**, because a partially replicated flow is a
-silently broken one: the matched frame never reaches the bridge, so a listener
-left out of the hardware set does not fall back to software, it stops
-receiving. The shipping shape is a Wi-Fi VAP on `br-lan`: a phone joining the
-stream a set-top box is already watching puts an uncarriable port in the
-answer, and the flow goes back to the bridge in its entirety. `/proc` says
-`refused-listener` for these.
+CDX Ethernet port — and have egress framing a rule can describe, or be a stack
+the copy can be read down (below). A port that does not **refuses the whole
+flow**, because a partially replicated flow is a silently broken one: the
+matched frame never reaches the bridge, so a listener left out of the hardware
+set does not fall back to software, it stops receiving. The shipping shape is a
+Wi-Fi VAP on `br-lan`: a phone joining the stream a set-top box is already
+watching puts an uncarriable port in the answer, and the flow goes back to the
+bridge in its entirety. `/proc` says `refused-listener` for these.
+
+A port that is a stack is read down the way Linux sends the copy
+(`ft_mc_port_copies()`). An 802.1Q device adds its tag outside the ones the
+frame carries and hands it to the device below. A second bridge below sends it
+to the ports `br_multicast_list_ports()` answers for what the host sends
+through it, each with the tags `ft_bridge_vlan()` derives — the routed
+learner's answer for a copy routed into a bridge, with the sender's addresses
+kept. That is `br-lan.3999` in the IPTV bridge above: a copy out of each LAN
+port, tagged as `br-lan` tags it. Every port of the second bridge must be
+physical. A copy that would leave exactly as the stream arrived, or exactly as
+another copy does, refuses the flow, and so does a VLAN device that does not
+reorder its header, which adds no tag to a frame that already carries one. The
+first bridge drops what does not fit a stacked port's own MTU, so that MTU
+bounds the flow beside the listeners' (`refused-mtu`). A copy through a second
+bridge crosses its `output` hook, which no forwarded frame does, and under
+`br_netfilter` it carries the first bridge's state into the second, which no
+walk follows; while either is present the flow is `refused-filter`. A change
+to the second bridge — a membership, a port's VLAN — asks the flow again, as
+a change to its own bridge does.
 
 **A flow the bridge forwards nowhere is dropped in hardware.** Its last listener
 has left, every listener sits behind its ingress, or every one blocks its
@@ -804,8 +839,10 @@ analogue for, and it is why `/proc` has to show it: an operator looking at a
 group that is not being replicated must be able to tell "refused" from "not yet
 seen". `/proc` prints one `mcast` row per flow, with `member_src` the source of
 the most specific membership naming it, and one per membership that names no
-flow yet, as `pending-source`. A flow that has aged out, or been taken back,
-reads `retiring` until the next worker pass removes it; its entry is still in
+flow yet, as `pending-source` — or `refused-ingress` once a source it names
+arrived on a bridge port the hardware cannot key. A flow that has aged out, or
+been taken back, reads `retiring` until the next worker pass removes it; its
+entry is still in
 hardware and still counted until then. `mcast_groups` counts memberships and
 `mcast_flows` flows; `mcast_installed` counts flows in hardware, and
 `mcast_enabled` is the global switch both learners answer to.
@@ -1188,6 +1225,16 @@ The host-MDB refusal is proved on the rig by
 `tools/tests/flowtable_service_multicast_host.py`. While the group is in
 hardware, a socket on the DUT joins it on the bridge device. The test is
 described with the routed learner's, in `multicast-routed.md` under Tests.
+
+The stacked IPTV bridge is proved by
+`tools/tests/flowtable_service_multicast_stacked_bridge.py`: `br-iptv` over
+`eth4.<vid>` and `br-lan.3999`, with `br-lan` VLAN-aware and not snooping, as
+OpenWrt configures it. Joined from the LAN VM with IGMPv2 and with an IGMPv3
+source-specific report, the flow is installed keyed on `eth4` and copied out of
+`eth3` tagged 3999, every frame arrives once and the CPU sees next to none.
+`mcast_learner.c`'s `a_bridge_port_can_be_a_stack()` covers what the rig cannot
+reach: every refusal down a stack, the shared key of two VLAN devices on one
+port, a stack that cannot be keyed, and the second bridge's changes.
 
 ## The consumer contract
 

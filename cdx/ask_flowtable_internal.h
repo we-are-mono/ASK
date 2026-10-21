@@ -353,6 +353,10 @@ struct ft_mc_group {
 	 * here because it keeps the membership: br_multicast_host_join() emits
 	 * it before any port group. */
 	bool host;
+	/* A source it names arrived on a bridge port the hardware cannot key
+	 * (ft_mc_in_port()), so no flow was learned: what its row says while
+	 * none is, rather than that it waits for a frame. */
+	bool in_refused;
 };
 
 /* A flow: one source's frames of a group as they arrive on one bridge port,
@@ -369,6 +373,16 @@ struct ft_mc_flow {
 	struct net_device *bridge;
 	struct br_ip addr;
 	struct net_device *in;
+	/* The physical port `in` receives through, which the entry is keyed
+	 * on, and the tags the frames carry there that the bridge never sees:
+	 * one per 802.1Q device `in` is stacked on, outermost first, which the
+	 * receive path strips before the bridge's rx handler runs. `in` itself
+	 * and none when it is the port; pinned apart from it when it is not.
+	 * Fixed for the flow's life, as a VLAN device's lower device and tag
+	 * are for the device's; see ft_mc_in_port(). */
+	struct net_device *in_port;
+	struct cdx_ft_vlan in_vlan[CDX_FT_VLAN_MAX];
+	u8 in_vlans;
 	/* The frames' own Ethernet pair, which a bridged entry is keyed on and
 	 * every bridged copy is rebuilt with, and whether they carry the
 	 * group's VLAN as a tag or arrive untagged on the port's PVID, which
@@ -434,6 +448,13 @@ struct ft_mc_flow {
 	unsigned int local;
 	int error;
 	bool derived;
+	/* Where a copy is a stack's rather than its port's own: the smallest
+	 * MTU of a bridge port the copies leave through that is not their
+	 * physical port, which the bridge drops what does not fit, U32_MAX for
+	 * none; and whether a copy is sent through a second bridge, whose
+	 * changes are then this flow's too. See ft_mc_port_copies(). */
+	u32 out_mtu;
+	bool stacked;
 	/* tc runs something in software where the flow's frames arrive, where a
 	 * copy of them leaves, or where the bridge hands them up; and a netdev
 	 * chain there could tell its streams apart, or any netfilter hook sees
@@ -963,6 +984,12 @@ bool ft_bridge_hooked_routed(unsigned int hooks);
  * postrouting hook (ask_flowtable_mr_probe.c); the bridged unicast learner
  * asks it too, of the frames br_netfilter hands there. */
 bool ft_mr_bpf_hooked(u8 family);
+/* The VLAN a bridge forwards what is sent through it in, given the tags it
+ * already carries (ask_flowtable_mr.c); the bridged learner asks it of a
+ * bridge a copy is sent through on its way down a stack. */
+int ft_mr_bridge_vid(struct net_device *bridge,
+		     const struct cdx_ft_vlan *inner, unsigned int tags,
+		     u16 *vid);
 
 /* The bridged unicast learner (ask_flowtable_l2.c). */
 int ft_l2_init(void);

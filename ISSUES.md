@@ -152,6 +152,10 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A412 — IPTV bridged between the WAN port's and br-lan's VLAN devices stayed in software, `pending-source`.** A
+  bridge port that is a stack of 802.1Q devices, on a port or on a second bridge, is now read down to the ports below; a
+  stack it cannot key reads `refused-ingress` (_:/^cdx: carry a bridged group through a bridge port that is a stack_).
+
 - [x] **A411 — the health probe failed a busy transaction as it would a dead one.** A read still waiting for cdx's
   transaction at the deadline now fails only if one holder has kept it that long (`flowtable_hold_ms`), and RTNL is
   asked first (_:/^cdx, flowtable: fail the health probe on a held transaction_).

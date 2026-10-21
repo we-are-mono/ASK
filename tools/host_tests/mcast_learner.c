@@ -107,6 +107,14 @@ struct net_device {
     bool chain_out;
     /* The device it sits on, for a VLAN device or a macvlan. */
     struct net_device *vlan_of;
+    /* An 802.1Q device's tag, zero for any other device; an 802.1ad one, and
+     * one that does not reorder its header (VLAN_FLAG_REORDER_HDR clear). */
+    uint16_t vlan_id;
+    bool vlan_ad;
+    bool vlan_no_reorder;
+    /* A bridge that filters VLANs whatever `vlan_enabled` says of the
+     * bridge under test: the second bridge of a stacked pair. */
+    bool filtering;
     /* References the learner holds on it: a device going away waits for
      * these, and one nothing holds may be freed. */
     unsigned refs;
@@ -116,6 +124,8 @@ struct net_device {
 #define __force
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define max_t(type, a, b) ((type)(a) > (type)(b) ? (type)(a) : (type)(b))
+#define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+#define U32_MAX UINT32_MAX
 #define ETH_DATA_LEN 1500
 
 struct cdx_ft_vlan { uint16_t proto; uint16_t id; };
@@ -218,11 +228,11 @@ static void dev_hold(struct net_device *d) { holds++; d->refs++; }
 static void dev_put(struct net_device *d) { assert(holds && d->refs); holds--; d->refs--; }
 
 /* The devices the traffic half can resolve an ingress index to. */
-static struct net_device *by_index[8];
+static struct net_device *by_index[16];
 static struct net_device *dev_get_by_index(void *net, int ifindex)
 {
     (void)net;
-    for (unsigned i = 0; i < 8; i++)
+    for (unsigned i = 0; i < ARRAY_SIZE(by_index); i++)
         if (by_index[i] && by_index[i]->ifindex == ifindex) {
             dev_hold(by_index[i]);
             return by_index[i];
@@ -263,7 +273,27 @@ static int br_vlan_get_pvid(struct net_device *port, uint16_t *p)
     return -EOPNOTSUPP;
 }
 
-static bool br_vlan_enabled(const struct net_device *br) { (void)br; return vlan_enabled; }
+static bool br_vlan_enabled(const struct net_device *br) { return br->filtering || vlan_enabled; }
+
+/* VLAN devices, as include/linux/if_vlan.h has them: the tag, its protocol,
+ * and the device below, which is fixed for the device's lifetime. */
+#define VLAN_FLAG_REORDER_HDR 0x1
+struct vlan_dev_priv { struct net_device *real_dev; u32 flags; };
+static inline bool is_vlan_dev(const struct net_device *d) { return d->vlan_id; }
+static inline uint16_t vlan_dev_vlan_id(const struct net_device *d) { return d->vlan_id; }
+static inline uint16_t vlan_dev_vlan_proto(const struct net_device *d)
+{
+    return htons(d->vlan_ad ? 0x88a8 : ETH_P_8021Q);
+}
+static inline struct vlan_dev_priv *vlan_dev_priv(const struct net_device *d)
+{
+    static struct vlan_dev_priv priv;
+
+    assert(is_vlan_dev(d));
+    priv.real_dev = d->vlan_of;
+    priv.flags = d->vlan_no_reorder ? 0 : VLAN_FLAG_REORDER_HDR;
+    return &priv;
+}
 static int br_vlan_get_proto(struct net_device *br, uint16_t *p)
 {
     (void)br; *p = vlan_proto; return 0;
@@ -341,7 +371,9 @@ static int __ipv6_addr_src_scope(int type) { return type >> 16; }
  * arriving on this port in this VLAN goes to, and why it also goes up. A flow
  * nothing scripted gets no port at all, and no BR_MCAST_SNOOPED either: an
  * empty set that is not snooping's verdict, which drops nothing. A case
- * wanting snooping's own "nowhere" scripts the bit. */
+ * wanting snooping's own "nowhere" scripts the bit. A frame sent through the
+ * bridge device, as a VLAN device stacked on it sends one, has no ingress and
+ * hands nothing up; its answer is scripted with the bridge as `in`. */
 static struct snap {
     struct net_device *in;
     uint32_t source;
@@ -361,14 +393,18 @@ static int br_multicast_list_ports(struct net_device *dev, const struct br_ip *g
 {
     snap_calls++;
     /* A received frame is asked about with its ingress, and the host's copy
-     * is part of the answer. */
-    assert(dev && dev->bridge_master && in_dev && local);
+     * is part of the answer; one sent through the bridge has neither. */
+    assert(dev && dev->bridge_master && (!in_dev || local));
+    if (!in_dev)
+        assert(!local);
     for (unsigned i = snap_count; i-- > 0;) {
         const struct snap *s = &snaps[i];
 
-        if (s->in != in_dev || s->source != group->src.ip4 || s->vid != group->vid)
+        if (s->in != (in_dev ? in_dev : dev) || s->source != group->src.ip4 ||
+            s->vid != group->vid)
             continue;
-        *local = s->local;
+        if (local)
+            *local = s->local;
         if (s->n < 0)
             return s->n;
         if ((unsigned)s->n > max)
@@ -376,7 +412,8 @@ static int br_multicast_list_ports(struct net_device *dev, const struct br_ip *g
         memcpy(ports, s->ports, s->n * sizeof(ports[0]));
         return s->n;
     }
-    *local = 0;
+    if (local)
+        *local = 0;
     return 0;
 }
 
@@ -480,6 +517,12 @@ static int in_transaction, rtnl;
 static bool caller_rtnl;
 static void rtnl_lock(void) { assert(!rtnl && !in_transaction && !ft_mc_lock); rtnl = 1; }
 static void rtnl_unlock(void) { assert(rtnl && !caller_rtnl); rtnl = 0; }
+/* The adjacency walk's answer, which needs RTNL. */
+static inline struct net_device *ft_vlan_lower(struct net_device *d)
+{
+    assert(rtnl);
+    return d->vlan_of;
+}
 /* Something that gets the transaction just before whoever asks for it next,
  * run once: a tc command's egress change and drain, or a device going away,
  * landing while the worker waits for the transaction with a flow it picked.
@@ -545,7 +588,7 @@ static void ft_mc_hook_sync(bool want) { (void)want; no_flow_busy(); }
 
 /* The devices the derivation asks tc about: every bridge and bridge port,
  * walked under RTNL. */
-static struct net_device *netdevs[8];
+static struct net_device *netdevs[20];
 #define for_each_netdev(net, d) \
     for (unsigned _i = ((void)(net), 0); _i < ARRAY_SIZE(netdevs); _i++) \
         if (((d) = netdevs[_i]) != NULL)
@@ -560,25 +603,28 @@ static bool netif_is_bridge_port(const struct net_device *d)
     for (unsigned _u = ((void)&(iter), 0); _u < ARRAY_SIZE(netdevs); _u++) \
         if (((updev) = netdevs[_u]) != NULL && (updev)->vlan_of == (dev))
 
-/* A bridge hook at LOCAL_IN, which sees what the bridge hands up. */
+/* A bridge hook at LOCAL_IN, which sees what the bridge hands up, and at
+ * LOCAL_OUT, which sees what is sent through the bridge device. */
 #define BIT(n) (1U << (n))
 #define NF_BR_LOCAL_IN 1
-static bool bridge_local_in;
+#define NF_BR_LOCAL_OUT 3
+static bool bridge_local_in, bridge_local_out;
 static bool ft_bridge_hooked(unsigned int hooks)
 {
-    return (hooks & BIT(NF_BR_LOCAL_IN)) && bridge_local_in;
+    return ((hooks & BIT(NF_BR_LOCAL_IN)) && bridge_local_in) ||
+           ((hooks & BIT(NF_BR_LOCAL_OUT)) && bridge_local_out);
 }
-/* br_netfilter's LOCAL_IN hook judges nothing: bridge_local_in stands for
- * any other. */
+/* br_netfilter's own hooks judge nothing: the two flags stand for any
+ * other. */
 static bool ft_bridge_hooked_routed(unsigned int hooks)
 {
     return ft_bridge_hooked(hooks);
 }
 
-/* What tc runs in software on a device, and on it and every device below it;
- * the devices here have none below. Asked under RTNL and never under the
- * group lock: a classifier walk can destroy a filter, whose destruction
- * reaches the egress mark, which takes the group lock. */
+/* What tc runs in software on a device, and on it and every device below it:
+ * a VLAN device's lower device, a bridge's ports. Asked under RTNL and never
+ * under the group lock: a classifier walk can destroy a filter, whose
+ * destruction reaches the egress mark, which takes the group lock. */
 static bool ft_dev_tc_soft(struct net_device *dev, bool ingress)
 {
     assert(rtnl && !ft_mc_lock);
@@ -586,7 +632,15 @@ static bool ft_dev_tc_soft(struct net_device *dev, bool ingress)
 }
 static bool ft_dev_stack_tc_soft(struct net_device *dev, bool ingress)
 {
-    return ft_dev_tc_soft(dev, ingress);
+    if (ft_dev_tc_soft(dev, ingress))
+        return true;
+    if (dev->vlan_of && ft_dev_stack_tc_soft(dev->vlan_of, ingress))
+        return true;
+    for (unsigned i = 0; dev->bridge_master && i < ARRAY_SIZE(netdevs); i++)
+        if (netdevs[i] && netdevs[i]->master == dev &&
+            ft_dev_stack_tc_soft(netdevs[i], ingress))
+            return true;
+    return false;
 }
 
 /* Whether a netfilter chain runs at a device's netdev ingress hook;
@@ -630,7 +684,7 @@ static int nft_port_dependent(int *net, const struct nft_port_probe *probe);
 static struct net_device BR;
 static int nft_ip_probe(const struct nft_port_probe *probe)
 {
-    assert(probe->in && probe->nout == 1 && probe->out[0] == &BR);
+    assert(probe->in && probe->nout == 1 && probe->out[0]->bridge_master);
     ip_in[0] = ip_in[1];
     ip_in[1] = probe->in;
     memmove(ip_pre, ip_pre + 1, sizeof(ip_pre) - sizeof(ip_pre[0]));
@@ -652,6 +706,19 @@ static bool ft_mr_bpf_hooked(u8 family)
 /* The bridge's VLAN device for a VLAN, as the receive path finds it. */
 static struct net_device *__vlan_find_dev_deep_rcu(struct net_device *dev, uint16_t proto,
                                                    uint16_t vid);
+/* A chain on `dev` or on a device below it, which the walk follows down a
+ * VLAN device and a bridge's ports. */
+static bool stack_chain(const struct net_device *dev, bool in)
+{
+    if (in ? dev->chain_in : dev->chain_out)
+        return true;
+    if (dev->vlan_of && stack_chain(dev->vlan_of, in))
+        return true;
+    for (unsigned i = 0; dev->bridge_master && i < ARRAY_SIZE(netdevs); i++)
+        if (netdevs[i] && netdevs[i]->master == dev && stack_chain(netdevs[i], in))
+            return true;
+    return false;
+}
 static int nft_port_dependent(int *net, const struct nft_port_probe *probe)
 {
     int rc = 0;
@@ -666,9 +733,9 @@ static int nft_port_dependent(int *net, const struct nft_port_probe *probe)
     probed.out = probed_out;
     if (probe_rc)
         return probe_rc;
-    rc = probe->in->chain_in;
+    rc = stack_chain(probe->in, true);
     for (unsigned i = 0; i < probe->nout; i++)
-        rc |= probe->out[i]->chain_out;
+        rc |= stack_chain(probe->out[i], false);
     return rc;
 }
 static unsigned long long ft_mc_port_probe_errors;
@@ -930,6 +997,33 @@ static struct net_device *__vlan_find_dev_deep_rcu(struct net_device *dev, uint1
     return dev == &BR && vid == 289 ? &BRV : NULL;
 }
 
+/* IPTV as OpenWrt bridges it: a bridge of its own whose ports are the WAN
+ * port's VLAN device and the LAN bridge's, which filters and carries the
+ * VLAN tagged to the set-top boxes. */
+static struct net_device WAN   = { .name = "eth4", .ifindex = 20, .physical = true };
+static struct net_device IPTV  = { .name = "br-iptv", .ifindex = 21, .bridge_master = true };
+static struct net_device WANV  = { .name = "eth4.3999", .ifindex = 22, .vlan_of = &WAN,
+                                   .vlan_id = 3999, .master = &IPTV };
+static struct net_device LANBR = { .name = "br-lan", .ifindex = 23, .bridge_master = true,
+                                   .filtering = true };
+static struct net_device LANV  = { .name = "br-lan.3999", .ifindex = 24, .vlan_of = &LANBR,
+                                   .vlan_id = 3999, .master = &IPTV };
+static struct net_device LAN1  = { .name = "eth2", .ifindex = 25, .physical = true,
+                                   .master = &LANBR };
+static struct net_device LAN2  = { .name = "eth3", .ifindex = 26, .physical = true,
+                                   .master = &LANBR };
+/* Another of the WAN port's VLANs in the same bridge, a VLAN device on
+ * something the hardware cannot key, one straight on a LAN port, and a port
+ * of the LAN bridge the hardware cannot replicate to. */
+static struct net_device WANV2 = { .name = "eth4.100", .ifindex = 27, .vlan_of = &WAN,
+                                   .vlan_id = 100, .master = &IPTV };
+static struct net_device TUN   = { .name = "tun0", .ifindex = 28 };
+static struct net_device TUNV  = { .name = "tun0.3999", .ifindex = 29, .vlan_of = &TUN,
+                                   .vlan_id = 3999, .master = &IPTV };
+static struct net_device LAN1V = { .name = "eth2.3999", .ifindex = 30, .vlan_of = &LAN1,
+                                   .vlan_id = 3999, .master = &IPTV };
+static struct net_device LANSOFT = { .name = "veth0", .ifindex = 31, .master = &LANBR };
+
 static const u8 GROUP_MAC[ETH_ALEN] = { 0x01, 0, 0x5e, 0x07, 0, 0x01 };
 static const u8 SENDER[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x51 };
 static const u8 OTHER_SENDER[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x52 };
@@ -1136,6 +1230,9 @@ static void reset(void)
     by_index[1] = &P2;
     by_index[2] = &P3;
     by_index[3] = &SOFT;
+    by_index[4] = &WANV;
+    by_index[5] = &WANV2;
+    by_index[6] = &TUNV;
     memset(netdevs, 0, sizeof(netdevs));
     netdevs[0] = &BR;
     netdevs[1] = &P1;
@@ -1144,11 +1241,29 @@ static void reset(void)
     netdevs[4] = &SOFT;
     netdevs[5] = &BR2;
     netdevs[6] = &BRV;
+    netdevs[7] = &IPTV;
+    netdevs[8] = &WANV;
+    netdevs[9] = &LANBR;
+    netdevs[10] = &LANV;
+    netdevs[11] = &LAN1;
+    netdevs[12] = &LAN2;
+    netdevs[13] = &WAN;
     BR.tc_ingress = BR2.tc_ingress = BRV.tc_ingress = false;
     BR.nf_ingress = BR2.nf_ingress = BRV.nf_ingress = false;
+    {
+        struct net_device *stack[] = { &WAN, &IPTV, &WANV, &LANBR, &LANV, &LAN1, &LAN2,
+                                       &WANV2, &TUN, &TUNV, &LAN1V, &LANSOFT };
+
+        for (unsigned i = 0; i < ARRAY_SIZE(stack); i++) {
+            stack[i]->mtu = 1500;
+            stack[i]->tc_ingress = stack[i]->tc_egress = false;
+            stack[i]->chain_in = stack[i]->chain_out = false;
+            stack[i]->vlan_no_reorder = false;
+        }
+    }
     vlan_enabled = false;
     vlan_proto = ETH_P_8021Q;
-    bridge_local_in = false;
+    bridge_local_in = bridge_local_out = false;
     ft_mc_refused = 0;
     assert(holds == 0);
 }
@@ -4639,6 +4754,200 @@ static void an_uncarried_flow_lives_while_its_stream_does(void)
     ft_mc_filtered = false;
 }
 
+/* The copies a flow's spec makes, each checked for the port, the one tag it
+ * leaves with, and the sender's addresses kept. */
+static bool copies_tagged(const struct cdx_mc_group_spec *spec, uint16_t vid,
+                          struct net_device *a, struct net_device *b)
+{
+    static const u8 none[ETH_ALEN];
+    bool seen_a = false, seen_b = false;
+
+    if (spec->listeners != 2)
+        return false;
+    for (u8 i = 0; i < spec->listeners; i++) {
+        const struct cdx_mc_listener *l = &spec->listener[i];
+
+        if (l->routed || memcmp(l->src_mac, none, ETH_ALEN) || l->vlans != 1 ||
+            l->vlan[0].proto != htons(ETH_P_8021Q) || l->vlan[0].id != vid)
+            return false;
+        seen_a |= l->dev == a;
+        seen_b |= l->dev == b;
+    }
+    return seen_a && seen_b;
+}
+
+/* A flow asked of the bridges again, as the refresh asks every flow. */
+static const char *rederived(struct ft_mc_flow *f)
+{
+    f->dirty = true;
+    pass();
+    return ft_mc_state(f);
+}
+
+/* A bridge port can be a stack: OpenWrt bridges IPTV between the WAN port's
+ * VLAN device and the LAN bridge's (A412). The hardware entry that carries it
+ * is an ordinary one -- the WAN port keyed on the tag its VLAN device strips,
+ * a copy out of each LAN port tagged as the LAN bridge tags it -- so the flow
+ * is learned from the frames the stacked bridge forwards and the copies are
+ * read down the stack, through the LAN bridge's own answer for what the host
+ * sends through it. */
+static void a_bridge_port_can_be_a_stack(void)
+{
+    const uint32_t G = htonl(0xe8cacb8d), S = htonl(0x0a000009);
+    struct br_ip any = group_v4(G, 0, 0);
+    struct cdx_mc_group_spec spec;
+    struct ft_mc_flow *f;
+
+    reset();
+    member(&LANBR, 3999, false);    /* br-lan.3999 sends through it */
+    member(&LAN1, 3999, false);
+    member(&LAN2, 3999, false);
+    /* Joined behind br-lan.3999: a port the hardware can replicate to, down
+     * the stack, and claimed as one. */
+    assert(ft_mc_port_eligible(&LANV) && ft_mc_port_eligible(&WANV));
+    assert(!ft_mc_port_eligible(&TUNV));
+    assert(ft_mc_membership(&IPTV, &LANV, &any, true, false));
+    answer(&WANV, S, 0, 0, 1, &LANV);
+    answer(&LANBR, S, 3999, 0, 2, &LAN1, &LAN2);
+    see(seen_v4(&IPTV, &WANV, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&WANV, S, 0);
+    assert(f && f->hw && !strcmp(ft_mc_state(f), "installed"));
+    ft_mc_flow_spec(f, &spec);
+    assert(spec.in == &WAN && spec.bridged);
+    assert(spec.in_vlans == 1 && spec.in_vlan[0].id == 3999 &&
+           spec.in_vlan[0].proto == htons(ETH_P_8021Q));
+    assert(copies_tagged(&spec, 3999, &LAN1, &LAN2));
+    assert(ft_mc_refused == 0);
+
+    /* What runs in software anywhere down the stack keeps it there: tc on a
+     * LAN port below br-lan.3999, a netdev chain on the WAN port below
+     * eth4.3999, a bridge hook that sees what the host sends through br-lan,
+     * and br_netfilter, whose state from the first bridge rides into the
+     * second. */
+    LAN2.tc_egress = true;
+    assert(!strcmp(rederived(f), "refused-tc") && !f->hw);
+    LAN2.tc_egress = false;
+    assert(!strcmp(rederived(f), "installed") && f->hw);
+    WAN.chain_in = true;
+    assert(!strcmp(rederived(f), "refused-filter") && !f->hw);
+    WAN.chain_in = false;
+    assert(!strcmp(rederived(f), "installed"));
+    bridge_local_out = true;
+    assert(!strcmp(rederived(f), "refused-filter") && !f->hw);
+    bridge_local_out = false;
+    assert(!strcmp(rederived(f), "installed"));
+    brnf_hooked = ft_mc_brnf = true;
+    assert(!strcmp(rederived(f), "refused-filter") && !f->hw);
+    brnf_hooked = ft_mc_brnf = false;
+    assert(!strcmp(rederived(f), "installed"));
+
+    /* br-iptv drops what does not fit br-lan.3999, which is no listener's
+     * port. */
+    LANV.mtu = 1400;
+    assert(!strcmp(rederived(f), "refused-mtu") && !f->hw);
+    LANV.mtu = 1500;
+    assert(!strcmp(rederived(f), "installed"));
+
+    /* Every copy must be one the hardware makes, or none is: a port of the
+     * LAN bridge that is not physical, a copy that would leave exactly as
+     * the stream arrives, and two copies that would leave alike. */
+    answer(&LANBR, S, 3999, 0, 3, &LAN1, &LAN2, &LANSOFT);
+    assert(!strcmp(rederived(f), "refused-listener") && !f->hw);
+    member(&WAN, 3999, false);
+    answer(&LANBR, S, 3999, 0, 2, &LAN1, &WAN);
+    assert(!strcmp(rederived(f), "refused-listener") && !f->hw);
+    netdevs[14] = &LAN1V;
+    answer(&LANBR, S, 3999, 0, 2, &LAN1, &LAN2);
+    answer(&WANV, S, 0, 0, 2, &LANV, &LAN1V);
+    assert(!strcmp(rederived(f), "refused-listener") && !f->hw);
+    /* Straight onto a LAN port through its own VLAN device is a copy too. */
+    answer(&WANV, S, 0, 0, 1, &LAN1V);
+    assert(!strcmp(rederived(f), "installed"));
+    ft_mc_flow_spec(f, &spec);
+    assert(spec.listeners == 1 && spec.listener[0].dev == &LAN1 &&
+           spec.listener[0].vlans == 1 && spec.listener[0].vlan[0].id == 3999);
+    netdevs[14] = NULL;
+    answer(&WANV, S, 0, 0, 1, &LANV);
+    assert(!strcmp(rederived(f), "installed"));
+
+    /* The LAN bridge's own changes are the flow's: a port's VLAN or a
+     * membership there asks it again. */
+    f->dirty = false;
+    ft_mc_bridge_changed(&LAN2);
+    assert(f->dirty);
+    f->dirty = false;
+    {
+        struct br_ip lan = group_v4(G, 0, 3999);
+
+        mutex_lock(&ft_mc_lock);
+        ft_mc_touch(&LANBR, &lan);
+        mutex_unlock(&ft_mc_lock);
+    }
+    assert(f->dirty);
+
+    /* The WAN port is the key, whichever VLAN device a frame came up: the same
+     * sender and source on eth4.100 is the same entry, so neither installs. */
+    netdevs[14] = &WANV2;
+    answer(&WANV2, S, 0, 0, 1, &LANV);
+    see(seen_v4(&IPTV, &WANV2, G, S, 0, false, SENDER));
+    pass();
+    pass();
+    assert(!strcmp(ft_mc_state(flow(&WANV2, S, 0)), "refused-contested"));
+    assert(!strcmp(ft_mc_state(f), "refused-contested") && !f->hw);
+    netdevs[14] = NULL;
+
+    /* The WAN port going away takes the flow, whichever device goes first. */
+    ft_mc_device_gone(&WAN, true);
+    assert(f->gone);
+    pass();
+    assert(!flow(&WANV, S, 0));
+
+    /* A stack the hardware cannot key is no flow, but it is a refusal: the
+     * membership was not waiting for a frame, it saw one it had to turn
+     * away. */
+    reset();
+    member(&LANBR, 3999, false);
+    member(&LAN1, 3999, false);
+    assert(ft_mc_membership(&IPTV, &LANV, &any, true, false));
+    assert(!strcmp(ft_mc_group_state(only_group()), "pending-source"));
+    see(seen_v4(&IPTV, &TUNV, G, S, 0, false, SENDER));
+    pass();
+    assert(!flow(&TUNV, S, 0) && ft_mc_refused == 1);
+    assert(!strcmp(ft_mc_group_state(only_group()), "refused-ingress"));
+
+    /* A VLAN device that does not reorder its header adds no tag to a frame
+     * that already carries one, so a copy the stacked bridge tags itself is
+     * not one the copies can be read down. */
+    reset();
+    vlan_enabled = true;
+    member(&LANBR, 3999, false);
+    member(&LAN1, 3999, false);
+    member(&LAN2, 3999, false);
+    member(&WANV, 7, false);
+    member(&LANV, 7, false);
+    pvid(&WANV, 7);
+    {
+        struct br_ip any7 = group_v4(G, 0, 7);
+
+        ft_mc_membership(&IPTV, &LANV, &any7, true, false);
+    }
+    answer(&WANV, S, 7, 0, 1, &LANV);
+    answer(&LANBR, S, 3999, 0, 2, &LAN1, &LAN2);
+    see(seen_v4(&IPTV, &WANV, G, S, 7, false, SENDER));
+    pass();
+    f = flow(&WANV, S, 7);
+    assert(f && f->hw);
+    /* The copy leaves br-iptv tagged 7, inside br-lan.3999's 3999, which
+     * br-lan forwards in. */
+    ft_mc_flow_spec(f, &spec);
+    assert(spec.listeners == 2 && spec.listener[0].vlans == 2 &&
+           spec.listener[0].vlan[0].id == 3999 && spec.listener[0].vlan[1].id == 7);
+    LANV.vlan_no_reorder = true;
+    assert(!strcmp(rederived(f), "refused-listener") && !f->hw);
+    reset();
+}
+
 int main(void)
 {
     /* Until the routed learner first says where its VIFs are, they may be
@@ -4675,6 +4984,7 @@ int main(void)
     an_evicted_named_discard_takes_no_place();
     parked_discards_are_bounded_by_ids();
     an_uncarried_flow_lives_while_its_stream_does();
+    a_bridge_port_can_be_a_stack();
 
     reset();
     assert(holds == 0);

@@ -50,6 +50,9 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #                                        bridged pairs)
 #   flowtable_l2bridge.py  3900         (borrowed, see below; and 172.29.77.0/24
 #                                        between its two stations)
+#   flowtable_service_multicast_stacked_bridge.py 3900/3999 (borrowed on the WAN
+#                                        wire, see below; the router's IPTV VLAN
+#                                        on the LAN, as mcast_e2e.py has it)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
 # orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access

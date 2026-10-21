@@ -254,14 +254,18 @@ static u32 ft_mc_group_key(const struct net_device *bridge, const struct br_ip *
 /* Ask the bridge again about every flow of this group on this bridge VLAN,
  * whatever its source: a membership changing -- a join, a leave, an (S,G)
  * port group created or blocked, a filter mode switched -- can change the
- * answer for any of them. Called with ft_mc_lock held. */
+ * answer for any of them. And about every flow of the group whose copies are
+ * sent through a second bridge, which may be this one, in a VLAN of its own.
+ * Called with ft_mc_lock held. */
 static void ft_mc_touch(const struct net_device *bridge, const struct br_ip *addr)
 {
 	struct ft_mc_flow *f;
 
 	lockdep_assert_held(&ft_mc_lock);
 	list_for_each_entry(f, &ft_mc_flows, list)
-		if (f->bridge == bridge && ft_mc_same_vlan_group(&f->addr, addr))
+		if ((f->bridge == bridge && ft_mc_same_vlan_group(&f->addr, addr)) ||
+		    (f->stacked && f->addr.proto == addr->proto &&
+		     !memcmp(&f->addr.dst, &addr->dst, sizeof(addr->dst))))
 			f->dirty = true;
 }
 
@@ -311,6 +315,15 @@ static bool ft_mc_carriable(const struct ft_mc_flow *f)
 	return !r || f->ports + r->listeners <= CDX_MC_MAX_LISTENERS;
 }
 
+/* Whether a root can validate every tag the flow's frames arrive with: those
+ * the stack below its bridge port strips, and the bridge's own when they
+ * carry it. Checked where the flow is learned, and again here for a shape
+ * learned later. */
+static bool ft_mc_in_fits(const struct ft_mc_flow *f)
+{
+	return f->in_vlans + f->in_tagged <= CDX_FT_VLAN_MAX;
+}
+
 /* Whether every frame the ingress port can deliver fits every port the flow
  * is replicated to, which is what lets the hardware carry it without ever
  * fragmenting a copy.
@@ -337,12 +350,18 @@ static bool ft_mc_mtu_bounded(const struct ft_mc_flow *f)
 	u32 in_mtu;
 	u8 i;
 
-	if (!f->in)
+	if (!f->in_port)
 		return true;
-	in_mtu = ft_port_arriving(f->in);
+	/* What the physical port's MAC delivers: a VLAN device above it takes
+	 * whatever arrives, and so does the bridge from it. */
+	in_mtu = ft_port_arriving(f->in_port);
 	for (i = 0; i < f->ports; i++)
 		if (READ_ONCE(f->port[i].dev->mtu) < in_mtu)
 			return false;
+	/* A bridge port a copy leaves through that is not its own port, the
+	 * derivation's to read: one change of an MTU re-derives every flow. */
+	if (f->out_mtu < in_mtu)
+		return false;
 	return !f->route || f->route->mtu >= in_mtu;
 }
 
@@ -354,10 +373,24 @@ static bool ft_mc_mtu_bounded(const struct ft_mc_flow *f)
  * position -- the tree describes it as a notifier-safe identity check that
  * never takes the control mutex while the caller owns RTNL. The authoritative
  * test runs in the worker; this one decides what the adapter tells the bridge.
+ *
+ * A port that is a stack of 802.1Q devices could carry one too, down to a
+ * physical port or to a bridge whose ports the copy is then sent to; which of
+ * those ports the hardware can be given is the derivation's question (see
+ * ft_mc_port_copies()). A VLAN device's lower device and tag are fixed for its
+ * lifetime, so the walk needs no lock of its own.
  */
 static bool ft_mc_port_eligible(struct net_device *dev)
 {
-	return cdx_mc_port_identity(dev);
+	u8 tags = 0;
+
+	while (!cdx_mc_port_identity(dev) && !netif_is_bridge_master(dev)) {
+		if (!is_vlan_dev(dev) || tags++ == CDX_FT_VLAN_MAX ||
+		    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q))
+			return false;
+		dev = vlan_dev_priv(dev)->real_dev;
+	}
+	return true;
 }
 
 /* The tags a copy of a group in `vid` leaves `port` with.
@@ -502,6 +535,8 @@ static void ft_mc_flow_free(struct ft_mc_flow *f)
 {
 	ft_mc_chain_forget(f);
 	ft_mc_flow_release_ports(f);
+	if (f->in_port && f->in_port != f->in)
+		dev_put(f->in_port);
 	if (f->in)
 		dev_put(f->in);
 	dev_put(f->bridge);
@@ -872,13 +907,14 @@ bool ft_mc_host_wants(const struct ft_mc_flow *f)
  * its frames; see ft_mc_bridge_filtered(). Nor while tc or a netdev chain
  * runs anything in software where it arrives or where a copy leaves; see what
  * runs in software on a bridged flow's ports. Nor while multicast
- * acceleration is switched off; see ft_mc_enabled. */
+ * acceleration is switched off; see ft_mc_enabled. Nor while its frames carry
+ * more tags than a root validates. */
 static bool ft_mc_installable(const struct ft_mc_flow *f)
 {
 	const struct ft_mc_route *r = ft_mc_live_route(f);
 
 	return READ_ONCE(ft_mc_enabled) && !ft_mc_filtered &&
-	       !f->tc_soft && !f->nf_hooked &&
+	       !f->tc_soft && !f->nf_hooked && ft_mc_in_fits(f) &&
 	       f->derived && f->in && !f->gone && !ft_mc_host_wants(f) &&
 	       (f->ports || r) && (r || !f->routed_host) &&
 	       ft_mc_carriable(f) && ft_mc_mtu_bounded(f);
@@ -901,7 +937,7 @@ static bool ft_mc_installable(const struct ft_mc_flow *f)
 static bool ft_mc_discardable(const struct ft_mc_flow *f)
 {
 	return READ_ONCE(ft_mc_enabled) && !ft_mc_filtered &&
-	       !f->tc_soft && !f->nf_hooked &&
+	       !f->tc_soft && !f->nf_hooked && ft_mc_in_fits(f) &&
 	       f->derived && f->in && !f->gone && !f->error &&
 	       !f->ports && !f->routed_host && !ft_mc_live_route(f) &&
 	       f->local == BR_MCAST_SNOOPED;
@@ -930,14 +966,15 @@ unsigned int ft_mc_parked(void)
 	return n;
 }
 
-/* The key a flow's hardware group is installed under: its port, its stream
- * and the one ingress shape the root accepts. Called with ft_mc_lock held. */
+/* The key a flow's hardware group is installed under: its physical port, its
+ * stream and the one ingress shape the root accepts. Called with ft_mc_lock
+ * held on a flow ft_mc_in_fits() accepts. */
 static void ft_mc_flow_key(const struct ft_mc_flow *f,
 			   struct cdx_mc_group_spec *spec)
 {
 	lockdep_assert_held(&ft_mc_lock);
 	memset(spec, 0, sizeof(*spec));
-	spec->in = f->in;
+	spec->in = f->in_port;
 	spec->bridged = true;
 	spec->family = ft_mc_family(&f->addr);
 	if (spec->family == AF_INET6) {
@@ -948,13 +985,17 @@ static void ft_mc_flow_key(const struct ft_mc_flow *f,
 		spec->dst.ip = f->addr.dst.ip4;
 	}
 	/* The frames' own pair, which the root is keyed on and every bridged
-	 * copy is rebuilt with, and the one ingress shape the root accepts. */
+	 * copy is rebuilt with, and the one ingress shape the root accepts: the
+	 * tags of the stack below the bridge port, outermost, then the bridge's
+	 * own when the frames carry it. */
 	ether_addr_copy(spec->dst_mac, f->dst_mac);
 	ether_addr_copy(spec->src_mac, f->src_mac);
-	if (f->in_tagged) {
-		spec->in_vlan[0].proto = htons(ETH_P_8021Q);
-		spec->in_vlan[0].id = f->addr.vid;
-		spec->in_vlans = 1;
+	memcpy(spec->in_vlan, f->in_vlan, f->in_vlans * sizeof(f->in_vlan[0]));
+	spec->in_vlans = f->in_vlans;
+	if (f->in_tagged && spec->in_vlans < CDX_FT_VLAN_MAX) {
+		spec->in_vlan[spec->in_vlans].proto = htons(ETH_P_8021Q);
+		spec->in_vlan[spec->in_vlans].id = f->addr.vid;
+		spec->in_vlans++;
 	}
 }
 
@@ -1375,13 +1416,15 @@ static void ft_mc_soft_on(const struct ft_mc_soft *soft, const struct net_device
 
 /* Whether a netdev chain where the flow's frames arrive, or where a copy
  * leaves, could tell its streams apart -- by their ports above all -- drop
- * them or translate them, as the routed learner asks of its groups. A walk a
+ * them or translate them, as the routed learner asks of its groups. The ports
+ * are the bridge's own, and the walk follows each down whatever it is stacked
+ * on, as it follows the flow's own bridge port down to the wire. A walk a
  * commit interrupted, or that found no memory, says nothing: the flow keeps
  * the answer it had for the same ports (`same`), or is refused, until the
  * refresh asks again. Called with RTNL and ft_mc_lock held; the walk takes
  * neither, and does not sleep. */
 static bool ft_mc_netdev_dependent(const struct ft_mc_flow *f,
-				   const struct cdx_mc_listener *port, u8 ports,
+				   struct net_device **port, u8 ports,
 				   bool same)
 {
 	const struct net_device *out[CDX_MC_MAX_LISTENERS];
@@ -1404,7 +1447,7 @@ static bool ft_mc_netdev_dependent(const struct ft_mc_flow *f,
 		probe.daddr.ip = f->addr.dst.ip4;
 	}
 	for (i = 0; i < ports; i++)
-		out[i] = port[i].dev;
+		out[i] = port[i];
 	rcu_read_lock();
 	rc = nft_port_dependent(&init_net, &probe);
 	rcu_read_unlock();
@@ -1476,6 +1519,139 @@ static int ft_mc_brnf_dependent(const struct ft_mc_flow *f)
 	return rc;
 }
 
+/* Append one copy, its tags outermost first as a listener describes them;
+ * `inner` is innermost first, the order the walk down a stack accumulates in,
+ * and the two meet here as they do in ft_mr_listener(). A copy that would
+ * leave exactly as the flow arrives -- the port and every tag -- is the stream
+ * sent back where it came from, and one that would leave exactly as another
+ * does is a second identical frame on the wire, which the backend refuses
+ * rather than deduplicates: either refuses the flow. Neither happens on one
+ * bridge, which never forwards to the ingress and names each port once; both
+ * can down a stack. Called with ft_mc_lock held. */
+static int ft_mc_copy(const struct ft_mc_flow *f, struct net_device *port,
+		      const struct cdx_ft_vlan *inner, unsigned int tags,
+		      struct cdx_mc_listener *out, u8 *count)
+{
+	struct cdx_mc_listener add = {};
+	struct cdx_mc_group_spec key;
+	unsigned int i;
+
+	if (tags > CDX_FT_VLAN_MAX || *count == CDX_MC_MAX_LISTENERS)
+		return -EOPNOTSUPP;
+	add.dev = port;
+	add.vlans = tags;
+	for (i = 0; i < tags; i++)
+		add.vlan[i] = inner[tags - 1 - i];
+	ft_mc_flow_key(f, &key);
+	if (add.dev == key.in && add.vlans == key.in_vlans &&
+	    !memcmp(add.vlan, key.in_vlan, sizeof(add.vlan)))
+		return -EOPNOTSUPP;
+	for (i = 0; i < *count; i++)
+		if (out[i].dev == add.dev && out[i].vlans == add.vlans &&
+		    !memcmp(out[i].vlan, add.vlan, sizeof(add.vlan)))
+			return -EOPNOTSUPP;
+	out[(*count)++] = add;
+	return 0;
+}
+
+/* The copies a frame sent through a second bridge makes, as a VLAN device
+ * stacked on the bridge sends one (br_dev_xmit()): to the ports
+ * br_multicast_list_ports() answers with no ingress, in the VLAN the tags
+ * above the bridge name, each with the tags ft_bridge_vlan() derives -- the
+ * routed learner's answer for a copy routed into a bridge
+ * (ft_mr_expand_bridge()), with the sender's pair kept, since a bridge
+ * rewrites nothing. Every one must be a physical port. Called with RTNL and
+ * ft_mc_lock held. */
+static int ft_mc_bridge_copies(const struct ft_mc_flow *f,
+			       struct net_device *bridge,
+			       const struct cdx_ft_vlan *inner, unsigned int tags,
+			       struct cdx_mc_listener *out, u8 *count)
+{
+	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
+	struct br_ip group = f->addr;
+	int n, rc;
+	u8 i;
+
+	if (ft_mr_bridge_vid(bridge, inner, tags, &group.vid))
+		return -EOPNOTSUPP;
+	n = br_multicast_list_ports(bridge, &group, NULL, NULL, chosen,
+				    ARRAY_SIZE(chosen));
+	if (n < 0)
+		return -EOPNOTSUPP;
+	for (i = 0; i < n; i++) {
+		struct cdx_ft_vlan stack[CDX_FT_VLAN_MAX];
+		unsigned int c = tags;
+
+		if (!cdx_mc_port_identity(chosen[i]))
+			return -EOPNOTSUPP;
+		memcpy(stack, inner, sizeof(stack));
+		if (ft_bridge_vlan(bridge, chosen[i], stack, &c) < 0)
+			return -EOPNOTSUPP;
+		rc = ft_mc_copy(f, chosen[i], stack, c, out, count);
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
+/* The copies for one port the bridge forwards a flow to, appended to `out`.
+ *
+ * A physical port is one copy, with the tags the bridge adds there. A bridge
+ * port can be a stack as well -- OpenWrt bridges IPTV between the WAN port's
+ * VLAN device and the LAN bridge's -- and the copy then leaves the way Linux
+ * sends it down the stack, which is how the routed learner resolves an oif
+ * (ft_mr_expand()): an 802.1Q device puts its tag outside the ones the frame
+ * carries and hands it to the device below, and a bridge below sends it on to
+ * its own ports (ft_mc_bridge_copies()). Anything else -- a device of another
+ * kind, a tag in another protocol, more tags than a listener carries -- the
+ * hardware cannot reproduce, and refuses the whole flow, -EOPNOTSUPP, as a
+ * port that is not physical always has.
+ *
+ * *mtu comes back lowered to the MTU of a port of this bridge that is not the
+ * copy's own port: the bridge drops what does not fit it
+ * (br_dev_queue_push_xmit()), and ft_mc_mtu_bounded() reads only the
+ * listeners'. *stacked says a copy is sent through a second bridge. Called
+ * with RTNL, which the walk down and the second bridge's answer need, and
+ * ft_mc_lock held. */
+static int ft_mc_port_copies(const struct ft_mc_flow *f, struct net_device *dev,
+			     struct cdx_mc_listener *out, u8 *count, u32 *mtu,
+			     bool *stacked)
+{
+	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX];
+	unsigned int tags;
+	u8 n;
+
+	/* The bridge's own tag, one at most, is the innermost the copy has. */
+	if (ft_mc_port_tags(f->bridge, dev, f->addr.vid, inner, &n))
+		return -EOPNOTSUPP;
+	tags = n;
+	if (!cdx_mc_port_identity(dev))
+		*mtu = min_t(u32, *mtu, READ_ONCE(dev->mtu));
+	for (;;) {
+		if (cdx_mc_port_identity(dev))
+			return ft_mc_copy(f, dev, inner, tags, out, count);
+		if (netif_is_bridge_master(dev)) {
+			*stacked = true;
+			return ft_mc_bridge_copies(f, dev, inner, tags, out, count);
+		}
+		/* A VLAN device advertises no VLAN offload, so a tag the frame
+		 * already has goes into the frame before its own is added --
+		 * unless it does not reorder its header, when it adds none to a
+		 * frame carrying one in its protocol
+		 * (vlan_dev_hard_start_xmit()). */
+		if (!is_vlan_dev(dev) || tags == CDX_FT_VLAN_MAX ||
+		    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q) ||
+		    (tags && !(vlan_dev_priv(dev)->flags & VLAN_FLAG_REORDER_HDR)))
+			return -EOPNOTSUPP;
+		inner[tags].proto = vlan_dev_vlan_proto(dev);
+		inner[tags].id = vlan_dev_vlan_id(dev);
+		tags++;
+		dev = ft_vlan_lower(dev);
+		if (!dev)
+			return -EOPNOTSUPP;
+	}
+}
+
 /* Ask the bridge what it does with this flow's frames, and keep the answer.
  *
  * br_multicast_list_ports() models the bridge's own receive path for a frame
@@ -1487,7 +1663,9 @@ static int ft_mc_brnf_dependent(const struct ft_mc_flow *f)
  * cannot reproduce -- a switchdev object carries no filter mode -- and reading
  * them off the bridge is what keeps the hardware from delivering a source a
  * port excluded. Each port it names must be one the hardware can replicate to
- * with the tags the bridge adds there, or the flow is refused whole.
+ * with the tags the bridge adds there -- down whatever the port is stacked
+ * on, a second bridge's own answer included (ft_mc_port_copies()) -- or the
+ * flow is refused whole.
  *
  * A changed answer marks the flow for the install pass, and an unchanged one
  * does not, so asking again at every refresh costs the hardware nothing.
@@ -1502,8 +1680,10 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *sof
 	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
 	struct cdx_mc_listener port[CDX_MC_MAX_LISTENERS];
 	bool tc_soft = false, nf_hooked = false, same, brnf_walked;
+	bool stacked = false;
 	struct ft_mc_seen seen;
 	unsigned int local = 0;
+	u32 out_mtu = U32_MAX;
 	int n, error = 0, rc;
 	u8 ports = 0, i;
 
@@ -1548,31 +1728,35 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *sof
 		error = n;
 		local = 0;
 	}
-	for (i = 0; !error && i < n; i++) {
-		if (!ft_mc_port_eligible(chosen[i]) ||
-		    ft_mc_port_tags(f->bridge, chosen[i], f->addr.vid,
-				    port[ports].vlan, &port[ports].vlans)) {
-			error = -EOPNOTSUPP;
-			break;
-		}
-		port[ports++].dev = chosen[i];
-	}
+	for (i = 0; !error && i < n; i++)
+		error = ft_mc_port_copies(f, chosen[i], port, &ports, &out_mtu,
+					  &stacked);
 	if (error) {
 		memset(port, 0, sizeof(port));
 		ports = 0;
+		n = 0;
+		out_mtu = U32_MAX;
 	}
 	/* Where the frames arrive, where each copy leaves, and where the bridge
 	 * hands them up; see what runs in software on a bridged flow's ports.
 	 * A host that joined, or a bridge flooding everything up, refuses the
-	 * flow whatever runs there. */
+	 * flow whatever runs there. A port is asked with what it is stacked on,
+	 * which is the whole of a copy's way down to the wire. */
 	ft_mc_soft_on(soft, f->in, true, &tc_soft, &nf_hooked);
 	if (local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC))
 		ft_mc_soft_on(soft, f->bridge, true, &tc_soft, &nf_hooked);
-	for (i = 0; i < ports; i++)
-		ft_mc_soft_on(soft, port[i].dev, false, &tc_soft, &nf_hooked);
+	for (i = 0; i < n; i++)
+		ft_mc_soft_on(soft, chosen[i], false, &tc_soft, &nf_hooked);
+	/* A copy sent through a second bridge crosses its LOCAL_OUT hook, which
+	 * no forwarded frame does, and its POST_ROUTING, which the filter test
+	 * already covers. Under br_netfilter it also carries the state the first
+	 * bridge's hooks left on it into the second's, which no walk follows. */
+	if (stacked && (ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT)) ||
+			READ_ONCE(ft_mc_brnf)))
+		nf_hooked = true;
 	same = f->derived && ports == f->ports &&
 	       ft_mc_listeners_same(port, f->port, ports);
-	if (ft_mc_netdev_dependent(f, port, ports, same))
+	if (ft_mc_netdev_dependent(f, chosen, n, same))
 		nf_hooked = true;
 	/* And under br_netfilter, the IP hooks it hands the frames to. A walk
 	 * a commit interrupted, or that found no memory, keeps the answer the
@@ -1594,7 +1778,8 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *sof
 	}
 	f->brnf_walked = brnf_walked;
 	if (same && error == f->error && local == f->local &&
-	    tc_soft == f->tc_soft && nf_hooked == f->nf_hooked)
+	    tc_soft == f->tc_soft && nf_hooked == f->nf_hooked &&
+	    out_mtu == f->out_mtu && stacked == f->stacked)
 		return;
 	/* Refused where it was not, for whichever reasons: one refusal. */
 	if ((error || tc_soft || nf_hooked) &&
@@ -1609,6 +1794,8 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *sof
 	f->error = error;
 	f->tc_soft = tc_soft;
 	f->nf_hooked = nf_hooked;
+	f->out_mtu = out_mtu;
+	f->stacked = stacked;
 	f->derived = true;
 	/* A changed answer is a new question: retries spent against the old
 	 * one say nothing about this one. */
@@ -1733,7 +1920,7 @@ bool ft_mc_evict_discard(u8 family)
 	victim->retries++;
 	cdx_mc_group_ids(family, &slots);
 	victim->parked = ft_mc_flow_named(victim) && parked < slots;
-	in = victim->in;
+	in = victim->in_port;
 	dev_hold(in);
 	/* Its frames reach the CPU again, and one recorded while the entry
 	 * dropped them has to be able to be recorded again. */
@@ -1781,8 +1968,11 @@ static void ft_mc_work_fn(struct work_struct *work)
 	if (READ_ONCE(ft_mc_recheck) || filtered != READ_ONCE(ft_mc_filtered) ||
 	    brnf != READ_ONCE(ft_mc_brnf)) {
 		/* br_netfilter coming or going changes what every flow's
-		 * frames cross, which only a derivation asks. */
-		bool rederive = brnf != READ_ONCE(ft_mc_brnf);
+		 * frames cross, which only a derivation asks; and an MTU may
+		 * be one of a port a copy leaves through above its own, which
+		 * only a derivation reads (ft_mc_port_copies()). */
+		bool rederive = brnf != READ_ONCE(ft_mc_brnf) ||
+				READ_ONCE(ft_mc_recheck);
 
 		WRITE_ONCE(ft_mc_recheck, false);
 		mutex_lock(&ft_mc_lock);
@@ -2469,7 +2659,7 @@ static bool ft_mc_flow_names_dev(const struct ft_mc_flow *f,
 {
 	u8 i;
 
-	if (f->bridge == dev || f->in == dev)
+	if (f->bridge == dev || f->in == dev || f->in_port == dev)
 		return true;
 	for (i = 0; i < f->ports; i++)
 		if (f->port[i].dev == dev)
@@ -2551,8 +2741,9 @@ void ft_mc_device_gone(struct net_device *dev, bool unregistering)
 		changed = true;
 	}
 	list_for_each_entry(f, &ft_mc_flows, list) {
-		if (f->in == dev || f->bridge == dev) {
-			/* The flow's ingress, or its bridge: the flow is over.
+		if (f->in == dev || f->in_port == dev || f->bridge == dev) {
+			/* The flow's ingress -- its bridge port or the port
+			 * that is stacked on -- or its bridge: the flow is over.
 			 * Its references go when the worker frees it, and not
 			 * before: an installed entry names the ingress, which
 			 * the backend borrows and unsubscribes the port's
@@ -2616,8 +2807,10 @@ void ft_mc_bridge_changed(struct net_device *dev)
 		return;
 	mutex_lock(&ft_mc_lock);
 	ft_mc_forget_seen();
+	/* And a flow whose copies are sent through a second bridge, which may be
+	 * this one. */
 	list_for_each_entry(f, &ft_mc_flows, list) {
-		if (f->bridge != bridge)
+		if (f->bridge != bridge && !f->stacked)
 			continue;
 		f->dirty = true;
 		marked = true;
@@ -2864,6 +3057,10 @@ static const char *ft_mc_state(const struct ft_mc_flow *f)
 		return "refused-filter";
 	if (f->tc_soft)
 		return "refused-tc";
+	/* More tags where it arrives than a root validates: the stack below
+	 * its bridge port's, and the bridge's own. */
+	if (!ft_mc_in_fits(f))
+		return "refused-ingress";
 	/* Nowhere to forward it and nothing else wanting it: the bridge drops
 	 * it, and the hardware does instead -- or will, once installed. */
 	if (ft_mc_discardable(f)) {
@@ -2902,6 +3099,17 @@ static const struct br_ip *ft_mc_member_src(const struct ft_mc_flow *f)
 		    !memcmp(&g->addr.src, &f->addr.src, sizeof(g->addr.src)))
 			return &g->addr;
 	return &any;
+}
+
+/* What a membership no flow speaks for is waiting on: nothing while the host
+ * joined it, which refuses every flow of it; a frame of a source it names, or
+ * nothing more once one arrived on a bridge port the hardware cannot key
+ * (ft_mc_in_refused()). */
+static const char *ft_mc_group_state(const struct ft_mc_group *g)
+{
+	if (g->host)
+		return "refused-host";
+	return g->in_refused ? "refused-ingress" : "pending-source";
 }
 
 /* Whether a membership names any flow, which then speaks for it in /proc.
@@ -3011,7 +3219,7 @@ void ft_mc_rows(struct seq_file *seq)
 		memset(&unlearned.src, 0, sizeof(unlearned.src));
 		ft_mc_row(seq, g->bridge, &unlearned, &g->addr,
 			  g->ports ? ports : "-", "-", NULL, 0, none, none,
-			  g->host ? "refused-host" : "pending-source", &stats);
+			  ft_mc_group_state(g), &stats);
 	}
 	mutex_unlock(&ft_mc_lock);
 }

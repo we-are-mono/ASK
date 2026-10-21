@@ -451,9 +451,9 @@ static int ft_mr_listener(struct net_device *port,
  * in the bridge's protocol, and the bridge's PVID otherwise. It is the first
  * half of what ft_bridge_vlan() decides per port, asked once because the MDB
  * lookup needs it before any port has been chosen. */
-static int ft_mr_bridge_vid(struct net_device *bridge,
-			    const struct cdx_ft_vlan *inner, unsigned int tags,
-			    u16 *vid)
+int ft_mr_bridge_vid(struct net_device *bridge,
+		     const struct cdx_ft_vlan *inner, unsigned int tags,
+		     u16 *vid)
 {
 	u16 proto;
 

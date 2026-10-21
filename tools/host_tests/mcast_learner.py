@@ -63,6 +63,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_same_group",
             "ft_mc_find",
             "ft_mc_carriable",
+            "ft_mc_in_fits",
             # What a port's MAC delivers, shared with the unicast bound.
             "ft_port_arriving",
             "ft_mc_mtu_bounded",
@@ -120,6 +121,9 @@ def test_mcast_learner(tmp_path):
             "ft_mc_source_named",
             "ft_mc_host_joined",
             "ft_mc_same_key",
+            # A bridge port that is a stack, and a source it cannot key.
+            "ft_mc_in_port",
+            "ft_mc_in_refused",
             "ft_mc_observe",
             "ft_mc_adopt_next",
             # The bridge's answer, what runs in software on its ports beside
@@ -133,6 +137,13 @@ def test_mcast_learner(tmp_path):
             "ft_mc_soft_on",
             "ft_mc_netdev_dependent",
             "ft_mc_brnf_dependent",
+            # A copy down a stack: the tags a bridge resolves a frame sent
+            # through it to, as both learners resolve them, and the copies.
+            "ft_mr_bridge_vid",
+            "ft_bridge_vlan",
+            "ft_mc_copy",
+            "ft_mc_bridge_copies",
+            "ft_mc_port_copies",
             "ft_mc_flow_derive",
             "ft_mc_count_delta",
             "ft_mc_flow_counted",
@@ -154,6 +165,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_work_fn",
             "ft_mc_state",
             "ft_mc_member_src",
+            "ft_mc_group_state",
             "ft_mc_group_has_flow",
             # The switchdev MDB handler, and the filter a replay reaches it
             # through.
@@ -401,9 +413,17 @@ def test_a_flow_the_hardware_cannot_serve_whole_is_not_served_at_all():
     """
     source = flowtable_source()
     derive = function(source, "ft_mc_flow_derive")
-    assert "ft_mc_port_eligible(chosen[i])" in derive
-    assert "error = -EOPNOTSUPP;" in derive
+    assert "error = ft_mc_port_copies(f, chosen[i]," in derive
+    assert "if (error) {\n\t\tmemset(port, 0, sizeof(port));\n\t\tports = 0;" in derive
     assert "if (f->error)\n\t\treturn false;" in function(source, "ft_mc_carriable")
+    # Down a stack, a copy ends at a physical port or a second bridge, whose
+    # every port must be physical; anything else refuses the flow.
+    copies = function(source, "ft_mc_port_copies")
+    assert "if (cdx_mc_port_identity(dev))\n\t\t\treturn ft_mc_copy(" in copies
+    assert copies.count("return -EOPNOTSUPP;") >= 3
+    second = function(source, "ft_mc_bridge_copies")
+    assert "br_multicast_list_ports(bridge, &group, NULL, NULL," in second
+    assert "if (!cdx_mc_port_identity(chosen[i]))\n\t\t\treturn -EOPNOTSUPP;" in second
 
     worker = function(source, "ft_mc_work_fn")
     pick = worker[:worker.index("target->stale = false;")]
@@ -555,10 +575,13 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     from _host_mroute_learner import (_assert_not_inside, _held_regions)
     source = flowtable_source()
     derive = function(source, "ft_mc_flow_derive")
+    # The bridge's own ports, each asked with what it is stacked on: the
+    # whole of a copy's way down to the wire, as the flow's own bridge port
+    # is asked with the port below it.
     for asked in ("ft_mc_soft_on(soft, f->in, true, &tc_soft, &nf_hooked);",
-                  "ft_mc_soft_on(soft, port[i].dev, false, &tc_soft, &nf_hooked);",
+                  "ft_mc_soft_on(soft, chosen[i], false, &tc_soft, &nf_hooked);",
                   "ft_mc_soft_on(soft, f->bridge, true, &tc_soft, &nf_hooked);",
-                  "ft_mc_netdev_dependent(f, port, ports, same)"):
+                  "ft_mc_netdev_dependent(f, chosen, n, same)"):
         assert asked in derive, asked
     # The bridge device only for a copy it hands up that a carried flow
     # takes away: a host that joined, or flooding, refuses the flow anyway.
@@ -568,8 +591,11 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     unchanged = derive[derive.index("if (same && error == f->error"):]
     unchanged = unchanged[:unchanged.index("return;")]
     assert "tc_soft == f->tc_soft" in unchanged and "nf_hooked == f->nf_hooked" in unchanged
+    # And what a stack decides: the MTU above a copy's port, and a second
+    # bridge whose changes are the flow's.
+    assert "out_mtu == f->out_mtu" in unchanged and "stacked == f->stacked" in unchanged
     assert "same = f->derived && ports == f->ports &&" in derive
-    assert derive.index("ft_mc_netdev_dependent(f, port, ports, same)") < \
+    assert derive.index("ft_mc_netdev_dependent(f, chosen, n, same)") < \
         derive.index("if (same && error == f->error")
     assert "f->tc_soft = tc_soft;" in derive and "f->nf_hooked = nf_hooked;" in derive
     # Refused for one reason or several at once: one refusal.

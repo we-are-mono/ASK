@@ -654,15 +654,81 @@ static bool ft_mc_host_joined(const struct net_device *bridge,
 	return false;
 }
 
-/* Whether two flows are the same classifier key: the key names the port, the
- * Ethernet pair and the address pair, and no VLAN. */
+/* Whether two flows are the same classifier key: the key names the physical
+ * port, the Ethernet pair and the address pair, and no VLAN -- neither the
+ * bridge's nor one a VLAN device below the bridge port strips. */
 bool ft_mc_same_key(const struct ft_mc_flow *a, const struct ft_mc_flow *b)
 {
-	return a->in && a->in == b->in && a->addr.proto == b->addr.proto &&
+	return a->in_port && a->in_port == b->in_port &&
+	       a->addr.proto == b->addr.proto &&
 	       !memcmp(&a->addr.dst, &b->addr.dst, sizeof(a->addr.dst)) &&
 	       !memcmp(&a->addr.src, &b->addr.src, sizeof(a->addr.src)) &&
 	       ether_addr_equal(a->src_mac, b->src_mac) &&
 	       ether_addr_equal(a->dst_mac, b->dst_mac);
+}
+
+/* The physical port a bridge port's frames arrive on, and the tags they carry
+ * there that the bridge never sees, outermost first.
+ *
+ * A bridge port can be a stack: OpenWrt bridges IPTV between the WAN port's
+ * VLAN device and the LAN bridge's. The receive path strips an 802.1Q
+ * device's tag and hands the frame to that device (vlan_do_receive()) before
+ * any rx handler of the port below runs, so the bridge above sees an untagged
+ * frame where the wire carried one more tag, and the entry is keyed on the
+ * port below with that tag for its root to validate and strip -- the one way
+ * the routed learner keys a VIF that is a VLAN device (ft_mr_ingress_port()).
+ *
+ * Nothing else is: a device of another kind, a tag in another protocol, more
+ * tags than a root validates, and a device below that is a bridge or a port
+ * of one -- a VLAN device on a bridge receives what that bridge forwarded,
+ * and one on another bridge's port is refused as the routed learner refuses
+ * it. NULL for those. Called with ft_mc_lock and a reference on `in`, and no
+ * RTNL: a VLAN device's lower device and tag are fixed for its lifetime. */
+static struct net_device *ft_mc_in_port(struct net_device *in,
+					struct cdx_ft_vlan *vlan, u8 *vlans)
+{
+	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX];
+	struct net_device *dev = in;
+	u8 n = 0, i;
+
+	while (!cdx_mc_port_identity(dev)) {
+		if (!is_vlan_dev(dev) || n == CDX_FT_VLAN_MAX ||
+		    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q))
+			return NULL;
+		inner[n].proto = vlan_dev_vlan_proto(dev);
+		inner[n].id = vlan_dev_vlan_id(dev);
+		n++;
+		dev = vlan_dev_priv(dev)->real_dev;
+		if (netif_is_bridge_master(dev) || netif_is_bridge_port(dev))
+			return NULL;
+	}
+	/* The walk met the innermost first; the wire carries the outermost. */
+	for (i = 0; i < n; i++)
+		vlan[i] = inner[n - 1 - i];
+	*vlans = n;
+	return dev;
+}
+
+/* A source something names arrived on a bridge port the hardware cannot key.
+ * It stays with the bridge, as everything outside the contract does, and is
+ * counted, as a source turned away at a bound is: once per frame the dedup
+ * slots let through, which is once until something is forgotten or lapses.
+ * The memberships naming it say so in their rows, which would otherwise read
+ * as waiting for a frame that has in fact arrived. Called with ft_mc_lock
+ * held. */
+static void ft_mc_in_refused(const struct net_device *bridge,
+			     const struct br_ip *key)
+{
+	struct ft_mc_group *g;
+
+	lockdep_assert_held(&ft_mc_lock);
+	ft_mc_refused++;
+	list_for_each_entry(g, &ft_mc_groups, list)
+		if (g->bridge == bridge && (g->ports || g->host) &&
+		    ft_mc_same_vlan_group(&g->addr, key) &&
+		    (!memchr_inv(&g->addr.src, 0, sizeof(g->addr.src)) ||
+		     !memcmp(&g->addr.src, &key->src, sizeof(key->src))))
+			g->in_refused = true;
 }
 
 /* Take what the hook observed: a frame of a flow already known, or the first
@@ -671,10 +737,12 @@ void ft_mc_observe(const struct ft_mc_seen *seen)
 {
 	bool counted = false, shared = false, o_capped = false;
 	unsigned int flows = 0, port_flows = 0, total = 0, rank, o_rank = 0;
-	struct net_device *bridge, *in;
+	struct cdx_ft_vlan in_vlan[CDX_FT_VLAN_MAX];
+	struct net_device *bridge, *in, *in_port;
 	struct ft_mc_seen other;
 	struct ft_mc_flow *f, *o;
 	struct br_ip key;
+	u8 in_vlans;
 
 	lockdep_assert_held(&ft_mc_lock);
 	ft_mc_seen_key(seen, &key);
@@ -746,7 +814,11 @@ void ft_mc_observe(const struct ft_mc_seen *seen)
 	in = dev_get_by_index(&init_net, seen->in_ifindex);
 	if (!in)
 		return;
-	if (!cdx_mc_port_identity(in)) {
+	/* The port and the tags the root keys and validates: the stack's, and
+	 * the bridge's own when the frame carries it. */
+	in_port = ft_mc_in_port(in, in_vlan, &in_vlans);
+	if (!in_port || in_vlans + seen->tagged > CDX_FT_VLAN_MAX) {
+		ft_mc_in_refused(bridge, &key);
 		dev_put(in);
 		return;
 	}
@@ -779,7 +851,7 @@ void ft_mc_observe(const struct ft_mc_seen *seen)
 
 		if (capped) {
 			total++;
-			port_flows += f->in == in;
+			port_flows += f->in_port == in_port;
 		}
 		if (f->gone || f->bridge != bridge ||
 		    !ft_mc_same_vlan_group(&f->addr, &key))
@@ -801,7 +873,7 @@ void ft_mc_observe(const struct ft_mc_seen *seen)
 		/* The new flow counts toward both bounds; the one giving way
 		 * made room in them only if it counted there itself. */
 		if (!o || shared || ft_mc_filtered ||
-		    ((o->in != in || !o_capped) &&
+		    ((o->in_port != in_port || !o_capped) &&
 		     port_flows >= FT_MC_MAX_PORT_FLOWS) ||
 		    (!o_capped && total >= FT_MC_MAX_TOTAL_FLOWS) ||
 		    ft_mc_host_joined(bridge, &key) ||
@@ -842,6 +914,12 @@ void ft_mc_observe(const struct ft_mc_seen *seen)
 	f->bridge = bridge;
 	f->addr = key;
 	f->in = in;
+	if (in_port != in)
+		dev_hold(in_port);
+	f->in_port = in_port;
+	memcpy(f->in_vlan, in_vlan, in_vlans * sizeof(in_vlan[0]));
+	f->in_vlans = in_vlans;
+	f->out_mtu = U32_MAX;
 	ether_addr_copy(f->dst_mac, seen->dst_mac);
 	ether_addr_copy(f->src_mac, seen->src_mac);
 	f->in_tagged = seen->tagged;

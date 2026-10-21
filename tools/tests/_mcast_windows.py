@@ -115,11 +115,13 @@ def summary(state: dict) -> dict:
 
 
 def stream(family: int, group: str, *, hops: int, source: str | None = None,
-           port: int = PORT) -> dict:
+           port: int = PORT, vlan: int = 0) -> dict:
     """One numbered stream, in the shape _mroute_capture.py decodes. `port` is
-    both UDP ports of its frames."""
+    both UDP ports of its frames; `vlan` the 802.1Q tag they carry on the WAN
+    wire, as an ISP's IPTV VLAN arrives, or none."""
     return {"family": family, "source": source or wan_source_address(family), "group": group,
-            "port": port, "count": COUNT, "token": uuid.uuid4().hex, "hops": hops}
+            "port": port, "count": COUNT, "token": uuid.uuid4().hex, "hops": hops,
+            "vlan": vlan}
 
 
 def stream_key(config: dict) -> str:
@@ -131,11 +133,14 @@ def stream_key(config: dict) -> str:
 
 
 def frames(config: dict) -> list:
-    from scapy.all import Ether, IP, IPv6, UDP, Raw
+    from scapy.all import Dot1Q, Ether, IP, IPv6, UDP, Raw
     # Explicit and above 1: no IP table is searched for TTL 0 or 1.
     layer = (IP(src=config["source"], dst=config["group"], ttl=64) if config["family"] == 4 else
              IPv6(src=config["source"], dst=config["group"], hlim=64))
-    return [Ether(dst=multicast_mac(config["group"]).hex(":")) / layer /
+    link = Ether(dst=multicast_mac(config["group"]).hex(":"))
+    if config.get("vlan"):
+        link = link / Dot1Q(vlan=config["vlan"])
+    return [link / layer /
             UDP(sport=config["port"], dport=config["port"]) / Raw(payload(config["token"], i))
             for i in range(config["count"])]
 
