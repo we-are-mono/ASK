@@ -734,7 +734,12 @@ serves Linux's deletion, one deferred because the transaction was held
 global invalidation, an SA or a VAP going, an offer that found the generation
 changed -- a binding's release and the unload drain: the count reaches the
 conntrack after the flow, its table and the binding are gone, and nothing is
-kept in the adapter for a deletion that may never reach it. A deletion's reply
+kept in the adapter for a deletion that may never reach it. The reference
+keeps only the conntrack's memory -- its table entry expires as before -- but
+that memory counts against `nf_conntrack_max` until the adapter's last put:
+one per entry or deferred deletion, so a burst of deletions behind a held
+transaction can hold up to the admission budget's worth of dead conntracks
+until the retirement worker's batches reach them. A deletion's reply
 carries nothing. The fold honours the counter mode the table had at
 Netfilter's last command about the flow, which is what lets it outlive the
 table. `/proc/cdx_flowtable` counts the non-empty last deltas as `finals`.
@@ -770,7 +775,14 @@ The residuals, each bounded:
   deletion the host-command round trip batched retirement exists to avoid.
 - **A conntrack killed first.** `conntrack -F` or a ctnetlink delete sends the
   conntrack's destroy event before its flow's direction leaves the hardware,
-  so the last delta reaches a counter nothing reads again.
+  so the last delta reaches a counter nothing reads again. So does a
+  conntrack that expires at once when its flow is torn down -- one never
+  answered, a TCP connection closing -- if the transaction was held and the
+  direction leaves with the next retirement batch instead.
+- **A new connection on an old tuple.** Until a deferred deletion's batch, the
+  old entry still forwards the tuple, so the first packets of a new connection
+  on it are counted to the old conntrack -- for as long as a deletion would
+  have waited for the transaction.
 - **A counter mode changed in place.** The last delta folds by the mode the
   table had at Netfilter's last command about the flow, at most one statistics
   period old, as a read's delta covers the period before it.

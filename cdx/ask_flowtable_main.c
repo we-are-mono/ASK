@@ -503,7 +503,9 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * they named, if anything was in hardware, to the retirement worker. */
 	seq_printf(seq, "destroy_deferrals %lld\n", atomic64_read(&ft_destroy_deferrals));
 	/* The non-empty last deltas directions reported through their flow's
-	 * handle as they left the hardware, for whatever reason they left. */
+	 * handle as they left the hardware, for whatever reason they left;
+	 * counted whether or not the table counts, which decides only whether
+	 * conntrack takes them. */
 	seq_printf(seq, "finals %llu\n", ft_finals);
 	seq_printf(seq, "ipsec_sas %u\nipsec_sa_cache %u\n",
 		   cdx_ipsec_sa_count(), cdx_ipsec_sa_cache_entries());

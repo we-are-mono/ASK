@@ -2630,10 +2630,10 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	 * than being taken for it. The entry forwards until that batch, as it
 	 * did while a deletion waited here for the transaction; what changes
 	 * is only that Linux, told the deletion is done, may release its flow
-	 * first -- the record's handle keeps the conntrack, so the batch still
+	 * first -- the entry's handle keeps the conntrack, so the batch still
 	 * reports what the entry counted -- and a new connection on the same
 	 * tuple meets the old entry until the batch, for no longer than the
-	 * wait was. */
+	 * wait was, its packets counted to the old conntrack meanwhile. */
 	if (cls->command == FLOW_CLS_DESTROY && !cdx_ft_trybegin()) {
 		ft_destroy_defer(binding, cls);
 		return 0;
