@@ -7,7 +7,9 @@
  * mode the table had at its last command about the flow, so the count reaches
  * the conntrack after the flow, its table and the driver's binding are gone
  * -- in full, since a pull every few seconds can exceed 32 bits on one flow.
- * A deletion's reply folds nothing, and unbinding a device tears none of its
+ * A reply the hardware counted, read or reported last, answered the
+ * connection, and marks its conntrack replied as the stack would have. A
+ * deletion's reply folds nothing, and unbinding a device tears none of its
  * flows down first. The work, the per-direction command, the handle and the
  * accounting entry point are compiled from the kernel; the drivers and the
  * conntrack are simulated. */
@@ -61,7 +63,19 @@ struct nf_conn { struct nf_conntrack ct_general; unsigned long status; struct nf
 static struct nf_conn_acct *nf_conn_acct_find(const struct nf_conn *ct) { return ct->acct; }
 static void nf_conntrack_get(struct nf_conntrack *nfct) { assert(nfct->use); nfct->use++; }
 static void nf_ct_put(struct nf_conn *ct) { assert(ct->ct_general.use); ct->ct_general.use--; }
+#define IPS_SEEN_REPLY_BIT 1
+#define IPS_DYING_BIT 9
 #define IPS_HW_OFFLOAD_BIT 15
+#define likely(x) (x)
+static bool nf_ct_is_dying(const struct nf_conn *ct) { return (ct->status >> IPS_DYING_BIT) & 1; }
+static bool test_and_set_bit(unsigned nr, unsigned long *addr)
+{ bool old = (*addr >> nr) & 1; *addr |= 1UL << nr; return old; }
+/* What conntrack's listeners hear: a reply event only for a conntrack already
+ * marked replied. */
+enum ip_conntrack_events { IPCT_REPLY = 3 };
+static unsigned reply_events;
+static int nf_conntrack_event(enum ip_conntrack_events event, struct nf_conn *ct)
+{ assert(event == IPCT_REPLY && ((ct->status >> IPS_SEEN_REPLY_BIT) & 1)); reply_events++; return 0; }
 
 enum flow_action_hw_stats { FLOW_ACTION_HW_STATS_DELAYED = 2 };
 struct flow_rule { int unused; };
@@ -233,6 +247,22 @@ int main(void)
     flow.tuplehash[0].tuple.iifidx = 3;
     flow.tuplehash[1].tuple.iifidx = 4;
 
+    /* A connection answered only in hardware has been answered all the same,
+     * as the stack would have seen: a read that counts a reply marks its
+     * conntrack replied and tells its listeners, once; one that counts the
+     * original direction alone does neither. */
+    report[0] = (struct flow_stats){ .pkts = 1, .bytes = 284 };
+    work.cmd = FLOW_CLS_STATS;
+    flow_offload_work_stats(&work);
+    assert(!test_bit(IPS_SEEN_REPLY_BIT, &ct.status) && !reply_events);
+    report[1] = (struct flow_stats){ .pkts = 1, .bytes = 60 };
+    flow_offload_work_stats(&work);
+    assert(test_bit(IPS_SEEN_REPLY_BIT, &ct.status) && reply_events == 1);
+    flow_offload_work_stats(&work);
+    assert(reply_events == 1);
+    acct = (struct nf_conn_acct){};
+    reads = 0;
+
     /* A counter read folds each direction's delta, as it always has. */
     report[0] = (struct flow_stats){ .pkts = 10, .bytes = 10 * 284 };
     report[1] = (struct flow_stats){ .pkts = 4, .bytes = 4 * 60 };
@@ -334,6 +364,34 @@ int main(void)
     flow.hw_handle = NULL;
     nf_flow_offload_handle_put(handle);
     assert(ct.ct_general.use == 1 && handles_freed == 2);
+
+    /* So does a direction's last delta, counted or not, and whatever the
+     * flow's state: a reply in it marks the conntrack replied and is
+     * reported once; an original alone, or a reply of no packets, does
+     * neither; and a conntrack already dying is left as it is. */
+    {
+        struct nf_conn_acct quiet = {};
+        struct nf_conn answered = { .ct_general.use = 1, .acct = &quiet };
+        struct nf_conn dying = { .ct_general.use = 1, .status = 1UL << IPS_DYING_BIT,
+                                 .acct = &quiet };
+        struct nf_flow_offload_handle *a = nf_flow_offload_handle_alloc(&table, &answered);
+        struct nf_flow_offload_handle *d = nf_flow_offload_handle_alloc(&table, &dying);
+
+        assert(!(table.flags & NF_FLOWTABLE_COUNTER));
+        reply_events = 0;
+        nf_flow_offload_handle_account(a, FLOW_OFFLOAD_DIR_ORIGINAL, 2, 200);
+        nf_flow_offload_handle_account(a, FLOW_OFFLOAD_DIR_REPLY, 0, 0);
+        assert(!test_bit(IPS_SEEN_REPLY_BIT, &answered.status) && !reply_events);
+        nf_flow_offload_handle_account(a, FLOW_OFFLOAD_DIR_REPLY, 1, 60);
+        assert(test_bit(IPS_SEEN_REPLY_BIT, &answered.status) && reply_events == 1);
+        nf_flow_offload_handle_account(a, FLOW_OFFLOAD_DIR_REPLY, 1, 60);
+        assert(reply_events == 1 && !packets(&answered, 1));
+        nf_flow_offload_handle_account(d, FLOW_OFFLOAD_DIR_REPLY, 1, 60);
+        assert(!test_bit(IPS_SEEN_REPLY_BIT, &dying.status) && reply_events == 1);
+        nf_flow_offload_handle_put(a);
+        nf_flow_offload_handle_put(d);
+        assert(answered.ct_general.use == 1 && dying.ct_general.use == 1 && handles_freed == 4);
+    }
 
     /* Unbinding a device tears none of its flows down first: a nft table's
      * deletion unbinds its devices while the chains that create flows still

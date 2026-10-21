@@ -94,7 +94,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://139-netfilter-nftables-commit-in-progress.patch \
            file://140-ask-flowtable-context.patch \
            file://141-ask-flowtable-teardown-attribution.patch \
-           file://142-ask-flowtable-teardown-handback-once.patch \
+           file://142-ask-flowtable-teardown-handback.patch \
            file://143-ask-flowtable-tunnel-path.patch \
            file://144-ask-flowtable-extend-ct-timeout.patch \
            file://146-xfrm-packet-offload-mixed-family-child-route.patch \
@@ -112,6 +112,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://172-br_netfilter-label-hooks-and-count-changes.patch \
            file://173-netfilter-nft_flow_offload-skip-br_netfilter-frames.patch \
            file://174-netfilter-flowtable-carry-transit-esp-and-ip-in-ip.patch \
+           file://175-netfilter-flowtable-conntrack-sees-carried-replies.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

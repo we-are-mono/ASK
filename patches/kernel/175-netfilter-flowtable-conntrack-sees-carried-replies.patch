@@ -1,0 +1,155 @@
+From c8fd78890dabf6ec70016dfeb9962530de03e96b Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Wed, 21 Oct 2026 14:22:58 +0200
+Subject: [PATCH] netfilter: flowtable: tell conntrack about the replies it
+ carries
+
+Conntrack marks a connection replied, IPS_SEEN_REPLY, when the first reply
+reaches it, and tells its listeners with IPCT_REPLY. The flowtable forwards a
+flow's replies around conntrack, in software and in hardware, from the moment
+the flow is added. A rule that offers a UDP flow in any state adds it at its
+second datagram, which can come before the first reply: from then on no reply
+reaches conntrack, and a connection answered thousands of times stays
+[UNREPLIED]. Its original-direction frames get IP_CT_NEW from the software
+path, no listener hears of the reply, and a teardown hands the conntrack back
+with UDP's unreplied timeout.
+
+Mark the conntrack replied, and report it, wherever a reply crosses the
+flowtable: every reply frame the software path forwards, and every reply
+count a driver hands back, through a statistics read or a direction's last
+delta. A dying conntrack is left alone, as its listeners have already heard
+the last of it. Replies the hardware counted since its last read arrive with
+the last delta, after a teardown has handed the conntrack back: it goes back
+with the unreplied timeout, which no longer has the flowtable's taken off a
+flow torn down live, and is marked as the delta arrives.
+
+act_ct does not need this: it keeps a UDP flow's replies in conntrack until
+the connection is assured, which takes a reply. The bpf flow lookup, built
+only with BTF, still forwards replies without it.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ include/net/netfilter/nf_flow_table.h |  5 ++++-
+ net/netfilter/nf_flow_table_core.c    | 30 ++++++++++++++++++++++++++-
+ net/netfilter/nf_flow_table_ip.c      | 10 ++++++---
+ net/netfilter/nf_flow_table_offload.c |  2 ++
+ 4 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+index c84168286d8e..f262416b5b8a 100644
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -323,10 +323,13 @@ void nf_flow_offload_handle_watch(struct nf_flow_offload_handle *handle);
+  * asked of it any more. The handle holds the conntrack, so the count reaches
+  * it after the flow, the table and the driver's binding are gone; the
+  * conntrack's table entry still expires as before, only its memory waits for
+- * the handle. */
++ * the handle. Reply packets in it mark the conntrack replied whether the
++ * table counts or not (nf_flow_ct_seen_reply()). */
+ void nf_flow_offload_handle_account(struct nf_flow_offload_handle *handle,
+ 				    enum flow_offload_tuple_dir dir,
+ 				    u64 packets, u64 bytes);
++/* The flowtable's own: what a reply it carried tells the conntrack. */
++void nf_flow_ct_seen_reply(struct nf_conn *ct);
+ /* Netfilter's own sampling of the counter mode; not for drivers. */
+ void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle,
+ 				     bool counter);
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index dcc215a0604b..bc6de7ac64a2 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -13,6 +13,7 @@
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#include <net/netfilter/nf_conntrack_ecache.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
+ 
+@@ -77,11 +78,38 @@ void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle,
+ 		WRITE_ONCE(handle->counter, counter);
+ }
+ 
++/* The stack marks a connection replied when the first reply reaches its
++ * conntrack, and tells conntrack's listeners so: nf_conntrack_in() does both.
++ * The flowtable forwards a flow's replies around the stack, in software and in
++ * hardware, from the moment the flow is added -- and a rule that offers a UDP
++ * flow in any state adds it at its second datagram, which may well come before
++ * the first reply -- so every reply it forwards, and every one a driver
++ * counts, does here what it would have done there. Without it a connection
++ * answered only around the stack stays unanswered to conntrack: its original
++ * frames read as a new connection's to whatever classifies them by their
++ * conntrack, no listener hears of the reply, and a teardown hands the
++ * conntrack back with the timeout of one that never got an answer. A dying
++ * conntrack is left as it is: its listeners have heard the last of it.
++ */
++void nf_flow_ct_seen_reply(struct nf_conn *ct)
++{
++	if (likely(test_bit(IPS_SEEN_REPLY_BIT, &ct->status)) ||
++	    nf_ct_is_dying(ct))
++		return;
++
++	if (!test_and_set_bit(IPS_SEEN_REPLY_BIT, &ct->status))
++		nf_conntrack_event(IPCT_REPLY, ct);
++}
++
+ void nf_flow_offload_handle_account(struct nf_flow_offload_handle *handle,
+ 				    enum flow_offload_tuple_dir dir,
+ 				    u64 packets, u64 bytes)
+ {
+-	if (handle && packets && READ_ONCE(handle->counter))
++	if (!handle || !packets)
++		return;
++	if (dir == FLOW_OFFLOAD_DIR_REPLY)
++		nf_flow_ct_seen_reply(handle->ct);
++	if (READ_ONCE(handle->counter))
+ 		nf_ct_acct_add(handle->ct, dir, packets, bytes);
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_offload_handle_account);
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index e2edd607afe7..47b521670e6c 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -297,7 +297,9 @@ static inline bool nf_flow_dst_check(const struct nf_flowtable *flowtable,
+  * drops it when it is freed. Nothing is counted: the flowtable accounts the
+  * frame itself, and no hook between here and the wire updates conntrack
+  * accounting. A conntrack the frame arrived with -- one it carried out of a
+- * tunnel, say -- describes some other connection and is dropped first.
++ * tunnel, say -- describes some other connection and is dropped first. A
++ * reply also marks the connection replied, as reaching the stack would have
++ * (nf_flow_ct_seen_reply()).
+  */
+ static void nf_flow_ct_set(struct sk_buff *skb, struct flow_offload *flow,
+ 			   enum flow_offload_tuple_dir dir)
+@@ -305,11 +307,13 @@ static void nf_flow_ct_set(struct sk_buff *skb, struct flow_offload *flow,
+ 	struct nf_conn *ct = flow->ct;
+ 	enum ip_conntrack_info ctinfo;
+ 
+-	if (dir == FLOW_OFFLOAD_DIR_ORIGINAL)
++	if (dir == FLOW_OFFLOAD_DIR_ORIGINAL) {
+ 		ctinfo = test_bit(IPS_SEEN_REPLY_BIT, &ct->status) ?
+ 			 IP_CT_ESTABLISHED : IP_CT_NEW;
+-	else
++	} else {
+ 		ctinfo = IP_CT_ESTABLISHED_REPLY;
++		nf_flow_ct_seen_reply(ct);
++	}
+ 
+ 	nf_reset_ct(skb);
+ 	nf_conntrack_get(&ct->ct_general);
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+index c58aad548e7a..c5b062333680 100644
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1149,6 +1149,8 @@ static void flow_offload_work_stats(struct flow_offload_work *offload)
+ 	offload->flow->timeout = max_t(u64, offload->flow->timeout,
+ 				       lastused + flow_offload_get_timeout(offload->flow));
+ 
++	if (stats[1].pkts)
++		nf_flow_ct_seen_reply(offload->flow->ct);
+ 	if (offload->flowtable->flags & NF_FLOWTABLE_COUNTER) {
+ 		if (stats[0].pkts)
+ 			nf_ct_acct_add(offload->flow->ct,
+-- 
+2.47.3
+

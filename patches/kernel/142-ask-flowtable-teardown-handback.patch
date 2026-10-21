@@ -1,0 +1,150 @@
+From f0f76e8a8d0eaa9bdef71fc46e430a23ec9ac984 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 19 Oct 2026 11:13:16 +0200
+Subject: [PATCH] netfilter: hand the conntrack back once per flow, with the
+ time it has left
+
+flow_offload_teardown() returns the conntrack to software every time it is
+called: it clears IPS_OFFLOAD and reinstates the short protocol timeout. The
+collector calls it on every pass while a flow waits for its hardware
+retirement, so a single stale flow does this once per second.
+
+A tuple reopened while its predecessor is still retiring leaves two flows
+pointing at one conntrack. The newer flow's admission re-takes IPS_OFFLOAD and
+restores NF_CT_DAY, and the older flow's next teardown takes both away again
+from the conntrack the live flow is now using. That conntrack cannot recover:
+gc_worker only refreshes conntracks carrying IPS_OFFLOAD, and the surviving
+flow is forwarded in hardware, so no packet reaches nft_flow_offload to set
+the bit again. It expires, and the collector then retires the live flow
+because its conntrack is dying.
+
+Guard the hand-back with the teardown bit so it happens once per flow.
+
+Measured on the sustained churn proof at 16384 offloaded connections. Before:
+82 conntracks reaped, 78 of them matching teardown/admit/teardown with the
+repeat landing 0.22-2.59s after the admission, and the proof failing on
+unrequested flow turnover. After: zero reaped and the proof passing, with
+flow retirements themselves unchanged at ~1200 per run. Only UDP was ever
+affected, because flow_offload_fixup_ct left established TCP 431880 seconds
+against UDP's 90.
+
+The hand-back also took the flowtable's own timeout off the conntrack's, on
+every teardown, as if every flow had sat idle that long; only one that
+expired had. A UDP conntrack that had seen no reply, torn down while its flow
+still carried traffic -- its table deleted, a port going down -- was handed
+back 30 - 30 = 0 seconds: it expired at once, the next datagram opened another
+connection, and everything counted on the first went with it. Take the
+flowtable's timeout off only for a flow that expired.
+
+Upstream fixes both defects: the first in d2d31ea8cd80 ("netfilter:
+conntrack: fix erronous removal of offload bit"), the second in fdbaf5163331
+("netfilter: flowtable: add CLOSING state"). Neither applies here.
+d2d31ea8cd80 repairs 03428ca5cee9 ("netfilter: conntrack: rework offload
+nf_conn timeout extension logic"), which this tree predates and which moved
+the IPS_OFFLOAD clear inside flow_offload_fixup_ct(); fdbaf5163331 brings a
+CLOSING state for TCP that this tree does not take. This is the same guard and
+the same expiry test applied to the older shape, so a kernel bump past
+d2d31ea8cd80 (6.15; fdbaf5163331 is in 6.14) drops this patch rather than
+conflicting.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ net/netfilter/nf_flow_table_core.c | 47 +++++++++++++++++++++++-------
+ 1 file changed, 36 insertions(+), 11 deletions(-)
+
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index d0fe2a530f07..9663f4811449 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -273,10 +273,17 @@ static void flow_offload_fixup_tcp(struct ip_ct_tcp *tcp)
+ 	tcp->seen[1].td_maxwin = 0;
+ }
+ 
+-static void flow_offload_fixup_ct(struct nf_conn *ct)
++static inline bool nf_flow_has_expired(const struct flow_offload *flow)
+ {
++	return nf_flow_timeout_delta(flow->timeout) <= 0;
++}
++
++static void flow_offload_fixup_ct(struct flow_offload *flow)
++{
++	struct nf_conn *ct = flow->ct;
+ 	struct net *net = nf_ct_net(ct);
+ 	int l4num = nf_ct_protonum(ct);
++	u32 offload_timeout = 0;
+ 	s32 timeout;
+ 
+ 	if (l4num == IPPROTO_TCP) {
+@@ -285,7 +292,7 @@ static void flow_offload_fixup_ct(struct nf_conn *ct)
+ 		flow_offload_fixup_tcp(&ct->proto.tcp);
+ 
+ 		timeout = tn->timeouts[ct->proto.tcp.state];
+-		timeout -= tn->offload_timeout;
++		offload_timeout = tn->offload_timeout;
+ 	} else if (l4num == IPPROTO_UDP) {
+ 		struct nf_udp_net *tn = nf_udp_pernet(net);
+ 		enum udp_conntrack state =
+@@ -293,11 +300,25 @@ static void flow_offload_fixup_ct(struct nf_conn *ct)
+ 			UDP_CT_REPLIED : UDP_CT_UNREPLIED;
+ 
+ 		timeout = tn->timeouts[state];
+-		timeout -= tn->offload_timeout;
++		offload_timeout = tn->offload_timeout;
+ 	} else {
+ 		return;
+ 	}
+ 
++	/* A flow that expired sat idle for the flowtable's timeout, which
++	 * conntrack would have counted down from its own: the conntrack gets
++	 * back what is left of that. One torn down while it still carried
++	 * traffic -- its table deleted, a port going down, a route changing --
++	 * was not idle, and gets its protocol's timeout whole, as a packet in
++	 * the stack would have given it. Taking the flowtable's timeout off
++	 * that too would leave UDP that has not been answered none at all: its
++	 * conntrack would expire the moment it was handed back, and the next
++	 * datagram would start another, with new counters and perhaps a new
++	 * translation.
++	 */
++	if (nf_flow_has_expired(flow))
++		timeout -= offload_timeout;
++
+ 	if (timeout < 0)
+ 		timeout = 0;
+ 
+@@ -448,11 +469,6 @@ void flow_offload_refresh(struct nf_flowtable *flow_table,
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_refresh);
+ 
+-static inline bool nf_flow_has_expired(const struct flow_offload *flow)
+-{
+-	return nf_flow_timeout_delta(flow->timeout) <= 0;
+-}
+-
+ static void flow_offload_del(struct nf_flowtable *flow_table,
+ 			     struct flow_offload *flow)
+ {
+@@ -467,9 +483,18 @@ static void flow_offload_del(struct nf_flowtable *flow_table,
+ 
+ void flow_offload_teardown(struct flow_offload *flow)
+ {
+-	clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
+-	set_bit(NF_FLOW_TEARDOWN, &flow->flags);
+-	flow_offload_fixup_ct(flow->ct);
++	/* Hand the conntrack back only on the first teardown of this flow. The
++	 * collector calls this again on every pass while the flow waits for its
++	 * hardware retirement, and a tuple reopened in the meantime has already
++	 * given the conntrack to a new flow, which the repeat would rob of the
++	 * only refresh it can get: gc_worker skips conntracks without
++	 * IPS_OFFLOAD, and the new flow is forwarded in hardware, so no packet
++	 * reaches the software path to set the bit again.
++	 */
++	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
++		clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
++		flow_offload_fixup_ct(flow);
++	}
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 
+-- 
+2.47.3
+

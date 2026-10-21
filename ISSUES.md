@@ -152,17 +152,22 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A408 — a UDP flow whose replies only ever crossed in hardware loses its conntrack at teardown.** Netfilter
-  offloads UDP on the first datagram after its conntrack is confirmed, so a flow whose first reply is lost (on the rig:
-  one of the first flows of a 1,000-flow burst on the KASAN image) can be in hardware before any reply reaches
-  software. Hardware stats and final deltas count its replies but never set `IPS_SEEN_REPLY`, and at any teardown
-  `flow_offload_fixup_ct()` gives an unreplied UDP conntrack `nf_conntrack_udp_timeout` (30 s) minus
-  `nf_flowtable_udp_timeout` (30 s): zero. Measured at `ip link set eth3 down`: an `[UNREPLIED]` conntrack holding 17
-  original and 14 reply packets destroyed by timeout, and a new one created 1.6 ms later by the next datagram. Its
-  counts were lost, and a masqueraded flow would lose its NAT mapping as well. Fix direction: mark the conntrack replied
-  when hardware reports reply-direction packets (patch 140, the stats fold and `nf_flow_offload_handle_account()`), as
-  `nf_conntrack_in()` does for a software reply; check UDP's stream/ASSURED handling and the IPCT_REPLY event.
-  `flowtable_burst_accounting.py` answers each flow's first datagram through software before streaming, to stay clear.
+- [ ] **A409 — an offloaded UDP conntrack is never ASSURED, so a full conntrack table evicts it first.** UDP becomes
+  ASSURED only from a packet conntrack sees 2 s after the connection opened (`nf_conntrack_udp_packet()`), and the
+  flowtable takes a UDP flow at its first established original datagram, normally well inside that: from then on
+  conntrack sees none of its packets, so it stays unassured for as long as it is offloaded (`conntrack -L` shows
+  `[HW_OFFLOAD]` without `[ASSURED]` on the rig; a teardown's stack packets assure it). Mainline lets both early-drop
+  paths evict unassured offloaded UDP on purpose ("netfilter: nf_conntrack: allow early drop of offloaded UDP conns",
+  aimed at act_ct, which keeps a UDP flow in software until it is assured): `early_drop_list()` and
+  `gc_worker_can_early_drop()` in `nf_conntrack_core.c` check `IPS_ASSURED` only. So once the table nears
+  `nf_conntrack_max` (a scan, a P2P client), every long-lived offloaded UDP stream on the box -- a VPN, a call, a game
+  -- is a candidate ahead of every software one, and an eviction tears its flow down and opens a new conntrack. Fix
+  direction: assure the conntrack where the flowtable carries the flow, as `nf_conntrack_udp_packet()` would have: a
+  carried packet of a replied connection past its `stream_ts` (patch 175's `nf_flow_ct_seen_reply()` sites, plus the
+  original direction); then test eviction with a full table on the rig.
+
+- [x] **A408 — a UDP conntrack whose replies only crossed outside it expired at a live teardown.** Carried replies now
+  mark it replied, and a live teardown keeps the full timeout (_:/^netfilter: hand back a carried UDP flow's conntrack_).
 
 - [x] **A407 — a burst of deletions dropped most flows' last delta.** Every unlink now reports it through the flow's
   handle, which holds the conntrack; the unbind sweep that recreated flows in a deleted table is gone (_:/^netfilter, cdx: report a hardware flow's last delta through its handle_).

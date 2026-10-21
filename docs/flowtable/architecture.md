@@ -781,6 +781,15 @@ carries nothing. The fold honours the counter mode the table had at
 Netfilter's last command about the flow, which is what lets it outlive the
 table. `/proc/cdx_flowtable` counts the non-empty last deltas as `finals`.
 
+Reply packets in a last delta mark the conntrack replied whatever the counter
+mode, as they do in a statistics read and as every reply the software fast path
+forwards does (patch 175): conntrack sees none of them, and a connection
+answered only around it -- a UDP flow a table offered at its second datagram,
+before the first reply came -- would otherwise stay unreplied. A teardown then
+hands the conntrack back with its state's whole timeout, less the flowtable's
+own only if the flow expired idle (patch 142), so a flow torn down live goes on
+in the same connection.
+
 Deleting a table needs nothing more, and must not tear its flows down before
 the unbind. nftables unbinds a deleted table's devices while its chains still
 run -- `nft_flush_table()` queues the flowtable's deletion ahead of its

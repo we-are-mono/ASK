@@ -7,7 +7,10 @@
  * untracked frame. The forward step is compiled from the kernel source; what it
  * calls is simulated, down to the conntrack's reference count, so a leaked or
  * missing reference, a frame given a conntrack on a path that returns it to
- * the stack, or a second accounting update fails here.
+ * the stack, or a second accounting update fails here. A reply forwarded here
+ * never reaches conntrack, so the forward step marks the connection replied
+ * itself; without that, a connection answered only through the flowtable
+ * stays unanswered to conntrack.
  */
 #include <assert.h>
 #include <stdbool.h>
@@ -108,6 +111,16 @@ static void ipv6_set_hop_limit(struct sk_buff *skb, struct ipv6hdr *hdr, u8 hop_
 static void skb_clear_tstamp(struct sk_buff *skb) { }
 static void nf_ct_acct_update(struct nf_conn *ct, u32 dir, unsigned int bytes)
 { accounted++; ct->acct_packets[dir]++; ct->acct_bytes[dir] += bytes; }
+/* What a carried reply tells the conntrack, as the flowtable's core does it:
+ * it is marked replied, once. */
+static unsigned marked;
+static void __attribute__((unused)) nf_flow_ct_seen_reply(struct nf_conn *ct)
+{
+    if (!test_bit(IPS_SEEN_REPLY_BIT, &ct->status)) {
+        ct->status |= 1UL << IPS_SEEN_REPLY_BIT;
+        marked++;
+    }
+}
 
 #include "flowtable_ct_production.inc"
 
@@ -164,7 +177,29 @@ static void family(forward_fn fn)
     assert(forward(fn, &table, &flow, FLOW_OFFLOAD_DIR_ORIGINAL, &skb) == 1);
     assert((skb._nfct & 7) == IP_CT_NEW);
     nf_reset_ct(&skb);
-    ct.status = 1UL << IPS_SEEN_REPLY_BIT;
+
+    /* A reply sent back to the stack is the stack's to see; one carried
+     * here answers the connection as the stack would have seen it do, so
+     * the conntrack is marked replied and the original direction's next
+     * frame is an established connection's. */
+    unsigned counted = accounted, rewrites = rewritten;
+    marked = 0;
+    too_big = true;
+    assert(forward(fn, &table, &flow, FLOW_OFFLOAD_DIR_REPLY, &skb) == 0);
+    too_big = false;
+    assert(!skb._nfct && !test_bit(IPS_SEEN_REPLY_BIT, &ct.status) && !marked);
+    assert(forward(fn, &table, &flow, FLOW_OFFLOAD_DIR_REPLY, &skb) == 1);
+    assert((skb._nfct & 7) == IP_CT_ESTABLISHED_REPLY);
+    assert(test_bit(IPS_SEEN_REPLY_BIT, &ct.status) && marked == 1);
+    nf_reset_ct(&skb);
+    assert(forward(fn, &table, &flow, FLOW_OFFLOAD_DIR_ORIGINAL, &skb) == 1);
+    assert((skb._nfct & 7) == IP_CT_ESTABLISHED);
+    nf_reset_ct(&skb);
+    assert(forward(fn, &table, &flow, FLOW_OFFLOAD_DIR_REPLY, &skb) == 1);
+    assert(marked == 1);
+    nf_reset_ct(&skb);
+    accounted = counted;
+    rewritten = rewrites;
 
     /* A frame that arrived with a conntrack of its own gives it back: it
      * describes some other connection. */

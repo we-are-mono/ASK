@@ -5,6 +5,7 @@ import asyncio
 import json
 import re
 import struct
+from collections import defaultdict
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_rig import (DPORT, TABLE, WAN_IP, command)
@@ -18,17 +19,24 @@ PORT = DPORT + 11
 
 class FlowEcho(asyncio.DatagramProtocol):
     """The WAN end of every flow, counting what it answers by the flow the
-    payload names rather than by source port, which NAT may remap."""
+    payload names rather than by source port, which NAT may remap, and noting
+    the ports each flow arrived from. A flow in `silent` is not answered until
+    its datagram of that sequence number."""
 
     def __init__(self):
         self.echoed = [0] * FLOWS
+        self.silent = {}
+        self.ports = defaultdict(set)
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        flow, _ = struct.unpack_from("!HI", data)
+        flow, seq = struct.unpack_from("!HI", data)
         if flow < len(self.echoed):
+            self.ports[flow].add(addr[1])
+            if seq < self.silent.get(flow, 0):
+                return
             self.echoed[flow] += 1
         self.transport.sendto(data, addr)
 
@@ -65,23 +73,6 @@ def send(i):
         sent[i] += 1
     except BlockingIOError:
         pass
-# Each flow's first datagram answered before its second is sent, a hundred at
-# a time: the second is what offloads the flow, and a conntrack whose replies
-# only ever cross in hardware is never marked replied and dies at teardown
-# with its counts (A408).
-cold = set(range(FLOWS))
-for attempt in range(3):
-    batch = sorted(cold)
-    for n in range(0, len(batch), 100):
-        for i in batch[n:n + 100]:
-            send(i)
-        drain(0.02)
-    end = time.monotonic() + 1
-    while time.monotonic() < end and any(received[i] == 0 for i in cold):
-        drain(0.05)
-    cold = {{i for i in cold if received[i] == 0}}
-    if not cold:
-        break
 start, tick = time.monotonic(), 0
 while time.monotonic() - start < SECONDS:
     for i in range(FLOWS):
@@ -95,7 +86,7 @@ while time.monotonic() - start < SECONDS:
 end = time.monotonic() + 2
 while time.monotonic() < end:
     drain(0.2)
-print(json.dumps({{"sent": sent, "received": received, "cold": sorted(cold)}}))
+print(json.dumps({{"sent": sent, "received": received}}))
 '''
 
 
@@ -112,13 +103,20 @@ async def conntrack(r, base, flows):
     return counts
 
 
-async def unreplied(r, base, flows):
-    """The flows whose conntrack has seen no reply, by index."""
-    listing = await command(r.target, r.session, "conntrack", "-L", "-p", "udp",
+async def connections(r, base, flows):
+    """Each flow's conntrack by index: its id, whether it has seen a reply,
+    its flags, and the port its replies are addressed to."""
+    listing = await command(r.target, r.session, "conntrack", "-L", "-p", "udp", "-o", "id",
                             "--orig-src", r.lan_ip, "--orig-dst", WAN_IP, "--dport", str(PORT))
-    return sorted(int(sport) - base for sport in re.findall(
-        rf"sport=(\d+) dport={PORT} packets=\d+ bytes=\d+ \[UNREPLIED\]", listing["stdout"])
-        if base <= int(sport) < base + flows)
+    found = {}
+    for line in listing["stdout"].splitlines():
+        match = re.search(rf"sport=(\d+) dport={PORT} packets=\d+ bytes=\d+ (\[UNREPLIED\] )?"
+                          rf"src=\S+ dst=\S+ sport={PORT} dport=(\d+) .*?id=(\d+)", line)
+        if match and base <= int(match[1]) < base + flows:
+            found[int(match[1]) - base] = {
+                "id": int(match[4]), "replied": not match[2], "port": int(match[3]),
+                "flags": re.findall(r"\[(\w+)\]", line)}
+    return found
 
 
 async def settled(r, base, flows, quiet=4.5):
@@ -146,31 +144,31 @@ def table(r, base, flows):
 }}'''
 
 
-async def burst(r, echo, base, label, retire, flows=FLOWS, rate=RATE):
+async def burst(r, echo, base, label, retire, flows=FLOWS, rate=RATE, offered=None):
     """Stream every flow through the hardware, call `retire` mid-stream, and
     check each flow's conntrack against what crossed it. A reply was counted
     no fewer times than the LAN end got one and no more than the WAN end sent
     one; an original no fewer times than the WAN end answered one and no more
     than the LAN end sent one. A last delta lost at teardown leaves a count
-    short; one reported twice leaves it over."""
+    short; one reported twice leaves it over. `offered`, if given, runs as
+    the stream starts."""
     await forget(r)
     echo.echoed = [0] * flows
+    echo.ports.clear()
     await r.nft(table(r, base, flows))
     before = await r.wait(lambda s: s["bindings"] == 2)
     peer = asyncio.create_task(lan_run_python(r.lan, stream(r.lan_ip, base, flows, rate),
                                               label=label, timeout=SECONDS + 30))
     try:
+        if offered:
+            await offered()
         admitted = await r.wait(lambda s: s["entries"] == 2 * flows, timeout=SECONDS / 2)
         await asyncio.sleep(2)  # hardware counting, a stats pass or so behind
-        # No conntrack the teardown would expire with its counts (A408).
-        cold = await unreplied(r, base, flows)
-        assert not cold, ("offloaded before any reply reached conntrack", cold)
         await retire()
     finally:
         result = await peer
     assert result.rc == 0, result.stdout
     report = json.loads(result.stdout.strip().splitlines()[-1])
-    assert not report["cold"], ("first datagram never answered", report["cold"])
     counts = await settled(r, base, flows)
     after = await r.state()
     wrong = {i: {"ct": counts.get(i), "sent": report["sent"][i], "echoed": echo.echoed[i],
@@ -184,6 +182,20 @@ async def burst(r, echo, base, label, retire, flows=FLOWS, rate=RATE):
     assert after["errors"] == before["errors"], (before, after)
     assert not wrong, (len(wrong), dict(list(wrong.items())[:8]))
     return counts
+
+
+async def port_stop(r):
+    """The LAN port down for a second, and up again."""
+    await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "down")
+    try:
+        await asyncio.sleep(1)
+    finally:
+        # Going down takes the fixture's host route and neighbour.
+        await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "up")
+        await command(r.target, r.session, "ip", "route", "replace", f"{r.lan_ip}/32",
+                      "dev", TARGET_LAN_IF)
+        await command(r.target, r.session, "ip", "neigh", "replace", r.lan_ip, "lladdr",
+                      r.lan_mac, "nud", "permanent", "dev", TARGET_LAN_IF)
 
 
 async def test_burst_teardown_accounting(rig):
@@ -236,23 +248,88 @@ async def test_port_stop_accounting(rig):
     nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", "udp", "--dport", str(PORT), "-j", "ACCEPT"]
     await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
     try:
-        async def stop():
-            await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "down")
-            try:
-                await asyncio.sleep(1)
-            finally:
-                # Going down takes the fixture's host route and neighbour.
-                await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "up")
-                await command(r.target, r.session, "ip", "route", "replace", f"{r.lan_ip}/32",
-                              "dev", TARGET_LAN_IF)
-                await command(r.target, r.session, "ip", "neigh", "replace", r.lan_ip, "lladdr",
-                              r.lan_mac, "nud", "permanent", "dev", TARGET_LAN_IF)
-
         try:
             # Below the LAN end's ephemeral ports, which a thousand might meet.
-            await burst(r, echo, 21000, "burst-port-stop", stop, flows=1000, rate=4)
+            await burst(r, echo, 21000, "burst-port-stop", lambda: port_stop(r), flows=1000, rate=4)
         finally:
             await r.delete_table(timeout=30)
+    finally:
+        transport.close()
+        await command(r.target, r.session, "iptables", "-t", "nat", "-D", *nat, check=False)
+        await forget(r)
+
+
+async def test_unanswered_flows_keep_their_conntrack(rig):
+    """Half the flows go unanswered for their first three seconds, so the
+    flowtable, which takes a UDP flow at its second datagram, has each of
+    them before any reply has reached its conntrack, and carries every reply
+    that follows itself. Conntrack still learns of those replies and marks
+    each connection replied, as it would have from the stack; so a teardown
+    that hands the conntracks straight back -- the table deleted, the LAN
+    port stopped -- hands each back alive, translated as it was and with
+    every datagram counted, and each flow goes on in the connection it
+    started in. Two more are never answered: a teardown hands theirs back
+    unreplied, and alive for as long as conntrack keeps an unanswered one --
+    the flowtable's own timeout comes off only a flow that expired idle."""
+    r = rig
+    flows, mute = 22, (20, 21)
+    loop = asyncio.get_running_loop()
+    transport, echo = await loop.create_datagram_endpoint(FlowEcho, local_addr=(WAN_IP, PORT))
+    nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", "udp", "--dport", str(PORT),
+           "-j", "MASQUERADE"]
+    await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
+    try:
+        async def delete():
+            await r.delete_table(timeout=30)
+
+        for base, label, teardown in ((22100, "unanswered-delete", delete),
+                                      (22200, "unanswered-port-stop", lambda: port_stop(r))):
+            echo.silent = {i: 3 * RATE for i in range(0, 20, 2)}
+            echo.silent.update({i: SECONDS * RATE * 2 for i in mute})
+            seen = {}
+
+            async def offered():
+                # Every silent flow in the flowtable while still unanswered.
+                deadline = loop.time() + SECONDS / 2
+                while loop.time() < deadline:
+                    seen["offered"] = await connections(r, base, flows)
+                    if all({"OFFLOAD", "HW_OFFLOAD"} & set(seen["offered"].get(i, {}).get("flags", ()))
+                           for i in echo.silent):
+                        break
+                    await asyncio.sleep(0.05)
+                assert not [i for i in echo.silent if seen["offered"].get(i, {}).get("replied", True)], \
+                    ("a silent flow was not offered unanswered", seen["offered"])
+
+            async def retire():
+                # Every flow answered for a second, through the flowtable
+                # alone, and every conntrack marked replied once a stats pass
+                # or two has brought the hardware's counts in.
+                deadline = loop.time() + SECONDS / 2
+                while loop.time() < deadline:
+                    seen["answered"] = await connections(r, base, flows)
+                    if min(echo.echoed[i] for i in echo.silent if i not in mute) >= RATE and \
+                            all(c["replied"] for i, c in seen["answered"].items() if i not in mute):
+                        break
+                    await asyncio.sleep(0.2)
+                await teardown()
+
+            try:
+                await burst(r, echo, base, label, retire, flows=flows, offered=offered)
+                seen["after"] = await connections(r, base, flows)
+            finally:
+                r.record(f"{label}-connections",
+                         {**seen, "ports": {i: sorted(p) for i, p in echo.ports.items()}})
+                await r.delete_table(timeout=30)
+            unreplied = [i for i in range(flows) if i not in mute and
+                         not seen["answered"].get(i, {}).get("replied")]
+            assert not unreplied, ("answered, yet never marked replied", label, unreplied)
+            replied = [i for i in mute if seen["after"].get(i, {}).get("replied", True)]
+            assert not replied, ("never answered, yet marked replied", label, replied)
+            moved = {(i, k): (seen["answered"].get(i, {}).get(k), seen["after"].get(i, {}).get(k))
+                     for i in range(flows) for k in ("id", "port")
+                     if seen["answered"].get(i, {}).get(k) != seen["after"].get(i, {}).get(k)}
+            assert not moved, ("a teardown replaced a flow's conntrack", label, moved)
+            assert all(len(echo.ports[i]) == 1 for i in range(flows)), (label, dict(echo.ports))
     finally:
         transport.close()
         await command(r.target, r.session, "iptables", "-t", "nat", "-D", *nat, check=False)

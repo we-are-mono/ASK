@@ -141,6 +141,16 @@ static void nf_ct_refresh(struct nf_conn *ct, const void *skb, unsigned extra)
  * tearing down: that one's timeout was just handed back to conntrack. */
 static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct) { assert(ct->refs); extensions++; }
 static bool nf_ct_is_dying(struct nf_conn *ct) { return ct->dying; }
+/* What a reply the flowtable carried tells the conntrack: its replied bit,
+ * and one event for its listeners. */
+#define IPS_SEEN_REPLY_BIT 1
+#define likely(v) (v)
+static bool __attribute__((unused)) test_and_set_bit(unsigned bit, unsigned long *p)
+{ bool old = (*p >> bit) & 1; *p |= 1UL << bit; return old; }
+enum ip_conntrack_events { IPCT_REPLY = 3 };
+static unsigned reply_events;
+static int __attribute__((unused)) nf_conntrack_event(enum ip_conntrack_events event, struct nf_conn *ct)
+{ assert(event == IPCT_REPLY && test_bit(IPS_SEEN_REPLY_BIT, &ct->status)); return ++reply_events; }
 static void nf_ct_put(struct nf_conn *ct) { assert(ct->refs); ct->refs--; }
 static bool nf_flowtable_hw_offload(struct nf_flowtable *table) { return table->hardware; }
 /* The replace work nf_flow_offload_add() queues, counted as an offer. */
@@ -257,10 +267,13 @@ int main(void)
     assert(old->refs == 2 && ct.refs == 2 && extensions == 1);
     /* The flow's conntrack reference goes after the grace period; the
      * retained handle's stays, so what its driver reports after the flow
-     * reaches the conntrack. */
+     * reaches the conntrack -- and a reply in it marks the conntrack
+     * replied, as it would have marked it before the flow went. */
     grace_period(); assert(allocations == 1 && ct.refs == 1);
+    assert(!test_bit(IPS_SEEN_REPLY_BIT, &ct.status));
     nf_flow_offload_handle_account(old, FLOW_OFFLOAD_DIR_REPLY, 3, 300);
     assert(acct_packets[1] == 3 && acct_bytes[1] == 300 && !acct_packets[0]);
+    assert(test_bit(IPS_SEEN_REPLY_BIT, &ct.status) && reply_events == 1);
 
     /* A retained old handle owns no Linux flow or route, only its conntrack.
      * Reusing the tuple cannot turn a delayed invalidation into an operation

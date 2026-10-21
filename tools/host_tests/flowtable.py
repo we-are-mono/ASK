@@ -196,7 +196,8 @@ def test_teardown_stats(tmp_path):
     """The flow's hardware handle, compiled from the kernel, holds its
     conntrack and folds what a driver reports through it, in 64 bits and as
     the table counted at its last command about the flow, after the flow is
-    gone; the delete work folds nothing from its reply, every command names
+    gone; a reply counted, by a read or as a last delta, marks the conntrack
+    replied; the delete work folds nothing from its reply, every command names
     its direction, and an unbind sweeps none of the device's flows."""
     kernel = kernel_source()
     flowtable = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
@@ -239,6 +240,48 @@ def test_teardown_stats(tmp_path):
         "-Wno-unused-parameter", "-Wno-unused-function",
         "-Werror", "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable_teardown_stats.c")), "-o", str(binary),
+    ], check=True)
+    run_process([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+
+
+def test_teardown_hands_back_the_timeout(tmp_path):
+    """A flow's teardown, compiled from the kernel, hands its conntrack back
+    once, with its protocol's timeout for the state it is in: whole for a
+    flow torn down while it still carried traffic, and less the flowtable's
+    own timeout only for one that expired idle. An unanswered UDP conntrack
+    handed back live does not expire on the spot."""
+    kernel = kernel_source()
+    core = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
+    table = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
+    netns = (kernel / "include/net/netns/conntrack.h").read_text()
+    common = (kernel / "include/uapi/linux/netfilter/nf_conntrack_common.h").read_text()
+    tcp = (kernel / "include/uapi/linux/netfilter/nf_conntrack_tcp.h").read_text()
+
+    def declaration(source, start):
+        return re.search(r"^" + re.escape(start) + r".*?^\};\n", source, re.M | re.S).group()
+
+    (tmp_path / "teardown_ct_types.inc").write_text(
+        declaration(common, "enum ip_conntrack_status {")
+        + declaration(tcp, "enum tcp_conntrack {")
+        + "".join(declaration(netns, start) for start in (
+            "struct nf_generic_net {", "struct nf_tcp_net {", "enum udp_conntrack {",
+            "struct nf_udp_net {"))
+        + declaration(table, "enum nf_flow_flags {"))
+    (tmp_path / "teardown_ct_production.inc").write_text(
+        function(table, "nf_flow_timeout_delta")
+        + function(core, "nf_flow_has_expired")
+        + function(core, "flow_offload_fixup_tcp")
+        + function(core, "flow_offload_fixup_ct")
+        + function(core, "flow_offload_teardown"))
+    binary = tmp_path / "flowtable_teardown_ct"
+    run_process([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
+        "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
+        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("flowtable_teardown_ct.c")), "-o", str(binary),
     ], check=True)
     run_process([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
@@ -297,7 +340,8 @@ def test_qos_flow_class(tmp_path):
 def test_software_path_carries_the_conntrack(tmp_path):
     """The software flowtable's forward step, compiled from the kernel, hands
     every frame it forwards its flow's conntrack with a reference of its own,
-    and none to a frame it gives back to the stack."""
+    and none to a frame it gives back to the stack; a reply it forwards marks
+    the conntrack replied, as the stack would have."""
     kernel = kernel_source()
     source = (kernel / "net/netfilter/nf_flow_table_ip.c").read_text()
     uapi = (kernel / "include/uapi/linux/netfilter/nf_conntrack_common.h").read_text()
