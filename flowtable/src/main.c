@@ -124,10 +124,8 @@ static bool same_devices(const struct ft_devices *installed, const struct ft_pol
 
 /* Bring a healthy owned table's flowtable to the ports "devices auto" now
  * resolves to, in place. The policy is unchanged, so nothing is drained: the
- * devices that stay keep their bindings, and their hardware flows but those
- * that also cross a device the update deletes, which Netfilter tears down
- * before unbinding it; the adapter binds or unbinds only the devices named in
- * the update. Verified as
+ * devices that stay keep their bindings and their hardware flows, and the
+ * adapter binds or unbinds only the devices named in the update. Verified as
  * strictly as a replacement. Returns 0, or -1 (ctx->err) for the caller to
  * fall back to the full transaction. */
 static int follow_devices(struct ft_ctx *ctx, const struct ft_policy *p,

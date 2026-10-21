@@ -1093,12 +1093,11 @@ static LIST_HEAD(ft_neigh_entries);
  * retirement took. */
 static unsigned unlinks_owed, settles;
 static void cdx_ft_assert_held(void) { assert(ft_transaction); }
-/* The last delta a retirement reads off the entry; a walk holds it for
- * Linux's deletion, which is flowtable.c's to prove. */
-struct ft_delta;
-static int ft_unlink(struct cdx_ft_entry *e, struct ft_delta *final)
+/* The last delta a retirement reads off the entry and reports through the
+ * flow's handle, which is flowtable.c's to prove. */
+static int ft_unlink(struct cdx_ft_entry *e)
 {
-	assert(ft_transaction && retirement_flows && !final);
+	assert(ft_transaction && retirement_flows);
 	retirement_flows--;
 	unlinks_owed++;
 	list_del(&e->list);

@@ -722,23 +722,31 @@ any PPPoE session header. `ft_l2_overhead()` subtracts exactly that stack, taken
 from the direction's own ingress framing, and saturates at zero rather than
 wrapping when a delta cannot carry it.
 
-A flow's last delta goes with its teardown. Linux's deletion (patch 140) reads
-stats back from `FLOW_CLS_DESTROY` as from `FLOW_CLS_STATS` and folds them into
-the conntrack the same way -- in 64 bits, since a read every few seconds
-exceeds 32 bits on one flow above eight gigabits per second -- and the adapter
-answers it with what the entry counted since its last report, which the
-backend reads once the entry's pieces are unlinked (`cdx_ft_unlink()`'s
-`final`). A retirement the adapter starts itself -- a dependency change, a
+A flow's last delta goes with the direction, whatever takes it out of the
+hardware. Every entry holds the flow's handle, and the handle (patch 140) holds
+the flow's conntrack: `ft_unlink()` reads what the entry counted since its last
+report once the backend has unlinked its pieces (`cdx_ft_unlink()`'s `final`)
+and reports it through `nf_flow_offload_handle_account()` into the direction
+Netfilter named at admission (`nf_dir`), in 64 bits -- a read every few seconds
+exceeds 32 bits on one flow above eight gigabits per second. That one path
+serves Linux's deletion, one deferred because the transaction was held
+(A327), a retirement the adapter starts itself -- a dependency change, a
 global invalidation, an SA or a VAP going, an offer that found the generation
-changed -- reads the entry the same way and holds the delta, keyed by binding,
-cookie and the generation's handle (`struct ft_final`), for the deletion Linux
-sends once its collector has retired the generation, or for the offer that
-readmits the generation first, which carries it into the new entry's next
-report. Unbinding a device's block tears the device's flows down through the
-still-bound driver first, as the indirect cleanup always did, so a deleted
-table reports its flows' last counts too: nftables unbinds the hooks before it
-frees the table's flows. `/proc/cdx_flowtable` shows `finals_held`, the deltas
-waiting for their deletion, and `finals_dropped`, those no deletion could take.
+changed -- a binding's release and the unload drain: the count reaches the
+conntrack after the flow, its table and the binding are gone, and nothing is
+kept in the adapter for a deletion that may never reach it. A deletion's reply
+carries nothing. The fold honours the counter mode the table had at
+Netfilter's last command about the flow, which is what lets it outlive the
+table. `/proc/cdx_flowtable` counts the non-empty last deltas as `finals`.
+
+Deleting a table needs nothing more, and must not tear its flows down before
+the unbind. nftables unbinds a deleted table's devices while its chains still
+run -- `nft_flush_table()` queues the flowtable's deletion ahead of its
+chains', and a deleted chain keeps its rules until its hook goes -- so flows
+torn down there would only fall to software and be recreated in the dying
+table, offloaded and released again inside the commit, the commit waiting on
+every admission. Instead the binding's release retires what it holds, each
+direction reporting its count, and no packet leaves the hardware before then.
 
 Per-interface counters are a separate set of firmware records, folded into a
 port's or a VLAN device's `rtnl_link_stats64` by the `dev_get_stats()` hook and
@@ -760,15 +768,12 @@ The residuals, each bounded:
   them: a frame whose classifier walk began before the unlink is counted after
   the read, and that count is lost. Waiting for the barrier would cost every
   deletion the host-command round trip batched retirement exists to avoid.
-- **Deletions with no taker.** A deletion that found the transaction held is
-  answered at once (`destroy_deferrals`), so what its entry counted since its
-  last report has no one to report to and is dropped; so is a delta held for a
-  binding Netfilter releases before the deletion that would take it -- a flow
-  whose deletion could not be queued behind a read in flight when the device's
-  flows were swept -- and one no record could be allocated for. All are counted
-  in `finals_dropped` (ISSUES A407). A conntrack killed first -- `conntrack -F`,
-  a ctnetlink delete -- has sent its destroy event before the flow's deletion
-  folds the last delta, so that delta reaches a counter nothing reads again.
+- **A conntrack killed first.** `conntrack -F` or a ctnetlink delete sends the
+  conntrack's destroy event before its flow's direction leaves the hardware,
+  so the last delta reaches a counter nothing reads again.
+- **A counter mode changed in place.** The last delta folds by the mode the
+  table had at Netfilter's last command about the flow, at most one statistics
+  period old, as a read's delta covers the period before it.
 
 This was previously resolved the other way: counter-enabled tables were refused
 outright and enabling counters on a live table invalidated it. That refused

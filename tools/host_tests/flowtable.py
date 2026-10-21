@@ -48,8 +48,6 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_dev_stats_reap", "ft_dev_stats_drop_all", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",
              "ft_l2_overhead", "ft_delta_read", "ft_reported", "ft_delta_report",
-             "ft_delta_empty", "ft_delta_drop", "ft_final_find", "ft_final_free", "ft_final_hold",
-             "ft_final_take", "ft_finals_drop", "ft_finals_drop_all",
              "ft_unlink", "ft_settle", "ft_remove",
              "ft_destroy_defer", "ft_retire_deferred", "ft_deferred_destroys_drop", "ft_retire_batch",
              "ft_handle_retired", "ft_retire_workfn", "ft_settle_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
@@ -71,10 +69,6 @@ def test_decoder_and_lifecycle(tmp_path):
         + re.search(r"^static atomic_t ft_retire_scan\b.*$", source, re.M).group() + "\n"
         + source[source.index("struct ft_deferred_destroy {"):
                  source.index("\n", source.index("static LLIST_HEAD(ft_deferred_destroys);")) + 1]
-        # And the record a retirement of the adapter's own leaves for Linux's
-        # deletion to collect, with the table it waits in.
-        + source[source.index("struct ft_final {"):
-                 source.index("\n", source.index("static DEFINE_HASHTABLE(ft_finals")) + 1]
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"
     run_process([
@@ -197,11 +191,13 @@ def test_stats_poll(tmp_path):
 
 
 def test_teardown_stats(tmp_path):
-    """The delete work, compiled from the kernel, folds what a driver reports
-    on FLOW_CLS_DESTROY into the conntrack as a counter read is folded, in
-    64 bits, and an unbind sweeps the device's flows through the driver before
-    its block goes."""
+    """The flow's hardware handle, compiled from the kernel, holds its
+    conntrack and folds what a driver reports through it, in 64 bits and as
+    the table counted at its last command about the flow, after the flow is
+    gone; the delete work folds nothing from its reply, every command names
+    its direction, and an unbind sweeps none of the device's flows."""
     kernel = kernel_source()
+    flowtable = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
     offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     header = (kernel / "include/net/flow_offload.h").read_text()
     table = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
@@ -222,6 +218,9 @@ def test_teardown_stats(tmp_path):
         + re.search(r"^void nf_ct_acct_add\(.*?\);\n", acct, re.M | re.S).group())
     (tmp_path / "teardown_stats_production.inc").write_text(
         function(core, "nf_ct_acct_add")
+        # The handle and everything defined with it, as defined.
+        + flowtable[flowtable.index("struct nf_flow_offload_handle {"):
+                    flowtable.index("/* A policy change retires every flow")]
         + function(offload, "nf_flow_offload_ingress")
         + function(offload, "nf_flow_offload_init")
         + function(offload, "nf_flow_offload_has_dst")

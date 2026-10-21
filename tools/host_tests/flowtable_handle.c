@@ -9,9 +9,11 @@
 
 typedef unsigned refcount_t;
 typedef int atomic_t;
+typedef uint64_t u64;
 struct rcu_head { int unused; };
 #define GFP_ATOMIC 0
 #define READ_ONCE(v) (v)
+#define WRITE_ONCE(x, v) ((x) = (v))
 #define smp_store_release(p, v) (*(p) = (v))
 #define smp_load_acquire(p) (*(p))
 #define EXPORT_SYMBOL_GPL(name)
@@ -27,11 +29,20 @@ static void set_bit(unsigned bit, unsigned long *p) { *p |= 1UL << bit; }
 #define __set_bit set_bit
 static bool test_bit(unsigned bit, const unsigned long *p) { return (*p >> bit) & 1; }
 enum { NF_FLOW_TEARDOWN, NF_FLOW_HW, NF_FLOW_HW_DYING, NF_FLOW_HW_DEAD };
-enum { FLOW_OFFLOAD_DIR_ORIGINAL, FLOW_OFFLOAD_DIR_REPLY, FLOW_OFFLOAD_DIR_MAX };
+enum flow_offload_tuple_dir { FLOW_OFFLOAD_DIR_ORIGINAL, FLOW_OFFLOAD_DIR_REPLY, FLOW_OFFLOAD_DIR_MAX };
 #define NF_FLOW_OFFLOAD_ROUTE 1
+#define NF_FLOWTABLE_COUNTER 0x2
 #define nf_flowtable_time_stamp 1000
 struct nf_flow_offload_handle;
-struct nf_conn { unsigned refs; bool dying; };
+/* One count for every reference, the flow's and the handle's alike. */
+struct nf_conntrack { int unused; };
+struct nf_conn { struct nf_conntrack ct_general; unsigned refs; bool dying; };
+static void nf_conntrack_get(struct nf_conntrack *nfct)
+{ struct nf_conn *ct = (struct nf_conn *)nfct; assert(ct->refs); ct->refs++; }
+/* What reached the conntrack's accounting, per direction. */
+static u64 acct_packets[2], acct_bytes[2];
+static void nf_ct_acct_add(struct nf_conn *ct, unsigned dir, u64 packets, u64 bytes)
+{ assert(ct->refs && dir < 2); acct_packets[dir] += packets; acct_bytes[dir] += bytes; }
 struct net { int unused; };
 static struct net conntrack_net;
 static uint64_t policy_generation;
@@ -58,7 +69,10 @@ struct flow_offload {
     struct rcu_head rcu_head;
 };
 struct rhashtable { struct flow_offload_tuple_rhash *slots[2]; };
-struct nf_flowtable { struct rhashtable rhashtable; bool use_hw_handles, hardware; };
+struct nf_flowtable { struct rhashtable rhashtable; bool use_hw_handles, hardware; unsigned flags; };
+/* Declared by the header in the kernel; the handle's definitions use it
+ * before they define it. */
+void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle, bool counter);
 static const int nf_flow_offload_rhash_params;
 static bool allocation_fail, expired;
 static unsigned allocations, insertions, fail_insert, adds, deletes, stats, teardowns, route_releases;
@@ -161,6 +175,7 @@ int main(void)
     grace_period(); assert(!allocations && !ct.refs);
 
     table.use_hw_handles = table.hardware = true;
+    table.flags = NF_FLOWTABLE_COUNTER;
     flow = new_flow(&ct); allocation_fail = true;
     assert(flow_offload_add(&table, flow) == -ENOMEM && !flow->hw_handle);
     allocation_fail = false; flow_offload_free(flow); grace_period(); assert(!allocations && !ct.refs);
@@ -184,26 +199,41 @@ int main(void)
     nf_flow_offload_gc_step(&table, flow, NULL); assert(deletes == 1);
     set_bit(NF_FLOW_HW_DEAD, &flow->flags);
     nf_flow_offload_gc_step(&table, flow, NULL);
-    assert(old->refs == 2 && ct.refs == 1 && extensions == 1);
-    grace_period(); assert(allocations == 1 && !ct.refs);
+    assert(old->refs == 2 && ct.refs == 2 && extensions == 1);
+    /* The flow's conntrack reference goes after the grace period; the
+     * retained handle's stays, so what its driver reports after the flow
+     * reaches the conntrack. */
+    grace_period(); assert(allocations == 1 && ct.refs == 1);
+    nf_flow_offload_handle_account(old, FLOW_OFFLOAD_DIR_REPLY, 3, 300);
+    assert(acct_packets[1] == 3 && acct_bytes[1] == 300 && !acct_packets[0]);
 
-    /* A retained old handle owns no Linux flow/route/CT. Reusing the tuple
-     * cannot turn a delayed invalidation into an operation on the new flow. */
+    /* A retained old handle owns no Linux flow or route, only its conntrack.
+     * Reusing the tuple cannot turn a delayed invalidation into an operation
+     * on the new flow. */
     flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
     assert(flow->hw_handle != old && nf_flow_offload_handle_valid(flow->hw_handle));
     assert(!nf_flow_offload_handle_invalidate(old));
     assert(flow_offload_lookup(&table, &key[0]) == &flow->tuplehash[0]);
+    assert(ct.refs == 3);
     nf_flow_offload_handle_put(old); nf_flow_offload_handle_put(old);
     assert(!nf_flow_offload_handle_valid(old)); /* Existing RCU reader is safe. */
-    assert(deferred_count == 1); grace_period(); assert(allocations == 2);
+    /* The last put drops the conntrack at once; only the memory waits. */
+    assert(deferred_count == 1 && ct.refs == 2); grace_period(); assert(allocations == 2);
 
     old = flow->hw_handle;
     nf_flow_offload_handle_get(old);
     flow_offload_del(&table, flow); /* Table destruction may precede driver put. */
-    assert(!nf_flow_offload_handle_valid(old) && old->refs == 1 && ct.refs == 1);
-    grace_period(); assert(allocations == 1 && !ct.refs);
-    nf_flow_offload_handle_put(old); grace_period(); assert(!allocations);
+    assert(!nf_flow_offload_handle_valid(old) && old->refs == 1 && ct.refs == 2);
+    grace_period(); assert(allocations == 1 && ct.refs == 1);
+    nf_flow_offload_handle_put(old); grace_period(); assert(!allocations && !ct.refs);
     assert(route_releases == 6 && adds == 2);
+    /* A table that does not count folds nothing, as the handle last saw it. */
+    table.flags = 0;
+    flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+    nf_flow_offload_handle_account(flow->hw_handle, FLOW_OFFLOAD_DIR_ORIGINAL, 5, 500);
+    assert(!acct_packets[0]);
+    flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+    table.flags = NF_FLOWTABLE_COUNTER;
     /* A policy update retires both lookup directions before asynchronous GC,
      * even while the provider handle is still valid. Fresh flows use the new
      * policy generation; a subsequent change cannot revive the old flow. */
@@ -240,5 +270,5 @@ int main(void)
     flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
     assert(!nf_flow_offload_handle_valid(NULL) && !nf_flow_offload_handle_invalidate(NULL));
     nf_flow_offload_handle_put(NULL);
-    puts("Flowtable handles: opt-in allocation, rollback, shared ownership, lookup, GC, RCU and generation isolation passed");
+    puts("Flowtable handles: opt-in allocation, rollback, shared ownership, the conntrack held for accounting, lookup, GC, RCU and generation isolation passed");
 }

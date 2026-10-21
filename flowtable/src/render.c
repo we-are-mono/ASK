@@ -152,9 +152,8 @@ static bool policy_has(const struct ft_policy *p, const char *name)
 
 /* One nft script, so one transaction: an add and a delete commit or abort
  * together. Netfilter binds an added device while preparing the transaction
- * and unbinds a deleted one at commit, having torn its flows down, both
- * directions, first; the devices in both lists are left alone, and with them
- * every hardware flow that touches no deleted device. */
+ * and unbinds a deleted one at commit; the devices in both lists are left
+ * alone, and with them every hardware flow that ingresses on them. */
 int ft_render_membership(struct ft_ctx *ctx, const struct ft_policy *p,
 			 const struct ft_devices *installed, char *buf, size_t buflen)
 {

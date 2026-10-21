@@ -152,18 +152,8 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A407 — a burst of deletions drops most flows' last delta.** Deleting a table with 100 offloaded flows (200
-  hardware directions) on the rig deferred 88 deletions and dropped 164 final deltas (`/proc/cdx_flowtable`
-  `destroy_deferrals`, `finals_dropped`); conntrack missed 2,766 of 40,000 packets. A single flow's teardown is exact.
-  Each FLOW_CLS_DESTROY only tries the backend transaction (`ft_rule_callback()`, A327) and Netfilter runs many at
-  once on its unbound delete workqueue, so in a burst most find it held by another deletion; a deferred one is
-  answered at once and its delta has no taker. A route change, a conntrack flush or a link event tears down the same
-  way. The counter also takes deltas held for a binding released before their deletion -- a flow whose deletion could
-  not queue behind a read in flight during the unbind sweep -- and a final held for a deferred deletion that could
-  not be recorded (`ft_destroy_defer()` allocation failure) stays in `finals_held` until its binding goes. Fix
-  direction: let a deletion wait for the transaction a bounded time -- another deletion holds it for microseconds,
-  and only a long holder should defer it; in the unbind sweep, collect and flush again for the flows whose deletion
-  a pending read held back.
+- [x] **A407 — a burst of deletions dropped most flows' last delta.** Every unlink now reports it through the flow's
+  handle, which holds the conntrack; the unbind sweep that recreated flows in a deleted table is gone (_:/^netfilter, cdx: report a hardware flow's last delta through its handle_).
 
 - [x] **A406 — `nf_ct_acct_add()` truncates a hardware stats delta to 32 bits.** Widened to u64 in patch 140, so both
   the read's and the deletion's fold take a delta whole (_:/^netfilter, cdx: count a hardware flow's last delta_).
@@ -183,8 +173,7 @@ result independently of those temporary files.
   a row and `ask-recovery-monitor` rebooted the box ("datapath health check failed or timed out"). The probe waits in
   `cdx_ft_begin()` (`ctrl.mutex`); retirement itself is batched (FT_RETIRE_BATCH, A327), so the holder is something
   else. One candidate since A403: `cdx_ft_recover()` runs a whole datapath restart for an adapter caller under
-  `ctrl.mutex` (RTNL steps up to ~200 ms, and its barriers), paced only by `ft_restart_next`. Since A405 an nft
-  commit that unbinds a device flushes the offload workqueues under its commit mutex, so a long holder delays it too. Fix direction: find the holder
+  `ctrl.mutex` (RTNL steps up to ~200 ms, and its barriers), paced only by `ft_restart_next`. Fix direction: find the holder
   on the ASK image (lockdep, or a hold-time report in `cdx_ft_end()`), then bound it. Production exposure: a PPPoE, VPN
   or default-route change with many flows offloaded.
 

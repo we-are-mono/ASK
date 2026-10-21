@@ -1,4 +1,4 @@
-From 43b447ee17f73a32b8339a904d16aa5ebfdfb641 Mon Sep 17 00:00:00 2001
+From d80b18d878ea37e8cb67d643f5d2f3ebd29daf44 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:14:51 +0200
 Subject: [PATCH] netfilter: walk the forwarding path through sit and ip6_tnl
@@ -37,14 +37,14 @@ port below would lose.
 Context version 13 adds the two tunnel records.
 ---
  include/linux/netdevice.h             | 32 +++++++++++
- include/net/flow_offload.h            | 18 +++++-
+ include/net/flow_offload.h            | 20 ++++++-
  include/net/netfilter/nf_flow_table.h | 29 ++++++++++
  net/ipv6/ip6_tunnel.c                 | 82 +++++++++++++++++++++++++++
  net/ipv6/sit.c                        | 69 ++++++++++++++++++++++
  net/netfilter/nf_flow_table_core.c    |  1 +
  net/netfilter/nf_flow_table_offload.c |  2 +
  net/netfilter/nft_flow_offload.c      | 38 +++++++++++++
- 8 files changed, 269 insertions(+), 2 deletions(-)
+ 8 files changed, 271 insertions(+), 2 deletions(-)
 
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
 index 1d0a3ff4e88c..1c92244baebf 100644
@@ -99,7 +99,7 @@ index 1d0a3ff4e88c..1c92244baebf 100644
  };
  
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 3851c360e54d..9f65f5a00d2d 100644
+index cf62dca18c9e..e7f0e54f5bf6 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
 @@ -690,6 +690,7 @@ struct flow_cls_common_offload {
@@ -110,7 +110,7 @@ index 3851c360e54d..9f65f5a00d2d 100644
  
  /* Context is borrowed for the callback and NULL for other producers. Drivers
   * must not retain nf_ct, either dst or either session. nf_dst is this
-@@ -718,14 +719,27 @@ struct nf_flow_session;
+@@ -720,14 +721,29 @@ struct nf_flow_session;
   * from other producers. Each direction is offered to every device bound to
   * the table, and a STATS or DESTROY carries no rule, so this is how a driver
   * tells the device that owns the direction from the others without looking
@@ -121,14 +121,16 @@ index 3851c360e54d..9f65f5a00d2d 100644
 + * for its session: nf_tunnel belongs to nf_dst and nf_tunnel_reverse to
 + * nf_dst_reverse, always non-NULL, and a path with no tunnel reports a zero
 + * lower_ifindex.
-+ * Version 14 reads stats back from a FLOW_CLS_DESTROY as from a
-+ * FLOW_CLS_STATS: a driver may report there what the direction has counted
-+ * since its last report, and Netfilter folds it into the conntrack the same
-+ * way, without extending the flow's timeout. A driver that reports nothing
-+ * leaves the counters as they were. The device's flows are also torn down
-+ * through the driver before its block is unbound, so the last of what a
-+ * deleted table's flows counted reaches conntrack. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 14
++ * Version 15 names the direction every command is about, as nf_dir, and has
++ * the handle hold the flow's conntrack: a driver reports what a direction
++ * counted since its last report through nf_flow_offload_handle_account() as
++ * it takes the direction out of the hardware, whenever and for whatever
++ * reason it does. It replaces version 14, in which a FLOW_CLS_DESTROY read
++ * that back as a FLOW_CLS_STATS does and an unbind first tore the device's
++ * flows down through the driver: a deletion the driver could not take at
++ * once, a retirement of its own, and the directions its binding still held
++ * when it was released had nowhere to report to. */
++#define FLOW_CLS_HAS_NF_CONTEXT 15
  struct flow_cls_offload {
  	const struct nf_conn *nf_ct;
  	struct dst_entry *nf_dst;
@@ -141,7 +143,7 @@ index 3851c360e54d..9f65f5a00d2d 100644
  	u64 nf_xfrm_genid;
  	u32 nf_dst_cookie;
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index bc7f2e12c936..92152691ea76 100644
+index 9a1e5b00a575..8a09e8a74f43 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -130,6 +130,32 @@ struct nf_flow_session {
@@ -382,10 +384,10 @@ index 1f980e827d04..7a95156dd697 100644
  
  static void ipip6_dev_free(struct net_device *dev)
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 161b76af2ff6..70ef1e27c792 100644
+index d1abc0e70d46..2f629c5bfa4a 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -191,6 +191,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+@@ -224,6 +224,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
  	 * path, not to how the path is transmitted, and a DIRECT tuple has no
  	 * room for it once the union holds its cached addresses. */
  	flow_tuple->session = route->tuple[dir].session;
@@ -394,7 +396,7 @@ index 161b76af2ff6..70ef1e27c792 100644
  	switch (route->tuple[dir].xmit_type) {
  	case FLOW_OFFLOAD_XMIT_DIRECT:
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4167a0724aa1..569e54ab3186 100644
+index 83c97b8c0ce6..44d33f6dd959 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -1002,6 +1002,8 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,

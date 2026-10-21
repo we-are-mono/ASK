@@ -716,7 +716,9 @@ GETMATCH(ipv6_addrs) GETMATCH(ports) GETMATCH(tcp) GETMATCH(vlan)
 /* The second visible tag arrives in its own key with the same value type. */
 static void flow_rule_match_cvlan(struct flow_rule *r, struct flow_match_vlan *m) { *m = r->cvlan; }
 struct flow_stats { u64 bytes, pkts; unsigned long lastused; };
-struct nf_flow_offload_handle { unsigned refs; bool invalid; };
+/* With what the adapter reported through it, per direction: a direction's
+ * last delta reaches the conntrack this way however the direction leaves. */
+struct nf_flow_offload_handle { unsigned refs; bool invalid; u64 packets[2], bytes[2]; unsigned reports; };
 static struct nf_flow_offload_handle handle;
 /* Every validity question is counted: a walk of the table for retired
  * generations asks one per entry, so a case can say no walk happened. */
@@ -733,6 +735,11 @@ static void nf_flow_offload_handle_get(struct nf_flow_offload_handle *h)
 { assert(h->refs); h->refs++; }
 static void nf_flow_offload_handle_put(struct nf_flow_offload_handle *h)
 { assert(h->refs > 1); h->refs--; }
+/* Only while the adapter still holds the handle: the conntrack is the
+ * handle's to keep, not the adapter's. */
+static void nf_flow_offload_handle_account(struct nf_flow_offload_handle *h, unsigned dir,
+                                           u64 packets, u64 bytes)
+{ assert(h->refs > 1 && dir < 2); h->packets[dir] += packets; h->bytes[dir] += bytes; h->reports++; }
 /* Same shape as patch 140's, and filled the same way: nf_session belongs to
  * nf_dst and nf_session_reverse to nf_dst_reverse, so a direction's egress and
  * ingress sessions are named the way its two destinations are. A path with no
@@ -762,6 +769,7 @@ struct flow_cls_offload {
     unsigned command;
     u16 nf_mtu;
     bool nf_counter;
+    u8 nf_dir;
     struct { unsigned chain_index, protocol; } common;
     struct flow_rule *rule;
     unsigned long cookie;
@@ -802,9 +810,9 @@ static unsigned ft_count, ft_bound, ft_parked, ft_fail_stage, ft_init_fail_stage
 /* Module parameters in production; plain globals here so a case can set the
  * mask, drive ft_parse, and read the class back off the rule. */
 static unsigned int ft_qos_mark_mask, ft_qos_default_class, ft_route_mark_mask;
-static unsigned ft_neighbour_refs, ft_handle_refs, ft_finals_held;
+static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_finals_dropped;
+static u64 ft_finals;
 static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations, ft_destroy_deferrals;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static u64 atomic64_inc_return(u64 *v) { return ++*v; }
@@ -5548,16 +5556,16 @@ static void park_and_leave(struct net_device *dev, u64 rearms)
     assert(!ft_bound && !ft_parked && !dev->refs && allocated == held);
 }
 /* Linux's deletion of a generation this adapter retired first, as its
- * collector sends it once the handle is marked: it finds no entry and takes
- * the count the retirement held for it, after which nothing is held. */
-static void destroy_collects(u64 packets)
+ * collector sends it once the handle is marked: it finds no entry, and
+ * reports nothing -- the retirement reported what the entry had counted. */
+static void destroy_finds_retired(void)
 {
-    unsigned command = cls.command, held = ft_finals_held;
+    unsigned command = cls.command, reports = cls.nf_handle->reports;
 
     cls.stats = (struct flow_stats){0};
     cls.command = FLOW_CLS_DESTROY;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-    assert(cls.stats.pkts == packets && ft_finals_held == held - 1);
+    assert(!cls.stats.pkts && !cls.stats.bytes && cls.nf_handle->reports == reports);
     cls.command = command;
 }
 
@@ -5820,9 +5828,10 @@ static void test_neighbours(void)
         e->hw->stats.packets++;
         assert(ft_stats(e, &cls) == -EOPNOTSUPP && neigh_uses == uses);
         /* The refused read left the packet unreported; the retirement
-         * holds it for the deletion that follows the marked handle. */
-        assert(ft_remove(e) == 0 && ft_finals_held == 1); ft_invalid = 0;
-        destroy_collects(1);
+         * reports it, and the deletion that follows the marked handle
+         * finds nothing more. */
+        assert(ft_remove(e) == 0 && handle.packets[0] == 1 && handle.refs == 1); ft_invalid = 0;
+        destroy_finds_retired();
     }
     fixture(); neighbour.dead = true;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP && !neighbour.refs);
@@ -5838,8 +5847,9 @@ static void test_neighbours(void)
     struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
     neigh_send_error = 1; e->hw->stats.packets++;
     assert(ft_stats(e, &cls) == -EOPNOTSUPP && !ft_invalid && handle.invalid);
-    assert(ft_remove(e) == 0 && ft_finals_held == 1); neigh_send_error = 0; ft_invalid = 0;
-    destroy_collects(1);
+    assert(ft_remove(e) == 0 && handle.packets[0] == 1 && handle.refs == 1);
+    neigh_send_error = 0; ft_invalid = 0;
+    destroy_finds_retired();
     fixture(); assert(ft_replace(&binding, &cls) == 0);
     cls.cookie++; pk.src = htons(10001);
     assert(ft_replace(&binding, &cls) == 0 && ft_neighbour_refs == 2 && neighbour.refs == 2);
@@ -6306,7 +6316,7 @@ static void test_batched_retirement(void)
 
 static void test_selective_neighbours(void)
 {
-    struct nf_flow_offload_handle contexts[3] = { {1, false}, {1, false}, {1, false} };
+    struct nf_flow_offload_handle contexts[3] = { { .refs = 1 }, { .refs = 1 }, { .refs = 1 } };
     struct cdx_ft_entry *entries[4];
     u64 invalidations = ft_neigh_invalidations, errors = ft_errors;
 
@@ -6314,6 +6324,7 @@ static void test_selective_neighbours(void)
     for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
         cls.nf_handle = &contexts[i / 2];
         cls.cookie = 5000 + i;
+        cls.nf_dir = i & 1;
         pk.src = htons(11000 + i);
         route.rt_gw_family = i & 1 ? 0 : AF_INET;
         route.rt_gw4 = i < 2 ? gateway.primary_key.ip : alternate_gateway.primary_key.ip;
@@ -6330,8 +6341,10 @@ static void test_selective_neighbours(void)
     ft_retire_workfn(NULL);
     assert(ft_count == 2 && ft_handle_refs == 2 && ft_neighbour_refs == 2);
     /* The two retired directions had counted since their last report: each
-     * leaves a record holding the generation's handle for Linux's deletion. */
-    assert(contexts[0].refs == 3 && contexts[1].refs == 3 && ft_finals_held == 2);
+     * reported that through the generation's handle, into its own direction,
+     * and holds the handle no more. */
+    assert(contexts[0].refs == 1 && contexts[1].refs == 3 && contexts[0].reports == 2);
+    assert(contexts[0].packets[0] == 100 && contexts[0].packets[1] == 101 && !contexts[1].reports);
     assert(!ft_find(&binding, 5000) && !ft_find(&binding, 5001));
     assert(ft_find(&binding, 5002) == entries[2] && ft_find(&binding, 5003) == entries[3]);
     assert(entries[2]->hw->stats.packets == 102 && entries[3]->hw->stats.packets == 103);
@@ -6350,10 +6363,10 @@ static void test_selective_neighbours(void)
     cls.command = FLOW_CLS_DESTROY;
     cls.stats = (struct flow_stats){0};
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-    /* The old generation's deletion takes what its direction had counted,
-     * and leaves the fresh one alone. */
-    assert(ft_find(&binding, cls.cookie) == fresh && cls.stats.pkts == 100);
-    assert(ft_finals_held == 1 && contexts[0].refs == 2);
+    /* The old generation's deletion finds nothing to report, and leaves the
+     * fresh one alone. */
+    assert(ft_find(&binding, cls.cookie) == fresh && !cls.stats.pkts);
+    assert(contexts[0].reports == 2 && contexts[0].refs == 1 && contexts[2].refs == 2);
     cls.command = FLOW_CLS_STATS;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -ENOENT);
     cls.command = FLOW_CLS_REPLACE;
@@ -6371,16 +6384,19 @@ static void test_selective_neighbours(void)
     ft_invalidate_work(NULL);
     assert(ft_invalid_done && !ft_count && !ft_handle_refs && !ft_neighbour_refs);
     assert(!live_hw && !out.refs && ft_installs == ft_deletes);
-    /* The pass's flush has Linux tear every flow down; each deletion takes
-     * what its direction had counted since its last report. */
-    assert(ft_finals_held == 3 && allocated == 3);
+    /* The pass reported what each direction had counted since its last
+     * report as it took it out, the fresh one's nothing; Linux's deletions
+     * after its flush find nothing more. */
+    assert(contexts[1].packets[0] == 102 && contexts[1].packets[1] == 103);
+    assert(contexts[1].reports == 2 && !contexts[2].reports && !allocated);
     cls.command = FLOW_CLS_DESTROY;
     for (unsigned i = 1; i < 4; i++) {
         cls.nf_handle = &contexts[i / 2]; cls.cookie = 5000 + i;
         cls.stats = (struct flow_stats){0};
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-        assert(cls.stats.pkts == 100 + i && ft_finals_held == 3 - i);
+        assert(!cls.stats.pkts && contexts[1].reports == 2);
     }
+    cls.nf_dir = 0;
     cls.command = FLOW_CLS_REPLACE;
     assert(!allocated);
     for (unsigned i = 0; i < ARRAY_SIZE(contexts); i++) assert(contexts[i].refs == 1);
@@ -7490,7 +7506,7 @@ static void test_policy_covers_tuples(void)
 
 static void test_selective_routes(void)
 {
-    struct nf_flow_offload_handle contexts[2] = {{1, false}, {1, false}};
+    struct nf_flow_offload_handle contexts[2] = { { .refs = 1 }, { .refs = 1 } };
     struct cdx_ft_entry *entries[4];
     struct net other_net;
     struct netevent_ipv4_route event = { .net = &init_net, .dst = htonl(0xc0000202), .prefixlen = 32 };
@@ -7502,7 +7518,7 @@ static void test_selective_routes(void)
         __be32 address = htonl(i < 2 ? 0xc0000202 : 0xcb007102);
         ik.src = i & 1 ? htonl(0xc6336402) : address;
         ik.dst = i & 1 ? address : htonl(0xc6336402);
-        cls.nf_handle = &contexts[i / 2]; cls.cookie = 6000 + i;
+        cls.nf_handle = &contexts[i / 2]; cls.cookie = 6000 + i; cls.nf_dir = i & 1;
         route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key.ip;
         assert(ft_replace(&binding, &cls) == 0);
         entries[i] = ft_find(&binding, cls.cookie);
@@ -7523,13 +7539,13 @@ static void test_selective_routes(void)
     assert(contexts[0].invalid && !contexts[1].invalid && !ft_invalid);
     assert(ft_route_invalidations == invalidations + 1);
     ft_retire_workfn(NULL);
-    /* Each retired direction had counted since its last report: a record
-     * holds the generation's handle until Linux's deletion takes it. */
-    assert(ft_count == 2 && contexts[0].refs == 3 && contexts[1].refs == 3 && ft_finals_held == 2);
+    /* Each retired direction had counted since its last report, and
+     * reported it through the generation's handle on its way out. */
+    assert(ft_count == 2 && contexts[0].refs == 1 && contexts[1].refs == 3);
+    assert(contexts[0].packets[0] == 20 && contexts[0].packets[1] == 21 && !contexts[1].reports);
     cls.nf_handle = &contexts[0];
-    cls.cookie = 6000; destroy_collects(20);
-    cls.cookie = 6001; destroy_collects(21);
-    assert(contexts[0].refs == 1 && !ft_finals_held);
+    cls.cookie = 6000; destroy_finds_retired();
+    cls.cookie = 6001; destroy_finds_retired();
     for (unsigned i = 2; i < 4; i++) {
         assert(ft_find(&binding, 6000 + i) == entries[i]);
         assert(entries[i]->hw->stats.packets == 20 + i);
@@ -7542,11 +7558,14 @@ static void test_selective_routes(void)
     ft_retire_workfn(NULL);
     assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && ft_errors == errors);
     assert(ft_route_invalidations == invalidations + 2);
-    assert(contexts[1].refs == 3 && ft_finals_held == 2);
+    /* The direction removed by hand reported as it went, the other as the
+     * walk took it out. */
+    assert(contexts[1].refs == 1 && contexts[1].packets[0] == 22 && contexts[1].packets[1] == 23);
     cls.nf_handle = &contexts[1];
-    cls.cookie = 6002; destroy_collects(22);
-    cls.cookie = 6003; destroy_collects(23);
-    assert(contexts[1].refs == 1 && !allocated);
+    cls.cookie = 6002; destroy_finds_retired();
+    cls.cookie = 6003; destroy_finds_retired();
+    assert(!allocated);
+    cls.nf_dir = 0;
 
     fixture();
     assert(ft_replace(&binding, &cls) == 0);
@@ -7569,7 +7588,7 @@ static void test_selective_routes(void)
 
     for (unsigned e = FIB_EVENT_NH_ADD; e <= FIB_EVENT_NH_DEL; e++) {
         fixture();
-        struct nf_flow_offload_handle other = {1, false};
+        struct nf_flow_offload_handle other = { .refs = 1 };
         u64 links = ft_link_invalidations;
         assert(ft_replace(&binding, &cls) == 0);
         cls.cookie++; pk.src++; cls.nf_handle = &other;
@@ -8077,10 +8096,12 @@ static void test_counter_accounting(void)
     cls.nf_counter = false;
 }
 
-/* What a direction counted since its last report goes back with the deletion
- * that takes it out: Linux's own, in its reply; one this adapter made first,
- * held for the deletion Linux sends once its collector has retired the
- * generation, and for that deletion alone. */
+/* What a direction counted since its last report reaches the conntrack once,
+ * through the flow's handle and into the direction Netfilter named, whichever
+ * way the direction leaves the hardware: Linux's deletion, one deferred for
+ * the transaction, or a retirement of this adapter's. Nothing goes back in a
+ * reply, nothing waits in the adapter for a deletion that may never come, and
+ * nothing is allocated to deliver it. */
 static void test_teardown_delta(void)
 {
     struct cdx_ft_entry *e;
@@ -8096,28 +8117,44 @@ static void test_teardown_delta(void)
     cls.stats = (struct flow_stats){0};
     cls.command = FLOW_CLS_STATS;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-    assert(cls.stats.pkts == 10 && cls.stats.bytes == 10 * 284);
+    assert(cls.stats.pkts == 10 && cls.stats.bytes == 10 * 284 && !handle.reports);
     e->hw->stats = (struct cdx_ft_counters){ .packets = 15, .bytes = 15 * 298, .lastused = 995 };
     cls.stats = (struct flow_stats){0};
     cls.command = FLOW_CLS_DESTROY;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
     assert(!ft_find(&binding, cls.cookie) && !ft_count && !live_hw);
-    assert(cls.stats.pkts == 5 && cls.stats.bytes == 5 * 284 && cls.stats.lastused == 995);
+    assert(!cls.stats.pkts && !cls.stats.bytes);
+    assert(handle.packets[0] == 5 && handle.bytes[0] == 5 * 284 && !handle.packets[1]);
+    assert(handle.reports == 1 && handle.refs == 1);
     flush_work(&ft_settle_work);
     cls.command = FLOW_CLS_REPLACE;
     assert(ft_replace(&binding, &cls) == 0);
-    cls.stats = (struct flow_stats){0};
     cls.command = FLOW_CLS_DESTROY;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-    assert(!cls.stats.pkts && !cls.stats.bytes && !ft_count);
+    assert(!ft_count && handle.packets[0] == 5 && handle.reports == 1);
     flush_work(&ft_settle_work);
 
-    /* A retirement of this adapter's -- a neighbour change here -- reads the
-     * entry on its way out and keeps what it counted for Linux's deletion of
-     * the generation, which reports it once; the record holds the handle
-     * until then. */
-    u64 dropped = ft_finals_dropped, errors = ft_errors;
+    /* The reply direction, offered as such, reports into its own counters. */
+    fixture();
+    cls.nf_counter = true;
+    cls.nf_dir = 1;
     cls.command = FLOW_CLS_REPLACE;
+    assert(ft_replace(&binding, &cls) == 0);
+    e = ft_find(&binding, cls.cookie);
+    e->hw->stats = (struct cdx_ft_counters){ .packets = 4, .bytes = 4 * 298 };
+    cls.command = FLOW_CLS_DESTROY;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && !ft_count);
+    assert(!handle.packets[0] && handle.packets[1] == 4 && handle.bytes[1] == 4 * 284);
+    flush_work(&ft_settle_work);
+    cls.nf_dir = 0;
+    cls.command = FLOW_CLS_REPLACE;
+
+    /* A retirement of this adapter's -- a neighbour change here -- reports
+     * what the entry counted as it takes it out, and holds the handle no
+     * longer; Linux's deletion of the generation then finds nothing. */
+    u64 errors = ft_errors;
+    fixture();
+    cls.nf_counter = true;
     assert(ft_replace(&binding, &cls) == 0);
     e = ft_find(&binding, cls.cookie);
     e->hw->stats = (struct cdx_ft_counters){ .packets = 7, .bytes = 7 * 298, .lastused = 990 };
@@ -8125,17 +8162,9 @@ static void test_teardown_delta(void)
     assert(handle.invalid);
     ft_retire_workfn(NULL);
     assert(!ft_find(&binding, cls.cookie) && !ft_count && !live_hw);
-    assert(ft_finals_held == 1 && handle.refs == 2 && allocated == 1);
-    cls.stats = (struct flow_stats){0};
-    cls.command = FLOW_CLS_DESTROY;
-    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-    assert(cls.stats.pkts == 7 && cls.stats.bytes == 7 * 284 && cls.stats.lastused == 990);
-    assert(!ft_finals_held && handle.refs == 1 && !allocated);
-    cls.stats = (struct flow_stats){0};
-    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-    assert(!cls.stats.pkts && !cls.stats.bytes);
-    assert(ft_finals_dropped == dropped);
-    cls.command = FLOW_CLS_REPLACE;
+    assert(handle.packets[0] == 7 && handle.bytes[0] == 7 * 284 && handle.refs == 1 && !allocated);
+    destroy_finds_retired();
+    destroy_finds_retired();
 
     /* A sample that went backwards delivers nothing and escalates, as a
      * read of it would have. */
@@ -8144,11 +8173,9 @@ static void test_teardown_delta(void)
     assert(ft_replace(&binding, &cls) == 0);
     e = ft_find(&binding, cls.cookie);
     e->reported.packets = 1;
-    cls.stats = (struct flow_stats){0};
     cls.command = FLOW_CLS_DESTROY;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && !ft_count);
-    assert(!cls.stats.pkts && !cls.stats.bytes && ft_errors == errors + 1 && ft_invalid);
-    assert(!ft_finals_held && ft_finals_dropped == dropped);
+    assert(!handle.reports && ft_errors == errors + 1 && ft_invalid);
     ft_invalid = 0;
     flush_work(&ft_settle_work);
     cls.command = FLOW_CLS_REPLACE;
@@ -8165,40 +8192,33 @@ static void test_teardown_delta(void)
     cls.nf_ingress_ifindex = 6;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
     assert(cls.stats.pkts == 1 && cls.stats.bytes == 1 && ft_find(&binding, cls.cookie) == e);
+    assert(!handle.reports);
     cls.nf_ingress_ifindex = 5;
-    cls.stats = (struct flow_stats){0};
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && !ft_count);
-    assert(cls.stats.pkts == 3 && cls.stats.bytes == 3 * 284);
+    assert(handle.packets[0] == 3 && handle.reports == 1);
     flush_work(&ft_settle_work);
     cls.command = FLOW_CLS_REPLACE;
 
     /* A generation retired by this adapter and offered again before Linux
-     * tore it down -- an offer that found its rule changed, here -- carries
-     * what it had counted into the entry that readmits it, reported with
-     * that entry's next delta and then no more. */
+     * tore it down -- an offer that found its rule changed, here -- reported
+     * its first entry's count on the way out; the entry that readmits it
+     * reports only its own. */
     fixture();
     cls.nf_counter = true;
     assert(ft_replace(&binding, &cls) == 0);
     e = ft_find(&binding, cls.cookie);
     e->hw->stats = (struct cdx_ft_counters){ .packets = 3, .bytes = 3 * 298, .lastused = 980 };
-    assert(ft_remove(e) == 0 && !ft_count && ft_finals_held == 1 && handle.refs == 2);
+    assert(ft_remove(e) == 0 && !ft_count && handle.packets[0] == 3 && handle.refs == 1);
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
     e = ft_find(&binding, cls.cookie);
-    assert(!ft_finals_held && handle.refs == 2 && allocated == 1);
-    assert(e->carried.packets == 3 && e->carried.bytes == 3 * 284 && e->carried.lastused == 980);
     e->hw->stats = (struct cdx_ft_counters){ .packets = 4, .bytes = 4 * 298, .lastused = 990 };
     cls.stats = (struct flow_stats){0};
     assert(ft_stats(e, &cls) == 0);
-    assert(cls.stats.pkts == 7 && cls.stats.bytes == 7 * 284 && cls.stats.lastused == 990);
-    assert(!e->carried.packets && !e->carried.bytes && !e->carried.lastused);
-    cls.stats = (struct flow_stats){0};
-    assert(ft_stats(e, &cls) == 0 && !cls.stats.pkts && !cls.stats.bytes);
-    /* Retired again with nothing new to its name, it leaves no record. */
-    assert(ft_remove(e) == 0 && !ft_finals_held && handle.refs == 1 && !allocated);
-    assert(ft_finals_dropped == dropped);
+    assert(cls.stats.pkts == 4 && cls.stats.bytes == 4 * 284 && cls.stats.lastused == 990);
+    /* Retired again with nothing new to its name, it reports nothing. */
+    assert(ft_remove(e) == 0 && handle.reports == 1 && handle.refs == 1 && !allocated);
 
-    /* A record that could not be allocated loses that delta alone, counted;
-     * a retirement with nothing to deliver records nothing. */
+    /* Delivery allocates nothing, so memory pressure loses nothing. */
     fixture();
     cls.nf_counter = true;
     assert(ft_replace(&binding, &cls) == 0);
@@ -8207,21 +8227,12 @@ static void test_teardown_delta(void)
     nowait_fail = true;
     assert(ft_remove(e) == 0 && !ft_count);
     nowait_fail = false;
-    assert(!ft_finals_held && ft_finals_dropped == dropped + 1 && handle.refs == 1 && !allocated);
-    cls.stats = (struct flow_stats){0};
-    cls.command = FLOW_CLS_DESTROY;
-    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-    assert(!cls.stats.pkts && !cls.stats.bytes);
-    cls.command = FLOW_CLS_REPLACE;
-    assert(ft_replace(&binding, &cls) == 0);
-    e = ft_find(&binding, cls.cookie);
-    assert(ft_remove(e) == 0 && !ft_finals_held && ft_finals_dropped == dropped + 1 && !allocated);
+    assert(handle.packets[0] == 2 && handle.refs == 1 && !allocated);
 
-    /* A deletion deferred for the transaction was answered at once, so what
-     * its entry counted since its last report has no taker: dropped by the
-     * worker that takes the entry out, counted. Where a retirement of this
-     * adapter's took the entry out first, the record it held for this
-     * deletion goes the same way. */
+    /* A deletion deferred for the transaction was answered at once; the
+     * worker that takes the entry out reports what it counted, with the
+     * handle the deferral held. So does the walk, where the deferral's own
+     * record could not be allocated. */
     fixture();
     cls.nf_counter = true;
     assert(ft_replace(&binding, &cls) == 0);
@@ -8232,11 +8243,27 @@ static void test_teardown_delta(void)
     transaction_busy = true;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
     transaction_busy = false;
-    assert(!cls.stats.pkts && !cls.stats.bytes && ft_find(&binding, cls.cookie) == e);
+    assert(!cls.stats.pkts && ft_find(&binding, cls.cookie) == e && !handle.reports);
     ft_retire_workfn(NULL);
-    assert(!ft_count && !live_hw && !ft_finals_held && ft_finals_dropped == dropped + 2);
-    assert(handle.refs == 1 && !allocated);
+    assert(!ft_count && !live_hw && handle.packets[0] == 5 && handle.bytes[0] == 5 * 284);
+    assert(handle.reports == 1 && handle.refs == 1 && !allocated);
     cls.command = FLOW_CLS_REPLACE;
+    fixture();
+    cls.nf_counter = true;
+    assert(ft_replace(&binding, &cls) == 0);
+    e = ft_find(&binding, cls.cookie);
+    e->hw->stats = (struct cdx_ft_counters){ .packets = 6, .bytes = 6 * 298 };
+    cls.command = FLOW_CLS_DESTROY;
+    transaction_busy = true; nowait_fail = true;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    transaction_busy = false; nowait_fail = false;
+    assert(ft_find(&binding, cls.cookie) == e && handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && handle.packets[0] == 6 && handle.refs == 1 && !allocated);
+    cls.command = FLOW_CLS_REPLACE;
+
+    /* And a deferred deletion of a generation this adapter had retired
+     * already finds nothing more to report. */
     fixture();
     cls.nf_counter = true;
     assert(ft_replace(&binding, &cls) == 0);
@@ -8244,37 +8271,26 @@ static void test_teardown_delta(void)
     e->hw->stats = (struct cdx_ft_counters){ .packets = 5, .bytes = 5 * 298 };
     ft_neigh_invalidate(e);
     ft_retire_workfn(NULL);
-    assert(!ft_count && ft_finals_held == 1 && handle.refs == 2);
-    cls.stats = (struct flow_stats){0};
+    assert(!ft_count && handle.packets[0] == 5 && handle.refs == 1);
     cls.command = FLOW_CLS_DESTROY;
     transaction_busy = true;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
     transaction_busy = false;
-    assert(!cls.stats.pkts && !cls.stats.bytes && ft_finals_held == 1);
     ft_retire_workfn(NULL);
-    assert(!ft_finals_held && ft_finals_dropped == dropped + 3 && handle.refs == 1 && !allocated);
+    assert(handle.packets[0] == 5 && handle.reports == 1 && handle.refs == 1 && !allocated);
     cls.command = FLOW_CLS_REPLACE;
-
-    /* Unload drops whatever is still held, with the handles. */
-    fixture();
-    cls.nf_counter = true;
-    assert(ft_replace(&binding, &cls) == 0);
-    e = ft_find(&binding, cls.cookie);
-    e->hw->stats = (struct cdx_ft_counters){ .packets = 6, .bytes = 6 * 298 };
-    assert(ft_remove(e) == 0 && ft_finals_held == 1 && handle.refs == 2);
-    ft_finals_drop_all();
-    assert(!ft_finals_held && ft_finals_dropped == dropped + 4 && handle.refs == 1 && !allocated);
     cls.nf_counter = false;
     assert(!allocated && !live_hw && ft_errors == errors + 1);
 }
 
-/* A binding's release drops what was held for deletions that reach it no
- * more, with their handles -- on an unbind, and on the unload drain. */
+/* A binding released with directions still in the hardware -- its table
+ * deleted, its device taken out of the table, the unload drain -- reports
+ * what each had counted since its last report as it takes them out: no
+ * deletion can reach the binding any more, and nothing was waiting for one. */
 static void test_teardown_delta_unbind(void)
 {
     struct cdx_ft_binding *bound;
     struct cdx_ft_entry *e;
-    u64 dropped = ft_finals_dropped;
 
     list_init(&table.flow_block.cb_list);
     ft_ready=ft_stopping=false; registration_step=canceled=0;
@@ -8287,17 +8303,15 @@ static void test_teardown_delta_unbind(void)
     assert(ft_replace(bound, &cls) == 0 && ft_count == 1);
     e = ft_find(bound, cls.cookie);
     e->hw->stats = (struct cdx_ft_counters){ .packets = 8, .bytes = 8 * 298 };
-    assert(ft_remove(e) == 0 && ft_finals_held == 1 && handle.refs == 2);
-    assert(bind_device_direct(&in, FLOW_BLOCK_UNBIND) == 0 && !ft_bound);
-    assert(!ft_finals_held && ft_finals_dropped == dropped + 1 && handle.refs == 1);
+    assert(bind_device_direct(&in, FLOW_BLOCK_UNBIND) == 0 && !ft_bound && !ft_count);
+    assert(handle.packets[0] == 8 && handle.bytes[0] == 8 * 284 && handle.refs == 1);
     assert(bind_device_direct(&in, FLOW_BLOCK_BIND) == 0 && ft_bound == 1);
     bound = list_entry(ft_bindings.next, struct cdx_ft_binding, list);
     assert(ft_replace(bound, &cls) == 0 && ft_count == 1);
     e = ft_find(bound, cls.cookie);
     e->hw->stats = (struct cdx_ft_counters){ .packets = 9, .bytes = 9 * 298 };
-    assert(ft_remove(e) == 0 && ft_finals_held == 1 && handle.refs == 2);
     ask_flowtable_exit();
-    assert(!ft_bound && !ft_finals_held && ft_finals_dropped == dropped + 2);
+    assert(!ft_bound && handle.packets[0] == 17 && handle.reports == 2);
     assert(handle.refs == 1 && !allocated && !in.refs && !ft_count);
     assert(table.flow_block.cb_list.next == &table.flow_block.cb_list);
     cls.nf_counter = false;
@@ -8318,7 +8332,7 @@ static void test_device_recovery(void)
                        event == NETDEV_CHANGEADDR ? &ft_mac_invalidations : &ft_link_invalidations;
         for (unsigned tcp = 0; tcp < 2; tcp++) {
             for (unsigned egress = 0; egress < 2; egress++) {
-                struct nf_flow_offload_handle queued = {1, false}, fresh = {1, false};
+                struct nf_flow_offload_handle queued = { .refs = 1 }, fresh = { .refs = 1 };
                 u64 invalidations = *counter;
                 if (tcp) tcp_fixture(); else fixture();
                 assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
