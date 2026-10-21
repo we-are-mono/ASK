@@ -144,6 +144,7 @@ static int mutex_trylock(int *lock)
 static void mutex_unlock(int *lock) { assert(*lock); *lock = 0; }
 /* The flowtable's transaction is the control mutex. */
 static void cdx_ft_begin(void) { mutex_lock(&cdx_info->ctrl.mutex); }
+static bool cdx_ft_trybegin(void) { return mutex_trylock(&cdx_info->ctrl.mutex); }
 static void cdx_ft_end(void) { mutex_unlock(&cdx_info->ctrl.mutex); }
 static void *kcalloc(size_t n, size_t size, int flags)
 {

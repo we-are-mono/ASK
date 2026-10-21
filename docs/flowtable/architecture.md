@@ -598,7 +598,15 @@ job takes it back, so batches alone let one waiter through each. And
 /proc/cdx_flowtable sizes its buffer for the header when it is opened, so the
 header renders in one hold rather than once more at every doubling of seq_file's
 buffer. The health probe reads it only as far as the counters: each buffer of
-the rows after them would be a hold of its own.
+the rows after them would be a hold of its own. That read still waits its turn
+behind every caller queued for the transaction, and under a route-flap storm
+with traffic in software -- hundreds of Linux's offers and counter reads ahead
+of it, each holder on a CPU the softirq fills running at a few percent of it --
+the turn came after the probe's 5 s deadline while every holder let the
+transaction go (A411). So a read still waiting at the deadline fails the probe
+only if one holder has kept the transaction that long:
+`/sys/module/cdx/parameters/flowtable_hold_ms` says how long the current holder
+has held it, read without it.
 
 Pending retirement includes entries CDX parked for its own paths: a multicast
 group delete or listener swap, or an IPsec SA delete, whose barrier failed. The

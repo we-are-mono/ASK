@@ -887,6 +887,7 @@ int param_get_uint(char *buffer, const struct kernel_param *kp)
 {
     return sprintf(buffer, "%u\n", *(unsigned *)kp->arg);
 }
+#define sysfs_emit(buf, ...) sprintf(buf, __VA_ARGS__)
 #define module_param_cb(name, ops, arg, perm) \
     static const struct kernel_param name##_param __attribute__((unused)) = { (arg) }; \
     static const struct kernel_param_ops *const name##_ops __attribute__((unused)) = (ops)
@@ -1524,6 +1525,28 @@ static void test_backend(void)
     assert(!cdx_ft_trybegin() && cdx_info->ctrl.mutex);
     cdx_ft_end();
     assert(!cdx_info->ctrl.mutex);
+    /* How long the transaction's holder has held it, read without it: 0
+     * while it is free, and the time since the take while it is held,
+     * however it was taken. Nothing writes it (A411). */
+    {
+        char shown[16];
+
+        flowtable_hold_ms_ops->get(shown, &flowtable_hold_ms_param);
+        assert(!strcmp(shown, "0\n"));
+        cdx_ft_begin();
+        jiffies += HZ / 2;
+        flowtable_hold_ms_ops->get(shown, &flowtable_hold_ms_param);
+        assert(!strcmp(shown, "500\n"));
+        cdx_ft_end();
+        assert(cdx_ft_trybegin());
+        jiffies += 6 * HZ;
+        flowtable_hold_ms_ops->get(shown, &flowtable_hold_ms_param);
+        assert(!strcmp(shown, "6000\n"));
+        cdx_ft_end();
+        flowtable_hold_ms_ops->get(shown, &flowtable_hold_ms_param);
+        assert(!strcmp(shown, "0\n"));
+        assert(flowtable_hold_ms_ops->set("1", &flowtable_hold_ms_param) == -EPERM);
+    }
     cdx_ft_begin();
     /* A statistics slot is backend-owned like anything else it hands out, so
      * it is refused before the claim. Freeing nothing is always a no-op,

@@ -97,7 +97,9 @@ void cdx_ctrl_lock_with_rtnl(void)
 {
 	for (;;) {
 		rtnl_lock();
-		if (mutex_trylock(&cdx_info->ctrl.mutex))
+		/* The transaction's own trylock, so its holder is timed like any
+		 * other (flowtable_hold_ms). */
+		if (cdx_ft_trybegin())
 			return;
 		rtnl_unlock();
 		/* Waited for as cdx_ft_begin() waits, so that a job letting
@@ -109,7 +111,7 @@ void cdx_ctrl_lock_with_rtnl(void)
 
 void cdx_ctrl_unlock_with_rtnl(void)
 {
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ft_end();
 	rtnl_unlock();
 }
 

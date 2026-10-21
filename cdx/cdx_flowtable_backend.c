@@ -257,11 +257,46 @@ void cdx_flowtable_guard_exit(void)
  * cdx_ft_let_waiters(). */
 static atomic_t cdx_ft_waiting = ATOMIC_INIT(0);
 
+/* When the transaction's current holder took it, in jiffies and never 0; 0
+ * while it is free. Written by the holder, read by anyone. */
+static unsigned long ft_held_since;
+
+static void cdx_ft_taken(void)
+{
+	WRITE_ONCE(ft_held_since, jiffies ?: 1);
+}
+
+/* How long the transaction's current holder has held it, in milliseconds; 0
+ * while it is free. Read without the transaction. The health probe's read of
+ * /proc/cdx_flowtable waits for it behind every caller queued for it, which
+ * under a route-flap storm with traffic in software took seconds while every
+ * holder let it go in turn (A411): what nothing behind it gets past is a
+ * holder that keeps it, which this shows. */
+static int ft_hold_ms_get(char *buffer, const struct kernel_param *kp)
+{
+	unsigned long since = READ_ONCE(ft_held_since);
+
+	return sysfs_emit(buffer, "%u\n", since ? jiffies_to_msecs(jiffies - since) : 0);
+}
+
+static int ft_hold_ms_set(const char *val, const struct kernel_param *kp)
+{
+	return -EPERM;
+}
+
+static const struct kernel_param_ops ft_hold_ms_ops = {
+	.set = ft_hold_ms_set,
+	.get = ft_hold_ms_get,
+};
+module_param_cb(flowtable_hold_ms, &ft_hold_ms_ops, NULL, 0444);
+MODULE_PARM_DESC(flowtable_hold_ms, "How long the CDX transaction's current holder has held it (ms); 0 while it is free");
+
 void cdx_ft_begin(void)
 {
 	atomic_inc(&cdx_ft_waiting);
 	mutex_lock(&cdx_info->ctrl.mutex);
 	atomic_dec(&cdx_ft_waiting);
+	cdx_ft_taken();
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_begin, ASK_CDX_FLOWTABLE);
 
@@ -290,12 +325,16 @@ EXPORT_SYMBOL_NS_GPL(cdx_ft_let_waiters, ASK_CDX_FLOWTABLE);
 
 bool cdx_ft_trybegin(void)
 {
-	return mutex_trylock(&cdx_info->ctrl.mutex);
+	if (!mutex_trylock(&cdx_info->ctrl.mutex))
+		return false;
+	cdx_ft_taken();
+	return true;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_trybegin, ASK_CDX_FLOWTABLE);
 
 void cdx_ft_end(void)
 {
+	WRITE_ONCE(ft_held_since, 0);
 	mutex_unlock(&cdx_info->ctrl.mutex);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_end, ASK_CDX_FLOWTABLE);

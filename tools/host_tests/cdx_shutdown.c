@@ -30,6 +30,7 @@ static int mutex_trylock(bool *lock)
     *lock = true;
     return 1;
 }
+static bool cdx_ft_trybegin(void) { return mutex_trylock(&cdx_info->ctrl.mutex); }
 static void rtnl_lock(void) { assert(!rtnl && !cdx_info->ctrl.mutex); rtnl = true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
 static void kthread_stop(void *thread)

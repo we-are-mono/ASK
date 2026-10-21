@@ -37,6 +37,30 @@ def test_quiet_network_retries_failed_apply(controller):
         assert len(c.calls("-f")) == 2
 
 
+def test_health_waits_behind_a_busy_transaction(controller):
+    """A read of the backend still waiting for CDX's transaction at the deadline
+    is not a failure while the transaction changes hands: CDX says how long its
+    current holder has held it, and the probe fails on one held past the
+    deadline, which nothing behind it gets past -- not on a queue, however long,
+    of holders that each let it go (A411)."""
+    c = controller
+    hold = c.root / "cdx/parameters/flowtable_hold_ms"
+    hold.parent.mkdir(parents=True)
+    (c.root / "backend").unlink()
+    os.mkfifo(c.root / "backend")  # a read that never gets its turn
+    hold.write_text("120\n")
+    started = time.monotonic()
+    busy = c.run("health", check=False)
+    assert busy.returncode == 0 and not busy.stderr, busy
+    assert time.monotonic() - started < 2
+    hold.write_text("600\n")  # past the 500 ms deadline these tests build with
+    stuck = c.run("health", check=False)
+    assert stuck.returncode == 1 and "held for 600 ms" in stuck.stderr, stuck
+    hold.unlink()
+    unsaid = c.run("health", check=False)
+    assert unsaid.returncode == 1 and "deadline" in unsaid.stderr, unsaid
+
+
 def test_platform_health_and_reboot_budget(controller):
     """The OS owns resets; ASK spends a persistent attempt once per boot.
 

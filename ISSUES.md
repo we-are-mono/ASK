@@ -152,12 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A411 — the health probe fails a busy transaction as it would a dead one.** `ask-flowtable health` reads
-  /proc/cdx_flowtable, whose header waits for cdx's transaction behind every caller queued for it; three reads past
-  5 s reboot the board. After A402 a route flapped every 5 s under eight TCP streams still kept a read waiting 1.7-5.3 s
-  on the KASAN image: holders on a CPU the streams' softirq fills run at a few percent of it, behind up to 500 queued
-  offers and counter reads. Bounding that queue cost admission, declining (CPU churn) or FIFO (stale offers). Fix
-  direction: judge whether the transaction changes hands, not how long a turn takes.
+- [x] **A411 — the health probe failed a busy transaction as it would a dead one.** A read still waiting for cdx's
+  transaction at the deadline now fails only if one holder has kept it that long (`flowtable_hold_ms`), and RTNL is
+  asked first (_:/^cdx, flowtable: fail the health probe on a held transaction_).
 
 - [x] **A410 — a peer flow went dark ~9 s at a case's start after a bridged case.** The LAN VM kept the bridge's MAC for
   its gateway; every case now starts with what the VM learned forgotten (_:/^tests: start every case with the LAN VM_).

@@ -19,12 +19,18 @@ enable automatic recovery because fault tests deliberately stop the datapath.
   available; keep the OS watchdog running.
 
 `ask-flowtable health` returns 0 while networking is responsive and 1 on
-invalid diagnostics or a five-second probe timeout. It checks RTNL even when no
-flow exists. A CDX datapath restart after an unproven deletion is healthy
-however long it waits: the classifier is bypassed and the ports forward in
-software meanwhile (`bypassed 1` in `/proc/cdx_flowtable`, the wait in
+invalid diagnostics, RTNL not answering within five seconds, or CDX's
+transaction held by one holder for five seconds. It checks RTNL even when no
+flow exists. Its read of `/proc/cdx_flowtable` waits for the transaction behind
+every caller queued for it; still waiting at the deadline while the
+transaction changes hands (`/sys/module/cdx/parameters/flowtable_hold_ms`, how
+long the current holder has held it, below five seconds), the datapath is busy,
+not dead, and the probe passes (A411). A CDX datapath restart after an
+unproven deletion is healthy however long it waits: the classifier is bypassed
+and the ports forward in software meanwhile (`bypassed 1` in
+`/proc/cdx_flowtable`, the wait in
 `/sys/module/cdx/parameters/flowtable_degraded_reason`). A blocked kernel
-reader cannot prevent the command's parent from reporting failure.
+reader cannot prevent the command's parent from reporting.
 
 The monitor resets the platform after three consecutive failed probes; nothing
 resets it at once. A slow but live datapath (a probe over its deadline, a
