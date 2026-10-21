@@ -130,7 +130,16 @@ static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct) { assert(ct->ref
 static bool nf_ct_is_dying(struct nf_conn *ct) { return ct->dying; }
 static void nf_ct_put(struct nf_conn *ct) { assert(ct->refs); ct->refs--; }
 static bool nf_flowtable_hw_offload(struct nf_flowtable *table) { return table->hardware; }
-static void nf_flow_offload_add(struct nf_flowtable *table, struct flow_offload *flow) { adds++; }
+/* The replace work nf_flow_offload_add() queues, counted as an offer. */
+enum flow_cls_command { FLOW_CLS_REPLACE };
+struct flow_offload_work { int unused; };
+static struct flow_offload_work offer;
+static struct flow_offload_work *nf_flow_offload_work_alloc(struct nf_flowtable *table,
+                                                            struct flow_offload *flow,
+                                                            unsigned int cmd)
+{ assert(cmd == FLOW_CLS_REPLACE); return &offer; }
+static void flow_offload_queue_work(struct flow_offload_work *work) { assert(work == &offer); adds++; }
+void nf_flow_offload_add(struct nf_flowtable *table, struct flow_offload *flow);
 static void nf_flow_offload_del(struct nf_flowtable *table, struct flow_offload *flow)
 { deletes++; set_bit(NF_FLOW_HW_DYING, &flow->flags); }
 static void nf_flow_offload_stats(struct nf_flowtable *table, struct flow_offload *flow) { stats++; }
@@ -270,5 +279,22 @@ int main(void)
     flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
     assert(!nf_flow_offload_handle_valid(NULL) && !nf_flow_offload_handle_invalidate(NULL));
     nf_flow_offload_handle_put(NULL);
+    /* A flow the table cached before a driver asked it for handles has none,
+     * and that driver can admit no offer without one. Offered again once the
+     * table has such a driver, it is retired instead, so that its next packet
+     * adds a flow that has one; until then it is offered as always. */
+    table.use_hw_handles = false;
+    flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0 && !flow->hw_handle);
+    unsigned offers = adds, retirements = teardowns;
+    nf_flow_offload_add(&table, flow);
+    assert(adds == offers + 1 && teardowns == retirements);
+    table.use_hw_handles = true;
+    nf_flow_offload_add(&table, flow);
+    assert(adds == offers + 1 && teardowns == retirements + 1);
+    assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+    flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+    flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0 && flow->hw_handle);
+    assert(adds == offers + 2 && teardowns == retirements + 1);
+    flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
     puts("Flowtable handles: opt-in allocation, rollback, shared ownership, the conntrack held for accounting, lookup, GC, RCU and generation isolation passed");
 }

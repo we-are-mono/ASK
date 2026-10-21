@@ -2606,8 +2606,17 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	 * of a mass readmission's offers (A139) and of the counter reads Linux
 	 * makes of every offloaded flow, and each would otherwise wait its turn
 	 * only to find nothing (A351). A deletion of nothing marks and records
-	 * nothing. Each is answered as finding nothing always was. */
-	if (!ft_request_owned(binding, cls))
+	 * nothing. Each is answered as finding nothing always was.
+	 *
+	 * So is every command about a flow with no handle. A table caches
+	 * such flows before its first live binding -- one made while another
+	 * table's binding exists may find it populated -- and nothing names
+	 * them: admission refuses an offer without a valid handle
+	 * (ft_parse()), so no entry holds a missing one. A deletion that
+	 * found the transaction held would otherwise record the handle it
+	 * does not have. Netfilter retires these flows itself once the table
+	 * has a live binding, and their next packets come back with one. */
+	if (!ft_request_owned(binding, cls) || !cls->nf_handle)
 		return cls->command == FLOW_CLS_DESTROY ? 0 :
 		       cls->command == FLOW_CLS_STATS ? -ENOENT : -EOPNOTSUPP;
 	/* Linux deletes one flow per work item, from an unbound workqueue

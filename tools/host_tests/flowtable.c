@@ -725,16 +725,18 @@ static struct nf_flow_offload_handle handle;
 static unsigned handle_validity_checks;
 static bool nf_flow_offload_handle_valid(const struct nf_flow_offload_handle *h)
 { handle_validity_checks++; return h && !h->invalid; }
+/* NULL as the kernel's take it: invalidate and put ignore a missing handle,
+ * and get, a bare reference increment there, must never be handed one. */
 static bool nf_flow_offload_handle_invalidate(struct nf_flow_offload_handle *h)
-{ bool old = h->invalid; h->invalid = true; return !old; }
+{ if (!h) return false; bool old = h->invalid; h->invalid = true; return !old; }
 /* The handle the adapter last took policy invalidation over for. */
 static const struct nf_flow_offload_handle *watched_handle;
 static void nf_flow_offload_handle_watch(struct nf_flow_offload_handle *h)
 { assert(h && !h->invalid); watched_handle = h; }
 static void nf_flow_offload_handle_get(struct nf_flow_offload_handle *h)
-{ assert(h->refs); h->refs++; }
+{ assert(h && h->refs); h->refs++; }
 static void nf_flow_offload_handle_put(struct nf_flow_offload_handle *h)
-{ assert(h->refs > 1); h->refs--; }
+{ if (!h) return; assert(h->refs > 1); h->refs--; }
 /* Only while the adapter still holds the handle: the conntrack is the
  * handle's to keep, not the adapter's. */
 static void nf_flow_offload_handle_account(struct nf_flow_offload_handle *h, unsigned dir,
@@ -6186,6 +6188,37 @@ static void test_batched_retirement(void)
         assert(gens[0].refs == 1 && gens[2].refs == 1 && next.refs == 1);
         assert(!ft_count && !live_hw && !allocated && !ft_handle_refs && !ft_invalid);
         assert(ft_errors == errors + 1);
+    }
+
+    /* A flow its table cached before its first live binding carries no
+     * handle, and no entry can name one. Its deletion, counter read and offer
+     * are answered without the transaction, as a visit to a port that owns
+     * nothing of the flow is: a deletion that found the transaction held
+     * would otherwise have recorded the missing handle. Nothing is retired,
+     * recorded or walked. */
+    {
+        unsigned tries, records = nowait_allocations, checks;
+        u64 deferrals = ft_destroy_deferrals, rejected = ft_rejects;
+
+        fixture();
+        connection_rule(0);
+        cls.nf_handle = NULL;
+        tries = transaction_tries;
+        checks = handle_validity_checks;
+        work_queued_retire = false;
+        transaction_busy = true;
+        cls.command = FLOW_CLS_DESTROY;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        cls.command = FLOW_CLS_STATS;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -ENOENT);
+        cls.command = FLOW_CLS_REPLACE;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+        transaction_busy = false;
+        assert(transaction_tries == tries && ft_destroy_deferrals == deferrals);
+        assert(nowait_allocations == records && !ft_deferred_destroys.first);
+        assert(!work_queued_retire && !ft_retire_scan && handle_validity_checks == checks);
+        assert(!ft_count && !live_hw && ft_rejects == rejected && !ft_invalid);
+        cls.nf_handle = &handle;
     }
 
     /* A record whose entry left with its binding: the release takes the entry

@@ -11,6 +11,7 @@ from _kernel_source import (kernel_source)
 def test_lifecycle(tmp_path):
     kernel = kernel_source()
     source = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
+    offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     (tmp_path / "handle_production.inc").write_text(
         source[source.index("struct nf_flow_offload_handle {"):
                source.index("static void\nflow_offload_fill_dir")]
@@ -19,7 +20,8 @@ def test_lifecycle(tmp_path):
         + function(source, "flow_offload_add")
         + source[source.index("struct flow_offload_tuple_rhash *\nflow_offload_lookup"):
                  source.index("EXPORT_SYMBOL_GPL(flow_offload_lookup);")]
-        + function(source, "nf_flow_offload_gc_step"))
+        + function(source, "nf_flow_offload_gc_step")
+        + function(offload, "nf_flow_offload_add"))
     binary = tmp_path / "flowtable_handle"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",

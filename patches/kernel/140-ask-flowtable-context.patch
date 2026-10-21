@@ -1,4 +1,4 @@
-From 3c2605c39d6284b65330275903b19896fa62dc15 Mon Sep 17 00:00:00 2001
+From 33dd20dd67f5fda54e9064fa5ff380fce0a4654a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
@@ -11,7 +11,9 @@ the ingress device, the MTU, the counter mode and a handle the flow
 shares with its driver: Linux or the driver can invalidate it, and the
 flowtable GC then retires that generation. IPv4 and IPv6 route changes
 are announced as netevents, and FLOWI_FLAG_NO_OIF_FALLBACK lets a
-table's reverse lookup respect a withdrawn or blackhole route.
+table's reverse lookup respect a withdrawn or blackhole route. A flow the
+table cached before its driver asked for handles has none, and is
+retired rather than offered, so that its next packet adds one that has.
 
 Each flow records the XFRM policy generation it was created under. While
 any policy or blocking default exists, a table whose driver uses handles
@@ -48,22 +50,22 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/net/flow_offload.h                |  47 +++++++
  include/net/netevent.h                    |  32 +++++
  include/net/netfilter/nf_conntrack_acct.h |   3 +-
- include/net/netfilter/nf_flow_table.h     |  81 ++++++++++++
+ include/net/netfilter/nf_flow_table.h     |  81 +++++++++++
  include/net/netns/xfrm.h                  |   2 +
- include/net/xfrm.h                        | 106 +++++++++++++--
+ include/net/xfrm.h                        | 106 ++++++++++++--
  net/ipv4/fib_trie.c                       |  20 +++
  net/ipv4/route.c                          |   3 +-
- net/ipv6/ip6_fib.c                        |  23 ++++
+ net/ipv6/ip6_fib.c                        |  23 +++
  net/netfilter/nf_conntrack_core.c         |   3 +-
- net/netfilter/nf_flow_table_core.c        | 123 ++++++++++++++++-
+ net/netfilter/nf_flow_table_core.c        | 123 +++++++++++++++-
  net/netfilter/nf_flow_table_ip.c          |  25 +++-
- net/netfilter/nf_flow_table_offload.c     | 153 ++++++++++++++++++++--
- net/netfilter/nft_flow_offload.c          | 102 ++++++++++++---
+ net/netfilter/nf_flow_table_offload.c     | 163 ++++++++++++++++++++--
+ net/netfilter/nft_flow_offload.c          | 102 +++++++++++---
  net/xfrm/xfrm_device.c                    |  29 +++-
- net/xfrm/xfrm_policy.c                    | 124 +++++++++++++++++-
+ net/xfrm/xfrm_policy.c                    | 124 +++++++++++++++-
  net/xfrm/xfrm_state.c                     |  25 +++-
  net/xfrm/xfrm_user.c                      |   6 +
- 21 files changed, 904 insertions(+), 87 deletions(-)
+ 21 files changed, 914 insertions(+), 87 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index d10bbe4c3571..f910915934cb 100644
@@ -1199,7 +1201,7 @@ index 98edcaa37b38..ff35d601699a 100644
  	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
  	if (ret < 0)
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 8e3edc7c37b3..e6fc6c79362c 100644
+index 8e3edc7c37b3..2c406fb74ec6 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -12,6 +12,7 @@
@@ -1436,7 +1438,24 @@ index 8e3edc7c37b3..e6fc6c79362c 100644
  		clear_bit(NF_FLOW_HW_PENDING, &flow->flags);
  		return NULL;
  	}
-@@ -1130,20 +1247,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
+@@ -1110,6 +1227,16 @@ void nf_flow_offload_add(struct nf_flowtable *flowtable,
+ {
+ 	struct flow_offload_work *offload;
+ 
++	/* A flow the table cached before a driver asked it for handles has
++	 * none, and that driver can admit no offer without one: retire the
++	 * flow instead of offering it, so its next packet adds one that has a
++	 * handle rather than offering this one again every second until it
++	 * expires. */
++	if (!flow->hw_handle && READ_ONCE(flowtable->use_hw_handles)) {
++		flow_offload_teardown(flow);
++		return;
++	}
++
+ 	offload = nf_flow_offload_work_alloc(flowtable, flow, FLOW_CLS_REPLACE);
+ 	if (!offload)
+ 		return;
+@@ -1130,20 +1257,36 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
  	flow_offload_queue_work(offload);
  }
  
