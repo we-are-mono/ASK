@@ -368,6 +368,57 @@ static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
 	spin_unlock_bh(&ft_watch_lock);
 }
 
+static bool ft_through(const struct cdx_ft_entry *entry, const void *dev)
+{
+	return ft_entry_uses(entry, dev);
+}
+
+/* A port about to stop leaves the classifier's reach before it does. The
+ * stop's first act is to mark the port's transmit side down in the record the
+ * microcode checks before it sends (dpa_stop(), dpa_update_eth_if()), some
+ * 200 ms before the MAC stops. From then on an entry still linked that sends
+ * to the port counts every frame it matches and hands the frame to Linux
+ * instead, where conntrack counts it again on its way to the stopped port,
+ * which drops it: one datagram counted twice and delivered nowhere. The worker
+ * the invalidation queued races the stop and need not get there first. So
+ * every direction and every bridged pair through the port goes here, before
+ * the notifier returns: unlinked, each direction's last delta reported as any
+ * unlink reports it, and the barrier that proves the firmware has left them
+ * completed. A direction arriving by the port goes as well: it is one the
+ * invalidation above has just retired anyway, and taking everything through
+ * the port keeps each batch's walk from passing over the same entries again.
+ *
+ * Under the RTNL the notifier holds. Nothing that holds the transaction waits
+ * for RTNL -- admission and the datapath's restart only try for it -- so a
+ * holder of RTNL may wait for the transaction, as a binding's release at
+ * unregistration, a tc change's egress drain and Netfilter's own NETDEV_DOWN
+ * flush, whose callbacks take it, already do. A batch per hold of the
+ * transaction, let go between batches as a binding's release lets it go. A
+ * failure CDX is recovering from changes none of this: the ports walk the
+ * tables until its restart sends them past the classifier, and that takes the
+ * RTNL held here. An unload retires everything itself, and the notifier's
+ * removal replays this event for every port that is up. */
+static void ft_port_stopping(const struct net_device *dev)
+{
+	bool stopping;
+
+	if (READ_ONCE(ft_stopping) || ft_device_role(dev) != FT_DEV_PORT)
+		return;
+	cdx_ft_begin();
+	while (!ft_stopping && ft_retire_batch(ft_through, dev)) {
+		cdx_ft_end();
+		cond_resched();
+		cdx_ft_begin();
+	}
+	/* An unload that began between two batches retires the rest; what
+	 * the batches before it unlinked is proven here all the same. */
+	ft_settle();
+	stopping = ft_stopping;
+	cdx_ft_end();
+	if (!stopping)
+		ft_l2_egress_drain(dev);
+}
+
 /* A port, or a VLAN of one, that stops forwarding has to stop carrying
  * software flows as well as hardware ones. ft_device_retire() reaches only
  * entries this adapter admitted. A flow it refused, never saw, or that
@@ -535,6 +586,10 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		/* Native DOWN also flushes flowtable work. Admission rechecks
 		 * both ports under RTNL; UP never clears failure state. */
 		ft_device_retire(dev, &ft_link_invalidations);
+		/* A port stopping, rather than one that lost its carrier, which
+		 * marks nothing down in the hardware: out of it first. */
+		if (event == NETDEV_GOING_DOWN)
+			ft_port_stopping(dev);
 		/* A multicast flow's ports are not flowtable entries and no
 		 * admission recheck reaches them, so they need telling
 		 * separately: every flow naming the device is asked of the

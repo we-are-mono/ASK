@@ -1570,8 +1570,10 @@ void ft_l2_dev_changed(const struct net_device *dev)
  * when the worker gets to the mark ft_egress_changed() left -- an entry still
  * enqueuing by the old plan would transmit on the new owner's queues. A pair
  * admitted from here on reads the new plan; one built across the change
- * found ft_egress_changes moved and was taken out again. Takes the
- * transaction. */
+ * found ft_egress_changes moved and was taken out again. The same for a port
+ * about to stop (ft_port_stopping()), whose stop marks it down for the
+ * microcode, which then hands Linux what a pair sending to it matches.
+ * Takes the transaction. */
 static bool ft_l2_on_port(const struct ft_l2_pair *p, const void *dev)
 {
 	return p->rule.in == dev || p->rule.out == dev;

@@ -59,7 +59,7 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_retire_bound", "ft_release",
              "ft_bind_admissible", "ft_passive_callback", "ft_bind_passive",
              "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
-             "ft_any_entry", "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire",
+             "ft_any_entry", "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire", "ft_through", "ft_port_stopping",
              "ft_port_stopped", "ft_stopped_clean", "ft_stopped_workfn", "ft_netdev_event",
              "ft_out_port", "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_egress_drain", "ft_egress_restarted", "ft_block_drain", "ft_hw_settle", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit", "ft_position_l2", "ft_position", "ft_start", "ft_next", "ft_stop"]
     (tmp_path / "flowtable_production.inc").write_text(

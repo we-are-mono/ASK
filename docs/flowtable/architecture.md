@@ -443,7 +443,14 @@ The required ordering and wait boundaries are:
   Shutdown stops its timer before releasing both locks between cleanup retries.
 - Netfilter work flushes always happen outside a backend transaction.
 - Notifiers inspect immutable dependencies under `ft_watch_lock`, latch
-  invalidation and queue work. They never start a backend transaction.
+  invalidation and queue work. They never start a backend transaction, with
+  one exception: a port's `NETDEV_GOING_DOWN` takes every direction and
+  bridged pair through the port out of the hardware itself, a batch per hold
+  of the transaction, under the RTNL the event arrives with. Nothing holding
+  the transaction waits for RTNL except by trying, so a holder of RTNL may
+  wait for the transaction. A binding's release at unregistration, a tc
+  change's egress drain and Netfilter's own `NETDEV_DOWN` flush (its
+  callbacks take the transaction) already do.
 - Neighbour callbacks nest `ft_watch_lock` inside the neighbour lock. No path
   takes a neighbour lock or begins a transaction while holding the watch lock.
 
@@ -458,6 +465,23 @@ immediately. Hardware retirement is asynchronous; native GC removes the obsolete
 generation and fresh traffic can be admitted after resolution. Cause counters
 count newly invalidated generations once per handle, not directions; concurrent
 causes can coalesce. Hardware retirement errors escalate to global recovery.
+
+A port about to stop is the exception: its directions and bridged pairs leave
+the hardware, reported and behind a completed barrier, before
+`NETDEV_GOING_DOWN` returns. The stop's first act (`dpa_stop()` →
+`dpa_update_eth_if()`) marks the port's transmit side down in the record the
+microcode checks before it sends, 200 ms before the MAC stops. An entry still
+linked that sends to the port then counts each frame it matches and hands the
+frame to Linux instead. Conntrack counts the frame again, and the stopped
+port's queue drops it.
+
+Measured with 10,000 flows on a production-like kernel:
+- **Before:** about 1,400 replies were counted twice when the LAN port went
+  down or left the namespace.
+- **After:** none were. The close holds RTNL longer by the retirement it now
+  waits for, 130–190 ms.
+
+A lost carrier marks nothing down in the hardware and stays asynchronous.
 
 | Change | Scope and recovery |
 | --- | --- |
@@ -784,7 +808,9 @@ The residuals, each bounded:
   bytes per frame.
 - **Punts.** A frame punted after its hit was counted here is counted again by
   the path that handled it. That is bounded by exception traffic (TTL, MTU,
-  TCP state), which is zero on a healthy flow.
+  TCP state), which is zero on a healthy flow. A port marked down would punt
+  every frame sent to it, which is why a stopping port's entries leave the
+  hardware first (see dependency retirement).
 - **The read after the unlink.** The final counters are read once the entry's
   pieces are unlinked, not after the barrier that proves the firmware has left
   them: a frame whose classifier walk began before the unlink is counted after

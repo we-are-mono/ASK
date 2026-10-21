@@ -547,7 +547,6 @@ static struct list_head *ft_l2_row_next(struct list_head *row)
            &l2_rows[i + 1] : NULL;
 }
 static unsigned l2_egress_drains;
-static int ft_l2_egress_drain(const struct net_device *dev) { (void)dev; l2_egress_drains++; return 0; }
 /* The Wi-Fi VAP registration lives in its own file and has its own harness
  * (wifi_admission.c); here the notifier's calls into it only count. */
 static unsigned wifi_reconsiders, wifi_address_changes, wifi_devices_gone;
@@ -1558,6 +1557,8 @@ static int ft_mc_egress_drain(const struct net_device *dev)
 { assert(!cdx_info->ctrl.mutex); mc_drains++; return mc_drain_rc; }
 static int ft_mr_egress_drain(const struct net_device *dev)
 { assert(!cdx_info->ctrl.mutex); mr_drains++; return mr_drain_rc; }
+static int ft_l2_egress_drain(const struct net_device *dev)
+{ (void)dev; assert(!cdx_info->ctrl.mutex); l2_egress_drains++; return 0; }
 /* What the encoder would write into the two PPPoE opcodes, recorded so a test
  * can require the index rather than the slot pointer: a direction that strips
  * counts into its session's receive half, one that inserts into the transmit
@@ -1792,7 +1793,14 @@ static void msleep(unsigned ms)
 /* Where a walk retiring entries a batch at a time lets the transaction go:
  * only ever outside it, and counted, so a case can say how many times. */
 static unsigned reschedules;
-static void cond_resched(void) { assert(!cdx_info->ctrl.mutex); reschedules++; }
+/* An unload that begins while a batched walk has let the transaction go. */
+static bool stop_on_reschedule;
+static void cond_resched(void)
+{
+    assert(!cdx_info->ctrl.mutex);
+    reschedules++;
+    if (stop_on_reschedule) { stop_on_reschedule = false; ft_stopping = true; }
+}
 #define NF_BR_LOCAL_OUT 3
 #define NF_BR_POST_ROUTING 4
 static unsigned bridge_hooks;
@@ -8411,7 +8419,10 @@ static void test_device_recovery(void)
                  * MTU it fragments SEC's output to, its MTU: each asks the
                  * SA to follow. Going down retires flows and leaves SAs. */
                 assert(ipsec_marked_device == marked + (event == NETDEV_GOING_DOWN ? 0 : 2));
-                assert(!ft_invalid && !ft_invalid_done && ft_count == 2 && handle.refs == 3);
+                /* A port going down has its entries out of the hardware by
+                 * the time the event returns; the others wait for the worker. */
+                unsigned left = event == NETDEV_GOING_DOWN ? 0 : 2;
+                assert(!ft_invalid && !ft_invalid_done && ft_count == left && handle.refs == 1 + left);
                 ft_retire_workfn(NULL);
                 assert(ft_bound == 1 && !ft_count && !ft_handle_refs && !ft_neighbour_refs);
                 assert(handle.refs == 1 && in.refs == 1 && !out.refs && !live_hw);
@@ -8441,7 +8452,9 @@ static void test_device_recovery(void)
                 ft_fib_event(NULL, FIB_EVENT_RULE_ADD, &policy);
                 ft_netdev_event(NULL, event, &info);
                 ft_retire_workfn(NULL);
-                assert(ft_invalid && !ft_invalid_done && ft_count == 1 && fresh.invalid);
+                /* The latch holds the worker off, not a port that is stopping. */
+                assert(ft_invalid && !ft_invalid_done && fresh.invalid &&
+                       ft_count == (event == NETDEV_GOING_DOWN ? 0 : 1));
                 ft_invalidate_work(NULL);
                 assert(ft_invalid_done && ft_invalid && !ft_count);
                 ft_netdev_event(NULL, event, &info);
@@ -8500,6 +8513,115 @@ static void test_device_recovery(void)
     assert(ft_remove(ft_find(&binding, cls.cookie)) == 0);
     ft_stopping = false;
     assert(ft_installs == ft_deletes && !allocated);
+}
+
+/* A port about to stop has every direction through it out of the hardware,
+ * proven and accounted for, by the time the notifier returns: the stop marks
+ * the port's transmit side down for the microcode, which then counts what a
+ * linked entry sending to it matches and hands the frame to Linux, to be
+ * counted again. Under the RTNL the notifier arrives with, the transaction let
+ * go between batches. A lost carrier stops nothing in the hardware, nor does a
+ * device that is not a port, and an unload retires everything itself: those
+ * go to the worker, or to the unload, as before. */
+static void test_stopping_port(void)
+{
+    struct netdev_notifier_info info;
+    struct cdx_ft_entry *e;
+    unsigned settled, yields, drains;
+
+    for (unsigned egress = 0; egress < 2; egress++) {
+        fixture();
+        cls.nf_counter = true;
+        assert(ft_replace(&binding, &cls) == 0);
+        e = ft_find(&binding, cls.cookie);
+        e->hw->stats = (struct cdx_ft_counters){ .packets = 6, .bytes = 6 * 298 };
+        settled = settles; drains = l2_egress_drains;
+        info.dev = egress ? &out : &in;
+        rtnl = true;
+        assert(ft_netdev_event(NULL, NETDEV_GOING_DOWN, &info) == NOTIFY_DONE);
+        assert(rtnl && !cdx_info->ctrl.mutex && !ft_watch_lock);
+        rtnl = false;
+        assert(handle.invalid && !ft_count && !live_hw && !owed && settles == settled + 1);
+        assert(handle.packets[0] == 6 && handle.bytes[0] == 6 * 284 && handle.refs == 1);
+        /* And the bridged pairs through the port, which no flow is. */
+        assert(l2_egress_drains == drains + 1);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && settles == settled + 1 && !allocated && !ft_invalid);
+    }
+
+    /* Batches behind one barrier, the transaction let go between them. */
+    fixture();
+    for (unsigned i = 0; i < 2 * FT_RETIRE_BATCH + 1; i++) {
+        connection_rule(i);
+        assert(ft_replace(&binding, &cls) == 0);
+    }
+    settled = settles; yields = reschedules;
+    info.dev = &out;
+    rtnl = true;
+    ft_netdev_event(NULL, NETDEV_GOING_DOWN, &info);
+    rtnl = false;
+    assert(!ft_count && !live_hw && !owed && settles == settled + 1);
+    assert(reschedules == yields + 2 && handle.refs == 1 && !allocated);
+
+    /* An unload beginning between two batches leaves it the rest, and what
+     * the first batch unlinked is proven all the same. */
+    fixture();
+    for (unsigned i = 0; i < 2 * FT_RETIRE_BATCH + 1; i++) {
+        connection_rule(i);
+        assert(ft_replace(&binding, &cls) == 0);
+    }
+    settled = settles; drains = l2_egress_drains;
+    stop_on_reschedule = true;
+    rtnl = true;
+    ft_netdev_event(NULL, NETDEV_GOING_DOWN, &info);
+    rtnl = false;
+    assert(ft_stopping && !stop_on_reschedule && !cdx_info->ctrl.mutex);
+    assert(ft_count == FT_RETIRE_BATCH + 1 && !owed && settles == settled + 1);
+    assert(l2_egress_drains == drains);
+    ft_stopping = false;
+    ft_netdev_event(NULL, NETDEV_GOING_DOWN, &info);
+    assert(!ft_count && !live_hw && !owed && handle.refs == 1 && !allocated);
+
+    /* A failure CDX is recovering from changes nothing: the ports walk the
+     * tables until its restart sends them past the classifier, which needs
+     * the RTNL the stop holds. */
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    ft_fatal = true; drains = l2_egress_drains;
+    info.dev = &out;
+    rtnl = true;
+    ft_netdev_event(NULL, NETDEV_GOING_DOWN, &info);
+    rtnl = false;
+    ft_fatal = false;
+    assert(!ft_count && !live_hw && !owed && l2_egress_drains == drains + 1 && handle.refs == 1);
+
+    /* What stops nothing the hardware sends to, or is an unload, whose
+     * notifier removal replays the event for every port that is up. */
+    for (unsigned which = 0; which < 3; which++) {
+        struct net_device unrelated = { .ifindex = 77 };
+
+        fixture();
+        assert(ft_replace(&binding, &cls) == 0);
+        info.dev = which == 1 ? &unrelated : &out;
+        if (which == 0) out.carrier_lost = true;
+        if (which == 2) ft_stopping = true;
+        drains = l2_egress_drains;
+        rtnl = true;
+        ft_netdev_event(NULL, which == 0 ? NETDEV_CHANGE : NETDEV_GOING_DOWN, &info);
+        rtnl = false;
+        assert(ft_count == 1 && live_hw == 1 && l2_egress_drains == drains);
+        assert(handle.invalid == (which != 1) && !cdx_info->ctrl.mutex);
+        out.carrier_lost = false;
+        if (which == 2) {
+            assert(ft_remove(ft_find(&binding, cls.cookie)) == 0);
+            ft_stopping = false;
+            continue;
+        }
+        if (which == 1)
+            ft_neigh_invalidate(ft_find(&binding, cls.cookie));
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !live_hw && handle.refs == 1 && !allocated);
+    }
 }
 
 static void test_nexthop_objects(void)
@@ -9241,6 +9363,7 @@ int main(void)
     test_counter_accounting();
     test_teardown_delta();
     test_device_recovery();
+    test_stopping_port();
     test_transient_admission();
     test_allocation_admission_recovery();
     test_installed_reoffer();

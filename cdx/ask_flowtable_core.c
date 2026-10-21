@@ -4,7 +4,9 @@
  * Backend transactions serialize hardware operations and adapter lists. Rule callbacks are
  * process-context NF workqueue callbacks. Binding release runs after the
  * flow-block core excludes callbacks. Notifiers only latch invalidation and
- * queue work; they never start a backend transaction. Dependency notifications inspect
+ * queue work; they never start a backend transaction, except for a port about
+ * to stop, which leaves the hardware under the RTNL its NETDEV_GOING_DOWN
+ * arrives with (ft_port_stopping()). Dependency notifications inspect
  * bound devices and immutable flow dependencies under ft_watch_lock. Neighbour
  * notifications nest this lock inside neigh->lock, and bridge FDB
  * notifications nest it inside the bridge's own hash lock, from softirq.

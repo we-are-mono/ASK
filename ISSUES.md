@@ -152,6 +152,18 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A408 — a UDP flow whose replies only ever crossed in hardware loses its conntrack at teardown.** Netfilter
+  offloads UDP on the first datagram after its conntrack is confirmed, so a flow whose first reply is lost (on the rig:
+  one of the first flows of a 1,000-flow burst on the KASAN image) can be in hardware before any reply reaches
+  software. Hardware stats and final deltas count its replies but never set `IPS_SEEN_REPLY`, and at any teardown
+  `flow_offload_fixup_ct()` gives an unreplied UDP conntrack `nf_conntrack_udp_timeout` (30 s) minus
+  `nf_flowtable_udp_timeout` (30 s): zero. Measured at `ip link set eth3 down`: an `[UNREPLIED]` conntrack holding 17
+  original and 14 reply packets destroyed by timeout, and a new one created 1.6 ms later by the next datagram. Its
+  counts were lost, and a masqueraded flow would lose its NAT mapping as well. Fix direction: mark the conntrack replied
+  when hardware reports reply-direction packets (patch 140, the stats fold and `nf_flow_offload_handle_account()`), as
+  `nf_conntrack_in()` does for a software reply; check UDP's stream/ASSURED handling and the IPCT_REPLY event.
+  `flowtable_burst_accounting.py` answers each flow's first datagram through software before streaming, to stay clear.
+
 - [x] **A407 — a burst of deletions dropped most flows' last delta.** Every unlink now reports it through the flow's
   handle, which holds the conntrack; the unbind sweep that recreated flows in a deleted table is gone (_:/^netfilter, cdx: report a hardware flow's last delta through its handle_).
 
