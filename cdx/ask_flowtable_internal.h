@@ -231,6 +231,13 @@ struct cdx_ft_entry {
  * each hold the transaction for milliseconds, not one walk that held it for 13
  * seconds (A327). */
 #define FT_RETIRE_BATCH 64U
+/* The most deferred deletions one run of the retirement work looks at. A
+ * record whose entry something else took out first -- the walk a route change
+ * asks for, a binding's release -- unlinks nothing, so FT_RETIRE_BATCH alone
+ * never ended a run over them: after a route change one run went through every
+ * deletion Linux had made of the table, 1.3 s in one hold on the KASAN image
+ * (A402). */
+#define FT_RETIRE_VISIT_BATCH (4 * FT_RETIRE_BATCH)
 /* The most unlinks a retirement leaves owed between its batches. A barrier is
  * a host-command round trip, two milliseconds on the KASAN image, and one
  * proves every unlink before it, so a retirement asks for one only every this

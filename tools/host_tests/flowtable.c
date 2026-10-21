@@ -1041,6 +1041,21 @@ static void schedule_delayed_work(int *work, unsigned delay)
 static unsigned neigh_scheduled, dev_stats_scheduled, stopped_scheduled, follow_scheduled,
                 settle_scheduled;
 static int ft_ipsec_retire, ft_ipsec_follow, ft_ipsec_stats;
+/* The retirement work goes to the unbound workqueue, never to the CPU that
+ * queued it, where the softirq load of the traffic it retires could starve it
+ * of everything but a sliver of that CPU with the transaction held (A402). */
+static int system_unbound_wq_stub;
+#define system_unbound_wq (&system_unbound_wq_stub)
+static bool queueing_unbound;
+static void schedule_work(int *work);
+static bool queue_work(int *wq, int *work)
+{
+    assert(wq == system_unbound_wq && work == &ft_retire_work);
+    queueing_unbound = true;
+    schedule_work(work);
+    queueing_unbound = false;
+    return true;
+}
 static void schedule_work(int *work)
 {
     if (work == &ft_mr_work) { mroute_kicks++; return; }
@@ -1053,7 +1068,7 @@ static void schedule_work(int *work)
     }
     assert(work == &ft_retire_work || work == &ft_dev_stats_work);
     if (work == &ft_dev_stats_work) { dev_stats_scheduled++; work_queued_dev_stats = true; }
-    else { neigh_scheduled++; work_queued_retire = true; }
+    else { assert(queueing_unbound); neigh_scheduled++; work_queued_retire = true; }
 }
 /* Which devices native cleanup was asked for, in order, and how many of those
  * calls ran under RTNL -- the stopped-port sweep's are all expected to. */
@@ -1285,10 +1300,26 @@ static int atomic_xchg(int *v, int n) { int old = *v; *v = n; return old; }
 struct llist_node { struct llist_node *next; };
 struct llist_head { struct llist_node *first; };
 #define LLIST_HEAD(name) struct llist_head name = { NULL }
+/* Every record put on the list, the first time or again. */
+static unsigned llist_adds;
 static bool llist_add(struct llist_node *node, struct llist_head *head)
-{ bool empty = !head->first; node->next = head->first; head->first = node; return empty; }
+{ bool empty = !head->first; node->next = head->first; head->first = node; llist_adds++; return empty; }
 static struct llist_node *llist_del_all(struct llist_head *head)
 { struct llist_node *first = head->first; head->first = NULL; return first; }
+static bool llist_empty(const struct llist_head *head) { return !head->first; }
+static struct llist_node *llist_reverse_order(struct llist_node *head)
+{
+    struct llist_node *reversed = NULL;
+
+    while (head) {
+        struct llist_node *next = head->next;
+
+        head->next = reversed;
+        reversed = head;
+        head = next;
+    }
+    return reversed;
+}
 #define llist_entry(p, t, m) container_of(p, t, m)
 #define llist_for_each_entry_safe(pos, n, node, member)                         \
     for (pos = llist_entry((node), typeof(*pos), member);                      \
@@ -6315,6 +6346,58 @@ static void test_batched_retirement(void)
         assert(!live_hw && !allocated && !ft_handle_refs);
     }
 
+    /* Records whose entries something else took out first -- the walk a
+     * route change asks for, a binding's release -- each cost a run a lookup,
+     * a handle and a free, and unlink nothing. A run visits at most
+     * FT_RETIRE_VISIT_BATCH records, and never one twice: after a route
+     * change one run went through every deletion Linux had made of the
+     * table, 1.3 s in one hold on the KASAN image (A402). Oldest first. */
+    {
+        enum { DEFERRED = 3 * FT_RETIRE_VISIT_BATCH + 5 };
+        static struct nf_flow_offload_handle gens[DEFERRED];
+        unsigned runs = 0, adds, unlinked, checks;
+
+        fixture();
+        for (unsigned i = 0; i < DEFERRED; i++) {
+            gens[i] = (struct nf_flow_offload_handle){ .refs = 1 };
+            connection_rule(i);
+            cls.nf_handle = &gens[i];
+            assert(ft_replace(&binding, &cls) == 0);
+        }
+        transaction_busy = true;
+        cls.command = FLOW_CLS_DESTROY;
+        for (unsigned i = 0; i < DEFERRED; i++) {
+            connection_rule(i);
+            cls.nf_handle = &gens[i];
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        }
+        transaction_busy = false;
+        cls.command = FLOW_CLS_REPLACE;
+        while (ft_entries.next != &ft_entries)
+            assert(ft_remove(list_entry(ft_entries.next, struct cdx_ft_entry, list)) == 0);
+        assert(!ft_count && allocated == DEFERRED && work_queued_retire);
+        adds = llist_adds; unlinked = unlinks; checks = handle_validity_checks;
+        while (work_queued_retire) {
+            unsigned left = allocated, oldest = 0;
+
+            while (oldest < DEFERRED && gens[oldest].refs == 1)
+                oldest++;
+            work_queued_retire = false;
+            ft_retire_workfn(NULL);
+            runs++;
+            assert(left - allocated ==
+                   (left < FT_RETIRE_VISIT_BATCH ? left : FT_RETIRE_VISIT_BATCH));
+            for (unsigned i = oldest; i < oldest + left - allocated; i++)
+                assert(gens[i].refs == 1);
+            assert(work_queued_retire == !!allocated);
+        }
+        assert(runs == (DEFERRED + FT_RETIRE_VISIT_BATCH - 1) / FT_RETIRE_VISIT_BATCH);
+        assert(llist_adds == adds && unlinks == unlinked && handle_validity_checks == checks);
+        assert(!ft_deferred_destroys.first && !allocated && !ft_handle_refs);
+        for (unsigned i = 0; i < DEFERRED; i++)
+            assert(gens[i].refs == 1);
+    }
+
     /* A record that cannot be had without sleeping: the handle is marked all
      * the same, and the walk finds it, as for any other marked handle. */
     {
@@ -9039,7 +9122,7 @@ static void bind_while_loading(void)
         cls.command = FLOW_CLS_REPLACE;
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, bound_to(&block, &in)) == 0);
         assert(ft_count == 1 && live_hw == 1);
-        schedule_work(&ft_retire_work);
+        queue_work(system_unbound_wq, &ft_retire_work);
         schedule_delayed_work(&ft_work, 0);
         schedule_delayed_work(&ft_rearm_work, HZ);
     } else if (!registered_qos_class) {

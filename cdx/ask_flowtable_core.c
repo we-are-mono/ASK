@@ -155,6 +155,16 @@ static struct cdx_ft_entry *ft_find(const struct cdx_ft_binding *binding,
  * the table. */
 static atomic_t ft_retire_scan = ATOMIC_INIT(0);
 
+/* The retirement work runs wherever the scheduler finds room, not on the CPU
+ * that queued it. Queued per CPU, it went on queueing itself on that CPU, and
+ * on one the softirq of traffic sent back to software took up, a batch that
+ * ran for 15 ms held the transaction for up to 950 ms (A402). */
+static void ft_retire_kick(void)
+{
+	if (!READ_ONCE(ft_stopping))
+		queue_work(system_unbound_wq, &ft_retire_work);
+}
+
 /* Called with either the backend transaction or the notifier's ft_watch_lock held. The
  * handle is immutable, owned before watch publication and shared by both
  * directions. Marking it also excludes Linux's cached flow immediately;
@@ -168,8 +178,7 @@ void ft_handle_invalidate(struct nf_flow_offload_handle *handle,
 	/* The worker has to walk the table for this one: nothing says which
 	 * entries name the handle. */
 	atomic_set(&ft_retire_scan, 1);
-	if (!READ_ONCE(ft_stopping))
-		schedule_work(&ft_retire_work);
+	ft_retire_kick();
 }
 
 /* A Linux deletion that found the transaction held (ft_rule_callback()):
@@ -184,6 +193,11 @@ struct ft_deferred_destroy {
 	struct nf_flow_offload_handle *handle;
 };
 
+/* The records the retirement work has taken off the list and not yet looked
+ * at, oldest first, for its next run to go on with: nothing it takes off is
+ * ever put back. The work's alone, under the transaction; unload's once the
+ * work is cancelled. */
+static struct llist_node *ft_deferred_backlog;
 static LLIST_HEAD(ft_deferred_destroys);
 
 static void ft_destroy_defer(const struct cdx_ft_binding *binding,
@@ -204,29 +218,26 @@ static void ft_destroy_defer(const struct cdx_ft_binding *binding,
 		/* The handle is marked all the same; the walk finds it. */
 		atomic_set(&ft_retire_scan, 1);
 	}
-	if (!READ_ONCE(ft_stopping))
-		schedule_work(&ft_retire_work);
+	ft_retire_kick();
 }
 
-/* Unlink the entries deferred deletions name, at most FT_RETIRE_BATCH of them;
+/* Unlink the entries deferred deletions name, at most FT_RETIRE_BATCH of them
+ * and looking at no more than FT_RETIRE_VISIT_BATCH records, oldest first;
  * true when records are left for the next run. Each reports what it counted
  * as it goes, as any unlink does. A record whose entry is gone -- released
  * with its binding, retired by a walk, or never in hardware -- is simply
  * dropped: whatever took the entry out reported for it. */
 static bool ft_retire_deferred(void)
 {
-	struct llist_node *list = llist_del_all(&ft_deferred_destroys);
-	struct ft_deferred_destroy *deferred, *next;
+	struct ft_deferred_destroy *deferred;
 	struct cdx_ft_entry *entry;
-	unsigned int n = 0;
-	bool more = false;
+	unsigned int n = 0, seen = 0;
 
-	llist_for_each_entry_safe(deferred, next, list, node) {
-		if (n == FT_RETIRE_BATCH) {
-			llist_add(&deferred->node, &ft_deferred_destroys);
-			more = true;
-			continue;
-		}
+	if (!ft_deferred_backlog)
+		ft_deferred_backlog = llist_reverse_order(llist_del_all(&ft_deferred_destroys));
+	while (ft_deferred_backlog && n < FT_RETIRE_BATCH && seen++ < FT_RETIRE_VISIT_BATCH) {
+		deferred = llist_entry(ft_deferred_backlog, struct ft_deferred_destroy, node);
+		ft_deferred_backlog = ft_deferred_backlog->next;
 		entry = ft_find(deferred->binding, deferred->cookie);
 		if (entry && entry->handle == deferred->handle) {
 			ft_unlink(entry);
@@ -235,7 +246,7 @@ static bool ft_retire_deferred(void)
 		nf_flow_offload_handle_put(deferred->handle);
 		kfree(deferred);
 	}
-	return more;
+	return ft_deferred_backlog || !llist_empty(&ft_deferred_destroys);
 }
 
 /* Every record left once nothing can add one: unload, after the bindings'
@@ -243,11 +254,15 @@ static bool ft_retire_deferred(void)
 void ft_deferred_destroys_drop(void)
 {
 	struct ft_deferred_destroy *deferred, *next;
+	struct llist_node *lists[] = { ft_deferred_backlog, llist_del_all(&ft_deferred_destroys) };
+	unsigned int i;
 
-	llist_for_each_entry_safe(deferred, next, llist_del_all(&ft_deferred_destroys), node) {
-		nf_flow_offload_handle_put(deferred->handle);
-		kfree(deferred);
-	}
+	ft_deferred_backlog = NULL;
+	for (i = 0; i < ARRAY_SIZE(lists); i++)
+		llist_for_each_entry_safe(deferred, next, lists[i], node) {
+			nf_flow_offload_handle_put(deferred->handle);
+			kfree(deferred);
+		}
 }
 
 void ft_neigh_invalidate(struct cdx_ft_entry *entry)
@@ -802,8 +817,8 @@ static void ft_retire_workfn(struct work_struct *work)
 		ft_settle();
 	cdx_ft_end();
 	/* Behind whatever queued for the transaction meanwhile. */
-	if (more && !READ_ONCE(ft_stopping))
-		schedule_work(&ft_retire_work);
+	if (more)
+		ft_retire_kick();
 }
 
 /* For unlinks whose callers could not settle them in the same transaction:

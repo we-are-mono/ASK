@@ -152,6 +152,13 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A411 — the health probe fails a busy transaction as it would a dead one.** `ask-flowtable health` reads
+  /proc/cdx_flowtable, whose header waits for cdx's transaction behind every caller queued for it; three reads past
+  5 s reboot the board. After A402 a route flapped every 5 s under eight TCP streams still kept a read waiting 1.7-5.3 s
+  on the KASAN image: holders on a CPU the streams' softirq fills run at a few percent of it, behind up to 500 queued
+  offers and counter reads. Bounding that queue cost admission, declining (CPU churn) or FIFO (stale offers). Fix
+  direction: judge whether the transaction changes hands, not how long a turn takes.
+
 - [x] **A410 — a peer flow went dark ~9 s at a case's start after a bridged case.** The LAN VM kept the bridge's MAC for
   its gateway; every case now starts with what the VM learned forgotten (_:/^tests: start every case with the LAN VM_).
 
@@ -188,15 +195,10 @@ result independently of those temporary files.
 - [x] **A403 — some datapath-restart failures still ended in "reboot required".** A restart now bypasses the classifier,
   the ports forwarding in software until it settles, and retries; nothing is terminal (_:/^sdk_fman, cdx: forward in software while a restart settles_).
 
-- [ ] **A402 — retiring thousands of flows after a route change holds cdx's control mutex past the recovery deadline.**
-  OpenWrt image on the DUT, ~6,000 offloaded flows behind a /32 route flapped every 5 s (18,602 route invalidations in
-  2 min): `ask-flowtable health` hit its 5 s deadline twice while RTNL answered in 10 ms; an earlier run missed three in
-  a row and `ask-recovery-monitor` rebooted the box ("datapath health check failed or timed out"). The probe waits in
-  `cdx_ft_begin()` (`ctrl.mutex`); retirement itself is batched (FT_RETIRE_BATCH, A327), so the holder is something
-  else. One candidate since A403: `cdx_ft_recover()` runs a whole datapath restart for an adapter caller under
-  `ctrl.mutex` (RTNL steps up to ~200 ms, and its barriers), paced only by `ft_restart_next`. Fix direction: find the holder
-  on the ASK image (lockdep, or a hold-time report in `cdx_ft_end()`), then bound it. Production exposure: a PPPoE, VPN
-  or default-route change with many flows offloaded.
+- [x] **A402 — retiring thousands of flows after a route change held cdx's control mutex past the recovery deadline.**
+  The retirement work stayed on the CPU that first queued it, whose softirq stretched 15 ms batches to a second, and one
+  run visited every deferred deletion; now unbound, ≤256 a run. A probe can still wait behind a busy queue: A411
+  (_:/^cdx: queue flow retirement unbound_).
 
 - [x] **A401 — a host command timed out in production; offload stayed off until reboot.** Its answer queued behind a WQ0
   exception queue on CPU0; it now leads at WQ0, and a late one reopens the channel (_:/^sdk_fman, cdx: answer host commands first_).

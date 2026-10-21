@@ -559,7 +559,14 @@ callbacks queued behind it (A327). So the adapter unlinks without the barrier
 any barrier has been asked of it. Every walk that retires many entries goes in
 batches of at most 64, letting the transaction go between them: the retirement
 worker, a binding's release, global invalidation, an SA's retirement and a
-Wi-Fi VAP's drain. A binding's release takes its batches from the binding's
+Wi-Fi VAP's drain. The retirement worker also looks at no more than 256 of
+Linux's deferred deletions a run (`FT_RETIRE_VISIT_BATCH`), going on next run
+where it stopped: after a route change most name entries the walk has already
+retired, which unlink nothing, and one run went through all of them in 1.3 s
+(A402). It queues itself on the unbound workqueue: queued per CPU, it stayed
+on the CPU that first queued it, and where the softirq of traffic the change
+sent to software filled that CPU, each 15 ms batch held the transaction for up
+to a second (A402). A binding's release takes its batches from the binding's
 own list of entries: found by walking every entry instead, past the other
 bindings' still in place, the first of a table's two releases cost the square
 of the table -- three times the second at 10,000 flows. A batch leaves its

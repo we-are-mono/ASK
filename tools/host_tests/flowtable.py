@@ -35,12 +35,13 @@ def test_decoder_and_lifecycle(tmp_path):
         # The retirement bounds, as defined: the cases below count batches
         # and barriers by them.
         + re.search(r"^#define FT_RETIRE_BATCH\s.*$", source, re.M).group() + "\n"
+        + re.search(r"^#define FT_RETIRE_VISIT_BATCH\s.*$", source, re.M).group() + "\n"
         + re.search(r"^#define FT_SETTLE_BOUND\s.*$", source, re.M).group() + "\n"
         # What the bridge-port walk keeps between its callbacks.
         + re.search(r"^struct ft_bridge_port_walk \{.*?^\};\n", source, re.M | re.S).group()
     )
     names = ["ft_fault", "ft_devices_hold", "ft_devices_put", "ft_rule_names", "ft_crossed_hold", "ft_crossed_hold_all", "ft_crossed_put_all",
-             "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
+             "ft_find", "ft_retire_kick", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
              "ft_neigh_table", "ft_neigh_check", "ft_neigh_moved", "ft_nexthop_usable",
              "ft_next_hop", "ft_routes_valid", "ft_offer_routes_current", "ft_offer_current", "ft_policy_covers", "ft_fdb_key", "ft_watch_publish", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
@@ -69,6 +70,7 @@ def test_decoder_and_lifecycle(tmp_path):
         # a deletion that found the transaction held leaves it instead, with
         # the list they wait on, as declared.
         + re.search(r"^static atomic_t ft_retire_scan\b.*$", source, re.M).group() + "\n"
+        # And what the work has taken off that list and not yet looked at.
         + source[source.index("struct ft_deferred_destroy {"):
                  source.index("\n", source.index("static LLIST_HEAD(ft_deferred_destroys);")) + 1]
         + "\n".join(function(source, name) for name in names))
