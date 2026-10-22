@@ -39,6 +39,7 @@ the tables (_flowtable_restart.py).
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import ipaddress
 import time
 
 import pytest
@@ -47,7 +48,7 @@ from _flowtable_restart import (HOLD, ROOT_FAULT, RUNNING, assert_healthy, asser
                                 dmesg_count, engines, knob, log_marks, ports, require_knobs,
                                 restart_budget, restart_counts, wait_bypassed, wait_restarted,
                                 wait_running, write)
-from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware, in_software, learn, mcast_rows, mdb, members, moved, mroute_row, packets, quiet, stream, streamed, summary)
+from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware, in_software, learn, mcast_rows, mdb, members, moved, mroute_row, packets, quiet, stream, streamed, summary, wan_segment)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
 from _flowtable_rig import (HEALTH_BASELINE, command, console_command, hardware_proof, read)
@@ -158,6 +159,23 @@ class Bridged:
         return self.row(state, group) is None
 
 
+def held_in_hardware(state, learner):
+    """How many entries the learner holds in hardware, but the WAN segment's
+    own. A bridged learner also carries what that live segment's hosts join
+    -- SSDP, mDNS -- installed, discarded or refused as the segment and the
+    bridge's querier state have it at the time (wan_segment()), so its
+    total moves under a case that changed nothing. A group of the case's own
+    that nobody wants any more discards on the WAN port as theirs do, and
+    still counts."""
+    own = {ipaddress.ip_address(g) for pair in GROUPS.values() for g in pair}
+    held = state[learner.kind + "_installed"]
+    if learner.kind == "mcast":
+        held -= sum(1 for row in state["mcast"]
+                    if row["state"] in ("installed", "discarding") and wan_segment(row)
+                    and ipaddress.ip_address(row["group"]) not in own)
+    return held
+
+
 async def withdrawal(r, learner, family):
     """The shared body: a failed delete parks, a good one releases."""
     target, control = GROUPS[family]
@@ -228,7 +246,8 @@ async def withdrawal(r, learner, family):
     # The next good barrier is the next delete that reaches one. It releases
     # everything parked before it, not only its own entries.
     await learner.remove(control)
-    released = await r.settle(lambda s: s[installed] == r.initial[installed],
+    baseline = held_in_hardware(r.initial, learner)
+    released = await r.settle(lambda s: held_in_hardware(s, learner) == baseline,
                               f"{control} withdrawn from hardware")
     assert released["quarantine"] == 0, summary(released)
     assert learner.withdrawn(released, control), summary(released)
@@ -240,7 +259,8 @@ async def withdrawal(r, learner, family):
     assert moved(again, row(target)) == COUNT, summary(again["after"])
     in_hardware(again)
     await learner.remove(target)
-    final = await r.settle(lambda s: s[installed] == r.initial[installed], f"{target} withdrawn")
+    final = await r.settle(lambda s: held_in_hardware(s, learner) == baseline,
+                           f"{target} withdrawn")
     assert final["quarantine"] == 0, summary(final)
     for counter in ("mcast_install_errors", "mroute_install_errors"):
         assert final[counter] == r.initial[counter], (counter, summary(final))
@@ -440,7 +460,6 @@ async def restart_after_withdrawal(r, learner, family):
     The stopped ports take the management path with them, so the window is
     read over the UART; everything after the restart goes over the agent."""
     target, control = GROUPS[family]
-    installed = learner.kind + "_installed"
 
     def window(groups, label):
         return r.window([stream(family, g, hops=learner.hops) for g in groups], learner.observers,
@@ -519,10 +538,13 @@ async def restart_after_withdrawal(r, learner, family):
             assert delivered(again, streamed(again, group), LAN_NIC), group
             assert moved(again, row(group)) == COUNT, (group, summary(again["after"]))
         in_hardware(again, streams=2)
-        assert again["after"][installed] == live[installed], summary(again["after"])
+        assert held_in_hardware(again["after"], learner) == held_in_hardware(live, learner), \
+            summary(again["after"])
         await learner.remove(target)
         await learner.remove(control)
-        final = await r.settle(lambda s: s[installed] == r.initial[installed] and not s["quarantine"],
+        baseline = held_in_hardware(r.initial, learner)
+        final = await r.settle(lambda s: held_in_hardware(s, learner) == baseline
+                               and not s["quarantine"],
                                "both groups withdrawn after the restart", timeout=30)
         assert final["fatal"] == 0 and final["restarts"] == live["restarts"] + 1, summary(final)
         assert final["resume_failures"] == live["resume_failures"], summary(final)
