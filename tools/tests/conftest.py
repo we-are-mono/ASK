@@ -30,7 +30,8 @@ from ask_orch.provenance import agent_sources, firmware_script
 
 
 from _dmesg_allowlist import load_allowlist
-from _topology import LAN_NIC
+from _topology import LAN_NIC, TARGET_WAN_IF, wire_interface
+import _wire_loss as wire_loss
 
 # Written on the DUT by a case that ends its boot, before it starts. The
 # rootfs is an initramfs, so only a new boot clears it.
@@ -129,7 +130,19 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
         finally:
             if boot.get("artifact"):
                 await client.TARGET.request(session, "artifact/release", {"id": boot["artifact"]["id"]})
+        # A frame the wire loses before the DUT fails a zero-loss case as a
+        # forwarding loss would. Measured once, so such a failure can be told.
+        wire = wire_interface()
+        lossy = None
+        if wire:
+            loss = await wire_loss.measure(client.TARGET, session, wire, TARGET_WAN_IF)
+            record("wan-wire-loss", loss, nodeid="session")
+            if loss["lost"]:
+                lossy = (f"the WAN wire lost {loss['lost']} of {loss['sent']} frames between {wire} "
+                         f"and the DUT's {TARGET_WAN_IF} MAC; zero-loss cases fed from the WAN can "
+                         "fail for it (session artifact wan-wire-loss.json)")
         if request.config.getoption("--release"):
+            assert not lossy, lossy
             assert not firmware["missing_binaries"], (
                 "release firmware lacks required tools", firmware["missing_binaries"])
             assert firmware["agent_matches_checkout"], (
@@ -141,6 +154,8 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
             # Testing an older image on purpose is legitimate outside a release.
             warnings.warn("DUT image was not built from this checkout: "
                           + "; ".join(firmware["build_problems"]))
+        if lossy and not request.config.getoption("--release"):
+            warnings.warn(lossy)
         return {"health": health, "boot": boot}
 
 

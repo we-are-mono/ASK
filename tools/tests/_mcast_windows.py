@@ -36,7 +36,7 @@ import pytest_asyncio
 from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
 from _mcast_cpu import cpu_frames, stream_cpu_counters
-from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python, wire_interface
 from _mroute_capture import MAGIC, multicast_mac, payload
 from _flowtable_rig import (artifact_dir, command, read, stop_boot_daemon)
 from _mcast_e2e import (dut_mac, wan_source_address)
@@ -51,25 +51,6 @@ MEMBER_SOURCE = Path(__file__).with_name("_multicast_member.py").read_text()
 # from the oracle that decodes what it sent.
 WIRE_HELPERS = ("import ipaddress, struct\n" + f"MAGIC = {MAGIC!r}\n"
                 + inspect.getsource(multicast_mac) + inspect.getsource(payload))
-
-
-def wire_interface() -> str:
-    """The orchestrator's physical port toward the DUT.
-
-    Not the bridge above it: that bridge snoops too, and a stream sent into it
-    reaches the DUT only while something on the DUT's side has joined -- which
-    a case about leaving must not depend on."""
-    configured = os.environ.get("ASK_WAN_WIRE_IF")
-    if configured:
-        return configured
-    inject = os.environ.get("ASK_WAN_INJECT_IF", "")
-    members = Path("/sys/class/net", inject, "brif")
-    if not members.exists():
-        return inject
-    physical = [p.name for p in members.iterdir()
-                if Path("/sys/class/net", p.name, "device").exists()]
-    assert len(physical) == 1, ("set ASK_WAN_WIRE_IF to the DUT-facing physical port", physical)
-    return physical[0]
 
 
 def same(a: str, b: str) -> bool:

@@ -15,6 +15,7 @@ import asyncio
 import errno
 import json
 import os
+from pathlib import Path
 import aiohttp
 import pytest_asyncio
 from ask_orch.lifecycle import CleanupStack, checked
@@ -603,3 +604,22 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         }
     finally:
         await cleanup.teardown("ipv6_topology")
+
+
+def wire_interface() -> str:
+    """The orchestrator's physical port toward the DUT.
+
+    Not the bridge above it: that bridge snoops too, and a stream sent into it
+    reaches the DUT only while something on the DUT's side has joined -- which
+    a case about leaving must not depend on."""
+    configured = os.environ.get("ASK_WAN_WIRE_IF")
+    if configured:
+        return configured
+    inject = os.environ.get("ASK_WAN_INJECT_IF", "")
+    members = Path("/sys/class/net", inject, "brif")
+    if not members.exists():
+        return inject
+    physical = [p.name for p in members.iterdir()
+                if Path("/sys/class/net", p.name, "device").exists()]
+    assert len(physical) == 1, ("set ASK_WAN_WIRE_IF to the DUT-facing physical port", physical)
+    return physical[0]
