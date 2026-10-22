@@ -33,11 +33,11 @@ EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX
 # CFG_FLAGS across two make arguments and the second define would be lost.
 EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL=1 -DCDX_DEBUG_DPA_INIT=1 -DCDX_DEBUG_FLOWTABLE=1 -DCDX_DEBUG_SPLIT_KEY_FAIL=1'"
 
-# Silence the [buildpaths] QA warning on the split kernel-module sub-package.
-# Under KASAN, cdx.ko embeds TMPDIR-prefixed header paths in its .rodata:
-# GCC's ASan global metadata records each instrumented global's source file
-# raw, and no -f*-prefix-map reaches it (ISSUES.md A326). The paths only
-# appear in KASAN reports; no runtime or ABI impact.
+# Silence the [buildpaths] QA warning on the split kernel-module sub-packages.
+# Under KASAN, cdx.ko and ask_flowtable.ko embed TMPDIR-prefixed header paths
+# in their .rodata: GCC's ASan global metadata records each instrumented
+# global's source file raw, and no -f*-prefix-map reaches it (ISSUES.md A326).
+# The paths only appear in KASAN reports; no runtime or ABI impact.
 #
 # Package name format comes from kernel-module-split.bbclass:
 #   ${KERNEL_MODULE_PACKAGE_PREFIX}${kernel_pkg}-module-<name>${SUFFIX}
@@ -45,6 +45,7 @@ EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL
 # `kernel-module-cdx-${KERNEL_VERSION}`. Using the variable keeps it
 # version-agnostic across kernel bumps.
 INSANE_SKIP:kernel-module-cdx-${KERNEL_VERSION} += "buildpaths"
+INSANE_SKIP:kernel-module-ask-flowtable-${KERNEL_VERSION} += "buildpaths"
 
 # ASK's cdx/Makefile has `modules` and `clean` but no `modules_install`.
 # Compile via `modules` target; install the .ko by hand —
