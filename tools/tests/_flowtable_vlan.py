@@ -115,7 +115,11 @@ with tempfile.TemporaryDirectory(prefix='ask-vlan-capture-') as directory:
             while 'listening on' not in log.read_text():
                 assert proc.poll() is None and time.monotonic() < deadline, log.read_text()
                 time.sleep(0.02)
-            ready.write_text('ready')
+            # Whole or not at all: the orchestrator polls for the file, and
+            # one written in place can be read in between, created but empty.
+            staged = ready.with_name(ready.name + '.tmp')
+            staged.write_text('ready')
+            staged.rename(ready)
             try:
                 complete = proc.wait(timeout=10) == 0
             except subprocess.TimeoutExpired:
