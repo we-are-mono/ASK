@@ -22,7 +22,7 @@ import time
 import pytest
 
 from _mcast_helpers import arm_bridge_querier
-from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, host, in_hardware, in_software, kernel_mroute, learn, mcast_rows, mdb, members, moved, mroute_row, packets, same, stream, streamed, summary)
+from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, host, in_hardware, in_software, kernel_mroute, learn, mcast_rows, mdb, members, moved, mroute_row, owned_installed, packets, same, stream, streamed, summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN, TopologyStack,
                        dut_vlan_subif, lan_vlan_subif)
 from _mroute_capture import payload
@@ -328,7 +328,7 @@ async def test_learner_handoff(multicast_rig, mcast_bridge, family):
             # routed group is carried once it has been seen forwarding it.
             taken = await learn(r, [stream(family, group, hops=63)],
                                 lambda s: routed(s, group, source) and not mcast_rows(s, group) and
-                                s["mcast_installed"] == r.initial["mcast_installed"],
+                                owned_installed(s, [group]) == owned_installed(r.initial, [group]),
                                 "the routed learner taking the key")
             assert taken["mroute_installed"] == r.initial["mroute_installed"] + 1, summary(taken)
             second = await r.window([stream(family, group, hops=63)], routed_observers,
@@ -635,7 +635,8 @@ async def test_reload_bridged(multicast_rig, mcast_bridge, family, failure_stage
     assert moved(after, row) == COUNT, summary(after["after"])
     in_hardware(after)
     await mdb(r, bridge, group, add=False)
-    final = await r.settle(lambda s: row(s) is None and s["mcast_installed"] == r.initial["mcast_installed"],
+    final = await r.settle(lambda s: row(s) is None and
+                           owned_installed(s, [group]) == owned_installed(r.initial, [group]),
                            "removed after the reload")
     assert final["quarantine"] == 0, summary(final)
 
@@ -711,13 +712,14 @@ async def test_reload_bridged_blocked_source(multicast_rig, mcast_bridge,
 
         relearned = await reload_adapter(r, f"mcast-reload-blocked-v{family}", standing, unloaded)
         # The allowed source carried and the blocked one discarding.
-        assert relearned["mcast_installed"] == r.initial["mcast_installed"] + 2, summary(relearned)
+        assert owned_installed(relearned, [group]) == owned_installed(r.initial, [group]) + 2, \
+            summary(relearned)
         after = await window("after")
         assert moved(after, lambda s: row(s, allowed)) == COUNT, summary(after["after"])
         assert moved(after, lambda s: row(s, blocked)) == COUNT, summary(after["after"])
         in_hardware(after, streams=2)
     final = await r.settle(lambda s: not mcast_rows(s, group) and
-                           s["mcast_installed"] == r.initial["mcast_installed"],
+                           owned_installed(s, [group]) == owned_installed(r.initial, [group]),
                            "removed after the reload", timeout=20)
     assert final["quarantine"] == 0, summary(final)
 
@@ -762,7 +764,7 @@ async def test_bridged_idle_flow_ages_out(multicast_rig, mcast_bridge, family):
 
         stopped = time.monotonic()
         aged = await r.settle(lambda s: row(s) is None and
-                              s["mcast_installed"] == r.initial["mcast_installed"],
+                              owned_installed(s, [group]) == owned_installed(r.initial, [group]),
                               "the idle flow out of hardware", timeout=IDLE_INTERVAL / 100 + 25)
         # Not before the interval: the refresh reads the count five seconds
         # apart, so the entry was last seen counting at most that long after
@@ -774,7 +776,7 @@ async def test_bridged_idle_flow_ages_out(multicast_rig, mcast_bridge, family):
         await learn(r, [stream(family, group, hops=64)], carried, "learned again when it resumes")
         await live("resumed")
     final = await r.settle(lambda s: not mcast_rows(s, group) and
-                           s["mcast_installed"] == r.initial["mcast_installed"],
+                           owned_installed(s, [group]) == owned_installed(r.initial, [group]),
                            "removed", timeout=15)
     assert final["quarantine"] == 0, summary(final)
     assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)

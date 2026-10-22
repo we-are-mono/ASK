@@ -80,6 +80,21 @@ def wan_segment(row: dict) -> bool:
     return all(port.split("/")[0] == TARGET_WAN_IF for port in row["ports"].split(","))
 
 
+def owned_installed(state: dict, own=(), kind: str = "mcast") -> int:
+    """How many entries a learner holds in hardware, less the bridged ones
+    held only on the WAN port (wan_segment()): those come and go -- installed,
+    discarded or refused -- on that segment's own schedule, so a total compared
+    across a case moves under a case that changed nothing. A group in `own`,
+    the case's, counts even when it discards on the WAN port as theirs do."""
+    held = state[kind + "_installed"]
+    if kind == "mcast":
+        mine = {ipaddress.ip_address(group) for group in own}
+        held -= sum(1 for row in state["mcast"]
+                    if row["state"] in ("installed", "discarding") and wan_segment(row)
+                    and ipaddress.ip_address(row["group"]) not in mine)
+    return held
+
+
 def lan_groups(state: dict) -> set[tuple[str, str]]:
     """Every bridged group but those held only on the WAN port."""
     return {(row["group"], row["vid"]) for row in state["mcast"] if not wan_segment(row)}

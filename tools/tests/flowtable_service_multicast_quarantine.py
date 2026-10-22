@@ -39,7 +39,6 @@ the tables (_flowtable_restart.py).
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import ipaddress
 import time
 
 import pytest
@@ -48,7 +47,7 @@ from _flowtable_restart import (HOLD, ROOT_FAULT, RUNNING, assert_healthy, asser
                                 dmesg_count, engines, knob, log_marks, ports, require_knobs,
                                 restart_budget, restart_counts, wait_bypassed, wait_restarted,
                                 wait_running, write)
-from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware, in_software, learn, mcast_rows, mdb, members, moved, mroute_row, packets, quiet, stream, streamed, summary, wan_segment)
+from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, in_hardware, in_software, learn, mcast_rows, mdb, members, moved, mroute_row, packets, owned_installed, quiet, stream, streamed, summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
 from _flowtable_rig import (HEALTH_BASELINE, command, console_command, hardware_proof, read)
@@ -160,20 +159,9 @@ class Bridged:
 
 
 def held_in_hardware(state, learner):
-    """How many entries the learner holds in hardware, but the WAN segment's
-    own. A bridged learner also carries what that live segment's hosts join
-    -- SSDP, mDNS -- installed, discarded or refused as the segment and the
-    bridge's querier state have it at the time (wan_segment()), so its
-    total moves under a case that changed nothing. A group of the case's own
-    that nobody wants any more discards on the WAN port as theirs do, and
-    still counts."""
-    own = {ipaddress.ip_address(g) for pair in GROUPS.values() for g in pair}
-    held = state[learner.kind + "_installed"]
-    if learner.kind == "mcast":
-        held -= sum(1 for row in state["mcast"]
-                    if row["state"] in ("installed", "discarding") and wan_segment(row)
-                    and ipaddress.ip_address(row["group"]) not in own)
-    return held
+    """The learner's hardware entries, the WAN segment's own left out
+    (owned_installed()), this module's groups counted whatever they do."""
+    return owned_installed(state, [g for pair in GROUPS.values() for g in pair], learner.kind)
 
 
 async def withdrawal(r, learner, family):
