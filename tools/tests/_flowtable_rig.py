@@ -367,10 +367,16 @@ IPSEC_OFFLINE_PORT = "/sys/devices/platform/soc/1a00000.fman/1a83000.port/statis
 
 # Where the DUT can lose a forwarded frame without an error of its own: each
 # port's drops, ingress enqueue refusals and the CPU's queue bound among them,
-# and the IPsec offline port's discards.
+# and the IPsec offline port's discards. A port's rx_dropped sums several
+# FMan receive discards; the two 10G receive halves' BMI counters, by their
+# register blocks, tell which one took a frame.
 DUT_DROPS = tuple(f"/sys/class/net/{dev}/statistics/{counter}"
                   for dev in (TARGET_LAN_IF, TARGET_WAN_IF)
-                  for counter in ("rx_dropped", "tx_dropped")) + (IPSEC_OFFLINE_PORT,)
+                  for counter in ("rx_dropped", "tx_dropped")) + (IPSEC_OFFLINE_PORT,) + tuple(
+    f"/sys/devices/platform/soc/1a00000.fman/{port}.port/statistics/{counter}"
+    for port in ("1a90000", "1a91000")
+    for counter in ("port_frame", "port_enq_total", "port_discard_frame", "port_rx_bad_frame",
+                    "port_rx_filter_frame", "port_rx_out_of_buffers_discard"))
 
 
 async def dut_drops(r):

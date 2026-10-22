@@ -333,7 +333,10 @@ for suffix in ('.py', '.pid', '.log', '.sock'):
 """, timeout=10, label="peer_finish")
                 r.record("connections-peer", {"rc": result.rc, "stdout": result.stdout,
                                              "server_errors": errors, "tcp_records": tcp_counts})
-                if shutdown_error is None:
+                if shutdown_error is not None:
+                    # A peer that died answers no RPC; its log says why.
+                    shutdown_error.add_note("peer log:\n" + result.stdout[-4000:])
+                else:
                     report = json.loads(result.stdout.strip().splitlines()[-1])
                     assert report["closed"], report
                 if result.rc != 0 or errors or shutdown_error:
