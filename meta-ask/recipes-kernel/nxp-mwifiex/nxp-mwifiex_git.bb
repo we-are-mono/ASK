@@ -74,6 +74,21 @@ EXTRA_OEMAKE = " \
 
 MODULES_MODULE_SYMVERS_LOCATION = "."
 
+# tools/tests/mwifiex_rx_dut.py builds its probe against this recipe's work
+# directory -- moal's headers, its compile flags, the toolchain -- and refuses a
+# loaded moal whose build ID differs from the moal.ko there. A package restored
+# from another build directory's shared state comes without that directory, and
+# its moal, built under another TMPDIR, never matches a local one. Every build
+# directory compiles the driver itself, about a minute, so the two always agree.
+SSTATE_SKIP_CREATION = "1"
+
+# Under KASAN, GCC's ASan global metadata records each instrumented global's
+# source file raw, TMPDIR-prefixed, past any -f*-prefix-map (ISSUES.md A326);
+# as for cdx, the paths only appear in KASAN reports.
+INSANE_SKIP:kernel-module-mlan-${KERNEL_VERSION} += "buildpaths"
+INSANE_SKIP:kernel-module-moal-${KERNEL_VERSION} += "buildpaths"
+INSANE_SKIP:${PN}-dbg += "buildpaths"
+
 do_compile() {
     oe_runmake modules
 }
