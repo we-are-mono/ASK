@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A413 — an offloaded flow's conntrack counts arrived in bursts every three or four seconds.** cdx now folds every
+  entry's counters into conntrack once a second, and Linux asks for none (_:/^netfilter, cdx: fold every hardware flow's counters_).
+
 - [x] **A412 — IPTV bridged between the WAN port's and br-lan's VLAN devices stayed in software, `pending-source`.** A
   bridge port that is a stack of 802.1Q devices, on a port or on a second bridge, is now read down to the ports below; a
   stack it cannot key reads `refused-ingress` (_:/^cdx: carry a bridged group through a bridge port that is a stack_).

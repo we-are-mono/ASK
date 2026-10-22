@@ -183,6 +183,7 @@ static void list_init(struct list_head *h) { h->next = h->prev = h; }
 #define INIT_LIST_HEAD(h) list_init(h)
 static bool list_empty(const struct list_head *h) { return h->next == h; }
 static void list_del_init(struct list_head *e) { list_del(e); list_init(e); }
+static void list_move_tail(struct list_head *e, struct list_head *h) { list_del(e); list_add_tail(e, h); }
 static void list_move(struct list_head *e, struct list_head *h)
 { list_del(e); e->next = h->next; e->prev = h; h->next->prev = e; h->next = e; }
 static void list_splice_init(struct list_head *from, struct list_head *to)
@@ -719,7 +720,8 @@ static void flow_rule_match_cvlan(struct flow_rule *r, struct flow_match_vlan *m
 struct flow_stats { u64 bytes, pkts; unsigned long lastused; };
 /* With what the adapter reported through it, per direction: a direction's
  * last delta reaches the conntrack this way however the direction leaves. */
-struct nf_flow_offload_handle { unsigned refs; bool invalid; u64 packets[2], bytes[2]; unsigned reports; };
+struct nf_flow_offload_handle { unsigned refs; bool invalid; u64 packets[2], bytes[2]; unsigned reports;
+                                 unsigned long used; unsigned used_reports; };
 static struct nf_flow_offload_handle handle;
 /* Every validity question is counted: a walk of the table for retired
  * generations asks one per entry, so a case can say no walk happened. */
@@ -743,6 +745,9 @@ static void nf_flow_offload_handle_put(struct nf_flow_offload_handle *h)
 static void nf_flow_offload_handle_account(struct nf_flow_offload_handle *h, unsigned dir,
                                            u64 packets, u64 bytes)
 { assert(h->refs > 1 && dir < 2); h->packets[dir] += packets; h->bytes[dir] += bytes; h->reports++; }
+/* When the adapter's own pass says the flow was last used. */
+static void nf_flow_offload_handle_used(struct nf_flow_offload_handle *h, unsigned long lastused)
+{ assert(h->refs > 1); h->used = lastused; h->used_reports++; }
 /* Same shape as patch 140's, and filled the same way: nf_session belongs to
  * nf_dst and nf_session_reverse to nf_dst_reverse, so a direction's egress and
  * ingress sessions are named the way its two destinations are. A path with no
@@ -816,6 +821,7 @@ static unsigned int ft_qos_mark_mask, ft_qos_default_class, ft_route_mark_mask;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
 static u64 ft_finals;
+static u64 ft_stats_passes, ft_stats_requests;
 static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations, ft_destroy_deferrals;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static u64 atomic64_inc_return(u64 *v) { return ++*v; }
@@ -1055,6 +1061,33 @@ static bool queue_work(int *wq, int *work)
     schedule_work(work);
     queueing_unbound = false;
     return true;
+}
+/* The counter pass, queued stats_ms ahead on the unbound workqueue. */
+static int ft_stats_work;
+static unsigned stats_queued;
+static unsigned long stats_delay;
+static bool queue_delayed_work(int *wq, int *work, unsigned long delay)
+{
+    assert(wq == system_unbound_wq && work == &ft_stats_work);
+    stats_queued++;
+    stats_delay = delay;
+    return true;
+}
+#define msecs_to_jiffies(m) ((unsigned long)(m) * HZ / 1000)
+static void ft_stats_kick(void);
+/* A batched job's turn to the others, with the transaction let go: what a
+ * case has them do meanwhile, once. */
+static unsigned let_waiters;
+static void (*waiter)(void);
+static void cdx_ft_let_waiters(void)
+{
+    void (*turn)(void) = waiter;
+
+    assert(!cdx_info->ctrl.mutex);
+    let_waiters++;
+    waiter = NULL;
+    if (turn)
+        turn();
 }
 static void schedule_work(int *work)
 {
@@ -1761,6 +1794,12 @@ static void cancel_delayed_work_sync(int *work)
     else if (work == &ft_rearm_work) work_queued_rearm = false;
     canceled++;
 }
+/* The counter pass is disabled, not cancelled, on the way out. */
+static void disable_delayed_work_sync(int *work)
+{
+    assert(work == &ft_stats_work);
+    canceled++;
+}
 static int register_indirect(void)
 {
     assert(ft_ready);
@@ -1773,16 +1812,16 @@ static void unregister_indirect(void (*release)(void *))
 {
     assert(indirect_registered && !cdx_info->ctrl.mutex);
     /* Both unwinds stop new binds first. Unload gives this route back last,
-     * with all six works cancelled -- retirement, the settle Linux's own
+     * with all seven works cancelled -- retirement, the settle Linux's own
      * deletions left, the delayed installer, the parked rearm's retry, the SA
-     * next-hop follower and the SA accounting pass -- and every notifier
-     * already gone. A load unwinding its own
-     * failure gives it back first and cancels the works after, once nothing
-     * bound is left to queue them, with its notifiers still registered: that
-     * is what tells the two apart. */
+     * next-hop follower, the SA accounting pass and the counter pass -- and
+     * every notifier already gone. A load unwinding its own failure gives it
+     * back first and cancels the works after, once nothing bound is left to
+     * queue them, with its notifiers still registered: that is what tells the
+     * two apart. */
     assert(ft_stopping);
     if (!netdev_registered) {
-        assert(canceled == 6);
+        assert(canceled == 7);
         assert(!neigh_registered && !fib_registered && !nexthop_registered);
         assert(!fdb_registered && !swdev_obj_registered);
     } else {
@@ -1816,7 +1855,7 @@ static unsigned unload_sleeps, unload_failures;
 static void msleep(unsigned ms)
 {
     assert(ms == 1000 && backend_claimed && !cdx_info->ctrl.mutex && !rtnl);
-    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 6);
+    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 7);
     assert(unload_failures);
     unload_sleeps++;
     if (!--unload_failures) { retry_error=0; quiesce_fail=false; }
@@ -5920,6 +5959,22 @@ static void connection_rule(unsigned n)
     rule.tcp = (struct flow_match_tcp){ &tk, &tm };
 }
 
+/* The connection a case retires while the counter pass lets others in, and
+ * installs again at once: the new entry joins the table behind those the pass
+ * has reported, and waits for the next. */
+static unsigned retiring;
+static struct cdx_ft_entry **retiring_slot;
+static void retire_unreached(void)
+{
+    assert(retiring_slot && (*retiring_slot)->pass != ft_stats_pass);
+    assert(ft_remove(*retiring_slot) == 0);
+    connection_rule(retiring);
+    assert(ft_replace(&binding, &cls) == 0);
+    *retiring_slot = ft_find(&binding, cls.cookie);
+    assert(*retiring_slot && (*retiring_slot)->pass != ft_stats_pass);
+    retiring_slot = NULL;
+}
+
 /* Complete and fragmented proc iteration must enumerate every live owner once,
  * including collisions, empty buckets and a resumed read at the current row --
  * and then every bridged pair's row once, after all of them, resuming inside
@@ -6011,6 +6066,44 @@ static void test_connections(void)
                cls.stats.bytes == (i + 1) * (100 - ETH_HLEN));
     }
     test_iterator(ARRAY_SIZE(entries));
+    /* The adapter's own pass: every entry's delta through its handle, and
+     * when it was last used, in batches of FT_STATS_BATCH that each let the
+     * transaction go to whoever waits for it; each entry once a pass, and the
+     * next pass queued stats_ms on while entries are left. A pass with
+     * nothing new counts nothing and still says when. Linux's own requests
+     * are counted apart, and a pass makes none. One the pass has not reached
+     * yet retired while it lets others in reports its own last delta, and the
+     * pass every other once. */
+    {
+        u64 counted = handle.packets[0] + handle.packets[1], added = 0;
+        unsigned used = handle.used_reports, waits = let_waiters, queued = stats_queued;
+        u64 passes = ft_stats_passes, requests = ft_stats_requests;
+
+        for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+            entries[i]->hw->stats.packets += 3;
+            entries[i]->hw->stats.bytes += 300;
+            added += 3;
+        }
+        retiring = FT_STATS_BATCH + 44;
+        retiring_slot = &entries[retiring];
+        waiter = retire_unreached;
+        ft_stats_workfn(NULL);
+        assert(!cdx_info->ctrl.mutex && !waiter && !retiring_slot);
+        assert(entries[retiring]->pass != ft_stats_pass && !entries[retiring]->reported.packets);
+        assert(handle.packets[0] + handle.packets[1] == counted + added);
+        assert(handle.used_reports == used + ARRAY_SIZE(entries) - 1);
+        assert(let_waiters == waits + (ARRAY_SIZE(entries) - 1) / FT_STATS_BATCH);
+        /* Queued by the install while it let others in, and by its own end. */
+        assert(stats_queued == queued + 2 && stats_delay == HZ);
+        assert(ft_stats_passes == passes + 1 && ft_stats_requests == requests);
+        for (unsigned i = 0; i < ARRAY_SIZE(entries); i++)
+            assert(entries[i]->reported.packets == entries[i]->hw->stats.packets);
+        used = handle.used_reports;
+        ft_stats_workfn(NULL);
+        assert(handle.packets[0] + handle.packets[1] == counted + added);
+        assert(handle.used_reports == used + ARRAY_SIZE(entries));
+        assert(ft_stats_passes == passes + 2);
+    }
     /* Different removal order exercises list head, middle and tail; sharing
      * a neighbour cannot tie one connection's lifetime to another's. */
     for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
@@ -6020,7 +6113,9 @@ static void test_connections(void)
         assert(ft_neighbour_refs == ft_count && out.refs == (int)ft_count);
     }
     assert(!live_hw && !allocated && ft_installs == ft_deletes);
-    assert(ft_installs == installs + ARRAY_SIZE(entries) + 1 && ft_errors == errors);
+    /* Two reinstalls: the middle key's new cookie, and the entry retired and
+     * installed again while the counter pass let others in. */
+    assert(ft_installs == installs + ARRAY_SIZE(entries) + 2 && ft_errors == errors);
     assert(!ft_invalid && !ft_fatal);
 
     test_iterator(0);

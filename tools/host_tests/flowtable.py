@@ -37,6 +37,10 @@ def test_decoder_and_lifecycle(tmp_path):
         + re.search(r"^#define FT_RETIRE_BATCH\s.*$", source, re.M).group() + "\n"
         + re.search(r"^#define FT_RETIRE_VISIT_BATCH\s.*$", source, re.M).group() + "\n"
         + re.search(r"^#define FT_SETTLE_BOUND\s.*$", source, re.M).group() + "\n"
+        # The counter pass's batch and the state it keeps, as defined.
+        + re.search(r"^#define FT_STATS_BATCH\s.*$", source, re.M).group() + "\n"
+        + re.search(r"^static unsigned int ft_stats_ms\b.*$", source, re.M).group() + "\n"
+        + re.search(r"^static u32 ft_stats_pass;$", source, re.M).group() + "\n"
         # What the bridge-port walk keeps between its callbacks.
         + re.search(r"^struct ft_bridge_port_walk \{.*?^\};\n", source, re.M | re.S).group()
     )
@@ -62,7 +66,8 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
              "ft_any_entry", "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire", "ft_through", "ft_port_stopping",
              "ft_port_stopped", "ft_stopped_clean", "ft_stopped_workfn", "ft_netdev_event",
-             "ft_out_port", "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_egress_drain", "ft_egress_restarted", "ft_block_drain", "ft_hw_settle", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit", "ft_position_l2", "ft_position", "ft_start", "ft_next", "ft_stop"]
+             "ft_out_port", "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_egress_drain", "ft_egress_restarted", "ft_block_drain", "ft_hw_settle", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit", "ft_position_l2", "ft_position", "ft_start", "ft_next", "ft_stop",
+             "ft_stats_kick", "ft_stats_report", "ft_stats_workfn"]
     (tmp_path / "flowtable_production.inc").write_text(
         # The stopped-port sweep's queue, lock and work item, as declared.
         source[source.index("struct ft_stopped {"):source.index("static void ft_port_stopped(")]
@@ -176,9 +181,14 @@ def test_stats_poll(tmp_path):
     kernel = kernel_source()
     offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
+    core = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
     stats = function(offload, "nf_flow_offload_stats")
+    handle = re.search(r"^struct nf_flow_offload_handle \{.*?^\};\n", core, re.M | re.S).group()
     (tmp_path / "stats_poll_production.inc").write_text(
-        function(header, "nf_flow_timeout_delta") + stats)
+        handle + function(core, "nf_flow_offload_handle_counting")
+        + function(core, "nf_flow_offload_handle_used")
+        + function(core, "nf_flow_offload_handle_reported")
+        + function(header, "nf_flow_timeout_delta") + stats)
     binary = tmp_path / "flowtable_stats_poll"
     run_process([
         # Upstream compares the signed timeout delta with the unsigned

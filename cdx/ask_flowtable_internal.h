@@ -68,8 +68,8 @@
 #include "cdx_wifi_backend.h"
 #include "cdx_police.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 15
-#error "CDX flowtable requires kernel flowtable context version 15 or later"
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 16
+#error "CDX flowtable requires kernel flowtable context version 16 or later"
 #endif
 
 /* The bridge FDB pins a bridged flow's egress port, and this is the only
@@ -215,6 +215,8 @@ struct cdx_ft_entry {
 	struct cdx_ft_rule rule;
 	struct cdx_ft_hw *hw;
 	struct cdx_ft_counters reported;
+	/* The counter pass that last reported it (ft_stats_workfn()). */
+	u32 pass;
 };
 
 /* Admission budget, not a firmware maximum. Directions consume slots
@@ -823,6 +825,9 @@ extern atomic64_t ft_ipsec_policy_invalidations;
 extern u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 extern u64 ft_rearms;
 extern u64 ft_finals;
+extern u64 ft_stats_passes, ft_stats_requests;
+extern struct delayed_work ft_stats_work;
+void ft_stats_kick(void);
 extern bool ft_ready, ft_stopping;
 extern atomic_t ft_invalid;
 extern bool ft_invalid_done;

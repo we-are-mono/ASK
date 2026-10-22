@@ -765,6 +765,34 @@ pass's neighbour keepalive its neighbour -- only once software fell silent.
 A fully offloaded flow is asked at the same pace as before, and since the
 callback reports deltas, nothing is counted twice.
 
+None of that asking happens while the adapter's own counter pass runs
+(`stats_ms`, a module parameter of `ask_flowtable`, default 1000). Once a pass,
+every entry's delta goes to the flow's conntrack through its handle
+(`nf_flow_offload_handle_account()`), with when the flow was last used
+(`nf_flow_offload_handle_used()`, patch 140; context version 16, patch 143).
+While a flow's driver keeps saying so at least once half its timeout (two
+seconds at least), Netfilter keeps the flow alive from that and sends it no
+`FLOW_CLS_STATS`; a flow whose passes stop, say because `stats_ms` was set to
+zero, is asked again as above with half its timeout left, and a report older
+than that is forgotten so a wrapped clock cannot revive it. A `stats_ms` up to
+half the timeout -- fifteen seconds at the default thirty -- therefore spends
+less for coarser counts; zero, Netfilter's own requests, spends more. Asked
+flow by flow, conntrack -- and nlbwmon, `conntrack -L`, Verso's per-device
+rates -- saw an offloaded flow's traffic arrive in bursts every three or four
+seconds; with the pass it trails the traffic by about a second at most
+(`flowtable_live_accounting.py`). What the pass suppresses is each flow's
+requests to every callback bound to the table, so a table it serves must not be
+shared with a driver that relies on them. The pass reads `FT_STATS_BATCH`
+entries per hold of the transaction and lets waiters in between, moving each
+entry it reports to the tail of `ft_entries`, so one pass is linear in the
+table, and the next is due a period after this one began. On the KASAN image,
+with a full table of live flows, the four CPUs were 47% busy asked flow by flow
+(14,500 requests a second) and 23% reported by the pass every second, against
+16% for the traffic alone; 512 new directions reached the hardware in 0.65 s
+either way, and the health probe's header read waited less with the pass (p99
+4.7-12.3 ms against 19.9 ms), the transaction being held in slices of at most
+10 ms that let others in.
+
 Counter-enabled hardware tables are admitted, and a reported delta is restated
 in the units Netfilter counts in. The two counters disagree about framing, not
 about packets: a classifier hit counts the frame as it arrived, while

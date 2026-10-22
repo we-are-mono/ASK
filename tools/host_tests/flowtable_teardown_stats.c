@@ -98,6 +98,9 @@ static void atomic_set(atomic_t *v, int i) { v->counter = i; }
 static int atomic_read(const atomic_t *v) { return v->counter; }
 static int atomic_xchg(atomic_t *v, int i) { int old = v->counter; v->counter = i; return old; }
 #define smp_store_release(p, v) (*(p) = (v))
+#define smp_load_acquire(p) (*(p))
+#define cmpxchg(p, o, n) (*(p) == (o) ? (*(p) = (n), (o)) : *(p))
+#define nf_flowtable_time_stamp ((u32)1000)
 static void *kzalloc(size_t size, int flags) { (void)flags; return calloc(1, size); }
 static unsigned handles_freed;
 #define kfree_rcu(p, field) (free(p), handles_freed++)

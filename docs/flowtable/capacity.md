@@ -149,12 +149,14 @@ software TX and CPU. TCP FIN/RST forward-hook counters independently verify
 the expected close operations reached Linux.
 
 Linux owns flow lifetime, and it can retire a live flow this round never
-touched. A hardware-owned flow keeps its deadline only through a stats round
-trip, which the flowtable core queues in the last tenth of the flow timeout and
-skips while any offload work for that flow is still pending; every such read
-shares one hardware transaction with this workload's installs and retirements.
-A starved refresh therefore retires a healthy flow, which forwards in software
-and returns to hardware with a fresh cookie on its next packet. The test does
+touched. A hardware-owned flow keeps its deadline through the adapter's counter
+pass, which says once a second when each flow was last used, or, with the pass
+off, through a stats round trip, which the flowtable core queues once a tenth
+of the flow timeout has run down and skips while any offload work for that
+flow is still pending. Either shares one hardware transaction with this workload's
+installs and retirements. A starved refresh therefore retires a healthy flow,
+which forwards in software and returns to hardware with a fresh cookie on its
+next packet. The test does
 not assert a race-free window. It requires the adapter to have retired nothing
 on its own initiative — every counter describing an adapter-driven retirement is
 frozen across the retirement — attributes each unrequested install to exactly

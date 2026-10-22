@@ -2396,6 +2396,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	hash_add(ft_cookies, &entry->cookie_node,
 		 entry->cookie ^ (unsigned long)entry->binding);
 	hash_add(ft_keys, &entry->key_node, ft_key_hash(&entry->rule));
+	ft_stats_kick();
 	ft_count++;
 	ft_installs++;
 	/* An SA may expire before this entry joins the dependency watch. */
@@ -2542,6 +2543,138 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 	ft_delta_report(cls, &delta);
 	ft_reported(entry, &now);
 	return 0;
+}
+
+/* Every entry's counters go to Linux once a pass, and a pass runs every
+ * stats_ms while any entry exists. Netfilter otherwise asks for each flow's on
+ * its own, once a tenth of the flow's timeout has run down -- every three or
+ * four seconds at the default thirty, so conntrack, and whatever reads it, sees
+ * a flow's traffic in bursts -- and each of those requests is a work item that
+ * takes this transaction: 14,500 a second for a full table, which kept 47% of
+ * the four CPUs busy on the KASAN image. A pass reads the same counters under
+ * one hold per FT_STATS_BATCH entries and says when each flow was last used,
+ * which keeps Netfilter from asking at all (nf_flow_offload_handle_used()):
+ * every flow each second, for 23%, and new flows admitted as fast. Netfilter trusts a report for half the
+ * flow's timeout, so a longer stats_ms, up to that, spends less for coarser
+ * counts; zero leaves it to Netfilter's requests, which costs more. A flow
+ * whose passes stop is asked again with half its timeout left. */
+#define FT_STATS_BATCH 256U
+static unsigned int ft_stats_ms = 1000;
+u64 ft_stats_passes, ft_stats_requests;
+static u32 ft_stats_pass;
+static void ft_stats_workfn(struct work_struct *work);
+DECLARE_DELAYED_WORK(ft_stats_work, ft_stats_workfn);
+
+/* A pass, stats_ms from now, unless one is already queued: from each install,
+ * and from a change of stats_ms. Unload disables the work, so nothing queued
+ * from here outlives the module. */
+void ft_stats_kick(void)
+{
+	unsigned int ms = READ_ONCE(ft_stats_ms);
+
+	if (ms && !READ_ONCE(ft_stopping))
+		queue_delayed_work(system_unbound_wq, &ft_stats_work, msecs_to_jiffies(ms));
+}
+
+/* The shortest period a pass may be asked for: a full table's pass takes a
+ * large part of a second on the KASAN image, and passes back to back would
+ * keep the transaction to themselves. */
+#define FT_STATS_MS_MIN 100U
+
+/* A value given at load is read before initialization, which the first
+ * install then starts the passes after. A new period applies from now, a
+ * pass already queued for the old one included; zero stops that pass. */
+static int ft_stats_ms_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int ms;
+	int rc = kstrtouint(val, 0, &ms);
+
+	if (rc)
+		return rc;
+	if (ms && ms < FT_STATS_MS_MIN)
+		return -EINVAL;
+	WRITE_ONCE(*(unsigned int *)kp->arg, ms);
+	if (!ms)
+		cancel_delayed_work(&ft_stats_work);
+	else if (READ_ONCE(ft_ready) && !READ_ONCE(ft_stopping))
+		mod_delayed_work(system_unbound_wq, &ft_stats_work, msecs_to_jiffies(ms));
+	return 0;
+}
+
+static const struct kernel_param_ops ft_stats_ms_ops = {
+	.set = ft_stats_ms_set,
+	.get = param_get_uint,
+};
+module_param_cb(stats_ms, &ft_stats_ms_ops, &ft_stats_ms, 0644);
+MODULE_PARM_DESC(stats_ms, "How often every offloaded flow's counters reach conntrack (ms, 100 or more, up to half the flowtable timeout); 0 leaves it to Netfilter's per-flow requests, which cost more");
+
+/* One entry's part of a pass: what it counted since its last report and when
+ * it was last used, through its handle, as a counter read's reply carries
+ * them (ft_stats()). A direction ft_stats() would refuse to answer for is
+ * left to Netfilter: its collector retires a flow whose handle is invalid
+ * within a second, and one that goes unreported is asked for again. */
+static void ft_stats_report(struct cdx_ft_entry *entry)
+{
+	struct cdx_ft_counters now;
+	struct ft_delta delta;
+
+	if (!nf_flow_offload_handle_valid(entry->handle) || !ft_entry_bounded(entry))
+		return;
+	cdx_ft_stats(entry->hw, &now);
+	if (ft_delta_read(entry, &now, &delta) || !ft_neigh_used(entry, delta.packets != 0))
+		return;
+	nf_flow_offload_handle_account(entry->handle, entry->dir, delta.packets, delta.bytes);
+	nf_flow_offload_handle_used(entry->handle, delta.lastused);
+	ft_reported(entry, &now);
+}
+
+/* A pass, in batches under the transaction with others let in between. Each
+ * entry reported is stamped and moved to the tail, so a batch starts where
+ * the last one stopped, whatever came and went meanwhile, and the pass ends
+ * at the first entry it has stamped; one installed during it waits for the
+ * next. The next pass is due stats_ms after this one began, not after it
+ * ended: a pass over a full table takes a large part of a second on the KASAN
+ * image, and counted from its end the passes would come every two. One that
+ * overran is followed at once, its batches still letting others in. */
+static void ft_stats_workfn(struct work_struct *work)
+{
+	unsigned long began = jiffies, period;
+	struct cdx_ft_entry *entry;
+	unsigned int done;
+	bool more, left;
+
+	ft_stats_pass++;
+	do {
+		done = 0;
+		more = false;
+		cdx_ft_begin();
+		if (READ_ONCE(ft_stopping)) {
+			cdx_ft_end();
+			return;
+		}
+		while (!list_empty(&ft_entries)) {
+			entry = list_first_entry(&ft_entries, struct cdx_ft_entry, list);
+			if (entry->pass == ft_stats_pass)
+				break;
+			entry->pass = ft_stats_pass;
+			list_move_tail(&entry->list, &ft_entries);
+			ft_stats_report(entry);
+			if (++done == FT_STATS_BATCH) {
+				more = true;
+				break;
+			}
+		}
+		left = !list_empty(&ft_entries);
+		if (!more)
+			ft_stats_passes++;
+		cdx_ft_end();
+		if (more)
+			cdx_ft_let_waiters();
+	} while (more);
+	period = msecs_to_jiffies(READ_ONCE(ft_stats_ms));
+	if (left && period && !READ_ONCE(ft_stopping))
+		queue_delayed_work(system_unbound_wq, &ft_stats_work,
+				   time_after(began + period, jiffies) ? began + period - jiffies : 0);
 }
 
 /* Native flowtable work visits all bound devices for each direction, and only
@@ -2773,6 +2906,7 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 			schedule_work(&ft_settle_work);
 		break;
 	case FLOW_CLS_STATS:
+		ft_stats_requests++;
 		rc = entry ? ft_stats(entry, cls) : -ENOENT;
 		break;
 	default:

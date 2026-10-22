@@ -10,12 +10,15 @@
 typedef unsigned refcount_t;
 typedef int atomic_t;
 typedef uint64_t u64;
+typedef uint32_t u32;
+typedef int32_t __s32;
 struct rcu_head { int unused; };
 #define GFP_ATOMIC 0
 #define READ_ONCE(v) (v)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define smp_store_release(p, v) (*(p) = (v))
 #define smp_load_acquire(p) (*(p))
+#define cmpxchg(p, o, n) (*(p) == (o) ? (*(p) = (n), (o)) : *(p))
 #define EXPORT_SYMBOL_GPL(name)
 #define unlikely(v) (v)
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))

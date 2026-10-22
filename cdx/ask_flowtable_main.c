@@ -508,6 +508,8 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * counted whether or not the table counts, which decides only whether
 	 * conntrack takes them. */
 	seq_printf(seq, "finals %llu\n", ft_finals);
+	seq_printf(seq, "stats_passes %llu\n", ft_stats_passes);
+	seq_printf(seq, "stats_requests %llu\n", ft_stats_requests);
 	seq_printf(seq, "ipsec_sas %u\nipsec_sa_cache %u\n",
 		   cdx_ipsec_sa_count(), cdx_ipsec_sa_cache_entries());
 	ft_sec_refusal_rows(seq);
@@ -926,6 +928,9 @@ netdev:
 	flush_work(&ft_ipsec_retire);
 	ft_ipsec_forget_all();
 	cancel_delayed_work_sync(&ft_ipsec_stats);
+	/* Disabled rather than cancelled: a write of stats_ms, which sysfs
+	 * still takes until the module is freed, queues nothing after this. */
+	disable_delayed_work_sync(&ft_stats_work);
 	cancel_work_sync(&ft_ipsec_follow);
 	ft_ipsec_watch_flush();
 	/* The drain above deleted whatever the binds had installed, and a
@@ -1015,6 +1020,9 @@ static void __exit ask_flowtable_exit(void)
 	 * none is by now: every offloaded state pins this module through its
 	 * ops, and xfrm deletes a state before it lets it go. */
 	cancel_delayed_work_sync(&ft_ipsec_stats);
+	/* Disabled rather than cancelled: a write of stats_ms, which sysfs
+	 * still takes until the module is freed, queues nothing after this. */
+	disable_delayed_work_sync(&ft_stats_work);
 	/* The last SA's retirement counted what SEC had refused by then; this
 	 * counts whatever SEC finished refusing after it, the last this module
 	 * will. */
